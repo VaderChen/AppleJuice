@@ -15,6 +15,12 @@ public:
         std::uint64_t budget_renewals{},budget_reissued_instructions{},native_budget_exits{},native_precise_exits{};
         // 真正無配額的 resident 框架與必要控制邊界；不冒充退休指令數。
         std::uint64_t resident_runs{},resident_callbacks{},resident_precise_callbacks{};
+        std::uint64_t resident_timestamps{};
+        // 無配額平行批次；CPU 時間以每個宿主 worker 的執行緒時鐘累計。
+        std::uint64_t parallel_batches{},parallel_workers{},parallel_peak_workers{},parallel_interrupts{};
+        std::uint64_t parallel_wall_ns{},parallel_cpu_ns{},parallel_sites{};
+        std::uint64_t parallel_messages{},parallel_resumes{},parallel_publications{},parallel_service_retries{};
+        std::uint64_t parallel_coordinated_services{};
         std::uint64_t capacity_growths{},cache_capacity_bytes{},cache_reservation_bytes{},peak_cache_bytes{};
         std::uint64_t cache_validation_nanoseconds{},code_invalidations{},unaffected_code_events{};
         // 全清原因分開計數：紀錄遺失（落後環狀紀錄容量）、結構世代、MMU 存取模式、其他情境（身分／服務／模式／排序）。

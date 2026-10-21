@@ -1,5 +1,6 @@
 #include "x64arm/startup_profile.hpp"
 #include "x64arm/windows_services.hpp"
+#include "resident_service_policy.hpp"
 #include "crt_library.hpp"
 #include "builtin_export_aliases.hpp"
 #include "windows_scalar_math.hpp"
@@ -75,7 +76,12 @@ bool trace_clock() noexcept {
 }
 std::uint64_t WindowsServices::timestamp_counter(const GuestState& state,GuestMemory& memory){
     if(!runtime_.host_clock)return state.tsc;
-    retired(memory,0);return runtime_.clock_ticks;
+    retired(memory,0);
+    // 宿主時鐘模式的 TSC 依客體處理器身分的標稱頻率計數（宿主未公告標稱值時用最高頻率），與 CPUID 0x16 同源；
+    // 兩者皆未知才沿用 100 ns 刻度。由同一宿主單調時鐘換算，跨執行緒與程序保持單調。
+    const auto& identity=memory.processor_identity();const std::uint64_t mhz=identity.base_mhz?identity.base_mhz:identity.maximum_mhz;
+    if(!mhz)return runtime_.clock_ticks;
+    return static_cast<std::uint64_t>(static_cast<unsigned __int128>(runtime_.clock_ticks)*mhz/10U);
 }
 void WindowsServices::set_host_clock(GuestMemory& memory, bool enabled) {
     if (!initialized_) throw std::logic_error("時鐘模式需要已初始化的 Windows 服務");
@@ -1052,11 +1058,50 @@ ResidentScalarErrors WindowsServices::resident_scalar_errors(GuestMemory& memory
     return {cell,runtime_.errno_cell,33,34};
 }
 #endif
+#ifdef X64ARM_HOST_SERVICES_COORDINATED_SERVICE
+bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory& memory) {
+    if(x86_ || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled() ||
+       runtime_.forced_exit_code() || debugger_stopped())return false;
+    const auto begin=stub_base_.value+services.size()*16;
+    const auto table=runtime_service_descriptors();
+    if(state.rip.value<begin || (state.rip.value-begin)%16 || (state.rip.value-begin)/16>=table.size())return false;
+    const auto& descriptor=table[(state.rip.value-begin)/16];
+    // 虛擬記憶體家族沿用同一個 provider；不重新實作配置、權限、錯誤或撤銷語義。
+    // 跨程序操作可能等待另一個程序，保留完整服務邊界。
+    const auto symbol=descriptor.symbol;
+    const auto mapping=detail::resident_mapping_service(symbol);
+    const bool extended=mapping==detail::ResidentMappingService::Process;
+    const bool allocation2=mapping==detail::ResidentMappingService::Allocation2;
+    if(descriptor.family!="kernel32.dll" || mapping==detail::ResidentMappingService::None)return false;
+    if((extended || allocation2) && !(allocation2 && !state.reg(Gpr::Rcx)) &&
+       !current_process_handle(state.reg(Gpr::Rcx)))return false;
+    const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
+    if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
+    const auto previous=threads_.current;const auto saved_error=last_error_;
+    const auto entry_error=static_cast<std::uint32_t>(memory.load(GuestAddress{state.gs_base+0x68},32));
+    struct Restore {
+        WindowsServices& self;std::uint64_t previous,current;std::uint32_t error;
+        ~Restore(){self.threads_.current=previous;if(current!=previous)self.last_error_=error;}
+    } restore{*this,previous,key,saved_error};
+    threads_.current=key;last_error_=entry_error;
+    entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,symbol);
+    refresh_guard_table(memory);
+    const auto result=invoke_process_memory(state,memory,descriptor);
+    if(result)throw std::logic_error("虛擬記憶體服務意外終止客體");
+    if(last_error_!=entry_error)memory.store(GuestAddress{state.gs_base+0x68},32,last_error_);
+    refresh_guard_table(memory);
+    ++state.tsc;state.rep_compare={};
+    return true;
+}
+#endif
 std::optional<std::uint32_t> WindowsServices::invoke(GuestState& state, GuestMemory& memory) {
     return invoke_boundary(state,memory);
 }
 std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,GuestMemory& memory,
                                                             const ResidentHostEnvironment* environment) {
+    // 協調者已接手此執行緒的完整 provider；成功、等待與例外均由同一流程完成。
+    // worker 的窄服務不經這裡，也不能提早清掉尚未處理的協調請求。
+    resident_service_requests_.erase(threads_.current);
     entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,
         entry_runtime_profile::enabled()?name(state.rip):std::string_view{});
 #ifdef X64ARM_HOST_SERVICES_MANAGED_FP

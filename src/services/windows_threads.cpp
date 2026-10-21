@@ -9,6 +9,7 @@
 #include <unistd.h>
 #endif
 #include "x64arm/windows_services.hpp"
+#include "resident_service_policy.hpp"
 #include "guest_crt_state.h"
 #include "windows_loader_lock.hpp"
 #include "x64arm/guest_address_policy.hpp"
@@ -26,6 +27,14 @@
 #include "monotonic_clock.hpp"
 namespace x64arm {
 namespace {
+bool resident_recipe_eligible(const HostServices& provider,GuestAddress address) {
+#ifdef X64ARM_HOST_SERVICES_SCALAR_RECIPE
+    return provider.resident_service(address) && provider.resident_scalar_service(address) &&
+        provider.resident_scalar_recipe(address)!=0;
+#else
+    (void)provider;(void)address;return false;
+#endif
+}
 #if !defined(_WIN32)
 // 診斷：X64ARM_TRACE_THREAD_CYCLES 啟用時，統計排程器閒置區間（沒有可執行客體執行緒）及其結束原因。
 struct IdleTrace {
@@ -461,10 +470,16 @@ std::vector<GuestState *> WindowsServices::parallel_contexts(GuestState &state) 
         if (candidate == threads_.items.end())
             candidate = threads_.items.begin();
         auto &[id, thread] = *candidate++;
+        const auto pending_service=resident_service_requests_.find(id);
         if (id == threads_.current || thread.status != ThreadStatus::Runnable || thread.suspended ||
+            (pending_service!=resident_service_requests_.end() && pending_service->second==thread.context.rip) ||
             thread.context.pending_cpu_trap || (handles(thread.context.rip)
 #ifdef X64ARM_HOST_SERVICES_PARALLEL_SERVICE
             && !parallel_service(thread.context.rip)
+            && !resident_recipe_eligible(*this,thread.context.rip)
+#ifdef X64ARM_HOST_SERVICES_COORDINATED_SERVICE
+            && detail::resident_mapping_service(name(thread.context.rip))==detail::ResidentMappingService::None
+#endif
 #endif
             ))
             continue;
@@ -499,6 +514,47 @@ void WindowsServices::after_parallel_instructions(GuestState &state, GuestMemory
     if (!counts.empty() && counts[0])
         after_instructions(state, memory, counts[0]);
 }
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_PARALLEL
+std::uint64_t WindowsServices::resident_context_key(const GuestState& state) const noexcept {
+    for(const auto& [id,thread]:threads_.items)if(&thread.context==&state)return id;
+    return threads_.current;
+}
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_SERVICE_REQUEST
+void WindowsServices::resident_service_request(std::uint64_t key,GuestAddress rip) {
+    if(threads_.items.contains(key))resident_service_requests_[key]=rip;
+}
+#endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTROL_REQUEST
+void WindowsServices::resident_control_request(std::uint64_t key,GuestAddress rip,bool pending) {
+    if(pending){
+        if(threads_.items.contains(key))resident_service_requests_[key]=rip;
+    }else{
+        const auto found=resident_service_requests_.find(key);
+        if(found!=resident_service_requests_.end() && found->second==rip)resident_service_requests_.erase(found);
+    }
+}
+#endif
+void WindowsServices::after_resident_parallel(GuestState& state,GuestMemory& memory) {
+    parallel_thread_count_=0;
+    after_instructions(state,memory,0);
+}
+std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState* const> contexts) const {
+    std::size_t runnable=0;std::uint64_t deadline=UINT64_MAX;
+    for(const auto& [id,thread]:threads_.items){
+        (void)id;
+        if(thread.status==ThreadStatus::Runnable && !thread.suspended)++runnable;
+        if(thread.status==ThreadStatus::Waiting)deadline=std::min(deadline,thread.wait.deadline);
+    }
+    // 尚未取得 worker 的 runnable 必須獲得排程；全部正在運算時不啟用時間片。
+    std::uint64_t wake=runnable>contexts.size()?5000000:0;
+    if(deadline!=UINT64_MAX){
+        const auto now=detail::monotonic_ticks();
+        const auto remaining=deadline>now?std::min<std::uint64_t>(deadline-now,UINT64_MAX/100)*100:1;
+        wake=wake?std::min(wake,remaining):remaining;
+    }
+    return wake;
+}
+#endif
 std::uint64_t WindowsServices::native_chain_limit() const noexcept {
     if(resident_execution_depth_)return UINT64_MAX;
     if(threads_.yield)return 0;
@@ -1396,6 +1452,27 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
                 break;
             ++chosen;
         }
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_PARALLEL
+        if (resident_execution_depth_ && parallel_workers() > 1) {
+            // 完整控制待辦（API／語義／故障）由協調者先承接；不能先啟動
+            // 少數可運算客體，再讓其餘客體空等下一個排程期限。
+            // 仍按原輪替順序選取，沿下方唯一的 TLS／回呼／例外切換流程；
+            // worker 可完成的服務保持平行，不在這裡搶回協調者。
+            auto request = threads_.items.upper_bound(threads_.current);
+            for (std::size_t n = 0; n < threads_.items.size(); ++n) {
+                if (request == threads_.items.end())request = threads_.items.begin();
+                const auto& thread = request->second;
+                const auto pending=resident_service_requests_.find(request->first);
+                if (thread.status == ThreadStatus::Runnable && !thread.suspended &&
+                    ((pending!=resident_service_requests_.end() && pending->second==thread.context.rip) ||
+                     (handles(thread.context.rip) && !parallel_service(thread.context.rip) &&
+                      !resident_recipe_eligible(*this,thread.context.rip)))) {
+                    chosen = request;break;
+                }
+                ++request;
+            }
+        }
+#endif
         if (chosen != threads_.items.end() && chosen->second.status == ThreadStatus::Runnable &&
             !chosen->second.suspended) {
             // 同一執行緒續跑時，runtime 仍是有效的 TLS／FLS；只在真正換人前保存。

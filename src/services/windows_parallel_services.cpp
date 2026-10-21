@@ -1,23 +1,58 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/startup_profile.hpp"
 #include "monotonic_clock.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
 
 namespace x64arm {
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_TIMESTAMP
+bool WindowsServices::resident_timestamp_counter(const GuestState&,const GuestMemory& memory,std::uint64_t& result) const noexcept {
+    if(!runtime_.host_clock)return false;
+    // 與一般 timestamp_counter 相同的單調時間軸及 CPUID 標稱頻率；worker
+    // 只讀硬體時間，不呼叫 retired，也不寫全體執行緒共用的 KUSER 時間頁。
+    const auto ticks=detail::monotonic_ticks();
+    const auto& identity=memory.processor_identity();
+    const std::uint64_t mhz=identity.base_mhz?identity.base_mhz:identity.maximum_mhz;
+    result=mhz?static_cast<std::uint64_t>(static_cast<unsigned __int128>(ticks)*mhz/10U):ticks;
+    return true;
+}
+#endif
 #ifdef X64ARM_HOST_SERVICES_PARALLEL_SERVICE
 bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_PARALLEL_SERVICES");return !setting || std::string_view(setting)!="0";}();
     if(!enabled || x86_ || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled() || runtime_.forced_exit_code())return false;
     const auto symbol=name(address);
     return symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue" ||
+        symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
+        symbol=="WakeConditionVariable" || symbol=="WakeAllConditionVariable" || symbol=="SwitchToThread" ||
+        symbol=="_control87" || symbol=="_controlfp" ||
         symbol=="GetLastError" || symbol=="SetLastError" || symbol=="GetCurrentThreadId" ||
         symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency" ||
         symbol=="EnterCriticalSection" || symbol=="TryEnterCriticalSection" || symbol=="LeaveCriticalSection";
 }
 
 bool WindowsServices::invoke_parallel_service(GuestState& state,GuestMemory& memory) {
+    bool retry=false;return invoke_parallel_service_impl(state,memory,retry);
+}
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_PARALLEL
+ResidentServiceProgress WindowsServices::resident_parallel_service(GuestState& state,GuestMemory& memory) {
+    bool retry=false;
+    if(invoke_parallel_service_impl(state,memory,retry))return ResidentServiceProgress::Completed;
+    return retry?ResidentServiceProgress::Retry:ResidentServiceProgress::Coordinator;
+}
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_ACTIVE_CONTEXTS
+ResidentServiceProgress WindowsServices::resident_parallel_service(GuestState& state,GuestMemory& memory,
+                                                                   std::span<GuestState* const> active) {
+    bool retry=false;
+    if(invoke_parallel_service_impl(state,memory,retry,active))return ResidentServiceProgress::Completed;
+    return retry?ResidentServiceProgress::Retry:ResidentServiceProgress::Coordinator;
+}
+#endif
+#endif
+bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory& memory,bool& retry,
+                                                  std::span<GuestState* const> active) {
     if(!parallel_service(state.rip))return false;
     const auto symbol=name(state.rip);
     // worker 身分由交給引擎的 context 決定；客體更動 GS 不得冒用另一執行緒。
@@ -57,6 +92,47 @@ bool WindowsServices::invoke_parallel_service(GuestState& state,GuestMemory& mem
         if(symbol=="TlsGetValue" && !error)return false;
         if(reading){result=load(slot,8);if(error){put(error,0,4);if(current)last_error_=0;}}
         else {put(slot,second,8);(current?runtime_.tls_values:thread.tls_values)[index]=second;result=1;}
+    }else if(symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue"){
+        const auto index=static_cast<std::uint32_t>(first);const bool reading=symbol!="FlsSetValue";
+        if(index>=runtime_.fls_used.size() || !runtime_.fls_used[index])return false;
+        auto* error=symbol=="FlsGetValue"?pointer(thread.teb+0x68,4,2):nullptr;
+        if(symbol=="FlsGetValue" && !error)return false;
+        auto* mirror=!reading && fls_mirror_?pointer(thread.teb+0x1840+std::uint64_t{index}*8,8,2):nullptr;
+        if(!reading && fls_mirror_ && !mirror)return false;
+        auto& values=current?runtime_.fls_values:thread.fls_values;
+        if(reading){result=values[index];if(error){put(error,0,4);if(current)last_error_=0;}}
+        else {values[index]=second;if(mirror)put(mirror,second,8);result=1;}
+    }else if(symbol=="WakeConditionVariable" || symbol=="WakeAllConditionVariable"){
+        if(!pointer(first,8,2))return false;
+        // 等待集合在 epoch 內固定。沒有尚待喚醒者時，通知已完整完成；有等待者
+        // 才交協調者更新等待狀態、重新取得鎖及排程，避免無效通知停止全體 worker。
+        for(const auto& [id,other]:threads_.items){
+            (void)id;
+            if(other.status==ThreadStatus::Waiting && other.wait.kind==ThreadWaitKind::Condition &&
+               other.wait.handles[0]==first && !other.wait.signaled)return false;
+        }
+    }else if(symbol=="SwitchToThread"){
+        if(active.empty() || state.processor_id>=64)return false;
+        for(const auto& [id,other]:threads_.items){
+            if(id==tid || other.status!=ThreadStatus::Runnable || other.suspended ||
+               !(other.affinity&(UINT64_C(1)<<state.processor_id)))continue;
+            // 主 context 位於呼叫端，其餘位於執行緒表。已取得別的 worker 者是
+            // running，不能當成目前處理器尚可接手的 ready 執行緒。
+            const bool running=id==threads_.current ||
+                std::find(active.begin(),active.end(),&other.context)!=active.end();
+            if(!running)return false;
+        }
+        result=0; // 沒有可接手者；依 Windows 契約不做排程切換。
+    }else if(symbol=="_control87" || symbol=="_controlfp"){
+        // x64 合法控制遮罩只修改呼叫者 MXCSR，沒有 errno、回呼或輸出指標。
+        // 非法遮罩沿既有完整例外路徑；有效呼叫共用原數學 provider。
+        if(static_cast<std::uint32_t>(second)&0x70000U)return false;
+        const auto sp=state.reg(Gpr::Rsp);
+        if(sp%16!=8 || sp>UINT64_MAX-40)return false;
+        const auto home=memory.native_window(GuestAddress{sp+8},2);
+        if(!home.data || home.after<32)return false;
+        if(invoke_math(state,memory,{"crt",symbol,2}))throw std::logic_error("浮點控制服務意外終止客體");
+        std::atomic_thread_fence(std::memory_order_seq_cst);return true;
     }else if(symbol=="GetCurrentThreadId")result=thread_identifier(tid);
     else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"){
         auto* output=pointer(first,8,2);if(!output)return false;
@@ -70,16 +146,37 @@ bool WindowsServices::invoke_parallel_service(GuestState& state,GuestMemory& mem
         auto* lock_count=pointer(first+8,4,2);auto* recursion=pointer(first+12,4,2);auto* owner=pointer(first+16,8,2);
         if(first>UINT64_MAX-40 || !lock_count || !recursion || !owner)return false;
         auto& section=section_it->second;std::atomic_ref guard(section.worker_guard);std::uint32_t expected=0;
-        // 不等待其他 worker：一次取鎖失敗就返回協調者，避免批次屏障與客體鎖互相等待。
-        if(!guard.compare_exchange_strong(expected,1,std::memory_order_acquire))return false;
+        // 僅回報等待，不持鎖進入信箱。舊 JIT 仍交回協調者；常駐 worker 可等待通知。
+        if(!guard.compare_exchange_strong(expected,1,std::memory_order_acquire)){retry=true;return false;}
         struct Release {std::atomic_ref<std::uint32_t> lock;~Release(){lock.store(0,std::memory_order_release);}} release{guard};
         if(symbol=="LeaveCriticalSection"){
             if(section.owner!=tid || !section.recursion)return false;
+            if(section.recursion==1)for(const auto& [id,other]:threads_.items){
+                (void)id;if(other.status!=ThreadStatus::Waiting)continue;
+                const auto& wait=other.wait;
+                const bool critical=wait.kind==ThreadWaitKind::Critical || wait.kind==ThreadWaitKind::CriticalRetry ||
+                    (wait.kind==ThreadWaitKind::CrtLockRetry && wait.critical);
+                const bool condition=wait.kind==ThreadWaitKind::Condition && wait.critical &&
+                    (wait.signaled || wait.deadline!=UINT64_MAX);
+                if((critical && !wait.handles.empty() && wait.handles[0]==first) ||
+                   (condition && wait.handles.size()>1 && wait.handles[1]==first))
+                    // 虛擬等待者沒有 active worker，服務進度通知無法喚醒它。
+                    // 尚未釋放鎖；由原 provider 完成釋放及 wake_threads，避免漏掉排程事件。
+                    return false;
+            }
             if(!--section.recursion)section.owner=0;
         }else if(!section.owner || section.owner==tid){
             if(section.recursion==UINT32_MAX)return false;
             section.owner=tid;++section.recursion;result=1;
-        }else if(symbol!="TryEnterCriticalSection")return false;
+        }else if(symbol!="TryEnterCriticalSection"){
+            // 只有持有者正取得 worker 時，等待服務進度才可能完成。
+            // 持有者尚未排程時交回共用等待流程，不能讓等待者佔著 worker
+            // 睡到下一個排程期限，反過來阻止持有者執行 LeaveCriticalSection。
+            const auto holder=threads_.items.find(section.owner);
+            retry=holder!=threads_.items.end() && (holder->first==threads_.current ||
+                std::find(active.begin(),active.end(),&holder->second.context)!=active.end());
+            return false;
+        }
         put(lock_count,section.recursion-1U,4);put(recursion,section.recursion,4);put(owner,thread_identifier(section.owner),8);
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);

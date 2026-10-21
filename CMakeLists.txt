@@ -179,7 +179,7 @@ target_sources(x64arm_windows PRIVATE src/services/socket_namespace.cpp src/serv
 target_sources(x64arm_windows PRIVATE src/services/socket_database.cpp src/services/windows_socket_database.cpp src/services/windows_socket_poll.cpp)
 target_sources(x64arm_windows PRIVATE src/services/socket_shared.cpp)
 target_sources(x64arm_windows PRIVATE src/services/url_cache.cpp src/services/windows_url_cache.cpp)
-target_link_libraries(x64arm_windows PUBLIC x64arm_core PRIVATE x64arm_options x64arm_platform x64arm_softfloat)
+target_link_libraries(x64arm_windows PUBLIC x64arm_core PRIVATE x64arm_options x64arm_jit x64arm_platform x64arm_softfloat)
 find_package(ZLIB 1.2.9 REQUIRED)
 target_sources(x64arm_windows PRIVATE src/services/native_library.cpp src/services/windows_native_library.cpp)
 target_link_libraries(x64arm_windows PRIVATE ZLIB::ZLIB)

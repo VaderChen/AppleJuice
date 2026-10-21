@@ -22,6 +22,11 @@
 #define X64ARM_HOST_SERVICES_TRANSLATION_IMAGE 1
 #define X64ARM_HOST_SERVICES_NATIVE_TIME_SLICE 1
 #define X64ARM_HOST_SERVICES_RESIDENT_EXECUTION 1
+#define X64ARM_HOST_SERVICES_RESIDENT_PARALLEL 1
+#define X64ARM_HOST_SERVICES_RESIDENT_TIMESTAMP 1
+#define X64ARM_HOST_SERVICES_RESIDENT_ACTIVE_CONTEXTS 1
+#define X64ARM_HOST_SERVICES_COORDINATED_SERVICE 1
+#define X64ARM_HOST_SERVICES_RESIDENT_SERVICE_REQUEST 1
 namespace x64arm {
 // 可選產碼範圍提示，end 不包含在範圍內。只影響探索分組，不授予執行權限。
 struct TranslationRegion {GuestAddress begin,end;};
@@ -37,6 +42,7 @@ inline constexpr std::uint32_t cpu_system_call_trap = 0x10000000U;
 inline constexpr std::uint32_t cpu_system_enter_trap = 0x10000001U;
 inline constexpr std::uint32_t cpu_software_interrupt_trap = 0x10000100U;
 enum class SystemCallEntry { Syscall, Sysenter, Interrupt };
+enum class ResidentServiceProgress {Completed,Retry,Coordinator};
 class HostCallFault : public std::runtime_error { using std::runtime_error::runtime_error; };
 struct CpuFault : std::runtime_error {
     std::uint32_t code;
@@ -126,6 +132,9 @@ public:
         if(!counts.empty() && counts[0])after_instructions(state,memory,counts[0]);
     }
     virtual std::uint64_t timestamp_counter(const GuestState& state,GuestMemory&) {return state.tsc;}
+    // 正常常駐模式的唯讀時間戳來源。可由多個 worker 同時呼叫，不更新共享時間頁、
+    // 排程或映射；false 不產生副作用，沿用一般語義流程。固定指令時鐘不得啟用。
+    virtual bool resident_timestamp_counter(const GuestState&,const GuestMemory&,std::uint64_t&) const noexcept {return false;}
     // 明確允許在此預算內延後 after_instructions；期間服務入口與映射不可變更。
     // 預設關閉，保留依賴每區塊回呼的自訂服務；仍受 instruction_slice 限制。
     virtual std::uint64_t native_chain_limit() const noexcept { return 0; }
@@ -140,6 +149,21 @@ public:
     // 作用域僅由無配額 AOT 入口持有；服務可據此停用計量排程，巢狀呼叫成對進出。
     virtual void enter_resident_execution() noexcept {}
     virtual void leave_resident_execution() noexcept {}
+    // 原生 worker 的慢出口隨虛擬執行緒保存；排程交換 GuestState 後仍須可識別。
+    // 僅在所有 worker 停止的協調邊界呼叫，不由 worker 查詢或修改服務狀態。
+    virtual std::uint64_t resident_context_key(const GuestState& state) const noexcept {
+        return reinterpret_cast<std::uintptr_t>(&state);
+    }
+    // 全體 worker 停止後傳遞實際未完成的服務；不能只依入口的靜態平行資格
+    // 重派同一個請求。key 為 resident_context_key，入口隨請求保存以排除舊狀態。
+    // provider 僅登記排程待辦，不在這個通知內執行服務或切換 context。
+    virtual void resident_service_request(std::uint64_t,GuestAddress) {}
+    // 無配額批次不虛構退休指令數。結束後由服務處理時間、等待及下一個 runnable。
+    virtual void after_resident_parallel(GuestState& state,GuestMemory& memory) {
+        after_instructions(state,memory,0);
+    }
+    // 零表示沒有待排程事件；不得為正常運算任意加入週期性的整批停止。
+    virtual std::uint64_t resident_parallel_wakeup_ns(std::span<GuestState* const>) const {return 0;}
     virtual bool allows_multiblock() const noexcept { return false; }
     virtual std::uint64_t instruction_slice() const noexcept { return UINT64_MAX; }
     // 載入器可提供已驗證的函式／程式區域；核心仍核對映射、入口及指令上限。
@@ -194,6 +218,21 @@ public:
     // true 代表已完整執行一個服務並設定返回 RIP／RSP；退休及 TSC 由引擎統一計算。
     virtual bool parallel_service(GuestAddress) const noexcept { return false; }
     virtual bool invoke_parallel_service(GuestState&,GuestMemory&) { return false; }
+    // Retry 保證尚無客體副作用，僅等待其他 worker 釋放資源；不要求全域退出。
+    virtual ResidentServiceProgress resident_parallel_service(GuestState& state,GuestMemory& memory) {
+        return invoke_parallel_service(state,memory)?ResidentServiceProgress::Completed:ResidentServiceProgress::Coordinator;
+    }
+    // active 是本 epoch 真正取得 worker 的 context，已排除尚待補譯／完整服務者。
+    // 身分與集合到下次一致邊界前不變；只比較指標，不讀取同伴正在改變的 GuestState。
+    virtual ResidentServiceProgress resident_parallel_service(GuestState& state,GuestMemory& memory,
+                                                               std::span<GuestState* const>) {
+        return resident_parallel_service(state,memory);
+    }
+    // 所有 worker 已交出完整狀態並解除映射借用；僅由協調者呼叫。
+    // 可改映射／程序內資料，但不得排程、變更 context 身分或執行客體回呼。
+    // true 已完成服務與返回，false 完全沒有客體副作用；例外隨原 context
+    // 保存，交既有服務例外流程收尾，不重複執行可能已產生副作用的操作。
+    virtual bool resident_coordinated_service(GuestState&,GuestMemory&) {return false;}
     virtual std::string_view name(GuestAddress address) const noexcept = 0;
     virtual std::optional<std::uint32_t> invoke(GuestState& state, GuestMemory& memory) = 0;
 };

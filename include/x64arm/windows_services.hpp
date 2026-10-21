@@ -132,10 +132,14 @@ public:
 #ifdef X64ARM_HOST_SERVICES_PARALLEL_SERVICE
     bool parallel_service(GuestAddress) const noexcept override;
     bool invoke_parallel_service(GuestState&,GuestMemory&) override;
+    bool invoke_parallel_service_impl(GuestState&,GuestMemory&,bool&,std::span<GuestState* const> = {});
 #endif
     ExecutionPolicy execution_policy(const GuestState&) const override;
     void after_parallel_instructions(GuestState&,GuestMemory&,std::span<const std::uint64_t>) override;
     std::uint64_t timestamp_counter(const GuestState&,GuestMemory&) override;
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_TIMESTAMP
+    bool resident_timestamp_counter(const GuestState&,const GuestMemory&,std::uint64_t&) const noexcept override;
+#endif
     std::uint64_t native_chain_limit() const noexcept override;
 #ifdef X64ARM_HOST_SERVICES_NATIVE_TIME_SLICE
     std::uint64_t native_chain_time_slice_ns() const noexcept override;
@@ -144,6 +148,24 @@ public:
     bool resident_execution() const noexcept override { return runtime_.host_clock; }
     void enter_resident_execution() noexcept override { ++resident_execution_depth_; }
     void leave_resident_execution() noexcept override { --resident_execution_depth_; }
+#endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_PARALLEL
+    std::uint64_t resident_context_key(const GuestState&) const noexcept override;
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_SERVICE_REQUEST
+    void resident_service_request(std::uint64_t,GuestAddress) override;
+#endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTROL_REQUEST
+    void resident_control_request(std::uint64_t,GuestAddress,bool) override;
+#endif
+    void after_resident_parallel(GuestState&,GuestMemory&) override;
+    std::uint64_t resident_parallel_wakeup_ns(std::span<GuestState* const>) const override;
+    ResidentServiceProgress resident_parallel_service(GuestState&,GuestMemory&) override;
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_ACTIVE_CONTEXTS
+    ResidentServiceProgress resident_parallel_service(GuestState&,GuestMemory&,std::span<GuestState* const>) override;
+#endif
+#ifdef X64ARM_HOST_SERVICES_COORDINATED_SERVICE
+    bool resident_coordinated_service(GuestState&,GuestMemory&) override;
+#endif
 #endif
     bool allows_multiblock() const noexcept override;
     std::uint64_t instruction_slice() const noexcept override;
@@ -958,6 +980,7 @@ private:
     std::array<std::uint64_t,64> parallel_thread_ids_{};
     std::size_t parallel_thread_count_{};
     std::uint64_t parallel_cursor_{};
+    std::map<std::uint64_t,GuestAddress> resident_service_requests_;
     std::uint64_t thread_id(std::uint64_t handle) const;
     std::uint32_t thread_identifier(std::uint64_t) const;
     std::uint64_t thread_from_identifier(std::uint32_t) const;
