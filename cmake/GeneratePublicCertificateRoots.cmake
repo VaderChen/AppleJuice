@@ -1,0 +1,20 @@
+# configure 與獨立 Smoke 使用同一份生成流程，不讀取宿主信任來源。
+if(NOT DEFINED X64ARM_ROOT)
+  get_filename_component(X64ARM_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+endif()
+if(NOT DEFINED X64ARM_GENERATED_DIR)
+  set(X64ARM_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+endif()
+set(X64ARM_PUBLIC_ROOTS_SOURCE "${X64ARM_ROOT}/launcher/assets/cacert.pem")
+file(READ "${X64ARM_ROOT}/launcher/assets/cacert-source.json" X64ARM_PUBLIC_ROOTS_METADATA)
+string(JSON X64ARM_PUBLIC_ROOTS_SHA256 GET "${X64ARM_PUBLIC_ROOTS_METADATA}" sha256)
+file(SHA256 "${X64ARM_PUBLIC_ROOTS_SOURCE}" X64ARM_PUBLIC_ROOTS_ACTUAL_SHA256)
+if(NOT X64ARM_PUBLIC_ROOTS_ACTUAL_SHA256 STREQUAL X64ARM_PUBLIC_ROOTS_SHA256)
+  message(FATAL_ERROR "內建公開根憑證套件雜湊不符")
+endif()
+file(READ "${X64ARM_PUBLIC_ROOTS_SOURCE}" X64ARM_PUBLIC_ROOTS_PEM)
+file(MAKE_DIRECTORY "${X64ARM_GENERATED_DIR}/x64arm")
+configure_file("${X64ARM_ROOT}/cmake/public_certificate_roots.hpp.in"
+  "${X64ARM_GENERATED_DIR}/x64arm/public_certificate_roots.hpp" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${X64ARM_PUBLIC_ROOTS_SOURCE}" "${X64ARM_ROOT}/launcher/assets/cacert-source.json")

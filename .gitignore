@@ -1,0 +1,13 @@
+/build/
+/config/
+*.bak
+.DS_Store
+._*
+__pycache__/
+*.smap
+*.smap.tmp.*
+*.key
+*.p12
+*.pfx
+*.provisionprofile
+*.mobileprovision

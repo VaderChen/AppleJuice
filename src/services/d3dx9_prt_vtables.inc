@@ -1,0 +1,22 @@
+// SDK ID3DXPRTBuffer ABI。
+constexpr WindowsServiceDescriptor prtMethods[]{
+    {"internal-d3d9","PRT.QueryInterface",3},
+    {"internal-d3d9","PRT.AddRef",1},
+    {"internal-d3d9","PRT.Release",1},
+    {"internal-d3d9","PRT.GetNumSamples",1},
+    {"internal-d3d9","PRT.GetNumCoeffs",1},
+    {"internal-d3d9","PRT.GetNumChannels",1},
+    {"internal-d3d9","PRT.IsTexture",1},
+    {"internal-d3d9","PRT.GetWidth",1},
+    {"internal-d3d9","PRT.GetHeight",1},
+    {"internal-d3d9","PRT.Resize",2},
+    {"internal-d3d9","PRT.LockBuffer",4},
+    {"internal-d3d9","PRT.UnlockBuffer",1},
+    {"internal-d3d9","PRT.ScaleBuffer",2},
+    {"internal-d3d9","PRT.AddBuffer",2},
+    {"internal-d3d9","PRT.AttachGH",2},
+    {"internal-d3d9","PRT.ReleaseGH",1},
+    {"internal-d3d9","PRT.EvalGH",1},
+    {"internal-d3d9","PRT.ExtractTexture",5},
+    {"internal-d3d9","PRT.ExtractToMesh",5},
+};

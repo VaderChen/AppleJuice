@@ -1,0 +1,20 @@
+[
+  {
+    "repo": "DirectXTex",
+    "commit": "1acf4ebe6330e06b7eb52e8db63d4f824ad77427",
+    "file": "directxtex-1acf4eb.tar.gz",
+    "sha256": "06a5b5fe61fe1a7dc1b515009f36c338d5d07afd10448c03806b75837f4b73c4"
+  },
+  {
+    "repo": "DirectXMath",
+    "commit": "5bbe2ceeec3236c27ad44c877715e1e0f3b9817a",
+    "file": "directxmath-5bbe2ce.tar.gz",
+    "sha256": "25107d9c57d19efe9cae7eda502166e154ab9ae0d634be0edbff9ef7e14758a0"
+  },
+  {
+    "repo": "DirectX-Headers",
+    "commit": "adbd6f3ba40795c46a8d0f33af00bcb57ff0f0a4",
+    "file": "directx-headers-adbd6f3.tar.gz",
+    "sha256": "38aedf08f2a6f775cc619639d30b109bd684742fda506ab510fcae1517b70adf"
+  }
+]

@@ -1,0 +1,5 @@
+{
+  "url": "https://raw.githubusercontent.com/dotnet/runtime/90b22d944aa56c7091e9f331cbe84081142529da/src/coreclr/pal/inc/rt/sal.h",
+  "commit": "90b22d944aa56c7091e9f331cbe84081142529da",
+  "sha256": "e26ee611231a859b5a800eb2e1606e7ca03b8e3981d7c98cf1ca20c89b658b68"
+}

@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""CMake 產生的 Ninja 共用鎖入口。"""
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path("@CMAKE_CURRENT_LIST_DIR_PY@").parent / 'scripts'))
+from ninja_build import main
+
+raise SystemExit(main("@X64ARM_NINJA_EXECUTABLE_PY@"))

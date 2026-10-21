@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Win64 Launcher</title><style>/* APP_CSS */</style></head>
+<body><div class="shell">
+<aside class="sidebar">
+ <div class="brand"><img class="brand-mark" src="APP_ICON_DATA" alt="" aria-hidden="true"><div>Win64<span>你的 Windows 程式庫</span></div><button id="app-settings" class="app-settings-button" aria-label="設定" title="設定"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 3-.6 2.1-1.8 1-2.2-.5-2 3.5L5 10.6v2.1l-1.6 1.5 2 3.5 2.2-.5 1.8 1L10 21h4l.6-2.8 1.8-1 2.2.5 2-3.5-1.6-1.5v-2.1l1.6-1.5-2-3.5-2.2.5-1.8-1L14 3Z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
+ <div class="library-heading"><h1>程式庫</h1><span id="count" class="count">0</span></div>
+ <label class="search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg><input id="search" placeholder="搜尋程式" aria-label="搜尋程式" autocomplete="off"></label>
+ <div id="program-list" class="program-list" role="list" aria-label="Windows 程式"></div>
+ <p id="list-empty" class="list-empty">加入第一個 EXE，<br>開始建立你的程式庫。</p>
+ <div class="sidebar-bottom"><div class="sidebar-actions"><button id="add" class="button add-button" title="加入 EXE（⌘ O）" aria-keyshortcuts="Meta+O"><span aria-hidden="true">＋</span> 加入 EXE</button><button id="temporary" class="button add-button"><span aria-hidden="true">▷</span> 臨時執行</button></div><div class="engine-indicator"><i id="engine-dot"></i><span id="engine-label">正在準備引擎…</span><span class="architecture">ARM64</span></div></div>
+</aside>
+<main>
+ <div id="temporary-sessions" class="temporary-sessions" hidden><label for="temporary-session-select">臨時工作階段</label><select id="temporary-session-select" aria-label="切換臨時工作階段"></select><button id="temporary-stop" class="text-button">停止</button><button id="temporary-close" class="text-button">關閉</button></div>
+ <section id="empty" class="empty-state"><div class="empty-art" aria-hidden="true"><div class="art-window"><div class="art-dots"><i></i><i></i><i></i></div><span>&gt;_</span></div><div class="art-badge">.exe</div></div><p class="eyebrow">WINDOWS，從這裡開始</p><h2>熟悉的程式，新的起點。</h2><p>加入 Windows x86／x64 執行檔，選取後即可執行。<br>主控台程式在內嵌終端互動，GUI 程式開啟獨立視窗。</p><button id="empty-add" class="button primary">＋ 加入第一個 EXE</button><div class="empty-note">每個程式，各自保存啟動設定。</div></section>
+ <section id="detail" hidden>
+
+  <div class="tabs" role="tablist" aria-label="程式功能"><button id="tab-workspace" role="tab" aria-selected="true" aria-controls="workspace" data-tab="workspace">終端</button><button id="tab-settings" role="tab" aria-selected="false" aria-controls="settings" data-tab="settings">程式設定<span id="dirty" hidden>●</span></button><button id="tab-log" role="tab" aria-selected="false" aria-controls="log" data-tab="log">LOG</button><div class="tabs-spacer"></div><button id="diagnostics" class="text-button">執行紀錄 ↗</button></div>
+  <div id="workspace" class="workspace" role="tabpanel" aria-labelledby="tab-workspace">
+   <div id="cli-panel" class="cli-panel"><div class="terminal-bar"><div><span class="live-dot"></span><strong>XTERM</strong><span id="terminal-state">尚未執行</span></div><button id="clear-terminal" title="清除畫面" aria-label="清除終端畫面">清除</button></div><div id="terminals" class="terminals"></div><div id="terminal-idle" class="terminal-idle"><span>&gt;_</span><p>終端已準備好</p><small>按下「執行」，在這裡輸入並查看程式輸出。</small></div><div class="terminal-footer"><span id="terminal-size">互動式終端</span><span>Ctrl C 中斷<span class="footer-divider">／</span>Ctrl D 結束輸入</span></div></div>
+   <div id="gui-panel" class="gui-panel" hidden>
+    <div id="gui-idle" class="gui-idle"><div class="gui-art" aria-hidden="true"><div class="art-dots"><i></i><i></i><i></i></div><div class="gui-art-content"><span></span><div><i></i><i></i><i></i></div></div></div><h3 id="gui-title">以獨立視窗開啟</h3><p id="gui-description">按下「執行」後，程式視窗會顯示在桌面。<br>你可以回到這裡查看狀態或停止程式。</p></div>
+    <div id="usage-panel" class="usage-panel" hidden>
+     <div class="usage-heading"><h3>即時資源用量</h3><span id="usage-state" role="status">正在取樣…</span></div>
+     <div class="usage-grid">
+      <article class="usage-card" aria-labelledby="usage-cpu-label"><div class="usage-card-heading"><h4 id="usage-cpu-label">CPU</h4><span>處理器</span></div><div class="usage-value" id="usage-cpu">—</div><p>100% = 1 個核心</p></article>
+      <article class="usage-card" aria-labelledby="usage-gpu-label"><div class="usage-card-heading"><h4 id="usage-gpu-label">GPU</h4><span>圖形處理器</span></div><div class="usage-value" id="usage-gpu">—</div><p id="usage-gpu-memory">正在取樣…</p></article>
+      <article class="usage-card" aria-labelledby="usage-memory-label"><div class="usage-card-heading"><h4 id="usage-memory-label">MEM</h4><span>記憶體</span></div><div class="usage-value" id="usage-memory">—</div><p>模擬程序實際佔用量</p></article>
+      <article class="usage-card" aria-labelledby="usage-network-label"><div class="usage-card-heading"><h4 id="usage-network-label">NET</h4><span>網路</span></div><div class="usage-value" id="usage-network">—</div><p id="usage-network-detail">正在取樣…</p></article>
+     </div>
+     <p class="usage-note">每 3 秒更新此模擬程序的用量。</p>
+    </div>
+    <div class="gui-process" id="gui-process">Windows x86／x64 → Apple Silicon</div>
+   </div>
+   <div id="run-message" class="run-message" role="status">啟動參數、工作資料夾與 C 槽映射可在「程式設定」調整。</div>
+  </div>
+  <div id="settings" class="settings-panel" role="tabpanel" aria-labelledby="tab-settings" hidden><div class="section-heading"><div><h3>啟動設定</h3><p id="settings-note">每個 EXE 使用自己的設定檔，下次啟動時套用。</p></div><div class="settings-actions"><button id="analyze" class="button secondary" hidden>程式加速分析</button><button id="save" class="button secondary">儲存設定</button></div></div><form id="settings-form">
+   <label for="work-dir">工作資料夾</label><div class="path-input"><input id="work-dir" autocomplete="off" spellcheck="false"><button type="button" id="pick-work">選擇…</button></div><p class="field-help">程式以此資料夾讀取或寫入檔案。</p>
+   <label for="c-drive">C 槽映射</label><div class="path-input"><input id="c-drive" autocomplete="off" spellcheck="false"><button type="button" id="pick-drive">選擇…</button></div><p class="field-help">指定資料夾對應到程式內的 C:\ 環境。</p>
+   <label for="install-root">安裝目錄（選填）</label><div class="path-input"><input id="install-root" autocomplete="off" spellcheck="false" placeholder="預設安裝到 C 槽的 Program Files"><button type="button" id="pick-install">選擇…</button></div><p class="field-help"><span id="install-default"></span><br>程式可能在安裝目錄內建立自己的子資料夾。</p>
+   <label for="arguments">啟動參數</label><input id="arguments" autocomplete="off" spellcheck="false" placeholder="例如：--help 或 -c ."><p class="field-help">依程式支援的 Windows 命令列格式填寫，可保留空白與引號。</p>
+   <label for="program-cpu-cores">此程式 CPU 核心數</label><select id="program-cpu-cores"><option value="0">沿用全域設定</option></select><p class="field-help">獨立保存，於此程式下次啟動生效。</p>
+   <label class="checkbox"><input type="checkbox" id="writable"><span>允許程式寫入上述資料夾</span></label><p id="install-read-only" class="field-help" hidden>目前關閉寫入，安裝程式無法建立檔案。安裝前請開啟寫入。</p>
+  </form><div id="config-file" class="config-file"><div><strong>獨立設定檔</strong><code id="config-path"></code></div><button id="reveal" class="text-button">在 Finder 顯示 ↗</button></div><div class="remove-row"><span id="remove-note">移出列表會保留原始 EXE 與設定檔。</span><button id="remove" class="text-button danger">移出列表</button></div></div>
+  <div id="log" class="runtime-log-panel" role="tabpanel" aria-labelledby="tab-log" hidden><div class="runtime-log-view"><div class="runtime-log-bar"><strong>LOG</strong><span id="log-size">0 / 131,072 B</span><button id="clear-log" class="text-button" aria-label="清除執行輸出" disabled>清除</button></div><div class="runtime-log-body"><p id="runtime-log-empty">執行後會在此顯示程式的標準輸出與錯誤輸出。</p><pre id="runtime-log-content" tabindex="0" aria-label="執行輸出"></pre></div></div><p class="runtime-log-note">保留最新 128KB 的標準輸出與錯誤輸出。<span id="log-truncated" hidden> 已淘汰較舊內容。</span></p></div>
+ </section>
+ <footer class="app-footer"><span id="library-summary">選取程式，開始執行。</span><span>Win64 Launcher <span class="footer-divider">/</span> <span id="app-build-version"></span></span></footer>
+</main></div>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+<dialog id="analysis-dialog" class="analysis-dialog" aria-labelledby="analysis-title">
+ <div class="dialog-heading"><h3 id="analysis-title">程式加速分析</h3></div>
+ <p id="analysis-name" class="analysis-name"></p>
+ <div id="analysis-prompt"><p>是否現在分析這個程式？</p><p class="field-help">預先分析 EXE 與同資料夾的 DLL，建立 resident AOT 快取，供啟用持久快取時使用。也可以稍後從「程式設定」開始。</p></div>
+ <div id="analysis-progress-area" hidden><p id="analysis-stage" class="eyebrow" role="status"></p><div class="analysis-activity"><span id="analysis-spinner" class="analysis-spinner" aria-hidden="true"></span><span id="analysis-message" role="status" aria-live="polite">正在準備…</span></div><progress id="analysis-progress" max="1" aria-label="程式加速分析進度"></progress><p id="analysis-count" class="field-help"></p></div>
+ <div class="analysis-actions"><button id="analysis-cancel" class="button secondary">稍後再說</button><button id="analysis-start" class="button primary">開始分析</button></div>
+</dialog>
+
+<dialog id="log-dialog"><div class="dialog-heading"><h3>引擎執行紀錄</h3><button id="close-log" class="text-button" aria-label="關閉執行紀錄">✕</button></div><p>客體程式輸出顯示在終端；這裡保留執行引擎的診斷。</p><pre id="log-content"></pre></dialog>
+<dialog id="app-settings-dialog" class="app-settings-dialog" aria-labelledby="app-settings-title">
+ <div class="dialog-heading"><h3 id="app-settings-title">設定</h3><button id="app-settings-close" class="text-button" aria-label="關閉設定">✕</button></div>
+ <div class="app-settings-layout"><nav class="app-settings-nav" role="tablist" aria-label="設定分頁" aria-orientation="vertical">
+  <button id="global-tab-general" type="button" role="tab" aria-controls="global-general" aria-selected="true" data-global-tab="general">一般</button>
+  <button id="global-tab-advanced" type="button" role="tab" aria-controls="global-advanced" aria-selected="false" data-global-tab="advanced" tabindex="-1">進階</button>
+  <button id="global-tab-windows" type="button" role="tab" aria-controls="global-windows" aria-selected="false" data-global-tab="windows" tabindex="-1">Windows 介面</button>
+  <button id="global-tab-cpu" type="button" role="tab" aria-controls="global-cpu" aria-selected="false" data-global-tab="cpu" tabindex="-1">CPU</button>
+  <button id="global-tab-gpu" type="button" role="tab" aria-controls="global-gpu" aria-selected="false" data-global-tab="gpu" tabindex="-1">GPU</button>
+  <button id="global-tab-experimental" type="button" role="tab" aria-controls="global-experimental" aria-selected="false" data-global-tab="experimental" tabindex="-1">實驗性功能</button>
+  <button id="global-tab-about" type="button" role="tab" aria-controls="global-about" aria-selected="false" data-global-tab="about" tabindex="-1">關於</button>
+ </nav><div class="app-settings-pages">
+  <section id="global-general" role="tabpanel" aria-labelledby="global-tab-general"><div class="appearance-settings">
+   <label for="ui-language">多國語言</label><select id="ui-language"><option value="auto">自動（依系統語言）</option><option value="zh-Hant" lang="zh-Hant">繁體中文</option><option value="en" lang="en">English</option><option value="ja" lang="ja">日本語</option><option value="ko" lang="ko">한국어</option></select>
+   <p class="field-help">選擇後立即預覽，儲存後於下次開啟時保留。</p>
+   <label for="ui-theme">介面配色</label><select id="ui-theme"><option value="forest">森林綠</option><option value="ocean">海洋藍</option><option value="violet">紫羅蘭</option><option value="amber">暖琥珀</option><option value="dark">深色</option></select>
+   <div class="theme-preview" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+  </div><h4>程式庫與啟動設定</h4><p>每個 EXE 分別保存 C:、工作目錄與啟動參數，可在主畫面的「程式設定」調整。</p><p>新加入的程式會使用進階頁設定的預設 C:。更改預設值不會覆寫既有 EXE 的個別設定。</p><p>從列表移除程式會保留原始 EXE 與設定檔。</p></section>
+  <section id="global-cpu" role="tabpanel" aria-labelledby="global-tab-cpu" hidden><h4>CPU 執行方式</h4><p id="cpu-system-cores" class="field-help"></p><form id="global-cpu-form">
+   <label for="cpu-cores-x64">Windows x64 核心數</label><div class="settings-slider-control"><input id="cpu-cores-x64" type="range" min="1" max="1" step="1" value="1" aria-describedby="cpu-cores-help cpu-system-cores"><output id="cpu-cores-x64-value" for="cpu-cores-x64">—</output></div><div class="settings-slider-scale" aria-hidden="true"><span>1</span><span id="cpu-cores-x64-max">—</span></div>
+   <label for="cpu-cores-x86">Windows x86 核心數</label><div class="settings-slider-control"><input id="cpu-cores-x86" type="range" min="1" max="1" step="1" value="1" aria-describedby="cpu-cores-help cpu-system-cores"><output id="cpu-cores-x86-value" for="cpu-cores-x86">—</output></div><div class="settings-slider-scale" aria-hidden="true"><span>1</span><span id="cpu-cores-x86-max">—</span></div>
+   <p id="cpu-cores-help" class="field-help">每次調整 1 個核心，儲存後套用於該架構所有程式的下次啟動。</p><p class="field-help">預設 x64 使用宿主實體核心，x86 使用 1 個核心。</p>
+   <label for="compiler-workers">編譯執行緒數</label><div class="settings-slider-control"><input id="compiler-workers" type="range" min="0" max="8" step="1" value="2" aria-describedby="compiler-workers-help"><output id="compiler-workers-value" for="compiler-workers">2</output></div><div class="settings-slider-scale" aria-hidden="true"><span>0</span><span>8</span></div>
+   <p id="compiler-workers-help" class="field-help">預設 2；0 為同步編譯。儲存後套用至下次程式啟動及加速分析。</p></form><dl class="settings-summary"><div><dt>執行模式</dt><dd id="execution-mode">Resident AOT 常駐轉譯</dd></div><div><dt>指令數上限</dt><dd>依個別程式設定，預設不限</dd></div></dl></section>
+  <section id="global-gpu" role="tabpanel" aria-labelledby="global-tab-gpu" hidden><h4>繪圖後端（所有程式）</h4><div class="appearance-settings"><label for="opengl-backend">OpenGL 繪圖後端</label><select id="opengl-backend"><option value="auto">auto — 優先 Metal，初始化失敗時使用舊版 OpenGL</option><option value="metal">metal — 直接 Metal 硬體加速</option><option value="legacy">legacy — 舊版 OpenGL driver</option></select><p class="field-help">套用於所有程式的 OpenGL，於下次啟動生效。需要 Metal 尚未支援的 OpenGL 功能時，請選 legacy。</p><p class="field-help">Direct3D 9／11 使用 Metal，GPU 記憶體沿用所選程式的設定。</p></div><h4>程式 GPU 記憶體</h4><p id="gpu-settings-program">先從程式庫選取程式，再調整它的 GPU 記憶體。</p><form id="global-gpu-form"><label for="gpu-memory">GPU 記憶體（MiB）</label>
+   <div class="settings-slider-control"><input id="gpu-memory" type="range" min="512" max="4096" step="512" value="4096" aria-describedby="gpu-memory-help gpu-memory-system" disabled><output id="gpu-memory-value" for="gpu-memory">4,096 MiB</output></div>
+   <div class="settings-slider-scale" aria-hidden="true"><span id="gpu-memory-min">512 MiB</span><span id="gpu-memory-max">—</span></div>
+   <p id="gpu-memory-system" class="field-help"></p><p id="gpu-memory-help" class="field-help">每次調整 512 MiB，上限為系統實體記憶體的 50%。預設 4096 MiB（4 GiB），按使用量配置，於下次執行生效。</p><p class="field-help">GPU 記憶體只套用於目前選取的程式，其他 EXE 的容量各自保存。</p></form></section>
+  <section id="global-advanced" role="tabpanel" aria-labelledby="global-tab-advanced" hidden><h4>預設磁碟映射</h4><p>C: 為必要設定。可新增 D: 至 Z:，供各程式在下次啟動時使用；讀寫權限沿用各 EXE 的設定。</p>
+   <form id="global-settings-form"><div id="global-drive-rows" class="global-drive-rows"></div><button id="global-add-drive" type="button" class="button secondary">＋ 新增磁碟映射</button></form>
+   <p class="global-hint">每個 EXE 的 C: 與工作目錄仍可獨立設定。更改映射不會搬移或刪除目錄中的檔案。</p>
+   <h4>Sandbox 根憑證</h4><div class="appearance-settings">
+    <label class="check"><input id="certificate-roots-file" type="checkbox">使用 Sandbox 根憑證檔案</label>
+    <label for="certificate-roots-path">保存位置（相對於 Sandbox C 槽）</label><input id="certificate-roots-path" type="text" autocomplete="off" spellcheck="false" placeholder="ProgramData/MacWin/Certificates/ROOT.pem">
+    <p class="field-help">首次啟動時優先沿用既有 ROOT.pem，缺檔才以當下時間與安全亂數生成。開關預設關閉，只控制是否使用此檔案；TLS 仍使用內建公開根憑證。</p>
+   </div>
+  </section>
+  <section id="global-windows" role="tabpanel" aria-labelledby="global-tab-windows" hidden><h4>Windows 介面字型</h4>
+   <div class="appearance-settings"><label for="windows-font">預設向量字型</label><select id="windows-font" aria-describedby="windows-font-help"><option value="auto">自動（macOS 系統向量字型）</option></select>
+    <p id="windows-font-help" class="field-help">套用於 Windows 系統介面與未指定字型的文字，儲存後於程式下次啟動生效。</p>
+   </div>
+   <div id="windows-font-preview" class="windows-font-preview" aria-label="字型預覽"><p>商店　收藏庫　社群</p><p>Windows · Steam · Aa Bb Cc · 0123456789</p><p>閱讀清晰的文字，讓操作更輕鬆。</p></div>
+  </section>
+  <section id="global-experimental" role="tabpanel" aria-labelledby="global-tab-experimental" hidden><h4>實驗性功能</h4>
+   <div class="experimental-option"><div><label for="native-library-bridge">原生函式庫橋接層</label><p id="native-library-bridge-help">將支援的函式庫呼叫轉交 ARM64 原生實作。目前僅支援部分 zlib 函式。</p></div><input id="native-library-bridge" class="settings-switch" type="checkbox" role="switch" aria-describedby="native-library-bridge-help native-library-bridge-default"></div>
+   <p id="native-library-bridge-default" class="field-help">預設關閉。儲存後套用至所有程式的下次啟動。</p>
+   <div class="experimental-option"><div><label for="native-v8-bridge">原生 V8 模組原型</label><p id="native-v8-bridge-help">使用 ARM64 V8 執行橋接測試程式。目前尚未自動替換 NW.js／遊戲內嵌 V8。</p></div><input id="native-v8-bridge" class="settings-switch" type="checkbox" role="switch" aria-describedby="native-v8-bridge-help native-v8-availability"></div>
+   <p id="native-v8-availability" class="field-help"></p>
+   <button id="add-native-v8-tests" type="button" class="button secondary">加入 V8 測試程式</button>
+   <p class="field-help">儲存開關後，將 x86／x64 測試程式加入程式庫，再按執行圖示測試。結果顯示於終端與 LOG。</p>
+  </section>
+  <section id="global-about" role="tabpanel" aria-labelledby="global-tab-about" hidden><h4>Win64 Launcher</h4><p id="app-version"></p><p>在 Apple Silicon 上執行 Windows x86／x64 程式，提供程式庫、獨立啟動設定與互動式終端。</p><p>Windows x86／x64 → ARM64</p></section>
+ </div></div>
+ <p id="global-settings-error" role="alert" hidden></p>
+ <div class="app-settings-footer"><span id="global-settings-status" role="status"></span><button id="global-settings-cancel" type="button" class="text-button">取消</button><button id="global-settings-save" type="button" class="button primary">儲存設定</button></div>
+</dialog>
+<script>/* APP_JS */</script></body></html>

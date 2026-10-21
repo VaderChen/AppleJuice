@@ -1,0 +1,33 @@
+        const bool save_mesh_handled=symbol=="D3DXSaveMeshToXA" || symbol=="D3DXSaveMeshToXW";
+        if(save_mesh_handled){
+            mesh_handled=true;require(arg(0) && u(6)<=3 && u(5)<=1048576);auto mesh=get(arg(1),Kind::Mesh);auto vb=get(mesh->vertex_buffer,Kind::VertexBuffer);require(!vb->mapped && !mesh->mapped);
+            const auto indices=mesh_indices(*mesh);d3d9_xfile::Writer writer(u(6));
+            std::vector<unsigned> extras;for(unsigned e=0;e+8<mesh->presentation.size();e+=8){const auto type=mesh->presentation[e+4],usage=mesh->presentation[e+6],index=mesh->presentation[e+7];if(index || !((usage==0 && type==2)||(usage==3 && type==2)||(usage==5 && type==1)||(usage==10 && type==4)))extras.push_back(e);}
+            if(!extras.empty())writer.templates("template VertexElement { <F752461C-1E23-48f6-B9F8-8350850F336F> DWORD Type; DWORD Method; DWORD Usage; DWORD UsageIndex; } template DeclData { <BF22E553-292C-4781-9FEA-62BD554BDD93> DWORD nElements; array VertexElement Elements[nElements]; DWORD nDWords; array DWORD data[nDWords]; }");
+            if(arg(4))writer.templates("template EffectInstance { <E331F7E4-0559-4cc2-8E99-1CEC1657928F> STRING EffectFilename; [...] } template EffectParamFloats { <3014B9A0-62F5-478c-9B86-E4AC9F4E418B> STRING ParamName; DWORD nFloats; array FLOAT Floats[nFloats]; } template EffectParamDWord { <E13963BC-AE51-4c5d-B00F-CFA3A9D97CE5> STRING ParamName; DWORD Value; } template EffectParamString { <1DBC4C88-94C1-46ee-9076-2C28818C9481> STRING ParamName; STRING Value; }");
+            const auto number=[&](unsigned value){writer.integer(value);writer.punct(';');};const auto real_number=[&](float value){writer.real(value);writer.punct(';');};
+            const auto faces=[&]{number(mesh->height);for(unsigned face=0;face<mesh->height;++face){number(3);for(unsigned c=0;c<3;++c){writer.integer(indices[face*3+c]);writer.punct(c==2?';':',');}writer.punct(face+1==mesh->height?';':',');}};
+            const auto vectors=[&](unsigned usage,unsigned components){const auto values=positions(*mesh,usage,0,components);number(mesh->width);for(unsigned i=0;i<values.size();++i){for(unsigned c=0;c<components;++c)real_number(values[i][c]);writer.punct(i+1==values.size()?';':',');}};
+            writer.begin("Mesh");vectors(0,3);faces();
+            const auto normal=offset_of(*mesh,3,0),uv=offset_of(*mesh,5,0),color=offset_of(*mesh,10,0);
+            if(normal!=UINT32_MAX && mesh->presentation[normal+4]==2){writer.begin("MeshNormals");vectors(3,3);faces();writer.end();}
+            if(uv!=UINT32_MAX && mesh->presentation[uv+4]==1){writer.begin("MeshTextureCoords");vectors(5,2);writer.end();}
+            if(color!=UINT32_MAX && mesh->presentation[color+4]==4){writer.begin("MeshVertexColors");number(mesh->width);const unsigned at=unsigned(mesh->presentation[color+2])|unsigned(mesh->presentation[color+3])<<8;for(unsigned i=0;i<mesh->width;++i){number(i);const auto packed=word(vb->pixels,i*mesh->stream_stride+at);for(unsigned shift:{16U,8U,0U,24U})real_number(static_cast<float>((packed>>shift)&255)/255);writer.punct(i+1==mesh->width?';':',');}writer.end();}
+            if(!extras.empty()){
+                writer.begin("DeclData");number(static_cast<unsigned>(extras.size()));unsigned words=0;
+                for(unsigned i=0;i<extras.size();++i){const auto e=extras[i];for(unsigned c=4;c<8;++c)number(mesh->presentation[e+c]);writer.punct(i+1==extras.size()?';':',');words+=element_bytes(mesh->presentation[e+4])/4;}
+                number(words*mesh->width);unsigned emitted=0;for(unsigned i=0;i<mesh->width;++i)for(auto e:extras){const unsigned at=unsigned(mesh->presentation[e+2])|unsigned(mesh->presentation[e+3])<<8;for(unsigned c=0;c<element_bytes(mesh->presentation[e+4]);c+=4){writer.integer(word(vb->pixels,i*mesh->stream_stride+at+c));writer.punct(++emitted==words*mesh->width?';':',');}}writer.end();
+            }
+            if(u(5)){
+                require(arg(3));writer.begin("MeshMaterialList");number(u(5));number(mesh->height);for(unsigned i=0;i<mesh->height;++i){const auto attribute=word(mesh->pixels,i*4);require(attribute<u(5));writer.integer(attribute);writer.punct(i+1==mesh->height?';':',');}
+                for(unsigned i=0;i<u(5);++i){
+                    const auto at=arg(3)+i*(x86_?72:80);const auto material=read(at,68);writer.begin("Material");for(unsigned c=0;c<4;++c)real_number(real(word(material,c*4)));writer.punct(';');real_number(real(word(material,64)));
+                    for(unsigned first:{8U,12U}){for(unsigned c=0;c<3;++c)real_number(real(word(material,(first+c)*4)));writer.punct(';');}
+                    const auto texture=memory.load(GuestAddress{at+(x86_?68:72)},pb);if(texture){writer.begin("TextureFilename");writer.string(read_ansi(memory,texture));writer.punct(';');writer.end();}
+                    if(arg(4)){const auto instance=arg(4)+i*3*ps;const auto filename=memory.load(GuestAddress{instance},pb);if(filename){writer.begin("EffectInstance");writer.string(read_ansi(memory,filename));writer.punct(';');const auto count=memory.load(GuestAddress{instance+ps},32),defaults=memory.load(GuestAddress{instance+2*ps},pb);require(count<=1048576 && (!count || defaults));
+                        for(unsigned j=0;j<count;++j){const auto entry=defaults+j*(x86_?16:24);const auto label=memory.load(GuestAddress{entry},pb),type=memory.load(GuestAddress{entry+ps},32),length=memory.load(GuestAddress{entry+ps+4},32),data=memory.load(GuestAddress{entry+ps+8},pb);require(label && data && type>=1 && type<=3 && length<=16U*1024U*1024U);const auto bytes=read(data,length);writer.begin(type==1?"EffectParamString":type==2?"EffectParamFloats":"EffectParamDWord");writer.string(read_ansi(memory,label));writer.punct(';');if(type==1){writer.string(std::string(bytes.begin(),std::find(bytes.begin(),bytes.end(),0)));writer.punct(';');}else if(type==2){require(length%4==0);number(static_cast<unsigned>(length/4));for(unsigned k=0;k<length;k+=4){writer.real(real(word(bytes,k)));writer.punct(k+4==length?';':',');}}else{require(length==4);number(word(bytes,0));}writer.end();}writer.end();}}
+                    writer.end();
+                }writer.end();
+            }writer.end();auto data=writer.finish();const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+            const auto opened=filesystem_.open_host(d3dx_path(path),0x40000000U,2,0x80,1);require(!opened.error,0x80070000U|opened.error);const auto written=opened.file->write(data,0);require(!written.error && written.bytes==data.size(),0x80070000U|(written.error?written.error:29U));
+        }

@@ -1,0 +1,80 @@
+{
+  "version": "21.1.8",
+  "commit": "2078da43e25a4623cab2d0d60decddf709aaea28",
+  "files": [
+    {
+      "upstream_path": "llvm/LICENSE.TXT",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/LICENSE.TXT",
+      "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee",
+      "bytes": 15141
+    },
+    {
+      "upstream_path": "llvm/include/llvm/Demangle/Demangle.h",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/include/llvm/Demangle/Demangle.h",
+      "sha256": "f78b11df8f9702c81ed6e0d4e46fad99c9b90e3f70667d987025800c7984aad9",
+      "bytes": 5286
+    },
+    {
+      "upstream_path": "llvm/include/llvm/Demangle/DemangleConfig.h",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/include/llvm/Demangle/DemangleConfig.h",
+      "sha256": "5e6942efe35e16ad2422fbf9a07de1750d8f28f564aa98da23aec36d877a9dad",
+      "bytes": 3151
+    },
+    {
+      "upstream_path": "llvm/include/llvm/Demangle/ItaniumDemangle.h",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/include/llvm/Demangle/ItaniumDemangle.h",
+      "sha256": "2122e19a7187a92e055f1d0d6a99e237146f4a2cd9aee8f6b7466b6911aeee0b",
+      "bytes": 193669
+    },
+    {
+      "upstream_path": "llvm/include/llvm/Demangle/ItaniumNodes.def",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/include/llvm/Demangle/ItaniumNodes.def",
+      "sha256": "e29522ac3d0a77da44f6299707b2c67af730f5748bd348ff33a3f4ae070f08f4",
+      "bytes": 2442
+    },
+    {
+      "upstream_path": "llvm/include/llvm/Demangle/MicrosoftDemangle.h",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/include/llvm/Demangle/MicrosoftDemangle.h",
+      "sha256": "d4693d728b12bdfde8d4ab1dd7ddd5f9eb3f2d0914fabe9f0afa582be7f1b8f8",
+      "bytes": 11304
+    },
+    {
+      "upstream_path": "llvm/include/llvm/Demangle/MicrosoftDemangleNodes.h",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/include/llvm/Demangle/MicrosoftDemangleNodes.h",
+      "sha256": "e3982bccc31ef69ab06826f5229c58992a0fd56e542a2a96ca97a0de941f2528",
+      "bytes": 22243
+    },
+    {
+      "upstream_path": "llvm/include/llvm/Demangle/StringViewExtras.h",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/include/llvm/Demangle/StringViewExtras.h",
+      "sha256": "7bbf7bc462ea8e17c574137cc4a62f146f7c6bf4aa25563df001feca5d8e235c",
+      "bytes": 1250
+    },
+    {
+      "upstream_path": "llvm/include/llvm/Demangle/Utility.h",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/include/llvm/Demangle/Utility.h",
+      "sha256": "fca36f82ce7f4c1c2d34fe03146f79565dd4de31d5f9b3e8695eb926e6912be7",
+      "bytes": 6674
+    },
+    {
+      "upstream_path": "llvm/lib/Demangle/ItaniumDemangle.cpp",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/lib/Demangle/ItaniumDemangle.cpp",
+      "sha256": "cd23d07e4045e1b2454aa4aa4d0fb903bccc20a8b7b998bcce9cbe32d83fa6ad",
+      "bytes": 17689
+    },
+    {
+      "upstream_path": "llvm/lib/Demangle/MicrosoftDemangle.cpp",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/lib/Demangle/MicrosoftDemangle.cpp",
+      "sha256": "a8f1a3bd9d1cd38526550760c39f74e264cd2b1d37c7cccdb8d5759e53087a2a",
+      "bytes": 82696
+    },
+    {
+      "upstream_path": "llvm/lib/Demangle/MicrosoftDemangleNodes.cpp",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/2078da43e25a4623cab2d0d60decddf709aaea28/llvm/lib/Demangle/MicrosoftDemangleNodes.cpp",
+      "sha256": "1f690a206a32afc3f7caa17e342b3988b6ed5371c8705358d1b87aa0656c6174",
+      "bytes": 22666
+    }
+  ],
+  "archive": "third_party/llvm-demangle-21.1.8.tar.gz",
+  "archive_sha256": "2dc2b67eba2b32b17ebc4d05201c6a2165106d70cfc0c54aef0b5effce679d24"
+}

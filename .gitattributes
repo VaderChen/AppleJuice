@@ -1,0 +1,5 @@
+*.bin binary
+*.tar.gz binary
+# 保留上游授權原文的 CRLF 與結尾空行。
+third_party/*-LICENSE whitespace=-blank-at-eof,cr-at-eol
+*.exe binary

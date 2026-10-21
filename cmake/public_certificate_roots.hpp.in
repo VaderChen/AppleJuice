@@ -1,0 +1,8 @@
+#pragma once
+#include <string_view>
+
+namespace x64arm::public_certificate_detail {
+// 共用 Launcher 固定版本的 Mozilla 公開 CA 套件；來源／授權見 cacert-source.json。
+inline constexpr std::string_view roots_pem=R"PUBLIC_CA(@X64ARM_PUBLIC_ROOTS_PEM@)PUBLIC_CA";
+inline constexpr std::string_view sha256="@X64ARM_PUBLIC_ROOTS_SHA256@";
+}

@@ -1,0 +1,14 @@
+{
+  "gl": {
+    "url": "https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/main/xml/gl.xml",
+    "sha256": "b9ca2cfa5c676e901c20d34af3407f1687cde0f1336a5ff7a8974d04c7494ad3"
+  },
+  "egl": {
+    "url": "https://raw.githubusercontent.com/KhronosGroup/EGL-Registry/main/api/egl.xml",
+    "sha256": "3327619123cdaa999400b41a7060180616df42571a0fdd11e9726e026f6d0fb8"
+  },
+  "gl_angle_ext": {
+    "url": "https://raw.githubusercontent.com/google/angle/main/scripts/gl_angle_ext.xml",
+    "sha256": "a5424e89aff2eea1e81937b110a31e3cc3bb7e0746e5882c37ff2ff0928630b9"
+  }
+}

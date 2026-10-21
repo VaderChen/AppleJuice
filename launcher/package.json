@@ -1,0 +1,6 @@
+{
+  "name": "x64arm-launcher-assets",
+  "private": true,
+  "scripts": {"vendor": "node scripts/vendor.mjs"},
+  "dependencies": {"@xterm/xterm": "6.0.0", "@xterm/addon-fit": "0.11.0"}
+}

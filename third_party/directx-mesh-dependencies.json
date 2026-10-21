@@ -1,0 +1,18 @@
+[
+  {
+    "專案": "DirectXMesh",
+    "commit": "27e180bbed50de536e4f666fb21eccf1914d88f1",
+    "來源": "https://github.com/microsoft/DirectXMesh/tree/27e180bbed50de536e4f666fb21eccf1914d88f1",
+    "封存檔": "directxmesh-27e180b.tar.gz",
+    "sha256": "4d7e949e56d34ec499e2aaf95dfd06479d113a63b2309b14df28e99ec5291d87",
+    "授權": "MIT"
+  },
+  {
+    "專案": "UVAtlas",
+    "commit": "3a7eaedb26dec6c1a5b5321692b6da2a6902cd4c",
+    "來源": "https://github.com/microsoft/UVAtlas/tree/3a7eaedb26dec6c1a5b5321692b6da2a6902cd4c",
+    "封存檔": "uvatlas-3a7eaed.tar.gz",
+    "sha256": "ce1fd047e7c2fe6a1eab703a5dd5b4803feb9d28b8a9b29a08a2848c19e5bc01",
+    "授權": "MIT"
+  }
+]

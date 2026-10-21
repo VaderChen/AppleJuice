@@ -1,0 +1,176 @@
+{
+  "GL_ANGLE_instanced_arrays": [
+    "glDrawArraysInstancedANGLE",
+    "glDrawElementsInstancedANGLE",
+    "glVertexAttribDivisorANGLE"
+  ],
+  "GL_ANGLE_translated_shader_source": [
+    "glGetTranslatedShaderSourceANGLE"
+  ],
+  "GL_EXT_blend_func_extended": [
+    "glBindFragDataLocationEXT",
+    "glBindFragDataLocationIndexedEXT",
+    "glGetFragDataIndexEXT"
+  ],
+  "GL_EXT_clip_control": [
+    "glClipControlEXT"
+  ],
+  "GL_EXT_disjoint_timer_query": [
+    "glBeginQueryEXT",
+    "glDeleteQueriesEXT",
+    "glEndQueryEXT",
+    "glGenQueriesEXT",
+    "glGetInteger64vEXT",
+    "glGetQueryObjecti64vEXT",
+    "glGetQueryObjectivEXT",
+    "glGetQueryObjectui64vEXT",
+    "glGetQueryObjectuivEXT",
+    "glGetQueryivEXT",
+    "glIsQueryEXT",
+    "glQueryCounterEXT"
+  ],
+  "GL_EXT_draw_buffers": [
+    "glDrawBuffersEXT"
+  ],
+  "GL_EXT_draw_buffers_indexed": [
+    "glBlendEquationSeparateiEXT",
+    "glBlendEquationiEXT",
+    "glBlendFuncSeparateiEXT",
+    "glBlendFunciEXT",
+    "glColorMaskiEXT",
+    "glDisableiEXT",
+    "glEnableiEXT",
+    "glIsEnablediEXT"
+  ],
+  "GL_EXT_instanced_arrays": [
+    "glDrawArraysInstancedEXT",
+    "glDrawElementsInstancedEXT",
+    "glVertexAttribDivisorEXT"
+  ],
+  "GL_EXT_occlusion_query_boolean": [
+    "glBeginQueryEXT",
+    "glDeleteQueriesEXT",
+    "glEndQueryEXT",
+    "glGenQueriesEXT",
+    "glGetQueryObjectuivEXT",
+    "glGetQueryivEXT",
+    "glIsQueryEXT"
+  ],
+  "GL_EXT_polygon_offset_clamp": [
+    "glPolygonOffsetClampEXT"
+  ],
+  "GL_EXT_robustness": [
+    "glGetGraphicsResetStatusEXT",
+    "glGetnUniformfvEXT",
+    "glGetnUniformivEXT",
+    "glReadnPixelsEXT"
+  ],
+  "GL_KHR_robustness": [
+    "glGetGraphicsResetStatusKHR",
+    "glGetnUniformfvKHR",
+    "glGetnUniformivKHR",
+    "glGetnUniformuivKHR",
+    "glReadnPixelsKHR"
+  ],
+  "GL_KHR_parallel_shader_compile": [
+    "glMaxShaderCompilerThreadsKHR"
+  ],
+  "GL_OES_draw_buffers_indexed": [
+    "glBlendEquationSeparateiOES",
+    "glBlendEquationiOES",
+    "glBlendFuncSeparateiOES",
+    "glBlendFunciOES",
+    "glColorMaskiOES",
+    "glDisableiOES",
+    "glEnableiOES",
+    "glIsEnablediOES"
+  ],
+  "GL_OES_vertex_array_object": [
+    "glBindVertexArrayOES",
+    "glDeleteVertexArraysOES",
+    "glGenVertexArraysOES",
+    "glIsVertexArrayOES"
+  ],
+  "GL_OVR_multiview": [
+    "glFramebufferTextureMultiviewOVR"
+  ],
+  "GL_ANGLE_request_extension": [
+    "glRequestExtensionANGLE"
+  ],
+  "GL_ANGLE_robust_client_memory": [
+    "glGetActiveUniformBlockivRobustANGLE",
+    "glGetBooleanvRobustANGLE",
+    "glGetBufferParameteri64vRobustANGLE",
+    "glGetBufferParameterivRobustANGLE",
+    "glGetBufferPointervRobustANGLE",
+    "glGetFloatvRobustANGLE",
+    "glGetFramebufferAttachmentParameterivRobustANGLE",
+    "glGetInteger64i_vRobustANGLE",
+    "glGetInteger64vRobustANGLE",
+    "glGetIntegeri_vRobustANGLE",
+    "glGetIntegervRobustANGLE",
+    "glGetInternalformativRobustANGLE",
+    "glGetProgramivRobustANGLE",
+    "glGetQueryObjecti64vRobustANGLE",
+    "glGetQueryObjectivRobustANGLE",
+    "glGetQueryObjectui64vRobustANGLE",
+    "glGetQueryObjectuivRobustANGLE",
+    "glGetQueryivRobustANGLE",
+    "glGetRenderbufferParameterivRobustANGLE",
+    "glGetSamplerParameterfvRobustANGLE",
+    "glGetSamplerParameterivRobustANGLE",
+    "glGetShaderivRobustANGLE",
+    "glGetTexLevelParameterfvRobustANGLE",
+    "glGetTexLevelParameterivRobustANGLE",
+    "glGetTexParameterfvRobustANGLE",
+    "glGetTexParameterivRobustANGLE",
+    "glGetUniformfvRobustANGLE",
+    "glGetUniformivRobustANGLE",
+    "glGetUniformuivRobustANGLE",
+    "glGetVertexAttribIivRobustANGLE",
+    "glGetVertexAttribIuivRobustANGLE",
+    "glGetVertexAttribPointervRobustANGLE",
+    "glGetVertexAttribfvRobustANGLE",
+    "glGetVertexAttribivRobustANGLE",
+    "glReadPixelsRobustANGLE",
+    "glSamplerParameterfvRobustANGLE",
+    "glSamplerParameterivRobustANGLE",
+    "glTexImage2DRobustANGLE",
+    "glTexImage3DRobustANGLE",
+    "glTexParameterfvRobustANGLE",
+    "glTexParameterivRobustANGLE",
+    "glTexSubImage2DRobustANGLE",
+    "glTexSubImage3DRobustANGLE"
+  ],
+  "GL_ANGLE_multi_draw": [
+    "glMultiDrawArraysANGLE",
+    "glMultiDrawArraysInstancedANGLE",
+    "glMultiDrawElementsANGLE",
+    "glMultiDrawElementsInstancedANGLE"
+  ],
+  "GL_ANGLE_base_vertex_base_instance": [
+    "glDrawArraysInstancedBaseInstanceANGLE",
+    "glDrawElementsInstancedBaseVertexBaseInstanceANGLE",
+    "glMultiDrawArraysInstancedBaseInstanceANGLE",
+    "glMultiDrawElementsInstancedBaseVertexBaseInstanceANGLE"
+  ],
+  "GL_ANGLE_polygon_mode": [
+    "glPolygonModeANGLE"
+  ],
+  "GL_ANGLE_provoking_vertex": [
+    "glProvokingVertexANGLE"
+  ],
+  "GL_ANGLE_get_tex_level_parameter": [
+    "glGetTexLevelParameterfvANGLE",
+    "glGetTexLevelParameterivANGLE"
+  ],
+  "EGL_KHR_fence_sync": [
+    "eglClientWaitSyncKHR",
+    "eglCreateSyncKHR",
+    "eglDestroySyncKHR",
+    "eglGetSyncAttribKHR"
+  ],
+  "EGL_KHR_wait_sync": [
+    "eglWaitSyncKHR"
+  ]
+}

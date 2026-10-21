@@ -1,0 +1,18 @@
+# 同一建置目錄只能有一個 Ninja 寫入者；cmake --build 也須共用此鎖。
+if(UNIX AND CMAKE_GENERATOR MATCHES "^Ninja")
+  set(X64ARM_NINJA_WRAPPER "${CMAKE_BINARY_DIR}/x64arm-ninja")
+  if(NOT CMAKE_MAKE_PROGRAM STREQUAL X64ARM_NINJA_WRAPPER)
+    set(X64ARM_NINJA_EXECUTABLE "${CMAKE_MAKE_PROGRAM}" CACHE FILEPATH "實際 Ninja 執行檔" FORCE)
+  endif()
+  if(NOT EXISTS "${X64ARM_NINJA_EXECUTABLE}")
+    message(FATAL_ERROR "找不到實際 Ninja：${X64ARM_NINJA_EXECUTABLE}")
+  endif()
+  # 路徑嵌入 Python 字串時保留空白、引號與反斜線。
+  foreach(name X64ARM_NINJA_EXECUTABLE CMAKE_CURRENT_LIST_DIR)
+    string(REPLACE "\\" "\\\\" ${name}_PY "${${name}}")
+    string(REPLACE "\"" "\\\"" ${name}_PY "${${name}_PY}")
+  endforeach()
+  configure_file("${CMAKE_CURRENT_LIST_DIR}/ninja_locked.py.in" "${X64ARM_NINJA_WRAPPER}" @ONLY)
+  file(CHMOD "${X64ARM_NINJA_WRAPPER}" PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+  set(CMAKE_MAKE_PROGRAM "${X64ARM_NINJA_WRAPPER}" CACHE FILEPATH "共用目錄鎖的 Ninja 入口" FORCE)
+endif()

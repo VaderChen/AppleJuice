@@ -1,0 +1,120 @@
+#pragma once
+#include <array>
+#include <span>
+#include <string_view>
+#include <cstdint>
+namespace x64arm::mf {
+using Guid=std::array<std::uint8_t,16>;
+enum Kind:unsigned {Attributes,Buffer,Sample,MediaType,Async,Event,Queue,Stream,Presentation,TypeHandler,Manager,Surface,Activate,TwoD,TwoD2,Transform,Generator,Shutdown,Source,MediaStream,Reader,Writer,ByteStream};
+constexpr Guid guid(std::uint32_t a,std::uint16_t b,std::uint16_t c,std::array<std::uint8_t,8> d){return {static_cast<std::uint8_t>(a),static_cast<std::uint8_t>(a>>8),static_cast<std::uint8_t>(a>>16),static_cast<std::uint8_t>(a>>24),static_cast<std::uint8_t>(b),static_cast<std::uint8_t>(b>>8),static_cast<std::uint8_t>(c),static_cast<std::uint8_t>(c>>8),d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7]};}
+constexpr Guid unknown=guid(0,0,0,{0xc0,0,0,0,0,0,0,0x46});
+constexpr Guid iid_Attributes=guid(0x2cd2d921,0xc447,0x44a7,{0xa1,0x3c,0x4a,0xda,0xbf,0xc2,0x47,0xe3});
+constexpr Guid iid_Buffer=guid(0x045fa593,0x8799,0x42b8,{0xbc,0x8d,0x89,0x68,0xc6,0x45,0x35,0x07});
+constexpr Guid iid_Sample=guid(0xc40a00f2,0xb93a,0x4d80,{0xae,0x8c,0x5a,0x1c,0x63,0x4f,0x58,0xe4});
+constexpr Guid iid_MediaType=guid(0x44ae0fa8,0xea31,0x4109,{0x8d,0x2e,0x4c,0xae,0x49,0x97,0xc5,0x55});
+constexpr Guid iid_Async=guid(0xac6b7889,0x0740,0x4d51,{0x86,0x19,0x90,0x59,0x94,0xa5,0x5c,0xc6});
+constexpr Guid iid_Event=guid(0xdf598932,0xf10c,0x4e39,{0xbb,0xa2,0xc3,0x08,0xf1,0x01,0xda,0xa3});
+constexpr Guid iid_Queue=guid(0x36f846fc,0x2256,0x48b6,{0xb5,0x8e,0xe2,0xb6,0x38,0x31,0x65,0x81});
+constexpr Guid iid_Stream=guid(0x56c03d9c,0x9dbb,0x45f5,{0xab,0x4b,0xd8,0x0f,0x47,0xc0,0x59,0x38});
+constexpr Guid iid_Presentation=guid(0x03cb2711,0x24d7,0x4db6,{0xa1,0x7f,0xf3,0xa7,0xa4,0x79,0xa5,0x36});
+constexpr Guid iid_TypeHandler=guid(0xe93dcf6c,0x4b07,0x4e1e,{0x81,0x23,0xaa,0x16,0xed,0x6e,0xad,0xf5});
+constexpr Guid iid_Manager=guid(0xeb533d5d,0x2db6,0x40f8,{0x97,0xa9,0x49,0x46,0x92,0x01,0x4f,0x07});
+constexpr Guid iid_Surface=guid(0xe7174cfa,0x1c9e,0x48b1,{0x88,0x66,0x62,0x62,0x26,0xbf,0xc2,0x58});
+constexpr Guid iid_Activate=guid(0x7fee9e9a,0x4a89,0x47a6,{0x89,0x9c,0xb6,0xa5,0x3a,0x70,0xfb,0x67});
+constexpr Guid MF_MT_MAJOR_TYPE=guid(0x48eba18e,0xf8c9,0x4687,{0xbf,0x11,0x0a,0x74,0xc9,0xf9,0x6a,0x8f});
+constexpr Guid MF_MT_SUBTYPE=guid(0xf7e34c9a,0x42e8,0x4714,{0xb7,0x4b,0xcb,0x29,0xd7,0x2c,0x35,0xe5});
+constexpr Guid MF_MT_AUDIO_NUM_CHANNELS=guid(0x37e48bf5,0x645e,0x4c5b,{0x89,0xde,0xad,0xa9,0xe2,0x9b,0x69,0x6a});
+constexpr Guid MF_MT_AUDIO_SAMPLES_PER_SECOND=guid(0x5faeeae7,0x0290,0x4c31,{0x9e,0x8a,0xc5,0x34,0xf6,0x8d,0x9d,0xba});
+constexpr Guid MF_MT_AUDIO_BLOCK_ALIGNMENT=guid(0x322de230,0x9eeb,0x43bd,{0xab,0x7a,0xff,0x41,0x22,0x51,0x54,0x1d});
+constexpr Guid MF_MT_AUDIO_AVG_BYTES_PER_SECOND=guid(0x1aab75c8,0xcfef,0x451c,{0xab,0x95,0xac,0x03,0x4b,0x8e,0x17,0x31});
+constexpr Guid MF_MT_AUDIO_BITS_PER_SAMPLE=guid(0xf2deb57f,0x40fa,0x4764,{0xaa,0x33,0xed,0x4f,0x2d,0x1f,0xf6,0x69});
+constexpr Guid MF_MT_AUDIO_CHANNEL_MASK=guid(0x55fb5765,0x644a,0x4caf,{0x84,0x79,0x93,0x89,0x83,0xbb,0x15,0x88});
+constexpr Guid MF_MT_COMPRESSED=guid(0x3afd0cee,0x18f2,0x4ba5,{0xa1,0x10,0x8b,0xea,0x50,0x2e,0x1f,0x92});
+constexpr Guid MFMediaType_Audio=guid(0x73647561,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71});
+constexpr Guid MF_MT_FIXED_SIZE_SAMPLES=guid(0xb8ebefaf,0xb718,0x4e04,{0xb0,0xa9,0x11,0x67,0x75,0xe3,0x32,0x1b});
+constexpr Guid MF_MT_SAMPLE_SIZE=guid(0xdad3ab78,0x1990,0x408b,{0xbc,0xe2,0xeb,0xa6,0x73,0xda,0xcc,0x10});
+constexpr Guid pcm=guid(1,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+constexpr Guid ieee=guid(3,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+struct Method {std::string_view name;unsigned args;std::uint32_t wide{},aggregate{},narrow{};};
+constexpr Method common[]={{"QueryInterface",3},{"AddRef",1},{"Release",1}};
+constexpr Method methods_Attributes[]={{"A_GetItem",3,0,0,0},{"A_GetItemType",3,0,0,0},{"A_CompareItem",4,0,0,0},{"A_Compare",4,0,0,4},{"A_GetUINT32",3,0,0,0},{"A_GetUINT64",3,0,0,0},{"A_GetDouble",3,0,0,0},{"A_GetGUID",3,0,0,0},{"A_GetStringLength",3,0,0,0},{"A_GetString",5,0,0,8},{"A_GetAllocatedString",4,0,0,0},{"A_GetBlobSize",3,0,0,0},{"A_GetBlob",5,0,0,8},{"A_GetAllocatedBlob",4,0,0,0},{"A_GetUnknown",4,0,0,0},{"A_SetItem",3,0,0,0},{"A_DeleteItem",2,0,0,0},{"A_DeleteAllItems",1,0,0,0},{"A_SetUINT32",3,0,0,4},{"A_SetUINT64",3,4,0,0},{"A_SetDouble",3,4,0,0},{"A_SetGUID",3,0,0,0},{"A_SetString",3,0,0,0},{"A_SetBlob",4,0,0,8},{"A_SetUnknown",3,0,0,0},{"A_LockStore",1,0,0,0},{"A_UnlockStore",1,0,0,0},{"A_GetCount",2,0,0,0},{"A_GetItemByIndex",4,0,0,2},{"A_CopyAllItems",2,0,0,0}};
+constexpr Method methods_Buffer[]={{"B_Lock",4,0,0,0},{"B_Unlock",1,0,0,0},{"B_GetCurrentLength",2,0,0,0},{"B_SetCurrentLength",2,0,0,2},{"B_GetMaxLength",2,0,0,0}};
+constexpr Method methods_Sample[]={{"S_GetSampleFlags",2,0,0,0},{"S_SetSampleFlags",2,0,0,2},{"S_GetSampleTime",2,0,0,0},{"S_SetSampleTime",2,2,0,0},{"S_GetSampleDuration",2,0,0,0},{"S_SetSampleDuration",2,2,0,0},{"S_GetBufferCount",2,0,0,0},{"S_GetBufferByIndex",3,0,0,2},{"S_ConvertToContiguousBuffer",2,0,0,0},{"S_AddBuffer",2,0,0,0},{"S_RemoveBufferByIndex",2,0,0,2},{"S_RemoveAllBuffers",1,0,0,0},{"S_GetTotalLength",2,0,0,0},{"S_CopyToBuffer",2,0,0,0}};
+constexpr Method methods_MediaType[]={{"T_GetMajorType",2,0,0,0},{"T_IsCompressedFormat",2,0,0,0},{"T_IsEqual",3,0,0,0},{"T_GetRepresentation",3,0,2,0},{"T_FreeRepresentation",3,0,2,0}};
+constexpr Method methods_Async[]={{"R_GetState",2,0,0,0},{"R_GetStatus",1,0,0,0},{"R_SetStatus",2,0,0,2},{"R_GetObject",2,0,0,0},{"R_GetStateNoAddRef",1,0,0,0}};
+constexpr Method methods_Event[]={{"E_GetType",2,0,0,0},{"E_GetExtendedType",2,0,0,0},{"E_GetStatus",2,0,0,0},{"E_GetValue",2,0,0,0}};
+constexpr Method methods_Queue[]={{"Q_GetEvent",3,0,0,2},{"Q_BeginGetEvent",3,0,0,0},{"Q_EndGetEvent",3,0,0,0},{"Q_QueueEvent",2,0,0,0},{"Q_QueueEventParamVar",5,0,0,10},{"Q_QueueEventParamUnk",5,0,0,10},{"Q_Shutdown",1,0,0,0}};
+constexpr Method methods_Stream[]={{"D_GetStreamIdentifier",2,0,0,0},{"D_GetMediaTypeHandler",2,0,0,0}};
+constexpr Method methods_Presentation[]={{"P_GetStreamDescriptorCount",2,0,0,0},{"P_GetStreamDescriptorByIndex",4,0,0,2},{"P_SelectStream",2,0,0,2},{"P_DeselectStream",2,0,0,2},{"P_Clone",2,0,0,0}};
+constexpr Method methods_TypeHandler[]={{"H_IsMediaTypeSupported",3,0,0,0},{"H_GetMediaTypeCount",2,0,0,0},{"H_GetMediaTypeByIndex",3,0,0,2},{"H_SetCurrentMediaType",2,0,0,0},{"H_GetCurrentMediaType",2,0,0,0},{"H_GetMajorType",2,0,0,0}};
+constexpr Method methods_Manager[]={{"G_CloseDeviceHandle",2,0,0,0},{"G_GetVideoService",4,0,0,0},{"G_LockDevice",5,0,0,16},{"G_OpenDeviceHandle",2,0,0,0},{"G_ResetDevice",3,0,0,4},{"G_TestDevice",2,0,0,0},{"G_UnlockDevice",3,0,0,4}};
+constexpr Method methods_Surface[]={{"X_GetResource",3,0,0,0},{"X_GetSubresourceIndex",2,0,0,0},{"X_GetUnknown",4,0,0,0},{"X_SetUnknown",3,0,0,0}};
+constexpr Method methods_Activate[]={{"V_ActivateObject",3,0,0,0},{"V_ShutdownObject",1,0,0,0},{"V_DetachObject",1,0,0,0}};
+constexpr Guid iid_TwoD=guid(0x7dc9d5f9,0x9ed9,0x44ec,{0x9b,0xbf,0x06,0x00,0xbb,0x58,0x9f,0xbb});
+constexpr Method methods_TwoD[]={{"Y_Lock2D",3,0,0,0},{"Y_Unlock2D",1,0,0,0},{"Y_GetScanline0AndPitch",3,0,0,0},{"Y_IsContiguousFormat",2,0,0,0},{"Y_GetContiguousLength",2,0,0,0},{"Y_ContiguousCopyTo",3,0,0,4},{"Y_ContiguousCopyFrom",3,0,0,4}};
+constexpr Guid iid_TwoD2=guid(0x33ae5ea6,0x4316,0x436f,{0x8d,0xdd,0xd7,0x3d,0x22,0xf8,0x29,0xec});
+constexpr Method methods_TwoD2[]={{"Y_Lock2D",3,0,0,0},{"Y_Unlock2D",1,0,0,0},{"Y_GetScanline0AndPitch",3,0,0,0},{"Y_IsContiguousFormat",2,0,0,0},{"Y_GetContiguousLength",2,0,0,0},{"Y_ContiguousCopyTo",3,0,0,4},{"Y_ContiguousCopyFrom",3,0,0,4},{"Y_Lock2DSize",6,0,0,2},{"Y_Copy2DTo",2,0,0,0}};
+constexpr Guid iid_Transform=guid(0xbf94c121,0x5b05,0x4e6f,{0x80,0x0,0xba,0x59,0x89,0x61,0x41,0x4d});
+constexpr Method methods_Transform[]={{"F_GetStreamLimits",5,0,0,0},{"F_GetStreamCount",3,0,0,0},{"F_GetStreamIDs",5,0,0,10},{"F_GetInputStreamInfo",3,0,0,2},{"F_GetOutputStreamInfo",3,0,0,2},{"F_GetAttributes",2,0,0,0},{"F_GetInputStreamAttributes",3,0,0,2},{"F_GetOutputStreamAttributes",3,0,0,2},{"F_DeleteInputStream",2,0,0,2},{"F_AddInputStreams",3,0,0,2},{"F_GetInputAvailableType",4,0,0,6},{"F_GetOutputAvailableType",4,0,0,6},{"F_SetInputType",4,0,0,10},{"F_SetOutputType",4,0,0,10},{"F_GetInputCurrentType",3,0,0,2},{"F_GetOutputCurrentType",3,0,0,2},{"F_GetInputStatus",3,0,0,2},{"F_GetOutputStatus",2,0,0,0},{"F_SetOutputBounds",3,6,0,0},{"F_ProcessEvent",3,0,0,2},{"F_ProcessMessage",3,0,0,2},{"F_ProcessInput",4,0,0,10},{"F_ProcessOutput",5,0,0,6}};
+constexpr Guid iid_Generator=guid(0x2cd0bd52,0xbcd5,0x4b89,{0xb6,0x2c,0xea,0xdc,0xc,0x3,0x1e,0x7d});
+constexpr Method methods_Generator[]={{"Q_GetEvent",3,0,0,2},{"Q_BeginGetEvent",3,0,0,0},{"Q_EndGetEvent",3,0,0,0},{"Q_QueueEventParamVar",5,0,0,10}};
+constexpr Guid iid_Shutdown=guid(0x97ec2ea4,0xe42,0x4937,{0x97,0xac,0x9d,0x6d,0x32,0x88,0x24,0xe1});
+constexpr Method methods_Shutdown[]={{"Z_Shutdown",1,0,0,0},{"Z_GetShutdownStatus",2,0,0,0}};
+constexpr Guid iid_Source=guid(0x279a808d,0xaec7,0x40c8,{0x9c,0x6b,0xa6,0xb4,0x92,0xc7,0x8a,0x66});
+constexpr Method methods_Source[]={{"Q_GetEvent",3,0,0,2},{"Q_BeginGetEvent",3,0,0,0},{"Q_EndGetEvent",3,0,0,0},{"Q_QueueEventParamVar",5,0,0,10},{"C_GetCharacteristics",2,0,0,0},{"C_CreatePresentationDescriptor",2,0,0,0},{"C_Start",4,0,0,0},{"C_Stop",1,0,0,0},{"C_Pause",1,0,0,0},{"C_Shutdown",1,0,0,0}};
+constexpr Guid iid_MediaStream=guid(0xd182108f,0x4ec6,0x443f,{0xaa,0x42,0xa7,0x11,0x6,0xec,0x82,0x5f});
+constexpr Method methods_MediaStream[]={{"Q_GetEvent",3,0,0,2},{"Q_BeginGetEvent",3,0,0,0},{"Q_EndGetEvent",3,0,0,0},{"Q_QueueEventParamVar",5,0,0,10},{"W_GetMediaSource",2,0,0,0},{"W_GetStreamDescriptor",2,0,0,0},{"W_RequestSample",2,0,0,0}};
+constexpr Guid iid_ByteStream=guid(0xad4c1b00,0x4bf7,0x422f,{0x91,0x75,0x75,0x66,0x93,0xd9,0x13,0x0d});
+constexpr Method methods_ByteStream[]={{"J_GetCapabilities",2},{"J_GetLength",2},{"J_SetLength",2,2},{"J_GetCurrentPosition",2},{"J_SetCurrentPosition",2,2},{"J_IsEndOfStream",2},{"J_Read",4,0,0,4},{"J_BeginRead",5,0,0,4},{"J_EndRead",3},{"J_Write",4,0,0,4},{"J_BeginWrite",5,0,0,4},{"J_EndWrite",3},{"J_Seek",5,4,0,10},{"J_Flush",1},{"J_Close",1}};
+constexpr Guid iid_Writer=guid(0x3137f1cd,0xfe5e,0x4805,{0xa5,0xd8,0xfb,0x47,0x74,0x48,0xcb,0x3d});
+constexpr Guid MF_TRANSCODE_CONTAINERTYPE=guid(0x150ff23f,0x4abc,0x478b,{0xac,0x4f,0xe1,0x91,0x6f,0xba,0x1c,0xca});
+constexpr Guid MFTranscodeContainerType_WAVE=guid(0x64c3453c,0x0f26,0x4741,{0xbe,0x63,0x87,0xbd,0xf8,0xbb,0x93,0x5b});
+constexpr Guid MFTranscodeContainerType_MPEG4=guid(0xdc6cd05d,0xb9d0,0x40ef,{0xbd,0x35,0xfa,0x62,0x2c,0x1a,0xb2,0x8a});
+constexpr Guid MF_SINK_WRITER_ASYNC_CALLBACK=guid(0x48cb183e,0x7b0b,0x46f4,{0x82,0x2e,0x5e,0x1d,0x2d,0xda,0x43,0x54});
+constexpr Method methods_Writer[]={{"I_AddStream",3},{"I_SetInputMediaType",4,0,0,2},{"I_BeginWriting",1},{"I_WriteSample",3,0,0,2},{"I_SendStreamTick",3,4,0,2},{"I_PlaceMarker",3,0,0,2},{"I_NotifyEndOfSegment",2,0,0,2},{"I_Flush",2,0,0,2},{"I_Finalize",1},{"I_GetServiceForStream",5,0,0,2},{"I_GetStatistics",3,0,0,2}};
+constexpr Guid iid_Reader=guid(0x70ae66f2,0xc809,0x4e4f,{0x89,0x15,0xbd,0xcb,0x40,0x6b,0x79,0x93});
+constexpr Method methods_Reader[]={{"L_GetStreamSelection",3,0,0,2},{"L_SetStreamSelection",3,0,0,6},{"L_GetNativeMediaType",4,0,0,6},{"L_GetCurrentMediaType",3,0,0,2},{"L_SetCurrentMediaType",4,0,0,2},{"L_SetCurrentPosition",3,0,0,0},{"L_ReadSample",7,0,0,6},{"L_Flush",2,0,0,2},{"L_GetServiceForStream",5,0,0,2},{"L_GetPresentationAttribute",4,0,0,2}};
+constexpr Guid MFMediaType_Video=guid(0x73646976,0x0,0x10,{0x80,0x0,0x0,0xaa,0x0,0x38,0x9b,0x71});
+constexpr Guid MFT_CATEGORY_VIDEO_DECODER=guid(0xd6c02d4b,0x6833,0x45b4,{0x97,0x1a,0x5,0xa4,0xb0,0x4b,0xab,0x91});
+constexpr Guid MF_MT_FRAME_SIZE=guid(0x1652c33d,0xd6b2,0x4012,{0xb8,0x34,0x72,0x3,0x8,0x49,0xa3,0x7d});
+constexpr Guid MF_MT_FRAME_RATE=guid(0xc459a2e8,0x3d2c,0x4e44,{0xb1,0x32,0xfe,0xe5,0x15,0x6c,0x7b,0xb0});
+constexpr Guid MF_MT_DEFAULT_STRIDE=guid(0x644b4e48,0x1e02,0x4516,{0xb0,0xeb,0xc0,0x1c,0xa9,0xd4,0x9a,0xc6});
+constexpr Guid MF_MT_MPEG_SEQUENCE_HEADER=guid(0x3c036de7,0x3ad0,0x4c9e,{0x92,0x16,0xee,0x6d,0x6a,0xc2,0x1c,0xb3});
+constexpr Guid MF_TRANSFORM_ASYNC=guid(0xf81a699a,0x649a,0x497d,{0x8c,0x73,0x29,0xf8,0xfe,0xd6,0xad,0x7a});
+constexpr Guid MF_TRANSFORM_ASYNC_UNLOCK=guid(0xe5666d6b,0x3422,0x4eb6,{0xa4,0x21,0xda,0x7d,0xb1,0xf8,0xe2,0x7});
+constexpr Guid MFT_TRANSFORM_CLSID_Attribute=guid(0x6821c42b,0x65a4,0x4e82,{0x99,0xbc,0x9a,0x88,0x20,0x5e,0xcd,0xc});
+constexpr Guid MFT_FRIENDLY_NAME_Attribute=guid(0x314ffbae,0x5b41,0x4c95,{0x9c,0x19,0x4e,0x7d,0x58,0x6f,0xac,0xe3});
+constexpr Guid MFT_INPUT_TYPES_Attributes=guid(0x4276c9b1,0x759d,0x4bf3,{0x9c,0xd0,0xd,0x72,0x3d,0x13,0x8f,0x96});
+constexpr Guid MFT_OUTPUT_TYPES_Attributes=guid(0x8eae8cf3,0xa44f,0x4306,{0xba,0x5c,0xbf,0x5d,0xda,0x24,0x28,0x18});
+constexpr Guid MFT_ENUM_HARDWARE_URL_Attribute=guid(0x2fb866ac,0xb078,0x4942,{0xab,0x6c,0x0,0x3d,0x5,0xcd,0xa6,0x74});
+constexpr Guid MFT_ENUM_HARDWARE_VENDOR_ID_Attribute=guid(0x3aecb0cc,0x35b,0x4bcc,{0x81,0x85,0x2b,0x8d,0x55,0x1e,0xf3,0xaf});
+constexpr Guid MF_EVENT_MFT_INPUT_STREAM_ID=guid(0xf29c2cca,0x7ae6,0x42d2,{0xb2,0x84,0xbf,0x83,0x7c,0xc8,0x74,0xe2});
+constexpr Guid MF_EVENT_MFT_CONTEXT=guid(0xb7cd31f1,0x899e,0x4b41,{0x80,0xc9,0x26,0xa8,0x96,0xd3,0x29,0x77});
+constexpr Guid MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE=guid(0xc60ac5fe,0x252a,0x478f,{0xa0,0xef,0xbc,0x8f,0xa5,0xf7,0xca,0xd3});
+constexpr Guid MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID=guid(0x14dd9a1c,0x7cff,0x41be,{0xb1,0xb9,0xba,0x1a,0xc6,0xec,0xb5,0x71});
+constexpr Guid MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID=guid(0x8ac3587a,0x4ae7,0x42d8,{0x99,0xe0,0xa,0x60,0x13,0xee,0xf9,0xf});
+constexpr Guid MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ENDPOINT_ID=guid(0x30da9258,0xfeb9,0x47a7,{0xa4,0x53,0x76,0x3a,0x7a,0x8e,0x1c,0x5f});
+constexpr Guid MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ROLE=guid(0xbc9d118e,0x8c67,0x4a18,{0x85,0xd4,0x12,0xd3,0x0,0x40,0x5,0x52});
+constexpr Guid MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME=guid(0x60d0e559,0x52f8,0x4fa2,{0xbb,0xce,0xac,0xdb,0x34,0xa8,0xec,0x1});
+constexpr Guid MF_DEVSOURCE_ATTRIBUTE_MEDIA_TYPE=guid(0x56a819ca,0xc78,0x4de4,{0xa0,0xa7,0x3d,0xda,0xba,0xf,0x24,0xd4});
+constexpr Guid MF_SOURCE_READER_ASYNC_CALLBACK=guid(0x1e3dbeac,0xbb43,0x4c35,{0xb5,0x7,0xcd,0x64,0x44,0x64,0xc9,0x65});
+constexpr Guid MF_SOURCE_READER_DISCONNECT_MEDIASOURCE_ON_SHUTDOWN=guid(0x56b67165,0x219e,0x456d,{0xa2,0x2e,0x2d,0x30,0x4,0xc7,0xfe,0x56});
+constexpr Guid MF_SOURCE_READER_MEDIASOURCE_CHARACTERISTICS=guid(0x6d23f5c8,0xc5d7,0x4a9b,{0x99,0x71,0x5d,0x11,0xf8,0xbc,0xa8,0x80});
+constexpr Guid MFSampleExtension_Token=guid(0x8294da66,0xf328,0x4805,{0xb5,0x51,0x0,0xde,0xb4,0xc5,0x7a,0x61});
+constexpr Guid MFSampleExtension_Discontinuity=guid(0x9cdf01d9,0xa0f0,0x43ba,{0xb0,0x77,0xea,0xa0,0x6c,0xbd,0x72,0x8a});
+constexpr Guid h264=guid(0x34363248,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+constexpr Guid nv12=guid(0x3231564e,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+constexpr Guid MFT_CATEGORY_VIDEO_ENCODER=guid(0xf79eac7d,0xe545,0x4387,{0xbd,0xee,0xd6,0x47,0xd7,0xbd,0xe4,0x2a});
+constexpr Guid MF_MT_AVG_BITRATE=guid(0x20332624,0xfb0d,0x4d9e,{0xbd,0x0d,0xcb,0xf6,0x78,0x6c,0x10,0x2e});
+constexpr Guid MF_MT_INTERLACE_MODE=guid(0xe2724bb8,0xe676,0x4806,{0xb4,0xb2,0xa8,0xd6,0xef,0xb4,0x4c,0xcd});
+constexpr Guid MF_MT_MPEG2_PROFILE=guid(0xad76a80b,0x2d5c,0x4e0b,{0xb3,0x75,0x64,0xe5,0x20,0x13,0x70,0x36});
+constexpr Guid MF_MT_MPEG2_LEVEL=guid(0x96f66574,0x11c5,0x4015,{0x86,0x66,0xbf,0xf5,0x16,0x43,0x6d,0xa7});
+constexpr Guid MF_MT_PIXEL_ASPECT_RATIO=guid(0xc6376a1e,0x8d0a,0x4027,{0xbe,0x45,0x6d,0x9a,0x0a,0xd3,0x9b,0xb6});
+constexpr Guid MFSampleExtension_CleanPoint=guid(0x9cdf01d8,0xa0f0,0x43ba,{0xb0,0x77,0xea,0xa0,0x6c,0xbd,0x72,0x8a});
+constexpr Guid MFSampleExtension_DecodeTimestamp=guid(0x73a954d4,0x9e2,0x4861,{0xbe,0xfc,0x94,0xbd,0x97,0xc0,0x8e,0x6e});
+constexpr Guid native_h264_encoder=guid(0x8a33afc7,0x18db,0x4b95,{0xaa,0x51,0x40,0xb4,0x68,0xe9,0x12,0x8a});
+constexpr Guid native_h264=guid(0x189f281a,0xad94,0x4bf7,{0xb4,0x45,0x3a,0xda,0x7e,0x9d,0x43,0xcb});
+inline bool attributes(Kind k){return k==Attributes || k==Sample || k==MediaType || k==Event || k==Stream || k==Presentation || k==Activate;}
+inline std::span<const Method> methods(Kind k){switch(k){case ByteStream:return methods_ByteStream;case Writer:return methods_Writer;case Reader:return methods_Reader;case MediaStream:return methods_MediaStream;case Source:return methods_Source;case Shutdown:return methods_Shutdown;case Generator:return methods_Generator;case Transform:return methods_Transform;case TwoD:return methods_TwoD;case TwoD2:return methods_TwoD2;case Attributes:return methods_Attributes;case Buffer:return methods_Buffer;case Sample:return methods_Sample;case MediaType:return methods_MediaType;case Async:return methods_Async;case Event:return methods_Event;case Queue:return methods_Queue;case Stream:return methods_Stream;case Presentation:return methods_Presentation;case TypeHandler:return methods_TypeHandler;case Manager:return methods_Manager;case Surface:return methods_Surface;case Activate:return methods_Activate;}return {};}
+inline Guid iid(Kind k){switch(k){case ByteStream:return iid_ByteStream;case Writer:return iid_Writer;case Reader:return iid_Reader;case MediaStream:return iid_MediaStream;case Source:return iid_Source;case Shutdown:return iid_Shutdown;case Generator:return iid_Generator;case Transform:return iid_Transform;case TwoD:return iid_TwoD;case TwoD2:return iid_TwoD2;case Attributes:return iid_Attributes;case Buffer:return iid_Buffer;case Sample:return iid_Sample;case MediaType:return iid_MediaType;case Async:return iid_Async;case Event:return iid_Event;case Queue:return iid_Queue;case Stream:return iid_Stream;case Presentation:return iid_Presentation;case TypeHandler:return iid_TypeHandler;case Manager:return iid_Manager;case Surface:return iid_Surface;case Activate:return iid_Activate;}return {};}
+}

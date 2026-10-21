@@ -1,0 +1,11 @@
+Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+
+Developed at SunSoft, a Sun Microsystems, Inc. business.
+Permission to use, copy, modify, and distribute this
+software is freely granted, provided that this notice
+is preserved.
+
+來源：https://netlib.org/fdlibm/s_atan.c
+      https://netlib.org/fdlibm/e_atan2.c
+      https://netlib.org/fdlibm/e_acos.c
+用途：resident atan／atan2／acos 原生配方的約化公式與係數。

@@ -1,0 +1,31 @@
+# 固定 Microsoft UVAtlas 版本，沿用共用 DirectXMath／Headers；不啟用 OpenMP。
+FetchContent_Declare(uvatlas
+  URL "${PROJECT_SOURCE_DIR}/third_party/uvatlas-3a7eaed.tar.gz"
+  URL_HASH SHA256=ce1fd047e7c2fe6a1eab703a5dd5b4803feb9d28b8a9b29a08a2848c19e5bc01
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR x64arm-do-not-add)
+FetchContent_MakeAvailable(uvatlas)
+# libc++ 不允許在 Edge／Vertex／Face 完整定義前實例化 vector 索引；僅延後方法定義。
+set(X64ARM_UVATLAS_TYPES "${uvatlas_SOURCE_DIR}/UVAtlas/geodesics/datatypes.h")
+file(READ "${X64ARM_UVATLAS_TYPES}" X64ARM_UVATLAS_TYPES_TEXT)
+if(NOT X64ARM_UVATLAS_TYPES_TEXT MATCHES "x64arm: complete geodesic types")
+  string(REPLACE "\r\n" "\n" X64ARM_UVATLAS_TYPES_TEXT "${X64ARM_UVATLAS_TYPES_TEXT}")
+  set(X64ARM_UVATLAS_LATE_DEFINITIONS "\n// x64arm: complete geodesic types\nnamespace GeodesicDist {\n")
+  foreach(method SetEdgeIdx SetPseuSrcVertexIdx SetMarkFromEdgeVertexIdx SetFaceIdxPropagatedFrom)
+    string(REGEX MATCH "void ${method}\\([^)]*\\)[ \n]*\\{[^}]*\\}" body "${X64ARM_UVATLAS_TYPES_TEXT}")
+    if(NOT body)
+      message(FATAL_ERROR "UVAtlas 完整型別修補找不到 ${method}")
+    endif()
+    string(REGEX REPLACE "[ \n]*\\{[^}]*\\}" ";" declaration "${body}")
+    string(REPLACE "${body}" "${declaration}" X64ARM_UVATLAS_TYPES_TEXT "${X64ARM_UVATLAS_TYPES_TEXT}")
+    string(REPLACE "void ${method}" "inline void EdgeWindow::${method}" definition "${body}")
+    string(APPEND X64ARM_UVATLAS_LATE_DEFINITIONS "${definition}\n")
+  endforeach()
+  string(APPEND X64ARM_UVATLAS_TYPES_TEXT "${X64ARM_UVATLAS_LATE_DEFINITIONS}}\n")
+  file(WRITE "${X64ARM_UVATLAS_TYPES}" "${X64ARM_UVATLAS_TYPES_TEXT}")
+endif()
+file(GLOB X64ARM_UVATLAS_SOURCES "${uvatlas_SOURCE_DIR}/UVAtlas/geodesics/*.cpp" "${uvatlas_SOURCE_DIR}/UVAtlas/isochart/*.cpp")
+add_library(x64arm_uvatlas STATIC ${X64ARM_UVATLAS_SOURCES} "${PROJECT_SOURCE_DIR}/src/services/d3dx_atlas.cpp")
+target_include_directories(x64arm_uvatlas SYSTEM PRIVATE "${uvatlas_SOURCE_DIR}/UVAtlas/inc")
+target_include_directories(x64arm_uvatlas SYSTEM PRIVATE "${uvatlas_SOURCE_DIR}/UVAtlas" "${uvatlas_SOURCE_DIR}/UVAtlas/geodesics" "${uvatlas_SOURCE_DIR}/UVAtlas/isochart")
+target_link_libraries(x64arm_uvatlas PRIVATE x64arm_directxtex)
+target_compile_features(x64arm_uvatlas PRIVATE cxx_std_20)
