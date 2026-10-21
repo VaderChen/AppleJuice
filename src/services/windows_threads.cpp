@@ -686,9 +686,13 @@ void WindowsServices::after_instructions(GuestState &state, GuestMemory &memory,
     const bool resident=resident_execution_depth_!=0;
     const bool clock_slice=!resident && runtime_.host_clock && clock_scheduled_slices();
     if(!resident && !clock_slice)threads_.remaining = count >= threads_.remaining ? 0 : threads_.remaining - count;
-    // 正常 AOT 的排程只在已存在的服務／語義邊界輪替，不設定或檢查時間片。
-    // 純原生迴圈不呼叫這裡；精確觀察與舊 JIT 保留原計量排程。
-    if (threads_.yield || (resident?threads_.items.size()>1:
+    // 正常 AOT 的排程只在已存在的服務／語義邊界輪替；純原生迴圈不呼叫這裡，熱迴圈不檢查配額或時間。
+    // 多執行緒時不在每個邊界都做完整排程與外部事件輪詢，改在宿主時鐘時間片（與計量模式相同的
+    // 2 ms×優先序）到期或明確 yield 時輪替。retired() 對小批次延後同步時鐘，這裡直接讀單調時鐘；
+    // 尚未設定截止點（UINT64_MAX）視為到期，由 schedule 建立。精確觀察與舊 JIT 保留原計量排程。
+    const bool resident_due=resident && threads_.items.size()>1 &&
+        (threads_.slice_deadline==UINT64_MAX || detail::monotonic_ticks()>=threads_.slice_deadline);
+    if (threads_.yield || (resident?resident_due:
         ((!clock_slice && !threads_.remaining) ||
          (runtime_.host_clock && runtime_.clock_ticks >= threads_.slice_deadline)))) {
         // 指令退休後 TEB 才是客體的最新值；直接寫入不能被 schedule 的
@@ -1528,9 +1532,11 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
             // 一般優先序以 2 ms 作為到期門檻；仍按優先序加權。retired 及 API 入口共用單調時鐘，
             // 大原生批次返回後即讓出到期切片，慢直譯也不能只等長指令預算耗盡。
             const auto span = UINT64_C(2500) * static_cast<unsigned>(priority);
-            threads_.slice_deadline = resident_execution_depth_?0:
-                                      runtime_.host_clock && runtime_.clock_ticks <= UINT64_MAX - span
-                                          ? runtime_.clock_ticks + span
+            // 常駐執行也使用同一時間片：只在服務／語義邊界比較，不進入生成碼。常駐模式的
+            // clock_ticks 可能尚未同步，直接以單調時鐘起算；溢位時保留 UINT64_MAX（下次邊界即到期）。
+            const auto slice_start = resident_execution_depth_ ? detail::monotonic_ticks() : runtime_.clock_ticks;
+            threads_.slice_deadline = runtime_.host_clock && slice_start <= UINT64_MAX - span - 1
+                                          ? slice_start + span
                                           : UINT64_MAX;
             target.dynamic_priority_boost = 0;
             threads_.yield = false;

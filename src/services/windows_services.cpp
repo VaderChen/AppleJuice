@@ -902,6 +902,10 @@ unsigned WindowsServices::runtime_compute_boundary(GuestAddress address) const n
             "EnterCriticalSection","TryEnterCriticalSection","LeaveCriticalSection","WakeConditionVariable","WakeAllConditionVariable"};
         static const bool time_boundary=[] {const auto* setting=std::getenv("X64ARM_TIME_BOUNDARY");return !setting || std::string_view(setting)!="0";}();
         constexpr std::array time_operations{"QueryPerformanceCounter","QueryPerformanceFrequency","GetSystemTimeAsFileTime","GetTickCount"};
+        static const bool resident_compute=[] {const auto* setting=std::getenv("X64ARM_RESIDENT_COMPUTE_SERVICES");return !setting || std::string_view(setting)!="0";}();
+        constexpr std::array once_operations{"InitOnceInitialize","InitOnceBeginInitialize","InitOnceComplete","InitOnceExecuteOnce"};
+        constexpr std::array extended_time_operations{"GetTickCount64","GetSystemTimePreciseAsFileTime",
+            "QueryUnbiasedInterruptTime","QueryUnbiasedInterruptTimePrecise"};
         static const bool fls_boundary=[] {const auto* setting=std::getenv("X64ARM_FLS_BOUNDARY");return !setting || std::string_view(setting)!="0";}();
         static const bool crt_compute=[] {const auto* setting=std::getenv("X64ARM_CRT_COMPUTE_BOUNDARY");return !setting || std::string_view(setting)!="0";}();
         constexpr std::array compute_operations{"sprintf","vsprintf","sprintf_s","vsprintf_s","swprintf_s","vswprintf_s",
@@ -910,6 +914,8 @@ unsigned WindowsServices::runtime_compute_boundary(GuestAddress address) const n
             "__stdio_common_vsprintf","__stdio_common_vsprintf_s","__stdio_common_vsnprintf_s","__stdio_common_vsprintf_p",
             "__stdio_common_vswprintf","__stdio_common_vswprintf_s","__stdio_common_vsnwprintf_s","__stdio_common_vswprintf_p",
             "strtod","strtof","strtol","strtoul","strtoll","strtoull","_strtoi64","_strtoui64",
+            "wcstod","wcstof","wcstol","wcstoul","wcstoll","wcstoull","_wcstoi64","_wcstoui64"};
+        constexpr std::array conversion_operations{"strtod","strtof","strtol","strtoul","strtoll","strtoull","_strtoi64","_strtoui64",
             "wcstod","wcstof","wcstol","wcstoul","wcstoll","wcstoull","_wcstoi64","_wcstoui64"};
         std::vector<std::uint8_t> result(runtime_table.size());
         for(std::size_t index=0;index<runtime_table.size();++index){
@@ -928,7 +934,14 @@ unsigned WindowsServices::runtime_compute_boundary(GuestAddress address) const n
                     std::find(cs_operations.begin(),cs_operations.end(),descriptor.symbol)!=cs_operations.end())result[index]=4;
             // 計時查詢只需要入口的時鐘同步（machine clock 準備與 retired），不需 GUI 資源、HTTP 輪詢等其餘前置處理。
             else if(time_boundary && descriptor.family=="kernel32.dll" &&
-                    std::find(time_operations.begin(),time_operations.end(),descriptor.symbol)!=time_operations.end())result[index]=9;
+                    (std::find(time_operations.begin(),time_operations.end(),descriptor.symbol)!=time_operations.end() ||
+                     (resident_compute && std::find(extended_time_operations.begin(),extended_time_operations.end(),descriptor.symbol)!=extended_time_operations.end())))result[index]=9;
+            else if(time_boundary && resident_compute && descriptor.family=="kernel32.dll" &&
+                    (descriptor.symbol=="GetSystemTime" || descriptor.symbol=="GetLocalTime"))result[index]=11;
+            // once 的競爭與回呼仍由原 provider 更新 context／epoch；完整狀態邊界
+            // 可直接續行成功查詢，也可將等待、回呼或映射變更交回既有協調流程。
+            else if(resident_compute && descriptor.family=="kernel32.dll" &&
+                    std::find(once_operations.begin(),once_operations.end(),descriptor.symbol)!=once_operations.end())result[index]=4;
             // FLS 取值／設值只讀寫目前執行緒的 FLS 陣列，與 TLS 同屬執行緒邊界；FlsAlloc／FlsFree 涉及回呼仍走完整入口。
             else if(fls_boundary && descriptor.family=="kernel32.dll" &&
                     (descriptor.symbol=="FlsGetValue" || descriptor.symbol=="FlsGetValue2" || descriptor.symbol=="FlsSetValue"))result[index]=4;
@@ -938,13 +951,16 @@ unsigned WindowsServices::runtime_compute_boundary(GuestAddress address) const n
                     std::find(allocation_operations.begin(),allocation_operations.end(),descriptor.symbol)!=allocation_operations.end())result[index]=6;
             else if(crt_character_operation(descriptor))result[index]=7;
             // 寫入緩衝區的格式化與字串轉數值：只讀寫客體記憶體、errno 與 invalid-parameter 回呼，
-            // 不碰 LastError、GUI、I/O 或排程；不進常駐路徑，只略過完整 OS 入口的前後處理。
+            // 不碰 LastError、GUI、I/O 或排程；轉換家族另列 10，沿用同一 provider。
+            // 格式化的完整 FP 常駐邊界已有實測退步，先保留既有入口並最佳化服務本體。
             else if(crt_compute && descriptor.family=="crt" &&
-                    std::find(compute_operations.begin(),compute_operations.end(),descriptor.symbol)!=compute_operations.end())result[index]=8;
+                    std::find(compute_operations.begin(),compute_operations.end(),descriptor.symbol)!=compute_operations.end())
+                result[index]=std::find(conversion_operations.begin(),conversion_operations.end(),descriptor.symbol)!=conversion_operations.end()?10:8;
         }
         return result;
     }();
-    return classes[(address.value-runtime_begin)/16];
+    const auto boundary=classes[(address.value-runtime_begin)/16];
+    return x86_ && boundary==10?8:boundary;
 }
 bool WindowsServices::x86_heap_compute_boundary(GuestAddress address) const noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_X86_HEAP_BOUNDARY");
@@ -967,6 +983,30 @@ bool WindowsServices::resident_service(GuestAddress address) const noexcept {
         return enabled;
     }
     const auto boundary=runtime_compute_boundary(address);
+    // 程序期間固定的家族政策與開關一次物化；共用一個初始化守衛。
+    // 一般呼叫直接索引，動態資格仍在上方逐次核對。
+    static const auto policies=[] {
+        const auto enabled=[](const char* name){const auto* value=std::getenv(name);return !value || std::string_view(value)!="0";};
+        struct Policies {std::array<bool,12> classes{};bool indexed{};};
+        Policies policy;
+        policy.indexed=enabled("X64ARM_RESIDENT_COMPUTE_SERVICES");
+        if(!policy.indexed)return policy;
+        auto& result=policy.classes;
+        result[1]=enabled("X64ARM_CRT_MEMORY");
+        result[2]=enabled("X64ARM_CRT_STRINGS");
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_HOST_FP
+        result[3]=scalar_math_requested();
+#endif
+        result[4]=enabled("X64ARM_THREAD_BOUNDARY");
+        result[5]=enabled("X64ARM_IDENTITY_BOUNDARY");
+        result[6]=enabled("X64ARM_ALLOCATION_BOUNDARY");
+        result[7]=crt_character_requested();
+        // 0 與固定 Heap／格式化類別 8 保持關閉；9～11 只可能來自
+        // 已通過位址、對齊及 descriptor 範圍檢查的延伸表。
+        result[9]=result[10]=result[11]=true;
+        return policy;
+    }();
+    if(policies.indexed)return boundary<policies.classes.size() && policies.classes[boundary];
     if(boundary==1){
         static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_CRT_MEMORY");return !setting || std::string_view(setting)!="0";}();
         return enabled;
@@ -998,7 +1038,9 @@ bool WindowsServices::resident_service(GuestAddress address) const noexcept {
 bool WindowsServices::resident_service_host_fp(GuestAddress address) const noexcept {
     const auto boundary=runtime_compute_boundary(address);
     // 非 C locale 可進入 ICU；沿用 SDK 的宿主 FP 邊界，不假設外部函式完全不碰浮點環境。
-    return boundary==3 || boundary==7;
+    // 數值轉換自行套用客體捨入模式，日期轉換會進宿主 libc，沿用完整 FP 邊界。
+    // 純整數的 counter／tick／FILETIME 查詢不切換 FPCR，也不重建客體 FP 核准狀態。
+    return boundary==3 || boundary==7 || (!x86_ && (boundary==10 || boundary==11));
 }
 #endif
 #ifdef X64ARM_HOST_SERVICES_MANAGED_FP
@@ -1177,8 +1219,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
         static const bool thread_boundary=[] {const auto* setting=std::getenv("X64ARM_THREAD_BOUNDARY");return !setting || std::string_view(setting)!="0";}();
         static const bool identity_boundary=[] {const auto* setting=std::getenv("X64ARM_IDENTITY_BOUNDARY");return !setting || std::string_view(setting)!="0";}();
         static const bool allocation_boundary=[] {const auto* setting=std::getenv("X64ARM_ALLOCATION_BOUNDARY");return !setting || std::string_view(setting)!="0";}();
-        if((thread_boundary && boundary==4) || (identity_boundary && boundary==5) || (allocation_boundary && boundary==6) || boundary==8 || boundary==9){
-            if(boundary==9){prepare_machine_clock();if(runtime_.host_clock)retired(memory,0);}
+        if((thread_boundary && boundary==4) || (identity_boundary && boundary==5) || (allocation_boundary && boundary==6) || boundary==8 || boundary==9 || boundary==10 || boundary==11){
+            if(boundary==9 || boundary==11){prepare_machine_clock();if(runtime_.host_clock)retired(memory,0);}
             // 與完整入口相同：另一執行緒持有 HeapLock 時，共用 process heap 的 CRT 配置先等待。
             if(boundary==6 && await_heap_service(state,memory,descriptor))return std::nullopt;
             // TLS／SRW、身分查詢與 CRT 配置只操作程序內的狀態。

@@ -1684,6 +1684,7 @@ private:
     std::uint64_t write_crt_stream(GuestMemory& memory, std::uint64_t stream, std::span<const std::uint8_t> bytes);
     std::uint64_t write_crt_wide_stream(GuestState&,GuestMemory&, std::uint64_t stream, std::u16string_view text);
     std::optional<std::uint32_t> invoke_runtime(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_crt_format(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,const WindowsCall&);
     // 純計算 CRT 邊界：0=非此類，1=記憶體操作，2=字串操作；依 stub 位址直接索引預先分類的表。
     unsigned runtime_compute_boundary(GuestAddress address) const noexcept;
     bool x86_heap_compute_boundary(GuestAddress address) const noexcept;

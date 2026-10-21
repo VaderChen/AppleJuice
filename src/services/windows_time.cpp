@@ -151,6 +151,18 @@ void write_system_time(GuestMemory& memory,std::uint64_t address,const std::tm& 
 }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    // 入口已同步共享時鐘。這組只做整數運算及客體讀寫，不依賴宿主浮點環境。
+    // 原通用 provider 仍供關閉政策時對照；ABI、返回寬度及故障順序一致。
+    if(service.symbol=="QueryPerformanceCounter" || service.symbol=="QueryPerformanceFrequency" ||
+       service.symbol=="GetSystemTimeAsFileTime" || service.symbol=="GetTickCount"){
+        const WindowsCall call(state,memory,service);std::uint64_t result=0;
+        if(service.symbol=="QueryPerformanceCounter" || service.symbol=="QueryPerformanceFrequency"){
+            memory.store(GuestAddress{call(0)},64,service.symbol=="QueryPerformanceFrequency"?10000000:runtime_.clock_ticks);
+            result=1;
+        }else if(service.symbol=="GetSystemTimeAsFileTime")memory.store(GuestAddress{call(0)},64,runtime_.system_filetime());
+        else result=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
+        call.return_to(state,result);return std::nullopt;
+    }
     if(service.symbol=="SetSystemTime" || service.symbol=="GetSystemTimeAdjustment" || service.symbol=="SetSystemTimeAdjustment"){
         const WindowsCall call(state,memory,service);
         const auto finish=[&](unsigned value,unsigned error=0){if(error)last_error_=error;call.return_to(state,value);return std::optional<std::uint32_t>{};};
