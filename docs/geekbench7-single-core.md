@@ -133,7 +133,7 @@ cp "$SANDBOX_C/geekbench-single-core.json" "$RESULTS/applejuice.json"
 
 `--memory-limit-mib` 由 Launcher 自動設為 8192 與宿主實體記憶體一半兩者中較小的值。宿主記憶體為 16 GB 以上時是 8192，請依自己的機器調整。
 
-直接使用 `x64arm` 命令列時，不要省略 `--max-instructions` 與 `--memory-limit-mib`。命令列的預設指令預算是 10,000,000 條，記憶體上限是 1024 MiB，只適合短程測試。Geekbench 連 `--workload-list` 都會在預設預算內耗盡而停止。
+以上命令明確固定執行模式與記憶體上限。正常 resident AOT 搭配宿主時計時，預設已沒有指令配額或時間片；明確指定有限 `--max-instructions` 時會使用獨立觀察模式，其他執行模式仍保留原有配額。命令列預設記憶體上限為 1024 MiB，執行 Geekbench 時仍應依範例指定足夠容量。
 
 ## 6. macOS 原生與 Rosetta 2 對照
 

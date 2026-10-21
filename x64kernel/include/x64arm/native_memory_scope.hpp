@@ -17,6 +17,8 @@ public:
     ~NativeMemoryScope(){if(active_)leave();}
     static std::uint64_t fault_count() noexcept;
     static std::uintptr_t take_fault_pc() noexcept;
+    // 僅能在狀態已物化、原生返回配對已清空的穩定控制邊界呼叫。
+    void rebind(const JitMemory*,const GuestMemory&) noexcept;
     NativeMemoryScope(const NativeMemoryScope&)=delete;
     NativeMemoryScope& operator=(const NativeMemoryScope&)=delete;
 private:

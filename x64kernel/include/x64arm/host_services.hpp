@@ -21,6 +21,7 @@
 #define X64ARM_HOST_SERVICES_TRANSLATION_REGION 1
 #define X64ARM_HOST_SERVICES_TRANSLATION_IMAGE 1
 #define X64ARM_HOST_SERVICES_NATIVE_TIME_SLICE 1
+#define X64ARM_HOST_SERVICES_RESIDENT_EXECUTION 1
 namespace x64arm {
 // 可選產碼範圍提示，end 不包含在範圍內。只影響探索分組，不授予執行權限。
 struct TranslationRegion {GuestAddress begin,end;};
@@ -133,6 +134,12 @@ public:
     // 無明確指令上限、無單步及無 instruction_slice 限制時採用，且不超過 250 us。
     // 時限只在既有完整指令邊界觀察；API、故障與失效出口仍立即交回宿主。
     virtual std::uint64_t native_chain_time_slice_ns() const noexcept { return 0; }
+    // 正常 resident AOT 的邊界驅動契約：純迴圈無配額、無時間片、無週期回呼。
+    // 服務的時鐘及生命期不得依賴退休指令數；API／例外仍有完整客體狀態。
+    virtual bool resident_execution() const noexcept { return false; }
+    // 作用域僅由無配額 AOT 入口持有；服務可據此停用計量排程，巢狀呼叫成對進出。
+    virtual void enter_resident_execution() noexcept {}
+    virtual void leave_resident_execution() noexcept {}
     virtual bool allows_multiblock() const noexcept { return false; }
     virtual std::uint64_t instruction_slice() const noexcept { return UINT64_MAX; }
     // 載入器可提供已驗證的函式／程式區域；核心仍核對映射、入口及指令上限。

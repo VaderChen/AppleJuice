@@ -13,6 +13,8 @@ public:
         std::uint64_t native_instructions{},fallback_instructions{},native_entries{},guard_exits{},hardware_faults{},invalidations{},capacity_resets{};
         // 原生續發次數／指令額度及真正回到宿主的配額出口；不把續發算成完整入口。
         std::uint64_t budget_renewals{},budget_reissued_instructions{},native_budget_exits{},native_precise_exits{};
+        // 真正無配額的 resident 框架與必要控制邊界；不冒充退休指令數。
+        std::uint64_t resident_runs{},resident_callbacks{},resident_precise_callbacks{};
         std::uint64_t capacity_growths{},cache_capacity_bytes{},cache_reservation_bytes{},peak_cache_bytes{};
         std::uint64_t cache_validation_nanoseconds{},code_invalidations{},unaffected_code_events{};
         // 全清原因分開計數：紀錄遺失（落後環狀紀錄容量）、結構世代、MMU 存取模式、其他情境（身分／服務／模式／排序）。

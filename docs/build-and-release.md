@@ -24,6 +24,8 @@ cmake --preset release -DAPPLEJUICE_KERNEL_ROOT=vendor/x64kernel
 
 `--backend jit` 在 32／64 位元程式均預設使用 resident AOT；Launcher 執行及 `precompile-pe` 也採用相同選擇。`X64ARM_JIT_MODULE_AOT=0` 明確切回原 JIT，`=1` 明確指定 resident AOT；未設定時仍尊重既有的 LLVM 後端選項。`--backend interpreter` 仍使用直譯器。
 
+正常 resident AOT 搭配宿主時計時，未指定 `--max-instructions` 時預設沒有指令配額或時間片。明確指定有限 `--max-instructions` 時使用獨立觀察模式；其他執行模式仍保留既有指令配額。這些設定不改變 `--memory-limit-mib` 的記憶體上限。
+
 resident AOT 的預編譯快取為 `.aot.smap`，執行期快取為 `.smap`。一般執行預設不讀寫持久快取；只有 `X64ARM_AOT_PERSISTENT=1` 才啟用。手動 `precompile-pe` 仍會產生預編譯快取。原 JIT 則以 `X64ARM_SMAP=1` 開啟快取。
 
 ## Launcher

@@ -140,6 +140,11 @@ public:
 #ifdef X64ARM_HOST_SERVICES_NATIVE_TIME_SLICE
     std::uint64_t native_chain_time_slice_ns() const noexcept override;
 #endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_EXECUTION
+    bool resident_execution() const noexcept override { return runtime_.host_clock; }
+    void enter_resident_execution() noexcept override { ++resident_execution_depth_; }
+    void leave_resident_execution() noexcept override { --resident_execution_depth_; }
+#endif
     bool allows_multiblock() const noexcept override;
     std::uint64_t instruction_slice() const noexcept override;
 #ifdef X64ARM_HOST_SERVICES_TRANSLATION_REGION
@@ -242,6 +247,7 @@ public:
     std::string d3d9_diagnostics() const;
     std::string module_diagnostics() const;
 private:
+    std::size_t resident_execution_depth_{};
     // 僅讓主 EXE loader 交接其剛完成驗證並映射的映像；公開 configure_image 仍先驗證。
     void configure_image_after_unwind_validation(GuestState&,GuestMemory&,RuntimeImage);
     NativeLibraries native_libraries_;

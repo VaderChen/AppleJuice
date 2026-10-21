@@ -500,12 +500,14 @@ void WindowsServices::after_parallel_instructions(GuestState &state, GuestMemory
         after_instructions(state, memory, counts[0]);
 }
 std::uint64_t WindowsServices::native_chain_limit() const noexcept {
+    if(resident_execution_depth_)return UINT64_MAX;
     if(threads_.yield)return 0;
     if(runtime_.host_clock && adaptive_scheduler_budget())return threads_.host_instruction_budget.limit;
     return 8U * (runtime_.host_clock ? scheduler_quantum() : 512U);
 }
 #ifdef X64ARM_HOST_SERVICES_NATIVE_TIME_SLICE
 std::uint64_t WindowsServices::native_chain_time_slice_ns() const noexcept {
+    if(resident_execution_depth_)return 0;
     if(threads_.yield || !runtime_.host_clock || !clock_scheduled_slices())return 0;
     // 100 us 在原有 50..250 us 觀察間隔內；仍於每次 API／故障返回立即更新服務。
     // 有排程中的執行緒時，不把續行時限延到該執行緒的時間片之外。
@@ -516,11 +518,12 @@ std::uint64_t WindowsServices::native_chain_time_slice_ns() const noexcept {
 #endif
 bool WindowsServices::allows_multiblock() const noexcept { return !threads_.yield; }
 std::uint64_t WindowsServices::instruction_slice() const noexcept {
+    if(resident_execution_depth_)return UINT64_MAX;
     return threads_.items.empty() || (runtime_.host_clock && clock_scheduled_slices()) ? UINT64_MAX : threads_.remaining;
 }
 void WindowsServices::after_instructions(GuestState &state, GuestMemory &memory, std::uint64_t count) {
     retired(memory, count);
-    if(runtime_.host_clock && adaptive_scheduler_budget())
+    if(!resident_execution_depth_ && runtime_.host_clock && adaptive_scheduler_budget())
         threads_.host_instruction_budget.observe(count,runtime_.clock_ticks);
     if (threads_.items.empty())
         return;
@@ -624,10 +627,14 @@ void WindowsServices::after_instructions(GuestState &state, GuestMemory &memory,
         }
     }
 #endif
-    const bool clock_slice=runtime_.host_clock && clock_scheduled_slices();
-    if(!clock_slice)threads_.remaining = count >= threads_.remaining ? 0 : threads_.remaining - count;
-    if ((!clock_slice && !threads_.remaining) || threads_.yield ||
-        (runtime_.host_clock && runtime_.clock_ticks >= threads_.slice_deadline)) {
+    const bool resident=resident_execution_depth_!=0;
+    const bool clock_slice=!resident && runtime_.host_clock && clock_scheduled_slices();
+    if(!resident && !clock_slice)threads_.remaining = count >= threads_.remaining ? 0 : threads_.remaining - count;
+    // 正常 AOT 的排程只在已存在的服務／語義邊界輪替，不設定或檢查時間片。
+    // 純原生迴圈不呼叫這裡；精確觀察與舊 JIT 保留原計量排程。
+    if (threads_.yield || (resident?threads_.items.size()>1:
+        ((!clock_slice && !threads_.remaining) ||
+         (runtime_.host_clock && runtime_.clock_ticks >= threads_.slice_deadline)))) {
         // 指令退休後 TEB 才是客體的最新值；直接寫入不能被 schedule 的
         // provider 快取覆蓋。API 內主動排程仍保留尚未發布的服務結果。
         if (state.gs_base || state.fs_base)
@@ -1437,13 +1444,15 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
             // 客體執行緒以基底優先序分配時間片；保留輪替，避免原生 callback 被忙碌客體餓死。
             const auto priority=target.effective_priority(runtime_.process_priority_class,runtime_.process_background);
             threads_.remaining =
+                resident_execution_depth_?0:
                 runtime_.host_clock && clock_scheduled_slices()?UINT64_MAX:
                 (runtime_.host_clock && adaptive_scheduler_budget()?threads_.host_instruction_budget.limit/8:
                     std::uint64_t{runtime_.host_clock ? scheduler_quantum() : 512U}) * static_cast<unsigned>(priority);
             // 一般優先序以 2 ms 作為到期門檻；仍按優先序加權。retired 及 API 入口共用單調時鐘，
             // 大原生批次返回後即讓出到期切片，慢直譯也不能只等長指令預算耗盡。
             const auto span = UINT64_C(2500) * static_cast<unsigned>(priority);
-            threads_.slice_deadline = runtime_.host_clock && runtime_.clock_ticks <= UINT64_MAX - span
+            threads_.slice_deadline = resident_execution_depth_?0:
+                                      runtime_.host_clock && runtime_.clock_ticks <= UINT64_MAX - span
                                           ? runtime_.clock_ticks + span
                                           : UINT64_MAX;
             target.dynamic_priority_boost = 0;

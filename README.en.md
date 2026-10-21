@@ -14,11 +14,11 @@ The complete `x64kernel/` static SDK is included; normal builds do not require t
 
 ## Geekbench 7 single-core total elapsed time
 
-The 16 single-core workloads in Geekbench 7.0.0 Pro (build 703423) were measured on October 21, 2026, on an Apple M4 Pro with 64 GiB of memory and macOS 27.0.1. AppleJuice used the same previously validated engine from Launcher 0.26.1021 (build 10).
+The 16 single-core workloads in Geekbench 7.0.0 Pro (build 703423) were completed on October 21, 2026, on an Apple M4 Pro with 64 GiB of memory and macOS 27.0.1. AppleJuice results use Launcher 0.26.1021 (build 10, engine `ced244119617`), with instruction quotas and time slices removed from normal resident AOT execution. All 16 workloads used the same executable.
 
 **Each workload's native ARM64 total elapsed time is normalized to 1.0; lower ratios are faster.** Total elapsed time runs from process start to exit and includes initialization, calibration, warm-up, the measured workload and result writing within the process. It excludes the measurement tool's input preparation, idle waiting and cleanup after exit. All four charts use the same Y-axis scale, with four workloads per chart.
 
-AppleJuice runs the Windows x86_64 version, Rosetta runs the macOS x86_64 version, and native execution uses the macOS ARM64 version. Versions, workload resources and workload amounts were checked across all three. Each result is the total elapsed time of one valid fresh process, so these are single-round measurements.
+AppleJuice runs the Windows x86_64 version, Rosetta runs the macOS x86_64 version, and native execution uses the macOS ARM64 version. Native and Rosetta results reuse earlier reports from the same day and were not rerun for this measurement. Versions, workload resources and workload amounts were checked across all three. Each result is the total elapsed time of one valid process; these are individual measurements taken at different times and do not establish statistical significance.
 
 ![Total elapsed time ratio: File Compression, Navigation, HTML5 Browser, PDF Viewer](docs/images/geekbench7-single-core-2026-10-21/chart-1.png)
 

@@ -10,7 +10,9 @@
   --command-line 'program.exe' --max-instructions 10000000000
 ```
 
-將範例路徑換成自己的程式與目錄。文字程式可使用 `--stdio live`；需要寫入映射檔案時加入 `--fs-mode read-write`。未知 API 的 `trap` 行為會在實際呼叫時停止，不能使未支援功能自動成功。指令預算耗盡時可調整 `--max-instructions` 並重新確認進度。
+將範例路徑換成自己的程式與目錄。文字程式可使用 `--stdio live`；需要寫入映射檔案時加入 `--fs-mode read-write`。未知 API 的 `trap` 行為會在實際呼叫時停止，不能使未支援功能自動成功。
+
+範例明確指定有限 `--max-instructions`，會使用獨立觀察模式。正常 resident AOT 搭配宿主時計時，省略此選項時預設沒有指令配額或時間片；其他執行模式仍保留既有配額。需要精確上限時可保留此選項，耗盡時再調整上限並確認程式進度。
 
 AppleJuice 提供 PE／DLL 載入及 Windows 相容服務，將視窗、繪圖、音訊與輸入連接至 macOS 原生介面。完整 Windows、任意遊戲與所有 API 參數組合並未全面支援；DRM、核心驅動程式及特定硬體功能亦可能阻止應用程式執行。成功載入或顯示視窗不代表後續功能均可使用。
 

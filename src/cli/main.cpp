@@ -61,7 +61,7 @@ void usage() {
         "32／64 位元預設使用 resident AOT，預設不讀寫持久快取；X64ARM_AOT_PERSISTENT=1 才啟用 .smap，手動預編譯產生 .aot.smap。\n"
         "X64ARM_JIT_MODULE_AOT=0|1 可明確選擇原 JIT／resident AOT；原 JIT 可用 X64ARM_SMAP=1 開啟快取。\n"
         "背景編譯：X64ARM_JIT_COMPILER_WORKERS=0..8（0 同步；即時與離線編譯預設 2）。\n"
-        "共用選項：--max-instructions <步數>（預設 10000000）、--dump-jit <目錄>\n"
+        "共用選項：--max-instructions <步數>（正常 resident AOT 預設無上限，其他模式預設 10000000）、--dump-jit <目錄>\n"
         "GPU 記憶體：--gpu-memory-mib <MiB>（至少 16，至多宿主實體記憶體的 50%；預設 256，按需配置）\n"
         "PE 記憶體：--memory-limit-mib <64..8192>（預設 1024，只按實際配置提交）\n"
         "raw 選項：--stack-address <地址>、--stack-size <bytes>\n"
@@ -463,7 +463,7 @@ int main(int argc, char** argv) {
         RawConfig config;
         PeOptions pe_options;
         pe_options.trap_unresolved_imports = inspection;
-        // CLI 預設：PE 記憶體上限 1024 MiB、指令預算 10,000,000；核心 RunOptions／GuestMemory 的預設值不變。
+        // 診斷後端保留有限預設；正常 resident AOT 在選定後端與時鐘後改為無配額。
         pe_options.memory_limit = std::size_t{1024} * 1024 * 1024;
         RunOptions run;
         run.max_instructions = 10'000'000;
@@ -612,6 +612,8 @@ int main(int argc, char** argv) {
             pe_options.defer_imports=startup_suspended;
             // 與 execute() 共用後端選擇；x86 載入器仍維持原 CFG 入口。
             pe_options.resident_translation=jit && !comparison && !inspection && module_aot_enabled();
+            if(pe_options.resident_translation && host_clock && !seen.contains("--max-instructions"))
+                run.max_instructions=UINT64_MAX;
             auto program = load_pe(bytes, pe_options);
             *diagnostics<<"cfg_guard fast_path="<<program.services.uses_guard_fast_path()<<'\n';
             if (program.memory.execution_mode() == ExecutionMode::X86) run.sentinel = GuestAddress{0x7ffffff0};

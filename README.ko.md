@@ -14,11 +14,11 @@ AppleJuice는 Apple Silicon Mac에서 지원되는 Windows 프로그램을 실�
 
 ## Geekbench 7 싱글 코어 전체 경과 시간
 
-2026년 10월 21일 Apple M4 Pro, 메모리 64 GiB, macOS 27.0.1 환경에서 Geekbench 7.0.0 Pro(build 703423)의 싱글 코어 항목 16개를 측정했습니다. AppleJuice는 Launcher 0.26.1021(build 10)의 동일한 검증된 엔진을 사용했습니다.
+2026년 10월 21일 Apple M4 Pro, 메모리 64 GiB, macOS 27.0.1 환경에서 Geekbench 7.0.0 Pro(build 703423)의 싱글 코어 항목 16개를 완료했습니다. AppleJuice 결과는 일반 resident AOT 실행에서 명령 수 할당과 타임 슬라이스를 제거한 Launcher 0.26.1021(build 10, 엔진 `ced244119617`)로 갱신했으며, 16개 항목 모두 동일한 실행 파일을 사용했습니다.
 
 **각 항목의 네이티브 ARM64 전체 경과 시간을 1.0으로 정규화했으며, 배수가 낮을수록 빠릅니다.** 전체 경과 시간은 프로세스 시작부터 종료까지이며 초기화, 보정, 워밍업, 본 측정 및 프로세스 내부의 결과 기록을 포함합니다. 측정 도구의 입력 준비, 유휴 대기 및 종료 후 정리는 제외합니다. 네 그래프는 동일한 Y축 범위를 사용하며 각각 네 항목을 표시합니다.
 
-AppleJuice는 Windows x86_64 버전, Rosetta는 macOS x86_64 버전, 네이티브 실행은 macOS ARM64 버전을 사용합니다. 세 환경의 버전, 작업 리소스 및 작업량을 대조했습니다. 각 결과는 새로 시작한 유효한 프로세스 하나의 전체 경과 시간이므로 단일 회차 측정입니다.
+AppleJuice는 Windows x86_64 버전, Rosetta는 macOS x86_64 버전, 네이티브 실행은 macOS ARM64 버전을 사용합니다. 네이티브와 Rosetta 결과는 같은 날의 기존 보고서를 사용했으며 이번 측정에서 다시 실행하지 않았습니다. 세 환경의 버전, 작업 리소스 및 작업량을 대조했습니다. 각 결과는 유효한 프로세스 하나의 전체 경과 시간으로, 서로 다른 시점의 단일 측정 비교이며 통계적 유의성을 의미하지 않습니다.
 
 ![전체 경과 시간 배수: File Compression, Navigation, HTML5 Browser, PDF Viewer](docs/images/geekbench7-single-core-2026-10-21/chart-1.png)
 
