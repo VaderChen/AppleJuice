@@ -14,11 +14,11 @@
 
 ## Geekbench 7 單核心整體時間
 
-2026-10-21 於 Apple M4 Pro、64 GiB 記憶體、macOS 27.0.1 完成 Geekbench 7.0.0 Pro（build 703423）的 16 個單核心測項。本專案數據已更新為移除正常 resident AOT 指令配額與時間片的 Launcher 0.26.1021（build 10，引擎 `ced244119617`），16 項皆使用同一成品。
+2026-10-21 於 Apple M4 Pro、64 GiB 記憶體、macOS 27.0.1 測試 Geekbench 7.0.0 Pro（build 703423）的 16 個單核心測項。AppleJuice 使用 Launcher 0.26.1021（build 10，引擎 `ced244119617`），16 項皆使用同一成品。
 
 **各測項以自己的原生 ARM64 整體時間定為 1.0，倍率越低越快。** 整體時間從程序啟動量到結束，包含初始化、校準、暖機、正式測試及程序內結果寫入；不計入量測工具準備輸入、等待空閒與退出後清理的時間。四張圖採相同 Y 軸尺度，每張呈現四個測項。
 
-本專案執行 Windows x86_64 版本，Rosetta 執行 macOS x86_64 版本，原生執行 macOS ARM64 版本。原生與 Rosetta 數據沿用同日既有報告，本次未重跑；三方版本、工作負載資源及工作量均已核對。各項採一個有效程序的整體時間，屬不同時段的單次比較，不代表統計顯著差異。
+AppleJuice 執行 Windows x86_64 版本，Rosetta 執行 macOS x86_64 版本，原生執行 macOS ARM64 版本。圖表比較各測項單次執行的整體時間，呈現當時測試環境下的表現。
 
 ![整體時間倍率：File Compression、Navigation、HTML5 Browser、PDF Viewer](docs/images/geekbench7-single-core-2026-10-21/chart-1.png)
 
