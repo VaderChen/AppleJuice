@@ -1045,17 +1045,29 @@ unsigned WindowsServices::resident_scalar_recipe(GuestAddress address) const noe
 }
 #endif
 #ifdef X64ARM_HOST_SERVICES_SCALAR_ERRORS
-ResidentScalarErrors WindowsServices::resident_scalar_errors(GuestMemory& memory) noexcept {
+namespace {
+ResidentScalarErrors scalar_error_cell(GuestMemory& memory,std::uint64_t address,bool x86) noexcept {
     static const bool enabled=[] {
         const auto* range=std::getenv("X64ARM_SCALAR_RANGE_NATIVE");
         const auto* errors=std::getenv("X64ARM_SCALAR_ERRNO_RESIDENT");
         return (!range || std::string_view(range)!="0") && (!errors || std::string_view(errors)!="0");
     }();
-    if(!enabled || x86_ || !runtime_.errno_cell || !scalar_math_requested())return {};
-    // native_pointer 拒絕 COW、程式碼、外部及宿主更新頁。切換執行緒或映射後，
-    // 既有批次出口會重新取得目前 runtime_.errno_cell，不保存跨批次的指標。
-    auto* cell=static_cast<std::uint32_t*>(memory.native_pointer(GuestAddress{runtime_.errno_cell},4,permission(Access::Write)));
-    return {cell,runtime_.errno_cell,33,34};
+    if(!enabled || x86 || !address || !scalar_math_requested())return {};
+    // native_pointer 拒絕 COW、程式碼、外部及宿主更新頁；每次發布或客體
+    // 重綁都重新借用，不保存跨映射世代或執行緒身分的指標。
+    auto* cell=static_cast<std::uint32_t*>(memory.native_pointer(GuestAddress{address},4,permission(Access::Write)));
+    return {cell,address,33,34};
+}
+}
+ResidentScalarErrors WindowsServices::resident_scalar_errors(GuestMemory& memory) noexcept {
+    return scalar_error_cell(memory,runtime_.errno_cell,x86_);
+}
+#endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_ERRORS
+ResidentScalarErrors WindowsServices::resident_context_errors(const GuestState& state,GuestMemory& memory) noexcept {
+    const auto thread=threads_.items.find(resident_context_key(state));
+    if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return {};
+    return scalar_error_cell(memory,thread->second.errno_cell,x86_);
 }
 #endif
 #ifdef X64ARM_HOST_SERVICES_COORDINATED_SERVICE

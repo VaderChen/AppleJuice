@@ -228,6 +228,9 @@ public:
 #ifdef X64ARM_HOST_SERVICES_SCALAR_ERRORS
     ResidentScalarErrors resident_scalar_errors(GuestMemory&) noexcept override;
 #endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_ERRORS
+    ResidentScalarErrors resident_context_errors(const GuestState&,GuestMemory&) noexcept override;
+#endif
     bool acquire_slim_word(GuestMemory&,std::uint64_t address,std::uint64_t id,bool shared);
     std::string_view name(GuestAddress address) const noexcept override;
     std::optional<std::uint32_t> invoke(GuestState& state, GuestMemory& memory) override;

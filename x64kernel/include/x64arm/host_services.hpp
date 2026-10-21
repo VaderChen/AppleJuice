@@ -27,6 +27,8 @@
 #define X64ARM_HOST_SERVICES_RESIDENT_ACTIVE_CONTEXTS 1
 #define X64ARM_HOST_SERVICES_COORDINATED_SERVICE 1
 #define X64ARM_HOST_SERVICES_RESIDENT_SERVICE_REQUEST 1
+#define X64ARM_HOST_SERVICES_RESIDENT_CONTROL_REQUEST 1
+#define X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_ERRORS 1
 namespace x64arm {
 // 可選產碼範圍提示，end 不包含在範圍內。只影響探索分組，不授予執行權限。
 struct TranslationRegion {GuestAddress begin,end;};
@@ -158,6 +160,12 @@ public:
     // 重派同一個請求。key 為 resident_context_key，入口隨請求保存以排除舊狀態。
     // provider 僅登記排程待辦，不在這個通知內執行服務或切換 context。
     virtual void resident_service_request(std::uint64_t,GuestAddress) {}
+    // 完整控制待辦涵蓋 API、指令語義、精確故障與例外。只在所有 worker
+    // 停止時通知排程器；pending=false 代表控制器已接手相同 key／RIP。
+    // 這不是退休或成功回報，實際語義仍由原有處理流程完成。
+    virtual void resident_control_request(std::uint64_t key,GuestAddress rip,bool pending) {
+        if(pending)resident_service_request(key,rip);
+    }
     // 無配額批次不虛構退休指令數。結束後由服務處理時間、等待及下一個 runnable。
     virtual void after_resident_parallel(GuestState& state,GuestMemory& memory) {
         after_instructions(state,memory,0);
@@ -235,5 +243,9 @@ public:
     virtual bool resident_coordinated_service(GuestState&,GuestMemory&) {return false;}
     virtual std::string_view name(GuestAddress address) const noexcept = 0;
     virtual std::optional<std::uint32_t> invoke(GuestState& state, GuestMemory& memory) = 0;
+    // 協調者在所有 worker 停止的一致邊界，為指定客體借用私人錯誤格位。
+    // 不可暫時切換 provider 的目前執行緒；映射或客體重綁後須重新取得。
+    // 預設空值，不假設單客體 resident_scalar_errors 對其他客體也適用。
+    virtual ResidentScalarErrors resident_context_errors(const GuestState&,GuestMemory&) noexcept { return {}; }
 };
 }
