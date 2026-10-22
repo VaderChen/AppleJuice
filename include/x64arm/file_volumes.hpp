@@ -1,4 +1,5 @@
 #pragma once
+#include <sys/stat.h>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -52,6 +53,9 @@ public:
     FileVolumeState snapshot() const;
     FileVolumeOpen open_root(char volume,bool metadata_only=false) const;
     FileVolumeReparse reparse(int directory) const;
+    // 以呼叫端剛取得的目錄 stat（不追蹤符號連結）查詢「已確認不是掛載點」快取；命中時不必開啟目錄再做 reparse。
+    // 與 reparse 相同的鍵（裝置、inode、ctime）及命名空間版本；未命中回傳 false，呼叫端照原流程開啟檢查。
+    bool plain_directory(const struct stat& entry) const;
     std::uint32_t set_drive(char drive,char volume,bool writable);
     std::uint32_t delete_drive(char drive,bool writable);
     std::uint32_t set_folder(char source,std::string path,char target,bool writable);

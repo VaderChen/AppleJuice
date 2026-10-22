@@ -5,6 +5,8 @@
 #include "x64arm/windows_raw_input.hpp"
 #include "x64arm/windows_pointer.hpp"
 #include "dinput_interfaces.hpp"
+#include <cstdlib>
+#include "monotonic_clock.hpp"
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -92,6 +94,8 @@ struct DirectInputState {
     std::array<GamepadSlot,4> gamepad_slots;
     // 背景輪詢最近一次處理的裝置清單換代，以及當時更新的 raw input 狀態。
     std::uint64_t device_generation{};const void* raw_input_refreshed{};
+    // 最近一次背景輪詢的宿主單調時間（100 ns）。
+    std::uint64_t background_polled{};
 };
 void WindowsServices::set_input_backend(std::shared_ptr<input::Backend> backend){if(dinput_ && !dinput_->objects.empty())throw std::logic_error("DirectInput 物件建立後不能替換輸入後端");if(!dinput_)dinput_=std::make_shared<DirectInputState>();dinput_->backend=std::move(backend);dinput_->gamepad_slots={};dinput_->device_generation=0;dinput_->raw_input_refreshed=nullptr;}
 std::span<const WindowsServiceDescriptor> dinput_service_descriptors(){
@@ -137,7 +141,22 @@ void WindowsServices::poll_dinput(bool background){
        (!raw_input_ || raw_input_->registrations.empty()) &&
        (!pointer_input_ || pointer_input_->registrations.empty()) &&
        std::none_of(files_.begin(),files_.end(),[](const auto& entry){return bool(entry.second.hid);}))return;
-    auto& bridge=*dinput_;const auto native_events=bridge.backend->poll();
+    auto& bridge=*dinput_;
+    // 背景排程每個時間片都會進來，後端快照約每 4 ms 才換代；有 DirectInput 物件時每次都會整份複製裝置清單。
+    // 背景輪詢至多每 2 ms 一次（X64ARM_DINPUT_POLL_US，0 不限）；事件由後端累積，下一次輪詢一併取出，不會遺失。
+    // API 主動查詢（background=false）照常立即更新。
+    if(background){
+        static const std::uint64_t interval=[] {
+            const auto* value=std::getenv("X64ARM_DINPUT_POLL_US");if(!value)return UINT64_C(20000);
+            const auto parsed=std::strtoull(value,nullptr,10);return std::min<std::uint64_t>(parsed,1000000)*10;
+        }();
+        if(interval){
+            const auto now=detail::monotonic_ticks();
+            if(bridge.background_polled && now-bridge.background_polled<interval)return;
+            bridge.background_polled=now;
+        }
+    }
+    const auto native_events=bridge.backend->poll();
     // 背景排程每個時間片都會進來，後端快照卻只約每 4 ms 換代。沒有 DirectInput 物件時，
     // 裝置清單只用於更新 raw input；同一換代已對同一 raw input 狀態更新過就不再複製與比對。
     // 換代編號須在取得清單前讀取：之後才發布的新清單會留給下一次輪詢。

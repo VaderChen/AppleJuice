@@ -1,4 +1,16 @@
         static const bool discard_enabled=[] {const auto* value=std::getenv("X64ARM_GRAPHICS_DISCARD_RENAME");return !value || std::string_view(value)!="0";}();
+        // 持久映射：D3D11 的 DYNAMIC 資源只有 CPU 能經 Map 寫入，GPU 唯讀，所以 CPU 端資料就是權威內容。
+        // 子資源第一次映射後保留客體 heap 區塊，之後 WRITE_DISCARD／WRITE_NO_OVERWRITE 直接回傳同一區塊（內容是上次寫入的資料），
+        // 不等 GPU、不讀回、不重新配置；Unmap 仍照常上傳。其他寫入路徑（UpdateSubresource、Copy*）使區塊失效。
+        // Steam GPU 程序實測 Map 平均 0.35 ms，主要在 graphics_read 的 wait_resource。X64ARM_D3D11_PERSISTENT_MAP=0 關閉。
+        static const bool persistent_maps_enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_PERSISTENT_MAP");return !value || std::string_view(value)!="0";}();
+        const auto drop_persistent=[&](auto& target){
+            for(auto it=target->persistent_maps.begin();it!=target->persistent_maps.end();){
+                if(target->subresource_maps.contains(it->first)){++it;continue;}
+                if(!free_heap(memory,it->second.pointer,state))throw HostCallFault("D3D11 持久映射記憶體已被客體破壞");
+                std::erase(target->allocations,it->second.pointer);it=target->persistent_maps.erase(it);
+            }
+        };
         // 共用物件操作，集中管理 COM 綁定的強參照與 guest pointer 寬度。
         const auto depth_family=[](std::uint32_t format)->std::array<std::uint32_t,4>{
             if(format>=19 && format<=22)return {19,20,21,22};
@@ -356,6 +368,7 @@
         else if(symbol=="GenerateMips"){graphics_handled=true;auto context=typed(arg(0),Kind::Context);const auto view=view_of(arg(1));submit(context,{[view](auto& native){native.graphics_mips(view);}});}
         else if((symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource" || symbol=="Map" || symbol=="Unmap") && object(arg(1)).identity->resource){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context),resource=object(arg(1)).identity;require(resource->device==context->device);
+            if(symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource")drop_persistent(resource);
             if(symbol=="CopyResource" || symbol=="CopySubresourceRegion"){const bool full=symbol=="CopyResource";auto source=object(arg(full?2:6)).identity;require(source->device==context->device && bool(source->resource));const auto& d=resource->resource->desc;const auto& s=source->resource->desc;if(std::getenv("X64ARM_TRACE_GRAPHICS_STATE"))std::fprintf(stderr,"[d3d11_copy] %.*s dst=%u/%u/%u/%u/%u/%u/%u/%u src=%u/%u/%u/%u/%u/%u/%u/%u\n",static_cast<int>(symbol.size()),symbol.data(),d.dimension,d.width,d.height,d.depth,d.levels,d.layers,d.format,d.samples,s.dimension,s.width,s.height,s.depth,s.levels,s.layers,s.format,s.samples);require(d.dimension==s.dimension && d.samples==s.samples && copy_format_family(d.format)==copy_format_family(s.format));if(full){require(resource->subresource_maps.empty() && source->subresource_maps.empty());require(d.width==s.width && d.height==s.height && d.depth==s.depth && d.levels==s.levels && d.layers==s.layers);for(unsigned i=0;i<d.levels*d.layers;++i){const auto dst=subresource(resource,i),src=subresource(source,i);submit(context,{[dst,src](auto& native){native.graphics_copy(dst,src,{0,0,0},{});}});}}else{require(!resource->subresource_maps.contains(u32(2)) && !source->subresource_maps.contains(u32(7)));std::array<std::uint32_t,6> box{};if(arg(8)){const auto values=bytes32(arg(8),6);std::copy(values.begin(),values.end(),box.begin());}const auto dst=subresource(resource,u32(2)),src=subresource(source,u32(7));const std::array origin{u32(3),u32(4),u32(5)};submit(context,{[dst,src,origin,box](auto& native){native.graphics_copy(dst,src,origin,box);}});}}
             else if(symbol=="UpdateSubresource"){
                 require(!resource->subresource_maps.contains(u32(2)));auto view=subresource(resource,u32(2));const auto& d=resource->resource->desc;
@@ -374,8 +387,26 @@
                     const bool region=arg(3)!=0;submit(context,{[view,data,row,image,box,region](auto& native){if(region)native.graphics_write_region(view,data,row,image,box);else native.graphics_write(view,data,row,image);}});
                 }
             }
-            else if(symbol=="Map"){const auto& d=resource->resource->desc;const auto usage=word(resource->desc,d.dimension==1?4:d.dimension==2?16:d.dimension==4?20:28),access=word(resource->desc,d.dimension==1?12:d.dimension==2?24:d.dimension==4?28:36);const auto type=u32(3);require(!resource->offered && !resource->subresource_maps.contains(u32(2)) && type>=1 && type<=5 && !(u32(4)&~0x100000U) && ((usage==3 && type<=3) || (usage==2 && type>=2)) && (!(type==1 || type==3) || (access&0x20000)) && (!(type>=2) || (access&0x10000)));auto view=subresource(resource,u32(2));std::vector<std::uint8_t> data;if(type==4 && discard_enabled && !context->context_type){const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));const auto size=std::uint64_t{pitch[0]}*pitch[1]*std::max(1U,d.depth>>view.level);require(size<=512U*1024U*1024U);data.resize(static_cast<std::size_t>(size));}else{data=context->native->graphics_read(view);if(type==4)std::fill(data.begin(),data.end(),0);}const auto pointer=allocate_heap(memory,data.size());if(!pointer)throw std::bad_alloc{};resource->allocations.push_back(pointer);memory.write(GuestAddress{pointer},data);resource->subresource_maps.emplace(u32(2),Identity::SubresourceMap{pointer,data.size(),type});write_pointer(arg(5),pointer);const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));memory.store(GuestAddress{arg(5)+pointer_size},32,pitch[0]);memory.store(GuestAddress{arg(5)+pointer_size+4},32,pitch[0]*pitch[1]);}
-            else {const auto found=resource->subresource_maps.find(u32(2));require(found!=resource->subresource_maps.end());const auto mapping=found->second;if(mapping.type!=1){const auto view=subresource(resource,u32(2));const auto data=read_bytes(memory,mapping.pointer,mapping.size);if(mapping.type==4 && discard_enabled && !context->context_type)context->native->graphics_write_discard(view,data,0,0);else context->native->graphics_write(view,data,0,0);}require(free_heap(memory,mapping.pointer,state));std::erase(resource->allocations,mapping.pointer);resource->subresource_maps.erase(found);}
+            else if(symbol=="Map"){const auto& d=resource->resource->desc;const auto usage=word(resource->desc,d.dimension==1?4:d.dimension==2?16:d.dimension==4?20:28),access=word(resource->desc,d.dimension==1?12:d.dimension==2?24:d.dimension==4?28:36);const auto type=u32(3);require(!resource->offered && !resource->subresource_maps.contains(u32(2)) && type>=1 && type<=5 && !(u32(4)&~0x100000U) && ((usage==3 && type<=3) || (usage==2 && type>=2)) && (!(type==1 || type==3) || (access&0x20000)) && (!(type>=2) || (access&0x10000)));auto view=subresource(resource,u32(2));
+                const bool persistent=persistent_maps_enabled && usage==2 && (type==4 || type==5) && !context->context_type;
+                const auto kept=persistent?resource->persistent_maps.find(u32(2)):resource->persistent_maps.end();
+                std::uint64_t pointer=0;std::size_t mapped_size=0;
+                if(kept!=resource->persistent_maps.end()){pointer=kept->second.pointer;mapped_size=kept->second.size;}
+                else{
+                    std::vector<std::uint8_t> data;if(type==4 && discard_enabled && !context->context_type){const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));const auto size=std::uint64_t{pitch[0]}*pitch[1]*std::max(1U,d.depth>>view.level);require(size<=512U*1024U*1024U);data.resize(static_cast<std::size_t>(size));}else{data=context->native->graphics_read(view);if(type==4)std::fill(data.begin(),data.end(),0);}
+                    pointer=allocate_heap(memory,data.size());if(!pointer)throw std::bad_alloc{};resource->allocations.push_back(pointer);memory.write(GuestAddress{pointer},data);mapped_size=data.size();
+                    if(persistent)resource->persistent_maps.emplace(u32(2),Identity::PersistentMap{pointer,mapped_size});
+                }
+                resource->subresource_maps.emplace(u32(2),Identity::SubresourceMap{pointer,mapped_size,type});write_pointer(arg(5),pointer);const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));memory.store(GuestAddress{arg(5)+pointer_size},32,pitch[0]);memory.store(GuestAddress{arg(5)+pointer_size+4},32,pitch[0]*pitch[1]);}
+            else {const auto found=resource->subresource_maps.find(u32(2));require(found!=resource->subresource_maps.end());const auto mapping=found->second;if(mapping.type!=1){const auto view=subresource(resource,u32(2));
+                    const auto kept_map=resource->persistent_maps.find(u32(2));const bool persistent=kept_map!=resource->persistent_maps.end() && kept_map->second.pointer==mapping.pointer;
+                    // 持久區塊直接以短期唯讀視圖上傳，不另複製一份；視圖只在本次呼叫內使用。
+                    std::vector<std::uint8_t> copied;std::span<const std::uint8_t> data;
+                    if(persistent){data=memory.readable_prefix(GuestAddress{mapping.pointer},mapping.size);if(data.size()<mapping.size)data={};}
+                    if(data.empty()){copied=read_bytes(memory,mapping.pointer,mapping.size);data=copied;}
+                    if(mapping.type==4 && discard_enabled && !context->context_type)context->native->graphics_write_discard(view,data,0,0);
+                    else if(mapping.type==5 && persistent)context->native->graphics_write_no_overwrite(view,data,0,0);
+                    else context->native->graphics_write(view,data,0,0);}const auto kept=resource->persistent_maps.find(u32(2));if(kept==resource->persistent_maps.end() || kept->second.pointer!=mapping.pointer){require(free_heap(memory,mapping.pointer,state));std::erase(resource->allocations,mapping.pointer);}resource->subresource_maps.erase(found);}
         }else if(symbol=="ResolveSubresource"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context),destination=object(arg(1)).identity,source=object(arg(3)).identity;
             require(destination->device==context->device && source->device==context->device && bool(destination->resource) && bool(source->resource));

@@ -133,6 +133,9 @@ struct Identity {
     struct SubresourceMap { std::uint64_t pointer{};std::size_t size{};std::uint32_t type{}; };
     // 每個 mip／array slice 的 CPU 映射獨立，不把整個資源當成單一鎖。
     std::map<std::uint32_t,SubresourceMap> subresource_maps;
+    // DYNAMIC 資源的持久映射區塊（子資源 → 客體 heap 位址與大小）；保留在 allocations，資源釋放時一併歸還。
+    struct PersistentMap { std::uint64_t pointer{};std::size_t size{}; };
+    std::map<std::uint32_t,PersistentMap> persistent_maps;
     std::map<Kind,std::uint64_t> interfaces;
     std::vector<std::uint64_t> allocations;
     std::array<std::uint32_t,11> texture_desc{};

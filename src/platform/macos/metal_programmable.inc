@@ -260,6 +260,16 @@ void MetalGl::graphics_write_discard(const GraphicsView& v,std::span<const std::
     if(resource.constant_bytes_match(data.first(resource.desc.width),0)){++constant_upload_skips_;constant_upload_saved_bytes_+=resource.desc.width;return;}
     if(!graphics_replace_buffer(v.resource,data))graphics_write(v,data,row,image);
 }}
+void MetalGl::graphics_write_no_overwrite(const GraphicsView& v,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){@autoreleasepool{
+    // D3D11 持久映射的 NO_OVERWRITE 上傳：客體保證不改寫 GPU 使用中的範圍，而這些範圍與上次上傳的位元組相同，
+    // 所以直接寫入共享記憶體 buffer，不等待 GPU、不另建 staging。非整個 buffer 或私有儲存時沿用一般寫入。
+    auto& resource=metal_resource(v.resource);
+    if(!resource.buffer || !resource.buffer.contents || v.first || (v.count && v.count!=resource.desc.width) || data.size()<resource.desc.width){graphics_write(v,data,row,image);return;}
+    const auto bytes=data.first(resource.desc.width);
+    if(resource.constant_bytes_match(bytes,0)){++constant_upload_skips_;constant_upload_saved_bytes_+=resource.desc.width;return;}
+    std::memcpy(resource.buffer.contents,bytes.data(),bytes.size());
+    resource.remember_constant_bytes(bytes,0);
+}}
 void MetalGl::graphics_write_region(const GraphicsView& v,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image,std::array<std::uint32_t,6> box){@autoreleasepool{
     if(box[0]>=box[3] || box[1]>=box[4] || box[2]>=box[5])return;
     auto& r=metal_resource(v.resource);const auto w=box[3]-box[0],h=box[4]-box[1],z=box[5]-box[2];

@@ -15,6 +15,10 @@
 #include <algorithm>
 #include <charconv>
 #include <sstream>
+#include <cstdio>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace x64arm {
 namespace {
@@ -336,7 +340,7 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
     RuntimeModule module;module.image=parsed.runtime;module.image.path=guest;module.name=name;module.loading=true;
 #ifdef X64ARM_HOST_SERVICES_TRANSLATION_IMAGE
     if(!resource_only && !source.source.empty())module.translation=TranslationImage{
-        source.source,SmapCache::source_identity(*source.bytes),parsed.metadata.loaded_base,
+        source.source,image_identity(source.source,*source.bytes),parsed.metadata.loaded_base,
         parsed.metadata.preferred_base,parsed.metadata.image_size};
 #endif
     if(resource_only) {
@@ -722,5 +726,41 @@ std::pair<std::uint64_t,std::uint32_t> WindowsServices::load_kernel_image(GuestM
 }
 std::string WindowsServices::module_diagnostics() const {
     std::string output;for(const auto& event:runtime_.module_events)output+=event+'\n';return output;
+}
+
+std::array<std::uint8_t,32> WindowsServices::image_identity(const std::filesystem::path& source,std::span<const std::uint8_t> bytes){
+#if defined(__APPLE__)
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_IDENTITY_CACHE");return !value || std::string_view(value)!="0";}();
+    struct stat info{};
+    if(!enabled || ::stat(source.c_str(),&info)<0 || !S_ISREG(info.st_mode) || static_cast<std::uint64_t>(info.st_size)!=bytes.size())
+        return SmapCache::source_identity(bytes);
+    static const std::filesystem::path directory=[] {
+        const auto n=::confstr(_CS_DARWIN_USER_TEMP_DIR,nullptr,0);if(!n)return std::filesystem::path{};
+        std::vector<char> text(n);::confstr(_CS_DARWIN_USER_TEMP_DIR,text.data(),n);
+        std::error_code error;auto path=std::filesystem::path(text.data())/"x64arm-identity-cache";std::filesystem::create_directories(path,error);
+        return error?std::filesystem::path{}:path;
+    }();
+    if(directory.empty())return SmapCache::source_identity(bytes);
+    char name[160];
+    std::snprintf(name,sizeof(name),"%llx-%llx-%llx-%lld.%ld-%lld.%ld",static_cast<unsigned long long>(info.st_dev),static_cast<unsigned long long>(info.st_ino),
+        static_cast<unsigned long long>(info.st_size),static_cast<long long>(info.st_mtimespec.tv_sec),static_cast<long>(info.st_mtimespec.tv_nsec),
+        static_cast<long long>(info.st_ctimespec.tv_sec),static_cast<long>(info.st_ctimespec.tv_nsec));
+    const auto path=directory/name;
+    std::array<std::uint8_t,32> identity{};
+    if(const int fd=::open(path.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW);fd>=0){
+        const auto read=::read(fd,identity.data(),identity.size());::close(fd);
+        if(read==static_cast<ssize_t>(identity.size()))return identity;
+    }
+    identity=SmapCache::source_identity(bytes);
+    // 寫入暫存檔再改名；同時寫入的程序結果相同。
+    const auto temporary=path.string()+".tmp-"+std::to_string(::getpid());
+    if(const int fd=::open(temporary.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);fd>=0){
+        const bool written=::write(fd,identity.data(),identity.size())==static_cast<ssize_t>(identity.size());::close(fd);
+        if(!written || ::rename(temporary.c_str(),path.c_str())<0)(void)::unlink(temporary.c_str());
+    }
+    return identity;
+#else
+    (void)source;return SmapCache::source_identity(bytes);
+#endif
 }
 }

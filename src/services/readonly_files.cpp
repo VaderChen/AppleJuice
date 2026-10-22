@@ -1,5 +1,7 @@
 #include "x64arm/startup_profile.hpp"
 #include "x64arm/readonly_files.hpp"
+#include <string_view>
+#include <tuple>
 #include "x64arm/pe_file_cache.hpp"
 #include "x64arm/shared_file_state.hpp"
 #include "x64arm/process_io.hpp"
@@ -416,6 +418,8 @@ ReadOnlyFiles::Resolved ReadOnlyFiles::resolve_mapped(std::string path, bool dir
         if(install_mapping)prefix+="Program Files/";
         for(std::size_t j=0;j<=at;++j){if(prefix.back()!='/')prefix+='/';prefix+=components[j];}
         if(S_ISDIR(entry.st_mode)){
+            // 已確認不是掛載點的目錄（同一 inode／ctime 與命名空間版本）不必再開啟檢查；逐層解析每層省一次 openat／fstat／close。
+            if(volumes_->plain_directory(entry))return {};
             Descriptor folder{::openat(directory.value,name.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW)};if(folder.value<0)return {};
             const auto point=volumes_->reparse(folder.value);if(point.error==4390 || point.error==50)return {};if(point.error)return finish({key,-1,point.error});
             auto target=windows_volume_path(point.mount.target);std::replace(target.begin(),target.end(),'\\','/');const auto target_root=target;
@@ -432,7 +436,7 @@ ReadOnlyFiles::Resolved ReadOnlyFiles::resolve_mapped(std::string path, bool dir
         }catch(const std::invalid_argument&){return finish({key,-1,5});}
     };
     for (std::size_t i = 0; i + 1 < components.size(); ++i) {
-        if(const auto error=authorize(directory.value,0x20U))return finish({key,-1,error,false,{},{},error==5});
+        if(const auto error=authorize_traverse(directory.value))return finish({key,-1,error,false,{},{},error==5});
         const auto name = component(components[i]); if (name.empty()) return finish({key, -1, 5});physical_components[i]=name;
         if(auto link=expand(i,name))return *link;
         const auto next = ::openat(directory.value, name.c_str(), traversal_mode | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -444,7 +448,7 @@ ReadOnlyFiles::Resolved ReadOnlyFiles::resolve_mapped(std::string path, bool dir
         if(!leaf && !metadata_only){const auto readable=::openat(directory.value,".",file_mode|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);if(readable<0)return finish({key,-1,error_code(),false,{},{},error_code()==5});::close(directory.value);directory.value=readable;}
         const auto fd = directory.value; directory.value = -1; return finish({key,fd,0,false,root,"."}); }
     const auto name = component(components.back()); if (name.empty()) return finish({key, -1, 5});physical_components.back()=name;
-    if(const auto error=authorize(directory.value,0x20U))return finish({key,-1,error,false,{},{},error==5});
+    if(const auto error=authorize_traverse(directory.value))return finish({key,-1,error,false,{},{},error==5});
     if(follow_leaf || (!leaf && !metadata_only))if(auto link=expand(components.size()-1,name))return *link;
     if (leaf) { *leaf=name; const auto fd=directory.value;directory.value=-1;return finish({key,fd,0,false,host_path/name}); }
     if(metadata_only){
@@ -611,6 +615,34 @@ std::uint32_t ReadOnlyFiles::authorize(int descriptor,std::uint32_t desired)cons
         (void)descriptor;(void)desired;return 50;
 #endif
     }catch(const SecurityDescriptorError& error){return error.code;}catch(const std::bad_alloc&){return 8;}
+}
+struct ReadOnlyFiles::TraverseCache {
+    std::mutex mutex;std::shared_ptr<const security::FileTokenContext> context;
+    std::map<std::tuple<std::uint64_t,std::uint64_t,std::int64_t,std::int64_t>,std::uint32_t> results;
+};
+std::uint32_t ReadOnlyFiles::authorize_traverse(int descriptor)const{
+    if(!security_context_)return 0;
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_TRAVERSE_CACHE");return !value || std::string_view(value)!="0";}();
+#if defined(__APPLE__)
+    struct stat info{};
+    if(!enabled || ::fstat(descriptor,&info)<0)return authorize(descriptor,0x20U);
+    const std::tuple<std::uint64_t,std::uint64_t,std::int64_t,std::int64_t> key{static_cast<std::uint64_t>(info.st_dev),static_cast<std::uint64_t>(info.st_ino),info.st_ctimespec.tv_sec,info.st_ctimespec.tv_nsec};
+    if(!traverse_cache_)traverse_cache_=std::make_shared<TraverseCache>();
+    const auto cache=traverse_cache_;
+    {
+        std::lock_guard lock(cache->mutex);
+        if(cache->context!=security_context_){cache->context=security_context_;cache->results.clear();}
+        if(const auto found=cache->results.find(key);found!=cache->results.end())return found->second;
+    }
+    const auto result=authorize(descriptor,0x20U);
+    if(result!=8){
+        std::lock_guard lock(cache->mutex);
+        if(cache->context==security_context_ && cache->results.size()<16384)cache->results.emplace(key,result);
+    }
+    return result;
+#else
+    (void)enabled;return authorize(descriptor,0x20U);
+#endif
 }
 std::uint32_t ReadOnlyFiles::authorize_at(int directory,std::string_view leaf,std::uint32_t desired)const{
     if(!security_context_)return 0;

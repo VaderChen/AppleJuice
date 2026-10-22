@@ -851,6 +851,7 @@ std::uint32_t WindowsServices::remote_process_job(GuestMemory& memory,std::uint3
 }
 std::optional<std::uint32_t> WindowsServices::duplicate_remote_handle(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);std::uint64_t result=0;std::uint32_t error=0;
+    const auto trace_started=std::chrono::steady_clock::now();
 #if !defined(_WIN32)
     const auto source_pid=process_handle_pid(arg(0),0x40),target_pid=process_handle_pid(arg(2),0x40);const auto self=process_id();
     if(!source_pid || !target_pid)error=process_object_type(arg(0))==u"Process" && process_object_type(arg(2))==u"Process"?5:6;
@@ -903,7 +904,13 @@ std::optional<std::uint32_t> WindowsServices::duplicate_remote_handle(GuestState
 #endif
     if(error){last_error_=error;if(std::getenv("X64ARM_TRACE_HANDLE_TRANSFER"))std::fprintf(stderr,"[duplicate_remote_error] pid=%u source_process=%llx source_handle=%llx target_process=%llx access=%x options=%x error=%u\n",process_id(),static_cast<unsigned long long>(arg(0)),static_cast<unsigned long long>(arg(1)),static_cast<unsigned long long>(arg(2)),static_cast<std::uint32_t>(arg(4)),static_cast<std::uint32_t>(arg(6)),error);}
 #if !defined(_WIN32)
-    else if(std::getenv("X64ARM_TRACE_HANDLE_TRANSFER"))std::fprintf(stderr,"[duplicate_remote_success] pid=%u source_pid=%u source_handle=%llx target_pid=%u target_handle=%llx\n",self,source_pid,static_cast<unsigned long long>(arg(1)),target_pid,static_cast<unsigned long long>(result));
+    else if(std::getenv("X64ARM_TRACE_HANDLE_TRANSFER")){
+        // 診斷：附宿主毫秒時間與本次呼叫耗時（含等待目標程序回覆）。
+        const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-trace_started).count();
+        const auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr,"[duplicate_remote_timing] pid=%u ms=%lld source_pid=%u target_pid=%u elapsed_us=%lld\n",self,static_cast<long long>(ms),source_pid,target_pid,static_cast<long long>(elapsed));
+        std::fprintf(stderr,"[duplicate_remote_success] pid=%u source_pid=%u source_handle=%llx target_pid=%u target_handle=%llx\n",self,source_pid,static_cast<unsigned long long>(arg(1)),target_pid,static_cast<unsigned long long>(result));
+    }
 #endif
     arg.return_to(state,error?0:1);return std::nullopt;
 }

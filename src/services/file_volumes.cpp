@@ -1,4 +1,6 @@
 #include "x64arm/file_volumes.hpp"
+#include <string_view>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -191,6 +193,18 @@ FileVolumeOpen FileVolumes::open_root(char volume,bool metadata_only) const{
     (void)metadata_only;
 #endif
     return impl_->walk(volume,{});
+}
+bool FileVolumes::plain_directory(const struct stat& entry) const {
+#if defined(__APPLE__)
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_REPARSE_PLAIN_CACHE");return !value || std::string_view(value)!="0";}();
+    if(!enabled || !S_ISDIR(entry.st_mode))return false;
+    const std::tuple<std::uint64_t,std::uint64_t,std::int64_t,std::int64_t> key{static_cast<std::uint64_t>(entry.st_dev),static_cast<std::uint64_t>(entry.st_ino),entry.st_ctimespec.tv_sec,entry.st_ctimespec.tv_nsec};
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    const auto state=impl_->cached_state();if(state.error)return false;
+    return impl_->reparse_cache.valid && impl_->reparse_cache.no_marker.contains(key);
+#else
+    (void)entry;return false;
+#endif
 }
 FileVolumeReparse FileVolumes::reparse(int directory) const {
 #if defined(__APPLE__)

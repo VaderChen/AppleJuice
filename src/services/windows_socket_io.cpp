@@ -27,7 +27,8 @@ void trace_loopback_io(std::uint32_t pid,const NativeSocket& socket,const Pendin
             peer.ss_family==AF_INET6 && IN6_IS_ADDR_LOOPBACK(&reinterpret_cast<sockaddr_in6*>(&peer)->sin6_addr);
         if(loopback){
             const auto port=ntohs(peer.ss_family==AF_INET?reinterpret_cast<sockaddr_in*>(&peer)->sin_port:reinterpret_cast<sockaddr_in6*>(&peer)->sin6_port);
-            std::fprintf(stderr,"[loopback_io] pid=%u socket=%llx port=%u phase=%s kind=%u requested=%zu transferred=%u error=%u overlapped=%llx prefix=",pid,static_cast<unsigned long long>(io.socket),port,phase,static_cast<unsigned>(io.kind),io.data.size(),io.transferred,io.error,static_cast<unsigned long long>(io.overlapped));
+            const auto ms=static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            std::fprintf(stderr,"[loopback_io] pid=%u ms=%lld socket=%llx port=%u phase=%s kind=%u requested=%zu transferred=%u error=%u overlapped=%llx prefix=",pid,ms,static_cast<unsigned long long>(io.socket),port,phase,static_cast<unsigned>(io.kind),io.data.size(),io.transferred,io.error,static_cast<unsigned long long>(io.overlapped));
             for(std::size_t i=0;i<std::min<std::size_t>(24,io.kind==PendingSocketIo::Kind::Receive?io.transferred:io.data.size());++i)std::fprintf(stderr,"%02x",io.data[i]);
             std::fputc('\n',stderr);
             const auto count=io.kind==PendingSocketIo::Kind::Receive?io.transferred:io.data.size();
@@ -84,7 +85,13 @@ void WindowsServices::poll_socket_io(GuestMemory& memory) {
     std::array<pollfd,128> entries{};std::array<std::size_t,128> indices{};
     std::size_t first=0,last=0;bool queried=false;
     // 小量一般收送的 recvmsg／sendmsg 較便宜；零長度 receive 原先每筆都需 poll。
-    const bool large_batch=network.pending_socket_io.size()>=64;
+    // 合併查詢的門檻：Steam.exe 有數十筆等待中的一般接收，每次排程逐筆 recvmsg 約占一成 CPU，
+    // 4 筆以上就先以一次 poll 篩出就緒者（沿用原本 64 筆以上的同一路徑）。X64ARM_SOCKET_POLL_BATCH 調整，64 為舊行為。
+    static const std::size_t batch_threshold=[] {
+        const auto* value=std::getenv("X64ARM_SOCKET_POLL_BATCH");if(!value)return std::size_t{4};
+        const auto parsed=std::strtoull(value,nullptr,10);return parsed>=2 && parsed<=4096?static_cast<std::size_t>(parsed):std::size_t{4};
+    }();
+    const bool large_batch=network.pending_socket_io.size()>=batch_threshold;
     const bool batching=large_batch || (network.pending_socket_io.size()>1 &&
         std::any_of(network.pending_socket_io.begin(),network.pending_socket_io.end(),[](const auto& pending){
             return !pending.done && !pending.error && pending.kind==PendingSocketIo::Kind::Receive && pending.data.empty();

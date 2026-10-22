@@ -62,6 +62,8 @@ public:
         std::uint64_t image_cache_opens{},image_cache_loads{},image_cache_rejections{},image_persistent_hits{},image_persistent_saved{};
         // 記憶體快取（X64ARM_AOT_MEMORY_CACHE）：命中、未命中、存入、核對失敗與無法開啟區段的次數。
         std::uint64_t memory_cache_hits{},memory_cache_misses{},memory_cache_stores{},memory_cache_rejects{},memory_cache_unavailable{};
+        // 記憶體快取命中時核對位元組、解壓與反序列化的累計時間（不含發布）。
+        std::uint64_t memory_cache_restore_ns{};
         // 背景預編譯（X64ARM_AOT_BACKGROUND_COMPILE）：排入工作、背景存入、命中背景記錄、
         // 前景等待背景完成同一入口，以及佇列滿或範圍過大而捨棄的目標數。
         std::uint64_t background_jobs{},background_stores{},background_hits{},background_waits{},background_drops{};

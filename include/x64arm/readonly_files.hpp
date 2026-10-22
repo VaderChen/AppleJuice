@@ -194,6 +194,11 @@ private:
     std::string shared_session_;
     std::uint32_t sharing_error(const FileMetadata& metadata, std::uint32_t access, std::uint32_t sharing,const HostFile* owner=nullptr);
     std::uint32_t authorize(int,std::uint32_t) const;
+    // 路徑逐層解析的 FILE_TRAVERSE 檢查：結果只取決於該目錄的安全資訊（ACL xattr、擁有者、模式，任何變更都會更新 ctime）
+    // 與目前權杖內容，以（裝置、inode、ctime）為鍵快取；權杖內容改變時整批作廢。命中只需一次 fstat。
+    std::uint32_t authorize_traverse(int) const;
+    struct TraverseCache;
+    mutable std::shared_ptr<TraverseCache> traverse_cache_;
     std::uint32_t authorize_at(int,std::string_view,std::uint32_t) const;
     std::uint32_t authorize_delete(int,std::string_view) const;
     std::uint32_t inherit_file_label(int,int,bool directory) const;

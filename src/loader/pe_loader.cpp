@@ -996,7 +996,7 @@ PeProgram load_pe(std::span<const std::uint8_t> bytes,PeOptions options){
 #ifdef X64ARM_HOST_SERVICES_TRANSLATION_IMAGE
     // 主程式與 DLL 同樣以內容雜湊作為翻譯身分；沒有宿主來源路徑（記憶體載入）時不提供。
     if(!options.executable_path.empty())program.services.set_main_translation(TranslationImage{options.executable_path,
-        SmapCache::source_identity(bytes),parsed.metadata.loaded_base,parsed.metadata.preferred_base,parsed.metadata.image_size});
+        WindowsServices::image_identity(options.executable_path,bytes),parsed.metadata.loaded_base,parsed.metadata.preferred_base,parsed.metadata.image_size});
 #endif
     parsed.mappings.clear();program.pending_imports=std::move(parsed);
     if(!options.defer_imports)complete_pe_load(program);

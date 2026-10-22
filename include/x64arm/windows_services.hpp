@@ -182,6 +182,10 @@ public:
 #ifdef X64ARM_HOST_SERVICES_TRANSLATION_IMAGE
     std::optional<TranslationImage> translation_image(GuestAddress) const override;
     void set_main_translation(TranslationImage image){runtime_.main_translation=std::move(image);}
+    // 載入映像的內容身分（SHA-256）：以宿主檔案（裝置、inode、大小、mtime、ctime）為鍵跨程序快取。
+    // libcef.dll 約 210 MiB，每個 webhelper 程序原本各算一次約 70 ms。身分只用於記憶體快取區段命名；
+    // 還原時仍逐條比對客體位元組，鍵錯也只會未命中。X64ARM_IDENTITY_CACHE=0 關閉。
+    static std::array<std::uint8_t,32> image_identity(const std::filesystem::path& source,std::span<const std::uint8_t> bytes);
 #endif
     static constexpr GuestAddress stub_base{windows_address_layout::x64.services};
     static constexpr std::size_t output_limit = 16U * 1024U * 1024U;
@@ -1849,6 +1853,14 @@ private:
     FileIoResult write_standard_output(unsigned stream, std::span<const std::uint8_t> bytes,bool retained=false);
     std::uint32_t last_error_{};
     std::string trace_services_;
+    // 診斷：X64ARM_SERVICE_COUNTS=1 時統計每個服務入口的呼叫次數與累計宿主時間（協調者／managed 與 worker 分列），結束時輸出。
+    struct ServiceCount {std::uint64_t calls{},ns{};};
+    bool service_counts_enabled_{};std::string service_counts_directory_;
+    std::unordered_map<std::uint64_t,ServiceCount> service_counts_,worker_service_counts_;
+    std::shared_ptr<std::mutex> worker_service_counts_mutex_{std::make_shared<std::mutex>()};
+    std::uint64_t service_count_events_{};std::chrono::steady_clock::time_point service_count_dumped_{};
+    // 值為目錄時每 5 秒改寫 <目錄>/service-counts-<pid>.txt（程序被終止也留得下）；否則結束時輸出到 stderr。
+    void dump_service_counts();
     // 客體端小型 CRT 記憶體常式頁；未映射（x86、停用或追蹤）時匯入仍指向宿主服務入口。
     GuestAddress guest_memory_routines_{};
     // Win64 純量常式頁；追蹤時 resolver 沿用原服務，特殊數值從常式尾跳原服務。

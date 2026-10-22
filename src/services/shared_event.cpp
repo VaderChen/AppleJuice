@@ -2,6 +2,10 @@
 #include "x64arm/shared_wake.hpp"
 #include "x64arm/host_services.hpp"
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -65,6 +69,15 @@ int SharedEvent::lock_descriptor()const noexcept{return storage_->directory;}
 void SharedEvent::set(bool value){
     {SharedEventLock lock(storage_->directory);std::atomic_ref(storage_->data->signal).store(value?1U:0U,std::memory_order_release);}
     if(value && storage_->wake)storage_->wake->notify();
+    // 診斷：X64ARM_TRACE_SHARED_EVENTS=1 時記錄跨程序事件的 Set／Reset（含毫秒時間與名稱），用來找 Set 後立即 Reset
+    // 使其他程序的等待者錯過訊號的情況。預設關閉。
+    static const bool trace=std::getenv("X64ARM_TRACE_SHARED_EVENTS")!=nullptr;
+    if(trace){
+        const auto& header=*storage_->data;std::string name;
+        for(std::uint32_t n=0;n<header.characters && n<header.name.size();++n)name.push_back(header.name[n]<0x80?static_cast<char>(header.name[n]):'?');
+        const auto us=static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        std::fprintf(stderr,"[shared_event] pid=%d us=%lld op=%s manual=%u name=%s\n",static_cast<int>(::getpid()),us,value?"set":"reset",header.manual,name.c_str());
+    }
 }
 void SharedEvent::consume_locked()noexcept{if(!manual_reset())std::atomic_ref(storage_->data->signal).store(0,std::memory_order_release);}
 OpenSharedEvent inherit_shared_event(const std::string& session,int descriptor) {

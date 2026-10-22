@@ -37,10 +37,35 @@ WindowsServices::WindowsServices() {
     startup_profile::Scope phase("services","construct_body",true);
     native_angle_=make_native_angle();
     if(const auto* trace=std::getenv("X64ARM_TRACE_SERVICES"))trace_services_=trace;
+    if(const auto* counts=std::getenv("X64ARM_SERVICE_COUNTS");counts && *counts){service_counts_enabled_=true;if(std::string_view(counts)!="1")service_counts_directory_=counts;}
     if(const auto* libraries=std::getenv("X64ARM_NATIVE_LIBRARIES"))native_libraries_.configure(libraries);
 }
 namespace { void report_guard_statistics() noexcept; }
-WindowsServices::~WindowsServices(){report_guard_statistics();while(!policy_sections_.empty())discard_policy_thread(policy_sections_.begin()->second.thread);release_url_cache();
+void WindowsServices::dump_service_counts() {
+    service_count_dumped_=std::chrono::steady_clock::now();
+    FILE* out=stderr;std::string path;
+    if(!service_counts_directory_.empty()){
+        path=service_counts_directory_+"/service-counts-"+std::to_string(process_id())+".txt.tmp";
+        out=std::fopen(path.c_str(),"w");if(!out)return;
+    }
+    const auto dump=[&](const char* label,const std::unordered_map<std::uint64_t,ServiceCount>& counts){
+        std::vector<std::pair<std::uint64_t,ServiceCount>> rows(counts.begin(),counts.end());
+        std::uint64_t calls=0,ns=0;for(const auto& [rip,c]:rows){calls+=c.calls;ns+=c.ns;}
+        std::fprintf(out,"[service_counts] pid=%llu kind=%s entries=%zu calls=%llu ns=%llu\n",static_cast<unsigned long long>(process_id()),label,rows.size(),
+            static_cast<unsigned long long>(calls),static_cast<unsigned long long>(ns));
+        std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){return a.second.ns>b.second.ns;});
+        for(std::size_t n=0;n<rows.size() && n<64;++n){
+            const auto symbol=name(GuestAddress{rows[n].first});
+            std::fprintf(out,"[service_counts]   %s rip=0x%llx calls=%llu ns=%llu avg_ns=%llu name=%.*s\n",label,static_cast<unsigned long long>(rows[n].first),
+                static_cast<unsigned long long>(rows[n].second.calls),static_cast<unsigned long long>(rows[n].second.ns),
+                static_cast<unsigned long long>(rows[n].second.calls?rows[n].second.ns/rows[n].second.calls:0),static_cast<int>(symbol.size()),symbol.data());
+        }
+    };
+    dump("boundary",service_counts_);
+    {std::lock_guard lock(*worker_service_counts_mutex_);dump("worker",worker_service_counts_);}
+    if(out!=stderr){std::fclose(out);std::rename(path.c_str(),path.substr(0,path.size()-4).c_str());}
+}
+WindowsServices::~WindowsServices(){if(service_counts_enabled_)dump_service_counts();report_guard_statistics();while(!policy_sections_.empty())discard_policy_thread(policy_sections_.begin()->second.thread);release_url_cache();
     if(std::getenv("X64ARM_IO_WAIT_PROFILE"))std::fprintf(stderr,"[io_wait] guest_packets=%llu guest_timeouts=%llu immediate=%llu waits=%llu\n",
         static_cast<unsigned long long>(io_wait_stats_.packets),static_cast<unsigned long long>(io_wait_stats_.timeouts),
         static_cast<unsigned long long>(io_wait_stats_.immediate),static_cast<unsigned long long>(io_wait_stats_.waits));
@@ -1206,6 +1231,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
     resident_service_requests_.erase(threads_.current);
     entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,
         entry_runtime_profile::enabled()?name(state.rip):std::string_view{});
+    struct CountScope {
+        WindowsServices& self;std::uint64_t rip;std::chrono::steady_clock::time_point start;
+        ~CountScope(){if(!self.service_counts_enabled_)return;auto& c=self.service_counts_[rip];++c.calls;
+            const auto now=std::chrono::steady_clock::now();
+            c.ns+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now-start).count());
+            if(!self.service_counts_directory_.empty() && (++self.service_count_events_&1023)==0 && now-self.service_count_dumped_>std::chrono::seconds(5))self.dump_service_counts();}
+    } count_scope{*this,state.rip.value,service_counts_enabled_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
 #ifdef X64ARM_HOST_SERVICES_MANAGED_FP
     // 非數學服務仍沿用宿主環境；同一入口也支援動態資格撤銷後的完整流程。
     if(environment && runtime_compute_boundary(state.rip)!=3

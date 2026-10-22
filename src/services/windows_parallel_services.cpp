@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include <chrono>
 #include "x64arm/startup_profile.hpp"
 #include "monotonic_clock.hpp"
 #include "srw_trace.hpp"
@@ -79,6 +80,12 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
                                                   std::span<GuestState* const> active) {
     if(!parallel_service(state.rip))return false;
     const auto symbol=name(state.rip);
+    struct CountScope {
+        WindowsServices& self;std::uint64_t rip;std::chrono::steady_clock::time_point start;
+        ~CountScope(){if(!self.service_counts_enabled_)return;
+            const auto ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count());
+            std::lock_guard lock(*self.worker_service_counts_mutex_);auto& c=self.worker_service_counts_[rip];++c.calls;c.ns+=ns;}
+    } count_scope{*this,state.rip.value,service_counts_enabled_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
     // worker 身分由交給引擎的 context 決定；客體更動 GS 不得冒用另一執行緒。
     auto key=threads_.current;
     {
@@ -217,7 +224,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             }
         }
     }else if(symbol=="GetCurrentThreadId")result=thread_identifier(tid);
-    else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"){
+else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"){
         auto* output=pointer(first,8,2);if(!output)return false;
         // host-clock 直接讀硬體計數器，與 machine clock 同一時間軸；不在 worker 更新共享時間頁。
         const auto value=symbol=="QueryPerformanceFrequency"?UINT64_C(10000000):detail::monotonic_ticks();

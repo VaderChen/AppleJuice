@@ -710,18 +710,31 @@ void WindowsServices::after_resident_interrupt(GuestState& state,GuestMemory& me
     after_resident_parallel(state,memory);
 }
 std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState* const> contexts) const {
-    std::size_t runnable=0,exited=0;std::uint64_t deadline=UINT64_MAX;
+    std::size_t runnable=0,exited=0;std::uint64_t deadline=UINT64_MAX;bool socket_select=false;
     {
         std::unique_lock<std::mutex> lock;
         auto& index=resident_thread_index(lock);
         for(const auto& [id,thread]:index.live){
             (void)id;
             if(thread->status==ThreadStatus::Runnable && !thread->suspended)++runnable;
-            else if(thread->status==ThreadStatus::Waiting)deadline=std::min(deadline,thread->wait.deadline);
+            else if(thread->status==ThreadStatus::Waiting){
+                deadline=std::min(deadline,thread->wait.deadline);
+                socket_select=socket_select || thread->wait.kind==ThreadWaitKind::SocketSelect;
+            }
             else if(thread->status==ThreadStatus::Exited)++exited;
         }
         if(exited*2>index.live.size())index.stale=true;
     }
+    // 全部客體執行緒都在等待、但仍有網路就緒狀態要輪詢（WSAEventSelect／WSAAsyncSelect 監看、重疊 socket 收發、
+    // accept、名稱解析、select）時，比照一般排程迴圈的外部等待，以輪詢上限（預設 1 ms）喚醒協調者。
+    // 否則資料抵達後沒有任何事件喚醒，要等到下一個客體計時器才被發現：Steam 熱啟動的 webhelper 網路程序
+    // 等 Steam.exe 的 loopback websocket 回覆，曾因此整個程序樹閒置 3～10 秒。只在完全閒置時縮短，
+    // 有客體運算時不增加協調者中斷。
+    // X64ARM_RESIDENT_NETWORK_POLL=0 關閉，供同引擎對照。
+    static const bool network_poll=[] {const auto* value=std::getenv("X64ARM_RESIDENT_NETWORK_POLL");return !value || std::string_view(value)!="0";}();
+    const auto& network=runtime_.network;
+    const bool network_wait=network_poll && !runnable && (socket_select || !gui_.socket_watches.empty() || !network.pending_socket_io.empty() ||
+        !network.pending_accepts.empty() || !network.resolvers.empty() || !network.pending_lookups.empty());
     // 尚未取得 worker 的 runnable 必須獲得排程；全部正在運算時不啟用時間片。單一常駐框架依目前
     // 執行緒時間片的絕對期限（排程時設定），不可每次進入本體都重新起算：頻繁冷出口會讓相對期限
     // 不斷順延而永不觸發。多 worker 仍以 5 ms 讓尚未取得 worker 的 runnable 獲得排程。
@@ -737,6 +750,10 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
         const auto remaining=deadline>now?std::min<std::uint64_t>(deadline-now,UINT64_MAX/100)*100:1;
         wake=wake?std::min(wake,remaining):remaining;
     }
+    if(network_wait){
+        const auto poll=external_wait_poll_limit()*100;
+        wake=wake?std::min(wake,poll):poll;
+    }
 #if !defined(_WIN32)
     if (idle_timeline_file()) {
         ++(wake ? run_trace.wake_set : run_trace.wake_zero);
@@ -744,8 +761,13 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
     }
     // 診斷：X64ARM_TRACE_IDLE_DUMP=<目錄> 時，常駐平行模式沒有 runnable 且下一次喚醒超過 20 ms（或無期限）
     // 就傾印各客體執行緒的等待（每程序最多每 3 秒一次）。協調者此時直接休眠，不經排程迴圈的閒置傾印。
+    // 有 socket 監看的程序喚醒期限會被網路輪詢夾短，永遠達不到 20 ms；X64ARM_TRACE_IDLE_DUMP_MIN_WAKE_US 可改門檻（0 表示任何閒置）。
     static const char* const idle_dump_directory=std::getenv("X64ARM_TRACE_IDLE_DUMP");
-    if(idle_dump_directory && !runnable && (!wake || wake>=UINT64_C(20000000))){
+    static const std::uint64_t idle_dump_min_wake=[] {
+        const auto* value=std::getenv("X64ARM_TRACE_IDLE_DUMP_MIN_WAKE_US");
+        return value && *value?std::strtoull(value,nullptr,10)*1000:UINT64_C(20000000);
+    }();
+    if(idle_dump_directory && !runnable && (!wake || wake>=idle_dump_min_wake)){
         static std::atomic<long long> last_dump{};
         const auto now_ms=static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
         auto previous=last_dump.load();
@@ -1845,12 +1867,18 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
 #if !defined(_WIN32)
         // 診斷：X64ARM_TRACE_IDLE_DUMP=<目錄> 時，程序內所有客體執行緒連續閒置超過 2 秒就傾印一次
         // 各執行緒的等待種類、handle 物件狀態、期限與客體返回位址；只讀排程狀態，未設定時只多一次旗標檢查。
+        // X64ARM_TRACE_IDLE_DUMP_INTERVAL_MS=<N> 時改為每次進入閒置、距上次傾印至少 N ms 就傾印，不要求連續閒置
+        // （有短週期計時器的程序永遠不會連續閒置 2 秒，卻仍可能在等待中錯過通知）。
         static const char* const idle_dump_directory=std::getenv("X64ARM_TRACE_IDLE_DUMP");
         if(idle_dump_directory){
+            static const long long idle_dump_interval=[] {
+                const auto* value=std::getenv("X64ARM_TRACE_IDLE_DUMP_INTERVAL_MS");return value && *value?std::atoll(value):0LL;}();
+            static std::chrono::steady_clock::time_point idle_dump_last{};
             const auto now=std::chrono::steady_clock::now();
             if(idle_dump_since==std::chrono::steady_clock::time_point{})idle_dump_since=now;
-            if(!idle_dumped && now-idle_dump_since>std::chrono::seconds(2)){
-                idle_dumped=true;
+            const bool periodic=idle_dump_interval>0 && now-idle_dump_last>=std::chrono::milliseconds(idle_dump_interval);
+            if(periodic || (!idle_dumped && now-idle_dump_since>std::chrono::seconds(2))){
+                idle_dumped=true;idle_dump_last=now;
                 const auto path=std::string(idle_dump_directory)+"/idle-"+std::to_string(::getpid())+".log";
                 if(auto* out=std::fopen(path.c_str(),"a")){
                     std::fprintf(out,"idle_dump unix_ms=%lld clock=%llu current=%llu threads=%zu wake_epoch=%llu\n",
@@ -1862,6 +1890,17 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
                             static_cast<unsigned long long>(id),static_cast<int>(thread.status),thread.suspended?1:0,
                             static_cast<int>(thread.wait.kind),static_cast<unsigned long long>(thread.wait.deadline),
                             static_cast<unsigned long long>(thread.entry),utf16_to_utf8(thread.description).c_str());
+                        if(thread.status==ThreadStatus::Waiting && thread.wait.kind==ThreadWaitKind::GuiInput){
+                            // 訊息等待的篩選條件與此執行緒佇列中的訊息（是否符合、是否已被 Peek 看過）。
+                            const auto& w=thread.wait;std::size_t queued=0,matching=0,seen=0;
+                            for(const auto& message:gui_.queue){
+                                if(message.thread!=id && !(message.window && gui_.windows.contains(message.window) && gui_.windows.at(message.window).thread==id))continue;
+                                ++queued;if(message.queue_seen)++seen;
+                                if(gui_message_matches(message,id,w.gui_window,w.gui_min,w.gui_max) && (gui_queue_category(message)&w.gui_mask))++matching;
+                            }
+                            std::fprintf(out,"    gui window=0x%llx min=0x%x max=0x%x mask=0x%x new_only=%d queued=%zu matching=%zu seen=%zu total=%zu\n",
+                                static_cast<unsigned long long>(w.gui_window),w.gui_min,w.gui_max,w.gui_mask,w.gui_new_only?1:0,queued,matching,seen,gui_.queue.size());
+                        }
                         for(const auto handle:thread.wait.handles){
                             const auto object=runtime_.wait_objects.find(handle);
                             if(object==runtime_.wait_objects.end()){std::fprintf(out,"    handle=0x%llx (非等待物件)\n",static_cast<unsigned long long>(handle));continue;}
