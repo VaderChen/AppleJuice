@@ -54,7 +54,7 @@ bool WindowsServices::dispatch_debug_request(GuestMemory& memory,const debugger:
             if(first){reply.error=87;return true;}
             const auto initial=target.events.offer(controller)->event.tid;
             if(!channel.breakpoint_page){
-                auto base=x86_?UINT64_C(0x7d000000):UINT64_C(0x7ffd10000000);
+                auto base=x86_?UINT64_C(0x7d000000):UINT64_C(0x3ffd10000000);
                 const auto limit=base+0x1000000;
                 while(base<limit && !memory.range_available(GuestAddress{base},4096))base+=4096;
                 if(base==limit || memory.remaining_capacity()<4096){reply.error=8;return true;}
@@ -87,7 +87,7 @@ bool WindowsServices::dispatch_debug_request(GuestMemory& memory,const debugger:
                     auto text=utf16_to_utf8(read_utf16(memory,GuestAddress{string->address}));
                     if(text.size()>65534){std::size_t end=65534;while((static_cast<unsigned char>(text[end])&0xc0)==0x80)--end;text.resize(end);}
                     if(!channel.debug_string_page){
-                        auto base=x86_?UINT64_C(0x7c000000):UINT64_C(0x7ffd20000000);const auto limit=base+0x1000000;
+                        auto base=x86_?UINT64_C(0x7c000000):UINT64_C(0x3ffd20000000);const auto limit=base+0x1000000;
                         while(base<limit && !memory.range_available(GuestAddress{base},65536))base+=65536;
                         if(base==limit || memory.remaining_capacity()<65536){reply.error=8;return true;}
                         memory.map(GuestAddress{base},65536,read_write);channel.debug_string_page=base;

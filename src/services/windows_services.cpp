@@ -823,13 +823,6 @@ std::string_view WindowsServices::name(GuestAddress address) const noexcept {
     const auto index = (address.value - stub_base_.value) / 16;
     return index < services.size() ? services[index].name : runtime_service_descriptors()[index - services.size()].symbol;
 }
-#ifdef X64ARM_HOST_SERVICES_PARALLEL_SERVICE
-const WindowsServiceDescriptor* WindowsServices::runtime_service_descriptor(GuestAddress address)const noexcept {
-    const auto begin=stub_base_.value+services.size()*16;const auto table=runtime_service_descriptors();
-    if(address.value<begin || (address.value-begin)%16 || (address.value-begin)/16>=table.size())return nullptr;
-    return &table[(address.value-begin)/16];
-}
-#endif
 bool WindowsServices::same_state(const WindowsServices& other) const {
     if(runtime_.machine_clock || other.runtime_.machine_clock)return false; // 共用機器 UTC 含跨程序狀態。
     if(detached_console_!=other.detached_console_)return false;

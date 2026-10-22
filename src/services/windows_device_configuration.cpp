@@ -393,7 +393,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
             if(!arg(4))return finish(3);if(arg(3)>1)return finish(31);if(arg(5)&~0x301U || (arg(5)&0x300U)==0x300U)return finish(4);
             if(arg(2) || (arg(5)&0x300U))return finish(52);if(arg(1)&~0x20119U)return finish(51);
             if(runtime_.registry.handles.size()>=4096)return finish(2);memory.check(GuestAddress{arg(4)},x86_?4:8,Access::Write);
-            auto& registry=runtime_.registry;RegistryTransaction transaction(registry,registry_file_);if(transaction.error)return finish(51);
+            auto& registry=runtime_.registry;RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_);if(transaction.error)return finish(51);
+            // 裝置鍵通常已存在；沿用快取避免每次都重新解析整個登錄檔，只有實際寫入才使快取失效。
+            bool committed=false;
             const auto path=folded(std::u16string(1,2)+((arg(5)&1)?u"\\system\\currentcontrolset\\control\\class\\"+node.class_guid+u"\\0000":u"\\system\\currentcontrolset\\enum\\"+node.id));
             if((arg(5)&1) && node.class_guid.empty())return finish(46);
             const auto missing_software=(arg(5)&1) && std::any_of(node.software.begin(),node.software.end(),[&](const auto& item){
@@ -402,6 +404,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
                 const auto before=registry;auto& values=registry.keys[path];
                 for(const auto& [value_name,data]:node.software)if(values.emplace(value_name,data).second){registry.bytes+=data.bytes.size();++registry.values;}
                 if(const auto error=transaction.commit();error){registry=before;return finish(51);}
+                committed=true;
             }
             if(!registry.keys.contains(path)){
                 std::uint64_t added=0;for(const auto& [property,data]:node.properties){(void)property;added+=data.second.bytes.size();}
@@ -412,7 +415,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
                 registry.bytes+=added;registry.values+=node.properties.size();
                 if(arg(5)&1)for(const auto& [value_name,data]:node.software)if(values.emplace(value_name,data).second){registry.bytes+=data.bytes.size();++registry.values;}
                 if(const auto error=transaction.commit();error){registry=before;return finish(51);}
+                committed=true;
             }
+            if(!committed)transaction.unchanged();
             const auto handle=registry.next_handle++;registry.handles.emplace(handle,RegistryHandle{path,static_cast<std::uint32_t>(arg(1)&~0x100U)});memory.store(GuestAddress{arg(4)},x86_?32:64,handle);return finish(0);
         }
         throw HostCallFault("尚未實作裝置組態服務："+std::string(name));

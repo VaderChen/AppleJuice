@@ -6,6 +6,8 @@
 
 儲存庫隨附完整的 `x64kernel/` 靜態 SDK；一般建置不需要核心來源。核心另由 AppleJuiceKernel 提供。靜態連結後的執行檔與 Launcher 套件均屬 AppleJuice 可發布範圍，散布時須保留適用授權。
 
+目前維護 resident AOT 的單核與多核執行路徑。**LLVM 執行後端與舊 JIT 已廢棄，保留但不再維護。** `--backend jit` 是既有介面名稱，預設仍選擇 resident AOT。
+
 ## 專案目標與特色
 
 - **不需要 Windows 系統檔案**：目標是在無須安裝 Windows 或提供 Windows 系統 DLL 的情況下執行支援的程式。應用程式及其附帶相依元件由使用者準備。

@@ -2,7 +2,8 @@
             const auto failed=[&](std::uint32_t error){last_error_=error;return finish(constructs?(x86_?UINT32_MAX:UINT64_MAX):0);};
             const auto registry_path=[&](const DeviceNode& node,bool driver){return folded(std::u16string(1,2)+(driver?u"\\system\\currentcontrolset\\control\\class\\"+node.class_guid+u"\\0000":u"\\system\\currentcontrolset\\enum\\"+node.id));};
             const auto ensure_registry=[&](const DeviceNode& node,bool driver)->std::uint32_t{
-                auto& registry=runtime_.registry;RegistryTransaction transaction(registry,registry_file_);if(transaction.error)return transaction.error;
+                // 裝置鍵通常已完整存在；沿用登錄快取，只有實際寫入才使快取失效。
+                auto& registry=runtime_.registry;RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_);if(transaction.error)return transaction.error;
                 const auto path=registry_path(node,driver);auto values=registry.keys.contains(path)?registry.keys.at(path):std::map<std::u16string,RegistryValue>{};
                 std::uint64_t added=0;unsigned count=0;
                 const auto add=[&](std::u16string key,const RegistryValue& value){key=folded(std::move(key));if(!values.contains(key)){values.emplace(std::move(key),value);added+=value.bytes.size();++count;}};
@@ -22,7 +23,7 @@
                     binary_value(u"HardwareInformation.DacType",wide(u"Integrated RAMDAC"),3);binary_value(u"HardwareInformation.BiosString",wide(u""),3);
                     std::vector<std::uint8_t> size(8);const auto shared=gpu_memory_stats().limit;for(unsigned i=0;i<8;++i)size[i]=static_cast<std::uint8_t>(shared>>(i*8));binary_value(u"HardwareInformation.qwMemorySize",size,11);
                 }
-                if(!count && registry.keys.contains(path))return 0;
+                if(!count && registry.keys.contains(path)){transaction.unchanged();return 0;}
                 if(registry.bytes+added>output_limit || registry.values+count>4096 || registry.keys.size()+12>4096)return 8;
                 const auto before=registry;
                 for(std::size_t end=1;;){registry.keys.try_emplace(path.substr(0,end));end=path.find(u'\\',end+1);if(end==path.npos)break;}

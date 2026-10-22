@@ -321,7 +321,7 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
             if(memory.range_available(preferred,size))return preferred;
             auto selected=runtime_.next_module_base;
             while(!memory.range_available(GuestAddress{selected},size)){
-                if(selected>UINT64_C(0x600000000000)-size)throw ModuleError(8,"沒有 DLL 映射位址");
+                if(selected>std::min<std::uint64_t>(UINT64_C(0x600000000000),user_address_limit())-size)throw ModuleError(8,"沒有 DLL 映射位址");
                 const auto mapping=memory.next_mapping(GuestAddress{selected});
                 selected=mapping?((mapping->base.value+mapping->size+65535)&~UINT64_C(65535)):selected+65536;
             }

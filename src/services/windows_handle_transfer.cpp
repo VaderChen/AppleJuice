@@ -338,6 +338,8 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
             }
         }
         signalled=transfer.watch && transfer.watch->signalled();
+        // 子程序回報管線也由同一監看等待；先讀空再於收尾恢復監看，否則它保持可讀而立即再通知。
+        if(signalled)drain_child_pipes();
     }
     bool listener_watched=false;
 #if defined(__APPLE__)

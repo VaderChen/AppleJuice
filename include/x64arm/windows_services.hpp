@@ -2,6 +2,8 @@
 #include "x64arm/host_services.hpp"
 #include <atomic>
 #include <functional>
+#include <mutex>
+#include <unordered_map>
 #include "x64arm/readonly_files.hpp"
 #include "x64arm/autoproxy.hpp"
 #include "x64arm/windows_runtime.hpp"
@@ -133,9 +135,6 @@ public:
     bool parallel_service(GuestAddress) const noexcept override;
     bool invoke_parallel_service(GuestState&,GuestMemory&) override;
     bool invoke_parallel_service_impl(GuestState&,GuestMemory&,bool&,std::span<GuestState* const> = {});
-    bool parallel_crt_format_service(GuestAddress) const noexcept;
-    bool invoke_parallel_crt_format(GuestState&,GuestMemory&,std::uint64_t);
-    const WindowsServiceDescriptor* runtime_service_descriptor(GuestAddress) const noexcept;
 #endif
     ExecutionPolicy execution_policy(const GuestState&) const override;
     void after_parallel_instructions(GuestState&,GuestMemory&,std::span<const std::uint64_t>) override;
@@ -260,6 +259,24 @@ public:
     // 常駐中斷的外部來源：排程器完整輪詢前取得的共用喚醒世代，與包裝它的等待來源。
     std::uint64_t resident_external_polled_{};
     mutable std::shared_ptr<const ResidentExternalWake> resident_external_source_;
+    // 常駐熱路徑（每次服務返回、每次重新進入本體）的執行緒索引。執行緒表只增不刪：已結束者
+    // 保留供 handle 與結束碼查詢，逐一走訪的成本會隨程序存活時間上升。表大小改變即重建；
+    // 走訪時已結束者過半也重建，熱路徑只看未結束者。複本指向另一份執行緒表，一律重建。
+    struct ResidentThreadIndex {
+        std::vector<std::pair<std::uint64_t,const GuestThread*>> live;
+        std::unordered_map<const GuestState*,std::uint64_t> contexts;
+        std::size_t size{SIZE_MAX};
+        bool stale{true};
+        std::mutex mutex;
+        ResidentThreadIndex()=default;
+        ResidentThreadIndex(const ResidentThreadIndex&) {}
+        ResidentThreadIndex& operator=(const ResidentThreadIndex&) {
+            std::lock_guard lock(mutex);live.clear();contexts.clear();size=SIZE_MAX;stale=true;return *this;
+        }
+    };
+    mutable ResidentThreadIndex resident_threads_;
+    ResidentThreadIndex& resident_thread_index(std::unique_lock<std::mutex>&) const;
+    std::vector<std::pair<std::uint64_t,GuestThread*>> live_threads();
     int mapping_session_descriptor();
     void set_mapping_session(const std::string&,int inherited_descriptor=-1);
     void configure_handle_transfer();
@@ -1196,6 +1213,7 @@ private:
     bool handle_transfer_polling() const noexcept; // 通道沒有監看執行緒時，排程器須輪詢它。
     void watch_descriptor(int descriptor) noexcept; // 交給監看執行緒等待可讀（子程序回報管線等）。
     std::vector<int> child_pipe_descriptors() const; // 現有子程序的回報管線，供監看執行緒建立時加入。
+    void drain_child_pipes(); // 監看執行緒回報可讀時讀取子程序回報，管線才不會保持可讀。
     std::uint32_t reserve_socket_duplication(std::shared_ptr<NativeSocket>,std::uint32_t sender=0,std::uint64_t sequence=0);
     std::uint32_t duplicate_socket_to_process(GuestMemory&,std::uint64_t socket,std::uint32_t pid,std::uint32_t& token);
     bool remote_process_available(std::uint32_t) const;
@@ -1624,8 +1642,11 @@ private:
     std::optional<std::uint32_t> finish_process(GuestState& state, GuestMemory& memory, std::uint32_t code);
     RuntimeState runtime_;
     // Wow64 的 32 位元 LAA 程序可使用 4 GiB 位址；容量仍由 GuestMemory 個別控管。
+    // x64 與原生 MMU 視窗（64 TiB）一致：超出視窗的位址每次存取都走受檢 helper，常駐 worker 須回協調者
+    // 單步執行。Chromium PartitionAlloc 依 47 位元隨機提示保留記憶體池，上限較低時提示失敗會改選其他位址。
     std::uint64_t user_address_limit() const noexcept {
-        return x86_?(runtime_.image.large_address_aware?UINT64_C(0xffff0000):UINT64_C(0x7fff0000)):UINT64_C(0x7fffffff0000);
+        return x86_?(runtime_.image.large_address_aware?UINT64_C(0xffff0000):UINT64_C(0x7fff0000)):
+            std::min<std::uint64_t>(UINT64_C(0x7fffffff0000),GuestMemory::native_mmu_window-0x10000);
     }
     std::uint64_t crt_stream(std::uint64_t pointer) const noexcept {
         const auto base=runtime_base_.value+0x800;

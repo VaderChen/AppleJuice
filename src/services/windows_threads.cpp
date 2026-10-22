@@ -483,15 +483,51 @@ bool WindowsServices::set_process_affinity(GuestState &state, std::uint64_t mask
     notify_concurrency_changed();
     return true;
 }
+WindowsServices::ResidentThreadIndex& WindowsServices::resident_thread_index(std::unique_lock<std::mutex>& lock) const {
+    auto& index = resident_threads_;
+    lock = std::unique_lock(index.mutex);
+    // 執行緒只在建立時加入表中、從不移除，std::map 節點位址在程序期間固定。
+    if (index.stale || index.size != threads_.items.size()) {
+        index.live.clear();
+        index.contexts.clear();
+        for (const auto &[id, thread] : threads_.items) {
+            index.contexts.emplace(&thread.context, id);
+            if (thread.status != ThreadStatus::Exited)
+                index.live.emplace_back(id, &thread);
+        }
+        index.size = threads_.items.size();
+        index.stale = false;
+        static const bool trace = std::getenv("X64ARM_TRACE_THREAD_INDEX") != nullptr;
+        if (trace)
+            std::fprintf(stderr, "[thread_index] pid=%d threads=%zu live=%zu\n", ::getpid(), index.size, index.live.size());
+    }
+    return index;
+}
+std::vector<std::pair<std::uint64_t, GuestThread *>> WindowsServices::live_threads() {
+    // 迴圈本體可能再查詢索引，只在鎖內複製快照；表中節點不移除，指標在程序期間有效。
+    std::vector<std::pair<std::uint64_t, GuestThread *>> result;
+    std::unique_lock<std::mutex> lock;
+    const auto &index = resident_thread_index(lock);
+    result.reserve(index.live.size());
+    for (const auto &[id, thread] : index.live)
+        result.emplace_back(id, const_cast<GuestThread *>(thread));
+    return result;
+}
 bool WindowsServices::concurrent_guest_threads() const noexcept {
     if (debugger_stopped())
         return false;
-    unsigned runnable = 0;
-    for (const auto &[id, thread] : threads_.items) {
+    unsigned runnable = 0, exited = 0;
+    std::unique_lock<std::mutex> lock;
+    auto &index = resident_thread_index(lock);
+    for (const auto &[id, thread] : index.live) {
         (void)id;
-        if (thread.status == ThreadStatus::Runnable && !thread.suspended && ++runnable >= 2)
+        if (thread->status == ThreadStatus::Exited)
+            ++exited;
+        else if (thread->status == ThreadStatus::Runnable && !thread->suspended && ++runnable >= 2)
             return true;
     }
+    if (exited * 2 > index.live.size())
+        index.stale = true;
     return false;
 }
 std::vector<GuestState *> WindowsServices::parallel_contexts(GuestState &state) {
@@ -513,11 +549,16 @@ std::vector<GuestState *> WindowsServices::parallel_contexts(GuestState &state) 
     std::vector<GuestState *> result{&state};
     parallel_thread_ids_[parallel_thread_count_++] = threads_.current;
     // 等待協調執行緒處理 API／例外的 context 不占原生 worker；其餘依輪替選擇，避免總是偏向最小 TID。
-    auto candidate = threads_.items.upper_bound(parallel_cursor_);
-    for (std::size_t visited = 0; available && visited < threads_.items.size(); ++visited) {
-        if (candidate == threads_.items.end())
-            candidate = threads_.items.begin();
-        auto &[id, thread] = *candidate++;
+    // 已結束者不會是 Runnable；只走訪未結束者，仍依 TID 順序自游標之後輪替。
+    const auto live = live_threads();
+    auto candidate = std::upper_bound(live.begin(), live.end(), parallel_cursor_,
+                                      [](std::uint64_t cursor, const auto &entry) { return cursor < entry.first; });
+    for (std::size_t visited = 0; available && visited < live.size(); ++visited) {
+        if (candidate == live.end())
+            candidate = live.begin();
+        const auto id = candidate->first;
+        auto &thread = *candidate->second;
+        ++candidate;
         const auto pending_service=resident_service_requests_.find(id);
         if (id == threads_.current || thread.status != ThreadStatus::Runnable || thread.suspended ||
             (pending_service!=resident_service_requests_.end() && pending_service->second==thread.context.rip) ||
@@ -564,8 +605,10 @@ void WindowsServices::after_parallel_instructions(GuestState &state, GuestMemory
 }
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_PARALLEL
 std::uint64_t WindowsServices::resident_context_key(const GuestState& state) const noexcept {
-    for(const auto& [id,thread]:threads_.items)if(&thread.context==&state)return id;
-    return threads_.current;
+    std::unique_lock<std::mutex> lock;
+    const auto& index=resident_thread_index(lock);
+    const auto found=index.contexts.find(&state);
+    return found!=index.contexts.end()?found->second:threads_.current;
 }
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_SERVICE_REQUEST
 void WindowsServices::resident_service_request(std::uint64_t key,GuestAddress rip) {
@@ -585,7 +628,8 @@ void WindowsServices::resident_control_request(std::uint64_t key,GuestAddress ri
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTROL_DRAIN
 bool WindowsServices::resident_select_control_request(GuestState& state,GuestMemory& memory) {
     if(!resident_execution_depth_ || parallel_workers()<2 || debugger_stopped())return false;
-    for(const auto& [id,thread]:threads_.items){
+    for(const auto& [id,entry]:live_threads()){
+        const auto& thread=*entry;
         if(id==threads_.current || thread.status!=ThreadStatus::Runnable || thread.suspended)continue;
         const auto pending=resident_service_requests_.find(id);
         if((pending==resident_service_requests_.end() || pending->second!=thread.context.rip) &&
@@ -651,11 +695,17 @@ void WindowsServices::after_resident_interrupt(GuestState& state,GuestMemory& me
     after_resident_parallel(state,memory);
 }
 std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState* const> contexts) const {
-    std::size_t runnable=0;std::uint64_t deadline=UINT64_MAX;
-    for(const auto& [id,thread]:threads_.items){
-        (void)id;
-        if(thread.status==ThreadStatus::Runnable && !thread.suspended)++runnable;
-        if(thread.status==ThreadStatus::Waiting)deadline=std::min(deadline,thread.wait.deadline);
+    std::size_t runnable=0,exited=0;std::uint64_t deadline=UINT64_MAX;
+    {
+        std::unique_lock<std::mutex> lock;
+        auto& index=resident_thread_index(lock);
+        for(const auto& [id,thread]:index.live){
+            (void)id;
+            if(thread->status==ThreadStatus::Runnable && !thread->suspended)++runnable;
+            else if(thread->status==ThreadStatus::Waiting)deadline=std::min(deadline,thread->wait.deadline);
+            else if(thread->status==ThreadStatus::Exited)++exited;
+        }
+        if(exited*2>index.live.size())index.stale=true;
     }
     // 尚未取得 worker 的 runnable 必須獲得排程；全部正在運算時不啟用時間片。單一常駐框架依目前
     // 執行緒時間片的絕對期限（排程時設定），不可每次進入本體都重新起算：頻繁冷出口會讓相對期限
@@ -1104,7 +1154,8 @@ void WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
     // 完整排程與同步通知共用取鎖、逾時、返回值及優先序處理。局部通知
     // 只更新相符等待者，不輪詢外部事件、不切換目前客體；worker 重綁時
     // 就能看到新的 Runnable 集合，無須等下一個時間片。
-    for (auto &[id, thread] : threads_.items) {
+    for (const auto &[id, entry] : live_threads()) {
+        auto &thread = *entry;
         if (thread.status != ThreadStatus::Waiting)
             continue;
         auto &wait = thread.wait;

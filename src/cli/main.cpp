@@ -59,7 +59,8 @@ void usage() {
         "相容性診斷：--unresolved-imports reject|trap；trap 在實際呼叫未知 API 時停止，預設 reject。\n"
         "預編譯：precompile-pe <EXE或DLL> [--scan-dlls adjacent] [--profile <熱點報告>] [--ordering host] [--image-base <位址>]，不執行客體程式\n"
         "32／64 位元預設使用 resident AOT，預設不讀寫持久快取；X64ARM_AOT_PERSISTENT=1 才啟用 .smap，手動預編譯產生 .aot.smap。\n"
-        "X64ARM_JIT_MODULE_AOT=0|1 可明確選擇原 JIT／resident AOT；原 JIT 可用 X64ARM_SMAP=1 開啟快取。\n"
+        "LLVM 執行後端與舊 JIT 已廢棄，保留但不再維護；--backend jit 預設仍使用 resident AOT。\n"
+        "X64ARM_JIT_MODULE_AOT=0|1 保留選擇舊 JIT／resident AOT；X64ARM_SMAP=1 僅供已廢棄的舊 JIT。\n"
         "背景編譯：X64ARM_JIT_COMPILER_WORKERS=0..8（0 同步；即時與離線編譯預設 2）。\n"
         "共用選項：--max-instructions <步數>（正常 resident AOT 預設無上限，其他模式預設 10000000）、--dump-jit <目錄>\n"
         "GPU 記憶體：--gpu-memory-mib <MiB>（至少 16，至多宿主實體記憶體的 50%；預設 256，按需配置）\n"
@@ -124,7 +125,7 @@ ExecutionResult execute_module(GuestState& state,GuestMemory& memory,RunOptions 
 }
 bool module_aot_enabled(){
     if(const auto* module=std::getenv("X64ARM_JIT_MODULE_AOT"))return std::string_view(module)=="1";
-    // MODULE_AOT 是明確覆寫；未指定時仍尊重既有 LLVM 後端選擇。
+    // MODULE_AOT 是明確覆寫；舊 JIT／LLVM 後端已廢棄，僅保留既有選擇相容性。
     for(const auto* key:{"X64ARM_JIT_LLVM","X64ARM_JIT_LLVM_TIER","X64ARM_AOT_LLVM"})
         if(const auto* configured=std::getenv(key);configured && std::string_view(configured)=="1")return false;
     return true;

@@ -31,8 +31,7 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
         symbol=="_control87" || symbol=="_controlfp" ||
         symbol=="GetLastError" || symbol=="SetLastError" || symbol=="GetCurrentThreadId" ||
         symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency" ||
-        symbol=="EnterCriticalSection" || symbol=="TryEnterCriticalSection" || symbol=="LeaveCriticalSection" ||
-        parallel_crt_format_service(address);
+        symbol=="EnterCriticalSection" || symbol=="TryEnterCriticalSection" || symbol=="LeaveCriticalSection";
 }
 
 bool WindowsServices::invoke_parallel_service(GuestState& state,GuestMemory& memory) {
@@ -58,8 +57,12 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     if(!parallel_service(state.rip))return false;
     const auto symbol=name(state.rip);
     // worker 身分由交給引擎的 context 決定；客體更動 GS 不得冒用另一執行緒。
-    auto found=threads_.items.find(threads_.current);
-    for(auto it=threads_.items.begin();it!=threads_.items.end();++it)if(&it->second.context==&state){found=it;break;}
+    auto key=threads_.current;
+    {
+        std::unique_lock<std::mutex> lock;const auto& index=resident_thread_index(lock);
+        if(const auto context=index.contexts.find(&state);context!=index.contexts.end())key=context->second;
+    }
+    auto found=threads_.items.find(key);
     if(found==threads_.items.end() || found->second.teb!=state.gs_base)return false;
     auto& thread=found->second;const auto tid=found->first;const bool current=tid==threads_.current;
     // 所有存取先驗證。native_window 排除 COW、可執行寫入、外部 backing 及跨映射；
@@ -81,10 +84,6 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     std::uint64_t result=0;
     // 與一般服務一樣，服務邊界保持客體可見的記憶體順序；不依賴宿主是否已授權 TSO。
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if(parallel_crt_format_service(state.rip)){
-        if(!invoke_parallel_crt_format(state,memory,tid))return false;
-        std::atomic_thread_fence(std::memory_order_seq_cst);return true;
-    }
     if(symbol=="GetLastError" || symbol=="SetLastError"){
         auto* error=pointer(thread.teb+0x68,4,symbol=="GetLastError"?1U:2U);if(!error)return false;
         if(symbol=="GetLastError")result=current?last_error_:load(error,4);

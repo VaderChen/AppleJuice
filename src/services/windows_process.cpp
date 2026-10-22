@@ -1701,6 +1701,15 @@ std::vector<int> WindowsServices::child_pipe_descriptors() const {
 #endif
     return result;
 }
+void WindowsServices::drain_child_pipes() {
+#if !defined(_WIN32)
+    // 子程序回報原本只在全部客體都等待時讀取；有可執行客體時管線保持可讀，監看執行緒每次
+    // 恢復都會立即再通知整個 session 的共用喚醒，所有程序的排程器因此持續空轉。
+    if (processes_)
+        for (auto &child : processes_->children)
+            child->poll();
+#endif
+}
 bool WindowsServices::processes_waiting() {
 #if !defined(_WIN32)
     if (!processes_)

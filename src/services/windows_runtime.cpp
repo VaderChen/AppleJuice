@@ -490,50 +490,6 @@ Formatted format(const GuestMemory& memory,std::u16string_view specification,boo
     }
     return result;
 }
-// 兩個入口共用規則；保留原 provider 的同函式資料流，避免抽取共用邏輯後
-// 每次格式化新增宿主呼叫框架。是否內聯仍以連結後的實際產碼核對。
-__attribute__((always_inline)) inline Formatted format_arguments(const GuestState& state,const GuestMemory& memory,const WindowsCall& arg,
-                           const CrtFormatLayout& layout,std::uint64_t fmt,std::uint64_t options,bool x86){
-    unsigned index=layout.format_index+1;
-    std::uint64_t list=layout.va?arg(layout.common?layout.format_index+2:layout.format_index+1):0;
-    std::u16string specification;
-    if(layout.wide)specification=read_utf16(memory,GuestAddress{fmt});
-    else {const auto bytes=read_ansi(memory,fmt);for(const auto c:bytes)specification.push_back(static_cast<unsigned char>(c));}
-    return format(memory,specification,layout.wide,layout.wide && (!layout.common || (options&4)),x86?4:8,
-                  layout.common?(options&0x20)!=0:layout.underscore,[&](unsigned size){
-        if(layout.va){const auto value=memory.load(GuestAddress{list},static_cast<std::uint8_t>(size*8));list+=x86?size:8;return value;}
-        if(x86){const auto value=memory.load(GuestAddress{state.reg(Gpr::Rsp)+4ULL*(index+1)},static_cast<std::uint8_t>(size*8));index+=size/4;return value;}
-        return arg(index++);
-    });
-}
-struct CrtBufferOutput {
-    std::vector<std::uint8_t> bytes;
-    std::uint64_t result{};
-    unsigned invalid_parameter{},errno_after_write{};
-};
-__attribute__((always_inline)) inline CrtBufferOutput format_buffer_output(const Formatted& formatted,const CrtFormatLayout& layout,
-                                    std::uint64_t capacity,std::uint64_t limit,std::uint64_t options,bool x86){
-    // 只建立輸出計畫，沒有客體副作用；兩個入口共用容量、終止字元及回傳規則。
-    const auto& text=formatted.text;CrtBufferOutput output;
-    output.result=formatted.failed?UINT32_MAX:text.size();
-    const bool legacy=!layout.secure && (layout.common_buffer?(options&1)!=0:layout.underscore);
-    if((layout.secure && !layout.limited && text.size()>=capacity) ||
-       (layout.limited && limit>=capacity && limit!=(x86?UINT32_MAX:UINT64_MAX) && text.size()>=capacity)){
-        output.invalid_parameter=34;return output;
-    }
-    const auto available=capacity?capacity-(legacy?0U:1U):0;
-    auto length=std::min<std::uint64_t>(text.size(),available);if(layout.limited)length=std::min(length,limit);
-    if(capacity){
-        auto& bytes=output.bytes;bytes.reserve(static_cast<std::size_t>((length+1)*(layout.wide?2:1)));
-        for(std::uint64_t i=0;i<length;++i){bytes.push_back(static_cast<std::uint8_t>(text[i]));if(layout.wide)bytes.push_back(static_cast<std::uint8_t>(text[i]>>8));}
-        if(length<capacity)bytes.resize(bytes.size()+(layout.wide?2:1));
-    }
-    if(layout.limited && length<text.size())output.result=UINT32_MAX;
-    else if(legacy && text.size()>capacity)output.result=UINT32_MAX;
-    else if(layout.common_buffer && !layout.secure && !legacy && !(options&2) && text.size()>=capacity)output.result=UINT32_MAX;
-    if(!capacity && legacy){output.errno_after_write=34;output.result=UINT32_MAX;}
-    return output;
-}
 }
 std::uint64_t WindowsServices::runtime_allocate(GuestMemory& memory, std::span<const std::uint8_t> bytes, std::size_t size, std::size_t alignment) {
     size = std::max({std::size_t{1}, size, bytes.size()});
@@ -2374,9 +2330,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
 std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& state,GuestMemory& memory,
                                                           const WindowsServiceDescriptor& service,const WindowsCall& arg){
     std::uint64_t result=0;
-    const auto layout=crt_format_layout(service);
     const auto [common,common_stream,common_buffer,stream,standard_output,counting,
-                wide,secure,limited,unbounded,va,underscore,format_index]=layout;
+                wide,secure,limited,unbounded,va,underscore,format_index]=crt_format_layout(service);
     const auto destination=stream || counting?0:arg(common_buffer?1:0),capacity=stream || counting?0:unbounded?output_limit:arg(common_buffer?2:1);
     const auto limit=limited?arg(common_buffer?3:2):capacity;const auto fmt=arg(format_index);const auto options=common?arg(0):0;
     const auto invalid_format=[&](unsigned error)->std::optional<std::uint32_t>{
@@ -2391,18 +2346,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& stat
     if(limited && !destination && !capacity && !limit){arg.return_to(state,0);return std::nullopt;}
     if(!stream && !counting && ((secure && (!destination || !capacity)) || (!destination && capacity)))return invalid_format(22);
     if(limited && !limit){memory.store(GuestAddress{destination},wide?16:8,0);arg.return_to(state,UINT32_MAX);return std::nullopt;}
+    unsigned index=format_index+1;std::uint64_t list=va?arg(common?format_index+2:format_index+1):0;
+    std::u16string specification;if(wide)specification=read_utf16(memory,GuestAddress{fmt});else {const auto bytes=read_ansi(memory,fmt);for(const auto c:bytes)specification.push_back(static_cast<unsigned char>(c));}
     Formatted formatted;
-    try {formatted=format_arguments(state,memory,arg,layout,fmt,options,x86_);}
-    catch(const FormatError& error){return invalid_format(error.code);}
+    try {formatted=format(memory,specification,wide,wide && (!common || (options&4)),x86_?4:8,common?(options&0x20)!=0:underscore,[&](unsigned size){
+        if(va){const auto value=memory.load(GuestAddress{list},static_cast<std::uint8_t>(size*8));list+=x86_?size:8;return value;}
+        if(x86_){const auto value=memory.load(GuestAddress{state.reg(Gpr::Rsp)+4ULL*(index+1)},static_cast<std::uint8_t>(size*8));index+=size/4;return value;}return arg(index++);
+    });}catch(const FormatError& error){return invalid_format(error.code);}
     const auto& text=formatted.text;if(formatted.encoding_error)memory.store(GuestAddress{runtime_.errno_cell},32,formatted.encoding_error);
     result=formatted.failed?UINT32_MAX:text.size();
     if(!stream && !counting){
+        const bool legacy=!secure && (common_buffer?(options&1)!=0:underscore);
         if(!destination && !capacity){arg.return_to(state,result);return std::nullopt;}
-        const auto output=format_buffer_output(formatted,layout,capacity,limit,options,x86_);
-        if(output.invalid_parameter)return invalid_format(output.invalid_parameter);
-        if(capacity)memory.write(GuestAddress{destination},output.bytes);
-        if(output.errno_after_write)memory.store(GuestAddress{runtime_.errno_cell},32,output.errno_after_write);
-        result=output.result;
+        if(secure && !limited && text.size()>=capacity)return invalid_format(34);
+        if(limited && limit>=(capacity) && limit!=(x86_?UINT32_MAX:UINT64_MAX) && text.size()>=capacity)return invalid_format(34);
+        const auto available=capacity?capacity-(legacy?0U:1U):0;auto length=std::min<std::uint64_t>(text.size(),available);if(limited)length=std::min(length,limit);
+        if(capacity){std::vector<std::uint8_t> bytes;bytes.reserve(static_cast<std::size_t>((length+1)*(wide?2:1)));for(std::uint64_t i=0;i<length;++i){bytes.push_back(static_cast<std::uint8_t>(text[i]));if(wide)bytes.push_back(static_cast<std::uint8_t>(text[i]>>8));}if(length<capacity)bytes.resize(bytes.size()+(wide?2:1));memory.write(GuestAddress{destination},bytes);}
+        if(limited && length<text.size())result=UINT32_MAX;
+        else if(legacy && text.size()>capacity)result=UINT32_MAX;
+        else if(common_buffer && !secure && !legacy && !(options&2) && text.size()>=capacity)result=UINT32_MAX;
+        if(!capacity && legacy){memory.store(GuestAddress{runtime_.errno_cell},32,34);result=UINT32_MAX;}
     }else if(stream){
         std::uint64_t written=0;
         if(wide)written=write_crt_wide_stream(state,memory,target,text);
@@ -2411,60 +2374,5 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& stat
     }
     arg.return_to(state,result);return std::nullopt;
 }
-
-#ifdef X64ARM_HOST_SERVICES_PARALLEL_SERVICE
-bool WindowsServices::parallel_crt_format_service(GuestAddress address)const noexcept {
-    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_RESIDENT_CRT_FORMAT");return !value || std::string_view(value)!="0";}();
-    if(!enabled || x86_)return false;
-    const auto* descriptor=runtime_service_descriptor(address);
-    return descriptor && descriptor->family=="crt" && crt_format_symbol(descriptor->symbol) && !crt_format_layout(*descriptor).stream;
-}
-bool WindowsServices::invoke_parallel_crt_format(GuestState& state,GuestMemory& memory,std::uint64_t tid){
-    // 呼叫者已核對 worker 身分及服務資格。所有準備均無客體副作用；遇到需要
-    // errno、回呼、I/O 或映射變更的情況，原 provider 取得完整狀態後再處理。
-    if(!parallel_crt_format_service(state.rip))return false;
-    const auto pending=runtime_.crt_io_operations.find(tid);
-    if(pending!=runtime_.crt_io_operations.end() && std::any_of(pending->second.begin(),pending->second.end(),
-        [](const auto& operation){return operation.id!=0;}))return false;
-    const auto& descriptor=*runtime_service_descriptor(state.rip);
-    struct Chunk {std::uint8_t* data;std::size_t size;};std::vector<Chunk> chunks;
-    std::vector<std::uint8_t> bytes;std::uint64_t result=0;std::optional<WindowsCall> call;
-    try {
-        call.emplace(state,memory,descriptor);const auto& arg=*call;const auto layout=crt_format_layout(descriptor);
-        const auto destination=layout.counting?0:arg(layout.common_buffer?1:0);
-        const auto capacity=layout.counting?0:layout.unbounded?output_limit:arg(layout.common_buffer?2:1);
-        const auto limit=layout.limited?arg(layout.common_buffer?3:2):capacity;
-        const auto fmt=arg(layout.format_index),options=layout.common?arg(0):0;
-        if(!fmt || (layout.common && ((options&~UINT64_C(0x27)) || arg(layout.format_index+1))) ||
-           (layout.limited && !limit) || (!layout.counting &&
-            ((layout.secure && (!destination || !capacity)) || (!destination && capacity))))return false;
-        const auto formatted=format_arguments(state,memory,arg,layout,fmt,options,false);
-        if(formatted.encoding_error || formatted.failed)return false;
-        result=formatted.text.size();
-        if(!layout.counting && (destination || capacity)){
-            auto output=format_buffer_output(formatted,layout,capacity,limit,options,false);
-            if(output.invalid_parameter || output.errno_after_write)return false;
-            if(output.bytes.size()>UINT64_MAX-destination)return false;
-            const auto sp=state.reg(Gpr::Rsp);
-            if(destination<sp+8 && destination+output.bytes.size()>sp)return false;
-            // 先驗證所有輸出頁；native_window 排除 COW、可執行寫入及外部 backing。
-            // 映射到下一次一致邊界前固定，提交途中不再呼叫可改映射的 GuestMemory 寫入。
-            for(std::size_t offset=0;offset<output.bytes.size();){
-                const auto window=memory.native_window(GuestAddress{destination+offset},2);
-                if(!window.data || !window.after)return false;
-                const auto count=std::min(window.after,output.bytes.size()-offset);
-                chunks.push_back({window.data,count});offset+=count;
-            }
-            result=output.result;bytes=std::move(output.bytes);
-        }
-    }catch(const MemoryFault&){return false;}
-     catch(const HostCallFault&){return false;}
-     catch(const FormatError&){return false;}
-    // 提交後不再回傳「尚無副作用」的 false；意外例外由既有 worker 例外流程接手。
-    std::size_t offset=0;
-    for(const auto& chunk:chunks){std::memcpy(chunk.data,bytes.data()+offset,chunk.size);offset+=chunk.size;}
-    call->return_to(state,result);return true;
-}
-#endif
 
 }
