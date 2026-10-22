@@ -166,6 +166,10 @@ public:
     void after_resident_interrupt(GuestState&,GuestMemory&) override;
     std::uint64_t resident_parallel_wakeup_ns(std::span<GuestState* const>) const override;
     std::shared_ptr<const ResidentExternalWake> resident_external_wake(std::uint64_t& observed) const override;
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_IDLE_WAKE
+    std::shared_ptr<const ResidentExternalWake> resident_idle_wake(std::uint64_t& observed) const override;
+    void request_resident_poll() override;
+#endif
     ResidentServiceProgress resident_parallel_service(GuestState&,GuestMemory&) override;
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_ACTIVE_CONTEXTS
     ResidentServiceProgress resident_parallel_service(GuestState&,GuestMemory&,std::span<GuestState* const>) override;

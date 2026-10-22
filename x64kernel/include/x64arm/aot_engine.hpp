@@ -18,6 +18,8 @@ public:
         std::uint64_t resident_timestamps{};
         // 無配額平行批次；CPU 時間以每個宿主 worker 的執行緒時鐘累計。
         std::uint64_t parallel_batches{},parallel_workers{},parallel_peak_workers{},parallel_interrupts{};
+        // 協調者在信箱閒置等待時因外部世代改變（跨程序管道／物件通知）提前輪詢的次數。
+        std::uint64_t parallel_external_wakes{};
         std::uint64_t parallel_wall_ns{},parallel_cpu_ns{},parallel_sites{};
         std::uint64_t parallel_messages{},parallel_resumes{},parallel_publications{},parallel_service_retries{};
         std::uint64_t parallel_coordinated_services{},parallel_coordinated_semantics{};

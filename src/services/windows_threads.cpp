@@ -681,6 +681,7 @@ public:
         if(!wake_->wait_for(observed,nanoseconds))std::this_thread::sleep_for(std::chrono::nanoseconds(nanoseconds));
         return wake_->snapshot()!=observed;
     }
+    bool changed(std::uint64_t observed) const noexcept override {return wake_->snapshot()!=observed;}
 };
 }
 std::shared_ptr<const ResidentExternalWake> WindowsServices::resident_external_wake(std::uint64_t& observed) const {
@@ -696,6 +697,22 @@ std::shared_ptr<const ResidentExternalWake> WindowsServices::resident_external_w
     observed=resident_external_polled_;
     return resident_external_source_;
 }
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_IDLE_WAKE
+// 協調者閒置等待時的外部喚醒：與搶占無關。renderer／browser／GPU 程序只靠 Mojo 管道與跨程序事件互通，
+// 所有客體執行緒都在等待時，對方送來的資料只會推進 session 喚醒世代，不會產生信箱請求；只依期限等待時，
+// Steam 熱啟動曾因此整個程序樹閒置 5～20 秒，直到某個客體計時器到期。X64ARM_RESIDENT_IDLE_WAKE=0 關閉。
+std::shared_ptr<const ResidentExternalWake> WindowsServices::resident_idle_wake(std::uint64_t& observed) const {
+    static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_RESIDENT_IDLE_WAKE");return !setting || std::string_view(setting)!="0";}();
+    if(!enabled || !runtime_.host_clock || threads_.items.size()<2)return {};
+    if(!resident_external_source_){
+        auto wake=mapping_wake();if(!wake)return {};
+        resident_external_source_=std::make_shared<SharedWakeSource>(std::move(wake));
+    }
+    observed=resident_external_polled_;
+    return resident_external_source_;
+}
+void WindowsServices::request_resident_poll() {threads_.yield=true;threads_.interrupt_poll=true;}
+#endif
 void WindowsServices::after_resident_parallel(GuestState& state,GuestMemory& memory) {
     parallel_thread_count_=0;
     after_instructions(state,memory,0);

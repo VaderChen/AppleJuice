@@ -32,6 +32,7 @@
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_ERRORS 1
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTROL_DRAIN 1
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_SCALAR 1
+#define X64ARM_HOST_SERVICES_RESIDENT_IDLE_WAKE 1
 namespace x64arm {
 // 可選產碼範圍提示，end 不包含在範圍內。只影響探索分組，不授予執行權限。
 struct TranslationRegion {GuestAddress begin,end;};
@@ -106,6 +107,8 @@ class ResidentExternalWake {
 public:
     virtual ~ResidentExternalWake()=default;
     virtual bool wait_changed(std::uint64_t observed,std::uint64_t nanoseconds) const noexcept=0;
+    // 不等待，只核對世代是否已不同於 observed；協調者持信箱鎖時呼叫，不得阻塞。
+    virtual bool changed(std::uint64_t observed) const noexcept {return wait_changed(observed,0);}
 };
 // CPU 只認識受控客體入口，Windows ABI 與 API 語義由服務層負責。
 class HostServices {
@@ -192,6 +195,14 @@ public:
     virtual std::shared_ptr<const ResidentExternalWake> resident_external_wake(std::uint64_t& observed) const {
         (void)observed;return {};
     }
+    // 常駐平行框架的協調者在信箱等待、且沒有 worker 正在執行客體碼時另監看外部事件（不受搶占設定影響）：
+    // 等待中的客體可能在等其他程序的管道資料或跨程序物件，這些通知不會產生信箱請求，只依期限等待會延誤到
+    // 下一個客體計時器。世代改變時協調者先呼叫 request_resident_poll，再在完整邊界輪詢並排程。
+    virtual std::shared_ptr<const ResidentExternalWake> resident_idle_wake(std::uint64_t& observed) const {
+        (void)observed;return {};
+    }
+    // 下一次排程邊界必須完整輪詢外部事件（等待物件、管道、時間），即使目前執行緒時間片尚未到期。
+    virtual void request_resident_poll() {}
     virtual bool allows_multiblock() const noexcept { return false; }
     virtual std::uint64_t instruction_slice() const noexcept { return UINT64_MAX; }
     // 載入器可提供已驗證的函式／程式區域；核心仍核對映射、入口及指令上限。
