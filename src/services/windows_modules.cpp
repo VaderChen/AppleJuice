@@ -155,6 +155,9 @@ std::optional<TranslationRegion> WindowsServices::translation_region(GuestAddres
 #endif
 #ifdef X64ARM_HOST_SERVICES_TRANSLATION_IMAGE
 std::optional<TranslationImage> WindowsServices::translation_image(GuestAddress address) const {
+    // 主程式不在 loaded_modules；以其載入範圍比對。
+    if(const auto& main=runtime_.main_translation;main && address.value>=main->begin.value && address.value-main->begin.value<main->size)
+        return main;
     auto next=runtime_.loaded_modules.upper_bound(address.value);
     if(next==runtime_.loaded_modules.begin())return {};
     const auto& module=std::prev(next)->second;

@@ -181,6 +181,7 @@ public:
 #endif
 #ifdef X64ARM_HOST_SERVICES_TRANSLATION_IMAGE
     std::optional<TranslationImage> translation_image(GuestAddress) const override;
+    void set_main_translation(TranslationImage image){runtime_.main_translation=std::move(image);}
 #endif
     static constexpr GuestAddress stub_base{windows_address_layout::x64.services};
     static constexpr std::size_t output_limit = 16U * 1024U * 1024U;

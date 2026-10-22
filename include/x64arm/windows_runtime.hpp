@@ -555,6 +555,10 @@ struct RuntimeState {
     std::uint64_t wargv_cell{}, wenviron_cell{};
     std::map<std::string, std::uint64_t> modules;
     std::map<std::uint64_t,RuntimeModule> loaded_modules;
+#ifdef X64ARM_HOST_SERVICES_TRANSLATION_IMAGE
+    // 主程式 EXE 的來源身分：與 DLL 相同，供 resident AOT 記憶體快取以內容雜湊辨識。
+    std::optional<TranslationImage> main_translation{};
+#endif
     std::map<std::uint64_t,RuntimeImage> builtin_images;
     RuntimeCxxExceptions cxx_exceptions;
     std::vector<RuntimeFunctionTable> dynamic_function_tables;

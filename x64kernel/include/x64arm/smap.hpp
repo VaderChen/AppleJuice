@@ -37,6 +37,8 @@ public:
     std::shared_ptr<const LlvmRegion> restore_llvm(std::uint64_t,const GuestMemory&,GuestAddress sentinel,const HostServices*)const;
     using Policy=std::array<std::uint8_t,32>;
     static Policy source_identity(std::span<const std::uint8_t>);
+    // 執行中引擎的產碼身分（CodeDirectory 與宿主產碼能力）；記憶體快取以此區隔不同引擎版本。
+    static Policy engine_identity();
     // 冷邊界綁定產碼環境與呼叫端政策；不保存原始環境字串或程序位址。
     static Policy aot_policy(std::span<const std::uint64_t>);
     struct RestoredAot {IrBlock ir;std::shared_ptr<const AotModule> module;};

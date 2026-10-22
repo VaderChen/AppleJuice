@@ -1,4 +1,5 @@
 #pragma once
+// 已廢棄：LLVM 區域執行後端保留但不再維護；不影響 LLVM 靜態分析工具。
 #include "x64arm/ir.hpp"
 #include "x64arm/native_chain.hpp"
 #include <algorithm>

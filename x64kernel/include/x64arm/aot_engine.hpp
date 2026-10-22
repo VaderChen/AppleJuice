@@ -60,6 +60,13 @@ public:
         std::uint64_t persistent_hits{},persistent_misses{},restored_words{},persistent_load_ns{},persistent_save_ns{},persistent_saved{},persistent_save_failures{};
         std::uint64_t prepared_modules{},prepared_words{},prepared_rejections{},prepared_cache_loads{};
         std::uint64_t image_cache_opens{},image_cache_loads{},image_cache_rejections{},image_persistent_hits{},image_persistent_saved{};
+        // 記憶體快取（X64ARM_AOT_MEMORY_CACHE）：命中、未命中、存入、核對失敗與無法開啟區段的次數。
+        std::uint64_t memory_cache_hits{},memory_cache_misses{},memory_cache_stores{},memory_cache_rejects{},memory_cache_unavailable{};
+        // 背景預編譯（X64ARM_AOT_BACKGROUND_COMPILE）：排入工作、背景存入、命中背景記錄、
+        // 前景等待背景完成同一入口，以及佇列滿或範圍過大而捨棄的目標數。
+        std::uint64_t background_jobs{},background_stores{},background_hits{},background_waits{},background_drops{};
+        // 依預測類別（跳轉／落下出口、直接 call、IAT call）分列的排入與命中數。
+        std::array<std::uint64_t,3> background_jobs_by_kind{},background_hits_by_kind{};
         // 發布時計數；calls 是靜態修補點，不是動態呼叫次數。compiled_words 仍代表自足模板。
         // published_words 不含池及尾端對齊，兩者另列，避免把壓縮字數當成配置容量收益。
         std::uint64_t runtime_pools{},runtime_linked_modules{},runtime_calls{},runtime_saved_words{},runtime_pool_bytes{},runtime_padding_words{},runtime_alignment_bytes{},published_words{};

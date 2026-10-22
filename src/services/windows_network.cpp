@@ -751,7 +751,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                         const auto status=symbol=="bind"?::bind(fd,pointer,address.size ) : ::connect(fd,pointer,address.size);
                         if(std::getenv("X64ARM_TRACE_NETWORK_STATE")){
                             const auto saved_errno=errno;char host[NI_MAXHOST]{},port[NI_MAXSERV]{};
-                            if(!::getnameinfo(pointer,address.size,host,sizeof(host),port,sizeof(port),NI_NUMERICHOST|NI_NUMERICSERV))std::fprintf(stderr,"[net_endpoint] pid=%u api=%.*s socket=%llx host=%s port=%s status=%d native_error=%d\n",process_id(),static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned long long>(arg(0)),host,port,status,status<0?saved_errno:0);
+                            if(!::getnameinfo(pointer,address.size,host,sizeof(host),port,sizeof(port),NI_NUMERICHOST|NI_NUMERICSERV))std::fprintf(stderr,"[net_endpoint] pid=%u ms=%lld api=%.*s socket=%llx host=%s port=%s status=%d native_error=%d\n",process_id(),static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()),static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned long long>(arg(0)),host,port,status,status<0?saved_errno:0);
                             errno=saved_errno;
                         }
                         if(symbol=="connect" && gui_.socket_watches.contains(arg(0)) && (!status || errno==EINPROGRESS))gui_.socket_watches.at(arg(0)).connecting=true;

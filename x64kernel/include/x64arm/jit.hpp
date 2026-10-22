@@ -74,6 +74,7 @@ struct JitStats {
     // 背景預譯：送出的快照入口、worker 完成數、主線採用／等待／比對失敗與捨棄數。
     std::uint64_t speculation_submitted{},speculation_compiled{},speculation_hits{},speculation_waits{},speculation_rejected{},speculation_dropped{};
 };
+// 已廢棄：舊 JIT 執行後端保留但不再維護。resident AOT 及其共用元件繼續維護。
 class JitEngine {
 public:
     // 預設依宿主記憶體 1/32 預留 64–1024 MiB；僅發布的程式碼會提交實體頁。

@@ -77,7 +77,7 @@ add_library(AppleJuiceKernel::JIT STATIC IMPORTED)
 
 set_target_properties(AppleJuiceKernel::JIT PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES "${_IMPORT_PREFIX}/include"
-  INTERFACE_LINK_LIBRARIES "AppleJuiceKernel::Core;AppleJuiceKernel::Platform;\$<LINK_ONLY:>;-framework Security;-framework CoreFoundation"
+  INTERFACE_LINK_LIBRARIES "AppleJuiceKernel::Core;AppleJuiceKernel::Platform;\$<LINK_ONLY:>;-framework Security;-framework CoreFoundation;\$<LINK_ONLY:compression>"
 )
 
 # Create imported target AppleJuiceKernel::SoftFloat

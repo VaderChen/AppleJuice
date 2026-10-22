@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/startup_profile.hpp"
 #include "monotonic_clock.hpp"
+#include "srw_trace.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -20,10 +21,32 @@ bool WindowsServices::resident_timestamp_counter(const GuestState&,const GuestMe
 }
 #endif
 #ifdef X64ARM_HOST_SERVICES_PARALLEL_SERVICE
+namespace {
+// SRW 慢路徑（客體常式 CAS 失敗、或未安裝客體常式）在 worker 完成可判定的情況：取得、Try 失敗、
+// 無等待者的釋放。有宿主等待者（bit1）的釋放、需要排隊的取得仍交協調者。X64ARM_PARALLEL_SRW=0 關閉（同成品對照）。
+bool parallel_srw_enabled() noexcept {
+    static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_PARALLEL_SRW");return !setting || std::string_view(setting)!="0";}();
+    return enabled;
+}
+bool srw_service(std::string_view symbol) noexcept {
+    return symbol=="AcquireSRWLockExclusive" || symbol=="AcquireSRWLockShared" ||
+        symbol=="TryAcquireSRWLockExclusive" || symbol=="TryAcquireSRWLockShared" ||
+        symbol=="ReleaseSRWLockExclusive" || symbol=="ReleaseSRWLockShared";
+}
+// 持有者在其他 worker 上執行時，短暫等待通常比進協調者排隊便宜（Windows SRW 亦先自旋）；
+// 約 1～2 µs 後仍未釋放就交回協調者，不讓等待者佔住 worker。
+constexpr unsigned srw_spin_limit=512;
+inline void spin_pause() noexcept {
+#if defined(__aarch64__)
+    __builtin_arm_yield();
+#endif
+}
+}
 bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_PARALLEL_SERVICES");return !setting || std::string_view(setting)!="0";}();
     if(!enabled || x86_ || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled() || runtime_.forced_exit_code())return false;
     const auto symbol=name(address);
+    if(parallel_srw_enabled() && srw_service(symbol))return true;
     return symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue" ||
         symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
         symbol=="InitOnceBeginInitialize" || symbol=="InitOnceExecuteOnce" ||
@@ -163,6 +186,36 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(!home.data || home.after<32)return false;
         if(invoke_math(state,memory,{"crt",symbol,2}))throw std::logic_error("浮點控制服務意外終止客體");
         std::atomic_thread_fence(std::memory_order_seq_cst);return true;
+    }else if(srw_service(symbol)){
+        // 字組編碼與協調者路徑／客體常式相同：bit0 獨占、bit1 宿主有等待者、bit2 起為共用持有數。
+        // 只以原子 CAS 改字組，不碰執行緒表；與協調者的 CAS 迴圈及客體 lock cmpxchg 互相線性化。
+        auto* word=pointer(first,8,3);if(!word)return false;
+        std::atomic_ref<std::uint64_t> lock(*static_cast<std::uint64_t*>(word));
+        const bool shared=symbol.ends_with("Shared");
+        auto value=lock.load(std::memory_order_acquire);
+        if(symbol.starts_with("Release")){
+            for(;;){
+                // 有等待者時須由原服務喚醒；未持有則交回原路徑回報錯誤。
+                if((value&2) || (shared?!(value>>2):!(value&1))){detail::record_srw(detail::SrwEvent::WorkerDefer);return false;}
+                if(lock.compare_exchange_weak(value,shared?value-4:value&~UINT64_C(1),std::memory_order_acq_rel,std::memory_order_acquire))break;
+            }
+            detail::record_srw(detail::SrwEvent::WorkerRelease);
+        }else{
+            // 取得條件與原服務相同（bit1 存在時仍可插隊取得）；Try 不等待，競爭即回 FALSE。
+            const bool attempt=symbol.starts_with("Try");const bool spin=!attempt && active.size()>1;
+            for(unsigned round=0;;){
+                if(!(value&1) && (shared || !(value>>2))){
+                    if(shared && (value>>2)==UINT64_C(0x3fffffffffffffff)){detail::record_srw(detail::SrwEvent::WorkerDefer);return false;}
+                    if(lock.compare_exchange_weak(value,shared?value+4:value|1,std::memory_order_acq_rel,std::memory_order_acquire)){
+                        result=1;detail::record_srw(round?detail::SrwEvent::WorkerSpinAcquire:detail::SrwEvent::WorkerAcquire);break;
+                    }
+                    continue;
+                }
+                if(attempt){detail::record_srw(detail::SrwEvent::WorkerTryFail);break;}
+                if(!spin || ++round>srw_spin_limit){detail::record_srw(detail::SrwEvent::WorkerDefer);return false;}
+                spin_pause();value=lock.load(std::memory_order_acquire);
+            }
+        }
     }else if(symbol=="GetCurrentThreadId")result=thread_identifier(tid);
     else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"){
         auto* output=pointer(first,8,2);if(!output)return false;

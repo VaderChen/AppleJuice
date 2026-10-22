@@ -5,6 +5,8 @@
 #include "socket_ingress.hpp"
 #include "socket_filter_control.hpp"
 #include <poll.h>
+#include <chrono>
+#include <netdb.h>
 #include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
@@ -149,6 +151,14 @@ void WindowsServices::poll_socket_io(GuestMemory& memory) {
                     const auto address=native_address(io.address);const auto flags=::fcntl(fd,F_GETFL);
                     if(flags<0 || ::fcntl(fd,F_SETFL,flags|O_NONBLOCK)<0)io.error=socket_error(errno);
                     else {const auto status=::connect(fd,reinterpret_cast<const sockaddr*>(&address.storage),address.size),error=errno;io.started=true;
+                        if(std::getenv("X64ARM_TRACE_NETWORK_STATE")){
+                            char host[NI_MAXHOST]{},port[NI_MAXSERV]{};
+                            if(!::getnameinfo(reinterpret_cast<const sockaddr*>(&address.storage),address.size,host,sizeof(host),port,sizeof(port),NI_NUMERICHOST|NI_NUMERICSERV))
+                                std::fprintf(stderr,"[socket_connect_start] pid=%u ms=%lld socket=%llx host=%s port=%s status=%d native_error=%d\n",process_id(),
+                                    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()),
+                                    static_cast<unsigned long long>(io.socket),host,port,status,status<0?error:0);
+                            errno=error;
+                        }
                         if(::fcntl(fd,F_SETFL,flags)<0)io.error=socket_error(errno);
                         else if(!status)io.connected=true;
                         else if(error!=EINPROGRESS && error!=EALREADY && error!=EINTR)io.error=socket_error(error);
@@ -188,7 +198,7 @@ void WindowsServices::poll_socket_io(GuestMemory& memory) {
         io.done=true;
         if(std::getenv("X64ARM_TRACE_NETWORK_STATE")){
             const auto saved=errno;
-            std::fprintf(stderr,"[socket_io_complete] pid=%u socket=%llx kind=%u requested=%zu transferred=%u error=%u overlapped=%llx port=%llx notify=%u\n",process_id(),static_cast<unsigned long long>(io.socket),static_cast<unsigned>(io.kind),io.data.size(),io.transferred,io.error,static_cast<unsigned long long>(io.overlapped),static_cast<unsigned long long>(io.port),io.notify?1U:0U);
+            std::fprintf(stderr,"[socket_io_complete] pid=%u ms=%lld socket=%llx kind=%u requested=%zu transferred=%u error=%u overlapped=%llx port=%llx notify=%u\n",process_id(),static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()),static_cast<unsigned long long>(io.socket),static_cast<unsigned>(io.kind),io.data.size(),io.transferred,io.error,static_cast<unsigned long long>(io.overlapped),static_cast<unsigned long long>(io.port),io.notify?1U:0U);
             errno=saved;
         }
         if(found!=network.sockets.end())trace_loopback_io(process_id(),*found->second,io,"complete");

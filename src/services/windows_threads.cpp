@@ -9,6 +9,7 @@
 #include <unistd.h>
 #endif
 #include "x64arm/windows_services.hpp"
+#include "srw_trace.hpp"
 #include "resident_service_policy.hpp"
 #include "guest_crt_state.h"
 #include "windows_loader_lock.hpp"
@@ -445,12 +446,26 @@ ExecutionPolicy WindowsServices::execution_policy(const GuestState &state) const
     if(runtime_.process_background || runtime_.process_priority_class==0x40)return ExecutionPolicy::Efficient;
     auto control=runtime_.process_power_control,state_mask=runtime_.process_power_state;
     const auto teb = x86_ ? state.fs_base : state.gs_base;
-    for (const auto &[id, thread] : threads_.items) {
-        (void)id;
-        if (thread.teb == teb){
-            if(thread.power_control&1U){control=thread.power_control;state_mask=thread.power_state;}
-            break;
+    // 重新綁定 worker 時頻繁查詢：先以 context 位址找到執行緒並核對 TEB，對不上才依 TEB 走訪。
+    const GuestThread *owner = nullptr;
+    {
+        std::unique_lock<std::mutex> lock;
+        const auto &index = resident_thread_index(lock);
+        if (const auto found = index.contexts.find(&state); found != index.contexts.end())
+            if (const auto thread = threads_.items.find(found->second); thread != threads_.items.end() && thread->second.teb == teb)
+                owner = &thread->second;
+    }
+    if (!owner)
+        for (const auto &[id, thread] : threads_.items) {
+            (void)id;
+            if (thread.teb == teb) {
+                owner = &thread;
+                break;
+            }
         }
+    if (owner && (owner->power_control & 1U)) {
+        control = owner->power_control;
+        state_mask = owner->power_state;
     }
     if(control&1U)return state_mask&1U?ExecutionPolicy::Efficient:ExecutionPolicy::Responsive;
     return runtime_.process_priority_class==0x4000?ExecutionPolicy::Utility:
@@ -726,6 +741,39 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
     if (idle_timeline_file()) {
         ++(wake ? run_trace.wake_set : run_trace.wake_zero);
         run_trace.last_wake = wake;
+    }
+    // 診斷：X64ARM_TRACE_IDLE_DUMP=<目錄> 時，常駐平行模式沒有 runnable 且下一次喚醒超過 20 ms（或無期限）
+    // 就傾印各客體執行緒的等待（每程序最多每 3 秒一次）。協調者此時直接休眠，不經排程迴圈的閒置傾印。
+    static const char* const idle_dump_directory=std::getenv("X64ARM_TRACE_IDLE_DUMP");
+    if(idle_dump_directory && !runnable && (!wake || wake>=UINT64_C(20000000))){
+        static std::atomic<long long> last_dump{};
+        const auto now_ms=static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        auto previous=last_dump.load();
+        if(now_ms-previous>=3000 && last_dump.compare_exchange_strong(previous,now_ms)){
+            const auto path=std::string(idle_dump_directory)+"/resident-idle-"+std::to_string(::getpid())+".log";
+            if(auto* out=std::fopen(path.c_str(),"a")){
+                const auto ticks=detail::monotonic_ticks();
+                std::fprintf(out,"resident_idle unix_ms=%lld wake_ns=%llu threads=%zu\n",now_ms,static_cast<unsigned long long>(wake),threads_.items.size());
+                for(const auto& [id,thread]:threads_.items){
+                    if(thread.status==ThreadStatus::Exited)continue;
+                    std::fprintf(out,"  id=%llu status=%d suspended=%d kind=%d remaining_ms=%lld name=%s rip=0x%llx api=%s\n",
+                        static_cast<unsigned long long>(id),static_cast<int>(thread.status),thread.suspended?1:0,static_cast<int>(thread.wait.kind),
+                        thread.wait.deadline==UINT64_MAX?-1LL:static_cast<long long>((thread.wait.deadline>ticks?thread.wait.deadline-ticks:0)/10000),
+                        utf16_to_utf8(thread.description).c_str(),static_cast<unsigned long long>(thread.context.rip.value),
+                        handles(thread.context.rip)?std::string(name(thread.context.rip)).c_str():"");
+                    for(const auto handle:thread.wait.handles){
+                        const auto object=runtime_.wait_objects.find(handle);
+                        if(object==runtime_.wait_objects.end()){std::fprintf(out,"    handle=0x%llx (非等待物件)\n",static_cast<unsigned long long>(handle));continue;}
+                        const auto& state_object=runtime_.wait_state(object->second);
+                        std::fprintf(out,"    handle=0x%llx kind=%d signaled=%d manual=%d count=%u shared_fd=%d name=%s\n",
+                            static_cast<unsigned long long>(handle),static_cast<int>(object->second.kind),state_object.signaled()?1:0,
+                            state_object.manual_reset?1:0,state_object.count,runtime_.wait_lock_descriptor(object->second),
+                            utf16_to_utf8(object->second.name).c_str());
+                    }
+                }
+                std::fclose(out);
+            }
+        }
     }
 #endif
     return wake;
@@ -1805,7 +1853,8 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
                 idle_dumped=true;
                 const auto path=std::string(idle_dump_directory)+"/idle-"+std::to_string(::getpid())+".log";
                 if(auto* out=std::fopen(path.c_str(),"a")){
-                    std::fprintf(out,"idle_dump clock=%llu current=%llu threads=%zu wake_epoch=%llu\n",
+                    std::fprintf(out,"idle_dump unix_ms=%lld clock=%llu current=%llu threads=%zu wake_epoch=%llu\n",
+                        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()),
                         static_cast<unsigned long long>(runtime_.clock_ticks),static_cast<unsigned long long>(threads_.current),
                         threads_.items.size(),static_cast<unsigned long long>(wake_epoch));
                     for(const auto& [id,thread]:threads_.items){
@@ -2630,6 +2679,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                     }
                 }
                 // 等待者由排程器的等待解析依字組取得鎖；bit1 保留到最後一位等待者離開。
+                detail::record_srw((value & 2) ? detail::SrwEvent::HostReleaseWake : detail::SrwEvent::HostRelease);
                 if (value & 2)
                     resolve_thread_waits(memory,ThreadWakeScope::Slim,address);
             } else {
@@ -2644,6 +2694,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                     } else if (exchange(value | 2)) { queued = true; break; }
                 }
                 if (acquired) result = 1;
+                detail::record_srw(acquired ? detail::SrwEvent::HostAcquire : queued ? detail::SrwEvent::HostQueue : detail::SrwEvent::HostTryFail);
                 if (queued) {
                 auto &thread = threads_.items.at(threads_.current);
                 thread.status = ThreadStatus::Waiting;
