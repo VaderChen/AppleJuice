@@ -164,7 +164,37 @@ constexpr std::array services{
     Service{"CreateFileW", 7}, Service{"CreateFileA", 7}, Service{"CreateFile2",5}, Service{"ReadFile", 5}, Service{"CloseHandle", 1},
     Service{"GetFileSizeEx", 2}, Service{"SetFilePointerEx", 4,1U<<1}, Service{"GetProcessHeaps",2}, Service{"HeapWalk",2}
 };
-
+// 診斷：X64ARM_TRACE_HEAP_PATHS=1 時每秒輸出 process heap 小物件與一般 heap 兩條路徑的次數及耗時。
+struct HeapPathStats {
+    std::uint64_t guest_alloc{},guest_alloc_ns{},general_alloc{},general_alloc_ns{},guest_free{},guest_free_ns{},
+        general_free{},general_free_ns{},general_large_free{},other{},other_ns{},skip_heap{},skip_locked{},skip_flags{},skip_full{},last_heap{},last_flags{};
+    std::chrono::steady_clock::time_point next{};
+};
+bool trace_heap_paths(){static const bool enabled=std::getenv("X64ARM_TRACE_HEAP_PATHS")!=nullptr;return enabled;}
+// x86 可成長私有 heap 改用級距配置區；X64ARM_GUEST_HEAP_PRIVATE=0 停用，恢復一般 heap（同成品對照用）。
+bool guest_heap_private_requested(){
+    static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_GUEST_HEAP_PRIVATE");return !setting || std::string_view(setting)!="0";}();
+    return enabled;
+}
+HeapPathStats heap_path_stats;
+void report_heap_paths(std::uint32_t pid,std::size_t objects){
+    auto& s=heap_path_stats;const auto now=std::chrono::steady_clock::now();
+    if(now<s.next)return;
+    if(s.next!=std::chrono::steady_clock::time_point{}){
+        const auto unix_us=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr,"heap_paths pid=%u unix_us=%lld guest_alloc=%llu/%llu general_alloc=%llu/%llu guest_free=%llu/%llu general_free=%llu/%llu large_free=%llu other=%llu/%llu objects=%zu skip_heap=%llu skip_locked=%llu skip_flags=%llu skip_full=%llu last_heap=0x%llx last_flags=0x%llx process_heap=0x%llx\n",
+            pid,static_cast<long long>(unix_us),
+            static_cast<unsigned long long>(s.guest_alloc),static_cast<unsigned long long>(s.guest_alloc_ns/1000),
+            static_cast<unsigned long long>(s.general_alloc),static_cast<unsigned long long>(s.general_alloc_ns/1000),
+            static_cast<unsigned long long>(s.guest_free),static_cast<unsigned long long>(s.guest_free_ns/1000),
+            static_cast<unsigned long long>(s.general_free),static_cast<unsigned long long>(s.general_free_ns/1000),
+            static_cast<unsigned long long>(s.general_large_free),static_cast<unsigned long long>(s.other),static_cast<unsigned long long>(s.other_ns/1000),objects,
+            static_cast<unsigned long long>(s.skip_heap),static_cast<unsigned long long>(s.skip_locked),static_cast<unsigned long long>(s.skip_flags),
+            static_cast<unsigned long long>(s.skip_full),static_cast<unsigned long long>(s.last_heap),static_cast<unsigned long long>(s.last_flags),
+            static_cast<unsigned long long>(WindowsServices::process_heap));
+    }
+    s=HeapPathStats{};s.next=now+std::chrono::seconds(1);
+}
 }
 bool WindowsServices::dispatch_system_call(GuestState& state,GuestMemory& memory){
     return dispatch_system_call(state,memory,SystemCallEntry::Syscall);
@@ -417,6 +447,8 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             guest_memory_routines_=GuestAddress{callback_return_.value+guest_memory_page_offset};
             memory.map(guest_memory_routines_,GuestMemory::guest_page_size,read_execute,bytes);
         }
+        // PE32 沒有客體常式頁；process heap 的小型配置仍可由服務端使用同一套 chunk 級距配置區。
+        if(x86_)(void)guest_heap_setup(memory);
         if(!x86_ && guest_scalar_math_enabled()){
             // 沿用客體 CRT 常式與 resolver；一般數值不經 HostServices 或物化完整 GuestState。
             // 只在初始化填入各自原服務的慢路徑，之後程式頁保持唯讀且可執行。
@@ -791,6 +823,13 @@ std::string_view WindowsServices::name(GuestAddress address) const noexcept {
     const auto index = (address.value - stub_base_.value) / 16;
     return index < services.size() ? services[index].name : runtime_service_descriptors()[index - services.size()].symbol;
 }
+#ifdef X64ARM_HOST_SERVICES_PARALLEL_SERVICE
+const WindowsServiceDescriptor* WindowsServices::runtime_service_descriptor(GuestAddress address)const noexcept {
+    const auto begin=stub_base_.value+services.size()*16;const auto table=runtime_service_descriptors();
+    if(address.value<begin || (address.value-begin)%16 || (address.value-begin)/16>=table.size())return nullptr;
+    return &table[(address.value-begin)/16];
+}
+#endif
 bool WindowsServices::same_state(const WindowsServices& other) const {
     if(runtime_.machine_clock || other.runtime_.machine_clock)return false; // 共用機器 UTC 含跨程序狀態。
     if(detached_console_!=other.detached_console_)return false;
@@ -1084,6 +1123,22 @@ unsigned WindowsServices::resident_scalar_recipe(GuestAddress address) const noe
     if(!resident_scalar_service(address) || !resident_service(address))return 0;
     const auto index=(address.value-stub_base_.value-services.size()*16)/16;
     return scalar_math_recipe(runtime_service_descriptors()[index]);
+}
+#endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_SCALAR
+bool WindowsServices::resident_context_scalar_service(GuestAddress address) const noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_AOT_WORKER_SCALAR");return !value || std::string_view(value)!="0";}();
+    return enabled && resident_scalar_service(address) && resident_service(address);
+}
+bool WindowsServices::invoke_resident_context_scalar(ResidentScalarCall& call,GuestMemory& memory,
+                                                     const ResidentScalarErrors& errors) noexcept {
+    const GuestAddress address{call.entry};
+    entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,address.value,
+        entry_runtime_profile::enabled()?name(address):std::string_view{});
+    if(!resident_context_scalar_service(address))return false;
+    const auto index=(address.value-stub_base_.value-services.size()*16)/16;
+    const auto* operation=scalar_math_operation(runtime_service_descriptors()[index]);
+    return operation && invoke_native_context_scalar_math(call,memory,*operation,errors);
 }
 #endif
 #ifdef X64ARM_HOST_SERVICES_SCALAR_ERRORS
@@ -1501,11 +1556,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
         else {
             memory.check(GuestAddress{arg(1)},size,Access::Write);const auto previous=memory.load(GuestAddress{arg(1)},bits);
             const auto belongs=[&](std::uint64_t pointer){const auto owner=runtime_.heap_owners.find(pointer);return owner==runtime_.heap_owners.end()?heap==process_heap:owner->second==heap;};
-            if(previous && (!allocations_.contains(previous) || !belongs(previous)))fail(87);
+            // x86 配置區的已配置區塊依 chunk 擁有者歸屬 heap，與一般區塊依位址合併列舉。
+            static const std::vector<std::pair<std::uint64_t,std::uint64_t>> no_guest_blocks;
+            const auto& guest=guest_heap_chunked_?guest_heap_allocated_blocks(memory,heap):no_guest_blocks;
+            const auto guest_after=[&](std::uint64_t at){return std::upper_bound(guest.begin(),guest.end(),std::pair<std::uint64_t,std::uint64_t>{at,UINT64_MAX});};
+            const bool previous_guest=previous && std::binary_search(guest.begin(),guest.end(),std::pair<std::uint64_t,std::uint64_t>{previous,0},
+                [](const auto& a,const auto& b){return a.first<b.first;});
+            if(previous && !previous_guest && (!allocations_.contains(previous) || !belongs(previous)))fail(87);
             else {auto block=previous?allocations_.upper_bound(previous):allocations_.begin();while(block!=allocations_.end() && !belongs(block->first))++block;
-                if(block==allocations_.end())fail(259);
-                else if(block->second>UINT32_MAX)fail(534);
-                else {memory.write(GuestAddress{arg(1)},std::vector<std::uint8_t>(size));memory.store(GuestAddress{arg(1)},bits,block->first);memory.store(GuestAddress{arg(1)+unit},32,block->second);memory.store(GuestAddress{arg(1)+unit+6},16,4);returned=1;}
+                const auto next_guest=previous?guest_after(previous):guest.begin();
+                const bool use_guest=next_guest!=guest.end() && (block==allocations_.end() || next_guest->first<block->first);
+                const auto entry_address=use_guest?next_guest->first:block!=allocations_.end()?block->first:0;
+                const auto entry_size=use_guest?next_guest->second:block!=allocations_.end()?static_cast<std::uint64_t>(block->second):0;
+                if(!use_guest && block==allocations_.end())fail(259);
+                else if(entry_size>UINT32_MAX)fail(534);
+                else {memory.write(GuestAddress{arg(1)},std::vector<std::uint8_t>(size));memory.store(GuestAddress{arg(1)},bits,entry_address);memory.store(GuestAddress{arg(1)+unit},32,entry_size);memory.store(GuestAddress{arg(1)+unit+6},16,4);returned=1;}
             }
         }
     }
@@ -1525,24 +1590,56 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
     else if(symbol=="HeapCreate") {
         if(dword(0)&~1U)fail(50);
         else if(arg(1)>memory.limit() || arg(2)>UINT64_MAX-4095 || (arg(2) && arg(1)>arg(2)))fail(8);
-        else {returned=runtime_.allocate_wait_handle();runtime_.private_heaps.emplace(returned,std::pair{arg(2)?(arg(2)+4095)&~UINT64_C(4095):0,UINT64_C(0)});if(dword(0)&1)runtime_.unserialized_heaps.insert(returned);}
+        else {returned=runtime_.allocate_wait_handle();runtime_.private_heaps.emplace(returned,std::pair{arg(2)?(arg(2)+4095)&~UINT64_C(4095):0,UINT64_C(0)});if(dword(0)&1)runtime_.unserialized_heaps.insert(returned);
+            // 可成長私有 heap（如靜態 CRT 的 _crtheap）可改用級距配置區；有上限者維持一般 heap 的容量契約。
+            if(guest_heap_chunked_ && !arg(2) && guest_heap_private_requested())guest_private_heaps_.emplace(returned,GuestPrivateHeap{});}
     } else if(symbol=="HeapDestroy") {
         const auto heap=runtime_.private_heaps.find(arg(0));
         if(heap==runtime_.private_heaps.end())fail(6);
         else {std::vector<std::uint64_t> pointers;for(const auto& [pointer,owner]:runtime_.heap_owners)if(owner==arg(0))pointers.push_back(pointer);
             for(const auto pointer:pointers)(void)free_heap(memory,pointer,state);
             // 釋放時可能進入快速清單；移除 heap 前把它的區塊全部歸還，頁面與用量帳目隨之結清。
-            flush_heap_quick(memory,arg(0));heap_quick_bins_.erase(arg(0));runtime_.private_heaps.erase(heap);runtime_.heap_locks.erase(arg(0));runtime_.unserialized_heaps.erase(arg(0));returned=1;}
+            flush_heap_quick(memory,arg(0));heap_quick_bins_.erase(arg(0));guest_heap_destroy(memory,arg(0));runtime_.private_heaps.erase(heap);runtime_.heap_locks.erase(arg(0));runtime_.unserialized_heaps.erase(arg(0));returned=1;}
     } else if(symbol=="HeapAlloc" || symbol=="HeapReAlloc" || symbol=="HeapFree" || symbol=="HeapSize" || symbol=="HeapValidate") {
         const auto heap=arg(0),pointer=arg(2);const bool valid=heap==process_heap || runtime_.private_heaps.contains(heap);
+        struct HeapPathScope {
+            bool active;std::uint64_t* calls{};std::uint64_t* nanoseconds{};std::chrono::steady_clock::time_point begin;
+            ~HeapPathScope(){if(active && calls){++*calls;*nanoseconds+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count());}}
+        } heap_path{trace_heap_paths(),nullptr,nullptr,trace_heap_paths()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
+        if(heap_path.active){
+            report_heap_paths(process_id(),allocations_.size());auto& s=heap_path_stats;
+            const bool guest=guest_heap_contains(pointer) && symbol!="HeapAlloc";
+            if(symbol=="HeapAlloc"){heap_path.calls=&s.guest_alloc;heap_path.nanoseconds=&s.guest_alloc_ns;}
+            else if(symbol=="HeapFree" && guest){heap_path.calls=&s.guest_free;heap_path.nanoseconds=&s.guest_free_ns;}
+            else if(symbol=="HeapFree"){heap_path.calls=&s.general_free;heap_path.nanoseconds=&s.general_free_ns;
+                if(const auto found=allocations_.find(pointer);found!=allocations_.end() && found->second>4096)++s.general_large_free;}
+            else {heap_path.calls=&s.other;heap_path.nanoseconds=&s.other_ns;}
+        }
         const auto allocation=allocations_.find(pointer);const auto owner=runtime_.heap_owners.find(pointer);
         const bool owned=allocation!=allocations_.end() && (owner==runtime_.heap_owners.end()?heap==process_heap:owner->second==heap);
         const auto flags_value=dword(1);const auto allowed=symbol=="HeapAlloc"?9U:symbol=="HeapReAlloc"?0x19U:1U;
         if(valid && (symbol=="HeapAlloc" || symbol=="HeapReAlloc") && (flags_value&4))throw HostCallFault("尚未支援 HEAP_GENERATE_EXCEPTIONS 的記憶體不足例外");
         if(!valid || (flags_value&~allowed)){fail(87);if(symbol=="HeapSize")returned=x86_?UINT32_MAX:UINT64_MAX;}
-        else if(symbol=="HeapAlloc")returned=allocate_heap(memory,arg(2),heap);
-        else if(heap==process_heap && guest_heap_contains(pointer)){
-            // malloc 配置區區塊同屬 process heap：與 UCRT 相同可經 Heap* API 查詢、重配或釋放。
+        else if(symbol=="HeapAlloc"){
+            // x86 process heap 與可成長私有 heap 的小型配置由 chunk 級距配置區提供（O(1) 串列，不經位址搜尋與
+            // 存活物件樹）；HeapFree／HeapSize／HeapReAlloc／HeapValidate 依位址與 chunk 擁有者辨識這些區塊。
+            // 不足時沿用一般 heap。HeapLock 期間（含持有者自己的配置）改走一般 heap，讓鎖定中的 HeapWalk 與既有登錄一致。
+            const auto heap_lock=runtime_.heap_locks.find(heap);
+            const bool heap_locked=heap_lock!=runtime_.heap_locks.end() && heap_lock->second.owner;
+            if(guest_heap_chunked_ && !heap_locked && !(flags_value&~9U) && (heap==process_heap || guest_heap_private_ready(heap)))
+                if(const auto block=guest_heap_allocate(memory,std::max<std::uint64_t>(UINT64_C(1),arg(2)),heap)){
+                    if(flags_value&8U)memory.fill(GuestAddress{block},0,static_cast<std::size_t>(std::max<std::uint64_t>(UINT64_C(1),arg(2))));
+                    returned=block;
+                }
+            if(!returned){
+                if(heap_path.active){heap_path.calls=&heap_path_stats.general_alloc;heap_path.nanoseconds=&heap_path_stats.general_alloc_ns;
+                    auto& st=heap_path_stats;
+                    if(heap!=process_heap){++st.skip_heap;st.last_heap=heap;}else if(heap_locked)++st.skip_locked;else if(flags_value&~9U){++st.skip_flags;st.last_flags=flags_value;}else ++st.skip_full;}
+                returned=allocate_heap(memory,arg(2),heap);
+            }
+        }
+        else if(guest_heap_contains(pointer) && guest_heap_owner(memory,pointer)==heap){
+            // malloc 配置區區塊同屬 process heap：與 UCRT 相同可經 Heap* API 查詢、重配或釋放；私有 heap 的區塊依 chunk 擁有者歸屬。
             const auto size=guest_heap_block_size(memory,pointer);
             if(symbol=="HeapFree"){guest_heap_free(memory,pointer);returned=1;}
             else if(symbol=="HeapSize")returned=size;
@@ -1680,6 +1777,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
                 }
                 if(writing && !standard && found->second.native && io.bytes)found->second.metadata=found->second.native->information().metadata;
             }catch(const std::bad_alloc&){io.error=8;}catch(const MemoryFault&){io.error=998;}
+            // 診斷：X64ARM_TRACE_FILE_READ=<路徑片段> 時，記錄符合檔案每次同步讀寫的位移、長度與宿主時間。
+            if(static const char* const read_trace=std::getenv("X64ARM_TRACE_FILE_READ");read_trace && *read_trace && !standard &&
+               found->second.path.find(read_trace)!=std::string::npos)
+                std::fprintf(stderr,"file_read_trace pid=%u op=%.*s path=%s offset=%llu count=%u bytes=%llu overlapped=%d unix_us=%lld\n",process_id(),
+                    static_cast<int>(symbol.size()),symbol.data(),found->second.path.c_str(),static_cast<unsigned long long>(offset),count,
+                    static_cast<unsigned long long>(io.bytes),overlapped?1:0,static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count()));
             if(io.error && std::getenv("X64ARM_TRACE_FILE_ERRORS"))std::fprintf(stderr,"[file_io] %.*s handle=%llu offset=%llu count=%u transferred=%llu error=%u\n",static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned long long>(handle),static_cast<unsigned long long>(offset),count,static_cast<unsigned long long>(io.bytes),io.error);
             if(count_pointer)memory.store(GuestAddress{count_pointer},32,io.bytes);
             if(!io.error && !standard && (!overlapped || (found->second.mode&0x30)))runtime_.win_file_positions.at(found->second.object)=offset+io.bytes;

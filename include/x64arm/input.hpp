@@ -18,6 +18,7 @@ struct Object {
     std::int32_t minimum{}, maximum{}, physical_minimum{}, physical_maximum{};
     bool relative{}, actuator{};
     std::string name;
+    bool operator==(const Object&) const = default;
 };
 struct Device {
     Guid instance{}, product{};
@@ -32,6 +33,7 @@ struct Device {
     // USB 字串描述元索引（iManufacturer／iProduct／iSerialNumber）；0 表示裝置未提供。
     std::array<std::uint8_t,3> string_indices{};
     std::vector<std::uint8_t> hid_descriptor{};
+    bool operator==(const Device&) const = default;
 };
 struct Event { Guid device{}; unsigned object{}; std::int64_t value{};std::uint32_t extra{};bool repeat{}; };
 // 標準控制器 profile；軸為 [-1,1]、扳機為 [0,1]，不在 API 層猜測 HID 按鈕順序。
@@ -91,6 +93,8 @@ class Backend {
 public:
     virtual ~Backend()=default;
     virtual std::vector<Device> devices()=0;
+    // devices() 內容的換代編號：相同編號保證清單完全相同；0 表示不提供，呼叫端須每次重新取得。
+    virtual std::uint64_t device_generation(){return 0;}
     virtual std::vector<Event> poll()=0;
     virtual std::vector<Report> reports(){return {};}
     virtual std::vector<Gamepad> gamepads(){return {};}

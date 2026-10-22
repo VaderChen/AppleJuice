@@ -100,6 +100,8 @@ struct ThreadRuntime {
     std::uint64_t slice_deadline{UINT64_MAX}; // 宿主時鐘模式的時間片上限，單位 100 ns。
     HostInstructionBudget host_instruction_budget;
     bool yield{};
+    // 常駐中斷返回的排程：完整輪詢外部事件與逾時，但時間片未到期時續跑目前執行緒，不強制輪替。
+    bool interrupt_poll{};
     bool operator==(const ThreadRuntime&) const = default;
 };
 }

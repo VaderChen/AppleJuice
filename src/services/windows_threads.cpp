@@ -28,6 +28,9 @@
 namespace x64arm {
 namespace {
 bool resident_recipe_eligible(const HostServices& provider,GuestAddress address) {
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_SCALAR
+    if(provider.resident_context_scalar_service(address))return true;
+#endif
 #ifdef X64ARM_HOST_SERVICES_SCALAR_RECIPE
     return provider.resident_service(address) && provider.resident_scalar_service(address) &&
         provider.resident_scalar_recipe(address)!=0;
@@ -42,6 +45,50 @@ struct IdleTrace {
     std::uint64_t buckets[6]{}; // <100µs、<500µs、<1ms、<5ms、<20ms、>=20ms 的次數
 };
 IdleTrace idle_trace;
+// 診斷：X64ARM_TRACE_IDLE_TIMELINE=<目錄> 時，逐段記錄閒置起訖（Unix 微秒），供跨程序幀節拍對照。
+std::FILE* idle_timeline_file() {
+    static std::FILE* const file = [] () -> std::FILE* {
+        const auto* directory = std::getenv("X64ARM_TRACE_IDLE_TIMELINE");
+        if (!directory || !*directory)
+            return nullptr;
+        auto* opened = std::fopen((std::string(directory) + "/idle-" + std::to_string(::getpid()) + ".txt").c_str(), "a");
+        if (opened)
+            std::setvbuf(opened, nullptr, _IOLBF, 0); // 程序可能被強制結束，逐行寫出。
+        return opened;
+    }();
+    return file;
+}
+// 同一時間線另記單一客體執行緒連續占用排程器 10 ms 以上的區段（換人或閒置時結算）。
+struct RunTrace {std::uint64_t thread{},boundaries{},wake_zero{},wake_set{},last_wake{},interrupts{},arms{};std::chrono::steady_clock::time_point start{};};
+RunTrace run_trace;
+long long idle_timeline_unix_us(std::chrono::steady_clock::time_point point);
+template<class Threads> void trace_run_switch(const Threads& threads, std::uint64_t next) {
+    auto* timeline = idle_timeline_file();
+    if (!timeline || run_trace.thread == next)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (run_trace.thread && now - run_trace.start >= std::chrono::milliseconds(10)) {
+        const auto found = threads.find(run_trace.thread);
+        const auto name = found == threads.end() ? std::string{} : utf16_to_utf8(found->second.description);
+        // 區段內經過的服務／語義邊界次數，及結算時其他可執行的執行緒（分辨無法搶占與主執行緒在等待）。
+        std::string runnable;
+        for (const auto& [id, thread] : threads)
+            if (id != run_trace.thread && thread.status == ThreadStatus::Runnable && !thread.suspended)
+                runnable += (runnable.empty() ? "" : ",") + std::to_string(id);
+        std::fprintf(timeline, "run %llu %lld %lld 0x%llx boundaries=%llu/%llu/%llu runnable=%s wake=%llu/%llu/%lluus %s\n", static_cast<unsigned long long>(run_trace.thread),
+                     idle_timeline_unix_us(run_trace.start), idle_timeline_unix_us(now),
+                     static_cast<unsigned long long>(found == threads.end() ? 0 : found->second.entry),
+                     static_cast<unsigned long long>(run_trace.boundaries), static_cast<unsigned long long>(run_trace.interrupts),
+                     static_cast<unsigned long long>(run_trace.arms), runnable.empty() ? "-" : runnable.c_str(),
+                     static_cast<unsigned long long>(run_trace.wake_zero), static_cast<unsigned long long>(run_trace.wake_set),
+                     static_cast<unsigned long long>(run_trace.last_wake / 1000), name.c_str());
+    }
+    run_trace = {next, 0, 0, 0, 0, 0, 0, now};
+}
+long long idle_timeline_unix_us(std::chrono::steady_clock::time_point point) {
+    const auto offset = std::chrono::system_clock::now().time_since_epoch() - std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(point.time_since_epoch() + offset).count());
+}
 #endif
 std::uint64_t external_wait_spin_ticks() {
     static const auto ticks = [] {
@@ -315,7 +362,8 @@ bool WindowsServices::acquire_slim_word(GuestMemory &memory, std::uint64_t addre
                 const auto &wait = thread.wait;
                 return entry.first != id && thread.status == ThreadStatus::Waiting &&
                        ((wait.kind == ThreadWaitKind::Slim && wait.handles[0] == address) ||
-                        (wait.kind == ThreadWaitKind::Condition && !wait.critical && wait.handles.size() > 1 && wait.handles[1] == address));
+                        (wait.kind == ThreadWaitKind::Condition && !wait.critical && wait.handles.size() > 1 &&
+                         wait.handles[1] == address && (wait.signaled || wait.deadline <= runtime_.clock_ticks)));
             });
             if (!others) next &= ~UINT64_C(2);
             if (memory.atomic_rmw(GuestAddress{address}, width, GuestMemory::AtomicRmw::CompareExchange, next, word) == word) return true;
@@ -534,9 +582,73 @@ void WindowsServices::resident_control_request(std::uint64_t key,GuestAddress ri
     }
 }
 #endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTROL_DRAIN
+bool WindowsServices::resident_select_control_request(GuestState& state,GuestMemory& memory) {
+    if(!resident_execution_depth_ || parallel_workers()<2 || debugger_stopped())return false;
+    for(const auto& [id,thread]:threads_.items){
+        if(id==threads_.current || thread.status!=ThreadStatus::Runnable || thread.suspended)continue;
+        const auto pending=resident_service_requests_.find(id);
+        if((pending==resident_service_requests_.end() || pending->second!=thread.context.rip) &&
+           (!handles(thread.context.rip) || parallel_service(thread.context.rip) ||
+            resident_recipe_eligible(*this,thread.context.rip)))continue;
+        // schedule 已按輪替順序優先選取相同類別的控制待辦，並保存目前
+        // GuestState、TLS／FLS、回呼及例外；不另設省略狀態交換的捷徑。
+        const auto previous=threads_.current;
+        schedule(state,memory);
+        return threads_.current!=previous;
+    }
+    return false;
+}
+#endif
+namespace {
+// 常駐搶占（時間片絕對期限、監看外部事件、中斷返回時輪詢）預設關閉：同成品實測長卡頓未改善、開機約慢 0.5 秒。
+// X64ARM_RESIDENT_PREEMPT=1 明確開啟；關閉時沿用相對 5 ms 期限，核心的中斷保留與計時器設施照常存在。
+bool resident_preempt_enabled() noexcept {
+    static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_RESIDENT_PREEMPT");return setting && std::string_view(setting)=="1";}();
+    return enabled;
+}
+bool resident_external_wake_enabled() noexcept {
+    // 搶占開啟時，X64ARM_RESIDENT_EXTERNAL_WAKE=0 另可停用外部事件中斷，只依期限與 runnable 武裝（同成品對照）。
+    static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_RESIDENT_EXTERNAL_WAKE");return !setting || std::string_view(setting)!="0";}();
+    return enabled && resident_preempt_enabled();
+}
+// 跨程序 IPC、管道與共用物件的通知都推進同一個 session 喚醒世代。
+class SharedWakeSource final : public ResidentExternalWake {
+    std::shared_ptr<SharedWake> wake_;
+public:
+    explicit SharedWakeSource(std::shared_ptr<SharedWake> wake):wake_(std::move(wake)){}
+    bool wait_changed(std::uint64_t observed,std::uint64_t nanoseconds) const noexcept override {
+        if(wake_->snapshot()!=observed)return true;
+        if(!wake_->wait_for(observed,nanoseconds))std::this_thread::sleep_for(std::chrono::nanoseconds(nanoseconds));
+        return wake_->snapshot()!=observed;
+    }
+};
+}
+std::shared_ptr<const ResidentExternalWake> WindowsServices::resident_external_wake(std::uint64_t& observed) const {
+    // 只有一個客體執行緒時沒有可被外部事件喚醒的等待者。
+#if !defined(_WIN32)
+    if(idle_timeline_file())++run_trace.arms; // 只在核心武裝中斷計時器時查詢
+#endif
+    if(!resident_external_wake_enabled() || !runtime_.host_clock || threads_.items.size()<2)return {};
+    if(!resident_external_source_){
+        auto wake=mapping_wake();if(!wake)return {};
+        resident_external_source_=std::make_shared<SharedWakeSource>(std::move(wake));
+    }
+    observed=resident_external_polled_;
+    return resident_external_source_;
+}
 void WindowsServices::after_resident_parallel(GuestState& state,GuestMemory& memory) {
     parallel_thread_count_=0;
     after_instructions(state,memory,0);
+}
+void WindowsServices::after_resident_interrupt(GuestState& state,GuestMemory& memory) {
+    // 中斷只為其他 runnable、等待期限或外部事件而武裝：直接做完整排程（輪詢外部事件、解析逾時、
+    // 輪替），不等時間片到期；否則期限已過的下一次武裝會立刻再中斷，直到時間片結束。
+    if(resident_preempt_enabled()){threads_.yield=true;threads_.interrupt_poll=true;}
+#if !defined(_WIN32)
+    if(idle_timeline_file())++run_trace.interrupts;
+#endif
+    after_resident_parallel(state,memory);
 }
 std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState* const> contexts) const {
     std::size_t runnable=0;std::uint64_t deadline=UINT64_MAX;
@@ -545,13 +657,27 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
         if(thread.status==ThreadStatus::Runnable && !thread.suspended)++runnable;
         if(thread.status==ThreadStatus::Waiting)deadline=std::min(deadline,thread.wait.deadline);
     }
-    // 尚未取得 worker 的 runnable 必須獲得排程；全部正在運算時不啟用時間片。
-    std::uint64_t wake=runnable>contexts.size()?5000000:0;
+    // 尚未取得 worker 的 runnable 必須獲得排程；全部正在運算時不啟用時間片。單一常駐框架依目前
+    // 執行緒時間片的絕對期限（排程時設定），不可每次進入本體都重新起算：頻繁冷出口會讓相對期限
+    // 不斷順延而永不觸發。多 worker 仍以 5 ms 讓尚未取得 worker 的 runnable 獲得排程。
+    std::uint64_t wake=0;
+    if(runnable>contexts.size()){
+        if(contexts.size()==1 && threads_.slice_deadline!=UINT64_MAX && resident_preempt_enabled()){
+            const auto now=detail::monotonic_ticks();
+            wake=threads_.slice_deadline>now?std::min<std::uint64_t>(threads_.slice_deadline-now,UINT64_MAX/100)*100:1;
+        }else wake=5000000;
+    }
     if(deadline!=UINT64_MAX){
         const auto now=detail::monotonic_ticks();
         const auto remaining=deadline>now?std::min<std::uint64_t>(deadline-now,UINT64_MAX/100)*100:1;
         wake=wake?std::min(wake,remaining):remaining;
     }
+#if !defined(_WIN32)
+    if (idle_timeline_file()) {
+        ++(wake ? run_trace.wake_set : run_trace.wake_zero);
+        run_trace.last_wake = wake;
+    }
+#endif
     return wake;
 }
 #endif
@@ -579,6 +705,15 @@ std::uint64_t WindowsServices::instruction_slice() const noexcept {
 }
 void WindowsServices::after_instructions(GuestState &state, GuestMemory &memory, std::uint64_t count) {
     retired(memory, count);
+#if !defined(_WIN32)
+    if (idle_timeline_file())
+        ++run_trace.boundaries;
+#endif
+    // 跨程序 handle 請求（DuplicateHandle、IsProcessInJob 等）由請求方同步等待回覆。常駐模式改以時間片排程後，
+    // 忙碌中的目標要等下一次 wake_threads 才處理，請求方每次約等 1.5 ms。監看執行緒在轉移通道可讀時設旗標；
+    // 這裡只多一次原子讀取，有請求才立即排空，不做完整排程或其他來源的輪詢。
+    if (handle_transfer_requested())
+        poll_handle_transfers(memory);
     if(!resident_execution_depth_ && runtime_.host_clock && adaptive_scheduler_budget())
         threads_.host_instruction_budget.observe(count,runtime_.clock_ticks);
     if (threads_.items.empty())
@@ -690,8 +825,11 @@ void WindowsServices::after_instructions(GuestState &state, GuestMemory &memory,
     // 多執行緒時不在每個邊界都做完整排程與外部事件輪詢，改在宿主時鐘時間片（與計量模式相同的
     // 2 ms×優先序）到期或明確 yield 時輪替。retired() 對小批次延後同步時鐘，這裡直接讀單調時鐘；
     // 尚未設定截止點（UINT64_MAX）視為到期，由 schedule 建立。精確觀察與舊 JIT 保留原計量排程。
-    const bool resident_due=resident && threads_.items.size()>1 &&
-        (threads_.slice_deadline==UINT64_MAX || detail::monotonic_ticks()>=threads_.slice_deadline);
+    // X64ARM_RESIDENT_SCHEDULE_EVERY_BOUNDARY=1 恢復舊行為（每個邊界都排程），只供同成品對照。
+    static const bool every_boundary=[] {const auto* setting=std::getenv("X64ARM_RESIDENT_SCHEDULE_EVERY_BOUNDARY");
+        return setting && std::string_view(setting)=="1";}();
+    const bool resident_due=resident && threads_.items.size()>1 && (every_boundary ||
+        threads_.slice_deadline==UINT64_MAX || detail::monotonic_ticks()>=threads_.slice_deadline);
     if (threads_.yield || (resident?resident_due:
         ((!clock_slice && !threads_.remaining) ||
          (runtime_.host_clock && runtime_.clock_ticks >= threads_.slice_deadline)))) {
@@ -701,6 +839,12 @@ void WindowsServices::after_instructions(GuestState &state, GuestMemory &memory,
             last_error_ = static_cast<std::uint32_t>(memory.load(
                 GuestAddress{x86_ ? state.fs_base + 0x34 : state.gs_base + 0x68}, 32));
         schedule(state, memory);
+    } else if(resident && parallel_workers()>1 && !debugger_stopped()) {
+        // 服務／語義邊界已交回完整狀態；沒有完整排程時，先將已滿足的
+        // 物件等待轉為 Runnable，讓保留中的 worker 可立即接手。共用解析
+        // 保留 WaitAll、訊號消耗與返回值，不輪詢外部裝置或強迫客體切換。
+        resolve_thread_waits(memory,ThreadWakeScope::Objects);
+        notify_concurrency_changed();
     }
     // 跨程序記憶體操作或排程期間套用的映射變更也在此邊界讓 CFG 快速路徑失效。
     refresh_guard_table(memory);
@@ -948,11 +1092,40 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
         else
             object.active = false;
     }
+    resolve_thread_waits(memory);
+    // 脈衝只屬於這次完整事件輪詢；局部鎖通知不消耗其他事件。
+    for (const auto handle : multimedia_pulses_) {
+        if (const auto event = runtime_.wait_objects.find(handle); event != runtime_.wait_objects.end())
+            event->second.set_signal(false);
+    }
+    multimedia_pulses_.clear();
+}
+void WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope scope,std::uint64_t wake_address) {
+    // 完整排程與同步通知共用取鎖、逾時、返回值及優先序處理。局部通知
+    // 只更新相符等待者，不輪詢外部事件、不切換目前客體；worker 重綁時
+    // 就能看到新的 Runnable 集合，無須等下一個時間片。
     for (auto &[id, thread] : threads_.items) {
-        (void)id;
         if (thread.status != ThreadStatus::Waiting)
             continue;
         auto &wait = thread.wait;
+        if(scope!=ThreadWakeScope::All){
+            const bool condition=wait.kind==ThreadWaitKind::Condition && wait.handles.size()>1;
+            bool selected=false;
+            if(scope==ThreadWakeScope::Condition)
+                selected=condition && wait.handles[0]==wake_address;
+            else if(scope==ThreadWakeScope::Slim)
+                selected=(wait.kind==ThreadWaitKind::Slim && !wait.handles.empty() && wait.handles[0]==wake_address) ||
+                    (condition && !wait.critical && wait.handles[1]==wake_address);
+            else if(scope==ThreadWakeScope::Critical)
+                selected=((wait.kind==ThreadWaitKind::Critical || wait.kind==ThreadWaitKind::CriticalRetry ||
+                           (wait.kind==ThreadWaitKind::CrtLockRetry && wait.critical)) &&
+                          !wait.handles.empty() && wait.handles[0]==wake_address) ||
+                    (condition && wait.critical && wait.handles[1]==wake_address);
+            else if(scope==ThreadWakeScope::Objects)
+                // 別名 handle 仍由鎖內的實際物件與 WaitAll 契約決定資格。
+                selected=wait.kind==ThreadWaitKind::Objects;
+            if(!selected)continue;
+        }
         bool ready = false;
         bool guest_return = false;
         std::uint64_t result = 258;
@@ -1365,12 +1538,6 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
             thread.wait = {};
         }
     }
-    // 脈衝僅釋放此輪已等待的執行緒，不保留訊號供未來的等待使用。
-    for (const auto handle : multimedia_pulses_) {
-        if (const auto event = runtime_.wait_objects.find(handle); event != runtime_.wait_objects.end())
-            event->second.set_signal(false);
-    }
-    multimedia_pulses_.clear();
 }
 // FLS 鏡像：TEB+0x1840 放 128 個值，+0x400 放程序共用的使用中位元圖，TEB FlsData 指向它。
 // 每個執行緒的鏡像永遠等於該執行緒目前（或其目前 fiber）的 FLS 值，所以執行緒切換不必同步；
@@ -1432,13 +1599,17 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
     const auto wake = runtime_.host_clock ? mapping_wake() : nullptr;
     auto handled_wake = wake ? wake->snapshot() : 0;
 #if !defined(_WIN32)
-    static const bool idle_tracing = std::getenv("X64ARM_TRACE_THREAD_CYCLES") != nullptr;
+    static const bool idle_tracing = std::getenv("X64ARM_TRACE_THREAD_CYCLES") != nullptr || idle_timeline_file() != nullptr;
     bool idle_active = false;
     std::chrono::steady_clock::time_point idle_start{};
+    // 閒置傾印以本次 schedule 呼叫內的連續閒置計時；有 runnable 即返回，下次呼叫重新起算。
+    std::chrono::steady_clock::time_point idle_dump_since{};
+    bool idle_dumped = false;
     std::uint64_t idle_epoch = 0;
 #endif
     for (;;) {
         const auto wake_epoch = wake ? wake->snapshot() : 0;
+        resident_external_polled_ = wake_epoch; // 常駐中斷以此為基準；之後的外部通知一定會被看見。
         if (runtime_.host_clock)
             retired(memory, 0);
         wait_debugger(memory);
@@ -1456,6 +1627,7 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
                 break;
             ++chosen;
         }
+
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_PARALLEL
         if (resident_execution_depth_ && parallel_workers() > 1) {
             // 完整控制待辦（API／語義／故障）由協調者先承接；不能先啟動
@@ -1477,6 +1649,17 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
             }
         }
 #endif
+        // 中斷只為投遞事件：目前執行緒時間片未到期就續跑並沿用原期限，喚醒者等時間片結束或目前執行緒等待時接手。
+        std::uint64_t kept_slice = UINT64_MAX;
+        if (std::exchange(threads_.interrupt_poll, false)) {
+            const auto current = threads_.items.find(threads_.current);
+            if (current != threads_.items.end() && current->second.status == ThreadStatus::Runnable &&
+                !current->second.suspended && threads_.slice_deadline != UINT64_MAX &&
+                detail::monotonic_ticks() < threads_.slice_deadline) {
+                chosen = current;
+                kept_slice = threads_.slice_deadline;
+            }
+        }
         if (chosen != threads_.items.end() && chosen->second.status == ThreadStatus::Runnable &&
             !chosen->second.suspended) {
             // 同一執行緒續跑時，runtime 仍是有效的 TLS／FLS；只在真正換人前保存。
@@ -1496,8 +1679,15 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
                     idle_trace.timer_ns += elapsed;
                 }
                 ++idle_trace.buckets[elapsed < 100'000 ? 0 : elapsed < 500'000 ? 1 : elapsed < 1'000'000 ? 2 : elapsed < 5'000'000 ? 3 : elapsed < 20'000'000 ? 4 : 5];
+                if (auto* timeline = idle_timeline_file(); timeline && elapsed >= 50'000) {
+                    const auto begin = idle_timeline_unix_us(idle_start);
+                    std::fprintf(timeline, "%lld %lld\n", begin, begin + static_cast<long long>(elapsed / 1000));
+                }
                 idle_active = false;
             }
+#endif
+#if !defined(_WIN32)
+            trace_run_switch(threads_.items, chosen->first);
 #endif
             const bool switching = chosen->first != threads_.current;
             if (switching) {
@@ -1538,6 +1728,8 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
             threads_.slice_deadline = runtime_.host_clock && slice_start <= UINT64_MAX - span - 1
                                           ? slice_start + span
                                           : UINT64_MAX;
+            if (kept_slice != UINT64_MAX)
+                threads_.slice_deadline = kept_slice;
             target.dynamic_priority_boost = 0;
             threads_.yield = false;
             prepare_debug_execution(state, memory);
@@ -1545,9 +1737,53 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
         }
 #if !defined(_WIN32)
         if (idle_tracing && !idle_active) {
+            trace_run_switch(threads_.items, 0);
             idle_active = true;
             idle_start = std::chrono::steady_clock::now();
             idle_epoch = wake_epoch;
+        }
+#endif
+#if !defined(_WIN32)
+        // 診斷：X64ARM_TRACE_IDLE_DUMP=<目錄> 時，程序內所有客體執行緒連續閒置超過 2 秒就傾印一次
+        // 各執行緒的等待種類、handle 物件狀態、期限與客體返回位址；只讀排程狀態，未設定時只多一次旗標檢查。
+        static const char* const idle_dump_directory=std::getenv("X64ARM_TRACE_IDLE_DUMP");
+        if(idle_dump_directory){
+            const auto now=std::chrono::steady_clock::now();
+            if(idle_dump_since==std::chrono::steady_clock::time_point{})idle_dump_since=now;
+            if(!idle_dumped && now-idle_dump_since>std::chrono::seconds(2)){
+                idle_dumped=true;
+                const auto path=std::string(idle_dump_directory)+"/idle-"+std::to_string(::getpid())+".log";
+                if(auto* out=std::fopen(path.c_str(),"a")){
+                    std::fprintf(out,"idle_dump clock=%llu current=%llu threads=%zu wake_epoch=%llu\n",
+                        static_cast<unsigned long long>(runtime_.clock_ticks),static_cast<unsigned long long>(threads_.current),
+                        threads_.items.size(),static_cast<unsigned long long>(wake_epoch));
+                    for(const auto& [id,thread]:threads_.items){
+                        std::fprintf(out,"  id=%llu status=%d suspended=%d kind=%d deadline=%llu entry=0x%llx name=%s\n",
+                            static_cast<unsigned long long>(id),static_cast<int>(thread.status),thread.suspended?1:0,
+                            static_cast<int>(thread.wait.kind),static_cast<unsigned long long>(thread.wait.deadline),
+                            static_cast<unsigned long long>(thread.entry),utf16_to_utf8(thread.description).c_str());
+                        for(const auto handle:thread.wait.handles){
+                            const auto object=runtime_.wait_objects.find(handle);
+                            if(object==runtime_.wait_objects.end()){std::fprintf(out,"    handle=0x%llx (非等待物件)\n",static_cast<unsigned long long>(handle));continue;}
+                            const auto& state_object=runtime_.wait_state(object->second);
+                            std::fprintf(out,"    handle=0x%llx kind=%d signaled=%d manual=%d count=%u shared_fd=%d name=%s\n",
+                                static_cast<unsigned long long>(handle),static_cast<int>(object->second.kind),state_object.signaled()?1:0,
+                                state_object.manual_reset?1:0,state_object.count,runtime_.wait_lock_descriptor(object->second),
+                                utf16_to_utf8(object->second.name).c_str());
+                        }
+                        if(thread.status!=ThreadStatus::Exited){
+                            const auto& walk=id==threads_.current?state:thread.context;
+                            std::fprintf(out,"    rip=0x%llx api=%s",static_cast<unsigned long long>(walk.rip.value),
+                                handles(walk.rip)?std::string(name(walk.rip)).c_str():"");
+                            const auto sp=walk.reg(Gpr::Rsp);const unsigned width=x86_?4U:8U;
+                            for(unsigned n=0;n<6;++n)try{std::fprintf(out," [sp+%u]=0x%llx",n*width,
+                                static_cast<unsigned long long>(memory.load(GuestAddress{sp+n*width},static_cast<std::uint8_t>(width*8))));}catch(const MemoryFault&){break;}
+                            std::fputc('\n',out);
+                        }
+                    }
+                    std::fclose(out);
+                }
+            }
         }
 #endif
         auto next = UINT64_MAX;
@@ -2343,6 +2579,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                     }
                 }
                 // 等待者由排程器的等待解析依字組取得鎖；bit1 保留到最後一位等待者離開。
+                if (value & 2)
+                    resolve_thread_waits(memory,ThreadWakeScope::Slim,address);
             } else {
                 bool acquired = false, queued = false;
                 for (;;) {
@@ -2379,6 +2617,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 throw HostCallFault("不可重新初始化等待中的條件變數");
             memory.store(GuestAddress{condition}, x86_ ? 32 : 64, 0);
         } else if (symbol.starts_with("Wake")) {
+            bool notified=false;
             for (auto &[id, thread] : threads_.items) {
                 (void)id;
                 auto &wait = thread.wait;
@@ -2386,10 +2625,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                     wait.handles[0] == condition && !wait.signaled) {
                     wait.signaled = true;
                     wait.deadline = UINT64_MAX;
+                    notified=true;
                     if (symbol == "WakeConditionVariable")
                         break;
                 }
             }
+            if(notified)resolve_thread_waits(memory,ThreadWakeScope::Condition,condition);
         } else {
             const bool critical = symbol.ends_with("CS"), shared = !critical && (u32(3) & 1);
             const auto address = arg(1);
@@ -2910,6 +3151,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 memory.store(GuestAddress{address + (x86_ ? 8 : 12)}, 32, section.recursion);
                 // Win32 可見的擁有者使用公開 TID；排程與鎖表仍以內部 ID 索引。
                 memory.store(GuestAddress{address + (x86_ ? 12 : 16)}, x86_ ? 32 : 64, thread_identifier(section.owner));
+                if(symbol=="LeaveCriticalSection" && !section.owner)
+                    resolve_thread_waits(memory,ThreadWakeScope::Critical,address);
             }
         }
     } else if (symbol == "CreateThread" || symbol == "_beginthreadex" || symbol == "CreateRemoteThread" ||

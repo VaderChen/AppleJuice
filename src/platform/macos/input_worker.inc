@@ -7,6 +7,8 @@ public:
         std::vector<Gamepad> gamepads;
         std::vector<PointerDevice> pointers;
         bool observes_wheel{};
+        // 裝置清單內容未變時沿用前一版編號，讓輪詢端略過複製與比對。
+        std::uint64_t device_generation{};
     };
 private:
     mutable std::mutex mutex_;
@@ -28,6 +30,9 @@ private:
         auto events=input.poll();auto reports=input.reports();auto pointers=input.pointer_samples();
         auto next=std::make_shared<Snapshot>();next->devices=input.devices();next->gamepads=input.gamepads();
         next->pointers=input.pointer_devices();next->observes_wheel=input.observes_wheel();
+        // snapshot_ 只由本工作執行緒寫入，這裡讀取不與其他寫入競爭。
+        const auto previous=snapshot_;
+        next->device_generation=!previous?1:previous->devices==next->devices?previous->device_generation:previous->device_generation+1;
         std::lock_guard lock(mutex_);
         append(events_,std::move(events),65536);append(reports_,std::move(reports),10000);append(pointers_,std::move(pointers),65536);
         snapshot_=std::move(next);
@@ -97,6 +102,7 @@ class WorkerInput final:public Backend {
     std::shared_ptr<InputWorker> worker_=std::make_shared<InputWorker>();
 public:
     std::vector<Device> devices()override{return worker_->snapshot()->devices;}
+    std::uint64_t device_generation()override{return worker_->snapshot()->device_generation;}
     std::vector<Event> poll()override{return worker_->poll();}
     std::vector<Report> reports()override{return worker_->reports();}
     std::vector<Gamepad> gamepads()override{return worker_->snapshot()->gamepads;}

@@ -51,6 +51,7 @@ static bool webview_trace_enabled(){static const bool enabled=std::getenv("X64AR
 #include <cerrno>
 #include <poll.h>
 #include <unistd.h>
+#include <thread>
 
 namespace x64arm { NSFont* native_gui_font(const GuiFont&); }
 
@@ -1737,17 +1738,18 @@ public:
         }
         view.guestUpdating=viewUpdating;button.guestUpdating=buttonUpdating;window.target.updating=updating;dirty_=true;
     }
-    explicit CocoaGui(std::filesystem::path snapshot) : snapshot_(std::move(snapshot)) {
+    // begin_activity=false：延遲建立時由外層代理在程序啟動就持有 App Nap 防護，這裡不重複開始。
+    explicit CocoaGui(std::filesystem::path snapshot,bool begin_activity=true) : snapshot_(std::move(snapshot)) {
         if (![NSThread isMainThread]) throw std::runtime_error("AppKit GUI 必須在主執行緒執行");
         @autoreleasepool {
             prepare_native_application();
             if(background_display_enabled()){
                 // sharedApplication 已初始化 AppKit；此後由 poll 手動派送事件。
                 // finishLaunching 本身會排程啟用應用程式，先 deactivate 也不能取消它。
-                (void)background_display();
-            }else {[NSApp finishLaunching];application_launched_=true;}
+                startup_profile::Scope measurement("gui_init","background_display");(void)background_display();
+            }else {startup_profile::Scope measurement("gui_init","finish_launching");[NSApp finishLaunching];application_launched_=true;}
             app_deactivate_observer_=[NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidResignActiveNotification object:NSApp queue:nil usingBlock:^(NSNotification* note){(void)note;interactive_activation_=false;pending_activation_=0;dirty_=true;}];
-            desktop_notifications_=make_native_desktop_notifications();
+            {startup_profile::Scope measurement("gui_init","desktop_notifications");desktop_notifications_=make_native_desktop_notifications();}
             const char* automation_path=std::getenv("X64ARM_GUI_AUTOMATION");
             const char* automation_fd=std::getenv("X64ARM_GUI_AUTOMATION_FD");
             if(automation_path || automation_fd){
@@ -1768,7 +1770,8 @@ public:
             // 原生 GUI 的主程序與隱藏輔助程序同屬使用者啟動的互動工作。
             // App Nap 可能停滯協作式客體排程，讓另一程序誤判它沒有回應；活動範圍隨 backend 釋放。
             // 仍允許系統閒置睡眠，且不變更客體的背景／QoS 契約；診斷可用 0 明確停用。
-            if(const char* value=std::getenv("X64ARM_GUI_ACTIVITY");!value || std::string_view(value)!="0")
+            startup_profile::Scope activity_measurement("gui_init","begin_activity");
+            if(const char* value=std::getenv("X64ARM_GUI_ACTIVITY");begin_activity && (!value || std::string_view(value)!="0"))
                 activity_=[NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep reason:@"執行使用者啟動的 Windows 互動程式"];
         }
     }
@@ -2819,5 +2822,147 @@ std::optional<GuiBitmap> render_gui_header_image(const GuiWindow& window,std::op
         return result;
     }
 }
-std::shared_ptr<NativeGui> make_native_gui(const std::filesystem::path& snapshot){return std::make_shared<CocoaGui>(snapshot);}
+
+namespace {
+// 延遲建立原生 GUI 後端。[NSApplication sharedApplication]（連線 WindowServer、初始化 AppKit）每個程序約 0.12–0.23 秒，
+// 是子程序啟動到客體開始執行之間最大的固定成本；沒有視窗的輔助程序（crashpad、renderer 等）不一定會用到 AppKit。
+// 代理在第一次呼叫任何原生 GUI 方法時才於同一執行緒建立 CocoaGui，之後全部轉發，結果與立即建立相同。
+// App Nap 防護不需要 AppKit，仍在程序啟動時開始，避免無視窗程序被節流而延誤跨程序回應。
+// 原始輸入政策先記錄，建立後端時補送。X64ARM_GUI_DEFERRED=0 恢復立即建立；
+// X64ARM_TRACE_GUI_DEFERRED=1 於建立時印出觸發的方法與時間。
+class DeferredCocoaGui final : public NativeGui {
+public:
+    explicit DeferredCocoaGui(std::filesystem::path snapshot):snapshot_(std::move(snapshot)){
+        @autoreleasepool {
+            if(const char* value=std::getenv("X64ARM_GUI_ACTIVITY");!value || std::string_view(value)!="0")
+                activity_=[NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep reason:@"執行使用者啟動的 Windows 互動程式"];
+        }
+        // sharedApplication 的一部分是建立 WindowServer 連線；CoreGraphics 的顯示與工作階段查詢執行緒安全，
+        // 先在背景建立，客體開始執行與第一次使用 GUI 之間的空檔即可完成。主執行緒稍後初始化 AppKit 時沿用同一連線；
+        // 兩者同時進行由 CoreGraphics 內部協調。X64ARM_GUI_PREWARM=0 停用。
+        static const bool prewarm=[] {const auto* value=std::getenv("X64ARM_GUI_PREWARM");return !value || std::string_view(value)!="0";}();
+        if(prewarm)try{
+            prewarm_=std::thread([]{@autoreleasepool {
+                startup_profile::Scope measurement("gui_init","prewarm_graphics");
+                const auto display=CGMainDisplayID();(void)CGDisplayBounds(display);
+                if(const auto session=CGSessionCopyCurrentDictionary())CFRelease(session);
+            }});
+        }catch(const std::system_error&){}
+    }
+    ~DeferredCocoaGui() override {if(prewarm_.joinable())prewarm_.join();real_.reset();@autoreleasepool {if(activity_)[NSProcessInfo.processInfo endActivity:activity_];}}
+    void create(std::uint64_t handle,const GuiWindow& window) override {real("create").create(handle,window);}
+    void show(std::uint64_t handle,bool visible) override {real("show").show(handle,visible);}
+    void reorder(std::uint64_t a,std::uint64_t b) override {real("reorder").reorder(a,b);}
+    void activate(std::uint64_t handle) override {real("activate").activate(handle);}
+    void focus(std::uint64_t handle) override {real("focus").focus(handle);}
+    bool accessibility_event(std::uint64_t handle,std::uint32_t event,std::uint32_t child) override {return real("accessibility_event").accessibility_event(handle,event,child);}
+    bool accessibility_announcement(std::uint64_t handle,std::u16string_view text,bool important) override {return real("accessibility_announcement").accessibility_announcement(handle,text,important);}
+    std::array<std::int32_t,4> work_area() override {return real("work_area").work_area();}
+    std::array<std::int32_t,4> screen_area() override {return real("screen_area").screen_area();}
+    std::vector<GuiDisplayMode> display_modes() override {return real("display_modes").display_modes();}
+    std::optional<GuiDisplayMode> current_display_mode() override {return real("current_display_mode").current_display_mode();}
+    bool display_fullscreen(std::uint64_t handle,bool enable,const std::optional<GuiDisplayMode>& mode) override {return real("display_fullscreen").display_fullscreen(handle,enable,mode);}
+    std::optional<shell::Dock> shell_dock() override {return real("shell_dock").shell_dock();}
+    std::uint32_t shell_reveal(std::span<const std::shared_ptr<HostFile>> files,std::uint32_t flags) override {return real("shell_reveal").shell_reveal(files,flags);}
+    std::vector<shell::Application> shell_applications(const std::shared_ptr<HostFile>& file,std::string_view verb) override {return real("shell_applications").shell_applications(file,verb);}
+    std::uint32_t shell_open(const std::shared_ptr<HostFile>& file,std::string_view verb,const shell::Application& application) override {return real("shell_open").shell_open(file,verb,application);}
+    std::optional<shell::Application> shell_default_application(const std::shared_ptr<HostFile>& file,std::string_view verb) override {return real("shell_default_application").shell_default_application(file,verb);}
+    bool set_opacity(std::uint64_t handle,std::uint8_t alpha) override {return real("set_opacity").set_opacity(handle,alpha);}
+    bool set_region(std::uint64_t handle,const std::optional<GuiRegion>& region) override {return real("set_region").set_region(handle,region);}
+    void present(std::uint64_t handle,const GuiWindow& window) override {real("present").present(handle,window);}
+    void destroy(std::uint64_t handle) override {real("destroy").destroy(handle);}
+    std::vector<GuiMessage> poll(bool wait) override {return real("poll").poll(wait);}
+    bool input_active() const override {return real("input_active").input_active();}
+    bool status_icons(const std::map<std::uint64_t,desktop::Icon>& icons) override {return real("status_icons").status_icons(icons);}
+    std::uint32_t help(const NativeHelpRequest& request) override {return real("help").help(request);}
+    bool status_focus(std::uint64_t handle) override {return real("status_focus").status_focus(handle);}
+    bool attention(std::uint64_t handle,bool flash,bool request) override {return real("attention").attention(handle,flash,request);}
+    std::optional<std::uint32_t> notification_state() const override {return real("notification_state").notification_state();}
+    bool ime_mark(std::uint64_t handle,const GuiImeData& data,std::array<std::int32_t,2> caret) override {return real("ime_mark").ime_mark(handle,data,caret);}
+    bool ime_convert(std::uint64_t handle) override {return real("ime_convert").ime_convert(handle);}
+    void raw_input_policy(bool keyboard,bool mouse,bool sink) override {
+        if(real_)real_->raw_input_policy(keyboard,mouse,sink);else raw_policy_={keyboard,mouse,sink};
+    }
+    std::vector<GuiMessage> poll_for(std::uint64_t nanoseconds) override {return real("poll_for").poll_for(nanoseconds);}
+    std::optional<GuiFontMetrics> font_metrics(const GuiFont& font) override {return real("font_metrics").font_metrics(font);}
+    std::optional<std::int32_t> text_width(const GuiFont& font,const std::u16string& text) override {return real("text_width").text_width(font,text);}
+    std::optional<std::vector<std::int32_t>> text_advances(const GuiFont& font,const std::u16string& text) override {return real("text_advances").text_advances(font,text);}
+    std::vector<std::u16string> font_families(bool all) override {return real("font_families").font_families(all);}
+    std::optional<std::u16string> clipboard_text() override {return real("clipboard_text").clipboard_text();}
+    bool set_clipboard_text(const std::u16string& text) override {return real("set_clipboard_text").set_clipboard_text(text);}
+    std::optional<std::uint64_t> clipboard_sequence() override {return real("clipboard_sequence").clipboard_sequence();}
+    bool clear_clipboard() override {return real("clear_clipboard").clear_clipboard();}
+    std::optional<std::array<std::int32_t,2>> cursor_position() override {return real("cursor_position").cursor_position();}
+    bool set_cursor_position(std::int32_t x,std::int32_t y) override {return real("set_cursor_position").set_cursor_position(x,y);}
+    bool set_cursor(const GuiIcon* icon,bool visible) override {return real("set_cursor").set_cursor(icon,visible);}
+    std::optional<bool> physical_key_state(unsigned key) override {return real("physical_key_state").physical_key_state(key);}
+    std::optional<std::uint64_t> input_idle_milliseconds() override {return real("input_idle_milliseconds").input_idle_milliseconds();}
+    std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags) override {
+        return real("popup_menu").popup_menu(owner,items,x,y,flags);
+    }
+    std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags,const std::function<bool()>& idle) override {
+        return real("popup_menu").popup_menu(owner,items,x,y,flags,idle);
+    }
+    std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags,const std::function<bool()>& idle,const std::function<bool(std::uint64_t,std::uint32_t,bool)>& popup) override {
+        return real("popup_menu").popup_menu(owner,items,x,y,flags,idle,popup);
+    }
+    std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags,const std::function<bool()>& idle,const std::function<bool(std::uint64_t,std::uint32_t,bool)>& popup,const std::function<bool(const GuiMenuHighlight&)>& highlight) override {
+        return real("popup_menu").popup_menu(owner,items,x,y,flags,idle,popup,highlight);
+    }
+    void graphics_text(std::uint64_t handle,const GuiDraw& draw) override {real("graphics_text").graphics_text(handle,draw);}
+    std::optional<GuiThemeMetrics> theme_metrics(std::u16string_view name,std::int32_t part,std::int32_t state,std::uint32_t property,std::array<std::int32_t,2> size) override {
+        return real("theme_metrics").theme_metrics(name,part,state,property,size);
+    }
+    std::optional<GuiBitmap> theme_background(std::u16string_view name,std::int32_t part,std::int32_t state,std::uint32_t property,std::array<std::int32_t,2> size) override {
+        return real("theme_background").theme_background(name,part,state,property,size);
+    }
+    std::optional<GuiBitmap> capture_client(std::uint64_t handle) override {return real("capture_client").capture_client(handle);}
+    void graphics_surface(std::uint64_t handle,std::shared_ptr<RasterSurface> surface) override {real("graphics_surface").graphics_surface(handle,std::move(surface));}
+    void* graphics_view(std::uint64_t handle) override {return real("graphics_view").graphics_view(handle);}
+    std::optional<std::array<std::uint16_t,768>> gamma_ramp() override {return real("gamma_ramp").gamma_ramp();}
+    bool set_gamma_ramp(std::span<const std::uint16_t,768> ramp) override {return real("set_gamma_ramp").set_gamma_ramp(ramp);}
+    void beep() override {real("beep").beep();}
+    void set_menu(std::uint64_t handle,const std::vector<GuiPopupItem>& items) override {real("set_menu").set_menu(handle,items);}
+    std::optional<std::array<std::int32_t,4>> menu_rectangle(std::uint64_t handle,std::int32_t index) override {return real("menu_rectangle").menu_rectangle(handle,index);}
+    std::optional<std::uint32_t> text_line_count(std::uint64_t handle) override {return real("text_line_count").text_line_count(handle);}
+    bool webview_create(std::uint64_t id,std::uint64_t parent) override {return real("webview_create").webview_create(id,parent);}
+    void webview_destroy(std::uint64_t id) override {real("webview_destroy").webview_destroy(id);}
+    void webview_visible(std::uint64_t id,bool visible) override {real("webview_visible").webview_visible(id,visible);}
+    void webview_bounds(std::uint64_t id,const std::array<std::int32_t,4>& bounds) override {real("webview_bounds").webview_bounds(id,bounds);}
+    void webview_zoom(std::uint64_t id,double zoom) override {real("webview_zoom").webview_zoom(id,zoom);}
+    void webview_focus(std::uint64_t id) override {real("webview_focus").webview_focus(id);}
+    void webview_navigate(std::uint64_t id,const std::u16string& url) override {real("webview_navigate").webview_navigate(id,url);}
+    void webview_load_html(std::uint64_t id,const std::u16string& html) override {real("webview_load_html").webview_load_html(id,html);}
+    void webview_command(std::uint64_t id,unsigned command) override {real("webview_command").webview_command(id,command);}
+    void webview_script(std::uint64_t id,const std::u16string& script) override {real("webview_script").webview_script(id,script);}
+    void webview_user_script(std::uint64_t id,const std::u16string& script) override {real("webview_user_script").webview_user_script(id,script);}
+    void webview_post_message(std::uint64_t id,const std::u16string& message,bool json) override {real("webview_post_message").webview_post_message(id,message,json);}
+    std::optional<std::vector<std::array<std::uint32_t,2>>> text_line_ranges(std::uint64_t handle) override {return real("text_line_ranges").text_line_ranges(handle);}
+private:
+    NativeGui& real(const char* method) const {
+        if(!real_){
+            startup_profile::Scope measurement("startup","native_gui_deferred_init",true);
+            real_=std::make_shared<CocoaGui>(snapshot_,false);
+            if(raw_policy_)real_->raw_input_policy((*raw_policy_)[0],(*raw_policy_)[1],(*raw_policy_)[2]);
+            static const bool trace=[] {const auto* value=std::getenv("X64ARM_TRACE_GUI_DEFERRED");return value && std::string_view(value)=="1";}();
+            if(trace)std::fprintf(stderr,"gui_deferred_init pid=%d method=%s unix_us=%lld\n",static_cast<int>(::getpid()),method,
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
+        }
+        return *real_;
+    }
+    std::filesystem::path snapshot_;
+    mutable std::shared_ptr<NativeGui> real_;
+    std::optional<std::array<bool,3>> raw_policy_;
+    id activity_{};
+    std::thread prewarm_;
+};
+bool native_gui_deferred(){
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_GUI_DEFERRED");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
+}
+std::shared_ptr<NativeGui> make_native_gui(const std::filesystem::path& snapshot){
+    if(native_gui_deferred())return std::make_shared<DeferredCocoaGui>(snapshot);
+    return std::make_shared<CocoaGui>(snapshot);
+}
 }

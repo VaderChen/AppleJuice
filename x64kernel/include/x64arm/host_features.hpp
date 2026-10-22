@@ -28,6 +28,10 @@ inline bool host_arm64_flagm() {
     static const bool supported=host_features_detail::arm64_feature("hw.optional.arm.FEAT_FlagM");
     return supported;
 }
+inline bool host_arm64_flagm2() {
+    static const bool supported=host_features_detail::arm64_feature("hw.optional.arm.FEAT_FlagM2");
+    return supported;
+}
 inline bool host_arm64_rpres() {
     static const bool supported=host_arm64_afp() && host_features_detail::arm64_feature("hw.optional.arm.FEAT_RPRES");
     return supported;

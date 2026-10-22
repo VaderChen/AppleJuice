@@ -351,6 +351,10 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
         for(const auto& region:parsed.mappings)module.mappings.emplace_back(base+region.rva,region.bytes.size());
         runtime_.loaded_modules.emplace(base,std::move(module));created.push_back(base);
         runtime_.modules.emplace(name,base);runtime_.modules.emplace(module_key(guest),base);
+        // 診斷：X64ARM_TRACE_MODULES=1 時印出載入模組的名稱、基址與映像大小，供剖析把客體 RIP 歸到模組。
+        static const bool trace_modules=[] {const auto* value=std::getenv("X64ARM_TRACE_MODULES");return value && std::string_view(value)=="1";}();
+        if(trace_modules)std::fprintf(stderr,"module_loaded pid=%d name=%s base=0x%llx size=0x%llx\n",static_cast<int>(process_id()),name.c_str(),
+            static_cast<unsigned long long>(base),static_cast<unsigned long long>(parsed.metadata.image_size));
         auto& loaded=runtime_.loaded_modules.at(base);
         initialize_module_tls(memory,loaded);
         const auto altered=(flags&0x108)?directory(guest):std::u16string(search_directory);

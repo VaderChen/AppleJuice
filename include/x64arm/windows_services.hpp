@@ -133,6 +133,9 @@ public:
     bool parallel_service(GuestAddress) const noexcept override;
     bool invoke_parallel_service(GuestState&,GuestMemory&) override;
     bool invoke_parallel_service_impl(GuestState&,GuestMemory&,bool&,std::span<GuestState* const> = {});
+    bool parallel_crt_format_service(GuestAddress) const noexcept;
+    bool invoke_parallel_crt_format(GuestState&,GuestMemory&,std::uint64_t);
+    const WindowsServiceDescriptor* runtime_service_descriptor(GuestAddress) const noexcept;
 #endif
     ExecutionPolicy execution_policy(const GuestState&) const override;
     void after_parallel_instructions(GuestState&,GuestMemory&,std::span<const std::uint64_t>) override;
@@ -157,8 +160,13 @@ public:
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTROL_REQUEST
     void resident_control_request(std::uint64_t,GuestAddress,bool) override;
 #endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTROL_DRAIN
+    bool resident_select_control_request(GuestState&,GuestMemory&) override;
+#endif
     void after_resident_parallel(GuestState&,GuestMemory&) override;
+    void after_resident_interrupt(GuestState&,GuestMemory&) override;
     std::uint64_t resident_parallel_wakeup_ns(std::span<GuestState* const>) const override;
+    std::shared_ptr<const ResidentExternalWake> resident_external_wake(std::uint64_t& observed) const override;
     ResidentServiceProgress resident_parallel_service(GuestState&,GuestMemory&) override;
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_ACTIVE_CONTEXTS
     ResidentServiceProgress resident_parallel_service(GuestState&,GuestMemory&,std::span<GuestState* const>) override;
@@ -231,6 +239,10 @@ public:
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_ERRORS
     ResidentScalarErrors resident_context_errors(const GuestState&,GuestMemory&) noexcept override;
 #endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_SCALAR
+    bool resident_context_scalar_service(GuestAddress) const noexcept override;
+    bool invoke_resident_context_scalar(ResidentScalarCall&,GuestMemory&,const ResidentScalarErrors&) noexcept override;
+#endif
     bool acquire_slim_word(GuestMemory&,std::uint64_t address,std::uint64_t id,bool shared);
     std::string_view name(GuestAddress address) const noexcept override;
     std::optional<std::uint32_t> invoke(GuestState& state, GuestMemory& memory) override;
@@ -245,6 +257,9 @@ public:
     bool same_state(const WindowsServices& other) const;
     std::string mapping_session();
     std::shared_ptr<class SharedWake> mapping_wake() const;
+    // 常駐中斷的外部來源：排程器完整輪詢前取得的共用喚醒世代，與包裝它的等待來源。
+    std::uint64_t resident_external_polled_{};
+    mutable std::shared_ptr<const ResidentExternalWake> resident_external_source_;
     int mapping_session_descriptor();
     void set_mapping_session(const std::string&,int inherited_descriptor=-1);
     void configure_handle_transfer();
@@ -994,6 +1009,8 @@ private:
     struct CompletionResult {std::uint32_t value{},error{};bool ready{},guest_return{};};
     CompletionResult poll_completion(GuestState&,GuestMemory&,std::uint64_t handle,bool extended,bool expired);
     void wake_threads(GuestMemory& memory);
+    enum class ThreadWakeScope { All, Condition, Slim, Critical, Objects };
+    void resolve_thread_waits(GuestMemory&,ThreadWakeScope scope=ThreadWakeScope::All,std::uint64_t address=0);
     void schedule(GuestState& state, GuestMemory& memory);
     std::optional<std::uint32_t> force_finish_thread(GuestState&,GuestMemory&);
     std::optional<std::uint32_t> finish_thread(GuestState& state, GuestMemory& memory, std::uint32_t code);
@@ -1174,6 +1191,8 @@ private:
     std::uint32_t query_process_io(std::uint64_t,process_io::Counters&);
     std::shared_ptr<HandleTransferState> handle_transfers_;
     void poll_handle_transfers(GuestMemory&,bool force=false);
+    // 監看執行緒已看到本程序的 handle 轉移通道可讀（其他程序的同步請求或回覆待處理）；只讀原子旗標。
+    bool handle_transfer_requested() const noexcept;
     bool handle_transfer_polling() const noexcept; // 通道沒有監看執行緒時，排程器須輪詢它。
     void watch_descriptor(int descriptor) noexcept; // 交給監看執行緒等待可讀（子程序回報管線等）。
     std::vector<int> child_pipe_descriptors() const; // 現有子程序的回報管線，供監看執行緒建立時加入。
@@ -1623,10 +1642,20 @@ private:
     // 客體小物件配置區：客體 malloc／free 常式的快速路徑與此處共用狀態頁、鎖及 chunk 格式。
     bool guest_heap_setup(GuestMemory& memory);
     bool guest_locale_lock_setup(GuestMemory& memory);
-    bool guest_heap_contains(std::uint64_t address) const noexcept {return guest_heap_base_ && address-guest_heap_base_<guest_heap_size_;}
-    std::uint64_t guest_heap_allocate(GuestMemory& memory, std::uint64_t size);
+    // x64 為單一連續保留區；x86 的 chunk 散在 32 位元空間各處，以每 256 KiB 一位元的位元圖判斷。
+    bool guest_heap_contains(std::uint64_t address) const noexcept {
+        if(guest_heap_chunked_)return address<(UINT64_C(1)<<32) && ((guest_heap_chunk_bits_[address>>24]>>((address>>18)&63U))&1U);
+        return guest_heap_base_ && address-guest_heap_base_<guest_heap_size_;
+    }
+    std::uint64_t guest_heap_reserve_chunk(GuestMemory& memory);
+    std::uint64_t guest_heap_allocate(GuestMemory& memory, std::uint64_t size, std::uint64_t heap = process_heap);
     void guest_heap_free(GuestMemory& memory, std::uint64_t address);
     std::uint64_t guest_heap_block_size(GuestMemory& memory, std::uint64_t address);
+    // chunk 標頭 +24 的擁有者；0（x64 常式與 process heap）回傳 process_heap。
+    std::uint64_t guest_heap_owner(GuestMemory& memory, std::uint64_t address);
+    // 可成長私有 heap 累計足夠配置後才啟用 chunk，避免大量短命小 heap 各占級距 chunk。
+    bool guest_heap_private_ready(std::uint64_t heap);
+    void guest_heap_destroy(GuestMemory& memory, std::uint64_t heap);
     void start_callbacks(GuestState& state, GuestMemory& memory, std::vector<GuestCallback> callbacks, Continuation continuation, std::uint64_t value = 0);
     void classify_callback(GuestCallback&, Continuation) const;
     void enter_callback(GuestState& state, GuestMemory& memory);
@@ -1808,6 +1837,15 @@ private:
     void sync_crt_thread_state(GuestMemory&, std::uint64_t id);
     void sync_crt_thread_states(GuestMemory&);
     GuestAddress guest_heap_state_{};std::uint64_t guest_heap_base_{},guest_heap_size_{},guest_heap_next_{};
+    bool guest_heap_chunked_{};std::array<std::uint64_t,256> guest_heap_chunk_bits_{};
+    // x86 可成長私有 heap 的級距串列頭；Heap* 服務在 x86 只由協調者序列執行，不需客體鎖。
+    // heads 為空表示尚未啟用 chunk，requests 累計一般路徑配置次數。
+    struct GuestPrivateHeap {std::vector<std::uint64_t> heads;std::uint64_t requests{};};
+    std::map<std::uint64_t,GuestPrivateHeap> guest_private_heaps_;
+    // HeapWalk 用：x86 配置區已配置區塊（位址、區塊大小）依位址排序的快取；配置／釋放即使快取失效。
+    std::uint64_t guest_heap_mutations_{},guest_heap_walk_generation_{UINT64_MAX},guest_heap_walk_heap_{};
+    std::vector<std::pair<std::uint64_t,std::uint64_t>> guest_heap_walk_blocks_,guest_heap_walk_free_;
+    const std::vector<std::pair<std::uint64_t,std::uint64_t>>& guest_heap_allocated_blocks(GuestMemory& memory, std::uint64_t heap = process_heap);
     GuestAddress guest_locale_lock_state_{};
     // Win64 TEB／TLS 與 pseudo handle 共用常式；只快取程式入口，不快取客體資料。
     GuestAddress guest_thread_routines_{};

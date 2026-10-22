@@ -1,3 +1,5 @@
+#include <unistd.h>
+#include <chrono>
 #include "x64arm/windows_services.hpp"
 #include "x64arm/audio.hpp"
 #include "x64arm/unicode.hpp"
@@ -15,6 +17,25 @@
 namespace x64arm {
 namespace {
 using wasapi::Guid;
+// 診斷：X64ARM_TRACE_AUDIO=start 時記錄串流生命週期（初始化、開始、停止、第一次提交）的宿主時間，
+// 用來區分「串流開得晚」與「串流早已開始但只送靜音」；未設定時只多一次靜態旗標檢查。
+// 共用模式混音格式的取樣率，即模擬端點的裝置設定（Windows 允許 44.1 或 48 kHz 等）。預設 44.1 kHz：
+// 常見遊戲／音樂素材為 44.1 kHz，客體（例如 Chromium WebAudio 的 SincResampler）不必再整段重新取樣；
+// 串流以本身取樣率交給 Core Audio，轉成宿主裝置取樣率由系統轉換器完成。X64ARM_WASAPI_MIX_RATE 可指定 8000–192000。
+std::uint32_t wasapi_mix_rate(){
+    static const std::uint32_t rate=[] {
+        const auto* setting=std::getenv("X64ARM_WASAPI_MIX_RATE");if(!setting || !*setting)return 44100U;
+        const auto value=std::strtoul(setting,nullptr,10);return value>=8000 && value<=192000?static_cast<std::uint32_t>(value):44100U;
+    }();
+    return rate;
+}
+void trace_audio_event(const char* kind,const void* stream,std::uint32_t value=0){
+    static const bool enabled=[] {const auto* trace=std::getenv("X64ARM_TRACE_AUDIO");return trace && std::string_view(trace)=="start";}();
+    if(!enabled)return;
+    const auto unix_us=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::fprintf(stderr,"wasapi_event kind=%s unix_us=%lld pid=%d stream=%p value=%u\n",kind,static_cast<long long>(unix_us),
+        static_cast<int>(::getpid()),stream,static_cast<unsigned>(value));
+}
 constexpr std::uint32_t pointer_error=0x80004003U,invalid=0x80070057U,no_interface=0x80004002U,
     not_initialized=0x88890001U,already_initialized=0x88890002U,not_stopped=0x88890005U,
     too_large=0x88890006U,out_of_order=0x88890007U,unsupported_format=0x88890008U,
@@ -148,7 +169,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
     const auto text=[&](std::u16string_view value){return allocation(utf16_bytes(value));};
     const auto mix=[] {
         std::vector<std::uint8_t> bytes(40);const auto store=[&](unsigned at,std::uint32_t value,unsigned count){for(unsigned i=0;i<count;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(8*i));};
-        store(0,0xfffe,2);store(2,2,2);store(4,48000,4);store(8,384000,4);store(12,8,2);store(14,32,2);store(16,22,2);store(18,32,2);store(20,3,4);std::copy(float_format.begin(),float_format.end(),bytes.begin()+24);return bytes;
+        const auto rate=wasapi_mix_rate();
+        store(0,0xfffe,2);store(2,2,2);store(4,rate,4);store(8,rate*8U,4);store(12,8,2);store(14,32,2);store(16,22,2);store(18,32,2);store(20,3,4);std::copy(float_format.begin(),float_format.end(),bytes.begin()+24);return bytes;
     };
     const auto format=[&](std::uint64_t p){if(!p)throw PointerError{};return read_pcm_wave_format(memory,p,true,true,8000,192000);};
     const auto create=[&](const std::shared_ptr<Object>& object,Kind k){
@@ -388,7 +410,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                         const auto frames=std::max<std::uint64_t>(f->rate/100,(arg(3)*f->rate+9999999)/10000000);
                         const auto data=allocate_heap(memory,frames*f->align);if(!data)throw std::bad_alloc{};
                         try{pcm.channels=f->channels;pcm.bits=f->bits;pcm.floating=f->floating;pcm.rate=pcm.frequency=f->rate;pcm.streaming=true;s.output=audio::open_output(s.pcm,s.device);}catch(const std::runtime_error&){(void)free_heap(memory,data,state);result=0x8889000fU;}
-                        if(!result){s.data=data;s.capacity=static_cast<std::uint32_t>(frames);s.format=*f;s.flags=d(2);s.initialized=true;s.observed_frames=pcm.rendered_frames;s.session=std::move(session);s.session->streams.push_back(object->stream);update_session(s.session);}
+                        if(!result){s.data=data;s.capacity=static_cast<std::uint32_t>(frames);s.format=*f;s.flags=d(2);s.initialized=true;s.observed_frames=pcm.rendered_frames;s.session=std::move(session);s.session->streams.push_back(object->stream);
+                            trace_audio_event("initialize",&s,f->rate);update_session(s.session);}
                     }
                 }else if(!s.initialized)result=not_initialized;
                 else if(name=="A_GetBufferSize")put(arg(1),s.capacity);
@@ -397,11 +420,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                 else if(name=="A_SetEventHandle"){
                     if(!(s.flags&0x40000U))result=0x88890011U;else if(s.started)result=not_stopped;else {const auto event=runtime_.wait_objects.find(arg(1));if(event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event || !(event->second.access&2U))result=invalid;else s.event=arg(1);}
                 }else if(name=="A_Start"){
-                    if(s.started)result=not_stopped;else if((s.flags&0x40000U) && !s.event)result=0x88890014U;else {s.started=true;pcm.playing=true;s.observed_frames=pcm.rendered_frames;s.event_frames=s.clock_frames;update_session(s.session);}
+                    if(s.started)result=not_stopped;else if((s.flags&0x40000U) && !s.event)result=0x88890014U;else {s.started=true;pcm.playing=true;s.observed_frames=pcm.rendered_frames;s.event_frames=s.clock_frames;update_session(s.session);trace_audio_event("start",&s);}
                 }else if(name=="A_Stop"){
                     if(!s.started)result=1;else {
                         s.started=false;pcm.playing=false;
-                        update_session(s.session);
+                        update_session(s.session);trace_audio_event("stop",&s,static_cast<std::uint32_t>(s.clock_frames));
                         if(const auto trace=std::getenv("X64ARM_TRACE_AUDIO");trace && std::string_view(trace)=="1")std::cerr<<"wasapi_output channels="<<s.format.channels<<" rate="<<s.format.rate<<" source_bits="<<s.format.bits<<" frames="<<s.clock_frames<<" peak_left="<<pcm.rendered_left_peak<<" peak_right="<<pcm.rendered_right_peak<<'\n';
                     }
                 }
@@ -422,9 +445,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                     else {
                         const auto frames=d(1);std::vector<std::uint8_t> bytes(static_cast<std::size_t>(frames)*pcm.frame_bytes(),pcm.bits==8?128:0);
                         if(frames && !(d(2)&2U))memory.read(GuestAddress{s.data},bytes);
+                        // 診斷：X64ARM_TRACE_AUDIO=start 時，程序第一次提交非靜音樣本就記錄一次宿主時間，
+                        // 供不擷取畫面的啟動量測判定「開始播放」；未設定時不掃描樣本。
+                        static const bool trace_first_audible=[] {const auto* trace=std::getenv("X64ARM_TRACE_AUDIO");
+                            return trace && std::string_view(trace)=="start";}();
+                        static bool first_audible_reported=false;
+                        static bool first_buffer_reported=false;
+                        if(!first_buffer_reported && frames){first_buffer_reported=true;trace_audio_event((d(2)&2U)?"first_buffer_silent_flag":"first_buffer",&s,frames);}
+                        if(trace_first_audible && !first_audible_reported && frames && !(d(2)&2U)){
+                            const std::uint8_t silent=pcm.bits==8?128:0;
+                            if(std::any_of(bytes.begin(),bytes.end(),[&](std::uint8_t v){return v!=silent;})){
+                                first_audible_reported=true;
+                                const auto unix_us=std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count();
+                                std::fprintf(stderr,"wasapi_first_audible unix_us=%lld pid=%d frames=%u\n",
+                                    static_cast<long long>(unix_us),static_cast<int>(::getpid()),static_cast<unsigned>(frames));
+                            }
+                        }
                         pcm.pcm.insert(pcm.pcm.end(),bytes.begin(),bytes.end());s.locked=false;s.requested=0;
                     }
-                }else if(name=="C_GetFrequency")put(arg(1),48000,64);
+                }else if(name=="C_GetFrequency")put(arg(1),wasapi_mix_rate(),64); // 端點時鐘頻率即混音取樣率
                 else if(name=="C_GetPosition"){check(arg(1),8);if(arg(2))check(arg(2),8);put(arg(1),s.clock_frames,64);if(arg(2))put(arg(2),runtime_.clock_ticks,64);}
                 else if(name=="C_GetCharacteristics")put(arg(1),0);
                 else if(name=="V_GetChannelCount")put(arg(1),s.format.channels);

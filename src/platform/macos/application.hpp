@@ -1,5 +1,6 @@
 #pragma once
 #include "x64arm/native_application.hpp"
+#include "x64arm/startup_profile.hpp"
 #import <AppKit/AppKit.h>
 #include <stdexcept>
 #include <cstdlib>
@@ -44,8 +45,10 @@ inline void prepare_native_application() {
     // 客體視窗由客體程式自行建立，引擎不使用 AppKit 視窗還原。引擎曾異常結束後，AppKit 會在
     // 第一次取事件時以 NSAlert runModal 詢問是否重開視窗；背景角色看不到該對話框，排程器會被
     // 模態迴圈無限期卡住。須在 NSApplication 處理開啟事件前登錄。
-    [NSUserDefaults.standardUserDefaults registerDefaults:@{@"ApplePersistenceIgnoreState":@YES,@"NSQuitAlwaysKeepsWindows":@NO}];
-    [NSApplication sharedApplication];
+    {startup_profile::Scope measurement("gui_init","register_defaults");
+    [NSUserDefaults.standardUserDefaults registerDefaults:@{@"ApplePersistenceIgnoreState":@YES,@"NSQuitAlwaysKeepsWindows":@NO}];}
+    {startup_profile::Scope measurement("gui_init","shared_application");[NSApplication sharedApplication];}
+    startup_profile::Scope policy_measurement("gui_init","activation_policy");
     const auto* background=std::getenv("X64ARM_GUI_BACKGROUND_DISPLAY");
     const auto policy=native_application_role()==NativeApplicationRole::Child || (background && std::string_view(background)=="1")
         ?NSApplicationActivationPolicyAccessory:NSApplicationActivationPolicyRegular;

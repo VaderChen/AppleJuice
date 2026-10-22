@@ -410,16 +410,28 @@ static bool scalar_errno_resident_requested() noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_SCALAR_ERRNO_RESIDENT");return !setting || std::string_view(setting)!="0";}();
     return enabled;
 }
-bool invoke_native_scalar_math(ResidentScalarCall& call,GuestMemory& memory,const ScalarMathOperation& operation,std::uint64_t errno_cell) noexcept {
+template<bool Worker>
+static bool invoke_native_scalar_math_impl(ResidentScalarCall& call,GuestMemory& memory,const ScalarMathOperation& operation,
+                                           std::uint64_t errno_cell,const ResidentScalarErrors* errors) noexcept {
 #if defined(__clang__)
 #pragma STDC FENV_ACCESS ON
 #endif
     try{
         // 沿 WindowsCall 的完整 Win64 框架契約；無效時不運算，交回原服務產生同一故障。
         if(memory.execution_mode()!=ExecutionMode::X64 || call.stack%16!=8 || call.stack>UINT64_MAX-40)return false;
-        memory.check(GuestAddress{call.stack},8,Access::Read);
-        memory.check(GuestAddress{call.stack+8},32,Access::Write);
-        const auto target=memory.load(GuestAddress{call.stack},64);
+        std::uint64_t target{};
+        if constexpr(Worker){
+            // worker 僅借用不改映射／頁面快取的視窗；跨頁 home 區及 COW
+            // 等未核准存取交回協調者，保留原 WindowsCall 的故障契約。
+            const auto stack=memory.native_window(GuestAddress{call.stack},permission(Access::Read));
+            const auto home=memory.native_window(GuestAddress{call.stack+8},permission(Access::Write));
+            if(!stack.data || stack.after<8 || !home.data || home.after<32)return false;
+            std::memcpy(&target,stack.data,8);
+        }else{
+            memory.check(GuestAddress{call.stack},8,Access::Read);
+            memory.check(GuestAddress{call.stack+8},32,Access::Write);
+            target=memory.load(GuestAddress{call.stack},64);
+        }
         auto mxcsr=call.mxcsr;std::uint64_t result{},integer{};
         const auto width=operation.integer?0U:operation.single()?4U:8U;
 #if defined(__aarch64__) && defined(__APPLE__)
@@ -448,7 +460,11 @@ bool invoke_native_scalar_math(ResidentScalarCall& call,GuestMemory& memory,cons
         if(error){
             if(!scalar_errno_resident_requested())return false;
             if(errno_cell+4>call.stack && errno_cell<call.stack+40)return false;
-            memory.store(GuestAddress{errno_cell},32,static_cast<std::uint32_t>(error));
+            if constexpr(Worker){
+                if(!errors->cell || errno_cell!=errors->guest_address)return false;
+                const auto error_value=static_cast<std::uint32_t>(error);
+                std::memcpy(errors->cell,&error_value,sizeof(error_value));
+            }else memory.store(GuestAddress{errno_cell},32,static_cast<std::uint32_t>(error));
         }
         if(!operation.integer)result=scalar_result_bits(operation.single()?static_cast<double>(single_value):value,operation.single());
         call.integer=integer;call.result=result;call.width=width;call.mxcsr=mxcsr;call.next=target;
@@ -458,6 +474,14 @@ bool invoke_native_scalar_math(ResidentScalarCall& call,GuestMemory& memory,cons
         if(exact_return && !(raised&0x80U))call.environment.retain_committed_status();
         return true;
     }catch(...){call.environment.retained=0;return false;}
+}
+bool invoke_native_scalar_math(ResidentScalarCall& call,GuestMemory& memory,const ScalarMathOperation& operation,
+                               std::uint64_t errno_cell) noexcept {
+    return invoke_native_scalar_math_impl<false>(call,memory,operation,errno_cell,nullptr);
+}
+bool invoke_native_context_scalar_math(ResidentScalarCall& call,GuestMemory& memory,const ScalarMathOperation& operation,
+                                       const ResidentScalarErrors& errors) noexcept {
+    return invoke_native_scalar_math_impl<true>(call,memory,operation,errors.guest_address,&errors);
 }
 #endif
 void invoke_scalar_math(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service,

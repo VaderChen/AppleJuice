@@ -66,7 +66,9 @@ void remove_member(JobHeader& data,JobMember& member){
     notify(data,7,member.pid);member={};
     if(std::none_of(data.members.begin(),data.members.end(),[](const auto& item){return item.pid!=0;}))notify(data,4,0);
 }
-void terminate_locked(JobHeader& data,std::uint32_t code){touch(data);for(auto& member:data.members)if(member.pid && !member.stopped){member.code=code;member.stopped=1;++data.terminated;}}
+// 只有成員實際轉為停止才遞增版本：KILL_ON_JOB_CLOSE 的 Job 在最後一個 handle 關閉後，
+// 每次 sweep 都會再進入這裡；無變更也遞增會讓所有觀察者的節流失效而持續完整輪詢。
+void terminate_locked(JobHeader& data,std::uint32_t code){bool changed=false;for(auto& member:data.members)if(member.pid && !member.stopped){member.code=code;member.stopped=1;++data.terminated;changed=true;}if(changed)touch(data);}
 std::optional<std::uint32_t> record_member_memory(JobHeader& data,std::uint64_t current,std::uint64_t peak){
     const auto pid=static_cast<std::uint32_t>(::getpid());std::uint64_t total=0;std::optional<std::uint32_t> termination;
     for(auto& member:data.members)if(member.pid){

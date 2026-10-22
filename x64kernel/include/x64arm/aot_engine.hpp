@@ -21,6 +21,7 @@ public:
         std::uint64_t parallel_wall_ns{},parallel_cpu_ns{},parallel_sites{};
         std::uint64_t parallel_messages{},parallel_resumes{},parallel_publications{},parallel_service_retries{};
         std::uint64_t parallel_coordinated_services{},parallel_coordinated_semantics{};
+        std::uint64_t parallel_mapping_batches{},parallel_mapping_requests{};
         std::uint64_t parallel_rebindings{},parallel_rebound_contexts{},parallel_local_runs{};
         std::uint64_t capacity_growths{},cache_capacity_bytes{},cache_reservation_bytes{},peak_cache_bytes{};
         std::uint64_t cache_validation_nanoseconds{},code_invalidations{},unaffected_code_events{};

@@ -450,7 +450,23 @@ decimal_to_double_routine atof, 0
 // 4 KiB 內為 16-byte 級距；其後為 256-byte 級距，含對齊標頭最多 497 級。
 // chunk 256 KiB 對齊：+0 magic、+8 class；區塊自 +64 起，空閒時以區塊首 8 bytes 串接。
 // 對齊配置額外有 16-byte 標頭：+0 原始大小、+8 alignment；回傳標頭之後的指標。
-// 空串列、鎖忙、超過上限或非配置區指標都尾跳原服務；宿主使用相同狀態並負責補充 chunk。
+// 空串列、超過上限或非配置區指標才尾跳原服務；宿主使用相同狀態並負責補充 chunk。
+// 四個常式共用鎖取得流程。競爭時留在客體，先唯讀觀察鎖，再原子重試，
+// 避免每次鎖忙都停止全體 worker；沒有指令配額或時間輪詢。
+.macro heap_lock name, temporary
+Lheap_retry_\name:
+    mov \temporary, 1
+    xchg dword ptr [r10], \temporary
+    test \temporary, \temporary
+    jne Lheap_wait_\name
+.endm
+.macro heap_lock_wait name
+Lheap_wait_\name:
+    pause
+    cmp dword ptr [r10], 0
+    jne Lheap_wait_\name
+    jmp Lheap_retry_\name
+.endm
 .macro heap_size_class
     cmp rax, 4096
     jbe Lsmall\@
@@ -476,10 +492,7 @@ _guest_malloc:
     ja Lmalloc_slow
     mov rax, rcx
     heap_size_class
-    mov edx, 1
-    xchg dword ptr [r10], edx
-    test edx, edx
-    jne Lmalloc_slow
+    heap_lock malloc, edx
     mov r8, qword ptr [r10 + rax*8 + 0x40]
     test r8, r8
     je Lmalloc_empty
@@ -492,6 +505,7 @@ Lmalloc_empty:
     mov dword ptr [r10], 0
 Lmalloc_slow:
     jmp qword ptr [rip + Lmalloc_slot]
+    heap_lock_wait malloc
 .p2align 3
 Lmalloc_cell:
     .quad 0
@@ -522,10 +536,7 @@ _guest__aligned_malloc:
     add rax, 16
     jc Laligned_malloc_slow
     heap_size_class
-    mov r9d, 1
-    xchg dword ptr [r10], r9d
-    test r9d, r9d
-    jne Laligned_malloc_slow
+    heap_lock _aligned_malloc, r9d
     mov r8, qword ptr [r10 + rax*8 + 0x40]
     test r8, r8
     je Laligned_malloc_empty
@@ -540,6 +551,7 @@ Laligned_malloc_empty:
     mov dword ptr [r10], 0
 Laligned_malloc_slow:
     jmp qword ptr [rip + Laligned_malloc_slot]
+    heap_lock_wait _aligned_malloc
 .p2align 3
 Laligned_malloc_cell:
     .quad 0
@@ -571,15 +583,7 @@ _guest_\name:
     cmp qword ptr [r8], r9
     jne Lslow\@
     mov eax, dword ptr [r8 + 8]
-    mov edx, 1
-Llock\@:
-    xchg dword ptr [r10], edx
-    test edx, edx
-    je Llocked\@
-    pause
-    mov edx, 1
-    jmp Llock\@
-Llocked\@:
+    heap_lock \name, edx
     mov r9, qword ptr [r10 + rax*8 + 0x40]
     mov qword ptr [\pointer], r9
     mov qword ptr [r10 + rax*8 + 0x40], \pointer
@@ -588,6 +592,7 @@ Ldone\@:
     ret
 Lslow\@:
     jmp qword ptr [rip + Lslot\@]
+    heap_lock_wait \name
 .p2align 3
 Lcell\@:
     .quad 0

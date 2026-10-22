@@ -71,6 +71,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_heap(GuestState& state,Gues
                     cursor=last;
                 }
             }
+            // 客體配置區（x86 chunk 或 x64 連續保留區）的 process heap 區塊：已配置逐一列出，空閒段依 chunk 內相鄰合併。
+            if(guest_heap_chunked_ || guest_heap_base_){
+                for(const auto& [address,size]:guest_heap_allocated_blocks(memory))entries.emplace(address,std::pair{size,true});
+                for(const auto& [address,size]:guest_heap_walk_free_)entries.emplace(address,std::pair{size,false});
+            }
             if(previous && !entries.contains(previous))return done(-6);
             const auto next=previous?entries.upper_bound(previous):entries.begin();
             if(next==entries.end())return done(entries.empty()?-1:-5);

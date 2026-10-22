@@ -3,6 +3,7 @@
 #include "x64arm/unicode.hpp"
 #include "window_presentation_fault.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +49,14 @@ struct FrameMapping {
     FrameMapping(const FrameMapping&)=delete;
     FrameMapping& operator=(const FrameMapping&)=delete;
 };
+// X64ARM_SHARED_FRAME_TRACE=frames 逐幀記錄發布／匯入時間，供跨程序幀節拍診斷。
+bool trace_shared_frames(){
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_SHARED_FRAME_TRACE");return value && std::string_view(value)=="frames";}();
+    return enabled;
+}
+long long trace_unix_us(){
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
 std::uint64_t frame_bytes(std::uint32_t stride,std::uint32_t height){
     const auto page=static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
     return (std::uint64_t{stride}*height+page-1)/page*page;
@@ -572,6 +581,7 @@ void WindowsServices::publish_remote_frame(std::uint64_t handle, NativeGraphics&
     if(::fstat(file.fd,&status) || (status.st_size<file_size && ::ftruncate(file.fd,file_size)))
         throw HostCallFault("共用影格配置失敗");
     const auto mapping=shared.frame_mapping(handle,file.fd,static_cast<std::size_t>(header.bytes),status);
+    const auto export_begin=trace_shared_frames()?trace_unix_us():0;
     graphics.graphics_export_frame(view,mapping->data,mapping->size,stride,shared.cache_frames?mapping:std::shared_ptr<void>{});
     if (::pwrite(file.fd, &header, sizeof(header), 0) != sizeof(header))
         throw HostCallFault("共用影格標頭寫入失敗");
@@ -579,7 +589,10 @@ void WindowsServices::publish_remote_frame(std::uint64_t handle, NativeGraphics&
     if (__atomic_load_n(&slot.handle, __ATOMIC_ACQUIRE) != handle ||
         __atomic_load_n(&slot.owner, __ATOMIC_ACQUIRE) != window->process)
         throw WindowPresentationFault("遠端呈現期間 HWND 已關閉");
-    __atomic_add_fetch(&slot.frame, 1U, __ATOMIC_RELEASE);
+    const auto sequence=__atomic_add_fetch(&slot.frame, 1U, __ATOMIC_RELEASE);
+    if(trace_shared_frames()){const auto now=trace_unix_us();
+        std::fprintf(stderr,"shared_frame kind=publish pid=%d handle=%llu seq=%u unix_us=%lld export_us=%lld\n",static_cast<int>(::getpid()),
+            static_cast<unsigned long long>(handle),sequence,now,now-export_begin);}
 #else
     throw HostCallFault("此平台缺少共用視窗呈現");
 #endif
@@ -621,7 +634,11 @@ void WindowsServices::poll_remote_frames() {
             if (native_gui_)
                 native_gui_->graphics_surface(handle, surface);
         }
+        const auto import_begin=trace_shared_frames()?trace_unix_us():0;
         surface->import_frame(mapping->data,mapping->size,header.stride,header.format,shared.cache_frames?mapping:std::shared_ptr<void>{});
+        if(trace_shared_frames()){const auto now=trace_unix_us();
+            std::fprintf(stderr,"shared_frame kind=import pid=%d handle=%llu seq=%u previous=%u unix_us=%lld import_us=%lld\n",static_cast<int>(::getpid()),
+                static_cast<unsigned long long>(handle),published,shared.frames[handle],now,now-import_begin);}
         shared.frames[handle] = published;
         (void)window;
     }

@@ -13,6 +13,9 @@ namespace {
 class CoreAudioOutput final : public Output {
     AudioUnit unit_{};
     std::shared_ptr<Buffer> buffer_;
+    // WASAPI 串流以串流本身的取樣率開啟輸出單元，取樣率轉換由 Core Audio 的轉換器完成；
+    // 其他來源（DirectSound、WinMM）維持 48 kHz 混音並沿用既有的頻率／Doppler 處理。
+    unsigned rate_=48000;
     // 診斷只保存有界視窗；即時 callback 不配置記憶體或寫入檔案。
     struct TraceWindow {std::uint64_t end{};unsigned frames{},nonzero{};float left{},right{};};
     const bool trace_enabled_=std::getenv("X64ARM_TRACE_AUDIO")!=nullptr;
@@ -24,7 +27,7 @@ class CoreAudioOutput final : public Output {
             const auto left=std::abs(samples[i]),right=std::abs(samples[i+1]);
             trace_current_.left=std::max(trace_current_.left,left);trace_current_.right=std::max(trace_current_.right,right);
             trace_current_.nonzero+=left>0 || right>0;++trace_current_.frames;++trace_frames_;
-            if(trace_current_.frames==48000){trace_current_.end=trace_frames_;(*trace_)[trace_count_++%trace_->size()]=trace_current_;trace_current_={};}
+            if(trace_current_.frames==rate_){trace_current_.end=trace_frames_;(*trace_)[trace_count_++%trace_->size()]=trace_current_;trace_current_={};}
         }
     }
     void report()const{
@@ -36,7 +39,7 @@ class CoreAudioOutput final : public Output {
     static OSStatus render(void* context,AudioUnitRenderActionFlags*,const AudioTimeStamp*,UInt32,UInt32 frames,AudioBufferList* data) {
         auto& self=*static_cast<CoreAudioOutput*>(context);
         if(data->mNumberBuffers!=1 || !data->mBuffers[0].mData || data->mBuffers[0].mDataByteSize<frames*2*sizeof(float))return kAudio_ParamError;
-        self.buffer_->render({static_cast<float*>(data->mBuffers[0].mData),static_cast<std::size_t>(frames)*2},48000);
+        self.buffer_->render({static_cast<float*>(data->mBuffers[0].mData),static_cast<std::size_t>(frames)*2},self.rate_);
         self.observe({static_cast<const float*>(data->mBuffers[0].mData),static_cast<std::size_t>(frames)*2});
         return noErr;
     }
@@ -44,11 +47,13 @@ class CoreAudioOutput final : public Output {
 public:
     // device 為 kAudioObjectUnknown 時使用 DefaultOutput，隨系統切換預設裝置；否則以 HAL 輸出綁定指定裝置。
     explicit CoreAudioOutput(std::shared_ptr<Buffer> buffer,AudioDeviceID device=kAudioObjectUnknown):buffer_(std::move(buffer)) {
+        // 呼叫端（例如 WASAPI 的 Initialize）已持有 buffer mutex；本單元的轉譯回呼在建構完成前尚未啟動，直接讀取即可，不可再上鎖。
+        if(buffer_->streaming && buffer_->rate>=8000 && buffer_->rate<=192000)rate_=buffer_->rate;
         AudioComponentDescription desc{};desc.componentType=kAudioUnitType_Output;desc.componentSubType=device==kAudioObjectUnknown?kAudioUnitSubType_DefaultOutput:kAudioUnitSubType_HALOutput;desc.componentManufacturer=kAudioUnitManufacturer_Apple;
         const auto component=AudioComponentFindNext(nullptr,&desc);
         if(!component || AudioComponentInstanceNew(component,&unit_)!=noErr)throw std::runtime_error("Core Audio output unavailable");
         if(device!=kAudioObjectUnknown && AudioUnitSetProperty(unit_,kAudioOutputUnitProperty_CurrentDevice,kAudioUnitScope_Global,0,&device,sizeof(device))!=noErr){close();throw std::runtime_error("Core Audio output device unavailable");}
-        AudioStreamBasicDescription format{};format.mSampleRate=48000;format.mFormatID=kAudioFormatLinearPCM;format.mFormatFlags=kAudioFormatFlagsNativeFloatPacked;
+        AudioStreamBasicDescription format{};format.mSampleRate=rate_;format.mFormatID=kAudioFormatLinearPCM;format.mFormatFlags=kAudioFormatFlagsNativeFloatPacked;
         format.mBytesPerPacket=8;format.mFramesPerPacket=1;format.mBytesPerFrame=8;format.mChannelsPerFrame=2;format.mBitsPerChannel=32;
         AURenderCallbackStruct callback{render,this};
         if(AudioUnitSetProperty(unit_,kAudioUnitProperty_StreamFormat,kAudioUnitScope_Input,0,&format,sizeof(format))!=noErr ||

@@ -3,6 +3,7 @@
 #include "x64arm/execution_policy.hpp"
 #include "x64arm/result.hpp"
 #include <functional>
+#include <memory>
 #include <optional>
 #include <filesystem>
 #include <array>
@@ -29,6 +30,8 @@
 #define X64ARM_HOST_SERVICES_RESIDENT_SERVICE_REQUEST 1
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTROL_REQUEST 1
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_ERRORS 1
+#define X64ARM_HOST_SERVICES_RESIDENT_CONTROL_DRAIN 1
+#define X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_SCALAR 1
 namespace x64arm {
 // 可選產碼範圍提示，end 不包含在範圍內。只影響探索分組，不授予執行權限。
 struct TranslationRegion {GuestAddress begin,end;};
@@ -97,6 +100,13 @@ struct ResidentScalarCall {
 static_assert(sizeof(ResidentScalarCall)==88 && offsetof(ResidentScalarCall,first)==16 &&
               offsetof(ResidentScalarCall,integer)==32 && offsetof(ResidentScalarCall,mxcsr)==48 &&
               offsetof(ResidentScalarCall,next)==56 && offsetof(ResidentScalarCall,environment)==64);
+// 常駐執行期間的外部喚醒來源（跨程序 IPC、裝置完成等）。只由中斷通知者執行緒呼叫，
+// 共享所有權保證等待期間有效；世代與 observed 不同或逾時才返回，回傳世代是否已改變。
+class ResidentExternalWake {
+public:
+    virtual ~ResidentExternalWake()=default;
+    virtual bool wait_changed(std::uint64_t observed,std::uint64_t nanoseconds) const noexcept=0;
+};
 // CPU 只認識受控客體入口，Windows ABI 與 API 語義由服務層負責。
 class HostServices {
     std::uint64_t concurrency_epoch_{};
@@ -170,8 +180,18 @@ public:
     virtual void after_resident_parallel(GuestState& state,GuestMemory& memory) {
         after_instructions(state,memory,0);
     }
+    // 單一常駐框架因中斷請求返回：請求只在服務明列待排程工作（其他 runnable、等待期限、
+    // 外部事件）時武裝，服務應在此做完整排程。預設沿用批次收尾，與既有服務相容。
+    virtual void after_resident_interrupt(GuestState& state,GuestMemory& memory) {
+        after_resident_parallel(state,memory);
+    }
     // 零表示沒有待排程事件；不得為正常運算任意加入週期性的整批停止。
     virtual std::uint64_t resident_parallel_wakeup_ns(std::span<GuestState* const>) const {return 0;}
+    // 可中斷的常駐框架另監看外部事件：observed 為協調者最近一次完整輪詢前的世代，
+    // 世代改變即要求中斷，讓協調者在完整邊界輪詢並排程。沒有來源時回傳空指標。
+    virtual std::shared_ptr<const ResidentExternalWake> resident_external_wake(std::uint64_t& observed) const {
+        (void)observed;return {};
+    }
     virtual bool allows_multiblock() const noexcept { return false; }
     virtual std::uint64_t instruction_slice() const noexcept { return UINT64_MAX; }
     // 載入器可提供已驗證的函式／程式區域；核心仍核對映射、入口及指令上限。
@@ -247,5 +267,16 @@ public:
     // 不可暫時切換 provider 的目前執行緒；映射或客體重綁後須重新取得。
     // 預設空值，不假設單客體 resident_scalar_errors 對其他客體也適用。
     virtual ResidentScalarErrors resident_context_errors(const GuestState&,GuestMemory&) noexcept { return {}; }
+    // 全體 worker 已交出狀態且目前客體沒有待辦時，選入另一個 runnable
+    // 的既有控制請求。provider 必須沿完整的 TLS／回呼／例外交換契約切換，
+    // 不執行客體指令、不虛構請求，也不喚醒仍在等待的客體。true 表示已切換；
+    // 控制器沿原服務／精確語義流程處理後再詢問，清空待辦才重派 worker。
+    virtual bool resident_select_control_request(GuestState&,GuestMemory&) { return false; }
+    // 純量值回退可在呼叫者的 worker 完成。分類不變；執行只讀固定服務表及
+    // epoch 內的映射，以已驗證視窗讀堆疊、借用私人 errno，不觸碰目前 runtime、
+    // 共用頁面快取、排程或回呼。false 必須沒有客體可見效果。
+    virtual bool resident_context_scalar_service(GuestAddress) const noexcept { return false; }
+    virtual bool invoke_resident_context_scalar(ResidentScalarCall&,GuestMemory&,
+                                               const ResidentScalarErrors&) noexcept { return false; }
 };
 }

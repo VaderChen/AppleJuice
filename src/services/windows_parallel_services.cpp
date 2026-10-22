@@ -26,11 +26,13 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
     const auto symbol=name(address);
     return symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue" ||
         symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
+        symbol=="InitOnceBeginInitialize" || symbol=="InitOnceExecuteOnce" ||
         symbol=="WakeConditionVariable" || symbol=="WakeAllConditionVariable" || symbol=="SwitchToThread" ||
         symbol=="_control87" || symbol=="_controlfp" ||
         symbol=="GetLastError" || symbol=="SetLastError" || symbol=="GetCurrentThreadId" ||
         symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency" ||
-        symbol=="EnterCriticalSection" || symbol=="TryEnterCriticalSection" || symbol=="LeaveCriticalSection";
+        symbol=="EnterCriticalSection" || symbol=="TryEnterCriticalSection" || symbol=="LeaveCriticalSection" ||
+        parallel_crt_format_service(address);
 }
 
 bool WindowsServices::invoke_parallel_service(GuestState& state,GuestMemory& memory) {
@@ -79,6 +81,10 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     std::uint64_t result=0;
     // 與一般服務一樣，服務邊界保持客體可見的記憶體順序；不依賴宿主是否已授權 TSO。
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    if(parallel_crt_format_service(state.rip)){
+        if(!invoke_parallel_crt_format(state,memory,tid))return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);return true;
+    }
     if(symbol=="GetLastError" || symbol=="SetLastError"){
         auto* error=pointer(thread.teb+0x68,4,symbol=="GetLastError"?1U:2U);if(!error)return false;
         if(symbol=="GetLastError")result=current?last_error_:load(error,4);
@@ -102,6 +108,31 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         auto& values=current?runtime_.fls_values:thread.fls_values;
         if(reading){result=values[index];if(error){put(error,0,4);if(current)last_error_=0;}}
         else {values[index]=second;if(mirror)put(mirror,second,8);result=1;}
+    }else if(symbol=="InitOnceBeginInitialize" || symbol=="InitOnceExecuteOnce"){
+        const bool begin=symbol=="InitOnceBeginInitialize";
+        if(begin && (static_cast<std::uint32_t>(second)&~1U))return false;
+        const auto sp=state.reg(Gpr::Rsp);
+        if(sp%16!=8 || sp>UINT64_MAX-40)return false;
+        const auto home=memory.native_window(GuestAddress{sp+8},2);
+        if(!home.data || home.after<32)return false;
+        auto* object=pointer(first,8,3);if(!object)return false;
+        const auto initialization=runtime_.once_initializations.find(first);
+        if(initialization==runtime_.once_initializations.end())return false;
+        const auto& once=initialization->second;
+        // once 表只在全體交出狀態後修改；完成查詢不需要停止其他 worker。
+        // 仍核對客體值，已歸零／重建的同址物件不得沿用前一個 context。
+        if(!once.complete || once.owner || load(object,8)!=(once.context|UINT64_C(2)))return false;
+        auto* pending=begin?pointer(state.reg(Gpr::R8),4,2):nullptr;
+        const auto output=state.reg(Gpr::R9);
+        auto* context=output?pointer(output,8,2):nullptr;
+        if((begin && !pending) || (output && !context))return false;
+        // 完成所有資格檢查後才按原 provider 順序寫入，保留輸出別名語義。
+        if(pending)put(pending,0,4);
+        if(context)put(context,once.context,8);
+        // 此 context 已由 worker 執行；只清除原流程會清除的自身等待紀錄。
+        auto& wait=thread.wait;
+        if(!begin || (wait.kind==ThreadWaitKind::Once && !wait.handles.empty() && wait.handles[0]==first))wait={};
+        result=1;
     }else if(symbol=="WakeConditionVariable" || symbol=="WakeAllConditionVariable"){
         if(!pointer(first,8,2))return false;
         // 等待集合在 epoch 內固定。沒有尚待喚醒者時，通知已完整完成；有等待者

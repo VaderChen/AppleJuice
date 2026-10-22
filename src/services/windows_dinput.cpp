@@ -90,8 +90,10 @@ struct DirectInputState {
     std::array<std::optional<input::Guid>,16> legacy_joystick_slots;
     struct GamepadSlot {std::optional<input::Guid> device;std::array<std::uint8_t,12> state{};std::uint32_t packet{};bool sampled{};};
     std::array<GamepadSlot,4> gamepad_slots;
+    // 背景輪詢最近一次處理的裝置清單換代，以及當時更新的 raw input 狀態。
+    std::uint64_t device_generation{};const void* raw_input_refreshed{};
 };
-void WindowsServices::set_input_backend(std::shared_ptr<input::Backend> backend){if(dinput_ && !dinput_->objects.empty())throw std::logic_error("DirectInput 物件建立後不能替換輸入後端");if(!dinput_)dinput_=std::make_shared<DirectInputState>();dinput_->backend=std::move(backend);dinput_->gamepad_slots={};}
+void WindowsServices::set_input_backend(std::shared_ptr<input::Backend> backend){if(dinput_ && !dinput_->objects.empty())throw std::logic_error("DirectInput 物件建立後不能替換輸入後端");if(!dinput_)dinput_=std::make_shared<DirectInputState>();dinput_->backend=std::move(backend);dinput_->gamepad_slots={};dinput_->device_generation=0;dinput_->raw_input_refreshed=nullptr;}
 std::span<const WindowsServiceDescriptor> dinput_service_descriptors(){
     static const auto table=[](){
         std::vector<WindowsServiceDescriptor> result{{"dinput.dll","DirectInputCreateA",4,0,0,2},{"dinput.dll","DirectInputCreateW",4,0,0,2},{"dinput.dll","DirectInputCreateEx",5,0,0,2},{"dinput.dll","GetdfDIJoystick",0},{"dinput8.dll","DirectInput8Create",5,0,0,2}};
@@ -135,8 +137,16 @@ void WindowsServices::poll_dinput(bool background){
        (!raw_input_ || raw_input_->registrations.empty()) &&
        (!pointer_input_ || pointer_input_->registrations.empty()) &&
        std::none_of(files_.begin(),files_.end(),[](const auto& entry){return bool(entry.second.hid);}))return;
-    auto& bridge=*dinput_;const auto native_events=bridge.backend->poll();auto devices=bridge.backend->devices();
-    refresh_raw_input(devices);
+    auto& bridge=*dinput_;const auto native_events=bridge.backend->poll();
+    // 背景排程每個時間片都會進來，後端快照卻只約每 4 ms 換代。沒有 DirectInput 物件時，
+    // 裝置清單只用於更新 raw input；同一換代已對同一 raw input 狀態更新過就不再複製與比對。
+    // 換代編號須在取得清單前讀取：之後才發布的新清單會留給下一次輪詢。
+    const auto generation=bridge.backend->device_generation();
+    std::vector<input::Device> devices;
+    if(!background || !generation || generation!=bridge.device_generation || !bridge.objects.empty() || bridge.raw_input_refreshed!=raw_input_.get()){
+        devices=bridge.backend->devices();refresh_raw_input(devices);
+        bridge.device_generation=generation;bridge.raw_input_refreshed=raw_input_.get();
+    }
     poll_pointer_input();
     const auto now=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
     std::vector<std::pair<input::Event,std::uint32_t>> events;events.reserve(native_events.size()+bridge.injected_events.size());

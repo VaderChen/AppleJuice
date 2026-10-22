@@ -73,22 +73,25 @@ void WindowsServices::poll_registry_notifications(bool reload,std::u16string_vie
         const bool root=watch.key>=0x80000000U && watch.key<=0x80000006U;
         bool changed=(!root && !registry.handles.contains(watch.key)) || !registry.keys.contains(watch.path) ||
             (!(watch.filter&0x10000000U) && (thread==threads_.items.end() || thread->second.status==ThreadStatus::Exited));
-        const auto prefix=watch.path+u"\\";
-        const auto within=[&](std::u16string_view path){return path==watch.path || (watch.subtree && path.starts_with(prefix));};
-        if((filter&watch.filter) && within(mutation))changed=true;
-        const auto relevant=[&](std::u16string_view path){return within(path) || ((watch.filter&1) && path.starts_with(prefix) && path.find(u'\\',prefix.size())==std::u16string_view::npos);};
-        // API 內的交易／變更立即比對；宿主登錄檔尚未重載時不重掃相同快照。
-        // 關閉 handle 與執行緒退出仍在每次輪詢檢查。
-        if(!changed && compare_snapshots) {
-            for(const auto& [path,values]:registry.keys)if(relevant(path)) {
-                const auto before=watch.snapshot.find(path);
-                if(((watch.filter&1) && before==watch.snapshot.end()) || ((watch.filter&4) && within(path) && before!=watch.snapshot.end() && values!=before->second)){changed=true;break;}
+        // 背景排程每個時間片都會輪詢；只有比對變更路徑或快照時才需要組出子鍵前綴。
+        if(!changed && ((filter&watch.filter) || compare_snapshots)) {
+            const auto prefix=watch.path+u"\\";
+            const auto within=[&](std::u16string_view path){return path==watch.path || (watch.subtree && path.starts_with(prefix));};
+            if((filter&watch.filter) && within(mutation))changed=true;
+            const auto relevant=[&](std::u16string_view path){return within(path) || ((watch.filter&1) && path.starts_with(prefix) && path.find(u'\\',prefix.size())==std::u16string_view::npos);};
+            // API 內的交易／變更立即比對；宿主登錄檔尚未重載時不重掃相同快照。
+            // 關閉 handle 與執行緒退出仍在每次輪詢檢查。
+            if(!changed && compare_snapshots) {
+                for(const auto& [path,values]:registry.keys)if(relevant(path)) {
+                    const auto before=watch.snapshot.find(path);
+                    if(((watch.filter&1) && before==watch.snapshot.end()) || ((watch.filter&4) && within(path) && before!=watch.snapshot.end() && values!=before->second)){changed=true;break;}
+                }
+                if(watch.filter&1)for(const auto& [path,values]:watch.snapshot){(void)values;if(!registry.keys.contains(path)){changed=true;break;}}
+                // 描述元可由繼承規則惰性建立；其他程序提交後重載會清空本地快取。
+                // 比對有效描述元，不能將「尚未放入快取」誤認為安全性變更。
+                if(watch.filter&8)for(const auto& [path,descriptor]:watch.security_snapshot)
+                    if(!registry.keys.contains(path) || registry_security_descriptor(path)!=descriptor){changed=true;break;}
             }
-            if(watch.filter&1)for(const auto& [path,values]:watch.snapshot){(void)values;if(!registry.keys.contains(path)){changed=true;break;}}
-            // 描述元可由繼承規則惰性建立；其他程序提交後重載會清空本地快取。
-            // 比對有效描述元，不能將「尚未放入快取」誤認為安全性變更。
-            if(watch.filter&8)for(const auto& [path,descriptor]:watch.security_snapshot)
-                if(!registry.keys.contains(path) || registry_security_descriptor(path)!=descriptor){changed=true;break;}
         }
         if(!changed){++it;continue;}
         if(watch.event){const auto event=runtime_.wait_objects.find(watch.event);if(event!=runtime_.wait_objects.end())event->second.set_signal(true);}

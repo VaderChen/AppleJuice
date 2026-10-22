@@ -84,6 +84,9 @@ int send_transfer(int socket,const std::string& path,const TransferMessage& pack
 struct DescriptorWatch {
     int queue{-1};std::shared_ptr<SharedWake> wake;
     std::atomic<bool> ready{false},stop{false};bool paused{};
+    // 第一個描述元是本程序的 handle 轉移通道；它可讀時另設旗標，讓服務邊界只在真的有轉移請求時才排空，
+    // 不因子程序管線等其他描述元可讀而每個邊界都輪詢。
+    int primary{-1};std::atomic<bool> primary_ready{false};
     std::mutex mutex;std::condition_variable resumed;std::thread thread;
     mutable std::mutex registry_mutex;std::set<int> registered;
     static constexpr std::uintptr_t stop_ident=1;
@@ -92,6 +95,7 @@ struct DescriptorWatch {
         (void)::fcntl(queue,F_SETFD,FD_CLOEXEC);
         struct kevent control{};EV_SET(&control,stop_ident,EVFILT_USER,EV_ADD|EV_CLEAR,0,0,nullptr);
         if(::kevent(queue,&control,1,nullptr,0,nullptr)<0){::close(queue);queue=-1;return;}
+        if(!fds.empty())primary=fds.front();
         for(const auto fd:fds)add(fd);
         try{thread=std::thread([this]{run();});}catch(const std::system_error&){}
     }
@@ -105,6 +109,7 @@ struct DescriptorWatch {
     }
     bool active()const noexcept{return thread.joinable();}
     bool signalled()const noexcept{return ready.load(std::memory_order_acquire);}
+    bool primary_signalled()const noexcept{return primary_ready.load(std::memory_order_acquire);}
     // 任一執行緒可加入；kqueue 的註冊與等待可同時進行。
     void add(int fd)noexcept{
         if(queue<0 || fd<0)return;
@@ -113,10 +118,18 @@ struct DescriptorWatch {
     }
     // 該描述元是否已交給監看執行緒等待（呼叫端據此略過自己的輪詢）。
     bool watches(int fd)const noexcept{std::lock_guard<std::mutex> lock(registry_mutex);return registered.contains(fd);}
-    // 協調執行緒排空後呼叫；未曾通知時不喚醒監看執行緒。
+    // 協調執行緒排空後呼叫。ready／paused 只在同一把鎖內一起轉換：監看執行緒已暫停就一定解除，
+    // 不依賴先前讀到的 ready。舊寫法在「ready 已設、paused 未設」之間被呼叫時會清掉 ready 卻沒有
+    // 解除後續的暫停，監看執行緒從此永遠停住，跨程序 handle 請求不再被處理（請求方卡在同步等待）。
+    // 解除後 kqueue 為 level-triggered，仍可讀的描述元會立即再次通知，不會遺失事件。
     void resume()noexcept{
-        if(!ready.exchange(false,std::memory_order_acq_rel))return;
-        {std::lock_guard<std::mutex> lock(mutex);paused=false;}resumed.notify_one();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            ready.store(false,std::memory_order_release);primary_ready.store(false,std::memory_order_release);
+            if(!paused)return;
+            paused=false;
+        }
+        resumed.notify_one();
     }
     void run(){
         std::array<struct kevent,16> events{};
@@ -124,11 +137,15 @@ struct DescriptorWatch {
             const int count=::kevent(queue,nullptr,0,events.data(),static_cast<int>(events.size()),nullptr);
             if(count<0){if(errno==EINTR)continue;break;}
             if(stop.load(std::memory_order_acquire))break;
-            bool readable=false;
-            for(int i=0;i<count;++i)if(events[static_cast<std::size_t>(i)].filter!=EVFILT_USER)readable=true;
+            bool readable=false,transfer=false;
+            for(int i=0;i<count;++i){
+                const auto& event=events[static_cast<std::size_t>(i)];
+                if(event.filter==EVFILT_USER)continue;
+                readable=true;if(primary>=0 && event.ident==static_cast<std::uintptr_t>(primary))transfer=true;
+            }
             if(!readable)continue;
-            ready.store(true,std::memory_order_release);
-            {std::lock_guard<std::mutex> lock(mutex);paused=true;}
+            {std::lock_guard<std::mutex> lock(mutex);ready.store(true,std::memory_order_release);
+                if(transfer)primary_ready.store(true,std::memory_order_release);paused=true;}
             if(wake)wake->notify();
             std::unique_lock<std::mutex> lock(mutex);resumed.wait(lock,[&]{return !paused || stop.load(std::memory_order_acquire);});
         }
@@ -291,6 +308,16 @@ void WindowsServices::watch_descriptor(int descriptor) noexcept {
 bool WindowsServices::handle_transfer_polling() const noexcept {
     // 監看執行緒會以共用喚醒通知通道事件；沒有監看（非 host clock、無共用喚醒或建立失敗）時沿用排程器輪詢。
     return handle_transfers_ && !(handle_transfers_->watch && handle_transfers_->watch->active());
+}
+bool WindowsServices::handle_transfer_requested() const noexcept {
+#if !defined(_WIN32)
+    // X64ARM_HANDLE_TRANSFER_PROMPT=0 保留只在排程時排空的舊行為，供同成品對照。
+    static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_HANDLE_TRANSFER_PROMPT");
+        return !setting || std::string_view(setting)!="0";}();
+    return enabled && handle_transfers_ && handle_transfers_->watch && handle_transfers_->watch->primary_signalled();
+#else
+    return false;
+#endif
 }
 void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
 #if !defined(_WIN32)

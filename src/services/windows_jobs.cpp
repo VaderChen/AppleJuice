@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/shared_job.hpp"
 #include "x64arm/shared_event.hpp"
+#include "x64arm/startup_profile.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/unicode.hpp"
 #include "monotonic_clock.hpp"
@@ -98,6 +99,8 @@ void WindowsServices::poll_job_termination(GuestMemory& memory){
         if(!changed && now<jobs_->next_poll)throttled=true;else jobs_->next_poll=now+job_poll_interval;
     }
     if(jobs_)jobs_->immediate=false;
+    // 完整輪詢需跨程序鎖與成員存活核對；分開計時以確認節流是否生效。
+    std::optional<startup_profile::Scope> full;if(jobs_ && !throttled)full.emplace("job_poll","full");
     if(jobs_ && !throttled)for(auto it=jobs_->associations.begin();it!=jobs_->associations.end();){
         auto& association=it->second;association.revision=association.observer->revision();
         const auto notifications=association.observer->notifications_since(association.cursor,association.generation);
