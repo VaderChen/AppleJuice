@@ -317,7 +317,7 @@ func NewApp(engine, dataDir, cDrive string) (*App, error) {
 	a.library.OpenGLBackend = normalizeOpenGLBackend(defaults.OpenGLBackend)
 	a.library.CompilerWorkers = normalizeCompilerWorkers(defaults.CompilerWorkers)
 	a.library.CPUCoresX64 = normalizeCPUCount(defaults.CPUCoresX64, a.cpuLimits.X64Max, a.cpuLimits.X64Max)
-	a.library.CPUCoresX86 = normalizeCPUCount(defaults.CPUCoresX86, a.cpuLimits.X86Max, 1)
+	a.library.CPUCoresX86 = normalizeCPUCount(defaults.CPUCoresX86, a.cpuLimits.X86Max, min(defaultX86CPUCores, a.cpuLimits.X86Max))
 	if cDrive != "" {
 		a.library.CDrive = cDrive
 	}
@@ -739,7 +739,7 @@ func validateGlobalSettings(settings GlobalSettings) (GlobalSettings, error) {
 	if err != nil {
 		return GlobalSettings{}, err
 	}
-	x86, err := validateCPUCount(settings.CPUCoresX86, limits.X86Max, 1, "x86")
+	x86, err := validateCPUCount(settings.CPUCoresX86, limits.X86Max, min(defaultX86CPUCores, limits.X86Max), "x86")
 	if err != nil {
 		return GlobalSettings{}, err
 	}

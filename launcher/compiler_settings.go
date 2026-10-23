@@ -52,5 +52,5 @@ func engineEnvironment(workers uint32, openGL string, nativeLibraryBridge bool, 
 		environment = append(environment, "X64ARM_NATIVE_LIBRARIES="+strings.Join(providers, ","))
 	}
 	return append(environment, "TERM=xterm-256color", "X64ARM_GL_BACKEND="+normalizeOpenGLBackend(openGL),
-		"X64ARM_JIT_COMPILER_WORKERS="+strconv.FormatUint(uint64(workers), 10), sharedRegionsSetting)
+		"X64ARM_JIT_COMPILER_WORKERS="+strconv.FormatUint(uint64(workers), 10), "X64ARM_AOT_MEMORY_CACHE=*", sharedRegionsSetting)
 }

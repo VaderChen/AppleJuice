@@ -113,6 +113,39 @@
   }
   try {
     await window.launcherReady;
+    if (smokeConfig.scenario === 'settings' && smokeConfig.settingsTest === 'cpu-defaults') {
+      check('新設定預設 x86 雙核與 2 個編譯 worker', state.globalSettings.cpuCoresX86 === Math.min(2, state.cpuLimits.x86Max) && state.globalSettings.compilerWorkers === 2);
+      await click('app-settings'); await click('global-tab-cpu');
+      for (const workers of [0, 4, 2]) {
+        $('compiler-workers').value = workers; $('compiler-workers').dispatchEvent(new Event('input'));
+        await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存編譯 worker');
+        await click('app-settings-close'); await click('app-settings'); await click('global-tab-cpu');
+        check(`遵守 UI 明確設定的 ${workers} 個編譯 worker`, state.globalSettings.compilerWorkers === workers && Number($('compiler-workers').value) === workers);
+      }
+      for (const architecture of ['x64', 'x86']) {
+        const id = 'cpu-cores-' + architecture, maximum = state.cpuLimits[architecture + 'Max'];
+        for (const value of [1, Math.min(2, maximum), Math.min(3, maximum)]) {
+          $(id).value = value; $(id).dispatchEvent(new Event('input'));
+          check(`${architecture} ${value} 核依門檻顯示提示`, $(id + '-warning').hidden === (value <= 2));
+        }
+      }
+      await capture('cpu-core-warning.png');
+      await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存超過雙核設定');
+      check('提示不阻擋儲存超過雙核的設定', state.globalSettings.cpuCoresX86 === Math.min(3, state.cpuLimits.x86Max));
+      await click('app-settings-close');
+      await api('smokePick', { paths: smokeConfig.programs }); await click('add');
+      await choose(state.programs[0].id); await click('tab-settings');
+      const maximum = state.cpuLimits[selected().architecture === 'x86' ? 'x86Max' : 'x64Max'];
+      for (const value of [0, Math.min(2, maximum), Math.min(3, maximum)]) {
+        $('program-cpu-cores').value = value; $('program-cpu-cores').dispatchEvent(new Event('input', { bubbles: true }));
+        check(`個別程式 ${value} 核依有效值顯示提示`, $('program-cpu-warning').hidden === ((value || Math.min(3, maximum)) <= 2));
+      }
+      await capture('program-core-warning.png');
+      await click('save'); await until(() => !busy, '儲存個別程式核心數');
+      check('提示不阻擋個別程式保存設定', selected().cpuCores === Math.min(3, maximum));
+      await api('smokeResult', { result: { passed: true, checks, captures, state } });
+      return;
+    }
     if (smokeConfig.scenario === 'settings' && ['gpu-save', 'gpu-reload'].includes(smokeConfig.settingsTest)) {
       const reload = smokeConfig.settingsTest === 'gpu-reload';
       if (!reload) {

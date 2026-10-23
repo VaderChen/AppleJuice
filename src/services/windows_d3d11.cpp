@@ -4,6 +4,7 @@
 #include "window_presentation_fault.hpp"
 #include "graphics_frame_test_control.hpp"
 #include "x64arm/windows_services.hpp"
+#include <atomic>
 #include "x64arm/d3dx_font_raster.hpp"
 #include "x64arm/d3dx_sprite_sort.hpp"
 #include "x64arm/media_surface.hpp"
@@ -119,6 +120,9 @@ struct Identity {
     std::map<std::pair<std::uint64_t,std::uint32_t>,DeferredGraphicsMap> deferred_maps;
     bool offered{};
     std::vector<std::uint8_t> query_data;
+    // 事件查詢（D3D11_QUERY_EVENT）以後端完成旗標判定就緒，End 不等待 GPU。
+    std::shared_ptr<const std::atomic<bool>> query_fence;
+    std::shared_ptr<const GraphicsTimestampFuture> query_timestamp;
     bool query_active{},query_ready{},fullscreen{};
     std::uint64_t fullscreen_output{};
     std::array<std::int32_t,4> windowed_rect{};

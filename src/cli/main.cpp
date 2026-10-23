@@ -104,6 +104,9 @@ bool equal_result(const ExecutionResult& a, const ExecutionResult& b) {
 }
 ExecutionResult execute_module(GuestState& state,GuestMemory& memory,RunOptions options,
                                const std::filesystem::path& dump,std::ostream& diagnostics,const std::filesystem::path& source){
+    const auto workers=compiler_worker_count();
+    if(!std::getenv("X64ARM_JIT_COMPILER_WORKERS"))::setenv("X64ARM_JIT_COMPILER_WORKERS",std::to_string(workers).c_str(),1);
+    diagnostics<<"aot_compiler_workers="<<(std::getenv("X64ARM_AOT_BACKGROUND_COMPILE")?std::getenv("X64ARM_AOT_BACKGROUND_COMPILE"):std::getenv("X64ARM_JIT_COMPILER_WORKERS"))<<'\n';
     AotEngine engine;ExecutionResult result;std::uint64_t completed=0;
     const auto* setting=std::getenv("X64ARM_AOT_PERSISTENT");
     const bool persistent=!source.empty() && setting && std::string_view(setting)=="1";

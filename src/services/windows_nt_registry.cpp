@@ -116,7 +116,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_registry(GuestState& sta
         const auto found=registry.handles.find(arg(0));if(found==registry.handles.end())return done(invalid_handle);
         const auto handle=found->second;if(!registry.keys.contains(handle.path))return done(deleted);
         auto& values=registry.keys.at(handle.path);
-        if(symbol=="NtFlushKey"){if(!(handle.access&1U))return done(denied);changed=true;return done(0);}
+        if(symbol=="NtFlushKey"){if(!(handle.access&1U))return done(denied);if(const auto error=flush_registry_hives())return done(native_io_error(error));return done(native_io_error(transaction.flush()));}
         if(symbol=="NtDeleteKey"){
             if(registry.hives.contains(handle.path))return done(denied);
             if(!(handle.access&0x10000U) || handle.path.size()==1)return done(denied);const auto prefix=handle.path+u"\\";

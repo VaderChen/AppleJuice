@@ -56,6 +56,9 @@ struct HostFile {
     std::uint32_t allocate(std::uint64_t size) const;
     std::uint32_t set_valid_data(std::uint64_t size) const;
     FileInformation information() const;
+    // 只取目前檔案大小（一次 fstat）：ReadFile／WriteFile 每次都要 EOF，information() 另讀兩個 xattr（valid data、DOS 屬性），
+    // Steam 校驗檔案時每秒數萬次 ReadFile 曾因此每次多 30 µs。沒有內容 fd 時回到 information()。
+    std::uint64_t current_size() const;
     // 借用描述元，只查詢即時資訊；不接管、不關閉，也不改變檔案位置。
     static FileInformation descriptor_information(int descriptor);
     FileVolumeSpace volume_space() const;

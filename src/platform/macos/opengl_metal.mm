@@ -94,7 +94,7 @@ class MetalGl final:public NativeOpenGlContext {
     std::map<unsigned,TextureLevelInfo> proxy_levels_;
     void texture_level(GlOperation,std::span<const std::uint64_t>,std::span<std::uint8_t>);
     MetalPendingObjects graphics_pending_;
-    struct Flight {id<MTLCommandBuffer> command;std::vector<std::shared_ptr<GpuMemoryReservation>> leases;MetalPendingObjects objects;};
+    struct Flight {id<MTLCommandBuffer> command;std::vector<std::shared_ptr<GpuMemoryReservation>> leases;MetalPendingObjects objects;std::shared_ptr<std::atomic<bool>> done;};
     std::deque<Flight> flights_;
     std::size_t flight_limit_{3},flight_peak_{};
     std::uint64_t wait_count_{},wait_ns_{},resource_wait_count_{};
@@ -159,6 +159,9 @@ class MetalGl final:public NativeOpenGlContext {
             // 在 commit 之前配置追蹤節點；資源／額度保留至 GPU 完成，避免非同步重用。
             flights_.emplace_back();auto& flight=flights_.back();flight.command=commands_;
             flight.leases=std::move(pending_leases_);flight.objects=std::move(graphics_pending_);
+            // 完成旗標供 D3D11 事件查詢輪詢；回呼只寫旗標，不觸碰後端狀態。
+            flight.done=std::make_shared<std::atomic<bool>>(false);auto done=flight.done;
+            [commands_ addCompletedHandler:^(id<MTLCommandBuffer>){done->store(true,std::memory_order_release);}];
             if(commands_gpu_work_)track_gpu_commands(commands_);[commands_ commit];commands_=nil;pending_leases_.clear();graphics_pending_.clear();pending_=0;++submissions_;
             flight_peak_=std::max(flight_peak_,flights_.size());
         }
@@ -387,6 +390,7 @@ public:
     std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t>)override;
     bool graphics_timestamp_supported()const override;
     GraphicsTimestamp graphics_timestamp()override;
+    std::shared_ptr<const GraphicsTimestampFuture> graphics_timestamp_future()override;
     void graphics_write(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t)override;
     void graphics_write_discard(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t)override;
     void graphics_write_no_overwrite(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t)override;
@@ -405,6 +409,18 @@ public:
     void graphics_capture_present(const GraphicsView&);
     void graphics_export_frame(const GraphicsView&,void*,std::size_t,std::uint32_t,std::shared_ptr<void>)override;
     void graphics_flush(bool wait)override{flush(wait);}
+    // 有待提交工作就提交；回傳最新 flight 的完成旗標（同一 queue 依序完成，涵蓋先前所有提交）。
+    // 不為 fence 建立空命令緩衝：那會占用 flight 名額，上限一到 flush 就同步等待，與原本等 GPU 閒置無異。
+    std::shared_ptr<const std::atomic<bool>> graphics_fence()override{@autoreleasepool{
+        static const bool trace=std::getenv("X64ARM_TRACE_GRAPHICS_STATE")!=nullptr;
+        const auto begin=trace?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        const bool pending=bool(commands_);
+        if(commands_)flush(false);else reap();
+        if(trace){static std::uint64_t calls=0,pending_calls=0,ns=0;++calls;pending_calls+=pending;ns+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count());
+            if(calls%500==1)std::fprintf(stderr,"[metal_fence] calls=%llu pending=%llu avg_us=%llu inflight=%zu\n",static_cast<unsigned long long>(calls),static_cast<unsigned long long>(pending_calls),static_cast<unsigned long long>(ns/calls/1000),flights_.size());}
+        if(flights_.empty())return std::make_shared<std::atomic<bool>>(true);
+        return flights_.back().done;
+    }}
     void graphics_bind(id<MTLRenderCommandEncoder>,id<MTLComputeCommandEncoder>,const GraphicsStage&,bool);
     MetalGeometryDraw graphics_geometry(const GraphicsDraw&,MTLVertexDescriptor*,const std::array<int,32>&,const std::string&);
     bool graphics_stream_output(const GraphicsDraw&,const MetalShader&,id<MTLBuffer>,unsigned,unsigned,unsigned);

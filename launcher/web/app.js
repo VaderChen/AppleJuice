@@ -125,7 +125,12 @@ function updateInstallLocation(prefix = '') {
   const cDrive = $(prefix + 'c-drive').value.replace(/\/+$/, '');
   $(prefix + 'install-default').textContent = chosen ? t`安裝位置：${chosen}` : t`預設：${cDrive}/Program Files`;
 }
-function updateDirty() { const p = selected(); $('dirty').hidden = !p || JSON.stringify(readSettings()) === JSON.stringify(settingsFrom(p)); $('install-read-only').hidden = !$('install-root').value || $('writable').checked; updateInstallLocation(); }
+function updateProgramCPUWarning() {
+  const p = selected(), architecture = p?.architecture === 'x86' ? 'X86' : 'X64';
+  const cores = Number($('program-cpu-cores').value) || state.globalSettings?.['cpuCores' + architecture] || 0;
+  $('program-cpu-warning').hidden = !p || cores <= 2;
+}
+function updateDirty() { const p = selected(); $('dirty').hidden = !p || JSON.stringify(readSettings()) === JSON.stringify(settingsFrom(p)); $('install-read-only').hidden = !$('install-root').value || $('writable').checked; updateInstallLocation(); updateProgramCPUWarning(); }
 function applyState(next) {
  state = next;
  programsByID = new Map();
@@ -254,7 +259,10 @@ function renderUsage(p) {
   setText('usage-cpu', fresh && usage.cpuPercent != null ? `${usageNumber(usage.cpuPercent)}%` : '—');
   setText('usage-gpu', fresh && usage.gpuPercent != null ? `${usageNumber(usage.gpuPercent)}%` : '—');
   setText('usage-memory', fresh && usage.memoryBytes != null ? usageBytes(usage.memoryBytes) : '—');
-  setText('usage-gpu-memory', fresh ? usage.gpuTimingAvailable ? t`GPU 記憶體 ${usageBytes(usage.gpuMemoryBytes)} / ${usageBytes(usage.gpuMemoryLimitBytes)}` : t`此繪圖後端未提供計時 · ${usageBytes(usage.gpuMemoryBytes)}` : t('正在取樣…'));
+  setText('usage-gpu-memory', fresh ? `GPU 記憶體合計 ${usageBytes(usage.gpuMemoryBytes)} · 每程序上限 ${usageBytes(usage.gpuMemoryLimitBytes)}${usage.gpuTimingAvailable ? '' : ' · 計時不可用'}` : t('正在取樣…'));
+  const cache = fresh && usage.compilerCache;
+  const lookups = cache ? cache.hits + cache.misses + cache.rejects : 0;
+  setText('usage-cache', cache ? `EXE／DLL 快取：${lookups ? `${(cache.hits / lookups * 100).toFixed(1)}%（${cache.hits}／${lookups}）` : '尚無查詢'} · 背景命中 ${cache.backgroundHits} · 編譯每程序 ${cache.workers} worker（已建立 ${cache.activeWorkers}） · ${usage.processCount} 個程序` : '編譯記憶體快取正在取樣…');
   const hasNetwork = fresh && usage.receiveBytesPerSecond != null && usage.sendBytesPerSecond != null;
   setText('usage-network', hasNetwork ? usageBytes(usage.receiveBytesPerSecond + usage.sendBytesPerSecond, true) : '—');
   setText('usage-network-detail', hasNetwork ? `↑ ${usageBytes(usage.sendBytesPerSecond, true)}  ↓ ${usageBytes(usage.receiveBytesPerSecond, true)}` : t('正在取樣…'));
@@ -444,6 +452,7 @@ function updateCPUReadouts() {
     const id = 'cpu-cores-' + architecture;
     setRangeReadout(id, t`${Number($(id).value).toLocaleString(currentLanguage)} 個核心`);
     setText(id + '-max', Number($(id).max).toLocaleString(currentLanguage));
+    $(id + '-warning').hidden = Number($(id).value) <= 2;
   }
   setText('cpu-system-cores', t`宿主實體核心：${state.cpuLimits.physicalCores.toLocaleString(currentLanguage)}`);
   const workers = Number($('compiler-workers').value);

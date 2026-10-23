@@ -506,11 +506,61 @@ std::uint64_t filetime(const timespec& value) {
     const auto ticks = static_cast<__int128>(value.tv_sec) * 10000000 + value.tv_nsec / 100 + UINT64_C(116444736000000000);
     return ticks < 0 ? 0 : ticks > UINT64_MAX ? UINT64_MAX : static_cast<std::uint64_t>(ticks);
 }
+// xattr（DOS 屬性、valid data）只在 ctime 改變時可能改變（setxattr／removexattr 會更新 ctime），
+// 以 (dev, ino, ctime) 為鍵快取解析結果：命中時 FindFirstFile／GetFileAttributes 每項只剩 stat，
+// 不再 openat＋兩次 fgetxattr＋close。Steam 啟動時 Steam.exe 約 350 次 FindFirstFile、600 次 GetFileAttributes
+// 共約 1 秒在這裡。X64ARM_METADATA_CACHE=0 關閉；超過 65,536 筆時整個清除。
+struct XattrCache {
+    struct Entry {std::uint32_t dos_attributes{};bool dos_valid{},valid_data_managed{};std::uint64_t valid_data_length{};std::uint32_t valid_data_error{};};
+    std::mutex mutex;std::unordered_map<std::string,Entry> entries;
+    static bool enabled(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METADATA_CACHE");return !text || std::string_view(text)!="0";}();return value;}
+    static std::string key(const struct stat& value){
+        char text[80];
+#if defined(__APPLE__)
+        std::snprintf(text,sizeof(text),"%llx:%llx:%lld.%ld",static_cast<unsigned long long>(value.st_dev),static_cast<unsigned long long>(value.st_ino),static_cast<long long>(value.st_ctimespec.tv_sec),value.st_ctimespec.tv_nsec);
+#else
+        std::snprintf(text,sizeof(text),"%llx:%llx:%lld.%ld",static_cast<unsigned long long>(value.st_dev),static_cast<unsigned long long>(value.st_ino),static_cast<long long>(value.st_ctim.tv_sec),value.st_ctim.tv_nsec);
+#endif
+        return text;
+    }
+    std::optional<Entry> find(const struct stat& value){
+        if(!enabled())return {};
+        std::lock_guard lock(mutex);const auto found=entries.find(key(value));
+        if(found==entries.end())return {};return found->second;
+    }
+    void store(const struct stat& value,const Entry& entry){
+        if(!enabled())return;
+        std::lock_guard lock(mutex);if(entries.size()>=65536)entries.clear();entries[key(value)]=entry;
+    }
+};
+XattrCache& xattr_cache(){static XattrCache cache;return cache;}
+// 只用快取（不開 fd）組出中繼資料；沒有快取時回傳空。
+std::optional<FileMetadata> cached_metadata(const struct stat& value);
+FileMetadata metadata_from(const struct stat& value,const XattrCache::Entry& xattr,std::uint32_t* query_error);
 FileMetadata metadata(const struct stat& value, int descriptor = -1, int directory = -1, std::string_view leaf = {}, std::uint32_t* query_error = nullptr) {
+    if(descriptor>=0){
+        // fd 路徑：先查快取，未命中才讀 xattr 並存入。路徑（pinned）路徑每次都要核對 inode，不快取。
+        if(const auto cached=xattr_cache().find(value))return metadata_from(value,*cached,query_error);
+        XattrCache::Entry entry;
+        if(S_ISREG(value.st_mode)){std::uint64_t length=0;bool managed=false;entry.valid_data_error=valid_data(descriptor,S_ISREG(value.st_mode) && value.st_size>0?static_cast<std::uint64_t>(value.st_size):0,length,managed);entry.valid_data_length=length;entry.valid_data_managed=managed;}
+#if defined(__APPLE__) || defined(__linux__)
+        std::array<std::uint8_t,8> stored{};
+#if defined(__APPLE__)
+        const auto size=::fgetxattr(descriptor,"com.x64arm.dosattributes",stored.data(),stored.size(),0,0);
+        const bool missing=size<0 && (errno==ENOATTR || errno==ENOTSUP);
+#else
+        const auto size=::fgetxattr(descriptor,"user.x64arm.dosattributes",stored.data(),stored.size());
+        const bool missing=size<0 && (errno==ENODATA || errno==ENOTSUP);
+#endif
+        if(size==8 && stored[0]=='x' && stored[1]=='6' && stored[2]=='4' && stored[3]==1){std::uint32_t attributes=0;for(unsigned i=0;i<4;++i)attributes|=static_cast<std::uint32_t>(stored[4+i])<<(8*i);entry.dos_attributes=attributes;entry.dos_valid=true;}
+        if(size<0 && !missing){if(query_error && !*query_error)*query_error=native_error();return metadata_from(value,entry,query_error);} // 讀取錯誤不快取
+#endif
+        xattr_cache().store(value,entry);
+        return metadata_from(value,entry,query_error);
+    }
     FileMetadata result;
     result.size = S_ISREG(value.st_mode) && value.st_size > 0 ? static_cast<std::uint64_t>(value.st_size) : 0;
     result.valid_data_size=result.size;
-    if(descriptor>=0 && S_ISREG(value.st_mode)){bool managed=false;const auto error=valid_data(descriptor,result.size,result.valid_data_size,managed);if(error && query_error)*query_error=error;}
     result.attributes = S_ISDIR(value.st_mode) ? 0x10U : 0x20U;
 #if defined(__APPLE__) || defined(__linux__)
     // DOS 屬性保存在檔案本身；重啟引擎、rename 及各種查詢共用同一份資料。
@@ -554,6 +604,31 @@ FileMetadata metadata(const struct stat& value, int descriptor = -1, int directo
     result.modified = filetime(value.st_mtim); result.changed = filetime(value.st_ctim);
 #endif
     return result;
+}
+FileMetadata metadata_from(const struct stat& value,const XattrCache::Entry& xattr,std::uint32_t* query_error){
+    FileMetadata result;
+    result.size = S_ISREG(value.st_mode) && value.st_size > 0 ? static_cast<std::uint64_t>(value.st_size) : 0;
+    result.valid_data_size=result.size;
+    if(S_ISREG(value.st_mode)){if(xattr.valid_data_error){if(query_error)*query_error=xattr.valid_data_error;}else if(xattr.valid_data_managed)result.valid_data_size=std::min(xattr.valid_data_length,result.size);}
+    result.attributes = S_ISDIR(value.st_mode) ? 0x10U : 0x20U;
+    if(xattr.dos_valid){result.attributes=(xattr.dos_attributes&0x3127U)|(S_ISDIR(value.st_mode)?0x10U:0U);if(!S_ISDIR(value.st_mode))result.attributes&=~1U;}
+    if (!(value.st_mode & S_IWUSR)) result.attributes |= 1;
+    if(!result.attributes)result.attributes=0x80;
+    if (S_ISLNK(value.st_mode)) result.attributes |= 0x400;
+    result.allocation_size=value.st_blocks>0?static_cast<std::uint64_t>(value.st_blocks)*512:0;
+    result.id = value.st_ino; result.device = static_cast<std::uint64_t>(value.st_dev); result.links = static_cast<std::uint32_t>(value.st_nlink);
+#if defined(__APPLE__)
+    result.created = filetime(value.st_birthtimespec); result.accessed = filetime(value.st_atimespec);
+    result.modified = filetime(value.st_mtimespec); result.changed = filetime(value.st_ctimespec);
+#else
+    result.created = filetime(value.st_ctim); result.accessed = filetime(value.st_atim);
+    result.modified = filetime(value.st_mtim); result.changed = filetime(value.st_ctim);
+#endif
+    return result;
+}
+std::optional<FileMetadata> cached_metadata(const struct stat& value){
+    if(const auto cached=xattr_cache().find(value))return metadata_from(value,*cached,nullptr);
+    return {};
 }
 std::uint32_t set_descriptor_attributes(int descriptor,const struct stat& info,std::uint32_t attributes) {
 #if defined(__APPLE__) || defined(__linux__)
@@ -946,8 +1021,10 @@ DirectorySnapshot ReadOnlyFiles::list(std::string path,const std::function<bool(
         struct stat info{};
         if (::fstatat(::dirfd(entries.value), name.c_str(), &info, AT_SYMLINK_NOFOLLOW) != 0) return {{}, native_error()};
         if (result.entries.size() >= 100000) return {{}, 8};
-        FileDescriptor entry{::openat(::dirfd(entries.value),name.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK)};
-        auto details=metadata(info,entry.value);
+        // 一般檔案的 xattr 結果命中 (dev, ino, ctime) 快取時不開 fd；目錄仍開 fd 以查 reparse（掛載點）。
+        const auto cached=S_ISDIR(info.st_mode)?std::nullopt:cached_metadata(info);
+        FileDescriptor entry{cached ? -1 : ::openat(::dirfd(entries.value),name.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK)};
+        auto details=cached?*cached:metadata(info,entry.value);
         if(S_ISLNK(info.st_mode)){const auto link=file_reparse::read(::dirfd(entries.value),name);if(!link.error){details.attributes=link.attributes;details.reparse_tag=0xa000000cU;}}
         else if(S_ISDIR(info.st_mode) && entry.value>=0){const auto point=volumes_->reparse(entry.value);if(!point.error){details.attributes|=0x400U;details.reparse_tag=0xa0000003U;}else if(point.error!=4390 && point.error!=50)return {{},point.error};}
         result.entries.push_back({name,details});
@@ -1014,6 +1091,12 @@ FileInformation HostFile::information() const {
     }
     return descriptor_information(descriptor_);
 #endif
+}
+std::uint64_t HostFile::current_size() const {
+#if !defined(_WIN32)
+    if(descriptor_>=0 && !security_target_){struct stat info{};if(::fstat(descriptor_,&info)==0)return S_ISREG(info.st_mode) && info.st_size>0?static_cast<std::uint64_t>(info.st_size):0;}
+#endif
+    return information().metadata.size;
 }
 FileInformation HostFile::descriptor_information(int descriptor) {
 #if defined(_WIN32)

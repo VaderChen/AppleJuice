@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <mutex>
@@ -75,15 +76,23 @@ void record_gpu_interval(double start,double end) noexcept {
     try { auto& c=counters(); std::lock_guard lock(c.mutex); c.gpu_intervals.emplace_back(start,end); }
     catch (...) { mark_gpu_timing_unavailable(); }
 }
-double take_gpu_busy_seconds(double start,double end) {
+namespace {
+std::vector<std::pair<double,double>> take_gpu_intervals(double start,double end) {
     auto& c=counters(); std::lock_guard lock(c.mutex);
     std::sort(c.gpu_intervals.begin(),c.gpu_intervals.end());
-    double busy=0,covered=start;
+    std::vector<std::pair<double,double>> merged;
     for (const auto& interval:c.gpu_intervals) {
-        const auto first=std::max({start,covered,interval.first}),last=std::min(end,interval.second);
-        if (last>first) { busy+=last-first; covered=last; }
+        const auto first=std::max(start,interval.first),last=std::min(end,interval.second);
+        if(last<=first)continue;
+        if(!merged.empty() && first<=merged.back().second)merged.back().second=std::max(last,merged.back().second);
+        else merged.emplace_back(first,last);
     }
     std::erase_if(c.gpu_intervals,[&](const auto& interval) { return interval.second<=end; });
+    return merged;
+}
+}
+double take_gpu_busy_seconds(double start,double end) {
+    double busy=0;for(const auto& [first,last]:take_gpu_intervals(start,end))busy+=last-first;
     return busy;
 }
 
@@ -119,7 +128,8 @@ struct ResourceUsageReporter::Impl {
         const auto now=host_seconds(); const auto process=process_sample(); const auto& c=counters();
         const auto received=c.received.load(std::memory_order_relaxed),sent=c.sent.load(std::memory_order_relaxed);
         const auto gpu=gpu_memory_stats(); const auto elapsed=initial?0:now-last_time;
-        const auto gpu_busy=initial?0:take_gpu_busy_seconds(last_time,now);
+        const auto intervals=initial?std::vector<std::pair<double,double>>{}:take_gpu_intervals(last_time,now);
+        double gpu_busy=0;for(const auto& [first,last]:intervals)gpu_busy+=last-first;
         const auto timestamp=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         std::ostringstream json; json<<std::setprecision(12)<<"{\"version\":1,\"pid\":"<<getpid()<<",\"sequence\":"<<++sequence<<",\"sampledAt\":"<<timestamp<<",\"intervalSeconds\":"<<elapsed;
         json<<",\"cpuPercent\":";
@@ -132,6 +142,10 @@ struct ResourceUsageReporter::Impl {
         if (elapsed>0) json<<double(received-last_received)/elapsed; else json<<"null";
         json<<",\"sendBytesPerSecond\":";
         if (elapsed>0) json<<double(sent-last_sent)/elapsed; else json<<"null";
+        // mach_absolute_time 為同機共用時基；Launcher 取共同觀測區間的聯集，避免多程序 GPU 重疊重算。
+        json<<",\"hostStart\":"<<(initial?now:last_time)<<",\"hostEnd\":"<<now<<",\"gpuIntervals\":[";
+        bool comma=false;for(const auto& [first,last]:intervals){if(comma)json<<',';comma=true;json<<'['<<first<<','<<last<<']';}
+        json<<']';
         json<<"}\n";
         last_time=now; last_process=process; last_received=received; last_sent=sent;
         auto temporary=path; temporary+=".tmp";
@@ -139,6 +153,22 @@ struct ResourceUsageReporter::Impl {
         std::filesystem::rename(temporary,path);
     }
 };
-ResourceUsageReporter::ResourceUsageReporter(const std::filesystem::path& path) { if (!path.empty()) impl_=std::make_unique<Impl>(path); }
-ResourceUsageReporter::~ResourceUsageReporter()=default;
+ResourceUsageReporter::ResourceUsageReporter(const std::filesystem::path& path) {
+    auto destination=path;
+    if(!destination.empty()){
+        const auto root=std::filesystem::absolute(destination).string();
+        std::filesystem::create_directories(root+".processes");
+        std::filesystem::create_directories(root+".cache");
+        ::setenv("X64ARM_USAGE_ROOT",root.c_str(),1);
+        ::setenv("X64ARM_AOT_CACHE_STATS_DIRECTORY",(root+".cache").c_str(),1);
+        root_=true;
+    }else if(const auto* root=std::getenv("X64ARM_USAGE_ROOT");root && *root){
+        destination=std::filesystem::path(std::string(root)+".processes")/(std::to_string(::getpid())+".json");
+    }
+    if(!destination.empty())impl_=std::make_unique<Impl>(destination);
+}
+ResourceUsageReporter::~ResourceUsageReporter(){
+    impl_.reset();
+    if(root_){::unsetenv("X64ARM_USAGE_ROOT");::unsetenv("X64ARM_AOT_CACHE_STATS_DIRECTORY");}
+}
 }

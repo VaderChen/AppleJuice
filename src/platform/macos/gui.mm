@@ -2872,7 +2872,10 @@ public:
     void present(std::uint64_t handle,const GuiWindow& window) override {real("present").present(handle,window);}
     void destroy(std::uint64_t handle) override {real("destroy").destroy(handle);}
     std::vector<GuiMessage> poll(bool wait) override {return real("poll").poll(wait);}
-    bool input_active() const override {return real("input_active").input_active();}
+    // 排程器每輪都問前景狀態；沒有建立過視窗的程序（steamsysinfo、driver query、utility 子程序）不該為此
+    // 初始化 AppKit（NSApplication 建立會同步向 tccd 查詢並初始化 safe aperture，負載下數百 ms 到數秒）。
+    // 尚未建立真正 GUI 就表示沒有可成為前景的視窗。
+    bool input_active() const override {return real_ && real_->input_active();}
     bool status_icons(const std::map<std::uint64_t,desktop::Icon>& icons) override {return real("status_icons").status_icons(icons);}
     std::uint32_t help(const NativeHelpRequest& request) override {return real("help").help(request);}
     bool status_focus(std::uint64_t handle) override {return real("status_focus").status_focus(handle);}

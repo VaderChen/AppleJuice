@@ -1,4 +1,6 @@
 #include "x64arm/windows_services.hpp"
+#include <chrono>
+#include <cstdlib>
 #include "x64arm/windows_window_state.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -20,9 +22,24 @@ std::string file_uri(std::string value){
     return decoded;
 }
 }
-std::array<std::int32_t,4> WindowsServices::gui_screen_area(){return native_gui_?native_gui_->screen_area():Rect{0,0,1440,900};}
+namespace {
+std::chrono::milliseconds gui_area_cache_window(){
+    static const auto window=[] {const auto* value=std::getenv("X64ARM_GUI_AREA_CACHE_MS");return std::chrono::milliseconds(value && *value?std::atoll(value):100LL);}();
+    return window;
+}
+}
+// 螢幕與工作區一起查、一起快取：GetMonitorInfo 每次都要兩者，Chromium 的 GPU 程序每個 Present 呼叫一次。
+// 顯示器設定變更後最多沿用快取 100 ms；X64ARM_GUI_AREA_CACHE_MS=0 關閉。
+void WindowsServices::refresh_gui_areas(){
+    const auto now=std::chrono::steady_clock::now();
+    if(gui_area_cached_!=std::chrono::steady_clock::time_point{} && gui_area_cache_window().count()>0 && now-gui_area_cached_<gui_area_cache_window())return;
+    gui_screen_cache_=native_gui_?native_gui_->screen_area():Rect{0,0,1440,900};
+    gui_work_cache_=native_gui_?native_gui_->work_area():Rect{0,0,1440,900};
+    gui_area_cached_=now;
+}
+std::array<std::int32_t,4> WindowsServices::gui_screen_area(){refresh_gui_areas();return gui_screen_cache_;}
 std::array<std::int32_t,4> WindowsServices::gui_work_area(std::uint64_t excluded){
-    auto area=native_gui_?native_gui_->work_area():Rect{0,0,1440,900};
+    refresh_gui_areas();auto area=gui_work_cache_;
     area[2]+=area[0];area[3]+=area[1];
     for(const auto& [handle,bar]:gui_.appbars){
         if(handle==excluded || !bar.positioned || bar.autohide)continue;

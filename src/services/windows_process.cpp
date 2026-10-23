@@ -3082,6 +3082,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
                         fail(5);
                     else if (!record || !record->alive())
                         fail(5);
+                    else if (trace_process_protocol() && std::fprintf(stderr,"process_terminate parent=%d target=%u remote=1 code=%u\n",::getpid(),static_cast<unsigned>(record->data->pid),static_cast<std::uint32_t>(arg(1)))<0)
+                        fail(5);
                     else if (::kill(static_cast<pid_t>(record->data->pid), SIGKILL))
                         fail(5);
                     else {
@@ -3130,6 +3132,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
                 result = static_cast<std::uint32_t>(child.pid);
             else if (symbol == "TerminateProcess") {
                 if (child.exited)
+                    fail(5);
+                else if (trace_process_protocol() && std::fprintf(stderr,"process_terminate parent=%d target=%d remote=0 code=%u\n",::getpid(),static_cast<int>(child.pid),static_cast<std::uint32_t>(arg(1)))<0)
                     fail(5);
                 else if (::kill(child.pid, SIGKILL))
                     fail(5);

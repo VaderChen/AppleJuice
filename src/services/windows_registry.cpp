@@ -193,7 +193,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     const bool relative_open=symbol.starts_with("RegOpenKey") || symbol.starts_with("RegCreateKey") || (symbol.starts_with("RegDeleteKey") && !delete_key_value) || (set_key_value && !name(arg(1)).empty());
     const bool relative_query=(symbol.starts_with("SHGetValue") || get_value || legacy_query || delete_key_value) && !name(arg(1)).empty();
     if(predefined && !relative_open && !relative_query)handle.access=registry_security_access(handle.path,0x02000000U);
-    if(symbol=="RegFlushKey"){if(!(handle.access&1U))return done(5);changed=true;return done(0);}
+    if(symbol=="RegFlushKey"){if(!(handle.access&1U))return done(5);if(const auto error=flush_registry_hives())return done(error);return done(transaction->flush());}
     if(key_value && !predefined && !(handle.access&2))return done(5);
     if(set_key_value){const auto size=static_cast<std::uint32_t>(arg(5));if(size>output_limit)return done(8);if(size && !arg(4))return done(87);if(size)memory.check(GuestAddress{arg(4)},size,Access::Read);}
     if(symbol.starts_with("RegQueryInfoKey")){

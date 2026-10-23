@@ -268,6 +268,9 @@ public:
     // 常駐中斷的外部來源：排程器完整輪詢前取得的共用喚醒世代，與包裝它的等待來源。
     std::uint64_t resident_external_polled_{};
     mutable std::shared_ptr<const ResidentExternalWake> resident_external_source_;
+    // 螢幕／工作區查詢結果的短期快取（X64ARM_GUI_AREA_CACHE_MS，預設 100）；NSScreen 每次約 0.45 ms，Chromium 每幀都查。
+    std::chrono::steady_clock::time_point gui_area_cached_{};
+    std::array<std::int32_t,4> gui_screen_cache_{},gui_work_cache_{};
     // 常駐熱路徑（每次服務返回、每次重新進入本體）的執行緒索引。執行緒表只增不刪：已結束者
     // 保留供 handle 與結束碼查詢，逐一走訪的成本會隨程序存活時間上升。表大小改變即重建；
     // 走訪時已結束者過半也重建，熱路徑只看未結束者。複本指向另一份執行緒表，一律重建。
@@ -1538,6 +1541,7 @@ private:
     bool shell_open_with_message(const GuiMessage&);
     std::array<std::int32_t,4> gui_screen_area();
     std::array<std::int32_t,4> gui_work_area(std::uint64_t excluded=0);
+    void refresh_gui_areas();
     void notify_appbars(std::uint32_t,std::uint64_t parameter=0);
     void poll_appbars();
     bool common_dialog_message(GuestMemory& memory, const GuiMessage& message,bool from_hook=false);

@@ -25,6 +25,8 @@ public:
     RegistryTransaction(const RegistryTransaction&)=delete;
     RegistryTransaction& operator=(const RegistryTransaction&)=delete;
     std::uint32_t commit();
+    // RegFlushKey／NtFlushKey 的同步耐久化邊界；不重寫或更改登錄值。
+    std::uint32_t flush();
     // 可寫交易最後沒有改變持久狀態（只配置程序內 handle）時呼叫：結束時保留快取，下一次不必重新解析登錄檔。
     void unchanged() noexcept {readonly_=true;}
 };

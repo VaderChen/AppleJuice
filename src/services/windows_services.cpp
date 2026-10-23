@@ -1754,7 +1754,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
             // OVERLAPPED 的搬移錯誤則保留後方 NTSTATUS／completion／998 契約。
             if(!overlapped){
                 auto extent=std::uint64_t{count};
-                if(!writing && !standard){const auto size=found->second.native?found->second.native->information().metadata.size:found->second.bytes->size();
+                if(!writing && !standard){const auto size=found->second.native?found->second.native->current_size():found->second.bytes->size();
                     const auto offset=runtime_.win_file_positions.at(found->second.object);extent=std::min<std::uint64_t>(count,size>offset?size-offset:0);}
                 memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(extent),writing?Access::Read:Access::Write);
             }
@@ -1773,13 +1773,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
             }
             auto extent=std::uint64_t{count};
             if(!writing) {
-                const auto size=standard?runtime_.standard_input.bytes.size():found->second.native?found->second.native->information().metadata.size:found->second.bytes->size();
+                const auto size=standard?runtime_.standard_input.bytes.size():found->second.native?found->second.native->current_size():found->second.bytes->size();
                 const auto position=standard?runtime_.standard_input.position:offset;extent=std::min<std::uint64_t>(count,size>position?size-position:0);
             }
             FileIoResult io;
             if(!standard && found->second.native){
                 auto& file=found->second;
-                if(writing && (offset==UINT64_MAX || (!(file.access&(0x40000000U|2U)) && (file.access&4U))))offset=file.native->information().metadata.size;
+                if(writing && (offset==UINT64_MAX || (!(file.access&(0x40000000U|2U)) && (file.access&4U))))offset=file.native->current_size();
                 // 整體範圍先檢查，避免後段的鎖衝突造成先寫入前段。
                 io.error=file.native->validate_io(offset,count,writing);
             }

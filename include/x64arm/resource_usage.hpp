@@ -4,7 +4,7 @@
 #include <memory>
 
 namespace x64arm {
-// 統計僅屬於目前引擎程序；不包含啟動器、其他程式或整部主機的負載。
+// 各引擎程序獨立取樣；子程序繼承同一報告群組，由 Launcher 彙總，不混入其他程式或主機負載。
 bool resource_usage_enabled() noexcept;
 void record_network_transfer(std::uint64_t received, std::uint64_t sent) noexcept;
 void record_gpu_interval(double start, double end) noexcept;
@@ -24,5 +24,6 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    bool root_{};
 };
 }

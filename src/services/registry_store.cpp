@@ -3,8 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <set>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -22,6 +27,37 @@ struct Reader {
 void number(std::vector<std::uint8_t>& data,std::uint64_t value,unsigned size){for(unsigned i=0;i<size;++i)data.push_back(static_cast<std::uint8_t>(value>>(i*8)));}
 void text(std::vector<std::uint8_t>& data,const std::u16string& value){number(data,value.size(),4);for(auto c:value)number(data,c,2);}
 std::uint32_t io_error(){return errno==EACCES || errno==EPERM || errno==ELOOP?5:errno==ENOENT?3:29;}
+// 呼叫端持有交易鎖；原子取代使其他程序立即看見變更，耐久化另由 lazy writer 或明確 Flush 完成。
+std::uint32_t flush_file(const std::filesystem::path& path){
+    Descriptor file{::open(path.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW)};
+    if(file.value<0)return errno==ENOENT?0:io_error();
+    if(::fsync(file.value))return io_error();
+    Descriptor directory{::open(path.parent_path().empty()?".":path.parent_path().c_str(),O_RDONLY|O_CLOEXEC)};
+    return directory.value<0 || ::fsync(directory.value)?io_error():0;
+}
+struct LazyWriter {
+    std::mutex mutex;std::condition_variable changed;std::set<std::filesystem::path> pending;bool stopping{};
+    std::thread worker;
+    LazyWriter():worker([this]{
+        std::unique_lock lock(mutex);
+        for(;;){
+            changed.wait(lock,[&]{return stopping || !pending.empty();});
+            if(!stopping)changed.wait_for(lock,std::chrono::seconds(1),[&]{return stopping;});
+            auto batch=std::move(pending);pending.clear();const bool last=stopping;lock.unlock();
+            for(const auto& path:batch){
+                Descriptor guard{::open((path.string()+".lock").c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW)};
+                if(guard.value<0)continue;
+                if(::flock(guard.value,LOCK_EX))continue;
+                const auto error=flush_file(path);::flock(guard.value,LOCK_UN);
+                if(error && !last){std::lock_guard retry(mutex);pending.insert(path);}
+            }
+            lock.lock();if(last)break;
+        }
+    }){}
+    ~LazyWriter(){ {std::lock_guard lock(mutex);stopping=true;}changed.notify_one();worker.join(); }
+    void schedule(const std::filesystem::path& path){ {std::lock_guard lock(mutex);pending.insert(path);}changed.notify_one(); }
+};
+LazyWriter& lazy_writer(){static LazyWriter writer;return writer;}
 }
 RegistryTransaction::RegistryTransaction(RegistryState& state,const std::filesystem::path& path,RegistryStoreCache* cache,bool readonly):state_(state),path_(path),cache_(cache),readonly_(readonly){
     if(path.empty())return;
@@ -92,10 +128,9 @@ std::uint32_t RegistryTransaction::commit(){
     auto pattern=path_.string()+".tmp-XXXXXX";std::vector<char> temporary(pattern.begin(),pattern.end());temporary.push_back(0);Descriptor file{::mkstemp(temporary.data())};if(file.value<0)return io_error();
     std::uint32_t result=0;std::size_t written=0;
     while(written<data.size()){const auto n=::write(file.value,data.data()+written,data.size()-written);if(n<0 && errno==EINTR)continue;if(n<=0){result=io_error();break;}written+=static_cast<std::size_t>(n);}
-    if(!result && ::fsync(file.value))result=io_error();
     if(!result && ::rename(temporary.data(),path_.c_str()))result=io_error();
-    if(!result){Descriptor directory{::open(path_.parent_path().empty()?".":path_.parent_path().c_str(),O_RDONLY|O_CLOEXEC)};
-        if(directory.value<0 || ::fsync(directory.value))result=io_error();}
+    if(!result){try{lazy_writer().schedule(path_);}catch(...){result=flush_file(path_);}}
     if(result)::unlink(temporary.data());return result;
 }
+std::uint32_t RegistryTransaction::flush(){return error?error:path_.empty()?0:flush_file(path_);}
 }

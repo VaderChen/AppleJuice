@@ -1,6 +1,7 @@
 // 單 EXE Smoke 經正式 DOM 與 Go bridge 操作；不保存啟動參數或終端內容到結果。
 (async () => {
   const checks = [], captures = [];
+  let observedUsage = null;
   const config = smokeConfig.launch;
   const deadline = Date.now() + (smokeConfig.timeoutSeconds - 2) * 1000;
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -26,7 +27,7 @@
   }
   function programResult() {
     const p = launched && state.programs.find(item => item.id === launched);
-    return p ? { id: p.id, kind: p.kind, temporary: !!p.temporary, status: p.status, runId: p.runId, pid: p.pid, exitCode: p.exitCode } : null;
+    return p ? { id: p.id, kind: p.kind, temporary: !!p.temporary, status: p.status, runId: p.runId, pid: p.pid, exitCode: p.exitCode, gpuMemoryMiB: p.gpuMemoryMiB } : null;
   }
   function outputText() {
     const item = terminals.get(launched);
@@ -37,7 +38,7 @@
   }
   async function finish(passed, error) {
     await api('smokeResult', { result: {
-      passed, scenario: 'launch', checks, captures, program: programResult(), log: logResult,
+      passed, scenario: 'launch', checks, captures, program: programResult(), log: logResult, observedUsage,
       startedAt, completedAt: new Date().toISOString(), ...(error ? { error: String(error) } : {})
     } });
   }
@@ -121,6 +122,12 @@
         await delay(250);
       }
       check('客體在觀察期間持續執行', active(selected()));
+      observedUsage = { value: selected().usage, gpu: $('usage-gpu').textContent, memory: $('usage-gpu-memory').textContent, cache: $('usage-cache').textContent };
+      if (config.capture) {
+        await api('smokeSnapshot', { data: 'launch-running.png' });
+        await until(() => api('smokeSnapshotReady', { data: 'launch-running.png' }), '執行中資源快照');
+        captures.push('launch-running.png');
+      }
       await click('stop');
       await until(() => !active(selected()), '由 UI 停止客體');
       check('UI 停止客體且保留執行紀錄', selected().status === 'stopped' && !!selected().runId);

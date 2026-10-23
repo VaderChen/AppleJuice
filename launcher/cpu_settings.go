@@ -5,6 +5,8 @@ import (
 	"sync"
 )
 
+const defaultX86CPUCores uint32 = 2
+
 type CPULimits struct {
 	PhysicalCores uint32 `json:"physicalCores"`
 	X64Max        uint32 `json:"x64Max"`

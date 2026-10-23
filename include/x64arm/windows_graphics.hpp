@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <atomic>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -40,6 +41,8 @@ struct GraphicsShader:GraphicsObject {
 };
 struct GraphicsSampler:GraphicsObject {};
 struct GraphicsTimestamp {std::uint64_t ticks{},frequency{1000000000};bool disjoint{};};
+// 非同步時間戳：done 為 true 後 value 有效；由後端完成回呼寫入，讀者以 acquire 讀取。
+struct GraphicsTimestampFuture {std::atomic<bool> done{};GraphicsTimestamp value{};};
 struct GraphicsView {
     std::shared_ptr<GraphicsResource> resource;
     std::uint32_t format{},level{},levels{1},slice{},slices{1},first{},count{},flags{};
@@ -104,6 +107,8 @@ public:
     virtual std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t>){throw std::runtime_error("後端缺少取樣器");}
     virtual bool graphics_timestamp_supported()const{return false;}
     virtual GraphicsTimestamp graphics_timestamp(){throw std::runtime_error("後端沒有 GPU timestamp");}
+    // 在目前提交點記錄 GPU 時間戳，不等待；供 D3D11 TIMESTAMP／TIMESTAMP_DISJOINT 查詢輪詢。預設後端同步取樣後直接完成。
+    virtual std::shared_ptr<const GraphicsTimestampFuture> graphics_timestamp_future(){auto future=std::make_shared<GraphicsTimestampFuture>();future->value=graphics_timestamp();future->done.store(true,std::memory_order_release);return future;}
     virtual void graphics_write(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t){throw std::runtime_error("後端缺少資源寫入");}
     virtual void graphics_write_discard(const GraphicsView& view,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){graphics_write(view,data,row,image);}
     // WRITE_NO_OVERWRITE 的整個資源上傳：呼叫端保證 GPU 使用中的範圍與上次上傳的位元組相同，後端可直接寫入而不等待。
@@ -122,6 +127,9 @@ public:
     virtual void graphics_present(const GraphicsView&){throw std::runtime_error("後端缺少呈現操作");}
     // 讓消費佇列等待先前命令；不支援 GPU 事件的後端沿用 CPU 完成等待。
     virtual void graphics_handoff(NativeGraphics&,const GraphicsView&){graphics_flush(true);}
+    // 提交目前已錄製的工作並回傳完成旗標：GPU 執行到此點（含先前所有提交）後旗標為 true。
+    // 供 D3D11 事件查詢（End／GetData 輪詢）使用；不等待 GPU。預設後端同步等待後回傳已完成。
+    virtual std::shared_ptr<const std::atomic<bool>> graphics_fence(){graphics_flush(true);return std::make_shared<std::atomic<bool>>(true);}
     virtual void graphics_flush(bool){throw std::runtime_error("後端缺少提交操作");}
 };
 std::uint32_t graphics_format_bytes(std::uint32_t format);
