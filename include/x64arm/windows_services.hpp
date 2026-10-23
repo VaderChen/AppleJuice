@@ -241,6 +241,9 @@ public:
 #ifdef X64ARM_HOST_SERVICES_SCALAR_RECIPE
     unsigned resident_scalar_recipe(GuestAddress) const noexcept override;
 #endif
+#ifdef X64ARM_HOST_SERVICES_CLOCK_RECIPE
+    ResidentClockRecipe resident_clock_recipe(GuestAddress) const noexcept override;
+#endif
 #ifdef X64ARM_HOST_SERVICES_SCALAR_ERRORS
     ResidentScalarErrors resident_scalar_errors(GuestMemory&) noexcept override;
 #endif
@@ -1039,7 +1042,7 @@ private:
     CompletionResult poll_completion(GuestState&,GuestMemory&,std::uint64_t handle,bool extended,bool expired);
     void wake_threads(GuestMemory& memory);
     enum class ThreadWakeScope { All, Condition, Slim, Critical, Objects };
-    void resolve_thread_waits(GuestMemory&,ThreadWakeScope scope=ThreadWakeScope::All,std::uint64_t address=0);
+    bool resolve_thread_waits(GuestMemory&,ThreadWakeScope scope=ThreadWakeScope::All,std::uint64_t address=0);
     void schedule(GuestState& state, GuestMemory& memory);
     std::optional<std::uint32_t> force_finish_thread(GuestState&,GuestMemory&);
     std::optional<std::uint32_t> finish_thread(GuestState& state, GuestMemory& memory, std::uint32_t code);
@@ -1880,7 +1883,7 @@ private:
     void sync_crt_thread_states(GuestMemory&);
     GuestAddress guest_heap_state_{};std::uint64_t guest_heap_base_{},guest_heap_size_{},guest_heap_next_{};
     bool guest_heap_chunked_{};std::array<std::uint64_t,256> guest_heap_chunk_bits_{};
-    // x86 可成長私有 heap 的級距串列頭；Heap* 服務在 x86 只由協調者序列執行，不需客體鎖。
+    // x86 可成長私有 heap 的級距串列頭；協調者在一致邊界擴充，worker 以客體狀態鎖同步。
     // heads 為空表示尚未啟用 chunk，requests 累計一般路徑配置次數。
     struct GuestPrivateHeap {std::vector<std::uint64_t> heads;std::uint64_t requests{};};
     std::map<std::uint64_t,GuestPrivateHeap> guest_private_heaps_;
@@ -1889,7 +1892,7 @@ private:
     std::vector<std::pair<std::uint64_t,std::uint64_t>> guest_heap_walk_blocks_,guest_heap_walk_free_;
     const std::vector<std::pair<std::uint64_t,std::uint64_t>>& guest_heap_allocated_blocks(GuestMemory& memory, std::uint64_t heap = process_heap);
     GuestAddress guest_locale_lock_state_{};
-    // Win64 TEB／TLS 與 pseudo handle 共用常式；只快取程式入口，不快取客體資料。
+    // Win32／Win64 TEB、TLS 與 pseudo handle 共用常式；只快取入口，不快取客體資料。
     GuestAddress guest_thread_routines_{};
     // 客體 FlsGetValue 讀取的 TEB 鏡像（TEB+0x1840：128 個值與使用中位元圖；FlsData 指向它）。
     bool fls_mirror_{};

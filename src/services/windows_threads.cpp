@@ -653,6 +653,12 @@ bool WindowsServices::resident_select_control_request(GuestState& state,GuestMem
         // schedule 已按輪替順序優先選取相同類別的控制待辦，並保存目前
         // GuestState、TLS／FLS、回呼及例外；不另設省略狀態交換的捷徑。
         const auto previous=threads_.current;
+        // 這是客體已交出完整狀態的排程邊界，並非 API 內尚未提交的結果。
+        // 原生 LastError／TLS 常式可能剛寫過 TEB；先接手最新值，避免
+        // schedule 把協調者的舊 last_error_ 寫回客體。Win32／Win64 共用契約。
+        if(runtime_.image.base)
+            last_error_=static_cast<std::uint32_t>(memory.load(
+                GuestAddress{x86_?state.fs_base+0x34:state.gs_base+0x68},32));
         schedule(state,memory);
         return threads_.current!=previous;
     }
@@ -980,8 +986,25 @@ void WindowsServices::after_instructions(GuestState &state, GuestMemory &memory,
         // 服務／語義邊界已交回完整狀態；沒有完整排程時，先將已滿足的
         // 物件等待轉為 Runnable，讓保留中的 worker 可立即接手。共用解析
         // 保留 WaitAll、訊號消耗與返回值，不輪詢外部裝置或強迫客體切換。
-        resolve_thread_waits(memory,ThreadWakeScope::Objects);
-        notify_concurrency_changed();
+        const bool changed=resolve_thread_waits(memory,ThreadWakeScope::Objects);
+        // 只有實際等待／排程狀態改變才撤銷目前服務的續行資格。空掃描
+        // 不代表發生排程事件，不能讓每次 Heap／CRT 計算服務都退出常駐本體。
+        // 舊通知政策僅供同成品比較；時間片、外部通知及完整 API 前置保持原契約。
+        static const bool precise_wake=[] {const auto* value=std::getenv("X64ARM_RESIDENT_PRECISE_WAKE");
+            return !value || std::string_view(value)!="0";}();
+        const bool notify=changed || !precise_wake;
+        if(notify)notify_concurrency_changed();
+        static const bool trace_wake=std::getenv("X64ARM_TRACE_RESIDENT_WAKE")!=nullptr;
+        if(trace_wake){
+            struct Counts {std::uint64_t calls{},changed{},notifications{};};
+            static thread_local Counts counts;
+            ++counts.calls;counts.changed+=changed;counts.notifications+=notify;
+            // 只在診斷時累計，沒有逐 API 讀時鐘；低頻輸出不改變等待／喚醒語義。
+            if((counts.calls&16383U)==0)std::fprintf(stderr,
+                "resident_wake calls=%llu changed=%llu notifications=%llu precise=%d\n",
+                static_cast<unsigned long long>(counts.calls),static_cast<unsigned long long>(counts.changed),
+                static_cast<unsigned long long>(counts.notifications),precise_wake?1:0);
+        }
     }
     // 跨程序記憶體操作或排程期間套用的映射變更也在此邊界讓 CFG 快速路徑失效。
     refresh_guard_table(memory);
@@ -1237,10 +1260,11 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
     }
     multimedia_pulses_.clear();
 }
-void WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope scope,std::uint64_t wake_address) {
+bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope scope,std::uint64_t wake_address) {
     // 完整排程與同步通知共用取鎖、逾時、返回值及優先序處理。局部通知
     // 只更新相符等待者，不輪詢外部事件、不切換目前客體；worker 重綁時
     // 就能看到新的 Runnable 集合，無須等下一個時間片。
+    bool changed=false;
     for (const auto &[id, entry] : live_threads()) {
         auto &thread = *entry;
         if (thread.status != ThreadStatus::Waiting)
@@ -1264,6 +1288,18 @@ void WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
                 selected=wait.kind==ThreadWaitKind::Objects;
             if(!selected)continue;
         }
+        // 部分等待直接重新執行原 API，會在下方提早 continue；統一在
+        // 離開這個等待者時回報狀態變化，不只涵蓋尾端 complete_call。
+        struct WaitChange {
+            const GuestThread& thread;
+            bool& changed;
+            ThreadStatus status;
+            ThreadWaitKind kind;
+            std::uint64_t deadline;
+            bool signaled;
+            ~WaitChange(){changed=changed || thread.status!=status || thread.wait.kind!=kind ||
+                thread.wait.deadline!=deadline || thread.wait.signaled!=signaled;}
+        } change{thread,changed,thread.status,wait.kind,wait.deadline,wait.signaled};
         bool ready = false;
         bool guest_return = false;
         std::uint64_t result = 258;
@@ -1676,6 +1712,7 @@ void WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             thread.wait = {};
         }
     }
+    return changed;
 }
 // FLS 鏡像：TEB+0x1840 放 128 個值，+0x400 放程序共用的使用中位元圖，TEB FlsData 指向它。
 // 每個執行緒的鏡像永遠等於該執行緒目前（或其目前 fiber）的 FLS 值，所以執行緒切換不必同步；

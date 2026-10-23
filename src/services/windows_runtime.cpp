@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "guest_crt_state.h"
+#include "guest_heap_layout.hpp"
 #include "windows_loader_lock.hpp"
 #include "x64arm/startup_profile.hpp"
 #include "service_descriptor_index.hpp"
@@ -841,23 +842,13 @@ std::uint64_t WindowsServices::reallocate_heap(GuestMemory& memory,std::uint64_t
 namespace {
 // 與 guest_scalar_math_x64.s 共用：4 KiB 內保留 16-byte 級距，
 // 其後以 256-byte 級距到 64 KiB；含對齊標頭的 497 個串列頭仍容納於原狀態頁。
-constexpr std::uint64_t guest_heap_chunk=0x40000,guest_heap_header=64,guest_heap_magic=0x50414548343658abULL,
-    guest_heap_small_limit=4096,guest_heap_limit=65536,guest_heap_reservation=UINT64_C(0x100000000),
-    guest_heap_aligned_header=16;
-constexpr std::uint64_t guest_heap_class(std::uint64_t size) {
-    return size<=guest_heap_small_limit?std::max(UINT64_C(1),(size+15)/16):
-        256+(size-guest_heap_small_limit+255)/256;
-}
-constexpr std::uint64_t guest_heap_class_size(std::uint64_t cls) {
-    return cls<=256?cls*16:guest_heap_small_limit+(cls-256)*256;
-}
+using namespace detail::guest_heap_layout;
 static_assert(guest_heap_class(guest_heap_limit+guest_heap_aligned_header)*8+0x40+8<=GuestMemory::guest_page_size,"配置區串列頭須容納於狀態頁");
 std::uint64_t guest_heap_request_limit() {
     static const bool medium=[] {const auto* setting=std::getenv("X64ARM_GUEST_HEAP_MEDIUM");
         return !setting || std::string_view(setting)!="0";}();
     return medium?guest_heap_limit:guest_heap_small_limit;
 }
-constexpr unsigned guest_heap_heads=0x40;
 // callback 區的頁面偏移：0x80000 記憶體常式、0x81000 純量 CRT 常式、0x82000 執行緒常式、0x8b000 I/O、
 // 0x8c000 配置區狀態、0x8d000 CFG 常式、0x8e000–0x95fff CFG 表、0x96000 locale 鎖狀態。
 constexpr std::uint64_t guest_heap_state_page_offset=0x8c000,guest_locale_lock_page_offset=0x96000;
@@ -873,9 +864,7 @@ std::uint64_t guest_heap_block_size_impl(GuestMemory& memory,std::uint64_t addre
     const auto chunk=address&~(guest_heap_chunk-1);
     if(memory.load(GuestAddress{chunk},64)!=guest_heap_magic)throw HostCallFault("配置區指標不屬於任何 chunk");
     const auto cls=memory.load(GuestAddress{chunk+8},64),block=memory.load(GuestAddress{chunk+16},64);
-    if(!cls || cls>guest_heap_class(guest_heap_limit+guest_heap_aligned_header) || block!=guest_heap_class_size(cls) ||
-       address<chunk+guest_heap_header || address>chunk+guest_heap_chunk-block ||
-       (address-chunk-guest_heap_header)%block)throw HostCallFault("配置區指標不是區塊起點");
+    if(!valid_block(address,cls,block))throw HostCallFault("配置區指標不是區塊起點");
     return block;
 }
 AlignedAllocation guest_heap_aligned_allocation(GuestMemory& memory,std::uint64_t address) {
@@ -977,7 +966,7 @@ std::uint64_t WindowsServices::guest_heap_allocate(GuestMemory& memory, std::uin
         return chunk+guest_heap_header;
     };
     if(heap!=process_heap){
-        // 私有 heap 只在 x86 chunk 模式啟用；串列頭在宿主，Heap* 服務序列執行。
+        // 私有 heap 只在 x86 chunk 模式啟用；宿主串列頭由協調者於一致邊界補充。
         const auto found=guest_private_heaps_.find(heap);
         if(!guest_heap_chunked_ || found==guest_private_heaps_.end() || found->second.heads.size()<=cls)return 0;
         auto& head=found->second.heads[cls];

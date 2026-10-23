@@ -3,6 +3,7 @@
 #include "x64arm/startup_profile.hpp"
 #include "monotonic_clock.hpp"
 #include "srw_trace.hpp"
+#include "guest_heap_layout.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -11,6 +12,16 @@
 #include <optional>
 
 namespace x64arm {
+#ifdef X64ARM_HOST_SERVICES_CLOCK_RECIPE
+ResidentClockRecipe WindowsServices::resident_clock_recipe(GuestAddress address) const noexcept {
+    if(!initialized_ || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled())
+        return ResidentClockRecipe::None;
+    const auto symbol=name(address);
+    if(symbol=="timeGetTime" || symbol=="GetTickCount")return ResidentClockRecipe::Milliseconds32;
+    if(symbol=="GetTickCount64")return ResidentClockRecipe::Milliseconds64;
+    return ResidentClockRecipe::None;
+}
+#endif
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_TIMESTAMP
 bool WindowsServices::resident_timestamp_counter(const GuestState&,const GuestMemory& memory,std::uint64_t& result) const noexcept {
     if(!runtime_.host_clock)return false;
@@ -36,10 +47,18 @@ bool srw_service(std::string_view symbol) noexcept {
         symbol=="TryAcquireSRWLockExclusive" || symbol=="TryAcquireSRWLockShared" ||
         symbol=="ReleaseSRWLockExclusive" || symbol=="ReleaseSRWLockShared";
 }
-// 同一組執行緒內服務共用 Win32 stdcall 框架；配置、回呼、等待與映射
+bool tick_clock_service(std::string_view symbol) noexcept {
+    return symbol=="timeGetTime" || symbol=="GetTickCount" || symbol=="GetTickCount64";
+}
+bool parallel_tick_clock_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_TICK_CLOCK");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
+// 同一組執行緒內服務共用 Win32 stdcall 框架；配置擴充、回呼、等待與映射
 // 仍交回協調者。Win64 沿用暫存器 ABI，不因擴充 Win32 改變原有資格。
 std::optional<unsigned> context_service_arguments(std::string_view symbol) noexcept {
-    if(symbol=="GetLastError" || symbol=="GetCurrentThreadId" || symbol=="SwitchToThread")return 0;
+    if(symbol=="HeapAlloc" || symbol=="HeapFree" || symbol=="HeapSize")return 3;
+    if(symbol=="GetLastError" || symbol=="GetCurrentThreadId" || symbol=="SwitchToThread" || tick_clock_service(symbol))return 0;
     if(symbol=="TlsSetValue" || symbol=="FlsSetValue")return 2;
     if(symbol=="SetLastError" || symbol=="TlsGetValue" || symbol=="TlsGetValue2" ||
        symbol=="FlsGetValue" || symbol=="FlsGetValue2" ||
@@ -63,8 +82,12 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
     const auto symbol=name(address);
     if(x86_){
         static const bool win32=[] {const auto* value=std::getenv("X64ARM_X86_PARALLEL_SERVICES");return !value || std::string_view(value)!="0";}();
+        static const bool heap=[] {const auto* value=std::getenv("X64ARM_X86_PARALLEL_HEAP");return !value || std::string_view(value)!="0";}();
+        if(symbol=="HeapAlloc" || symbol=="HeapFree" || symbol=="HeapSize")return win32 && heap && guest_heap_chunked_;
+        if(tick_clock_service(symbol))return win32 && parallel_tick_clock_enabled();
         return win32 && context_service_arguments(symbol).has_value() && (!srw_service(symbol) || parallel_srw_enabled());
     }
+    if(tick_clock_service(symbol))return parallel_tick_clock_enabled();
     if(parallel_srw_enabled() && srw_service(symbol))return true;
     return symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue" ||
         symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
@@ -133,7 +156,8 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     const auto sp=state.reg(Gpr::Rsp);
     auto* stack=pointer(sp,unit,1);if(!stack || sp>UINT64_MAX-unit)return false;
     const auto target=load(stack,unit);
-    auto first=state.reg(Gpr::Rcx),second=state.reg(Gpr::Rdx);
+    std::array<std::uint64_t,3> arguments{state.reg(Gpr::Rcx),state.reg(Gpr::Rdx),state.reg(Gpr::R8)};
+    auto& first=arguments[0];auto& second=arguments[1];
     unsigned argument_count=0;
     if(x86_){
         const auto count=context_service_arguments(symbol);if(!count)return false;
@@ -143,15 +167,77 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         // 在任何客體副作用前核對全部引數；逐槽讀取容許合法框架跨頁。
         for(unsigned n=0;n<argument_count;++n){
             auto* slot=pointer(sp+(n+1)*unit,unit,1);if(!slot)return false;
-            if(n==0)first=load(slot,unit);else second=load(slot,unit);
+            arguments[n]=load(slot,unit);
         }
     }
     std::uint64_t result=0;
     // 與一般服務一樣，服務邊界保持客體可見的記憶體順序；不依賴宿主是否已授權 TSO。
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if(symbol=="GetLastError" || symbol=="SetLastError"){
+    if(x86_ && (symbol=="HeapAlloc" || symbol=="HeapFree" || symbol=="HeapSize")){
+        using namespace detail::guest_heap_layout;
+        const bool allocating=symbol=="HeapAlloc",freeing=symbol=="HeapFree";
+        const auto heap=first,value=arguments[2];const auto flags=static_cast<std::uint32_t>(second);
+        if(!guest_heap_chunked_ || !guest_heap_state_.value || (flags&~(allocating?9U:1U)) ||
+           (allocating && value>guest_heap_small_limit+guest_heap_aligned_header))return false;
+        const auto heap_lock=runtime_.heap_locks.find(heap);
+        if(heap_lock!=runtime_.heap_locks.end() && heap_lock->second.owner)return false;
+        auto private_heap=guest_private_heaps_.end();
+        if(heap!=process_heap){
+            if(!runtime_.private_heaps.contains(heap))return false;
+            private_heap=guest_private_heaps_.find(heap);
+            if(private_heap==guest_private_heaps_.end() || private_heap->second.heads.empty())return false;
+        }
+        // Win32 沒有直接改串列的客體常式。所有 worker 共用狀態頁的鎖，
+        // 連同私有 heap 串列頭與 HeapWalk 變動世代一起發布；協調者只在全體停妥後操作。
+        auto* guard=pointer(guest_heap_state_.value,4,3);if(!guard)return false;
+        std::atomic_ref lock(*static_cast<std::uint32_t*>(guard));std::uint32_t expected=0;
+        if(!lock.compare_exchange_strong(expected,1,std::memory_order_acquire))return false;
+        struct Unlock {std::atomic_ref<std::uint32_t> lock;~Unlock(){lock.store(0,std::memory_order_release);}} unlock{lock};
+        std::uint64_t address=value,cls=allocating?guest_heap_class(std::max(UINT64_C(1),value)):0;
+        void* guest_head=nullptr;std::uint64_t* private_head=nullptr;
+        const auto head_for=[&](std::uint64_t index){
+            if(private_heap!=guest_private_heaps_.end()){
+                if(index>=private_heap->second.heads.size())return false;
+                private_head=&private_heap->second.heads[static_cast<std::size_t>(index)];
+            }else guest_head=pointer(guest_heap_state_.value+guest_heap_heads+index*8,8,3);
+            return private_head || guest_head;
+        };
+        const auto read_head=[&]{return private_head?*private_head:load(guest_head,8);};
+        const auto write_head=[&](std::uint64_t next){if(private_head)*private_head=next;else put(guest_head,next,8);};
+        if(allocating){if(!head_for(cls))return false;address=read_head();}
+        // 空串列、非配置區、損毀標頭、COW／權限變更均無副作用地交回原 provider。
+        if(!address || !guest_heap_contains(address))return false;
+        const auto chunk=address&~(guest_heap_chunk-1);
+        const auto header=memory.native_window(GuestAddress{chunk},1);
+        if(!header.data || header.after<32 || load(header.data,8)!=guest_heap_magic)return false;
+        const auto* bytes=static_cast<const std::uint8_t*>(header.data);
+        const auto stored_class=load(bytes+8,8),block=load(bytes+16,8),owner=load(bytes+24,8);
+        if(!valid_block(address,stored_class,block) || (owner?owner:process_heap)!=heap ||
+           (allocating && stored_class!=cls))return false;
+        cls=stored_class;
+        if(!allocating && !head_for(cls))return false;
+        const auto payload=memory.native_window(GuestAddress{address},allocating || freeing?3U:1U);
+        if(!payload.data || payload.after<block)return false;
+        const auto written=freeing?UINT64_C(8):allocating && (flags&8U)?std::max(UINT64_C(1),value):0;
+        if(written && address<sp+unit && address+written>sp)return false;
+        if(allocating){
+            const auto next=load(payload.data,8);
+            if(next && (!guest_heap_contains(next) || next==address))return false;
+            write_head(next);
+            if(flags&8U)std::memset(payload.data,0,static_cast<std::size_t>(std::max(UINT64_C(1),value)));
+            result=address;++guest_heap_mutations_;
+        }else if(freeing){put(payload.data,read_head(),8);write_head(address);++guest_heap_mutations_;result=1;}
+        else result=block;
+    }else if(tick_clock_service(symbol)){
+        // 與 host-clock provider 共用開機單調時間軸；純讀取不推進共享時鐘、排程或 KUSER 頁。
+        // timeGetTime／GetTickCount 保留 DWORD 回繞，GetTickCount64 在 Win32 以 EDX:EAX 返回。
+        const auto milliseconds=detail::monotonic_ticks()/10000;
+        result=symbol=="GetTickCount64"?milliseconds:static_cast<std::uint32_t>(milliseconds);
+    }else if(symbol=="GetLastError" || symbol=="SetLastError"){
         auto* error=pointer(thread.teb+error_offset,4,symbol=="GetLastError"?1U:2U);if(!error)return false;
-        if(symbol=="GetLastError")result=current?last_error_:load(error,4);
+        // 原生 SetLastError 或客體直接寫入 TEB 後，以客體值為準。
+        // 協調者的快取只在完整服務／排程邊界同步，不可蓋過 worker 的最新狀態。
+        if(symbol=="GetLastError")result=load(error,4);
         else {put(error,static_cast<std::uint32_t>(first),4);if(current)last_error_=static_cast<std::uint32_t>(first);}
     }else if(symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue"){
         const auto index=static_cast<std::uint32_t>(first);const bool reading=symbol!="TlsSetValue";
@@ -311,6 +397,7 @@ else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"
     state.rip=GuestAddress{target};
     state.reg(Gpr::Rsp)=x86_?static_cast<std::uint32_t>(sp+4+argument_count*4):sp+8;
     state.reg(Gpr::Rax)=x86_?static_cast<std::uint32_t>(result):result;
+    if(x86_ && symbol=="GetTickCount64")state.reg(Gpr::Rdx)=static_cast<std::uint32_t>(result>>32);
     return true;
 }
 #endif

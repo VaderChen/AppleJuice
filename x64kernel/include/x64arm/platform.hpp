@@ -6,6 +6,7 @@
 #include <string>
 #include <span>
 #include <vector>
+#include <atomic>
 #include <memory>
 #include <map>
 #include <set>
@@ -103,6 +104,21 @@ private:
     std::uint64_t publication_serial_{};
     struct PublishedRecovery {std::size_t bytes;bool chained;std::uint8_t body_words;std::shared_ptr<const Arm64Recovery> table;std::uint64_t serial;std::shared_ptr<const PreparedBlock> read_fallback;bool llvm_native{};std::shared_ptr<const LlvmRegion> llvm{};std::shared_ptr<const AotModule> aot_module{};std::shared_ptr<std::vector<resident_abi::DispatchEntry>> aot_sites{};};
     std::map<std::size_t,PublishedRecovery> recovery_;
+    // 每頁獨立發布不可變排序表；訊號處理器只讀固定目錄與該頁快照，不碰 std::map。
+    // 新模組只更新涵蓋的頁，不因逐次發布而複製整個 arena 的恢復資料。
+    // 舊頁到一致邊界才釋放，保護仍在執行的故障處理器。
+    struct RecoveryEntry {std::size_t offset;const PublishedRecovery* record;};
+    using RecoverySnapshot=std::vector<RecoveryEntry>;
+    static constexpr std::size_t recovery_page_bytes=4096;
+    std::size_t recovery_page_count_{};
+    std::unique_ptr<std::atomic<const RecoverySnapshot*>[]> recovery_pages_;
+    std::vector<std::unique_ptr<const RecoverySnapshot>> retired_recovery_;
+    void update_recovery_snapshot(std::size_t offset,std::size_t bytes);
+    void clear_recovery_snapshot() noexcept;
+public:
+    void reclaim_retired_recovery() noexcept;
+    std::size_t retired_recovery_count() const noexcept;
+private:
     // 帶模組 AOT 站點快取的已發布區塊位移；撤銷任一區塊時只需清這些快取，不必走訪全部 recovery_。
     // JIT 基本區塊沒有站點快取，集合為空時撤銷成本與區塊總數無關。
     std::set<std::size_t> aot_site_offsets_;

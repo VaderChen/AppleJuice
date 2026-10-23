@@ -17,6 +17,7 @@
 #define X64ARM_HOST_SERVICES_SCALAR_NATIVE 1
 // 服務層以此判斷 SDK 是否支援純量原生配方：核心內的 ARM64 葉常式直接完成已知 CRT 數學入口。
 #define X64ARM_HOST_SERVICES_SCALAR_RECIPE 1
+#define X64ARM_HOST_SERVICES_CLOCK_RECIPE 1
 #define X64ARM_HOST_SERVICES_SCALAR_ERRORS 1
 #define X64ARM_HOST_SERVICES_PARALLEL_SERVICE 1
 #define X64ARM_HOST_SERVICES_TRANSLATION_REGION 1
@@ -49,6 +50,9 @@ inline constexpr std::uint32_t cpu_system_enter_trap = 0x10000001U;
 inline constexpr std::uint32_t cpu_software_interrupt_trap = 0x10000100U;
 enum class SystemCallEntry { Syscall, Sysenter, Interrupt };
 enum class ResidentServiceProgress {Completed,Retry,Coordinator};
+// 含睡眠的宿主連續時鐘，毫秒自宿主開機起算；DWORD 自然回繞。
+// 核心依客體模式選擇 EAX、EDX:EAX 或 RAX，沒有參數、LastError 或共享時間頁副作用。
+enum class ResidentClockRecipe : unsigned {None=0,Milliseconds32=1,Milliseconds64=2};
 class HostCallFault : public std::runtime_error { using std::runtime_error::runtime_error; };
 struct CpuFault : std::runtime_error {
     std::uint32_t code;
@@ -246,6 +250,9 @@ public:
     // 配方在客體 FP 環境內以 NEON／FP 指令運算，不物化 GuestState、不切換 FPCR，只產生 inexact 黏著旗標；
     // 特殊值、errno 路徑、非惰性浮點環境或無 MMU 基址時由核心交回同一入口的純量值服務。分類於物件生命期內固定。
     virtual unsigned resident_scalar_recipe(GuestAddress) const noexcept { return 0; }
+    // 唯讀時鐘入口的原生 lowering。分類與時鐘來源在一次原生執行期間固定；
+    // 切換虛擬時鐘／追蹤政策須先撤銷原生執行。None 沿用原服務，不以近似時間替代。
+    virtual ResidentClockRecipe resident_clock_recipe(GuestAddress) const noexcept { return ResidentClockRecipe::None; }
     virtual ResidentScalarErrors resident_scalar_errors(GuestMemory&) noexcept { return {}; }
     virtual std::optional<std::uint32_t> invoke_managed_service(GuestState& state,GuestMemory& memory,
                                                               const ResidentHostEnvironment& environment) {

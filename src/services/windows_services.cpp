@@ -6,6 +6,7 @@
 #include "windows_scalar_math.hpp"
 #include "guest_scalar_math_code.hpp"
 #include "guest_thread_code.hpp"
+#include "guest_thread_x86_code.hpp"
 #include "guest_io_completion_code.hpp"
 #include "io_wait_policy.hpp"
 #include "x64arm/entry_runtime_profile.hpp"
@@ -436,20 +437,24 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
         }
         static const bool thread_routines=[] {const auto* setting=std::getenv("X64ARM_GUEST_THREAD");
             return !setting || std::string_view(setting)!="0";}();
-        if(!x86_ && thread_routines && trace_services_.empty() && !startup_profile::enabled()){
+        if(thread_routines && trace_services_.empty() && !startup_profile::enabled()){
             static_assert(detail::guest_thread_code.size()<=GuestMemory::guest_page_size);
+            static_assert(detail::guest_thread_x86_code.size()<=GuestMemory::guest_page_size);
             static_assert(std::tuple_size_v<decltype(runtime_.tls_used)> == detail::guest_thread_tls_slots);
-            // 唯讀程式碼與可變 TEB 分離；常式每次讀取當前 GS，不保存上一執行緒的值。
+            static_assert(detail::guest_thread_x86_tls_slots == detail::guest_thread_tls_slots);
+            // 唯讀程式碼與可變 TEB 分離；每次讀取當前 FS／GS，不保存上一執行緒的值。
             guest_thread_routines_=GuestAddress{callback_return_.value+guest_thread_page_offset};
             // FlsGetValue 客體常式讀 TEB 鏡像。微基準每次約省 33 ns，但 703／103 同成品對照開啟反而慢 1–3%
             // （跨客體碼頁呼叫的成本高於常駐執行緒邊界），預設關閉；X64ARM_GUEST_FLS=1 才維護鏡像並導向常式。
             static const bool fls_routines=[] {const auto* setting=std::getenv("X64ARM_GUEST_FLS");return setting && std::string_view(setting)=="1";}();
-            fls_mirror_=fls_routines;
+            fls_mirror_=!x86_ && fls_routines;
             // 有慢路徑 cell 的常式（SRW 鎖）在初始化填入同名 kernel32 服務 stub；之後程式頁保持唯讀可執行。
             const auto table=runtime_service_descriptors();
             std::vector<std::uint8_t> bytes(GuestMemory::guest_page_size,0xcc);
-            std::copy(detail::guest_thread_code.begin(),detail::guest_thread_code.end(),bytes.begin());
-            for(const auto& routine:detail::guest_thread_routines){
+            const auto code=x86_?std::span<const std::uint8_t>{detail::guest_thread_x86_code}:
+                                  std::span<const std::uint8_t>{detail::guest_thread_code};
+            std::copy(code.begin(),code.end(),bytes.begin());
+            if(!x86_)for(const auto& routine:detail::guest_thread_routines){
                 if(!routine.slot)continue;
                 const auto found=std::find_if(table.begin(),table.end(),[&](const auto& d){return d.family=="kernel32.dll" && d.symbol==routine.symbol;});
                 if(found==table.end() || routine.slot+8>detail::guest_thread_code.size())throw std::logic_error("客體執行緒常式的原服務或慢路徑不存在");
@@ -598,11 +603,14 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     }
     if (lower == "kernel32.dll"){
         if(guest_thread_routines_.value && runtime_.image.base && trace_services_.empty() && !startup_profile::enabled()){
-            static const auto routines=[] {
+            const auto entries=[](const auto& source) {
                 std::unordered_map<std::string_view,std::size_t> table;
-                for(const auto& routine:detail::guest_thread_routines)table.try_emplace(routine.symbol,routine.entry);
+                for(const auto& routine:source)table.try_emplace(routine.symbol,routine.entry);
                 return table;
-            }();
+            };
+            static const auto win32_routines=entries(detail::guest_thread_x86_routines);
+            static const auto win64_routines=entries(detail::guest_thread_routines);
+            const auto& routines=x86_?win32_routines:win64_routines;
             if(const auto found=routines.find(symbol);found!=routines.end() && (fls_mirror_ || !symbol.starts_with("FlsGetValue")))
                 return GuestAddress{guest_thread_routines_.value+found->second};
         }
@@ -1189,6 +1197,20 @@ ResidentScalarErrors WindowsServices::resident_context_errors(const GuestState& 
 bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory& memory) {
     if(x86_ || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled() ||
        runtime_.forced_exit_code() || debugger_stopped())return false;
+    // CFG 分派是控制流程邊界，不是 OS 呼叫：只核對目標、不改 LastError／權杖／GUI／IO，也不切換執行緒，
+    // 可在其他 worker 繼續執行時由協調者完成（renderer 每輪數萬次，是 worker 完整服務出口的大宗）。
+    if(state.rip.value==callback_return_.value+0x60 || state.rip.value==callback_return_.value+0x70){
+        const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
+        if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
+        const auto previous=threads_.current;
+        struct RestoreCurrent {WindowsServices& self;std::uint64_t previous;~RestoreCurrent(){self.threads_.current=previous;}} restore_current{*this,previous};
+        threads_.current=key;resident_service_requests_.erase(key);
+        refresh_guard_table(memory);
+        const auto result=invoke_service(state,memory);
+        if(result)throw std::logic_error("CFG 分派服務意外終止客體");
+        refresh_guard_table(memory);
+        return true;
+    }
     const auto begin=stub_base_.value+services.size()*16;
     const auto table=runtime_service_descriptors();
     if(state.rip.value<begin || (state.rip.value-begin)%16 || (state.rip.value-begin)/16>=table.size())return false;

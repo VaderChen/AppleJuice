@@ -6,6 +6,8 @@
 #include <functional>
 #include <iterator>
 #include <span>
+#include <cstring>
+#include <type_traits>
 
 namespace x64arm::address_cache {
 // 所有位址位元參與 CRC32C；雜湊只決定槽位，不能取代完整鍵、權限或世代驗證。
@@ -21,13 +23,26 @@ template<class Table,class Match>
 auto direct_find(Table& table,std::uint64_t key,Match matches) noexcept {
     auto& slot=direct_slot(table,key);return matches(slot)?&slot:nullptr;
 }
+// 直接快取的 {鍵,值} 以單一 STP 寫入：槽位 16 位元組對齊時，LSE2 宿主的 LDP／STP 為單拷貝原子，
+// 正在執行的 worker 不會讀到「新鍵配舊值」的錯配配對（並行模式在 worker 執行中發布新入口時必要）。
+template<class Value>
+void store_pair(Value& slot,const Value& value) noexcept {
+#if defined(__aarch64__)
+    if constexpr(sizeof(Value)==16 && alignof(Value)>=16){
+        std::uint64_t words[2];std::memcpy(words,&value,sizeof words);
+        __asm__ volatile("stp %0, %1, [%2]" : : "r"(words[0]),"r"(words[1]),"r"(&slot) : "memory");
+        return;
+    }
+#endif
+    slot=value;
+}
 template<class Table,class Value>
 void direct_refill(Table& table,std::uint64_t key,const Value& value) noexcept {
-    direct_slot(table,key)=value;
+    store_pair(direct_slot(table,key),value);
 }
 template<class Table,class Match>
 void direct_invalidate(Table& table,std::uint64_t key,Match matches) noexcept {
-    if(auto* slot=direct_find(table,key,matches))*slot={};
+    if(auto* slot=direct_find(table,key,matches))store_pair(*slot,std::remove_reference_t<decltype(*slot)>{});
 }
 // 線性探測表必須為二次方容量，且至少保留一個空槽。滿載政策／配置由擁有者管理。
 // Occupied 獨立於鍵和值，因此 key=0、value=nullptr 都能是有效項目。

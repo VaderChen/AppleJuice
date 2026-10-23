@@ -21,6 +21,14 @@ public:
         // 協調者在信箱閒置等待時因外部世代改變（跨程序管道／物件通知）提前輪詢的次數。
         std::uint64_t parallel_external_wakes{};
         std::uint64_t parallel_wall_ns{},parallel_cpu_ns{},parallel_sites{};
+        // 不經 quiesce（worker 執行中）完成的純新增發布次數。
+        std::uint64_t parallel_lockfree_publications{};
+        // 不停其他 worker 完成的協調服務（虛擬記憶體家族）次數。
+        std::uint64_t parallel_local_services{};
+        // 利用率退避：第二核沒有運算而離開平行批次的次數、累計退避時間與對應的 quiesce 次數。
+        std::uint64_t parallel_backoffs{},parallel_backoff_ns{},parallel_quiesce_backoff{};
+        // 各 quiesce 呼叫點的次數（診斷哪一類出口在中斷 worker）。
+        std::uint64_t parallel_quiesce_external_wake{},parallel_quiesce_timeout{},parallel_quiesce_service_bounce{},parallel_quiesce_mapping_refused{},parallel_quiesce_mapping_consistent{},parallel_quiesce_local_fallback{},parallel_quiesce_full_exit{},parallel_quiesce_publish_fallback{},parallel_quiesce_batch_end{};
         std::uint64_t parallel_messages{},parallel_resumes{},parallel_publications{},parallel_service_retries{};
         std::uint64_t parallel_coordinated_services{},parallel_coordinated_semantics{};
         std::uint64_t parallel_mapping_batches{},parallel_mapping_requests{};
@@ -39,6 +47,8 @@ public:
         std::uint64_t scalar_native_services{},scalar_native_retries{};
         // 已登錄為核心 ARM64 配方本體的純量服務入口數；配方每次呼叫不進 C++，不逐次計數。
         std::uint64_t scalar_recipe_bodies{};
+        // 已登錄的唯讀時鐘 ARM64 入口；每次呼叫不進 provider，也不逐次計數。
+        std::uint64_t clock_recipe_bodies{};
         // 只在明確開啟探索診斷時逐段計時；正式計時須維持關閉。
         std::uint64_t profiled_discoveries{},decode_fetch_nanoseconds{},decode_ir_nanoseconds{},decode_index_nanoseconds{},decode_copy_nanoseconds{};
         std::uint64_t profiled_decoder_calls{},decode_decoder_nanoseconds{},decode_validation_nanoseconds{},decode_store_nanoseconds{};
