@@ -26,6 +26,8 @@ struct Buffer {
     bool capture_failed{};
     std::uint64_t captured_frames{};
     std::uint64_t rendered_frames{};
+    // 串流播放中、但客體尚未補入資料而輸出靜音的 frame 數與次數（音訊斷續診斷）。
+    std::uint64_t starved_frames{},starved_runs{};bool starving{};
     float rendered_peak{};
     float rendered_left_peak{},rendered_right_peak{};
     double capture_fraction{};

@@ -52,6 +52,7 @@ std::FILE* idle_timeline_file() {
         const auto* directory = std::getenv("X64ARM_TRACE_IDLE_TIMELINE");
         if (!directory || !*directory)
             return nullptr;
+        if(std::string_view(directory)=="stderr")return stderr; // 可由觀測器的記憶體 pipe 接收，避免磁碟停頓。
         auto* opened = std::fopen((std::string(directory) + "/idle-" + std::to_string(::getpid()) + ".txt").c_str(), "a");
         if (opened)
             std::setvbuf(opened, nullptr, _IOLBF, 0); // 程序可能被強制結束，逐行寫出。
@@ -76,13 +77,18 @@ template<class Threads> void trace_run_switch(const Threads& threads, std::uint6
         for (const auto& [id, thread] : threads)
             if (id != run_trace.thread && thread.status == ThreadStatus::Runnable && !thread.suspended)
                 runnable += (runnable.empty() ? "" : ",") + std::to_string(id);
-        std::fprintf(timeline, "run %llu %lld %lld 0x%llx boundaries=%llu/%llu/%llu runnable=%s wake=%llu/%llu/%lluus %s\n", static_cast<unsigned long long>(run_trace.thread),
+        const auto prefix=timeline==stderr?"timeline pid="+std::to_string(::getpid())+" ":std::string{};
+        std::fprintf(timeline, "%srun %llu %lld %lld 0x%llx boundaries=%llu/%llu/%llu runnable=%s wake=%llu/%llu/%lluus priority=%d multimedia=%d %s\n", prefix.c_str(),static_cast<unsigned long long>(run_trace.thread),
                      idle_timeline_unix_us(run_trace.start), idle_timeline_unix_us(now),
                      static_cast<unsigned long long>(found == threads.end() ? 0 : found->second.entry),
                      static_cast<unsigned long long>(run_trace.boundaries), static_cast<unsigned long long>(run_trace.interrupts),
                      static_cast<unsigned long long>(run_trace.arms), runnable.empty() ? "-" : runnable.c_str(),
                      static_cast<unsigned long long>(run_trace.wake_zero), static_cast<unsigned long long>(run_trace.wake_set),
-                     static_cast<unsigned long long>(run_trace.last_wake / 1000), name.c_str());
+                     static_cast<unsigned long long>(run_trace.last_wake / 1000),
+                     found==threads.end()?0:found->second.priority,
+                     found==threads.end() || !found->second.multimedia.handle?0:
+                         std::clamp(found->second.multimedia.base+found->second.multimedia.relative,
+                                    found->second.multimedia.minimum,found->second.multimedia.maximum),name.c_str());
     }
     run_trace = {next, 0, 0, 0, 0, 0, 0, now};
 }
@@ -91,6 +97,32 @@ long long idle_timeline_unix_us(std::chrono::steady_clock::time_point point) {
     return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(point.time_since_epoch() + offset).count());
 }
 #endif
+// 沿用明確啟用的排程時間線；一般執行不讀時鐘、不記錄輪詢細節。
+class WakePollScope {
+    startup_profile::Scope profile_;
+#if !defined(_WIN32)
+    std::FILE* file_{};
+    const char* name_{};
+    std::chrono::steady_clock::time_point start_{};
+#endif
+public:
+    explicit WakePollScope(const char* name):profile_("wake_poll",name) {
+#if !defined(_WIN32)
+        file_=idle_timeline_file();name_=name;
+        if(file_)start_=std::chrono::steady_clock::now();
+#endif
+    }
+    ~WakePollScope() {
+#if !defined(_WIN32)
+        if(!file_)return;
+        const auto end=std::chrono::steady_clock::now();
+        if(end-start_>=std::chrono::milliseconds(5)){
+            const auto prefix=file_==stderr?"timeline pid="+std::to_string(::getpid())+" ":std::string{};
+            std::fprintf(file_,"%spoll %s %lld %lld\n",prefix.c_str(),name_,idle_timeline_unix_us(start_),idle_timeline_unix_us(end));
+        }
+#endif
+    }
+};
 std::uint64_t external_wait_spin_ticks() {
     static const auto ticks = [] {
         const auto *raw = std::getenv("X64ARM_WAIT_SPIN_US");
@@ -469,6 +501,10 @@ ExecutionPolicy WindowsServices::execution_policy(const GuestState &state) const
         state_mask = owner->power_state;
     }
     if(control&1U)return state_mask&1U?ExecutionPolicy::Efficient:ExecutionPolicy::Responsive;
+    // MMCSS 的即時工作也映射宿主 QoS；只改實際執行該客體的 worker，明確電源設定優先。
+    if(owner && owner->multimedia.handle &&
+       owner->effective_priority(runtime_.process_priority_class,runtime_.process_background)>=16)
+        return ExecutionPolicy::Interactive;
     return runtime_.process_priority_class==0x4000?ExecutionPolicy::Utility:
         runtime_.process_priority_class==0x8000?ExecutionPolicy::Responsive:
         runtime_.process_priority_class==0x80?ExecutionPolicy::Interactive:ExecutionPolicy::Automatic;
@@ -564,17 +600,19 @@ std::vector<GuestState *> WindowsServices::parallel_contexts(GuestState &state) 
     available &= ~(UINT64_C(1) << state.processor_id);
     std::vector<GuestState *> result{&state};
     parallel_thread_ids_[parallel_thread_count_++] = threads_.current;
-    // 等待協調執行緒處理 API／例外的 context 不占原生 worker；其餘依輪替選擇，避免總是偏向最小 TID。
-    // 已結束者不會是 Runnable；只走訪未結束者，仍依 TID 順序自游標之後輪替。
-    const auto live = live_threads();
-    auto candidate = std::upper_bound(live.begin(), live.end(), parallel_cursor_,
+    // 等待協調者處理 API／例外的 context 不占 worker。依有效優先序分派，
+    // 同優先序從游標之後輪替；MMCSS 喚醒後尚未完成的工作仍保有優先權。
+    auto live = live_threads();
+    const auto pivot = std::upper_bound(live.begin(), live.end(), parallel_cursor_,
                                       [](std::uint64_t cursor, const auto &entry) { return cursor < entry.first; });
-    for (std::size_t visited = 0; available && visited < live.size(); ++visited) {
-        if (candidate == live.end())
-            candidate = live.begin();
-        const auto id = candidate->first;
-        auto &thread = *candidate->second;
-        ++candidate;
+    std::rotate(live.begin(),pivot,live.end());
+    std::stable_sort(live.begin(),live.end(),[&](const auto& left,const auto& right){
+        return left.second->effective_priority(runtime_.process_priority_class,runtime_.process_background)>
+               right.second->effective_priority(runtime_.process_priority_class,runtime_.process_background);
+    });
+    for (const auto& [id,entry] : live) {
+        if(!available)break;
+        auto &thread = *entry;
         const auto pending_service=resident_service_requests_.find(id);
         if (id == threads_.current || thread.status != ThreadStatus::Runnable || thread.suspended ||
             (pending_service!=resident_service_requests_.end() && pending_service->second==thread.context.rip) ||
@@ -667,16 +705,16 @@ bool WindowsServices::resident_select_control_request(GuestState& state,GuestMem
 }
 #endif
 namespace {
-// 常駐搶占（時間片絕對期限、監看外部事件、中斷返回時輪詢）預設關閉：同成品實測長卡頓未改善、開機約慢 0.5 秒。
-// X64ARM_RESIDENT_PREEMPT=1 明確開啟；關閉時沿用相對 5 ms 期限，核心的中斷保留與計時器設施照常存在。
+// 時間片絕對期限可獨立比較；關閉時沿用相對 5 ms 期限。
+// 跨程序通知與等待期限屬正確性契約，不受此時間片策略開關影響。
 bool resident_preempt_enabled() noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_RESIDENT_PREEMPT");return setting && std::string_view(setting)=="1";}();
     return enabled;
 }
 bool resident_external_wake_enabled() noexcept {
-    // 搶占開啟時，X64ARM_RESIDENT_EXTERNAL_WAKE=0 另可停用外部事件中斷，只依期限與 runnable 武裝（同成品對照）。
+    // X64ARM_RESIDENT_EXTERNAL_WAKE=0 僅供診斷對照；預設保留跨程序事件中斷。
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_RESIDENT_EXTERNAL_WAKE");return !setting || std::string_view(setting)!="0";}();
-    return enabled && resident_preempt_enabled();
+    return enabled;
 }
 // 跨程序 IPC、管道與共用物件的通知都推進同一個 session 喚醒世代。
 class SharedWakeSource final : public ResidentExternalWake {
@@ -694,7 +732,7 @@ public:
 std::shared_ptr<const ResidentExternalWake> WindowsServices::resident_external_wake(std::uint64_t& observed) const {
     // 只有一個客體執行緒時沒有可被外部事件喚醒的等待者。
 #if !defined(_WIN32)
-    if(idle_timeline_file())++run_trace.arms; // 只在核心武裝中斷計時器時查詢
+    if(idle_timeline_file())++run_trace.arms; // 核心查詢外部喚醒來源的次數，與絕對時間片計時器分開。
 #endif
     if(!resident_external_wake_enabled() || !runtime_.host_clock || threads_.items.size()<2)return {};
     if(!resident_external_source_){
@@ -727,7 +765,7 @@ void WindowsServices::after_resident_parallel(GuestState& state,GuestMemory& mem
 void WindowsServices::after_resident_interrupt(GuestState& state,GuestMemory& memory) {
     // 中斷只為其他 runnable、等待期限或外部事件而武裝：直接做完整排程（輪詢外部事件、解析逾時、
     // 輪替），不等時間片到期；否則期限已過的下一次武裝會立刻再中斷，直到時間片結束。
-    if(resident_preempt_enabled()){threads_.yield=true;threads_.interrupt_poll=true;}
+    threads_.yield=true;threads_.interrupt_poll=true;
 #if !defined(_WIN32)
     if(idle_timeline_file())++run_trace.interrupts;
 #endif
@@ -774,6 +812,9 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
         const auto remaining=deadline>now?std::min<std::uint64_t>(deadline-now,UINT64_MAX/100)*100:1;
         wake=wake?std::min(wake,remaining):remaining;
     }
+    // 音訊已有實際播放進度與下一個事件期限；沿同一獨立中斷計時器喚醒，
+    // 不等待其他客體計時器，也不在正常產碼加入配額、時鐘讀取或裝置輪詢。
+    if(const auto audio=wasapi_wakeup_ns())wake=wake?std::min(wake,audio):audio;
     if(network_wait){
         const auto poll=external_wait_poll_limit()*100;
         wake=wake?std::min(wake,poll):poll;
@@ -1090,121 +1131,122 @@ WindowsServices::CompletionResult WindowsServices::poll_completion(GuestState& s
 }
 void WindowsServices::wake_threads(GuestMemory &memory) {
     startup_profile::Scope measurement("scheduler", "wake_threads");
+    WakePollScope wake_measurement("wake_threads");
     process_io::Scope io_scope(runtime_.io_counters, io_publisher_.get());
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_http_io");
+        WakePollScope poll_measurement("poll_http_io");
         poll_http_io();
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_autoproxy");
+        WakePollScope poll_measurement("poll_autoproxy");
         poll_autoproxy(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_handle_transfers");
+        WakePollScope poll_measurement("poll_handle_transfers");
         poll_handle_transfers(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_job_termination");
+        WakePollScope poll_measurement("poll_job_termination");
         poll_job_termination(memory);
     }
     poll_machine_shutdown();
     if (runtime_.forced_exit_code() || debugger_stopped())
         return;
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_directory_notifications");
+        WakePollScope poll_measurement("poll_directory_notifications");
         poll_directory_notifications();
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_shell_notifications");
+        WakePollScope poll_measurement("poll_shell_notifications");
         poll_shell_notifications(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_file_io");
+        WakePollScope poll_measurement("poll_file_io");
         poll_file_io(memory, true);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_network_io");
+        WakePollScope poll_measurement("poll_network_io");
         poll_network_io(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_midi_input");
+        WakePollScope poll_measurement("poll_midi_input");
         poll_midi_input(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_media_foundation");
+        WakePollScope poll_measurement("poll_media_foundation");
         poll_media_foundation(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_wave_input");
+        WakePollScope poll_measurement("poll_wave_input");
         poll_wave_input(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_wave_output");
+        WakePollScope poll_measurement("poll_wave_output");
         poll_wave_output(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_winusb");
+        WakePollScope poll_measurement("poll_winusb");
         poll_winusb(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_dsound");
+        WakePollScope poll_measurement("poll_dsound");
         poll_dsound();
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_wasapi");
+        WakePollScope poll_measurement("poll_wasapi");
         poll_wasapi();
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_directmusic");
+        WakePollScope poll_measurement("poll_directmusic");
         poll_directmusic();
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_dinput");
+        WakePollScope poll_measurement("poll_dinput");
         poll_dinput(true);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_address_notifications");
+        WakePollScope poll_measurement("poll_address_notifications");
         poll_address_notifications(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_desktop_notifications");
+        WakePollScope poll_measurement("poll_desktop_notifications");
         poll_desktop_notifications();
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_device_notifications");
+        WakePollScope poll_measurement("poll_device_notifications");
         poll_device_notifications(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_bluetooth");
+        WakePollScope poll_measurement("poll_bluetooth");
         poll_bluetooth(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_registry_notifications");
+        WakePollScope poll_measurement("poll_registry_notifications");
         poll_registry_notifications();
         poll_guest_services(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_power_notifications");
+        WakePollScope poll_measurement("poll_power_notifications");
         poll_power_notifications(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_timer_queues");
+        WakePollScope poll_measurement("poll_timer_queues");
         poll_timer_queues(memory);
     }
     {
-        (void)refresh_memory_resource_notifications();
-        startup_profile::Scope poll_measurement("wake_poll", "poll_registered_waits");
+        {WakePollScope poll_measurement("refresh_memory_resource_notifications");(void)refresh_memory_resource_notifications();}
+        WakePollScope poll_measurement("poll_registered_waits");
         poll_registered_waits(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_threadpool");
+        WakePollScope poll_measurement("poll_threadpool");
         poll_threadpool(memory);
     }
     {
-        startup_profile::Scope poll_measurement("wake_poll", "poll_etw");
+        WakePollScope poll_measurement("poll_etw");
         poll_etw(memory);
     }
-    poll_perflib(memory);
+    {WakePollScope poll_measurement("poll_perflib");poll_perflib(memory);}
     // 執行中的客體每個指令時間片仍檢查等待物件；AppKit 外部事件最多每毫秒輪詢一次。
     // 明確的訊息 API 與所有執行緒等待時仍立即 pump；已到期的 GUI 計時器也不延後。
     const bool gui_due = !runtime_.host_clock || !native_gui_ || runtime_.clock_ticks >= gui_.scheduler_poll_deadline ||
@@ -1214,6 +1256,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
             return entry.second.status == ThreadStatus::Waiting && entry.second.wait.kind == ThreadWaitKind::GuiInput;
         })) {
         gui_.scheduler_poll_deadline = runtime_.clock_ticks + 10000;
+        WakePollScope poll_measurement("pump_gui");
         pump_gui(memory, false);
     }
     // 等待完成、取消或執行緒結束後，釋放不再使用的內部物件參照。
@@ -1253,7 +1296,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
         else
             object.active = false;
     }
-    resolve_thread_waits(memory);
+    {WakePollScope poll_measurement("resolve_thread_waits");resolve_thread_waits(memory);}
     // 脈衝只屬於這次完整事件輪詢；局部鎖通知不消耗其他事件。
     for (const auto handle : multimedia_pulses_) {
         if (const auto event = runtime_.wait_objects.find(handle); event != runtime_.wait_objects.end())
@@ -1292,18 +1335,33 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
         // 部分等待直接重新執行原 API，會在下方提早 continue；統一在
         // 離開這個等待者時回報狀態變化，不只涵蓋尾端 complete_call。
         struct WaitChange {
-            const GuestThread& thread;
+            GuestThread& thread;
             bool& changed;
             ThreadStatus status;
             ThreadWaitKind kind;
             std::uint64_t deadline;
             bool signaled;
-            ~WaitChange(){changed=changed || thread.status!=status || thread.wait.kind!=kind ||
-                thread.wait.deadline!=deadline || thread.wait.signaled!=signaled;}
+            ~WaitChange(){
+                if(status==ThreadStatus::Waiting && thread.status==ThreadStatus::Runnable)thread.wake_pending=true;
+                changed=changed || thread.status!=status || thread.wait.kind!=kind ||
+                    thread.wait.deadline!=deadline || thread.wait.signaled!=signaled;
+            }
         } change{thread,changed,thread.status,wait.kind,wait.deadline,wait.signaled};
         bool ready = false;
         bool guest_return = false;
         std::uint64_t result = 258;
+        if(wait.kind==ThreadWaitKind::HandleTransfer){
+            if(finish_duplicate_remote_handle(thread.context,memory,id)){
+                thread.status=ThreadStatus::Runnable;thread.wait={};
+            }
+            continue;
+        }
+        if(wait.kind==ThreadWaitKind::ProcessCreation){
+            if(finish_guest_process_creation(thread.context,memory,id)){
+                thread.status=ThreadStatus::Runnable;thread.wait={};
+            }
+            continue;
+        }
         if(wait.kind==ThreadWaitKind::Sleep && !thread.callbacks.empty() && thread.callbacks.back().continuation==Continuation::PolicyRetry){
             const auto pending=policy_sections_.find(thread.callbacks.back().value);
             const auto wake=mapping_wake();
@@ -1786,8 +1844,9 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
     for (;;) {
         const auto wake_epoch = wake ? wake->snapshot() : 0;
         resident_external_polled_ = wake_epoch; // 常駐中斷以此為基準；之後的外部通知一定會被看見。
-        if (runtime_.host_clock)
-            retired(memory, 0);
+        if (runtime_.host_clock){
+            WakePollScope poll_measurement("retired");retired(memory, 0);
+        }
         wait_debugger(memory);
         if (wake_epoch != handled_wake) {
             poll_handle_transfers(memory, true);
@@ -1808,9 +1867,10 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
         if (resident_execution_depth_ && parallel_workers() > 1) {
             // 完整控制待辦（API／語義／故障）由協調者先承接；不能先啟動
             // 少數可運算客體，再讓其餘客體空等下一個排程期限。
-            // 仍按原輪替順序選取，沿下方唯一的 TLS／回呼／例外切換流程；
+            // 待辦之間依有效優先序選取，同優先序保留輪替，沿下方唯一的 TLS／回呼／例外切換流程；
             // worker 可完成的服務保持平行，不在這裡搶回協調者。
             auto request = threads_.items.upper_bound(threads_.current);
+            int request_priority=0;
             for (std::size_t n = 0; n < threads_.items.size(); ++n) {
                 if (request == threads_.items.end())request = threads_.items.begin();
                 const auto& thread = request->second;
@@ -1819,19 +1879,40 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
                     ((pending!=resident_service_requests_.end() && pending->second==thread.context.rip) ||
                      (handles(thread.context.rip) && !parallel_service(thread.context.rip) &&
                       !resident_recipe_eligible(*this,thread.context.rip)))) {
-                    chosen = request;break;
+                    const auto priority=thread.effective_priority(runtime_.process_priority_class,runtime_.process_background);
+                    if(priority>request_priority){chosen=request;request_priority=priority;}
                 }
                 ++request;
             }
         }
 #endif
-        // 中斷只為投遞事件：目前執行緒時間片未到期就續跑並沿用原期限，喚醒者等時間片結束或目前執行緒等待時接手。
+        // 物件／I/O 剛喚醒的高優先序工作須先取得一次執行機會；不能讓
+        // MMCSS 音訊通知排在所有普通 runnable 後面。等優先序仍沿原輪替順序，
+        // dispatch 後消耗 wake_pending；不能借用可被關閉、且不適用即時工作的 boost。
+        auto awakened = threads_.items.end();
+        int awakened_priority = 0;
+        auto candidate = threads_.items.upper_bound(threads_.current);
+        for(std::size_t n=0;n<threads_.items.size();++n){
+            if(candidate==threads_.items.end())candidate=threads_.items.begin();
+            const auto& thread=candidate->second;
+            if(thread.status==ThreadStatus::Runnable && !thread.suspended && thread.wake_pending){
+                const auto priority=thread.effective_priority(runtime_.process_priority_class,runtime_.process_background);
+                if(priority>awakened_priority){awakened=candidate;awakened_priority=priority;}
+            }
+            ++candidate;
+        }
+        if(awakened!=threads_.items.end() && (chosen==threads_.items.end() ||
+           awakened_priority>chosen->second.effective_priority(runtime_.process_priority_class,runtime_.process_background)))
+            chosen=awakened;
+        // 只投遞事件而未喚醒更高優先序工作時，沿用目前執行緒尚未到期的時間片。
         std::uint64_t kept_slice = UINT64_MAX;
         if (std::exchange(threads_.interrupt_poll, false)) {
             const auto current = threads_.items.find(threads_.current);
             if (current != threads_.items.end() && current->second.status == ThreadStatus::Runnable &&
                 !current->second.suspended && threads_.slice_deadline != UINT64_MAX &&
-                detail::monotonic_ticks() < threads_.slice_deadline) {
+                detail::monotonic_ticks() < threads_.slice_deadline &&
+                (awakened==threads_.items.end() || awakened_priority<=
+                 current->second.effective_priority(runtime_.process_priority_class,runtime_.process_background))) {
                 chosen = current;
                 kept_slice = threads_.slice_deadline;
             }
@@ -1857,7 +1938,8 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
                 ++idle_trace.buckets[elapsed < 100'000 ? 0 : elapsed < 500'000 ? 1 : elapsed < 1'000'000 ? 2 : elapsed < 5'000'000 ? 3 : elapsed < 20'000'000 ? 4 : 5];
                 if (auto* timeline = idle_timeline_file(); timeline && elapsed >= 50'000) {
                     const auto begin = idle_timeline_unix_us(idle_start);
-                    std::fprintf(timeline, "%lld %lld\n", begin, begin + static_cast<long long>(elapsed / 1000));
+                    const auto prefix=timeline==stderr?"timeline pid="+std::to_string(::getpid())+" ":std::string{};
+                    std::fprintf(timeline, "%s%lld %lld\n", prefix.c_str(),begin, begin + static_cast<long long>(elapsed / 1000));
                 }
                 idle_active = false;
             }
@@ -1906,6 +1988,7 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
                                           : UINT64_MAX;
             if (kept_slice != UINT64_MAX)
                 threads_.slice_deadline = kept_slice;
+            target.wake_pending=false;
             target.dynamic_priority_boost = 0;
             threads_.yield = false;
             prepare_debug_execution(state, memory);
@@ -2071,6 +2154,8 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
                         [](const auto &item) {
                             return item.second.status == ThreadStatus::Waiting &&
                                    (item.second.wait.kind == ThreadWaitKind::SocketSelect ||
+                                    item.second.wait.kind == ThreadWaitKind::HandleTransfer ||
+                                    item.second.wait.kind == ThreadWaitKind::ProcessCreation ||
                                     item.second.wait.kind == ThreadWaitKind::EtwTrace ||
                                     item.second.wait.kind == ThreadWaitKind::DebugEvent ||
                                     item.second.wait.kind == ThreadWaitKind::CrtProcess);
@@ -2096,7 +2181,8 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
             const auto until_deadline = next > runtime_.clock_ticks ? next - runtime_.clock_ticks : 0;
             const auto ticks = std::min(until_deadline, external_wait ? external_poll_ticks : UINT64_C(500000));
             if (wake && external_wait) {
-                pump_gui(memory, false);
+                WakePollScope poll_measurement("pump_gui");
+        pump_gui(memory, false);
                 if (ticks && !wake->wait_for(wake_epoch, ticks * 100))
                     std::this_thread::sleep_for(std::chrono::nanoseconds(ticks * 100));
             } else
@@ -2182,6 +2268,8 @@ std::optional<std::uint32_t> WindowsServices::finish_thread(GuestState &state, G
     // 正常 ThreadExit continuation 已執行並移除 FLS/TLS callback；此時才清除
     // 被 ExitThread 跨越的外層 callback，歸還混合 A/W hook 等暫存與 loader ownership。
     cancel_network_io(memory, 0, threads_.current);
+    cancel_duplicate_remote_handle(memory,threads_.current);
+    cancel_guest_process_creation(threads_.current);
     discard_file_transfers(state,memory,threads_.current);
     if(const auto job=runtime_.network.resolvers.find(threads_.current);job!=runtime_.network.resolvers.end()){
         job->second->cancelled.store(true);runtime_.network.resolvers.erase(job);

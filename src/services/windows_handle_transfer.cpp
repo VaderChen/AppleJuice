@@ -8,6 +8,7 @@
 #include "x64arm/process_identity.hpp"
 #include "socket_state_access.hpp"
 #include "windows_debug_state.hpp"
+#include "monotonic_clock.hpp"
 #include <array>
 #include <algorithm>
 #include <atomic>
@@ -48,6 +49,7 @@ struct TransferMessage {
 };
 using TransferKey=std::pair<std::uint32_t,std::uint64_t>;
 constexpr std::uint32_t family_request_kind=21,family_cancel_kind=22,family_protocol=0x31435052U;
+constexpr std::uint32_t duplicate_protocol=0x31505544U;
 struct TransferReply {TransferMessage message;int descriptor{-1};std::vector<std::uint8_t> context{};};
 struct FamilyRequest {
     TransferMessage packet;
@@ -60,6 +62,23 @@ struct FamilyRequest {
     }
 };
 struct FamilyCancel {TransferMessage packet;std::chrono::steady_clock::time_point deadline,next_attempt{};};
+// 跨程序複製保留原本的 export/import/ack 契約，但只掛起呼叫的客體執行緒。
+// 描述元與 lifetime 都由作業持有，其他客體關閉原 handle 不會破壞已開始的轉移。
+struct DuplicateRequest {
+    std::array<std::uint64_t,7> arguments{};
+    std::uint32_t source{},target{},peer{},error{};
+    std::uint64_t result{},export_sequence{};
+    InheritedHandle item;
+    TransferMessage packet;
+    bool exporting{},sent{};
+    int descriptor{-1};
+    std::chrono::steady_clock::time_point deadline,started;
+    ~DuplicateRequest(){
+#if !defined(_WIN32)
+        if(descriptor>=0)::close(descriptor);
+#endif
+    }
+};
 std::string endpoint(const std::string& directory,std::uint32_t pid){return directory+"/process-"+std::to_string(pid);}
 #if !defined(_WIN32)
 int send_transfer(int socket,const std::string& path,const TransferMessage& packet,int descriptor=-1,int state_descriptor=-1,std::span<const std::uint8_t> context={}){
@@ -160,6 +179,8 @@ struct HandleTransferState {
     std::map<TransferKey,FamilyCancel> family_cancellations;
     std::map<TransferKey,std::shared_ptr<void>> exports;
     std::map<TransferKey,std::uint64_t> imports;
+    std::map<std::uint64_t,std::shared_ptr<DuplicateRequest>> duplicates;
+    std::set<TransferKey> duplicate_requests;
     ~HandleTransferState(){
 #if !defined(_WIN32)
         watch.reset(); // 先停止監看執行緒，再關閉它等待的描述元。
@@ -393,17 +414,23 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
         if(packet.kind==3){
             // 已取消或完成的家族 RPC 回覆直接忽略，不佔用其他程序控制的回覆表。
             if(packet.reserved==family_protocol && !transfer.family_requests.contains(key))continue;
+            if(packet.reserved==duplicate_protocol && !transfer.duplicate_requests.contains(key))continue;
             if(transfer.replies.size()<1024){
                 const auto [position,inserted]=transfer.replies.emplace(key,TransferReply{packet,descriptor,std::vector<std::uint8_t>(context.begin(),context.begin()+context_size)});
                 (void)position;if(inserted)descriptor=-1;
             }continue;
         }
         if(packet.kind==4 || packet.kind==5){transfer.exports.erase(key);if(const auto found=transfer.imports.find(key);found!=transfer.imports.end()){if(packet.kind==5)close_transfer_handle(memory,found->second);transfer.imports.erase(found);}continue;}
-        TransferMessage reply;reply.kind=3;reply.sequence=packet.sequence;reply.sender=process_id();InheritedHandle item;
+        TransferMessage reply;reply.kind=3;reply.sequence=packet.sequence;reply.sender=process_id();reply.reserved=packet.reserved;InheritedHandle item;
         if(packet.kind==6){reply.handle=local_process_handle_count();reply.type=active_thread_count();(void)send_transfer(transfer.descriptor,path,reply);}
         else if(packet.kind==7 || packet.kind==8){reply.error=packet.kind==7?(descriptor<0?6U:import_process_job(descriptor)):0U;reply.handle=current_job_identity();(void)send_transfer(transfer.descriptor,path,reply);}
         else if(packet.kind==10){reply.error=local_process_accounting(reply.accounting);(void)send_transfer(transfer.descriptor,path,reply);}
-        else if(packet.kind==11){auto value=static_cast<std::uint32_t>(packet.handle);reply.error=local_process_thread_control(packet.options,value);reply.handle=value;(void)send_transfer(transfer.descriptor,path,reply);}
+        else if(packet.kind==11){
+            auto value=static_cast<std::uint32_t>(packet.handle);
+            reply.auxiliary=process_identity_birth();
+            reply.error=packet.reserved==family_protocol && packet.auxiliary!=reply.auxiliary?87U:local_process_thread_control(packet.options,value);
+            reply.handle=value;reply.accounting[0]=value;(void)send_transfer(transfer.descriptor,path,reply);
+        }
         else if(packet.kind==12){
             struct stat info{};const auto size=x86_?716U:1232U;
             if(descriptor<0 || packet.options>1 || packet.mode!=(x86_?32U:64U))reply.error=50;
@@ -560,6 +587,24 @@ std::uint32_t WindowsServices::remote_process_request(GuestMemory& memory,std::u
     (void)memory;(void)pid;(void)birth;(void)kind;(void)operation;(void)values;(void)mode;(void)descriptor;return 50;
 #endif
 }
+std::uint32_t WindowsServices::begin_remote_process_thread_control(std::uint32_t pid,std::uint64_t birth,std::uint32_t operation,std::uint64_t& sequence){
+    sequence=0;
+#if !defined(_WIN32)
+    if(!handle_transfers_ || !pid || !birth)return 50;
+    if(!process_identity::query(pid).live({pid,birth}))return 87;
+    auto& transfer=*handle_transfers_;
+    if(transfer.family_requests.size()>=1024 || !transfer.next_sequence || transfer.next_sequence==UINT64_MAX)return 8;
+    try{
+        auto request=std::make_shared<FamilyRequest>();request->birth=birth;
+        request->deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        auto& packet=request->packet;packet.kind=11;packet.sender=process_id();packet.sequence=transfer.next_sequence++;
+        packet.options=operation;packet.auxiliary=birth;packet.reserved=family_protocol;
+        transfer.family_requests.emplace(TransferKey{pid,packet.sequence},request);sequence=packet.sequence;return 0;
+    }catch(const std::bad_alloc&){return 8;}
+#else
+    (void)pid;(void)birth;(void)operation;return 50;
+#endif
+}
 std::uint32_t WindowsServices::begin_remote_family_request(std::uint32_t pid,std::uint64_t birth,std::uint32_t family,std::uint32_t operation,
     const std::array<std::uint64_t,5>& values,std::uint32_t mode,int descriptor,int state_descriptor,std::uint64_t& sequence,std::uint32_t timeout){
     sequence=0;
@@ -586,7 +631,7 @@ std::uint32_t WindowsServices::begin_remote_family_request(std::uint32_t pid,std
 }
 WindowsServices::RemoteFamilyResult WindowsServices::poll_remote_family_request(GuestMemory& memory,std::uint32_t pid,std::uint64_t sequence){
 #if !defined(_WIN32)
-    if(!runtime_.network.external_io || !handle_transfers_)return {true,50,{},0};
+    if(!handle_transfers_)return {true,50,{},0};
     auto& transfer=*handle_transfers_;const TransferKey key{pid,sequence};const auto found=transfer.family_requests.find(key);
     if(found==transfer.family_requests.end())return {true,6,{},0};const auto request=found->second;
     const auto finish=[&](RemoteFamilyResult result){
@@ -594,6 +639,17 @@ WindowsServices::RemoteFamilyResult WindowsServices::poll_remote_family_request(
             if(reply->second.descriptor>=0)::close(reply->second.descriptor);transfer.replies.erase(reply);
         }transfer.family_requests.erase(key);return result;
     };
+    if(!runtime_.network.external_io && request->packet.kind!=11)return finish({true,50,{},0});
+    if(request->packet.kind==11){
+        // Resume 的回覆可能先於子程序快速退出；已確認的操作不可因隨後
+        // 的退出被改判失敗。回覆仍核對請求的 birth，排除 PID 重用。
+        poll_handle_transfers(memory,true);
+        if(const auto reply=transfer.replies.find(key);reply!=transfer.replies.end()){
+            const auto& value=reply->second;
+            if(value.message.reserved!=family_protocol || value.message.auxiliary!=request->birth || value.descriptor>=0 || !value.context.empty())return finish({true,13,{},0});
+            return finish({true,value.message.error,value.message.accounting,value.message.mode});
+        }
+    }
     if(!request->sent && std::chrono::steady_clock::now()>=request->deadline){cancel_remote_family_request(pid,sequence);return {true,121,{},0};}
     if(!process_identity::query(pid).live({pid,request->birth}))return finish({true,87,{},0});
     if(!request->sent){
@@ -616,14 +672,14 @@ WindowsServices::RemoteFamilyResult WindowsServices::poll_remote_family_request(
 }
 void WindowsServices::cancel_remote_family_request(std::uint32_t pid,std::uint64_t sequence){
 #if !defined(_WIN32)
-    if(!runtime_.network.external_io || !handle_transfers_)return;
+    if(!handle_transfers_)return;
     auto& transfer=*handle_transfers_;const TransferKey key{pid,sequence};const auto found=transfer.family_requests.find(key);
     if(found==transfer.family_requests.end())return;
     const auto request=found->second;
     if(const auto reply=transfer.replies.find(key);reply!=transfer.replies.end()){
         if(reply->second.descriptor>=0)::close(reply->second.descriptor);transfer.replies.erase(reply);
     }transfer.family_requests.erase(key);
-    if(request->sent)(void)queue_remote_family_cancel(pid,request->birth,request->packet.options,sequence);
+    if(request->sent && request->packet.kind==family_request_kind)(void)queue_remote_family_cancel(pid,request->birth,request->packet.options,sequence);
 #else
     (void)pid;(void)sequence;
 #endif
@@ -849,69 +905,148 @@ std::uint32_t WindowsServices::remote_process_job(GuestMemory& memory,std::uint3
     (void)memory;(void)descriptor;return 50;
 #endif
 }
-std::optional<std::uint32_t> WindowsServices::duplicate_remote_handle(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    const WindowsCall arg(state,memory,service);std::uint64_t result=0;std::uint32_t error=0;
-    const auto trace_started=std::chrono::steady_clock::now();
+void WindowsServices::cancel_duplicate_remote_handle(GuestMemory& memory,std::uint64_t thread){
 #if !defined(_WIN32)
-    const auto source_pid=process_handle_pid(arg(0),0x40),target_pid=process_handle_pid(arg(2),0x40);const auto self=process_id();
-    if(!source_pid || !target_pid)error=process_object_type(arg(0))==u"Process" && process_object_type(arg(2))==u"Process"?5:6;
+    (void)memory;if(!handle_transfers_)return;auto& transfer=*handle_transfers_;
+    const auto found=transfer.duplicates.find(thread);if(found==transfer.duplicates.end())return;
+    const auto& op=*found->second;
+    const auto cancel=[&](std::uint32_t pid,std::uint64_t sequence){
+        if(!sequence)return;TransferMessage packet;packet.kind=5;packet.sender=process_id();packet.sequence=sequence;
+        (void)send_transfer(transfer.descriptor,endpoint(transfer.directory,pid),packet);
+        transfer.duplicate_requests.erase({pid,sequence});
+        if(const auto reply=transfer.replies.find({pid,sequence});reply!=transfer.replies.end()){
+            if(reply->second.descriptor>=0)::close(reply->second.descriptor);transfer.replies.erase(reply);
+        }
+    };
+    cancel(op.peer,op.packet.sequence);cancel(op.source,op.export_sequence);
+    transfer.duplicates.erase(found);
+#else
+    (void)memory;(void)thread;
+#endif
+}
+bool WindowsServices::finish_duplicate_remote_handle(GuestState& state,GuestMemory& memory,std::uint64_t thread){
+#if !defined(_WIN32)
+    if(!handle_transfers_)return true;auto& transfer=*handle_transfers_;
+    const auto found=transfer.duplicates.find(thread);if(found==transfer.duplicates.end())return true;
+    auto& op=*found->second;const auto self=process_id();
+    const auto acknowledge=[&](std::uint32_t pid,std::uint64_t sequence,bool cancel){
+        if(!sequence)return;TransferMessage packet;packet.kind=cancel?5U:4U;packet.sender=self;packet.sequence=sequence;
+        (void)send_transfer(transfer.descriptor,endpoint(transfer.directory,pid),packet);
+        transfer.duplicate_requests.erase({pid,sequence});
+    };
+    for(;;){
+        if(op.error || op.result)break;
+        if(!op.packet.sequence){
+            op.packet={};op.packet.sender=self;op.packet.reserved=duplicate_protocol;
+            op.packet.sequence=transfer.next_sequence++;op.sent=false;
+            op.deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+            if(op.exporting){
+                op.peer=op.source;op.packet.kind=2;op.packet.handle=op.arguments[1];
+                op.packet.access=static_cast<std::uint32_t>(op.arguments[4]);op.packet.options=static_cast<std::uint32_t>(op.arguments[6]);op.packet.flags=op.arguments[5]?1U:0U;
+            }else{
+                op.item.flags=op.arguments[5]?1U:0U;
+                if(op.target==self){
+                    op.item.handle=runtime_.allocate_wait_handle();
+                    // import_transfer_handle 接收描述元的所有權；失敗也由該 provider 回收。
+                    op.descriptor=-1;
+                    try{import_transfer_handle(op.item);op.result=op.item.handle;}catch(const HostCallFault&){op.error=50;}
+                    op.packet.sequence=0;break;
+                }
+                op.peer=op.target;op.packet.kind=1;op.packet.type=op.item.type;op.packet.access=op.item.access;
+                op.packet.flags=op.item.flags;op.packet.mode=op.item.mode;op.packet.pipe_mode=op.item.pipe_mode;op.packet.auxiliary=op.item.auxiliary;
+            }
+            transfer.duplicate_requests.emplace(op.peer,op.packet.sequence);
+        }
+        if(!op.sent){
+            const auto failure=send_transfer(transfer.descriptor,endpoint(transfer.directory,op.peer),op.packet,op.exporting?-1:op.item.descriptor);
+            if(!failure)op.sent=true;
+            else if(failure!=EAGAIN && failure!=ENOBUFS && failure!=ENOENT && failure!=ECONNREFUSED){op.error=50;break;}
+        }
+        const auto reply=transfer.replies.find({op.peer,op.packet.sequence});
+        if(reply!=transfer.replies.end()){
+            auto received=std::move(reply->second);transfer.replies.erase(reply);
+            transfer.duplicate_requests.erase({op.peer,op.packet.sequence});op.error=received.message.error;
+            if(op.exporting){
+                op.export_sequence=op.packet.sequence;op.descriptor=received.descriptor;
+                op.item.type=received.message.type;op.item.access=received.message.access;op.item.mode=received.message.mode;
+                op.item.pipe_mode=received.message.pipe_mode;op.item.auxiliary=received.message.auxiliary;op.item.descriptor=received.descriptor;
+                if(!op.error && op.item.descriptor<0)op.error=6;
+                if(!op.error && op.item.type==3 && op.item.auxiliary && (op.item.access&~0x100001U))op.error=5;
+                op.exporting=false;op.packet.sequence=0;continue;
+            }
+            if(received.descriptor>=0)::close(received.descriptor);
+            op.result=received.message.handle;break;
+        }
+        if(std::chrono::steady_clock::now()>=op.deadline || (::kill(static_cast<pid_t>(op.peer),0)<0 && errno==ESRCH)){
+            op.error=1460;break;
+        }
+        // 其他客體持續運算時，也須喚醒逾時或尚未送出的請求；不能只
+        // 依外部回覆，否則死亡／滿佇列的對端會讓這個等待永久失效。
+        const auto remaining=std::chrono::duration_cast<std::chrono::nanoseconds>(op.deadline-std::chrono::steady_clock::now()).count();
+        const auto delay=op.sent?remaining:std::min<std::int64_t>(remaining,1000000);
+        threads_.items.at(thread).wait.deadline=(runtime_.host_clock?detail::monotonic_ticks():runtime_.clock_ticks)+static_cast<std::uint64_t>(std::max<std::int64_t>(delay,100))/100;
+        return false;
+    }
+    if(!op.error){
+        try{memory.store(GuestAddress{op.arguments[3]},x86_?32:64,op.result);}
+        catch(const MemoryFault&){op.error=998;if(op.target==self && op.result)close_transfer_handle(memory,op.result);}
+    }
+    acknowledge(op.peer,op.packet.sequence,op.error!=0);
+    acknowledge(op.source,op.export_sequence,op.error!=0);
+    if(op.error){
+        memory.store(GuestAddress{threads_.items.at(thread).teb+(x86_?0x34:0x68)},32,op.error);
+        if(thread==threads_.current)last_error_=op.error;
+    }
+    if(std::getenv("X64ARM_TRACE_HANDLE_TRANSFER"))std::fprintf(stderr,
+        "[duplicate_remote_complete] pid=%u thread=%llu source_pid=%u target_pid=%u error=%u elapsed_us=%lld\n",self,
+        static_cast<unsigned long long>(thread),op.source,op.target,op.error,
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-op.started).count()));
+    WindowsCall(state,memory,7).return_to(state,op.error?0:1);
+    transfer.duplicates.erase(found);return true;
+#else
+    (void)state;(void)memory;(void)thread;return true;
+#endif
+}
+std::optional<std::uint32_t> WindowsServices::duplicate_remote_handle(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    const WindowsCall arg(state,memory,service);std::uint32_t error=0;
+#if !defined(_WIN32)
+    const auto source=process_handle_pid(arg(0),0x40),target=process_handle_pid(arg(2),0x40),self=process_id();
+    if(!source || !target)error=process_object_type(arg(0))==u"Process" && process_object_type(arg(2))==u"Process"?5:6;
     else if(!arg(3) || arg(6)&~3U)error=87;
     else if(!handle_transfers_)error=50;
     else {
         memory.check(GuestAddress{arg(3)},x86_?4:8,Access::Write);auto& transfer=*handle_transfers_;
-        const auto acknowledge=[&](std::uint32_t pid,std::uint64_t sequence,bool cancel){TransferMessage message;message.kind=cancel?5U:4U;message.sender=self;message.sequence=sequence;(void)send_transfer(transfer.descriptor,endpoint(transfer.directory,pid),message);};
-        const auto request=[&](std::uint32_t pid,TransferMessage message,int fd)->TransferReply {
-            message.sender=self;message.sequence=transfer.next_sequence++;const auto path=endpoint(transfer.directory,pid);const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);bool sent=false;
-            for(;;){
-                if(!sent){const auto failure=send_transfer(transfer.descriptor,path,message,fd);if(!failure)sent=true;else if(failure!=EAGAIN && failure!=ENOBUFS && failure!=ENOENT && failure!=ECONNREFUSED){message.error=50;return {message,-1};}}
-                poll_handle_transfers(memory,true);const auto found=transfer.replies.find({pid,message.sequence});
-                if(found!=transfer.replies.end()){const auto reply=found->second;transfer.replies.erase(found);return reply;}
-                if(std::chrono::steady_clock::now()>=deadline || (::kill(static_cast<pid_t>(pid),0)<0 && errno==ESRCH)){acknowledge(pid,message.sequence,true);message.error=1460;return {message,-1};}
-                pollfd wait{transfer.descriptor,POLLIN,0};(void)::poll(&wait,1,2);
+        if(transfer.duplicates.size()>=1024 || transfer.next_sequence>=UINT64_MAX-1)error=8;
+        else {
+            auto op=std::make_shared<DuplicateRequest>();op->source=source;op->target=target;op->exporting=source!=self;
+            for(unsigned i=0;i<op->arguments.size();++i)op->arguments[i]=arg(i);
+            op->started=std::chrono::steady_clock::now();
+            if(source==self){
+                auto& item=op->item;error=export_transfer_handle(arg(1),item);
+                if(!error && (arg(6)&1U) && (item.flags&2U))error=5;
+                if(!error && !(arg(6)&2U)){
+                    if(item.type==3 || item.type==5){try{initialize_tokens();const auto all=item.type==5?0x1f0001U:0x1f0003U;const security::AccessMapping mapping{0x20001U,item.type==5?0x20001U:0x20002U,0x120000U,all};item.access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(shared_object_security(item.descriptor)),item.access,static_cast<std::uint32_t>(arg(4)),mapping);}catch(const SecurityDescriptorError& failure){error=failure.code;}}
+                    else {const auto requested=transfer_access(item.type,static_cast<std::uint32_t>(arg(4)));if(requested&~transfer_access(item.type,item.access))error=5;else item.access=requested;}
+                }
+                if(!error && item.type==3 && item.auxiliary && (item.access&~0x100001U))error=5;
+                if(!error){do{op->descriptor=::fcntl(item.descriptor,F_DUPFD_CLOEXEC,0);}while(op->descriptor<0 && errno==EINTR);
+                    if(op->descriptor<0)error=6;else item.descriptor=op->descriptor;}
+                // CLOSE_SOURCE 不依結果而保留原 handle；先取得作業私有描述元，再只關閉一次。
+                if((arg(6)&1U) && !(runtime_.handle_flags[arg(1)]&2U))close_transfer_handle(memory,arg(1));
             }
-        };
-        InheritedHandle item;std::uint64_t export_sequence=0;int received_descriptor=-1;
-        if(source_pid==self){
-            error=export_transfer_handle(arg(1),item);
-            if(!error && (arg(6)&1U) && (item.flags&2U))error=5;
-            if(!error && !(arg(6)&2U)){
-                if(item.type==3 || item.type==5){try{initialize_tokens();const auto all=item.type==5?0x1f0001U:0x1f0003U;const security::AccessMapping mapping{0x20001U,item.type==5?0x20001U:0x20002U,0x120000U,all};item.access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(shared_object_security(item.descriptor)),item.access,static_cast<std::uint32_t>(arg(4)),mapping);}catch(const SecurityDescriptorError& failure){error=failure.code;}}
-                else {const auto requested=transfer_access(item.type,static_cast<std::uint32_t>(arg(4)));if(requested&~transfer_access(item.type,item.access))error=5;else item.access=requested;}
-            }
-        }else {
-            TransferMessage query;query.kind=2;query.handle=arg(1);query.access=static_cast<std::uint32_t>(arg(4));query.options=static_cast<std::uint32_t>(arg(6));query.flags=arg(5)?1U:0U;
-            const auto reply=request(source_pid,query,-1);error=reply.message.error;export_sequence=reply.message.sequence;received_descriptor=reply.descriptor;
-            item.type=reply.message.type;item.access=reply.message.access;item.mode=reply.message.mode;item.pipe_mode=reply.message.pipe_mode;item.auxiliary=reply.message.auxiliary;item.descriptor=reply.descriptor;
-            if(!error && item.descriptor<0)error=6;
-        }
-        if(!error && item.type==3 && item.auxiliary && (item.access&~0x100001U))error=5;
-        item.flags=arg(5)?1U:0U;
-        if(!error){
-            if(target_pid==self){item.handle=runtime_.allocate_wait_handle();received_descriptor=-1;try{import_transfer_handle(item);result=item.handle;}catch(const HostCallFault&){error=50;}}
-            else {
-                TransferMessage query;query.kind=1;query.type=item.type;query.access=item.access;query.flags=item.flags;query.mode=item.mode;query.pipe_mode=item.pipe_mode;query.auxiliary=item.auxiliary;
-                const auto reply=request(target_pid,query,item.descriptor);error=reply.message.error;result=reply.message.handle;acknowledge(target_pid,reply.message.sequence,error!=0);
-                if(reply.descriptor>=0)::close(reply.descriptor);
+            if(!error){
+                transfer.duplicates.emplace(threads_.current,std::move(op));poll_handle_transfers(memory,true);
+                auto& thread=threads_.items.at(threads_.current);
+                thread.wait={};thread.wait.kind=ThreadWaitKind::HandleTransfer;
+                if(finish_duplicate_remote_handle(state,memory,threads_.current)){thread.wait={};return std::nullopt;}
+                thread.status=ThreadStatus::Waiting;
+                schedule(state,memory);return std::nullopt;
             }
         }
-        if(received_descriptor>=0)::close(received_descriptor);
-        if(export_sequence)acknowledge(source_pid,export_sequence,error!=0);
-        if(source_pid==self && (arg(6)&1U) && !(runtime_.handle_flags[arg(1)]&2U))close_transfer_handle(memory,arg(1));
-        if(!error)memory.store(GuestAddress{arg(3)},x86_?32:64,result);
     }
 #else
     error=50;
 #endif
-    if(error){last_error_=error;if(std::getenv("X64ARM_TRACE_HANDLE_TRANSFER"))std::fprintf(stderr,"[duplicate_remote_error] pid=%u source_process=%llx source_handle=%llx target_process=%llx access=%x options=%x error=%u\n",process_id(),static_cast<unsigned long long>(arg(0)),static_cast<unsigned long long>(arg(1)),static_cast<unsigned long long>(arg(2)),static_cast<std::uint32_t>(arg(4)),static_cast<std::uint32_t>(arg(6)),error);}
-#if !defined(_WIN32)
-    else if(std::getenv("X64ARM_TRACE_HANDLE_TRANSFER")){
-        // 診斷：附宿主毫秒時間與本次呼叫耗時（含等待目標程序回覆）。
-        const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-trace_started).count();
-        const auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        std::fprintf(stderr,"[duplicate_remote_timing] pid=%u ms=%lld source_pid=%u target_pid=%u elapsed_us=%lld\n",self,static_cast<long long>(ms),source_pid,target_pid,static_cast<long long>(elapsed));
-        std::fprintf(stderr,"[duplicate_remote_success] pid=%u source_pid=%u source_handle=%llx target_pid=%u target_handle=%llx\n",self,source_pid,static_cast<unsigned long long>(arg(1)),target_pid,static_cast<unsigned long long>(result));
-    }
-#endif
-    arg.return_to(state,error?0:1);return std::nullopt;
+    last_error_=error;arg.return_to(state,0);return std::nullopt;
 }
 }

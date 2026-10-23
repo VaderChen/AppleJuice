@@ -11,6 +11,7 @@
 #include "process_manifest.hpp"
 #include "crt_lowio_abi.hpp"
 #include "crt_os_error.hpp"
+#include "monotonic_clock.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -452,6 +453,16 @@ struct ProcessState {
     std::shared_ptr<ProcessRecord> record;
     std::map<std::uint32_t,std::shared_ptr<ProcessRecord>> thread_records;
     std::vector<std::shared_ptr<Child>> children;
+    struct Creation {
+        std::shared_ptr<Child> child;
+        std::shared_ptr<ProcessRecord> record;
+        std::uint64_t output{},resume_sequence{};
+        std::uint32_t flags{};
+        unsigned arguments{};
+        bool process_inherit{},thread_inherit{},require_job{};
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::map<std::uint64_t,Creation> creations;
     ~ProcessState() {
         // Windows 的程序／執行緒 handles 與建立者生命週期不擁有子程序。
         // 長期存活的宿主需要回收 waitpid；CLI 宿主退出後由作業系統接管。
@@ -481,6 +492,74 @@ struct ProcessState {
     }
 #endif
 };
+#if !defined(_WIN32)
+namespace {
+// 同步包裝與可排程的 Win32 建立流程共用同一發布點，維持 handle 權限、
+// 繼承、完整 PID 身分及輸出記憶體契約；完成前不把暫存子程序變成獨立程序。
+void publish_created_process(ProcessState& processes,RuntimeState& runtime,GuestMemory& memory,bool x86,const ProcessState::Creation& creation){
+    memory.check(GuestAddress{creation.output},x86?16:24,Access::Write);
+    const auto process=runtime.allocate_wait_handle(),thread=runtime.allocate_wait_handle();
+    const auto& child=creation.child;const auto birth=creation.record->data->birth;
+    try{
+        processes.handles.emplace(process,Handle{child,false,0x1fffffU,0,creation.record,birth});
+        processes.handles.emplace(thread,Handle{child,true,0x1fffffU,0,creation.record,birth});
+        if(creation.process_inherit)runtime.handle_flags[process]=1;
+        if(creation.thread_inherit)runtime.handle_flags[thread]=1;
+        memory.store(GuestAddress{creation.output},x86?32:64,process);
+        memory.store(GuestAddress{creation.output+(x86?4U:8U)},x86?32:64,thread);
+        memory.store(GuestAddress{creation.output+(x86?8U:16U)},32,static_cast<std::uint32_t>(child->pid));
+        memory.store(GuestAddress{creation.output+(x86?12U:20U)},32,static_cast<std::uint32_t>(child->pid));
+        processes.children.push_back(child);child->independent=true;
+    }catch(...){
+        processes.handles.erase(process);processes.handles.erase(thread);
+        runtime.handle_flags.erase(process);runtime.handle_flags.erase(thread);throw;
+    }
+}
+}
+#endif
+void WindowsServices::cancel_guest_process_creation(std::uint64_t thread){
+#if !defined(_WIN32)
+    if(!processes_)return;
+    const auto found=processes_->creations.find(thread);if(found==processes_->creations.end())return;
+    if(found->second.resume_sequence)cancel_remote_family_request(static_cast<std::uint32_t>(found->second.child->pid),found->second.resume_sequence);
+    processes_->creations.erase(found); // 尚未發布的 Child 回收其程序與描述元。
+#else
+    (void)thread;
+#endif
+}
+bool WindowsServices::finish_guest_process_creation(GuestState& state,GuestMemory& memory,std::uint64_t thread){
+#if !defined(_WIN32)
+    if(!processes_)return true;
+    const auto found=processes_->creations.find(thread);if(found==processes_->creations.end())return true;
+    auto& op=found->second;auto& child=*op.child;std::uint32_t error=0;
+    child.poll();
+    if(child.startup_error || child.job_error)error=child.startup_error?child.startup_error:child.job_error;
+    else if((child.exited && !child.startup_ready) || std::chrono::steady_clock::now()>=op.deadline)error=1460;
+    bool ready=child.startup_ready && (!op.require_job || child.job_started);
+    if(!error && ready && !(op.flags&4U)){
+        if(!op.resume_sequence)error=begin_remote_process_thread_control(static_cast<std::uint32_t>(child.pid),op.record->data->birth,3,op.resume_sequence);
+        if(!error){const auto result=poll_remote_family_request(memory,static_cast<std::uint32_t>(child.pid),op.resume_sequence);
+            ready=result.ready;if(ready){error=result.error;op.resume_sequence=0;}}
+    }
+    if(!error && !ready){
+        // 管線就緒與 RPC 回覆有外部通知；有限期限也保留重試及子程序死亡的補查。
+        threads_.items.at(thread).wait.deadline=(runtime_.host_clock?detail::monotonic_ticks():runtime_.clock_ticks)+10000;
+        return false;
+    }
+    if(!error)try{publish_created_process(*processes_,runtime_,memory,x86_,op);}
+        catch(const MemoryFault&){error=998;}
+        catch(const std::bad_alloc&){error=8;}
+    const auto arguments=op.arguments;
+    if(error){
+        memory.store(GuestAddress{threads_.items.at(thread).teb+(x86_?0x34:0x68)},32,error);
+        if(thread==threads_.current)last_error_=error;
+    }
+    cancel_guest_process_creation(thread);
+    WindowsCall(state,memory,arguments).return_to(state,error?0:1);return true;
+#else
+    (void)state;(void)memory;(void)thread;return true;
+#endif
+}
 std::uint32_t WindowsServices::thread_access(std::uint64_t handle)const{
     if(thread_id(handle)){
         if(handle==(x86_?UINT32_MAX-1:UINT64_MAX-1))return kernel_pseudo_access(true);
@@ -1790,7 +1869,7 @@ std::span<const WindowsServiceDescriptor> process_service_descriptors() {
     return table;
 }
 bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array<std::uint64_t, 10> &call_arguments,
-                                           bool wide, bool as_user, std::uint64_t token_handle, unsigned privilege) {
+                                           bool wide, bool as_user, std::uint64_t token_handle, unsigned privilege,unsigned completion_arguments) {
     startup_profile::ProcessLaunch launch;
     initialize_tokens();
     if ((runtime_.child_process_policy & 1U) || runtime_.token_objects.at(1).child_process_restricted) {
@@ -1805,6 +1884,7 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
     (void)as_user;
     (void)token_handle;
     (void)privilege;
+    (void)completion_arguments;
     last_error_ = 50;
     launch.result(last_error_);
     return false;
@@ -1866,7 +1946,7 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
         fail(50);
     else if (memory.load(GuestAddress{arg(8)}, 32) < (x86_ ? 68U : 104U))
         fail(87);
-    else if (processes_->children.size() >= 1024)
+    else if (processes_->children.size()+processes_->creations.size() >= 1024)
         fail(8);
     else {
         std::vector<std::uint8_t> environment_bytes;
@@ -2530,6 +2610,12 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
                                 }
                                 launch.event("startup_wait_begin");
                                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+                                ProcessState::Creation creation{child,record,arg(9),0,flags,completion_arguments,
+                                    process_security.inherit,thread_security.inherit,job_descriptor>=0,deadline};
+                                if(completion_arguments){
+                                    processes_->creations.emplace(threads_.current,std::move(creation));
+                                    launch.event("startup_deferred");launch.result(997);return false;
+                                }
                                 while (!child->startup_ready && !child->startup_error && !child->job_error &&
                                        !child->exited && std::chrono::steady_clock::now() < deadline) {
                                     child->poll();
@@ -2555,24 +2641,7 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
                                         return false;
                                     }
                                 }
-                                const auto process = runtime_.allocate_wait_handle(), thread = runtime_.allocate_wait_handle();
-                                const auto birth =
-                                    process_debugger::query(static_cast<std::uint32_t>(child->pid)).identity;
-                                processes_->children.push_back(child);
-                                processes_->handles.emplace(process, Handle{child, false, 0x1fffffU, 0, record, birth});
-                                processes_->handles.emplace(
-                                    thread, Handle{child, true, 0x1fffffU, 0, std::move(record), birth});
-                                if (process_security.inherit)
-                                    runtime_.handle_flags[process] = 1;
-                                if (thread_security.inherit)
-                                    runtime_.handle_flags[thread] = 1;
-                                memory.store(GuestAddress{arg(9)}, x86_ ? 32 : 64, process);
-                                memory.store(GuestAddress{arg(9) + (x86_ ? 4U : 8U)}, x86_ ? 32 : 64, thread);
-                                memory.store(GuestAddress{arg(9) + (x86_ ? 8U : 16U)}, 32,
-                                             static_cast<std::uint32_t>(child->pid));
-                                memory.store(GuestAddress{arg(9) + (x86_ ? 12U : 20U)}, 32,
-                                             static_cast<std::uint32_t>(child->pid));
-                                child->independent = true;
+                                publish_created_process(*processes_,runtime_,memory,x86_,creation);
                                 result = 1;
                             }
                         }
@@ -3037,7 +3106,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
         std::array<std::uint64_t, 10> arguments{};
         for (unsigned i = 0; i < arguments.size(); ++i)
             arguments[i] = arg(i);
-        result = create_guest_process(memory, arguments, symbol.ends_with('W'), as_user, as_user ? call(0) : 0);
+        result = create_guest_process(memory, arguments, symbol.ends_with('W'), as_user, as_user ? call(0) : 0,0,as_user?11U:10U);
+#if !defined(_WIN32)
+        if(processes_ && processes_->creations.contains(threads_.current)){
+            auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;
+            thread.wait={};thread.wait.kind=ThreadWaitKind::ProcessCreation;
+            thread.wait.deadline=(runtime_.host_clock?detail::monotonic_ticks():runtime_.clock_ticks)+10000;
+            schedule(state,memory);return std::nullopt;
+        }
+#endif
     } else if ((symbol == "GetExitCodeProcess" || symbol == "GetProcessId") && current_process_handle(arg(0))) {
         if (!current_process_handle(arg(0), 0x400) && !current_process_handle(arg(0), 0x1000))
             fail(5);

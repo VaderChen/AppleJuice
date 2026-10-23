@@ -98,5 +98,88 @@ Lset_invalid:
 end TlsSetValue
 // 絕對差值不切開 Mach-O code atom，跨此位置的分支仍能在組譯時完全解析。
 .set _guest_tls_bitmap_patch, Ltls_bitmap_patch - _guest_TlsSetValue
+
+// 與 Win64 常式及 provider 共用鎖字組契約：bit0 獨占、bit1 等待者、bit2 起為讀者數。
+// 原生 CAS 成功直接 stdcall 返回；競爭、等待者及溢位尾跳同名完整服務。
+// 慢路徑保留原始堆疊與引數，只改 volatile 暫存器；立即值由共用初始化流程修補。
+.macro slow_end name
+    mov eax, 0
+    jmp eax
+end \name
+.endm
+
+entry AcquireSRWLockExclusive
+    mov ecx, dword ptr [esp+4]
+    xor eax, eax
+    mov edx, 1
+    lock cmpxchg dword ptr [ecx], edx
+    jne 1f
+    ret 4
+1:
+slow_end AcquireSRWLockExclusive
+
+entry ReleaseSRWLockExclusive
+    mov ecx, dword ptr [esp+4]
+    mov eax, 1
+    xor edx, edx
+    lock cmpxchg dword ptr [ecx], edx
+    jne 1f
+    ret 4
+1:
+slow_end ReleaseSRWLockExclusive
+
+entry AcquireSRWLockShared
+    mov ecx, dword ptr [esp+4]
+    mov eax, dword ptr [ecx]
+    test al, 3
+    jne 1f
+    cmp eax, -4
+    je 1f
+    lea edx, [eax+4]
+    lock cmpxchg dword ptr [ecx], edx
+    jne 1f
+    ret 4
+1:
+slow_end AcquireSRWLockShared
+
+entry ReleaseSRWLockShared
+    mov ecx, dword ptr [esp+4]
+    mov eax, dword ptr [ecx]
+    test al, 3
+    jne 1f
+    cmp eax, 4
+    jb 1f
+    lea edx, [eax-4]
+    lock cmpxchg dword ptr [ecx], edx
+    jne 1f
+    ret 4
+1:
+slow_end ReleaseSRWLockShared
+
+entry TryAcquireSRWLockExclusive
+    mov ecx, dword ptr [esp+4]
+    xor eax, eax
+    mov edx, 1
+    lock cmpxchg dword ptr [ecx], edx
+    jne 1f
+    mov eax, 1
+    ret 4
+1:
+slow_end TryAcquireSRWLockExclusive
+
+entry TryAcquireSRWLockShared
+    mov ecx, dword ptr [esp+4]
+    mov eax, dword ptr [ecx]
+    test al, 3
+    jne 1f
+    cmp eax, -4
+    je 1f
+    lea edx, [eax+4]
+    lock cmpxchg dword ptr [ecx], edx
+    jne 1f
+    mov eax, 1
+    ret 4
+1:
+slow_end TryAcquireSRWLockShared
 .globl _guest_thread_end
 _guest_thread_end:

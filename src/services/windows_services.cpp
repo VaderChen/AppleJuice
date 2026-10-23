@@ -470,13 +470,16 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             if(bitmap_patch+bitmap_width>code.size() || (x86_ && guest_tls_bitmap_.value>UINT32_MAX))
                 throw std::logic_error("TLS 配置位元圖位址修補超出常式或 Win32 範圍");
             for(unsigned n=0;n<bitmap_width;++n)bytes[bitmap_patch+n]=static_cast<std::uint8_t>(guest_tls_bitmap_.value>>(8*n));
-            if(!x86_)for(const auto& routine:detail::guest_thread_routines){
+            const auto patch_services=[&](const auto& routines,unsigned width){for(const auto& routine:routines){
                 if(!routine.slot)continue;
                 const auto found=std::find_if(table.begin(),table.end(),[&](const auto& d){return d.family=="kernel32.dll" && d.symbol==routine.symbol;});
-                if(found==table.end() || routine.slot+8>detail::guest_thread_code.size())throw std::logic_error("客體執行緒常式的原服務或慢路徑不存在");
+                if(found==table.end() || routine.slot+width>code.size())throw std::logic_error("客體執行緒常式的原服務或慢路徑不存在");
                 const auto stub=stub_base_.value+(services.size()+static_cast<std::size_t>(found-table.begin()))*16;
-                for(unsigned n=0;n<8;++n)bytes[routine.slot+n]=static_cast<std::uint8_t>(stub>>(8*n));
-            }
+                if(width==4 && stub>UINT32_MAX)throw std::logic_error("客體執行緒常式的原服務超出 Win32 範圍");
+                for(unsigned n=0;n<width;++n)bytes[routine.slot+n]=static_cast<std::uint8_t>(stub>>(8*n));
+            }};
+            if(x86_)patch_services(detail::guest_thread_x86_routines,4);
+            else patch_services(detail::guest_thread_routines,8);
             memory.map(guest_thread_routines_,GuestMemory::guest_page_size,read_execute,bytes);
         }
         if(!x86_ && guest_memory_enabled()){
@@ -626,8 +629,11 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             };
             static const auto win32_routines=entries(detail::guest_thread_x86_routines);
             static const auto win64_routines=entries(detail::guest_thread_routines);
+            // SRW 家族可獨立同成品對照；初始化、等待者／喚醒與錯誤仍沿原 provider。
+            static const bool srw_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_SRW");return !value || std::string_view(value)!="0";}();
             const auto& routines=x86_?win32_routines:win64_routines;
-            if(const auto found=routines.find(symbol);found!=routines.end() && (fls_mirror_ || !symbol.starts_with("FlsGetValue")))
+            if(const auto found=routines.find(symbol);found!=routines.end() &&
+               (srw_routines || symbol.find("SRWLock")==symbol.npos) && (fls_mirror_ || !symbol.starts_with("FlsGetValue")))
                 return GuestAddress{guest_thread_routines_.value+found->second};
         }
         // 核心服務與擴充 descriptor 相同：只索引不可變身分，保留首筆優先。
@@ -1269,13 +1275,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
     resident_service_requests_.erase(threads_.current);
     entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,
         entry_runtime_profile::enabled()?name(state.rip):std::string_view{});
+    static const bool trace_slow_calls=std::getenv("X64ARM_TRACE_SLOW_CALLS")!=nullptr;
     struct CountScope {
-        WindowsServices& self;std::uint64_t rip;std::chrono::steady_clock::time_point start;
-        ~CountScope(){if(!self.service_counts_enabled_)return;auto& c=self.service_counts_[rip];++c.calls;
+        WindowsServices& self;std::uint64_t rip,thread;bool trace;std::chrono::steady_clock::time_point start;
+        ~CountScope(){if(!self.service_counts_enabled_ && !trace)return;
             const auto now=std::chrono::steady_clock::now();
+            const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(now-start).count();
+            if(trace && elapsed>=5000){const auto symbol=self.name(GuestAddress{rip});
+                std::fprintf(stderr,"slow_service pid=%llu thread=%llu current=%llu rip=0x%llx duration_us=%lld end_unix_us=%llu name=%.*s\n",
+                    static_cast<unsigned long long>(self.process_id()),static_cast<unsigned long long>(thread),static_cast<unsigned long long>(self.threads_.current),
+                    static_cast<unsigned long long>(rip),static_cast<long long>(elapsed),static_cast<unsigned long long>(startup_profile::unix_us()),static_cast<int>(symbol.size()),symbol.data());}
+            if(!self.service_counts_enabled_)return;auto& c=self.service_counts_[rip];++c.calls;
             c.ns+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now-start).count());
             if(!self.service_counts_directory_.empty() && (++self.service_count_events_&1023)==0 && now-self.service_count_dumped_>std::chrono::seconds(5))self.dump_service_counts();}
-    } count_scope{*this,state.rip.value,service_counts_enabled_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
+    } count_scope{*this,state.rip.value,threads_.current,trace_slow_calls,(service_counts_enabled_ || trace_slow_calls)?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
 #ifdef X64ARM_HOST_SERVICES_MANAGED_FP
     // 非數學服務仍沿用宿主環境；同一入口也支援動態資格撤銷後的完整流程。
     if(environment && runtime_compute_boundary(state.rip)!=3

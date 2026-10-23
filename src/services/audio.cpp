@@ -31,7 +31,12 @@ void Buffer::render(std::span<float> out,unsigned output_rate) {
     std::fill(out.begin(),out.end(),0.0F);
     std::lock_guard lock(mutex);
     rendered_frames+=out.size()/2;
-    if((!playing && effects.empty()) || !output_rate || pcm.empty())return;
+    // 串流 underrun 計數：本次 callback 有多少 frame 因 queue 耗盡而以靜音補上。
+    const auto starve=[&](std::size_t missing){
+        if(!streaming || !playing)return;
+        if(missing){starved_frames+=missing;if(!starving)++starved_runs;starving=true;}else starving=false;
+    };
+    if((!playing && effects.empty()) || !output_rate || pcm.empty()){starve(out.size()/2);return;}
     const auto frames=pcm.size()/frame_bytes();
     const auto advance=[&](double previous){
         for(const auto& n:notifications){
@@ -61,6 +66,7 @@ void Buffer::render(std::span<float> out,unsigned output_rate) {
             rendered_peak=std::max({rendered_peak,peak[0],peak[1]});rendered_left_peak=std::max(rendered_left_peak,peak[0]);rendered_right_peak=std::max(rendered_right_peak,peak[1]);
             const auto previous=cursor+static_cast<double>(count-1);cursor+=static_cast<double>(count);done+=count;advance(previous);
         }
+        starve(requested-done);
         // 自然停止後保留原逐 frame 乘法的 signed zero；串流耗盡仍保持填入的 +0。
         if(!playing && !streaming)for(std::size_t frame=done;frame<requested;++frame){out[frame*2]=0.F*left_gain;out[frame*2+1]=0.F*right_gain;}
         return;
@@ -72,9 +78,10 @@ void Buffer::render(std::span<float> out,unsigned output_rate) {
         const auto raw=static_cast<std::uint16_t>(pcm[at]|(static_cast<unsigned>(pcm[at+1])<<8));
         return static_cast<float>(static_cast<std::int16_t>(raw))/32768.0F;
     };
+    std::size_t missing=0;
     for(std::size_t i=0;i+1<out.size();i+=2){
         // 串流的 queue 耗盡時輸出靜音，保留播放狀態與讀取游標，讓 API 補入下一包。
-        if(streaming && cursor>=static_cast<double>(frames))continue;
+        if(streaming && cursor>=static_cast<double>(frames)){++missing;continue;}
         if(!playing){for(auto& effect:effects)effect->process(out[i],out[i+1],spatial_distance);out[i]*=left*spatial_left;out[i+1]*=right*spatial_right;rendered_peak=std::max({rendered_peak,std::abs(out[i]),std::abs(out[i+1])});continue;}
         const auto frame=static_cast<std::size_t>(cursor);
         out[i]=sample(frame,0);out[i+1]=sample(frame,channels==1?0:1);
@@ -86,5 +93,6 @@ void Buffer::render(std::span<float> out,unsigned output_rate) {
         cursor+=static_cast<double>(frequency)*doppler/output_rate;
         advance(previous);
     }
+    starve(missing);
 }
 }

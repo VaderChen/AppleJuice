@@ -10,7 +10,7 @@ struct MultimediaThreadTask {
     bool operator==(const MultimediaThreadTask&) const = default;
 };
 enum class ThreadStatus { Runnable, Waiting, Exited };
-enum class ThreadWaitKind { HeapRetry, Http, Resolver, SocketSelect, Objects, Sleep, Critical, CriticalRetry, Completion, CrtLock, StandardInput, ConsoleInput, GuiSend, GuiInput, Slim, Condition, Once, LoaderRetry, ProcessInputIdle, FileIo, RegisteredWait, RegisteredWaitCompletion, TimerQueueCompletion, RegistryNotify, ThreadpoolCompletion, PowerNotificationCompletion, EtwTrace, EtwEnable, DebugEvent, MediaFoundation, ServiceControl, CrtFileRetry, CrtProcess, CrtLockRetry, NativeDevice, Perflib };
+enum class ThreadWaitKind { HeapRetry, Http, Resolver, SocketSelect, Objects, Sleep, Critical, CriticalRetry, Completion, CrtLock, StandardInput, ConsoleInput, GuiSend, GuiInput, Slim, Condition, Once, LoaderRetry, ProcessInputIdle, FileIo, RegisteredWait, RegisteredWaitCompletion, TimerQueueCompletion, RegistryNotify, ThreadpoolCompletion, PowerNotificationCompletion, EtwTrace, EtwEnable, DebugEvent, MediaFoundation, ServiceControl, CrtFileRetry, CrtProcess, CrtLockRetry, NativeDevice, Perflib, HandleTransfer, ProcessCreation };
 struct ThreadWait {
     ThreadWaitKind kind{ThreadWaitKind::Objects};
     std::vector<std::uint64_t> handles;
@@ -63,6 +63,8 @@ struct GuestThread {
         const int base=background || process_class==0x40?4:process_class==0x4000?6:process_class==0x8000?10:process_class==0x80?13:8;
         return priority==-15?1:priority==15?15:std::clamp(base+priority+static_cast<int>(dynamic_priority_boost),1,15);
     }
+    // 等待剛完成而尚未 dispatch；與 Windows 可停用的動態優先序提升分開。
+    bool wake_pending{};
     std::uint32_t dynamic_priority_boost{};
     bool priority_boost_disabled{};
     std::uint32_t power_control{}, power_state{};

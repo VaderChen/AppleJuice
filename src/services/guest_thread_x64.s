@@ -132,6 +132,8 @@ entry AcquireSRWLockShared
     mov rax, qword ptr [rcx]
     test al, 3
     jne 1f
+    cmp rax, -4
+    je 1f
     lea rdx, [rax + 4]
     lock cmpxchg qword ptr [rcx], rdx
     jne 1f
@@ -166,6 +168,8 @@ entry TryAcquireSRWLockShared
     mov rax, qword ptr [rcx]
     test al, 3
     jne 1f
+    cmp rax, -4
+    je 1f
     lea rdx, [rax + 4]
     lock cmpxchg qword ptr [rcx], rdx
     jne 1f

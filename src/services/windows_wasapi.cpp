@@ -104,15 +104,47 @@ struct Stream {
     PcmWaveFormat format;bool initialized{},started{},locked{},closed{};
     std::shared_ptr<Session> session;
     std::uint32_t flags{},capacity{},requested{},category{},options{};
-    std::uint64_t data{},event{},clock_frames{},observed_frames{},event_frames{};
+    std::uint64_t data{},event{},clock_frames{},observed_frames{},event_origin_frames{},event_periods{};
     std::array<float,2> volumes{1,1};
+    // 診斷（X64ARM_TRACE_AUDIO=start／1／stats）：客體補資料與事件節奏，定位斷續來源。
+    struct Stats {std::uint64_t releases{},frames{},events{},catchups{},requested{};double max_release_gap{},max_event_gap{};
+        std::chrono::steady_clock::time_point last_release{},last_event{},last_report{};std::uint64_t starved{},runs{},thread{};int priority{},base_priority{};bool multimedia{};} stats;
 };
+// 共用模式緩衝的最小引擎週期數（預設 3）；X64ARM_WASAPI_MIN_PERIODS=2 供同引擎對照。
+std::uint64_t wasapi_min_periods(){static const std::uint64_t value=[] {const auto* v=std::getenv("X64ARM_WASAPI_MIN_PERIODS");
+    const auto parsed=v && *v?std::strtoull(v,nullptr,10):3ULL;return parsed>=1 && parsed<=20?parsed:3ULL;}();return value;}
+bool audio_stats_enabled(){static const bool value=[] {const auto* trace=std::getenv("X64ARM_TRACE_AUDIO");
+    return trace && (std::string_view(trace)=="start" || std::string_view(trace)=="1" || std::string_view(trace)=="stats");}();return value;}
+double elapsed_ms(std::chrono::steady_clock::time_point from,std::chrono::steady_clock::time_point to){
+    return from.time_since_epoch().count()?std::chrono::duration<double,std::milli>(to-from).count():0.0;}
 struct Object {
     Kind canonical{};std::uint32_t refs{1};std::map<Kind,std::uint64_t> pointers;std::shared_ptr<Stream> stream;std::shared_ptr<Session> session;unsigned count{};std::set<std::uint64_t> notifications;
     std::uint64_t activated{},handler{};std::uint32_t activation_result{};bool ready{};
     std::shared_ptr<EndpointInfo> endpoint;std::vector<EndpointInfo> items;
 };
 struct Entry {std::shared_ptr<Object> object;Kind kind;};
+// 共用引擎每秒 100 次處理；以累計 frame 算週期，不能用本次輪詢時刻重設相位。
+// 非整百取樣率（例如 22050 Hz）也保留分數，不逐週期截斷或累加 callback 尾差。
+constexpr std::uint64_t engine_periods_per_second=100;
+std::uint64_t periods_at(std::uint64_t frames,unsigned rate){
+    return frames/rate*engine_periods_per_second+frames%rate*engine_periods_per_second/rate;
+}
+std::uint64_t frames_at(std::uint64_t periods,unsigned rate){
+    return periods/engine_periods_per_second*rate+
+        (periods%engine_periods_per_second*rate+engine_periods_per_second-1)/engine_periods_per_second;
+}
+// 自動重設事件會合併多個到期週期；客體逐包填入時，尚有完整週期空間就保留一次追補通知。
+// 只在協調者更新 Windows 物件；音訊 callback 不碰客體記憶體、handle 或排程狀態。
+void signal_stream(Stream& s,RuntimeState& runtime,bool catchup=false){
+    const auto event=runtime.wait_objects.find(s.event);
+    if(event==runtime.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event)return;
+    event->second.set_signal(true);
+    if(audio_stats_enabled()){
+        const auto now=std::chrono::steady_clock::now();
+        s.stats.max_event_gap=std::max(s.stats.max_event_gap,elapsed_ms(s.stats.last_event,now));
+        s.stats.last_event=now;++s.stats.events;s.stats.catchups+=catchup;
+    }
+}
 void advance(Stream& s){
     auto& p=*s.pcm;
     if(s.started)s.clock_frames+=p.rendered_frames-s.observed_frames;
@@ -135,16 +167,44 @@ bool WindowsServices::wasapi_waiting() const {
     for(const auto& [pointer,entry]:wasapi_->objects){(void)pointer;if(entry.kind==Client && entry.object->stream->started)return true;}
     return false;
 }
+std::uint64_t WindowsServices::wasapi_wakeup_ns() const {
+    if(!wasapi_)return 0;
+    std::uint64_t earliest=0;
+    for(const auto& [pointer,entry]:wasapi_->objects){
+        (void)pointer;if(entry.kind!=Client)continue;const auto& s=*entry.object->stream;
+        if(!s.started || !s.event)continue;
+        std::lock_guard lock(s.pcm->mutex);
+        const auto elapsed=s.clock_frames+s.pcm->rendered_frames-s.observed_frames-s.event_origin_frames;
+        const auto next=frames_at(s.event_periods+1,s.format.rate);
+        const auto remaining=next>elapsed?(next-elapsed)*UINT64_C(1000000000)/s.format.rate:1;
+        earliest=earliest?std::min(earliest,remaining):remaining;
+    }
+    return earliest;
+}
 void WindowsServices::poll_wasapi(){
     if(!wasapi_)return;
     for(const auto& [pointer,entry]:wasapi_->objects){
         (void)pointer;if(entry.kind!=Client)continue;auto& s=*entry.object->stream;
         std::lock_guard lock(s.pcm->mutex);advance(s);
-        const auto period=std::max(1U,s.format.rate/100);
-        if(s.started && s.event && s.clock_frames-s.event_frames>=period){
-            s.event_frames=s.clock_frames;
-            const auto event=runtime_.wait_objects.find(s.event);
-            if(event!=runtime_.wait_objects.end() && event->second.kind==WaitObject::Kind::Event)event->second.set_signal(true);
+        const auto periods=s.initialized?periods_at(s.clock_frames-s.event_origin_frames,s.format.rate):0;
+        if(s.started && s.event && periods>s.event_periods){
+            s.event_periods=periods;
+            signal_stream(s,runtime_);
+        }
+        if(audio_stats_enabled() && s.started){
+            const auto now=std::chrono::steady_clock::now();
+            if(!s.stats.last_report.time_since_epoch().count())s.stats.last_report=now;
+            else if(now-s.stats.last_report>=std::chrono::seconds(2)){
+                auto& p=*s.pcm;
+                std::fprintf(stderr,"wasapi_stats pid=%d stream=%p clock=%llu releases=%llu frames=%llu events=%llu max_release_gap_ms=%.1f max_event_gap_ms=%.1f starved_frames=%llu starved_runs=%llu padding=%zu capacity=%u catchup_events=%llu thread=%llu priority=%d base_priority=%d multimedia=%d unix_ms=%lld\n",
+                    static_cast<int>(::getpid()),static_cast<const void*>(&s),static_cast<unsigned long long>(s.clock_frames),static_cast<unsigned long long>(s.stats.releases),
+                    static_cast<unsigned long long>(s.stats.frames),static_cast<unsigned long long>(s.stats.events),s.stats.max_release_gap,s.stats.max_event_gap,
+                    static_cast<unsigned long long>(p.starved_frames-s.stats.starved),static_cast<unsigned long long>(p.starved_runs-s.stats.runs),
+                    p.pcm.size()/p.frame_bytes(),s.capacity,static_cast<unsigned long long>(s.stats.catchups),static_cast<unsigned long long>(s.stats.thread),s.stats.priority,s.stats.base_priority,s.stats.multimedia?1:0,
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
+                s.stats.starved=p.starved_frames;s.stats.runs=p.starved_runs;s.stats.releases=s.stats.frames=s.stats.events=s.stats.catchups=0;
+                s.stats.max_release_gap=s.stats.max_event_gap=0;s.stats.last_report=now;
+            }
         }
     }
 }
@@ -407,11 +467,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                         auto& weak=bridge.sessions[session_id];auto session=weak.lock();
                         if(!session){session=std::make_shared<Session>();weak=session;}
                         session->streams.reserve(session->streams.size()+1);
-                        const auto frames=std::max<std::uint64_t>(f->rate/100,(arg(3)*f->rate+9999999)/10000000);
+                        // 單一共用佇列須同時容納正在播放與等待客體補回的週期。
+                        // 一個週期的容量會在通知時剛好歸零，任何合法的喚醒／填充延遲都產生缺口。
+                        // 依引擎處理週期決定最小容量，較大的客體要求仍完整保留。
+                        // Core Audio 每次 callback 拉的量大於一個週期（44.1 kHz 約 470 frames），兩個週期拉完只剩 412 frames，
+                        // 客體補資料晚過約 21 ms 就缺 58 frames 的整數倍（DQ3 實測）；預設三個週期，可容忍約 32 ms。
+                        const auto frames=std::max<std::uint64_t>(frames_at(wasapi_min_periods(),f->rate),(arg(3)*f->rate+9999999)/10000000);
                         const auto data=allocate_heap(memory,frames*f->align);if(!data)throw std::bad_alloc{};
                         try{pcm.channels=f->channels;pcm.bits=f->bits;pcm.floating=f->floating;pcm.rate=pcm.frequency=f->rate;pcm.streaming=true;s.output=audio::open_output(s.pcm,s.device);}catch(const std::runtime_error&){(void)free_heap(memory,data,state);result=0x8889000fU;}
                         if(!result){s.data=data;s.capacity=static_cast<std::uint32_t>(frames);s.format=*f;s.flags=d(2);s.initialized=true;s.observed_frames=pcm.rendered_frames;s.session=std::move(session);s.session->streams.push_back(object->stream);
-                            trace_audio_event("initialize",&s,f->rate);update_session(s.session);}
+                            trace_audio_event("initialize",&s,f->rate);update_session(s.session);
+                            if(audio_stats_enabled())std::fprintf(stderr,"wasapi_init pid=%d stream=%p rate=%u channels=%u bits=%u flags=0x%x requested_hns=%llu period_hns=%llu capacity=%u\n",
+                                static_cast<int>(::getpid()),static_cast<const void*>(&s),f->rate,f->channels,f->bits,d(2),static_cast<unsigned long long>(arg(3)),
+                                static_cast<unsigned long long>(arg(4)),s.capacity);}
                     }
                 }else if(!s.initialized)result=not_initialized;
                 else if(name=="A_GetBufferSize")put(arg(1),s.capacity);
@@ -420,7 +488,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                 else if(name=="A_SetEventHandle"){
                     if(!(s.flags&0x40000U))result=0x88890011U;else if(s.started)result=not_stopped;else {const auto event=runtime_.wait_objects.find(arg(1));if(event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event || !(event->second.access&2U))result=invalid;else s.event=arg(1);}
                 }else if(name=="A_Start"){
-                    if(s.started)result=not_stopped;else if((s.flags&0x40000U) && !s.event)result=0x88890014U;else {s.started=true;pcm.playing=true;s.observed_frames=pcm.rendered_frames;s.event_frames=s.clock_frames;update_session(s.session);trace_audio_event("start",&s);}
+                    if(s.started)result=not_stopped;else if((s.flags&0x40000U) && !s.event)result=0x88890014U;else {s.started=true;pcm.playing=true;s.observed_frames=pcm.rendered_frames;s.event_origin_frames=s.clock_frames;s.event_periods=0;update_session(s.session);trace_audio_event("start",&s);}
                 }else if(name=="A_Stop"){
                     if(!s.started)result=1;else {
                         s.started=false;pcm.playing=false;
@@ -428,7 +496,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                         if(const auto trace=std::getenv("X64ARM_TRACE_AUDIO");trace && std::string_view(trace)=="1")std::cerr<<"wasapi_output channels="<<s.format.channels<<" rate="<<s.format.rate<<" source_bits="<<s.format.bits<<" frames="<<s.clock_frames<<" peak_left="<<pcm.rendered_left_peak<<" peak_right="<<pcm.rendered_right_peak<<'\n';
                     }
                 }
-                else if(name=="A_Reset"){if(s.started)result=not_stopped;else if(s.locked)result=operation_pending;else {pcm.pcm.clear();pcm.cursor=0;s.clock_frames=s.event_frames=0;}}
+                else if(name=="A_Reset"){if(s.started)result=not_stopped;else if(s.locked)result=operation_pending;else {pcm.pcm.clear();pcm.cursor=0;s.clock_frames=s.event_origin_frames=s.event_periods=0;}}
                 else if(name=="A_GetService"){
                     out(2);const auto iid=guid(arg(1));Kind service_kind=Factory;
                     for(Kind k:{Render,Clock,Volume,SessionControl})if(iid==interfaces[k])service_kind=k;
@@ -463,6 +531,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                             }
                         }
                         pcm.pcm.insert(pcm.pcm.end(),bytes.begin(),bytes.end());s.locked=false;s.requested=0;
+                        if(frames && s.started && s.event &&
+                           s.capacity-pcm.pcm.size()/pcm.frame_bytes()>=frames_at(1,s.format.rate))
+                            signal_stream(s,runtime_,true);
+                        if(audio_stats_enabled() && frames){const auto now=std::chrono::steady_clock::now();if(s.started)s.stats.max_release_gap=std::max(s.stats.max_release_gap,elapsed_ms(s.stats.last_release,now));s.stats.last_release=now;++s.stats.releases;s.stats.frames+=frames;
+                            const auto& thread=threads_.items.at(threads_.current);s.stats.thread=threads_.current;
+                            s.stats.priority=thread.effective_priority(runtime_.process_priority_class,runtime_.process_background);s.stats.multimedia=thread.multimedia.handle!=0;s.stats.base_priority=thread.priority;}
                     }
                 }else if(name=="C_GetFrequency")put(arg(1),wasapi_mix_rate(),64); // 端點時鐘頻率即混音取樣率
                 else if(name=="C_GetPosition"){check(arg(1),8);if(arg(2))check(arg(2),8);put(arg(1),s.clock_frames,64);if(arg(2))put(arg(2),runtime_.clock_ticks,64);}

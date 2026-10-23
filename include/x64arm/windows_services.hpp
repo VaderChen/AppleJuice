@@ -482,6 +482,7 @@ private:
     std::optional<std::uint32_t> process_thread_control(GuestMemory&,std::uint64_t,std::uint32_t,std::uint32_t&);
     std::uint32_t local_process_thread_control(std::uint32_t,std::uint32_t&);
     std::uint32_t remote_process_thread_control(GuestMemory&,std::uint32_t,std::uint32_t,std::uint32_t&);
+    std::uint32_t begin_remote_process_thread_control(std::uint32_t,std::uint64_t,std::uint32_t,std::uint64_t&);
     std::optional<std::uint32_t> process_thread_target(GuestMemory&,std::uint64_t,std::uint32_t,std::uint32_t&,std::uint64_t* = nullptr);
     std::uint32_t process_memory_target(GuestMemory&,std::uint64_t,std::uint32_t,std::uint32_t&,std::uint64_t&);
     std::uint32_t process_basic_information(GuestMemory&,std::uint64_t,std::array<std::uint64_t,5>&,std::uint32_t&,std::uint32_t&);
@@ -658,7 +659,9 @@ private:
     std::vector<PendingFileIo> pending_file_io_;
     PipeResult read_directory_notification(const PendingFileIo&,GuestMemory&);
     bool close_process(std::uint64_t);
-    bool create_guest_process(GuestMemory&,const std::array<std::uint64_t,10>&,bool,bool = false,std::uint64_t = 0,unsigned = 0);
+    bool create_guest_process(GuestMemory&,const std::array<std::uint64_t,10>&,bool,bool = false,std::uint64_t = 0,unsigned = 0,unsigned = 0);
+    bool finish_guest_process_creation(GuestState&,GuestMemory&,std::uint64_t);
+    void cancel_guest_process_creation(std::uint64_t);
     std::uint32_t query_association(std::uint32_t,std::uint32_t,std::u16string,const std::u16string&,std::u16string&);
     std::optional<std::uint32_t> invoke_shell_execute(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_shell_item(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -963,6 +966,7 @@ private:
     std::optional<std::uint32_t> invoke_wasapi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void poll_wasapi();
     bool wasapi_waiting() const;
+    std::uint64_t wasapi_wakeup_ns() const;
     std::shared_ptr<DirectInputState> dinput_;
     std::optional<std::uint32_t> invoke_dinput(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     void poll_dinput(bool background=false);
@@ -1247,6 +1251,8 @@ private:
     void import_transfer_handle(const InheritedHandle&);
     void close_transfer_handle(GuestMemory&,std::uint64_t);
     std::optional<std::uint32_t> duplicate_remote_handle(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    bool finish_duplicate_remote_handle(GuestState&,GuestMemory&,std::uint64_t);
+    void cancel_duplicate_remote_handle(GuestMemory&,std::uint64_t);
     bool mapping_handle(std::uint64_t) const;
     bool shared_mapping_page(std::uint64_t) const;
     struct MappingViewInfo {std::uint64_t base{},size{};std::uint32_t protection{};};
