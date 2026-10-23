@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "guest_crt_state.h"
 #include "guest_heap_layout.hpp"
+#include "guest_tls.hpp"
 #include "windows_loader_lock.hpp"
 #include "x64arm/startup_profile.hpp"
 #include "service_descriptor_index.hpp"
@@ -1628,6 +1629,16 @@ std::optional<std::uint32_t> WindowsServices::finish_process(GuestState& state, 
     if (callbacks.empty()) {record_job_exit(code);(void)emit_debug_event(state,memory,debugger::ExitProcess{code});return code;}
     runtime_.exiting = true; start_loader_callbacks(state, memory, std::move(callbacks), Continuation::Exit, code); return std::nullopt;
 }
+void WindowsServices::set_tls_allocation(GuestMemory& memory,std::size_t index,bool used) {
+    // Alloc／Free 為協調生命週期邊界，所有 resident worker 在恢復前看見相同配置狀態。
+    // 先發布客體鏡像再更新 provider；鏡像寫入若故障，不留下只改了宿主的半套狀態。
+    if(guest_tls_bitmap_.value){
+        const auto address=GuestAddress{guest_tls_bitmap_.value+index/8};
+        const auto previous=memory.load(address,8),mask=UINT64_C(1)<<(index%8);
+        memory.store(address,8,used?previous|mask:previous&~mask);
+    }
+    runtime_.tls_used[index]=used;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
     // 字元家族的操作已由不可變 descriptor 索引；完整與常駐入口共用 locale／ABI 實作。
     if(crt_character_requested() && crt_character_operation(service))return invoke_crt_character(state,memory,service);
@@ -1832,7 +1843,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         const auto written=write_crt_stream(memory,runtime_base_.value+0x800+stream*128,std::span(reinterpret_cast<const std::uint8_t*>(text.data()),text.size()));
         result=written==text.size()?written:UINT32_MAX;
     };
-    const auto tls_offset=[&](std::size_t index){const auto unit=x86_?4U:8U;return index<64?(x86_?0xe10U:0x1480U)+index*unit:0x2000+(index-64)*unit;};
+    const auto tls_offset=[&](std::size_t index){return detail::tls_slot_offset(x86_,index);};
     const auto tls_slot = [&](std::size_t index) { return GuestAddress{(x86_?state.fs_base:state.gs_base)+tls_offset(index)}; };
     const auto clear_tls_slot = [&](std::size_t index) {
         runtime_.tls_values[index]=0;
@@ -1869,15 +1880,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         }
     } else if (symbol == "TlsAlloc") {
         result = UINT32_MAX;
-        for (std::size_t i = 0; i < runtime_.tls_used.size(); ++i) if (!runtime_.tls_used[i]) { runtime_.tls_used[i] = true;
+        for (std::size_t i = 0; i < runtime_.tls_used.size(); ++i) if (!runtime_.tls_used[i]) { set_tls_allocation(memory,i,true);
             clear_tls_slot(i); result = i; break; }
         if (result == UINT32_MAX) last_error_ = 8;
     } else if (symbol == "TlsGetValue" || symbol == "TlsGetValue2" || symbol == "TlsSetValue" || symbol == "TlsFree") {
         const auto index = static_cast<std::uint32_t>(arg(0));
         const bool reading=symbol=="TlsGetValue" || symbol=="TlsGetValue2";
-        if (index >= runtime_.tls_used.size() || (!reading && !runtime_.tls_used[index])) {if(symbol=="TlsGetValue2")result=0;else fail(87);}
+        // Windows TlsSetValue 對低 64 槽採最小驗證；Free 仍須是已配置槽。
+        const bool valid=index<runtime_.tls_used.size() && (reading || (symbol=="TlsSetValue"?
+            detail::tls_writable_index(index,runtime_.tls_used):runtime_.tls_used[index]));
+        if (!valid) {if(symbol=="TlsGetValue2")result=0;else fail(87);}
         else if (reading) { if(symbol=="TlsGetValue")last_error_ = 0; result = runtime_.image.base ? memory.load(tls_slot(index), x86_?32:64) : runtime_.tls_values[index]; }
-        else if (symbol == "TlsFree") { runtime_.tls_used[index] = false; clear_tls_slot(index); result = 1; }
+        else if (symbol == "TlsFree") { set_tls_allocation(memory,index,false); clear_tls_slot(index); result = 1; }
         else { runtime_.tls_values[index] = arg(1); if (runtime_.image.base) memory.store(tls_slot(index), x86_?32:64, arg(1)); result = 1; }
     } else if (symbol == "Sleep") { if (arg(0)) throw HostCallFault("單執行緒模式尚不支援等待其他執行緒的 Sleep"); }
     else if (symbol == "SetUnhandledExceptionFilter" || symbol=="__crtSetUnhandledExceptionFilter") { result = runtime_.unhandled_filter; runtime_.unhandled_filter = arg(0); }

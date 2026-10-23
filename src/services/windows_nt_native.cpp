@@ -66,6 +66,8 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         {"ntdll.dll","RtlAnsiStringToUnicodeString",3,0,0,0x4},{"ntdll.dll","RtlCompareUnicodeString",3,0,0,0x4},{"ntdll.dll","RtlEqualUnicodeString",3,0,0,0x4},
         {"ntdll.dll","RtlFreeUnicodeString",1},{"ntdll.dll","RtlGetLastNtStatus",0}
         ,{"ntdll.dll","LdrLockLoaderLock",3,0,0,1},{"ntdll.dll","LdrUnlockLoaderLock",2,0,0,1}
+        ,{"ntdll.dll","LdrLoadDll",4},{"ntdll.dll","LdrGetDllHandle",4},{"ntdll.dll","LdrGetProcedureAddress",4,0,0,0x4},{"ntdll.dll","LdrUnloadDll",1}
+        ,{"ntdll.dll","RtlAreLongPathsEnabled",0}
     };return table;
 }
 std::map<std::uint64_t,std::uint32_t> WindowsServices::builtin_system_calls() const {
@@ -198,6 +200,36 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             last_error_=0;
             return start("kernel32.dll","InitOnceExecuteOnce",{call(0),call(1),call(2),call(3)});
         }
+        if(name=="RtlAreLongPathsEnabled")return finish(0); // 預設登錄 LongPathsEnabled=0。
+        if(name=="LdrGetDllHandle"){
+            // (PathToFile, Flags, ModuleFileName, *ModuleHandle)：只查詢已載入模組，不載入。
+            if(!call(2) || !call(3))return finish(0xc000000dU);
+            const auto handle=find_module(native_string(memory,call(2),x86_));
+            if(!handle)return finish(0xc0000135U);
+            memory.check(GuestAddress{call(3)},unit,Access::Write);memory.store(GuestAddress{call(3)},bits,handle);return finish(0);
+        }
+        if(name=="LdrLoadDll"){
+            // (PathToFile, Flags, ModuleFileName, *ModuleHandle)：以 LoadLibraryExW 流程載入（含 DllMain 排程），完成後寫回 handle。
+            if(!call(2) || !call(3))return finish(0xc000000dU);
+            const auto module_name=native_string(memory,call(2),x86_);if(module_name.empty())return finish(0xc000000dU);
+            memory.check(GuestAddress{call(3)},unit,Access::Write);
+            const auto encoded=utf16_bytes(module_name);const auto buffer=scratch(encoded.size()+2);memory.write(GuestAddress{buffer},encoded);
+            return start("kernel32.dll","LoadLibraryExW",{buffer,0,0});
+        }
+        if(name=="LdrGetProcedureAddress"){
+            // (ModuleHandle, PANSI_STRING Name, Ordinal, *Address)：名稱優先，否則依序數。
+            if(!call(0) || !call(3))return finish(0xc000000dU);
+            memory.check(GuestAddress{call(3)},unit,Access::Write);
+            std::uint64_t lookup=call(2)&0xffffU;
+            if(call(1)){
+                const auto length=memory.load(GuestAddress{call(1)},16),source=memory.load(GuestAddress{call(1)+unit},bits);
+                if(length && !source)return finish(0xc000000dU);
+                std::vector<std::uint8_t> bytes;for(std::uint64_t n=0;n<length;++n)bytes.push_back(static_cast<std::uint8_t>(memory.load(GuestAddress{source+n},8)));
+                lookup=scratch(bytes.size()+1);memory.write(GuestAddress{lookup},bytes);
+            }
+            return start("kernel32.dll","GetProcAddress",{call(0),lookup});
+        }
+        if(name=="LdrUnloadDll"){if(!call(0))return finish(0xc000000dU);return start("kernel32.dll","FreeLibrary",{call(0)});}
         if(name=="LdrLockLoaderLock" || name=="LdrUnlockLoaderLock"){
             const auto flags=static_cast<std::uint32_t>(call(0));
             const auto loader_error=[&](std::uint32_t status){
@@ -356,7 +388,10 @@ std::optional<std::uint32_t> WindowsServices::resume_nt_native(GuestState& state
         if(status==0x103U){const auto pending=std::find_if(pending_file_io_.begin(),pending_file_io_.end(),[&](const auto& io){return io.overlapped==op.scratch+64 && !io.done;});
             if(pending==pending_file_io_.end())throw HostCallFault("NT 待命 I/O 缺少共用要求");pending->native_iosb=a[4];pending->native_context=a[3];pending->native_scratch=op.scratch;pending->routine=a[2];keep_scratch=true;
         }else if(a[2] && (!status || status==0xc0000011U || status==0x80000005U)){threads_.items.at(threads_.current).apcs.push_back({a[2],{a[3],a[4],0}});threads_.yield=true;}
-    }else status=value?0:status;
+    }else if(name=="LdrLoadDll"){status=value?0:(last_error_==126?0xc0000135U:last_error_==193?0xc000007bU:status);if(value)memory.store(GuestAddress{a[3]},bits,value);}
+    else if(name=="LdrGetProcedureAddress"){status=value?0:0xc0000139U;if(value)memory.store(GuestAddress{a[3]},bits,value);}
+    else if(name=="LdrUnloadDll")status=value?0:0xc0000135U;
+    else status=value?0:status;
     if(op.scratch && !keep_scratch)(void)free_heap(memory,op.scratch,state);last_error_=op.saved_error;threads_.items.at(threads_.current).last_native_status=status;complete_call(state,memory,status);return std::nullopt;
 }
 }

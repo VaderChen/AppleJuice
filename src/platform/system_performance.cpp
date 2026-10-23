@@ -1,5 +1,7 @@
 #include "x64arm/system_performance.hpp"
 #include <algorithm>
+#include <chrono>
+#include <mutex>
 #include <fstream>
 #include <string>
 #if !defined(_WIN32)
@@ -81,8 +83,15 @@ SystemPerformance native_system_performance(){
     const auto host=mach_host_self();vm_size_t host_page=0;vm_statistics64_data_t statistics{};mach_msg_type_number_t count=HOST_VM_INFO64_COUNT;
     const auto page_status=host_page_size(host,&host_page);const auto vm_status=host_statistics64(host,HOST_VM_INFO64,reinterpret_cast<host_info64_t>(&statistics),&count);
     (void)mach_port_deallocate(mach_task_self(),host);
-    std::uint64_t physical=0;std::size_t physical_size=sizeof physical;struct xsw_usage swap{};std::size_t swap_size=sizeof swap;
-    if(page_status!=KERN_SUCCESS || vm_status!=KERN_SUCCESS || !host_page || ::sysctlbyname("hw.memsize",&physical,&physical_size,nullptr,0) || ::sysctlbyname("vm.swapusage",&swap,&swap_size,nullptr,0)){result.error=50;return result;}
+    // hw.memsize 固定不變、vm.swapusage 的 sysctl 約 0.2～0.3 ms 且變化緩慢：分別永久與每 2 秒快取一次，
+    // 讓 GlobalMemoryStatusEx 之類每幀查詢只付 host_statistics64 的成本。
+    static std::mutex cache_mutex;static std::uint64_t cached_physical=0;static struct xsw_usage cached_swap{};static std::chrono::steady_clock::time_point swap_at{};static bool swap_valid=false;
+    std::uint64_t physical=0;struct xsw_usage swap{};bool sysctl_failed=false;
+    {std::lock_guard lock(cache_mutex);const auto now=std::chrono::steady_clock::now();
+        if(!cached_physical){std::size_t physical_size=sizeof cached_physical;if(::sysctlbyname("hw.memsize",&cached_physical,&physical_size,nullptr,0))cached_physical=0;}
+        if(!swap_valid || now-swap_at>std::chrono::seconds(2)){std::size_t swap_size=sizeof cached_swap;if(::sysctlbyname("vm.swapusage",&cached_swap,&swap_size,nullptr,0))swap_valid=false;else {swap_valid=true;swap_at=now;}}
+        physical=cached_physical;swap=cached_swap;sysctl_failed=!cached_physical || !swap_valid;}
+    if(page_status!=KERN_SUCCESS || vm_status!=KERN_SUCCESS || !host_page || sysctl_failed){result.error=50;return result;}
     const auto pages=[&](std::uint64_t value){return value*host_page/4096;};
     // Darwin 沒有 NT commit reservation／paged-pool。以匿名、壓縮與 wired VM 的實測值
     // 映射負載；不是 Windows 開機以來的精確 commit／pool accounting。

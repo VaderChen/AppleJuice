@@ -262,6 +262,7 @@ std::span<const WindowsServiceDescriptor> thread_service_descriptors() {
                                                       {"kernel32.dll", "SetThreadIdealProcessor", 2},
                                                       {"kernel32.dll", "GetExitCodeThread", 2},
                                                       {"kernel32.dll", "GetThreadId", 1},
+                                                      {"kernel32.dll", "GetProcessIdOfThread", 1},
                                                       {"kernel32.dll", "FreeLibraryAndExitThread", 2},
                                                       {"kernel32.dll", "SetThreadDescription", 2},
                                                       {"kernel32.dll", "GetThreadDescription", 2},
@@ -987,11 +988,11 @@ void WindowsServices::after_instructions(GuestState &state, GuestMemory &memory,
         // 物件等待轉為 Runnable，讓保留中的 worker 可立即接手。共用解析
         // 保留 WaitAll、訊號消耗與返回值，不輪詢外部裝置或強迫客體切換。
         const bool changed=resolve_thread_waits(memory,ThreadWakeScope::Objects);
-        // 只有實際等待／排程狀態改變才撤銷目前服務的續行資格。空掃描
-        // 不代表發生排程事件，不能讓每次 Heap／CRT 計算服務都退出常駐本體。
-        // 舊通知政策僅供同成品比較；時間片、外部通知及完整 API 前置保持原契約。
+        // 精確通知候選只在等待／排程狀態改變時撤銷續行資格；仍待效能驗收，
+        // 預設沿用舊通知政策，明確設定 X64ARM_RESIDENT_PRECISE_WAKE 非 0 才啟用。
+        // 時間片、外部通知及完整 API 前置保持原契約。
         static const bool precise_wake=[] {const auto* value=std::getenv("X64ARM_RESIDENT_PRECISE_WAKE");
-            return !value || std::string_view(value)!="0";}();
+            return value && *value && std::string_view(value)!="0";}();
         const bool notify=changed || !precise_wake;
         if(notify)notify_concurrency_changed();
         static const bool trace_wake=std::getenv("X64ARM_TRACE_RESIDENT_WAKE")!=nullptr;
@@ -2594,7 +2595,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
         }
     }
     const auto thread_required =
-        symbol == "GetThreadId" || symbol == "GetExitCodeThread" || symbol == "QueryThreadCycleTime" ? 0x840U
+        symbol == "GetThreadId" || symbol == "GetProcessIdOfThread" || symbol == "GetExitCodeThread" || symbol == "QueryThreadCycleTime" ? 0x840U
         : symbol == "SetThreadAffinityMask" || symbol == "SetThreadIdealProcessor"                   ? 0x20U
         : symbol == "SuspendThread" || symbol == "ResumeThread"                                      ? 2U
         : symbol == "GetThreadContext"                                                               ? 8U
@@ -3616,6 +3617,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             auto &thread = threads_.items.at(id);
             if (symbol == "GetThreadId")
                 result = thread_identifier(id);
+            else if (symbol == "GetProcessIdOfThread")
+                result = process_id(); // 執行緒 handle 只涵蓋本程序的執行緒。
             else if (symbol == "GetExitCodeThread") {
                 memory.store(GuestAddress{arg(1)}, 32, thread.status == ThreadStatus::Exited ? thread.exit_code : 259);
                 result = 1;

@@ -4,6 +4,33 @@ struct MetalBufferBacking final:GraphicsObject {
     id<MTLBuffer> buffer;
     std::shared_ptr<GpuMemoryReservation> lease;
 };
+// D3D11 pipeline 狀態的快取鍵：以固定寬度的二進位欄位串接，取代每次繪圖的 ostringstream 格式化（DQ3 每次 DrawIndexed 約 42 µs 的主要成分）。
+// 鍵只作 map 查找與串接，不被解析；相同欄位序列產生相同位元組。
+struct MetalPipelineKey {
+    std::string bytes;
+    MetalPipelineKey(){bytes.reserve(512);}
+    template<class T> requires (std::is_integral_v<T> || std::is_enum_v<T>) && (!std::is_same_v<T,char>)
+    MetalPipelineKey& operator<<(T value){const auto raw=static_cast<std::uint64_t>(static_cast<std::int64_t>(value));bytes.append(reinterpret_cast<const char*>(&raw),sizeof raw);return *this;}
+    MetalPipelineKey& operator<<(char value){bytes.push_back(value);return *this;}
+    MetalPipelineKey& operator<<(const char* text){bytes.append(text);bytes.push_back('\0');return *this;}
+    MetalPipelineKey& operator<<(const std::string& text){bytes.append(text);bytes.push_back('\0');return *this;}
+    MetalPipelineKey& operator<<(float value){bytes.append(reinterpret_cast<const char*>(&value),sizeof value);return *this;}
+    MetalPipelineKey& operator<<(double value){bytes.append(reinterpret_cast<const char*>(&value),sizeof value);return *this;}
+    const std::string& str()const{return bytes;}
+};
+// DISCARD 更換 backing 時回收舊 buffer：舊 buffer 在 GPU 用完（flight 退役）後進入池，下一次同長度的更換直接取用，
+// 省掉 newBufferWithLength＋整段清零＋額度保留。池上限 64 MiB，超出即照常釋放。
+struct MetalBufferPool {
+    struct Entry {id<MTLBuffer> buffer;std::shared_ptr<GpuMemoryReservation> lease;};
+    std::multimap<std::size_t,Entry> free;std::size_t bytes{};std::uint64_t hits{},puts{},drops{};
+    static constexpr std::size_t limit=64U<<20;
+    std::optional<Entry> take(std::size_t length){auto it=free.find(length);if(it==free.end())return std::nullopt;auto entry=std::move(it->second);free.erase(it);bytes-=length;++hits;return entry;}
+    void put(id<MTLBuffer> buffer,std::shared_ptr<GpuMemoryReservation> lease){
+        const auto length=static_cast<std::size_t>(buffer.length);
+        if(!length || bytes+length>limit){++drops;return;}
+        free.emplace(length,Entry{buffer,std::move(lease)});bytes+=length;++puts;
+    }
+};
 class MetalPendingObjects {
     static bool indexed(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_RESOURCE_INDEX");return !text || std::string_view(text)!="0";}();return value;}
     std::vector<std::shared_ptr<GraphicsObject>> objects_;
@@ -21,6 +48,9 @@ struct MetalResource final:GraphicsResource {
     id<MTLBuffer> buffer;id<MTLTexture> texture;
     std::shared_ptr<GpuMemoryReservation> lease;
     std::shared_ptr<MetalBufferBacking> backing;
+    // 被 DISCARD 更換下來的舊 backing：最後一個持有者（flight 或更換點）釋放時交回池。
+    std::shared_ptr<MetalBufferPool> recycle;
+    ~MetalResource() override {if(recycle && buffer && !texture)recycle->put(buffer,std::move(lease));}
     // 常數 buffer 不允許 GPU 寫入綁定；保存最後排程的 CPU 內容，GPU copy 目的端必須失效。
     std::vector<std::uint8_t> constant_bytes;
     bool constant_bytes_valid{};

@@ -229,8 +229,27 @@ void MetalGl::graphics_write_buffer(const std::shared_ptr<GraphicsResource>& res
 }
 bool MetalGl::graphics_replace_buffer(const std::shared_ptr<GraphicsResource>& destination,std::span<const std::uint8_t> data){
     auto& resource=metal_resource(destination);
+    // 沒有待提交或在飛命令使用此 backing 時，DISCARD 可以直接就地寫入：舊內容不會再被 GPU 讀到。
+    if(!metal_backing_generation_enabled()){
+        reap();
+        const auto identity=metal_resource_use_identity(destination);
+        const bool in_use=graphics_pending_.contains(identity) || std::any_of(flights_.begin(),flights_.end(),[&](const auto& flight){return flight.objects.contains(identity);});
+        if(!in_use){
+            std::memcpy(resource.buffer.contents,data.data(),resource.desc.width);
+            resource.constant_bytes_valid=false;resource.remember_constant_bytes(data.first(resource.desc.width),0);
+            ++discard_in_place_;return true;
+        }
+    }
     std::shared_ptr<GraphicsResource> replacement;std::shared_ptr<MetalResource> previous;
-    try{replacement=graphics_resource(resource.desc);if(!metal_backing_generation_enabled())previous=std::make_shared<MetalResource>();}catch(const std::bad_alloc&){return false;}
+    try{
+        if(!metal_backing_generation_enabled()){
+            if(auto pooled=discard_pool_->take(static_cast<std::size_t>(resource.buffer.length))){
+                auto pooled_resource=std::make_shared<MetalResource>();pooled_resource->desc=resource.desc;pooled_resource->buffer=pooled->buffer;pooled_resource->lease=std::move(pooled->lease);replacement=pooled_resource;
+            }
+            previous=std::make_shared<MetalResource>();previous->recycle=discard_pool_;
+        }
+        if(!replacement)replacement=graphics_resource(resource.desc);
+    }catch(const std::bad_alloc&){return false;}
     auto& next=metal_resource(replacement);std::memcpy(next.buffer.contents,data.data(),resource.desc.width);
     next.remember_constant_bytes(data.first(resource.desc.width),0);
     // 保持客體 resource／view 身分；已編碼命令使用舊 backing，後續綁定使用新 backing。
@@ -481,7 +500,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         const auto s=static_cast<unsigned>(slots[e.slot]);vertex.attributes[input.attribute].format=metal_vertex_format(e.format);vertex.attributes[input.attribute].offset=e.offset;vertex.attributes[input.attribute].bufferIndex=s;vertex.layouts[s].stride=d.vertices[e.slot].stride;vertex.layouts[s].stepFunction=e.classification?MTLVertexStepFunctionPerInstance:MTLVertexStepFunctionPerVertex;vertex.layouts[s].stepRate=e.classification?std::max(1U,e.step):1;
     }
     if(!d.stages[0].shader->inputs.empty())desc.vertexDescriptor=vertex;
-    std::ostringstream key;key<<dynamic_cast<MetalShader&>(*d.stages[0].shader).serial<<':'<<(d.stages[1].shader?dynamic_cast<MetalShader&>(*d.stages[1].shader).serial:0)<<':'<<desc.sampleCount<<':'<<desc.depthAttachmentPixelFormat;
+    MetalPipelineKey key;key<<dynamic_cast<MetalShader&>(*d.stages[0].shader).serial<<':'<<(d.stages[1].shader?dynamic_cast<MetalShader&>(*d.stages[1].shader).serial:0)<<':'<<desc.sampleCount<<':'<<desc.depthAttachmentPixelFormat;
     for(unsigned i=0;i<d.targets.size();++i)key<<':'<<desc.colorAttachments[i].pixelFormat;key<<":alpha:"<<d.alpha_function<<':'<<d.alpha_reference;key<<":stencil:"<<desc.stencilAttachmentPixelFormat<<":input-topology:"<<metal_primitive_class(raster_topology);for(const auto& e:d.layout)key<<e.semantic<<':'<<e.index<<':'<<e.format<<':'<<e.slot<<':'<<e.offset<<':'<<e.classification<<':'<<e.step;for(const auto& v:d.vertices)key<<':'<<v.stride;for(auto b:d.blend)key<<':'<<unsigned(b);
     MetalTessellationDraw tessellation;
     if(tessellated){

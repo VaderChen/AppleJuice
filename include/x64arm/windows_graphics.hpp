@@ -130,6 +130,8 @@ public:
     // 提交目前已錄製的工作並回傳完成旗標：GPU 執行到此點（含先前所有提交）後旗標為 true。
     // 供 D3D11 事件查詢（End／GetData 輪詢）使用；不等待 GPU。預設後端同步等待後回傳已完成。
     virtual std::shared_ptr<const std::atomic<bool>> graphics_fence(){graphics_flush(true);return std::make_shared<std::atomic<bool>>(true);}
+    // 不提交：回傳「目前尚未提交的命令批次」完成旗標；呼叫端（D3D11 GetData 無 DONOTFLUSH 時）再決定何時 flush。
+    virtual std::shared_ptr<const std::atomic<bool>> graphics_fence_pending(){return graphics_fence();}
     virtual void graphics_flush(bool){throw std::runtime_error("後端缺少提交操作");}
 };
 std::uint32_t graphics_format_bytes(std::uint32_t format);

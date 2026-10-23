@@ -2,6 +2,7 @@
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/security_descriptor.hpp"
 #include <algorithm>
+#include <optional>
 #include <atomic>
 #include <filesystem>
 #include <cerrno>
@@ -504,25 +505,50 @@ std::uint64_t WindowsServices::installed_physical_memory(const GuestMemory& memo
 }
 std::uint32_t WindowsServices::memory_status_fields(GuestMemory& memory,std::array<std::uint64_t,6>& values) const{
     if(!runtime_.network.external_io)return 50;
-    const auto snapshot=native_system_performance();if(snapshot.error)return snapshot.error;
-    const auto unit=snapshot.pages[9];if(!unit || !snapshot.pages[3] || snapshot.pages[4]>snapshot.pages[3] || snapshot.pages[0]>snapshot.pages[1])return 13;
-    values[0]=snapshot.pages[3]*unit;values[1]=snapshot.pages[4]*unit;
-    values[2]=std::min<std::uint64_t>(snapshot.pages[1]*unit,memory.limit());
-    values[3]=std::min<std::uint64_t>((snapshot.pages[1]-snapshot.pages[0])*unit,memory.remaining_capacity());
+    auto& cache=memory_status_cache_;const auto now=std::chrono::steady_clock::now();
+    // 宿主實體記憶體快照（host_statistics64＋vm.swapusage sysctl 約 0.3 ms）每 100 ms 取一次；Windows 本身此 API 約 1 µs。
+    if(!cache.physical_valid || now-cache.physical_at>std::chrono::milliseconds(100)){
+        const auto snapshot=native_system_performance();cache.physical_at=now;cache.physical_valid=true;cache.physical_error=snapshot.error;
+        if(!snapshot.error){
+            const auto unit=snapshot.pages[9];if(!unit || !snapshot.pages[3] || snapshot.pages[4]>snapshot.pages[3] || snapshot.pages[0]>snapshot.pages[1])cache.physical_error=13;
+            else cache.physical={snapshot.pages[3]*unit,snapshot.pages[4]*unit,snapshot.pages[1]*unit,(snapshot.pages[1]-snapshot.pages[0])*unit};
+        }
+    }
+    if(cache.physical_error)return cache.physical_error;
+    values[0]=cache.physical[0];values[1]=cache.physical[1];
+    values[2]=std::min<std::uint64_t>(cache.physical[2],memory.limit());
+    values[3]=std::min<std::uint64_t>(cache.physical[3],memory.remaining_capacity());
     const auto limit=user_address_limit();constexpr std::uint64_t minimum=0x10000;
-    std::vector<std::pair<std::uint64_t,std::uint64_t>> ranges;
-    const auto add=[&](std::uint64_t begin,std::uint64_t size){
-        if(!size || begin>=limit)return;const auto end=begin+std::min(size,limit-begin);begin=std::max(begin,minimum);
-        if(begin<end)ranges.emplace_back(begin,end);
-    };
-    for(auto mapping=memory.next_mapping(GuestAddress{0});mapping;mapping=memory.next_mapping(GuestAddress{mapping->base.value+mapping->size}))add(mapping->base.value,mapping->size);
-    for(const auto& [base,region]:runtime_.virtual_regions)add(base,region.size);
-    add(runtime_.image.base,runtime_.image.size);
-    for(const auto& [base,module]:runtime_.loaded_modules){(void)base;add(module.image.base,module.image.size);}
-    for(const auto& [base,module]:runtime_.resource_modules){(void)base;add(module.image.base,module.image.size);}
-    std::sort(ranges.begin(),ranges.end());std::uint64_t used=0,last=minimum;
-    for(const auto& [begin,end]:ranges)if(end>last){used+=end-std::max(last,begin);last=end;}
-    values[4]=limit-minimum;values[5]=values[4]-used;return 0;
+    // 虛擬使用量在保留區數量、已配置容量或模組數量改變時重算（VirtualAlloc 保留後必須立即反映，見 memory_resource fixture），
+    // 否則最多 5 秒重用；5 萬個保留區時單次走訪約 2～4 ms，合併走訪避免每次排序。
+    if(!cache.valid || cache.regions!=runtime_.virtual_regions.size() || cache.capacity!=memory.remaining_capacity() ||
+       cache.modules!=runtime_.loaded_modules.size() || cache.resources!=runtime_.resource_modules.size() || now-cache.at>std::chrono::seconds(5)){
+        // 三個來源各自已排序（GuestMemory 映射、virtual_regions 的 std::map、少量模組映像），以合併方式累計聯集長度，不再建向量排序。
+        std::vector<std::pair<std::uint64_t,std::uint64_t>> modules;
+        const auto clip=[&](std::uint64_t begin,std::uint64_t size)->std::pair<std::uint64_t,std::uint64_t>{
+            if(!size || begin>=limit)return {0,0};const auto end=begin+std::min(size,limit-begin);begin=std::max(begin,minimum);return begin<end?std::pair{begin,end}:std::pair<std::uint64_t,std::uint64_t>{0,0};
+        };
+        const auto push_module=[&](std::uint64_t begin,std::uint64_t size){const auto range=clip(begin,size);if(range.second)modules.push_back(range);};
+        push_module(runtime_.image.base,runtime_.image.size);
+        for(const auto& [base,module]:runtime_.loaded_modules){(void)base;push_module(module.image.base,module.image.size);}
+        for(const auto& [base,module]:runtime_.resource_modules){(void)base;push_module(module.image.base,module.image.size);}
+        std::sort(modules.begin(),modules.end());
+        std::uint64_t used=0,last=minimum;
+        const auto consume=[&](std::pair<std::uint64_t,std::uint64_t> range){if(range.second>last){used+=range.second-std::max(last,range.first);last=range.second;}};
+        auto mapping=memory.next_mapping(GuestAddress{0});auto region=runtime_.virtual_regions.begin();std::size_t module_index=0;
+        while(true){
+            std::optional<std::pair<std::uint64_t,std::uint64_t>> next;unsigned source=0;
+            if(mapping){next=std::pair{mapping->base.value,std::uint64_t{mapping->size}};source=1;}
+            if(region!=runtime_.virtual_regions.end() && (!next || region->first<next->first)){next=std::pair{region->first,std::uint64_t{region->second.size}};source=2;}
+            if(module_index<modules.size() && (!next || modules[module_index].first<next->first)){next=std::pair{modules[module_index].first,modules[module_index].second-modules[module_index].first};source=3;}
+            if(!next)break;
+            if(source==1){consume(clip(next->first,next->second));mapping=memory.next_mapping(GuestAddress{mapping->base.value+mapping->size});}
+            else if(source==2){consume(clip(next->first,next->second));++region;}
+            else {consume(modules[module_index]);++module_index;}
+        }
+        cache.at=now;cache.regions=runtime_.virtual_regions.size();cache.capacity=memory.remaining_capacity();cache.modules=runtime_.loaded_modules.size();cache.resources=runtime_.resource_modules.size();cache.used=used;cache.valid=true;
+    }
+    values[4]=limit-minimum;values[5]=values[4]-cache.used;return 0;
 }
 std::uint32_t WindowsServices::refresh_memory_resource_notifications(bool force){
     if(!force && memory_resource_poll_deadline_>runtime_.clock_ticks)return 0;

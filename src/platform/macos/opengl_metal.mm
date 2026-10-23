@@ -20,6 +20,9 @@
 #include <cmath>
 #include <cstring>
 #include <set>
+#include <map>
+#include <optional>
+#include <type_traits>
 #include <unordered_set>
 #include <tuple>
 #include <deque>
@@ -100,6 +103,8 @@ class MetalGl final:public NativeOpenGlContext {
     std::uint64_t wait_count_{},wait_ns_{},resource_wait_count_{};
     std::uint64_t constant_upload_skips_{},constant_upload_saved_bytes_{};
     std::map<std::string,id<MTLRenderPipelineState>> graphics_pipelines_;
+    std::shared_ptr<MetalBufferPool> discard_pool_{std::make_shared<MetalBufferPool>()};std::uint64_t discard_in_place_{};
+    std::shared_ptr<std::atomic<bool>> commands_done_;
     #include "metal_state_cache.inc"
     std::map<std::array<unsigned,4>,std::shared_ptr<GraphicsResource>> discard_depth_;
     std::map<std::string,std::shared_ptr<MetalGeometryPipeline>> geometry_pipelines_;
@@ -160,7 +165,7 @@ class MetalGl final:public NativeOpenGlContext {
             flights_.emplace_back();auto& flight=flights_.back();flight.command=commands_;
             flight.leases=std::move(pending_leases_);flight.objects=std::move(graphics_pending_);
             // 完成旗標供 D3D11 事件查詢輪詢；回呼只寫旗標，不觸碰後端狀態。
-            flight.done=std::make_shared<std::atomic<bool>>(false);auto done=flight.done;
+            flight.done=commands_done_?std::move(commands_done_):std::make_shared<std::atomic<bool>>(false);commands_done_=nullptr;auto done=flight.done;
             [commands_ addCompletedHandler:^(id<MTLCommandBuffer>){done->store(true,std::memory_order_release);}];
             if(commands_gpu_work_)track_gpu_commands(commands_);[commands_ commit];commands_=nil;pending_leases_.clear();graphics_pending_.clear();pending_=0;++submissions_;
             flight_peak_=std::max(flight_peak_,flights_.size());
@@ -411,6 +416,13 @@ public:
     void graphics_flush(bool wait)override{flush(wait);}
     // 有待提交工作就提交；回傳最新 flight 的完成旗標（同一 queue 依序完成，涵蓋先前所有提交）。
     // 不為 fence 建立空命令緩衝：那會占用 flight 名額，上限一到 flush 就同步等待，與原本等 GPU 閒置無異。
+    // 查詢 End 不再逐次 commit：回傳目前 command buffer 的完成旗標，等 Present／GetData 或 flight 額度才提交。
+    std::shared_ptr<const std::atomic<bool>> graphics_fence_pending()override{
+        reap();
+        if(commands_){if(!commands_done_)commands_done_=std::make_shared<std::atomic<bool>>(false);return commands_done_;}
+        if(flights_.empty())return std::make_shared<std::atomic<bool>>(true);
+        return flights_.back().done;
+    }
     std::shared_ptr<const std::atomic<bool>> graphics_fence()override{@autoreleasepool{
         static const bool trace=std::getenv("X64ARM_TRACE_GRAPHICS_STATE")!=nullptr;
         const auto begin=trace?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};

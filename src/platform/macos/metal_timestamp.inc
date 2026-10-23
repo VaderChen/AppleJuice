@@ -15,5 +15,6 @@ std::shared_ptr<const GraphicsTimestampFuture> MetalGl::graphics_timestamp_futur
         (void)sample.reservation;
         future->value=value;future->done.store(true,std::memory_order_release);
     }];
-    flush(false);return future;
+    // 不在此提交：時間戳隨下一次 Present／GetData（無 DONOTFLUSH）或 flight 額度一起提交，避免每個 End 一個 command buffer。
+    return future;
 }}

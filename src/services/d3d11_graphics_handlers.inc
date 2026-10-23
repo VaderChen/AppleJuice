@@ -452,13 +452,16 @@
                 if(type==6 || type==7){auto stats=context->stream_statistics;submit(context,{[query,stats](auto&){query->stream_begin=*stats;}},false);}
                 if(type==1 || type==5){require(!binding(context,"Visibility"));const auto view=view_of(arg(1));submit(context,{[view,query](auto& native){query->query_ready=false;std::vector<std::uint8_t> zero(65536);native.graphics_write(view,zero,0,0);}},false);bind_one(context,"Visibility",arg(1));}
             }else if(symbol=="End"){
-                require(binding(context,"Predicate")!=arg(1));require(type==0 || type==2 || query->query_active);query->query_active=false;query->query_ready=false;query->query_fence.reset();query->query_timestamp.reset();const auto sequence=query->sequence;
+                require(binding(context,"Predicate")!=arg(1));require(type==0 || type==2 || query->query_active);query->query_active=false;query->query_ready=false;query->query_fence.reset();query->query_timestamp.reset();query->query_polls=0;const auto sequence=query->sequence;
                 // 事件查詢：提交後取完成旗標，GetData 輪詢旗標。Chromium／ANGLE 以此當 fence，每幀數十次；
                 // 同步等待 GPU 閒置會把 GPU 程序卡在每次 End（Steam 實測每次約 0.4 ms）。
                 if(std::getenv("X64ARM_TRACE_GRAPHICS_STATE")){static std::array<std::uint32_t,8> ends{};if(type<ends.size() && ++ends[type]%500==1)std::fprintf(stderr,"[d3d11_query_end] type=%u count=%u\n",type,ends[type]);}
-                if(type==0){submit(context,{[query](auto& native){std::fill(query->query_data.begin(),query->query_data.end(),0);put_word(query->query_data,0,1);query->query_fence=native.graphics_fence();}},false);}
+                if(type==0){submit(context,{[query](auto& native){std::fill(query->query_data.begin(),query->query_data.end(),0);put_word(query->query_data,0,1);query->query_fence=native.graphics_fence_pending();}},false);}
                 // 時間戳與 disjoint：在提交點記錄 GPU 時間戳，GetData 輪詢完成旗標後填入。
                 else if(type==2 || type==3){submit(context,{[query](auto& native){std::fill(query->query_data.begin(),query->query_data.end(),0);query->query_timestamp=native.graphics_timestamp_future();}},false);}
+                // 遮蔽／遮蔽判定：原本在 End 同步 flush 並讀回（UE4 每秒上百次、每次等 GPU 約 0.4 ms），
+                // 改為提交後取完成旗標，GetData 看到旗標完成才讀回累加；型別 6／7 仍走同步統計。
+                else if(type==1 || type==5){submit(context,{[query,sequence](auto& native){std::fill(query->query_data.begin(),query->query_data.end(),0);query->query_pending_sequence=sequence;query->query_fence=native.graphics_fence_pending();}},false);}
                 else submit(context,{[query,type,sequence,stats=context->stream_statistics](auto& native){
                     native.graphics_flush(true);std::fill(query->query_data.begin(),query->query_data.end(),0);
                     if(type==2){const auto stamp=native.graphics_timestamp();std::memcpy(query->query_data.data(),&stamp.ticks,8);}
@@ -469,14 +472,24 @@
                 }},false);
                 if(type==1 || type==5)bind_one(context,"Visibility",0);
             }else {require(!context->context_type);
-                if(query->query_fence && query->query_fence->load(std::memory_order_acquire)){query->query_ready=true;query->query_fence.reset();}
+                if(query->query_fence && query->query_fence->load(std::memory_order_acquire)){
+                    if(type==1 || type==5){
+                        const auto samples=context->native->graphics_read(GraphicsView{query->resource});std::uint64_t total=0;
+                        for(unsigned i=0;i<query->query_pending_sequence && (i+1)*8<=samples.size();++i){std::uint64_t value=0;std::memcpy(&value,samples.data()+i*8,8);total+=value;}
+                        std::fill(query->query_data.begin(),query->query_data.end(),0);
+                        if(type==5)put_word(query->query_data,0,total?1U:0U);else std::memcpy(query->query_data.data(),&total,8);
+                    }
+                    query->query_ready=true;query->query_fence.reset();
+                }
                 if(query->query_timestamp && query->query_timestamp->done.load(std::memory_order_acquire)){
                     const auto& stamp=query->query_timestamp->value;
                     if(type==2)std::memcpy(query->query_data.data(),&stamp.ticks,8);
                     else {std::memcpy(query->query_data.data(),&stamp.frequency,8);put_word(query->query_data,8,stamp.disjoint?1U:0U);}
                     query->query_ready=true;query->query_timestamp.reset();
                 }
-                if(!query->query_ready)result=1;else{require(!arg(2) || u32(3)==query->query_size);if(arg(2))memory.write(GuestAddress{arg(2)},query->query_data);}}
+                // D3D11 契約：GetData 沒帶 D3D11_ASYNC_GETDATA_DONOTFLUSH 就隱含提交；帶了也在連續輪詢 32 次後提交，避免永不完成。
+                if(!query->query_ready){if(!(u32(4)&1U) || ++query->query_polls>=32U){query->query_polls=0;context->native->graphics_flush(false);}result=1;}
+                else{require(!arg(2) || u32(3)==query->query_size);if(arg(2))memory.write(GuestAddress{arg(2)},query->query_data);}}
         }
         else if(symbol=="CreateDXGIFactory2"){
             graphics_handled=true;output(2);write_pointer(arg(2),0);const auto guid=read_guid(memory,arg(1));if(u32(0)&~1U)result=invalid;else if(!dxgi_factory_guid(guid) && guid!=IID_IUnknown)result=no_interface;else write_pointer(arg(2),create(Kind::Factory)->root);

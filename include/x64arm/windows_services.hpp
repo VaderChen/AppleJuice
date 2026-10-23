@@ -491,6 +491,9 @@ private:
     std::uint32_t memory_status_fields(GuestMemory&,std::array<std::uint64_t,6>&) const;
     std::uint32_t refresh_memory_resource_notifications(bool force=false);
     std::uint64_t memory_resource_poll_deadline_{UINT64_MAX};
+    // GlobalMemoryStatusEx 的虛擬位址使用量要走訪全部映射與保留區；UE4 等每幀查詢時以短期快取避免每次排序。
+    struct MemoryStatusCache {std::chrono::steady_clock::time_point at{},physical_at{};std::size_t regions{},modules{},resources{},capacity{};std::uint64_t used{};std::array<std::uint64_t,4> physical{};std::uint32_t physical_error{};bool valid{},physical_valid{};};
+    mutable MemoryStatusCache memory_status_cache_;
     std::uint32_t process_parent_id() const;
     std::uint32_t capture_process_snapshot(GuestMemory&,std::vector<ProcessSnapshot::Process>&);
     std::uint32_t local_process_information(std::uint32_t,std::array<std::uint64_t,5>&,std::uint32_t&,int);
@@ -1894,6 +1897,9 @@ private:
     GuestAddress guest_locale_lock_state_{};
     // Win32／Win64 TEB、TLS 與 pseudo handle 共用常式；只快取入口，不快取客體資料。
     GuestAddress guest_thread_routines_{};
+    // 程序共用配置位元圖；新執行緒沿用同一頁，Alloc／Free 只在協調生命週期邊界修改。
+    GuestAddress guest_tls_bitmap_{};
+    void set_tls_allocation(GuestMemory&,std::size_t index,bool used);
     // 客體 FlsGetValue 讀取的 TEB 鏡像（TEB+0x1840：128 個值與使用中位元圖；FlsData 指向它）。
     bool fls_mirror_{};
     void sync_fls_mirror(GuestMemory&,std::uint64_t teb,const std::array<std::uint64_t,128>& values) noexcept;

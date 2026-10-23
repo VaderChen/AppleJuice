@@ -4,6 +4,7 @@
 #include "monotonic_clock.hpp"
 #include "srw_trace.hpp"
 #include "guest_heap_layout.hpp"
+#include "guest_tls.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -137,7 +138,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     if(found==threads_.items.end() || found->second.teb!=(x86_?state.fs_base:state.gs_base))return false;
     auto& thread=found->second;const auto tid=found->first;const bool current=tid==threads_.current;
     const unsigned unit=x86_?4U:8U;
-    const auto error_offset=x86_?0x34U:0x68U;
+    const auto error_offset=static_cast<unsigned>(x86_?X64ARM_TLS_X86_ERROR_OFFSET:X64ARM_TLS_X64_ERROR_OFFSET);
     // 所有存取先驗證。native_window 排除 COW、可執行寫入、外部 backing 及跨映射；
     // 失敗留給協調者處理，不在 worker 內改變映射或吞掉客體例外。
     const auto pointer=[&](std::uint64_t address,unsigned size,unsigned access)->void* {
@@ -241,12 +242,13 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         else {put(error,static_cast<std::uint32_t>(first),4);if(current)last_error_=static_cast<std::uint32_t>(first);}
     }else if(symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue"){
         const auto index=static_cast<std::uint32_t>(first);const bool reading=symbol!="TlsSetValue";
-        if(index>=runtime_.tls_used.size() || (!reading && !runtime_.tls_used[index]) || !runtime_.image.base)return false;
-        const auto offset=index<64?(x86_?0xe10U:0x1480U)+index*unit:0x2000+(index-64)*unit;
+        if(index>=runtime_.tls_used.size() || (!reading && !detail::tls_writable_index(index,runtime_.tls_used)) || !runtime_.image.base)return false;
+        const auto offset=detail::tls_slot_offset(x86_,index);
         auto* slot=pointer(thread.teb+offset,unit,reading?1U:2U);if(!slot)return false;
         auto* error=symbol=="TlsGetValue"?pointer(thread.teb+error_offset,4,2):nullptr;
         if(symbol=="TlsGetValue" && !error)return false;
         if(reading){result=load(slot,unit);if(error){put(error,0,4);if(current)last_error_=0;}}
+        // PE 的 TLS 真值位於 TEB；陣列只保留非 PE provider／狀態相容性，不能覆寫客體直接寫入。
         else {put(slot,second,unit);(current?runtime_.tls_values:thread.tls_values)[index]=second;result=1;}
     }else if(symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue"){
         const auto index=static_cast<std::uint32_t>(first);const bool reading=symbol!="FlsSetValue";

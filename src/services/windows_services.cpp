@@ -7,6 +7,7 @@
 #include "guest_scalar_math_code.hpp"
 #include "guest_thread_code.hpp"
 #include "guest_thread_x86_code.hpp"
+#include "guest_tls.hpp"
 #include "guest_io_completion_code.hpp"
 #include "io_wait_policy.hpp"
 #include "x64arm/entry_runtime_profile.hpp"
@@ -315,6 +316,7 @@ constexpr std::array guest_memory_routines{
 constexpr std::uint64_t guest_memory_page_offset=0x80000;
 constexpr std::uint64_t guest_scalar_math_page_offset=0x81000;
 constexpr std::uint64_t guest_thread_page_offset=0x82000;
+constexpr std::uint64_t guest_tls_bitmap_page_offset=X64ARM_TLS_BITMAP_PAGE_OFFSET;
 constexpr std::uint64_t guest_io_page_offset=0x8b000;
 // CFG 客體快速路徑：常式頁與 4096 項已驗證目標表（直接映射，整個目標位址比對）。
 // 檢查入口在 +0x00（rcx 為目標，命中 ret），dispatch 入口在 +0x40（rax 為目標，命中 jmp rax）；
@@ -327,6 +329,8 @@ constexpr std::size_t guard_table_entries=4096,guard_table_bytes=guard_table_ent
 static_assert(guard_code_page_offset!=guest_thread_page_offset && guard_code_page_offset!=guest_scalar_math_page_offset &&
               guard_code_page_offset!=guest_memory_page_offset && guard_code_page_offset!=guest_io_page_offset);
 static_assert(guest_io_page_offset+0x1000<=guard_table_page_offset || guest_io_page_offset>=guard_table_page_offset+guard_table_bytes);
+static_assert(guest_thread_page_offset+GuestMemory::guest_page_size<=guest_tls_bitmap_page_offset &&
+              guest_tls_bitmap_page_offset+GuestMemory::guest_page_size<=guest_io_page_offset);
 constexpr std::size_t guard_check_table_slot=0x1a,guard_dispatch_table_slot=0x5a,guard_slow_check_cell=0x80,guard_slow_dispatch_cell=0x88;
 constexpr std::array<std::uint8_t,0x90> guard_fast_code{
     0x49,0x89,0xca,0x49,0xc1,0xea,0x04,0x49,0x89,0xcb,0x49,0xc1,0xeb,0x14,0x4d,0x31,
@@ -454,6 +458,18 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             const auto code=x86_?std::span<const std::uint8_t>{detail::guest_thread_x86_code}:
                                   std::span<const std::uint8_t>{detail::guest_thread_code};
             std::copy(code.begin(),code.end(),bytes.begin());
+            // 配置生命週期由協調者管理，讀寫槽本身留在客體。獨立共享頁不佔用 TEB／FLS 鏡像，
+            // 新執行緒不需複製配置狀態；其新映射 TEB 的 TLS 值仍由零開始。
+            guest_tls_bitmap_=GuestAddress{callback_return_.value+guest_tls_bitmap_page_offset};
+            std::vector<std::uint8_t> bitmap(GuestMemory::guest_page_size);
+            for(std::size_t index=0;index<runtime_.tls_used.size();++index)
+                if(runtime_.tls_used[index])bitmap[index/8]|=static_cast<std::uint8_t>(1U<<(index%8));
+            memory.map(guest_tls_bitmap_,GuestMemory::guest_page_size,read_write,bitmap);
+            const auto bitmap_patch=x86_?detail::guest_thread_x86_tls_bitmap_patch:detail::guest_thread_tls_bitmap_patch;
+            const unsigned bitmap_width=x86_?4U:8U;
+            if(bitmap_patch+bitmap_width>code.size() || (x86_ && guest_tls_bitmap_.value>UINT32_MAX))
+                throw std::logic_error("TLS 配置位元圖位址修補超出常式或 Win32 範圍");
+            for(unsigned n=0;n<bitmap_width;++n)bytes[bitmap_patch+n]=static_cast<std::uint8_t>(guest_tls_bitmap_.value>>(8*n));
             if(!x86_)for(const auto& routine:detail::guest_thread_routines){
                 if(!routine.slot)continue;
                 const auto found=std::find_if(table.begin(),table.end(),[&](const auto& d){return d.family=="kernel32.dll" && d.symbol==routine.symbol;});

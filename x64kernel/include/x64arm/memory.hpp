@@ -10,6 +10,8 @@
 #include <memory>
 #include <map>
 #include <mutex>
+#include <set>
+#include <exception>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
@@ -27,6 +29,9 @@ struct MemoryFault : std::runtime_error {
     std::size_t size;
     MemoryFault(GuestAddress address, Access access, std::size_t size, const char* message);
 };
+// 來源頁保護失敗不是客體 MemoryFault，也不能作為可忽略的快取 miss。
+struct CodeSourceError : std::runtime_error {using std::runtime_error::runtime_error;};
+struct CodeSourceOwnerRequired : CodeSourceError {using CodeSourceError::CodeSourceError;};
 // 主機提供的資料區域；owner 保證 mmap / buffer 生命期，客體地址不洩漏主機指標。
 class MemoryBacking {
 public:
@@ -52,6 +57,7 @@ public:
     struct NativeLayout {std::uint32_t cache,direct,mmu,mmu_permissions;};
     // 資格表低三位沿用讀／寫／RMW；額外位只表示整個客體頁均有效，排除填補與空洞。
     static constexpr unsigned native_mmu_full_read=1U<<3,native_mmu_full_write=1U<<4;
+    static constexpr unsigned native_mmu_code_source=1U<<5;
     static constexpr unsigned native_page_bits=9;
     static constexpr std::size_t native_page_slots=std::size_t{1}<<native_page_bits;
     static constexpr std::size_t native_page_index(std::uint64_t page) noexcept {return address_cache::index(page,native_page_slots-1);}
@@ -82,6 +88,25 @@ public:
     GuestMemory& operator=(const GuestMemory& other);
     GuestMemory(GuestMemory&& other) noexcept;
     GuestMemory& operator=(GuestMemory&& other) noexcept;
+    // 候選政策在建構時固定；所有 Execute 消費者共用單調來源頁追蹤。
+    // 未裝 scope 時，與映射 API 一樣要求呼叫者已停止所有客體 worker。
+    // 平行執行須在 worker 啟動前裝 owner scope；回呼只能 quiesce，不得排程、
+    // 執行客體回呼或改映射。巢狀 scope 僅在同一 owner 執行緒按 LIFO 使用。
+    class CodeSourceScope {
+    public:
+        CodeSourceScope(const GuestMemory&,void(*quiesce)(void*),void* opaque);
+        ~CodeSourceScope();
+        CodeSourceScope(const CodeSourceScope&)=delete;
+        CodeSourceScope& operator=(const CodeSourceScope&)=delete;
+        void check() const;
+    private:
+        friend class GuestMemory;
+        const GuestMemory* memory_{};void(*quiesce_)(void*){};void* opaque_{};
+        CodeSourceScope* previous_{};bool owns_token_{};
+        static thread_local CodeSourceScope* current_;
+    };
+    void ensure_code_source(GuestAddress,std::size_t) const;
+    void throw_if_code_source_failed() const;
     static constexpr std::size_t capacity_limit = 256U * 1024U * 1024U;
     static constexpr std::size_t maximum_capacity = UINT64_C(8) * 1024 * 1024 * 1024;
     static constexpr std::size_t guest_page_size = 4096;
@@ -286,6 +311,13 @@ private:
     std::uint64_t identity_{};
     std::uint64_t generation_{};
     std::uint64_t structure_generation_{};
+    bool code_source_watch_enabled_{};
+    mutable std::set<std::uint64_t> code_source_pages_;
+    mutable const std::set<std::uint64_t>* code_source_pending_{};
+    mutable std::atomic<const CodeSourceScope*> code_source_owner_{};
+    mutable std::atomic<bool> code_source_failed_{};
+    mutable std::exception_ptr code_source_failure_;
+    bool code_source_watched(std::uint64_t) const noexcept;
     ExecutionMode mode_{ExecutionMode::X64};
     unsigned processor_count_{1};
     VirtualProcessorIdentity processor_identity_;

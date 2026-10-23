@@ -123,6 +123,9 @@ struct Identity {
     // 事件查詢（D3D11_QUERY_EVENT）以後端完成旗標判定就緒，End 不等待 GPU。
     std::shared_ptr<const std::atomic<bool>> query_fence;
     std::shared_ptr<const GraphicsTimestampFuture> query_timestamp;
+    // 遮蔽查詢：End 只記錄 fence 與取樣序號，GetData 在 fence 完成後才讀回可見度緩衝區。
+    std::uint64_t query_pending_sequence{};
+    std::uint32_t query_polls{}; // GetData 以 DONOTFLUSH 連續輪詢的次數；超過門檻仍提交，避免永不完成。
     bool query_active{},query_ready{},fullscreen{};
     std::uint64_t fullscreen_output{};
     std::array<std::int32_t,4> windowed_rect{};

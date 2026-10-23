@@ -90,8 +90,9 @@ struct DirectInputState {
     std::uint32_t sequence{},locks{};std::uint64_t joystick_format{};
     std::vector<std::pair<input::Event,std::uint32_t>> injected_events;
     std::array<std::optional<input::Guid>,16> legacy_joystick_slots;
-    struct GamepadSlot {std::optional<input::Guid> device;std::array<std::uint8_t,12> state{};std::uint32_t packet{};bool sampled{};};
+    struct GamepadSlot {std::optional<input::Guid> device;std::array<std::uint8_t,12> state{};std::uint32_t packet{};std::uint16_t keystroke_buttons{};bool sampled{};};
     std::array<GamepadSlot,4> gamepad_slots;
+    bool xinput_enabled{true}; // XInputEnable(FALSE) 後 GetState 回中性狀態、SetState 不震動。
     // 背景輪詢最近一次處理的裝置清單換代，以及當時更新的 raw input 狀態。
     std::uint64_t device_generation{};const void* raw_input_refreshed{};
     // 最近一次背景輪詢的宿主單調時間（100 ns）。
@@ -106,7 +107,14 @@ std::span<const WindowsServiceDescriptor> dinput_service_descriptors(){
             result.push_back({family,"XInputGetState",2,0,0,1});
             result.push_back({family,"XInputSetState",2,0,0,1});
             result.push_back({family,"XInputGetCapabilities",3,0,0,3});
+            result.push_back({family,"XInputEnable",1,0,0,1});
+            result.push_back({family,"XInputGetBatteryInformation",3,0,0,3});
+            result.push_back({family,"XInputGetKeystroke",3,0,0,3});
+            result.push_back({family,"#100",2,0,0,1}); // XInputGetStateEx：含 Guide 鍵。
         }
+        result.push_back({"xinput1_3.dll","XInputGetDSoundAudioDeviceGuids",3,0,0,1});
+        result.push_back({"xinput1_4.dll","XInputGetAudioDeviceIds",5,0,0,1});
+        result.push_back({"xinput1_4.dll","#108",4,0,0,7}); // XInputGetCapabilitiesEx。
         for(auto family:{"dinput.dll","dinput8.dll"}){result.push_back({family,"DllGetClassObject",3});result.push_back({family,"DllCanUnloadNow",0});result.push_back({family,"DllRegisterServer",0});result.push_back({family,"DllUnregisterServer",0});}
         std::set<std::string_view> names;for(auto methods:{std::span<const Method>(roots),std::span<const Method>(root8),std::span<const Method>(device_methods),std::span<const Method>(effects),std::span<const Method>(factories)})for(const auto& method:methods)if(names.insert(method.name).second)result.push_back({"internal-dinput",method.name,method.args,0,0,method.scalars});return result;
     }();return table;
