@@ -7,7 +7,7 @@ void WindowsServices::finish_device_notification(GuestState& state,GuestMemory& 
 void WindowsServices::poll_device_notifications(GuestMemory& memory){
     if(!device_configuration_ || device_configuration_->notifications.empty())return;
     auto& config=*device_configuration_;const auto saved_error=last_error_;
-    if(runtime_.clock_ticks>=config.poll_deadline){
+    if(!registry_io_busy_ && runtime_.clock_ticks>=config.poll_deadline){
         // 每次重新列舉 HID 等裝置約 4～5 ms；插拔通知以 500 ms 為間隔（原 100 ms，Steam.exe 主執行緒約 5%）。
         // X64ARM_DEVICE_POLL_MS 調整，100 為舊行為。
         static const std::uint64_t interval=[] {

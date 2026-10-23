@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <map>
+#include <string>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -28,6 +30,9 @@ struct Counters {
     std::atomic<std::uint64_t> received{}, sent{};
     std::mutex mutex;
     std::vector<std::pair<double,double>> gpu_intervals;
+    std::mutex diagnostics_mutex;
+    std::map<std::string,std::int64_t> diagnostic_counts;
+    std::map<std::string,std::string> diagnostic_texts;
 };
 // 完成回呼可能比報告器活得更久；程序共用計數器不依賴報告器的物件生命週期。
 Counters& counters() { static auto* value = new Counters; return *value; }
@@ -146,6 +151,17 @@ struct ResourceUsageReporter::Impl {
         json<<",\"hostStart\":"<<(initial?now:last_time)<<",\"hostEnd\":"<<now<<",\"gpuIntervals\":[";
         bool comma=false;for(const auto& [first,last]:intervals){if(comma)json<<',';comma=true;json<<'['<<first<<','<<last<<']';}
         json<<']';
+        {   // 常駐診斷：計數為累計值，文字為最後一次設定的值。
+            auto& counters_ref=counters();std::lock_guard lock(counters_ref.diagnostics_mutex);
+            if(!counters_ref.diagnostic_counts.empty() || !counters_ref.diagnostic_texts.empty()){
+                const auto quote=[&](std::string_view text){json<<'"';for(const char raw:text){const auto c=static_cast<unsigned char>(raw);
+                    if(c=='"' || c=='\\')json<<'\\'<<raw;else if(c<32)json<<' ';else json<<raw;}json<<'"';};
+                json<<",\"diagnostics\":{";bool first=true;
+                for(const auto& [key,value]:counters_ref.diagnostic_counts){if(!first)json<<',';first=false;quote(key);json<<':'<<value;}
+                for(const auto& [key,value]:counters_ref.diagnostic_texts){if(!first)json<<',';first=false;quote(key);json<<':';quote(value);}
+                json<<'}';
+            }
+        }
         json<<"}\n";
         last_time=now; last_process=process; last_received=received; last_sent=sent;
         auto temporary=path; temporary+=".tmp";
@@ -153,6 +169,14 @@ struct ResourceUsageReporter::Impl {
         std::filesystem::rename(temporary,path);
     }
 };
+void record_diagnostic(const char* key,std::int64_t delta) noexcept {
+    auto& c=counters();if(!c.enabled.load(std::memory_order_relaxed))return;
+    try{std::lock_guard lock(c.diagnostics_mutex);c.diagnostic_counts[key]+=delta;}catch(...){}
+}
+void set_diagnostic(const char* key,std::string_view text) noexcept {
+    auto& c=counters();if(!c.enabled.load(std::memory_order_relaxed))return;
+    try{std::lock_guard lock(c.diagnostics_mutex);c.diagnostic_texts[key]=std::string(text.substr(0,240));}catch(...){}
+}
 ResourceUsageReporter::ResourceUsageReporter(const std::filesystem::path& path) {
     auto destination=path;
     if(!destination.empty()){

@@ -20,15 +20,17 @@ struct MetalPipelineKey {
 };
 // DISCARD 更換 backing 時回收舊 buffer：舊 buffer 在 GPU 用完（flight 退役）後進入池，下一次同長度的更換直接取用，
 // 省掉 newBufferWithLength＋整段清零＋額度保留。池上限 64 MiB，超出即照常釋放。
+// 池只保留 MTLBuffer，不保留 GPU 額度：入池即釋放額度（否則 Steam GPU 程序 256 MiB 額度會被池吃掉 64 MiB），
+// 取用時重新保留，失敗就改走一般配置。X64ARM_METAL_DISCARD_POOL=0 關閉就地寫入與回收池，回到每次更換新 buffer。
+bool metal_discard_pool_enabled(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_DISCARD_POOL");return !text || std::string_view(text)!="0";}();return value;}
 struct MetalBufferPool {
-    struct Entry {id<MTLBuffer> buffer;std::shared_ptr<GpuMemoryReservation> lease;};
-    std::multimap<std::size_t,Entry> free;std::size_t bytes{};std::uint64_t hits{},puts{},drops{};
+    std::multimap<std::size_t,id<MTLBuffer>> free;std::size_t bytes{};std::uint64_t hits{},puts{},drops{};
     static constexpr std::size_t limit=64U<<20;
-    std::optional<Entry> take(std::size_t length){auto it=free.find(length);if(it==free.end())return std::nullopt;auto entry=std::move(it->second);free.erase(it);bytes-=length;++hits;return entry;}
-    void put(id<MTLBuffer> buffer,std::shared_ptr<GpuMemoryReservation> lease){
+    id<MTLBuffer> take(std::size_t length){auto it=free.find(length);if(it==free.end())return nil;auto buffer=it->second;free.erase(it);bytes-=length;++hits;return buffer;}
+    void put(id<MTLBuffer> buffer){
         const auto length=static_cast<std::size_t>(buffer.length);
         if(!length || bytes+length>limit){++drops;return;}
-        free.emplace(length,Entry{buffer,std::move(lease)});bytes+=length;++puts;
+        free.emplace(length,buffer);bytes+=length;++puts;
     }
 };
 class MetalPendingObjects {
@@ -50,7 +52,7 @@ struct MetalResource final:GraphicsResource {
     std::shared_ptr<MetalBufferBacking> backing;
     // 被 DISCARD 更換下來的舊 backing：最後一個持有者（flight 或更換點）釋放時交回池。
     std::shared_ptr<MetalBufferPool> recycle;
-    ~MetalResource() override {if(recycle && buffer && !texture)recycle->put(buffer,std::move(lease));}
+    ~MetalResource() override {if(recycle && buffer && !texture)recycle->put(buffer);}
     // 常數 buffer 不允許 GPU 寫入綁定；保存最後排程的 CPU 內容，GPU copy 目的端必須失效。
     std::vector<std::uint8_t> constant_bytes;
     bool constant_bytes_valid{};

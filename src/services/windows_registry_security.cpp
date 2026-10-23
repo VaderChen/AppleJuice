@@ -57,6 +57,7 @@ std::pair<std::u16string,std::uint32_t> WindowsServices::registry_security_handl
     if((found->second.access&required)!=required)throw SecurityDescriptorError{5};return {found->second.path,found->second.access};
 }
 std::optional<std::uint32_t> WindowsServices::invoke_registry_security(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    RegistryIoScope io([&](const auto& work){await_registry_io(state,memory,work);});
     using namespace security;
     const WindowsCall call(state,memory,service);const auto api=service.symbol;
     const bool reg=api=="RegGetKeySecurity" || api=="RegSetKeySecurity",setting=api.starts_with("Set") || api=="RegSetKeySecurity";

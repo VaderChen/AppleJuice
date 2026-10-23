@@ -133,7 +133,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
     if(filesystem_.writable() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許開啟可寫宿主檔案");
     CreationSecurity security;std::uint32_t security_error=0;
     try{security=read_security_attributes(memory,arg(3),x86_,false);}catch(const SecurityDescriptorError& error){security_error=error.code;}catch(const MemoryFault&){security_error=87;}
-    const std::uint32_t read_access=filesystem_.writable()?0xc01f01bfU:0x801200a9U;constexpr std::uint32_t supported_flags=0xde3f01a7U;
+    // FILE_FLAG_NO_BUFFERING（0x20000000）只要求呼叫端以磁區對齊讀寫並略過系統快取，不改變資料內容；宿主照常讀寫。
+    // Steam 驗證下載暫存檔以此旗標開檔，拒絕時整個更新被判為「磁碟讀取錯誤」。
+    const std::uint32_t read_access=filesystem_.writable()?0xc01f01bfU:0x801200a9U;constexpr std::uint32_t supported_flags=0xfe3f01a7U;
     if ((dword(1)&~read_access) || (!filesystem_.writable() && (dword(4)!=3 || (dword(5)&0x04000000U))) || (dword(2)&~7U) || (dword(5)&~supported_flags)) last_error_=50;
     else if (security_error) last_error_=security_error;
     else if (files_.size()>=1024) last_error_=4;

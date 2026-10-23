@@ -253,6 +253,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_guest_service(GuestState& s
 }
 
 void WindowsServices::poll_guest_services(GuestMemory& memory){
+    if(registry_io_busy_)return; // 不可重入尚未完成的登錄交易；其他 I/O／音訊輪詢照常進行。
     (void)memory;namespace gs=guest_service;if(guest_service_waits_.empty() || gs::now()<guest_service_poll_time_+10)return;guest_service_poll_time_=gs::now();
     RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return;
     for(const auto& [id,wait]:guest_service_waits_){auto it=threads_.items.find(id);if(it==threads_.items.end() || it->second.status!=ThreadStatus::Waiting || it->second.wait.kind!=ThreadWaitKind::ServiceControl)continue;

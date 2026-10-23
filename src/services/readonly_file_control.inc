@@ -111,7 +111,9 @@ std::uint32_t HostFile::allocate(std::uint64_t size) const {
     if(readonly_)return 5;if(size>INT64_MAX)return 87;const auto info=information();if(info.error)return info.error;if(info.metadata.attributes&0x10U)return 5;
     if(size<info.metadata.size)return truncate(size);if(size==info.metadata.allocation_size)return 0;
 #if defined(__APPLE__)
-    if(size<info.metadata.allocation_size)return 50;
+    // 配置大小縮小但不小於檔案大小：Windows 會釋放多出的配置；宿主無法在不截斷的情況下歸還已預配區塊，
+    // 多保留的配置對客體不可見（檔案大小與內容不變），因此照 Windows 契約回報成功。
+    if(size<info.metadata.allocation_size)return 0;
     fstore_t request{};request.fst_flags=F_ALLOCATEALL;request.fst_posmode=F_PEOFPOSMODE;request.fst_length=static_cast<off_t>(size-info.metadata.allocation_size);
     return ::fcntl(descriptor_,F_PREALLOCATE,&request)<0?native_error():0;
 #else

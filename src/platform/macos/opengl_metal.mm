@@ -407,6 +407,7 @@ public:
     bool graphics_clear_unordered(const GraphicsView&,std::array<std::uint32_t,4>,bool)override;
     void graphics_draw(const GraphicsDraw&)override;
     void graphics_dispatch(const GraphicsStage&,std::array<std::uint32_t,3>)override;
+    void graphics_dispatch_indirect(const GraphicsStage&,const std::shared_ptr<GraphicsResource>&,std::uint32_t)override;
     void graphics_handoff(NativeGraphics&,const GraphicsView&)override;
     void graphics_mips(const GraphicsView&)override;
     void graphics_present(const GraphicsView&)override;
@@ -434,7 +435,7 @@ public:
         return flights_.back().done;
     }}
     void graphics_bind(id<MTLRenderCommandEncoder>,id<MTLComputeCommandEncoder>,const GraphicsStage&,bool);
-    MetalGeometryDraw graphics_geometry(const GraphicsDraw&,MTLVertexDescriptor*,const std::array<int,32>&,const std::string&);
+    MetalGeometryDraw graphics_geometry(const GraphicsDraw&,MTLVertexDescriptor*,const std::array<int,32>&,const std::vector<std::array<std::uint32_t,3>>&,const std::string&);
     bool graphics_stream_output(const GraphicsDraw&,const MetalShader&,id<MTLBuffer>,unsigned,unsigned,unsigned);
     std::shared_ptr<GraphicsShader> graphics_translate_shader(std::uint32_t,std::span<const std::uint8_t>,GLSLCrossDependencyData*);
     MetalTessellationDraw graphics_tessellation(const GraphicsDraw&,const std::string&);

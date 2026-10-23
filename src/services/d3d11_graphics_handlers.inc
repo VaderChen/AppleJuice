@@ -55,6 +55,11 @@
             if(context->context_type)context->commands.push_back(std::move(command));
             else {command.execute(*context->native);context->draws+=command.draws;context->dispatches+=command.dispatches;bridge.graphics_draws+=command.draws;bridge.graphics_dispatches+=command.dispatches;}
         };
+        // 與 submit 的立即路徑相同的條件與計數；X64ARM_D3D11_DIRECT_DRAW=0 回到一律經 submit（同引擎對照）。
+        static const bool direct_draw_enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_DIRECT_DRAW");return !value || std::string_view(value)!="0";}();
+        const auto direct_submit=[&](const std::shared_ptr<Identity>& context){return direct_draw_enabled && !context->context_type && !binding(context,"Predicate");};
+        const auto count_direct=[&](const std::shared_ptr<Identity>& context,std::uint64_t draws,std::uint64_t dispatches){
+            context->draws+=draws;context->dispatches+=dispatches;bridge.graphics_draws+=draws;bridge.graphics_dispatches+=dispatches;};
 #include "d3d11_binding_helpers.inc"
         const auto draw_state=[&](const std::shared_ptr<Identity>& context){GraphicsDraw draw;draw.topology=context->topology;draw.index_format=context->index_format;draw.index_offset=context->index_offset;draw.viewports=context->viewports;draw.scissors=context->scissors;draw.blend_factor=context->blend_factor;draw.sample_mask=context->sample_mask;draw.stencil_reference=context->stencil_reference;
             static const bool snapshot_enabled=[](){const char* option=std::getenv("X64ARM_D3D11_BINDING_SNAPSHOT");return !option || std::string_view(option)!="0";}();
@@ -346,12 +351,34 @@
             else {const auto total=viewport?context->viewports.size():context->scissors.size();memory.store(GuestAddress{arg(1)},32,total);if(arg(2))for(unsigned i=0;i<std::min<std::size_t>(count,total);++i){const auto* data=viewport?reinterpret_cast<const std::uint8_t*>(context->viewports[i].data()):reinterpret_cast<const std::uint8_t*>(context->scissors[i].data());memory.write(GuestAddress{arg(2)+i*(viewport?24:16)},std::span<const std::uint8_t>{data,viewport?24U:16U});}}
         }else if(symbol=="Draw" || symbol=="DrawIndexed" || symbol=="DrawInstanced" || symbol=="DrawIndexedInstanced"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto draw=draw_state(context);draw.count=u32(1);draw.indexed=symbol.find("Indexed")!=symbol.npos;const bool instanced=symbol.find("Instanced")!=symbol.npos;draw.instances=instanced?u32(2):1;draw.start=u32(instanced?3:2);if(draw.indexed)draw.base_vertex=static_cast<std::int32_t>(u32(instanced?4:3));if(instanced)draw.start_instance=u32(draw.indexed?5:4);if(auto ptr=binding(context,"Visibility")){auto query=object(ptr).identity;require(query->sequence<8192);draw.visibility=query->resource;draw.visibility_offset=static_cast<std::uint32_t>(query->sequence++*8);}
-            submit(context,{[draw=std::move(draw)](auto& native){native.graphics_draw(draw);},1,0});
+            // 立即模式且未設 predicate 時直接執行：submit 對立即 context 本來就同步呼叫，包成 std::function 只多一次
+            // 63 KB 狀態的搬移與堆積配置（微基準每次約 3.9 µs）。延遲 context 與 predicate 仍走 submit。
+            if(direct_submit(context)){context->native->graphics_draw(draw);count_direct(context,1,0);}
+            else submit(context,{[draw=std::move(draw)](auto& native){native.graphics_draw(draw);},1,0});
+        }else if(symbol=="DrawIndexedInstancedIndirect" || symbol=="DrawInstancedIndirect" || symbol=="DispatchIndirect"){
+            // 參數 buffer 須以 D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS 建立，offset 4 位元組對齊且整組參數在範圍內；
+            // 不合法時與 runtime 相同略過呼叫（void 方法，debug layer 才報錯）。參數交給後端的原生間接呼叫，不讀回 CPU。
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto arguments=typed(arg(1),Kind::BufferObject);const auto offset=u32(2);
+            const bool dispatch=symbol=="DispatchIndirect",indexed=symbol=="DrawIndexedInstancedIndirect";const auto size=dispatch?12U:indexed?20U:16U;
+            const auto& desc=arguments->resource->desc;
+            if(arguments->device!=context->device || !(desc.misc&0x10U) || (offset&3U) || std::uint64_t{offset}+size>desc.width)bridge.last_error=std::string(symbol)+" 的參數 buffer、旗標或 offset 不合法";
+            else if(dispatch){
+                auto stage=draw_state(context).stages[5];auto resource=arguments->resource;
+                if(direct_submit(context)){context->native->graphics_dispatch_indirect(stage,resource,offset);count_direct(context,0,1);}
+                else submit(context,{[stage=std::move(stage),resource,offset](auto& native){native.graphics_dispatch_indirect(stage,resource,offset);},0,1});
+            }else{
+                auto draw=draw_state(context);draw.indexed=indexed;draw.indirect=arguments->resource;draw.indirect_offset=offset;
+                if(auto ptr=binding(context,"Visibility")){auto query=object(ptr).identity;require(query->sequence<8192);draw.visibility=query->resource;draw.visibility_offset=static_cast<std::uint32_t>(query->sequence++*8);}
+                if(direct_submit(context)){context->native->graphics_draw(draw);count_direct(context,1,0);}
+                else submit(context,{[draw=std::move(draw)](auto& native){native.graphics_draw(draw);},1,0});
+            }
         }else if(symbol=="DrawAuto"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto draw=draw_state(context);require(bool(draw.vertices[0].resource));
             submit(context,{[draw=std::move(draw)](auto& native)mutable{draw.count=static_cast<std::uint32_t>(draw.vertices[0].resource->stream_vertices);native.graphics_draw(draw);},1,0});
         }else if(symbol=="Dispatch"){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto stage=draw_state(context).stages[5];const std::array groups{u32(1),u32(2),u32(3)};submit(context,{[stage=std::move(stage),groups](auto& native){native.graphics_dispatch(stage,groups);},0,1});
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto stage=draw_state(context).stages[5];const std::array groups{u32(1),u32(2),u32(3)};
+            if(direct_submit(context)){context->native->graphics_dispatch(stage,groups);count_direct(context,0,1);}
+            else submit(context,{[stage=std::move(stage),groups](auto& native){native.graphics_dispatch(stage,groups);},0,1});
         }else if(symbol=="ClearRenderTargetView" || symbol=="ClearDepthStencilView"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto view=view_of(arg(1));std::array<float,4> values{};const bool depth=symbol=="ClearDepthStencilView";if(depth){const auto bits=x86_?u32(3):(std::uint32_t{state.xmm[3][0]}|(std::uint32_t{state.xmm[3][1]}<<8)|(std::uint32_t{state.xmm[3][2]}<<16)|(std::uint32_t{state.xmm[3][3]}<<24));values[0]=std::bit_cast<float>(bits);values[1]=static_cast<float>(u32(4));}else {auto bytes=read_bytes(memory,arg(2),16);std::memcpy(values.data(),bytes.data(),16);}const auto flags=depth?u32(2):0;submit(context,{[view,values,flags](auto& native){native.graphics_clear(view,values,flags);}});
         }else if(symbol=="CopyStructureCount"){
@@ -362,7 +389,8 @@
             else bridge.last_error="CopyStructureCount 的來源或目的範圍不合法";
         }else if(symbol=="ClearUnorderedAccessViewUint" || symbol=="ClearUnorderedAccessViewFloat"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context),view=typed(arg(1),Kind::Unordered);require(view->device==context->device);const auto raw=bytes32(arg(2),4);std::array<std::uint32_t,4> values{};std::copy(raw.begin(),raw.end(),values.begin());
-            const auto target=view->graphics_view;const bool floating=symbol.ends_with("Float");submit(context,{[target,values,floating](auto& native){if(!native.graphics_clear_unordered(target,values,floating))throw std::invalid_argument("UAV 清除值與格式不相容");}});
+            const auto target=view->graphics_view;const bool floating=symbol.ends_with("Float");// 文件：Float 版只用於 FLOAT／UNORM／SNORM UAV，其他 UAV 的呼叫「不送達驅動」即略過；Uint 版適用任何 UAV。
+            submit(context,{[target,values,floating](auto& native){if(!native.graphics_clear_unordered(target,values,floating) && !floating)throw std::invalid_argument("UAV 清除值與格式不相容");}});
         }else if(symbol=="ClearState"){graphics_handled=true;auto context=typed(arg(0),Kind::Context);clear_bindings(context);context->linkage_constants={};context->linkage_keys={};}
         else if(symbol=="Flush"){graphics_handled=true;auto context=typed(arg(0),Kind::Context);require(!context->context_type);context->native->graphics_flush(false);}
         else if(symbol=="GenerateMips"){graphics_handled=true;auto context=typed(arg(0),Kind::Context);const auto view=view_of(arg(1));submit(context,{[view](auto& native){native.graphics_mips(view);}});}
@@ -442,6 +470,18 @@
             if(std::getenv("X64ARM_TRACE_GRAPHICS_STATE"))std::fprintf(stderr,"[d3d11_caps] format=%u samples=%u quality=%u\n",u32(1),u32(2),quality);
         }
         else if(symbol=="CheckFeatureSupport"){graphics_handled=true;require(u32(3)<=256);std::vector<std::uint8_t> data(u32(3));if(u32(1)==0 && data.size()==8){put_word(data,0,1);put_word(data,4,1);}else if(u32(1)==4 && data.size()==4)put_word(data,0,1);else if(u32(1)==3 && data.size()==8){const auto format=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)},32));put_word(data,0,format);put_word(data,4,0);}else if(u32(1)!=5 && u32(1)!=6 && u32(1)!=7)result=invalid;if(!result)memory.write(GuestAddress{arg(2)},data);}
+        else if(symbol=="CheckCounterInfo"){
+            // 不提供裝置相依計數器：LastDeviceDependentCounter=0、可同時啟用 0 個、可偵測平行單元 1。
+            graphics_handled=true;(void)typed(arg(0),Kind::Device);if(arg(1)){std::vector<std::uint8_t> info(12);put_word(info,8,1);memory.write(GuestAddress{arg(1)},info);}
+        }else if(symbol=="CreateCounter" || symbol=="CheckCounter"){
+            // D3D11 只剩裝置相依計數器（>=D3D11_COUNTER_DEVICE_DEPENDENT_0），CheckCounterInfo 回報 0 個：
+            // 合法描述回 DXGI_ERROR_UNSUPPORTED，其餘 E_INVALIDARG；輸出介面清為 NULL。
+            graphics_handled=true;(void)typed(arg(0),Kind::Device);if(symbol=="CreateCounter" && arg(2)){output(2);write_pointer(arg(2),0);}
+            const auto counter=arg(1)?static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)},32)):0U;
+            const auto flags=arg(1) && symbol=="CreateCounter"?static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)+4},32)):0U;
+            result=arg(1) && counter>=0x40000000U && !flags?not_supported:invalid;
+        }else if(symbol=="SetExceptionMode"){graphics_handled=true;auto device=typed(arg(0),Kind::Device);if(u32(1)&~1U)result=invalid;else device->exception_mode=u32(1);}
+        else if(symbol=="GetExceptionMode"){graphics_handled=true;result=typed(arg(0),Kind::Device)->exception_mode;}
         else if(symbol=="CreateQuery" || symbol=="CreatePredicate"){
             graphics_handled=true;auto device=typed(arg(0),Kind::Device);if(arg(2)){output(2);write_pointer(arg(2),0);}auto desc=read_bytes(memory,arg(1),8);const auto type=word(desc,0);require(symbol!="CreatePredicate" || type==5 || type==7);require(!(word(desc,4)&~1U) && (!word(desc,4) || type==5));if(((type==2 || type==3) && !device->native->graphics_timestamp_supported()) || (type!=0 && type!=1 && type!=2 && type!=3 && type!=5 && type!=6 && type!=7)){result=not_supported;}else if(!arg(2))result=1;else{auto id=create(symbol=="CreatePredicate"?Kind::Predicate:Kind::Query,device->root);id->desc=desc;id->query_size=type==0 || type==5 || type==7?4:type==3?16:type==4?88:type>=6?16:8;id->query_data.resize(id->query_size);if(type==1 || type==5){GraphicsResourceDesc resource;resource.width=65536;id->resource=device->native->graphics_resource(resource);}write_pointer(arg(2),id->root);}
         }else if(symbol=="GetDataSize"){graphics_handled=true;result=object(arg(0)).identity->query_size;}

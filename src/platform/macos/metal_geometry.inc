@@ -98,7 +98,7 @@ std::vector<unsigned> metal_free_buffers(const MetalShader& shader,const std::ar
 std::pair<unsigned,unsigned> metal_input_primitives(unsigned topology,unsigned count){
     switch(topology){case 1:return {count,1};case 2:return {count/2,2};case 3:return {count>1?count-1:0,2};case 4:return {count/3,3};case 5:return {count>2?count-2:0,3};case 10:return {count/4,4};case 11:return {count>3?count-3:0,4};case 12:return {count/6,6};default:throw std::invalid_argument("幾何輸入 topology 尚未映射");}
 }
-MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDescriptor* descriptor,const std::array<int,32>& slots,const std::string& layout_key){@autoreleasepool{
+MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDescriptor* descriptor,const std::array<int,32>& slots,const std::vector<std::array<std::uint32_t,3>>& shifted,const std::string& layout_key){@autoreleasepool{
     auto& vs=dynamic_cast<MetalShader&>(*d.stages[0].shader);auto& original_gs=dynamic_cast<MetalShader&>(*d.stages[2].shader);
     MetalShader passthrough;auto* selected=&original_gs;
     const auto [primitives,input_count]=metal_input_primitives(d.topology,d.count);
@@ -212,6 +212,7 @@ MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDesc
     auto capture=[commands_ renderCommandEncoderWithDescriptor:pass];MetalEncoderScope capture_scope{capture};if(!capture)throw std::runtime_error("幾何 capture encoder 建立失敗");[capture setRenderPipelineState:p->capture];
     graphics_bind(capture,nil,d.stages[0],true);
     for(unsigned i=0;i<32;++i)if(slots[i]>=0){const auto& v=d.vertices[i];[capture setVertexBuffer:metal_resource(v.resource).buffer offset:v.offset atIndex:static_cast<NSUInteger>(slots[i])];graphics_pending_.push_back(v.resource);}
+    for(const auto& b:shifted){const auto& v=d.vertices[b[1]];[capture setVertexBuffer:metal_resource(v.resource).buffer offset:std::uint64_t{v.offset}+b[2] atIndex:b[0]];}
     const std::array<std::uint32_t,2> capture_params{static_cast<std::uint32_t>(vertices),d.start_instance};
     [capture setVertexBuffer:inputs offset:0 atIndex:p->capture_buffer];[capture setVertexBytes:capture_params.data() length:sizeof(capture_params) atIndex:p->capture_params];
     if(d.indexed)[capture drawIndexedPrimitives:MTLPrimitiveTypePoint indexCount:d.count indexType:d.index_format==57?MTLIndexTypeUInt16:MTLIndexTypeUInt32 indexBuffer:indices indexBufferOffset:d.index_offset+std::uint64_t{d.start}*(d.index_format==57?2:4) instanceCount:d.instances baseVertex:d.base_vertex baseInstance:d.start_instance];

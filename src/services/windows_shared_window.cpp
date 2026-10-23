@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/resource_usage.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/unicode.hpp"
 #include "window_presentation_fault.hpp"
@@ -590,6 +591,7 @@ void WindowsServices::publish_remote_frame(std::uint64_t handle, NativeGraphics&
         __atomic_load_n(&slot.owner, __ATOMIC_ACQUIRE) != window->process)
         throw WindowPresentationFault("遠端呈現期間 HWND 已關閉");
     const auto sequence=__atomic_add_fetch(&slot.frame, 1U, __ATOMIC_RELEASE);
+    record_diagnostic("remote_frame_published");
     if(trace_shared_frames()){const auto now=trace_unix_us();
         std::fprintf(stderr,"shared_frame kind=publish pid=%d handle=%llu seq=%u unix_us=%lld export_us=%lld\n",static_cast<int>(::getpid()),
             static_cast<unsigned long long>(handle),sequence,now,now-export_begin);}
@@ -636,6 +638,16 @@ void WindowsServices::poll_remote_frames() {
         }
         const auto import_begin=trace_shared_frames()?trace_unix_us():0;
         surface->import_frame(mapping->data,mapping->size,header.stride,header.format,shared.cache_frames?mapping:std::shared_ptr<void>{});
+        record_diagnostic("remote_frame_imported");
+        // 每 60 幀抽樣一次匯入影格的平均亮度（8×8 格點），判斷 GPU 程序產出的影格本身是否全黑。
+        if(static std::uint64_t imported=0;(imported++%60)==0 && mapping->data && header.width && header.height){
+            const auto* pixels=static_cast<const std::uint8_t*>(mapping->data);double sum=0;unsigned count=0;
+            for(unsigned gy=0;gy<8;++gy)for(unsigned gx=0;gx<8;++gx){
+                const auto x=(header.width*(2*gx+1))/16,y=(header.height*(2*gy+1))/16;const auto at=std::size_t{y}*header.stride+std::size_t{x}*4;
+                if(at+3<mapping->size){sum+=0.299*pixels[at+2]+0.587*pixels[at+1]+0.114*pixels[at];++count;}}
+            if(count)set_diagnostic("remote_frame_last",std::to_string(header.width)+"x"+std::to_string(header.height)+" fmt="+std::to_string(header.format)+
+                " luma="+std::to_string(static_cast<int>(sum/count))+" handle="+std::to_string(handle));
+        }
         if(trace_shared_frames()){const auto now=trace_unix_us();
             std::fprintf(stderr,"shared_frame kind=import pid=%d handle=%llu seq=%u previous=%u unix_us=%lld import_us=%lld\n",static_cast<int>(::getpid()),
                 static_cast<unsigned long long>(handle),published,shared.frames[handle],now,now-import_begin);}

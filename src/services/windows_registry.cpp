@@ -2,6 +2,11 @@
 #include "x64arm/unicode.hpp"
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <exception>
+#include <thread>
+#include "x64arm/shared_wake.hpp"
+#include "x64arm/interpreter.hpp"
 #include "x64arm/registry_store.hpp"
 #include "processor_registry.hpp"
 #include "x64arm/network_registry.hpp"
@@ -9,6 +14,7 @@
 #include "registry_hive.hpp"
 
 namespace x64arm {
+#include "windows_registry_io.inc"
 void WindowsServices::set_registry_file(std::filesystem::path path) {
     registry_file_=std::move(path);
     if(registry_file_.empty() || !runtime_.network.external_io) return;
@@ -62,8 +68,8 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
 void WindowsServices::poll_registry_notifications(bool reload,std::u16string_view mutation,std::uint32_t filter) {
     if(registry_notifications_.empty())return;
     auto& registry=runtime_.registry;
-    bool compare_snapshots=!reload || registry_file_.empty();
-    if(reload && !registry_file_.empty()) {
+    bool compare_snapshots=!registry_io_busy_ && (!reload || registry_file_.empty());
+    if(!registry_io_busy_ && reload && !registry_file_.empty()) {
         const auto now=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
         if(now>=registry_poll_time_+100){RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return;registry_poll_time_=now;compare_snapshots=true;}
     }
@@ -71,10 +77,10 @@ void WindowsServices::poll_registry_notifications(bool reload,std::u16string_vie
         const auto& watch=it->second;
         const auto thread=threads_.items.find(watch.thread);
         const bool root=watch.key>=0x80000000U && watch.key<=0x80000006U;
-        bool changed=(!root && !registry.handles.contains(watch.key)) || !registry.keys.contains(watch.path) ||
+        bool changed=(!root && !registry.handles.contains(watch.key)) || (!registry_io_busy_ && !registry.keys.contains(watch.path)) ||
             (!(watch.filter&0x10000000U) && (thread==threads_.items.end() || thread->second.status==ThreadStatus::Exited));
         // 背景排程每個時間片都會輪詢；只有比對變更路徑或快照時才需要組出子鍵前綴。
-        if(!changed && ((filter&watch.filter) || compare_snapshots)) {
+        if(!changed && !registry_io_busy_ && ((filter&watch.filter) || compare_snapshots)) {
             const auto prefix=watch.path+u"\\";
             const auto within=[&](std::u16string_view path){return path==watch.path || (watch.subtree && path.starts_with(prefix));};
             if((filter&watch.filter) && within(mutation))changed=true;
@@ -99,6 +105,8 @@ void WindowsServices::poll_registry_notifications(bool reload,std::u16string_vie
     }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    // 僅登錄 API 家族保留原生堆疊讓出 I/O；其他 consumer 在共同入口等待 store 門閂。
+    RegistryIoScope io([&](const auto& work){await_registry_io(state,memory,work);});
     if(service.symbol.starts_with("RegSaveKey") || service.symbol.starts_with("RegLoadKey") || service.symbol.starts_with("RegUnLoadKey") || service.symbol.starts_with("RegConnectRegistry"))return invoke_registry_hive(state,memory,service);
     if(service.symbol=="RegGetKeySecurity" || service.symbol=="RegSetKeySecurity")return invoke_registry_security(state,memory,service);
     if(service.family=="ntdll.dll")return invoke_nt_registry(state,memory,service);

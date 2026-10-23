@@ -1,4 +1,5 @@
 #include <cstdio>
+#include "x64arm/resource_usage.hpp"
 #include <cstdlib>
 #include "windows_display_identity.hpp"
 #include "window_presentation_fault.hpp"
@@ -136,7 +137,7 @@ struct Identity {
     float min_lod{};
 
     std::uint64_t root{}, device{}, texture{}, current_view{}, mapped{}, lock_address{};
-    std::uint32_t references{1}, slice{}, creation_flags{}, feature_level{0xb000};
+    std::uint32_t references{1}, slice{}, creation_flags{}, feature_level{0xb000}, exception_mode{};
     struct SubresourceMap { std::uint64_t pointer{};std::size_t size{};std::uint32_t type{}; };
     // 每個 mip／array slice 的 CPU 映射獨立，不把整個資源當成單一鎖。
     std::map<std::uint32_t,SubresourceMap> subresource_maps;
@@ -873,7 +874,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
       catch(const texture_image::Error& error){result=error.hresult;bridge.last_error=error.what();}
       catch(const video::VideoCodecError& error){result=failure;bridge.last_error=error.what();}
       catch(const video::DxvaH264Error& error){result=not_supported;bridge.last_error=error.what();}
-      catch(const WindowPresentationFault& error){result=0x887a0001U;bridge.last_error=error.what();if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] %.*s: %s\n",static_cast<int>(symbol.size()),symbol.data(),error.what());}
+      catch(const WindowPresentationFault& error){result=0x887a0001U;bridge.last_error=error.what();record_diagnostic("d3d11_present_fault");set_diagnostic("d3d11_present_fault_last",error.what());if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] %.*s: %s\n",static_cast<int>(symbol.size()),symbol.data(),error.what());}
       catch(const std::invalid_argument& error){bridge.last_error=error.what();if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] %.*s: %s\n",static_cast<int>(symbol.size()),symbol.data(),error.what());if(void_methods.contains(symbol))throw HostCallFault(bridge.last_error);result=invalid;}
     if(effect_compile){const auto hresult=original_arg(service.symbol.find("FromFile")!=std::string_view::npos?11:13);if(hresult)memory.store(GuestAddress{hresult},32,result);}
     if(symbol.starts_with("D3DX11GetImageInfoFrom") || symbol.starts_with("D3DX11CreateTextureFrom") || symbol.starts_with("D3DX11CreateShaderResourceViewFrom")){

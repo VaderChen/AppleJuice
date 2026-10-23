@@ -396,6 +396,30 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
     }
     if(!force && !signalled && watched){transfer.next_idle_poll=now+std::chrono::milliseconds(1);return;}
     for(unsigned received=0;received<64;++received){
+        if(registry_io_busy_){
+            // 外部程序也可能暫停／改寫目前保留原生框架的 owner。請求仍留在
+            // 有界 socket 佇列，交易完成後依原順序處理，不回傳假的 busy 成功。
+            // peek 同樣可能複製 SCM_RIGHTS；沿完整 control buffer 契約接收並
+            // 立即關閉 peek 的副本，不能讓無 control buffer 的 recv 洩漏 fd。
+            TransferMessage next{};iovec peek_data{&next,sizeof(next)};msghdr peek_message{};
+            alignas(cmsghdr) std::array<char,8192> peek_control{};
+            peek_message.msg_iov=&peek_data;peek_message.msg_iovlen=1;
+            peek_message.msg_control=peek_control.data();peek_message.msg_controllen=peek_control.size();
+            const auto peek=socket_detail::SocketStateAccess::receive_rights(transfer.descriptor,peek_message,MSG_PEEK|MSG_DONTWAIT);
+            if(peek<0){
+                if(errno==EINTR)continue;
+                if(errno==EINPROGRESS || errno==EAGAIN || errno==EWOULDBLOCK)break;
+                throw HostCallFault("程序控制通道預覽失敗");
+            }
+            if(peek>=0)for(auto* header=CMSG_FIRSTHDR(&peek_message);header;header=CMSG_NXTHDR(&peek_message,header))
+                if(header->cmsg_level==SOL_SOCKET && header->cmsg_type==SCM_RIGHTS && header->cmsg_len>=CMSG_LEN(sizeof(int))){
+                    const auto bytes=header->cmsg_len-CMSG_LEN(0);
+                    for(std::size_t at=0;at+sizeof(int)<=bytes;at+=sizeof(int)){int fd=-1;std::memcpy(&fd,CMSG_DATA(header)+at,sizeof(fd));(void)socket_detail::SocketStateAccess::close_descriptor(fd);}
+                }
+            if(peek>=static_cast<ssize_t>(sizeof(next)) &&
+               (next.kind==6 || next.kind==7 || next.kind==11 || next.kind==12 ||
+                next.kind==14 || next.kind==15 || next.kind==18 || next.kind==family_request_kind))break;
+        }
         TransferMessage packet;sockaddr_un sender{};std::array<std::uint8_t,1232> context{};std::array<iovec,2> data{{{&packet,sizeof(packet)},{context.data(),context.size()}}};msghdr message{};
         alignas(cmsghdr) std::array<char,CMSG_SPACE(2*sizeof(int))> control{};message.msg_name=&sender;message.msg_namelen=sizeof(sender);message.msg_iov=data.data();message.msg_iovlen=data.size();message.msg_control=control.data();message.msg_controllen=control.size();
         ssize_t count;{startup_profile::Scope measurement("scheduler",force?"handle_recvmsg_forced":"handle_recvmsg_idle");count=socket_detail::SocketStateAccess::receive_rights(transfer.descriptor,message,MSG_DONTWAIT);}if(count<0){if(errno==EINTR)continue;if(errno==EINPROGRESS)break;if(errno==EAGAIN || errno==EWOULDBLOCK){transfer.next_idle_poll=now+std::chrono::milliseconds(1);break;}throw HostCallFault("程序 handle 通道接收失敗");}

@@ -16,6 +16,7 @@ void put(std::vector<std::uint8_t>& bytes,std::size_t offset,std::uint64_t value
 std::vector<std::uint8_t> text_bytes(std::u16string_view text){auto bytes=utf16_bytes(text);bytes.resize(text.size()*2);return bytes;}
 }
 std::optional<std::uint32_t> WindowsServices::invoke_nt_registry(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    RegistryIoScope io([&](const auto& work){await_registry_io(state,memory,work);});
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;auto& registry=runtime_.registry;
     const auto finish=[&](std::uint32_t status){arg.return_to(state,status);return std::optional<std::uint32_t>{};};
     if(symbol=="NtClose"){

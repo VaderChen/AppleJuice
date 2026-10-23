@@ -1,4 +1,5 @@
 #include "metal_shared_frame.hpp"
+#include "x64arm/resource_usage.hpp"
 #include "metal_command_encoder.hpp"
 #include "fixed_metal_library.hpp"
 #import <AppKit/AppKit.h>
@@ -251,7 +252,21 @@ public:
             if(layer_ && presentation_dirty_){
                 const auto request=timing_?CACurrentMediaTime():0;
                 auto drawable=[layer_ nextDrawable];
+                record_diagnostic(drawable?"raster_drawable":"raster_no_drawable");
+                if(static NSUInteger reported=0;drawable && layer_ && ++reported%120==1){
+                    // 呈現視窗所在螢幕與狀態：名稱、更新率、縮放、drawable 尺寸、遮蔽狀態。
+                    NSWindow* window=presentation_view_?presentation_view_.window:nil;
+                    NSScreen* screen=window.screen;
+                    // 呈現 view 被放在宿主 view 最底層；記錄兄弟 view 數、自身框與是否隱藏，判斷是否被其他圖層蓋住。
+                    NSView* host=presentation_view_.superview;long fps=0;if(@available(macOS 12.0,*))fps=screen?static_cast<long>(screen.maximumFramesPerSecond):0;
+                    char text[240];std::snprintf(text,sizeof text,"screen=%s fps=%ld scale=%.1f drawable=%.0fx%.0f texture=%ux%u visible=%d key=%d siblings=%lu frame=%.0fx%.0f host=%.0fx%.0f hidden=%d",
+                        screen?screen.localizedName.UTF8String:"?",fps,screen?screen.backingScaleFactor:0.0,
+                        layer_.drawableSize.width,layer_.drawableSize.height,width_,height_,window?((window.occlusionState&NSWindowOcclusionStateVisible)!=0):-1,window?window.isKeyWindow:-1,
+                        static_cast<unsigned long>(host?host.subviews.count:0),presentation_view_.frame.size.width,presentation_view_.frame.size.height,host?host.bounds.size.width:0.0,host?host.bounds.size.height:0.0,presentation_view_.hidden?1:0);
+                    set_diagnostic("raster_present_state",text);
+                }
                 if(drawable){
+                    [drawable addPresentedHandler:^(id<MTLDrawable> shown){if(shown.presentedTime>0)record_diagnostic("raster_presented");else record_diagnostic("raster_present_dropped");}];
                     auto copy=[commands_ blitCommandEncoder];MetalEncoderScope copy_scope{copy};
                     [copy copyFromTexture:texture_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:drawable.texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
                     copy_scope.end();

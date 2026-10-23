@@ -78,6 +78,9 @@ private:
     void invalidate_aot_site_caches() noexcept;
     std::span<const resident_abi::DispatchEntry> aot_site_cache_entries(std::size_t offset) const;
     void discard_block(std::size_t offset);
+    // 批次回收專用：true 要求同一安全點已清除全部站點快取，且中間沒有執行客體。
+    // 保留單塊入口原有契約；避免每塊回收都重掃所有仍存活的呼叫點。
+    void discard_block(std::size_t offset,bool site_caches_invalidated);
     // 直接連結：把已發布串接區塊中條件出口樁的一字改為 B thunk；thunk 為固定模板，
     // 執行期核對框架、預算、目標 body 與作用域後直接進入目標節點，否則退回原出口路徑。
     // elide=true 從樁開頭連結，略過 RIP／旗標物化（呼叫端須證明目標入口不讀舊旗標）。

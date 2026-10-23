@@ -80,6 +80,9 @@ struct GraphicsDraw {
     std::uint32_t alpha_function{},alpha_reference{};
     bool indexed{};
     std::shared_ptr<GraphicsResource> visibility;std::uint32_t visibility_offset{};
+    // Draw*InstancedIndirect：count／instances／start／base_vertex／start_instance 改由此 buffer 的 offset 處取得
+    // （D3D11 與 Metal 的間接參數佈局相同）；GPU 寫入的參數不經 CPU 讀回。
+    std::shared_ptr<GraphicsResource> indirect;std::uint32_t indirect_offset{};
 };
 struct FixedGraphicsVertex {std::array<float,4> position,color,texcoord;std::array<float,4> secondary{};};
 struct FixedGraphicsDraw {
@@ -121,6 +124,7 @@ public:
     virtual bool graphics_clear_unordered(const GraphicsView&,std::array<std::uint32_t,4>,bool){throw std::runtime_error("後端缺少 UAV 清除操作");}
     virtual void graphics_draw(const GraphicsDraw&){throw std::runtime_error("後端缺少繪製操作");}
     virtual void graphics_dispatch(const GraphicsStage&,std::array<std::uint32_t,3>){throw std::runtime_error("後端缺少運算操作");}
+    virtual void graphics_dispatch_indirect(const GraphicsStage&,const std::shared_ptr<GraphicsResource>&,std::uint32_t){throw std::runtime_error("後端缺少間接運算操作");}
     virtual void graphics_mips(const GraphicsView&){throw std::runtime_error("後端缺少 mipmap 操作");}
     // 呼叫期間由呼叫端持有跨程序鎖；返回前 GPU 已完成寫入。
     virtual void graphics_export_frame(const GraphicsView&,void*,std::size_t,std::uint32_t,std::shared_ptr<void> = {}){throw std::runtime_error("後端缺少共用影格匯出");}

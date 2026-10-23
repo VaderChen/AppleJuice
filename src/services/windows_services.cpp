@@ -1265,6 +1265,24 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     return true;
 }
 #endif
+#include "registry_service_dependencies.inc"
+bool WindowsServices::defer_registry_io_call(GuestState& state,GuestMemory& memory){
+    if(!registry_io_busy_ || threads_.current==registry_io_owner_ || runtime_.forced_exit_code())return false;
+    // 續行尚未 pop callback frame，普通入口也尚未讀寫 API 輸出；等待後可安全重新進入。
+    bool dependent=true;
+    const auto table=runtime_service_descriptors();
+    if(state.rip.value>=stub_base_.value && (state.rip.value-stub_base_.value)%16==0){
+        const auto index=(state.rip.value-stub_base_.value)/16;
+        if(index<services.size())dependent=registry_dependent_service({"kernel32.dll",services[index].name,services[index].arguments,services[index].wide_arguments});
+        else if(index-services.size()<table.size())dependent=registry_dependent_service(table[index-services.size()]);
+    }
+    if(!dependent)return false;
+    auto& thread=threads_.items.at(threads_.current);
+    thread.registry_deferred_wait.emplace(std::move(thread.wait));
+    thread.status=ThreadStatus::Waiting;thread.wait={};
+    thread.wait.kind=ThreadWaitKind::RegistryIo;
+    schedule(state,memory);return true;
+}
 std::optional<std::uint32_t> WindowsServices::invoke(GuestState& state, GuestMemory& memory) {
     return invoke_boundary(state,memory);
 }
@@ -1273,12 +1291,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
     // 協調者已接手此執行緒的完整 provider；成功、等待與例外均由同一流程完成。
     // worker 的窄服務不經這裡，也不能提早清掉尚未處理的協調請求。
     resident_service_requests_.erase(threads_.current);
+#ifdef X64ARM_HOST_SERVICES_MANAGED_FP
+    if(registry_io_busy_ && environment){environment->restore();environment=nullptr;}
+#endif
+    if(defer_registry_io_call(state,memory))return std::nullopt;
     entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,
         entry_runtime_profile::enabled()?name(state.rip):std::string_view{});
     static const bool trace_slow_calls=std::getenv("X64ARM_TRACE_SLOW_CALLS")!=nullptr;
     struct CountScope {
         WindowsServices& self;std::uint64_t rip,thread;bool trace;std::chrono::steady_clock::time_point start;
+        const char* phase_name{"boundary"};std::chrono::steady_clock::time_point phase_start{start};
+        void phase(const char* next){
+            if(!trace)return;
+            const auto now=std::chrono::steady_clock::now();
+            const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(now-phase_start).count();
+            if(elapsed>=5000){const auto symbol=self.name(GuestAddress{rip});
+                std::fprintf(stderr,"slow_service_phase pid=%llu thread=%llu phase=%s duration_us=%lld end_unix_us=%llu name=%.*s\n",
+                    static_cast<unsigned long long>(self.process_id()),static_cast<unsigned long long>(thread),phase_name,
+                    static_cast<long long>(elapsed),static_cast<unsigned long long>(startup_profile::unix_us()),static_cast<int>(symbol.size()),symbol.data());}
+            phase_name=next;phase_start=now;
+        }
         ~CountScope(){if(!self.service_counts_enabled_ && !trace)return;
+            phase("finished");
             const auto now=std::chrono::steady_clock::now();
             const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(now-start).count();
             if(trace && elapsed>=5000){const auto symbol=self.name(GuestAddress{rip});
@@ -1393,6 +1427,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
             return result;
     }
     startup_profile::Scope measurement("api",startup_profile::enabled()?name(state.rip):std::string_view{});
+    count_scope.phase("preamble");
     process_io::Scope io_scope(runtime_.io_counters,io_publisher_.get());
     struct GuiResources {
         GuiState& gui;
@@ -1424,6 +1459,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
         ~PreserveClock(){state.tsc=tsc+services.nested_instruction_count()-nested;}
     } clock{state,*this,state.tsc,nested_instruction_count()};
     const std::string_view trace=trace_services_;
+    count_scope.phase("trace");
     const auto service_name=trace.empty()?std::string_view{}:name(state.rip);
     const bool tracing=!trace.empty() && (trace=="*" || trace.find(service_name)!=trace.npos);
     std::uint64_t trace_duplicate_output{};
@@ -1514,7 +1550,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
         const auto aggregate=index<services.size()?0U:runtime_service_descriptors()[index-services.size()].aggregate_arguments;
         for(unsigned i=x86_?0:4;i<arguments;++i) {try {std::fprintf(stderr,"[api] arg%u=%llx\n",i,static_cast<unsigned long long>(WindowsCall(state,memory,arguments,true,wide,aggregate)(i)));}catch(const MemoryFault&) {break;}}
     }
+    count_scope.phase("body");
     const auto result = invoke_service(state, memory);
+    count_scope.phase("completion");
     // 記憶體操作可合法寫入 TEB 本身；完整入口也不得用呼叫前的快照蓋回輸出。
     if((memory_operation || string_operation) && runtime_.image.base)last_error_=static_cast<std::uint32_t>(memory.load(GuestAddress{x86_?state.fs_base+0x34:state.gs_base+0x68},32));
     if(tracing)std::fprintf(stderr,"[api] %.*s rax=%llx last_error=%u errno=%llu\n",static_cast<int>(service_name.size()),service_name.data(),static_cast<unsigned long long>(state.reg(Gpr::Rax)),last_error_,static_cast<unsigned long long>(memory.load(GuestAddress{runtime_.errno_cell},32)));

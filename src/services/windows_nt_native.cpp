@@ -143,6 +143,11 @@ std::optional<ExecutionResult> WindowsServices::dispatch_software_interrupt(Gues
     if(vector==0x29){
         // Fast-fail 是第二次機會、不可繼續的程序失敗，不能進入一般 SEH／VEH。
         state.rip.value=(state.rip.value-length)&(x86_?UINT32_MAX:UINT64_MAX);
+        // 終止前記錄 fast-fail 代碼（RCX／ECX）與位址：多核平行模式下的 0xC0000409 需要知道是 stack cookie、
+        // guard ICall 還是其他檢查失敗；一次性輸出，不影響正常路徑。
+        {const auto code=static_cast<std::uint32_t>(state.reg(Gpr::Rcx));const auto* image=module_image(state.rip.value,true);
+         std::fprintf(stderr,"fast_fail pid=%u code=%u rip=0x%llx module=%s offset=0x%llx thread=%llu\n",process_id(),code,static_cast<unsigned long long>(state.rip.value),
+             image?utf16_to_utf8(image->path).c_str():"?",static_cast<unsigned long long>(image?state.rip.value-image->base:0),static_cast<unsigned long long>(threads_.current));}
         (void)emit_debug_event(state,memory,debugger::Exception{0xc0000409U,1,0,state.rip.value,{static_cast<std::uint32_t>(state.reg(Gpr::Rcx))},false});
         record_job_exit(0xc0000409U);(void)emit_debug_event(state,memory,debugger::ExitProcess{0xc0000409U});
         ExecutionResult result;result.reason=StopReason::Exited;result.exit_code=0xc0000409U;result.rip=state.rip;return result;

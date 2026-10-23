@@ -1309,6 +1309,25 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
     // 只更新相符等待者，不輪詢外部事件、不切換目前客體；worker 重綁時
     // 就能看到新的 Runnable 集合，無須等下一個時間片。
     bool changed=false;
+    // 不取共用命名空間鎖，先判斷這組 handle 是否「可能」就緒；可能就緒時才在鎖下重查／消耗，保留 auto-reset 與
+    // WaitAll 的原子性。共用 event 讀原子訊號；本地物件、執行緒、子程序與檔案 I/O 的狀態不需共用鎖；共用 mutex 的
+    // 擁有權（含 abandoned 探查）只能在鎖下判斷，視為可能就緒。schedule 在 wake_threads 之前保存喚醒 epoch，
+    // 檢查後才發生的 SetEvent 不會遺失。
+    const auto may_be_ready=[&](const std::vector<std::uint64_t>& handles,bool all,std::uint64_t thread_id){
+        bool any=false,every=true;
+        for(const auto handle:handles){
+            bool possible=true;
+            if(const auto object=runtime_.wait_objects.find(handle);object!=runtime_.wait_objects.end()){
+                if(object->second.shared_event)possible=object->second.signaled();
+                else if(runtime_.wait_lock_descriptor(object->second)<0)possible=runtime_.wait_ready(object->second,handles,all,thread_id);
+            }else if(const auto target=this->thread_id(handle))possible=threads_.items.at(target).status==ThreadStatus::Exited;
+            else if(const auto child=process_signaled(handle))possible=*child;
+            else if(const auto file=file_io_signaled(handle))possible=*file;
+            any|=possible;every&=possible;
+            if(all?!every:any)break;
+        }
+        return all?every:any;
+    };
     for (const auto &[id, entry] : live_threads()) {
         auto &thread = *entry;
         if (thread.status != ThreadStatus::Waiting)
@@ -1350,6 +1369,17 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
         bool ready = false;
         bool guest_return = false;
         std::uint64_t result = 258;
+        if(wait.kind==ThreadWaitKind::RegistryIo){
+            // owner 的原生呼叫框架仍在外層；其他依賴登錄的 API 尚未執行任何副作用。
+            if(id==registry_io_owner_ ? registry_io_ready() : !registry_io_busy_){
+                if(thread.registry_deferred_wait){
+                    thread.wait=std::move(*thread.registry_deferred_wait);
+                    thread.registry_deferred_wait.reset();
+                }
+                thread.status=ThreadStatus::Runnable;
+            }
+            continue;
+        }
         if(wait.kind==ThreadWaitKind::HandleTransfer){
             if(finish_duplicate_remote_handle(thread.context,memory,id)){
                 thread.status=ThreadStatus::Runnable;thread.wait={};
@@ -1474,8 +1504,11 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
                 const auto handle=wait.handles[2];bool signaled=false;
                 if(!handle)signaled=memory.load(GuestAddress{wait.handles[1]},x86_?32:64)!=0x103;
                 else if(const auto event=runtime_.wait_objects.find(handle);event!=runtime_.wait_objects.end()){
-                    SharedEventLock event_lock(runtime_.wait_lock_descriptor(event->second));
-                    auto& signal=runtime_.wait_state(event->second);signaled=signal.signaled();if(signaled)signal.consume_signal();
+                    // 共用 event 尚未有訊號時不取命名空間鎖（仍照常判定逾時）；有訊號才在鎖下重查並消耗。
+                    if(!event->second.shared_event || event->second.signaled()){
+                        SharedEventLock event_lock(runtime_.wait_lock_descriptor(event->second));
+                        auto& signal=runtime_.wait_state(event->second);signaled=signal.signaled();if(signaled)signal.consume_signal();
+                    }
                 }else if(const auto file=file_io_signaled(handle))signaled=*file;
                 else signaled=true; // handle 在等待期間被關閉，由共用查詢流程回報錯誤。
                 wait.signaled=signaled;
@@ -1531,7 +1564,8 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
                        (gui_queue_category(message) & wait.gui_mask) && (!wait.gui_new_only || !message.queue_seen);
             });
             int lock = -1;
-            for (const auto handle : wait.handles) {
+            const bool possible = wait.handles.empty() || may_be_ready(wait.handles, wait.all, id);
+            for (const auto handle : possible ? wait.handles : std::vector<std::uint64_t>{}) {
                 const auto object = runtime_.wait_objects.find(handle);
                 if (object != runtime_.wait_objects.end() && runtime_.wait_lock_descriptor(object->second) >= 0) {
                     lock = runtime_.wait_lock_descriptor(object->second);
@@ -1539,7 +1573,9 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
                 }
             }
             SharedEventLock event_lock(lock);
-            for (const auto handle : wait.handles) {
+            if (!possible && wait.all)
+                ready = false;
+            for (const auto handle : possible ? wait.handles : std::vector<std::uint64_t>{}) {
                 const auto object = runtime_.wait_objects.find(handle);
                 const auto target = thread_id(handle);
                 const auto process = process_signaled(handle);
@@ -1573,21 +1609,8 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             // 只有共用 event、且尚未到期時，先用原子訊號排除不可能成功的等待。
             // 正面結果仍在原命名空間鎖下重查／消耗，保留 auto-reset 與 WaitAll 的原子性。
             // schedule 在 wake_threads 之前保存喚醒 epoch；檢查後的 SetEvent 不會遺失。
-            if (wait.deadline > runtime_.clock_ticks && !wait.handles.empty()) {
-                bool events_only = true, any = false, every = true;
-                for (const auto handle : wait.handles) {
-                    const auto object = runtime_.wait_objects.find(handle);
-                    if (object == runtime_.wait_objects.end() || !object->second.shared_event) {
-                        events_only = false;
-                        break;
-                    }
-                    const bool signaled = object->second.signaled();
-                    any |= signaled;
-                    every &= signaled;
-                }
-                if (events_only && !(wait.all ? every : any))
-                    continue;
-            }
+            if (wait.deadline > runtime_.clock_ticks && !wait.handles.empty() && !may_be_ready(wait.handles, wait.all, id))
+                continue;
             int shared_lock = -1;
             for (const auto handle : wait.handles) {
                 const auto object = runtime_.wait_objects.find(handle);
@@ -2156,6 +2179,7 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
                                    (item.second.wait.kind == ThreadWaitKind::SocketSelect ||
                                     item.second.wait.kind == ThreadWaitKind::HandleTransfer ||
                                     item.second.wait.kind == ThreadWaitKind::ProcessCreation ||
+                                    item.second.wait.kind == ThreadWaitKind::RegistryIo ||
                                     item.second.wait.kind == ThreadWaitKind::EtwTrace ||
                                     item.second.wait.kind == ThreadWaitKind::DebugEvent ||
                                     item.second.wait.kind == ThreadWaitKind::CrtProcess);

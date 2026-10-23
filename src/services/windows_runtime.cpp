@@ -1639,6 +1639,15 @@ void WindowsServices::set_tls_allocation(GuestMemory& memory,std::size_t index,b
     }
     runtime_.tls_used[index]=used;
 }
+// CRT 的無效參數／watson 路徑最終以 0xC0000409 結束程序；一次性記錄呼叫者返回位址與模組，供多核平行模式的
+// fail-fast 定位（不改變行為）。
+void WindowsServices::report_crt_fast_fail(const GuestState& state,GuestMemory& memory,std::string_view symbol){
+    std::uint64_t caller=0;
+    try{caller=memory.load(GuestAddress{state.reg(Gpr::Rsp)},x86_?32:64);}catch(const MemoryFault&){caller=0;}
+    const auto* image=module_image(caller,true);
+    std::fprintf(stderr,"crt_fast_fail pid=%u symbol=%.*s caller=0x%llx module=%s offset=0x%llx thread=%llu\n",process_id(),static_cast<int>(symbol.size()),symbol.data(),
+        static_cast<unsigned long long>(caller),image?utf16_to_utf8(image->path).c_str():"?",static_cast<unsigned long long>(image?caller-image->base:0),static_cast<unsigned long long>(threads_.current));
+}
 std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
     // 字元家族的操作已由不可變 descriptor 索引；完整與常駐入口共用 locale／ABI 實作。
     if(crt_character_requested() && crt_character_operation(service))return invoke_crt_character(state,memory,service);
@@ -2297,8 +2306,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
     else if (symbol == "setvbuf") { if (crt_stream(arg(0)) < runtime_base_.value + 0x800 || crt_stream(arg(0)) > runtime_base_.value + 0x900) result = UINT32_MAX; }
     else if (symbol == "puts") { const CrtIoScope scope(*this,state,memory,runtime_base_.value+0x880);if(!scope)return std::nullopt;auto text = read_ansi(memory, arg(0)); text += '\n'; output(text); }
     else if (symbol == "putchar") { const CrtIoScope scope(*this,state,memory,runtime_base_.value+0x880);if(!scope)return std::nullopt;output(std::string(1, static_cast<char>(arg(0) & 255))); result = arg(0) & 255; }
-    else if(symbol=="_invoke_watson")return 0xc0000409U;
+    else if(symbol=="_invoke_watson"){report_crt_fast_fail(state,memory,symbol);return 0xc0000409U;}
     else if(symbol=="_invalid_parameter_noinfo" || symbol=="_invalid_parameter" || symbol=="_invalid_parameter_noinfo_noreturn"){
+        if(!current_invalid_parameter_handler() || symbol=="_invalid_parameter_noinfo_noreturn")report_crt_fast_fail(state,memory,symbol);
         if(current_invalid_parameter_handler()){
             std::vector<std::uint64_t> values(5,0);if(symbol=="_invalid_parameter")for(unsigned i=0;i<5;++i)values[i]=arg(i);
             const bool fatal=symbol=="_invalid_parameter_noinfo_noreturn";

@@ -14,8 +14,9 @@ registry_hive::Tree registry_hive_tree(const RegistryState& state,const std::u16
     if(!tree.keys.contains(u""))throw registry_hive::Error{1021};return tree;
 }
 std::uint32_t registry_hive_write(HostFile& file,std::span<const std::uint8_t> bytes){
+    // HostFile 的開啟／鎖定狀態仍由協調者序列化；只將私有 POSIX 登錄存放區 I/O 交給 worker。
     std::size_t offset=0;while(offset<bytes.size()){const auto written=file.write(bytes.subspan(offset),offset);if(written.error)return written.error;if(!written.bytes || written.bytes>bytes.size()-offset)return 29;offset+=static_cast<std::size_t>(written.bytes);}
-    if(const auto error=file.truncate(bytes.size()))return error;return file.flush();
+    const auto result=file.truncate(bytes.size());return result?result:file.flush();
 }
 }
 std::uint32_t WindowsServices::flush_registry_hives(){

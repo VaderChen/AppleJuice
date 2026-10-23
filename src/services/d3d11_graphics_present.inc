@@ -54,7 +54,8 @@
                         {static_cast<std::uint32_t>(r[0]),static_cast<std::uint32_t>(r[1]),0},
                         {static_cast<std::uint32_t>(r[0]),static_cast<std::uint32_t>(r[1]),0,static_cast<std::uint32_t>(r[2]),static_cast<std::uint32_t>(r[3]),1});
                 }
-                if(gui_.windows.contains(swap->window))swap->native->graphics_present(composed);else publish_remote_frame(swap->window,*swap->native,composed);
+                if(gui_.windows.contains(swap->window)){swap->native->graphics_present(composed);record_diagnostic("d3d11_present_local");}
+                else {publish_remote_frame(swap->window,*swap->native,composed);record_diagnostic("d3d11_present_remote");}
                 std::swap(swap->present_frame,swap->present_spare);
                 if(gpu_handoff)swap->native->graphics_handoff(*producer,shared_view);else swap->native->graphics_flush(true);
                 ++swap->frames;++bridge.graphics_frames;

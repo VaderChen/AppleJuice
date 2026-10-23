@@ -338,6 +338,13 @@ private:
     GuiDialogLayout gui_dialog_layout(GuestMemory&,std::uint64_t,std::uint64_t);
     std::filesystem::path registry_file_;
     RegistryStoreCache registry_store_cache_;
+    struct RegistryIoWorker;
+    std::shared_ptr<RegistryIoWorker> registry_io_worker_;
+    bool registry_io_busy_{};
+    std::uint64_t registry_io_owner_{};
+    bool registry_io_ready() const;
+    bool defer_registry_io_call(GuestState&,GuestMemory&);
+    void await_registry_io(GuestState&,GuestMemory&,const std::function<void()>&);
     OpenGlState opengl_;
     std::optional<std::uint32_t> invoke_opengl(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::map<std::uint64_t,std::shared_ptr<PowerRequest>> power_requests_;
@@ -965,6 +972,7 @@ private:
     std::optional<MediaSurface> media_graphics_surface(std::uint64_t,std::uint32_t) const;
     std::optional<std::uint32_t> invoke_wasapi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void poll_wasapi();
+    void report_crt_fast_fail(const GuestState&,GuestMemory&,std::string_view);
     bool wasapi_waiting() const;
     std::uint64_t wasapi_wakeup_ns() const;
     std::shared_ptr<DirectInputState> dinput_;
