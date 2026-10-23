@@ -1,6 +1,6 @@
 // 單 EXE Smoke 經正式 DOM 與 Go bridge 操作；不保存啟動參數或終端內容到結果。
 (async () => {
-  const checks = [], captures = [];
+  const checks = [], captures = [], observedRuns = [];
   let observedUsage = null;
   const config = smokeConfig.launch;
   const deadline = Date.now() + (smokeConfig.timeoutSeconds - 2) * 1000;
@@ -38,7 +38,7 @@
   }
   async function finish(passed, error) {
     await api('smokeResult', { result: {
-      passed, scenario: 'launch', checks, captures, program: programResult(), log: logResult, observedUsage,
+      passed, scenario: 'launch', checks, captures, program: programResult(), log: logResult, observedUsage, observedRuns,
       startedAt, completedAt: new Date().toISOString(), ...(error ? { error: String(error) } : {})
     } });
   }
@@ -116,21 +116,34 @@
       captures.push('launch-workspace.png');
     }
     if (config.observeSeconds) {
-      const observeUntil = Date.now() + config.observeSeconds * 1000;
-      while (Date.now() < observeUntil && !(await api('smokeStopRequested'))) {
-        if (!active(selected())) throw new Error('客體在觀察期間提前結束');
-        await delay(250);
+      const restarts = config.restartCount || 0;
+      check('連續啟停次數合法', Number.isInteger(restarts) && restarts >= 0 && restarts <= 4 && (!restarts || !config.temporary));
+      for (let cycle = 0; cycle <= restarts; cycle++) {
+        if (cycle) {
+          const previousRun = selected().runId;
+          const play = document.querySelector(`[data-id="${launched}"] .program-action`);
+          check('停止後可由相同列表再次執行', !!play && !play.disabled);
+          play.click();
+          await until(() => !busy, '同一 Launcher 再次啟動');
+          check('再次啟動建立新的客體執行階段', active(selected()) && selected().runId !== previousRun && selected().pid > 0);
+        }
+        const observeUntil = Date.now() + config.observeSeconds * 1000;
+        while (Date.now() < observeUntil && !(await api('smokeStopRequested'))) {
+          if (!active(selected())) throw new Error('客體在觀察期間提前結束');
+          await delay(250);
+        }
+        check('客體在觀察期間持續執行', active(selected()));
+        observedUsage = { value: selected().usage, gpu: $('usage-gpu').textContent, memory: $('usage-gpu-memory').textContent, cache: $('usage-cache').textContent };
+        observedRuns.push({ cycle, program: programResult(), usage: observedUsage });
+        if (config.capture) {
+          await api('smokeSnapshot', { data: 'launch-running.png' });
+          await until(() => api('smokeSnapshotReady', { data: 'launch-running.png' }), '執行中資源快照');
+          captures.push('launch-running.png');
+        }
+        await click('stop');
+        await until(() => !active(selected()), '由 UI 停止客體');
+        check('UI 停止客體且保留執行紀錄', selected().status === 'stopped' && !!selected().runId);
       }
-      check('客體在觀察期間持續執行', active(selected()));
-      observedUsage = { value: selected().usage, gpu: $('usage-gpu').textContent, memory: $('usage-gpu-memory').textContent, cache: $('usage-cache').textContent };
-      if (config.capture) {
-        await api('smokeSnapshot', { data: 'launch-running.png' });
-        await until(() => api('smokeSnapshotReady', { data: 'launch-running.png' }), '執行中資源快照');
-        captures.push('launch-running.png');
-      }
-      await click('stop');
-      await until(() => !active(selected()), '由 UI 停止客體');
-      check('UI 停止客體且保留執行紀錄', selected().status === 'stopped' && !!selected().runId);
     } else {
       await until(() => !active(selected()), '客體自行結束');
       check('客體自行結束且退出碼符合預期', selected().exitCode === config.expectedExitCode && ['exited', 'failed'].includes(selected().status));

@@ -47,6 +47,7 @@ python3 scripts/build_launcher.py --engine-build-dir build/release \
 
 ## 散布成品
 
+
 散布完整 Launcher app 時保留內部目錄、簽章及 `Contents/Resources/Licenses/`。單獨散布 CLI 亦需附帶適用授權。不要封裝個人設定、客體程式、Windows 磁碟資料、憑證或私鑰。
 
 本機預設為 ad-hoc 簽署；Developer ID 與公證須自行準備並完成，見[macOS 簽署](macos-signing.md)。授權見[適用範圍](licensing.md)及[第三方聲明](../THIRD-PARTY-NOTICES.md)。

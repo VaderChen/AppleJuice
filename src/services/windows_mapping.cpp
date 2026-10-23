@@ -225,9 +225,14 @@ Opened open_mapping(const std::shared_ptr<Session>& ns, std::u16string_view name
 std::shared_ptr<MemoryBacking> backing(const std::shared_ptr<Mapping>& mapping) {
     if (auto current = mapping->backing.lock()) return current;
     // 匿名區段由 mapping 持有且大小固定；原生 JIT 的共享標記保留軟體排序屏障，
-    // 不以硬體 TSO 授權決定生命期。一般檔案仍使用受檢存取，避免外部截短。
+    // 不以硬體 TSO 授權決定生命期。檔案區段：Windows 禁止截短仍被映射的檔案，區段大小建立後固定；宿主端若
+    // 截短，原生 MMU 視窗的 SIGBUS 由既有故障處理器轉成客體故障，不影響其他頁。先前把檔案映射標成受檢存取，
+    // 只要有一個可寫的檔案 view，整個程序就掉到受檢記憶體模式並重編全部模組（Steam 的 browser／utility 各有
+    // 一個 4 MiB／516 KiB 的讀寫檔案映射）。X64ARM_FILE_MAPPING_CHECKED=1 回到受檢存取以供對照。
+    static const bool file_checked=[] {const auto* value=std::getenv("X64ARM_FILE_MAPPING_CHECKED");return value && std::string_view(value)=="1";}();
+    const bool file_backed=mapping->file_lifetime || mapping->file_descriptor>=0;
     auto result = std::make_shared<MemoryBacking>(mapping,std::span(static_cast<std::uint8_t*>(mapping->data),static_cast<std::size_t>(mapping->size)),
-        !mapping->file_lifetime && mapping->file_descriptor<0?MemoryBacking::ExternalAccess::StableShared:MemoryBacking::ExternalAccess::Checked);
+        !file_backed || !file_checked?MemoryBacking::ExternalAccess::StableShared:MemoryBacking::ExternalAccess::Checked);
     mapping->backing = result; return result;
 }
 bool allows(std::uint32_t protection, std::uint32_t access) {

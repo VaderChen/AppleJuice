@@ -7,6 +7,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <optional>
 
 namespace x64arm {
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_TIMESTAMP
@@ -34,6 +36,18 @@ bool srw_service(std::string_view symbol) noexcept {
         symbol=="TryAcquireSRWLockExclusive" || symbol=="TryAcquireSRWLockShared" ||
         symbol=="ReleaseSRWLockExclusive" || symbol=="ReleaseSRWLockShared";
 }
+// 同一組執行緒內服務共用 Win32 stdcall 框架；配置、回呼、等待與映射
+// 仍交回協調者。Win64 沿用暫存器 ABI，不因擴充 Win32 改變原有資格。
+std::optional<unsigned> context_service_arguments(std::string_view symbol) noexcept {
+    if(symbol=="GetLastError" || symbol=="GetCurrentThreadId" || symbol=="SwitchToThread")return 0;
+    if(symbol=="TlsSetValue" || symbol=="FlsSetValue")return 2;
+    if(symbol=="SetLastError" || symbol=="TlsGetValue" || symbol=="TlsGetValue2" ||
+       symbol=="FlsGetValue" || symbol=="FlsGetValue2" ||
+       symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency" ||
+       symbol=="EnterCriticalSection" || symbol=="TryEnterCriticalSection" || symbol=="LeaveCriticalSection" ||
+       symbol=="WakeConditionVariable" || symbol=="WakeAllConditionVariable" || srw_service(symbol))return 1;
+    return std::nullopt;
+}
 // 持有者在其他 worker 上執行時，短暫等待通常比進協調者排隊便宜（Windows SRW 亦先自旋）；
 // 約 1～2 µs 後仍未釋放就交回協調者，不讓等待者佔住 worker。
 constexpr unsigned srw_spin_limit=512;
@@ -45,8 +59,12 @@ inline void spin_pause() noexcept {
 }
 bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_PARALLEL_SERVICES");return !setting || std::string_view(setting)!="0";}();
-    if(!enabled || x86_ || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled() || runtime_.forced_exit_code())return false;
+    if(!enabled || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled() || runtime_.forced_exit_code())return false;
     const auto symbol=name(address);
+    if(x86_){
+        static const bool win32=[] {const auto* value=std::getenv("X64ARM_X86_PARALLEL_SERVICES");return !value || std::string_view(value)!="0";}();
+        return win32 && context_service_arguments(symbol).has_value() && (!srw_service(symbol) || parallel_srw_enabled());
+    }
     if(parallel_srw_enabled() && srw_service(symbol))return true;
     return symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue" ||
         symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
@@ -93,15 +111,18 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(const auto context=index.contexts.find(&state);context!=index.contexts.end())key=context->second;
     }
     auto found=threads_.items.find(key);
-    if(found==threads_.items.end() || found->second.teb!=state.gs_base)return false;
+    if(found==threads_.items.end() || found->second.teb!=(x86_?state.fs_base:state.gs_base))return false;
     auto& thread=found->second;const auto tid=found->first;const bool current=tid==threads_.current;
+    const unsigned unit=x86_?4U:8U;
+    const auto error_offset=x86_?0x34U:0x68U;
     // 所有存取先驗證。native_window 排除 COW、可執行寫入、外部 backing 及跨映射；
     // 失敗留給協調者處理，不在 worker 內改變映射或吞掉客體例外。
     const auto pointer=[&](std::uint64_t address,unsigned size,unsigned access)->void* {
-        if((address&(size-1U)) || address>UINT64_MAX-size)return nullptr;
+        if((address&(std::min(size,unit)-1U)) || address>UINT64_MAX-size ||
+           (x86_ && (address>UINT32_MAX || size>UINT64_C(0x100000000)-address)))return nullptr;
         // 一般 WindowsCall 在寫入後讀取返回位址；輸出若與返回槽重疊，交回完整路徑。
         const auto sp=state.reg(Gpr::Rsp);
-        if((access&2U) && (sp>UINT64_MAX-8 || (address<sp+8 && address+size>sp)))return nullptr;
+        if((access&2U) && (sp>UINT64_MAX-unit || (address<sp+unit && address+size>sp)))return nullptr;
         // 對齊的 4／8 byte 存取不跨客體頁；沿用相同原生權限，避免每次 API
         // 都經 native_pointer 重寫全體 worker 共用的 JIT 頁面快取與 ready 旗標。
         const auto window=memory.native_window(GuestAddress{address},access);
@@ -109,28 +130,42 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     };
     const auto load=[](const void* source,unsigned size){std::uint64_t value=0;std::memcpy(&value,source,size);return value;};
     const auto put=[](void* destination,std::uint64_t value,unsigned size){std::memcpy(destination,&value,size);};
-    auto* stack=pointer(state.reg(Gpr::Rsp),8,1);if(!stack || state.reg(Gpr::Rsp)>UINT64_MAX-8)return false;
-    const auto target=load(stack,8),first=state.reg(Gpr::Rcx),second=state.reg(Gpr::Rdx);
+    const auto sp=state.reg(Gpr::Rsp);
+    auto* stack=pointer(sp,unit,1);if(!stack || sp>UINT64_MAX-unit)return false;
+    const auto target=load(stack,unit);
+    auto first=state.reg(Gpr::Rcx),second=state.reg(Gpr::Rdx);
+    unsigned argument_count=0;
+    if(x86_){
+        const auto count=context_service_arguments(symbol);if(!count)return false;
+        argument_count=*count;
+        const auto extent=std::uint64_t{argument_count+1}*unit;
+        if(extent>UINT64_C(0x100000000)-sp)return false;
+        // 在任何客體副作用前核對全部引數；逐槽讀取容許合法框架跨頁。
+        for(unsigned n=0;n<argument_count;++n){
+            auto* slot=pointer(sp+(n+1)*unit,unit,1);if(!slot)return false;
+            if(n==0)first=load(slot,unit);else second=load(slot,unit);
+        }
+    }
     std::uint64_t result=0;
     // 與一般服務一樣，服務邊界保持客體可見的記憶體順序；不依賴宿主是否已授權 TSO。
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if(symbol=="GetLastError" || symbol=="SetLastError"){
-        auto* error=pointer(thread.teb+0x68,4,symbol=="GetLastError"?1U:2U);if(!error)return false;
+        auto* error=pointer(thread.teb+error_offset,4,symbol=="GetLastError"?1U:2U);if(!error)return false;
         if(symbol=="GetLastError")result=current?last_error_:load(error,4);
         else {put(error,static_cast<std::uint32_t>(first),4);if(current)last_error_=static_cast<std::uint32_t>(first);}
     }else if(symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue"){
         const auto index=static_cast<std::uint32_t>(first);const bool reading=symbol!="TlsSetValue";
         if(index>=runtime_.tls_used.size() || (!reading && !runtime_.tls_used[index]) || !runtime_.image.base)return false;
-        const auto offset=index<64?0x1480+index*8U:0x2000+(index-64)*8U;
-        auto* slot=pointer(thread.teb+offset,8,reading?1U:2U);if(!slot)return false;
-        auto* error=symbol=="TlsGetValue"?pointer(thread.teb+0x68,4,2):nullptr;
+        const auto offset=index<64?(x86_?0xe10U:0x1480U)+index*unit:0x2000+(index-64)*unit;
+        auto* slot=pointer(thread.teb+offset,unit,reading?1U:2U);if(!slot)return false;
+        auto* error=symbol=="TlsGetValue"?pointer(thread.teb+error_offset,4,2):nullptr;
         if(symbol=="TlsGetValue" && !error)return false;
-        if(reading){result=load(slot,8);if(error){put(error,0,4);if(current)last_error_=0;}}
-        else {put(slot,second,8);(current?runtime_.tls_values:thread.tls_values)[index]=second;result=1;}
+        if(reading){result=load(slot,unit);if(error){put(error,0,4);if(current)last_error_=0;}}
+        else {put(slot,second,unit);(current?runtime_.tls_values:thread.tls_values)[index]=second;result=1;}
     }else if(symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue"){
         const auto index=static_cast<std::uint32_t>(first);const bool reading=symbol!="FlsSetValue";
         if(index>=runtime_.fls_used.size() || !runtime_.fls_used[index])return false;
-        auto* error=symbol=="FlsGetValue"?pointer(thread.teb+0x68,4,2):nullptr;
+        auto* error=symbol=="FlsGetValue"?pointer(thread.teb+error_offset,4,2):nullptr;
         if(symbol=="FlsGetValue" && !error)return false;
         auto* mirror=!reading && fls_mirror_?pointer(thread.teb+0x1840+std::uint64_t{index}*8,8,2):nullptr;
         if(!reading && fls_mirror_ && !mirror)return false;
@@ -140,7 +175,6 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     }else if(symbol=="InitOnceBeginInitialize" || symbol=="InitOnceExecuteOnce"){
         const bool begin=symbol=="InitOnceBeginInitialize";
         if(begin && (static_cast<std::uint32_t>(second)&~1U))return false;
-        const auto sp=state.reg(Gpr::Rsp);
         if(sp%16!=8 || sp>UINT64_MAX-40)return false;
         const auto home=memory.native_window(GuestAddress{sp+8},2);
         if(!home.data || home.after<32)return false;
@@ -163,7 +197,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(!begin || (wait.kind==ThreadWaitKind::Once && !wait.handles.empty() && wait.handles[0]==first))wait={};
         result=1;
     }else if(symbol=="WakeConditionVariable" || symbol=="WakeAllConditionVariable"){
-        if(!pointer(first,8,2))return false;
+        if(!pointer(first,unit,2))return false;
         // 等待集合在 epoch 內固定。沒有尚待喚醒者時，通知已完整完成；有等待者
         // 才交協調者更新等待狀態、重新取得鎖及排程，避免無效通知停止全體 worker。
         for(const auto& [id,other]:threads_.items){
@@ -187,7 +221,6 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         // x64 合法控制遮罩只修改呼叫者 MXCSR，沒有 errno、回呼或輸出指標。
         // 非法遮罩沿既有完整例外路徑；有效呼叫共用原數學 provider。
         if(static_cast<std::uint32_t>(second)&0x70000U)return false;
-        const auto sp=state.reg(Gpr::Rsp);
         if(sp%16!=8 || sp>UINT64_MAX-40)return false;
         const auto home=memory.native_window(GuestAddress{sp+8},2);
         if(!home.data || home.after<32)return false;
@@ -196,15 +229,16 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     }else if(srw_service(symbol)){
         // 字組編碼與協調者路徑／客體常式相同：bit0 獨占、bit1 宿主有等待者、bit2 起為共用持有數。
         // 只以原子 CAS 改字組，不碰執行緒表；與協調者的 CAS 迴圈及客體 lock cmpxchg 互相線性化。
-        auto* word=pointer(first,8,3);if(!word)return false;
-        std::atomic_ref<std::uint64_t> lock(*static_cast<std::uint64_t*>(word));
+        auto* word=pointer(first,unit,3);if(!word)return false;
+        const auto operate=[&]<class Word>(Word* storage){
+        std::atomic_ref<Word> lock(*storage);
         const bool shared=symbol.ends_with("Shared");
         auto value=lock.load(std::memory_order_acquire);
         if(symbol.starts_with("Release")){
             for(;;){
                 // 有等待者時須由原服務喚醒；未持有則交回原路徑回報錯誤。
                 if((value&2) || (shared?!(value>>2):!(value&1))){detail::record_srw(detail::SrwEvent::WorkerDefer);return false;}
-                if(lock.compare_exchange_weak(value,shared?value-4:value&~UINT64_C(1),std::memory_order_acq_rel,std::memory_order_acquire))break;
+                if(lock.compare_exchange_weak(value,shared?value-Word{4}:value&~Word{1},std::memory_order_acq_rel,std::memory_order_acquire))break;
             }
             detail::record_srw(detail::SrwEvent::WorkerRelease);
         }else{
@@ -212,7 +246,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             const bool attempt=symbol.starts_with("Try");const bool spin=!attempt && active.size()>1;
             for(unsigned round=0;;){
                 if(!(value&1) && (shared || !(value>>2))){
-                    if(shared && (value>>2)==UINT64_C(0x3fffffffffffffff)){detail::record_srw(detail::SrwEvent::WorkerDefer);return false;}
+                    if(shared && (value>>2)==(std::numeric_limits<Word>::max()>>2)){detail::record_srw(detail::SrwEvent::WorkerDefer);return false;}
                     if(lock.compare_exchange_weak(value,shared?value+4:value|1,std::memory_order_acq_rel,std::memory_order_acquire)){
                         result=1;detail::record_srw(round?detail::SrwEvent::WorkerSpinAcquire:detail::SrwEvent::WorkerAcquire);break;
                     }
@@ -223,6 +257,9 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
                 spin_pause();value=lock.load(std::memory_order_acquire);
             }
         }
+        return true;
+        };
+        if(!(x86_?operate(static_cast<std::uint32_t*>(word)):operate(static_cast<std::uint64_t*>(word))))return false;
     }else if(symbol=="GetCurrentThreadId")result=thread_identifier(tid);
 else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"){
         auto* output=pointer(first,8,2);if(!output)return false;
@@ -232,9 +269,10 @@ else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"
     }else {
         const auto section_it=runtime_.critical_sections.find(first);if(section_it==runtime_.critical_sections.end())return false;
         const auto window=memory.native_window(GuestAddress{first},2);
-        if(!window.data || window.after<40)return false;
-        auto* lock_count=pointer(first+8,4,2);auto* recursion=pointer(first+12,4,2);auto* owner=pointer(first+16,8,2);
-        if(first>UINT64_MAX-40 || !lock_count || !recursion || !owner)return false;
+        const auto bytes=x86_?24U:40U;
+        if(!window.data || window.after<bytes)return false;
+        auto* lock_count=pointer(first+unit,4,2);auto* recursion=pointer(first+unit+4,4,2);auto* owner=pointer(first+unit+8,unit,2);
+        if(first>UINT64_MAX-bytes || !lock_count || !recursion || !owner)return false;
         auto& section=section_it->second;std::atomic_ref guard(section.worker_guard);std::uint32_t expected=0;
         // 僅回報等待，不持鎖進入信箱。舊 JIT 仍交回協調者；常駐 worker 可等待通知。
         if(!guard.compare_exchange_strong(expected,1,std::memory_order_acquire)){retry=true;return false;}
@@ -267,10 +305,12 @@ else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"
                 std::find(active.begin(),active.end(),&holder->second.context)!=active.end());
             return false;
         }
-        put(lock_count,section.recursion-1U,4);put(recursion,section.recursion,4);put(owner,thread_identifier(section.owner),8);
+        put(lock_count,section.recursion-1U,4);put(recursion,section.recursion,4);put(owner,thread_identifier(section.owner),unit);
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    state.rip=GuestAddress{target};state.reg(Gpr::Rsp)+=8;state.reg(Gpr::Rax)=result;
+    state.rip=GuestAddress{target};
+    state.reg(Gpr::Rsp)=x86_?static_cast<std::uint32_t>(sp+4+argument_count*4):sp+8;
+    state.reg(Gpr::Rax)=x86_?static_cast<std::uint32_t>(result):result;
     return true;
 }
 #endif

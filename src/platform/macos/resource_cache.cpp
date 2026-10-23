@@ -164,7 +164,10 @@ public:
         }else if(copy>=0)::close(copy);
         std::sort(files.begin(),files.end(),[](const auto& a,const auto& b){return a.modified.tv_sec!=b.modified.tv_sec?a.modified.tv_sec>b.modified.tv_sec:a.modified.tv_nsec>b.modified.tv_nsec;});
         clock_=files.size();std::uint64_t recency=clock_;
-        for(const auto& file:files){const auto use=recency--;if(entries_.size()>=capacity_ || used_==limit_ || preload_cancelled.load(std::memory_order_relaxed))break;const auto key=resource_key(file.name);ResourceCache::Result timing;
+        // 預設不整批解碼：目錄裡的字型產物約 180 MiB，每個程序啟動都解碼會多 200 MiB RSS 與數十 ms CPU，
+        // 短命的 helper 子程序從未用到；get 未命中時再從磁碟讀單一產物。X64ARM_RESOURCE_CACHE_PRELOAD=1 回復整批預載。
+        static const bool eager=[] {const auto* value=std::getenv("X64ARM_RESOURCE_CACHE_PRELOAD");return value && std::string_view(value)=="1";}();
+        if(eager)for(const auto& file:files){const auto use=recency--;if(entries_.size()>=capacity_ || used_==limit_ || preload_cancelled.load(std::memory_order_relaxed))break;const auto key=resource_key(file.name);ResourceCache::Result timing;
             try{auto bytes=read_resource(directory_.value,file.name,key,limit_,timing);if(bytes.empty() || bytes.size()>limit_-used_)continue;
                 used_+=bytes.size();disk_bytes+=timing.stored_bytes;reads+=timing.read_ms;decodes+=timing.decode_ms;
                 entries_.emplace(file.name,Entry{std::make_shared<Bytes>(std::move(bytes)),key,use,timing.stored_bytes,false,false,false});
