@@ -14,6 +14,9 @@ inline std::uint64_t monotonic_ticks() noexcept {
 #if defined(__APPLE__)
     static const auto timebase=[] {mach_timebase_info_data_t value{};if(mach_timebase_info(&value) || !value.denom)value={1,1};return value;}();
     const auto counter=mach_continuous_time();
+    // Apple Silicon 的 24 MHz 時基（125/3）：100 ns 刻度＝計數×5/12，不經 128 位元除法。
+    // 注意：使用者模式讀 cntvct_el0 在此系統恆為 0（EL0 存取關閉），不可繞過 mach_* 直接讀計數器。
+    if(timebase.numer==125 && timebase.denom==3)return counter/12*5+counter%12*5/12;
     // 128 位元乘除，避免長時間運作後溢位。
     const auto numerator=static_cast<unsigned __int128>(counter)*timebase.numer;
     return static_cast<std::uint64_t>(numerator/(static_cast<unsigned __int128>(timebase.denom)*100U));

@@ -65,6 +65,7 @@ struct GuestThread {
     }
     // 等待剛完成而尚未 dispatch；與 Windows 可停用的動態優先序提升分開。
     bool wake_pending{};
+    std::uint64_t last_dispatch_ticks{}; // 上次被排程執行的單調時鐘（100 ns），防餓死提升用。
     std::uint32_t dynamic_priority_boost{};
     bool priority_boost_disabled{};
     std::uint32_t power_control{}, power_state{};

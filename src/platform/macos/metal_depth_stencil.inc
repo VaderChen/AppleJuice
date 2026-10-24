@@ -54,16 +54,19 @@ id<MTLTexture> metal_shader_texture(const GraphicsView& view){
         case 8:type=MTLTextureType3D;break;case 9:type=MTLTextureTypeCube;break;case 10:type=MTLTextureTypeCubeArray;break;default:break;}
     auto pixel_format=metal_format(format);
     if(metal_depth_format(texture.pixelFormat))pixel_format=stencil?MTLPixelFormatX32_Stencil8:texture.pixelFormat;
-    if(view.level || view.levels!=resource.desc.levels || view.slice || view.slices!=resource.desc.layers || pixel_format!=texture.pixelFormat || stencil || rgb32 || type!=texture.textureType){
+    if(view.level || view.levels!=resource.desc.levels || view.slice || view.slices!=resource.desc.layers || pixel_format!=texture.pixelFormat || stencil || rgb32 || type!=texture.textureType)
+    return resource.shader_view((__bridge const void*)texture,{2,static_cast<std::uint32_t>(pixel_format),static_cast<std::uint32_t>(type),(rgb32?1U:0U)|(stencil?2U:0U),view.level|(view.levels<<16),view.slice|(view.slices<<16)},[&]()->id<MTLTexture>{
+        id<MTLTexture> made=nil;
         if(rgb32){
             const auto swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleOne);
-            texture=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(view.level,view.levels) slices:NSMakeRange(view.slice,view.slices) swizzle:swizzle];
+            made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(view.level,view.levels) slices:NSMakeRange(view.slice,view.slices) swizzle:swizzle];
         }else if(stencil){
             // DXGI 的 stencil 位於 G 通道；Metal 的 X32_Stencil8 讀值在 R。
             const auto swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleZero,MTLTextureSwizzleRed,MTLTextureSwizzleZero,MTLTextureSwizzleOne);
-            texture=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(view.level,view.levels) slices:NSMakeRange(view.slice,view.slices) swizzle:swizzle];
-        }else texture=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(view.level,view.levels) slices:NSMakeRange(view.slice,view.slices)];
-        if(!texture)throw std::invalid_argument("Metal 紋理 view 格式或範圍不合法");
-    }
+            made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(view.level,view.levels) slices:NSMakeRange(view.slice,view.slices) swizzle:swizzle];
+        }else made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(view.level,view.levels) slices:NSMakeRange(view.slice,view.slices)];
+        if(!made)throw std::invalid_argument("Metal 紋理 view 格式或範圍不合法");
+        return made;
+    });
     return texture;
 }

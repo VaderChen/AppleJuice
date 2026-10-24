@@ -23,6 +23,7 @@
 #include <map>
 #include <optional>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <tuple>
 #include <deque>
@@ -76,6 +77,7 @@ id<MTLTexture> metal_shader_texture(const GraphicsView&);
 
 #include "metal_gl_program_types.inc"
 #include "metal_immediate_present.inc"
+#include "metal_command_thread.inc"
 class MetalGl final:public NativeOpenGlContext {
     MetalSharedFrame exported_frame_;
     id<MTLDevice> device_;id<MTLCommandQueue> queue_;id<MTLLibrary> library_;
@@ -97,14 +99,16 @@ class MetalGl final:public NativeOpenGlContext {
     std::map<unsigned,TextureLevelInfo> proxy_levels_;
     void texture_level(GlOperation,std::span<const std::uint64_t>,std::span<std::uint8_t>);
     MetalPendingObjects graphics_pending_;
-    struct Flight {id<MTLCommandBuffer> command;std::vector<std::shared_ptr<GpuMemoryReservation>> leases;MetalPendingObjects objects;std::shared_ptr<std::atomic<bool>> done;};
+    struct Flight {id<MTLCommandBuffer> command;std::vector<std::shared_ptr<GpuMemoryReservation>> leases;MetalPendingObjects objects;std::shared_ptr<std::atomic<bool>> done;std::shared_ptr<MetalFenceRelays> relays;};
     std::deque<Flight> flights_;
     std::size_t flight_limit_{3},flight_peak_{};
     std::uint64_t wait_count_{},wait_ns_{},resource_wait_count_{};
     std::uint64_t constant_upload_skips_{},constant_upload_saved_bytes_{};
-    std::map<std::string,id<MTLRenderPipelineState>> graphics_pipelines_;
+    // 鍵為數百位元組的二進位欄位串接；有序 map 每次查找要做十幾次長字串比較，改為雜湊。
+    std::unordered_map<std::string,id<MTLRenderPipelineState>> graphics_pipelines_;
     std::shared_ptr<MetalBufferPool> discard_pool_{std::make_shared<MetalBufferPool>()};std::uint64_t discard_in_place_{};
     std::shared_ptr<std::atomic<bool>> commands_done_;
+    std::shared_ptr<MetalFenceRelays> commands_relays_;
     #include "metal_state_cache.inc"
     std::map<std::array<unsigned,4>,std::shared_ptr<GraphicsResource>> discard_depth_;
     std::map<std::string,std::shared_ptr<MetalGeometryPipeline>> geometry_pipelines_;
@@ -146,7 +150,11 @@ class MetalGl final:public NativeOpenGlContext {
     std::uint64_t draws_{},submissions_{},list_bytes_{};unsigned pending_{};
     GlOperation active_operation_{};
     void error(unsigned e){if(std::getenv("X64ARM_GL_TRACE"))std::fprintf(stderr,"[gl-error] operation=%u error=0x%x\n",static_cast<unsigned>(active_operation_),e);if(!error_)error_=e;}
-    void begin_commands(bool gpu_work=true){if(!commands_){commands_=[queue_ commandBuffer];commands_gpu_work_=false;}if(!commands_)throw std::runtime_error("Metal command buffer 建立失敗");commands_gpu_work_|=gpu_work;}
+    // 連續繪製沿用的 render encoder 與其附件鍵；任何其他編碼、提交前都先結束。
+    id<MTLRenderCommandEncoder> open_render_;std::vector<std::uintptr_t> open_render_key_;std::uint64_t coalesced_draws_{};
+    void end_open_render(){if(open_render_){[open_render_ endEncoding];open_render_=nil;open_render_key_.clear();}}
+    void ensure_commands(bool gpu_work){if(!commands_){commands_=[queue_ commandBuffer];commands_gpu_work_=false;}if(!commands_)throw std::runtime_error("Metal command buffer 建立失敗");commands_gpu_work_|=gpu_work;}
+    void begin_commands(bool gpu_work=true){end_open_render();ensure_commands(gpu_work);}
     void retire_front(bool wait){
         auto command=flights_.front().command;
         if(wait && command.status<MTLCommandBufferStatusCompleted){
@@ -158,6 +166,7 @@ class MetalGl final:public NativeOpenGlContext {
     }
     void reap(){while(!flights_.empty() && flights_.front().command.status>=MTLCommandBufferStatusCompleted)retire_front(false);}
     void flush(bool wait){
+        end_open_render();
         reap();
         if(commands_){
             if(flights_.size()>=flight_limit_)retire_front(true);
@@ -166,7 +175,8 @@ class MetalGl final:public NativeOpenGlContext {
             flight.leases=std::move(pending_leases_);flight.objects=std::move(graphics_pending_);
             // 完成旗標供 D3D11 事件查詢輪詢；回呼只寫旗標，不觸碰後端狀態。
             flight.done=commands_done_?std::move(commands_done_):std::make_shared<std::atomic<bool>>(false);commands_done_=nullptr;auto done=flight.done;
-            [commands_ addCompletedHandler:^(id<MTLCommandBuffer>){done->store(true,std::memory_order_release);}];
+            flight.relays=commands_relays_?std::move(commands_relays_):std::make_shared<MetalFenceRelays>();commands_relays_=nullptr;auto relays=flight.relays;
+            [commands_ addCompletedHandler:^(id<MTLCommandBuffer>){done->store(true,std::memory_order_release);relays->fire();}];
             if(commands_gpu_work_)track_gpu_commands(commands_);[commands_ commit];commands_=nil;pending_leases_.clear();graphics_pending_.clear();pending_=0;++submissions_;
             flight_peak_=std::max(flight_peak_,flights_.size());
         }
@@ -328,7 +338,7 @@ public:
         pipeline(false);pipeline(true,false);
         drawable(view,w,h);
     }}
-    ~MetalGl()override{if(commands_){if(commands_gpu_work_)track_gpu_commands(commands_);[commands_ commit];[commands_ waitUntilCompleted];}for(const auto& flight:flights_)[flight.command waitUntilCompleted];finish_immediate_present();if(std::getenv("X64ARM_METAL_IMMUTABLE_STATE_CACHE"))std::fprintf(stderr,"[metal-state-cache] enabled=%u depth_hits=%llu depth_builds=%llu sampler_hits=%llu sampler_builds=%llu waits=%llu resource_waits=%llu wait_ns=%llu\n",immutable_state_cache_enabled()?1U:0U,static_cast<unsigned long long>(depth_state_hits_),static_cast<unsigned long long>(depth_state_builds_),static_cast<unsigned long long>(sampler_state_hits_),static_cast<unsigned long long>(sampler_state_builds_),static_cast<unsigned long long>(wait_count_),static_cast<unsigned long long>(resource_wait_count_),static_cast<unsigned long long>(wait_ns_));if(std::getenv("X64ARM_METAL_CONSTANT_UPLOAD_SNAPSHOT"))std::fprintf(stderr,"[metal-constant-upload] enabled=%u skips=%llu saved_bytes=%llu\n",MetalResource::constant_snapshot_enabled()?1U:0U,static_cast<unsigned long long>(constant_upload_skips_),static_cast<unsigned long long>(constant_upload_saved_bytes_));if(std::getenv("X64ARM_METAL_STREAM_OUTPUT_GPU"))std::fprintf(stderr,"[metal-stream-output] draws=%llu bytes=%llu\n",static_cast<unsigned long long>(stream_gpu_draws_),static_cast<unsigned long long>(stream_gpu_bytes_));detach();}
+    ~MetalGl()override{end_open_render();if(commands_){if(commands_gpu_work_)track_gpu_commands(commands_);[commands_ commit];[commands_ waitUntilCompleted];}for(const auto& flight:flights_)[flight.command waitUntilCompleted];finish_immediate_present();if(std::getenv("X64ARM_METAL_IMMUTABLE_STATE_CACHE"))std::fprintf(stderr,"[metal-state-cache] enabled=%u depth_hits=%llu depth_builds=%llu sampler_hits=%llu sampler_builds=%llu waits=%llu resource_waits=%llu wait_ns=%llu\n",immutable_state_cache_enabled()?1U:0U,static_cast<unsigned long long>(depth_state_hits_),static_cast<unsigned long long>(depth_state_builds_),static_cast<unsigned long long>(sampler_state_hits_),static_cast<unsigned long long>(sampler_state_builds_),static_cast<unsigned long long>(wait_count_),static_cast<unsigned long long>(resource_wait_count_),static_cast<unsigned long long>(wait_ns_));if(std::getenv("X64ARM_METAL_CONSTANT_UPLOAD_SNAPSHOT"))std::fprintf(stderr,"[metal-constant-upload] enabled=%u skips=%llu saved_bytes=%llu\n",MetalResource::constant_snapshot_enabled()?1U:0U,static_cast<unsigned long long>(constant_upload_skips_),static_cast<unsigned long long>(constant_upload_saved_bytes_));if(std::getenv("X64ARM_METAL_STREAM_OUTPUT_GPU"))std::fprintf(stderr,"[metal-stream-output] draws=%llu bytes=%llu\n",static_cast<unsigned long long>(stream_gpu_draws_),static_cast<unsigned long long>(stream_gpu_bytes_));detach();}
     void bind()override{if(view_ && view_.layer!=layer_)view_.layer=layer_;}
     void drawable(void* raw,unsigned w,unsigned h)override{@autoreleasepool{
         if(!w || !h || w>16384 || h>16384 || std::uint64_t{w}*h>64*1024*1024)throw std::bad_alloc{};
@@ -418,6 +428,13 @@ public:
     // 有待提交工作就提交；回傳最新 flight 的完成旗標（同一 queue 依序完成，涵蓋先前所有提交）。
     // 不為 fence 建立空命令緩衝：那會占用 flight 名額，上限一到 flush 就同步等待，與原本等 GPU 閒置無異。
     // 查詢 End 不再逐次 commit：回傳目前 command buffer 的完成旗標，等 Present／GetData 或 flight 額度才提交。
+    // 命令執行緒的中繼 fence：語義同 graphics_fence／graphics_fence_pending，只是旗標由呼叫端先建立。
+    void fence_relay(std::shared_ptr<std::atomic<bool>> relay,bool flush_first){
+        if(flush_first && commands_)flush(false);else reap();
+        if(commands_){if(!commands_relays_)commands_relays_=std::make_shared<MetalFenceRelays>();commands_relays_->attach(std::move(relay));return;}
+        if(flights_.empty() || !flights_.back().relays){relay->store(true,std::memory_order_release);return;}
+        flights_.back().relays->attach(std::move(relay));
+    }
     std::shared_ptr<const std::atomic<bool>> graphics_fence_pending()override{
         reap();
         if(commands_){if(!commands_done_)commands_done_=std::make_shared<std::atomic<bool>>(false);return commands_done_;}
@@ -595,6 +612,10 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     if(op==GlOperation::Color3f || op==GlOperation::Color4f || op==GlOperation::Color4fv || op==GlOperation::Color4dv)track_color();
     return 0;
 }}
+void metal_fence_relay(NativeOpenGlContext& native,std::shared_ptr<std::atomic<bool>> relay,bool flush){
+    if(auto* gl=dynamic_cast<MetalGl*>(&native)){gl->fence_relay(std::move(relay),flush);return;}
+    native.graphics_flush(true);relay->store(true,std::memory_order_release);
+}
 }
 // MTLCreateSystemDefaultDevice 每個程序第一次呼叫約 50 ms；只為裝置列舉取名稱時改讀 IOKit。
 // 單一 IOAccelerator 的 model 與 Metal 預設裝置的 name 相同（Apple Silicon 實測一致）；
@@ -617,4 +638,5 @@ std::optional<std::pair<std::string,std::string>> metal_opengl_identity(){
     return std::pair<std::string,std::string>{*model+" (Metal)","MacWin"};
 }
 std::shared_ptr<NativeOpenGlContext> make_metal_opengl(void* view,std::uint32_t w,std::uint32_t h){return std::make_shared<MetalGl>(view,w,h);}
+std::shared_ptr<NativeOpenGlContext> make_metal_command_thread(std::shared_ptr<NativeOpenGlContext> inner){return std::make_shared<MetalCommandThread>(std::move(inner));}
 }

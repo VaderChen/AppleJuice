@@ -2,6 +2,7 @@
 #include <chrono>
 #include "x64arm/windows_services.hpp"
 #include "x64arm/audio.hpp"
+#include "x64arm/shared_wake.hpp"
 #include "x64arm/unicode.hpp"
 #include "wasapi_interfaces.hpp"
 #include "audio_endpoints.hpp"
@@ -110,9 +111,10 @@ struct Stream {
     struct Stats {std::uint64_t releases{},frames{},events{},catchups{},requested{};double max_release_gap{},max_event_gap{};
         std::chrono::steady_clock::time_point last_release{},last_event{},last_report{};std::uint64_t starved{},runs{},thread{};int priority{},base_priority{};bool multimedia{};} stats;
 };
-// 共用模式緩衝的最小引擎週期數（預設 3）；X64ARM_WASAPI_MIN_PERIODS=2 供同引擎對照。
+// 共用模式緩衝的最小引擎週期數（預設 5，約 50 ms）：單核執行時音訊執行緒補資料常晚 20～40 ms，3 週期（30 ms）
+// 會規律斷音（DQ3 遊戲內第一條串流欠載窗 24→2）。X64ARM_WASAPI_MIN_PERIODS 供同引擎對照。
 std::uint64_t wasapi_min_periods(){static const std::uint64_t value=[] {const auto* v=std::getenv("X64ARM_WASAPI_MIN_PERIODS");
-    const auto parsed=v && *v?std::strtoull(v,nullptr,10):3ULL;return parsed>=1 && parsed<=20?parsed:3ULL;}();return value;}
+    const auto parsed=v && *v?std::strtoull(v,nullptr,10):5ULL;return parsed>=1 && parsed<=20?parsed:5ULL;}();return value;}
 bool audio_stats_enabled(){static const bool value=[] {const auto* trace=std::getenv("X64ARM_TRACE_AUDIO");
     return trace && (std::string_view(trace)=="start" || std::string_view(trace)=="1" || std::string_view(trace)=="stats");}();return value;}
 double elapsed_ms(std::chrono::steady_clock::time_point from,std::chrono::steady_clock::time_point to){
@@ -473,6 +475,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                         // Core Audio 每次 callback 拉的量大於一個週期（44.1 kHz 約 470 frames），兩個週期拉完只剩 412 frames，
                         // 客體補資料晚過約 21 ms 就缺 58 frames 的整數倍（DQ3 實測）；預設三個週期，可容忍約 32 ms。
                         const auto frames=std::max<std::uint64_t>(frames_at(wasapi_min_periods(),f->rate),(arg(3)*f->rate+9999999)/10000000);
+                        // 輸出建構時就可能開始 callback；先由協調者準備 namespace 並固定持有通知來源。
+                        // 原生 callback 只通知排程器重查音訊時鐘，不存取客體或建立共享資源。
+                        (void)mapping_session();
+                        pcm.progress_notify=[wake=mapping_wake()]() noexcept {if(wake)wake->notify();};
                         const auto data=allocate_heap(memory,frames*f->align);if(!data)throw std::bad_alloc{};
                         try{pcm.channels=f->channels;pcm.bits=f->bits;pcm.floating=f->floating;pcm.rate=pcm.frequency=f->rate;pcm.streaming=true;s.output=audio::open_output(s.pcm,s.device);}catch(const std::runtime_error&){(void)free_heap(memory,data,state);result=0x8889000fU;}
                         if(!result){s.data=data;s.capacity=static_cast<std::uint32_t>(frames);s.format=*f;s.flags=d(2);s.initialized=true;s.observed_frames=pcm.rendered_frames;s.session=std::move(session);s.session->streams.push_back(object->stream);

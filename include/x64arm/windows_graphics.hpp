@@ -137,6 +137,14 @@ public:
     // 不提交：回傳「目前尚未提交的命令批次」完成旗標；呼叫端（D3D11 GetData 無 DONOTFLUSH 時）再決定何時 flush。
     virtual std::shared_ptr<const std::atomic<bool>> graphics_fence_pending(){return graphics_fence();}
     virtual void graphics_flush(bool){throw std::runtime_error("後端缺少提交操作");}
+    // 呼叫端保證 draw／stage 的內容在下一次 graphics_sync() 前不變時使用；非同步後端可只保留參照。預設同步執行。
+    virtual void graphics_draw_retained(const GraphicsDraw& draw){graphics_draw(draw);}
+    virtual void graphics_dispatch_retained(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){graphics_dispatch(stage,groups);}
+    // 等待先前排入的非同步命令完成，並拋出其中的錯誤；同步後端為空操作。
+    virtual void graphics_sync(){}
+    // 非同步後端：最後一個排入命令的序號，以及等到某序號（含之前）全部完成；同步後端恆為 0、不等待。
+    virtual std::uint64_t graphics_ticket()const{return 0;}
+    virtual void graphics_sync_until(std::uint64_t){graphics_sync();}
 };
 std::uint32_t graphics_format_bytes(std::uint32_t format);
 std::uint32_t graphics_format_bc_family(std::uint32_t format) noexcept;

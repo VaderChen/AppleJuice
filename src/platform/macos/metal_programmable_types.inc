@@ -16,6 +16,8 @@ struct MetalPipelineKey {
     MetalPipelineKey& operator<<(const std::string& text){bytes.append(text);bytes.push_back('\0');return *this;}
     MetalPipelineKey& operator<<(float value){bytes.append(reinterpret_cast<const char*>(&value),sizeof value);return *this;}
     MetalPipelineKey& operator<<(double value){bytes.append(reinterpret_cast<const char*>(&value),sizeof value);return *this;}
+    // 固定格式的原始位元組（呼叫端負責長度前綴）；blend 描述等逐位元組展開會讓鍵膨脹約九倍。
+    MetalPipelineKey& raw(const void* data,std::size_t size){bytes.append(static_cast<const char*>(data),size);return *this;}
     const std::string& str()const{return bytes;}
 };
 // DISCARD 更換 backing 時回收舊 buffer：舊 buffer 在 GPU 用完（flight 退役）後進入池，下一次同長度的更換直接取用，
@@ -53,6 +55,19 @@ struct MetalResource final:GraphicsResource {
     // 被 DISCARD 更換下來的舊 backing：最後一個持有者（flight 或更換點）釋放時交回池。
     std::shared_ptr<MetalBufferPool> recycle;
     ~MetalResource() override {if(recycle && buffer && !texture)recycle->put(buffer);}
+    // shader 用的 texture view／typed buffer view：每次繪製重建約占綁定成本四成。鍵含目前 backing 的位址，
+    // backing 更換（DISCARD、重新配置）後整批丟棄；同一 backing 物件上的 view 內容與 backing 共用，可跨命令重用。
+    struct ShaderView {const void* base{};std::array<std::uint32_t,6> key{};id<MTLTexture> view;};
+    std::vector<ShaderView> shader_views;
+    template<class Make> id<MTLTexture> shader_view(const void* base,const std::array<std::uint32_t,6>& key,Make&& make){
+        static const bool enabled=[] {const auto* text=std::getenv("X64ARM_METAL_VIEW_CACHE");return !text || std::string_view(text)!="0";}();
+        if(!enabled)return make();
+        for(const auto& entry:shader_views)if(entry.base==base && entry.key==key)return entry.view;
+        std::erase_if(shader_views,[&](const auto& entry){return entry.base!=base;});
+        auto view=make();
+        if(shader_views.size()>=16)shader_views.erase(shader_views.begin());
+        shader_views.push_back({base,key,view});return view;
+    }
     // 常數 buffer 不允許 GPU 寫入綁定；保存最後排程的 CPU 內容，GPU copy 目的端必須失效。
     std::vector<std::uint8_t> constant_bytes;
     bool constant_bytes_valid{};

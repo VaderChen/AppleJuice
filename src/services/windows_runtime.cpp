@@ -661,6 +661,8 @@ std::array<std::uint64_t,2> heap_block_pages(std::uint64_t address,std::size_t s
 }
 }
 std::uint64_t WindowsServices::allocate_heap(GuestMemory& memory, std::uint64_t requested, std::uint64_t heap) {
+    // 本地協調的 D3D11 服務與 worker 並行，不可改動 worker 可能借用的 heap（見 d3d11_local_eligible）。
+    if(graphics_local())throw HostCallFault("D3D11 本地協調服務不可配置 heap");
     const auto fail=[&](const char* reason)->std::uint64_t {
         if(std::getenv("X64ARM_TRACE_HEAP_FAILURES"))std::fprintf(stderr,"heap_failure pid=%u reason=%s requested=%llu objects=%zu remaining=%zu next=0x%llx\n",process_id(),reason,static_cast<unsigned long long>(requested),allocations_.size(),memory.remaining_capacity(),static_cast<unsigned long long>(next_allocation_));
         return 0;
@@ -904,6 +906,7 @@ std::uint64_t WindowsServices::guest_heap_reserve_chunk(GuestMemory& memory) {
     if(!base)return 0;
     runtime_.virtual_regions.emplace(base,VirtualRegion{guest_heap_chunk,4U});
     guest_heap_chunk_bits_[base>>24]|=UINT64_C(1)<<((base>>18)&63U);
+    ++guest_heap_chunk_generation_;
     guest_heap_next_=base+guest_heap_chunk;
     return base;
 }
@@ -918,6 +921,7 @@ bool WindowsServices::guest_heap_setup(GuestMemory& memory) {
         for(unsigned n=0;n<8;++n)page[24+n]=static_cast<std::uint8_t>(guest_heap_small_limit>>(8*n));
         memory.map(state,GuestMemory::guest_page_size,read_write,page);
         guest_heap_state_=state;guest_heap_chunked_=true;guest_heap_next_=runtime_.next_virtual;
+        ++guest_heap_topology_generation_;
         return true;
     }
     // 保留一段客體視窗內未映射、未保留的位址；以 virtual_regions 登錄，heap 與 VirtualAlloc 不會再使用。
@@ -1020,6 +1024,7 @@ bool WindowsServices::guest_heap_private_ready(std::uint64_t heap) {
     if(!lists.heads.empty())return true;
     if(++lists.requests<1024)return false;
     lists.heads.assign(static_cast<std::size_t>(guest_heap_class(guest_heap_small_limit+guest_heap_aligned_header))+1,0);
+    ++guest_heap_topology_generation_;
     return true;
 }
 void WindowsServices::guest_heap_destroy(GuestMemory& memory, std::uint64_t heap) {
@@ -1034,11 +1039,13 @@ void WindowsServices::guest_heap_destroy(GuestMemory& memory, std::uint64_t heap
                 if(memory.load(GuestAddress{chunk+24},64)!=heap)continue;
                 memory.unmap(GuestAddress{chunk},guest_heap_chunk);
                 guest_heap_chunk_bits_[word]&=~(UINT64_C(1)<<bit);
+                ++guest_heap_chunk_generation_;
                 runtime_.virtual_regions.erase(chunk);
             }
         ++guest_heap_mutations_;
     }
     guest_private_heaps_.erase(found);
+    ++guest_heap_topology_generation_;
 }
 const std::vector<std::pair<std::uint64_t,std::uint64_t>>& WindowsServices::guest_heap_allocated_blocks(GuestMemory& memory, std::uint64_t heap) {
     // x86 沒有客體常式，配置與釋放都經宿主，變動計數準確；只在變動或改查其他 heap 後重建。
@@ -1087,6 +1094,7 @@ const std::vector<std::pair<std::uint64_t,std::uint64_t>>& WindowsServices::gues
     return guest_heap_walk_blocks_;
 }
 bool WindowsServices::free_heap(GuestMemory& memory, std::uint64_t address, const GuestState& state) {
+    if(graphics_local())throw HostCallFault("D3D11 本地協調服務不可釋放 heap");
     if (!address) return true;
     if (guest_heap_contains(address)) {guest_heap_free(memory,address);return true;}
     const auto found = allocations_.find(address);
@@ -1610,6 +1618,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     return std::nullopt;
 }
 std::optional<std::uint32_t> WindowsServices::finish_process(GuestState& state, GuestMemory& memory, std::uint32_t code) {
+    if(code && code!=0xc0000409U)report_crt_fast_fail(state,memory,"ExitProcess"); // 非 0 自行結束：回溯客體堆疊。
     // CRT callback 已可能從框架堆疊移除；以獨立入口保存退出碼，不能重跑 callback_return_。
     state.rip = process_exit_retry_; state.reg(Gpr::Rcx) = code;
     if (await_loader(state, memory)) return std::nullopt;
@@ -1647,6 +1656,16 @@ void WindowsServices::report_crt_fast_fail(const GuestState& state,GuestMemory& 
     const auto* image=module_image(caller,true);
     std::fprintf(stderr,"crt_fast_fail pid=%u symbol=%.*s caller=0x%llx module=%s offset=0x%llx thread=%llu\n",process_id(),static_cast<int>(symbol.size()),symbol.data(),
         static_cast<unsigned long long>(caller),image?utf16_to_utf8(image->path).c_str():"?",static_cast<unsigned long long>(image?caller-image->base:0),static_cast<unsigned long long>(threads_.current));
+    // x64：依 PE unwind 資訊再回溯最多 16 層，定位呼叫 abort／fail-fast 的客體程式（x86 只回報直接呼叫者）。
+    if(x86_ || !caller)return;
+    GuestState walk=state;walk.rip=GuestAddress{caller};walk.reg(Gpr::Rsp)=state.reg(Gpr::Rsp)+8;
+    for(unsigned depth=0;depth<16;++depth){
+        const auto* frame=module_image(walk.rip.value,true);if(!frame)break;
+        std::fprintf(stderr,"crt_fast_fail_frame pid=%u depth=%u module=%s offset=0x%llx\n",process_id(),depth,utf16_to_utf8(frame->path).c_str(),
+            static_cast<unsigned long long>(walk.rip.value-frame->base));
+        try{const auto old_sp=walk.reg(Gpr::Rsp);walk=virtual_unwind(memory,*frame,walk.rip.value,walk,0).caller;if(walk.reg(Gpr::Rsp)<=old_sp)break;}
+        catch(const MemoryFault&){break;}catch(const HostCallFault&){break;}
+    }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
     // 字元家族的操作已由不可變 descriptor 索引；完整與常駐入口共用 locale／ABI 實作。
@@ -2078,6 +2097,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
     } else if (symbol == "_exit") return finish_process(state, memory, static_cast<std::uint32_t>(arg(0)));
     else if (symbol == "_set_abort_behavior") {result=runtime_.crt_abort_behavior;runtime_.crt_abort_behavior=(runtime_.crt_abort_behavior&~static_cast<std::uint32_t>(arg(1)))|(static_cast<std::uint32_t>(arg(0))&static_cast<std::uint32_t>(arg(1)));}
     else if (symbol == "abort") {
+        report_crt_fast_fail(state,memory,symbol);
         if(runtime_.crt_abort_behavior&1U){constexpr std::string_view message="This application has requested the Runtime to terminate it in an unusual way.\n";(void)write_standard_output(2,{reinterpret_cast<const std::uint8_t*>(message.data()),message.size()});}
         const auto abort_callback=runtime_.signals[22];
         if(abort_callback>1){runtime_.signals[22]=0;start_callbacks(state,memory,{{abort_callback,{22}}},Continuation::Exit,3);return std::nullopt;}

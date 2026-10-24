@@ -21,6 +21,7 @@
 #include <cstring>
 #include <chrono>
 #include <set>
+#include <unordered_map>
 #include "d3d11_guids.hpp"
 #include "d3d10_guids.hpp"
 #include "d3d10_effect.hpp"
@@ -62,6 +63,20 @@ struct DeferredGraphicsMap {
     std::vector<std::uint8_t> bytes;
     std::uint64_t pointer{};
     std::uint32_t row{},image{};
+};
+// 立即 context 的繪製狀態快取：保留上次解析的 GraphicsDraw 與各槽位的原始客體指標，
+// 繪製時只重新解析指標有變動的槽位，不再每次重建約 65 KB 的狀態與 816 個 view。
+// 非弱綁定 context 持有已綁定物件的引用，物件不會在綁定中被銷毀；任何 D3D11 物件銷毀後整份重新解析，
+// 避免解除綁定後同一位址建立的新物件沿用舊解析結果。
+struct D3D11DrawCache {
+    GraphicsDraw draw;
+    std::uint64_t destroyed{UINT64_MAX};
+    std::array<std::array<std::vector<std::uint64_t>,4>,6> stage_raw; // ConstantBuffers、ShaderResources、Samplers、UnorderedAccessViews。
+    std::array<std::uint64_t,6> shaders{};
+    std::array<bool,6> present{};
+    std::vector<std::uint64_t> stream_raw,vertex_raw,target_raw;
+    std::uint64_t layout{},index{},depth{},blend{},depth_state{},raster{};
+    std::uint64_t ticket{}; // 最後一次以參照交給後端的命令序號（同步後端恆為 0）。
 };
 struct Identity {
     std::map<std::pair<std::string,std::uint32_t>,std::pair<std::uint32_t,std::uint64_t>> class_instances;
@@ -106,6 +121,8 @@ struct Identity {
     GraphicsView graphics_view;
     std::vector<GraphicsElement> layout;
     std::map<std::string,std::vector<std::uint64_t>> bindings;
+    // 多份輪流使用：Metal 命令執行緒可能仍以參照讀取先前繪製的那幾份（見 draw_state）。
+    std::array<std::unique_ptr<D3D11DrawCache>,8> draw_caches;unsigned draw_slot{};
     std::map<Guid,std::vector<std::uint8_t>> private_data;
     std::map<Guid,std::uint64_t> private_interfaces;
     std::vector<std::array<float,6>> viewports;
@@ -126,6 +143,7 @@ struct Identity {
     std::shared_ptr<const GraphicsTimestampFuture> query_timestamp;
     // 遮蔽查詢：End 只記錄 fence 與取樣序號，GetData 在 fence 完成後才讀回可見度緩衝區。
     std::uint64_t query_pending_sequence{};
+    std::uint32_t visibility_planned{}; // 遮蔽查詢可見度緩衝已排入清零的位元組數（Begin 歸零）。
     std::uint32_t query_polls{}; // GetData 以 DONOTFLUSH 連續輪詢的次數；超過門檻仍提交，避免永不完成。
     bool query_active{},query_ready{},fullscreen{};
     std::uint64_t fullscreen_output{};
@@ -213,12 +231,16 @@ struct D3D11State {
     std::uint32_t next_shared_resource{0xa6000000};
     std::map<std::uint64_t,D3DCompileOperation> compilations;
     std::uint64_t next_compilation{};
-    std::map<std::uint64_t,Object> objects;
+    // 每個 D3D11 呼叫都以介面指標查表數次；順序不影響語義（迭代點皆為全體掃描或唯一匹配）。
+    std::unordered_map<std::uint64_t,Object> objects;
     std::map<std::pair<Kind,bool>,std::uint64_t> vtables;
     std::uint64_t hardware_sessions{}, decoded_frames{};
     std::string last_error;
     std::uint64_t graphics_draws{},graphics_dispatches{},graphics_frames{};
     std::uint64_t linkage_draws{},linkage_cache_hits{},linkage_uploads{},linkage_readback_bytes{};
+    std::uint64_t destroyed_objects{},draw_cache_full{},draw_cache_incremental{};
+    // 本地協調服務中引用歸零的物件：延到下一次非本地 D3D11 呼叫再銷毀（銷毀會釋放 heap）。
+    std::vector<std::uint64_t> deferred_releases;
     std::size_t peak_interfaces{};
 };
 void WindowsServices::discard_d3d_compile(GuestState& state,GuestMemory& memory,std::uint64_t key){
@@ -288,6 +310,7 @@ std::string WindowsServices::video_diagnostics() const {
     std::ostringstream out;
     out<<"video_backend=VideoToolbox hardware_sessions="<<d3d11_->hardware_sessions<<" decoded_frames="<<d3d11_->decoded_frames<<" live_interfaces="<<d3d11_->objects.size()<<" peak_interfaces="<<d3d11_->peak_interfaces<<'\n';
     if(d3d11_->graphics_draws || d3d11_->graphics_dispatches || d3d11_->graphics_frames)out<<"d3d11_backend=Metal draws="<<d3d11_->graphics_draws<<" dispatches="<<d3d11_->graphics_dispatches<<" frames="<<d3d11_->graphics_frames<<'\n';
+    if(d3d11_->draw_cache_full || d3d11_->draw_cache_incremental)out<<"d3d11_draw_cache full="<<d3d11_->draw_cache_full<<" incremental="<<d3d11_->draw_cache_incremental<<" destroyed="<<d3d11_->destroyed_objects<<'\n';
     if(d3d11_->linkage_draws)out<<"d3d11_linkage draws="<<d3d11_->linkage_draws<<" cache_hits="<<d3d11_->linkage_cache_hits<<" uploads="<<d3d11_->linkage_uploads<<" readback_bytes="<<d3d11_->linkage_readback_bytes<<'\n';
     if(std::getenv("X64ARM_TRACE_GRAPHICS_LIFETIME"))for(const auto& [pointer,entry]:d3d11_->objects){const auto& id=*entry.identity;out<<"d3d11_live pointer="<<pointer<<" root="<<id.root<<" kind="<<static_cast<unsigned>(entry.kind)<<" refs="<<id.references<<" device="<<id.device<<" texture="<<id.texture<<"\n";}
     if(!d3d11_->last_error.empty())out<<"video_error="<<d3d11_->last_error<<'\n';
@@ -372,7 +395,44 @@ std::span<const WindowsServiceDescriptor> d3d11_service_descriptors() {
     return table;
 }
 
+// 能否在其他 worker 執行期間由協調者本地完成（見 resident_coordinated_service）：只限 x64；排除會配置／釋放 heap
+// 的方法（建立介面、命令列表）與開啟執行緒保護（裝置鎖可能要排程等待）的裝置；延後銷毀清單過長時
+// 改走全體靜止的完整服務，順便清空清單。只讀取物件表，不改任何狀態。
+// Map／Unmap 只在重用既有持久映射時合格：立即內容上的 WRITE_DISCARD／NO_OVERWRITE 沿用同一客體區塊，
+// Unmap 上傳後保留區塊，都不配置或釋放 heap（每幀數千次，是平行模式全體靜止的最大來源）。
+bool WindowsServices::d3d11_local_eligible(const GuestState& state,std::string_view symbol) const {
+    if(!d3d11_ || x86_ || d3d11_->deferred_releases.size()>=256)return false;
+    static constexpr std::string_view excluded[]{"QueryInterface","FinishCommandList","ExecuteCommandList"};
+    if(std::find(std::begin(excluded),std::end(excluded),symbol)!=std::end(excluded))return false;
+    const auto found=d3d11_->objects.find(state.reg(Gpr::Rcx));if(found==d3d11_->objects.end())return false;
+    if(symbol=="Map" || symbol=="Unmap"){
+        const auto resource=d3d11_->objects.find(state.reg(Gpr::Rdx));
+        if(found->second.kind!=Kind::Context || found->second.identity->context_type || resource==d3d11_->objects.end() ||
+           !resource->second.identity->resource)return false;
+        const auto& id=*resource->second.identity;const auto subresource=static_cast<std::uint32_t>(state.reg(Gpr::R8));
+        const auto kept=id.persistent_maps.find(subresource);if(kept==id.persistent_maps.end())return false;
+        if(symbol=="Map"){const auto type=static_cast<std::uint32_t>(state.reg(Gpr::R9));if(type!=4 && type!=5)return false;}
+        else{const auto mapped=id.subresource_maps.find(subresource);if(mapped==id.subresource_maps.end() || mapped->second.pointer!=kept->second.pointer)return false;}
+    }
+    // 只限裝置、裝置內容、資源與 view、著色器、佈局、狀態物件、查詢與 class linkage；交換鏈、工廠、輸出、
+    // DXGI 裝置、多執行緒鎖、反射、命令列表與 D3D10 物件仍走完整服務。
+    switch(found->second.kind){
+    case Kind::Device:case Kind::Context:case Kind::Texture:case Kind::BufferObject:case Kind::Texture1D:case Kind::Texture3D:
+    case Kind::ShaderResource:case Kind::Unordered:case Kind::RenderTarget:case Kind::DepthView:
+    case Kind::VertexShader:case Kind::PixelShader:case Kind::ComputeShader:case Kind::GeometryShader:case Kind::HullShader:case Kind::DomainShader:
+    case Kind::Layout:case Kind::Blend:case Kind::DepthState:case Kind::Raster:case Kind::Sampler:case Kind::Query:case Kind::Predicate:
+    case Kind::ClassLinkage:case Kind::ClassInstance:break;
+    default:return false;
+    }
+    const auto& id=*found->second.identity;
+    if(id.api10)return false;
+    const auto device=id.device?d3d11_->objects.find(id.device):found;if(device==d3d11_->objects.end())return false;
+    return !(device->second.identity->protected_threads && device->second.identity->lock_address);
+}
+std::recursive_mutex& WindowsServices::graphics_mutex() noexcept {static std::recursive_mutex value;return value;}
 std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    // worker 可直接執行裝置內容方法（見 graphics_worker_service）；所有 D3D11 服務在此串行化。
+    const std::lock_guard graphics_lock(graphics_mutex());
     if(!runtime_.network.external_io)throw HostCallFault("原生硬體裝置不能在 compare 模式建立或使用");
     if(!d3d11_)d3d11_=std::make_shared<D3D11State>();
     auto& bridge=*d3d11_;
@@ -382,7 +442,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
     const auto adapt=[&](unsigned i,std::uint64_t value){adapted_arguments.at(i)=value;adapted_mask|=1U<<i;};
     std::vector<std::uint64_t> temporary_arguments;std::function<void()> finish_adapter;
     bool effect_compile=false;std::uint64_t effect_code_slot=0;
-    struct TemporaryCleanup { std::function<void()> cleanup;~TemporaryCleanup(){cleanup();} } temporary_cleanup{[&]{for(auto pointer:temporary_arguments)(void)free_heap(memory,pointer,state);}};
+    struct TemporaryCleanup {
+        WindowsServices& self;GuestMemory& memory;const GuestState& state;const std::vector<std::uint64_t>& pointers;
+        ~TemporaryCleanup(){for(auto pointer:pointers)(void)self.free_heap(memory,pointer,state);}
+    } temporary_cleanup{*this,memory,state,temporary_arguments};
     const unsigned pointer_size=x86_?4:8;const std::uint8_t pointer_bits=x86_?32:64;
     const auto u32=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
     const auto output=[&](unsigned i){memory.check(GuestAddress{arg(i)},pointer_size,Access::Write);};
@@ -408,34 +471,39 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
             notify_swap_window(id->window,id->windowed_rect[0],id->windowed_rect[1],static_cast<std::uint32_t>(id->windowed_rect[2]),static_cast<std::uint32_t>(id->windowed_rect[3]));}
         id->fullscreen=false;put_word(id->desc,x86_?48:56,1);return true;
     };
-    std::function<void(std::uint64_t)> release;
-    release=[&](std::uint64_t address) {
+    // 遞迴釋放不經 std::function：其捕獲超過小物件緩衝，原本每個 D3D11 呼叫都多一次堆積配置。
+    const auto release_object=[&](const auto& self,std::uint64_t address)->void {
         auto id=object(address).identity;
+        if(graphics_local() && id->references==1){bridge.deferred_releases.push_back(address);return;}
         if(id->references==1 && id->fullscreen && !restore_fullscreen(id))throw WindowPresentationFault("無法恢復 DXGI 全螢幕視窗");
         if(id->references==1 && id->lock_address && runtime_.critical_sections.at(id->lock_address).owner)throw HostCallFault("不可釋放仍鎖定的 D3D11 裝置");
         if(--id->references)return;
+        ++bridge.destroyed_objects;
+        // 命令執行緒可能仍以參照讀取此 context 的繪製狀態快取。
+        if(std::any_of(id->draw_caches.begin(),id->draw_caches.end(),[](const auto& cache){return bool(cache);}) && id->native)id->native->graphics_sync();
         // D3D10 的管線綁定不增加 COM 引用；物件銷毀時自動清除所有綁定位置。
         if(id->api10)for(auto& [pointer,entry]:bridge.objects){
             auto& context=*entry.identity;if(pointer!=context.root || !context.weak_bindings)continue;
             for(auto& [name,values]:context.bindings){(void)name;for(auto& bound:values)
                 if(bound && std::any_of(id->interfaces.begin(),id->interfaces.end(),[&](const auto& item){return item.second==bound;}))bound=0;}
         }
-        if(!id->weak_bindings)for(auto& [name,values]:id->bindings){(void)name;for(auto pointer:values)if(pointer)release(pointer);}
-        for(const auto& item:id->sprite.items)if(item.retained)release(item.texture);
-        for(auto& [guid,pointer]:id->private_interfaces){(void)guid;if(pointer)release(pointer);}
+        if(!id->weak_bindings)for(auto& [name,values]:id->bindings){(void)name;for(auto pointer:values)if(pointer)self(self,pointer);}
+        for(const auto& item:id->sprite.items)if(item.retained)self(self,item.texture);
+        for(auto& [guid,pointer]:id->private_interfaces){(void)guid;if(pointer)self(self,pointer);}
         if(id->font_dc){const auto found=gui_.contexts.find(id->font_dc);if(found!=gui_.contexts.end()){const auto bitmap=found->second.bitmap;rasters_.erase(bitmap);gui_.bitmaps.erase(bitmap);gui_.contexts.erase(found);}gui_.fonts.erase(id->font_handle);}
-        if(id->sprite_saved)for(const auto& [key,values]:id->sprite_saved->bindings){(void)key;for(auto pointer:values)if(pointer)release(pointer);}
-        if(id->factory)release(id->factory);
-        if(id->adapter)release(id->adapter);
-        if(id->fullscreen_output)release(id->fullscreen_output);
+        if(id->sprite_saved)for(const auto& [key,values]:id->sprite_saved->bindings){(void)key;for(auto pointer:values)if(pointer)self(self,pointer);}
+        if(id->factory)self(self,id->factory);
+        if(id->adapter)self(self,id->adapter);
+        if(id->fullscreen_output)self(self,id->fullscreen_output);
         if(id->lock_address)runtime_.critical_sections.erase(id->lock_address);
         for(const auto& [kind,pointer]:id->interfaces){(void)kind;bridge.objects.erase(pointer);}
         for(const auto pointer:id->allocations)if(!free_heap(memory,pointer,state))throw HostCallFault("D3D11 物件配置已被客體破壞");
-        if(id->current_view)release(id->current_view);
-        if(id->texture)release(id->texture);
-        if(id->context10){auto context=object(id->context10).identity;context->device=0;release(id->context10);}
-        if(id->device)release(id->device);
+        if(id->current_view)self(self,id->current_view);
+        if(id->texture)self(self,id->texture);
+        if(id->context10){auto context=object(id->context10).identity;context->device=0;self(self,id->context10);}
+        if(id->device)self(self,id->device);
     };
+    const auto release=[&](std::uint64_t address){release_object(release_object,address);};
     const auto vtable=[&](Kind kind,bool api10) {
         const auto key=std::pair{kind,api10};
         if(bridge.vtables.contains(key))return bridge.vtables.at(key);
@@ -483,13 +551,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
         try {if(device)hold(device);}catch(...) {release(id->root);throw;}
         id->device=device;
         try{if(device)id->native=object(device).identity->native;
-            else if(kind==Kind::Device || kind==Kind::Factory)id->native=make_metal_opengl(nullptr,1,1);
+            else if(kind==Kind::Device || kind==Kind::Factory){
+                id->native=make_metal_opengl(nullptr,1,1);
+                // D3D11 裝置的 Metal 編碼移到專用宿主執行緒（見 metal_command_thread.inc）；X64ARM_METAL_COMMAND_THREAD=0 關閉。
+                static const bool command_thread=[] {const auto* value=std::getenv("X64ARM_METAL_COMMAND_THREAD");return !value || std::string_view(value)!="0";}();
+                if(command_thread && kind==Kind::Device && !id->api10)id->native=make_metal_command_thread(std::move(id->native));
+            }
         }catch(...){release(id->root);throw;}
         return id;
     };
     std::uint64_t result=0;
 #include "d3d11_graphics_void.inc"
     try {
+        if(!graphics_local() && !bridge.deferred_releases.empty()){
+            auto pending=std::move(bridge.deferred_releases);bridge.deferred_releases.clear();
+            for(const auto address:pending)release(address);
+        }
+        // COM 的 AddRef／Release 佔呼叫大宗，原本要先比對數百個方法名稱才命中；兩者語義與介面種類無關，先行處理。
+        // 仍在同一 try 內，例外與收尾（return_to）與一般路徑相同。
+        if((symbol=="AddRef" || symbol=="Release") && (service.family=="internal-d3d11" || service.family=="internal-d3d10")){
+            if(symbol=="AddRef")result=hold(arg(0));
+            else {result=object(arg(0)).identity->references-1;release(arg(0));}
+        }else {
         // 每個 host 呼叫為同步且不可重入；手動 Enter 的範圍仍須跨客體排程保護。
         if(service.family=="internal-d3d11" && symbol!="Unsupported" && symbol!="QueryInterface" && symbol!="AddRef" && symbol!="Release" && symbol!="Enter" && symbol!="Leave") {
             const auto identity=object(arg(0)).identity;
@@ -863,6 +946,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
             std::erase(texture->allocations,mapping.pointer);texture->subresource_maps.erase(found);
         } else if(symbol=="Flush" || symbol=="GetContextType" || symbol=="GetContextFlags") {(void)typed(arg(0),Kind::Context);}
         else throw HostCallFault("尚未實作的 D3D11 服務："+std::string(symbol));
+        }
     } catch(const std::bad_alloc&){
         const auto gpu=gpu_memory_stats();
         bridge.last_error=std::string(symbol)+"：宿主、客體 heap 或 GPU 配置失敗；live_interfaces="+std::to_string(bridge.objects.size())+
@@ -889,7 +973,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
         for(unsigned i=0;i<11;++i)std::fprintf(stderr,"%s%x",i?",":"",static_cast<unsigned>(memory.load(GuestAddress{arg(1)+i*4},32)));
         std::fprintf(stderr," error=%s\n",bridge.last_error.c_str());
     }
-    if(std::getenv("X64ARM_TRACE_DXGI_STATE") && service.family=="internal-d3d11"){
+    static const bool trace_dxgi_state=std::getenv("X64ARM_TRACE_DXGI_STATE")!=nullptr; // 每次 D3D11 呼叫都經過，不重複查環境變數。
+    if(trace_dxgi_state && service.family=="internal-d3d11"){
         const bool present=symbol=="Present" || symbol=="Present1";
         const bool change=symbol=="SetFullscreenState" || symbol=="ResizeTarget" || symbol=="ResizeBuffers" || symbol=="EnumOutputs" || symbol=="GetContainingOutput";
         if(present || change){const auto id=object(arg(0)).identity;const auto now=std::chrono::steady_clock::now();

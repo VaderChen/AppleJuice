@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -26,6 +27,9 @@ struct Buffer {
     bool capture_failed{};
     std::uint64_t captured_frames{};
     std::uint64_t rendered_frames{};
+    // 在開啟宿主輸出前設定，輸出存活期間不變。僅發布宿主通知，不拋例外或存取客體。
+    // active streaming 的 frame 時鐘前進後，在 mutex 外呼叫；耗盡佇列也須通知補資料。
+    std::function<void()> progress_notify;
     // 串流播放中、但客體尚未補入資料而輸出靜音的 frame 數與次數（音訊斷續診斷）。
     std::uint64_t starved_frames{},starved_runs{};bool starving{};
     float rendered_peak{};

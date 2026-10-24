@@ -33,8 +33,11 @@ id<MTLTexture> metal_buffer_texture(const GraphicsView& view){
     const auto row=((std::uint64_t{resource.desc.width}+alignment-1)/alignment)*alignment;
     if(row>resource.buffer.length)throw std::invalid_argument("Metal typed buffer 配置長度不足");
     MTLTextureUsage usage=MTLTextureUsageShaderRead;if(resource.desc.bind&0x80)usage|=MTLTextureUsageShaderWrite;
-    auto descriptor=[MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:format width:resource.desc.width/stride resourceOptions:MTLResourceStorageModeShared usage:usage];
-    auto texture=[resource.buffer newTextureWithDescriptor:descriptor offset:0 bytesPerRow:row];
-    if(!texture)throw std::invalid_argument("Metal typed buffer view 建立失敗");
-    return texture;
+    // view 範圍由 x64arm_buffer_views 傳入，texture 本身恆為整段 buffer：只依 backing 與格式快取。
+    return resource.shader_view((__bridge const void*)resource.buffer,{1,static_cast<std::uint32_t>(format),stride,static_cast<std::uint32_t>(row),0,0},[&]{
+        auto descriptor=[MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:format width:resource.desc.width/stride resourceOptions:MTLResourceStorageModeShared usage:usage];
+        auto texture=[resource.buffer newTextureWithDescriptor:descriptor offset:0 bytesPerRow:row];
+        if(!texture)throw std::invalid_argument("Metal typed buffer view 建立失敗");
+        return texture;
+    });
 }

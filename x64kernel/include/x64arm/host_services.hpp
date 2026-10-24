@@ -2,6 +2,7 @@
 #include "x64arm/memory.hpp"
 #include "x64arm/execution_policy.hpp"
 #include "x64arm/result.hpp"
+#include "x64arm/resident_heap.hpp"
 #include <functional>
 #include <memory>
 #include <optional>
@@ -34,6 +35,7 @@
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTROL_DRAIN 1
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_SCALAR 1
 #define X64ARM_HOST_SERVICES_RESIDENT_IDLE_WAKE 1
+#define X64ARM_HOST_SERVICES_RESIDENT_HEAP 1
 namespace x64arm {
 // 可選產碼範圍提示，end 不包含在範圍內。只影響探索分組，不授予執行權限。
 struct TranslationRegion {GuestAddress begin,end;};
@@ -253,6 +255,10 @@ public:
     // 唯讀時鐘入口的原生 lowering。分類與時鐘來源在一次原生執行期間固定；
     // 切換虛擬時鐘／追蹤政策須先撤銷原生執行。None 沿用原服務，不以近似時間替代。
     virtual ResidentClockRecipe resident_clock_recipe(GuestAddress) const noexcept { return ResidentClockRecipe::None; }
+    // 有界 heap 配方只消耗既有配置區。借用表僅於全部使用者停止後更新，
+    // 映射／heap 生命期改變須先建立一致邊界；空值沿原服務完成完整契約。
+    virtual ResidentHeapOperation resident_heap_recipe(GuestAddress) const noexcept { return ResidentHeapOperation::None; }
+    virtual const ResidentHeap* borrow_resident_heap(GuestMemory&) noexcept { return nullptr; }
     virtual ResidentScalarErrors resident_scalar_errors(GuestMemory&) noexcept { return {}; }
     virtual std::optional<std::uint32_t> invoke_managed_service(GuestState& state,GuestMemory& memory,
                                                               const ResidentHostEnvironment& environment) {

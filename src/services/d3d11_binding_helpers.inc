@@ -7,8 +7,15 @@
             if(!output_address)return;memory.check(GuestAddress{output_address},count*pointer_size,Access::Write);
             for(unsigned i=0;i<count;++i){const auto pointer=binding(context,name,start+i);if(pointer)hold(pointer);write_pointer(output_address+i*pointer_size,pointer);}
         };
+        // 只取 view 所屬資源的位址，不複製 GraphicsView：綁定與 OMSet* 會拿每個輸入對所有輸出逐一比對。
+        const auto view_resource=[&](std::uint64_t pointer)->const GraphicsResource* {
+            const auto& id=*object(pointer).identity;return id.graphics_view.resource?id.graphics_view.resource.get():id.resource.get();
+        };
         const auto overlaps=[&](std::uint64_t first,std::uint64_t second){
-            if(!first || !second)return false;const auto a=view_of(first),b=view_of(second);if(a.resource!=b.resource)return false;
+            if(!first || !second)return false;
+            // 不同資源必不重疊；資源缺失時沿用 view_of 的驗證與錯誤。
+            if(first!=second)if(const auto ra=view_resource(first),rb=view_resource(second);ra && rb && ra!=rb)return false;
+            const auto a=view_of(first),b=view_of(second);if(a.resource!=b.resource)return false;
             if(a.resource->desc.dimension==1)return true; // Buffer 在 D3D11 中只有一個 subresource。
             if(a.level>=b.level+b.levels || b.level>=a.level+a.levels)return false;
             if(a.resource->desc.dimension!=4 && (a.slice>=b.slice+b.slices || b.slice>=a.slice+a.slices))return false;

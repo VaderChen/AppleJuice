@@ -2159,6 +2159,26 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
             fail(inherit_error);
             return false;
         }
+        // CreateProcess 文件：lpApplicationName 為 NULL 且命令列開頭的路徑未加引號又含空白時，依空白逐段嘗試
+        // （C:\Program.exe、C:\Program Files\Sub.exe…，無副檔名補 .exe），第一個存在的模組即為映像；客體命令列不改寫。
+        if(application.empty() && image.find_first_of(u"\\/:")!=image.npos){
+            const auto begin=command.find_first_not_of(u" \t");
+            const auto exists=[&](std::u16string candidate)->std::optional<std::u16string>{
+                const auto leaf=candidate.find_last_of(u"\\/");
+                if(candidate.find(u'.',leaf==candidate.npos?0:leaf)==candidate.npos)candidate+=u".exe";
+                try{
+                    const auto path=normalized_windows_path(candidate,runtime_.current_directory);
+                    if(!filesystem_.executable_path(utf16_to_utf8(path),runtime_.application_source,utf16_to_utf8(runtime_.application_directory)).second)return candidate;
+                }catch(const std::invalid_argument&){}
+                return std::nullopt;
+            };
+            if(begin!=command.npos && command[begin]!=u'"' && !exists(image))
+                for(auto end=command.find_first_of(u" \t",begin);end!=command.npos;){
+                    const auto next=command.find_first_of(u" \t",end+1);
+                    if(const auto found=exists(command.substr(begin,(next==command.npos?command.size():next)-begin))){image=*found;break;}
+                    end=next;
+                }
+        }
         std::string full;
         try {
             if(application.empty() && image.find_first_of(u"\\/:")==image.npos){
@@ -3127,6 +3147,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
     }
     // 強制終止不執行 FLS、TLS 或 DLL_PROCESS_DETACH；ExitProcess 才走有序退出。
     else if (symbol == "TerminateProcess" && current_process_handle(arg(0), 1)) {
+        // 非 0 結束自己（例如 UE4 嚴重錯誤以 3 結束）時回溯客體堆疊，定位觸發的程式碼。
+        if(static_cast<std::uint32_t>(arg(1)))report_crt_fast_fail(state,memory,"TerminateProcess");
         record_job_exit(static_cast<std::uint32_t>(arg(1)));
         return static_cast<std::uint32_t>(arg(1));
     } else {

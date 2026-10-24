@@ -397,8 +397,9 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     if(original.indirect){
         const auto size=original.indexed?20U:16U;auto& arguments=metal_resource(original.indirect);
         if(!arguments.buffer || (original.indirect_offset&3U) || std::uint64_t{original.indirect_offset}+size>arguments.desc.width)throw std::invalid_argument("間接繪製參數越界或未對齊");
-        // 細分、幾何／SO 與 SO 統計需要 CPU 端數量：等 GPU 寫完後讀回參數，轉成一般繪製。
-        if(original.stages[2].shader || original.stages[3].shader || original.stages[4].shader || original.stream_statistics ||
+        // 細分、幾何／SO 需要 CPU 端數量：等 GPU 寫完後讀回參數，轉成一般繪製。SO 統計只在 GS 路徑累計；
+        // 每個 context 都持有統計物件，不能以其存在判斷（否則每次間接繪製都同步等待 GPU）。
+        if(original.stages[2].shader || original.stages[3].shader || original.stages[4].shader ||
            std::any_of(original.stream_targets.begin(),original.stream_targets.end(),[](const auto& target){return bool(target);})){
             GraphicsView view;view.resource=original.indirect;view.first=original.indirect_offset;view.count=size;
             const auto bytes=graphics_read(view);std::array<std::uint32_t,5> values{};std::memcpy(values.data(),bytes.data(),size);
@@ -542,7 +543,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     }
     if(!d.stages[0].shader->inputs.empty())desc.vertexDescriptor=vertex;
     MetalPipelineKey key;key<<dynamic_cast<MetalShader&>(*d.stages[0].shader).serial<<':'<<(d.stages[1].shader?dynamic_cast<MetalShader&>(*d.stages[1].shader).serial:0)<<':'<<desc.sampleCount<<':'<<desc.depthAttachmentPixelFormat;
-    for(unsigned i=0;i<d.targets.size();++i)key<<':'<<desc.colorAttachments[i].pixelFormat;key<<":alpha:"<<d.alpha_function<<':'<<d.alpha_reference;key<<":stencil:"<<desc.stencilAttachmentPixelFormat<<":input-topology:"<<metal_primitive_class(raster_topology);for(const auto& e:d.layout)key<<e.semantic<<':'<<e.index<<':'<<e.format<<':'<<e.slot<<':'<<e.offset<<':'<<e.classification<<':'<<e.step;for(const auto& v:d.vertices)key<<':'<<v.stride;for(auto b:d.blend)key<<':'<<unsigned(b);
+    for(unsigned i=0;i<d.targets.size();++i)key<<':'<<desc.colorAttachments[i].pixelFormat;key<<":alpha:"<<d.alpha_function<<':'<<d.alpha_reference;key<<":stencil:"<<desc.stencilAttachmentPixelFormat<<":input-topology:"<<metal_primitive_class(raster_topology);for(const auto& e:d.layout)key<<e.semantic<<':'<<e.index<<':'<<e.format<<':'<<e.slot<<':'<<e.offset<<':'<<e.classification<<':'<<e.step;{std::array<std::uint32_t,32> strides{};for(std::size_t i=0;i<strides.size();++i)strides[i]=d.vertices[i].stride;key<<':';key.raw(strides.data(),sizeof strides);}key<<':'<<d.blend.size();key.raw(d.blend.data(),d.blend.size());
     MetalTessellationDraw tessellation;
     if(tessellated){
         key<<":tess:"<<dynamic_cast<MetalShader&>(*d.stages[3].shader).serial<<':'<<dynamic_cast<MetalShader&>(*d.stages[4].shader).serial<<':'<<d.topology;
@@ -554,7 +555,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     MetalGeometryDraw geometry;
     if(d.stages[2].shader){geometry=graphics_geometry(d,vertex,slots,shifted,key.str());if(stream_only || !geometry.function){++draws_;graphics_capture(original);return;}if(!geometry.count)return;desc.vertexFunction=geometry.function;desc.vertexDescriptor=nil;key<<":geometry:"<<dynamic_cast<MetalShader&>(*d.stages[2].shader).serial;}
     key<<":samples:"<<desc.sampleCount<<":topology:"<<desc.inputPrimitiveTopology;
-    id<MTLRenderPipelineState> pipeline=nil;auto k=key.str();if(graphics_pipelines_.contains(k))pipeline=graphics_pipelines_.at(k);else {
+    id<MTLRenderPipelineState> pipeline=nil;const auto& k=key.str();if(const auto found=graphics_pipelines_.find(k);found!=graphics_pipelines_.end())pipeline=found->second;else {
         // 未命中才記錄（建立失敗時 Metal 可能直接 abort，用量快照留下最後一個嘗試的頂點佈局）。
         {std::string text="vs="+std::to_string(dynamic_cast<MetalShader&>(*d.stages[0].shader).serial)+" topology="+std::to_string(d.topology);for(const auto& e:d.layout)text+=" "+e.semantic+std::to_string(e.index)+":f"+std::to_string(e.format)+"@"+std::to_string(e.slot)+"+"+std::to_string(e.offset)+(e.classification?"i"+std::to_string(e.step):"")+"/s"+std::to_string(e.slot<32?d.vertices[e.slot].stride:0);set_diagnostic("metal_pipeline_last",text);record_diagnostic("metal_pipelines_created");}
         NSError* error=nil;pipeline=[device_ newRenderPipelineStateWithDescriptor:desc error:&error];if(!pipeline)throw std::invalid_argument("Metal D3D pipeline："+std::string(error.localizedDescription.UTF8String));if(graphics_pipelines_.size()>2048)graphics_pipelines_.clear();graphics_pipelines_[k]=pipeline;}
@@ -562,10 +563,31 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     if(d.depth.flags&1)depth.depthWriteEnabled=NO;
     if(!d.depth.resource){depth.depthCompareFunction=MTLCompareFunctionAlways;depth.depthWriteEnabled=NO;}
     if(d.depth.resource && desc.stencilAttachmentPixelFormat!=MTLPixelFormatInvalid && !d.depth_state.empty() && metal_word(d.depth_state,12)){for(unsigned i=0;i<2;++i){const auto off=20+i*16;auto stencil=make_metal_stencil(static_cast<MTLCompareFunction>(metal_word(d.depth_state,off+12)-1),static_cast<MTLStencilOperation>(metal_word(d.depth_state,off)-1),static_cast<MTLStencilOperation>(metal_word(d.depth_state,off+4)-1),static_cast<MTLStencilOperation>(metal_word(d.depth_state,off+8)-1),d.depth_state[16],(d.depth.flags&2)?0:d.depth_state[17]);if(i)depth.backFaceStencil=stencil;else depth.frontFaceStencil=stencil;}}
-    begin_commands();auto enc=[commands_ renderCommandEncoderWithDescriptor:pass];MetalEncoderScope enc_scope{enc};if(!enc)throw std::runtime_error("Metal draw encoder 建立失敗");[enc setRenderPipelineState:pipeline];if(d.visibility)[enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:d.visibility_offset];[enc setDepthStencilState:cached_depth_state(depth)];[enc setStencilReferenceValue:d.stencil_reference];[enc setBlendColorRed:d.blend_factor[0] green:d.blend_factor[1] blue:d.blend_factor[2] alpha:d.blend_factor[3]];
+    // 附件設定相同的連續繪製沿用同一個 render encoder：每個新 pass 在 TBDR GPU 上都要重新載入／寫回附件，
+    // CPU 端也省去建立 encoder。像素 UAV、細分、幾何擷取不合併（D3D11 保證 draw 間 UAV 依序；後兩者另有編碼）。
+    // 沿用時前一次繪製的固定功能狀態會殘留，下面一律重設。X64ARM_METAL_RENDER_COALESCE=0 關閉。
+    static const bool coalesce_enabled=[] {const auto* value=std::getenv("X64ARM_METAL_RENDER_COALESCE");return !value || std::string_view(value)!="0";}();
+    const bool coalesce=coalesce_enabled && !tessellated && !geometry.function &&
+        std::none_of(d.stages[1].unordered.begin(),d.stages[1].unordered.end(),[](const auto& view){return bool(view.resource);});
+    std::vector<std::uintptr_t> pass_key;
+    if(coalesce){
+        const auto object=[](id value){return reinterpret_cast<std::uintptr_t>((__bridge void*)value);};
+        pass_key.reserve(48);
+        for(unsigned i=0;i<8;++i){auto a=pass.colorAttachments[i];pass_key.insert(pass_key.end(),{object(a.texture),a.level,a.slice,a.depthPlane});}
+        pass_key.insert(pass_key.end(),{object(pass.depthAttachment.texture),pass.depthAttachment.level,pass.depthAttachment.slice,static_cast<std::uintptr_t>(pass.depthAttachment.loadAction),
+            object(pass.stencilAttachment.texture),pass.stencilAttachment.level,pass.stencilAttachment.slice,object(pass.visibilityResultBuffer),
+            pass.renderTargetArrayLength,pass.renderTargetWidth,pass.renderTargetHeight,pass.defaultRasterSampleCount,sample_count,center_samples?1U:0U});
+    }
+    id<MTLRenderCommandEncoder> enc=nil;const bool reused=coalesce && open_render_ && pass_key==open_render_key_;
+    if(reused){enc=open_render_;++coalesced_draws_;}
+    else{begin_commands();enc=[commands_ renderCommandEncoderWithDescriptor:pass];if(!enc)throw std::runtime_error("Metal draw encoder 建立失敗");
+        if(coalesce){open_render_=enc;open_render_key_=std::move(pass_key);}}
+    std::optional<MetalEncoderScope> enc_scope;if(!coalesce)enc_scope.emplace(enc);
+    [enc setRenderPipelineState:pipeline];if(d.visibility)[enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:d.visibility_offset];else if(reused)[enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];[enc setDepthStencilState:cached_depth_state(depth)];[enc setStencilReferenceValue:d.stencil_reference];[enc setBlendColorRed:d.blend_factor[0] green:d.blend_factor[1] blue:d.blend_factor[2] alpha:d.blend_factor[3]];
     if(!d.viewports.empty()){std::vector<MTLViewport> views;for(auto v:d.viewports)views.push_back({v[0],v[1],v[2],v[3],v[4],v[5]});[enc setViewports:views.data() count:views.size()];}else [enc setViewport:MTLViewport{0,0,static_cast<double>(width),static_cast<double>(height),0,1}];
-    if(!d.raster.empty()){const auto cull=metal_word(d.raster,4);[enc setCullMode:cull==1?MTLCullModeNone:cull==2?MTLCullModeFront:MTLCullModeBack];[enc setFrontFacingWinding:metal_word(d.raster,8)?MTLWindingCounterClockwise:MTLWindingClockwise];[enc setTriangleFillMode:metal_word(d.raster,0)==2?MTLTriangleFillModeLines:MTLTriangleFillModeFill];[enc setDepthBias:static_cast<float>(static_cast<std::int32_t>(metal_word(d.raster,12))) slopeScale:metal_float(d.raster,20) clamp:metal_float(d.raster,16)];[enc setDepthClipMode:metal_word(d.raster,24)?MTLDepthClipModeClip:MTLDepthClipModeClamp];if(metal_word(d.raster,28) && !d.scissors.empty()){const auto r=d.scissors.front();const auto x=static_cast<unsigned>(std::clamp(r[0],0,static_cast<int>(width))),y=static_cast<unsigned>(std::clamp(r[1],0,static_cast<int>(height))),right=static_cast<unsigned>(std::clamp(r[2],static_cast<int>(x),static_cast<int>(width))),bottom=static_cast<unsigned>(std::clamp(r[3],static_cast<int>(y),static_cast<int>(height)));[enc setScissorRect:MTLScissorRect{x,y,right-x,bottom-y}];}}
-    else {[enc setCullMode:MTLCullModeBack];[enc setFrontFacingWinding:MTLWindingClockwise];}
+    if(!d.raster.empty()){const auto cull=metal_word(d.raster,4);[enc setCullMode:cull==1?MTLCullModeNone:cull==2?MTLCullModeFront:MTLCullModeBack];[enc setFrontFacingWinding:metal_word(d.raster,8)?MTLWindingCounterClockwise:MTLWindingClockwise];[enc setTriangleFillMode:metal_word(d.raster,0)==2?MTLTriangleFillModeLines:MTLTriangleFillModeFill];[enc setDepthBias:static_cast<float>(static_cast<std::int32_t>(metal_word(d.raster,12))) slopeScale:metal_float(d.raster,20) clamp:metal_float(d.raster,16)];[enc setDepthClipMode:metal_word(d.raster,24)?MTLDepthClipModeClip:MTLDepthClipModeClamp];if(metal_word(d.raster,28) && !d.scissors.empty()){const auto r=d.scissors.front();const auto x=static_cast<unsigned>(std::clamp(r[0],0,static_cast<int>(width))),y=static_cast<unsigned>(std::clamp(r[1],0,static_cast<int>(height))),right=static_cast<unsigned>(std::clamp(r[2],static_cast<int>(x),static_cast<int>(width))),bottom=static_cast<unsigned>(std::clamp(r[3],static_cast<int>(y),static_cast<int>(height)));[enc setScissorRect:MTLScissorRect{x,y,right-x,bottom-y}];}else if(reused)[enc setScissorRect:MTLScissorRect{0,0,width,height}];}
+    else {[enc setCullMode:MTLCullModeBack];[enc setFrontFacingWinding:MTLWindingClockwise];
+        if(reused){[enc setTriangleFillMode:MTLTriangleFillModeFill];[enc setDepthBias:0 slopeScale:0 clamp:0];[enc setDepthClipMode:MTLDepthClipModeClip];[enc setScissorRect:MTLScissorRect{0,0,width,height}];}}
     if(tessellated){auto stage=d.stages[4];stage.shader=tessellation.pipeline->stages[2];graphics_bind(enc,nil,stage,true);}
     else if(geometry.function)[enc setVertexBuffer:geometry.vertices offset:0 atIndex:0];else graphics_bind(enc,nil,d.stages[0],true);graphics_bind(enc,nil,d.stages[1],false);
     for(unsigned i=0;i<32;++i)if(!tessellated && !geometry.function && slots[i]>=0){auto& v=d.vertices[i];auto& r=metal_resource(v.resource);if(v.offset>=r.desc.width)throw std::invalid_argument("頂點 buffer offset 越界");[enc setVertexBuffer:r.buffer offset:v.offset atIndex:static_cast<unsigned>(slots[i])];graphics_pending_.push_back(v.resource);}
@@ -587,7 +609,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         graphics_pending_.push_back(d.indirect);
     }
     else if(d.indexed){auto& r=metal_resource(d.indices);const auto bpp=d.index_format==57?2U:4U;const auto offset=std::uint64_t{d.index_offset}+std::uint64_t{d.start}*bpp;if(offset+std::uint64_t{d.count}*bpp>r.desc.width)throw std::invalid_argument("索引 buffer 越界");[enc drawIndexedPrimitives:primitive indexCount:d.count indexType:bpp==2?MTLIndexTypeUInt16:MTLIndexTypeUInt32 indexBuffer:r.buffer indexBufferOffset:offset instanceCount:d.instances baseVertex:d.base_vertex baseInstance:d.start_instance];graphics_pending_.push_back(d.indices);}
-    else [enc drawPrimitives:primitive vertexStart:d.start vertexCount:d.count instanceCount:d.instances baseInstance:d.start_instance];enc_scope.end();++draws_;if(++pending_>=128)flush(false);
+    else [enc drawPrimitives:primitive vertexStart:d.start vertexCount:d.count instanceCount:d.instances baseInstance:d.start_instance];if(enc_scope)enc_scope->end();++draws_;if(++pending_>=128)flush(false);
     if(raster && original.stream_statistics)original.stream_statistics->needed+=std::uint64_t{metal_input_primitives(original.topology,original.count).first}*original.instances;
     graphics_capture(original);
 }}
@@ -601,7 +623,10 @@ void MetalGl::graphics_dispatch_indirect(const GraphicsStage& stage,const std::s
 void MetalGl::graphics_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){@autoreleasepool{if(!stage.shader)throw std::invalid_argument("Dispatch 缺少 CS");auto& shader=dynamic_cast<MetalShader&>(*stage.shader);begin_commands();auto e=[commands_ computeCommandEncoder];MetalEncoderScope e_scope{e};[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);[e dispatchThreadgroups:MTLSizeMake(groups[0],groups[1],groups[2]) threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];e_scope.end();if(++pending_>=128)flush(false);}}
 void MetalGl::graphics_mips(const GraphicsView& v){@autoreleasepool{begin_commands();auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};[e generateMipmapsForTexture:metal_texture(v)];e_scope.end();graphics_pending_.push_back(v.resource);}}
 void MetalGl::graphics_handoff(NativeGraphics& consumer,const GraphicsView& view){@autoreleasepool{
-    auto* next=dynamic_cast<MetalGl*>(&consumer);
+    // 命令執行緒代理：先清空其佇列，再交接給底層後端。
+    NativeGraphics* target=&consumer;
+    if(auto* proxy=dynamic_cast<MetalCommandThread*>(target)){proxy->graphics_sync();target=&proxy->inner();}
+    auto* next=dynamic_cast<MetalGl*>(target);
     if(next==this)return;
     if(!next || next->device_.registryID!=device_.registryID){flush(true);return;}
     if(!handoff_event_ || handoff_value_==UINT64_MAX){flush(true);handoff_event_=[device_ newEvent];handoff_value_=0;}

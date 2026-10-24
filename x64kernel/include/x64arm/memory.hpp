@@ -184,6 +184,12 @@ public:
     // before 不含目前 byte，after 含目前 byte；排除外部 backing／宿主更新頁。
     struct NativeWindow {std::uint8_t* data{};std::size_t before{},after{};};
     NativeWindow native_window(GuestAddress address,unsigned permissions) noexcept;
+    // 完整私人連續 backing 借用：可跨同一 backing 的相鄰 Region，不回填 JIT 頁面快取。
+    // 呼叫及使用期間須禁止映射／保護／backing 變動；僅借資料，不借 Region 指標或所有權。
+    // 不完整、COW、外部、宿主更新或無法證明無 guest alias 的範圍回傳空值。
+    // 只在一致邊界核對身分及世代後重借。
+    std::span<std::uint8_t> native_private_span(GuestAddress address,std::size_t size,unsigned permissions) noexcept;
+    std::uint64_t native_borrow_generation() const noexcept {return native_borrow_generation_;}
     struct WindowStats {std::uint64_t pages{},mixed_permissions{},partial{},split_backing{},excluded{},eligible{};};
     // 量測 MMU 視窗的保守候選頁；呼叫者須在 worker 停止時讀取。
     WindowStats window_stats(std::size_t host_page_size)const;
@@ -311,6 +317,9 @@ private:
     std::uint64_t identity_{};
     std::uint64_t generation_{};
     std::uint64_t structure_generation_{};
+    // 與物件身分一起使用；純 RW 映射／權限／私人 backing 遷移也撤銷長借用。
+    // 不隨普通資料寫入、原生 MMU alias 重建或 JIT 頁面快取命中遞增。
+    std::uint64_t native_borrow_generation_{};
     bool code_source_watch_enabled_{};
     mutable std::set<std::uint64_t> code_source_pages_;
     mutable const std::set<std::uint64_t>* code_source_pending_{};

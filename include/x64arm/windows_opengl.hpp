@@ -50,6 +50,8 @@ public:
     virtual GraphicsView graphics_drawable(bool depth){(void)depth;return {};}
 };
 std::shared_ptr<NativeOpenGlContext> make_metal_opengl(void* view,std::uint32_t width,std::uint32_t height);
+// 包裝後端，讓繪製／運算／寫入／複製／清除在專用宿主執行緒依序執行（見 metal_command_thread.inc）。
+std::shared_ptr<NativeOpenGlContext> make_metal_command_thread(std::shared_ptr<NativeOpenGlContext> inner);
 // 不建立 Metal 裝置即可確定 make_metal_opengl 會回報的 renderer／vendor 時回傳兩者；否則回空，呼叫端改建裝置。
 std::optional<std::pair<std::string,std::string>> metal_opengl_identity();
 std::shared_ptr<NativeOpenGlContext> make_native_opengl(void* view,std::uint32_t width,std::uint32_t height);

@@ -77,18 +77,30 @@ std::string key(std::u16string& name) {
 // 先以 kill 排除已結束程序；存在時才查出生識別，並對同一 (pid, birth) 快取 identity_recheck。
 // 因此 zombie 與 PID 重用最多延遲 identity_recheck 才偵測到，與待命讀取的存活複查間隔相同。
 // 快取以 pid＋birth 為鍵且放在 thread_local：fork 後沿用的只是時間有界的既有判定，不會套到別的程序。
+// 自身程序正在執行時只需核對出生識別；其他程序仍每次 kill。固定 16 格以完整鍵查找，
+// 避免不同擁有者的雜湊碰撞反覆淘汰尚未過期的結果；滿載時替換最早查詢的一格。
 constexpr auto identity_recheck=std::chrono::milliseconds(50);
 bool alive(const Owner& owner){
     if(!owner.pid)return false;
+    if(owner.pid==static_cast<std::uint32_t>(::getpid())){
+        if(!owner.birth)return true;
+        if(const auto birth=self_birth())return owner.birth==birth;
+    }
     if(::kill(static_cast<pid_t>(owner.pid),0)!=0 && errno==ESRCH)return false;
     struct Verdict {std::uint32_t pid{};std::uint64_t birth{};bool live{};std::chrono::steady_clock::time_point checked{};};
     thread_local std::array<Verdict,16> verdicts{};
     const auto now=std::chrono::steady_clock::now();
-    auto& cached=verdicts[(owner.pid^static_cast<std::uint32_t>(owner.birth))%verdicts.size()];
-    if(cached.pid==owner.pid && cached.birth==owner.birth && now-cached.checked<identity_recheck)return cached.live;
+    auto* cached=&verdicts.front();
+    for(auto& verdict:verdicts){
+        if(verdict.pid==owner.pid && verdict.birth==owner.birth){
+            if(now-verdict.checked<identity_recheck)return verdict.live;
+            cached=&verdict;break;
+        }
+        if(verdict.checked<cached->checked)cached=&verdict;
+    }
     const auto status=process_identity::query(owner.pid);
     const bool live=status.error?status.error!=87:!status.exited && (!owner.birth || status.identity.birth==owner.birth);
-    cached={owner.pid,owner.birth,live,now};
+    *cached={owner.pid,owner.birth,live,now};
     return live;
 }
 // 清除已結束程序的擁有者，並依剩餘參考重算該 slot 的 server／client 代表 pid。

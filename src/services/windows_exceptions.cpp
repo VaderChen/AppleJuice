@@ -54,7 +54,9 @@ bool WindowsServices::dispatch_fault(GuestState& state, GuestMemory& memory, con
     struct Refresh { WindowsServices& self;GuestMemory& memory;~Refresh(){self.refresh_guard_table(memory);} } refresh{*this,memory};
     prune_x86_exception_callbacks(state,memory);
     if (!runtime_.image.base) return false;
-    if(std::getenv("X64ARM_TRACE_FAULTS"))std::cerr<<"[fault] rip=0x"<<std::hex<<state.rip.value<<" address=0x"<<fault.address.value<<" access="<<static_cast<unsigned>(fault.access)<<std::dec<<'\n';
+    if(std::getenv("X64ARM_TRACE_FAULTS"))std::cerr<<"[fault] rip=0x"<<std::hex<<state.rip.value<<" address=0x"<<fault.address.value<<" access="<<static_cast<unsigned>(fault.access)
+        <<" teb=0x"<<(x86_?state.fs_base:state.gs_base)<<" rax=0x"<<state.reg(Gpr::Rax)<<" rbx=0x"<<state.reg(Gpr::Rbx)<<" rcx=0x"<<state.reg(Gpr::Rcx)<<" rdx=0x"<<state.reg(Gpr::Rdx)
+        <<" rsi=0x"<<state.reg(Gpr::Rsi)<<" rdi=0x"<<state.reg(Gpr::Rdi)<<" r8=0x"<<state.reg(Gpr::R8)<<" rsp=0x"<<state.reg(Gpr::Rsp)<<std::dec<<'\n';
     if(release_stack_guard(state,memory,fault.address.value)){
         constexpr std::uint32_t overflow=0xc00000fdU;
         if(emit_debug_event(state,memory,debugger::Exception{overflow,0,0,state.rip.value,{},true})==debugger::handled)return true;

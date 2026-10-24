@@ -29,7 +29,14 @@ void Buffer::capture(std::span<const float> in,unsigned input_rate){
 }
 void Buffer::render(std::span<float> out,unsigned output_rate) {
     std::fill(out.begin(),out.end(),0.0F);
+    // 先宣告通知守衛，讓所有返回路徑都先釋放下面的音訊鎖，再喚醒協調者。
+    struct ProgressNotification {
+        const std::function<void()>& notify;
+        bool active{};
+        ~ProgressNotification(){if(active && notify)notify();}
+    } progress{progress_notify};
     std::lock_guard lock(mutex);
+    progress.active=streaming && playing && out.size()/2!=0;
     rendered_frames+=out.size()/2;
     // 串流 underrun 計數：本次 callback 有多少 frame 因 queue 耗盡而以靜音補上。
     const auto starve=[&](std::size_t missing){

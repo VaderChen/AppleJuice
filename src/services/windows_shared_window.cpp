@@ -21,6 +21,15 @@
 
 namespace x64arm {
 namespace {
+// 偶發黑畫面診斷：記錄第一次與最長無畫面間隔（以及結束時刻），用量快照即使事後恢復也保留證據。
+void record_frame_timing(const char* first_key,const char* gap_key,std::int64_t& last_ms,std::int64_t& max_gap_ms){
+    const auto now=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    if(!last_ms)set_diagnostic(first_key,"unix_ms="+std::to_string(now));
+    else if(now-last_ms>max_gap_ms){max_gap_ms=now-last_ms;set_diagnostic(gap_key,"gap_ms="+std::to_string(max_gap_ms)+" end_unix_ms="+std::to_string(now));}
+    last_ms=now;
+}
+}
+namespace {
 constexpr std::uint32_t window_slots = 8192, window_magic = 0x57473458;
 static_assert(std::is_trivially_copyable_v<SharedWindowInfo> && sizeof(SharedWindowInfo) % 4 == 0);
 static_assert(sizeof(SharedWindowInfo)==1672 && offsetof(SharedWindowInfo,display_affinity)==1668);
@@ -592,6 +601,7 @@ void WindowsServices::publish_remote_frame(std::uint64_t handle, NativeGraphics&
         throw WindowPresentationFault("遠端呈現期間 HWND 已關閉");
     const auto sequence=__atomic_add_fetch(&slot.frame, 1U, __ATOMIC_RELEASE);
     record_diagnostic("remote_frame_published");
+    {static std::int64_t last=0,gap=0;record_frame_timing("remote_frame_first_published","remote_frame_max_publish_gap",last,gap);}
     if(trace_shared_frames()){const auto now=trace_unix_us();
         std::fprintf(stderr,"shared_frame kind=publish pid=%d handle=%llu seq=%u unix_us=%lld export_us=%lld\n",static_cast<int>(::getpid()),
             static_cast<unsigned long long>(handle),sequence,now,now-export_begin);}
@@ -639,6 +649,7 @@ void WindowsServices::poll_remote_frames() {
         const auto import_begin=trace_shared_frames()?trace_unix_us():0;
         surface->import_frame(mapping->data,mapping->size,header.stride,header.format,shared.cache_frames?mapping:std::shared_ptr<void>{});
         record_diagnostic("remote_frame_imported");
+        {static std::int64_t last=0,gap=0;record_frame_timing("remote_frame_first_imported","remote_frame_max_import_gap",last,gap);}
         // 每 60 幀抽樣一次匯入影格的平均亮度（8×8 格點），判斷 GPU 程序產出的影格本身是否全黑。
         if(static std::uint64_t imported=0;(imported++%60)==0 && mapping->data && header.width && header.height){
             const auto* pixels=static_cast<const std::uint8_t*>(mapping->data);double sum=0;unsigned count=0;

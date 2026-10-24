@@ -1538,7 +1538,11 @@ class CocoaGui final : public NativeGui {
         }
         if(!selected)return;auto& w=*selected;
         if(step[@"calendar_owner"]){if(!w.model.calendar || !w.model.calendar->picker_owner)return;const auto owner=windows_.find(w.model.calendar->picker_owner);if(owner==windows_.end() || owner->second.model.id!=[step[@"calendar_owner"] unsignedLongLongValue] || !owner->second.model.calendar || !owner->second.model.calendar->open)return;}
-        if([operation isEqualToString:@"window_activate"] && !background_display_enabled()){if(@available(macOS 14.0,*))[NSApp activate];else [NSApp activateIgnoringOtherApps:YES];[w.view.window makeKeyAndOrderFront:nil];[w.view.window makeFirstResponder:w.view];}
+        if([operation isEqualToString:@"window_activate"]){
+            if(!background_display_enabled()){if(@available(macOS 14.0,*))[NSApp activate];else [NSApp activateIgnoringOtherApps:YES];[w.view.window makeKeyAndOrderFront:nil];[w.view.window makeFirstResponder:w.view];}
+            // 背景顯示不搶宿主焦點：只送與 windowDidBecomeKey 相同的客體啟用事件，讓依前景狀態接收輸入的程式（如 UE4）可測。
+            else for(const auto& [handle,window]:windows_)if(&window==&w){events_.push_back({handle,1,0,0x1000d});break;}
+        }
         else if([operation isEqualToString:@"window_resize"] && w.native){[w.native setContentSize:NSMakeSize([step[@"width"] doubleValue],[step[@"height"] doubleValue]+(w.model.menu?20:0))];}
         else if([operation isEqualToString:@"window_minimize"] && w.native){[w.native performMiniaturize:nil];}
         else if([operation isEqualToString:@"window_maximize"] && w.native){[w.native zoom:nil];}

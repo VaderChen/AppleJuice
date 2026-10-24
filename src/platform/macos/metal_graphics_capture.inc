@@ -1,6 +1,6 @@
 // 可選的離線繪圖診斷；未設定環境變數時不讀回 GPU，也不影響呈現路徑。
 void MetalGl::graphics_capture(const GraphicsDraw& draw){
-    const auto* directory=std::getenv("X64ARM_GRAPHICS_CAPTURE_DIR");if(!directory || !*directory)return;
+    static const auto* const directory=std::getenv("X64ARM_GRAPHICS_CAPTURE_DIR");if(!directory || !*directory)return; // 每次繪製都經過，只查一次。
     if(const char* filter=std::getenv("X64ARM_GRAPHICS_CAPTURE_STREAM_OUTPUT");filter && std::string_view(filter)=="1")
         if(!draw.stages[2].shader || draw.stages[2].shader->stream_output.empty())return;
     // 依實際綁定篩選，避免 UI draw 耗盡診斷張數；不依程式或 shader 名稱。

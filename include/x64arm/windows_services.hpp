@@ -244,6 +244,10 @@ public:
 #ifdef X64ARM_HOST_SERVICES_CLOCK_RECIPE
     ResidentClockRecipe resident_clock_recipe(GuestAddress) const noexcept override;
 #endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_HEAP
+    ResidentHeapOperation resident_heap_recipe(GuestAddress) const noexcept override;
+    const ResidentHeap* borrow_resident_heap(GuestMemory&) noexcept override;
+#endif
 #ifdef X64ARM_HOST_SERVICES_SCALAR_ERRORS
     ResidentScalarErrors resident_scalar_errors(GuestMemory&) noexcept override;
 #endif
@@ -1013,6 +1017,13 @@ private:
     std::optional<std::uint32_t> resume_d3d_compile(GuestState&, GuestMemory&, std::uint64_t, std::uint32_t);
     void discard_d3d_compile(GuestState&, GuestMemory&, std::uint64_t);
     std::optional<std::uint32_t> invoke_d3d11(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
+    bool d3d11_local_eligible(const GuestState&,std::string_view symbol) const;
+    // D3D11 裝置內容方法在其他 worker 執行期間（協調者本地或 worker 上）執行時為 true；執行緒區域。
+    static bool& graphics_local() noexcept {static thread_local bool value=false;return value;}
+    // 所有 D3D11／DXGI 服務共用的鎖（可重入）：worker 上直接執行裝置內容方法時與協調者串行化。
+    static std::recursive_mutex& graphics_mutex() noexcept;
+    // 可直接在 worker 上執行的 D3D11 裝置內容方法（不寫客體記憶體）；不符資格回傳空指標。
+    const WindowsServiceDescriptor* graphics_worker_service(GuestAddress) const noexcept;
     static constexpr GuestAddress unresolved_base{windows_address_layout::x64.unresolved};
     std::vector<std::string> unresolved_imports_;
     static constexpr GuestAddress runtime_base{0x3002000000ULL};
@@ -1045,6 +1056,11 @@ private:
     std::array<std::uint64_t,64> parallel_thread_ids_{};
     std::size_t parallel_thread_count_{};
     std::uint64_t parallel_cursor_{};
+    std::uint64_t resident_object_wake_after_{}; // 服務邊界下一次解析物件等待的單調時鐘（100 ns）。
+    // 上一個服務是 D3D11 裝置內容輕量入口時，常駐服務收尾的等待解析與排程限流（見 after_resident_parallel）。
+    bool graphics_service_epilogue_{};std::uint64_t last_graphics_epilogue_{};
+    // 最近一次計算喚醒期限時最早的客體等待期限（100 ns 單調刻度）；過期即需完整排程解析逾時，schedule 後清除。
+    mutable std::uint64_t resident_wait_deadline_{UINT64_MAX}; // 只在協調執行緒讀寫。
     std::map<std::uint64_t,GuestAddress> resident_service_requests_;
     std::uint64_t thread_id(std::uint64_t handle) const;
     std::uint32_t thread_identifier(std::uint64_t) const;
@@ -1904,6 +1920,23 @@ private:
     // heads 為空表示尚未啟用 chunk，requests 累計一般路徑配置次數。
     struct GuestPrivateHeap {std::vector<std::uint64_t> heads;std::uint64_t requests{};};
     std::map<std::uint64_t,GuestPrivateHeap> guest_private_heaps_;
+    // 頭表的生命期／HeapLock 與 chunk 登錄各有世代；配置／釋放只改 mutations，不重建描述元。
+    std::uint64_t guest_heap_topology_generation_{1},guest_heap_chunk_generation_{1};
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_HEAP
+    struct ResidentHeapCache {
+        ResidentHeap descriptor;
+        std::unique_ptr<std::array<std::uint8_t*,resident_heap_chunk_count>> chunks;
+        std::vector<ResidentHeapEntry> entries;
+        std::uint64_t memory_identity{},memory_generation{},topology_generation{},chunk_generation{},borrow_generation{};
+        ResidentHeapCache()=default;
+        // WindowsServices 的快照可複製；借用不可跟著複製到另一份 private heads／GuestMemory。
+        ResidentHeapCache(const ResidentHeapCache&) noexcept {}
+        ResidentHeapCache& operator=(const ResidentHeapCache&) noexcept {
+            descriptor={};chunks.reset();entries.clear();memory_identity=memory_generation=topology_generation=chunk_generation=borrow_generation=0;
+            return *this;
+        }
+    } resident_heap_cache_;
+#endif
     // HeapWalk 用：x86 配置區已配置區塊（位址、區塊大小）依位址排序的快取；配置／釋放即使快取失效。
     std::uint64_t guest_heap_mutations_{},guest_heap_walk_generation_{UINT64_MAX},guest_heap_walk_heap_{};
     std::vector<std::pair<std::uint64_t,std::uint64_t>> guest_heap_walk_blocks_,guest_heap_walk_free_;

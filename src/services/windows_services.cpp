@@ -34,6 +34,8 @@
 #include <charconv>
 #include <unordered_map>
 
+#include <shared_mutex>
+namespace x64arm::detail {std::shared_mutex& parallel_mapping_mutex() noexcept;}
 namespace x64arm {
 WindowsServices::WindowsServices() {
     startup_profile::Scope phase("services","construct_body",true);
@@ -1058,8 +1060,72 @@ bool WindowsServices::x86_heap_compute_boundary(GuestAddress address) const noex
         !runtime_.forced_exit_code() && !threads_.yield && runtime_.heap_locks.empty() &&
         exceptions_.stack.empty() && runtime_compute_boundary(address)==8;
 }
+namespace {
+// D3D11 裝置內容（ID3D11DeviceContext）方法與 COM 生命週期是遊戲每幀上千次的呼叫：只操作圖形物件表與
+// Metal 後端，不執行巢狀客體碼，也不涉及檔案安全內容、網路輪詢、GUI 資源峰值或機器時鐘。這些呼叫改走
+// 輕量入口並納入常駐服務，不再每次離開常駐執行器。Effects、DXGI 呈現與 D3DCompile（含 include 回呼）
+// 維持完整入口。X64ARM_GRAPHICS_RESIDENT=0 關閉。
+bool graphics_context_service(std::size_t runtime_index) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_GRAPHICS_RESIDENT");return !value || std::string_view(value)!="0";}();
+    static const std::vector<bool> table=[] {
+        constexpr std::string_view methods[]{"QueryInterface","AddRef","Release","GetDevice","GetPrivateData","SetPrivateData","SetPrivateDataInterface","VSSetConstantBuffers","PSSetShaderResources","PSSetShader","PSSetSamplers","VSSetShader","DrawIndexed","Draw","Map","Unmap","PSSetConstantBuffers","IASetInputLayout","IASetVertexBuffers","IASetIndexBuffer","DrawIndexedInstanced","DrawInstanced","GSSetConstantBuffers","GSSetShader","IASetPrimitiveTopology","VSSetShaderResources","VSSetSamplers","Begin","End","GetData","SetPredication","GSSetShaderResources","GSSetSamplers","OMSetRenderTargets","OMSetRenderTargetsAndUnorderedAccessViews","OMSetBlendState","OMSetDepthStencilState","SOSetTargets","DrawAuto","DrawIndexedInstancedIndirect","DrawInstancedIndirect","Dispatch","DispatchIndirect","RSSetState","RSSetViewports","RSSetScissorRects","CopySubresourceRegion","CopyResource","UpdateSubresource","CopyStructureCount","ClearRenderTargetView","ClearUnorderedAccessViewUint","ClearUnorderedAccessViewFloat","ClearDepthStencilView","GenerateMips","SetResourceMinLOD","GetResourceMinLOD","ResolveSubresource","ExecuteCommandList","HSSetShaderResources","HSSetShader","HSSetSamplers","HSSetConstantBuffers","DSSetShaderResources","DSSetShader","DSSetSamplers","DSSetConstantBuffers","CSSetShaderResources","CSSetUnorderedAccessViews","CSSetShader","CSSetSamplers","CSSetConstantBuffers","VSGetConstantBuffers","PSGetShaderResources","PSGetShader","PSGetSamplers","VSGetShader","PSGetConstantBuffers","IAGetInputLayout","IAGetVertexBuffers","IAGetIndexBuffer","GSGetConstantBuffers","GSGetShader","IAGetPrimitiveTopology","VSGetShaderResources","VSGetSamplers","GetPredication","GSGetShaderResources","GSGetSamplers","OMGetRenderTargets","OMGetRenderTargetsAndUnorderedAccessViews","OMGetBlendState","OMGetDepthStencilState","SOGetTargets","RSGetState","RSGetViewports","RSGetScissorRects","HSGetShaderResources","HSGetShader","HSGetSamplers","HSGetConstantBuffers","DSGetShaderResources","DSGetShader","DSGetSamplers","DSGetConstantBuffers","CSGetShaderResources","CSGetUnorderedAccessViews","CSGetShader","CSGetSamplers","CSGetConstantBuffers","ClearState","Flush","GetContextType","GetContextFlags","FinishCommandList"};
+        const auto descriptors=runtime_service_descriptors();std::vector<bool> result(descriptors.size());
+        for(std::size_t i=0;i<descriptors.size();++i)
+            result[i]=descriptors[i].family=="internal-d3d11" && std::find(std::begin(methods),std::end(methods),descriptors[i].symbol)!=std::end(methods);
+        return result;
+    }();
+    return enabled && runtime_index<table.size() && table[runtime_index];
+}
+// 可在其他 worker 執行期間完成（協調者本地或 worker 上）的 D3D11 方法：internal-d3d11 家族中排除會建立介面或配置
+// heap（Create*、QueryInterface、GetImmediateContext、命令列表）、涉及交換鏈／視窗／輸出、裝置鎖、
+// Effects／反射與視訊的方法；實際物件種類與 Map／Unmap 的持久映射另由 d3d11_local_eligible 核對。
+bool graphics_local_service(std::size_t runtime_index) noexcept {
+    static const std::vector<bool> table=[] {
+        constexpr std::string_view prefixes[]{"Create","Open","D3D","Fx","Present","Resize","SetFullscreen","GetFullscreen","Enum",
+            "GetContainingOutput","GetBuffer","MakeWindowAssociation","GetWindowAssociation","Video","Decoder","Reflect"};
+        constexpr std::string_view names[]{"QueryInterface","GetImmediateContext","FinishCommandList","ExecuteCommandList","Enter","Leave"};
+        const auto descriptors=runtime_service_descriptors();std::vector<bool> result(descriptors.size());
+        for(std::size_t i=0;i<descriptors.size();++i){
+            const auto symbol=descriptors[i].symbol;
+            result[i]=descriptors[i].family=="internal-d3d11" &&
+                std::none_of(std::begin(prefixes),std::end(prefixes),[&](auto prefix){return symbol.starts_with(prefix);}) &&
+                std::find(std::begin(names),std::end(names),symbol)==std::end(names);
+        }
+        return result;
+    }();
+    return runtime_index<table.size() && table[runtime_index];
+}
+}
+// 可直接在 worker 上執行的 D3D11 方法：與協調者本地路徑相同的家族。會寫客體記憶體的方法（Get*、Check*、Map）
+// 由 worker 入口先核對參數指向的頁面都不是寫入時複製頁（見 graphics_worker_outputs_private），worker 的共用映射鎖下
+// 不會私有化頁面、也就不需重整其他 worker 的原生 MMU；不符時交協調者本地路徑（獨占映射鎖，核心於服務後重整 MMU）。
+// 平行模式下 RHI 執行緒的 D3D11 呼叫不再每次經信箱往返協調者。X64ARM_WORKER_GRAPHICS_SERVICE=0 關閉。
+const WindowsServiceDescriptor* WindowsServices::graphics_worker_service(GuestAddress address) const noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_WORKER_GRAPHICS_SERVICE");return !value || std::string_view(value)!="0";}();
+    if(!enabled || x86_)return nullptr;
+    const auto begin=stub_base_.value+services.size()*16;
+    if(address.value<begin || ((address.value-begin)&15U))return nullptr;
+    const auto index=(address.value-begin)/16;
+    if(!graphics_local_service(index))return nullptr;
+    // GetPrivateData 的輸出長度由客體決定，可能跨越參數核對涵蓋的頁面，留給協調者。
+    const auto& descriptor=runtime_service_descriptors()[index];
+    if(descriptor.symbol=="GetPrivateData")return nullptr;
+    return &descriptor;
+}
+namespace detail {
+// worker 入口依 stub 位址取得延伸 runtime descriptor（固定 kernel32 表之後）；不是延伸 stub 時回傳 nullptr。
+const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,GuestAddress address) noexcept {
+    const auto begin=stub_base.value+services.size()*16;const auto table=runtime_service_descriptors();
+    if(address.value<begin || ((address.value-begin)&15U) || (address.value-begin)/16>=table.size())return nullptr;
+    return &table[(address.value-begin)/16];
+}
+}
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_SERVICE
 bool WindowsServices::resident_service(GuestAddress address) const noexcept {
+    if(trace_services_.empty() && !startup_profile::enabled() && !runtime_.forced_exit_code()){
+        const auto begin=stub_base_.value+services.size()*16;
+        if(address.value>=begin && !((address.value-begin)&15U) && graphics_context_service((address.value-begin)/16))return true;
+    }
     // 與 invoke 使用相同動態資格；x86 先納入無等待／回呼的 heap 計算邊界。
     if(x86_)return x86_heap_compute_boundary(address);
     if(!trace_services_.empty() || startup_profile::enabled() || runtime_.forced_exit_code())return false;
@@ -1162,6 +1228,7 @@ bool WindowsServices::invoke_resident_scalar(ResidentScalarCall& call,GuestMemor
     const auto& descriptor=runtime_service_descriptors()[index];
     const auto* operation=scalar_math_operation(descriptor);
     if(!operation)return false;
+    const std::shared_lock mapping_guard(detail::parallel_mapping_mutex()); // worker 上寫 errno 也會查區域表。
     return invoke_native_scalar_math(call,memory,*operation,runtime_.errno_cell);
 }
 #endif
@@ -1216,12 +1283,38 @@ ResidentScalarErrors WindowsServices::resident_context_errors(const GuestState& 
 }
 #endif
 #ifdef X64ARM_HOST_SERVICES_COORDINATED_SERVICE
+namespace {
+// 診斷：X64ARM_TRACE_COORDINATED=1 依服務統計協調者收到的 worker 服務請求，分完成與拒絕（拒絕即進入全體一致邊界），
+// 每 2^18 次拒絕印出前 24 名。provider 的 false 契約保證拒絕時 rip 不變，據此判定結果，不改各返回點。
+struct CoordinatedTrace {
+    std::mutex mutex;std::unordered_map<std::uint64_t,std::pair<std::uint64_t,std::uint64_t>> counts;std::uint64_t refused{};
+    void record(const WindowsServices& provider,std::uint64_t rip,bool completed){
+        const std::lock_guard lock(mutex);auto& entry=counts[rip];(completed?entry.first:entry.second)++;
+        if(completed || (++refused&((UINT64_C(1)<<18)-1)))return;
+        std::vector<std::pair<std::uint64_t,std::pair<std::uint64_t,std::uint64_t>>> items(counts.begin(),counts.end());
+        std::sort(items.begin(),items.end(),[](const auto& a,const auto& b){return a.second.first+a.second.second>b.second.first+b.second.second;});
+        std::fprintf(stderr,"[coordinated] pid=%d refused=%llu\n",static_cast<int>(::getpid()),static_cast<unsigned long long>(refused));
+        for(std::size_t i=0;i<items.size() && i<24;++i){const auto label=provider.name(GuestAddress{items[i].first});
+            std::fprintf(stderr,"[coordinated]   done=%llu refused=%llu %.*s\n",static_cast<unsigned long long>(items[i].second.first),
+                static_cast<unsigned long long>(items[i].second.second),static_cast<int>(label.size()),label.data());}
+    }
+};
+}
 bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory& memory) {
+    static const bool trace=std::getenv("X64ARM_TRACE_COORDINATED")!=nullptr;
+    struct Trace {
+        const WindowsServices& self;const GuestState& state;std::uint64_t rip;
+        ~Trace(){if(!trace)return;static CoordinatedTrace counts;counts.record(self,rip,state.rip.value!=rip);}
+    } trace_scope{*this,state,state.rip.value};
     if(x86_ || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled() ||
        runtime_.forced_exit_code() || debugger_stopped())return false;
     // CFG 分派是控制流程邊界，不是 OS 呼叫：只核對目標、不改 LastError／權杖／GUI／IO，也不切換執行緒，
     // 可在其他 worker 繼續執行時由協調者完成（renderer 每輪數萬次，是 worker 完整服務出口的大宗）。
+    // 診斷：X64ARM_LOCAL_CFG_SERVICE=0／X64ARM_LOCAL_MAPPING_SERVICE=0 分別讓 CFG 分派、虛擬記憶體家族改走全停路徑。
+    static const bool local_cfg=[] {const auto* value=std::getenv("X64ARM_LOCAL_CFG_SERVICE");return !value || std::string_view(value)!="0";}();
+    static const bool local_mapping=[] {const auto* value=std::getenv("X64ARM_LOCAL_MAPPING_SERVICE");return !value || std::string_view(value)!="0";}();
     if(state.rip.value==callback_return_.value+0x60 || state.rip.value==callback_return_.value+0x70){
+        if(!local_cfg)return false;
         const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
         if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
         const auto previous=threads_.current;
@@ -1237,13 +1330,116 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     const auto table=runtime_service_descriptors();
     if(state.rip.value<begin || (state.rip.value-begin)%16 || (state.rip.value-begin)/16>=table.size())return false;
     const auto& descriptor=table[(state.rip.value-begin)/16];
+    // D3D11 裝置內容方法：在其他 worker 繼續執行時由協調者完成，不必全體靜止（DQ3 強制平行時占協調服務大宗）。
+    // 只操作圖形物件表與 Metal 命令執行緒；資格見 d3d11_local_eligible，物件銷毀延到下一次非本地 D3D11 呼叫。
+    // 不切換 context、不排程、不執行客體回呼。X64ARM_LOCAL_GRAPHICS_SERVICE=0 關閉。
+    static const bool local_graphics=[] {const auto* value=std::getenv("X64ARM_LOCAL_GRAPHICS_SERVICE");return !value || std::string_view(value)!="0";}();
+    if(local_graphics && graphics_local_service((state.rip.value-begin)/16)){
+        // 鎖順序與 worker 服務相同：映射 → D3D11。反過來會與持映射共用鎖、等待 D3D11 鎖的 worker 互鎖
+        // （DQ3 強制平行讀檔時整個程序停住）。COW 等映射變動期間不得有 worker 服務查表（見 parallel_mapping_mutex）。
+        const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
+        const std::lock_guard graphics_lock(graphics_mutex());
+        if(!d3d11_local_eligible(state,descriptor.symbol))return false;
+        const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
+        if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
+        const auto previous=threads_.current;const auto saved_error=last_error_;
+        const auto entry_error=static_cast<std::uint32_t>(memory.load(GuestAddress{state.gs_base+0x68},32));
+        struct Restore {
+            WindowsServices& self;std::uint64_t previous,current;std::uint32_t error;
+            ~Restore(){self.graphics_local()=false;self.threads_.current=previous;if(current!=previous)self.last_error_=error;}
+        } restore{*this,previous,key,saved_error};
+        threads_.current=key;last_error_=entry_error;graphics_local()=true;
+        entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,descriptor.symbol);
+        const auto result=invoke_runtime(state,memory,descriptor);
+        if(result)throw std::logic_error("D3D11 本地協調服務意外終止客體");
+        if(last_error_!=entry_error)memory.store(GuestAddress{state.gs_base+0x68},32,last_error_);
+        ++state.tsc;state.rep_compare={};
+        return true;
+    }
     // 虛擬記憶體家族沿用同一個 provider；不重新實作配置、權限、錯誤或撤銷語義。
     // 跨程序操作可能等待另一個程序，保留完整服務邊界。
     const auto symbol=descriptor.symbol;
+    // 同步家族中不必切換客體執行緒的情況：已就緒或逾時為 0 的物件等待、沒有等待者的 SetEvent、ResetEvent，
+    // 以及每個 runnable 都已有 vCPU 時的 Sleep(0)／SwitchToThread。沿用排程器 resolve_thread_waits 的就緒判斷與
+    // 消耗（wait_ready／acquire_wait_object），在其他 worker 繼續執行時本地完成；需要阻塞、喚醒等待者、讓出
+    // vCPU、APC、跨程序共用物件或任何錯誤回報，一律在未改狀態前交回全停路徑。獨占映射鎖讓 worker 上的臨界區
+    // 服務不會同時讀執行緒表。X64ARM_LOCAL_SYNC_SERVICE=0 關閉。
+    static const bool local_sync=[] {const auto* value=std::getenv("X64ARM_LOCAL_SYNC_SERVICE");return !value || std::string_view(value)!="0";}();
+    const bool wait_service=symbol=="WaitForSingleObject" || symbol=="WaitForSingleObjectEx" ||
+        symbol=="WaitForMultipleObjects" || symbol=="WaitForMultipleObjectsEx";
+    if(local_sync && descriptor.family=="kernel32.dll" &&
+       (wait_service || symbol=="SetEvent" || symbol=="ResetEvent" || symbol=="SwitchToThread" || symbol=="Sleep")){
+        const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
+        if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
+        const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
+        entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,symbol);
+        const WindowsCall arg(state,memory,descriptor);
+        std::uint64_t value=0;
+        if(symbol=="SetEvent" || symbol=="ResetEvent"){
+            const auto found=runtime_.wait_objects.find(arg(0));
+            if(found==runtime_.wait_objects.end() || found->second.shared_event || !(found->second.access&2U) ||
+               (found->second.kind!=WaitObject::Kind::Event && found->second.kind!=WaitObject::Kind::MemoryResource))return false;
+            if(symbol=="SetEvent"){
+                // 同一物件（同 handle、共用狀態身分或任何跨程序 event）有等待者時，喚醒與排程交給全停路徑。
+                const auto same_object=[&](std::uint64_t handle){
+                    if(handle==arg(0))return true;
+                    const auto other=runtime_.wait_objects.find(handle);
+                    return other!=runtime_.wait_objects.end() &&
+                        (other->second.shared_event || (found->second.identity && other->second.identity==found->second.identity));
+                };
+                for(const auto& [id,other]:threads_.items){
+                    (void)id;if(other.status!=ThreadStatus::Waiting)continue;
+                    if(std::any_of(other.wait.handles.begin(),other.wait.handles.end(),same_object))return false;
+                }
+                for(const auto& [id,wait]:registered_waits_){(void)id;if(same_object(wait.target))return false;}
+            }
+            found->second.set_signal(symbol=="SetEvent");value=1;
+        }else if(wait_service){
+            const bool multiple=symbol.find("Multiple")!=std::string_view::npos;
+            const auto count=multiple?static_cast<std::uint32_t>(arg(0)):1U,timeout=static_cast<std::uint32_t>(arg(multiple?3:1));
+            const bool all=multiple && static_cast<std::uint32_t>(arg(2));
+            const bool alertable=symbol.ends_with("Ex") && static_cast<std::uint32_t>(arg(multiple?4:2));
+            if(!count || count>64 || (alertable && !thread->second.apcs.empty()))return false;
+            std::vector<std::uint64_t> handles;handles.reserve(count);
+            for(unsigned i=0;i<count;++i)handles.push_back(multiple?memory.load(GuestAddress{arg(1)+i*8},64):arg(0));
+            std::size_t first=handles.size(),available=0;
+            for(std::size_t i=0;i<handles.size();++i){
+                if(std::find(handles.begin(),handles.begin()+static_cast<std::ptrdiff_t>(i),handles[i])!=handles.begin()+static_cast<std::ptrdiff_t>(i))return false;
+                bool signaled=false;
+                if(const auto object=runtime_.wait_objects.find(handles[i]);object!=runtime_.wait_objects.end()){
+                    // 共用命名空間物件須在共用鎖下判斷與消耗，交回完整路徑。
+                    if(runtime_.wait_lock_descriptor(object->second)>=0 || !(object->second.access&0x100000))return false;
+                    signaled=runtime_.wait_ready(object->second,handles,all,key);
+                }else if(const auto target=thread_id(handles[i])){
+                    if(!(thread_access(handles[i])&0x100000))return false;
+                    signaled=threads_.items.at(target).status==ThreadStatus::Exited;
+                }else return false; // 子程序、檔案 I/O 與無效 handle 交回完整路徑。
+                if(signaled){++available;if(first==handles.size())first=i;}
+            }
+            if(all?available==handles.size():available!=0){
+                value=all?0:first;
+                for(std::size_t i=0;i<handles.size();++i)if(all || i==first){
+                    const auto object=runtime_.wait_objects.find(handles[i]);
+                    if(object!=runtime_.wait_objects.end() && runtime_.acquire_wait_object(object->second,key))value=0x80U+(all?0:i);
+                }
+            }else if(!timeout)value=258;
+            else return false;
+        }else{
+            if(symbol=="Sleep" && static_cast<std::uint32_t>(arg(0)))return false;
+            // 讓出只在有 runnable 執行緒等不到 vCPU 時才有作用；否則立即返回（SwitchToThread 回傳 0）。
+            std::size_t runnable=0;
+            for(const auto& [id,other]:threads_.items){(void)id;if(other.status==ThreadStatus::Runnable && !other.suspended)++runnable;}
+            if(runnable>std::max<std::size_t>(1,runtime_.processor_count))return false;
+            value=0;
+        }
+        arg.return_to(state,value);
+        ++state.tsc;state.rep_compare={};
+        return true;
+    }
     const auto mapping=detail::resident_mapping_service(symbol);
     const bool extended=mapping==detail::ResidentMappingService::Process;
     const bool allocation2=mapping==detail::ResidentMappingService::Allocation2;
-    if(descriptor.family!="kernel32.dll" || mapping==detail::ResidentMappingService::None)return false;
+    if(descriptor.family!="kernel32.dll" || mapping==detail::ResidentMappingService::None || !local_mapping)return false;
     if((extended || allocation2) && !(allocation2 && !state.reg(Gpr::Rcx)) &&
        !current_process_handle(state.reg(Gpr::Rcx)))return false;
     const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
@@ -1256,6 +1452,8 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     } restore{*this,previous,key,saved_error};
     threads_.current=key;last_error_=entry_error;
     entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,symbol);
+    // 區域表變更期間不得有 worker 服務查表（見 parallel_mapping_mutex）。
+    const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
     refresh_guard_table(memory);
     const auto result=invoke_process_memory(state,memory,descriptor);
     if(result)throw std::logic_error("虛擬記憶體服務意外終止客體");
@@ -1290,7 +1488,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
                                                             const ResidentHostEnvironment* environment) {
     // 協調者已接手此執行緒的完整 provider；成功、等待與例外均由同一流程完成。
     // worker 的窄服務不經這裡，也不能提早清掉尚未處理的協調請求。
-    resident_service_requests_.erase(threads_.current);
+    resident_service_requests_.erase(threads_.current);graphics_service_epilogue_=false;
 #ifdef X64ARM_HOST_SERVICES_MANAGED_FP
     if(registry_io_busy_ && environment){environment->restore();environment=nullptr;}
 #endif
@@ -1352,6 +1550,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
         (state.rip.value-runtime_begin)%16==0?&runtime_table[(state.rip.value-runtime_begin)/16]:nullptr;
     const auto boundary=runtime_compute_boundary(state.rip);
     const bool memory_operation=boundary==1,string_operation=boundary==2;
+    if(runtime_descriptor && trace_services_.empty() && !startup_profile::enabled() && !runtime_.forced_exit_code() &&
+       graphics_context_service((state.rip.value-runtime_begin)/16)){
+        // 與完整入口相同同步 TEB LastError（含 x86）；裝置鎖等待等排程由 provider 更新 concurrency epoch，
+        // 核心常駐邊界據此交回宿主。HeapLock 等待沿用 invoke_service 的同一檢查。
+        const auto thread=threads_.current;
+        if(runtime_.image.base)last_error_=static_cast<std::uint32_t>(memory.load(GuestAddress{x86_?state.fs_base+0x34:state.gs_base+0x68},32));
+        const auto entry_error=last_error_;
+        std::optional<std::uint32_t> result;
+        if(!await_heap_service(state,memory,*runtime_descriptor))result=invoke_runtime(state,memory,*runtime_descriptor);
+        if(runtime_.image.base && (last_error_!=entry_error || threads_.current!=thread))
+            memory.store(GuestAddress{x86_?state.fs_base+0x34:state.gs_base+0x68},32,last_error_);
+        // 只在常駐執行器內的服務後略過收尾；宿主迴圈路徑不會緊接 after_resident_parallel，留下旗標會讓之後的
+        // 平行重新排程誤略過收尾。
+        graphics_service_epilogue_=threads_.current==thread && resident_execution_depth_!=0;
+        return result;
+    }
     if(boundary==8 && x86_heap_compute_boundary(state.rip)){
         // 仍由同一 provider 執行 stdcall 參數、返回、配置、釋放及錯誤處理。
         // HeapLock／SEH 不在此資格內；服務不切換執行緒，TSC 只由核心退休一次。
@@ -1696,9 +1910,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
             auto& lock=runtime_.heap_locks[heap];
             if(symbol=="HeapLock"){
                 if(lock.recursion==UINT32_MAX)fail(534);
-                else {lock.owner=threads_.current;++lock.recursion;returned=1;}
+                else {lock.owner=threads_.current;++lock.recursion;returned=1;++guest_heap_topology_generation_;}
             }else if(lock.owner!=threads_.current || !lock.recursion)fail(288);
-            else {if(!--lock.recursion)lock.owner=0;returned=1;threads_.yield=true;}
+            else {if(!--lock.recursion)lock.owner=0;returned=1;threads_.yield=true;++guest_heap_topology_generation_;}
         }
     }
     else if(symbol=="HeapCreate") {
@@ -1706,7 +1920,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
         else if(arg(1)>memory.limit() || arg(2)>UINT64_MAX-4095 || (arg(2) && arg(1)>arg(2)))fail(8);
         else {returned=runtime_.allocate_wait_handle();runtime_.private_heaps.emplace(returned,std::pair{arg(2)?(arg(2)+4095)&~UINT64_C(4095):0,UINT64_C(0)});if(dword(0)&1)runtime_.unserialized_heaps.insert(returned);
             // 可成長私有 heap（如靜態 CRT 的 _crtheap）可改用級距配置區；有上限者維持一般 heap 的容量契約。
-            if(guest_heap_chunked_ && !arg(2) && guest_heap_private_requested())guest_private_heaps_.emplace(returned,GuestPrivateHeap{});}
+            if(guest_heap_chunked_ && !arg(2) && guest_heap_private_requested()){
+                guest_private_heaps_.emplace(returned,GuestPrivateHeap{});++guest_heap_topology_generation_;}}
     } else if(symbol=="HeapDestroy") {
         const auto heap=runtime_.private_heaps.find(arg(0));
         if(heap==runtime_.private_heaps.end())fail(6);
