@@ -1459,19 +1459,29 @@ std::uint32_t ReadOnlyFiles::remove(std::string path,bool directory) try {
         }else if(point.error!=4390 && point.error!=50)return point.error;}
     }
     if(protected_source())return 5;
+    if(directory && !S_ISDIR(identity.st_mode))return 267;
     if(!directory) {const auto details=information(path);if(!details.error && (details.metadata.attributes&1))return 5;}
     if(!S_ISREG(identity.st_mode) && !S_ISDIR(identity.st_mode))return 5;
     if(const auto error=authorize_delete(fd.value,leaf))return error;
     const auto info=metadata(identity);
     if(const auto error=sharing_error(info,0x10000U,7))return error;
     if(const auto state=file_state(info)) {
-        if(directory)return 50;
+        // 已開啟／曾發布共享紀錄的目錄也有刪除生命週期；仍須先驗證為空。
+        if(directory){
+            FileDescriptor contents{::openat(fd.value,leaf.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW)};
+            if(contents.value<0)return native_error();struct stat current{};
+            if(::fstat(contents.value,&current)<0)return native_error();
+            if(current.st_dev!=identity.st_dev || current.st_ino!=identity.st_ino)return 32;
+            std::unique_ptr<DIR,decltype(&::closedir)> entries(::fdopendir(contents.value),::closedir);
+            if(!entries)return native_error();contents.value=-1;
+            while(const auto* entry=::readdir(entries.get()))if(std::string_view(entry->d_name)!="." && std::string_view(entry->d_name)!="..")return 145;
+        }
         if(::faccessat(fd.value,".",W_OK|X_OK,0)<0)return native_error();
         auto deletion=std::make_shared<HostDeleteTarget>();deletion->leaf=leaf;
-        deletion->directory=fd.value;fd.value=-1;deletion->device=info.device;deletion->inode=info.id;
+        deletion->directory=fd.value;fd.value=-1;deletion->device=info.device;deletion->inode=info.id;deletion->is_directory=directory;
         struct stat parent_info{};if(::fstat(deletion->directory,&parent_info)<0)return native_error();
         deletion->parent_device=static_cast<std::uint64_t>(parent_info.st_dev);deletion->parent_inode=static_cast<std::uint64_t>(parent_info.st_ino);
-        if(state->shared){auto [index,error]=state->shared->target(deletion->directory,deletion->leaf,info,false);if(error)return error;deletion->shared_index=index;if(const auto code=state->shared->disposition(index,true))return code;}
+        if(state->shared){auto [index,error]=state->shared->target(deletion->directory,deletion->leaf,info,directory);if(error)return error;deletion->shared_index=index;if(const auto code=state->shared->disposition(index,true))return code;}
         state->targets.push_back(deletion);deletion->pending=true;state->pending=true;return 0;
     }
     return ::unlinkat(fd.value,leaf.c_str(),directory?AT_REMOVEDIR:0)<0?native_error():0;

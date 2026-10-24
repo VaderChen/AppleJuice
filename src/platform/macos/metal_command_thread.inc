@@ -27,6 +27,12 @@ public:
         if(on_worker())return;
         const auto target=std::min(ticket,queued_.load(std::memory_order_acquire));
         if(completed_.load(std::memory_order_acquire)<target){
+            // 統計：需要等待命令執行緒的同步次數與等待時間（隨 statistics 輸出，供判斷客體端是否被編碼速度卡住）。
+            const auto wait_begin=std::chrono::steady_clock::now();
+            struct WaitStat {std::atomic<std::uint64_t>& count;std::atomic<std::uint64_t>& ns;std::chrono::steady_clock::time_point begin;
+                ~WaitStat(){count.fetch_add(1,std::memory_order_relaxed);
+                    ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count()),std::memory_order_relaxed);}
+            } wait_stat{sync_waits_,sync_wait_ns_,wait_begin};
             // 繪製編碼通常數微秒內完成：先短暫自旋，避免每次同步都經 futex。
             for(unsigned i=0;i<20000 && completed_.load(std::memory_order_acquire)<target;++i)
 #if defined(__aarch64__)
@@ -97,6 +103,11 @@ public:
     GraphicsTimestamp graphics_timestamp() override {graphics_sync();return inner_->graphics_timestamp();}
     std::shared_ptr<const GraphicsTimestampFuture> graphics_timestamp_future() override {graphics_sync();return inner_->graphics_timestamp_future();}
     std::vector<std::uint8_t> graphics_read(const GraphicsView& view) override {graphics_sync();return inner_->graphics_read(view);}
+    // 已完成範圍的 Shared 緩衝不必等命令執行緒排空；其他資源仍同步後讀回。
+    std::vector<std::uint8_t> graphics_read_completed(const GraphicsView& view) override {
+        if(metal_completed_readable(view.resource))return inner_->graphics_read_completed(view);
+        graphics_sync();return inner_->graphics_read(view);
+    }
     bool graphics_clear_unordered(const GraphicsView& view,std::array<std::uint32_t,4> value,bool floating) override {graphics_sync();return inner_->graphics_clear_unordered(view,value,floating);}
     void graphics_export_frame(const GraphicsView& view,void* destination,std::size_t size,std::uint32_t pitch,std::shared_ptr<void> owner) override {
         graphics_sync();inner_->graphics_export_frame(view,destination,size,pitch,std::move(owner));
@@ -133,7 +144,13 @@ public:
     void array(unsigned index,std::int32_t size,std::uint32_t type,std::span<const std::uint8_t> bytes,bool enabled) override {graphics_sync();inner_->array(index,size,type,bytes,enabled);}
     std::string string(std::uint32_t name) override {graphics_sync();return inner_->string(name);}
     OpenGlRendererInfo info()const override {const_cast<MetalCommandThread*>(this)->graphics_sync();return inner_->info();}
-    std::string statistics()const override {const_cast<MetalCommandThread*>(this)->graphics_sync();return inner_->statistics();}
+    std::string statistics()const override {
+        const_cast<MetalCommandThread*>(this)->graphics_sync();
+        // 內層字串以換行結尾；欄位接在同一行，換行放回最後。
+        auto text=inner_->statistics();while(!text.empty() && (text.back()=='\n' || text.back()==' '))text.pop_back();
+        return text+" metal_command_sync_waits="+std::to_string(sync_waits_.load(std::memory_order_relaxed))+
+            " metal_command_sync_wait_ns="+std::to_string(sync_wait_ns_.load(std::memory_order_relaxed))+"\n";
+    }
     std::string capture(const std::filesystem::path& path) override {graphics_sync();return inner_->capture(path);}
     GraphicsView graphics_drawable(bool depth) override {graphics_sync();return inner_->graphics_drawable(depth);}
 private:
@@ -153,8 +170,8 @@ private:
             std::function<void()> task;
             {
                 std::unique_lock lock(mutex_);
-                if(queue_.empty()){
-                    // 客體在相鄰繪製之間通常只隔數十微秒：先自旋一小段，避免每次排入都要 futex 喚醒。
+                // 同成品診斷對照專用；正常執行不輪詢空佇列。
+                if(legacy_idle_spin_ && queue_.empty()){
                     lock.unlock();
                     for(unsigned i=0;i<200000 && queued_.load(std::memory_order_acquire)==taken_ && !stop_requested_.load(std::memory_order_acquire);++i)
 #if defined(__aarch64__)
@@ -163,9 +180,25 @@ private:
                         ;
 #endif
                     lock.lock();
-                    while(queue_.empty() && !stopping_){sleeping_=true;cv_.wait(lock);sleeping_=false;}
-                    if(queue_.empty())return;
                 }
+                // 有時限的閒置自旋：繪製之間客體工作通常只有數微秒到十幾微秒，佇列一空就睡會讓下一次 post 付出
+                // notify 系統呼叫（DQ3 主執行緒約 2%），命令執行緒也要再等喚醒延遲。只看已提交序號、不取鎖；
+                // 逾時仍回到下方的條件變數等待。X64ARM_METAL_COMMAND_SPIN_US=0 關閉（預設 20 µs）。
+                if(idle_spin_ns_ && !legacy_idle_spin_ && queue_.empty() && !stopping_){
+                    lock.unlock();
+                    const auto deadline=std::chrono::steady_clock::now()+std::chrono::nanoseconds(idle_spin_ns_);
+                    for(unsigned i=1;queued_.load(std::memory_order_acquire)==taken_ && !stop_requested_.load(std::memory_order_acquire);++i){
+#if defined(__aarch64__)
+                        __builtin_arm_yield();
+#endif
+                        if(!(i&63U) && std::chrono::steady_clock::now()>=deadline)break;
+                    }
+                    lock.lock();
+                }
+                // 佇列檢查、睡眠標記與 post 的喚醒判定共用 mutex，避免遺失通知。
+                // 空佇列直接等待；停止時仍依序完成已排入的命令。
+                while(queue_.empty() && !stopping_){sleeping_=true;cv_.wait(lock);sleeping_=false;}
+                if(queue_.empty())return;
                 task=std::move(queue_.front());queue_.pop_front();++taken_;
             }
             try{task();}
@@ -178,8 +211,11 @@ private:
     std::shared_ptr<NativeOpenGlContext> inner_;
     std::mutex mutex_;std::condition_variable cv_,idle_cv_;
     std::deque<std::function<void()>> queue_;
+    const bool legacy_idle_spin_=[] {const auto* value=std::getenv("X64ARM_METAL_LEGACY_IDLE_SPIN");return value && std::string_view(value)=="1";}();
+    const std::int64_t idle_spin_ns_=[] {const auto* value=std::getenv("X64ARM_METAL_COMMAND_SPIN_US");
+        if(!value || !*value)return std::int64_t{20000};const auto us=std::strtoll(value,nullptr,10);return us<0?std::int64_t{0}:std::min<std::int64_t>(us,1000)*1000;}();
     std::uint64_t submitted_{},taken_{};
-    std::atomic<std::uint64_t> completed_{},queued_{};
+    std::atomic<std::uint64_t> completed_{},queued_{},sync_waits_{},sync_wait_ns_{};
     std::atomic<bool> failed_{},stop_requested_{};
     bool stopping_{},sleeping_{},waiting_{};
     std::exception_ptr error_;

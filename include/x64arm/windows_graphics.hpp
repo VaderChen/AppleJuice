@@ -118,6 +118,9 @@ public:
     virtual void graphics_write_no_overwrite(const GraphicsView& view,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){graphics_write(view,data,row,image);}
     virtual void graphics_write_region(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t,std::array<std::uint32_t,6>){throw std::runtime_error("後端缺少區域資源寫入");}
     virtual std::vector<std::uint8_t> graphics_read(const GraphicsView&){throw std::runtime_error("後端缺少資源讀回");}
+    // 呼叫端已確認寫入此範圍的 GPU 工作都已完成（例如遮蔽查詢 fence）時讀回：不等待同一資源上較新的批次，
+    // 非同步後端也不先排空命令佇列。只用於不會被 discard 改名的緩衝；預設沿用 graphics_read。
+    virtual std::vector<std::uint8_t> graphics_read_completed(const GraphicsView& view){return graphics_read(view);}
     virtual void graphics_copy(const GraphicsView&,const GraphicsView&,std::array<std::uint32_t,3>,std::array<std::uint32_t,6>){throw std::runtime_error("後端缺少資源複製");}
     virtual void graphics_resolve(const GraphicsView&,const GraphicsView&,std::uint32_t){throw std::runtime_error("後端缺少多重取樣 resolve");}
     virtual void graphics_clear(const GraphicsView&,std::array<float,4>,std::uint32_t){throw std::runtime_error("後端缺少清除操作");}

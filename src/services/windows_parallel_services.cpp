@@ -167,13 +167,13 @@ bool crt_memory_worker_service(std::string_view symbol) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_CRT_MEMORY");return !value || std::string_view(value)!="0";}();
     return enabled && (symbol=="memcpy" || symbol=="memmove" || symbol=="memset");
 }
-// CRT 唯讀的寬字串搜尋／比較與浮點分類：只讀參數與客體記憶體，不寫 errno、LastError 或其他程序狀態，也不配置。
+// CRT 唯讀的寬字串搜尋／比較、記憶體比較與浮點分類：只讀參數與客體記憶體，不寫 errno、LastError 或其他程序狀態，也不配置。
 // worker 上直接呼叫同一 provider（invoke_runtime）；無效指標或字串超過上限等故障一律交回協調者完整重做，
 // 返回前沒有任何副作用，可安全重放。DQ3 強制平行每秒數千次，原本每次都讓全體 worker 靜止。
 // X64ARM_PARALLEL_CRT_PURE=0 關閉。
 bool crt_pure_worker_service(const WindowsServiceDescriptor& descriptor) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_CRT_PURE");return !value || std::string_view(value)!="0";}();
-    static constexpr std::string_view names[]{"wcsstr","wcschr","wcsrchr","wcscmp","wcsncmp","_finite","_isnan"};
+    static constexpr std::string_view names[]{"wcsstr","wcschr","wcsrchr","wcscmp","wcsncmp","_finite","_isnan","memcmp"};
     return enabled && descriptor.family=="crt" && std::find(std::begin(names),std::end(names),descriptor.symbol)!=std::end(names);
 }
 // worker 上的 D3D11 寫入型方法（Get*、Check*、Map）只把結果寫到參數指向的位置。先核對每個參數值（含堆疊參數）
@@ -563,7 +563,10 @@ else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"
         struct Release {std::atomic_ref<std::uint32_t> lock;~Release(){lock.store(0,std::memory_order_release);}} release{guard};
         if(symbol=="LeaveCriticalSection"){
             if(section.owner!=tid || !section.recursion)return false;
-            if(section.recursion==1)for(const auto& [id,other]:threads_.items){
+            // 只有可能有等待者時才走訪全部執行緒（每秒數萬次，原本每次 O(執行緒數)）；走訪確認沒有就清除提示。
+            // 2026-10-24：與協調者 Map 本地化同時開啟時 DQ3 會崩潰（單獨開啟未重現），原因未查明前預設關閉；=1 開啟。
+            static const bool waiter_hint=[] {const auto* value=std::getenv("X64ARM_CS_WAITER_HINT");return value && std::string_view(value)=="1";}();
+            if(section.recursion==1 && (section.waiters_hint || !waiter_hint))for(const auto& [id,other]:threads_.items){
                 (void)id;if(other.status!=ThreadStatus::Waiting)continue;
                 const auto& wait=other.wait;
                 const bool critical=wait.kind==ThreadWaitKind::Critical || wait.kind==ThreadWaitKind::CriticalRetry ||
@@ -576,6 +579,7 @@ else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"
                     // 尚未釋放鎖；由原 provider 完成釋放及 wake_threads，避免漏掉排程事件。
                     return false;
             }
+            if(section.recursion==1)section.waiters_hint=false;
             if(!--section.recursion)section.owner=0;
         }else if(!section.owner || section.owner==tid){
             if(section.recursion==UINT32_MAX)return false;

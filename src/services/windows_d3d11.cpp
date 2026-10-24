@@ -58,6 +58,39 @@ struct RecordedGraphicsCommand {
     std::function<void(NativeOpenGlContext&)> execute;
     std::uint32_t draws{},dispatches{};
 };
+// invoke_d3d11 內以值捕獲 GraphicsDraw（約 62 KB）／GraphicsStage（約 10 KB）的錄製命令：若在巨型分派函式內建立 lambda 暫存，
+// 每次 D3D11 呼叫（含最常見的簡單方法）的堆疊框架都包含這些空間並要逐頁探測。改在不內聯的小函式以堆積快照建立，
+// 快照時點與內容不變（呼叫當下的繪製狀態）。
+[[gnu::noinline]] RecordedGraphicsCommand recorded_draw(const GraphicsDraw& draw){
+    auto copy=std::make_shared<const GraphicsDraw>(draw);
+    return {[copy](NativeOpenGlContext& native){native.graphics_draw(*copy);},1,0};
+}
+[[gnu::noinline]] RecordedGraphicsCommand recorded_draw_auto(const GraphicsDraw& draw){
+    auto copy=std::make_shared<GraphicsDraw>(draw);
+    return {[copy](NativeOpenGlContext& native){copy->count=static_cast<std::uint32_t>(copy->vertices[0].resource->stream_vertices);native.graphics_draw(*copy);},1,0};
+}
+[[gnu::noinline]] RecordedGraphicsCommand recorded_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){
+    auto copy=std::make_shared<const GraphicsStage>(stage);
+    return {[copy,groups](NativeOpenGlContext& native){native.graphics_dispatch(*copy,groups);},0,1};
+}
+[[gnu::noinline]] RecordedGraphicsCommand recorded_dispatch_indirect(const GraphicsStage& stage,std::shared_ptr<GraphicsResource> resource,std::uint32_t offset){
+    auto copy=std::make_shared<const GraphicsStage>(stage);
+    return {[copy,resource=std::move(resource),offset](NativeOpenGlContext& native){native.graphics_dispatch_indirect(*copy,resource,offset);},0,1};
+}
+// 繪製狀態快取輪替份數：重用某份前要等命令執行緒處理完上一次用它的繪製；份數越多越能吸收突發，但增量更新要與更舊的
+// 狀態比對。X64ARM_D3D11_DRAW_CACHES=<1～32>，預設 8。
+unsigned d3d11_draw_cache_count() noexcept {
+    static const unsigned value=[] {const auto* text=std::getenv("X64ARM_D3D11_DRAW_CACHES");
+        const auto parsed=text && *text?std::strtoul(text,nullptr,10):8UL;return static_cast<unsigned>(std::clamp<unsigned long>(parsed,1,32));}();
+    return value;
+}
+// 立即內容的遮蔽查詢共用可見度池：Metal 每個 render pass 只能掛一個可見度緩衝，每個查詢各自持有緩衝時，查詢 draw
+// 前後都要換 encoder（DQ3 遊戲內每幀約 128 次、占 encoder 的四分之三）。X64ARM_D3D11_VISIBILITY_POOL=0 回到每查詢緩衝。
+bool d3d11_visibility_pool_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_VISIBILITY_POOL");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
+constexpr std::uint32_t d3d11_visibility_pool_bytes=65536; // 與原每查詢緩衝相同（8192 槽），在 Metal 可見度偏移範圍內。
 struct DeferredGraphicsMap {
     GraphicsView view;
     std::vector<std::uint8_t> bytes;
@@ -122,7 +155,8 @@ struct Identity {
     std::vector<GraphicsElement> layout;
     std::map<std::string,std::vector<std::uint64_t>> bindings;
     // 多份輪流使用：Metal 命令執行緒可能仍以參照讀取先前繪製的那幾份（見 draw_state）。
-    std::array<std::unique_ptr<D3D11DrawCache>,8> draw_caches;unsigned draw_slot{};
+    // 輪流使用的繪製狀態快取（實際份數見 d3d11_draw_cache_count，上限 32）。
+    std::array<std::unique_ptr<D3D11DrawCache>,32> draw_caches;unsigned draw_slot{};
     std::map<Guid,std::vector<std::uint8_t>> private_data;
     std::map<Guid,std::uint64_t> private_interfaces;
     std::vector<std::array<float,6>> viewports;
@@ -144,6 +178,13 @@ struct Identity {
     // 遮蔽查詢：End 只記錄 fence 與取樣序號，GetData 在 fence 完成後才讀回可見度緩衝區。
     std::uint64_t query_pending_sequence{};
     std::uint32_t visibility_planned{}; // 遮蔽查詢可見度緩衝已排入清零的位元組數（Begin 歸零）。
+    // 立即內容的 OCCLUSION 查詢改用裝置內容共用的可見度池（d3d11_visibility_pool_enabled）：槽位只遞增不重用，
+    // 池建立時已清零；查詢以 {緩衝, 起始位元組, 槽數} 記錄取樣範圍（池用完換新池時分段）。
+    struct VisibilitySegment {std::shared_ptr<GraphicsResource> buffer;std::uint32_t base{},count{};};
+    std::vector<VisibilitySegment> visibility_segments;
+    std::shared_ptr<GraphicsResource> visibility_pool; // 裝置內容：目前的可見度池。
+    std::uint32_t visibility_cursor{}; // 裝置內容：池內下一個可用位元組。
+    bool visibility_pooled{}; // 查詢：本次 Begin 使用共用池。
     std::uint32_t query_polls{}; // GetData 以 DONOTFLUSH 連續輪詢的次數；超過門檻仍提交，避免永不完成。
     bool query_active{},query_ready{},fullscreen{};
     std::uint64_t fullscreen_output{};
@@ -239,6 +280,8 @@ struct D3D11State {
     std::uint64_t graphics_draws{},graphics_dispatches{},graphics_frames{};
     std::uint64_t linkage_draws{},linkage_cache_hits{},linkage_uploads{},linkage_readback_bytes{};
     std::uint64_t destroyed_objects{},draw_cache_full{},draw_cache_incremental{};
+    // 診斷：遊戲內各 D3D11 方法建立後端資源的次數（隨 X64ARM_TRACE_GRAPHICS_STATS 輸出）。
+    std::map<std::string,std::uint64_t,std::less<>> resource_creations;
     // 本地協調服務中引用歸零的物件：延到下一次非本地 D3D11 呼叫再銷毀（銷毀會釋放 heap）。
     std::vector<std::uint64_t> deferred_releases;
     std::size_t peak_interfaces{};
@@ -408,28 +451,35 @@ std::span<const WindowsServiceDescriptor> d3d11_service_descriptors() {
 // 能否在其他 worker 執行期間完成（見 resident_coordinated_service）：Win32／Win64 共用 WindowsCall ABI；排除
 // 建立介面、命令列表與開啟執行緒保護（裝置鎖可能要排程等待）的裝置；延後銷毀清單過長時
 // 改走全體靜止的完整服務，順便清空清單。只讀取物件表，不改任何狀態。
-// Map／Unmap 只在重用既有持久映射時合格：立即內容上的 WRITE_DISCARD／NO_OVERWRITE 沿用同一客體區塊，
-// Unmap 上傳後保留區塊，都不配置或釋放 heap（每幀數千次，是平行模式全體靜止的最大來源）。
-bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) const try {
+// worker（共用映射鎖）上 Map／Unmap 只在重用既有持久映射時合格：立即內容上的 WRITE_DISCARD／NO_OVERWRITE 沿用同一
+// 客體區塊，Unmap 上傳後保留區塊，都不配置或釋放 heap（每幀數千次，是平行模式全體靜止的最大來源）。協調者
+//（coordinator=true）持獨占映射鎖，可配置與釋放 heap，Map／Unmap 與寫入持久映射資源的複製都可本地完成。
+bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service,bool coordinator) const try {
     if(!d3d11_ || d3d11_->deferred_releases.size()>=256)return false;
     const auto symbol=service.symbol;
     static constexpr std::string_view excluded[]{"QueryInterface","FinishCommandList","ExecuteCommandList"};
     if(std::find(std::begin(excluded),std::end(excluded),symbol)!=std::end(excluded))return false;
     const WindowsCall arg(state,memory,service);
     const auto found=d3d11_->objects.find(arg(0));if(found==d3d11_->objects.end())return false;
-    if(symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource"){
+    if(!coordinator && (symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource")){
         // 寫入目的資源會撤銷持久映射並釋放客體 heap；在任何副作用之前交回完整服務邊界。
         const auto destination=d3d11_->objects.find(arg(1));
         if(destination!=d3d11_->objects.end() && !destination->second.identity->persistent_maps.empty())return false;
     }
     if(symbol=="Map" || symbol=="Unmap"){
         const auto resource=d3d11_->objects.find(arg(1));
-        if(found->second.kind!=Kind::Context || found->second.identity->context_type || resource==d3d11_->objects.end() ||
-           !resource->second.identity->resource)return false;
-        const auto& id=*resource->second.identity;const auto subresource=static_cast<std::uint32_t>(arg(2));
-        const auto kept=id.persistent_maps.find(subresource);if(kept==id.persistent_maps.end())return false;
-        if(symbol=="Map"){const auto type=static_cast<std::uint32_t>(arg(3));if(type!=4 && type!=5)return false;}
-        else{const auto mapped=id.subresource_maps.find(subresource);if(mapped==id.subresource_maps.end() || mapped->second.pointer!=kept->second.pointer)return false;}
+        if(coordinator){
+            // 立即內容上的對應：一般完整服務同樣在協調執行緒執行（讀回會等命令執行緒與 GPU）。延遲內容交回完整路徑。
+            if(found->second.kind!=Kind::Context || found->second.identity->context_type || resource==d3d11_->objects.end() ||
+               !resource->second.identity->resource)return false;
+        }else{
+            if(found->second.kind!=Kind::Context || found->second.identity->context_type || resource==d3d11_->objects.end() ||
+               !resource->second.identity->resource)return false;
+            const auto& id=*resource->second.identity;const auto subresource=static_cast<std::uint32_t>(arg(2));
+            const auto kept=id.persistent_maps.find(subresource);if(kept==id.persistent_maps.end())return false;
+            if(symbol=="Map"){const auto type=static_cast<std::uint32_t>(arg(3));if(type!=4 && type!=5)return false;}
+            else{const auto mapped=id.subresource_maps.find(subresource);if(mapped==id.subresource_maps.end() || mapped->second.pointer!=kept->second.pointer)return false;}
+        }
     }
     // 只限裝置、裝置內容、資源與 view、著色器、佈局、狀態物件、查詢與 class linkage；交換鏈、工廠、輸出、
     // DXGI 裝置、多執行緒鎖、反射、命令列表與 D3D10 物件仍走完整服務。
@@ -447,7 +497,42 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     return !(device->second.identity->protected_threads && device->second.identity->lock_address);
 }catch(const MemoryFault&){return false;}catch(const HostCallFault&){return false;}
 std::recursive_mutex& WindowsServices::graphics_mutex() noexcept {static std::recursive_mutex value;return value;}
+// 前置快速路徑：完整分派函式內聯了上百個方法與數十個繪製狀態暫存物件，堆疊框架約 336 KB，每次呼叫都要逐頁探測
+// 堆疊與初始化；遊戲內 D3D11 呼叫約八成是 COM AddRef／Release 與 GetDesc（DQ3 每秒十餘萬次），在進入完整函式前
+// 以相同語義完成：AddRef 與非最後一次 Release 只改引用計數；GetDesc 只把建立時保存的描述寫回客體，並遵守
+// 多執行緒保護裝置的鎖（被其他執行緒持有時交回完整路徑等待）。其餘情況（找不到物件、最後一次 Release 需要銷毀、
+// 延後銷毀清單待處理、比對模式）一律交給完整路徑，例外與錯誤回報不變。X64ARM_D3D11_FRONT_PATH=0 關閉。
 std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    static const bool front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_FRONT_PATH");return !value || std::string_view(value)!="0";}();
+    const auto symbol=service.symbol;
+    const bool com=symbol=="AddRef" || symbol=="Release";
+    const bool desc=!com && (symbol=="BufferGetDesc" || symbol=="Texture1DGetDesc" || symbol=="Texture3DGetDesc" || symbol=="GraphicsGetDesc");
+    if(front_path && (com || desc) && d3d11_ &&
+       (service.family=="internal-d3d11" || (com && service.family=="internal-d3d10"))){
+        const std::lock_guard graphics_lock(graphics_mutex());
+        auto& bridge=*d3d11_;
+        if(runtime_.network.external_io && (graphics_local() || bridge.deferred_releases.empty())){
+            const WindowsCall arg(state,memory,service);
+            if(const auto found=bridge.objects.find(arg(0));found!=bridge.objects.end() && found->second.identity){
+                auto& id=*found->second.identity;
+                if(symbol=="AddRef"){
+                    if(id.references!=UINT32_MAX){arg.return_to(state,++id.references);return std::nullopt;}
+                }else if(symbol=="Release"){
+                    if(id.references>1){arg.return_to(state,--id.references);return std::nullopt;}
+                }else{
+                    const auto device=id.device?bridge.objects.find(id.device):found;
+                    if(device!=bridge.objects.end() && device->second.identity &&
+                       !(device->second.identity->protected_threads && device->second.identity->lock_address)){
+                        memory.write(GuestAddress{arg(1)},id.desc);
+                        arg.return_to(state,0);return std::nullopt;
+                    }
+                }
+            }
+        }
+    }
+    return invoke_d3d11_full(state,memory,service);
+}
+std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     // worker 可直接執行裝置內容方法（見 graphics_worker_service）；所有 D3D11 服務在此串行化。
     const std::lock_guard graphics_lock(graphics_mutex());
     if(!runtime_.network.external_io)throw HostCallFault("原生硬體裝置不能在 compare 模式建立或使用");

@@ -66,6 +66,8 @@ struct GuestThread {
     // 等待剛完成而尚未 dispatch；與 Windows 可停用的動態優先序提升分開。
     bool wake_pending{};
     std::uint64_t last_dispatch_ticks{}; // 上次被排程執行的單調時鐘（100 ns），防餓死提升用。
+    // 常駐平行 worker slot 的時間片期限（單調時鐘 100 ns）：期限內重新選取客體時保留原 slot，避免每次集合都輪替。
+    std::uint64_t parallel_slice_deadline{};
     std::uint32_t dynamic_priority_boost{};
     bool priority_boost_disabled{};
     std::uint32_t power_control{}, power_state{};

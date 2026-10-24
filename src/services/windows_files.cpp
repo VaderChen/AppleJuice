@@ -2,11 +2,17 @@
 #include "crt_os_error.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_security_attributes.hpp"
+#include "x64arm/security_access.hpp"
+#include "x64arm/windows_paths.hpp"
 #include "x64arm/windows_raw_input.hpp"
 #include "x64arm/shared_wake.hpp"
 #include <algorithm>
 #include <bit>
 #include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <system_error>
 #include <thread>
 #if !defined(_WIN32)
@@ -15,6 +21,49 @@
 
 namespace x64arm {
 namespace {
+bool eager_file_information() {
+    static const bool legacy=[] {const auto* value=std::getenv("X64ARM_FILE_OPEN_LEGACY_INFORMATION");
+        return value && std::string_view(value)=="1";}();
+    return legacy;
+}
+// 僅在指定的檔案服務診斷輪量測；不記錄檔名，不在客體迴圈增加輪詢。
+struct FileOpenCpuProfile {
+    bool enabled{},valid{true},information_queried{};
+    std::uint64_t begin{},information_cpu{},host_open_cpu{};
+    FileOpenCpuProfile() {
+        static const bool requested=[] {const auto* value=std::getenv("X64ARM_FILE_OPEN_PROFILE");
+            return value && std::string_view(value)=="1";}();
+        enabled=requested;begin=now();
+    }
+    std::uint64_t now() {
+        if(!enabled)return 0;
+#if defined(CLOCK_THREAD_CPUTIME_ID) && !defined(_WIN32)
+        const auto saved=errno;timespec stamp{};
+        const auto result=clock_gettime(CLOCK_THREAD_CPUTIME_ID,&stamp);errno=saved;
+        if(result){valid=false;return 0;}
+        return static_cast<std::uint64_t>(stamp.tv_sec)*1000000000ULL+static_cast<std::uint64_t>(stamp.tv_nsec);
+#else
+        valid=false;return 0;
+#endif
+    }
+    void add(std::uint64_t& value,std::uint64_t start) {
+        if(!enabled)return;
+        const auto end=now();if(end<start){valid=false;return;}value+=end-start;
+    }
+    ~FileOpenCpuProfile() {
+        if(!enabled)return;
+        const auto end=now();if(!valid || end<begin || information_cpu+host_open_cpu>end-begin)return;
+#if !defined(_WIN32)
+        const auto saved=errno;
+        std::fprintf(stderr,"file_open_cpu pid=%d unix_ms=%lld mode=%s information=%u information_cpu_ns=%llu host_open_cpu_ns=%llu other_cpu_ns=%llu total_cpu_ns=%llu\n",
+            static_cast<int>(::getpid()),static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()),
+            eager_file_information()?"eager":"demand",information_queried?1U:0U,
+            static_cast<unsigned long long>(information_cpu),static_cast<unsigned long long>(host_open_cpu),
+            static_cast<unsigned long long>(end-begin-information_cpu-host_open_cpu),static_cast<unsigned long long>(end-begin));
+        errno=saved;
+#endif
+    }
+};
 bool find_matches(std::u16string pattern,std::u16string_view name,bool case_sensitive) {
     if(pattern==u"*.*")pattern=u"*";
     std::u16string expression;
@@ -91,6 +140,7 @@ void find_data(GuestMemory& memory,std::uint64_t address,const DirectoryEntry& e
 }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    FileOpenCpuProfile profile;
     const WindowsCall frame(state,memory,service);
     FileOpenArguments values{};
     const auto invalid=[&](std::uint32_t error){last_error_=error;frame.return_to(state,x86_?UINT32_MAX:UINT64_MAX);return std::optional<std::uint32_t>{};};
@@ -151,11 +201,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
                 try {runtime_.win_file_positions.emplace(handle,0);files_.emplace(handle,std::move(file));if(security.inherit)runtime_.handle_flags[handle]=1;returned=handle;return true;}
                 catch(const std::bad_alloc&) {files_.erase(handle);runtime_.win_file_positions.erase(handle);last_error_=8;returned=UINT64_MAX;return false;}
             };
-            const auto info=filesystem_.information(path);
+            FileInformation info;bool information_loaded=false;
+            const auto load_information=[&] {
+                if(information_loaded)return;
+                const auto started=profile.now();profile.information_queried=true;
+                info=filesystem_.information(path);profile.add(profile.information_cpu,started);information_loaded=true;
+            };
+            // 可寫掛載由 open_host 保留路徑、權限、inode 分享與建立契約。
+            // 只有相容性可能衝突的非 native 快照需要先解析 key；唯讀快照仍使用完整中繼資料。
+            if(eager_file_information() || !filesystem_.writable())load_information();
             const auto sharing_conflict=[&](const auto& entry) {
-                if(entry.second.native || entry.second.key!=info.key)return false;
+                if(entry.second.native)return false;
                 const auto category=[](std::uint32_t access){return ((access&(0x80000000U|1U|0x20U))?1U:0U)|((access&(0x40000000U|2U|4U))?2U:0U)|((access&0x10000U)?4U:0U);};
-                return (category(dword(1))&~entry.second.sharing) || (category(entry.second.access)&~dword(2));
+                if(!(category(dword(1))&~entry.second.sharing) && !(category(entry.second.access)&~dword(2)))return false;
+                load_information();return entry.second.key==info.key;
             };
             if (std::any_of(files_.begin(),files_.end(),sharing_conflict)) last_error_=32;
             else if (filesystem_.writable()) {
@@ -170,7 +229,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
                     if(details.metadata.attributes&0x10U)return {{},{},{},5,false};
                     return {details.key,file,details.metadata,0,true};
                 };
+                const auto opening=profile.now();
                 const auto opened=filesystem_.open_host(path,dword(1),dword(4),dword(5),dword(2),[&]{return file_creation_descriptor(memory,arg(3));},arg(6)?std::function<OpenHostFile()>{file_template}:std::function<OpenHostFile()>{});
+                profile.add(profile.host_open_cpu,opening);
                 if(opened.error)last_error_=opened.error;
                 else {
                     FileHandle file;file.key=opened.key;file.bytes=std::make_shared<const std::vector<std::uint8_t>>();file.native=opened.file;file.metadata=opened.metadata;
@@ -387,17 +448,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
             if(!status && file.native)file.metadata=file.native->information().metadata;
         } else if(symbol=="NtQueryVolumeInformationFile") {
             const auto kind=u32(4),capacity=u32(3);const auto output=arg(2);const auto& file=found->second;
-            const unsigned size=kind==3?24U:kind==7?32U:kind==4?8U:kind==5?24U:0U;
+            const unsigned size=kind==1?24U:kind==3?24U:kind==7?32U:kind==4?8U:kind==5?16U:0U;
             if(!size)status=0xc0000003;else if(capacity<size)status=0xc0000004;
+            else if(file.pipe && kind!=4)status=0xc0000010;
             else {
                 FileVolumeSpace space;if(kind==3 || kind==7){auto path=file.path;if(!(file.metadata.attributes&0x10)){const auto slash=path.find_last_of("\\/");path=slash==path.npos?".":path.substr(0,slash+1);}space=file.native?file.native->volume_space():filesystem_.volume_space(path);status=nt_error(space.error);if(!status && (!space.allocation_unit || !space.sector_size))status=0xc00000bb;}
+                FileInformation volume;
+                if(kind==1){
+                    const auto location=filesystem_.volume_location(file.path.empty()?file.key:file.path);
+                    status=nt_error(location.error);
+                    if(!status){volume=filesystem_.information(windows_volume_path(location.volume));status=nt_error(volume.error);}
+                }
                 if(!status){
-                    memory.write(GuestAddress{output},std::vector<std::uint8_t>(size));
-                    const auto put=[&](unsigned offset,unsigned length,std::uint64_t value){memory.store(GuestAddress{output+offset},static_cast<std::uint8_t>(length*8),value);};
+                    std::vector<std::uint8_t> bytes(kind==1?18U:kind==5?12U:size);
+                    const auto put=[&](unsigned offset,unsigned length,std::uint64_t value){for(unsigned n=0;n<length;++n)bytes.at(offset+n)=static_cast<std::uint8_t>(value>>(n*8));};
                     if(kind==3 || kind==7){put(0,8,space.total/space.allocation_unit);put(8,8,space.available/space.allocation_unit);if(kind==7)put(16,8,space.free/space.allocation_unit);put(kind==7?24:16,4,space.allocation_unit/space.sector_size);put(kind==7?28:20,4,space.sector_size);}
-                    else if(kind==4){put(0,4,7);put(4,4,0x20);}
-                    else {put(0,4,2|4|(filesystem_.writable()?0U:0x80000U));put(4,4,255);put(8,4,12);auto name=utf16_bytes(u"X64ARM");name.resize(12);memory.write(GuestAddress{output+12},name);}
-                    transferred=size;
+                    else if(kind==4){put(0,4,file.pipe?0x11U:7U);put(4,4,file.pipe?0U:0x20U);}
+                    else {
+                        // 與 Win32 volume 查詢共用虛擬卷名、裝置序號及檔案系統能力。
+                        auto name=utf16_bytes(u"X64ARM");name.resize(name.size()-2);
+                        if(kind==1){put(0,8,volume.metadata.created);put(8,4,volume.metadata.device);put(12,4,name.size());}
+                        else {put(0,4,2|4|(filesystem_.writable()?0U:0x80000U));put(4,4,255);put(8,4,name.size());}
+                        bytes.insert(bytes.end(),name.begin(),name.end());
+                        if(bytes.size()>capacity){bytes.resize(capacity&~1U);status=0x80000005U;}
+                    }
+                    memory.write(GuestAddress{output},bytes);transferred=bytes.size();
                 }
             }
         } else {
@@ -676,46 +751,65 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         if(error) {if(crt){crt_os_error::store(memory,runtime_.errno_cell,error);result=UINT32_MAX;}else fail(error);}
         else result=crt?0:1;
     } else if (symbol=="NtQueryInformationFile") {
-        const auto found=files_.find(arg(0));if(found!=files_.end() && found->second.native)found->second.metadata=found->second.native->information().metadata;const bool standard=arg(0)>=0x100 && arg(0)<=0x102 && standard_open_[arg(0)-0x100];
-        if(u32(4)==9) {
-            std::uint32_t status=0;std::size_t written=0;
-            memory.check(GuestAddress{arg(1)},x86_?8:16,Access::Write);
-            if(found==files_.end())status=standard?0xc0000010U:0xc0000008U;
-            else if(u32(3)<4)status=0xc0000004U;
-            else {
-                auto [bytes,error]=name_information(found->second);
-                if(error)status=error==3?0xc000003aU:0xc0000001U;
-                else {written=std::min<std::size_t>(u32(3),bytes.size());memory.write(GuestAddress{arg(2)},std::span{bytes}.first(written));if(written<bytes.size())status=0x80000005U;}
-            }
-            memory.store(GuestAddress{arg(1)},x86_?32:64,status);memory.store(GuestAddress{arg(1)+(x86_?4U:8U)},x86_?32:64,written);
-            arg.return_to(state,status);return std::nullopt;
-        }
+        const auto found=files_.find(arg(0));
+        const bool standard=arg(0)>=0x100 && arg(0)<=0x102 && standard_open_[arg(0)-0x100];
+        const auto kind=u32(4),capacity=u32(3);
         std::size_t size=0;std::uint32_t status=0;std::vector<std::uint8_t> bytes;
+        const auto access=security::mapped_access(standard?(arg(0)==0x100?0x80000000U:0x40000000U):found==files_.end()?0U:found->second.access,{0x120089U,0x120116U,0x1200a0U,0x1f01ffU});
         if (!standard && found==files_.end()) status=0xc0000008;
         else {
-            switch (u32(4)) {
+            switch (kind) {
             case 4:size=40;break;case 5:size=24;break;case 6:size=8;break;case 7:case 8:case 16:case 17:size=4;break;case 14:size=8;break;
+            case 9:size=8;break;case 18:size=104;break;case 34:size=56;break;case 35:size=8;break;
             default:status=0xc0000003;break;
             }
-            if (!status && u32(3)<size) status=0xc0000004;
+            if (!status && capacity<size) status=0xc0000004;
+            if (!status && (kind==4 || kind==18 || kind==34 || kind==35) && !(access&0x80U))status=0xc0000022;
+            if (!status && standard && (kind==9 || kind==18))status=0xc0000010;
+            if (!status && found!=files_.end() && found->second.native) {
+                const auto current=found->second.native->information();
+                if(current.error)status=current.error==5?0xc0000022U:current.error==6?0xc0000008U:0xc0000001U;
+                else found->second.metadata=current.metadata;
+            }
         }
         memory.check(GuestAddress{arg(1)},x86_?8:16,Access::Write);
         if (!status) {
-            bytes.resize(size);memory.write(GuestAddress{arg(2)},bytes);
+            bytes.resize(size);
             const auto& info=standard?FileMetadata{}:found->second.metadata;
-            const auto store=[&](unsigned offset,unsigned width,std::uint64_t value){memory.store(GuestAddress{arg(2)+offset},static_cast<std::uint8_t>(width),value);};
-            switch (u32(4)) {
-            case 4:store(0,64,info.created);store(8,64,info.accessed);store(16,64,info.modified);store(24,64,info.changed);store(32,32,info.attributes);break;
-            case 5:store(0,64,info.allocation_size);store(8,64,info.size);store(16,32,info.links);store(20,8,!standard && found->second.native && found->second.native->delete_pending());store(21,8,(info.attributes&0x10)!=0);break;
-            case 6:store(0,64,info.id);break;
-            case 8:store(0,32,standard?(arg(0)==0x100?0x80000000:0x40000000):found->second.access);break;
-            case 14:store(0,64,standard?0:static_cast<std::uint64_t>(runtime_.win_file_positions.at(found->second.object)));break;
-            case 16:store(0,32,standard?0x20:found->second.mode);break;
-            default:break;
+            const auto store=[&](unsigned offset,unsigned width,std::uint64_t value){for(unsigned n=0;n<width/8;++n)bytes.at(offset+n)=static_cast<std::uint8_t>(value>>(n*8));};
+            // 單項與 All 使用相同的欄位契約；x86／x64 的 FILE_ALL_INFORMATION 固定區皆為 100 bytes。
+            const auto fill=[&](std::uint32_t part,unsigned offset) {
+                switch(part) {
+                case 4:store(offset,64,info.created);store(offset+8,64,info.accessed);store(offset+16,64,info.modified);store(offset+24,64,info.changed);store(offset+32,32,info.attributes);break;
+                case 5:store(offset,64,info.allocation_size);store(offset+8,64,info.size);store(offset+16,32,info.links);store(offset+20,8,!standard && found->second.native && found->second.native->delete_pending());store(offset+21,8,(info.attributes&0x10)!=0);break;
+                case 6:store(offset,64,info.id);break;
+                case 8:store(offset,32,access);break;
+                case 14:store(offset,64,standard?0:static_cast<std::uint64_t>(runtime_.win_file_positions.at(found->second.object)));break;
+                case 16:store(offset,32,standard?0x20:found->second.mode);break;
+                default:break; // 未提供 NT EA；一般映射檔案支援 byte alignment。
+                }
+            };
+            if(kind==18) {
+                fill(4,0);fill(5,40);fill(6,64);fill(7,72);fill(8,76);fill(14,80);fill(16,88);fill(17,92);
+            } else if(kind==34) {
+                fill(4,0);store(32,64,info.allocation_size);store(40,64,info.size);store(48,32,info.attributes);
+            } else if(kind==35) {
+                store(0,32,info.attributes);store(4,32,(info.attributes&0x400U)?info.reparse_tag:0U);
+            } else fill(kind,0);
+            if(kind==9 || kind==18) {
+                auto [name,error]=name_information(found->second);
+                if(error){status=error==3?0xc000003aU:0xc0000001U;bytes.clear();}
+                else {
+                    const unsigned offset=kind==18?96U:0U;
+                    bytes.resize(offset);bytes.insert(bytes.end(),name.begin(),name.end());
+                    // 保留完整名稱長度，短緩衝只複製完整 WCHAR；警告仍提供所有已填入的 metadata。
+                    if(bytes.size()>capacity){bytes.resize(capacity&~1U);status=0x80000005U;}
+                }
             }
+            if(!bytes.empty())memory.write(GuestAddress{arg(2)},bytes);
         }
-        if(!status)process_io::record(process_io::Kind::Other,size);
-        memory.store(GuestAddress{arg(1)},x86_?32:64,status);memory.store(GuestAddress{arg(1)+(x86_?4U:8U)},x86_?32:64,status?0:size);result=status;
+        if(!bytes.empty())process_io::record(process_io::Kind::Other,bytes.size());
+        memory.store(GuestAddress{arg(1)},x86_?32:64,status);memory.store(GuestAddress{arg(1)+(x86_?4U:8U)},x86_?32:64,bytes.size());result=status;
     } else if (symbol=="GetVolumeInformationByHandleW") {
         const auto found=files_.find(arg(0));
         if (found==files_.end()) fail(6);

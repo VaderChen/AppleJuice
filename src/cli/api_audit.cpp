@@ -1,6 +1,6 @@
 #include "x64arm/api_audit.hpp"
 #include "x64arm/pe_loader.hpp"
-#include "x64arm/raw_program.hpp"
+#include "x64arm/pe_file_cache.hpp"
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
@@ -27,7 +27,9 @@ void resolution(std::ostream& out, const WindowsServices& services, std::string 
 }
 }
 void audit_pe(const std::filesystem::path& path, std::ostream& output) {
-    const auto bytes=read_raw_file(path);
+    // 盤點與執行共用 PE 來源契約；檔案 overlay 不受客體映像容量限制。
+    const auto source=read_pe_snapshot(path);
+    const auto& bytes=*source;
     const auto parsed=inspect_pe_image(bytes);
     std::string loader_error;
     try { (void)parse_pe_image(bytes,{},parsed.dll); }

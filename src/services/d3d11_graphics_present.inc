@@ -62,8 +62,10 @@
                 // 診斷：X64ARM_TRACE_GRAPHICS_STATS=1 每 600 幀輸出一次裝置的 Metal 後端統計（GPU 忙碌、CPU 等待、encoder 數），
                 // 遊戲被強制結束時也有資料；統計字串由命令執行緒代理同步後讀取。
                 static const bool trace_stats=[] {const auto* value=std::getenv("X64ARM_TRACE_GRAPHICS_STATS");return value && std::string_view(value)=="1";}();
-                if(trace_stats && swap->frames%600==0)
-                    std::fprintf(stderr,"[d3d11_metal] frames=%llu draws=%llu %s\n",static_cast<unsigned long long>(bridge.graphics_frames),
-                        static_cast<unsigned long long>(bridge.graphics_draws),producer->statistics().c_str());
+                if(trace_stats && swap->frames%600==0){
+                    std::string creations;for(const auto& [name,count]:bridge.resource_creations)creations+=name+":"+std::to_string(count)+",";
+                    std::fprintf(stderr,"[d3d11_metal] frames=%llu draws=%llu d3d11_resource_creations=%s %s\n",static_cast<unsigned long long>(bridge.graphics_frames),
+                        static_cast<unsigned long long>(bridge.graphics_draws),creations.empty()?"none":creations.c_str(),producer->statistics().c_str());
+                }
                 graphics_close_after_present(swap->window,swap->frames,[&](std::uint64_t target){if(!gui_.windows.contains(target))return false;enqueue_gui_message({target,0,0,0x10});return true;});
             }

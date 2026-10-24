@@ -90,6 +90,10 @@ MachineTime MachineClock::snapshot(std::uint64_t monotonic)const noexcept{
     std::lock_guard guard(storage_->mutex);const auto value=storage_->read_locked();const auto now=synchronize(monotonic);
     return {time_at(value,now),now,storage_->cached_revision,static_cast<std::uint32_t>(value[2]),static_cast<std::uint32_t>(value[3]),value[4]!=0};
 }
+MachineTime MachineClock::snapshot_at(std::uint64_t fresh)const noexcept{
+    std::lock_guard guard(storage_->mutex);const auto value=storage_->read_locked();const auto now=storage_->data->host?fresh:synchronize(fresh);
+    return {time_at(value,now),now,storage_->cached_revision,static_cast<std::uint32_t>(value[2]),static_cast<std::uint32_t>(value[3]),value[4]!=0};
+}
 void MachineClock::set_time(std::uint64_t monotonic,std::uint64_t filetime){
     if(filetime>limit)throw SecurityDescriptorError{87};std::lock_guard guard(storage_->mutex);SharedEventLock lock(storage_->file);const auto now=synchronize(monotonic);
     auto value=storage_->read_locked();value[0]=filetime;value[1]=now;storage_->publish_locked(value);if(storage_->wake)storage_->wake->notify();

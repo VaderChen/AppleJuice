@@ -30,6 +30,8 @@
 #include "x64arm/usb.hpp"
 
 namespace x64arm {
+// 協調者本地一般服務的 provider 要啟動客體回呼時丟出；呼叫端恢復狀態交回完整路徑。
+struct LocalServiceRefused {};
 struct ResidentHostEnvironment;
 struct PrivateKeyStoreContext;
 class SharedPolicy;
@@ -165,6 +167,10 @@ public:
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_PREEMPT
     bool resident_preempt_plan(GuestMemory&,std::span<GuestState* const>,ResidentPreemptPlan&) override;
     void resident_preempt_commit(GuestState&,GuestState&) override;
+#endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_BLOCK
+    bool resident_block_service(GuestState&,GuestMemory&,std::span<GuestState* const>,GuestState*&) override;
+    bool resident_block_service_impl(GuestState&,GuestMemory&,std::span<GuestState* const>,GuestState*&,int* outcome);
 #endif
     void after_resident_parallel(GuestState&,GuestMemory&) override;
     void after_resident_interrupt(GuestState&,GuestMemory&) override;
@@ -1021,7 +1027,10 @@ private:
     std::optional<std::uint32_t> resume_d3d_compile(GuestState&, GuestMemory&, std::uint64_t, std::uint32_t);
     void discard_d3d_compile(GuestState&, GuestMemory&, std::uint64_t);
     std::optional<std::uint32_t> invoke_d3d11(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
-    bool d3d11_local_eligible(const GuestState&,GuestMemory&,const WindowsServiceDescriptor&) const;
+    // 完整 D3D11 分派（巨型函式，堆疊框架約 336 KB）；invoke_d3d11 先以前置快速路徑處理最常見的簡單方法。
+    std::optional<std::uint32_t> invoke_d3d11_full(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
+    // coordinator=true：協調者持獨占映射鎖，可配置／釋放 heap；worker（共用鎖）維持持久映射重用的限制。
+    bool d3d11_local_eligible(const GuestState&,GuestMemory&,const WindowsServiceDescriptor&,bool coordinator=false) const;
     // worker 上的 D3D11 方法為 true；延後需要改動客體 heap 的銷毀，協調者本地路徑則可處理。
     static bool& graphics_local() noexcept {static thread_local bool value=false;return value;}
     // 所有 D3D11／DXGI 服務共用的鎖（可重入）：worker 上直接執行裝置內容方法時與協調者串行化。
@@ -1063,6 +1072,27 @@ private:
     std::uint64_t resident_object_wake_after_{}; // 服務邊界下一次解析物件等待的單調時鐘（100 ns）。
     // 上一個服務是 D3D11 裝置內容輕量入口時，常駐服務收尾的等待解析與排程限流（見 after_resident_parallel）。
     bool graphics_service_epilogue_{};std::uint64_t last_graphics_epilogue_{};
+    // 協調者本地一般服務執行中（resident_coordinated_service）：provider 要啟動客體回呼時改丟 LocalServiceRefused，交回完整路徑重做。
+    bool local_plain_service_{};
+    // 核心已選定、尚未換入的單 slot 搶占替換者（resident_preempt_plan 回報 true 時記錄）；單槽換手選人時排除，避免同一
+    // 客體執行緒同時進入兩個 slot。搶占提交或重新選取平行集合時清除。
+    GuestState* resident_preempt_pending_{};
+    // concurrent_guest_threads 的近似快取：世代號未變時每 8 次呼叫才重新走訪（多執行緒讀寫，鬆散原子）。
+    struct ConcurrentGuestCache {
+        std::atomic<std::uint64_t> epoch{UINT64_MAX};
+        std::atomic<std::uint32_t> countdown{};
+        std::atomic<bool> value{};
+        ConcurrentGuestCache()=default;
+        // 快取不屬於服務物件的複製狀態；副本重新計算，也保留 PeProgram 的傳回契約。
+        ConcurrentGuestCache(const ConcurrentGuestCache&) noexcept {}
+        ConcurrentGuestCache& operator=(const ConcurrentGuestCache&) noexcept {
+            epoch.store(UINT64_MAX,std::memory_order_relaxed);
+            countdown.store(0,std::memory_order_relaxed);
+            value.store(false,std::memory_order_relaxed);
+            return *this;
+        }
+    };
+    mutable ConcurrentGuestCache concurrent_cache_;
     // 最近一次計算喚醒期限時最早的客體等待期限（100 ns 單調刻度）；過期即需完整排程解析逾時，schedule 後清除。
     mutable std::uint64_t resident_wait_deadline_{UINT64_MAX}; // 只在協調執行緒讀寫。
     std::map<std::uint64_t,GuestAddress> resident_service_requests_;
@@ -1079,6 +1109,8 @@ private:
     enum class ThreadWakeScope { All, Condition, Slim, Critical, Objects };
     bool resolve_thread_waits(GuestMemory&,ThreadWakeScope scope=ThreadWakeScope::All,std::uint64_t address=0);
     void schedule(GuestState& state, GuestMemory& memory);
+    // 常駐平行時協調者在其他 worker 執行中切換 slot 0 的目前客體（只做 schedule 的保存／載入，不輪詢、不選人）。
+    void switch_resident_current(GuestState& state, GuestMemory& memory, std::uint64_t target);
     std::optional<std::uint32_t> force_finish_thread(GuestState&,GuestMemory&);
     std::optional<std::uint32_t> finish_thread(GuestState& state, GuestMemory& memory, std::uint32_t code);
     std::optional<std::uint32_t> exit_thread(GuestState& state, GuestMemory& memory, std::uint32_t code);

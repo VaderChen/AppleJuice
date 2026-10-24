@@ -419,6 +419,7 @@ public:
     void graphics_write_no_overwrite(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t)override;
     void graphics_write_region(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t,std::array<std::uint32_t,6>)override;
     std::vector<std::uint8_t> graphics_read(const GraphicsView&)override;
+    std::vector<std::uint8_t> graphics_read_completed(const GraphicsView&)override;
     void graphics_copy(const GraphicsView&,const GraphicsView&,std::array<std::uint32_t,3>,std::array<std::uint32_t,6>)override;
     void graphics_resolve(const GraphicsView&,const GraphicsView&,std::uint32_t)override;
     void graphics_clear(const GraphicsView&,std::array<float,4>,std::uint32_t)override;

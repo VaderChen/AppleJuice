@@ -1255,6 +1255,7 @@ void WindowsServices::classify_callback(GuestCallback& callback, Continuation co
         std::any_of(gui_.timers.begin(),gui_.timers.end(),[&](const auto& item){return item.second.procedure==target;});
 }
 void WindowsServices::start_callbacks(GuestState& state, GuestMemory& memory, std::vector<GuestCallback> callbacks, Continuation continuation, std::uint64_t value) {
+    if (local_plain_service_) throw LocalServiceRefused{}; // 協調者本地服務不切換回呼框架，交回完整路徑。
     if (runtime_.callbacks.size() >= 128) throw HostCallFault("客體 callback 巢狀深度超過上限");
     for(auto& callback:callbacks)classify_callback(callback,continuation);
     runtime_.callbacks.emplace_back(state, std::move(callbacks), 0, continuation, value, exceptions_.stack.size());

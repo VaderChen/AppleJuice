@@ -73,6 +73,24 @@
             auto chunk=view;chunk.first=first;chunk.count=count;
             submit(context,{[chunk](auto& native){native.graphics_write(chunk,std::span<const std::uint8_t>(zero.data(),chunk.count),0,0);}},false);
         };
+        // 繪製時為進行中的遮蔽查詢分配可見度槽位。共用池只遞增游標（池建立時已清零，不必逐次清零），用完換新池並開新區段；
+        // 其他查詢沿用每查詢緩衝與逐段清零。
+        const auto assign_visibility=[&](const std::shared_ptr<Identity>& context,GraphicsDraw& draw){
+            const auto pointer=binding(context,"Visibility");if(!pointer)return;
+            auto query=object(pointer).identity;require(query->sequence<8192);
+            if(query->visibility_pooled){
+                if(!context->visibility_pool || context->visibility_cursor+8>d3d11_visibility_pool_bytes){
+                    GraphicsResourceDesc desc;desc.width=d3d11_visibility_pool_bytes;
+                    context->visibility_pool=context->native->graphics_resource(desc);context->visibility_cursor=0;++d3d11_->resource_creations["VisibilityPool"];
+                }
+                auto& segments=query->visibility_segments;
+                if(segments.empty() || segments.back().buffer!=context->visibility_pool)segments.push_back({context->visibility_pool,context->visibility_cursor,0});
+                draw.visibility=context->visibility_pool;draw.visibility_offset=context->visibility_cursor;
+                context->visibility_cursor+=8;++segments.back().count;++query->sequence;return;
+            }
+            const auto slot=static_cast<std::uint32_t>(query->sequence++*8);visibility_zero(context,query,view_of(pointer),slot);
+            draw.visibility=query->resource;draw.visibility_offset=slot;
+        };
         const auto draw_state=[&](const std::shared_ptr<Identity>& context)->GraphicsDraw& {
             static const bool snapshot_enabled=[](){const char* option=std::getenv("X64ARM_D3D11_BINDING_SNAPSHOT");return !option || std::string_view(option)!="0";}();
             // X64ARM_D3D11_DRAW_CACHE=0 每次整份重新解析（快取前的行為）。
@@ -85,11 +103,12 @@
             static const std::string stream_key{"StreamOutput"},layout_key{"Layout"},index_key{"Index"},vertex_key{"Vertices"},target_key{"Targets"},depth_key{"Depth"},blend_key{"Blend"},depth_state_key{"DepthState"},raster_key{"Raster"};
             // 多份快取輪流使用：先前以參照排入命令執行緒的繪製可能仍在讀前幾份，只等使用同一份的那次繪製
             // （連續繪製間客體工作很少時，少量份數仍會等待；DQ3 四份時同步等待約 6%，改八份吸收更深的突發）。
-            context->draw_slot=(context->draw_slot+1)%context->draw_caches.size();
+            context->draw_slot=(context->draw_slot+1)%d3d11_draw_cache_count();
             auto& cache=context->draw_caches[context->draw_slot];if(!cache)cache=std::make_unique<D3D11DrawCache>();
             if(context->native)context->native->graphics_sync_until(cache->ticket);
             if(snapshot_enabled && draw_cache_enabled && !context->weak_bindings && cache->destroyed==d3d11_->destroyed_objects)++d3d11_->draw_cache_incremental;
-            else {*cache=D3D11DrawCache{};++d3d11_->draw_cache_full;}
+            // 就地解構再建構（命令執行緒已用完這份快取）；以暫存物件指派會讓每次呼叫的堆疊框架多出約 64 KB。
+            else {std::destroy_at(cache.get());std::construct_at(cache.get());++d3d11_->draw_cache_full;}
             cache->destroyed=d3d11_->destroyed_objects;
             auto& draw=cache->draw;
             try{
@@ -109,7 +128,7 @@
                 if(snapshot_enabled){
                     // 保留 PS 的輸出 UAV（即使 PS 為空）；其他未綁 shader 的 stage 不取快照。
                     if(!shader_pointer && stage!=1){
-                        if(cache->present[stage]){target=GraphicsStage{};cache->present[stage]=false;cache->shaders[stage]=0;for(auto& raw:cache->stage_raw[stage])raw.clear();}
+                        if(cache->present[stage]){std::destroy_at(&target);std::construct_at(&target);cache->present[stage]=false;cache->shaders[stage]=0;for(auto& raw:cache->stage_raw[stage])raw.clear();}
                         continue;
                     }
                     cache->present[stage]=true;
@@ -160,7 +179,7 @@
                         }else {
                             // 每個 context／stage 只快取上一組 binding；不覆寫仍在 GPU 使用的 buffer。
                             auto key=bytes;bytes.resize(65536);GraphicsResourceDesc desc;desc.width=65536;desc.bind=4;
-                            auto data=context->native->graphics_resource(desc);context->native->graphics_write(GraphicsView{data},bytes,65536,65536);
+                            auto data=context->native->graphics_resource(desc);++d3d11_->resource_creations["ClassLinkage"];context->native->graphics_write(GraphicsView{data},bytes,65536,65536);
                             context->linkage_keys[stage]=std::move(key);context->linkage_constants[stage]=data;draw.stages[stage].constants[14]=std::move(data);++d3d11_->linkage_uploads;
                         }
                     }
@@ -225,7 +244,7 @@
                 }
             }
             if(!arg(3))result=1;
-            else{auto native=device->native->graphics_resource(d);auto id=create(buffer?Kind::BufferObject:one?Kind::Texture1D:three?Kind::Texture3D:Kind::Texture,device->root);id->resource=std::move(native);id->desc=desc;if(!buffer && !one && !three)for(unsigned i=0;i<11;++i)id->texture_desc[i]=word(desc,4*i);
+            else{auto native=device->native->graphics_resource(d);++bridge.resource_creations[std::string(symbol)];auto id=create(buffer?Kind::BufferObject:one?Kind::Texture1D:three?Kind::Texture3D:Kind::Texture,device->root);id->resource=std::move(native);id->desc=desc;if(!buffer && !one && !three)for(unsigned i=0;i<11;++i)id->texture_desc[i]=word(desc,4*i);
                 try{if(arg(2))for(unsigned i=0;i<d.levels*d.layers;++i){const auto at=arg(2)+i*(x86_?12:16);const auto data=memory.load(GuestAddress{at},pointer_bits);const auto row=static_cast<std::uint32_t>(memory.load(GuestAddress{at+pointer_size},32)),depth=static_cast<std::uint32_t>(memory.load(GuestAddress{at+pointer_size+4},32));const auto w=std::max(1U,d.width>>(i%d.levels)),h=std::max(1U,d.height>>(i%d.levels)),z=std::max(1U,d.depth>>(i%d.levels));const auto pitch=buffer?std::array{d.width,1U}:graphics_format_pitch(d.format,w,h);require(buffer || one || row>=pitch[0]);const auto size=buffer?d.width:std::uint64_t{depth}*(z-1)+std::uint64_t{row}*(pitch[1]-1)+pitch[0];require(size<=512*1024*1024);device->native->graphics_write(subresource(id,i),read_bytes(memory,data,static_cast<std::size_t>(size)),one?pitch[0]:row,three?depth:0);}}
                 catch(...){release(id->root);throw;}write_pointer(arg(3),id->root);}
         }else if(symbol=="OpenSharedResource"){
@@ -277,7 +296,7 @@
             }
             if(!srv && !rtv && !dsv && d.dimension==1){
                 v.flags=word(desc,16);require(!(v.flags&~7U) && (v.flags&6)!=6 && (!(v.flags&1) || (v.flags==1 && v.format==39 && (d.misc&0x20))) && (!(v.flags&6) || (!v.format && d.stride && (d.misc&0x40))));
-                if((v.flags&6) && arg(3)){GraphicsResourceDesc counter;counter.width=4;v.counter=device->native->graphics_resource(counter);}
+                if((v.flags&6) && arg(3)){GraphicsResourceDesc counter;counter.width=4;v.counter=device->native->graphics_resource(counter);++bridge.resource_creations["UavCounter"];}
             }
             if(!arg(3))result=1;else {auto id=create(srv?Kind::ShaderResource:rtv?Kind::RenderTarget:dsv?Kind::DepthView:Kind::Unordered,device->root);id->texture=arg(1);hold(arg(1));id->graphics_view=v;id->desc=desc;write_pointer(arg(3),id->root);}
         }else if(symbol=="GetResource" && graphics_view_kind(object(arg(0)).kind)){graphics_handled=true;auto id=object(arg(0)).identity;hold(id->texture);write_pointer(arg(1),id->texture);}
@@ -402,11 +421,11 @@
             if(set){if(viewport){context->viewports.resize(count);for(unsigned i=0;i<count;++i){const auto data=read_bytes(memory,arg(2)+24*i,24);std::memcpy(context->viewports[i].data(),data.data(),24);require(context->viewports[i][2]>=0 && context->viewports[i][3]>=0 && context->viewports[i][4]>=0 && context->viewports[i][5]<=1);}}else{context->scissors.resize(count);for(unsigned i=0;i<count;++i){const auto data=read_bytes(memory,arg(2)+16*i,16);std::memcpy(context->scissors[i].data(),data.data(),16);}}}
             else {const auto total=viewport?context->viewports.size():context->scissors.size();memory.store(GuestAddress{arg(1)},32,total);if(arg(2))for(unsigned i=0;i<std::min<std::size_t>(count,total);++i){const auto* data=viewport?reinterpret_cast<const std::uint8_t*>(context->viewports[i].data()):reinterpret_cast<const std::uint8_t*>(context->scissors[i].data());memory.write(GuestAddress{arg(2)+i*(viewport?24:16)},std::span<const std::uint8_t>{data,viewport?24U:16U});}}
         }else if(symbol=="Draw" || symbol=="DrawIndexed" || symbol=="DrawInstanced" || symbol=="DrawIndexedInstanced"){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto& draw=draw_state(context);draw.count=u32(1);draw.indexed=symbol.find("Indexed")!=symbol.npos;const bool instanced=symbol.find("Instanced")!=symbol.npos;draw.instances=instanced?u32(2):1;draw.start=u32(instanced?3:2);if(draw.indexed)draw.base_vertex=static_cast<std::int32_t>(u32(instanced?4:3));if(instanced)draw.start_instance=u32(draw.indexed?5:4);if(auto ptr=binding(context,"Visibility")){auto query=object(ptr).identity;require(query->sequence<8192);const auto slot=static_cast<std::uint32_t>(query->sequence++*8);visibility_zero(context,query,view_of(ptr),slot);draw.visibility=query->resource;draw.visibility_offset=slot;}
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto& draw=draw_state(context);draw.count=u32(1);draw.indexed=symbol.find("Indexed")!=symbol.npos;const bool instanced=symbol.find("Instanced")!=symbol.npos;draw.instances=instanced?u32(2):1;draw.start=u32(instanced?3:2);if(draw.indexed)draw.base_vertex=static_cast<std::int32_t>(u32(instanced?4:3));if(instanced)draw.start_instance=u32(draw.indexed?5:4);assign_visibility(context,draw);
             // 立即模式且未設 predicate 時直接執行：submit 對立即 context 本來就同步呼叫，包成 std::function 只多一次
             // 63 KB 狀態的搬移與堆積配置（微基準每次約 3.9 µs）。延遲 context 與 predicate 仍走 submit。
             if(direct_submit(context)){context->native->graphics_draw_retained(draw);count_direct(context,1,0);}
-            else submit(context,{[draw](auto& native){native.graphics_draw(draw);},1,0});
+            else submit(context,recorded_draw(draw));
         }else if(symbol=="DrawIndexedInstancedIndirect" || symbol=="DrawInstancedIndirect" || symbol=="DispatchIndirect"){
             // 參數 buffer 須以 D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS 建立，offset 4 位元組對齊且整組參數在範圍內；
             // 不合法時與 runtime 相同略過呼叫（void 方法，debug layer 才報錯）。參數交給後端的原生間接呼叫，不讀回 CPU。
@@ -417,20 +436,20 @@
             else if(dispatch){
                 const auto& stage=draw_state(context).stages[5];auto resource=arguments->resource;
                 if(direct_submit(context)){context->native->graphics_dispatch_indirect(stage,resource,offset);count_direct(context,0,1);}
-                else submit(context,{[stage,resource,offset](auto& native){native.graphics_dispatch_indirect(stage,resource,offset);},0,1});
+                else submit(context,recorded_dispatch_indirect(stage,resource,offset));
             }else{
                 auto& draw=draw_state(context);draw.indexed=indexed;draw.indirect=arguments->resource;draw.indirect_offset=offset;
-                if(auto ptr=binding(context,"Visibility")){auto query=object(ptr).identity;require(query->sequence<8192);const auto slot=static_cast<std::uint32_t>(query->sequence++*8);visibility_zero(context,query,view_of(ptr),slot);draw.visibility=query->resource;draw.visibility_offset=slot;}
+                assign_visibility(context,draw);
                 if(direct_submit(context)){context->native->graphics_draw_retained(draw);count_direct(context,1,0);}
-                else submit(context,{[draw](auto& native){native.graphics_draw(draw);},1,0});
+                else submit(context,recorded_draw(draw));
             }
         }else if(symbol=="DrawAuto"){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto draw=draw_state(context);require(bool(draw.vertices[0].resource));
-            submit(context,{[draw=std::move(draw)](auto& native)mutable{draw.count=static_cast<std::uint32_t>(draw.vertices[0].resource->stream_vertices);native.graphics_draw(draw);},1,0});
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const auto& draw=draw_state(context);require(bool(draw.vertices[0].resource));
+            submit(context,recorded_draw_auto(draw));
         }else if(symbol=="Dispatch"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);const auto& stage=draw_state(context).stages[5];const std::array groups{u32(1),u32(2),u32(3)};
             if(direct_submit(context)){context->native->graphics_dispatch_retained(stage,groups);count_direct(context,0,1);}
-            else submit(context,{[stage,groups](auto& native){native.graphics_dispatch(stage,groups);},0,1});
+            else submit(context,recorded_dispatch(stage,groups));
         }else if(symbol=="ClearRenderTargetView" || symbol=="ClearDepthStencilView"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto view=view_of(arg(1));std::array<float,4> values{};const bool depth=symbol=="ClearDepthStencilView";if(depth){const auto bits=x86_?u32(3):(std::uint32_t{state.xmm[3][0]}|(std::uint32_t{state.xmm[3][1]}<<8)|(std::uint32_t{state.xmm[3][2]}<<16)|(std::uint32_t{state.xmm[3][3]}<<24));values[0]=std::bit_cast<float>(bits);values[1]=static_cast<float>(u32(4));}else {auto bytes=read_bytes(memory,arg(2),16);std::memcpy(values.data(),bytes.data(),16);}const auto flags=depth?u32(2):0;submit(context,{[view,values,flags](auto& native){native.graphics_clear(view,values,flags);}});
         }else if(symbol=="CopyStructureCount"){
@@ -535,14 +554,19 @@
         }else if(symbol=="SetExceptionMode"){graphics_handled=true;auto device=typed(arg(0),Kind::Device);if(u32(1)&~1U)result=invalid;else device->exception_mode=u32(1);}
         else if(symbol=="GetExceptionMode"){graphics_handled=true;result=typed(arg(0),Kind::Device)->exception_mode;}
         else if(symbol=="CreateQuery" || symbol=="CreatePredicate"){
-            graphics_handled=true;auto device=typed(arg(0),Kind::Device);if(arg(2)){output(2);write_pointer(arg(2),0);}auto desc=read_bytes(memory,arg(1),8);const auto type=word(desc,0);require(symbol!="CreatePredicate" || type==5 || type==7);require(!(word(desc,4)&~1U) && (!word(desc,4) || type==5));if(((type==2 || type==3) && !device->native->graphics_timestamp_supported()) || (type!=0 && type!=1 && type!=2 && type!=3 && type!=5 && type!=6 && type!=7)){result=not_supported;}else if(!arg(2))result=1;else{auto id=create(symbol=="CreatePredicate"?Kind::Predicate:Kind::Query,device->root);id->desc=desc;id->query_size=type==0 || type==5 || type==7?4:type==3?16:type==4?88:type>=6?16:8;id->query_data.resize(id->query_size);if(type==1 || type==5){GraphicsResourceDesc resource;resource.width=65536;id->resource=device->native->graphics_resource(resource);}write_pointer(arg(2),id->root);}
+            graphics_handled=true;auto device=typed(arg(0),Kind::Device);if(arg(2)){output(2);write_pointer(arg(2),0);}auto desc=read_bytes(memory,arg(1),8);const auto type=word(desc,0);require(symbol!="CreatePredicate" || type==5 || type==7);require(!(word(desc,4)&~1U) && (!word(desc,4) || type==5));if(((type==2 || type==3) && !device->native->graphics_timestamp_supported()) || (type!=0 && type!=1 && type!=2 && type!=3 && type!=5 && type!=6 && type!=7)){result=not_supported;}else if(!arg(2))result=1;else{auto id=create(symbol=="CreatePredicate"?Kind::Predicate:Kind::Query,device->root);id->desc=desc;id->query_size=type==0 || type==5 || type==7?4:type==3?16:type==4?88:type>=6?16:8;id->query_data.resize(id->query_size);if(type==5 || (type==1 && !d3d11_visibility_pool_enabled())){GraphicsResourceDesc resource;resource.width=65536;id->resource=device->native->graphics_resource(resource);++bridge.resource_creations[std::string(symbol)];}write_pointer(arg(2),id->root);}
         }else if(symbol=="GetDataSize"){graphics_handled=true;result=object(arg(0)).identity->query_size;}
         else if(symbol=="Begin" || symbol=="End" || symbol=="GetData"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context),query=object(arg(1)).identity;require(query->device==context->device && query->query_size);const auto type=word(query->desc,0);
             if(symbol=="Begin"){
                 require(binding(context,"Predicate")!=arg(1));require(type!=0 && type!=2 && !query->query_active);query->query_active=true;query->query_ready=false;query->sequence=0;
                 if(type==6 || type==7){auto stats=context->stream_statistics;submit(context,{[query,stats](auto&){query->stream_begin=*stats;}},false);}
-                if(type==1 || type==5){require(!binding(context,"Visibility"));const auto view=view_of(arg(1));submit(context,{[query](auto&){query->query_ready=false;}},false);query->visibility_planned=0;visibility_zero(context,query,view,0);bind_one(context,"Visibility",arg(1));}
+                if(type==1 || type==5){require(!binding(context,"Visibility"));submit(context,{[query](auto&){query->query_ready=false;}},false);
+                    query->visibility_pooled=type==1 && !context->context_type && d3d11_visibility_pool_enabled();query->visibility_segments.clear();
+                    // 立即內容 OCCLUSION 改用共用池，建立時不再配置每查詢緩衝；延遲內容等其他用途在第一次 Begin 時補配置。
+                    if(!query->visibility_pooled && !query->resource){GraphicsResourceDesc resource;resource.width=65536;query->resource=context->native->graphics_resource(resource);}
+                    if(!query->visibility_pooled){const auto view=view_of(arg(1));query->visibility_planned=0;visibility_zero(context,query,view,0);}
+                    bind_one(context,"Visibility",arg(1));}
             }else if(symbol=="End"){
                 require(binding(context,"Predicate")!=arg(1));require(type==0 || type==2 || query->query_active);query->query_active=false;query->query_ready=false;query->query_fence.reset();query->query_timestamp.reset();query->query_polls=0;const auto sequence=query->sequence;
                 // 事件查詢：提交後取完成旗標，GetData 輪詢旗標。Chromium／ANGLE 以此當 fence，每幀數十次；
@@ -567,8 +591,15 @@
             }else {require(!context->context_type);
                 if(query->query_fence && query->query_fence->load(std::memory_order_acquire)){
                     if(type==1 || type==5){
-                        const auto samples=context->native->graphics_read(GraphicsView{query->resource});std::uint64_t total=0;
-                        for(unsigned i=0;i<query->query_pending_sequence && (i+1)*8<=samples.size();++i){std::uint64_t value=0;std::memcpy(&value,samples.data()+i*8,8);total+=value;}
+                        // fence 已完成：只讀本查詢的取樣範圍，不等待同一緩衝上較新的批次，也不排空命令執行緒。
+                        std::uint64_t total=0;
+                        const auto add=[&](const std::shared_ptr<GraphicsResource>& buffer,std::uint32_t base,std::uint64_t count){
+                            if(!count)return;GraphicsView view{buffer};view.first=base;view.count=static_cast<std::uint32_t>(count*8);
+                            const auto samples=context->native->graphics_read_completed(view);
+                            for(std::size_t i=0;i<count && (i+1)*8<=samples.size();++i){std::uint64_t value=0;std::memcpy(&value,samples.data()+i*8,8);total+=value;}
+                        };
+                        if(query->visibility_pooled)for(const auto& segment:query->visibility_segments)add(segment.buffer,segment.base,segment.count);
+                        else add(query->resource,0,query->query_pending_sequence);
                         std::fill(query->query_data.begin(),query->query_data.end(),0);
                         if(type==5)put_word(query->query_data,0,total?1U:0U);else std::memcpy(query->query_data.data(),&total,8);
                     }

@@ -93,7 +93,7 @@ struct DirectInputState {
     struct GamepadSlot {std::optional<input::Guid> device;std::array<std::uint8_t,12> state{};std::uint32_t packet{};std::uint16_t keystroke_buttons{};bool sampled{};};
     std::array<GamepadSlot,4> gamepad_slots;
     bool xinput_enabled{true}; // XInputEnable(FALSE) 後 GetState 回中性狀態、SetState 不震動。
-    // 背景輪詢最近一次處理的裝置清單換代，以及當時更新的 raw input 狀態。
+    // 最近一次處理的裝置清單換代，以及當時更新的 raw input 狀態。
     std::uint64_t device_generation{};const void* raw_input_refreshed{};
     // 最近一次背景輪詢的宿主單調時間（100 ns）。
     std::uint64_t background_polled{};
@@ -165,12 +165,16 @@ void WindowsServices::poll_dinput(bool background){
         }
     }
     const auto native_events=bridge.backend->poll();
-    // 背景排程每個時間片都會進來，後端快照卻只約每 4 ms 換代。沒有 DirectInput 物件時，
-    // 裝置清單只用於更新 raw input；同一換代已對同一 raw input 狀態更新過就不再複製與比對。
+    // backend 保證同一非零換代的清單完全相同。沒有 DirectInput 物件時，
+    // 前景與背景都可省略已對同一 raw input 狀態完成的清單複製；事件與報告仍每次收取。
     // 換代編號須在取得清單前讀取：之後才發布的新清單會留給下一次輪詢。
+    static const bool legacy_foreground_refresh=[] {
+        const auto* value=std::getenv("X64ARM_DINPUT_LEGACY_FOREGROUND_REFRESH");
+        return value && std::string_view(value)=="1";
+    }();
     const auto generation=bridge.backend->device_generation();
     std::vector<input::Device> devices;
-    if(!background || !generation || generation!=bridge.device_generation || !bridge.objects.empty() || bridge.raw_input_refreshed!=raw_input_.get()){
+    if((legacy_foreground_refresh && !background) || !generation || generation!=bridge.device_generation || !bridge.objects.empty() || bridge.raw_input_refreshed!=raw_input_.get()){
         devices=bridge.backend->devices();refresh_raw_input(devices);
         bridge.device_generation=generation;bridge.raw_input_refreshed=raw_input_.get();
     }

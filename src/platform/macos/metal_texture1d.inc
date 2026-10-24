@@ -2,8 +2,18 @@
 // 只改變已宣告的一維 texture 呼叫，保留 LOD、array slice 與 X 位址模式。
 void metal_texture1d_shader(MetalShader& shader){
     auto& source=shader.source;std::map<std::string,bool> textures;
-    const std::regex declaration(R"(texture1d(_array)?\s*<[^>]+>\s+([A-Za-z_]\w*))");
-    for(std::sregex_iterator it(source.begin(),source.end(),declaration),end;it!=end;++it)textures[(*it)[2]]=(*it)[1].matched;
+    // 宣告掃描（texture1d(_array)?\s*<[^>]+>\s+識別字）：每個著色器都要跑，改為直接掃描，不用 std::regex。
+    const auto space=[](char c){return std::isspace(static_cast<unsigned char>(c))!=0;};
+    for(auto at=source.find("texture1d");at!=std::string::npos;at=source.find("texture1d",at+9)){
+        auto cursor=at+9;const bool array=source.compare(cursor,6,"_array")==0;if(array)cursor+=6;
+        while(cursor<source.size() && space(source[cursor]))++cursor;
+        if(cursor>=source.size() || source[cursor]!='<')continue;
+        const auto close=source.find('>',cursor+1);if(close==std::string::npos || close==cursor+1)continue;
+        cursor=close+1;const auto gap=cursor;while(cursor<source.size() && space(source[cursor]))++cursor;
+        if(cursor==gap || cursor>=source.size() || !(std::isalpha(static_cast<unsigned char>(source[cursor])) || source[cursor]=='_'))continue;
+        const auto name=cursor;while(cursor<source.size() && (std::isalnum(static_cast<unsigned char>(source[cursor])) || source[cursor]=='_'))++cursor;
+        textures[source.substr(name,cursor-name)]=array;
+    }
     if(textures.empty())return;
     const auto arguments=[](std::string_view text,std::size_t begin){
         std::vector<std::string> result;unsigned depth=1;std::size_t start=begin,at=begin;

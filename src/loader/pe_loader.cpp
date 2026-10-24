@@ -481,7 +481,7 @@ void relocation(Image& image, Directory dir, std::uint64_t delta, PeMetadata& me
     for (const auto& [target, value] : changes) image.store(target, value, width);
     metadata.relocations = static_cast<std::uint32_t>(changes.size());
 }
-std::vector<PeImport> imports(const Image& image, Directory directory, Directory iat, PeMetadata& metadata, bool inventory_only=false) {
+std::vector<PeImport> imports(const Image& image, Directory directory, PeMetadata& metadata, bool inventory_only=false) {
     const auto width = metadata.pointer_bytes();
     const auto ordinal_bit = UINT64_C(1) << (width * 8 - 1);
     if (!directory.rva) return {};
@@ -504,7 +504,8 @@ std::vector<PeImport> imports(const Image& image, Directory directory, Directory
             const auto value = image.integer(lookup + n * width, width);
             const auto slot = first + n * width;
             image.check(slot, width);
-            if (iat.rva && (slot < iat.rva || slot + width > std::uint64_t{iat.rva} + iat.size)) reject("IAT slot 超出資料目錄範圍");
+            // 描述子的 FirstThunk 才是綁定位置；獨立 IAT 目錄可能仍指向原始表。
+            // 每個 slot 仍須落在實際映射，並於下方檢查標頭、重疊及項目上限。
             if (!value) { thunk_end = true; break; }
             PeImport imported;
             imported.dll=dll;imported.slot=static_cast<std::uint32_t>(slot);
@@ -664,14 +665,19 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
         const auto at = table + std::size_t{n} * 40;
         const auto virtual_size = file.u32(at + 8), rva = file.u32(at + 12), raw_size = file.u32(at + 16), raw = file.u32(at + 20);
         const auto flags_value = file.u32(at + 36);
-        const auto extent = std::max(virtual_size, raw_size);
+        // VirtualSize 決定載入範圍；只有未指定時才使用檔案大小。
+        // SizeOfRawData 可含超過映射範圍的封存資料，不應擴大客體區段。
+        const auto extent = virtual_size ? virtual_size : raw_size;
         if (extent == 0) continue;
         const auto rounded = (std::uint64_t{extent} + 4095) & ~UINT64_C(4095);
         if (rva % section_alignment || rva < headers || rva >= image_size || rounded > image_size - rva) reject("section RVA 或大小不合法");
         // Windows 可載入省略尾端 file-alignment padding 的映像；檔案來源仍須完整落在檔案內，
         // 映射尾端由已清零的 section 補足，不讀取宣告範圍外的位元組。
-        if (raw_size && (raw < headers || raw % file_alignment)) reject("section raw 位址未對齊或覆蓋標頭");
-        if (raw_size) file.check(raw, raw_size);
+        // SizeOfHeaders 可涵蓋 section 的檔案來源；兩者映射到不同 RVA，
+        // 不能把檔案來源重複讀取誤判為客體映射重疊。零 raw 指標表示沒有檔案資料。
+        const auto file_size = raw ? raw_size : 0;
+        if (file_size && raw % file_alignment) reject("section raw 位址未對齊");
+        if (file_size) file.check(raw, file_size);
         Permissions permissions = 0;
         if (flags_value & 0x40000000U) permissions |= permission(Access::Read);
         if (flags_value & 0x80000000U) permissions |= permission(Access::Write);
@@ -683,11 +689,11 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
         else if (!inventory_only && (flags_value & 0x10000000U)) reject("尚未支援 shared section");
         for (const auto& other : image.sections) {
             if (rva < std::uint64_t{other.rva} + other.size && other.rva < std::uint64_t{rva} + rounded) reject("section 虛擬範圍重疊");
-            if (raw_size && other.raw_size && raw < std::uint64_t{other.raw} + other.raw_size && other.raw < std::uint64_t{raw} + raw_size) reject("section raw 範圍重疊");
+            if (file_size && other.raw_size && raw < std::uint64_t{other.raw} + other.raw_size && other.raw < std::uint64_t{raw} + file_size) reject("section raw 範圍重疊");
         }
-        image.sections.push_back({rva, static_cast<std::uint32_t>(rounded), raw, raw_size, permissions,
+        image.sections.push_back({rva, static_cast<std::uint32_t>(rounded), raw, file_size, permissions,
                                   std::vector<std::uint8_t>(static_cast<std::size_t>(rounded))});
-        if (raw_size) std::copy_n(bytes.begin() + raw, raw_size, image.sections.back().bytes.begin());
+        if (file_size) std::copy_n(bytes.begin() + raw, std::min<std::uint64_t>(file_size, rounded), image.sections.back().bytes.begin());
     }
     image.index_sections();
     std::array<Directory, 16> directories{};
@@ -723,7 +729,7 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
     parsed.metadata = {GuestAddress{preferred}, GuestAddress{base}, GuestAddress{entry ? base + entry : 0}, image_size, 0, {}};
     parsed.metadata.architecture = x86 ? PeArchitecture::X86 : PeArchitecture::X64;
     // 先解析匯入，避免重定位或 IAT patch 改變之後的解析內容。
-    parsed.imports=imports(image,directories[1],directories[12],parsed.metadata,inventory_only);
+    parsed.imports=imports(image,directories[1],parsed.metadata,inventory_only);
     std::vector<Directory> delay_tables;
     parsed.delay_imports=delay_imports(image,directories[13],parsed.imports,preferred,pointer_size,delay_tables);
     if(inventory_only)return parsed;

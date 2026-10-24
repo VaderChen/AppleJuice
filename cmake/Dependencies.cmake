@@ -50,6 +50,7 @@ include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalSamplerNames.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalClipDistance.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalCoverage.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalPosition.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/HlslccCoalesceTemps.cmake")
 file(GLOB HLSLCC_SOURCES CONFIGURE_DEPENDS "${hlslcc_SOURCE_DIR}/src/*.cpp" "${hlslcc_SOURCE_DIR}/src/cbstring/*.c")
 # AppleDouble 是二進位中繼資料，副檔名相同也不能當成原始碼編譯。
 list(FILTER HLSLCC_SOURCES EXCLUDE REGEX "/[.]_[^/]*$")

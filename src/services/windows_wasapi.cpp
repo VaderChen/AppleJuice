@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <chrono>
+#include <cstring>
 #include "x64arm/windows_services.hpp"
 #include "x64arm/audio.hpp"
 #include "x64arm/shared_wake.hpp"
@@ -109,7 +110,9 @@ struct Stream {
     std::array<float,2> volumes{1,1};
     // 診斷（X64ARM_TRACE_AUDIO=start／1／stats）：客體補資料與事件節奏，定位斷續來源。
     struct Stats {std::uint64_t releases{},frames{},events{},catchups{},requested{};double max_release_gap{},max_event_gap{};
-        std::chrono::steady_clock::time_point last_release{},last_event{},last_report{};std::uint64_t starved{},runs{},thread{};int priority{},base_priority{};bool multimedia{};} stats;
+        std::chrono::steady_clock::time_point last_release{},last_event{},last_report{};std::uint64_t starved{},runs{},thread{};int priority{},base_priority{};bool multimedia{};
+        // 診斷視窗內客體送出 PCM 的峰值（0～1）與非零取樣框數，確認遊戲內確實有聲（不是只看沒欠載）。
+        double peak{};std::uint64_t nonzero{};} stats;
 };
 // 共用模式緩衝的最小引擎週期數（預設 5，約 50 ms）：單核執行時音訊執行緒補資料常晚 20～40 ms，3 週期（30 ms）
 // 會規律斷音（DQ3 遊戲內第一條串流欠載窗 24→2）。X64ARM_WASAPI_MIN_PERIODS 供同引擎對照。
@@ -198,14 +201,14 @@ void WindowsServices::poll_wasapi(){
             if(!s.stats.last_report.time_since_epoch().count())s.stats.last_report=now;
             else if(now-s.stats.last_report>=std::chrono::seconds(2)){
                 auto& p=*s.pcm;
-                std::fprintf(stderr,"wasapi_stats pid=%d stream=%p clock=%llu releases=%llu frames=%llu events=%llu max_release_gap_ms=%.1f max_event_gap_ms=%.1f starved_frames=%llu starved_runs=%llu padding=%zu capacity=%u catchup_events=%llu thread=%llu priority=%d base_priority=%d multimedia=%d unix_ms=%lld\n",
+                std::fprintf(stderr,"wasapi_stats pid=%d stream=%p clock=%llu releases=%llu frames=%llu events=%llu max_release_gap_ms=%.1f max_event_gap_ms=%.1f starved_frames=%llu starved_runs=%llu padding=%zu capacity=%u catchup_events=%llu thread=%llu priority=%d base_priority=%d multimedia=%d peak=%.4f nonzero_frames=%llu unix_ms=%lld\n",
                     static_cast<int>(::getpid()),static_cast<const void*>(&s),static_cast<unsigned long long>(s.clock_frames),static_cast<unsigned long long>(s.stats.releases),
                     static_cast<unsigned long long>(s.stats.frames),static_cast<unsigned long long>(s.stats.events),s.stats.max_release_gap,s.stats.max_event_gap,
                     static_cast<unsigned long long>(p.starved_frames-s.stats.starved),static_cast<unsigned long long>(p.starved_runs-s.stats.runs),
-                    p.pcm.size()/p.frame_bytes(),s.capacity,static_cast<unsigned long long>(s.stats.catchups),static_cast<unsigned long long>(s.stats.thread),s.stats.priority,s.stats.base_priority,s.stats.multimedia?1:0,
+                    p.pcm.size()/p.frame_bytes(),s.capacity,static_cast<unsigned long long>(s.stats.catchups),static_cast<unsigned long long>(s.stats.thread),s.stats.priority,s.stats.base_priority,s.stats.multimedia?1:0,s.stats.peak,static_cast<unsigned long long>(s.stats.nonzero),
                     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
                 s.stats.starved=p.starved_frames;s.stats.runs=p.starved_runs;s.stats.releases=s.stats.frames=s.stats.events=s.stats.catchups=0;
-                s.stats.max_release_gap=s.stats.max_event_gap=0;s.stats.last_report=now;
+                s.stats.max_release_gap=s.stats.max_event_gap=0;s.stats.peak=0;s.stats.nonzero=0;s.stats.last_report=now;
             }
         }
     }
@@ -542,7 +545,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                             signal_stream(s,runtime_,true);
                         if(audio_stats_enabled() && frames){const auto now=std::chrono::steady_clock::now();if(s.started)s.stats.max_release_gap=std::max(s.stats.max_release_gap,elapsed_ms(s.stats.last_release,now));s.stats.last_release=now;++s.stats.releases;s.stats.frames+=frames;
                             const auto& thread=threads_.items.at(threads_.current);s.stats.thread=threads_.current;
-                            s.stats.priority=thread.effective_priority(runtime_.process_priority_class,runtime_.process_background);s.stats.multimedia=thread.multimedia.handle!=0;s.stats.base_priority=thread.priority;}
+                            s.stats.priority=thread.effective_priority(runtime_.process_priority_class,runtime_.process_background);s.stats.multimedia=thread.multimedia.handle!=0;s.stats.base_priority=thread.priority;
+                            if(!(d(2)&2U)){
+                                const auto sample_bytes=std::max(1U,pcm.bits/8U),sample_channels=std::max(1U,pcm.channels);
+                                for(std::size_t frame=0;frame*sample_bytes*sample_channels+sample_bytes*sample_channels<=bytes.size();++frame){
+                                    bool audible=false;
+                                    for(unsigned c=0;c<sample_channels;++c){
+                                        const auto* sample=bytes.data()+(frame*sample_channels+c)*sample_bytes;double value=0;
+                                        if(pcm.floating && sample_bytes==4){float f;std::memcpy(&f,sample,4);value=std::abs(f);}
+                                        else if(sample_bytes==2){std::int16_t v;std::memcpy(&v,sample,2);value=std::abs(v/32768.0);}
+                                        else if(sample_bytes==4){std::int32_t v;std::memcpy(&v,sample,4);value=std::abs(v/2147483648.0);}
+                                        else if(sample_bytes==1)value=std::abs((static_cast<int>(sample[0])-128)/128.0);
+                                        if(value>0){audible=true;s.stats.peak=std::max(s.stats.peak,value);}
+                                    }
+                                    s.stats.nonzero+=audible;
+                                }
+                            }}
                     }
                 }else if(name=="C_GetFrequency")put(arg(1),wasapi_mix_rate(),64); // 端點時鐘頻率即混音取樣率
                 else if(name=="C_GetPosition"){check(arg(1),8);if(arg(2))check(arg(2),8);put(arg(1),s.clock_frames,64);if(arg(2))put(arg(2),runtime_.clock_ticks,64);}

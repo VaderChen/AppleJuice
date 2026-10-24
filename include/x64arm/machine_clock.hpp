@@ -17,6 +17,8 @@ public:
     static std::shared_ptr<MachineClock> open(const std::string& session,bool host,std::uint64_t monotonic,std::uint64_t filetime);
     std::uint64_t synchronize(std::uint64_t monotonic)const noexcept;
     MachineTime snapshot(std::uint64_t monotonic)const noexcept;
+    // 呼叫端剛讀過宿主單調時鐘時使用：宿主時鐘模式直接採用 now，不再讀一次硬體計數器；虛擬時鐘與 snapshot 相同。
+    MachineTime snapshot_at(std::uint64_t now)const noexcept;
     void set_time(std::uint64_t monotonic,std::uint64_t filetime);
     void set_adjustment(std::uint64_t monotonic,std::uint32_t adjustment,bool disabled);
 };

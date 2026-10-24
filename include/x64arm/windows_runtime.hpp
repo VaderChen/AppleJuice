@@ -316,7 +316,12 @@ struct CriticalSection {
     std::uint32_t recursion{}, spin{};
     // 只在並行服務中以 atomic_ref 存取；協調者必須等所有 worker 返回才讀寫物件。
     std::uint32_t worker_guard{};
-    bool operator==(const CriticalSection&) const = default;
+    // 可能有執行緒在等待此鎖（Critical／CriticalRetry／CRT lowio 重試／條件變數重新取得）。建立等待時（schedule 或單槽換手，
+    // 皆在獨占映射鎖或全體靜止下）設定；worker 版 Leave 走訪確認沒有等待者才清除。只是加速提示，不屬鎖的語義狀態。
+    bool waiters_hint{};
+    bool operator==(const CriticalSection& other) const noexcept {
+        return owner==other.owner && debug==other.debug && recursion==other.recursion && spin==other.spin && worker_guard==other.worker_guard;
+    }
 };
 struct SlimLock {
     std::uint64_t exclusive{};
@@ -612,6 +617,10 @@ struct RuntimeState {
     }
     MachineTime system_time_state() const noexcept {
         return machine_clock?machine_clock->snapshot(clock_ticks):MachineTime{local_system_filetime(),clock_ticks,0,system_time_increment,system_time_adjustment,system_time_adjustment_disabled};
+    }
+    // clock_ticks 剛由宿主單調時鐘刷新時使用（見 WindowsServices::retired），不重讀硬體計數器。
+    MachineTime system_time_state_fresh() const noexcept {
+        return machine_clock?machine_clock->snapshot_at(clock_ticks):MachineTime{local_system_filetime(),clock_ticks,0,system_time_increment,system_time_adjustment,system_time_adjustment_disabled};
     }
     std::uint64_t system_filetime() const noexcept {return system_time_state().filetime;}
     void detach_machine_clock() noexcept {

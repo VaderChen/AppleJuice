@@ -90,8 +90,8 @@ inline ssize_t socket_receive_buffer(const NativeSocket& socket,void* bytes,std:
 // Deferred 是內部有界工作／鎖競爭，呼叫者必須協同重試，不能當成完整空快照。
 inline bool socket_readiness(const NativeSocket& socket,pollfd& entry)try{
     if(socket.type!=SOCK_DGRAM || !(entry.events&POLLIN))return false;
-    // 原生 socket 沒有資料，且共享佇列狀態檔自上次確認為空後沒有變動（其他程序放入資料報必經 pwrite 而改變 mtime）時，
-    // 直接判定不可讀，不取跨程序紀錄鎖、不讀佇列標頭。標記在完整檢查之前取得：檢查期間的寫入只會讓下一次重查。
+    // 原生 socket 沒有資料，且共享佇列狀態檔自上次完整檢查後沒有變動（其他程序放入資料報必經 pwrite 而改變 mtime）時，
+    // 直接沿用上次的空／可讀結果，不取跨程序紀錄鎖、不讀佇列標頭。標記在完整檢查之前取得：檢查期間的寫入只會讓下一次重查。
     // Steam.exe 每次排程都會查所有 WSAEventSelect 監看的 UDP socket，原本每個都要 fcntl 鎖與數次 pread。X64ARM_DATAGRAM_IDLE_CACHE=0 關閉。
     static const bool idle_cache=[] {const auto* value=std::getenv("X64ARM_DATAGRAM_IDLE_CACHE");return !value || std::string_view(value)!="0";}();
     const bool native=(entry.revents&(POLLIN|POLLERR|POLLHUP))!=0;
@@ -103,14 +103,18 @@ inline bool socket_readiness(const NativeSocket& socket,pollfd& entry)try{
 #else
         stamp={static_cast<std::int64_t>(before.st_ino),static_cast<std::int64_t>(before.st_size),before.st_mtim.tv_sec,before.st_mtim.tv_nsec,before.st_ctim.tv_sec,before.st_ctim.tv_nsec};
 #endif
-        if(socket.datagram_idle && socket.datagram_idle_stamp==stamp){entry.revents=static_cast<short>(entry.revents&~POLLIN);return false;}
+        if(socket.datagram_idle && socket.datagram_idle_stamp==stamp){
+            entry.revents=static_cast<short>(entry.revents&~POLLIN);if(socket.datagram_ready)entry.revents|=POLLIN;return false;}
     }
     socket.datagram_idle=false;
     DatagramBroker broker(socket.descriptor,socket.shared->descriptor());
     const auto ready=broker.readable();entry.revents=static_cast<short>(entry.revents&~POLLIN);
     if(ready==MulticastReadiness::Ready)entry.revents|=POLLIN;
     else if(ready==MulticastReadiness::Error)entry.revents|=POLLERR;
-    if(stamped && ready==MulticastReadiness::Empty){socket.datagram_idle=true;socket.datagram_idle_stamp=stamp;}
+    // 有封包但尚未讀走（例如 WSAEventSelect 的 FD_READ 未重新啟用）同樣沿用：讀取、放入與 pump 都經 pwrite 改變戳記。
+    // 每次排程都查監看中的 socket，原本佇列非空時每次都取鎖並讀標頭與布局（DQ3 強制平行約占主執行緒四成）。
+    if(stamped && (ready==MulticastReadiness::Empty || ready==MulticastReadiness::Ready)){
+        socket.datagram_idle=true;socket.datagram_ready=ready==MulticastReadiness::Ready;socket.datagram_idle_stamp=stamp;}
     return ready==MulticastReadiness::Deferred;
 }catch(const std::bad_alloc&){entry.revents=static_cast<short>((entry.revents&~POLLIN)|POLLERR);errno=ENOMEM;return false;}
 inline int socket_readable_bytes(const NativeSocket& socket,int& bytes)try{

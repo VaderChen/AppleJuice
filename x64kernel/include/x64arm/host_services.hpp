@@ -34,6 +34,7 @@
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_ERRORS 1
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTROL_DRAIN 1
 #define X64ARM_HOST_SERVICES_RESIDENT_PREEMPT 1
+#define X64ARM_HOST_SERVICES_RESIDENT_BLOCK 1
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_SCALAR 1
 #define X64ARM_HOST_SERVICES_RESIDENT_IDLE_WAKE 1
 #define X64ARM_HOST_SERVICES_RESIDENT_HEAP 1
@@ -306,6 +307,10 @@ public:
     virtual bool resident_preempt_plan(GuestMemory&,std::span<GuestState* const>,ResidentPreemptPlan&) { return false; }
     // 被換下的 worker 已交出完整狀態、替換者即將取得該 vCPU；provider 只更新排程簿記（處理器編號、游標）。
     virtual void resident_preempt_commit(GuestState&,GuestState&) {}
+    // worker slot（非 slot 0）在服務入口要阻塞等待時（協調服務已回 false）：provider 在不切換目前客體、不停其他 worker
+    // 的前提下，把該客體標成等待（沿用完整路徑的等待契約，之後由一般等待解析完成呼叫），並指定一個可接手該 vCPU 的
+    // runnable 客體。只有找得到替換者時才可改狀態並回 true；false 必須沒有任何副作用（協調者沿全停路徑處理）。
+    virtual bool resident_block_service(GuestState&,GuestMemory&,std::span<GuestState* const>,GuestState*&) { return false; }
     // 純量值回退可在呼叫者的 worker 完成。分類不變；執行只讀固定服務表及
     // epoch 內的映射，以已驗證視窗讀堆疊、借用私人 errno，不觸碰目前 runtime、
     // 共用頁面快取、排程或回呼。false 必須沒有客體可見效果。

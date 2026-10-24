@@ -52,9 +52,9 @@ struct NativeSocket {
     bool &accept_context,&connect_context,&listening,&reusable,&send_shutdown;
     std::uint8_t completion_modes{};
     bool io_signaled{true};
-    // UDP 共享佇列「已確認為空」時狀態檔的身分與時間；原生 socket 無資料且狀態檔未變時可直接判定不可讀。
+    // UDP 共享佇列上次完整檢查（空或有封包）時狀態檔的身分與時間；原生 socket 無資料且狀態檔未變時沿用該結果。
     mutable std::array<std::int64_t,6> datagram_idle_stamp{};
-    mutable bool datagram_idle{};
+    mutable bool datagram_idle{},datagram_ready{};
     NativeSocket(int fd,int af,int kind,int proto,std::shared_ptr<SharedSocketState> state={});
     std::vector<std::uint8_t> bound_address() const;
     void set_bound_address(const std::vector<std::uint8_t>&);
