@@ -210,7 +210,7 @@ bool MetalGl::graphics_upload_buffer(const std::shared_ptr<GraphicsResource>& de
     graphics_pending_.push_back(staging);graphics_pending_.push_back(destination);begin_commands();
     auto encoder=[commands_ blitCommandEncoder];MetalEncoderScope scope{encoder};
     [encoder copyFromBuffer:source.buffer sourceOffset:0 toBuffer:target.buffer destinationOffset:offset size:data.size()];
-    scope.end();if(++pending_>=128)flush(false);return true;
+    scope.end();if(++pending_>=128)flush(false,"batch_128");return true;
 }
 void MetalGl::graphics_write_buffer(const std::shared_ptr<GraphicsResource>& resource,std::span<const std::uint8_t> data,std::uint32_t offset){
     auto& target=metal_resource(resource);
@@ -348,7 +348,7 @@ void MetalGl::graphics_copy(const GraphicsView& dst,const GraphicsView& src,std:
         auto pixels=graphics_read(src);const auto offset=(std::size_t{box[1]}*sw+box[0])*bpp;
         graphics_write_region(dst,std::span<const std::uint8_t>(pixels).subspan(offset),sw*bpp,0,{origin[0],origin[1],0,origin[0]+box[3]-box[0],origin[1]+box[4]-box[1],1});return;
     }
-    begin_commands();auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};
+    begin_commands(true,"copy");auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};
     if(d.buffer && s.buffer){if(!box[3])box[3]=s.desc.width;if(box[0]>box[3] || box[3]>s.desc.width || std::uint64_t{origin[0]}+box[3]-box[0]>d.desc.width)throw std::invalid_argument("緩衝區複製越界");d.constant_bytes_valid=false;[e copyFromBuffer:s.buffer sourceOffset:box[0] toBuffer:d.buffer destinationOffset:origin[0] size:box[3]-box[0]];}
     else if(d.texture && s.texture){if(!box[3]){box[3]=std::max(1U,s.desc.width>>src.level);box[4]=std::max(1U,s.desc.height>>src.level);box[5]=std::max(1U,s.desc.depth>>src.level);}for(unsigned i=0;i<3;++i)if(box[i]>=box[i+3])throw std::invalid_argument("紋理複製區域不合法");auto source_texture=s.texture;if(source_texture.pixelFormat!=d.texture.pixelFormat){source_texture=[source_texture newTextureViewWithPixelFormat:d.texture.pixelFormat];if(!source_texture)throw std::invalid_argument("Metal 不能建立同格式家族的複製 view");}[e copyFromTexture:source_texture sourceSlice:src.slice sourceLevel:src.level sourceOrigin:MTLOriginMake(box[0],box[1],box[2]) sourceSize:MTLSizeMake(box[3]-box[0],box[4]-box[1],box[5]-box[2]) toTexture:d.texture destinationSlice:dst.slice destinationLevel:dst.level destinationOrigin:MTLOriginMake(origin[0],origin[1],origin[2])];}
     else throw std::invalid_argument("資源複製類型不符");e_scope.end();graphics_pending_.push_back(dst.resource);graphics_pending_.push_back(src.resource);
@@ -360,7 +360,7 @@ void MetalGl::graphics_resolve(const GraphicsView& dst,const GraphicsView& src,s
        std::max(1U,d.desc.width>>dst.level)!=s.desc.width || std::max(1U,d.desc.height>>dst.level)!=s.desc.height ||
        metal_depth_format(s.texture.pixelFormat) || !graphics_samples_supported(format,s.desc.samples) ||
        d.texture.pixelFormat!=metal_format(format) || s.texture.pixelFormat!=metal_format(format))throw std::invalid_argument("Metal resolve 的格式／子資源／取樣數不相容");
-    begin_commands();auto pass=[MTLRenderPassDescriptor renderPassDescriptor];auto color=pass.colorAttachments[0];
+    begin_commands(true,"resolve");auto pass=[MTLRenderPassDescriptor renderPassDescriptor];auto color=pass.colorAttachments[0];
     color.texture=s.texture;color.level=src.level;color.slice=src.slice;color.loadAction=MTLLoadActionLoad;
     color.resolveTexture=d.texture;color.resolveLevel=dst.level;color.resolveSlice=dst.slice;
     // ResolveSubresource 不破壞來源；保留 MSAA samples，不能只用 discard resolve。
@@ -369,7 +369,7 @@ void MetalGl::graphics_resolve(const GraphicsView& dst,const GraphicsView& src,s
     encoder_scope.end();graphics_pending_.push_back(dst.resource);graphics_pending_.push_back(src.resource);
 }}
 void MetalGl::graphics_clear(const GraphicsView& v,std::array<float,4> color,std::uint32_t flags){@autoreleasepool{
-    const auto target=metal_render_target(v);begin_commands();for(unsigned slice=0;slice<target.layers;++slice){auto p=[MTLRenderPassDescriptor renderPassDescriptor];if(!flags){metal_attach_target(p.colorAttachments[0],target,slice);p.colorAttachments[0].loadAction=MTLLoadActionClear;p.colorAttachments[0].storeAction=MTLStoreActionStore;p.colorAttachments[0].clearColor=MTLClearColorMake(color[0],color[1],color[2],color[3]);}
+    const auto target=metal_render_target(v);begin_commands(true,"clear");for(unsigned slice=0;slice<target.layers;++slice){auto p=[MTLRenderPassDescriptor renderPassDescriptor];if(!flags){metal_attach_target(p.colorAttachments[0],target,slice);p.colorAttachments[0].loadAction=MTLLoadActionClear;p.colorAttachments[0].storeAction=MTLStoreActionStore;p.colorAttachments[0].clearColor=MTLClearColorMake(color[0],color[1],color[2],color[3]);}
     else{metal_attach_target(p.depthAttachment,target,slice);p.depthAttachment.loadAction=(flags&1)?MTLLoadActionClear:MTLLoadActionLoad;p.depthAttachment.storeAction=MTLStoreActionStore;p.depthAttachment.clearDepth=color[0];if(target.texture.pixelFormat==MTLPixelFormatDepth32Float_Stencil8){metal_attach_target(p.stencilAttachment,target,slice);p.stencilAttachment.loadAction=(flags&2)?MTLLoadActionClear:MTLLoadActionLoad;p.stencilAttachment.storeAction=MTLStoreActionStore;p.stencilAttachment.clearStencil=static_cast<std::uint32_t>(color[1]);}}
     auto e=[commands_ renderCommandEncoderWithDescriptor:p];MetalEncoderScope e_scope{e};if(!e)throw std::runtime_error("Metal clear encoder 建立失敗");e_scope.end();}graphics_pending_.push_back(v.resource);
 }}
@@ -580,7 +580,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     }
     id<MTLRenderCommandEncoder> enc=nil;const bool reused=coalesce && open_render_ && pass_key==open_render_key_;
     if(reused){enc=open_render_;++coalesced_draws_;}
-    else{begin_commands();enc=[commands_ renderCommandEncoderWithDescriptor:pass];if(!enc)throw std::runtime_error("Metal draw encoder 建立失敗");
+    else{begin_commands(true,coalesce?"draw_pass_change":"draw_uncoalesced");enc=[commands_ renderCommandEncoderWithDescriptor:pass];if(!enc)throw std::runtime_error("Metal draw encoder 建立失敗");++render_encoders_;
         if(coalesce){open_render_=enc;open_render_key_=std::move(pass_key);}}
     std::optional<MetalEncoderScope> enc_scope;if(!coalesce)enc_scope.emplace(enc);
     [enc setRenderPipelineState:pipeline];if(d.visibility)[enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:d.visibility_offset];else if(reused)[enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];[enc setDepthStencilState:cached_depth_state(depth)];[enc setStencilReferenceValue:d.stencil_reference];[enc setBlendColorRed:d.blend_factor[0] green:d.blend_factor[1] blue:d.blend_factor[2] alpha:d.blend_factor[3]];
@@ -609,19 +609,19 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         graphics_pending_.push_back(d.indirect);
     }
     else if(d.indexed){auto& r=metal_resource(d.indices);const auto bpp=d.index_format==57?2U:4U;const auto offset=std::uint64_t{d.index_offset}+std::uint64_t{d.start}*bpp;if(offset+std::uint64_t{d.count}*bpp>r.desc.width)throw std::invalid_argument("索引 buffer 越界");[enc drawIndexedPrimitives:primitive indexCount:d.count indexType:bpp==2?MTLIndexTypeUInt16:MTLIndexTypeUInt32 indexBuffer:r.buffer indexBufferOffset:offset instanceCount:d.instances baseVertex:d.base_vertex baseInstance:d.start_instance];graphics_pending_.push_back(d.indices);}
-    else [enc drawPrimitives:primitive vertexStart:d.start vertexCount:d.count instanceCount:d.instances baseInstance:d.start_instance];if(enc_scope)enc_scope->end();++draws_;if(++pending_>=128)flush(false);
+    else [enc drawPrimitives:primitive vertexStart:d.start vertexCount:d.count instanceCount:d.instances baseInstance:d.start_instance];if(enc_scope)enc_scope->end();++draws_;if(++pending_>=128)flush(false,"batch_128");
     if(raster && original.stream_statistics)original.stream_statistics->needed+=std::uint64_t{metal_input_primitives(original.topology,original.count).first}*original.instances;
     graphics_capture(original);
 }}
 void MetalGl::graphics_dispatch_indirect(const GraphicsStage& stage,const std::shared_ptr<GraphicsResource>& arguments,std::uint32_t offset){@autoreleasepool{
     if(!stage.shader)throw std::invalid_argument("DispatchIndirect 缺少 CS");auto& args=metal_resource(arguments);
     if(!args.buffer || (offset&3U) || std::uint64_t{offset}+12>args.desc.width)throw std::invalid_argument("間接運算參數越界或未對齊");
-    auto& shader=dynamic_cast<MetalShader&>(*stage.shader);begin_commands();auto e=[commands_ computeCommandEncoder];MetalEncoderScope e_scope{e};[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);
+    auto& shader=dynamic_cast<MetalShader&>(*stage.shader);begin_commands(true,"dispatch");auto e=[commands_ computeCommandEncoder];MetalEncoderScope e_scope{e};[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);
     [e dispatchThreadgroupsWithIndirectBuffer:args.buffer indirectBufferOffset:offset threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];
-    graphics_pending_.push_back(arguments);e_scope.end();if(++pending_>=128)flush(false);
+    graphics_pending_.push_back(arguments);e_scope.end();if(++pending_>=128)flush(false,"batch_128");
 }}
-void MetalGl::graphics_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){@autoreleasepool{if(!stage.shader)throw std::invalid_argument("Dispatch 缺少 CS");auto& shader=dynamic_cast<MetalShader&>(*stage.shader);begin_commands();auto e=[commands_ computeCommandEncoder];MetalEncoderScope e_scope{e};[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);[e dispatchThreadgroups:MTLSizeMake(groups[0],groups[1],groups[2]) threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];e_scope.end();if(++pending_>=128)flush(false);}}
-void MetalGl::graphics_mips(const GraphicsView& v){@autoreleasepool{begin_commands();auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};[e generateMipmapsForTexture:metal_texture(v)];e_scope.end();graphics_pending_.push_back(v.resource);}}
+void MetalGl::graphics_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){@autoreleasepool{if(!stage.shader)throw std::invalid_argument("Dispatch 缺少 CS");auto& shader=dynamic_cast<MetalShader&>(*stage.shader);begin_commands(true,"dispatch");auto e=[commands_ computeCommandEncoder];MetalEncoderScope e_scope{e};[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);[e dispatchThreadgroups:MTLSizeMake(groups[0],groups[1],groups[2]) threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];e_scope.end();if(++pending_>=128)flush(false,"batch_128");}}
+void MetalGl::graphics_mips(const GraphicsView& v){@autoreleasepool{begin_commands(true,"mips");auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};[e generateMipmapsForTexture:metal_texture(v)];e_scope.end();graphics_pending_.push_back(v.resource);}}
 void MetalGl::graphics_handoff(NativeGraphics& consumer,const GraphicsView& view){@autoreleasepool{
     // 命令執行緒代理：先清空其佇列，再交接給底層後端。
     NativeGraphics* target=&consumer;
@@ -640,7 +640,7 @@ void MetalGl::graphics_handoff(NativeGraphics& consumer,const GraphicsView& view
     [next->commands_ encodeWaitForEvent:handoff_event_ value:value];
 }}
 void MetalGl::graphics_present(const GraphicsView& v){@autoreleasepool{
-    auto texture=metal_texture(v);if(texture.width!=width_ || texture.height!=height_)throw std::invalid_argument("交換鏈尺寸與共用呈現表面不符");begin_commands();
+    auto texture=metal_texture(v);if(texture.width!=width_ || texture.height!=height_)throw std::invalid_argument("交換鏈尺寸與共用呈現表面不符");begin_commands(true,"present");
     // 呈現保留交換鏈已編碼的 sRGB 值；格式轉換取樣不可再次解碼成線性值。
     if(texture.pixelFormat==MTLPixelFormatRGBA8Unorm_sRGB)texture=[texture newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
     else if(texture.pixelFormat==MTLPixelFormatBGRA8Unorm_sRGB)texture=[texture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];

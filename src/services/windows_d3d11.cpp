@@ -242,6 +242,16 @@ struct D3D11State {
     // 本地協調服務中引用歸零的物件：延到下一次非本地 D3D11 呼叫再銷毀（銷毀會釋放 heap）。
     std::vector<std::uint64_t> deferred_releases;
     std::size_t peak_interfaces{};
+    // 程序結束時把每個 D3D11 裝置的 Metal 後端統計（draws、encoders、GPU 忙碌時間、CPU 等待）印到 stderr，
+    // 供 CPU／GPU 瓶頸判斷；只讀統計字串，不改任何狀態。
+    ~D3D11State(){
+        try{
+            for(const auto& [pointer,object]:objects)
+                if(object.kind==Kind::Device && object.identity && object.identity->native && object.identity->root==pointer)
+                    std::fprintf(stderr,"[d3d11_metal] device=0x%llx draws=%llu frames=%llu %s\n",static_cast<unsigned long long>(pointer),
+                        static_cast<unsigned long long>(graphics_draws),static_cast<unsigned long long>(graphics_frames),object.identity->native->statistics().c_str());
+        }catch(...){}
+    }
 };
 void WindowsServices::discard_d3d_compile(GuestState& state,GuestMemory& memory,std::uint64_t key){
     if(!d3d11_)return;const auto at=d3d11_->compilations.find(key);if(at==d3d11_->compilations.end())return;
@@ -395,23 +405,30 @@ std::span<const WindowsServiceDescriptor> d3d11_service_descriptors() {
     return table;
 }
 
-// 能否在其他 worker 執行期間由協調者本地完成（見 resident_coordinated_service）：只限 x64；排除會配置／釋放 heap
-// 的方法（建立介面、命令列表）與開啟執行緒保護（裝置鎖可能要排程等待）的裝置；延後銷毀清單過長時
+// 能否在其他 worker 執行期間完成（見 resident_coordinated_service）：Win32／Win64 共用 WindowsCall ABI；排除
+// 建立介面、命令列表與開啟執行緒保護（裝置鎖可能要排程等待）的裝置；延後銷毀清單過長時
 // 改走全體靜止的完整服務，順便清空清單。只讀取物件表，不改任何狀態。
 // Map／Unmap 只在重用既有持久映射時合格：立即內容上的 WRITE_DISCARD／NO_OVERWRITE 沿用同一客體區塊，
 // Unmap 上傳後保留區塊，都不配置或釋放 heap（每幀數千次，是平行模式全體靜止的最大來源）。
-bool WindowsServices::d3d11_local_eligible(const GuestState& state,std::string_view symbol) const {
-    if(!d3d11_ || x86_ || d3d11_->deferred_releases.size()>=256)return false;
+bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) const try {
+    if(!d3d11_ || d3d11_->deferred_releases.size()>=256)return false;
+    const auto symbol=service.symbol;
     static constexpr std::string_view excluded[]{"QueryInterface","FinishCommandList","ExecuteCommandList"};
     if(std::find(std::begin(excluded),std::end(excluded),symbol)!=std::end(excluded))return false;
-    const auto found=d3d11_->objects.find(state.reg(Gpr::Rcx));if(found==d3d11_->objects.end())return false;
+    const WindowsCall arg(state,memory,service);
+    const auto found=d3d11_->objects.find(arg(0));if(found==d3d11_->objects.end())return false;
+    if(symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource"){
+        // 寫入目的資源會撤銷持久映射並釋放客體 heap；在任何副作用之前交回完整服務邊界。
+        const auto destination=d3d11_->objects.find(arg(1));
+        if(destination!=d3d11_->objects.end() && !destination->second.identity->persistent_maps.empty())return false;
+    }
     if(symbol=="Map" || symbol=="Unmap"){
-        const auto resource=d3d11_->objects.find(state.reg(Gpr::Rdx));
+        const auto resource=d3d11_->objects.find(arg(1));
         if(found->second.kind!=Kind::Context || found->second.identity->context_type || resource==d3d11_->objects.end() ||
            !resource->second.identity->resource)return false;
-        const auto& id=*resource->second.identity;const auto subresource=static_cast<std::uint32_t>(state.reg(Gpr::R8));
+        const auto& id=*resource->second.identity;const auto subresource=static_cast<std::uint32_t>(arg(2));
         const auto kept=id.persistent_maps.find(subresource);if(kept==id.persistent_maps.end())return false;
-        if(symbol=="Map"){const auto type=static_cast<std::uint32_t>(state.reg(Gpr::R9));if(type!=4 && type!=5)return false;}
+        if(symbol=="Map"){const auto type=static_cast<std::uint32_t>(arg(3));if(type!=4 && type!=5)return false;}
         else{const auto mapped=id.subresource_maps.find(subresource);if(mapped==id.subresource_maps.end() || mapped->second.pointer!=kept->second.pointer)return false;}
     }
     // 只限裝置、裝置內容、資源與 view、著色器、佈局、狀態物件、查詢與 class linkage；交換鏈、工廠、輸出、
@@ -428,7 +445,7 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,std::string_v
     if(id.api10)return false;
     const auto device=id.device?d3d11_->objects.find(id.device):found;if(device==d3d11_->objects.end())return false;
     return !(device->second.identity->protected_threads && device->second.identity->lock_address);
-}
+}catch(const MemoryFault&){return false;}catch(const HostCallFault&){return false;}
 std::recursive_mutex& WindowsServices::graphics_mutex() noexcept {static std::recursive_mutex value;return value;}
 std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     // worker 可直接執行裝置內容方法（見 graphics_worker_service）；所有 D3D11 服務在此串行化。
@@ -479,6 +496,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
         if(id->references==1 && id->lock_address && runtime_.critical_sections.at(id->lock_address).owner)throw HostCallFault("不可釋放仍鎖定的 D3D11 裝置");
         if(--id->references)return;
         ++bridge.destroyed_objects;
+        // 裝置銷毀時輸出 Metal 後端統計（draws、encoders、GPU 忙碌時間、CPU 等待），供 CPU／GPU 瓶頸判斷。
+        if(id->kind==Kind::Device && id->native && !id->api10)
+            std::fprintf(stderr,"[d3d11_metal] device=0x%llx frames=%llu %s\n",static_cast<unsigned long long>(id->root),
+                static_cast<unsigned long long>(bridge.graphics_frames),id->native->statistics().c_str());
         // 命令執行緒可能仍以參照讀取此 context 的繪製狀態快取。
         if(std::any_of(id->draw_caches.begin(),id->draw_caches.end(),[](const auto& cache){return bool(cache);}) && id->native)id->native->graphics_sync();
         // D3D10 的管線綁定不增加 COM 引用；物件銷毀時自動清除所有綁定位置。

@@ -3,6 +3,29 @@
 import math
 
 
+def bounded_launcher_row(row):
+    """Launcher 以 UI 停止客體；其 -1 狀態不是客體自然退出碼。"""
+    if (row.get('criterion') != 'menu_visible' or row.get('image_confirmed') is not True or
+            row.get('stop_reason') != 'launcher_ui_stop' or row.get('launcher_exit_code') != 0 or
+            row.get('program_state') != 'stopped' or row.get('program_exit_code') != -1 or
+            row.get('natural_exit_code') is not None or 'natural_exit_code' not in row or
+            row.get('all_producers_stopped') is not True or row.get('remaining_pids') != [] or
+            row.get('guard_stop_reason') is not None or 'guard_stop_reason' not in row or
+            row.get('guard_exit_code') != 0 or row.get('guard_child_exit_code') != 0 or
+            row.get('backend') != 'jit' or row.get('launcher_ui_passed') is not True or
+            any(row.get(key) is not True for key in ('engine_controls_applied', 'engine_unchanged',
+                                                    'app_unchanged', 'source_settings_unchanged', 'group_stopped'))):
+        raise ValueError('Launcher GUI 觀測未達選單、未完成 UI 停止或程序樹未收尾')
+    checks = row.get('checks')
+    if (not isinstance(checks, dict) or not checks or any(value is not True for value in checks.values()) or
+            row.get('pressure_levels') != [1]):
+        raise ValueError('Launcher GUI 觀測缺少通過的檢查或正常記憶體壓力')
+    for key in ('image_sha256', 'report_sha256', 'exe_sha256', 'launcher_sha256'):
+        digest = row.get(key)
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+            raise ValueError('Launcher GUI 觀測缺少輸入或畫面身分：' + key)
+
+
 def bounded_gui_rows(evidence):
     rows = evidence.get('workloads', [])
     if evidence.get('smoke_run') is not False or evidence.get('backends') != ['jit'] or not rows:
@@ -12,6 +35,9 @@ def bounded_gui_rows(evidence):
         if (any(isinstance(value, bool) or not isinstance(value, (int, float)) or
                 not math.isfinite(value) for value in times) or not 0 <= times[0] <= times[1] <= times[2]):
             raise ValueError('GUI 影像不在指定觀測期限內')
+        if row.get('observer') == 'launcher_ui':
+            bounded_launcher_row(row)
+            continue
         if (row.get('criterion') != 'menu_visible' or row.get('image_confirmed') is not True or
                 row.get('nonfocused') is not True or row.get('stop_reason') != 'deadline' or
                 row.get('returncode') != -15 or row.get('natural_exit_code') is not None or

@@ -33,6 +33,7 @@
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTROL_REQUEST 1
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_ERRORS 1
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTROL_DRAIN 1
+#define X64ARM_HOST_SERVICES_RESIDENT_PREEMPT 1
 #define X64ARM_HOST_SERVICES_RESIDENT_CONTEXT_SCALAR 1
 #define X64ARM_HOST_SERVICES_RESIDENT_IDLE_WAKE 1
 #define X64ARM_HOST_SERVICES_RESIDENT_HEAP 1
@@ -117,6 +118,7 @@ public:
     virtual bool changed(std::uint64_t observed) const noexcept {return wait_changed(observed,0);}
 };
 // CPU 只認識受控客體入口，Windows ABI 與 API 語義由服務層負責。
+struct ResidentPreemptPlan {std::size_t victim{SIZE_MAX};GuestState* replacement{};};
 class HostServices {
     std::uint64_t concurrency_epoch_{};
     std::uint64_t nested_instructions_{};
@@ -296,6 +298,14 @@ public:
     // 不執行客體指令、不虛構請求，也不喚醒仍在等待的客體。true 表示已切換；
     // 控制器沿原服務／精確語義流程處理後再詢問，清空待辦才重派 worker。
     virtual bool resident_select_control_request(GuestState&,GuestMemory&) { return false; }
+    // 協調者信箱等待逾時、全部 slot 都有客體在運算時，不停止全體 worker：provider 自行同步地解析逾時／就緒等待，
+    // 若有 runnable 客體需要 vCPU，指定一個可被換下的 active slot（不含 slot 0，其 context 由協調者持有）與替換
+    // context。replacement 不在 active 中、沒有待辦、不停在服務入口；victim 仍視為 Runnable。false 表示不搶占：
+    // 此時 plan.replacement 非空代表仍有 runnable 候選（協調者須沿全停輪替排程），為空代表沒有客體需要 vCPU，
+    // 協調者只重算期限。期間其他 worker 繼續運算，不得改映射、程式碼或 active 客體的狀態。
+    virtual bool resident_preempt_plan(GuestMemory&,std::span<GuestState* const>,ResidentPreemptPlan&) { return false; }
+    // 被換下的 worker 已交出完整狀態、替換者即將取得該 vCPU；provider 只更新排程簿記（處理器編號、游標）。
+    virtual void resident_preempt_commit(GuestState&,GuestState&) {}
     // 純量值回退可在呼叫者的 worker 完成。分類不變；執行只讀固定服務表及
     // epoch 內的映射，以已驗證視窗讀堆疊、借用私人 errno，不觸碰目前 runtime、
     // 共用頁面快取、排程或回呼。false 必須沒有客體可見效果。

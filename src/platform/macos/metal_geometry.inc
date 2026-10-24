@@ -208,7 +208,7 @@ MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDesc
     const auto count_bytes=std::uint64_t{primitives}*d.instances*4;auto lease=reserve_gpu_memory(input_bytes+output_bytes+count_bytes);
     auto inputs=[device_ newBufferWithLength:input_bytes options:MTLResourceStorageModePrivate];auto outputs=[device_ newBufferWithLength:output_bytes options:gs.stream_output.empty()?MTLResourceStorageModePrivate:MTLResourceStorageModeShared];auto counts=[device_ newBufferWithLength:count_bytes options:MTLResourceStorageModeShared];
     if(!inputs || !outputs || !counts)throw std::bad_alloc{};pending_leases_.push_back(std::move(lease));
-    begin_commands();auto pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.renderTargetWidth=1;pass.renderTargetHeight=1;pass.defaultRasterSampleCount=1;pass.renderTargetArrayLength=1;
+    begin_commands(true,"geometry");auto pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.renderTargetWidth=1;pass.renderTargetHeight=1;pass.defaultRasterSampleCount=1;pass.renderTargetArrayLength=1;
     auto capture=[commands_ renderCommandEncoderWithDescriptor:pass];MetalEncoderScope capture_scope{capture};if(!capture)throw std::runtime_error("幾何 capture encoder 建立失敗");[capture setRenderPipelineState:p->capture];
     graphics_bind(capture,nil,d.stages[0],true);
     for(unsigned i=0;i<32;++i)if(slots[i]>=0){const auto& v=d.vertices[i];[capture setVertexBuffer:metal_resource(v.resource).buffer offset:v.offset atIndex:static_cast<NSUInteger>(slots[i])];graphics_pending_.push_back(v.resource);}

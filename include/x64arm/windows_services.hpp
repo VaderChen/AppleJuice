@@ -162,6 +162,10 @@ public:
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_CONTROL_DRAIN
     bool resident_select_control_request(GuestState&,GuestMemory&) override;
 #endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_PREEMPT
+    bool resident_preempt_plan(GuestMemory&,std::span<GuestState* const>,ResidentPreemptPlan&) override;
+    void resident_preempt_commit(GuestState&,GuestState&) override;
+#endif
     void after_resident_parallel(GuestState&,GuestMemory&) override;
     void after_resident_interrupt(GuestState&,GuestMemory&) override;
     std::uint64_t resident_parallel_wakeup_ns(std::span<GuestState* const>) const override;
@@ -1017,12 +1021,12 @@ private:
     std::optional<std::uint32_t> resume_d3d_compile(GuestState&, GuestMemory&, std::uint64_t, std::uint32_t);
     void discard_d3d_compile(GuestState&, GuestMemory&, std::uint64_t);
     std::optional<std::uint32_t> invoke_d3d11(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
-    bool d3d11_local_eligible(const GuestState&,std::string_view symbol) const;
-    // D3D11 裝置內容方法在其他 worker 執行期間（協調者本地或 worker 上）執行時為 true；執行緒區域。
+    bool d3d11_local_eligible(const GuestState&,GuestMemory&,const WindowsServiceDescriptor&) const;
+    // worker 上的 D3D11 方法為 true；延後需要改動客體 heap 的銷毀，協調者本地路徑則可處理。
     static bool& graphics_local() noexcept {static thread_local bool value=false;return value;}
     // 所有 D3D11／DXGI 服務共用的鎖（可重入）：worker 上直接執行裝置內容方法時與協調者串行化。
     static std::recursive_mutex& graphics_mutex() noexcept;
-    // 可直接在 worker 上執行的 D3D11 裝置內容方法（不寫客體記憶體）；不符資格回傳空指標。
+    // 可直接在 worker 上執行的 D3D11 方法；輸出頁另核對 COW，不符資格回傳空指標。
     const WindowsServiceDescriptor* graphics_worker_service(GuestAddress) const noexcept;
     static constexpr GuestAddress unresolved_base{windows_address_layout::x64.unresolved};
     std::vector<std::string> unresolved_imports_;

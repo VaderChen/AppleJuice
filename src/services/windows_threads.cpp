@@ -1,4 +1,5 @@
 #include "x64arm/startup_profile.hpp"
+#include <shared_mutex>
 #include <chrono>
 #include <array>
 #include <cerrno>
@@ -886,6 +887,54 @@ bool WindowsServices::resident_select_control_request(GuestState& state,GuestMem
         return threads_.current!=previous;
     }
     return false;
+}
+#endif
+#ifdef X64ARM_HOST_SERVICES_RESIDENT_PREEMPT
+namespace detail {std::shared_mutex& parallel_mapping_mutex() noexcept;}
+// 單一 worker 搶占（協調者信箱逾時、所有 slot 都在運算）：在獨占映射鎖下刷新宿主時鐘並解析逾時／就緒等待，
+// 不切換目前客體；若有 runnable 執行緒需要 vCPU，挑 active[1..] 中有效優先序最低、且替換者親和性允許的 slot。
+// 替換者優先序不低於被換下者才搶占（同優先序輪替，與全停排程的輪替相同）；其餘情況回報不需要，協調者只重算期限。
+// 不得改映射、程式碼或 active 客體的狀態。X64ARM_RESIDENT_PREEMPT_SLOT=0 關閉（核心同名開關一併關閉）。
+bool WindowsServices::resident_preempt_plan(GuestMemory& memory,std::span<GuestState* const> active,ResidentPreemptPlan& plan) {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_RESIDENT_PREEMPT_SLOT");return value && std::string_view(value)=="1";}();
+    if(!enabled || x86_ || active.size()<2 || threads_.yield || debugger_stopped() || !runtime_.host_clock || !trace_services_.empty())return false;
+    const std::unique_lock<std::shared_mutex> mapping_guard{detail::parallel_mapping_mutex()};
+    retired(memory,0);
+    resolve_thread_waits(memory);
+    const auto is_active=[&](const GuestThread& thread){return std::find(active.begin(),active.end(),&thread.context)!=active.end();};
+    const auto priority_of=[&](const GuestThread& thread){return thread.effective_priority(runtime_.process_priority_class,runtime_.process_background);};
+    GuestThread* best=nullptr;std::uint64_t best_id=0;int best_priority=0;bool best_wrapped=true;
+    for(const auto& [id,entry]:live_threads()){
+        auto& thread=*entry;
+        // 目前執行緒的活體狀態在協調者持有的 GuestState（slot 0），thread.context 只是舊副本，不可當替換者。
+        if(id==threads_.current || thread.status!=ThreadStatus::Runnable || thread.suspended || thread.context.pending_cpu_trap || is_active(thread))continue;
+        const auto pending=resident_service_requests_.find(id);
+        if(pending!=resident_service_requests_.end() && pending->second==thread.context.rip)continue;
+        if(handles(thread.context.rip))continue;
+        const int priority=priority_of(thread);const bool wrapped=id<=parallel_cursor_;
+        if(!best || priority>best_priority || (priority==best_priority && ((!wrapped && best_wrapped) || (wrapped==best_wrapped && id<best_id)))){
+            best=&thread;best_id=id;best_priority=priority;best_wrapped=wrapped;
+        }
+    }
+    if(!best)return false;
+    std::size_t victim=SIZE_MAX;int victim_priority=0;
+    for(std::size_t k=1;k<active.size();++k){
+        const auto found=threads_.items.find(resident_context_key(*active[k]));
+        if(found==threads_.items.end() || !(best->affinity&(UINT64_C(1)<<active[k]->processor_id)))continue;
+        const int priority=priority_of(found->second);
+        if(victim==SIZE_MAX || priority<victim_priority){victim=k;victim_priority=priority;}
+    }
+    // 只在替換者有效優先序嚴格較高時搶占（Windows 的高優先序喚醒立即搶占）；同優先序沿原全停輪替，
+    // 避免 2 vCPU 下每個逾時都把兩條同優先序執行緒互換（DQ3 實測遊戲內 45→31 fps）。
+    plan.replacement=&best->context; // 有候選：不搶占時協調者仍須沿全停輪替排程它。
+    if(victim==SIZE_MAX || best_priority<=victim_priority)return false;
+    plan.victim=victim;
+    return true;
+}
+void WindowsServices::resident_preempt_commit(GuestState& victim,GuestState& replacement) {
+    replacement.processor_id=victim.processor_id;
+    const auto key=resident_context_key(replacement);
+    if(threads_.items.contains(key))parallel_cursor_=key;
 }
 #endif
 namespace {

@@ -182,11 +182,14 @@ bool crt_pure_worker_service(const WindowsServiceDescriptor& descriptor) noexcep
 bool graphics_worker_outputs_private(const GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& descriptor) noexcept {
     const auto symbol=descriptor.symbol;
     if(symbol.find("Get")==std::string_view::npos && !symbol.starts_with("Check") && symbol!="Map")return true;
-    constexpr std::array registers{Gpr::Rcx,Gpr::Rdx,Gpr::R8,Gpr::R9};
     try{
+        // COM 的 this 亦由 WindowsCall 依 Win32 stdcall／Win64 暫存器與堆疊 ABI 取得。
+        const WindowsCall arg(state,memory,descriptor);
+        const auto address_mask=memory.execution_mode()==ExecutionMode::X86?UINT64_C(0xffffffff):UINT64_MAX;
         for(unsigned i=0;i<descriptor.arguments;++i){
-            const auto value=i<4?state.reg(registers[i]):memory.load(GuestAddress{state.reg(Gpr::Rsp)+8*(i+1)},64);
-            if(value<0x10000 || value>UINT64_MAX-4096)continue;
+            const auto value=arg(i);
+            if(value<0x10000)continue;
+            if(value>address_mask-4095)return false;
             if(memory.is_copy_on_write(GuestAddress{value}) || memory.is_copy_on_write(GuestAddress{value+4095}))return false;
         }
     }catch(...){return false;}
@@ -240,11 +243,20 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
                                                   std::span<GuestState* const> active) {
     if(!parallel_service(state.rip))return false;
     const std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
+    struct CountScope {
+        WindowsServices& self;std::uint64_t rip;std::chrono::steady_clock::time_point start;
+        bool accepted{true};
+        ~CountScope(){if(!accepted || !self.service_counts_enabled_)return;
+            const auto ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count());
+            std::lock_guard lock(*self.worker_service_counts_mutex_);auto& c=self.worker_service_counts_[rip];++c.calls;c.ns+=ns;}
+    } count_scope{*this,state.rip.value,service_counts_enabled_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
     if(const auto* graphics=graphics_worker_service(state.rip)){
+        count_scope.accepted=false;
         // 鎖順序：映射（共用）→ D3D11。資格不符（裝置鎖、延後銷毀清單過長）時交回協調者，未改任何狀態。
         const std::lock_guard graphics_lock(graphics_mutex());
         const auto& descriptor=*graphics;
-        if(!d3d11_local_eligible(state,descriptor.symbol) || !graphics_worker_outputs_private(state,memory,descriptor))return false;
+        if(!d3d11_local_eligible(state,memory,descriptor) || !graphics_worker_outputs_private(state,memory,descriptor))return false;
+        count_scope.accepted=true;
         struct Local {~Local(){graphics_local()=false;}} local;graphics_local()=true;
         if(invoke_d3d11(state,memory,descriptor))throw std::logic_error("worker 上的 D3D11 服務意外終止客體");
         state.rep_compare={};
@@ -258,12 +270,6 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         return true;
     }
     const auto symbol=name(state.rip);
-    struct CountScope {
-        WindowsServices& self;std::uint64_t rip;std::chrono::steady_clock::time_point start;
-        ~CountScope(){if(!self.service_counts_enabled_)return;
-            const auto ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count());
-            std::lock_guard lock(*self.worker_service_counts_mutex_);auto& c=self.worker_service_counts_[rip];++c.calls;c.ns+=ns;}
-    } count_scope{*this,state.rip.value,service_counts_enabled_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
     // worker 身分由交給引擎的 context 決定；客體更動 GS 不得冒用另一執行緒。
     auto key=threads_.current;
     {

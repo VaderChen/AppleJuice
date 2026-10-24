@@ -32,9 +32,13 @@ func normalizeCompilerWorkers(value uint32) uint32 {
 // 首次呈現 14–15 秒、約 35 FPS；Launcher 先固定關閉，待該功能修正並重測後移除此設定。
 const sharedRegionsSetting = "X64ARM_JIT_SHARED_REGIONS=0"
 
+// 先追蹤實際作為程式來源的頁面；私人 RWX 的資料寫入沿核心契約執行，
+// 來源頁仍由寫入故障、撤銷與精確恢復保護。執行與離線分析須使用同一設定。
+const codeSourceWatchSetting = "X64ARM_NATIVE_MMU_CODE_WATCH=1"
+
 // 執行及離線分析使用相同的已驗證設定，不繼承外部的引擎實驗開關。
 func engineEnvironment(workers uint32, openGL string, nativeLibraryBridge bool, nativeV8Host string) []string {
-	environment := make([]string, 0, len(os.Environ())+4)
+	environment := make([]string, 0, len(os.Environ())+5)
 	for _, entry := range os.Environ() {
 		if !strings.HasPrefix(entry, "X64ARM_") && !strings.HasPrefix(entry, "TERM=") {
 			environment = append(environment, entry)
@@ -52,5 +56,5 @@ func engineEnvironment(workers uint32, openGL string, nativeLibraryBridge bool, 
 		environment = append(environment, "X64ARM_NATIVE_LIBRARIES="+strings.Join(providers, ","))
 	}
 	return append(environment, "TERM=xterm-256color", "X64ARM_GL_BACKEND="+normalizeOpenGLBackend(openGL),
-		"X64ARM_JIT_COMPILER_WORKERS="+strconv.FormatUint(uint64(workers), 10), "X64ARM_AOT_MEMORY_CACHE=*", sharedRegionsSetting)
+		"X64ARM_JIT_COMPILER_WORKERS="+strconv.FormatUint(uint64(workers), 10), "X64ARM_AOT_MEMORY_CACHE=*", sharedRegionsSetting, codeSourceWatchSetting)
 }

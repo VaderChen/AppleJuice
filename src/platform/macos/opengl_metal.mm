@@ -151,10 +151,13 @@ class MetalGl final:public NativeOpenGlContext {
     GlOperation active_operation_{};
     void error(unsigned e){if(std::getenv("X64ARM_GL_TRACE"))std::fprintf(stderr,"[gl-error] operation=%u error=0x%x\n",static_cast<unsigned>(active_operation_),e);if(!error_)error_=e;}
     // 連續繪製沿用的 render encoder 與其附件鍵；任何其他編碼、提交前都先結束。
-    id<MTLRenderCommandEncoder> open_render_;std::vector<std::uintptr_t> open_render_key_;std::uint64_t coalesced_draws_{};
-    void end_open_render(){if(open_render_){[open_render_ endEncoding];open_render_=nil;open_render_key_.clear();}}
+    id<MTLRenderCommandEncoder> open_render_;std::vector<std::uintptr_t> open_render_key_;std::uint64_t coalesced_draws_{},render_encoders_{};
+    std::shared_ptr<std::atomic<std::uint64_t>> gpu_busy_ns_=std::make_shared<std::atomic<std::uint64_t>>(0);
+    // 診斷：記錄每次結束沿用中 render encoder 的原因（統計字串輸出），找出切斷合併的來源。
+    std::map<std::string,std::uint64_t> encoder_breaks_;
+    void end_open_render(const char* why=nullptr){if(open_render_){++encoder_breaks_[why?why:"other"];[open_render_ endEncoding];open_render_=nil;open_render_key_.clear();}}
     void ensure_commands(bool gpu_work){if(!commands_){commands_=[queue_ commandBuffer];commands_gpu_work_=false;}if(!commands_)throw std::runtime_error("Metal command buffer 建立失敗");commands_gpu_work_|=gpu_work;}
-    void begin_commands(bool gpu_work=true){end_open_render();ensure_commands(gpu_work);}
+    void begin_commands(bool gpu_work=true,const char* why=nullptr){end_open_render(why);ensure_commands(gpu_work);}
     void retire_front(bool wait){
         auto command=flights_.front().command;
         if(wait && command.status<MTLCommandBufferStatusCompleted){
@@ -165,8 +168,8 @@ class MetalGl final:public NativeOpenGlContext {
         flights_.pop_front();
     }
     void reap(){while(!flights_.empty() && flights_.front().command.status>=MTLCommandBufferStatusCompleted)retire_front(false);}
-    void flush(bool wait){
-        end_open_render();
+    void flush(bool wait,const char* why="flush"){
+        end_open_render(why);
         reap();
         if(commands_){
             if(flights_.size()>=flight_limit_)retire_front(true);
@@ -176,7 +179,12 @@ class MetalGl final:public NativeOpenGlContext {
             // 完成旗標供 D3D11 事件查詢輪詢；回呼只寫旗標，不觸碰後端狀態。
             flight.done=commands_done_?std::move(commands_done_):std::make_shared<std::atomic<bool>>(false);commands_done_=nullptr;auto done=flight.done;
             flight.relays=commands_relays_?std::move(commands_relays_):std::make_shared<MetalFenceRelays>();commands_relays_=nullptr;auto relays=flight.relays;
-            [commands_ addCompletedHandler:^(id<MTLCommandBuffer>){done->store(true,std::memory_order_release);relays->fire();}];
+            // GPU 忙碌時間累計供診斷（CPU／GPU 瓶頸判斷）；只讀命令緩衝時間戳，不觸碰後端狀態。
+            auto gpu_ns=gpu_busy_ns_;
+            [commands_ addCompletedHandler:^(id<MTLCommandBuffer> buffer){
+                const auto start=buffer.GPUStartTime,end=buffer.GPUEndTime;
+                if(end>start)gpu_ns->fetch_add(static_cast<std::uint64_t>((end-start)*1e9),std::memory_order_relaxed);
+                done->store(true,std::memory_order_release);relays->fire();}];
             if(commands_gpu_work_)track_gpu_commands(commands_);[commands_ commit];commands_=nil;pending_leases_.clear();graphics_pending_.clear();pending_=0;++submissions_;
             flight_peak_=std::max(flight_peak_,flights_.size());
         }
@@ -185,7 +193,7 @@ class MetalGl final:public NativeOpenGlContext {
     void wait_resource(const std::shared_ptr<GraphicsResource>& resource){
         const auto identity=metal_resource_use_identity(resource);
         const auto uses=[&](const auto& objects){return objects.contains(identity);};
-        if(uses(graphics_pending_))flush(false);else reap();
+        if(uses(graphics_pending_))flush(false,"wait_resource");else reap();
         std::size_t through=0;for(std::size_t n=0;n<flights_.size();++n)if(uses(flights_[n].objects))through=n+1;
         if(through)++resource_wait_count_;
         // 同一 queue 保證先後；只等待最後使用此資源的批次，保留後續無關工作。
@@ -363,7 +371,7 @@ public:
         if(layer_){auto drawable=[layer_ nextDrawable];if(!drawable)return false;begin_commands();auto enc=[commands_ blitCommandEncoder];MetalEncoderScope enc_scope{enc};[enc copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:drawable.texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];enc_scope.end();[commands_ presentDrawable:drawable];}flush(false);return true;}}
     OpenGlRendererInfo info()const override{return {"MacWin",std::string(device_.name.UTF8String)+" (Metal)","1.1 MacWin Metal subset",true};}
     std::string string(unsigned name)override{const auto i=info();switch(name){case 0x1f00:return i.vendor;case 0x1f01:return i.renderer;case 0x1f02:return i.version;case 0x1f03:return {};case 0x8b8c:return "4.60 MacWin GLSL compiler";default:error(0x500);return {};}}
-    std::string statistics()const override{return "opengl_backend=metal opengl_metal_draws="+std::to_string(draws_)+" opengl_metal_submissions="+std::to_string(submissions_)+" opengl_metal_inflight="+std::to_string(flights_.size())+" opengl_metal_inflight_limit="+std::to_string(flight_limit_)+" opengl_metal_inflight_peak="+std::to_string(flight_peak_)+" opengl_metal_waits="+std::to_string(wait_count_)+" opengl_metal_wait_ns="+std::to_string(wait_ns_)+" glsl_compiles="+std::to_string(gl_.compiles)+" glsl_links="+std::to_string(gl_.links)+" glsl_compile_ns="+std::to_string(gl_.compile_ns)+" glsl_link_ns="+std::to_string(gl_.link_ns)+" opengl_metal_resource_waits="+std::to_string(resource_wait_count_)+" gl_buffer_uploads="+std::to_string(gl_.buffer_uploads)+" gl_buffer_upload_bytes="+std::to_string(gl_.buffer_upload_bytes)+" gl_direct_vertex_bindings="+std::to_string(gl_.direct_vertex_bindings)+" gl_direct_index_draws="+std::to_string(gl_.direct_index_draws)+" gl_converted_vertices="+std::to_string(gl_.converted_vertices)+"\n";}
+    std::string statistics()const override{return "opengl_backend=metal opengl_metal_draws="+std::to_string(draws_)+" opengl_metal_submissions="+std::to_string(submissions_)+" opengl_metal_inflight="+std::to_string(flights_.size())+" opengl_metal_inflight_limit="+std::to_string(flight_limit_)+" opengl_metal_inflight_peak="+std::to_string(flight_peak_)+" opengl_metal_render_encoders="+std::to_string(render_encoders_)+" opengl_metal_encoder_breaks="+[&]{std::string text;for(const auto& [why,count]:encoder_breaks_)text+=why+":"+std::to_string(count)+",";return text.empty()?std::string("none"):text;}()+" opengl_metal_coalesced_draws="+std::to_string(coalesced_draws_)+" opengl_metal_gpu_busy_ns="+std::to_string(gpu_busy_ns_->load(std::memory_order_relaxed))+" opengl_metal_waits="+std::to_string(wait_count_)+" opengl_metal_wait_ns="+std::to_string(wait_ns_)+" glsl_compiles="+std::to_string(gl_.compiles)+" glsl_links="+std::to_string(gl_.links)+" glsl_compile_ns="+std::to_string(gl_.compile_ns)+" glsl_link_ns="+std::to_string(gl_.link_ns)+" opengl_metal_resource_waits="+std::to_string(resource_wait_count_)+" gl_buffer_uploads="+std::to_string(gl_.buffer_uploads)+" gl_buffer_upload_bytes="+std::to_string(gl_.buffer_upload_bytes)+" gl_direct_vertex_bindings="+std::to_string(gl_.direct_vertex_bindings)+" gl_direct_index_draws="+std::to_string(gl_.direct_index_draws)+" gl_converted_vertices="+std::to_string(gl_.converted_vertices)+"\n";}
     void array(unsigned index,int size,unsigned type,std::span<const std::uint8_t> bytes,bool enabled)override{if(index>=4 || size<1 || size>4)throw std::invalid_argument("GL array");auto& a=arrays_[index];a.size=size;a.type=type;a.enabled=enabled;a.bytes.assign(bytes.begin(),bytes.end());}
     std::string capture(const std::filesystem::path& path)override{@autoreleasepool{flush(true);std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width_)*height_*4);[color_ getBytes:pixels.data() bytesPerRow:width_*4 fromRegion:MTLRegionMake2D(0,0,width_,height_) mipmapLevel:0];auto bitmap=[[NSBitmapImageRep alloc] initWithBitmapDataPlanes:nullptr pixelsWide:width_ pixelsHigh:height_ bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace bitmapFormat:NSBitmapFormatAlphaNonpremultiplied bytesPerRow:width_*4 bitsPerPixel:32];if(!bitmap)throw std::bad_alloc{};for(std::size_t i=0;i<pixels.size();i+=4){std::swap(pixels[i],pixels[i+2]);}std::memcpy(bitmap.bitmapData,pixels.data(),pixels.size());if(!path.parent_path().empty())std::filesystem::create_directories(path.parent_path());if(![[bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:[NSString stringWithUTF8String:path.c_str()] atomically:YES])throw std::runtime_error("Metal PNG capture failed");return "opengl_capture="+path.string()+" backend=metal\n";}}
     bool programmable()const noexcept override{return true;}

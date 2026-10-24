@@ -661,8 +661,8 @@ std::array<std::uint64_t,2> heap_block_pages(std::uint64_t address,std::size_t s
 }
 }
 std::uint64_t WindowsServices::allocate_heap(GuestMemory& memory, std::uint64_t requested, std::uint64_t heap) {
-    // 本地協調的 D3D11 服務與 worker 並行，不可改動 worker 可能借用的 heap（見 d3d11_local_eligible）。
-    if(graphics_local())throw HostCallFault("D3D11 本地協調服務不可配置 heap");
+    // worker 上的 D3D11 服務只持共用映射鎖，不可改動 heap（見 graphics_worker_service）。
+    if(graphics_local())throw HostCallFault("worker 上的 D3D11 服務不可配置 heap");
     const auto fail=[&](const char* reason)->std::uint64_t {
         if(std::getenv("X64ARM_TRACE_HEAP_FAILURES"))std::fprintf(stderr,"heap_failure pid=%u reason=%s requested=%llu objects=%zu remaining=%zu next=0x%llx\n",process_id(),reason,static_cast<unsigned long long>(requested),allocations_.size(),memory.remaining_capacity(),static_cast<unsigned long long>(next_allocation_));
         return 0;
@@ -1094,7 +1094,7 @@ const std::vector<std::pair<std::uint64_t,std::uint64_t>>& WindowsServices::gues
     return guest_heap_walk_blocks_;
 }
 bool WindowsServices::free_heap(GuestMemory& memory, std::uint64_t address, const GuestState& state) {
-    if(graphics_local())throw HostCallFault("D3D11 本地協調服務不可釋放 heap");
+    if(graphics_local())throw HostCallFault("worker 上的 D3D11 服務不可釋放 heap");
     if (!address) return true;
     if (guest_heap_contains(address)) {guest_heap_free(memory,address);return true;}
     const auto found = allocations_.find(address);
