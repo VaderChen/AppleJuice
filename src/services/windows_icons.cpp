@@ -8,6 +8,7 @@
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> icon_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"comctl32.dll","LoadIconMetric",4},{"comctl32.dll","LoadIconWithScaleDown",5},
         {"user32.dll","LoadCursorFromFileA",1},{"user32.dll","LoadCursorFromFileW",1},
         {"user32.dll","CopyImage",5},
         {"user32.dll","CreateIconFromResource",4},{"user32.dll","CreateIconFromResourceEx",7},
@@ -51,8 +52,28 @@ void decorate_stock(GuiIcon& icon,std::uint32_t flags){
 std::optional<std::uint32_t> WindowsServices::invoke_icon_api(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const auto d=[&](unsigned n){return static_cast<std::uint32_t>(arg(n));};const auto unit=x86_?4U:8U;
     std::uint64_t result=0;std::vector<std::uint64_t> allocated;
+    const bool metric=symbol=="LoadIconMetric",scaled=metric || symbol=="LoadIconWithScaleDown";
     try {
-        if(symbol=="CopyImage"){
+        if(scaled){
+            const auto finish=[&](std::uint32_t status){arg.return_to(state,status);return std::optional<std::uint32_t>{};};
+            const auto output=arg(metric?3:4);if(!output)return finish(0x80070057U);
+            memory.store(GuestAddress{output},static_cast<std::uint8_t>(unit*8),0);
+            if(!arg(1) || (metric && d(2)>1))return finish(0x80070057U);
+            const auto width=metric?system_metric(d(2)?11:49):d(2),height=metric?system_metric(d(2)?12:50):d(3);
+            if(width>4096 || height>4096)return finish(0x80070057U);
+            const auto standard=[](std::uint32_t size){return size==16 || size==32 || size==48 || size==256;};
+            const bool prefer_larger=metric || !(standard(width) && standard(height));
+            // 名稱／序號、ICO／ANI 與模組資源共用既有解碼、縮放及 HICON 生命週期。
+            std::uint64_t handle=0;
+            if(!arg(0) && arg(1)>65535){
+                const auto file=filesystem_.open(utf16_to_utf8(read_utf16(memory,GuestAddress{arg(1)})));
+                if(file.error)last_error_=file.error==2 || file.error==3?1813:file.error;
+                else handle=store_gui_icon(decode_icon_file(*file.bytes,false,width,height,0x40U,prefer_larger));
+            }else handle=load_gui_icon(memory,arg(0),arg(1),true,width,height,false,false,false,0,prefer_larger);
+            if(!handle)return finish(0x80070000U|(last_error_?last_error_:1813U));
+            memory.store(GuestAddress{output},static_cast<std::uint8_t>(unit*8),handle);
+            return finish(0);
+        }else if(symbol=="CopyImage"){
             const auto type=d(1),flags=d(4),requested_width=d(2),requested_height=d(3);
             const auto finish=[&](std::uint64_t handle){arg.return_to(state,handle);return std::optional<std::uint32_t>{};};
             const auto fail=[&](std::uint32_t error){last_error_=error;return finish(0);};
@@ -177,8 +198,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_icon_api(GuestState& state,
                 }
             }
         }
-    }catch(const std::invalid_argument&){last_error_=193;result=symbol=="SHGetStockIconInfo"?0x8007000dU:symbol.starts_with("ExtractIconEx")?UINT32_MAX:0;}
-    catch(const std::bad_alloc&){for(const auto handle:allocated){const auto icon=gui_.icons.find(handle);if(icon!=gui_.icons.end() && !icon->second.shared)gui_.icons.erase(icon);}last_error_=8;result=symbol=="SHGetStockIconInfo"?0x8007000eU:0;}
+    }catch(const std::invalid_argument&){last_error_=193;result=scaled || symbol=="SHGetStockIconInfo"?0x8007000dU:symbol.starts_with("ExtractIconEx")?UINT32_MAX:0;}
+    catch(const std::bad_alloc&){for(const auto handle:allocated){const auto icon=gui_.icons.find(handle);if(icon!=gui_.icons.end() && !icon->second.shared)gui_.icons.erase(icon);}last_error_=8;result=scaled || symbol=="SHGetStockIconInfo"?0x8007000eU:0;}
     arg.return_to(state,result);return std::nullopt;
 }
 }

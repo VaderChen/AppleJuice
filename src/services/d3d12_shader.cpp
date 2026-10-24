@@ -2,6 +2,11 @@
 #include <vkd3d_shader.h>
 #include <spirv_msl.hpp>
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -30,6 +35,13 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
     static std::mutex lock;const std::lock_guard guard(lock);
     if(stage!=0 && stage!=1 && stage!=5)throw std::invalid_argument("現代著色器目前支援 VS／PS／CS");
     if(!graphics_modern_shader_required(bytes))throw std::invalid_argument("著色器不是 DXIL 或 SM5.1 DXBC");
+    if(const char* directory=std::getenv("X64ARM_DUMP_DXBC");directory && *directory){
+        // 與 SM4／5 相同的診斷開關：保存原始容器，供 d3d12_shader_corpus 離線重現轉譯。
+        static std::atomic<std::uint64_t> sequence{};
+        const auto path=std::filesystem::path(directory)/(std::to_string(getpid())+"-"+std::to_string(++sequence)+"-stage"+std::to_string(stage)+".dxil");
+        std::filesystem::create_directories(path.parent_path());std::ofstream output(path,std::ios::binary);
+        output.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));
+    }
     bool dxil=false;
     for(unsigned i=0;i<word(bytes,28);++i)if(word(bytes,word(bytes,32+4*i))==0x4c495844U)dxil=true;
     struct Scan {
@@ -38,7 +50,11 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
     } scan;
     scan.descriptors.type=VKD3D_SHADER_STRUCTURE_TYPE_SCAN_DESCRIPTOR_INFO;scan.descriptors.next=&scan.signatures;
     scan.signatures.type=VKD3D_SHADER_STRUCTURE_TYPE_SCAN_SIGNATURE_INFO;
-    const std::array<vkd3d_shader_compile_option,1> options{{{VKD3D_SHADER_COMPILE_OPTION_BUFFER_UAV,VKD3D_SHADER_COMPILE_OPTION_BUFFER_UAV_STORAGE_BUFFER}}};
+    // Apple GPU 的 SIMD group 對應 D3D wave（寬 32），MSL 支援 64 位元整數但不支援 double。
+    // 無格式型別 UAV 讀取對應 Metal read_write 紋理。threadgroup 零初始化暫不開：SPIRV-Cross 產生的初始化碼引用未宣告的 gl_WorkGroupSize。
+    const std::array<vkd3d_shader_compile_option,3> options{{{VKD3D_SHADER_COMPILE_OPTION_BUFFER_UAV,VKD3D_SHADER_COMPILE_OPTION_BUFFER_UAV_STORAGE_BUFFER},
+        {VKD3D_SHADER_COMPILE_OPTION_FEATURE,VKD3D_SHADER_COMPILE_OPTION_FEATURE_INT64|VKD3D_SHADER_COMPILE_OPTION_FEATURE_WAVE_OPS},
+        {VKD3D_SHADER_COMPILE_OPTION_TYPED_UAV,VKD3D_SHADER_COMPILE_OPTION_TYPED_UAV_READ_FORMAT_UNKNOWN}}};
     vkd3d_shader_compile_info info{};info.type=VKD3D_SHADER_STRUCTURE_TYPE_COMPILE_INFO;info.source={bytes.data(),bytes.size()};
     info.source_type=dxil?VKD3D_SHADER_SOURCE_DXBC_DXIL:VKD3D_SHADER_SOURCE_DXBC_TPF;info.target_type=VKD3D_SHADER_TARGET_SPIRV_BINARY;
     info.options=options.data();info.option_count=static_cast<unsigned>(options.size());info.log_level=VKD3D_SHADER_LOG_WARNING;info.next=&scan.descriptors;
@@ -61,7 +77,7 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
         binding.flags=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER?0U:buffer?VKD3D_SHADER_BINDING_FLAG_BUFFER:VKD3D_SHADER_BINDING_FLAG_IMAGE;
         by_binding.emplace(binding.binding.binding,Descriptor{d.type,d.register_index,d.count,buffer});bindings.push_back(binding);
     }
-    vkd3d_shader_spirv_target_info target{};target.type=VKD3D_SHADER_STRUCTURE_TYPE_SPIRV_TARGET_INFO;target.environment=VKD3D_SHADER_SPIRV_ENVIRONMENT_VULKAN_1_0;
+    vkd3d_shader_spirv_target_info target{};target.type=VKD3D_SHADER_STRUCTURE_TYPE_SPIRV_TARGET_INFO;target.environment=VKD3D_SHADER_SPIRV_ENVIRONMENT_VULKAN_1_1;
     vkd3d_shader_interface_info interface{};interface.type=VKD3D_SHADER_STRUCTURE_TYPE_INTERFACE_INFO;interface.next=&target;
     interface.bindings=bindings.data();interface.binding_count=static_cast<unsigned>(bindings.size());info.next=&interface;
     if(vkd3d_shader_compile(&info,&scan.code,&scan.messages)<0){scan.code={};throw std::invalid_argument("現代著色器轉譯失敗："+std::string(scan.messages?scan.messages:""));}

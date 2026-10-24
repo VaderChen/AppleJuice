@@ -33,6 +33,7 @@ inline unsigned element(const WindowsServiceDescriptor& service){
     return service.symbol.find("basic_streambuf@D")!=service.symbol.npos || service.symbol.find("basic_ios@D")!=service.symbol.npos ||
         service.symbol.find("basic_istream@D")!=service.symbol.npos || service.symbol.find("basic_ostream@D")!=service.symbol.npos ||
         service.symbol.find("basic_iostream@D")!=service.symbol.npos || service.symbol.find("ctype@D")!=service.symbol.npos ||
+        service.symbol.find("time_put@D")!=service.symbol.npos || service.symbol.find("codecvt@DD")!=service.symbol.npos ||
         service.symbol.find("num_put@D")!=service.symbol.npos || service.symbol.find("numpunct@D")!=service.symbol.npos ||
         service.symbol.find("numpunct_byname@D")!=service.symbol.npos?1U:2U;
 }

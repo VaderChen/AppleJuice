@@ -7,6 +7,7 @@ struct ExceptionWalkFrame {
     std::uint64_t pc{};
     UnwindResult unwind;
     std::size_t callback_depth{}, exception_depth{};
+    std::size_t scope_index{};
     bool operator==(const ExceptionWalkFrame&) const = default;
 };
 struct SehScope {
@@ -30,6 +31,8 @@ struct ExceptionDispatch {
     std::vector<SehScope> scopes;
     std::size_t index{}, callback_depth{}, target_frame{}, scope_index{};
     std::size_t walk_callback_depth{}, walk_exception_depth{};
+    std::size_t walk_scope_index{};
+    std::uint64_t unwind_context{};
     std::uint64_t target_ip{}, return_value{};
     std::uint64_t consolidate_record{}, consolidate_context{};
     GuestState consolidate_origin;

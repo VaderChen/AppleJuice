@@ -38,6 +38,7 @@ void add_headers(HttpHeaders& headers,std::u16string_view text,std::uint32_t fla
 std::span<const WindowsServiceDescriptor> http_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"wininet.dll","InternetCheckConnectionA",3},{"wininet.dll","InternetCheckConnectionW",3},
+        {"wininet.dll","InternetGetConnectedState",2},{"wininet.dll","InternetGetConnectedStateEx",4},{"wininet.dll","InternetGetConnectedStateExA",4},{"wininet.dll","InternetGetConnectedStateExW",4},
         {"wininet.dll","CreateUrlCacheEntryA",5},{"wininet.dll","CreateUrlCacheEntryW",5},{"wininet.dll","CommitUrlCacheEntryA",9,12},{"wininet.dll","CommitUrlCacheEntryW",9,12},{"wininet.dll","GetUrlCacheEntryInfoA",3},{"wininet.dll","GetUrlCacheEntryInfoW",3},{"wininet.dll","GetUrlCacheEntryInfoExA",7},{"wininet.dll","GetUrlCacheEntryInfoExW",7},{"wininet.dll","RetrieveUrlCacheEntryFileA",4},{"wininet.dll","RetrieveUrlCacheEntryFileW",4},{"wininet.dll","UnlockUrlCacheEntryFileA",2},{"wininet.dll","UnlockUrlCacheEntryFileW",2},{"wininet.dll","DeleteUrlCacheEntryA",1},{"wininet.dll","DeleteUrlCacheEntryW",1},{"wininet.dll","SetUrlCacheEntryInfoA",3},{"wininet.dll","SetUrlCacheEntryInfoW",3},{"wininet.dll","RetrieveUrlCacheEntryStreamA",5},{"wininet.dll","RetrieveUrlCacheEntryStreamW",5},{"wininet.dll","FindFirstUrlCacheEntryA",3},{"wininet.dll","FindFirstUrlCacheEntryW",3},{"wininet.dll","FindNextUrlCacheEntryA",3},{"wininet.dll","FindNextUrlCacheEntryW",3},{"wininet.dll","UnlockUrlCacheEntryFile",2},{"wininet.dll","ReadUrlCacheEntryStream",5},{"wininet.dll","ReadUrlCacheEntryStreamEx",4,2},{"wininet.dll","UnlockUrlCacheEntryStream",2},{"wininet.dll","FindCloseUrlCache",1},
         {"wininet.dll","InternetOpenA",5},{"wininet.dll","InternetOpenW",5},{"wininet.dll","InternetOpenUrlA",6},{"wininet.dll","InternetOpenUrlW",6},
         {"wininet.dll","InternetConnectA",8},{"wininet.dll","InternetConnectW",8},{"wininet.dll","HttpOpenRequestA",8},{"wininet.dll","HttpOpenRequestW",8},
@@ -90,7 +91,7 @@ bool WindowsServices::http_waiting() const {
 std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.symbol=="WinHttpGetProxyForUrl" || service.symbol=="WinHttpDetectAutoProxyConfigUrl" || service.symbol=="WinHttpCreateProxyResolver" || service.symbol=="WinHttpGetProxyForUrlEx" || service.symbol=="WinHttpGetProxyResult" || service.symbol=="WinHttpFreeProxyResult" || service.symbol=="WinHttpSetStatusCallback")return invoke_autoproxy(state,memory,service);
     if(service.symbol.find("UrlCache")!=std::string_view::npos)return invoke_url_cache(state,memory,service);
-    const WindowsCall arg(state,memory,service);const bool inet=service.family=="wininet.dll",ansi=inet && service.symbol.ends_with('A');
+    const WindowsCall arg(state,memory,service);const bool inet=service.family=="wininet.dll",ansi=inet && (service.symbol.ends_with('A') || service.symbol=="InternetGetConnectedStateEx");
     std::string_view symbol=service.symbol;
     if(inet){
         if(symbol.starts_with("InternetOpenUrl"))symbol="InternetOpenUrl";
@@ -130,7 +131,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
     try {
         if(service.symbol=="InternetQueryDataAvailable" && (d(2) || arg(3)))throw HttpError{87};
         if(service.symbol=="InternetReadFile" || service.symbol=="InternetWriteFile"){if(!arg(3))throw HttpError{87};memory.store(GuestAddress{arg(3)},32,0);}
-        if(symbol.starts_with("InternetCheckConnection")){
+        if(symbol.starts_with("InternetGetConnectedState")){
+            // 依宿主網路設定：有已啟用、非回送且有預設閘道的介面即為 LAN 連線（一般 PC 回報 LAN｜RAS_INSTALLED）；否則 OFFLINE。
+            const bool extended=symbol.starts_with("InternetGetConnectedStateEx");
+            if(!arg(0) || d(extended?3:1))throw HttpError{87};
+            NetworkConfiguration config;bool online=false;
+            if(runtime_.network.external_io && snapshot_network_configuration(config))
+                online=std::any_of(config.interfaces.begin(),config.interfaces.end(),[](const auto& item){return item.status==1 && item.type!=24 && !item.gateways.empty();});
+            memory.check(GuestAddress{arg(0)},4,Access::Write);memory.store(GuestAddress{arg(0)},32,online?0x12U:0x20U);
+            if(extended && arg(1) && d(2)){
+                const std::u16string name=online?u"LAN Connection":u"";const auto count=std::min<std::size_t>(name.size(),d(2)-1);
+                if(ansi){std::vector<std::uint8_t> bytes(name.begin(),name.begin()+static_cast<std::ptrdiff_t>(count));bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);}
+                else memory.write(GuestAddress{arg(1)},utf16_bytes(name.substr(0,count)));
+            }
+            result=online?1:0;
+        }else if(symbol.starts_with("InternetCheckConnection")){
             if(d(2) || (d(1)&~1U))throw HttpError{87};if(!runtime_.network.external_io)throw HttpError{2250};
             auto pending=runtime_.http.connection_probes.find(threads_.current);std::uint64_t id=0;
             if(pending==runtime_.http.connection_probes.end()){

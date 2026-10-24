@@ -57,7 +57,7 @@ struct NativeTlsSession {
         std::vector<std::uint8_t> bytes(size);if(size && BIO_read(bio,bytes.data(),static_cast<int>(size))!=static_cast<int>(size))throw HostCallFault("TLS BIO 輸出不完整");return bytes;
     }
 };
-TlsState::TlsState(const TlsState& other):digest(other.digest),credentials(other.credentials),buffers(other.buffers),next_handle(other.next_handle) {
+TlsState::TlsState(const TlsState& other):digest(other.digest),credentials(other.credentials),buffers(other.buffers),next_handle(other.next_handle),function_tables(other.function_tables) {
     if(!other.sessions.empty())throw std::invalid_argument("作用中的 TLS 連線不能複製供兩後端差分執行");
 }
 TlsState& TlsState::operator=(const TlsState& other) {if(this!=&other){TlsState copy(other);*this=std::move(copy);}return *this;}
@@ -166,7 +166,8 @@ std::span<const WindowsServiceDescriptor> tls_service_descriptors() {
         {"secur32.dll","AcceptSecurityContext",9},{"secur32.dll","CompleteAuthToken",2},{"secur32.dll","DeleteSecurityContext",1},{"secur32.dll","FreeContextBuffer",1},
         {"secur32.dll","QueryContextAttributesA",3},{"secur32.dll","QueryContextAttributesW",3},
         {"secur32.dll","SetContextAttributesA",4},{"secur32.dll","SetContextAttributesW",4},
-        {"secur32.dll","EncryptMessage",4},{"secur32.dll","DecryptMessage",4},{"secur32.dll","ApplyControlToken",2}
+        {"secur32.dll","EncryptMessage",4},{"secur32.dll","DecryptMessage",4},{"secur32.dll","ApplyControlToken",2},
+        {"secur32.dll","InitSecurityInterfaceW",0},{"secur32.dll","InitSecurityInterfaceA",0}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_tls(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
@@ -174,6 +175,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_tls(GuestState& state,Guest
     const auto text=[&](unsigned i){return symbol.back()=='W'?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(i)})):read_ansi(memory,arg(i));};
     const auto expiry=[&](std::uint64_t pointer){if(pointer)memory.store(GuestAddress{pointer},64,INT64_MAX);};
     const auto package_name=[](std::string value){for(auto& c:value)if(c>='A' && c<='Z')c=static_cast<char>(c+32);return value=="schannel" || value=="microsoft unified security protocol provider";};
+    if(symbol=="InitSecurityInterfaceW" || symbol=="InitSecurityInterfaceA"){
+        // SecurityFunctionTable（SECURITY_SUPPORT_PROVIDER_INTERFACE_VERSION_4）：各槽指向本 DLL 既有的 SSPI 入口；
+        // 尚未提供的函式指向未解析匯入陷阱（呼叫時可診斷），保留欄位依官方佈局為 0。程序內傳回同一份表。
+        const bool wide=symbol.back()=='W';auto& table=tls.function_tables[wide?1:0];
+        if(!table){
+            const std::string suffix=wide?"W":"A";
+            const std::vector<std::string> names{"EnumerateSecurityPackages"+suffix,"QueryCredentialsAttributes"+suffix,"AcquireCredentialsHandle"+suffix,
+                "FreeCredentialsHandle","","InitializeSecurityContext"+suffix,"AcceptSecurityContext","CompleteAuthToken","DeleteSecurityContext",
+                "ApplyControlToken","QueryContextAttributes"+suffix,"ImpersonateSecurityContext","RevertSecurityContext","MakeSignature",
+                "VerifySignature","FreeContextBuffer","QuerySecurityPackageInfo"+suffix,"","","ExportSecurityContext","ImportSecurityContext"+suffix,
+                "AddCredentials"+suffix,"","QuerySecurityContextToken","EncryptMessage","DecryptMessage","SetContextAttributes"+suffix,
+                "SetCredentialsAttributes"+suffix,"ChangeAccountPassword"+suffix};
+            const unsigned unit=x86_?4U:8U;std::vector<std::uint8_t> bytes(unit+names.size()*unit);bytes[0]=4;
+            for(std::size_t i=0;i<names.size();++i){
+                const auto target=names[i].empty()?0:bind_import("secur32.dll",names[i],true).value;
+                for(unsigned b=0;b<unit;++b)bytes[unit+i*unit+b]=static_cast<std::uint8_t>(target>>(8*b));
+            }
+            table=runtime_allocate(memory,bytes);
+        }
+        arg.return_to(state,table);return std::nullopt;
+    }
     if(symbol=="CompleteAuthToken" || symbol.starts_with("QuerySecurityPackageInfo") || symbol.starts_with("EnumerateSecurityPackages"))return invoke_digest(state,memory,service);
     if(symbol.starts_with("AcquireCredentialsHandle")){
         try{auto package=text(1);for(auto& c:package)if(c>='A' && c<='Z')c=static_cast<char>(c+32);if(package=="wdigest" || package=="digest")return invoke_digest(state,memory,service);}catch(const MemoryFault&){arg.return_to(state,0x8009035d);return {};}

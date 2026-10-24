@@ -585,7 +585,7 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
         const auto& token=runtime_.token_objects.at(1);
         initialize_windows_profile_security(filesystem_,"C:/Users/User",token.user.sid,token.primary_group);
         // 新子目錄必須從已初始化的 profile 繼承使用者權限。
-        for(const auto directory:{"Users/User/AppData","Users/User/AppData/Local","Users/User/AppData/Local/Temp","Users/User/AppData/Roaming","Users/User/Desktop","Users/User/Documents","Users/User/Downloads"})ensure_directory(filesystem_,directory);
+        for(const auto directory:{"Users/User/AppData","Users/User/AppData/Local","Users/User/AppData/Local/Temp","Users/User/AppData/LocalLow","Users/User/AppData/Roaming","Users/User/Desktop","Users/User/Documents","Users/User/Downloads"})ensure_directory(filesystem_,directory);
     }
     runtime_.process_creation_time=runtime_.filetime_base;
     memory.map(GuestAddress{0x7ffe0000}, GuestMemory::guest_page_size, permission(Access::Read));
@@ -673,17 +673,10 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         if(symbol=="??3@YAXPAXI@Z" || symbol=="??_V@YAXPAXI@Z" || symbol=="??3@YAXPEAX_K@Z" || symbol=="??_V@YAXPEAX_K@Z")symbol="free";
         // 系統 msvcrt 的 x86 舊式匯出仍使用 32-bit time_t；UCRT 的無後綴入口使用 64-bit。
         if(x86_ && legacy_32bit_time(lower))for(const auto& [name,alias]:{std::pair{"time","_time32"},std::pair{"gmtime","_gmtime32"},std::pair{"localtime","_localtime32"},std::pair{"mktime","_mktime32"},std::pair{"_mkgmtime","_mkgmtime32"},std::pair{"difftime","_difftime32"},std::pair{"ctime","_ctime32"},std::pair{"_wctime","_wctime32"}})if(symbol==name){symbol=alias;break;}
-        if(symbol=="_calloc_crt" || symbol=="_calloc_base")symbol="calloc";
-        if(symbol=="getwc")symbol="fgetwc";
-        if(symbol=="putwc")symbol="fputwc";
-        if(symbol=="strtoumax")symbol="strtoull";
-        if(symbol=="strtoimax")symbol="strtoll";
-        if(symbol=="_hypot")symbol="hypot";
-        if(symbol=="__p__timezone")symbol="__timezone";
-        if(symbol=="__p__daylight")symbol="__daylight";
-        if(symbol=="__p__tzname")symbol="__tzname";
+        static const std::map<std::string_view,std::string_view> common_aliases(
+            std::begin(detail::crt_export_aliases),std::end(detail::crt_export_aliases));
+        if(const auto found=common_aliases.find(symbol);found!=common_aliases.end())symbol=found->second;
         if(symbol=="_iob")return GuestAddress{runtime_base_.value+0x800};
-        if (symbol == "__set_app_type") symbol = "_set_app_type";
         const std::array data{
             std::pair{"__argc", 0U}, std::pair{"__argv", 8U},
             std::pair{"__wargv", 56U}, std::pair{"__initenv", 112U},
@@ -692,7 +685,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             std::pair{"_commode", 32U}, std::pair{"_acmdln", 48U}, std::pair{"_wcmdln", 104U},
             // 軟體 x87 除法不具有早期 Pentium FDIV 缺陷；保留 CRT 可寫資料 ABI。
             std::pair{"_adjust_fdiv", 72U}, std::pair{"_timezone",80U},
-            std::pair{"_daylight",84U}, std::pair{"_tzname",88U}
+            std::pair{"_daylight",84U}, std::pair{"_tzname",88U}, std::pair{"__mb_cur_max",128U}
         };
         for (const auto& [name, offset] : data) if (symbol == name) return GuestAddress{runtime_base_.value + offset};
     }
@@ -744,25 +737,33 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
                 index[service.family].emplace("Zw"+std::string(service.symbol.substr(2)));
             if(service.family=="bcrypt.dll" && service.symbol.starts_with("BCrypt"))index["ncrypt.dll"].emplace(service.symbol);
         }
-        for(const auto& alias:detail::service_export_aliases)
-            if(alias.symbol.starts_with('#') || all.contains(alias.symbol) || alias.family=="ntdll.dll")
-                index[alias.family].emplace(alias.symbol);
+        // 別名不必另有同名 descriptor；依共用目錄列舉後，由 resolve_service 核對實際目標。
+        for(const auto& alias:detail::service_export_aliases)index[alias.family].emplace(alias.symbol);
         for(const auto& [ordinal,name]:detail::ole_ordinal_exports){(void)name;index["oleaut32.dll"].emplace("#"+std::to_string(ordinal));}
         for(const auto& service:math_service_descriptors())if(service.family=="d3dx9_43.dll")index["d3dx10_43.dll"].emplace(service.symbol);
         // CRT 別名仍經 resolve_service 選擇版本及 x86 ABI；只加入既有可列舉名稱。
         for(const auto symbol:{"_create_locale","__create_locale","_wcreate_locale","_get_current_locale","__get_current_locale",
             "??2@YAPAXI@Z","??_U@YAPAXI@Z","??2@YAPEAX_K@Z","??_U@YAPEAX_K@Z",
             "??3@YAXPAX@Z","??_V@YAXPAX@Z","??3@YAXPEAX@Z","??_V@YAXPEAX@Z",
-            "??3@YAXPAXI@Z","??_V@YAXPAXI@Z","??3@YAXPEAX_K@Z","??_V@YAXPEAX_K@Z",
-            "getwc","putwc","strtoumax","strtoimax","_hypot","__p__timezone","__p__daylight","__p__tzname"})
+            "??3@YAXPAXI@Z","??_V@YAXPAXI@Z","??3@YAXPEAX_K@Z","??_V@YAXPEAX_K@Z"})
             if(all.contains(symbol))index["crt"].emplace(symbol);
-        for(const auto symbol:{"_calloc_crt","_calloc_base","__set_app_type"})index["crt"].emplace(symbol);
+        for(const auto& [alias,target]:detail::crt_export_aliases)
+            if(all.contains(target))index["crt"].emplace(alias);
         for(const auto symbol:all)if(symbol.starts_with("_o_"))index["api-ms-win-crt-private-l1-1-0.dll"].emplace(symbol);
         index["wsock32.dll"].insert(index["ws2_32.dll"].begin(),index["ws2_32.dll"].end());
         return index;
     }();
     std::map<std::string,std::uint64_t> result;
     const auto guest_entry=[&](GuestAddress target){
+        // 與 resolve_service 共用架構對應的執行緒函式目錄，包含直接返回與同步原語。
+        if(guest_thread_routines_.value){
+            const auto contains=[&](const auto& routines){
+                return std::any_of(routines.begin(),routines.end(),[&](const auto& entry){
+                    return target.value==guest_thread_routines_.value+entry.entry;
+                });
+            };
+            if(x86_?contains(detail::guest_thread_x86_routines):contains(detail::guest_thread_routines))return true;
+        }
         if(guest_memory_routines_.value)
             for(const auto& entry:guest_memory_routines)if(target.value==guest_memory_routines_.value+entry.entry)return true;
         if(guest_scalar_math_routines_.value)
@@ -900,6 +901,8 @@ bool WindowsServices::same_state(const WindowsServices& other) const {
     if(minidump_ || other.minidump_)return false; // 正在客體回呼中的 dump 不宣告可作分支等價比較。
     if(!same_ole_streams(other))return false;
     if(!same_storage(other))return false;
+    if(!same_msi(other))return false;
+    if(!same_esent(other))return false;
     if(demangle_ || other.demangle_)return false; // 客體配置回呼含共用可變狀態。
     if(device_configuration_ || other.device_configuration_)return false; // 原生裝置快照與 SetupAPI 集合不可假設為 deterministic 複本。
     if(bluetooth_ || other.bluetooth_)return false; // 原生請求、訂閱與 GATT 快取含外部生命週期。
@@ -1904,7 +1907,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
     }
     if (state.rip.value == callback_return_.value+0xa0) return force_finish_thread(state,memory);
     if (state.rip.value == callback_return_.value+0x80) return exit_thread(state,memory,0);
-    if (state.rip == thread_return_) return exit_thread(state, memory, static_cast<std::uint32_t>(state.reg(Gpr::Rax)));
+    if (state.rip == thread_return_) {
+        // _beginthread 常式為 void；返回後與 _endthread 相同以 0 結束。
+        const auto& thread=threads_.items.at(threads_.current);
+        return exit_thread(state, memory, thread.crt_detached_handle?0U:static_cast<std::uint32_t>(state.reg(Gpr::Rax)));
+    }
     if (state.rip == process_exit_retry_) return finish_process(state, memory, static_cast<std::uint32_t>(state.reg(Gpr::Rcx)));
     if (state.rip == thread_start_) {
         if(await_loader(state,memory))return std::nullopt;
@@ -2095,7 +2102,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
     } else if (symbol == "CloseHandle") {
         const auto handle = arg(0);
         if (runtime_.handle_flags[handle]&2)fail(5);
-        else if (handle >= 0x100 && handle <= 0x102 && standard_open_[handle - 0x100]) { standard_open_[handle - 0x100] = false; returned = 1; }
+        else if (handle >= 0x100 && handle <= 0x102 && standard_open_[handle - 0x100]) {
+            auto& duplicates=standard_duplicates_[handle - 0x100];
+            if(duplicates)--duplicates;else standard_open_[handle - 0x100] = false;
+            returned = 1;
+        }
         else if (const auto file=files_.find(handle);file!=files_.end()) {
             close_transfer_handle(memory,handle);
             returned=1;

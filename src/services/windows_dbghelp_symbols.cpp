@@ -89,7 +89,9 @@ std::span<const WindowsServiceDescriptor> dbghelp_symbol_service_descriptors(){
         {"dbghelp.dll","SymAddSymbol",6,10,0,0x30},{"dbghelp.dll","SymAddSymbolW",6,10,0,0x30},
         {"dbghelp.dll","SymDeleteSymbol",5,10,0,0x10},{"dbghelp.dll","SymDeleteSymbolW",5,10,0,0x10},
         {"dbghelp.dll","SymLoadModule",6,0,0,0x30},{"dbghelp.dll","SymLoadModule64",6,16,0,0x20},
-        {"dbghelp.dll","SymGetSymFromAddr",4},{"dbghelp.dll","SymGetSymFromAddr64",4,2}
+        {"dbghelp.dll","SymGetSymFromAddr",4},{"dbghelp.dll","SymGetSymFromAddr64",4,2},
+        {"dbghelp.dll","EnumerateLoadedModules",3},{"dbghelp.dll","EnumerateLoadedModules64",3},{"dbghelp.dll","EnumerateLoadedModulesW64",3},
+        {"dbghelp.dll","EnumerateLoadedModulesEx",3},{"dbghelp.dll","EnumerateLoadedModulesExW",3}
     };return table;
 }
 void WindowsServices::refresh_symbol_modules(SymbolSession& session,const GuestMemory& memory){
@@ -111,6 +113,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_symbols(GuestState&
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W') || name.ends_with("W64");
     const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16(read_ansi(memory,pointer,32768));};
     std::uint64_t result=0;const auto fail=[&](std::uint32_t error){last_error_=error;};
+    if(name.starts_with("EnumerateLoadedModules")){
+        // 不需 SymInitialize：依載入器清單（主程式、外部 DLL、內建系統 DLL）回呼完整路徑、基底與大小，回呼回 FALSE 即停止。
+        const bool unicode=name.ends_with("W64") || name.ends_with("ExW"),legacy=name=="EnumerateLoadedModules";
+        if(!arg(1)){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+        std::vector<const RuntimeImage*> images;if(runtime_.image.base)images.push_back(&runtime_.image);
+        for(const auto& [base,module]:runtime_.loaded_modules)images.push_back(&module.image);
+        for(const auto& [base,image]:runtime_.builtin_images)images.push_back(&image);
+        std::vector<GuestCallback> calls;
+        for(const auto* image:images){
+            auto cached=runtime_.loaded_module_names.find(image->path);
+            if(cached==runtime_.loaded_module_names.end()){
+                const auto ansi=utf16_to_utf8(image->path);std::vector<std::uint8_t> narrow(ansi.begin(),ansi.end());narrow.push_back(0);
+                std::vector<std::uint8_t> wide_text;for(const auto c:image->path){wide_text.push_back(static_cast<std::uint8_t>(c));wide_text.push_back(static_cast<std::uint8_t>(c>>8));}wide_text.insert(wide_text.end(),{0,0});
+                cached=runtime_.loaded_module_names.emplace(image->path,std::array<std::uint64_t,2>{runtime_allocate(memory,narrow),runtime_allocate(memory,wide_text)}).first;
+            }
+            const auto text_address=cached->second[unicode?1:0];
+            if(x86_ && !legacy)calls.push_back({arg(1),{text_address,image->base&UINT32_MAX,image->base>>32,image->size,arg(2)}});
+            else calls.push_back({arg(1),{text_address,image->base,image->size,arg(2)}});
+        }
+        if(calls.empty()){arg.return_to(state,1);return std::nullopt;}
+        start_callbacks(state,memory,std::move(calls),Continuation::ReturnUntilFalse,1);return std::nullopt;
+    }
     const auto found=runtime_.symbol_sessions.find(arg(0));
     if(found==runtime_.symbol_sessions.end())fail(6);
     else try{

@@ -40,16 +40,7 @@ std::pair<std::u16string,std::uint32_t> WindowsServices::registry_security_handl
     const auto root=static_cast<std::uint32_t>(value);auto& registry=runtime_.registry;
     if((value==root || value==(UINT64_C(0xffffffff00000000)|root)) && root>=0x80000000U && root<=0x80000006U && root!=0x80000004U){
         initialize_tokens();std::u16string path(1,static_cast<char16_t>(root&255));
-        if(root==0x80000001U){
-            const bool cache=!runtime_.registry_cache_disabled && !runtime_.registry_user_cache_disabled;
-            const auto found=runtime_.registry_predefined_cache.find(root);
-            if(cache && found!=runtime_.registry_predefined_cache.end())path=found->second;
-            else if(runtime_.token_objects.at(effective_token_id()).user.sid!=runtime_.token_objects.at(1).user.sid){
-                path=std::u16string(1,3)+u"\\"+fold(utf8_to_utf16(token_user_sid_string(effective_token_id())));
-                if(!registry.keys.contains(path))path=std::u16string(1,3)+u"\\.default";
-            }
-            if(cache)runtime_.registry_predefined_cache[root]=path;
-        }
+        if(root==0x80000001U)path=registry_current_user_path(true);
         registry.keys.try_emplace(path);const auto granted=registry_security_access(path,required);return {path,granted};
     }
     const auto found=registry.handles.find(value);if(found==registry.handles.end())throw SecurityDescriptorError{6};

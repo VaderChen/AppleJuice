@@ -17,9 +17,9 @@ if((X64ARM_SANITIZERS AND NOT AppleJuiceKernel_SANITIZERS) OR
    (NOT X64ARM_SANITIZERS AND AppleJuiceKernel_SANITIZERS))
   message(FATAL_ERROR "AppleJuice 與 AppleJuiceKernel 的 sanitizer 設定必須相同")
 endif()
-option(X64ARM_LLVM_REGIONS "使用 SDK 中的 LLVM 區域編譯器" "${AppleJuiceKernel_LLVM_REGIONS}")
-if(X64ARM_LLVM_REGIONS AND NOT AppleJuiceKernel_LLVM_REGIONS)
-  message(FATAL_ERROR "此 SDK 不包含所要求的可選功能，請選擇相容 SDK 或關閉 X64ARM_LLVM_REGIONS")
+option(X64ARM_LLVM_REGIONS "已退役的 LLVM 執行後端；啟用時明確拒絕" OFF)
+if(X64ARM_LLVM_REGIONS OR AppleJuiceKernel_LLVM_REGIONS)
+  message(FATAL_ERROR "舊 JIT／LLVM 執行後端已封閉；請使用 resident AOT 靜態 SDK")
 endif()
 # Windows 層的 ICU／OpenSSL 也使用相同目標架構判斷。
 set(X64ARM_TARGET_ARM64 OFF)

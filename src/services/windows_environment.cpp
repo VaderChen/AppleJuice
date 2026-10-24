@@ -110,7 +110,8 @@ std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
         {"kernel32.dll","GetNumaHighestNodeNumber",1},{"kernel32.dll","GetPhysicallyInstalledSystemMemory",1},
         {"kernel32.dll","GetNumaNodeProcessorMask",2},{"kernel32.dll","GetNumaNodeProcessorMaskEx",2},
         {"kernel32.dll","GetNumaAvailableMemoryNode",2},{"kernel32.dll","GetNumaAvailableMemoryNodeEx",2},
-        {"kernel32.dll","GetSystemCpuSetInformation",5},{"kernel32.dll","GetLogicalProcessorInformationEx",3},{"kernel32.dll","GetLogicalProcessorInformation",2},
+        {"kernel32.dll","GetSystemCpuSetInformation",5},{"kernel32.dll","GetProcessDefaultCpuSets",4},{"kernel32.dll","SetProcessDefaultCpuSets",3},
+        {"kernel32.dll","GetThreadSelectedCpuSets",4},{"kernel32.dll","SetThreadSelectedCpuSets",3},{"kernel32.dll","GetLogicalProcessorInformationEx",3},{"kernel32.dll","GetLogicalProcessorInformation",2},
         {"kernel32.dll","GetActiveProcessorGroupCount",0},{"kernel32.dll","GetMaximumProcessorGroupCount",0},
         {"kernel32.dll","GetActiveProcessorCount",1},{"kernel32.dll","GetMaximumProcessorCount",1},
         {"kernel32.dll","GetCurrentProcessorNumberEx",1},{"kernel32.dll","GetCurrentProcessorNumber",0},
@@ -131,7 +132,7 @@ std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
         {"kernel32.dll","PowerCreateRequest",1},{"kernel32.dll","PowerSetRequest",2},{"kernel32.dll","PowerClearRequest",2},
         {"advapi32.dll","EventRegister",4},{"advapi32.dll","EventUnregister",1,1},
         {"advapi32.dll","EventEnabled",2,1},{"advapi32.dll","EventProviderEnabled",3,5},
-        {"advapi32.dll","EventWrite",4,1},{"advapi32.dll","EventWriteTransfer",6,1},
+        {"advapi32.dll","EventWrite",4,1},{"advapi32.dll","EventWriteTransfer",6,1},{"advapi32.dll","EventWriteEx",8,1},
         {"advapi32.dll","EventSetInformation",4,1},
         {"advapi32.dll","RegisterTraceGuidsA",8},{"advapi32.dll","RegisterTraceGuidsW",8},
         {"advapi32.dll","UnregisterTraceGuids",1,1},
@@ -204,7 +205,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
 #include "policy_handlers.inc"
 #include "appcontainer_handlers.inc"
     const bool wide=symbol.back()=='W' || symbol.starts_with("_w");
-    if(symbol=="EventRegister" || symbol=="EventUnregister" || symbol=="EventEnabled" || symbol=="EventProviderEnabled" || symbol=="EventWrite" || symbol=="EventWriteTransfer" ||
+    if(symbol=="EventRegister" || symbol=="EventUnregister" || symbol=="EventEnabled" || symbol=="EventProviderEnabled" || symbol=="EventWrite" || symbol=="EventWriteTransfer" || symbol=="EventWriteEx" ||
        symbol=="RegisterTraceGuidsA" || symbol=="RegisterTraceGuidsW" || symbol=="UnregisterTraceGuids" || symbol=="GetTraceEnableFlags" || symbol=="GetTraceEnableLevel" || symbol=="GetTraceLoggerHandle" || symbol=="TraceEvent" || symbol=="TraceMessage" || symbol=="TraceMessageVa")return invoke_etw_provider(state,memory,service);
     const auto text=[&](unsigned i){return wide?read_utf16(memory,GuestAddress{arg(i)}):utf8_to_utf16(read_ansi(memory,arg(i),32767));};
     const auto encode=[&](std::u16string_view value) {
@@ -495,6 +496,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
             else if(!runtime_.network.external_io)last_error_=50;
             else {const auto snapshot=native_system_performance();if(snapshot.error)last_error_=snapshot.error;
                 else {memory.store(GuestAddress{arg(1)},64,snapshot.pages[4]*snapshot.pages[9]);result=1;}}
+        }
+    }
+    else if(symbol=="GetProcessDefaultCpuSets" || symbol=="SetProcessDefaultCpuSets" || symbol=="GetThreadSelectedCpuSets" || symbol=="SetThreadSelectedCpuSets") {
+        const bool for_thread=symbol.find("Thread")!=std::string_view::npos,setting=symbol.starts_with("Set");
+        std::vector<std::uint32_t>* selected=nullptr;
+        if(for_thread){if(const auto id=thread_id(arg(0)))selected=&thread_cpu_sets_[id];else last_error_=6;}
+        else if(current_process_handle(arg(0)))selected=&process_cpu_sets_;else last_error_=6;
+        if(selected){
+            const auto count=static_cast<std::uint32_t>(arg(2));
+            if(setting){
+                // 0 個 ID 清除選取；每個 ID 都必須是 GetSystemCpuSetInformation 回報的 CPU set。
+                if(count && !arg(1))last_error_=87;
+                else if(count>4096)last_error_=87;
+                else{
+                    std::vector<std::uint32_t> ids(count);bool valid=true;
+                    for(unsigned i=0;i<count;++i){ids[i]=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)+i*4},32));valid=valid && ids[i]>=0x100 && ids[i]<0x100+runtime_.processor_count;}
+                    if(!valid)last_error_=87;else {*selected=std::move(ids);result=1;}
+                }
+            }else if(!arg(3))last_error_=87;
+            else{
+                const auto required=static_cast<std::uint32_t>(selected->size());memory.check(GuestAddress{arg(3)},4,Access::Write);memory.store(GuestAddress{arg(3)},32,required);
+                if(count<required || (required && !arg(1)))last_error_=122;
+                else{for(unsigned i=0;i<required;++i)memory.store(GuestAddress{arg(1)+i*4},32,(*selected)[i]);result=1;}
+            }
         }
     }
     else if(symbol=="GetSystemCpuSetInformation") {

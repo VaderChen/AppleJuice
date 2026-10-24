@@ -22,7 +22,6 @@ void* jit_checked_memory(GuestMemory* memory, std::uint64_t address, unsigned si
 void* jit_checked_memory_page(GuestMemory* memory, std::uint64_t address, unsigned size, unsigned permissions) noexcept;
 unsigned host_physical_processors();
 std::uint64_t host_physical_memory();
-class JitEngine;
 class Arm64CodeDescription;
 class AotModule;
 namespace resident_abi {struct DispatchEntry;}
@@ -46,7 +45,6 @@ public:
     std::uint32_t invoke() const;
     std::size_t capacity() const noexcept { return capacity_; }
 private:
-    friend class JitEngine;
     friend class AotEngine;
     friend class NativeMemoryScope;
     friend struct JitMemoryTestAccess;

@@ -12,6 +12,8 @@ std::span<const WindowsServiceDescriptor> version_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"version.dll","GetFileVersionInfoSizeA",2},{"version.dll","GetFileVersionInfoSizeW",2},
         {"version.dll","GetFileVersionInfoA",4},{"version.dll","GetFileVersionInfoW",4},
+        {"version.dll","GetFileVersionInfoSizeExA",3},{"version.dll","GetFileVersionInfoSizeExW",3},
+        {"version.dll","GetFileVersionInfoExA",5},{"version.dll","GetFileVersionInfoExW",5},
         {"version.dll","VerQueryValueA",4},{"version.dll","VerQueryValueW",4}
     };return table;
 }
@@ -119,7 +121,11 @@ const VersionNode* query(const VersionNode& root,std::u16string_view path){
 }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_version(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    const WindowsCall arg(state,memory,service);const bool wide=service.symbol.ends_with('W');std::uint64_t result=0;
+    const WindowsCall call(state,memory,service);const bool wide=service.symbol.ends_with('W');std::uint64_t result=0;
+    // *Ex 版本多一個前置 dwFlags（LOCALISED 1、NEUTRAL 2、PREFETCHED 4）；版本資源只有一份語系無關的原始資料，其餘參數與舊版相同。
+    const bool extended=service.symbol.starts_with("GetFileVersionInfo") && service.symbol.find("Ex")!=std::string_view::npos;
+    const auto arg=[&](unsigned index){return call(index+(extended?1U:0U));};
+    if(extended && (call(0)&~UINT64_C(7))){last_error_=87;call.return_to(state,0);return std::nullopt;}
     const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer));};
     try {
         if(service.symbol.starts_with("VerQueryValue")){
@@ -177,6 +183,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_version(GuestState& state,G
     }catch(const VersionFailure& failure){last_error_=failure.error;if(service.symbol.starts_with("VerQueryValue") && arg(3))memory.store(GuestAddress{arg(3)},32,0);}
     catch(const std::invalid_argument&){last_error_=1113;if(service.symbol.starts_with("VerQueryValue") && arg(3))memory.store(GuestAddress{arg(3)},32,0);}
     catch(const std::bad_alloc&){last_error_=8;}
-    arg.return_to(state,result);return std::nullopt;
+    call.return_to(state,result);return std::nullopt;
 }
 }

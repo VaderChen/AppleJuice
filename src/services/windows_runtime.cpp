@@ -7,6 +7,7 @@
 #include "service_descriptor_index.hpp"
 #include "service_descriptor_catalog.hpp"
 #include "windows_crt_character.hpp"
+#include "windows_locale_data.hpp"
 #include "crt_os_error.hpp"
 #include "x64arm/process_debugger.hpp"
 #include "x64arm/windows_raw_input.hpp"
@@ -75,7 +76,13 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"crt", "strcat", 2}, {"crt", "strncat", 3}, {"crt", "wcscat", 2}, {"crt", "wcsncat", 3},
         {"crt", "_get_stream_buffer_pointers", 4}, {"crt", "__acrt_iob_func", 1}, {"crt", "__iob_func", 0}, {"crt", "fflush", 1}, {"crt", "setvbuf", 4}, {"crt", "setbuf", 2}, {"crt", "_getmaxstdio", 0}, {"crt", "_setmaxstdio", 1}, {"crt", "_dup2", 2}, {"crt", "_locking", 3},
         {"crt", "puts", 1}, {"crt", "putchar", 1}, {"crt", "printf", 1}, {"crt", "fprintf", 2},
-        {"crt", "vprintf", 2}, {"crt", "wprintf", 1}, {"crt", "vwprintf", 2}, {"crt", "fwprintf", 2}, {"crt", "vfwprintf", 3}, {"crt", "vfprintf", 3}, {"crt", "__stdio_common_vfprintf", 5,1}, {"crt", "__stdio_common_vfwprintf", 5,1}, {"crt", "snprintf", 3},
+        {"crt", "vprintf", 2}, {"crt", "wprintf", 1}, {"crt", "vwprintf", 2}, {"crt", "fwprintf", 2}, {"crt", "vfwprintf", 3}, {"crt", "vfprintf", 3}, {"crt", "__stdio_common_vfprintf", 5,1}, {"crt", "__stdio_common_vfprintf_s", 5,1}, {"crt", "__stdio_common_vfwprintf_s", 5,1}, {"crt", "__stdio_common_vfwprintf", 5,1}, {"crt", "snprintf", 3},
+        {"crt","__conio_common_vcprintf",4,1},{"crt","__conio_common_vcprintf_s",4,1},{"crt","__conio_common_vcprintf_p",4,1},
+        {"crt","__conio_common_vcwprintf",4,1},{"crt","__conio_common_vcwprintf_s",4,1},{"crt","__conio_common_vcwprintf_p",4,1},
+        {"crt","_cprintf",1},{"crt","_cprintf_l",2},{"crt","_cprintf_s",1},{"crt","_cprintf_s_l",2},{"crt","_cprintf_p",1},{"crt","_cprintf_p_l",2},
+        {"crt","_cwprintf",1},{"crt","_cwprintf_l",2},{"crt","_cwprintf_s",1},{"crt","_cwprintf_s_l",2},{"crt","_cwprintf_p",1},{"crt","_cwprintf_p_l",2},
+        {"crt","_vcprintf",2},{"crt","_vcprintf_l",3},{"crt","_vcprintf_s",2},{"crt","_vcprintf_s_l",3},{"crt","_vcprintf_p",2},{"crt","_vcprintf_p_l",3},
+        {"crt","_vcwprintf",2},{"crt","_vcwprintf_l",3},{"crt","_vcwprintf_s",2},{"crt","_vcwprintf_s_l",3},{"crt","_vcwprintf_p",2},{"crt","_vcwprintf_p_l",3},
         {"kernel32.dll", "DebugBreak", 0}, {"kernel32.dll", "UnhandledExceptionFilter", 1}, {"kernel32.dll", "RtlUnwind", 4}, {"ntdll.dll", "RtlUnwind", 4},
         {"kernel32.dll", "RaiseFailFastException", 3},
         {"kernel32.dll", "RtlAddFunctionTable", 3,1U<<2}, {"ntdll.dll", "RtlAddFunctionTable", 3,1U<<2},
@@ -85,6 +92,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"kernel32.dll", "RaiseException", 4}, {"kernel32.dll", "AddVectoredExceptionHandler", 2}, {"kernel32.dll", "RemoveVectoredExceptionHandler", 1},
         {"kernel32.dll", "AddVectoredContinueHandler", 2}, {"kernel32.dll", "RemoveVectoredContinueHandler", 1},
         {"kernel32.dll", "RtlPcToFileHeader", 2}, {"ntdll.dll", "RtlPcToFileHeader", 2}, {"kernel32.dll", "RtlCaptureContext", 1}, {"kernel32.dll", "RtlLookupFunctionEntry", 3}, {"kernel32.dll", "RtlVirtualUnwind", 8}, {"kernel32.dll", "RtlUnwindEx", 6},
+        {"crt", "_local_unwind", 2},
         {"user32.dll", "RegisterClassW", 1}, {"user32.dll", "RegisterClassExW", 1}, {"user32.dll", "RegisterClassA", 1}, {"user32.dll", "RegisterClassExA", 1},
         {"user32.dll", "CreateWindowExW", 12}, {"user32.dll", "CreateWindowExA", 12}, {"user32.dll", "DefWindowProcW", 4}, {"user32.dll", "DefWindowProcA", 4},
         {"user32.dll", "ShowWindow", 2}, {"user32.dll", "UpdateWindow", 1}, {"user32.dll", "DestroyWindow", 1},
@@ -171,6 +179,8 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
             {ole_service_descriptors(), true},
             {ole_stream_service_descriptors(), true},
             {storage_service_descriptors(), true},
+            {msi_service_descriptors(), true},
+            {esent_service_descriptors(), true},
             {safearray_service_descriptors(), true},
             {resource_service_descriptors(), true},
             {security_service_descriptors(), true},
@@ -358,18 +368,24 @@ std::vector<std::uint8_t> bytes_of(std::string_view value) {
     std::vector<std::uint8_t> bytes(value.begin(), value.end()); bytes.push_back(0); return bytes;
 }
 bool crt_format_symbol(std::string_view symbol) noexcept {
-    return symbol=="printf" || symbol=="vprintf" || symbol=="wprintf" || symbol=="vwprintf" || symbol=="fwprintf" || symbol=="vfwprintf" || symbol=="fprintf" || symbol=="vfprintf" || symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf" || symbol=="snprintf" || symbol=="vsnprintf" || symbol.starts_with("__stdio_common_vs") || symbol=="sprintf" || symbol=="vsprintf" || symbol=="sprintf_s" || symbol=="vsprintf_s" || symbol=="swprintf_s" || symbol=="vswprintf_s" || symbol=="_snprintf" || symbol=="_vsnprintf" || symbol=="_snwprintf" || symbol=="_vsnwprintf" || symbol=="_snprintf_s" || symbol=="_vsnprintf_s" || symbol=="_snwprintf_s" || symbol=="_vsnwprintf_s" || symbol=="_scprintf" || symbol=="_vscprintf" || symbol=="_scwprintf" || symbol=="_vscwprintf";
+    if(symbol.starts_with("__conio_common_vc") || symbol.starts_with("_cprintf") || symbol.starts_with("_cwprintf") || symbol.starts_with("_vcprintf") || symbol.starts_with("_vcwprintf"))return true;
+    return symbol=="printf" || symbol=="vprintf" || symbol=="wprintf" || symbol=="vwprintf" || symbol=="fwprintf" || symbol=="vfwprintf" || symbol=="fprintf" || symbol=="vfprintf" || symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf" || symbol=="__stdio_common_vfprintf_s" || symbol=="__stdio_common_vfwprintf_s" || symbol=="snprintf" || symbol=="vsnprintf" || symbol.starts_with("__stdio_common_vs") || symbol=="sprintf" || symbol=="vsprintf" || symbol=="sprintf_s" || symbol=="vsprintf_s" || symbol=="swprintf_s" || symbol=="vswprintf_s" || symbol=="_snprintf" || symbol=="_vsnprintf" || symbol=="_snwprintf" || symbol=="_vsnwprintf" || symbol=="_snprintf_s" || symbol=="_vsnprintf_s" || symbol=="_snwprintf_s" || symbol=="_vsnwprintf_s" || symbol=="_scprintf" || symbol=="_vscprintf" || symbol=="_scwprintf" || symbol=="_vscwprintf";
 }
 struct CrtFormatLayout {
     bool common{},common_stream{},common_buffer{},stream{},standard_output{},counting{};
     bool wide{},secure{},limited{},unbounded{},va{},underscore{};
     unsigned format_index{};
+    bool console{},positional{},explicit_locale{};
 };
 CrtFormatLayout parse_crt_format_layout(std::string_view symbol){
     CrtFormatLayout result;
-    result.common=symbol.starts_with("__stdio_common_");
-    result.common_stream=symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf";
-    result.common_buffer=result.common && !result.common_stream;
+    result.console=symbol.starts_with("__conio_common_") || symbol.starts_with("_cprintf") || symbol.starts_with("_cwprintf") || symbol.starts_with("_vcprintf") || symbol.starts_with("_vcwprintf");
+    result.common=symbol.starts_with("__stdio_common_") || symbol.starts_with("__conio_common_");
+    result.explicit_locale=symbol.ends_with("_l");if(result.explicit_locale)symbol.remove_suffix(2);
+    result.positional=symbol.ends_with("_p");
+    // *_s 串流版本只多格式驗證（無效格式走 invalid parameter），輸出語義與一般串流版本相同。
+    result.common_stream=symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf" || symbol=="__stdio_common_vfprintf_s" || symbol=="__stdio_common_vfwprintf_s";
+    result.common_buffer=result.common && !result.common_stream && !result.console;
     result.standard_output=symbol=="printf" || symbol=="vprintf" || symbol=="wprintf" || symbol=="vwprintf";
     result.stream=result.standard_output || symbol=="fwprintf" || symbol=="vfwprintf" || symbol=="fprintf" || symbol=="vfprintf" || result.common_stream;
     result.counting=symbol=="_scprintf" || symbol=="_vscprintf" || symbol=="_scwprintf" || symbol=="_vscwprintf";
@@ -378,7 +394,7 @@ CrtFormatLayout parse_crt_format_layout(std::string_view symbol){
     result.unbounded=symbol=="sprintf" || symbol=="vsprintf";
     result.va=result.common || symbol.starts_with('v') || symbol.starts_with("_v");
     result.underscore=symbol.starts_with('_');
-    result.format_index=result.common_buffer?(result.limited?4U:3U):result.common_stream?2:
+    result.format_index=result.console?(result.common?1U:0U):result.common_buffer?(result.limited?4U:3U):result.common_stream?2:
         result.standard_output || result.counting?0:result.stream || result.unbounded?1:result.limited?3:2;
     return result;
 }
@@ -401,23 +417,32 @@ CrtFormatLayout crt_format_layout(const WindowsServiceDescriptor& service){
 }
 struct FormatError {unsigned code;};
 struct Formatted {std::u16string text;unsigned encoding_error{};bool failed{};};
-Formatted format(const GuestMemory& memory,std::u16string_view specification,bool wide,bool wide_strings,unsigned pointer_size,bool three_digit_exponents,const std::function<std::uint64_t(unsigned)>& next){
+enum class FormatArgumentKind {Integer,Floating,Pointer};
+Formatted format(const GuestMemory& memory,std::u16string_view specification,bool wide,bool wide_strings,unsigned pointer_size,bool three_digit_exponents,
+                 bool positional,bool inspect,const CrtLocaleCategory& locale,std::u16string_view decimal_symbol,
+                 const std::function<std::uint64_t(unsigned,unsigned,FormatArgumentKind)>& next){
     Formatted result;auto& output=result.text;
     for(std::size_t at=0;at<specification.size();){
         if(specification[at]!=u'%'){output.push_back(specification[at++]);continue;}
         ++at;if(at<specification.size() && specification[at]==u'%'){output.push_back(u'%');++at;continue;}
+        const auto decimal=[&]{unsigned value=0;while(at<specification.size() && specification[at]>=u'0' && specification[at]<=u'9'){if(value>6553)throw FormatError{22};value=value*10+static_cast<unsigned>(specification[at++]-u'0');}return value;};
+        const auto position=[&]{
+            if(!positional)return 0U;const auto saved=at;const auto value=decimal();
+            if(at>saved && at<specification.size() && specification[at]==u'$'){++at;if(!value || value>100)throw FormatError{22};return value;}
+            at=saved;return 0U;
+        };
+        const auto argument=position();
         std::string flags;
         while(at<specification.size() && std::u16string_view(u"-+ #0").find(specification[at])!=std::u16string_view::npos)flags+=static_cast<char>(specification[at++]);
-        const auto decimal=[&]{unsigned value=0;while(at<specification.size() && specification[at]>=u'0' && specification[at]<=u'9'){if(value>6553)throw FormatError{22};value=value*10+static_cast<unsigned>(specification[at++]-u'0');}return value;};
         int width=0,precision=-1;
-        if(at<specification.size() && specification[at]==u'*'){++at;width=static_cast<std::int32_t>(next(4));}else width=static_cast<int>(decimal());
-        if(at<specification.size() && specification[at]==u'.'){++at;if(at<specification.size() && specification[at]==u'*'){++at;precision=static_cast<std::int32_t>(next(4));}else precision=static_cast<int>(decimal());}
+        if(at<specification.size() && specification[at]==u'*'){++at;width=static_cast<std::int32_t>(next(4,position(),FormatArgumentKind::Integer));}else width=static_cast<int>(decimal());
+        if(at<specification.size() && specification[at]==u'.'){++at;if(at<specification.size() && specification[at]==u'*'){++at;precision=static_cast<std::int32_t>(next(4,position(),FormatArgumentKind::Integer));}else precision=static_cast<int>(decimal());}
         if(width<-65536 || width>65536 || precision>65536)throw FormatError{22};if(width<0){flags+='-';width=-width;}
         std::u16string_view length;
         const auto length_at=at;
         if(specification.substr(at,3)==u"I64" || specification.substr(at,3)==u"I32")at+=3;
         else if(specification.substr(at,2)==u"ll" || specification.substr(at,2)==u"hh")at+=2;
-        else if(at<specification.size() && std::u16string_view(u"hlztjLIw").find(specification[at])!=std::u16string_view::npos)++at;
+        else if(at<specification.size() && std::u16string_view(u"hlztjLIwT").find(specification[at])!=std::u16string_view::npos)++at;
         length=specification.substr(length_at,at-length_at);if(at==specification.size())throw FormatError{22};const auto conversion=specification[at++];
         const bool integer=std::u16string_view(u"diouxX").find(conversion)!=std::u16string_view::npos;
         const bool floating=std::u16string_view(u"fFeEgGaA").find(conversion)!=std::u16string_view::npos;
@@ -427,13 +452,52 @@ Formatted format(const GuestMemory& memory,std::u16string_view specification,boo
         const unsigned integer_bits=length==u"ll" || length==u"I64" || length==u"j"?64:pointer_integer?pointer_size*8:length==u"h"?16:length==u"hh"?8:32;
         if(integer && (length==u"L" || length==u"w"))throw FormatError{22};
         if(floating && !length.empty() && length!=u"l" && length!=u"L")throw FormatError{22};
-        if((string || character) && !length.empty() && length!=u"h" && length!=u"l" && length!=u"w")throw FormatError{22};
-        const unsigned size=floating?8:integer?std::max(4U,integer_bits/8):character?4:pointer_size;const auto value=next(size);
+        if((string || character) && !length.empty() && length!=u"h" && length!=u"l" && length!=u"w" && length!=u"T")throw FormatError{22};
+        // UCRT 的 T 修飾子（%Ts、%Tc）取函式本身的字元寬度，不受舊式寬字串選項影響；其餘轉換不接受。
+        if(length==u"T" && !string && !character)throw FormatError{22};
+        const unsigned size=floating?8:integer?std::max(4U,integer_bits/8):character?4:pointer_size;
+        const auto value=next(size,argument,floating?FormatArgumentKind::Floating:integer || character?FormatArgumentKind::Integer:FormatArgumentKind::Pointer);
+        if(inspect)continue;
         std::u16string rendered;
         if(string || character){
-            const bool opposite=conversion==u'S' || conversion==u'C';const bool source_wide=length==u"l" || length==u"w" || (length.empty() && (opposite?!wide_strings:wide_strings));
-            if(character){const auto c=static_cast<char16_t>(value&(source_wide?65535:255));if(!wide && c>255){result.encoding_error=42;continue;}rendered.push_back(c);}
+            const bool opposite=conversion==u'S' || conversion==u'C';const bool source_wide=length==u"T"?wide:length==u"l" || length==u"w" || (length.empty() && (opposite?!wide_strings:wide_strings));
+            if(character){
+                const auto c=static_cast<char16_t>(value&(source_wide?65535:255));
+                if(source_wide==wide)rendered.push_back(c);
+                else if(source_wide){const auto bytes=windows_crt_encode({&c,1},locale.codepage);if(!bytes){result.encoding_error=42;continue;}for(const auto byte:*bytes)rendered+=byte;}
+                else {const std::array<std::uint8_t,1> bytes{static_cast<std::uint8_t>(c)};const auto decoded=windows_crt_decode(bytes,locale.codepage);
+                    if(decoded.status!=CrtDecodedCharacter::Status::Complete || decoded.character>65535){result.encoding_error=42;continue;}rendered+=static_cast<char16_t>(decoded.character);}
+            }
             else if(!value)rendered=u"(null)";
+            else if(source_wide!=wide){
+                // 跨寬度轉換以完整字元為單位，precision 計算輸出單位；不可切斷 DBCS／UTF-8 或 surrogate pair。
+                std::uint64_t offset=0;const auto limit=precision<0?UINT64_C(1048576):static_cast<std::uint64_t>(precision);
+                while(rendered.size()<limit){
+                    std::u16string converted;
+                    if(source_wide){
+                        auto c=static_cast<char16_t>(memory.load(GuestAddress{value+offset},16));if(!c)break;offset+=2;
+                        std::u16string units(1,c);
+                        if(c>=0xd800 && c<=0xdbff){units+=static_cast<char16_t>(memory.load(GuestAddress{value+offset},16));offset+=2;}
+                        const auto bytes=windows_crt_encode(units,locale.codepage);
+                        if(!bytes){result.encoding_error=42;result.failed=true;return result;}for(const auto byte:*bytes)converted+=byte;
+                    }else {
+                        std::array<std::uint8_t,4> bytes{};CrtDecodedCharacter decoded;bool end=false;
+                        for(std::size_t n=0;n<std::min<std::size_t>(bytes.size(),locale.maximum_character_bytes);++n){
+                            bytes[n]=static_cast<std::uint8_t>(memory.load(GuestAddress{value+offset+n},8));
+                            if(!bytes[n] && !n){end=true;break;}
+                            decoded=windows_crt_decode(std::span(bytes).first(n+1),locale.codepage);
+                            if(decoded.status!=CrtDecodedCharacter::Status::Partial || !bytes[n])break;
+                        }
+                        if(end)break;
+                        if(decoded.status!=CrtDecodedCharacter::Status::Complete){result.encoding_error=42;result.failed=true;return result;}
+                        offset+=decoded.bytes;
+                        if(decoded.character<=65535)converted+=static_cast<char16_t>(decoded.character);
+                        else {const auto cp=decoded.character-0x10000;converted+=static_cast<char16_t>(0xd800+(cp>>10));converted+=static_cast<char16_t>(0xdc00+(cp&1023));}
+                    }
+                    if(converted.size()>limit-rendered.size())break;rendered+=converted;
+                    if(offset>UINT64_C(4194304))throw HostCallFault("CRT 轉碼字串超過上限");
+                }
+            }
             else {
                 const auto limit=precision<0?UINT64_C(1048576):static_cast<std::uint64_t>(precision);const unsigned unit=source_wide?2:1;
                 static const bool batched=[] {const auto* setting=std::getenv("X64ARM_CRT_FORMAT_PROVIDER");return !setting || std::string_view(setting)!="0";}();
@@ -487,6 +551,11 @@ Formatted format(const GuestMemory& memory,std::u16string_view specification,boo
             else {pattern="%"+flags+std::to_string(std::max(width,static_cast<int>(pointer_size*2)))+"."+std::to_string(pointer_size*2)+"llX";number=render(static_cast<unsigned long long>(value));}
             if(floating && three_digit_exponents){const auto exponent=number.find_first_of("eE");if(exponent!=number.npos && exponent+4==number.size() && (number[exponent+1]=='+' || number[exponent+1]=='-'))number.insert(exponent+2,1,'0');}
             rendered.assign(number.begin(),number.end());
+            if(floating && decimal_symbol!=u".")if(const auto point=rendered.find(u'.');point!=rendered.npos){
+                std::u16string replacement;if(wide)replacement=decimal_symbol;
+                else {const auto bytes=windows_crt_encode(decimal_symbol,locale.codepage);if(!bytes){result.encoding_error=42;result.failed=true;return result;}for(const auto byte:*bytes)replacement+=byte;}
+                rendered.replace(point,1,replacement);
+            }
         }
         if(output.size()+rendered.size()>WindowsServices::output_limit/(wide?2U:1U))throw HostCallFault("CRT 格式輸出超過上限");output+=rendered;
     }
@@ -544,6 +613,8 @@ void WindowsServices::initialize_runtime(GuestMemory& memory, std::u16string_vie
     runtime_.errno_cell = runtime_base_.value + 40;
     runtime_.wargv_cell = runtime_base_.value + 56;
     runtime_.wenviron_cell = runtime_base_.value + 64;
+    // 舊 MSVCRT 的資料匯出在第一個 locale 呼叫前即須可由 IAT 讀取。
+    memory.store(GuestAddress{runtime_base_.value+128},32,1);
     initialize_crt_lowio(memory);
     runtime_.command_ansi = runtime_allocate(memory, bytes_of(utf16_to_utf8(command_line)));
     std::vector<std::uint64_t> pointers;
@@ -1328,6 +1399,8 @@ void WindowsServices::discard_callbacks(std::size_t depth, GuestState& state, Gu
         if(frame.continuation==Continuation::MdiMoveOperation)discard_mdi_move(memory,state,frame.value);
         if(frame.continuation==Continuation::ThemeTextOperation)discard_theme_text(frame.value);
         if(frame.continuation==Continuation::StorageOperation)discard_storage(state,memory,frame.value);
+        if(frame.continuation==Continuation::MsiOperation)discard_msi(state,memory,frame.value);
+        if(frame.continuation==Continuation::EsentOperation)discard_esent(state,memory,frame.value);
         if(frame.continuation==Continuation::StorageCopyOperation)discard_storage_copy(state,memory,frame.value);
         if(frame.continuation==Continuation::DWriteOperation)discard_dwrite(frame.value,memory,state);
         if(frame.continuation==Continuation::StackWalkOperation)discard_stack_walk(frame.value,memory,state);
@@ -1350,7 +1423,7 @@ void WindowsServices::discard_callbacks(std::size_t depth, GuestState& state, Gu
         if(frame.continuation==Continuation::CrtLongjmp)runtime_.crt_jump_operations.erase(frame.value);
         if(frame.continuation==Continuation::MetafileEnumeration)finish_metafile_enumeration(frame.value);
         if(frame.continuation==Continuation::SafeArrayOperation){const auto locks=memory.load(GuestAddress{frame.value+8},32);if(locks)memory.store(GuestAddress{frame.value+8},32,locks-1);}
-        if(frame.continuation==Continuation::CrtAssertion || frame.continuation==Continuation::CrtFatalDialog || frame.continuation==Continuation::CertificateDecodeAllocation || frame.continuation==Continuation::AccessibleOperation || frame.continuation==Continuation::OleStreamCopy || frame.continuation==Continuation::GuiIntegerText || frame.continuation==Continuation::ReturnCallbackFreeHeap || frame.continuation==Continuation::GuiBusyResult || frame.continuation==Continuation::ReturnZeroFreeHeap || frame.continuation==Continuation::MetafileEnumeration || frame.continuation==Continuation::LocaleEnumeration || frame.continuation==Continuation::ResourceEnumeration)(void)free_heap(memory,frame.value,state);
+        if(frame.continuation==Continuation::CrtAssertion || frame.continuation==Continuation::CrtFatalDialog || frame.continuation==Continuation::CertificateDecodeAllocation || frame.continuation==Continuation::AccessibleOperation || frame.continuation==Continuation::OleStreamCopy || frame.continuation==Continuation::GuiIntegerText || frame.continuation==Continuation::ReturnCallbackFreeHeap || frame.continuation==Continuation::GuiBusyResult || frame.continuation==Continuation::ReturnZeroFreeHeap || frame.continuation==Continuation::MetafileEnumeration || frame.continuation==Continuation::LocaleEnumeration || frame.continuation==Continuation::RegistryBooleanResult || frame.continuation==Continuation::ResourceEnumeration)(void)free_heap(memory,frame.value,state);
         if(frame.continuation==Continuation::GuiMenuInit || frame.continuation==Continuation::GuiMenuFinish){release_gui_scratch(memory,state,frame.hook.scratch);gui_.menu_tracks.erase(frame.value);}
         if(frame.continuation==Continuation::GuiSentMessage)cancel_gui_send(frame.value,995);
         if(frame.continuation==Continuation::GuiAsyncSend || frame.continuation==Continuation::GuiAsyncCallback)gui_.async_sends.erase(frame.value);
@@ -1457,6 +1530,8 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     if(finished.continuation==Continuation::WinrtOriginSetup || finished.continuation==Continuation::WinrtOriginFinish)return resume_winrt_origin(state,memory,finished.value,static_cast<std::uint32_t>(callback_value),finished.continuation==Continuation::WinrtOriginSetup);
     if(finished.continuation==Continuation::GuiDragDetection)return resume_gui_drag(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::StorageOperation)return resume_storage(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));
+    if(finished.continuation==Continuation::MsiOperation)return resume_msi(state,memory,finished.value,callback_value);
+    if(finished.continuation==Continuation::EsentOperation)return resume_esent(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::StorageCopyOperation)return resume_storage_copy(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));
     if(finished.continuation==Continuation::DWriteOperation)return resume_dwrite(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::StackWalkOperation)return resume_stack_walk(state,memory,finished.value,callback_value);
@@ -1526,6 +1601,10 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
         const bool success=static_cast<std::uint32_t>(callback_value)!=0;
         if(!success)last_error_=15106;
         complete_call(state,memory,success);return std::nullopt;
+    }
+    if(finished.continuation==Continuation::RegistryBooleanResult){
+        (void)free_heap(memory,finished.value,state);const auto error=static_cast<std::uint32_t>(callback_value);
+        if(error)last_error_=error;complete_call(state,memory,error?0:1);return std::nullopt;
     }
     if(finished.continuation==Continuation::LocaleEnumeration){(void)free_heap(memory,finished.value,state);complete_call(state,memory,1);return std::nullopt;}
     if(finished.continuation==Continuation::MetafileEnumeration){finish_metafile_enumeration(finished.value);(void)free_heap(memory,finished.value,state);complete_call(state,memory,static_cast<std::uint32_t>(callback_value)!=0);return std::nullopt;}
@@ -1609,6 +1688,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
         state=read_context(memory,exceptions_.stack.back().context,finished.saved);exceptions_.stack.pop_back();return std::nullopt;
     }
     if (finished.continuation == Continuation::SehFilter) return seh_filter_result(state, memory, callback_value);
+    if (finished.continuation == Continuation::SehFinally) return seh_finally_result(state, memory);
     if (finished.continuation == Continuation::Startup){(void)dispatch_user_apc(state,memory,UINT64_MAX);return std::nullopt;}
     if (finished.continuation == Continuation::Exit) {
         record_job_exit(static_cast<std::uint32_t>(finished.value));
@@ -1761,6 +1841,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         if(detail::service_descriptor_contains<safearray_service_descriptors>(service,reuse))return &WindowsServices::invoke_safearray;
         if(detail::service_descriptor_contains<ole_stream_service_descriptors>(service,reuse))return &WindowsServices::invoke_ole_stream;
         if(detail::service_descriptor_contains<storage_service_descriptors>(service,reuse))return &WindowsServices::invoke_storage;
+        if(service.family=="msi.dll")return &WindowsServices::invoke_msi;
+        if(service.family=="esent.dll")return &WindowsServices::invoke_esent;
         if(detail::service_descriptor_contains<ole_service_descriptors>(service,reuse))return &WindowsServices::invoke_ole;
         if(detail::service_descriptor_contains<gui_drag_service_descriptors>(service,reuse))return &WindowsServices::invoke_gui_drag;
         if(service.family=="internal-window-interaction")return &WindowsServices::invoke_gui_move_size;
@@ -1832,7 +1914,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         if(detail::service_descriptor_contains<gui_service_descriptors>(service,reuse))return &WindowsServices::invoke_gui_support;
         if (service.family == "user32.dll" || service.family == "gdi32.dll") return &WindowsServices::invoke_gui;
         if(service.symbol=="RtlMoveMemory")return nullptr; // 記憶體搬移走共用 CRT 核心，不是例外處理服務。
-        if (service.symbol == "DebugBreak" || service.symbol == "UnhandledExceptionFilter" || service.symbol == "__crtUnhandledException" || service.symbol == "__crtCapturePreviousContext" || service.symbol == "RaiseException" || service.symbol == "RaiseFailFastException" || service.symbol == "AddVectoredExceptionHandler" || service.symbol == "RemoveVectoredExceptionHandler" || service.symbol == "AddVectoredContinueHandler" || service.symbol == "RemoveVectoredContinueHandler" || service.symbol.starts_with("Rtl") || service.symbol == "__C_specific_handler" || service.symbol.find("setjmp") != std::string_view::npos || (service.symbol == "longjmp" || service.symbol == "_longjmpex"))
+        if (service.symbol == "DebugBreak" || service.symbol == "UnhandledExceptionFilter" || service.symbol == "__crtUnhandledException" || service.symbol == "__crtCapturePreviousContext" || service.symbol == "RaiseException" || service.symbol == "RaiseFailFastException" || service.symbol == "AddVectoredExceptionHandler" || service.symbol == "RemoveVectoredExceptionHandler" || service.symbol == "AddVectoredContinueHandler" || service.symbol == "RemoveVectoredContinueHandler" || service.symbol.starts_with("Rtl") || service.symbol == "__C_specific_handler" || service.symbol == "_local_unwind" || service.symbol.find("setjmp") != std::string_view::npos || (service.symbol == "longjmp" || service.symbol == "_longjmpex"))
             return &WindowsServices::invoke_exception;
         return nullptr;
     };
@@ -2365,8 +2447,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& stat
                                                           const WindowsServiceDescriptor& service,const WindowsCall& arg){
     std::uint64_t result=0;
     const auto [common,common_stream,common_buffer,stream,standard_output,counting,
-                wide,secure,limited,unbounded,va,underscore,format_index]=crt_format_layout(service);
-    const auto destination=stream || counting?0:arg(common_buffer?1:0),capacity=stream || counting?0:unbounded?output_limit:arg(common_buffer?2:1);
+                wide,secure,limited,unbounded,va,underscore,format_index,console,positional,explicit_locale]=crt_format_layout(service);
+    const auto destination=stream || counting || console?0:arg(common_buffer?1:0),capacity=stream || counting || console?0:unbounded?output_limit:arg(common_buffer?2:1);
     const auto limit=limited?arg(common_buffer?3:2):capacity;const auto fmt=arg(format_index);const auto options=common?arg(0):0;
     const auto invalid_format=[&](unsigned error)->std::optional<std::uint32_t>{
         if(destination && capacity)memory.store(GuestAddress{destination},wide?16:8,0);memory.store(GuestAddress{runtime_.errno_cell},32,error);
@@ -2376,20 +2458,52 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& stat
     const CrtIoScope scope(*this,state,memory,target);if(!scope)return std::nullopt;
     if(stream)if(auto* file=crt_file(target);file && (!import_crt_lowio(memory,*file) || (!wide && file->text && (file->lowio_extended&3U))))return invalid_format(22);
     if(!fmt)return invalid_format(22);
-    if(common && ((options&~UINT64_C(0x27)) || arg(format_index+1)))throw HostCallFault("目前 CRT formatter 僅支援預設 C locale 與基本 UCRT options");
+    if(common && (options&~UINT64_C(0x37)))throw HostCallFault("CRT formatter 尚未支援 legacy MSVCRT compatibility 與未知 UCRT options");
+    auto locale_handle=common || explicit_locale?arg(format_index+1):0;
+    if(!locale_handle){const auto thread=runtime_.crt_thread_locales.find(threads_.current);locale_handle=thread==runtime_.crt_thread_locales.end()?runtime_.crt_current_locale:thread->second;}
+    static const CrtLocaleObject initial_locale{};const auto* locale=&initial_locale;
+    if(locale_handle){const auto found=runtime_.crt_locales.find(locale_handle);if(found==runtime_.crt_locales.end())return invalid_format(22);locale=&found->second;}
     if(limited && !destination && !capacity && !limit){arg.return_to(state,0);return std::nullopt;}
-    if(!stream && !counting && ((secure && (!destination || !capacity)) || (!destination && capacity)))return invalid_format(22);
+    if(!stream && !counting && !console && ((secure && (!destination || !capacity)) || (!destination && capacity)))return invalid_format(22);
     if(limited && !limit){memory.store(GuestAddress{destination},wide?16:8,0);arg.return_to(state,UINT32_MAX);return std::nullopt;}
-    unsigned index=format_index+1;std::uint64_t list=va?arg(common?format_index+2:format_index+1):0;
+    unsigned index=format_index+1+(explicit_locale?1U:0U);std::uint64_t list=va?arg(common?format_index+2:index):0;
     std::u16string specification;if(wide)specification=read_utf16(memory,GuestAddress{fmt});else {const auto bytes=read_ansi(memory,fmt);for(const auto c:bytes)specification.push_back(static_cast<unsigned char>(c));}
     Formatted formatted;
-    try {formatted=format(memory,specification,wide,wide && (!common || (options&4)),x86_?4:8,common?(options&0x20)!=0:underscore,[&](unsigned size){
+    const auto read_argument=[&](unsigned size){
         if(va){const auto value=memory.load(GuestAddress{list},static_cast<std::uint8_t>(size*8));list+=x86_?size:8;return value;}
         if(x86_){const auto value=memory.load(GuestAddress{state.reg(Gpr::Rsp)+4ULL*(index+1)},static_cast<std::uint8_t>(size*8));index+=size/4;return value;}return arg(index++);
-    });}catch(const FormatError& error){return invalid_format(error.code);}
+    };
+    try {
+        const auto decimal=windows_crt_numeric(locale->categories[4]).decimal;
+        const auto run=[&](bool inspect,const std::function<std::uint64_t(unsigned,unsigned,FormatArgumentKind)>& next){
+            return format(memory,specification,wide,wide && (!common || (options&4)),x86_?4:8,common?(options&0x10)!=0:underscore,
+                          positional,inspect,locale->categories[2],decimal,next);
+        };
+        struct Argument {unsigned size{},position{};FormatArgumentKind kind{};std::uint64_t value{};};
+        std::vector<Argument> slots;bool indexed=false;
+        if(positional){
+            std::vector<Argument> uses;
+            (void)run(true,[&](unsigned size,unsigned position,FormatArgumentKind kind){uses.push_back({size,position,kind,0});indexed|=position!=0;return UINT64_C(0);});
+            if(indexed){
+                for(const auto& use:uses){
+                    if(!use.position)throw FormatError{22};if(slots.size()<use.position)slots.resize(use.position);
+                    auto& slot=slots[use.position-1];if(slot.size && (slot.size!=use.size || slot.kind!=use.kind))throw FormatError{22};slot=use;
+                }
+                // 先依參數次序讀取完整 ABI，x86 的 double／I64 佔兩個 stack slot。
+                for(auto& slot:slots){if(!slot.size)throw FormatError{22};slot.value=read_argument(slot.size);}
+            }
+        }
+        formatted=run(false,[&](unsigned size,unsigned position,FormatArgumentKind){return indexed?slots.at(position-1).value:read_argument(size);});
+    }catch(const FormatError& error){
+        // 無效格式會進入 invalid parameter 處理（多半終止程序）；保留格式字串供相容性診斷。
+        std::fprintf(stderr,"crt_format_invalid pid=%u symbol=%.*s errno=%u format=%s\n",process_id(),static_cast<int>(service.symbol.size()),service.symbol.data(),error.code,utf16_to_utf8(specification.substr(0,240)).c_str());
+        return invalid_format(error.code);}
     const auto& text=formatted.text;if(formatted.encoding_error)memory.store(GuestAddress{runtime_.errno_cell},32,formatted.encoding_error);
     result=formatted.failed?UINT32_MAX:text.size();
-    if(!stream && !counting){
+    if(console){
+        const auto error=text.empty()?0:write_crt_console(text,wide);
+        if(error){memory.store(GuestAddress{runtime_.errno_cell},32,error==109?32:9);result=UINT32_MAX;}
+    }else if(!stream && !counting){
         const bool legacy=!secure && (common_buffer?(options&1)!=0:underscore);
         if(!destination && !capacity){arg.return_to(state,result);return std::nullopt;}
         if(secure && !limited && text.size()>=capacity)return invalid_format(34);

@@ -24,7 +24,7 @@ void dimensions(std::uint32_t w,std::uint32_t h){
     if(!w || !h || w>4096 || h>4096 || std::uint64_t{w}*h>16U*1024U*1024U)throw std::invalid_argument("圖示尺寸不合法");
 }
 }
-IconChoice choose_icon(std::span<const std::uint8_t> bytes,bool cursor,bool file,std::uint32_t width,std::uint32_t height,bool mono){
+IconChoice choose_icon(std::span<const std::uint8_t> bytes,bool cursor,bool file,std::uint32_t width,std::uint32_t height,bool mono,bool prefer_larger){
     const auto count=integer(bytes,4,2),entry_size=file?16U:14U;
     if(integer(bytes,0,2) || integer(bytes,2,2)!=(cursor?2U:1U) || !count || count>4096 || bytes.size()<6+count*entry_size)throw std::invalid_argument("圖示群組格式不合法");
     width=width?width:32;height=height?height:32;dimensions(width,height);
@@ -35,9 +35,9 @@ IconChoice choose_icon(std::span<const std::uint8_t> bytes,bool cursor,bool file
         const auto h=cursor && !file?integer(bytes,at+2,2)/2:(integer(bytes,at+1,1)?integer(bytes,at+1,1):256U);
         if(!w || !h)continue;
         const auto depth=cursor && file?32U:integer(bytes,at+6,2);
-        const bool fits=w<=width && h<=height;
+        const bool fits=prefer_larger?w>=width && h>=height:w<=width && h<=height;
         const auto distance=static_cast<std::uint32_t>(std::abs(static_cast<int>(w)-static_cast<int>(width))+std::abs(static_cast<int>(h)-static_cast<int>(height)));
-        // 先選不超過要求的尺寸，再選顯示色深以下最接近者；無符合者才採較大的尺寸／色深。
+        // 同一解析器依 API 契約選擇放大或縮小來源；尺寸相同時再比色深。
         const auto depth_distance=depth<=wanted_depth?wanted_depth-depth:1024U+depth-wanted_depth;
         if(!selected || (fits && !best_fits) || (fits==best_fits && (distance<best_distance || (distance==best_distance && depth_distance<best_depth_distance)))){
             best={at,w,h,depth,file?UINT32_MAX:integer(bytes,at+12,2)};best_fits=fits;best_distance=distance;best_depth_distance=depth_distance;selected=true;
@@ -141,12 +141,12 @@ GuiIcon decode_icon_resource(std::span<const std::uint8_t> bytes,bool is_icon,st
 }
 
 namespace {
-GuiIcon single_icon_file(std::span<const std::uint8_t> bytes,bool cursor,std::uint32_t width,std::uint32_t height,std::uint32_t flags){
+GuiIcon single_icon_file(std::span<const std::uint8_t> bytes,bool cursor,std::uint32_t width,std::uint32_t height,std::uint32_t flags,bool prefer_larger){
     const auto type=integer(bytes,2,2);
     if(integer(bytes,0,2) || (type!=1 && type!=2))throw std::invalid_argument("不是 ICO／CUR 檔案");
     const auto requested_width=width?width:(flags&0x40)?32U:(integer(bytes,6,1)?integer(bytes,6,1):256U);
     const auto requested_height=height?height:(flags&0x40)?32U:(integer(bytes,7,1)?integer(bytes,7,1):256U);
-    const auto choice=choose_icon(bytes,type==2,true,requested_width,requested_height,(flags&1)!=0);
+    const auto choice=choose_icon(bytes,type==2,true,requested_width,requested_height,(flags&1)!=0,prefer_larger);
     const auto length=integer(bytes,choice.offset+8,4),offset=integer(bytes,choice.offset+12,4);
     if(length>16U*1024U*1024U || offset>bytes.size() || length>bytes.size()-offset)throw std::invalid_argument("圖示檔像素截斷");
     auto payload=bytes.subspan(offset,length);GuiIcon icon;
@@ -157,9 +157,9 @@ GuiIcon single_icon_file(std::span<const std::uint8_t> bytes,bool cursor,std::ui
     icon.is_icon=!cursor;finish_icon(icon);return icon;
 }
 }
-GuiIcon decode_icon_file(std::span<const std::uint8_t> bytes,bool cursor,std::uint32_t width,std::uint32_t height,std::uint32_t flags){
+GuiIcon decode_icon_file(std::span<const std::uint8_t> bytes,bool cursor,std::uint32_t width,std::uint32_t height,std::uint32_t flags,bool prefer_larger){
     if(bytes.size()>64U*1024U*1024U)throw std::invalid_argument("圖示檔超過容量限制");
-    if(bytes.size()<12 || integer(bytes,0,4)!=0x46464952)return single_icon_file(bytes,cursor,width,height,flags);
+    if(bytes.size()<12 || integer(bytes,0,4)!=0x46464952)return single_icon_file(bytes,cursor,width,height,flags,prefer_larger);
     const auto end=std::uint64_t{integer(bytes,4,4)}+8;
     if(integer(bytes,8,4)!=0x4e4f4341 || end<12 || end>bytes.size())throw std::invalid_argument("ANI RIFF 格式不合法");
     std::span<const std::uint8_t> header,rates,sequence;std::vector<std::span<const std::uint8_t>> frames;
@@ -186,7 +186,7 @@ GuiIcon decode_icon_file(std::span<const std::uint8_t> bytes,bool cursor,std::ui
     if(!rates.empty() && rates.size()<static_cast<std::size_t>(steps)*4)throw std::invalid_argument("ANI 播放速率截斷");
     std::vector<GuiIcon> decoded;std::vector<std::uint32_t> order,durations;std::size_t allocation=0;
     for(const auto frame:frames){
-        auto icon=single_icon_file(frame,cursor,width,height,flags);
+        auto icon=single_icon_file(frame,cursor,width,height,flags,prefer_larger);
         allocation+=icon.image.size()+icon.rgba.size()*4+icon.color_pixels.size()*4+icon.mask_pixels.size();
         if(allocation>64U*1024U*1024U)throw std::bad_alloc{};decoded.push_back(std::move(icon));
     }

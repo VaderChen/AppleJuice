@@ -53,7 +53,6 @@ public:
     std::size_t decoded_entries() const noexcept {return decode_cache().size();}
     static constexpr std::size_t decode_cache_capacity=DecodeCache::default_capacity;
 private:
-    friend class JitEngine;
     // 原生後端的直譯語義橋接只借用單條 execute，不經 run 的服務、預算與例外派送。
     friend struct InterpreterBridgeAccess;
     static bool fast_scalar_form(const Instruction& instruction);

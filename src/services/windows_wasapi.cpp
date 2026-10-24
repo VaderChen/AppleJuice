@@ -463,7 +463,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                     if(arg(3))out(3);if(d(1)>1)result=invalid;else if(d(1))result=exclusive_denied;else if(!arg(3))throw PointerError{};else if(!format(arg(2))){put(arg(3),allocation(mix()),bits);result=1;}
                 }else if(name=="A_Initialize"){
                     if(s.initialized)result=already_initialized;else if(d(1)>1)result=invalid;else if(d(1))result=exclusive_denied;
-                    else if((d(2)&~0x800c0000U) || arg(4) || static_cast<std::int64_t>(arg(3))<0)result=invalid;
+                    else if((d(2)&~0x800c0000U) || static_cast<std::int64_t>(arg(4))<0 || static_cast<std::int64_t>(arg(3))<0)result=invalid;
+                    // 共用模式由音訊引擎週期驅動：hnsPeriodicity 可為 0 或不小於引擎週期（GetDevicePeriod 回報的
+                    // 10 ms；FMOD 等函式庫會原樣傳回），較短週期只在獨佔模式有效。
+                    else if(arg(4) && arg(4)<100000)result=0x88890020U;
                     else if(const auto f=format(arg(5));!f)result=unsupported_format;
                     else if(arg(3)>UINT64_C(20000000))result=too_large;
                     else {

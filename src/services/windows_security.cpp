@@ -84,6 +84,7 @@ std::span<const WindowsServiceDescriptor> security_service_descriptors() {
         {"advapi32.dll", "LsaOpenPolicy", 4}, {"advapi32.dll", "LsaClose", 1},
         {"advapi32.dll", "LsaAddAccountRights", 4}, {"advapi32.dll", "LsaNtStatusToWinError", 1},
         {"advapi32.dll", "LookupAccountNameA", 7}, {"advapi32.dll", "LookupAccountNameW", 7},
+        {"advapi32.dll", "LookupAccountSidA", 7}, {"advapi32.dll", "LookupAccountSidW", 7},
         {"advapi32.dll", "GetFileSecurityA", 5}, {"advapi32.dll", "GetFileSecurityW", 5},
         {"advapi32.dll", "SetFileSecurityA", 3}, {"advapi32.dll", "SetFileSecurityW", 3}
     };
@@ -536,49 +537,54 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
         result = 0xc0000008;
     } else if (symbol == "LsaNtStatusToWinError") {
         result = lsa_winerror(u32(0));
-    } else if (symbol == "LookupAccountNameA" || symbol == "LookupAccountNameW") {
-        const bool wide = symbol.back() == 'W';
+    } else if (symbol == "LookupAccountNameA" || symbol == "LookupAccountNameW" ||
+               symbol == "LookupAccountSidA" || symbol == "LookupAccountSidW") {
+        const bool wide = symbol.back() == 'W', by_sid = symbol.starts_with("LookupAccountSid");
         const auto text = [&](std::uint64_t address) {
             return wide ? utf16_to_utf8(read_utf16(memory, GuestAddress{address}, 1024)) : read_ansi(memory, address, 1024);
         };
-        if (!arg(1) || !arg(3) || !arg(5)) fail(87);
-        else if (arg(0) && !text(arg(0)).empty()) fail(50);
-        else {
-            const auto name = text(arg(1));
-            const auto found=find_account(name);
-            if (!found) fail(1332); // ERROR_NONE_MAPPED
+        const auto encoded = [&](std::string_view value) {
+            if (wide) return utf16_bytes(utf8_to_utf16(value));
+            std::vector<std::uint8_t> bytes(value.begin(),value.end()); bytes.push_back(0); return bytes;
+        };
+        try {
+            if (!arg(1) || !arg(3) || !arg(5)) fail(87);
+            else if (arg(0) && !text(arg(0)).empty() && !same_name(text(arg(0)),"X64ARM") &&
+                     !same_name(text(arg(0)),"\\\\X64ARM") && text(arg(0))!=".") fail(50);
             else {
-                const auto sid_size = 8U + 4U * found->count;
-                const auto domain_size = static_cast<std::uint32_t>(found->domain.size() + 1);
-                const auto sid_capacity = memory.load(GuestAddress{arg(3)}, 32);
-                const auto domain_capacity = memory.load(GuestAddress{arg(5)}, 32);
-                memory.check(GuestAddress{arg(3)}, 4, Access::Write);
-                memory.check(GuestAddress{arg(5)}, 4, Access::Write);
-                if (sid_capacity < sid_size || domain_capacity < domain_size) {
-                    memory.store(GuestAddress{arg(3)}, 32, sid_size);
-                    memory.store(GuestAddress{arg(5)}, 32, domain_size);
-                    fail(122);
-                } else if (!arg(2) || !arg(4) || !arg(6)) fail(87);
+                initialize_tokens();
+                const auto& primary = runtime_.token_objects.at(1).user.sid;
+                const auto found = by_sid ? resolve_account(read_sid(memory,arg(1)),primary) : resolve_account(text(arg(1)),primary);
+                if (!found) fail(1332);
                 else {
-                    std::vector<std::uint8_t> sid(sid_size);
-                    sid[0] = 1; sid[1] = found->count; sid[7] = found->authority;
-                    for (std::uint32_t i = 0; i < found->count; ++i)
-                        for (unsigned byte = 0; byte < 4; ++byte)
-                            sid[8 + i * 4 + byte] = static_cast<std::uint8_t>(found->subauthorities[i] >> (byte * 8));
-                    std::vector<std::uint8_t> domain;
-                    if (wide) domain = utf16_bytes(utf8_to_utf16(found->domain));
-                    else { domain.assign(found->domain.begin(), found->domain.end()); domain.push_back(0); }
-                    memory.check(GuestAddress{arg(2)}, sid.size(), Access::Write);
-                    memory.check(GuestAddress{arg(4)}, domain.size(), Access::Write);
-                    memory.check(GuestAddress{arg(6)}, 4, Access::Write);
-                    memory.write(GuestAddress{arg(2)}, sid); memory.write(GuestAddress{arg(4)}, domain);
-                    memory.store(GuestAddress{arg(3)}, 32, sid_size);
-                    memory.store(GuestAddress{arg(5)}, 32, domain_size - 1);
-                    memory.store(GuestAddress{arg(6)}, 32, found->type);
-                    result = 1;
+                    const auto first = by_sid ? encoded(found->name) : found->sid;
+                    const auto domain = encoded(found->domain);
+                    const auto first_size = first.size() / (by_sid && wide ? 2U : 1U);
+                    const auto domain_size = domain.size() / (wide ? 2U : 1U);
+                    const auto first_capacity = memory.load(GuestAddress{arg(3)},32);
+                    const auto domain_capacity = memory.load(GuestAddress{arg(5)},32);
+                    memory.check(GuestAddress{arg(3)},4,Access::Write);
+                    memory.check(GuestAddress{arg(5)},4,Access::Write);
+                    if (first_capacity < first_size || domain_capacity < domain_size ||
+                        (by_sid && (!arg(2) || !arg(4)))) {
+                        memory.store(GuestAddress{arg(3)},32,first_size);
+                        memory.store(GuestAddress{arg(5)},32,domain_size);
+                        fail(122);
+                    } else if (!arg(2) || !arg(4) || !arg(6)) fail(87);
+                    else {
+                        memory.check(GuestAddress{arg(2)},first.size(),Access::Write);
+                        memory.check(GuestAddress{arg(4)},domain.size(),Access::Write);
+                        memory.check(GuestAddress{arg(6)},4,Access::Write);
+                        memory.write(GuestAddress{arg(2)},first); memory.write(GuestAddress{arg(4)},domain);
+                        memory.store(GuestAddress{arg(3)},32,first_size-(by_sid?1U:0U));
+                        memory.store(GuestAddress{arg(5)},32,domain_size-1);
+                        memory.store(GuestAddress{arg(6)},32,found->type);
+                        result=1;
+                    }
                 }
             }
-        }
+        } catch(const SecurityDescriptorError& error) { fail(error.code); }
+          catch(const MemoryFault&) { fail(998); }
     } else if (symbol == "LookupPrivilegeValueA" || symbol == "LookupPrivilegeValueW") {
         const bool wide = symbol.back() == 'W';
         const auto text = [&](std::uint64_t address) {
@@ -788,9 +794,9 @@ SynchronizationDescriptor WindowsServices::synchronization_descriptor(const Gues
     auto security=read_security_attributes(memory,address,x86_,true,check_length);
     return {security.inherit,object_security_descriptor(std::move(security.descriptor),true,true)};
 }
-std::vector<std::uint8_t> WindowsServices::file_creation_descriptor(const GuestMemory& memory,std::uint64_t address){
+std::vector<std::uint8_t> WindowsServices::file_creation_descriptor(const GuestMemory& memory,std::uint64_t address,bool check_length){
     try{
-        auto sd=read_security_attributes(memory,address,x86_).descriptor;const bool dacl_present=sd.control&4U;
+        auto sd=read_security_attributes(memory,address,x86_,true,check_length).descriptor;const bool dacl_present=sd.control&4U;
         sd=security::parse_relative_descriptor(object_security_descriptor(std::move(sd),true,false));
         // 父層繼承先於 token 的預設 DACL；驗證時補入的 ACL 不可變成明示 ACL。
         if(!dacl_present){sd.control&=static_cast<std::uint16_t>(~4U);sd.data[3].clear();}

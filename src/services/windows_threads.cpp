@@ -509,6 +509,7 @@ std::span<const WindowsServiceDescriptor> thread_service_descriptors() {
                                                       {"kernel32.dll", "AcquireSRWLockShared", 1},
                                                       {"kernel32.dll", "TryAcquireSRWLockExclusive", 1},
                                                       {"kernel32.dll", "TryAcquireSRWLockShared", 1},
+                                                      {"internal-sync", "TryAcquireSRWLockExclusiveFor", 2},
                                                       {"kernel32.dll", "ReleaseSRWLockExclusive", 1},
                                                       {"kernel32.dll", "ReleaseSRWLockShared", 1},
                                                       {"kernel32.dll", "InitializeConditionVariable", 1},
@@ -516,13 +517,18 @@ std::span<const WindowsServiceDescriptor> thread_service_descriptors() {
                                                       {"kernel32.dll", "SleepConditionVariableCS", 3},
                                                       {"kernel32.dll", "WakeConditionVariable", 1},
                                                       {"kernel32.dll", "WakeAllConditionVariable", 1},
+                                                      {"kernel32.dll", "WaitOnAddress", 4},
+                                                      {"kernel32.dll", "WakeByAddressSingle", 1},
+                                                      {"kernel32.dll", "WakeByAddressAll", 1},
                                                       {"kernel32.dll", "InitOnceExecuteOnce", 4},
                                                       {"kernel32.dll", "InitOnceInitialize", 1},
                                                       {"kernel32.dll", "InitOnceBeginInitialize", 4},
                                                       {"kernel32.dll", "InitOnceComplete", 3},
                                                       {"crt", "_beginthreadex", 6},
                                                       {"crt", "_resetstkoflw", 0},
-                                                      {"crt", "_endthreadex", 1}};
+                                                      {"crt", "_endthreadex", 1},
+                                                      {"crt", "_beginthread", 3},
+                                                      {"crt", "_endthread", 0}};
     return table;
 }
 std::uint64_t WindowsServices::open_local_thread(std::uint64_t id, std::uint32_t rights, bool inherit) {
@@ -1866,6 +1872,8 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
         const bool condition=wait.kind==ThreadWaitKind::Condition && wait.handles.size()>1;
         if(scope==ThreadWakeScope::Condition)
             return condition && wait.handles[0]==wake_address;
+        if(scope==ThreadWakeScope::Address)
+            return wait.kind==ThreadWaitKind::Address && !wait.handles.empty() && wait.handles[0]==wake_address;
         if(scope==ThreadWakeScope::Slim)
             return (wait.kind==ThreadWaitKind::Slim && !wait.handles.empty() && wait.handles[0]==wake_address) ||
                 (condition && !wait.critical && wait.handles[1]==wake_address);
@@ -2295,6 +2303,20 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
                 thread.status = ThreadStatus::Runnable;
             continue;
         }
+        if (wait.kind == ThreadWaitKind::Address) {
+            // WaitOnAddress：只等通知或逾時，不重新取得任何鎖；喚醒後由呼叫端重新比對值（允許虛假喚醒）。
+            if (!wait.signaled && wait.deadline <= runtime_.clock_ticks) {
+                wait.signaled = true;
+                wait.timed_out = true;
+                wait.deadline = UINT64_MAX;
+            }
+            if (!wait.signaled)
+                continue;
+            ready = true;
+            result = wait.timed_out ? 0 : 1;
+            if (wait.timed_out)
+                memory.store(GuestAddress{thread.teb + (x86_ ? 0x34 : 0x68)}, 32, 1460);
+        }
         if (wait.kind == ThreadWaitKind::Condition) {
             if (!wait.signaled && wait.deadline <= runtime_.clock_ticks) {
                 wait.signaled = true;
@@ -2326,16 +2348,16 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
         if (wait.kind == ThreadWaitKind::Slim) {
             if (acquire_slim_word(memory, wait.handles[0], id, wait.shared)) {
                 ready = true;
-                result = 0;
+                result = wait.slim_timed ? 1 : 0;
             }
         }
         if (!ready && wait.deadline <= runtime_.clock_ticks) {
             ready = true;
-            result = wait.kind == ThreadWaitKind::Sleep ? 0 : 258;
+            result = wait.kind == ThreadWaitKind::Sleep || wait.slim_timed ? 0 : 258;
         }
         if (ready) {
             if (!runtime_.priority_boost_disabled && !thread.priority_boost_disabled &&
-                wait.kind != ThreadWaitKind::Sleep && result != 258 && thread.priority > -15 && thread.priority < 15)
+                wait.kind != ThreadWaitKind::Sleep && result != 258 && !(wait.slim_timed && !result) && thread.priority > -15 && thread.priority < 15)
                 thread.dynamic_priority_boost = 1;
             if (!guest_return)complete_call(thread.context, memory, result);
             thread.status = ThreadStatus::Runnable;
@@ -2922,6 +2944,9 @@ std::optional<std::uint32_t> WindowsServices::finish_thread(GuestState &state, G
     (void)retire_com_marshal(memory, threads_.current, false);
     auto &thread = threads_.items.at(threads_.current);
     thread.status = ThreadStatus::Exited;
+    if(const auto handle=std::exchange(thread.crt_detached_handle,0);handle && runtime_.process_thread_handles.erase(handle)){
+        runtime_.thread_handle_access.erase(handle);runtime_.handle_flags.erase(handle);
+    }
     if(thread.msvc_exception_cells){(void)free_heap(memory,thread.msvc_exception_cells,state);thread.msvc_exception_cells=0;}
     if(thread.msvc_exception_area){(void)free_heap(memory,thread.msvc_exception_area,state);thread.msvc_exception_area=0;}
     thread.exit_code = code;
@@ -3057,7 +3082,7 @@ std::uint64_t WindowsServices::create_guest_thread(const GuestState &state, Gues
                 last_error_ = 8;
                 return 0;
             }
-        }else if(prefer_low_guest_stack()){
+        }else{
             const auto reserved_end=[&](std::uint64_t first,std::uint64_t end){
                 const auto& reservations=runtime_.virtual_regions;
                 const auto next=reservations.lower_bound(first);auto high=first;
@@ -3068,8 +3093,17 @@ std::uint64_t WindowsServices::create_guest_thread(const GuestState &state, Gues
                 if(next!=reservations.end() && next->first<end)high=std::max(high,next->first+next->second.size);
                 return high;
             };
-            if(const auto low=find_guest_address_gap(memory,UINT64_C(0x60000000),0x100000+stack_size,
-                                                    UINT64_C(0x100000000),reserved_end))base=low->value;
+            const auto span=0x100000+stack_size;
+            if(prefer_low_guest_stack()){
+                if(const auto low=find_guest_address_gap(memory,UINT64_C(0x60000000),span,UINT64_C(0x100000000),reserved_end))base=low->value;
+            }
+            // 固定槽位已被映射或 VirtualAlloc 保留（例如程式先以 MEM_RESERVE 保留數 GiB 而落在 0x30xxxxxxxx）時，
+            // 以同一空洞搜尋在 MMU 視窗內另選位置，不覆寫既有保留。
+            if(!memory.range_available(GuestAddress{base},span) || reserved_end(base,base+span)!=base){
+                const auto gap=find_guest_address_gap(memory,UINT64_C(0x3010000000),span,user_address_limit(),reserved_end);
+                if(!gap){last_error_=8;return 0;}
+                base=gap->value;
+            }
         }
         GuestThread thread;
         thread.desktop_handle = threads_.items.at(threads_.current).desktop_handle;
@@ -3460,6 +3494,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             runtime_.slim_locks.erase(address);
         } else {
             const bool shared = symbol.ends_with("Shared");
+            const bool timed = symbol == "TryAcquireSRWLockExclusiveFor";
             if (symbol.starts_with("Release")) {
                 for (;;) {
                     if (shared) {
@@ -3483,7 +3518,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                         if (shared && (value >> 2) == (once_width == 32 ? 0x3fffffffU : UINT64_C(0x3fffffffffffffff)))
                             throw HostCallFault("SRW reader 次數溢位");
                         if (exchange(shared ? value + 4 : value | 1)) { acquired = true; break; }
-                    } else if (symbol.starts_with("Try")) {
+                    } else if (symbol.starts_with("Try") && (!timed || !u32(1))) {
                         break;
                     } else if (exchange(value | 2)) { queued = true; break; }
                 }
@@ -3496,11 +3531,56 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 thread.wait.kind = ThreadWaitKind::Slim;
                 thread.wait.handles = {address};
                 thread.wait.shared = shared;
+                thread.wait.slim_timed = timed;
+                if (timed && u32(1) != UINT32_MAX)
+                    thread.wait.deadline = runtime_.clock_ticks + std::uint64_t{u32(1)} * 10000;
                 schedule(state, memory);
                 return std::nullopt;
                 }
             }
         }
+    } else if (symbol == "WaitOnAddress") {
+        // 值不同立即成功；相同時登記位址等待，比對與登記之間沒有客體排程切點，不會漏掉之後的 WakeByAddress。
+        const auto address = arg(0), compare = arg(1), size = arg(2);
+        if (size != 1 && size != 2 && size != 4 && size != 8)
+            fail(87);
+        else {
+            memory.check(GuestAddress{address}, size, Access::Read);
+            memory.check(GuestAddress{compare}, size, Access::Read);
+            const auto width = static_cast<std::uint8_t>(size * 8);
+            if (memory.load(GuestAddress{address}, width) != memory.load(GuestAddress{compare}, width))
+                result = 1;
+            else if (!u32(3))
+                fail(1460);
+            else {
+                auto &thread = threads_.items.at(threads_.current);
+                thread.status = ThreadStatus::Waiting;
+                thread.wait = {};
+                thread.wait.kind = ThreadWaitKind::Address;
+                thread.wait.handles = {address};
+                thread.wait.deadline =
+                    u32(3) == UINT32_MAX ? UINT64_MAX : runtime_.clock_ticks + std::uint64_t{u32(3)} * 10000;
+                schedule(state, memory);
+                return std::nullopt;
+            }
+        }
+    } else if (symbol == "WakeByAddressSingle" || symbol == "WakeByAddressAll") {
+        const auto address = arg(0);
+        bool notified = false;
+        for (auto &[id, thread] : threads_.items) {
+            (void)id;
+            auto &wait = thread.wait;
+            if (thread.status == ThreadStatus::Waiting && wait.kind == ThreadWaitKind::Address &&
+                wait.handles[0] == address && !wait.signaled) {
+                wait.signaled = true;
+                wait.deadline = UINT64_MAX;
+                notified = true;
+                if (symbol == "WakeByAddressSingle")
+                    break;
+            }
+        }
+        if (notified)
+            resolve_thread_waits(memory, ThreadWakeScope::Address, address);
     } else if (symbol.find("ConditionVariable") != symbol.npos) {
         const auto condition = arg(0);
         memory.check(GuestAddress{condition}, x86_ ? 4 : 8, Access::Write);
@@ -3969,7 +4049,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
         }
         memory.check(GuestAddress{address}, x86_ ? 24 : 40, Access::Write);
         if (symbol.starts_with("Initialize")) {
-            if (symbol == "InitializeCriticalSectionEx" && (u32(2) & ~0x17000000U))
+            // 與 RtlInitializeCriticalSectionEx 相同只拒絕保留旗標位元（RTL_CRITICAL_SECTION_FLAG_RESERVED）；
+            // 低 24 位元不使用（curl 的 Curl_mutex_init 傳 1），NO_DEBUG_INFO／DYNAMIC_SPIN／STATIC_INIT／
+            // RESOURCE_TYPE／FORCE_DEBUG_INFO 皆合法。
+            if (symbol == "InitializeCriticalSectionEx" && (u32(2) & 0xe0000000U))
                 fail(87);
             else {
                 CriticalSection section;
@@ -3995,8 +4078,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             }
         } else {
             const auto found = runtime_.critical_sections.find(address);
-            if (found == runtime_.critical_sections.end())
-                throw HostCallFault("未初始化的 critical section");
+            if (found == runtime_.critical_sections.end() && symbol == "DeleteCriticalSection") {
+                // RtlDeleteCriticalSection 對全零（未初始化或已刪除）的物件沒有 DebugInfo／LockSemaphore 可釋放，
+                // 只把結構清零；只有含有效狀態卻未登錄的物件才視為損毀。
+                const std::uint8_t width = x86_ ? 32 : 64;
+                const auto debug = memory.load(GuestAddress{address}, width);
+                const auto semaphore = memory.load(GuestAddress{address + (x86_ ? 16 : 24)}, width);
+                if ((debug && debug != (x86_ ? UINT32_MAX : UINT64_MAX)) || semaphore)
+                    throw HostCallFault("未初始化的 critical section");
+                memory.write(GuestAddress{address}, std::vector<std::uint8_t>(x86_ ? 24 : 40));
+                arg.return_to(state, 0);
+                return std::nullopt;
+            }
+            if (found == runtime_.critical_sections.end()) {
+                // 附上物件位址與呼叫端返回位址，供對照模組映像定位。
+                std::uint64_t caller = 0;
+                try {caller = memory.load(GuestAddress{state.reg(Gpr::Rsp)}, x86_ ? 32 : 64);} catch (const MemoryFault &) {}
+                char detail[96];
+                std::snprintf(detail, sizeof(detail), "（%.*s object=0x%llx caller=0x%llx）", static_cast<int>(symbol.size()), symbol.data(),
+                              static_cast<unsigned long long>(address), static_cast<unsigned long long>(caller));
+                throw HostCallFault(std::string("未初始化的 critical section") + detail);
+            }
             auto &section = found->second;
             if (symbol == "SetCriticalSectionSpinCount") {
                 result = section.spin;
@@ -4113,7 +4215,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 }
             }
         }
-    } else if (symbol == "ExitThread" || symbol == "_endthreadex")
+    } else if (symbol == "_beginthread") {
+        // UCRT：失敗回 -1 並設 errno（無效常式 EINVAL、資源不足 EAGAIN）；成功的 handle 在執行緒結束時自動關閉。
+        const auto failed = x86_ ? UINT64_C(0xffffffff) : UINT64_MAX;
+        if (!arg(0)) {
+            memory.store(GuestAddress{runtime_.errno_cell}, 32, 22);
+            result = failed;
+        } else if (arg(1) > 8U * 1024 * 1024) {
+            memory.store(GuestAddress{runtime_.errno_cell}, 32, 11);
+            result = failed;
+        } else {
+            result = create_guest_thread(state, memory, arg(0), arg(2), arg(1), 0);
+            if (result)
+                threads_.items.at(thread_id(result)).crt_detached_handle = result;
+            else {
+                memory.store(GuestAddress{runtime_.errno_cell}, 32, 11);
+                result = failed;
+            }
+        }
+    } else if (symbol == "_endthread")
+        return exit_thread(state, memory, 0);
+    else if (symbol == "ExitThread" || symbol == "_endthreadex")
         return exit_thread(state, memory, u32(0));
     else if (symbol == "SetThreadIdealProcessor") {
         const auto id = thread_id(arg(0));

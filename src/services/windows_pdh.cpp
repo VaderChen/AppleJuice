@@ -39,13 +39,14 @@ constexpr CounterName counter_names[]{
     {Object::Memory,u"% committed bytes in use",Counter::CommittedInUse,fraction,false,true},
 };
 struct Snapshot {
+    std::uint64_t timestamp{};
     std::vector<SystemCpuTime> cpus;SystemCpuTime total;
     std::vector<std::array<std::uint32_t,6>> power;std::uint32_t nominal_mhz{};
     SystemPerformance memory;
 };
 struct Path {Object object{};const CounterName* counter{};std::u16string instance;bool wildcard{},has_instance{};};
 struct CounterState {std::uint64_t query{},user{};Path path;std::shared_ptr<const Snapshot> previous,current;};
-struct Query {std::uint64_t user{};std::vector<std::uint64_t> counters;};
+struct Query {std::uint64_t user{};std::vector<std::uint64_t> counters;std::uint64_t registration{};};
 std::u16string fold(std::u16string_view text){std::u16string result(text);for(auto& c:result)c=unicode_case_unit(c,false);return result;}
 std::uint32_t parse(std::u16string_view text,Path& out){
     if(text.starts_with(u"\\\\")){
@@ -145,11 +146,58 @@ std::optional<double> value(const CounterState& counter,std::size_t index,unsign
 }
 }
 struct PdhState {std::map<std::uint64_t,pdh::Query> queries;std::map<std::uint64_t,pdh::CounterState> counters;};
+std::uint32_t WindowsServices::collect_pdh_query(std::uint64_t handle,std::uint64_t* timestamp){
+    const auto query=pdh_->queries.find(handle);if(query==pdh_->queries.end())return pdh::invalid_handle;
+    if(query->second.counters.empty())return pdh::no_data;
+    const unsigned count=std::max(1U,runtime_.processor_count);
+    auto snapshot=std::make_shared<pdh::Snapshot>();snapshot->timestamp=runtime_.system_time_state().filetime;
+    if(runtime_.host_clock){
+        const auto host=native_processor_cpu_times();snapshot->cpus.assign(count,{});
+        // 與同步採樣相同：宿主核心依序分配到客體 vCPU。
+        if(host.size()>=count)for(std::size_t i=0;i<host.size();++i){auto& target=snapshot->cpus[i*count/host.size()];target.idle+=host[i].idle;target.kernel+=host[i].kernel;target.user+=host[i].user;}
+        else if(!host.empty())for(unsigned i=0;i<count;++i)snapshot->cpus[i]=host[i%host.size()];
+    }else {
+        std::uint64_t user=0;for(const auto& [id,thread]:threads_.items){(void)id;user+=thread.cycles;}
+        const auto elapsed=runtime_.clock_ticks*count;user=std::min(user,elapsed);
+        for(unsigned i=0;i<count;++i){const auto share=user/count,idle=(elapsed-user)/count;snapshot->cpus.push_back({idle,idle,share,0});}
+    }
+    for(const auto& cpu:snapshot->cpus){snapshot->total.idle+=cpu.idle;snapshot->total.kernel+=cpu.kernel;snapshot->total.user+=cpu.user;}
+    if(runtime_.network.external_io){
+        if(const auto power=native_processor_power_information(count);power && power->size()==count)snapshot->power=*power;
+        snapshot->nominal_mhz=native_processor_information().nominal_mhz;snapshot->memory=native_system_performance();
+    }else snapshot->memory.error=50;
+    bool available=false;
+    for(const auto counter_handle:query->second.counters){
+        auto& counter=pdh_->counters.at(counter_handle);counter.previous=std::move(counter.current);counter.current=snapshot;
+        const auto names=pdh::instances(counter.path.object,count);
+        available=available || counter.path.wildcard || counter.path.object==pdh::Object::Memory ||
+            std::any_of(names.begin(),names.end(),[&](const auto& name){return pdh::fold(name)==pdh::fold(counter.path.instance);});
+    }
+    if(!available)return pdh::no_data;
+    if(timestamp)*timestamp=snapshot->timestamp;return 0;
+}
+std::optional<std::uint32_t> WindowsServices::advance_pdh(GuestState& state,GuestMemory& memory,std::uint64_t handle){
+    auto& wait=registered_waits_.at(wait_workers_.at(threads_.current));
+    const auto query=pdh_->queries.find(handle);
+    if(query==pdh_->queries.end())wait.closing=true;
+    else {
+        // 此工作在共用服務排程邊界內完成，採樣與通知之間沒有客體回呼；
+        // CloseQuery／重新啟動可直接撤銷尚未執行的工作，不留下舊通知。
+        try{(void)collect_pdh_query(handle);}catch(const std::bad_alloc&){wait.closing=true;}
+        const auto event=runtime_.wait_objects.find(wait.parameter);
+        if(!wait.closing && event!=runtime_.wait_objects.end() && event->second.kind==WaitObject::Kind::Event && (event->second.access&2U))
+            runtime_.wait_state(event->second).set_signal(true);
+        else wait.closing=true;
+        if(wait.closing)query->second.registration=0;
+    }
+    return resume_registered_wait(state,memory);
+}
 std::span<const WindowsServiceDescriptor> pdh_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"pdh.dll","PdhOpenQueryA",3},{"pdh.dll","PdhOpenQueryW",3},{"pdh.dll","PdhOpenQuery",3},
         {"pdh.dll","PdhAddCounterA",4},{"pdh.dll","PdhAddCounterW",4},{"pdh.dll","PdhAddEnglishCounterA",4},{"pdh.dll","PdhAddEnglishCounterW",4},
         {"pdh.dll","PdhRemoveCounter",1},{"pdh.dll","PdhCollectQueryData",1},{"pdh.dll","PdhCloseQuery",1},
+        {"pdh.dll","PdhCollectQueryDataEx",3,0,0,0x2},{"pdh.dll","PdhCollectQueryDataWithTime",2},
         {"pdh.dll","PdhGetFormattedCounterValue",4},{"pdh.dll","PdhGetFormattedCounterArrayA",5},{"pdh.dll","PdhGetFormattedCounterArrayW",5},
         {"pdh.dll","PdhValidatePathA",1},{"pdh.dll","PdhValidatePathW",1},
         {"pdh.dll","PdhEnumObjectsA",6},{"pdh.dll","PdhEnumObjectsW",6},{"pdh.dll","PdhEnumObjectItemsA",9},{"pdh.dll","PdhEnumObjectItemsW",9},
@@ -191,34 +239,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_pdh(GuestState& state,Guest
         }
         if(symbol=="PdhCloseQuery"){
             const auto query=pdh_state.queries.find(arg(0));if(query==pdh_state.queries.end())return finish(pdh::invalid_handle);
+            if(query->second.registration)release_registered_wait(query->second.registration);
             for(const auto handle:query->second.counters)pdh_state.counters.erase(handle);pdh_state.queries.erase(query);return finish(0);
         }
-        if(symbol=="PdhCollectQueryData"){
+        if(symbol=="PdhCollectQueryDataEx"){
             const auto query=pdh_state.queries.find(arg(0));if(query==pdh_state.queries.end())return finish(pdh::invalid_handle);
             if(query->second.counters.empty())return finish(pdh::no_data);
-            auto snapshot=std::make_shared<pdh::Snapshot>();
-            if(runtime_.host_clock){
-                const auto host=native_processor_cpu_times();
-                snapshot->cpus.assign(count,{});
-                if(!host.empty()){
-                    // 宿主核心依序分配到客體 vCPU；宿主核心較少時各 vCPU 共用對應核心。
-                    if(host.size()>=count)for(std::size_t i=0;i<host.size();++i){auto& target=snapshot->cpus[i*count/host.size()];target.idle+=host[i].idle;target.kernel+=host[i].kernel;target.user+=host[i].user;}
-                    else for(unsigned i=0;i<count;++i)snapshot->cpus[i]=host[i%host.size()];
-                }
-            }else {
-                // 虛擬時鐘：一個 retired instruction 為一個 tick，與 GetSystemTimes 相同，平均分攤到各 vCPU。
-                std::uint64_t user=0;for(const auto& [id,thread]:threads_.items){(void)id;user+=thread.cycles;}
-                const auto elapsed=runtime_.clock_ticks*count;user=std::min(user,elapsed);
-                for(unsigned i=0;i<count;++i){const auto share=user/count,idle=(elapsed-user)/count;snapshot->cpus.push_back({idle,idle,share,0});}
-            }
-            for(const auto& cpu:snapshot->cpus){snapshot->total.idle+=cpu.idle;snapshot->total.kernel+=cpu.kernel;snapshot->total.user+=cpu.user;}
-            if(runtime_.network.external_io){
-                if(const auto power=native_processor_power_information(count);power && power->size()==count)snapshot->power=*power;
-                snapshot->nominal_mhz=native_processor_information().nominal_mhz;
-                snapshot->memory=native_system_performance();
-            }else snapshot->memory.error=50;
-            for(const auto handle:query->second.counters){auto& counter=pdh_state.counters.at(handle);counter.previous=std::move(counter.current);counter.current=snapshot;}
+            if(query->second.registration){release_registered_wait(query->second.registration);query->second.registration=0;}
+            if(registered_waits_.size()>=64)return finish(pdh::memory_failure);
+            const auto saved_error=last_error_;
+            const auto worker=acquire_wait_worker(state,memory,std::max(UINT64_C(65536),runtime_.image.stack_size));
+            last_error_=saved_error;if(!worker)return finish(pdh::memory_failure);
+            RegisteredWait wait;wait.pdh_query=arg(0);wait.parameter=arg(2);wait.worker=worker;
+            wait.interval_ticks=std::uint64_t{static_cast<std::uint32_t>(arg(1))}*10000000;
+            wait.deadline=runtime_.clock_ticks+std::min(wait.interval_ticks,UINT64_MAX-runtime_.clock_ticks);
+            const auto registration=next_registered_wait_++;registered_waits_.emplace(registration,wait);wait_workers_[worker]=registration;
+            query->second.registration=registration;
+            auto& thread=threads_.items.at(worker);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::RegisteredWait;thread.wait.deadline=wait.deadline;
             return finish(0);
+        }
+        if(symbol=="PdhCollectQueryData" || symbol=="PdhCollectQueryDataWithTime"){
+            const bool with_time=symbol=="PdhCollectQueryDataWithTime";
+            if(with_time){if(!arg(1))return finish(pdh::invalid_argument);memory.check(GuestAddress{arg(1)},8,Access::Write);}
+            std::uint64_t timestamp=0;const auto status=collect_pdh_query(arg(0),&timestamp);
+            if(!status && with_time)memory.store(GuestAddress{arg(1)},64,timestamp);
+            return finish(status);
         }
         // 多字串輸出：A 版以 ANSI（UTF-8 子集）編碼，W 版 UTF-16；長度單位為字元。
         const auto multi=[&](const std::vector<std::u16string>& items){std::u16string list;for(const auto& item:items){list+=item;list.push_back(0);}list.push_back(0);return list;};
@@ -274,7 +319,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_pdh(GuestState& state,Guest
                     case pdh::Counter::UserTime:first=static_cast<std::int64_t>(times.user);break;case pdh::Counter::PrivilegedTime:first=static_cast<std::int64_t>(times.kernel>times.idle?times.kernel-times.idle:0);break;
                     default:{std::uint32_t status=0;const auto value=pdh::value(counter->second,index,count,status);first=value?static_cast<std::int64_t>(*value):0;second=100;break;}}
             }else {std::uint32_t status=0;const auto value=pdh::value(counter->second,index,count,status);if(!value){memory.store(GuestAddress{arg(2)},32,status);return finish(pdh::invalid_data);}first=static_cast<std::int64_t>(*value);}
-            const auto now=runtime_.system_time_state().filetime;memory.store(GuestAddress{arg(2)+4},32,static_cast<std::uint32_t>(now));memory.store(GuestAddress{arg(2)+8},32,static_cast<std::uint32_t>(now>>32));
+            const auto now=current.timestamp;memory.store(GuestAddress{arg(2)+4},32,static_cast<std::uint32_t>(now));memory.store(GuestAddress{arg(2)+8},32,static_cast<std::uint32_t>(now>>32));
             memory.store(GuestAddress{arg(2)+16},64,static_cast<std::uint64_t>(first));memory.store(GuestAddress{arg(2)+24},64,static_cast<std::uint64_t>(second));memory.store(GuestAddress{arg(2)+32},32,1);return finish(0);
         }
         const auto format=static_cast<std::uint32_t>(arg(1));const auto kind=format&0x700U;

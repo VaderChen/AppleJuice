@@ -10,7 +10,7 @@ struct MultimediaThreadTask {
     bool operator==(const MultimediaThreadTask&) const = default;
 };
 enum class ThreadStatus { Runnable, Waiting, Exited };
-enum class ThreadWaitKind { HeapRetry, Http, Resolver, SocketSelect, Objects, Sleep, Critical, CriticalRetry, Completion, CrtLock, StandardInput, ConsoleInput, GuiSend, GuiInput, Slim, Condition, Once, LoaderRetry, ProcessInputIdle, FileIo, RegisteredWait, RegisteredWaitCompletion, TimerQueueCompletion, RegistryNotify, ThreadpoolCompletion, PowerNotificationCompletion, EtwTrace, EtwEnable, DebugEvent, MediaFoundation, ServiceControl, CrtFileRetry, CrtProcess, CrtLockRetry, NativeDevice, Perflib, HandleTransfer, ProcessCreation, RegistryIo };
+enum class ThreadWaitKind { HeapRetry, Http, Resolver, SocketSelect, Objects, Sleep, Critical, CriticalRetry, Completion, CrtLock, StandardInput, ConsoleInput, GuiSend, GuiInput, Slim, Condition, Once, LoaderRetry, ProcessInputIdle, FileIo, RegisteredWait, RegisteredWaitCompletion, TimerQueueCompletion, RegistryNotify, ThreadpoolCompletion, PowerNotificationCompletion, EtwTrace, EtwEnable, DebugEvent, MediaFoundation, ServiceControl, CrtFileRetry, CrtProcess, CrtLockRetry, NativeDevice, Perflib, HandleTransfer, ProcessCreation, RegistryIo, Address };
 struct ThreadWait {
     ThreadWaitKind kind{ThreadWaitKind::Objects};
     std::vector<std::uint64_t> handles;
@@ -18,6 +18,7 @@ struct ThreadWait {
     std::uint64_t deadline{UINT64_MAX};
     bool all{}, alertable{};
     bool shared{}, critical{}, signaled{}, timed_out{};
+    bool slim_timed{}; // 共用 SRW 等待的限時介面：取得回 true，逾時回 false。
     std::uint64_t gui_window{},gui_drag_detection{},gui_move_size{};
     std::uint32_t gui_min{},gui_max{},gui_mask{UINT32_MAX};bool gui_new_only{},gui_callbacks{true};
     bool operator==(const ThreadWait&) const = default;
@@ -79,6 +80,8 @@ struct GuestThread {
     std::uint64_t gui_pump_time{},dpi_context{};
     std::uint64_t message_extra{};std::uint32_t message_time{},message_position{};
     bool terminating{},forced_stop{};
+    // _beginthread 傳回的 handle：常式返回時結束碼為 0，執行緒結束時由 CRT 自動關閉。
+    std::uint64_t crt_detached_handle{};
     ThreadStatus status{ThreadStatus::Runnable};
     ThreadWait wait;
     std::optional<ThreadWait> registry_deferred_wait; // I/O 門閂不消耗已喚醒入口的原等待結果。

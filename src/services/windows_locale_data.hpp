@@ -30,4 +30,9 @@ char16_t windows_crt_map_character(char16_t,const CrtLocaleCategory&,bool upper)
 struct CrtDecodedCharacter {std::uint32_t character{};std::size_t bytes{};enum class Status{Complete,Partial,Invalid} status{Status::Invalid};};
 CrtDecodedCharacter windows_crt_decode(std::span<const std::uint8_t>,std::uint32_t page);
 std::optional<std::vector<std::uint8_t>> windows_crt_encode(std::u16string_view,std::uint32_t page);
+// Win32 轉換沿用 CRT 的碼頁選擇；另保留替代字元及嚴格錯誤契約。
+std::optional<std::u16string> windows_nls_decode(std::string_view,std::uint32_t page,bool strict);
+struct NlsEncodedString {std::vector<std::uint8_t> bytes;bool used_default{};};
+std::optional<NlsEncodedString> windows_nls_encode(std::u16string_view,std::uint32_t page,
+                                                bool no_best_fit,std::string_view replacement,bool strict=false);
 }

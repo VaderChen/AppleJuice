@@ -6,11 +6,11 @@
 namespace x64arm {
 struct IconChoice {std::size_t offset{};std::uint32_t width{},height{},depth{},id{};};
 IconChoice choose_icon(std::span<const std::uint8_t>,bool cursor,bool file,
-                       std::uint32_t width,std::uint32_t height,bool monochrome=false);
+                       std::uint32_t width,std::uint32_t height,bool monochrome=false,bool prefer_larger=false);
 GuiIcon decode_icon_resource(std::span<const std::uint8_t>,bool icon=true,
                              std::uint32_t width=0,std::uint32_t height=0,std::uint32_t flags=0);
 GuiIcon decode_icon_file(std::span<const std::uint8_t>,bool cursor,
-                        std::uint32_t width=0,std::uint32_t height=0,std::uint32_t flags=0);
+                        std::uint32_t width=0,std::uint32_t height=0,std::uint32_t flags=0,bool prefer_larger=false);
 std::uint32_t icon_animation_step(const GuiIcon&,std::uint64_t elapsed_ticks);
 void finish_icon(GuiIcon&);
 void resize_icon(GuiIcon&,std::uint32_t,std::uint32_t,bool monochrome=false);

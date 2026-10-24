@@ -33,6 +33,7 @@ ObjectAttributes object_attributes(const GuestMemory& memory,std::uint64_t addre
 }
 std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+#include "concrt_sync_descriptors.inc"
         {"ntdll.dll","NtCreateFile",11,0,0,0x5e2},{"ntdll.dll","NtOpenFile",6,0,0,0x32},
         {"ntdll.dll","NtQueryAttributesFile",2},{"ntdll.dll","NtQueryFullAttributesFile",2},
         {"ntdll.dll","NtReadFile",9,0,0,0x40},{"ntdll.dll","NtWriteFile",9,0,0,0x40},
@@ -54,6 +55,28 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         {"msvcp140.dll","_Cnd_signal",1,0,0,0,true},
         {"msvcp140.dll","_Cnd_broadcast",1,0,0,0,true},
         {"msvcp140.dll","_Thrd_yield",0,0,0,0,true},
+        {"msvcp140.dll","_Mtx_trylock",1,0,0,0,true},
+        {"msvcp140.dll","_Mtx_current_owns",1,0,0,0,true},
+        {"msvcp140.dll","_Mtx_clear_owner",1,0,0,0,true},
+        {"msvcp140.dll","_Mtx_reset_owner",1,0,0,0,true},
+        {"msvcp140.dll","_Mtx_getconcrtcs",1,0,0,0,true},
+        {"msvcp140.dll","_Mtx_init",2,0,0,0,true},
+        {"msvcp140.dll","_Mtx_destroy",1,0,0,0,true},
+        {"msvcp140.dll","_Cnd_init",1,0,0,0,true},
+        {"msvcp140.dll","_Cnd_destroy",1,0,0,0,true},
+        {"msvcp140.dll","_Cnd_timedwait",3,0,0,0,true},
+        {"msvcp140.dll","_Cnd_register_at_thread_exit",3,0,0,0,true},
+        {"msvcp140.dll","_Cnd_unregister_at_thread_exit",1,0,0,0,true},
+        {"msvcp140.dll","_Cnd_do_broadcast_at_thread_exit",0,0,0,0,true},
+        {"msvcp140.dll","_Thrd_id",0,0,0,0,true},
+        {"msvcp140.dll","_Thrd_hardware_concurrency",0,0,0,0,true},
+        {"msvcp140.dll","_Thrd_sleep",1,0,0,0,true},
+        {"msvcp140.dll","_Thrd_detach",1,1,0,0,true},
+        {"msvcp140.dll","_Thrd_join",2,1,0,0,true},
+        {"msvcp140.dll","_Thrd_start",3,0,0,0,true},
+        {"msvcp140.dll","_Query_perf_counter",0,0,0,0,true},
+        {"msvcp140.dll","_Query_perf_frequency",0,0,0,0,true},
+        {"msvcp140.dll","_Xtime_get_ticks",0,0,0,0,true},
         {"msvcp140.dll","??0_Lockit@std@@QEAA@H@Z",2},
         {"msvcp140.dll","??0_Lockit@std@@QEAA@XZ",1},
         {"msvcp140.dll","??1_Lockit@std@@QEAA@XZ",1},
@@ -61,10 +84,29 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         {"msvcp140.dll","??0_Lockit@std@@QAE@XZ",0},
         {"msvcp140.dll","??1_Lockit@std@@QAE@XZ",0},
         {"internal-msvcp","GlobalLocksInit",3},
+        // PPL（Concurrency）在 msvcp140 的匯出：執行緒池工作、內容回呼與工作事件記錄。
+        {"internal-msvcp","TaskSchedulerCallback",3},
+        {"msvcp140.dll","??0task_continuation_context@Concurrency@@AEAA@XZ",1},{"msvcp140.dll","??0task_continuation_context@Concurrency@@AAE@XZ",0},
+        {"msvcp140.dll","?GetCurrentThreadId@platform@details@Concurrency@@YAJXZ",0,0,0,0,true},
+        {"msvcp140.dll","?ReportUnhandledError@_ExceptionHolder@details@Concurrency@@AEAAXXZ",1},{"msvcp140.dll","?ReportUnhandledError@_ExceptionHolder@details@Concurrency@@AAEXXZ",0},
+        {"msvcp140.dll","?_CallInContext@_ContextCallback@details@Concurrency@@QEBAXV?$function@$$A6AXXZ@std@@_N@Z",3},
+        {"msvcp140.dll","?_Capture@_ContextCallback@details@Concurrency@@AEAAXXZ",1},{"msvcp140.dll","?_Capture@_ContextCallback@details@Concurrency@@AAEXXZ",0},
+        {"msvcp140.dll","?_Reset@_ContextCallback@details@Concurrency@@AEAAXXZ",1},{"msvcp140.dll","?_Reset@_ContextCallback@details@Concurrency@@AAEXXZ",0},
+        {"msvcp140.dll","?_LogCancelTask@_TaskEventLogger@details@Concurrency@@QEAAXXZ",1},{"msvcp140.dll","?_LogScheduleTask@_TaskEventLogger@details@Concurrency@@QEAAX_N@Z",2},
+        {"msvcp140.dll","?_LogTaskCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ",1},{"msvcp140.dll","?_LogTaskExecutionCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ",1},
+        {"msvcp140.dll","?_LogWorkItemCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ",1},{"msvcp140.dll","?_LogWorkItemStarted@_TaskEventLogger@details@Concurrency@@QEAAXXZ",1},
+        {"msvcp140.dll","?_LogCancelTask@_TaskEventLogger@details@Concurrency@@QAEXXZ",0},{"msvcp140.dll","?_LogScheduleTask@_TaskEventLogger@details@Concurrency@@QAEX_N@Z",1},
+        {"msvcp140.dll","?_LogTaskCompleted@_TaskEventLogger@details@Concurrency@@QAEXXZ",0},{"msvcp140.dll","?_LogTaskExecutionCompleted@_TaskEventLogger@details@Concurrency@@QAEXXZ",0},
+        {"msvcp140.dll","?_LogWorkItemCompleted@_TaskEventLogger@details@Concurrency@@QAEXXZ",0},{"msvcp140.dll","?_LogWorkItemStarted@_TaskEventLogger@details@Concurrency@@QAEXXZ",0},
+        {"msvcp140.dll","?_ReportUnobservedException@details@Concurrency@@YAXXZ",0,0,0,0,true},
+        {"msvcp140.dll","?_Schedule_chore@details@Concurrency@@YAHPEAU_Threadpool_chore@12@@Z",1,0,0,0,true},{"msvcp140.dll","?_Schedule_chore@details@Concurrency@@YAHPAU_Threadpool_chore@12@@Z",1,0,0,0,true},
+        {"msvcp140.dll","?_Release_chore@details@Concurrency@@YAXPEAU_Threadpool_chore@12@@Z",1,0,0,0,true},{"msvcp140.dll","?_Release_chore@details@Concurrency@@YAXPAU_Threadpool_chore@12@@Z",1,0,0,0,true},
         {"msvcp140.dll","?_Execute_once@std@@YAHAEAUonce_flag@1@P6AHPEAX1PEAPEAX@Z1@Z",3,0,0,0,true},
         {"msvcp140.dll","?_Execute_once@std@@YAHAAUonce_flag@1@P6GHPAX1PAPAX@Z1@Z",3,0,0,0,true},
         {"ntdll.dll","RtlAnsiStringToUnicodeString",3,0,0,0x4},{"ntdll.dll","RtlCompareUnicodeString",3,0,0,0x4},{"ntdll.dll","RtlEqualUnicodeString",3,0,0,0x4},
         {"ntdll.dll","RtlFreeUnicodeString",1},{"ntdll.dll","RtlGetLastNtStatus",0}
+        ,{"ntdll.dll","RtlDetermineDosPathNameType_U",1},{"ntdll.dll","RtlIsDosDeviceName_U",1}
+        ,{"ntdll.dll","RtlGetFullPathName_U",4},{"ntdll.dll","RtlDosPathNameToNtPathName_U",4},{"ntdll.dll","RtlDosPathNameToNtPathName_U_WithStatus",4}
         ,{"ntdll.dll","LdrLockLoaderLock",3,0,0,1},{"ntdll.dll","LdrUnlockLoaderLock",2,0,0,1}
         ,{"ntdll.dll","LdrLoadDll",4},{"ntdll.dll","LdrGetDllHandle",4},{"ntdll.dll","LdrGetProcedureAddress",4,0,0,0x4},{"ntdll.dll","LdrUnloadDll",1}
         ,{"ntdll.dll","RtlAreLongPathsEnabled",0}
@@ -162,22 +204,84 @@ std::optional<ExecutionResult> WindowsServices::dispatch_software_interrupt(Gues
 std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall call(state,memory,service);const auto name=service.symbol;const auto saved_error=last_error_;const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto finish=[&](std::uint64_t status){if(name.starts_with("Nt"))threads_.items.at(threads_.current).last_native_status=static_cast<std::uint32_t>(status);last_error_=saved_error;call.return_to(state,status);return std::optional<std::uint32_t>{};};
+    const auto failure=[&](std::uint32_t status){return finish(name=="RtlDosPathNameToNtPathName_U" || name=="RtlGetFullPathName_U" || name=="RtlDetermineDosPathNameType_U" || name=="RtlIsDosDeviceName_U"?0:status);};
     NativeOperation op;op.symbol=name;op.saved_error=saved_error;for(unsigned i=0;i<service.arguments;++i)op.arguments[i]=call(i);
     const auto start=[&](std::string_view family,std::string_view symbol,std::vector<std::uint64_t> arguments){
         const auto id=next_native_operation_++;native_operations_.emplace(id,op);start_callbacks(state,memory,{{resolve(family,symbol).value,std::move(arguments)}},Continuation::NativeOperation,id);return std::optional<std::uint32_t>{};
     };
     const auto scratch=[&](std::size_t size){op.scratch=allocate_heap(memory,size);if(!op.scratch)throw NativeError{0xc0000017U};memory.write(GuestAddress{op.scratch},std::vector<std::uint8_t>(size));return op.scratch;};
     const auto security=[&](const ObjectAttributes& attr,std::uint64_t at){memory.store(GuestAddress{at},32,x86_?12U:24U);memory.store(GuestAddress{at+unit},bits,attr.security);memory.store(GuestAddress{at+unit*2},32,(attr.flags&2U)!=0);return at;};
+    const auto path_string=[&](std::uint64_t pointer){try{return read_utf16(memory,GuestAddress{pointer},32768);}catch(const std::invalid_argument&){throw NativeError{0xc0000033U};}};
     const auto path=[&](ObjectAttributes attr){
         auto value=std::move(attr.name);if(value.find(u'\0')!=value.npos || value.empty())throw NativeError{0xc0000033U};
         if(attr.root){const auto file=files_.find(attr.root);if(file==files_.end())throw NativeError{object_type(attr.root).empty()?0xc0000008U:0xc0000024U};if(!(file->second.metadata.attributes&0x10U))throw NativeError{0xc0000024U};if(value.front()==u'\\' || value.find(u':')!=value.npos)throw NativeError{0xc0000033U};value=utf8_to_utf16(file->second.path)+u"\\"+value;}
-        else if(value.starts_with(u"\\??\\"))value.erase(0,4);
-        else if(value.starts_with(u"\\DosDevices\\"))value.erase(0,12);
+        else if(value.starts_with(u"\\??\\") || value.starts_with(u"\\DosDevices\\")){
+            value.erase(0,value.starts_with(u"\\??\\")?4:12);
+            if(value.size()>=4 && windows_path_upper(value[0])==u'U' && windows_path_upper(value[1])==u'N' && windows_path_upper(value[2])==u'C' && value[3]==u'\\')value=u"\\\\"+value.substr(4);
+            else if(windows_dos_path_type(value)!=WindowsDosPathType::DriveAbsolute){
+                const auto volume=u"\\\\?\\"+value;
+                if(windows_volume_letter(std::u16string_view(volume)))value=volume;
+                else throw NativeError{0xc0000034U};
+            }
+        }
         else {bool matched=false;for(char16_t drive=u'A';drive<=u'Z';++drive){const auto device=windows_device_name(drive);if(value.starts_with(device+u"\\")){value=std::u16string{drive,u':'}+value.substr(device.size());matched=true;break;}}if(!matched && (value.size()<3 || value[1]!=u':'))throw NativeError{0xc000003bU};}
         return value;
     };
     try{
+#include "concrt_sync_handlers.inc"
 #include "msvcp_sync_handlers.inc"
+        if(name=="RtlDetermineDosPathNameType_U" || name=="RtlIsDosDeviceName_U"){
+            if(!call(0))throw NativeError{0xc000000dU};
+            const auto input=path_string(call(0));
+            return finish(name=="RtlDetermineDosPathNameType_U"?static_cast<std::uint32_t>(windows_dos_path_type(input)):windows_dos_device(input));
+        }
+        if(name=="RtlGetFullPathName_U" || name=="RtlDosPathNameToNtPathName_U" || name=="RtlDosPathNameToNtPathName_U_WithStatus"){
+            const bool full=name=="RtlGetFullPathName_U";
+            if(!call(0))throw NativeError{0xc0000033U};
+            const auto input=path_string(call(0));
+            if(input.empty())throw NativeError{0xc0000033U};
+            // Microsoft 公開的 DOS→NT 契約將第四參數保留；不假造目前目錄參照物件。
+            if(!full && call(3))throw NativeError{0xc000000dU};
+            const auto part_pointer=call(full?3:2);
+            if(part_pointer)memory.check(GuestAddress{part_pointer},unit,Access::Write);
+            const bool literal=!full && (input.starts_with(u"\\\\?\\") || (input.starts_with(u"\\??\\") && input.size()>4) || (input.starts_with(u"\\\\.\\") && windows_dos_device(input)==0x00080006U));
+            std::u16string result;
+            bool device=false;
+            try{
+                if(literal)result=u"\\??\\"+input.substr(4);
+                else {
+                    const auto dos_device=windows_dos_device(input);device=dos_device!=0;
+                    if(!full && (dos_device>>16)){
+                        const auto parent=full_windows_environment_path(input.substr(0,(dos_device>>16)/2),runtime_.current_directory,runtime_.environment);
+                        const auto info=filesystem_.information(utf16_to_utf8(parent));
+                        if(info.error || !(info.metadata.attributes&0x10U))throw NativeError{0xc0000033U};
+                    }
+                    result=full_windows_environment_path(input,runtime_.current_directory,runtime_.environment);
+                    if(!full){
+                        const auto type=windows_dos_path_type(result);
+                        if(type==WindowsDosPathType::UncAbsolute)result=u"\\??\\UNC\\"+result.substr(2);
+                        else if(type==WindowsDosPathType::LocalDevice)result=u"\\??\\"+result.substr(4);
+                        else result=u"\\??\\"+result;
+                    }
+                }
+            }catch(const std::invalid_argument&){throw NativeError{0xc0000033U};}
+            if(result.size()>32766)throw NativeError{0xc0000033U};
+            const auto bytes=utf16_bytes(result);const auto part=windows_path_file_part(result,device);
+            if(full){
+                if(part_pointer)memory.store(GuestAddress{part_pointer},bits,0);
+                if(static_cast<std::uint32_t>(call(1))<bytes.size())return finish(bytes.size());
+                memory.write(GuestAddress{call(2)},bytes);
+                if(part_pointer && part!=result.npos)memory.store(GuestAddress{part_pointer},bits,call(2)+part*2);
+                return finish(bytes.size()-2);
+            }
+            memory.check(GuestAddress{call(1)},unit*2,Access::Write);
+            const auto buffer=scratch(bytes.size());memory.write(GuestAddress{buffer},bytes);
+            memory.write(GuestAddress{call(1)},std::vector<std::uint8_t>(unit*2));
+            memory.store(GuestAddress{call(1)},16,bytes.size()-2);memory.store(GuestAddress{call(1)+2},16,bytes.size());
+            memory.store(GuestAddress{call(1)+unit},bits,buffer);
+            if(part_pointer)memory.store(GuestAddress{part_pointer},bits,part==result.npos?0:buffer+part*2);
+            op.scratch=0;return finish(name=="RtlDosPathNameToNtPathName_U"?1:0);
+        }
         if(name=="NtQueryMutant"){
             // MUTANT_BASIC_INFORMATION：CurrentCount=1-遞迴次數、OwnedByCaller、AbandonedState；MUTANT_OWNER_INFORMATION：擁有者 CLIENT_ID。
             const auto handle=runtime_.wait_objects.find(call(0));
@@ -346,12 +450,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             return start("kernel32.dll",writing?"WriteFile":"ReadFile",{call(0),call(5),call(6),at+32,at+64});
         }
         throw HostCallFault("未知 NT 原生服務");
-    }catch(const NativeError& error){if(op.scratch)(void)free_heap(memory,op.scratch,state);return finish(error.status);}
-    catch(const MemoryFault&){if(op.scratch)(void)free_heap(memory,op.scratch,state);return finish(0xc0000005U);}
-    catch(const std::bad_alloc&){if(op.scratch)(void)free_heap(memory,op.scratch,state);return finish(0xc0000017U);}
+    }catch(const NativeError& error){if(op.scratch)(void)free_heap(memory,op.scratch,state);return failure(error.status);}
+    catch(const MemoryFault&){if(op.scratch)(void)free_heap(memory,op.scratch,state);return failure(0xc0000005U);}
+    catch(const std::bad_alloc&){if(op.scratch)(void)free_heap(memory,op.scratch,state);return failure(0xc0000017U);}
 }
 std::optional<std::uint32_t> WindowsServices::resume_nt_native(GuestState& state,GuestMemory& memory,std::uint64_t id,std::uint64_t value){
     auto op=native_operations_.at(id);native_operations_.erase(id);const auto& a=op.arguments;const auto name=op.symbol;const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);auto status=nt_status(last_error_);bool keep_scratch=false;
+    if (name.find("@critical_section@Concurrency@@") != name.npos || name.find("@_Condition_variable@details@Concurrency@@") != name.npos) {
+        const bool scoped = name.starts_with("??0scoped_lock@"), waiting = name.starts_with("?wait");
+        const bool trying = name.starts_with("?try_lock");
+        if (scoped || waiting || name.starts_with("?lock@") || (trying && (value & 0xffU)))
+            memory.store(GuestAddress{a[scoped || waiting ? 1 : 0]}, bits, threads_.current);
+        last_error_ = op.saved_error;
+        complete_call(state, memory, scoped ? a[0] : trying || name.starts_with("?wait_for@") ? (value & 0xffU) : 0);
+        return std::nullopt;
+    }
     if(name.find("_Lockit@std@@")!=name.npos){
         if(!op.information){
             if(!value)throw HostCallFault("STL 共用鎖初始化失敗");
@@ -362,15 +475,33 @@ std::optional<std::uint32_t> WindowsServices::resume_nt_native(GuestState& state
         }
         last_error_=op.saved_error;complete_call(state,memory,name.starts_with("??0")?a[0]:0);return std::nullopt;
     }
-    if(name.starts_with("_Mtx_") || name.starts_with("_Cnd_") || name=="_Thrd_yield" || name.starts_with("?_Execute_once@std@@")){
-        if(name=="_Mtx_lock" || name=="_Cnd_wait"){
-            const auto address=a[name=="_Cnd_wait"?1:0],owner=address+(x86_?40U:72U);
+    if(name.starts_with("?_Schedule_chore@")){
+        // CreateThreadpoolWork 成功後寫回 _M_work 再 SubmitThreadpoolWork；失敗回 GetLastError()。
+        if(!op.information){
+            if(!value){const auto error=last_error_?last_error_:8U;last_error_=op.saved_error;complete_call(state,memory,error);return std::nullopt;}
+            memory.store(GuestAddress{a[0]},bits,value);op.information=1;const auto token=next_native_operation_++;native_operations_.emplace(token,op);
+            start_callbacks(state,memory,{{resolve("kernel32.dll","SubmitThreadpoolWork").value,{value}}},Continuation::NativeOperation,token);return std::nullopt;
+        }
+        last_error_=op.saved_error;complete_call(state,memory,0);return std::nullopt;
+    }
+    if(name.starts_with("?_Release_chore@")){last_error_=op.saved_error;complete_call(state,memory,0);return std::nullopt;}
+    if(name.starts_with("_Mtx_") || name.starts_with("_Cnd_") || name.starts_with("_Thrd_") || name.starts_with("?_Execute_once@std@@")){
+        // _Thrd_result：_Success 0、_Timedout 2、_Busy 3、_Error 4。
+        std::uint64_t result=0;
+        const bool acquired=name=="_Mtx_lock" || name=="_Cnd_wait" || name=="_Cnd_timedwait" || (name=="_Mtx_trylock" && (value&0xffU));
+        if(name=="_Mtx_trylock" && !(value&0xffU))result=3;
+        if(name=="_Cnd_timedwait" && !value)result=last_error_==1460?2:4;
+        if(name=="_Thrd_detach" && !value)result=4;
+        // _Thrd_start 與 STL 相同：handle 寫回 _Thrd_t，建立失敗時 id 清為 0 並回 _Error。
+        if(name=="_Thrd_start"){memory.store(GuestAddress{a[0]},bits,value);if(!value){memory.store(GuestAddress{a[0]+unit},32,0);result=4;}}
+        if(acquired){
+            const auto address=a[name.starts_with("_Cnd_")?1:0],owner=address+(x86_?40U:72U);
             memory.store(GuestAddress{owner},32,thread_identifier(threads_.current));
             memory.store(GuestAddress{owner+4},32,memory.load(GuestAddress{owner+4},32)+1);
         }
         // once 的回呼失敗及 LastError 完整沿用 InitOnceExecuteOnce。
         if(!name.starts_with("?_Execute_once@std@@"))last_error_=op.saved_error;
-        complete_call(state,memory,name.starts_with("?_Execute_once@std@@")?value:0);
+        complete_call(state,memory,name.starts_with("?_Execute_once@std@@")?value:result);
         return std::nullopt;
     }
     if(name=="RtlCreateHeap"){if(op.scratch)(void)free_heap(memory,op.scratch,state);last_error_=op.saved_error;complete_call(state,memory,value);return std::nullopt;}

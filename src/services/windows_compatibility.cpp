@@ -3,6 +3,7 @@
 #include "virtual_firmware.hpp"
 #include "x3daudio.hpp"
 #include "windows_crt_character.hpp"
+#include "windows_locale_data.hpp"
 #include "x64arm/process_debugger.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/cpu_features.hpp"
@@ -132,7 +133,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"newdev.dll","DiInstallDriverA",4,0,0,4},{"newdev.dll","DiInstallDriverW",4,0,0,4},{"newdev.dll","DiUninstallDriverA",4,0,0,4},{"newdev.dll","DiUninstallDriverW",4,0,0,4},
         {"setupapi.dll","SetupDiCallClassInstaller",3,0,0,1},{"setupapi.dll","SetupDiRegisterDeviceInfo",6,0,0,4},{"setupapi.dll","SetupDiRemoveDevice",2},
         CM_SERVICE("CM_Get_DevNode_PropertyW",6,33),
-        {"cfgmgr32.dll","CM_Register_Notification",4},{"cfgmgr32.dll","CM_Unregister_Notification",1},
+        {"cfgmgr32.dll","CM_Register_Notification",4},{"cfgmgr32.dll","CM_Unregister_Notification",1},{"cfgmgr32.dll","CM_MapCrToWin32Err",2},
         CM_SERVICE("CM_Locate_DevNodeA",3,4),CM_SERVICE("CM_Locate_DevNodeW",3,4),
         CM_SERVICE("CM_Get_Child",3,6),CM_SERVICE("CM_Get_Sibling",3,6),CM_SERVICE("CM_Get_Parent",3,6),
         CM_SERVICE("CM_Get_DevNode_Status",4,12),
@@ -296,17 +297,6 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
     };
 #undef CM_SERVICE
     return table;
-}
-namespace {
-std::u16string full_path(std::u16string path,std::u16string_view current) {
-    // 延伸長度的絕對 DOS 路徑保留命名空間與字元；實際 I/O 仍由掛載層檢查。
-    if(path.starts_with(u"\\\\?\\") && path.size()>=7 && (path[4]==u'C' || path[4]==u'c') && path[5]==u':' && path[6]==u'\\'){
-        if(path.find(u'\0')!=path.npos)throw std::invalid_argument("路徑包含 NUL");
-        return path;
-    }
-    // C:、C:.、C:檔名皆相對於該磁碟的工作目錄，不能直接去除磁碟字首。
-    return normalized_windows_path(std::move(path),current);
-}
 }
 // CRT 與內建 C++ 例外物件共用訊息配置、複製及銷毀，保留 ABI padding。
 std::uint64_t WindowsServices::crt_duplicate_string(GuestMemory& memory,std::uint64_t source,bool wide){
@@ -559,12 +549,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         else if(extended && arg(0)!=2)fail(1332); // 本機帳號只有 SAM compatible 名稱，沒有網域 DN／UPN。
         else {
             initialize_tokens();const auto& sid=runtime_.token_objects.at(effective_token_id()).user.sid;
-            std::u16string value=extended?u"X64ARM\\user":u"user";
-            if(sid!=runtime_.token_objects.at(1).user.sid){
-                const auto* account=security::find_account(std::span<const std::uint8_t>{sid});
-                if(!account){fail(1332);arg.return_to(state,result);return std::nullopt;}
-                value=utf8_to_utf16(extended && !account->domain.empty()?std::string(account->domain)+"\\"+std::string(account->name):std::string(account->name));
-            }
+            const auto account=security::resolve_account(sid,runtime_.token_objects.at(1).user.sid);
+            if(!account){fail(1332);arg.return_to(state,result);return std::nullopt;}
+            const auto value=utf8_to_utf16(extended && !account->domain.empty()?std::string(account->domain)+"\\"+std::string(account->name):std::string(account->name));
             const auto text=utf16_to_utf8(value);const auto count=(wide?value.size():text.size())+1;
             const auto capacity=memory.load(GuestAddress{size},32);memory.check(GuestAddress{size},4,Access::Write);
             if(!buffer || capacity<count){memory.store(GuestAddress{size},32,count);fail(extended?234:122);}
@@ -572,11 +559,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         }
     }
     else if(symbol.starts_with("GetLocaleInfo"))return invoke_locale(state,memory,service);
-    else if(symbol=="IsValidCodePage") result=(dword(0)==65001 || dword(0)==1252)?1:0;
+    else if(symbol=="IsValidCodePage") result=dword(0)>3 && windows_crt_codepage(dword(0)).has_value();
     else if(symbol=="GetOEMCP") result=65001;
     else if(symbol=="GetCPInfo") {
-        if((dword(0)!=0 && dword(0)!=1 && dword(0)!=65001 && dword(0)!=1252) || !arg(1)) fail(87);
-        else { memory.write(GuestAddress{arg(1)},std::array<std::uint8_t,20>{}); memory.store(GuestAddress{arg(1)},32,dword(0)==1252?1:4); memory.store(GuestAddress{arg(1)+4},8,'?'); result=1; }
+        const auto page=dword(0)==0 || dword(0)==1 || dword(0)==3?65001U:dword(0);const auto info=windows_crt_codepage(page);
+        if(!info || !arg(1))fail(87);
+        else{
+            std::array<std::uint8_t,20> bytes{};bytes[0]=static_cast<std::uint8_t>(info->maximum_character_bytes);bytes[4]='?';
+            unsigned at=6;bool valid=true;
+            for(unsigned i=0;i<256;++i)if(info->lead[i]){const auto first=i;while(i+1<256 && info->lead[i+1])++i;if(at+2>18){valid=false;break;}bytes[at++]=static_cast<std::uint8_t>(first);bytes[at++]=static_cast<std::uint8_t>(i);}
+            if(!valid)fail(87);else{memory.write(GuestAddress{arg(1)},bytes);result=1;}
+        }
     }
     else if(symbol=="GetConsoleScreenBufferInfo")return invoke_console_control(state,memory,service);
     else if (symbol == "CommandLineToArgvW") {
@@ -790,12 +783,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         const bool crt = symbol.front() == '_', current = symbol.ends_with("getcwd") || symbol.starts_with("GetCurrentDirectory");
         const bool wide = symbol == "_wgetcwd" || symbol == "_wfullpath" || symbol.back() == 'W';
         const auto pointer = current ? 0 : crt ? arg(1) : arg(0);
-        std::u16string path;
+        std::u16string path;bool device=false;
         try {
             auto input=pointer ? (wide ? read_utf16(memory,GuestAddress{pointer}) : utf8_to_utf16(read_ansi(memory,pointer))) : std::u16string{};
-            if(current) path=runtime_.current_directory;
+            if(current || (crt && input.empty())) path=runtime_.current_directory;
             else {
-                path=full_path(std::move(input),runtime_.current_directory);
+                device=windows_dos_device(input)!=0;
+                path=full_windows_environment_path(std::move(input),runtime_.current_directory,runtime_.environment);
             }
         }
         catch (const std::invalid_argument&) { if (crt) { memory.store(GuestAddress{runtime_.errno_cell}, 32, 22); result = 0; } else fail(123); arg.return_to(state, result); return std::nullopt; }
@@ -815,9 +809,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             if (!crt && !current && arg(3)) memory.check(GuestAddress{arg(3)}, x86_?4:8, Access::Write);
             memory.write(GuestAddress{destination}, bytes); result = crt ? destination : count - 1;
             if (!crt && !current && arg(3)) {
-                const auto slash = path.find_last_of(u'\\');
-                const auto offset = wide ? (slash + 1) * 2 : utf16_to_utf8(path.substr(0, slash + 1)).size();
-                memory.store(GuestAddress{arg(3)}, x86_?32:64, slash + 1 == path.size() ? 0 : destination + offset);
+                const auto part=windows_path_file_part(path,device);
+                const auto offset=part==path.npos?0:wide?part*2:utf16_to_utf8(path.substr(0,part)).size();
+                memory.store(GuestAddress{arg(3)},x86_?32:64,part==path.npos?0:destination+offset);
             }
         }
     } else if (symbol == "DuplicateHandle") {
@@ -831,6 +825,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             arg.return_to(state,result);return std::nullopt;
         }
         if(!current_process_handle(arg(0)) || (arg(2) && !current_process_handle(arg(2))))return duplicate_remote_handle(state,memory,service);
+        if(const auto source=arg(1);source>=0x100 && source<=0x102 && standard_open_[source-0x100]){
+            // 標準串流以 0x100～0x102 代表宿主即時描述元（CRT fd 0～2 共用同一狀態）。同程序複本沿用同一串流值並
+            // 增加參照數，寫入、型別與重新導向保持一致；跨程序仍由 duplicate_remote_handle 以描述元傳遞。
+            const auto stream=static_cast<unsigned>(source-0x100);const bool close_source=(dword(6)&1U)!=0;
+            if(!current_process_handle(arg(0),0x40) || (arg(2) && !current_process_handle(arg(2),0x40)))fail(5);
+            else if(dword(6)&~3U)fail(87);
+            else if(close_source && (runtime_.handle_flags[source]&2U))fail(5);
+            else if(!arg(2)){
+                if(!close_source)fail(87);
+                else {if(standard_duplicates_[stream])--standard_duplicates_[stream];else standard_open_[stream]=false;result=1;}
+            }else if(!arg(3))fail(87);
+            else{
+                memory.check(GuestAddress{arg(3)},x86_?4:8,Access::Write);memory.store(GuestAddress{arg(3)},x86_?32:64,source);
+                if(!close_source)++standard_duplicates_[stream];
+                if(arg(5))runtime_.handle_flags[source]|=1U;
+                result=1;
+            }
+            arg.return_to(state,result);return std::nullopt;
+        }
         if(const auto event=runtime_.wait_objects.find(arg(1));event!=runtime_.wait_objects.end() && (event->second.kind==WaitObject::Kind::Event || event->second.kind==WaitObject::Kind::MemoryResource || event->second.kind==WaitObject::Kind::Mutex)){
             std::uint32_t access=event->second.access,access_error=0;
             if(!(dword(6)&2U)){try{initialize_tokens();const auto mutex=event->second.kind==WaitObject::Kind::Mutex;const auto all=mutex?0x1f0001U:0x1f0003U;const security::AccessMapping mapping{0x20001U,mutex?0x20001U:0x20002U,0x120000U,all};const auto descriptor=mutex?(runtime_.mutex_objects.at(event->second.mutex).shared?shared_object_security(runtime_.mutex_objects.at(event->second.mutex).shared->descriptor()):runtime_.mutex_objects.at(event->second.mutex).security_descriptor):(event->second.shared_event?shared_object_security(event->second.shared_event->descriptor()):event->second.security_descriptor);access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(descriptor),access,dword(4),mapping);}catch(const SecurityDescriptorError& failure){access_error=failure.code;}}
@@ -1211,11 +1224,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     } else if (symbol == "WideCharToMultiByte" || symbol == "MultiByteToWideChar") {
         const bool wide = symbol == "WideCharToMultiByte";
         const auto count = sint(3), capacity = sint(5); const auto codepage = dword(0),flags=dword(1);
+        const auto page=codepage==0 || codepage==1 || codepage==3?65001U:codepage;
+        const auto page_info=windows_crt_codepage(page);
         const bool legacy_composition=codepage==0 || codepage==3 || codepage==1252;
-        const auto allowed_flags=wide?(codepage==1252?0x480U:0x80U):(legacy_composition?0xfU:8U);
-        if (codepage != 0 && codepage != 1 && codepage != 3 && codepage != 65001 && codepage != 1252) fail(87);
+        const bool multibyte=page!=65001 && page!=1252;
+        const auto allowed_flags=wide?(codepage==1252?0x480U:multibyte && page!=54936?0x400U:0x80U):(legacy_composition?0xfU:multibyte && page!=54936?0xbU:8U);
+        if (!page_info) fail(87);
         else if((flags&~allowed_flags) || (!wide && (flags&3)==3))fail(1004);
-        else if (count == 0 || count < -1 || capacity < 0 || !arg(2) || (!arg(4) && capacity)) fail(87);
+        else if (count == 0 || count < -1 || capacity < 0 || !arg(2) || (!arg(4) && capacity) || arg(2)==arg(4)) fail(87);
         // CP_UTF8 的明確參數限制不套用到 CP_ACP／CP_OEMCP 別名。
         else if (wide && codepage==65001 && (arg(6) || arg(7))) fail(87);
         else {
@@ -1228,7 +1244,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
                         if (count > 1048576) throw HostCallFault("UTF-16 轉換超過上限");
                         text=read_utf16_counted(memory,GuestAddress{arg(2)},static_cast<std::size_t>(count));
                     }
-                    bool used_default=false;const auto bytes = codepage==1252?utf16_to_cp1252(text,arg(6)?static_cast<char>(memory.load(GuestAddress{arg(6)},8)):'?',used_default):utf16_to_utf8(text);if(codepage!=65001 && arg(7))memory.store(GuestAddress{arg(7)},32,used_default?1:0);output.assign(bytes.begin(), bytes.end()); required = output.size();
+                    bool used_default=false;
+                    if(multibyte){
+                        std::string replacement(1,arg(6)?static_cast<char>(memory.load(GuestAddress{arg(6)},8)):'?');
+                        if(arg(6) && page_info->lead[static_cast<unsigned char>(replacement[0])])replacement.push_back(static_cast<char>(memory.load(GuestAddress{arg(6)+1},8)));
+                        auto converted=windows_nls_encode(text,page,(flags&0x400U)!=0,replacement,(flags&0x80U)!=0);if(!converted)throw std::invalid_argument("無法轉換指定碼頁");
+                        output=std::move(converted->bytes);used_default=converted->used_default;
+                    }else{const auto bytes=codepage==1252?utf16_to_cp1252(text,arg(6)?static_cast<char>(memory.load(GuestAddress{arg(6)},8)):'?',used_default):utf16_to_utf8(text);output.assign(bytes.begin(),bytes.end());}
+                    if(codepage!=65001 && arg(7))memory.store(GuestAddress{arg(7)},32,used_default?1:0);required=output.size();
                 } else {
                     std::string text;
                     if (count == -1) { text = read_ansi(memory, arg(2)); text.push_back(0); }
@@ -1237,11 +1260,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
                         text.resize(static_cast<std::size_t>(count));
                         memory.read(GuestAddress{arg(2)},std::span(reinterpret_cast<std::uint8_t*>(text.data()),text.size()));
                     }
-                    auto converted = codepage==1252?cp1252_to_utf16(text):(flags&8)?utf8_to_utf16(text):utf8_to_utf16_lossy(text);
+                    std::u16string converted;
+                    if(multibyte){auto value=windows_nls_decode(text,page,(flags&8)!=0);if(!value)throw std::invalid_argument("無效的多位元組字元");converted=std::move(*value);}
+                    else converted=codepage==1252?cp1252_to_utf16(text):(flags&8)?utf8_to_utf16(text):utf8_to_utf16_lossy(text);
                     // 相容延伸：虛擬 UTF-8 ACP/THREAD_ACP 仍接受舊 CRT 的組合旗標。
                     // 明確 CP_UTF8 保持僅 0/MB_ERR_INVALID_CHARS；不忽略 NFC/NFD 語意。
                     // CP1252 的映射字元已是 NFC；ACP 的既有 flags=0/8 保留 UTF-8 碼點。
-                    if((codepage==1252 && (flags&2)) || ((codepage==0 || codepage==3) && (flags&3))){auto normalized=normalize_utf16(converted,(flags&2)==0);if(!normalized){fail(50);arg.return_to(state,0);return std::nullopt;}converted=std::move(*normalized);}
+                    if((codepage==1252 && (flags&2)) || ((multibyte || codepage==0 || codepage==3) && (flags&3))){auto normalized=normalize_utf16(converted,(flags&2)==0);if(!normalized){fail(50);arg.return_to(state,0);return std::nullopt;}converted=std::move(*normalized);}
                     required = converted.size(); output = utf16_bytes(converted); output.resize(required * 2);
                 }
             } catch (const std::invalid_argument&) { fail(1113); arg.return_to(state, 0); return std::nullopt; }
@@ -1250,7 +1275,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             else { memory.write(GuestAddress{arg(4)}, output); result = required; }
         }
     } else if (symbol == "AreFileApisANSI") result = 1;
-    else if (symbol == "IsDBCSLeadByteEx") { if (dword(0) != 0 && dword(0) != 1 && dword(0) != 65001 && dword(0)!=1252) fail(87); }
+    else if(symbol=="IsDBCSLeadByteEx"){
+        const auto page=dword(0)==0 || dword(0)==1 || dword(0)==3?65001U:dword(0);const auto info=windows_crt_codepage(page);
+        if(!info)fail(87);else result=info->lead[static_cast<std::uint8_t>(arg(1))];
+    }
     else if (symbol == "IsWow64Process" || symbol == "IsWow64Process2") {
         if(arg(0)!=(x86_?UINT64_C(0xffffffff):UINT64_MAX))fail(6);
         else if(!arg(1) || (symbol=="IsWow64Process2" && !arg(2)))fail(87);

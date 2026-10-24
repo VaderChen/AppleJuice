@@ -182,6 +182,21 @@ const KnownAccount* find_account(std::span<const std::uint8_t> sid) {
     });
     return found==known_accounts.end()?nullptr:&*found;
 }
+std::optional<AccountIdentity> resolve_account(std::string_view name, std::span<const std::uint8_t> primary_sid) {
+    // 虛擬使用者與 well-known SID 共用雙向查找；不查詢宿主使用者資料庫。
+    if (!primary_sid.empty() && (same_name(name,"user") || same_name(name,"X64ARM\\user")))
+        return AccountIdentity{{primary_sid.begin(),primary_sid.end()},"user","X64ARM",1};
+    if (const auto* account=find_account(name))
+        return AccountIdentity{account_sid(*account),account->name,account->domain,account->type};
+    return std::nullopt;
+}
+std::optional<AccountIdentity> resolve_account(std::span<const std::uint8_t> sid, std::span<const std::uint8_t> primary_sid) {
+    if (!primary_sid.empty() && std::equal(sid.begin(),sid.end(),primary_sid.begin(),primary_sid.end()))
+        return AccountIdentity{{sid.begin(),sid.end()},"user","X64ARM",1};
+    if (const auto* account=find_account(sid))
+        return AccountIdentity{account_sid(*account),account->name,account->domain,account->type};
+    return std::nullopt;
+}
 Bytes unix_sid(bool group, std::uint32_t id) {
     Bytes sid(16); sid[0]=1; sid[1]=2; sid[7]=22;
     sddl_put(sid,8,group?2U:1U); sddl_put(sid,12,id); return sid;

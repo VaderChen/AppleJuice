@@ -4,6 +4,7 @@
 #include "x64arm/registry_store.hpp"
 #include "x64arm/security_descriptor.hpp"
 #include "iphelper_legacy.hpp"
+#include "ipv4_prefix.h"
 #include "http_proxy_configuration.hpp"
 #include "x64arm/dhcp_lease.hpp"
 #include <arpa/inet.h>
@@ -315,6 +316,20 @@ void WindowsServices::poll_address_notifications(GuestMemory& memory){
 }
 std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);std::uint64_t result=0;
+    if(service.symbol=="ConvertLengthToIpv4Mask" || service.symbol=="ConvertIpv4MaskToLength"){
+        try {
+            if(!arg(1))result=87;
+            else if(service.symbol=="ConvertLengthToIpv4Mask"){
+                const auto length=static_cast<std::uint32_t>(arg(0));
+                memory.store(GuestAddress{arg(1)},32,x64arm_ipv4_mask(length));
+                if(length>32)result=87;
+            }else {
+                const auto length=x64arm_ipv4_length(static_cast<std::uint32_t>(arg(0)));
+                if(length==UINT32_MAX)result=87;else memory.store(GuestAddress{arg(1)},8,length);
+            }
+        }catch(const MemoryFault&){result=87;}
+        arg.return_to(state,result);return std::nullopt;
+    }
     if(service.symbol=="GetExtendedTcpTable" || service.symbol=="GetTcpTable"){arg.return_to(state,tcp_table_call(memory,arg,service.symbol));return std::nullopt;}
     if(service.family=="dhcpcsvc.dll"){
         struct Error {std::uint32_t code;};const auto require=[](bool ok,std::uint32_t code=87){if(!ok)throw Error{code};};

@@ -215,6 +215,28 @@ std::uint32_t WindowsServices::console_sync(unsigned stream,std::size_t start,st
     text+=buffer.cursor_size>=50?"\x1b[2 q":"\x1b[4 q";
     return terminal_write(endpoint.descriptor,text);
 }
+std::uint32_t WindowsServices::write_crt_console(std::u16string_view units,bool wide){
+    const auto current=std::find_if(consoles_.begin(),consoles_.end(),[](const auto& endpoint){return endpoint!=nullptr;});
+    if(current==consoles_.end())return 6;
+    // 直接主控台 I/O 與 stdout 的重新導向獨立；整次輸出共用既有 console 狀態。
+    const auto endpoint=consoles_[1]?consoles_[1]:consoles_[2]?consoles_[2]:*current;auto& screen=*endpoint->buffer;
+    std::string text;
+    if(wide){
+        std::u16string complete;complete.reserve(units.size()+1);
+        for(const auto value:units){
+            if(screen.conio_output_high){
+                if(value>=0xdc00 && value<=0xdfff){complete+=screen.conio_output_high;complete+=value;screen.conio_output_high=0;continue;}
+                complete+=u'\ufffd';screen.conio_output_high=0;
+            }
+            if(value>=0xd800 && value<=0xdbff)screen.conio_output_high=value;
+            else complete+=value>=0xdc00 && value<=0xdfff?u'\ufffd':value;
+        }
+        text=utf16_to_utf8(complete);
+    }else {text.reserve(units.size());for(const auto value:units)text+=static_cast<char>(static_cast<std::uint8_t>(value));}
+    if(text.empty())return 0;
+    if(screen.window){if(screen.window->closed())return 109;screen.write(text);return screen.window->update(screen)?0:5;}
+    const auto error=terminal_write(endpoint->descriptor,text);if(!error)screen.write(text);return error;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);auto name=service.symbol;if(name.ends_with("_nolock"))name.remove_suffix(7);std::uint64_t result=0;
     if(service.family=="internal-console"){
@@ -229,23 +251,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
     const auto current=std::find_if(consoles_.begin(),consoles_.end(),[](const auto& endpoint){return endpoint!=nullptr;});
     const bool attached=current!=consoles_.end();
     const auto reset_standard=[&]{
-        standard_open_={true,true,true};runtime_.standard_handles={0x100,0x101,0x102};
+        standard_open_={true,true,true};standard_duplicates_={};runtime_.standard_handles={0x100,0x101,0x102};
         runtime_.standard_input.bytes.clear();runtime_.standard_input.position=0;runtime_.console_input.clear();
         runtime_.console_handlers.clear();runtime_.ignore_ctrl_c=false;live_input_eof_=false;
         runtime_.conio_byte_pushback.reset();runtime_.conio_wide_pushback.reset();
     };
     const auto output_character=[&](std::uint16_t value,bool wide){
-        if(!attached)return 6U;
-        const auto endpoint=consoles_[1]?consoles_[1]:consoles_[2]?consoles_[2]:*current;auto& screen=*endpoint->buffer;
-        std::string text;
-        if(wide){
-            std::u16string units;if(screen.conio_output_high){units+=screen.conio_output_high;screen.conio_output_high=0;if(value<0xdc00 || value>0xdfff)units[0]=0xfffd;}
-            if(value>=0xd800 && value<=0xdbff){screen.conio_output_high=static_cast<char16_t>(value);if(units.empty())return 0U;}
-            else units+=static_cast<char16_t>(value);
-            try{text=utf16_to_utf8(units);}catch(const std::invalid_argument&){text="\xef\xbf\xbd";}
-        }else text.push_back(static_cast<char>(static_cast<std::uint8_t>(value)));
-        if(screen.window){if(screen.window->closed())return 109U;screen.write(text);return screen.window->update(screen)?0U:5U;}
-        const auto error=terminal_write(endpoint->descriptor,text);if(!error)screen.write(text);return error;
+        const auto character=static_cast<char16_t>(value);return write_crt_console({&character,1},wide);
     };
     try{
         if(name=="_ungetch" || name=="_ungetwch"){
@@ -305,15 +317,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
                 if(current_invalid_parameter_handler()){start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,UINT64_MAX);return std::nullopt;}
                 return 0xc0000409U;
             }
-            const auto text=name=="_cputws"?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
-            std::uint32_t error=6;
-            if(attached){
-                // CONOUT$ 與 stdout 的重新導向獨立；直接使用已附接的主控台。
-                const auto endpoint=consoles_[1]?consoles_[1]:consoles_[2]?consoles_[2]:*current;
-                auto& screen=*endpoint->buffer;
-                if(screen.window){error=screen.window->closed()?109:0;if(!error){screen.write(text);error=screen.window->update(screen)?0:5;}}
-                else {error=terminal_write(endpoint->descriptor,text);if(!error)screen.write(text);}
-            }
+            // _cputws 先驗證整個字串，無效 UTF-16 回 EILSEQ；不消耗 _putwch 的跨呼叫 surrogate 狀態。
+            const auto encoded=name=="_cputws"?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+            std::u16string text;for(const auto c:encoded)text+=static_cast<unsigned char>(c);
+            const auto error=write_crt_console(text,false);
             if(error){memory.store(GuestAddress{runtime_.errno_cell},32,error==109?32:9);result=UINT64_MAX;}
         }else if(name=="AllocConsole"){
             if(attached)fail(5);else if(!runtime_.network.external_io)fail(50);
@@ -348,7 +355,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
             const auto error=generate_console_control(memory,d(0),d(1));if(error)fail(error);else result=1;
         }else if(name=="FreeConsole"){
             for(const auto& endpoint:consoles_)if(endpoint && endpoint->buffer->window_handle){const auto handle=endpoint->buffer->window_handle;endpoint->buffer->window_handle=0;erase_window(handle);}
-            consoles_={};live_stdio_={-1,-1,-1};standard_open_={false,false,false};runtime_.standard_handles={0,0,0};
+            consoles_={};live_stdio_={-1,-1,-1};standard_open_={false,false,false};standard_duplicates_={};runtime_.standard_handles={0,0,0};
             runtime_.console_input.clear();runtime_.standard_input.bytes.clear();runtime_.standard_input.position=0;
             runtime_.console_handlers.clear();runtime_.ignore_ctrl_c=false;live_input_eof_=true;result=1;
             publish_console_identity(false);

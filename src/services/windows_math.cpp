@@ -1,6 +1,8 @@
 #include "x64arm/windows_services.hpp"
 #include "windows_scalar_math.hpp"
 #include "windows_math_environment.hpp"
+#include "host_complex_math.h"
+#include "crt_float_bits.h"
 #include "x64arm/x87_fp.hpp"
 #include "x64arm/unicode.hpp"
 #include "d3dx_sh.hpp"
@@ -11,6 +13,7 @@ extern "C" {
 #include <cerrno>
 #include <cfenv>
 #include <cmath>
+#include <complex>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -20,6 +23,40 @@ extern "C" {
 #include <fstream>
 
 namespace x64arm {
+namespace {
+using ComplexKind=X64armComplexKind;
+struct ComplexOperation {
+    std::string_view name;ComplexKind kind;bool single{},real{},binary{};
+};
+// 複數的輸入／輸出是 CRT 結構 ABI，不是兩個獨立的浮點參數。
+constexpr ComplexOperation complex_operations[]{
+#define COMPLEX_REAL(name,kind) {#name,X64armComplex##kind,false,true},{#name "f",X64armComplex##kind,true,true}
+#define COMPLEX_UNARY(name,kind) {#name,X64armComplex##kind},{#name "f",X64armComplex##kind,true}
+    COMPLEX_REAL(cabs,Abs),COMPLEX_REAL(carg,Arg),COMPLEX_REAL(creal,Real),COMPLEX_REAL(cimag,Imag),
+    COMPLEX_UNARY(ccos,Cos),COMPLEX_UNARY(csin,Sin),COMPLEX_UNARY(ctan,Tan),
+    COMPLEX_UNARY(cacos,Acos),COMPLEX_UNARY(casin,Asin),COMPLEX_UNARY(catan,Atan),
+    COMPLEX_UNARY(ccosh,Cosh),COMPLEX_UNARY(csinh,Sinh),COMPLEX_UNARY(ctanh,Tanh),
+    COMPLEX_UNARY(cacosh,Acosh),COMPLEX_UNARY(casinh,Asinh),COMPLEX_UNARY(catanh,Atanh),
+    COMPLEX_UNARY(cexp,Exp),COMPLEX_UNARY(clog,Log),COMPLEX_UNARY(clog10,Log10),
+    COMPLEX_UNARY(csqrt,Sqrt),COMPLEX_UNARY(conj,Conj),COMPLEX_UNARY(cproj,Proj),
+    {"cpow",X64armComplexPow,false,false,true},{"cpowf",X64armComplexPow,true,false,true}
+#undef COMPLEX_UNARY
+#undef COMPLEX_REAL
+};
+const ComplexOperation* complex_operation(std::string_view name){
+    for(const auto& operation:complex_operations)if(name==operation.name)return &operation;
+    return nullptr;
+}
+template<class T> std::complex<T> complex_value(ComplexKind kind,std::complex<T> x,std::complex<T> y){
+#if defined(__clang__)
+#pragma STDC FENV_ACCESS ON
+#endif
+    const T input[]{x.real(),x.imag(),y.real(),y.imag()};T output[2];
+    if constexpr(sizeof(T)==4)x64arm_complex_float(kind,input,output);
+    else x64arm_complex_double(kind,input,output);
+    return {output[0],output[1]};
+}
+}
 std::span<const WindowsServiceDescriptor> math_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
         {"d3dx9_42.dll","D3DXSHDot",3},
@@ -123,7 +160,8 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"crt","_ftol",0},{"crt","_ftol2",0},{"crt","_ftol2_sse",0},
         {"crt","_clear87",0},{"crt","_clearfp",0},{"crt","_status87",0},{"crt","_statusfp",0},{"crt","_statusfp2",2},
         {"crt", "fetestexcept", 1}, {"crt", "feclearexcept", 1}, {"crt", "_dclass", 1}, {"crt", "_fdclass", 1}, {"crt", "_ldclass", 1}, {"crt", "_fpclass", 1}, {"crt", "_fpclassf", 1}, {"crt", "_dsign", 1}, {"crt", "_fdsign", 1}, {"crt", "_ldsign", 1}, {"crt", "_control87", 2}, {"crt", "_controlfp", 2}, {"crt","_controlfp_s",3},
-        {"crt","__fpe_flt_rounds",0},
+        {"crt","__fpe_flt_rounds",0},{"crt","_fpreset",0},
+        {"crt","_dpcomp",2,3},{"crt","_fdpcomp",2},{"crt","ilogb",1,1},{"crt","ilogbf",1},
         {"crt", "acos", 1,1}, {"crt", "acosh", 1,1}, {"crt", "asin", 1,1}, {"crt", "asinh", 1,1},
         {"crt", "atan", 1,1}, {"crt", "atanh", 1,1}, {"crt", "cbrt", 1,1}, {"crt", "ceil", 1,1},
         {"crt", "cos", 1,1}, {"crt", "cosh", 1,1}, {"crt", "erf", 1,1}, {"crt", "erfc", 1,1},
@@ -150,7 +188,17 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"crt", "atof", 1}, {"crt", "atoi", 1}, {"crt", "atol", 1}, {"crt", "_atoi64", 1},
         {"crt", "_strtoi64", 3}, {"crt", "_strtoui64", 3}, {"crt", "strtol", 3}, {"crt", "strtoul", 3}, {"crt", "strtoll", 3}, {"crt", "strtoull", 3}, {"crt", "strtod", 2}, {"crt", "strtof", 2}
     };
-    return table;
+    static const auto complete=[]{
+        std::vector<WindowsServiceDescriptor> result(std::begin(table),std::end(table));
+        for(const auto& operation:complex_operations){
+            // 16-byte 結果在兩種 ABI 都有第一個隱藏指標；8-byte 結果使用 RAX／EDX:EAX。
+            const unsigned inputs=operation.binary?2U:1U,hidden=!operation.single && !operation.real?1U:0U;
+            const auto mask=(1U<<inputs)-1;
+            result.push_back({"crt",operation.name,inputs+hidden,operation.single?mask:0U,operation.single?0U:mask<<hidden});
+        }
+        return result;
+    }();
+    return complete;
 }
 namespace {
 double scalar(const GuestState& state, unsigned index) {
@@ -545,6 +593,69 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         invoke_scalar_math(state,memory,service,*operation,runtime_.errno_cell,x86_);return std::nullopt;
     }
     const WindowsCall arg(state, memory, service); const auto symbol = service.symbol;
+    if(const auto* operation=complex_operation(symbol)){
+        const auto execute=[&]<class T>(){
+            constexpr bool single=sizeof(T)==4;
+            const bool hidden=!single && !operation->real;
+            const unsigned first=hidden?1U:0U;
+            const auto input=[&](unsigned index)->std::complex<T>{
+                if constexpr(single){const auto bits=arg(index);return {std::bit_cast<float>(static_cast<std::uint32_t>(bits)),std::bit_cast<float>(static_cast<std::uint32_t>(bits>>32))};}
+                else {const auto pointer=arg(index);memory.check(GuestAddress{pointer},16,Access::Read);
+                    return {std::bit_cast<double>(memory.load(GuestAddress{pointer},64)),std::bit_cast<double>(memory.load(GuestAddress{pointer+8},64))};}
+            };
+            // 先取得完整輸入再寫回，保留輸出與輸入重疊及精確記憶體故障契約。
+            const auto x=input(first),y=operation->binary?input(first+1):std::complex<T>{};
+            const auto output=hidden?arg(0):0;
+            if(hidden)memory.check(GuestAddress{output},16,Access::Write);
+            Environment environment(x86_?static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13:state.mxcsr);
+            const auto result=complex_value(operation->kind,x,y);
+            if(operation->real){
+                if(x86_)conversion_result(state,true,result.real(),single);
+                else {
+                    const auto bits=[&] {if constexpr(single)return std::uint64_t{std::bit_cast<std::uint32_t>(result.real())};else return std::bit_cast<std::uint64_t>(result.real());}();
+                    for(unsigned n=0;n<sizeof(T);++n)state.xmm[0][n]=static_cast<std::uint8_t>(bits>>(n*8));
+                }
+                commit_math_environment(state,memory,runtime_.errno_cell,x86_,environment);
+                arg.return_to(state,0);
+            }else if constexpr(single){
+                const auto bits=std::bit_cast<std::uint32_t>(result.real())|(std::uint64_t{std::bit_cast<std::uint32_t>(result.imag())}<<32);
+                commit_math_environment(state,memory,runtime_.errno_cell,x86_,environment);
+                arg.return_to(state,bits,true);
+            }else {
+                commit_math_environment(state,memory,runtime_.errno_cell,x86_,environment);
+                memory.store(GuestAddress{output},64,std::bit_cast<std::uint64_t>(result.real()));
+                memory.store(GuestAddress{output+8},64,std::bit_cast<std::uint64_t>(result.imag()));
+                arg.return_to(state,output);
+            }
+        };
+        if(operation->single)execute.template operator()<float>();else execute.template operator()<double>();
+        return std::nullopt;
+    }
+    if(symbol=="_fpreset"){
+        state.mxcsr=0x1f80;
+        if(x86_){state.x87_control=0x27f;state.x87_status=0;state.x87_tag=0xffff;
+            state.x87_instruction_pointer=state.x87_data_pointer=0;
+            state.x87_opcode=state.x87_code_selector=state.x87_data_selector=0;}
+        arg.return_to(state,0);return std::nullopt;
+    }
+    if(symbol=="_dpcomp" || symbol=="_fdpcomp" || symbol=="ilogb" || symbol=="ilogbf"){
+        const unsigned width=(symbol=="_fdpcomp" || symbol=="ilogbf")?32U:64U;
+        const auto bits=[&](unsigned index){
+            if(x86_)return arg(index);
+            std::uint64_t value=0;for(unsigned n=0;n<width/8;++n)value|=std::uint64_t{state.xmm[index][n]}<<(n*8);return value;
+        };
+        if(symbol.starts_with('_'))arg.return_to(state,static_cast<unsigned>(x64arm_ordered_float_bits(bits(0),bits(1),width)));
+        else {
+            int invalid=0;const auto value=x64arm_ilogb_float_bits(bits(0),width,&invalid);
+            if(invalid){
+                memory.store(GuestAddress{runtime_.errno_cell},32,33);
+                if(x86_){state.x87_status|=1;if(!(state.x87_control&1))state.x87_status|=0x8080;}
+                else state.mxcsr|=1;
+            }
+            arg.return_to(state,static_cast<std::uint32_t>(value));
+        }
+        return std::nullopt;
+    }
     if(symbol=="__fpe_flt_rounds"){
         constexpr std::array<std::uint32_t,4> modes{1,3,2,0};const auto sse=(state.mxcsr>>13)&3U;
         const auto value=x86_ && ((state.x87_control>>10)&3U)!=sse?UINT32_MAX:modes[sse];

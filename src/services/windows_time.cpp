@@ -49,7 +49,8 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
         {"crt","_Getdays",0},{"crt","_Getmonths",0},{"crt","_W_Getdays",0},{"crt","_W_Getmonths",0},
         {"crt","_Gettnames",0},{"crt","_W_Gettnames",0},
         {"kernel32.dll","SystemTimeToTzSpecificLocalTime",3},{"kernel32.dll","TzSpecificLocalTimeToSystemTime",3},
-        {"kernel32.dll","GetSystemTimes",3},{"kernel32.dll","GetDynamicTimeZoneInformation",1},{"kernel32.dll","GetTimeZoneInformation",1},{"kernel32.dll","GetSystemTime",1},{"kernel32.dll","GetLocalTime",1}
+        {"kernel32.dll","GetSystemTimes",3},{"kernel32.dll","GetDynamicTimeZoneInformation",1},{"kernel32.dll","GetTimeZoneInformation",1},{"kernel32.dll","GetTimeZoneInformationForYear",3},
+        {"advapi32.dll","EnumDynamicTimeZoneInformation",2},{"advapi32.dll","GetDynamicTimeZoneInformationEffectiveYears",3},{"kernel32.dll","GetSystemTime",1},{"kernel32.dll","GetLocalTime",1}
         ,{"kernel32.dll","SetSystemTime",1},{"kernel32.dll","GetSystemTimeAdjustment",3},{"kernel32.dll","SetSystemTimeAdjustment",2}
         ,{"kernel32.dll","FileTimeToLocalFileTime",2},{"kernel32.dll","LocalFileTimeToFileTime",2}
         ,{"kernel32.dll","FileTimeToSystemTime",2},{"kernel32.dll","SystemTimeToFileTime",2},{"kernel32.dll","CompareFileTime",2}
@@ -449,6 +450,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
         // 與既有客體 UTC 時區一致：無轉換日期，動態規則沒有停用。
         if(dynamic){bytes[172]='U';bytes[174]='T';bytes[176]='C';}
         memory.write(GuestAddress{arg(0)},bytes);
+    } else if (symbol=="EnumDynamicTimeZoneInformation") {
+        // 客體時區資料庫只有 UTC：索引 0 與 GetDynamicTimeZoneInformation 相同，其餘 ERROR_NO_MORE_ITEMS。
+        if(!arg(1))result=87;
+        else if(static_cast<std::uint32_t>(arg(0)))result=259;
+        else {
+            std::vector<std::uint8_t> bytes(432U);
+            for (unsigned offset : {4U,88U,172U}) {bytes[offset]='U';bytes[offset+2]='T';bytes[offset+4]='C';}
+            memory.write(GuestAddress{arg(1)},bytes);
+        }
+    } else if (symbol=="GetDynamicTimeZoneInformationEffectiveYears") {
+        // UTC 沒有 Dynamic DST 年度規則；與 Windows 對無規則時區相同回 ERROR_FILE_NOT_FOUND，不寫輸出。
+        if(!arg(0) || !arg(1) || !arg(2))result=87;
+        else {memory.check(GuestAddress{arg(0)},432,Access::Read);result=2;}
+    } else if (symbol=="GetTimeZoneInformationForYear") {
+        // 指定時區時沿用其固定規則（客體沒有逐年動態資料）；未指定時為目前的 UTC 時區。
+        if(!arg(2)){last_error_=87;}
+        else {
+            std::vector<std::uint8_t> bytes(172U);
+            if(arg(1))memory.read(GuestAddress{arg(1)},bytes);
+            else for (unsigned offset : {4U,88U}) {bytes[offset]='U';bytes[offset+2]='T';bytes[offset+4]='C';}
+            memory.write(GuestAddress{arg(2)},bytes);result=1;
+        }
     } else if (symbol=="GetSystemTime" || symbol=="GetLocalTime") {
         // 客體時區為 UTC；使用與 FILETIME／CRT 相同的虛擬時鐘。
         const auto ticks=runtime_.system_filetime();

@@ -152,7 +152,7 @@ std::uint64_t WindowsServices::gui_resource(const GuestMemory& memory,std::uint6
     return 0;
 }
 #include "gui_window_position.inc"
-std::uint64_t WindowsServices::load_gui_icon(GuestMemory& memory,std::uint64_t instance,std::uint64_t name,bool wide,std::uint32_t width,std::uint32_t height,bool intrinsic,bool first,bool cursor,std::uint32_t flags){
+std::uint64_t WindowsServices::load_gui_icon(GuestMemory& memory,std::uint64_t instance,std::uint64_t name,bool wide,std::uint32_t width,std::uint32_t height,bool intrinsic,bool first,bool cursor,std::uint32_t flags,bool prefer_larger){
     const auto fail=[&](std::uint32_t error){last_error_=error;return UINT64_C(0);};
     if(width>4096 || height>4096)return fail(87);
     try {
@@ -172,11 +172,11 @@ std::uint64_t WindowsServices::load_gui_icon(GuestMemory& memory,std::uint64_t i
             const auto animated=gui_resource(memory,instance,name,cursor?21:22,wide,first);if(!animated)return fail(1814);
             const auto length=memory.load(GuestAddress{animated+4},32);if(length>64*1024*1024)return fail(8);std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));
             memory.read(GuestAddress{resource_image(animated,true)->base+memory.load(GuestAddress{animated},32)},bytes);
-            return store_gui_icon(decode_icon_file(bytes,cursor,width,height,flags),flags);
+            return store_gui_icon(decode_icon_file(bytes,cursor,width,height,flags,prefer_larger),flags);
         }
         const auto size=memory.load(GuestAddress{group+4},32);if(size>65536)return fail(1814);std::vector<std::uint8_t> directory(static_cast<std::size_t>(size));
         memory.read(GuestAddress{resource_image(group,true)->base+memory.load(GuestAddress{group},32)},directory);
-        auto choice=choose_icon(directory,cursor,false,width,height,(flags&1)!=0);
+        auto choice=choose_icon(directory,cursor,false,width,height,(flags&1)!=0,prefer_larger);
         if(intrinsic && !width && !height){
             const auto w=cursor?directory.at(6)+(std::uint32_t{directory.at(7)}<<8):directory.at(6)?directory[6]:256U;
             const auto h=cursor?(directory.at(8)+(std::uint32_t{directory.at(9)}<<8))/2:directory.at(7)?directory[7]:256U;

@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "x64arm/windows_security_attributes.hpp"
 #include "automation_value.hpp"
 #include "windows_locale_data.hpp"
 #include "crt_multibyte_state.hpp"
@@ -9,11 +10,13 @@
 #include <algorithm>
 #include <cstdio>
 #include <memory>
+#include <span>
 #include <bit>
 #include <chrono>
 #include <unicode/udat.h>
 #include <unicode/ucnv.h>
 #include <unicode/ucnv_err.h>
+#include <unicode/ucnv_cb.h>
 #include <unicode/unum.h>
 #include <unicode/udatpg.h>
 #include <unicode/uchar.h>
@@ -22,6 +25,10 @@
 #include <unicode/ustring.h>
 #include <unicode/utrans.h>
 #include <unicode/ulocdata.h>
+#include <unicode/ucurr.h>
+#include <unicode/uloc.h>
+#include <unicode/uldnames.h>
+#include <unicode/uenum.h>
 #include "idn_conversion.hpp"
 #include "crt_c_locale.hpp"
 #include <mutex>
@@ -70,6 +77,13 @@ std::u16string locale_name(std::uint32_t){return {};}
 std::uint32_t locale_code(std::u16string_view){return 0;}
 #endif
 std::optional<Locale> named(std::u16string_view value){const auto found=locales().find(key(std::u16string(value)));if(found==locales().end())return {};return found->second;}
+std::u16string requested_locale_name(const GuestMemory& memory,std::uint64_t pointer){
+    auto value=pointer?read_utf16(memory,GuestAddress{pointer},85):std::u16string(u"en-US");
+    if(value==u"!x-sys-default-locale")value=u"en-US";return value;
+}
+std::string codepage_encoding(std::uint32_t page){
+    return page==65001?std::string{"UTF-8"}:page==20127?std::string{"US-ASCII"}:"windows-"+std::to_string(page);
+}
 std::optional<Locale> numbered(std::uint32_t id){
     if(id==0x400 || id==0x800)id=0x409;
     if(id==0x7f)return named(u"");
@@ -153,9 +167,13 @@ std::vector<DateToken> date_tokens(std::u16string_view pattern){
         else literal+=c;
     }flush();return result;
 }
+// 與 Windows NLS 樣式相同，只有含字母（含 CJK 等文字）或引號的字面文字才加引號；標點與空白直接保留，ICU 亦同樣視為字面。
+std::u16string literal_pattern(std::u16string_view text){
+    return std::any_of(text.begin(),text.end(),[](char16_t c){return c==u'\'' || u_isalpha(c);})?quote_pattern(text):std::u16string(text);
+}
 std::u16string render_pattern(const std::vector<DateToken>& tokens){
-    std::u16string result,literal;for(const auto& token:tokens){if(!token.field)literal+=token.text;else{if(!literal.empty()){result+=quote_pattern(literal);literal.clear();}result+=token.text;}}
-    if(!literal.empty())result+=quote_pattern(literal);return result;
+    std::u16string result,literal;for(const auto& token:tokens){if(!token.field)literal+=token.text;else{if(!literal.empty()){result+=literal_pattern(literal);literal.clear();}result+=token.text;}}
+    if(!literal.empty())result+=literal_pattern(literal);return result;
 }
 void month_pattern_context(std::vector<DateToken>& tokens){
     // 星期 ddd/dddd 已轉成 ICU E；引號內的 d 是 literal，不構成日期數字。
@@ -215,6 +233,7 @@ std::uint32_t automation_integer(std::string_view decimal,unsigned bits,bool uns
 }
 std::string icu_locale(const Locale& locale){auto result=utf16_to_utf8(locale.name);std::replace(result.begin(),result.end(),'-','_');return result;}
 #include "windows_locale_info.inc"
+#include "windows_calendar_info.inc"
 std::u16string transform(std::u16string value,std::u16string_view rule){
     UErrorCode error=U_ZERO_ERROR;
     std::unique_ptr<UTransliterator,decltype(&utrans_close)> trans(utrans_openU(rule.data(),static_cast<std::int32_t>(rule.size()),UTRANS_FORWARD,nullptr,0,nullptr,&error),utrans_close);
@@ -342,7 +361,7 @@ std::optional<CrtLocaleCategory> windows_crt_codepage(std::uint32_t page){
     if(!page){cache.emplace(page,value);return value;}
     if(page==65000 || page==1200 || page==1201 || page==12000 || page==12001)return {};
     UErrorCode status=U_ZERO_ERROR;
-    const auto encoding=page==65001?std::string{"UTF-8"}:page==20127?std::string{"US-ASCII"}:"windows-"+std::to_string(page);
+    const auto encoding=codepage_encoding(page);
     std::unique_ptr<UConverter,decltype(&ucnv_close)> converter(ucnv_open(encoding.c_str(),&status),ucnv_close);
     if(U_FAILURE(status) || !converter)return {};
     // ICU 的最大值以 UTF-16 code unit 計算；Windows CRT 的 UTF-8 字元可佔四個 bytes。
@@ -454,7 +473,7 @@ std::optional<std::u16string> windows_crt_time_calendar(const CrtTimeData& data,
 CrtDecodedCharacter windows_crt_decode(std::span<const std::uint8_t> bytes,std::uint32_t page){
     if(bytes.empty())return {0,0,CrtDecodedCharacter::Status::Partial};
     if(!page)return {bytes.front(),1,CrtDecodedCharacter::Status::Complete};
-    UErrorCode status=U_ZERO_ERROR;const auto encoding=page==65001?std::string{"UTF-8"}:page==20127?std::string{"US-ASCII"}:"windows-"+std::to_string(page);
+    UErrorCode status=U_ZERO_ERROR;const auto encoding=codepage_encoding(page);
     std::unique_ptr<UConverter,decltype(&ucnv_close)> converter(ucnv_open(encoding.c_str(),&status),ucnv_close);if(U_FAILURE(status) || !converter)return {};
     ucnv_setToUCallBack(converter.get(),UCNV_TO_U_CALLBACK_STOP,nullptr,nullptr,nullptr,&status);if(U_FAILURE(status))return {};
     const auto first=reinterpret_cast<const char*>(bytes.data());auto next=first;const auto value=ucnv_getNextUChar(converter.get(),&next,first+bytes.size(),&status);
@@ -463,11 +482,54 @@ CrtDecodedCharacter windows_crt_decode(std::span<const std::uint8_t> bytes,std::
 }
 std::optional<std::vector<std::uint8_t>> windows_crt_encode(std::u16string_view text,std::uint32_t page){
     if(!page){std::vector<std::uint8_t> bytes;for(const auto c:text){const auto value=crt_c_locale::encode(c);if(!value)return {};bytes.push_back(*value);}return bytes;}
-    UErrorCode status=U_ZERO_ERROR;const auto encoding=page==65001?std::string{"UTF-8"}:page==20127?std::string{"US-ASCII"}:"windows-"+std::to_string(page);
+    UErrorCode status=U_ZERO_ERROR;const auto encoding=codepage_encoding(page);
     std::unique_ptr<UConverter,decltype(&ucnv_close)> converter(ucnv_open(encoding.c_str(),&status),ucnv_close);if(U_FAILURE(status) || !converter)return {};
     ucnv_setFromUCallBack(converter.get(),UCNV_FROM_U_CALLBACK_STOP,nullptr,nullptr,nullptr,&status);if(U_FAILURE(status))return {};
     const auto size=ucnv_fromUChars(converter.get(),nullptr,0,text.data(),static_cast<std::int32_t>(text.size()),&status);if(U_FAILURE(status) && status!=U_BUFFER_OVERFLOW_ERROR)return {};
     status=U_ZERO_ERROR;std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));ucnv_fromUChars(converter.get(),reinterpret_cast<char*>(bytes.data()),size,text.data(),static_cast<std::int32_t>(text.size()),&status);if(U_FAILURE(status))return {};return bytes;
+}
+namespace {
+void U_CALLCONV nls_replacement_callback(const void*,UConverterToUnicodeArgs* args,const char*,
+                                        std::int32_t,UConverterCallbackReason reason,UErrorCode* status){
+    if(reason<=UCNV_IRREGULAR){
+        // ICU 部分 DBCS 的單 byte 替代字是 U+001A；Win32 Vista 起固定使用 U+FFFD。
+        const UChar replacement=0xfffd;*status=U_ZERO_ERROR;ucnv_cbToUWriteUChars(args,&replacement,1,0,status);
+    }
+}
+}
+std::optional<std::u16string> windows_nls_decode(std::string_view bytes,std::uint32_t page,bool strict){
+    UErrorCode error=U_ZERO_ERROR;
+    std::unique_ptr<UConverter,decltype(&ucnv_close)> converter(ucnv_open(codepage_encoding(page).c_str(),&error),ucnv_close);
+    if(U_FAILURE(error) || !converter)return {};
+    ucnv_setToUCallBack(converter.get(),strict?UCNV_TO_U_CALLBACK_STOP:nls_replacement_callback,nullptr,nullptr,nullptr,&error);
+    if(U_FAILURE(error))return {};
+    const auto size=ucnv_toUChars(converter.get(),nullptr,0,bytes.data(),static_cast<std::int32_t>(bytes.size()),&error);
+    if(U_FAILURE(error) && error!=U_BUFFER_OVERFLOW_ERROR)return {};
+    error=U_ZERO_ERROR;std::u16string result(static_cast<std::size_t>(size),0);
+    ucnv_toUChars(converter.get(),result.data(),size,bytes.data(),static_cast<std::int32_t>(bytes.size()),&error);
+    if(U_FAILURE(error))return {};return result;
+}
+namespace {
+void U_CALLCONV nls_default_callback(const void* context,UConverterFromUnicodeArgs* args,
+    const UChar* text,std::int32_t length,UChar32 codepoint,UConverterCallbackReason reason,UErrorCode* status){
+    if(reason<=UCNV_IRREGULAR)*static_cast<bool*>(const_cast<void*>(context))=true;
+    UCNV_FROM_U_CALLBACK_SUBSTITUTE(nullptr,args,text,length,codepoint,reason,status);
+}
+}
+std::optional<NlsEncodedString> windows_nls_encode(std::u16string_view text,std::uint32_t page,
+                                                 bool no_best_fit,std::string_view replacement,bool strict){
+    bool used=false;UErrorCode error=U_ZERO_ERROR;
+    std::unique_ptr<UConverter,decltype(&ucnv_close)> converter(ucnv_open(codepage_encoding(page).c_str(),&error),ucnv_close);
+    if(U_FAILURE(error) || !converter || replacement.empty() || replacement.size()>2)return {};
+    ucnv_setFallback(converter.get(),!no_best_fit);
+    ucnv_setSubstChars(converter.get(),replacement.data(),static_cast<std::int8_t>(replacement.size()),&error);
+    ucnv_setFromUCallBack(converter.get(),strict?UCNV_FROM_U_CALLBACK_STOP:nls_default_callback,&used,nullptr,nullptr,&error);
+    if(U_FAILURE(error))return {};
+    const auto size=ucnv_fromUChars(converter.get(),nullptr,0,text.data(),static_cast<std::int32_t>(text.size()),&error);
+    if(U_FAILURE(error) && error!=U_BUFFER_OVERFLOW_ERROR)return {};
+    error=U_ZERO_ERROR;NlsEncodedString result;result.bytes.resize(static_cast<std::size_t>(size));
+    ucnv_fromUChars(converter.get(),reinterpret_cast<char*>(result.bytes.data()),size,text.data(),static_cast<std::int32_t>(text.size()),&error);
+    if(U_FAILURE(error))return {};result.used_default=used;return result;
 }
 char16_t windows_crt_map_character(char16_t input,const CrtLocaleCategory& locale,bool upper){
     if(!locale.codepage){
@@ -565,22 +627,27 @@ std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
         {"crt","_mbsrchr",2},{"crt","_mbsrchr_l",3},{"crt","_mbschr",2},{"crt","_mbschr_l",3},
         {"crt","isleadbyte",1},{"crt","_isleadbyte_l",2},{"crt","_ismbblead_l",2},{"crt","_ismbbtrail_l",2},
         {"crt","_setmbcp",1},{"crt","_getmbcp",0},
+        {"crt","__p___mb_cur_max",0},{"crt","___mb_cur_max_l_func",1},
         {"normaliz.dll","IdnToAscii",5},{"normaliz.dll","IdnToUnicode",5},
         {"ntdll.dll","RtlUTF8ToUnicodeN",5},{"ntdll.dll","RtlUnicodeToUTF8N",5},
-        {"msvcp140.dll","_Strcoll",5,0,0,0,true},{"msvcp140.dll","_Strxfrm",5,0,0,0,true},
+        {"msvcp140.dll","_Strcoll",5,0,0,0,true},{"msvcp140.dll","_Strxfrm",5,0,0,0,true},{"msvcp140.dll","_Mbrtowc",5,0,0,0,true},
         {"oleaut32.dll","VarI1FromStr",4},{"oleaut32.dll","VarI2FromStr",4},{"oleaut32.dll","VarI4FromStr",4},{"oleaut32.dll","VarI8FromStr",4},
         {"oleaut32.dll","VarUI1FromStr",4},{"oleaut32.dll","VarUI2FromStr",4},{"oleaut32.dll","VarUI4FromStr",4},{"oleaut32.dll","VarUI8FromStr",4},
         {"kernel32.dll","GetNumberFormatA",6},{"kernel32.dll","GetNumberFormatW",6},{"kernel32.dll","GetNumberFormatEx",6},
         {"kernel32.dll","GetCurrencyFormatA",6},{"kernel32.dll","GetCurrencyFormatW",6},{"kernel32.dll","GetCurrencyFormatEx",6},
-        {"kernel32.dll","GetDateFormatW",6},{"kernel32.dll","GetDateFormatEx",7},
-        {"kernel32.dll","GetTimeFormatW",6},{"kernel32.dll","GetTimeFormatEx",6},
+        {"kernel32.dll","GetDateFormatA",6},{"kernel32.dll","GetDateFormatW",6},{"kernel32.dll","GetDateFormatEx",7},
+        {"kernel32.dll","GetTimeFormatA",6},{"kernel32.dll","GetTimeFormatW",6},{"kernel32.dll","GetTimeFormatEx",6},
         {"kernel32.dll","ConvertDefaultLocale",1},{"kernel32.dll","CompareStringA",6},{"kernel32.dll","LCMapStringA",6},{"kernel32.dll","GetStringTypeA",5},{"kernel32.dll","GetStringTypeExA",5},{"kernel32.dll","CompareStringW",6},{"kernel32.dll","CompareStringEx",9},{"kernel32.dll","CompareStringOrdinal",5},
         {"kernel32.dll","LCMapStringW",6},{"kernel32.dll","LCMapStringEx",9},
         {"kernel32.dll","FoldStringA",5},{"kernel32.dll","FoldStringW",5},
         {"kernel32.dll","GetStringTypeW",4},{"kernel32.dll","GetStringTypeExW",5},
         {"kernel32.dll","LocaleNameToLCID",2},{"kernel32.dll","LCIDToLocaleName",4},{"kernel32.dll","ResolveLocaleName",3},
         {"kernel32.dll","IsValidLocaleName",1},{"kernel32.dll","IsValidLocale",2},
-        {"kernel32.dll","EnumSystemLocalesA",2},{"kernel32.dll","EnumSystemLocalesW",2},{"kernel32.dll","EnumSystemLocalesEx",4}
+        {"kernel32.dll","EnumSystemLocalesA",2},{"kernel32.dll","EnumSystemLocalesW",2},{"kernel32.dll","EnumSystemLocalesEx",4},
+        {"kernel32.dll","GetCalendarInfoA",6},{"kernel32.dll","GetCalendarInfoW",6},{"kernel32.dll","GetCalendarInfoEx",7},
+        {"kernel32.dll","EnumCalendarInfoA",4},{"kernel32.dll","EnumCalendarInfoW",4},
+        {"kernel32.dll","EnumCalendarInfoExA",4},{"kernel32.dll","EnumCalendarInfoExW",4},{"kernel32.dll","EnumCalendarInfoExEx",6},
+        {"kernel32.dll","SetCalendarInfoA",4},{"kernel32.dll","SetCalendarInfoW",4}
     };return table;
 }
 namespace {
@@ -604,6 +671,10 @@ void crt_mbc_assign(GuestMemory& memory,std::uint64_t address,const CrtLocaleCat
 void crt_mbc_copy(GuestMemory& memory,const CrtLocaleObject& source,const CrtLocaleObject& destination,bool x86){
     memory.move(GuestAddress{crt_mbc_address(memory,destination,x86)},GuestAddress{crt_mbc_address(memory,source,x86)},544);
 }
+std::uint64_t crt_max_address(const GuestMemory& memory,const CrtLocaleObject& locale,bool x86){
+    const unsigned p=x86?4U:8U;const auto info=memory.load(GuestAddress{locale.storage},static_cast<std::uint8_t>(p*8));
+    return info+(locale.legacy?76U+24U*p:p);
+}
 }
 void WindowsServices::sync_crt_thread_state(GuestMemory& memory,std::uint64_t id){
     if(x86_)return;
@@ -612,7 +683,7 @@ void WindowsServices::sync_crt_thread_state(GuestMemory& memory,std::uint64_t id
     const auto local=runtime_.crt_thread_locales.find(id);
     const auto locale=local==runtime_.crt_thread_locales.end()?runtime_.crt_current_locale:local->second;
     const auto tables=thread.teb+GUEST_CRT_TABLE_OFFSET;
-    std::array<std::uint64_t,6> cells{thread.errno_cell,locale,tables,tables+512,tables+768,0};
+    std::array<std::uint64_t,7> cells{thread.errno_cell,locale,tables,tables+512,tables+768,0,runtime_base_.value+128};
     if(locale){
         const auto& object=runtime_.crt_locales.at(locale);
         // create_crt_locale 的內部表格配置；不依 UCRT／舊 MSVCRT 的公開 locinfo 版型。
@@ -621,12 +692,16 @@ void WindowsServices::sync_crt_thread_state(GuestMemory& memory,std::uint64_t id
         memory.read(GuestAddress{ctype+2},bytes);
         memory.write(GuestAddress{tables},bytes);
         cells[5]=object.categories[2].codepage|(std::uint64_t{object.categories[4].codepage}<<32);
+        cells[6]=crt_max_address(memory,object,false);
     }
-    static_assert(sizeof(GuestCrtThreadState)==48 && offsetof(GuestCrtThreadState,ctype_codepage)==40);
+    static_assert(sizeof(GuestCrtThreadState)==56 && offsetof(GuestCrtThreadState,ctype_codepage)==40 && offsetof(GuestCrtThreadState,mb_cur_max_address)==48);
     for(std::size_t n=0;n<cells.size();++n)
         memory.store(GuestAddress{thread.teb+GUEST_CRT_STATE_OFFSET+n*8},64,cells[n]);
 }
 void WindowsServices::sync_crt_thread_states(GuestMemory& memory){
+    // 資料匯出表示程序 locale；啟用個別執行緒 locale 時，不可覆寫程序值。
+    const auto global=runtime_.crt_current_locale;
+    memory.store(GuestAddress{runtime_base_.value+128},32,global?memory.load(GuestAddress{crt_max_address(memory,runtime_.crt_locales.at(global),x86_)},32):1);
     // 客體執行與服務由同一排程器串行；發布新表後才釋放舊 locale。
     for(const auto& [id,thread]:threads_.items){(void)thread;sync_crt_thread_state(memory,id);}
 }
@@ -853,11 +928,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
                 runtime_.crt_locales.erase(address);(void)free_heap(memory,address,state);
             }return returned(previous);
         }
+        if(name=="__p___mb_cur_max" || name=="___mb_cur_max_l_func"){
+            const CrtLocaleObject* selected=nullptr;
+            if(name=="___mb_cur_max_l_func" && arg(0)){
+                const auto found=runtime_.crt_locales.find(arg(0));if(found==runtime_.crt_locales.end())return invalid(22);
+                selected=&found->second;
+            }else selected=&current_crt_locale(state,memory);
+            const auto address=crt_max_address(memory,*selected,x86_);
+            return returned(name=="__p___mb_cur_max"?address:memory.load(GuestAddress{address},32));
+        }
         if(name=="setlocale" || name=="_wsetlocale" || name=="localeconv" || name=="__lconv_init" || name=="___lc_codepage_func" || name=="___lc_collate_cp_func" || name=="___mb_cur_max_func" || name=="__mb_cur_max_func" || name=="___lc_locale_name_func" || name=="__pctype_func"){
             auto& current=current_crt_locale(state,memory);const unsigned p=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(p*8);
             const auto pointer=[&](std::uint64_t at){return memory.load(GuestAddress{at},bits);};
             if(name=="___lc_codepage_func" || name=="___lc_collate_cp_func")return returned(current.categories[name=="___lc_codepage_func"?2:1].codepage);
-            if(name=="___mb_cur_max_func" || name=="__mb_cur_max_func")return returned(current.categories[2].maximum_character_bytes);
+            if(name=="___mb_cur_max_func" || name=="__mb_cur_max_func")return returned(memory.load(GuestAddress{crt_max_address(memory,current,x86_)},32));
             const auto info=pointer(current.storage),references=info+72+24*p+8;
             if(name=="localeconv" || name=="__lconv_init")return returned(name=="__lconv_init"?0:pointer(references+3*p));
             if(name=="__pctype_func")return returned(pointer(references+6*p));
@@ -972,6 +1056,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         }
         throw HostCallFault("未知 CRT locale 作業");
     }
+    if(service.family=="msvcp140.dll" && name=="_Mbrtowc"){
+        // STL 的 _Mbrtowc(pwc, s, n, mbstate_t*, const _Cvtvec*)：依 _Cvtvec 的 code page 轉一個字元，回傳位元組數，
+        // 空字元回 0、不完整回 -2（前綴存入 mbstate_t）、無效回 -1 並設 EILSEQ；C locale 直接把位元組零延伸。
+        const auto returned=[&](std::int32_t value){arg.return_to(state,static_cast<std::uint32_t>(value));return std::optional<std::uint32_t>{};};
+        const auto output=arg(0),state_pointer=arg(3),vector=arg(4);auto source=arg(1);auto capacity=arg(2);
+        crt_multibyte::State conversion{};if(state_pointer){memory.read(GuestAddress{state_pointer},conversion);memory.check(GuestAddress{state_pointer},8,Access::Write);}
+        std::uint32_t page=0;bool classic=true;
+        if(vector){page=static_cast<std::uint32_t>(memory.load(GuestAddress{vector},32));classic=memory.load(GuestAddress{vector+8},32)!=0;}
+        else {const auto& category=current_crt_locale(state,memory).categories[2];page=category.codepage;classic=!page;}
+        if(!source){if(state_pointer)memory.fill(GuestAddress{state_pointer},0,8);return returned(0);}
+        if(!capacity)return returned(-2);
+        if(classic){const auto byte=static_cast<std::uint8_t>(memory.load(GuestAddress{source},8));if(output)memory.store(GuestAddress{output},16,byte);return returned(byte?1:0);}
+        std::array<std::uint8_t,8> input{};crt_multibyte::Result result;auto trial=conversion;
+        const auto count=std::min<std::uint64_t>(capacity,6);
+        for(std::uint64_t i=0;i<count;++i){input[static_cast<std::size_t>(i)]=static_cast<std::uint8_t>(memory.load(GuestAddress{source+i},8));
+            trial=conversion;result=crt_multibyte::decode(trial,std::span(input).first(static_cast<std::size_t>(i+1)),page);
+            if(result.status!=CrtDecodedCharacter::Status::Partial)break;}
+        if(result.status==CrtDecodedCharacter::Status::Partial){if(state_pointer)memory.write(GuestAddress{state_pointer},trial);return returned(-2);}
+        if(state_pointer)memory.fill(GuestAddress{state_pointer},0,8);
+        if(result.status!=CrtDecodedCharacter::Status::Complete || result.character>65535){memory.store(GuestAddress{runtime_.errno_cell},32,42);return returned(-1);}
+        if(output)memory.store(GuestAddress{output},16,result.character);return returned(result.character?static_cast<std::int32_t>(result.consumed):0);
+    }
     if(service.family=="msvcp140.dll"){
         const bool mapping=name=="_Strxfrm";
         const auto returned=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
@@ -1074,8 +1180,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         if(genitive && !((type>=0x38 && type<=0x4f) || type==0x100e || type==0x100f))return fail(1004);
         try{
             std::optional<Locale> locale;
-            if(extended){auto value=arg(0)?read_utf16(memory,GuestAddress{arg(0)},85):std::u16string(u"en-US");
-                if(value==u"!x-sys-default-locale")value=u"en-US";locale=named(value);}
+            if(extended)locale=named(requested_locale_name(memory,arg(0)));
             else locale=numbered(static_cast<std::uint32_t>(arg(0)));
             if(!locale)return fail(87);const auto info=locale_information(*locale,type,genitive);if(!info)return fail(1004);
             if(flags&0x20000000U){if(!info->number)return fail(1004);const unsigned required=wide?2:4;
@@ -1117,7 +1222,94 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         }catch(const std::invalid_argument&){return finish(0x80020005U);}catch(const std::bad_alloc&){return finish(0x8007000eU);}
     }
     if(locales().empty())return fail(50);
-    const auto requested=[&](){return !arg(0) || arg(0)==(x86_?UINT32_MAX:UINT64_MAX)?std::u16string(u"en-US"):read_utf16(memory,GuestAddress{arg(0)},85);};
+    const auto requested=[&](){return requested_locale_name(memory,arg(0)==(x86_?UINT32_MAX:UINT64_MAX)?0:arg(0));};
+    if(name.starts_with("GetCalendarInfo") || name.starts_with("EnumCalendarInfo") || name.starts_with("SetCalendarInfo")){
+        try{
+            const bool enumeration=name.starts_with("Enum"),setting=name.starts_with("Set"),wide=!name.ends_with('A');
+            const bool named_locale=name=="GetCalendarInfoEx" || name=="EnumCalendarInfoExEx";
+            const unsigned locale_arg=enumeration?1:0,calendar_arg=enumeration?2:1;
+            const unsigned type_arg=enumeration?(named_locale?4:3):(named_locale?3:2);
+            const auto locale_name=[&](){return requested_locale_name(memory,arg(locale_arg));};
+            const auto locale=named_locale?named(locale_name()):calendar_numbered(static_cast<std::uint32_t>(arg(locale_arg)));
+            if(!locale || (named_locale && arg(enumeration?3:2)))return fail(87);
+            const auto calendar=static_cast<std::uint32_t>(arg(calendar_arg)),flags=static_cast<std::uint32_t>(arg(type_arg)),type=flags&0xffffU;
+            if((flags&~0xf000ffffU) || !type || type>0x3d || ((flags&0x10000000U) && (type<0x15 || type>0x2e)))return fail(1004);
+            const auto* kind=calendar_kind(calendar);
+            if(setting){
+                if((flags&~0x40000000U)!=0x30U)return fail(1004);
+                if(!kind || !arg(3))return fail(87);
+                const auto value=wide?read_utf16(memory,GuestAddress{arg(3)}):ansi_input(memory,arg(3),-1,false,ansi_encoding(*locale,(flags&0x40000000U)!=0));
+                const auto parsed=calendar_decimal(value);if(!parsed)return fail(87);
+                // 透過既有登錄 API 保留交易、ACL、通知及非同步 I/O 契約。
+                const auto path=utf16_bytes(u"Control Panel\\International\\Calendars\\TwoDigitYearMax");
+                const auto field=utf16_bytes(utf8_to_utf16(std::to_string(calendar))),data=utf16_bytes(utf8_to_utf16(std::to_string(*parsed)));
+                const auto storage=allocate_heap(memory,path.size()+field.size()+data.size());if(!storage)return fail(14);
+                try{
+                    const auto field_at=storage+path.size(),value_at=field_at+field.size();
+                    memory.write(GuestAddress{storage},path);memory.write(GuestAddress{field_at},field);memory.write(GuestAddress{value_at},data);
+                    start_callbacks(state,memory,{{resolve("advapi32.dll","RegSetKeyValueW").value,
+                        {0x80000001U,storage,field_at,1,value_at,data.size()}}},Continuation::RegistryBooleanResult,storage);
+                }catch(...){(void)free_heap(memory,storage,state);throw;}
+                return std::nullopt;
+            }
+            const auto available=locale_calendars(*locale);
+            if(calendar!=UINT32_MAX || !enumeration){
+                if(!kind || (type!=0x30 && std::find(available.begin(),available.end(),calendar)==available.end()))return fail(87);
+            }
+            // 覆寫與 Reg* 共用客體使用者和 store；無效或無讀取權限的覆寫採系統預設值。
+            const auto information=[&](const CalendarKind& selected)->std::optional<LocaleInfo>{
+                auto result=calendar_information(*locale,selected,type,(flags&0x10000000U)!=0);
+                if(!result || type!=0x30 || (flags&0x80000000U))return result;
+                if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
+                RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
+                if(transaction.error)return result;
+                const auto path=registry_current_user_path(true)+u"\\control panel\\international\\calendars\\twodigityearmax";
+                const auto found=runtime_.registry.keys.find(path);if(found==runtime_.registry.keys.end())return result;
+                try{(void)registry_security_access(path,1);}catch(const SecurityDescriptorError&){return result;}
+                const auto entry=found->second.find(utf8_to_utf16(std::to_string(selected.id)));if(entry==found->second.end())return result;
+                const auto& data=entry->second.bytes;
+                if(entry->second.type!=1 || data.size()<4 || data.size()>12 || data.size()%2 || data[data.size()-1] || data[data.size()-2])return result;
+                std::u16string value;for(std::size_t i=0;i+2<data.size();i+=2)value.push_back(static_cast<char16_t>(data[i]|(unsigned(data[i+1])<<8)));
+                if(const auto number=calendar_decimal(value))return locale_info_number(*number);
+                return result;
+            };
+            const auto encoding=ansi_encoding(*locale,(flags&0x40000000U)!=0);
+            if(enumeration){
+                if(!arg(0))return fail(87);memory.check(GuestAddress{arg(0)},1,Access::Execute);
+                std::vector<std::pair<std::vector<std::uint8_t>,std::uint32_t>> items;std::size_t bytes=0;
+                for(const auto id:calendar==UINT32_MAX?available:std::vector<std::uint32_t>{calendar}){
+                    const auto info=information(*calendar_kind(id));if(!info)return fail(1004);
+                    auto text=wide?utf16_bytes(info->text):ansi_output(info->text+u'\0',encoding);
+                    bytes+=text.size();items.emplace_back(std::move(text),id);
+                }
+                if(items.empty())return finish(1);
+                const auto buffer=allocate_heap(memory,bytes);if(!buffer)return fail(14);auto at=buffer;
+                std::vector<GuestCallback> callbacks;
+                try{
+                    for(const auto& [text,id]:items){
+                        memory.write(GuestAddress{at},text);std::vector<std::uint64_t> args{at};
+                        if(name!="EnumCalendarInfoA" && name!="EnumCalendarInfoW")args.push_back(id);
+                        if(named_locale){args.push_back(0);args.push_back(arg(5));}
+                        callbacks.push_back({arg(0),std::move(args)});at+=text.size();
+                    }
+                    start_callbacks(state,memory,std::move(callbacks),Continuation::LocaleEnumeration,buffer);
+                }catch(...){(void)free_heap(memory,buffer,state);throw;}
+                return std::nullopt;
+            }
+            const auto output=arg(type_arg+1),number=arg(type_arg+3);const auto capacity=static_cast<std::int32_t>(arg(type_arg+2));
+            if(capacity<0)return fail(87);
+            const bool numeric=flags&0x20000000U;
+            if(numeric?(!number || output || capacity):number!=0)return fail(87);
+            if(capacity && !output)return fail(122);
+            const auto info=information(*kind);if(!info || (numeric && !info->number))return fail(1004);
+            if(numeric){memory.store(GuestAddress{number},32,*info->number);return finish(wide?2:4);}
+            const auto text=wide?utf16_bytes(info->text):ansi_output(info->text+u'\0',encoding);
+            const auto required=static_cast<std::uint32_t>(wide?info->text.size()+1:text.size());
+            if(!capacity)return finish(required);if(static_cast<std::uint32_t>(capacity)<required)return fail(122);
+            memory.write(GuestAddress{output},text);return finish(required);
+        }catch(const MemoryFault&){return fail(998);}catch(const std::bad_alloc&){return fail(14);}
+        catch(const std::runtime_error&){return fail(13);}
+    }
     if(name.starts_with("GetNumberFormat") || name.starts_with("GetCurrencyFormat")){
         const bool currency=name.starts_with("GetCurrency"),extended=name.ends_with("Ex"),wide=!name.ends_with('A');
         const auto locale=extended?named(requested()):numbered(static_cast<std::uint32_t>(arg(0)));if(!locale)return fail(87);
@@ -1161,11 +1353,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         if(!capacity)return finish(required);if(static_cast<std::uint32_t>(capacity)<required)return fail(122);
         if(wide)memory.write(GuestAddress{arg(4)},utf16_bytes(result));else memory.write(GuestAddress{arg(4)},std::span(reinterpret_cast<const std::uint8_t*>(narrow.c_str()),narrow.size()+1));return finish(required);
     }
-    if(name=="GetDateFormatW" || name=="GetDateFormatEx" || name=="GetTimeFormatW" || name=="GetTimeFormatEx"){
-        const bool date=name.starts_with("GetDate"),extended=name.ends_with("Ex");
+    if(name=="GetDateFormatA" || name=="GetDateFormatW" || name=="GetDateFormatEx" || name=="GetTimeFormatA" || name=="GetTimeFormatW" || name=="GetTimeFormatEx"){
+        const bool date=name.starts_with("GetDate"),extended=name.ends_with("Ex"),wide=!name.ends_with('A');
         auto locale=extended?named(requested()):numbered(static_cast<std::uint32_t>(arg(0)));if(!locale)return fail(87);
         if(date && extended && arg(6))return fail(87);
         const auto flags=static_cast<std::uint32_t>(arg(1)),options=flags&0xffU;const auto capacity=static_cast<std::int32_t>(arg(5));
+        const auto encoding=ansi_encoding(*locale,(flags&0x40000000U)!=0);
+        const auto input_pattern=[&]{return wide?read_utf16(memory,GuestAddress{arg(3)}):ansi_input(memory,arg(3),-1,false,encoding);};
         if(capacity<0 || (capacity && !arg(4)))return fail(87);
         if(flags&~(date?0xc00000ffU:0xc000000fU))return fail(1004);
         if(date){const auto style=options&0x8bU;if(std::popcount(style)>1 || std::popcount(options&0x70U)>1 || (arg(3) && options))return fail(1004);
@@ -1185,7 +1379,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         if(U_FAILURE(error) || !format)return fail(87);
         std::u16string pattern;
         if(date){
-            if(arg(3))pattern=windows_date_pattern(read_utf16(memory,GuestAddress{arg(3)}));
+            if(arg(3))pattern=windows_date_pattern(input_pattern());
             else if(options&(8U|0x80U)){
                 std::unique_ptr<UDateTimePatternGenerator,decltype(&udatpg_close)> generator(udatpg_open(id.c_str(),&error),udatpg_close);if(U_FAILURE(error) || !generator)return fail(87);
                 const auto skeleton=options&8U?u"yMMMM":u"MMMMd";const auto size=udatpg_getBestPattern(generator.get(),skeleton,5,nullptr,0,&error);error=U_ZERO_ERROR;
@@ -1193,15 +1387,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             }
         }else{
             std::u16string marker;DateFormat ampm(udat_open(UDAT_PATTERN,UDAT_PATTERN,id.c_str(),u"UTC",3,u"a",1,&error),udat_close);if(U_FAILURE(error) || !ampm)return fail(87);marker=date_text(ampm.get(),stamp);
-            pattern=time_pattern(arg(3)?read_utf16(memory,GuestAddress{arg(3)}):date_pattern(format.get()),options,arg(3)!=0,marker);
+            pattern=time_pattern(arg(3)?input_pattern():date_pattern(format.get()),options,arg(3)!=0,marker);
         }
         if(date && !arg(3)){
             if(pattern.empty())pattern=date_pattern(format.get());
             auto tokens=date_tokens(pattern);month_pattern_context(tokens);pattern=render_pattern(tokens);
         }
         if(arg(3) || !pattern.empty())udat_applyPattern(format.get(),false,pattern.data(),static_cast<std::int32_t>(pattern.size()));
-        const auto value=date_text(format.get(),stamp);const auto required=static_cast<std::uint32_t>(value.size()+1);
-        if(!capacity)return finish(required);if(static_cast<std::uint32_t>(capacity)<required)return fail(122);memory.write(GuestAddress{arg(4)},utf16_bytes(value));return finish(required);
+        const auto value=date_text(format.get(),stamp);
+        // A／W 共用日期與旗標語義，只在邊界依語系字碼頁轉換並計算實際緩衝區長度。
+        const auto bytes=wide?utf16_bytes(value):ansi_output(value+u'\0',encoding);
+        const auto required=static_cast<std::uint32_t>(wide?value.size()+1:bytes.size());
+        if(!capacity)return finish(required);if(static_cast<std::uint32_t>(capacity)<required)return fail(122);memory.write(GuestAddress{arg(4)},bytes);return finish(required);
     }
     if(name=="GetStringTypeW" || name=="GetStringTypeExW" || name=="GetStringTypeA" || name=="GetStringTypeExA"){
         const unsigned offset=name=="GetStringTypeW"?0U:1U,type=static_cast<unsigned>(arg(offset));

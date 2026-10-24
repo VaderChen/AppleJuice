@@ -22,11 +22,11 @@ cmake --preset release -DAPPLEJUICE_KERNEL_ROOT=vendor/x64kernel
 
 ## 執行後端與快取
 
-`--backend jit` 在 32／64 位元程式均預設使用 resident AOT；Launcher 執行及 `precompile-pe` 也採用相同選擇。`X64ARM_JIT_MODULE_AOT=0` 明確切回原 JIT，`=1` 明確指定 resident AOT；未設定時仍尊重既有的 LLVM 後端選項。`--backend interpreter` 仍使用直譯器。
+`--backend jit` 是 resident AOT 的相容名稱；Launcher、CLI、預編譯及效能量測均使用 resident AOT。舊 JIT／LLVM 執行後端已封閉，只保留原始碼參考。`X64ARM_JIT_MODULE_AOT=0` 或要求啟用舊 LLVM 的設定會明確報錯；`=1` 仍可使用。`--backend interpreter` 保留直譯器。
 
 正常 resident AOT 搭配宿主時計時，未指定 `--max-instructions` 時預設沒有指令配額或時間片。明確指定有限 `--max-instructions` 時使用獨立觀察模式；其他執行模式仍保留既有指令配額。這些設定不改變 `--memory-limit-mib` 的記憶體上限。
 
-resident AOT 的預編譯快取為 `.aot.smap`，執行期快取為 `.smap`。一般執行預設不讀寫持久快取；只有 `X64ARM_AOT_PERSISTENT=1` 才啟用。手動 `precompile-pe` 仍會產生預編譯快取。原 JIT 則以 `X64ARM_SMAP=1` 開啟快取。
+resident AOT 的預編譯快取為 `.aot.smap`，執行期快取為 `.smap`。一般執行預設不讀寫持久快取；只有 `X64ARM_AOT_PERSISTENT=1` 才啟用。手動 `precompile-pe` 仍會產生預編譯快取。舊 JIT 的快取設定不會重新啟用退役後端。
 
 ## Launcher
 

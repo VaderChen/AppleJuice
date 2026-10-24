@@ -13,7 +13,8 @@
 #endif
 #include "x64arm/api_audit.hpp"
 #include <csignal>
-#include "x64arm/jit.hpp"
+#include "backend_policy.hpp"
+#include "x64arm/platform.hpp"
 #include "x64arm/aot_engine.hpp"
 #include "x64arm/cross_architecture.hpp"
 #include "x64arm/execution_policy.hpp"
@@ -59,8 +60,8 @@ void usage() {
         "相容性診斷：--unresolved-imports reject|trap；trap 在實際呼叫未知 API 時停止，預設 reject。\n"
         "預編譯：precompile-pe <EXE或DLL> [--scan-dlls adjacent] [--profile <熱點報告>] [--ordering host] [--image-base <位址>]，不執行客體程式\n"
         "32／64 位元預設使用 resident AOT，預設不讀寫持久快取；X64ARM_AOT_PERSISTENT=1 才啟用 .smap，手動預編譯產生 .aot.smap。\n"
-        "LLVM 執行後端與舊 JIT 已廢棄，保留但不再維護；--backend jit 預設仍使用 resident AOT。\n"
-        "X64ARM_JIT_MODULE_AOT=0|1 保留選擇舊 JIT／resident AOT；X64ARM_SMAP=1 僅供已廢棄的舊 JIT。\n"
+        "舊 JIT／LLVM 執行入口已封閉，只保留原始碼參考；--backend jit 固定使用 resident AOT。\n"
+        "X64ARM_JIT_MODULE_AOT 僅相容值 1；舊 JIT／LLVM 啟用設定會明確拒絕。\n"
         "背景編譯：X64ARM_JIT_COMPILER_WORKERS=0..8（0 同步；即時與離線編譯預設 2）。\n"
         "共用選項：--max-instructions <步數>（正常 resident AOT 預設無上限，其他模式預設 10000000）、--dump-jit <目錄>\n"
         "GPU 記憶體：--gpu-memory-mib <MiB>（至少 16，至多宿主實體記憶體的 50%；預設 256，按需配置）\n"
@@ -79,15 +80,6 @@ std::uint64_t number(std::string_view text) {
     if (text.empty() || error != std::errc{} || end != text.data() + text.size())
         throw std::invalid_argument("數值不合法：" + std::string(original));
     return value;
-}
-// 預譯統計只在 SDK 提供這些欄位時輸出，讓同一份 CLI 可連結不含預譯的核心。
-template<class Stats> std::string speculation_stats(const Stats& s){
-    if constexpr(requires{s.speculation_submitted;s.speculation_compiled;s.speculation_hits;s.speculation_waits;s.speculation_rejected;s.speculation_dropped;}){
-        std::ostringstream out;
-        out<<" speculation_submitted="<<s.speculation_submitted<<" speculation_compiled="<<s.speculation_compiled<<" speculation_hits="<<s.speculation_hits
-           <<" speculation_waits="<<s.speculation_waits<<" speculation_rejected="<<s.speculation_rejected<<" speculation_dropped="<<s.speculation_dropped;
-        return out.str();
-    } else return {};
 }
 unsigned compiler_worker_count(){
     // 即時與離線編譯預設兩個 worker；呼叫端可明確覆寫。
@@ -126,154 +118,11 @@ ExecutionResult execute_module(GuestState& state,GuestMemory& memory,RunOptions 
     if(persistent)diagnostics<<"aot_smap_saved="<<engine.save_smap()<<'\n';
     result.completed=completed;if(!dump.empty())engine.dump(dump);diagnostics<<format_stats(engine.stats());return result;
 }
-bool module_aot_enabled(){
-    if(const auto* module=std::getenv("X64ARM_JIT_MODULE_AOT"))return std::string_view(module)=="1";
-    // MODULE_AOT 是明確覆寫；舊 JIT／LLVM 後端已廢棄，僅保留既有選擇相容性。
-    for(const auto* key:{"X64ARM_JIT_LLVM","X64ARM_JIT_LLVM_TIER","X64ARM_AOT_LLVM"})
-        if(const auto* configured=std::getenv(key);configured && std::string_view(configured)=="1")return false;
-    return true;
-}
 ExecutionResult execute(bool jit, GuestState& state, GuestMemory& memory, RunOptions options,
                         const std::filesystem::path& dump, std::ostream& diagnostics, const std::filesystem::path& source = {}) {
     if (!jit) return Interpreter{}.run(state, memory, options);
-    if(module_aot_enabled())
-        return execute_module(state,memory,options,dump,diagnostics,source);
-    JitEngine engine;
-    const auto compiler_workers=compiler_worker_count();
-    engine.retain_llvm_ir(!dump.empty());
-    engine.set_compiler_workers(compiler_workers);diagnostics<<"jit_compiler_workers="<<compiler_workers<<'\n';
-    const char* cache=std::getenv("X64ARM_SMAP");
-    // SMAP 暫停使用：還原成本與重新編譯相當，且引擎更新即全數作廢；僅在明確設定 X64ARM_SMAP=1 時讀寫。
-    const bool persistent=!source.empty() && cache && std::string_view(cache)=="1";
-    if(persistent){
-        const auto path=std::filesystem::absolute(source);
-        const auto loaded=engine.open_smap(path);diagnostics<<"smap_loaded="<<loaded<<'\n';
-        // 相鄰 DLL 的離線快取可預先匯入；客體載入時仍須逐指令驗證位址及 bytes。
-        std::error_code error;
-        for(const auto& item:std::filesystem::directory_iterator(path.parent_path(),error)){
-            if(item.path().extension()!=".smap")continue;
-            auto dll=item.path();dll.replace_extension();
-            auto extension=dll.extension().string();for(auto& c:extension)c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if(extension!=".dll")continue;
-            if(std::filesystem::is_regular_file(dll,error))engine.open_smap(dll,false);
-        }
-    }
-    std::filesystem::path profile_path;
-    if(const auto* profile=std::getenv("X64ARM_JIT_PROFILE");profile && *profile)profile_path=profile;
-    if(const auto* directory=std::getenv("X64ARM_JIT_PROFILE_DIR");directory && *directory){
-        std::filesystem::create_directories(directory);
-        profile_path=std::filesystem::path(directory)/("jit-"+std::to_string(host_process_id())+".txt");
-    }
-    if(!profile_path.empty()){const auto* mode=std::getenv("X64ARM_JIT_PROFILE_MODE");engine.enable_profiling(!mode || std::string_view(mode)!="fallback");}
-    std::filesystem::path native_request,native_response;
-    if(const auto* directory=std::getenv("X64ARM_JIT_NATIVE_SAMPLES_DIR");directory && *directory){
-        std::filesystem::create_directories(directory);
-        const auto name=std::to_string(host_process_id());
-        engine.retain_llvm_ir();
-        native_request=std::filesystem::path(directory)/(name+".request");
-        native_response=std::filesystem::path(directory)/(name+".response");
-    }
-    const auto native_samples=[&]{
-        if(native_request.empty())return;
-        std::ifstream request(native_request);if(!request)return;
-        std::string token;request>>token;
-        try {
-            if(token=="cursor"){
-                auto temporary=native_response;temporary+=".tmp";
-                {std::ofstream out(temporary);out<<"serial="<<engine.native_publication_serial()<<'\n';
-                 out<<"rip=0x"<<std::hex<<state.rip.value<<" mxcsr=0x"<<state.mxcsr<<std::dec<<'\n';
-                 out<<"llvm_batches="<<engine.stats().llvm_batches<<" llvm_guard_exits="<<engine.stats().llvm_guard_exits<<'\n';
-                 out.close();if(!out)throw std::runtime_error("原生取樣序號寫入失敗");}
-                std::filesystem::rename(temporary,native_response);
-            }else{
-                const auto limit=number(token);std::vector<std::uintptr_t> pcs;
-                while(request>>token){if(pcs.size()==8192)throw std::invalid_argument("原生取樣查詢超過上限");pcs.push_back(number(token));}
-                engine.dump_native_samples(native_response,memory,pcs,limit);
-            }
-        }catch(const std::exception& error){diagnostics<<"native_samples_error="<<error.what()<<'\n';}
-        request.close();std::filesystem::remove(native_request);
-    };
-    const bool memory_profile=std::getenv("X64ARM_MEMORY_PROFILE")!=nullptr;
-    const auto memory_snapshot=[&](std::string_view phase){
-        if(!memory_profile)return;
-        const auto page=host_page_size();const auto stats=memory.window_stats(page);
-        diagnostics<<"memory_window phase="<<phase<<" host_page_size="<<page<<" pages="<<stats.pages
-            <<" mixed_permissions="<<stats.mixed_permissions<<" partial="<<stats.partial<<" split_backing="<<stats.split_backing
-            <<" excluded="<<stats.excluded<<" eligible="<<stats.eligible<<'\n';
-        const auto gap=memory.native_mmu_gap();
-        diagnostics<<"native_mmu_layout phase="<<phase<<" complete="<<!gap;
-        if(gap)diagnostics<<" reason="<<gap->reason<<" base="<<gap->base.value<<" length="<<gap->length
-            <<" required="<<gap->required<<" first="<<gap->first<<" last="<<gap->last
-            <<" host_updated="<<gap->host_updated<<" external="<<gap->external<<" copy_on_write="<<gap->copy_on_write;
-        diagnostics<<'\n';
-    };
-    memory_snapshot("before");
-    startup_profile::mark("jit_execute_begin");
-    ExecutionResult result;
-    const char* progress=std::getenv("X64ARM_PROGRESS_INSTRUCTIONS");
-    if((!progress || !*progress) && profile_path.empty() && native_request.empty())result=engine.run(state,memory,options);
-    else {
-        const auto interval=progress && *progress?number(progress):UINT64_C(100000000);if(!interval)throw std::invalid_argument("進度診斷間隔不得為零");
-        const auto started=std::chrono::steady_clock::now();std::uint64_t completed=0;
-        do {
-            auto slice=options;slice.max_instructions=std::min(interval,options.max_instructions-completed);
-            slice.diagnose_budget=slice.max_instructions==options.max_instructions-completed && options.diagnose_budget;
-            result=engine.run(state,memory,slice);completed+=result.completed;
-            diagnostics<<"execution_progress host_unix_us="<<startup_profile::unix_us()<<" instructions="<<completed<<" elapsed_seconds="<<std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()<<" native_mmu_faults="<<NativeMemoryScope::fault_count()
-                <<" parallel_instructions="<<engine.stats().parallel_instructions<<" parallel_peak_workers="<<engine.stats().parallel_peak_workers
-                <<" native_instructions="<<engine.stats().native_instructions<<" fallback_instructions="<<engine.stats().fallback_instructions
-                <<" fragment_instructions="<<engine.stats().fragment_instructions<<" fragment_exits="<<engine.stats().fragment_exits
-                <<" llvm_regions="<<engine.stats().llvm_regions<<" llvm_instructions="<<engine.stats().llvm_instructions
-                <<" llvm_batches="<<engine.stats().llvm_batches<<" llvm_guard_exits="<<engine.stats().llvm_guard_exits
-                <<" llvm_compile_nanoseconds="<<engine.stats().llvm_compile_nanoseconds
-                <<" chain_batches="<<engine.stats().chain_batches<<" chain_blocks="<<engine.stats().chain_blocks<<" chain_instructions="<<engine.stats().chain_instructions
-                <<" admission_blocks="<<engine.stats().admission_blocks<<" admission_instructions="<<engine.stats().admission_instructions<<" admission_promotions="<<engine.stats().admission_promotions
-                <<speculation_stats(engine.stats())
-                <<" translated_blocks="<<engine.stats().translated_blocks<<" cache_hits="<<engine.stats().cache_hits
-                <<" first_regions="<<engine.stats().first_regions<<" first_region_entries="<<engine.stats().first_region_entries
-                <<" first_region_used="<<engine.stats().first_region_used<<" first_region_unused="<<engine.stats().first_region_unused
-                <<" first_region_links="<<engine.stats().first_region_links<<" first_region_word_stops="<<engine.stats().first_region_word_stops
-                <<" cache_resets="<<engine.stats().cache_resets<<" cache_reset_generation="<<engine.stats().cache_reset_generation
-                <<" cache_reset_ordering="<<engine.stats().cache_reset_ordering<<" cache_reset_context="<<engine.stats().cache_reset_context
-                <<" cache_reset_capacity="<<engine.stats().cache_reset_capacity<<" peak_cache_entries="<<engine.stats().peak_cache_entries
-                <<" cache_recycle_nanoseconds="<<engine.stats().cache_recycle_nanoseconds<<" cache_recycle_max_nanoseconds="<<engine.stats().cache_recycle_max_nanoseconds
-                <<" compiler_submitted="<<engine.stats().compiler_submitted<<" compiler_completed="<<engine.stats().compiler_completed<<" compiler_stale="<<engine.stats().compiler_stale
-                <<" compiler_cancelled="<<engine.stats().compiler_cancelled<<" compiler_queue_full="<<engine.stats().compiler_queue_full<<" compiler_nanoseconds="<<engine.stats().compiler_nanoseconds
-                <<" compiler_publish_nanoseconds="<<engine.stats().compiler_publish_nanoseconds<<" compiler_publish_max_nanoseconds="<<engine.stats().compiler_publish_max_nanoseconds<<" compiler_peak_workers="<<engine.stats().compiler_peak_workers
-                <<" compile_base_nanoseconds="<<engine.stats().compile_base_nanoseconds<<" compile_upgrade_nanoseconds="<<engine.stats().compile_upgrade_nanoseconds<<" compile_prefix_nanoseconds="<<engine.stats().compile_prefix_nanoseconds<<" compile_chain_nanoseconds="<<engine.stats().compile_chain_nanoseconds<<" compile_decode_nanoseconds="<<engine.stats().compile_decode_nanoseconds<<" compile_emit_nanoseconds="<<engine.stats().compile_emit_nanoseconds<<" compile_publish_nanoseconds="<<engine.stats().compile_publish_nanoseconds<<" cache_cleared_entries="<<engine.stats().cache_cleared_entries<<" cache_cleared_bytes="<<engine.stats().cache_cleared_bytes<<" code_mapping_ranges="<<engine.stats().code_mapping_ranges
-                << " translation_hits=" << engine.stats().translation_hits<< " translation_misses=" << engine.stats().translation_misses<< " translation_stale=" << engine.stats().translation_stale<< " translation_admissions=" << engine.stats().translation_admissions<< " translation_evictions=" << engine.stats().translation_evictions<< " translation_protected_hits=" << engine.stats().translation_protected_hits<< " translation_restored_fragments=" << engine.stats().translation_restored_fragments<< " translation_restored_prefixes=" << engine.stats().translation_restored_prefixes<< " translation_reused_upgrades=" << engine.stats().translation_reused_upgrades<< " translation_bytes=" << engine.stats().translation_bytes<< " translation_peak_bytes=" << engine.stats().translation_peak_bytes<< " translation_restore_nanoseconds=" << engine.stats().translation_restore_nanoseconds
-                <<" code_write_unchanged="<<engine.stats().code_write_unchanged<<" code_write_uncovered="<<engine.stats().code_write_uncovered
-                <<" code_write_page_only="<<engine.stats().code_write_page_only<<" code_write_overlap="<<engine.stats().code_write_overlap
-                <<" code_write_unclassified="<<engine.stats().code_write_unclassified<<" code_write_resets="<<engine.stats().code_write_resets
-                <<" code_write_cleared_entries="<<engine.stats().code_write_cleared_entries<<" code_write_page_entries="<<engine.stats().code_write_page_entries
-                <<" code_write_overlap_entries="<<engine.stats().code_write_overlap_entries
-                <<" code_flush_ranges="<<engine.stats().code_flush_ranges<<" code_write_events="<<engine.stats().code_write_events
-                <<" code_write_invalidations="<<engine.stats().code_write_invalidations
-                <<" memory_code_generation="<<memory.code_generation()<<" memory_code_structure_generation="<<memory.code_structure_generation();
-            const auto& generations=memory.generation_stats();
-            diagnostics<<" generation_executable_maps="<<generations.executable_maps<<" generation_executable_unmaps="<<generations.executable_unmaps
-                <<" generation_protect="<<generations.protect<<" generation_non_executable_protect="<<generations.non_executable_protect
-                <<" generation_executable_writes="<<generations.executable_writes<<" generation_executable_write_bytes="<<generations.executable_write_bytes
-                <<" generation_executable_write_unchanged="<<generations.executable_write_unchanged
-                <<" generation_executable_write_unchanged_bytes="<<generations.executable_write_unchanged_bytes
-                <<" generation_flush_ranges="<<generations.flush_ranges
-                <<" generation_restores="<<generations.restores<<" generation_flushes="<<generations.flushes<<" generation_mode_changes="<<generations.mode_changes
-                <<" last_executable_write_address="<<generations.last_write_address<<" last_executable_write_region_base="<<generations.last_write_region_base
-                <<" last_executable_write_region_size="<<generations.last_write_region_size<<std::endl;
-            if(!profile_path.empty())engine.dump_profile(profile_path);
-            native_samples();
-            memory_snapshot("slice");
-            if(result.reason!=StopReason::BudgetExhausted || !result.completed)break;
-        }while(completed<options.max_instructions);
-        result.completed=completed;
-    }
-
-    memory_snapshot("after");
-    if(persistent){const auto saved=engine.save_smap();diagnostics<<"smap_saved="<<saved<<'\n';}
-    if(!profile_path.empty())engine.dump_profile(profile_path);
-    if (!dump.empty()) engine.dump(dump,memory);
-    diagnostics << format_stats(engine.stats());
-    return result;
+    cli::reject_retired_backends();
+    return execute_module(state,memory,options,dump,diagnostics,source);
 }
 int compare(GuestState state, GuestMemory memory, RunOptions options, WindowsServices* services,
             const std::filesystem::path& dump) {
@@ -306,6 +155,7 @@ int main(int argc, char** argv) {
         }
         if (argc < 2) { usage(); return 2; }
         const std::string_view command = argv[1];
+        if(command=="run-pe" || command=="run-raw" || command=="compare" || command=="precompile-pe" || command=="bench")cli::reject_retired_backends();
         const auto host_files = command == "run-pe" ? prepare_host_file_limit() : HostFileLimit{};
 #if defined(__APPLE__)
         if(command=="run-pe"){startup_profile::Scope measurement("startup","resource_preload",true);preload_generated_resources_async();}
@@ -354,11 +204,11 @@ int main(int argc, char** argv) {
             std::signal(SIGTERM,[](int){analysis_cancelled=1;});
             std::signal(SIGINT,[](int){analysis_cancelled=1;});
             if(argc<3)throw std::invalid_argument("precompile-pe <EXE或DLL> [--scan-dlls adjacent] [--profile <熱點報告>] [--ordering host] [--image-base <位址>]");
-            bool adjacent=false,host_ordering=false;std::filesystem::path profile_path;std::optional<GuestAddress> precompile_base;
+            bool adjacent=false;std::filesystem::path profile_path;std::optional<GuestAddress> precompile_base;
             for(int n=3;n<argc;++n){const std::string_view option=argv[n];
                 if(option=="--scan-dlls" && n+1<argc && std::string_view(argv[n+1])=="adjacent"){adjacent=true;++n;}
                 else if(option=="--profile" && n+1<argc)profile_path=argv[++n];
-                else if(option=="--ordering" && n+1<argc && std::string_view(argv[n+1])=="host"){host_ordering=true;++n;}
+                else if(option=="--ordering" && n+1<argc && std::string_view(argv[n+1])=="host"){++n;}
                 else if(option=="--image-base" && n+1<argc)precompile_base=GuestAddress{number(argv[++n])};
                 else throw std::invalid_argument("未知預編譯參數");
             }
@@ -421,7 +271,7 @@ int main(int argc, char** argv) {
                     std::cout<<"profile_selected="<<seeds.size()<<" candidates="<<matched.size()<<" instruction_coverage="<<static_cast<double>(covered/total)<<std::endl;
                 }
                 // 熱點模式重新產生精簡快取，不把舊的全檔掃描記錄帶回來。
-                if(module_aot_enabled()){
+                {
                     std::vector<TranslationRegion> regions;
                     for(const auto& function:image.runtime.functions){
                         if(function.begin==function.end)continue;
@@ -442,19 +292,7 @@ int main(int argc, char** argv) {
                     std::cout<<"precompile_source="<<source<<" seeds="<<seeds.size()<<" smap_loaded="<<loaded
                         <<" prepared="<<modules<<" smap_saved="<<saved<<" preparation_limited="<<(engine.stats().prepared_rejections!=0)<<'\n'
                         <<format_stats(engine.stats());
-                }else{
-                JitEngine engine;const auto compiler_workers=compiler_worker_count();engine.set_compiler_workers(compiler_workers);
-                const bool loaded=engine.open_smap(source,true,profile_path.empty());
-                std::cout<<"precompile_workers="<<compiler_workers<<std::endl;
-                std::cout<<"smap_progress="<<finished<<'/'<<sources.size()<<" phase=compile source="<<source<<std::endl;
-                // 本機準備只產生可用的排序版本，避免其他模式擠掉固定容量內的程式入口。
-                const auto ordering_mask=host_ordering?(enter_hardware_tso()?(memory.prepare_native_mmu()?0x10U:0x08U):(memory.prepare_native_mmu()?0x27U:0x07U)):0x3fU;
-                const auto blocks=engine.precompile(memory,seeds,image.metadata.loaded_base,image.metadata.image_size,[]{return analysis_cancelled!=0;},profile_path.empty(),ordering_mask);
-                if(analysis_cancelled)return 130;
-                std::cout<<"smap_progress="<<finished<<'/'<<sources.size()<<" phase=save source="<<source<<std::endl;
-                const bool saved=engine.save_smap();passed&=saved;
-                if(!saved)std::cerr<<"無法保存 JIT 快取，請確認程式目錄可寫入且本機快取金鑰可用。"<<std::endl;
-                std::cout<<"precompile_source="<<source<<" seeds="<<seeds.size()<<" smap_loaded="<<loaded<<" compiled="<<blocks<<" smap_saved="<<saved<<" compiler_peak_workers="<<engine.stats().precompile_peak_workers<<'\n';
+
                 }
             }catch(const std::exception& error){passed=false;std::cerr<<source<<"："<<error.what()<<'\n';}
                 ++finished;std::cout<<"smap_progress="<<finished<<'/'<<sources.size()<<" phase=complete"<<std::endl;}
@@ -615,10 +453,11 @@ int main(int argc, char** argv) {
             pe_options.primary_token_descriptor=process_token_descriptor;
             pe_options.defer_imports=startup_suspended;
             // 與 execute() 共用後端選擇；x86 載入器仍維持原 CFG 入口。
-            pe_options.resident_translation=jit && !comparison && !inspection && module_aot_enabled();
+            pe_options.resident_translation=jit && !comparison && !inspection;
             if(pe_options.resident_translation && host_clock && !seen.contains("--max-instructions"))
                 run.max_instructions=UINT64_MAX;
             auto program = load_pe(bytes, pe_options);
+            if(!process_session.empty())program.services.set_mapping_session(process_session,process_session_descriptor);
             *diagnostics<<"cfg_guard fast_path="<<program.services.uses_guard_fast_path()<<'\n';
             if (program.memory.execution_mode() == ExecutionMode::X86) run.sentinel = GuestAddress{0x7ffffff0};
             program.services.set_processor_count(program.memory,processor_count);
@@ -653,7 +492,6 @@ int main(int argc, char** argv) {
             process_options.max_instructions=run.max_instructions;process_options.memory_limit_mib=program.memory.limit()/1024/1024;process_options.gpu_memory_mib=gpu_memory_mib;
             program.services.configure_processes(std::move(process_options), program.memory);
             if(process_session_descriptor>=0 && process_session.empty())throw std::invalid_argument("mapping session fd 需要命名空間路徑");
-            if(!process_session.empty())program.services.set_mapping_session(process_session,process_session_descriptor);
             if(!mapping_session_output.empty()) {
                 const auto temporary=mapping_session_output.string()+".tmp";
                 {std::ofstream output(temporary,std::ios::binary);output<<program.services.mapping_session()<<'\n';output.close();if(!output)throw std::runtime_error("無法發布 Windows 工作階段路徑");}
@@ -737,6 +575,7 @@ int main(int argc, char** argv) {
         if (seen.contains("--drive") || seen.contains("--gpu-memory-mib") || seen.contains("--clock") || seen.contains("--memory-limit-mib") || seen.contains("--stdio") || seen.contains("--fs-mode") || seen.contains("--stdin-file") || seen.contains("--c-drive") || seen.contains("--install-root") || seen.contains("--unresolved-imports") || seen.contains("--gui") || seen.contains("--gui-snapshot") || seen.contains("--image-base") || seen.contains("--command-line") || seen.contains("--fs-root") || seen.contains("--certificate-roots-file")) throw std::invalid_argument("PE 選項不能用於 raw 程式");
         for (const auto required : {"--load-address", "--entry"})
             if (!seen.contains(required)) throw std::invalid_argument(std::string("raw 檔必須指定 ") + required);
+        if(jit && !comparison && !seen.contains("--max-instructions"))run.max_instructions=UINT64_MAX;
         auto program = prepare_raw(bytes, config);
         if (comparison) return compare(program.state, std::move(program.memory), run, nullptr, dump);
         const auto result = execute(jit, program.state, program.memory, run, dump, std::cout);

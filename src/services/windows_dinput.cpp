@@ -113,6 +113,9 @@ std::span<const WindowsServiceDescriptor> dinput_service_descriptors(){
             result.push_back({family,"#100",2,0,0,1}); // XInputGetStateEx：含 Guide 鍵。
         }
         result.push_back({"xinput1_3.dll","XInputGetDSoundAudioDeviceGuids",3,0,0,1});
+        // XInput 9.1.0（Vista 起內建）只匯出四個入口，語義與 1_3 相同。
+        for(const auto& item:std::array<WindowsServiceDescriptor,4>{{{"xinput9_1_0.dll","XInputGetState",2,0,0,1},{"xinput9_1_0.dll","XInputSetState",2,0,0,1},
+            {"xinput9_1_0.dll","XInputGetCapabilities",3,0,0,3},{"xinput9_1_0.dll","XInputGetDSoundAudioDeviceGuids",3,0,0,1}}})result.push_back(item);
         result.push_back({"xinput1_4.dll","XInputGetAudioDeviceIds",5,0,0,1});
         result.push_back({"xinput1_4.dll","#108",4,0,0,7}); // XInputGetCapabilitiesEx。
         for(auto family:{"dinput.dll","dinput8.dll"}){result.push_back({family,"DllGetClassObject",3});result.push_back({family,"DllCanUnloadNow",0});result.push_back({family,"DllRegisterServer",0});result.push_back({family,"DllUnregisterServer",0});}
@@ -241,7 +244,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dinput(GuestState& state,Gu
     if(!runtime_.network.external_io)throw HostCallFault("DirectInput 不能在 compare 模式使用");
     if(!dinput_)dinput_=std::make_shared<DirectInputState>();auto& bridge=*dinput_;if(!bridge.backend)bridge.backend=input::make_backend();
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const unsigned unit=x86_?4U:8U;const std::uint8_t bits=x86_?32:64;
-    if(service.family=="xinput1_3.dll" || service.family=="xinput1_4.dll"){
+    if(service.family=="xinput1_3.dll" || service.family=="xinput1_4.dll" || service.family=="xinput9_1_0.dll"){
 #include "windows_xinput.inc"
     }
     if(service.family=="winmm.dll"){

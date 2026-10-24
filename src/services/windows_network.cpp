@@ -284,6 +284,7 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         {"iphlpapi.dll","GetUnicastIpAddressTable",2},{"iphlpapi.dll","GetUnicastIpAddressEntry",1},
         {"iphlpapi.dll","InitializeUnicastIpAddressEntry",1},
         {"iphlpapi.dll","ConvertInterfaceIndexToLuid",2},{"iphlpapi.dll","ConvertInterfaceLuidToIndex",2},
+        {"iphlpapi.dll","ConvertLengthToIpv4Mask",2,0,0,1},{"iphlpapi.dll","ConvertIpv4MaskToLength",2,0,0,1},
         {"iphlpapi.dll","ConvertInterfaceLuidToNameA",3},{"iphlpapi.dll","ConvertInterfaceLuidToNameW",3},
         {"iphlpapi.dll","ConvertInterfaceNameToLuidA",2},{"iphlpapi.dll","ConvertInterfaceNameToLuidW",2},
         {"iphlpapi.dll","ConvertInterfaceAliasToLuid",2},{"iphlpapi.dll","ConvertInterfaceLuidToAlias",3},
@@ -307,12 +308,15 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         {"ws2_32.dll","WSCEnumProtocols",4},{"ws2_32.dll","WSCGetProviderPath",4},
         {"ws2_32.dll","WSADuplicateSocketA",3},{"ws2_32.dll","WSADuplicateSocketW",3},{"ws2_32.dll","WSASocketA",6},{"ws2_32.dll","WSASocketW",6},{"ws2_32.dll","WSAIoctl",9},
         {"ws2_32.dll","socket",3},{"ws2_32.dll","closesocket",1},{"ws2_32.dll","bind",3},{"ws2_32.dll","connect",3},
+        {"ws2_32.dll","WSAConnect",7,0,0,4},
         {"ws2_32.dll","listen",2},{"ws2_32.dll","accept",3},{"ws2_32.dll","shutdown",2},{"ws2_32.dll","getsockname",3},{"ws2_32.dll","getpeername",3},
         {"ws2_32.dll","send",4},{"ws2_32.dll","recv",4},{"ws2_32.dll","sendto",6},{"ws2_32.dll","recvfrom",6},
         {"ws2_32.dll","select",5},{"ws2_32.dll","ioctlsocket",3},{"ws2_32.dll","setsockopt",5},{"ws2_32.dll","getsockopt",5},
         {"ws2_32.dll","htonl",1},{"ws2_32.dll","htons",1},{"ws2_32.dll","ntohl",1},{"ws2_32.dll","ntohs",1},
         {"ws2_32.dll","__WSAFDIsSet",2},{"ws2_32.dll","getaddrinfo",4},{"ws2_32.dll","freeaddrinfo",1},{"ws2_32.dll","gethostname",2},
         {"ws2_32.dll","GetAddrInfoW",4},{"ws2_32.dll","FreeAddrInfoW",1},{"ws2_32.dll","GetNameInfoW",7},
+        {"ws2_32.dll","GetAddrInfoExW",10},{"ws2_32.dll","GetAddrInfoExA",10},{"ws2_32.dll","FreeAddrInfoExW",1},{"ws2_32.dll","FreeAddrInfoEx",1},
+        {"ws2_32.dll","GetAddrInfoExCancel",1},{"ws2_32.dll","GetAddrInfoExOverlappedResult",1},
         {"ws2_32.dll","inet_ntop",4},{"ws2_32.dll","InetNtopW",4},{"ws2_32.dll","inet_pton",3},{"ws2_32.dll","InetPtonW",3},
         {"ws2_32.dll","WSAAddressToStringA",5},{"ws2_32.dll","WSAAddressToStringW",5},
         {"ws2_32.dll","WSAStringToAddressA",5},{"ws2_32.dll","WSAStringToAddressW",5},
@@ -340,7 +344,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
     if(symbol=="WSASendMsg"){const auto socket=network.sockets.find(arg(0));if(socket!=network.sockets.end() && socket->second->overlapped && arg(4))return invoke_socket_io(state,memory,service);}
     if(symbol=="WSARecvMsg"){const auto socket=network.sockets.find(arg(0));if(socket!=network.sockets.end() && socket->second->overlapped && (arg(3) || arg(4)))return invoke_socket_io(state,memory,service);}
     if(symbol=="WSASend" || symbol=="WSARecv" || symbol=="WSASendTo" || symbol=="WSARecvFrom"){const bool addressed=symbol=="WSASendTo" || symbol=="WSARecvFrom";const auto socket=network.sockets.find(arg(0));if(socket!=network.sockets.end() && socket->second->overlapped && (arg(addressed?7:5) || arg(addressed?8:6)))return invoke_socket_io(state,memory,service);}
-    const bool wide=symbol.ends_with('W'),resolve_address=symbol=="getaddrinfo" || symbol=="GetAddrInfoW",resolve_name=symbol=="getnameinfo" || symbol=="GetNameInfoW";
+    const bool address_ex=symbol=="GetAddrInfoExW" || symbol=="GetAddrInfoExA";
+    const bool wide=symbol.ends_with('W'),resolve_address=symbol=="getaddrinfo" || symbol=="GetAddrInfoW" || address_ex,resolve_name=symbol=="getnameinfo" || symbol=="GetNameInfoW";
     const bool host_lookup=symbol=="gethostbyname" || symbol=="gethostbyaddr";
     const bool ntop=symbol=="inet_ntop" || symbol=="InetNtopW",pton=symbol=="inet_pton" || symbol=="InetPtonW";
     if(!network.external_io && (symbol=="socket" || symbol.starts_with("WSASocket") || resolve_address || resolve_name || host_lookup || symbol=="gethostname" || symbol=="getservbyname" || symbol=="getservbyport"))
@@ -549,15 +554,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
             }
             if (result)last_error_=static_cast<std::uint32_t>(result);
         } else if (resolve_address) {
-            const unsigned entry_size=x86_?32:48,canon=x86_?20:24,addr=x86_?24:32,next=x86_?28:40;
-            memory.store(GuestAddress{arg(3)},bits,0);addrinfo hints{};std::uint32_t validation_error=0;
-            if (arg(2)) {
-                const auto pointer=arg(2);const auto flags_value=memory.load(GuestAddress{pointer},32);
+            // ADDRINFOEX 在 ai_addr 後多 ai_blob／ai_bloblen／ai_provider，ai_next 移到最後；其餘欄位位置相同。
+            const unsigned hints_arg=address_ex?4:2,out_arg=address_ex?5:3;
+            const unsigned entry_size=address_ex?(x86_?44:72):(x86_?32:48),canon=x86_?20:24,addr=x86_?24:32,next=address_ex?(x86_?40:64):(x86_?28:40);
+            memory.store(GuestAddress{arg(out_arg)},bits,0);addrinfo hints{};std::uint32_t validation_error=0;
+            // 只提供 DNS／全部命名空間；非同步 OVERLAPPED 由完成常式或事件回報。
+            if(address_ex && u32(2)!=0 && u32(2)!=12)validation_error=10022;
+            if (arg(hints_arg) && !validation_error) {
+                const auto pointer=arg(hints_arg);const auto flags_value=memory.load(GuestAddress{pointer},32);
                 hints.ai_family=host_family(static_cast<unsigned>(memory.load(GuestAddress{pointer+4},32)));
                 hints.ai_socktype=static_cast<int>(memory.load(GuestAddress{pointer+8},32));hints.ai_protocol=static_cast<int>(memory.load(GuestAddress{pointer+12},32));
                 if(flags_value&~UINT64_C(0xd0f))validation_error=10022;
                 else if(hints.ai_family<0)validation_error=10047;
                 else if(memory.load(GuestAddress{pointer+16},bits) || memory.load(GuestAddress{pointer+canon},bits) || memory.load(GuestAddress{pointer+addr},bits) || memory.load(GuestAddress{pointer+next},bits))validation_error=11003;
+                else if(address_ex)for(unsigned field=addr+unit;field<next;field+=unit)if(memory.load(GuestAddress{pointer+field},bits))validation_error=11003;
                 if (flags_value&1) hints.ai_flags|=AI_PASSIVE;if (flags_value&2) hints.ai_flags|=AI_CANONNAME;
                 if (flags_value&4) hints.ai_flags|=AI_NUMERICHOST;if (flags_value&8) hints.ai_flags|=AI_NUMERICSERV;
                 if (flags_value&0x100) hints.ai_flags|=AI_ALL;if (flags_value&0x400) hints.ai_flags|=AI_ADDRCONFIG;if (flags_value&0x800) hints.ai_flags|=AI_V4MAPPED;
@@ -591,12 +601,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                             if (!names[i].empty()) {cursor=(cursor+7)&~UINT64_C(7);memory.store(GuestAddress{at+canon},bits,cursor);memory.write(GuestAddress{cursor},names[i]);cursor+=names[i].size();}
                             memory.store(GuestAddress{at+next},bits,i+1<sources.size()?at+entry_size:0);
                         }
-                        network.addresses.insert(base);memory.store(GuestAddress{arg(3)},bits,base);
+                        network.addresses.insert(base);memory.store(GuestAddress{arg(out_arg)},bits,base);
                     }
                 }
             }
-            if (result) {memory.store(GuestAddress{arg(3)},bits,0);last_error_=static_cast<std::uint32_t>(result);}
-        } else if (symbol=="freeaddrinfo" || symbol=="FreeAddrInfoW") {
+            if (result) {memory.store(GuestAddress{arg(out_arg)},bits,0);last_error_=static_cast<std::uint32_t>(result);}
+            if(address_ex && arg(7) && !validation_error){
+                // 查詢已在呼叫端執行緒完成；依非同步契約回 WSA_IO_PENDING，結果碼寫入 OVERLAPPED.Internal
+                // （GetAddrInfoExOverlappedResult 讀取），再觸發完成常式或 hEvent。完成後的取消 handle 不再有效。
+                const auto overlapped=arg(7);memory.store(GuestAddress{overlapped},bits,result);
+                if(arg(9))memory.store(GuestAddress{arg(9)},bits,overlapped);
+                if(arg(8)){
+                    if(const auto error=queue_pool_callback(state,memory,{arg(8),{result,0,overlapped}})){
+                        if(const auto base=memory.load(GuestAddress{arg(out_arg)},bits);base && network.addresses.erase(base))free_heap(memory,base,state);
+                        memory.store(GuestAddress{arg(out_arg)},bits,0);result=error;last_error_=error;
+                    }else{result=997;last_error_=997;}
+                }else{
+                    if(const auto event=memory.load(GuestAddress{overlapped+(x86_?16:24)},bits)){
+                        const auto found=runtime_.wait_objects.find(event&~UINT64_C(1));
+                        if(found!=runtime_.wait_objects.end() && found->second.kind==WaitObject::Kind::Event)found->second.set_signal(true);
+                    }
+                    result=997;last_error_=997;
+                }
+            }
+        } else if (symbol=="GetAddrInfoExCancel") {
+            // 查詢都在 GetAddrInfoExW 回傳前完成，沒有可取消的進行中操作。
+            if(!arg(0)){result=10022;last_error_=10022;}else {(void)memory.load(GuestAddress{arg(0)},bits);result=6;last_error_=6;}
+        } else if (symbol=="GetAddrInfoExOverlappedResult") {
+            if(!arg(0)){result=10022;last_error_=10022;}else result=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},bits));
+        } else if (symbol=="freeaddrinfo" || symbol=="FreeAddrInfoW" || symbol=="FreeAddrInfoExW" || symbol=="FreeAddrInfoEx") {
             if (arg(0) && network.addresses.erase(arg(0))) free_heap(memory,arg(0),state);
             else if (arg(0)) throw HostCallFault("freeaddrinfo 收到非配置起點");
         } else if (symbol=="select") {
@@ -744,7 +777,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                         }
                     }
                 } else if (symbol=="closesocket") {cancel_network_io(memory,arg(0));const auto watch=gui_.socket_watches.find(arg(0));if(watch!=gui_.socket_watches.end() && watch->second.generation==socket->shared->data().watch_generation.load())socket->shared->data().watch_generation.fetch_add(1);gui_.socket_watches.erase(arg(0));runtime_.handle_flags.erase(arg(0));network.sockets.erase(found);std::erase_if(network.completion_flags,[&](const auto& item){return item.second.first==arg(0);});std::erase_if(network.completion_errors,[&](const auto& item){return item.second.first==arg(0);});}
-                else if (symbol=="bind" || symbol=="connect") {
+                else if (symbol=="bind" || symbol=="connect" || symbol=="WSAConnect") {
+                    const bool connecting=symbol!="bind",extended=symbol=="WSAConnect";
+                    std::uint32_t option_error=0;
+                    if(extended){
+                        // TCP／UDP 不支援 connect payload／QoS；不把資料誤當一般 send，也不忽略請求。
+                        if(arg(6))option_error=10022;
+                        if(!option_error && arg(3)){
+                            memory.check(GuestAddress{arg(3)},2*unit,Access::Read);
+                            const auto count=memory.load(GuestAddress{arg(3)},32);
+                            const auto data=memory.load(GuestAddress{arg(3)+unit},bits);
+                            if(count){if(!data)option_error=10014;else {memory.check(GuestAddress{data},count,Access::Read);option_error=10043;}}
+                        }
+                        if(!option_error && arg(5)){memory.check(GuestAddress{arg(5)},64+2*unit,Access::Read);option_error=10045;}
+                        if(!option_error && arg(4)){
+                            memory.check(GuestAddress{arg(4)},2*unit,Access::Read);
+                            memory.check(GuestAddress{arg(4)},4,Access::Write);
+                            const auto count=memory.load(GuestAddress{arg(4)},32);
+                            const auto data=memory.load(GuestAddress{arg(4)+unit},bits);
+                            if(count){if(!data)option_error=10014;else memory.check(GuestAddress{data},count,Access::Write);}
+                        }
+                    }
+                    if(option_error){fail(option_error);arg.return_to(state,result);return std::nullopt;}
                     const auto address=read_address(memory,arg(1),u32(2));
                     if (!address.size) fail(10047);
                     else {const auto* pointer=reinterpret_cast<const sockaddr*>(&address.storage);
@@ -754,8 +808,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                             if(!::getnameinfo(pointer,address.size,host,sizeof(host),port,sizeof(port),NI_NUMERICHOST|NI_NUMERICSERV))std::fprintf(stderr,"[net_endpoint] pid=%u ms=%lld api=%.*s socket=%llx host=%s port=%s status=%d native_error=%d\n",process_id(),static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()),static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned long long>(arg(0)),host,port,status,status<0?saved_errno:0);
                             errno=saved_errno;
                         }
-                        if(symbol=="connect" && gui_.socket_watches.contains(arg(0)) && (!status || errno==EINPROGRESS))gui_.socket_watches.at(arg(0)).connecting=true;
-                        if (status<0) fail(errno==EINPROGRESS?10035U:socket_error(errno));else if(symbol=="connect")socket->accepted_at=socket_clock_ticks();else{sockaddr_storage local{};socklen_t size=sizeof(local);if(::getsockname(fd,reinterpret_cast<sockaddr*>(&local),&size)==0)socket->set_bound_address(address_bytes(reinterpret_cast<sockaddr*>(&local)));}}
+                        if(extended && arg(4) && (!status || errno==EINPROGRESS))memory.store(GuestAddress{arg(4)},32,0);
+                        if(connecting && gui_.socket_watches.contains(arg(0)) && (!status || errno==EINPROGRESS))gui_.socket_watches.at(arg(0)).connecting=true;
+                        if (status<0) fail(errno==EINPROGRESS?10035U:socket_error(errno));else if(connecting)socket->accepted_at=socket_clock_ticks();else{sockaddr_storage local{};socklen_t size=sizeof(local);if(::getsockname(fd,reinterpret_cast<sockaddr*>(&local),&size)==0)socket->set_bound_address(address_bytes(reinterpret_cast<sockaddr*>(&local)));}}
                 } else if (symbol=="listen") {if (::listen(fd,sint(1))<0) fail(socket_error(errno));else socket->listening=true;}
                 else if (symbol=="shutdown") {if (u32(1)>2) fail(10022);else if (::shutdown(fd,sint(1))<0) fail(socket_error(errno));else if(u32(1))socket->send_shutdown=true;}
                 else if (symbol=="getsockname" || symbol=="getpeername" || symbol=="accept") {
@@ -866,6 +921,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                             else if(get){memory.write(GuestAddress{arg(3)},std::span<const std::uint8_t>(bytes).first(4));memory.store(GuestAddress{arg(4)},32,4);}
                         }
                     }
+                } else if ((symbol=="setsockopt" || symbol=="getsockopt") && u32(1)==0xffff && u32(2)==0xfffffffbU) {
+                    // SO_EXCLUSIVEADDRUSE（~SO_REUSEADDR）：須在 bind 前設定，且與 SO_REUSEADDR 互斥。Darwin 在雙方都未開
+                    // SO_REUSEADDR／SO_REUSEPORT 時已拒絕重複綁定，因此保持宿主 socket 不可重用並記錄旗標即可。
+                    const bool get=symbol=="getsockopt";auto& exclusive=socket->shared->data().exclusive_address;
+                    const auto capacity=get?memory.load(GuestAddress{arg(4)},32):u32(4);
+                    if(capacity<4)fail(10014);
+                    else if(get){memory.check(GuestAddress{arg(3)},4,Access::Write);memory.store(GuestAddress{arg(3)},32,exclusive.load());memory.store(GuestAddress{arg(4)},32,4);}
+                    else{
+                        const bool enable=memory.load(GuestAddress{arg(3)},32)!=0;int reuse=0;socklen_t size=sizeof(reuse);
+                        if(socket->shared->data().bound_size)fail(10022);
+                        else if(enable && ::getsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&reuse,&size)<0)fail(socket_error(errno));
+                        else if(enable && reuse)fail(10022);
+                        else exclusive.store(enable?1U:0U);
+                    }
                 } else if (symbol=="setsockopt" || symbol=="getsockopt") {
                     const bool get=symbol=="getsockopt";int level=0,option=0;bool timeout=false,linger_value=false;
                     const auto fragmentation=fragmentation_option(u32(1),u32(2),socket->family,socket->type);
@@ -901,6 +970,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                         // Darwin 沒有相同選項；1 byte 在連線後會逐位元組等待 ACK，導致 TLS 逾時。
                         // 保留可用的傳輸層佇列，客體 getsockopt 仍由共享狀態回報零。
                         if(zero_buffer)integer=65536;
+                        // SO_REUSEADDR 與 SO_EXCLUSIVEADDRUSE 互斥（Winsock 回 WSAEINVAL）。
+                        if(!get && level==SOL_SOCKET && option==SO_REUSEADDR && integer && socket->shared->data().exclusive_address.load()){fail(10022);arg.return_to(state,result);return std::nullopt;}
                         const auto status=get?::getsockopt(fd,level,option,value,&size ) : ::setsockopt(fd,level,option,value,size);
                         if (status<0) {
                             const auto native_error=errno;

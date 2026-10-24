@@ -4,6 +4,7 @@
  * 映射後整個模組唯讀。沒有宿主指標、隱藏排序狀態或依測項選路。
  */
 #include "guest_crt_state.h"
+#include "crt_float_bits.h"
 typedef __SIZE_TYPE__ Size;
 typedef __UINTPTR_TYPE__ Address;
 typedef unsigned char Byte;
@@ -21,6 +22,58 @@ EXPORT Size (*volatile host__msize)(void *);
 EXPORT void *(*volatile call_malloc)(Size);
 EXPORT void (*volatile call_free)(void *);
 EXPORT const Word *volatile heap_state;
+
+/* 同一份位元契約供宿主回退與客體常駐產碼使用；錯誤路徑仍交回原 CRT 服務。 */
+EXPORT int (*volatile host_ilogb)(double);
+EXPORT int (*volatile host_ilogbf)(float);
+EXPORT int guest__dpcomp(double x,double y){
+    Word a,b;__builtin_memcpy(&a,&x,8);__builtin_memcpy(&b,&y,8);
+    return x64arm_ordered_float_bits(a,b,64);
+}
+EXPORT int guest__fdpcomp(float x,float y){
+    unsigned a,b;__builtin_memcpy(&a,&x,4);__builtin_memcpy(&b,&y,4);
+    return x64arm_ordered_float_bits(a,b,32);
+}
+EXPORT int guest_ilogb(double x){
+    Word bits;__builtin_memcpy(&bits,&x,8);int invalid;
+    const int result=x64arm_ilogb_float_bits(bits,64,&invalid);
+    return invalid?host_ilogb(x):result;
+}
+EXPORT int guest_ilogbf(float x){
+    unsigned bits;__builtin_memcpy(&bits,&x,4);int invalid;
+    const int result=x64arm_ilogb_float_bits(bits,32,&invalid);
+    return invalid?host_ilogbf(x):result;
+}
+EXPORT void guest__fpreset(void){
+    const unsigned control=0x1f80;
+    __asm__ volatile("ldmxcsr %0"::"m"(control):"memory");
+}
+typedef struct {double real,imag;} ComplexDouble;
+typedef struct {float real,imag;} ComplexFloat;
+EXPORT double guest_creal(ComplexDouble x){return x.real;}
+EXPORT double guest_cimag(ComplexDouble x){return x.imag;}
+EXPORT float guest_crealf(ComplexFloat x){return x.real;}
+EXPORT float guest_cimagf(ComplexFloat x){return x.imag;}
+EXPORT ComplexDouble guest_conj(ComplexDouble x){
+    Word bits;__builtin_memcpy(&bits,&x.imag,8);bits^=1ULL<<63;__builtin_memcpy(&x.imag,&bits,8);return x;
+}
+EXPORT ComplexFloat guest_conjf(ComplexFloat x){
+    unsigned bits;__builtin_memcpy(&bits,&x.imag,4);bits^=1U<<31;__builtin_memcpy(&x.imag,&bits,4);return x;
+}
+EXPORT ComplexDouble guest_cproj(ComplexDouble x){
+    Word real,imag;__builtin_memcpy(&real,&x.real,8);__builtin_memcpy(&imag,&x.imag,8);
+    if((real&0x7fffffffffffffffULL)==0x7ff0000000000000ULL || (imag&0x7fffffffffffffffULL)==0x7ff0000000000000ULL){
+        real=0x7ff0000000000000ULL;imag&=1ULL<<63;__builtin_memcpy(&x.real,&real,8);__builtin_memcpy(&x.imag,&imag,8);
+    }
+    return x;
+}
+EXPORT ComplexFloat guest_cprojf(ComplexFloat x){
+    unsigned real,imag;__builtin_memcpy(&real,&x.real,4);__builtin_memcpy(&imag,&x.imag,4);
+    if((real&0x7fffffffU)==0x7f800000U || (imag&0x7fffffffU)==0x7f800000U){
+        real=0x7f800000U;imag&=1U<<31;__builtin_memcpy(&x.real,&real,4);__builtin_memcpy(&x.imag,&imag,4);
+    }
+    return x;
+}
 
 static Word load_word(const void *at) {
     Word value;
@@ -247,6 +300,18 @@ INLINE const GuestCrtThreadState *thread_state(void) {
     Address teb;
     __asm__("movq %%gs:0x30, %0" : "=r"(teb));
     return (const GuestCrtThreadState *)(teb + GUEST_CRT_STATE_OFFSET);
+}
+/* 直接讀取已發布的客體 locale 欄位；明確 locale 的版型／驗證仍由共用 provider 處理。 */
+EXPORT unsigned (*volatile host____mb_cur_max_l_func)(Address);
+EXPORT unsigned guest____mb_cur_max_func(void) {
+    return *(const unsigned *)(Address)thread_state()->mb_cur_max_address;
+}
+EXPORT unsigned guest___mb_cur_max_func(void) { return guest____mb_cur_max_func(); }
+EXPORT unsigned *guest___p___mb_cur_max(void) {
+    return (unsigned *)(Address)thread_state()->mb_cur_max_address;
+}
+EXPORT unsigned guest____mb_cur_max_l_func(Address locale) {
+    return locale?host____mb_cur_max_l_func(locale):guest____mb_cur_max_func();
 }
 /* 與 crt_c_locale.hpp 相同的分類位元；常數表避免每次呼叫重算全部分類。 */
 #define C_UPPER(c) ((c) >= 'A' && (c) <= 'Z')

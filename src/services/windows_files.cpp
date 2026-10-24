@@ -722,9 +722,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
                 const auto security_argument=template_directory?2U:1U;
                 if(template_directory && (!arg(0) || !arg(1)))error=87;
                 else {
-                    if(!crt)(void)read_security_attributes(memory,arg(security_argument),x86_,false);
+                    // kernel32 CreateDirectory 只把 lpSecurityDescriptor 交給 NtCreateFile，不檢查 nLength（.NET 傳 0）。
+                    if(!crt)(void)read_security_attributes(memory,arg(security_argument),x86_,false,false);
                     const auto source=template_directory?path(0):std::string{};
-                    error=template_directory && source.empty()?3U:filesystem_.create_directory(from,crt?std::function<std::vector<std::uint8_t>()>{}:std::function<std::vector<std::uint8_t>()>{[&]{return file_creation_descriptor(memory,arg(security_argument));}},source);
+                    error=template_directory && source.empty()?3U:filesystem_.create_directory(from,crt?std::function<std::vector<std::uint8_t>()>{}:std::function<std::vector<std::uint8_t>()>{[&]{return file_creation_descriptor(memory,arg(security_argument),false);}},source);
                 }
             }catch(const SecurityDescriptorError& failure){error=failure.code;}catch(const MemoryFault&){error=87;}
         }

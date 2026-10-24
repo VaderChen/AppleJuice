@@ -27,6 +27,7 @@ struct SharedSocketData {
     std::atomic<std::uint32_t> watch_rearm{},watch_recorded{};
     std::array<std::atomic<std::uint32_t>,10> watch_errors{};
     std::atomic<std::uint32_t> zero_send_buffer{};
+    std::atomic<std::uint32_t> exclusive_address{}; // Winsock SO_EXCLUSIVEADDRUSE
 };
 class SharedSocketState {
 public:

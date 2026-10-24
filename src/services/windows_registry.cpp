@@ -39,6 +39,7 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
         {"advapi32.dll","RegGetValueA",7,0,0,0x8},{"advapi32.dll","RegGetValueW",7,0,0,0x8},{"advapi32.dll","RegQueryValueA",4},{"advapi32.dll","RegQueryValueW",4},
         {"advapi32.dll","RegQueryInfoKeyA",12},{"advapi32.dll","RegQueryInfoKeyW",12},{"advapi32.dll","RegQueryValueExA",6},{"advapi32.dll","RegQueryValueExW",6},
         {"advapi32.dll","RegSetValueExA",6,0,0,0x2c},{"advapi32.dll","RegSetValueExW",6,0,0,0x2c},
+        {"advapi32.dll","RegSetValueA",5,0,0,0x14},{"advapi32.dll","RegSetValueW",5,0,0,0x14},
         {"advapi32.dll","RegSetKeyValueA",6,0,0,0x28},{"advapi32.dll","RegSetKeyValueW",6,0,0,0x28},
         {"advapi32.dll","RegDeleteKeyValueA",3},{"advapi32.dll","RegDeleteKeyValueW",3},
         {"advapi32.dll","RegDeleteValueA",2},{"advapi32.dll","RegDeleteValueW",2},
@@ -104,6 +105,21 @@ void WindowsServices::poll_registry_notifications(bool reload,std::u16string_vie
         it=registry_notifications_.erase(it);
     }
 }
+std::u16string WindowsServices::registry_current_user_path(bool cached){
+    initialize_tokens();
+    const bool cache=cached && !runtime_.registry_cache_disabled && !runtime_.registry_user_cache_disabled;
+    if(cache)if(const auto found=runtime_.registry_predefined_cache.find(0x80000001U);found!=runtime_.registry_predefined_cache.end())return found->second;
+    std::u16string path(1,1);
+    if(runtime_.token_objects.at(effective_token_id()).user.sid!=runtime_.token_objects.at(1).user.sid){
+        auto sid=utf8_to_utf16(token_user_sid_string(effective_token_id()));
+        for(auto& c:sid)c=unicode_case_unit(c,false);
+        path=std::u16string(1,3)+u"\\"+sid;
+        if(!runtime_.registry.keys.contains(path))path=std::u16string(1,3)+u"\\.default";
+    }
+    runtime_.registry.keys.try_emplace(path);
+    if(cache)runtime_.registry_predefined_cache[0x80000001U]=path;
+    return path;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     // 僅登錄 API 家族保留原生堆疊讓出 I/O；其他 consumer 在共同入口等待 store 門閂。
     RegistryIoScope io([&](const auto& work){await_registry_io(state,memory,work);});
@@ -111,7 +127,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     if(service.symbol=="RegGetKeySecurity" || service.symbol=="RegSetKeySecurity")return invoke_registry_security(state,memory,service);
     if(service.family=="ntdll.dll")return invoke_nt_registry(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;auto& registry=runtime_.registry;
-    const bool set_key_value=symbol.starts_with("RegSetKeyValue"),delete_key_value=symbol.starts_with("RegDeleteKeyValue");
+    const bool legacy_set=symbol=="RegSetValueA" || symbol=="RegSetValueW";
+    const bool set_key_value=legacy_set || symbol.starts_with("RegSetKeyValue"),delete_key_value=symbol.starts_with("RegDeleteKeyValue");
     const bool key_value=set_key_value || delete_key_value;
     try {
     const bool get_value=symbol.starts_with("RegGetValue"),legacy_query=symbol=="RegQueryValueA" || symbol=="RegQueryValueW";
@@ -158,14 +175,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     const auto canonical=[&](const std::u16string& path){return path==primary_hive || path.starts_with(primary_hive+u"\\")?std::u16string(1,1)+path.substr(primary_hive.size()):path;};
     registry.keys.try_emplace(std::u16string(1,1));registry.keys.try_emplace(std::u16string(1,3));registry.keys.try_emplace(primary_hive);
     registry.display_names[primary_hive]=utf8_to_utf16(token_user_sid_string(1));
-    const auto current_user_path=[&]{const auto path=user_hive(effective_token_id());if(path==primary_hive)return std::u16string(1,1);if(registry.keys.contains(path))return path;const auto fallback=std::u16string(1,3)+u"\\.default";registry.keys.try_emplace(fallback);return fallback;};
     if(symbol=="RegOpenCurrentUser"){
         const auto access=static_cast<std::uint32_t>(arg(0));
         if(!arg(1) || (access&0x300U)==0x300U)return done(87);
         if(access&~0xf30f033fU)return done(50);
         if(registry.handles.size()>=4096)return done(8);
         memory.check(GuestAddress{arg(1)},x86_?4:8,Access::Write);const auto token=registry.next_handle++;
-        const auto path=current_user_path();const auto granted=registry_security_access(path,access);
+        const auto path=registry_current_user_path();const auto granted=registry_security_access(path,access);
         registry.handles.emplace(token,RegistryHandle{path,granted,registry_view(access,x86_),path});memory.store(GuestAddress{arg(1)},x86_?32:64,token);return done(0);
     }
     const auto root=static_cast<std::uint32_t>(arg(0));
@@ -175,7 +191,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     if(predefined) {
         const bool cache=!runtime_.registry_cache_disabled && !(root==0x80000001U && runtime_.registry_user_cache_disabled);
         const auto found=runtime_.registry_predefined_cache.find(root);
-        handle.path=cache && found!=runtime_.registry_predefined_cache.end()?found->second:root==0x80000001U?current_user_path():std::u16string(1,static_cast<char16_t>(root&255));
+        handle.path=cache && found!=runtime_.registry_predefined_cache.end()?found->second:root==0x80000001U?registry_current_user_path(true):std::u16string(1,static_cast<char16_t>(root&255));
         if(cache)runtime_.registry_predefined_cache[root]=handle.path;handle.access=0xf003f;handle.view=registry_view(0,x86_);handle.logical_path=handle.path;registry.keys.try_emplace(handle.path);
     }
     else {
@@ -203,7 +219,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     if(predefined && !relative_open && !relative_query)handle.access=registry_security_access(handle.path,0x02000000U);
     if(symbol=="RegFlushKey"){if(!(handle.access&1U))return done(5);if(const auto error=flush_registry_hives())return done(error);return done(transaction->flush());}
     if(key_value && !predefined && !(handle.access&2))return done(5);
-    if(set_key_value){const auto size=static_cast<std::uint32_t>(arg(5));if(size>output_limit)return done(8);if(size && !arg(4))return done(87);if(size)memory.check(GuestAddress{arg(4)},size,Access::Read);}
+    std::vector<std::uint8_t> legacy_data;
+    if(legacy_set){
+        // 舊 API 的 cbData 不參與長度計算；在建立子鍵前驗證完整 REG_SZ。
+        if(static_cast<std::uint32_t>(arg(2))!=1 || !arg(3))return done(87);
+        if(wide)legacy_data=utf16_bytes(read_utf16(memory,GuestAddress{arg(3)},output_limit/2));
+        else {const auto text=read_ansi(memory,arg(3),output_limit);legacy_data.assign(text.begin(),text.end());legacy_data.push_back(0);}
+        if(legacy_data.size()>output_limit)return done(8);
+    }else if(set_key_value){const auto size=static_cast<std::uint32_t>(arg(5));if(size>output_limit)return done(8);if(size && !arg(4))return done(87);if(size)memory.check(GuestAddress{arg(4)},size,Access::Read);}
     if(symbol.starts_with("RegQueryInfoKey")){
         if(!(handle.access&1))return done(5);
         if(arg(3) || (arg(1) && !arg(2)))return done(87);
@@ -376,7 +399,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         }
     }
     auto& values=registry.keys.at(handle.path);
-    const auto value_name=set_key_value?name(arg(2)):key_name;
+    const auto value_name=legacy_set?std::u16string{}:set_key_value?name(arg(2)):key_name;
     if(symbol.starts_with("RegDeleteValue") || delete_key_value) {
         if(!(handle.access&2))return done(5);
         const auto found=values.find(value_name);if(found==values.end())return done(2);
@@ -385,9 +408,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     if(!shell_query && !get_value && !legacy_query && !key_value && arg(2))return done(87);
     if(symbol.starts_with("RegSetValueEx") || set_key_value) {
         if(!(handle.access&2))return done(5);
-        const auto type=static_cast<std::uint32_t>(arg(3)),size=static_cast<std::uint32_t>(arg(5));
-        if(size>output_limit)return done(8);if(size && !arg(4))return done(87);
-        std::vector<std::uint8_t> data(size);if(size)memory.read(GuestAddress{arg(4)},data);
+        const auto type=static_cast<std::uint32_t>(arg(legacy_set?2:3));
+        const auto size=legacy_set?static_cast<std::uint32_t>(legacy_data.size()):static_cast<std::uint32_t>(arg(5));
+        if(size>output_limit)return done(8);if(!legacy_set && size && !arg(4))return done(87);
+        std::vector<std::uint8_t> data=legacy_set?std::move(legacy_data):std::vector<std::uint8_t>(size);
+        if(!legacy_set && size)memory.read(GuestAddress{arg(4)},data);
         if(!wide && (type==1 || type==2 || type==7)) {
             const auto converted=utf8_to_utf16(std::string(data.begin(),data.end()));data.clear();
             for(const auto c:converted){data.push_back(static_cast<std::uint8_t>(c));data.push_back(static_cast<std::uint8_t>(c>>8));}
@@ -395,7 +420,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         const auto found=values.find(value_name);const auto previous=found==values.end()?0:found->second.bytes.size();
         if(registry.bytes-previous+data.size()>output_limit || (found==values.end() && registry.values>=4096))return done(8);
         registry.bytes=registry.bytes-previous+data.size();if(found==values.end())++registry.values;
-        const auto pointer=arg(set_key_value?2:1);const auto original=pointer?(wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16(read_ansi(memory,pointer))):std::u16string{};
+        const auto pointer=legacy_set?0:arg(set_key_value?2:1);const auto original=pointer?(wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16(read_ansi(memory,pointer))):std::u16string{};
         const auto display=found==values.end()?(original==value_name?std::u16string{}:original):found->second.display_name;
         values[value_name]={type,std::move(data),display};modified(handle.path);mutations.emplace_back(handle.path,4U);return done(0);
     }

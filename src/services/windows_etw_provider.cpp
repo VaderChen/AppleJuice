@@ -98,7 +98,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_etw_provider(GuestState& st
             if(name=="EventProviderEnabled")return finish(runtime_.traces.provider_enabled(arg(0),static_cast<std::uint8_t>(arg(1)),arg(2)));
             const auto descriptor=etw::guest::descriptor(memory,arg(1));return finish(runtime_.traces.provider_enabled(arg(0),descriptor.level,descriptor.keyword));
         }
-        if(name!="EventWrite" && name!="EventWriteTransfer" && name!="EventWriteString")throw HostCallFault("未知 ETW provider 入口");
+        if(name!="EventWrite" && name!="EventWriteTransfer" && name!="EventWriteEx" && name!="EventWriteString")throw HostCallFault("未知 ETW provider 入口");
+        // EventWriteEx 只多 Filter（排除的 session）與 Flags；旗標只有 NO_FAULTING(1)、INPRIVATE(2)。
+        if(name=="EventWriteEx" && (static_cast<std::uint32_t>(arg(3))&~3U))return finish(87);
         if(!arg(0))return finish(0);if(registration==runtime_.event_providers.end() || registration->second.classic)return finish(6);
         // 未啟用時不讀取 descriptor、資料指標、count 或 activity，保留原本有效契約。
         if(!runtime_.traces.aggregate(arg(0)).enabled)return finish(0);
@@ -110,8 +112,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_etw_provider(GuestState& st
             if(!arg(3))return finish(87);record.data=utf16_bytes(read_utf16(memory,GuestAddress{arg(3)}));
         }else{
             record.descriptor=etw::guest::descriptor(memory,arg(1));if(!runtime_.traces.provider_enabled(arg(0),record.descriptor.level,record.descriptor.keyword))return finish(0);
-            if(name=="EventWriteTransfer"){if(arg(2))memory.read(GuestAddress{arg(2)},record.activity);if(arg(3)){etw::Bytes related(16);memory.read(GuestAddress{arg(3)},related);record.extensions.push_back({1,0,std::move(related)});}}
-            const auto count=static_cast<std::uint32_t>(arg(name=="EventWriteTransfer"?4:2));const auto source=arg(name=="EventWriteTransfer"?5:3);
+            const bool transfer=name=="EventWriteTransfer" || name=="EventWriteEx";const unsigned activity=name=="EventWriteEx"?4:2;
+            if(transfer){if(arg(activity))memory.read(GuestAddress{arg(activity)},record.activity);if(arg(activity+1)){etw::Bytes related(16);memory.read(GuestAddress{arg(activity+1)},related);record.extensions.push_back({1,0,std::move(related)});}}
+            const auto count=static_cast<std::uint32_t>(arg(transfer?activity+2:2));const auto source=arg(transfer?activity+3:3);
             etw::guest::data(memory,record,count,source,registration->second.use_descriptor_type);
         }
         if(!registration->second.traits.empty() && std::none_of(record.extensions.begin(),record.extensions.end(),[](const auto& e){return e.type==12;}))record.extensions.push_back({12,0,registration->second.traits});

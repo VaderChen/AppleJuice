@@ -39,9 +39,7 @@
         const auto binding=[&](const std::shared_ptr<Identity>& context,const std::string& name,std::size_t index=0)->std::uint64_t{const auto found=context->bindings.find(name);return found!=context->bindings.end() && index<found->second.size()?found->second[index]:0;};
         const auto view_of=[&](std::uint64_t pointer){if(!pointer)return GraphicsView{};auto id=object(pointer).identity;require(bool(id->resource) || bool(id->graphics_view.resource));return id->graphics_view.resource?id->graphics_view:GraphicsView{id->resource,id->resource->desc.format,0,id->resource->desc.levels,0,id->resource->desc.layers};};
         const auto subresource=[&](const std::shared_ptr<Identity>& resource,std::uint32_t index){require(bool(resource->resource));const auto& d=resource->resource->desc;require(index<d.levels*d.layers);return GraphicsView{resource->resource,d.format,index%d.levels,1,index/d.levels,1};};
-        const auto clear_bindings=[&](const std::shared_ptr<Identity>& context){auto previous=std::move(context->bindings);context->bindings.clear();if(!context->weak_bindings)for(const auto& [name,values]:previous){(void)name;for(auto pointer:values)if(pointer)release(pointer);}context->viewports.clear();context->scissors.clear();context->strides={};context->offsets={};context->stream_offsets={};context->topology=0;context->index_format=42;context->index_offset=0;context->blend_factor={1,1,1,1};context->sample_mask=UINT32_MAX;context->stencil_reference=0;context->predicate_value=false;};
-        const auto stage_index=[](std::string_view name)->unsigned {if(name.starts_with("VS"))return 0;if(name.starts_with("PS"))return 1;if(name.starts_with("GS"))return 2;if(name.starts_with("HS"))return 3;if(name.starts_with("DS"))return 4;return 5;};
-        static const std::array<std::string,6> stage_names{"VS","PS","GS","HS","DS","CS"};
+        const auto clear_bindings=[&](const std::shared_ptr<Identity>& context){auto previous=std::move(context->bindings);context->bindings.clear();if(!context->weak_bindings)for(const auto& [name,values]:previous){(void)name;for(auto pointer:values)if(pointer)release(pointer);}context->viewports.clear();context->scissors.clear();context->strides={};context->offsets={};context->stream_offsets={};context->topology=0;context->index_format=42;context->index_offset=0;context->blend_factor={1,1,1,1};context->sample_mask=UINT32_MAX;context->stencil_reference=0;context->predicate_value=false;context->constant_first={};context->constant_count={};};
         const auto submit=[&](const std::shared_ptr<Identity>& context,RecordedGraphicsCommand command,bool predicable=true){
             if(predicable)if(const auto pointer=binding(context,"Predicate")){
                 const auto query=object(pointer).identity;const auto expected=context->predicate_value;
@@ -146,6 +144,8 @@
                     for(unsigned i=0;i<16;++i)if(auto ptr=binding(context,keys[3],i))target.samplers[i]=object(ptr).identity->sampler;
                     for(unsigned i=0;i<8;++i)if(auto ptr=binding(context,keys[4],i))target.unordered[i]=view_of(ptr);
                 }
+                // D3D11.1 常數緩衝範圍：位移以 16 位元組常數計，256 位元組對齊，符合 Metal 的緩衝位移要求。
+                for(unsigned i=0;i<14;++i)target.constant_offsets[i]=context->constant_first[stage][i]*16U;
                 if(shader_pointer){const auto shader_id=object(shader_pointer).identity;
                     if(shader_id->reflection && shader_id->reflection->linkage){
                         require(!context->context_type);const auto& linked=*shader_id->reflection->linkage;
@@ -357,7 +357,8 @@
                         for(auto pointer:values)if(pointer)release(pointer);reset_counters(context,counts);
                     }
                     else bridge.last_error="重疊的 CS UAV 綁定已拒絕";
-                }else bind(context,name,u32(1),values,limit);
+                }else{bind(context,name,u32(1),values,limit);
+                    if(what=="ConstantBuffers")for(unsigned i=0;i<u32(2);++i){context->constant_first[stage][u32(1)+i]=0;context->constant_count[stage][u32(1)+i]=0;}}
             }else get_views(context,name,u32(1),u32(2),arg(3));}
         }else if(symbol=="SetPredication" || symbol=="GetPredication"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);
@@ -476,7 +477,7 @@
                 // 空 box 是規範中的 no-op，不能讀取 pSrcData；非空區域保留其外部的既有像素。
                 if(box[0]<box[3] && box[1]<box[4] && box[2]<box[5]){
                     require(box[3]<=(d.dimension==1?d.width:std::max(1U,d.width>>view.level)) && box[4]<=std::max(1U,d.height>>view.level) && box[5]<=std::max(1U,d.depth>>view.level));
-                    require(!(d.dimension==1 && (d.bind&4) && arg(3)));
+                    require(!(d.dimension==1 && (d.bind&4) && arg(3)) || (partial_constant_update && !(box[0]&15U) && !(box[3]&15U)));
                     const auto w=box[3]-box[0],h=box[4]-box[1],z=box[5]-box[2];
                     const auto pitch=d.dimension==1?std::array{w,h}:graphics_format_pitch(d.format,w,h);const auto line=pitch[0];
                     const auto row=d.dimension==1?w:u32(5),image=d.dimension==1?w:u32(6);
@@ -512,35 +513,164 @@
             require(destination->resource->desc.dimension==3 && word(destination->desc,28)==0 && !destination->subresource_maps.contains(u32(2)) && !source->subresource_maps.contains(u32(4)) && !destination->offered && !source->offered);
             const auto dst=subresource(destination,u32(2)),src=subresource(source,u32(4));const auto format=u32(5);submit(context,{[dst,src,format](auto& native){native.graphics_resolve(dst,src,format);}});
         }else if(symbol=="CheckFormatSupport" && u32(1)!=103){
-            graphics_handled=true;auto device=typed(arg(0),Kind::Device);require(bool(arg(2)));const auto f=u32(1);std::uint32_t support=0;
-            if(device->native->graphics_samples_supported(f,1)){
-                support=0x1U|0x10U|0x20U|0x40U|0x80U|0x100U|0x200U|0x1000U|0x4000U;
-                if(f==67)support&=~0x4000U;
-                if(f>=5 && f<=8){support&=~0x4000U;if(f!=6)support&=~0x200U;if(f==5)support&=~0x101U;}
-                const bool combined=(f>=19 && f<=22) || (f>=44 && f<=47),depth=combined || f==40 || f==55;
-                if(depth){
-                    support=0x20U|0x1000U|0x20000U;
-                    if(f==20 || f==40 || f==45 || f==55)support|=0x10000U;
-                    else if(f==21 || f==46)support|=0x100U|0x200U|0x400U;
-                    else if(f==22 || f==47)support|=0x100U;
-                    if(f==19 || f==44)support|=0x100000U;
-                }
-                if(const auto family=graphics_format_bc_family(f)){support=0x20U|0x40U|0x80U|0x1000U;if(f!=family)support|=0x100U|0x200U;}
-                if(device->native->graphics_samples_supported(f,2)){
-                    if(!depth || f==20 || f==40 || f==45 || f==55)support|=0x200000U;
-                    if(!depth)support|=0x40000U;
-                    if(f==21 || f==22 || f==46 || f==47)support|=0x400000U;
-                }
-            }else if(device->native->graphics_vertex_format_supported(f))support=1;else result=not_supported;
-            if(device->native->graphics_vertex_format_supported(f))support|=2;
-            memory.store(GuestAddress{arg(2)},32,support);
-            if(std::getenv("X64ARM_TRACE_GRAPHICS_STATE"))std::fprintf(stderr,"[d3d11_caps] format=%u support=0x%x\n",f,support);
+            graphics_handled=true;auto device=typed(arg(0),Kind::Device);require(bool(arg(2)));const auto f=u32(1);const auto support=format_support(device,f);
+            if(!support)result=not_supported;
+            memory.store(GuestAddress{arg(2)},32,support.value_or(0));
+            if(std::getenv("X64ARM_TRACE_GRAPHICS_STATE"))std::fprintf(stderr,"[d3d11_caps] format=%u support=0x%x\n",f,support.value_or(0));
         }else if(symbol=="CheckMultisampleQualityLevels"){
             graphics_handled=true;auto device=typed(arg(0),Kind::Device);require(bool(arg(3)));const auto quality=device->native->graphics_samples_supported(u32(1),u32(2))?1U:0U;
             memory.store(GuestAddress{arg(3)},32,quality);if(!u32(2) || u32(2)>32)result=invalid;
             if(std::getenv("X64ARM_TRACE_GRAPHICS_STATE"))std::fprintf(stderr,"[d3d11_caps] format=%u samples=%u quality=%u\n",u32(1),u32(2),quality);
         }
-        else if(symbol=="CheckFeatureSupport"){graphics_handled=true;require(u32(3)<=256);std::vector<std::uint8_t> data(u32(3));if(u32(1)==0 && data.size()==8){put_word(data,0,1);put_word(data,4,1);}else if(u32(1)==4 && data.size()==4)put_word(data,0,1);else if(u32(1)==3 && data.size()==8){const auto format=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)},32));put_word(data,0,format);put_word(data,4,0);}else if(u32(1)!=5 && u32(1)!=6 && u32(1)!=7)result=invalid;if(!result)memory.write(GuestAddress{arg(2)},data);}
+        else if(symbol=="BlendGetDesc1"){
+            // D3D11_BLEND_DESC1：每個 RT 補 LogicOpEnable=FALSE、LogicOp=NOOP（不支援邏輯運算混合）。
+            graphics_handled=true;const auto& desc=typed(arg(0),Kind::Blend)->desc;require(desc.size()>=264);std::vector<std::uint8_t> out(328);put_word(out,0,word(desc,0));put_word(out,4,word(desc,4));
+            for(unsigned i=0;i<8;++i){const auto in=8+i*32,at=8+i*40;put_word(out,at,word(desc,in));for(unsigned j=0;j<6;++j)put_word(out,at+8+j*4,word(desc,in+4+j*4));put_word(out,at+32,4);out[at+36]=desc[in+28];}
+            memory.write(GuestAddress{arg(1)},out);
+        }else if(symbol=="RasterGetDesc1" || symbol=="RasterGetDesc2"){
+            // ForcedSampleCount 與 ConservativeRaster 建立時只接受 0。
+            graphics_handled=true;auto desc=typed(arg(0),Kind::Raster)->desc;desc.resize(symbol=="RasterGetDesc1"?44:48);memory.write(GuestAddress{arg(1)},desc);
+        }else if(symbol=="Texture3DGetDesc1"){
+            graphics_handled=true;auto desc=typed(arg(0),Kind::Texture3D)->desc;desc.resize(40);memory.write(GuestAddress{arg(1)},desc);
+        }else if(symbol=="ViewGetDesc1"){
+            // *_DESC1 只在 TEXTURE2D／TEXTURE2DARRAY 多 PlaneSlice（恆為 0），其餘維度原樣並補長度。
+            graphics_handled=true;const auto& value=object(arg(0));require(value.kind==Kind::ShaderResource || value.kind==Kind::RenderTarget || value.kind==Kind::Unordered);
+            const bool srv=value.kind==Kind::ShaderResource;auto desc=value.identity->desc;desc.resize(srv?24:20);std::vector<std::uint8_t> out(srv?28:24);
+            const auto dimension=word(desc,4);const unsigned keep=dimension==4?(srv?16U:12U):(srv?24U:20U);
+            std::copy(desc.begin(),desc.begin()+keep,out.begin());memory.write(GuestAddress{arg(1)},out);
+        }else if(symbol=="QueryGetDesc1"){
+            graphics_handled=true;auto id=typed(arg(0),Kind::Query);auto desc=id->desc;desc.resize(12);put_word(desc,8,id->query_context);memory.write(GuestAddress{arg(1)},desc);
+        }else if(symbol=="CheckMultisampleQualityLevels1"){
+            // TILED_RESOURCE 查詢：不支援 tiled resources，品質等級 0（一般查詢已轉接到 11.0）。
+            graphics_handled=true;(void)typed(arg(0),Kind::Device);memory.check(GuestAddress{arg(4)},4,Access::Write);memory.store(GuestAddress{arg(4)},32,0);
+        }else if(symbol=="GetResourceTiling"){
+            // 非 tiled 資源：磚數、packed mip 與磚形狀皆為 0，子資源磚資訊數量回 0。
+            graphics_handled=true;auto device=typed(arg(0),Kind::Device);const auto resource=object(arg(1)).identity;require(resource_kind(object(arg(1)).kind) && resource->device==device->root);
+            if(arg(2))memory.store(GuestAddress{arg(2)},32,0);
+            if(arg(3))memory.write(GuestAddress{arg(3)},std::vector<std::uint8_t>(12));
+            if(arg(4))memory.write(GuestAddress{arg(4)},std::vector<std::uint8_t>(12));
+            if(arg(5))memory.store(GuestAddress{arg(5)},32,0);
+        }else if(symbol=="RegisterDeviceRemovedEvent" || symbol=="UnregisterDeviceRemoved"){
+            // 共用 Metal 裝置在程序存活期間不會被移除，登記的事件不會觸發；仍驗證事件並配發 cookie。
+            graphics_handled=true;(void)typed(arg(0),Kind::Device);
+            if(symbol=="RegisterDeviceRemovedEvent"){
+                static std::uint32_t next_removed_cookie=1;const auto event=runtime_.wait_objects.find(arg(1));
+                if(!arg(2) || event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event)result=invalid;
+                else{memory.check(GuestAddress{arg(2)},4,Access::Write);memory.store(GuestAddress{arg(2)},32,next_removed_cookie++);}
+            }
+        }else if(symbol=="CreateFence" || symbol=="OpenSharedFence"){
+            // 不建立跨程序共享 fence（SHARED／SHARED_CROSS_ADAPTER 回 DXGI_ERROR_UNSUPPORTED），因此也沒有可開啟的共享 handle。
+            graphics_handled=true;auto device=typed(arg(0),Kind::Device);const bool creating=symbol=="CreateFence";const unsigned out=creating?4U:3U;
+            if(arg(out)){output(out);write_pointer(arg(out),0);}
+            const auto guid=read_guid(memory,arg(creating?3U:2U));
+            if(!creating || !arg(out))result=invalid;
+            else if(u32(2)&~8U)result=(u32(2)&6U) && !(u32(2)&~14U)?not_supported:invalid;
+            else if(guid!=IID_ID3D11Fence && guid!=IID_IUnknown && guid!=IID_ID3D11DeviceChild)result=no_interface;
+            else{auto id=create(Kind::Fence,device->root);id->fence_value=arg(1);write_pointer(arg(out),id->root);}
+        }else if(symbol=="FenceGetCompletedValue"){
+            graphics_handled=true;const auto value=typed(arg(0),Kind::Fence)->fence_value;result=value;if(x86_)state.reg(Gpr::Rdx)=value>>32;
+        }else if(symbol=="FenceSetEventOnCompletion"){
+            graphics_handled=true;auto fence=typed(arg(0),Kind::Fence);const auto value=arg(1),handle=arg(2);const auto event=runtime_.wait_objects.find(handle);
+            if(event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event)result=invalid;
+            else if(value<=fence->fence_value)event->second.set_signal(true);
+            else{require(fence->fence_events.size()<4096);fence->fence_events.emplace_back(value,handle);}
+        }else if(symbol=="FenceCreateSharedHandle"){
+            graphics_handled=true;(void)typed(arg(0),Kind::Fence);if(arg(4)){memory.check(GuestAddress{arg(4)},pointer_size,Access::Write);write_pointer(arg(4),0);}result=invalid;
+        }else if(symbol=="Signal" || symbol=="Wait"){
+            // 單一 Metal 佇列：Signal 等先前提交的命令完成後才更新 fence 並觸發已到達的事件；Wait 依佇列順序不需額外等待。
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto fence=typed(arg(1),Kind::Fence);require(!context->context_type && fence->device==context->device);
+            if(symbol=="Signal"){
+                context->native->graphics_flush(true);fence->fence_value=arg(2);
+                std::erase_if(fence->fence_events,[&](const auto& item){if(item.first>fence->fence_value)return false;
+                    if(const auto event=runtime_.wait_objects.find(item.second);event!=runtime_.wait_objects.end())event->second.set_signal(true);return true;});
+            }
+        }else if(symbol=="DiscardResource" || symbol=="DiscardView" || symbol=="DiscardView1"){
+            // 捨棄只允許內容變為未定義；保留原內容同樣符合語義（D3D11_OPTIONS 回報 DiscardAPIsSeenByDriver=FALSE）。
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const auto& value=object(arg(1));
+            require(symbol=="DiscardResource"?resource_kind(value.kind):graphics_view_kind(value.kind));require(value.identity->device==context->device);
+            if(symbol=="DiscardView1")require(!u32(3) || arg(2));
+        }else if(symbol=="ClearView"){
+            // RTV 以清除色、UAV 以浮點值轉格式。有矩形時與 D3D12 的矩形 UAV 清除相同：清暫存資源後逐矩形複製，其餘像素保持原值。
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const auto& value=object(arg(1));
+            require((value.kind==Kind::RenderTarget || value.kind==Kind::Unordered) && value.identity->device==context->device);
+            const bool render_target=value.kind==Kind::RenderTarget;const auto view=view_of(arg(1));std::array<float,4> color{};
+            {const auto bytes=read_bytes(memory,arg(2),16);std::memcpy(color.data(),bytes.data(),16);}
+            require(!u32(4) || arg(3));require(u32(4)<=4096);std::vector<std::array<std::int32_t,4>> rects(u32(4));
+            for(unsigned i=0;i<rects.size();++i){const auto bytes=read_bytes(memory,arg(3)+i*16,16);std::memcpy(rects[i].data(),bytes.data(),16);}
+            submit(context,{[view,color,rects,render_target](auto& native){
+                std::array<std::uint32_t,4> bits{};std::memcpy(bits.data(),color.data(),16);
+                const auto clear=[&](const GraphicsView& target){if(render_target)native.graphics_clear(target,color,0);else (void)native.graphics_clear_unordered(target,bits,true);};
+                if(rects.empty()){clear(view);return;}
+                const auto& desc=view.resource->desc;
+                if(desc.dimension==1){
+                    const auto element=std::max(1U,graphics_format_bytes(view.format?view.format:desc.format));const auto width=view.count/element;
+                    for(const auto& r:rects){const auto x=static_cast<std::uint32_t>(std::clamp<std::int64_t>(r[0],0,width)),right=static_cast<std::uint32_t>(std::clamp<std::int64_t>(r[2],0,width));
+                        if(x<right){auto region=view;region.first+=x*element;region.count=(right-x)*element;clear(region);}}
+                    return;
+                }
+                GraphicsView cleared=view;cleared.resource=native.graphics_resource(desc);clear(cleared);
+                const auto width=std::max(1U,desc.width>>view.level),height=std::max(1U,desc.height>>view.level);
+                for(const auto& r:rects){
+                    const auto x=static_cast<std::uint32_t>(std::clamp<std::int64_t>(r[0],0,width)),y=static_cast<std::uint32_t>(std::clamp<std::int64_t>(r[1],0,height));
+                    const auto right=static_cast<std::uint32_t>(std::clamp<std::int64_t>(r[2],0,width)),bottom=static_cast<std::uint32_t>(std::clamp<std::int64_t>(r[3],0,height));
+                    if(x<right && y<bottom)native.graphics_copy(view,cleared,{x,y,0},{x,y,0,right,bottom,1});
+                }
+            }});
+        }else if(symbol=="UpdateTileMappings" || symbol=="CopyTileMappings" || symbol=="ResizeTilePool"){
+            // 沒有 tiled resources 與 tile pool（D3D11_OPTIONS1 TiledResourcesTier=0），參數必然無效。
+            graphics_handled=true;(void)typed(arg(0),Kind::Context);result=invalid;
+        }else if(symbol=="CopyTiles" || symbol=="UpdateTiles" || symbol=="TiledResourceBarrier"){
+            // 非 tiled 資源的磚操作由 runtime 丟棄；屏障沒有 tiled 存取需要排序。
+            graphics_handled=true;(void)typed(arg(0),Kind::Context);
+        }else if(symbol=="IsAnnotationEnabled"){graphics_handled=true;(void)typed(arg(0),Kind::Context);result=0;}
+        else if(symbol=="SetMarkerInt" || symbol=="BeginEventInt" || symbol=="EndEvent"){graphics_handled=true;(void)typed(arg(0),Kind::Context);}
+        else if(symbol=="AnnotationBeginEvent" || symbol=="AnnotationEndEvent" || symbol=="AnnotationSetMarker" || symbol=="AnnotationGetStatus"){
+            // 沒有附加 PIX 等分析工具：BeginEvent／EndEvent 回 -1、GetStatus 回 FALSE，標記不記錄。
+            graphics_handled=true;(void)typed(arg(0),Kind::Annotation);result=symbol=="AnnotationBeginEvent" || symbol=="AnnotationEndEvent"?UINT32_MAX:0;
+        }else if(symbol=="Flush1"){
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);require(u32(1)<=4);
+            if(!context->context_type){
+                if(arg(2)){const auto event=runtime_.wait_objects.find(arg(2));require(event!=runtime_.wait_objects.end() && event->second.kind==WaitObject::Kind::Event);
+                    context->native->graphics_flush(true);event->second.set_signal(true);}
+                else context->native->graphics_flush(false);
+            }
+        }else if(symbol=="SetHardwareProtectionState"){graphics_handled=true;typed(arg(0),Kind::Context)->hardware_protection=u32(1)!=0;}
+        else if(symbol=="GetHardwareProtectionState"){
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);memory.check(GuestAddress{arg(1)},4,Access::Write);memory.store(GuestAddress{arg(1)},32,context->hardware_protection?1:0);
+        }else if(symbol=="OpenSharedResourceByName"){
+            // 不建立具名共享資源；與 Windows 名稱不存在時相同。
+            graphics_handled=true;(void)typed(arg(0),Kind::Device);if(arg(4)){output(4);write_pointer(arg(4),0);}result=0x80070002U;
+        }
+        else if(symbol=="CheckFeatureSupport"){
+            graphics_handled=true;auto device=typed(arg(0),Kind::Device);const auto feature=u32(1),size=u32(3);require(size<=256);std::vector<std::uint8_t> data(size);
+            const auto words=[&](std::initializer_list<std::uint32_t> values){if(size!=values.size()*4){result=invalid;return;}unsigned at=0;for(const auto value:values){put_word(data,at,value);at+=4;}};
+            switch(feature){
+            case 0:words({1,1});break; // THREADING：並行建立與 command list
+            case 1:words({0});break; // DOUBLES：Metal 著色器沒有雙精度
+            case 2:case 3:{
+                if(size!=8){result=invalid;break;}const auto format=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)},32));put_word(data,0,format);
+                if(feature==2){const auto support=format_support(device,format);put_word(data,4,support.value_or(0));if(!support)result=not_supported;}
+                else put_word(data,4,format_support2(device,format));
+                break;}
+            case 4:words({1});break; // D3D10_X_HARDWARE_OPTIONS：cs_4_x
+            // D3D11_OPTIONS：ClearView、常數緩衝部分更新與位移、動態常數緩衝／SRV 緩衝 NO_OVERWRITE；邏輯運算、捨棄與複製旗標不交給驅動。
+            case 5:words({0,0,0,0,1,0,1,1,1,1,0,0,0,0});break;
+            case 6:words({0});break; // ARCHITECTURE_INFO
+            case 7:words({1});break; // D3D9_OPTIONS：完整非 2 冪紋理
+            case 8:words({0,0});break; // 最小精度：一律以 32 位元執行
+            case 9:words({1});break; // D3D9_SHADOW_SUPPORT：深度比較取樣
+            case 10:words({0,0,0,0});break; // OPTIONS1：無 tiled resources、min/max 濾波、深度 ClearView、預設緩衝映射
+            case 11:words({1});break; // D3D9_SIMPLE_INSTANCING_SUPPORT
+            case 12:words({0});break; // MARKER_SUPPORT
+            case 13:words({1,1,1,1});break; // D3D9_OPTIONS1
+            case 14:words({0,0,0,0,0,0,0,0});break; // OPTIONS2：無 ROV、保守光柵化、tiled、預設紋理映射與標準 swizzle
+            case 15:case 17:case 18:case 19:words({0});break; // OPTIONS3、OPTIONS4、SHADER_CACHE、OPTIONS5
+            case 16:words({32,40});break; // GPU 虛擬位址：每資源 32 位元、每程序 40 位元
+            case 20:words({0,0});break; // DISPLAYABLE
+            default:result=invalid;break;
+            }
+            if(!result || result==not_supported)memory.write(GuestAddress{arg(2)},data);
+        }
         else if(symbol=="CheckCounterInfo"){
             // 不提供裝置相依計數器：LastDeviceDependentCounter=0、可同時啟用 0 個、可偵測平行單元 1。
             graphics_handled=true;(void)typed(arg(0),Kind::Device);if(arg(1)){std::vector<std::uint8_t> info(12);put_word(info,8,1);memory.write(GuestAddress{arg(1)},info);}
@@ -615,6 +745,10 @@
                 if(!query->query_ready){if(!(u32(4)&1U) || ++query->query_polls>=32U){query->query_polls=0;context->native->graphics_flush(false);}result=1;}
                 else{require(!arg(2) || u32(3)==query->query_size);if(arg(2))memory.write(GuestAddress{arg(2)},query->query_data);}}
         }
+        else if(symbol=="DXGIGetDebugInterface1"){
+            // 未安裝圖形工具（DXGI 除錯層）的 Windows 回 E_NOINTERFACE；Flags 保留須為 0。
+            graphics_handled=true;output(2);write_pointer(arg(2),0);result=u32(0)?invalid:no_interface;
+        }
         else if(symbol=="CreateDXGIFactory2"){
             graphics_handled=true;output(2);write_pointer(arg(2),0);const auto guid=read_guid(memory,arg(1));if(u32(0)&~1U)result=invalid;else if(!dxgi_factory_guid(guid) && guid!=IID_IUnknown)result=no_interface;else write_pointer(arg(2),create(Kind::Factory)->root);
         }else if(symbol=="GetAdapter"){
@@ -642,6 +776,37 @@
             graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);for(auto ptr:swap->bindings.at("Backbuffers"))require(object(ptr).identity->references==1);const auto remote=gui_.windows.contains(swap->window)?std::nullopt:shared_gui_window(swap->window);require(gui_.windows.contains(swap->window) || remote.has_value());const auto count=u32(1)?u32(1):word(swap->desc,40),width=u32(2)?u32(2):(remote?remote->width:gui_.windows.at(swap->window).width),height=u32(3)?u32(3):(remote?remote->height:gui_.windows.at(swap->window).height),format=u32(4)?u32(4):word(swap->desc,16);swap_buffers(swap,width,height,format,count,word(swap->desc,36),word(swap->desc,28));put_word(swap->desc,0,width);put_word(swap->desc,4,height);put_word(swap->desc,16,format);put_word(swap->desc,40,count);put_word(swap->desc,x86_?56:64,u32(5));
         }else if(symbol=="GetHwnd"){graphics_handled=true;write_pointer(arg(1),typed(arg(0),Kind::SwapChain)->window);}
         else if(symbol=="GetLastPresentCount"){graphics_handled=true;memory.store(GuestAddress{arg(1)},32,typed(arg(0),Kind::SwapChain)->frames);}
+        else if(symbol=="GetFrameStatistics"){
+            // 依目前顯示模式的更新率，把最後一次 Present 對齊到其後的第一個 vblank；尚未呈現時統計不連續。
+            graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);
+            if(!arg(1))result=invalid;
+            else if(!swap->frames)result=0x887a000bU;
+            else{
+                std::uint64_t numerator=60,denominator=1;
+                if(native_gui_)if(const auto mode=native_gui_->current_display_mode();mode && mode->refresh_numerator && mode->refresh_denominator){numerator=mode->refresh_numerator;denominator=mode->refresh_denominator;}
+                const auto period=static_cast<unsigned __int128>(denominator)*10000000U;
+                const auto refresh=static_cast<std::uint64_t>((static_cast<unsigned __int128>(swap->present_ticks)*numerator+period-1)/period);
+                const auto sync=static_cast<std::uint64_t>(static_cast<unsigned __int128>(refresh)*period/numerator);
+                std::vector<std::uint8_t> stats(32);put_word(stats,0,static_cast<std::uint32_t>(swap->frames));put_word(stats,4,static_cast<std::uint32_t>(refresh));put_word(stats,8,static_cast<std::uint32_t>(refresh));
+                for(unsigned i=0;i<8;++i)stats[16+i]=static_cast<std::uint8_t>(sync>>(8*i));
+                memory.write(GuestAddress{arg(1)},stats);
+            }
+        }else if(symbol=="GetCoreWindow"){
+            // HWND 交換鏈沒有 CoreWindow。
+            graphics_handled=true;(void)typed(arg(0),Kind::SwapChain);output(2);write_pointer(arg(2),0);result=0x887a0001U;
+        }else if(symbol=="IsTemporaryMonoSupported"){graphics_handled=true;(void)typed(arg(0),Kind::SwapChain);result=0;}
+        else if(symbol=="SetBackgroundColor" || symbol=="GetBackgroundColor"){
+            graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);
+            if(!arg(1))result=invalid;
+            else if(symbol=="SetBackgroundColor")memory.read(GuestAddress{arg(1)},swap->background_color);
+            else memory.write(GuestAddress{arg(1)},swap->background_color);
+        }else if(symbol=="SetRotation"){
+            // 呈現路徑不旋轉輸出；只接受 IDENTITY，其他方向依不支援的交換鏈回 DXGI_ERROR_INVALID_CALL。
+            graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);
+            if(!u32(1) || u32(1)>4)result=invalid;else if(u32(1)!=1)result=0x887a0001U;else swap->rotation=1;
+        }else if(symbol=="GetRotation"){
+            graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);if(!arg(1))result=invalid;else memory.store(GuestAddress{arg(1)},32,swap->rotation);
+        }
         else if(symbol=="SetGPUThreadPriority" || symbol=="GetGPUThreadPriority" || symbol=="SetMaximumFrameLatency" || symbol=="GetMaximumFrameLatency"){
             graphics_handled=true;auto device=typed(arg(0),Kind::DxgiDevice);if(symbol=="SetGPUThreadPriority"){require(static_cast<std::int32_t>(u32(1))>=-7 && static_cast<std::int32_t>(u32(1))<=7);device->priority=u32(1);}else if(symbol=="GetGPUThreadPriority")memory.store(GuestAddress{arg(1)},32,device->priority);else if(symbol=="SetMaximumFrameLatency"){require(u32(1)<=16);device->slice=u32(1)?u32(1):3;}else memory.store(GuestAddress{arg(1)},32,device->slice?device->slice:3);
         }

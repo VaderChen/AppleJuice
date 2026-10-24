@@ -276,6 +276,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
     const auto read=[&](std::uint64_t pointer){return pointer?(wide?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16(read_ansi(memory,pointer,32768))):std::u16string{};};
     if(!runtime_.network.external_io)throw HostCallFault("原生顯示裝置盤點不支援 deterministic compare");
     if(name=="CM_Register_Notification" || name=="CM_Unregister_Notification")return invoke_device_notification(state,memory,service);
+    if(name=="CM_MapCrToWin32Err"){
+        // CONFIGRET → Win32 錯誤（與 Windows 的對照表相同）；未列出的代碼回傳呼叫端指定的預設值。
+        switch(static_cast<std::uint32_t>(arg(0))){
+        case 0x00:return finish(0);                 // CR_SUCCESS
+        case 0x02:return finish(8);                 // CR_OUT_OF_MEMORY → ERROR_NOT_ENOUGH_MEMORY
+        case 0x03:return finish(1784);              // CR_INVALID_POINTER → ERROR_INVALID_USER_BUFFER
+        case 0x04:return finish(1004);              // CR_INVALID_FLAG → ERROR_INVALID_FLAGS
+        case 0x05:case 0x1e:case 0x1f:case 0x2f:return finish(13); // 無效 devnode／device ID／資料／機器名稱 → ERROR_INVALID_DATA
+        case 0x0d:case 0x25:case 0x37:return finish(1168); // 不存在的 devnode／值／裝置介面 → ERROR_NOT_FOUND
+        case 0x10:return finish(183);               // CR_ALREADY_SUCH_DEVNODE → ERROR_ALREADY_EXISTS
+        case 0x1a:return finish(122);               // CR_BUFFER_SMALL → ERROR_INSUFFICIENT_BUFFER
+        case 0x1c:return finish(6);                 // CR_NO_REGISTRY_HANDLE → ERROR_INVALID_HANDLE
+        case 0x1d:return finish(1009);              // CR_REGISTRY_ERROR → ERROR_REGISTRY_CORRUPT
+        case 0x2e:return finish(2);                 // CR_NO_SUCH_REGISTRY_KEY → ERROR_FILE_NOT_FOUND
+        case 0x30:case 0x31:case 0x32:return finish(1062); // 遠端／機器不可用／無 CM 服務 → ERROR_SERVICE_NOT_ACTIVE
+        case 0x33:return finish(5);                 // CR_ACCESS_DENIED
+        case 0x34:return finish(120);               // CR_CALL_NOT_IMPLEMENTED
+        case 0x35:return finish(87);                // CR_INVALID_PROPERTY → ERROR_INVALID_PARAMETER
+        default:return finish(static_cast<std::uint32_t>(arg(1)));
+        }
+    }
     try{
         if(name.starts_with("SetupGetInfDriverStoreLocation")){
             const auto failed=[&](std::uint32_t error){last_error_=error;return finish(0);};

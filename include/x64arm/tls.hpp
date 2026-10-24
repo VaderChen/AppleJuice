@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include "x64arm/sspi_digest.hpp"
 #include <cstdint>
 #include <map>
@@ -16,6 +17,8 @@ struct TlsState {
     std::map<std::uint64_t,std::shared_ptr<NativeTlsSession>> sessions;
     std::set<std::uint64_t> buffers;
     std::uint64_t next_handle{0xb0000};
+    // InitSecurityInterfaceA／W 傳回的 SecurityFunctionTable（程序內固定位址，0 表示尚未建立）。
+    std::array<std::uint64_t,2> function_tables{};
     TlsState() = default;
     TlsState(const TlsState& other);
     TlsState& operator=(const TlsState& other);

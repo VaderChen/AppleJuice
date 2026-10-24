@@ -54,6 +54,8 @@ struct GraphicsStage {
     std::shared_ptr<GraphicsShader> shader;
     // b14 保留給引擎的動態 linkage 資料；D3D11 公開綁定仍限 b0–b13。
     std::array<std::shared_ptr<GraphicsResource>,15> constants;
+    // D3D11.1 常數緩衝範圍的起點（位元組，256 對齊）；0 表示從緩衝起點綁定。
+    std::array<std::uint32_t,15> constant_offsets{};
     std::array<GraphicsView,128> resources;
     std::array<GraphicsView,8> unordered;
     std::array<std::shared_ptr<GraphicsSampler>,16> samplers;

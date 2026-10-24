@@ -7,10 +7,10 @@ namespace x64arm {
 namespace {
 // MSVC x86 使用絕對指標；x64 的 RTTI／throw metadata 使用 32-bit image RVA。
 // 結構依 Clang MicrosoftCXXABI 的編譯器輸出，不依物件名稱或呼叫位址判斷。
-enum ExceptionKind : unsigned { BadCast,BadTypeid,NonRtti,Exception,BadAlloc,BadFunction,LogicError,LengthError,OutOfRange,RuntimeError,RegexError,InvalidArgument,OverflowError,SystemError,IosFailure,BadException };
+enum ExceptionKind : unsigned { BadCast,BadTypeid,NonRtti,Exception,BadAlloc,BadFunction,LogicError,LengthError,OutOfRange,RuntimeError,RegexError,InvalidArgument,OverflowError,SystemError,IosFailure,BadException,FutureError,ImproperLock };
 struct ExceptionType {std::string_view name,message;unsigned parent;bool error_code;};
 constexpr unsigned no_parent=UINT32_MAX;
-constexpr std::array<ExceptionType,16> exception_types{{
+constexpr std::array<ExceptionType,static_cast<unsigned>(MsvcExceptionKind::Count)> exception_types{{
     {".?AVbad_cast@std@@","Bad dynamic_cast",Exception,false},
     {".?AVbad_typeid@std@@","Attempted typeid of null pointer",Exception,false},
     {".?AV__non_rtti_object@std@@","Object has no readable RTTI",BadTypeid,false},
@@ -27,7 +27,12 @@ constexpr std::array<ExceptionType,16> exception_types{{
     {".?AVsystem_error@std@@","system error",RuntimeError,true},
     {".?AVfailure@ios_base@std@@","ios_base failure",SystemError,true},
     {".?AVbad_exception@std@@","bad exception",Exception,false},
+    {".?AVfuture_error@std@@","future error",LogicError,true},
+    {".?AVimproper_lock@Concurrency@@","Already locked",Exception,false},
 }};
+// future_error 與 system_error 相同帶 error_code（值＋分類指標）；what 依 MSVC _Future_error_map。
+constexpr bool category_error(unsigned kind){return kind==SystemError || kind==IosFailure || kind==FutureError;}
+constexpr std::array<std::string_view,5> future_messages{"future error","broken promise","future already retrieved","promise already satisfied","no state"};
 // 公開 error_type 值與訊息語義；what 文字不依賴宿主 libc++ 的 enum 編碼。
 constexpr std::array<std::string_view,15> regex_messages{
     "regex_error(error_collate): invalid collating element", "regex_error(error_ctype): invalid character class",
@@ -127,7 +132,8 @@ void WindowsServices::initialize_msvc_exception_types(GuestMemory& memory){
         if(!data.image.base){
             // 每個程序共用型別目錄、繼承圖、throw metadata 與唯讀 helper 程式頁。
             // RTTI 與 STL 拋出入口沿用同一個執行緒例外物件及 unwind 生命週期。
-            constexpr unsigned code_page=16384,image_size=20480,metadata_start=0x1000,metadata_stride=0x300;
+            // 每個型別 metadata 佔 0x300；型別增加時程式頁跟著後移，避免與 metadata 重疊。
+            constexpr unsigned metadata_start=0x1000,metadata_stride=0x300,code_page=static_cast<unsigned>((metadata_start+exception_types.size()*metadata_stride+4095)/4096*4096),image_size=code_page+4096;
             const auto base=runtime_allocate(memory,{},image_size,4096);
             memory.write(GuestAddress{base},std::array<std::uint8_t,image_size>{});
             const auto put=[&](std::uint64_t at,std::uint64_t value,unsigned width=32){memory.store(GuestAddress{base+at},static_cast<std::uint8_t>(width),value);};
@@ -148,7 +154,7 @@ void WindowsServices::initialize_msvc_exception_types(GuestMemory& memory){
                 for(unsigned j=0;j<count;++j){
                     const auto type=chain[j],item=block+0x40+j*28;
                     relative(table+4+j*4,item);relative(item+4,0x100+type*0x80);put(item+12,UINT32_MAX);
-                    put(item+20,(type==SystemError || type==IosFailure?5U:exception_types[type].error_code?4U:3U)*unit);relative(item+24,code_page+96+type*32);
+                    put(item+20,(category_error(type)?5U:exception_types[type].error_code?4U:3U)*unit);relative(item+24,code_page+96+type*32);
                 }
                 const auto hierarchy=block+0x180,base_array=block+0x190;
                 put(hierarchy+8,count);relative(hierarchy+12,base_array);
@@ -179,8 +185,8 @@ void WindowsServices::throw_msvc_exception(GuestState& state,GuestMemory& memory
         initialize_msvc_exception_types(memory);auto& data=runtime_.cxx_exceptions;
         auto message=random_error?data.image.base+0x40:kind==BadFunction?0:data.message[kind];bool owned=false;
         if(custom_message){message=crt_duplicate_string(memory,custom_message);owned=message!=0;}
-        if(kind==RegexError){
-            const auto value=error_code<regex_messages.size()?regex_messages[error_code]:std::string_view("regex_error");
+        if(kind==RegexError || kind==FutureError){
+            const auto value=kind==FutureError?future_messages[error_code<future_messages.size()?error_code:0]:error_code<regex_messages.size()?regex_messages[error_code]:std::string_view("regex_error");
             message=allocate_heap(memory,value.size()+1);owned=message!=0;
             if(message){std::vector<std::uint8_t> bytes(value.begin(),value.end());bytes.push_back(0);memory.write(GuestAddress{message},bytes);}
         }
@@ -190,7 +196,7 @@ void WindowsServices::throw_msvc_exception(GuestState& state,GuestMemory& memory
         const auto object=exceptions_.stack.back().record+0x1800;memory.store(GuestAddress{exceptions_.stack.back().record+(x86_?24U:40U)},bits,object);
         memory.store(GuestAddress{object},bits,data.vtable[kind]);memory.store(GuestAddress{object+unit},bits,message);memory.store(GuestAddress{object+2*unit},bits,owned?1:0);
         if(exception_types[kind].error_code)memory.store(GuestAddress{object+3*unit},32,error_code);
-        if(kind==SystemError || kind==IosFailure)memory.store(GuestAddress{object+4*unit},bits,category);
+        if(category_error(kind))memory.store(GuestAddress{object+4*unit},bits,category);
         state=caller;
 }
 
@@ -209,7 +215,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_rtti(GuestState& state,Gues
             const auto kind=static_cast<std::size_t>(found-tables.begin());
             crt_exception_data(state,memory,source+unit,object+unit,false);
             if(exception_types[kind].error_code)memory.store(GuestAddress{object+3*unit},32,memory.load(GuestAddress{source+3*unit},32));
-            if(kind==SystemError || kind==IosFailure)memory.store(GuestAddress{object+4*unit},bits,memory.load(GuestAddress{source+4*unit},bits));
+            if(category_error(static_cast<unsigned>(kind)))memory.store(GuestAddress{object+4*unit},bits,memory.load(GuestAddress{source+4*unit},bits));
         }else {
             const auto flags=deleting?method(x86_?0U:1U):0;
             crt_exception_data(state,memory,object+unit,object+unit,true);

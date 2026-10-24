@@ -25,6 +25,7 @@ std::span<const WindowsServiceDescriptor> shell_service_descriptors() {
         {"internal-shell","IPropertyStore.GetCount",2},{"internal-shell","IPropertyStore.GetAt",3},{"internal-shell","IPropertyStore.GetValue",3},{"internal-shell","IPropertyStore.SetValue",3},{"internal-shell","IPropertyStore.Commit",1},
         {"shell32.dll","SHGetKnownFolderPath",4},{"shell32.dll","SHGetKnownFolderIDList",4},
         {"shell32.dll","SHGetFolderPathA",5},{"shell32.dll","SHGetFolderPathW",5},
+        {"shfolder.dll","SHGetFolderPathA",5},{"shfolder.dll","SHGetFolderPathW",5},
         {"shell32.dll","SHFileOperationA",1},{"shell32.dll","SHFileOperationW",1},
         {"shell32.dll","SHCloneSpecialIDList",3},{"shell32.dll","SHGetSpecialFolderLocation",3},{"shell32.dll","SHGetFileInfoA",5},{"shell32.dll","SHGetFileInfoW",5},
         {"shell32.dll","SHGetSpecialFolderPathA",4},{"shell32.dll","SHGetSpecialFolderPathW",4},

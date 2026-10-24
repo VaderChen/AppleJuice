@@ -62,6 +62,9 @@ std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
         {"msvcp140.dll","?system_category@std@@YAAEBVerror_category@1@XZ",0,0,0,0,true},{"msvcp140.dll","?system_category@std@@YAABVerror_category@1@XZ",0,0,0,0,true},
         {"msvcp140.dll","?iostream_category@std@@YAAEBVerror_category@1@XZ",0,0,0,0,true},{"msvcp140.dll","?iostream_category@std@@YAABVerror_category@1@XZ",0,0,0,0,true},
         {"msvcp140.dll","?_Winerror_map@std@@YAHH@Z",1,0,0,0,true},
+        {"msvcp140.dll","?_Throw_future_error@std@@YAXAEBVerror_code@1@@Z",1,0,0,0,true},{"msvcp140.dll","?_Throw_future_error@std@@YAXABVerror_code@1@@Z",1,0,0,0,true},
+        {"msvcp140.dll","?_Rethrow_future_exception@std@@YAXVexception_ptr@1@@Z",1,0,0,0,true},
+        {"msvcp140.dll","?_Winerror_message@std@@YAKKPEADK@Z",3,0,0,0,true},{"msvcp140.dll","?_Winerror_message@std@@YAKKPADK@Z",3,0,0,0,true},
         {"msvcp140.dll","?_Syserror_map@std@@YAPEBDH@Z",1,0,0,0,true},{"msvcp140.dll","?_Syserror_map@std@@YAPBDH@Z",1,0,0,0,true},
         {"crt","_CxxThrowException",2},{"crt","__uncaught_exception",0},{"msvcp140.dll","?uncaught_exception@std@@YA_NXZ",0},{"crt","__uncaught_exceptions",0},{"crt","__current_exception",0},{"crt","__current_exception_context",0},{"crt","__processing_throw",0},{"crt","__AdjustPointer",2},{"crt","__GetPlatformExceptionInfo",1},{"crt","_SetWinRTOutOfMemoryExceptionCallback",1},{"crt","__CxxFrameHandler",4},{"crt","__CxxFrameHandler3",4},{"vcruntime140_1.dll","__CxxFrameHandler4",4},
         {"crt","?terminate@@YAXXZ",0},{"crt","terminate",0},{"crt","__std_terminate",0},{"crt","_purecall",0},
@@ -170,7 +173,7 @@ std::uint64_t WindowsServices::msvc_exception_cells(GuestState&,GuestMemory& mem
 }
 std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.family=="msvcp100.dll" && service.symbol.find("_Lockit@std@@")!=service.symbol.npos)return invoke_nt_native(state,memory,service);
-    if(service.symbol.starts_with("?_XGetLastError@") || service.symbol.starts_with("?generic_category@") || service.symbol.starts_with("?system_category@") || service.symbol.starts_with("?iostream_category@") || service.symbol.starts_with("?_Winerror_map@") || service.symbol.starts_with("?_Syserror_map@"))return invoke_msvcp100(state,memory,service);
+    if(service.symbol.starts_with("?_XGetLastError@") || service.symbol.starts_with("?generic_category@") || service.symbol.starts_with("?system_category@") || service.symbol.starts_with("?iostream_category@") || service.symbol.starts_with("?_Winerror_map@") || service.symbol.starts_with("?_Winerror_message@") || service.symbol.starts_with("?_Syserror_map@") || service.symbol.starts_with("?_Throw_future_error@") || service.symbol.starts_with("?_Rethrow_future_exception@"))return invoke_msvcp100(state,memory,service);
     if(service.symbol.starts_with("??0exception@") || service.symbol.starts_with("??1exception@") || service.symbol.starts_with("??0bad_") || service.symbol.starts_with("??1bad_") || service.symbol.starts_with("?what@exception@") || service.symbol.starts_with("?_type_info_dtor_internal_method@") || service.family=="x64arm.msvc" || service.symbol.starts_with("__RT") || service.symbol.starts_with("?_X") || service.symbol=="?_Random_device@std@@YAIXZ")return invoke_rtti(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
 #include "msvcp_yarn_handlers.inc"
@@ -181,7 +184,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,Gues
         symbol.find("basic_istream@")!=symbol.npos || symbol.find("basic_ostream@")!=symbol.npos || symbol.find("basic_iostream@")!=symbol.npos ||
         symbol.find("codecvt")!=symbol.npos || symbol.find("ctype@")!=symbol.npos || symbol.find("_Locinfo@")!=symbol.npos ||
         symbol.find("num_put@")!=symbol.npos || symbol.find("numpunct@")!=symbol.npos || symbol.find("numpunct_byname@")!=symbol.npos ||
-        symbol.find("@locale@std@@")!=symbol.npos || symbol.starts_with("?__ExceptionPtr") || symbol.starts_with("?setw@") || symbol.starts_with("?setprecision@") || symbol.starts_with("?_Throw_C_error@"))))return invoke_msvcp100(state,memory,service);
+        symbol.find("@locale@std@@")!=symbol.npos || symbol.starts_with("?__ExceptionPtr") || symbol.starts_with("?setw@") || symbol.starts_with("?setprecision@") || symbol.starts_with("?_Throw_C_error@") ||
+        symbol.starts_with("?_Throw_Cpp_error@") || symbol.find("ios_base@std@@")!=symbol.npos || symbol.find("time_put@")!=symbol.npos)))return invoke_msvcp100(state,memory,service);
     if(symbol=="__processing_throw"){
         // vcruntime 每執行緒的 _ProcessingThrow；FH4 在派送 catch 期間增減。
         const auto cells=msvc_exception_cells(state,memory,true);arg.return_to(state,cells+(x86_?8:16));return std::nullopt;
@@ -232,10 +236,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,Gues
         // 現行 Microsoft DLL 保留的 void cdecl 入口只有 RET 0；保留暫存器、LastError 與客體資料。
         arg.return_to(state,state.reg(Gpr::Rax));return std::nullopt;
     }
-    if(symbol=="__uncaught_exception" || symbol=="?uncaught_exception@std@@YA_NXZ" || symbol=="__uncaught_exceptions"){
+    if(symbol=="__uncaught_exception" || symbol=="?uncaught_exception@std@@YA_NXZ" || symbol=="__uncaught_exceptions" || symbol=="?uncaught_exceptions@std@@YAHXZ"){
         // 使用既有執行緒／fiber 例外堆疊；catch 離開後的物件解構不再算未捕捉。
         const auto count=std::count_if(exceptions_.stack.begin(),exceptions_.stack.end(),[](const ExceptionDispatch& item){return item.code==cpp_code && !item.msvc.entered_catch;});
-        arg.return_to(state,symbol=="__uncaught_exceptions"?static_cast<std::uint64_t>(count):static_cast<std::uint64_t>(count!=0));return std::nullopt;
+        arg.return_to(state,symbol=="__uncaught_exceptions" || symbol=="?uncaught_exceptions@std@@YAHXZ"?static_cast<std::uint64_t>(count):static_cast<std::uint64_t>(count!=0));return std::nullopt;
     }
     if(symbol.starts_with("?_Fiopen@std@@"))return invoke_crt_io(state,memory,service);
     if(symbol=="_except_handler3" || symbol=="_except_handler4_common" || symbol=="_local_unwind2" || symbol=="_seh_longjmp_unwind")return invoke_eh4(state,memory,service);

@@ -58,7 +58,7 @@
                 else {publish_remote_frame(swap->window,*swap->native,composed);record_diagnostic("d3d11_present_remote");}
                 std::swap(swap->present_frame,swap->present_spare);
                 if(gpu_handoff)swap->native->graphics_handoff(*producer,shared_view);else swap->native->graphics_flush(true);
-                ++swap->frames;++bridge.graphics_frames;
+                ++swap->frames;++bridge.graphics_frames;swap->present_ticks=runtime_.clock_ticks;
                 // 診斷：X64ARM_TRACE_GRAPHICS_STATS=1 每 600 幀輸出一次裝置的 Metal 後端統計（GPU 忙碌、CPU 等待、encoder 數），
                 // 遊戲被強制結束時也有資料；統計字串由命令執行緒代理同步後讀取。
                 static const bool trace_stats=[] {const auto* value=std::getenv("X64ARM_TRACE_GRAPHICS_STATS");return value && std::string_view(value)=="1";}();

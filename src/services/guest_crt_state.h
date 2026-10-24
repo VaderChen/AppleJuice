@@ -14,4 +14,5 @@ typedef struct GuestCrtThreadState {
     unsigned long long upper_address;
     unsigned ctype_codepage;
     unsigned numeric_codepage;
+    unsigned long long mb_cur_max_address;
 } GuestCrtThreadState;

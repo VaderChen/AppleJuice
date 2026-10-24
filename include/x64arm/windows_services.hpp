@@ -75,6 +75,8 @@ struct MetafileState;
 struct OleStreamState;
 struct ComRpcState;
 struct StorageState;
+struct MsiState;
+struct EsentState;
 namespace compound {struct Node;struct Document;}
 struct SafeArrayState;
 struct GdiplusState;
@@ -374,6 +376,8 @@ private:
     std::uint32_t commit_transaction(KtmTransaction&);
     std::optional<std::uint32_t> invoke_transactions(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<PdhState> pdh_;
+    std::uint32_t collect_pdh_query(std::uint64_t,std::uint64_t* = nullptr);
+    std::optional<std::uint32_t> advance_pdh(GuestState&,GuestMemory&,std::uint64_t);
     std::optional<std::uint32_t> invoke_pdh(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     struct PrivilegeAcquisition {
         bool process{},in_place{};std::uint64_t token{},thread{},previous_thread_token{},keeper{};
@@ -825,6 +829,22 @@ private:
     std::shared_ptr<StorageState> storage_;
     StorageState& storage_bridge();
     bool same_storage(const WindowsServices&) const;
+    std::shared_ptr<MsiState> msi_;
+    std::shared_ptr<EsentState> esent_;
+    EsentState& esent_bridge();
+    bool same_esent(const WindowsServices&) const;
+    std::optional<std::uint32_t> invoke_esent(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_esent_cursor(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> resume_esent(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
+    void discard_esent(GuestState&,GuestMemory&,std::uint64_t);
+    MsiState& msi_bridge();
+    bool same_msi(const WindowsServices&) const;
+    void collect_msi(GuestMemory&);
+    std::optional<std::uint32_t> invoke_msi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> resume_msi(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
+    void discard_msi(GuestState&,GuestMemory&,std::uint64_t);
+    std::optional<std::uint32_t> begin_msi_registry(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> resume_msi_registry(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     std::optional<std::uint32_t> invoke_storage(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_storage_stream(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_storage_enumerator(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1106,7 +1126,7 @@ private:
     struct CompletionResult {std::uint32_t value{},error{};bool ready{},guest_return{};};
     CompletionResult poll_completion(GuestState&,GuestMemory&,std::uint64_t handle,bool extended,bool expired);
     void wake_threads(GuestMemory& memory);
-    enum class ThreadWakeScope { All, Condition, Slim, Critical, Objects };
+    enum class ThreadWakeScope { All, Condition, Slim, Critical, Objects, Address };
     bool resolve_thread_waits(GuestMemory&,ThreadWakeScope scope=ThreadWakeScope::All,std::uint64_t address=0);
     void schedule(GuestState& state, GuestMemory& memory);
     // 常駐平行時協調者在其他 worker 執行中切換 slot 0 的目前客體（只做 schedule 的保存／載入，不輪詢、不選人）。
@@ -1124,6 +1144,7 @@ private:
     const std::vector<std::uint8_t>& registry_security_descriptor(const std::u16string&);
     std::vector<std::uint8_t> registry_creation_descriptor(const std::vector<std::uint8_t>&,security::SecurityDescriptor);
     std::uint32_t registry_security_access(const std::u16string&,std::uint32_t);
+    std::u16string registry_current_user_path(bool cached=false);
     std::pair<std::u16string,std::uint32_t> registry_security_handle(std::uint64_t,std::uint32_t);
     std::optional<std::uint32_t> invoke_nt_registry(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_file_control(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1206,10 +1227,12 @@ private:
     std::uint64_t next_registry_notification_{1},registry_poll_time_{};
     void poll_registry_notifications(bool reload=true,std::u16string_view mutation={},std::uint32_t filter=0);
     struct RegisteredWait {
-        std::uint64_t target{},callback{},parameter{},worker{},deadline{},completion_event{},timer_owner{},pool_instance{},power_owner{},etw_operation{},device_owner{},perflib_operation{},bluetooth_delivery{};
+        std::uint64_t target{},callback{},parameter{},worker{},deadline{},completion_event{},timer_owner{},pool_instance{},power_owner{},etw_operation{},device_owner{},perflib_operation{},bluetooth_delivery{},pdh_query{};
+        // 共用 100 ns 間隔，避免 PDH 的 DWORD 秒數在轉成 DWORD 毫秒時溢位。
+        std::uint64_t interval_ticks{UINT64_MAX};
         std::vector<GuestCallback> callback_batch;
         std::vector<std::uint64_t> callback_storage;
-        std::uint32_t milliseconds{},flags{};bool armed{true},ready{},active{},closing{},timed_out{},work_item{},pool_cleanup{};
+        std::uint32_t flags{};bool armed{true},ready{},active{},closing{},timed_out{},work_item{},pool_cleanup{};
         bool operator==(const RegisteredWait&) const = default;
     };
     std::map<std::uint64_t,RegisteredWait> registered_waits_;
@@ -1240,6 +1263,8 @@ private:
     bool cleanup_threadpool_callback(GuestState&,GuestMemory&,std::uint64_t);
     std::optional<std::uint32_t> invoke_threadpool(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint64_t acquire_wait_worker(const GuestState&,GuestMemory&,std::uint64_t);
+    // 在執行緒池 worker 上執行一次性完成常式（例如 GetAddrInfoExW 的 lpCompletionRoutine）；失敗回 Win32 錯誤碼。
+    std::uint32_t queue_pool_callback(const GuestState&,GuestMemory&,GuestCallback);
     void poll_timer_queues(GuestMemory&);
     void collect_timer_queues();
     std::optional<std::uint32_t> invoke_timer_queue(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1275,6 +1300,7 @@ private:
     void begin_unwind(GuestState& state, GuestMemory& memory, std::size_t target, std::uint64_t ip, std::uint64_t result);
     std::optional<std::uint32_t> seh_filter_result(GuestState& state, GuestMemory& memory, std::uint64_t result);
     std::optional<std::uint32_t> invoke_exception(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> seh_finally_result(GuestState& state, GuestMemory& memory);
     std::shared_ptr<FileMappingState> mappings_;
     std::optional<std::uint32_t> invoke_mapping(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool close_mapping(std::uint64_t);
@@ -1454,7 +1480,7 @@ private:
     bool begin_gui_text_thunk(GuestState&,GuestMemory&,const GuiMessage&,bool,Continuation=Continuation::ReturnCallback,std::uint64_t=0,std::uint64_t=0,std::optional<bool> = {});
     std::optional<std::uint32_t> resume_gui_text_thunk(GuestState&,GuestMemory&,const CallbackFrame&,std::uint64_t);
     void discard_gui_text_thunk(GuestMemory&,const GuestState&,std::uint64_t);
-    std::uint64_t load_gui_icon(GuestMemory& memory,std::uint64_t instance,std::uint64_t name,bool wide,std::uint32_t width,std::uint32_t height,bool intrinsic=false,bool first=false,bool cursor=false,std::uint32_t flags=0);
+    std::uint64_t load_gui_icon(GuestMemory& memory,std::uint64_t instance,std::uint64_t name,bool wide,std::uint32_t width,std::uint32_t height,bool intrinsic=false,bool first=false,bool cursor=false,std::uint32_t flags=0,bool prefer_larger=false);
     std::uint64_t store_gui_icon(GuiIcon,std::uint32_t flags=0);
     std::uint64_t shell_system_icons(std::uint32_t size);
     std::optional<std::uint32_t> invoke_icon_api(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1547,7 +1573,8 @@ private:
     std::vector<std::uint8_t> security_trustee_name(std::string_view);
     std::uint32_t native_file_token_access(const security::SecurityDescriptor&,std::uint32_t);
     SynchronizationDescriptor synchronization_descriptor(const GuestMemory&,std::uint64_t,bool check_length=true);
-    std::vector<std::uint8_t> file_creation_descriptor(const GuestMemory&,std::uint64_t);
+    // check_length=false：CreateDirectory 與 Windows 相同只取 lpSecurityDescriptor／bInheritHandle，不驗證 nLength。
+    std::vector<std::uint8_t> file_creation_descriptor(const GuestMemory&,std::uint64_t,bool check_length=true);
     std::uint32_t process_security_location(std::uint64_t,std::uint32_t,std::vector<std::uint8_t>*&,int&,int&,bool&);
     std::uint32_t kernel_security_access(const std::vector<std::uint8_t>&,std::uint32_t,bool) const;
     std::uint32_t kernel_pseudo_access(bool) const;
@@ -1927,6 +1954,7 @@ private:
     bool console_input_ready(std::uint64_t,unsigned=0);
     bool console_text_ready(bool,int=0);
     std::uint32_t console_sync(unsigned,std::size_t=0,std::size_t=0);
+    std::uint32_t write_crt_console(std::u16string_view,bool);
     bool live_input_eof_{};
     bool standard_input_ready(std::uint64_t count, bool text, bool line, int timeout = 0);
     bool await_standard_input(GuestState& state, GuestMemory& memory, std::uint64_t count, bool text = false, bool line = false);
@@ -2044,6 +2072,13 @@ private:
     // 對 43-bit 指標的相容性；明確指定的 VirtualAlloc 位址仍可使用完整客體空間。
     std::uint64_t next_handle_{0x1000}, next_allocation_{0x2000000000ULL}; // x64 堆積高於 4 GiB 但位於 MMU 視窗內。
     std::array<bool, 3> standard_open_{true, true, true};
+    // 同程序 DuplicateHandle 對標準串流取得的額外參照；CloseHandle 先抵銷複本，最後一個才關閉串流。
+    std::array<std::uint32_t, 3> standard_duplicates_{};
+    // std::notify_all_at_thread_exit／promise::*_at_thread_exit 的登記：{執行緒, _Cnd_t, _Mtx_t, int* 結果}。
+    std::vector<std::array<std::uint64_t,4>> msvcp_thread_exit_notifications_;
+    // CPU Sets（ID 與 GetSystemCpuSetInformation 相同為 0x100＋CPU）：程序預設與各執行緒選取的集合。
+    // Windows 視為排程偏好；本引擎保存並回報，不改寫執行緒的硬親和性。
+    std::vector<std::uint32_t> process_cpu_sets_;std::map<std::uint64_t,std::vector<std::uint32_t>> thread_cpu_sets_;
     bool detached_console_{};
     std::uint64_t console_identity_{};
     std::uint32_t console_group_{};

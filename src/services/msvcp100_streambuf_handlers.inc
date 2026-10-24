@@ -9,7 +9,13 @@ if((service.family=="msvcp100.dll" || service.family=="msvcp140.dll") && symbol.
     const auto store_pointer=[&](std::uint64_t at,std::uint64_t value){memory.store(GuestAddress{at},bits,value);};
     const auto method=symbol.substr(1,symbol.find('@')-1);
     std::uint64_t result=0;
-    if(method=="_Init"){
+    if(method=="_Init" && (symbol.find("PEAPEA")!=symbol.npos || symbol.find("PAPA")!=symbol.npos)){
+        // 六參數 _Init：get／put 區改由外部變數（例如 FILE 欄位）保存起點、目前位置與數量。
+        for(unsigned side=0;side<2;++side){
+            store_pointer(object+layout.first_indirect(side),parameter(side*3));store_pointer(object+layout.next_indirect(side),parameter(side*3+1));
+            store_pointer(object+layout.count_indirect(side),parameter(side*3+2));
+        }
+    }else if(method=="_Init"){
         for(unsigned side=0;side<2;++side){
             store_pointer(object+layout.first_indirect(side),object+layout.first(side));
             store_pointer(object+layout.next_indirect(side),object+layout.next(side));

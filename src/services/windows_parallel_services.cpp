@@ -139,7 +139,8 @@ std::optional<unsigned> context_service_arguments(std::string_view symbol) noexc
        symbol=="FlsGetValue" || symbol=="FlsGetValue2" ||
        symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency" ||
        symbol=="EnterCriticalSection" || symbol=="TryEnterCriticalSection" || symbol=="LeaveCriticalSection" ||
-       symbol=="WakeConditionVariable" || symbol=="WakeAllConditionVariable" || srw_service(symbol))return 1;
+       symbol=="WakeConditionVariable" || symbol=="WakeAllConditionVariable" ||
+       symbol=="WakeByAddressSingle" || symbol=="WakeByAddressAll" || srw_service(symbol))return 1;
     return std::nullopt;
 }
 // 持有者在其他 worker 上執行時，短暫等待通常比進協調者排隊便宜（Windows SRW 亦先自旋）；
@@ -214,6 +215,7 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
         symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
         symbol=="InitOnceBeginInitialize" || symbol=="InitOnceExecuteOnce" ||
         symbol=="WakeConditionVariable" || symbol=="WakeAllConditionVariable" || symbol=="SwitchToThread" ||
+        symbol=="WakeByAddressSingle" || symbol=="WakeByAddressAll" ||
         symbol=="_control87" || symbol=="_controlfp" ||
         symbol=="GetLastError" || symbol=="SetLastError" || symbol=="GetCurrentThreadId" ||
         symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency" ||
@@ -441,6 +443,13 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         for(const auto& [id,other]:threads_.items){
             (void)id;
             if(other.status==ThreadStatus::Waiting && other.wait.kind==ThreadWaitKind::Condition &&
+               other.wait.handles[0]==first && !other.wait.signaled)return false;
+        }
+    }else if(symbol=="WakeByAddressSingle" || symbol=="WakeByAddressAll"){
+        // 與條件變數相同：等待集合在 epoch 內固定，沒有尚待喚醒的位址等待者時通知已完整完成。
+        for(const auto& [id,other]:threads_.items){
+            (void)id;
+            if(other.status==ThreadStatus::Waiting && other.wait.kind==ThreadWaitKind::Address &&
                other.wait.handles[0]==first && !other.wait.signaled)return false;
         }
     }else if(symbol=="SwitchToThread"){

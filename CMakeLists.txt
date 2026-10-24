@@ -148,6 +148,7 @@ target_sources(x64arm_windows PRIVATE src/services/windows_calendar.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_calendar_grid.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_tooltip.cpp)
 target_sources(x64arm_windows PRIVATE src/services/registry_view.cpp)
+target_sources(x64arm_windows PRIVATE src/services/host_complex_math.c)
 target_sources(x64arm_windows PRIVATE src/services/windows_compatibility.cpp src/services/windows_sort.cpp src/services/windows_math.cpp src/services/windows_crt_strings.cpp src/services/windows_path.cpp src/services/windows_time.cpp src/services/windows_mmio.cpp src/services/windows_winmm_midi.cpp src/services/windows_midi_input.cpp src/services/windows_wave_output.cpp src/services/windows_acm.cpp src/services/windows_crypto.cpp src/services/windows_data_protection.cpp src/services/data_protection_storage.cpp src/services/windows_memory.cpp src/services/windows_nt_process.cpp src/services/windows_nt_native.cpp src/services/windows_network.cpp src/services/windows_http.cpp src/services/windows_autoproxy.cpp src/services/windows_eventlog.cpp src/services/windows_msxml.cpp src/services/windows_environment.cpp src/services/windows_power.cpp src/services/windows_power_notifications.cpp src/services/windows_threads.cpp src/services/windows_fibers.cpp src/services/windows_files.cpp src/services/windows_file_control.cpp
     src/services/windows_file_transfer.cpp src/services/windows_errors.cpp src/services/windows_network_config.cpp)
 target_sources(x64arm_windows PRIVATE src/services/file_reparse.cpp src/services/readonly_reparse.cpp src/services/windows_reparse.cpp)
@@ -190,6 +191,16 @@ add_library(x64arm_compound_file STATIC src/services/compound_file.cpp src/servi
 target_include_directories(x64arm_compound_file PUBLIC include)
 target_link_libraries(x64arm_compound_file PRIVATE x64arm_options ICU::uc)
 target_link_libraries(x64arm_windows PRIVATE x64arm_compound_file)
+add_library(x64arm_msi_database STATIC src/services/msi_database.cpp src/services/msi_query.cpp)
+target_include_directories(x64arm_msi_database PUBLIC include)
+target_link_libraries(x64arm_msi_database PRIVATE x64arm_options x64arm_compound_file ICU::uc)
+target_link_libraries(x64arm_windows PRIVATE x64arm_msi_database)
+target_sources(x64arm_windows PRIVATE src/services/windows_msi.cpp src/services/windows_msi_io.cpp src/services/windows_msi_registry.cpp)
+add_library(x64arm_esent_database STATIC src/services/esent_database.cpp)
+target_include_directories(x64arm_esent_database PUBLIC include)
+target_link_libraries(x64arm_esent_database PRIVATE x64arm_options)
+target_link_libraries(x64arm_windows PRIVATE x64arm_esent_database)
+target_sources(x64arm_windows PRIVATE src/services/windows_esent.cpp src/services/windows_esent_io.cpp src/services/windows_esent_cursor.cpp)
 find_package(LibXml2 REQUIRED)
 target_link_libraries(x64arm_windows PRIVATE LibXml2::LibXml2)
 target_sources(x64arm_windows PRIVATE src/services/sspi_digest.cpp src/services/windows_digest.cpp)
@@ -340,13 +351,17 @@ x64arm_sign(x64arm)
 if(X64ARM_CROSS_ARCH_PROFILE AND X64ARM_NATIVE_JIT)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   target_compile_definitions(x64arm PRIVATE X64ARM_CLI_BUNDLE_PATH="x64arm.app/Contents/MacOS/x64arm")
-  add_custom_command(TARGET x64arm POST_BUILD
-    COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/bundle_cross_architecture.py"
-      --binary "$<TARGET_FILE:x64arm>" --output "${CMAKE_CURRENT_BINARY_DIR}/x64arm.app"
-      --profile "${X64ARM_CROSS_ARCH_PROFILE}" --identity "${X64ARM_CODESIGN_IDENTITY}"
-      --identifier "${X64ARM_CODESIGN_IDENTIFIER_PREFIX}.x64arm"
-    VERBATIM COMMENT "建立已授權 TSO／4 KiB 的引擎 bundle")
-  set_property(TARGET x64arm APPEND PROPERTY LINK_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/bundle_cross_architecture.py" "${X64ARM_CROSS_ARCH_PROFILE}")
+  # 引擎與需要原生 MMU 的測試沿用同一封裝及既有授權，不把未授權的 16 KiB 程序當成原生驗收。
+  function(x64arm_cross_arch_bundle target)
+    add_custom_command(TARGET ${target} POST_BUILD
+      COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/bundle_cross_architecture.py"
+        --binary "$<TARGET_FILE:${target}>" --output "${CMAKE_CURRENT_BINARY_DIR}/${target}.app"
+        --profile "${X64ARM_CROSS_ARCH_PROFILE}" --identity "${X64ARM_CODESIGN_IDENTITY}"
+        --identifier "${X64ARM_CODESIGN_IDENTIFIER_PREFIX}.x64arm"
+      VERBATIM COMMENT "建立 ${target} 已授權 TSO／4 KiB 的 bundle")
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/bundle_cross_architecture.py" "${X64ARM_CROSS_ARCH_PROFILE}")
+  endfunction()
+  x64arm_cross_arch_bundle(x64arm)
 endif()
 
 target_sources(x64arm_windows PRIVATE src/services/com_marshal.cpp src/services/windows_com_marshal.cpp src/services/windows_com_marshal_public.cpp)

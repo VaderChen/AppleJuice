@@ -2,6 +2,7 @@
 #include "x64arm/memory.hpp"
 #include <array>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -71,6 +72,13 @@ bool same_name(std::string_view, std::string_view);
 const KnownAccount* find_account(std::string_view);
 const KnownAccount* find_account(std::span<const std::uint8_t>);
 Bytes account_sid(const KnownAccount&);
+struct AccountIdentity {
+    Bytes sid;
+    std::string_view name, domain;
+    std::uint32_t type;
+};
+std::optional<AccountIdentity> resolve_account(std::string_view, std::span<const std::uint8_t> primary_sid);
+std::optional<AccountIdentity> resolve_account(std::span<const std::uint8_t>, std::span<const std::uint8_t> primary_sid);
 Bytes unix_sid(bool group, std::uint32_t id);
 }
 }

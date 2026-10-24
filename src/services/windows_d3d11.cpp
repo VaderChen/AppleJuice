@@ -47,7 +47,7 @@ namespace {
 using namespace d3d11_guid;
 constexpr std::uint32_t invalid=0x80070057U, no_interface=0x80004002U, not_supported=0x887a0004U,
     not_found=0x887a0002U, out_of_memory=0x8007000eU, failure=0x80004005U;
-enum class Kind { Mesh10, MeshBuffer10, Sprite10, Font10, Effect10, EffectType10, EffectVariable10, EffectScalar10, EffectVector10, EffectMatrix10, EffectString10, EffectResource10, EffectRenderTarget10, EffectDepthView10, EffectBuffer10, EffectShader10, EffectBlend10, EffectDepth10, EffectRaster10, EffectSampler10, EffectTechnique10, EffectPass10, StateBlock10, ClassLinkage, ClassInstance, Reflection, ReflectionBuffer, ReflectionVariable, ReflectionType, Device, Context, VideoDevice, VideoContext, Multithread, Texture, Decoder, View, Factory, Adapter, BufferObject, Texture1D, Texture3D, ShaderResource, Unordered, RenderTarget, DepthView, VertexShader, PixelShader, ComputeShader, GeometryShader, HullShader, DomainShader, Layout, Blend, DepthState, Raster, Sampler, Query, Predicate, CommandList, DxgiDevice, SwapChain, Output, Blob, DxgiResource };
+enum class Kind { Mesh10, MeshBuffer10, Sprite10, Font10, Effect10, EffectType10, EffectVariable10, EffectScalar10, EffectVector10, EffectMatrix10, EffectString10, EffectResource10, EffectRenderTarget10, EffectDepthView10, EffectBuffer10, EffectShader10, EffectBlend10, EffectDepth10, EffectRaster10, EffectSampler10, EffectTechnique10, EffectPass10, StateBlock10, ClassLinkage, ClassInstance, Reflection, ReflectionBuffer, ReflectionVariable, ReflectionType, Device, Context, VideoDevice, VideoContext, Multithread, Texture, Decoder, View, Factory, Adapter, BufferObject, Texture1D, Texture3D, ShaderResource, Unordered, RenderTarget, DepthView, VertexShader, PixelShader, ComputeShader, GeometryShader, HullShader, DomainShader, Layout, Blend, DepthState, Raster, Sampler, Query, Predicate, CommandList, DxgiDevice, SwapChain, Output, Blob, DxgiResource, Fence, Annotation };
 struct Buffer { std::uint64_t address{}; std::uint32_t capacity{}; bool acquired{}; std::vector<std::uint8_t> submitted; };
 struct ReferenceSurface {
     std::array<std::int32_t,2> poc;
@@ -149,6 +149,8 @@ struct Identity {
     std::shared_ptr<GraphicsResource> resource;
     // 交換鏈的完整前幀與下一幀；Present1 局部更新不能讀取未更新的 backbuffer 區域。
     std::shared_ptr<GraphicsResource> present_frame,present_spare;
+    // 最後一次 Present 的 QPC 時間（10 MHz）、IDXGISwapChain1 背景色（DXGI_RGBA）與旋轉。
+    std::uint64_t present_ticks{};std::array<std::uint8_t,16> background_color{};std::uint32_t rotation{1};
     std::shared_ptr<GraphicsShader> shader;
     std::shared_ptr<GraphicsSampler> sampler;
     GraphicsView graphics_view;
@@ -194,6 +196,11 @@ struct Identity {
     std::vector<std::uint8_t> target_mode;
     std::chrono::steady_clock::time_point present_trace{};
     float min_lod{};
+    // D3D11.1 *SetConstantBuffers1：各 stage 14 槽的起始常數與常數數（單位 16 位元組），數量 0 表示整個緩衝。
+    std::array<std::array<std::uint32_t,14>,6> constant_first{},constant_count{};
+    // ID3D11Query1 的 ContextType、ID3D11DeviceContext3 的硬體保護狀態、ID3D11Fence 已完成值與待觸發事件（值, 事件）。
+    std::uint32_t query_context{};bool hardware_protection{};
+    std::uint64_t fence_value{};std::vector<std::pair<std::uint64_t,std::uint64_t>> fence_events;
 
     std::uint64_t root{}, device{}, texture{}, current_view{}, mapped{}, lock_address{};
     std::uint32_t references{1}, slice{}, creation_flags{}, feature_level{0xb000}, exception_mode{};
@@ -243,7 +250,7 @@ bool valid_decoder_desc(std::span<const std::uint8_t> value) {
 bool resource_kind(Kind k){return k==Kind::Texture || k==Kind::BufferObject || k==Kind::Texture1D || k==Kind::Texture3D;}
 bool graphics_view_kind(Kind k){return k==Kind::ShaderResource || k==Kind::Unordered || k==Kind::RenderTarget || k==Kind::DepthView;}
 bool child(Kind k) {
-    switch(k){case Kind::ClassLinkage:case Kind::ClassInstance:case Kind::Context:case Kind::VideoContext:case Kind::Texture:case Kind::Texture1D:case Kind::Texture3D:case Kind::BufferObject:case Kind::Decoder:case Kind::View:case Kind::ShaderResource:case Kind::Unordered:case Kind::RenderTarget:case Kind::DepthView:case Kind::VertexShader:case Kind::PixelShader:case Kind::ComputeShader:case Kind::GeometryShader:case Kind::HullShader:case Kind::DomainShader:case Kind::Layout:case Kind::Blend:case Kind::DepthState:case Kind::Raster:case Kind::Sampler:case Kind::Query:case Kind::Predicate:case Kind::CommandList:return true;default:return false;}
+    switch(k){case Kind::ClassLinkage:case Kind::ClassInstance:case Kind::Context:case Kind::VideoContext:case Kind::Texture:case Kind::Texture1D:case Kind::Texture3D:case Kind::BufferObject:case Kind::Decoder:case Kind::View:case Kind::ShaderResource:case Kind::Unordered:case Kind::RenderTarget:case Kind::DepthView:case Kind::VertexShader:case Kind::PixelShader:case Kind::ComputeShader:case Kind::GeometryShader:case Kind::HullShader:case Kind::DomainShader:case Kind::Layout:case Kind::Blend:case Kind::DepthState:case Kind::Raster:case Kind::Sampler:case Kind::Query:case Kind::Predicate:case Kind::CommandList:case Kind::Fence:return true;default:return false;}
 }
 }
 
@@ -376,7 +383,7 @@ std::span<const WindowsServiceDescriptor> d3d11_service_descriptors() {
 #include "d3d10_effect_descriptors.inc"
 #include "d3d10_sprite_descriptors.inc"
 #include "d3d10_mesh_descriptors.inc"
-        {"d3d11.dll","D3D11CreateDeviceAndSwapChain",12},{"dxgi.dll","CreateDXGIFactory2",3},
+        {"d3d11.dll","D3D11CreateDeviceAndSwapChain",12},{"dxgi.dll","CreateDXGIFactory2",3},{"dxgi.dll","DXGIGetDebugInterface1",3},
         {"d3dx11_42.dll","D3DX11LoadTextureFromTexture",4},{"d3dx11_43.dll","D3DX11LoadTextureFromTexture",4},
         {"d3dx11_42.dll","D3DX11SaveTextureToFileA",4},{"d3dx11_42.dll","D3DX11SaveTextureToFileW",4},{"d3dx11_42.dll","D3DX11SaveTextureToMemory",5},
         {"d3dx11_43.dll","D3DX11SaveTextureToFileA",4},{"d3dx11_43.dll","D3DX11SaveTextureToFileW",4},{"d3dx11_43.dll","D3DX11SaveTextureToMemory",5},
@@ -628,7 +635,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
 #include "d3d11_reflection_vtables.inc"
         case Kind::VideoDevice:count=20;methods.insert({{3,"CreateVideoDecoder"},{7,"CreateVideoDecoderOutputView"},{11,"GetVideoDecoderProfileCount"},{12,"GetVideoDecoderProfile"},{13,"CheckVideoDecoderFormat"},{14,"GetVideoDecoderConfigCount"},{15,"GetVideoDecoderConfig"}});break;
         case Kind::VideoContext:count=65;methods.insert({{7,"GetDecoderBuffer"},{8,"ReleaseDecoderBuffer"},{9,"DecoderBeginFrame"},{10,"DecoderEndFrame"},{11,"SubmitDecoderBuffers"}});break;
-        case Kind::Texture:count=11;methods.insert({{7,"ResourceGetType"},{10,"TextureGetDesc"}});break;
+        case Kind::Texture:count=12;methods.insert({{7,"ResourceGetType"},{10,"TextureGetDesc"},{11,"Texture2DGetDesc1"}});break;
+        case Kind::Fence:count=10;methods.insert({{7,"FenceCreateSharedHandle"},{8,"FenceGetCompletedValue"},{9,"FenceSetEventOnCompletion"}});break;
+        case Kind::Annotation:count=7;methods.insert({{3,"AnnotationBeginEvent"},{4,"AnnotationEndEvent"},{5,"AnnotationSetMarker"},{6,"AnnotationGetStatus"}});break;
         case Kind::Decoder:count=9;methods[7]="GetCreationParameters";break;
         case Kind::View:count=9;methods.insert({{7,"ViewGetResource"},{8,"ViewGetDesc"}});break;
         case Kind::Multithread:count=7;methods.insert({{3,"Enter"},{4,"Leave"},{5,"SetMultithreadProtected"},{6,"GetMultithreadProtected"}});break;
@@ -691,7 +700,60 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
                 }
             }
         }
+        // stage 順序與 GraphicsDraw::stages 相同；轉接器與共用處理器一起使用。
+        const auto stage_index=[](std::string_view name)->unsigned {if(name.starts_with("VS"))return 0;if(name.starts_with("PS"))return 1;if(name.starts_with("GS"))return 2;if(name.starts_with("HS"))return 3;if(name.starts_with("DS"))return 4;return 5;};
+        static const std::array<std::string,6> stage_names{"VS","PS","GS","HS","DS","CS"};
+        // D3D11_FORMAT_SUPPORT／FORMAT_SUPPORT2 依共用後端（Metal）的實際能力；CheckFormatSupport 與 CheckFeatureSupport 共用。
+        const auto format_support=[&](const std::shared_ptr<Identity>& device,std::uint32_t f)->std::optional<std::uint32_t> {
+            std::uint32_t support=0;
+            if(device->native->graphics_samples_supported(f,1)){
+                support=0x1U|0x10U|0x20U|0x40U|0x80U|0x100U|0x200U|0x1000U|0x4000U;
+                if(f==67)support&=~0x4000U;
+                if(f>=5 && f<=8){support&=~0x4000U;if(f!=6)support&=~0x200U;if(f==5)support&=~0x101U;}
+                const bool combined=(f>=19 && f<=22) || (f>=44 && f<=47),depth=combined || f==40 || f==55;
+                if(depth){
+                    support=0x20U|0x1000U|0x20000U;
+                    if(f==20 || f==40 || f==45 || f==55)support|=0x10000U;
+                    else if(f==21 || f==46)support|=0x100U|0x200U|0x400U;
+                    else if(f==22 || f==47)support|=0x100U;
+                    if(f==19 || f==44)support|=0x100000U;
+                }
+                const bool bc=graphics_format_bc_family(f)!=0;
+                if(const auto family=graphics_format_bc_family(f)){support=0x20U|0x40U|0x80U|0x1000U;if(f!=family)support|=0x100U|0x200U;}
+                if(device->native->graphics_samples_supported(f,2)){
+                    if(!depth || f==20 || f==40 || f==45 || f==55)support|=0x200000U;
+                    if(!depth)support|=0x40000U;
+                    if(f==21 || f==22 || f==46 || f==47)support|=0x400000U;
+                }
+                if(!depth && !bc){
+                    const bool integer=f==3 || f==4 || f==12 || f==14 || f==17 || f==18 || f==25 || f==30 || f==32 || f==36 || f==38 ||
+                        f==42 || f==43 || f==50 || f==52 || f==57 || f==59 || f==62 || f==64;
+                    const bool srgb=f==29 || f==72 || f==74 || f==76 || f==91 || f==93 || f==99;
+                    support|=0x20000U; // CPU_LOCKABLE：staging 資源可映射。
+                    if(support&0x200U)support|=0x800000U; // SHADER_GATHER
+                    if((support&0x4000U) && !integer){
+                        support|=0x8000U; // BLENDABLE
+                        if(f!=2 && f!=16 && f!=41)support|=0x2000U; // MIP_AUTOGEN（32 位元浮點不保證可濾波）
+                    }
+                    // TYPED_UNORDERED_ACCESS_VIEW：Metal 可由著色器寫入的色彩格式；sRGB、共用指數、打包 16 位元、A8 與 RGB32 不可。
+                    if(!srgb && f!=65 && f!=67 && f!=68 && f!=69 && f!=85 && f!=86 && f!=115 && !(f>=5 && f<=8))support|=0x2000000U;
+                    if(f==10 || f==24 || f==28 || f==29 || f==87 || f==91)support|=0x80000U; // DISPLAY（scanout 格式）
+                }
+                if(support&0x400U)support|=0x4000000U; // SHADER_GATHER_COMPARISON
+            }else if(device->native->graphics_vertex_format_supported(f))support=1;else return std::nullopt;
+            if(device->native->graphics_vertex_format_supported(f))support|=2;
+            if(f==42 || f==57)support|=4; // IA_INDEX_BUFFER：R32_UINT／R16_UINT
+            return support;
+        };
+        const auto format_support2=[&](const std::shared_ptr<Identity>& device,std::uint32_t f)->std::uint32_t {
+            const auto support=format_support(device,f);if(!support)return 0;std::uint32_t value=0;
+            if(*support&0x2000000U)value|=0x80U; // UAV_TYPED_STORE
+            if(f==41 || f==42 || f==43)value|=0x40U; // UAV_TYPED_LOAD：FL11 保證的 R32 格式
+            if(f==42 || f==43)value|=0x3fU; // R32_UINT／SINT 的原子加、位元、比較交換、交換與極值
+            return value;
+        };
         #include "d3d10_adapter.inc"
+        #include "d3d11_1_adapter.inc"
         bool graphics_handled=false;
 #include "d3d11_graphics_handlers.inc"
 #include "d3d10_handlers.inc"
@@ -769,14 +831,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
                 if(graphics_view_kind(id->kind) && guid==d3d10_guid::IID_ID3D10View)supported=true;
                 if(id->kind==Kind::Device){if(guid==IID_IDXGIDevice || guid==IID_IDXGIDevice1 || guid==IID_IDXGIDevice2 || guid==IID_IDXGIObject){target=Kind::DxgiDevice;supported=true;}if(guid==IID_ID3D10Multithread){target=Kind::Multithread;supported=true;}}
             } else if(id->kind==Kind::Device){
-                if(guid==IID_ID3D11Device){target=Kind::Device;supported=true;}
+                // ID3D11Device1～5 的 vtable 是同一份延伸表。
+                if(guid==IID_ID3D11Device || guid==IID_ID3D11Device1 || guid==IID_ID3D11Device2 || guid==IID_ID3D11Device3 ||
+                   guid==IID_ID3D11Device4 || guid==IID_ID3D11Device5){target=Kind::Device;supported=true;}
                 if(guid==IID_IDXGIDevice || guid==IID_IDXGIDevice1 || guid==IID_IDXGIDevice2 || guid==IID_IDXGIObject){target=Kind::DxgiDevice;supported=true;}
                 if(guid==IID_ID3D11VideoDevice){target=Kind::VideoDevice;supported=true;}
                 if(guid==IID_ID3D10Multithread){target=Kind::Multithread;supported=true;}
             } else if(id->kind==Kind::Context){
-                if(guid==IID_ID3D11DeviceContext || guid==IID_ID3D11DeviceChild){target=Kind::Context;supported=true;}
+                if(guid==IID_ID3D11DeviceContext || guid==IID_ID3D11DeviceChild || guid==IID_ID3D11DeviceContext1 || guid==IID_ID3D11DeviceContext2 ||
+                   guid==IID_ID3D11DeviceContext3 || guid==IID_ID3D11DeviceContext4){target=Kind::Context;supported=true;}
+                if(guid==IID_ID3DUserDefinedAnnotation){target=Kind::Annotation;supported=true;}
                 if(guid==IID_ID3D11VideoContext){target=Kind::VideoContext;supported=true;}
-            } else if(id->kind==Kind::Texture)supported=guid==IID_ID3D11Texture2D || guid==IID_ID3D11Resource || guid==IID_ID3D11DeviceChild;
+            } else if(id->kind==Kind::Texture)supported=guid==IID_ID3D11Texture2D || guid==IID_ID3D11Texture2D1 || guid==IID_ID3D11Resource || guid==IID_ID3D11DeviceChild;
+            else if(id->kind==Kind::Fence)supported=guid==IID_ID3D11Fence || guid==IID_ID3D11DeviceChild;
             else if(id->kind==Kind::Decoder)supported=guid==IID_ID3D11VideoDecoder || guid==IID_ID3D11DeviceChild;
             else if(id->kind==Kind::View)supported=guid==IID_ID3D11VideoDecoderOutputView || guid==IID_ID3D11View || guid==IID_ID3D11DeviceChild;
             else if(id->kind==Kind::Reflection)supported=guid==IID_ID3D11ShaderReflection || guid==IID_ID3D11ShaderReflection43;
@@ -842,6 +909,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         } else if(symbol=="RegisterAdaptersChangedEvent") {
             (void)typed(arg(0),Kind::Factory);if(!arg(1) || !arg(2))result=invalid;else memory.store(GuestAddress{arg(2)},32,1);
         } else if(symbol=="UnregisterAdaptersChangedNotification"){(void)typed(arg(0),Kind::Factory);}
+        else if(symbol=="IsWindowedStereoEnabled"){(void)typed(arg(0),Kind::Factory);result=0;} // macOS 沒有視窗化立體顯示。
+        else if(symbol=="RegisterStereoStatusWindow" || symbol=="RegisterOcclusionStatusWindow" ||
+                symbol=="RegisterStereoStatusEvent" || symbol=="RegisterOcclusionStatusEvent") {
+            // 立體模式不存在、Present 不回報 DXGI_STATUS_OCCLUDED，狀態不會改變，因此登記後不會送出通知；
+            // 仍驗證視窗／事件並配發可註銷的 cookie，與 Windows 在狀態未變時的行為一致。
+            (void)typed(arg(0),Kind::Factory);const bool window=symbol.ends_with("Window");const unsigned out=window?3U:2U;
+            static std::uint32_t next_status_cookie=1;
+            if(!arg(out))result=invalid;
+            else if(window && !gui_.windows.contains(arg(1)))result=invalid;
+            else if(!window){const auto event=runtime_.wait_objects.find(arg(1));if(event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event)result=invalid;}
+            if(arg(out)){memory.check(GuestAddress{arg(out)},4,Access::Write);memory.store(GuestAddress{arg(out)},32,result?0U:next_status_cookie++);}
+        } else if(symbol=="UnregisterStereoStatus" || symbol=="UnregisterOcclusionStatus"){(void)typed(arg(0),Kind::Factory);}
+        else if(symbol=="GetSharedResourceAdapterLuid") {
+            (void)typed(arg(0),Kind::Factory);
+            const auto found=arg(1)<=UINT32_MAX?bridge.shared_resources.find(u32(1)):bridge.shared_resources.end();
+            if(!arg(2) || found==bridge.shared_resources.end() || found->second.resource.expired())result=invalid;
+            else {memory.check(GuestAddress{arg(2)},8,Access::Write);memory.store(GuestAddress{arg(2)},64,display_identity::adapter_luid);}
+        } else if(symbol=="CreateSwapChainForCoreWindow") {
+            // 桌面程序沒有 CoreWindow；與非 UWP 環境相同回 DXGI_ERROR_INVALID_CALL。
+            (void)typed(arg(0),Kind::Factory);output(5);memory.store(GuestAddress{arg(5)},pointer_bits,0);result=0x887a0001U;
+        }
         else if(symbol=="AdapterCheckInterfaceSupport") {
             (void)typed(arg(0),Kind::Adapter);const auto guid=read_guid(memory,arg(1));
             if(guid!=IID_IDXGIDevice && guid!=IID_ID3D11Device)result=not_supported;
@@ -916,8 +1004,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
                 else if(!arg(3))result=1; // S_FALSE：合法的僅驗證呼叫。
                 else {auto allocation=reserve_gpu_memory(static_cast<std::size_t>(size*desc[3]));std::vector<std::uint64_t> generations(desc[3]);auto texture=create(Kind::Texture,device->root);texture->gpu_allocation=std::move(allocation);texture->texture_desc=desc;texture->pixels=std::move(pixels);texture->video_frames.resize(desc[3]);texture->generations=std::move(generations);memory.store(GuestAddress{arg(3)},pointer_bits,texture->root);}
             }
-        } else if(symbol=="TextureGetDesc") {
-            auto id=typed(arg(0),Kind::Texture);std::vector<std::uint8_t> bytes(44);for(unsigned i=0;i<11;++i)put_word(bytes,i*4,id->texture_desc[i]);memory.write(GuestAddress{arg(1)},bytes);
+        } else if(symbol=="TextureGetDesc" || symbol=="Texture2DGetDesc1") {
+            // D3D11_TEXTURE2D_DESC1 只多 TextureLayout；建立時只接受 UNDEFINED。
+            auto id=typed(arg(0),Kind::Texture);std::vector<std::uint8_t> bytes(symbol=="TextureGetDesc"?44:48);for(unsigned i=0;i<11;++i)put_word(bytes,i*4,id->texture_desc[i]);memory.write(GuestAddress{arg(1)},bytes);
         } else if(symbol=="ResourceGetType") {(void)typed(arg(0),Kind::Texture);memory.store(GuestAddress{arg(1)},32,3);}
         else if(symbol=="GetVideoDecoderProfileCount") {(void)typed(arg(0),Kind::VideoDevice);result=video::hardware_decode_supported(video::Codec::H264)?1:0;}
         else if(symbol=="GetVideoDecoderProfile") {

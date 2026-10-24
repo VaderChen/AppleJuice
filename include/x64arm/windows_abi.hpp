@@ -156,6 +156,8 @@ std::span<const WindowsServiceDescriptor> gui_drag_service_descriptors();
 std::span<const WindowsServiceDescriptor> gui_move_size_service_descriptors();
 std::span<const WindowsServiceDescriptor> ole_stream_service_descriptors();
 std::span<const WindowsServiceDescriptor> storage_service_descriptors();
+std::span<const WindowsServiceDescriptor> msi_service_descriptors();
+std::span<const WindowsServiceDescriptor> esent_service_descriptors();
 std::span<const WindowsServiceDescriptor> safearray_service_descriptors();
 std::span<const WindowsServiceDescriptor> wmi_service_descriptors();
 std::string_view ole_ordinal_name(std::uint16_t ordinal);

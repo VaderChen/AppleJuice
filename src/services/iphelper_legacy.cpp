@@ -1,3 +1,4 @@
+#include "ipv4_prefix.h"
 #include "iphelper_legacy.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -62,7 +63,8 @@ Blob adapters(const NetworkConfiguration& config,bool x86){
             if(address.bytes.size()<8 || address.bytes[0]!=2)continue;
             const auto node=used?w.allocate(w.node):first;if(used)w.pointer(last,node);used=true;last=node;
             std::array<std::uint8_t,4> ip{},mask{};std::copy_n(address.bytes.begin()+4,4,ip.begin());
-            for(unsigned bit=0;bit<std::min<unsigned>(32,address.prefix);++bit)mask[bit/8]|=static_cast<std::uint8_t>(0x80U>>(bit%8));
+            const auto packed_mask=x64arm_ipv4_mask(address.prefix);
+            for(unsigned i=0;i<4;++i)mask[i]=static_cast<std::uint8_t>(packed_mask>>(i*8));
             w.address(node,ip,mask,++context); // 本快照中的 IPv4 NTE 身分；不冒用宿主指標。
         }
         w.list(at+(x86?468:488),item.gateways);w.address(at+(x86?508:536),item.dhcp_server);

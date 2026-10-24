@@ -4,9 +4,69 @@
 #include <utility>
 
 namespace x64arm::detail {
+// Windows CRT 的 long double 與 double 同為 binary64；名稱、參數及回傳 ABI
+// 完全相同的入口共用實作與 resident AOT 配方。不要依字尾猜測混合型別的 ABI。
+inline constexpr std::pair<std::string_view,std::string_view> crt_export_aliases[]{
+    {"_calloc_crt","calloc"},{"_calloc_base","calloc"},{"__set_app_type","_set_app_type"},
+    {"getwc","fgetwc"},{"putwc","fputwc"},{"strtoumax","strtoull"},{"strtoimax","strtoll"},
+    {"_hypot","hypot"},{"__p__timezone","__timezone"},{"__p__daylight","__daylight"},{"__p__tzname","__tzname"},
+    {"acosl","acos"},{"acoshl","acosh"},{"asinl","asin"},{"asinhl","asinh"},
+    {"atanl","atan"},{"atanhl","atanh"},{"atan2l","atan2"},{"cbrtl","cbrt"},
+    {"ceill","ceil"},{"cosl","cos"},{"coshl","cosh"},{"erfl","erf"},{"erfcl","erfc"},
+    {"expl","exp"},{"exp2l","exp2"},{"expm1l","expm1"},{"fabsl","fabs"},
+    {"floorl","floor"},{"logl","log"},{"log10l","log10"},{"log1pl","log1p"},{"log2l","log2"},{"logbl","logb"},
+    {"nearbyintl","nearbyint"},{"rintl","rint"},{"roundl","round"},{"sinl","sin"},{"sinhl","sinh"},
+    {"sqrtl","sqrt"},{"tanl","tan"},{"tanhl","tanh"},{"tgammal","tgamma"},{"truncl","trunc"},
+    {"copysignl","copysign"},{"fdiml","fdim"},{"fmaxl","fmax"},{"fminl","fmin"},
+    {"fmodl","fmod"},{"hypotl","hypot"},{"nextafterl","nextafter"},{"_nextafter","nextafter"},
+    {"nexttoward","nextafter"},{"nexttowardl","nextafter"},{"powl","pow"},{"remainderl","remainder"},
+    {"fmal","fma"},{"frexpl","frexp"},{"modfl","modf"},{"ldexpl","ldexp"},{"scalbnl","scalbn"},
+    {"_ldpcomp","_dpcomp"},{"ilogbl","ilogb"},
+    {"_cabs","cabs"},{"cabsl","cabs"},{"cargl","carg"},{"creall","creal"},{"cimagl","cimag"},
+    {"ccosl","ccos"},{"csinl","csin"},{"ctanl","ctan"},{"cacosl","cacos"},{"casinl","casin"},{"catanl","catan"},
+    {"ccoshl","ccosh"},{"csinhl","csinh"},{"ctanhl","ctanh"},{"cacoshl","cacosh"},{"casinhl","casinh"},{"catanhl","catanh"},
+    {"cexpl","cexp"},{"clogl","clog"},{"clog10l","clog10"},{"cpowl","cpow"},{"csqrtl","csqrt"},{"conjl","conj"},{"cprojl","cproj"}
+};
 // 固定名稱／序號別名是解析與匯出列舉的共用來源，不探測空序號。
 struct ServiceExportAlias { std::string_view family, symbol, target_family, target_symbol; };
 inline constexpr ServiceExportAlias service_export_aliases[]{
+    // MSI 的序號匯出與具名 API 共用同一實作及 ABI。
+    {"msi.dll","#7","msi.dll","MsiCloseAllHandles"},
+    {"msi.dll","#8","msi.dll","MsiCloseHandle"},
+    {"msi.dll","#17","msi.dll","MsiCreateRecord"},
+    {"msi.dll","#20","msi.dll","MsiDatabaseCommit"},
+    {"msi.dll","#25","msi.dll","MsiDatabaseGetPrimaryKeysA"},
+    {"msi.dll","#26","msi.dll","MsiDatabaseGetPrimaryKeysW"},
+    {"msi.dll","#31","msi.dll","MsiDatabaseOpenViewA"},
+    {"msi.dll","#32","msi.dll","MsiDatabaseOpenViewW"},
+    {"msi.dll","#52","msi.dll","MsiGetDatabaseState"},
+    {"msi.dll","#67","msi.dll","MsiGetProductInfoA"},
+    {"msi.dll","#70","msi.dll","MsiGetProductInfoW"},
+    {"msi.dll","#91","msi.dll","MsiOpenDatabaseA"},
+    {"msi.dll","#92","msi.dll","MsiOpenDatabaseW"},
+    {"msi.dll","#114","msi.dll","MsiRecordDataSize"},
+    {"msi.dll","#115","msi.dll","MsiRecordGetFieldCount"},
+    {"msi.dll","#116","msi.dll","MsiRecordGetInteger"},
+    {"msi.dll","#117","msi.dll","MsiRecordGetStringA"},
+    {"msi.dll","#118","msi.dll","MsiRecordGetStringW"},
+    {"msi.dll","#119","msi.dll","MsiRecordIsNull"},
+    {"msi.dll","#120","msi.dll","MsiRecordReadStream"},
+    {"msi.dll","#121","msi.dll","MsiRecordSetInteger"},
+    {"msi.dll","#122","msi.dll","MsiRecordSetStreamA"},
+    {"msi.dll","#123","msi.dll","MsiRecordSetStreamW"},
+    {"msi.dll","#124","msi.dll","MsiRecordSetStringA"},
+    {"msi.dll","#125","msi.dll","MsiRecordSetStringW"},
+    {"msi.dll","#158","msi.dll","MsiViewClose"},
+    {"msi.dll","#159","msi.dll","MsiViewExecute"},
+    {"msi.dll","#160","msi.dll","MsiViewFetch"},
+    {"msi.dll","#164","msi.dll","MsiDatabaseIsTablePersistentA"},
+    {"msi.dll","#165","msi.dll","MsiDatabaseIsTablePersistentW"},
+    {"msi.dll","#166","msi.dll","MsiViewGetColumnInfo"},
+    {"msi.dll","#167","msi.dll","MsiRecordClearData"},
+    {"msi.dll","#172","msi.dll","MsiGetComponentPathA"},
+    {"msi.dll","#173","msi.dll","MsiGetComponentPathW"},
+    {"comctl32.dll","#380","comctl32.dll","LoadIconMetric"},
+    {"comctl32.dll","#381","comctl32.dll","LoadIconWithScaleDown"},
     {"ws2_32.dll","#1","ws2_32.dll","accept"},
     {"ws2_32.dll","#2","ws2_32.dll","bind"},
     {"ws2_32.dll","#3","ws2_32.dll","closesocket"},
@@ -129,6 +189,8 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"ntdll.dll","RtlLookupFunctionEntry","kernel32.dll","RtlLookupFunctionEntry"},
     {"ntdll.dll","RtlVirtualUnwind","kernel32.dll","RtlVirtualUnwind"},
     {"ntdll.dll","RtlUnwindEx","kernel32.dll","RtlUnwindEx"},
+    {"ntdll.dll","_local_unwind","msvcrt.dll","_local_unwind"},
+    {"kernel32.dll","_local_unwind","msvcrt.dll","_local_unwind"},
 };
 // OLEAUT32 固定公開序號依序排序，供二分查詢及直接列舉。
 inline constexpr std::pair<std::uint16_t,std::string_view> ole_ordinal_exports[]{

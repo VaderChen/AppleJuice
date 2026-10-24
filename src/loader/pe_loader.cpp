@@ -278,6 +278,19 @@ void function_overrides(const Image& image,std::uint64_t at,std::uint64_t availa
         at=next;
     }
 }
+bool pre_cfg_load_config(std::uint64_t size,Directory dir,unsigned pointer_bytes){
+    // PE32 的舊結構到 SafeSEH（72 bytes），PE32+ 的對應前綴為 112 bytes。
+    // Size 與 directory extent 都未包含 CFG 欄位時，DllCharacteristics 不能單獨啟用 CFG。
+    const auto prefix=pointer_bytes==4?72U:112U;
+    return size<=prefix && dir.size<=prefix;
+}
+bool load_config_heap_hint(std::uint64_t offset,std::uint64_t size,unsigned pointer_bytes){
+    // DeCommitFreeBlockThreshold／DeCommitTotalFreeThreshold 皆為 pointer-sized 整數。
+    // 這些是宿主 heap 回收調校提示；客體配置仍受既有容量與權限限制。
+    for(const auto field:{24U,24U+pointer_bytes})
+        if(field+pointer_bytes<=size && offset>=field && offset<field+pointer_bytes)return true;
+    return false;
+}
 void load_config32(const Image& image,Directory dir,std::uint64_t base,RuntimeImage& runtime,bool guarded){
     if(!dir.rva){if(guarded)reject("PE32 GuardCF 缺少 Load Config");return;}
     if(dir.size<4)reject("PE32 Load Config 標頭截斷");
@@ -286,9 +299,7 @@ void load_config32(const Image& image,Directory dir,std::uint64_t base,RuntimeIm
     if(size<4 || size>192 || dir.size>192)reject("尚未支援此 PE32 Load Config 大小");
     image.check(dir.rva,std::max<std::uint64_t>(size,dir.size));
     const auto value=[&](unsigned offset){return offset+4<=size?image.integer(std::uint64_t{dir.rva}+offset,4):0;};
-    // 舊版 72-byte 結構只到 SafeSEH，並未提供 CFG instrumentation。
-    // DLLCharacteristics 宣告不能讓不存在的 GuardFlags 變成作用中 policy。
-    const bool legacy_config=size<=72 && dir.size<=72;
+    const bool legacy_config=pre_cfg_load_config(size,dir,4);
     const auto guard_flags=value(88);const bool cfg=guarded && !legacy_config;
     if(cfg && (size<92 || (guard_flags&0x500)!=0x500 || (guard_flags&~UINT64_C(0x10017d00))))reject("尚未支援此 PE32 GuardCF policy");
     if(!cfg && (guard_flags&~UINT64_C(0x100)))reject("PE32 GuardFlags 缺少完整 CFG 結構");
@@ -296,11 +307,10 @@ void load_config32(const Image& image,Directory dir,std::uint64_t base,RuntimeIm
     runtime.guard_cf=cfg;
     constexpr std::array pointers{60U,72U,76U,184U,188U};
     for(std::uint64_t offset=12;offset<std::max<std::uint64_t>(size,dir.size);++offset){
-        bool accepted=false;
+        bool accepted=load_config_heap_hint(offset,size,4);
         for(auto field:pointers)if(field+4<=size && offset>=field && offset<field+4)accepted=true;
         if(cfg && ((offset>=80 && offset<92) || (offset>=104 && offset<120)))accepted=true;
-        // DeCommit 閾值是宿主 heap 的回收調校提示；客體配置仍受既有容量與權限限制。
-        for(auto field:{24U,28U,64U,68U,88U,160U})if(field+4<=size && offset>=field && offset<field+4)accepted=true;
+        for(auto field:{64U,68U,88U,160U})if(field+4<=size && offset>=field && offset<field+4)accepted=true;
         if(!accepted && image.integer(std::uint64_t{dir.rva}+offset,1))reject("PE32 Load Config 包含尚未支援的作用中欄位，offset="+std::to_string(offset));
     }
     for(auto field:pointers)if(const auto pointer=value(field)){if(pointer<base)reject("PE32 Load Config 指標低於 image base");image.check(pointer-base,4);}
@@ -353,13 +363,14 @@ void load_config(const Image& image, Directory dir, std::uint64_t base, RuntimeI
     if (dir.size < 4) reject("Load Config 標頭截斷");
     const auto size = image.integer(dir.rva, 4);
     if (size < 4 || size > dir.size || size > 320) reject("尚未支援此 Load Config 大小");
+    const bool cfg=guarded && !pre_cfg_load_config(size,dir,8);
     // CFG 由客體載入器安裝檢查／dispatch 入口，不能保留 compiler 的 no-op stub。
     // XFG 映像可在未啟用 XFG 的程序中使用 CFG 相容模式；不宣告 hash enforcement。
     // export suppression 啟用與未知的動態 relocation 仍明確拒絕。
     const auto guard_flags=size>=148?image.integer(std::uint64_t{dir.rva}+144,4):0;
-    if(guarded && ((guard_flags&0x500)!=0x500 || (guard_flags&~UINT64_C(0x10c17d00))))reject("尚未支援此 GuardCF policy");
-    if((guard_flags&0x800000U) && (!guarded || size<304))reject("XFG Load Config 缺少完整的相容入口");
-    runtime.guard_cf=guarded;
+    if(cfg && ((guard_flags&0x500)!=0x500 || (guard_flags&~UINT64_C(0x10c17d00))))reject("尚未支援此 GuardCF policy");
+    if((guard_flags&0x800000U) && (!cfg || size<304))reject("XFG Load Config 缺少完整的相容入口");
+    runtime.guard_cf=cfg;
     if(size>=230){
         const auto offset=image.integer(std::uint64_t{dir.rva}+224,4),section=image.integer(std::uint64_t{dir.rva}+228,2);
         if(section || offset){
@@ -371,11 +382,11 @@ void load_config(const Image& image, Directory dir, std::uint64_t base, RuntimeI
     }
     constexpr std::array pointer_offsets{88U, 112U, 120U, 256U, 280U, 288U, 296U, 304U, 312U};
     for (std::uint64_t offset = 12; offset < dir.size; ++offset) {
-        bool accepted = false;
+        bool accepted = load_config_heap_hint(offset,size,8);
         for (const auto pointer : pointer_offsets) if (offset >= pointer && offset < pointer + 8 && pointer + 8 <= size) accepted = true;
         if (offset>=224 && offset<230 && size>=230)accepted=true;
         if (offset >= 144 && offset < 148 && size >= 148) accepted = true;
-        if(guarded && ((offset>=128 && offset<144) || (offset>=160 && offset<192) || (offset>=264 && offset<280)))accepted=true;
+        if(cfg && ((offset>=128 && offset<144) || (offset>=160 && offset<192) || (offset>=264 && offset<280)))accepted=true;
         if (!accepted && image.integer(std::uint64_t{dir.rva} + offset, 1)) reject("Load Config 包含尚未支援的作用中欄位，offset=" + std::to_string(offset));
     }
     // Volatile metadata 描述編譯器的 volatile 存取；直譯器原有逐次記憶體語義
@@ -395,12 +406,12 @@ void load_config(const Image& image, Directory dir, std::uint64_t base, RuntimeI
             for(std::uint64_t n=0;n<range_size;n+=8)image.check(image.integer(ranges+n,4),image.integer(ranges+n+4,4));
         }
     }
-    if (!guarded && size >= 148 && (image.integer(std::uint64_t{dir.rva} + 144, 4) & ~UINT64_C(0x900))) reject("尚未支援作用中的 GuardFlags");
+    if (!cfg && size >= 148 && (image.integer(std::uint64_t{dir.rva} + 144, 4) & ~UINT64_C(0x900))) reject("尚未支援作用中的 GuardFlags");
     for (const auto offset : pointer_offsets) if (offset + 8 <= size) {
         const auto pointer = image.integer(std::uint64_t{dir.rva} + offset, 8);
         if (pointer) { if (pointer < base) reject("Load Config 指標低於 image base"); image.check(pointer - base, 8); }
     }
-    if(guarded){
+    if(cfg){
         const auto stride=4U+static_cast<unsigned>(guard_flags>>28);
         if(stride>5)reject("未知的 GFIDS metadata stride");
         const auto table=[&](unsigned pointer_offset,unsigned count_offset,bool code,bool flags,std::vector<std::uint32_t>* targets,unsigned item_stride){
@@ -442,7 +453,9 @@ void load_config(const Image& image, Directory dir, std::uint64_t base, RuntimeI
 }
 void relocation(Image& image, Directory dir, std::uint64_t delta, PeMetadata& metadata) {
     const auto width = metadata.pointer_bytes();
-    if (!dir.rva) { if (delta) reject("變更 image base 需要 relocation table"); return; }
+    // 沒有重定位資料且未標記 RELOCS_STRIPPED（已於呼叫前拒絕）時與 Windows 載入器相同：沒有位址需要修正，
+    // 可映射到其他基址（例如 ICU 的純資料 DLL、轉發用 API-set DLL）。
+    if (!dir.rva || !dir.size) return;
     const auto end = std::uint64_t{dir.rva} + dir.size;
     auto at = std::uint64_t{dir.rva};
     // 目標互不重疊的判定：每個目標占 width 位元組，以映像位元組位圖 O(1) 檢查與標記。
@@ -454,9 +467,14 @@ void relocation(Image& image, Directory dir, std::uint64_t delta, PeMetadata& me
     // 先收集且檢查，避免重定位資料與目標重疊時改寫後續解析內容。
     std::vector<std::pair<std::uint64_t, std::uint64_t>> changes;
     changes.reserve(dir.size / 2);
+    const auto padding = [&] {
+        // 目錄可在最後一個完整區塊後保留零填尾端；非零截斷資料仍拒絕。
+        for (; at < end; ++at) if (image.integer(at, 1)) reject("重定位尾端含非零截斷資料");
+    };
     while (at < end) {
-        if (end - at < 8) reject("重定位區塊標頭截斷");
+        if (end - at < 8) { padding(); break; }
         const auto page = image.integer(at, 4), size = image.integer(at + 4, 4);
+        if (!page && !size) { padding(); break; }
         if (page % 4096 || size < 8 || size % 4 || size > end - at) reject("重定位區塊大小或頁地址不合法");
         for (std::uint64_t offset = 8; offset < size; offset += 2) {
             const auto item = image.integer(at + offset, 2);
@@ -686,7 +704,9 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
         // 沒有 R/W/X 的 metadata 區段仍有合法的映像範圍與內容；以不可存取映射保留。
         // 客體 W+X 仍是資料映射；僅經 JIT 驗證的 ARM64 進入宿主可執行 arena。
         // 可執行來源寫入沿用 GuestMemory 世代／範圍撤銷，不能直接執行舊翻譯。
-        else if (!inventory_only && (flags_value & 0x10000000U)) reject("尚未支援 shared section");
+        // 唯讀 shared section（例如 Qt5Core 的 .qtmimed）載入後內容不再改變，各程序私有映射與共用頁面語義相同；
+        // 可寫入者需要跨程序共用頁面，仍拒絕。
+        else if (!inventory_only && (flags_value & 0x10000000U) && (flags_value & 0x80000000U)) reject("尚未支援可寫入的 shared section");
         for (const auto& other : image.sections) {
             if (rva < std::uint64_t{other.rva} + other.size && other.rva < std::uint64_t{rva} + rounded) reject("section 虛擬範圍重疊");
             if (file_size && other.raw_size && raw < std::uint64_t{other.raw} + other.raw_size && other.raw < std::uint64_t{raw} + file_size) reject("section raw 範圍重疊");

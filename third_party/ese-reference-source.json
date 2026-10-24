@@ -1,0 +1,37 @@
+{
+  "repository": "https://github.com/microsoft/Extensible-Storage-Engine",
+  "revision": "7030fe7407615160e54d152e4ef704eede2fdd7e",
+  "files": {
+    "LICENSE": {
+      "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+      "url": "https://raw.githubusercontent.com/microsoft/Extensible-Storage-Engine/7030fe7407615160e54d152e4ef704eede2fdd7e/LICENSE"
+    },
+    "dev/ese/src/checksum/checksum.cxx": {
+      "sha256": "595cc1edbad1661545dfa8c553738bc69b3b889ec4dad8a91547a66f2385a328",
+      "url": "https://raw.githubusercontent.com/microsoft/Extensible-Storage-Engine/7030fe7407615160e54d152e4ef704eede2fdd7e/dev/ese/src/checksum/checksum.cxx"
+    },
+    "dev/ese/src/checksum/checksum_amd64.cxx": {
+      "sha256": "e75a9b0b6add75fa536205faea27c25fa176c86c26dbb97245cdee9c1ec6ba6b",
+      "url": "https://raw.githubusercontent.com/microsoft/Extensible-Storage-Engine/7030fe7407615160e54d152e4ef704eede2fdd7e/dev/ese/src/checksum/checksum_amd64.cxx"
+    },
+    "dev/ese/src/ese/_osu/checksumu.cxx": {
+      "sha256": "db3ab4334ea59997b5614a7ae695a2e70ee9104a32efc316cb72e09154fcac3d",
+      "url": "https://raw.githubusercontent.com/microsoft/Extensible-Storage-Engine/7030fe7407615160e54d152e4ef704eede2fdd7e/dev/ese/src/ese/_osu/checksumu.cxx"
+    },
+    "dev/ese/published/inc/jethdr.w": {
+      "sha256": "9b3ceb6b86e2c2bfd933b9078ad48ed4dc8426e35ddfbe8340e0f79827bf493a",
+      "url": "https://raw.githubusercontent.com/microsoft/Extensible-Storage-Engine/7030fe7407615160e54d152e4ef704eede2fdd7e/dev/ese/published/inc/jethdr.w"
+    },
+    "dev/ese/src/inc/tdb.hxx": {
+      "sha256": "62a230035604bb3525b0c9a839f2556218a73617aece7c0e73abf227c68d6281",
+      "url": "https://raw.githubusercontent.com/microsoft/Extensible-Storage-Engine/7030fe7407615160e54d152e4ef704eede2fdd7e/dev/ese/src/inc/tdb.hxx"
+    },
+    "dev/ese/src/ese/db.cxx": {
+      "sha256": "f795cee37df67558055765bcb8e930abe45e4bd84013fc093eee1c3ad9c57f1a",
+      "url": "https://raw.githubusercontent.com/microsoft/Extensible-Storage-Engine/7030fe7407615160e54d152e4ef704eede2fdd7e/dev/ese/src/ese/db.cxx"
+    }
+  },
+  "license": "ese-reference-LICENSE",
+  "integration": "src/services/esent_database.cpp",
+  "scope": "HSIAO ECC／XOR 校驗算法移植；未引入完整 ESE 執行引擎。"
+}

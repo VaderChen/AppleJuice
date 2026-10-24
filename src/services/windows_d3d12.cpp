@@ -23,7 +23,7 @@ namespace x64arm {
 // 運算、繪圖、交換鏈、間接命令、Bundle、條件執行與 UAV 清除均使用共用 NativeGraphics／Metal 後端。
 // 參考：https://learn.microsoft.com/windows/win32/direct3d12/directx-12-programming-guide
 struct D3D12State {
-    enum class Kind {Device,Queue,Allocator,List,Fence,Resource,DescriptorHeap,RootSignature,Pipeline,QueryHeap,Heap,Blob,CommandSignature,SwapChain};
+    enum class Kind {Device,Queue,Allocator,List,Fence,Resource,DescriptorHeap,RootSignature,Pipeline,QueryHeap,Heap,Blob,CommandSignature,SwapChain,PipelineLibrary};
     struct Object {Kind kind{};unsigned references{1};std::uint64_t device{};std::map<std::array<std::uint8_t,16>,std::vector<std::uint8_t>> data;};
     struct Resource {
         std::uint32_t dimension{},format{},height{1},depth{1},levels{1},samples{1},flags{},heap_type{1};std::uint64_t width{};
@@ -70,6 +70,8 @@ struct D3D12State {
     std::map<std::uint64_t,RootSignature> roots;std::map<std::uint64_t,Pipeline> pipelines;std::map<std::uint64_t,List> lists;
     std::map<std::uint64_t,Fence> fences;std::map<std::uint64_t,std::vector<std::uint8_t>> blobs;std::map<std::uint64_t,std::uint32_t> queues;std::map<std::uint64_t,SwapChain> swaps;
     std::map<std::uint64_t,MemoryHeap> memory_heaps;std::map<std::uint64_t,QueryHeap> query_heaps;
+    // 管線庫：名稱對應已儲存的 PSO（持有參照）；由序列化資料還原的名稱沒有現存 PSO（值為 0），載入時依呼叫端描述重新建立。
+    std::map<std::uint64_t,std::map<std::u16string,std::uint64_t>> libraries;
     std::map<Kind,std::uint64_t> tables;
     std::uint64_t next_address{UINT64_C(0x0000100000000000)},next_descriptor{UINT64_C(0x0000700000000000)};
     std::set<std::string> reported;
@@ -79,6 +81,9 @@ using Kind=D3D12State::Kind;
 constexpr std::uint32_t ok=0,false_ok=1,not_implemented=0x80004001U,no_interface=0x80004002U,pointer_error=0x80004003U,fail=0x80004005U,
     invalid=0x80070057U,no_memory=0x8007000eU,unsupported=0x887a0004U,not_found=0x887a0002U;
 constexpr std::uint64_t descriptor_size=32;
+// 管線庫序列化格式：識別字串＋格式版本＋名稱數，之後每筆為 UTF-16 長度與內容。識別不符即視為其他驅動版本產生。
+constexpr std::array<std::uint8_t,16> library_magic{'X','6','4','A','R','M','-','P','S','O','L','I','B',0,0,1};
+constexpr std::uint32_t driver_version_mismatch=0x887e0002U;
 struct KindInfo {Kind kind;std::string_view prefix;std::string_view top;std::vector<std::string_view> chain;};
 const std::vector<KindInfo>& kinds(){
     static const std::vector<KindInfo> list{
@@ -94,6 +99,7 @@ const std::vector<KindInfo>& kinds(){
         {Kind::CommandSignature,"CommandSignature.","ID3D12CommandSignature",{"ID3D12Object","ID3D12DeviceChild","ID3D12Pageable","ID3D12CommandSignature"}},
         {Kind::QueryHeap,"QueryHeap.","ID3D12QueryHeap",{"ID3D12Object","ID3D12DeviceChild","ID3D12Pageable","ID3D12QueryHeap"}},
         {Kind::Heap,"Heap.","ID3D12Heap1",{"ID3D12Object","ID3D12DeviceChild","ID3D12Pageable","ID3D12Heap","ID3D12Heap1"}},
+        {Kind::PipelineLibrary,"PipelineLibrary.","ID3D12PipelineLibrary1",{"ID3D12Object","ID3D12DeviceChild","ID3D12PipelineLibrary","ID3D12PipelineLibrary1"}},
     };
     return list;
 }
@@ -321,6 +327,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             if(kind==Kind::Heap){if(const auto h=bridge.memory_heaps.find(self);h!=bridge.memory_heaps.end()){if(h->second.cpu)(void)free_heap(memory,h->second.cpu,state);bridge.memory_heaps.erase(h);}}
             bridge.signatures.erase(self);bridge.query_heaps.erase(self);
             bridge.heaps.erase(self);bridge.roots.erase(self);bridge.pipelines.erase(self);bridge.lists.erase(self);bridge.fences.erase(self);bridge.queues.erase(self);
+            if(const auto library=bridge.libraries.find(self);library!=bridge.libraries.end()){
+                for(const auto& [name,pipeline]:library->second)if(const auto entry=bridge.objects.find(pipeline);pipeline && entry!=bridge.objects.end() && entry->second.references && !--entry->second.references){
+                    const auto owner=entry->second.device;bridge.pipelines.erase(pipeline);bridge.objects.erase(entry);
+                    if(const auto parent=bridge.objects.find(owner);parent!=bridge.objects.end() && parent->second.references)--parent->second.references;}
+                bridge.libraries.erase(library);
+            }
             if(const auto swap=bridge.swaps.find(self);swap!=bridge.swaps.end()){for(const auto buffer:swap->second.buffers){bridge.resources.erase(buffer);bridge.objects.erase(buffer);}bridge.swaps.erase(swap);}
             if(kind==Kind::Blob){if(const auto data=load(self+8,64))(void)free_heap(memory,data,state);bridge.blobs.erase(self);}
             if(kind==Kind::Device)bridge.devices.erase(self);
@@ -418,6 +430,37 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         report("Swap."+std::string(member));return finish(not_implemented);
     }
     if(kind==Kind::Device){
+        if(member=="CreatePipelineLibrary"){
+            // 空資料建立新庫；資料須為本實作 Serialize 的格式，其他驅動或版本的快取回 DRIVER_VERSION_MISMATCH，損毀回 E_INVALIDARG。
+            std::map<std::u16string,std::uint64_t> names;const auto size=arg(2);
+            if(size){
+                if(!arg(1))return finish(invalid);if(size<20)return finish(driver_version_mismatch);
+                const auto data=bytes(arg(1),static_cast<std::size_t>(std::min<std::uint64_t>(size,UINT64_C(64)*1024*1024)));
+                if(!std::equal(library_magic.begin(),library_magic.end(),data.begin()))return finish(driver_version_mismatch);
+                std::uint32_t count;std::memcpy(&count,data.data()+16,4);std::size_t at=20;
+                for(std::uint32_t i=0;i<count;++i){
+                    if(at+4>data.size())return finish(invalid);std::uint32_t length;std::memcpy(&length,data.data()+at,4);at+=4;
+                    if(length>32768 || at+std::size_t{length}*2>data.size())return finish(invalid);
+                    std::u16string name(length,0);std::memcpy(name.data(),data.data()+at,std::size_t{length}*2);at+=std::size_t{length}*2;names.emplace(std::move(name),0);
+                }
+            }
+            if(!arg(4))return finish(false_ok);
+            const auto object=create(Kind::PipelineLibrary,self);bridge.libraries[object]=std::move(names);return finish(give(object,arg(3),arg(4)));
+        }
+        // 駐留管理：Apple Silicon 為統一記憶體，沒有可被換出的顯示記憶體預算，所有 pageable 物件恆駐留；
+        // EnqueueMakeResident 因此立即把 fence 推進到要求的值。物件須屬於本裝置的 pageable 種類。
+        if(member=="MakeResident" || member=="Evict" || member=="SetResidencyPriority" || member=="EnqueueMakeResident"){
+            const bool enqueue=member=="EnqueueMakeResident";const std::uint32_t count=u32(enqueue?2:1);const std::uint64_t list=arg(enqueue?3:2);
+            if(enqueue && (u32(1)&~1U))return finish(invalid);if(count && !list)return finish(invalid);
+            for(std::uint32_t i=0;i<count;++i){const auto object=bridge.objects.find(load(list+i*8,64));
+                if(object==bridge.objects.end() || object->second.kind==Kind::Device || object->second.kind==Kind::Blob || object->second.kind==Kind::SwapChain)return finish(invalid);}
+            if(enqueue){
+                const auto fence=bridge.fences.find(arg(4));if(fence==bridge.fences.end())return finish(invalid);
+                fence->second.value=std::max(fence->second.value,arg(5));
+                std::erase_if(fence->second.events,[&](const auto& item){if(item.first>fence->second.value)return false;if(const auto event=runtime_.wait_objects.find(item.second);event!=runtime_.wait_objects.end())event->second.set_signal(true);return true;});
+            }
+            return finish(ok);
+        }
         if(member=="GetNodeCount")return finish(1);
         if(member=="GetDescriptorHandleIncrementSize")return finish(descriptor_size);
         if(member=="GetDeviceRemovedReason")return finish(ok);
@@ -430,14 +473,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             case 1:if(!zero(16))return finish(invalid);store(data+4,32,1);store(data+8,32,1);store(data+12,32,1);return finish(ok); // ARCHITECTURE：TBDR、UMA、cache coherent。
             case 2:{if(size!=24)return finish(invalid);const auto count=load(data,32),list=load(data+8,64);std::uint32_t best=0;
                 for(std::uint64_t i=0;i<count;++i){const auto level=static_cast<std::uint32_t>(load(list+i*4,32));if(level<=0xc100)best=std::max(best,level);}store(data+16,32,best);return finish(best?ok:unsupported);}
-            case 3:if(size!=12)return finish(invalid);store(data+4,32,graphics_format_bytes(static_cast<std::uint32_t>(load(data,32)))?0x0fffffffU:0U);store(data+8,32,0);return finish(ok);
+            case 3:{
+                // FORMAT_SUPPORT：共用後端可對應的格式（含 BC 區塊壓縮）回報支援；其餘格式回報 0（不擲出例外）。
+                if(size!=12)return finish(invalid);const auto format=static_cast<std::uint32_t>(load(data,32));bool known=graphics_format_bc_family(format)!=0;
+                if(!known)try{known=graphics_format_bytes(format)!=0;}catch(const std::invalid_argument&){known=false;}
+                store(data+4,32,known?0x0fffffffU:0U);store(data+8,32,0);return finish(ok);}
             case 4:if(size!=16)return finish(invalid);store(data+12,32,load(data+4,32)==1 || native.graphics_samples_supported(static_cast<std::uint32_t>(load(data,32)),static_cast<std::uint32_t>(load(data+4,32)))?1:0);return finish(ok);
             case 5:if(size!=8)return finish(invalid);store(data+4,32,1);return finish(ok);
             case 6:if(!zero(8))return finish(invalid);store(data,32,40);store(data+4,32,40);return finish(ok);
             case 7:if(size!=4)return finish(invalid);store(data,32,std::min<std::uint64_t>(load(data,32),0x60));return finish(ok); // 最高 SM6.0。
             case 12:if(size!=4)return finish(invalid);store(data,32,std::min<std::uint64_t>(load(data,32),2));return finish(ok);
             case 16:if(size!=20)return finish(invalid);store(data+4,32,1);store(data+8,32,1);store(data+12,32,1);store(data+16,32,1);return finish(ok);
-            case 8:if(!zero(24))return finish(invalid);store(data+16,32,1);return finish(ok); // OPTIONS1：無 wave 運算；ExpandedComputeResourceStates。
+            case 8:if(!zero(24))return finish(invalid);store(data,32,1);store(data+4,32,32);store(data+8,32,32);store(data+12,32,1024);store(data+16,32,1);store(data+20,32,1);return finish(ok); // OPTIONS1：wave 寬 32（Metal SIMD group）、ExpandedComputeResourceStates、64 位元整數。
             case 20:if(size!=12)return finish(invalid);store(data+8,32,load(data+4,32)==0 || load(data+4,32)==100?1:0);return finish(ok); // 佇列優先權：NORMAL／HIGH。
             // 其餘選項結構：未支援的能力回報 FALSE／tier 0（大小依 d3d12.h）。
             case 18:case 39:if(!zero(8))return finish(invalid);return finish(ok);
@@ -665,7 +712,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             std::uint64_t total=0;
             for(std::uint64_t i=0;i<arg(3);++i){const auto d=arg(4)+i*56;const auto width=load(d+16,64),height=load(d+24,32),layers=load(d+28,32)&0xffffU;
                 const auto dimension=load(d,32);const auto format=static_cast<std::uint32_t>(load(d+32,32));
-                const auto size=dimension==1?width:std::uint64_t{std::max(1U,graphics_format_bytes(format))}*width*std::max<std::uint64_t>(height,1)*std::max<std::uint64_t>(layers,1)*2;
+                // 依列距（BC 以 4×4 區塊計）估計含 mip 鏈的大小（約為最上層的兩倍）。
+                const auto pitch=dimension==1?std::array<std::uint32_t,2>{1U,1U}:graphics_format_pitch(format,static_cast<std::uint32_t>(std::min<std::uint64_t>(width,UINT32_MAX)),static_cast<std::uint32_t>(std::max<std::uint64_t>(height,1)));
+                const auto size=dimension==1?width:std::uint64_t{pitch[0]}*pitch[1]*std::max<std::uint64_t>(layers,1)*2;
                 total+=(size+0xffffU)&~UINT64_C(0xffff);}
             if(arg(1)){store(arg(1),64,total);store(arg(1)+8,64,0x10000);}return finish(arg(1));
         }
@@ -774,6 +823,33 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         report(symbol);return finish(not_implemented);
     }
     if(kind==Kind::Allocator){if(member=="Reset")return finish(ok);report(symbol);return finish(not_implemented);}
+    if(kind==Kind::PipelineLibrary){
+        auto& library=bridge.libraries.at(self);
+        const auto text=[&](std::uint64_t at){return read_utf16(memory,GuestAddress{at},32768);};
+        if(member=="StorePipeline"){
+            // 名稱不可重複；庫持有 PSO 參照直到釋放。
+            if(!arg(1) || !arg(2))return finish(invalid);const auto pipeline=bridge.objects.find(arg(2));
+            if(pipeline==bridge.objects.end() || pipeline->second.kind!=Kind::Pipeline)return finish(invalid);
+            const auto name=text(arg(1));if(library.contains(name))return finish(invalid);
+            ++pipeline->second.references;library.emplace(name,arg(2));return finish(ok);
+        }
+        if(member=="LoadGraphicsPipeline" || member=="LoadComputePipeline" || member=="LoadPipeline"){
+            // 找不到名稱回 E_INVALIDARG；找到時依呼叫端描述建立 PSO（與驅動重用已編譯結果相同，回傳等價物件）。
+            if(!arg(1) || !arg(2))return finish(invalid);if(arg(4))store(arg(4),64,0);
+            if(!library.contains(text(arg(1))))return finish(invalid);
+            const auto owner=found->second.device,desc=arg(2),riid=arg(3),out=arg(4);
+            state.reg(Gpr::Rcx)=owner;state.reg(Gpr::Rdx)=desc;state.reg(Gpr::R8)=riid;state.reg(Gpr::R9)=out;
+            const auto target=member=="LoadGraphicsPipeline"?"Device.CreateGraphicsPipelineState":member=="LoadComputePipeline"?"Device.CreateComputePipelineState":"Device.CreatePipelineState";
+            return invoke_d3d12(state,memory,WindowsServiceDescriptor{"internal-d3d12",target,4});
+        }
+        std::vector<std::uint8_t> serialized(library_magic.begin(),library_magic.end());
+        const auto append=[&](std::uint32_t value){for(unsigned b=0;b<4;++b)serialized.push_back(static_cast<std::uint8_t>(value>>(8*b)));};
+        append(static_cast<std::uint32_t>(library.size()));
+        for(const auto& [name,pipeline]:library){(void)pipeline;append(static_cast<std::uint32_t>(name.size()));for(const auto c:name){serialized.push_back(static_cast<std::uint8_t>(c));serialized.push_back(static_cast<std::uint8_t>(c>>8));}}
+        if(member=="GetSerializedSize")return finish(serialized.size());
+        if(member=="Serialize"){if(!arg(1) || arg(2)<serialized.size())return finish(invalid);memory.write(GuestAddress{arg(1)},serialized);return finish(ok);}
+        report(symbol);return finish(not_implemented);
+    }
     if(kind==Kind::Heap){
         auto& heap=bridge.memory_heaps.at(self);
         if(member=="GetDesc"){if(arg(1))memory.write(GuestAddress{arg(1)},heap.desc);return finish(arg(1));}

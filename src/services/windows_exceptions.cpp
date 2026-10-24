@@ -167,11 +167,13 @@ bool WindowsServices::append_exception_frame(GuestMemory& memory, ExceptionDispa
             dispatch.walk=active.context;dispatch.walk_callback_depth=active.callback_depth;dispatch.walk_exception_depth=active.exception_depth;
             dispatch.msvc.parent=parent.msvc.parent;dispatch.msvc.function_info=parent.msvc.function_info;dispatch.msvc.rethrow_state=parent.msvc.catch_state;
             dispatch.unwound=false;
-        } else if((callback.continuation==Continuation::Exception || callback.continuation==Continuation::SehFilter) && callback.exception_depth) {
+        } else if((callback.continuation==Continuation::Exception || callback.continuation==Continuation::SehFilter || callback.continuation==Continuation::SehFinally) && callback.exception_depth) {
             const auto& parent=exceptions_.stack.at(callback.exception_depth-1);
             if(parent.frames.empty())throw HostCallFault("例外 callback 沒有作用中 unwind 框架");
             const auto& active=parent.frames.at(parent.stage==ExceptionStage::Unwind?parent.index-1:parent.frames.size()-1);
             dispatch.walk=active.context;dispatch.walk_callback_depth=active.callback_depth;dispatch.walk_exception_depth=active.exception_depth;
+            // finally 內再次展開時，從已離開的 scope 之後續走，不能重新執行同一個 finally。
+            if(parent.stage==ExceptionStage::Unwind)dispatch.walk_scope_index=memory.load(GuestAddress{parent.dispatcher+72},32);
             dispatch.unwound=false;
         } else {
             dispatch.walk=callback.saved;dispatch.walk_exception_depth=callback.exception_depth;
@@ -191,7 +193,8 @@ bool WindowsServices::append_exception_frame(GuestMemory& memory, ExceptionDispa
     static const RuntimeImage leaf_image;
     const auto unwind=virtual_unwind(memory,image?*image:leaf_image,pc,dispatch.walk,3);
     if(unwind.caller.reg(Gpr::Rsp)<=dispatch.walk.reg(Gpr::Rsp))throw HostCallFault("例外 unwind 未向上推進堆疊");
-    dispatch.frames.push_back({dispatch.walk,pc,unwind,dispatch.walk_callback_depth,dispatch.walk_exception_depth});return true;
+    dispatch.frames.push_back({dispatch.walk,pc,unwind,dispatch.walk_callback_depth,dispatch.walk_exception_depth,dispatch.walk_scope_index});
+    dispatch.walk_scope_index=0;return true;
 }
 void WindowsServices::prepare_handler(GuestMemory& memory, ExceptionDispatch& dispatch, const ExceptionWalkFrame& frame, bool target) {
     const auto* image=unwind_image(memory,frame.pc,frame.unwind.function_entry);
@@ -200,7 +203,9 @@ void WindowsServices::prepare_handler(GuestMemory& memory, ExceptionDispatch& di
     const std::array<std::uint64_t, 9> fields{frame.pc, image->base, frame.unwind.function_entry, frame.unwind.establisher,
         dispatch.stage == ExceptionStage::Unwind ? dispatch.target_ip : 0, dispatch.walk_context, frame.unwind.handler, frame.unwind.handler_data, 0};
     for (std::size_t i = 0; i < fields.size(); ++i) memory.store(GuestAddress{dispatch.dispatcher + i * 8}, 64, fields[i]);
+    memory.store(GuestAddress{dispatch.dispatcher+72},32,frame.scope_index);
     write_context(memory, dispatch.walk_context, frame.unwind.caller);
+    if(dispatch.unwind_context)write_context(memory,dispatch.unwind_context,frame.context);
     memory.store(GuestAddress{dispatch.record + 4}, 32, dispatch.flags | (dispatch.stage == ExceptionStage::Unwind ? 2U | (target ? 32U : 0U) : 0));
 }
 std::optional<std::uint32_t> WindowsServices::finish_user_callback_exception(GuestState& state,GuestMemory& memory){
@@ -282,6 +287,7 @@ std::optional<std::uint32_t> WindowsServices::advance_exception(GuestState& stat
         state = dispatch.target_context;
         if(!dispatch.restore_jump)state.reg(Gpr::Rsp) = dispatch.frames[dispatch.target_frame].unwind.establisher;
         state.rip = GuestAddress{dispatch.target_ip}; state.reg(Gpr::Rax) = dispatch.return_value;
+        if(dispatch.unwind_context)write_context(memory,dispatch.unwind_context,state);
         const auto& target=dispatch.frames[dispatch.target_frame];
         discard_callbacks(target.callback_depth,state,memory);
         const auto depth=target.exception_depth;
@@ -403,6 +409,24 @@ std::optional<std::uint32_t> WindowsServices::seh_filter_result(GuestState& stat
         start_callbacks(state, memory, {{handler, {dispatch.pointers, frame.unwind.establisher}}}, Continuation::SehFilter); return std::nullopt;
     }
     complete_call(state,memory,1); return std::nullopt;
+}
+std::optional<std::uint32_t> WindowsServices::seh_finally_result(GuestState& state,GuestMemory& memory) {
+    auto& dispatch=exceptions_.stack.back();
+    const auto& frame=dispatch.frames.at(dispatch.index-1);
+    const auto* image=unwind_image(memory,frame.pc,frame.unwind.function_entry);
+    if(!image)throw HostCallFault("SEH finally 所屬映像已不存在");
+    const auto pc=frame.pc-image->base;
+    while(dispatch.scope_index<dispatch.scopes.size()) {
+        const auto& scope=dispatch.scopes[dispatch.scope_index++];
+        if(scope.target || pc<scope.begin || pc>=scope.end)continue;
+        const auto target=dispatch.target_ip-image->base;
+        if(dispatch.index-1==dispatch.target_frame && target>=scope.begin && target<scope.end)break;
+        // DISPATCHER_CONTEXT.ScopeIndex 在呼叫前發布，供巢狀展開恢復進度。
+        memory.store(GuestAddress{dispatch.dispatcher+72},32,dispatch.scope_index);
+        start_callbacks(state,memory,{{image->base+scope.filter,{1,frame.unwind.establisher}}},Continuation::SehFinally);
+        return std::nullopt;
+    }
+    complete_call(state,memory,1);return std::nullopt;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state, memory, service); const auto symbol = service.symbol;
@@ -526,9 +550,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
             if(unwind.floating_sources[i])memory.store(GuestAddress{arg(7)+i*8},64,unwind.floating_sources[i]);
             if(unwind.integer_sources[i])memory.store(GuestAddress{arg(7)+128+i*8},64,unwind.integer_sources[i]);
         }
-    } else if (symbol == "RtlUnwindEx" || symbol == "RtlUnwind") {
+    } else if (symbol == "RtlUnwindEx" || symbol == "RtlUnwind" || symbol == "_local_unwind") {
         if(x86_)throw HostCallFault("RtlUnwindEx 僅支援 AMD64；Win32 請使用 RtlUnwind");
-        const auto target=arg(0),ip=arg(1),record=arg(2),value=arg(3);
+        const auto target=arg(0),ip=arg(1),record=symbol=="_local_unwind"?UINT64_C(0):arg(2),value=symbol=="_local_unwind"?UINT64_C(0):arg(3);
+        const auto output_context=symbol=="RtlUnwindEx"?arg(4):UINT64_C(0);
+        if(output_context)memory.check(GuestAddress{output_context},1232,Access::Write);
         if(record && memory.load(GuestAddress{record},32)==0x80000026U){
             if(const auto* image=module_image(ip,true);image && image->guard_long_jump &&
                !std::binary_search(image->guard_long_jump_targets.begin(),image->guard_long_jump_targets.end(),static_cast<std::uint32_t>(ip-image->base)))return 0xc0000409U;
@@ -552,6 +578,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
             }
         }
         auto& dispatch = exceptions_.stack.back();
+        dispatch.unwind_context=output_context;
         const auto frame = std::find_if(dispatch.frames.begin(), dispatch.frames.end(), [&](const auto& f) { return f.unwind.establisher == target; });
         if (frame == dispatch.frames.end()) throw HostCallFault("RtlUnwindEx 目標框架不在搜尋鏈內");
         if(record && memory.load(GuestAddress{record},32)==0x80000029U){
@@ -571,23 +598,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
         if(!image)throw HostCallFault("C specific handler 所屬映像已不存在");
         const auto data = memory.load(GuestAddress{dispatch.dispatcher + 56}, 64), count = memory.load(GuestAddress{data}, 32);
         if (count > 4096) throw HostCallFault("SEH scope table 過大");
-        const auto pc = memory.load(GuestAddress{dispatch.dispatcher}, 64) - image->base;
-        const auto frame = memory.load(GuestAddress{dispatch.dispatcher + 24}, 64);
-        dispatch.scopes.clear(); dispatch.scope_index = 0;
-        std::vector<GuestCallback> finalizers;
+        dispatch.scopes.clear();dispatch.scope_index=memory.load(GuestAddress{dispatch.dispatcher+72},32);
+        if(dispatch.scope_index>count)throw HostCallFault("SEH ScopeIndex 超出範圍");
         for (std::uint64_t i = 0; i < count; ++i) {
             const auto at = data + 4 + i * 16;
             SehScope scope{static_cast<std::uint32_t>(memory.load(GuestAddress{at}, 32)), static_cast<std::uint32_t>(memory.load(GuestAddress{at + 4}, 32)),
                 static_cast<std::uint32_t>(memory.load(GuestAddress{at + 8}, 32)), static_cast<std::uint32_t>(memory.load(GuestAddress{at + 12}, 32))};
             if (scope.begin >= scope.end || scope.end > image->size || scope.target >= image->size || (scope.filter > 1 && scope.filter >= image->size)) throw HostCallFault("SEH scope RVA 不合法");
             dispatch.scopes.push_back(scope);
-            if (dispatch.stage == ExceptionStage::Unwind && !scope.target && pc >= scope.begin && pc < scope.end) {
-                const auto target = dispatch.target_ip - image->base;
-                const bool target_frame=dispatch.index-1==dispatch.target_frame;
-                if (!target_frame || !(target >= scope.begin && target < scope.end)) finalizers.push_back({image->base + scope.filter, {1, frame}});
-            }
         }
-        if (dispatch.stage == ExceptionStage::Unwind) { start_callbacks(state, memory, std::move(finalizers), Continuation::Return, 1); return std::nullopt; }
+        if (dispatch.stage == ExceptionStage::Unwind)return seh_finally_result(state,memory);
         return seh_filter_result(state, memory, 0);
     }
     arg.return_to(state, result); return std::nullopt;

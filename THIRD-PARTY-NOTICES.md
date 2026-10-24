@@ -12,6 +12,7 @@ AppleJuice 的[自訂授權](LICENSE.md)適用於著作權人有權提供的自�
 | Berkeley SoftFloat | [SoftFloat](x64kernel/share/AppleJuiceKernel/licenses/SoftFloat-LICENSE) |
 | OpenSSL | [OpenSSL](third_party/OPENSSL-LICENSE) |
 | ICU | [ICU](third_party/ICU-LICENSE) |
+| Microsoft ESE HSIAO ECC／XOR 校驗算法（MIT，移植為有界 C++20 讀取） | [ESE](third_party/ese-reference-LICENSE)；[固定來源](third_party/ese-reference-source.json) |
 | HLSLcc／vkd3d-shader | [HLSLcc](third_party/HLSLCC-LICENSE)、[vkd3d](third_party/VKD3D-LICENSE) |
 | SPIR-V headers／glslang／SPIRV-Cross | [Headers](third_party/SPIRV-HEADERS-LICENSE)、[glslang](third_party/GLSLANG-LICENSE)、[SPIRV-Cross](third_party/SPIRV-CROSS-LICENSE) |
 | LLVM Microsoft demangler | [LLVM](third_party/LLVM-DEMANGLER-LICENSE) |
