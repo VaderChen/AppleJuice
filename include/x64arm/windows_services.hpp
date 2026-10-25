@@ -1915,6 +1915,13 @@ private:
     std::optional<std::uint32_t> invoke_mmio(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> start_sort(GuestState& state, GuestMemory& memory, bool search = false);
     std::optional<std::uint32_t> advance_sort(GuestState& state, GuestMemory& memory, std::uint64_t comparison, bool reuse_callback = false);
+    struct DirectoryQueryState {
+        std::vector<DirectoryEntry> entries;
+        std::size_t cursor{};
+        bool loaded{};
+        std::optional<std::u16string> pattern;
+        bool operator==(const DirectoryQueryState&) const = default;
+    };
     struct FileHandle {
         std::string key;
         std::shared_ptr<const std::vector<std::uint8_t>> bytes;
@@ -1929,10 +1936,8 @@ private:
         std::shared_ptr<struct UsbFile> usb;
         std::uint32_t pipe_mode{};
         std::string path;
-        std::vector<DirectoryEntry> entries;
-        std::size_t directory_cursor{};
-        bool directory_loaded{};
-        std::optional<std::u16string> directory_pattern;
+        // 同一檔案物件的複製控制代碼共用列舉狀態，避免游標分岔與目錄快照複製。
+        std::shared_ptr<DirectoryQueryState> directory{std::make_shared<DirectoryQueryState>()};
         std::uint64_t completion_port{}, completion_key{};
         std::uint8_t completion_modes{};
         bool io_signaled{true};

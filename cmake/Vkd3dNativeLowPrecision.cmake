@@ -560,3 +560,46 @@ x64arm_vkd3d_patch("${vkd3d_shader_SOURCE_DIR}/libs/vkd3d-shader/dxil.c"
                 "x64arm: 16-bit raw/structured buffer stores are not implemented yet.");
         return;
     }]=])
+
+# 純量 ALLOCA（例如 -Od 或以位址傳遞的區域變數：alloca i32, i32 1）與全域純量相同，
+# 以 1 個元素的索引暫存器承接；直接 load／store 該指標時索引為 0。
+x64arm_vkd3d_patch("${vkd3d_shader_SOURCE_DIR}/libs/vkd3d-shader/dxil.c"
+  [=[    if (!sm6_type_is_array(type[0]) || !sm6_type_is_numeric(elem_type = type[0]->u.array.elem_type))
+    {
+        vkd3d_shader_parser_error(&sm6->p, VKD3D_SHADER_ERROR_DXIL_INVALID_OPERAND,
+                "Result type of an ALLOCA instruction is not a numeric array.");
+        return;
+    }]=]
+  [=[    if (sm6_type_is_numeric(type[0]))
+    {
+        elem_type = type[0];
+    }
+    else if (!sm6_type_is_array(type[0]) || !sm6_type_is_numeric(elem_type = type[0]->u.array.elem_type))
+    {
+        vkd3d_shader_parser_error(&sm6->p, VKD3D_SHADER_ERROR_DXIL_INVALID_OPERAND,
+                "Result type of an ALLOCA instruction is not a numeric array.");
+        return;
+    }]=])
+x64arm_vkd3d_patch("${vkd3d_shader_SOURCE_DIR}/libs/vkd3d-shader/dxil.c"
+  [=[    sm6_parser_declare_indexable_temp(sm6, elem_type, type[0]->u.array.count, alignment, true, 0, ins, dst);]=]
+  [=[    sm6_parser_declare_indexable_temp(sm6, elem_type, sm6_type_is_array(type[0]) ? type[0]->u.array.count : 1,
+            alignment, true, 0, ins, dst);]=])
+
+# 提升模型下 16 位元值一律以 32 位元運算，索引暫存器（區域／靜態陣列）與 I/O 簽章也須同樣提升；
+# 否則原生 16 位元旗標會留下 F16／FLOAT16 型別，SPIR-V 後端無法宣告（Unhandled data type "f16"）。
+# 簽章改走最小精度表示（32 位元＋precision 標記），輸入版面的 16 位元格式由頂點擷取轉換。
+x64arm_vkd3d_patch("${vkd3d_shader_SOURCE_DIR}/libs/vkd3d-shader/dxil.c"
+  [=[    enum vsir_data_type data_type = vsir_data_type_from_dxil(elem_type, 0, sm6);
+
+    if (!(sm6->program->global_flags & VKD3DSGF_ENABLE_NATIVE_LOW_PRECISION))
+    {]=]
+  [=[    enum vsir_data_type data_type = vsir_data_type_from_dxil(elem_type, 0, sm6);
+
+    /* x64arm: native 16-bit values are promoted to 32 bits by the front end. */
+    {]=])
+x64arm_vkd3d_patch("${vkd3d_shader_SOURCE_DIR}/libs/vkd3d-shader/dxil.c"
+  [=[    native_16bit = program->global_flags & VKD3DSGF_ENABLE_NATIVE_LOW_PRECISION;
+    for (i = 0; i < operand_count; ++i)]=]
+  [=[    /* x64arm: signatures follow the promoted 32-bit model, as for minimum precision. */
+    native_16bit = false;
+    for (i = 0; i < operand_count; ++i)]=])

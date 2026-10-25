@@ -36,7 +36,7 @@ std::uint32_t WindowsServices::set_file_information(GuestMemory& memory,std::uin
         const auto original=current.metadata;
         error=filesystem_.rename(current.key,destination,memory.load(GuestAddress{input},8)!=0,false,false,file.native.get());
         if(!error){const auto updated=filesystem_.final_path(*file.native,destination);if(updated.error)return updated.error;
-            for(auto& [other,entry]:files_){(void)other;if(entry.metadata.id==original.id && entry.metadata.device==original.device){entry.path=updated.key;entry.key=updated.key;for(auto& c:entry.key)if(c>='A' && c<='Z')c=static_cast<char>(c+32);entry.directory_loaded=false;}}
+            for(auto& [other,entry]:files_){(void)other;if(entry.metadata.id==original.id && entry.metadata.device==original.device){entry.path=updated.key;entry.key=updated.key;for(auto& c:entry.key)if(c>='A' && c<='Z')c=static_cast<char>(c+32);entry.directory->loaded=false;}}
         }
     }
     if(!error)file.metadata=file.native->information().metadata;return error;

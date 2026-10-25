@@ -25,7 +25,7 @@ std::uint64_t WindowsServices::trust_call(GuestState& state,GuestMemory& memory,
     const auto file_bytes=[&](std::uint64_t handle,std::uint64_t path){
         std::shared_ptr<HostFile> native;std::shared_ptr<const std::vector<std::uint8_t>> snapshot;
         if(handle && handle!=(x86_?UINT32_MAX:UINT64_MAX)){
-            const auto found=files_.find(handle);require(found!=files_.end(),6);require((found->second.access&0x80000001U)!=0,5);require(!found->second.directory_loaded && !(found->second.metadata.attributes&0x10) && !found->second.pipe && !found->second.serial && !found->second.hid,6);native=found->second.native;snapshot=found->second.bytes;
+            const auto found=files_.find(handle);require(found!=files_.end(),6);require((found->second.access&0x80000001U)!=0,5);require(!found->second.directory->loaded && !(found->second.metadata.attributes&0x10) && !found->second.pipe && !found->second.serial && !found->second.hid,6);native=found->second.native;snapshot=found->second.bytes;
         }else{require(path);if(!runtime_.network.external_io)throw HostCallFault("compare 不允許 WinTrust 檔案 I/O");const auto opened=filesystem_.open_reader(wide(path));require(!opened.error,opened.error);native=opened.file;}
         if(native){if(!runtime_.network.external_io)throw HostCallFault("compare 不允許 WinTrust 原生檔案 I/O");const auto info=native->information();require(!info.error,info.error);require(!(info.metadata.attributes&0x10),5);require(info.metadata.size<=256ULL*1024*1024,8);std::vector<std::uint8_t> bytes(static_cast<std::size_t>(info.metadata.size));const auto read=native->read(bytes,0);require(!read.error,read.error);require(read.bytes==bytes.size(),38);return bytes;}
         require(bool(snapshot),6);return *snapshot;

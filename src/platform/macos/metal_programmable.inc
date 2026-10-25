@@ -212,8 +212,7 @@ bool MetalGl::graphics_upload_buffer(const std::shared_ptr<GraphicsResource>& de
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_METAL_ASYNC_BUFFER_UPLOAD");return !value || std::string_view(value)=="1";}();
     if(!enabled || data.empty() || offset%4 || data.size()%4)return false;
     reap();
-    const auto identity=metal_resource_use_identity(destination);
-    if(!graphics_pending_.contains(identity) && std::none_of(flights_.begin(),flights_.end(),[&](const auto& flight){return flight.objects.contains(identity);}))return false;
+    if(!metal_batch_uses(graphics_pending_,destination) && std::none_of(flights_.begin(),flights_.end(),[&](const auto& flight){return metal_batch_uses(flight.objects,destination);}))return false;
     GraphicsResourceDesc descriptor;descriptor.width=static_cast<std::uint32_t>(data.size());
     std::shared_ptr<GraphicsResource> staging;
     try{staging=graphics_resource(descriptor);}catch(const std::bad_alloc&){return false;}
@@ -232,8 +231,7 @@ void MetalGl::graphics_write_buffer(const std::shared_ptr<GraphicsResource>& res
     static const bool rename=[] {const auto* value=std::getenv("X64ARM_METAL_CONSTANT_RENAME");return !value || std::string_view(value)=="1";}();
     if(rename && target.desc.bind==4 && !offset && data.size()==target.desc.width){
         reap();
-        const auto identity=metal_resource_use_identity(resource);
-        const bool used=graphics_pending_.contains(identity) || std::any_of(flights_.begin(),flights_.end(),[&](const auto& flight){return flight.objects.contains(identity);});
+        const bool used=metal_batch_uses(graphics_pending_,resource) || std::any_of(flights_.begin(),flights_.end(),[&](const auto& flight){return metal_batch_uses(flight.objects,resource);});
         if(used && graphics_replace_buffer(resource,data))return;
     }
     if(!graphics_upload_buffer(resource,data,offset)){
@@ -246,8 +244,7 @@ bool MetalGl::graphics_replace_buffer(const std::shared_ptr<GraphicsResource>& d
     // 沒有待提交或在飛命令使用此 backing 時，DISCARD 可以直接就地寫入：舊內容不會再被 GPU 讀到。
     if(!metal_backing_generation_enabled() && metal_discard_pool_enabled()){
         reap();
-        const auto identity=metal_resource_use_identity(destination);
-        const bool in_use=graphics_pending_.contains(identity) || std::any_of(flights_.begin(),flights_.end(),[&](const auto& flight){return flight.objects.contains(identity);});
+        const bool in_use=metal_batch_uses(graphics_pending_,destination) || std::any_of(flights_.begin(),flights_.end(),[&](const auto& flight){return metal_batch_uses(flight.objects,destination);});
         if(!in_use){
             std::memcpy(resource.buffer.contents,data.data(),resource.desc.width);
             resource.constant_bytes_valid=false;resource.remember_constant_bytes(data.first(resource.desc.width),0);
@@ -367,7 +364,9 @@ bool MetalGl::graphics_descriptor(const GraphicsView& v,std::uint32_t type,std::
             const std::uint64_t first=v.first,length=v.count?v.count:(r.buffer.length>first?r.buffer.length-first:0);
             value={r.buffer.gpuAddress+first,length};keep=v.resource;metal_make_resident(&r,r.buffer);return true;
         }
-        id<MTLTexture> texture=r.buffer?metal_buffer_texture(v):metal_shader_texture(v);
+        // raw／structured 緩衝沒有貼圖形式（現代著色器以 storage buffer 存取）：貼圖鏡像改放空描述元。
+        if(r.buffer && (r.desc.stride || (v.flags&1)))return false;
+        id<MTLTexture> texture=r.buffer?metal_buffer_texture(v,true):metal_shader_texture(v);
         if(!texture)return false;
         value[0]=texture.gpuResourceID._impl;
         // view 可能被資源的 view 快取淘汰；由描述元保留到被覆寫為止。
@@ -397,6 +396,35 @@ std::vector<std::uint8_t> MetalGl::graphics_read_completed(const GraphicsView& v
 }
 void MetalGl::graphics_copy(const GraphicsView& dst,const GraphicsView& src,std::array<std::uint32_t,3> origin,std::array<std::uint32_t,6> box){@autoreleasepool{
     auto& d=metal_resource(dst.resource);auto& s=metal_resource(src.resource);
+    // D3D12 允許位元大小相同的未壓縮格式與 BC 區塊互拷（未壓縮的每個 texel 對應一個 4×4 區塊，例如 GPU 壓縮後
+    // R32G32_UINT → BC4）。Metal 不能以 view 在兩者間轉換：經 GPU 暫存緩衝做兩次 blit，位元組原樣搬移。
+    if(d.texture && s.texture && (graphics_format_bc_family(s.desc.format)!=0)!=(graphics_format_bc_family(d.desc.format)!=0)){
+        const bool to_bc=graphics_format_bc_family(d.desc.format)!=0;const auto& bc=to_bc?d:s;const auto& plain=to_bc?s:d;
+        const auto block=graphics_format_pitch(bc.desc.format,4,4)[0],bpp=graphics_format_bytes(plain.desc.format);
+        if(block!=bpp || src.level>=s.desc.levels || dst.level>=d.desc.levels || src.slice>=s.desc.layers || dst.slice>=d.desc.layers || s.desc.samples!=1 || d.desc.samples!=1)
+            throw std::invalid_argument("未壓縮與 BC 格式複製的位元大小或子資源不相容");
+        const auto sw=std::max(1U,s.desc.width>>src.level),sh=std::max(1U,s.desc.height>>src.level),sz=std::max(1U,s.desc.depth>>src.level);
+        const auto dw=std::max(1U,d.desc.width>>dst.level),dh=std::max(1U,d.desc.height>>dst.level),dz=std::max(1U,d.desc.depth>>dst.level);
+        if(!box[3])box={0,0,0,sw,sh,sz};
+        if(box[0]>=box[3] || box[1]>=box[4] || box[2]>=box[5] || box[3]>sw || box[4]>sh || box[5]>sz)throw std::invalid_argument("未壓縮與 BC 格式複製的來源範圍不合法");
+        // 以區塊為單位的寬高：未壓縮端一個 texel＝一個區塊。
+        const auto blocks_x=to_bc?box[3]-box[0]:(box[3]-box[0]+3)/4,blocks_y=to_bc?box[4]-box[1]:(box[4]-box[1]+3)/4,depth=box[5]-box[2];
+        const auto row=std::uint64_t{blocks_x}*block,image=row*blocks_y;
+        if(std::uint64_t{origin[2]}+depth>dz)throw std::invalid_argument("未壓縮與 BC 格式複製的目的範圍不合法");
+        // 目的端尺寸：BC 端以像素計（邊緣不足 4 時裁到 mip 大小），未壓縮端以區塊數計。
+        const auto out_x=to_bc?std::min<std::uint64_t>(std::uint64_t{blocks_x}*4,dw>origin[0]?dw-origin[0]:0):blocks_x;
+        const auto out_y=to_bc?std::min<std::uint64_t>(std::uint64_t{blocks_y}*4,dh>origin[1]?dh-origin[1]:0):blocks_y;
+        if(!out_x || !out_y || (!to_bc && (std::uint64_t{origin[0]}+out_x>dw || std::uint64_t{origin[1]}+out_y>dh)))throw std::invalid_argument("未壓縮與 BC 格式複製的目的範圍不合法");
+        auto lease=reserve_gpu_memory(static_cast<std::size_t>(image*depth));
+        auto staging=[device_ newBufferWithLength:static_cast<NSUInteger>(image*depth) options:MTLResourceStorageModePrivate];if(!staging)throw std::bad_alloc{};
+        pending_leases_.push_back(std::move(lease));
+        begin_commands(true,"copy_bc_cast");auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};
+        [e copyFromTexture:s.texture sourceSlice:src.slice sourceLevel:src.level sourceOrigin:MTLOriginMake(box[0],box[1],box[2]) sourceSize:MTLSizeMake(box[3]-box[0],box[4]-box[1],depth)
+                  toBuffer:staging destinationOffset:0 destinationBytesPerRow:static_cast<NSUInteger>(row) destinationBytesPerImage:static_cast<NSUInteger>(image)];
+        [e copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:static_cast<NSUInteger>(row) sourceBytesPerImage:static_cast<NSUInteger>(image) sourceSize:MTLSizeMake(static_cast<NSUInteger>(out_x),static_cast<NSUInteger>(out_y),depth)
+                 toTexture:d.texture destinationSlice:dst.slice destinationLevel:dst.level destinationOrigin:MTLOriginMake(origin[0],origin[1],origin[2])];
+        e_scope.end();graphics_pending_.push_back(dst.resource);graphics_pending_.push_back(src.resource);return;
+    }
     if(graphics_format_bc_family(s.desc.format)){
         if(src.level>=s.desc.levels || dst.level>=d.desc.levels || src.slice>=s.desc.layers || dst.slice>=d.desc.layers ||
            graphics_format_bc_family(s.desc.format)!=graphics_format_bc_family(d.desc.format))throw std::invalid_argument("BC 複製的格式或子資源不相容");
@@ -461,10 +489,18 @@ void MetalGl::graphics_bind(id<MTLRenderCommandEncoder> render,id<MTLComputeComm
             const GraphicsDescriptorTable* table=nullptr;
             for(const auto& t:stage.tables)if(t.type==b.type && t.space==b.space && t.slot==b.slot){table=&t;break;}
             if(!table || !table->heap)throw std::invalid_argument("著色器描述元表缺少根簽章對應的範圍");
-            metal_commit_residency();auto& mirror=metal_resource(table->heap);graphics_pending_.push_back(table->heap);
+            if(!encoder_chain_fence_){encoder_chain_fence_=[device_ newFence];if(!encoder_chain_fence_)throw std::bad_alloc{};metal_encoder_chain=encoder_chain_fence_;}
+            metal_commit_residency();auto& mirror=metal_resource(table->heap);graphics_pending_.push_back(table->heap);graphics_pending_.tables=true;
             if(compute)[compute setBuffer:mirror.buffer offset:table->offset atIndex:b.native_slot];
             else if(vertex)[render setVertexBuffer:mirror.buffer offset:table->offset atIndex:b.native_slot];
             else [render setFragmentBuffer:mirror.buffer offset:table->offset atIndex:b.native_slot];
+            // 有界小表的項目已逐項解析：宣告使用，讓 Metal 依讀寫追蹤與前後 pass 的危害。
+            const MTLResourceUsage usage=b.type==7 || b.type==9?MTLResourceUsageRead|MTLResourceUsageWrite:MTLResourceUsageRead;
+            for(const auto& view:table->views){
+                if(!view.resource)continue;auto& native=metal_resource(view.resource);id<MTLResource> used=native.texture?(id<MTLResource>)native.texture:(id<MTLResource>)native.buffer;
+                if(!used)continue;graphics_pending_.push_back(view.resource);
+                if(compute)[compute useResource:used usage:usage];else [render useResource:used usage:usage stages:vertex?MTLRenderStageVertex:MTLRenderStageFragment];
+            }
             continue;
         }
         if(b.type==0){if(b.slot>=stage.constants.size())throw std::invalid_argument("常數緩衝區超出範圍");resource=stage.constants[b.slot];}
@@ -472,7 +508,7 @@ void MetalGl::graphics_bind(id<MTLRenderCommandEncoder> render,id<MTLComputeComm
         else {const bool uav=b.type==4 || b.type==5;if(b.slot>=(uav?stage.unordered.size():stage.resources.size()))throw std::invalid_argument("著色器資源超出範圍");v=uav?stage.unordered[b.slot]:stage.resources[b.slot];resource=v.resource;}
         if(b.type==2){if(compute)[compute setSamplerState:sampler atIndex:b.native_slot];else if(vertex)[render setVertexSamplerState:sampler atIndex:b.native_slot];else [render setFragmentSamplerState:sampler atIndex:b.native_slot];continue;}
         id<MTLBuffer> buffer=nil;id<MTLTexture> texture=nil;std::size_t offset=0;if(resource){auto& native=metal_resource(resource);buffer=native.buffer;texture=native.texture?metal_shader_texture(v):nil;offset=v.first;graphics_pending_.push_back(resource);}if(b.type==0 && resource)offset=stage.constant_offsets[b.slot];
-        if(b.type==1 || b.type==5){if(buffer)texture=metal_buffer_texture(v);if(compute)[compute setTexture:texture atIndex:b.native_slot];else if(vertex)[render setVertexTexture:texture atIndex:b.native_slot];else [render setFragmentTexture:texture atIndex:b.native_slot];}
+        if(b.type==1 || b.type==5){if(buffer)texture=metal_buffer_texture(v,views_slot==UINT32_MAX);if(compute)[compute setTexture:texture atIndex:b.native_slot];else if(vertex)[render setVertexTexture:texture atIndex:b.native_slot];else [render setFragmentTexture:texture atIndex:b.native_slot];}
         else {if(compute)[compute setBuffer:buffer offset:offset atIndex:b.native_slot];else if(vertex)[render setVertexBuffer:buffer offset:offset atIndex:b.native_slot];else [render setFragmentBuffer:buffer offset:offset atIndex:b.native_slot];if(b.counter_slot!=UINT32_MAX && resource){if(!v.counter)throw std::invalid_argument("著色器需要具有計數器的 UAV view");auto counter=metal_resource(v.counter).buffer;graphics_pending_.push_back(v.counter);if(compute)[compute setBuffer:counter offset:0 atIndex:b.counter_slot];else [render setFragmentBuffer:counter offset:0 atIndex:b.counter_slot];}}
     }
 }
@@ -683,7 +719,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
             for(std::size_t i=0;only_visibility && i<pass_key.size();++i)if(i!=39 && pass_key[i]!=open_render_key_[i])only_visibility=false;
             if(only_visibility)why="draw_visibility_change";
         }
-        begin_commands(true,why);enc=[commands_ renderCommandEncoderWithDescriptor:pass];if(!enc)throw std::runtime_error("Metal draw encoder 建立失敗");++render_encoders_;
+        begin_commands(true,why);enc=[commands_ renderCommandEncoderWithDescriptor:pass];if(!enc)throw std::runtime_error("Metal draw encoder 建立失敗");++render_encoders_;if(coalesce)metal_chain_wait(enc);
         if(coalesce){open_render_=enc;open_render_key_=std::move(pass_key);}}
     std::optional<MetalEncoderScope> enc_scope;if(!coalesce)enc_scope.emplace(enc);
     [enc setRenderPipelineState:pipeline];if(d.visibility)[enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:d.visibility_offset];else if(reused)[enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];[enc setDepthStencilState:cached_depth_state(depth)];[enc setStencilReferenceValue:d.stencil_reference];[enc setBlendColorRed:d.blend_factor[0] green:d.blend_factor[1] blue:d.blend_factor[2] alpha:d.blend_factor[3]];

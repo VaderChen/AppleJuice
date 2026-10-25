@@ -23,13 +23,27 @@ std::array<std::uint32_t,4> metal_buffer_view_info(const GraphicsView& view){
     if(count>d.width-view.first || view.first%stride || count%stride)throw std::invalid_argument("緩衝區 view 範圍不合法");
     return {view.first/stride,count/stride,stride,(view.flags&1)?count:count/stride};
 }
-id<MTLTexture> metal_buffer_texture(const GraphicsView& view){
+// ranged：現代（SM6／5.1）著色器沒有 x64arm_buffer_views，view 的起點與長度直接做進 texture；
+// 起點未對齊 Metal texture buffer 要求時退回整段 buffer（與 HLSLcc 路徑相同的 texture）。
+id<MTLTexture> metal_buffer_texture(const GraphicsView& view,bool ranged=false){
     auto& resource=metal_resource(view.resource);
     if(!resource.buffer || resource.desc.stride || (view.flags&1))throw std::invalid_argument("Typed buffer 與 view 類型不符");
-    (void)metal_buffer_view_info(view);
+    const auto info=metal_buffer_view_info(view);
     const bool rgb32=view.format>=5 && view.format<=8;const auto format=metal_format(rgb32?(view.format<=6?41:view.format==7?42:43):view.format);const auto stride=rgb32?4U:graphics_format_bytes(view.format);
     const auto alignment=[resource.buffer.device minimumTextureBufferAlignmentForPixelFormat:format];
     if(!alignment)throw std::invalid_argument("Metal 不支援此 typed buffer 格式");
+    if(ranged && !rgb32 && view.first && !(view.first%alignment) && info[1]){
+        const auto bytes=std::uint64_t{info[1]}*stride;const auto row=((bytes+alignment-1)/alignment)*alignment;
+        if(view.first+row<=resource.buffer.length){
+            MTLTextureUsage usage=MTLTextureUsageShaderRead;if(resource.desc.bind&0x80)usage|=MTLTextureUsageShaderWrite;
+            return resource.shader_view((__bridge const void*)resource.buffer,{3,static_cast<std::uint32_t>(format),view.first,info[1],static_cast<std::uint32_t>(row),0},[&]{
+                auto descriptor=[MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:format width:info[1] resourceOptions:MTLResourceStorageModeShared usage:usage];
+                auto texture=[resource.buffer newTextureWithDescriptor:descriptor offset:view.first bytesPerRow:row];
+                if(!texture)throw std::invalid_argument("Metal typed buffer view 建立失敗");
+                return texture;
+            });
+        }
+    }
     const auto row=((std::uint64_t{resource.desc.width}+alignment-1)/alignment)*alignment;
     if(row>resource.buffer.length)throw std::invalid_argument("Metal typed buffer 配置長度不足");
     MTLTextureUsage usage=MTLTextureUsageShaderRead;if(resource.desc.bind&0x80)usage|=MTLTextureUsageShaderWrite;

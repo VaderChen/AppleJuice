@@ -1172,6 +1172,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         for(unsigned i=0;i<11;++i)std::fprintf(stderr,"%s%x",i?",":"",static_cast<unsigned>(memory.load(GuestAddress{arg(1)+i*4},32)));
         std::fprintf(stderr," error=%s\n",bridge.last_error.c_str());
     }
+    // 診斷：X64ARM_TRACE_GRAPHICS_ERRORS 時列出所有回傳失敗 HRESULT 的 D3D11／DXGI 方法（D3DX11 已於上方列出）。
+    static const bool trace_graphics_errors=std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS")!=nullptr;
+    if(trace_graphics_errors && (result&0x80000000U) && !symbol.starts_with("D3DX11") && symbol!="CreateTexture2D")
+        std::fprintf(stderr,"[d3d11] %.*s HRESULT=%08x %s\n",static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned>(result),bridge.last_error.c_str());
     static const bool trace_dxgi_state=std::getenv("X64ARM_TRACE_DXGI_STATE")!=nullptr; // 每次 D3D11 呼叫都經過，不重複查環境變數。
     if(trace_dxgi_state && service.family=="internal-d3d11"){
         const bool present=symbol=="Present" || symbol=="Present1";

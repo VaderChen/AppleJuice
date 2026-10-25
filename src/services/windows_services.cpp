@@ -958,7 +958,7 @@ bool WindowsServices::same_state(const WindowsServices& other) const {
         const auto found = other.files_.find(handle);
         if(file.native || file.pipe || file.serial || file.hid || (found!=other.files_.end() && (found->second.native || found->second.pipe || found->second.serial || found->second.hid)))return false;
         if (found == other.files_.end() || file.key != found->second.key || file.object != found->second.object ||
-            file.path != found->second.path || file.directory_cursor != found->second.directory_cursor || file.directory_loaded != found->second.directory_loaded || file.entries != found->second.entries || file.completion_port != found->second.completion_port || file.completion_key != found->second.completion_key || file.completion_modes != found->second.completion_modes || file.io_signaled != found->second.io_signaled || file.sharing != found->second.sharing || file.metadata != found->second.metadata || file.access != found->second.access || file.mode != found->second.mode || *file.bytes != *found->second.bytes) return false;
+            file.path != found->second.path || *file.directory != *found->second.directory || file.completion_port != found->second.completion_port || file.completion_key != found->second.completion_key || file.completion_modes != found->second.completion_modes || file.io_signaled != found->second.io_signaled || file.sharing != found->second.sharing || file.metadata != found->second.metadata || file.access != found->second.access || file.mode != found->second.mode || *file.bytes != *found->second.bytes) return false;
     }
     return true;
 }

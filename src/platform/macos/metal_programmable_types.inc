@@ -45,7 +45,9 @@ public:
     auto end(){return objects_.end();}
     template<class Iterator> void insert(std::vector<std::shared_ptr<GraphicsObject>>::iterator,Iterator first,Iterator last){for(;first!=last;++first)push_back(*first);}
     bool contains(const GraphicsObject* object)const{if(indexed())return index_.contains(object);return std::any_of(objects_.begin(),objects_.end(),[&](const auto& value){return value.get()==object;});}
-    void clear(){objects_.clear();index_.clear();}
+    // 本批次綁定過 D3D12 描述元表：表內資源不在清單中，曾被表引用的資源一律視為可能使用中。
+    bool tables{};
+    void clear(){objects_.clear();index_.clear();tables=false;}
 };
 // 與固定管線共用 MetalGl；本檔只提供資源與可程式化管線的共用資料。
 struct MetalResource final:GraphicsResource {
@@ -99,6 +101,12 @@ void MetalPendingObjects::push_back(std::shared_ptr<GraphicsObject> object){
 const GraphicsObject* metal_resource_use_identity(const std::shared_ptr<GraphicsResource>& resource){
     if(metal_backing_generation_enabled())if(auto* native=dynamic_cast<MetalResource*>(resource.get());native && native->backing)return native->backing.get();
     return resource.get();
+}
+// 批次是否使用資源：明確綁定，或批次用過描述元表且資源曾被描述元表引用（residency set 成員）。
+bool metal_batch_uses(const MetalPendingObjects& objects,const std::shared_ptr<GraphicsResource>& resource){
+    if(objects.contains(metal_resource_use_identity(resource)))return true;
+    if(!objects.tables)return false;
+    const auto* native=dynamic_cast<const MetalResource*>(resource.get());return native && native->residency;
 }
 struct MetalVarying {
     std::string name,semantic;

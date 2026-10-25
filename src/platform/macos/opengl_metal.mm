@@ -164,9 +164,11 @@ class MetalGl final:public NativeOpenGlContext {
     std::shared_ptr<std::atomic<std::uint64_t>> gpu_busy_ns_=std::make_shared<std::atomic<std::uint64_t>>(0);
     // 診斷：記錄每次結束沿用中 render encoder 的原因（統計字串輸出），找出切斷合併的來源。
     std::map<std::string,std::uint64_t> encoder_breaks_;
-    void end_open_render(const char* why=nullptr){if(open_render_){++encoder_breaks_[why?why:"other"];[open_render_ endEncoding];open_render_=nil;open_render_key_.clear();}}
+    void end_open_render(const char* why=nullptr){if(open_render_){++encoder_breaks_[why?why:"other"];metal_chain_update(open_render_);[open_render_ endEncoding];open_render_=nil;open_render_key_.clear();}}
     void ensure_commands(bool gpu_work){if(!commands_){commands_=[queue_ commandBuffer];commands_gpu_work_=false;}if(!commands_)throw std::runtime_error("Metal command buffer 建立失敗");commands_gpu_work_|=gpu_work;}
-    void begin_commands(bool gpu_work=true,const char* why=nullptr){end_open_render(why);ensure_commands(gpu_work);}
+    // D3D12 描述元表使用後建立的 encoder 串接 fence（見 metal_command_encoder.hpp）；nil 表示未啟用。
+    id<MTLFence> encoder_chain_fence_;
+    void begin_commands(bool gpu_work=true,const char* why=nullptr){end_open_render(why);ensure_commands(gpu_work);metal_encoder_chain=encoder_chain_fence_;}
     void retire_front(bool wait){
         auto command=flights_.front().command;
         if(wait && command.status<MTLCommandBufferStatusCompleted){
@@ -200,8 +202,7 @@ class MetalGl final:public NativeOpenGlContext {
         if(wait)while(!flights_.empty())retire_front(true);
     }
     void wait_resource(const std::shared_ptr<GraphicsResource>& resource){
-        const auto identity=metal_resource_use_identity(resource);
-        const auto uses=[&](const auto& objects){return objects.contains(identity);};
+        const auto uses=[&](const auto& objects){return metal_batch_uses(objects,resource);};
         if(uses(graphics_pending_))flush(false,"wait_resource");else reap();
         std::size_t through=0;for(std::size_t n=0;n<flights_.size();++n)if(uses(flights_[n].objects))through=n+1;
         if(through)++resource_wait_count_;

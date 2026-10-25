@@ -66,22 +66,36 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
     // 每個 D3D 描述元給一個 SPIR-V binding；register space 0 的一般描述元對應 D3D11 的 t／s／u／b 暫存器槽。
     // 超過 Metal 離散綁定上限的大陣列與無界陣列（bindless）改為描述元表：SPIRV-Cross 以執行期陣列產生
     // device const void* 緩衝參數，執行時綁定描述元堆積鏡像與表起點偏移。
+    // 共用後端的離散 UAV 槽只有 u0–u7，Metal 函式參數最多 8 張 read_write 紋理；超出的 UAV 紋理同樣改走描述元表
+    // （D3D12 的 UAV 紋理必定來自描述元表；UAV 緩衝可能是根描述元，不走此路）。單一描述元以長度 2 宣告，讓 vkd3d 產生執行期陣列並以索引 0 存取；
+    // 這類綁定依暫存器由大到小排在最後，vkd3d 依序比對時其他暫存器會先命中自己的綁定。
     struct Descriptor {vkd3d_shader_descriptor_type type;unsigned register_index,count,space;bool buffer,table;};
-    std::vector<vkd3d_shader_resource_binding> bindings;std::map<unsigned,Descriptor> by_binding;
+    std::vector<vkd3d_shader_resource_binding> bindings,overflow;std::vector<Descriptor> overflow_descriptors;std::map<unsigned,Descriptor> by_binding;
+    unsigned read_write=0;
     for(unsigned i=0;i<scan.descriptors.descriptor_count;++i){
         const auto& d=scan.descriptors.descriptors[i];
         if(!d.count)throw std::invalid_argument("現代著色器描述元陣列長度為 0");
-        const bool table=d.count==~0U || d.count>8;
+        const bool buffer=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV || d.resource_type==VKD3D_SHADER_RESOURCE_BUFFER;
+        bool table=d.count==~0U || d.count>8,spilled=false;
+        if(!table && d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV && !buffer){
+            const bool reads=d.flags&(VKD3D_SHADER_DESCRIPTOR_INFO_FLAG_UAV_READ|VKD3D_SHADER_DESCRIPTOR_INFO_FLAG_UAV_ATOMICS);
+            if(d.register_index+d.count>8 || (reads && read_write+d.count>8))table=spilled=true;
+            else if(reads)read_write+=d.count;
+        }
         if(table && (d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV || d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER))
             throw std::invalid_argument("現代著色器尚不支援常數緩衝或取樣器的描述元表");
         if(!table && d.register_space)throw std::invalid_argument("現代著色器尚不支援非零 register space 的離散描述元");
         if(d.flags&VKD3D_SHADER_DESCRIPTOR_INFO_FLAG_UAV_COUNTER)throw std::invalid_argument("現代著色器尚不支援 UAV counter");
-        const bool buffer=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV || d.resource_type==VKD3D_SHADER_RESOURCE_BUFFER;
         vkd3d_shader_resource_binding binding{};binding.type=d.type;binding.register_space=d.register_space;binding.register_index=d.register_index;
-        binding.shader_visibility=VKD3D_SHADER_VISIBILITY_ALL;binding.binding.set=0;binding.binding.binding=static_cast<unsigned>(bindings.size());binding.binding.count=d.count;
+        binding.shader_visibility=VKD3D_SHADER_VISIBILITY_ALL;binding.binding.set=0;binding.binding.count=spilled?std::max(d.count,2U):d.count;
         binding.flags=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER?0U:buffer?VKD3D_SHADER_BINDING_FLAG_BUFFER:VKD3D_SHADER_BINDING_FLAG_IMAGE;
-        by_binding.emplace(binding.binding.binding,Descriptor{d.type,d.register_index,d.count,d.register_space,buffer,table});bindings.push_back(binding);
+        const Descriptor descriptor{d.type,d.register_index,d.count,d.register_space,buffer,table};
+        if(spilled){overflow.push_back(binding);overflow_descriptors.push_back(descriptor);continue;}
+        binding.binding.binding=static_cast<unsigned>(bindings.size());by_binding.emplace(binding.binding.binding,descriptor);bindings.push_back(binding);
     }
+    std::vector<std::size_t> order(overflow.size());for(std::size_t i=0;i<order.size();++i)order[i]=i;
+    std::sort(order.begin(),order.end(),[&](std::size_t a,std::size_t b){return overflow[a].register_index>overflow[b].register_index;});
+    for(const auto i:order){auto binding=overflow[i];binding.binding.binding=static_cast<unsigned>(bindings.size());by_binding.emplace(binding.binding.binding,overflow_descriptors[i]);bindings.push_back(binding);}
     // 描述元表（bindless）需要動態索引描述元陣列：開啟 EXT_descriptor_indexing，SPIRV-Cross 再以執行期陣列輸出。
     static constexpr vkd3d_shader_spirv_extension extensions[]{VKD3D_SHADER_SPIRV_EXTENSION_EXT_DESCRIPTOR_INDEXING};
     vkd3d_shader_spirv_target_info target{};target.type=VKD3D_SHADER_STRUCTURE_TYPE_SPIRV_TARGET_INFO;target.environment=VKD3D_SHADER_SPIRV_ENVIRONMENT_VULKAN_1_1;
@@ -95,11 +109,25 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
         std::ofstream out(std::filesystem::path(folder)/(std::to_string(hash)+".spv"),std::ios::binary);out.write(reinterpret_cast<const char*>(words.data()),static_cast<std::streamsize>(words.size()*4));}
     spirv_cross::CompilerMSL compiler(std::move(words));
     const auto model=stage==0?spv::ExecutionModelVertex:stage==1?spv::ExecutionModelFragment:spv::ExecutionModelGLCompute;
-    auto msl=compiler.get_msl_options();msl.platform=spirv_cross::CompilerMSL::Options::macOS;msl.set_msl_version(3,0);msl.pad_fragment_output_components=true;
+    auto msl=compiler.get_msl_options();msl.platform=spirv_cross::CompilerMSL::Options::macOS;msl.set_msl_version(3,1);msl.pad_fragment_output_components=true;
     // 描述元表的 storage buffer 項目帶長度（spvBufferDescriptor：位址、長度、補齊，共 16 位元組）。
+    // MSL 3.1：影像原子運算用原生紋理原子（UAV 紋理已帶 MTLTextureUsageShaderAtomic），不再產生會占用 buffer 槽的 _atomic 別名。
     // 無界描述元陣列要求 argument buffer tier 2（Apple Silicon 皆支援）。
+    // typed buffer（Buffer<T>／RWBuffer<T>）用原生 texture_buffer，與執行期的 MTLTextureTypeTextureBuffer 檢視一致；
+    // raw／structured 緩衝已由 vkd3d 改為 storage buffer（見 Vkd3dStorageBufferArrays.cmake）。
+    msl.texture_buffer_native=true;
     msl.runtime_array_rich_descriptor=true;msl.argument_buffers_tier=spirv_cross::CompilerMSL::Options::ArgumentBuffersTier::Tier2;compiler.set_msl_options(msl);
     GraphicsModernShader result;
+    // 離散 UAV 緩衝可能來自根描述元，不能改走描述元表；暫存器超出 u7 時改用本著色器未占用的 u0–u7 slot，
+    // 綁定保存原始暫存器，執行期依此放置 view。
+    std::array<bool,8> uav_used{};
+    for(const auto& [binding,d]:by_binding)if(d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV && !d.table)
+        for(unsigned j=0;j<d.count;++j)if(d.register_index+j<8)uav_used[d.register_index+j]=true;
+    const auto uav_slot=[&](unsigned reg)->std::pair<unsigned,unsigned>{
+        if(reg<8)return {reg,UINT32_MAX};
+        for(unsigned slot=0;slot<8;++slot)if(!uav_used[slot]){uav_used[slot]=true;return {slot,reg};}
+        throw std::invalid_argument("現代著色器的離散 UAV 超出 8 個槽位");
+    };
     // 依 SPIRV-Cross 反射的實際資源型別分配 Metal 索引，與宣告順序無關。
     unsigned next_buffer=0,next_texture=0,next_sampler=0;
     const auto assign=[&](const spirv_cross::SmallVector<spirv_cross::Resource>& resources,unsigned group){
@@ -112,7 +140,7 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
                 // 執行期陣列：SPIRV-Cross 以 [[buffer(n)]] 的 device const void* 傳入，n 取自該資源種類的索引。
                 const bool uav=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV;native=next_buffer++;
                 mapping.count=0;mapping.msl_buffer=mapping.msl_texture=mapping.msl_sampler=native;compiler.add_msl_resource_binding(mapping);
-                result.bindings.push_back({group==1?(uav?9U:8U):(uav?7U:6U),d.register_index,native,UINT32_MAX,d.space});
+                result.bindings.push_back({group==1?(uav?9U:8U):(uav?7U:6U),d.register_index,native,UINT32_MAX,d.space,d.count});
                 continue;
             }
             if(group==0){kind=0;native=next_buffer;next_buffer+=d.count;mapping.msl_buffer=native;}
@@ -120,7 +148,10 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
             else if(group==2){kind=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV?5:1;native=next_texture;next_texture+=d.count;mapping.msl_texture=native;}
             else {kind=2;native=next_sampler;next_sampler+=d.count;mapping.msl_sampler=native;}
             compiler.add_msl_resource_binding(mapping);
-            for(unsigned j=0;j<d.count;++j)result.bindings.push_back({kind,d.register_index+j,native+j,UINT32_MAX,0});
+            for(unsigned j=0;j<d.count;++j){
+                const auto [slot,source]=kind==4?uav_slot(d.register_index+j):std::pair<unsigned,unsigned>{d.register_index+j,UINT32_MAX};
+                result.bindings.push_back({kind,slot,native+j,UINT32_MAX,0,0,source});
+            }
         }
     };
     const auto resources=compiler.get_shader_resources();

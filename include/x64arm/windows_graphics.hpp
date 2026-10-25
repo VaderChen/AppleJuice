@@ -24,7 +24,9 @@ struct GraphicsStreamElement {std::string semantic;std::uint32_t index{},first{}
 struct GraphicsStreamStatistics {std::uint64_t written{},needed{};};
 // type：0 CBV、1 SRV 貼圖／typed buffer、2 取樣器、3 SRV 緩衝、4 UAV 緩衝、5 UAV 貼圖；
 // 6～9 為 D3D12 描述元表（bindless 大陣列）：6 SRV 貼圖、7 UAV 貼圖、8 SRV 緩衝、9 UAV 緩衝，以 (space, slot) 對應根簽章範圍。
-struct GraphicsBinding {std::uint32_t type{},slot{},native_slot{},counter_slot{UINT32_MAX},space{};};
+// count：描述元表宣告的描述元數（~0U 為無界；0 表示非描述元表）。
+// source：D3D12 離散 UAV 緩衝暫存器超出 u7 時改用未占用的 slot，這裡保存原始暫存器（UINT32_MAX 表示未重新對應）。
+struct GraphicsBinding {std::uint32_t type{},slot{},native_slot{},counter_slot{UINT32_MAX},space{},count{},source{UINT32_MAX};};
 struct GraphicsInput {std::string semantic;std::uint32_t index{},attribute{};};
 struct GraphicsLegacyShader {std::string source,entry;std::vector<GraphicsBinding> bindings;std::vector<GraphicsInput> inputs;};
 GraphicsLegacyShader graphics_legacy_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes);
@@ -53,8 +55,8 @@ struct GraphicsView {
     std::uint32_t dimension{}; // SRV 維度，保留 cube／cube array 的取樣形狀。
 };
 // D3D12 描述元表：heap 為描述元堆積的 GPU 鏡像（貼圖每項 8 位元組 MTLResourceID；緩衝每項位址＋長度共 16 位元組），
-// offset 為此表第一個描述元在鏡像中的位元組位置。
-struct GraphicsDescriptorTable {std::uint32_t type{},space{},slot{};std::shared_ptr<GraphicsResource> heap;std::uint64_t offset{};};
+// offset 為此表第一個描述元在鏡像中的位元組位置。views：有界小表逐項解析的資源，後端據此宣告使用以維持危害追蹤。
+struct GraphicsDescriptorTable {std::uint32_t type{},space{},slot{};std::shared_ptr<GraphicsResource> heap;std::uint64_t offset{};std::vector<GraphicsView> views;};
 struct GraphicsStage {
     std::shared_ptr<GraphicsShader> shader;
     // b14 保留給引擎的動態 linkage 資料；D3D11 公開綁定仍限 b0–b13。

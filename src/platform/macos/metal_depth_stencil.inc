@@ -54,17 +54,24 @@ id<MTLTexture> metal_shader_texture(const GraphicsView& view){
         case 8:type=MTLTextureType3D;break;case 9:type=MTLTextureTypeCube;break;case 10:type=MTLTextureTypeCubeArray;break;default:break;}
     auto pixel_format=metal_format(format);
     if(metal_depth_format(texture.pixelFormat))pixel_format=stencil?MTLPixelFormatX32_Stencil8:texture.pixelFormat;
-    if(view.level || view.levels!=resource.desc.levels || view.slice || view.slices!=resource.desc.layers || pixel_format!=texture.pixelFormat || stencil || rgb32 || type!=texture.textureType)
-    return resource.shader_view((__bridge const void*)texture,{2,static_cast<std::uint32_t>(pixel_format),static_cast<std::uint32_t>(type),(rgb32?1U:0U)|(stencil?2U:0U),view.level|(view.levels<<16),view.slice|(view.slices<<16)},[&]()->id<MTLTexture>{
+    // Metal view 的範圍須符合類型：3D 只能涵蓋單一 slice（整個體積；D3D 的 FirstWSlice／WSize 以整個體積表示），
+    // 2D／MSAA 為 1、Cube 為 6；0 表示其餘全部（D3D 的 -1／未指定）。
+    const bool volume=type==MTLTextureType3D || texture.textureType==MTLTextureType3D;
+    const std::uint32_t layers=std::max(1U,resource.desc.layers),slice=volume?0:std::min(view.slice,layers-1);
+    std::uint32_t slices=view.slices && view.slices<=layers-slice?view.slices:layers-slice;
+    if(volume || type==MTLTextureType2D || type==MTLTextureType2DMultisample)slices=1;else if(type==MTLTextureTypeCube)slices=6;
+    const std::uint32_t mips=std::max(1U,resource.desc.levels),level=std::min(view.level,mips-1),levels=view.levels && view.levels<=mips-level?view.levels:mips-level;
+    if(level || levels!=resource.desc.levels || slice || (!volume && slices!=resource.desc.layers) || pixel_format!=texture.pixelFormat || stencil || rgb32 || type!=texture.textureType)
+    return resource.shader_view((__bridge const void*)texture,{2,static_cast<std::uint32_t>(pixel_format),static_cast<std::uint32_t>(type),(rgb32?1U:0U)|(stencil?2U:0U),level|(levels<<16),slice|(slices<<16)},[&]()->id<MTLTexture>{
         id<MTLTexture> made=nil;
         if(rgb32){
             const auto swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleOne);
-            made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(view.level,view.levels) slices:NSMakeRange(view.slice,view.slices) swizzle:swizzle];
+            made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(level,levels) slices:NSMakeRange(slice,slices) swizzle:swizzle];
         }else if(stencil){
             // DXGI 的 stencil 位於 G 通道；Metal 的 X32_Stencil8 讀值在 R。
             const auto swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleZero,MTLTextureSwizzleRed,MTLTextureSwizzleZero,MTLTextureSwizzleOne);
-            made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(view.level,view.levels) slices:NSMakeRange(view.slice,view.slices) swizzle:swizzle];
-        }else made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(view.level,view.levels) slices:NSMakeRange(view.slice,view.slices)];
+            made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(level,levels) slices:NSMakeRange(slice,slices) swizzle:swizzle];
+        }else made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(level,levels) slices:NSMakeRange(slice,slices)];
         if(!made)throw std::invalid_argument("Metal 紋理 view 格式或範圍不合法");
         return made;
     });

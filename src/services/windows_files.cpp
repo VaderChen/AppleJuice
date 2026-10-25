@@ -482,10 +482,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
             auto& file=found->second;const auto capacity=u32(6),kind=u32(7);const auto output=arg(5);
             const unsigned fixed=kind==1?64U:kind==2?68U:kind==3?94U:kind==12?12U:kind==37?104U:kind==38?80U:kind==60?88U:kind==63?114U:0U;
             const auto flags=extended?u32(8):0U;
-            const bool stateless=(flags&0x10U)!=0,first=stateless || !file.directory_pattern.has_value();
+            const bool stateless=(flags&0x10U)!=0,first=stateless || !file.directory->pattern.has_value();
             const bool restart=extended?(flags&0x11U)!=0:arg(10)!=0;
             const bool single=extended?(flags&2U)!=0:arg(8)!=0;
-            auto pattern=file.directory_pattern.value_or(u"*");
+            auto pattern=file.directory->pattern.value_or(u"*");
             if(!(file.metadata.attributes&0x10))status=0xc0000103;
             else if(!(file.access&(0x80000000U|1U)))status=0xc0000022;
             // INDEX_SPECIFIED 只能隨自建 IRP 傳入；此使用者模式入口沒有索引參數。
@@ -501,14 +501,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
                         if((count&1) || count>maximum)status=0xc000000d;
                         else {pattern.clear();for(std::uint64_t i=0;i<count;i+=2)pattern+=static_cast<char16_t>(memory.load(GuestAddress{pointer+i},16));}
                     }
-                    if(!status && !stateless)file.directory_pattern=pattern;
+                    if(!status && !stateless)file.directory->pattern=pattern;
                 }
-                if(!status && !file.directory_loaded){auto entries=filesystem_.list(file.path);status=nt_error(entries.error);if(!status){file.entries=std::move(entries.entries);file.directory_loaded=true;}}
+                // 無游標模式不保留另一份快照；重新掃描則刷新既有列舉狀態。
+                std::vector<DirectoryEntry> temporary_entries;
+                if(!status && (stateless || restart || !file.directory->loaded)){
+                    auto entries=filesystem_.list(file.path);status=nt_error(entries.error);
+                    if(!status){
+                        if(stateless)temporary_entries=std::move(entries.entries);
+                        else {file.directory->entries=std::move(entries.entries);file.directory->loaded=true;}
+                    }
+                }
                 if(!status){
-                    auto cursor=(first || restart)?0:file.directory_cursor;std::vector<std::uint8_t> bytes;std::size_t previous=0;
+                    const auto& entries=stateless?temporary_entries:file.directory->entries;
+                    auto cursor=(first || restart)?0:file.directory->cursor;std::vector<std::uint8_t> bytes;std::size_t previous=0;
                     const auto put=[&](std::size_t at,std::uint64_t value,unsigned count){for(unsigned i=0;i<count;++i)bytes.at(at+i)=static_cast<std::uint8_t>(value>>(i*8));};
-                    while(cursor<file.entries.size()){
-                        const auto& entry=file.entries[cursor];if(!find_matches(pattern,utf8_to_utf16(entry.name),false)){++cursor;continue;}
+                    while(cursor<entries.size()){
+                        const auto& entry=entries[cursor];if(!find_matches(pattern,utf8_to_utf16(entry.name),false)){++cursor;continue;}
                         auto name=utf16_bytes(utf8_to_utf16(entry.name));name.resize(name.size()-2);const auto length=fixed+name.size(),offset=(bytes.size()+7)&~std::size_t{7};
                         const bool overflow=offset>capacity || length>capacity-offset;
                         if(overflow && (!bytes.empty() || !first))break;
@@ -520,16 +529,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
                         std::copy_n(name.begin(),std::min(name.size(),bytes.size()-offset-fixed),bytes.begin()+static_cast<std::ptrdiff_t>(offset+fixed));
                         if(overflow){status=0x80000005;break;}++cursor;if(single)break;
                     }
-                    if(bytes.empty() && cursor==file.entries.size())status=first?0xc000000f:0x80000006;
+                    if(bytes.empty() && cursor==entries.size())status=first?0xc000000f:0x80000006;
                     if(!bytes.empty()){memory.write(GuestAddress{output},bytes);transferred=bytes.size();}
-                    if(!stateless)file.directory_cursor=cursor;
+                    if(!stateless)file.directory->cursor=cursor;
                 }
             }
         }
         if(directory && (status==0 || status==0x80000005U || status==0x80000006U || status==0xc000000fU)){
             PendingFileIo completion;completion.handle=arg(0);completion.thread=threads_.current;
             completion.event=arg(1);completion.routine=arg(2);completion.native_context=arg(3);completion.native_iosb=iosb;
-            completion.result.bytes=transferred;completion.result.error=status==0?0U:status==0x80000005U?234U:status==0x80000006U?18U:2U;
+            completion.result.bytes=static_cast<std::uint32_t>(transferred);completion.result.error=status==0?0U:status==0x80000005U?234U:status==0x80000006U?18U:2U;
             complete_file_io(memory,completion,status);
         }else {memory.store(GuestAddress{iosb},bits,status);memory.store(GuestAddress{iosb+width},bits,transferred);}
         threads_.items.at(threads_.current).last_native_status=status;
@@ -853,18 +862,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
             auto& file=found->second;
             if (!(file.metadata.attributes&0x10)) fail(87);
             else {
-                if (!file.directory_loaded) {
-                    const auto entries=filesystem_.list(file.path);
-                    if (entries.error) {fail(entries.error);arg.return_to(state,result);return std::nullopt;}
-                    file.entries=entries.entries;file.directory_loaded=true;
-                }
                 const bool restart=kind==11 || kind==15,both=kind==10 || kind==11;
-                auto cursor=restart?0:file.directory_cursor;std::vector<std::uint8_t> bytes;
+                if (restart || !file.directory->loaded) {
+                    auto entries=filesystem_.list(file.path);
+                    if (entries.error) {fail(entries.error);arg.return_to(state,result);return std::nullopt;}
+                    file.directory->entries=std::move(entries.entries);file.directory->loaded=true;
+                }
+                auto cursor=restart?0:file.directory->cursor;std::vector<std::uint8_t> bytes;
                 const unsigned fixed=both?104U:68U;
                 std::size_t previous=0;
                 const auto put=[&](std::size_t at,std::uint64_t value,unsigned width) {for (unsigned i=0;i<width;++i) bytes.at(at+i)=static_cast<std::uint8_t>(value>>(i*8));};
-                while (cursor<file.entries.size()) {
-                    const auto& entry=file.entries[cursor];auto name=utf16_bytes(utf8_to_utf16(entry.name));name.resize(name.size()-2);const auto extent=(fixed+name.size()+7)&~std::size_t{7};
+                while (cursor<file.directory->entries.size()) {
+                    const auto& entry=file.directory->entries[cursor];auto name=utf16_bytes(utf8_to_utf16(entry.name));name.resize(name.size()-2);const auto extent=(fixed+name.size()+7)&~std::size_t{7};
                     if (extent>capacity-bytes.size()) break;
                     const auto offset=bytes.size();bytes.resize(offset+extent);
                     if (offset) put(previous,offset-previous,4);previous=offset;const auto& info=entry.metadata;
@@ -872,8 +881,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
                     put(offset+40,info.size,8);put(offset+48,info.allocation_size,8);put(offset+56,info.attributes,4);put(offset+60,name.size(),4);
                     if (both) put(offset+96,info.id,8);std::copy(name.begin(),name.end(),bytes.begin()+static_cast<std::ptrdiff_t>(offset+fixed));++cursor;
                 }
-                if (bytes.empty()) fail(cursor==file.entries.size()?18:234);
-                else {memory.write(GuestAddress{output},bytes);file.directory_cursor=cursor;process_io::record(process_io::Kind::Other,bytes.size());result=1;}
+                if (bytes.empty()) fail(cursor==file.directory->entries.size()?18:234);
+                else {memory.write(GuestAddress{output},bytes);file.directory->cursor=cursor;process_io::record(process_io::Kind::Other,bytes.size());result=1;}
             }
         } else {
             const auto& info=queried.metadata;const unsigned extent=kind==0?40U:kind==1 || kind==18?24U:kind==9?8U:0;

@@ -17,6 +17,11 @@ x64arm_hlslcc_patch(ShaderInfo.cpp
   "    const ResourceBinding* psBindings = &psResourceBindings[0];"
   "    const ResourceBinding* psBindings = psResourceBindings.data();")
 # RDEF 省略時 MOV 以原始 uint 位元搬移；浮點來源修飾仍須操作 sign bit，不能做整數負值運算。
+# 後續整數來源修補會更新此區塊；重設 CMake 時以保留的宣告辨識已套用版本。
+file(READ "${hlslcc_SOURCE_DIR}/src/toMetalOperand.cpp" X64ARM_OPERAND_REFLECTION_SOURCE)
+string(FIND "${X64ARM_OPERAND_REFLECTION_SOURCE}"
+  "const auto rawType = TypeFlagsToSVTType(ui32TOFlag);" X64ARM_OPERAND_REFLECTION_APPLIED)
+if(X64ARM_OPERAND_REFLECTION_APPLIED EQUAL -1)
 x64arm_hlslcc_patch(toMetalOperand.cpp
   [=[std::string ToMetal::TranslateOperand(const Operand* psOperand, uint32_t ui32TOFlag, uint32_t ui32ComponentMask)
 {
@@ -39,6 +44,9 @@ x64arm_hlslcc_patch(toMetalOperand.cpp
         return value;
     }
     std::ostringstream oss;]=])
+endif()
+unset(X64ARM_OPERAND_REFLECTION_SOURCE)
+unset(X64ARM_OPERAND_REFLECTION_APPLIED)
 # 常數緩衝來源的負號依指令型別解讀：整數指令（iadd、ishl、ult、itof…）的 neg 是二補數取負，
 # 只有無型別搬移（mov／movc）與浮點指令才翻轉 sign bit。翻轉 sign bit 用在整數上會得到 x+2^31，
 # 例如 Niagara 產生間接參數的 CS 以 ThreadID - NumArgGenTasks 定位清零任務，錯成天文數字而永不清零計數。

@@ -39,7 +39,7 @@ void checksum(Bytes& bytes,const Image& image){
 }
 std::uint32_t WindowsServices::image_certificate_call(GuestMemory& memory,const WindowsCall& arg,std::string_view symbol){
     try {
-        const auto found=files_.find(arg(0));require(found!=files_.end(),6);auto& file=found->second;require(!file.directory_loaded && !(file.metadata.attributes&0x10) && !file.pipe && !file.serial && !file.hid,6);
+        const auto found=files_.find(arg(0));require(found!=files_.end(),6);auto& file=found->second;require(!file.directory->loaded && !(file.metadata.attributes&0x10) && !file.pipe && !file.serial && !file.hid,6);
         const bool writing=symbol=="ImageAddCertificate" || symbol=="ImageRemoveCertificate";require((file.access&0x80000001U)!=0,5);if(writing)require(file.native && (file.access&0x40000002U)!=0 && filesystem_.writable(),5);
         Bytes original;if(file.native){if(!runtime_.network.external_io)throw HostCallFault("compare 不允許原生映像檔 I/O");const auto info=file.native->information();require(!info.error,info.error);require(info.metadata.size<=256ULL*1024*1024,8);original.resize(static_cast<std::size_t>(info.metadata.size));const auto io=file.native->read(original,0);require(!io.error,io.error);require(io.bytes==original.size(),38);}else{require(bool(file.bytes),6);original=*file.bytes;}
         const auto image=parse(original);const auto count=static_cast<std::uint32_t>(image.certificates.size());
