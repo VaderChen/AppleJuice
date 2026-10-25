@@ -114,6 +114,8 @@ public:
     virtual std::shared_ptr<GraphicsResource> graphics_resource(const GraphicsResourceDesc&){throw std::runtime_error("後端缺少可程式化資源");}
     virtual bool graphics_samples_supported(std::uint32_t,std::uint32_t){return false;}
     virtual bool graphics_vertex_format_supported(std::uint32_t){return false;}
+    // 呼叫端之後會修改物件（例如加上串流輸出宣告）時使用：後端可依內容共用編譯結果，但回傳私有物件。
+    virtual std::shared_ptr<GraphicsShader> graphics_shader_private(std::uint32_t stage,std::span<const std::uint8_t> bytes){return graphics_shader(stage,bytes);}
     virtual std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t,std::span<const std::uint8_t>){throw std::runtime_error("後端缺少 DXBC 著色器");}
     // 由相容層自行產生的 MSL compute 核心（例如 DirectML 運算子）；bindings 的 slot 對應 GraphicsStage 陣列。
     virtual std::shared_ptr<GraphicsShader> graphics_compute_source(const GraphicsModernShader&){throw std::runtime_error("後端缺少 MSL compute 核心");}

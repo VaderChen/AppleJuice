@@ -118,6 +118,8 @@ struct MetalPendingLibrary {
     std::mutex mutex;std::condition_variable ready;bool done{};
     id<MTLLibrary> library;std::string error;NSString* entry;
 };
+// 診斷：X64ARM_METAL_LABELS=1 時以著色器內容雜湊標記 encoder（Metal System Trace 可依標籤彙總 GPU 時間）。
+inline bool metal_labels() noexcept {static const bool enabled=std::getenv("X64ARM_METAL_LABELS")!=nullptr;return enabled;}
 struct MetalShader final:GraphicsShader {
     std::vector<std::uint8_t> bytecode;
     std::shared_ptr<MetalPendingLibrary> pending;
@@ -126,6 +128,7 @@ struct MetalShader final:GraphicsShader {
     std::map<unsigned,id<MTLFunction>> alpha_functions;
     std::string source,geometry_original;
     std::uint64_t serial{};
+    std::uint64_t content_key{}; // 著色器位元組內容雜湊（快取鍵）；X64ARM_METAL_LABELS=1 時作為 encoder 標籤。
     bool writes_depth{};
     bool non_point_checked{};
     std::vector<MetalVarying> input_varyings,output_varyings;

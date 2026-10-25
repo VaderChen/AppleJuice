@@ -145,6 +145,17 @@ bool WindowsServices::route_gui_send(GuestState& state,GuestMemory& memory,const
     schedule(state,memory);return true;
 }
 bool WindowsServices::dispatch_gui_send(GuestState& state,GuestMemory& memory,std::uint64_t modal,bool callbacks,bool wait_message) {
+    // 協調者本地服務（PeekMessage 不停其他 worker）不能啟動客體回呼；下方各迴圈都先把事件移出佇列才啟動回呼，
+    // 拒絕必須在任何移除之前，交回完整路徑時事件仍在原佇列。
+    if(local_plain_service_){
+        const auto current=threads_.current;
+        const bool pending=(callbacks && std::any_of(gui_.send_callbacks.begin(),gui_.send_callbacks.end(),[&](const auto& item){return item.thread==current;})) ||
+            std::any_of(gui_.event_queue.begin(),gui_.event_queue.end(),[&](const auto& item){
+                const auto hook=gui_.event_hooks.find(item.hook);return hook==gui_.event_hooks.end() || hook->second.owner==current;}) ||
+            std::any_of(gui_.sent_messages.begin(),gui_.sent_messages.end(),[&](const auto& item){
+                return item.second.receiver==current && !item.second.active && !item.second.done;});
+        if(pending)throw LocalServiceRefused{};
+    }
     if(const auto thread=threads_.items.find(threads_.current);thread!=threads_.items.end())thread->second.gui_pump_time=runtime_.clock_ticks;
     if(callbacks)for(auto it=gui_.send_callbacks.begin();it!=gui_.send_callbacks.end();){
         const auto thread=threads_.items.find(it->thread);

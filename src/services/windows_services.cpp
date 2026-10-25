@@ -1,4 +1,5 @@
 #include "x64arm/startup_profile.hpp"
+#include "parallel_mapping_lock.hpp"
 #include "x64arm/resource_usage.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_unwind.hpp"
@@ -38,7 +39,7 @@
 #include <unordered_map>
 
 #include <shared_mutex>
-namespace x64arm::detail {std::shared_mutex& parallel_mapping_mutex() noexcept;}
+namespace x64arm::detail {ParallelMappingLock& parallel_mapping_mutex() noexcept;}
 namespace x64arm {
 WindowsServices::WindowsServices() {
     startup_profile::Scope phase("services","construct_body",true);
@@ -1330,6 +1331,23 @@ struct CoordinatedTrace {
 // 及呼叫執行緒的 LastError／errno。其他 worker 繼續執行時由協調者以獨占映射鎖完成；provider 要啟動客體回呼
 // （無效參數處理常式等）、終止程序或丟出任何例外時，恢復 GuestState 交回全停路徑重做。家族成員的輸出只由輸入
 // 決定，拒絕後重做的部分寫入與完整路徑相同。X64ARM_LOCAL_PLAIN_SERVICE=0 關閉。
+// D3D12 協調者本地方法：命令清單錄製（List.*，不含 COM 生命週期）、描述元建立與複製、取值型方法。
+bool d3d12_local_service(std::string_view symbol) noexcept {
+    const auto method=[&](std::string_view prefix){return symbol.starts_with(prefix);};
+    if(symbol.ends_with(".QueryInterface") || symbol.ends_with(".AddRef") || symbol.ends_with(".Release") || symbol.find("PrivateData")!=std::string_view::npos)return false;
+    if(method("List."))return true;
+    static constexpr std::string_view names[]{
+        "Device.CopyDescriptors","Device.CopyDescriptorsSimple","Device.CreateConstantBufferView","Device.CreateShaderResourceView",
+        "Device.CreateUnorderedAccessView","Device.CreateRenderTargetView","Device.CreateDepthStencilView","Device.CreateSampler",
+        "Device.GetDescriptorHandleIncrementSize","Device.GetResourceAllocationInfo","Device.GetCopyableFootprints","Device.CheckFeatureSupport",
+        "Device.GetNodeCount","DescriptorHeap.GetCPUDescriptorHandleForHeapStart","DescriptorHeap.GetGPUDescriptorHandleForHeapStart",
+        "DescriptorHeap.GetDesc","Resource.GetGPUVirtualAddress","Resource.GetDesc","Fence.GetCompletedValue"};
+    return std::find(std::begin(names),std::end(names),symbol)!=std::end(names);
+}
+bool local_heap_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_LOCAL_HEAP");return !value || std::string_view(value)!="0";}();
+    return enabled && (symbol=="HeapAlloc" || symbol=="HeapFree" || symbol=="HeapSize" || symbol=="HeapReAlloc");
+}
 bool plain_local_service(const WindowsServiceDescriptor& descriptor) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_LOCAL_PLAIN_SERVICE");return !value || std::string_view(value)!="0";}();
     if(!enabled)return false;
@@ -1344,15 +1362,27 @@ bool plain_local_service(const WindowsServiceDescriptor& descriptor) noexcept {
         return symbol.starts_with("__stdio_common_vs") || std::find(std::begin(names),std::end(names),symbol)!=std::end(names);
     }
     if(family=="user32.dll")
-        return symbol=="GetCursorPos" || symbol=="IsIconic" || symbol=="IsZoomed" || symbol=="IsWindow" || symbol=="IsWindowEnabled";
+        // PeekMessage：協調者即宿主主執行緒，可在其他 worker 執行時抽取宿主事件、比對佇列。會啟動回呼的情況
+        // （送出訊息、事件 hook、WM_QUEUESYNC 的 CBT hook）在移除任何事件前拒絕（見 dispatch_gui_send 與下方檢查）。
+        // 電馭判客強制平行 60 秒有 57 萬次 PeekMessageW 原本每次都全停。X64ARM_LOCAL_PEEK_MESSAGE=0 關閉。
+        return symbol=="GetCursorPos" || symbol=="IsIconic" || symbol=="IsZoomed" || symbol=="IsWindow" || symbol=="IsWindowEnabled" ||
+            ((symbol=="PeekMessageW" || symbol=="PeekMessageA") && [] {
+                const auto* value=std::getenv("X64ARM_LOCAL_PEEK_MESSAGE");return !value || std::string_view(value)!="0";}());
     if(family=="gdi32.dll")return symbol=="PtInRegion" || symbol=="RectInRegion" || symbol=="GetRgnBox";
-    if(family=="kernel32.dll")
+    if(family=="kernel32.dll"){
         // SList 的 API 全部經協調者，在獨占映射鎖下序列化；臨界區段初始化只改鎖表與客體結構，Leave 有等待者時
         // provider 自行以 Critical 範圍喚醒（不排程）。Enter 競爭會阻塞，不在此家族。
+        // Heap*：provider 的客體級距配置以客體狀態頁的鎖（有界自旋）與 worker 上的客體 malloc 常式共存，宿主表格只有
+        // 協調者改；增減映射與本地 VirtualAlloc 相同由核心在服務後更新原生 MMU。電馭判客強制平行 60 秒各約 6 萬次
+        // 原本每次全停。X64ARM_LOCAL_HEAP=0 關閉。
         return symbol=="InterlockedFlushSList" || symbol=="InterlockedPushEntrySList" || symbol=="InterlockedPopEntrySList" ||
             symbol=="QueryDepthSList" || symbol=="InitializeSListHead" || symbol=="InitializeCriticalSection" ||
             symbol=="InitializeCriticalSectionAndSpinCount" || symbol=="InitializeCriticalSectionEx" ||
-            symbol=="SetCriticalSectionSpinCount" || symbol=="LeaveCriticalSection";
+            symbol=="SetCriticalSectionSpinCount" || symbol=="LeaveCriticalSection" ||
+            local_heap_service(symbol);
+    }
+    // MSVCP 的純讀取時鐘：只讀宿主單調時鐘與固定頻率。
+    if(family=="msvcp140.dll")return symbol=="_Query_perf_counter" || symbol=="_Query_perf_frequency" || symbol=="_Xtime_get_ticks";
     // WASAPI 緩衝方法：只改串流狀態與 PCM 佇列；ReleaseBuffer 可能觸發串流事件，完成後由呼叫端本地喚醒等待者。
     if(family=="internal-wasapi")
         return symbol=="A_GetCurrentPadding" || symbol=="A_GetBufferSize" || symbol=="R_GetBuffer" || symbol=="R_ReleaseBuffer";
@@ -1360,6 +1390,18 @@ bool plain_local_service(const WindowsServiceDescriptor& descriptor) noexcept {
 }
 }
 bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory& memory) {
+    static const bool debug_park=std::getenv("X64ARM_DEBUG_PARK")!=nullptr; // 暫時診斷：偵測執行目前執行緒的過期副本
+    if(debug_park){
+        const auto key=resident_context_key(state);const auto found=threads_.items.find(key);
+        if(found!=threads_.items.end() && &found->second.context==&state && key==threads_.current)
+            std::fprintf(stderr,"[debug_park] 協調服務在目前執行緒的執行緒表副本上執行 key=%llu rip=0x%llx rsp=0x%llx parked=%d status=%d\n",
+                static_cast<unsigned long long>(key),static_cast<unsigned long long>(state.rip.value),static_cast<unsigned long long>(state.reg(Gpr::Rsp)),
+                resident_current_parked_?1:0,static_cast<int>(found->second.status));
+        if(found!=threads_.items.end() && found->second.status!=ThreadStatus::Runnable)
+            std::fprintf(stderr,"[debug_park] 協調服務的客體不是 runnable key=%llu rip=0x%llx status=%d current=%llu\n",
+                static_cast<unsigned long long>(key),static_cast<unsigned long long>(state.rip.value),static_cast<int>(found->second.status),
+                static_cast<unsigned long long>(threads_.current));
+    }
     static const bool trace=std::getenv("X64ARM_TRACE_COORDINATED")!=nullptr;
     struct Trace {
         const WindowsServices& self;const GuestState& state;std::uint64_t rip;
@@ -1384,6 +1426,50 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         if(result)throw std::logic_error("CFG 分派服務意外終止客體");
         refresh_guard_table(memory);
         return true;
+    }
+    // 協調者本地一般服務的共用流程：呼叫者暫為目前執行緒（LastError／errno 依其 TEB 與格位），本地模式下 provider
+    // 要啟動回呼時改丟 LocalServiceRefused；拒絕、例外或終止程序一律還原 GuestState 交回完整路徑重做。
+    const auto run_plain_local=[&](std::string_view symbol,std::string_view family,auto&& invoke)->bool{
+        const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
+        if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
+        // loader lock 的釋放會通知等待載入的執行緒，留在完整路徑。
+        if(symbol.find("CriticalSection")!=std::string_view::npos && state.reg(Gpr::Rcx)==peb_base_.value+0x800)return false;
+        // PeekMessage 取出 WM_QUEUESYNC 後才執行 CBT hook，已有 CBT hook 時留在完整路徑。
+        if(symbol.starts_with("PeekMessage") &&
+           std::any_of(gui_.hooks.begin(),gui_.hooks.end(),[](const auto& item){return item.second.type==5;}))return false;
+        const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
+        const GuestAddress error_slot{state.gs_base+0x68};
+        const auto entry_error=static_cast<std::uint32_t>(memory.load(error_slot,32));
+        const auto previous=threads_.current;const auto saved_error=last_error_;const auto saved_errno=runtime_.errno_cell;
+        const auto entry_state=state;bool completed=false;
+        // 與 D3D11 本地路徑相同：完成時呼叫者若是目前執行緒，保留服務更新後的 last_error_；拒絕時全部還原。
+        struct Restore {
+            WindowsServices& self;std::uint64_t previous,current;std::uint32_t error;std::uint64_t errno_cell;const bool& completed;
+            ~Restore(){self.local_plain_service_=false;self.threads_.current=previous;self.runtime_.errno_cell=errno_cell;
+                if(!completed || current!=previous)self.last_error_=error;}
+        } restore{*this,previous,key,saved_error,saved_errno,completed};
+        threads_.current=key;last_error_=entry_error;
+        if(thread->second.errno_cell)runtime_.errno_cell=thread->second.errno_cell;
+        local_plain_service_=true;
+        entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,symbol);
+        std::optional<std::uint32_t> result;
+        try{result=invoke();}catch(...){state=entry_state;return false;}
+        if(result){state=entry_state;return false;} // 終止程序的錯誤路徑由完整入口重做並回報。
+        local_plain_service_=false;
+        if(last_error_!=entry_error)memory.store(error_slot,32,last_error_);
+        completed=true;
+        // WASAPI ReleaseBuffer 可能已觸發串流事件：在同一獨占鎖下喚醒物件等待者（不切換客體）。
+        if(family=="internal-wasapi"){
+            threads_.current=previous;runtime_.errno_cell=saved_errno;
+            (void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
+        }
+        ++state.tsc;state.rep_compare={};
+        return true;
+    };
+    // 固定 kernel32 服務表的 Heap*（由 invoke_service 依入口分派）：與延伸描述表的一般本地服務共用流程。
+    if(!x86_ && state.rip.value>=stub_base_.value && state.rip.value<stub_base_.value+services.size()*16 && !((state.rip.value-stub_base_.value)&15U)){
+        const auto symbol=services[(state.rip.value-stub_base_.value)/16].name;
+        if(local_heap_service(symbol))return run_plain_local(symbol,"kernel32.dll",[&]{return invoke_service(state,memory);});
     }
     const auto begin=stub_base_.value+services.size()*16;
     const auto table=runtime_service_descriptors();
@@ -1422,42 +1508,34 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         ++state.tsc;state.rep_compare={};
         return true;
     }
-    // 後續 CFG／同步／虛擬記憶體本地路徑仍有各自的 Win64 契約；不因圖形家族擴充而放行。
-    if(x86_)return false;
-    if(plain_local_service(descriptor)){
+    // D3D12：所有 D3D12 呼叫本來就只在協調者執行（沒有 worker 版），在其他 worker 繼續執行時本地完成不新增並行。
+    // 只收命令清單錄製、描述元建立／複製與取值型方法：不建立／銷毀物件、不提交命令、不映射記憶體、不等 GPU。
+    // 鎖順序與 D3D11 本地路徑相同（映射 → 圖形）。電馭判客強制平行 60 秒約 45 萬次原本每次全停。X64ARM_LOCAL_D3D12=0 關閉。
+    static const bool local_d3d12=[] {const auto* value=std::getenv("X64ARM_LOCAL_D3D12");return !value || std::string_view(value)!="0";}();
+    if(local_d3d12 && !x86_ && descriptor.family=="internal-d3d12" && d3d12_local_service(descriptor.symbol)){
+        const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
+        const std::lock_guard graphics_lock(graphics_mutex());
         const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
         if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
-        // loader lock 的釋放會通知等待載入的執行緒，留在完整路徑。
-        if(descriptor.symbol.find("CriticalSection")!=std::string_view::npos && state.reg(Gpr::Rcx)==peb_base_.value+0x800)return false;
-        const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
+        const auto previous=threads_.current;const auto saved_error=last_error_;
         const GuestAddress error_slot{state.gs_base+0x68};
         const auto entry_error=static_cast<std::uint32_t>(memory.load(error_slot,32));
-        const auto previous=threads_.current;const auto saved_error=last_error_;const auto saved_errno=runtime_.errno_cell;
-        const auto entry_state=state;bool completed=false;
-        // 與 D3D11 本地路徑相同：完成時呼叫者若是目前執行緒，保留服務更新後的 last_error_；拒絕時全部還原。
         struct Restore {
-            WindowsServices& self;std::uint64_t previous,current;std::uint32_t error;std::uint64_t errno_cell;const bool& completed;
-            ~Restore(){self.local_plain_service_=false;self.threads_.current=previous;self.runtime_.errno_cell=errno_cell;
-                if(!completed || current!=previous)self.last_error_=error;}
-        } restore{*this,previous,key,saved_error,saved_errno,completed};
+            WindowsServices& self;std::uint64_t previous,current;std::uint32_t error;
+            ~Restore(){self.threads_.current=previous;if(current!=previous)self.last_error_=error;}
+        } restore{*this,previous,key,saved_error};
         threads_.current=key;last_error_=entry_error;
-        if(thread->second.errno_cell)runtime_.errno_cell=thread->second.errno_cell;
-        local_plain_service_=true;
         entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,descriptor.symbol);
-        std::optional<std::uint32_t> result;
-        try{result=invoke_runtime(state,memory,descriptor);}catch(...){state=entry_state;return false;}
-        if(result){state=entry_state;return false;} // 終止程序的錯誤路徑由完整入口重做並回報。
-        local_plain_service_=false;
+        const auto result=invoke_runtime(state,memory,descriptor);
+        if(result)throw std::logic_error("D3D12 本地協調服務意外終止客體");
         if(last_error_!=entry_error)memory.store(error_slot,32,last_error_);
-        completed=true;
-        // WASAPI ReleaseBuffer 可能已觸發串流事件：在同一獨占鎖下喚醒物件等待者（不切換客體）。
-        if(descriptor.family=="internal-wasapi"){
-            threads_.current=previous;runtime_.errno_cell=saved_errno;
-            (void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
-        }
         ++state.tsc;state.rep_compare={};
         return true;
     }
+    // 後續 CFG／同步／虛擬記憶體本地路徑仍有各自的 Win64 契約；不因圖形家族擴充而放行。
+    if(x86_)return false;
+    if(plain_local_service(descriptor))
+        return run_plain_local(descriptor.symbol,descriptor.family,[&]{return invoke_runtime(state,memory,descriptor);});
     // 虛擬記憶體家族沿用同一個 provider；不重新實作配置、權限、錯誤或撤銷語義。
     // 跨程序操作可能等待另一個程序，保留完整服務邊界。
     const auto symbol=descriptor.symbol;
@@ -1470,7 +1548,7 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     const bool wait_service=symbol=="WaitForSingleObject" || symbol=="WaitForSingleObjectEx" ||
         symbol=="WaitForMultipleObjects" || symbol=="WaitForMultipleObjectsEx";
     if(local_sync && descriptor.family=="kernel32.dll" &&
-       (wait_service || symbol=="SetEvent" || symbol=="ResetEvent" || symbol=="SwitchToThread" || symbol=="Sleep")){
+       (wait_service || symbol=="SetEvent" || symbol=="ResetEvent" || symbol=="ReleaseSemaphore" || symbol=="SwitchToThread" || symbol=="Sleep")){
         const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
         if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
         const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
@@ -1501,6 +1579,33 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
                 for(const auto& [id,wait]:registered_waits_){(void)id;if(same_object(wait.target))return false;}
             }
             found->second.set_signal(symbol=="SetEvent");value=1;
+            if(waiters)(void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
+        }else if(symbol=="ReleaseSemaphore"){
+            // 與 provider 相同的計數與上限；錯誤回報、共用命名空間物件與執行緒池已登錄等待交回完整路徑。
+            // 有等待者時在同一獨占鎖下以物件範圍喚醒（被喚醒者等下一次重選或停駐 slot 原地續跑）。X64ARM_LOCAL_SEMAPHORE=0 關閉。
+            static const bool local_semaphore=[] {const auto* value=std::getenv("X64ARM_LOCAL_SEMAPHORE");return !value || std::string_view(value)!="0";}();
+            if(!local_semaphore)return false;
+            const auto found=runtime_.wait_objects.find(arg(0));
+            if(found==runtime_.wait_objects.end() || found->second.kind!=WaitObject::Kind::Semaphore || !(found->second.access&2U) ||
+               runtime_.wait_lock_descriptor(found->second)>=0)return false;
+            auto& object=runtime_.wait_state(found->second);
+            const auto increment=static_cast<std::uint32_t>(arg(1));
+            if(std::bit_cast<std::int32_t>(increment)<=0 || increment>object.maximum-object.count)return false;
+            const auto previous=arg(2);
+            if(previous){try{memory.check(GuestAddress{previous},4,Access::Write);}catch(...){return false;}}
+            const auto same_object=[&](std::uint64_t handle){
+                if(handle==arg(0))return true;
+                const auto other=runtime_.wait_objects.find(handle);
+                return other!=runtime_.wait_objects.end() && found->second.identity && other->second.identity==found->second.identity;
+            };
+            for(const auto& [id,wait]:registered_waits_){(void)id;if(same_object(wait.target))return false;}
+            bool waiters=false;
+            for(const auto& [id,other]:threads_.items){
+                (void)id;if(other.status!=ThreadStatus::Waiting)continue;
+                if(std::any_of(other.wait.handles.begin(),other.wait.handles.end(),same_object)){waiters=true;break;}
+            }
+            if(previous)memory.store(GuestAddress{previous},32,object.count);
+            object.count+=increment;value=1;
             if(waiters)(void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
         }else if(wait_service){
             const bool multiple=symbol.find("Multiple")!=std::string_view::npos;

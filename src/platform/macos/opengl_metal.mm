@@ -16,6 +16,7 @@
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
 #include <algorithm>
 #include <bit>
 #include <charconv>
@@ -125,6 +126,10 @@ class MetalGl final:public NativeOpenGlContext {
     std::uint64_t stream_gpu_draws_{},stream_gpu_bytes_{};
     std::map<std::string,std::shared_ptr<MetalTessellationPipeline>> tessellation_pipelines_;
     std::uint64_t shader_serial_{};
+    // 著色器依內容共用（D3D9 legacy、D3D10／11 HLSLcc、D3D12 DXIL 同一入口）：命中時回傳同一物件，轉譯與 Metal 編譯
+    // 只做一次，render pipeline 快取（以 serial 為鍵）也能跨 PSO 重用。之後會修改物件的呼叫端改用 graphics_shader_private。
+    std::mutex shader_cache_mutex_;std::unordered_map<std::uint64_t,std::vector<std::shared_ptr<MetalShader>>> shader_cache_;std::deque<std::uint64_t> shader_cache_order_;
+    std::shared_ptr<GraphicsShader> graphics_shader_create(std::uint32_t,std::span<const std::uint8_t>);
     std::array<Array,4> arrays_;
     State state_;
     GlProgrammable gl_;
@@ -212,7 +217,15 @@ class MetalGl final:public NativeOpenGlContext {
     bool graphics_upload_buffer(const std::shared_ptr<GraphicsResource>&,std::span<const std::uint8_t>,std::uint32_t);
     bool graphics_replace_buffer(const std::shared_ptr<GraphicsResource>&,std::span<const std::uint8_t>);
     void graphics_write_buffer(const std::shared_ptr<GraphicsResource>&,std::span<const std::uint8_t>,std::uint32_t);
+    // Windows 的 flip model 交換鏈接管視窗後，GDI 內容不再顯示。GDI raster 以子 view 疊在同一個 NSView 上，
+    // 會蓋住本 context 替換的 view 圖層：呈現時隱藏，卸離時恢復。
+    void raster_overlays(bool hidden){
+        if(!view_)return;bool changed=false;
+        for(NSView* sub in view_.subviews)if([sub.identifier isEqualToString:@"x64arm-raster-presentation"] && sub.hidden!=hidden){sub.hidden=hidden;changed=true;}
+        if(changed)[CATransaction flush];
+    }
     void detach(){if(!view_)return;auto it=metal_view_users.find((__bridge void*)view_);if(it!=metal_view_users.end()){
+        raster_overlays(false);
         if(view_.layer==layer_)view_.layer=it->second.original;
         if(--it->second.count==0){view_.layer=it->second.original;view_.wantsLayer=it->second.wanted;if([view_ respondsToSelector:NSSelectorFromString(@"setOpenGLManaged:")])[view_ setValue:@NO forKey:@"openGLManaged"];metal_view_users.erase(it);[view_ setNeedsDisplay:YES];}}
         view_=nil;layer_=nil;
@@ -368,7 +381,7 @@ public:
         if(layer_){layer_.drawableSize=CGSizeMake(w,h);layer_.displaySyncEnabled=interval_!=0;}bind();
     }}
     bool swap_interval(std::int32_t n)override{if(n<0 || n>1)return false;if(n)finish_immediate_present();interval_=n;if(layer_)layer_.displaySyncEnabled=n!=0;return true;}
-    bool swap()override{@autoreleasepool{bind();begin_commands();auto front_copy=[commands_ blitCommandEncoder];MetalEncoderScope front_copy_scope{front_copy};[front_copy copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:front_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];front_copy_scope.end();if(layer_ && !interval_ && immediate_present_enabled() && !immediate_unavailable_){
+    bool swap()override{@autoreleasepool{bind();if(layer_)raster_overlays(true);begin_commands();auto front_copy=[commands_ blitCommandEncoder];MetalEncoderScope front_copy_scope{front_copy};[front_copy copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:front_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];front_copy_scope.end();if(layer_ && !interval_ && immediate_present_enabled() && !immediate_unavailable_){
             if(!immediate_presenter_)try{immediate_presenter_=std::make_unique<MetalImmediatePresenter>(device_,layer_,width_,height_);}catch(const std::bad_alloc&){immediate_unavailable_=true;}
             if(immediate_presenter_){
                 const auto index=immediate_presenter_->prepare();auto encoder=[commands_ blitCommandEncoder];MetalEncoderScope scope{encoder};
@@ -419,6 +432,7 @@ public:
     bool graphics_samples_supported(std::uint32_t,std::uint32_t)override;
     bool graphics_vertex_format_supported(std::uint32_t)override;
     std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t,std::span<const std::uint8_t>)override;
+    std::shared_ptr<GraphicsShader> graphics_shader_private(std::uint32_t,std::span<const std::uint8_t>)override;
     std::shared_ptr<GraphicsShader> graphics_compute_source(const GraphicsModernShader&)override;
     std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t>)override;
     bool graphics_timestamp_supported()const override;

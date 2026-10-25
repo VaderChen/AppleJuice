@@ -313,7 +313,7 @@
             if(arg(out)){output(out);write_pointer(arg(out),0);}require(arg(2)>0 && arg(2)<=16*1024*1024 && u32(4)<=64);
             if(!ten && arg(8))require(typed(arg(8),Kind::ClassLinkage)->device==device->root);
             const auto bytes=read_bytes(memory,arg(1),static_cast<std::size_t>(arg(2)));auto reflected=std::make_shared<dxbc::Reflection>(bytes);
-            const auto stage=!reflected->version?6U:(reflected->version>>16)==1?0U:2U;auto shader=device->native->graphics_shader(stage,bytes);
+            const auto stage=!reflected->version?6U:(reflected->version>>16)==1?0U:2U;auto shader=device->native->graphics_shader_private(stage,bytes);
             for(unsigned i=0;i<u32(4);++i){
                 const auto at=arg(3)+i*(ten?(x86_?12:16):(x86_?16:24));const auto name_offset=ten?0U:x86_?4U:8U;
                 GraphicsStreamElement e;e.stream=ten?0:static_cast<unsigned>(memory.load(GuestAddress{at},32));
@@ -572,25 +572,29 @@
             if(arg(out)){output(out);write_pointer(arg(out),0);}
             const auto guid=read_guid(memory,arg(creating?3U:2U));
             if(!creating || !arg(out))result=invalid;
-            else if(u32(2)&~8U)result=(u32(2)&6U) && !(u32(2)&~14U)?not_supported:invalid;
+            // D3D11_FENCE_FLAG：NONE＝0x1（與 D3D12 的 0 不同）、SHARED 0x2、SHARED_CROSS_ADAPTER 0x4、NON_MONITORED 0x8。
+            else if(u32(2)&~9U)result=(u32(2)&6U) && !(u32(2)&~15U)?not_supported:invalid;
             else if(guid!=IID_ID3D11Fence && guid!=IID_IUnknown && guid!=IID_ID3D11DeviceChild)result=no_interface;
             else{auto id=create(Kind::Fence,device->root);id->fence_value=arg(1);write_pointer(arg(out),id->root);}
         }else if(symbol=="FenceGetCompletedValue"){
-            graphics_handled=true;const auto value=typed(arg(0),Kind::Fence)->fence_value;result=value;if(x86_)state.reg(Gpr::Rdx)=value>>32;
+            graphics_handled=true;poll_gpu_signals(memory);const auto value=typed(arg(0),Kind::Fence)->fence_value;result=value;if(x86_)state.reg(Gpr::Rdx)=value>>32;
         }else if(symbol=="FenceSetEventOnCompletion"){
-            graphics_handled=true;auto fence=typed(arg(0),Kind::Fence);const auto value=arg(1),handle=arg(2);const auto event=runtime_.wait_objects.find(handle);
+            graphics_handled=true;poll_gpu_signals(memory);auto fence=typed(arg(0),Kind::Fence);const auto value=arg(1),handle=arg(2);const auto event=runtime_.wait_objects.find(handle);
             if(event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event)result=invalid;
             else if(value<=fence->fence_value)event->second.set_signal(true);
             else{require(fence->fence_events.size()<4096);fence->fence_events.emplace_back(value,handle);}
         }else if(symbol=="FenceCreateSharedHandle"){
             graphics_handled=true;(void)typed(arg(0),Kind::Fence);if(arg(4)){memory.check(GuestAddress{arg(4)},pointer_size,Access::Write);write_pointer(arg(4),0);}result=invalid;
         }else if(symbol=="Signal" || symbol=="Wait"){
-            // 單一 Metal 佇列：Signal 等先前提交的命令完成後才更新 fence 並觸發已到達的事件；Wait 依佇列順序不需額外等待。
+            // 單一 Metal 佇列：Signal 提交先前的命令但不等 GPU（與 D3D12 共用 GPU 完成通知），完成後才更新 fence 並觸發已到達的事件；
+            // Wait 依佇列順序不需額外等待。
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto fence=typed(arg(1),Kind::Fence);require(!context->context_type && fence->device==context->device);
             if(symbol=="Signal"){
-                context->native->graphics_flush(true);fence->fence_value=arg(2);
-                std::erase_if(fence->fence_events,[&](const auto& item){if(item.first>fence->fence_value)return false;
-                    if(const auto event=runtime_.wait_objects.find(item.second);event!=runtime_.wait_objects.end())event->second.set_signal(true);return true;});
+                queue_gpu_signal(memory,context->native->graphics_fence(),fence->device,[this,fence,value=arg(2)](GuestMemory&){
+                    fence->fence_value=value;
+                    std::erase_if(fence->fence_events,[&](const auto& item){if(item.first>fence->fence_value)return false;
+                        if(const auto event=runtime_.wait_objects.find(item.second);event!=runtime_.wait_objects.end())event->second.set_signal(true);return true;});
+                });
             }
         }else if(symbol=="DiscardResource" || symbol=="DiscardView" || symbol=="DiscardView1"){
             // 捨棄只允許內容變為未定義；保留原內容同樣符合語義（D3D11_OPTIONS 回報 DiscardAPIsSeenByDriver=FALSE）。

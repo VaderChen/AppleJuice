@@ -7,12 +7,14 @@
 #include "srw_trace.hpp"
 #include "guest_heap_layout.hpp"
 #include "guest_tls.hpp"
+#include "parallel_mapping_lock.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <thread>
 
 namespace x64arm {
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_HEAP
@@ -158,7 +160,7 @@ const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,G
 // GuestMemory 的區域表（std::vector）讀取不加鎖；協調者在其他 worker 繼續執行時本地完成虛擬記憶體服務會插入／刪除
 // 區域，worker 上的服務（native_window、load／store）同時查表即可能讀到重新配置中的陣列，把客體資料寫到錯誤位置
 // （DQ3 強制平行在 13～16 秒崩潰；停用本地映射服務即不再發生）。worker 服務持共享鎖，本地映射服務持獨占鎖。
-std::shared_mutex& parallel_mapping_mutex() noexcept {static std::shared_mutex mutex;return mutex;}
+ParallelMappingLock& parallel_mapping_mutex() noexcept {static ParallelMappingLock lock;return lock;}
 }
 namespace x64arm {
 // CRT memcpy／memmove／memset 只讀寫呼叫者傳入的客體範圍：較長的複製在單核時於常駐框架內執行，平行時若交回協調者，
@@ -273,13 +275,26 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     }
     const auto symbol=name(state.rip);
     // worker 身分由交給引擎的 context 決定；客體更動 GS 不得冒用另一執行緒。
-    auto key=threads_.current;
-    {
+    // &thread.context 到執行緒編號的對應在程序期間不變（執行緒只增不刪、std::map 節點位址固定），每條 worker 以
+    // 執行緒區域快取記住最近一次查到的對應，免取全域索引鎖；TEB 不符時清快取重查。協調者自己的 GuestState
+    // （slot 0）不在索引中，沿用目前執行緒。
+    struct IdentityCache {const WindowsServices* owner;const GuestState* state;std::uint64_t key;};
+    thread_local IdentityCache identity{};
+    const auto teb=x86_?state.fs_base:state.gs_base;
+    auto key=threads_.current;bool cached=identity.owner==this && identity.state==&state;
+    if(cached)key=identity.key;
+    else{
         std::unique_lock<std::mutex> lock;const auto& index=resident_thread_index(lock);
-        if(const auto context=index.contexts.find(&state);context!=index.contexts.end())key=context->second;
+        if(const auto context=index.contexts.find(&state);context!=index.contexts.end()){key=context->second;identity={this,&state,key};}
     }
     auto found=threads_.items.find(key);
-    if(found==threads_.items.end() || found->second.teb!=(x86_?state.fs_base:state.gs_base))return false;
+    if(cached && (found==threads_.items.end() || found->second.teb!=teb)){
+        identity={};key=threads_.current;
+        std::unique_lock<std::mutex> lock;const auto& index=resident_thread_index(lock);
+        if(const auto context=index.contexts.find(&state);context!=index.contexts.end()){key=context->second;identity={this,&state,key};}
+        found=threads_.items.find(key);
+    }
+    if(found==threads_.items.end() || found->second.teb!=teb)return false;
     auto& thread=found->second;const auto tid=found->first;const bool current=tid==threads_.current;
     const unsigned unit=x86_?4U:8U;
     const auto error_offset=static_cast<unsigned>(x86_?X64ARM_TLS_X86_ERROR_OFFSET:X64ARM_TLS_X64_ERROR_OFFSET);
@@ -566,9 +581,15 @@ else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"
         if(!window.data || window.after<bytes)return false;
         auto* lock_count=pointer(first+unit,4,2);auto* recursion=pointer(first+unit+4,4,2);auto* owner=pointer(first+unit+8,unit,2);
         if(first>UINT64_MAX-bytes || !lock_count || !recursion || !owner)return false;
-        auto& section=section_it->second;std::atomic_ref guard(section.worker_guard);std::uint32_t expected=0;
-        // 僅回報等待，不持鎖進入信箱。舊 JIT 仍交回協調者；常駐 worker 可等待通知。
-        if(!guard.compare_exchange_strong(expected,1,std::memory_order_acquire)){retry=true;return false;}
+        auto& section=section_it->second;std::atomic_ref guard(section.worker_guard);
+        // 守衛只在本函式內不阻塞的短區段持有（共用映射鎖下讀執行緒表、寫客體欄位），取不到就短暫自旋。
+        // 不能回報重試去等「服務進度」：持有守衛的 worker 也可能以重試結束（等待同一臨界區段的持有者），
+        // 雙方都不推進進度序號而永久互等（cs_shared 2 vCPU 競爭時卡死）。
+        for(unsigned spins=0;;++spins){
+            std::uint32_t expected=0;
+            if(guard.compare_exchange_weak(expected,1,std::memory_order_acquire,std::memory_order_relaxed))break;
+            if(spins<srw_spin_limit)spin_pause();else std::this_thread::yield();
+        }
         struct Release {std::atomic_ref<std::uint32_t> lock;~Release(){lock.store(0,std::memory_order_release);}} release{guard};
         if(symbol=="LeaveCriticalSection"){
             if(section.owner!=tid || !section.recursion)return false;

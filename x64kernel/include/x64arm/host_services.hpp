@@ -311,6 +311,21 @@ public:
     // 的前提下，把該客體標成等待（沿用完整路徑的等待契約，之後由一般等待解析完成呼叫），並指定一個可接手該 vCPU 的
     // runnable 客體。只有找得到替換者時才可改狀態並回 true；false 必須沒有任何副作用（協調者沿全停路徑處理）。
     virtual bool resident_block_service(GuestState&,GuestMemory&,std::span<GuestState* const>,GuestState*&) { return false; }
+    // slot 停駐（resident_block_parking() 為 true 的 provider）：resident_block_service 回 true 且 replacement 為 nullptr
+    // 表示客體已標成等待、沒有替換者；核心保留該 slot 的 worker 不回覆、不停其他 worker。slot 0（協調者的目前客體）
+    // 停駐時 provider 已把活體狀態存回執行緒表。等待由一般等待解析完成後，核心以 resident_unpark 取回狀態並原地續跑。
+    virtual bool resident_block_parking() const noexcept { return false; }
+    // 停駐 slot 的客體是否已回到 runnable（呼叫已由等待解析完成）。
+    virtual bool resident_context_runnable(const GuestState&) const { return false; }
+    // 停駐 slot 續跑前：slot 0 由執行緒表載回活體狀態；其他 slot 只記錄已派送。
+    virtual void resident_unpark(GuestState&,GuestMemory&) {}
+    // 不停 worker 地解析等待（逾時、已就緒物件）；回傳是否有客體狀態改變。
+    virtual bool resident_resolve_waits(GuestMemory&) { return false; }
+    // 是否有可執行、未暫停、卻不在任何 slot 的客體（需要全停輪替才能取得 vCPU）。保守預設為有。
+    virtual bool resident_runnable_waiting(std::span<GuestState* const>) const { return true; }
+    // 停駐 slot 換人：仍在等待的停駐客體讓出此 vCPU 給不在任何 slot 的 runnable 客體。回傳接手者的 context
+    // （slot 0 為已載入新目前客體的原 GuestState）；沒有可接手者回 nullptr 且沒有副作用。
+    virtual GuestState* resident_idle_replacement(GuestState&,GuestMemory&,std::span<GuestState* const>) { return nullptr; }
     // 純量值回退可在呼叫者的 worker 完成。分類不變；執行只讀固定服務表及
     // epoch 內的映射，以已驗證視窗讀堆疊、借用私人 errno，不觸碰目前 runtime、
     // 共用頁面快取、排程或回呼。false 必須沒有客體可見效果。

@@ -40,6 +40,7 @@ class MacDirectoryWatch final : public DirectoryWatch {
     std::vector<std::uint8_t> pending_;
     std::size_t last_record_{};
     std::uint32_t filter_,capacity_,notification_error_{};
+    unsigned information_class_;
     bool subtree_,overflow_{},rescan_{};
     std::chrono::steady_clock::time_point next_scan_{},next_poll_{};
     using Identity=std::pair<std::uint64_t,std::uint64_t>;
@@ -94,18 +95,34 @@ class MacDirectoryWatch final : public DirectoryWatch {
         return true;
     }
     void lose_details(std::uint32_t error=1022){pending_.clear();overflow_=true;notification_error_=error;}
-    void append(std::uint32_t action,const std::string& path) {
+    void append(std::uint32_t action,const std::string& path,const Node& node,const std::map<std::string,Node>& snapshot) {
         if(overflow_)return;
-        const auto name=utf8_to_utf16(path);const auto size=(12+name.size()*2+3)&~std::size_t{3};
+        const auto name=utf8_to_utf16(path);const auto header=information_class_==1?12U:84U;
+        if(information_class_==3 && name.size()>UINT16_MAX/2){lose_details();return;}
+        const auto size=(header+name.size()*2+3)&~std::size_t{3};
         if(size>capacity_ || pending_.size()>capacity_-size){lose_details(0);return;}
-        const auto offset=pending_.size();pending_.resize(offset+size);
+        const auto offset=pending_.size();
+        // vector 的幾何擴張不得跨過首次要求的佇列容量。
+        if(offset+size>pending_.capacity())pending_.reserve(std::min<std::size_t>(capacity_,std::max(offset+size,pending_.capacity()*2)));
+        pending_.resize(offset+size);
         const auto store=[&](std::size_t at,std::uint32_t value){for(unsigned i=0;i<4;++i)pending_[at+i]=static_cast<std::uint8_t>(value>>(8*i));};
+        const auto wide=[&](std::size_t at,std::uint64_t value){store(offset+at,static_cast<std::uint32_t>(value));store(offset+at+4,static_cast<std::uint32_t>(value>>32));};
         if(offset)store(last_record_,static_cast<std::uint32_t>(offset-last_record_));
-        last_record_=offset;store(offset+4,action);store(offset+8,static_cast<std::uint32_t>(name.size()*2));
-        for(std::size_t i=0;i<name.size();++i){pending_[offset+12+i*2]=static_cast<std::uint8_t>(name[i]);pending_[offset+13+i*2]=static_cast<std::uint8_t>(name[i]>>8);}
+        last_record_=offset;store(offset+4,action);
+        if(information_class_==1)store(offset+8,static_cast<std::uint32_t>(name.size()*2));
+        else {
+            const auto& info=node.info;
+            wide(8,info.created);wide(16,info.modified);wide(24,info.changed);wide(32,info.accessed);
+            wide(40,info.allocation_size);wide(48,info.size);store(offset+56,info.attributes);store(offset+60,info.reparse_tag);wide(64,info.id);
+            const auto split=path.rfind('\\');const auto parent=split==path.npos?snapshot.end():snapshot.find(path.substr(0,split));
+            wide(72,parent==snapshot.end()?root_->information().metadata.id:parent->second.info.id);
+            // Full 的長度為 USHORT；未提供 DOS 別名，名稱類型旗標與 Reserved 維持零。
+            store(offset+80,static_cast<std::uint32_t>(name.size()*2));
+        }
+        for(std::size_t i=0;i<name.size();++i){pending_[offset+header+i*2]=static_cast<std::uint8_t>(name[i]);pending_[offset+header+1+i*2]=static_cast<std::uint8_t>(name[i]>>8);}
     }
 public:
-    MacDirectoryWatch(bool subtree,std::uint32_t filter,std::uint32_t capacity):filter_(filter),capacity_(capacity),subtree_(subtree){}
+    MacDirectoryWatch(bool subtree,std::uint32_t filter,std::uint32_t capacity,unsigned information_class):filter_(filter),capacity_(capacity),information_class_(information_class),subtree_(subtree){}
     bool initialize(const HostFile& file,std::uint32_t& error) {
         queue_.value=::kqueue();if(queue_.value<0){error=watch_error();return false;}
         (void)::fcntl(queue_.value,F_SETFD,FD_CLOEXEC);
@@ -118,7 +135,8 @@ public:
         watched_.emplace("",root);
         return collect(root->descriptor.value,"",nodes_,watched_,error,0);
     }
-    bool matches(bool subtree,std::uint32_t filter)const override{return subtree_==subtree && filter_==filter;}
+    bool matches(bool subtree,std::uint32_t filter,unsigned information_class)const override{return subtree_==subtree && filter_==filter && information_class_==information_class;}
+    std::size_t pending_bytes()const override{return pending_.size();}
     void poll() override try {
         // vnode 事件在 kqueue 內保留；同一毫秒的排程切片共用輪詢結果。
         const auto now=std::chrono::steady_clock::now();if(now<next_poll_)return;
@@ -153,12 +171,12 @@ public:
         for(const auto& [id,items]:removed)for(const auto item:items){const auto& [path,node]=*item;
             changed_directories.insert(parent(path));const auto target=added.find(id);
             if(items.size()==1 && target!=added.end() && target->second.size()==1){
-                if(names(node)){append(4,path);append(5,target->second.front()->first);}
-            }else if(names(node))append(2,path);
+                if(names(node)){append(4,path,node,nodes_);const auto& moved=*target->second.front();append(5,moved.first,moved.second,current);}
+            }else if(names(node))append(2,path,node,nodes_);
         }
         for(const auto& [id,items]:added)for(const auto item:items){const auto& [path,node]=*item;
             changed_directories.insert(parent(path));const auto source=removed.find(id);
-            if(!(items.size()==1 && source!=removed.end() && source->second.size()==1) && names(node))append(1,path);
+            if(!(items.size()==1 && source!=removed.end() && source->second.size()==1) && names(node))append(1,path,node,current);
         }
         for(const auto& [path,node]:current){
             const auto found=nodes_.find(path);if(found==nodes_.end() || identity(node)!=identity(found->second))continue;
@@ -169,7 +187,7 @@ public:
                 ((filter_&0x20) && node.info.accessed!=old.info.accessed) ||
                 ((filter_&0x40) && node.info.created!=old.info.created) ||
                 ((filter_&0x100) && (node.mode!=old.mode || node.uid!=old.uid || node.gid!=old.gid || node.acl!=old.acl));
-            if(modified)append(3,path);
+            if(modified)append(3,path,node,current);
         }
         // kqueue 會合併事件。create+delete 等無法重建名稱時，要求重新列舉，不能吞掉事件。
         for(const auto& [path,bits]:flags){const auto node=nodes_.find(path);const bool directory=path.empty() || (node!=nodes_.end() && (node->second.info.attributes&0x10));
@@ -187,9 +205,10 @@ public:
 };
 }
 #endif
-std::shared_ptr<DirectoryWatch> DirectoryWatch::create(const HostFile& file,bool subtree,std::uint32_t filter,std::uint32_t capacity,std::uint32_t& error) try {
+std::shared_ptr<DirectoryWatch> DirectoryWatch::create(const HostFile& file,bool subtree,std::uint32_t filter,std::uint32_t capacity,std::uint32_t& error,unsigned information_class) try {
+    if(information_class<1 || information_class>3){error=87;return {};}
 #if defined(__APPLE__)
-    auto result=std::make_shared<MacDirectoryWatch>(subtree,filter,capacity);
+    auto result=std::make_shared<MacDirectoryWatch>(subtree,filter,capacity,information_class);
     if(result->initialize(file,error))return result;
     return {};
 #else

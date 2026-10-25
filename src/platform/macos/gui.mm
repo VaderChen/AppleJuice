@@ -1,6 +1,7 @@
 #include "x64arm/raster_surface.hpp"
 #include "gui_timing.hpp"
 #include "application.hpp"
+#include "modifier_keys.hpp"
 #import <AppKit/AppKit.h>
 #import <CoreText/CoreText.h>
 #import <CoreVideo/CoreVideo.h>
@@ -62,6 +63,17 @@ bool offline_render_enabled(){static const bool enabled=[] {const auto* value=st
 // 自動驗證可投影到非作用中螢幕；客體仍使用自身桌面的相對座標。
 bool background_display_enabled(){return x64arm::native_background_display_enabled();}
 NSScreen* background_display(){return x64arm::native_background_display();}
+// X64ARM_DISPLAY_SIZE=<寬>x<高>：客體看到的虛擬顯示器解析度（例如 1280x720，讓預設全螢幕解析度較高的遊戲降低負載）。
+// 只改變公開給客體的桌面、工作區與顯示模式；宿主視窗依客體座標放置，不切換實體顯示器模式。
+std::optional<std::pair<std::uint32_t,std::uint32_t>> virtual_display_size(){
+    static const auto value=[]()->std::optional<std::pair<std::uint32_t,std::uint32_t>>{
+        const auto* text=std::getenv("X64ARM_DISPLAY_SIZE");if(!text || !*text)return {};
+        unsigned width=0,height=0;char separator=0;
+        if(std::sscanf(text,"%u%c%u",&width,&separator,&height)!=3 || (separator!='x' && separator!='X') || width<320 || height<200 || width>16384 || height>16384)return {};
+        return std::pair{width,height};
+    }();
+    return value;
+}
 // ICO 的 DIB 與 AND mask 各自以 DWORD 對齊；避免宿主解碼器把非 32 倍數寬度的遮罩錯位。
 NSImage* guest_icon_image(const std::vector<std::uint8_t>& bytes) {
     const auto fallback=[&](){return [[NSImage alloc] initWithData:[NSData dataWithBytes:bytes.data() length:bytes.size()]];};
@@ -222,8 +234,22 @@ std::uint16_t coordinate_word(CGFloat value) {
     if (!std::isfinite(value)) return 0;
     return static_cast<std::uint16_t>(static_cast<std::int16_t>(std::clamp(value, static_cast<CGFloat>(-32768), static_cast<CGFloat>(32767))));
 }
+std::uint32_t guest_mouse_buttons(NSUInteger native) {
+    return static_cast<std::uint32_t>(native&3U)|((native&4U)?16U:0U);
+}
 }
 
+void native_guest_modifier(std::uint64_t handle,std::vector<x64arm::GuiMessage>* events,std::array<std::uint32_t,256>& pressedGuestKeys,NSEvent* event) {
+    const auto* key=x64arm::native_modifier_key(event.keyCode);if(!events || !key)return;
+    auto& saved=pressedGuestKeys[event.keyCode];const bool previous=saved!=0;
+    const bool pressed=x64arm::native_modifier_pressed(*key,event.modifierFlags,previous);if(pressed==previous)return;
+    const std::uint32_t modifiers=((event.modifierFlags&NSEventModifierFlagShift)?1U:0U)|((event.modifierFlags&NSEventModifierFlagControl)?2U:0U)|((event.modifierFlags&NSEventModifierFlagOption)?4U:0U);
+    const bool system=pressed?((modifiers&4U) && !(modifiers&2U)):(saved&0x1000000U)!=0;
+    const auto lparam=UINT64_C(1)|(std::uint64_t{key->scan}<<16)|(pressed?0:UINT64_C(0xc0000000))|
+        ((key->key==18 || (modifiers&4U))?UINT64_C(1)<<29:0);
+    saved=pressed?((std::uint32_t{key->scan}<<8)|key->key|(system?0x1000000U:0U)):0;
+    events->push_back({handle,key->key,lparam,system?(pressed?0x104U:0x105U):(pressed?0x100U:0x101U),{},modifiers});
+}
 void native_guest_key(std::uint64_t handle,std::vector<x64arm::GuiMessage>* events,std::array<std::uint32_t,256>& pressedGuestKeys,NSEvent* event,bool pressed) {
     if(!events)return;
     NSString* chars = event.characters;
@@ -493,6 +519,10 @@ void native_guest_key(std::uint64_t handle,std::vector<x64arm::GuiMessage>* even
     self.events->push_back(std::move(input));
 }
 - (void)mouseUp:(NSEvent*)event { [self guestMouse:event message:0x202 button:1 pressed:NO]; }
+- (void)mouseMoved:(NSEvent*)event {
+    self.buttons=guest_mouse_buttons(NSEvent.pressedMouseButtons);
+    [self guestMouse:event message:0x200 button:0 pressed:NO];
+}
 - (void)mouseDragged:(NSEvent*)event { [self guestMouse:event message:0x200 button:1 pressed:YES]; }
 - (void)rightMouseDown:(NSEvent*)event { [self guestMouse:event message:event.clickCount>1?0x206U:0x204U button:2 pressed:YES]; }
 - (void)rightMouseUp:(NSEvent*)event { [self guestMouse:event message:0x205 button:2 pressed:NO]; }
@@ -527,6 +557,7 @@ void native_guest_key(std::uint64_t handle,std::vector<x64arm::GuiMessage>* even
 }
 - (void)guestKeyDown:(NSEvent*)event {[self guestKey:event pressed:YES];}
 - (void)keyUp:(NSEvent*)event {[self guestKey:event pressed:NO];}
+- (void)flagsChanged:(NSEvent*)event {native_guest_modifier(self.guestHandle,self.events,pressedGuestKeys,event);}
 - (void)guestKey:(NSEvent*)event pressed:(BOOL)pressed {native_guest_key(self.guestHandle,self.events,pressedGuestKeys,event,pressed);}
 - (BOOL)hasMarkedText {return imeData.composing;}
 - (NSRange)markedRange {return imeData.composing?NSMakeRange(0,imeData.text.size()):NSMakeRange(NSNotFound,0);}
@@ -606,6 +637,7 @@ void native_guest_key(std::uint64_t handle,std::vector<x64arm::GuiMessage>* even
 - (void)mouseUp:(NSEvent*)event {if(!self.model || !self.events)return;if(self.isOwnerDraw)[self buttonMouse:event message:0x202];else [super mouseUp:event];}
 - (void)keyDown:(NSEvent*)event {if(self.model && self.events && self.enabled)native_guest_key(self.guestHandle,self.events,pressedGuestKeys,event,true);}
 - (void)keyUp:(NSEvent*)event {if(self.model && self.events && self.enabled)native_guest_key(self.guestHandle,self.events,pressedGuestKeys,event,false);}
+- (void)flagsChanged:(NSEvent*)event {if(self.model && self.events && self.enabled)native_guest_modifier(self.guestHandle,self.events,pressedGuestKeys,event);}
 - (void)performClick:(id)sender {if(!self.model || !self.events)return;if(self.isOwnerDraw){if(self.enabled && self.events){[self.window makeFirstResponder:self];self.events->push_back({self.guestHandle,0,0,0xf5});}}else [super performClick:sender];}
 @end
 @interface X64ArmMenuContainer : NSView
@@ -755,7 +787,7 @@ NSDictionary* menu_bitmap_details(NSImage* image){
 }
 - (void)mouseDown:(NSEvent*)event{[self guestMouse:event message:event.clickCount>1?0x203U:0x201U button:1 pressed:YES];}
 - (void)mouseDragged:(NSEvent*)event{[self guestMouse:event message:0x200 button:1 pressed:YES];}
-- (void)mouseMoved:(NSEvent*)event{self.buttons=(NSEvent.pressedMouseButtons&1U)?1U:0U;[self guestMouse:event message:0x200 button:0 pressed:NO];}
+- (void)mouseMoved:(NSEvent*)event{self.buttons=guest_mouse_buttons(NSEvent.pressedMouseButtons);[self guestMouse:event message:0x200 button:0 pressed:NO];}
 - (void)mouseUp:(NSEvent*)event{[self guestMouse:event message:0x202 button:1 pressed:NO];}
 - (void)rightMouseDown:(NSEvent*)event{[self guestMouse:event message:0x204 button:2 pressed:YES];}
 - (void)rightMouseUp:(NSEvent*)event{[self guestMouse:event message:0x205 button:2 pressed:NO];}
@@ -1177,6 +1209,11 @@ NSDictionary* menu_bitmap_details(NSImage* image){
 @property(nonatomic) x64arm::GuiWindow* guestModel;
 @end
 @implementation X64ArmGuestWindow
+- (instancetype)initWithContentRect:(NSRect)rect styleMask:(NSWindowStyleMask)style backing:(NSBackingStoreType)backing defer:(BOOL)defer {
+    self=[super initWithContentRect:rect styleMask:style backing:backing defer:defer];
+    if(self)self.acceptsMouseMovedEvents=YES;
+    return self;
+}
 - (BOOL)canBecomeKeyWindow {return self.guestModel?self.guestModel->enabled && !(self.guestModel->ex_style&0x08000000U):[super canBecomeKeyWindow];}
 - (BOOL)canBecomeMainWindow {return self.guestModel?[self canBecomeKeyWindow] && !(self.guestModel->ex_style&0x80U):[super canBecomeMainWindow];}
 - (BOOL)performKeyEquivalent:(NSEvent*)event {
@@ -1422,6 +1459,7 @@ class CocoaGui final : public NativeGui {
         automation_cursor_={static_cast<std::int32_t>(std::clamp<CGFloat>(point.x,INT32_MIN,INT32_MAX)),static_cast<std::int32_t>(std::clamp<CGFloat>(point.y,INT32_MIN,INT32_MAX))};
     }
     NSString* __strong automation_live_path_{};
+    bool automation_input_active_{}; // 背景顯示下由自動化 window_activate 模擬的前景輸入狀態。
     NSDate* automation_read_time_{};
     id __strong automation_input_monitor_{};
     NSMutableSet<NSEvent*>* __strong automation_posted_events_{[NSMutableSet set]};
@@ -1541,7 +1579,11 @@ class CocoaGui final : public NativeGui {
         if([operation isEqualToString:@"window_activate"]){
             if(!background_display_enabled()){if(@available(macOS 14.0,*))[NSApp activate];else [NSApp activateIgnoringOtherApps:YES];[w.view.window makeKeyAndOrderFront:nil];[w.view.window makeFirstResponder:w.view];}
             // 背景顯示不搶宿主焦點：只送與 windowDidBecomeKey 相同的客體啟用事件，讓依前景狀態接收輸入的程式（如 UE4）可測。
-            else for(const auto& [handle,window]:windows_)if(&window==&w){events_.push_back({handle,1,0,0x1000d});break;}
+            else {
+                // 同時視為輸入作用中：依前景投遞的 Raw Input（WM_INPUT）在宿主未啟用時本會被丟棄。
+                automation_input_active_=true;
+                for(const auto& [handle,window]:windows_)if(&window==&w){events_.push_back({handle,1,0,0x1000d});break;}
+            }
         }
         else if([operation isEqualToString:@"window_resize"] && w.native){[w.native setContentSize:NSMakeSize([step[@"width"] doubleValue],[step[@"height"] doubleValue]+(w.model.menu?20:0))];}
         else if([operation isEqualToString:@"window_minimize"] && w.native){[w.native performMiniaturize:nil];}
@@ -1611,8 +1653,11 @@ class CocoaGui final : public NativeGui {
             NSString* phase=step[@"phase"]?:@"tap";
             if(![phase isEqualToString:@"tap"] && ![phase isEqualToString:@"down"] && ![phase isEqualToString:@"up"])throw std::runtime_error("GUI 測試按鍵階段無效");
             [w.view.window makeFirstResponder:w.view];
+            // 自動化按鍵不經實體鍵盤狀態，標成注入：服務端比照 SendInput 一併產生 Raw Input（WM_INPUT）。
+            const auto first_event=events_.size();
             if(![phase isEqualToString:@"up"]){NSEvent* event=[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:modifiers timestamp:0 windowNumber:w.view.window.windowNumber context:nil characters:chars charactersIgnoringModifiers:chars isARepeat:NO keyCode:hardware];[w.view keyDown:event];}
             if(![phase isEqualToString:@"down"]){NSEvent* event=[NSEvent keyEventWithType:NSEventTypeKeyUp location:NSZeroPoint modifierFlags:modifiers timestamp:0 windowNumber:w.view.window.windowNumber context:nil characters:chars charactersIgnoringModifiers:chars isARepeat:NO keyCode:hardware];[w.view keyUp:event];}
+            for(auto i=first_event;i<events_.size();++i)if(events_[i].message>=0x100 && events_[i].message<=0x105)events_[i].injected=true;
         }else if([operation isEqualToString:@"mouse"] && [w.control isKindOfClass:NSOutlineView.class] && [step[@"phase"] isEqualToString:@"tap"]){
             auto* target=(NSOutlineView*)w.control;const auto point=[target convertPoint:NSMakePoint([step[@"x"] doubleValue],[step[@"y"] doubleValue]) toView:nil];const auto timestamp=NSProcessInfo.processInfo.systemUptime;
             const auto event=[&](NSEventType type){return [NSEvent mouseEventWithType:type location:point modifierFlags:automation_modifiers(step) timestamp:timestamp windowNumber:target.window.windowNumber context:nil eventNumber:0 clickCount:1 pressure:1];};
@@ -1920,7 +1965,9 @@ public:
     }
     void* graphics_view(std::uint64_t handle) override {if(offline_render_enabled())return nullptr;const auto f=windows_.find(handle);return f==windows_.end()?nullptr:(__bridge void*)f->second.view;}
     std::optional<GuiDisplayMode> current_display_mode() override {
-        const auto mode=CGDisplayCopyDisplayMode(CGMainDisplayID());if(!mode)return {};const auto result=describe_display_mode(mode);CGDisplayModeRelease(mode);return result;
+        const auto mode=CGDisplayCopyDisplayMode(CGMainDisplayID());if(!mode)return {};auto result=describe_display_mode(mode);CGDisplayModeRelease(mode);
+        if(const auto size=virtual_display_size()){result.width=size->first;result.height=size->second;}
+        return result;
     }
     std::vector<GuiDisplayMode> display_modes() override {
         std::vector<GuiDisplayMode> result;const auto modes=CGDisplayCopyAllDisplayModes(CGMainDisplayID(),nullptr);if(!modes)return result;
@@ -1928,7 +1975,13 @@ public:
             auto value=describe_display_mode(mode);if(!value.width || !value.height || value.width>16384 || value.height>16384)continue;
             if(std::none_of(result.begin(),result.end(),[&](const auto& a){return a.width==value.width && a.height==value.height && a.refresh_numerator==value.refresh_numerator && a.refresh_denominator==value.refresh_denominator;}))result.push_back(value);
         }
-        CFRelease(modes);std::sort(result.begin(),result.end(),[](const auto& a,const auto& b){return std::tie(a.width,a.height,a.refresh_numerator)<std::tie(b.width,b.height,b.refresh_numerator);});return result;
+        CFRelease(modes);
+        // 虛擬解析度：只公開不超過它的模式，並保證該解析度本身存在（沿用目前更新率與原生模式識別）。
+        if(const auto size=virtual_display_size()){
+            std::erase_if(result,[&](const auto& m){return m.width>size->first || m.height>size->second;});
+            if(const auto current=current_display_mode();current && std::none_of(result.begin(),result.end(),[&](const auto& m){return m.width==size->first && m.height==size->second;}))result.push_back(*current);
+        }
+        std::sort(result.begin(),result.end(),[](const auto& a,const auto& b){return std::tie(a.width,a.height,a.refresh_numerator)<std::tie(b.width,b.height,b.refresh_numerator);});return result;
     }
     bool display_fullscreen(std::uint64_t handle,bool enabled,const std::optional<GuiDisplayMode>& desired={}) override {
         const auto found=windows_.find(handle);if(found==windows_.end() || !found->second.native)return !enabled && (!fullscreen_window_ || fullscreen_window_==handle) && restore_display_mode();
@@ -1946,8 +1999,8 @@ public:
         written_display_mode_=display_mode_id(target?target:current);if(target)CGDisplayModeRelease(target);CGDisplayModeRelease(current);
         fullscreen_display_=display;fullscreen_window_=handle;window.fullscreen=true;apply_z_order(handle);return true;
     }
-    std::array<std::int32_t,4> work_area() override {const auto screen=background_display()?:NSScreen.mainScreen;const auto frame=screen.visibleFrame;return {static_cast<std::int32_t>(frame.origin.x-(background_display()?screen.frame.origin.x:0)),static_cast<std::int32_t>(NSMaxY(screen.frame)-NSMaxY(frame)),static_cast<std::int32_t>(frame.size.width),static_cast<std::int32_t>(frame.size.height)};}
-    std::array<std::int32_t,4> screen_area() override {const auto r=(background_display()?:NSScreen.mainScreen).frame;return {0,0,static_cast<std::int32_t>(r.size.width),static_cast<std::int32_t>(r.size.height)};}
+    std::array<std::int32_t,4> work_area() override {if(const auto size=virtual_display_size())return {0,0,static_cast<std::int32_t>(size->first),static_cast<std::int32_t>(size->second)};const auto screen=background_display()?:NSScreen.mainScreen;const auto frame=screen.visibleFrame;return {static_cast<std::int32_t>(frame.origin.x-(background_display()?screen.frame.origin.x:0)),static_cast<std::int32_t>(NSMaxY(screen.frame)-NSMaxY(frame)),static_cast<std::int32_t>(frame.size.width),static_cast<std::int32_t>(frame.size.height)};}
+    std::array<std::int32_t,4> screen_area() override {if(const auto size=virtual_display_size())return {0,0,static_cast<std::int32_t>(size->first),static_cast<std::int32_t>(size->second)};const auto r=(background_display()?:NSScreen.mainScreen).frame;return {0,0,static_cast<std::int32_t>(r.size.width),static_cast<std::int32_t>(r.size.height)};}
     std::optional<shell::Dock> shell_dock() override {return shell::dock();}
     std::uint32_t shell_reveal(std::span<const std::shared_ptr<HostFile>> files,std::uint32_t flags) override {return shell::reveal(files,flags);}
     std::vector<shell::Application> shell_applications(const std::shared_ptr<HostFile>& file,std::string_view uri) override {return shell::applications(file,uri);}
@@ -2520,7 +2573,7 @@ public:
             popup_stack_.pop_back();
             // AppKit 的 tracking loop 會消耗放開事件；以狀態事件同步，避免停用中的 owner 留下按鍵狀態。
             const auto nativeButtons=automation_?0U:static_cast<unsigned>([NSEvent pressedMouseButtons]);
-            const std::uint32_t buttons=(nativeButtons&1U)|((nativeButtons&2U)?2U:0U)|((nativeButtons&4U)?16U:0U);
+            const std::uint32_t buttons=guest_mouse_buttons(nativeButtons);
             const auto nativeModifiers=automation_?static_cast<NSEventModifierFlags>(0):[NSEvent modifierFlags];
             const std::uint32_t modifiers=((nativeModifiers&NSEventModifierFlagShift)?1U:0U)|((nativeModifiers&NSEventModifierFlagControl)?2U:0U)|((nativeModifiers&NSEventModifierFlagOption)?4U:0U);
             for(auto& [id,window]:windows_){(void)id;if(window.view.window==ownerWindow && [window.view isKindOfClass:[X64ArmGuestView class]])((X64ArmGuestView*)window.view).buttons=buttons;}
@@ -2674,7 +2727,7 @@ public:
             [w.mdi_frame removeFromSuperview];[w.view removeFromSuperview];[w.native.parentWindow removeChildWindow:w.native];w.native.commandShortcut=nil;w.native.guestModel=nullptr;w.native.delegate=nil;[w.native close];windows_.erase(found);dirty_=true;
         }
     }
-    bool input_active() const override {return NSApp.isActive;}
+    bool input_active() const override {return NSApp.isActive || automation_input_active_;}
     bool status_icons(const std::map<std::uint64_t,desktop::Icon>& icons)override{return desktop_notifications_->update(icons,desktop_time());}
     std::uint32_t help(const NativeHelpRequest& request)override{
         if(!help_)help_=make_native_winhelp();

@@ -172,6 +172,12 @@ public:
 #endif
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_BLOCK
     bool resident_block_service(GuestState&,GuestMemory&,std::span<GuestState* const>,GuestState*&) override;
+    bool resident_block_parking() const noexcept override;
+    bool resident_context_runnable(const GuestState&) const override;
+    void resident_unpark(GuestState&,GuestMemory&) override;
+    bool resident_resolve_waits(GuestMemory&) override;
+    bool resident_runnable_waiting(std::span<GuestState* const>) const override;
+    GuestState* resident_idle_replacement(GuestState&,GuestMemory&,std::span<GuestState* const>) override;
     bool resident_block_service_impl(GuestState&,GuestMemory&,std::span<GuestState* const>,GuestState*&,int* outcome);
 #endif
     void after_resident_parallel(GuestState&,GuestMemory&) override;
@@ -681,6 +687,7 @@ private:
         std::uint64_t pipe_wake_epoch{},pipe_poll_deadline{};
     };
     // 共用即時／待命 I/O 的結果發布、事件、APC 及完成埠通知。
+    static std::uint32_t file_io_status(std::uint32_t);
     void complete_file_io(GuestMemory&,PendingFileIo&,std::uint32_t);
     PipeResult poll_hid_io(PendingFileIo&,GuestMemory&);
     std::vector<PendingFileIo> pending_file_io_;
@@ -1011,6 +1018,14 @@ private:
     void report_crt_fast_fail(const GuestState&,GuestMemory&,std::string_view);
     bool wasapi_waiting() const;
     std::uint64_t wasapi_wakeup_ns() const;
+    // 共用 GPU 完成通知（D3D11 ID3D11Fence、D3D12 佇列 fence）：提交不等 GPU，完成旗標成立後在客體端依序執行
+    // 套用動作（讀回、設定 fence 值、觸發事件）；同一 order 鍵（裝置）依登記順序，前一個未完成就停止該鍵。
+    struct GpuSignal {std::shared_ptr<const std::atomic<bool>> done;std::uint64_t order{};std::function<void(GuestMemory&)> apply;};
+    std::deque<GpuSignal> gpu_signals_;
+    void queue_gpu_signal(GuestMemory&,std::shared_ptr<const std::atomic<bool>>,std::uint64_t,std::function<void(GuestMemory&)>);
+    void poll_gpu_signals(GuestMemory&);
+    std::uint64_t gpu_signal_wakeup_ns() const;
+    void d3d12_signal_fence(std::uint64_t,std::uint64_t);
     std::shared_ptr<DirectInputState> dinput_;
     std::optional<std::uint32_t> invoke_dinput(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     void poll_dinput(bool background=false);
@@ -1133,6 +1148,12 @@ private:
     void schedule(GuestState& state, GuestMemory& memory);
     // 常駐平行時協調者在其他 worker 執行中切換 slot 0 的目前客體（只做 schedule 的保存／載入，不輪詢、不選人）。
     void switch_resident_current(GuestState& state, GuestMemory& memory, std::uint64_t target);
+    // slot 0 停駐：目前客體的活體狀態已存回執行緒表（見 resident_unpark）。
+    void park_resident_current(GuestState& state, GuestMemory& memory);
+    void save_resident_current(GuestState& state, GuestMemory& memory);
+    void load_resident_current(GuestState& state, GuestMemory& memory, std::uint64_t target);
+    GuestThread* select_resident_replacement(std::span<GuestState* const> active, std::uint32_t processor, std::uint64_t exclude);
+    bool resident_current_parked_{};
     std::optional<std::uint32_t> force_finish_thread(GuestState&,GuestMemory&);
     std::optional<std::uint32_t> finish_thread(GuestState& state, GuestMemory& memory, std::uint32_t code);
     std::optional<std::uint32_t> exit_thread(GuestState& state, GuestMemory& memory, std::uint32_t code);

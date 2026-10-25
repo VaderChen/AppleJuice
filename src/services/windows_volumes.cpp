@@ -62,6 +62,9 @@ std::span<const WindowsServiceDescriptor> volume_service_descriptors() {
         {"kernel32.dll", "GetTempPath2A", 2}, {"kernel32.dll", "GetTempPath2W", 2}, {"kernel32.dll", "GetTempPathA", 2}, {"kernel32.dll", "GetTempPathW", 2},
         {"kernel32.dll", "FindFirstChangeNotificationA", 3}, {"kernel32.dll", "FindFirstChangeNotificationW", 3},
         {"kernel32.dll", "ReadDirectoryChangesW", 8},
+        {"kernel32.dll", "ReadDirectoryChangesExW", 9},
+        {"ntdll.dll", "NtNotifyChangeDirectoryFile", 9},
+        {"ntdll.dll", "NtNotifyChangeDirectoryFileEx", 10},
         {"kernel32.dll", "FindNextChangeNotification", 1}, {"kernel32.dll", "FindCloseChangeNotification", 1}
         ,{"crt","_tempnam",2},{"crt","_wtempnam",2},{"crt","tmpnam",1},{"crt","_wtmpnam",1}
         ,{"crt","tmpnam_s",2},{"crt","_wtmpnam_s",2}
@@ -103,6 +106,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
                                                          const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state, memory, service);
     const auto symbol = service.symbol;
+    if(symbol.starts_with("NtNotifyChangeDirectory"))return invoke_directory_notification(state,memory,service);
     const bool wide = symbol.back() == 'W' || symbol.starts_with("_wtempnam") || symbol.starts_with("_wtmpnam");
     const auto u32 = [&](unsigned i) { return static_cast<std::uint32_t>(arg(i)); };
     const auto text = [&](unsigned i) { return wide ? utf16_to_utf8(read_utf16(memory, GuestAddress{arg(i)})) : read_ansi(memory, arg(i)); };
@@ -246,7 +250,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
     }else
     if (symbol.starts_with("FindFirstChangeNotification")) {
         return invoke_directory_notification(state,memory,service);
-    } else if (symbol == "FindNextChangeNotification" || symbol == "FindCloseChangeNotification" || symbol == "ReadDirectoryChangesW") {
+    } else if (symbol == "FindNextChangeNotification" || symbol == "FindCloseChangeNotification" || symbol == "ReadDirectoryChangesW" || symbol == "ReadDirectoryChangesExW") {
         return invoke_directory_notification(state,memory,service);
     } else if(symbol.starts_with("QueryDosDevice")){
         std::u16string value;std::uint32_t error=0;

@@ -5,8 +5,10 @@
 #include "windows_display_identity.hpp"
 #include <vkd3d_shader.h>
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -77,10 +79,17 @@ struct D3D12State {
     std::map<std::uint64_t,RootSignature> roots;std::map<std::uint64_t,Pipeline> pipelines;std::map<std::uint64_t,List> lists;
     std::map<std::uint64_t,Fence> fences;std::map<std::uint64_t,std::vector<std::uint8_t>> blobs;std::map<std::uint64_t,std::uint32_t> queues;std::map<std::uint64_t,SwapChain> swaps;
     std::map<std::uint64_t,MemoryHeap> memory_heaps;std::map<std::uint64_t,QueryHeap> query_heaps;
+    // 非同步提交：ExecuteCommandLists 不等 GPU，記錄各佇列最近一次提交的完成旗標與待讀回資源（READBACK 堆積）。
+    // Queue.Signal 遇到未完成的提交時登記待完成訊號，由 poll_d3d12（客體等待輪詢、GetCompletedValue、
+    // SetEventOnCompletion）在 GPU 完成後依序讀回、設定 fence 值並觸發事件。
+    struct QueueState {std::shared_ptr<const std::atomic<bool>> done;std::vector<std::uint64_t> readbacks;};
+    std::map<std::uint64_t,QueueState> queue_states;
     // 管線庫：名稱對應已儲存的 PSO（持有參照）；由序列化資料還原的名稱沒有現存 PSO（值為 0），載入時依呼叫端描述重新建立。
     std::map<std::uint64_t,std::map<std::u16string,std::uint64_t>> libraries;
     std::map<Kind,std::uint64_t> tables;
     std::uint64_t next_address{UINT64_C(0x0000100000000000)},next_descriptor{UINT64_C(0x0000700000000000)};
+    // 緩衝 GPU 位址 → 資源（位址單調遞增、不重用）；資源釋放後的失效項目於查詢時清除。
+    std::map<std::uint64_t,std::uint64_t> addresses;
     std::set<std::string> reported;
 };
 namespace {
@@ -164,12 +173,40 @@ std::uint64_t WindowsServices::d3d12_device_of(std::uint64_t object) const{
 bool WindowsServices::d3d12_resource_width(std::uint64_t resource,std::uint64_t& width) const{
     if(!d3d12_)return false;const auto found=d3d12_->resources.find(resource);if(found==d3d12_->resources.end())return false;width=found->second.width;return true;
 }
+// fence 達到 value：設定完成值並觸發已達門檻的事件。
+void WindowsServices::d3d12_signal_fence(std::uint64_t object,std::uint64_t value){
+    if(!d3d12_)return;const auto found=d3d12_->fences.find(object);if(found==d3d12_->fences.end())return;auto& fence=found->second;
+    fence.value=value;
+    std::erase_if(fence.events,[&](const auto& item){if(item.first>fence.value)return false;if(const auto event=runtime_.wait_objects.find(item.second);event!=runtime_.wait_objects.end())event->second.set_signal(true);return true;});
+}
+// 共用 GPU 完成通知：登記後立即檢查一次（已完成者直接套用）。
+void WindowsServices::queue_gpu_signal(GuestMemory& memory,std::shared_ptr<const std::atomic<bool>> done,std::uint64_t order,std::function<void(GuestMemory&)> apply){
+    gpu_signals_.push_back({std::move(done),order,std::move(apply)});poll_gpu_signals(memory);
+}
+void WindowsServices::poll_gpu_signals(GuestMemory& memory){
+    if(gpu_signals_.empty())return;std::set<std::uint64_t> blocked;
+    for(auto it=gpu_signals_.begin();it!=gpu_signals_.end();){
+        if(blocked.contains(it->order) || (it->done && !it->done->load(std::memory_order_acquire))){blocked.insert(it->order);++it;continue;}
+        auto apply=std::move(it->apply);it=gpu_signals_.erase(it);if(apply)apply(memory);
+    }
+}
+// 有待完成的 GPU 通知時，客體等待最多 0.25 ms 就重新檢查。
+std::uint64_t WindowsServices::gpu_signal_wakeup_ns() const {return gpu_signals_.empty()?0:250000;}
 std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);
     // d3d12.lib 以序號 101 匯入 D3D12CreateDevice。
     const std::string_view symbol=service.symbol=="#101"?"D3D12CreateDevice":service.symbol;
     // 診斷：X64ARM_TRACE_GRAPHICS_ERRORS 時列出回傳失敗 HRESULT 的 D3D12 方法（32 位元且最高位元為 1 的回傳值）。
     static const bool trace_graphics_errors=std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS")!=nullptr;
+    // 診斷：X64ARM_TRACE_D3D12 時即時列出未支援方法、無效錄製、重播失敗與 ExecuteIndirect 參數（有數量上限）。
+    static const bool trace_d3d12=std::getenv("X64ARM_TRACE_D3D12")!=nullptr;
+    static std::atomic<unsigned> trace_lines{};
+    // 被 ExecuteIndirect 讀取過的參數資源；診斷時記錄寫入它們的清除／複製／立即寫入命令（每種命令與資源限幾次）。
+    static const auto watched_arguments=[]()->std::set<std::uint64_t>&{static std::set<std::uint64_t> watched;return watched;};
+    static std::map<std::pair<std::string,std::uint64_t>,unsigned> watch_counts;
+    const auto watch=[&](std::string_view op,std::uint64_t resource)->bool{
+        if(!trace_d3d12 || !watched_arguments().contains(resource))return false;return ++watch_counts[{std::string(op),resource}]<=6;};
+    const auto trace=[&](const char* format,auto... values){if(trace_d3d12 && trace_lines.fetch_add(1,std::memory_order_relaxed)<4000)std::fprintf(stderr,format,values...);};
     const auto finish=[&](std::uint64_t value){
         if(trace_graphics_errors && value<=UINT32_MAX && (value&0x80000000U))std::fprintf(stderr,"[d3d12] %.*s HRESULT=%08x\n",static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned>(value));
         arg.return_to(state,value);return std::optional<std::uint32_t>{};};
@@ -180,7 +217,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
     const auto load=[&](std::uint64_t at,unsigned bits){return memory.load(GuestAddress{at},static_cast<std::uint8_t>(bits));};
     const auto store=[&](std::uint64_t at,unsigned bits,std::uint64_t value){memory.store(GuestAddress{at},static_cast<std::uint8_t>(bits),value);};
     const auto bytes=[&](std::uint64_t at,std::size_t size){std::vector<std::uint8_t> out(size);if(size)memory.read(GuestAddress{at},out);return out;};
-    const auto report=[&](std::string_view name){if(bridge.reported.insert(std::string(name)).second)runtime_.module_events.push_back("d3d12_note=尚未支援 "+std::string(name));};
+    const auto report=[&](std::string_view name){if(bridge.reported.insert(std::string(name)).second){runtime_.module_events.push_back("d3d12_note=尚未支援 "+std::string(name));trace("[d3d12] 尚未支援 %.*s\n",static_cast<int>(name.size()),name.data());}};
     const auto create=[&](Kind kind,std::uint64_t device)->std::uint64_t{
         auto& table=bridge.tables[kind];
         if(!table){
@@ -389,14 +426,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         return nullptr;
     };
     const auto resource_at=[&](std::uint64_t address)->std::pair<std::uint64_t,std::uint64_t>{
-        for(const auto& [object,resource]:bridge.resources)if(resource.address && address>=resource.address && address<resource.address+std::max<std::uint64_t>(resource.width,1))return {object,address-resource.address};
-        return {0,0};
+        auto it=bridge.addresses.upper_bound(address);if(it==bridge.addresses.begin())return {0,0};--it;
+        const auto found=bridge.resources.find(it->second);
+        if(found==bridge.resources.end() || found->second.address!=it->first){bridge.addresses.erase(it);return {0,0};}
+        const auto& resource=found->second;if(address>=resource.address+std::max<std::uint64_t>(resource.width,1))return {0,0};
+        return {found->first,address-resource.address};
     };
     // UPLOAD 堆積：GPU 讀取前以客體後備記憶體更新影子資源；READBACK：GPU 寫入後回寫。
-    const auto gpu_resource=[&](std::uint64_t object)->std::shared_ptr<GraphicsResource>{
+    // 同一次服務呼叫（一次 ExecuteCommandLists 重播）期間客體不會改寫已提交的上傳資料：每個資源只上傳實際用到的範圍，
+    // 已上傳的範圍不重複複製；下一次呼叫重新上傳（客體可能已寫入新資料）。
+    std::map<std::uint64_t,std::vector<std::pair<std::uint64_t,std::uint64_t>>> uploaded;
+    const auto gpu_resource=[&](std::uint64_t object,std::uint64_t first=0,std::uint64_t length=UINT64_MAX)->std::shared_ptr<GraphicsResource>{
         auto& r=bridge.resources.at(object);
         if(!r.gpu){GraphicsResourceDesc d;d.dimension=1;d.width=static_cast<std::uint32_t>(r.width);d.bind=0x8c;r.gpu=native.graphics_resource(d);}
-        if(r.cpu && r.uploads())native.graphics_write(GraphicsView{r.gpu},bytes(r.cpu,static_cast<std::size_t>(r.width)),static_cast<std::uint32_t>(r.width),static_cast<std::uint32_t>(r.width));
+        if(r.cpu && r.uploads() && first<r.width){
+            // 範圍對齊 4 位元組：Metal 緩衝 blit 要求位移與長度為 4 的倍數，否則後端改走同步等待後直寫。
+            // 來源是完整的客體記憶體，多上傳邊界上的位元組不影響內容。
+            auto end=length>r.width-first?r.width:first+length;first&=~UINT64_C(3);end=std::min<std::uint64_t>(r.width,(end+3)&~UINT64_C(3));auto& done=uploaded[object];
+            if(std::none_of(done.begin(),done.end(),[&](const auto& range){return range.first<=first && end<=range.second;})){
+                thread_local std::vector<std::uint8_t> scratch;const auto size=static_cast<std::size_t>(end-first);if(scratch.size()<size)scratch.resize(size);
+                const std::span<std::uint8_t> data(scratch.data(),size);memory.read(GuestAddress{r.cpu+first},data);
+                GraphicsView view{r.gpu};view.first=static_cast<std::uint32_t>(first);view.count=static_cast<std::uint32_t>(size);
+                native.graphics_write(view,data,static_cast<std::uint32_t>(size),static_cast<std::uint32_t>(size));done.emplace_back(first,end);
+            }
+        }
         return r.gpu;
     };
     const auto read_back=[&](std::uint64_t object){
@@ -406,7 +459,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
     if(kind==Kind::SwapChain){
         auto& swap=bridge.swaps.at(self);
         if(member=="Present" || member=="Present1"){
-            if(trace_graphics_errors && (swap.frames<8 || !(swap.frames%64)))std::fprintf(stderr,"[d3d12] Present frame=%llu sync=%u flags=%#x window=%#llx known=%d\n",static_cast<unsigned long long>(swap.frames),u32(1),u32(2),static_cast<unsigned long long>(swap.window),gui_.windows.contains(swap.window)?1:0);
+            if(trace_graphics_errors && (swap.frames<8 || !(swap.frames%64)))std::fprintf(stderr,"[d3d12] Present frame=%llu t=%.3f sync=%u flags=%#x window=%#llx known=%d\n",static_cast<unsigned long long>(swap.frames),
+                std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),u32(1),u32(2),static_cast<unsigned long long>(swap.window),gui_.windows.contains(swap.window)?1:0);
+            // 診斷：X64ARM_TRACE_GRAPHICS_STATS=1 每 64 幀輸出 Metal 後端累計統計（GPU 忙碌、CPU 等待、命令執行緒同步、encoder 斷點），與 D3D11 相同。
+            static const bool trace_stats=[] {const auto* value=std::getenv("X64ARM_TRACE_GRAPHICS_STATS");return value && std::string_view(value)=="1";}();
+            if(trace_stats && !(swap.frames%64))std::fprintf(stderr,"[d3d12_metal] frames=%llu t=%.3f %s",static_cast<unsigned long long>(swap.frames),
+                std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),native.statistics().c_str());
             if(u32(2)&1)return finish(ok); // DXGI_PRESENT_TEST。
             auto& buffer=bridge.resources.at(swap.buffers[swap.index]);GraphicsView view{buffer.gpu};
             try{
@@ -615,13 +673,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             const bool depth=member=="CreateDepthStencilView";const auto target=descriptor(arg(3),false);if(!target)return finish(0);*target={};
             const auto r=bridge.resources.find(arg(1));if(r==bridge.resources.end() || !r->second.gpu)return finish(0);
             target->type=depth?D3D12State::Descriptor::Type::Depth:D3D12State::Descriptor::Type::Target;target->resource=arg(1);
-            GraphicsView v{r->second.gpu};v.format=r->second.format;v.slices=1;
+            // 空描述＝整個資源：陣列取全部切片，3D 取全部 W 切片（mip 0）。
+            const auto& viewed=r->second;GraphicsView v{viewed.gpu};v.format=viewed.format;v.slices=std::max(1U,viewed.depth);
             if(arg(2)){
                 const auto format=static_cast<std::uint32_t>(load(arg(2),32));if(format)v.format=format;const auto dimension=static_cast<std::uint32_t>(load(arg(2)+4,32));
                 const auto base=depth?12U:8U;if(depth)v.flags=static_cast<std::uint32_t>(load(arg(2)+8,32))&3U;
-                v.level=static_cast<std::uint32_t>(load(arg(2)+base,32));
-                const bool array=depth?(dimension==3 || dimension==5):(dimension==3 || dimension==5);
-                if(array){v.slice=static_cast<std::uint32_t>(load(arg(2)+base+4,32));v.slices=static_cast<std::uint32_t>(load(arg(2)+base+8,32));}
+                const auto field=[&](unsigned index){return static_cast<std::uint32_t>(load(arg(2)+base+index*4,32));};
+                // RTV：1D=2、1D 陣列=3、2D=4、2D 陣列=5、MS=6、MS 陣列=7、3D=8；DSV：1D=1、1D 陣列=2、2D=3、2D 陣列=4、MS=5、MS 陣列=6。
+                const unsigned view_kind=depth?dimension+1:dimension;v.slice=0;v.slices=1;
+                if(view_kind==2 || view_kind==4)v.level=field(0);
+                else if(view_kind==3 || view_kind==5){v.level=field(0);v.slice=field(1);v.slices=field(2);}
+                else if(view_kind==7){v.slice=field(0);v.slices=field(1);}
+                else if(view_kind==8 && !depth){
+                    v.level=field(0);v.slice=field(1);const auto planes=std::max(1U,viewed.depth>>std::min(v.level,31U));
+                    v.slices=field(2)==UINT32_MAX?(v.slice<planes?planes-v.slice:0):field(2);
+                }
+                const auto total=viewed.dimension==4?std::max(1U,viewed.depth>>std::min(v.level,31U)):std::max(1U,viewed.depth);
+                if(v.slices==UINT32_MAX)v.slices=v.slice<total?total-v.slice:0;
             }
             target->view=v;return finish(0);
         }
@@ -660,7 +728,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 try{r.gpu=native.graphics_resource(d);}catch(const std::exception& error){runtime_.module_events.push_back(std::string("d3d12_note=建立資源失敗：")+error.what());return invalid;}
             }
             if(r.dimension==1){r.address=bridge.next_address;bridge.next_address+=(r.width+0xffffU)&~UINT64_C(0xffff);}
-            const auto object=create(Kind::Resource,self);bridge.resources[object]=std::move(r);return give(object,riid,out);
+            const auto object=create(Kind::Resource,self);if(r.address)bridge.addresses[r.address]=object;bridge.resources[object]=std::move(r);return give(object,riid,out);
         };
         if(member=="CreateCommittedResource" || member=="CreateCommittedResource1" || member=="CreateCommittedResource2" || member=="CreateCommittedResource3"){
             // CreateCommittedResource(heapProps, heapFlags, desc, initialState, clear, riid, out)。
@@ -842,11 +910,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         report(symbol);return finish(not_implemented);
     }
     if(kind==Kind::Fence){
+        poll_gpu_signals(memory);
         auto& fence=bridge.fences.at(self);
-        const auto signal=[&](std::uint64_t value){
-            fence.value=value;
-            std::erase_if(fence.events,[&](const auto& item){if(item.first>fence.value)return false;if(const auto event=runtime_.wait_objects.find(item.second);event!=runtime_.wait_objects.end())event->second.set_signal(true);return true;});
-        };
+        const auto signal=[&](std::uint64_t value){d3d12_signal_fence(self,value);};
         if(member=="GetCompletedValue")return finish(fence.value);
         if(member=="Signal"){signal(arg(1));return finish(ok);}
         if(member=="SetEventOnCompletion"){
@@ -896,6 +962,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
     if(kind==Kind::List){
         auto& list=bridge.lists.at(self);
         if(member=="GetType")return finish(list.type);
+        struct InvalidTrace {const D3D12State::List& list;bool before;std::string_view member;bool enabled;
+            ~InvalidTrace(){if(enabled && !before && list.invalid_recording)std::fprintf(stderr,"[d3d12] 無效錄製：List.%.*s\n",static_cast<int>(member.size()),member.data());}
+        } invalid_trace{list,list.invalid_recording,member,trace_d3d12};
         if(member=="Close"){if(!list.open)return finish(fail);list.open=false;return finish(list.invalid_recording?invalid:ok);}
         if(member=="Reset"){list.commands.clear();list.callbacks.clear();list.open=true;list.invalid_recording=false;list.allocator=arg(1);if(arg(2))list.commands.push_back({"SetPipelineState",{arg(2)},{},{}});return finish(ok);}
         if(!list.open)return finish(0);
@@ -914,6 +983,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         if(member=="SetComputeRoot32BitConstants" || member=="SetGraphicsRoot32BitConstants")command.data=bytes(arg(3),std::size_t{u32(2)}*4);
         else if(member=="SetDescriptorHeaps")for(std::uint32_t i=0;i<u32(1);++i)command.values.push_back(load(arg(2)+i*8,64));
         else if(member=="CopyTextureRegion"){command.data=bytes(arg(1),48);const auto src=bytes(arg(5),48);command.data.insert(command.data.end(),src.begin(),src.end());if(arg(6)){const auto box=bytes(arg(6),24);command.data.insert(command.data.end(),box.begin(),box.end());}}
+        else if(member=="WriteBufferImmediate"){
+            // D3D12_WRITEBUFFERIMMEDIATE_PARAMETER 陣列（GPU 位址＋32 位元值，16 位元組一筆）在錄製時複製；
+            // 模式陣列（DEFAULT／MARKER_IN／MARKER_OUT）在依序重播下語義相同，不另保存。
+            if(!u32(1) || u32(1)>65536 || !arg(2)){list.invalid_recording=true;return finish(0);}
+            command.data=bytes(arg(2),std::size_t{u32(1)}*16);
+        }
         else if(member=="ClearUnorderedAccessViewUint" || member=="ClearUnorderedAccessViewFloat"){
             const auto entry=descriptor(arg(2),false);
             if(!entry || entry->type!=D3D12State::Descriptor::Type::Unordered || entry->resource!=arg(3) || u32(5)>65536 || (u32(5) && !arg(6))){list.invalid_recording=true;return finish(0);}
@@ -949,12 +1024,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         if(member=="Wait")return finish(ok);
         if(member=="Signal"){
             const auto fence=bridge.fences.find(arg(1));if(fence==bridge.fences.end())return finish(invalid);
-            fence->second.value=arg(2);
-            std::erase_if(fence->second.events,[&](const auto& item){if(item.first>fence->second.value)return false;if(const auto event=runtime_.wait_objects.find(item.second);event!=runtime_.wait_objects.end())event->second.set_signal(true);return true;});
-            return finish(ok);
+            // 佇列仍有未完成的提交（或待讀回、或更早的待完成訊號）：登記，GPU 完成後才生效，維持訊號順序。
+            auto& queue_state=bridge.queue_states[self];
+            const bool outstanding=(queue_state.done && !queue_state.done->load(std::memory_order_acquire)) || !queue_state.readbacks.empty();
+            if(outstanding || !gpu_signals_.empty()){
+                auto readbacks=std::move(queue_state.readbacks);queue_state.readbacks.clear();
+                queue_gpu_signal(memory,queue_state.done,bridge.objects.at(self).device,[this,readbacks=std::move(readbacks),fence=arg(1),value=arg(2)](GuestMemory& target){
+                    if(!d3d12_)return;auto& state=*d3d12_;
+                    // 先讀回 GPU 寫入的 READBACK 資源，再讓 fence 達到門檻（客體看到完成時資料已就緒）。
+                    for(const auto object:readbacks){
+                        const auto found=state.resources.find(object);if(found==state.resources.end() || !found->second.cpu || !found->second.gpu)continue;
+                        const auto owner=state.objects.find(object);if(owner==state.objects.end())continue;const auto device=state.devices.find(owner->second.device);if(device==state.devices.end())continue;
+                        try{
+                            const auto data=device->second.native->graphics_read(GraphicsView{found->second.gpu});auto& r=found->second;
+                            target.write(GuestAddress{r.cpu},std::span<const std::uint8_t>(data).first(std::min<std::size_t>(data.size(),static_cast<std::size_t>(r.width))));
+                        }catch(const std::exception& error){runtime_.module_events.push_back(std::string("d3d12_note=非同步讀回失敗：")+error.what());}
+                    }
+                    d3d12_signal_fence(fence,value);
+                });
+                return finish(ok);
+            }
+            d3d12_signal_fence(arg(1),arg(2));return finish(ok);
         }
         if(member=="ExecuteCommandLists"){
-            std::set<std::uint64_t> written;
+            std::set<std::uint64_t> written;std::string failed_op;
             try{
                 for(std::uint32_t l=0;l<u32(1);++l){
                     const auto handle=load(arg(2)+l*8,64);const auto found_list=bridge.lists.find(handle);if(found_list==bridge.lists.end())continue;
@@ -962,14 +1055,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                     struct Roots {std::uint64_t root{};std::map<std::uint32_t,std::uint64_t> tables,views;std::map<std::uint32_t,std::vector<std::uint8_t>> constants;};
                     Roots compute_roots,graphics_roots;std::uint64_t pipeline=0;GraphicsDraw draw;std::uint32_t target_count=0;
                     std::uint64_t occlusion_heap=0;std::uint32_t occlusion_index=0;constexpr std::uint32_t occlusion_slots=4096;
-                    const auto constant_buffer=[&](std::uint64_t address,std::uint32_t size)->std::shared_ptr<GraphicsResource>{
-                        const auto [object,offset]=resource_at(address);if(!object)return {};auto& resource=bridge.resources.at(object);
-                        if(!offset && (!size || size>=resource.width))return gpu_resource(object);
-                        // 子範圍 CBV：建立對應內容的常數緩衝。
-                        const auto length=static_cast<std::uint32_t>(std::min<std::uint64_t>(size?size:resource.width-offset,resource.width-offset));
-                        std::vector<std::uint8_t> data;
-                        if(resource.cpu)data=bytes(resource.cpu+offset,length);else{auto all=native.graphics_read(GraphicsView{resource.gpu});data.assign(all.begin()+static_cast<std::ptrdiff_t>(offset),all.begin()+static_cast<std::ptrdiff_t>(offset+length));}
-                        GraphicsResourceDesc d;d.dimension=1;d.width=(length+15U)&~15U;d.bind=4;auto buffer=native.graphics_resource(d);data.resize(d.width);native.graphics_write(GraphicsView{buffer},data,d.width,d.width);return buffer;
+                    // CBV 位址依 D3D12 規範 256 位元組對齊：綁定上層緩衝並設定位移，只上傳用到的範圍，不再為子範圍另建緩衝。
+                    const auto constant_view=[&](std::uint64_t address,std::uint32_t size)->std::pair<std::shared_ptr<GraphicsResource>,std::uint32_t>{
+                        const auto [object,offset]=resource_at(address);if(!object || offset>UINT32_MAX)return {};auto& resource=bridge.resources.at(object);
+                        if(!resource.cpu && !resource.gpu)return {};
+                        return {gpu_resource(object,offset,size?size:UINT64_MAX),static_cast<std::uint32_t>(offset)};
                     };
                     // 描述元表鏡像：把待更新的描述元換成後端的資源 ID／緩衝位址，寫入 GPU 鏡像。
                     const auto refresh_mirror=[&](D3D12State::Heap& heap){
@@ -981,8 +1071,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         for(std::uint32_t i=0;i<heap.count;++i){
                             if(!heap.dirty[i])continue;heap.dirty[i]=0;
                             const auto& entry=heap.descriptors[i];const bool uav=entry.type==D3D12State::Descriptor::Type::Unordered;GraphicsView view;
-                            if((entry.type==D3D12State::Descriptor::Type::Shader || uav) && entry.resource){
-                                const auto& resource=bridge.resources.at(entry.resource);view=entry.view;view.resource=resource.dimension==1?gpu_resource(entry.resource):resource.gpu;}
+                            // 描述元可指向已釋放的資源（GPU 未存取即合法）：視為空描述元，不中止整批重播。
+                            const auto live=entry.resource?bridge.resources.find(entry.resource):bridge.resources.end();
+                            if((entry.type==D3D12State::Descriptor::Type::Shader || uav) && live!=bridge.resources.end()){
+                                const auto& resource=live->second;view=entry.view;view.resource=resource.dimension==1?gpu_resource(entry.resource,entry.view.first,entry.view.count?entry.view.count:UINT64_MAX):resource.gpu;}
                             std::array<std::uint64_t,2> texture{},buffer{};std::shared_ptr<void> keep,unused;
                             if(!native.graphics_descriptor(view,uav?7U:6U,texture,keep))native.graphics_descriptor(GraphicsView{},6,texture,keep);
                             if(!native.graphics_descriptor(view,uav?9U:8U,buffer,unused))buffer={};
@@ -1014,7 +1106,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                         if(b.count && b.count<=16)for(std::uint64_t k=0;k<b.count && first+k<heap.count;++k){
                                             const auto& entry=heap.descriptors[first+k];
                                             if((entry.type!=D3D12State::Descriptor::Type::Shader && entry.type!=D3D12State::Descriptor::Type::Unordered) || !entry.resource)continue;
-                                            const auto& resource=bridge.resources.at(entry.resource);auto view=entry.view;view.resource=resource.dimension==1?gpu_resource(entry.resource):resource.gpu;
+                                            const auto live=bridge.resources.find(entry.resource);if(live==bridge.resources.end())continue;
+                                            const auto& resource=live->second;auto view=entry.view;view.resource=resource.dimension==1?gpu_resource(entry.resource,entry.view.first,entry.view.count?entry.view.count:UINT64_MAX):resource.gpu;
                                             table.views.push_back(view);if(entry.type==D3D12State::Descriptor::Type::Unordered)written.insert(entry.resource);
                                         }
                                         stage.tables.push_back(std::move(table));bound=true;break;
@@ -1041,12 +1134,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             if(parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS){
                                 auto data=roots.constants[index];data.resize((std::max<std::size_t>(parameter.values*4,data.size())+15U)&~std::size_t{15});
                                 GraphicsResourceDesc d;d.dimension=1;d.width=static_cast<std::uint32_t>(data.size());d.bind=4;auto buffer=native.graphics_resource(d);native.graphics_write(GraphicsView{buffer},data,d.width,d.width);
-                                if(parameter.reg<stage.constants.size())stage.constants[parameter.reg]=buffer;
+                                if(parameter.reg<stage.constants.size()){stage.constants[parameter.reg]=buffer;stage.constant_offsets[parameter.reg]=0;}
                             }else if(parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_CBV){
-                                if(const auto address=roots.views[index];address && parameter.reg<stage.constants.size())stage.constants[parameter.reg]=constant_buffer(address,0);
+                                if(const auto address=roots.views[index];address && parameter.reg<stage.constants.size()){const auto [buffer,at]=constant_view(address,0);stage.constants[parameter.reg]=buffer;stage.constant_offsets[parameter.reg]=at;}
                             }else if(parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_SRV || parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_UAV){
                                 const auto [object,offset]=resource_at(roots.views[index]);if(!object)continue;auto& resource=bridge.resources.at(object);
-                                GraphicsView view{gpu_resource(object)};view.first=static_cast<std::uint32_t>(offset);view.count=static_cast<std::uint32_t>(resource.width-offset);view.format=42;
+                                GraphicsView view{gpu_resource(object,offset)};view.first=static_cast<std::uint32_t>(offset);view.count=static_cast<std::uint32_t>(resource.width-offset);view.format=42;
                                 if(parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_UAV){place_unordered(parameter.reg,view);written.insert(object);}
                                 else if(parameter.reg<stage.resources.size())stage.resources[parameter.reg]=view;
                             }else{
@@ -1058,8 +1151,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                     for(std::uint32_t i=0;i<count;++i){
                                         const auto entry=descriptor(base+(std::uint64_t{range.offset}+i)*descriptor_size,true);if(!entry)continue;const auto reg=range.base+i;
                                         if(range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER){if(reg<stage.samplers.size())stage.samplers[reg]=entry->sampler;continue;}
-                                        if(range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV){if(reg<stage.constants.size() && entry->address)stage.constants[reg]=constant_buffer(entry->address,entry->size);continue;}
-                                        if(!entry->resource)continue;auto view=entry->view;auto& resource=bridge.resources.at(entry->resource);view.resource=resource.dimension==1?gpu_resource(entry->resource):resource.gpu;
+                                        if(range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV){if(reg<stage.constants.size() && entry->address){const auto [buffer,at]=constant_view(entry->address,entry->size);stage.constants[reg]=buffer;stage.constant_offsets[reg]=at;}continue;}
+                                        if(!entry->resource)continue;auto view=entry->view;auto& resource=bridge.resources.at(entry->resource);view.resource=resource.dimension==1?gpu_resource(entry->resource,entry->view.first,entry->view.count?entry->view.count:UINT64_MAX):resource.gpu;
                                         if(range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV){place_unordered(reg,view);written.insert(entry->resource);}
                                         else if(reg<stage.resources.size())stage.resources[reg]=view;
                                     }
@@ -1085,7 +1178,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                     // 間接命令在執行時讀取，前面的 GPU 寫入／複製因此可產生命令與計數。
                     std::deque<D3D12State::Command> pending(found_list->second.commands.begin(),found_list->second.commands.end());
                     while(!pending.empty()){
-                        auto c=std::move(pending.front());pending.pop_front();
+                        auto c=std::move(pending.front());pending.pop_front();if(trace_d3d12)failed_op=c.op;
                         const auto& v=c.values;const bool graphics=c.op.find("Graphics")!=std::string::npos;auto& roots=graphics?graphics_roots:compute_roots;
                         const auto ends=[&](std::string_view suffix){return c.op.ends_with(suffix);};
                         if(predicate_skip && (c.op=="DrawInstanced" || c.op=="DrawIndexedInstanced" || c.op=="Dispatch" ||
@@ -1103,10 +1196,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         else if(c.op=="SetPredication"){
                             predicate_skip=false;
                             if(v[0]){
-                                if((v[1]&7) || v[2]>1 || found_list->second.type==1)throw std::invalid_argument("SetPredication 參數無效");
+                                // Operation 是 32 位元列舉：暫存器高 32 位元不保證為 0，只取低位。
+                                const auto operation=static_cast<std::uint32_t>(v[2]);
+                                if((v[1]&7) || operation>1 || found_list->second.type==1)throw std::invalid_argument("SetPredication 參數無效");
                                 const auto data=read_buffer(v[0],v[1],8);std::uint64_t value;std::memcpy(&value,data.data(),8);
                                 // 在 SetPredication 執行當下快照 64 位值，後續緩衝變動不改變判斷。
-                                predicate_skip=v[2]==0?value==0:value!=0;
+                                predicate_skip=operation==0?value==0:value!=0;
                             }
                         }
                         else if(c.op=="ExecuteIndirect"){
@@ -1118,9 +1213,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             if((v[3]&3) || (v[5]&3))throw std::invalid_argument("ExecuteIndirect 位移未對齊");
                             const auto& argument_resource=bridge.resources.at(v[2]);
                             if(argument_resource.dimension!=1 || v[3]>argument_resource.width || std::uint64_t{static_cast<std::uint32_t>(v[1])}*signature.stride>argument_resource.width-v[3])throw std::invalid_argument("ExecuteIndirect 最大命令範圍無效");
+                            if(const auto& only=signature.arguments.front();!v[4] && signature.arguments.size()==1 && only.type<=2 && !argument_resource.cpu &&
+                               v[3]+std::uint64_t{static_cast<std::uint32_t>(v[1])}*signature.stride<=UINT32_MAX){
+                                // 參數留在 GPU：簽章只有一個 Draw／DrawIndexed／Dispatch 且沒有計數緩衝時，D3D12 與 Metal 的間接參數排列相同，
+                                // 直接展開成 GPU 間接命令，不必等前面的 GPU 工作完成再讀回（否則每次 ExecuteIndirect 都讓 CPU 與 GPU 互等）。
+                                const char* op=only.type==2?"DispatchIndirectGpu":only.type==1?"DrawIndexedIndirectGpu":"DrawIndirectGpu";
+                                for(auto i=static_cast<std::uint32_t>(v[1]);i-->0;)pending.push_front({op,{v[2],v[3]+std::uint64_t{i}*signature.stride},{},{}});
+                                continue;
+                            }
                             auto count=static_cast<std::uint32_t>(v[1]);
                             if(v[4]){const auto data=read_buffer(v[4],v[5],4);std::uint32_t limit;std::memcpy(&limit,data.data(),4);count=std::min(count,limit);}
                             const auto data=read_buffer(v[2],v[3],std::uint64_t{count}*signature.stride);
+                            if(trace_d3d12 && count && !signature.arguments.empty()){
+                                // 只在同一參數位置的值改變時輸出，避免每幀重複的固定參數占滿上限。
+                                static std::map<std::pair<std::uint64_t,std::uint64_t>,std::array<std::uint32_t,3>> last;watched_arguments().insert(v[2]);
+                                const auto& a=signature.arguments.back();std::array<std::uint32_t,3> w{};std::memcpy(w.data(),data.data()+(signature.stride-a.size),std::min<std::size_t>(12,a.size));
+                                const auto [seen,added]=last.try_emplace({v[2],v[3]},w);
+                                if(added || seen->second!=w)seen->second=w,trace("[d3d12] ExecuteIndirect op=%u 參數=%llx+%llu 計數=%llx 筆數=%u/%u 末參數型別=%u 值=%u,%u,%u\n",signature.operation,
+                                    static_cast<unsigned long long>(v[2]),static_cast<unsigned long long>(v[3]),static_cast<unsigned long long>(v[4]),count,static_cast<std::uint32_t>(v[1]),a.type,w[0],w[1],w[2]);
+                            }
                             const std::string prefix=signature.operation==2?"SetComputeRoot":"SetGraphicsRoot";
                             std::vector<D3D12State::Command> expanded;
                             const auto decode=[&](const D3D12State::IndirectArgument& a,const std::uint8_t* data,bool reset){
@@ -1144,16 +1255,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         else if(ends("Root32BitConstants")){auto& data=roots.constants[static_cast<std::uint32_t>(v[0])];const auto offset=static_cast<std::uint32_t>(v[3])*4;if(data.size()<offset+c.data.size())data.resize(offset+c.data.size());std::memcpy(data.data()+offset,c.data.data(),c.data.size());}
                         else if(c.op=="IASetPrimitiveTopology")draw.topology=static_cast<std::uint32_t>(v[0]);
                         else if(c.op=="IASetVertexBuffers"){
-                            for(std::size_t i=0;i*16<c.data.size() && v[0]+i<draw.vertices.size();++i){
-                                std::uint64_t location;std::uint32_t stride;std::memcpy(&location,c.data.data()+i*16,8);std::memcpy(&stride,c.data.data()+i*16+12,4);
+                            const auto start_slot=static_cast<std::uint32_t>(v[0]); // 32 位元 StartSlot，忽略暫存器高位元。
+                            for(std::size_t i=0;i*16<c.data.size() && start_slot+i<draw.vertices.size();++i){
+                                std::uint64_t location;std::uint32_t size,stride;std::memcpy(&location,c.data.data()+i*16,8);std::memcpy(&size,c.data.data()+i*16+8,4);std::memcpy(&stride,c.data.data()+i*16+12,4);
                                 const auto [object,offset]=resource_at(location);
-                                draw.vertices[v[0]+i]=object?GraphicsVertexBuffer{gpu_resource(object),stride,static_cast<std::uint32_t>(offset)}:GraphicsVertexBuffer{};
+                                draw.vertices[start_slot+i]=object?GraphicsVertexBuffer{gpu_resource(object,offset,size),stride,static_cast<std::uint32_t>(offset)}:GraphicsVertexBuffer{};
                             }
                         }
                         else if(c.op=="IASetIndexBuffer"){
                             if(c.data.size()<16){draw.indices.reset();continue;}
-                            std::uint64_t location;std::uint32_t format;std::memcpy(&location,c.data.data(),8);std::memcpy(&format,c.data.data()+12,4);
-                            const auto [object,offset]=resource_at(location);draw.indices=object?gpu_resource(object):nullptr;draw.index_offset=static_cast<std::uint32_t>(offset);draw.index_format=format;
+                            std::uint64_t location;std::uint32_t size,format;std::memcpy(&location,c.data.data(),8);std::memcpy(&size,c.data.data()+8,4);std::memcpy(&format,c.data.data()+12,4);
+                            const auto [object,offset]=resource_at(location);draw.indices=object?gpu_resource(object,offset,size):nullptr;draw.index_offset=static_cast<std::uint32_t>(offset);draw.index_format=format;
                         }
                         else if(c.op=="RSSetViewports"){draw.viewports.clear();for(std::size_t i=0;i+24<=c.data.size();i+=24){std::array<float,6> viewport;std::memcpy(viewport.data(),c.data.data()+i,24);draw.viewports.push_back(viewport);}}
                         else if(c.op=="RSSetScissorRects"){draw.scissors.clear();for(std::size_t i=0;i+16<=c.data.size();i+=16){std::array<std::int32_t,4> rect;std::memcpy(rect.data(),c.data.data()+i,16);draw.scissors.push_back(rect);}}
@@ -1166,8 +1278,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         }
                         else if(c.op=="ClearUnorderedAccessViewUint" || c.op=="ClearUnorderedAccessViewFloat"){
                             auto view=c.views.at(0);view.resource=gpu_resource(v[2]);std::array<std::uint32_t,4> values;std::memcpy(values.data(),c.data.data(),16);
+                            if(watch(c.op,v[2]))trace("[d3d12] 監看 %s 資源=%llx first=%u count=%u format=%u flags=%u 值=%u 矩形=%llu\n",c.op.c_str(),static_cast<unsigned long long>(v[2]),view.first,view.count,view.format,view.flags,values[0],static_cast<unsigned long long>(v[4]));
                             const bool floating=c.op.ends_with("Float");const auto& desc=view.resource->desc;
-                            if(!v[4]){
+                            // NumRects 是 32 位元參數：暫存器高位元可能殘留垃圾，誤判成有矩形會整個略過清除。
+                            if(!static_cast<std::uint32_t>(v[4])){
                                 if(!native.graphics_clear_unordered(view,values,floating))throw std::invalid_argument("UAV 清除值與格式不相容");
                             }else{
                                 // 共用 Metal 清除與複製：矩形只影響指定區域，其餘像素保持原值。
@@ -1192,14 +1306,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             float depth;std::memcpy(&depth,c.data.data(),4);const std::array<float,4> values{depth,static_cast<float>(v[3]&0xffU),0,0};
                             if(c.views[0].resource)native.graphics_clear(c.views[0],values,static_cast<std::uint32_t>(v[1]));
                         }
-                        else if(c.op=="DrawInstanced" || c.op=="DrawIndexedInstanced"){
+                        else if(c.op=="DrawInstanced" || c.op=="DrawIndexedInstanced" || c.op=="DrawIndirectGpu" || c.op=="DrawIndexedIndirectGpu"){
                             const auto p=bridge.pipelines.find(pipeline);if(p==bridge.pipelines.end() || p->second.compute)throw std::invalid_argument("Draw 缺少繪圖管線");
                             const auto& signature=signature_of(graphics_roots);GraphicsDraw d=draw;
                             d.stages[0].shader=p->second.shader;bind(d.stages[0],graphics_roots,signature);
                             if(p->second.pixel){d.stages[1].shader=p->second.pixel;bind(d.stages[1],graphics_roots,signature);}
                             d.layout=p->second.layout;d.blend=p->second.blend;d.depth_state=p->second.depth;d.raster=p->second.raster;d.sample_mask=p->second.sample_mask;
-                            const bool indexed=c.op=="DrawIndexedInstanced";d.indexed=indexed;d.count=static_cast<std::uint32_t>(v[0]);d.instances=static_cast<std::uint32_t>(v[1]);d.start=static_cast<std::uint32_t>(v[2]);
-                            if(indexed){d.base_vertex=static_cast<std::int32_t>(static_cast<std::uint32_t>(v[3]));d.start_instance=static_cast<std::uint32_t>(v[4]);}else d.start_instance=static_cast<std::uint32_t>(v[3]);
+                            const bool indexed=c.op=="DrawIndexedInstanced" || c.op=="DrawIndexedIndirectGpu";d.indexed=indexed;
+                            if(c.op.ends_with("IndirectGpu")){d.indirect=gpu_resource(v[0]);d.indirect_offset=static_cast<std::uint32_t>(v[1]);}
+                            else {
+                                d.count=static_cast<std::uint32_t>(v[0]);d.instances=static_cast<std::uint32_t>(v[1]);d.start=static_cast<std::uint32_t>(v[2]);
+                                if(indexed){d.base_vertex=static_cast<std::int32_t>(static_cast<std::uint32_t>(v[3]));d.start_instance=static_cast<std::uint32_t>(v[4]);}else d.start_instance=static_cast<std::uint32_t>(v[3]);
+                            }
                             if(occlusion_heap){
                                 auto& occlusion=bridge.query_heaps.at(occlusion_heap).occlusion[occlusion_index];
                                 if(occlusion.slots>=occlusion_slots)throw std::invalid_argument("單一遮蔽查詢內的繪製次數超過上限");
@@ -1247,15 +1365,37 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             found_list->second.callbacks.at(static_cast<std::size_t>(v[0]))(native,[&](std::uint64_t object)->std::shared_ptr<GraphicsResource>{
                                 if(!bridge.resources.contains(object))return {};written.insert(object);return gpu_resource(object);});
                         }
-                        else if(c.op=="Dispatch"){
+                        else if(c.op=="Dispatch" || c.op=="DispatchIndirectGpu"){
                             const auto p=bridge.pipelines.find(pipeline);if(p==bridge.pipelines.end() || !p->second.compute)throw std::invalid_argument("Dispatch 缺少運算管線");
                             GraphicsStage stage;stage.shader=p->second.shader;bind(stage,compute_roots,signature_of(compute_roots));
-                            native.graphics_dispatch(stage,{static_cast<std::uint32_t>(v[0]),static_cast<std::uint32_t>(v[1]),static_cast<std::uint32_t>(v[2])});
+                            if(c.op=="DispatchIndirectGpu")native.graphics_dispatch_indirect(stage,gpu_resource(v[0]),static_cast<std::uint32_t>(v[1]));
+                            else native.graphics_dispatch(stage,{static_cast<std::uint32_t>(v[0]),static_cast<std::uint32_t>(v[1]),static_cast<std::uint32_t>(v[2])});
+                        }
+                        else if(c.op=="WriteBufferImmediate"){
+                            // 依命令順序把 32 位元值寫到 GPU 位址（遊戲常用來每幀歸零計數器／寫入標記）：CPU 端資源直接寫客體
+                            // 記憶體，GPU 資源以排在目前命令流中的上傳完成，前面的 GPU 工作先執行、後面的命令看得到新值。
+                            for(std::size_t at=0;at+16<=c.data.size();at+=16){
+                                std::uint64_t location;std::uint32_t value;std::memcpy(&location,c.data.data()+at,8);std::memcpy(&value,c.data.data()+at+8,4);
+                                const auto [object,offset]=resource_at(location);
+                                if(!object)throw std::invalid_argument("WriteBufferImmediate 目的位址不屬於任何資源");
+                                if(watch(c.op,object))trace("[d3d12] 監看 WriteBufferImmediate 資源=%llx+%llu 值=%u\n",static_cast<unsigned long long>(object),static_cast<unsigned long long>(offset),value);
+                                const auto& d=bridge.resources.at(object);
+                                if(d.dimension!=1 || (offset&3) || offset+4>d.width)throw std::invalid_argument("WriteBufferImmediate 目的範圍無效");
+                                if(d.cpu){memory.store(GuestAddress{d.cpu+offset},32,value);continue;}
+                                if(!d.gpu)throw std::invalid_argument("WriteBufferImmediate 目的資源沒有儲存");
+                                std::array<std::uint8_t,4> data;std::memcpy(data.data(),&value,4);
+                                native.graphics_write_region(GraphicsView{d.gpu},data,4,4,{static_cast<std::uint32_t>(offset),0,0,static_cast<std::uint32_t>(offset+4),1,1});
+                            }
                         }
                         else if(c.op=="CopyBufferRegion" || c.op=="CopyResource"){
                             const bool whole=c.op=="CopyResource";const auto dst=v[0],src=whole?v[1]:v[2];
                             auto& d=bridge.resources.at(dst);auto& s=bridge.resources.at(src);
                             const auto dst_offset=whole?0:v[1],src_offset=whole?0:v[3],size=whole?std::min(d.width,s.width):v[4];
+                            if(watch(c.op,dst)){
+                                std::array<std::uint32_t,3> head{};if(s.cpu && size>=12)memory.read(GuestAddress{s.cpu+src_offset},std::span<std::uint8_t>(reinterpret_cast<std::uint8_t*>(head.data()),12));
+                                trace("[d3d12] 監看 %s 目的=%llx+%llu 來源=%llx+%llu 大小=%llu 來源CPU=%d 開頭=%u,%u,%u\n",c.op.c_str(),static_cast<unsigned long long>(dst),static_cast<unsigned long long>(dst_offset),
+                                    static_cast<unsigned long long>(src),static_cast<unsigned long long>(src_offset),static_cast<unsigned long long>(size),s.cpu?1:0,head[0],head[1],head[2]);
+                            }
                             if(d.dimension!=1 || s.dimension!=1){
                                 if(!whole || !d.gpu || !s.gpu)throw std::invalid_argument("CopyResource 紋理需兩端皆為 GPU 資源");
                                 for(std::uint32_t level=0;level<s.levels;++level)for(std::uint32_t layer=0;layer<(s.dimension==4?1:s.depth);++layer){
@@ -1265,7 +1405,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                 continue;
                             }
                             if(s.cpu && d.cpu){const auto data=bytes(s.cpu+src_offset,static_cast<std::size_t>(size));memory.write(GuestAddress{d.cpu+dst_offset},data);continue;}
-                            const auto data=s.cpu?bytes(s.cpu+src_offset,static_cast<std::size_t>(size)):[&]{auto all=native.graphics_read(GraphicsView{s.gpu});return std::vector<std::uint8_t>(all.begin()+static_cast<std::ptrdiff_t>(src_offset),all.begin()+static_cast<std::ptrdiff_t>(src_offset+size));}();
+                            // 目的在 GPU：來源只上傳用到的範圍（或本來就在 GPU），以 GPU blit 複製，不經 CPU 讀回。
+                            if(!d.cpu && d.gpu && size && dst_offset+size<=UINT32_MAX && src_offset+size<=UINT32_MAX){
+                                const auto source=gpu_resource(src,src_offset,size);
+                                native.graphics_copy(GraphicsView{d.gpu},GraphicsView{source},{static_cast<std::uint32_t>(dst_offset),0,0},
+                                    {static_cast<std::uint32_t>(src_offset),0,0,static_cast<std::uint32_t>(src_offset+size),1,1});
+                                continue;
+                            }
+                            const auto data=s.cpu?bytes(s.cpu+src_offset,static_cast<std::size_t>(size)):[&]{GraphicsView range{s.gpu};range.first=static_cast<std::uint32_t>(src_offset);range.count=static_cast<std::uint32_t>(size);return native.graphics_read(range);}();
                             if(d.cpu){memory.write(GuestAddress{d.cpu+dst_offset},data);continue;}
                             native.graphics_write_region(GraphicsView{d.gpu},data,static_cast<std::uint32_t>(size),static_cast<std::uint32_t>(size),{static_cast<std::uint32_t>(dst_offset),0,0,static_cast<std::uint32_t>(dst_offset+size),1,1});
                         }
@@ -1279,10 +1426,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             if(dst_type==0 && src_type==1){
                                 const auto [offset,f]=footprint(48);const auto level=dst_sub%d.levels,layer=dst_sub/d.levels;
                                 const auto pitch=graphics_format_pitch(f[0],f[1],f[2]);std::vector<std::uint8_t> data(std::size_t{pitch[0]}*pitch[1]*f[3]);
+                                // 來源在 GPU（DEFAULT 堆積）時讀回足跡範圍；CPU 後備則逐列直接讀入，不另配置每列暫存。
+                                std::vector<std::uint8_t> staged;const std::uint64_t span_bytes=(std::uint64_t{f[3]}*pitch[1]-1)*f[4]+pitch[0];
+                                if(!s.cpu && s.gpu){GraphicsView range{s.gpu};range.first=static_cast<std::uint32_t>(offset);range.count=static_cast<std::uint32_t>(span_bytes);staged=native.graphics_read(range);}
                                 for(std::uint32_t slice=0;slice<f[3];++slice)for(std::uint32_t row=0;row<pitch[1];++row){
-                                    const auto from=offset+(std::uint64_t{slice}*pitch[1]+row)*f[4];
-                                    const auto line=s.cpu?bytes(s.cpu+from,pitch[0]):std::vector<std::uint8_t>(pitch[0]);
-                                    std::memcpy(data.data()+(std::size_t{slice}*pitch[1]+row)*pitch[0],line.data(),pitch[0]);
+                                    const auto from=offset+(std::uint64_t{slice}*pitch[1]+row)*f[4];auto* target=data.data()+(std::size_t{slice}*pitch[1]+row)*pitch[0];
+                                    if(s.cpu)memory.read(GuestAddress{s.cpu+from},std::span<std::uint8_t>(target,pitch[0]));
+                                    else if(from-offset+pitch[0]<=staged.size())std::memcpy(target,staged.data()+(from-offset),pitch[0]);
                                 }
                                 GraphicsView view{d.gpu};view.level=level;view.slice=layer;
                                 native.graphics_write_region(view,data,pitch[0],pitch[0]*pitch[1],{x,y,z,x+f[1],y+f[2],z+f[3]});
@@ -1302,9 +1452,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         else report("List."+c.op);
                     }
                 }
-                native.graphics_flush(true);
-                for(const auto object:written)if(bridge.resources.at(object).reads_back())read_back(object);
+                // 預設非同步：提交後不等 GPU（CPU 準備下一批與 GPU 執行重疊）；讀回延到此佇列下一個 Signal 完成時。
+                // X64ARM_D3D12_SYNC_SUBMIT=1 回到每次提交都等 GPU 完成的同步模式。
+                static const bool sync_submit=[] {const auto* value=std::getenv("X64ARM_D3D12_SYNC_SUBMIT");return value && std::string_view(value)=="1";}();
+                if(sync_submit){
+                    native.graphics_flush(true);
+                    for(const auto object:written)if(bridge.resources.at(object).reads_back())read_back(object);
+                }else{
+                    auto& queue_state=bridge.queue_states[self];queue_state.done=native.graphics_fence();
+                    for(const auto object:written)if(bridge.resources.at(object).reads_back())queue_state.readbacks.push_back(object);
+                }
             }catch(const std::exception& error){
+                trace("[d3d12] ExecuteCommandLists 失敗（%s）：%s\n",failed_op.c_str(),error.what());
                 runtime_.module_events.push_back(std::string("d3d12_note=ExecuteCommandLists 失敗：")+error.what());
             }
             return finish(0);

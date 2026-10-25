@@ -1,4 +1,5 @@
 #include "x64arm/startup_profile.hpp"
+#include "parallel_mapping_lock.hpp"
 #include <shared_mutex>
 #include <chrono>
 #include <array>
@@ -872,6 +873,34 @@ std::vector<GuestState *> WindowsServices::parallel_contexts(GuestState &state) 
         }
         thread.wake_pending=false;thread.last_dispatch_ticks=now_ticks;
     }
+    // 停駐模式：還有空的 vCPU 時，把可由等待解析完成呼叫的等待中客體也選入。它們入場即停駐、喚醒後原地續跑，
+    // 不必醒來後換手搶 slot（執行緒數不超過 vCPU 時每條執行緒固定持有自己的 slot，與 1:1 宿主執行緒相同）。
+    // 只收物件、臨界區段、Sleep、SRW、條件變數與位址等待；可投遞 APC 的 alertable 等待、I/O 與其他特殊等待留給完整排程。
+    static const bool admit_waiting = [] {const auto* value=std::getenv("X64ARM_RESIDENT_PARK_ADMIT");return !value || std::string_view(value)!="0";}();
+    if (available && admit_waiting && resident_block_parking()) {
+        for (const auto &[id, entry] : live_threads()) {
+            if (!available || parallel_thread_count_ >= parallel_thread_ids_.size())
+                break;
+            auto &thread = *entry;
+            const auto kind = thread.wait.kind;
+            if (id == threads_.current || thread.status != ThreadStatus::Waiting || thread.suspended ||
+                thread.context.pending_cpu_trap || thread.wait.alertable ||
+                (kind != ThreadWaitKind::Objects && kind != ThreadWaitKind::Critical && kind != ThreadWaitKind::Sleep &&
+                 kind != ThreadWaitKind::Slim && kind != ThreadWaitKind::Condition && kind != ThreadWaitKind::Address) ||
+                std::find(result.begin(), result.end(), &thread.context) != result.end())
+                continue;
+            const auto eligible = available & thread.affinity;
+            if (!eligible)
+                continue;
+            thread.context.processor_id =
+                static_cast<std::uint32_t>(((eligible & (UINT64_C(1) << thread.ideal_processor))
+                                                ? thread.ideal_processor
+                                                : static_cast<std::uint32_t>(std::countr_zero(eligible))));
+            available &= ~(UINT64_C(1) << thread.context.processor_id);
+            result.push_back(&thread.context);
+            parallel_thread_ids_[parallel_thread_count_++] = id;
+        }
+    }
     return result;
 }
 void WindowsServices::after_parallel_instructions(GuestState &state, GuestMemory &memory,
@@ -939,7 +968,7 @@ bool WindowsServices::resident_select_control_request(GuestState& state,GuestMem
 }
 #endif
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_PREEMPT
-namespace detail {std::shared_mutex& parallel_mapping_mutex() noexcept;}
+namespace detail {ParallelMappingLock& parallel_mapping_mutex() noexcept;}
 // 協調者信箱逾時、所有 slot 都在運算時的本地處理（X64ARM_RESIDENT_PREEMPT_SLOT=1 開啟，核心同名開關一併開啟）：
 // 在獨占映射鎖下刷新宿主時鐘並做與 schedule 開頭相同的 wake_threads（I/O、計時器、音訊週期、等待解析），
 // 不切換目前客體。之後判斷是否需要全體重排：沒有可執行候選，或候選優先序不高於執行中者且所有 slot 的時間片
@@ -949,7 +978,7 @@ namespace detail {std::shared_mutex& parallel_mapping_mutex() noexcept;}
 bool WindowsServices::resident_preempt_plan(GuestMemory& memory,std::span<GuestState* const> active,ResidentPreemptPlan& plan) {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_RESIDENT_PREEMPT_SLOT");return value && std::string_view(value)=="1";}();
     if(!enabled || x86_ || active.size()<2 || threads_.yield || debugger_stopped() || !runtime_.host_clock || !trace_services_.empty())return false;
-    const std::unique_lock<std::shared_mutex> mapping_guard{detail::parallel_mapping_mutex()};
+    const std::unique_lock mapping_guard{detail::parallel_mapping_mutex()};
     retired(memory,0);
     wake_threads(memory);
     const auto is_active=[&](const GuestThread& thread){return std::find(active.begin(),active.end(),&thread.context)!=active.end();};
@@ -1059,29 +1088,11 @@ bool WindowsServices::resident_block_service_impl(GuestState& state,GuestMemory&
     // 目前客體的回呼框架在 runtime_.callbacks（schedule 換出時才存回 GuestThread）。
     const auto& callbacks=current?runtime_.callbacks:thread.callbacks;
     if(!callbacks.empty() && callbacks.back().continuation==Continuation::NativeOperation)return false;
-    const std::unique_lock<std::shared_mutex> mapping_guard{detail::parallel_mapping_mutex()};
+    const std::unique_lock mapping_guard{detail::parallel_mapping_mutex()};
     const WindowsCall arg(state,memory,*descriptor);
     retired(memory,0);
     // 替換者：不在 active、非目前執行緒、沒有待辦服務、不停在服務入口，依有效優先序、剛喚醒者優先與輪替選取，並符合此 vCPU 的親和性。
-    const auto is_active=[&](const GuestThread& other){return std::find(active.begin(),active.end(),&other.context)!=active.end();};
-    const auto select_replacement=[&]()->GuestThread*{
-        GuestThread* best=nullptr;std::uint64_t best_id=0;int best_priority=0;bool best_wrapped=true,best_woken=false;
-        for(const auto& [id,entry]:live_threads()){
-            auto& other=*entry;
-            if(id==threads_.current || id==key || other.status!=ThreadStatus::Runnable || other.suspended || other.context.pending_cpu_trap || is_active(other) ||
-               &other.context==resident_preempt_pending_)continue;
-            if(!(other.affinity&(UINT64_C(1)<<state.processor_id)))continue;
-            const auto pending=resident_service_requests_.find(id);
-            if(pending!=resident_service_requests_.end() && pending->second==other.context.rip)continue;
-            if(handles(other.context.rip))continue;
-            const int priority=other.effective_priority(runtime_.process_priority_class,runtime_.process_background);const bool wrapped=id<=parallel_cursor_;
-            if(!best || priority>best_priority || (priority==best_priority && (other.wake_pending>best_woken ||
-               (other.wake_pending==best_woken && ((!wrapped && best_wrapped) || (wrapped==best_wrapped && id<best_id)))))){
-                best=&other;best_id=id;best_priority=priority;best_wrapped=wrapped;best_woken=other.wake_pending;
-            }
-        }
-        return best;
-    };
+    const auto select_replacement=[&]{return select_resident_replacement(active,state.processor_id,key);};
     // 讓出（Sleep(0)、SleepEx(0)、SwitchToThread）：呼叫立即完成、執行緒保持 Runnable，只把這個 slot 交給下一個
     // 可執行者；沒有可替換者時以自身續跑（SwitchToThread 回傳 0）。Windows Vista 起 Sleep(0) 讓給任何就緒執行緒。
     // alertable SleepEx 有待處理 APC 時交回完整路徑。X64ARM_RESIDENT_YIELD_SLOT=0 恢復全停。
@@ -1138,9 +1149,18 @@ bool WindowsServices::resident_block_service_impl(GuestState& state,GuestMemory&
     }
     if(wait.alertable && !thread.apcs.empty())return false;
     auto* best=select_replacement();
-    if(!best){if(outcome)*outcome=1;return false;}
+    if(!best && !resident_block_parking()){if(outcome)*outcome=1;return false;}
     thread.wait=std::move(wait);thread.status=ThreadStatus::Waiting;thread.parallel_slice_deadline=0;
     mark_critical_waiters(runtime_.critical_sections,thread.wait);
+    if(!best){
+        // 沒有可接手此 vCPU 的客體：slot 停駐（核心保留 worker、不停其他 slot），等待解析完成呼叫後原地續跑。
+        // slot 0 先把活體狀態存回執行緒表，等待解析才寫得到同一份 context。
+        if(current)park_resident_current(state,memory);
+        static const bool debug_park=std::getenv("X64ARM_DEBUG_PARK")!=nullptr; // 暫時診斷
+        if(debug_park)std::fprintf(stderr,"[debug_park] 停駐 key=%llu current=%d api=%s deadline=%llu clock=%llu\n",static_cast<unsigned long long>(key),current?1:0,
+            std::string(symbol).c_str(),static_cast<unsigned long long>(thread.wait.deadline),static_cast<unsigned long long>(runtime_.clock_ticks));
+        replacement=nullptr;if(outcome)*outcome=2;return true;
+    }
     if(current){switch_resident_current(state,memory,resident_context_key(best->context));replacement=&state;return true;}
     best->wake_pending=false;best->last_dispatch_ticks=detail::monotonic_ticks();
     replacement=&best->context;
@@ -1150,11 +1170,31 @@ bool WindowsServices::resident_block_service_impl(GuestState& state,GuestMemory&
 // 與 schedule 換人段落相同的保存／載入：目前客體的 GuestState、回呼、排序、例外堆疊、TLS／FLS、errno 與 LastError
 // 存回其 GuestThread，載入目標的狀態並重設時間片。只在協調者持獨占映射鎖、目標不在任何 slot 時呼叫；不輪詢、
 // 不解析等待、不選人（呼叫端已選定）。原生 LastError 常式可能剛寫過 TEB，先以 TEB 為準。
-void WindowsServices::switch_resident_current(GuestState& state,GuestMemory& memory,std::uint64_t target_id) {
-    notify_concurrency_changed();
+// 從可執行、不在任何 slot、沒有待辦服務的客體中，依有效優先序、剛喚醒者優先與輪替選出可接手 processor 的替換者。
+// 呼叫端持獨占映射鎖。active 的 slot 0 是協調者的 GuestState，目前執行緒以 threads_.current 排除。
+GuestThread* WindowsServices::select_resident_replacement(std::span<GuestState* const> active,std::uint32_t processor,std::uint64_t exclude) {
+    const auto is_active=[&](const GuestThread& other){return std::find(active.begin(),active.end(),&other.context)!=active.end();};
+    GuestThread* best=nullptr;std::uint64_t best_id=0;int best_priority=0;bool best_wrapped=true,best_woken=false;
+    for(const auto& [id,entry]:live_threads()){
+        auto& other=*entry;
+        if(id==threads_.current || id==exclude || other.status!=ThreadStatus::Runnable || other.suspended || other.context.pending_cpu_trap || is_active(other) ||
+           &other.context==resident_preempt_pending_)continue;
+        if(processor>=64 || !(other.affinity&(UINT64_C(1)<<processor)))continue;
+        const auto pending=resident_service_requests_.find(id);
+        if(pending!=resident_service_requests_.end() && pending->second==other.context.rip)continue;
+        if(handles(other.context.rip))continue;
+        const int priority=other.effective_priority(runtime_.process_priority_class,runtime_.process_background);const bool wrapped=id<=parallel_cursor_;
+        if(!best || priority>best_priority || (priority==best_priority && (other.wake_pending>best_woken ||
+           (other.wake_pending==best_woken && ((!wrapped && best_wrapped) || (wrapped==best_wrapped && id<best_id)))))){
+            best=&other;best_id=id;best_priority=priority;best_wrapped=wrapped;best_woken=other.wake_pending;
+        }
+    }
+    return best;
+}
+// schedule 換人段落的保存半段：目前客體的 GuestState、回呼、排序、例外堆疊、TLS／FLS 存回其 GuestThread。
+// 原生 LastError 常式可能剛寫過 TEB，先以 TEB 為準。
+void WindowsServices::save_resident_current(GuestState& state,GuestMemory& memory) {
     auto& source=threads_.items.at(threads_.current);
-    auto& target=threads_.items.at(target_id);
-    const auto tsc=state.tsc;
     if(state.gs_base || state.fs_base)
         last_error_=static_cast<std::uint32_t>(memory.load(GuestAddress{x86_?state.fs_base+0x34:state.gs_base+0x68},32));
     source.context=state;
@@ -1163,6 +1203,11 @@ void WindowsServices::switch_resident_current(GuestState& state,GuestMemory& mem
     source.exceptions=std::move(exceptions_.stack);
     source.fls_values=runtime_.fls_values;
     source.tls_values=runtime_.tls_values;
+}
+// 載入半段：目標成為目前客體，載入其狀態並重設時間片；TSC 沿用協調者的連續計數。
+void WindowsServices::load_resident_current(GuestState& state,GuestMemory& memory,std::uint64_t target_id) {
+    auto& target=threads_.items.at(target_id);
+    const auto tsc=state.tsc;
     threads_.current=target_id;
     state=target.context;
     state.tsc=tsc;
@@ -1182,6 +1227,95 @@ void WindowsServices::switch_resident_current(GuestState& state,GuestMemory& mem
     target.wake_pending=false;target.dynamic_priority_boost=0;target.last_dispatch_ticks=now;
     threads_.yield=false;
     prepare_debug_execution(state,memory);
+}
+// 與 schedule 換人段落相同的保存／載入。只在協調者持獨占映射鎖、目標不在任何 slot 時呼叫；不輪詢、
+// 不解析等待、不選人（呼叫端已選定）。
+void WindowsServices::switch_resident_current(GuestState& state,GuestMemory& memory,std::uint64_t target_id) {
+    notify_concurrency_changed();
+    save_resident_current(state,memory);
+    load_resident_current(state,memory,target_id);
+}
+// switch_resident_current 的保存半段：目前客體在 slot 0 停駐，其活體狀態（含回呼、排序、例外、TLS／FLS）存回執行緒表，
+// threads_.current 不變。等待解析以 complete_call 寫入的就是這份 context；續跑前 resident_unpark 載回。
+void WindowsServices::park_resident_current(GuestState& state,GuestMemory& memory) {
+    save_resident_current(state,memory);
+    resident_current_parked_=true;
+}
+bool WindowsServices::resident_block_parking() const noexcept {
+    // 單槽換手同樣只在 x64、主機時鐘、無偵錯／追蹤時啟用。2026-10-26 起預設關閉：微量測的分工／匯合在 8～12 vCPU
+    // 快 50～100%，但電馭判客 4 vCPU 啟動大部分時間閒置（標題視窗 25→119 秒），疑有實際遊戲中的遺失喚醒路徑未查明；
+    // X64ARM_RESIDENT_PARK_SLOT=1 明確開啟。
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_RESIDENT_PARK_SLOT");return value && std::string_view(value)=="1";}();
+    return enabled && !x86_ && runtime_.host_clock && trace_services_.empty() && !startup_profile::enabled();
+}
+bool WindowsServices::resident_context_runnable(const GuestState& state) const {
+    const auto found=threads_.items.find(resident_context_key(state));
+    return found!=threads_.items.end() && found->second.status==ThreadStatus::Runnable && !found->second.suspended;
+}
+void WindowsServices::resident_unpark(GuestState& state,GuestMemory& memory) {
+    const std::unique_lock mapping_guard{detail::parallel_mapping_mutex()};
+    const auto key=resident_context_key(state);
+    const auto found=threads_.items.find(key);
+    if(found==threads_.items.end())return;
+    auto& thread=found->second;
+    static const bool debug_park=std::getenv("X64ARM_DEBUG_PARK")!=nullptr; // 暫時診斷
+    if(debug_park)std::fprintf(stderr,"[debug_park] 續跑 key=%llu status=%d slot0=%d\n",static_cast<unsigned long long>(key),static_cast<int>(thread.status),
+        (resident_current_parked_ && key==threads_.current && &state!=&thread.context)?1:0);
+    if(resident_current_parked_ && key==threads_.current && &state!=&thread.context){
+        resident_current_parked_=false;
+        // 重選集合時仍在等待（核心只在全停後這樣呼叫）：先解析一次等待，已到期或已就緒者直接完成呼叫；
+        // 仍在等待就撤銷停駐時登記的等待（尚未取得任何物件，沒有副作用），客體留在 API 入口，
+        // 由重排程沿原本的完整路徑重新執行並正常阻塞（與停駐前「沒有替換者就全停」相同）。
+        if(thread.status==ThreadStatus::Waiting){
+            if(runtime_.host_clock)retired(memory,0);
+            (void)resolve_thread_waits(memory,ThreadWakeScope::All);
+        }
+        if(thread.status==ThreadStatus::Waiting){thread.wait={};thread.status=ThreadStatus::Runnable;}
+        load_resident_current(state,memory,key);notify_concurrency_changed();return;
+    }
+    thread.wake_pending=false;thread.dynamic_priority_boost=0;thread.last_dispatch_ticks=detail::monotonic_ticks();
+    notify_concurrency_changed();
+}
+GuestState* WindowsServices::resident_idle_replacement(GuestState& parked,GuestMemory& memory,std::span<GuestState* const> active) {
+    if(!resident_block_parking())return nullptr;
+    const std::unique_lock mapping_guard{detail::parallel_mapping_mutex()};
+    const auto key=resident_context_key(parked);
+    auto* best=select_resident_replacement(active,parked.processor_id,key);
+    if(!best)return nullptr;
+    const auto target=resident_context_key(best->context);
+    if(resident_current_parked_ && key==threads_.current && &parked!=&threads_.items.at(key).context){
+        // slot 0：停駐者已保存；目標成為目前客體並載入協調者的 GuestState。
+        resident_current_parked_=false;notify_concurrency_changed();
+        load_resident_current(parked,memory,target);return &parked;
+    }
+    best->wake_pending=false;best->dynamic_priority_boost=0;best->last_dispatch_ticks=detail::monotonic_ticks();
+    notify_concurrency_changed();
+    return &best->context;
+}
+bool WindowsServices::resident_runnable_waiting(std::span<GuestState* const> active) const {
+    std::unique_lock<std::mutex> lock;const auto& index=resident_thread_index(lock);
+    for(const auto& [id,thread]:index.live){
+        if(id==threads_.current || thread->status!=ThreadStatus::Runnable || thread->suspended)continue;
+        if(std::find(active.begin(),active.end(),&thread->context)==active.end())return true;
+    }
+    return false;
+}
+bool WindowsServices::resident_resolve_waits(GuestMemory& memory) {
+    // 與單槽換手相同在獨占映射鎖下推進時鐘並解析等待（逾時、已就緒物件），不輪詢外部裝置、不切換目前客體。
+    const std::unique_lock mapping_guard{detail::parallel_mapping_mutex()};
+    if(runtime_.host_clock)retired(memory,0);
+    // 與 wake_threads 相同：有執行緒等 GUI 輸入時抽取宿主事件（協調者即宿主主執行緒）。平行批次中 worker 持續運算時
+    // 不會經過完整排程，等 GUI 的執行緒只能靠這裡被解析（Steam 強制平行曾因此觸發 stalled cross-thread pipe）。
+    if(native_gui_ && std::any_of(threads_.items.begin(),threads_.items.end(),[](const auto& entry){
+           return entry.second.status==ThreadStatus::Waiting && entry.second.wait.kind==ThreadWaitKind::GuiInput;})){
+        gui_.scheduler_poll_deadline=runtime_.clock_ticks+10000;
+        pump_gui(memory,false);
+    }
+    const auto changed=resolve_thread_waits(memory,ThreadWakeScope::All);
+    static const bool debug_park=std::getenv("X64ARM_DEBUG_PARK")!=nullptr; // 暫時診斷
+    if(debug_park)std::fprintf(stderr,"[debug_park] 解析等待 changed=%d clock=%llu monotonic=%llu\n",changed?1:0,
+        static_cast<unsigned long long>(runtime_.clock_ticks),static_cast<unsigned long long>(detail::monotonic_ticks()));
+    return changed;
 }
 void WindowsServices::resident_preempt_commit(GuestState& victim,GuestState& replacement) {
     if(&replacement==resident_preempt_pending_)resident_preempt_pending_=nullptr;
@@ -1263,7 +1397,7 @@ void WindowsServices::after_resident_interrupt(GuestState& state,GuestMemory& me
     after_resident_parallel(state,memory);
 }
 std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState* const> contexts) const {
-    std::size_t runnable=0,exited=0;std::uint64_t deadline=UINT64_MAX;bool socket_select=false;
+    std::size_t runnable=0,exited=0;std::uint64_t deadline=UINT64_MAX;bool socket_select=false,gui_wait=false;
     {
         std::unique_lock<std::mutex> lock;
         auto& index=resident_thread_index(lock);
@@ -1273,6 +1407,7 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
             else if(thread->status==ThreadStatus::Waiting){
                 deadline=std::min(deadline,thread->wait.deadline);
                 socket_select=socket_select || thread->wait.kind==ThreadWaitKind::SocketSelect;
+                gui_wait=gui_wait || thread->wait.kind==ThreadWaitKind::GuiInput;
             }
             else if(thread->status==ThreadStatus::Exited)++exited;
         }
@@ -1311,6 +1446,8 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
         }
     }
     resident_wait_deadline_=deadline;
+    // 有執行緒等 GUI 輸入時，協調者至少每毫秒解析一次（見 resident_resolve_waits），與單控制器的 GUI 輪詢間隔相同。
+    if(native_gui_ && gui_wait)wake=wake?std::min<std::uint64_t>(wake,1000000):1000000;
     if(deadline!=UINT64_MAX){
         const auto now=detail::monotonic_ticks();
         const auto remaining=deadline>now?std::min<std::uint64_t>(deadline-now,UINT64_MAX/100)*100:1;
@@ -1319,6 +1456,7 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
     // 音訊已有實際播放進度與下一個事件期限；沿同一獨立中斷計時器喚醒，
     // 不等待其他客體計時器，也不在正常產碼加入配額、時鐘讀取或裝置輪詢。
     if(const auto audio=wasapi_wakeup_ns())wake=wake?std::min(wake,audio):audio;
+    if(const auto gpu=gpu_signal_wakeup_ns())wake=wake?std::min(wake,gpu):gpu;
     if(network_wait){
         const auto poll=external_wait_poll_limit()*100;
         wake=wake?std::min(wake,poll):poll;
@@ -1385,6 +1523,9 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
         }
     }
 #endif
+    static const bool debug_park=std::getenv("X64ARM_DEBUG_PARK")!=nullptr; // 暫時診斷
+    if(debug_park && !runnable)std::fprintf(stderr,"[debug_park] 期限 wake_ns=%llu deadline=%llu monotonic=%llu\n",static_cast<unsigned long long>(wake),
+        static_cast<unsigned long long>(deadline),static_cast<unsigned long long>(detail::monotonic_ticks()));
     return wake;
 }
 #endif
@@ -1735,6 +1876,10 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
     {
         WakePollScope poll_measurement("poll_wasapi");
         poll_wasapi();
+    }
+    {
+        WakePollScope poll_measurement("poll_gpu_signals");
+        poll_gpu_signals(memory);
     }
     {
         WakePollScope poll_measurement("poll_directmusic");

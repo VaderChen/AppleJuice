@@ -271,6 +271,8 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
             if(msg.message==0x100 || msg.message==0x101 || msg.message==0x104 || msg.message==0x105)observe_gui_key(msg,false);
             if(physical_mouse || msg.message==0x10004){key(1,msg.wparam&1);key(2,msg.wparam&2);key(4,msg.wparam&16);key(5,msg.wparam&32);key(6,msg.wparam&64);}
         }
+        // 實體按鍵的 Raw Input 來自宿主鍵盤狀態輪詢；注入（自動化）按鍵沒有實體狀態，比照 SendInput 在此產生。
+        if(physical_key && msg.injected)raw_input_keyboard(msg,static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0);
         if((msg.message==0x100 || msg.message==0x101 || msg.message==0x104 || msg.message==0x105) && match_gui_hotkey(msg))continue;
         if((physical_key && !raw_legacy_enabled(true)) || (physical_mouse && !raw_legacy_enabled(false)))continue;
         if(msg.message==0x10004){ // 原生 tracking loop 消耗的放開事件只同步狀態，不重送客體輸入。

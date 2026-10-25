@@ -45,7 +45,48 @@ std::shared_ptr<GraphicsResource> MetalGl::graphics_resource(const GraphicsResou
     }
     return r;
 }}
-std::shared_ptr<GraphicsShader> MetalGl::graphics_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes){@autoreleasepool{
+std::shared_ptr<GraphicsShader> MetalGl::graphics_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes){
+    // 串流輸出簽章容器（stage 6）只保存位元組，不經快取。
+    if(stage==6)return graphics_shader_create(stage,bytes);
+    std::uint64_t key=UINT64_C(1469598103934665603)^stage;for(const auto value:bytes){key^=value;key*=UINT64_C(1099511628211);}
+    {
+        const std::lock_guard lock(shader_cache_mutex_);
+        if(const auto found=shader_cache_.find(key);found!=shader_cache_.end())for(const auto& cached:found->second)
+            if(cached->stage==stage && cached->bytecode.size()==bytes.size() && std::equal(cached->bytecode.begin(),cached->bytecode.end(),bytes.begin()))return cached;
+    }
+    auto created=graphics_shader_create(stage,bytes);
+    if(auto native=std::dynamic_pointer_cast<MetalShader>(created)){
+        native->content_key=key;
+        // 診斷：X64ARM_METAL_DUMP_KEYS=<雜湊,…> 與 X64ARM_METAL_DUMP_DIR=<目錄>：把命中的著色器原始位元組與翻譯後的 MSL 寫出
+        // （雜湊同 X64ARM_METAL_LABELS 的標籤）。
+        static const char* dump_keys=std::getenv("X64ARM_METAL_DUMP_KEYS");static const char* dump_dir=std::getenv("X64ARM_METAL_DUMP_DIR");
+        if(dump_keys && dump_dir){
+            char hex[17];std::snprintf(hex,sizeof hex,"%016llx",static_cast<unsigned long long>(key));
+            if(std::string_view(dump_keys).find(hex)!=std::string_view::npos){
+                const auto base=std::string(dump_dir)+"/"+hex;
+                if(auto* out=std::fopen((base+".bin").c_str(),"wb")){std::fwrite(bytes.data(),1,bytes.size(),out);std::fclose(out);}
+                if(auto* out=std::fopen((base+".metal").c_str(),"wb")){std::fwrite(native->source.data(),1,native->source.size(),out);std::fclose(out);}
+            }
+        }
+    }
+    if(auto native=std::dynamic_pointer_cast<MetalShader>(created);native && native->bytecode.size()==bytes.size()){
+        const std::lock_guard lock(shader_cache_mutex_);
+        shader_cache_[key].push_back(std::move(native));shader_cache_order_.push_back(key);
+        // 上限 2048 個範本，先進先出淘汰（被淘汰者只是下次重新編譯）。
+        while(shader_cache_order_.size()>2048){const auto old=shader_cache_order_.front();shader_cache_order_.pop_front();
+            if(const auto found=shader_cache_.find(old);found!=shader_cache_.end()){found->second.erase(found->second.begin());if(found->second.empty())shader_cache_.erase(found);}}
+    }
+    return created;
+}
+// 私有複本：共用快取中的編譯結果，但給新 serial 並清掉串流輸出狀態，供呼叫端之後自行設定。
+std::shared_ptr<GraphicsShader> MetalGl::graphics_shader_private(std::uint32_t stage,std::span<const std::uint8_t> bytes){
+    auto shared=graphics_shader(stage,bytes);
+    if(const auto* native=dynamic_cast<const MetalShader*>(shared.get())){
+        auto copy=std::make_shared<MetalShader>(*native);copy->serial=++shader_serial_;copy->stream_output.clear();copy->stream_strides={};copy->rasterized_stream={};return copy;
+    }
+    return shared;
+}
+std::shared_ptr<GraphicsShader> MetalGl::graphics_shader_create(std::uint32_t stage,std::span<const std::uint8_t> bytes){@autoreleasepool{
     // stage 6 是僅含輸出簽章的 SO 轉送物件；實際資料由目前綁定的 VS 產生。
     if(stage==6){
         if(bytes.size()<32 || metal_word(bytes,0)!=0x43425844 || metal_word(bytes,24)!=bytes.size())throw std::invalid_argument("SO 簽章容器不合法");
@@ -611,7 +652,8 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         sample_count=resource.samples;center_samples=center;
     };
     const auto target_extent=[&](unsigned w,unsigned h){width=width?std::min(width,w):w;height=height?std::min(height,h):h;};
-    const auto target_layers=[&](unsigned count){if(!count || (layers && layers!=count))throw std::invalid_argument("Render-target／depth view 的層數不相容");layers=count;};
+    // 各 view 層數不同時取最小值：超出較短 view 的層 D3D 視為捨棄，Metal 的 renderTargetArrayLength 也不得超過任一 attachment。
+    const auto target_layers=[&](unsigned count){if(!count)throw std::invalid_argument("Render-target／depth view 沒有層");layers=layers?std::min(layers,count):count;};
     for(const auto& target:d.targets)if(target.resource)sample_pattern(target.resource->desc);
     if(d.depth.resource)sample_pattern(d.depth.resource->desc);
     if(sample_count>1){
@@ -720,6 +762,14 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
             if(only_visibility)why="draw_visibility_change";
         }
         begin_commands(true,why);enc=[commands_ renderCommandEncoderWithDescriptor:pass];if(!enc)throw std::runtime_error("Metal draw encoder 建立失敗");++render_encoders_;if(coalesce)metal_chain_wait(enc);
+        if(metal_labels()){
+            NSMutableString* label=[NSMutableString stringWithString:@"draw"];
+            for(const auto& item:d.stages)if(const auto* shader=dynamic_cast<const MetalShader*>(item.shader.get()))
+                [label appendFormat:@" s%u:%016llx",static_cast<unsigned>(shader->stage),static_cast<unsigned long long>(shader->content_key)];
+            id<MTLTexture> target=pass.colorAttachments[0].texture?pass.colorAttachments[0].texture:pass.depthAttachment.texture;
+            if(target)[label appendFormat:@" %ux%u fmt%u",static_cast<unsigned>(target.width),static_cast<unsigned>(target.height),static_cast<unsigned>(target.pixelFormat)];
+            enc.label=label;
+        }
         if(coalesce){open_render_=enc;open_render_key_=std::move(pass_key);}}
     std::optional<MetalEncoderScope> enc_scope;if(!coalesce)enc_scope.emplace(enc);
     [enc setRenderPipelineState:pipeline];if(d.visibility)[enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:d.visibility_offset];else if(reused)[enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];[enc setDepthStencilState:cached_depth_state(depth)];[enc setStencilReferenceValue:d.stencil_reference];[enc setBlendColorRed:d.blend_factor[0] green:d.blend_factor[1] blue:d.blend_factor[2] alpha:d.blend_factor[3]];
@@ -761,7 +811,8 @@ void MetalGl::graphics_dispatch_indirect(const GraphicsStage& stage,const std::s
     [e dispatchThreadgroupsWithIndirectBuffer:args.buffer indirectBufferOffset:offset threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];
     graphics_pending_.push_back(arguments);e_scope.end();graphics_trace_dispatch(stage,{0,0,0},arguments,offset);if(metal_dispatch_sync())flush(true,"dispatch_sync");else if(++pending_>=128)flush(false,"batch_128");
 }}
-void MetalGl::graphics_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){@autoreleasepool{if(!stage.shader)throw std::invalid_argument("Dispatch 缺少 CS");auto& shader=dynamic_cast<MetalShader&>(*stage.shader);metal_resolve_shader(device_,shader);begin_commands(true,"dispatch");auto e=[commands_ computeCommandEncoder];MetalEncoderScope e_scope{e};[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);[e dispatchThreadgroups:MTLSizeMake(groups[0],groups[1],groups[2]) threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];e_scope.end();graphics_trace_dispatch(stage,groups,{},0);if(metal_dispatch_sync())flush(true,"dispatch_sync");else if(++pending_>=128)flush(false,"batch_128");}}
+void MetalGl::graphics_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){@autoreleasepool{if(!stage.shader)throw std::invalid_argument("Dispatch 缺少 CS");auto& shader=dynamic_cast<MetalShader&>(*stage.shader);metal_resolve_shader(device_,shader);begin_commands(true,"dispatch");auto e=[commands_ computeCommandEncoder];MetalEncoderScope e_scope{e};
+    if(metal_labels())e.label=[NSString stringWithFormat:@"cs %016llx %ux%ux%u",static_cast<unsigned long long>(shader.content_key),groups[0],groups[1],groups[2]];[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);[e dispatchThreadgroups:MTLSizeMake(groups[0],groups[1],groups[2]) threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];e_scope.end();graphics_trace_dispatch(stage,groups,{},0);if(metal_dispatch_sync())flush(true,"dispatch_sync");else if(++pending_>=128)flush(false,"batch_128");}}
 void MetalGl::graphics_mips(const GraphicsView& v){@autoreleasepool{begin_commands(true,"mips");auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};[e generateMipmapsForTexture:metal_texture(v)];e_scope.end();graphics_pending_.push_back(v.resource);}}
 void MetalGl::graphics_handoff(NativeGraphics& consumer,const GraphicsView& view){@autoreleasepool{
     // 命令執行緒代理：先清空其佇列，再交接給底層後端。

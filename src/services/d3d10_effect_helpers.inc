@@ -14,7 +14,7 @@
         const auto fx_find_variable=[&](const std::shared_ptr<Identity>& owner,const std::string& name){const auto& vars=owner->effect->variables;const auto found=std::find_if(vars.begin(),vars.end(),[&](const auto& v){return v.name==name;});return found==vars.end()?UINT32_MAX:static_cast<unsigned>(found-vars.begin());};
         const auto fx_shader=[&](const std::shared_ptr<Identity>& owner,unsigned stage,const std::vector<std::uint8_t>& bytes,const std::string& key,std::string_view so={}){
             if(owner->effect_handles.contains(key))return owner->effect_handles.at(key);if(bytes.empty())return std::uint64_t{};
-            auto device=object(owner->device).identity;auto reflected=std::make_shared<dxbc::Reflection>(bytes);auto shader=device->native->graphics_shader(stage==2 && (reflected->version>>16)==1?0U:stage,bytes);if(!so.empty())stream_output::parse(*shader,*reflected,so);
+            auto device=object(owner->device).identity;auto reflected=std::make_shared<dxbc::Reflection>(bytes);const auto native_stage=stage==2 && (reflected->version>>16)==1?0U:stage;auto shader=so.empty()?device->native->graphics_shader(native_stage,bytes):device->native->graphics_shader_private(native_stage,bytes);if(!so.empty())stream_output::parse(*shader,*reflected,so);
             auto id=create(stage==0?Kind::VertexShader:stage==1?Kind::PixelShader:Kind::GeometryShader,owner->device);id->shader=std::move(shader);id->reflection=std::move(reflected);id->desc=bytes;owner->bindings["EffectShaders"].push_back(id->root);owner->effect_handles[key]=id->root;return id->root;
         };
         const auto fx_create=[&](std::uint64_t device_pointer,std::span<const std::uint8_t> bytes){

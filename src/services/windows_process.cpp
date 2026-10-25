@@ -3168,7 +3168,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
                         if(symbol=="GetThreadId")result=object.record->thread_identifier();
                         else{
                             if(!arg(1))fail(87);
-                            else if(!object.record->exited() && !object.record->alive())throw HostCallFault("遠端執行緒未回報 DWORD 結束狀態");
+                            // 宿主程序異常結束（訊號）而未回報狀態：與等待邏輯一致視為已結束，結束碼沿用子程序故障的 0xC0000001。
+                            else if(!object.record->exited() && !object.record->alive()){object.record->finish(0xC0000001U);memory.store(GuestAddress{arg(1)},32,object.record->data->code);result=1;}
                             else{memory.store(GuestAddress{arg(1)},32,object.record->exited()?object.record->data->code:259U);result=1;}
                         }
                         call.return_to(state,result);return std::nullopt;
@@ -3202,8 +3203,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
                                  found->second.debug_life->exited ? found->second.debug_life->code : 259);
                     result = 1;
                 } else if (symbol == (found->second.thread ? "GetExitCodeThread" : "GetExitCodeProcess") && record) {
+                    // 宿主程序異常結束（訊號）而未回報狀態：與等待邏輯一致視為已結束，結束碼沿用子程序故障的 0xC0000001，
+                    // 不讓父程序（例如 Steam 查詢崩潰的 webhelper）因此中止。
                     if (!record->exited() && !record->alive())
-                        throw HostCallFault("遠端程序未回報 DWORD 結束狀態");
+                        record->finish(0xC0000001U);
                     memory.store(GuestAddress{arg(1)}, 32, record->exited() ? record->data->code : 259U);
                     result = 1;
                 } else

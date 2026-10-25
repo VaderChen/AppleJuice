@@ -19,6 +19,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #ifdef __APPLE__
+#include "x64arm/resource_cache.hpp"
 #include <libproc.h>
 #include <mach/mach_time.h>
 #endif
@@ -161,6 +162,25 @@ struct ResourceUsageReporter::Impl {
         if (elapsed>0 && !c.gpu_unavailable.load(std::memory_order_relaxed)) json<<std::clamp(gpu_busy/elapsed*100,0.0,100.0); else json<<"null";
         json<<",\"gpuTimingAvailable\":"<<(c.gpu_unavailable.load(std::memory_order_relaxed)?"false":"true")<<",\"memoryBytes\":";
         if (process.memory_available) json<<process.memory_bytes; else json<<"null";
+#ifdef __APPLE__
+        {   // 同一份每 3 秒覆寫的快照；固定欄位，不另建逐筆快取歷史。
+            const auto resource=generated_resource_cache_stats();
+            json<<",\"generatedResourceCache\":{\"stores\":"<<resource.stores<<",\"entries\":"<<resource.entries
+                <<",\"payloadBudgetBytes\":"<<resource.payload_budget_bytes<<",\"payloadReservedBytes\":"<<resource.payload_reserved_bytes<<",\"peakPayloadReservedBytes\":"<<resource.peak_payload_reserved_bytes
+                <<",\"storeLimit\":"<<resource.store_limit<<",\"reservedStores\":"<<resource.reserved_stores<<",\"entryLimitPerStore\":"<<resource.entry_limit_per_store
+                <<",\"budgetRejections\":"<<resource.budget_rejections<<",\"storeRejections\":"<<resource.store_rejections<<",\"storeEvictions\":"<<resource.store_evictions
+                <<",\"retainedBytes\":"<<resource.retained_bytes<<",\"livePayloads\":"<<resource.live_payloads
+                <<",\"livePayloadBytes\":"<<resource.live_payload_bytes<<",\"peakLivePayloadBytes\":"<<resource.peak_live_payload_bytes
+                <<",\"writerHeldBytes\":"<<resource.writer_held_bytes<<",\"peakWriterHeldBytes\":"<<resource.peak_writer_held_bytes
+                <<",\"activeLoads\":"<<resource.active_loads<<",\"requests\":"<<resource.requests
+                <<",\"memoryHits\":"<<resource.memory_hits<<",\"diskHits\":"<<resource.disk_hits
+                <<",\"buildCalls\":"<<resource.build_calls<<",\"buildFailures\":"<<resource.build_failures
+                <<",\"waitCalls\":"<<resource.wait_calls<<",\"evictions\":"<<resource.evictions<<",\"bypasses\":"<<resource.bypasses
+                <<",\"buildNanoseconds\":"<<resource.build_ns<<",\"readNanoseconds\":"<<resource.read_ns
+                <<",\"decodeNanoseconds\":"<<resource.decode_ns<<",\"encodeNanoseconds\":"<<resource.encode_ns
+                <<",\"writeNanoseconds\":"<<resource.write_ns<<",\"writeFailures\":"<<resource.write_failures<<'}';
+        }
+#endif
         {   // 與宿主取樣不同步，明列客體快照時間與序號，不把舊值標成當下值。
             auto& guest_counters=counters();std::lock_guard lock(guest_counters.guest_mutex);json<<",\"guestMemory\":";
             if(!guest_counters.guest_sequence)json<<"null";

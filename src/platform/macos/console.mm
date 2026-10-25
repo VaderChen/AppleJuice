@@ -1,4 +1,5 @@
 #include "application.hpp"
+#include "modifier_keys.hpp"
 #import <AppKit/AppKit.h>
 #include "x64arm/native_console.hpp"
 #include <algorithm>
@@ -11,10 +12,13 @@ static NSString* console_string(std::u16string_view text){
 }
 static std::uint32_t console_modifiers(NSEvent* event){
     const auto flags=event.modifierFlags;std::uint32_t result=0;
-    if(flags&NSEventModifierFlagShift)result|=0x10;if(flags&NSEventModifierFlagControl)result|=8;
-    if(flags&NSEventModifierFlagOption)result|=2;if(flags&NSEventModifierFlagCapsLock)result|=0x80;return result;
+    if(flags&NSEventModifierFlagShift)result|=0x10;
+    if(flags&NSEventModifierFlagControl){if(flags&NX_DEVICERCTLKEYMASK)result|=4;if((flags&NX_DEVICELCTLKEYMASK) || !(flags&(NX_DEVICELCTLKEYMASK|NX_DEVICERCTLKEYMASK)))result|=8;}
+    if(flags&NSEventModifierFlagOption){if(flags&NX_DEVICERALTKEYMASK)result|=1;if((flags&NX_DEVICELALTKEYMASK) || !(flags&(NX_DEVICELALTKEYMASK|NX_DEVICERALTKEYMASK)))result|=2;}
+    if(flags&NSEventModifierFlagCapsLock)result|=0x80;return result;
 }
 static std::array<std::uint16_t,2> console_virtual_key(unsigned code,NSString* text){
+    if(const auto* key=native_modifier_key(code))return {key->key,static_cast<std::uint16_t>(key->scan&255U)};
     struct Key{unsigned mac,win,scan;};
     static constexpr Key keys[]{
         {0,65,30},{1,83,31},{2,68,32},{3,70,33},{4,72,35},{5,71,34},{6,90,44},{7,88,45},{8,67,46},{9,86,47},{11,66,48},
@@ -22,8 +26,8 @@ static std::array<std::uint16_t,2> console_virtual_key(unsigned code,NSString* t
         {22,54,7},{23,53,6},{24,187,13},{25,57,10},{26,55,8},{27,189,12},{28,56,9},{29,48,11},{30,221,27},
         {31,79,24},{32,85,22},{33,219,26},{34,73,23},{35,80,25},{36,13,28},{37,76,38},{38,74,36},{39,222,40},
         {40,75,37},{41,186,39},{42,220,43},{43,188,51},{44,191,53},{45,78,49},{46,77,50},{47,190,52},
-        {48,9,15},{49,32,57},{50,192,41},{51,8,14},{53,27,1},{55,91,91},{56,16,42},{57,20,58},{58,18,56},{59,17,29},
-        {60,16,54},{61,18,56},{62,17,29},{76,13,28},{96,116,63},{97,117,64},{98,118,65},{99,114,61},{100,119,66},
+        {48,9,15},{49,32,57},{50,192,41},{51,8,14},{53,27,1},{55,91,91},{57,20,58},
+        {76,13,28},{96,116,63},{97,117,64},{98,118,65},{99,114,61},{100,119,66},
         {101,120,67},{103,122,87},{109,121,68},{111,123,88},{115,36,71},{116,33,73},{117,46,83},{118,115,62},
         {119,35,79},{120,113,60},{121,34,81},{122,112,59},{123,37,75},{124,39,77},{125,40,80},{126,38,72}
     };
@@ -32,7 +36,9 @@ static std::array<std::uint16_t,2> console_virtual_key(unsigned code,NSString* t
 }
 }
 
-@interface X64ArmConsoleView : NSView
+@interface X64ArmConsoleView : NSView {
+    std::array<bool,256> pressedModifiers;
+}
 @property(nonatomic) x64arm::ConsoleViewState* model;
 @end
 @implementation X64ArmConsoleView
@@ -77,6 +83,12 @@ static std::array<std::uint16_t,2> console_virtual_key(unsigned code,NSString* t
 - (void)keyDown:(NSEvent*)event {[self recordKey:event down:YES];}
 - (void)keyUp:(NSEvent*)event {[self recordKey:event down:NO];}
 - (void)flagsChanged:(NSEvent*)event {
+    if(const auto* key=x64arm::native_modifier_key(event.keyCode)){
+        if(!self.model)return;auto& previous=pressedModifiers[event.keyCode];
+        const bool pressed=x64arm::native_modifier_pressed(*key,event.modifierFlags,previous);if(pressed==previous)return;previous=pressed;
+        const auto state=x64arm::console_modifiers(event)|((key->scan&0x100U)?0x100U:0U);
+        self.model->events.push_back(x64arm::console_key(0,pressed,key->key,static_cast<std::uint16_t>(key->scan&255U),state));return;
+    }
     if(!self.model)return;const auto key=x64arm::console_virtual_key(event.keyCode,@"");const auto mask=key[0]==16?NSEventModifierFlagShift:key[0]==17?NSEventModifierFlagControl:key[0]==18?NSEventModifierFlagOption:key[0]==20?NSEventModifierFlagCapsLock:NSEventModifierFlagCommand;
     self.model->events.push_back(x64arm::console_key(0,(event.modifierFlags&mask)!=0,key[0],key[1],x64arm::console_modifiers(event)));
 }

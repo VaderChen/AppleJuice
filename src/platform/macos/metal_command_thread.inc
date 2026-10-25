@@ -97,6 +97,7 @@ public:
     bool graphics_samples_supported(std::uint32_t format,std::uint32_t samples) override {graphics_sync();return inner_->graphics_samples_supported(format,samples);}
     bool graphics_vertex_format_supported(std::uint32_t format) override {graphics_sync();return inner_->graphics_vertex_format_supported(format);}
     std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes) override {graphics_sync();return inner_->graphics_shader(stage,bytes);}
+    std::shared_ptr<GraphicsShader> graphics_shader_private(std::uint32_t stage,std::span<const std::uint8_t> bytes) override {graphics_sync();return inner_->graphics_shader_private(stage,bytes);}
     std::shared_ptr<GraphicsShader> graphics_compute_source(const GraphicsModernShader& shader) override {graphics_sync();return inner_->graphics_compute_source(shader);}
     std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t> desc) override {graphics_sync();return inner_->graphics_sampler(desc);}
     bool graphics_timestamp_supported()const override {return inner_->graphics_timestamp_supported();}

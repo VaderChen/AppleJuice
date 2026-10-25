@@ -9,9 +9,15 @@
 #include <algorithm>
 
 namespace x64arm {
-namespace {
-std::uint32_t pipe_status(std::uint32_t error) {
+std::uint32_t WindowsServices::file_io_status(std::uint32_t error) {
     switch (error) {
+    case 1: return 0xc0000010;
+    case 2: return 0xc0000034;
+    case 3: return 0xc000003a;
+    case 4: return 0xc000011f;
+    case 6: return 0xc0000008;
+    case 50: return 0xc00000bb;
+    case 267: return 0xc0000103;
     case 0:
         return 0;
     case 5:
@@ -50,6 +56,7 @@ std::uint32_t pipe_status(std::uint32_t error) {
         return 0xc000000d;
     }
 }
+namespace {
 std::uint32_t pipe_error(std::uint32_t status) {
     switch (status) {
     case 0:
@@ -195,7 +202,7 @@ void WindowsServices::cancel_file_io(GuestMemory &memory, std::uint64_t handle, 
                                      std::uint64_t overlapped) {
     for (auto &io : pending_file_io_)
         if (io.handle == handle && !io.done && (!thread || io.thread == thread) &&
-            (!overlapped || io.overlapped == overlapped))
+            (!overlapped || io.overlapped == overlapped || io.native_iosb == overlapped))
             io.result = {0, 995};
     poll_file_io(memory);
 }
@@ -370,14 +377,14 @@ void WindowsServices::poll_file_io(GuestMemory &memory, bool scheduler_poll) {
             } catch (const MemoryFault &) {
                 io.result = {0, 998};
             }
-        complete_file_io(memory,io,pipe_status(io.result.error));
+        complete_file_io(memory,io,file_io_status(io.result.error));
         if (io.native_scratch) {
             (void)free_heap(memory, io.native_scratch, threads_.items.at(io.thread).context);
             io.native_scratch = 0;
         }
     }
     std::erase_if(pending_file_io_,
-                  [](const auto &io) { return io.overlapped && !io.blocking && io.notify && io.done; });
+                  [](const auto &io) { return (io.overlapped || io.native_iosb) && !io.blocking && io.notify && io.done; });
 }
 std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, GuestMemory &memory,
                                                              const WindowsServiceDescriptor &service,const FileOpenArguments* arguments) {
@@ -744,7 +751,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
             const bool extended = symbol == "CancelIoEx";
             const auto present = std::any_of(pending_file_io_.begin(), pending_file_io_.end(), [&](const auto &io) {
                 return io.handle == arg(0) && !io.done &&
-                       (extended ? (!arg(1) || arg(1) == io.overlapped) : io.thread == threads_.current);
+                       (extended ? (!arg(1) || arg(1) == io.overlapped || arg(1) == io.native_iosb) : io.thread == threads_.current);
             });
             if (!present && extended)
                 fail(1168);

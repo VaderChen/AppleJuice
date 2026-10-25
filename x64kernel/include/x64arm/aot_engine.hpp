@@ -35,6 +35,7 @@ public:
         std::uint64_t parallel_rebindings{},parallel_rebound_contexts{},parallel_local_runs{};
         std::uint64_t parallel_preemptions{},parallel_preempt_idle{},parallel_preempt_fallbacks{};
         std::uint64_t parallel_blocked_swaps{};
+        std::uint64_t parallel_parked{},parallel_unparked{},parallel_parked_timeouts{},parallel_parked_swaps{},parallel_service_rebounds{},parallel_parked_stale{},parallel_parked_resolves{},parallel_timeout_resolves{};
         std::uint64_t capacity_growths{},cache_capacity_bytes{},cache_reservation_bytes{},peak_cache_bytes{};
         std::uint64_t cache_validation_nanoseconds{},code_invalidations{},unaffected_code_events{};
         // 全清原因分開計數：紀錄遺失（落後環狀紀錄容量）、結構世代、MMU 存取模式、其他情境（身分／服務／模式／排序）。
