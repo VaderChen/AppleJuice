@@ -158,6 +158,8 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_translate_shader(std::uint32_t
         if(slot)shader->inputs.push_back({input.semanticName,input.ui32SemanticIndex,*slot});
     }
     if(shared)return shader;
+    // 診斷：X64ARM_DUMP_MSL=<目錄> 保存轉譯後的 MSL（檔名含階段與序號，與繪製追蹤的 vs／ps／cs 編號相同）。
+    if(const char* folder=std::getenv("X64ARM_DUMP_MSL");folder && *folder){std::ofstream out(std::filesystem::path(folder)/("stage"+std::to_string(stage)+"-"+std::to_string(shader->serial)+".metal"));out<<shader->source;}
     if(stage==2){shader->geometry_original=shader->source;shader->source=metal_geometry_clean(shader->source);}
     // VS 接到 GS 時可以只輸出自訂 varying，裁切位置由 GS 產生。
     // 仍編譯驗證 VS 主體，真正執行沿用幾何管線的 rasterization-disabled capture。
@@ -281,6 +283,7 @@ bool MetalGl::graphics_replace_buffer(const std::shared_ptr<GraphicsResource>& d
     return true;
 }
 void MetalGl::graphics_write(const GraphicsView& v,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){@autoreleasepool{
+    graphics_trace_upload("write",v,data);
     auto& r=metal_resource(v.resource);if(r.buffer){const auto size=v.count?v.count:r.desc.width-v.first;if(std::uint64_t{v.first}+size>r.desc.width || data.size()<size)throw std::invalid_argument("緩衝區寫入越界");graphics_write_buffer(v.resource,data.first(size),v.first);return;}
     wait_resource(v.resource);
     const auto w=std::max(1U,r.desc.width>>v.level),h=std::max(1U,r.desc.height>>v.level),z=std::max(1U,r.desc.depth>>v.level);
@@ -291,6 +294,7 @@ void MetalGl::graphics_write(const GraphicsView& v,std::span<const std::uint8_t>
     [r.texture replaceRegion:MTLRegionMake3D(0,0,0,w,h,z) mipmapLevel:v.level slice:v.slice withBytes:data.data() bytesPerRow:row bytesPerImage:z>1?image:0];
 }}
 void MetalGl::graphics_write_discard(const GraphicsView& v,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){@autoreleasepool{
+    graphics_trace_upload("discard",v,data);
     auto& resource=metal_resource(v.resource);
     if(!resource.buffer || v.first || (v.count && v.count!=resource.desc.width)){graphics_write(v,data,row,image);return;}
     if(data.size()<resource.desc.width)throw std::invalid_argument("Discard 緩衝區來源不足");
@@ -298,6 +302,7 @@ void MetalGl::graphics_write_discard(const GraphicsView& v,std::span<const std::
     if(!graphics_replace_buffer(v.resource,data))graphics_write(v,data,row,image);
 }}
 void MetalGl::graphics_write_no_overwrite(const GraphicsView& v,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){@autoreleasepool{
+    graphics_trace_upload("no_overwrite",v,data);
     // D3D11 持久映射的 NO_OVERWRITE 上傳：客體保證不改寫 GPU 使用中的範圍，而這些範圍與上次上傳的位元組相同，
     // 所以直接寫入共享記憶體 buffer，不等待 GPU、不另建 staging。非整個 buffer 或私有儲存時沿用一般寫入。
     auto& resource=metal_resource(v.resource);
@@ -718,9 +723,9 @@ void MetalGl::graphics_dispatch_indirect(const GraphicsStage& stage,const std::s
     if(!args.buffer || (offset&3U) || std::uint64_t{offset}+12>args.desc.width)throw std::invalid_argument("間接運算參數越界或未對齊");
     auto& shader=dynamic_cast<MetalShader&>(*stage.shader);metal_resolve_shader(device_,shader);begin_commands(true,"dispatch");auto e=[commands_ computeCommandEncoder];MetalEncoderScope e_scope{e};[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);
     [e dispatchThreadgroupsWithIndirectBuffer:args.buffer indirectBufferOffset:offset threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];
-    graphics_pending_.push_back(arguments);e_scope.end();if(metal_dispatch_sync())flush(true,"dispatch_sync");else if(++pending_>=128)flush(false,"batch_128");
+    graphics_pending_.push_back(arguments);e_scope.end();graphics_trace_dispatch(stage,{0,0,0},arguments,offset);if(metal_dispatch_sync())flush(true,"dispatch_sync");else if(++pending_>=128)flush(false,"batch_128");
 }}
-void MetalGl::graphics_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){@autoreleasepool{if(!stage.shader)throw std::invalid_argument("Dispatch 缺少 CS");auto& shader=dynamic_cast<MetalShader&>(*stage.shader);metal_resolve_shader(device_,shader);begin_commands(true,"dispatch");auto e=[commands_ computeCommandEncoder];MetalEncoderScope e_scope{e};[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);[e dispatchThreadgroups:MTLSizeMake(groups[0],groups[1],groups[2]) threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];e_scope.end();if(metal_dispatch_sync())flush(true,"dispatch_sync");else if(++pending_>=128)flush(false,"batch_128");}}
+void MetalGl::graphics_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){@autoreleasepool{if(!stage.shader)throw std::invalid_argument("Dispatch 缺少 CS");auto& shader=dynamic_cast<MetalShader&>(*stage.shader);metal_resolve_shader(device_,shader);begin_commands(true,"dispatch");auto e=[commands_ computeCommandEncoder];MetalEncoderScope e_scope{e};[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);[e dispatchThreadgroups:MTLSizeMake(groups[0],groups[1],groups[2]) threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];e_scope.end();graphics_trace_dispatch(stage,groups,{},0);if(metal_dispatch_sync())flush(true,"dispatch_sync");else if(++pending_>=128)flush(false,"batch_128");}}
 void MetalGl::graphics_mips(const GraphicsView& v){@autoreleasepool{begin_commands(true,"mips");auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};[e generateMipmapsForTexture:metal_texture(v)];e_scope.end();graphics_pending_.push_back(v.resource);}}
 void MetalGl::graphics_handoff(NativeGraphics& consumer,const GraphicsView& view){@autoreleasepool{
     // 命令執行緒代理：先清空其佇列，再交接給底層後端。

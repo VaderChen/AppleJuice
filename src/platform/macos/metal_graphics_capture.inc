@@ -17,6 +17,21 @@ static bool metal_trace_window(){
     }
     return metal_present_index.load()<window_end;
 }
+// 常數緩衝內容：每幀每個緩衝只讀一次，全部記 FNV 雜湊；1 KB 以上（View 類）另以獨立行記完整十六進位內容。
+template<class Read> static void metal_trace_constant(std::ostream& o,std::vector<std::string>& extra,const std::shared_ptr<GraphicsResource>& constant,const Read& graphics_read){
+    static std::uint64_t dumped_frame=UINT64_MAX;static std::set<const void*> dumped;
+    if(dumped_frame!=metal_present_index.load()){dumped_frame=metal_present_index.load();dumped.clear();}
+    if(!constant || !dumped.insert(constant.get()).second)return;
+    try{
+        const auto bytes=graphics_read(GraphicsView{constant});std::uint64_t hash=1469598103934665603ULL;for(const auto b:bytes){hash^=b;hash*=1099511628211ULL;}
+        o<<" cbh"<<constant.get()<<'='<<bytes.size()<<':'<<std::hex<<hash<<std::dec;
+        if(bytes.size()>=1024){
+            std::ostringstream line;line<<"cbdata frame="<<dumped_frame<<" cb="<<constant.get()<<" size="<<bytes.size()<<" hex=";
+            static constexpr char digits[]="0123456789abcdef";for(const auto b:bytes)line<<digits[b>>4]<<digits[b&15];
+            extra.push_back(line.str());
+        }
+    }catch(const std::exception&){}
+}
 template<class Read> static void metal_trace_stencil_draw(const GraphicsDraw& draw,const Read& graphics_read){
     auto* out=metal_stencil_trace();if(!out)return;
     const bool stencil=draw.depth_state.size()>=52 && metal_word(draw.depth_state,12);const bool window=metal_trace_window();
@@ -40,20 +55,46 @@ template<class Read> static void metal_trace_stencil_draw(const GraphicsDraw& dr
         for(unsigned i=0;i<draw.stages[0].resources.size();++i)if(draw.stages[0].resources[i].resource){o<<" vt"<<i<<'=';view(draw.stages[0].resources[i]);}
         for(unsigned i=0;i<draw.stages[0].constants.size();++i)if(draw.stages[0].constants[i])o<<" vc"<<i<<'='<<draw.stages[0].constants[i].get();
         for(unsigned i=0;i<draw.stages[1].constants.size();++i)if(draw.stages[1].constants[i])o<<" pc"<<i<<'='<<draw.stages[1].constants[i].get();
-        // 常數緩衝內容：每幀每個緩衝只讀一次，全部記 FNV 雜湊；1 KB 以上（View 類）另以獨立行記完整十六進位內容。
-        static std::uint64_t dumped_frame=UINT64_MAX;static std::set<const void*> dumped;
-        if(dumped_frame!=metal_present_index.load()){dumped_frame=metal_present_index.load();dumped.clear();}
-        for(unsigned s=0;s<2;++s)for(const auto& constant:draw.stages[s].constants){
-            if(!constant || !dumped.insert(constant.get()).second)continue;
-            try{
-                const auto bytes=graphics_read(GraphicsView{constant});std::uint64_t hash=1469598103934665603ULL;for(const auto b:bytes){hash^=b;hash*=1099511628211ULL;}
-                o<<" cbh"<<constant.get()<<'='<<bytes.size()<<':'<<std::hex<<hash<<std::dec;
-                if(bytes.size()>=1024){
-                    std::ostringstream line;line<<"cbdata frame="<<dumped_frame<<" cb="<<constant.get()<<" size="<<bytes.size()<<" hex=";
-                    static constexpr char digits[]="0123456789abcdef";for(const auto b:bytes)line<<digits[b>>4]<<digits[b&15];
-                    extra.push_back(line.str());
+        for(unsigned st=0;st<2;++st)for(const auto& constant:draw.stages[st].constants)metal_trace_constant(o,extra,constant,graphics_read);
+        if(draw.indirect){try{const auto bytes=graphics_read(GraphicsView{draw.indirect});o<<" ind="<<draw.indirect.get()<<'+'<<draw.indirect_offset<<':';for(unsigned k=0;k<5 && draw.indirect_offset+4*k+4<=bytes.size();++k){std::uint32_t value;std::memcpy(&value,bytes.data()+draw.indirect_offset+4*k,4);o<<value<<(k<4?",":"");}}catch(const std::exception&){o<<" ind=?";}
+            // 間接繪製後的渲染目標 0 縮小 8 倍存成 PPM（追蹤檔旁），逐 draw 檢視哪一個畫出異常。
+            if(const auto& target=draw.targets[0];target.resource && target.resource->desc.dimension==3){
+                const auto format=target.format?target.format:target.resource->desc.format;
+                if(format==10 || format==2 || format==28 || format==87 || format==24 || format==26){
+                    try{
+                        const auto pixels=graphics_read(target);const auto& d=target.resource->desc;const unsigned w=std::max(1U,d.width>>target.level),h=std::max(1U,d.height>>target.level);
+                        const unsigned bpp=format==10?8:format==2?16:4,sw=w/8,sh=h/8;
+                        static const std::string base=[]{const auto* path=std::getenv("X64ARM_GRAPHICS_STENCIL_TRACE");return std::string(path)+".rt";}();
+                        std::filesystem::create_directories(base);
+                        std::ofstream ppm(base+"/f"+std::to_string(metal_present_index.load())+"-d"+std::to_string(serial)+"-vs"+(draw.stages[0].shader?std::to_string(dynamic_cast<const MetalShader&>(*draw.stages[0].shader).serial):std::string("x"))+".ppm",std::ios::binary);
+                        ppm<<"P6\n"<<sw<<' '<<sh<<"\n255\n";
+                        const auto channel=[&](const std::uint8_t* p,unsigned c)->float{
+                            if(format==10){std::uint16_t half;std::memcpy(&half,p+2*c,2);__fp16 value;std::memcpy(&value,&half,2);return static_cast<float>(value);}
+                            if(format==2){float value;std::memcpy(&value,p+4*c,4);return value;}
+                            if(format==87)return p[2-c]/255.0F;
+                            return p[c]/255.0F;
+                        };
+                        for(unsigned y=0;y<sh;++y)for(unsigned x=0;x<sw;++x){
+                            const auto* p=pixels.data()+(static_cast<std::size_t>(y*8)*w+x*8)*bpp;
+                            for(unsigned c=0;c<3;++c){const float v=channel(p,c);const float mapped=std::isfinite(v)?v/(1.0F+std::max(0.0F,v)):1.0F;ppm.put(static_cast<char>(static_cast<std::uint8_t>(std::clamp(mapped*2.0F,0.0F,1.0F)*255.0F)));}
+                        }
+                    }catch(const std::exception&){}
                 }
-            }catch(const std::exception&){}
+            }
+            // 間接繪製（GPU 粒子）讀取的 VS 緩衝健康度：浮點看 NaN／Inf 數與最大絕對值，整數看最大值（排序索引是否越界）。
+            for(unsigned i=0;i<draw.stages[0].resources.size();++i){
+                const auto& v=draw.stages[0].resources[i];if(!v.resource || v.resource->desc.dimension!=1)continue;
+                const auto format=v.format?v.format:v.resource->desc.format;if(format!=41 && format!=42 && format!=43)continue;
+                try{
+                    const auto bytes=graphics_read(GraphicsView{v.resource});const std::size_t begin=v.first,end=std::min<std::size_t>(bytes.size(),v.count?v.first+v.count:bytes.size());
+                    std::size_t bad=0;double largest=0;std::int64_t top=INT64_MIN;
+                    for(std::size_t at=begin;at+4<=end;at+=4){
+                        if(format==41){float value;std::memcpy(&value,bytes.data()+at,4);if(!std::isfinite(value))++bad;else largest=std::max(largest,static_cast<double>(std::fabs(value)));}
+                        else{std::int32_t value;std::memcpy(&value,bytes.data()+at,4);top=std::max<std::int64_t>(top,format==42?static_cast<std::int64_t>(static_cast<std::uint32_t>(value)):value);}
+                    }
+                    if(format==41)o<<" vh"<<i<<"=nan"<<bad<<"/max"<<largest;else o<<" vh"<<i<<"=imax"<<top;
+                }catch(const std::exception&){o<<" vh"<<i<<"=?";}
+            }
         }
         // 極小的浮點紋理（例如 1×1 曝光值）直接附上內容：讀回會等待 GPU，只在請求視窗內使用。
         for(unsigned s=0;s<2;++s)for(unsigned i=0;i<draw.stages[s].resources.size();++i){
@@ -66,6 +107,38 @@ template<class Read> static void metal_trace_stencil_draw(const GraphicsDraw& dr
     for(const auto& v:draw.viewports)o<<" vp="<<v[0]<<','<<v[1]<<','<<v[2]<<','<<v[3];
     for(const auto& r:draw.scissors)o<<" sc="<<r[0]<<','<<r[1]<<','<<r[2]<<','<<r[3];
     o<<'\n';for(const auto& line:extra)o<<line<<'\n';
+}
+// 請求視窗內的 compute dispatch：CS、群組數或間接參數、UAV／SRV 與常數緩衝雜湊，與 draw 追蹤寫在同一檔案。
+void MetalGl::graphics_trace_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups,const std::shared_ptr<GraphicsResource>& arguments,std::uint32_t offset){
+    auto* out=metal_stencil_trace();if(!out || !metal_trace_window() || !stage.shader)return;
+    auto& o=*out;std::vector<std::string> extra;const auto read=[this](const GraphicsView& view){return graphics_read(view);};
+    const auto view=[&](const GraphicsView& v){o<<v.resource.get()<<':'<<v.format<<':'<<v.level<<':'<<v.slice;if(v.first || v.count)o<<'+'<<v.first<<'#'<<v.count;};
+    o<<"dispatch cs="<<dynamic_cast<const MetalShader&>(*stage.shader).serial<<" g="<<groups[0]<<','<<groups[1]<<','<<groups[2];
+    if(arguments){try{const auto bytes=read(GraphicsView{arguments});o<<" ind="<<arguments.get()<<'+'<<offset<<':';for(unsigned k=0;k<3 && offset+4*k+4<=bytes.size();++k){std::uint32_t value;std::memcpy(&value,bytes.data()+offset+4*k,4);o<<value<<(k<2?",":"");}}catch(const std::exception&){o<<" ind=?";}}
+    for(unsigned i=0;i<stage.unordered.size();++i)if(stage.unordered[i].resource){o<<" u"<<i<<'=';view(stage.unordered[i]);}
+    for(unsigned i=0;i<stage.resources.size();++i)if(stage.resources[i].resource){o<<" t"<<i<<'=';view(stage.resources[i]);}
+    for(unsigned i=0;i<stage.constants.size();++i)if(stage.constants[i])o<<" c"<<i<<'='<<stage.constants[i].get();
+    for(const auto& constant:stage.constants)metal_trace_constant(o,extra,constant,read);
+    // 常數緩衝實際讀到的前 32 個值（含綁定起點），與上傳紀錄比對是否為本幀內容。
+    for(unsigned i=0;i<stage.constants.size();++i){
+        if(!stage.constants[i])continue;
+        try{const auto bytes=read(GraphicsView{stage.constants[i]});const std::size_t base=stage.constant_offsets[i];o<<" cv"<<i<<'=';for(std::size_t at=base;at+4<=bytes.size() && at<base+640;at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<value<<',';}}
+        catch(const std::exception&){o<<" cv"<<i<<"=?";}
+    }
+    // 小型緩衝 SRV（例如 GPU 粒子的任務資訊）直接附上前 32 個 32 位元值：比對各幀上傳內容是否為最新。
+    for(unsigned i=0;i<stage.resources.size();++i){
+        const auto& v=stage.resources[i];if(!v.resource || v.resource->desc.dimension!=1 || v.resource->desc.width>4096)continue;
+        try{const auto bytes=read(GraphicsView{v.resource});o<<" tv"<<i<<'=';for(std::size_t at=v.first;at+4<=bytes.size() && at<v.first+128;at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<value<<',';}}
+        catch(const std::exception&){o<<" tv"<<i<<"=?";}
+    }
+    o<<'\n';for(const auto& line:extra)o<<line<<'\n';
+}
+// 請求視窗內 4 KB 以下緩衝的上傳內容（前 32 個 32 位元值），與 dispatch／draw 紀錄同序，用來比對上傳與讀取是否一致。
+void MetalGl::graphics_trace_upload(const char* kind,const GraphicsView& view,std::span<const std::uint8_t> data){
+    auto* out=metal_stencil_trace();if(!out || !view.resource || view.resource->desc.dimension!=1 || view.resource->desc.width>4096 || !metal_trace_window())return;
+    auto& o=*out;o<<"upload kind="<<kind<<" res="<<view.resource.get()<<" first="<<view.first<<" bytes="<<data.size()<<" data=";
+    for(std::size_t at=0;at+4<=data.size() && at<128;at+=4){std::uint32_t value;std::memcpy(&value,data.data()+at,4);o<<value<<',';}
+    o<<'\n';
 }
 // 可選的離線繪圖診斷；未設定環境變數時不讀回 GPU，也不影響呈現路徑。
 void MetalGl::graphics_capture(const GraphicsDraw& draw){

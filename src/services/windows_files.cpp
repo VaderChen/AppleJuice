@@ -260,6 +260,7 @@ std::span<const WindowsServiceDescriptor> file_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
         {"ntdll.dll","NtQueryInformationFile",5},{"ntdll.dll","NtSetInformationFile",5},
         {"ntdll.dll","NtQueryVolumeInformationFile",5},{"ntdll.dll","NtQueryDirectoryFile",11},
+        {"ntdll.dll","NtQueryDirectoryFileEx",10},
         {"ntdll.dll","NtDeviceIoControlFile",10},
         {"kernel32.dll","GetFinalPathNameByHandleA",4},{"kernel32.dll","GetFinalPathNameByHandleW",4},{"kernel32.dll","ReOpenFile",4},{"kernel32.dll","SetFileInformationByHandle",4},
         {"kernel32.dll","SetFileValidData",2,2},
@@ -307,7 +308,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
     if(kernel_device_handle(arg(0)))return invoke_kernel_device_io(state,memory,service);
     if(const auto file=files_.find(arg(0));file!=files_.end() && (file->second.serial || file->second.hid || file->second.usb)){
         if(symbol.starts_with("Nt")){
-            const auto iosb=arg(symbol=="NtDeviceIoControlFile" || symbol=="NtQueryDirectoryFile"?4:1);const auto unit=x86_?4U:8U;
+            const auto iosb=arg(symbol=="NtDeviceIoControlFile" || symbol=="NtQueryDirectoryFile" || symbol=="NtQueryDirectoryFileEx"?4:1);const auto unit=x86_?4U:8U;
             memory.check(GuestAddress{iosb},2*unit,Access::Write);memory.store(GuestAddress{iosb},static_cast<std::uint8_t>(unit*8),0xc0000010);memory.store(GuestAddress{iosb+unit},static_cast<std::uint8_t>(unit*8),0);
             arg.return_to(state,0xc0000010);return std::nullopt;
         }
@@ -419,8 +420,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         }
         arg.return_to(state,result);return std::nullopt;
     }
-    if(symbol=="NtDeviceIoControlFile" || symbol=="NtSetInformationFile" || symbol=="NtQueryVolumeInformationFile" || symbol=="NtQueryDirectoryFile") {
-        const bool control=symbol=="NtDeviceIoControlFile",directory=symbol=="NtQueryDirectoryFile";
+    if(symbol=="NtDeviceIoControlFile" || symbol=="NtSetInformationFile" || symbol=="NtQueryVolumeInformationFile" || symbol=="NtQueryDirectoryFile" || symbol=="NtQueryDirectoryFileEx") {
+        const bool control=symbol=="NtDeviceIoControlFile",extended=symbol=="NtQueryDirectoryFileEx",directory=extended || symbol=="NtQueryDirectoryFile";
         const auto iosb=arg(control || directory?4:1);const unsigned width=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(width*8);
         memory.check(GuestAddress{iosb},width*2,Access::Write);
         auto found=files_.find(arg(0));std::uint32_t status=0;std::uint64_t transferred=0;
@@ -428,7 +429,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
             switch(error){case 0:return 0;case 2:case 3:return 0xc0000034;case 5:return 0xc0000022;case 6:return 0xc0000008;case 8:return 0xc000009a;case 32:return 0xc0000043;case 87:return 0xc000000d;case 112:return 0xc000007f;default:return 0xc00000bb;}
         };
         if(found==files_.end())status=0xc0000008;
-        else if((control || directory) && (arg(2) || found->second.completion_port))status=0xc00000bb; // APC 尚未接到 NT 檔案完成路徑。
+        else if(control && (arg(2) || found->second.completion_port))status=0xc00000bb;
+        else if(directory && arg(2) && found->second.completion_port)status=0xc000000d;
+        else if(directory && (arg(1) || arg(2)) && (found->second.mode&0x30U))status=0xc000000d;
         else if((control || directory) && arg(1) && (runtime_.wait_objects.find(arg(1))==runtime_.wait_objects.end() || runtime_.wait_objects.at(arg(1)).kind!=WaitObject::Kind::Event))status=0xc0000008;
         else if(control)status=0xc0000010; // 現有一般檔案後端沒有裝置驅動程式的 IOCTL。
         else if(symbol=="NtSetInformationFile") {
@@ -477,29 +480,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
             }
         } else {
             auto& file=found->second;const auto capacity=u32(6),kind=u32(7);const auto output=arg(5);
-            const unsigned fixed=kind==1?64U:kind==2?68U:kind==3?94U:kind==12?12U:kind==37?104U:kind==38?80U:0U;
-            const bool first=!file.directory_pattern.has_value();
+            const unsigned fixed=kind==1?64U:kind==2?68U:kind==3?94U:kind==12?12U:kind==37?104U:kind==38?80U:kind==60?88U:kind==63?114U:0U;
+            const auto flags=extended?u32(8):0U;
+            const bool stateless=(flags&0x10U)!=0,first=stateless || !file.directory_pattern.has_value();
+            const bool restart=extended?(flags&0x11U)!=0:arg(10)!=0;
+            const bool single=extended?(flags&2U)!=0:arg(8)!=0;
+            auto pattern=file.directory_pattern.value_or(u"*");
             if(!(file.metadata.attributes&0x10))status=0xc0000103;
             else if(!(file.access&(0x80000000U|1U)))status=0xc0000022;
+            // INDEX_SPECIFIED 只能隨自建 IRP 傳入；此使用者模式入口沒有索引參數。
+            else if(flags&~0x1bU)status=0xc000000d;
             else if(!fixed)status=0xc0000003;
-            else if(capacity<fixed)status=0xc0000004;
+            else if(capacity<fixed)status=0xc0000023;
             else {
                 if(first){
-                    std::u16string pattern=u"*";
+                    pattern=u"*";
                     if(arg(9)){
                         const auto count=memory.load(GuestAddress{arg(9)},16),maximum=memory.load(GuestAddress{arg(9)+2},16);
                         const auto pointer=memory.load(GuestAddress{arg(9)+width},bits);
                         if((count&1) || count>maximum)status=0xc000000d;
                         else {pattern.clear();for(std::uint64_t i=0;i<count;i+=2)pattern+=static_cast<char16_t>(memory.load(GuestAddress{pointer+i},16));}
                     }
-                    if(!status)file.directory_pattern=std::move(pattern);
+                    if(!status && !stateless)file.directory_pattern=pattern;
                 }
                 if(!status && !file.directory_loaded){auto entries=filesystem_.list(file.path);status=nt_error(entries.error);if(!status){file.entries=std::move(entries.entries);file.directory_loaded=true;}}
                 if(!status){
-                    auto cursor=(first || arg(10))?0:file.directory_cursor;std::vector<std::uint8_t> bytes;std::size_t previous=0;
+                    auto cursor=(first || restart)?0:file.directory_cursor;std::vector<std::uint8_t> bytes;std::size_t previous=0;
                     const auto put=[&](std::size_t at,std::uint64_t value,unsigned count){for(unsigned i=0;i<count;++i)bytes.at(at+i)=static_cast<std::uint8_t>(value>>(i*8));};
                     while(cursor<file.entries.size()){
-                        const auto& entry=file.entries[cursor];if(!find_matches(*file.directory_pattern,utf8_to_utf16(entry.name),false)){++cursor;continue;}
+                        const auto& entry=file.entries[cursor];if(!find_matches(pattern,utf8_to_utf16(entry.name),false)){++cursor;continue;}
                         auto name=utf16_bytes(utf8_to_utf16(entry.name));name.resize(name.size()-2);const auto length=fixed+name.size(),offset=(bytes.size()+7)&~std::size_t{7};
                         const bool overflow=offset>capacity || length>capacity-offset;
                         if(overflow && (!bytes.empty() || !first))break;
@@ -507,18 +516,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
                         const auto& info=entry.metadata;
                         put(offset+4,cursor,4);
                         if(kind==12)put(offset+8,name.size(),4);
-                        else {put(offset+8,info.created,8);put(offset+16,info.accessed,8);put(offset+24,info.modified,8);put(offset+32,info.changed,8);put(offset+40,info.size,8);put(offset+48,info.allocation_size,8);put(offset+56,info.attributes,4);put(offset+60,name.size(),4);if(kind==37)put(offset+96,info.id,8);if(kind==38)put(offset+72,info.id,8);}
+                        else {put(offset+8,info.created,8);put(offset+16,info.accessed,8);put(offset+24,info.modified,8);put(offset+32,info.changed,8);put(offset+40,info.size,8);put(offset+48,info.allocation_size,8);put(offset+56,info.attributes,4);put(offset+60,name.size(),4);if(kind==37)put(offset+96,info.id,8);if(kind==38 || kind==60 || kind==63)put(offset+72,info.id,8);if(kind==60 || kind==63)put(offset+68,info.reparse_tag,4);}
                         std::copy_n(name.begin(),std::min(name.size(),bytes.size()-offset-fixed),bytes.begin()+static_cast<std::ptrdiff_t>(offset+fixed));
-                        if(overflow){status=0x80000005;break;}++cursor;if(arg(8))break;
+                        if(overflow){status=0x80000005;break;}++cursor;if(single)break;
                     }
                     if(bytes.empty() && cursor==file.entries.size())status=first?0xc000000f:0x80000006;
                     if(!bytes.empty()){memory.write(GuestAddress{output},bytes);transferred=bytes.size();}
-                    file.directory_cursor=cursor;
+                    if(!stateless)file.directory_cursor=cursor;
                 }
             }
         }
-        memory.store(GuestAddress{iosb},bits,status);memory.store(GuestAddress{iosb+width},bits,transferred);
-        if(!status && directory && arg(1))runtime_.wait_objects.at(arg(1)).set_signal(true);
+        if(directory && (status==0 || status==0x80000005U || status==0x80000006U || status==0xc000000fU)){
+            PendingFileIo completion;completion.handle=arg(0);completion.thread=threads_.current;
+            completion.event=arg(1);completion.routine=arg(2);completion.native_context=arg(3);completion.native_iosb=iosb;
+            completion.result.bytes=transferred;completion.result.error=status==0?0U:status==0x80000005U?234U:status==0x80000006U?18U:2U;
+            complete_file_io(memory,completion,status);
+        }else {memory.store(GuestAddress{iosb},bits,status);memory.store(GuestAddress{iosb+width},bits,transferred);}
+        threads_.items.at(threads_.current).last_native_status=status;
         arg.return_to(state,status);return std::nullopt;
     }
     if(symbol=="DeviceIoControl"){

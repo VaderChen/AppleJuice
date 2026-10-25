@@ -82,16 +82,23 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
         binding.flags=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER?0U:buffer?VKD3D_SHADER_BINDING_FLAG_BUFFER:VKD3D_SHADER_BINDING_FLAG_IMAGE;
         by_binding.emplace(binding.binding.binding,Descriptor{d.type,d.register_index,d.count,d.register_space,buffer,table});bindings.push_back(binding);
     }
+    // 描述元表（bindless）需要動態索引描述元陣列：開啟 EXT_descriptor_indexing，SPIRV-Cross 再以執行期陣列輸出。
+    static constexpr vkd3d_shader_spirv_extension extensions[]{VKD3D_SHADER_SPIRV_EXTENSION_EXT_DESCRIPTOR_INDEXING};
     vkd3d_shader_spirv_target_info target{};target.type=VKD3D_SHADER_STRUCTURE_TYPE_SPIRV_TARGET_INFO;target.environment=VKD3D_SHADER_SPIRV_ENVIRONMENT_VULKAN_1_1;
+    target.extensions=extensions;target.extension_count=1;
     vkd3d_shader_interface_info interface{};interface.type=VKD3D_SHADER_STRUCTURE_TYPE_INTERFACE_INFO;interface.next=&target;
     interface.bindings=bindings.data();interface.binding_count=static_cast<unsigned>(bindings.size());info.next=&interface;
     if(vkd3d_shader_compile(&info,&scan.code,&scan.messages)<0){scan.code={};throw std::invalid_argument("現代著色器轉譯失敗："+std::string(scan.messages?scan.messages:""));}
     std::vector<std::uint32_t> words(scan.code.size/4);std::memcpy(words.data(),scan.code.code,words.size()*4);
+    // 診斷：X64ARM_DUMP_SPIRV=<目錄> 保存 vkd3d 輸出的 SPIR-V（檔名為內容雜湊），供 spirv-dis 檢查。
+    if(const char* folder=std::getenv("X64ARM_DUMP_SPIRV");folder && *folder){std::uint64_t hash=1469598103934665603ULL;for(const auto w:words){hash^=w;hash*=1099511628211ULL;}
+        std::ofstream out(std::filesystem::path(folder)/(std::to_string(hash)+".spv"),std::ios::binary);out.write(reinterpret_cast<const char*>(words.data()),static_cast<std::streamsize>(words.size()*4));}
     spirv_cross::CompilerMSL compiler(std::move(words));
     const auto model=stage==0?spv::ExecutionModelVertex:stage==1?spv::ExecutionModelFragment:spv::ExecutionModelGLCompute;
     auto msl=compiler.get_msl_options();msl.platform=spirv_cross::CompilerMSL::Options::macOS;msl.set_msl_version(3,0);msl.pad_fragment_output_components=true;
     // 描述元表的 storage buffer 項目帶長度（spvBufferDescriptor：位址、長度、補齊，共 16 位元組）。
-    msl.runtime_array_rich_descriptor=true;compiler.set_msl_options(msl);
+    // 無界描述元陣列要求 argument buffer tier 2（Apple Silicon 皆支援）。
+    msl.runtime_array_rich_descriptor=true;msl.argument_buffers_tier=spirv_cross::CompilerMSL::Options::ArgumentBuffersTier::Tier2;compiler.set_msl_options(msl);
     GraphicsModernShader result;
     // 依 SPIRV-Cross 反射的實際資源型別分配 Metal 索引，與宣告順序無關。
     unsigned next_buffer=0,next_texture=0,next_sampler=0;

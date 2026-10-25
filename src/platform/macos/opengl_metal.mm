@@ -444,6 +444,8 @@ public:
     void graphics_mips(const GraphicsView&)override;
     void graphics_present(const GraphicsView&)override;
     void graphics_capture(const GraphicsDraw&);
+    void graphics_trace_dispatch(const GraphicsStage&,std::array<std::uint32_t,3>,const std::shared_ptr<GraphicsResource>&,std::uint32_t);
+    void graphics_trace_upload(const char*,const GraphicsView&,std::span<const std::uint8_t>);
     void graphics_capture_present(const GraphicsView&);
     void graphics_export_frame(const GraphicsView&,void*,std::size_t,std::uint32_t,std::shared_ptr<void>)override;
     void graphics_flush(bool wait)override{flush(wait);}

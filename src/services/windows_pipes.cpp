@@ -199,6 +199,50 @@ void WindowsServices::cancel_file_io(GuestMemory &memory, std::uint64_t handle, 
             io.result = {0, 995};
     poll_file_io(memory);
 }
+void WindowsServices::complete_file_io(GuestMemory& memory,PendingFileIo& io,std::uint32_t status) {
+    const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+    const auto file=files_.find(io.handle);
+    io.done = true;
+    set_file_io_signaled(io.handle, true);
+    if (io.routine && (io.notify || !io.result.error || io.result.error == 234)) {
+        const auto thread = threads_.items.find(io.thread);
+        if (thread != threads_.items.end() && thread->second.status != ThreadStatus::Exited &&
+            !thread->second.terminating) {
+            thread->second.apcs.push_back(
+                {io.routine, io.native_iosb
+                                 ? std::vector<std::uint64_t>{io.native_context, io.native_iosb, 0}
+                                 : std::vector<std::uint64_t>{io.result.error, io.result.bytes, io.overlapped}});
+            threads_.yield = true;
+        }
+    }
+    if (io.count_pointer)
+        memory.store(GuestAddress{io.count_pointer}, 32, io.result.bytes);
+    if (io.overlapped || io.native_iosb) {
+        if (io.overlapped) {
+            memory.store(GuestAddress{io.overlapped}, bits, status);
+            memory.store(GuestAddress{io.overlapped + unit}, bits, io.result.bytes);
+        }
+        if (io.native_iosb) {
+            memory.store(GuestAddress{io.native_iosb}, bits, status);
+            memory.store(GuestAddress{io.native_iosb + unit}, bits, io.result.bytes);
+        }
+        if (io.event) {
+            const auto event = runtime_.wait_objects.find(io.event & ~UINT64_C(1));
+            if (event != runtime_.wait_objects.end())
+                event->second.set_signal(true);
+        }
+        // 同步失敗的要求不會再排入 IOCP；已回 ERROR_IO_PENDING 的要求則須交付錯誤／取消封包。
+        if (!io.routine && file != files_.end() && !(io.event & 1) &&
+            (io.notify || !io.result.error || io.result.error == 234) &&
+            (io.notify || io.result.error || !(file->second.completion_modes & 1))) {
+            const auto port = runtime_.completion_ports.find(file->second.completion_port);
+            if (port != runtime_.completion_ports.end())
+                port->second.packets.push_back({file->second.completion_key,
+                                                io.native_iosb ? io.native_context : io.overlapped,
+                                                status, io.result.bytes});
+        }
+    }
+}
 void WindowsServices::poll_file_io(GuestMemory &memory, bool scheduler_poll) {
     if (pending_file_io_.empty())
         return;
@@ -206,8 +250,6 @@ void WindowsServices::poll_file_io(GuestMemory &memory, bool scheduler_poll) {
     const auto wake = scheduler_poll && runtime_.host_clock ? mapping_wake() : nullptr;
     // 在檢查完成條件之前擷取 epoch；檢查途中發生的通知留待下一輪處理。
     const auto epoch = wake ? wake->snapshot() : 0;
-    const unsigned unit = x86_ ? 4 : 8;
-    const std::uint8_t bits = x86_ ? 32 : 64;
     for (auto &io : pending_file_io_) {
         if (io.done)
             continue;
@@ -328,44 +370,7 @@ void WindowsServices::poll_file_io(GuestMemory &memory, bool scheduler_poll) {
             } catch (const MemoryFault &) {
                 io.result = {0, 998};
             }
-        io.done = true;
-        set_file_io_signaled(io.handle, true);
-        if (io.routine && (io.notify || !io.result.error || io.result.error == 234)) {
-            const auto thread = threads_.items.find(io.thread);
-            if (thread != threads_.items.end() && thread->second.status != ThreadStatus::Exited &&
-                !thread->second.terminating) {
-                thread->second.apcs.push_back(
-                    {io.routine, io.native_iosb
-                                     ? std::vector<std::uint64_t>{io.native_context, io.native_iosb, 0}
-                                     : std::vector<std::uint64_t>{io.result.error, io.result.bytes, io.overlapped}});
-                threads_.yield = true;
-            }
-        }
-        if (io.count_pointer)
-            memory.store(GuestAddress{io.count_pointer}, 32, io.result.bytes);
-        if (io.overlapped) {
-            memory.store(GuestAddress{io.overlapped}, bits, pipe_status(io.result.error));
-            memory.store(GuestAddress{io.overlapped + unit}, bits, io.result.bytes);
-            if (io.native_iosb) {
-                memory.store(GuestAddress{io.native_iosb}, bits, pipe_status(io.result.error));
-                memory.store(GuestAddress{io.native_iosb + unit}, bits, io.result.bytes);
-            }
-            if (io.event) {
-                const auto event = runtime_.wait_objects.find(io.event & ~UINT64_C(1));
-                if (event != runtime_.wait_objects.end())
-                    event->second.set_signal(true);
-            }
-            // 同步失敗的要求不會再排入 IOCP；已回 ERROR_IO_PENDING 的要求則須交付錯誤／取消封包。
-            if (!io.routine && file != files_.end() && !(io.event & 1) &&
-                (io.notify || !io.result.error || io.result.error == 234) &&
-                (io.notify || io.result.error || !(file->second.completion_modes & 1))) {
-                const auto port = runtime_.completion_ports.find(file->second.completion_port);
-                if (port != runtime_.completion_ports.end())
-                    port->second.packets.push_back({file->second.completion_key,
-                                                    io.native_iosb ? io.native_context : io.overlapped,
-                                                    pipe_status(io.result.error), io.result.bytes});
-            }
-        }
+        complete_file_io(memory,io,pipe_status(io.result.error));
         if (io.native_scratch) {
             (void)free_heap(memory, io.native_scratch, threads_.items.at(io.thread).context);
             io.native_scratch = 0;

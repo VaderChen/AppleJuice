@@ -680,6 +680,8 @@ private:
         bool hid{};
         std::uint64_t pipe_wake_epoch{},pipe_poll_deadline{};
     };
+    // 共用即時／待命 I/O 的結果發布、事件、APC 及完成埠通知。
+    void complete_file_io(GuestMemory&,PendingFileIo&,std::uint32_t);
     PipeResult poll_hid_io(PendingFileIo&,GuestMemory&);
     std::vector<PendingFileIo> pending_file_io_;
     PipeResult read_directory_notification(const PendingFileIo&,GuestMemory&);

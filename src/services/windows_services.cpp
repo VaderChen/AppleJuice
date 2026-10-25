@@ -1,6 +1,7 @@
 #include "x64arm/startup_profile.hpp"
 #include "x64arm/resource_usage.hpp"
 #include "x64arm/windows_services.hpp"
+#include "x64arm/windows_unwind.hpp"
 #include "guest_heap_layout.hpp"
 #include "resident_service_policy.hpp"
 #include "crt_library.hpp"
@@ -1815,6 +1816,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
                 }catch(const MemoryFault&){break;}
             }
         }
+        // 沿用例外處理及 CaptureStackBackTrace 的 AMD64 unwind；只在明確診斷時讀取。
+        if(!x86_ && std::getenv("X64ARM_TRACE_SERVICE_UNWIND")){
+            try {
+                auto walk=state;
+                const auto low=memory.load(GuestAddress{state.gs_base+16},64);
+                const auto high=memory.load(GuestAddress{state.gs_base+8},64);
+                walk.rip=GuestAddress{memory.load(GuestAddress{walk.reg(Gpr::Rsp)},64)};
+                walk.reg(Gpr::Rsp)+=8;
+                for(unsigned depth=0;depth<24 && walk.rip.value;++depth){
+                    const auto sp=walk.reg(Gpr::Rsp);
+                    if(sp<low || sp>=high || handles(walk.rip))break;
+                    const auto* image=module_image(walk.rip.value,true);if(!image)break;
+                    memory.check(walk.rip,1,Access::Execute);
+                    std::fprintf(stderr,"[api] unwind%u pc=%llx sp=%llx\n",depth,
+                        static_cast<unsigned long long>(walk.rip.value),static_cast<unsigned long long>(sp));
+                    walk=virtual_unwind(memory,*image,walk.rip.value,walk,0).caller;
+                    if(walk.reg(Gpr::Rsp)<=sp)break;
+                }
+            }catch(const MemoryFault&){}catch(const HostCallFault&){}
+        }
         // 診斷指定位置的客體狀態；僅讀取，不更動記憶體或 API 結果。
         static const auto observed_address=[]()->std::optional<std::uint64_t> {
             const auto* setting=std::getenv("X64ARM_TRACE_MEMORY_ADDRESS");if(!setting || !*setting)return std::nullopt;
@@ -1836,6 +1857,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
                 if(args(1)>0xffff)trace_text("symbol",args(1),false);
                 else std::fprintf(stderr,"[api] ordinal=%llu\n",static_cast<unsigned long long>(args(1)));
             }else if(service_name.starts_with("LoadLibrary"))trace_text("library",args(0),service_name.ends_with('W'));
+            else if(service_name=="fopen" || service_name=="_wfopen" || service_name=="_fsopen" || service_name=="_wfsopen" ||
+                    service_name=="freopen" || service_name=="_wfreopen" || service_name=="_open" || service_name=="_wopen" ||
+                    service_name=="_sopen" || service_name=="_wsopen")trace_text("path",args(0),service_name.starts_with("_w"));
+            else if(service_name=="fopen_s" || service_name=="_wfopen_s" || service_name=="freopen_s" || service_name=="_wfreopen_s" ||
+                    service_name=="_sopen_s" || service_name=="_wsopen_s")trace_text("path",args(1),service_name.starts_with("_w"));
             else if(service_name.starts_with("CreateFileMapping"))trace_text("mapping",args(5),service_name.ends_with('W'));
             else if(service_name.starts_with("OpenFileMapping"))trace_text("mapping",args(2),service_name.ends_with('W'));
             else if(service_name=="CreateProcessW" || service_name=="CreateProcessA")trace_text("command",args(1),service_name.ends_with('W'));

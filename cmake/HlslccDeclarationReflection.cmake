@@ -39,3 +39,46 @@ x64arm_hlslcc_patch(toMetalOperand.cpp
         return value;
     }
     std::ostringstream oss;]=])
+# 常數緩衝來源的負號依指令型別解讀：整數指令（iadd、ishl、ult、itof…）的 neg 是二補數取負，
+# 只有無型別搬移（mov／movc）與浮點指令才翻轉 sign bit。翻轉 sign bit 用在整數上會得到 x+2^31，
+# 例如 Niagara 產生間接參數的 CS 以 ThreadID - NumArgGenTasks 定位清零任務，錯成天文數字而永不清零計數。
+x64arm_hlslcc_patch(toMetalInstruction.cpp
+  [=[void ToMetal::TranslateInstruction(Instruction* psInst)
+{
+    bstring glsl = *psContext->currentGLSLString;]=]
+  [=[thread_local const Instruction* x64armCurrentInstruction = nullptr;
+void ToMetal::TranslateInstruction(Instruction* psInst)
+{
+    x64armCurrentInstruction = psInst;
+    bstring glsl = *psContext->currentGLSLString;]=])
+x64arm_hlslcc_patch(toMetalOperand.cpp
+  [=[        if (psOperand->eModifier == OPERAND_MODIFIER_NEG || psOperand->eModifier == OPERAND_MODIFIER_ABSNEG)
+            value = "(" + value + " ^ 0x80000000u)";]=]
+  [=[        if (psOperand->eModifier == OPERAND_MODIFIER_NEG || psOperand->eModifier == OPERAND_MODIFIER_ABSNEG)
+            value = x64armIntegerInstruction() ? "(0u - " + value + ")" : "(" + value + " ^ 0x80000000u)";]=])
+x64arm_hlslcc_patch(toMetalOperand.cpp
+  [=[std::string ToMetal::TranslateOperand(const Operand* psOperand, uint32_t ui32TOFlag, uint32_t ui32ComponentMask)
+{
+    const auto rawType = TypeFlagsToSVTType(ui32TOFlag);]=]
+  [=[extern thread_local const Instruction* x64armCurrentInstruction;
+// DXBC 整數指令：來源 neg 修飾為二補數取負（D3D10 規格），其餘指令沿用浮點 sign bit 語義。
+static bool x64armIntegerInstruction()
+{
+    if (!x64armCurrentInstruction) return false;
+    switch (x64armCurrentInstruction->eOpcode)
+    {
+        case OPCODE_IADD: case OPCODE_IEQ: case OPCODE_IGE: case OPCODE_ILT: case OPCODE_IMAD: case OPCODE_IMAX:
+        case OPCODE_IMIN: case OPCODE_IMUL: case OPCODE_INE: case OPCODE_INEG: case OPCODE_ISHL: case OPCODE_ISHR:
+        case OPCODE_ITOF: case OPCODE_UDIV: case OPCODE_ULT: case OPCODE_UGE: case OPCODE_UMUL: case OPCODE_UMAD:
+        case OPCODE_UMAX: case OPCODE_UMIN: case OPCODE_USHR: case OPCODE_UTOF: case OPCODE_AND: case OPCODE_OR:
+        case OPCODE_XOR: case OPCODE_NOT: case OPCODE_UADDC: case OPCODE_USUBB: case OPCODE_BFI: case OPCODE_UBFE:
+        case OPCODE_IBFE: case OPCODE_BFREV: case OPCODE_COUNTBITS: case OPCODE_FIRSTBIT_HI: case OPCODE_FIRSTBIT_LO:
+        case OPCODE_FIRSTBIT_SHI: case OPCODE_SWITCH: case OPCODE_CASE:
+            return true;
+        default:
+            return false;
+    }
+}
+std::string ToMetal::TranslateOperand(const Operand* psOperand, uint32_t ui32TOFlag, uint32_t ui32ComponentMask)
+{
+    const auto rawType = TypeFlagsToSVTType(ui32TOFlag);]=])
