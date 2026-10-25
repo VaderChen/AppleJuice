@@ -1699,12 +1699,13 @@ std::optional<WindowsServices::ObjectMetadata> WindowsServices::process_object_m
         return {};
     ObjectMetadata out;
     out.access = 0x1fffffU;
-    out.identity = process_id();
+    out.identity = type==u"Thread"?(std::uint64_t{process_id()}<<32)|1U:process_id();
 #if !defined(_WIN32)
     const auto identity = [&](const auto &item) {
-        return item.child        ? static_cast<std::uint64_t>(item.child->pid)
+        const auto pid=item.child        ? static_cast<std::uint64_t>(item.child->pid)
                : item.remote_pid ? static_cast<std::uint64_t>(item.remote_pid)
                                  : static_cast<std::uint64_t>(process_id());
+        return item.thread?(pid<<32)|(item.remote_tid?item.remote_tid:1U):pid;
     };
     if (processes_) {
         const auto found = processes_->handles.find(handle);
@@ -1743,6 +1744,7 @@ bool WindowsServices::close_process(std::uint64_t handle) {
 #endif
 }
 std::optional<bool> WindowsServices::process_signaled(std::uint64_t handle, bool input_idle) {
+    if(current_process_handle(handle))return false;
 #if !defined(_WIN32)
     if (!processes_)
         return {};

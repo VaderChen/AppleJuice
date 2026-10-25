@@ -33,6 +33,10 @@ struct Counters {
     std::mutex diagnostics_mutex;
     std::map<std::string,std::int64_t> diagnostic_counts;
     std::map<std::string,std::string> diagnostic_texts;
+    std::atomic<bool> guest_sample_requested{};
+    std::mutex guest_mutex;
+    GuestMemoryUsage guest_usage;
+    std::uint64_t guest_sampled_at{},guest_sequence{};
 };
 // 完成回呼可能比報告器活得更久；程序共用計數器不依賴報告器的物件生命週期。
 Counters& counters() { static auto* value = new Counters; return *value; }
@@ -65,6 +69,18 @@ ProcessSample process_sample() {
 }
 
 bool resource_usage_enabled() noexcept { return counters().enabled.load(std::memory_order_relaxed); }
+bool take_guest_memory_sample_request() noexcept {
+    auto& c=counters();
+    return c.guest_sample_requested.load(std::memory_order_relaxed) &&
+        c.guest_sample_requested.exchange(false,std::memory_order_relaxed);
+}
+void record_guest_memory_usage(const GuestMemoryUsage& value) noexcept {
+    auto& c=counters();if(!c.enabled.load(std::memory_order_relaxed))return;
+    try{
+        const auto sampled=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        std::lock_guard lock(c.guest_mutex);c.guest_usage=value;c.guest_sampled_at=static_cast<std::uint64_t>(sampled);++c.guest_sequence;
+    }catch(...){}
+}
 void record_network_transfer(std::uint64_t received,std::uint64_t sent) noexcept {
     auto& c=counters(); if (!c.enabled.load(std::memory_order_relaxed)) return;
     c.received.fetch_add(received,std::memory_order_relaxed); c.sent.fetch_add(sent,std::memory_order_relaxed);
@@ -110,6 +126,7 @@ struct ResourceUsageReporter::Impl {
     explicit Impl(std::filesystem::path destination):path(std::move(destination)) {
         if (counters().enabled.exchange(true)) throw std::logic_error("資源用量報告器已啟用");
         try {
+            {auto& c=counters();std::lock_guard lock(c.guest_mutex);c.guest_usage={};c.guest_sequence=0;c.guest_sampled_at=0;}
             publish(true);
             worker=std::thread([this] {
                 auto next=std::chrono::steady_clock::now()+std::chrono::seconds(3);
@@ -122,12 +139,13 @@ struct ResourceUsageReporter::Impl {
                     if (next<std::chrono::steady_clock::now()) next=std::chrono::steady_clock::now()+std::chrono::seconds(3);
                 }
             });
-        } catch (...) { counters().enabled.store(false); throw; }
+        } catch (...) { counters().enabled.store(false);counters().guest_sample_requested.store(false);throw; }
     }
     ~Impl() {
         { std::lock_guard lock(mutex); stopping=true; } changed.notify_one();
         if (worker.joinable()) worker.join();
         counters().enabled.store(false,std::memory_order_relaxed);
+        counters().guest_sample_requested.store(false,std::memory_order_relaxed);
     }
     void publish(bool initial) {
         const auto now=host_seconds(); const auto process=process_sample(); const auto& c=counters();
@@ -143,6 +161,21 @@ struct ResourceUsageReporter::Impl {
         if (elapsed>0 && !c.gpu_unavailable.load(std::memory_order_relaxed)) json<<std::clamp(gpu_busy/elapsed*100,0.0,100.0); else json<<"null";
         json<<",\"gpuTimingAvailable\":"<<(c.gpu_unavailable.load(std::memory_order_relaxed)?"false":"true")<<",\"memoryBytes\":";
         if (process.memory_available) json<<process.memory_bytes; else json<<"null";
+        {   // 與宿主取樣不同步，明列客體快照時間與序號，不把舊值標成當下值。
+            auto& guest_counters=counters();std::lock_guard lock(guest_counters.guest_mutex);json<<",\"guestMemory\":";
+            if(!guest_counters.guest_sequence)json<<"null";
+            else {const auto& g=guest_counters.guest_usage;
+                json<<"{\"sampledAt\":"<<guest_counters.guest_sampled_at<<",\"sequence\":"<<guest_counters.guest_sequence
+                    <<",\"committedBytes\":"<<g.committed<<",\"privateCommitBytes\":"<<g.private_commit
+                    <<",\"peakCommittedBytes\":"<<g.peak_committed<<",\"peakPrivateCommitBytes\":"<<g.peak_private_commit
+                    <<",\"virtualBytes\":"<<g.virtual_size<<",\"serviceHeapBytes\":"<<g.service_heap_bytes
+                    <<",\"serviceHeapBlocks\":"<<g.service_heap_blocks<<",\"serviceHeapLargestBytes\":"<<g.service_heap_largest
+                    <<",\"largeHeapBytes\":"<<g.large_heap_bytes<<",\"largeHeapBlocks\":"<<g.large_heap_blocks
+                    <<",\"quickHeapBytes\":"<<g.quick_heap_bytes<<",\"quickHeapBlocks\":"<<g.quick_heap_blocks
+                    <<",\"smallHeapMappedBytes\":"<<g.small_heap_mapped<<'}';
+            }
+            guest_counters.guest_sample_requested.store(true,std::memory_order_relaxed);
+        }
         json<<",\"gpuMemoryBytes\":"<<gpu.used<<",\"gpuMemoryLimitBytes\":"<<gpu.limit<<",\"receivedBytes\":"<<received<<",\"sentBytes\":"<<sent<<",\"receiveBytesPerSecond\":";
         if (elapsed>0) json<<double(received-last_received)/elapsed; else json<<"null";
         json<<",\"sendBytesPerSecond\":";

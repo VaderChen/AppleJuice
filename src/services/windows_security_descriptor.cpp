@@ -23,8 +23,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_security_descriptor(
     const auto bits=static_cast<std::uint8_t>(x86_?32:64); const unsigned unit=x86_?4:8;
     const bool builder=symbol.starts_with("BuildSecurityDescriptor");
     const bool setting=symbol.starts_with("Set");
-    const bool buffer=symbol.starts_with("GetFileSecurity") || symbol.starts_with("SetFileSecurity");
-    const bool handle=symbol=="GetSecurityInfo" || symbol=="SetSecurityInfo";
+    const bool kernel=symbol=="GetKernelObjectSecurity" || symbol=="SetKernelObjectSecurity";
+    const bool buffer=kernel || symbol.starts_with("GetFileSecurity") || symbol.starts_with("SetFileSecurity");
+    const bool handle=kernel || symbol=="GetSecurityInfo" || symbol=="SetSecurityInfo";
     const bool wide=symbol.ends_with('W');
     const NameResolver resolve=[&](std::string_view name) { return security_trustee_name(name); };
     std::uint32_t result{};

@@ -87,7 +87,7 @@ std::string metal_assign_varying(const MetalVarying& v,const std::string& destin
 std::vector<unsigned> metal_free_buffers(const MetalShader& shader,const std::array<int,32>* slots,unsigned count){
     std::set<unsigned> occupied;
     if(shader.buffer_views_slot!=UINT32_MAX)occupied.insert(shader.buffer_views_slot);
-    for(const auto& b:shader.bindings)if(b.type==0 || b.type==3 || b.type==4){occupied.insert(b.native_slot);if(b.counter_slot!=UINT32_MAX)occupied.insert(b.counter_slot);}
+    for(const auto& b:shader.bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9)){occupied.insert(b.native_slot);if(b.counter_slot!=UINT32_MAX)occupied.insert(b.counter_slot);}
     if(slots)for(int slot:*slots)if(slot>=0)occupied.insert(static_cast<unsigned>(slot));
     std::vector<unsigned> result;for(unsigned i=0;i<31 && result.size()<count;++i)if(!occupied.contains(i))result.push_back(i);
     if(result.size()!=count)throw std::invalid_argument("Metal 幾何階段 buffer binding 配額不足");return result;

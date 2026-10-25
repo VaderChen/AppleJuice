@@ -338,9 +338,10 @@ std::span<const WindowsServiceDescriptor> working_set_service_descriptors(){
         {"kernel32.dll","GetProcessWorkingSetSize",3},{"kernel32.dll","SetProcessWorkingSetSize",3}
     };return table;
 }
-std::uint32_t WindowsServices::process_memory_copy(GuestMemory& memory,std::uint64_t handle,std::uint64_t address,std::uint64_t buffer,std::uint64_t size,bool writing,std::uint64_t& copied){
+std::uint32_t WindowsServices::process_memory_copy(GuestMemory& memory,std::uint64_t handle,std::uint64_t address,std::uint64_t buffer,std::uint64_t size,bool writing,std::uint64_t& copied,bool native){
     copied=0;std::uint32_t pid{};std::uint64_t birth{};
-    const auto rights=writing?0x28U:0x10U;auto error=process_memory_target(memory,handle,rights,pid,birth);
+    if(native && !size)return 0;
+    const auto rights=writing?(native?0x20U:0x28U):0x10U;auto error=process_memory_target(memory,handle,rights,pid,birth);
     // macOS 的讀寫保留有界 stream、探查與逐封包回覆驗證；共用 target 檢查仍先驗證權限及退出狀態。
     // 其他平台沿用 descriptor 通道，不能把已驗證失敗的回覆改送另一通道。
     const bool debug_transport=(!error && pid!=process_id() && debug_memory_) ||
@@ -357,7 +358,8 @@ std::uint32_t WindowsServices::process_memory_copy(GuestMemory& memory,std::uint
                 for(;mapping && mapping->base.value<end;mapping=memory.next_mapping(GuestAddress{mapping->base.value+mapping->size}))if(mapping->permissions&permission(Access::Execute))return 1655;
             }
             memory.check(GuestAddress{source},static_cast<std::size_t>(size),Access::Read);memory.check(GuestAddress{destination},static_cast<std::size_t>(size),Access::Write);
-            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));memory.read(GuestAddress{source},bytes);memory.write(GuestAddress{destination},bytes);copied=size;return 0;
+            // 沿用 SDK 的重疊／別名與可執行頁失效契約，不再另配一份完整大小的服務層暫存。
+            memory.move(GuestAddress{destination},GuestAddress{source},static_cast<std::size_t>(size));copied=size;return 0;
         }
         if(debug_transport){
             if(size>UINT64_MAX-address)return 299;
@@ -401,13 +403,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_process_memory(GuestState& 
         if(native){last_error_=saved_error;const auto status=error==0?0U:error==5?0xc0000022U:error==6?(object_type(call(0)).empty()?0xc0000008U:0xc0000024U):error==8?0xc0000017U:error==50?0xc00000bbU:error==299?0x8000000dU:error==487?(symbol=="UnmapViewOfSection"?0xc0000019U:0xc0000018U):error==0x10003U?0xc0000003U:error==998?0xc0000005U:error==1655?0xc0000604U:error==24?0xc0000004U:0xc000000dU;call.return_to(state,status);}
         else {if(error)last_error_=error;call.return_to(state,error?0:result);}return std::optional<std::uint32_t>{};
     };
-    const bool reading=symbol=="ReadProcessMemory" || symbol=="ReadVirtualMemory",writing=symbol=="WriteProcessMemory" || symbol=="WriteVirtualMemory";
+    const bool wow64=symbol=="Wow64ReadVirtualMemory64" || symbol=="Wow64WriteVirtualMemory64";
+    const bool reading=symbol=="ReadProcessMemory" || symbol=="ReadVirtualMemory" || symbol=="Wow64ReadVirtualMemory64",writing=symbol=="WriteProcessMemory" || symbol=="WriteVirtualMemory" || symbol=="Wow64WriteVirtualMemory64";
     const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     try{
         if(reading || writing){
-            const auto size=call(3);if(call(4)){memory.check(GuestAddress{call(4)},unit,Access::Write);memory.store(GuestAddress{call(4)},bits,0);}
-            std::uint64_t copied{};const auto error=process_memory_copy(memory,call(0),call(1),call(2),size,writing,copied);
-            if(call(4))memory.store(GuestAddress{call(4)},bits,copied);return finish(1,error);
+            const auto count_bits=static_cast<std::uint8_t>(wow64?64:bits);
+            const auto size=call(3),count_pointer=call(4);if(count_pointer)memory.check(GuestAddress{count_pointer},count_bits/8,Access::Write);
+            std::uint64_t copied{};const auto error=process_memory_copy(memory,call(0),call(1),call(2),size,writing,copied,native);
+            // 搬移可以改寫客體 stack 上的參數；輸出位址沿用呼叫進入時擷取的值。
+            if(count_pointer)memory.store(GuestAddress{count_pointer},count_bits,copied);return finish(1,error);
         }
         const bool query=symbol=="VirtualQuery" || symbol=="VirtualQueryEx" || symbol=="QueryVirtualMemory";
         const bool allocation2=symbol=="VirtualAlloc2" || symbol=="VirtualAlloc2FromApp" || symbol=="AllocateVirtualMemoryEx";
@@ -590,6 +595,7 @@ std::span<const WindowsServiceDescriptor> memory_service_descriptors() {
         {"ntdll.dll","NtAllocateVirtualMemoryEx",7},{"ntdll.dll","ZwAllocateVirtualMemoryEx",7},
         {"ntdll.dll","NtProtectVirtualMemory",5},{"ntdll.dll","NtQueryVirtualMemory",6},{"ntdll.dll","NtUnmapViewOfSection",2},
         {"ntdll.dll","NtReadVirtualMemory",5},{"ntdll.dll","NtWriteVirtualMemory",5},
+        {"ntdll.dll","NtWow64ReadVirtualMemory64",5,0xa},{"ntdll.dll","NtWow64WriteVirtualMemory64",5,0xa},
         {"ntdll.dll","ZwReadVirtualMemory",5},{"ntdll.dll","ZwWriteVirtualMemory",5},
         {"ntdll.dll","ZwAllocateVirtualMemory",6},{"ntdll.dll","ZwFreeVirtualMemory",4},
         {"ntdll.dll","ZwProtectVirtualMemory",5},{"ntdll.dll","ZwQueryVirtualMemory",6},{"ntdll.dll","ZwUnmapViewOfSection",2}

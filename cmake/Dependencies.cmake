@@ -85,6 +85,7 @@ include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dSubtractionConversion.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dDynamicLinkage.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dTextureBuffers.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dShaderIsolation.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/Vkd3dNativeLowPrecision.cmake")
 # 舊版 shader model 的 PSIZE 使用特殊暫存器；SM4+ 已改為可與其他
 # semantic 共用的輸出暫存器，必須保留真正的 component mask。
 # 上游把 SM1 的全分量規則套到 SM4+，會覆蓋同一暫存器其他輸出的反射。

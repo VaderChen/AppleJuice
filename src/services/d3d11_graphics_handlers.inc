@@ -654,7 +654,7 @@
                 break;}
             case 4:words({1});break; // D3D10_X_HARDWARE_OPTIONS：cs_4_x
             // D3D11_OPTIONS：ClearView、常數緩衝部分更新與位移、動態常數緩衝／SRV 緩衝 NO_OVERWRITE；邏輯運算、捨棄與複製旗標不交給驅動。
-            case 5:words({0,0,0,0,1,0,1,1,1,1,0,0,0,0});break;
+            case 5:if(legacy_format_caps)words({0,0,0,0,0,0,0,0,0,0,0,0,0,0});else words({0,0,0,0,1,0,1,1,1,1,0,0,0,0});break;
             case 6:words({0});break; // ARCHITECTURE_INFO
             case 7:words({1});break; // D3D9_OPTIONS：完整非 2 冪紋理
             case 8:words({0,0});break; // 最小精度：一律以 32 位元執行

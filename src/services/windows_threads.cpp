@@ -3295,13 +3295,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
         last_error_ = error;
         result = 0;
     };
+    const NativeOperation* native_wait=nullptr;
     const auto native_deadline = [&](std::uint64_t fallback) {
         if (!runtime_.callbacks.empty()) {
             const auto &callback = runtime_.callbacks.back();
             if (callback.continuation == Continuation::NativeOperation) {
                 const auto &operation = native_operations_.at(callback.value);
-                if (operation.symbol == "NtWaitForSingleObject" || operation.symbol == "NtSignalAndWaitForSingleObject")
+                if (operation.symbol == "NtWaitForSingleObject" || operation.symbol == "NtSignalAndWaitForSingleObject" || operation.symbol.starts_with("NtWaitForMultipleObjects")) {
+                    native_wait=&operation;
                     return operation.information;
+                }
             }
         }
         return fallback;
@@ -4078,7 +4081,38 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             }
         } else {
             const auto found = runtime_.critical_sections.find(address);
-            if (found == runtime_.critical_sections.end() && symbol == "DeleteCriticalSection") {
+            auto adopted = found;
+            if (found == runtime_.critical_sections.end()) {
+                // Windows 的 critical section 狀態全在結構本身；UE4 TArray 等容器會以 memmove 搬移已初始化的物件，
+                // 搬移後仍可直接使用。依客體記憶體辨識有效狀態後在新位址接手：未持有（LockCount=-1、遞迴 0、擁有者 0），
+                // 或由現存執行緒持有且 LockCount＝遞迴次數−1。DebugInfo 指回原位址的登錄時一併轉移，避免重複釋放。
+                const std::uint8_t width = x86_ ? 32 : 64;
+                const auto lock_count = static_cast<std::int32_t>(memory.load(GuestAddress{address + (x86_ ? 4 : 8)}, 32));
+                const auto recursion = static_cast<std::uint32_t>(memory.load(GuestAddress{address + (x86_ ? 8 : 12)}, 32));
+                const auto owner_tid = memory.load(GuestAddress{address + (x86_ ? 12 : 16)}, width);
+                const auto debug = memory.load(GuestAddress{address}, width);
+                std::uint64_t owner = 0;bool valid = false;
+                if (lock_count == -1 && !recursion && !owner_tid) valid = true;
+                else if (recursion && lock_count == static_cast<std::int32_t>(recursion - 1U))
+                    for (const auto& [id, thread] : threads_.items)
+                        if (thread.status != ThreadStatus::Exited && thread_identifier(id) == owner_tid) {owner = id;valid = true;break;}
+                if (valid) {
+                    CriticalSection section;section.owner = owner;section.recursion = recursion;
+                    section.spin = static_cast<std::uint32_t>(memory.load(GuestAddress{address + (x86_ ? 20 : 32)}, width));
+                    if (debug && debug != (x86_ ? UINT32_MAX : UINT64_MAX)) {
+                        try {
+                            const auto original = memory.load(GuestAddress{debug + (x86_ ? 4U : 8U)}, width);
+                            const auto previous = runtime_.critical_sections.find(original);
+                            if (original != address && previous != runtime_.critical_sections.end() && previous->second.debug == debug && !previous->second.owner) {
+                                section.debug = debug;memory.store(GuestAddress{debug + (x86_ ? 4U : 8U)}, width, address);
+                                runtime_.critical_sections.erase(previous);
+                            }
+                        } catch (const MemoryFault&) {}
+                    }
+                    adopted = runtime_.critical_sections.emplace(address, section).first;
+                }
+            }
+            if (adopted == runtime_.critical_sections.end() && symbol == "DeleteCriticalSection") {
                 // RtlDeleteCriticalSection 對全零（未初始化或已刪除）的物件沒有 DebugInfo／LockSemaphore 可釋放，
                 // 只把結構清零；只有含有效狀態卻未登錄的物件才視為損毀。
                 const std::uint8_t width = x86_ ? 32 : 64;
@@ -4090,7 +4124,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 arg.return_to(state, 0);
                 return std::nullopt;
             }
-            if (found == runtime_.critical_sections.end()) {
+            if (adopted == runtime_.critical_sections.end()) {
                 // 附上物件位址與呼叫端返回位址，供對照模組映像定位。
                 std::uint64_t caller = 0;
                 try {caller = memory.load(GuestAddress{state.reg(Gpr::Rsp)}, x86_ ? 32 : 64);} catch (const MemoryFault &) {}
@@ -4099,7 +4133,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                               static_cast<unsigned long long>(address), static_cast<unsigned long long>(caller));
                 throw HostCallFault(std::string("未初始化的 critical section") + detail);
             }
-            auto &section = found->second;
+            auto &section = adopted->second;
             if (symbol == "SetCriticalSectionSpinCount") {
                 result = section.spin;
                 section.spin = u32(1);
@@ -4123,7 +4157,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 memory.store(GuestAddress{address+(x86_ ? 8 : 12)},32,0);
                 memory.store(GuestAddress{address+(x86_ ? 12 : 16)},x86_ ? 32 : 64,0);
                 memory.store(GuestAddress{address+(x86_ ? 16 : 24)},x86_ ? 32 : 64,0);
-                runtime_.critical_sections.erase(found);
+                runtime_.critical_sections.erase(adopted);
             } else {
                 if (symbol == "LeaveCriticalSection") {
                     if (section.owner != threads_.current || !section.recursion)
@@ -4379,8 +4413,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 if ((!runtime_.wait_objects.contains(wait.handles[i]) && !thread_id(wait.handles[i]) &&
                      !process_signaled(wait.handles[i]).has_value() &&
                      !file_io_signaled(wait.handles[i]).has_value()) ||
-                    std::find(wait.handles.begin(), wait.handles.begin() + static_cast<std::ptrdiff_t>(i),
-                              wait.handles[i]) != wait.handles.begin() + static_cast<std::ptrdiff_t>(i))
+                    ((!native_wait || wait.all) && std::find(wait.handles.begin(), wait.handles.begin() + static_cast<std::ptrdiff_t>(i),
+                              wait.handles[i]) != wait.handles.begin() + static_cast<std::ptrdiff_t>(i)))
                     valid = false;
             if (!valid) {
                 last_error_ = 6;

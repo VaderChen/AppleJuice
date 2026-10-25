@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 
 namespace x64arm {
@@ -15,8 +16,13 @@ constexpr std::array<std::u16string_view,23> stock_classes{u"button",u"static",u
 constexpr std::uint64_t stock_base=windows_address_layout::x64.callbacks+0x100;
 constexpr std::uint64_t stock_base_x86=windows_address_layout::x86.callbacks+0x100;
 void trace_gui_input(std::string_view filter,const char* stage,const GuiMessage& message,std::uint64_t thread,std::uint64_t ticks) {
-    if(filter.find("GuiInput")==filter.npos || message.message<0x100 || message.message>0x107)return;
-    std::fprintf(stderr,"[gui-input] stage=%s ticks=%llu thread=%llu hwnd=%llx message=%x key=%llx flags=%llx\n",stage,
+    // X64ARM_TRACE_GUI_INPUT 只開按鍵紀錄，不經 X64ARM_TRACE_SERVICES（後者會關閉常駐快速路徑），
+    // 供錄製人工操作後轉成自動化腳本；unix_ms 用來與量測工具的時間軸對齊。
+    static const bool standalone=std::getenv("X64ARM_TRACE_GUI_INPUT")!=nullptr;
+    if((!standalone && filter.find("GuiInput")==filter.npos) || message.message<0x100 || message.message>0x107)return;
+    if(standalone && std::string_view(stage)!="enqueue")return;
+    const auto unix_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::fprintf(stderr,"[gui-input] stage=%s unix_ms=%lld ticks=%llu thread=%llu hwnd=%llx message=%x key=%llx flags=%llx\n",stage,static_cast<long long>(unix_ms),
         static_cast<unsigned long long>(ticks),static_cast<unsigned long long>(thread),static_cast<unsigned long long>(message.window),
         message.message,static_cast<unsigned long long>(message.wparam),static_cast<unsigned long long>(message.lparam));
 }

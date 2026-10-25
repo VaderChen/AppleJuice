@@ -105,34 +105,40 @@ float single(const Number& n){
 #endif
     if(!end || *end || !std::isfinite(result))throw std::range_error("單精度浮點溢位");return result;
 }
-}
-std::uint32_t number_convert(const Value& source,std::string_view decimal,std::uint16_t target,Value& output){
-    try{
-        auto n=number(source,decimal);output={};put(output,0,2,target);unsigned bits=0;bool unsign=false;unsigned scale=0;
+std::uint32_t encode_number(const Number& n,unsigned target,Value& output,
+                            bool minus_zero=false,bool boolean_unsigned=false,unsigned decimal_scale=0){
+        output={};put(output,0,2,target);unsigned bits=0;bool unsign=false;unsigned scale=0;
         switch(target){case 2:bits=16;break;case 3:case 22:bits=32;break;case 16:bits=8;break;case 17:bits=8;unsign=true;break;case 18:bits=16;unsign=true;break;case 19:case 23:bits=32;unsign=true;break;case 20:bits=64;break;case 21:bits=64;unsign=true;break;case 6:bits=64;scale=4;break;
         case 11:put(output,8,2,BN_is_zero(n.numerator.get())?0:0xffff);return 0;
         case 4:case 5:case 7:{
-            const auto from=get(source,0,2);const bool minus_zero=BN_is_zero(n.numerator.get()) && ((from==4 && (get(source,8,4)>>31)) || ((from==5 || from==7) && (get(source,8,8)>>63)) || (from==8 && !decimal.empty() && decimal.front()=='-'));
             if(target==4){const auto f=single(n);put(output,8,4,minus_zero?UINT64_C(1)<<31:std::bit_cast<std::uint32_t>(f));}
             else {const auto d=floating(n);if(target==7 && (d<=-657435.0 || d>=2958466.0))return overflow;put(output,8,8,minus_zero?UINT64_C(1)<<63:std::bit_cast<std::uint64_t>(d));}return 0;
         }
         case 14:{
             Big coefficient(nullptr,BN_free);unsigned s=28;for(;;){coefficient=rounded(n,s);if(BN_num_bits(coefficient.get())<=96)break;if(!s)return overflow;--s;}
-            while(s && !BN_is_zero(coefficient.get()) && BN_mod_word(coefficient.get(),10)==0){BN_div_word(coefficient.get(),10);--s;}if(BN_is_zero(coefficient.get()))s=0;
+            while(s>decimal_scale && !BN_is_zero(coefficient.get()) && BN_mod_word(coefficient.get(),10)==0){BN_div_word(coefficient.get(),10);--s;}if(BN_is_zero(coefficient.get()))s=std::min(s,decimal_scale);
             std::array<unsigned char,12> bytes{};if(BN_bn2binpad(coefficient.get(),bytes.data(),12)!=12)return overflow;
             output[2]=static_cast<std::uint8_t>(s);output[3]=n.negative && !BN_is_zero(coefficient.get())?128:0;for(unsigned i=0;i<4;++i)output[4+i]=bytes[3-i];for(unsigned i=0;i<8;++i)output[8+i]=bytes[11-i];return 0;
         }
         default:return mismatch;
         }
-        if(unsign && get(source,0,2)==11 && n.negative){put(output,8,bits/8,bits==64?UINT64_MAX:(UINT64_C(1)<<bits)-1);return 0;}
+        if(unsign && boolean_unsigned && n.negative){put(output,8,bits/8,bits==64?UINT64_MAX:(UINT64_C(1)<<bits)-1);return 0;}
         const auto coefficient=rounded(n,scale);auto bound=integer(1);checked(BN_lshift(bound.get(),bound.get(),static_cast<int>(unsign?bits:bits-1)));
         if(unsign || !n.negative)checked(BN_sub_word(bound.get(),1));if(BN_cmp(coefficient.get(),bound.get())>0 || (unsign && n.negative && !BN_is_zero(coefficient.get())))return overflow;
         const auto magnitude=u64(coefficient.get());put(output,8,bits/8,n.negative?UINT64_C(0)-magnitude:magnitude);return 0;
+}
+}
+std::uint32_t number_convert(const Value& source,std::string_view decimal,std::uint16_t target,Value& output){
+    try{
+        const auto n=number(source,decimal);const auto from=get(source,0,2);
+        const bool minus_zero=BN_is_zero(n.numerator.get()) && ((from==4 && (get(source,8,4)>>31)) || ((from==5 || from==7) && (get(source,8,8)>>63)) || (from==8 && !decimal.empty() && decimal.front()=='-'));
+        return encode_number(n,target,output,minus_zero,from==11);
     }catch(const std::invalid_argument&){return mismatch;}catch(const std::range_error&){return overflow;}catch(const std::bad_alloc&){return nomemory;}
 }
 std::uint32_t number_compare(const Value& a,const Value& b,std::string_view left_text,std::string_view right_text){
     try{const auto left=number(a,left_text),right=number(b,right_text);if(left.negative!=right.negative)return left.negative?0:2;auto x=big(),y=big();auto ctx=context();checked(BN_mul(x.get(),left.numerator.get(),right.denominator.get(),ctx.get()));checked(BN_mul(y.get(),right.numerator.get(),left.denominator.get(),ctx.get()));int c=BN_cmp(x.get(),y.get());if(left.negative)c=-c;return c<0?0:c>0?2:1;}catch(const std::invalid_argument&){return mismatch;}catch(const std::range_error&){return overflow;}catch(const std::bad_alloc&){return nomemory;}
 }
+#include "automation_operators.inc"
 std::string number_string(const Value& v){
     const auto t=get(v,0,2);if(t==4 || t==5){const auto d=t==4?static_cast<double>(std::bit_cast<float>(static_cast<std::uint32_t>(get(v,8,4)))):std::bit_cast<double>(get(v,8,8));if(!std::isfinite(d))throw std::range_error("非有限浮點值");std::array<char,64> buffer{};
 #if defined(__APPLE__)

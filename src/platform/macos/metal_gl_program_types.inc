@@ -8,7 +8,8 @@ struct GlProgram {
     std::map<std::string,int> locations;
     std::vector<GlUniformLocation> uniforms;
     std::vector<GlProgramStage> stages;
-    std::map<std::string,id<MTLRenderPipelineState>> pipelines;
+    // 共用 context 快取使用全程序唯一的 link 世代，刪除／重連後不可命中舊管線。
+    std::uint64_t pipeline_generation{};
     std::string log;bool linked{},deleted{};
 };
 struct GlBuffer:OpenGlBuffer {std::shared_ptr<GraphicsResource> resource;};
@@ -17,7 +18,6 @@ struct GlVertexArray {std::array<GlVertexAttribute,16> attributes;std::shared_pt
 struct GlAttachment {unsigned name{},level{};Texture texture;};
 struct GlFramebuffer {std::map<unsigned,GlAttachment> attachments;std::vector<unsigned> draw_buffers{0x8ce0};unsigned read_buffer{0x8ce0};};
 struct GlProgrammable {
-    std::map<std::array<unsigned,5>,id<MTLSamplerState>> samplers;
     // shader、program 與 buffer 屬 wglShareLists 的共用物件；framebuffer 與 VAO 是容器物件，各 context 獨立。
     GlSharedNames<std::shared_ptr<GlShader>> shaders;
     GlSharedNames<std::shared_ptr<GlProgram>> programs;

@@ -27,23 +27,47 @@ std::uint32_t WindowsServices::local_primary_thread_control(std::uint32_t operat
         return 0;
     }
     if(operation==2 || operation==5) {
-        if(thread.suspended>=127)return 87;value=thread.suspended++;
+        if(thread.suspended>=127)return 156;value=thread.suspended++;
     } else if(operation==3) {value=thread.suspended;if(thread.suspended)--thread.suspended;}
     else return 87;
     threads_.remaining=0;threads_.yield=true;notify_concurrency_changed();return 0;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_thread_control(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
-    const WindowsCall call(state,memory,service);const auto name=service.symbol;
+    const WindowsCall call(state,memory,service);const bool native=service.family=="ntdll.dll";
+    const auto name=native?service.symbol.substr(2):service.symbol;const auto saved_error=last_error_;
     const bool getter=name=="GetThreadContext" || name=="Wow64GetThreadContext";
     const bool setter=name=="SetThreadContext" || name=="Wow64SetThreadContext";
     const bool wow64=name.starts_with("Wow64");const bool suspend=name=="SuspendThread" || name=="Wow64SuspendThread";
     const auto mode=wow64 || x86_?ExecutionMode::X86:ExecutionMode::X64;
-    const auto fail=[&](std::uint32_t error){last_error_=error;call.return_to(state,getter || setter?0:UINT32_MAX);return std::optional<std::uint32_t>{};};
-    const auto id=thread_id(call(0));std::uint32_t pid=0,remote_tid=1,rights=id?thread_access(call(0)):0;std::uint64_t birth=0;
-    if(!id)if(const auto error=process_thread_target(call(0),pid,rights,&birth,&remote_tid))return fail(error);
-    if(!(rights&(getter?8U:setter?16U:2U)))return fail(5);
-    if(id && (getter || setter || wow64) && mode!=(x86_?ExecutionMode::X86:ExecutionMode::X64))return fail(87);
+    const auto fail=[&](std::uint32_t error){
+        if(native){
+            const auto status=error==5?0xc0000022U:error==6?(object_type(call(0)).empty()?0xc0000008U:0xc0000024U):
+                error==8?0xc0000017U:error==87?0xc000004bU:error==156?0xc000004aU:error==998?0xc0000005U:
+                error==128?0x80000002U:error==121?0xc00000b5U:error==50?0xc00000bbU:0xc0000001U;
+            threads_.items.at(threads_.current).last_native_status=status;last_error_=saved_error;call.return_to(state,status);
+        }else{last_error_=error;call.return_to(state,getter || setter?0:UINT32_MAX);}
+        return std::optional<std::uint32_t>{};
+    };
+    const auto finish=[&](std::uint32_t value){
+        if(native){
+            if(call(1))memory.store(GuestAddress{call(1)},32,value);
+            threads_.items.at(threads_.current).last_native_status=0;last_error_=saved_error;
+        }
+        call.return_to(state,native?0:value);return std::optional<std::uint32_t>{};
+    };
     try {
+        // 輸出只有 ULONG，且先探測再改計數；自我暫停在寫回及 ABI 返回後才排程。
+        if(native && call(1)){
+            if(call(1)%4)return fail(128);
+            memory.check(GuestAddress{call(1)},4,Access::Write);
+        }
+        const auto id=thread_id(call(0));std::uint32_t pid=0,remote_tid=1,rights=id?thread_access(call(0)):0;std::uint64_t birth=0;
+        if(!id)if(const auto error=process_thread_target(call(0),pid,rights,&birth,&remote_tid)){
+            if(native && !suspend && error==87 && (rights&0x1002U) && process_signaled(call(0))==true)return finish(0);
+            return fail(error);
+        }
+        if(!(rights&(getter?8U:setter?16U:native && !suspend?0x1002U:2U)))return fail(5);
+        if(id && (getter || setter || wow64) && mode!=(x86_?ExecutionMode::X86:ExecutionMode::X64))return fail(87);
         std::uint32_t flags=0,value=0;std::vector<std::uint8_t> context;
         if(getter || setter) {
             if(!call(1))return fail(87);
@@ -55,7 +79,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread_control(GuestState& 
             if(setter){context.resize(thread_context::size(mode));memory.read(GuestAddress{call(1)},context);}
         }
         if(id) {
-            auto& thread=threads_.items.at(id);if(thread.status==ThreadStatus::Exited)return fail(87);
+            auto& thread=threads_.items.at(id);
+            if(thread.status==ThreadStatus::Exited){if(native && !suspend)return finish(0);return fail(87);}
             if(getter) {
                 if(id!=threads_.current && !thread.suspended)return fail(87);
                 context=thread_context::capture(id==threads_.current?state:thread.context,mode,flags);
@@ -64,8 +89,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread_control(GuestState& 
                 if((flags&1U) && thread.status==ThreadStatus::Waiting)return fail(170);
                 try{thread.context=thread_context::restore(thread.context,mode,context);}catch(const HostCallFault&){return fail(50);}value=1;
             } else if(suspend) {
-                if(thread.suspended>=127)return fail(87);value=thread.suspended++;
-                if(id==threads_.current){call.return_to(state,value);schedule(state,memory);return std::nullopt;}
+                if(thread.suspended>=127)return fail(156);value=thread.suspended++;
+                if(id==threads_.current){(void)finish(value);schedule(state,memory);return std::nullopt;}
             } else {value=thread.suspended;if(thread.suspended)--thread.suspended;}
             if(!getter)notify_concurrency_changed();
         } else {
@@ -75,7 +100,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread_control(GuestState& 
             else if(const auto error=transfer_thread_control(memory,pid,operation,mode,flags,value,context,birth,remote_tid))return fail(error);
         }
         if(getter){thread_context::write_selected(memory,call(1),mode,context);value=1;}
-        call.return_to(state,value);return std::nullopt;
+        return finish(value);
     } catch(const MemoryFault&){return fail(998);}
       catch(const std::bad_alloc&){return fail(8);}
       catch(const std::invalid_argument&){return fail(87);}

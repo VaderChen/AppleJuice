@@ -1,5 +1,7 @@
 #include "x64arm/startup_profile.hpp"
+#include "x64arm/resource_usage.hpp"
 #include "x64arm/windows_services.hpp"
+#include "guest_heap_layout.hpp"
 #include "resident_service_policy.hpp"
 #include "crt_library.hpp"
 #include "builtin_export_aliases.hpp"
@@ -1602,7 +1604,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
         entry_runtime_profile::enabled()?name(state.rip):std::string_view{});
     static const bool trace_slow_calls=std::getenv("X64ARM_TRACE_SLOW_CALLS")!=nullptr;
     struct CountScope {
-        WindowsServices& self;std::uint64_t rip,thread;bool trace;std::chrono::steady_clock::time_point start;
+        WindowsServices& self;GuestMemory& memory;std::uint64_t rip,thread;bool trace;std::chrono::steady_clock::time_point start;
         const char* phase_name{"boundary"};std::chrono::steady_clock::time_point phase_start{start};
         void phase(const char* next){
             if(!trace)return;
@@ -1614,7 +1616,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
                     static_cast<long long>(elapsed),static_cast<unsigned long long>(startup_profile::unix_us()),static_cast<int>(symbol.size()),symbol.data());}
             phase_name=next;phase_start=now;
         }
-        ~CountScope(){if(!self.service_counts_enabled_ && !trace)return;
+        ~CountScope(){
+            // 只回應 3 秒報告器的要求；不讀取客體自由串列、不停止 worker、不累積逐筆配置。
+            if(take_guest_memory_sample_request()){
+                const auto u=memory.usage();GuestMemoryUsage g;
+                g.committed=u.committed;g.private_commit=u.private_commit;g.peak_committed=u.peak_committed;
+                g.peak_private_commit=u.peak_private_commit;g.virtual_size=u.virtual_size;
+                g.service_heap_blocks=self.allocations_.size();
+                for(const auto& [address,size]:self.allocations_){(void)address;g.service_heap_bytes+=size;g.service_heap_largest=std::max(g.service_heap_largest,static_cast<std::uint64_t>(size));if(size>=1024U*1024U){g.large_heap_bytes+=size;++g.large_heap_blocks;}}
+                g.quick_heap_blocks=self.heap_quick_blocks_.size();
+                for(const auto& [address,block]:self.heap_quick_blocks_){(void)address;g.quick_heap_bytes+=block.size;}
+                if(self.guest_heap_chunked_)for(const auto bits:self.guest_heap_chunk_bits_)g.small_heap_mapped+=static_cast<std::uint64_t>(std::popcount(bits))*detail::guest_heap_layout::guest_heap_chunk;
+                else if(self.guest_heap_base_)g.small_heap_mapped=self.guest_heap_next_-self.guest_heap_base_;
+                record_guest_memory_usage(g);
+            }
+            if(!self.service_counts_enabled_ && !trace)return;
             phase("finished");
             const auto now=std::chrono::steady_clock::now();
             const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(now-start).count();
@@ -1625,7 +1641,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
             if(!self.service_counts_enabled_)return;auto& c=self.service_counts_[rip];++c.calls;
             c.ns+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now-start).count());
             if(!self.service_counts_directory_.empty() && (++self.service_count_events_&1023)==0 && now-self.service_count_dumped_>std::chrono::seconds(5))self.dump_service_counts();}
-    } count_scope{*this,state.rip.value,threads_.current,trace_slow_calls,(service_counts_enabled_ || trace_slow_calls)?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
+    } count_scope{*this,memory,state.rip.value,threads_.current,trace_slow_calls,(service_counts_enabled_ || trace_slow_calls)?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
 #ifdef X64ARM_HOST_SERVICES_MANAGED_FP
     // 非數學服務仍沿用宿主環境；同一入口也支援動態資格撤銷後的完整流程。
     if(environment && runtime_compute_boundary(state.rip)!=3

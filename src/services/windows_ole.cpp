@@ -27,6 +27,9 @@ std::span<const WindowsServiceDescriptor> ole_service_descriptors(){
         {"oleaut32.dll","VariantTimeToDosDateTime",3,1},{"oleaut32.dll","DosDateTimeToVariantTime",3},
         {"oleaut32.dll","VariantInit",1},{"oleaut32.dll","VariantClear",1},{"oleaut32.dll","VariantCopy",2},
         {"oleaut32.dll","VariantCopyInd",2},{"oleaut32.dll","VariantChangeType",4},{"oleaut32.dll","VariantChangeTypeEx",5},{"oleaut32.dll","VarCmp",4},
+        {"oleaut32.dll","VarAdd",3},{"oleaut32.dll","VarSub",3},{"oleaut32.dll","VarMul",3},{"oleaut32.dll","VarDiv",3},
+        {"oleaut32.dll","VarIdiv",3},{"oleaut32.dll","VarMod",3},{"oleaut32.dll","VarNeg",2},{"oleaut32.dll","VarNot",2},
+        {"oleaut32.dll","VarAnd",3},{"oleaut32.dll","VarOr",3},{"oleaut32.dll","VarXor",3},
         {"ole32.dll","CoInitializeSecurity",9},{"ole32.dll","OleInitialize",1},{"ole32.dll","OleUninitialize",0},{"ole32.dll","ReleaseStgMedium",1},
         {"ole32.dll","OleRun",1},{"ole32.dll","OleIsRunning",1},{"ole32.dll","OleLockRunning",3},{"ole32.dll","OleSetContainedObject",2},
         {"ole32.dll","OleSetClipboard",1},{"ole32.dll","OleGetClipboard",1},{"ole32.dll","OleFlushClipboard",0},{"ole32.dll","OleIsCurrentClipboard",1},
@@ -119,7 +122,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole(GuestState& state,Guest
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     const std::uint8_t bits=x86_?32:64;const unsigned width=bits/8U,variant_size=x86_?16:24;
     const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
-    if(name=="VariantCopyInd" || name=="VariantChangeType" || name=="VariantChangeTypeEx" || name=="VarCmp")return invoke_automation(state,memory,service);
+    if(name=="VariantCopyInd" || name=="VariantChangeType" || name=="VariantChangeTypeEx" || name=="VarCmp" ||
+       name=="VarAdd" || name=="VarSub" || name=="VarMul" || name=="VarDiv" || name=="VarIdiv" || name=="VarMod" ||
+       name=="VarNeg" || name=="VarNot" || name=="VarAnd" || name=="VarOr" || name=="VarXor")return invoke_automation(state,memory,service);
     if(name=="QISearch"){
         if(!arg(3))return done(0x80004003U);
         try {

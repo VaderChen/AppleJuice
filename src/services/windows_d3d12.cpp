@@ -38,7 +38,13 @@ struct D3D12State {
         enum class Type {Empty,Constant,Shader,Unordered,Sampler,Target,Depth} type{Type::Empty};
         GraphicsView view;std::uint64_t resource{},address{};std::uint32_t size{};std::shared_ptr<GraphicsSampler> sampler;
     };
-    struct Heap {std::uint32_t type{},count{};bool visible{};std::uint64_t cpu{},gpu{};std::vector<Descriptor> descriptors;};
+    // shader-visible CBV_SRV_UAV 堆積另有 GPU 鏡像供描述元表（bindless）使用：mirrors[0] 每項 8 位元組資源 ID，
+    // mirrors[1] 每項 16 位元組緩衝位址＋長度；dirty 標記經 CPU handle 寫入過的項目，下次綁定前更新。
+    struct Heap {
+        std::uint32_t type{},count{};bool visible{};std::uint64_t cpu{},gpu{};std::vector<Descriptor> descriptors;
+        std::array<std::shared_ptr<GraphicsResource>,2> mirrors;std::array<std::vector<std::uint8_t>,2> shadow;
+        std::vector<std::shared_ptr<void>> keep;std::vector<std::uint8_t> dirty;bool any_dirty{};
+    };
     struct Range {std::uint32_t type{},count{},base{},space{},offset{};};
     struct Parameter {std::uint32_t type{},reg{},space{},values{};std::vector<Range> ranges;};
     struct RootSignature {std::vector<Parameter> parameters;std::vector<std::pair<std::uint32_t,std::shared_ptr<GraphicsSampler>>> samplers;};
@@ -366,7 +372,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
     // 描述元控制代碼：CPU／GPU 位址皆為堆積基底加索引×32。
     const auto descriptor=[&](std::uint64_t handle,bool gpu)->D3D12State::Descriptor*{
         for(auto& [object,heap]:bridge.heaps){(void)object;const auto base=gpu?heap.gpu:heap.cpu;
-            if(base && handle>=base && handle<base+heap.count*descriptor_size && !((handle-base)%descriptor_size))return &heap.descriptors[(handle-base)/descriptor_size];}
+            if(base && handle>=base && handle<base+heap.count*descriptor_size && !((handle-base)%descriptor_size)){
+                const auto index=(handle-base)/descriptor_size;
+                // 經 CPU handle 取得的項目可能被寫入：標記鏡像待更新。
+                if(!gpu && !heap.dirty.empty()){heap.dirty[index]=1;heap.any_dirty=true;}
+                return &heap.descriptors[index];
+            }}
         return nullptr;
     };
     const auto resource_at=[&](std::uint64_t address)->std::pair<std::uint64_t,std::uint64_t>{
@@ -521,6 +532,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             heap.cpu=bridge.next_descriptor;bridge.next_descriptor+=(std::uint64_t{heap.count}*descriptor_size+0xffffU)&~UINT64_C(0xffff);
             if(heap.visible){heap.gpu=bridge.next_descriptor;bridge.next_descriptor+=(std::uint64_t{heap.count}*descriptor_size+0xffffU)&~UINT64_C(0xffff);}
             heap.descriptors.resize(heap.count);
+            if(heap.visible && heap.type==0){heap.dirty.assign(heap.count,1);heap.any_dirty=true;}
             const auto object=create(Kind::DescriptorHeap,self);bridge.heaps[object]=std::move(heap);return finish(give(object,arg(2),arg(3)));
         }
         if(member=="CreateRootSignature"){
@@ -937,8 +949,55 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         if(resource.cpu)data=bytes(resource.cpu+offset,length);else{auto all=native.graphics_read(GraphicsView{resource.gpu});data.assign(all.begin()+static_cast<std::ptrdiff_t>(offset),all.begin()+static_cast<std::ptrdiff_t>(offset+length));}
                         GraphicsResourceDesc d;d.dimension=1;d.width=(length+15U)&~15U;d.bind=4;auto buffer=native.graphics_resource(d);data.resize(d.width);native.graphics_write(GraphicsView{buffer},data,d.width,d.width);return buffer;
                     };
-                    // 根參數 → 共用後端的 b／t／u／s 暫存器槽（register space 0）。
+                    // 描述元表鏡像：把待更新的描述元換成後端的資源 ID／緩衝位址，寫入 GPU 鏡像。
+                    const auto refresh_mirror=[&](D3D12State::Heap& heap){
+                        if(heap.dirty.empty() || (!heap.any_dirty && heap.mirrors[0]))return;
+                        for(unsigned m=0;m<2;++m)if(!heap.mirrors[m]){
+                            GraphicsResourceDesc d;d.dimension=1;d.width=heap.count*(m?16U:8U);d.bind=0x8c;heap.mirrors[m]=native.graphics_resource(d);heap.shadow[m].assign(d.width,0);}
+                        if(heap.keep.size()<heap.count)heap.keep.resize(heap.count);
+                        const auto put=[](std::vector<std::uint8_t>& out,std::size_t at,std::uint64_t value){for(unsigned b=0;b<8;++b)out[at+b]=static_cast<std::uint8_t>(value>>(8*b));};
+                        for(std::uint32_t i=0;i<heap.count;++i){
+                            if(!heap.dirty[i])continue;heap.dirty[i]=0;
+                            const auto& entry=heap.descriptors[i];const bool uav=entry.type==D3D12State::Descriptor::Type::Unordered;GraphicsView view;
+                            if((entry.type==D3D12State::Descriptor::Type::Shader || uav) && entry.resource){
+                                const auto& resource=bridge.resources.at(entry.resource);view=entry.view;view.resource=resource.dimension==1?gpu_resource(entry.resource):resource.gpu;}
+                            std::array<std::uint64_t,2> texture{},buffer{};std::shared_ptr<void> keep,unused;
+                            if(!native.graphics_descriptor(view,uav?7U:6U,texture,keep))native.graphics_descriptor(GraphicsView{},6,texture,keep);
+                            if(!native.graphics_descriptor(view,uav?9U:8U,buffer,unused))buffer={};
+                            put(heap.shadow[0],std::size_t{i}*8,texture[0]);put(heap.shadow[1],std::size_t{i}*16,buffer[0]);put(heap.shadow[1],std::size_t{i}*16+8,buffer[1]&UINT32_MAX);
+                            heap.keep[i]=std::move(keep);
+                        }
+                        for(unsigned m=0;m<2;++m){const auto width=static_cast<std::uint32_t>(heap.shadow[m].size());native.graphics_write(GraphicsView{heap.mirrors[m]},heap.shadow[m],width,width);}
+                        heap.any_dirty=false;
+                    };
+                    // 描述元表：依著色器的 (類型, space, register) 找到根簽章中涵蓋它的描述元表範圍，換算成鏡像位置。
+                    const auto bind_tables=[&](GraphicsStage& stage,Roots& roots,const D3D12State::RootSignature& signature){
+                        stage.tables.clear();if(!stage.shader)return;
+                        for(const auto& b:stage.shader->bindings){
+                            if(b.type<6 || b.type>9)continue;
+                            const std::uint32_t range_type=b.type==6 || b.type==8?VKD3D_SHADER_DESCRIPTOR_TYPE_SRV:VKD3D_SHADER_DESCRIPTOR_TYPE_UAV;bool bound=false;
+                            for(std::uint32_t index=0;index<signature.parameters.size() && !bound;++index){
+                                const auto& parameter=signature.parameters[index];
+                                if(parameter.type!=VKD3D_SHADER_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)continue;
+                                const auto base=roots.tables[index];if(!base)continue;
+                                for(const auto& range:parameter.ranges){
+                                    if(range.type!=range_type || range.space!=b.space || b.slot<range.base || (range.count!=~0U && b.slot-range.base>=range.count))continue;
+                                    for(auto& [object,heap]:bridge.heaps){(void)object;
+                                        if(!heap.gpu || heap.dirty.empty() || base<heap.gpu || base>=heap.gpu+std::uint64_t{heap.count}*descriptor_size)continue;
+                                        const auto first=(base-heap.gpu)/descriptor_size+range.offset+(b.slot-range.base);
+                                        if(first>=heap.count)throw std::invalid_argument("描述元表超出堆積範圍");
+                                        refresh_mirror(heap);const bool buffer_table=b.type>=8;
+                                        stage.tables.push_back({b.type,b.space,b.slot,heap.mirrors[buffer_table?1:0],first*(buffer_table?16U:8U)});bound=true;break;
+                                    }
+                                    if(bound)break;
+                                }
+                            }
+                            if(!bound)throw std::invalid_argument("著色器描述元表在根簽章中沒有對應範圍");
+                        }
+                    };
+                    // 根參數 → 共用後端的 b／t／u／s 暫存器槽（register space 0）；非零 space 與大陣列走描述元表。
                     const auto bind=[&](GraphicsStage& stage,Roots& roots,const D3D12State::RootSignature& signature){
+                        bind_tables(stage,roots,signature);
                         for(std::uint32_t index=0;index<signature.parameters.size();++index){
                             const auto& parameter=signature.parameters[index];
                             if(parameter.space)throw std::invalid_argument("根參數使用非零 register space");
@@ -956,8 +1015,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             }else{
                                 const auto base=roots.tables[index];if(!base)continue;
                                 for(const auto& range:parameter.ranges){
-                                    if(range.space)throw std::invalid_argument("描述元表使用非零 register space");
-                                    const auto count=range.count==~0U?1U:range.count;
+                                    if(range.space)continue;
+                                    // 共用後端最多 128 個 SRV 槽；更大的陣列只能經描述元表存取。
+                                    const auto count=range.count==~0U?1U:std::min<std::uint32_t>(range.count,128);
                                     for(std::uint32_t i=0;i<count;++i){
                                         const auto entry=descriptor(base+(std::uint64_t{range.offset}+i)*descriptor_size,true);if(!entry)continue;const auto reg=range.base+i;
                                         if(range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER){if(reg<stage.samplers.size())stage.samplers[reg]=entry->sampler;continue;}

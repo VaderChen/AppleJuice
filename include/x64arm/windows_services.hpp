@@ -538,7 +538,7 @@ private:
         const std::array<std::uint64_t,5>&,std::uint32_t);
     bool remote_family_waiting()const;
     std::uint32_t local_memory_operation(GuestMemory&,std::uint32_t,std::array<std::uint64_t,5>&,int,std::uint64_t=0,std::uint64_t=0,const VirtualAddressRequirements* =nullptr);
-    std::uint32_t process_memory_copy(GuestMemory&,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t,bool,std::uint64_t&);
+    std::uint32_t process_memory_copy(GuestMemory&,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t,bool,std::uint64_t&,bool native=false);
     std::optional<std::uint32_t> invoke_process_memory(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_nt_process(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_nt_native(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);

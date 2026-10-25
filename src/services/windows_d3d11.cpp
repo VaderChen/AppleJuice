@@ -704,6 +704,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         const auto stage_index=[](std::string_view name)->unsigned {if(name.starts_with("VS"))return 0;if(name.starts_with("PS"))return 1;if(name.starts_with("GS"))return 2;if(name.starts_with("HS"))return 3;if(name.starts_with("DS"))return 4;return 5;};
         static const std::array<std::string,6> stage_names{"VS","PS","GS","HS","DS","CS"};
         // D3D11_FORMAT_SUPPORT／FORMAT_SUPPORT2 依共用後端（Metal）的實際能力；CheckFormatSupport 與 CheckFeatureSupport 共用。
+        // 診斷對照：X64ARM_D3D11_FORMAT_CAPS=legacy 時回到 2026-10-24 前的格式能力回報（不含 BLENDABLE、typed UAV、MIP_AUTOGEN、
+        // CPU_LOCKABLE、DISPLAY、GATHER 位元，FORMAT_SUPPORT2 為 0、D3D11_OPTIONS 全 FALSE），用於判斷能力回報改變對遊戲路徑的影響。
+        static const bool legacy_format_caps=[]{const auto* value=std::getenv("X64ARM_D3D11_FORMAT_CAPS");return value && std::string_view(value)=="legacy";}();
         const auto format_support=[&](const std::shared_ptr<Identity>& device,std::uint32_t f)->std::optional<std::uint32_t> {
             std::uint32_t support=0;
             if(device->native->graphics_samples_supported(f,1)){
@@ -725,7 +728,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
                     if(!depth)support|=0x40000U;
                     if(f==21 || f==22 || f==46 || f==47)support|=0x400000U;
                 }
-                if(!depth && !bc){
+                if(!depth && !bc && !legacy_format_caps){
                     const bool integer=f==3 || f==4 || f==12 || f==14 || f==17 || f==18 || f==25 || f==30 || f==32 || f==36 || f==38 ||
                         f==42 || f==43 || f==50 || f==52 || f==57 || f==59 || f==62 || f==64;
                     const bool srgb=f==29 || f==72 || f==74 || f==76 || f==91 || f==93 || f==99;
@@ -739,13 +742,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
                     if(!srgb && f!=65 && f!=67 && f!=68 && f!=69 && f!=85 && f!=86 && f!=115 && !(f>=5 && f<=8))support|=0x2000000U;
                     if(f==10 || f==24 || f==28 || f==29 || f==87 || f==91)support|=0x80000U; // DISPLAY（scanout 格式）
                 }
-                if(support&0x400U)support|=0x4000000U; // SHADER_GATHER_COMPARISON
+                if((support&0x400U) && !legacy_format_caps)support|=0x4000000U; // SHADER_GATHER_COMPARISON
             }else if(device->native->graphics_vertex_format_supported(f))support=1;else return std::nullopt;
             if(device->native->graphics_vertex_format_supported(f))support|=2;
             if(f==42 || f==57)support|=4; // IA_INDEX_BUFFER：R32_UINT／R16_UINT
             return support;
         };
         const auto format_support2=[&](const std::shared_ptr<Identity>& device,std::uint32_t f)->std::uint32_t {
+            if(legacy_format_caps)return 0;
             const auto support=format_support(device,f);if(!support)return 0;std::uint32_t value=0;
             if(*support&0x2000000U)value|=0x80U; // UAV_TYPED_STORE
             if(f==41 || f==42 || f==43)value|=0x40U; // UAV_TYPED_LOAD：FL11 保證的 R32 格式

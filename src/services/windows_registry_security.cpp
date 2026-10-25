@@ -51,7 +51,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry_security(GuestStat
     RegistryIoScope io([&](const auto& work){await_registry_io(state,memory,work);});
     using namespace security;
     const WindowsCall call(state,memory,service);const auto api=service.symbol;
-    const bool reg=api=="RegGetKeySecurity" || api=="RegSetKeySecurity",setting=api.starts_with("Set") || api=="RegSetKeySecurity";
+    const bool kernel=api=="GetKernelObjectSecurity" || api=="SetKernelObjectSecurity";
+    const bool reg=kernel || api=="RegGetKeySecurity" || api=="RegSetKeySecurity",setting=api.starts_with("Set") || api=="RegSetKeySecurity";
     const bool named=api.starts_with("GetNamed") || api.starts_with("SetNamed"),wide=api.ends_with('W');
     const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
     std::uint32_t result=0;
@@ -103,9 +104,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry_security(GuestStat
             if(!(flags&4U)){sd.data[3].clear();sd.control&=static_cast<std::uint16_t>(~12U);}
             const auto bytes=relative_descriptor(sd);
             if(reg){
-                if(!call(3))throw SecurityDescriptorError{87};memory.check(GuestAddress{call(3)},4,Access::Write);const auto capacity=memory.load(GuestAddress{call(3)},32);
+                const auto length=call(kernel?4:3);
+                if(!length)throw SecurityDescriptorError{87};memory.check(GuestAddress{length},4,Access::Write);
+                const auto capacity=kernel?static_cast<std::uint32_t>(call(3)):memory.load(GuestAddress{length},32);
                 if(call(2) && capacity>=bytes.size())memory.check(GuestAddress{call(2)},bytes.size(),Access::Write);
-                memory.store(GuestAddress{call(3)},32,bytes.size());if(!call(2) || capacity<bytes.size())throw SecurityDescriptorError{122};memory.write(GuestAddress{call(2)},bytes);
+                memory.store(GuestAddress{length},32,bytes.size());if(!call(2) || capacity<bytes.size())throw SecurityDescriptorError{122};memory.write(GuestAddress{call(2)},bytes);
             }else{
                 if(!call(7))throw SecurityDescriptorError{87};for(unsigned i=3;i<=7;++i)if(call(i))memory.check(GuestAddress{call(i)},unit,Access::Write);
                 const auto output=allocate_heap(memory,bytes.size());if(!output)throw SecurityDescriptorError{8};memory.write(GuestAddress{output},bytes);runtime_.local_allocations.insert(output);
@@ -114,6 +117,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry_security(GuestStat
             }
         }
     }catch(const SecurityDescriptorError& error){result=error.code;}catch(const MemoryFault&){result=998;}catch(const std::bad_alloc&){result=8;}
-    call.return_to(state,result);return std::nullopt;
+    if(kernel){if(result)last_error_=result;call.return_to(state,result==0);}else call.return_to(state,result);
+    return std::nullopt;
 }
 }

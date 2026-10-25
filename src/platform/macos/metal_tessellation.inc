@@ -24,7 +24,7 @@ MetalTessellationDraw MetalGl::graphics_tessellation(const GraphicsDraw& d,const
         p->patch_slot=dependencies.hasPatchConstant?slot("patchConstants"):UINT32_MAX;
         p->factor_slot=slot("tessFactors");p->info_slot=slot("patchInfo");
         std::set<unsigned> kernel_slots{p->factor_slot,p->info_slot};if(p->control_slot!=UINT32_MAX)kernel_slots.insert(p->control_slot);if(p->patch_slot!=UINT32_MAX)kernel_slots.insert(p->patch_slot);
-        for(unsigned i=0;i<2;++i)for(const auto& b:p->stages[i]->bindings)if(b.type==0 || b.type==3 || b.type==4)kernel_slots.insert(b.native_slot);
+        for(unsigned i=0;i<2;++i)for(const auto& b:p->stages[i]->bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9))kernel_slots.insert(b.native_slot);
         // VS／HS 共用 kernel，但 typed buffer 的 view 範圍各自獨立。
         for(unsigned i=0;i<2;++i)if(p->stages[i]->source.find("x64arm_buffer_views[")!=std::string::npos){
             unsigned at=30;while(kernel_slots.contains(at)){if(!at)throw std::invalid_argument("細分 buffer view 配額不足");--at;}
@@ -71,7 +71,7 @@ MetalTessellationDraw MetalGl::graphics_tessellation(const GraphicsDraw& d,const
         p->compute=[device_ newComputePipelineStateWithDescriptor:descriptor options:MTLPipelineOptionArgumentInfo|MTLPipelineOptionBufferTypeInfo reflection:&reflection error:&error];
         if(!p->compute)throw std::invalid_argument("Metal 細分 kernel 建立失敗："+std::string(error.localizedDescription.UTF8String));
         p->descriptor=[MTLVertexDescriptor vertexDescriptor];
-        std::set<unsigned> domain_slots;for(const auto& b:p->stages[2]->bindings)if(b.type==0 || b.type==3 || b.type==4)domain_slots.insert(b.native_slot);
+        std::set<unsigned> domain_slots;for(const auto& b:p->stages[2]->bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9))domain_slots.insert(b.native_slot);
         if(p->stages[2]->buffer_views_slot!=UINT32_MAX)domain_slots.insert(p->stages[2]->buffer_views_slot);
         const auto domain_slot=[&](){unsigned at=30;while(domain_slots.contains(at)){if(!at)throw std::invalid_argument("DS 輸入 binding 配額不足");--at;}domain_slots.insert(at);return at;};
         p->domain_control_slot=domain_slot();p->domain_patch_slot=domain_slot();
@@ -124,7 +124,7 @@ MetalTessellationDraw MetalGl::graphics_tessellation(const GraphicsDraw& d,const
     }
     begin_commands();auto encoder=[commands_ computeCommandEncoder];MetalEncoderScope scope{encoder};[encoder setComputePipelineState:p->compute];
     std::set<unsigned> occupied{p->factor_slot,p->info_slot,p->vertex_id_slot};if(p->control_slot!=UINT32_MAX)occupied.insert(p->control_slot);if(p->patch_slot!=UINT32_MAX)occupied.insert(p->patch_slot);
-    for(unsigned i=0;i<2;++i){auto stage=d.stages[i?3:0];stage.shader=p->stages[i];graphics_bind(nil,encoder,stage,false);for(const auto& b:stage.shader->bindings)if(b.type==0 || b.type==3 || b.type==4)occupied.insert(b.native_slot);}
+    for(unsigned i=0;i<2;++i){auto stage=d.stages[i?3:0];stage.shader=p->stages[i];graphics_bind(nil,encoder,stage,false);for(const auto& b:stage.shader->bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9))occupied.insert(b.native_slot);}
     for(unsigned i=0;i<2;++i)if(p->stages[i]->buffer_views_slot!=UINT32_MAX)occupied.insert(p->stages[i]->buffer_views_slot);
     unsigned next=30;for(auto buffer:gathered){while(occupied.contains(next))--next;[encoder setBuffer:buffer offset:0 atIndex:next];occupied.insert(next);--next;}
     if(p->control_slot!=UINT32_MAX)[encoder setBuffer:result.controls offset:0 atIndex:p->control_slot];if(p->patch_slot!=UINT32_MAX)[encoder setBuffer:result.patches offset:0 atIndex:p->patch_slot];[encoder setBuffer:result.factors offset:0 atIndex:p->factor_slot];

@@ -54,7 +54,12 @@ struct MetalResource final:GraphicsResource {
     std::shared_ptr<MetalBufferBacking> backing;
     // 被 DISCARD 更換下來的舊 backing：最後一個持有者（flight 或更換點）釋放時交回池。
     std::shared_ptr<MetalBufferPool> recycle;
-    ~MetalResource() override {if(recycle && buffer && !texture)recycle->put(buffer);}
+    // 被 D3D12 描述元表引用時加入的 residency set；資源釋放時一併移除。
+    id residency;
+    ~MetalResource() override {
+        if(residency){if(@available(macOS 15.0,*))[(id<MTLResidencySet>)residency removeAllocation:(id<MTLAllocation>)(texture?(id)texture:(id)buffer)];}
+        if(recycle && buffer && !texture)recycle->put(buffer);
+    }
     // shader 用的 texture view／typed buffer view：每次繪製重建約占綁定成本四成。鍵含目前 backing 的位址，
     // backing 更換（DISCARD、重新配置）後整批丟棄；同一 backing 物件上的 view 內容與 backing 共用，可跨命令重用。
     struct ShaderView {const void* base{};std::array<std::uint32_t,6> key{};id<MTLTexture> view;};

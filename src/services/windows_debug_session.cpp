@@ -133,7 +133,7 @@ bool WindowsServices::dispatch_debug_request(GuestMemory& memory,const debugger:
             const auto found=threads_.items.find(a);
             if(b || found==threads_.items.end() || found->second.status==ThreadStatus::Exited){reply.error=87;return true;}
             auto& thread=found->second;
-            if(request.kind==suspend_thread && thread.suspended>=127){reply.error=87;return true;}
+            if(request.kind==suspend_thread && thread.suspended>=127){reply.error=156;return true;}
             append(reply.payload,thread.suspended);
             if(request.kind==suspend_thread)++thread.suspended;else if(thread.suspended)--thread.suspended;
             threads_.remaining=0;threads_.yield=true;notify_concurrency_changed();

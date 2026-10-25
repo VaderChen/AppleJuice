@@ -10,6 +10,7 @@
 #include "resource_usage.hpp"
 #include "x64arm/windows_opengl.hpp"
 #include "x64arm/gpu_memory.hpp"
+#include "x64arm/bounded_cache.hpp"
 #include <IOKit/IOKitLib.h>
 #include "x64arm/graphics_index_range.hpp"
 #import <AppKit/AppKit.h>
@@ -17,6 +18,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <set>
@@ -43,6 +45,12 @@
 
 namespace x64arm { namespace {
 using namespace metal_gl;
+// 診斷可縮小或停用快取，不能放大正式上限。計帳涵蓋索引與鍵，Metal 私有配置由筆數限制。
+std::size_t metal_cache_entries(const char* name,std::size_t limit){
+    const auto* text=std::getenv(name);if(!text || !*text)return limit;
+    std::size_t value{};const auto end=text+std::strlen(text);const auto parsed=std::from_chars(text,end,value);
+    return parsed.ec==std::errc{} && parsed.ptr==end?std::min(value,limit):limit;
+}
 Matrix identity(){Matrix m{};m[0]=m[5]=m[10]=m[15]=1;return m;}
 Matrix multiply(const Matrix& a,const Matrix& b){Matrix m{};for(unsigned c=0;c<4;++c)for(unsigned r=0;r<4;++r)for(unsigned k=0;k<4;++k)m[c*4+r]+=a[k*4+r]*b[c*4+k];return m;}
 struct Vertex {Vec position{},color{},texcoord{},normal{},ambient{},diffuse{},specular{},emission{},shininess{};};
@@ -91,7 +99,8 @@ class MetalGl final:public NativeOpenGlContext {
     void finish_immediate_present(){if(immediate_presenter_){immediate_presenter_->finish();immediate_presenter_->report();immediate_presenter_.reset();}}
     std::shared_ptr<GpuMemoryReservation> surface_;
     std::vector<std::shared_ptr<GpuMemoryReservation>> pending_leases_;
-    std::map<std::tuple<std::uint64_t,unsigned,unsigned,unsigned>,id<MTLRenderPipelineState>> pipelines_;
+    // 固定與可程式化 OpenGL 共用 context 配額，不隨 program 數目相乘。
+    BoundedCache<id<MTLRenderPipelineState>> gl_pipelines_{2U<<20,metal_cache_entries("X64ARM_METAL_GL_PIPELINE_CACHE_ENTRIES",512)};
     bool fixed_targets_set_{};GraphicsView fixed_color_,fixed_depth_,fixed_texture_;
     std::array<std::uint32_t,12> fixed_stencil_{};
     GlSharedNames<Texture,true> textures_;
@@ -215,11 +224,11 @@ class MetalGl final:public NativeOpenGlContext {
     static MTLBlendFactor blend(unsigned x){switch(x){case 0:return MTLBlendFactorZero;case 1:return MTLBlendFactorOne;case 0x300:return MTLBlendFactorSourceColor;case 0x301:return MTLBlendFactorOneMinusSourceColor;case 0x302:return MTLBlendFactorSourceAlpha;case 0x303:return MTLBlendFactorOneMinusSourceAlpha;case 0x304:return MTLBlendFactorDestinationAlpha;case 0x305:return MTLBlendFactorOneMinusDestinationAlpha;case 0x306:return MTLBlendFactorDestinationColor;case 0x307:return MTLBlendFactorOneMinusDestinationColor;default:return MTLBlendFactorSourceAlphaSaturated;}}
     id<MTLRenderPipelineState> pipeline(bool clear,bool color_write=true,bool fixed=false,MTLPixelFormat color_format=MTLPixelFormatBGRA8Unorm,MTLPixelFormat depth_format=MTLPixelFormatDepth32Float_Stencil8,unsigned samples=1){
         const bool blending=!clear && state_.enabled.contains(0xbe2);const std::uint64_t flags=(blending?1ULL:0ULL)|(std::uint64_t{state_.blend_src}<<1)|(std::uint64_t{state_.blend_dst}<<16)|(color_write?1ULL<<40:0)|(fixed?1ULL<<41:0)|(std::uint64_t{state_.color_mask&15U}<<42);
-        const auto key=std::tuple{flags,static_cast<unsigned>(color_format),static_cast<unsigned>(depth_format),samples};
-        if(pipelines_.contains(key))return pipelines_.at(key);
+        MetalPipelineKey fields;fields<<'f'<<flags<<color_format<<depth_format<<samples;const auto& key=fields.str();
+        if(const auto found=gl_pipelines_.get(key))return *found;
         auto desc=[MTLRenderPipelineDescriptor new];desc.vertexFunction=[library_ newFunctionWithName:fixed?@"fixed_vertex_main":@"vertex_main"];desc.fragmentFunction=[library_ newFunctionWithName:@"fragment_main"];desc.colorAttachments[0].pixelFormat=color_format;desc.depthAttachmentPixelFormat=depth_format;desc.stencilAttachmentPixelFormat=depth_format==MTLPixelFormatDepth32Float_Stencil8?depth_format:MTLPixelFormatInvalid;desc.sampleCount=samples;
         auto attachment=desc.colorAttachments[0];attachment.blendingEnabled=blending;attachment.sourceRGBBlendFactor=blend(state_.blend_src);attachment.sourceAlphaBlendFactor=blend(state_.blend_src);attachment.destinationRGBBlendFactor=blend(state_.blend_dst);attachment.destinationAlphaBlendFactor=blend(state_.blend_dst);attachment.writeMask=color_write?((state_.color_mask&1U?MTLColorWriteMaskRed:MTLColorWriteMaskNone)|(state_.color_mask&2U?MTLColorWriteMaskGreen:MTLColorWriteMaskNone)|(state_.color_mask&4U?MTLColorWriteMaskBlue:MTLColorWriteMaskNone)|(state_.color_mask&8U?MTLColorWriteMaskAlpha:MTLColorWriteMaskNone)):MTLColorWriteMaskNone;
-        NSError* e=nil;auto p=[device_ newRenderPipelineStateWithDescriptor:desc error:&e];if(!p)throw std::runtime_error(std::string("Metal GL pipeline: ")+e.localizedDescription.UTF8String);pipelines_[key]=p;return p;
+        NSError* e=nil;auto p=[device_ newRenderPipelineStateWithDescriptor:desc error:&e];if(!p)throw std::runtime_error(std::string("Metal GL pipeline: ")+e.localizedDescription.UTF8String);gl_pipelines_.put(key,p);return p;
     }
     MTLScissorRect scissor(bool enabled,unsigned width=0,unsigned height=0){
         const auto clip_width=width?width:width_,clip_height=height?height:height_;
@@ -371,7 +380,7 @@ public:
         if(layer_){auto drawable=[layer_ nextDrawable];if(!drawable)return false;begin_commands();auto enc=[commands_ blitCommandEncoder];MetalEncoderScope enc_scope{enc};[enc copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:drawable.texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];enc_scope.end();[commands_ presentDrawable:drawable];}flush(false);return true;}}
     OpenGlRendererInfo info()const override{return {"MacWin",std::string(device_.name.UTF8String)+" (Metal)","1.1 MacWin Metal subset",true};}
     std::string string(unsigned name)override{const auto i=info();switch(name){case 0x1f00:return i.vendor;case 0x1f01:return i.renderer;case 0x1f02:return i.version;case 0x1f03:return {};case 0x8b8c:return "4.60 MacWin GLSL compiler";default:error(0x500);return {};}}
-    std::string statistics()const override{return "opengl_backend=metal opengl_metal_draws="+std::to_string(draws_)+" opengl_metal_submissions="+std::to_string(submissions_)+" opengl_metal_inflight="+std::to_string(flights_.size())+" opengl_metal_inflight_limit="+std::to_string(flight_limit_)+" opengl_metal_inflight_peak="+std::to_string(flight_peak_)+" opengl_metal_render_encoders="+std::to_string(render_encoders_)+" opengl_metal_encoder_breaks="+[&]{std::string text;for(const auto& [why,count]:encoder_breaks_)text+=why+":"+std::to_string(count)+",";return text.empty()?std::string("none"):text;}()+" opengl_metal_coalesced_draws="+std::to_string(coalesced_draws_)+" opengl_metal_gpu_busy_ns="+std::to_string(gpu_busy_ns_->load(std::memory_order_relaxed))+" opengl_metal_waits="+std::to_string(wait_count_)+" opengl_metal_wait_ns="+std::to_string(wait_ns_)+" glsl_compiles="+std::to_string(gl_.compiles)+" glsl_links="+std::to_string(gl_.links)+" glsl_compile_ns="+std::to_string(gl_.compile_ns)+" glsl_link_ns="+std::to_string(gl_.link_ns)+" opengl_metal_resource_waits="+std::to_string(resource_wait_count_)+" gl_buffer_uploads="+std::to_string(gl_.buffer_uploads)+" gl_buffer_upload_bytes="+std::to_string(gl_.buffer_upload_bytes)+" gl_direct_vertex_bindings="+std::to_string(gl_.direct_vertex_bindings)+" gl_direct_index_draws="+std::to_string(gl_.direct_index_draws)+" gl_converted_vertices="+std::to_string(gl_.converted_vertices)+"\n";}
+    std::string statistics()const override{return "opengl_backend=metal opengl_metal_draws="+std::to_string(draws_)+" opengl_metal_submissions="+std::to_string(submissions_)+" opengl_metal_inflight="+std::to_string(flights_.size())+" opengl_metal_inflight_limit="+std::to_string(flight_limit_)+" opengl_metal_inflight_peak="+std::to_string(flight_peak_)+" opengl_metal_render_encoders="+std::to_string(render_encoders_)+" opengl_metal_encoder_breaks="+[&]{std::string text;for(const auto& [why,count]:encoder_breaks_)text+=why+":"+std::to_string(count)+",";return text.empty()?std::string("none"):text;}()+" opengl_metal_coalesced_draws="+std::to_string(coalesced_draws_)+" opengl_metal_gpu_busy_ns="+std::to_string(gpu_busy_ns_->load(std::memory_order_relaxed))+" opengl_metal_waits="+std::to_string(wait_count_)+" opengl_metal_wait_ns="+std::to_string(wait_ns_)+" glsl_compiles="+std::to_string(gl_.compiles)+" glsl_links="+std::to_string(gl_.links)+" glsl_compile_ns="+std::to_string(gl_.compile_ns)+" glsl_link_ns="+std::to_string(gl_.link_ns)+" opengl_metal_resource_waits="+std::to_string(resource_wait_count_)+" gl_buffer_uploads="+std::to_string(gl_.buffer_uploads)+" gl_buffer_upload_bytes="+std::to_string(gl_.buffer_upload_bytes)+" gl_direct_vertex_bindings="+std::to_string(gl_.direct_vertex_bindings)+" gl_direct_index_draws="+std::to_string(gl_.direct_index_draws)+" gl_converted_vertices="+std::to_string(gl_.converted_vertices)+cache_statistics()+"\n";}
     void array(unsigned index,int size,unsigned type,std::span<const std::uint8_t> bytes,bool enabled)override{if(index>=4 || size<1 || size>4)throw std::invalid_argument("GL array");auto& a=arrays_[index];a.size=size;a.type=type;a.enabled=enabled;a.bytes.assign(bytes.begin(),bytes.end());}
     std::string capture(const std::filesystem::path& path)override{@autoreleasepool{flush(true);std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width_)*height_*4);[color_ getBytes:pixels.data() bytesPerRow:width_*4 fromRegion:MTLRegionMake2D(0,0,width_,height_) mipmapLevel:0];auto bitmap=[[NSBitmapImageRep alloc] initWithBitmapDataPlanes:nullptr pixelsWide:width_ pixelsHigh:height_ bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace bitmapFormat:NSBitmapFormatAlphaNonpremultiplied bytesPerRow:width_*4 bitsPerPixel:32];if(!bitmap)throw std::bad_alloc{};for(std::size_t i=0;i<pixels.size();i+=4){std::swap(pixels[i],pixels[i+2]);}std::memcpy(bitmap.bitmapData,pixels.data(),pixels.size());if(!path.parent_path().empty())std::filesystem::create_directories(path.parent_path());if(![[bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:[NSString stringWithUTF8String:path.c_str()] atomically:YES])throw std::runtime_error("Metal PNG capture failed");return "opengl_capture="+path.string()+" backend=metal\n";}}
     bool programmable()const noexcept override{return true;}
@@ -419,6 +428,10 @@ public:
     void graphics_write_no_overwrite(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t)override;
     void graphics_write_region(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t,std::array<std::uint32_t,6>)override;
     std::vector<std::uint8_t> graphics_read(const GraphicsView&)override;
+    bool graphics_descriptor(const GraphicsView&,std::uint32_t,std::array<std::uint64_t,2>&,std::shared_ptr<void>&)override;
+    void metal_make_resident(MetalResource*,id<MTLResource>);
+    void metal_commit_residency();
+    id residency_set_;bool residency_dirty_{};id<MTLTexture> null_texture_;
     std::vector<std::uint8_t> graphics_read_completed(const GraphicsView&)override;
     void graphics_copy(const GraphicsView&,const GraphicsView&,std::array<std::uint32_t,3>,std::array<std::uint32_t,6>)override;
     void graphics_resolve(const GraphicsView&,const GraphicsView&,std::uint32_t)override;

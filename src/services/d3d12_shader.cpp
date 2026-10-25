@@ -51,9 +51,9 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
     scan.descriptors.type=VKD3D_SHADER_STRUCTURE_TYPE_SCAN_DESCRIPTOR_INFO;scan.descriptors.next=&scan.signatures;
     scan.signatures.type=VKD3D_SHADER_STRUCTURE_TYPE_SCAN_SIGNATURE_INFO;
     // Apple GPU 的 SIMD group 對應 D3D wave（寬 32），MSL 支援 64 位元整數但不支援 double。
-    // 無格式型別 UAV 讀取對應 Metal read_write 紋理。threadgroup 零初始化暫不開：SPIRV-Cross 產生的初始化碼引用未宣告的 gl_WorkGroupSize。
+    // 無格式型別 UAV 讀取對應 Metal read_write 紋理；threadgroup 零初始化由 SPIRV-Cross 產生協作清零迴圈（見 SpirvCrossWorkgroupZeroInit.cmake）。
     const std::array<vkd3d_shader_compile_option,3> options{{{VKD3D_SHADER_COMPILE_OPTION_BUFFER_UAV,VKD3D_SHADER_COMPILE_OPTION_BUFFER_UAV_STORAGE_BUFFER},
-        {VKD3D_SHADER_COMPILE_OPTION_FEATURE,VKD3D_SHADER_COMPILE_OPTION_FEATURE_INT64|VKD3D_SHADER_COMPILE_OPTION_FEATURE_WAVE_OPS},
+        {VKD3D_SHADER_COMPILE_OPTION_FEATURE,VKD3D_SHADER_COMPILE_OPTION_FEATURE_INT64|VKD3D_SHADER_COMPILE_OPTION_FEATURE_WAVE_OPS|VKD3D_SHADER_COMPILE_OPTION_FEATURE_ZERO_INITIALIZE_WORKGROUP_MEMORY},
         {VKD3D_SHADER_COMPILE_OPTION_TYPED_UAV,VKD3D_SHADER_COMPILE_OPTION_TYPED_UAV_READ_FORMAT_UNKNOWN}}};
     vkd3d_shader_compile_info info{};info.type=VKD3D_SHADER_STRUCTURE_TYPE_COMPILE_INFO;info.source={bytes.data(),bytes.size()};
     info.source_type=dxil?VKD3D_SHADER_SOURCE_DXBC_DXIL:VKD3D_SHADER_SOURCE_DXBC_TPF;info.target_type=VKD3D_SHADER_TARGET_SPIRV_BINARY;
@@ -63,19 +63,24 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
         throw std::invalid_argument("現代著色器掃描失敗："+std::string(scan.messages?scan.messages:""));
     }
     vkd3d_shader_free_messages(scan.messages);scan.messages=nullptr;
-    // 每個 D3D 描述元給一個 SPIR-V binding；register space 0 對應 D3D11 的 t／s／u／b 暫存器槽。
-    struct Descriptor {vkd3d_shader_descriptor_type type;unsigned register_index,count;bool buffer;};
+    // 每個 D3D 描述元給一個 SPIR-V binding；register space 0 的一般描述元對應 D3D11 的 t／s／u／b 暫存器槽。
+    // 超過 Metal 離散綁定上限的大陣列與無界陣列（bindless）改為描述元表：SPIRV-Cross 以執行期陣列產生
+    // device const void* 緩衝參數，執行時綁定描述元堆積鏡像與表起點偏移。
+    struct Descriptor {vkd3d_shader_descriptor_type type;unsigned register_index,count,space;bool buffer,table;};
     std::vector<vkd3d_shader_resource_binding> bindings;std::map<unsigned,Descriptor> by_binding;
     for(unsigned i=0;i<scan.descriptors.descriptor_count;++i){
         const auto& d=scan.descriptors.descriptors[i];
-        if(d.register_space)throw std::invalid_argument("現代著色器尚不支援 register space "+std::to_string(d.register_space));
-        if(!d.count || d.count==~0U || d.count>128)throw std::invalid_argument("現代著色器尚不支援無界或過大的描述元陣列");
+        if(!d.count)throw std::invalid_argument("現代著色器描述元陣列長度為 0");
+        const bool table=d.count==~0U || d.count>8;
+        if(table && (d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV || d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER))
+            throw std::invalid_argument("現代著色器尚不支援常數緩衝或取樣器的描述元表");
+        if(!table && d.register_space)throw std::invalid_argument("現代著色器尚不支援非零 register space 的離散描述元");
         if(d.flags&VKD3D_SHADER_DESCRIPTOR_INFO_FLAG_UAV_COUNTER)throw std::invalid_argument("現代著色器尚不支援 UAV counter");
         const bool buffer=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV || d.resource_type==VKD3D_SHADER_RESOURCE_BUFFER;
-        vkd3d_shader_resource_binding binding{};binding.type=d.type;binding.register_space=0;binding.register_index=d.register_index;
+        vkd3d_shader_resource_binding binding{};binding.type=d.type;binding.register_space=d.register_space;binding.register_index=d.register_index;
         binding.shader_visibility=VKD3D_SHADER_VISIBILITY_ALL;binding.binding.set=0;binding.binding.binding=static_cast<unsigned>(bindings.size());binding.binding.count=d.count;
         binding.flags=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER?0U:buffer?VKD3D_SHADER_BINDING_FLAG_BUFFER:VKD3D_SHADER_BINDING_FLAG_IMAGE;
-        by_binding.emplace(binding.binding.binding,Descriptor{d.type,d.register_index,d.count,buffer});bindings.push_back(binding);
+        by_binding.emplace(binding.binding.binding,Descriptor{d.type,d.register_index,d.count,d.register_space,buffer,table});bindings.push_back(binding);
     }
     vkd3d_shader_spirv_target_info target{};target.type=VKD3D_SHADER_STRUCTURE_TYPE_SPIRV_TARGET_INFO;target.environment=VKD3D_SHADER_SPIRV_ENVIRONMENT_VULKAN_1_1;
     vkd3d_shader_interface_info interface{};interface.type=VKD3D_SHADER_STRUCTURE_TYPE_INTERFACE_INFO;interface.next=&target;
@@ -84,7 +89,9 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
     std::vector<std::uint32_t> words(scan.code.size/4);std::memcpy(words.data(),scan.code.code,words.size()*4);
     spirv_cross::CompilerMSL compiler(std::move(words));
     const auto model=stage==0?spv::ExecutionModelVertex:stage==1?spv::ExecutionModelFragment:spv::ExecutionModelGLCompute;
-    auto msl=compiler.get_msl_options();msl.platform=spirv_cross::CompilerMSL::Options::macOS;msl.set_msl_version(2,3);msl.pad_fragment_output_components=true;compiler.set_msl_options(msl);
+    auto msl=compiler.get_msl_options();msl.platform=spirv_cross::CompilerMSL::Options::macOS;msl.set_msl_version(3,0);msl.pad_fragment_output_components=true;
+    // 描述元表的 storage buffer 項目帶長度（spvBufferDescriptor：位址、長度、補齊，共 16 位元組）。
+    msl.runtime_array_rich_descriptor=true;compiler.set_msl_options(msl);
     GraphicsModernShader result;
     // 依 SPIRV-Cross 反射的實際資源型別分配 Metal 索引，與宣告順序無關。
     unsigned next_buffer=0,next_texture=0,next_sampler=0;
@@ -94,12 +101,19 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
             if(found==by_binding.end())throw std::invalid_argument("現代著色器資源缺少 D3D 描述元");
             const auto& d=found->second;unsigned kind=0,native=0;
             spirv_cross::MSLResourceBinding mapping{};mapping.stage=model;mapping.desc_set=0;mapping.binding=binding;mapping.count=d.count;
+            if(d.table){
+                // 執行期陣列：SPIRV-Cross 以 [[buffer(n)]] 的 device const void* 傳入，n 取自該資源種類的索引。
+                const bool uav=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV;native=next_buffer++;
+                mapping.count=0;mapping.msl_buffer=mapping.msl_texture=mapping.msl_sampler=native;compiler.add_msl_resource_binding(mapping);
+                result.bindings.push_back({group==1?(uav?9U:8U):(uav?7U:6U),d.register_index,native,UINT32_MAX,d.space});
+                continue;
+            }
             if(group==0){kind=0;native=next_buffer;next_buffer+=d.count;mapping.msl_buffer=native;}
             else if(group==1){kind=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV?4:3;native=next_buffer;next_buffer+=d.count;mapping.msl_buffer=native;}
             else if(group==2){kind=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV?5:1;native=next_texture;next_texture+=d.count;mapping.msl_texture=native;}
             else {kind=2;native=next_sampler;next_sampler+=d.count;mapping.msl_sampler=native;}
             compiler.add_msl_resource_binding(mapping);
-            for(unsigned j=0;j<d.count;++j)result.bindings.push_back({kind,d.register_index+j,native+j});
+            for(unsigned j=0;j<d.count;++j)result.bindings.push_back({kind,d.register_index+j,native+j,UINT32_MAX,0});
         }
     };
     const auto resources=compiler.get_shader_resources();

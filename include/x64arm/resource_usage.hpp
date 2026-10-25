@@ -13,6 +13,15 @@ void record_gpu_interval(double start, double end) noexcept;
 // Launcher 會剝除 X64ARM_* 環境變數，這是正式啟動流程中唯一能取得呈現路徑狀態的管道。
 void record_diagnostic(const char* key, std::int64_t delta = 1) noexcept;
 void set_diagnostic(const char* key, std::string_view text) noexcept;
+// 報告器只提出要求；協調者在既有服務邊界取樣，背景執行緒不碰映射或 heap 容器。
+// 固定大小且只留最新一份；各欄為不同分類，不能相加當成宿主 RSS。
+struct GuestMemoryUsage {
+    std::uint64_t committed{},private_commit{},peak_committed{},peak_private_commit{},virtual_size{};
+    std::uint64_t service_heap_bytes{},service_heap_blocks{},service_heap_largest{};
+    std::uint64_t large_heap_bytes{},large_heap_blocks{},quick_heap_bytes{},quick_heap_blocks{},small_heap_mapped{};
+};
+bool take_guest_memory_sample_request() noexcept;
+void record_guest_memory_usage(const GuestMemoryUsage&) noexcept;
 void mark_gpu_timing_unavailable() noexcept;
 double take_gpu_busy_seconds(double start, double end);
 // D3DKMT 節點統計：第一次查詢後開始累計本程序 Metal command buffer 的 GPU 執行時間（100 ns）。

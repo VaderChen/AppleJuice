@@ -22,7 +22,9 @@ struct GraphicsResource:GraphicsObject {
 };
 struct GraphicsStreamElement {std::string semantic;std::uint32_t index{},first{},count{},slot{},stream{};};
 struct GraphicsStreamStatistics {std::uint64_t written{},needed{};};
-struct GraphicsBinding {std::uint32_t type{},slot{},native_slot{},counter_slot{UINT32_MAX};};
+// type：0 CBV、1 SRV 貼圖／typed buffer、2 取樣器、3 SRV 緩衝、4 UAV 緩衝、5 UAV 貼圖；
+// 6～9 為 D3D12 描述元表（bindless 大陣列）：6 SRV 貼圖、7 UAV 貼圖、8 SRV 緩衝、9 UAV 緩衝，以 (space, slot) 對應根簽章範圍。
+struct GraphicsBinding {std::uint32_t type{},slot{},native_slot{},counter_slot{UINT32_MAX},space{};};
 struct GraphicsInput {std::string semantic;std::uint32_t index{},attribute{};};
 struct GraphicsLegacyShader {std::string source,entry;std::vector<GraphicsBinding> bindings;std::vector<GraphicsInput> inputs;};
 GraphicsLegacyShader graphics_legacy_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes);
@@ -50,6 +52,9 @@ struct GraphicsView {
     std::shared_ptr<GraphicsResource> counter{};
     std::uint32_t dimension{}; // SRV 維度，保留 cube／cube array 的取樣形狀。
 };
+// D3D12 描述元表：heap 為描述元堆積的 GPU 鏡像（貼圖每項 8 位元組 MTLResourceID；緩衝每項位址＋長度共 16 位元組），
+// offset 為此表第一個描述元在鏡像中的位元組位置。
+struct GraphicsDescriptorTable {std::uint32_t type{},space{},slot{};std::shared_ptr<GraphicsResource> heap;std::uint64_t offset{};};
 struct GraphicsStage {
     std::shared_ptr<GraphicsShader> shader;
     // b14 保留給引擎的動態 linkage 資料；D3D11 公開綁定仍限 b0–b13。
@@ -59,6 +64,7 @@ struct GraphicsStage {
     std::array<GraphicsView,128> resources;
     std::array<GraphicsView,8> unordered;
     std::array<std::shared_ptr<GraphicsSampler>,16> samplers;
+    std::vector<GraphicsDescriptorTable> tables;
 };
 struct GraphicsElement {std::string semantic;std::uint32_t index{},format{},slot{},offset{},classification{},step{};};
 struct GraphicsVertexBuffer {std::shared_ptr<GraphicsResource> resource;std::uint32_t stride{},offset{};};
@@ -120,6 +126,9 @@ public:
     virtual void graphics_write_no_overwrite(const GraphicsView& view,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){graphics_write(view,data,row,image);}
     virtual void graphics_write_region(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t,std::array<std::uint32_t,6>){throw std::runtime_error("後端缺少區域資源寫入");}
     virtual std::vector<std::uint8_t> graphics_read(const GraphicsView&){throw std::runtime_error("後端缺少資源讀回");}
+    // 描述元表項目：type 6／7 回傳 view 的 GPU 資源 ID（value[0]），8／9 回傳緩衝位址與長度；空 view 回傳後端的預設空資源。
+    // keep 持有 view 物件直到描述元被覆寫；被引用的配置由後端維持駐留。
+    virtual bool graphics_descriptor(const GraphicsView&,std::uint32_t,std::array<std::uint64_t,2>&,std::shared_ptr<void>&){return false;}
     // 呼叫端已確認寫入此範圍的 GPU 工作都已完成（例如遮蔽查詢 fence）時讀回：不等待同一資源上較新的批次，
     // 非同步後端也不先排空命令佇列。只用於不會被 discard 改名的緩衝；預設沿用 graphics_read。
     virtual std::vector<std::uint8_t> graphics_read_completed(const GraphicsView& view){return graphics_read(view);}

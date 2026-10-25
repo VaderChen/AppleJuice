@@ -6,6 +6,8 @@ Gamepad gamepad_profile(GCExtendedGamepad* profile){
     button(profile.leftThumbstickButton,0x40);button(profile.rightThumbstickButton,0x80);
     button(profile.leftShoulder,0x100);button(profile.rightShoulder,0x200);
     button(profile.buttonA,0x1000);button(profile.buttonB,0x2000);button(profile.buttonX,0x4000);button(profile.buttonY,0x8000);
+    // Home（PS／Xbox 鍵）只經 #100 GetStateEx 回報 Guide；公開 GetState 由 XInput 層遮掉。
+    if(@available(macOS 11.0,*))button(profile.buttonHome,0x400);
     const std::array<GCControllerButtonInput*,2> triggers{profile.leftTrigger,profile.rightTrigger};
     for(unsigned i=0;i<2;++i){value.supported_triggers[i]=triggers[i]!=nil;value.triggers[i]=triggers[i].value;}
     const std::array<GCControllerAxisInput*,4> axes{profile.leftThumbstick.xAxis,profile.leftThumbstick.yAxis,profile.rightThumbstick.xAxis,profile.rightThumbstick.yAxis};
@@ -71,6 +73,10 @@ class NativeGamepads {
         std::erase_if(controllers_,[&](const auto& entry){return !attached.contains(entry.first);});
     }
 public:
+    NativeGamepads(){
+        // Windows 的 XInput／DirectInput 不論視窗焦點都回報狀態（是否忽略由遊戲決定）；GameController 預設只送前景 App。
+        if(@available(macOS 11.3,*))GCController.shouldMonitorBackgroundEvents=YES;
+    }
     std::vector<Gamepad> sample(){@autoreleasepool{
         refresh();std::vector<Gamepad> out;
         for(auto& [key,record]:controllers_){

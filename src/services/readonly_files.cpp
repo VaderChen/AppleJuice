@@ -950,7 +950,7 @@ FileInformation ReadOnlyFiles::information_resolved(Resolved resolved) {
     FileDescriptor parent{resolved.descriptor};
     const auto name=resolved.security_leaf.empty()?".":resolved.security_leaf.c_str();
     if(const auto error=authorize_at(parent.value,name,0x80U))return {resolved.key,{},error};
-    if (const auto found = cache_->metadata.find(resolved.key); !writable_ && found != cache_->metadata.end()) return {resolved.key, found->second, 0};
+    if(!writable_)if(const auto found=cache_->metadata.get(resolved.key))return {resolved.key,*found,0};
     // 屬性查詢不要求內容／目錄列舉；所有路徑查詢保留 NOFOLLOW 與 inode 驗證。
     struct stat value{};if(::fstatat(parent.value,name,&value,AT_SYMLINK_NOFOLLOW)<0)return {resolved.key,{},native_error()};
 #if defined(__APPLE__)
@@ -968,7 +968,7 @@ FileInformation ReadOnlyFiles::information_resolved(Resolved resolved) {
     const auto before_change=value.st_ctim,after_change=after.st_ctim;
 #endif
     if(value.st_dev!=after.st_dev || value.st_ino!=after.st_ino || value.st_mode!=after.st_mode || before_change.tv_sec!=after_change.tv_sec || before_change.tv_nsec!=after_change.tv_nsec)return {resolved.key,{},1237};
-    cache_->metadata.emplace(resolved.key, info);
+    if(!writable_)cache_->metadata.put(resolved.key,info);
     return {resolved.key, info, 0};
 #endif
 }
@@ -1006,9 +1006,9 @@ DirectorySnapshot ReadOnlyFiles::list(std::string path,const std::function<bool(
 #else
     FileDescriptor fd{resolved.descriptor};
     if(const auto error=authorize(fd.value,1U))return {{},error};
-    if (const auto found = cache_->directories.find(resolved.key); !writable_ && found != cache_->directories.end()) {
-        if(!include)return found->second;
-        DirectorySnapshot filtered;for(const auto& entry:found->second.entries)if(include(entry.name))filtered.entries.push_back(entry);return filtered;
+    if(!writable_)if(const auto found=cache_->directories.get(resolved.key)){
+        if(!include)return *found;
+        DirectorySnapshot filtered;for(const auto& entry:found->entries)if(include(entry.name))filtered.entries.push_back(entry);return filtered;
     }
     struct DirectoryStream { DIR* value; ~DirectoryStream() { if (value) ::closedir(value); } } entries{::fdopendir(fd.value)};
     if (!entries.value) return {{}, native_error()};
@@ -1031,7 +1031,11 @@ DirectorySnapshot ReadOnlyFiles::list(std::string path,const std::function<bool(
     }
     overlays(result);
     std::sort(result.entries.begin(), result.entries.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
-    if(!include)cache_->directories.emplace(resolved.key, result);
+    if(!writable_ && !include){
+        std::size_t bytes=result.entries.capacity()*sizeof(DirectoryEntry);
+        for(const auto& entry:result.entries)bytes+=entry.name.capacity()+1;
+        cache_->directories.put(resolved.key,result,bytes);
+    }
     return result;
 #endif
 }
@@ -1045,15 +1049,13 @@ FileSnapshot ReadOnlyFiles::open(std::string path) {
 #else
     FileDescriptor file{resolved.descriptor};
     if(const auto error=authorize(file.value,1U))return {key,{},error};
-    if (const auto found = cache_->files.find(key); !writable_ && found != cache_->files.end()) return {key, found->second, 0};
-    if (cache_->files.size() >= 4096) return {key, {}, 8};
+    if(!writable_)if(const auto found=cache_->files.get(key))return {key,*found,0};
     struct stat information{};
     if (::fstat(file.value, &information) != 0) return {key, {}, native_error()};
     if (!S_ISREG(information.st_mode)) return {key, {}, 5};
     if(writable_)if(const auto error=sharing_error(metadata(information,file.value),0x80000000U,7))return {key,{},error};
-    constexpr std::size_t file_limit = 16U * 1024U * 1024U, total_limit = 128U * 1024U * 1024U;
-    if (information.st_size < 0 || static_cast<std::uint64_t>(information.st_size) > file_limit ||
-        static_cast<std::uint64_t>(information.st_size) > total_limit - cache_->bytes) return {key, {}, 8};
+    constexpr std::size_t file_limit=16U*1024U*1024U;
+    if(information.st_size<0 || static_cast<std::uint64_t>(information.st_size)>file_limit)return {key,{},8};
     auto bytes = std::make_shared<std::vector<std::uint8_t>>(static_cast<std::size_t>(information.st_size));
     std::size_t offset = 0;
     while (offset < bytes->size()) {
@@ -1065,7 +1067,7 @@ FileSnapshot ReadOnlyFiles::open(std::string path) {
     std::uint8_t extra{}; ssize_t trailing;
     do { trailing = ::read(file.value, &extra, 1); } while (trailing < 0 && errno == EINTR);
     if (trailing != 0) return {key, {}, 1117};
-    if (!writable_) {cache_->files.emplace(key, bytes); cache_->bytes += bytes->size(); cache_->metadata.emplace(key, metadata(information,file.value));}
+    if(!writable_){cache_->files.put(key,bytes,bytes->capacity());cache_->metadata.put(key,metadata(information,file.value));}
     return {key, std::move(bytes), 0};
 #endif
 }

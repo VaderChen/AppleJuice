@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "windows_loader_lock.hpp"
+#include "windows_object_identity.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -8,12 +9,15 @@ namespace x64arm {
 namespace {
 struct NativeError {std::uint32_t status;};
 std::uint32_t nt_status(std::uint32_t error){
-    switch(error){case 0:return 0;case 2:return 0xc0000034U;case 3:return 0xc000003aU;case 5:return 0xc0000022U;case 6:return 0xc0000008U;
-    case 8:return 0xc0000017U;case 24:return 0xc0000004U;case 32:return 0xc0000043U;case 33:return 0xc0000054U;case 38:return 0xc0000011U;
+    switch(error){case 0:return 0;case 1:return 0xc0000010U;case 2:return 0xc0000034U;case 3:return 0xc000003aU;case 5:return 0xc0000022U;case 6:return 0xc0000008U;
+    case 8:return 0xc0000017U;case 19:return 0xc00000a2U;case 24:return 0xc0000004U;case 32:return 0xc0000043U;case 33:return 0xc0000054U;case 38:return 0xc0000011U;
     case 50:return 0xc00000bbU;case 80:case 183:return 0xc0000035U;case 87:return 0xc000000dU;case 109:return 0xc000014bU;
-    case 112:return 0xc000007fU;case 123:return 0xc0000033U;case 234:return 0x80000005U;case 267:return 0xc0000103U;
+    case 112:return 0xc000007fU;case 122:return 0xc0000023U;case 123:return 0xc0000033U;case 234:return 0x80000005U;case 267:return 0xc0000103U;
     case 288:return 0xc0000046U;case 298:return 0xc0000047U;case 995:return 0xc0000120U;case 997:return 0x103U;case 998:return 0xc0000005U;
-    case 1008:return 0xc000007cU;case 1314:return 0xc0000061U;case 1346:return 0xc00000a5U;case 1347:return 0xc00000a4U;default:return 0xc0000001U;}
+    case 1008:return 0xc000007cU;case 1018:return 0xc000017cU;case 1117:return 0xc0000185U;case 1305:return 0xc0000058U;case 1306:return 0xc0000059U;
+    case 1307:return 0xc000005aU;case 1308:return 0xc000005bU;case 1314:return 0xc0000061U;
+    case 1336:return 0xc0000077U;case 1337:return 0xc0000078U;case 1338:return 0xc0000079U;
+    case 1346:return 0xc00000a5U;case 1347:return 0xc00000a4U;default:return 0xc0000001U;}
 }
 struct ObjectAttributes {std::u16string name;std::uint64_t root{},security{};std::uint32_t flags{};};
 std::u16string native_string(const GuestMemory& memory,std::uint64_t address,bool x86){
@@ -36,11 +40,15 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
 #include "concrt_sync_descriptors.inc"
         {"ntdll.dll","NtCreateFile",11,0,0,0x5e2},{"ntdll.dll","NtOpenFile",6,0,0,0x32},
         {"ntdll.dll","NtQueryAttributesFile",2},{"ntdll.dll","NtQueryFullAttributesFile",2},
+        {"ntdll.dll","NtDeleteFile",1},{"ntdll.dll","NtFlushBuffersFile",2},
+        {"ntdll.dll","NtQuerySecurityObject",5,0,0,0xa},{"ntdll.dll","NtSetSecurityObject",3,0,0,0x2},
         {"ntdll.dll","NtReadFile",9,0,0,0x40},{"ntdll.dll","NtWriteFile",9,0,0,0x40},
         {"ntdll.dll","NtOpenProcess",4,0,0,0x2},{"ntdll.dll","NtOpenThread",4,0,0,0x2},
         {"ntdll.dll","NtOpenProcessToken",3,0,0,0x2},{"ntdll.dll","NtOpenProcessTokenEx",4,0,0,0x6},
         {"ntdll.dll","NtOpenThreadToken",4,0,0,0x6},{"ntdll.dll","NtOpenThreadTokenEx",5,0,0,0xe},
         {"ntdll.dll","NtDuplicateObject",7,0,0,0x70},{"ntdll.dll","NtWaitForSingleObject",3,0,0,0x2},{"ntdll.dll","NtQueryMutant",5,0,0,0xa},{"ntdll.dll","NtSignalAndWaitForSingleObject",4,0,0,0x4},
+        {"ntdll.dll","NtWaitForMultipleObjects",5,0,0,0xd},{"ntdll.dll","NtWaitForMultipleObjects32",5,0,0,0xd},
+        {"ntdll.dll","NtSuspendThread",2},{"ntdll.dll","NtResumeThread",2},
         {"ntdll.dll","NtCreateSection",7,0,0,0x32},{"ntdll.dll","NtOpenSection",3,0,0,0x2},{"ntdll.dll","NtMapViewOfSection",10,0,0,0x380},
         {"ntdll.dll","RtlCreateHeap",6,0,0,0x1},{"ntdll.dll","RtlDestroyHeap",1},
         {"ntdll.dll","RtlRunOnceExecuteOnce",4},
@@ -202,6 +210,7 @@ std::optional<ExecutionResult> WindowsServices::dispatch_software_interrupt(Gues
     return HostServices::dispatch_software_interrupt(state,memory,vector,length);
 }
 std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol=="NtSuspendThread" || service.symbol=="NtResumeThread")return invoke_thread_control(state,memory,service);
     const WindowsCall call(state,memory,service);const auto name=service.symbol;const auto saved_error=last_error_;const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto finish=[&](std::uint64_t status){if(name.starts_with("Nt"))threads_.items.at(threads_.current).last_native_status=static_cast<std::uint32_t>(status);last_error_=saved_error;call.return_to(state,status);return std::optional<std::uint32_t>{};};
     const auto failure=[&](std::uint32_t status){return finish(name=="RtlDosPathNameToNtPathName_U" || name=="RtlGetFullPathName_U" || name=="RtlDetermineDosPathNameType_U" || name=="RtlIsDosDeviceName_U"?0:status);};
@@ -385,6 +394,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
         if(name=="RtlCreateHeap"){if(call(1) || call(4) || call(5) || (call(0)&~1U))return finish(0);return start("kernel32.dll","HeapCreate",{call(0),call(3),call(2)});}
         if(name=="RtlDestroyHeap")return start("kernel32.dll","HeapDestroy",{call(0)});
         if(name=="NtMapViewOfSection")return invoke_nt_section(state,memory,service);
+        if(name=="NtDeleteFile"){
+            const auto file=path(object_attributes(memory,call(0),x86_));
+            const auto at=scratch(file.size()*2+2);memory.write(GuestAddress{at},utf16_bytes(file));
+            return start("kernel32.dll","DeleteFileW",{at});
+        }
+        if(name=="NtFlushBuffersFile"){
+            memory.check(GuestAddress{call(1)},unit*2,Access::Write);
+            // 沿用共用 FileIo 等待及完成通知；NT 呼叫同步返回後才發布 IOSB。
+            return start("kernel32.dll","FlushFileBuffers",{call(0)});
+        }
+        if(name=="NtQuerySecurityObject"){
+            memory.check(GuestAddress{call(4)},4,Access::Write);
+            return start("advapi32.dll","GetKernelObjectSecurity",{call(0),call(1),call(2),call(3),call(4)});
+        }
+        if(name=="NtSetSecurityObject"){
+            if(!call(2))return finish(0xc0000005U);
+            return start("advapi32.dll","SetKernelObjectSecurity",{call(0),call(1),call(2)});
+        }
         if(name=="NtQueryAttributesFile" || name=="NtQueryFullAttributesFile"){
             const auto file=path(object_attributes(memory,call(0),x86_));const auto info=filesystem_.information(utf16_to_utf8(file));if(info.error)return finish(nt_status(info.error));
             const auto error=filesystem_.security_access(utf16_to_utf8(file),0x80U);if(error)return finish(nt_status(error));
@@ -422,13 +449,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             return start("advapi32.dll",process?"OpenProcessToken":"OpenThreadToken",process?std::vector<std::uint64_t>{call(0),call(1),output}:std::vector<std::uint64_t>{call(0),call(1),call(2),output});
         }
         if(name=="NtDuplicateObject"){if(call(5)&~2U)return finish(0xc000000dU);if(call(3))memory.check(GuestAddress{call(3)},unit,Access::Write);return start("kernel32.dll","DuplicateHandle",{call(0),call(1),call(2),call(3),call(4),(call(5)&2U)!=0,call(6)});}
-        if(name=="NtWaitForSingleObject" || name=="NtSignalAndWaitForSingleObject"){
-            const bool signal=name.starts_with("NtSignal");const auto timeout=call(signal?3:2);std::uint64_t ticks=UINT64_MAX;
-            if(timeout){const auto value=memory.load(GuestAddress{timeout},64);ticks=value>>63?(~value+1):value>runtime_.system_filetime()?value-runtime_.system_filetime():0;}
+        if(name=="NtWaitForSingleObject" || name=="NtSignalAndWaitForSingleObject" || name.starts_with("NtWaitForMultipleObjects")){
+            const bool signal=name.starts_with("NtSignal"),multiple=name.starts_with("NtWaitForMultiple");
+            std::uint64_t captured=0;
+            if(multiple){
+                const auto count=static_cast<std::uint32_t>(call(0)),type=static_cast<std::uint32_t>(call(2));
+                if(!count || count>64)return finish(0xc00000efU); // STATUS_INVALID_PARAMETER_1
+                if(type>1)return finish(0xc00000f1U); // STATUS_INVALID_PARAMETER_3
+                const auto source_unit=name.ends_with("32")?4U:unit;
+                memory.check(GuestAddress{call(1)},count*source_unit,Access::Read);
+                // 至多 64 個 handle；先完整擷取、驗證再進入共用等待，失敗不消耗任何信號。
+                std::array<std::uint64_t,64> handles{};
+                std::array<std::pair<std::u16string_view,std::pair<std::uint64_t,std::uint64_t>>,64> identities{};
+                for(unsigned i=0;i<count;++i){
+                    auto handle=memory.load(GuestAddress{call(1)+i*source_unit},static_cast<std::uint8_t>(source_unit*8));
+                    if(source_unit==4 && !x86_)handle=static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(handle)));
+                    handles[i]=handle;const auto object=object_metadata(handle);const auto kind=object_type(handle);
+                    if(!object)return finish(0xc0000008U);
+                    if(!(object->access&0x100000U) || (kind==u"Thread" && !(thread_access(handle)&0x100000U)))return finish(0xc0000022U);
+                    if(!runtime_.wait_objects.contains(handle) && !thread_id(handle) && !process_signaled(handle).has_value() && !file_io_signaled(handle).has_value())
+                        return finish(kind==u"IoCompletion"?0xc0000008U:0xc0000024U);
+                    identities[i]={kind,detail::object_identity(runtime_,handle,object->identity)};
+                }
+                if(!type)for(unsigned i=0;i<count;++i)
+                    if(std::find(identities.begin(),identities.begin()+i,identities[i])!=identities.begin()+i)return finish(0xc0000030U);
+                captured=scratch(count*unit);
+                for(unsigned i=0;i<count;++i)memory.store(GuestAddress{captured+i*unit},bits,handles[i]);
+            }
+            const auto timeout=call(multiple?4:signal?3:2);std::uint64_t ticks=UINT64_MAX;
+            if(timeout){const auto value=memory.load(GuestAddress{timeout},64),now=runtime_.system_filetime();ticks=value>>63?(~value+1):value>now?value-now:0;}
             // 共用等待 API 的排程及 APC 行為；保留 NT 的 100 ns 截止時間供排程器使用。
             op.information=ticks==UINT64_MAX?UINT64_MAX:ticks>UINT64_MAX-runtime_.clock_ticks?UINT64_MAX:runtime_.clock_ticks+ticks;
             const auto millis=ticks==UINT64_MAX?UINT32_MAX:std::min<std::uint64_t>(0xfffffffeU,ticks/10000+(ticks%10000!=0));
-            return start("kernel32.dll",signal?"SignalObjectAndWait":"WaitForSingleObjectEx",signal?std::vector<std::uint64_t>{call(0),call(1),millis,call(2)}:std::vector<std::uint64_t>{call(0),millis,call(1)});
+            if(multiple)return start("kernel32.dll","WaitForMultipleObjectsEx",{call(0),captured,call(2)==0,millis,static_cast<std::uint8_t>(call(3))});
+            return start("kernel32.dll",signal?"SignalObjectAndWait":"WaitForSingleObjectEx",signal?std::vector<std::uint64_t>{call(0),call(1),millis,static_cast<std::uint8_t>(call(2))}:std::vector<std::uint64_t>{call(0),millis,static_cast<std::uint8_t>(call(1))});
         }
         if(name=="NtCreateSection" || name=="NtOpenSection"){
             const bool create=name=="NtCreateSection";memory.check(GuestAddress{call(0)},unit,Access::Write);const auto attr=object_attributes(memory,call(2),x86_,create);if(attr.root)return finish(0xc00000bbU);
@@ -515,10 +569,12 @@ std::optional<std::uint32_t> WindowsServices::resume_nt_native(GuestState& state
         if(good){if(const auto file=files_.find(value);file!=files_.end()){file->second.mode=op.attributes&0x30U;if(op.allocation && file->second.native)status=nt_status(file->second.native->allocate(op.allocation));}
             if(!status)memory.store(GuestAddress{a[0]},bits,value);else {files_.erase(value);runtime_.win_file_positions.erase(value);runtime_.handle_flags.erase(value);}}
         memory.store(GuestAddress{a[3]},bits,status);memory.store(GuestAddress{a[3]+unit},bits,status?0:op.information);
+    }else if(name=="NtFlushBuffersFile"){
+        status=value?0:status;memory.store(GuestAddress{a[1]},bits,status);memory.store(GuestAddress{a[1]+unit},bits,0);
     }else if(name=="NtOpenProcess" || name=="NtOpenThread"){status=value?0:status;if(value)memory.store(GuestAddress{a[0]},bits,value);}
     else if(name.find("Token")!=name.npos){status=value?0:status;if(value && (op.attributes&2U)){const bool process=name.starts_with("NtOpenProcess"),extended=name.ends_with("Ex");const auto output=a[process?(extended?3:2):(extended?4:3)];runtime_.handle_flags[memory.load(GuestAddress{output},bits)]|=1U;}}
     else if(name=="NtCreateSection" || name=="NtOpenSection"){status=value?native_section_access(value,op.attributes):status;if(!status)memory.store(GuestAddress{a[0]},bits,value);else if(value)(void)close_mapping(value);}
-    else if(name=="NtWaitForSingleObject" || name=="NtSignalAndWaitForSingleObject")status=value==UINT32_MAX?status:static_cast<std::uint32_t>(value);
+    else if(name=="NtWaitForSingleObject" || name=="NtSignalAndWaitForSingleObject" || name.starts_with("NtWaitForMultipleObjects"))status=value==UINT32_MAX?status:static_cast<std::uint32_t>(value);
     else if(name=="NtReadFile" || name=="NtWriteFile"){
         status=value?0:status;const auto bytes=memory.load(GuestAddress{op.scratch+64+unit},bits);memory.store(GuestAddress{a[4]},bits,status);memory.store(GuestAddress{a[4]+unit},bits,bytes);
         if(status==0x103U){const auto pending=std::find_if(pending_file_io_.begin(),pending_file_io_.end(),[&](const auto& io){return io.overlapped==op.scratch+64 && !io.done;});

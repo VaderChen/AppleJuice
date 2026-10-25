@@ -10,8 +10,9 @@ namespace x64arm {
 namespace {
 using namespace automation;
 constexpr unsigned scratch_size=640,source_offset=32,output_offset=56,result_offset=192;
+constexpr unsigned operation_offset=80,operand_offset=84,right_offset=576;
 constexpr unsigned maximum_dispatch=16;
-enum Phase {Convert,Copy,Dispatch,Query,Commit,Cleanup};
+enum Phase {Convert,Copy,Dispatch,Query,Commit,Cleanup,Operands,Concatenate};
 Value read_value(const GuestMemory& memory,std::uint64_t pointer){Value v{};memory.read(GuestAddress{pointer},std::span{v}.first(memory.execution_mode()==ExecutionMode::X86?16:24));return v;}
 std::uint32_t indirect(const GuestMemory& memory,Value& v){
     const auto width=memory.execution_mode()==ExecutionMode::X86?4U:8U;std::set<std::uint64_t> visited;
@@ -28,9 +29,6 @@ std::u16string string_value(const GuestMemory& memory,const Value& v){
     std::u16string text(static_cast<std::size_t>(bytes/2),0);for(std::size_t i=0;i<text.size();++i)text[i]=static_cast<char16_t>(memory.load(GuestAddress{pointer+2*i},16));return text;
 }
 std::uint64_t method(const GuestMemory& memory,std::uint64_t object,unsigned slot){const auto bits=memory.execution_mode()==ExecutionMode::X86?32U:64U;return memory.load(GuestAddress{memory.load(GuestAddress{object},static_cast<std::uint8_t>(bits))+slot*(bits/8)},static_cast<std::uint8_t>(bits));}
-bool boolean_word(std::u16string_view text,std::u16string_view word){
-    if(text.size()!=word.size())return false;for(std::size_t i=0;i<text.size();++i){auto a=text[i],b=word[i];if(a>=u'A' && a<=u'Z')a+=32;if(b>=u'A' && b<=u'Z')b+=32;if(a!=b)return false;}return true;
-}
 std::uint32_t comparison(const GuestMemory& memory,Value left,Value right,std::uint32_t lcid,std::uint32_t flags){
     const bool lh=get(left,0,2)&0x8000U,rh=get(right,0,2)&0x8000U;put(left,0,2,get(left,0,2)&~0x8000U);put(right,0,2,get(right,0,2)&~0x8000U);
     const auto l=get(left,0,2),r=get(right,0,2);if(!valid_type(static_cast<std::uint16_t>(l),false) || !valid_type(static_cast<std::uint16_t>(r),false))return badtype;
@@ -50,6 +48,21 @@ std::uint32_t comparison(const GuestMemory& memory,Value left,Value right,std::u
 }
 std::optional<std::uint32_t> WindowsServices::invoke_automation(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     using namespace automation;const WindowsCall arg(state,memory,service);const auto done=[&](std::uint32_t result){arg.return_to(state,result);return std::optional<std::uint32_t>{};};
+    if(const auto op=operator_kind(service.symbol)){
+        const auto destination=arg(unary_operator(*op)?1:2);const auto size=x86_?16U:24U;
+        if(!destination)return done(invalid);memory.check(GuestAddress{destination},size,Access::Write);
+        const auto failed=[&](std::uint32_t status){memory.store(GuestAddress{destination},16,0);return done(status);};
+        if(!arg(0) || (!unary_operator(*op) && !arg(1)))return failed(invalid);
+        // 先擷取輸入，允許數值輸出與其中一個運算元使用相同 VARIANT。
+        const auto left=read_value(memory,arg(0)),right=unary_operator(*op)?Value{}:read_value(memory,arg(1));
+        if(const auto status=operator_types(*op,static_cast<std::uint16_t>(get(left,0,2)),static_cast<std::uint16_t>(get(right,0,2))))return failed(status);
+        const auto scratch=allocate_heap(memory,scratch_size);if(!scratch)return failed(nomemory);
+        memory.write(GuestAddress{scratch},std::array<std::uint8_t,scratch_size>{});
+        memory.store(GuestAddress{scratch},32,Operands);memory.store(GuestAddress{scratch+8},64,destination);
+        memory.store(GuestAddress{scratch+16},32,0x400);memory.store(GuestAddress{scratch+operation_offset},32,static_cast<unsigned>(*op));
+        memory.write(GuestAddress{scratch+source_offset},left);memory.write(GuestAddress{scratch+right_offset},right);
+        try{return resume_automation(state,memory,scratch,0);}catch(...){discard_automation(state,memory,scratch);throw;}
+    }
     if(!arg(0) || !arg(1))return done(invalid);const auto size=x86_?16U:24U;
     if(service.symbol=="VarCmp"){
         try{return done(comparison(memory,read_value(memory,arg(0)),read_value(memory,arg(1)),static_cast<std::uint32_t>(arg(2)),static_cast<std::uint32_t>(arg(3))));}catch(const std::invalid_argument&){return done(mismatch);}catch(const std::range_error&){return done(overflow);}catch(const std::bad_alloc&){return done(nomemory);}
@@ -75,6 +88,10 @@ std::optional<std::uint32_t> WindowsServices::resume_automation(GuestState& stat
     const auto builtin=[&](std::string_view name,std::initializer_list<std::uint64_t> args,Phase phase){return callback({resolve("oleaut32.dll",name).value,args},phase);};
     const auto cleanup=[&](std::uint32_t status){store(4,status);store(24,load(28)+1);store(0,Cleanup);};
     const auto commit=[&](){return builtin("VariantClear",{load(8,64)},Commit);};
+    const bool operation=load(operation_offset)!=0;
+    const auto publish=[&](){
+        const auto out=read_value(memory,scratch+output_offset);memory.write(GuestAddress{load(8,64)},std::span{out}.first(size));store(output_offset,0,16);cleanup(0);
+    };
     const auto phase=static_cast<Phase>(load(0));
     if(phase==Copy){if(result)cleanup(result);else return commit();}
     else if(phase==Query){
@@ -83,12 +100,54 @@ std::optional<std::uint32_t> WindowsServices::resume_automation(GuestState& stat
     }
     else if(phase==Dispatch){
         if(result)cleanup(result);
-        else {auto source=read_value(memory,scratch+result_offset+24*(load(28)-1));const auto status=indirect(memory,source);if(status)cleanup(status);else {memory.write(GuestAddress{scratch+source_offset},source);store(0,Convert);}}
+        else {auto source=read_value(memory,scratch+result_offset+24*(load(28)-1));const auto status=indirect(memory,source);if(status)cleanup(status);else {memory.write(GuestAddress{scratch+(operation && load(operand_offset)?right_offset:source_offset)},source);store(0,operation?Operands:Convert);}}
     }
     else if(phase==Commit){
         if(!result){const auto out=read_value(memory,scratch+output_offset);memory.write(GuestAddress{load(8,64)},std::span{out}.first(size));store(output_offset,0,16);}cleanup(result);
     }
     else if(phase==Cleanup && result && !load(4))store(4,result);
+    else if(phase==Concatenate){if(result)cleanup(result);else publish();}
+    if(load(0)==Operands){
+        const auto op=static_cast<Operator>(load(operation_offset));const bool unary=unary_operator(op);
+        auto left=read_value(memory,scratch+source_offset),right=read_value(memory,scratch+right_offset);
+        if(const auto type_status=operator_types(op,static_cast<std::uint16_t>(get(left,0,2)),static_cast<std::uint16_t>(get(right,0,2))))cleanup(type_status);
+        else if((get(left,0,2)==1 || (!unary && get(right,0,2)==1)) && !logical_operator(op)){
+            Value out{};put(out,0,2,1);memory.write(GuestAddress{scratch+output_offset},out);publish();
+        }else{
+            for(unsigned side=0;side<(unary?1U:2U);++side){
+                const auto& source=side?right:left;if(get(source,0,2)!=9)continue;
+                const auto object=get(source,8,width),depth=load(28);
+                if(!object || depth>=maximum_dispatch){cleanup(mismatch);break;}
+                store(operand_offset,side);store(28,depth+1);memory.write(GuestAddress{scratch+104},std::array<std::uint8_t,40>{});
+                return callback({method(memory,object,6),{object,0,scratch+104,load(16),2,scratch+120,scratch+result_offset+24*depth,0,0}},Dispatch);
+            }
+            if(load(0)==Operands){
+                const auto l=get(left,0,2),r=get(right,0,2);
+                if(op==Operator::Add && ((l==8 && (r==8 || r==0)) || (r==8 && l==0))){
+                    store(output_offset,8,16);
+                    return builtin("VarBstrCat",{l==8?get(left,8,width):0,r==8?get(right,8,width):0,scratch+output_offset+8},Concatenate);
+                }
+                try{
+                    std::string left_text,right_text;std::uint32_t status=0;
+                    const auto prepare=[&](Value& value,std::string& decimal){
+                        if(get(value,0,2)!=8)return;
+                        auto text=string_value(memory,value);
+                        if(logical_operator(op)){
+                            std::u16string_view word=text;if(word.size()>=2 && word.front()==u'#' && word.back()==u'#'){word.remove_prefix(1);word.remove_suffix(1);}
+                            if(const auto boolean=parse_bool(word,static_cast<std::uint32_t>(load(16)),false)){
+                                value={};put(value,0,2,11);put(value,8,2,*boolean?0xffff:0);return;
+                            }
+                        }
+                        const auto parsed=parse_number(std::move(text),static_cast<std::uint32_t>(load(16)),status);
+                        if(parsed)decimal=*parsed;
+                    };
+                    prepare(left,left_text);if(!status && !unary)prepare(right,right_text);
+                    Value out{};if(!status)status=number_operation(op,left,right,out,left_text,right_text);
+                    if(status)cleanup(status);else {memory.write(GuestAddress{scratch+output_offset},out);publish();}
+                }catch(const std::invalid_argument&){cleanup(mismatch);}catch(const std::range_error&){cleanup(overflow);}catch(const std::bad_alloc&){cleanup(nomemory);}
+            }
+        }
+    }
     if(load(0)==Convert){
         auto source=read_value(memory,scratch+source_offset);const auto from=static_cast<std::uint16_t>(get(source,0,2)),target=static_cast<std::uint16_t>(load(22,16)),flags=static_cast<std::uint16_t>(load(20,16));const auto lcid=static_cast<std::uint32_t>(load(16));
         if(from==target)return builtin("VariantCopy",{scratch+output_offset,scratch+source_offset},Copy);
@@ -117,8 +176,7 @@ std::optional<std::uint32_t> WindowsServices::resume_automation(GuestState& stat
             else if(from==8){
                 auto text=string_value(memory,source);
                 if(target==7){const auto date=parse_date(text,lcid,flags);if(!date)status=mismatch;else put(out,8,8,std::bit_cast<std::uint64_t>(*date));}
-                else if(target==11 && (boolean_word(text,u"True") || boolean_word(text,bool_string(true,lcid,flags&0x10U))))put(out,8,2,0xffff);
-                else if(target==11 && (boolean_word(text,u"False") || boolean_word(text,bool_string(false,lcid,flags&0x10U))))put(out,8,2,0);
+                else if(const auto boolean=target==11?parse_bool(text,lcid,flags&0x10U):std::optional<bool>{};boolean)put(out,8,2,*boolean?0xffff:0);
                 else {const auto parsed=parse_number(std::move(text),lcid,status);if(parsed)status=number_convert(source,*parsed,target,out);}
             }
             else status=number_convert(source,{},target,out);
@@ -130,7 +188,8 @@ std::optional<std::uint32_t> WindowsServices::resume_automation(GuestState& stat
         const auto index=load(24)-1;store(24,index);const auto pointer=scratch+(index?result_offset+24*(index-1):output_offset);
         if(memory.load(GuestAddress{pointer},16))return builtin("VariantClear",{pointer},Cleanup);
     }
-    const auto status=static_cast<std::uint32_t>(load(4));(void)free_heap(memory,scratch,state);complete_call(state,memory,status);return std::nullopt;
+    const auto status=static_cast<std::uint32_t>(load(4));if(operation && status)memory.store(GuestAddress{load(8,64)},16,0);
+    (void)free_heap(memory,scratch,state);complete_call(state,memory,status);return std::nullopt;
 }
 void WindowsServices::discard_automation(GuestState& state,GuestMemory& memory,std::uint64_t scratch){
     // SEH 拋離回呼時不能執行新的 guest COM 方法；先回收自有字串與工作區。

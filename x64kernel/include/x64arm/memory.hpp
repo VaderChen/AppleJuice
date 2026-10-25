@@ -46,10 +46,14 @@ public:
     bool external() const noexcept { return external_; }
     bool stable_shared() const noexcept { return stable_shared_; }
 private:
+    friend class GuestMemory;
+    void reuse_pages(std::size_t offset,std::size_t size);
     std::shared_ptr<void> owner_;
     std::uint8_t* data_{};
     std::size_t size_{};
     bool external_{},stable_shared_{};
+    std::span<std::uint8_t> native_storage_;
+    bool reusable_pages_{};
 };
 class GuestMemory {
 public:
@@ -305,6 +309,12 @@ private:
         bool operator==(const Region&) const;
     };
     std::vector<Region> regions_;
+    struct BackingReclaim {
+        std::shared_ptr<MemoryBacking> backing;
+        std::vector<std::pair<std::uintptr_t,std::uintptr_t>> spans;
+    };
+    std::vector<BackingReclaim> plan_backing_reclaim(GuestAddress,std::size_t) const;
+    static void reclaim_backing_pages(std::span<const BackingReclaim>) noexcept;
     std::size_t allocated_{};
     bool native_shared_access_{};
     bool copy_on_write_present_{};

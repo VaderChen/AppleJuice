@@ -103,6 +103,7 @@ public:
     GraphicsTimestamp graphics_timestamp() override {graphics_sync();return inner_->graphics_timestamp();}
     std::shared_ptr<const GraphicsTimestampFuture> graphics_timestamp_future() override {graphics_sync();return inner_->graphics_timestamp_future();}
     std::vector<std::uint8_t> graphics_read(const GraphicsView& view) override {graphics_sync();return inner_->graphics_read(view);}
+    bool graphics_descriptor(const GraphicsView& view,std::uint32_t type,std::array<std::uint64_t,2>& value,std::shared_ptr<void>& keep) override {graphics_sync();return inner_->graphics_descriptor(view,type,value,keep);}
     // 已完成範圍的 Shared 緩衝不必等命令執行緒排空；其他資源仍同步後讀回。
     std::vector<std::uint8_t> graphics_read_completed(const GraphicsView& view) override {
         if(metal_completed_readable(view.resource))return inner_->graphics_read_completed(view);

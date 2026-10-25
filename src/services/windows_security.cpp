@@ -229,7 +229,8 @@ std::optional<WindowsServices::ObjectMetadata> WindowsServices::object_metadata(
     }else if(const auto key=runtime_.registry.handles.find(handle);key!=runtime_.registry.handles.end()){
         out.access=key->second.access;out.identity=std::hash<std::u16string>{}(key->second.path);out.handles=0;for(const auto& [h,item]:runtime_.registry.handles){(void)h;if(item.path==key->second.path)++out.handles;}out.pointers=out.handles;
     }else if(type==u"Thread"){
-        out.access=0x1fffff;out.identity=thread_id(handle);out.handles=0;for(const auto& [h,item]:runtime_.process_thread_handles){(void)h;if(item.first==out.identity)++out.handles;}out.pointers=out.handles+(threads_.items.contains(out.identity)?1U:0U);
+        const auto id=thread_id(handle);out.access=thread_access(handle);out.identity=(std::uint64_t{process_id()}<<32)|id;
+        out.handles=0;for(const auto& [h,item]:runtime_.process_thread_handles){(void)h;if(item.first==id)++out.handles;}out.pointers=out.handles+(threads_.items.contains(id)?1U:0U);
     }else if(handle>=0x100 && handle<=0x102)out.access=handle==0x100?0x120089U:0x120116U;
     else if(runtime_.completion_ports.contains(handle))out.access=0x1f0003;
     else if(runtime_.process_snapshots.contains(handle))out.access=0xf001f;
@@ -254,6 +255,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
            (info && call(1)==7) ||
            (files_.contains(call(0)) && files_.at(call(0)).pipe && (!info || call(1)==1)) ||
            ((!process_object_type(call(0)).empty() || thread_id(call(0))) && (!info || call(1)==6)))return invoke_object_security(state,memory,service);
+        if(!info){
+            if(runtime_.registry.handles.contains(call(0)))return invoke_registry_security(state,memory,service);
+            if(files_.contains(call(0)))return invoke_security_descriptor(state,memory,service);
+        }
     }
     if(service.symbol.starts_with("BuildSecurityDescriptor") || service.symbol.starts_with("GetNamedSecurityInfo") ||
        service.symbol.starts_with("SetNamedSecurityInfo") || service.symbol.starts_with("GetFileSecurity") ||

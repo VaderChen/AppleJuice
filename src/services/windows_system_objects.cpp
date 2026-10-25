@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "windows_object_identity.hpp"
 #include "x64arm/security_descriptor.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -33,11 +34,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_system_objects(GuestState& 
     try{
         if(symbol=="CompareObjectHandles" || symbol.ends_with("CompareObjects")){
             const bool native=symbol!="CompareObjectHandles";
-            const auto resolve=[&](std::uint64_t handle)->std::optional<std::pair<std::u16string,std::uint64_t>>{
+            using Identity=std::pair<std::u16string,std::pair<std::uint64_t,std::uint64_t>>;
+            const auto resolve=[&](std::uint64_t handle)->std::optional<Identity>{
                 const auto current=x86_?UINT64_C(0xffffffff):UINT64_MAX;
-                if(handle==current || current_process_handle(handle))return std::pair{std::u16string{u"Process"},std::uint64_t{process_id()}};
+                if(handle==current || current_process_handle(handle))return Identity{u"Process",{0,process_id()}};
                 const auto type=object_type(handle);if(type.empty())return std::nullopt;
-                const auto metadata=object_metadata(handle);return std::pair{std::u16string(type),metadata?metadata->identity:handle};
+                const auto metadata=object_metadata(handle);return Identity{std::u16string(type),detail::object_identity(runtime_,handle,metadata?metadata->identity:handle)};
             };
             const auto left=resolve(arg(0)),right=resolve(arg(1));
             if(!left || !right){if(native)return finish(0xC0000008U);last_error_=6;return finish(0);}

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "x64arm/bounded_cache.hpp"
 #include "x64arm/certificate_roots_path.hpp"
 #include "x64arm/file_reparse.hpp"
 #include "x64arm/file_volumes.hpp"
@@ -116,6 +117,8 @@ struct FileVolumeSpace {
 };
 class ReadOnlyFiles {
 public:
+    struct CacheStats {BoundedCacheStats files,metadata,directories;};
+    CacheStats cache_stats()const{return {cache_->files.stats(),cache_->metadata.stats(),cache_->directories.stats()};}
     explicit ReadOnlyFiles(const std::filesystem::path& root = {}, const std::filesystem::path& c_drive = {}, bool writable = false, const std::filesystem::path& install_root = {}, const std::map<char,std::filesystem::path>& drives = {});
     FileSnapshot open(std::string path);
     FileSnapshot open_library(std::string path, const std::filesystem::path& application = {}, std::string_view application_guest_directory = {});
@@ -175,10 +178,9 @@ public:
     std::uint32_t set_disposition(HostFile&,std::string path,bool deleting);
 private:
     struct Cache {
-        std::map<std::string, std::shared_ptr<const std::vector<std::uint8_t>>> files;
-        std::map<std::string, FileMetadata> metadata;
-        std::map<std::string, DirectorySnapshot> directories;
-        std::size_t bytes{};
+        BoundedCache<std::shared_ptr<const std::vector<std::uint8_t>>> files{128U*1024U*1024U,4096};
+        BoundedCache<FileMetadata> metadata{2U*1024U*1024U,4096};
+        BoundedCache<DirectorySnapshot> directories{8U*1024U*1024U,128};
         std::optional<FileVolumeState> volumes;
     };
     struct Resolved { std::string key; int descriptor{-1}; std::uint32_t error{}; bool readonly_file{}; std::filesystem::path host_path{}; std::string security_leaf{}; bool access_denied{}; char volume{}; std::string volume_path{},mount_path{}; std::shared_ptr<void> network_lease{}; };

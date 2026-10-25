@@ -13,6 +13,7 @@
 #include <span>
 #include <bit>
 #include <chrono>
+#include <tuple>
 #include <unicode/udat.h>
 #include <unicode/ucnv.h>
 #include <unicode/ucnv_err.h>
@@ -211,25 +212,13 @@ std::u16string counted_string(const GuestMemory& memory,std::uint64_t pointer,st
     for(std::size_t i=0;i<value.size();++i)value[i]=static_cast<char16_t>(memory.load(GuestAddress{pointer+i*2},16));
     return value;
 }
-// 整數轉換不經宿主 double，避免 UINT64_MAX 附近的十進位精度損失。
-std::uint32_t automation_integer(std::string_view decimal,unsigned bits,bool unsigned_type,std::uint64_t& output){
-    bool negative=false;std::size_t at=0;if(at<decimal.size() && (decimal[at]=='-' || decimal[at]=='+'))negative=decimal[at++]=='-';
-    std::string digits;std::int64_t point=0;bool dot=false;
-    for(;at<decimal.size() && decimal[at]!='e' && decimal[at]!='E';++at){const auto c=decimal[at];if(c=='.' && !dot){dot=true;continue;}if(c<'0' || c>'9')return 0x80020005U;digits+=c;if(!dot)++point;}
-    if(digits.empty())return 0x80020005U;
-    if(at<decimal.size()){
-        ++at;bool minus=false;if(at<decimal.size() && (decimal[at]=='-' || decimal[at]=='+'))minus=decimal[at++]=='-';if(at==decimal.size())return 0x80020005U;
-        std::int64_t exponent=0;for(;at<decimal.size();++at){if(decimal[at]<'0' || decimal[at]>'9')return 0x80020005U;exponent=std::min<std::int64_t>(100000,exponent*10+decimal[at]-'0');}point+=minus?-exponent:exponent;
-    }
-    const auto first=digits.find_first_not_of('0');if(first==digits.npos){output=0;return 0;}point-=static_cast<std::int64_t>(first);digits.erase(0,first);
-    const auto maximum=unsigned_type?(bits==64?UINT64_MAX:(UINT64_C(1)<<bits)-1):negative?(UINT64_C(1)<<(bits-1)):(UINT64_C(1)<<(bits-1))-1;
-    if(point>20)return 0x8002000aU;std::uint64_t value=0;
-    for(std::int64_t i=0;i<point;++i){const auto digit=static_cast<std::uint64_t>(static_cast<std::size_t>(i)<digits.size()?digits[static_cast<std::size_t>(i)]-'0':0);if(value>maximum/10 || (value==maximum/10 && digit>maximum%10))return 0x8002000aU;value=value*10+digit;}
-    if(point>=0 && static_cast<std::uint64_t>(point)<digits.size()){
-        const auto index=static_cast<std::size_t>(point);const char digit=digits[index];const bool tail=digits.find_first_not_of('0',index+1)!=digits.npos;
-        if(digit>'5' || (digit=='5' && (tail || (value&1)))){if(value==maximum)return 0x8002000aU;++value;}
-    }
-    if(unsigned_type && negative && value)return 0x8002000aU;output=negative?UINT64_C(0)-value:value;return 0;
+// 純量入口與 VARIANT 共用精確數值轉換；僅在此對應 Windows 的型別名稱與大小。
+std::pair<std::uint16_t,unsigned> automation_scalar(std::string_view name){
+    static constexpr std::tuple<std::string_view,std::uint16_t,unsigned> types[]{
+        {"I1",16,1},{"I2",2,2},{"I4",3,4},{"I8",20,8},
+        {"UI1",17,1},{"UI2",18,2},{"UI4",19,4},{"UI8",21,8},
+        {"R4",4,4},{"R8",5,8},{"Cy",6,8},{"Date",7,8},{"Bool",11,2},{"Dec",14,16}};
+    for(const auto& [label,type,size]:types)if(name==label)return {type,size};return {};
 }
 std::string icu_locale(const Locale& locale){auto result=utf16_to_utf8(locale.name);std::replace(result.begin(),result.end(),'-','_');return result;}
 #include "windows_locale_info.inc"
@@ -602,22 +591,37 @@ void full_year(UDateFormat* format){
     bool quote=false;for(std::size_t i=0;i<pattern.size();++i){if(pattern[i]==u'\'')quote=!quote;else if(!quote && pattern[i]==u'y'){std::size_t end=i+1;while(end<pattern.size() && pattern[end]==u'y')++end;if(end-i<4){pattern.replace(i,end-i,u"yyyy");end=i+4;}i=end-1;}}udat_applyPattern(format,false,pattern.data(),static_cast<std::int32_t>(pattern.size()));
 }
 }
-std::optional<double> parse_date(std::u16string_view input,std::uint32_t lcid,std::uint16_t flags){
+std::optional<double> parse_date(std::u16string_view input,std::uint32_t lcid,std::uint16_t flags,unsigned parts){
     using namespace std::chrono;
     std::u16string text(input);while(!text.empty() && u_isUWhiteSpace(text.back()))text.pop_back();std::size_t first=0;while(first<text.size() && u_isUWhiteSpace(text[first]))++first;text.erase(0,first);if(text.empty() || text.size()>32767)return {};
     for(const auto styles:{std::pair{UDAT_MEDIUM,UDAT_SHORT},std::pair{UDAT_SHORT,UDAT_SHORT},std::pair{UDAT_NONE,UDAT_SHORT},std::pair{UDAT_NONE,UDAT_MEDIUM},std::pair{UDAT_MEDIUM,UDAT_NONE},std::pair{UDAT_SHORT,UDAT_NONE}}){
         const auto format=date_format(lcid,flags,styles.first,styles.second);if(!format)continue;UErrorCode error=U_ZERO_ERROR;std::int32_t position=0;auto milliseconds=udat_parse(format.get(),text.data(),static_cast<std::int32_t>(text.size()),&position,&error);
         if(U_FAILURE(error) || position!=static_cast<std::int32_t>(text.size()))continue;
         const double days=milliseconds/86400000.0+25569.0;const auto whole=std::floor(days);const auto fraction=days-whole;
-        const double value=styles.second==UDAT_NONE?fraction:whole+(whole<0?-fraction:fraction);if(time_fields(value))return value;
+        const double value=styles.second==UDAT_NONE?fraction:whole+(whole<0?-fraction:fraction);if(time_fields(value))return parts==1?std::abs(value-std::trunc(value)):parts==2?std::trunc(value):value;
     }return {};
 }
-std::optional<std::u16string> format_date(double value,std::uint32_t lcid,std::uint16_t flags){
+std::optional<std::u16string> format_date(double value,std::uint32_t lcid,std::uint16_t flags,unsigned parts,bool four_digits){
     using namespace std::chrono;const auto fields=time_fields(value);if(!fields)return {};const auto date=sys_days{year{static_cast<int>((*fields)[0])}/month{(*fields)[1]}/day{(*fields)[3]}};
     const double milliseconds=static_cast<double>(date.time_since_epoch().count())*86400000.0+((*fields)[4]*3600+(*fields)[5]*60+(*fields)[6])*1000.0;
-    const auto format=date_format(lcid,flags,value==std::trunc(value)?UDAT_NONE:UDAT_MEDIUM,std::trunc(value)==0 && value!=0?UDAT_NONE:UDAT_SHORT);if(!format)return {};
-    full_year(format.get());
+    const auto time_style=parts==2?UDAT_NONE:parts==1?UDAT_MEDIUM:value==std::trunc(value)?UDAT_NONE:UDAT_MEDIUM;
+    const auto date_style=parts==1?UDAT_NONE:parts==2?UDAT_SHORT:std::trunc(value)==0 && value!=0?UDAT_NONE:UDAT_SHORT;
+    const auto format=date_format(lcid,flags,time_style,date_style);if(!format)return {};
+    if(four_digits)full_year(format.get());
     UErrorCode error=U_ZERO_ERROR;std::u16string text(256,0);const auto length=udat_format(format.get(),milliseconds,text.data(),static_cast<std::int32_t>(text.size()),nullptr,&error);if(U_FAILURE(error) || length<0)return {};text.resize(static_cast<std::size_t>(length));return text;
+}
+std::optional<bool> parse_bool(std::u16string_view input,std::uint32_t lcid,bool local){
+    if(!numbered(lcid))return {};
+    while(!input.empty() && u_isUWhiteSpace(input.front()))input.remove_prefix(1);
+    while(!input.empty() && u_isUWhiteSpace(input.back()))input.remove_suffix(1);
+    for(const bool value:{false,true}){
+        for(const bool localized:{false,true}){
+            if(localized && !local)continue;const auto word=bool_string(value,lcid,localized);UErrorCode status=U_ZERO_ERROR;
+            const auto result=u_strCaseCompare(input.data(),static_cast<std::int32_t>(input.size()),word.data(),static_cast<std::int32_t>(word.size()),U_FOLD_CASE_DEFAULT,&status);
+            if(U_SUCCESS(status) && !result)return value;
+        }
+    }
+    return {};
 }
 }
 std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
@@ -633,6 +637,12 @@ std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
         {"msvcp140.dll","_Strcoll",5,0,0,0,true},{"msvcp140.dll","_Strxfrm",5,0,0,0,true},{"msvcp140.dll","_Mbrtowc",5,0,0,0,true},
         {"oleaut32.dll","VarI1FromStr",4},{"oleaut32.dll","VarI2FromStr",4},{"oleaut32.dll","VarI4FromStr",4},{"oleaut32.dll","VarI8FromStr",4},
         {"oleaut32.dll","VarUI1FromStr",4},{"oleaut32.dll","VarUI2FromStr",4},{"oleaut32.dll","VarUI4FromStr",4},{"oleaut32.dll","VarUI8FromStr",4},
+        {"oleaut32.dll","VarR4FromStr",4},{"oleaut32.dll","VarR8FromStr",4},{"oleaut32.dll","VarCyFromStr",4},
+        {"oleaut32.dll","VarDateFromStr",4},{"oleaut32.dll","VarBoolFromStr",4},{"oleaut32.dll","VarDecFromStr",4},
+        {"oleaut32.dll","VarBstrFromI1",4},{"oleaut32.dll","VarBstrFromI2",4},{"oleaut32.dll","VarBstrFromI4",4},{"oleaut32.dll","VarBstrFromI8",4,1},
+        {"oleaut32.dll","VarBstrFromUI1",4},{"oleaut32.dll","VarBstrFromUI2",4},{"oleaut32.dll","VarBstrFromUI4",4},{"oleaut32.dll","VarBstrFromUI8",4,1},
+        {"oleaut32.dll","VarBstrFromR4",4},{"oleaut32.dll","VarBstrFromR8",4,1},{"oleaut32.dll","VarBstrFromCy",4,1},
+        {"oleaut32.dll","VarBstrFromDate",4,1},{"oleaut32.dll","VarBstrFromBool",4},{"oleaut32.dll","VarBstrFromDec",4},
         {"kernel32.dll","GetNumberFormatA",6},{"kernel32.dll","GetNumberFormatW",6},{"kernel32.dll","GetNumberFormatEx",6},
         {"kernel32.dll","GetCurrencyFormatA",6},{"kernel32.dll","GetCurrencyFormatW",6},{"kernel32.dll","GetCurrencyFormatEx",6},
         {"kernel32.dll","GetDateFormatA",6},{"kernel32.dll","GetDateFormatW",6},{"kernel32.dll","GetDateFormatEx",7},
@@ -1212,14 +1222,39 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             memory.write(GuestAddress{arg(3)},bytes);return finish(static_cast<std::uint32_t>(actual));
         }catch(const MemoryFault&){return fail(998);}catch(const std::bad_alloc&){return fail(14);}catch(const std::runtime_error&){return fail(13);}
     }
-    if(name.starts_with("Var") && name.ends_with("FromStr")){
-        if(!arg(3) || (static_cast<std::uint32_t>(arg(2))&~0x80000003U))return finish(0x80070057U);
-        if(!arg(0))return finish(0x80020005U);const auto locale=numbered(static_cast<std::uint32_t>(arg(1)));if(!locale)return finish(0x80070057U);
+    if(name.starts_with("Var") && (name.ends_with("FromStr") || name.starts_with("VarBstrFrom"))){
+        using namespace automation;const bool to_string=name.starts_with("VarBstrFrom");
+        const auto [type,bytes]=automation_scalar(to_string?name.substr(11):name.substr(3,name.size()-10));
+        const auto flags=static_cast<std::uint32_t>(arg(2)),lcid=static_cast<std::uint32_t>(arg(1));
+        const auto allowed=0x80000000U|(type==7?0x1cfU:type==11?0x10U:to_string?0U:3U);
+        const auto calendars=flags&0x188U;
+        const bool conflicting_date_flags=type==7 && ((flags&3U)==3U || (calendars && (calendars&(calendars-1))));
+        if(!type || !arg(3) || (flags&~allowed) || conflicting_date_flags)return finish(invalid);
+        if(!numbered(lcid))return finish(invalid);
+        const auto calendar_flags=static_cast<std::uint16_t>((flags&8U)|((flags&0x80U)?0x20U:0)|((flags&0x100U)?0x40U:0));
         try{
-            std::uint32_t parse_status=0;const auto parsed=automation::parse_number(read_utf16(memory,GuestAddress{arg(0)},32767),static_cast<std::uint32_t>(arg(1)),parse_status);if(!parsed)return finish(parse_status);const auto& decimal=*parsed;
-            const bool unsigned_type=name.starts_with("VarUI");const auto bytes=static_cast<unsigned>(name[unsigned_type?5:4]-'0');std::uint64_t value=0;
-            const auto status=automation_integer(decimal,bytes*8,unsigned_type,value);if(status)return finish(status);memory.store(GuestAddress{arg(3)},static_cast<std::uint8_t>(bytes*8),value);return finish(0);
-        }catch(const std::invalid_argument&){return finish(0x80020005U);}catch(const std::bad_alloc&){return finish(0x8007000eU);}
+            Value value{};put(value,0,2,type);
+            if(!to_string){
+                if(!arg(0))return finish(mismatch);const auto text=read_utf16(memory,GuestAddress{arg(0)},32767);
+                std::uint32_t status=0;
+                if(type==7){const auto date=parse_date(text,lcid,calendar_flags,flags&3U);if(!date)return finish(mismatch);put(value,8,8,std::bit_cast<std::uint64_t>(*date));}
+                else if(const auto boolean=type==11?parse_bool(text,lcid,flags&0x10U):std::optional<bool>{};boolean)put(value,8,2,*boolean?0xffff:0);
+                else {const auto decimal=parse_number(text,lcid,status);if(!decimal)return finish(status);Value source{};put(source,0,2,8);status=number_convert(source,*decimal,type,value);if(status)return finish(status);}
+                // DECIMAL 的 wReserved 不帶 VARIANT 的 vt；其他型別只寫自身大小。
+                if(type==14){put(value,0,2,0);memory.write(GuestAddress{arg(3)},std::span{value}.first(16));}
+                else memory.write(GuestAddress{arg(3)},std::span{value}.subspan(8,bytes));
+            }else{
+                memory.check(GuestAddress{arg(3)},x86_?4:8,Access::Write);
+                if(type==14){if(!arg(0))return finish(invalid);memory.read(GuestAddress{arg(0)},std::span{value}.first(16));put(value,0,2,14);}
+                else {auto raw=arg(0);if(!x86_ && (type==4 || type==5 || type==7)){raw=0;for(unsigned i=0;i<bytes;++i)raw|=std::uint64_t(state.xmm[0][i])<<(i*8);}put(value,8,bytes,raw);}
+                std::optional<std::u16string> text;
+                if(type==11)text=bool_string(get(value,8,2)!=0,lcid,flags&0x10U);
+                else if(type==7){const auto date=std::bit_cast<double>(get(value,8,8));if(!time_fields(date))return finish(overflow);text=format_date(date,lcid,calendar_flags,flags&3U,flags&0x40U);}
+                else text=format_number(number_string(value),lcid);
+                if(!text)return finish(invalid);auto data=utf16_bytes(*text);data.resize(data.size()-2);
+                const auto output=allocate_bstr(memory,data.size(),data);if(!output)return finish(nomemory);memory.store(GuestAddress{arg(3)},x86_?32:64,output);
+            }return finish(0);
+        }catch(const std::invalid_argument&){return finish(mismatch);}catch(const std::range_error&){return finish(overflow);}catch(const std::bad_alloc&){return finish(nomemory);}
     }
     if(locales().empty())return fail(50);
     const auto requested=[&](){return requested_locale_name(memory,arg(0)==(x86_?UINT32_MAX:UINT64_MAX)?0:arg(0));};
