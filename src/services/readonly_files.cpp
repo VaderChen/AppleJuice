@@ -156,7 +156,7 @@ std::uint32_t ReadOnlyFiles::attach_shared_file(HostFile& file,std::uint64_t obj
     if(!file.shared_lease_){
         auto [lease,error]=state.shared->acquire(object,file.access_,file.sharing_,existing,target);if(error)return error;file.shared_lease_=std::move(lease);
         // 發佈前已取得的原始 inode 鎖併入同一紀錄，之後仍能精確解鎖。
-        for(const auto& held:file.locks_)if(const auto code=state.shared->range_lock(file.transfer_identity(),held.offset,held.length,held.exclusive,false,[]{return 0U;},true)){file.shared_lease_.reset();return code;}
+        for(const auto& held:file.locks_)if(const auto code=state.shared->range_lock(file.transfer_identity(),held.offset,held.length,held.exclusive,false,[]{return 0U;},true,held.key)){file.shared_lease_.reset();return code;}
     }
     else if(target)if(const auto error=state.shared->close_target(file.transfer_identity(),target))return error;
     if(file.delete_target_ && file.delete_target_->pending)if(const auto error=state.shared->disposition(file.delete_target_->shared_index,true,file.transfer_identity()))return error;
@@ -164,6 +164,7 @@ std::uint32_t ReadOnlyFiles::attach_shared_file(HostFile& file,std::uint64_t obj
 #endif
 }
 std::uint32_t ReadOnlyFiles::publish_shared_file(HostFile& file){
+    if(file.null_device())return 0; // 裝置沒有磁碟分享、刪除或鎖資料；游標仍沿既有能力紀錄傳遞。
 #if !defined(__APPLE__)
     (void)file;return 0;
 #else
@@ -440,7 +441,7 @@ ReadOnlyFiles::Resolved ReadOnlyFiles::resolve_mapped(std::string path, bool dir
         const auto name = component(components[i]); if (name.empty()) return finish({key, -1, 5});physical_components[i]=name;
         if(auto link=expand(i,name))return *link;
         const auto next = ::openat(directory.value, name.c_str(), traversal_mode | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        if (next < 0) return finish({key, -1, error_code(),false,{},{},error_code()==5});
+        if (next < 0) {const auto error=errno==ENOENT?3U:error_code();return finish({key,-1,error,false,{},{},error==5});}
         ::close(directory.value); directory.value = next;
         host_path/=name;
     }
@@ -719,10 +720,23 @@ std::uint32_t ReadOnlyFiles::authorize_traverse(int descriptor)const{
     (void)enabled;return authorize(descriptor,0x20U);
 #endif
 }
-std::uint32_t ReadOnlyFiles::authorize_at(int directory,std::string_view leaf,std::uint32_t desired)const{
-    if(!security_context_)return 0;
+std::uint32_t ReadOnlyFiles::effective_access(const HostFile& file,std::uint32_t& granted)const{
+    granted=0;
+    if(!security_context_){granted=0x1f01ffU;return 0;}
+    try{
+        const auto sd=security::file_descriptor(security::read_native_file_security(file,true),0x17);
+        try{granted=security::file_token_access(*security_context_,sd,0x02000000U);}
+        catch(const SecurityDescriptorError& error){if(error.code!=5)return error.code;}
+        return 0;
+    }catch(const SecurityDescriptorError& error){return error.code;}catch(const std::bad_alloc&){return 8;}
+}
+std::uint32_t ReadOnlyFiles::authorize_at(int directory,std::string_view leaf,std::uint32_t desired,std::uint32_t* effective)const{
+    if(effective)*effective=0;
+    if(!security_context_){if(effective)*effective=0x1f01ffU;return 0;}
     try{
         const auto sd=security::file_descriptor(security::read_native_file_security_at(directory,leaf,true),0x17);
+        if(effective)try{*effective=security::file_token_access(*security_context_,sd,0x02000000U);}
+        catch(const SecurityDescriptorError& error){if(error.code!=5)return error.code;}
         try{(void)security::file_token_access(*security_context_,sd,desired);return 0;}
         catch(const SecurityDescriptorError& error){
             if(error.code!=5 || !desired || (desired&~0x88U))return error.code;
@@ -781,13 +795,12 @@ std::uint32_t ReadOnlyFiles::initialize_file_security(const HostFile& file,std::
         security::write_native_file_security(file,sd,7U|(sd.control&16U?16U:0U),context.primary_user,context.primary_group);return 0;
     }catch(const SecurityDescriptorError& error){return error.code;}catch(const std::bad_alloc&){return 8;}
 }
-FileSnapshot ReadOnlyFiles::open_library(std::string path,const std::filesystem::path& application,std::string_view application_guest_directory) {
-    startup_profile::Scope measurement("library_file",path,true);
+ReadOnlyFiles::Resolved ReadOnlyFiles::resolve_library(std::string path,const std::filesystem::path& application,std::string_view application_guest_directory,bool strict_root) const {
 #if defined(_WIN32)
-    (void)path;(void)application;(void)application_guest_directory;return {{},{},50};
+    (void)path;(void)application;(void)application_guest_directory;(void)strict_root;return {{},-1,50};
 #else
-    auto resolved=resolve(path);
-    if(resolved.key.empty())return {{},{},resolved.error,resolved.access_denied};
+    auto resolved=resolve(path,false,nullptr,false,false,0,strict_root);
+    if(resolved.key.empty())return resolved;
     auto key=resolved.key;
     if(key.starts_with("relative:/"))key="c:/"+key.substr(10);
     auto prefix=std::string(application_guest_directory);std::replace(prefix.begin(),prefix.end(),'\\','/');
@@ -804,15 +817,39 @@ FileSnapshot ReadOnlyFiles::open_library(std::string path,const std::filesystem:
             FileDescriptor previous{resolved.descriptor};resolved=std::move(adjacent);
         }
     }
+    resolved.key=std::move(key);
+    return resolved;
+#endif
+}
+OpenHostFile ReadOnlyFiles::open_library_reader(std::string path,const std::filesystem::path& application,std::string_view application_guest_directory) try {
+#if defined(_WIN32)
+    (void)path;(void)application;(void)application_guest_directory;return {{},{},{},50};
+#else
+    auto resolved=resolve_library(std::move(path),application,application_guest_directory);
     FileDescriptor fd{resolved.descriptor};
-    if(resolved.error)return {key,{},resolved.error,resolved.access_denied};
-    if(const auto error=authorize(fd.value,1U))return {key,{},error,error==5};
+    if(resolved.error)return {resolved.key,{},{},resolved.error,false,{},resolved.access_denied};
+    if(const auto error=authorize(fd.value,1U))return {resolved.key,{},{},error,false,{},error==5};
+    struct stat info{};if(::fstat(fd.value,&info)<0)return {resolved.key,{},{},native_error()};
+    if(!S_ISREG(info.st_mode) || info.st_size<0)return {resolved.key,{},{},193};
+    auto file=std::make_shared<HostFile>(fd.value);fd.value=-1;
+    file->access_=1U;file->readonly_=true;file->network_lease_=resolved.network_lease;
+    return {resolved.key,std::move(file),metadata(info,resolved.descriptor),0,true,resolved.host_path};
+#endif
+} catch(const std::bad_alloc&) {return {{},{},{},8};}
+FileSnapshot ReadOnlyFiles::open_library(std::string path,const std::filesystem::path& application,std::string_view application_guest_directory) {
+    startup_profile::Scope measurement("library_file",path,true);
+#if defined(_WIN32)
+    (void)path;(void)application;(void)application_guest_directory;return {{},{},50};
+#else
+    const auto opened=open_library_reader(std::move(path),application,application_guest_directory);
+    const auto& key=opened.key;
+    if(opened.error)return {key,{},opened.error,opened.access_denied};
     // 快取只接收上述已授權的描述元；同名檔案替換、相鄰來源、硬連結
     // 與不同 ReadOnlyFiles 實例以真正的檔案身分區分／共用，不能只相信 guest key。
     try {
-        auto bytes=pe_file_cache().read(fd.value,256U*1024U*1024U);
-        readonly_files_[key]=resolved.host_path;
-        return {key,std::move(bytes),0,false,resolved.host_path};
+        auto bytes=pe_file_cache().read(opened.file->transfer_descriptor(),256U*1024U*1024U);
+        readonly_files_[key]=opened.source;
+        return {key,std::move(bytes),0,false,opened.source};
     }catch(const std::length_error&){return {key,{},193};}
     catch(const std::invalid_argument&){return {key,{},193};}
     catch(const std::bad_alloc&){return {key,{},8};}
@@ -824,25 +861,16 @@ OpenHostFile ReadOnlyFiles::open_reader(std::string path,const std::filesystem::
     (void)path;(void)application;(void)application_guest_directory;(void)sharing;return {{},{},{},50,false};
 #else
     // 唯讀來源能力維持既有根目錄邊界；一般 Windows 檔案 I/O 另依磁碟根目錄正規化。
-    auto resolved=resolve(path,false,nullptr,false,false,0,true);FileDescriptor descriptor{resolved.descriptor};
+    auto resolved=resolve_library(std::move(path),application,application_guest_directory,true);FileDescriptor descriptor{resolved.descriptor};
     auto key=resolved.key;if(key.empty())return {{},{},{},resolved.error,false};
-    if(key.starts_with("relative:/"))key="c:/"+key.substr(10);
-    auto prefix=std::string(application_guest_directory);std::replace(prefix.begin(),prefix.end(),'\\','/');
-    for(auto& c:prefix)if(c>='A' && c<='Z')c=static_cast<char>(c+32);
-    if(!prefix.empty() && !prefix.ends_with('/'))prefix+='/';
-    // 沿用 DLL 相鄰目錄的唯讀能力；純查詢不登錄 DLL、不改 writable 路徑權限。
-    if(!application.empty() && !prefix.empty() && key.starts_with(prefix)) {
-        ReadOnlyFiles source({},application);source.security_context_=security_context_;auto adjacent=source.resolve("C:/"+key.substr(prefix.size()));
-        if(!adjacent.error) {if(descriptor.value>=0)::close(descriptor.value);descriptor.value=adjacent.descriptor;resolved.error=0;}
-    }
-    if(resolved.error)return {key,{},{},resolved.error,false};
-    if(const auto error=authorize(descriptor.value,0x80000000U))return {key,{},{},error,false};
+    if(resolved.error)return {key,{},{},resolved.error,false,{},resolved.access_denied};
+    if(const auto error=authorize(descriptor.value,0x80000000U))return {key,{},{},error,false,{},error==5};
     struct stat info{};if(::fstat(descriptor.value,&info)<0)return {key,{},{},native_error(),false};
     if(!S_ISREG(info.st_mode) || info.st_size<0)return {key,{},{},5,false};
     const auto details=metadata(info,descriptor.value);if(const auto error=sharing_error(details,0x80000000U,sharing))return {key,{},{},error,true};
     auto state=file_state(details,true);auto file=std::make_shared<HostFile>(descriptor.value);descriptor.value=-1;
     file->state_=state;file->access_=0x80000000U;file->sharing_=sharing;file->readonly_=true;file->volume_=resolved.readonly_file?0:resolved.volume;file->network_lease_=resolved.network_lease;if(const auto error=attach_shared_file(*file))return {key,{},{},error,false};std::erase_if(state->opens,[](const auto& weak){return weak.expired();});state->opens.push_back(file);
-    return {key,std::move(file),details,0,true};
+    return {key,std::move(file),details,0,true,resolved.host_path};
 #endif
 } catch(const std::bad_alloc&) {return {{},{},{},8,false};}
 std::uint32_t ReadOnlyFiles::set_current_directory(std::string path) {
@@ -859,18 +887,19 @@ std::uint32_t ReadOnlyFiles::set_current_directory(std::string path) {
 #endif
 }
 std::pair<std::filesystem::path,std::uint32_t> ReadOnlyFiles::executable_path(std::string path,const std::filesystem::path& application,std::string_view guest_directory) {
-    const auto opened = open_library(std::move(path),application,guest_directory);
+    const auto opened = open_library_reader(std::move(path),application,guest_directory);
     if (opened.error) return {{},opened.error};
-    const auto found = readonly_files_.find(opened.key);
-    return found == readonly_files_.end() ? std::pair<std::filesystem::path,std::uint32_t>{{},2} : std::pair{found->second,0U};
+    return {opened.source,0U};
 }
 bool HostFile::transferable()const{
+    if(null_device_)return is_null_descriptor(descriptor_);
 #if !defined(_WIN32)
     struct stat info{};
-    // 尚未共用 delete disposition 與 range-lock 的生命週期，不能降級成普通 open。
 #if defined(__APPLE__)
-    return locks_.empty() && !::fstat(descriptor_,&info) && S_ISREG(info.st_mode);
+    // 已發布的鎖依程序身分留在共用表；只傳資料 fd，獨立鎖 fd 不隨子程序延命。
+    return (locks_.empty() || shared_lease_) && !::fstat(descriptor_,&info) && S_ISREG(info.st_mode);
 #else
+    // 尚未共用 delete disposition 與 range-lock 的生命週期，不能降級成普通 open。
     return !delete_on_close_ && !delete_pending() && !(access_&(0x10000U|0x10000000U)) && locks_.empty() && !::fstat(descriptor_,&info) && S_ISREG(info.st_mode);
 #endif
 #else
@@ -883,11 +912,17 @@ OpenHostFile ReadOnlyFiles::inherit_host(int descriptor,std::uint32_t access,std
 #else
     if(sharing&~7U)return {{},{},{},87,false};
     struct stat info{};const auto flags=::fcntl(descriptor,F_GETFL);
-    if(flags<0 || ::fstat(descriptor,&info) || !S_ISREG(info.st_mode))return {{},{},{},6,false};
+    if(flags<0 || ::fstat(descriptor,&info) || (!S_ISREG(info.st_mode) && !HostFile::is_null_descriptor(descriptor)))return {{},{},{},6,false};
     const bool reads=(access&(0x80000000U|1U))!=0,writes=(access&(0x40000000U|2U|4U))!=0;
     if((writes && (readonly || (flags&O_ACCMODE)==O_RDONLY)) || (reads && (flags&O_ACCMODE)==O_WRONLY))return {{},{},{},5,false};
     const auto details=metadata(info,descriptor);const auto copied=::fcntl(descriptor,F_DUPFD_CLOEXEC,3);if(copied<0)return {{},{},{},native_error(),false};
-    FileDescriptor owned{copied};auto state=file_state(details,true);auto file=std::make_shared<HostFile>(owned.value);owned.value=-1;
+    FileDescriptor owned{copied};
+    if(HostFile::is_null_descriptor(descriptor)){
+        if(object)return {{},{},{},6,false};
+        auto file=std::make_shared<HostFile>(owned.value);owned.value=-1;file->null_device_=true;file->access_=access;file->sharing_=sharing;
+        return {{},std::move(file),details,0,true};
+    }
+    auto state=file_state(details,true);auto file=std::make_shared<HostFile>(owned.value);owned.value=-1;
     file->state_=state;file->access_=access;file->sharing_=sharing;file->readonly_=readonly;
     if(const auto error=attach_shared_file(*file,object,true))return {{},{},{},error,false};
     std::erase_if(state->opens,[](const auto& weak){return weak.expired();});state->opens.push_back(file);
@@ -915,7 +950,9 @@ OpenHostFile ReadOnlyFiles::open_directory_observer(std::string path) {
     return {resolved.key,{},{},50,false};
 #endif
 }
-FileInformation ReadOnlyFiles::information(std::string path) {
+FileInformation ReadOnlyFiles::information(std::string path) {return information_impl(std::move(path),nullptr);}
+FileInformation ReadOnlyFiles::information(std::string path,std::uint32_t& effective) {effective=0;return information_impl(std::move(path),&effective);}
+FileInformation ReadOnlyFiles::information_impl(std::string path,std::uint32_t* effective) {
     security::NativeFileIdentityScope identity_scope;
 #if !defined(_WIN32)
     // 一般檔案不可能是重解析點；同一次解析確認葉節點是一般檔案時，略過另一輪 reparse 解析。
@@ -924,23 +961,27 @@ FileInformation ReadOnlyFiles::information(std::string path) {
         auto resolved=resolve(path,false,nullptr,true);
         struct stat probe{};
         if(!resolved.error && !resolved.security_leaf.empty() && ::fstatat(resolved.descriptor,resolved.security_leaf.c_str(),&probe,AT_SYMLINK_NOFOLLOW)==0 && S_ISREG(probe.st_mode))
-            return information_resolved(std::move(resolved));
+            return information_resolved(std::move(resolved),effective);
         if(resolved.descriptor>=0)::close(resolved.descriptor);
     }
 #endif
     const auto link=reparse(path);if(!link.error){std::string leaf;const auto parent=resolve(path,true,&leaf);
 #if !defined(_WIN32)
         FileDescriptor fd{parent.descriptor};struct stat entry{};if(parent.error)return {parent.key,{},parent.error};
-        if(const auto error=authorize(fd.value,0x80U))return {parent.key,{},error};
         if(::fstatat(fd.value,leaf.c_str(),&entry,AT_SYMLINK_NOFOLLOW)<0)return {parent.key,{},native_error()};
         if(static_cast<std::uint64_t>(entry.st_dev)!=link.device || entry.st_ino!=link.id)return {parent.key,{},32};
+        // 查詢連結自身，沿用一般葉節點的 READ_ATTRIBUTES／父目錄列舉授權，不額外要求父目錄 READ_ATTRIBUTES。
+        if(const auto error=authorize_at(fd.value,leaf,0x80U,effective))return {parent.key,{},error};
         FileDescriptor own{link.kind==3?::openat(fd.value,leaf.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW):-1};
-        auto info=metadata(entry,own.value);info.attributes=link.kind==3?info.attributes|0x400U:link.attributes;info.reparse_tag=link.kind==3?0xa0000003U:0xa000000cU;return {parent.key,info,0};
+        auto info=metadata(entry,own.value);info.attributes=link.kind==3?info.attributes|0x400U:link.attributes;info.reparse_tag=link.kind==3?0xa0000003U:0xa000000cU;
+        struct stat after{};if(::fstatat(fd.value,leaf.c_str(),&after,AT_SYMLINK_NOFOLLOW)<0)return {parent.key,{},native_error()};
+        if(entry.st_dev!=after.st_dev || entry.st_ino!=after.st_ino || metadata(after).changed!=info.changed)return {parent.key,{},1237};
+        return {parent.key,info,0};
 #endif
     }
-    return information_resolved(resolve(std::move(path),false,nullptr,true));
+    return information_resolved(resolve(std::move(path),false,nullptr,true),effective);
 }
-FileInformation ReadOnlyFiles::information_resolved(Resolved resolved) {
+FileInformation ReadOnlyFiles::information_resolved(Resolved resolved,std::uint32_t* effective) {
     if((resolved.error==2 || resolved.error==3 || resolved.error==5) && std::any_of(readonly_mounts_.begin(),readonly_mounts_.end(),[&](const auto& entry){return entry.first.starts_with(resolved.key+(resolved.key.ends_with('/')?"":"/"));})) {FileMetadata info;info.attributes=0x10;return {resolved.key,info,0};}
     if(resolved.error && resolved.key=="c:/" && c_drive_.empty() && (!install_root_.empty() || !readonly_files_.empty())) {FileMetadata info;info.attributes=0x10;return {resolved.key,info,0};}
     if (resolved.error) return {resolved.key, {}, resolved.error};
@@ -949,10 +990,10 @@ FileInformation ReadOnlyFiles::information_resolved(Resolved resolved) {
 #else
     FileDescriptor parent{resolved.descriptor};
     const auto name=resolved.security_leaf.empty()?".":resolved.security_leaf.c_str();
-    if(const auto error=authorize_at(parent.value,name,0x80U))return {resolved.key,{},error};
-    if(!writable_)if(const auto found=cache_->metadata.get(resolved.key))return {resolved.key,*found,0};
+    if(!effective && !writable_)if(const auto found=cache_->metadata.get(resolved.key)){if(const auto error=authorize_at(parent.value,name,0x80U))return {resolved.key,{},error};return {resolved.key,*found,0};}
     // 屬性查詢不要求內容／目錄列舉；所有路徑查詢保留 NOFOLLOW 與 inode 驗證。
     struct stat value{};if(::fstatat(parent.value,name,&value,AT_SYMLINK_NOFOLLOW)<0)return {resolved.key,{},native_error()};
+    if(const auto error=authorize_at(parent.value,name,0x80U,effective))return {resolved.key,{},error};
 #if defined(__APPLE__)
     FileDescriptor fd{::openat(parent.value,name,O_EVTONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK)};
 #else
@@ -1079,6 +1120,7 @@ HostSecurityTarget::~HostSecurityTarget(){
 HostFile::~HostFile() {
     if(delete_on_close_ && delete_target_ && !shared_lease_) {delete_target_->pending=true;state_->pending=true;}
 #if !defined(_WIN32)
+    if (lock_descriptor_>=0) ::close(lock_descriptor_);
     if (descriptor_>=0) ::close(descriptor_);
 #endif
 }
@@ -1107,25 +1149,37 @@ FileInformation HostFile::descriptor_information(int descriptor) {
     struct stat info{};if (::fstat(descriptor,&info)<0) return {{},{},native_error()};return {{},metadata(info,descriptor),0};
 #endif
 }
-std::uint32_t HostFile::validate_io(std::uint64_t offset,std::uint64_t length,bool writing) const {
-    if(offset>INT64_MAX || length>static_cast<std::uint64_t>(INT64_MAX)-offset)return 87;
-    return lock_conflict(offset,length,writing);
-}
-FileIoResult HostFile::read(std::span<std::uint8_t> bytes,std::uint64_t offset) const {
+bool HostFile::is_null_descriptor(int descriptor) {
 #if defined(_WIN32)
-    (void)bytes;(void)offset;return {0,50};
+    (void)descriptor;return false;
 #else
-    if(const auto error=validate_io(offset,bytes.size(),false))return {0,error};
+    struct stat actual{},expected{};
+    return !::fstat(descriptor,&actual) && S_ISCHR(actual.st_mode) && !::stat("/dev/null",&expected) &&
+        S_ISCHR(expected.st_mode) && actual.st_rdev==expected.st_rdev;
+#endif
+}
+std::uint32_t HostFile::validate_io(std::uint64_t offset,std::uint64_t length,bool writing,std::uint32_t key) const {
+    if(null_device_)return 0;
+    if(offset>INT64_MAX || length>static_cast<std::uint64_t>(INT64_MAX)-offset)return 87;
+    return lock_conflict(offset,length,writing,key);
+}
+FileIoResult HostFile::read(std::span<std::uint8_t> bytes,std::uint64_t offset,std::uint32_t key) const {
+    if(null_device_){process_io::record(process_io::Kind::Read,0);return {};}
+#if defined(_WIN32)
+    (void)bytes;(void)offset;(void)key;return {0,50};
+#else
+    if(const auto error=validate_io(offset,bytes.size(),false,key))return {0,error};
     ssize_t size;do {size=::pread(descriptor_,bytes.data(),bytes.size(),static_cast<off_t>(offset));} while(size<0 && errno==EINTR);
     process_io::record(process_io::Kind::Read,size<0?0:static_cast<std::uint64_t>(size));
     return size<0?FileIoResult{0,native_error()}:FileIoResult{static_cast<std::uint64_t>(size),0};
 #endif
 }
-FileIoResult HostFile::write(std::span<const std::uint8_t> bytes,std::uint64_t offset) const {
+FileIoResult HostFile::write(std::span<const std::uint8_t> bytes,std::uint64_t offset,std::uint32_t key) const {
+    if(null_device_){process_io::record(process_io::Kind::Write,bytes.size());return {bytes.size(),0};}
 #if defined(_WIN32)
-    (void)bytes;(void)offset;return {0,50};
+    (void)bytes;(void)offset;(void)key;return {0,50};
 #else
-    if(const auto error=validate_io(offset,bytes.size(),true))return {0,error};
+    if(const auto error=validate_io(offset,bytes.size(),true,key))return {0,error};
     FileIoResult output;
     output.error=mutate_size([&](){
         struct stat info{};if(::fstat(descriptor_,&info)<0)return native_error();std::uint64_t previous=0;bool managed=false;
@@ -1137,6 +1191,7 @@ FileIoResult HostFile::write(std::span<const std::uint8_t> bytes,std::uint64_t o
 #endif
 }
 std::uint32_t HostFile::truncate(std::uint64_t size) const {
+    if(null_device_)return 1;
 #if defined(_WIN32)
     (void)size;return 50;
 #else
@@ -1158,6 +1213,7 @@ std::uint32_t HostFile::mutate_size(const std::function<std::uint32_t()>& operat
     return operation();
 }
 std::uint32_t HostFile::set_valid_data(std::uint64_t size) const{
+    if(null_device_)return 1;
     if(readonly_ || !security_writable())return 5;
     if(!size || size>INT64_MAX)return 87;
     return mutate_size([&](){
@@ -1171,64 +1227,91 @@ std::uint32_t HostFile::set_valid_data(std::uint64_t size) const{
     });
 }
 std::uint32_t HostFile::flush() const {
+    if(null_device_)return 1;
 #if defined(_WIN32)
     return 50;
 #else
     const auto result=::fsync(descriptor_);process_io::record(process_io::Kind::Other);return result<0?native_error():0;
 #endif
 }
-std::uint32_t HostFile::lock_conflict(std::uint64_t offset,std::uint64_t length,bool writing) const {
+int HostFile::range_descriptor() {
+#if defined(F_OFD_SETLK)
+    if(lock_descriptor_!=-2)return lock_descriptor_;
+    lock_descriptor_=-1;const auto flags=::fcntl(descriptor_,F_GETFL);if(flags<0)return -1;
+    int candidate=-1;
+#if defined(__APPLE__)
+    std::array<char,4096> path{};
+    if(::fcntl(descriptor_,F_GETPATH,path.data())==0)candidate=::open(path.data(),(flags&O_ACCMODE)|O_CLOEXEC|O_NOFOLLOW);
+#elif defined(__linux__)
+    std::array<char,64> path{};std::snprintf(path.data(),path.size(),"/proc/self/fd/%d",descriptor_);
+    candidate=::open(path.data(),(flags&O_ACCMODE)|O_CLOEXEC);
+#endif
+    if(candidate>=0){struct stat original{},opened{};
+        if(::fstat(descriptor_,&original)==0 && ::fstat(candidate,&opened)==0 && original.st_dev==opened.st_dev && original.st_ino==opened.st_ino)lock_descriptor_=candidate;
+        else ::close(candidate);
+    }
+    // 已刪除或重新命名後無法重新開啟時，仍由同一 Windows 鎖表保護存活物件。
+    // 重新開啟只取得原存取模式且核對 inode，不擴張客體權限或改變資料游標。
+#endif
+    return lock_descriptor_;
+}
+std::uint32_t HostFile::lock_conflict(std::uint64_t offset,std::uint64_t length,bool writing,std::uint32_t key) const {
 #if defined(F_OFD_GETLK)
     if(!length)return 0;
-    if(state_ && state_->shared){if(const auto code=state_->shared->range_conflict(transfer_identity(),offset,length,writing))return code;}
+    if(state_ && state_->shared){if(const auto code=state_->shared->range_conflict(transfer_identity(),offset,length,writing,key))return code;}
     else if(state_)for(const auto& weak:state_->opens)if(const auto peer=weak.lock())for(const auto& held:peer->locks_)
-        if(offset<held.offset+held.length && held.offset<offset+length && (peer.get()==this?writing && !held.exclusive:writing || held.exclusive))return 33;
+        if(offset<held.offset+held.length && held.offset<offset+length && (peer.get()==this && held.key==key?writing && !held.exclusive:writing || held.exclusive))return 33;
     // 共用鎖亦限制持鎖 handle 自己寫入；獨佔鎖允許持鎖者讀寫。
-    if(!state_ && writing && std::any_of(locks_.begin(),locks_.end(),[&](auto lock){return !lock.exclusive && offset<lock.offset+lock.length && lock.offset<offset+length;}))return 33;
+    if(!state_ && std::any_of(locks_.begin(),locks_.end(),[&](const auto& held){return offset<held.offset+held.length && held.offset<offset+length && (held.key==key?writing && !held.exclusive:writing || held.exclusive);}))return 33;
     struct flock lock{};lock.l_type=writing?F_WRLCK:F_RDLCK;lock.l_whence=SEEK_SET;lock.l_start=static_cast<off_t>(offset);lock.l_len=static_cast<off_t>(length);
-    if(::fcntl(descriptor_,F_OFD_GETLK,&lock)<0)return native_error();return lock.l_type==F_UNLCK?0:33;
+    if(::fcntl(lock_descriptor_>=0?lock_descriptor_:descriptor_,F_OFD_GETLK,&lock)<0)return native_error();return lock.l_type==F_UNLCK?0:33;
 #else
-    (void)offset;(void)length;(void)writing;return 0;
+    (void)offset;(void)length;(void)writing;(void)key;return 0;
 #endif
 }
-std::uint32_t HostFile::lock_range(std::uint64_t offset,std::uint64_t length,bool exclusive,bool unlock) {
+std::uint32_t HostFile::lock_range(std::uint64_t offset,std::uint64_t length,bool exclusive,bool unlock,std::uint32_t key) {
+    if(null_device_)return 0;
 #if defined(F_OFD_SETLK)
     if(!length || offset>INT64_MAX || length>UINT64_MAX-offset)return 87;
     const auto conflict=[&](const auto& lock){return offset<lock.offset+lock.length && lock.offset<offset+length;};
     const auto native=[&]()->std::uint32_t {
-    const auto found=unlock?std::find_if(locks_.begin(),locks_.end(),[&](auto lock){return lock.offset==offset && lock.length==length;}):locks_.end();
-    if(unlock && found==locks_.end())return 158;
-    const bool native_exclusive=unlock?found->exclusive:exclusive;
-    const auto flags=::fcntl(descriptor_,F_GETFL);if(flags<0)return native_error();
-    const auto access=flags&O_ACCMODE;
-    // Windows 允許唯讀 handle 持獨佔鎖；Sandbox 的共用紀錄保留完整契約。
-    // 原始 inode 鎖仍保護可對應的宿主讀寫，不替客體擴張檔案存取權。
-    const bool skip=!native_exclusive && access==O_WRONLY;
-    const auto type=native_exclusive && access!=O_RDONLY?F_WRLCK:F_RDLCK;
-    if((skip || (native_exclusive && access==O_RDONLY)) && !state_)return 6;
+    auto index=locks_.size();
+    if(unlock)for(std::size_t i=0;i<locks_.size();++i)if(locks_[i].offset==offset && locks_[i].length==length && locks_[i].key==key){index=i;if(locks_[i].exclusive)break;}
+    if(unlock && index==locks_.size())return 158;
     if(!unlock){
-        if(std::any_of(locks_.begin(),locks_.end(),[&](auto lock){return conflict(lock) && (exclusive || lock.exclusive);} ))return 33;
+        if(std::any_of(locks_.begin(),locks_.end(),[&](const auto& held){return conflict(held) && (exclusive || (held.exclusive && held.key!=key));}))return 33;
         if(state_ && !state_->shared)for(const auto& weak:state_->opens)if(const auto peer=weak.lock())if(peer.get()!=this)
             for(const auto& held:peer->locks_)if(conflict(held) && (exclusive || held.exclusive))return 33;
         if(locks_.size()>=1024)return 8;
-        struct flock lock{};lock.l_type=static_cast<decltype(lock.l_type)>(type);lock.l_whence=SEEK_SET;lock.l_start=static_cast<off_t>(offset);lock.l_len=length>static_cast<std::uint64_t>(INT64_MAX)-offset?0:static_cast<off_t>(length);
-        if(!skip && ::fcntl(descriptor_,F_OFD_SETLK,&lock)<0)return errno==EAGAIN || errno==EACCES?33:native_error();
-        locks_.push_back({offset,length,exclusive});return 0;
+        if(locks_.size()==locks_.capacity())locks_.reserve(std::min<std::size_t>(1024,std::max<std::size_t>(4,locks_.size()*2)));
     }
-    // 僅解除未被其他共用鎖覆蓋的區段，避免先全解鎖再重鎖的競態。
-    std::vector<std::pair<std::uint64_t,std::uint64_t>> covered;
-    for(auto it=locks_.begin();it!=locks_.end();++it)if(it!=found && conflict(*it))covered.emplace_back(std::max(offset,it->offset),std::min(offset+length,it->offset+it->length));
-    std::sort(covered.begin(),covered.end());covered.emplace_back(offset+length,offset+length);auto begin=offset;
-    for(auto [low,high]:covered){if(low>begin && !skip){struct flock lock{};lock.l_type=F_UNLCK;lock.l_whence=SEEK_SET;lock.l_start=static_cast<off_t>(begin);lock.l_len=low>static_cast<std::uint64_t>(INT64_MAX)?0:static_cast<off_t>(low-begin);if(::fcntl(descriptor_,F_OFD_SETLK,&lock)<0)return native_error();}begin=std::max(begin,high);}
-    locks_.erase(found);return 0;
+    const auto independent=range_descriptor(),fd=independent>=0?independent:state_?-1:descriptor_;
+    if(fd>=0){
+        const auto flags=::fcntl(fd,F_GETFL);if(flags<0)return native_error();const auto access=flags&O_ACCMODE;
+        const auto type=[&](unsigned level){return !level || (level==1 && access==O_WRONLY)?F_UNLCK:level==2 && access!=O_RDONLY?F_WRLCK:F_RDLCK;};
+        if(!state_ && ((exclusive && access==O_RDONLY) || (!exclusive && access==O_WRONLY)))return 6;
+        // 只修改本次範圍內有差異的區段，保留較強的鎖；解除獨佔後仍保有重疊共用鎖。
+        std::vector<std::uint64_t> points;points.reserve(2+2*locks_.size());points.push_back(offset);points.push_back(offset+length);
+        for(const auto& held:locks_)if(conflict(held)){points.push_back(std::max(offset,held.offset));points.push_back(std::min(offset+length,held.offset+held.length));}
+        std::sort(points.begin(),points.end());points.erase(std::unique(points.begin(),points.end()),points.end());
+        struct Change {std::uint64_t begin,end;int before,after;};std::vector<Change> changes;changes.reserve(points.size());
+        for(std::size_t p=1;p<points.size();++p){unsigned before=0,after=unlock?0:exclusive?2:1;
+            for(std::size_t i=0;i<locks_.size();++i){const auto& held=locks_[i];if(points[p-1]<held.offset+held.length && held.offset<points[p]){before=std::max(before,held.exclusive?2U:1U);if(!unlock || i!=index)after=std::max(after,held.exclusive?2U:1U);}}
+            if(type(before)!=type(after))changes.push_back({points[p-1],points[p],type(before),type(after)});
+        }
+        const auto apply=[&](const Change& change,int value){if(change.begin>INT64_MAX)return 0;struct flock lock{};lock.l_type=static_cast<decltype(lock.l_type)>(value);lock.l_whence=SEEK_SET;lock.l_start=static_cast<off_t>(change.begin);lock.l_len=change.end>INT64_MAX?0:static_cast<off_t>(change.end-change.begin);return ::fcntl(fd,F_OFD_SETLK,&lock);};
+        for(std::size_t i=0;i<changes.size();++i)if(apply(changes[i],changes[i].after)<0){const auto error=errno==EAGAIN || errno==EACCES?33:native_error();while(i){--i;(void)apply(changes[i],changes[i].before);}return error;}
+    }
+    if(unlock)locks_.erase(locks_.begin()+static_cast<std::ptrdiff_t>(index));else locks_.push_back({offset,length,exclusive,key});return 0;
     };
-    if(state_ && state_->shared)return state_->shared->range_lock(transfer_identity(),offset,length,exclusive,unlock,native);
+    if(state_ && state_->shared)return state_->shared->range_lock(transfer_identity(),offset,length,exclusive,unlock,native,false,key);
     return native();
 #else
-    (void)offset;(void)length;(void)exclusive;(void)unlock;return 50;
+    (void)offset;(void)length;(void)exclusive;(void)unlock;(void)key;return 50;
 #endif
 }
 std::uint32_t HostFile::set_times(std::uint64_t created,std::uint64_t accessed,std::uint64_t modified) const {
+    if(null_device_)return 1;
 #if defined(_WIN32)
     (void)created;(void)accessed;(void)modified;return 50;
 #else
@@ -1249,6 +1332,18 @@ std::uint32_t HostFile::set_times(std::uint64_t created,std::uint64_t accessed,s
 }
 OpenHostFile ReadOnlyFiles::open_host(std::string path,std::uint32_t access,std::uint32_t disposition,std::uint32_t flags_value,std::uint32_t sharing,const std::function<std::vector<std::uint8_t>()>& creation,const std::function<OpenHostFile()>& file_template) try {
     security::NativeFileIdentityScope identity_scope;
+    if(windows_null_device(utf8_to_utf16(path))){
+        if(disposition<1 || disposition>5 || (sharing&~7U))return {{},{},{},87,false};
+#if defined(_WIN32)
+        return {{},{},{},50,false};
+#else
+        // 每次開啟有獨立物件；宿主 null fd 只用於既有關閉／跨程序能力傳遞，沒有內容快取。
+        FileDescriptor owned{::open("/dev/null",O_RDWR|O_CLOEXEC)};if(owned.value<0)return {{},{},{},native_error(),false};
+        auto file=std::make_shared<HostFile>(owned.value);owned.value=-1;file->null_device_=true;file->access_=access;file->sharing_=sharing;
+        const auto info=file->information();if(info.error)return {{},{},{},info.error,false};
+        return {"null-device",std::move(file),info.metadata,0,true};
+#endif
+    }
     if(!writable_)return {{},{},{},50,false};
     if(flags_value&0x00200000U){const auto point=reparse(path);if(!point.error)return {{},{},{},50,true};}
     const auto followed=follow_reparse(path);if(followed.second && followed.second!=50)return {{},{},{},followed.second,false};
@@ -1748,7 +1843,8 @@ std::uint32_t ReadOnlyFiles::rename(std::string from,std::string to,bool replace
         if(const auto error=sharing_error(metadata(existing),0x10000U,7))return error;
     }
     struct Relocation {std::shared_ptr<HostDeleteTarget> original,replacement;};std::vector<Relocation> relocations;
-    if(const auto state=file_state(original_metadata))for(const auto& entry:state->targets) {
+    const auto state=file_state(original_metadata);
+    if(state)for(const auto& entry:state->targets) {
         if(entry->leaf!=from_name || entry->parent_device!=static_cast<std::uint64_t>(first_info.st_dev) || entry->parent_inode!=static_cast<std::uint64_t>(first_info.st_ino))continue;
         auto replacement=std::make_shared<HostDeleteTarget>();replacement->leaf=to_name;replacement->directory=::fcntl(second.value,F_DUPFD_CLOEXEC,0);
         if(replacement->directory<0)return native_error();replacement->parent_device=static_cast<std::uint64_t>(second_info.st_dev);replacement->parent_inode=static_cast<std::uint64_t>(second_info.st_ino);
@@ -1764,6 +1860,7 @@ std::uint32_t ReadOnlyFiles::rename(std::string from,std::string to,bool replace
 #endif
     } else moved=::renameat(first.value,from_name.c_str(),second.value,to_name.c_str());
     return moved==0?0U:native_error();};
+    const auto relocate=[&]()->std::uint32_t {
     if(different_volume){move_error=17;if(!copy_allowed)return move_error;}
     else if(source.volume && target.volume)move_error=volumes_->relocate_folders(source.volume,source.volume_path,target.volume,target.volume_path,true,native_move,[&]{
 #if defined(__APPLE__)
@@ -1774,6 +1871,9 @@ std::uint32_t ReadOnlyFiles::rename(std::string from,std::string to,bool replace
         return ::renameat(second.value,to_name.c_str(),first.value,from_name.c_str())<0?native_error():0U;
 #endif
     });else move_error=native_move();
+    return move_error;
+    };
+    move_error=state && state->shared?state->shared->relocate_targets(first.value,from_name,second.value,to_name,original_metadata,relocate):relocate();
     if(move_error && move_error!=17)return move_error;
     if(moved==0) {
         if(!image_key.empty()) {

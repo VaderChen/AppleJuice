@@ -441,10 +441,15 @@ int main(int argc, char** argv) {
                          << " hard=" << host_files.maximum << '\n';
         *diagnostics<<"cross_architecture host_page_size="<<host_page_size()<<" hardware_tso="<<enter_hardware_tso()<<'\n'
                     <<"apflg enabled="<<hardware_apflg_enabled()<<'\n';diagnostics->flush();
-        const auto pe_bytes = (command == "run-pe" || inspection || comparison) ?
+        auto pe_bytes = (command == "run-pe" || inspection || comparison) ?
             read_pe_snapshot(argv[2],comparison?GuestMemory::capacity_limit:std::size_t{2}*1024*1024*1024) : PeFileBytes{};
-        const auto raw_bytes = pe_bytes ? std::vector<std::uint8_t>{} : read_raw_file(argv[2]);
-        const auto bytes = pe_bytes ? std::span<const std::uint8_t>{*pe_bytes} : std::span<const std::uint8_t>{raw_bytes};
+        auto raw_bytes = pe_bytes ? std::vector<std::uint8_t>{} : read_raw_file(argv[2]);
+        auto bytes = pe_bytes ? std::span<const std::uint8_t>{*pe_bytes} : std::span<const std::uint8_t>{raw_bytes};
+        const auto release_source = [&] {
+            // 載入器已持有映像及匯入資料；不把完整來源（含未映射 overlay）留到客體退出。
+            // 僅釋放 CLI 的引用，仍由既有有界 PE 快取決定可重用快照的生命週期。
+            bytes={};pe_bytes.reset();std::vector<std::uint8_t>{}.swap(raw_bytes);
+        };
         const bool pe = command == "run-pe" || inspection || (comparison && bytes.size() >= 2 && bytes[0] == 'M' && bytes[1] == 'Z');
         if (pe) {
             for (const auto option : {"--load-address", "--entry", "--stack-address", "--stack-size"})
@@ -457,6 +462,7 @@ int main(int argc, char** argv) {
             if(pe_options.resident_translation && host_clock && !seen.contains("--max-instructions"))
                 run.max_instructions=UINT64_MAX;
             auto program = load_pe(bytes, pe_options);
+            release_source();
             if(!process_session.empty())program.services.set_mapping_session(process_session,process_session_descriptor);
             *diagnostics<<"cfg_guard fast_path="<<program.services.uses_guard_fast_path()<<'\n';
             if (program.memory.execution_mode() == ExecutionMode::X86) run.sentinel = GuestAddress{0x7ffffff0};
@@ -577,6 +583,7 @@ int main(int argc, char** argv) {
             if (!seen.contains(required)) throw std::invalid_argument(std::string("raw 檔必須指定 ") + required);
         if(jit && !comparison && !seen.contains("--max-instructions"))run.max_instructions=UINT64_MAX;
         auto program = prepare_raw(bytes, config);
+        release_source();
         if (comparison) return compare(program.state, std::move(program.memory), run, nullptr, dump);
         const auto result = execute(jit, program.state, program.memory, run, dump, std::cout);
         std::cout << format_result(result, program.state);

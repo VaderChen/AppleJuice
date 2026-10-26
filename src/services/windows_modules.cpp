@@ -12,6 +12,7 @@
 #include "x64arm/windows_unwind.hpp"
 #include "x64arm/windows_api_sets.hpp"
 #include "x64arm/windows_sdk_modules.hpp"
+#include "x64arm/retained_capacity.hpp"
 #include <algorithm>
 #include <charconv>
 #include <sstream>
@@ -207,7 +208,8 @@ void WindowsServices::initialize_thread_module_tls(GuestMemory& memory,std::uint
         memory.store(GuestAddress{vector+module.tls_slot*(x86_?4U:8U)},x86_?32:64,tls);
     }
 }
-std::uint64_t WindowsServices::module_export(GuestMemory& memory,std::uint64_t handle,std::string_view symbol,std::optional<std::uint16_t> ordinal,std::vector<std::uint64_t>& created,unsigned depth) {
+#include "windows_module_file.inc"
+std::uint64_t WindowsServices::module_export(GuestMemory& memory,std::uint64_t handle,std::string_view symbol,std::optional<std::uint16_t> ordinal,std::vector<std::uint64_t>& created,unsigned depth,GuestState* state) {
     if(depth>=32)throw ModuleError(127,"DLL export forwarder 循環或超過深度");
     const auto* image=module_image(handle);
     if(!image || runtime_.builtin_images.contains(handle)) {
@@ -234,19 +236,19 @@ std::uint64_t WindowsServices::module_export(GuestMemory& memory,std::uint64_t h
         const auto value=forward->second;const auto dot=value.find_last_of('.');
         if(dot==value.npos)throw ModuleError(193,"DLL forwarder 格式不合法");
         auto name=value.substr(0,dot);if(!name.ends_with(".dll"))name+=".dll";
-        const auto target=load_module(memory,utf8_to_utf16(name),0,created);
+        const auto target=load_module(memory,utf8_to_utf16(name),0,created,{},state);
         if(handle==runtime_.image.base)runtime_.main_dependencies.insert(target);else runtime_.loaded_modules.at(handle).dependencies.insert(target);
         auto exported=value.substr(dot+1);std::optional<std::uint16_t> index;
         if(exported.starts_with('#')) {
             unsigned parsed=0;const auto first=exported.data()+1,last=exported.data()+exported.size();const auto conversion=std::from_chars(first,last,parsed);
             if(conversion.ec!=std::errc{} || conversion.ptr!=last || parsed>65535)throw ModuleError(193,"forwarder ordinal 不合法");index=static_cast<std::uint16_t>(parsed);
         }
-        return module_export(memory,target,exported,index,created,depth+1);
+        return module_export(memory,target,exported,index,created,depth+1,state);
     }
     const auto found=image->export_ordinals.find(number);if(found==image->export_ordinals.end())throw ModuleError(127,"找不到序號匯出");
     return image->base+found->second;
 }
-std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string requested,std::uint32_t flags,std::vector<std::uint64_t>& created,std::u16string_view search_directory) {
+std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string requested,std::uint32_t flags,std::vector<std::uint64_t>& created,std::u16string_view search_directory,GuestState* state) {
     if(requested.empty())throw ModuleError(87,"DLL 名稱為空");
     // 明確的 LOAD_LIBRARY_SEARCH 旗標覆蓋程序預設值，相依 DLL 沿用同一搜尋政策。
     if(!(flags&0x1f08))flags|=runtime_.default_dll_directories;
@@ -263,16 +265,16 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
     const bool redistributable=name=="msvcp140.dll" || name=="msvcp140_1.dll" || name=="vcruntime140.dll" || name=="vcruntime140_1.dll";
     if(bare && redistributable && (!(flags&0xf00) || (flags&0x200))) {
         const auto local=runtime_.application_directory+requested;
-        const auto source=filesystem_.open_library(utf16_to_utf8(local),runtime_.application_source,utf16_to_utf8(runtime_.application_directory));
-        if(!source.error)return load_module(memory,local,flags,created,search_directory);
+        auto source=read_module_file(state,memory,local);
+        if(!source.error){source.bytes.reset();return load_module(memory,local,flags,created,search_directory,state);}
         // 未提供客體搜尋根時仍可使用內建 CRT；真正的 ACL／traversal 拒絕不可降級。
         const bool unavailable=source.error==5 && !source.access_denied;
         if(source.error!=2 && source.error!=3 && !unavailable)throw ModuleError(source.error,"無法讀取 app-local 執行階段："+name);
     }
     if((bare || key=="c:\\windows\\system32\\"+name || (angle_module(name) && native_angle_)) && builtin_module(name)) {
         if(runtime_.signature_policy && native_library_module(name))throw ModuleError(577,"原生第三方模組不符合程序簽章政策");
-        if(const auto host=windows_api_set_host(name);host!=name){const auto base=load_module(memory,utf8_to_utf16(host),flags,created);runtime_.modules.emplace(name,base);return base;}
-        if(name.starts_with("api-ms-win-crt-")){const auto base=load_module(memory,u"ucrtbase.dll",flags,created);runtime_.modules.emplace(name,base);return base;}
+        if(const auto host=windows_api_set_host(name);host!=name){const auto base=load_module(memory,utf8_to_utf16(host),flags,created,{},state);runtime_.modules.emplace(name,base);return base;}
+        if(name.starts_with("api-ms-win-crt-")){const auto base=load_module(memory,u"ucrtbase.dll",flags,created,{},state);runtime_.modules.emplace(name,base);return base;}
         if(runtime_.builtin_images.size()>=windows_address_layout::module_slots)throw ModuleError(8,"內建模組數量超過固定容量");
         // 每個引擎版本共用固定模組配置，與各程序載入順序無關。
         static const auto bases=[] {std::set<std::string> names{"kernel32.dll","wsock32.dll"};for(const auto name:modern_crt_libraries)names.emplace(name);for(const auto name:legacy_crt_libraries)names.emplace(name);for(const auto& item:runtime_service_descriptors())if(item.family.ends_with(".dll") || item.family.ends_with(".drv") || item.family.ends_with(".ocx") || item.family.ends_with(".cpl") || item.family.ends_with(".exe"))names.emplace(item.family);std::map<std::string,std::size_t> result;for(const auto& item:names)result.emplace(item,result.size());return result;}();
@@ -308,7 +310,7 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
     FileSnapshot source;source.error=126;
     bool access_denied=false;
     for(const auto& candidate:candidates) {
-        source=filesystem_.open_library(utf16_to_utf8(candidate),runtime_.application_source,utf16_to_utf8(runtime_.application_directory));
+        source=read_module_file(state,memory,candidate);
         if(!source.error)break;
         access_denied|=source.access_denied;
         if(source.error!=2 && source.error!=3 && source.error!=5)throw ModuleError(source.error,"無法讀取 DLL");
@@ -343,6 +345,8 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
         source.source,image_identity(source.source,*source.bytes),parsed.metadata.loaded_base,
         parsed.metadata.preferred_base,parsed.metadata.image_size};
 #endif
+    // 檔案原始位元組只用到解析與身分核對；相依 DLL 載入前歸還本次讀取額度。
+    source.bytes.reset();
     if(resource_only) {
         map_pe_image(memory,parsed);
         for(const auto& region:parsed.mappings)module.mappings.emplace_back(base+region.rva,region.bytes.size());
@@ -367,7 +371,7 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
         const auto altered=(flags&0x108)?directory(guest):std::u16string(search_directory);
         bind_pe_imports(memory,parsed,[&](const PeImport& imported) {
             const auto count=created.size();std::uint64_t dependency=0;
-            try{dependency=load_module(memory,utf8_to_utf16(imported.dll),flags,created,altered);}
+            try{dependency=load_module(memory,utf8_to_utf16(imported.dll),flags,created,altered,state);}
             catch(const ModuleError& error){
                 // 明確選用 trap 時，只將未提供的 SDK 系統 API 綁到會停止的入口。
                 // 真實 DLL 的遞迴依賴失敗不得被轉成 trap，也不建立虛構 provider。
@@ -376,7 +380,7 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
                 throw;
             }
             loaded.dependencies.insert(dependency);
-            try{return GuestAddress{module_export(memory,dependency,imported.symbol,imported.by_ordinal?std::optional{imported.ordinal}:std::nullopt,created)};}
+            try{return GuestAddress{module_export(memory,dependency,imported.symbol,imported.by_ordinal?std::optional{imported.ordinal}:std::nullopt,created,0,state)};}
             catch(const ModuleError&) {
                 if((!module_image(dependency) || runtime_.builtin_images.contains(dependency)) && runtime_.trap_unresolved_imports)return bind_import(imported.dll,imported.by_ordinal?"#"+std::to_string(imported.ordinal):imported.symbol,true);
                 throw;
@@ -551,6 +555,14 @@ bool WindowsServices::await_loader(GuestState& state,GuestMemory& memory) {
 }
 std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     if(await_loader(state,memory))return std::nullopt;
+    // 檔案回呼可等待／重入；載入鎖涵蓋來源讀取、映射、匯入與操作交接。
+    // DllMain／TLS 的非同步部分由既有 ModuleOperation 接續持有自己的深度。
+    if(runtime_.loader_depth==UINT32_MAX)throw HostCallFault("loader lock 遞迴深度溢位");
+    runtime_.loader_owner=threads_.current;++runtime_.loader_depth;
+    publish_loader_lock(memory,peb_base_.value,x86_,thread_identifier(runtime_.loader_owner),runtime_.loader_depth);
+    struct LoaderScope {WindowsServices& self;GuestMemory& memory;
+        ~LoaderScope(){if(self.runtime_.loader_depth && !--self.runtime_.loader_depth)self.runtime_.loader_owner=0;
+            publish_loader_lock(memory,self.peb_base_.value,self.x86_,self.thread_identifier(self.runtime_.loader_owner),self.runtime_.loader_depth);}} scope{*this,memory};
     const WindowsCall call(state,memory,service);const auto arg=[&](unsigned i){return call(i);};
     const auto symbol=service.symbol.starts_with("K32")?service.symbol.substr(3):service.symbol;const bool wide=symbol.ends_with('W');std::uint64_t result=0;
     std::vector<std::uint64_t> created;
@@ -641,7 +653,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,Gu
             auto name=read_name(memory,arg(0),wide);
             if((flags&0x100) && !(name.size()>=3 && name[1]==u':' && (name[2]==u'\\' || name[2]==u'/')))throw ModuleError(87,"DLL_LOAD_DIR 必須指定完整路徑");
             if(flags&0x1000)flags=(flags&~0x1000U)|0xe00;
-            const auto handle=load_module(memory,std::move(name),flags,created);
+            const auto handle=load_module(memory,std::move(name),flags,created,{},&state);
             if(auto found=runtime_.loaded_modules.find(handle);found!=runtime_.loaded_modules.end())++found->second.references;
             ModuleOperation operation;operation.created=std::move(created);operation.result=handle;
             return start_module_operation(state,memory,std::move(operation));
@@ -655,7 +667,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,Gu
             else {
                 const auto name=read_name(memory,pointer,wide);result=find_module(name);
                 const auto key=module_key(name);
-                if(!result && key.find('\\')==key.npos && builtin_module(key))result=load_module(memory,name,0,created);
+                if(!result && key.find('\\')==key.npos && builtin_module(key))result=load_module(memory,name,0,created,{},&state);
             }
             if(extended) {
                 memory.store(GuestAddress{arg(2)},x86_?32:64,result);
@@ -666,7 +678,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,Gu
         }else if(symbol=="GetProcAddress") {
             const auto ordinal=arg(1)<=65535?std::optional{static_cast<std::uint16_t>(arg(1))}:std::nullopt;
             const auto name=ordinal?std::string{}:read_string(memory,arg(1));
-            const auto address=module_export(memory,arg(0),name,ordinal,created);
+            const auto address=module_export(memory,arg(0),name,ordinal,created,0,&state);
             ModuleOperation operation;operation.created=std::move(created);operation.result=address;
             return start_module_operation(state,memory,std::move(operation));
         }else if(symbol=="DisableThreadLibraryCalls") {

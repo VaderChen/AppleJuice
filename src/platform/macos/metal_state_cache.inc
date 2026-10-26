@@ -36,6 +36,20 @@ id<MTLDepthStencilState> cached_depth_state(MTLDepthStencilDescriptor* descripto
     auto state=[device_ newDepthStencilStateWithDescriptor:descriptor];if(!state)throw std::bad_alloc{};++depth_state_builds_;
     if(cached)depth_states_.put(state_cache_key(key),state);return state;
 }
+// 純值版本：鍵與上面相同，只在未命中時建立描述物件（繪圖熱路徑每次繪製都會查詢）。
+id<MTLDepthStencilState> cached_depth_state(const MetalDepthSpec& spec){
+    if(!immutable_state_cache_enabled())return cached_depth_state(spec.make());
+    std::array<std::uint64_t,16> key{};key[0]=spec.depthCompareFunction;key[1]=spec.depthWriteEnabled;
+    for(unsigned face=0;face<2;++face){
+        const auto& stencil=face?spec.backFaceStencil:spec.frontFaceStencil;const auto offset=2+7*face;
+        key[offset]=1;key[offset+1]=stencil.stencilCompareFunction;key[offset+2]=stencil.stencilFailureOperation;
+        key[offset+3]=stencil.depthFailureOperation;key[offset+4]=stencil.depthStencilPassOperation;
+        key[offset+5]=stencil.readMask;key[offset+6]=stencil.writeMask;
+    }
+    if(const auto found=depth_states_.get(state_cache_key(key))){++depth_state_hits_;return *found;}
+    auto state=[device_ newDepthStencilStateWithDescriptor:spec.make()];if(!state)throw std::bad_alloc{};++depth_state_builds_;
+    depth_states_.put(state_cache_key(key),state);return state;
+}
 std::shared_ptr<MetalSampler> cached_sampler(MTLSamplerDescriptor* descriptor){
     const bool cached=immutable_state_cache_enabled() && !descriptor.label;
     std::array<std::uint64_t,16> key{};

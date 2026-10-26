@@ -697,6 +697,7 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
     memory.store(GuestAddress{teb_base_.value + 0x40}, 64, process_id()); memory.store(GuestAddress{teb_base_.value + 0x48}, 64, 1);
     memory.store(GuestAddress{teb_base_.value + 0x60}, 64, peb_base_.value);
     memory.store(GuestAddress{peb_base_.value + 0x10}, 64, runtime_.image.base);
+    memory.store(GuestAddress{peb_base_.value + 0xb8}, 32, std::max(1U, runtime_.processor_count)); // NumberOfProcessors
     // RTL_USER_PROCESS_PARAMETERS64：供靜態 CRT 與原生 Win32 程式讀取程序資料。
     const auto parameters=runtime_allocate(memory,{},0x448);memory.store(GuestAddress{peb_base_.value+0x20},64,parameters);
     memory.store(GuestAddress{parameters},32,0x448);memory.store(GuestAddress{parameters+4},32,0x448);memory.store(GuestAddress{parameters+8},32,1);
@@ -918,6 +919,8 @@ namespace {
 // 其後以 256-byte 級距到 64 KiB；含對齊標頭的 497 個串列頭仍容納於原狀態頁。
 using namespace detail::guest_heap_layout;
 static_assert(guest_heap_class(guest_heap_limit+guest_heap_aligned_header)*8+0x40+8<=GuestMemory::guest_page_size,"配置區串列頭須容納於狀態頁");
+static_assert(GUEST_CRT_TABLE_OFFSET+1024<=guest_heap_cache_offset && guest_heap_cache_offset+(guest_heap_cache_classes+1)*8<=guest_heap_cache_count_offset &&
+              guest_heap_cache_count_offset+guest_heap_cache_classes+1<=GUEST_CRT_ERRNO_OFFSET,"每執行緒級距快取須位於 TEB CRT 私有頁的空白區");
 std::uint64_t guest_heap_request_limit() {
     static const bool medium=[] {const auto* setting=std::getenv("X64ARM_GUEST_HEAP_MEDIUM");
         return !setting || std::string_view(setting)!="0";}();
@@ -1004,7 +1007,7 @@ bool WindowsServices::guest_heap_setup(GuestMemory& memory) {
         const auto state=GuestAddress{callback_return_.value+guest_heap_state_page_offset};
         std::vector<std::uint8_t> page(GuestMemory::guest_page_size,0);
         const auto put=[&](unsigned at,std::uint64_t value){for(unsigned n=0;n<8;++n)page[at+n]=static_cast<std::uint8_t>(value>>(8*n));};
-        put(8,base);put(16,guest_heap_reservation);put(24,guest_heap_request_limit());
+        put(8,base);put(16,0);put(24,guest_heap_request_limit()); // +16 已建立長度，隨補充增加
         memory.map(state,GuestMemory::guest_page_size,read_write,page);
         runtime_.virtual_regions.emplace(base,VirtualRegion{guest_heap_reservation,4U});
         guest_heap_state_=state;guest_heap_base_=base;guest_heap_size_=guest_heap_reservation;guest_heap_next_=base;
@@ -1028,9 +1031,13 @@ std::uint64_t WindowsServices::guest_heap_allocate(GuestMemory& memory, std::uin
     const auto cls=guest_heap_class(size),block=guest_heap_class_size(cls);
     // 新 chunk：標頭（+24 擁有者，process heap 為 0）＋整段空閒鏈一次映射；第一個區塊直接回傳，其餘成為級距串列。
     const auto fill=[&](std::uint64_t owner)->std::uint64_t {
-        const bool room=guest_heap_chunked_ || guest_heap_next_+guest_heap_chunk<=guest_heap_base_+guest_heap_size_;
-        const auto chunk=room && memory.remaining_capacity()>=guest_heap_chunk?
-            (guest_heap_chunked_?guest_heap_reserve_chunk(memory):guest_heap_next_):0;
+        if(memory.remaining_capacity()<guest_heap_chunk)return 0;
+        std::uint64_t chunk=0;
+        if(guest_heap_chunked_)chunk=guest_heap_reserve_chunk(memory);
+        // x64 預留區內若已有其他映射，視為配置區用盡（回退一般 heap）：配置區只涵蓋自起點連續建立的 chunk，
+        // 客體常式與 guest_heap_contains 的範圍檢查才不會碰到外來映射。
+        else if(guest_heap_next_+guest_heap_chunk<=guest_heap_base_+guest_heap_size_ &&
+                memory.range_available(GuestAddress{guest_heap_next_},guest_heap_chunk))chunk=guest_heap_next_;
         if(!chunk)return 0;
         std::vector<std::uint8_t> image(guest_heap_chunk,0);
         const auto put=[&](std::uint64_t at,std::uint64_t value){for(unsigned n=0;n<8;++n)image[at+n]=static_cast<std::uint8_t>(value>>(8*n));};
@@ -1038,7 +1045,8 @@ std::uint64_t WindowsServices::guest_heap_allocate(GuestMemory& memory, std::uin
         const auto count=(guest_heap_chunk-guest_heap_header)/block;
         for(std::uint64_t i=0;i+1<count;++i)put(guest_heap_header+i*block,chunk+guest_heap_header+(i+1)*block);
         memory.map(GuestAddress{chunk},guest_heap_chunk,read_write,image);
-        if(!guest_heap_chunked_)guest_heap_next_+=guest_heap_chunk;
+        // 狀態頁 +16 是已建立範圍的長度（客體常式以此判斷指標是否屬於配置區）。
+        if(!guest_heap_chunked_){guest_heap_next_+=guest_heap_chunk;memory.store(GuestAddress{guest_heap_state_.value+16},64,guest_heap_next_-guest_heap_base_);}
         return chunk+guest_heap_header;
     };
     if(heap!=process_heap){
@@ -1047,7 +1055,8 @@ std::uint64_t WindowsServices::guest_heap_allocate(GuestMemory& memory, std::uin
         if(!guest_heap_chunked_ || found==guest_private_heaps_.end() || found->second.heads.size()<=cls)return 0;
         auto& head=found->second.heads[cls];
         auto result=head?head:fill(heap);
-        if(result){head=memory.load(GuestAddress{result},64);++guest_heap_mutations_;}
+        // 首 8 bytes 是空閒串列指標；取出後清零，未用過的區塊全為零（與一般 heap 新區塊相同）。
+        if(result){head=memory.load(GuestAddress{result},64);memory.store(GuestAddress{result},64,0);++guest_heap_mutations_;}
         return result;
     }
     const GuestAddress lock{guest_heap_state_.value},head{guest_heap_state_.value+guest_heap_heads+cls*8};
@@ -1059,7 +1068,7 @@ std::uint64_t WindowsServices::guest_heap_allocate(GuestMemory& memory, std::uin
     try{
         result=memory.load(head,64);
         if(!result)result=fill(0);
-        if(result){memory.store(head,64,memory.load(GuestAddress{result},64));++guest_heap_mutations_;}
+        if(result){memory.store(head,64,memory.load(GuestAddress{result},64));memory.store(GuestAddress{result},64,0);++guest_heap_mutations_;}
     }catch(...){memory.store(lock,32,0);throw;}
     memory.store(lock,32,0);
     return result;
@@ -1128,7 +1137,7 @@ const std::vector<std::pair<std::uint64_t,std::uint64_t>>& WindowsServices::gues
     const auto owner=heap==process_heap?0:heap;
     std::vector<std::uint64_t> chunks;std::uint64_t total=0;
     const auto add_chunk=[&](std::uint64_t chunk){
-        if(memory.load(GuestAddress{chunk},64)!=guest_heap_magic)return;
+        if(!memory.mapped(GuestAddress{chunk}) || memory.load(GuestAddress{chunk},64)!=guest_heap_magic)return;
         const auto block=memory.load(GuestAddress{chunk+16},64);if(!block || memory.load(GuestAddress{chunk+24},64)!=owner)return;
         chunks.push_back(chunk);total+=(guest_heap_chunk-guest_heap_header)/block;
     };
@@ -1148,6 +1157,16 @@ const std::vector<std::pair<std::uint64_t,std::uint64_t>>& WindowsServices::gues
             collect(memory.load(GuestAddress{guest_heap_state_.value+guest_heap_heads+cls*8},64));}
         catch(...){memory.store(lock,32,0);throw;}
         memory.store(lock,32,0);
+        // x64 各執行緒級距快取中的區塊同屬空閒。其他執行緒可能正在改自己的快取（只影響走訪結果），
+        // 只跟隨配置區內已映射的指標，且每級距不超過上限，讀到不一致的串列不會越界或無窮迴圈。
+        if(!x86_)for(const auto& [id,thread]:threads_.items){(void)id;
+            if(!thread.teb || !memory.mapped(GuestAddress{thread.teb+guest_heap_cache_offset}))continue;
+            for(std::uint64_t cls=1;cls<=guest_heap_cache_classes;++cls){
+                auto at=memory.load(GuestAddress{thread.teb+guest_heap_cache_offset+cls*8},64);
+                for(unsigned n=0;at && n<=guest_heap_cache_limit && guest_heap_contains(at) && memory.mapped(GuestAddress{at});++n){
+                    free.insert(at);at=memory.load(GuestAddress{at},64);}
+            }
+        }
     }else if(const auto found=guest_private_heaps_.find(heap);found!=guest_private_heaps_.end())
         for(const auto at:found->second.heads)collect(at);
     for(const auto chunk:chunks){
@@ -1163,6 +1182,24 @@ const std::vector<std::pair<std::uint64_t,std::uint64_t>>& WindowsServices::gues
     std::sort(guest_heap_walk_free_.begin(),guest_heap_walk_free_.end());
     guest_heap_walk_generation_=guest_heap_chunked_?guest_heap_mutations_:UINT64_MAX;guest_heap_walk_heap_=heap;
     return guest_heap_walk_blocks_;
+}
+void WindowsServices::guest_heap_flush_thread_cache(GuestMemory& memory, std::uint64_t teb) {
+    // 執行緒結束、TEB 回收前：把級距快取的區塊依序推回全域串列（配置區鎖內），避免 TEB 回收後永久遺失。
+    // 鎖長時間取不到時保留區塊不歸還（只少回收這些記憶體），不讓結束流程失敗。
+    if(x86_ || !guest_heap_base_ || !guest_heap_state_.value || !teb || !memory.mapped(GuestAddress{teb+guest_heap_cache_offset}))return;
+    const GuestAddress lock{guest_heap_state_.value};bool locked=false;
+    for(std::uint64_t n=0;n<(UINT64_C(1)<<24) && !locked;++n)locked=memory.atomic_rmw(lock,32,GuestMemory::AtomicRmw::CompareExchange,1,0)==0;
+    if(!locked)return;
+    try{
+        for(std::uint64_t cls=1;cls<=guest_heap_cache_classes;++cls){
+            const GuestAddress cache{teb+guest_heap_cache_offset+cls*8},head{guest_heap_state_.value+guest_heap_heads+cls*8};
+            auto at=memory.load(cache,64);
+            for(unsigned n=0;at && n<=guest_heap_cache_limit && guest_heap_contains(at);++n){
+                const auto next=memory.load(GuestAddress{at},64);memory.store(GuestAddress{at},64,memory.load(head,64));memory.store(head,64,at);at=next;}
+            memory.store(cache,64,0);memory.store(GuestAddress{teb+guest_heap_cache_count_offset+cls},8,0);
+        }
+    }catch(...){memory.store(lock,32,0);throw;}
+    memory.store(lock,32,0);++guest_heap_mutations_;
 }
 bool WindowsServices::free_heap(GuestMemory& memory, std::uint64_t address, const GuestState& state) {
     if(graphics_local())throw HostCallFault("worker 上的 D3D11 服務不可釋放 heap");
@@ -1505,6 +1542,8 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
         complete_call(state,memory,callback_value?0U:last_error_==6?0xc0000008U:last_error_==5?0xc0000022U:0xc0000001U);return std::nullopt;
     }
     if(finished.loader_notification_lock){release_loader_notification();publish_loader_lock(memory,peb_base_.value,x86_,thread_identifier(runtime_.loader_owner),runtime_.loader_depth);}
+    // 同後端巢狀執行由呼叫端繼續完成原操作；此時只恢復狀態與回呼結果。
+    if(finished.continuation==Continuation::NestedResult){state.reg(Gpr::Rax)=callback_value;return std::nullopt;}
     if(finished.continuation==Continuation::D3DXProgressOperation)return resume_d3dx_progress(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));
     if(finished.continuation==Continuation::D3DCompileOperation)return resume_d3d_compile(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));
     if(finished.continuation==Continuation::AutomationOperation)return resume_automation(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));

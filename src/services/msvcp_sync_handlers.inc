@@ -64,7 +64,12 @@ if(service.family=="msvcp140.dll" && name.find("@Concurrency@@")!=name.npos){
     }
 }
 if(service.family=="msvcp140.dll"){
-    if(name=="_Thrd_yield")return start("kernel32.dll","SwitchToThread",{});
+    // x64：讓出／睡眠直接尾跳到 kernel32 的 SwitchToThread／Sleep（返回位址與影子空間沿用呼叫端），由該服務自行返回，
+    // 不經客體回呼與回呼返回邊界（平行模式每次各多一次全停；電馭判客 Benchmark 每秒數百次）。x86 的 cdecl 與 stdcall
+    // 堆疊清理不同，沿用回呼。
+    const auto tail=[&](const char* target,std::uint64_t argument)->std::optional<std::uint32_t>{
+        state.reg(Gpr::Rcx)=argument;state.rip=GuestAddress{resolve("kernel32.dll",target).value};return std::nullopt;};
+    if(name=="_Thrd_yield")return x86_?start("kernel32.dll","SwitchToThread",{}):tail("SwitchToThread",0);
     if(name.starts_with("?_Execute_once@std@@"))
         return start("kernel32.dll","InitOnceExecuteOnce",{call(0),call(1),call(2),0});
     // 時鐘與身分沿用 QueryPerformanceCounter（10 MHz）、GetSystemTimePreciseAsFileTime 與 GetCurrentThreadId 的來源。
@@ -73,17 +78,9 @@ if(service.family=="msvcp140.dll"){
     if(name=="_Xtime_get_ticks"){call.return_to(state,runtime_.system_filetime()-UINT64_C(116444736000000000),true);return std::nullopt;}
     if(name=="_Thrd_id")return finish(thread_identifier(threads_.current));
     if(name=="_Thrd_hardware_concurrency")return finish(runtime_.processor_count);
-    // _timespec64／xtime（__time64_t 秒＋long 奈秒）是 UTC 絕對時間；換成 Win32 等待的毫秒數，已過期為 0。
-    const auto milliseconds_until=[&](std::uint64_t target)->std::uint32_t{
-        constexpr std::int64_t limit=INT64_C(900000000000);
-        const auto seconds=std::clamp(std::bit_cast<std::int64_t>(memory.load(GuestAddress{target},64)),-limit,limit);
-        const auto nanoseconds=static_cast<std::int32_t>(memory.load(GuestAddress{target+8},32));
-        const auto due=seconds*10000000+nanoseconds/100;
-        const auto now=static_cast<std::int64_t>(runtime_.system_filetime()-UINT64_C(116444736000000000));
-        if(due<=now)return 0;
-        return static_cast<std::uint32_t>(std::min<std::int64_t>((due-now+9999)/10000,0xfffffffe));
-    };
+    const auto milliseconds_until=[&](std::uint64_t target)->std::uint32_t{return msvcp_wait_milliseconds(memory,target);};
     if(name=="_Thrd_sleep"){
+        if(!x86_)return tail("Sleep",milliseconds_until(call(0)));
         start_callbacks(state,memory,{{resolve("kernel32.dll","Sleep").value,{milliseconds_until(call(0))}}},Continuation::Return,0);return std::nullopt;
     }
     if(name=="_Thrd_start"){

@@ -277,6 +277,14 @@ public:
     bool invoke_resident_context_scalar(ResidentScalarCall&,GuestMemory&,const ResidentScalarErrors&) noexcept override;
 #endif
     bool acquire_slim_word(GuestMemory&,std::uint64_t address,std::uint64_t id,bool shared);
+    // 臨界區段的共用操作：guest 區段依客體字組協定（見 windows_threads.cpp），宿主內部鎖依 owner／recursion。
+    bool critical_held(GuestMemory&,std::uint64_t address,const CriticalSection&);
+    bool critical_owned_by(GuestMemory&,std::uint64_t address,const CriticalSection&,std::uint64_t thread);
+    std::uint32_t critical_recursion(GuestMemory&,std::uint64_t address,const CriticalSection&);
+    bool critical_acquire(GuestMemory&,std::uint64_t address,CriticalSection&,std::uint64_t thread,bool queue);
+    bool critical_wait_needed(GuestMemory&,std::uint64_t address,CriticalSection&,std::uint64_t thread);
+    bool critical_release(GuestMemory&,std::uint64_t address,CriticalSection&);
+    void critical_settle_waiters(GuestMemory&,std::uint64_t address,CriticalSection&);
     std::string_view name(GuestAddress address) const noexcept override;
     std::optional<std::uint32_t> invoke(GuestState& state, GuestMemory& memory) override;
     const std::string& standard_output() const noexcept { return stdout_; }
@@ -623,7 +631,11 @@ private:
     bool protection_allocation_range(std::uint64_t,std::uint64_t) const;
     using FileOpenArguments = std::array<std::uint64_t,7>;
     std::optional<std::uint32_t> invoke_file_open(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_file_close(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint64_t> open_native_file(GuestState&,GuestMemory&,const std::u16string&,const FileOpenArguments&);
     std::optional<std::uint32_t> invoke_overlapped_result(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_file_readwrite(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_file_lock(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_file_io(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){return invoke_file_io(state,memory,service,nullptr);}
     std::optional<std::uint32_t> invoke_file_io(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,const FileOpenArguments*);
     std::optional<std::uint32_t> invoke_serial(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){return invoke_serial(state,memory,service,nullptr);}
@@ -677,7 +689,7 @@ private:
         NamedPipe::WriteCompletion pipe_write;
         std::uint64_t handle{},thread{},overlapped{},event{},input{},output{},count_pointer{},routine{};
         std::uint64_t native_iosb{},native_context{},native_scratch{};
-        std::uint32_t input_size{},output_size{};
+        std::uint32_t input_size{},output_size{},lock_key{};
         std::uint64_t offset{},length{},input_transferred{},transferred{};
         bool attempted{},io_recorded{};
         std::uint64_t io_accounted{};
@@ -724,8 +736,16 @@ private:
     GuestAddress resolve_service(std::string_view,std::string_view,bool required) const;
     std::map<std::string,std::uint64_t> builtin_export_targets(std::string_view) const;
     std::map<std::uint64_t,std::uint32_t> builtin_system_calls() const;
-    std::uint64_t load_module(GuestMemory&, std::u16string name, std::uint32_t flags, std::vector<std::uint64_t>& created, std::u16string_view search_directory = {});
-    std::uint64_t module_export(GuestMemory&, std::uint64_t module, std::string_view symbol, std::optional<std::uint16_t> ordinal, std::vector<std::uint64_t>& created, unsigned depth = 0);
+    std::uint64_t load_module(GuestMemory&, std::u16string name, std::uint32_t flags, std::vector<std::uint64_t>& created, std::u16string_view search_directory = {}, GuestState* = nullptr);
+    std::uint64_t module_export(GuestMemory&, std::uint64_t module, std::string_view symbol, std::optional<std::uint16_t> ordinal, std::vector<std::uint64_t>& created, unsigned depth = 0, GuestState* = nullptr);
+    FileSnapshot read_module_file(GuestState*,GuestMemory&,const std::u16string&);
+    std::uint32_t call_guest_native_file(GuestState&,GuestMemory&,std::uint64_t,std::vector<std::uint64_t>);
+    std::pair<std::uint64_t,bool> native_file_entry(GuestMemory&,std::string_view);
+    std::optional<std::uint64_t> invoke_native_file_io(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint64_t> invoke_native_file_position(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint64_t> invoke_native_file_information(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint64_t> invoke_native_mapping(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    FileInformation query_native_file_attributes(GuestState&,GuestMemory&,const std::u16string&,bool);
     void unmap_module(GuestMemory&,std::uint64_t module);
     void append_module_detach(ModuleOperation&,std::uint64_t module,bool unmap,std::uint64_t reserved = 0);
     std::optional<std::uint32_t> start_module_operation(GuestState&,GuestMemory&,ModuleOperation);
@@ -786,6 +806,12 @@ private:
     std::shared_ptr<DXCoreState> dxcore_;
     std::optional<std::uint32_t> invoke_dxcore(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_d3d12(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // worker 上的 COM 引用計數：AddRef 與不會歸零的 Release 只改計數；歸零（銷毀物件）回傳 false 交回協調者。
+    bool d3d12_worker_reference(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // MSVCP 絕對時間（_timespec64／xtime）到 Win32 等待毫秒數；已過期為 0。
+    std::uint32_t msvcp_wait_milliseconds(GuestMemory&,std::uint64_t) const;
+    // worker 上的 Resource.Map／Unmap：不需等 GPU 也不需讀回、輸出指標不在寫入時複製頁時完成，否則回傳 false 交回協調者。
+    bool d3d12_worker_map(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool d3d12_queue(std::uint64_t) const;
     // DirectML 等建立在 D3D12 上的 API：錄製於命令清單、於 ExecuteCommandLists 重播時以裝置的共用後端執行。
     bool d3d12_record(std::uint64_t list,D3D12Replay replay);
@@ -1070,10 +1096,14 @@ private:
     bool d3d11_local_eligible(const GuestState&,GuestMemory&,const WindowsServiceDescriptor&,bool coordinator=false) const;
     // worker 上的 D3D11 方法為 true；延後需要改動客體 heap 的銷毀，協調者本地路徑則可處理。
     static bool& graphics_local() noexcept {static thread_local bool value=false;return value;}
+    // 目前執行緒正在 worker 上執行 D3D12 服務：程序事件紀錄（module_events）屬協調者，worker 端先暫存於 D3D12 狀態。
+    static bool& d3d12_worker_context() noexcept {static thread_local bool value=false;return value;}
     // 所有 D3D11／DXGI 服務共用的鎖（可重入）：worker 上直接執行裝置內容方法時與協調者串行化。
     static std::recursive_mutex& graphics_mutex() noexcept;
     // 可直接在 worker 上執行的 D3D11 方法；輸出頁另核對 COW，不符資格回傳空指標。
     const WindowsServiceDescriptor* graphics_worker_service(GuestAddress) const noexcept;
+    // 可直接在 worker 上執行的 D3D12 方法（命令清單錄製、描述元建立／複製、不寫客體記憶體的取值）；其餘回傳空指標。
+    const WindowsServiceDescriptor* d3d12_worker_service(GuestAddress) const noexcept;
     static constexpr GuestAddress unresolved_base{windows_address_layout::x64.unresolved};
     std::vector<std::string> unresolved_imports_;
     static constexpr GuestAddress runtime_base{0x3002000000ULL};
@@ -1154,6 +1184,7 @@ private:
     void load_resident_current(GuestState& state, GuestMemory& memory, std::uint64_t target);
     GuestThread* select_resident_replacement(std::span<GuestState* const> active, std::uint32_t processor, std::uint64_t exclude);
     bool resident_current_parked_{};
+    std::optional<std::pair<std::int32_t,std::int32_t>> automation_mouse_{}; // 自動化注入滑鼠的上一個客戶區位置（Raw Input 相對位移基準）
     std::optional<std::uint32_t> force_finish_thread(GuestState&,GuestMemory&);
     std::optional<std::uint32_t> finish_thread(GuestState& state, GuestMemory& memory, std::uint32_t code);
     std::optional<std::uint32_t> exit_thread(GuestState& state, GuestMemory& memory, std::uint32_t code);
@@ -1170,6 +1201,7 @@ private:
     std::u16string registry_current_user_path(bool cached=false);
     std::pair<std::u16string,std::uint32_t> registry_security_handle(std::uint64_t,std::uint32_t);
     std::optional<std::uint32_t> invoke_nt_registry(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::uint32_t query_registry_multiple_values(GuestMemory&,const WindowsCall&,const RegistryHandle&,bool,bool);
     std::optional<std::uint32_t> invoke_file_control(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint32_t set_file_information(GuestMemory&,std::uint64_t,std::uint32_t,std::uint64_t,std::uint32_t);
     std::uint32_t set_file_valid_data(std::uint64_t,std::uint64_t);
@@ -1240,9 +1272,14 @@ private:
     std::uint64_t etw_timestamp(std::uint32_t,const GuestState&)const;
     std::optional<std::uint32_t> invoke_volume(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     struct RegistryNotification {
+        struct KeySnapshot {
+            std::map<std::u16string,RegistryValue> values;
+            std::uint64_t modified{};
+            bool operator==(const KeySnapshot&) const = default;
+        };
         std::uint64_t key{},event{},thread{};
         std::u16string path;std::uint32_t filter{};bool subtree{};
-        std::map<std::u16string,std::map<std::u16string,RegistryValue>> snapshot;
+        std::map<std::u16string,KeySnapshot> snapshot;
         std::map<std::u16string,std::vector<std::uint8_t>> security_snapshot;
         bool operator==(const RegistryNotification&) const = default;
     };
@@ -1326,6 +1363,7 @@ private:
     std::optional<std::uint32_t> seh_finally_result(GuestState& state, GuestMemory& memory);
     std::shared_ptr<FileMappingState> mappings_;
     std::optional<std::uint32_t> invoke_mapping(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    bool flush_file_view(std::uint64_t,std::uint64_t);
     bool close_mapping(std::uint64_t);
     std::uint64_t map_file_view(GuestMemory&,std::uint64_t handle,std::uint32_t access,std::uint64_t offset,std::uint64_t size,std::uint64_t address=0,bool dib=false,bool copy_override=false);
     std::uint64_t map_dib_section(GuestMemory&,std::uint64_t handle,std::uint32_t offset,std::uint64_t size,std::uint64_t& view);
@@ -1795,13 +1833,16 @@ private:
     bool validate_heap(const GuestMemory& memory,std::uint64_t heap,std::uint64_t pointer=0) const;
     std::uint64_t reallocate_heap(GuestMemory& memory, std::uint64_t address, std::uint64_t size, const GuestState& state);
     bool free_heap(GuestMemory& memory, std::uint64_t address, const GuestState& state);
+    // 把宿主持有的記憶體（圖形 API 的映射緩衝等）映入客體位址空間：依配置粒度搜尋不衝突的位址，以 StableShared
+    // 讓原生 MMU 直接別名。owner 隨映射保留，撤除映射（unmap）後才可能釋放；呼叫時所有 worker 須已停止。失敗回傳 0。
+    std::uint64_t map_host_memory(GuestMemory& memory,std::shared_ptr<void> owner,std::span<std::uint8_t> bytes,bool checked=false);
     // 客體小物件配置區：客體 malloc／free 常式的快速路徑與此處共用狀態頁、鎖及 chunk 格式。
     bool guest_heap_setup(GuestMemory& memory);
     bool guest_locale_lock_setup(GuestMemory& memory);
     // x64 為單一連續保留區；x86 的 chunk 散在 32 位元空間各處，以每 256 KiB 一位元的位元圖判斷。
     bool guest_heap_contains(std::uint64_t address) const noexcept {
         if(guest_heap_chunked_)return address<(UINT64_C(1)<<32) && ((guest_heap_chunk_bits_[address>>24]>>((address>>18)&63U))&1U);
-        return guest_heap_base_ && address-guest_heap_base_<guest_heap_size_;
+        return guest_heap_base_ && address-guest_heap_base_<guest_heap_next_-guest_heap_base_; // 只含已建立的連續 chunk
     }
     std::uint64_t guest_heap_reserve_chunk(GuestMemory& memory);
     std::uint64_t guest_heap_allocate(GuestMemory& memory, std::uint64_t size, std::uint64_t heap = process_heap);
@@ -2033,6 +2074,7 @@ private:
     std::uint64_t guest_heap_mutations_{},guest_heap_walk_generation_{UINT64_MAX},guest_heap_walk_heap_{};
     std::vector<std::pair<std::uint64_t,std::uint64_t>> guest_heap_walk_blocks_,guest_heap_walk_free_;
     const std::vector<std::pair<std::uint64_t,std::uint64_t>>& guest_heap_allocated_blocks(GuestMemory& memory, std::uint64_t heap = process_heap);
+    void guest_heap_flush_thread_cache(GuestMemory& memory, std::uint64_t teb);
     GuestAddress guest_locale_lock_state_{};
     // Win32／Win64 TEB、TLS 與 pseudo handle 共用常式；只快取入口，不快取客體資料。
     GuestAddress guest_thread_routines_{};

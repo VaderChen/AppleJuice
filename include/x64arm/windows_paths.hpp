@@ -85,6 +85,13 @@ inline std::size_t windows_unc_root_length(std::u16string_view path){
     for(unsigned part=0;part<2;++part){while(at<path.size() && path[at]==u'\\')++at;while(at<path.size() && path[at]!=u'\\')++at;}
     return at;
 }
+// DOS NUL 與明確裝置名稱共用判定；延伸磁碟路徑中的同名一般檔案不轉成裝置。
+inline bool windows_null_device(std::u16string_view path){
+    const auto nul=[](std::u16string_view name){return name.size()==3 && windows_path_upper(name[0])==u'N' && windows_path_upper(name[1])==u'U' && windows_path_upper(name[2])==u'L';};
+    if(path.size()==7 && (path.starts_with(u"\\\\.\\") || path.starts_with(u"\\\\?\\")))return nul(path.substr(4));
+    const auto device=windows_dos_device(path);
+    return device && nul(path.substr((device>>16)/2,(device&65535)/2));
+}
 // 共用元件折疊；純字串 Win32／NT 轉換與掛載層的尾字元政策分開。
 inline std::u16string windows_collapse_path(std::u16string path,std::size_t root,bool trim_suffix,bool keep_separator){
     std::replace(path.begin(),path.end(),u'/',u'\\');

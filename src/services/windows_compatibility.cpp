@@ -321,6 +321,9 @@ void WindowsServices::crt_exception_data(GuestState& state,GuestMemory& memory,s
     }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
+    if(service.symbol=="GetFileType")if(const auto native=invoke_native_file_information(state,memory,service)){
+        WindowsCall(state,memory,service).return_to(state,*native);return std::nullopt;
+    }
     if(service.symbol.starts_with("CreateSemaphore") || service.symbol.starts_with("OpenSemaphore") || service.symbol.starts_with("CreateWaitableTimer") || service.symbol.starts_with("OpenWaitableTimer") || service.symbol=="ReleaseSemaphore")return invoke_sync_object(state,memory,service);
     if(service.symbol.starts_with("CM_") || service.symbol.starts_with("SetupDi") || service.symbol.starts_with("SetupGetInf") || service.symbol.starts_with("SetupCopyOEMInf") ||
        service.symbol.starts_with("SetupUninstallOEMInf") || service.family=="newdev.dll")return invoke_device_configuration(state,memory,service);
@@ -1280,14 +1283,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         if(!info)fail(87);else result=info->lead[static_cast<std::uint8_t>(arg(1))];
     }
     else if (symbol == "IsWow64Process" || symbol == "IsWow64Process2") {
-        if(arg(0)!=(x86_?UINT64_C(0xffffffff):UINT64_MAX))fail(6);
-        else if(!arg(1) || (symbol=="IsWow64Process2" && !arg(2)))fail(87);
+        std::array<std::uint64_t,5> information{};
+        std::uint32_t pid{},target_bits{};
+        const auto error=process_basic_information(memory,arg(0),information,pid,target_bits);
+        if(error)fail(error);
+        else if(!arg(1))fail(87);
         else {
-            // 虛擬 Windows 系統為 AMD64；32-bit 程序透過 Win32 ABI 執行。
-            if(symbol=="IsWow64Process")memory.store(GuestAddress{arg(1)},32,x86_?1:0);
+            // 沿程序查詢共用權限與生命週期；架構屬於目標程序，不能取呼叫者的 ABI。
+            // 虛擬 Windows 系統為 AMD64，pNativeMachine 是可選輸出。
+            if(symbol=="IsWow64Process")memory.store(GuestAddress{arg(1)},32,target_bits==32?1:0);
             else {
-                memory.check(GuestAddress{arg(1)},2,Access::Write);memory.check(GuestAddress{arg(2)},2,Access::Write);
-                memory.store(GuestAddress{arg(1)},16,x86_?0x14c:0);memory.store(GuestAddress{arg(2)},16,0x8664);
+                memory.check(GuestAddress{arg(1)},2,Access::Write);
+                if(arg(2))memory.check(GuestAddress{arg(2)},2,Access::Write);
+                memory.store(GuestAddress{arg(1)},16,target_bits==32?0x14c:0);
+                if(arg(2))memory.store(GuestAddress{arg(2)},16,0x8664);
             }
             result=1;
         }
@@ -1302,7 +1311,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         const bool socket=runtime_.network.sockets.contains(handle);
         const bool valid=bluetooth_handle(handle) || power_requests_.contains(handle) || transaction_handle(handle) || job_handle(handle) || mapping_handle(handle) || process_signaled(handle).has_value() || standard || files_.contains(handle) || socket || runtime_.wait_objects.contains(handle) || runtime_.process_thread_handles.contains(handle) || runtime_.completion_ports.contains(handle) || runtime_.process_snapshots.contains(handle) || runtime_.token_handles.contains(handle);
         if (!valid) fail(6);
-        else if (symbol == "GetFileType") result = standard?standard_file_type(static_cast<unsigned>(handle-0x100)):bluetooth_handle(handle) || console_handle(handle) || (files_.contains(handle) && (files_.at(handle).serial || files_.at(handle).hid))?2:socket || (files_.contains(handle) && files_.at(handle).pipe) ? 3 : files_.contains(handle)?1:0;
+        else if (symbol == "GetFileType") result = standard?standard_file_type(static_cast<unsigned>(handle-0x100)):bluetooth_handle(handle) || console_handle(handle) || (files_.contains(handle) && (files_.at(handle).serial || files_.at(handle).hid || (files_.at(handle).native && files_.at(handle).native->null_device())))?2:socket || (files_.contains(handle) && files_.at(handle).pipe) ? 3 : files_.contains(handle)?1:0;
         else if(symbol=="SetHandleInformation"){
             if((dword(1)|dword(2))&~3U)fail(87);
             else {auto& flags=runtime_.handle_flags[handle];flags=(flags&~dword(1))|(dword(2)&dword(1));result=1;}

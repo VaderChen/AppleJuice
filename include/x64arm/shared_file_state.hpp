@@ -14,12 +14,13 @@ public:
     bool pending();
     std::pair<std::shared_ptr<SharedFileLease>,std::uint32_t> acquire(std::uint64_t,std::uint32_t,std::uint32_t,bool existing=false,std::uint32_t close_target=0);
     std::pair<std::uint32_t,std::uint32_t> target(int,std::string_view,const FileMetadata&,bool directory);
+    std::uint32_t relocate_targets(int,std::string_view,int,std::string_view,const FileMetadata&,const std::function<std::uint32_t()>&);
     std::uint32_t disposition(std::uint32_t,bool,std::uint64_t object=0);
     std::uint32_t close_target(std::uint64_t,std::uint32_t);
     std::uint32_t mutate_size(const std::function<std::uint32_t()>&);
     // 同一 Sandbox 的 FILE_OBJECT 共用範圍鎖，不取決於宿主描述元的讀寫權限。
-    std::uint32_t range_conflict(std::uint64_t object,std::uint64_t offset,std::uint64_t length,bool writing);
-    std::uint32_t range_lock(std::uint64_t object,std::uint64_t offset,std::uint64_t length,bool exclusive,bool unlock,const std::function<std::uint32_t()>& native,bool adopt=false);
+    std::uint32_t range_conflict(std::uint64_t object,std::uint64_t offset,std::uint64_t length,bool writing,std::uint32_t key=0);
+    std::uint32_t range_lock(std::uint64_t object,std::uint64_t offset,std::uint64_t length,bool exclusive,bool unlock,const std::function<std::uint32_t()>& native,bool adopt=false,std::uint32_t key=0);
 };
 class SharedFileLease {
     std::shared_ptr<SharedFileState> state_;std::uint64_t identity_{};

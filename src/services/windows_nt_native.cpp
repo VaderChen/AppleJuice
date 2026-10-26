@@ -1,6 +1,8 @@
 #include "x64arm/windows_services.hpp"
 #include "windows_loader_lock.hpp"
 #include "windows_object_identity.hpp"
+#include "windows_file_stat.hpp"
+#include "x64arm/process_io.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -14,24 +16,31 @@ std::uint32_t nt_status(std::uint32_t error){
     case 50:return 0xc00000bbU;case 80:case 183:return 0xc0000035U;case 87:return 0xc000000dU;case 109:return 0xc000014bU;
     case 112:return 0xc000007fU;case 122:return 0xc0000023U;case 123:return 0xc0000033U;case 234:return 0x80000005U;case 267:return 0xc0000103U;
     case 288:return 0xc0000046U;case 298:return 0xc0000047U;case 995:return 0xc0000120U;case 997:return 0x103U;case 998:return 0xc0000005U;
-    case 1008:return 0xc000007cU;case 1018:return 0xc000017cU;case 1117:return 0xc0000185U;case 1305:return 0xc0000058U;case 1306:return 0xc0000059U;
+    case 1006:return 0xc000011eU;case 1008:return 0xc000007cU;case 1018:return 0xc000017cU;case 1117:return 0xc0000185U;case 1168:return 0xc0000225U;case 1237:return 0xc000022dU;case 1305:return 0xc0000058U;case 1306:return 0xc0000059U;
     case 1307:return 0xc000005aU;case 1308:return 0xc000005bU;case 1314:return 0xc0000061U;
     case 1336:return 0xc0000077U;case 1337:return 0xc0000078U;case 1338:return 0xc0000079U;
     case 1346:return 0xc00000a5U;case 1347:return 0xc00000a4U;default:return 0xc0000001U;}
 }
-struct ObjectAttributes {std::u16string name;std::uint64_t root{},security{};std::uint32_t flags{};};
+struct ObjectAttributes {std::u16string name;std::uint64_t root{},security{};std::uint32_t flags{},file_qos{};};
 std::u16string native_string(const GuestMemory& memory,std::uint64_t address,bool x86){
     const auto length=memory.load(GuestAddress{address},16),maximum=memory.load(GuestAddress{address+2},16),buffer=memory.load(GuestAddress{address+(x86?4U:8U)},x86?32:64);
     if(length%2 || length>maximum || (length && !buffer))throw NativeError{0xc000000dU};
     std::u16string result;for(std::uint64_t n=0;n<length;n+=2)result.push_back(static_cast<char16_t>(memory.load(GuestAddress{buffer+n},16)));return result;
 }
-ObjectAttributes object_attributes(const GuestMemory& memory,std::uint64_t address,bool x86,bool optional=false){
+ObjectAttributes object_attributes(const GuestMemory& memory,std::uint64_t address,bool x86,bool optional=false,bool file_qos=false){
     if(!address){if(optional)return {};throw NativeError{0xc000000dU};}
     if(memory.load(GuestAddress{address},32)!=(x86?24U:48U))throw NativeError{0xc000000dU};
     const auto unit=x86?4U:8U;const auto pointer=[&](unsigned n){return memory.load(GuestAddress{address+n*unit},x86?32:64);};
     ObjectAttributes result;result.root=pointer(1);result.flags=static_cast<std::uint32_t>(pointer(3));result.security=pointer(4);
-    // 核心模式 handle 與自訂 SQOS 不能冒充已支援的使用者模式物件。
-    if((result.flags&~0x1c2U) || pointer(5))throw NativeError{0xc000000dU};
+    // 檔案 SQOS 沿用共用開檔旗標；其他物件仍維持原有的拒絕契約。
+    if(result.flags&~0x1c2U)throw NativeError{0xc000000dU};
+    if(const auto qos=pointer(5)){
+        if(!file_qos)throw NativeError{0xc000000dU};
+        memory.check(GuestAddress{qos},12,Access::Read);
+        const auto level=memory.load(GuestAddress{qos+4},32),tracking=memory.load(GuestAddress{qos+8},8),effective=memory.load(GuestAddress{qos+9},8);
+        if(memory.load(GuestAddress{qos},32)!=12 || level>3 || tracking>1 || effective>1)throw NativeError{0xc000000dU};
+        result.file_qos=0x100000U|static_cast<std::uint32_t>(level<<16)|(tracking?0x40000U:0U)|(effective?0x80000U:0U);
+    }
     if(pointer(2))result.name=native_string(memory,pointer(2),x86);return result;
 }
 }
@@ -40,9 +49,17 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
 #include "concrt_sync_descriptors.inc"
         {"ntdll.dll","NtCreateFile",11,0,0,0x5e2},{"ntdll.dll","NtOpenFile",6,0,0,0x32},
         {"ntdll.dll","NtQueryAttributesFile",2},{"ntdll.dll","NtQueryFullAttributesFile",2},
+        {"ntdll.dll","NtQueryInformationByName",5,0,0,0x18},
         {"ntdll.dll","NtDeleteFile",1},{"ntdll.dll","NtFlushBuffersFile",2},
         {"ntdll.dll","NtQuerySecurityObject",5,0,0,0xa},{"ntdll.dll","NtSetSecurityObject",3,0,0,0x2},
         {"ntdll.dll","NtReadFile",9,0,0,0x40},{"ntdll.dll","NtWriteFile",9,0,0,0x40},
+        {"ntdll.dll","NtCancelIoFile",2},{"ntdll.dll","NtCancelIoFileEx",3},
+        {"ntdll.dll","NtLockFile",10,0,0,0x380},{"ntdll.dll","NtUnlockFile",5,0,0,0x10},
+        {"internal-nt-file","ReadFile",9,0,0,0x24},{"internal-nt-file","WriteFile",9,0,0,0x24},
+        {"internal-nt-file","CreateFileW",7,0,0,0x36},{"internal-nt-file","CloseHandle",1},
+        {"internal-nt-file","CancelIo",1},{"internal-nt-file","CancelIoEx",2},
+        {"internal-file-apc","Complete",3},
+        {"internal-nt-mapping","CreateFileMappingW",7,0,0,0x5c},{"internal-nt-mapping","OpenFileMappingW",3,0,0,0x3},
         {"ntdll.dll","NtOpenProcess",4,0,0,0x2},{"ntdll.dll","NtOpenThread",4,0,0,0x2},
         {"ntdll.dll","NtOpenProcessToken",3,0,0,0x2},{"ntdll.dll","NtOpenProcessTokenEx",4,0,0,0x6},
         {"ntdll.dll","NtOpenThreadToken",4,0,0,0x6},{"ntdll.dll","NtOpenThreadTokenEx",5,0,0,0xe},
@@ -50,6 +67,7 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         {"ntdll.dll","NtWaitForMultipleObjects",5,0,0,0xd},{"ntdll.dll","NtWaitForMultipleObjects32",5,0,0,0xd},
         {"ntdll.dll","NtSuspendThread",2},{"ntdll.dll","NtResumeThread",2},
         {"ntdll.dll","NtCreateSection",7,0,0,0x32},{"ntdll.dll","NtOpenSection",3,0,0,0x2},{"ntdll.dll","NtMapViewOfSection",10,0,0,0x380},
+        {"ntdll.dll","NtFlushVirtualMemory",4},
         {"ntdll.dll","RtlCreateHeap",6,0,0,0x1},{"ntdll.dll","RtlDestroyHeap",1},
         {"ntdll.dll","RtlRunOnceExecuteOnce",4},
         // MSVC ABI 包裝沿用此處的非同步服務轉接，底層同步物件仍由 Win32 共用流程持有。
@@ -210,6 +228,25 @@ std::optional<ExecutionResult> WindowsServices::dispatch_software_interrupt(Gues
     return HostServices::dispatch_software_interrupt(state,memory,vector,length);
 }
 std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.family=="internal-file-apc"){
+        const WindowsCall arg(state,memory,service);const auto target=arg(0),ios=arg(1);const auto saved_error=last_error_;
+        const auto status=static_cast<std::uint32_t>(memory.load(GuestAddress{ios},x86_?32:64));
+        const auto count=static_cast<std::uint32_t>(memory.load(GuestAddress{ios+(x86_?4:8)},x86_?32:64));
+        const auto error=nested_service(state,memory,"ntdll.dll","RtlNtStatusToDosError",{status});last_error_=saved_error;
+        // NT APC 與 Win32 completion 都是三參數 stdcall／Win64 ABI。
+        // 尾呼叫保留原回程框架及 alertable 執行緒，不配置 thunk 或新增常駐索引。
+        if(x86_){memory.store(GuestAddress{state.reg(Gpr::Rsp)+4},32,error);memory.store(GuestAddress{state.reg(Gpr::Rsp)+8},32,count);memory.store(GuestAddress{state.reg(Gpr::Rsp)+12},32,ios);}
+        else{state.reg(Gpr::Rcx)=error;state.reg(Gpr::Rdx)=count;state.reg(Gpr::R8)=ios;}
+        state.rip=GuestAddress{target};return std::nullopt;
+    }
+    if(service.family=="internal-nt-mapping")return invoke_mapping(state,memory,service);
+    if(service.family=="internal-nt-file") {
+        if(service.symbol=="CreateFileW")return invoke_file_open(state,memory,service);
+        if(service.symbol=="CloseHandle")return invoke_file_close(state,memory,service);
+        if(service.symbol=="CancelIo" || service.symbol=="CancelIoEx")return invoke_file_io(state,memory,service);
+        return invoke_file_readwrite(state,memory,service);
+    }
+    if(service.symbol=="NtLockFile" || service.symbol=="NtUnlockFile")return invoke_file_lock(state,memory,service);
     if(service.symbol=="NtSuspendThread" || service.symbol=="NtResumeThread")return invoke_thread_control(state,memory,service);
     const WindowsCall call(state,memory,service);const auto name=service.symbol;const auto saved_error=last_error_;const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto finish=[&](std::uint64_t status){if(name.starts_with("Nt"))threads_.items.at(threads_.current).last_native_status=static_cast<std::uint32_t>(status);last_error_=saved_error;call.return_to(state,status);return std::optional<std::uint32_t>{};};
@@ -224,13 +261,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
     const auto path=[&](ObjectAttributes attr){
         auto value=std::move(attr.name);if(value.find(u'\0')!=value.npos || value.empty())throw NativeError{0xc0000033U};
         if(attr.root){const auto file=files_.find(attr.root);if(file==files_.end())throw NativeError{object_type(attr.root).empty()?0xc0000008U:0xc0000024U};if(!(file->second.metadata.attributes&0x10U))throw NativeError{0xc0000024U};if(value.front()==u'\\' || value.find(u':')!=value.npos)throw NativeError{0xc0000033U};value=utf8_to_utf16(file->second.path)+u"\\"+value;}
+        else if(value.size()==12 && std::equal(value.begin(),value.end(),u"\\Device\\Null",[](auto a,auto b){return windows_path_upper(a)==windows_path_upper(b);}))value=u"\\\\.\\NUL";
         else if(value.starts_with(u"\\??\\") || value.starts_with(u"\\DosDevices\\")){
             value.erase(0,value.starts_with(u"\\??\\")?4:12);
             if(value.size()>=4 && windows_path_upper(value[0])==u'U' && windows_path_upper(value[1])==u'N' && windows_path_upper(value[2])==u'C' && value[3]==u'\\')value=u"\\\\"+value.substr(4);
             else if(windows_dos_path_type(value)!=WindowsDosPathType::DriveAbsolute){
                 const auto volume=u"\\\\?\\"+value;
                 if(windows_volume_letter(std::u16string_view(volume)))value=volume;
-                else throw NativeError{0xc0000034U};
+                else value=u"\\\\.\\"+value; // DOS 裝置（含管道）交回既有共用 provider 判定。
             }
         }
         else {bool matched=false;for(char16_t drive=u'A';drive<=u'Z';++drive){const auto device=windows_device_name(drive);if(value.starts_with(device+u"\\")){value=std::u16string{drive,u':'}+value.substr(device.size());matched=true;break;}}if(!matched && (value.size()<3 || value[1]!=u':'))throw NativeError{0xc000003bU};}
@@ -393,7 +431,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
         if(name=="RtlFreeUnicodeString"){const auto buffer=memory.load(GuestAddress{call(0)+unit},bits);if(buffer)(void)free_heap(memory,buffer,state);memory.write(GuestAddress{call(0)},std::vector<std::uint8_t>(unit*2));return finish(0);}
         if(name=="RtlCreateHeap"){if(call(1) || call(4) || call(5) || (call(0)&~1U))return finish(0);return start("kernel32.dll","HeapCreate",{call(0),call(3),call(2)});}
         if(name=="RtlDestroyHeap")return start("kernel32.dll","HeapDestroy",{call(0)});
-        if(name=="NtMapViewOfSection")return invoke_nt_section(state,memory,service);
+        if(name=="NtMapViewOfSection" || name=="NtFlushVirtualMemory")return invoke_nt_section(state,memory,service);
         if(name=="NtDeleteFile"){
             const auto file=path(object_attributes(memory,call(0),x86_));
             const auto at=scratch(file.size()*2+2);memory.write(GuestAddress{at},utf16_bytes(file));
@@ -412,6 +450,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             if(!call(2))return finish(0xc0000005U);
             return start("advapi32.dll","SetKernelObjectSecurity",{call(0),call(1),call(2)});
         }
+        if(name=="NtQueryInformationByName"){
+            memory.check(GuestAddress{call(1)},unit*2,Access::Write);
+            const auto done=[&](std::uint32_t status,std::size_t count=0){memory.store(GuestAddress{call(1)},bits,status);memory.store(GuestAddress{call(1)+unit},bits,count);return finish(status);};
+            try{
+                const auto kind=static_cast<std::uint32_t>(call(4));const auto extent=file_stat::size(kind);
+                if(!extent)return done(0xc000000dU);
+                if(static_cast<std::uint32_t>(call(3))<extent)return done(0xc0000004U);
+                memory.check(GuestAddress{call(2)},extent,Access::Write);
+                const auto file=path(object_attributes(memory,call(0),x86_));std::uint32_t effective{};
+                const auto info=filesystem_.information(utf16_to_utf8(file),effective);if(info.error)return done(nt_status(info.error));
+                memory.write(GuestAddress{call(2)},file_stat::encode(kind,info.metadata,effective));process_io::record(process_io::Kind::Other,extent);
+                return done(0,extent);
+            }catch(const NativeError& error){return done(error.status);}catch(const MemoryFault&){return done(0xc0000005U);}catch(const std::bad_alloc&){return done(0xc0000017U);}
+        }
         if(name=="NtQueryAttributesFile" || name=="NtQueryFullAttributesFile"){
             const auto file=path(object_attributes(memory,call(0),x86_));const auto info=filesystem_.information(utf16_to_utf8(file));if(info.error)return finish(nt_status(info.error));
             const auto error=filesystem_.security_access(utf16_to_utf8(file),0x80U);if(error)return finish(nt_status(error));
@@ -420,22 +472,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             if(full){memory.store(GuestAddress{call(1)+32},64,m.allocation_size);memory.store(GuestAddress{call(1)+40},64,m.size);}memory.store(GuestAddress{call(1)+(full?48:32)},32,m.attributes);return finish(0);
         }
         if(name=="NtCreateFile" || name=="NtOpenFile"){
-            const bool create=name=="NtCreateFile";const auto attr=object_attributes(memory,call(2),x86_);const auto file=path(attr);const auto options=static_cast<std::uint32_t>(call(create?8:5)),disposition=create?static_cast<std::uint32_t>(call(7)):1U;
+            const bool create=name=="NtCreateFile";const auto attr=object_attributes(memory,call(2),x86_,false,true);const auto file=path(attr);const auto options=static_cast<std::uint32_t>(call(create?8:5)),disposition=create?static_cast<std::uint32_t>(call(7)):1U;
             memory.check(GuestAddress{call(0)},unit,Access::Write);memory.check(GuestAddress{call(3)},unit*2,Access::Write);
-            if(disposition>5 || (options&~0x0020507fU) || (options&0x30U)==0x30U || ((options&0x30U) && !(call(1)&0x100000U)) || ((options&1U) && (options&0x40U)))return finish(0xc000000dU);
+            if(disposition>5 || (options&~0x0060587fU) || (options&0x30U)==0x30U || ((options&0x30U) && !(call(1)&0x100000U)) || ((options&1U) && (options&0x40U)))return finish(0xc000000dU);
             if(create && (call(9) || call(10)))return finish(0xc00000bbU);
-            const auto info=filesystem_.information(utf16_to_utf8(file));const bool existed=!info.error;if(info.error && info.error!=2 && info.error!=3)return finish(nt_status(info.error));
+            const bool device=file.starts_with(u"\\\\.\\");
+            // DOS 裝置不以宿主路徑預查；分享、存在與建立契約由裝置 provider 驗證。
+            const auto info=device?FileInformation{}:filesystem_.information(utf16_to_utf8(file));const bool existed=device || !info.error;if(info.error && info.error!=2 && info.error!=3)return finish(nt_status(info.error));
             if(existed && (options&0x40U) && (info.metadata.attributes&0x10U))return finish(0xc00000baU);
             if(existed && (options&1U) && !(info.metadata.attributes&0x10U))return finish(0xc0000103U);
-            auto flags=create?static_cast<std::uint32_t>(call(5)):0x80U;if(!flags)flags=0x80U;
+            auto flags=create?static_cast<std::uint32_t>(call(5)):0x80U;if(!flags)flags=0x80U;flags|=attr.file_qos;
             if(options&2U)flags|=0x80000000U;if(options&4U)flags|=0x08000000U;if(options&8U)flags|=0x20000000U;
+            if(options&0x800U)flags|=0x10000000U;if(options&0x400000U)flags|=0x00100000U;
             if(!(options&0x30U))flags|=0x40000000U;if(options&0x1000U)flags|=0x04000000U;if(options&0x4000U)flags|=0x02000000U;if(options&0x200000U)flags|=0x00200000U;
             const auto at=scratch(128+file.size()*2+2);memory.write(GuestAddress{at+128},utf16_bytes(file));security(attr,at);
             unsigned win_disposition=disposition==0 || disposition==5?2U:disposition==1?3U:disposition==2?1U:disposition==3?4U:5U;
             if(options&1U){if(disposition!=1 && disposition!=2 && disposition!=3)throw NativeError{0xc000000dU};if(existed && disposition==2)throw NativeError{0xc0000035U};if(!existed && disposition==1)throw NativeError{0xc0000034U};if(!existed){const auto error=filesystem_.create_directory(utf16_to_utf8(file),[&]{return file_creation_descriptor(memory,at);});if(error)throw NativeError{nt_status(error)};}flags|=0x02000000U;win_disposition=3;}
             op.information=existed?(disposition==0?0U:disposition==4 || disposition==5?3U:1U):2U;op.attributes=options;
             if(create && call(4) && op.information!=1){op.allocation=memory.load(GuestAddress{call(4)},64);if(op.allocation>INT64_MAX)throw NativeError{0xc000000dU};}
-            return start("kernel32.dll","CreateFileW",{at+128,call(1),call(create?6:4),at,win_disposition,flags,0});
+            return start("internal-nt-file","CreateFileW",{at+128,call(1),call(create?6:4),at,win_disposition,flags,0});
         }
         if(name=="NtOpenProcess" || name=="NtOpenThread"){
             memory.check(GuestAddress{call(0)},unit,Access::Write);const auto attr=object_attributes(memory,call(2),x86_);if(!attr.name.empty() || attr.root || attr.security || !call(3))return finish(0xc000000dU);
@@ -489,19 +544,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             auto section=attr.name;if(section.starts_with(u"\\BaseNamedObjects\\"))section.erase(0,18);else if(!section.empty() && section.front()==u'\\')return finish(0xc000003bU);
             if(call(1)&~0xf001fU)return finish(0xc0000022U);
             if(create && call(5)!=0x8000000U && call(5)!=0)return finish(0xc00000bbU);
-            const auto at=scratch(128+section.size()*2+2);security(attr,at);if(!section.empty())memory.write(GuestAddress{at+128},utf16_bytes(section));op.attributes=static_cast<std::uint32_t>(call(1));
-            if(create){const auto size=call(3)?memory.load(GuestAddress{call(3)},64):0;if(size>INT64_MAX)throw NativeError{0xc000000dU};return start("kernel32.dll","CreateFileMappingW",{call(6)?call(6):(x86_?UINT32_MAX:UINT64_MAX),at,call(4)|0x8000000U,size>>32,static_cast<std::uint32_t>(size),section.empty()?0:at+128});}
-            if(section.empty())throw NativeError{0xc0000033U};return start("kernel32.dll","OpenFileMappingW",{call(1),(attr.flags&2U)!=0,at+128});
+            const auto at=scratch(128+section.size()*2+2);security(attr,at);if(!section.empty())memory.write(GuestAddress{at+128},utf16_bytes(section));op.attributes=static_cast<std::uint32_t>(call(1));op.information=attr.flags;
+            if(create){const auto size=call(3)?memory.load(GuestAddress{call(3)},64):0;if(size>INT64_MAX)throw NativeError{0xc000000dU};return start("internal-nt-mapping","CreateFileMappingW",{call(6)?call(6):(x86_?UINT32_MAX:UINT64_MAX),at,call(4)|0x8000000U,size>>32,static_cast<std::uint32_t>(size),section.empty()?0:at+128,call(1)});}
+            if(section.empty())throw NativeError{0xc0000033U};return start("internal-nt-mapping","OpenFileMappingW",{call(1),(attr.flags&2U)!=0,at+128});
+        }
+        if(name=="NtCancelIoFile" || name=="NtCancelIoFileEx"){
+            const bool extended=name.ends_with("Ex");memory.check(GuestAddress{call(extended?2:1)},unit*2,Access::Write);
+            return start("internal-nt-file",extended?"CancelIoEx":"CancelIo",extended?
+                std::vector<std::uint64_t>{call(0),call(1)}:std::vector<std::uint64_t>{call(0)});
         }
         if(name=="NtReadFile" || name=="NtWriteFile"){
             memory.check(GuestAddress{call(4)},unit*2,Access::Write);const auto file=files_.find(call(0));if(file==files_.end())return finish(0xc0000008U);
-            const bool sync=(file->second.mode&0x30U)!=0,writing=name=="NtWriteFile";if(call(8))return finish(0xc00000bbU);
-            if(call(1) && (!runtime_.wait_objects.contains(call(1)) || runtime_.wait_objects.at(call(1)).kind!=WaitObject::Kind::Event))return finish(0xc0000008U);
+            const bool sync=(file->second.mode&0x30U)!=0,writing=name=="NtWriteFile";
+            const auto key=call(8)?static_cast<std::uint32_t>(memory.load(GuestAddress{call(8)},32)):0U;
+            const auto event=call(1)&~UINT64_C(1);
+            if(event && (!runtime_.wait_objects.contains(event) || runtime_.wait_objects.at(event).kind!=WaitObject::Kind::Event))return finish(0xc0000008U);
             if(call(2) && file->second.completion_port)return finish(0xc000000dU);
             auto offset=call(7)?memory.load(GuestAddress{call(7)},64):UINT64_MAX-1;if(offset==UINT64_MAX-1){if(!sync && !file->second.pipe && !file->second.serial && !file->second.hid)return finish(0xc000000dU);offset=file->second.pipe || file->second.serial || file->second.hid?0:static_cast<std::uint64_t>(runtime_.win_file_positions.at(file->second.object));}
             if(offset>INT64_MAX && !(writing && offset==UINT64_MAX))return finish(0xc000000dU);
             const auto at=scratch(128);memory.store(GuestAddress{at+64+unit*2},64,offset);memory.store(GuestAddress{at+64+(x86_?16U:24U)},bits,call(1));
-            return start("kernel32.dll",writing?"WriteFile":"ReadFile",{call(0),call(5),call(6),at+32,at+64});
+            op.attributes=1; // 所有檔案種類沿共用完成流程，不能經 Win32 再次進入 Native hook。
+            return start("internal-nt-file",writing?"WriteFile":"ReadFile",{call(0),call(5),call(6),at+32,at+64,key,call(4),call(3),call(2)});
         }
         throw HostCallFault("未知 NT 原生服務");
     }catch(const NativeError& error){if(op.scratch)(void)free_heap(memory,op.scratch,state);return failure(error.status);}
@@ -573,17 +636,39 @@ std::optional<std::uint32_t> WindowsServices::resume_nt_native(GuestState& state
         status=value?0:status;memory.store(GuestAddress{a[1]},bits,status);memory.store(GuestAddress{a[1]+unit},bits,0);
     }else if(name=="NtOpenProcess" || name=="NtOpenThread"){status=value?0:status;if(value)memory.store(GuestAddress{a[0]},bits,value);}
     else if(name.find("Token")!=name.npos){status=value?0:status;if(value && (op.attributes&2U)){const bool process=name.starts_with("NtOpenProcess"),extended=name.ends_with("Ex");const auto output=a[process?(extended?3:2):(extended?4:3)];runtime_.handle_flags[memory.load(GuestAddress{output},bits)]|=1U;}}
-    else if(name=="NtCreateSection" || name=="NtOpenSection"){status=value?native_section_access(value,op.attributes):status;if(!status)memory.store(GuestAddress{a[0]},bits,value);else if(value)(void)close_mapping(value);}
+    else if(name=="NtCreateSection" || name=="NtOpenSection"){
+        const bool existed=name=="NtCreateSection" && last_error_==183;
+        status=value?native_section_access(value,op.attributes):status;
+        if(!status && existed && !(op.information&0x80U))status=0xc0000035U;
+        if(!status){memory.store(GuestAddress{a[0]},bits,value);if(existed)status=0x40000000U;}
+        else if(value)(void)close_mapping(value);
+    }
     else if(name=="NtWaitForSingleObject" || name=="NtSignalAndWaitForSingleObject" || name.starts_with("NtWaitForMultipleObjects"))status=value==UINT32_MAX?status:static_cast<std::uint32_t>(value);
+    else if(name=="NtCancelIoFile" || name=="NtCancelIoFileEx"){
+        status=value?0:status;const auto ios=a[name.ends_with("Ex")?2:1];memory.store(GuestAddress{ios},bits,status);memory.store(GuestAddress{ios+unit},bits,0);
+    }
     else if(name=="NtReadFile" || name=="NtWriteFile"){
-        status=value?0:status;const auto bytes=memory.load(GuestAddress{op.scratch+64+unit},bits);memory.store(GuestAddress{a[4]},bits,status);memory.store(GuestAddress{a[4]+unit},bits,bytes);
+        status=value?static_cast<std::uint32_t>(memory.load(GuestAddress{op.scratch+64},bits)):status;const auto bytes=memory.load(GuestAddress{op.scratch+64+unit},bits);memory.store(GuestAddress{a[4]},bits,status);memory.store(GuestAddress{a[4]+unit},bits,bytes);
         if(status==0x103U){const auto pending=std::find_if(pending_file_io_.begin(),pending_file_io_.end(),[&](const auto& io){return io.overlapped==op.scratch+64 && !io.done;});
             if(pending==pending_file_io_.end())throw HostCallFault("NT 待命 I/O 缺少共用要求");pending->native_iosb=a[4];pending->native_context=a[3];pending->native_scratch=op.scratch;pending->routine=a[2];keep_scratch=true;
-        }else if(a[2] && (!status || status==0xc0000011U || status==0x80000005U)){threads_.items.at(threads_.current).apcs.push_back({a[2],{a[3],a[4],0}});threads_.yield=true;}
+        }else if(!op.attributes && a[2] && (!status || status==0xc0000011U || status==0x80000005U)){threads_.items.at(threads_.current).apcs.push_back({a[2],{a[3],a[4],0}});threads_.yield=true;}
     }else if(name=="LdrLoadDll"){status=value?0:(last_error_==126?0xc0000135U:last_error_==193?0xc000007bU:status);if(value)memory.store(GuestAddress{a[3]},bits,value);}
     else if(name=="LdrGetProcedureAddress"){status=value?0:0xc0000139U;if(value)memory.store(GuestAddress{a[3]},bits,value);}
     else if(name=="LdrUnloadDll")status=value?0:0xc0000135U;
     else status=value?0:status;
     if(op.scratch && !keep_scratch)(void)free_heap(memory,op.scratch,state);last_error_=op.saved_error;threads_.items.at(threads_.current).last_native_status=status;complete_call(state,memory,status);return std::nullopt;
+}
+}
+// _timespec64／xtime（__time64_t 秒＋long 奈秒）是 UTC 絕對時間；換成 Win32 等待的毫秒數，已過期為 0。
+// MSVCP 等待服務與 worker 上的 _Thrd_sleep 尾跳共用。
+namespace x64arm {
+std::uint32_t WindowsServices::msvcp_wait_milliseconds(GuestMemory& memory,std::uint64_t target) const {
+    constexpr std::int64_t limit=INT64_C(900000000000);
+    const auto seconds=std::clamp(std::bit_cast<std::int64_t>(memory.load(GuestAddress{target},64)),-limit,limit);
+    const auto nanoseconds=static_cast<std::int32_t>(memory.load(GuestAddress{target+8},32));
+    const auto due=seconds*10000000+nanoseconds/100;
+    const auto now=static_cast<std::int64_t>(runtime_.system_filetime()-UINT64_C(116444736000000000));
+    if(due<=now)return 0;
+    return static_cast<std::uint32_t>(std::min<std::int64_t>((due-now+9999)/10000,0xfffffffe));
 }
 }

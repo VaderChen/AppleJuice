@@ -490,6 +490,20 @@ bool WindowsServices::unmap_file_view(GuestMemory& memory,std::uint64_t address,
     memory.discard(GuestAddress{address},static_cast<std::size_t>(view->second.size));runtime_.virtual_page_protections.erase(runtime_.virtual_page_protections.lower_bound(address),runtime_.virtual_page_protections.lower_bound(address+view->second.size));mappings_->views.erase(view);return true;
 #endif
 }
+bool WindowsServices::flush_file_view(std::uint64_t address,std::uint64_t length){
+#if defined(_WIN32)
+    (void)address;(void)length;last_error_=50;return false;
+#else
+    const auto fail=[&](std::uint32_t error){last_error_=error;return false;};
+    if(!mappings_)return fail(487);
+    auto view=mappings_->views.upper_bound(address);if(view==mappings_->views.begin())return fail(487);
+    --view;const auto offset=address-view->first;
+    if(offset>=view->second.size || (length && length>view->second.size-offset))return fail(487);
+    if(view->second.copy)return true;
+    if(::msync(view->second.object->data,static_cast<std::size_t>(view->second.object->size),MS_SYNC))return fail(os_error());
+    return true;
+#endif
+}
 std::uint64_t WindowsServices::map_dib_section(GuestMemory& memory,std::uint64_t handle,std::uint32_t offset,std::uint64_t size,std::uint64_t& view){
     view=0;
 #if defined(_WIN32)
@@ -524,6 +538,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_section(GuestState& stat
     return finish(0xc00000bbU);
 #else
     try{
+        if(service.symbol=="NtFlushVirtualMemory"){
+            if(!current_process_handle(arg(0),8U))return finish(current_process_handle(arg(0))?0xc0000022U:process_object_type(arg(0))==u"Process"?0xc00000bbU:0xc0000008U);
+            const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+            memory.check(GuestAddress{arg(1)},unit,Access::Write);memory.check(GuestAddress{arg(2)},unit,Access::Write);
+            if(arg(3))memory.check(GuestAddress{arg(3)},unit*2,Access::Write);
+            const auto address=memory.load(GuestAddress{arg(1)},bits),length=memory.load(GuestAddress{arg(2)},bits);
+            const auto view=mapping_view_info(address);std::uint32_t status=0;
+            if(!view || (length && length>view->size-(address-view->base)))status=0xc0000019U;
+            else if(!flush_file_view(address,length))status=last_error_==8?0xc0000017U:last_error_==5?0xc0000022U:last_error_==1117?0xc0000185U:0xc000000dU;
+            else{
+                const auto begin=address&~UINT64_C(4095),count=length?length:view->size-(address-view->base);
+                memory.store(GuestAddress{arg(1)},bits,begin);memory.store(GuestAddress{arg(2)},bits,(address-begin+count+4095)&~UINT64_C(4095));
+            }
+            if(arg(3)){memory.store(GuestAddress{arg(3)},bits,status);memory.store(GuestAddress{arg(3)+unit},bits,0);}
+            return finish(status);
+        }
         if(!current_process_handle(arg(1),8U))return finish(current_process_handle(arg(1))?0xc0000022U:process_object_type(arg(1))==u"Process"?0xc00000bbU:0xc0000008U);
         if(!mappings_)return finish(0xc0000008U);const auto found=mappings_->handles.find(arg(0));if(found==mappings_->handles.end())return finish(0xc0000008U);
         if(arg(3) || (arg(7)!=1 && arg(7)!=2) || arg(8))return finish(0xc00000bbU);
@@ -549,8 +579,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
 #if defined(_WIN32)
     fail(50);
 #else
-    (void)mapping_session();
     try{
+    if(service.family!="internal-nt-mapping")if(const auto native=invoke_native_mapping(state,memory,service)){
+        arg.return_to(state,*native);return std::nullopt;
+    }
+    (void)mapping_session();
     if(symbol.find("GetMappedFileName")!=symbol.npos){
         if(!current_process_handle(arg(0),0x400))fail(6);
         else if(!arg(2) || !dword(3))fail(87);
@@ -599,6 +632,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
     }
     else if (symbol.starts_with("CreateFileMapping") || symbol.starts_with("OpenFileMapping")) {
         const bool create = symbol.starts_with("Create"); const auto name_at = arg(create ? 5 : 2);
+        // Native 建立／再次開啟保留原 DesiredAccess；不能為共用 Win32 流程多要求權限，
+        // 再於完成時縮小 handle。新建與既有物件均沿相同權限值，DACL 仍照原流程檢查。
+        const auto create_access=create && service.family=="internal-nt-mapping"?dword(6):0xf001fU;
         const auto security=create?synchronization_descriptor(memory,arg(1)):SynchronizationDescriptor{arg(1)!=0,{}};
         auto name = name_at ? (symbol.ends_with('W') ? read_utf16(memory,GuestAddress{name_at}) : utf8_to_utf16(read_ansi(memory,name_at))) : std::u16string{};
         if(name.starts_with(u"Local\\"))name.erase(0,6);
@@ -609,12 +645,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
             // 已存在時沿用原物件；不能先擴張呼叫者此次傳入的檔案。
             DirectoryLock lock(mappings_->name_space->directory);
             const auto descriptor=shared_object_security(existing.mapping->descriptor);
-            const auto granted=object_security_access(descriptor,0xf001fU,{0x20005U,0x20012U,0x20008U,0xf001fU});
+            const auto granted=object_security_access(descriptor,create_access,{0x20005U,0x20012U,0x20008U,0xf001fU});
             result=runtime_.allocate_wait_handle();mappings_->handles.emplace(result,FileMappingState::Handle{std::move(existing.mapping),granted});runtime_.handle_flags[result]=security.inherit?1U:0U;last_error_=183;
         }
         else if (create && arg(0) != (x86_?UINT32_MAX:UINT64_MAX)) {
             const auto file = files_.find(arg(0));
             if (file == files_.end()) fail(6);
+            else if (file->second.native && file->second.native->null_device()) fail(6);
             else if (!file->second.native) fail(50);
             else if (!(file->second.access & (0x80000000U|1U|0x20U)) || (((protection & 0xffU) == 4 || (protection & 0xffU)==0x40U) && !(file->second.access & (0x40000000U|2U)))) fail(5);
             else {
@@ -632,7 +669,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
                             auto opened=open_mapping(mappings_->name_space,name,bytes,protection,true,security.bytes,&input);
                             if(opened.error)fail(opened.error);
                             else {
-                                const auto granted=opened.existed?object_security_access(shared_object_security(opened.mapping->descriptor),0xf001fU,{0x20005U,0x20012U,0x20008U,0xf001fU}):0xf001fU;
+                                const auto granted=opened.existed?object_security_access(shared_object_security(opened.mapping->descriptor),create_access,{0x20005U,0x20012U,0x20008U,0xf001fU}):create_access;
                                 result=runtime_.allocate_wait_handle();mappings_->handles.emplace(result,FileMappingState::Handle{std::move(opened.mapping),granted});runtime_.handle_flags[result]=security.inherit?1U:0U;last_error_=opened.existed?183U:0U;
                             }
                         }
@@ -644,7 +681,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
                         object->data=::mmap(nullptr,static_cast<std::size_t>(object->size),PROT_READ|PROT_WRITE,
                             (protection&0xffU)==4 || (protection&0xffU)==0x40U?MAP_SHARED:MAP_PRIVATE,object->descriptor,0);
                         if(object->data==MAP_FAILED)fail(os_error());
-                        else {object->security_descriptor=security.bytes;const auto granted=0xf001fU;result=runtime_.allocate_wait_handle();mappings_->handles.emplace(result,FileMappingState::Handle{std::move(object),granted});runtime_.handle_flags[result]=security.inherit?1U:0U;last_error_=0;}
+                        else {object->security_descriptor=security.bytes;const auto granted=create_access;result=runtime_.allocate_wait_handle();mappings_->handles.emplace(result,FileMappingState::Handle{std::move(object),granted});runtime_.handle_flags[result]=security.inherit?1U:0U;last_error_=0;}
                     }
                 }
             }
@@ -655,7 +692,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
             auto opened = open_mapping(mappings_->name_space,name,size,protection,create,security.bytes);
             if (opened.error) fail(opened.error);
             else {
-                const auto access = create ? 0xf001fU : dword(0);
+                const auto access = create ? create_access : dword(0);
                 if (!create && !allows(opened.mapping->protection,access)) fail(5);
                 else {
                     DirectoryLock lock(mappings_->name_space->directory);const auto descriptor=shared_object_security(opened.mapping->descriptor);if(descriptor.empty())throw SecurityDescriptorError{1338};// 新建物件的初始 handle 具完整權限；DACL 保護之後的開啟。
@@ -670,18 +707,34 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
     } else if (symbol == "UnmapViewOfFile") {
         result=unmap_file_view(memory,arg(0));
     } else if (symbol == "FlushViewOfFile") {
-        auto view = mappings_->views.upper_bound(arg(0));
-        if (view == mappings_->views.begin()) fail(487);
-        else {
-            --view;const auto offset=arg(0)-view->first;const auto count=arg(1)?arg(1):view->second.size-offset;
-            if (offset>=view->second.size || count>view->second.size-offset) fail(487);
-            else if (view->second.copy) result=1;
-            else if (::msync(view->second.object->data,static_cast<std::size_t>(view->second.object->size),MS_SYNC)) fail(os_error());
-            else result=1;
-        }
+        result=flush_file_view(arg(0),arg(1));
     } else throw HostCallFault("未知 FileMapping 服務");
-    }catch(const SecurityDescriptorError& error){fail(error.code);}catch(const MemoryFault&){fail(998);}catch(const std::bad_alloc&){fail(8);}
+    }catch(const SecurityDescriptorError& error){fail(error.code);}catch(const MemoryFault&){fail(998);}catch(const std::bad_alloc&){fail(8);}catch(const std::invalid_argument&){fail(123);}
 #endif
     arg.return_to(state,result);return std::nullopt;
+}
+std::uint64_t WindowsServices::map_host_memory(GuestMemory& memory,std::shared_ptr<void> owner,std::span<std::uint8_t> bytes,bool checked){
+    // 與檔案檢視相同的位址搜尋：避開保留區與既有映射，以配置粒度對齊。
+    const auto limit=user_address_limit();const auto size=bytes.size();
+    std::uint64_t address=(runtime_.next_virtual+granularity-1)&~(granularity-1);
+    for(;;){
+        if(address<granularity || address>=limit || size>limit-address)return 0;
+        const auto end=address+size;std::uint64_t conflict_end=0;
+        const auto next=runtime_.virtual_regions.upper_bound(address);
+        if(next!=runtime_.virtual_regions.begin()){const auto previous=std::prev(next);if(previous->first+previous->second.size>address)conflict_end=previous->first+previous->second.size;}
+        if(next!=runtime_.virtual_regions.end() && next->first<end)conflict_end=std::max(conflict_end,next->first+next->second.size);
+        auto mapped=memory.query(GuestAddress{address});if(!mapped)mapped=memory.next_mapping(GuestAddress{address});
+        if(mapped && mapped->base.value<end)conflict_end=std::max(conflict_end,mapped->base.value+mapped->size);
+        if(!conflict_end)break;
+        address=(conflict_end+granularity-1)&~(granularity-1);
+    }
+    if(size>memory.remaining_capacity())return 0;
+    try{
+        // 生命週期由 owner 持有（撤除客體映射前不釋放），長度固定：StableShared 讓客體存取不經受檢慢速路徑。
+        auto backing=std::make_shared<MemoryBacking>(std::move(owner),bytes,checked?MemoryBacking::ExternalAccess::Checked:MemoryBacking::ExternalAccess::StableShared);
+        memory.map_shared(GuestAddress{address},size,read_write,backing,0);
+    }catch(const std::exception&){return 0;}
+    runtime_.next_virtual=(address+size+granularity-1)&~(granularity-1);
+    return address;
 }
 }

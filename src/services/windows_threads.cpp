@@ -705,6 +705,9 @@ void WindowsServices::set_processor_count(GuestMemory &memory, unsigned count) {
         thread.affinity = runtime_.process_affinity;
     }
     memory.set_processor_count(count);
+    // PEB NumberOfProcessors：Windows 程式與客體臨界區段常式（多處理器才自旋）讀取。
+    if (peb_base_.value && memory.mapped(GuestAddress{peb_base_.value}))
+        memory.store(GuestAddress{peb_base_.value + (x86_ ? 0x64 : 0xb8)}, 32, count);
     notify_concurrency_changed();
 }
 bool WindowsServices::set_process_affinity(GuestState &state, std::uint64_t mask) {
@@ -751,6 +754,114 @@ void mark_critical_waiters(std::map<std::uint64_t,CriticalSection>& sections,con
     if(!address)return;
     if(const auto found=sections.find(address);found!=sections.end())found->second.waiters_hint=true;
 }
+}
+// kernel32 臨界區段的客體字組協定（與 guest_thread_x64.s 的 Enter／Leave／TryEnter 常式相同）：
+// LockCount＝-1 未持有；持有時低 30 位元為遞迴次數−1、bit30 表示宿主有等待者；0x7fffffff 為未持有但有等待者。
+// 擁有者以公開 TID 寫在 OwningThread、遞迴次數寫在 RecursionCount，由持有者在取得後寫入、完全釋放前清除。
+// 客體常式只在無等待者時以 lock cmpxchg 取得／釋放；有等待者的釋放一律進宿主喚醒。字組以 CAS 更新，
+// 平行 worker 的客體快速路徑可能同時改寫，CAS 失敗就以新值重新判定。
+namespace {
+constexpr std::uint32_t critical_free=UINT32_MAX,critical_waiters=0x40000000U,critical_free_waiting=0x7fffffffU,critical_count=0x3fffffffU;
+// X64ARM_GUEST_CS=0：臨界區段回到宿主欄位模型（同時停用客體常式），供同成品對照。
+bool guest_critical_enabled(){static const bool enabled=[] {const auto* value=std::getenv("X64ARM_GUEST_CS");return !value || std::string_view(value)!="0";}();return enabled;}
+}
+bool WindowsServices::critical_held(GuestMemory& memory,std::uint64_t address,const CriticalSection& section){
+    if(!section.guest)return section.owner!=0;
+    const auto word=static_cast<std::uint32_t>(memory.load(GuestAddress{address+(x86_?4:8)},32));
+    return word!=critical_free && word!=critical_free_waiting;
+}
+bool WindowsServices::critical_owned_by(GuestMemory& memory,std::uint64_t address,const CriticalSection& section,std::uint64_t thread){
+    if(!section.guest)return section.owner==thread;
+    return critical_held(memory,address,section) && memory.load(GuestAddress{address+(x86_?12:16)},x86_?32:64)==thread_identifier(thread);
+}
+std::uint32_t WindowsServices::critical_recursion(GuestMemory& memory,std::uint64_t address,const CriticalSection& section){
+    if(!section.guest)return section.recursion;
+    return critical_held(memory,address,section)?static_cast<std::uint32_t>(memory.load(GuestAddress{address+(x86_?8:12)},32)):0U;
+}
+bool WindowsServices::critical_acquire(GuestMemory& memory,std::uint64_t address,CriticalSection& section,std::uint64_t thread,bool queue){
+    // 取得（含遞迴）成功回 true；取不到時 queue 為真則設等待者位元，讓持有者的釋放進宿主喚醒。
+    const GuestAddress word{address+(x86_?4:8)},recursion{address+(x86_?8:12)},owner{address+(x86_?12:16)};const std::uint8_t width=x86_?32:64;
+    if(!section.guest){
+        if(section.owner && section.owner!=thread)return false;
+        if(section.recursion==UINT32_MAX)throw HostCallFault("critical section 遞迴過深");
+        section.owner=thread;++section.recursion;
+        memory.store(word,32,section.recursion-1U);memory.store(recursion,32,section.recursion);memory.store(owner,width,thread_identifier(section.owner));
+        return true;
+    }
+    const auto tid=thread_identifier(thread);
+    auto value=static_cast<std::uint32_t>(memory.load(word,32));
+    const auto exchange=[&](std::uint32_t next){
+        const auto seen=static_cast<std::uint32_t>(memory.atomic_rmw(word,32,GuestMemory::AtomicRmw::CompareExchange,next,value));
+        if(seen==value)return true;
+        value=seen;return false;
+    };
+    for(;;){
+        if(value==critical_free || value==critical_free_waiting){
+            // 未持有但有等待者時保留等待者位元：其他等待者仍在，最後一位離開時由宿主清除。
+            if(!exchange(value==critical_free?0U:critical_waiters))continue;
+            memory.store(recursion,32,1);memory.store(owner,width,tid);return true;
+        }
+        if(memory.load(owner,width)==tid){
+            const auto depth=static_cast<std::uint32_t>(memory.load(recursion,32));
+            if((value&critical_count)>=critical_count-1U || depth>=critical_count)throw HostCallFault("critical section 遞迴過深");
+            if(!exchange(value+1U))continue;
+            memory.store(recursion,32,depth+1U);return true;
+        }
+        if(!queue || (value&critical_waiters))return false;
+        if(exchange(value|critical_waiters))return false;
+    }
+}
+bool WindowsServices::critical_wait_needed(GuestMemory& memory,std::uint64_t address,CriticalSection& section,std::uint64_t thread){
+    // 單槽阻塞前的判定：由其他執行緒持有才需等待，並先設等待者位元；未持有或自己持有交回一般路徑。
+    if(!section.guest)return section.owner && section.owner!=thread;
+    const GuestAddress word{address+(x86_?4:8)};
+    auto value=static_cast<std::uint32_t>(memory.load(word,32));
+    for(;;){
+        if(value==critical_free || value==critical_free_waiting)return false;
+        if(memory.load(GuestAddress{address+(x86_?12:16)},x86_?32:64)==thread_identifier(thread))return false;
+        if(value&critical_waiters)return true;
+        const auto seen=static_cast<std::uint32_t>(memory.atomic_rmw(word,32,GuestMemory::AtomicRmw::CompareExchange,value|critical_waiters,value));
+        if(seen==value)return true;
+        value=seen;
+    }
+}
+bool WindowsServices::critical_release(GuestMemory& memory,std::uint64_t address,CriticalSection& section){
+    // 釋放一層；呼叫端已確認持有。回傳是否需要解析等待者（完全釋放且有等待者）。
+    const GuestAddress word{address+(x86_?4:8)},recursion{address+(x86_?8:12)},owner{address+(x86_?12:16)};const std::uint8_t width=x86_?32:64;
+    if(!section.guest){
+        if(!--section.recursion)section.owner=0;
+        memory.store(word,32,section.recursion-1U);memory.store(recursion,32,section.recursion);memory.store(owner,width,thread_identifier(section.owner));
+        return !section.owner;
+    }
+    const auto depth=static_cast<std::uint32_t>(memory.load(recursion,32));
+    if(depth>1){memory.store(recursion,32,depth-1U);(void)memory.atomic_rmw(word,32,GuestMemory::AtomicRmw::Add,UINT32_MAX);return false;}
+    memory.store(owner,width,0);memory.store(recursion,32,0);
+    auto value=static_cast<std::uint32_t>(memory.load(word,32));
+    for(;;){
+        const auto next=(value&critical_waiters)?critical_free_waiting:critical_free;
+        const auto seen=static_cast<std::uint32_t>(memory.atomic_rmw(word,32,GuestMemory::AtomicRmw::CompareExchange,next,value));
+        if(seen==value)return (value&critical_waiters)!=0;
+        value=seen;
+    }
+}
+void WindowsServices::critical_settle_waiters(GuestMemory& memory,std::uint64_t address,CriticalSection& section){
+    // 解析後沒有任何等待者時清除等待者位元，之後的取得／釋放回到客體快速路徑。
+    if(!section.guest)return;
+    const bool waiting=std::any_of(threads_.items.begin(),threads_.items.end(),[&](const auto& entry){
+        const auto& thread=entry.second;const auto& wait=thread.wait;
+        if(thread.status!=ThreadStatus::Waiting)return false;
+        if(wait.kind==ThreadWaitKind::Critical || wait.kind==ThreadWaitKind::CriticalRetry)return !wait.handles.empty() && wait.handles[0]==address;
+        return wait.kind==ThreadWaitKind::Condition && wait.critical && wait.handles.size()>1 && wait.handles[1]==address;
+    });
+    if(waiting)return;
+    const GuestAddress word{address+(x86_?4:8)};
+    auto value=static_cast<std::uint32_t>(memory.load(word,32));
+    while((value&critical_waiters) && value!=critical_free){
+        const auto next=value==critical_free_waiting?critical_free:(value&~critical_waiters);
+        const auto seen=static_cast<std::uint32_t>(memory.atomic_rmw(word,32,GuestMemory::AtomicRmw::CompareExchange,next,value));
+        if(seen==value)break;
+        value=seen;
+    }
 }
 std::vector<std::pair<std::uint64_t, GuestThread *>> WindowsServices::live_threads() {
     // 迴圈本體可能再查詢索引，只在鎖內複製快照；表中節點不移除，指標在程序期間有效。
@@ -1075,7 +1186,10 @@ bool WindowsServices::resident_block_service_impl(GuestState& state,GuestMemory&
     const auto symbol=descriptor->symbol;
     const bool wait_service=symbol=="WaitForSingleObject" || symbol=="WaitForSingleObjectEx" ||
         symbol=="WaitForMultipleObjects" || symbol=="WaitForMultipleObjectsEx";
-    if(!wait_service && symbol!="Sleep" && symbol!="SleepEx" && symbol!="SwitchToThread" && symbol!="EnterCriticalSection")return false;
+    // SleepConditionVariableSRW 同樣登記等待後換手（電馭判客 Benchmark 每秒數百次原本全停）；X64ARM_RESIDENT_BLOCK_CONDITION=0 交回全停。
+    static const bool block_condition=[] {const auto* value=std::getenv("X64ARM_RESIDENT_BLOCK_CONDITION");return !value || std::string_view(value)!="0";}();
+    const bool condition_service=block_condition && symbol=="SleepConditionVariableSRW";
+    if(!wait_service && !condition_service && symbol!="Sleep" && symbol!="SleepEx" && symbol!="SwitchToThread" && symbol!="EnterCriticalSection")return false;
     const auto key=resident_context_key(state);
     const auto found=threads_.items.find(key);
     // slot 0 的目前客體活體狀態在協調者的 GuestState；換手時以 switch_resident_current 保存／載入（與 schedule 相同），
@@ -1111,13 +1225,27 @@ bool WindowsServices::resident_block_service_impl(GuestState& state,GuestMemory&
         return true;
     }
     ThreadWait wait;
-    if(symbol=="EnterCriticalSection"){
+    // 條件變數睡眠要先釋放 SRW：確定可換手（或停駐）後才寫入字組，寫入失敗時尚未改任何狀態。
+    struct {std::uint64_t address{},expected{},next{};bool pending{};} srw_release;
+    if(condition_service){
+        // 與完整路徑相同：釋放 SRW（共用模式減一個持有者、獨占清 bit0）後登記 Condition 等待，喚醒時由等待解析重新取得。
+        // 字組有宿主等待者（bit1，釋放後須喚醒）、旗標非法、逾時 0、未持有或記憶體不可寫，交回完整路徑。
+        const auto condition=arg(0),address=arg(1);const auto flags=static_cast<std::uint32_t>(arg(3)),timeout=static_cast<std::uint32_t>(arg(2));
+        if((flags&~1U) || !timeout)return false;
+        try{memory.check(GuestAddress{condition},8,Access::Write);memory.check(GuestAddress{address},8,Access::Write);}catch(...){return false;}
+        const bool shared=flags&1U;const auto word=memory.load(GuestAddress{address},64);
+        if((shared?!(word>>2):!(word&1U)) || (word&2U))return false;
+        wait.kind=ThreadWaitKind::Condition;wait.handles={condition,address};wait.shared=shared;wait.critical=false;
+        wait.deadline=timeout==UINT32_MAX?UINT64_MAX:runtime_.clock_ticks+std::uint64_t{timeout}*10000;
+        srw_release={address,word,shared?word-4:word&~UINT64_C(1),true};
+    }else if(symbol=="EnterCriticalSection"){
         // 臨界區段競爭：與 provider 相同地以 Critical 等待阻塞（擁有者釋放時由等待解析直接取得並完成呼叫）。
         // 無競爭、遞迴或 loader lock 交回一般路徑。
         const auto address=arg(0);
         if(address==peb_base_.value+0x800)return false;
         const auto section=runtime_.critical_sections.find(address);
-        if(section==runtime_.critical_sections.end() || !section->second.owner || section->second.owner==key)return false;
+        // 由其他執行緒持有才阻塞；客體字組協定下同時設等待者位元，持有者的釋放會進宿主喚醒。
+        if(section==runtime_.critical_sections.end() || !critical_wait_needed(memory,address,section->second,key))return false;
         wait.kind=ThreadWaitKind::Critical;wait.handles={address};
     }else if(wait_service){
         const bool multiple=symbol.find("Multiple")!=std::string_view::npos;
@@ -1150,6 +1278,8 @@ bool WindowsServices::resident_block_service_impl(GuestState& state,GuestMemory&
     if(wait.alertable && !thread.apcs.empty())return false;
     auto* best=select_replacement();
     if(!best && !resident_block_parking()){if(outcome)*outcome=1;return false;}
+    if(srw_release.pending && memory.atomic_rmw(GuestAddress{srw_release.address},64,GuestMemory::AtomicRmw::CompareExchange,srw_release.next,srw_release.expected)!=srw_release.expected)
+        return false; // 字組在核對後被改寫（客體常式並行取得等待位元）：尚未登記等待，交回完整路徑。
     thread.wait=std::move(wait);thread.status=ThreadStatus::Waiting;thread.parallel_slice_deadline=0;
     mark_critical_waiters(runtime_.critical_sections,thread.wait);
     if(!best){
@@ -2392,7 +2522,7 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
         }
         if (wait.kind == ThreadWaitKind::CriticalRetry) {
             const auto &section = runtime_.critical_sections.at(wait.handles[0]);
-            if (!section.owner || section.owner == id) {
+            if (!critical_held(memory, wait.handles[0], section) || critical_owned_by(memory, wait.handles[0], section, id)) {
                 thread.status = ThreadStatus::Runnable;
                 thread.wait = {};
             }
@@ -2401,7 +2531,8 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
         if(wait.kind==ThreadWaitKind::CrtLockRetry){
             const auto& locks=wait.critical?runtime_.critical_sections:runtime_.file_locks;
             const auto section=locks.find(wait.handles[0]);
-            if(section==locks.end() || !section->second.owner || section->second.owner==id){thread.status=ThreadStatus::Runnable;thread.wait={};}
+            if(section==locks.end() || (wait.critical?!critical_held(memory,wait.handles[0],section->second) || critical_owned_by(memory,wait.handles[0],section->second,id):
+                                        !section->second.owner || section->second.owner==id)){thread.status=ThreadStatus::Runnable;thread.wait={};}
             continue; // 重試完整 CRT 呼叫，不能當成 _lock_file 已成功返回。
         }
         if (wait.kind == ThreadWaitKind::LoaderRetry) {
@@ -2410,15 +2541,11 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             continue;
         }
         if (wait.kind == ThreadWaitKind::Critical) {
+            // 等待者依共用協定取得；取不到時保持（或補設）等待者位元，下一次釋放再解析。
             auto &section = runtime_.critical_sections.at(wait.handles[0]);
-            if (!section.owner) {
-                section.owner = id;
-                section.recursion = 1;
+            if (critical_acquire(memory, wait.handles[0], section, id, true)) {
                 ready = true;
                 result = 0;
-                memory.store(GuestAddress{wait.handles[0] + (x86_ ? 4 : 8)}, 32, 0);
-                memory.store(GuestAddress{wait.handles[0] + (x86_ ? 8 : 12)}, 32, 1);
-                memory.store(GuestAddress{wait.handles[0] + (x86_ ? 12 : 16)}, x86_ ? 32 : 64, thread_identifier(id));
             }
         }
         if (wait.kind == ThreadWaitKind::CrtLock && wait.handles[0] == UINT64_MAX && guest_locale_lock_state_.value) {
@@ -2473,13 +2600,8 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             const auto address = wait.handles[1];
             if (wait.critical) {
                 auto &section = runtime_.critical_sections.at(address);
-                if (section.owner)
+                if (!critical_acquire(memory, address, section, id, true))
                     continue;
-                section.owner = id;
-                section.recursion = 1;
-                memory.store(GuestAddress{address + (x86_ ? 4 : 8)}, 32, 0);
-                memory.store(GuestAddress{address + (x86_ ? 8 : 12)}, 32, 1);
-                memory.store(GuestAddress{address + (x86_ ? 12 : 16)}, x86_ ? 32 : 64, thread_identifier(id));
             } else {
                 // 依字組重新取得；取不到時已設等待位，持有者釋放會進宿主再解析。
                 if (!acquire_slim_word(memory, address, id, wait.shared))
@@ -3148,6 +3270,7 @@ std::optional<std::uint32_t> WindowsServices::finish_thread(GuestState &state, G
     if(retired_id!=1){
         if(retired_size && memory.mapped(GuestAddress{retired_stack}))memory.unmap(GuestAddress{retired_stack},static_cast<std::size_t>(retired_size));
         runtime_.virtual_page_protections.erase(runtime_.virtual_page_protections.lower_bound(retired_stack),runtime_.virtual_page_protections.lower_bound(retired_stack+retired_size));
+        if(retired_teb)guest_heap_flush_thread_cache(memory,retired_teb);
         if(retired_teb && memory.mapped(GuestAddress{retired_teb}))memory.unmap(GuestAddress{retired_teb},x86_?0x4000:GUEST_CRT_TEB_SIZE);
         if(retired_exceptions && memory.mapped(GuestAddress{retired_exceptions}))memory.unmap(GuestAddress{retired_exceptions},0x20000);
         thread.stack_size=0;thread.teb=0;thread.exception_area=0;thread.errno_cell=0;
@@ -3764,14 +3887,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 memory.check(GuestAddress{address}, critical ? (x86_ ? 24 : 40) : (x86_ ? 4 : 8), Access::Write);
                 if (critical) {
                     const auto found = runtime_.critical_sections.find(address);
-                    if (found == runtime_.critical_sections.end() || found->second.owner != threads_.current ||
-                        found->second.recursion != 1)
+                    if (found == runtime_.critical_sections.end() || !critical_owned_by(memory, address, found->second, threads_.current) ||
+                        critical_recursion(memory, address, found->second) != 1)
                         throw HostCallFault("條件變數必須搭配只取得一次的 critical section");
-                    found->second.owner = 0;
-                    found->second.recursion = 0;
-                    memory.store(GuestAddress{address + (x86_ ? 4 : 8)}, 32, UINT32_MAX);
-                    memory.store(GuestAddress{address + (x86_ ? 8 : 12)}, 32, 0);
-                    memory.store(GuestAddress{address + (x86_ ? 12 : 16)}, x86_ ? 32 : 64, 0);
+                    // 釋放時若有其他執行緒在等此臨界區段，先交給它們（登記本執行緒的條件等待前沒有客體排程切點）。
+                    if (critical_release(memory, address, found->second)) {
+                        resolve_thread_waits(memory, ThreadWakeScope::Critical, address);
+                        critical_settle_waiters(memory, address, found->second);
+                    }
                 } else {
                     const std::uint8_t width = x86_ ? 32 : 64;
                     auto word = memory.load(GuestAddress{address}, width);
@@ -4203,7 +4326,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             if (symbol == "InitializeCriticalSectionEx" && (u32(2) & 0xe0000000U))
                 fail(87);
             else {
-                CriticalSection section;
+                CriticalSection section;section.guest = guest_critical_enabled();
                 section.spin = symbol == "InitializeCriticalSection" ? 0 : u32(1);
                 memory.write(GuestAddress{address}, std::vector<std::uint8_t>(x86_ ? 24 : 40));
                 memory.store(GuestAddress{address + (x86_ ? 4 : 8)}, 32, UINT32_MAX);
@@ -4242,7 +4365,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                     for (const auto& [id, thread] : threads_.items)
                         if (thread.status != ThreadStatus::Exited && thread_identifier(id) == owner_tid) {owner = id;valid = true;break;}
                 if (valid) {
-                    CriticalSection section;section.owner = owner;section.recursion = recursion;
+                    // 擁有權仍以客體欄位為準（客體字組協定）；未登錄的物件不會有宿主等待者，字組即遞迴次數−1。
+                    CriticalSection section;section.guest = guest_critical_enabled();section.owner = section.guest ? 0 : owner;section.recursion = section.guest ? 0 : recursion;
                     section.spin = static_cast<std::uint32_t>(memory.load(GuestAddress{address + (x86_ ? 20 : 32)}, width));
                     if (debug && debug != (x86_ ? UINT32_MAX : UINT64_MAX)) {
                         try {
@@ -4293,7 +4417,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 });
                 // 舊 runtime 的物件解構可能仍持有自己的鎖。沒有其他參與者時實際
                 // 回收資源；其他執行緒持有或仍在等待的未定義用法保留明確診斷。
-                if ((section.owner && section.owner!=threads_.current) || waiting)
+                if ((critical_held(memory,address,section) && !critical_owned_by(memory,address,section,threads_.current)) || waiting)
                     throw HostCallFault("不可刪除其他執行緒持有或等待中的 critical section");
                 if (section.debug)
                     (void)free_heap(memory, section.debug, state);
@@ -4305,17 +4429,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 runtime_.critical_sections.erase(adopted);
             } else {
                 if (symbol == "LeaveCriticalSection") {
-                    if (section.owner != threads_.current || !section.recursion)
+                    if (!critical_owned_by(memory, address, section, threads_.current) || !critical_recursion(memory, address, section))
                         throw HostCallFault("執行緒未持有 critical section");
-                    if (!--section.recursion)
-                        section.owner = 0;
-                } else if (!section.owner || section.owner == threads_.current) {
-                    if (section.recursion == UINT32_MAX)
-                        throw HostCallFault("critical section 遞迴過深");
-                    section.owner = threads_.current;
-                    ++section.recursion;
+                    if (critical_release(memory, address, section)) {
+                        resolve_thread_waits(memory,ThreadWakeScope::Critical,address);
+                        critical_settle_waiters(memory, address, section);
+                    }
+                } else if (critical_acquire(memory, address, section, threads_.current, symbol == "EnterCriticalSection"))
                     result = 1;
-                } else if (symbol == "TryEnterCriticalSection")
+                else if (symbol == "TryEnterCriticalSection")
                     result = 0;
                 else {
                     auto &thread = threads_.items.at(threads_.current);
@@ -4326,12 +4448,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                     schedule(state, memory);
                     return std::nullopt;
                 }
-                memory.store(GuestAddress{address + (x86_ ? 4 : 8)}, 32, section.recursion - 1U);
-                memory.store(GuestAddress{address + (x86_ ? 8 : 12)}, 32, section.recursion);
-                // Win32 可見的擁有者使用公開 TID；排程與鎖表仍以內部 ID 索引。
-                memory.store(GuestAddress{address + (x86_ ? 12 : 16)}, x86_ ? 32 : 64, thread_identifier(section.owner));
-                if(symbol=="LeaveCriticalSection" && !section.owner)
-                    resolve_thread_waits(memory,ThreadWakeScope::Critical,address);
             }
         }
     } else if (symbol == "CreateThread" || symbol == "_beginthreadex" || symbol == "CreateRemoteThread" ||

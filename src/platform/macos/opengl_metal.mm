@@ -111,12 +111,13 @@ class MetalGl final:public NativeOpenGlContext {
     MetalPendingObjects graphics_pending_;
     struct Flight {id<MTLCommandBuffer> command;std::vector<std::shared_ptr<GpuMemoryReservation>> leases;MetalPendingObjects objects;std::shared_ptr<std::atomic<bool>> done;std::shared_ptr<MetalFenceRelays> relays;};
     std::deque<Flight> flights_;
-    std::size_t flight_limit_{3},flight_peak_{};
+    std::size_t flight_limit_{3},flight_peak_{};bool flight_explicit_{};
     std::uint64_t wait_count_{},wait_ns_{},resource_wait_count_{};
     std::uint64_t constant_upload_skips_{},constant_upload_saved_bytes_{};
     // 鍵為數百位元組的二進位欄位串接；有序 map 每次查找要做十幾次長字串比較，改為雜湊。
     std::unordered_map<std::string,id<MTLRenderPipelineState>> graphics_pipelines_;
     std::shared_ptr<MetalBufferPool> discard_pool_{std::make_shared<MetalBufferPool>()};std::uint64_t discard_in_place_{};
+    MetalTimestampPool timestamp_pool_;
     std::shared_ptr<std::atomic<bool>> commands_done_;
     std::shared_ptr<MetalFenceRelays> commands_relays_;
     #include "metal_state_cache.inc"
@@ -363,7 +364,7 @@ class MetalGl final:public NativeOpenGlContext {
     }
 public:
     MetalGl(void* view,unsigned w,unsigned h){@autoreleasepool{
-        if(const char* value=std::getenv("X64ARM_METAL_IN_FLIGHT")){char* end=nullptr;const auto count=std::strtoul(value,&end,10);if(!*value || *end || count<1 || count>8)throw std::invalid_argument("X64ARM_METAL_IN_FLIGHT 必須為 1–8");flight_limit_=count;}
+        if(const char* value=std::getenv("X64ARM_METAL_IN_FLIGHT")){char* end=nullptr;const auto count=std::strtoul(value,&end,10);if(!*value || *end || count<1 || count>8)throw std::invalid_argument("X64ARM_METAL_IN_FLIGHT 必須為 1–8");flight_limit_=count;flight_explicit_=true;}
         device_=MTLCreateSystemDefaultDevice();if(!device_)throw std::runtime_error("無可用 Metal GPU");queue_=[device_ newCommandQueue];NSError* e=nil;library_=fixed_metal_library(device_,&e);if(!library_ || !queue_)throw std::runtime_error(std::string("Metal GL shader: ")+(e?e.localizedDescription.UTF8String:"queue unavailable"));
         auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];d.storageMode=MTLStorageModeShared;d.usage=MTLTextureUsageShaderRead;Texture black;black.lease=reserve_gpu_memory(4);black.native=[device_ newTextureWithDescriptor:d];if(!black.native)throw std::bad_alloc{};const std::array<std::uint8_t,4> pixel{0,0,0,255};[black.native replaceRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0 withBytes:pixel.data() bytesPerRow:4];textures_[UINT32_MAX]=std::move(black);
         pipeline(false);pipeline(true,false);
@@ -424,6 +425,8 @@ public:
         draw({},types[input.topology-1],false,0,&fixed);
     }}
     std::shared_ptr<GraphicsResource> graphics_resource(const GraphicsResourceDesc&)override;
+    std::shared_ptr<GraphicsResource> graphics_buffer_alias(std::shared_ptr<void>,std::span<std::uint8_t>)override;
+    void graphics_submission_depth(std::uint32_t depth)override{if(!flight_explicit_)flight_limit_=std::clamp<std::size_t>(depth,1,16);}
     GraphicsView graphics_drawable(bool depth)override{
         auto resource=std::make_shared<MetalResource>();resource->texture=depth?depth_:color_;resource->lease=surface_;
         auto& desc=resource->desc;desc.dimension=3;desc.width=width_;desc.height=height_;desc.format=depth?20:87;desc.bind=depth?0x40:0x28;
@@ -449,6 +452,7 @@ public:
     id residency_set_;bool residency_dirty_{};id<MTLTexture> null_texture_;
     std::vector<std::uint8_t> graphics_read_completed(const GraphicsView&)override;
     void graphics_copy(const GraphicsView&,const GraphicsView&,std::array<std::uint32_t,3>,std::array<std::uint32_t,6>)override;
+    bool graphics_copy_buffer_texture(const GraphicsView&,const GraphicsView&,std::uint64_t,std::uint32_t,std::uint32_t,std::array<std::uint32_t,6>,bool)override;
     void graphics_resolve(const GraphicsView&,const GraphicsView&,std::uint32_t)override;
     void graphics_clear(const GraphicsView&,std::array<float,4>,std::uint32_t)override;
     bool graphics_clear_unordered(const GraphicsView&,std::array<std::uint32_t,4>,bool)override;

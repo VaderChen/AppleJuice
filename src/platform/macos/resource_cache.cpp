@@ -1,4 +1,5 @@
 #include "x64arm/resource_cache.hpp"
+#include "x64arm/retained_capacity.hpp"
 #include <CommonCrypto/CommonDigest.h>
 #include <compression.h>
 #include <algorithm>
@@ -43,12 +44,7 @@ struct ResourcePolicy {std::uint64_t bytes;std::size_t stores;};
 const ResourcePolicy& policy(){
     // 只在程序首次使用時讀取；環境選項僅能縮小內建上限，不能在使用中放大額度。
     static const ResourcePolicy value=[] {
-        const auto lower=[](const char* name,std::uint64_t maximum){
-            const auto* text=std::getenv(name);if(!text || !*text)return maximum;std::uint64_t value{};
-            const auto end=text+std::strlen(text);const auto parsed=std::from_chars(text,end,value);
-            return parsed.ec==std::errc{} && parsed.ptr==end?std::min(value,maximum):maximum;
-        };
-        return ResourcePolicy{lower("X64ARM_RESOURCE_CACHE_TOTAL_BYTES",maximum_retained_bytes),static_cast<std::size_t>(lower("X64ARM_RESOURCE_CACHE_MAX_STORES",maximum_stores))};
+        return ResourcePolicy{retained_capacity_setting("X64ARM_RESOURCE_CACHE_TOTAL_BYTES",maximum_retained_bytes),static_cast<std::size_t>(retained_capacity_setting("X64ARM_RESOURCE_CACHE_MAX_STORES",maximum_stores))};
     }();return value;
 }
 void add_live(std::atomic<std::uint64_t>& live,std::atomic<std::uint64_t>& peak,std::uint64_t bytes){
@@ -57,11 +53,8 @@ void add_live(std::atomic<std::uint64_t>& live,std::atomic<std::uint64_t>& peak,
 }
 void add_time(std::atomic<std::uint64_t>& counter,double milliseconds){counter.fetch_add(static_cast<std::uint64_t>(milliseconds*1000000),std::memory_order_relaxed);}
 bool reserve_payload(std::uint64_t bytes){
-    const auto limit=policy().bytes;auto used=counters.payload_reserved_bytes.load(std::memory_order_relaxed);
-    do{if(bytes>limit || used>limit-bytes){counters.budget_rejections.fetch_add(1,std::memory_order_relaxed);return false;}}
-    while(!counters.payload_reserved_bytes.compare_exchange_weak(used,used+bytes,std::memory_order_relaxed));
-    auto peak=counters.peak_payload_reserved_bytes.load(std::memory_order_relaxed);while(used+bytes>peak && !counters.peak_payload_reserved_bytes.compare_exchange_weak(peak,used+bytes,std::memory_order_relaxed)){}
-    return true;
+    return reserve_retained_capacity(bytes,policy().bytes,counters.payload_reserved_bytes,
+        counters.peak_payload_reserved_bytes,counters.budget_rejections);
 }
 template<class T> struct RetainedAllocator {
     using value_type=T;

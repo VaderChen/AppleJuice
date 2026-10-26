@@ -112,6 +112,12 @@ public:
     virtual void graphics_fixed_stencil(const std::array<std::uint32_t,12>&){throw std::runtime_error("後端缺少固定管線雙面 stencil");}
     virtual void graphics_fixed_draw(const FixedGraphicsDraw&){throw std::runtime_error("後端缺少固定管線頂點處理");}
     virtual std::shared_ptr<GraphicsResource> graphics_resource(const GraphicsResourceDesc&){throw std::runtime_error("後端缺少可程式化資源");}
+    // 零複製緩衝：以呼叫端的宿主記憶體（宿主分頁對齊、長度為分頁倍數）作為緩衝內容，GPU 直接讀寫同一段記憶體；
+    // owner 持有記憶體直到資源釋放。後端不支援或位址不符時回傳空值，呼叫端改用一般資源加上傳。
+    virtual std::shared_ptr<GraphicsResource> graphics_buffer_alias(std::shared_ptr<void>,std::span<std::uint8_t>){return nullptr;}
+    // 在途命令緩衝上限：每幀多次提交、由應用程式以 fence 控制幀數的 API（D3D12）可提高，CPU 不必每幾次提交就等 GPU。
+    // 預設後端不限制；明確設定的環境變數優先。
+    virtual void graphics_submission_depth(std::uint32_t){}
     virtual bool graphics_samples_supported(std::uint32_t,std::uint32_t){return false;}
     virtual bool graphics_vertex_format_supported(std::uint32_t){return false;}
     // 呼叫端之後會修改物件（例如加上串流輸出宣告）時使用：後端可依內容共用編譯結果，但回傳私有物件。
@@ -137,6 +143,9 @@ public:
     // 非同步後端也不先排空命令佇列。只用於不會被 discard 改名的緩衝；預設沿用 graphics_read。
     virtual std::vector<std::uint8_t> graphics_read_completed(const GraphicsView& view){return graphics_read(view);}
     virtual void graphics_copy(const GraphicsView&,const GraphicsView&,std::array<std::uint32_t,3>,std::array<std::uint32_t,6>){throw std::runtime_error("後端缺少資源複製");}
+    // 緩衝足跡與紋理子資源之間的 GPU 複製（依命令順序，不經 CPU）：offset／row／image 是緩衝端位移、列距與層距，
+    // box 是紋理端範圍（texel）。to_texture 為 true 時緩衝→紋理。格式或對齊不支援時回傳 false 且不排入任何命令。
+    virtual bool graphics_copy_buffer_texture(const GraphicsView&,const GraphicsView&,std::uint64_t,std::uint32_t,std::uint32_t,std::array<std::uint32_t,6>,bool){return false;}
     virtual void graphics_resolve(const GraphicsView&,const GraphicsView&,std::uint32_t){throw std::runtime_error("後端缺少多重取樣 resolve");}
     virtual void graphics_clear(const GraphicsView&,std::array<float,4>,std::uint32_t){throw std::runtime_error("後端缺少清除操作");}
     virtual bool graphics_clear_unordered(const GraphicsView&,std::array<std::uint32_t,4>,bool){throw std::runtime_error("後端缺少 UAV 清除操作");}

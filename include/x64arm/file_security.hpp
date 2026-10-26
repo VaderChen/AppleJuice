@@ -1,5 +1,6 @@
 #pragma once
 #include "x64arm/security_descriptor.hpp"
+#include <array>
 #include <optional>
 
 namespace x64arm {
@@ -21,6 +22,21 @@ struct NativeFileSecurity {
     Bytes mandatory_label;
     std::optional<Bytes> mapped_descriptor; // Windows 虛擬 owner／group／ACL，綁定同一份原生 ACL。
 };
+
+// 索引仍持有的物件與 vector capacity；不含呼叫端副本、淘汰後仍在複製中的參照、
+// allocator／map／deque 開銷，也不代表程序 RSS。固定大小統計不保存逐筆存取歷史。
+struct NativeFileSecurityCacheStats {
+    std::uint64_t entries{}, entry_limit{}, object_bytes{}, dynamic_bytes{}, peak_indexed_bytes{};
+    std::uint64_t hits{}, misses{}, insertions{}, duplicate_insertions{}, evictions{}, invalidations{};
+    std::uint64_t acl_entries{}, largest_dynamic_bytes{};
+    // 物件、動態 capacity 與控制區額度；含已移出索引但仍被複製的物件，另有 4096 筆索引上限。
+    // 不含 malloc rounding、map／deque 與呼叫端回傳副本，不是整程序記憶體上限。
+    std::uint64_t byte_limit{},reserved_bytes{},peak_reserved_bytes{},indexed_charged_bytes{};
+    std::uint64_t budget_rejections{},allocation_rejections{};
+    // 每筆動態容量：0、1～256、257～4096、4097～65536、65537 以上。
+    std::array<std::uint64_t,5> size_buckets{};
+};
+NativeFileSecurityCacheStats native_file_security_cache_stats();
 
 // 同一個已固定 inode 的描述符提供 UID／GID、mode 與原生 ACL。
 NativeFileSecurity read_native_file_security(const HostFile&, bool with_acl);

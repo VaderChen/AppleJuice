@@ -19,6 +19,16 @@ bool MetalGl::graphics_samples_supported(std::uint32_t format,std::uint32_t samp
     if(format==1 || format==2 || format==15 || format==16 || format==39 || format==41){if(@available(macOS 11.0,*)){if(!device_.supports32BitMSAA)return false;}else return false;}
     return [device_ supportsTextureSampleCount:samples];
 }}
+std::shared_ptr<GraphicsResource> MetalGl::graphics_buffer_alias(std::shared_ptr<void> owner,std::span<std::uint8_t> bytes){@autoreleasepool{
+    // newBufferWithBytesNoCopy 要求宿主分頁對齊的位址與分頁倍數長度；共享儲存模式下 CPU 寫入不需另外標記。
+    // 記憶體屬於呼叫端（客體同時映射），不另計 GPU 額度；不清零（呼叫端的記憶體內容即緩衝內容）。
+    const auto page=static_cast<std::uintptr_t>(getpagesize());
+    if(!owner || bytes.empty() || bytes.size()>UINT32_MAX || reinterpret_cast<std::uintptr_t>(bytes.data())%page || bytes.size()%page)return nullptr;
+    auto r=std::make_shared<MetalResource>();r->desc.dimension=1;r->desc.width=static_cast<std::uint32_t>(bytes.size());r->desc.bind=0x8c;
+    r->buffer=[device_ newBufferWithBytesNoCopy:bytes.data() length:bytes.size() options:MTLResourceStorageModeShared deallocator:nil];
+    if(!r->buffer)return nullptr;
+    r->host_owner=std::move(owner);return r;
+}}
 std::shared_ptr<GraphicsResource> MetalGl::graphics_resource(const GraphicsResourceDesc& d){@autoreleasepool{
     auto r=std::make_shared<MetalResource>();r->desc=d;
     if(!d.width || !d.levels || !d.layers || !d.depth || !d.samples || (d.dimension!=1 && d.width>16384) || d.height>16384 || d.depth>2048 || d.layers>2048)throw std::invalid_argument("資源尺寸不合法");
@@ -435,6 +445,28 @@ std::vector<std::uint8_t> MetalGl::graphics_read_completed(const GraphicsView& v
     const auto* p=static_cast<const std::uint8_t*>(r.buffer.contents)+v.first;
     return std::vector<std::uint8_t>(p,p+count);
 }
+bool MetalGl::graphics_copy_buffer_texture(const GraphicsView& texture,const GraphicsView& buffer,std::uint64_t offset,std::uint32_t row,std::uint32_t image,std::array<std::uint32_t,6> box,bool to_texture){@autoreleasepool{
+    // 深度／模板、MSAA 與 RGB32（實體為 RGBA32）不走此路徑，由呼叫端沿用讀寫路徑。
+    auto& t=metal_resource(texture.resource);auto& b=metal_resource(buffer.resource);
+    if(!t.texture || !b.buffer || t.desc.samples!=1 || metal_depth_format(t.texture.pixelFormat) || (t.desc.format>=5 && t.desc.format<=8) ||
+       texture.level>=t.desc.levels || texture.slice>=t.desc.layers)return false;
+    const auto w=std::max(1U,t.desc.width>>texture.level),h=std::max(1U,t.desc.height>>texture.level),z=std::max(1U,t.desc.depth>>texture.level);
+    if(box[0]>=box[3] || box[1]>=box[4] || box[2]>=box[5] || box[3]>w || box[4]>h || box[5]>z)return false;
+    // 壓縮格式的範圍須對齊區塊或到達 mip 邊緣；位移與列距須為像素（區塊）大小的倍數。
+    if(graphics_format_bc_family(t.desc.format) && (box[0]%4 || box[1]%4 || (box[3]%4 && box[3]!=w) || (box[4]%4 && box[4]!=h)))return false;
+    const auto element=graphics_format_pitch(t.desc.format,1,1)[0];const auto pitch=graphics_format_pitch(t.desc.format,box[3]-box[0],box[4]-box[1]);
+    const auto depth=box[5]-box[2];
+    if(!element || offset%element || row%element || row<pitch[0] || (depth>1 && image<std::uint64_t{row}*pitch[1]))return false;
+    const auto bytes=std::uint64_t{image}*(depth-1)+std::uint64_t{row}*(pitch[1]-1)+pitch[0];
+    if(offset>b.buffer.length || bytes>b.buffer.length-offset)return false;
+    const auto per_image=t.desc.dimension==4?static_cast<NSUInteger>(image):0;
+    begin_commands(true,to_texture?"copy_buffer_texture":"copy_texture_buffer");auto e=[commands_ blitCommandEncoder];MetalEncoderScope scope{e};
+    if(to_texture)[e copyFromBuffer:b.buffer sourceOffset:static_cast<NSUInteger>(offset) sourceBytesPerRow:row sourceBytesPerImage:per_image sourceSize:MTLSizeMake(box[3]-box[0],box[4]-box[1],depth)
+                         toTexture:t.texture destinationSlice:texture.slice destinationLevel:texture.level destinationOrigin:MTLOriginMake(box[0],box[1],box[2])];
+    else {[e copyFromTexture:t.texture sourceSlice:texture.slice sourceLevel:texture.level sourceOrigin:MTLOriginMake(box[0],box[1],box[2]) sourceSize:MTLSizeMake(box[3]-box[0],box[4]-box[1],depth)
+                   toBuffer:b.buffer destinationOffset:static_cast<NSUInteger>(offset) destinationBytesPerRow:row destinationBytesPerImage:per_image];b.constant_bytes_valid=false;}
+    scope.end();graphics_pending_.push_back(texture.resource);graphics_pending_.push_back(buffer.resource);return true;
+}}
 void MetalGl::graphics_copy(const GraphicsView& dst,const GraphicsView& src,std::array<std::uint32_t,3> origin,std::array<std::uint32_t,6> box){@autoreleasepool{
     auto& d=metal_resource(dst.resource);auto& s=metal_resource(src.resource);
     // D3D12 允許位元大小相同的未壓縮格式與 BC 區塊互拷（未壓縮的每個 texel 對應一個 4×4 區塊，例如 GPU 壓縮後
@@ -487,6 +519,24 @@ void MetalGl::graphics_copy(const GraphicsView& dst,const GraphicsView& src,std:
         const auto sw=std::max(1U,s.desc.width>>src.level),sh=std::max(1U,s.desc.height>>src.level),bpp=graphics_format_bytes(s.desc.format);
         if(!box[3])box={0,0,0,sw,sh,1};
         if(box[0]>=box[3] || box[1]>=box[4] || box[3]>sw || box[4]>sh || box[2] || box[5]!=1 || origin[2])throw std::invalid_argument("深度資源複製區域不合法");
+        // 純深度格式（無模板平面）與同寬的色彩格式整張互拷（同一無型別家族，例如 D16／R16、D32／R32）：
+        // 經 GPU 私有暫存緩衝兩次 blit，位元組原樣搬移，不讀回 CPU、不等 GPU。其餘組合沿用讀回路徑。
+        const auto depth_only=[](MTLPixelFormat format){return format==MTLPixelFormatDepth16Unorm || format==MTLPixelFormatDepth32Float;};
+        const auto dw=std::max(1U,d.desc.width>>dst.level),dh=std::max(1U,d.desc.height>>dst.level);
+        if((!metal_depth_format(s.texture.pixelFormat) || depth_only(s.texture.pixelFormat)) && (!metal_depth_format(d.texture.pixelFormat) || depth_only(d.texture.pixelFormat)) &&
+           (bpp==2 || bpp==4) && graphics_format_bytes(d.desc.format)==bpp && !box[0] && !box[1] && box[3]==sw && box[4]==sh && !origin[0] && !origin[1] && dw==sw && dh==sh &&
+           src.slice<s.desc.layers && dst.slice<d.desc.layers){
+            const auto row=std::uint64_t{sw}*bpp,image=row*sh;
+            auto lease=reserve_gpu_memory(static_cast<std::size_t>(image));
+            auto staging=[device_ newBufferWithLength:static_cast<NSUInteger>(image) options:MTLResourceStorageModePrivate];if(!staging)throw std::bad_alloc{};
+            pending_leases_.push_back(std::move(lease));
+            begin_commands(true,"copy_depth_cast");auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};
+            [e copyFromTexture:s.texture sourceSlice:src.slice sourceLevel:src.level sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(sw,sh,1)
+                      toBuffer:staging destinationOffset:0 destinationBytesPerRow:static_cast<NSUInteger>(row) destinationBytesPerImage:static_cast<NSUInteger>(image)];
+            [e copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:static_cast<NSUInteger>(row) sourceBytesPerImage:static_cast<NSUInteger>(image) sourceSize:MTLSizeMake(sw,sh,1)
+                     toTexture:d.texture destinationSlice:dst.slice destinationLevel:dst.level destinationOrigin:MTLOriginMake(0,0,0)];
+            e_scope.end();graphics_pending_.push_back(dst.resource);graphics_pending_.push_back(src.resource);return;
+        }
         auto pixels=graphics_read(src);const auto offset=(std::size_t{box[1]}*sw+box[0])*bpp;
         graphics_write_region(dst,std::span<const std::uint8_t>(pixels).subspan(offset),sw*bpp,0,{origin[0],origin[1],0,origin[0]+box[3]-box[0],origin[1]+box[4]-box[1],1});return;
     }
@@ -584,7 +634,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     if(!d.indirect && (!d.count || !d.instances))return;if(!d.stages[0].shader)throw std::invalid_argument("繪製缺少 VS 著色器");const bool tessellated=bool(d.stages[3].shader || d.stages[4].shader);
     if(tessellated && (!d.stages[3].shader || !d.stages[4].shader))throw std::invalid_argument("細分繪製缺少 HS 或 DS");
     for(const auto& stage:d.stages)if(stage.shader)if(auto* metal=dynamic_cast<MetalShader*>(stage.shader.get()))metal_resolve_shader(device_,*metal);
-    auto desc=[MTLRenderPipelineDescriptor new];desc.vertexFunction=dynamic_cast<MetalShader&>(*d.stages[0].shader).function;desc.fragmentFunction=d.stages[1].shader?dynamic_cast<MetalShader&>(*d.stages[1].shader).function:nil;desc.sampleCount=1;desc.alphaToCoverageEnabled=!d.blend.empty() && metal_word(d.blend,0);
+    MetalPipelineSpec desc;desc.vertexFunction=dynamic_cast<MetalShader&>(*d.stages[0].shader).function;desc.fragmentFunction=d.stages[1].shader?dynamic_cast<MetalShader&>(*d.stages[1].shader).function:nil;desc.sampleCount=1;desc.alphaToCoverageEnabled=!d.blend.empty() && metal_word(d.blend,0);
     if(d.alpha_function && d.alpha_function!=8){
         if(d.alpha_function>8 || !d.stages[1].shader)throw std::invalid_argument("Alpha test 需要有效比較函數及像素著色器");
         auto& shader=dynamic_cast<MetalShader&>(*d.stages[1].shader);const unsigned key=d.alpha_function*256+(d.alpha_reference&255);
@@ -645,7 +695,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         }
         desc.fragmentFunction=shader.dual_source_function;
     }
-    auto pass=[MTLRenderPassDescriptor renderPassDescriptor];unsigned width=0,height=0,layers=0,sample_count=0;bool center_samples=false;
+    MetalPassSpec pass;unsigned width=0,height=0,layers=0,sample_count=0;bool center_samples=false;
     const auto sample_pattern=[&](const GraphicsResourceDesc& resource){
         const bool center=resource.samples>1 && resource.sample_quality==UINT32_MAX-1U;
         if(sample_count && (sample_count!=resource.samples || center_samples!=center))throw std::invalid_argument("Render-target／depth 的取樣數與品質模式不相容");
@@ -660,10 +710,10 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         std::array<MTLSamplePosition,8> positions{};
         if(center_samples)std::fill_n(positions.begin(),sample_count,MTLSamplePosition{0.5F,0.5F});
         else [device_ getDefaultSamplePositions:positions.data() count:sample_count];
-        [pass setSamplePositions:positions.data() count:sample_count];
+        pass.setSamplePositions(positions.data(),sample_count);
     }
     for(unsigned i=0;i<8;++i)if(d.targets[i].resource){const auto& v=d.targets[i];const auto target=metal_render_target(v);target_layers(target.layers);auto texture=target.texture;desc.colorAttachments[i].pixelFormat=texture.pixelFormat;desc.sampleCount=texture.sampleCount;metal_attach_target(pass.colorAttachments[i],target);pass.colorAttachments[i].loadAction=MTLLoadActionLoad;pass.colorAttachments[i].storeAction=MTLStoreActionStore;target_extent(std::max(1U,v.resource->desc.width>>v.level),std::max(1U,v.resource->desc.height>>v.level));graphics_pending_.push_back(v.resource);
-        if(!d.blend.empty()){const auto off=8+32*(metal_word(d.blend,4)?i:0);auto a=desc.colorAttachments[i];a.blendingEnabled=metal_word(d.blend,off);if(a.blendingEnabled){a.sourceRGBBlendFactor=metal_d3d_blend(metal_word(d.blend,off+4));a.destinationRGBBlendFactor=metal_d3d_blend(metal_word(d.blend,off+8));a.rgbBlendOperation=static_cast<MTLBlendOperation>(metal_word(d.blend,off+12)-1);a.sourceAlphaBlendFactor=metal_d3d_blend(metal_word(d.blend,off+16));a.destinationAlphaBlendFactor=metal_d3d_blend(metal_word(d.blend,off+20));a.alphaBlendOperation=static_cast<MTLBlendOperation>(metal_word(d.blend,off+24)-1);}const auto mask=d.blend[off+28];a.writeMask=static_cast<MTLColorWriteMask>(((mask&1)?MTLColorWriteMaskRed:0)|((mask&2)?MTLColorWriteMaskGreen:0)|((mask&4)?MTLColorWriteMaskBlue:0)|((mask&8)?MTLColorWriteMaskAlpha:0));}}
+        if(!d.blend.empty()){const auto off=8+32*(metal_word(d.blend,4)?i:0);auto& a=desc.colorAttachments[i];a.blendingEnabled=metal_word(d.blend,off);if(a.blendingEnabled){a.sourceRGBBlendFactor=metal_d3d_blend(metal_word(d.blend,off+4));a.destinationRGBBlendFactor=metal_d3d_blend(metal_word(d.blend,off+8));a.rgbBlendOperation=static_cast<MTLBlendOperation>(metal_word(d.blend,off+12)-1);a.sourceAlphaBlendFactor=metal_d3d_blend(metal_word(d.blend,off+16));a.destinationAlphaBlendFactor=metal_d3d_blend(metal_word(d.blend,off+20));a.alphaBlendOperation=static_cast<MTLBlendOperation>(metal_word(d.blend,off+24)-1);}const auto mask=d.blend[off+28];a.writeMask=static_cast<MTLColorWriteMask>(((mask&1)?MTLColorWriteMaskRed:0)|((mask&2)?MTLColorWriteMaskGreen:0)|((mask&4)?MTLColorWriteMaskBlue:0)|((mask&8)?MTLColorWriteMaskAlpha:0));}}
     if(!d.stages[1].shader)for(unsigned i=0;i<8;++i)desc.colorAttachments[i].writeMask=MTLColorWriteMaskNone;
     if(d.depth.resource){const auto target=metal_render_target(d.depth);target_layers(target.layers);auto texture=target.texture;desc.depthAttachmentPixelFormat=texture.pixelFormat;metal_attach_target(pass.depthAttachment,target);pass.depthAttachment.loadAction=MTLLoadActionLoad;pass.depthAttachment.storeAction=MTLStoreActionStore;target_extent(std::max(1U,d.depth.resource->desc.width>>d.depth.level),std::max(1U,d.depth.resource->desc.height>>d.depth.level));desc.sampleCount=texture.sampleCount;graphics_pending_.push_back(d.depth.resource);if(texture.pixelFormat==MTLPixelFormatDepth32Float_Stencil8){desc.stencilAttachmentPixelFormat=texture.pixelFormat;metal_attach_target(pass.stencilAttachment,target);pass.stencilAttachment.loadAction=MTLLoadActionLoad;pass.stencilAttachment.storeAction=MTLStoreActionStore;}}
     if(layered || layers>1)pass.renderTargetArrayLength=std::max(1U,layers);
@@ -678,9 +728,11 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     if((!width || !height) && std::any_of(d.stages[1].unordered.begin(),d.stages[1].unordered.end(),[](const auto& view){return bool(view.resource);})){for(const auto& viewport:d.viewports){width=std::max(width,static_cast<unsigned>(std::max(0.0F,std::ceil(viewport[0]+viewport[2]))));height=std::max(height,static_cast<unsigned>(std::max(0.0F,std::ceil(viewport[1]+viewport[3]))));}pass.renderTargetWidth=width;pass.renderTargetHeight=height;pass.defaultRasterSampleCount=1;}
     if(stream_only){width=height=1;}
     if(!width || !height)throw std::invalid_argument("繪製沒有輸出目標或 UAV viewport");
-    std::array<int,32> slots;slots.fill(-1);std::set<unsigned> occupied;for(const auto& b:d.stages[0].shader->bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9)){occupied.insert(b.native_slot);if(b.counter_slot!=UINT32_MAX)occupied.insert(b.counter_slot);}const auto views_slot=dynamic_cast<MetalShader&>(*d.stages[0].shader).buffer_views_slot;if(views_slot!=UINT32_MAX)occupied.insert(views_slot);int next=30;auto vertex=[MTLVertexDescriptor vertexDescriptor];
-    std::set<unsigned> input_attributes;std::vector<std::array<std::uint32_t,4>> fetched; // attribute、D3D slot、offset、大小。
-    for(const auto& input:d.stages[0].shader->inputs){if(input.attribute>=31 || !input_attributes.insert(input.attribute).second)throw std::invalid_argument("Metal 頂點 attribute 位置越界或重複");auto it=std::find_if(d.layout.begin(),d.layout.end(),[&](const auto& e){return e.semantic==input.semantic && e.index==input.index;});if(it==d.layout.end())throw std::invalid_argument("頂點 layout 缺少 semantic："+input.semantic);const auto& e=*it;if(e.slot>=32 || !d.vertices[e.slot].resource)throw std::invalid_argument("頂點緩衝區未綁定");if(slots[e.slot]<0){while(next>=0 && occupied.contains(static_cast<unsigned>(next)))--next;if(next<0)throw std::invalid_argument("Metal 頂點與常數 buffer binding 配額不足");slots[e.slot]=next--;}
+    // 已占用的 Metal buffer index：指派只查詢 0–30，用位元遮罩代替每次繪製配置的 std::set。
+    struct {std::uint64_t bits{};void insert(unsigned v){if(v<64)bits|=std::uint64_t{1}<<v;}bool contains(unsigned v)const{return v<64 && ((bits>>v)&1U);}} occupied;
+    std::array<int,32> slots;slots.fill(-1);for(const auto& b:d.stages[0].shader->bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9)){occupied.insert(b.native_slot);if(b.counter_slot!=UINT32_MAX)occupied.insert(b.counter_slot);}const auto views_slot=dynamic_cast<MetalShader&>(*d.stages[0].shader).buffer_views_slot;if(views_slot!=UINT32_MAX)occupied.insert(views_slot);int next=30;MetalVertexSpec vertex;
+    std::uint32_t input_attributes=0;const auto first_use=[&](unsigned attribute){const auto bit=1U<<attribute;const bool fresh=!(input_attributes&bit);input_attributes|=bit;return fresh;};std::vector<std::array<std::uint32_t,4>> fetched; // attribute、D3D slot、offset、大小。
+    for(const auto& input:d.stages[0].shader->inputs){if(input.attribute>=31 || !first_use(input.attribute))throw std::invalid_argument("Metal 頂點 attribute 位置越界或重複");auto it=std::find_if(d.layout.begin(),d.layout.end(),[&](const auto& e){return e.semantic==input.semantic && e.index==input.index;});if(it==d.layout.end())throw std::invalid_argument("頂點 layout 缺少 semantic："+input.semantic);const auto& e=*it;if(e.slot>=32 || !d.vertices[e.slot].resource)throw std::invalid_argument("頂點緩衝區未綁定");if(slots[e.slot]<0){while(next>=0 && occupied.contains(static_cast<unsigned>(next)))--next;if(next<0)throw std::invalid_argument("Metal 頂點與常數 buffer binding 配額不足");slots[e.slot]=next--;}
         const auto s=static_cast<unsigned>(slots[e.slot]);vertex.attributes[input.attribute].format=metal_vertex_format(e.format);vertex.attributes[input.attribute].offset=e.offset;vertex.attributes[input.attribute].bufferIndex=s;vertex.layouts[s].stride=d.vertices[e.slot].stride;vertex.layouts[s].stepFunction=e.classification?MTLVertexStepFunctionPerInstance:MTLVertexStepFunctionPerVertex;vertex.layouts[s].stepRate=e.classification?std::max(1U,e.step):1;
         fetched.push_back({input.attribute,e.slot,e.offset,graphics_format_bytes(e.format)});
     }
@@ -690,43 +742,43 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     std::vector<std::array<std::uint32_t,3>> shifted; // Metal buffer index、D3D slot、額外 offset。
     {
         std::array<std::uint32_t,32> extent{};for(const auto& a:fetched)extent[a[1]]=std::max(extent[a[1]],a[2]+a[3]);
-        for(unsigned i=0;i<32;++i)if(slots[i]>=0 && !d.vertices[i].stride){auto layout=vertex.layouts[static_cast<unsigned>(slots[i])];layout.stepFunction=MTLVertexStepFunctionConstant;layout.stepRate=0;layout.stride=std::max(4U,(extent[i]+3U)&~3U);}
+        for(unsigned i=0;i<32;++i)if(slots[i]>=0 && !d.vertices[i].stride){auto& layout=vertex.layouts[static_cast<unsigned>(slots[i])];layout.stepFunction=MTLVertexStepFunctionConstant;layout.stepRate=0;layout.stride=std::max(4U,(extent[i]+3U)&~3U);}
         std::array<bool,32> kept{};
         for(const auto& a:fetched){
             const auto stride=d.vertices[a[1]].stride;if(!stride || a[2]+a[3]<=stride){kept[a[1]]=true;continue;}
             auto found=std::find_if(shifted.begin(),shifted.end(),[&](const auto& b){return b[1]==a[1] && b[2]==a[2];});
             if(found==shifted.end()){
                 while(next>=0 && occupied.contains(static_cast<unsigned>(next)))--next;if(next<0)throw std::invalid_argument("Metal 頂點與常數 buffer binding 配額不足");
-                const auto index=static_cast<std::uint32_t>(next--);const auto source=vertex.layouts[static_cast<unsigned>(slots[a[1]])];auto layout=vertex.layouts[index];
+                const auto index=static_cast<std::uint32_t>(next--);const auto source=vertex.layouts[static_cast<unsigned>(slots[a[1]])];auto& layout=vertex.layouts[index];
                 layout.stride=stride;layout.stepFunction=source.stepFunction;layout.stepRate=source.stepRate;found=shifted.insert(shifted.end(),{index,a[1],a[2]});
             }
             vertex.attributes[a[0]].bufferIndex=(*found)[0];vertex.attributes[a[0]].offset=0;
         }
         // 原 binding 沒有剩下任何 attribute 時，Metal 不接受仍設 stride 的 layout：恢復為未使用。
-        for(unsigned i=0;i<32;++i)if(slots[i]>=0 && !kept[i]){auto layout=vertex.layouts[static_cast<unsigned>(slots[i])];layout.stride=0;layout.stepFunction=MTLVertexStepFunctionPerVertex;layout.stepRate=1;}
+        for(unsigned i=0;i<32;++i)if(slots[i]>=0 && !kept[i]){auto& layout=vertex.layouts[static_cast<unsigned>(slots[i])];layout.stride=0;layout.stepFunction=MTLVertexStepFunctionPerVertex;layout.stepRate=1;}
     }
-    if(!d.stages[0].shader->inputs.empty())desc.vertexDescriptor=vertex;
+    if(!d.stages[0].shader->inputs.empty())desc.vertexDescriptor=&vertex;
     MetalPipelineKey key;key<<dynamic_cast<MetalShader&>(*d.stages[0].shader).serial<<':'<<(d.stages[1].shader?dynamic_cast<MetalShader&>(*d.stages[1].shader).serial:0)<<':'<<desc.sampleCount<<':'<<desc.depthAttachmentPixelFormat;
     for(unsigned i=0;i<d.targets.size();++i)key<<':'<<desc.colorAttachments[i].pixelFormat;key<<":alpha:"<<d.alpha_function<<':'<<d.alpha_reference;key<<":stencil:"<<desc.stencilAttachmentPixelFormat<<":input-topology:"<<metal_primitive_class(raster_topology);for(const auto& e:d.layout)key<<e.semantic<<':'<<e.index<<':'<<e.format<<':'<<e.slot<<':'<<e.offset<<':'<<e.classification<<':'<<e.step;{std::array<std::uint32_t,32> strides{};for(std::size_t i=0;i<strides.size();++i)strides[i]=d.vertices[i].stride;key<<':';key.raw(strides.data(),sizeof strides);}key<<':'<<d.blend.size();key.raw(d.blend.data(),d.blend.size());
     MetalTessellationDraw tessellation;
     if(tessellated){
         key<<":tess:"<<dynamic_cast<MetalShader&>(*d.stages[3].shader).serial<<':'<<dynamic_cast<MetalShader&>(*d.stages[4].shader).serial<<':'<<d.topology;
         tessellation=graphics_tessellation(d,key.str());if(!tessellation.count)return;
-        const auto& p=*tessellation.pipeline;desc.vertexFunction=p.domain;desc.vertexDescriptor=p.descriptor;
+        const auto& p=*tessellation.pipeline;desc.vertexFunction=p.domain;desc.vertexDescriptor=nullptr;desc.vertexDescriptorObject=p.descriptor;desc.tessellation=true;
         desc.tessellationPartitionMode=static_cast<MTLTessellationPartitionMode>(p.settings[0]);desc.tessellationOutputWindingOrder=static_cast<MTLWinding>(p.settings[1]);desc.maxTessellationFactor=std::clamp(p.settings[2],1U,64U);
         desc.tessellationFactorFormat=MTLTessellationFactorFormatHalf;desc.tessellationFactorStepFunction=MTLTessellationFactorStepFunctionPerPatch;desc.tessellationControlPointIndexType=MTLTessellationControlPointIndexTypeNone;
     }
     MetalGeometryDraw geometry;
-    if(d.stages[2].shader){geometry=graphics_geometry(d,vertex,slots,shifted,key.str());if(stream_only || !geometry.function){++draws_;graphics_capture(original);return;}if(!geometry.count)return;desc.vertexFunction=geometry.function;desc.vertexDescriptor=nil;key<<":geometry:"<<dynamic_cast<MetalShader&>(*d.stages[2].shader).serial;}
+    if(d.stages[2].shader){geometry=graphics_geometry(d,vertex.make(),slots,shifted,key.str());if(stream_only || !geometry.function){++draws_;graphics_capture(original);return;}if(!geometry.count)return;desc.vertexFunction=geometry.function;desc.vertexDescriptor=nullptr;desc.vertexDescriptorObject=nil;key<<":geometry:"<<dynamic_cast<MetalShader&>(*d.stages[2].shader).serial;}
     key<<":samples:"<<desc.sampleCount<<":topology:"<<desc.inputPrimitiveTopology;
     id<MTLRenderPipelineState> pipeline=nil;const auto& k=key.str();if(const auto found=graphics_pipelines_.find(k);found!=graphics_pipelines_.end())pipeline=found->second;else {
         // 未命中才記錄（建立失敗時 Metal 可能直接 abort，用量快照留下最後一個嘗試的頂點佈局）。
         {std::string text="vs="+std::to_string(dynamic_cast<MetalShader&>(*d.stages[0].shader).serial)+" topology="+std::to_string(d.topology);for(const auto& e:d.layout)text+=" "+e.semantic+std::to_string(e.index)+":f"+std::to_string(e.format)+"@"+std::to_string(e.slot)+"+"+std::to_string(e.offset)+(e.classification?"i"+std::to_string(e.step):"")+"/s"+std::to_string(e.slot<32?d.vertices[e.slot].stride:0);set_diagnostic("metal_pipeline_last",text);record_diagnostic("metal_pipelines_created");}
-        NSError* error=nil;pipeline=[device_ newRenderPipelineStateWithDescriptor:desc error:&error];if(!pipeline)throw std::invalid_argument("Metal D3D pipeline："+std::string(error.localizedDescription.UTF8String));if(graphics_pipelines_.size()>2048)graphics_pipelines_.clear();graphics_pipelines_[k]=pipeline;}
-    auto depth=[MTLDepthStencilDescriptor new];depth.depthCompareFunction=d.depth_state.empty()?MTLCompareFunctionLess:metal_word(d.depth_state,0)?static_cast<MTLCompareFunction>(metal_word(d.depth_state,8)-1):MTLCompareFunctionAlways;depth.depthWriteEnabled=d.depth_state.empty() || (metal_word(d.depth_state,0) && metal_word(d.depth_state,4));
+        NSError* error=nil;pipeline=[device_ newRenderPipelineStateWithDescriptor:desc.make() error:&error];if(!pipeline)throw std::invalid_argument("Metal D3D pipeline："+std::string(error.localizedDescription.UTF8String));if(graphics_pipelines_.size()>2048)graphics_pipelines_.clear();graphics_pipelines_[k]=pipeline;}
+    MetalDepthSpec depth;depth.depthCompareFunction=d.depth_state.empty()?MTLCompareFunctionLess:metal_word(d.depth_state,0)?static_cast<MTLCompareFunction>(metal_word(d.depth_state,8)-1):MTLCompareFunctionAlways;depth.depthWriteEnabled=d.depth_state.empty() || (metal_word(d.depth_state,0) && metal_word(d.depth_state,4));
     if(d.depth.flags&1)depth.depthWriteEnabled=NO;
     if(!d.depth.resource){depth.depthCompareFunction=MTLCompareFunctionAlways;depth.depthWriteEnabled=NO;}
-    if(d.depth.resource && desc.stencilAttachmentPixelFormat!=MTLPixelFormatInvalid && !d.depth_state.empty() && metal_word(d.depth_state,12)){for(unsigned i=0;i<2;++i){const auto off=20+i*16;auto stencil=make_metal_stencil(static_cast<MTLCompareFunction>(metal_word(d.depth_state,off+12)-1),static_cast<MTLStencilOperation>(metal_word(d.depth_state,off)-1),static_cast<MTLStencilOperation>(metal_word(d.depth_state,off+4)-1),static_cast<MTLStencilOperation>(metal_word(d.depth_state,off+8)-1),d.depth_state[16],(d.depth.flags&2)?0:d.depth_state[17]);if(i)depth.backFaceStencil=stencil;else depth.frontFaceStencil=stencil;}}
+    if(d.depth.resource && desc.stencilAttachmentPixelFormat!=MTLPixelFormatInvalid && !d.depth_state.empty() && metal_word(d.depth_state,12)){for(unsigned i=0;i<2;++i){const auto off=20+i*16;depth.stencil(i!=0,static_cast<MTLCompareFunction>(metal_word(d.depth_state,off+12)-1),static_cast<MTLStencilOperation>(metal_word(d.depth_state,off)-1),static_cast<MTLStencilOperation>(metal_word(d.depth_state,off+4)-1),static_cast<MTLStencilOperation>(metal_word(d.depth_state,off+8)-1),d.depth_state[16],(d.depth.flags&2)?0:d.depth_state[17]);}}
     // 附件設定相同的連續繪製沿用同一個 render encoder：每個新 pass 在 TBDR GPU 上都要重新載入／寫回附件，
     // CPU 端也省去建立 encoder。像素 UAV、細分、幾何擷取不合併（D3D11 保證 draw 間 UAV 依序；後兩者另有編碼）。
     // 沿用時前一次繪製的固定功能狀態會殘留，下面一律重設。X64ARM_METAL_RENDER_COALESCE=0 關閉。
@@ -761,7 +813,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
             for(std::size_t i=0;only_visibility && i<pass_key.size();++i)if(i!=39 && pass_key[i]!=open_render_key_[i])only_visibility=false;
             if(only_visibility)why="draw_visibility_change";
         }
-        begin_commands(true,why);enc=[commands_ renderCommandEncoderWithDescriptor:pass];if(!enc)throw std::runtime_error("Metal draw encoder 建立失敗");++render_encoders_;if(coalesce)metal_chain_wait(enc);
+        begin_commands(true,why);enc=[commands_ renderCommandEncoderWithDescriptor:pass.make()];if(!enc)throw std::runtime_error("Metal draw encoder 建立失敗");++render_encoders_;if(coalesce)metal_chain_wait(enc);
         if(metal_labels()){
             NSMutableString* label=[NSMutableString stringWithString:@"draw"];
             for(const auto& item:d.stages)if(const auto* shader=dynamic_cast<const MetalShader*>(item.shader.get()))

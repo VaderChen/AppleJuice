@@ -15,6 +15,7 @@
 #include "guest_io_completion_code.hpp"
 #include "io_wait_policy.hpp"
 #include "x64arm/entry_runtime_profile.hpp"
+#include "x64arm/interpreter.hpp"
 #include "windows_crt_character.hpp"
 #include "monotonic_clock.hpp"
 #include "x64arm/windows_api_sets.hpp"
@@ -516,11 +517,20 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             const bool heap=guest_heap_setup(memory);
             const bool locale_lock=guest_locale_lock_setup(memory);
             for(const auto& routine:detail::guest_scalar_math_routines){
-                const auto found=std::find_if(table.begin(),table.end(),[&](const auto& d){return d.family=="crt" && d.symbol==routine.symbol;});
-                if(found==table.end() || routine.slot+8>detail::guest_scalar_math_code.size())throw std::logic_error("客體純量常式的原服務或慢路徑不存在");
-                const auto stub=stub_base_.value+(services.size()+static_cast<std::size_t>(found-table.begin()))*16;
+                // Heap* 常式的慢路徑是 kernel32 核心服務（stub 依核心表索引），其餘為 CRT 擴充 descriptor。
+                std::uint64_t stub=0;
+                if(routine.symbol.starts_with("Heap")){
+                    const auto core=std::find_if(services.begin(),services.end(),[&](const auto& service){return service.name==routine.symbol;});
+                    if(core==services.end() || routine.slot+8>detail::guest_scalar_math_code.size())throw std::logic_error("客體純量常式的原服務或慢路徑不存在");
+                    stub=stub_base_.value+static_cast<std::size_t>(core-services.begin())*16;
+                }else{
+                    const auto found=std::find_if(table.begin(),table.end(),[&](const auto& d){return d.family=="crt" && d.symbol==routine.symbol;});
+                    if(found==table.end() || routine.slot+8>detail::guest_scalar_math_code.size())throw std::logic_error("客體純量常式的原服務或慢路徑不存在");
+                    stub=stub_base_.value+(services.size()+static_cast<std::size_t>(found-table.begin()))*16;
+                }
                 for(unsigned n=0;n<8;++n)bytes[routine.slot+n]=static_cast<std::uint8_t>(stub>>(8*n));
-                const bool heap_routine=routine.symbol=="malloc" || routine.symbol=="free" || routine.symbol=="_aligned_malloc" || routine.symbol=="_aligned_free";
+                const bool heap_routine=routine.symbol=="malloc" || routine.symbol=="free" || routine.symbol=="_aligned_malloc" || routine.symbol=="_aligned_free" ||
+                    routine.symbol=="HeapAlloc" || routine.symbol=="HeapFree";
                 if(heap && heap_routine)for(unsigned n=0;n<8;++n)bytes[routine.slot-8+n]=static_cast<std::uint8_t>(guest_heap_state_.value>>(8*n));
                 const bool locale_routine=routine.symbol=="_lock_locales" || routine.symbol=="_unlock_locales";
                 if(locale_lock && locale_routine)for(unsigned n=0;n<8;++n)bytes[routine.slot-8+n]=static_cast<std::uint8_t>(guest_locale_lock_state_.value>>(8*n));
@@ -638,11 +648,18 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             static const auto win64_routines=entries(detail::guest_thread_routines);
             // SRW 家族可獨立同成品對照；初始化、等待者／喚醒與錯誤仍沿原 provider。
             static const bool srw_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_SRW");return !value || std::string_view(value)!="0";}();
+            // 臨界區段家族同樣可獨立對照（X64ARM_GUEST_CS=0 回到原服務）。
+            static const bool critical_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_CS");return !value || std::string_view(value)!="0";}();
             const auto& routines=x86_?win32_routines:win64_routines;
             if(const auto found=routines.find(symbol);found!=routines.end() &&
-               (srw_routines || symbol.find("SRWLock")==symbol.npos) && (fls_mirror_ || !symbol.starts_with("FlsGetValue")))
+               (srw_routines || symbol.find("SRWLock")==symbol.npos) && (critical_routines || symbol.find("CriticalSection")==symbol.npos) &&
+               (fls_mirror_ || !symbol.starts_with("FlsGetValue")))
                 return GuestAddress{guest_thread_routines_.value+found->second};
         }
+        // 程序堆積的 HeapAlloc／HeapFree：與 malloc／free 同頁共用配置區；X64ARM_GUEST_HEAPALLOC=0 回到原服務（同成品對照）。
+        static const bool heap_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_HEAPALLOC");return !value || std::string_view(value)!="0";}();
+        if(heap_routines && !x86_ && guest_scalar_math_routines_.value && guest_heap_base_ && (symbol=="HeapAlloc" || symbol=="HeapFree"))
+            for(const auto& routine:detail::guest_scalar_math_routines)if(routine.symbol==symbol)return GuestAddress{guest_scalar_math_routines_.value+routine.entry};
         // 核心服務與擴充 descriptor 相同：只索引不可變身分，保留首筆優先。
         static const auto core_index=[] {
             std::unordered_map<std::string_view,std::size_t> table;
@@ -1112,6 +1129,7 @@ bool graphics_local_service(std::size_t runtime_index) noexcept {
     }();
     return runtime_index<table.size() && table[runtime_index];
 }
+bool d3d12_worker_symbol(std::string_view symbol) noexcept;
 bool x86_graphics_parallel_enabled() noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_X86_PARALLEL_GRAPHICS");return !value || std::string_view(value)!="0";}();
     return enabled;
@@ -1121,6 +1139,31 @@ bool x86_graphics_parallel_enabled() noexcept {
 // 由 worker 入口先核對參數指向的頁面都不是寫入時複製頁（見 graphics_worker_outputs_private），worker 的共用映射鎖下
 // 不會私有化頁面、也就不需重整其他 worker 的原生 MMU；不符時交協調者本地路徑（獨占映射鎖，核心於服務後重整 MMU）。
 // 平行模式下 RHI 執行緒的 D3D11 呼叫不再每次經信箱往返協調者。X64ARM_WORKER_GRAPHICS_SERVICE=0 關閉。
+// D3D12 的 worker 路徑：與 D3D11 worker 相同在共用映射鎖＋圖形鎖下執行，與持獨占映射鎖的協調者本地服務、等待解析互斥；
+// 全停服務執行時 worker 已停止。電馭判客的工作執行緒錄製命令清單每秒數萬次，原本每次都要經信箱往返協調者。
+// X64ARM_WORKER_D3D12_SERVICE=0 關閉。
+const WindowsServiceDescriptor* WindowsServices::d3d12_worker_service(GuestAddress address) const noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_WORKER_D3D12_SERVICE");return !value || std::string_view(value)!="0";}();
+    if(!enabled || x86_ || !d3d12_)return nullptr;
+    const auto begin=stub_base_.value+services.size()*16;
+    if(address.value<begin || ((address.value-begin)&15U))return nullptr;
+    const auto index=(address.value-begin)/16;const auto table=runtime_service_descriptors();
+    if(index>=table.size())return nullptr;
+    // 描述表固定：依索引預先判定（每次 worker 服務出口都會查詢數次，不逐次比對名稱）。
+    // COM 引用計數另走 d3d12_worker_reference（只處理不銷毀物件的情況）。X64ARM_WORKER_D3D12_REFERENCE=0 關閉。
+    static const std::vector<bool> worker=[] {
+        static const bool references=[] {const auto* value=std::getenv("X64ARM_WORKER_D3D12_REFERENCE");return !value || std::string_view(value)!="0";}();
+        const auto descriptors=runtime_service_descriptors();std::vector<bool> result(descriptors.size());
+        for(std::size_t i=0;i<descriptors.size();++i){
+            const auto symbol=descriptors[i].symbol;
+            result[i]=descriptors[i].family=="internal-d3d12" &&
+                (d3d12_worker_symbol(symbol) || (references && (symbol.ends_with(".AddRef") || symbol.ends_with(".Release") ||
+                    symbol=="Resource.Map" || symbol=="Resource.Unmap")));
+        }
+        return result;
+    }();
+    return worker[index]?&table[index]:nullptr;
+}
 const WindowsServiceDescriptor* WindowsServices::graphics_worker_service(GuestAddress address) const noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_WORKER_GRAPHICS_SERVICE");return !value || std::string_view(value)!="0";}();
     if(!enabled || (x86_ && !x86_graphics_parallel_enabled()))return nullptr;
@@ -1325,23 +1368,54 @@ struct CoordinatedTrace {
         for(std::size_t i=0;i<items.size() && i<24;++i)
             std::fprintf(stderr,"[coordinated]   done=%llu refused=%llu %.*s\n",static_cast<unsigned long long>(items[i].second.done),
                 static_cast<unsigned long long>(items[i].second.refused),static_cast<int>(items[i].second.name.size()),items[i].second.name.data());
+        // 另列被拒（改走全停）最多的服務：全停次數是平行模式的主要成本來源。
+        std::sort(items.begin(),items.end(),[](const auto& a,const auto& b){return a.second.refused>b.second.refused;});
+        for(std::size_t i=0;i<items.size() && i<24 && items[i].second.refused;++i)
+            std::fprintf(stderr,"[coordinated_refused]   refused=%llu done=%llu %.*s\n",static_cast<unsigned long long>(items[i].second.refused),
+                static_cast<unsigned long long>(items[i].second.done),static_cast<int>(items[i].second.name.size()),items[i].second.name.data());
     }
 };
 // 協調者本地的一般服務家族：不阻塞、不切換客體、不讀寫 TLS／FLS／例外堆疊，只改程序內表格、參數指向的客體記憶體
 // 及呼叫執行緒的 LastError／errno。其他 worker 繼續執行時由協調者以獨占映射鎖完成；provider 要啟動客體回呼
 // （無效參數處理常式等）、終止程序或丟出任何例外時，恢復 GuestState 交回全停路徑重做。家族成員的輸出只由輸入
 // 決定，拒絕後重做的部分寫入與完整路徑相同。X64ARM_LOCAL_PLAIN_SERVICE=0 關閉。
-// D3D12 協調者本地方法：命令清單錄製（List.*，不含 COM 生命週期）、描述元建立與複製、取值型方法。
+// D3D12 協調者本地方法：命令清單錄製（List.*，不含 COM 生命週期）、描述元建立與複製、取值型方法，
+// 以及實作只回傳成功或只讀物件表的方法（SetName、配置器 Reset、佇列 GPU 端 Wait、GetPrivateData）。
 bool d3d12_local_service(std::string_view symbol) noexcept {
     const auto method=[&](std::string_view prefix){return symbol.starts_with(prefix);};
-    if(symbol.ends_with(".QueryInterface") || symbol.ends_with(".AddRef") || symbol.ends_with(".Release") || symbol.find("PrivateData")!=std::string_view::npos)return false;
+    // 每幀呼叫的取值方法（QueryInterface 只回傳同一物件並加計數，不建立物件）。X64ARM_LOCAL_D3D12_QUERY=0 關閉。
+    static const bool local_query=[] {const auto* value=std::getenv("X64ARM_LOCAL_D3D12_QUERY");return !value || std::string_view(value)!="0";}();
+    if(local_query && (symbol=="Resource.QueryInterface" || symbol=="Resource.GetDevice" || symbol=="Resource.GetHeapProperties" ||
+       symbol=="Swap.GetCurrentBackBufferIndex" || symbol=="Swap.GetFullscreenState" || symbol=="Queue.GetDesc"))return true;
+    if(symbol.ends_with(".QueryInterface") || symbol.ends_with(".AddRef") || symbol.ends_with(".Release"))return false;
+    if(symbol.ends_with(".SetName") || symbol.ends_with(".GetPrivateData"))return true;
+    if(symbol.find("PrivateData")!=std::string_view::npos)return false;
     if(method("List."))return true;
     static constexpr std::string_view names[]{
         "Device.CopyDescriptors","Device.CopyDescriptorsSimple","Device.CreateConstantBufferView","Device.CreateShaderResourceView",
         "Device.CreateUnorderedAccessView","Device.CreateRenderTargetView","Device.CreateDepthStencilView","Device.CreateSampler",
         "Device.GetDescriptorHandleIncrementSize","Device.GetResourceAllocationInfo","Device.GetCopyableFootprints","Device.CheckFeatureSupport",
         "Device.GetNodeCount","DescriptorHeap.GetCPUDescriptorHandleForHeapStart","DescriptorHeap.GetGPUDescriptorHandleForHeapStart",
-        "DescriptorHeap.GetDesc","Resource.GetGPUVirtualAddress","Resource.GetDesc","Fence.GetCompletedValue"};
+        "DescriptorHeap.GetDesc","Resource.GetGPUVirtualAddress","Resource.GetDesc","Fence.GetCompletedValue","Allocator.Reset","Queue.Wait"};
+    // Queue.Signal、Fence.Signal／SetEventOnCompletion：只登記或套用 fence 值（設定 fence 事件），不建立物件、不映射記憶體、不等 GPU；事件的等待者由本地路徑
+    // 隨即解析（與本地 SetEvent 相同），執行緒池已登錄等待存在時交回全停。電馭判客 Benchmark 後段約 5.7 萬次原本全停。
+    // X64ARM_LOCAL_D3D12_SIGNAL=0 關閉。
+    static const bool local_signal=[] {const auto* value=std::getenv("X64ARM_LOCAL_D3D12_SIGNAL");return !value || std::string_view(value)!="0";}();
+    if(symbol=="Queue.Signal" || symbol=="Fence.Signal" || symbol=="Fence.SetEventOnCompletion")return local_signal;
+    return std::find(std::begin(names),std::end(names),symbol)!=std::end(names);
+}
+// 可在 worker 上直接執行的 D3D12 方法：協調者本地集合中只讀寫橋接層表格、參數指向的客體資料（只讀）及暫存器回傳值者。
+// 寫入客體記憶體的取值（GetCPU／GPUDescriptorHandleForHeapStart 以隱藏指標回傳、GetDesc、GetCopyableFootprints 等）、
+// 會推進 fence 的 GetCompletedValue、交換鏈與 COM 生命週期不在此集合。
+// ExecuteCommandLists 不在此集合（2026-10-26 實測）：改在呼叫端 worker 重播時，重播期間圖形鎖與共用映射鎖長時間被占住，
+// 協調者本地服務與全停都要等重播結束，Benchmark 交錯量測沒有改善，且一次遊戲自行中止（exit_code=3）。
+bool d3d12_worker_symbol(std::string_view symbol) noexcept {
+    if(symbol.starts_with("Swap.") || symbol.ends_with(".QueryInterface") || symbol.ends_with(".AddRef") || symbol.ends_with(".Release"))return false;
+    if(symbol.starts_with("List.") || symbol.ends_with(".SetName"))return true;
+    static constexpr std::string_view names[]{
+        "Device.CopyDescriptors","Device.CopyDescriptorsSimple","Device.CreateConstantBufferView","Device.CreateShaderResourceView",
+        "Device.CreateUnorderedAccessView","Device.CreateRenderTargetView","Device.CreateDepthStencilView","Device.CreateSampler",
+        "Device.GetDescriptorHandleIncrementSize","Resource.GetGPUVirtualAddress","Allocator.Reset","Queue.Wait"};
     return std::find(std::begin(names),std::end(names),symbol)!=std::end(names);
 }
 bool local_heap_service(std::string_view symbol) noexcept {
@@ -1381,6 +1455,8 @@ bool plain_local_service(const WindowsServiceDescriptor& descriptor) noexcept {
             symbol=="SetCriticalSectionSpinCount" || symbol=="LeaveCriticalSection" ||
             local_heap_service(symbol);
     }
+    // RtlGenRandom：只把宿主亂數寫入參數緩衝區並設定 LastError（電馭判客每秒約 160 次原本每次全停）。
+    if(family=="advapi32.dll")return symbol=="SystemFunction036";
     // MSVCP 的純讀取時鐘：只讀宿主單調時鐘與固定頻率。
     if(family=="msvcp140.dll")return symbol=="_Query_perf_counter" || symbol=="_Query_perf_frequency" || symbol=="_Xtime_get_ticks";
     // WASAPI 緩衝方法：只改串流狀態與 PCM 佇列；ReleaseBuffer 可能觸發串流事件，完成後由呼叫端本地喚醒等待者。
@@ -1517,6 +1593,8 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         const std::lock_guard graphics_lock(graphics_mutex());
         const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
         if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
+        const bool signal=descriptor.symbol=="Queue.Signal" || descriptor.symbol=="Fence.Signal" || descriptor.symbol=="Fence.SetEventOnCompletion";
+        if(signal && !registered_waits_.empty())return false; // 已登錄等待的回呼要在全停路徑啟動。
         const auto previous=threads_.current;const auto saved_error=last_error_;
         const GuestAddress error_slot{state.gs_base+0x68};
         const auto entry_error=static_cast<std::uint32_t>(memory.load(error_slot,32));
@@ -1529,6 +1607,7 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         const auto result=invoke_runtime(state,memory,descriptor);
         if(result)throw std::logic_error("D3D12 本地協調服務意外終止客體");
         if(last_error_!=entry_error)memory.store(error_slot,32,last_error_);
+        if(signal)(void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
         ++state.tsc;state.rep_compare={};
         return true;
     }
@@ -1678,7 +1757,15 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
 #endif
 #include "registry_service_dependencies.inc"
 bool WindowsServices::defer_registry_io_call(GuestState& state,GuestMemory& memory){
-    if(!registry_io_busy_ || threads_.current==registry_io_owner_ || runtime_.forced_exit_code())return false;
+    if(!registry_io_busy_ || runtime_.forced_exit_code())return false;
+    // owner 的 C++ 交易框架仍在外層。控制待辦的派送可能早於 cooperative_stop，
+    // 必須沿 SDK 的巢狀返回契約離開這次執行，讓原框架提交或回滾。
+    // 只原地返回會讓 resident 派送器反覆重派同一 RIP，並不保證到達 stop 檢查。
+    if(threads_.current==registry_io_owner_){
+        if(!registry_io_ready())throw HostCallFault("登錄 I/O 原呼叫者在完成前被重新派送");
+        ExecutionResult result;result.reason=StopReason::Returned;result.rip=state.rip;
+        throw NestedExecutionStop(std::move(result));
+    }
     // 續行尚未 pop callback frame，普通入口也尚未讀寫 API 輸出；等待後可安全重新進入。
     bool dependent=true;
     const auto table=runtime_service_descriptors();
@@ -2140,9 +2227,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
         else {
             memory.check(GuestAddress{arg(1)},size,Access::Write);const auto previous=memory.load(GuestAddress{arg(1)},bits);
             const auto belongs=[&](std::uint64_t pointer){const auto owner=runtime_.heap_owners.find(pointer);return owner==runtime_.heap_owners.end()?heap==process_heap:owner->second==heap;};
-            // x86 配置區的已配置區塊依 chunk 擁有者歸屬 heap，與一般區塊依位址合併列舉。
+            // 配置區的已配置區塊依 chunk 擁有者歸屬 heap，與一般區塊依位址合併列舉（x86 chunk 模式；x64 為程序堆積，含 malloc 與 HeapAlloc）。
             static const std::vector<std::pair<std::uint64_t,std::uint64_t>> no_guest_blocks;
-            const auto& guest=guest_heap_chunked_?guest_heap_allocated_blocks(memory,heap):no_guest_blocks;
+            const auto& guest=guest_heap_chunked_ || (guest_heap_base_ && heap==process_heap)?guest_heap_allocated_blocks(memory,heap):no_guest_blocks;
             const auto guest_after=[&](std::uint64_t at){return std::upper_bound(guest.begin(),guest.end(),std::pair<std::uint64_t,std::uint64_t>{at,UINT64_MAX});};
             const bool previous_guest=previous && std::binary_search(guest.begin(),guest.end(),std::pair<std::uint64_t,std::uint64_t>{previous,0},
                 [](const auto& a,const auto& b){return a.first<b.first;});
@@ -2169,6 +2256,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
                 else {lock.owner=threads_.current;++lock.recursion;returned=1;++guest_heap_topology_generation_;}
             }else if(lock.owner!=threads_.current || !lock.recursion)fail(288);
             else {if(!--lock.recursion)lock.owner=0;returned=1;threads_.yield=true;++guest_heap_topology_generation_;}
+            // x64 客體 HeapAlloc／HeapFree 常式看狀態頁 +32：程序堆積被鎖定期間一律交回服務（走一般 heap）。
+            if(heap==process_heap && !x86_ && guest_heap_base_ && guest_heap_state_.value)memory.store(GuestAddress{guest_heap_state_.value+32},32,lock.owner?1U:0U);
         }
     }
     else if(symbol=="HeapCreate") {
@@ -2211,7 +2300,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
             // 不足時沿用一般 heap。HeapLock 期間（含持有者自己的配置）改走一般 heap，讓鎖定中的 HeapWalk 與既有登錄一致。
             const auto heap_lock=runtime_.heap_locks.find(heap);
             const bool heap_locked=heap_lock!=runtime_.heap_locks.end() && heap_lock->second.owner;
-            if(guest_heap_chunked_ && !heap_locked && !(flags_value&~9U) && (heap==process_heap || guest_heap_private_ready(heap)))
+            // x64 的程序堆積同樣取自 malloc 共用的配置區（UCRT 本來就以程序堆積配置）；私有 heap 仍只在 x86 chunk 模式。
+            static const bool x64_heap=[] {const auto* value=std::getenv("X64ARM_GUEST_HEAPALLOC");return !value || std::string_view(value)!="0";}();
+            if((guest_heap_chunked_ || (x64_heap && guest_heap_base_ && heap==process_heap)) && !heap_locked && !(flags_value&~9U) &&
+               (heap==process_heap || guest_heap_private_ready(heap)))
                 if(const auto block=guest_heap_allocate(memory,std::max<std::uint64_t>(UINT64_C(1),arg(2)),heap)){
                     if(flags_value&8U)memory.fill(GuestAddress{block},0,static_cast<std::size_t>(std::max<std::uint64_t>(UINT64_C(1),arg(2))));
                     returned=block;
@@ -2245,39 +2337,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
         else if(arg(3)<=allocation->second)returned=pointer;
         else if(!(flags_value&0x10))returned=reallocate_heap(memory,pointer,arg(3),state);
     } else if (symbol == "CreateFileW" || symbol=="CreateFileA" || symbol=="CreateFile2") {
+        // 診斷：X64ARM_TRACE_FILE_OPEN=1 列出開檔路徑、存取／共用／建立方式與結果（含 LastError）。
+        static const bool trace_open=std::getenv("X64ARM_TRACE_FILE_OPEN")!=nullptr;
+        if(trace_open){
+            std::string path;
+            try{for(std::uint64_t at=arg(0),n=0;n<520;++n){const auto c=memory.load(GuestAddress{at+n*(symbol=="CreateFileA"?1:2)},symbol=="CreateFileA"?8:16);if(!c)break;path.push_back(c<128?static_cast<char>(c):'?');}}catch(const MemoryFault&){path="<fault>";}
+            const auto access=static_cast<std::uint32_t>(arg(1)),share=static_cast<std::uint32_t>(arg(2)),disposition=symbol=="CreateFile2"?static_cast<std::uint32_t>(arg(3)):static_cast<std::uint32_t>(arg(4));
+            auto outcome=invoke_file_open(state,memory,{"kernel32.dll",symbol,symbol=="CreateFile2"?5U:7U});
+            std::fprintf(stderr,"[file_open] %.*s path=%s access=%#x share=%#x disposition=%u result=%#llx error=%u\n",static_cast<int>(symbol.size()),symbol.data(),path.c_str(),access,share,disposition,
+                static_cast<unsigned long long>(state.reg(Gpr::Rax)),last_error_);
+            return outcome;
+        }
         return invoke_file_open(state,memory,{"kernel32.dll",symbol,symbol=="CreateFile2"?5U:7U});
     } else if (symbol == "CloseHandle") {
-        const auto handle = arg(0);
-        if (runtime_.handle_flags[handle]&2)fail(5);
-        else if (handle >= 0x100 && handle <= 0x102 && standard_open_[handle - 0x100]) {
-            auto& duplicates=standard_duplicates_[handle - 0x100];
-            if(duplicates)--duplicates;else standard_open_[handle - 0x100] = false;
-            returned = 1;
-        }
-        else if (const auto file=files_.find(handle);file!=files_.end()) {
-            close_transfer_handle(memory,handle);
-            returned=1;
-        }
-        else if (kernel_device_handle(handle)) return close_kernel_device(state,memory,handle);
-        else if (power_requests_.erase(handle)) returned = 1;
-        else if (close_transaction(handle)) returned = 1;
-        else if (close_bluetooth(handle)) returned = 1;
-        else if (close_mapping(handle)) returned = 1;
-        else if (close_job(handle)) returned = 1;
-        else if (close_process(handle)) returned = 1;
-        else if (runtime_.completion_ports.erase(handle)) returned = 1;
-        else if (runtime_.process_snapshots.erase(handle)) returned = 1;
-        else if (close_wait_object(handle)) returned=1;
-        else if (runtime_.process_thread_handles.erase(handle)) {runtime_.thread_handle_access.erase(handle);returned = 1;}
-        else if (runtime_.token_handles.erase(handle)) {runtime_.token_handle_objects.erase(handle);collect_tokens();returned = 1;}
-        else fail(6);
-        if(returned)runtime_.handle_flags.erase(handle);
+        return invoke_file_close(state,memory,{"kernel32.dll",symbol,1});
     } else if (symbol == "GetFileSizeEx") {
+        if(const auto native=invoke_native_file_information(state,memory,{"kernel32.dll",symbol,2})){frame.return_to(state,*native);return std::nullopt;}
         const auto file=file_handle_information(arg(0));
         if(file.error)fail(file.error);
         else if(!arg(1))fail(87);
         else {memory.store(GuestAddress{arg(1)},64,file.metadata.size);returned=1;}
     } else if (symbol == "SetFilePointerEx") {
+        if(const auto value=invoke_native_file_position(state,memory,{"kernel32.dll",symbol,4,2})){frame.return_to(state,*value);return std::nullopt;}
         const auto found = files_.find(arg(0));
         if (found == files_.end()) fail(6);
         else if(found->second.serial || found->second.hid)fail(1);
@@ -2301,97 +2382,116 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
     } else if(symbol=="CreatePipe"){
         return invoke_file_io(state,memory,{"kernel32.dll",symbol,4,0,0,8});
     } else if (symbol == "ReadFile" || symbol == "WriteFile" || symbol=="ReadFileEx" || symbol=="WriteFileEx") {
-        const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
-        const bool extended=symbol.ends_with("Ex"),writing=symbol.starts_with("Write");const auto handle=arg(0),overlapped=arg(extended?3:4),count_pointer=extended?0:arg(3);const auto count=dword(2);
-        const auto found=files_.find(handle);const bool standard=handle>=0x100 && handle<=0x102 && standard_open_[handle-0x100];
-        if(found!=files_.end() && (found->second.pipe || found->second.serial || found->second.hid))return invoke_file_io(state,memory,{"kernel32.dll",symbol,5});
-        if(found!=files_.end() && found->second.usb){if(count_pointer)memory.store(GuestAddress{count_pointer},32,0);fail(1);} // WinUSB 裝置 handle 只經 WinUsb_* 傳輸。
-        else if(extended && (!overlapped || !arg(4)))fail(87);
-        else if(extended && (standard || (found!=files_.end() && ((found->second.mode&0x30) || found->second.completion_port))))fail(87);
-        else if(extended && (threads_.items.at(threads_.current).apcs.size()+static_cast<std::size_t>(std::count_if(pending_file_io_.begin(),pending_file_io_.end(),[&](const auto& io){return io.thread==threads_.current && io.routine;}))>=1024))fail(8);
-        else if (!count_pointer && !overlapped) fail(87);
-        else if (!standard && found==files_.end()) {if(count_pointer)memory.store(GuestAddress{count_pointer},32,0);fail(6);}
-        else if (standard && ((writing && handle==0x100) || (!writing && handle!=0x100))) fail(5);
-        else if (!standard && ((found->second.metadata.attributes&0x10) || (writing?!(found->second.access&(0x40000000U|2U|4U)):!(found->second.access&(0x80000000U|1U))))) {if(count_pointer)memory.store(GuestAddress{count_pointer},32,0);fail(5);}
-        else {
-            // 同步客體記憶體 fault 必須在 count／signal／position 變更前派送。
-            // OVERLAPPED 的搬移錯誤則保留後方 NTSTATUS／completion／998 契約。
-            if(!overlapped){
-                auto extent=std::uint64_t{count};
-                if(!writing && !standard){const auto size=found->second.native?found->second.native->current_size():found->second.bytes->size();
-                    const auto offset=runtime_.win_file_positions.at(found->second.object);extent=std::min<std::uint64_t>(count,size>offset?size-offset:0);}
-                memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(extent),writing?Access::Read:Access::Write);
-            }
-            if(count_pointer){memory.check(GuestAddress{count_pointer},4,Access::Write);memory.store(GuestAddress{count_pointer},32,0);}
-            const auto position_guard=standard?std::shared_ptr<void>{}:runtime_.win_file_positions.at(found->second.object).lock();
-            // FilePosition 的隱含轉型若與 int 分支混用，會截成有號 32 位元；同步大檔 I/O 必須保留完整游標。
-            std::uint64_t offset=standard?UINT64_C(0):static_cast<std::uint64_t>(runtime_.win_file_positions.at(found->second.object)),event=0;
-            if(overlapped) {
-                memory.check(GuestAddress{overlapped},x86_?20:32,Access::Write);offset=memory.load(GuestAddress{overlapped+2*unit},64);event=extended?0:memory.load(GuestAddress{overlapped+(x86_?16:24)},bits)&~UINT64_C(1);
-                if(event && (!runtime_.wait_objects.contains(event) || runtime_.wait_objects.at(event).kind!=WaitObject::Kind::Event)) {fail(6);frame.return_to(state,returned);return std::nullopt;}
-            }
-            if(!standard)set_file_io_signaled(handle,false);
-            if(standard && !writing && count) {
-                memory.check(GuestAddress{arg(1)},count,Access::Write);
-                if(!await_standard_input(state,memory,1))return std::nullopt;
-            }
-            auto extent=std::uint64_t{count};
-            if(!writing) {
-                const auto size=standard?runtime_.standard_input.bytes.size():found->second.native?found->second.native->current_size():found->second.bytes->size();
-                const auto position=standard?runtime_.standard_input.position:offset;extent=std::min<std::uint64_t>(count,size>position?size-position:0);
-            }
-            FileIoResult io;
-            if(!standard && found->second.native){
-                auto& file=found->second;
-                if(writing && (offset==UINT64_MAX || (!(file.access&(0x40000000U|2U)) && (file.access&4U))))offset=file.native->current_size();
-                // 整體範圍先檢查，避免後段的鎖衝突造成先寫入前段。
-                io.error=file.native->validate_io(offset,count,writing);
-            }
-            process_io::Batch io_request(writing?process_io::Kind::Write:process_io::Kind::Read);
-            if(!io.error)try{
-                memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(extent),writing?Access::Read:Access::Write);
-                // DWORD 是單次 API 的長度；暫存區大小只限制分段搬移，不限制合法 I/O。
-                std::vector<std::uint8_t> buffer(static_cast<std::size_t>(std::min<std::uint64_t>(extent,1024U*1024U)));
-                bool first=true;
-                while(first || io.bytes<extent){
-                    first=false;const auto length=static_cast<std::size_t>(std::min<std::uint64_t>(extent-io.bytes,buffer.size()));auto part=std::span(buffer).first(length);
-                    if(writing)memory.read(GuestAddress{arg(1)+io.bytes},part);FileIoResult transferred;
-                    if(standard && writing)transferred=write_standard_output(static_cast<unsigned>(handle-0x100),part);
-                    else if(standard){auto& input=runtime_.standard_input;transferred.bytes=std::min<std::uint64_t>(length,input.bytes.size()-input.position);std::copy_n(input.bytes.begin()+static_cast<std::ptrdiff_t>(input.position),static_cast<std::size_t>(transferred.bytes),part.begin());input.position+=transferred.bytes;process_io::record(process_io::Kind::Read,transferred.bytes);}
-                    else if(found->second.native)transferred=writing?found->second.native->write(part,offset+io.bytes):found->second.native->read(part,offset+io.bytes);
-                    else if(writing)transferred.error=5;
-                    else{const auto& bytes=*found->second.bytes;const auto position=static_cast<std::size_t>(std::min<std::uint64_t>(offset+io.bytes,bytes.size()));transferred.bytes=std::min<std::uint64_t>(length,bytes.size()-position);std::copy_n(bytes.begin()+static_cast<std::ptrdiff_t>(position),static_cast<std::size_t>(transferred.bytes),part.begin());process_io::record(process_io::Kind::Read,transferred.bytes);}
-                    if(!writing && transferred.bytes)memory.write(GuestAddress{arg(1)+io.bytes},part.first(static_cast<std::size_t>(transferred.bytes)));
-                    io.bytes+=transferred.bytes;io.error=transferred.error;if(io.error || transferred.bytes<length || !length)break;
-                }
-                if(writing && !standard && found->second.native && io.bytes)found->second.metadata=found->second.native->information().metadata;
-            }catch(const std::bad_alloc&){io.error=8;}catch(const MemoryFault&){io.error=998;}
-            // 診斷：X64ARM_TRACE_FILE_READ=<路徑片段> 時，記錄符合檔案每次同步讀寫的位移、長度與宿主時間。
-            if(static const char* const read_trace=std::getenv("X64ARM_TRACE_FILE_READ");read_trace && *read_trace && !standard &&
-               found->second.path.find(read_trace)!=std::string::npos)
-                std::fprintf(stderr,"file_read_trace pid=%u op=%.*s path=%s offset=%llu count=%u bytes=%llu overlapped=%d unix_us=%lld\n",process_id(),
-                    static_cast<int>(symbol.size()),symbol.data(),found->second.path.c_str(),static_cast<unsigned long long>(offset),count,
-                    static_cast<unsigned long long>(io.bytes),overlapped?1:0,static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count()));
-            if(io.error && std::getenv("X64ARM_TRACE_FILE_ERRORS"))std::fprintf(stderr,"[file_io] %.*s handle=%llu offset=%llu count=%u transferred=%llu error=%u\n",static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned long long>(handle),static_cast<unsigned long long>(offset),count,static_cast<unsigned long long>(io.bytes),io.error);
-            if(count_pointer)memory.store(GuestAddress{count_pointer},32,io.bytes);
-            if(!io.error && !standard && (!overlapped || (found->second.mode&0x30)))runtime_.win_file_positions.at(found->second.object)=offset+io.bytes;
-            if(overlapped) {
-                if(!writing && !io.error && !io.bytes && count)io.error=38;
-                const auto status=io.error?(io.error==38?0xc0000011U:io.error==5?0xc0000022U:io.error==33?0xc0000054U:io.error==8?0xc0000017U:io.error==998?0xc0000005U:0xc000000dU):0U;
-                memory.store(GuestAddress{overlapped},bits,status);memory.store(GuestAddress{overlapped+unit},bits,io.bytes);if(event)runtime_.wait_objects.at(event).set_signal(true);
-                if(!extended && !io.error && !standard && ((found->second.mode&0x30) || !(found->second.completion_modes&1)) && !(memory.load(GuestAddress{overlapped+(x86_?16:24)},bits)&1)) {
-                    const auto port=runtime_.completion_ports.find(found->second.completion_port);
-                    if(port!=runtime_.completion_ports.end())port->second.packets.push_back({found->second.completion_key,overlapped,status,static_cast<std::uint32_t>(io.bytes)});
-                }
-            }
-            if(!standard)set_file_io_signaled(handle,true);
-            if(extended && (!io.error || io.error==38)){
-                threads_.items.at(threads_.current).apcs.push_back({arg(4),{io.error,io.bytes,overlapped}});returned=1;threads_.yield=true;
-            }else if(io.error)fail(io.error);else returned=1;
-        }
+        return invoke_file_readwrite(state,memory,{"kernel32.dll",symbol,5});
     } else throw HostCallFault("服務名稱尚未實作");
     frame.return_to(state, returned);
     return std::nullopt;
+}
+std::optional<std::uint32_t> WindowsServices::invoke_file_readwrite(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    const WindowsCall frame(state,memory,service);const auto arg=[&](unsigned i){return frame(i);};
+    if(const auto value=invoke_native_file_io(state,memory,service)){frame.return_to(state,*value);return std::nullopt;}
+    const auto dword=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};const auto symbol=service.symbol;
+    const bool native=service.family=="internal-nt-file";const auto key=native?dword(5):0U;
+    std::uint64_t returned=0;const auto fail=[&](std::uint32_t error){last_error_=error;returned=0;};
+    const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
+    const bool extended=symbol.ends_with("Ex"),writing=symbol.starts_with("Write");const auto handle=arg(0),overlapped=arg(extended?3:4),count_pointer=extended?0:arg(3);const auto count=dword(2);
+    const auto found=files_.find(handle);const bool standard=handle>=0x100 && handle<=0x102 && standard_open_[handle-0x100];
+    if(found!=files_.end() && (found->second.pipe || found->second.serial || found->second.hid))return invoke_file_io(state,memory,service);
+    if(found!=files_.end() && found->second.usb){if(count_pointer)memory.store(GuestAddress{count_pointer},32,0);fail(1);} // WinUSB 裝置 handle 只經 WinUsb_* 傳輸。
+    else if(extended && (!overlapped || !arg(4)))fail(87);
+    else if(extended && (standard || (found!=files_.end() && ((found->second.mode&0x30) || found->second.completion_port))))fail(87);
+    else if((extended || (native && arg(8))) && (threads_.items.at(threads_.current).apcs.size()+static_cast<std::size_t>(std::count_if(pending_file_io_.begin(),pending_file_io_.end(),[&](const auto& io){return io.thread==threads_.current && io.routine;}))>=1024))fail(8);
+    else if (!count_pointer && !overlapped) fail(87);
+    else if (!standard && found==files_.end()) {if(count_pointer)memory.store(GuestAddress{count_pointer},32,0);fail(6);}
+    else if (standard && ((writing && handle==0x100) || (!writing && handle!=0x100))) fail(5);
+    else if (!standard && ((found->second.metadata.attributes&0x10) || (writing?!(found->second.access&(0x40000000U|2U|4U)):!(found->second.access&(0x80000000U|1U))))) {if(count_pointer)memory.store(GuestAddress{count_pointer},32,0);fail(5);}
+    else {
+        // 同步客體記憶體 fault 必須在 count／signal／position 變更前派送。
+        // OVERLAPPED 的搬移錯誤則保留後方 NTSTATUS／completion／998 契約。
+        if(!overlapped){
+            auto extent=std::uint64_t{count};
+            if(!writing && !standard){const auto size=found->second.native?found->second.native->current_size():found->second.bytes->size();
+                const auto offset=runtime_.win_file_positions.at(found->second.object);extent=std::min<std::uint64_t>(count,size>offset?size-offset:0);}
+            memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(extent),writing?Access::Read:Access::Write);
+        }
+        if(count_pointer){memory.check(GuestAddress{count_pointer},4,Access::Write);memory.store(GuestAddress{count_pointer},32,0);}
+        const auto position_guard=standard?std::shared_ptr<void>{}:runtime_.win_file_positions.at(found->second.object).lock();
+        // FilePosition 的隱含轉型若與 int 分支混用，會截成有號 32 位元；同步大檔 I/O 必須保留完整游標。
+        std::uint64_t offset=standard?UINT64_C(0):static_cast<std::uint64_t>(runtime_.win_file_positions.at(found->second.object)),event=0;
+        if(overlapped) {
+            memory.check(GuestAddress{overlapped},x86_?20:32,Access::Write);offset=memory.load(GuestAddress{overlapped+2*unit},64);event=extended?0:memory.load(GuestAddress{overlapped+(x86_?16:24)},bits)&~UINT64_C(1);
+            if(event && (!runtime_.wait_objects.contains(event) || runtime_.wait_objects.at(event).kind!=WaitObject::Kind::Event)) {fail(6);frame.return_to(state,returned);return std::nullopt;}
+            if(native && event)runtime_.wait_objects.at(event).set_signal(false);
+        }
+        if(!standard)set_file_io_signaled(handle,false);
+        if(standard && !writing && count) {
+            memory.check(GuestAddress{arg(1)},count,Access::Write);
+            if(!await_standard_input(state,memory,1))return std::nullopt;
+        }
+        auto extent=std::uint64_t{count};
+        if(!writing) {
+            const auto size=standard?runtime_.standard_input.bytes.size():found->second.native?found->second.native->current_size():found->second.bytes->size();
+            const auto position=standard?runtime_.standard_input.position:offset;extent=std::min<std::uint64_t>(count,size>position?size-position:0);
+        }
+        FileIoResult io;
+        if(!standard && found->second.native){
+            auto& file=found->second;
+            if(writing && (offset==UINT64_MAX || (!(file.access&(0x40000000U|2U)) && (file.access&4U))))offset=file.native->current_size();
+            // 整體範圍先檢查，避免後段的鎖衝突造成先寫入前段。
+            io.error=file.native->validate_io(offset,count,writing,key);
+        }
+        process_io::Batch io_request(writing?process_io::Kind::Write:process_io::Kind::Read);
+        if(!io.error)try{
+            memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(extent),writing?Access::Read:Access::Write);
+            if(!standard && found->second.native && found->second.native->null_device()){
+                // NUL 沒有 payload；沿用後續 count、IOSB、APC、event 與 IOCP 完成契約。
+                io.bytes=writing?count:0;process_io::record(writing?process_io::Kind::Write:process_io::Kind::Read,io.bytes);
+            }else{
+            // DWORD 是單次 API 的長度；暫存區大小只限制分段搬移，不限制合法 I/O。
+            std::vector<std::uint8_t> buffer(static_cast<std::size_t>(std::min<std::uint64_t>(extent,1024U*1024U)));
+            bool first=true;
+            while(first || io.bytes<extent){
+                first=false;const auto length=static_cast<std::size_t>(std::min<std::uint64_t>(extent-io.bytes,buffer.size()));auto part=std::span(buffer).first(length);
+                if(writing)memory.read(GuestAddress{arg(1)+io.bytes},part);FileIoResult transferred;
+                if(standard && writing)transferred=write_standard_output(static_cast<unsigned>(handle-0x100),part);
+                else if(standard){auto& input=runtime_.standard_input;transferred.bytes=std::min<std::uint64_t>(length,input.bytes.size()-input.position);std::copy_n(input.bytes.begin()+static_cast<std::ptrdiff_t>(input.position),static_cast<std::size_t>(transferred.bytes),part.begin());input.position+=transferred.bytes;process_io::record(process_io::Kind::Read,transferred.bytes);}
+                else if(found->second.native)transferred=writing?found->second.native->write(part,offset+io.bytes,key):found->second.native->read(part,offset+io.bytes,key);
+                else if(writing)transferred.error=5;
+                else{const auto& bytes=*found->second.bytes;const auto position=static_cast<std::size_t>(std::min<std::uint64_t>(offset+io.bytes,bytes.size()));transferred.bytes=std::min<std::uint64_t>(length,bytes.size()-position);std::copy_n(bytes.begin()+static_cast<std::ptrdiff_t>(position),static_cast<std::size_t>(transferred.bytes),part.begin());process_io::record(process_io::Kind::Read,transferred.bytes);}
+                if(!writing && transferred.bytes)memory.write(GuestAddress{arg(1)+io.bytes},part.first(static_cast<std::size_t>(transferred.bytes)));
+                io.bytes+=transferred.bytes;io.error=transferred.error;if(io.error || transferred.bytes<length || !length)break;
+            }
+            }
+            if(writing && !standard && found->second.native && io.bytes)found->second.metadata=found->second.native->information().metadata;
+        }catch(const std::bad_alloc&){io.error=8;}catch(const MemoryFault&){io.error=998;}
+        // 診斷：X64ARM_TRACE_FILE_READ=<路徑片段> 時，記錄符合檔案每次同步讀寫的位移、長度與宿主時間。
+        if(static const char* const read_trace=std::getenv("X64ARM_TRACE_FILE_READ");read_trace && *read_trace && !standard &&
+           found->second.path.find(read_trace)!=std::string::npos)
+            std::fprintf(stderr,"file_read_trace pid=%u op=%.*s path=%s offset=%llu count=%u bytes=%llu overlapped=%d unix_us=%lld\n",process_id(),
+                static_cast<int>(symbol.size()),symbol.data(),found->second.path.c_str(),static_cast<unsigned long long>(offset),count,
+                static_cast<unsigned long long>(io.bytes),overlapped?1:0,static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()));
+        if(io.error && std::getenv("X64ARM_TRACE_FILE_ERRORS"))std::fprintf(stderr,"[file_io] %.*s handle=%llu offset=%llu count=%u transferred=%llu error=%u\n",static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned long long>(handle),static_cast<unsigned long long>(offset),count,static_cast<unsigned long long>(io.bytes),io.error);
+        if(count_pointer)memory.store(GuestAddress{count_pointer},32,io.bytes);
+        if(!io.error && !standard && (!overlapped || (found->second.mode&0x30)))runtime_.win_file_positions.at(found->second.object)=offset+io.bytes;
+        if(overlapped) {
+            if(!writing && !io.error && !io.bytes && count)io.error=38;
+            const auto status=file_io_status(io.error);
+            memory.store(GuestAddress{overlapped},bits,status);memory.store(GuestAddress{overlapped+unit},bits,io.bytes);if(event)runtime_.wait_objects.at(event).set_signal(true);
+            if(native){
+                PendingFileIo completed;completed.kind=writing?PendingFileIo::Kind::Write:PendingFileIo::Kind::Read;
+                completed.handle=handle;completed.thread=threads_.current;completed.event=memory.load(GuestAddress{overlapped+(x86_?16:24)},bits);completed.native_iosb=arg(6);completed.native_context=arg(7);completed.routine=arg(8);
+                completed.result={static_cast<std::uint32_t>(io.bytes),io.error};complete_file_io(memory,completed,status);
+            }else if(!extended && !io.error && !standard && ((found->second.mode&0x30) || !(found->second.completion_modes&1)) && !(memory.load(GuestAddress{overlapped+(x86_?16:24)},bits)&1)) {
+                const auto port=runtime_.completion_ports.find(found->second.completion_port);
+                if(port!=runtime_.completion_ports.end())port->second.packets.push_back({found->second.completion_key,overlapped,status,static_cast<std::uint32_t>(io.bytes)});
+            }
+        }
+        if(!standard)set_file_io_signaled(handle,true);
+        if(extended && (!io.error || io.error==234)){
+            threads_.items.at(threads_.current).apcs.push_back({arg(4),{io.error,io.bytes,overlapped}});returned=1;last_error_=io.error;threads_.yield=true;
+        }else if(io.error)fail(io.error);else returned=1;
+    }
+    frame.return_to(state,returned);return std::nullopt;
 }
 }

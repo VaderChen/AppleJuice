@@ -18,13 +18,14 @@
 #endif
 namespace x64arm {
 namespace {
-constexpr std::uint64_t magic=UINT64_C(0x3246494c45533458);
+// 共用範圍鎖加入程序與 Key；保留同一主檔名，混用舊成品時明確拒絕，不能繞過舊鎖表。
+constexpr std::uint64_t magic=UINT64_C(0x3346494c45533458);
 struct Owner {std::uint32_t pid{},count{};std::uint64_t birth{};};
 struct Open {std::uint64_t object{},birth{};std::uint32_t pid{},count{},access{},sharing{},close_target{},disposition_target{};};
 struct Target {std::uint64_t parent_device{},parent_inode{},device{},inode{},created{};std::uint32_t pending{},permanent_pending{},directory{};std::array<char,1024> parent{},leaf{};};
 struct Header {std::uint64_t signature{},device{},inode{},created{};std::uint32_t owner_count{},open_count{},target_count{},pending{};std::array<Owner,64> owners{};std::array<Open,4096> opens{};std::array<Target,1024> targets{};};
-constexpr std::uint64_t range_magic=UINT64_C(0x31524c4645533458);
-struct Range {std::uint64_t object{},offset{},length{};std::uint32_t exclusive{},reserved{};};
+constexpr std::uint64_t range_magic=UINT64_C(0x32524c4645533458);
+struct Range {std::uint64_t object{},offset{},length{},birth{};std::uint32_t pid{},key{},exclusive{},reserved{};};
 struct RangeHeader {std::uint64_t signature{},device{},inode{},created{};std::uint32_t count{},reserved{};std::array<Range,4096> locks{};};
 #if defined(__APPLE__)
 std::uint32_t error(){switch(errno){case ENOENT:return 2;case EACCES:case EPERM:case ELOOP:return 5;case EMFILE:case ENFILE:return 4;case ENOMEM:case ENOSPC:return 8;case EBADF:return 6;case ENAMETOOLONG:return 206;default:return 1117;}}
@@ -66,7 +67,7 @@ struct SharedFileState::Storage {
     struct Guard {Storage& storage;std::unique_lock<std::mutex> lock;Guard(Storage& s):storage(s),lock(s.mutex){while(::flock(s.descriptor,LOCK_EX)<0)if(errno!=EINTR)throw HostCallFault("無法鎖定共用檔案狀態");}~Guard(){(void)::flock(storage.descriptor,LOCK_UN);}};
     std::uint32_t open_ranges(){
         if(ranges)return 0;
-        const auto name="file-ranges-v1-"+std::to_string(data->device)+"-"+std::to_string(data->inode)+"-"+std::to_string(data->created);
+        const auto name="file-ranges-v2-"+std::to_string(data->device)+"-"+std::to_string(data->inode)+"-"+std::to_string(data->created);
         bool fresh=false;
         range_descriptor=::openat(range_directory,name.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);fresh=range_descriptor>=0;
         if(!fresh && errno==EEXIST)range_descriptor=::openat(range_directory,name.c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW);
@@ -79,24 +80,40 @@ struct SharedFileState::Storage {
         ranges=static_cast<RangeHeader*>(mapped);
         if(fresh){ranges->signature=range_magic;ranges->device=data->device;ranges->inode=data->inode;ranges->created=data->created;}
         if(ranges->signature!=range_magic || ranges->device!=data->device || ranges->inode!=data->inode || ranges->created!=data->created || ranges->count>ranges->locks.size() || ranges->reserved)return 6;
-        for(std::size_t i=0;i<ranges->count;++i){const auto& r=ranges->locks[i];if(!r.object || !r.length || r.offset>INT64_MAX || r.length>UINT64_MAX-r.offset || r.exclusive>1 || r.reserved)return 6;}
+        for(std::size_t i=0;i<ranges->count;++i){const auto& r=ranges->locks[i];if(!r.object || !r.length || !r.pid || !r.birth || r.offset>INT64_MAX || r.length>UINT64_MAX-r.offset || r.exclusive>1 || r.reserved)return 6;}
         cleanup.keep=true;return 0;
     }
     void clean_ranges(){
         if(!ranges)return;auto count=std::atomic_ref(ranges->count).load(std::memory_order_relaxed);
-        for(std::uint32_t i=0;i<count;){const auto object=ranges->locks[i].object;
-            if(std::any_of(data->opens.begin(),data->opens.begin()+data->open_count,[&](const auto& entry){return entry.count && entry.object==object;})){++i;continue;}
+        for(std::uint32_t i=0;i<count;){const auto& held=ranges->locks[i];
+            if(std::any_of(data->opens.begin(),data->opens.begin()+data->open_count,[&](const auto& entry){return entry.count && entry.object==held.object && entry.pid==held.pid && entry.birth==held.birth;})){++i;continue;}
             ranges->locks[i]=ranges->locks[--count];ranges->locks[count]={};
         }
         std::atomic_ref(ranges->count).store(count,std::memory_order_release);
     }
-    void refresh(){for(std::uint32_t i=0;i<data->target_count;++i)if(!directories.contains(i)){const auto& target=data->targets[i];const auto fd=::open(target.parent.data(),O_SEARCH|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);struct stat parent{};if(fd>=0 && !::fstat(fd,&parent) && target.parent_device==static_cast<std::uint64_t>(parent.st_dev) && target.parent_inode==parent.st_ino)directories.emplace(i,fd);else if(fd>=0)::close(fd);}}
+    void refresh(){for(std::uint32_t i=0;i<data->target_count;++i){
+        const auto& target=data->targets[i];struct stat parent{};
+        // 另一程序可在同一 target index 上改名；不能繼續使用舊目錄描述元。
+        if(const auto found=directories.find(i);found!=directories.end()){
+            if(!::fstat(found->second,&parent) && target.parent_device==static_cast<std::uint64_t>(parent.st_dev) && target.parent_inode==parent.st_ino)continue;
+            ::close(found->second);directories.erase(found);
+        }
+        const auto fd=::open(target.parent.data(),O_SEARCH|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+        if(fd>=0 && !::fstat(fd,&parent) && target.parent_device==static_cast<std::uint64_t>(parent.st_dev) && target.parent_inode==parent.st_ino){
+            try{directories.emplace(i,fd);}catch(...){::close(fd);throw;}
+        }else if(fd>=0)::close(fd);
+    }}
     void cleanup(){
         auto& h=*data;if(!h.pending || std::any_of(h.owners.begin(),h.owners.begin()+h.owner_count,[](const auto& v){return v.count;}) || std::any_of(h.opens.begin(),h.opens.begin()+h.open_count,[](const auto& v){return v.count;}))return;
         refresh();for(std::uint32_t i=0;i<h.target_count;++i){auto& target=h.targets[i];const auto found=directories.find(i);if(!target.pending || found==directories.end())continue;struct stat file{};
-            if(!::fstatat(found->second,target.leaf.data(),&file,AT_SYMLINK_NOFOLLOW) && target.device==static_cast<std::uint64_t>(file.st_dev) && target.inode==file.st_ino && target.created==created(file))
-                (void)::unlinkat(found->second,target.leaf.data(),target.directory?AT_REMOVEDIR:0);
+            const auto queried=::fstatat(found->second,target.leaf.data(),&file,AT_SYMLINK_NOFOLLOW);
+            const bool replaced=!queried && (target.device!=static_cast<std::uint64_t>(file.st_dev) || target.inode!=file.st_ino || target.created!=created(file));
+            const bool removed=queried?(errno==ENOENT):replaced || !::unlinkat(found->second,target.leaf.data(),target.directory?AT_REMOVEDIR:0);
+            // 刪除完成的是這個名稱；清除已完成的 pending，其他硬連結仍可重新開啟或刪除。
+            // 真正的權限／I/O 失敗保留 pending，不把未完成的刪除宣稱為成功。
+            if(removed)target.pending=target.permanent_pending=0;
         }
+        update_pending(h);
     }
     ~Storage(){
         if(registered && data)try{Guard guard(*this);reap(*data);for(std::size_t i=0;i<data->owner_count;++i){auto& owner=data->owners[i];if(owner.pid==pid && owner.birth==birth && owner.count){--owner.count;break;}}cleanup();}catch(...){}
@@ -176,14 +193,15 @@ void SharedFileState::release(std::uint64_t object){
     (void)object;
 #endif
 }
-std::uint32_t SharedFileState::range_conflict(std::uint64_t object,std::uint64_t offset,std::uint64_t length,bool writing){
+std::uint32_t SharedFileState::range_conflict(std::uint64_t object,std::uint64_t offset,std::uint64_t length,bool writing,std::uint32_t key){
 #if !defined(__APPLE__)
-    (void)object;(void)offset;(void)length;(void)writing;return 50;
+    (void)object;(void)offset;(void)length;(void)writing;(void)key;return 50;
 #else
     if(!length || !std::atomic_ref(storage_->ranges->count).load(std::memory_order_acquire))return 0;
     Storage::Guard guard(*storage_);
     const auto conflict=[&](){for(std::size_t i=0;i<storage_->ranges->count;++i){const auto& r=storage_->ranges->locks[i];
-        if(offset<r.offset+r.length && r.offset<offset+length && (r.object==object?writing && !r.exclusive:writing || r.exclusive))return true;
+        const bool own=r.object==object && r.pid==storage_->pid && r.birth==storage_->birth && r.key==key;
+        if(offset<r.offset+r.length && r.offset<offset+length && (own?writing && !r.exclusive:writing || r.exclusive))return true;
     }return false;};
     if(!conflict())return 0;reap(*storage_->data);storage_->clean_ranges();return conflict()?33U:0U;
 #endif
@@ -194,21 +212,22 @@ std::uint32_t SharedFileState::mutate_size(const std::function<std::uint32_t()>&
 #endif
     return operation();
 }
-std::uint32_t SharedFileState::range_lock(std::uint64_t object,std::uint64_t offset,std::uint64_t length,bool exclusive,bool unlock,const std::function<std::uint32_t()>& native,bool adopt){
+std::uint32_t SharedFileState::range_lock(std::uint64_t object,std::uint64_t offset,std::uint64_t length,bool exclusive,bool unlock,const std::function<std::uint32_t()>& native,bool adopt,std::uint32_t key){
 #if !defined(__APPLE__)
-    (void)object;(void)offset;(void)length;(void)exclusive;(void)unlock;(void)native;(void)adopt;return 50;
+    (void)object;(void)offset;(void)length;(void)exclusive;(void)unlock;(void)native;(void)adopt;(void)key;return 50;
 #else
     if(!object || !length || offset>INT64_MAX || length>UINT64_MAX-offset)return 87;
     Storage::Guard guard(*storage_);reap(*storage_->data);storage_->clean_ranges();auto& h=*storage_->ranges;
+    const auto own=[&](const Range& r){return r.object==object && r.pid==storage_->pid && r.birth==storage_->birth && r.key==key;};
     if(!unlock){
         for(std::size_t i=0;i<h.count;++i){const auto& r=h.locks[i];
-            if(adopt && r.object==object && r.offset==offset && r.length==length && r.exclusive==static_cast<unsigned>(exclusive))return 0;
-            if(offset<r.offset+r.length && r.offset<offset+length && (exclusive || r.exclusive))return 33;
+            if(adopt && own(r) && r.offset==offset && r.length==length && r.exclusive==static_cast<unsigned>(exclusive))return 0;
+            if(offset<r.offset+r.length && r.offset<offset+length && (exclusive || (r.exclusive && !own(r))))return 33;
         }
         if(h.count==h.locks.size())return 8;if(const auto code=native())return code;
-        const auto count=h.count;h.locks[count]={object,offset,length,exclusive?1U:0U,0};std::atomic_ref(h.count).store(count+1,std::memory_order_release);return 0;
+        const auto count=h.count;h.locks[count]={object,offset,length,storage_->birth,storage_->pid,key,exclusive?1U:0U,0};std::atomic_ref(h.count).store(count+1,std::memory_order_release);return 0;
     }
-    std::size_t index=0;while(index<h.count && (h.locks[index].object!=object || h.locks[index].offset!=offset || h.locks[index].length!=length))++index;
+    std::size_t index=h.count;for(std::size_t i=0;i<h.count;++i)if(own(h.locks[i]) && h.locks[i].offset==offset && h.locks[i].length==length){index=i;if(h.locks[i].exclusive)break;}
     if(index==h.count)return 158;if(const auto code=native())return code;const auto count=h.count-1;
     h.locks[index]=h.locks[count];h.locks[count]={};std::atomic_ref(h.count).store(count,std::memory_order_release);return 0;
 #endif
@@ -225,6 +244,36 @@ std::pair<std::uint32_t,std::uint32_t> SharedFileState::target(int descriptor,st
     if(index==h.targets.size())return {0,8};const auto copy=::fcntl(descriptor,F_DUPFD_CLOEXEC,3);if(copy<0)return {0,error()};
     auto& t=h.targets[index];t.parent_device=static_cast<std::uint64_t>(parent.st_dev);t.parent_inode=parent.st_ino;t.device=info.device;t.inode=info.id;t.created=info.created;t.directory=directory;std::copy(path.begin(),path.end(),t.parent.begin());t.leaf.fill(0);std::copy(leaf.begin(),leaf.end(),t.leaf.begin());
     if(index==h.target_count)++h.target_count;const auto old=storage_->directories.find(index);if(old!=storage_->directories.end()){::close(old->second);old->second=copy;}else storage_->directories.emplace(index,copy);return {index+1,0};
+#endif
+}
+std::uint32_t SharedFileState::relocate_targets(int source,std::string_view from,int destination,std::string_view to,const FileMetadata& info,const std::function<std::uint32_t()>& operation){
+#if !defined(__APPLE__)
+    (void)source;(void)from;(void)destination;(void)to;(void)info;return operation();
+#else
+    Storage::Guard guard(*storage_);auto& h=*storage_->data;
+    if(info.device!=h.device || info.id!=h.inode || info.created!=h.created)return 6;
+    struct stat parent{},next_parent{};if(::fstat(source,&parent))return error();
+    bool matched=false;
+    const auto matches=[&](const Target& target){return target.parent_device==static_cast<std::uint64_t>(parent.st_dev) && target.parent_inode==parent.st_ino && std::string_view(target.leaf.data())==from;};
+    for(std::uint32_t i=0;i<h.target_count;++i)matched|=matches(h.targets[i]);
+    if(!matched)return operation();
+    if(to.empty() || to=="." || to==".." || to.find('/')!=to.npos || to.find('\0')!=to.npos || to.size()>=Target{}.leaf.size())return 87;
+    std::array<char,1024> path{};
+    if(::fstat(destination,&next_parent) || !S_ISDIR(next_parent.st_mode) || ::fcntl(destination,F_GETPATH,path.data()))return error();
+    // 在更動檔案前完成所有配置。沿用原 target index，其他程序的 close／
+    // disposition 引用與 pending 旗標不變，亦不因反覆改名增加紀錄。
+    struct Prepared {std::map<std::uint32_t,int> values;~Prepared(){for(const auto& [index,fd]:values){(void)index;::close(fd);}}} prepared;
+    for(std::uint32_t i=0;i<h.target_count;++i)if(matches(h.targets[i])){
+        const auto fd=::fcntl(destination,F_DUPFD_CLOEXEC,3);if(fd<0)return error();
+        try{prepared.values.emplace(i,fd);}catch(...){::close(fd);throw;}
+    }
+    if(const auto code=operation())return code;
+    for(const auto& [index,fd]:prepared.values){
+        (void)fd;auto& target=h.targets[index];target.parent_device=static_cast<std::uint64_t>(next_parent.st_dev);target.parent_inode=next_parent.st_ino;
+        target.parent=path;target.leaf.fill(0);std::copy(to.begin(),to.end(),target.leaf.begin());
+        if(const auto old=storage_->directories.find(index);old!=storage_->directories.end()){::close(old->second);storage_->directories.erase(old);}
+    }
+    storage_->directories.merge(prepared.values);return 0;
 #endif
 }
 std::uint32_t SharedFileState::disposition(std::uint32_t index,bool pending,std::uint64_t object){

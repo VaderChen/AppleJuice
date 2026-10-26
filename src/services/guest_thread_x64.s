@@ -177,6 +177,122 @@ entry TryAcquireSRWLockShared
     ret
 1:
 slow_end TryAcquireSRWLockShared
+// 臨界區段（字組協定與服務層共用，見 windows_threads.cpp）：LockCount＝-1 未持有；持有時低 30 位元為遞迴次數−1、
+// bit30 表示宿主有等待者；0x7fffffff 為未持有但有等待者。OwningThread 為 TEB ClientId.UniqueThread（gs:[0x48]）。
+// 只在無等待者時以 lock cmpxchg 取得／完全釋放，遞迴由持有者遞增／遞減。loader lock（PEB+0x800）、有等待者的釋放、
+// 遞迴上限、非持有者解鎖與未持有但有等待者一律以原參數尾跳原服務。只使用 RAX／RDX 與旗標，RCX 保持原值。
+.macro critical_loader_lock
+    mov rax, qword ptr gs:[0x60]
+    add rax, 0x800
+    cmp rcx, rax
+    je 1f
+.endm
+
+entry EnterCriticalSection
+    critical_loader_lock
+    mov eax, -1
+    xor edx, edx
+    lock cmpxchg dword ptr [rcx + 8], edx
+    jne 2f
+5:
+    mov eax, dword ptr gs:[0x48]
+    mov qword ptr [rcx + 16], rax
+    mov dword ptr [rcx + 12], 1
+    ret
+2:
+    mov edx, dword ptr gs:[0x48]
+    cmp qword ptr [rcx + 16], rdx
+    jne 3f
+    mov edx, dword ptr [rcx + 12]
+    cmp edx, 0x3ffffffe
+    jae 1f
+    inc edx
+    mov dword ptr [rcx + 12], edx
+    lock inc dword ptr [rcx + 8]
+    ret
+3:
+    // 他人持有：多處理器（PEB NumberOfProcessors>1）時先有界自旋等字組回到 -1（與 Windows 臨界區段自旋相同用意），
+    // 逾量才進原服務登記等待；單處理器直接進服務。只讀字組，不設等待位元。
+    mov rdx, qword ptr gs:[0x60]
+    cmp dword ptr [rdx + 0xb8], 1
+    jbe 1f
+    mov r8d, 4000
+4:
+    pause
+    cmp dword ptr [rcx + 8], -1
+    jne 6f
+    mov eax, -1
+    xor edx, edx
+    lock cmpxchg dword ptr [rcx + 8], edx
+    je 5b
+6:
+    dec r8d
+    jne 4b
+1:
+slow_end EnterCriticalSection
+
+entry LeaveCriticalSection
+    critical_loader_lock
+    mov eax, dword ptr gs:[0x48]
+    cmp qword ptr [rcx + 16], rax
+    jne 1f
+    mov edx, dword ptr [rcx + 12]
+    cmp edx, 1
+    jne 2f
+    // 先清除擁有者再釋放字組：新持有者寫入的擁有者不會被覆寫。
+    mov qword ptr [rcx + 16], 0
+    mov dword ptr [rcx + 12], 0
+    xor eax, eax
+    mov edx, -1
+    lock cmpxchg dword ptr [rcx + 8], edx
+    jne 3f
+    ret
+3:
+    // 有等待者：恢復擁有權，由原服務釋放並喚醒。
+    mov eax, dword ptr gs:[0x48]
+    mov qword ptr [rcx + 16], rax
+    mov dword ptr [rcx + 12], 1
+    jmp 1f
+2:
+    jb 1f
+    dec edx
+    mov dword ptr [rcx + 12], edx
+    lock dec dword ptr [rcx + 8]
+    ret
+1:
+slow_end LeaveCriticalSection
+
+entry TryEnterCriticalSection
+    critical_loader_lock
+    mov eax, -1
+    xor edx, edx
+    lock cmpxchg dword ptr [rcx + 8], edx
+    jne 2f
+    mov eax, dword ptr gs:[0x48]
+    mov qword ptr [rcx + 16], rax
+    mov dword ptr [rcx + 12], 1
+    mov eax, 1
+    ret
+2:
+    cmp eax, 0x7fffffff
+    je 1f
+    mov edx, dword ptr gs:[0x48]
+    cmp qword ptr [rcx + 16], rdx
+    jne 4f
+    mov edx, dword ptr [rcx + 12]
+    cmp edx, 0x3ffffffe
+    jae 1f
+    inc edx
+    mov dword ptr [rcx + 12], edx
+    lock inc dword ptr [rcx + 8]
+    mov eax, 1
+    ret
+4:
+    // 由其他執行緒持有：與 Windows 相同直接回 FALSE，不進服務。
+    xor eax, eax
+    ret
+1:
+slow_end TryEnterCriticalSection
 // FLS：服務層在 TEB+0x1840 維護目前執行緒（或其目前 fiber）的 128 個值，+0x400 為程序共用的使用中位元圖，
 // 並以 TEB FlsData（gs:[0x17c8]）指向該區。所有寫入（Alloc／Free／SetValue、fiber 切換、執行緒結束）都由
 // 服務層同步，常式只讀。未使用的索引與服務層相同：回 0，FlsGetValue 另設 LastError 87；指標為零時尾跳原服務。

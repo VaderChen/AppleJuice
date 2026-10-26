@@ -273,6 +273,23 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
         }
         // 實體按鍵的 Raw Input 來自宿主鍵盤狀態輪詢；注入（自動化）按鍵沒有實體狀態，比照 SendInput 在此產生。
         if(physical_key && msg.injected)raw_input_keyboard(msg,static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0);
+        // 注入的滾輪同樣產生 Raw Input（RI_MOUSE_WHEEL／RI_MOUSE_HWHEEL，usButtonData 為滾動量）。
+        if((msg.message==0x20a || msg.message==0x20e) && msg.injected)
+            raw_input_mouse(0,0,0,msg.message==0x20a?0x400U:0x800U,static_cast<std::uint16_t>(msg.wparam>>16),static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0);
+        // 注入的滑鼠移動：以 Raw Input 相對位移送出（依 Raw Input 自繪游標的程式只看相對位移）。
+        // 起點取視窗中央（游標置中的程式常見初始位置），之後以上一次注入位置為基準。
+        if(msg.message==0x200 && msg.injected){
+            const auto x=static_cast<std::int32_t>(static_cast<std::int16_t>(msg.lparam&0xffffU)),y=static_cast<std::int32_t>(static_cast<std::int16_t>((msg.lparam>>16)&0xffffU));
+            if(!automation_mouse_){const auto found=gui_.windows.find(msg.window);
+                automation_mouse_=found!=gui_.windows.end()?std::pair{static_cast<std::int32_t>(found->second.width/2),static_cast<std::int32_t>(found->second.height/2)}:std::pair{x,y};}
+            raw_input_mouse(0,x-automation_mouse_->first,y-automation_mouse_->second,0,0,static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0);
+            automation_mouse_=std::pair{x,y};
+        }
+        // 注入的滑鼠按鍵：RI_MOUSE_{LEFT,RIGHT,MIDDLE}_BUTTON_{DOWN,UP}。
+        if(msg.message>=0x201 && msg.message<=0x209 && msg.injected){
+            static constexpr std::uint16_t flags[]={0x1,0x2,0x1,0x4,0x8,0x4,0x10,0x20,0x10}; // DOWN、UP、DBLCLK（視同 DOWN）
+            raw_input_mouse(0,0,0,flags[msg.message-0x201],0,static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0);
+        }
         if((msg.message==0x100 || msg.message==0x101 || msg.message==0x104 || msg.message==0x105) && match_gui_hotkey(msg))continue;
         if((physical_key && !raw_legacy_enabled(true)) || (physical_mouse && !raw_legacy_enabled(false)))continue;
         if(msg.message==0x10004){ // 原生 tracking loop 消耗的放開事件只同步狀態，不重送客體輸入。

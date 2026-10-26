@@ -1,6 +1,7 @@
 #include "x64arm/file_security.hpp"
 #include "x64arm/readonly_files.hpp"
 #include "x64arm/security_access.hpp"
+#include "x64arm/retained_capacity.hpp"
 #include "windows_sddl.hpp"
 #include <algorithm>
 #include <array>
@@ -637,11 +638,29 @@ namespace {
 // 身分 UUID→SID 的解析結果隨之保留，避免每個路徑元件都向 opendirectoryd 往返。
 using SecurityCacheKey=std::tuple<std::uint64_t,std::uint64_t,std::int64_t,std::int64_t,bool>;
 struct SecurityCache {
+    std::shared_ptr<RetainedCapacity> budget=std::make_shared<RetainedCapacity>(
+        retained_capacity_setting("X64ARM_NATIVE_SECURITY_CACHE_BYTES",8U*1024U*1024U));
     std::mutex mutex;
     std::map<SecurityCacheKey,std::shared_ptr<const NativeFileSecurity>> entries;
     std::deque<SecurityCacheKey> order;
+    NativeFileSecurityCacheStats stats;
 };
+struct RetainedSecurity {
+    RetainedCapacityLease lease;
+    NativeFileSecurity value;
+    RetainedSecurity(RetainedCapacityLease&& reservation,const NativeFileSecurity& source)
+        :lease(std::move(reservation)),value(source){}
+};
+// 保守保留 shared_ptr 控制區額度；固定索引另外由 4096 筆限制約束。
+constexpr std::uint64_t security_retention_overhead=sizeof(RetainedSecurity)+64;
 SecurityCache& security_cache(){static SecurityCache cache;return cache;}
+std::size_t security_dynamic_bytes(const NativeFileSecurity& value){
+    auto bytes=value.extended.capacity()*sizeof(ExplicitAce)+value.mandatory_label.capacity();
+    for(const auto& ace:value.extended)bytes+=ace.sid.capacity();
+    if(value.mapped_dacl)bytes+=value.mapped_dacl->capacity();
+    if(value.mapped_descriptor)bytes+=value.mapped_descriptor->capacity();
+    return bytes;
+}
 SecurityCacheKey security_cache_key(const struct stat& info,bool with_acl){
 #if defined(__APPLE__)
     const auto& changed=info.st_ctimespec;
@@ -652,21 +671,68 @@ SecurityCacheKey security_cache_key(const struct stat& info,bool with_acl){
             static_cast<std::int64_t>(changed.tv_sec),static_cast<std::int64_t>(changed.tv_nsec),with_acl};
 }
 std::shared_ptr<const NativeFileSecurity> cached_security(const SecurityCacheKey& key){
+    try{
     auto& cache=security_cache();std::lock_guard<std::mutex> guard(cache.mutex);
-    const auto found=cache.entries.find(key);return found==cache.entries.end()?nullptr:found->second;
+    const auto found=cache.entries.find(key);
+    if(found==cache.entries.end()){++cache.stats.misses;return {};}
+    ++cache.stats.hits;return found->second;
+    }catch(const std::bad_alloc&){return {};}
 }
 void remember_security(const SecurityCacheKey& key,const NativeFileSecurity& value){
+    try{
     auto& cache=security_cache();std::lock_guard<std::mutex> guard(cache.mutex);
     constexpr std::size_t limit=4096;
-    while(cache.entries.size()>=limit && !cache.order.empty()){cache.entries.erase(cache.order.front());cache.order.pop_front();}
-    if(cache.entries.emplace(key,std::make_shared<const NativeFileSecurity>(value)).second)cache.order.push_back(key);
+    // 同鍵合併先於淘汰與配置；並行 miss 不複製用不到的資料或趕走其他鍵。
+    if(cache.entries.contains(key)){++cache.stats.duplicate_insertions;return;}
+    const auto charge=security_retention_overhead+security_dynamic_bytes(value);
+    if(charge>cache.budget->limit){cache.budget->rejected.fetch_add(1,std::memory_order_relaxed);return;}
+    const auto room=[&]{return cache.budget->used.load(std::memory_order_relaxed)<=cache.budget->limit-charge;};
+    while((cache.entries.size()>=limit || !room()) && !cache.order.empty()){
+        const auto found=cache.entries.find(cache.order.front());
+        if(found!=cache.entries.end()){cache.stats.dynamic_bytes-=security_dynamic_bytes(*found->second);cache.entries.erase(found);++cache.stats.evictions;}
+        cache.order.pop_front();
+    }
+    auto reservation=RetainedCapacityLease::acquire(cache.budget,charge);if(!reservation)return;
+    try{
+        auto retained=std::make_shared<RetainedSecurity>(std::move(*reservation),value);
+        const auto bytes=security_dynamic_bytes(retained->value);
+        // 預約來源 capacity；標準容器複製後再次核對，超出預約就不保留該副本。
+        if(!retained->lease.shrink(security_retention_overhead+bytes)){
+            cache.budget->rejected.fetch_add(1,std::memory_order_relaxed);return;
+        }
+        std::shared_ptr<const NativeFileSecurity> stored(retained,&retained->value);
+        cache.order.push_back(key);
+        try{cache.entries.emplace(key,std::move(stored));}catch(...){cache.order.pop_back();throw;}
+        ++cache.stats.insertions;cache.stats.dynamic_bytes+=bytes;
+        cache.stats.largest_dynamic_bytes=std::max<std::uint64_t>(cache.stats.largest_dynamic_bytes,bytes);
+        cache.stats.peak_indexed_bytes=std::max<std::uint64_t>(cache.stats.peak_indexed_bytes,
+            cache.entries.size()*sizeof(NativeFileSecurity)+cache.stats.dynamic_bytes);
+    }catch(const std::bad_alloc&){++cache.stats.allocation_rejections;}
+    }catch(const std::bad_alloc&){} // 首次快取／額度物件配置失敗，原生查詢仍成功返回。
 }
+}
+NativeFileSecurityCacheStats native_file_security_cache_stats(){
+    auto& cache=security_cache();std::lock_guard<std::mutex> guard(cache.mutex);
+    auto result=cache.stats;result.entries=cache.entries.size();result.entry_limit=4096;
+    result.object_bytes=result.entries*sizeof(NativeFileSecurity);
+    result.byte_limit=cache.budget->limit;result.reserved_bytes=cache.budget->used.load(std::memory_order_relaxed);
+    result.peak_reserved_bytes=cache.budget->peak.load(std::memory_order_relaxed);
+    result.budget_rejections=cache.budget->rejected.load(std::memory_order_relaxed);
+    result.indexed_charged_bytes=result.entries*security_retention_overhead+result.dynamic_bytes;
+    for(const auto& [key,value]:cache.entries){
+        result.acl_entries+=std::get<4>(key);
+        const auto bytes=security_dynamic_bytes(*value);
+        ++result.size_buckets[bytes==0?0:bytes<=256?1:bytes<=4096?2:bytes<=65536?3:4];
+    }
+    return result;
 }
 void invalidate_native_file_security_cache(){
     auto& cache=security_cache();std::lock_guard<std::mutex> guard(cache.mutex);cache.entries.clear();cache.order.clear();
+    cache.stats.dynamic_bytes=0;++cache.stats.invalidations;
 }
 #else
 void invalidate_native_file_security_cache(){}
+NativeFileSecurityCacheStats native_file_security_cache_stats(){return {};}
 #endif
 NativeFileSecurity read_native_file_security(const HostFile& file, bool with_acl) {
     NativeFileIdentityScope identity_scope;

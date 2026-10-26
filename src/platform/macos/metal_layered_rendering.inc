@@ -18,3 +18,8 @@ void metal_attach_target(MTLRenderPassAttachmentDescriptor* attachment,const Met
     if(target.volume)attachment.depthPlane=target.depth_start+layer;
     else attachment.slice=layer;
 }
+void metal_attach_target(MetalPassSpec::Attachment& attachment,const MetalRenderTarget& target,unsigned layer=0){
+    attachment.texture=target.texture;attachment.level=0;
+    if(target.volume)attachment.depthPlane=target.depth_start+layer;
+    else attachment.slice=layer;
+}

@@ -144,23 +144,27 @@ void MetalGl::graphics_trace_upload(const char* kind,const GraphicsView& view,st
 void MetalGl::graphics_capture(const GraphicsDraw& draw){
     metal_trace_stencil_draw(draw,[this](const GraphicsView& view){return graphics_read(view);});
     static const auto* const directory=std::getenv("X64ARM_GRAPHICS_CAPTURE_DIR");if(!directory || !*directory)return; // 每次繪製都經過，只查一次。
-    if(const char* filter=std::getenv("X64ARM_GRAPHICS_CAPTURE_STREAM_OUTPUT");filter && std::string_view(filter)=="1")
+    // 篩選設定在程序內不變：只讀一次（擷取目錄設定後每次繪製都會經過這裡，逐次 getenv 會扭曲量測）。
+    static const char* const stream_filter=std::getenv("X64ARM_GRAPHICS_CAPTURE_STREAM_OUTPUT");static const char* const cb_filter=std::getenv("X64ARM_GRAPHICS_CAPTURE_REQUIRE_CB");
+    static const char* const count_filter=std::getenv("X64ARM_GRAPHICS_CAPTURE_NONINDEXED_COUNT");static const char* const request_file=std::getenv("X64ARM_GRAPHICS_CAPTURE_REQUEST");
+    static const char* const begin_setting=std::getenv("X64ARM_GRAPHICS_CAPTURE_BEGIN");static const char* const count_setting=std::getenv("X64ARM_GRAPHICS_CAPTURE_COUNT");
+    if(const char* filter=stream_filter;filter && std::string_view(filter)=="1")
         if(!draw.stages[2].shader || draw.stages[2].shader->stream_output.empty())return;
     // 依實際綁定篩選，避免 UI draw 耗盡診斷張數；不依程式或 shader 名稱。
-    if(const char* filter=std::getenv("X64ARM_GRAPHICS_CAPTURE_REQUIRE_CB");filter && *filter){
+    if(const char* filter=cb_filter;filter && *filter){
         char* separator=nullptr;const auto stage=std::strtoul(filter,&separator,10);
         if(separator==filter || *separator!=':')throw std::invalid_argument("擷取常數槽篩選格式應為 stage:slot");
         char* end=nullptr;const auto slot=std::strtoul(separator+1,&end,10);
         if(end==separator+1 || *end || stage>=draw.stages.size() || slot>=draw.stages[stage].constants.size())throw std::invalid_argument("擷取常數槽篩選超出範圍");
         if(!draw.stages[stage].constants[slot])return;
     }
-    if(const char* filter=std::getenv("X64ARM_GRAPHICS_CAPTURE_NONINDEXED_COUNT");filter && *filter){
+    if(const char* filter=count_filter;filter && *filter){
         char* end=nullptr;const auto count=std::strtoul(filter,&end,10);
         if(end==filter || *end || !count || count>UINT32_MAX)throw std::invalid_argument("擷取非索引 draw 頂點數不合法");
         if(draw.indexed || draw.count!=count)return;
     }
     static std::atomic<std::uint64_t> serial{};const auto id=serial.fetch_add(1,std::memory_order_relaxed);
-    if(const auto* request_path=std::getenv("X64ARM_GRAPHICS_CAPTURE_REQUEST");request_path && *request_path){
+    if(const auto* request_path=request_file;request_path && *request_path){
         // 明確啟用的即時診斷：檔案為「請求編號 張數」，新編號才觸發，
         // 每次最多 128 張。以原子替換檔案送出，沒有請求時不讀回 GPU。
         static std::uint64_t previous_request{},remaining{};
@@ -176,8 +180,8 @@ void MetalGl::graphics_capture(const GraphicsDraw& draw){
         if(!remaining)return;
         --remaining;
     }else{
-        const auto* begin_text=std::getenv("X64ARM_GRAPHICS_CAPTURE_BEGIN");const auto begin=begin_text?std::strtoull(begin_text,nullptr,10):0;
-        const auto* count_text=std::getenv("X64ARM_GRAPHICS_CAPTURE_COUNT");const auto count=count_text?std::min(128ULL,std::strtoull(count_text,nullptr,10)):128ULL;
+        const auto* begin_text=begin_setting;const auto begin=begin_text?std::strtoull(begin_text,nullptr,10):0;
+        const auto* count_text=count_setting;const auto count=count_text?std::min(128ULL,std::strtoull(count_text,nullptr,10)):128ULL;
         if(id<begin || id-begin>=count)return;
     }
     const auto base=std::filesystem::path(directory)/std::to_string(::getpid());std::filesystem::create_directories(base);

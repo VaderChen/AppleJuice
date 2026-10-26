@@ -5,7 +5,7 @@
 .intel_syntax noprefix
 .text
 .macro remainder name, width, fraction, max_exponent
-.p2align 7
+.p2align 6
 .globl _guest_\name
 _guest_\name:
 .if \width == 32
@@ -102,7 +102,7 @@ remainder fmodf, 32, 23, 255
 
 // isspace：ASCII 範圍（0..127）在所有 Windows 單／多位元組 locale 都相同，直接判定 9..13 與 32 回 1；
 // 其餘值（EOF、>=128 的 locale 相關字元）尾跳原字元分類服務。只使用 EAX／EDX，ECX 保持原值供慢路徑。
-.p2align 7
+.p2align 6
 .globl _guest_isspace
 _guest_isspace:
     xor eax, eax
@@ -129,7 +129,7 @@ _guest_isspace_end:
 // 回傳第一個不同位元組的差值（轉小寫後）。空指標交回原服務（errno／invalid parameter）。
 // 只使用 volatile GPR，RCX／RDX 以索引 R10 存取而保持原值。
 .macro stricmp_routine name
-.p2align 7
+.p2align 6
 .globl _guest_\name
 _guest_\name:
     test rcx, rcx
@@ -171,7 +171,7 @@ stricmp_routine _strcmpi
 
 // atoi：與服務層相同（C locale 的 strtoll 後夾到 int32）。略過 ASCII 空白、選用正負號、十進位數字；
 // 累計值超過 int32 範圍（需設 ERANGE）或空指標交回原服務。只用 volatile GPR，RCX 保持原值。
-.p2align 7
+.p2align 6
 .globl _guest_atoi
 _guest_atoi:
     test rcx, rcx
@@ -238,7 +238,7 @@ _guest_atoi_end:
 // 只用 volatile GPR 與 XMM0；RCX 全程保持原值，MXCSR 暫存在呼叫者提供的 home space [RSP+8]。
 // R8 游標、R9 bit0 尾數負號／bit1 指數負號、R10 有效位數值、R11 bit0 見過數字＋bit8 起位數（之後改為指數）、EDX 十進位指數。
 .macro decimal_to_double_routine name, end_pointer
-.p2align 7
+.p2align 6
 .globl _guest_\name
 _guest_\name:
     test rcx, rcx
@@ -446,7 +446,7 @@ decimal_to_double_routine atof, 0
 
 // 客體配置區：malloc／free／_aligned_malloc（對齊 <=16）／_aligned_free 的快速路徑。
 // 狀態頁位址由宿主填入各常式慢路徑 slot 前 8 bytes 的 cell；0 表示未啟用，一律交回原服務。
-// 狀態頁：+0 鎖、+8 配置區起點、+16 長度、+24 大小上限、+0x40+class*8 空閒串列頭。
+// 狀態頁：+0 鎖、+8 配置區起點、+16 已建立的連續 chunk 長度、+24 大小上限、+32 程序堆積 HeapLock 持有旗標、+0x40+class*8 空閒串列頭。
 // 4 KiB 內為 16-byte 級距；其後為 256-byte 級距，含對齊標頭最多 497 級。
 // chunk 256 KiB 對齊：+0 magic、+8 class；區塊自 +64 起，空閒時以區塊首 8 bytes 串接。
 // 對齊配置額外有 16-byte 標頭：+0 原始大小、+8 alignment；回傳標頭之後的指標。
@@ -482,7 +482,31 @@ Lsmall\@:
     cmove rax, r9
 Lclass\@:
 .endm
-.p2align 7
+// 每執行緒級距快取（TEB 的 CRT 私有頁，常數與 guest_heap_layout.hpp 相同）：級距 1～64 的空閒區塊以區塊首 8 bytes
+// 串接，串列頭 gs:[0x4600+class*8]、數量 gs:[0x4810+class]（每級距至多 32）。配置先取、釋放先放，命中時不碰全域鎖；
+// 只有本執行緒讀寫；宿主在執行緒結束時歸還全域串列，HeapWalk 將其視為空閒。rax 為級距。
+.macro heap_cache_pop got, miss, block, scratch
+    cmp rax, 64
+    ja \miss
+    mov \block, qword ptr gs:[rax*8 + 0x4600]
+    test \block, \block
+    je \miss
+    mov \scratch, qword ptr [\block]
+    mov qword ptr gs:[rax*8 + 0x4600], \scratch
+    dec byte ptr gs:[rax + 0x4810]
+    jmp \got
+.endm
+.macro heap_cache_push pointer, miss, scratch
+    cmp rax, 64
+    ja \miss
+    cmp byte ptr gs:[rax + 0x4810], 32
+    jae \miss
+    mov \scratch, qword ptr gs:[rax*8 + 0x4600]
+    mov qword ptr [\pointer], \scratch
+    mov qword ptr gs:[rax*8 + 0x4600], \pointer
+    inc byte ptr gs:[rax + 0x4810]
+.endm
+.p2align 6
 .globl _guest_malloc
 _guest_malloc:
     mov r10, qword ptr [rip + Lmalloc_cell]
@@ -492,6 +516,8 @@ _guest_malloc:
     ja Lmalloc_slow
     mov rax, rcx
     heap_size_class
+    heap_cache_pop Lmalloc_hit, Lmalloc_global, r8, r9
+Lmalloc_global:
     heap_lock malloc, edx
     mov r8, qword ptr [r10 + rax*8 + 0x40]
     test r8, r8
@@ -499,6 +525,10 @@ _guest_malloc:
     mov r9, qword ptr [r8]
     mov qword ptr [r10 + rax*8 + 0x40], r9
     mov dword ptr [r10], 0
+Lmalloc_hit:
+    // 區塊首 8 bytes 是空閒串列指標：取出時清零，從未用過的區塊因而全為零（與一般 heap 新區塊相同，
+    // 依賴新配置記憶體為零的程式才不會讀到串列指標）。
+    mov qword ptr [r8], 0
     mov rax, r8
     ret
 Lmalloc_empty:
@@ -514,7 +544,7 @@ Lmalloc_slot:
 .globl _guest_malloc_end
 _guest_malloc_end:
 
-.p2align 7
+.p2align 6
 .globl _guest__aligned_malloc
 _guest__aligned_malloc:
     test rcx, rcx
@@ -562,7 +592,7 @@ _guest__aligned_malloc_end:
 
 // free／_aligned_free：NULL 無動作；配置區指標（範圍與 chunk magic 皆符合）推回級距串列，其餘交回原服務。
 .macro heap_free_routine name, pointer=rcx, header=0
-.p2align 7
+.p2align 6
 .globl _guest_\name
 _guest_\name:
     test rcx, rcx
@@ -583,6 +613,9 @@ _guest_\name:
     cmp qword ptr [r8], r9
     jne Lslow\@
     mov eax, dword ptr [r8 + 8]
+    heap_cache_push \pointer, Lglobal\@, r9
+    ret
+Lglobal\@:
     heap_lock \name, edx
     mov r9, qword ptr [r10 + rax*8 + 0x40]
     mov qword ptr [\pointer], r9
@@ -607,7 +640,7 @@ heap_free_routine _aligned_free, r11, 16
 // _lock_locales／_unlock_locales：locale 鎖的客體快速路徑。cell 指向狀態格：+0 擁有者公開執行緒編號
 // （TEB+0x48）、+4 遞迴次數、+8 宿主登記的等待者數；0 表示未啟用，一律交回原服務。
 // 無主以 LOCK CMPXCHG 取得、自身持有則遞增；其他執行緒持有、遞迴上限、非持有者解鎖或有等待者時尾跳原服務。
-.p2align 7
+.p2align 6
 .globl _guest__lock_locales
 _guest__lock_locales:
     mov r10, qword ptr [rip + Llock_locales_cell]
@@ -640,7 +673,7 @@ Llock_locales_slot:
 .globl _guest__lock_locales_end
 _guest__lock_locales_end:
 
-.p2align 7
+.p2align 6
 .globl _guest__unlock_locales
 _guest__unlock_locales:
     mov r10, qword ptr [rip + Lunlock_locales_cell]
@@ -677,6 +710,113 @@ _guest__unlock_locales_end:
 // RDX 原 endptr 存於 home space；非空時回填結尾，任何慢路徑都恢復原參數。
 // 長字串、尾綴、特殊值、非就近捨入及超界一律使用原 strtod 完整契約。
 decimal_to_double_routine strtod, 1
+
+// kernel32 HeapAlloc／HeapFree：程序堆積（0x200）與 malloc／free 共用配置區鎖及級距串列（UCRT 同樣以程序堆積配置）。
+// 配置旗標只收 0／HEAP_ZERO_MEMORY、釋放只收 0；狀態頁 +32 非零表示程序堆積正被 HeapLock 持有。
+// 私有 heap、其他旗標、NULL、超過上限、空串列、非配置區或非程序堆積 chunk 一律以原參數尾跳原服務。
+.p2align 6
+.globl _guest_HeapAlloc
+_guest_HeapAlloc:
+    cmp rcx, 0x200
+    jne LHeapAlloc_slow
+    test edx, -9
+    jne LHeapAlloc_slow
+    mov r10, qword ptr [rip + LHeapAlloc_cell]
+    test r10, r10
+    je LHeapAlloc_slow
+    cmp dword ptr [r10 + 32], 0
+    jne LHeapAlloc_slow
+    cmp r8, qword ptr [r10 + 24]
+    ja LHeapAlloc_slow
+    mov rax, r8
+    heap_size_class
+    heap_cache_pop LHeapAlloc_got, LHeapAlloc_global, r9, r11
+LHeapAlloc_global:
+    heap_lock HeapAlloc, r9d
+    mov r9, qword ptr [r10 + rax*8 + 0x40]
+    test r9, r9
+    je LHeapAlloc_empty
+    mov r11, qword ptr [r9]
+    mov qword ptr [r10 + rax*8 + 0x40], r11
+    mov dword ptr [r10], 0
+LHeapAlloc_got:
+    mov qword ptr [r9], 0
+    mov rax, r9
+    test edx, 8
+    jne LHeapAlloc_zero
+    ret
+LHeapAlloc_zero:
+    // HEAP_ZERO_MEMORY：以 8-byte 寫入清除請求大小（級距大小為 16 的倍數，進位不超出區塊）。
+    lea r11, [r8 + 7]
+    shr r11, 3
+    je LHeapAlloc_done
+LHeapAlloc_clear:
+    mov qword ptr [r9], 0
+    add r9, 8
+    dec r11
+    jne LHeapAlloc_clear
+LHeapAlloc_done:
+    ret
+LHeapAlloc_empty:
+    mov dword ptr [r10], 0
+LHeapAlloc_slow:
+    jmp qword ptr [rip + LHeapAlloc_slot]
+    heap_lock_wait HeapAlloc
+.p2align 3
+LHeapAlloc_cell:
+    .quad 0
+LHeapAlloc_slot:
+    .quad 0
+.globl _guest_HeapAlloc_end
+_guest_HeapAlloc_end:
+
+.p2align 6
+.globl _guest_HeapFree
+_guest_HeapFree:
+    cmp rcx, 0x200
+    jne LHeapFree_slow
+    test edx, edx
+    jne LHeapFree_slow
+    test r8, r8
+    je LHeapFree_slow
+    mov r10, qword ptr [rip + LHeapFree_cell]
+    test r10, r10
+    je LHeapFree_slow
+    cmp dword ptr [r10 + 32], 0
+    jne LHeapFree_slow
+    mov rax, r8
+    sub rax, qword ptr [r10 + 8]
+    cmp rax, qword ptr [r10 + 16]
+    jae LHeapFree_slow
+    mov r9, r8
+    and r9, -0x40000
+    movabs r11, 0x50414548343658ab
+    cmp qword ptr [r9], r11
+    jne LHeapFree_slow
+    cmp qword ptr [r9 + 24], 0
+    jne LHeapFree_slow
+    mov eax, dword ptr [r9 + 8]
+    heap_cache_push r8, LHeapFree_global, r9
+    mov eax, 1
+    ret
+LHeapFree_global:
+    heap_lock HeapFree, r11d
+    mov r9, qword ptr [r10 + rax*8 + 0x40]
+    mov qword ptr [r8], r9
+    mov qword ptr [r10 + rax*8 + 0x40], r8
+    mov dword ptr [r10], 0
+    mov eax, 1
+    ret
+LHeapFree_slow:
+    jmp qword ptr [rip + LHeapFree_slot]
+    heap_lock_wait HeapFree
+.p2align 3
+LHeapFree_cell:
+    .quad 0
+LHeapFree_slot:
+    .quad 0
+.globl _guest_HeapFree_end
+_guest_HeapFree_end:
 
 .globl _guest_scalar_math_end
 _guest_scalar_math_end:

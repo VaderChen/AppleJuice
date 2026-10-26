@@ -50,6 +50,7 @@ OpenHostFile ReadOnlyFiles::reopen(const HostFile& original,std::string path,std
 #endif
 }catch(const std::bad_alloc&){return {{},{},{},8,false};}
 std::uint32_t HostFile::set_basic(std::uint64_t created,std::uint64_t accessed,std::uint64_t modified,std::uint64_t changed,std::uint32_t attributes) const {
+    if(null_device_)return 1;
     if(readonly_)return 5;if(attributes&~0x31b7U || created==UINT64_MAX || accessed==UINT64_MAX || modified==UINT64_MAX || changed==UINT64_MAX)return 50;
 #if defined(_WIN32)
     (void)created;(void)accessed;(void)modified;(void)changed;return 50;
@@ -108,6 +109,7 @@ std::uint32_t HostFile::copy_template_metadata(int destination,bool directory,st
 #endif
 }
 std::uint32_t HostFile::allocate(std::uint64_t size) const {
+    if(null_device_)return 1;
     if(readonly_)return 5;if(size>INT64_MAX)return 87;const auto info=information();if(info.error)return info.error;if(info.metadata.attributes&0x10U)return 5;
     if(size<info.metadata.size)return truncate(size);if(size==info.metadata.allocation_size)return 0;
 #if defined(__APPLE__)

@@ -56,7 +56,7 @@ enum class SystemCallEntry { Syscall, Sysenter, Interrupt };
 enum class ResidentServiceProgress {Completed,Retry,Coordinator};
 // 含睡眠的宿主連續時鐘，毫秒自宿主開機起算；DWORD 自然回繞。
 // 核心依客體模式選擇 EAX、EDX:EAX 或 RAX，沒有參數、LastError 或共享時間頁副作用。
-enum class ResidentClockRecipe : unsigned {None=0,Milliseconds32=1,Milliseconds64=2};
+enum class ResidentClockRecipe : unsigned {None=0,Milliseconds32=1,Milliseconds64=2,PerformanceCounter=3};
 class HostCallFault : public std::runtime_error { using std::runtime_error::runtime_error; };
 struct CpuFault : std::runtime_error {
     std::uint32_t code;

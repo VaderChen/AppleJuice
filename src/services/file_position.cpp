@@ -1,5 +1,6 @@
 #include "x64arm/file_position.hpp"
 #include "x64arm/host_services.hpp"
+#include "x64arm/readonly_files.hpp"
 #include <array>
 #include <algorithm>
 #include <cerrno>
@@ -96,7 +97,7 @@ std::pair<FilePosition,std::uint32_t> FilePosition::inherit(const std::string& s
     storage->descriptor=::openat(storage->directory,record_name(identity).c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW);if(storage->descriptor<0)return {FilePosition{},6};
     if(const auto error=map_record(*storage))return {FilePosition{},error};
     PositionLock guard(storage);const auto& data=*storage->data;struct stat info{};
-    if(data.identity!=identity || ::fstat(file_descriptor,&info) || !S_ISREG(info.st_mode) || data.device!=static_cast<std::uint64_t>(info.st_dev) || data.inode!=static_cast<std::uint64_t>(info.st_ino))return {FilePosition{},6};
+    if(data.identity!=identity || ::fstat(file_descriptor,&info) || (!S_ISREG(info.st_mode) && !HostFile::is_null_descriptor(file_descriptor)) || data.device!=static_cast<std::uint64_t>(info.st_dev) || data.inode!=static_cast<std::uint64_t>(info.st_ino))return {FilePosition{},6};
     metadata={data.device,data.inode,data.access,data.sharing,data.mode,(data.readonly&1)!=0,std::string(data.path.data(),data.path_size),data.object,(data.readonly&2)!=0};
     FilePosition result;result.shared_=std::move(storage);return {std::move(result),0};
 #endif

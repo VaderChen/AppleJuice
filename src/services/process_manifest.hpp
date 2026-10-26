@@ -1,6 +1,5 @@
 #pragma once
-#include "x64arm/pe_loader.hpp"
-#include "x64arm/pe_file_cache.hpp"
+#include "image_file_metadata.hpp"
 #include "x64arm/security_descriptor.hpp"
 #include <fstream>
 #include <libxml/parser.h>
@@ -37,7 +36,11 @@ inline Level parse(std::span<const std::uint8_t> bytes){
     return result.value_or(Level::Invoker);
 }
 
-inline Level executable(const std::filesystem::path& path){
+struct Inspection {
+    Level level{};std::uint16_t subsystem{},flags{},machine{};
+    std::uint64_t file_bytes{},read_bytes{},read_calls{};
+};
+inline Inspection inspect(const HostFile& source,const std::filesystem::path& path){
     const auto read=[](const std::filesystem::path& name,std::size_t maximum,bool optional)->std::optional<std::vector<std::uint8_t>>{
         std::ifstream file(name,std::ios::binary|std::ios::ate);
         if(!file){if(optional && errno==ENOENT)return {};throw SecurityDescriptorError{5};}
@@ -46,13 +49,17 @@ inline Level executable(const std::filesystem::path& path){
         if(!file.read(reinterpret_cast<char*>(data.data()),static_cast<std::streamsize>(data.size())))throw SecurityDescriptorError{30};
         return data;
     };
-    PeFileBytes image;
-    try{image=read_pe_snapshot(path,512U*1024U*1024U);}
-    catch(const std::length_error&){throw SecurityDescriptorError{8};}
-    catch(const std::system_error& error){throw SecurityDescriptorError{error.code()==std::errc::permission_denied?5U:30U};}
-    const auto embedded=read_pe_resource(*image,u"#24",1);
-    if(embedded)return parse(embedded->bytes);
-    const auto external=read(path.string()+".manifest",1024U*1024U,true);
-    return external?parse(*external):Level::Invoker;
+    image_file::Reader reader(source);image_file::PeMetadata image(reader);
+    const auto embedded=image.resource(24,1,1024U*1024U);
+    Level level=Level::Invoker;
+    if(embedded)level=parse(*embedded);
+    else if(const auto external=read(path.string()+".manifest",1024U*1024U,true))level=parse(*external);
+    reader.finish();
+    return {level,image.header().subsystem,image.header().flags,image.header().machine,reader.size(),reader.read_bytes(),reader.read_calls()};
+}
+inline Level executable(const std::filesystem::path& path){
+    // 初始 EXE 已由呼叫端選定；仍沿用同一個來源能力與描述元流程。
+    ReadOnlyFiles files;const auto guest=files.map_executable(path);const auto source=files.open_library_reader(guest);
+    if(source.error)throw SecurityDescriptorError{source.error};return inspect(*source.file,source.source).level;
 }
 }

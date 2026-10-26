@@ -10,7 +10,7 @@ namespace {
 constexpr std::uint32_t invalid_handle=0xc0000008U,invalid_parameter=0xc000000dU,denied=0xc0000022U;
 constexpr std::uint32_t missing=0xc0000034U,deleted=0xc000017cU,unsupported=0xc00000bbU,no_memory=0xc0000017U;
 struct NativeRegistryError {std::uint32_t status;};
-std::uint32_t native_io_error(std::uint32_t code){return !code?0U:code==2 || code==3?missing:code==5?denied:code==6?invalid_handle:code==8?no_memory:code==13?0xc000003eU:code==50?unsupported:code==87?invalid_parameter:code==1314?0xc0000061U:code==1336?0xc0000077U:code==1337?0xc0000078U:code==1338?0xc0000079U:0xc0000001U;}
+std::uint32_t native_io_error(std::uint32_t code){return !code?0U:code==2 || code==3?missing:code==5?denied:code==6?invalid_handle:code==8?no_memory:code==13?0xc000003eU:code==50?unsupported:code==87?invalid_parameter:code==234?0x80000005U:code==1314?0xc0000061U:code==1336?0xc0000077U:code==1337?0xc0000078U:code==1338?0xc0000079U:0xc0000001U;}
 std::u16string folded(std::u16string text){for(auto& c:text)c=unicode_case_unit(c,false);return text;}
 void put(std::vector<std::uint8_t>& bytes,std::size_t offset,std::uint64_t value,unsigned size=4){for(unsigned i=0;i<size;++i)bytes.at(offset+i)=static_cast<std::uint8_t>(value>>(i*8));}
 std::vector<std::uint8_t> text_bytes(std::u16string_view text){auto bytes=utf16_bytes(text);bytes.resize(text.size()*2);return bytes;}
@@ -22,7 +22,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_registry(GuestState& sta
     if(symbol=="NtClose"){
         if(const auto flags=runtime_.handle_flags.find(arg(0));flags!=runtime_.handle_flags.end() && (flags->second&2U))return finish(0xc0000235U);
         if(registry.handles.erase(arg(0))){runtime_.handle_flags.erase(arg(0));poll_registry_notifications(false);return finish(0);}
-        start_callbacks(state,memory,{{resolve("kernel32.dll","CloseHandle").value,{arg(0)}}},Continuation::NtCloseResult);return std::nullopt;
+        start_callbacks(state,memory,{{resolve("internal-nt-file","CloseHandle").value,{arg(0)}}},Continuation::NtCloseResult);return std::nullopt;
     }
     if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
     const bool readonly=symbol.starts_with("NtOpen") || symbol.starts_with("NtQuery") || symbol.starts_with("NtEnumerate") || symbol=="NtFlushKey";
@@ -117,6 +117,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_registry(GuestState& sta
         const auto found=registry.handles.find(arg(0));if(found==registry.handles.end())return done(invalid_handle);
         const auto handle=found->second;if(!registry.keys.contains(handle.path))return done(deleted);
         auto& values=registry.keys.at(handle.path);
+        if(symbol=="NtQueryMultipleValueKey")return done(native_io_error(query_registry_multiple_values(memory,arg,handle,true,true)));
+        if(symbol=="NtSetInformationKey"){
+            // 公開的寫入時間類別；其他類別保留給系統，不能假造變更成功。
+            if(static_cast<std::uint32_t>(arg(1))!=0)return done(0xc0000003U);
+            if(static_cast<std::uint32_t>(arg(3))!=8)return done(0xc0000004U);
+            if((handle.access&0x20006U)!=0x20006U)return done(denied);
+            const auto stamp=memory.load(GuestAddress{arg(2)},64);
+            if(!registry.modified_times.contains(handle.path) || registry.modified_times.at(handle.path)!=stamp){
+                mutations.emplace_back(handle.path,2U);registry.modified_times[handle.path]=stamp;changed=true;
+            }
+            return done(0);
+        }
         if(symbol=="NtFlushKey"){if(!(handle.access&1U))return done(denied);if(const auto error=flush_registry_hives())return done(native_io_error(error));return done(native_io_error(transaction.flush()));}
         if(symbol=="NtDeleteKey"){
             if(registry.hives.contains(handle.path))return done(denied);

@@ -17,6 +17,7 @@ std::uint32_t WindowsServices::file_io_status(std::uint32_t error) {
     case 4: return 0xc000011f;
     case 6: return 0xc0000008;
     case 50: return 0xc00000bb;
+    case 158: return 0xc000007e;
     case 267: return 0xc0000103;
     case 0:
         return 0;
@@ -70,6 +71,7 @@ std::uint32_t pipe_error(std::uint32_t status) {
     case 0xc0000005:
         return 998;
     case 0xc0000054:
+    case 0xc0000055:
         return 33;
     case 0xc0000011:
         return 38;
@@ -302,7 +304,7 @@ void WindowsServices::poll_file_io(GuestMemory &memory, bool scheduler_poll) {
             io.attempted = true;
             std::uint32_t error=0;
             if(runtime_.network.external_io){(void)mapping_session();error=filesystem_.publish_shared_file(*file->second.native);}
-            if(!error)error = file->second.native->lock_range(io.offset, io.length, io.exclusive, false);
+            if(!error)error = file->second.native->lock_range(io.offset, io.length, io.exclusive, false,io.lock_key);
             io.result = {0, error == 33 && !io.immediate ? 0U : error, error == 33 && !io.immediate};
         } else if (!io.result.error && io.kind == PendingFileIo::Kind::Directory) {
             io.attempted = true;
@@ -377,7 +379,7 @@ void WindowsServices::poll_file_io(GuestMemory &memory, bool scheduler_poll) {
             } catch (const MemoryFault &) {
                 io.result = {0, 998};
             }
-        complete_file_io(memory,io,file_io_status(io.result.error));
+        complete_file_io(memory,io,io.kind==PendingFileIo::Kind::Lock && io.result.error==33?0xc0000055U:file_io_status(io.result.error));
         if (io.native_scratch) {
             (void)free_heap(memory, io.native_scratch, threads_.items.at(io.thread).context);
             io.native_scratch = 0;
@@ -386,10 +388,75 @@ void WindowsServices::poll_file_io(GuestMemory &memory, bool scheduler_poll) {
     std::erase_if(pending_file_io_,
                   [](const auto &io) { return (io.overlapped || io.native_iosb) && !io.blocking && io.notify && io.done; });
 }
+std::optional<std::uint32_t> WindowsServices::invoke_file_lock(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
+    const bool native=symbol.starts_with("Nt"),unlock=symbol=="NtUnlockFile" || symbol=="UnlockFile" || symbol=="UnlockFileEx";
+    const bool simple=symbol=="LockFile" || symbol=="UnlockFile";
+    const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+    const auto u32=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
+    const auto status=[](std::uint32_t error){return error==33?0xc0000055U:file_io_status(error);};
+    const auto finish=[&](std::uint32_t error)->std::optional<std::uint32_t>{
+        const auto value=native?status(error):error?0U:1U;
+        if(native)threads_.items.at(threads_.current).last_native_status=value;else if(error)last_error_=error;
+        arg.return_to(state,value);return std::nullopt;
+    };
+    try {
+        const auto iosb=native?arg(unlock?1:4):0,overlap=native || simple?0:arg(unlock?4:5);
+        // 恢復原要求的完成結果優先於 handle 查詢，保留關閉中的同步取消。
+        if(!unlock && !simple){const auto previous=std::find_if(pending_file_io_.begin(),pending_file_io_.end(),[&](const auto& io){
+            return io.kind==PendingFileIo::Kind::Lock && io.blocking && io.thread==threads_.current && io.handle==arg(0) && io.overlapped==overlap && io.native_iosb==iosb;
+        });
+            if(previous!=pending_file_io_.end()){
+                if(!previous->done)throw HostCallFault("檔案鎖尚未完成卻恢復執行緒");
+                const auto error=previous->result.error;pending_file_io_.erase(previous);threads_.items.at(threads_.current).wait={};return finish(error);
+            }
+        }
+        if(native){if(!iosb)return finish(998);memory.check(GuestAddress{iosb},unit*2,Access::Write);}
+        const auto file=files_.find(arg(0));if(file==files_.end())return finish(6);
+        if(!file->second.native || (file->second.metadata.attributes&0x10U))return finish(native?1:simple?6:87);
+        if(!(file->second.access&0xc0000003U))return finish(5);
+        PendingFileIo io;io.kind=PendingFileIo::Kind::Lock;io.handle=arg(0);io.thread=threads_.current;io.overlapped=overlap;io.native_iosb=iosb;
+        if(native){
+            io.offset=memory.load(GuestAddress{arg(unlock?2:5)},64);io.length=memory.load(GuestAddress{arg(unlock?3:6)},64);io.lock_key=u32(unlock?4:7);
+            if(!unlock){io.event=arg(1);io.routine=arg(2);io.native_context=arg(3);io.immediate=static_cast<std::uint8_t>(arg(8))!=0;io.exclusive=static_cast<std::uint8_t>(arg(9))!=0;}
+        }else if(simple){
+            io.offset=std::uint64_t{u32(1)}|(std::uint64_t{u32(2)}<<32);io.length=std::uint64_t{u32(3)}|(std::uint64_t{u32(4)}<<32);io.immediate=true;io.exclusive=true;
+        }else{
+            if(!overlap || u32(unlock?1:2) || (!unlock && (u32(1)&~3U)))return finish(87);
+            memory.check(GuestAddress{overlap},x86_?20:32,Access::Write);io.offset=memory.load(GuestAddress{overlap+unit*2},64);
+            io.length=std::uint64_t{u32(unlock?2:3)}|(std::uint64_t{u32(unlock?3:4)}<<32);
+            if(!unlock){io.event=memory.load(GuestAddress{overlap+(x86_?16:24)},bits);io.immediate=(u32(1)&1U)!=0;io.exclusive=(u32(1)&2U)!=0;}
+        }
+        if(!io.length || io.offset>INT64_MAX || io.length>UINT64_MAX-io.offset)return finish(87);
+        if(unlock || simple){
+            std::uint32_t error=0;if(runtime_.network.external_io){(void)mapping_session();error=filesystem_.publish_shared_file(*file->second.native);}
+            if(!error)error=file->second.native->lock_range(io.offset,io.length,io.exclusive,unlock,io.lock_key);
+            if(native){memory.store(GuestAddress{iosb},bits,status(error));memory.store(GuestAddress{iosb+unit},bits,0);set_file_io_signaled(io.handle,true);}
+            return finish(error);
+        }
+        io.blocking=(file->second.mode&0x30U)!=0;
+        const auto event_handle=native?io.event:io.event&~UINT64_C(1);
+        if(event_handle){const auto event=runtime_.wait_objects.find(event_handle);if(event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event)return finish(6);}
+        if(io.routine && file->second.completion_port)return finish(87);
+        if(pending_file_io_.size()>=1024 || (io.routine && threads_.items.at(threads_.current).apcs.size()+static_cast<std::size_t>(std::count_if(pending_file_io_.begin(),pending_file_io_.end(),[&](const auto& p){return p.thread==io.thread && p.routine;}))>=1024))return finish(8);
+        if(std::any_of(pending_file_io_.begin(),pending_file_io_.end(),[&](const auto& p){return (overlap && p.overlapped==overlap) || (iosb && p.native_iosb==iosb);}))return finish(87);
+        const auto block=native?iosb:overlap;memory.store(GuestAddress{block},bits,0x103);memory.store(GuestAddress{block+unit},bits,0);
+        if(event_handle)runtime_.wait_objects.at(event_handle).set_signal(false);
+        set_file_io_signaled(io.handle,false);pending_file_io_.push_back(io);poll_file_io(memory);
+        const auto current=std::find_if(pending_file_io_.begin(),pending_file_io_.end(),[&](const auto& p){return p.kind==PendingFileIo::Kind::Lock && p.handle==io.handle && p.thread==io.thread && p.overlapped==overlap && p.native_iosb==iosb;});
+        if(current==pending_file_io_.end())throw HostCallFault("檔案鎖缺少共用完成要求");
+        if(current->done){const auto error=current->result.error;pending_file_io_.erase(current);return finish(error);}
+        if(!io.blocking){current->notify=true;if(native){threads_.items.at(threads_.current).last_native_status=0x103;arg.return_to(state,0x103);return std::nullopt;}return finish(997);}
+        auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::FileIo;thread.wait.handles={io.handle};schedule(state,memory);return std::nullopt;
+    }catch(const MemoryFault&){return finish(998);}catch(const std::bad_alloc&){return finish(8);}
+}
 std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, GuestMemory &memory,
                                                              const WindowsServiceDescriptor &service,const FileOpenArguments* arguments) {
+    if(service.symbol=="LockFile" || service.symbol=="UnlockFile" || service.symbol=="LockFileEx" || service.symbol=="UnlockFileEx")return invoke_file_lock(state,memory,service);
     if(service.symbol=="GetOverlappedResult" || service.symbol=="GetOverlappedResultEx")return invoke_overlapped_result(state,memory,service);
     const WindowsCall frame(state, memory, service);
+    if(service.symbol=="CancelIo" || service.symbol=="CancelIoEx")
+        if(const auto value=invoke_native_file_io(state,memory,service)){frame.return_to(state,*value);return std::nullopt;}
     const auto arg=[&](unsigned i){return arguments?arguments->at(i):frame(i);};
     const auto symbol = service.symbol;
     const auto u32 = [&](unsigned i) { return static_cast<std::uint32_t>(arg(i)); };
@@ -563,8 +630,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
         }
     } else {
         const auto file = files_.find(arg(0));
-        const bool generic = symbol == "LockFile" || symbol == "UnlockFile" || symbol == "LockFileEx" ||
-                             symbol == "UnlockFileEx" || symbol == "GetOverlappedResult" || symbol == "CancelIo" ||
+        const bool generic = symbol == "GetOverlappedResult" || symbol == "CancelIo" ||
                              symbol == "CancelIoEx";
         const bool serial_operation = symbol == "ReadFile" || symbol == "WriteFile" || symbol == "ReadFileEx" ||
                                       symbol == "WriteFileEx" || symbol == "FlushFileBuffers" ||
@@ -572,106 +638,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
         if (file == files_.end() || (symbol == "WaitCommEvent" && !file->second.serial) ||
             (!file->second.pipe && !((file->second.serial || file->second.hid) && serial_operation) && !generic))
             fail(6);
-        else if (symbol == "LockFile" || symbol == "UnlockFile") {
-            if (!file->second.native)
-                fail(6);
-            else if (!(file->second.access & 0xc0000003U))
-                fail(5);
-            else {
-                const auto offset = std::uint64_t{u32(1)} | (std::uint64_t{u32(2)} << 32),
-                           length = std::uint64_t{u32(3)} | (std::uint64_t{u32(4)} << 32);
-                std::uint32_t error=0;
-                if(runtime_.network.external_io){(void)mapping_session();error=filesystem_.publish_shared_file(*file->second.native);}
-                if(!error)error = file->second.native->lock_range(offset, length, true, symbol == "UnlockFile");
-                if (error)
-                    fail(error);
-                else
-                    result = 1;
-            }
-        } else if (symbol == "LockFileEx" || symbol == "UnlockFileEx") {
-            const bool unlock = symbol == "UnlockFileEx";
-            const auto overlap = arg(unlock ? 4 : 5);
-            const auto previous = std::find_if(pending_file_io_.begin(), pending_file_io_.end(), [&](const auto &io) {
-                return io.blocking && io.handle == arg(0) && io.thread == threads_.current && io.overlapped == overlap;
-            });
-            if (previous != pending_file_io_.end()) {
-                if (!previous->done)
-                    throw HostCallFault("檔案鎖尚未完成卻恢復執行緒");
-                const auto completed = previous->result;
-                pending_file_io_.erase(previous);
-                threads_.items.at(threads_.current).wait = {};
-                if (completed.error)
-                    fail(completed.error);
-                else
-                    result = 1;
-            } else if (!file->second.native || !overlap || u32(unlock ? 1 : 2) || (!unlock && (u32(1) & ~3U)))
-                fail(87);
-            else if (!(file->second.access & 0xc0000003U))
-                fail(5);
-            else {
-                memory.check(GuestAddress{overlap}, x86_ ? 20 : 32, Access::Write);
-                const auto offset = memory.load(GuestAddress{overlap + 2 * unit}, 64),
-                           length = std::uint64_t{u32(unlock ? 2 : 3)} | (std::uint64_t{u32(unlock ? 3 : 4)} << 32);
-                if (unlock) {
-                    std::uint32_t error=0;
-                    if(runtime_.network.external_io){(void)mapping_session();error=filesystem_.publish_shared_file(*file->second.native);}
-                    if(!error)error = file->second.native->lock_range(offset, length, false, true);
-                    if (error)
-                        fail(error);
-                    else
-                        result = 1;
-                } else {
-                    PendingFileIo io;
-                    io.kind = PendingFileIo::Kind::Lock;
-                    io.handle = arg(0);
-                    io.thread = threads_.current;
-                    io.overlapped = overlap;
-                    io.offset = offset;
-                    io.length = length;
-                    io.exclusive = (u32(1) & 2) != 0;
-                    io.immediate = (u32(1) & 1) != 0;
-                    io.blocking = (file->second.mode & 0x30) != 0;
-                    io.event = memory.load(GuestAddress{overlap + (x86_ ? 16 : 24)}, bits);
-                    const auto e = runtime_.wait_objects.find(io.event & ~UINT64_C(1));
-                    if (std::any_of(pending_file_io_.begin(), pending_file_io_.end(),
-                                    [&](const auto &item) { return item.overlapped == overlap; }))
-                        fail(87);
-                    else if ((io.event & ~UINT64_C(1)) &&
-                             (e == runtime_.wait_objects.end() || e->second.kind != WaitObject::Kind::Event))
-                        fail(6);
-                    else {
-                        memory.store(GuestAddress{overlap}, bits, 0x103);
-                        memory.store(GuestAddress{overlap + unit}, bits, 0);
-                        if (io.event & ~UINT64_C(1))
-                            e->second.set_signal(false);
-                        set_file_io_signaled(io.handle, false);
-                        pending_file_io_.push_back(io);
-                        poll_file_io(memory);
-                        const auto current = std::find_if(pending_file_io_.begin(), pending_file_io_.end(),
-                                                          [&](const auto &item) { return item.overlapped == overlap; });
-                        if (current->done) {
-                            const auto completed = current->result;
-                            pending_file_io_.erase(current);
-                            if (completed.error)
-                                fail(completed.error);
-                            else
-                                result = 1;
-                        } else if (!io.blocking) {
-                            current->notify = true;
-                            fail(997);
-                        } else {
-                            auto &thread = threads_.items.at(threads_.current);
-                            thread.status = ThreadStatus::Waiting;
-                            thread.wait = {};
-                            thread.wait.kind = ThreadWaitKind::FileIo;
-                            thread.wait.handles = {io.handle};
-                            schedule(state, memory);
-                            return std::nullopt;
-                        }
-                    }
-                }
-            }
-        } else if (symbol == "GetNamedPipeClientProcessId" || symbol == "GetNamedPipeServerProcessId") {
+        else if (symbol == "GetNamedPipeClientProcessId" || symbol == "GetNamedPipeServerProcessId") {
             if (!arg(1))
                 fail(87);
             else {
@@ -780,6 +747,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
                 PendingFileIo io;
                 io.handle = arg(0);
                 io.thread = threads_.current;
+                if(service.family=="internal-nt-file"){
+                    io.native_iosb=arg(6);io.native_context=arg(7);io.routine=arg(8);
+                }
                 io.hid = file->second.hid != nullptr;
                 if (symbol == "ConnectNamedPipe") {
                     io.kind = PendingFileIo::Kind::Connect;
@@ -804,7 +774,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
                     io.kind = writing ? PendingFileIo::Kind::Write : PendingFileIo::Kind::Read;
                     io.count_pointer = extended ? 0 : arg(3);
                     io.overlapped = arg(extended ? 3 : 4);
-                    io.routine = extended ? arg(4) : 0;
+                    if(!io.native_iosb)io.routine = extended ? arg(4) : 0;
                     if (writing) {
                         io.input = arg(1);
                         io.input_size = u32(2);
@@ -817,7 +787,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
                 const bool reading = io.kind == PendingFileIo::Kind::Read || io.kind == PendingFileIo::Kind::Transact,
                            writing = io.kind == PendingFileIo::Kind::Write || io.kind == PendingFileIo::Kind::Transact;
                 std::uint32_t error = 0;
-                if (file->second.serial && (io.kind == PendingFileIo::Kind::CommEvent && !io.output))
+                if (pending_file_io_.size()>=1024)
+                    error = 8;
+                else if (file->second.serial && (io.kind == PendingFileIo::Kind::CommEvent && !io.output))
                     error = 87;
                 else if (file->second.serial && io.kind == PendingFileIo::Kind::CommEvent &&
                          std::any_of(pending_file_io_.begin(), pending_file_io_.end(), [&](const auto &other) {
@@ -853,7 +825,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
                     error = 87;
                 if (!error && io.overlapped) {
                     memory.check(GuestAddress{io.overlapped}, x86_ ? 20 : 32, Access::Write);
-                    io.event = io.routine ? 0 : memory.load(GuestAddress{io.overlapped + (x86_ ? 16 : 24)}, bits);
+                    io.event = io.routine && !io.native_iosb ? 0 : memory.load(GuestAddress{io.overlapped + (x86_ ? 16 : 24)}, bits);
                     const auto e = runtime_.wait_objects.find(io.event & ~UINT64_C(1));
                     if ((io.event & ~UINT64_C(1)) &&
                         (e == runtime_.wait_objects.end() || e->second.kind != WaitObject::Kind::Event))
@@ -911,7 +883,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
                     if (current->done) {
                         const auto completed = current->result;
                         pending_file_io_.erase(current);
-                        if (completed.error && !(io.routine && completed.error == 234))
+                        if (completed.error && !(io.routine && !io.native_iosb && completed.error == 234))
                             fail(completed.error);
                         else {
                             result = 1;
@@ -920,7 +892,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
                         }
                     } else if (io.overlapped && !io.blocking) {
                         current->notify = true;
-                        if (io.routine)
+                        if (io.routine && !io.native_iosb)
                             result = 1;
                         else
                             fail(997);

@@ -250,8 +250,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
         call.return_to(state,result);return std::nullopt;
     }
     if(service.symbol=="PathIsDirectoryA" || service.symbol=="PathIsDirectoryW"){
-        const WindowsCall arg(state,memory,service);std::uint32_t value=0;
-        if(arg(0)){const auto path=service.symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));const auto info=filesystem_.information(path);if(!info.error)value=info.metadata.attributes&0x10U;}
+        const WindowsCall arg(state,memory,service);std::uint32_t value=0;const auto previous=last_error_;
+        try{if(arg(0)){
+            const auto path=service.symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},32768):utf8_to_utf16(read_ansi(memory,arg(0)));
+            const auto info=query_native_file_attributes(state,memory,path,false);if(!info.error)value=info.metadata.attributes&0x10U;
+        }}catch(const MemoryFault&){}catch(const std::invalid_argument&){}catch(const std::bad_alloc&){}
+        last_error_=previous;
         arg.return_to(state,value);return std::nullopt;
     }
     const WindowsCall arg(state,memory,service);std::uint32_t result=0;

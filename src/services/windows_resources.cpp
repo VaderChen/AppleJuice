@@ -21,6 +21,7 @@ std::span<const WindowsServiceDescriptor> resource_service_descriptors(){
         {"user32.dll","LoadBitmapA",2},{"user32.dll","LoadBitmapW",2},
         {"user32.dll","SetThreadDpiAwarenessContext",1},{"user32.dll","GetThreadDpiAwarenessContext",0},
         {"user32.dll","SetProcessDpiAwarenessContext",1},{"user32.dll","IsValidDpiAwarenessContext",1},
+        {"user32.dll","SetProcessDpiAwarenessInternal",1},{"user32.dll","GetProcessDpiAwarenessInternal",2},
         {"user32.dll","AreDpiAwarenessContextsEqual",2},{"user32.dll","GetAwarenessFromDpiAwarenessContext",1},
         {"user32.dll","GetWindowDpiAwarenessContext",1},{"user32.dll","GetDpiFromDpiAwarenessContext",1},
         {"user32.dll","EnableNonClientDpiScaling",1},{"user32.dll","GetSystemMetricsForDpi",2},
@@ -314,7 +315,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
         // 與 monitor／GDI／DPI context 共用同一個 96 DPI 虛擬桌面。
         result=0x80070057U;
         if(arg(0)==1 && d(1)<=2 && arg(2) && arg(3))try{memory.check(GuestAddress{arg(2)},4,Access::Write);memory.check(GuestAddress{arg(3)},4,Access::Write);memory.store(GuestAddress{arg(2)},32,96);memory.store(GuestAddress{arg(3)},32,96);result=0;}catch(const MemoryFault&){}
-    }else if(symbol=="SetThreadDpiAwarenessContext" || symbol=="GetThreadDpiAwarenessContext" || symbol=="SetProcessDpiAwarenessContext" || symbol=="SetProcessDPIAware" || symbol=="SetProcessDpiAwareness" || symbol=="GetProcessDpiAwareness" || symbol=="IsProcessDPIAware" || symbol=="IsValidDpiAwarenessContext" || symbol=="AreDpiAwarenessContextsEqual" || symbol=="GetAwarenessFromDpiAwarenessContext" || symbol=="GetWindowDpiAwarenessContext" || symbol=="GetDpiFromDpiAwarenessContext" || symbol=="GetDpiForWindow" || symbol=="GetDpiForSystem" || symbol=="GetSystemMetricsForDpi" || symbol=="EnableNonClientDpiScaling"){
+    }else if(symbol=="SetThreadDpiAwarenessContext" || symbol=="GetThreadDpiAwarenessContext" || symbol=="SetProcessDpiAwarenessContext" || symbol=="SetProcessDPIAware" || symbol=="SetProcessDpiAwareness" || symbol=="GetProcessDpiAwareness" || symbol=="SetProcessDpiAwarenessInternal" || symbol=="GetProcessDpiAwarenessInternal" || symbol=="IsProcessDPIAware" || symbol=="IsValidDpiAwarenessContext" || symbol=="AreDpiAwarenessContextsEqual" || symbol=="GetAwarenessFromDpiAwarenessContext" || symbol=="GetWindowDpiAwarenessContext" || symbol=="GetDpiFromDpiAwarenessContext" || symbol=="GetDpiForWindow" || symbol=="GetDpiForSystem" || symbol=="GetSystemMetricsForDpi" || symbol=="EnableNonClientDpiScaling"){
         const auto canonical=[&](std::uint64_t value){return x86_?static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(value))):value;};
         const auto valid=[](std::uint64_t context){return context>=UINT64_MAX-4;};
         const auto awareness=[](std::uint64_t context){return context==UINT64_MAX || context==UINT64_MAX-4?0U:context==UINT64_MAX-1?1U:2U;};
@@ -344,12 +345,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
             else {w->second.nonclient_dpi_scaling=true;result=1;}
         }
         else if(symbol=="IsProcessDPIAware")result=awareness(gui_.dpi_context)!=0;
-        else if(symbol=="GetProcessDpiAwareness"){
-            if(!arg(1) || (arg(0) && !current_process_handle(arg(0))))result=0x80070057U;
-            else{memory.store(GuestAddress{arg(1)},32,awareness(gui_.dpi_context));result=0;}
+        else if(symbol=="GetProcessDpiAwareness" || symbol=="GetProcessDpiAwarenessInternal"){
+            // USER32 內部入口使用 BOOL／LastError；SHCore 使用 HRESULT，共用程序狀態。
+            const bool internal=symbol=="GetProcessDpiAwarenessInternal";
+            const bool process=arg(0)==0 || current_process_handle(arg(0));
+            std::uint32_t error=arg(1) && process?0:87;
+            if(arg(1) && (process || internal))try{memory.store(GuestAddress{arg(1)},32,process?awareness(gui_.dpi_context):UINT32_MAX);}
+            catch(const MemoryFault&){error=87;}
+            if(error){if(internal)fail(error);else result=0x80070000U|error;}
+            else result=internal?1:0;
         }else {
-            const bool hresult=symbol=="SetProcessDpiAwareness";const auto value=symbol=="SetProcessDPIAware"?UINT64_MAX-1:hresult?UINT64_MAX-d(0):context;
-            const auto error=!valid(value) || (hresult && d(0)>2)?87U:(gui_.dpi_context_set && !(symbol=="SetProcessDPIAware" && value==gui_.dpi_context)) || (!gui_.windows.empty() && symbol!="SetProcessDPIAware")?5U:0U;
+            const bool hresult=symbol=="SetProcessDpiAwareness",enumerated=hresult || symbol=="SetProcessDpiAwarenessInternal";
+            const auto value=symbol=="SetProcessDPIAware"?UINT64_MAX-1:enumerated?UINT64_MAX-d(0):context;
+            const auto error=!valid(value) || (enumerated && d(0)>2)?87U:(gui_.dpi_context_set && !(symbol=="SetProcessDPIAware" && value==gui_.dpi_context)) || (!gui_.windows.empty() && symbol!="SetProcessDPIAware")?5U:0U;
             if(error){if(hresult)result=0x80070000U|error;else fail(error);}
             else{gui_.dpi_context=value;gui_.dpi_context_set=true;gui_.dpi_aware=awareness(value)!=0;result=hresult?0:1;}
         }

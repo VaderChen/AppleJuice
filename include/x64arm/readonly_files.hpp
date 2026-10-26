@@ -46,12 +46,12 @@ struct HostFile {
     ~HostFile();
     HostFile(const HostFile&) = delete;
     HostFile& operator=(const HostFile&) = delete;
-    std::uint32_t validate_io(std::uint64_t offset,std::uint64_t length,bool writing) const;
-    FileIoResult read(std::span<std::uint8_t> bytes, std::uint64_t offset) const;
-    FileIoResult write(std::span<const std::uint8_t> bytes, std::uint64_t offset) const;
+    std::uint32_t validate_io(std::uint64_t offset,std::uint64_t length,bool writing,std::uint32_t key=0) const;
+    FileIoResult read(std::span<std::uint8_t> bytes, std::uint64_t offset,std::uint32_t key=0) const;
+    FileIoResult write(std::span<const std::uint8_t> bytes, std::uint64_t offset,std::uint32_t key=0) const;
     std::uint32_t truncate(std::uint64_t size) const;
     std::uint32_t flush() const;
-    std::uint32_t lock_range(std::uint64_t offset,std::uint64_t length,bool exclusive,bool unlock);
+    std::uint32_t lock_range(std::uint64_t offset,std::uint64_t length,bool exclusive,bool unlock,std::uint32_t key=0);
     std::uint32_t set_times(std::uint64_t created, std::uint64_t accessed, std::uint64_t modified) const;
     std::uint32_t set_basic(std::uint64_t created,std::uint64_t accessed,std::uint64_t modified,std::uint64_t changed,std::uint32_t attributes) const;
     std::uint32_t allocate(std::uint64_t size) const;
@@ -62,6 +62,8 @@ struct HostFile {
     std::uint64_t current_size() const;
     // 借用描述元，只查詢即時資訊；不接管、不關閉，也不改變檔案位置。
     static FileInformation descriptor_information(int descriptor);
+    static bool is_null_descriptor(int descriptor);
+    bool null_device() const noexcept { return null_device_; }
     FileVolumeSpace volume_space() const;
     int duplicate_descriptor() const;
     int transfer_descriptor() const noexcept { return descriptor_; }
@@ -74,17 +76,20 @@ struct HostFile {
 private:
     friend class ReadOnlyFiles;
     int descriptor_{-1};
+    // 鎖的宿主 open description 不隨資料描述元跨程序傳遞；程序退出即可釋放。
+    int lock_descriptor_{-2};
+    int range_descriptor();
     std::shared_ptr<HostSecurityTarget> security_target_;
     std::shared_ptr<HostFileState> state_;
     std::shared_ptr<HostDeleteTarget> delete_target_;
     std::uint32_t access_{}, sharing_{7};
-    bool readonly_{},delete_on_close_{};
+    bool readonly_{},delete_on_close_{},null_device_{};
     char volume_{};
-    struct RangeLock {std::uint64_t offset{},length{};bool exclusive{};};
+    struct RangeLock {std::uint64_t offset{},length{};bool exclusive{};std::uint32_t key{};};
     std::vector<RangeLock> locks_;
     std::shared_ptr<SharedFileLease> shared_lease_;
     std::shared_ptr<void> network_lease_;
-    std::uint32_t lock_conflict(std::uint64_t offset,std::uint64_t length,bool writing) const;
+    std::uint32_t lock_conflict(std::uint64_t offset,std::uint64_t length,bool writing,std::uint32_t key) const;
     std::uint32_t mutate_size(const std::function<std::uint32_t()>&) const;
     std::uint32_t copy_template_metadata(int destination,bool directory,std::uint32_t attributes) const;
 };
@@ -94,6 +99,8 @@ struct OpenHostFile {
     FileMetadata metadata;
     std::uint32_t error{};
     bool existed{};
+    std::filesystem::path source{}; // 已授權描述元的來源；查詢不登錄載入索引。
+    bool access_denied{};
 };
 struct DirectoryEntry {
     std::string name;
@@ -122,6 +129,7 @@ public:
     explicit ReadOnlyFiles(const std::filesystem::path& root = {}, const std::filesystem::path& c_drive = {}, bool writable = false, const std::filesystem::path& install_root = {}, const std::map<char,std::filesystem::path>& drives = {});
     FileSnapshot open(std::string path);
     FileSnapshot open_library(std::string path, const std::filesystem::path& application = {}, std::string_view application_guest_directory = {});
+    OpenHostFile open_library_reader(std::string path, const std::filesystem::path& application = {}, std::string_view application_guest_directory = {});
     OpenHostFile open_reader(std::string path, const std::filesystem::path& application = {}, std::string_view application_guest_directory = {}, std::uint32_t sharing = 7);
     std::string map_executable(const std::filesystem::path& path);
     // Windows DOS 名稱空間先折疊 .／..，之後仍由映射與 NOFOLLOW 限制宿主存取。
@@ -129,6 +137,9 @@ public:
     void mount_readonly(std::string guest_directory,const std::filesystem::path& host_directory);
     std::pair<std::filesystem::path,std::uint32_t> executable_path(std::string path, const std::filesystem::path& application, std::string_view application_guest_directory);
     FileInformation information(std::string path);
+    // Stat 查詢沿用 metadata 與虛擬權杖；權限結果只存活於本次呼叫，不加入 metadata 快取。
+    FileInformation information(std::string path,std::uint32_t& effective_access);
+    std::uint32_t effective_access(const HostFile&,std::uint32_t& granted) const;
     void set_shared_session(std::string);
     const std::string& shared_session()const noexcept{return shared_session_;}
     std::uint32_t publish_shared_file(HostFile&);
@@ -185,9 +196,11 @@ private:
     };
     struct Resolved { std::string key; int descriptor{-1}; std::uint32_t error{}; bool readonly_file{}; std::filesystem::path host_path{}; std::string security_leaf{}; bool access_denied{}; char volume{}; std::string volume_path{},mount_path{}; std::shared_ptr<void> network_lease{}; };
     Resolved resolve(std::string path, bool directory = false, std::string* leaf = nullptr, bool metadata_only = false,bool follow_leaf = false,unsigned depth = 0,bool strict_root = false) const;
+    Resolved resolve_library(std::string path,const std::filesystem::path& application,std::string_view application_guest_directory,bool strict_root=false) const;
     Resolved resolve_mapped(std::string path, bool directory, std::string* leaf, bool metadata_only = false,unsigned depth = 0,bool follow_leaf = false,bool strict_root = false) const;
     // 已完成 metadata 解析後的屬性查詢；接管 resolved.descriptor。
-    FileInformation information_resolved(Resolved resolved);
+    FileInformation information_impl(std::string path,std::uint32_t* effective_access);
+    FileInformation information_resolved(Resolved resolved,std::uint32_t* effective_access=nullptr);
     std::uint32_t symbolic_link_reparse(std::string target,std::string link,bool directory);
     std::pair<std::string,std::uint32_t> follow_reparse(std::string path,bool strict_root=false) const;
     std::pair<std::filesystem::path,std::uint32_t> link_host_path(std::string path) const;
@@ -204,7 +217,7 @@ private:
     std::uint32_t authorize_traverse(int) const;
     struct TraverseCache;
     mutable std::shared_ptr<TraverseCache> traverse_cache_;
-    std::uint32_t authorize_at(int,std::string_view,std::uint32_t) const;
+    std::uint32_t authorize_at(int,std::string_view,std::uint32_t,std::uint32_t* effective_access=nullptr) const;
     std::uint32_t authorize_delete(int,std::string_view) const;
     std::uint32_t inherit_file_label(int,int,bool directory) const;
     std::vector<std::uint8_t> creation_security(int,bool,std::span<const std::uint8_t>) const;

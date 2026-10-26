@@ -20,6 +20,91 @@ struct MetalPipelineKey {
     MetalPipelineKey& raw(const void* data,std::size_t size){bytes.append(static_cast<const char*>(data),size);return *this;}
     const std::string& str()const{return bytes;}
 };
+// 繪圖管線／頂點／render pass 描述的純值版本：欄位名稱與 Metal 描述物件相同，繪圖時先填這些值並據以組管線快取鍵，
+// 只在快取未命中（或需要新的 render encoder）時才建立 Metal 描述物件；每次繪製不再配置與釋放數個 Objective-C 物件。
+// 預設值與 Metal 描述物件的預設值相同。
+struct MetalVertexSpec {
+    struct Attribute {MTLVertexFormat format{MTLVertexFormatInvalid};NSUInteger offset{},bufferIndex{};};
+    struct Layout {NSUInteger stride{};MTLVertexStepFunction stepFunction{MTLVertexStepFunctionPerVertex};NSUInteger stepRate{1};};
+    std::array<Attribute,31> attributes;std::array<Layout,31> layouts;
+    MTLVertexDescriptor* make()const{
+        auto vertex=[MTLVertexDescriptor vertexDescriptor];
+        for(unsigned i=0;i<attributes.size();++i)if(const auto& a=attributes[i];a.format!=MTLVertexFormatInvalid || a.offset || a.bufferIndex){auto out=vertex.attributes[i];out.format=a.format;out.offset=a.offset;out.bufferIndex=a.bufferIndex;}
+        for(unsigned i=0;i<layouts.size();++i)if(const auto& l=layouts[i];l.stride || l.stepFunction!=MTLVertexStepFunctionPerVertex || l.stepRate!=1){auto out=vertex.layouts[i];out.stride=l.stride;out.stepFunction=l.stepFunction;out.stepRate=l.stepRate;}
+        return vertex;
+    }
+};
+struct MetalPipelineSpec {
+    struct Color {
+        MTLPixelFormat pixelFormat{MTLPixelFormatInvalid};BOOL blendingEnabled{NO};
+        MTLBlendFactor sourceRGBBlendFactor{MTLBlendFactorOne},destinationRGBBlendFactor{MTLBlendFactorZero};MTLBlendOperation rgbBlendOperation{MTLBlendOperationAdd};
+        MTLBlendFactor sourceAlphaBlendFactor{MTLBlendFactorOne},destinationAlphaBlendFactor{MTLBlendFactorZero};MTLBlendOperation alphaBlendOperation{MTLBlendOperationAdd};
+        MTLColorWriteMask writeMask{MTLColorWriteMaskAll};
+    };
+    id<MTLFunction> vertexFunction,fragmentFunction;NSUInteger sampleCount{1};BOOL alphaToCoverageEnabled{NO};
+    MTLPrimitiveTopologyClass inputPrimitiveTopology{MTLPrimitiveTopologyClassUnspecified};
+    std::array<Color,8> colorAttachments;MTLPixelFormat depthAttachmentPixelFormat{MTLPixelFormatInvalid},stencilAttachmentPixelFormat{MTLPixelFormatInvalid};
+    // 頂點描述：vertexDescriptor 指向本次繪製的純值描述；細分改用其管線的描述物件（vertexDescriptorObject）。
+    const MetalVertexSpec* vertexDescriptor{};MTLVertexDescriptor* vertexDescriptorObject{};
+    bool tessellation{};MTLTessellationPartitionMode tessellationPartitionMode{MTLTessellationPartitionModePow2};MTLWinding tessellationOutputWindingOrder{MTLWindingClockwise};
+    NSUInteger maxTessellationFactor{16};MTLTessellationFactorFormat tessellationFactorFormat{MTLTessellationFactorFormatHalf};
+    MTLTessellationFactorStepFunction tessellationFactorStepFunction{MTLTessellationFactorStepFunctionConstant};MTLTessellationControlPointIndexType tessellationControlPointIndexType{MTLTessellationControlPointIndexTypeNone};
+    MTLRenderPipelineDescriptor* make()const{
+        auto desc=[MTLRenderPipelineDescriptor new];desc.vertexFunction=vertexFunction;desc.fragmentFunction=fragmentFunction;desc.sampleCount=sampleCount;
+        desc.alphaToCoverageEnabled=alphaToCoverageEnabled;desc.inputPrimitiveTopology=inputPrimitiveTopology;
+        for(unsigned i=0;i<colorAttachments.size();++i){
+            const auto& c=colorAttachments[i];auto a=desc.colorAttachments[i];a.pixelFormat=c.pixelFormat;a.blendingEnabled=c.blendingEnabled;
+            a.sourceRGBBlendFactor=c.sourceRGBBlendFactor;a.destinationRGBBlendFactor=c.destinationRGBBlendFactor;a.rgbBlendOperation=c.rgbBlendOperation;
+            a.sourceAlphaBlendFactor=c.sourceAlphaBlendFactor;a.destinationAlphaBlendFactor=c.destinationAlphaBlendFactor;a.alphaBlendOperation=c.alphaBlendOperation;a.writeMask=c.writeMask;
+        }
+        desc.depthAttachmentPixelFormat=depthAttachmentPixelFormat;desc.stencilAttachmentPixelFormat=stencilAttachmentPixelFormat;
+        if(vertexDescriptor)desc.vertexDescriptor=vertexDescriptor->make();else if(vertexDescriptorObject)desc.vertexDescriptor=vertexDescriptorObject;
+        if(tessellation){
+            desc.tessellationPartitionMode=tessellationPartitionMode;desc.tessellationOutputWindingOrder=tessellationOutputWindingOrder;desc.maxTessellationFactor=maxTessellationFactor;
+            desc.tessellationFactorFormat=tessellationFactorFormat;desc.tessellationFactorStepFunction=tessellationFactorStepFunction;desc.tessellationControlPointIndexType=tessellationControlPointIndexType;
+        }
+        return desc;
+    }
+};
+// 深度／stencil 狀態的純值版本：未設定的 stencil 面與 Metal 預設相同（Always、Keep、遮罩全開），快取鍵與描述物件版本一致。
+struct MetalDepthSpec {
+    struct Stencil {
+        MTLCompareFunction stencilCompareFunction{MTLCompareFunctionAlways};
+        MTLStencilOperation stencilFailureOperation{MTLStencilOperationKeep},depthFailureOperation{MTLStencilOperationKeep},depthStencilPassOperation{MTLStencilOperationKeep};
+        std::uint32_t readMask{UINT32_MAX},writeMask{UINT32_MAX};bool set{};
+    };
+    MTLCompareFunction depthCompareFunction{MTLCompareFunctionAlways};BOOL depthWriteEnabled{NO};Stencil frontFaceStencil,backFaceStencil;
+    void stencil(bool back,MTLCompareFunction compare,MTLStencilOperation fail,MTLStencilOperation depth_fail,MTLStencilOperation pass,std::uint32_t read_mask,std::uint32_t write_mask){
+        auto& face=back?backFaceStencil:frontFaceStencil;face={compare,fail,depth_fail,pass,read_mask,write_mask,true};
+    }
+    MTLDepthStencilDescriptor* make()const{
+        auto depth=[MTLDepthStencilDescriptor new];depth.depthCompareFunction=depthCompareFunction;depth.depthWriteEnabled=depthWriteEnabled;
+        for(unsigned i=0;i<2;++i)if(const auto& f=i?backFaceStencil:frontFaceStencil;f.set){
+            auto stencil=make_metal_stencil(f.stencilCompareFunction,f.stencilFailureOperation,f.depthFailureOperation,f.depthStencilPassOperation,f.readMask,f.writeMask);
+            if(i)depth.backFaceStencil=stencil;else depth.frontFaceStencil=stencil;
+        }
+        return depth;
+    }
+};
+struct MetalPassSpec {
+    struct Attachment {id<MTLTexture> texture;NSUInteger level{},slice{},depthPlane{};MTLLoadAction loadAction{MTLLoadActionDontCare};MTLStoreAction storeAction{MTLStoreActionStore};};
+    std::array<Attachment,8> colorAttachments;Attachment depthAttachment,stencilAttachment;
+    id<MTLBuffer> visibilityResultBuffer;NSUInteger renderTargetArrayLength{},renderTargetWidth{},renderTargetHeight{},defaultRasterSampleCount{};
+    std::array<MTLSamplePosition,8> samplePositions{};NSUInteger samplePositionCount{};
+    void setSamplePositions(const MTLSamplePosition* positions,NSUInteger count){samplePositionCount=std::min<NSUInteger>(count,samplePositions.size());std::copy_n(positions,samplePositionCount,samplePositions.begin());}
+    MTLRenderPassDescriptor* make()const{
+        auto pass=[MTLRenderPassDescriptor renderPassDescriptor];
+        const auto copy=[](MTLRenderPassAttachmentDescriptor* out,const Attachment& a){out.texture=a.texture;out.level=a.level;out.slice=a.slice;out.depthPlane=a.depthPlane;out.loadAction=a.loadAction;out.storeAction=a.storeAction;};
+        for(unsigned i=0;i<colorAttachments.size();++i)if(colorAttachments[i].texture)copy(pass.colorAttachments[i],colorAttachments[i]);
+        if(depthAttachment.texture)copy(pass.depthAttachment,depthAttachment);if(stencilAttachment.texture)copy(pass.stencilAttachment,stencilAttachment);
+        pass.visibilityResultBuffer=visibilityResultBuffer;
+        if(renderTargetArrayLength)pass.renderTargetArrayLength=renderTargetArrayLength;
+        if(renderTargetWidth)pass.renderTargetWidth=renderTargetWidth;if(renderTargetHeight)pass.renderTargetHeight=renderTargetHeight;
+        if(defaultRasterSampleCount)pass.defaultRasterSampleCount=defaultRasterSampleCount;
+        if(samplePositionCount)[pass setSamplePositions:samplePositions.data() count:samplePositionCount];
+        return pass;
+    }
+};
 // DISCARD 更換 backing 時回收舊 buffer：舊 buffer 在 GPU 用完（flight 退役）後進入池，下一次同長度的更換直接取用，
 // 省掉 newBufferWithLength＋整段清零＋額度保留。池上限 64 MiB，超出即照常釋放。
 // 池只保留 MTLBuffer，不保留 GPU 額度：入池即釋放額度（否則 Steam GPU 程序 256 MiB 額度會被池吃掉 64 MiB），
@@ -39,18 +124,38 @@ class MetalPendingObjects {
     static bool indexed(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_RESOURCE_INDEX");return !text || std::string_view(text)!="0";}();return value;}
     std::vector<std::shared_ptr<GraphicsObject>> objects_;
     std::unordered_set<const GraphicsObject*> index_;
-    void append(std::shared_ptr<GraphicsObject> object){if(!indexed()){objects_.push_back(std::move(object));return;}auto [position,added]=index_.insert(object.get());if(added){try{objects_.push_back(std::move(object));}catch(...){index_.erase(position);throw;}}}
+    // 本批最近加入者的直接對應快取：每次繪製都把同一批目標、著色器與常數緩衝重複加入，命中即略過雜湊查找與
+    // shared_ptr 複製（重播取樣約 8%）。項目只指向 objects_ 持有的物件（批次期間位址不會被重用），清空或移走批次時一併清除。
+    std::array<const GraphicsObject*,64> recent_{};
+    static std::size_t recent_slot(const GraphicsObject* object) noexcept {return (reinterpret_cast<std::uintptr_t>(object)>>4)&63U;}
+    template<class T> void append(const std::shared_ptr<T>& object){
+        const GraphicsObject* raw=object.get();
+        if(!indexed()){objects_.push_back(object);return;}
+        auto& recent=recent_[recent_slot(raw)];if(raw && recent==raw)return;
+        auto [position,added]=index_.insert(raw);
+        if(added){try{objects_.push_back(object);}catch(...){index_.erase(position);throw;}}
+        recent=raw;
+    }
 public:
-    void push_back(std::shared_ptr<GraphicsObject>);
+    MetalPendingObjects()=default;
+    MetalPendingObjects(const MetalPendingObjects&)=delete;MetalPendingObjects& operator=(const MetalPendingObjects&)=delete;
+    MetalPendingObjects(MetalPendingObjects&& other) noexcept {*this=std::move(other);}
+    MetalPendingObjects& operator=(MetalPendingObjects&& other) noexcept {
+        objects_=std::move(other.objects_);index_=std::move(other.index_);recent_=other.recent_;tables=other.tables;
+        other.objects_.clear();other.index_.clear();other.recent_.fill(nullptr);other.tables=false;return *this;
+    }
+    template<class T> void push_back(const std::shared_ptr<T>& object);
     auto end(){return objects_.end();}
     template<class Iterator> void insert(std::vector<std::shared_ptr<GraphicsObject>>::iterator,Iterator first,Iterator last){for(;first!=last;++first)push_back(*first);}
     bool contains(const GraphicsObject* object)const{if(indexed())return index_.contains(object);return std::any_of(objects_.begin(),objects_.end(),[&](const auto& value){return value.get()==object;});}
     // 本批次綁定過 D3D12 描述元表：表內資源不在清單中，曾被表引用的資源一律視為可能使用中。
     bool tables{};
-    void clear(){objects_.clear();index_.clear();tables=false;}
+    void clear(){objects_.clear();index_.clear();recent_.fill(nullptr);tables=false;}
 };
 // 與固定管線共用 MetalGl；本檔只提供資源與可程式化管線的共用資料。
 struct MetalResource final:GraphicsResource {
+    // 零複製緩衝的宿主記憶體擁有者：宣告在 buffer 之前，解構時最後釋放（buffer 先放掉對記憶體的引用）。
+    std::shared_ptr<void> host_owner;
     id<MTLBuffer> buffer;id<MTLTexture> texture;
     std::shared_ptr<GpuMemoryReservation> lease;
     std::shared_ptr<MetalBufferBacking> backing;
@@ -92,11 +197,11 @@ struct MetalResource final:GraphicsResource {
         }else std::copy(data.begin(),data.end(),constant_bytes.begin()+offset);
     }
 };
-void MetalPendingObjects::push_back(std::shared_ptr<GraphicsObject> object){
+template<class T> void MetalPendingObjects::push_back(const std::shared_ptr<T>& object){
     // 捕捉實際編碼時的不可變 backing，避免後續更換 buffer 後依邏輯身分誤判使用範圍。
     // 先保存 backing；即使後續配置節點失敗，已編碼工作的實體額度仍有所有者。
-    if(metal_backing_generation_enabled())if(auto* resource=dynamic_cast<MetalResource*>(object.get());resource && resource->backing)append(resource->backing);
-    append(std::move(object));
+    if(metal_backing_generation_enabled())if(auto* resource=dynamic_cast<MetalResource*>(static_cast<GraphicsObject*>(object.get()));resource && resource->backing)append(resource->backing);
+    append(object);
 }
 const GraphicsObject* metal_resource_use_identity(const std::shared_ptr<GraphicsResource>& resource){
     if(metal_backing_generation_enabled())if(auto* native=dynamic_cast<MetalResource*>(resource.get());native && native->backing)return native->backing.get();

@@ -2207,13 +2207,19 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
             fail(123);
             return false;
         }
-        const auto [host, error] = filesystem_.executable_path(full, runtime_.application_source,
-                                                               utf16_to_utf8(runtime_.application_directory));
-        if (error)
-            fail(error);
+        const auto executable_file = filesystem_.open_library_reader(full, runtime_.application_source,
+                                                            utf16_to_utf8(runtime_.application_directory));
+        const auto& host=executable_file.source;
+        if (executable_file.error)
+            fail(executable_file.error);
         else {
+            process_manifest::Inspection image_metadata;
             try {
-                const auto level=process_manifest::executable(host);
+                image_metadata=process_manifest::inspect(*executable_file.file,host);
+                const auto level=image_metadata.level;
+                if((image_metadata.flags&0x2000U) || (image_metadata.subsystem!=2 && image_metadata.subsystem!=3)){fail(193);return false;}
+                if(trace_process_protocol())std::fprintf(stderr,"process_image_probe file_bytes=%llu read_bytes=%llu read_calls=%llu\n",
+                    static_cast<unsigned long long>(image_metadata.file_bytes),static_cast<unsigned long long>(image_metadata.read_bytes),static_cast<unsigned long long>(image_metadata.read_calls));
                 const auto administrators=security::account_sid(*security::find_account("Administrators"));
                 const bool admin=security::token_sid_matches(*creation_token,administrators,false) &&
                     (!creation_token->restriction_check || security::token_sid_matches(*creation_token,administrators,false,true));
@@ -2240,19 +2246,8 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
                     command = u"\"" + image + u"\"";
                 auto child = std::make_shared<Child>();
                 child->host_clock = uses_host_clock();
-                PeFileBytes executable_source;
-                try {executable_source=read_pe_snapshot(host,512U*1024U*1024U);}
-                catch(const std::system_error&){fail(30);return false;}
-                catch(const std::length_error&){fail(193);return false;}
-                const auto& header=*executable_source;
-                const auto count=header.size();
-                const auto pe=count>=64?std::uint32_t{header[60]} | (std::uint32_t{header[61]} << 8) |
-                                (std::uint32_t{header[62]} << 16) | (std::uint32_t{header[63]} << 24):0U;
-                if (count < 94 || static_cast<std::uint64_t>(pe) + 94U > count ||
-                    header[0] != 'M' || header[1] != 'Z')
-                    fail(193);
-                else {
-                    child->gui = header[pe + 24 + 68] == 2;
+                {
+                    child->gui = image_metadata.subsystem == 2;
                     // 這三個值是父引擎自己的 UI 控制通道，並非 Windows 環境區塊。
                     // 其他宿主選項照常承襲，避免改變共用效能／圖形設定。
                     std::vector<char *> environment;
@@ -2362,7 +2357,7 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
                                 values.push_back("--process-startup-handles");
                                 values.push_back(std::move(handles));
                             }
-                            const bool child_x64 = header[pe + 4] == 0x64 && header[pe + 5] == 0x86;
+                            const bool child_x64 = image_metadata.machine == 0x8664;
                             const auto child_cores = std::min(settings.processor_count, child_x64 ? 64U : 32U);
                             const auto child_system_mask =
                                 child_cores == 64 ? UINT64_MAX : (UINT64_C(1) << child_cores) - 1;

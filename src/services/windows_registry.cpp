@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <exception>
 #include <thread>
 #include "x64arm/shared_wake.hpp"
@@ -38,6 +39,7 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
         {"advapi32.dll","RegCreateKeyA",3},{"advapi32.dll","RegCreateKeyW",3},
         {"advapi32.dll","RegGetValueA",7,0,0,0x8},{"advapi32.dll","RegGetValueW",7,0,0,0x8},{"advapi32.dll","RegQueryValueA",4},{"advapi32.dll","RegQueryValueW",4},
         {"advapi32.dll","RegQueryInfoKeyA",12},{"advapi32.dll","RegQueryInfoKeyW",12},{"advapi32.dll","RegQueryValueExA",6},{"advapi32.dll","RegQueryValueExW",6},
+        {"advapi32.dll","RegQueryMultipleValuesA",5,0,0,0x4},{"advapi32.dll","RegQueryMultipleValuesW",5,0,0,0x4},
         {"advapi32.dll","RegSetValueExA",6,0,0,0x2c},{"advapi32.dll","RegSetValueExW",6,0,0,0x2c},
         {"advapi32.dll","RegSetValueA",5,0,0,0x14},{"advapi32.dll","RegSetValueW",5,0,0,0x14},
         {"advapi32.dll","RegSetKeyValueA",6,0,0,0x28},{"advapi32.dll","RegSetKeyValueW",6,0,0,0x28},
@@ -62,10 +64,12 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
         {"ntdll.dll","NtOpenKey",3,0,0,0x2},{"ntdll.dll","NtOpenKeyEx",4,0,0,0xa},{"ntdll.dll","NtCreateKey",7,0,0,0x2a},
         {"ntdll.dll","NtQueryKey",5,0,0,0xa},{"ntdll.dll","NtEnumerateKey",6,0,0,0x16},
         {"ntdll.dll","NtQueryValueKey",6,0,0,0x14},{"ntdll.dll","NtEnumerateValueKey",6,0,0,0x16},{"ntdll.dll","NtSetValueKey",6,0,0,0x2c},
+        {"ntdll.dll","NtQueryMultipleValueKey",6,0,0,0x4},{"ntdll.dll","NtSetInformationKey",4,0,0,0xa},
         {"ntdll.dll","NtDeleteValueKey",2},{"ntdll.dll","NtDeleteKey",1},{"ntdll.dll","NtFlushKey",1},{"ntdll.dll","NtClose",1}
     };return table;
 }
 #include "windows_registry_hive.inc"
+#include "windows_registry_values.inc"
 void WindowsServices::poll_registry_notifications(bool reload,std::u16string_view mutation,std::uint32_t filter) {
     if(registry_notifications_.empty())return;
     auto& registry=runtime_.registry;
@@ -91,7 +95,11 @@ void WindowsServices::poll_registry_notifications(bool reload,std::u16string_vie
             if(!changed && compare_snapshots) {
                 for(const auto& [path,values]:registry.keys)if(relevant(path)) {
                     const auto before=watch.snapshot.find(path);
-                    if(((watch.filter&1) && before==watch.snapshot.end()) || ((watch.filter&4) && within(path) && before!=watch.snapshot.end() && values!=before->second)){changed=true;break;}
+                    if(((watch.filter&1) && before==watch.snapshot.end()) || ((watch.filter&4) && within(path) && before!=watch.snapshot.end() && values!=before->second.values)){changed=true;break;}
+                    if((watch.filter&2) && within(path) && before!=watch.snapshot.end()){
+                        const auto now=registry.modified_times.find(path);
+                        if((now==registry.modified_times.end()?runtime_.filetime_base:now->second)!=before->second.modified){changed=true;break;}
+                    }
                 }
                 if(watch.filter&1)for(const auto& [path,values]:watch.snapshot){(void)values;if(!registry.keys.contains(path)){changed=true;break;}}
                 // 描述元可由繼承規則惰性建立；其他程序提交後重載會清空本地快取。
@@ -217,6 +225,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     const bool relative_open=symbol.starts_with("RegOpenKey") || symbol.starts_with("RegCreateKey") || (symbol.starts_with("RegDeleteKey") && !delete_key_value) || (set_key_value && !name(arg(1)).empty());
     const bool relative_query=(symbol.starts_with("SHGetValue") || get_value || legacy_query || delete_key_value) && !name(arg(1)).empty();
     if(predefined && !relative_open && !relative_query)handle.access=registry_security_access(handle.path,0x02000000U);
+    if(symbol.starts_with("RegQueryMultipleValues"))return done(query_registry_multiple_values(memory,arg,handle,false,wide));
     if(symbol=="RegFlushKey"){if(!(handle.access&1U))return done(5);if(const auto error=flush_registry_hives())return done(error);return done(transaction->flush());}
     if(key_value && !predefined && !(handle.access&2))return done(5);
     std::vector<std::uint8_t> legacy_data;
@@ -298,7 +307,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         RegistryNotification watch;watch.key=predefined?root:arg(0);watch.event=arg(4)?arg(3):0;watch.thread=threads_.current;
         watch.path=handle.path;watch.filter=filter;watch.subtree=arg(1)!=0;
         const auto prefix=handle.path+u"\\";
-        for(const auto& [path,values]:registry.keys)if(path==handle.path || (path.starts_with(prefix) && (watch.subtree || ((filter&1) && path.find(u'\\',prefix.size())==std::u16string::npos))))watch.snapshot.emplace(path,values);
+        for(const auto& [path,values]:registry.keys)if(path==handle.path || (path.starts_with(prefix) && (watch.subtree || ((filter&1) && path.find(u'\\',prefix.size())==std::u16string::npos)))){
+            // 名稱／屬性／權限通知只需鍵清單，避免無用地複製完整值 payload。
+            const bool data=(filter&4U) && (path==handle.path || watch.subtree);
+            RegistryNotification::KeySnapshot snapshot;
+            if(data)snapshot.values=values;
+            if(filter&2U)snapshot.modified=registry.modified_times.contains(path)?registry.modified_times.at(path):runtime_.filetime_base;
+            watch.snapshot.emplace(path,std::move(snapshot));
+        }
         if(filter&8U)for(const auto& [path,values]:watch.snapshot){(void)values;watch.security_snapshot.emplace(path,registry_security_descriptor(path));}
         const auto token=next_registry_notification_++;registry_notifications_.emplace(token,std::move(watch));
         if(arg(4))return done(0);

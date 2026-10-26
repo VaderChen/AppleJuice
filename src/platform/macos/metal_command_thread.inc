@@ -67,6 +67,9 @@ public:
     void graphics_copy(const GraphicsView& target,const GraphicsView& source,std::array<std::uint32_t,3> offset,std::array<std::uint32_t,6> box) override {
         post([this,target,source,offset,box]{inner_->graphics_copy(target,source,offset,box);});
     }
+    bool graphics_copy_buffer_texture(const GraphicsView& texture,const GraphicsView& buffer,std::uint64_t offset,std::uint32_t row,std::uint32_t image,std::array<std::uint32_t,6> box,bool to_texture) override {
+        graphics_sync();return inner_->graphics_copy_buffer_texture(texture,buffer,offset,row,image,box,to_texture);
+    }
     void graphics_resolve(const GraphicsView& target,const GraphicsView& source,std::uint32_t format) override {
         post([this,target,source,format]{inner_->graphics_resolve(target,source,format);});
     }
@@ -94,6 +97,8 @@ public:
     void graphics_fixed_stencil(const std::array<std::uint32_t,12>& state) override {graphics_sync();inner_->graphics_fixed_stencil(state);}
     void graphics_fixed_draw(const FixedGraphicsDraw& draw) override {graphics_sync();inner_->graphics_fixed_draw(draw);}
     std::shared_ptr<GraphicsResource> graphics_resource(const GraphicsResourceDesc& desc) override {graphics_sync();return inner_->graphics_resource(desc);}
+    std::shared_ptr<GraphicsResource> graphics_buffer_alias(std::shared_ptr<void> owner,std::span<std::uint8_t> bytes) override {graphics_sync();return inner_->graphics_buffer_alias(std::move(owner),bytes);}
+    void graphics_submission_depth(std::uint32_t depth) override {graphics_sync();inner_->graphics_submission_depth(depth);}
     bool graphics_samples_supported(std::uint32_t format,std::uint32_t samples) override {graphics_sync();return inner_->graphics_samples_supported(format,samples);}
     bool graphics_vertex_format_supported(std::uint32_t format) override {graphics_sync();return inner_->graphics_vertex_format_supported(format);}
     std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes) override {graphics_sync();return inner_->graphics_shader(stage,bytes);}

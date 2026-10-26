@@ -460,32 +460,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_vulkan(GuestState& state,Gu
     VulkanCall::Host host;
     host.resolve=[this](std::string_view name){return resolve("vulkan-1.dll",name).value;};
     host.map=[this,&memory](void* data,std::size_t size)->std::uint64_t{
-        // 與檔案檢視相同的位址搜尋：避開保留區與既有映射，以配置粒度對齊。
-        constexpr std::uint64_t granularity=0x10000;const auto limit=user_address_limit();
-        std::uint64_t address=(runtime_.next_virtual+granularity-1)&~(granularity-1);
-        for(;;){
-            if(address<granularity || address>=limit || size>limit-address)return 0;
-            const auto end=address+size;std::uint64_t conflict_end=0;
-            const auto next=runtime_.virtual_regions.upper_bound(address);
-            if(next!=runtime_.virtual_regions.begin()){const auto previous=std::prev(next);if(previous->first+previous->second.size>address)conflict_end=previous->first+previous->second.size;}
-            if(next!=runtime_.virtual_regions.end() && next->first<end)conflict_end=std::max(conflict_end,next->first+next->second.size);
-            auto mapped=memory.query(GuestAddress{address});if(!mapped)mapped=memory.next_mapping(GuestAddress{address});
-            if(mapped && mapped->base.value<end)conflict_end=std::max(conflict_end,mapped->base.value+mapped->size);
-            if(!conflict_end)break;
-            address=(conflict_end+granularity-1)&~(granularity-1);
-        }
-        if(size>memory.remaining_capacity())return 0;
-        try{
-            // 生命週期由橋接層持有（先撤除客體映射才 vkUnmapMemory／vkFreeMemory），長度固定：
-            // 以 StableShared 讓原生 MMU 直接別名，客體存取對映記憶體不經受檢慢速路徑。
-            // X64ARM_VULKAN_CHECKED_MAPPING=1：診斷用，改回受檢外部 backing 以比較兩種映射對 GPU／客體的影響。
-            static const bool checked=[]{const char* value=std::getenv("X64ARM_VULKAN_CHECKED_MAPPING");return value && std::string_view(value)=="1";}();
-            auto backing=std::make_shared<MemoryBacking>(std::shared_ptr<void>(data,[](void*){}),std::span<std::uint8_t>(static_cast<std::uint8_t*>(data),size),
-                checked?MemoryBacking::ExternalAccess::Checked:MemoryBacking::ExternalAccess::StableShared);
-            memory.map_shared(GuestAddress{address},size,read_write,backing,0);
-        }catch(const std::exception&){return 0;}
-        runtime_.next_virtual=(address+size+granularity-1)&~(granularity-1);
-        return address;
+        // 生命週期由橋接層持有（先撤除客體映射才 vkUnmapMemory／vkFreeMemory），長度固定：共用 map_host_memory 以
+        // StableShared 讓原生 MMU 直接別名。X64ARM_VULKAN_CHECKED_MAPPING=1：診斷用，改回受檢外部 backing 以比較兩種映射。
+        static const bool checked=[]{const char* value=std::getenv("X64ARM_VULKAN_CHECKED_MAPPING");return value && std::string_view(value)=="1";}();
+        return map_host_memory(memory,std::shared_ptr<void>(data,[](void*){}),std::span<std::uint8_t>(static_cast<std::uint8_t*>(data),size),checked);
     };
     host.unmap=[&memory](std::uint64_t address,std::size_t size){try{memory.unmap(GuestAddress{address},size);}catch(const std::exception&){}};
     VulkanCall call(state,memory,arg,vulkan,std::move(host));

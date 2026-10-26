@@ -468,6 +468,8 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     if(std::find(std::begin(excluded),std::end(excluded),symbol)!=std::end(excluded))return false;
     const WindowsCall arg(state,memory,service);
     const auto found=d3d11_->objects.find(arg(0));if(found==d3d11_->objects.end())return false;
+    // DXGI 介面卡的顯示記憶體預算查詢與保留：只讀寫自帶鎖的 GPU 額度池與參數指向的客體記憶體（電馭判客每秒約 500 次）。
+    if(symbol=="QueryVideoMemoryInfo" || symbol=="SetVideoMemoryReservation")return found->second.kind==Kind::Adapter;
     if(!coordinator && (symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource")){
         // 寫入目的資源會撤銷持久映射並釋放客體 heap；在任何副作用之前交回完整服務邊界。
         const auto destination=d3d11_->objects.find(arg(1));

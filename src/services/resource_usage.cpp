@@ -1,5 +1,6 @@
 #include "x64arm/resource_usage.hpp"
 #include "x64arm/gpu_memory.hpp"
+#include "x64arm/file_security.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -181,6 +182,21 @@ struct ResourceUsageReporter::Impl {
                 <<",\"writeNanoseconds\":"<<resource.write_ns<<",\"writeFailures\":"<<resource.write_failures<<'}';
         }
 #endif
+        {
+            const auto cache=security::native_file_security_cache_stats();
+            json<<",\"nativeFileSecurityCache\":{\"entries\":"<<cache.entries<<",\"entryLimit\":"<<cache.entry_limit
+                <<",\"indexedObjectBytes\":"<<cache.object_bytes<<",\"indexedDynamicBytes\":"<<cache.dynamic_bytes
+                <<",\"peakIndexedBytes\":"<<cache.peak_indexed_bytes<<",\"hits\":"<<cache.hits<<",\"misses\":"<<cache.misses
+                <<",\"insertions\":"<<cache.insertions<<",\"duplicateInsertions\":"<<cache.duplicate_insertions
+                <<",\"evictions\":"<<cache.evictions<<",\"invalidations\":"<<cache.invalidations
+                <<",\"aclEntries\":"<<cache.acl_entries<<",\"largestDynamicBytes\":"<<cache.largest_dynamic_bytes
+                <<",\"byteLimit\":"<<cache.byte_limit<<",\"reservedBytes\":"<<cache.reserved_bytes
+                <<",\"peakReservedBytes\":"<<cache.peak_reserved_bytes<<",\"indexedChargedBytes\":"<<cache.indexed_charged_bytes
+                <<",\"budgetRejections\":"<<cache.budget_rejections<<",\"allocationRejections\":"<<cache.allocation_rejections
+                <<",\"dynamicSizeBuckets\":[";
+            for(std::size_t i=0;i<cache.size_buckets.size();++i){if(i)json<<',';json<<cache.size_buckets[i];}
+            json<<"]}";
+        }
         {   // 與宿主取樣不同步，明列客體快照時間與序號，不把舊值標成當下值。
             auto& guest_counters=counters();std::lock_guard lock(guest_counters.guest_mutex);json<<",\"guestMemory\":";
             if(!guest_counters.guest_sequence)json<<"null";

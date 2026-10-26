@@ -1664,6 +1664,9 @@ class CocoaGui final : public NativeGui {
             // AppKit 的 disclosure tracking 使用真正的配對 NSEvent，客體仍可同步否決。
             [NSApp postEvent:event(NSEventTypeLeftMouseUp) atStart:YES];[target mouseDown:event(NSEventTypeLeftMouseDown)];[target mouseUp:event(NSEventTypeLeftMouseUp)];
         }else if([operation isEqualToString:@"mouse"] && ([w.view isKindOfClass:[X64ArmGuestView class]] || [w.view isKindOfClass:[X64ArmHeaderView class]])){
+            // 與自動化按鍵／滾輪相同標記為注入：服務層依此產生 Raw Input 按鍵旗標。
+            const auto first_event=events_.size();
+            struct MarkInjected {std::vector<GuiMessage>& events;std::size_t first;~MarkInjected(){for(auto i=first;i<events.size();++i)if(events[i].message>=0x200 && events[i].message<=0x209)events[i].injected=true;}} mark{events_,first_event};
             NSString* phase=step[@"phase"]?:@"down";NSString* button=step[@"button"]?:@"left";
             const bool down=[phase isEqualToString:@"down"],up=[phase isEqualToString:@"up"],move=[phase isEqualToString:@"move"],right=[button isEqualToString:@"right"],middle=[button isEqualToString:@"middle"];
             if((!down && !up && !move && ![phase isEqualToString:@"drag"]) || (!right && !middle && ![button isEqualToString:@"left"]))throw std::runtime_error("GUI 滑鼠測試的按鍵或動作無效");
@@ -1682,6 +1685,9 @@ class CocoaGui final : public NativeGui {
             const auto x=coordinate_word(local.x),y=coordinate_word(local.y);
             events_.push_back({w.target.guestHandle,0x200,static_cast<std::uint64_t>(x)|(static_cast<std::uint64_t>(y)<<16),0x10012});
         }else if([operation isEqualToString:@"scroll"] && [w.view isKindOfClass:[X64ArmGuestView class]]){
+            // 與自動化按鍵相同標記為注入：沒有實體滑鼠狀態，Raw Input（WM_INPUT 滾輪）由服務層依此產生。
+            const auto first_event=events_.size();
+            struct MarkInjected {std::vector<GuiMessage>& events;std::size_t first;~MarkInjected(){for(auto i=first;i<events.size();++i)if(events[i].message==0x20a || events[i].message==0x20e)events[i].injected=true;}} mark{events_,first_event};
             automation_cursor_at(w,NSMakePoint([step[@"x"] doubleValue],[step[@"y"] doubleValue]));
             [(X64ArmGuestView*)w.view guestScrollAt:NSMakePoint([step[@"x"] doubleValue],[step[@"y"] doubleValue]) vertical:[step[@"delta_y"] doubleValue] horizontal:[step[@"delta_x"] doubleValue] precise:[step[@"precise"] boolValue] modifiers:automation_modifiers(step)];
         }else if([operation isEqualToString:@"clipboard"]){if(!set_clipboard_text(gueststring(step[@"value"]?:@"")))throw std::runtime_error("GUI 測試無法設定剪貼簿");
