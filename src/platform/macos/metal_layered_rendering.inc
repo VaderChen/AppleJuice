@@ -13,11 +13,6 @@ MetalRenderTarget metal_render_target(const GraphicsView& view){
     if(!texture)throw std::invalid_argument("Render target 必須是紋理");
     return {texture,view.slices,volume?view.slice:0,volume};
 }
-void metal_attach_target(MTLRenderPassAttachmentDescriptor* attachment,const MetalRenderTarget& target,unsigned layer=0){
-    attachment.texture=target.texture;attachment.level=0;
-    if(target.volume)attachment.depthPlane=target.depth_start+layer;
-    else attachment.slice=layer;
-}
 void metal_attach_target(MetalPassSpec::Attachment& attachment,const MetalRenderTarget& target,unsigned layer=0){
     attachment.texture=target.texture;attachment.level=0;
     if(target.volume)attachment.depthPlane=target.depth_start+layer;

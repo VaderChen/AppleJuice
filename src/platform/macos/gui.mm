@@ -1317,6 +1317,7 @@ class CocoaGui final : public NativeGui {
         return CGCompleteDisplayConfiguration(config,kCGConfigureForAppOnly)==kCGErrorSuccess;
     }
     bool restore_display_mode(){
+        display_mode_cached_=false;
         if(original_display_mode_){const auto current=CGDisplayCopyDisplayMode(fullscreen_display_);const bool ours=current && display_mode_id(current)==written_display_mode_;if(current)CGDisplayModeRelease(current);
             if(ours && written_display_mode_!=display_mode_id(original_display_mode_) && !configure_display(fullscreen_display_,original_display_mode_))return false;
             CGDisplayModeRelease(original_display_mode_);original_display_mode_=nullptr;
@@ -1459,6 +1460,8 @@ class CocoaGui final : public NativeGui {
         automation_cursor_={static_cast<std::int32_t>(std::clamp<CGFloat>(point.x,INT32_MIN,INT32_MAX)),static_cast<std::int32_t>(std::clamp<CGFloat>(point.y,INT32_MIN,INT32_MAX))};
     }
     NSString* __strong automation_live_path_{};
+    // current_display_mode 的短期快取（見該函式）。
+    std::optional<GuiDisplayMode> display_mode_cache_{};bool display_mode_cached_{};std::chrono::steady_clock::time_point display_mode_time_{};
     bool automation_input_active_{}; // 背景顯示下由自動化 window_activate 模擬的前景輸入狀態。
     NSDate* automation_read_time_{};
     id __strong automation_input_monitor_{};
@@ -1971,8 +1974,17 @@ public:
     }
     void* graphics_view(std::uint64_t handle) override {if(offline_render_enabled())return nullptr;const auto f=windows_.find(handle);return f==windows_.end()?nullptr:(__bridge void*)f->second.view;}
     std::optional<GuiDisplayMode> current_display_mode() override {
-        const auto mode=CGDisplayCopyDisplayMode(CGMainDisplayID());if(!mode)return {};auto result=describe_display_mode(mode);CGDisplayModeRelease(mode);
-        if(const auto size=virtual_display_size()){result.width=size->first;result.height=size->second;}
+        // CGDisplayCopyDisplayMode 經 WindowServer 往返（約 1～2 ms）；DXGI 應用程式每幀列舉輸出、查詢描述時反覆呼叫
+        //（電馭判客 Benchmark EnumOutputs 每次約 2 ms，且在全停中）。快取 250 ms，本程序切換或還原顯示模式時清除。
+        const auto now=std::chrono::steady_clock::now();
+        if(display_mode_cached_ && now-display_mode_time_<std::chrono::milliseconds(250))return display_mode_cache_;
+        std::optional<GuiDisplayMode> result;
+        if(const auto mode=CGDisplayCopyDisplayMode(CGMainDisplayID())){
+            auto value=describe_display_mode(mode);CGDisplayModeRelease(mode);
+            if(const auto size=virtual_display_size()){value.width=size->first;value.height=size->second;}
+            result=value;
+        }
+        display_mode_cache_=result;display_mode_cached_=true;display_mode_time_=now;
         return result;
     }
     std::vector<GuiDisplayMode> display_modes() override {
@@ -1993,6 +2005,7 @@ public:
         const auto found=windows_.find(handle);if(found==windows_.end() || !found->second.native)return !enabled && (!fullscreen_window_ || fullscreen_window_==handle) && restore_display_mode();
         if(offline_render_enabled()){found->second.fullscreen=enabled;return true;}
         auto& window=found->second;if(fullscreen_window_ && fullscreen_window_!=handle)return false;
+        display_mode_cached_=false;
         if(!enabled){if(!restore_display_mode())return false;window.fullscreen=false;apply_z_order(handle);return true;}
         if(!window.native.visible || window.native.miniaturized)return false;
         const auto display=CGMainDisplayID();const auto current=CGDisplayCopyDisplayMode(display);if(!current)return false;

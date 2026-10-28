@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <atomic>
 #include <span>
@@ -11,7 +12,8 @@
 
 namespace x64arm {
 // D3D9 固定管線及 D3D11 可程式化管線共用同一 Metal context、提交與呈現。
-struct GraphicsObject {virtual ~GraphicsObject()=default;};
+// pending_stamp：後端在途清單最近一次加入此物件的批次編號（Metal 在途追蹤以它略過同批重複加入，不查雜湊表）。
+struct GraphicsObject {virtual ~GraphicsObject()=default;std::uint64_t pending_stamp{};};
 struct GraphicsResourceDesc {
     std::uint32_t dimension{1},width{},height{1},depth{1},levels{1},layers{1},format{},samples{1},bind{},stride{},misc{};
     std::uint32_t sample_quality{};
@@ -93,6 +95,9 @@ struct GraphicsDraw {
     // Draw*InstancedIndirect：count／instances／start／base_vertex／start_instance 改由此 buffer 的 offset 處取得
     // （D3D11 與 Metal 的間接參數佈局相同）；GPU 寫入的參數不經 CPU 讀回。
     std::shared_ptr<GraphicsResource> indirect;std::uint32_t indirect_offset{};
+    // 非零時，值相同的繪製其著色器、輸入佈局、混色／深度／光柵狀態與 sample mask 皆相同（D3D12 PSO 建立後不變），
+    // 後端可據此快取管線；0 表示不保證（D3D11 等逐次比對）。
+    std::uint64_t pipeline_serial{};
 };
 struct FixedGraphicsVertex {std::array<float,4> position,color,texcoord;std::array<float,4> secondary{};};
 struct FixedGraphicsDraw {
@@ -134,6 +139,9 @@ public:
     virtual void graphics_write_discard(const GraphicsView& view,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){graphics_write(view,data,row,image);}
     // WRITE_NO_OVERWRITE 的整個資源上傳：呼叫端保證 GPU 使用中的範圍與上次上傳的位元組相同，後端可直接寫入而不等待。
     virtual void graphics_write_no_overwrite(const GraphicsView& view,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){graphics_write(view,data,row,image);}
+    // 緩衝範圍寫入，呼叫端保證這個範圍尚未被任何已編碼的命令引用（暫存區每段只寫一次再綁定）：後端可直接寫入
+    // 共享記憶體，不等待 GPU、不經 staging 複製（不切斷進行中的 render encoder）。
+    virtual void graphics_write_unused(const GraphicsView& view,std::span<const std::uint8_t> data){graphics_write(view,data,static_cast<std::uint32_t>(data.size()),static_cast<std::uint32_t>(data.size()));}
     virtual void graphics_write_region(const GraphicsView&,std::span<const std::uint8_t>,std::uint32_t,std::uint32_t,std::array<std::uint32_t,6>){throw std::runtime_error("後端缺少區域資源寫入");}
     virtual std::vector<std::uint8_t> graphics_read(const GraphicsView&){throw std::runtime_error("後端缺少資源讀回");}
     // 描述元表項目：type 6／7 回傳 view 的 GPU 資源 ID（value[0]），8／9 回傳緩衝位址與長度；空 view 回傳後端的預設空資源。
@@ -169,6 +177,9 @@ public:
     virtual void graphics_dispatch_retained(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){graphics_dispatch(stage,groups);}
     // 等待先前排入的非同步命令完成，並拋出其中的錯誤；同步後端為空操作。
     virtual void graphics_sync(){}
+    // 把一段後端工作依序排在先前的命令之後執行（非同步後端在編碼執行緒上以內層後端呼叫；同步後端立即執行）。
+    // task 只能使用傳入的後端與自行擁有的資料。
+    virtual void graphics_post(std::function<void(NativeGraphics&)> task){task(*this);}
     // 非同步後端：最後一個排入命令的序號，以及等到某序號（含之前）全部完成；同步後端恆為 0、不等待。
     virtual std::uint64_t graphics_ticket()const{return 0;}
     virtual void graphics_sync_until(std::uint64_t){graphics_sync();}

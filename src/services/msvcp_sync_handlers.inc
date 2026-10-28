@@ -132,11 +132,14 @@ if(service.family=="msvcp140.dll"){
         if(creating_mutex){memory.store(GuestAddress{object},32,call(1));memory.store(GuestAddress{object+(x86_?40U:72U)},32,UINT32_MAX);}
         memory.store(GuestAddress{call(0)},bits,object);return finish(0);
     }
+    // 銷毀仍被持有的 mutex：release 版 msvcp140 的 _Mtx_destroy_in_situ 只有除錯版才斷言（_THREAD_ASSERT），
+    // 實際照常返回（_Mtx_destroy 也照常釋放）；電馭判客結束時會這樣做。不中止程式，保留 SRW 鎖狀態讓持有者之後解鎖不出錯。
+    const auto busy_destroy=[&]{static std::atomic<bool> noted{false};if(!noted.exchange(true))std::fprintf(stderr,"msvcp: 銷毀持有中的 mutex（release 版 MSVC 不檢查，照常繼續）\n");};
     if(name=="_Mtx_destroy" || name=="_Cnd_destroy"){
         if(const auto object=call(0)){
             if(name=="_Mtx_destroy"){
-                if(memory.load(GuestAddress{object+(x86_?44U:76U)},32))throw HostCallFault("不可銷毀持有中的 MSVC mutex");
-                runtime_.slim_locks.erase(object+unit*2);
+                if(memory.load(GuestAddress{object+(x86_?44U:76U)},32))busy_destroy();
+                else runtime_.slim_locks.erase(object+unit*2);
             }
             (void)free_heap(memory,object,state);
         }
@@ -157,8 +160,8 @@ if(service.family=="msvcp140.dll"){
     }
     if(name.ends_with("destroy_in_situ")){
         if(mutex){
-            if(memory.load(GuestAddress{owner+4},32))throw HostCallFault("不可銷毀持有中的 MSVC mutex");
-            runtime_.slim_locks.erase(lock);
+            if(memory.load(GuestAddress{owner+4},32))busy_destroy();
+            else runtime_.slim_locks.erase(lock);
         }
         // 條件變數沒有獨立配置；STL 的原位解構器本身不修改儲存區。
         return finish(0);

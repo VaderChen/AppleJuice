@@ -1,6 +1,7 @@
 #pragma once
 #include "x64arm/host_services.hpp"
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <unordered_map>
@@ -803,6 +804,10 @@ private:
     std::shared_ptr<PmrState> msvcp_pmr_;
     std::shared_ptr<WebView2State> webview2_;
     std::shared_ptr<D3D12State> d3d12_;
+    // D3D12 提交執行緒（見 windows_d3d12.cpp 的 D3D12Submitter）：第一個裝置建立時啟動，在主體成員之後宣告以最先結束。
+    void d3d12_start_submitter(GuestMemory&);
+    void d3d12_submit_loop(GuestMemory&,struct D3D12Submitter&);
+    void d3d12_drain();
     std::shared_ptr<DXCoreState> dxcore_;
     std::optional<std::uint32_t> invoke_dxcore(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_d3d12(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1048,8 +1053,12 @@ private:
     // 套用動作（讀回、設定 fence 值、觸發事件）；同一 order 鍵（裝置）依登記順序，前一個未完成就停止該鍵。
     struct GpuSignal {std::shared_ptr<const std::atomic<bool>> done;std::uint64_t order{};std::function<void(GuestMemory&)> apply;};
     std::deque<GpuSignal> gpu_signals_;
-    void queue_gpu_signal(GuestMemory&,std::shared_ptr<const std::atomic<bool>>,std::uint64_t,std::function<void(GuestMemory&)>);
-    void poll_gpu_signals(GuestMemory&);
+    // poll=false：只登記不套用（D3D12 提交執行緒不觸發事件、不改執行緒等待狀態，由客體端輪詢套用）。
+    void queue_gpu_signal(GuestMemory&,std::shared_ptr<const std::atomic<bool>>,std::uint64_t,std::function<void(GuestMemory&)>,bool poll=true);
+    // 待完成通知數（圖形鎖內以原子操作更新）：協調者計算喚醒期限時不取鎖讀取。WindowsServices 須可移動，不用 std::atomic 成員。
+    std::size_t gpu_signal_count_{};
+    // try_only：圖形鎖正被占用（提交執行緒重播中）時略過本次輪詢，供週期性的等待解析與免鎖取值使用。
+    void poll_gpu_signals(GuestMemory&,bool try_only=false);
     std::uint64_t gpu_signal_wakeup_ns() const;
     void d3d12_signal_fence(std::uint64_t,std::uint64_t);
     std::shared_ptr<DirectInputState> dinput_;
@@ -1094,12 +1103,28 @@ private:
     std::optional<std::uint32_t> invoke_d3d11_full(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     // coordinator=true：協調者持獨占映射鎖，可配置／釋放 heap；worker（共用鎖）維持持久映射重用的限制。
     bool d3d11_local_eligible(const GuestState&,GuestMemory&,const WindowsServiceDescriptor&,bool coordinator=false) const;
+    // object 是 DXGI 介面卡（只在協調者建立，worker 可不取圖形鎖查詢）。
+    bool d3d11_adapter(std::uint64_t object) const;
     // worker 上的 D3D11 方法為 true；延後需要改動客體 heap 的銷毀，協調者本地路徑則可處理。
     static bool& graphics_local() noexcept {static thread_local bool value=false;return value;}
     // 目前執行緒正在 worker 上執行 D3D12 服務：程序事件紀錄（module_events）屬協調者，worker 端先暫存於 D3D12 狀態。
     static bool& d3d12_worker_context() noexcept {static thread_local bool value=false;return value;}
+    // 目前執行緒是 D3D12 提交執行緒且正在重播的工作（D3D12Submitter::Job*）：invoke_d3d12 以工作參數代替客體呼叫框架。
+    static void*& d3d12_submit_context() noexcept {static thread_local void* value=nullptr;return value;}
+    // worker 上不取圖形鎖執行的 D3D12 方法（錄製、描述元、取值、提交排入）：invoke_d3d12 入口據此不取圖形鎖。
+    static bool& d3d12_unlocked_call() noexcept {static thread_local bool value=false;return value;}
     // 所有 D3D11／DXGI 服務共用的鎖（可重入）：worker 上直接執行裝置內容方法時與協調者串行化。
     static std::recursive_mutex& graphics_mutex() noexcept;
+    // 等待圖形鎖的執行緒數：D3D12 提交執行緒在命令清單之間看到有人等待就暫時讓出（見 D3D12Submitter）。
+    static std::atomic<unsigned>& graphics_waiters() noexcept {static std::atomic<unsigned> value{};return value;}
+    // 目前執行緒累計等圖形鎖的時間（奈秒，只在競爭時計時）：X64ARM_TRACE_D3D12_SUBMIT 統計提交執行緒用。
+    static std::uint64_t& graphics_wait_ns() noexcept {static thread_local std::uint64_t value=0;return value;}
+    static void lock_graphics(std::unique_lock<std::recursive_mutex>& lock){
+        if(lock.try_lock())return;
+        const auto start=std::chrono::steady_clock::now();
+        graphics_waiters().fetch_add(1,std::memory_order_relaxed);lock.lock();graphics_waiters().fetch_sub(1,std::memory_order_relaxed);
+        graphics_wait_ns()+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count());
+    }
     // 可直接在 worker 上執行的 D3D11 方法；輸出頁另核對 COW，不符資格回傳空指標。
     const WindowsServiceDescriptor* graphics_worker_service(GuestAddress) const noexcept;
     // 可直接在 worker 上執行的 D3D12 方法（命令清單錄製、描述元建立／複製、不寫客體記憶體的取值）；其餘回傳空指標。
@@ -1162,6 +1187,7 @@ private:
     mutable ConcurrentGuestCache concurrent_cache_;
     // 最近一次計算喚醒期限時最早的客體等待期限（100 ns 單調刻度）；過期即需完整排程解析逾時，schedule 後清除。
     mutable std::uint64_t resident_wait_deadline_{UINT64_MAX}; // 只在協調執行緒讀寫。
+    std::uint64_t resident_full_poll_ticks_{}; // 上次完整排程輪詢外部完成（wake_threads）的單調時間；物件等待停駐的保險用。
     std::map<std::uint64_t,GuestAddress> resident_service_requests_;
     std::uint64_t thread_id(std::uint64_t handle) const;
     std::uint32_t thread_identifier(std::uint64_t) const;
@@ -2153,5 +2179,7 @@ private:
     std::uint64_t console_identity_{};
     std::uint32_t console_group_{};
     bool initialized_{};
+    // 最後宣告：解構時最先等提交執行緒結束，它仍會使用上方的 D3D12 狀態與 GPU 通知佇列。
+    std::shared_ptr<struct D3D12Submitter> d3d12_submitter_;
 };
 }

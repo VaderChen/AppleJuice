@@ -6,6 +6,20 @@ struct MetalBufferBacking final:GraphicsObject {
 };
 // D3D11 pipeline 狀態的快取鍵：以固定寬度的二進位欄位串接，取代每次繪圖的 ostringstream 格式化（DQ3 每次 DrawIndexed 約 42 µs 的主要成分）。
 // 鍵只作 map 查找與串接，不被解析；相同欄位序列產生相同位元組。
+// D3D12 PSO 的快速管線鍵（見 graphics_draw）：serial 為 GraphicsDraw::pipeline_serial；strides 只填輸入佈局用到的槽位。
+struct MetalFastPipelineKey {
+    std::uint64_t serial{};std::array<std::uint32_t,8> colors{};std::uint32_t depth{},stencil{},samples{},topology{};std::array<std::uint32_t,2> alpha{};
+    std::array<std::uint32_t,32> strides{};
+    bool operator==(const MetalFastPipelineKey&)const=default;
+};
+struct MetalFastPipelineHash {
+    std::size_t operator()(const MetalFastPipelineKey& key)const noexcept{
+        std::uint64_t hash=key.serial*0x9E3779B97F4A7C15ULL;const auto mix=[&](std::uint64_t value){hash^=value+0x9E3779B97F4A7C15ULL+(hash<<6)+(hash>>2);};
+        for(const auto value:key.colors)mix(value);mix(key.depth);mix(key.stencil);mix(key.samples);mix(key.topology);mix(key.alpha[0]);mix(key.alpha[1]);
+        for(const auto value:key.strides)mix(value);
+        return static_cast<std::size_t>(hash);
+    }
+};
 struct MetalPipelineKey {
     std::string bytes;
     MetalPipelineKey(){bytes.reserve(512);}
@@ -87,7 +101,9 @@ struct MetalDepthSpec {
     }
 };
 struct MetalPassSpec {
-    struct Attachment {id<MTLTexture> texture;NSUInteger level{},slice{},depthPlane{};MTLLoadAction loadAction{MTLLoadActionDontCare};MTLStoreAction storeAction{MTLStoreActionStore};};
+    struct Attachment {id<MTLTexture> texture;NSUInteger level{},slice{},depthPlane{};MTLLoadAction loadAction{MTLLoadActionDontCare};MTLStoreAction storeAction{MTLStoreActionStore};
+        // loadAction 為 Clear 時的清除值（延後清除併入 pass 時設定）。
+        MTLClearColor clearColor{0,0,0,0};double clearDepth{1};std::uint32_t clearStencil{};};
     std::array<Attachment,8> colorAttachments;Attachment depthAttachment,stencilAttachment;
     id<MTLBuffer> visibilityResultBuffer;NSUInteger renderTargetArrayLength{},renderTargetWidth{},renderTargetHeight{},defaultRasterSampleCount{};
     std::array<MTLSamplePosition,8> samplePositions{};NSUInteger samplePositionCount{};
@@ -95,8 +111,9 @@ struct MetalPassSpec {
     MTLRenderPassDescriptor* make()const{
         auto pass=[MTLRenderPassDescriptor renderPassDescriptor];
         const auto copy=[](MTLRenderPassAttachmentDescriptor* out,const Attachment& a){out.texture=a.texture;out.level=a.level;out.slice=a.slice;out.depthPlane=a.depthPlane;out.loadAction=a.loadAction;out.storeAction=a.storeAction;};
-        for(unsigned i=0;i<colorAttachments.size();++i)if(colorAttachments[i].texture)copy(pass.colorAttachments[i],colorAttachments[i]);
-        if(depthAttachment.texture)copy(pass.depthAttachment,depthAttachment);if(stencilAttachment.texture)copy(pass.stencilAttachment,stencilAttachment);
+        for(unsigned i=0;i<colorAttachments.size();++i)if(colorAttachments[i].texture){copy(pass.colorAttachments[i],colorAttachments[i]);pass.colorAttachments[i].clearColor=colorAttachments[i].clearColor;}
+        if(depthAttachment.texture){copy(pass.depthAttachment,depthAttachment);pass.depthAttachment.clearDepth=depthAttachment.clearDepth;}
+        if(stencilAttachment.texture){copy(pass.stencilAttachment,stencilAttachment);pass.stencilAttachment.clearStencil=stencilAttachment.clearStencil;}
         pass.visibilityResultBuffer=visibilityResultBuffer;
         if(renderTargetArrayLength)pass.renderTargetArrayLength=renderTargetArrayLength;
         if(renderTargetWidth)pass.renderTargetWidth=renderTargetWidth;if(renderTargetHeight)pass.renderTargetHeight=renderTargetHeight;
@@ -122,35 +139,41 @@ struct MetalBufferPool {
 };
 class MetalPendingObjects {
     static bool indexed(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_RESOURCE_INDEX");return !text || std::string_view(text)!="0";}();return value;}
+    static std::uint64_t next_batch() noexcept {static std::atomic<std::uint64_t> next{0};return next.fetch_add(1,std::memory_order_relaxed)+1;}
     std::vector<std::shared_ptr<GraphicsObject>> objects_;
-    std::unordered_set<const GraphicsObject*> index_;
-    // 本批最近加入者的直接對應快取：每次繪製都把同一批目標、著色器與常數緩衝重複加入，命中即略過雜湊查找與
-    // shared_ptr 複製（重播取樣約 8%）。項目只指向 objects_ 持有的物件（批次期間位址不會被重用），清空或移走批次時一併清除。
-    std::array<const GraphicsObject*,64> recent_{};
-    static std::size_t recent_slot(const GraphicsObject* object) noexcept {return (reinterpret_cast<std::uintptr_t>(object)>>4)&63U;}
+    // 每個批次（清單實例；清空或被移走後換新）有唯一編號，加入時寫入物件的 pending_stamp：同批重複加入只比對編號，
+    // 不查雜湊表、不配置節點（每次繪製都重複加入同一批目標、著色器與常數緩衝）。不同後端同時加入同一物件時
+    // 編號互相覆寫，最多造成重複項目，不會漏加。contains 很少呼叫（等資源閒置、更換 backing），第一次查詢時才建立索引。
+    std::uint64_t batch_{next_batch()};
+    mutable std::unordered_set<const GraphicsObject*> index_;mutable bool index_valid_{};
     template<class T> void append(const std::shared_ptr<T>& object){
-        const GraphicsObject* raw=object.get();
+        GraphicsObject* raw=object.get();
         if(!indexed()){objects_.push_back(object);return;}
-        auto& recent=recent_[recent_slot(raw)];if(raw && recent==raw)return;
-        auto [position,added]=index_.insert(raw);
-        if(added){try{objects_.push_back(object);}catch(...){index_.erase(position);throw;}}
-        recent=raw;
+        if(!raw)return;
+        std::atomic_ref<std::uint64_t> stamp(raw->pending_stamp);
+        if(stamp.load(std::memory_order_relaxed)==batch_)return;
+        objects_.push_back(object);stamp.store(batch_,std::memory_order_relaxed);
+        if(index_valid_)index_.insert(raw);
     }
 public:
     MetalPendingObjects()=default;
     MetalPendingObjects(const MetalPendingObjects&)=delete;MetalPendingObjects& operator=(const MetalPendingObjects&)=delete;
     MetalPendingObjects(MetalPendingObjects&& other) noexcept {*this=std::move(other);}
     MetalPendingObjects& operator=(MetalPendingObjects&& other) noexcept {
-        objects_=std::move(other.objects_);index_=std::move(other.index_);recent_=other.recent_;tables=other.tables;
-        other.objects_.clear();other.index_.clear();other.recent_.fill(nullptr);other.tables=false;return *this;
+        objects_=std::move(other.objects_);index_=std::move(other.index_);index_valid_=other.index_valid_;batch_=other.batch_;tables=other.tables;
+        other.objects_.clear();other.index_.clear();other.index_valid_=false;other.batch_=next_batch();other.tables=false;return *this;
     }
     template<class T> void push_back(const std::shared_ptr<T>& object);
     auto end(){return objects_.end();}
     template<class Iterator> void insert(std::vector<std::shared_ptr<GraphicsObject>>::iterator,Iterator first,Iterator last){for(;first!=last;++first)push_back(*first);}
-    bool contains(const GraphicsObject* object)const{if(indexed())return index_.contains(object);return std::any_of(objects_.begin(),objects_.end(),[&](const auto& value){return value.get()==object;});}
+    bool contains(const GraphicsObject* object)const{
+        if(!indexed())return std::any_of(objects_.begin(),objects_.end(),[&](const auto& value){return value.get()==object;});
+        if(!index_valid_){index_.clear();index_.reserve(objects_.size());for(const auto& value:objects_)index_.insert(value.get());index_valid_=true;}
+        return index_.contains(object);
+    }
     // 本批次綁定過 D3D12 描述元表：表內資源不在清單中，曾被表引用的資源一律視為可能使用中。
     bool tables{};
-    void clear(){objects_.clear();index_.clear();recent_.fill(nullptr);tables=false;}
+    void clear(){objects_.clear();index_.clear();index_valid_=false;batch_=next_batch();tables=false;}
 };
 // 與固定管線共用 MetalGl；本檔只提供資源與可程式化管線的共用資料。
 struct MetalResource final:GraphicsResource {

@@ -51,7 +51,10 @@ public:
 };
 std::shared_ptr<NativeOpenGlContext> make_metal_opengl(void* view,std::uint32_t width,std::uint32_t height);
 // 包裝後端，讓繪製／運算／寫入／複製／清除在專用宿主執行緒依序執行（見 metal_command_thread.inc）。
-std::shared_ptr<NativeOpenGlContext> make_metal_command_thread(std::shared_ptr<NativeOpenGlContext> inner);
+// on_error：設定時背景工作的例外交給它記錄（在命令執行緒上呼叫），不留到下一次同步時在呼叫端拋出；
+// 多個執行緒共用後端時（D3D12），延後的例外否則會在無關的呼叫端出現。
+std::shared_ptr<NativeOpenGlContext> make_metal_command_thread(std::shared_ptr<NativeOpenGlContext> inner,
+    std::function<void(const std::string&)> on_error={});
 // 不建立 Metal 裝置即可確定 make_metal_opengl 會回報的 renderer／vendor 時回傳兩者；否則回空，呼叫端改建裝置。
 std::optional<std::pair<std::string,std::string>> metal_opengl_identity();
 std::shared_ptr<NativeOpenGlContext> make_native_opengl(void* view,std::uint32_t width,std::uint32_t height);

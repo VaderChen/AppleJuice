@@ -325,5 +325,92 @@ slow_end \name
 .endm
 fls_read FlsGetValue, 1
 fls_read FlsGetValue2, 0
+// SList（x64 SLIST_HEADER：低 64 位元 Depth:16／Sequence:48，高 64 位元 16 位元組對齊的第一項指標｜低 4 位元保留旗標），
+// 與服務層 slist::（windows_slist.hpp）格式相同。每次更新序號加一並以 LOCK CMPXCHG16B 一次比較交換整個標頭（防 ABA），
+// worker 上直接完成，不經協調者。CMPXCHG16B 以 RCX:RBX 為新值：RBX 暫存於 R11，不動堆疊。
+entry InitializeSListHead
+    mov qword ptr [rcx], 0
+    mov qword ptr [rcx + 8], 0
+    ret
+end InitializeSListHead
+entry QueryDepthSList
+    movzx eax, word ptr [rcx]
+    ret
+end QueryDepthSList
+// 回傳原本的第一項；entry->Next 每次重試都改寫成目前的第一項。
+entry InterlockedPushEntrySList
+    mov r10, rcx
+    mov r9, rdx
+    mov r11, rbx
+    mov rax, qword ptr [r10]
+    mov rdx, qword ptr [r10 + 8]
+1:
+    mov r8, rdx
+    and r8, -16
+    mov qword ptr [r9], r8
+    lea rbx, [rax + 0x10000]
+    and rbx, -65536
+    lea ecx, [rax + 1]
+    movzx ecx, cx
+    or rbx, rcx
+    mov rcx, rdx
+    and ecx, 15
+    or rcx, r9
+    lock cmpxchg16b xmmword ptr [r10]
+    jne 1b
+    mov rbx, r11
+    mov rax, r8
+    ret
+end InterlockedPushEntrySList
+// 空串列回 NULL（不改標頭）。
+entry InterlockedPopEntrySList
+    mov r10, rcx
+    mov r11, rbx
+    mov rax, qword ptr [r10]
+    mov rdx, qword ptr [r10 + 8]
+1:
+    mov r8, rdx
+    and r8, -16
+    je 2f
+    mov r9, qword ptr [r8]
+    lea rbx, [rax + 0x10000]
+    and rbx, -65536
+    lea ecx, [rax - 1]
+    movzx ecx, cx
+    or rbx, rcx
+    mov rcx, rdx
+    and ecx, 15
+    or rcx, r9
+    lock cmpxchg16b xmmword ptr [r10]
+    jne 1b
+    mov rbx, r11
+    mov rax, r8
+    ret
+2:
+    mov rbx, r11
+    xor eax, eax
+    ret
+end InterlockedPopEntrySList
+// 取走整串：回傳原本的第一項，深度歸零；已空時回 NULL。
+entry InterlockedFlushSList
+    mov r10, rcx
+    mov r11, rbx
+    mov rax, qword ptr [r10]
+    mov rdx, qword ptr [r10 + 8]
+1:
+    mov r8, rdx
+    and r8, -16
+    je 2f
+    lea rbx, [rax + 0x10000]
+    and rbx, -65536
+    mov rcx, rdx
+    and ecx, 15
+    lock cmpxchg16b xmmword ptr [r10]
+    jne 1b
+2:
+    mov rbx, r11
+    mov rax, r8
+    ret
+end InterlockedFlushSList
 .globl _guest_thread_end
 _guest_thread_end:

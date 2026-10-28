@@ -10,9 +10,14 @@ struct MetalFenceRelays {
     void attach(std::shared_ptr<std::atomic<bool>> relay){std::lock_guard lock(mutex);if(fired)relay->store(true,std::memory_order_release);else items.push_back(std::move(relay));}
 };
 void metal_fence_relay(NativeOpenGlContext&,std::shared_ptr<std::atomic<bool>>,bool flush);
+void metal_timestamp_relay(NativeOpenGlContext&,const std::shared_ptr<GraphicsTimestampFuture>&);
+// 只讀資源描述的資格判斷（定義於 metal_programmable.inc／metal_unordered_clear.inc）：代理據此在呼叫端回傳結果並非同步排入。
+bool metal_copy_buffer_texture_eligible(const GraphicsView&,const GraphicsView&,std::uint64_t,std::uint32_t,std::uint32_t,const std::array<std::uint32_t,6>&);
+bool metal_unordered_clear_pattern(const GraphicsView&,const std::array<std::uint32_t,4>&,bool,std::array<std::uint8_t,16>&,unsigned&);
 class MetalCommandThread final:public NativeOpenGlContext {
 public:
-    explicit MetalCommandThread(std::shared_ptr<NativeOpenGlContext> inner):inner_(std::move(inner)) {
+    explicit MetalCommandThread(std::shared_ptr<NativeOpenGlContext> inner,std::function<void(const std::string&)> on_error={}):
+        inner_(std::move(inner)),on_error_(std::move(on_error)) {
         worker_=std::thread([this]{run();});
     }
     ~MetalCommandThread() override {
@@ -58,6 +63,9 @@ public:
     void graphics_write_discard(const GraphicsView& view,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image) override {
         post([this,view,bytes=std::vector<std::uint8_t>(data.begin(),data.end()),row,image]{inner_->graphics_write_discard(view,bytes,row,image);});
     }
+    void graphics_write_unused(const GraphicsView& view,std::span<const std::uint8_t> data) override {
+        post([this,view,bytes=std::vector<std::uint8_t>(data.begin(),data.end())]{inner_->graphics_write_unused(view,bytes);});
+    }
     void graphics_write_no_overwrite(const GraphicsView& view,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image) override {
         post([this,view,bytes=std::vector<std::uint8_t>(data.begin(),data.end()),row,image]{inner_->graphics_write_no_overwrite(view,bytes,row,image);});
     }
@@ -67,8 +75,12 @@ public:
     void graphics_copy(const GraphicsView& target,const GraphicsView& source,std::array<std::uint32_t,3> offset,std::array<std::uint32_t,6> box) override {
         post([this,target,source,offset,box]{inner_->graphics_copy(target,source,offset,box);});
     }
+    // 資格只看資源本身：呼叫端判定後排入，D3D12 串流貼圖的每次上傳不再等編碼執行緒清空。
     bool graphics_copy_buffer_texture(const GraphicsView& texture,const GraphicsView& buffer,std::uint64_t offset,std::uint32_t row,std::uint32_t image,std::array<std::uint32_t,6> box,bool to_texture) override {
-        graphics_sync();return inner_->graphics_copy_buffer_texture(texture,buffer,offset,row,image,box,to_texture);
+        if(!metal_copy_buffer_texture_eligible(texture,buffer,offset,row,image,box))return false;
+        post([this,texture,buffer,offset,row,image,box,to_texture]{
+            if(!inner_->graphics_copy_buffer_texture(texture,buffer,offset,row,image,box,to_texture))throw std::logic_error("緩衝紋理複製資格與編碼端不一致");});
+        return true;
     }
     void graphics_resolve(const GraphicsView& target,const GraphicsView& source,std::uint32_t format) override {
         post([this,target,source,format]{inner_->graphics_resolve(target,source,format);});
@@ -96,8 +108,12 @@ public:
     bool graphics_fixed_texture(const GraphicsView& view) override {graphics_sync();return inner_->graphics_fixed_texture(view);}
     void graphics_fixed_stencil(const std::array<std::uint32_t,12>& state) override {graphics_sync();inner_->graphics_fixed_stencil(state);}
     void graphics_fixed_draw(const FixedGraphicsDraw& draw) override {graphics_sync();inner_->graphics_fixed_draw(draw);}
-    std::shared_ptr<GraphicsResource> graphics_resource(const GraphicsResourceDesc& desc) override {graphics_sync();return inner_->graphics_resource(desc);}
-    std::shared_ptr<GraphicsResource> graphics_buffer_alias(std::shared_ptr<void> owner,std::span<std::uint8_t> bytes) override {graphics_sync();return inner_->graphics_buffer_alias(std::move(owner),bytes);}
+    // 建立資源只配置新的 Metal 物件（GPU 記憶體額度有自己的鎖），不碰編碼狀態，不必等佇列清空。
+    std::shared_ptr<GraphicsResource> graphics_resource(const GraphicsResourceDesc& desc) override {return inner_->graphics_resource(desc);}
+    void graphics_post(std::function<void(NativeGraphics&)> task) override {post([this,task=std::move(task)]{task(*inner_);});}
+    // 零複製緩衝別名與 graphics_resource 相同只建立新的 Metal 物件，不碰編碼狀態，不必等佇列清空（電馭判客 CreateCommittedResource1
+    // 原本每次在協調者上等編碼執行緒排空，約 0.3 ms）。
+    std::shared_ptr<GraphicsResource> graphics_buffer_alias(std::shared_ptr<void> owner,std::span<std::uint8_t> bytes) override {return inner_->graphics_buffer_alias(std::move(owner),bytes);}
     void graphics_submission_depth(std::uint32_t depth) override {graphics_sync();inner_->graphics_submission_depth(depth);}
     bool graphics_samples_supported(std::uint32_t format,std::uint32_t samples) override {graphics_sync();return inner_->graphics_samples_supported(format,samples);}
     bool graphics_vertex_format_supported(std::uint32_t format) override {graphics_sync();return inner_->graphics_vertex_format_supported(format);}
@@ -107,7 +123,10 @@ public:
     std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t> desc) override {graphics_sync();return inner_->graphics_sampler(desc);}
     bool graphics_timestamp_supported()const override {return inner_->graphics_timestamp_supported();}
     GraphicsTimestamp graphics_timestamp() override {graphics_sync();return inner_->graphics_timestamp();}
-    std::shared_ptr<const GraphicsTimestampFuture> graphics_timestamp_future() override {graphics_sync();return inner_->graphics_timestamp_future();}
+    // 時間戳查詢（電馭判客每幀數百次）：先回傳未完成的 future，取樣由命令執行緒依序編入，前端不等佇列清空。
+    std::shared_ptr<const GraphicsTimestampFuture> graphics_timestamp_future() override {
+        auto future=std::make_shared<GraphicsTimestampFuture>();post([this,future]{metal_timestamp_relay(*inner_,future);});return future;
+    }
     std::vector<std::uint8_t> graphics_read(const GraphicsView& view) override {graphics_sync();return inner_->graphics_read(view);}
     bool graphics_descriptor(const GraphicsView& view,std::uint32_t type,std::array<std::uint64_t,2>& value,std::shared_ptr<void>& keep) override {graphics_sync();return inner_->graphics_descriptor(view,type,value,keep);}
     // 已完成範圍的 Shared 緩衝不必等命令執行緒排空；其他資源仍同步後讀回。
@@ -115,7 +134,13 @@ public:
         if(metal_completed_readable(view.resource))return inner_->graphics_read_completed(view);
         graphics_sync();return inner_->graphics_read(view);
     }
-    bool graphics_clear_unordered(const GraphicsView& view,std::array<std::uint32_t,4> value,bool floating) override {graphics_sync();return inner_->graphics_clear_unordered(view,value,floating);}
+    // UAV 清除：格式相容性只看資源描述，呼叫端判定後排入（後端以 GPU blit 清除，不等目標閒置）。
+    bool graphics_clear_unordered(const GraphicsView& view,std::array<std::uint32_t,4> value,bool floating) override {
+        std::array<std::uint8_t,16> pattern;unsigned size=0;
+        if(!metal_unordered_clear_pattern(view,value,floating,pattern,size))return false;
+        post([this,view,value,floating]{if(!inner_->graphics_clear_unordered(view,value,floating))throw std::logic_error("UAV 清除資格與編碼端不一致");});
+        return true;
+    }
     void graphics_export_frame(const GraphicsView& view,void* destination,std::size_t size,std::uint32_t pitch,std::shared_ptr<void> owner) override {
         graphics_sync();inner_->graphics_export_frame(view,destination,size,pitch,std::move(owner));
     }
@@ -156,7 +181,8 @@ public:
         // 內層字串以換行結尾；欄位接在同一行，換行放回最後。
         auto text=inner_->statistics();while(!text.empty() && (text.back()=='\n' || text.back()==' '))text.pop_back();
         return text+" metal_command_sync_waits="+std::to_string(sync_waits_.load(std::memory_order_relaxed))+
-            " metal_command_sync_wait_ns="+std::to_string(sync_wait_ns_.load(std::memory_order_relaxed))+"\n";
+            " metal_command_sync_wait_ns="+std::to_string(sync_wait_ns_.load(std::memory_order_relaxed))+
+            " metal_command_busy_ns="+std::to_string(busy_ns_.load(std::memory_order_relaxed))+" metal_command_tasks="+std::to_string(completed_.load(std::memory_order_relaxed))+"\n";
     }
     std::string capture(const std::filesystem::path& path) override {graphics_sync();return inner_->capture(path);}
     GraphicsView graphics_drawable(bool depth) override {graphics_sync();return inner_->graphics_drawable(depth);}
@@ -208,21 +234,33 @@ private:
                 if(queue_.empty())return;
                 task=std::move(queue_.front());queue_.pop_front();++taken_;
             }
+            // 忙碌時間（執行工作，不含等待佇列）：診斷用，只在提交追蹤或繪製計時開啟時量測。
+            static const bool timing=std::getenv("X64ARM_TRACE_D3D12_SUBMIT") || std::getenv("X64ARM_TRACE_METAL_DRAW_TIME");
+            const auto task_start=timing?clock_gettime_nsec_np(CLOCK_UPTIME_RAW):0;
             try{task();}
-            catch(...){std::lock_guard lock(mutex_);if(!error_)error_=std::current_exception();failed_.store(true,std::memory_order_release);}
+            catch(const std::exception& error){
+                if(on_error_)on_error_(error.what());
+                else{std::lock_guard lock(mutex_);if(!error_)error_=std::current_exception();failed_.store(true,std::memory_order_release);}
+            }
+            catch(...){
+                if(on_error_)on_error_("未知例外");
+                else{std::lock_guard lock(mutex_);if(!error_)error_=std::current_exception();failed_.store(true,std::memory_order_release);}
+            }
             task=nullptr;
+            if(task_start)busy_ns_.fetch_add(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)-task_start,std::memory_order_relaxed);
             completed_.fetch_add(1,std::memory_order_acq_rel);
             {std::lock_guard lock(mutex_);if(waiting_)idle_cv_.notify_all();}
         }
     }
     std::shared_ptr<NativeOpenGlContext> inner_;
+    std::function<void(const std::string&)> on_error_;
     std::mutex mutex_;std::condition_variable cv_,idle_cv_;
     std::deque<std::function<void()>> queue_;
     const bool legacy_idle_spin_=[] {const auto* value=std::getenv("X64ARM_METAL_LEGACY_IDLE_SPIN");return value && std::string_view(value)=="1";}();
     const std::int64_t idle_spin_ns_=[] {const auto* value=std::getenv("X64ARM_METAL_COMMAND_SPIN_US");
         if(!value || !*value)return std::int64_t{20000};const auto us=std::strtoll(value,nullptr,10);return us<0?std::int64_t{0}:std::min<std::int64_t>(us,1000)*1000;}();
     std::uint64_t submitted_{},taken_{};
-    std::atomic<std::uint64_t> completed_{},queued_{},sync_waits_{},sync_wait_ns_{};
+    std::atomic<std::uint64_t> completed_{},queued_{},sync_waits_{},sync_wait_ns_{},busy_ns_{};
     std::atomic<bool> failed_{},stop_requested_{};
     bool stopping_{},sleeping_{},waiting_{};
     std::exception_ptr error_;

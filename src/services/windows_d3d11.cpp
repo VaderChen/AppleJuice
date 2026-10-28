@@ -461,6 +461,9 @@ std::span<const WindowsServiceDescriptor> d3d11_service_descriptors() {
 // worker（共用映射鎖）上 Map／Unmap 只在重用既有持久映射時合格：立即內容上的 WRITE_DISCARD／NO_OVERWRITE 沿用同一
 // 客體區塊，Unmap 上傳後保留區塊，都不配置或釋放 heap（每幀數千次，是平行模式全體靜止的最大來源）。協調者
 //（coordinator=true）持獨占映射鎖，可配置與釋放 heap，Map／Unmap 與寫入持久映射資源的複製都可本地完成。
+bool WindowsServices::d3d11_adapter(std::uint64_t object) const{
+    if(!d3d11_)return false;const auto found=d3d11_->objects.find(object);return found!=d3d11_->objects.end() && found->second.kind==Kind::Adapter;
+}
 bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service,bool coordinator) const try {
     if(!d3d11_ || d3d11_->deferred_releases.size()>=256)return false;
     const auto symbol=service.symbol;
@@ -518,7 +521,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
     const bool desc=!com && (symbol=="BufferGetDesc" || symbol=="Texture1DGetDesc" || symbol=="Texture3DGetDesc" || symbol=="GraphicsGetDesc");
     if(front_path && (com || desc) && d3d11_ &&
        (service.family=="internal-d3d11" || (com && service.family=="internal-d3d10"))){
-        const std::lock_guard graphics_lock(graphics_mutex());
+        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         auto& bridge=*d3d11_;
         if(runtime_.network.external_io && (graphics_local() || bridge.deferred_releases.empty())){
             const WindowsCall arg(state,memory,service);
@@ -543,7 +546,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
 }
 std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     // worker 可直接執行裝置內容方法（見 graphics_worker_service）；所有 D3D11 服務在此串行化。
-    const std::lock_guard graphics_lock(graphics_mutex());
+    // 以登記等待者的方式取鎖：D3D12 提交執行緒看到等待者就在命令之間讓出（DXGI EnumOutputs／GetDesc 原本在全停中等整段重播）。
+    std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
     if(!runtime_.network.external_io)throw HostCallFault("原生硬體裝置不能在 compare 模式建立或使用");
     if(!d3d11_)d3d11_=std::make_shared<D3D11State>();
     auto& bridge=*d3d11_;

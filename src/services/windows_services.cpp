@@ -650,8 +650,11 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             static const bool srw_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_SRW");return !value || std::string_view(value)!="0";}();
             // 臨界區段家族同樣可獨立對照（X64ARM_GUEST_CS=0 回到原服務）。
             static const bool critical_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_CS");return !value || std::string_view(value)!="0";}();
+            // SList 家族（LOCK CMPXCHG16B）：常駐 AOT 在平行模式尚未原生化 128 位元 CAS，會不支援退出並全停單步，
+            // 比協調者本地服務（獨占映射鎖下序列化）更慢（電馭判客 Benchmark 16.1→14.2 fps）。原生化前預設關閉，X64ARM_GUEST_SLIST=1 才導向常式。
+            static const bool slist_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_SLIST");return value && std::string_view(value)=="1";}();
             const auto& routines=x86_?win32_routines:win64_routines;
-            if(const auto found=routines.find(symbol);found!=routines.end() &&
+            if(const auto found=routines.find(symbol);found!=routines.end() && (slist_routines || symbol.find("SList")==symbol.npos) &&
                (srw_routines || symbol.find("SRWLock")==symbol.npos) && (critical_routines || symbol.find("CriticalSection")==symbol.npos) &&
                (fls_mirror_ || !symbol.starts_with("FlsGetValue")))
                 return GuestAddress{guest_thread_routines_.value+found->second};
@@ -1387,6 +1390,17 @@ bool d3d12_local_service(std::string_view symbol) noexcept {
     static const bool local_query=[] {const auto* value=std::getenv("X64ARM_LOCAL_D3D12_QUERY");return !value || std::string_view(value)!="0";}();
     if(local_query && (symbol=="Resource.QueryInterface" || symbol=="Resource.GetDevice" || symbol=="Resource.GetHeapProperties" ||
        symbol=="Swap.GetCurrentBackBufferIndex" || symbol=="Swap.GetFullscreenState" || symbol=="Queue.GetDesc"))return true;
+    // 資源建立與資源的最後一次 Release：改動橋接層表格、配置／釋放客體 heap 並映射／撤除零複製頁，在持獨占映射鎖與圖形鎖的
+    // 協調者本地完成（映射變更沿用本地 VirtualAlloc 的服務後 MMU 更新），不必全停。電馭判客 Benchmark 每次全停 0.4～0.7 ms，
+    // 約占三成全停損失。X64ARM_LOCAL_D3D12_RESOURCE=0 交回全停路徑。
+    static const bool local_resource=[] {const auto* value=std::getenv("X64ARM_LOCAL_D3D12_RESOURCE");return !value || std::string_view(value)!="0";}();
+    if(local_resource && (symbol=="Device.CreatePlacedResource" || symbol.starts_with("Device.CreateCommittedResource") || symbol=="Resource.Release"))return true;
+    // PSO 建立與管線庫載入（找到名稱時依描述重建 PSO）：翻譯／編譯著色器、建立 Metal 管線、改動橋接層表格與 COM 物件，
+    // 不阻塞、不啟動客體回呼，與資源建立相同在持獨占映射鎖與圖形鎖的協調者本地完成，其他 worker 不停。電馭判客
+    // Benchmark 每次約 2.3 ms 全停（約 7 次／秒，也是長幀來源）。X64ARM_LOCAL_D3D12_PIPELINE=0 交回全停路徑。
+    static const bool local_pipeline=[] {const auto* value=std::getenv("X64ARM_LOCAL_D3D12_PIPELINE");return !value || std::string_view(value)!="0";}();
+    if(local_pipeline && (symbol=="Device.CreateGraphicsPipelineState" || symbol=="Device.CreateComputePipelineState" || symbol=="Device.CreatePipelineState" ||
+       symbol=="PipelineLibrary.LoadGraphicsPipeline" || symbol=="PipelineLibrary.LoadComputePipeline" || symbol=="PipelineLibrary.LoadPipeline"))return true;
     if(symbol.ends_with(".QueryInterface") || symbol.ends_with(".AddRef") || symbol.ends_with(".Release"))return false;
     if(symbol.ends_with(".SetName") || symbol.ends_with(".GetPrivateData"))return true;
     if(symbol.find("PrivateData")!=std::string_view::npos)return false;
@@ -1402,6 +1416,10 @@ bool d3d12_local_service(std::string_view symbol) noexcept {
     // X64ARM_LOCAL_D3D12_SIGNAL=0 關閉。
     static const bool local_signal=[] {const auto* value=std::getenv("X64ARM_LOCAL_D3D12_SIGNAL");return !value || std::string_view(value)!="0";}();
     if(symbol=="Queue.Signal" || symbol=="Fence.Signal" || symbol=="Fence.SetEventOnCompletion")return local_signal;
+    // Present：有提交執行緒時只排入呈現工作（在途超過 3 幀才等），不必全停；同步模式在圖形鎖下直接呈現。
+    // 只讀寫交換鏈與 GUI 視窗表（協調者狀態），不啟動回呼。X64ARM_LOCAL_D3D12_PRESENT=0 交回全停路徑。
+    static const bool local_present=[] {const auto* value=std::getenv("X64ARM_LOCAL_D3D12_PRESENT");return !value || std::string_view(value)!="0";}();
+    if(symbol=="Swap.Present" || symbol=="Swap.Present1")return local_present;
     return std::find(std::begin(names),std::end(names),symbol)!=std::end(names);
 }
 // 可在 worker 上直接執行的 D3D12 方法：協調者本地集合中只讀寫橋接層表格、參數指向的客體資料（只讀）及暫存器回傳值者。
@@ -1415,7 +1433,8 @@ bool d3d12_worker_symbol(std::string_view symbol) noexcept {
     static constexpr std::string_view names[]{
         "Device.CopyDescriptors","Device.CopyDescriptorsSimple","Device.CreateConstantBufferView","Device.CreateShaderResourceView",
         "Device.CreateUnorderedAccessView","Device.CreateRenderTargetView","Device.CreateDepthStencilView","Device.CreateSampler",
-        "Device.GetDescriptorHandleIncrementSize","Resource.GetGPUVirtualAddress","Allocator.Reset","Queue.Wait"};
+        "Device.GetDescriptorHandleIncrementSize","Resource.GetGPUVirtualAddress","Allocator.Reset","Queue.Wait","Queue.ExecuteCommandLists",
+        "DescriptorHeap.GetCPUDescriptorHandleForHeapStart","DescriptorHeap.GetGPUDescriptorHandleForHeapStart","Device.GetResourceAllocationInfo","Fence.GetCompletedValue"};
     return std::find(std::begin(names),std::end(names),symbol)!=std::end(names);
 }
 bool local_heap_service(std::string_view symbol) noexcept {
@@ -1559,7 +1578,7 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         // 鎖順序與 worker 服務相同：映射 → D3D11。反過來會與持映射共用鎖、等待 D3D11 鎖的 worker 互鎖
         // （DQ3 強制平行讀檔時整個程序停住）。COW 等映射變動期間不得有 worker 服務查表（見 parallel_mapping_mutex）。
         const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
-        const std::lock_guard graphics_lock(graphics_mutex());
+        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         // 協調者本地完成非持久 Map／Unmap 與寫入持久映射資源的複製（配置／釋放 heap）：2026-10-24 DQ3 在預設與強制平行模式
         // 進遊戲後都出現 UE4 存取客體堆積位址的崩潰，關閉即正常；原因未查明前預設關閉，X64ARM_LOCAL_GRAPHICS_MAP=1 才開啟。
         static const bool coordinator_maps=[] {const auto* value=std::getenv("X64ARM_LOCAL_GRAPHICS_MAP");return value && std::string_view(value)=="1";}();
@@ -1590,7 +1609,17 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     static const bool local_d3d12=[] {const auto* value=std::getenv("X64ARM_LOCAL_D3D12");return !value || std::string_view(value)!="0";}();
     if(local_d3d12 && !x86_ && descriptor.family=="internal-d3d12" && d3d12_local_service(descriptor.symbol)){
         const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
-        const std::lock_guard graphics_lock(graphics_mutex());
+        // 有 D3D12 提交執行緒時，本地方法除了用到 Metal 後端者（CreateSampler、CheckFeatureSupport）都不取圖形鎖：
+        // 此處持獨占映射鎖已排除所有 worker 服務；唯一並行的提交執行緒只讀表格（延遲建立的 gpu／gpu_writes 在資源分段鎖內），
+        // 不碰私有資料、fence、參照計數、交換鏈索引與等待物件。持鎖重播一次數毫秒，協調者在此等待會讓其他 worker 一起停
+        //（電馭判客 Benchmark 的 Queue.GetPrivateData 與 Fence.Signal 每次 0.5～0.9 ms）。
+        // 資源與 PSO 建立、Release 改動表格結構（PSO 另用 Metal 後端），仍與提交執行緒的重播串行（取圖形鎖）。
+        const auto& symbol=descriptor.symbol;
+        const bool table_change=symbol=="Device.CreatePlacedResource" || symbol.starts_with("Device.CreateCommittedResource") || symbol.ends_with(".Release") ||
+            symbol.ends_with("PipelineState") || symbol.starts_with("PipelineLibrary.Load");
+        const bool unlocked=d3d12_submitter_ && !table_change && symbol!="Device.CreateSampler" && symbol!="Device.CheckFeatureSupport";
+        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!unlocked)lock_graphics(graphics_lock);
+        struct Unlocked {bool previous;~Unlocked(){d3d12_unlocked_call()=previous;}} unlocked_scope{std::exchange(d3d12_unlocked_call(),unlocked)};
         const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
         if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
         const bool signal=descriptor.symbol=="Queue.Signal" || descriptor.symbol=="Fence.Signal" || descriptor.symbol=="Fence.SetEventOnCompletion";

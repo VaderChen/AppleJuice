@@ -905,6 +905,30 @@ bool WindowsServices::concurrent_guest_threads() const noexcept {
     }
     return value;
 }
+namespace {
+// slot 停駐範圍：0 關閉、1 全部可停駐的等待、2 只停駐 Sleep（X64ARM_RESIDENT_PARK_SLOT=sleep）、3 Sleep 與物件等待（預設，=objects 同義）。
+// Sleep 只有到期時間、沒有喚醒物件：協調者的期限本來就涵蓋等待中執行緒的到期時間，到期解析後原地續跑，
+// 不涉及只在完整排程輪詢的外部完成（檔案 I/O、GPU fence 事件等）。2026-10-28 電馭判客 720p 交錯對照
+// 31.13 → 32.18 fps（+3.4%，1% low 亦較好）：沒有替換者的 Sleep 原本全停（映射一致性），改為只停該 slot。
+int resident_park_mode() noexcept {
+    static const int mode=[] {const auto* value=std::getenv("X64ARM_RESIDENT_PARK_SLOT");
+        if(!value)return 3;const std::string_view text(value);return text=="1"?1:text=="sleep"?2:text=="objects"?3:0;}();
+    return mode;
+}
+// 停駐中的物件等待距上次完整輪詢的上限（100 ns 單位；X64ARM_RESIDENT_PARK_POLL_MS，預設 2 ms）。
+std::uint64_t resident_park_poll_ticks() noexcept {
+    static const std::uint64_t ticks=[] {const auto* value=std::getenv("X64ARM_RESIDENT_PARK_POLL_MS");
+        return std::max<std::uint64_t>(1,value?std::strtoull(value,nullptr,10):2)*10000;}();
+    return ticks;
+}
+// 3（預設）：另停駐物件等待（WaitForSingleObject／WaitForMultipleObjects）；等待由協調者的解析決定結果與所有權（號誌計數、
+// mutex），不需重新執行 API。條件變數、臨界區段與 SRW 等待醒來要重新取得鎖，不停駐。外部完成（檔案 I/O 等）只在完整排程輪詢，
+// 由 resident_runnable_waiting 的保險限制遺失喚醒的延遲。2026-10-28 電馭判客 720p 交錯對照 31.37 → 33.42 fps（+6.5%）。
+bool resident_parkable(ThreadWaitKind kind) noexcept {
+    const auto mode=resident_park_mode();
+    return mode==1 || kind==ThreadWaitKind::Sleep || (mode==3 && kind==ThreadWaitKind::Objects);
+}
+}
 std::vector<GuestState *> WindowsServices::parallel_contexts(GuestState &state) {
     if(AdmissionTrace::enabled())trace_provider_admission(*this,threads_,resident_service_requests_,runtime_.processor_count,
         runtime_.process_priority_class,runtime_.process_background,parallel_cursor_,debugger_stopped(),1);
@@ -995,7 +1019,7 @@ std::vector<GuestState *> WindowsServices::parallel_contexts(GuestState &state) 
             auto &thread = *entry;
             const auto kind = thread.wait.kind;
             if (id == threads_.current || thread.status != ThreadStatus::Waiting || thread.suspended ||
-                thread.context.pending_cpu_trap || thread.wait.alertable ||
+                thread.context.pending_cpu_trap || thread.wait.alertable || !resident_parkable(kind) ||
                 (kind != ThreadWaitKind::Objects && kind != ThreadWaitKind::Critical && kind != ThreadWaitKind::Sleep &&
                  kind != ThreadWaitKind::Slim && kind != ThreadWaitKind::Condition && kind != ThreadWaitKind::Address) ||
                 std::find(result.begin(), result.end(), &thread.context) != result.end())
@@ -1277,7 +1301,7 @@ bool WindowsServices::resident_block_service_impl(GuestState& state,GuestMemory&
     }
     if(wait.alertable && !thread.apcs.empty())return false;
     auto* best=select_replacement();
-    if(!best && !resident_block_parking()){if(outcome)*outcome=1;return false;}
+    if(!best && (!resident_block_parking() || !resident_parkable(wait.kind))){if(outcome)*outcome=1;return false;}
     if(srw_release.pending && memory.atomic_rmw(GuestAddress{srw_release.address},64,GuestMemory::AtomicRmw::CompareExchange,srw_release.next,srw_release.expected)!=srw_release.expected)
         return false; // 字組在核對後被改寫（客體常式並行取得等待位元）：尚未登記等待，交回完整路徑。
     thread.wait=std::move(wait);thread.status=ThreadStatus::Waiting;thread.parallel_slice_deadline=0;
@@ -1372,11 +1396,10 @@ void WindowsServices::park_resident_current(GuestState& state,GuestMemory& memor
     resident_current_parked_=true;
 }
 bool WindowsServices::resident_block_parking() const noexcept {
-    // 單槽換手同樣只在 x64、主機時鐘、無偵錯／追蹤時啟用。2026-10-26 起預設關閉：微量測的分工／匯合在 8～12 vCPU
-    // 快 50～100%，但電馭判客 4 vCPU 啟動大部分時間閒置（標題視窗 25→119 秒），疑有實際遊戲中的遺失喚醒路徑未查明；
-    // X64ARM_RESIDENT_PARK_SLOT=1 明確開啟。
-    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_RESIDENT_PARK_SLOT");return value && std::string_view(value)=="1";}();
-    return enabled && !x86_ && runtime_.host_clock && trace_services_.empty() && !startup_profile::enabled();
+    // 單槽換手同樣只在 x64、主機時鐘、無偵錯／追蹤時啟用。全部等待停駐（=1）2026-10-26 起預設關閉：微量測的分工／匯合在
+    // 8～12 vCPU 快 50～100%，但電馭判客 4 vCPU 啟動大部分時間閒置（標題視窗 25→119 秒）；10-28 重測時遊戲在開窗前以
+    //「條件變數的 SRW lock 尚未持有」中止，停駐後的條件變數／SRW 狀態仍有問題。預設只停駐 Sleep（見 resident_park_mode）。
+    return resident_park_mode() && !x86_ && runtime_.host_clock && trace_services_.empty() && !startup_profile::enabled();
 }
 bool WindowsServices::resident_context_runnable(const GuestState& state) const {
     const auto found=threads_.items.find(resident_context_key(state));
@@ -1428,12 +1451,29 @@ bool WindowsServices::resident_runnable_waiting(std::span<GuestState* const> act
         if(id==threads_.current || thread->status!=ThreadStatus::Runnable || thread->suspended)continue;
         if(std::find(active.begin(),active.end(),&thread->context)==active.end())return true;
     }
+    // 物件等待停駐的保險：檔案 I/O、音訊等外部完成只在完整排程（wake_threads）輪詢；停駐中的物件等待距上次完整輪詢超過
+    // X64ARM_RESIDENT_PARK_POLL_MS（預設 2）時回報需要全體重排，遺失喚醒的延遲因此有上限（協調者在時間片內重排）。
+    const auto mode=resident_park_mode();
+    if(mode==1 || mode==3){
+        const auto now=detail::monotonic_ticks();
+        if(now-resident_full_poll_ticks_>resident_park_poll_ticks())
+            for(const auto& [id,thread]:index.live){
+                (void)id;
+                if(thread->status==ThreadStatus::Waiting && thread->wait.kind==ThreadWaitKind::Objects &&
+                   std::find(active.begin(),active.end(),&thread->context)!=active.end())return true;
+            }
+    }
     return false;
 }
 bool WindowsServices::resident_resolve_waits(GuestMemory& memory) {
     // 與單槽換手相同在獨占映射鎖下推進時鐘並解析等待（逾時、已就緒物件），不輪詢外部裝置、不切換目前客體。
     const std::unique_lock mapping_guard{detail::parallel_mapping_mutex()};
     if(runtime_.host_clock)retired(memory,0);
+    // GPU 完成通知（D3D12／D3D11 fence、讀回）：與 wake_threads 的週期輪詢相同只嘗試取圖形鎖（提交執行緒持鎖重播時略過，
+    // 下次逾時再套用），套用後由下方的等待解析喚醒等 fence 事件的客體，不必全停。原本只在全停後的完整排程套用，
+    // 協調者每 0.25 ms 為輪詢 GPU 醒來就全停一次。X64ARM_RESIDENT_LOCAL_GPU_SIGNALS=0 關閉（對照用）。
+    static const bool local_gpu=[] {const auto* value=std::getenv("X64ARM_RESIDENT_LOCAL_GPU_SIGNALS");return !value || std::string_view(value)!="0";}();
+    if(local_gpu && gpu_signal_wakeup_ns())poll_gpu_signals(memory,true);
     // 與 wake_threads 相同：有執行緒等 GUI 輸入時抽取宿主事件（協調者即宿主主執行緒）。平行批次中 worker 持續運算時
     // 不會經過完整排程，等 GUI 的執行緒只能靠這裡被解析（Steam 強制平行曾因此觸發 stalled cross-thread pipe）。
     if(native_gui_ && std::any_of(threads_.items.begin(),threads_.items.end(),[](const auto& entry){
@@ -1576,6 +1616,17 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
         }
     }
     resident_wait_deadline_=deadline;
+    // 物件等待停駐的保險（見 resident_runnable_waiting）：有停駐中的物件等待時，協調者至少每個保險間隔醒來核對一次。
+    if(const auto mode=resident_park_mode();mode==1 || mode==3){
+        std::unique_lock<std::mutex> lock;const auto& index=resident_thread_index(lock);
+        for(const auto& [id,thread]:index.live){
+            (void)id;
+            if(thread->status==ThreadStatus::Waiting && thread->wait.kind==ThreadWaitKind::Objects &&
+               std::find(contexts.begin(),contexts.end(),&thread->context)!=contexts.end()){
+                const auto poll=resident_park_poll_ticks()*100;wake=wake?std::min(wake,poll):poll;break;
+            }
+        }
+    }
     // 有執行緒等 GUI 輸入時，協調者至少每毫秒解析一次（見 resident_resolve_waits），與單控制器的 GUI 輪詢間隔相同。
     if(native_gui_ && gui_wait)wake=wake?std::min<std::uint64_t>(wake,1000000):1000000;
     if(deadline!=UINT64_MAX){
@@ -1942,6 +1993,7 @@ WindowsServices::CompletionResult WindowsServices::poll_completion(GuestState& s
 }
 void WindowsServices::wake_threads(GuestMemory &memory) {
     startup_profile::Scope measurement("scheduler", "wake_threads");
+    resident_full_poll_ticks_=detail::monotonic_ticks();
     WakePollScope wake_measurement("wake_threads");
     process_io::Scope io_scope(runtime_.io_counters, io_publisher_.get());
     {
@@ -2009,7 +2061,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
     }
     {
         WakePollScope poll_measurement("poll_gpu_signals");
-        poll_gpu_signals(memory);
+        poll_gpu_signals(memory,true); // 週期輪詢：D3D12 提交執行緒持鎖重播時略過，下次再套用。
     }
     {
         WakePollScope poll_measurement("poll_directmusic");
