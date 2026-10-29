@@ -64,6 +64,7 @@ struct FileMappingState;
 struct ThreadpoolState;
 struct HandleTransferState;
 struct ProcessState;
+struct RemoteThreadState;
 struct PerflibState;
 struct PdhState;
 struct TransactionState;
@@ -114,6 +115,7 @@ struct DebugMemoryState;
 namespace debugger {struct TransportEvent;struct Frame;}
 class WindowsServices final : public HostServices {
     friend struct WindowsNetworkTestAccess;
+    friend struct WindowsHeapTestAccess;
     friend PeProgram load_pe(std::span<const std::uint8_t>,PeOptions);
 public:
     WindowsServices();
@@ -218,9 +220,10 @@ public:
     bool uses_guard_fast_path() const noexcept {return guard_fast_code_.value!=0;}
     std::u16string map_executable(const std::filesystem::path& path);
     void configure_image(GuestState& state, GuestMemory& memory, RuntimeImage image);
-    void configure_loader(const std::filesystem::path& source, bool trap_unresolved);
+    void configure_loader(const std::filesystem::path& source, bool trap_unresolved,const std::filesystem::path& directory={});
     GuestAddress bind_image_import(GuestMemory&, const PeImport&, std::uint64_t owner);
     void prepare_image_startup(GuestState&);
+    std::optional<std::uint32_t> wait_for_initial_thread(GuestState&,GuestMemory&);
     void set_standard_input(std::span<const std::uint8_t> bytes);
     void set_live_standard_io(int input = 0, int output = 1, int error = 2);
     void map_serial_port(unsigned,const std::filesystem::path&);
@@ -279,6 +282,7 @@ public:
 #endif
     bool acquire_slim_word(GuestMemory&,std::uint64_t address,std::uint64_t id,bool shared);
     // 臨界區段的共用操作：guest 區段依客體字組協定（見 windows_threads.cpp），宿主內部鎖依 owner／recursion。
+    static bool guest_critical_enabled();
     bool critical_held(GuestMemory&,std::uint64_t address,const CriticalSection&);
     bool critical_owned_by(GuestMemory&,std::uint64_t address,const CriticalSection&,std::uint64_t thread);
     std::uint32_t critical_recursion(GuestMemory&,std::uint64_t address,const CriticalSection&);
@@ -352,7 +356,11 @@ public:
 private:
     std::size_t resident_execution_depth_{};
     // 僅讓主 EXE loader 交接其剛完成驗證並映射的映像；公開 configure_image 仍先驗證。
-    void configure_image_after_unwind_validation(GuestState&,GuestMemory&,RuntimeImage);
+    void configure_image_after_unwind_validation(GuestState&,GuestMemory&,RuntimeImage,bool initial_thread=true);
+    bool awaiting_initial_thread_{};
+    std::optional<std::uint64_t> initial_thread_entry_;
+    void discard_unstarted_thread(GuestMemory&,std::uint64_t,std::uint32_t);
+    std::uint32_t process_image_source(std::uint64_t,ProcessImageSource&);
     NativeLibraries native_libraries_;
     std::shared_ptr<NativeAngle> native_angle_;
     std::optional<std::uint32_t> invoke_angle(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -538,6 +546,8 @@ private:
     mutable MemoryStatusCache memory_status_cache_;
     std::uint32_t process_parent_id() const;
     std::uint32_t capture_process_snapshot(GuestMemory&,std::vector<ProcessSnapshot::Process>&);
+    std::uint32_t capture_thread_snapshot(GuestMemory&,std::vector<ProcessSnapshot::Thread>&);
+    std::vector<ProcessSnapshot::Thread> local_thread_snapshot();
     std::uint32_t local_process_information(std::uint32_t,std::array<std::uint64_t,5>&,std::uint32_t&,int);
     std::uint32_t collect_pss_process_data(GuestMemory&,std::vector<std::uint8_t>&);
     std::uint32_t local_process_api_information(GuestMemory&,std::uint32_t,bool,std::array<std::uint64_t,5>&);
@@ -716,9 +726,18 @@ private:
     std::vector<PendingFileIo> pending_file_io_;
     PipeResult read_directory_notification(const PendingFileIo&,GuestMemory&);
     bool close_process(std::uint64_t);
-    bool create_guest_process(GuestMemory&,const std::array<std::uint64_t,10>&,bool,bool = false,std::uint64_t = 0,unsigned = 0,unsigned = 0,const NativeProcessParameters* = nullptr);
+    bool create_guest_process(GuestMemory&,const std::array<std::uint64_t,10>&,bool,bool = false,std::uint64_t = 0,unsigned = 0,unsigned = 0,const NativeProcessParameters* = nullptr,const ProcessImageSource* = nullptr);
     bool finish_guest_process_creation(GuestState&,GuestMemory&,std::uint64_t);
     void cancel_guest_process_creation(std::uint64_t);
+    std::shared_ptr<RemoteThreadState> remote_threads_;
+    std::uint32_t begin_remote_thread_creation(GuestMemory&,std::uint64_t,std::uint32_t,std::uint64_t,std::uint64_t,std::uint64_t,const GuestThreadBootstrap&,RemoteThreadOutputs);
+    bool finish_remote_thread_creation(GuestState&,GuestMemory&,std::uint64_t);
+    void cancel_remote_thread_creation(std::uint64_t);
+    std::uint32_t receive_remote_thread_creation(GuestMemory&,std::uint32_t,std::uint64_t,std::uint64_t,std::uint32_t,std::uint32_t,const std::array<std::uint64_t,5>&,std::uint32_t,int&);
+    void poll_remote_thread_creations(GuestMemory&);
+    bool remote_thread_creations_waiting()const;
+    std::uint32_t remote_thread_process_identity(std::uint64_t,std::uint32_t,std::uint32_t&,std::uint64_t&);
+    std::uint64_t import_created_thread(std::uint32_t,std::uint64_t,std::uint32_t,std::uint32_t,std::uint32_t,bool);
     std::uint32_t query_association(std::uint32_t,std::uint32_t,std::u16string,const std::u16string&,std::u16string&);
     std::optional<std::uint32_t> invoke_shell_execute(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_shell_item(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -751,6 +770,8 @@ private:
     std::uint64_t module_export(GuestMemory&, std::uint64_t module, std::string_view symbol, std::optional<std::uint16_t> ordinal, std::vector<std::uint64_t>& created, unsigned depth = 0, GuestState* = nullptr);
     FileSnapshot read_module_file(GuestState*,GuestMemory&,const std::u16string&);
     std::uint32_t call_guest_native_file(GuestState&,GuestMemory&,std::uint64_t,std::vector<std::uint64_t>);
+    std::uint64_t call_guest_nested(GuestState&,GuestMemory&,std::uint64_t,std::vector<std::uint64_t>);
+    void notify_dll(GuestState&,GuestMemory&,const RuntimeImage&,std::uint32_t reason);
     std::pair<std::uint64_t,bool> native_file_entry(GuestMemory&,std::string_view);
     std::optional<std::uint64_t> invoke_native_file_io(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint64_t> invoke_native_file_position(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -758,7 +779,7 @@ private:
     std::optional<std::uint64_t> invoke_native_file_completion(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint64_t> invoke_native_mapping(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     FileInformation query_native_file_attributes(GuestState&,GuestMemory&,const std::u16string&,bool);
-    void unmap_module(GuestMemory&,std::uint64_t module);
+    void unmap_module(GuestMemory&,std::uint64_t module,GuestState* state=nullptr);
     void append_module_detach(ModuleOperation&,std::uint64_t module,bool unmap,std::uint64_t reserved = 0);
     std::optional<std::uint32_t> start_module_operation(GuestState&,GuestMemory&,ModuleOperation);
     std::optional<std::uint32_t> advance_module_operation(GuestState&,GuestMemory&,std::uint64_t id);
@@ -1034,6 +1055,9 @@ private:
     bool wave_input_waiting() const;
     std::optional<std::uint32_t> invoke_wave_input(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::map<std::uint64_t,std::shared_ptr<WinmmMidiOutput>> midi_outputs_;
+    std::uint32_t midi_device_volume_{UINT32_MAX};
+    void poll_midi_output(GuestMemory&);
+    bool midi_output_waiting() const;
     std::map<std::uint64_t,std::shared_ptr<WinmmMidiInput>> midi_inputs_;
     void poll_midi_input(GuestMemory&);
     bool midi_input_waiting() const;
@@ -1440,6 +1464,7 @@ private:
     std::optional<std::uint32_t> invoke_mapping(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool flush_file_view(std::uint64_t,std::uint64_t);
     bool close_mapping(std::uint64_t);
+    std::uint64_t map_shared_table(GuestMemory&,std::u16string_view family,std::u16string_view generation,std::span<const std::uint8_t> bytes,bool writable,const std::function<void()>& publish={},std::u16string_view previous_generation={});
     std::uint64_t map_file_view(GuestMemory&,std::uint64_t handle,std::uint32_t access,std::uint64_t offset,std::uint64_t size,std::uint64_t address=0,bool dib=false,bool copy_override=false,bool replace_placeholder=false,const VirtualAddressRequirements* requirements=nullptr);
     std::uint64_t map_dib_section(GuestMemory&,std::uint64_t handle,std::uint32_t offset,std::uint64_t size,std::uint64_t& view);
     bool unmap_file_view(GuestMemory&,std::uint64_t address,bool dib=false,std::uint32_t flags=0);
@@ -1903,9 +1928,14 @@ private:
         return redirected==runtime_.crt_redirects.end()?pointer:redirected->second;
     }
     void initialize_runtime(GuestMemory& memory, std::u16string_view command_line);
+    void configure_runtime_arguments(GuestMemory&,std::u16string_view,std::uint64_t);
+    void configure_initial_environment(GuestMemory&,const GuestState&,std::span<const std::uint8_t>);
+    void configure_native_startup(GuestMemory&,const NativeProcessParameters&,std::uint64_t);
+    std::uint32_t adopt_initial_process_parameters(GuestState&,GuestMemory&);
     std::uint64_t runtime_allocate(GuestMemory& memory, std::span<const std::uint8_t> bytes, std::size_t size = 0, std::size_t alignment = 16);
     std::uint64_t allocate_heap(GuestMemory& memory, std::uint64_t size, std::uint64_t heap = process_heap);
-    bool validate_heap(const GuestMemory& memory,std::uint64_t heap,std::uint64_t pointer=0) const;
+    bool validate_heap(GuestMemory& memory,std::uint64_t heap,std::uint64_t pointer=0) const;
+    bool validate_guest_heap(GuestMemory& memory,std::uint64_t heap,std::uint64_t pointer=0) const;
     std::uint64_t reallocate_heap(GuestMemory& memory, std::uint64_t address, std::uint64_t size, const GuestState& state);
     bool free_heap(GuestMemory& memory, std::uint64_t address, const GuestState& state);
     // 把宿主持有的記憶體（圖形 API 的映射緩衝等）映入客體位址空間：依配置粒度搜尋不衝突的位址，以 StableShared
@@ -1922,6 +1952,8 @@ private:
     std::uint64_t guest_heap_reserve_chunk(GuestMemory& memory);
     std::uint64_t guest_heap_allocate(GuestMemory& memory, std::uint64_t size, std::uint64_t heap = process_heap);
     void guest_heap_free(GuestMemory& memory, std::uint64_t address);
+    void guest_heap_defer_free(GuestMemory& memory,std::uint64_t address,std::uint64_t cls);
+    void guest_heap_publish_deferred(GuestMemory& memory);
     std::uint64_t guest_heap_block_size(GuestMemory& memory, std::uint64_t address);
     // chunk 標頭 +24 的擁有者；0（x64 常式與 process heap）回傳 process_heap。
     std::uint64_t guest_heap_owner(GuestMemory& memory, std::uint64_t address);
@@ -2123,6 +2155,10 @@ private:
     void sync_crt_thread_state(GuestMemory&, std::uint64_t id);
     void sync_crt_thread_states(GuestMemory&);
     GuestAddress guest_heap_state_{};std::uint64_t guest_heap_base_{},guest_heap_size_{},guest_heap_next_{};
+    // 協調者專用的待發布空閒串列；客體持鎖且已停駐時不能在宿主等待它解鎖。
+    // 每級距保留首尾，下一次成功取得客體鎖便接回全域串列；節點仍存於已釋放區塊內。
+    std::vector<std::pair<std::uint64_t,std::uint64_t>> guest_heap_deferred_;
+    bool guest_heap_deferred_pending_{};
     bool guest_heap_chunked_{};std::array<std::uint64_t,256> guest_heap_chunk_bits_{};
     // x86 可成長私有 heap 的級距串列頭；協調者在一致邊界擴充，worker 以客體狀態鎖同步。
     // heads 為空表示尚未啟用 chunk，requests 累計一般路徑配置次數。

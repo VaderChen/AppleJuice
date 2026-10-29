@@ -31,7 +31,7 @@ if(service.family=="ntdll.dll") {
             const auto process_type=object_type(process);
             if(process_type!=u"Process")return finish(process_type.empty()?0xc0000008U:0xc0000024U);
             if(!process_handle_pid(process,2))return finish(0xc0000022U);
-            if(!current_process_handle(process))return finish(0xc00000bbU);
+            const bool remote=!current_process_handle(process);
             const auto probe=[&](std::uint64_t address,std::uint64_t size){memory.check(GuestAddress{address},static_cast<std::size_t>(size),Access::Write);};
             if(!output && !rtl)return finish(0xc0000005U);
             if((output && output%unit) || (client && client%unit))return finish(0x80000002U);
@@ -55,7 +55,7 @@ if(service.family=="ntdll.dll") {
             }
             bootstrap.security_descriptor=descriptor?object_security_descriptor(security::read_descriptor(memory,descriptor,x86_,true),true,true):synchronization_descriptor(memory,0).bytes;
             std::uint64_t entry=0,parameter=0,requested=0;
-            bool suspended=false;
+            bool suspended=false,default_stack=false;
             struct OutputAttribute {std::uint64_t kind,address,length;};
             std::vector<OutputAttribute> attributes;
             if(legacy) {
@@ -68,14 +68,17 @@ if(service.family=="ntdll.dll") {
                 if(error || !(flags&1U))return finish(error==50?0xc00000bbU:0xc000000dU);
                 std::vector<std::uint8_t> bytes(thread_context::size(mode));memory.read(GuestAddress{context},bytes);
                 GuestState initial_state;initial_state.segments=state.segments;
-                try{bootstrap.context=thread_context::restore(initial_state,mode,bytes);}catch(const HostCallFault&){return finish(0xc00000bbU);}
+                try{bootstrap.context=thread_context::restore(initial_state,mode,bytes);}catch(const HostCallFault& error){
+                    if(std::getenv("X64ARM_TRACE_THREAD_CREATION"))std::fprintf(stderr,"native_thread_create_context pid=%u detail=%s\n",process_id(),error.what());
+                    return finish(0xc00000bbU);
+                }
                 const auto pointer=[&](unsigned index){return memory.load(GuestAddress{initial+index*unit},bits);};
                 if(pointer(0) || pointer(1))return finish(0xc00000bbU);
                 bootstrap.stack_high=pointer(2);bootstrap.stack_low=pointer(3);bootstrap.stack_allocation=pointer(4);
                 const auto sp=bootstrap.context->reg(Gpr::Rsp);
                 if(!bootstrap.stack_allocation || bootstrap.stack_allocation>bootstrap.stack_low || bootstrap.stack_low>=bootstrap.stack_high ||
                    sp<bootstrap.stack_low || sp>=bootstrap.stack_high || bootstrap.stack_high>user_address_limit())return finish(0xc000000dU);
-                memory.check(GuestAddress{sp},unit,Access::Write);
+                if(!remote)memory.check(GuestAddress{sp},unit,Access::Write);
                 entry=bootstrap.context->rip.value;suspended=static_cast<std::uint8_t>(arg(7))!=0;
             } else {
                 entry=arg(rtl?6:4);parameter=arg(rtl?7:5);
@@ -89,6 +92,7 @@ if(service.family=="ntdll.dll") {
                 if(reserve && commit>reserve)return finish(0xc000000dU);
                 // 沿用共用堆疊的預先提交政策；保留容量至少涵蓋明確 commit 與 image 預設。
                 requested=reserve?reserve:std::max(commit,runtime_.image.stack_size);
+                if(remote && !reserve){requested=commit;default_stack=true;}
                 if(!rtl && arg(10)) {
                     const auto list=arg(10);if(list%unit)return finish(0x80000002U);
                     const auto size=memory.load(GuestAddress{list},bits);
@@ -104,6 +108,14 @@ if(service.family=="ntdll.dll") {
                         attributes.push_back({kind,buffer,returned});
                     }
                 }
+            }
+            if(remote){
+                RemoteThreadOutputs outputs;outputs.native=true;outputs.arguments=service.arguments;
+                outputs.handle=output;outputs.client=client;outputs.suspended=suspended;outputs.default_stack=default_stack;
+                for(const auto& attribute:attributes)outputs.attributes.push_back({attribute.kind,attribute.address,attribute.length});
+                const auto error=begin_remote_thread_creation(memory,process,2,entry,parameter,requested,bootstrap,std::move(outputs));
+                if(error)return finish(error==5?0xc0000022U:error==6?0xc0000008U:error==8?0xc0000017U:error==50?0xc00000bbU:0xc000000dU);
+                schedule(state,memory);return std::nullopt;
             }
             // 先暫停建立；所有輸出與安全參數已探測，完成發布後才允許排程。
             const auto handle=create_guest_thread(state,memory,entry,parameter,requested,4,&bootstrap);

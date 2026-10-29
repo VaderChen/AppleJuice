@@ -7,6 +7,31 @@
 
 namespace x64arm::detail {
 struct NativeProcessError {std::uint32_t status;};
+inline void normalize_process_parameter_pointers(GuestMemory& memory,std::uint64_t base,bool x86,bool normalized){
+    const auto layout=ProcessParameterLayout::for_x86(x86);const auto unit=layout.unit;
+    const auto flags=static_cast<std::uint32_t>(memory.load(GuestAddress{base+8},32));
+    if(bool(flags&1U)==normalized)return;
+    const auto length=memory.load(GuestAddress{base+4},32);const auto extended=layout.strings.back()+unit*2;
+    const auto prefix=length>=extended?extended:layout.strings[7]+unit*2;
+    memory.check(GuestAddress{base},prefix,Access::Read);memory.check(GuestAddress{base},prefix,Access::Write);
+    std::vector<std::uint8_t> bytes(prefix);memory.read(GuestAddress{base},bytes);
+    for(const auto offset:layout.strings){
+        if(offset+unit*2>prefix)continue;
+        std::uint64_t pointer=0;for(unsigned i=0;i<unit;++i)pointer|=std::uint64_t{bytes[offset+unit+i]}<<(i*8);
+        if(pointer){pointer=normalized?pointer+base:pointer-base;for(unsigned i=0;i<unit;++i)bytes[offset+unit+i]=static_cast<std::uint8_t>(pointer>>(i*8));}
+    }
+    const auto updated=(flags&~1U)|(normalized?1U:0U);for(unsigned i=0;i<4;++i)bytes[8+i]=static_cast<std::uint8_t>(updated>>(i*8));
+    memory.write(GuestAddress{base},bytes);
+}
+inline std::vector<std::uint8_t> capture_native_environment(const GuestMemory& memory,std::uint64_t address){
+    if(!address)return {0,0,0,0};
+    std::vector<std::uint8_t> bytes;bool zero=false;
+    for(std::uint64_t offset=0;offset<16*1024*1024;offset+=2){
+        const auto c=memory.load(GuestAddress{address+offset},16);bytes.push_back(static_cast<std::uint8_t>(c));bytes.push_back(static_cast<std::uint8_t>(c>>8));
+        if(!c && (zero || !offset)){if(bytes.size()==2)bytes.resize(4);return bytes;}zero=!c;
+    }
+    throw NativeProcessError{0xc000000dU};
+}
 inline NativeProcessParameters capture_native_process_parameters(const GuestMemory& memory,std::uint64_t address,bool x86){
     NativeProcessParameters result;
     if(!address)return result;
@@ -26,7 +51,7 @@ inline NativeProcessParameters capture_native_process_parameters(const GuestMemo
         const auto size=memory.load(GuestAddress{address+offset},16),capacity=memory.load(GuestAddress{address+offset+2},16);
         auto pointer=memory.load(GuestAddress{address+offset+layout.unit},bits);
         if(size>capacity || size>65533 || (i!=7 && size%2) || (size && !pointer))throw NativeProcessError{0xc000000dU};
-        if(pointer && !(result.flags&1U)){if(pointer>UINT64_MAX-address || (x86 && pointer+address>UINT32_MAX))throw NativeProcessError{0xc000000dU};pointer+=address;}
+        if(pointer && !(result.flags&1U)){pointer+=address;if(x86)pointer&=UINT32_MAX;}
         auto& bytes=result.strings[i];bytes.resize(static_cast<std::size_t>(size));if(size)memory.read(GuestAddress{pointer},bytes);
         if(i!=7)for(std::size_t at=0;at<bytes.size();at+=2)if(!bytes[at] && !bytes[at+1])throw NativeProcessError{0xc000000dU};
     }

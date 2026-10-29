@@ -2,6 +2,7 @@
 #include "x64arm/interpreter.hpp"
 #include "x64arm/windows_unwind.hpp"
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <iostream>
@@ -9,6 +10,117 @@
 
 namespace x64arm {
 namespace {
+void trace_fault_memory(const GuestState& state,const GuestMemory& memory,std::uint64_t pid,std::uint64_t thread) noexcept {
+    if(!std::getenv("X64ARM_TRACE_FAULT_MEMORY"))return;
+    static std::atomic<unsigned> samples{};
+    const auto sample=samples.fetch_add(1,std::memory_order_relaxed);if(sample>=16)return;
+    try{
+        constexpr std::array registers{Gpr::Rax,Gpr::Rcx,Gpr::Rdx,Gpr::Rbx,Gpr::Rsp,Gpr::Rbp,Gpr::Rsi,Gpr::Rdi,
+            Gpr::R8,Gpr::R9,Gpr::R10,Gpr::R11,Gpr::R12,Gpr::R13,Gpr::R14,Gpr::R15};
+        constexpr std::array names{"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15"};
+        std::ostringstream out;out<<"[fault_context] pid="<<pid<<" thread="<<thread<<" sample="<<sample
+            <<" rip=0x"<<std::hex<<state.rip.value<<" rflags=0x"<<state.rflags<<'\n';
+        const bool regions=sample<4 && std::getenv("X64ARM_TRACE_FAULT_REGIONS");
+        const bool pointers=sample<4 && std::getenv("X64ARM_TRACE_FAULT_POINTERS");
+        const bool pages=sample<2 && std::getenv("X64ARM_TRACE_FAULT_PAGES");
+        struct Word {std::uint64_t address,value;};
+        std::array<Word,128> roots{};std::size_t root_count=0;
+        std::array<std::uint64_t,16> recorded_regions{};std::size_t recorded_count=0;
+        for(std::size_t n=0;n<registers.size();++n){
+            const auto value=state.reg(registers[n]);const auto aligned=value&~UINT64_C(7);
+            const auto mapping=memory.query(GuestAddress{value});
+            // 位址恰在映射開頭時，不因前方 16 bytes 不可讀而遺失有效資料。
+            const auto begin=std::max(aligned>=16?aligned-16:0,mapping?mapping->base.value:0);
+            out<<"[fault_memory] "<<names[n]<<"=0x"<<value<<" begin=0x"<<begin;
+            // 每個暫存器最多讀取 64 bytes；逐字核對，以保留映射尾端的有效前綴。
+            for(unsigned i=0;i<8;++i){
+                if(begin>UINT64_MAX-i*8U-7U){out<<" unreadable";break;}
+                try{const auto word=memory.load(GuestAddress{begin+i*8},64);out<<" 0x"<<word;
+                    if(pointers)roots[root_count++]={begin+i*8,word};}
+                catch(const MemoryFault&){out<<" unreadable";break;}
+            }
+            out<<'\n';
+            if(!regions || !mapping)continue;
+            out<<"[fault_mapping] "<<names[n]<<" base=0x"<<mapping->base.value<<" size=0x"<<mapping->size
+                <<" permissions=0x"<<static_cast<unsigned>(mapping->permissions)<<'\n';
+            if(std::find(recorded_regions.begin(),recorded_regions.begin()+recorded_count,mapping->base.value)!=
+               recorded_regions.begin()+recorded_count)continue;
+            recorded_regions[recorded_count++]=mapping->base.value;
+            // 額外開啟才保存每個不同映射的前兩個客體頁；最多 16 個映射、4 次故障。
+            // 只讀共用記憶體介面，不更動客體資料、頁面權限或例外處理結果。
+            const auto bytes=std::min<std::size_t>(mapping->size,8192)&~std::size_t{7};
+            for(std::size_t offset=0;offset<bytes;offset+=64){
+                out<<"[fault_region] begin=0x"<<mapping->base.value+offset;
+                bool readable=true;
+                for(std::size_t i=offset;i<std::min(bytes,offset+64);i+=8){
+                    try{const auto word=memory.load(GuestAddress{mapping->base.value+i},64);out<<" 0x"<<word;}
+                    catch(const MemoryFault&){out<<" unreadable";readable=false;break;}
+                }
+                out<<'\n';if(!readable)break;
+            }
+        }
+        if(pages){
+            // 只在故障時讀取暫存器所在的 16 KiB 視窗及前方 16 bytes，涵蓋頁界前的標頭。
+            // 每次最多 16 個不同視窗、全程序最多兩次；限制在原映射，不改權限或客體資料。
+            std::array<std::uint64_t,16> starts{};std::size_t count=0;
+            for(const auto reg:registers){
+                const auto value=state.reg(reg);const auto mapping=memory.query(GuestAddress{value});
+                if(!mapping)continue;
+                const auto window=value&~UINT64_C(16383);
+                const auto begin=std::max(window>=16?window-16:0,mapping->base.value);
+                const auto end=std::min(window<=UINT64_MAX-16384?window+16384:UINT64_MAX,
+                    mapping->base.value+mapping->size);
+                if(end<=begin || end-begin<8 ||
+                   std::find(starts.begin(),starts.begin()+count,begin)!=starts.begin()+count)continue;
+                starts[count++]=begin;
+                for(auto address=begin;end-address>=8;){
+                    out<<"[fault_page] begin=0x"<<address;
+                    bool readable=true;
+                    for(unsigned i=0;i<8 && end-address>=8;++i,address+=8){
+                        try{const auto word=memory.load(GuestAddress{address},64);out<<" 0x"<<word;}
+                        catch(const MemoryFault&){out<<" unreadable";readable=false;break;}
+                    }
+                    out<<'\n';if(!readable)break;
+                }
+            }
+        }
+        if(pointers){
+            // 故障時才沿暫存器鄰近資料追一層指標，保留中間物件；不遞迴遍歷整個 heap。
+            // 同時觀察完整指標與以 4 GiB 對齊基址表示的壓縮指標。基址須來自實際暫存器且已映射，
+            // 候選目標也須已映射；這只是診斷解讀，不改寫客體指標或加入執行特例。
+            std::array<std::uint64_t,16> bases{};std::size_t base_count=0;
+            for(const auto reg:registers){
+                const auto base=state.reg(reg)&~UINT64_C(0xffffffff);
+                if(!base || !memory.query(GuestAddress{base}) ||
+                   std::find(bases.begin(),bases.begin()+base_count,base)!=bases.begin()+base_count)continue;
+                bases[base_count++]=base;
+            }
+            std::array<std::uint64_t,256> targets{};std::size_t target_count=0;
+            const auto record=[&](std::uint64_t from,std::uint64_t value,std::uint64_t base){
+                if(target_count==targets.size())return;
+                const auto aligned=value&~UINT64_C(7);
+                if(std::find(targets.begin(),targets.begin()+target_count,aligned)!=targets.begin()+target_count)return;
+                const auto mapping=memory.query(GuestAddress{value});if(!mapping)return;
+                targets[target_count++]=aligned;
+                const auto begin=std::max(aligned>=16?aligned-16:0,mapping->base.value);
+                out<<"[fault_pointer] from=0x"<<from<<" value=0x"<<value<<" base=0x"<<base<<" begin=0x"<<begin;
+                for(unsigned i=0;i<8;++i){
+                    if(begin>UINT64_MAX-i*8U-7U){out<<" unreadable";break;}
+                    try{const auto word=memory.load(GuestAddress{begin+i*8},64);out<<" 0x"<<word;}
+                    catch(const MemoryFault&){out<<" unreadable";break;}
+                }
+                out<<'\n';
+            };
+            for(std::size_t i=0;i<root_count;++i)record(roots[i].address,roots[i].value,0);
+            for(std::size_t i=0;i<root_count;++i)for(unsigned half=0;half<2;++half){
+                const auto offset=static_cast<std::uint32_t>(roots[i].value>>(half*32));
+                if(!offset)continue;
+                for(std::size_t j=0;j<base_count;++j)record(roots[i].address+half*4,bases[j]|offset,bases[j]);
+            }
+        }
+        std::cerr<<out.str();
+    }catch(...){/* 診斷失敗不得取代原本的客體例外。 */}
+}
 constexpr std::array jump_registers{Gpr::Rbx, Gpr::Rsp, Gpr::Rbp, Gpr::Rsi, Gpr::Rdi, Gpr::R12, Gpr::R13, Gpr::R14, Gpr::R15};
 GuestState read_jump_buffer(const GuestMemory& memory, std::uint64_t address, const GuestState& state, std::uint32_t value) {
     memory.check(GuestAddress{address}, 256, Access::Read);
@@ -51,6 +163,7 @@ bool WindowsServices::dispatch_cpu_exception(GuestState& state, GuestMemory& mem
     begin_exception(state, memory, code, 0, {}); return true;
 }
 bool WindowsServices::dispatch_fault(GuestState& state, GuestMemory& memory, const MemoryFault& fault) {
+    trace_fault_memory(state,memory,process_id(),threads_.current);
     struct Refresh { WindowsServices& self;GuestMemory& memory;~Refresh(){self.refresh_guard_table(memory);} } refresh{*this,memory};
     prune_x86_exception_callbacks(state,memory);
     if (!runtime_.image.base) return false;

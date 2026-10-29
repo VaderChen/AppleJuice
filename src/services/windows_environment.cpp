@@ -11,7 +11,7 @@
 #include "x64arm/registry_store.hpp"
 #include "appcontainer_identity.hpp"
 #include "x64arm/system_performance.hpp"
-#include "windows_process_parameter_layout.hpp"
+#include "windows_native_process_parameters.hpp"
 #include <algorithm>
 #include <bit>
 #include <functional>
@@ -151,6 +151,12 @@ void WindowsServices::import_guest_environment(GuestMemory& memory,const GuestSt
     struct stat info{};if(::fstat(descriptor,&info) || !S_ISREG(info.st_mode) || info.st_size<4 || info.st_size>static_cast<off_t>(output_limit))throw HostCallFault("子程序環境資料無效");
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(info.st_size));std::size_t offset=0;
     while(offset<bytes.size()){const auto count=::pread(descriptor,bytes.data()+offset,bytes.size()-offset,static_cast<off_t>(offset));if(count<0 && errno==EINTR)continue;if(count<=0)throw HostCallFault("子程序環境資料截斷");offset+=static_cast<std::size_t>(count);}
+    configure_initial_environment(memory,state,bytes);
+#else
+    (void)memory;(void)state;(void)descriptor;throw HostCallFault("此平台未支援子程序環境");
+#endif
+}
+void WindowsServices::configure_initial_environment(GuestMemory& memory,const GuestState& state,std::span<const std::uint8_t> bytes){
     const auto environment=decode_guest_environment(bytes,true);if(!environment)throw HostCallFault("子程序環境格式無效");runtime_.environment=*environment;runtime_.crt_environment=*environment;rebuild_crt_environment(memory,state);
     // 匯入發生在子程序啟動前；以啟動資料取代建構時的預設快照，之後 _putenv 不再改動初始環境。
     const auto previous_initial=runtime_.initial_environ;
@@ -159,9 +165,6 @@ void WindowsServices::import_guest_environment(GuestMemory& memory,const GuestSt
     memory.store(GuestAddress{runtime_base_.value+112},x86_?32:64,runtime_.initial_environ);
     memory.store(GuestAddress{runtime_base_.value+120},x86_?32:64,runtime_.initial_wenviron);
     if(previous_initial && previous_initial!=runtime_.initial_environ)(void)free_heap(memory,previous_initial,state);
-#else
-    (void)memory;(void)state;(void)descriptor;throw HostCallFault("此平台未支援子程序環境");
-#endif
 }
 void WindowsServices::rebuild_crt_environment(GuestMemory& memory,const GuestState& state) {
     const auto& environment=runtime_.crt_environment;const unsigned unit=x86_?4:8;const auto pointers=(environment.size()+1)*unit;

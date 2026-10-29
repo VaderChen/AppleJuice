@@ -15,6 +15,13 @@ struct InheritedHandle {
     int descriptor{-1};
     std::shared_ptr<void> lifetime;
 };
+struct ProcessImageSource {
+    int descriptor{-1};
+    std::uint64_t offset{},size{};
+    std::uint16_t machine{},subsystem{};
+    std::u16string path;
+    std::shared_ptr<void> lifetime;
+};
 struct ProcessOptions {
     std::filesystem::path engine, filesystem_root, c_drive, install_root, registry_file;
     std::map<char,std::filesystem::path> drive_mappings{};

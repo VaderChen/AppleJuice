@@ -22,12 +22,12 @@ class Synth final:public Output {
         if(status==noErr && !self.playback_->failed){
             if(data->mNumberBuffers==2 && self.playback_->mono){auto* left=static_cast<float*>(data->mBuffers[0].mData);auto* right=static_cast<float*>(data->mBuffers[1].mData);if(left && right)for(UInt32 n=0;n<frames;++n)left[n]=right[n]=(left[n]+right[n])*0.5F;}
             const auto& p=*self.playback_;
-            for(UInt32 i=0;i<data->mNumberBuffers;++i){auto& b=data->mBuffers[i];if(!b.mData)continue;auto* samples=static_cast<float*>(b.mData);const auto count=std::min<std::size_t>(b.mDataByteSize/sizeof(float),static_cast<std::size_t>(frames)*b.mNumberChannels);for(std::size_t n=0;n<count;++n){const auto factor=p.gain_remaining?p.gain+(p.gain_target-p.gain)*static_cast<float>(std::min<std::uint64_t>(n/b.mNumberChannels+1,p.gain_remaining))/static_cast<float>(p.gain_remaining):p.gain;samples[n]*=p.active?factor:0.0F;}}
+            for(UInt32 i=0;i<data->mNumberBuffers;++i){auto& b=data->mBuffers[i];if(!b.mData)continue;auto* samples=static_cast<float*>(b.mData);const auto count=std::min<std::size_t>(b.mDataByteSize/sizeof(float),static_cast<std::size_t>(frames)*b.mNumberChannels);for(std::size_t n=0;n<count;++n){const auto factor=p.gain_remaining?p.gain+(p.gain_target-p.gain)*static_cast<float>(std::min<std::uint64_t>(n/b.mNumberChannels+1,p.gain_remaining))/static_cast<float>(p.gain_remaining):p.gain;const auto channel=data->mNumberBuffers==1?n%2:i%2;samples[n]*=p.active?factor*(channel?p.right_gain:p.left_gain):0.0F;}}
             if(self.playback_->gain_remaining){const auto step=std::min<std::uint64_t>(frames,self.playback_->gain_remaining);self.playback_->gain+=(self.playback_->gain_target-self.playback_->gain)*static_cast<float>(step)/static_cast<float>(self.playback_->gain_remaining);self.playback_->gain_remaining-=step;}
             self.playback_->rendered_frames+=frames;
             for(UInt32 i=0;i<data->mNumberBuffers;++i){const auto& buffer=data->mBuffers[i];if(!buffer.mData)continue;
                 const auto* samples=static_cast<const float*>(buffer.mData);const auto count=std::min<std::size_t>(buffer.mDataByteSize/sizeof(float),static_cast<std::size_t>(frames)*buffer.mNumberChannels);
-                for(std::size_t n=0;n<count;++n)self.playback_->rendered_peak=std::max(self.playback_->rendered_peak,std::abs(samples[n]));}
+                for(std::size_t n=0;n<count;++n){const auto peak=std::abs(samples[n]);self.playback_->rendered_peak=std::max(self.playback_->rendered_peak,peak);const auto channel=data->mNumberBuffers==1?n%2:i%2;self.playback_->rendered_channel_peak[channel]=std::max(self.playback_->rendered_channel_peak[channel],peak);}}
         }
         return noErr;
     }

@@ -126,13 +126,12 @@ struct Mapping {
     std::shared_ptr<void> file_lifetime;
     std::string name;
     std::u16string path;
-    std::vector<std::uint8_t> security_descriptor;
     int descriptor{-1},file_descriptor{-1};
     std::unique_ptr<mapping_detail::Broker> broker;
     std::shared_ptr<MappingWindow> window;
     std::uint64_t size{};
     std::uint32_t protection{};
-    bool named{}, counted{};
+    bool named{}, counted{}, persistent{};
     std::weak_ptr<MemoryBacking> backing;
     std::optional<PeSectionImage> image;
     ~Mapping() {
@@ -149,7 +148,7 @@ struct Mapping {
                 }
                 if (counted && ::pread(descriptor, &header, sizeof(header), 0) == sizeof(header) && header.signature == magic && header.references) {
                     --header.references;
-                    if (header.references) (void)::pwrite(descriptor, &header, sizeof(header), 0);
+                    if (header.references || persistent) (void)::pwrite(descriptor, &header, sizeof(header), 0);
                     else (void)::unlinkat(name_space->directory, name.c_str(), 0);
                 }
             } catch (...) { /* 解構不拋例外；程序異常結束的檔案留待 session 清理。 */ }
@@ -192,13 +191,14 @@ std::uint32_t attach_mapping_file(Mapping& object,mapping_detail::FileRecord& re
 }
 struct MappingFileInput {int descriptor;std::u16string path;std::shared_ptr<void> lifetime;};
 struct Opened { std::shared_ptr<Mapping> mapping; std::uint32_t error{}; bool existed{}; };
-Opened open_mapping(const std::shared_ptr<Session>& ns, std::u16string_view name, std::uint64_t size, std::uint32_t protection, bool create,const std::vector<std::uint8_t>& security,const MappingFileInput* file=nullptr,std::size_t image_limit=GuestMemory::capacity_limit) {
+Opened open_mapping(const std::shared_ptr<Session>& ns, std::u16string_view name, std::uint64_t size, std::uint32_t protection, bool create,const std::vector<std::uint8_t>& security,const MappingFileInput* file=nullptr,std::size_t image_limit=GuestMemory::capacity_limit,std::span<const std::uint8_t> initial={},bool internal=false) {
     if (name.size() >= 260 || name.find(u'\\', name.starts_with(u"Local\\") ? 6 : name.starts_with(u"Global\\") ? 7 : 0) != std::u16string_view::npos)
         return {{}, 123};
     auto result = std::make_shared<Mapping>(); result->name_space = ns; result->named = !name.empty();
     // 全命名空間鎖同時涵蓋 open / reference / unlink，避免 last-close 與再 open 競態。
     DirectoryLock lock(ns->directory);
     result->name = result->named ? object_name(name) : "anonymous-" + std::to_string(::getpid()) + "-" + std::to_string(reinterpret_cast<std::uintptr_t>(result.get()));
+    if(internal){result->name="table-"+result->name;result->persistent=true;} // 與客體可開啟的命名 section 分離。
     bool created = false;
     if (create) {
         result->descriptor = ::openat(ns->directory, result->name.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -213,6 +213,7 @@ Opened open_mapping(const std::shared_ptr<Session>& ns, std::u16string_view name
     } pending{ns->directory,result->name,created};
     Header header{};
     if (created) {
+        std::shared_ptr<MappingWindow> image_source;
         if(protection&0x1000000U) {
             const auto fail_image=[&](std::uint32_t error)->Opened{(void)::unlinkat(ns->directory,result->name.c_str(),0);return {{},error};};
             if(!file)return fail_image(87);
@@ -224,6 +225,7 @@ Opened open_mapping(const std::shared_ptr<Session>& ns, std::u16string_view name
             if(protection&0x10000000U)for(auto& range:result->image->ranges)range.permissions&=~permission(Access::Execute);
             if(std::any_of(result->image->ranges.begin(),result->image->ranges.end(),[](const auto& r){return r.shared && (r.permissions&6U)==6U;}))return fail_image(50);
             size=result->image->image_size;
+            image_source=std::move(raw);
         }
         if (!size || size > GuestMemory::maximum_capacity) { (void)::unlinkat(ns->directory,result->name.c_str(),0);return {{},87}; }
         header.size = (size + 4095) & ~UINT64_C(4095); header.protection = protection; header.characters = static_cast<std::uint32_t>(name.size());
@@ -232,7 +234,9 @@ Opened open_mapping(const std::shared_ptr<Session>& ns, std::u16string_view name
             const auto error = os_error(); (void)::unlinkat(ns->directory,result->name.c_str(),0);return {{},error};
         }
         try{set_shared_object_security(result->descriptor,security);}catch(...){(void)::unlinkat(ns->directory,result->name.c_str(),0);throw;}
-        if(result->image && !write_image_section(result->descriptor,*result->image)){const auto error=os_error();(void)::unlinkat(ns->directory,result->name.c_str(),0);return {{},error};}
+        if(result->image && !write_image_section(result->descriptor,*result->image,
+            {static_cast<const std::uint8_t*>(image_source->data),static_cast<std::size_t>(image_source->size)})){
+            const auto error=os_error();(void)::unlinkat(ns->directory,result->name.c_str(),0);return {{},error};}
     } else {
         struct stat info{};
         if (::fstat(result->descriptor,&info) || !S_ISREG(info.st_mode) || info.st_uid != ::geteuid() || (info.st_mode & 077) ||
@@ -259,6 +263,10 @@ Opened open_mapping(const std::shared_ptr<Session>& ns, std::u16string_view name
         file_backed?result->file_descriptor:result->descriptor,file_backed?0:data_offset);
     if (result->window->data == MAP_FAILED) {
         const auto error = os_error();if(created)(void)::unlinkat(ns->directory,result->name.c_str(),0);return {{},error};
+    }
+    if(created && !initial.empty()){
+        if(initial.size()>header.size)return {{},87};
+        std::memcpy(result->window->data,initial.data(),initial.size());
     }
     if (result->named) {
         ++header.references;
@@ -293,13 +301,36 @@ bool allows(std::uint32_t protection, std::uint32_t access) {
 }
 struct FileMappingState {
 #if !defined(_WIN32)
+    struct Table {std::u16string generation;std::shared_ptr<Mapping> object;};
     struct Handle { std::shared_ptr<Mapping> object; std::uint32_t access; };
     struct View { std::shared_ptr<Mapping> object; std::uint64_t size{}, offset{}; bool copy{},dib{}; std::uint32_t protection{}; bool placeholder{}; };
     std::shared_ptr<Session> name_space;
     std::map<std::uint64_t,Handle> handles;
     std::map<std::uint64_t,View> views;
+    std::map<std::u16string,Table> tables;
 #endif
 };
+std::uint32_t WindowsServices::process_image_source(std::uint64_t handle,ProcessImageSource& source){
+#if !defined(_WIN32)
+    if(!mappings_)return 6;
+    const auto found=mappings_->handles.find(handle);if(found==mappings_->handles.end())return 6;
+    if(!(found->second.access&8U))return 5;
+    const auto& object=found->second.object;
+    if(!object->image)return 193;
+    const auto& image=*object->image;
+    if((object->protection&0x10000000U) || (image.characteristics&0x2000U))return 193;
+    if(std::any_of(image.ranges.begin(),image.ranges.end(),[](const auto& range){return range.shared && (range.permissions&permission(Access::Write));}))return 50;
+    std::array<std::uint64_t,2> marker{};struct stat info{};
+    if(::pread(object->descriptor,marker.data(),sizeof(marker),image_record_offset+510*8)!=sizeof(marker) ||
+       marker[0]!=image_source_magic || marker[1]!=image.file_size || !marker[1] ||
+       ::fstat(object->descriptor,&info) || static_cast<std::uint64_t>(info.st_size)!=data_offset+object->size+marker[1])return 13;
+    source={object->descriptor,data_offset+object->size,marker[1],static_cast<std::uint16_t>(image.machine),
+        static_cast<std::uint16_t>(image.subsystem),object->path,object};
+    return 0;
+#else
+    (void)handle;(void)source;return 50;
+#endif
+}
 std::optional<WindowsServices::ObjectMetadata> WindowsServices::mapping_object_metadata(std::uint64_t handle)const{
 #if !defined(_WIN32)
     if(!mappings_)return {};const auto at=mappings_->handles.find(handle);if(at==mappings_->handles.end())return {};const auto& object=at->second.object;
@@ -448,8 +479,8 @@ bool WindowsServices::mapping_handle(std::uint64_t handle) const {
 std::uint32_t WindowsServices::mapping_security_location(std::uint64_t handle,std::uint32_t needed,std::vector<std::uint8_t>*& local,int& native,int& lock){
 #if !defined(_WIN32)
     if(!mappings_ || !mappings_->handles.contains(handle))return 6;const auto& item=mappings_->handles.at(handle);if((item.access&needed)!=needed)return 5;
-    if(item.object->file_lifetime && !item.object->named)local=&item.object->security_descriptor;
-    else {native=item.object->descriptor;lock=item.object->name_space->directory;}return 0;
+    // 檔案與 pagefile Section 均已使用共享物件紀錄；匿名檔案映射不能另讀空的本機 DACL。
+    local=nullptr;native=item.object->descriptor;lock=item.object->name_space->directory;return 0;
 #else
     (void)handle;(void)needed;(void)local;(void)native;(void)lock;return 50;
 #endif
@@ -488,6 +519,41 @@ bool WindowsServices::close_mapping(std::uint64_t handle) {
     return mappings_->handles.erase(handle) != 0;
 #else
     (void)handle; return false;
+#endif
+}
+std::uint64_t WindowsServices::map_shared_table(GuestMemory& memory,std::u16string_view family,std::u16string_view generation,std::span<const std::uint8_t> bytes,bool writable,const std::function<void()>& publish,std::u16string_view previous_generation){
+#if defined(_WIN32)
+    (void)memory;(void)family;(void)generation;(void)bytes;(void)writable;(void)publish;(void)previous_generation;last_error_=50;return 0;
+#else
+    (void)mapping_session();
+    if(family.empty() || generation.empty() || family.size()+generation.size()+1>=260 || mappings_->handles.size()>=4096){last_error_=87;return 0;}
+    if(!mappings_->tables.contains(std::u16string(family)) && mappings_->tables.size()>=64){last_error_=8;return 0;}
+    auto& slot=mappings_->tables[std::u16string(family)];
+    auto object=slot.generation==generation?slot.object:std::shared_ptr<Mapping>{};
+    bool created=false;
+    if(!object){
+        const auto name=std::u16string(family)+u":"+std::u16string(generation);
+        const auto security=synchronization_descriptor(memory,0);
+        auto opened=open_mapping(mappings_->name_space,name,bytes.size(),4,!bytes.empty(),security.bytes,nullptr,
+                                 GuestMemory::capacity_limit,bytes,true);
+        if(opened.error){last_error_=opened.error;return 0;}
+        created=!opened.existed;object=std::move(opened.mapping);
+    }
+    struct Rollback {std::shared_ptr<Mapping> object;bool pending;~Rollback(){if(pending)object->persistent=false;}} rollback{object,created};
+    FileMappingState::Table next{std::u16string(generation),object};
+    const auto handle=runtime_.allocate_wait_handle();mappings_->handles.emplace(handle,FileMappingState::Handle{object,0xf001fU});
+    struct Close {FileMappingState& state;std::uint64_t handle;~Close(){state.handles.erase(handle);}} close{*mappings_,handle};
+    const auto address=map_file_view(memory,handle,writable?2U:1U,0,0);
+    if(address){
+        try{if(publish)publish();}catch(...){(void)unmap_file_view(memory,address);throw;}
+        std::swap(slot,next); // 舊 view 持有舊區段；新的 table 不覆寫它。
+        rollback.pending=false;
+        if(!previous_generation.empty() && previous_generation!=generation){
+            const auto retired="table-"+object_name(std::u16string(family)+u":"+std::u16string(previous_generation));
+            DirectoryLock lock(mappings_->name_space->directory);(void)::unlinkat(mappings_->name_space->directory,retired.c_str(),0);
+        }
+    }
+    return address;
 #endif
 }
 std::uint64_t WindowsServices::map_file_view(GuestMemory& memory,std::uint64_t id,std::uint32_t access,std::uint64_t offset,std::uint64_t size,std::uint64_t address,bool dib,bool copy_override,bool replace_placeholder,const VirtualAddressRequirements* requirements){

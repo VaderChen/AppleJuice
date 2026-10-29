@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/interpreter.hpp"
 #include "service_callback_task.hpp"
 #include "guest_crt_state.h"
 #include "guest_heap_layout.hpp"
@@ -35,6 +36,7 @@
 #include <functional>
 #include <limits>
 #include <random>
+#include <sstream>
 
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> com_marshal_service_descriptors();
@@ -591,6 +593,26 @@ std::uint64_t WindowsServices::runtime_allocate(GuestMemory& memory, std::span<c
     const auto address = (runtime_.arena_base?runtime_.arena_base:runtime_base_.value)+offset;
     memory.write(GuestAddress{address}, bytes);runtime_.arena_next=offset+rounded;return address;
 }
+void WindowsServices::configure_runtime_arguments(GuestMemory& memory,std::u16string_view command_line,std::uint64_t wide_address){
+    command_line_address_=GuestAddress{wide_address};
+    runtime_.command_ansi = runtime_allocate(memory, bytes_of(utf16_to_utf8(command_line)));
+    std::vector<std::uint64_t> pointers;
+    std::vector<std::uint64_t> wide_pointers;
+    for (const auto& item : parse_windows_arguments(command_line)) {
+        pointers.push_back(runtime_allocate(memory, bytes_of(utf16_to_utf8(item))));
+        wide_pointers.push_back(runtime_allocate(memory, utf16_bytes(item)));
+    }
+    const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+    const auto argv = runtime_allocate(memory, {}, (pointers.size() + 1) * unit);
+    for (std::size_t i = 0; i < pointers.size(); ++i) memory.store(GuestAddress{argv + i * unit}, bits, pointers[i]);
+    memory.store(GuestAddress{runtime_.argc_cell}, 32, pointers.size()); memory.store(GuestAddress{runtime_.argv_cell}, bits, argv);
+    const auto wargv = runtime_allocate(memory, {}, (wide_pointers.size() + 1) * unit);
+    for (std::size_t i = 0; i < wide_pointers.size(); ++i) memory.store(GuestAddress{wargv + i * unit}, bits, wide_pointers[i]);
+    memory.store(GuestAddress{runtime_.wargv_cell}, bits, wargv);
+    memory.store(GuestAddress{runtime_base_.value + 48}, bits, runtime_.command_ansi);
+    // CRT 資料匯出保存指標，而非字串本身；與 GetCommandLineW 共用程序文字。
+    memory.store(GuestAddress{runtime_base_.value + 104}, bits, command_line_address_.value);
+}
 void WindowsServices::initialize_runtime(GuestMemory& memory, std::u16string_view command_line) {
     startup_profile::Scope phase("services","initialize_runtime",true);
     runtime_.filetime_base = UINT64_C(116444736000000000) + static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::duration<std::int64_t,std::ratio<1,10000000>>>(std::chrono::system_clock::now().time_since_epoch()).count());
@@ -618,25 +640,10 @@ void WindowsServices::initialize_runtime(GuestMemory& memory, std::u16string_vie
     // 舊 MSVCRT 的資料匯出在第一個 locale 呼叫前即須可由 IAT 讀取。
     memory.store(GuestAddress{runtime_base_.value+128},32,1);
     initialize_crt_lowio(memory);
-    runtime_.command_ansi = runtime_allocate(memory, bytes_of(utf16_to_utf8(command_line)));
-    std::vector<std::uint64_t> pointers;
-    std::vector<std::uint64_t> wide_pointers;
-    for (const auto& item : parse_windows_arguments(command_line)) {
-        pointers.push_back(runtime_allocate(memory, bytes_of(utf16_to_utf8(item))));
-        wide_pointers.push_back(runtime_allocate(memory, utf16_bytes(item)));
-    }
+    configure_runtime_arguments(memory,command_line,command_line_address_.value);
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
-    const auto argv = runtime_allocate(memory, {}, (pointers.size() + 1) * unit);
-    for (std::size_t i = 0; i < pointers.size(); ++i) memory.store(GuestAddress{argv + i * unit}, bits, pointers[i]);
-    memory.store(GuestAddress{runtime_.argc_cell}, 32, pointers.size()); memory.store(GuestAddress{runtime_.argv_cell}, bits, argv);
     memory.store(GuestAddress{runtime_.environ_cell}, bits, runtime_allocate(memory, {}, unit));
-    const auto wargv = runtime_allocate(memory, {}, (wide_pointers.size() + 1) * unit);
-    for (std::size_t i = 0; i < wide_pointers.size(); ++i) memory.store(GuestAddress{wargv + i * unit}, bits, wide_pointers[i]);
-    memory.store(GuestAddress{runtime_.wargv_cell}, bits, wargv);
     memory.store(GuestAddress{runtime_.wenviron_cell}, bits, runtime_allocate(memory, {}, unit));
-    memory.store(GuestAddress{runtime_base_.value + 48}, bits, runtime_.command_ansi);
-    // CRT 資料匯出保存指標，而非字串本身；與 GetCommandLineW 共用程序文字。
-    memory.store(GuestAddress{runtime_base_.value + 104}, bits, command_line_address_.value);
     // 資料匯出可在第一次時間 API 呼叫前由 IAT 直接讀取。
     runtime_.timezone_name=runtime_allocate(memory,std::array<std::uint8_t,4>{'U','T','C',0});
     memory.store(GuestAddress{runtime_base_.value+88},bits,runtime_.timezone_name);
@@ -659,25 +666,29 @@ void WindowsServices::configure_image(GuestState& state, GuestMemory& memory, Ru
     validate_unwind(memory, image);
     configure_image_after_unwind_validation(state,memory,std::move(image));
 }
-void WindowsServices::configure_image_after_unwind_validation(GuestState& state, GuestMemory& memory, RuntimeImage image) {
+void WindowsServices::configure_image_after_unwind_validation(GuestState& state, GuestMemory& memory, RuntimeImage image,bool initial_thread) {
     runtime_.image = std::move(image);
     std::vector<std::uint64_t> builtins;const auto native=load_module(memory,u"ntdll.dll",0,builtins);runtime_.main_dependencies.insert(native);
     install_guard(memory,runtime_.image);
-    memory.map(teb_base_, x86_?0x4000:GUEST_CRT_TEB_SIZE, read_write); memory.map(peb_base_, 0x1000, read_write);
+    if(initial_thread)memory.map(teb_base_, x86_?0x4000:GUEST_CRT_TEB_SIZE, read_write);
+    memory.map(peb_base_, 0x1000, read_write);
     publish_loader_lock(memory,peb_base_.value,x86_,0,0);
     (void)process_debugger::self(memory,peb_base_,runtime_.network.external_io);
-    memory.map(exception_base_, 16 * 8192, read_write);
+    if(initial_thread)memory.map(exception_base_, 16 * 8192, read_write);
     if (x86_) {
-        state.fs_base = teb_base_.value;
         state.segments={0x23,0x1b,0x23,0x23,0x3b,0};
+        if(initial_thread){
+        state.fs_base = teb_base_.value;
         memory.store(GuestAddress{teb_base_.value},32,UINT32_MAX);
         memory.store(GuestAddress{teb_base_.value+4},32,runtime_.image.stack_base+runtime_.image.stack_size);
         memory.store(GuestAddress{teb_base_.value+8},32,runtime_.image.stack_base);
         memory.store(GuestAddress{teb_base_.value+0x18},32,teb_base_.value);
         memory.store(GuestAddress{teb_base_.value+0x20},32,process_id()); memory.store(GuestAddress{teb_base_.value+0x24},32,1);
         memory.store(GuestAddress{teb_base_.value+0x30},32,peb_base_.value);
+        }
         memory.store(GuestAddress{peb_base_.value+8},32,runtime_.image.base);
         memory.store(GuestAddress{peb_base_.value+0x18},32,process_heap);
+        if(initial_thread){
         const auto parameter_header=detail::ProcessParameterLayout::for_x86(true).header;
         const auto parameters=runtime_allocate(memory,{},parameter_header);
         memory.store(GuestAddress{peb_base_.value+0x10},32,parameters);
@@ -691,17 +702,21 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
             const auto tls=runtime_allocate(memory,runtime_.image.tls_data,std::max<std::size_t>(1,runtime_.image.tls_data.size()+runtime_.image.tls_zero),runtime_.image.tls_alignment);
             memory.store(GuestAddress{runtime_.image.tls_index},32,0);memory.store(GuestAddress{vector},32,tls);
         }
+        }
     } else {
-    state.gs_base = teb_base_.value;
     state.segments={0x2b,0x33,0x2b,0x2b,0x53,0x2b};
+    if(initial_thread){
+    state.gs_base = teb_base_.value;
     memory.store(GuestAddress{teb_base_.value + 8}, 64, runtime_.image.stack_base + runtime_.image.stack_size);
     memory.store(GuestAddress{teb_base_.value + 16}, 64, runtime_.image.stack_base);
     memory.store(GuestAddress{teb_base_.value + 0x30}, 64, teb_base_.value);
     memory.store(GuestAddress{teb_base_.value + 0x40}, 64, process_id()); memory.store(GuestAddress{teb_base_.value + 0x48}, 64, 1);
     memory.store(GuestAddress{teb_base_.value + 0x60}, 64, peb_base_.value);
+    }
     memory.store(GuestAddress{peb_base_.value + 0x10}, 64, runtime_.image.base);
     memory.store(GuestAddress{peb_base_.value + 0xb8}, 32, std::max(1U, runtime_.processor_count)); // NumberOfProcessors
     // RTL_USER_PROCESS_PARAMETERS64：供靜態 CRT 與原生 Win32 程式讀取程序資料。
+    if(initial_thread){
     const auto parameter_header=detail::ProcessParameterLayout::for_x86(false).header;
     const auto parameters=runtime_allocate(memory,{},parameter_header);memory.store(GuestAddress{peb_base_.value+0x20},64,parameters);
     memory.store(GuestAddress{parameters},32,parameter_header);memory.store(GuestAddress{parameters+4},32,parameter_header);memory.store(GuestAddress{parameters+8},32,1);
@@ -715,6 +730,12 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
         const auto tls = runtime_allocate(memory, runtime_.image.tls_data, std::max<std::size_t>(1, runtime_.image.tls_data.size() + runtime_.image.tls_zero),runtime_.image.tls_alignment);
         memory.store(GuestAddress{runtime_.image.tls_index}, 32, 0); memory.store(GuestAddress{tls_vector}, 64, tls);
     }
+    }
+    }
+    awaiting_initial_thread_=!initial_thread;
+    if(!initial_thread){
+        if(runtime_.image.tls_index)memory.store(GuestAddress{runtime_.image.tls_index},32,0);
+        threads_.current=0;return;
     }
     if (!runtime_.image.tls_callbacks.empty()) state.rip = startup_entry_;
     GuestThread main_thread; main_thread.affinity=runtime_.process_affinity; main_thread.context = state; main_thread.teb = teb_base_.value;
@@ -943,7 +964,18 @@ bool guest_heap_enabled(){
 }
 std::uint64_t guest_heap_block_size_impl(GuestMemory& memory,std::uint64_t address) {
     const auto chunk=address&~(guest_heap_chunk-1);
-    if(memory.load(GuestAddress{chunk},64)!=guest_heap_magic)throw HostCallFault("配置區指標不屬於任何 chunk");
+    const auto magic=memory.load(GuestAddress{chunk},64);
+    if(magic!=guest_heap_magic){
+        // 只在既有拒絕分支保存實際比較值；不重讀 magic，也不修改客體或放寬完整性檢查。
+        std::ostringstream detail;detail<<"配置區指標不屬於任何 chunk address=0x"<<std::hex<<address
+            <<" chunk=0x"<<chunk<<" magic=0x"<<magic;
+        try {for(unsigned offset=8;offset<guest_heap_header;offset+=8)
+            detail<<" header+0x"<<offset<<"=0x"<<memory.load(GuestAddress{chunk+offset},64);}
+        catch(const MemoryFault&){detail<<" header_unreadable";}
+        detail<<" native_mmu_pending="<<memory.native_mmu_update_pending()
+            <<" borrow_generation=0x"<<memory.native_borrow_generation();
+        throw HostCallFault(detail.str());
+    }
     const auto cls=memory.load(GuestAddress{chunk+8},64),block=memory.load(GuestAddress{chunk+16},64);
     if(!valid_block(address,cls,block))throw HostCallFault("配置區指標不是區塊起點");
     return block;
@@ -990,6 +1022,7 @@ std::uint64_t WindowsServices::guest_heap_reserve_chunk(GuestMemory& memory) {
 }
 bool WindowsServices::guest_heap_setup(GuestMemory& memory) {
     if(!guest_heap_enabled() || guest_heap_base_ || guest_heap_chunked_)return false;
+    guest_heap_deferred_.resize(guest_heap_class(guest_heap_limit+guest_heap_aligned_header)+1);
     if(x86_){
         if(!guest_heap_x86_requested())return false;
         const auto state=GuestAddress{callback_return_.value+guest_heap_state_page_offset};
@@ -1049,6 +1082,12 @@ std::uint64_t WindowsServices::guest_heap_allocate(GuestMemory& memory, std::uin
         const auto count=(guest_heap_chunk-guest_heap_header)/block;
         for(std::uint64_t i=0;i+1<count;++i)put(guest_heap_header+i*block,chunk+guest_heap_header+(i+1)*block);
         memory.map(GuestAddress{chunk},guest_heap_chunk,read_write,image);
+        // 故障定位專用：chunk 標頭在發布後不再變動；僅保護標頭，payload 權限維持可寫。
+        // 混合權限的首個宿主頁沿精確回退處理，讓越界寫入在原客體 RIP 產生故障。
+        // 此模式改變頁面布局與執行成本，預設關閉，不用於效能驗收或正式遊戲設定。
+        static const bool guard_headers=[] {const auto* value=std::getenv("X64ARM_GUEST_HEAP_HEADER_GUARD");
+            return value && std::string_view(value)=="1";}();
+        if(guard_headers)memory.protect(GuestAddress{chunk},guest_heap_header,permission(Access::Read));
         // 狀態頁 +16 是已建立範圍的長度（客體常式以此判斷指標是否屬於配置區）。
         if(!guest_heap_chunked_){guest_heap_next_+=guest_heap_chunk;memory.store(GuestAddress{guest_heap_state_.value+16},64,guest_heap_next_-guest_heap_base_);}
         return chunk+guest_heap_header;
@@ -1070,6 +1109,7 @@ std::uint64_t WindowsServices::guest_heap_allocate(GuestMemory& memory, std::uin
     if(!locked)return 0;
     std::uint64_t result=0;
     try{
+        guest_heap_publish_deferred(memory);
         result=memory.load(head,64);
         if(!result)result=fill(0);
         if(result){memory.store(head,64,memory.load(GuestAddress{result},64));memory.store(GuestAddress{result},64,0);++guest_heap_mutations_;}
@@ -1084,6 +1124,104 @@ std::uint64_t WindowsServices::guest_heap_owner(GuestMemory& memory, std::uint64
     const auto owner=memory.load(GuestAddress{(address&~(guest_heap_chunk-1))+24},64);
     return owner?owner:process_heap;
 }
+bool WindowsServices::validate_guest_heap(GuestMemory& memory,std::uint64_t heap,std::uint64_t pointer) const {
+    // HeapValidate／CRT heap 檢查沿用完整服務邊界；原生 worker 已停止，才能把全域串列與
+    // 每執行緒快取視為同一個快照。不要把此檢查加入可與 worker 同時執行的本地配置服務。
+    if(!guest_heap_chunked_ && !guest_heap_base_)return !pointer;
+    if(!guest_heap_chunked_ && heap!=process_heap)return !pointer;
+    if(pointer && !guest_heap_contains(pointer))return false;
+    try {
+        const auto expected_owner=heap==process_heap?0:heap;
+        const auto read_block=[&](std::uint64_t address,std::uint64_t expected_class=0){
+            if(!guest_heap_contains(address))return UINT64_C(0);
+            const auto chunk=address&~(guest_heap_chunk-1);
+            if(memory.load(GuestAddress{chunk},64)!=guest_heap_magic ||
+               memory.load(GuestAddress{chunk+24},64)!=expected_owner)return UINT64_C(0);
+            const auto cls=memory.load(GuestAddress{chunk+8},64),size=memory.load(GuestAddress{chunk+16},64);
+            return valid_block(address,cls,size) && (!expected_class || cls==expected_class)?size:UINT64_C(0);
+        };
+        const auto pointer_size=pointer?read_block(pointer):0;
+        if(pointer && !pointer_size)return false;
+        const auto pointer_class=pointer?guest_heap_class(pointer_size):0;
+        std::uint64_t chunks=0;
+        if(guest_heap_chunked_)for(const auto bits:guest_heap_chunk_bits_)chunks+=static_cast<std::uint64_t>(std::popcount(bits));
+        else chunks=(guest_heap_next_-guest_heap_base_)/guest_heap_chunk;
+        const auto maximum_nodes=chunks*((guest_heap_chunk-guest_heap_header)/16);
+        if(!pointer){
+            const auto valid_chunk=[&](std::uint64_t chunk){
+                if(memory.load(GuestAddress{chunk},64)!=guest_heap_magic)return false;
+                const auto owner=memory.load(GuestAddress{chunk+24},64);
+                if(owner!=expected_owner)return owner==0 || runtime_.private_heaps.contains(owner);
+                const auto cls=memory.load(GuestAddress{chunk+8},64),size=memory.load(GuestAddress{chunk+16},64);
+                if(!valid_block(chunk+guest_heap_header,cls,size))return false;
+                for(auto at=chunk;at<chunk+guest_heap_chunk;){
+                    const auto region=memory.query(GuestAddress{at});
+                    if(!region || !region->size || region->size>UINT64_MAX-region->base.value)return false;
+                    const auto end=region->base.value+region->size;
+                    if(end<=at)return false;
+                    at=std::min(chunk+guest_heap_chunk,end);
+                }
+                return true;
+            };
+            if(guest_heap_chunked_){
+                for(std::size_t word=0;word<guest_heap_chunk_bits_.size();++word)
+                    for(auto bits=guest_heap_chunk_bits_[word];bits;bits&=bits-1U)
+                        if(!valid_chunk((static_cast<std::uint64_t>(word)<<24)|
+                            (static_cast<std::uint64_t>(std::countr_zero(bits))<<18)))return false;
+            }else for(auto chunk=guest_heap_base_;chunk<guest_heap_next_;chunk+=guest_heap_chunk)
+                if(!valid_chunk(chunk))return false;
+        }
+        std::unordered_set<std::uint64_t> free;
+        const auto collect=[&](std::uint64_t at,std::uint64_t cls,std::uint64_t limit,std::optional<unsigned> expected_count={}){
+            unsigned count=0;
+            for(;at;at=memory.load(GuestAddress{at},64)){
+                if(count>=limit || !read_block(at,cls) || !free.insert(at).second)return false;
+                ++count;
+            }
+            return !expected_count || count==*expected_count;
+        };
+        const auto first=pointer?pointer_class:1,last=pointer?pointer_class:guest_heap_class(guest_heap_limit+guest_heap_aligned_header);
+        if(heap==process_heap){
+            if(!guest_heap_state_.value || memory.load(guest_heap_state_,32))return false;
+            for(auto cls=first;cls<=last;++cls)
+                if(!collect(memory.load(GuestAddress{guest_heap_state_.value+guest_heap_heads+cls*8},64),cls,maximum_nodes))return false;
+            for(auto cls=first;cls<=last && cls<guest_heap_deferred_.size();++cls)
+                if(!collect(guest_heap_deferred_[cls].first,cls,maximum_nodes))return false;
+            if(!x86_)for(const auto& [id,thread]:threads_.items){(void)id;
+                if(!thread.teb || !memory.mapped(GuestAddress{thread.teb+guest_heap_cache_offset}))continue;
+                for(auto cls=first;cls<=std::min<std::uint64_t>(last,guest_heap_cache_classes);++cls){
+                    const auto count=memory.load(GuestAddress{thread.teb+guest_heap_cache_count_offset+cls},8);
+                    if(count>guest_heap_cache_limit || !collect(memory.load(GuestAddress{thread.teb+guest_heap_cache_offset+cls*8},64),
+                        cls,guest_heap_cache_limit,static_cast<unsigned>(count)))return false;
+                }
+            }
+        }else if(const auto found=guest_private_heaps_.find(heap);found!=guest_private_heaps_.end()){
+            for(auto cls=first;cls<=last && cls<found->second.heads.size();++cls)
+                if(!collect(found->second.heads[cls],cls,maximum_nodes))return false;
+        }
+        return !pointer || !free.contains(pointer);
+    }catch(const MemoryFault&){return false;}
+     catch(const HostCallFault&){return false;}
+     catch(const std::invalid_argument&){return false;}
+     catch(const std::bad_alloc&){return false;}
+}
+void WindowsServices::guest_heap_defer_free(GuestMemory& memory,std::uint64_t address,std::uint64_t cls) {
+    auto& [first,last]=guest_heap_deferred_.at(static_cast<std::size_t>(cls));
+    memory.store(GuestAddress{address},64,first);
+    if(!first)last=address;
+    first=address;guest_heap_deferred_pending_=true;++guest_heap_mutations_;
+}
+void WindowsServices::guest_heap_publish_deferred(GuestMemory& memory) {
+    // 僅在已取得客體配置鎖的協調者呼叫；每級距以尾節點一次串接，無需逐塊搬移。
+    if(!guest_heap_deferred_pending_)return;
+    for(std::size_t cls=1;cls<guest_heap_deferred_.size();++cls){
+        auto& [first,last]=guest_heap_deferred_[cls];if(!first)continue;
+        const GuestAddress head{guest_heap_state_.value+guest_heap_heads+cls*8};
+        memory.store(GuestAddress{last},64,memory.load(head,64));
+        memory.store(head,64,first);first=last=0;
+    }
+    guest_heap_deferred_pending_=false;
+}
 void WindowsServices::guest_heap_free(GuestMemory& memory, std::uint64_t address) {
     const auto block=guest_heap_block_size(memory,address);
     if(const auto owner=guest_heap_owner(memory,address);owner!=process_heap){
@@ -1094,10 +1232,12 @@ void WindowsServices::guest_heap_free(GuestMemory& memory, std::uint64_t address
         return;
     }
     const GuestAddress lock{guest_heap_state_.value},head{guest_heap_state_.value+guest_heap_heads+guest_heap_class(block)*8};
-    bool locked=false;
-    for(std::uint64_t n=0;n<(UINT64_C(1)<<24) && !locked;++n)locked=memory.atomic_rmw(lock,32,GuestMemory::AtomicRmw::CompareExchange,1,0)==0;
-    if(!locked)throw HostCallFault("配置區鎖長時間被持有");
-    try{memory.store(GuestAddress{address},64,memory.load(head,64));memory.store(head,64,address);++guest_heap_mutations_;}
+    // 全體停駐的服務邊界可能截在另一客體的鎖內；自旋不能使該擁有者前進。
+    // 已釋放區塊立即由宿主串列接管，成功取鎖後再發布，不能直接改動仍由客體持有的全域串列。
+    if(memory.atomic_rmw(lock,32,GuestMemory::AtomicRmw::CompareExchange,1,0)!=0){
+        guest_heap_defer_free(memory,address,guest_heap_class(block));return;
+    }
+    try{guest_heap_publish_deferred(memory);memory.store(GuestAddress{address},64,memory.load(head,64));memory.store(head,64,address);++guest_heap_mutations_;}
     catch(...){memory.store(lock,32,0);throw;}
     memory.store(lock,32,0);
 }
@@ -1161,6 +1301,7 @@ const std::vector<std::pair<std::uint64_t,std::uint64_t>>& WindowsServices::gues
             collect(memory.load(GuestAddress{guest_heap_state_.value+guest_heap_heads+cls*8},64));}
         catch(...){memory.store(lock,32,0);throw;}
         memory.store(lock,32,0);
+        for(const auto& [first,last]:guest_heap_deferred_){(void)last;collect(first);}
         // x64 各執行緒級距快取中的區塊同屬空閒。其他執行緒可能正在改自己的快取（只影響走訪結果），
         // 只跟隨配置區內已映射的指標，且每級距不超過上限，讀到不一致的串列不會越界或無窮迴圈。
         if(!x86_)for(const auto& [id,thread]:threads_.items){(void)id;
@@ -1189,21 +1330,25 @@ const std::vector<std::pair<std::uint64_t,std::uint64_t>>& WindowsServices::gues
 }
 void WindowsServices::guest_heap_flush_thread_cache(GuestMemory& memory, std::uint64_t teb) {
     // 執行緒結束、TEB 回收前：把級距快取的區塊依序推回全域串列（配置區鎖內），避免 TEB 回收後永久遺失。
-    // 鎖長時間取不到時保留區塊不歸還（只少回收這些記憶體），不讓結束流程失敗。
+    // 客體鎖忙時改交宿主待發布串列，TEB 回收後仍保有這些空閒區塊。
     if(x86_ || !guest_heap_base_ || !guest_heap_state_.value || !teb || !memory.mapped(GuestAddress{teb+guest_heap_cache_offset}))return;
-    const GuestAddress lock{guest_heap_state_.value};bool locked=false;
-    for(std::uint64_t n=0;n<(UINT64_C(1)<<24) && !locked;++n)locked=memory.atomic_rmw(lock,32,GuestMemory::AtomicRmw::CompareExchange,1,0)==0;
-    if(!locked)return;
+    const GuestAddress lock{guest_heap_state_.value};
+    const bool locked=memory.atomic_rmw(lock,32,GuestMemory::AtomicRmw::CompareExchange,1,0)==0;
     try{
+        if(locked)guest_heap_publish_deferred(memory);
         for(std::uint64_t cls=1;cls<=guest_heap_cache_classes;++cls){
             const GuestAddress cache{teb+guest_heap_cache_offset+cls*8},head{guest_heap_state_.value+guest_heap_heads+cls*8};
             auto at=memory.load(cache,64);
             for(unsigned n=0;at && n<=guest_heap_cache_limit && guest_heap_contains(at);++n){
-                const auto next=memory.load(GuestAddress{at},64);memory.store(GuestAddress{at},64,memory.load(head,64));memory.store(head,64,at);at=next;}
+                const auto next=memory.load(GuestAddress{at},64);
+                if(locked){memory.store(GuestAddress{at},64,memory.load(head,64));memory.store(head,64,at);}
+                else guest_heap_defer_free(memory,at,cls);
+                at=next;}
             memory.store(cache,64,0);memory.store(GuestAddress{teb+guest_heap_cache_count_offset+cls},8,0);
         }
-    }catch(...){memory.store(lock,32,0);throw;}
-    memory.store(lock,32,0);++guest_heap_mutations_;
+    }catch(...){if(locked)memory.store(lock,32,0);throw;}
+    if(locked)memory.store(lock,32,0);
+    ++guest_heap_mutations_;
 }
 bool WindowsServices::free_heap(GuestMemory& memory, std::uint64_t address, const GuestState& state) {
     if(graphics_local())throw HostCallFault("worker 上的 D3D11 服務不可釋放 heap");
@@ -1327,6 +1472,14 @@ void WindowsServices::enter_callback(GuestState& state, GuestMemory& memory) {
         (call.floating_result && call.floating_result!=32 && call.floating_result!=64) || call.x86_register_arguments>2 ||
         call.x86_register_arguments>call.arguments.size() || (call.wide_arguments&((1U<<call.x86_register_arguments)-1U))) throw HostCallFault("callback 參數數量、寬度或暫存器無效");
     if(!handles(GuestAddress{call.target}))memory.check(GuestAddress{call.target}, 1, Access::Execute);
+    for(const auto& write:call.writebacks){
+        memory.check(GuestAddress{write.address},4,Access::Write);
+        if(write.clear_mask!=UINT32_MAX)memory.check(GuestAddress{write.address},4,Access::Read);
+    }
+    for(const auto& write:call.writebacks){
+        const auto previous=write.clear_mask==UINT32_MAX?0U:static_cast<std::uint32_t>(memory.load(GuestAddress{write.address},32));
+        memory.store(GuestAddress{write.address},32,(previous&~write.clear_mask)|write.value);
+    }
     retain_shell_callback(frame,call);
     const auto original_sp = frame.saved.reg(Gpr::Rsp);
     if (original_sp < 256) throw HostCallFault("callback 堆疊不足");
@@ -1380,6 +1533,19 @@ void WindowsServices::start_callbacks(GuestState& state, GuestMemory& memory, st
             state.rip = callback_return_; state.reg(Gpr::Rax) = 0;
         } else enter_callback(state, memory);
     } catch (...) { finish_shell_callbacks(memory,runtime_.callbacks.back());runtime_.callbacks.pop_back(); throw; }
+}
+std::uint64_t WindowsServices::call_guest_nested(GuestState& state,GuestMemory& memory,
+        std::uint64_t target,std::vector<std::uint64_t> arguments) {
+    if(!has_nested_runner())throw HostCallFault("目前執行範圍無法完成巢狀客體回呼");
+    const auto saved=state;const auto depth=runtime_.callbacks.size();const auto owner=threads_.current;
+    // 沿用目前後端及真正的 ABI 框架；排程、例外與停止訊號仍交由核心處理。
+    try {start_callbacks(state,memory,{{target,std::move(arguments)}},Continuation::NestedResult);}
+    catch(...){state=saved;throw;}
+    const auto stopped=[&]{return threads_.current==owner && runtime_.callbacks.size()==depth && state.rip==saved.rip;};
+    const auto result=run_nested(state,memory,stopped);
+    if(!stopped())throw NestedExecutionStop(result);
+    const auto value=state.reg(Gpr::Rax);const auto tsc=state.tsc;
+    state=saved;state.tsc=tsc;return value;
 }
 void WindowsServices::release_loader_notification() {
     if (runtime_.loader_owner != threads_.current || !runtime_.loader_depth)

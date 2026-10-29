@@ -80,6 +80,10 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
         ,{"winmm.dll","midiOutOpen",5},{"winmm.dll","midiOutClose",1},{"winmm.dll","midiOutGetID",2}
         ,{"winmm.dll","midiOutShortMsg",2},{"winmm.dll","midiOutLongMsg",3},{"winmm.dll","midiOutReset",1}
         ,{"winmm.dll","midiOutPrepareHeader",3},{"winmm.dll","midiOutUnprepareHeader",3}
+        ,{"winmm.dll","midiOutGetVolume",2},{"winmm.dll","midiOutSetVolume",2}
+        ,{"winmm.dll","midiStreamOpen",6},{"winmm.dll","midiStreamClose",1},{"winmm.dll","midiStreamOut",3}
+        ,{"winmm.dll","midiStreamPause",1},{"winmm.dll","midiStreamRestart",1},{"winmm.dll","midiStreamStop",1}
+        ,{"winmm.dll","midiStreamPosition",3},{"winmm.dll","midiStreamProperty",3}
         ,{"winmm.dll","midiInGetNumDevs",0},{"winmm.dll","midiInGetDevCapsA",3},{"winmm.dll","midiInGetDevCapsW",3}
         ,{"winmm.dll","midiInOpen",5},{"winmm.dll","midiInClose",1},{"winmm.dll","midiInGetID",2}
         ,{"winmm.dll","midiInPrepareHeader",3},{"winmm.dll","midiInUnprepareHeader",3},{"winmm.dll","midiInAddBuffer",3}
@@ -246,7 +250,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
     if(service.symbol.starts_with("PlaySound") || service.symbol.starts_with("sndPlaySound"))return invoke_play_sound(state,memory,service);
     if(service.symbol.starts_with("waveIn"))return invoke_wave_input(state,memory,service);
     if(service.symbol.starts_with("midiIn"))return invoke_midi_input(state,memory,service);
-    if(service.symbol.starts_with("midiOut"))return invoke_winmm_midi(state,memory,service);
+    if(service.symbol.starts_with("midiOut") || service.symbol.starts_with("midiStream"))return invoke_winmm_midi(state,memory,service);
     const WindowsCall arg(state,memory,service); const auto symbol=service.symbol;
     if(symbol=="_Getdays" || symbol=="_W_Getdays" || symbol=="_Getmonths" || symbol=="_W_Getmonths" || symbol=="_Gettnames" || symbol=="_W_Gettnames"){
         const auto& category=current_crt_locale(state,memory).categories[5];const auto data=windows_crt_time_data(category);std::vector<std::uint8_t> bytes;

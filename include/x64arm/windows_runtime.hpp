@@ -103,7 +103,7 @@ struct RuntimeModule {
     std::set<std::uint64_t> dependencies;
     std::vector<std::pair<std::uint64_t,std::size_t>> mappings;
     std::uint32_t references{}, tls_slot{UINT32_MAX};
-    bool loading{}, attached{}, pinned{}, no_thread_calls{};
+    bool loading{}, attached{}, pinned{}, no_thread_calls{}, notification_ready{};
     bool operator==(const RuntimeModule&) const = default;
 };
 struct ModuleStep {
@@ -111,6 +111,10 @@ struct ModuleStep {
     std::uint64_t module{};
     bool check_result{}, complete{}, unmap{};
     bool operator==(const ModuleStep&) const = default;
+};
+struct DllNotificationRegistration {
+    std::uint64_t function{}, context{};
+    bool operator==(const DllNotificationRegistration&) const = default;
 };
 struct ModuleOperation {
     std::vector<ModuleStep> steps;
@@ -320,7 +324,8 @@ struct CriticalSection {
     // 皆在獨占映射鎖或全體靜止下）設定；worker 版 Leave 走訪確認沒有等待者才清除。只是加速提示，不屬鎖的語義狀態。
     bool waiters_hint{};
     // kernel32 臨界區段：擁有權只在客體結構（LockCount 字組＋RecursionCount／OwningThread），與 Win64 客體常式共用協定，
-    // owner／recursion 不使用。宿主內部鎖（D3D11 裝置鎖、CRT lowio、Media Foundation）維持 false，以宿主欄位為準。
+    // owner／recursion 不使用；公開於 CRT lowio 的臨界區段亦共用客體協定。
+    // 宿主內部鎖（D3D11 裝置鎖、Media Foundation）維持 false，以宿主欄位為準。
     bool guest{};
     bool operator==(const CriticalSection& other) const noexcept {
         return owner==other.owner && debug==other.debug && recursion==other.recursion && spin==other.spin && worker_guard==other.worker_guard && guest==other.guest;
@@ -347,7 +352,11 @@ struct ProcessSnapshot {
         bool operator==(const Module&) const = default;
     };
     std::vector<Module> modules;
-    std::vector<std::uint64_t> threads;
+    struct Thread {
+        std::uint32_t id{},owner{},priority{};
+        bool operator==(const Thread&) const = default;
+    };
+    std::vector<Thread> threads;
     std::u16string executable;
     std::uint32_t flags{};
     std::size_t process_cursor{}, thread_cursor{}, module_cursor{};
@@ -593,6 +602,8 @@ struct RuntimeState {
     std::uint32_t loader_depth{};
     std::map<std::uint64_t,std::uint64_t> loader_lock_cookies;
     std::uint32_t next_loader_lock_cookie{1};
+    std::map<std::uint64_t,DllNotificationRegistration> dll_notifications;
+    std::uint64_t next_dll_notification_cookie{1};
     std::vector<std::string> module_events;
     std::filesystem::path application_source;
     std::u16string application_directory, dll_directory, native_dll_path;

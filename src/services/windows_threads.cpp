@@ -782,9 +782,9 @@ void mark_critical_waiters(std::map<std::uint64_t,CriticalSection>& sections,con
 // 平行 worker 的客體快速路徑可能同時改寫，CAS 失敗就以新值重新判定。
 namespace {
 constexpr std::uint32_t critical_free=UINT32_MAX,critical_waiters=0x40000000U,critical_free_waiting=0x7fffffffU,critical_count=0x3fffffffU;
-// X64ARM_GUEST_CS=0：臨界區段回到宿主欄位模型（同時停用客體常式），供同成品對照。
-bool guest_critical_enabled(){static const bool enabled=[] {const auto* value=std::getenv("X64ARM_GUEST_CS");return !value || std::string_view(value)!="0";}();return enabled;}
 }
+// X64ARM_GUEST_CS=0：臨界區段回到宿主欄位模型（同時停用客體常式），供同成品對照。
+bool WindowsServices::guest_critical_enabled(){static const bool enabled=[] {const auto* value=std::getenv("X64ARM_GUEST_CS");return !value || std::string_view(value)!="0";}();return enabled;}
 bool WindowsServices::critical_held(GuestMemory& memory,std::uint64_t address,const CriticalSection& section){
     if(!section.guest)return section.owner!=0;
     const auto word=static_cast<std::uint32_t>(memory.load(GuestAddress{address+(x86_?4:8)},32));
@@ -870,7 +870,7 @@ void WindowsServices::critical_settle_waiters(GuestMemory& memory,std::uint64_t 
     const bool waiting=std::any_of(threads_.items.begin(),threads_.items.end(),[&](const auto& entry){
         const auto& thread=entry.second;const auto& wait=thread.wait;
         if(thread.status!=ThreadStatus::Waiting)return false;
-        if(wait.kind==ThreadWaitKind::Critical || wait.kind==ThreadWaitKind::CriticalRetry)return !wait.handles.empty() && wait.handles[0]==address;
+        if(wait.kind==ThreadWaitKind::Critical || wait.kind==ThreadWaitKind::CriticalRetry || (wait.kind==ThreadWaitKind::CrtLockRetry && wait.critical))return !wait.handles.empty() && wait.handles[0]==address;
         return wait.kind==ThreadWaitKind::Condition && wait.critical && wait.handles.size()>1 && wait.handles[1]==address;
     });
     if(waiting)return;
@@ -2029,6 +2029,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
         WakePollScope poll_measurement("poll_handle_transfers");
         poll_handle_transfers(memory);
     }
+    poll_remote_thread_creations(memory);
     {
         WakePollScope poll_measurement("poll_job_termination");
         poll_job_termination(memory);
@@ -2055,6 +2056,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
     {
         WakePollScope poll_measurement("poll_midi_input");
         poll_midi_input(memory);
+        poll_midi_output(memory);
     }
     {
         WakePollScope poll_measurement("poll_media_foundation");
@@ -2294,6 +2296,12 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
         }
         if(wait.kind==ThreadWaitKind::ProcessCreation){
             if(finish_guest_process_creation(thread.context,memory,id)){
+                thread.status=ThreadStatus::Runnable;thread.wait={};
+            }
+            continue;
+        }
+        if(wait.kind==ThreadWaitKind::RemoteThreadCreation){
+            if(finish_remote_thread_creation(thread.context,memory,id)){
                 thread.status=ThreadStatus::Runnable;thread.wait={};
             }
             continue;
@@ -2593,10 +2601,15 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             continue; // 重新執行原始 _locking 呼叫，保留每秒一次的嘗試次數與起始位置。
         }
         if (wait.kind == ThreadWaitKind::HeapRetry) {
+            // 等待解析可與原生 worker 並行，不能讀其活體 RIP。到期後重試完整 API，
+            // 由全停服務邊界重新確認配置器已完成發布。
+            if(wait.handles.size()>1 && wait.deadline>runtime_.clock_ticks)continue;
             const auto lock = runtime_.heap_locks.find(wait.handles[0]);
             if (lock == runtime_.heap_locks.end() || !lock->second.owner || lock->second.owner == id) {
                 thread.status = ThreadStatus::Runnable;
                 thread.wait = {};
+            } else if(wait.handles.size()>1) {
+                wait.handles.resize(1);wait.deadline=UINT64_MAX;
             }
             continue; // 重試原始 Heap／配置 API，保留其 ABI 參數與返回框架。
         }
@@ -3135,9 +3148,9 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory, bool cont
         const auto file_deadline=file_io_poll_deadline(gui_polling ? nullptr : wake.get());
         if(file_deadline)next=std::min(next,*file_deadline);
         const bool external_wait =
-            debugger_attached() || suspended_wait || policy_wait || media_foundation_waiting() || midi_input_waiting() || wave_output_waiting() || dsound_waiting() ||
+            debugger_attached() || suspended_wait || policy_wait || media_foundation_waiting() || midi_input_waiting() || midi_output_waiting() || wave_output_waiting() || dsound_waiting() ||
             wasapi_waiting() || directmusic_waiting() || dinput_waiting() || processes_waiting() || http_waiting() || bluetooth_waiting() || winusb_waiting() ||
-            shared_wait || remote_family_waiting() || perflib_remote_waiting() ||
+            shared_wait || remote_family_waiting() || perflib_remote_waiting() || remote_thread_creations_waiting() ||
             std::any_of(threads_.items.begin(), threads_.items.end(),
                         [](const auto &item) {
                             return item.second.status == ThreadStatus::Waiting &&
@@ -3259,6 +3272,7 @@ std::optional<std::uint32_t> WindowsServices::finish_thread(GuestState &state, G
     cancel_network_io(memory, 0, threads_.current);
     cancel_duplicate_remote_handle(memory,threads_.current);
     cancel_guest_process_creation(threads_.current);
+    cancel_remote_thread_creation(threads_.current);
     discard_file_transfers(state,memory,threads_.current);
     if(const auto job=runtime_.network.resolvers.find(threads_.current);job!=runtime_.network.resolvers.end()){
         job->second->cancelled.store(true);runtime_.network.resolvers.erase(job);
@@ -3419,6 +3433,53 @@ std::optional<std::uint32_t> WindowsServices::exit_thread(GuestState &state, Gue
     }
     return finish_thread(state, memory, code);
 }
+void WindowsServices::discard_unstarted_thread(GuestMemory& memory,std::uint64_t id,std::uint32_t code){
+    auto& thread=threads_.items.at(id);
+    // 只用於尚未提交、從未執行的遠端建立；不派送使用者 callback 或終止整個程序。
+    if(thread.cycles || !thread.suspended || thread.context.rip!=thread_start_)
+        throw HostCallFault("不能以建立回滾回收已執行的執行緒");
+    thread.status=ThreadStatus::Exited;thread.exit_code=code;
+    publish_thread_lifetime(id,code);
+    if(thread.owns_stack){
+        if(thread.stack_size)memory.unmap(GuestAddress{thread.stack_base},static_cast<std::size_t>(thread.stack_size));
+        runtime_.virtual_page_protections.erase(runtime_.virtual_page_protections.lower_bound(thread.stack_base),
+            runtime_.virtual_page_protections.lower_bound(thread.stack_base+thread.stack_size));
+    }
+    if(thread.teb)memory.unmap(GuestAddress{thread.teb},x86_?0x4000:GUEST_CRT_TEB_SIZE);
+    if(thread.exception_area)memory.unmap(GuestAddress{thread.exception_area},0x20000);
+    if(thread.static_tls_size)memory.unmap(GuestAddress{thread.static_tls_base},static_cast<std::size_t>(thread.static_tls_size));
+    thread.static_tls_base=thread.static_tls_size=thread.stack_size=thread.teb=thread.exception_area=thread.errno_cell=0;
+    notify_concurrency_changed();
+}
+std::optional<std::uint32_t> WindowsServices::wait_for_initial_thread(GuestState& state,GuestMemory& memory){
+    if(!awaiting_initial_thread_)return {};
+    const auto wake=mapping_wake();
+    for(;;){
+        const auto epoch=wake?wake->snapshot():0;
+        retired(memory,0);
+        poll_handle_transfers(memory,true);
+        poll_remote_thread_creations(memory);
+        poll_job_termination(memory);
+        poll_machine_shutdown();
+        if(const auto code=runtime_.forced_exit_code()){record_job_exit(*code);return code;}
+        const auto ready=std::find_if(threads_.items.begin(),threads_.items.end(),[](const auto& item){
+            return item.second.status==ThreadStatus::Runnable && !item.second.suspended;
+        });
+        if(ready!=threads_.items.end()){
+            const auto& thread=ready->second;threads_.current=ready->first;
+            state=thread.context;runtime_.errno_cell=thread.errno_cell;
+            runtime_.fls_values=thread.fls_values;runtime_.tls_values=thread.tls_values;
+            last_error_=static_cast<std::uint32_t>(memory.load(GuestAddress{thread.teb+(x86_?0x34U:0x68U)},32));
+            if(const auto error=adopt_initial_process_parameters(state,memory)){
+                publish_thread_lifetime(ready->first,error);record_job_exit(error);return error;
+            }
+            initial_thread_entry_=thread.entry;awaiting_initial_thread_=false;threads_.yield=false;
+            return {};
+        }
+        // 描述元與共享物件通知負責喚醒；50 ms 只補查建立者死亡／交易期限與 Job。
+        if(!wake || !wake->wait_for(epoch,50'000'000))std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
 std::uint64_t WindowsServices::create_guest_thread(const GuestState &state, GuestMemory &memory, std::uint64_t entry,
                                                    std::uint64_t parameter, std::uint64_t requested,
                                                    std::uint32_t flags_value,const GuestThreadBootstrap* bootstrap) {
@@ -3483,7 +3544,8 @@ std::uint64_t WindowsServices::create_guest_thread(const GuestState &state, Gues
             }
         }
         GuestThread thread;
-        thread.desktop_handle = threads_.items.at(threads_.current).desktop_handle;
+        if(const auto parent=threads_.items.find(threads_.current);parent!=threads_.items.end())
+            thread.desktop_handle = parent->second.desktop_handle;
         thread.affinity = runtime_.process_affinity;
         thread.context.segments = state.segments;
         thread.teb = base;
@@ -3691,7 +3753,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
         service.symbol == "SetThreadContext" || service.symbol == "Wow64SetThreadContext" ||
         service.symbol == "SuspendThread" || service.symbol == "Wow64SuspendThread" || service.symbol == "ResumeThread")
         return invoke_thread_control(state, memory, service);
-    if ((service.symbol == "GetExitCodeThread" || service.symbol == "GetThreadId") &&
+    if ((service.symbol == "GetExitCodeThread" || service.symbol == "GetThreadId" || service.symbol == "GetProcessIdOfThread") &&
         process_signaled(arg(0)).has_value())
         return invoke_process(state, memory, service);
     // CRT 包裝保留 cdecl 框架，初始化、錯誤與鎖狀態共用 Win32 流程。
@@ -4278,9 +4340,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
         } else {
             ProcessSnapshot snapshot;
             snapshot.flags = u32(0);
-            for (const auto &[id, thread] : threads_.items)
-                if (thread.status != ThreadStatus::Exited)
-                    snapshot.threads.push_back(thread_identifier(id));
+            if (snapshot.flags & 4U) {
+                const auto error = capture_thread_snapshot(memory, snapshot.threads);
+                if (error) {
+                    last_error_ = error;
+                    arg.return_to(state, UINT64_MAX);
+                    return std::nullopt;
+                }
+            }
             const auto argv = memory.load(GuestAddress{runtime_.wargv_cell}, x86_ ? 32 : 64);
             const auto name = memory.load(GuestAddress{argv}, x86_ ? 32 : 64);
             if (name)
@@ -4402,9 +4469,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                     memory.write(GuestAddress{arg(1)}, std::vector<std::uint8_t>(required));
                     memory.store(GuestAddress{arg(1)}, 32, required);
                     if (thread) {
-                        memory.store(GuestAddress{arg(1) + 8}, 32, snapshot.threads[cursor]);
-                        memory.store(GuestAddress{arg(1) + 12}, 32, process_id());
-                        memory.store(GuestAddress{arg(1) + 16}, 32, 8);
+                        const auto &entry = snapshot.threads[cursor];
+                        memory.store(GuestAddress{arg(1) + 8}, 32, entry.id);
+                        memory.store(GuestAddress{arg(1) + 12}, 32, entry.owner);
+                        memory.store(GuestAddress{arg(1) + 16}, 32, entry.priority);
                     } else {
                         const auto &process = snapshot.processes[cursor];
                         memory.store(GuestAddress{arg(1) + 8}, 32, process.id);
@@ -4581,8 +4649,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
         const unsigned shift = remote ? 1 : 0, id_argument = extended ? 7 : 5 + shift;
         const auto flags_value = u32(4 + shift);
         const auto requested = arg(1 + shift);
-        if (remote && !current_process_handle(arg(0), 0x43a))
-            fail(current_process_handle(arg(0)) ? 5U : process_object_type(arg(0)) == u"Process" ? 50U : 6U);
+        if (remote && !process_handle_pid(arg(0), 0x43a))
+            fail(process_object_type(arg(0)) == u"Process" ? 5U : 6U);
         else if (extended && arg(6))
             fail(50);
         else if (flags_value & ~0x10004U || requested > 8U * 1024 * 1024)
@@ -4593,16 +4661,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 if (arg(id_argument))
                     memory.check(GuestAddress{arg(id_argument)}, 4, Access::Write);
                 GuestThreadBootstrap bootstrap;bootstrap.security_descriptor=security.bytes;bootstrap.inherit=security.inherit;
+                if(remote && !current_process_handle(arg(0))){
+                    RemoteThreadOutputs outputs;outputs.arguments=service.arguments;outputs.identifier=arg(id_argument);outputs.suspended=(flags_value&4U)!=0;
+                    const auto error=begin_remote_thread_creation(memory,arg(0),0x43a,arg(2+shift),arg(3+shift),requested,bootstrap,std::move(outputs));
+                    if(error)fail(error);
+                    else {schedule(state,memory);return std::nullopt;}
+                }else{
                 // 起始位址由真正啟動時的 CPU 執行權限檢查；CREATE_SUSPENDED 不提前執行它。
                 result = create_guest_thread(state, memory, arg(2 + shift), arg(3 + shift), requested, flags_value,&bootstrap);
                 if (result) {
                     if (arg(id_argument))
                         memory.store(GuestAddress{arg(id_argument)}, 32, thread_identifier(thread_id(result)));
                 }
+                }
             } catch (const SecurityDescriptorError &error) {
                 fail(error.code);
             } catch (const MemoryFault &) {
                 fail(87);
+            } catch (const std::bad_alloc &) {
+                fail(8);
             }
         }
     } else if (symbol == "TerminateThread") {

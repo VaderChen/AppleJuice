@@ -26,6 +26,22 @@ EXPORT const Word *volatile heap_state;
 /* 同一份位元契約供宿主回退與客體常駐產碼使用；錯誤路徑仍交回原 CRT 服務。 */
 EXPORT int (*volatile host_ilogb)(double);
 EXPORT int (*volatile host_ilogbf)(float);
+/* Windows 的 long double 與 double 同為 IEEE binary64；short 結果依 ABI 使用 AX。
+ * 只搬移整數位元，保留 signaling NaN、RC／DAZ／FTZ、sticky、errno 與 LastError。
+ * 指標版本只讀取指定寬度，錯誤地址仍由客體記憶體／例外契約處理。 */
+INLINE Word double_bits(double x){Word bits;__builtin_memcpy(&bits,&x,8);return bits;}
+INLINE unsigned float_bits(float x){unsigned bits;__builtin_memcpy(&bits,&x,4);return bits;}
+EXPORT short guest__dclass(double x){return (short)x64arm_classify_float_bits(double_bits(x),64);}
+EXPORT short guest__ldclass(double x){return (short)x64arm_classify_float_bits(double_bits(x),64);}
+EXPORT short guest__fdclass(float x){return (short)x64arm_classify_float_bits(float_bits(x),32);}
+EXPORT int guest__fpclass(double x){return x64arm_fpclass_float_bits(double_bits(x),64);}
+EXPORT int guest__fpclassf(float x){return x64arm_fpclass_float_bits(float_bits(x),32);}
+EXPORT short guest__dtest(const double* x){Word bits;__builtin_memcpy(&bits,x,8);return (short)x64arm_classify_float_bits(bits,64);}
+EXPORT short guest__ldtest(const double* x){Word bits;__builtin_memcpy(&bits,x,8);return (short)x64arm_classify_float_bits(bits,64);}
+EXPORT short guest__fdtest(const float* x){unsigned bits;__builtin_memcpy(&bits,x,4);return (short)x64arm_classify_float_bits(bits,32);}
+EXPORT short guest__dsign(double x){return (short)x64arm_sign_float_bits(double_bits(x),64);}
+EXPORT short guest__ldsign(double x){return (short)x64arm_sign_float_bits(double_bits(x),64);}
+EXPORT short guest__fdsign(float x){return (short)x64arm_sign_float_bits(float_bits(x),32);}
 EXPORT int guest__dpcomp(double x,double y){
     Word a,b;__builtin_memcpy(&a,&x,8);__builtin_memcpy(&b,&y,8);
     return x64arm_ordered_float_bits(a,b,64);

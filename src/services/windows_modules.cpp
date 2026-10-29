@@ -170,9 +170,10 @@ std::optional<TranslationImage> WindowsServices::translation_image(GuestAddress 
     return module.translation;
 }
 #endif
-void WindowsServices::configure_loader(const std::filesystem::path& source,bool trap) {
+void WindowsServices::configure_loader(const std::filesystem::path& source,bool trap,const std::filesystem::path& source_directory) {
     runtime_.trap_unresolved_imports=trap;
     if(!source.empty())runtime_.application_source=std::filesystem::canonical(source).parent_path();
+    else if(!source_directory.empty())runtime_.application_source=std::filesystem::canonical(source_directory);
     runtime_.application_directory=directory(runtime_.image.path);
     if(runtime_.application_directory.empty())runtime_.application_directory=u"C:\\";
 }
@@ -248,6 +249,39 @@ std::uint64_t WindowsServices::module_export(GuestMemory& memory,std::uint64_t h
     const auto found=image->export_ordinals.find(number);if(found==image->export_ordinals.end())throw ModuleError(127,"找不到序號匯出");
     return image->base+found->second;
 }
+void WindowsServices::notify_dll(GuestState& state,GuestMemory& memory,const RuntimeImage& image,std::uint32_t reason) {
+    if(runtime_.dll_notifications.empty())return;
+    // 資料僅在回呼期間借用。載入時尚未綁定 IAT；卸載時 DllMain 已完成，但映像仍可讀。
+    const auto full=image.path;
+    const auto name=full.substr(full.find_last_of(u"\\/")+1);
+    if(full.size()>(UINT16_MAX-2U)/2U || name.size()>(UINT16_MAX-2U)/2U)
+        throw ModuleError(206,"DLL 通知路徑超過 UNICODE_STRING 長度");
+    const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+    const auto header=unit*5U,strings=header+unit*4U;
+    std::vector<std::uint8_t> bytes(strings+(full.size()+name.size()+2)*2);
+    const auto at=allocate_heap(memory,bytes.size());if(!at)throw std::bad_alloc{};
+    const auto saved_error=last_error_;
+    struct Cleanup {WindowsServices& self;GuestMemory& memory;const GuestState& state;std::uint64_t at;std::uint32_t error;
+        ~Cleanup(){(void)self.free_heap(memory,at,state);self.last_error_=error;}} cleanup{*this,memory,state,at,saved_error};
+    memory.write(GuestAddress{at},bytes);
+    const auto store=[&](std::uint64_t offset,std::uint8_t width,std::uint64_t value){memory.store(GuestAddress{at+offset},width,value);};
+    const auto unicode=[&](std::uint64_t descriptor,std::uint64_t buffer,std::u16string_view text){
+        store(descriptor,16,text.size()*2);store(descriptor+2,16,(text.size()+1)*2);store(descriptor+unit,bits,at+buffer);
+        for(std::size_t n=0;n<text.size();++n)store(buffer+n*2,16,text[n]);
+    };
+    store(unit,bits,at+header);store(unit*2,bits,at+header+unit*2);
+    store(unit*3,bits,image.base);store(unit*4,32,image.size);
+    unicode(header,strings,full);unicode(header+unit*2,strings+(full.size()+1)*2,name);
+    // 回呼內取消註冊可立即生效；新註冊從下一次事件開始，不擴張本次派送。
+    const auto last=runtime_.dll_notifications.rbegin()->first;
+    std::uint64_t previous=0;
+    for(;;){
+        const auto found=runtime_.dll_notifications.upper_bound(previous);
+        if(found==runtime_.dll_notifications.end() || found->first>last)break;
+        previous=found->first;const auto registration=found->second;
+        (void)call_guest_nested(state,memory,registration.function,{reason,at,registration.context});
+    }
+}
 std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string requested,std::uint32_t flags,std::vector<std::uint64_t>& created,std::u16string_view search_directory,GuestState* state) {
     if(requested.empty())throw ModuleError(87,"DLL 名稱為空");
     // 明確的 LOAD_LIBRARY_SEARCH 旗標覆蓋程序預設值，相依 DLL 沿用同一搜尋政策。
@@ -292,6 +326,7 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
             if(headers.bytes.size()>headers.code){memory.map(GuestAddress{base+headers.code},headers.bytes.size()-headers.code,read_execute,std::span(headers.bytes).subspan(headers.code));code_mapped=true;}
             runtime_.builtin_images.emplace(base,std::move(image));runtime_.modules.emplace(name,base);
         }catch(...){if(code_mapped)memory.unmap(GuestAddress{base+headers.code});memory.unmap(GuestAddress{base});runtime_.builtin_images.erase(base);throw;}
+        if(state)notify_dll(*state,memory,runtime_.builtin_images.at(base),1);
         return base;
     }
     const bool resource_only=(flags&0x20)!=0;
@@ -376,6 +411,8 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
             static_cast<unsigned long long>(base),static_cast<unsigned long long>(parsed.metadata.image_size));
         auto& loaded=runtime_.loaded_modules.at(base);
         initialize_module_tls(memory,loaded);
+        loaded.notification_ready=true;
+        if(state)notify_dll(*state,memory,loaded.image,1);
         const auto altered=(flags&0x108)?directory(guest):std::u16string(search_directory);
         bind_pe_imports(memory,parsed,[&](const PeImport& imported) {
             const auto count=created.size();std::uint64_t dependency=0;
@@ -422,15 +459,16 @@ GuestAddress WindowsServices::bind_image_import(GuestMemory& memory,const PeImpo
     }
 }
 void WindowsServices::prepare_image_startup(GuestState& state) {
-    if(!runtime_.module_order.empty() || !runtime_.image.tls_callbacks.empty())state.rip=startup_entry_;
+    if(initial_thread_entry_ || !runtime_.module_order.empty() || !runtime_.image.tls_callbacks.empty())state.rip=startup_entry_;
 }
-void WindowsServices::unmap_module(GuestMemory& memory,std::uint64_t base) {
+void WindowsServices::unmap_module(GuestMemory& memory,std::uint64_t base,GuestState* state) {
     if(const auto resource=runtime_.resource_modules.find(base);resource!=runtime_.resource_modules.end()) {
         for(const auto& [address,size]:resource->second.mappings)memory.unmap(GuestAddress{address},size);
         runtime_.module_events.push_back("resource_unload="+utf16_to_utf8(resource->second.image.path));runtime_.resource_modules.erase(resource);return;
     }
     const auto found=runtime_.loaded_modules.find(base);if(found==runtime_.loaded_modules.end())return;
     const auto& module=found->second;
+    if(state && module.notification_ready)notify_dll(*state,memory,module.image,2);
     if(module.tls_slot!=UINT32_MAX) {
         for(const auto& [id,thread]:threads_.items){
             (void)id;if(thread.status==ThreadStatus::Exited)continue;
@@ -489,7 +527,7 @@ std::optional<std::uint32_t> WindowsServices::advance_module_operation(GuestStat
             start_callbacks(state,memory,{step.callback},Continuation::ModuleOperation,id);return std::nullopt;
         }
         if(step.complete)runtime_.loaded_modules.at(step.module).attached=true;
-        if(step.unmap){unmap_module(memory,step.module);emit_debug_module(state,memory,step.module,false);}
+        if(step.unmap){unmap_module(memory,step.module,&state);emit_debug_module(state,memory,step.module,false);}
         ++operation.index;
     }
     const auto result=operation.result;const auto error=operation.error;const bool startup=operation.startup;
@@ -696,7 +734,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,Gu
             found->second.no_thread_calls=true;result=1;
         }else if(symbol=="FreeLibrary" || symbol=="FreeLibraryAndExitThread") {
             if(runtime_.resource_modules.contains(arg(0))) {
-                unmap_module(memory,arg(0));
+                unmap_module(memory,arg(0),&state);
                 if(symbol=="FreeLibraryAndExitThread")return exit_thread(state,memory,static_cast<std::uint32_t>(arg(1)));
                 call.return_to(state,1);return std::nullopt;
             }
@@ -722,14 +760,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,Gu
             }
         }else throw HostCallFault("未實作此模組 API");
     }catch(const ModuleError& error) {
-        for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it);
+        for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it,&state);
         last_error_=error.code;result=0;
         runtime_.module_events.push_back("module_error="+std::to_string(error.code)+" "+error.what());
     }catch(const std::invalid_argument& error) {
-        for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it);
+        for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it,&state);
         last_error_=193;result=0;runtime_.module_events.push_back("module_error=193 "+std::string(error.what()));
     }catch(const std::bad_alloc&) {
-        for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it);
+        for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it,&state);
         last_error_=8;result=0;runtime_.module_events.push_back("module_error=8 模組／TLS 配置超過客體記憶體預算");
     }
     if(symbol=="FreeLibraryAndExitThread")return exit_thread(state,memory,static_cast<std::uint32_t>(arg(1)));

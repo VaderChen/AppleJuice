@@ -1024,33 +1024,36 @@ PeProgram load_pe(std::span<const std::uint8_t> bytes,PeOptions options){
     GuestAddress stack_base{x86 ? UINT64_C(0x78000000) : UINT64_C(0x3000000000)}; // x64 主堆疊位於 MMU 視窗內。
     if(!x86 && prefer_low_guest_stack())
         if(const auto low=find_guest_address_gap(program.memory,UINT64_C(0x78000000),parsed.stack_size,UINT64_C(0x100000000)))stack_base=*low;
-    {startup_profile::Scope phase("loader","map_stack",true);
+    if(!options.no_initial_thread){startup_profile::Scope phase("loader","map_stack",true);
         program.memory.map(stack_base,static_cast<std::size_t>(parsed.stack_size),read_write);}
     program.services.initialize(program.memory,options.command_line,options.filesystem_root,options.c_drive,options.writable_files,options.install_root,options.drive_mappings,options.certificate_roots_file,options.resident_translation);
     if(options.primary_token_descriptor>=0)program.services.import_primary_token(options.primary_token_descriptor);
     else if(!options.executable_path.empty())program.services.apply_manifest_elevation(options.executable_path);
     auto& runtime=parsed.runtime;
     if(!options.executable_path.empty())runtime.path=program.services.map_executable(options.executable_path);
+    else if(!options.guest_image_path.empty())runtime.path=options.guest_image_path;
     program.state.rip=program.metadata.entry;
-    program.state.reg(Gpr::Rsp)=stack_base.value+parsed.stack_size-(x86 ? 4 : 40);
-    program.memory.store(GuestAddress{program.state.reg(Gpr::Rsp)},x86 ? 32 : 64,x86 ? UINT64_C(0x7ffffff0) : return_sentinel.value);
-    runtime.stack_base=stack_base.value;runtime.stack_size=parsed.stack_size;
+    if(!options.no_initial_thread){
+        program.state.reg(Gpr::Rsp)=stack_base.value+parsed.stack_size-(x86 ? 4 : 40);
+        program.memory.store(GuestAddress{program.state.reg(Gpr::Rsp)},x86 ? 32 : 64,x86 ? UINT64_C(0x7ffffff0) : return_sentinel.value);
+    }
+    runtime.stack_base=options.no_initial_thread?0:stack_base.value;runtime.stack_size=parsed.stack_size;
     // parsed 僅由本次完整解析建立，映射後尚未執行客體；直接交接驗證結果。
     try{startup_profile::Scope phase("loader","configure_image",true);
-        program.services.configure_image_after_unwind_validation(program.state,program.memory,std::move(runtime));}
+        program.services.configure_image_after_unwind_validation(program.state,program.memory,std::move(runtime),!options.no_initial_thread);}
     catch(const HostCallFault& error){reject(error.what());}
     catch(const MemoryFault& error){
         std::ostringstream detail;detail<<error.what()<<"，address=0x"<<std::hex<<error.address.value<<" access="<<access_name(error.access)<<" size="<<std::dec<<error.size;
         reject(detail.str());
     }
-    program.services.configure_loader(options.executable_path,options.trap_unresolved_imports);
+    program.services.configure_loader(options.executable_path,options.trap_unresolved_imports,options.loader_directory);
 #ifdef X64ARM_HOST_SERVICES_TRANSLATION_IMAGE
     // 主程式與 DLL 同樣以內容雜湊作為翻譯身分；沒有宿主來源路徑（記憶體載入）時不提供。
     if(!options.executable_path.empty())program.services.set_main_translation(TranslationImage{options.executable_path,
         WindowsServices::image_identity(options.executable_path,bytes),parsed.metadata.loaded_base,parsed.metadata.preferred_base,parsed.metadata.image_size});
 #endif
     parsed.mappings.clear();program.pending_imports=std::move(parsed);
-    if(!options.defer_imports)complete_pe_load(program);
+    if(!options.defer_imports && !options.no_initial_thread)complete_pe_load(program);
     return program;
 }
 void complete_pe_load(PeProgram& program){

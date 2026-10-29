@@ -482,21 +482,26 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
             reply.error=packet.reserved!=family_protocol || !packet.sequence || !packet.options || !packet.flags || packet.flags>60000 ||
                 !packet.auxiliary || packet.auxiliary!=reply.auxiliary || !caller.live({packet.sender,packet.handle})?87U:0U;
             if(!reply.error)reply.error=packet.options==1?
-                queue_perflib_remote(packet.sender,packet.handle,packet.sequence,packet.type,packet.flags,packet.accounting,packet.mode,descriptor,state_descriptor):50U;
+                queue_perflib_remote(packet.sender,packet.handle,packet.sequence,packet.type,packet.flags,packet.accounting,packet.mode,descriptor,state_descriptor):
+                packet.options==2 && state_descriptor<0?
+                receive_remote_thread_creation(memory,packet.sender,packet.handle,packet.sequence,packet.type,packet.flags,packet.accounting,packet.mode,descriptor):50U;
             // 已接受的請求由客體 worker 執行及回覆，不能在排入工作時回傳 API 成功。
             if(reply.error)(void)send_transfer(transfer.descriptor,path,reply);
         }
         else if(packet.kind==family_cancel_kind){
-            if(packet.reserved==family_protocol && packet.options==1 && packet.sequence && !descriptor_count &&
-               packet.auxiliary==process_identity_birth() && process_identity::query(packet.sender).live({packet.sender,packet.handle}))
-                cancel_perflib_remote(packet.sender,packet.handle,packet.sequence);
+            if(packet.reserved==family_protocol && packet.sequence && !descriptor_count &&
+               packet.auxiliary==process_identity_birth() && process_identity::query(packet.sender).live({packet.sender,packet.handle})){
+                if(packet.options==1)cancel_perflib_remote(packet.sender,packet.handle,packet.sequence);
+                // thread channel 的 atomic phase 決定提交或取消；已提交的建立不可被晚到的取消撤回。
+                else if(packet.options==2)poll_remote_thread_creations(memory);
+            }
         }
         else if(packet.kind==14 || packet.kind==15 || packet.kind==19){
             reply.accounting=packet.accounting;reply.mode=packet.mode;
             // 每次請求仍核對建立時間，避免舊 handle 因 PID 重用操作另一程序。
             if(!packet.auxiliary || packet.auxiliary!=process_identity_birth())reply.error=87;
             else {
-                const bool needs_file=packet.kind==14?(packet.options==6 || packet.options==7 || packet.options==8 || packet.options==9):packet.kind==15 && (packet.options<=1 || packet.options==9);
+                const bool needs_file=packet.kind==14?(packet.options==6 || packet.options==7 || packet.options==8 || packet.options==9 || packet.options==12):packet.kind==15 && (packet.options<=1 || packet.options==9);
                 struct stat info{};const auto size=packet.kind==14?UINT64_C(65534):packet.options==9?UINT64_C(24):packet.accounting[1];
                 if(needs_file && (descriptor<0 || size>static_cast<std::uint64_t>(INT64_MAX) || ::fstat(descriptor,&info) || !S_ISREG(info.st_mode) || info.st_uid!=::geteuid() || (info.st_mode&077) || info.st_nlink || info.st_size<0 || static_cast<std::uint64_t>(info.st_size)!=size))reply.error=13;
                 else if(packet.kind==19){

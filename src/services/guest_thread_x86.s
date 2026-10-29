@@ -181,5 +181,46 @@ entry TryAcquireSRWLockShared
     ret 4
 1:
 slow_end TryAcquireSRWLockShared
+// Interlocked 純量家族沿同一 LOCK 原子指令契約編譯為 resident AOT。
+// 自然對齊以外的呼叫尾跳原 provider；不改 LastError、非 volatile 暫存器及原始呼叫框架。
+.macro interlocked_word name, operation, arguments
+entry \name
+    mov ecx, dword ptr [esp+4]
+    test cl, 3
+    jne 1f
+    .ifc \operation,increment
+    mov eax, 1
+    lock xadd dword ptr [ecx], eax
+    inc eax
+    .endif
+    .ifc \operation,decrement
+    mov eax, -1
+    lock xadd dword ptr [ecx], eax
+    dec eax
+    .endif
+    .ifc \operation,add
+    mov eax, dword ptr [esp+8]
+    lock xadd dword ptr [ecx], eax
+    .endif
+    .ifc \operation,exchange
+    mov eax, dword ptr [esp+8]
+    xchg dword ptr [ecx], eax
+    .endif
+    .ifc \operation,compare
+    mov edx, dword ptr [esp+8]
+    mov eax, dword ptr [esp+12]
+    lock cmpxchg dword ptr [ecx], edx
+    .endif
+    ret \arguments*4
+1:
+slow_end \name
+.endm
+interlocked_word InterlockedExchange, exchange, 2
+interlocked_word InterlockedIncrement, increment, 1
+interlocked_word InterlockedDecrement, decrement, 1
+interlocked_word InterlockedExchangeAdd, add, 2
+interlocked_word InterlockedCompareExchange, compare, 3
+interlocked_word InterlockedExchangePointer, exchange, 2
+interlocked_word InterlockedCompareExchangePointer, compare, 3
 .globl _guest_thread_end
 _guest_thread_end:

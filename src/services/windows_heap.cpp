@@ -1,17 +1,21 @@
 #include "x64arm/windows_services.hpp"
 #include "ldap_api.hpp"
+#include "guest_heap_inspection.hpp"
 #include <algorithm>
 
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> heap_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{{"kernel32.dll","HeapCompact",2,0,0,2},{"crt","_get_heap_handle",0},{"crt","_heapchk",0},{"crt","_heapmin",0},{"crt","_heapwalk",1}};return table;
 }
-bool WindowsServices::validate_heap(const GuestMemory& memory,std::uint64_t heap,std::uint64_t pointer) const{
+bool WindowsServices::validate_heap(GuestMemory& memory,std::uint64_t heap,std::uint64_t pointer) const{
     if(heap!=process_heap && !runtime_.private_heaps.contains(heap))return false;
+    if(pointer && guest_heap_contains(pointer))return validate_guest_heap(memory,heap,pointer);
     const auto owner=[&](std::uint64_t address){const auto found=runtime_.heap_owners.find(address);return found==runtime_.heap_owners.end()?process_heap:found->second;};
     if(pointer && (!allocations_.contains(pointer) || owner(pointer)!=heap))return false;
     std::uint64_t previous_end=0;
     for(const auto& [address,size]:allocations_){
+        // 單一區塊驗證不掃描其他配置的控制資料。
+        if(pointer && pointer!=address)continue;
         if(address<previous_end || size>UINT64_MAX-address)return false;
         previous_end=address+size;
         if(owner(address)!=heap || (pointer && pointer!=address))continue;
@@ -26,7 +30,7 @@ bool WindowsServices::validate_heap(const GuestMemory& memory,std::uint64_t heap
         if(free!=free_heap_blocks_.end() && free->first<previous_end)return false;
         if(free!=free_heap_blocks_.begin()){const auto prior=std::prev(free);if(prior->second>UINT64_MAX-prior->first || prior->first+prior->second>address)return false;}
     }
-    return true;
+    return pointer || validate_guest_heap(memory,heap);
 }
 std::optional<std::uint32_t> WindowsServices::invoke_heap(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.family=="crt"){
@@ -126,9 +130,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_heap(GuestState& state,Gues
     arg.return_to(state,largest);return std::nullopt;
 }
 bool WindowsServices::await_heap_service(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    const auto name=service.symbol;
+    if(detail::heap_inspection_service(name)){
+        const WindowsCall call(state,memory,service);
+        const auto heap=name.front()=='_'?process_heap:call(0);
+        const bool serialized=name!="HeapValidate" || !(call(1)&1U);
+        if(serialized && heap==process_heap && detail::guest_heap_inspection_busy(guest_scalar_math_routines_.value,threads_,threads_.current,
+                guest_heap_state_.value && memory.load(guest_heap_state_,32))){
+            auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};
+            // 第二個元素表示還須等客體配置常式完成；第一個元素仍為原本的 HeapLock 歸屬。
+            thread.wait.kind=ThreadWaitKind::HeapRetry;thread.wait.handles={heap,1};
+            // 只有驗證等待者使用期限喚醒；重新進入完整服務邊界後才讀其他 worker 的 RIP。
+            // 配置常式可以持續在客體執行，不必靠下一次宿主呼叫，也不加入熱路徑輪詢。
+            thread.wait.deadline=runtime_.clock_ticks+10000;
+            schedule(state,memory);return true;
+        }
+    }
     // 沒有 HeapLock 紀錄時不可能等待；API 本體仍負責完整的框架與 heap 檢查。
     if(runtime_.heap_locks.empty())return false;
-    const auto name=service.symbol;
     const bool explicit_heap=name=="HeapCompact" || name=="HeapLock" || name=="HeapDestroy" || name=="HeapAlloc" || name=="HeapReAlloc" || name=="HeapFree" || name=="HeapSize" || name=="HeapValidate" || name=="HeapWalk" || name=="HeapSetInformation" || name=="HeapQueryInformation";
     // 這些入口共用本引擎的 process heap，不能在另一執行緒持有 HeapLock 時穿越。
     static constexpr std::string_view process_allocators[]{

@@ -14,8 +14,7 @@ bool native_file_trace_slot(bool enabled,std::atomic<unsigned>& count) {
 }
 std::uint32_t WindowsServices::call_guest_native_file(GuestState& state,GuestMemory& memory,
         std::uint64_t target,std::vector<std::uint64_t> arguments) {
-    if(!has_nested_runner())throw HostCallFault("目前執行範圍無法完成客體檔案回呼");
-    const auto saved=state;const auto depth=runtime_.callbacks.size();const auto owner=threads_.current;
+    const auto depth=runtime_.callbacks.size();const auto owner=threads_.current;
     // 有界開檔診斷只記錄參數的借用區間，不保留路徑或擴張客體配置生命週期。
     static const bool trace_enabled=std::getenv("X64ARM_TRACE_NATIVE_OPEN")!=nullptr;
     static std::atomic<unsigned> traced{};
@@ -36,14 +35,7 @@ std::uint32_t WindowsServices::call_guest_native_file(GuestState& state,GuestMem
     };
     describe("enter");
     struct TraceEnd {const decltype(describe)& describe;~TraceEnd(){describe("leave");}} trace_end{describe};
-    // 保留真正的呼叫框架；回呼只傳回結果，尚未返回外層 Windows API。
-    try {start_callbacks(state,memory,{{target,std::move(arguments)}},Continuation::NestedResult);}
-    catch(...){state=saved;throw;}
-    const auto stopped=[&]{return threads_.current==owner && runtime_.callbacks.size()==depth && state.rip==saved.rip;};
-    const auto result=run_nested(state,memory,stopped);
-    if(!stopped())throw NestedExecutionStop(result);
-    const auto value=static_cast<std::uint32_t>(state.reg(Gpr::Rax));const auto tsc=state.tsc;
-    state=saved;state.tsc=tsc;return value;
+    return static_cast<std::uint32_t>(call_guest_nested(state,memory,target,std::move(arguments)));
 }
 
 std::pair<std::uint64_t,bool> WindowsServices::native_file_entry(GuestMemory& memory,std::string_view symbol) {

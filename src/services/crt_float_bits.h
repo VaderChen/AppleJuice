@@ -1,5 +1,26 @@
 #pragma once
 /* CRT 分類原語共用 IEEE 位元契約，避免 NaN 比較污染宿主或客體浮點旗標。 */
+static inline int x64arm_classify_float_bits(unsigned long long bits,unsigned width) {
+    const unsigned fraction_width=width==32?23:52;
+    const unsigned exponent_mask=width==32?255:2047;
+    const unsigned exponent=(unsigned)(bits>>fraction_width)&exponent_mask;
+    const unsigned long long fraction=bits&((1ULL<<fraction_width)-1);
+    if(exponent==exponent_mask)return fraction?2:1;
+    return exponent?-1:fraction?-2:0;
+}
+static inline int x64arm_fpclass_float_bits(unsigned long long bits,unsigned width) {
+    const unsigned fraction_width=width==32?23:52;
+    const int classification=x64arm_classify_float_bits(bits,width);
+    const int negative=(int)((bits>>(width-1))&1);
+    if(classification==2)return bits&(1ULL<<(fraction_width-1))?2:1;
+    if(classification==1)return negative?4:512;
+    if(classification==-1)return negative?8:256;
+    if(classification==-2)return negative?16:128;
+    return negative?32:64;
+}
+static inline unsigned short x64arm_sign_float_bits(unsigned long long bits,unsigned width) {
+    return (unsigned short)(((bits>>(width-1))&1)<<15);
+}
 static inline int x64arm_ordered_float_bits(unsigned long long a,unsigned long long b,unsigned width) {
     const unsigned long long sign=1ULL<<(width-1),mask=sign-1;
     const unsigned long long infinity=width==32?0x7f800000ULL:0x7ff0000000000000ULL;

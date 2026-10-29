@@ -23,6 +23,13 @@ struct GuestCallback {
     // 只攔截逸出這個 callback 的例外；guest 內部仍可搜尋 handler 並完成 unwind。
     GuestExceptionPolicy exception_policy{GuestExceptionPolicy::Propagate};
     std::uint64_t waitable_timer{}; // 核心物件身分，用於取消或去除重複的 timer APC。
+    // 非同步通知的資料必須在該次 callback 進入前發布，不能被後續通知覆蓋。
+    struct Writeback32 {
+        std::uint64_t address{};
+        std::uint32_t clear_mask{UINT32_MAX},value{};
+        bool operator==(const Writeback32&) const = default;
+    };
+    std::vector<Writeback32> writebacks{};
     bool operator==(const GuestCallback&) const = default;
 };
 }

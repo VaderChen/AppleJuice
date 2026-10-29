@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <cerrno>
 #include <cstdlib>
+#include <cstdio>
 #include <iostream>
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -29,6 +30,23 @@ std::uint32_t residency_error(const std::error_code& error){
     if(error==std::errc::invalid_argument)return 87;
     if(error==std::errc::operation_not_supported || error==std::errc::function_not_supported)return 50;
     return 998;
+}
+void trace_virtual_transition(std::uint64_t pid,const char* operation,std::uint64_t address,
+        std::uint64_t size,std::uint64_t flags,std::uint32_t status,
+        std::uint64_t cleared=0,std::uint64_t advised=0) noexcept {
+    // 故障定位專用，預設關閉；只記宿主已處理的操作，不讀寫額外客體資料。
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_TRACE_VIRTUAL_TRANSITIONS");
+        return value && std::string_view(value)=="1";}();
+    if(!enabled)return;
+    static std::atomic<unsigned> sequence{};
+    constexpr unsigned capacity=262144;
+    const auto index=sequence.fetch_add(1,std::memory_order_relaxed);
+    if(index>capacity)return;
+    if(index==capacity){std::fprintf(stderr,"[virtual_transition_limit] pid=%llu records=%u\n",static_cast<unsigned long long>(pid),capacity);return;}
+    std::fprintf(stderr,"[virtual_transition] pid=%llu sequence=%u operation=%s address=0x%llx size=0x%llx flags=0x%llx status=%u cleared=0x%llx advised=0x%llx\n",
+        static_cast<unsigned long long>(pid),index,operation,static_cast<unsigned long long>(address),
+        static_cast<unsigned long long>(size),static_cast<unsigned long long>(flags),status,
+        static_cast<unsigned long long>(cleared),static_cast<unsigned long long>(advised));
 }
 }
 VirtualMemoryInformation WindowsServices::virtual_memory_information(const GuestMemory& memory,std::uint64_t raw) const {
@@ -343,6 +361,9 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
     if(error)return error;
     if(operation==2){const auto requested=values[0];values[0]=result;values[1]=requested?round_page(requested+values[1])-result:round_page(values[1]);}
     else if(operation==4){const auto end=round_page(values[0]+values[1]);values[0]&=~(page-1);values[1]=end-values[0];}
+    if(operation==2 || operation==3 || operation==4)
+        trace_virtual_transition(process_id(),operation==2?"allocate":operation==3?"release":"protect",
+            values[0],values[1],values[2],result?0U:487U);
     return result?0U:487U;
 }
 std::span<const WindowsServiceDescriptor> working_set_service_descriptors(){
@@ -773,6 +794,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,Gu
     };
     if(symbol=="DiscardVirtualMemory" || symbol=="OfferVirtualMemory" || symbol=="ReclaimVirtualMemory"){
         const auto address=arg(0),size=arg(1);
+        std::uint64_t cleared=0,advised=0;
         const bool offer=symbol=="OfferVirtualMemory",reclaim=symbol=="ReclaimVirtualMemory";
         const auto priority=offer?static_cast<std::uint32_t>(arg(2)):0U;
         // DWORD 錯誤碼直接回傳；成功和失敗皆不以 LastError 取代這項契約。
@@ -812,13 +834,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,Gu
                         pending.emplace(cursor,OfferedMemoryPage{mapping->permissions,priority,true});}
                     // 此後端採立即丟棄策略；Reclaim 依實際 lost 狀態要求客體重寫資料。
                     if(!status){
-                        (void)memory.discard_contents(GuestAddress{address},static_cast<std::size_t>(size),offer);
+                        const auto discarded=memory.discard_contents(GuestAddress{address},static_cast<std::size_t>(size),offer);
+                        cleared=discarded.cleared;advised=discarded.advised;
                         if(offer)offered.merge(pending);
                         for(auto item=runtime_.reset_memory_pages.lower_bound(address);item!=runtime_.reset_memory_pages.end() && item->first<end;++item)item->second=true;
                     }
                 }
             }
         }catch(const MemoryFault&){status=487;}catch(const std::invalid_argument&){status=87;}catch(const std::bad_alloc&){status=8;}
+        trace_virtual_transition(process_id(),offer?"offer":reclaim?"reclaim":"discard",address,size,priority,status,cleared,advised);
         last_error_=saved_error;call.return_to(state,status);return std::nullopt;
     }else if(symbol=="PrefetchVirtualMemory"){
         if(!current_process_handle(arg(0),0x10))fail(current_process_handle(arg(0))?5:process_object_type(arg(0))==u"Process"?50:6);

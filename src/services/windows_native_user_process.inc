@@ -113,13 +113,7 @@ if(service.symbol=="NtCreateUserProcess" || service.symbol=="ZwCreateUserProcess
             if(call(8)){
                 const auto env=pointer(call(8)+layout.environment);
                 if(env){
-                    bool zero=false,terminated=false;
-                    for(std::uint64_t offset=0;offset<16*1024*1024;offset+=2){
-                        const auto c=m.load(GuestAddress{env+offset},16);environment.push_back(static_cast<std::uint8_t>(c));environment.push_back(static_cast<std::uint8_t>(c>>8));
-                        if(!c && (zero || !offset)){terminated=true;break;}zero=!c;
-                    }
-                    if(!terminated)co_return done(0xc000000dU);
-                    if(environment.size()==2){environment.push_back(0);environment.push_back(0);}
+                    environment=detail::capture_native_environment(m,env);
                 }
             }
             const auto image_bytes=encode(image);

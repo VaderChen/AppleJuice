@@ -345,6 +345,16 @@ struct D3D12Submitter {
         std::atomic<std::uint64_t> copy_skipped{},copy_written{};} stats;
     static bool tracing(){static const bool on=std::getenv("X64ARM_TRACE_D3D12_SUBMIT")!=nullptr;return on;}
     static std::uint64_t now_ns(){return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
+    // 長幀診斷：X64ARM_TRACE_STALLS=<毫秒門檻>（未設定時關閉）時，單次客體等待或提交執行緒的單一工作超過門檻就輸出 slow_service 格式的一行。
+    static std::uint64_t stall_us(){static const std::uint64_t value=[]()->std::uint64_t{const auto* text=std::getenv("X64ARM_TRACE_STALLS");
+        return text?std::max<std::uint64_t>(1,std::strtoull(text,nullptr,10))*1000:0;}();return value;}
+    static bool timed(){return tracing() || stall_us();}
+    static void stall(const char* name,std::uint64_t start){
+        if(!start || !stall_us())return;const auto us=(now_ns()-start)/1000;if(us<stall_us())return;
+        const auto now=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr,"slow_service pid=%d thread=0 duration_us=%llu end_unix_us=%lld name=stall:%s\n",static_cast<int>(::getpid()),
+            static_cast<unsigned long long>(us),static_cast<long long>(now),name);
+    }
     ~D3D12Submitter(){{const std::lock_guard lock(mutex);stopping=true;}wake.notify_all();if(started)pthread_join(thread,nullptr);}
 };
 namespace {
@@ -492,9 +502,10 @@ std::uint64_t d3d12_enqueue(D3D12Submitter& submitter,D3D12Submitter::Job job,bo
     {
         std::unique_lock lock(submitter.mutex);
         if(bounded && submitter.queued-submitter.done>=256){
-            const auto start=D3D12Submitter::tracing()?D3D12Submitter::now_ns():0;
+            const auto start=D3D12Submitter::timed()?D3D12Submitter::now_ns():0;
             submitter.idle.wait(lock,[&]{return submitter.queued-submitter.done<256;});
             if(start)submitter.stats.enqueue_wait.fetch_add(D3D12Submitter::now_ns()-start,std::memory_order_relaxed);
+            D3D12Submitter::stall("guest_queue_limit",start);
         }
         submitter.jobs.push_back(std::move(job));ticket=++submitter.queued;
     }
@@ -503,9 +514,10 @@ std::uint64_t d3d12_enqueue(D3D12Submitter& submitter,D3D12Submitter::Job job,bo
 // 等提交執行緒完成到指定排入序號（呼叫端不得持圖形鎖：重播需要它）。
 void d3d12_wait_ticket(D3D12Submitter& submitter,std::uint64_t ticket){
     std::unique_lock lock(submitter.mutex);if(submitter.done>=ticket)return;
-    const auto start=D3D12Submitter::tracing()?D3D12Submitter::now_ns():0;
+    const auto start=D3D12Submitter::timed()?D3D12Submitter::now_ns():0;
     submitter.idle.wait(lock,[&]{return submitter.done>=ticket;});
     if(start)submitter.stats.drain_wait.fetch_add(D3D12Submitter::now_ns()-start,std::memory_order_relaxed);
+    D3D12Submitter::stall("guest_wait_ticket",start);
 }
 }
 void WindowsServices::d3d12_start_submitter(GuestMemory& memory){
@@ -536,7 +548,7 @@ void WindowsServices::d3d12_submit_loop(GuestMemory& memory,D3D12Submitter& subm
             job=std::move(submitter.jobs.front());submitter.jobs.pop_front();
         }
         const bool signal=job.method==&d3d12_signal_method,present=job.method==&d3d12_present_method;
-        const auto started=trace?D3D12Submitter::now_ns():0;const auto waited=graphics_wait_ns();
+        const auto started=(trace || D3D12Submitter::stall_us())?D3D12Submitter::now_ns():0;const auto waited=graphics_wait_ns();
         if(trace){
             (signal?stats.signals:present?stats.presents:stats.executes).fetch_add(1,std::memory_order_relaxed);
             stats.lists.fetch_add(job.programs.size(),std::memory_order_relaxed);
@@ -548,6 +560,7 @@ void WindowsServices::d3d12_submit_loop(GuestMemory& memory,D3D12Submitter& subm
             if(d3d12_){const std::lock_guard lock(d3d12_->notes_mutex);d3d12_->worker_notes.push_back(std::string("d3d12_note=提交執行緒失敗：")+error.what());}
         }
         d3d12_submit_context()=nullptr;
+        D3D12Submitter::stall(signal?"submit_signal":present?"submit_present":"submit_execute",started);
         job.programs.clear();
         // 客體 Reset 交出的快照在此釋放（鎖外解構），不佔客體執行緒的時間。
         if(d3d12_){
@@ -639,9 +652,10 @@ void WindowsServices::d3d12_drain(){
     if(!d3d12_submitter_)return;auto& submitter=*d3d12_submitter_;
     std::unique_lock lock(submitter.mutex);const auto target=submitter.queued;
     if(submitter.done>=target)return;
-    const auto start=D3D12Submitter::tracing()?D3D12Submitter::now_ns():0;
+    const auto start=D3D12Submitter::timed()?D3D12Submitter::now_ns():0;
     submitter.idle.wait(lock,[&]{return submitter.done>=target;});
     if(start)submitter.stats.drain_wait.fetch_add(D3D12Submitter::now_ns()-start,std::memory_order_relaxed);
+    D3D12Submitter::stall("guest_drain",start);
 }
 // Benchmark 期間 Resource.AddRef／Release 每秒約上千次，原本每次全停。呼叫端持共用映射鎖＋圖形鎖；
 // 物件表的增刪只在全停或獨占映射鎖下發生，這裡只改既有物件的計數。
@@ -660,6 +674,10 @@ bool WindowsServices::d3d12_worker_reference(GuestState& state,GuestMemory& memo
 }
 // Benchmark 期間 Resource.Map／Unmap 每秒各數百次原本全停。零複製資源（UPLOAD／READBACK）沒有待完成的 GPU 寫入時，
 // Map 只把客體位址寫到輸出指標；等 GPU、讀回與輸出落在寫入時複製頁（共用映射鎖下不得私有化）時交回協調者，未改任何狀態。
+// 零複製資源的 Map 不等尚未完成的 GPU 寫入與提交重播。D3D12 的 Map 本身不同步，應用程式以 fence 判斷哪一段可讀；
+// 零複製資源的 GPU 寫入完成時直接對 CPU 可見，fence 也在完成後才發出。原本讀回資源的 Map 會持圖形鎖等整個 GPU，
+// 連帶卡住提交執行緒與其他需鎖呼叫（電馭判客 Benchmark +2.7%）。X64ARM_D3D12_MAP_NO_WAIT=0 恢復等待，對照用。
+static bool d3d12_map_no_wait(){static const bool value=[] {const auto* text=std::getenv("X64ARM_D3D12_MAP_NO_WAIT");return !text || std::string_view(text)!="0";}();return value;}
 bool WindowsServices::d3d12_worker_map(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(x86_ || !d3d12_)return false;
     const WindowsCall arg(state,memory,service);
@@ -670,9 +688,10 @@ bool WindowsServices::d3d12_worker_map(GuestState& state,GuestMemory& memory,con
     {
         // 只清除已完成的寫入旗標；未完成時交回協調者路徑等 GPU。
         const std::lock_guard lock(d3d12_->resource_lock(arg(0)));
-        if(!r.cpu || (r.gpu_writes && !r.gpu_writes->load(std::memory_order_acquire)) || (r.reads_back() && r.gpu && !r.host_shared))return false;
-        if(r.submit_ticket && d3d12_submitter_){const std::lock_guard pending(d3d12_submitter_->mutex);if(d3d12_submitter_->done<r.submit_ticket)return false;}
-        r.gpu_writes.reset();
+        const bool no_wait=r.host_shared && d3d12_map_no_wait();
+        if(!r.cpu || (!no_wait && r.gpu_writes && !r.gpu_writes->load(std::memory_order_acquire)) || (r.reads_back() && r.gpu && !r.host_shared))return false;
+        if(!no_wait && r.submit_ticket && d3d12_submitter_){const std::lock_guard pending(d3d12_submitter_->mutex);if(d3d12_submitter_->done<r.submit_ticket)return false;}
+        if(!r.gpu_writes || r.gpu_writes->load(std::memory_order_acquire))r.gpu_writes.reset();
     }
     if(const auto out=arg(3))memory.store(GuestAddress{out},64,r.cpu);
     arg.return_to(state,0);return true;
@@ -689,7 +708,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
     if(!submit_job && !d3d12_worker_context() && d3d12_drains(symbol))d3d12_drain();
     if(!submit_job && symbol=="Resource.Map" && d3d12_submitter_ && d3d12_){
         std::uint64_t ticket{};
-        if(const auto found=d3d12_->resources.find(arg(0));found!=d3d12_->resources.end()){const std::lock_guard lock(d3d12_->resource_lock(found->first));ticket=found->second.submit_ticket;}
+        if(const auto found=d3d12_->resources.find(arg(0));found!=d3d12_->resources.end()){const std::lock_guard lock(d3d12_->resource_lock(found->first));if(!(found->second.host_shared && d3d12_map_no_wait()))ticket=found->second.submit_ticket;}
         if(ticket)d3d12_wait_ticket(*d3d12_submitter_,ticket);
     }
     std::unique_lock<std::recursive_mutex> graphics_guard(graphics_mutex(),std::defer_lock);
@@ -1079,9 +1098,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 {
                     std::unique_lock lock(submitter.mutex);
                     if(submitter.presents>=3){
-                        const auto start=D3D12Submitter::tracing()?D3D12Submitter::now_ns():0;
+                        const auto start=D3D12Submitter::timed()?D3D12Submitter::now_ns():0;
                         submitter.idle.wait(lock,[&]{return submitter.presents<3;});
                         if(start)submitter.stats.present_wait.fetch_add(D3D12Submitter::now_ns()-start,std::memory_order_relaxed);
+                        D3D12Submitter::stall("guest_present_inflight",start);
                     }
                     ++submitter.presents;
                 }
@@ -1606,7 +1626,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         if(member=="Map"){
             if(!r.cpu)return finish(invalid);
             // READBACK：映射時取得 GPU 最新內容；零複製資源只需等寫入它的提交完成。
-            const auto writes=[&]{const std::lock_guard lock(bridge.resource_lock(self));return std::exchange(r.gpu_writes,nullptr);}();
+            const auto writes=[&]{const std::lock_guard lock(bridge.resource_lock(self));
+                // 不等待時保留未完成的寫入旗標（見 d3d12_map_no_wait）。
+                if(r.host_shared && d3d12_map_no_wait() && r.gpu_writes && !r.gpu_writes->load(std::memory_order_acquire))return std::shared_ptr<const std::atomic<bool>>{};
+                return std::exchange(r.gpu_writes,nullptr);}();
             if(writes && !writes->load(std::memory_order_acquire)){count_sync("map_wait_gpu_writes");native.graphics_flush(true);}
             if(r.reads_back() && r.gpu)read_back(self);
             if(arg(3))store(arg(3),64,r.cpu);return finish(ok);
@@ -1903,6 +1926,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             if(!heap.posted_keep)heap.posted_keep=std::make_shared<std::vector<std::shared_ptr<void>>>(heap.count);
                             native.graphics_post([updates,keeps=heap.posted_keep,textures=heap.mirrors[0],buffers=heap.mirrors[1]](NativeGraphics& backend){
                                 static const bool use_cache=[] {const auto* text=std::getenv("X64ARM_D3D12_MIRROR_CACHE");return !text || std::string_view(text)!="0";}();
+                                // 連續索引的描述元合併成一次鏡像寫入（每次寫入都要查資源與 Metal 緩衝位址）；順序與內容不變。
+                                // 電馭判客 Benchmark +4.3%；X64ARM_D3D12_MIRROR_RUNS=0 恢復逐項寫入，對照用。
+                                static const bool use_runs=[] {const auto* text=std::getenv("X64ARM_D3D12_MIRROR_RUNS");return !text || std::string_view(text)!="0";}();
+                                static thread_local std::vector<std::uint64_t> run_textures,run_buffers;std::uint32_t run_begin=0;
+                                const auto flush_run=[&]{
+                                    if(run_textures.empty())return;
+                                    GraphicsView at{textures};at.first=run_begin*8U;at.count=static_cast<std::uint32_t>(run_textures.size()*8);
+                                    backend.graphics_write_unused(at,std::span(reinterpret_cast<const std::uint8_t*>(run_textures.data()),run_textures.size()*8));
+                                    at=GraphicsView{buffers};at.first=run_begin*16U;at.count=static_cast<std::uint32_t>(run_buffers.size()*8);
+                                    backend.graphics_write_unused(at,std::span(reinterpret_cast<const std::uint8_t*>(run_buffers.data()),run_buffers.size()*8));
+                                    run_textures.clear();run_buffers.clear();
+                                };
                                 for(auto& update:*updates){
                                     std::array<std::uint64_t,2> texture{},buffer{};std::shared_ptr<void> keep,unused;
                                     auto* const cache=use_cache && update.view.resource?update.cache.get():nullptr;
@@ -1913,12 +1948,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                         if(cache){cache->resource=update.view.resource.get();cache->uav=update.uav;cache->texture=texture[0];cache->buffer=buffer;cache->keep=keep;cache->valid=true;}
                                     }
                                     const std::uint64_t buffer_entry[2]{buffer[0],buffer[1]&UINT32_MAX};
+                                    if(use_runs){
+                                        if(!run_textures.empty() && update.index!=run_begin+run_textures.size())flush_run();
+                                        if(run_textures.empty())run_begin=update.index;
+                                        run_textures.push_back(texture[0]);run_buffers.insert(run_buffers.end(),std::begin(buffer_entry),std::end(buffer_entry));
+                                        (*keeps)[update.index]=std::move(keep);continue;
+                                    }
                                     GraphicsView at{textures};at.first=update.index*8U;at.count=8;
                                     backend.graphics_write_unused(at,std::span(reinterpret_cast<const std::uint8_t*>(&texture[0]),8));
                                     at=GraphicsView{buffers};at.first=update.index*16U;at.count=16;
                                     backend.graphics_write_unused(at,std::span(reinterpret_cast<const std::uint8_t*>(buffer_entry),16));
                                     (*keeps)[update.index]=std::move(keep);
                                 }
+                                flush_run();
                             });
                             return;
                         }

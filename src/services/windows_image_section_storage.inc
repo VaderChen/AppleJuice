@@ -1,6 +1,7 @@
 constexpr off_t image_record_offset=32768;
 constexpr std::size_t image_record_size=4096;
 constexpr std::uint64_t image_record_magic=UINT64_C(0x31474d4941343658);
+constexpr std::uint64_t image_source_magic=UINT64_C(0x3143525349343658);
 static_assert(mapping_detail::file_record_offset+sizeof(mapping_detail::FileRecord)<=image_record_offset);
 static_assert(image_record_offset+image_record_size<=data_offset);
 bool section_write(int fd,std::uint64_t offset,std::span<const std::uint8_t> bytes) {
@@ -11,7 +12,7 @@ bool section_write(int fd,std::uint64_t offset,std::span<const std::uint8_t> byt
     }
     return true;
 }
-bool write_image_section(int fd,PeSectionImage& image) {
+bool write_image_section(int fd,PeSectionImage& image,std::span<const std::uint8_t> source) {
     std::array<std::uint8_t,image_record_size> bytes{};
     const auto put=[&](std::size_t index,std::uint64_t value){for(unsigned b=0;b<8;++b)bytes[index*8+b]=static_cast<std::uint8_t>(value>>(b*8));};
     const std::array<std::uint64_t,17> fields{image_record_magic,image.preferred_base,image.stack_reserve,image.stack_commit,
@@ -25,7 +26,9 @@ bool write_image_section(int fd,PeSectionImage& image) {
         if(range.bytes.size()!=range.size || !section_write(fd,data_offset+range.rva,range.bytes))return false;
         std::vector<std::uint8_t>{}.swap(range.bytes);
     }
-    return section_write(fd,image_record_offset,bytes);
+    // 原始 PE 放在可映射 image 之後，客體 section view 無法覆寫；建立程序不再重開來源路徑。
+    put(510,image_source_magic);put(511,source.size());
+    return !source.empty() && section_write(fd,data_offset+image.image_size,source) && section_write(fd,image_record_offset,bytes);
 }
 std::optional<PeSectionImage> read_image_section(int fd,std::uint64_t size) {
     std::array<std::uint8_t,image_record_size> bytes{};std::size_t done=0;

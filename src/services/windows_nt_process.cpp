@@ -74,11 +74,28 @@ std::uint32_t WindowsServices::local_process_information(std::uint32_t operation
         (void)descriptor;return 50;
 #endif
     }
-    const auto found=threads_.items.find(1);if(found==threads_.items.end())return 6;auto& thread=found->second;
+    if(operation==12){
+#if !defined(_WIN32)
+        const auto threads=local_thread_snapshot();if(threads.size()>4096)return 8;
+        std::vector<std::uint8_t> bytes;bytes.reserve(threads.size()*12);
+        for(const auto& thread:threads)for(const auto value:{thread.id,thread.owner,thread.priority})
+            for(unsigned shift=0;shift<32;shift+=8)bytes.push_back(static_cast<std::uint8_t>(value>>shift));
+        std::size_t done=0;while(done<bytes.size()){
+            const auto count=::pwrite(descriptor,bytes.data()+done,bytes.size()-done,static_cast<off_t>(done));
+            if(count<0 && errno==EINTR)continue;if(count<=0)return 8;done+=static_cast<std::size_t>(count);
+        }
+        values[0]=bytes.size();return 0;
+#else
+        (void)descriptor;return 50;
+#endif
+    }
+    const auto id=values[4]?values[4]:1U;
+    if(id>UINT32_MAX)return 87;
+    const auto found=threads_.items.find(id);if(found==threads_.items.end())return 6;auto& thread=found->second;
     const auto priority=thread.priority==-15?1:thread.priority==15?15:std::clamp(base+thread.priority,1,15);
     if(operation==1){values={thread.status==ThreadStatus::Exited?thread.exit_code:259U,thread.teb,thread.affinity,static_cast<std::uint64_t>(std::min(priority+static_cast<int>(thread.dynamic_priority_boost),15)),static_cast<std::uint64_t>(priority)};return 0;}
     if(operation==2){values[0]=thread.entry;return 0;}
-    if(operation==3){values[0]=pending_io(1,pending_file_io_,runtime_.network.pending_accepts,runtime_.network.pending_socket_io);return 0;}
+    if(operation==3){values[0]=pending_io(id,pending_file_io_,runtime_.network.pending_accepts,runtime_.network.pending_socket_io);return 0;}
     if(operation==4){values[0]=thread.hidden_from_debugger?1U:0U;return 0;}
     if(operation==5){if(thread.status==ThreadStatus::Exited)return 87;thread.hidden_from_debugger=true;return 0;}
     return 87;
@@ -119,19 +136,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_process(GuestState& stat
                 const auto priority=thread.priority==-15?1:thread.priority==15?15:std::clamp(base+thread.priority,1,15);
                 values={thread.status==ThreadStatus::Exited?thread.exit_code:259U,thread.teb,thread.affinity,static_cast<std::uint64_t>(std::min(priority+static_cast<int>(thread.dynamic_priority_boost),15)),static_cast<std::uint64_t>(priority)};pid=process_id();bits=x86_?32U:64U;
             }else {
-                const auto target=process_thread_target(memory,call(0),setting?0x20U:0x40U,pid,&birth);
-                if(!target)return finish(object_type(call(0)).empty()?0xc0000008U:0xc0000024U);
-                if(*target)return finish(native_status(*target));tid=pid;
+                std::uint32_t rights{},internal{};
+                error=process_thread_target(call(0),pid,rights,&birth,&internal);
+                if(error)return finish(error==6 && !object_type(call(0)).empty()?0xc0000024U:native_status(error));
+                if(setting?!(rights&0x20U):!(rights&0x840U))return finish(0xc0000022U);
+                tid=internal;
             }
             if(setting){
                 if(cls!=17)return finish(0xc0000003U);
                 if(length)return finish(0xc0000004U);
                 if(pid==process_id()){auto& thread=threads_.items.at(tid);if(thread.status==ThreadStatus::Exited)return finish(0xc000004bU);thread.hidden_from_debugger=true;}
-                else {error=remote_process_request(memory,pid,birth,14,5,values,bits);if(error)return finish(native_status(error));}
+                else {values[4]=tid;error=remote_process_request(memory,pid,birth,14,5,values,bits);if(error)return finish(native_status(error));}
                 return finish(0);
             }
             if(cls!=0 && cls!=9 && cls!=16 && cls!=17)return finish(0xc0000003U);
-            if(pid!=process_id()){error=remote_process_request(memory,pid,birth,14,cls==0?1U:cls==9?2U:cls==16?3U:4U,values,bits);if(error)return finish(native_status(error));}
+            if(pid!=process_id()){values[4]=tid;error=remote_process_request(memory,pid,birth,14,cls==0?1U:cls==9?2U:cls==16?3U:4U,values,bits);if(error)return finish(native_status(error));}
             else if(cls==9)values[0]=threads_.items.at(tid).entry;
             else if(cls==16)values[0]=pending_io(tid,pending_file_io_,runtime_.network.pending_accepts,runtime_.network.pending_socket_io);
             else if(cls==17)values[0]=threads_.items.at(tid).hidden_from_debugger?1U:0U;
@@ -145,7 +164,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_process(GuestState& stat
             if(narrow && (values[1]>UINT32_MAX || values[2]>UINT32_MAX))return finish(0xc00000bbU);
             put(unit,unit,values[1]);
             if(process){put(unit*2,unit,values[2]);put(unit*3,4,values[3]);put(unit*4,unit,pid);put(unit*5,unit,values[4]);}
-            else {put(unit*2,unit,pid);put(unit*3,unit,pid==process_id()?thread_identifier(tid):tid);put(unit*4,unit,values[2]);put(unit*5,4,values[3]);put(unit*5+4,4,values[4]);}
+            else {put(unit*2,unit,pid);put(unit*3,unit,pid==process_id()?thread_identifier(tid):remote_thread_identifier(pid,birth,static_cast<std::uint32_t>(tid)));put(unit*4,unit,values[2]);put(unit*5,4,values[3]);put(unit*5+4,4,values[4]);}
         }else if(process && (cls==7 || cls==26)){
             bytes.resize(unit);put(0,unit,cls==26 && bits==32?values[1]:0);
         }else if(process && cls==20){

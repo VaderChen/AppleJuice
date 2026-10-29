@@ -655,8 +655,12 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             // 不再經協調者（原本獨占映射鎖下序列化，每次往返 7～12 µs）。原生化前導向常式會不支援退出並全停單步（16.1→14.2 fps）。
             // X64ARM_GUEST_SLIST=0 回到協調者本地服務。
             static const bool slist_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_SLIST");return !value || std::string_view(value)!="0";}();
+            // 七個純量／指標 Interlocked API 留在客體原子指令路徑；不把自旋迴圈的每次 CAS 送回協調者。
+            // 此開關僅供同一成品比對；SList 的獨立契約與開關保持原樣。
+            static const bool interlocked_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_INTERLOCKED");return !value || std::string_view(value)!="0";}();
             const auto& routines=x86_?win32_routines:win64_routines;
             if(const auto found=routines.find(symbol);found!=routines.end() && (slist_routines || symbol.find("SList")==symbol.npos) &&
+               (interlocked_routines || !symbol.starts_with("Interlocked") || symbol.find("SList")!=symbol.npos) &&
                (srw_routines || symbol.find("SRWLock")==symbol.npos) && (critical_routines || symbol.find("CriticalSection")==symbol.npos) &&
                (fls_mirror_ || !symbol.starts_with("FlsGetValue")))
                 return GuestAddress{guest_thread_routines_.value+found->second};
@@ -948,6 +952,7 @@ bool WindowsServices::same_state(const WindowsServices& other) const {
     if (acm_ || other.acm_ || media_foundation_ || other.media_foundation_ || wasapi_ || other.wasapi_ || !wave_outputs_.empty() || !other.wave_outputs_.empty() || !wave_inputs_.empty() || !other.wave_inputs_.empty() || audio_input_backend_ || other.audio_input_backend_ || !wave_callbacks_.empty() || !other.wave_callbacks_.empty())return false;
     if (!midi_inputs_.empty() || !other.midi_inputs_.empty())return false;
     if (!midi_outputs_.empty() || !other.midi_outputs_.empty())return false;
+    if (midi_device_volume_!=other.midi_device_volume_)return false;
     if (!power_requests_.empty() || !other.power_requests_.empty())return false;
     // KTM 交易會在提交時改動宿主檔案，PDH 取樣讀取宿主即時資料；兩者都不宣告可作分支等價比較。
     if(transactions_open() || other.transactions_open() || pdh_ || other.pdh_)return false;
@@ -2234,7 +2239,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
     if (state.rip == exception_entry_) return advance_exception(state, memory);
     if (state.rip == callback_return_) return resume_callback(state, memory);
     if (state.rip == startup_entry_) {
-        auto initial = state; initial.rip = GuestAddress{runtime_.image.base + memory.load(GuestAddress{runtime_.image.base + memory.load(GuestAddress{runtime_.image.base + 60}, 32) + 40}, 32)};
+        auto initial = state; initial.rip = GuestAddress{initial_thread_entry_.value_or(
+            runtime_.image.base + memory.load(GuestAddress{runtime_.image.base + memory.load(GuestAddress{runtime_.image.base + 60}, 32) + 40}, 32))};
         state = initial;
         ModuleOperation operation;operation.startup=true;operation.created=runtime_.module_order;
         return start_module_operation(state,memory,std::move(operation));
@@ -2368,7 +2374,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
         const bool owned=allocation!=allocations_.end() && (owner==runtime_.heap_owners.end()?heap==process_heap:owner->second==heap);
         const auto flags_value=dword(1);const auto allowed=symbol=="HeapAlloc"?9U:symbol=="HeapReAlloc"?0x19U:1U;
         if(valid && (symbol=="HeapAlloc" || symbol=="HeapReAlloc") && (flags_value&4))throw HostCallFault("尚未支援 HEAP_GENERATE_EXCEPTIONS 的記憶體不足例外");
-        if(!valid || (flags_value&~allowed)){fail(87);if(symbol=="HeapSize")returned=x86_?UINT32_MAX:UINT64_MAX;}
+        // 驗證失敗不設定 LastError，也不能先以尺寸查詢解讀尚未驗證的指標。
+        if(symbol=="HeapValidate")returned=valid && !(flags_value&~allowed) && validate_heap(memory,heap,pointer);
+        else if(!valid || (flags_value&~allowed)){fail(87);if(symbol=="HeapSize")returned=x86_?UINT32_MAX:UINT64_MAX;}
         else if(symbol=="HeapAlloc"){
             // x86 process heap 與可成長私有 heap 的小型配置由 chunk 級距配置區提供（O(1) 串列，不經位址搜尋與
             // 存活物件樹）；HeapFree／HeapSize／HeapReAlloc／HeapValidate 依位址與 chunk 擁有者辨識這些區塊。
@@ -2395,7 +2403,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
             const auto size=guest_heap_block_size(memory,pointer);
             if(symbol=="HeapFree"){guest_heap_free(memory,pointer);returned=1;}
             else if(symbol=="HeapSize")returned=size;
-            else if(symbol=="HeapValidate")returned=1;
             else if(arg(3)<=size)returned=pointer;
             else if(!(flags_value&0x10)){
                 returned=allocate_heap(memory,arg(3),heap);
@@ -2405,7 +2412,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
                     guest_heap_free(memory,pointer);}
             }
         }
-        else if(symbol=="HeapValidate")returned=validate_heap(memory,heap,pointer);
         else if(!owned && (pointer || symbol!="HeapFree")){fail(87);if(symbol=="HeapSize")returned=x86_?UINT32_MAX:UINT64_MAX;}
         else if(symbol=="HeapFree")returned=free_heap(memory,pointer,state);
         else if(symbol=="HeapSize")returned=allocation->second;

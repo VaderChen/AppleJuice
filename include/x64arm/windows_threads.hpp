@@ -10,7 +10,7 @@ struct MultimediaThreadTask {
     bool operator==(const MultimediaThreadTask&) const = default;
 };
 enum class ThreadStatus { Runnable, Waiting, Exited };
-enum class ThreadWaitKind { HeapRetry, Http, Resolver, SocketSelect, Objects, Sleep, Critical, CriticalRetry, Completion, CrtLock, StandardInput, ConsoleInput, GuiSend, GuiInput, Slim, Condition, Once, LoaderRetry, ProcessInputIdle, FileIo, RegisteredWait, RegisteredWaitCompletion, TimerQueueCompletion, RegistryNotify, ThreadpoolCompletion, PowerNotificationCompletion, EtwTrace, EtwEnable, DebugEvent, MediaFoundation, ServiceControl, CrtFileRetry, CrtProcess, CrtLockRetry, NativeDevice, Perflib, HandleTransfer, ProcessCreation, RegistryIo, Address };
+enum class ThreadWaitKind { HeapRetry, Http, Resolver, SocketSelect, Objects, Sleep, Critical, CriticalRetry, Completion, CrtLock, StandardInput, ConsoleInput, GuiSend, GuiInput, Slim, Condition, Once, LoaderRetry, ProcessInputIdle, FileIo, RegisteredWait, RegisteredWaitCompletion, TimerQueueCompletion, RegistryNotify, ThreadpoolCompletion, PowerNotificationCompletion, EtwTrace, EtwEnable, DebugEvent, MediaFoundation, ServiceControl, CrtFileRetry, CrtProcess, CrtLockRetry, NativeDevice, Perflib, HandleTransfer, ProcessCreation, RemoteThreadCreation, RegistryIo, Address };
 struct ThreadWait {
     ThreadWaitKind kind{ThreadWaitKind::Objects};
     std::vector<std::uint64_t> handles;
@@ -35,6 +35,14 @@ struct GuestThreadBootstrap {
     std::vector<std::uint8_t> security_descriptor;
     std::uint32_t access{0x1fffffU};
     bool inherit{},hidden_from_debugger{},skip_thread_attach{};
+};
+// 所有輸出均位於呼叫程序；入口、參數及外部堆疊則屬於目標程序。
+struct RemoteThreadOutputs {
+    struct Attribute {std::uint64_t kind,address,returned;};
+    std::uint64_t handle{},client{},identifier{};
+    std::vector<Attribute> attributes;
+    unsigned arguments{};
+    bool native{},suspended{},default_stack{};
 };
 struct GuestThread {
     struct SystemCallFrame {

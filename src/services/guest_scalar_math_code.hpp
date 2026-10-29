@@ -281,4 +281,12 @@ inline constexpr std::array guest_scalar_math_routines{
     GuestScalarMathRoutine{"malloc",0x680,0x748},
     GuestScalarMathRoutine{"strtod",0xb00,0xda8}
 };
+struct GuestHeapPublicationRange {std::size_t begin,end;};
+inline constexpr std::array guest_heap_publication_ranges{
+    GuestHeapPublicationRange{0x6e3,0x6f3},
+    GuestHeapPublicationRange{0x8db,0x8eb},
+    GuestHeapPublicationRange{0x99f,0x9af},
+    GuestHeapPublicationRange{0xe47,0xe57},
+    GuestHeapPublicationRange{0xf86,0xf96}
+};
 }

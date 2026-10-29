@@ -5,6 +5,8 @@
 #include "x64arm/native_application.hpp"
 #if !defined(_WIN32)
 #include <unistd.h>
+#include <sys/stat.h>
+#include <cerrno>
 #endif
 #include "x64arm/gpu_memory.hpp"
 #include "x64arm/resource_usage.hpp"
@@ -80,6 +82,27 @@ std::uint64_t number(std::string_view text) {
     if (text.empty() || error != std::errc{} || end != text.data() + text.size())
         throw std::invalid_argument("數值不合法：" + std::string(original));
     return value;
+}
+PeFileBytes read_process_image(const std::array<std::uint64_t,3>& source){
+#if !defined(_WIN32)
+    const auto [descriptor,offset,size]=source;
+    struct Close{int fd;~Close(){::close(fd);}} close{static_cast<int>(descriptor)};
+    struct stat info{};
+    if(descriptor<3 || descriptor>65535 || !size || size>UINT64_C(2)*1024*1024*1024 ||
+       ::fstat(close.fd,&info) || !S_ISREG(info.st_mode) || info.st_uid!=::geteuid() || (info.st_mode&077) ||
+       info.st_size<0 || offset>static_cast<std::uint64_t>(info.st_size) || size!=static_cast<std::uint64_t>(info.st_size)-offset)
+        throw std::invalid_argument("程序映像快照的描述元、範圍或歸屬無效");
+    auto bytes=std::make_shared<std::vector<std::uint8_t>>(static_cast<std::size_t>(size));
+    for(std::size_t done=0;done<bytes->size();){
+        const auto count=::pread(close.fd,bytes->data()+done,bytes->size()-done,static_cast<off_t>(offset+done));
+        if(count<0 && errno==EINTR)continue;
+        if(count<=0)throw std::invalid_argument("程序映像快照未完整讀取");
+        done+=static_cast<std::size_t>(count);
+    }
+    return bytes;
+#else
+    (void)source;throw std::invalid_argument("此平台不支援程序映像快照");
+#endif
 }
 unsigned compiler_worker_count(){
     // 即時與離線編譯預設兩個 worker；呼叫端可明確覆寫。
@@ -315,6 +338,7 @@ int main(int argc, char** argv) {
         std::uint32_t startup_show=UINT32_MAX;std::size_t gpu_memory_mib=256;unsigned processor_count=1;std::uint64_t process_affinity=0;
         std::optional<std::array<std::uint64_t,3>> startup_handles;bool startup_suspended=false,startup_detached=false,ignore_ctrl_c=false;std::uint64_t console_identity=0;std::uint32_t console_group=0;ProcessStartupData startup_data;
         bool native_gui = false, live_stdio = false, host_clock = false;
+        std::optional<std::array<std::uint64_t,3>> process_image_source;
         std::set<std::string_view> seen;
         for (int i = 3; i < argc; i += 2) {
             const std::string_view option = argv[i];
@@ -363,6 +387,13 @@ int main(int argc, char** argv) {
             else if (option == "--mapping-session-fd") {const auto descriptor=number(value);if(command!="run-pe" || descriptor<3 || descriptor>65535)throw std::invalid_argument("mapping session fd 無效");process_session_descriptor=static_cast<int>(descriptor);}
             else if (option == "--process-startup-show") {if(command!="run-pe" || number(value)>11)throw std::invalid_argument("子程序顯示模式無效");startup_show=static_cast<std::uint32_t>(number(value));}
             else if(option=="--process-startup-suspended"){if(command!="run-pe" || value!="1")throw std::invalid_argument("子程序暫停參數無效");startup_suspended=true;}
+            else if(option=="--process-no-initial-thread"){if(command!="run-pe" || value!="1")throw std::invalid_argument("零執行緒程序參數無效");pe_options.no_initial_thread=true;}
+            else if(option=="--process-loader-directory"){if(command!="run-pe")throw std::invalid_argument("程序載入目錄只供 run-pe 使用");pe_options.loader_directory=value;}
+            else if(option=="--process-image-source"){
+                const auto first=value.find(':'),last=value.rfind(':');
+                if(command!="run-pe" || first==value.npos || last==first)throw std::invalid_argument("程序映像快照格式無效");
+                process_image_source=std::array{number(value.substr(0,first)),number(value.substr(first+1,last-first-1)),number(value.substr(last+1))};
+            }
             else if(option=="--process-detached"){if(command!="run-pe" || value!="1")throw std::invalid_argument("子程序 console 分離參數無效");startup_detached=true;}
             else if(option=="--process-console-id"){if(command!="run-pe")throw std::invalid_argument("console 身分只供子程序使用");console_identity=number(value);}
             else if(option=="--process-console-group"){if(command!="run-pe" || number(value)>UINT32_MAX)throw std::invalid_argument("console 群組無效");console_group=static_cast<std::uint32_t>(number(value));}
@@ -441,7 +472,9 @@ int main(int argc, char** argv) {
                          << " hard=" << host_files.maximum << '\n';
         *diagnostics<<"cross_architecture host_page_size="<<host_page_size()<<" hardware_tso="<<enter_hardware_tso()<<'\n'
                     <<"apflg enabled="<<hardware_apflg_enabled()<<'\n';diagnostics->flush();
-        auto pe_bytes = (command == "run-pe" || inspection || comparison) ?
+        if(pe_options.no_initial_thread!=process_image_source.has_value() || (pe_options.no_initial_thread && startup_suspended))
+            throw std::invalid_argument("零執行緒程序需要映像快照，且不可同時暫停初始執行緒");
+        auto pe_bytes = process_image_source?read_process_image(*process_image_source):(command == "run-pe" || inspection || comparison) ?
             read_pe_snapshot(argv[2],comparison?GuestMemory::capacity_limit:std::size_t{2}*1024*1024*1024) : PeFileBytes{};
         auto raw_bytes = pe_bytes ? std::vector<std::uint8_t>{} : read_raw_file(argv[2]);
         auto bytes = pe_bytes ? std::span<const std::uint8_t>{*pe_bytes} : std::span<const std::uint8_t>{raw_bytes};
@@ -454,9 +487,10 @@ int main(int argc, char** argv) {
         if (pe) {
             for (const auto option : {"--load-address", "--entry", "--stack-address", "--stack-size"})
                 if (seen.contains(option)) throw std::invalid_argument(std::string("PE 不接受 raw 選項：") + option);
-            pe_options.executable_path=argv[2];
+            if(process_image_source)pe_options.guest_image_path=utf8_to_utf16(argv[2]);
+            else pe_options.executable_path=argv[2];
             pe_options.primary_token_descriptor=process_token_descriptor;
-            pe_options.defer_imports=startup_suspended;
+            pe_options.defer_imports=startup_suspended || pe_options.no_initial_thread;
             // 與 execute() 共用後端選擇；x86 載入器仍維持原 CFG 入口。
             pe_options.resident_translation=jit && !comparison && !inspection;
             if(pe_options.resident_translation && host_clock && !seen.contains("--max-instructions"))
@@ -535,12 +569,18 @@ int main(int argc, char** argv) {
                 program.services.set_live_standard_io();
             }
             if(!inherited_handles.empty())program.services.import_process_handles(inherited_handles);
-            program.services.import_crt_startup(program.state,program.memory);
+            if(!pe_options.no_initial_thread)program.services.import_crt_startup(program.state,program.memory);
             configure_gpu_memory(gpu_memory_mib*1024*1024);
             ResourceUsageReporter resource_usage(usage_file);
             run.services = &program.services;
             startup_profile::mark("child_setup_ready");
             report_child_startup_ready();
+            if(pe_options.no_initial_thread){
+                if(const auto code=program.services.wait_for_initial_thread(program.state,program.memory)){
+                    program.services.report_process_accounting();report_child_result(*code,true);return 0;
+                }
+                program.services.import_crt_startup(program.state,program.memory);
+            }
             if(startup_suspended)program.services.after_instructions(program.state,program.memory,0);
             // CreateProcess 只需程序與初始執行緒已建立，不等子程序初始化；父程序在就緒後還要等子程序
             // 處理恢復執行緒的遠端請求。原生 GUI 後端（約 0.1 秒）因此改在暫停等待結束之後、

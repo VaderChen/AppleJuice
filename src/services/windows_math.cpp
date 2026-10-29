@@ -758,25 +758,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         if(symbol.ends_with("test"))raw=memory.load(GuestAddress{arg(0)},static_cast<std::uint8_t>(width));
         else if(x86_)raw=memory.load(GuestAddress{state.reg(Gpr::Rsp)+4},static_cast<std::uint8_t>(width));
         else for(unsigned n=0;n<width/8;++n)raw|=std::uint64_t{state.xmm[0][n]}<<(n*8);
-        const unsigned mantissa=width==64?52:23;const auto exponent=(raw>>mantissa)&(width==64?0x7ffU:0xffU);
-        const auto fraction=raw&((UINT64_C(1)<<mantissa)-1);const bool negative=raw>>(width-1);
-        std::int32_t classification;
-        if(exponent==(width==64?0x7ffU:0xffU))classification=fraction?2:1;
-        else classification=exponent?-1:fraction?-2:0;
-        std::uint32_t result=static_cast<std::uint32_t>(classification);
-        if(symbol.starts_with("_fpclass")) {
-            if(classification==2)result=(fraction&(UINT64_C(1)<<(mantissa-1)))?2U:1U;
-            else if(classification==1)result=negative?4:512;
-            else if(classification==-1)result=negative?8:256;
-            else if(classification==-2)result=negative?16:128;
-            else result=negative?32:64;
-        }
+        const auto result=static_cast<std::uint32_t>(symbol.starts_with("_fpclass")?
+            x64arm_fpclass_float_bits(raw,width):x64arm_classify_float_bits(raw,width));
         arg.return_to(state,result);return std::nullopt;
     }
     if(symbol=="_dsign" || symbol=="_fdsign" || symbol=="_ldsign") {
         const unsigned width=symbol=="_fdsign"?32:64;
-        const auto sign=x86_?(memory.load(GuestAddress{state.reg(Gpr::Rsp)+4},static_cast<std::uint8_t>(width))>>(width-1)):(state.xmm[0][width/8-1]>>7);
-        arg.return_to(state,sign?0x8000:0);return std::nullopt;
+        std::uint64_t raw=0;
+        if(x86_)raw=memory.load(GuestAddress{state.reg(Gpr::Rsp)+4},static_cast<std::uint8_t>(width));
+        else for(unsigned n=0;n<width/8;++n)raw|=std::uint64_t{state.xmm[0][n]}<<(n*8);
+        arg.return_to(state,x64arm_sign_float_bits(raw,width));return std::nullopt;
     }
     if(symbol=="_control87" || symbol=="_controlfp" || symbol=="_controlfp_s") {
         const bool secure=symbol=="_controlfp_s";const unsigned first=secure?1U:0U;

@@ -3,6 +3,7 @@
 #include <limits>
 #include <stdexcept>
 #include <map>
+#include <cmath>
 namespace x64arm::midi {
 namespace {
 struct Reader {
@@ -75,9 +76,71 @@ std::vector<Event> chase(const Sequence& sequence,std::uint64_t frame){
     for(const auto& [key,e]:controls){(void)key;result.push_back({0,e.status,e.first,e.second});}
     for(unsigned c=0;c<16;++c)for(unsigned n=0;n<128;++n)if(notes[c][n])result.push_back({0,static_cast<std::uint8_t>(0x90+c),static_cast<std::uint8_t>(n),notes[c][n]});return result;
 }
+bool Stream::valid_division(std::uint32_t value){
+    value&=0xffff;
+    if(!(value&0x8000))return value!=0;
+    const auto rate=256U-(value>>8);
+    return (value&255U) && (rate==24 || rate==25 || rate==29 || rate==30);
+}
+std::vector<Stream::Event> Stream::parse(std::span<const std::uint8_t> source,std::uint8_t& running){
+    if(source.empty() || source.size()>=65536)throw std::invalid_argument("MIDI 串流緩衝區大小無效");
+    std::vector<Event> result;auto status=running;
+    const auto load=[&](std::size_t at){std::uint32_t value=0;for(unsigned i=0;i<4;++i)value|=static_cast<std::uint32_t>(source[at+i])<<(8*i);return value;};
+    for(std::size_t at=0;at<source.size();){
+        if(source.size()-at<12 || load(at+4))throw std::invalid_argument("MIDI 串流事件標頭無效");
+        Event event;event.delta=load(at);event.word=load(at+8);event.offset=static_cast<std::uint32_t>(at);event.bytes=12;
+        const auto type=(event.word>>24)&~0x40U,param=event.word&0xffffffU;
+        if(type&0x80U){
+            const auto padded=(static_cast<std::size_t>(param)+3)&~std::size_t{3};
+            if(padded>source.size()-at-12 || (type!=0x80 && type!=0x82 && type!=0x84))throw std::invalid_argument("MIDI 串流長事件無效");
+            if(type==0x80){const auto data=source.subspan(at+12,param);event.data.assign(data.begin(),data.end());status=0;}
+            event.bytes+=static_cast<std::uint32_t>(padded);
+        }else if(type==0){
+            auto s=static_cast<std::uint8_t>(param),a=static_cast<std::uint8_t>(param>>8),b=static_cast<std::uint8_t>(param>>16);
+            if(s<0x80){b=a;a=s;s=status;}
+            unsigned count=s<0xf0?((s&0xe0)==0xc0?1:2):(s==0xf2?2:(s==0xf1 || s==0xf3?1:0));
+            if(s<0x80 || s==0xf0 || s==0xf4 || s==0xf5 || s==0xf7 || s==0xf9 || s==0xfd || (count && a>=128) || (count==2 && b>=128))throw std::invalid_argument("MIDI 串流短事件無效");
+            event.word=(event.word&0xff000000U)|s|(static_cast<std::uint32_t>(count?a:0)<<8)|(static_cast<std::uint32_t>(count==2?b:0)<<16);
+            if(s<0xf0)status=s;else if(s<0xf8)status=0;
+        }else if(type==1){if(!param)throw std::invalid_argument("MIDI 速度不可為零");}
+        else if(type!=2)throw std::invalid_argument("未知的 MIDI 串流事件");
+        at+=event.bytes;result.push_back(std::move(event));
+    }
+    running=status;return result;
+}
+void Stream::advance(unsigned count,Playback::Send send,void* context,Playback::SendSysex sysex){
+    if(!running)return;
+    unsigned offset=0;
+    while(offset<count){
+        long double rate;
+        if(division&0x8000){const auto fps=256U-((division>>8)&255U);rate=(fps==29?30000.L/1001:fps)*(division&255U)/48000.L;}
+        else rate=static_cast<long double>(division)*1000000.L/(static_cast<long double>(tempo)*48000.L);
+        auto found=std::find_if(buffers.begin(),buffers.end(),[](const auto& buffer){return !buffer->done;});
+        if(found==buffers.end()){ticks+=rate*(count-offset);frames+=count-offset;break;}
+        auto& buffer=**found;const auto& event=buffer.events[buffer.next];
+        if(!armed){event_tick+=event.delta;armed=true;}
+        if(event_tick>ticks){
+            const auto needed=std::ceil((event_tick-ticks)/rate-1e-12L);
+            const auto step=static_cast<unsigned>(std::min<long double>(count-offset,std::max(needed,1.L)));
+            ticks+=rate*step;frames+=step;offset+=step;if(offset==count)break;
+        }
+        const auto type=(event.word>>24)&~0x40U;
+        if(type==0){
+            const auto status=static_cast<std::uint8_t>(event.word),a=static_cast<std::uint8_t>(event.word>>8),b=static_cast<std::uint8_t>(event.word>>16);
+            if((status&0xf0)==0x90)notes[status&15][a]=b!=0;
+            else if((status&0xf0)==0x80)notes[status&15][a]=false;
+            else if((status&0xf0)==0xb0 && (a==120 || a==123))notes[status&15].fill(false);
+            send(context,status,a,b,offset);
+        }else if(type==1)tempo=event.word&0xffffffU;
+        else if(type==0x80 && sysex && !event.data.empty())sysex(context,event.data);
+        bytes+=event.bytes;armed=false;
+        if(++buffer.next==buffer.events.size())buffer.done=true;
+    }
+}
 void Playback::advance(unsigned count,Send send,void* context,SendSysex sysex){
     const auto silence=[&](unsigned offset){for(unsigned c=0;c<16;++c){send(context,static_cast<std::uint8_t>(0xb0+c),120,0,offset);send(context,static_cast<std::uint8_t>(0xb0+c),121,0,offset);send(context,static_cast<std::uint8_t>(0xc0+c),0,0,offset);}};
     if(reset){silence(0);for(auto& channel:note_owners)channel.fill(0);for(auto& channel:direct_notes)channel.fill({});active_notes=0;reset=false;}
+    if(stream)stream->advance(count,send,context,sysex);
     const auto direct=[&](const Event& e,unsigned frame){
         if(!e.sysex.empty()){if(sysex)sysex(context,e.sysex);return;}
         if(voice_limit){

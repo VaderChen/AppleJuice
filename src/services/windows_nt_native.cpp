@@ -141,6 +141,7 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         ,{"ntdll.dll","RtlGetFullPathName_U",4},{"ntdll.dll","RtlDosPathNameToNtPathName_U",4},{"ntdll.dll","RtlDosPathNameToNtPathName_U_WithStatus",4}
         ,{"ntdll.dll","LdrLockLoaderLock",3,0,0,1},{"ntdll.dll","LdrUnlockLoaderLock",2,0,0,1}
         ,{"ntdll.dll","LdrLoadDll",4},{"ntdll.dll","LdrGetDllHandle",4},{"ntdll.dll","LdrGetProcedureAddress",4,0,0,0x4},{"ntdll.dll","LdrUnloadDll",1}
+        ,{"ntdll.dll","LdrRegisterDllNotification",4},{"ntdll.dll","LdrUnregisterDllNotification",1}
         ,{"ntdll.dll","RtlAreLongPathsEnabled",0}
     };return table;
 }
@@ -364,6 +365,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             return start("kernel32.dll","InitOnceExecuteOnce",{call(0),call(1),call(2),call(3)});
         }
         if(name=="RtlAreLongPathsEnabled")return finish(0); // 預設登錄 LongPathsEnabled=0。
+        if(name=="LdrRegisterDllNotification" || name=="LdrUnregisterDllNotification"){
+            // 與映射、通知、卸載共用 loader ownership；等待後重新進入，不提前返回成功。
+            if(await_loader(state,memory))return std::nullopt;
+            if(name=="LdrUnregisterDllNotification")
+                return finish(runtime_.dll_notifications.erase(call(0))?0:0xc0000135U);
+            if(static_cast<std::uint32_t>(call(0)) || !call(1) || !call(3))return finish(0xc000000dU);
+            memory.check(GuestAddress{call(3)},unit,Access::Write);
+            // Cookie 只供識別，不能被當作客體指標；不重用已取消的身分。
+            const auto cookie=runtime_.next_dll_notification_cookie;
+            if(!cookie || cookie>(x86_?UINT32_MAX:UINT64_MAX))return finish(0xc0000017U);
+            runtime_.dll_notifications.emplace(cookie,DllNotificationRegistration{call(1),call(2)});
+            ++runtime_.next_dll_notification_cookie;
+            memory.store(GuestAddress{call(3)},bits,cookie);return finish(0);
+        }
         if(name=="LdrGetDllHandle"){
             // (PathToFile, Flags, ModuleFileName, *ModuleHandle)：只查詢已載入模組，不載入。
             if(!call(2) || !call(3))return finish(0xc000000dU);

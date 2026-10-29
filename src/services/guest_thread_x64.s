@@ -432,5 +432,60 @@ entry D3D12HeapGetGPUDescriptorHandleForHeapStart
     mov rax, rdx
     ret
 end D3D12HeapGetGPUDescriptorHandleForHeapStart
+// LONG 固定為 32 位元；Pointer 使用完整 64 位元。LOCK／隱含鎖定 XCHG
+// 共用既有原子指令的完整記憶體順序、故障及執行緒中斷契約。
+.macro interlocked_word name, operation
+entry \name
+    test cl, 3
+    jne 1f
+    .ifc \operation,increment
+    mov eax, 1
+    lock xadd dword ptr [rcx], eax
+    inc eax
+    .endif
+    .ifc \operation,decrement
+    mov eax, -1
+    lock xadd dword ptr [rcx], eax
+    dec eax
+    .endif
+    .ifc \operation,add
+    mov eax, edx
+    lock xadd dword ptr [rcx], eax
+    .endif
+    .ifc \operation,exchange
+    mov eax, edx
+    xchg dword ptr [rcx], eax
+    .endif
+    .ifc \operation,compare
+    mov eax, r8d
+    lock cmpxchg dword ptr [rcx], edx
+    .endif
+    ret
+1:
+slow_end \name
+.endm
+interlocked_word InterlockedExchange, exchange
+interlocked_word InterlockedIncrement, increment
+interlocked_word InterlockedDecrement, decrement
+interlocked_word InterlockedExchangeAdd, add
+interlocked_word InterlockedCompareExchange, compare
+
+entry InterlockedExchangePointer
+    test cl, 7
+    jne 1f
+    mov rax, rdx
+    xchg qword ptr [rcx], rax
+    ret
+1:
+slow_end InterlockedExchangePointer
+
+entry InterlockedCompareExchangePointer
+    test cl, 7
+    jne 1f
+    mov rax, r8
+    lock cmpxchg qword ptr [rcx], rdx
+    ret
+1:
+slow_end InterlockedCompareExchangePointer
 .globl _guest_thread_end
 _guest_thread_end:

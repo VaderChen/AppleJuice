@@ -433,7 +433,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
             CrtFile file;file.standard_handle=handle;file.readable=handle==0x100;file.writable=handle!=0x100;file.text=!(flags&0x8000);file.lowio_extended=crt_lowio::with_mode(file.lowio_extended,unicode);file.noinherit=(flags&0x80)!=0;install(std::move(file));result=result?runtime_.streams.at(result).descriptor:UINT32_MAX;
         }else if(const auto found=files_.find(handle);found!=files_.end()){
             const auto& source=found->second;CrtFile file;file.native=source.native;if(source.bytes)file.bytes=*source.bytes;
-            file.key=source.key;file.metadata=source.metadata;file.os_handle=handle;file.readable=(source.access&0x80000000U)!=0;file.writable=(source.access&0x40000000U)!=0;file.text=!(flags&0x8000);file.append=(flags&8U)!=0;
+            file.key=source.key;file.metadata=source.metadata;file.os_handle=handle;file.readable=(source.access&(0x80000000U|1U))!=0;file.writable=(source.access&(0x40000000U|2U|4U))!=0;file.text=!(flags&0x8000);file.append=(flags&8U)!=0;
             file.noinherit=(flags&0x80)!=0;
             file.lowio_extended=crt_lowio::with_mode(file.lowio_extended,unicode);
             install(std::move(file));result=result?runtime_.streams.at(result).descriptor:UINT32_MAX;

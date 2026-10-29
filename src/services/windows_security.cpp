@@ -791,7 +791,8 @@ std::uint32_t WindowsServices::kernel_security_access(const std::vector<std::uin
     return granted;
 }
 std::uint32_t WindowsServices::created_thread_pseudo_access(const std::vector<std::uint8_t>& bytes)const{
-    if(!threads_.items.at(threads_.current).impersonation_token)return 0x1fffffU;
+    const auto caller=threads_.items.find(threads_.current);
+    if(caller==threads_.items.end() || !caller->second.impersonation_token)return 0x1fffffU;
     try{return security::object_access(runtime_.token_objects.at(1),security::parse_relative_descriptor(bytes),0x02000000U,security::thread_access_mapping);}
     catch(const SecurityDescriptorError& error){if(error.code==5)return 0;throw;}
 }

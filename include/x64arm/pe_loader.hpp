@@ -26,10 +26,13 @@ struct PeOptions {
     std::map<char,std::filesystem::path> drive_mappings{};
     std::filesystem::path install_root{};
     std::filesystem::path executable_path{};
+    std::u16string guest_image_path{}; // 已持有映像快照時，名稱不需要重新開啟來源檔案。
+    std::filesystem::path loader_directory{};
     bool writable_files{};
     std::size_t memory_limit{GuestMemory::capacity_limit};
     int primary_token_descriptor{-1}; // 在載入相依 DLL 及執行任何客體程式之前安裝。
     bool defer_imports{}; // 暫停程序在 ResumeThread 後以初始執行緒身分完成 loader。
+    bool no_initial_thread{}; // Native 程序只建立位址空間；TEB、堆疊及 TLS 等待真正的執行緒。
     std::string certificate_roots_file{}; // 相對於 Sandbox C 槽；空值只使用內建公開 CA。
     bool resident_translation{}; // 呼叫端已選定常駐執行器，載入時建立對應的原生控制流入口。
 };

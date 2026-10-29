@@ -14,6 +14,13 @@
 #include "x64arm/windows_security_attributes.hpp"
 #include "registry_hive.hpp"
 #include "registry_native_status.hpp"
+#include "apphelp_cache_store.hpp"
+#include "apphelp_environment.hpp"
+#include "apphelp_sdb.hpp"
+#include "x64arm/file_security.hpp"
+#include "x64arm/windows_system_paths.hpp"
+#include "x64arm/security_access.hpp"
+#include "windows_sddl.hpp"
 #include "x64arm/windows_paths.hpp"
 #include <cerrno>
 #include <fcntl.h>
@@ -77,7 +84,8 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
         {"ntdll.dll","NtNotifyChangeKey",10,0,0,0x360},
         {"ntdll.dll","NtLoadKey",2},{"ntdll.dll","NtLoadKey2",3,0,0,4},{"ntdll.dll","NtUnloadKey",1},
         {"ntdll.dll","NtSaveKey",2},{"ntdll.dll","NtRestoreKey",3,0,0,4},{"ntdll.dll","NtReplaceKey",3},
-        {"ntdll.dll","NtDeleteValueKey",2},{"ntdll.dll","NtDeleteKey",1},{"ntdll.dll","NtFlushKey",1},{"ntdll.dll","NtClose",1}
+        {"ntdll.dll","NtDeleteValueKey",2},{"ntdll.dll","NtDeleteKey",1},{"ntdll.dll","NtFlushKey",1},{"ntdll.dll","NtClose",1},
+        {"ntdll.dll","NtApphelpCacheControl",2,0,0,1},{"ntdll.dll","ZwApphelpCacheControl",2,0,0,1}
     };return table;
 }
 #include "windows_registry_hive.inc"
@@ -165,6 +173,9 @@ std::u16string WindowsServices::registry_current_user_path(bool cached){
 std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     // 僅登錄 API 家族保留原生堆疊讓出 I/O；其他 consumer 在共同入口等待 store 門閂。
     RegistryIoScope io([&](const auto& work){await_registry_io(state,memory,work);});
+    if(service.symbol=="NtApphelpCacheControl" || service.symbol=="ZwApphelpCacheControl"){
+#include "windows_apphelp_cache.inc"
+    }
     if(service.symbol=="RegNotifyChangeKeyValue" || service.symbol=="NtNotifyChangeKey")return invoke_registry_notify(state,memory,service);
     if(service.symbol.starts_with("RegSaveKey") || service.symbol.starts_with("RegLoadKey") || service.symbol.starts_with("RegUnLoadKey") || service.symbol.starts_with("RegConnectRegistry") || service.symbol.starts_with("RegRestoreKey") || service.symbol.starts_with("RegReplaceKey") || service.symbol=="NtLoadKey" || service.symbol=="NtLoadKey2" || service.symbol=="NtUnloadKey" || service.symbol=="NtSaveKey" || service.symbol=="NtRestoreKey" || service.symbol=="NtReplaceKey")return invoke_registry_hive(state,memory,service);
     if(service.symbol=="RegGetKeySecurity" || service.symbol=="RegSetKeySecurity")return invoke_registry_security(state,memory,service);

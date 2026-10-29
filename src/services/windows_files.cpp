@@ -191,7 +191,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
         return invoke_file_io(state,memory,canonical,&values);
     }
     const auto arg=[&](unsigned i){return values.at(i);};
-    const auto dword=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
+    const auto requested_access=security::mapped_access(static_cast<std::uint32_t>(arg(1)),
+        {0x120089U,0x120116U,0x1200a0U,0x1f01ffU});
+    // Generic 權限先依檔案契約轉成實際權限，驗證、ACL、sharing 與後續 handle 共用結果。
+    const auto dword=[&](unsigned i){return i==1?requested_access:static_cast<std::uint32_t>(arg(i));};
     std::uint64_t returned=UINT64_MAX;
     if(!null_device && filesystem_.writable() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許開啟可寫宿主檔案");
     CreationSecurity security;std::uint32_t security_error=0;

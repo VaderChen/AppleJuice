@@ -9,22 +9,7 @@ if(service.family=="ntdll.dll" && (symbol=="RtlCreateProcessParameters" || symbo
     }
     if(symbol=="RtlNormalizeProcessParams" || symbol=="RtlDeNormalizeProcessParams") {
         const auto base=arg(0);if(!base)return finish(0);
-        const bool normalized=symbol=="RtlNormalizeProcessParams";
-        const auto flags=static_cast<std::uint32_t>(memory.load(GuestAddress{base+8},32));
-        if(bool(flags&1U)!=normalized) {
-            const auto length=memory.load(GuestAddress{base+4},32);
-            const auto extended=layout.strings.back()+unit*2;
-            const auto prefix=length>=extended?extended:layout.strings[7]+unit*2;
-            memory.check(GuestAddress{base},prefix,Access::Read);memory.check(GuestAddress{base},prefix,Access::Write);
-            std::vector<std::uint8_t> bytes(prefix);memory.read(GuestAddress{base},bytes);
-            for(const auto offset:layout.strings) {
-                if(offset+unit*2>prefix)continue;
-                std::uint64_t pointer=0;for(unsigned i=0;i<unit;++i)pointer|=std::uint64_t{bytes[offset+unit+i]}<<(i*8);
-                if(pointer){pointer=normalized?pointer+base:pointer-base;for(unsigned i=0;i<unit;++i)bytes[offset+unit+i]=static_cast<std::uint8_t>(pointer>>(i*8));}
-            }
-            const auto updated=(flags&~1U)|(normalized?1U:0U);for(unsigned i=0;i<4;++i)bytes[8+i]=static_cast<std::uint8_t>(updated>>(i*8));
-            memory.write(GuestAddress{base},bytes);
-        }
+        detail::normalize_process_parameter_pointers(memory,base,x86_,symbol=="RtlNormalizeProcessParams");
         return finish(base);
     }
     std::uint64_t allocation=0;

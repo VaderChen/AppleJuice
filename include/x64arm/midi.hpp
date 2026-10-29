@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <deque>
 #include <array>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,7 @@ struct Sequence {
 // Standard MIDI file format 0/1, PPQ division; timeline is 48 kHz.
 Sequence parse(std::span<const std::uint8_t> bytes);
 std::vector<Event> chase(const Sequence&,std::uint64_t frame);
+struct Stream;
 struct Playback {
     std::mutex mutex;
     std::shared_ptr<const Sequence> sequence;
@@ -30,6 +32,9 @@ struct Playback {
     bool playing{},reset{true},failed{};
     std::uint64_t rendered_frames{};
     float rendered_peak{};
+    std::array<float,2> rendered_channel_peak{};
+    float left_gain{1},right_gain{1};
+    std::shared_ptr<Stream> stream;
     struct Voice {
         std::shared_ptr<const Sequence> sequence;
         std::uint64_t start{},stop{UINT64_MAX},loop_start{},loop_end{},id{},loops{};
@@ -58,6 +63,29 @@ struct Playback {
     using SendSysex=void(*)(void*,std::span<const std::uint8_t>);
     // Called with mutex held; callbacks never access guest memory.
     void advance(unsigned frames,Send send,void* context,SendSysex sysex=nullptr);
+};
+// WinMM 串流的 48 kHz 時基；只持有宿主副本，不在音訊執行緒存取客體記憶體。
+struct Stream {
+    struct Event {
+        std::uint32_t delta{},word{},offset{},bytes{};
+        std::vector<std::uint8_t> data;
+    };
+    struct Buffer {
+        std::uint64_t token{};
+        std::vector<Event> events;
+        std::size_t next{},reported{};
+        bool done{};
+    };
+    std::deque<std::shared_ptr<Buffer>> buffers;
+    std::uint32_t tempo{500000},division{480};
+    std::uint8_t queued_status{};
+    std::uint64_t frames{},bytes{};
+    long double ticks{},event_tick{};
+    bool running{},stopped{true},armed{};
+    std::array<std::array<bool,128>,16> notes{};
+    static bool valid_division(std::uint32_t);
+    static std::vector<Event> parse(std::span<const std::uint8_t>,std::uint8_t& running_status);
+    void advance(unsigned,Playback::Send,void*,Playback::SendSysex);
 };
 class Output {
 public:

@@ -235,7 +235,7 @@ private:
                 task=std::move(queue_.front());queue_.pop_front();++taken_;
             }
             // 忙碌時間（執行工作，不含等待佇列）：診斷用，只在提交追蹤或繪製計時開啟時量測。
-            static const bool timing=std::getenv("X64ARM_TRACE_D3D12_SUBMIT") || std::getenv("X64ARM_TRACE_METAL_DRAW_TIME");
+            static const bool timing=std::getenv("X64ARM_TRACE_D3D12_SUBMIT") || std::getenv("X64ARM_TRACE_METAL_DRAW_TIME") || metal_stall_threshold_us();
             const auto task_start=timing?clock_gettime_nsec_np(CLOCK_UPTIME_RAW):0;
             try{task();}
             catch(const std::exception& error){
@@ -247,7 +247,7 @@ private:
                 else{std::lock_guard lock(mutex_);if(!error_)error_=std::current_exception();failed_.store(true,std::memory_order_release);}
             }
             task=nullptr;
-            if(task_start)busy_ns_.fetch_add(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)-task_start,std::memory_order_relaxed);
+            if(task_start){const auto spent=clock_gettime_nsec_np(CLOCK_UPTIME_RAW)-task_start;busy_ns_.fetch_add(spent,std::memory_order_relaxed);metal_stall_note("encoder_task",spent/1000);}
             completed_.fetch_add(1,std::memory_order_acq_rel);
             {std::lock_guard lock(mutex_);if(waiting_)idle_cv_.notify_all();}
         }
