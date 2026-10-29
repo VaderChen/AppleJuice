@@ -4,6 +4,7 @@
 #include "x64arm/windows_gui_abi.hpp"
 #include "x64arm/windows_icon.hpp"
 #include "x64arm/unicode.hpp"
+#include "monotonic_clock.hpp"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -648,13 +649,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
     } else if (symbol == "PostQuitMessage") { GuiMessage message{0,static_cast<std::uint32_t>(arg(0)),0,18};message.thread=threads_.current;enqueue_gui_message(message); }
     else if (symbol.starts_with("GetMessage") || symbol.starts_with("PeekMessage")) {
         const bool peek = symbol.starts_with("PeekMessage");
-        if(!peek || dword(4)==1)retire_shell_messages(memory);
-        if ((arg(1) && arg(1) != (x86_?UINT32_MAX:UINT64_MAX) && (!gui_.windows.contains(arg(1)) || gui_.windows.at(arg(1)).thread!=threads_.current)) || dword(2) > 65535 || dword(3) > 65535 || (peek && dword(4) > 1)) { fail(87); result = peek ? 0 : UINT32_MAX; }
+        // PeekMessage 旗標：bit 0 PM_REMOVE、bit 1 PM_NOYIELD（不讓出，無作用），高 16 位元為 PM_QS_* 的佇列類別遮罩（0 為全部，
+        // 類別同 GetQueueStatus 的 gui_queue_category）。遮罩只篩選取出的訊息；送出訊息一律先處理，PM_QS_SENDMESSAGE 單獨使用
+        // 時只處理送出訊息並回傳 FALSE。原本旗標大於 1 一律回 ERROR_INVALID_PARAMETER，送出訊息也不處理。
+        const auto flags=peek?dword(4):1U;const bool remove=!peek || (flags&1U);const auto categories=flags>>16;
+        const auto selected=[&](const GuiMessage& message){return !categories || (gui_queue_category(message)&categories);};
+        if(remove)retire_shell_messages(memory);
+        if ((arg(1) && arg(1) != (x86_?UINT32_MAX:UINT64_MAX) && (!gui_.windows.contains(arg(1)) || gui_.windows.at(arg(1)).thread!=threads_.current)) || dword(2) > 65535 || dword(3) > 65535 || (peek && ((flags&0xfffcU) || (categories&~0x1dffU)))) { fail(87); result = peek ? 0 : UINT32_MAX; }
         else {
             memory.check(GuestAddress{arg(0)}, x86_?28:48, Access::Write);
             for (;;) {
                 if(dispatch_gui_send(state,memory))return std::nullopt;
-                const bool input_pending=std::any_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& msg){return gui_message_matches(msg,threads_.current,arg(1),dword(2),dword(3));});
+                const bool input_pending=std::any_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& msg){return gui_message_matches(msg,threads_.current,arg(1),dword(2),dword(3)) && selected(msg);});
                 pump_gui(memory,false,input_pending?gui_native_poll_deferred:0);
                 // 宿主 pump 可能產生新的 sent 通知，須先交給 WNDPROC 再回傳 Peek／Get。
                 if(dispatch_gui_send(state,memory))return std::nullopt;
@@ -662,20 +668,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                 // 保留同來源的 FIFO；明確 PostMessage 的 WM_PAINT/WM_TIMER 仍是 posted。
                 auto found=gui_.queue.end();
                 for(auto it=gui_.queue.begin();it!=gui_.queue.end();++it)
-                    if(gui_message_matches(*it,threads_.current,arg(1),dword(2),dword(3)) &&
+                    if(gui_message_matches(*it,threads_.current,arg(1),dword(2),dword(3)) && selected(*it) &&
                        (found==gui_.queue.end() || it->queue_priority<found->queue_priority))found=it;
                 if (found != gui_.queue.end()) {
-                    if(!peek || dword(4)){
+                    if(remove){
                         consume_gui_input(*found);consume_shell_message(*found);
                     }
                     remember_gui_message(*found);gui_write_message(memory, arg(0), *found); result = peek || found->message != 18 ? 1 : 0;
-                    const bool queuesync=found->message==0x23 && (!peek || dword(4));
-                    if (!peek || dword(4)) gui_.queue.erase(found);
+                    const bool queuesync=found->message==0x23 && remove;
+                    if (remove) gui_.queue.erase(found);
                     if(queuesync && start_gui_hooks(state,memory,5,2,0,0,Continuation::Return,result))return std::nullopt;
                     break;
                 }
                 if (!gui_.windows.empty()) report_child_input_idle();
-                if (peek) break;
+                // 剛抽過宿主事件（pump_gui 未延後原生輪詢）仍沒有符合的訊息：期限內 worker 可在訊息來源全空時直接回 FALSE。
+                if (peek) {gui_peek_idle_until_=detail::monotonic_ticks()+10000;break;}
                 ThreadWait wait;wait.gui_window=arg(1);wait.gui_min=dword(2);wait.gui_max=dword(3);
                 wait_gui_input(state,memory,std::move(wait));return std::nullopt;
             }

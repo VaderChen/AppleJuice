@@ -20,6 +20,16 @@ struct MetalFastPipelineHash {
         return static_cast<std::size_t>(hash);
     }
 };
+// 快速管線鍵命中時沿用的繪製計畫：管線、D3D 頂點槽對應的 Metal buffer index、超出 stride 改綁的額外 binding 與分層輸出旗標，
+// 都只由 PSO（著色器、輸入佈局）與鍵內的附件格式／頂點跨距決定。
+struct MetalFastPipeline {
+    id<MTLRenderPipelineState> pipeline;std::array<int,32> slots;std::vector<std::array<std::uint32_t,3>> shifted;bool layered{};
+};
+// D3D12 PSO 序號對應的頂點輸入解析：VS 每個輸入（attribute）對應的輸入佈局項索引。序號決定 VS 與輸入佈局，
+// 第一次繪製解析後沿用，繪製時不再逐項比對語意字串。attribute 越界／重複、佈局缺語意或槽位越界時 valid 為 false，照原路徑檢查並拋錯。
+struct MetalPipelineInputs {
+    std::vector<std::array<std::uint32_t,2>> inputs;bool valid{true};
+};
 struct MetalPipelineKey {
     std::string bytes;
     MetalPipelineKey(){bytes.reserve(512);}

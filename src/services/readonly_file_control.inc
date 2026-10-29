@@ -151,6 +151,6 @@ OpenHostFile ReadOnlyFiles::pin(std::string path) const try {
     return {resolved.key,{},{},50,false};
 #else
     FileDescriptor fd{resolved.descriptor};if(resolved.error)return {resolved.key,{},{},resolved.error,false};struct stat info{};if(::fstat(fd.value,&info)<0)return {resolved.key,{},{},native_error(),false};if(!S_ISREG(info.st_mode) && !S_ISDIR(info.st_mode))return {resolved.key,{},{},5,false};
-    auto file=std::make_shared<HostFile>(fd.value);fd.value=-1;file->readonly_=true;return {resolved.key,file,file->information().metadata,0,true};
+    auto file=std::make_shared<HostFile>(fd.value);fd.value=-1;file->readonly_=true;file->volume_=resolved.volume;return {resolved.key,file,file->information().metadata,0,true};
 #endif
 }catch(const std::bad_alloc&){return {{},{},{},8,false};}

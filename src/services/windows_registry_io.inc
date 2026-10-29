@@ -44,12 +44,16 @@ void WindowsServices::await_registry_io(GuestState& state,GuestMemory& memory,co
     const auto trace=[&](const char* phase){
         static const bool enabled=std::getenv("X64ARM_TRACE_REGISTRY_IO")!=nullptr;
         if(!enabled)return;
+        static const unsigned limit=[] {
+            const auto* value=std::getenv("X64ARM_TRACE_REGISTRY_IO_LIMIT");
+            return value?static_cast<unsigned>(std::clamp(std::strtoul(value,nullptr,10),64UL,65536UL)):64U;
+        }();
         static std::atomic<unsigned> emitted{};
         auto count=emitted.load(std::memory_order_relaxed);
-        while(count<64 && !emitted.compare_exchange_weak(count,count+1,std::memory_order_relaxed)){}
-        // 正常流程至多保留 64 筆；重入只在終止點輸出，不累積逐筆永久歷史。
-        if(count>=64 && !registry_io_busy_)return;
-        if(count>=64 && std::string_view(phase)!="enter")return;
+        while(count<limit && !emitted.compare_exchange_weak(count,count+1,std::memory_order_relaxed)){}
+        // 預設 64 筆；診斷上限最高 65536，重入只在終止點輸出。
+        if(count>=limit && !registry_io_busy_)return;
+        if(count>=limit && std::string_view(phase)!="enter")return;
         std::fprintf(stderr,"[registry-io] phase=%s pid=%llu current=%llu owner=%llu busy=%u ready=%u saved=%u rip=%llx callbacks=%zu\n",
             phase,static_cast<unsigned long long>(process_id()),static_cast<unsigned long long>(threads_.current),
             static_cast<unsigned long long>(registry_io_owner_),registry_io_busy_?1U:0U,registry_io_ready()?1U:0U,

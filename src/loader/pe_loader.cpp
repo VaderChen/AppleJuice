@@ -1,5 +1,6 @@
 #include "x64arm/startup_profile.hpp"
 #include "x64arm/pe_loader.hpp"
+#include "x64arm/pe_section_image.hpp"
 #include "x64arm/guest_address_policy.hpp"
 #include "x64arm/windows_unwind.hpp"
 #include "x64arm/smap.hpp"
@@ -619,7 +620,7 @@ std::vector<PeDelayImport> delay_imports(const Image& image,Directory directory,
     if(!terminated)reject("delay import directory 缺少終止描述子");
     return result;
 }
-ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::optional<GuestAddress> image_base, bool dll, std::size_t memory_limit, bool resource_only, bool inventory_only, const PeImageBaseSelector& select_base = {}, bool native_subsystem = false) {
+ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::optional<GuestAddress> image_base, bool dll, std::size_t memory_limit, bool resource_only, bool inventory_only, const PeImageBaseSelector& select_base = {}, bool native_subsystem = false, bool section_only = false) {
     if(!memory_limit || memory_limit>GuestMemory::maximum_capacity)reject("客體記憶體容量設定不合法");
     // 安裝器的 overlay 是檔案資料，不計入映像的客體記憶體額度。
     Reader file{bytes};
@@ -634,9 +635,9 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
     const bool x86 = machine == 0x14c;
     const unsigned pointer_size = x86 ? 4 : 8, directory_offset = x86 ? 96 : 112;
     const auto count = file.u16(pe + 6), optional_size = file.u16(pe + 20), characteristics = file.u16(pe + 22);
-    if (count == 0 || count > 96 || !(characteristics & 2) || ((characteristics & 0x1000U) && !native_subsystem)) reject("不支援 system image 或不合法 section 數目");
+    if (count == 0 || count > 96 || !(characteristics & 2) || ((characteristics & 0x1000U) && !native_subsystem && !section_only)) reject("不支援 system image 或不合法 section 數目");
     // 核心驅動是可執行映像（無 DLL 旗標），由驅動宿主以模組方式載入。
-    if(!resource_only && !inventory_only && !native_subsystem && bool(characteristics & 0x2000U)!=dll)reject("PE 映像種類與要求的 EXE／DLL 不符");
+    if(!resource_only && !inventory_only && !section_only && !native_subsystem && bool(characteristics & 0x2000U)!=dll)reject("PE 映像種類與要求的 EXE／DLL 不符");
     const auto opt = pe + 24;
     file.check(opt, optional_size);
     if (optional_size < directory_offset || file.u16(opt) != (x86 ? 0x10b : 0x20b)) reject("PE optional header 與 Machine 架構不符");
@@ -649,7 +650,7 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
         file_alignment > 65536 || file_alignment > section_alignment) reject("不支援此 section/file alignment");
     if (image_size == 0 || image_size > memory_limit || image_size % section_alignment ||
         headers == 0 || headers > image_size || headers % file_alignment) reject("SizeOfImage 或 SizeOfHeaders 不合法");
-    if (!inventory_only && !dll) {
+    if (!inventory_only && !section_only && !dll) {
         // PE 的保留量以 bytes 表示；Windows 向上取整至 64 KiB 配置粒度。
         // 使用同一個正規化大小建立映射、初始 SP 及 TEB，容量以程序設定為準。
         constexpr std::uint64_t stack_granularity = 65536;
@@ -660,8 +661,8 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
             reject("堆疊提交量、保留量或客體總容量超過支援範圍");
     }
     // native subsystem 只開放給核心驅動宿主載入的 DLL 型映像。
-    if (!inventory_only && file.u16(opt + 68) != 3 && file.u16(opt + 68) != 2 && !(native_subsystem && dll && file.u16(opt + 68) == 1)) reject("只支援 Windows console／GUI subsystem");
-    if (!resource_only && !inventory_only && (file.u16(opt + 70) & 0x1000U)) reject("尚未支援 AppContainer 映像");
+    if (!inventory_only && !section_only && file.u16(opt + 68) != 3 && file.u16(opt + 68) != 2 && !(native_subsystem && dll && file.u16(opt + 68) == 1)) reject("只支援 Windows console／GUI subsystem");
+    if (!resource_only && !inventory_only && !section_only && (file.u16(opt + 70) & 0x1000U)) reject("尚未支援 AppContainer 映像");
     if (directory_count > 16 || std::uint64_t{directory_count} * 8 + directory_offset > optional_size) reject("data directory 數目超過 optional header");
     const auto table = opt + optional_size;
     file.check(0, headers); file.check(table, std::size_t{count} * 40);
@@ -700,13 +701,14 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
         if (flags_value & 0x40000000U) permissions |= permission(Access::Read);
         if (flags_value & 0x80000000U) permissions |= permission(Access::Write);
         if (flags_value & 0x20000000U) permissions |= permission(Access::Execute);
+        if(section_only && (permissions&permission(Access::Write)))permissions|=permission(Access::Read);
         if(resource_only)permissions=permission(Access::Read);
         // 沒有 R/W/X 的 metadata 區段仍有合法的映像範圍與內容；以不可存取映射保留。
         // 客體 W+X 仍是資料映射；僅經 JIT 驗證的 ARM64 進入宿主可執行 arena。
         // 可執行來源寫入沿用 GuestMemory 世代／範圍撤銷，不能直接執行舊翻譯。
         // 唯讀 shared section（例如 Qt5Core 的 .qtmimed）載入後內容不再改變，各程序私有映射與共用頁面語義相同；
         // 可寫入者需要跨程序共用頁面，仍拒絕。
-        else if (!inventory_only && (flags_value & 0x10000000U) && (flags_value & 0x80000000U)) reject("尚未支援可寫入的 shared section");
+        else if (!inventory_only && !section_only && (flags_value & 0x10000000U) && (flags_value & 0x80000000U)) reject("尚未支援可寫入的 shared section");
         for (const auto& other : image.sections) {
             if (rva < std::uint64_t{other.rva} + other.size && other.rva < std::uint64_t{rva} + rounded) reject("section 虛擬範圍重疊");
             if (file_size && other.raw_size && raw < std::uint64_t{other.raw} + other.raw_size && other.raw < std::uint64_t{raw} + file_size) reject("section raw 範圍重疊");
@@ -718,6 +720,7 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
     image.index_sections();
     std::array<Directory, 16> directories{};
     for (std::uint32_t i = 0; i < directory_count; ++i) {
+        if(section_only)continue; // 映像 Section 不綁定目錄；各目錄的消費者負責其格式驗證。
         const Directory directory{file.u32(opt + directory_offset + i * 8), file.u32(opt + directory_offset + 4 + i * 8)};
         // 資源映射不執行映像；只驗證實際會使用的 resource directory。
         if(resource_only && i!=2)continue;
@@ -731,18 +734,19 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
         }
         directories[i] = directory;
     }
-    if (!resource_only && (characteristics & 1U) && base != preferred) reject("映像標示 RELOCS_STRIPPED，不能變更 image base");
+    if (!resource_only && !section_only && (characteristics & 1U) && base != preferred) reject("映像標示 RELOCS_STRIPPED，不能變更 image base");
     ParsedPeImage parsed;
     parsed.dll=inventory_only?bool(characteristics & 0x2000U):dll;parsed.stack_size=stack_size;
     auto& runtime=parsed.runtime;
     runtime.large_address_aware=bool(characteristics & 0x20U);
-    if(resource_only) {
-        resources(image,directories[2]);
-        parsed.metadata={GuestAddress{preferred},GuestAddress{base},GuestAddress{0},image_size,0,{}};
+    if(resource_only || section_only) {
+        if(resource_only)resources(image,directories[2]);
+        if(section_only && entry>=image_size)reject("映像 Section 的入口超出 SizeOfImage");
+        parsed.metadata={GuestAddress{preferred},GuestAddress{base},GuestAddress{section_only && entry?base+entry:0},image_size,0,{}};
         parsed.metadata.architecture = x86 ? PeArchitecture::X86 : PeArchitecture::X64;
         runtime.base=base;runtime.size=image_size;
         parsed.mappings.push_back({0,permission(Access::Read),std::move(image.header_bytes)});
-        for(auto& section:image.sections)parsed.mappings.push_back({section.rva,permission(Access::Read),std::move(section.bytes)});
+        for(auto& section:image.sections)parsed.mappings.push_back({section.rva,section_only?section.permissions:permission(Access::Read),std::move(section.bytes)});
         return parsed;
     }
     exports(image,directories[0],runtime);
@@ -864,6 +868,27 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
 ParsedPeImage parse_pe_image(std::span<const std::uint8_t> bytes, std::optional<GuestAddress> image_base, bool dll, std::size_t memory_limit, bool resource_only, const PeImageBaseSelector& select_base, bool native_subsystem) {
     startup_profile::Scope measurement("loader","parse_pe_image",true);
     return parse_pe_image_impl(bytes,image_base,dll,memory_limit,resource_only,false,select_base,native_subsystem);
+}
+PeSectionImage parse_pe_section_image(std::span<const std::uint8_t> bytes,std::size_t memory_limit) {
+    if(bytes.size()>UINT32_MAX)reject("映像 Section 的檔案大小超過 DWORD");
+    auto parsed=parse_pe_image_impl(bytes,{},false,memory_limit,false,false,{},false,true);
+    const Reader file{bytes};const auto pe=std::size_t{file.u32(60)},opt=pe+24;
+    const bool x86=parsed.metadata.architecture==PeArchitecture::X86;const unsigned unit=x86?4:8;
+    PeSectionImage result;result.preferred_base=parsed.metadata.preferred_base.value;
+    result.image_size=parsed.metadata.image_size;result.entry=file.u32(opt+16);
+    result.stack_reserve=file.integer(opt+72,unit);result.stack_commit=file.integer(opt+72+unit,unit);
+    result.subsystem=file.u16(opt+68);result.subsystem_version=(std::uint32_t{file.u16(opt+48)}<<16)|file.u16(opt+50);
+    result.os_version=file.u32(opt+40);result.characteristics=file.u16(pe+22);result.dll_characteristics=file.u16(opt+70);
+    result.machine=file.u16(pe+4);result.contains_code=file.u32(opt+4)!=0;result.loader_flags=file.u32(opt+(x86?88:104));
+    result.file_size=static_cast<std::uint32_t>(bytes.size());result.checksum=file.u32(opt+64);
+    const auto table=opt+file.u16(pe+20);const auto count=file.u16(pe+6);
+    for(auto& mapping:parsed.mappings) {
+        bool shared=false;
+        for(unsigned i=0;i<count && mapping.rva;++i){const auto at=table+i*40;if(file.u32(at+12)==mapping.rva){shared=(file.u32(at+36)&0x10000000U)!=0;break;}}
+        result.ranges.push_back({mapping.rva,static_cast<std::uint32_t>(mapping.bytes.size()),mapping.permissions,shared,std::move(mapping.bytes)});
+    }
+    std::sort(result.ranges.begin(),result.ranges.end(),[](const auto& a,const auto& b){return a.rva<b.rva;});
+    return result;
 }
 PeInventory inspect_pe_image(std::span<const std::uint8_t> bytes) {
     auto parsed=parse_pe_image_impl(bytes,{},false,GuestMemory::capacity_limit,false,true);

@@ -3,6 +3,7 @@
 #include "processor_registry.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/unicode.hpp"
+#include "registry_native_status.hpp"
 #include <algorithm>
 
 namespace x64arm {
@@ -10,7 +11,8 @@ namespace {
 constexpr std::uint32_t invalid_handle=0xc0000008U,invalid_parameter=0xc000000dU,denied=0xc0000022U;
 constexpr std::uint32_t missing=0xc0000034U,deleted=0xc000017cU,unsupported=0xc00000bbU,no_memory=0xc0000017U;
 struct NativeRegistryError {std::uint32_t status;};
-std::uint32_t native_io_error(std::uint32_t code){return !code?0U:code==2 || code==3?missing:code==5?denied:code==6?invalid_handle:code==8?no_memory:code==13?0xc000003eU:code==50?unsupported:code==87?invalid_parameter:code==234?0x80000005U:code==1314?0xc0000061U:code==1336?0xc0000077U:code==1337?0xc0000078U:code==1338?0xc0000079U:0xc0000001U;}
+std::uint32_t native_io_error(std::uint32_t code){return registry_native_status(code);}
+
 std::u16string folded(std::u16string text){for(auto& c:text)c=unicode_case_unit(c,false);return text;}
 void put(std::vector<std::uint8_t>& bytes,std::size_t offset,std::uint64_t value,unsigned size=4){for(unsigned i=0;i<size;++i)bytes.at(offset+i)=static_cast<std::uint8_t>(value>>(i*8));}
 std::vector<std::uint8_t> text_bytes(std::u16string_view text){auto bytes=utf16_bytes(text);bytes.resize(text.size()*2);return bytes;}
@@ -21,7 +23,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_registry(GuestState& sta
     const auto finish=[&](std::uint32_t status){arg.return_to(state,status);return std::optional<std::uint32_t>{};};
     if(symbol=="NtClose"){
         if(const auto flags=runtime_.handle_flags.find(arg(0));flags!=runtime_.handle_flags.end() && (flags->second&2U))return finish(0xc0000235U);
-        if(registry.handles.erase(arg(0))){runtime_.handle_flags.erase(arg(0));poll_registry_notifications(false);return finish(0);}
+        if(registry.handles.erase(arg(0))){runtime_.handle_flags.erase(arg(0));poll_registry_notifications(false,{},0,&memory);return finish(0);}
         start_callbacks(state,memory,{{resolve("internal-nt-file","CloseHandle").value,{arg(0)}}},Continuation::NtCloseResult);return std::nullopt;
     }
     if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
@@ -29,11 +31,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_registry(GuestState& sta
     RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_,readonly);if(transaction.error)return finish(native_io_error(transaction.error));
     refresh_processor_registry(registry,memory.processor_count(),guest_processor_information(memory));
     initialize_registry_views(registry);
-    poll_registry_notifications(false);bool changed=false;std::vector<std::pair<std::u16string,std::uint32_t>> mutations;
+    poll_registry_notifications(false,{},0,&memory);bool changed=false;std::vector<std::pair<std::u16string,std::uint32_t>> mutations;
     const auto original=registry_file_.empty() || readonly?RegistryState{}:registry;
     const auto done=[&](std::uint32_t status){
         if(!status && changed){status=native_io_error(commit_registry_transaction(transaction));if(status && !registry_file_.empty())registry=original;}
-        if(!status){for(const auto& [path,filter]:mutations)poll_registry_notifications(false,path,filter);poll_registry_notifications(false);}
+        if(!status){for(const auto& [path,filter]:mutations)poll_registry_notifications(false,path,filter,&memory);poll_registry_notifications(false,{},0,&memory);}
         return finish(status);
     };
     const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);

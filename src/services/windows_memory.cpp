@@ -35,6 +35,8 @@ VirtualMemoryInformation WindowsServices::virtual_memory_information(const Guest
     const auto address=raw,address_limit=user_address_limit();const auto& regions=runtime_.virtual_regions;
     auto found=regions.upper_bound(address);if(found!=regions.begin()){--found;if(address-found->first>=found->second.size)found=regions.end();}else found=regions.end();
     const auto mapped=memory.query(GuestAddress{address});
+    const auto view=mapping_view_info(address);
+    const bool section_image=view && (view->protection&0x1000000U);
     std::uint64_t base=address,allocation=0,end=address_limit;std::uint32_t initial=0,mode=0,allocation_state=0x10000,type=0;
     if (found!=regions.end()) {
         allocation=found->first;initial=found->second.protection;end=allocation+found->second.size;allocation_state=0x2000;type=0x20000;
@@ -44,6 +46,7 @@ VirtualMemoryInformation WindowsServices::virtual_memory_information(const Guest
         for(const auto& [id,thread]:threads_.items){(void)id;stack(thread.stack_base,thread.stack_size);}
         for(const auto& [handle,fiber]:threads_.fibers){(void)handle;stack(fiber.stack_base,fiber.stack_size);}
     }
+    if(section_image){allocation=view->base;initial=view->protection&0xffU;type=0x1000000U;allocation_state=0x2000;end=std::min(end,view->base+view->size);}
     if (mapped) {
         // 查詢從包含 lpAddress 的頁面開始，大小只涵蓋同狀態／權限的連續區間。
         base=address;end=std::min(end,mapped->base.value+mapped->size);mode=protection(mapped->permissions);allocation_state=0x1000;
@@ -51,15 +54,18 @@ VirtualMemoryInformation WindowsServices::virtual_memory_information(const Guest
             const auto* image=module_image(address,true);allocation=image?image->base:mapped->base.value;
             initial=mode;type=image?0x1000000U:0x20000U;
         }
-        if(const auto view=mapping_view_info(address)){
-            allocation=view->base;initial=view->protection;if((initial==8 || initial==128) && memory.is_copy_on_write(GuestAddress{address}))mode=initial;type=0x40000U;end=std::min(end,view->base+view->size);
+        if(view){
+            allocation=view->base;initial=view->protection&0xffU;
+            if(section_image){if((mapped->permissions&permission(Access::Write)) && !shared_mapping_page(address) && memory.is_copy_on_write(GuestAddress{address}))mode=(mapped->permissions&permission(Access::Execute))?128U:8U;}
+            else{if((initial==8 || initial==128) && memory.is_copy_on_write(GuestAddress{address}))mode=initial;type=0x40000U;}
+            end=std::min(end,view->base+view->size);
         }
         const auto page_address=address&~(page-1);const auto override=runtime_.virtual_page_protections.find(page_address);
         if(override!=runtime_.virtual_page_protections.end()){
             mode=override->second.mode;if((mode==8 || mode==128) && !memory.is_copy_on_write(GuestAddress{address}))mode>>=1;initial=override->second.initial;auto cursor=page_address+page;
             while(cursor<end){const auto next=runtime_.virtual_page_protections.find(cursor);if(next==runtime_.virtual_page_protections.end() || next->second!=override->second)break;cursor+=page;}end=std::min(end,cursor);
         }else if(const auto next=runtime_.virtual_page_protections.upper_bound(page_address);next!=runtime_.virtual_page_protections.end())end=std::min(end,next->first);
-        while (end<address_limit) {
+        while (!section_image && end<address_limit) {
             const auto next=memory.query(GuestAddress{end});
             if (!next || next->permissions!=mapped->permissions || next->base.value!=end || found==regions.end() || end>=found->first+found->second.size) break;
             end=std::min(found->first+found->second.size,next->base.value+next->size);
@@ -124,10 +130,14 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
             const auto basic=mode&0xffU;const bool copy=basic==8 || basic==128;
             const Permissions permissions = basic == 1 ? 0 : basic == 2 ? 1 : basic == 4 || basic==8 ? 3 : basic == 16 ? 4 : basic == 32 ? 5 : 7;
             const auto actual=static_cast<Permissions>((mode&0x100U)?0:permissions);
+            bool shared_image_code=false;
+            if(previous.type==0x1000000U && (permissions&permission(Access::Execute)))
+                for(auto cursor=at;cursor<end;cursor+=page)if(shared_mapping_page(cursor)){shared_image_code=true;break;}
             // 不可撤銷目前 API return frame 或 oldProtect out parameter 的存取權限。
             if(!protection_allocation_range(at,end))fail(487);
             else if(copy && previous.type!=0x1000000U && previous.type!=0x40000U)fail(87);
             else if(offered_overlap(at,end))fail(487);
+            else if(shared_image_code)fail(50); // 跨程序共享程式碼的失效協定尚未提供。
             else if(dynamic_code_blocked() && ((permissions&permission(Access::Execute)) || ((permissions&permission(Access::Write)) && executable_range(at,end-at))))fail(1655);
             else if (!(actual & permission(Access::Write)) && ((output && at < output + 4 && output < end) || (at <= frame && frame < end))) fail(87);
             else {
@@ -144,6 +154,7 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
 
     } else if(operation==2){
         const auto requested=arg(0),size=arg(1);const auto type=static_cast<std::uint32_t>(arg(2)),mode=static_cast<std::uint32_t>(arg(3));
+        if(const auto view=mapping_view_info(requested);view && (view->protection&0x1000000U))return 487;
         const bool replace=bool(type&0x4000),placeholder=bool(type&0x40000);
         const bool reserve=(bool(type&0x2000) || !requested) && !replace;
         const auto access=permissions(mode);
@@ -257,6 +268,7 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
         }
     } else if(operation==3){
         const auto address=arg(0),size=arg(1);const auto type=static_cast<std::uint32_t>(arg(2));auto found=region_at(address);
+        if(mapping_view_info(address))return 487; // section view 只能由 Unmap 流程釋放，保留其物件生命週期。
         if(type==0x8001U || type==0x8002U){
             if(found==regions.end() || (address&4095U) || (size&4095U) || size>address_limit-address)fail(87);
             else if(type==0x8001U){
@@ -303,9 +315,11 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
         if(values[0] && values[1] && values[1]<=UINT64_C(64)*1024*1024)memory.flush_instruction_cache(GuestAddress{values[0]},static_cast<std::size_t>(values[1]));
         else memory.flush_instruction_cache();return 0;
     }else if(operation==7){
+        if(values[2]&~UINT64_C(3))return 87;
         const auto view=mapping_view_info(values[0]);if(!view)return 487;
+        if(values[1] && view->base!=values[0])return 487;
         if(frame && view->base<=frame && frame-view->base<view->size)return 87;
-        const auto saved=last_error_;const bool result_unmap=unmap_file_view(memory,view->base);const auto error_unmap=result_unmap?0U:last_error_;last_error_=saved;return error_unmap;
+        const auto saved=last_error_;const bool result_unmap=unmap_file_view(memory,view->base,false,static_cast<std::uint32_t>(values[2]));const auto error_unmap=result_unmap?0U:last_error_;last_error_=saved;return error_unmap;
     }else if(operation<=1){
 #if !defined(_WIN32)
         const auto address=values[0],size=values[1];values[4]=0;
@@ -400,7 +414,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_process_memory(GuestState& 
     const WindowsCall call(state,memory,service);const auto saved_error=last_error_;const bool native=service.family=="ntdll.dll";
     auto symbol=service.symbol;if(native && symbol.starts_with("Zw"))symbol.remove_prefix(2);else if(native && symbol.starts_with("Nt"))symbol.remove_prefix(2);
     const auto finish=[&](std::uint64_t result,std::uint32_t error){
-        if(native){last_error_=saved_error;const auto status=error==0?0U:error==5?0xc0000022U:error==6?(object_type(call(0)).empty()?0xc0000008U:0xc0000024U):error==8?0xc0000017U:error==50?0xc00000bbU:error==299?0x8000000dU:error==487?(symbol=="UnmapViewOfSection"?0xc0000019U:0xc0000018U):error==0x10003U?0xc0000003U:error==998?0xc0000005U:error==1655?0xc0000604U:error==24?0xc0000004U:0xc000000dU;call.return_to(state,status);}
+        if(native){last_error_=saved_error;const auto status=error==0?0U:error==5?0xc0000022U:error==6?(object_type(call(0)).empty()?0xc0000008U:0xc0000024U):error==8?0xc0000017U:error==50?0xc00000bbU:error==299?0x8000000dU:error==487?(symbol.starts_with("UnmapViewOfSection")?0xc0000019U:0xc0000018U):error==0x10003U?0xc0000003U:error==998?0xc0000005U:error==1655?0xc0000604U:error==24?0xc0000004U:0xc000000dU;call.return_to(state,status);}
         else {if(error)last_error_=error;call.return_to(state,error?0:result);}return std::optional<std::uint32_t>{};
     };
     const bool wow64=symbol=="Wow64ReadVirtualMemory64" || symbol=="Wow64WriteVirtualMemory64";
@@ -420,17 +434,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_process_memory(GuestState& 
         const bool allocate=symbol=="VirtualAlloc" || symbol=="VirtualAllocEx" || symbol=="AllocateVirtualMemory" || allocation2 || numa_allocate;
         const bool freeing=symbol=="VirtualFree" || symbol=="VirtualFreeEx" || symbol=="FreeVirtualMemory";
         const bool protect=symbol=="VirtualProtect" || symbol=="VirtualProtectEx" || symbol=="ProtectVirtualMemory";
-        const bool flush=symbol=="FlushInstructionCache",unmap=symbol=="UnmapViewOfSection";
-        const bool extended=native || symbol.ends_with("Ex") || flush || allocation2 || numa_allocate;
+        const bool flush=symbol=="FlushInstructionCache",unmap=symbol.starts_with("UnmapViewOfSection") || symbol.starts_with("UnmapViewOfFile");
+        const bool extended=unmap?(native || symbol=="UnmapViewOfFile2"):native || symbol.ends_with("Ex") || flush || allocation2 || numa_allocate;
         const auto handle=allocation2 && !native && !call(0)?(x86_?UINT32_MAX:UINT64_MAX):extended?call(0):(x86_?UINT32_MAX:UINT64_MAX);std::uint32_t pid{};std::uint64_t birth{};
         const auto rights=query?0x400U:flush?0U:8U;
         auto error=process_memory_target(memory,handle,rights,pid,birth);
         const bool debug_transport=error==87 && (query || protect || flush) && !current_process_handle(handle) && !process_remote_target(handle,rights,pid,birth);
         if(error && !debug_transport)return finish(0,error);
         std::array<std::uint64_t,5> values{};std::uint64_t output=0,length=0,address_pointer=0,size_pointer=0;
-        if(native){
-            if(unmap)values[0]=call(1);
-            else if(query){if(static_cast<std::uint32_t>(call(2)))return finish(0,static_cast<std::uint32_t>(call(2))==2?50U:0x10003U);output=call(3);length=call(4);values[0]=call(1);if(call(5))memory.check(GuestAddress{call(5)},unit,Access::Write);}
+        if(unmap){values[0]=call(extended?1:0);values[1]=native?0U:1U;values[2]=symbol=="UnmapViewOfSection"?0U:static_cast<std::uint32_t>(call(extended?2:1));}
+        else if(native){
+            if(query){if(static_cast<std::uint32_t>(call(2)))return finish(0,static_cast<std::uint32_t>(call(2))==2?50U:0x10003U);output=call(3);length=call(4);values[0]=call(1);if(call(5))memory.check(GuestAddress{call(5)},unit,Access::Write);}
             else {
                 address_pointer=call(1);size_pointer=call(allocate && !allocation2?3U:2U);
                 memory.check(GuestAddress{address_pointer},unit,Access::Read);memory.check(GuestAddress{address_pointer},unit,Access::Write);
@@ -583,6 +597,7 @@ std::span<const WindowsServiceDescriptor> memory_service_descriptors() {
         {"kernel32.dll","FlushInstructionCache",3},{"kernel32.dll","FlushProcessWriteBuffers",0},{"psapi.dll","QueryWorkingSet",3},{"kernel32.dll","K32QueryWorkingSet",3},
         {"kernel32.dll","ReadProcessMemory",5},{"kernel32.dll","WriteProcessMemory",5},
         {"kernel32.dll","VirtualAllocEx",5},{"kernel32.dll","VirtualFreeEx",4},{"kernel32.dll","VirtualProtect",4},{"kernel32.dll","VirtualProtectEx",5},
+        {"kernel32.dll","UnmapViewOfFileEx",2},{"kernel32.dll","UnmapViewOfFile2",3},
         {"kernel32.dll","VirtualAlloc",4},{"kernel32.dll","VirtualFree",3},{"kernel32.dll","VirtualQuery",3},{"kernel32.dll","VirtualQueryEx",4},
         {"kernel32.dll","VirtualAlloc2",7},{"kernel32.dll","VirtualAlloc2FromApp",7},{"kernel32.dll","VirtualAllocExNuma",6},
         {"kernel32.dll","GetNumaHighestNodeNumber",1},{"kernel32.dll","GetNumaProcessorNode",2},{"kernel32.dll","GetNumaProcessorNodeEx",2},
@@ -594,6 +609,7 @@ std::span<const WindowsServiceDescriptor> memory_service_descriptors() {
         {"ntdll.dll","NtAllocateVirtualMemory",6},{"ntdll.dll","NtFreeVirtualMemory",4},
         {"ntdll.dll","NtAllocateVirtualMemoryEx",7},{"ntdll.dll","ZwAllocateVirtualMemoryEx",7},
         {"ntdll.dll","NtProtectVirtualMemory",5},{"ntdll.dll","NtQueryVirtualMemory",6},{"ntdll.dll","NtUnmapViewOfSection",2},
+        {"ntdll.dll","NtUnmapViewOfSectionEx",3,0,0,4},{"ntdll.dll","ZwUnmapViewOfSectionEx",3,0,0,4},
         {"ntdll.dll","NtReadVirtualMemory",5},{"ntdll.dll","NtWriteVirtualMemory",5},
         {"ntdll.dll","NtWow64ReadVirtualMemory64",5,0xa},{"ntdll.dll","NtWow64WriteVirtualMemory64",5,0xa},
         {"ntdll.dll","ZwReadVirtualMemory",5},{"ntdll.dll","ZwWriteVirtualMemory",5},
@@ -603,7 +619,7 @@ std::span<const WindowsServiceDescriptor> memory_service_descriptors() {
 }
 std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     poll_job_termination(memory);
-    if(service.symbol=="ReadProcessMemory" || service.symbol=="WriteProcessMemory" || service.symbol=="FlushInstructionCache" || service.symbol.starts_with("VirtualAlloc") || service.symbol.starts_with("VirtualFree") || service.symbol.starts_with("VirtualProtect") || service.symbol.starts_with("VirtualQuery") || service.family=="ntdll.dll")return invoke_process_memory(state,memory,service);
+    if(service.symbol=="ReadProcessMemory" || service.symbol=="WriteProcessMemory" || service.symbol=="FlushInstructionCache" || service.symbol.starts_with("UnmapViewOfFile") || service.symbol.starts_with("VirtualAlloc") || service.symbol.starts_with("VirtualFree") || service.symbol.starts_with("VirtualProtect") || service.symbol.starts_with("VirtualQuery") || service.family=="ntdll.dll")return invoke_process_memory(state,memory,service);
     const WindowsCall call(state,memory,service);
     if(service.symbol.starts_with("GetNuma")){
         const auto name=service.symbol;const bool extended=name.ends_with("Ex");

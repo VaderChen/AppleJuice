@@ -355,11 +355,12 @@ struct ProcessSnapshot {
 };
 struct CompletionPacket {
     std::uint64_t key{}, overlapped{}, status{};
-    std::uint32_t bytes{};
+    std::uint64_t bytes{}, wait_packet{};
     bool operator==(const CompletionPacket&) const = default;
 };
 struct CompletionPort {
     std::deque<CompletionPacket> packets;
+    std::uint32_t access{0x1f0003};
     bool operator==(const CompletionPort&) const = default;
 };
 struct EventProviderRegistration {
@@ -430,6 +431,8 @@ struct RuntimeState {
     process_io::Counters io_counters;
     std::uint32_t startup_show{UINT32_MAX};bool startup_show_used{};
     std::optional<std::array<std::uint64_t,3>> startup_handles;
+    std::optional<std::array<std::uint32_t,9>> native_startup_window;
+    std::array<std::uint64_t,4> native_startup_text{}; // desktop/title 的 W 與 A 穩定位址。
     std::vector<std::uint8_t> startup_reserved2;
     std::uint64_t startup_reserved2_address{};unsigned startup_reserved2_pointer_bytes{};
     std::optional<std::uint32_t> job_exit_code;
@@ -592,7 +595,7 @@ struct RuntimeState {
     std::uint32_t next_loader_lock_cookie{1};
     std::vector<std::string> module_events;
     std::filesystem::path application_source;
-    std::u16string application_directory, dll_directory;
+    std::u16string application_directory, dll_directory, native_dll_path;
     std::map<std::uint64_t,std::u16string> added_dll_directories;
     std::uint32_t default_dll_directories{};
     std::uint32_t search_path_mode{};

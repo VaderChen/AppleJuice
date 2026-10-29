@@ -41,7 +41,7 @@ std::span<const WindowsServiceDescriptor> ole_service_descriptors(){
         {"internal-clipboard-enum","QueryInterface",3},{"internal-clipboard-enum","AddRef",1},{"internal-clipboard-enum","Release",1},
         {"internal-clipboard-enum","Next",4},{"internal-clipboard-enum","Skip",2},{"internal-clipboard-enum","Reset",1},{"internal-clipboard-enum","Clone",2},
         {"ole32.dll","CoRegisterMessageFilter",2},{"ole32.dll","CoFreeUnusedLibraries",0},
-        {"ole32.dll","CoRegisterClassObject",5},{"ole32.dll","CoRevokeClassObject",1},
+        {"ole32.dll","CoRegisterClassObject",5},{"ole32.dll","CoRevokeClassObject",1},{"ole32.dll","CoCreateInstanceEx",6,0,0,0x14},
         {"ole32.dll","CoAddRefServerProcess",0},{"ole32.dll","CoReleaseServerProcess",0},
         {"ole32.dll","CoSuspendClassObjects",0},{"ole32.dll","CoResumeClassObjects",0},
         {"ole32.dll","RegisterDragDrop",2},{"ole32.dll","RevokeDragDrop",1}
@@ -114,7 +114,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole(GuestState& state,Guest
     if(service.family.starts_with("internal-clipboard-") || service.family=="internal-ole-clipboard" ||
        service.symbol=="OleSetClipboard" || service.symbol=="OleGetClipboard" || service.symbol=="OleFlushClipboard" || service.symbol=="OleIsCurrentClipboard")
         return invoke_ole_clipboard(state,memory,service);
-    if(service.symbol=="CoRegisterClassObject" || service.symbol=="CoRevokeClassObject" ||
+    if(service.symbol=="CoCreateInstanceEx" || service.symbol=="CoRegisterClassObject" || service.symbol=="CoRevokeClassObject" ||
        service.symbol=="CoAddRefServerProcess" || service.symbol=="CoReleaseServerProcess" ||
        service.symbol=="CoSuspendClassObjects" || service.symbol=="CoResumeClassObjects" ||
        service.symbol=="OleRun" || service.symbol=="OleIsRunning" || service.symbol=="OleLockRunning" || service.symbol=="OleSetContainedObject")

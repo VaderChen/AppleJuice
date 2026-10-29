@@ -57,6 +57,7 @@ std::span<const WindowsServiceDescriptor> volume_service_descriptors() {
         {"kernel32.dll", "GetDiskFreeSpaceA", 5}, {"kernel32.dll", "GetDiskFreeSpaceW", 5},
         {"kernel32.dll", "GetDiskFreeSpaceExA", 4}, {"kernel32.dll", "GetDiskFreeSpaceExW", 4},
         {"kernel32.dll", "GetVolumeInformationA", 8}, {"kernel32.dll", "GetVolumeInformationW", 8},
+        {"kernel32.dll", "SetVolumeLabelA", 2}, {"kernel32.dll", "SetVolumeLabelW", 2},
         {"kernel32.dll", "GetCompressedFileSizeA", 2}, {"kernel32.dll", "GetCompressedFileSizeW", 2},
         {"kernel32.dll", "GetTempFileNameA", 4}, {"kernel32.dll", "GetTempFileNameW", 4},
         {"kernel32.dll", "GetTempPath2A", 2}, {"kernel32.dll", "GetTempPath2W", 2}, {"kernel32.dll", "GetTempPathA", 2}, {"kernel32.dll", "GetTempPathW", 2},
@@ -123,7 +124,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
             const auto found=runtime_.environment.find(key);
             if(found!=runtime_.environment.end() && !found->second.second.empty()){path=found->second.second;break;}
         }
-        return temp_absolute(normalized_windows_path(std::move(path),runtime_.current_directory));
+        return temp_absolute(full_windows_environment_path(std::move(path),runtime_.current_directory,runtime_.environment));
     };
     if(service.family=="crt"){
         const bool allocated=symbol=="_tempnam" || symbol=="_wtempnam",secure=symbol.ends_with("_s");
@@ -155,7 +156,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
                 if(!exists(directory))return error(2);
                 prefix=arg(1)?utf8_to_utf16(text(1)):std::u16string{};
                 if(prefix.find_first_of(u"\\/:*?\"<>|")!=prefix.npos)return error(22);
-                directory=temp_absolute(normalized_windows_path(std::move(directory),runtime_.current_directory));
+                directory=temp_absolute(full_windows_environment_path(std::move(directory),runtime_.current_directory,runtime_.environment));
             }else directory=temporary_directory();
             auto& sequence=allocated?runtime_.crt_tempnam_sequence:runtime_.crt_tmpnam_sequence;
             const std::uint64_t maximum=allocated?UINT64_MAX:secure?INT32_MAX:32767U;
@@ -306,19 +307,29 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
                 }
             }
         }
+    } else if (symbol.starts_with("SetVolumeLabel")) {
+        if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許卷標宿主寫入");
+        const auto path=arg(0)?text(0):utf16_to_utf8(runtime_.current_directory);
+        const auto location=arg(0)?FileVolumeLocation{}:filesystem_.volume_location(path,true);
+        const auto [id,root_error]=arg(0)?mount_volume(path):std::pair<char,std::uint32_t>{location.volume,location.error};
+        const auto error=root_error?root_error:filesystem_.set_volume_label(id,arg(1)?(wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(text(1))):std::u16string{});
+        if(error)fail(error);else result=1;
     } else if (symbol.starts_with("GetVolumeInformation")) {
         const auto path = arg(0) ? text(0) : std::string("C:\\");
         const auto [id,root_error]=mount_volume(path);
         const auto info = filesystem_.information(root_error?path:windows_volume_path(id));
+        const auto properties=root_error?FileVolumeProperties{}:filesystem_.volume_properties(id);
+        const auto label=encoded(properties.label);
         if (root_error) fail(root_error==123 || root_error==4390?3U:root_error);
         else if (info.error) fail(info.error);
-        else if ((arg(1) && u32(2) < 7) || (arg(6) && u32(7) < 7)) fail(122);
+        else if(properties.error)fail(properties.error);
+        else if ((arg(1) && u32(2) < label.size()/(wide?2U:1U)) || (arg(6) && u32(7) < 7)) fail(122);
         else {
             const auto name = encoded(u"X64ARM");
-            if (arg(1)) memory.check(GuestAddress{arg(1)}, name.size(), Access::Write);
+            if (arg(1)) memory.check(GuestAddress{arg(1)}, label.size(), Access::Write);
             if (arg(6)) memory.check(GuestAddress{arg(6)}, name.size(), Access::Write);
             for (unsigned i = 3; i <= 5; ++i) if (arg(i)) memory.check(GuestAddress{arg(i)}, 4, Access::Write);
-            if (arg(1)) memory.write(GuestAddress{arg(1)}, name);
+            if (arg(1)) memory.write(GuestAddress{arg(1)}, label);
             if (arg(6)) memory.write(GuestAddress{arg(6)}, name);
             if (arg(3)) memory.store(GuestAddress{arg(3)}, 32, info.metadata.device);
             if (arg(4)) memory.store(GuestAddress{arg(4)}, 32, 255);

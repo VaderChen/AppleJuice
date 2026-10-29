@@ -1,4 +1,6 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/unicode.hpp"
+#include "service_callback_task.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -49,7 +51,9 @@ std::vector<GuestCallback> WindowsServices::revoke_com_classes(GuestMemory& memo
     return result;
 }
 
-std::optional<std::uint32_t> WindowsServices::invoke_com_class(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+std::optional<std::uint32_t> WindowsServices::invoke_com_class(GuestState& entry_state,GuestMemory& entry_memory,const WindowsServiceDescriptor& service){
+#include "windows_com_multiquery.inc"
+    auto& state=entry_state;auto& memory=entry_memory;
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     const auto done=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     if(name=="OleRun" || name=="OleIsRunning" || name=="OleLockRunning" || name=="OleSetContainedObject"){

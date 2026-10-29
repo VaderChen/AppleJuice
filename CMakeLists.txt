@@ -154,6 +154,7 @@ target_sources(x64arm_windows PRIVATE src/services/windows_compatibility.cpp src
 target_sources(x64arm_windows PRIVATE src/services/file_reparse.cpp src/services/readonly_reparse.cpp src/services/windows_reparse.cpp)
 target_sources(x64arm_windows PRIVATE src/services/file_volumes.cpp)
 target_sources(x64arm_windows PRIVATE src/services/readonly_volumes.cpp)
+target_sources(x64arm_windows PRIVATE src/services/windows_native_file_control.cpp)
 target_sources(x64arm_windows PRIVATE src/services/com_context.cpp src/services/windows_com_context.cpp)
 target_sources(x64arm_windows PRIVATE src/services/com_error.cpp src/services/windows_winrt_strings.cpp src/services/windows_com_error.cpp src/services/windows_bstr.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_winrt_error.cpp)

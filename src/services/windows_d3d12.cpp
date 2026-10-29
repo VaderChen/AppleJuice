@@ -214,6 +214,9 @@ struct D3D12State {
     struct Program {std::uint32_t type{};std::vector<Command> commands;std::vector<D3D12Replay> callbacks;std::vector<std::uint64_t> readback_targets;};
     struct List {std::uint32_t type{};std::uint64_t allocator{};bool open{true},invalid_recording{};std::vector<Command> commands;std::vector<D3D12Replay> callbacks;
         std::vector<std::uint64_t> readback_targets;std::shared_ptr<const Program> submitted;};
+    // 重設清單時交出的提交快照：客體通常等 fence 完成才 Reset，提交執行緒早已放掉它的參照，快照（每幀數千個命令）
+    // 會在客體執行緒上解構。有提交執行緒時改移到這裡，由提交執行緒每完成一件工作後釋放。
+    std::mutex retired_mutex;std::vector<std::shared_ptr<const Program>> retired_programs;
     struct IndirectArgument {std::uint32_t type{},index{},offset{},count{},size{};};
     struct CommandSignature {std::uint32_t stride{},operation{};std::uint64_t root{};std::vector<IndirectArgument> arguments;};
     std::map<std::uint64_t,CommandSignature> signatures;
@@ -296,6 +299,28 @@ struct D3D12State {
         std::atomic_ref<std::uint64_t>(heap.dirty_summary[index>>12]).fetch_or(std::uint64_t{1}<<((index>>6)&63U),std::memory_order_seq_cst);
         std::atomic_ref<bool>(heap.any_dirty).store(true,std::memory_order_seq_cst);
     }
+    // 連續範圍的批次標記（描述元複製）：項目位元組逐一設定，區塊／摘要位元每 64 項只做一次原子 OR，any_dirty 最後設定；
+    // 順序與 mark_dirty 相同（項目→區塊→摘要→any_dirty），區塊的 seq_cst OR 一併發布前面的位元組寫入。多條執行緒同時
+    // 寫描述元環時，原本每項 4 次 seq_cst 原子操作集中在共用的區塊／摘要字組上。
+    static void mark_dirty_range(Heap& heap,std::uint64_t first,std::uint64_t count){
+        if(heap.dirty.empty() || first>=heap.count)return;
+        const auto end=std::min<std::uint64_t>(heap.count,first+std::min<std::uint64_t>(count,heap.count));
+        bool any=false;
+        for(auto index=first;index<end;){
+            const auto word=index>>6;const auto stop=std::min<std::uint64_t>(end,(word+1)<<6);std::uint64_t bits=0;
+            for(auto i=index;i<stop;++i){
+                std::atomic_ref<std::uint8_t> flag(heap.dirty[i]);
+                if(!flag.load(std::memory_order_relaxed)){flag.store(1,std::memory_order_relaxed);bits|=std::uint64_t{1}<<(i&63U);}
+            }
+            if(bits){
+                std::atomic_ref<std::uint64_t>(heap.dirty_chunks[word]).fetch_or(bits,std::memory_order_seq_cst);
+                std::atomic_ref<std::uint64_t>(heap.dirty_summary[word>>6]).fetch_or(std::uint64_t{1}<<(word&63U),std::memory_order_seq_cst);
+                any=true;
+            }
+            index=stop;
+        }
+        if(any)std::atomic_ref<bool>(heap.any_dirty).store(true,std::memory_order_seq_cst);
+    }
     DescriptorSpin& descriptor_lock(const Heap* heap,std::uint64_t index){return descriptor_stripes[((reinterpret_cast<std::uintptr_t>(heap)>>4)^index)&255U];}
     // 資源的 gpu／gpu_writes 共享指標：提交執行緒（持圖形鎖）與 worker 上不取圖形鎖的 Map、RTV／DSV 建立會同時存取，一律在此分段鎖內讀寫。
     DescriptorSpin& resource_lock(std::uint64_t object){return descriptor_stripes[((object>>4)^(object>>12))&255U];}
@@ -316,7 +341,8 @@ struct D3D12Submitter {
         draws{},table_entries{},upload_steps{},uav_clears{},uav_clear_bytes{},texture_copies{};
         // 前端每次繪製的分段時間（奈秒累計）：VS 綁定、PS 綁定、其餘設定、狀態池複製（含等池格）、排入編碼執行緒；
         // replay 為整批命令重播（不含等提交工作）。
-        std::atomic<std::uint64_t> draw_vs{},draw_ps{},draw_setup{},draw_fill{},draw_post{},draw_fill_wait{},replay{};} stats;
+        std::atomic<std::uint64_t> draw_vs{},draw_ps{},draw_setup{},draw_fill{},draw_post{},draw_fill_wait{},replay{};
+        std::atomic<std::uint64_t> copy_skipped{},copy_written{};} stats;
     static bool tracing(){static const bool on=std::getenv("X64ARM_TRACE_D3D12_SUBMIT")!=nullptr;return on;}
     static std::uint64_t now_ns(){return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
     ~D3D12Submitter(){{const std::lock_guard lock(mutex);stopping=true;}wake.notify_all();if(started)pthread_join(thread,nullptr);}
@@ -522,6 +548,12 @@ void WindowsServices::d3d12_submit_loop(GuestMemory& memory,D3D12Submitter& subm
             if(d3d12_){const std::lock_guard lock(d3d12_->notes_mutex);d3d12_->worker_notes.push_back(std::string("d3d12_note=提交執行緒失敗：")+error.what());}
         }
         d3d12_submit_context()=nullptr;
+        job.programs.clear();
+        // 客體 Reset 交出的快照在此釋放（鎖外解構），不佔客體執行緒的時間。
+        if(d3d12_){
+            std::vector<std::shared_ptr<const D3D12State::Program>> retired;
+            {const std::lock_guard lock(d3d12_->retired_mutex);retired.swap(d3d12_->retired_programs);}
+        }
         if(trace){
             const auto finished=D3D12Submitter::now_ns();
             stats.busy.fetch_add(finished-started,std::memory_order_relaxed);stats.lock.fetch_add(graphics_wait_ns()-waited,std::memory_order_relaxed);
@@ -547,7 +579,8 @@ void WindowsServices::d3d12_submit_loop(GuestMemory& memory,D3D12Submitter& subm
                 }
                 static std::uint64_t gpu_reported=0,sync_waits_reported=0,sync_ns_reported=0,encoders_reported=0,coalesced_reported=0,resource_waits_reported=0;
                 // render encoder 數與合併繪製數、等 GPU 用完資源的次數（區間差）；中斷原因為累計值。
-                std::fprintf(stderr,"d3d12_submit_encode 清除累計：併入pass=%llu 獨立pass=%llu\n",static_cast<unsigned long long>(clears_folded),static_cast<unsigned long long>(clears_encoded));
+                std::fprintf(stderr,"d3d12_submit_encode 清除累計：併入pass=%llu 獨立pass=%llu 描述元複製：略過=%llu 寫入=%llu\n",static_cast<unsigned long long>(clears_folded),static_cast<unsigned long long>(clears_encoded),
+                    static_cast<unsigned long long>(stats.copy_skipped.exchange(0)),static_cast<unsigned long long>(stats.copy_written.exchange(0)));
                 {
                     // 編碼執行緒等 GPU 完成（在途命令緩衝達上限或同步讀回）的次數與時間占比，以及提交的命令緩衝數。
                     static std::uint64_t waits_reported=0,wait_ns_reported=0,submissions_reported=0;
@@ -701,11 +734,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 for(const auto* name:{"Blob.QueryInterface","Blob.AddRef","Blob.Release","Blob.GetBufferPointer","Blob.GetBufferSize"})store(table+8*i++,64,resolve("internal-d3d12",name).value);
             }else{
                 const auto* item=info_of(kind);const auto* abi=d3d12abi::find_interface(item->top);table=runtime_allocate(memory,{},abi->methods.size()*8);
-                for(std::size_t i=0;i<abi->methods.size();++i)store(table+i*8,64,resolve("internal-d3d12",std::string(item->prefix)+std::string(abi->methods[i].name)).value);
+                // ID3D12Resource::GetGPUVirtualAddress 改由客體常式直接讀 [this+8]（建立時寫入的緩衝 GPU 位址），不經服務：
+                // 電馭判客每幀上萬次，原本每次離開原生碼往返 worker 服務。X64ARM_GUEST_D3D12_GPUVA=0 關閉（含下方堆積起點）。
+                static const bool guest_gpuva=[] {const auto* value=std::getenv("X64ARM_GUEST_D3D12_GPUVA");return !value || std::string_view(value)!="0";}();
+                // 描述元堆積的 CPU／GPU 起點同樣由客體常式讀 [this+8]／[this+16]（見 CreateDescriptorHeap）。
+                const auto routine=[&](std::string_view method)->std::uint64_t{
+                    if(!guest_gpuva)return 0;
+                    if(kind==Kind::Resource && method=="GetGPUVirtualAddress")return guest_thread_routine("D3D12ResourceGetGPUVirtualAddress").value;
+                    if(kind==Kind::DescriptorHeap && method=="GetCPUDescriptorHandleForHeapStart")return guest_thread_routine("D3D12HeapGetCPUDescriptorHandleForHeapStart").value;
+                    if(kind==Kind::DescriptorHeap && method=="GetGPUDescriptorHandleForHeapStart")return guest_thread_routine("D3D12HeapGetGPUDescriptorHandleForHeapStart").value;
+                    return 0;
+                };
+                for(std::size_t i=0;i<abi->methods.size();++i){
+                    const auto guest=routine(abi->methods[i].name);
+                    store(table+i*8,64,guest?guest:resolve("internal-d3d12",std::string(item->prefix)+std::string(abi->methods[i].name)).value);
+                }
             }
         }
-        const auto pointer=allocate_heap(memory,16);if(!pointer)throw std::bad_alloc();
-        store(pointer,64,table);store(pointer+8,64,0);
+        // [0] vtable、[8] 依種類保存客體常式讀取的值（Blob 資料、資源 GPU 位址、堆積 CPU 起點），堆積另有 [16] GPU 起點。
+        const auto pointer=allocate_heap(memory,kind==Kind::DescriptorHeap?24:16);if(!pointer)throw std::bad_alloc();
+        store(pointer,64,table);store(pointer+8,64,0);if(kind==Kind::DescriptorHeap)store(pointer+16,64,0);
         D3D12State::Object object;object.kind=kind;object.device=device;bridge.objects.emplace(pointer,std::move(object));
         if(device)++bridge.objects.at(device).references;
         return pointer;
@@ -1176,6 +1224,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 if(heap.dirty_chunks.size()%64U)heap.dirty_summary.back()=(std::uint64_t{1}<<(heap.dirty_chunks.size()%64U))-1U;
                 heap.any_dirty=true;}
             const auto object=create(Kind::DescriptorHeap,self);bridge.descriptor_ranges[heap.cpu]=object;if(heap.gpu)bridge.descriptor_ranges[heap.gpu]=object;
+            store(object+8,64,heap.cpu);store(object+16,64,heap.gpu); // 客體常式讀取的堆積起點。
             bridge.heaps[object]=std::move(heap);return finish(give(object,arg(2),arg(3)));
         }
         if(member=="CreateRootSignature"){
@@ -1331,7 +1380,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 try{r.gpu=native.graphics_resource(d);}catch(const std::exception& error){runtime_.module_events.push_back(std::string("d3d12_note=建立資源失敗：")+error.what());return invalid;}
             }
             if(r.dimension==1){r.address=bridge.next_address;bridge.next_address+=(r.width+0xffffU)&~UINT64_C(0xffff);}
-            const auto object=create(Kind::Resource,self);if(r.address)bridge.addresses[r.address]=object;bridge.resources[object]=std::move(r);return give(object,riid,out);
+            const auto object=create(Kind::Resource,self);if(r.address)bridge.addresses[r.address]=object;
+            store(object+8,64,r.address); // 客體常式 D3D12ResourceGetGPUVirtualAddress 讀取（紋理為 0）。
+            bridge.resources[object]=std::move(r);return give(object,riid,out);
         };
         if(member=="CreateCommittedResource" || member=="CreateCommittedResource1" || member=="CreateCommittedResource2" || member=="CreateCommittedResource3"){
             // CreateCommittedResource(heapProps, heapFlags, desc, initialState, clear, riid, out)。
@@ -1476,7 +1527,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         if(view_dimension==8 && v.slices==UINT32_MAX){const auto depth=std::max(1U,resource.depth>>std::min(v.level,31U));v.slices=v.slice<depth?depth-v.slice:0;}}
                 }
             }else if(resource.dimension==1){v.first=0;v.count=static_cast<std::uint32_t>(resource.width);v.levels=1;v.format=42;}
-            target->view=v;target->mirror=std::make_shared<D3D12State::MirrorCache>();return finish(0);
+            // 鏡像值快取隨描述元複製共用；X64ARM_D3D12_MIRROR_CACHE=0 時不建立（複製時也不再加減參照計數）。
+            static const bool mirror_cache=[] {const auto* text=std::getenv("X64ARM_D3D12_MIRROR_CACHE");return !text || std::string_view(text)!="0";}();
+            target->view=v;if(mirror_cache)target->mirror=std::make_shared<D3D12State::MirrorCache>();return finish(0);
         }
         if(member=="CreateSampler"){
             auto write=write_descriptor(arg(2));if(!write || !arg(1)){write.cancel();return finish(0);}auto* const target=&write.value;
@@ -1484,17 +1537,36 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         }
         // 描述元複製：參數只讀一次；每個範圍只解析一次所屬堆積，之後以索引遞增（同一範圍的描述元必在同一堆積）。
         // 超出堆積的項目與原本逐項查找相同：目的略過、來源視為空描述元。
-        const auto copy_entry=[&](D3D12State::Heap* source_heap,std::uint64_t source_index,D3D12State::Heap* dest_heap,std::uint64_t dest_index,bool clear_missing){
-            std::optional<D3D12State::Descriptor> value;
-            if(source_heap && source_index<source_heap->count){const std::lock_guard lock(bridge.descriptor_lock(source_heap,source_index));value=source_heap->descriptors[source_index];}
-            if(!dest_heap || dest_index>=dest_heap->count || (!value && !clear_missing))return;
-            D3D12State::Descriptor incoming=value?std::move(*value):D3D12State::Descriptor{};
-            {const std::lock_guard lock(bridge.descriptor_lock(dest_heap,dest_index));std::swap(dest_heap->descriptors[dest_index],incoming);}
-            D3D12State::mark_dirty(*dest_heap,dest_index);
+        // 單項複製：來源鎖內複製、目的鎖內比對身分後交換，舊值在鎖外釋放；回傳是否寫入，鏡像待更新由呼叫端依目的範圍批次標記。
+        // 目的已是同一份描述元（SRV／UAV 同一次建立的鏡像快取、CBV 位址與大小、同一取樣器、皆為空）就不交換（X64ARM_D3D12_COPY_SKIP=0
+        // 關閉）。電馭判客寫入描述元環時相同項只約 2%，比對放在目的鎖內，不另取鎖。
+        static const bool skip_same=[] {const auto* text=std::getenv("X64ARM_D3D12_COPY_SKIP");return !text || std::string_view(text)!="0";}();
+        const auto copy_entry=[&](D3D12State::Heap* source_heap,std::uint64_t source_index,D3D12State::Heap* dest_heap,std::uint64_t dest_index,bool clear_missing)->bool{
+            const bool source_valid=source_heap && source_index<source_heap->count;
+            if(!dest_heap || dest_index>=dest_heap->count || (!source_valid && !clear_missing))return false;
+            D3D12State::Descriptor incoming;
+            if(source_valid){const std::lock_guard lock(bridge.descriptor_lock(source_heap,source_index));incoming=source_heap->descriptors[source_index];}
+            {const std::lock_guard lock(bridge.descriptor_lock(dest_heap,dest_index));auto& current=dest_heap->descriptors[dest_index];
+                if(skip_same && current.type==incoming.type){
+                    using Type=D3D12State::Descriptor::Type;bool same=false;
+                    switch(incoming.type){
+                        case Type::Empty:same=true;break;
+                        case Type::Constant:same=current.address==incoming.address && current.size==incoming.size;break;
+                        case Type::Sampler:same=incoming.sampler && current.sampler==incoming.sampler;break;
+                        case Type::Shader:case Type::Unordered:same=incoming.mirror && current.mirror==incoming.mirror && current.resource==incoming.resource;break;
+                        default:break;
+                    }
+                    if(D3D12Submitter::tracing() && d3d12_submitter_)(same?d3d12_submitter_->stats.copy_skipped:d3d12_submitter_->stats.copy_written).fetch_add(1,std::memory_order_relaxed);
+                    if(same)return false;
+                }
+                std::swap(current,incoming);}
+            return true;
         };
         if(member=="CopyDescriptorsSimple"){
             const auto count=u32(1);const auto [dest_heap,dest_first]=heap_at(arg(2),false);const auto [source_heap,source_first]=heap_at(arg(3),false);
-            for(std::uint32_t i=0;i<count;++i)copy_entry(source_heap,source_first+i,dest_heap,dest_first+i,false);
+            bool written=false;
+            for(std::uint32_t i=0;i<count;++i)written|=copy_entry(source_heap,source_first+i,dest_heap,dest_first+i,false);
+            if(written)D3D12State::mark_dirty_range(*dest_heap,dest_first,count);
             return finish(0);
         }
         if(member=="CopyDescriptors"){
@@ -1506,12 +1578,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             auto source=source_ranges?heap_at(load(source_starts,64),false):std::pair<D3D12State::Heap*,std::uint64_t>{};
             for(std::uint32_t i=0;i<dest_ranges;++i){
                 const auto count=dest_sizes?load(dest_sizes+i*4,32):1;const auto [dest_heap,dest_first]=heap_at(load(dest_starts+i*8,64),false);
-                for(std::uint64_t j=0;j<count;++j){
+                bool written=false;std::uint64_t j=0;
+                for(;j<count;++j){
                     while(source_range<source_ranges && source_index>=source_count){
                         if(++source_range<source_ranges){source_index=0;source_count=source_size(source_range);source=heap_at(load(source_starts+source_range*8,64),false);}}
-                    if(source_range>=source_ranges)return finish(0);
-                    copy_entry(source.first,source.second+source_index,dest_heap,dest_first+j,true);++source_index;
+                    if(source_range>=source_ranges)break;
+                    written|=copy_entry(source.first,source.second+source_index,dest_heap,dest_first+j,true);++source_index;
                 }
+                if(written)D3D12State::mark_dirty_range(*dest_heap,dest_first,j);
+                if(source_range>=source_ranges)return finish(0);
             }
             return finish(0);
         }
@@ -1602,7 +1677,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             ~InvalidTrace(){if(enabled && !before && list.invalid_recording)std::fprintf(stderr,"[d3d12] 無效錄製：List.%.*s\n",static_cast<int>(member.size()),member.data());}
         } invalid_trace{list,list.invalid_recording,member,trace_d3d12};
         if(member=="Close"){if(!list.open)return finish(fail);list.open=false;return finish(list.invalid_recording?invalid:ok);}
-        if(member=="Reset"){list.submitted.reset();list.commands.clear();list.callbacks.clear();list.readback_targets.clear();list.open=true;list.invalid_recording=false;list.allocator=arg(1);if(arg(2))list.commands.push_back({"SetPipelineState",{arg(2)},{},{}});return finish(ok);}
+        if(member=="Reset"){
+            // 錄製內容在提交時整份移入快照，清單容量歸零：依上一份快照的命令數預留，避免錄製時反覆擴容搬移（每幀數千個命令）。
+            const auto previous=list.submitted?list.submitted->commands.size():list.commands.size();
+            if(list.submitted && d3d12_submitter_){const std::lock_guard lock(bridge.retired_mutex);bridge.retired_programs.push_back(std::move(list.submitted));}
+            list.submitted.reset();list.commands.clear();list.commands.reserve(std::min<std::size_t>(previous,65536));list.callbacks.clear();list.readback_targets.clear();list.open=true;list.invalid_recording=false;list.allocator=arg(1);if(arg(2))list.commands.push_back({"SetPipelineState",{arg(2)},{},{}});return finish(ok);}
         if(!list.open)return finish(0);
         if(member=="ExecuteBundle"){
             const auto bundle=bridge.lists.find(arg(1));

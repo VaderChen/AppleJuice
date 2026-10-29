@@ -350,11 +350,17 @@ PipeResult NamedPipe::write(std::span<const std::uint8_t> input,bool nonblocking
     if(completion && input.size()+4>p.header->capacity){*completion={q.produced,p.generation,count};return {0,0,true};}
     return {count,0};
 }
-PipeResult NamedPipe::read(std::span<std::uint8_t> output,bool message,bool peek,std::uint32_t* available,std::uint32_t* remaining){
+PipeResult NamedPipe::read(std::span<std::uint8_t> output,bool message,bool peek,std::uint32_t* available,std::uint32_t* remaining){return read_impl(output,message,peek,available,remaining,nullptr);}
+PipeResult NamedPipe::peek(std::span<std::uint8_t> output,PipePeekInfo& info){return read_impl(output,false,true,nullptr,nullptr,&info);}
+PipeResult NamedPipe::read_impl(std::span<std::uint8_t> output,bool message,bool peek,std::uint32_t* available,std::uint32_t* remaining,PipePeekInfo* information){
     auto& p=*impl_;const unsigned n=p.is_server?0:1;
     if(!peek && !available && !remaining && p.would_block(n))return {0,0,true};
     Lock lock(p.directory);reap_slot(p.header->slots[p.slot]);p.idle=false;auto q=p.data->queues[n];
     if(available)*available=q.bytes;if(remaining)*remaining=0;const auto status=p.status();
+    if(information){
+        message=(p.header->mode&4U)!=0;*information={status==109?4U:3U,q.bytes,message?q.messages:0U,0};
+        if(message && q.messages){information->message_length=q.remaining;if(!q.remaining)p.transfer(n,q.head,{reinterpret_cast<std::uint8_t*>(&information->message_length),4},false);}
+    }
     if(status && status!=109)return {0,status};
     if(!q.messages){
         if(status)return {0,status};if(peek)return {};
@@ -457,6 +463,8 @@ std::uint32_t NamedPipe::available(const std::string&,std::u16string,std::uint32
 std::uint32_t NamedPipe::security(const std::string&,std::u16string,const std::function<void(int)>&){return 50;}
 PipeResult NamedPipe::connect(){return {0,50};}std::uint32_t NamedPipe::disconnect(){return 50;}
 PipeResult NamedPipe::read(std::span<std::uint8_t>,bool,bool,std::uint32_t*,std::uint32_t*){return {0,50};}
+PipeResult NamedPipe::peek(std::span<std::uint8_t>,PipePeekInfo&){return {0,50};}
+PipeResult NamedPipe::read_impl(std::span<std::uint8_t>,bool,bool,std::uint32_t*,std::uint32_t*,PipePeekInfo*){return {0,50};}
 PipeResult NamedPipe::transact(std::span<const std::uint8_t>,std::span<std::uint8_t>,std::shared_ptr<Transaction>&){return {0,50};}
 PipeResult NamedPipe::write(std::span<const std::uint8_t>,bool,WriteCompletion*){return {0,50};}PipeResult NamedPipe::flush(){return {0,50};}
 int NamedPipe::descriptor()const{return -1;}std::uint64_t NamedPipe::identity()const{return 0;}NamedPipe::Opened NamedPipe::inherit(const std::string&,int,std::uint64_t,bool){return {{},50};}

@@ -818,6 +818,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             }
         }
     } else if (symbol == "DuplicateHandle") {
+#include "windows_wait_completion_duplicate.inc"
         if(bluetooth_handle(arg(1)) && current_process_handle(arg(0)))return duplicate_bluetooth(state,memory,service);
         if(power_requests_.contains(arg(1)) && current_process_handle(arg(0)) && (!arg(2) || current_process_handle(arg(2))))return invoke_power(state,memory,service);
         if(job_handle(arg(1)) && current_process_handle(arg(0)) && current_process_handle(arg(2)))return invoke_job(state,memory,service);
@@ -1309,7 +1310,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         const auto handle = arg(0);
         const bool standard = handle >= 0x100 && handle < 0x103 && standard_open_[handle - 0x100];
         const bool socket=runtime_.network.sockets.contains(handle);
-        const bool valid=bluetooth_handle(handle) || power_requests_.contains(handle) || transaction_handle(handle) || job_handle(handle) || mapping_handle(handle) || process_signaled(handle).has_value() || standard || files_.contains(handle) || socket || runtime_.wait_objects.contains(handle) || runtime_.process_thread_handles.contains(handle) || runtime_.completion_ports.contains(handle) || runtime_.process_snapshots.contains(handle) || runtime_.token_handles.contains(handle);
+        const bool valid=wait_completion_handles_.contains(handle) || bluetooth_handle(handle) || power_requests_.contains(handle) || transaction_handle(handle) || job_handle(handle) || mapping_handle(handle) || process_signaled(handle).has_value() || standard || files_.contains(handle) || socket || runtime_.wait_objects.contains(handle) || runtime_.process_thread_handles.contains(handle) || runtime_.completion_ports.contains(handle) || runtime_.process_snapshots.contains(handle) || runtime_.token_handles.contains(handle);
         if (!valid) fail(6);
         else if (symbol == "GetFileType") result = standard?standard_file_type(static_cast<unsigned>(handle-0x100)):bluetooth_handle(handle) || console_handle(handle) || (files_.contains(handle) && (files_.at(handle).serial || files_.at(handle).hid || (files_.at(handle).native && files_.at(handle).native->null_device())))?2:socket || (files_.contains(handle) && files_.at(handle).pipe) ? 3 : files_.contains(handle)?1:0;
         else if(symbol=="SetHandleInformation"){

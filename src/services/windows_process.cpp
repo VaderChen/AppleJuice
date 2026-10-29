@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "windows_forced_thread_stop.hpp"
 #include "x64arm/windows_cpu_time.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
@@ -12,6 +13,8 @@
 #include "crt_lowio_abi.hpp"
 #include "crt_os_error.hpp"
 #include "monotonic_clock.hpp"
+#include "windows_native_process_parameters.hpp"
+#include "service_callback_task.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -59,7 +62,13 @@ struct ProcessRecord {
         std::uint32_t accounting_valid{};
         std::uint32_t thread_id{}, object_kind{}, public_thread_id{};
         std::uint64_t console_identity{};std::uint32_t console_group{};
+        // 舊版 4096-byte 紀錄的尾端原為零；保留原欄位位置，以版本辨認新增登錄。
+        struct alignas(8) RestartSettings {
+            std::uint32_t version{}, flags{}, length{};
+            std::array<char16_t, 1025> command_line{};
+        } restart;
     };
+    static_assert(sizeof(Header) <= 4096);
     int descriptor{-1};
     Header *data{};
     std::shared_ptr<process_identity::Lifetime> lifetime;
@@ -231,6 +240,7 @@ std::filesystem::path executable_path(std::filesystem::path hint) {
 }
 struct Child {
     pid_t pid{-1};
+    std::shared_ptr<ProcessRecord> record;
     int pipe{-1}, host_status{};
     std::uint32_t exit_code{259};
     bool gui{}, idle{}, exited{}, have_result{}, success{}, terminated{}, job_started{}, startup_ready{}, independent{};
@@ -337,6 +347,14 @@ struct Child {
                 }
             } else if (done < 0 && errno != EINTR)
                 throw HostCallFault("無法查詢客體子程序狀態");
+        }
+        if (exited && !have_result && record && WIFSIGNALED(host_status) && WTERMSIG(host_status) == SIGKILL) {
+            // 其他客體程序可以合法終止本子程序；與終止端的發布鎖配對，避免遺失完整退出碼。
+            SharedEventLock lock(record->descriptor);
+            if (record->exited()) {
+                exit_code = record->data->code;
+                terminated = have_result = success = true;
+            }
         }
         if (exited && !diagnostics_saved) {
             if (const auto *directory = std::getenv("X64ARM_PROCESS_DIAGNOSTICS_DIR"); directory && *directory) {
@@ -463,6 +481,7 @@ struct ProcessState {
         std::chrono::steady_clock::time_point deadline;
     };
     std::map<std::uint64_t,Creation> creations;
+    std::map<std::uint64_t,NativeProcessParameters> native_parameters;
     ~ProcessState() {
         // Windows 的程序／執行緒 handles 與建立者生命週期不擁有子程序。
         // 長期存活的宿主需要回收 waitpid；CLI 宿主退出後由作業系統接管。
@@ -500,6 +519,7 @@ void publish_created_process(ProcessState& processes,RuntimeState& runtime,Guest
     memory.check(GuestAddress{creation.output},x86?16:24,Access::Write);
     const auto process=runtime.allocate_wait_handle(),thread=runtime.allocate_wait_handle();
     const auto& child=creation.child;const auto birth=creation.record->data->birth;
+    child->record=creation.record;
     try{
         processes.handles.emplace(process,Handle{child,false,0x1fffffU,0,creation.record,birth});
         processes.handles.emplace(thread,Handle{child,true,0x1fffffU,0,creation.record,birth});
@@ -602,9 +622,18 @@ void WindowsServices::configure_thread_record(std::uint64_t id){
     if(security.empty())security=synchronization_descriptor(GuestMemory{},0).bytes;
     auto record=ProcessRecord::open(mapping_session(),process_id(),true,static_cast<std::uint32_t>(id),thread_identifier(id));
     if(!record)throw HostCallFault("無法建立共用執行緒身分紀錄");
+    record->owner=true;
     {SharedEventLock lock(record->descriptor);if(shared_object_security(record->descriptor,true).empty())set_shared_object_security(record->descriptor,security,true);}
-    record->owner=true;record->publish_identifier(mapping_session());if(thread.status==ThreadStatus::Exited)record->finish(thread.exit_code);
+    record->publish_identifier(mapping_session());if(thread.status==ThreadStatus::Exited)record->finish(thread.exit_code);
     processes_->thread_records.emplace(static_cast<std::uint32_t>(id),record);local_thread_records[static_cast<std::uint32_t>(id)]=record;
+#else
+    (void)id;
+#endif
+}
+void WindowsServices::discard_thread_record(std::uint64_t id){
+#if !defined(_WIN32)
+    if(processes_)processes_->thread_records.erase(static_cast<std::uint32_t>(id));
+    local_thread_records.erase(static_cast<std::uint32_t>(id));
 #else
     (void)id;
 #endif
@@ -768,6 +797,29 @@ void WindowsServices::configure_processes(ProcessOptions options, GuestMemory &m
     if(!runtime_.startup_reserved2.empty())runtime_.startup_reserved2_address=runtime_allocate(memory,runtime_.startup_reserved2);
     if (options.startup_handles)
         runtime_.standard_handles = *options.startup_handles;
+    if(options.startup_data.native){
+        const auto& native=*options.startup_data.native;const auto layout=detail::ProcessParameterLayout::for_x86(x86_);
+        runtime_.standard_handles=native.standard_handles;
+        const auto bits=static_cast<std::uint8_t>(layout.unit*8);
+        const auto parameters=memory.load(GuestAddress{peb_base_.value+(x86_?0x10U:0x20U)},x86_?32:64);
+        memory.store(GuestAddress{parameters+8},32,native.flags|1U);memory.store(GuestAddress{parameters+layout.console_flags},32,native.console_flags);
+        for(unsigned i=0;i<native.strings.size();++i){
+            auto bytes=native.strings[i];const auto length=bytes.size();bytes.push_back(0);bytes.push_back(0);
+            const auto buffer=runtime_allocate(memory,bytes);const auto offset=layout.strings[i];
+            memory.store(GuestAddress{parameters+offset},16,length);memory.store(GuestAddress{parameters+offset+2},16,bytes.size());
+            memory.store(GuestAddress{parameters+offset+layout.unit},bits,buffer);
+            if(i==4 || i==5){
+                const auto index=i==5?0U:1U;runtime_.native_startup_text[index]=buffer;
+                std::u16string text;for(std::size_t at=0;at<length;at+=2)text.push_back(static_cast<char16_t>(bytes[at]|(unsigned{bytes[at+1]}<<8)));
+                const auto ansi=utf16_to_utf8(text);std::vector<std::uint8_t> narrow(ansi.begin(),ansi.end());narrow.push_back(0);
+                runtime_.native_startup_text[index+2]=runtime_allocate(memory,narrow);
+            }
+        }
+        runtime_.native_startup_window=native.window;
+        for(unsigned i=0;i<3;++i)memory.store(GuestAddress{parameters+(x86_?0x18U:0x20U)+i*layout.unit},bits,runtime_.standard_handles[i]);
+        for(unsigned i=0;i<native.window.size();++i)memory.store(GuestAddress{parameters+(x86_?0x4cU:0x88U)+4*i},32,native.window[i]);
+        runtime_.native_dll_path.clear();for(std::size_t at=0;at<native.strings[1].size();at+=2)runtime_.native_dll_path.push_back(static_cast<char16_t>(native.strings[1][at]|(unsigned{native.strings[1][at+1]}<<8)));
+    }
     if(detached_console_)for(unsigned i=0;i<3;++i)if(!runtime_.standard_handles[i] || runtime_.standard_handles[i]==(x86_?UINT64_C(0xffffffff):UINT64_MAX))standard_open_[i]=false;
     if (options.startup_suspended) {
         threads_.items.at(1).suspended = 1;
@@ -1295,7 +1347,7 @@ std::uint32_t WindowsServices::local_process_thread_control(std::uint32_t operat
 }
 std::uint32_t WindowsServices::local_process_handle_count() const {
     std::size_t count = power_requests_.size() + files_.size() + job_handle_count() + mapping_handle_count() +
-                        runtime_.wait_objects.size() + runtime_.completion_ports.size() +
+                        runtime_.wait_objects.size() + runtime_.completion_ports.size() + wait_completion_handles_.size() +
                         runtime_.process_thread_handles.size() + runtime_.token_handles.size() +
                         runtime_.process_snapshots.size() + runtime_.network.sockets.size() +
                         runtime_.registry.handles.size() + runtime_.directory_searches.size();
@@ -1311,7 +1363,7 @@ std::uint32_t WindowsServices::local_process_handle_count() const {
     if (processes_)
         count += processes_->handles.size();
 #endif
-    return static_cast<std::uint32_t>(std::min<std::size_t>(count, UINT32_MAX));
+    return static_cast<std::uint32_t>(std::min<std::size_t>(count-wait_completion_targets_.size(), UINT32_MAX));
 }
 std::vector<std::uint64_t> WindowsServices::local_process_handles() const {
     std::vector<std::uint64_t> result;
@@ -1327,6 +1379,7 @@ std::vector<std::uint64_t> WindowsServices::local_process_handles() const {
     append_mapping_handles(result);
     append(runtime_.wait_objects);
     append(runtime_.completion_ports);
+    append(wait_completion_handles_);
     append(runtime_.process_thread_handles);
     append(runtime_.token_handles);
     append(runtime_.process_snapshots);
@@ -1342,6 +1395,7 @@ std::vector<std::uint64_t> WindowsServices::local_process_handles() const {
 #endif
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
+    std::erase_if(result,[&](auto handle){return wait_completion_targets_.contains(handle);});
     return result;
 }
 std::uint32_t WindowsServices::process_id() const noexcept { return processes_ ? processes_->identity : 1; }
@@ -1735,6 +1789,14 @@ std::u16string_view WindowsServices::process_object_type(std::uint64_t handle) c
 #endif
     return {};
 }
+std::uint64_t WindowsServices::retain_wait_completion_process(std::uint64_t handle) {
+#if !defined(_WIN32)
+    if(!processes_)return 0;const auto at=processes_->handles.find(handle);if(at==processes_->handles.end())return 0;
+    const auto copy=runtime_.allocate_wait_handle();processes_->handles.emplace(copy,at->second);return copy;
+#else
+    (void)handle;return 0;
+#endif
+}
 bool WindowsServices::close_process(std::uint64_t handle) {
 #if !defined(_WIN32)
     return processes_ && processes_->handles.erase(handle);
@@ -1833,6 +1895,9 @@ std::span<const WindowsServiceDescriptor> process_service_descriptors() {
         {"kernel32.dll", "DeleteProcThreadAttributeList", 1},
         {"kernel32.dll", "CreateProcessW", 10, 0, 0, 0x30},
         {"kernel32.dll", "CreateProcessA", 10, 0, 0, 0x30},
+        {"internal-native-process", "CreateProcessW", 10, 0, 0, 0x30},
+        {"ntdll.dll", "NtCreateUserProcess", 11, 0, 0, 0xcc},
+        {"ntdll.dll", "ZwCreateUserProcess", 11, 0, 0, 0xcc},
         {"advapi32.dll", "CreateProcessAsUserW", 11, 0, 0, 0x60},
         {"kernel32.dll", "CreateProcessAsUserW", 11, 0, 0, 0x60},
         {"advapi32.dll", "CreateProcessAsUserA", 11, 0, 0, 0x60},
@@ -1847,6 +1912,9 @@ std::span<const WindowsServiceDescriptor> process_service_descriptors() {
         {"kernel32.dll", "GetProcessShutdownParameters", 2},
         {"kernel32.dll", "ProcessIdToSessionId", 2, 0, 0, 0x1},
         {"kernel32.dll", "GetProcessHandleCount", 2},
+        {"kernel32.dll", "RegisterApplicationRestart", 2, 0, 0, 0x2},
+        {"kernel32.dll", "GetApplicationRestartSettings", 4},
+        {"kernel32.dll", "UnregisterApplicationRestart", 0},
         {"kernel32.dll", "GetProcessMitigationPolicy", 4, 0, 0, 0x2},
         {"kernel32.dll", "SetProcessMitigationPolicy", 3, 0, 0, 0x1},
         {"kernel32.dll", "SetProcessInformation", 4}, {"kernel32.dll", "GetProcessInformation", 4},
@@ -1867,11 +1935,13 @@ std::span<const WindowsServiceDescriptor> process_service_descriptors() {
         {"kernel32.dll", "GetProcessPriorityBoost", 2},
         {"kernel32.dll", "SetProcessPriorityBoost", 2, 0, 0, 0x2},
         {"kernel32.dll", "TerminateProcess", 2, 0, 0, 0x2},
+        {"ntdll.dll", "NtTerminateProcess", 2, 0, 0, 0x2},
+        {"ntdll.dll", "ZwTerminateProcess", 2, 0, 0, 0x2},
         {"user32.dll", "WaitForInputIdle", 2, 0, 0, 0x2}};
     return table;
 }
 bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array<std::uint64_t, 10> &call_arguments,
-                                           bool wide, bool as_user, std::uint64_t token_handle, unsigned privilege,unsigned completion_arguments) {
+                                           bool wide, bool as_user, std::uint64_t token_handle, unsigned privilege,unsigned completion_arguments,const NativeProcessParameters* native_parameters) {
     startup_profile::ProcessLaunch launch;
     initialize_tokens();
     if ((runtime_.child_process_policy & 1U) || runtime_.token_objects.at(1).child_process_restricted) {
@@ -1887,6 +1957,7 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
     (void)token_handle;
     (void)privilege;
     (void)completion_arguments;
+    (void)native_parameters;
     last_error_ = 50;
     launch.result(last_error_);
     return false;
@@ -1953,6 +2024,7 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
     else {
         std::vector<std::uint8_t> environment_bytes;
         ProcessStartupData startup_data;startup_data.pointer_bytes=x86_?4U:8U;
+        if(native_parameters)startup_data.native=*native_parameters;
         try {
             const auto reserved_size=memory.load(GuestAddress{arg(8)+(x86_?50U:66U)},16);
             const auto reserved_pointer=memory.load(GuestAddress{arg(8)+(x86_?52U:72U)},x86_?32:64);
@@ -2299,7 +2371,7 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
                             child->diagnostics = name.data();
                             const auto &settings = processes_->options;
                             struct StartupDescriptor {int fd{-1};~StartupDescriptor(){if(fd>=0)::close(fd);}} passed_startup;
-                            if(!startup_data.reserved2.empty()){
+                            if(!startup_data.reserved2.empty() || startup_data.native){
                                 passed_startup.fd=create_process_startup_descriptor(startup_data,static_cast<int>(200+inherited.size()));
                                 if(passed_startup.fd<0){::close(pipes[1]);fail(8);return false;}
                             }
@@ -2736,6 +2808,7 @@ std::uint32_t WindowsServices::local_process_priority_operation(std::uint32_t op
 }
 std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, GuestMemory &memory,
                                                              const WindowsServiceDescriptor &service) {
+#include "windows_native_user_process.inc"
     if(service.symbol.starts_with("Pss")){
 #include "windows_pss_snapshot.inc"
     }
@@ -2765,6 +2838,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
         last_error_ = error;
         result = 0;
     };
+#include "windows_application_restart.inc"
+#include "windows_process_termination.inc"
     if (symbol == "GetProcessIoCounters") {
         if (!arg(1))
             fail(87);
@@ -3123,7 +3198,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
         std::array<std::uint64_t, 10> arguments{};
         for (unsigned i = 0; i < arguments.size(); ++i)
             arguments[i] = arg(i);
-        result = create_guest_process(memory, arguments, symbol.ends_with('W'), as_user, as_user ? call(0) : 0,0,as_user?11U:10U);
+        const NativeProcessParameters* native=nullptr;
+        if(service.family=="internal-native-process"){
+#if !defined(_WIN32)
+            if(!processes_){last_error_=50;call.return_to(state,0);return std::nullopt;}
+            const auto found=processes_->native_parameters.find(threads_.current);
+            if(found==processes_->native_parameters.end()){last_error_=87;call.return_to(state,0);return std::nullopt;}native=&found->second;
+#else
+            last_error_=50;call.return_to(state,0);return std::nullopt;
+#endif
+        }
+        result = create_guest_process(memory, arguments, symbol.ends_with('W'), as_user, as_user ? call(0) : 0,0,as_user?11U:10U,native);
 #if !defined(_WIN32)
         if(processes_ && processes_->creations.contains(threads_.current)){
             auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;
@@ -3141,13 +3226,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
             memory.store(GuestAddress{arg(1)}, 32, 259);
             result = 1;
         }
-    }
-    // 強制終止不執行 FLS、TLS 或 DLL_PROCESS_DETACH；ExitProcess 才走有序退出。
-    else if (symbol == "TerminateProcess" && current_process_handle(arg(0), 1)) {
-        // 非 0 結束自己（例如 UE4 嚴重錯誤以 3 結束）時回溯客體堆疊，定位觸發的程式碼。
-        if(static_cast<std::uint32_t>(arg(1)))report_crt_fast_fail(state,memory,"TerminateProcess");
-        record_job_exit(static_cast<std::uint32_t>(arg(1)));
-        return static_cast<std::uint32_t>(arg(1));
     } else {
         auto found = processes_ ? processes_->handles.find(arg(0)) : std::map<std::uint64_t, Handle>::iterator{};
         if (!processes_ || found == processes_->handles.end())
@@ -3174,20 +3252,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
             }
             if (found->second.remote_pid) {
                 const auto &record = found->second.record;
-                if (symbol == "TerminateProcess") {
-                    if (!(found->second.access & 1U))
-                        fail(5);
-                    else if (!record || !record->alive())
-                        fail(5);
-                    else if (trace_process_protocol() && std::fprintf(stderr,"process_terminate parent=%d target=%u remote=1 code=%u\n",::getpid(),static_cast<unsigned>(record->data->pid),static_cast<std::uint32_t>(arg(1)))<0)
-                        fail(5);
-                    else if (::kill(static_cast<pid_t>(record->data->pid), SIGKILL))
-                        fail(5);
-                    else {
-                        record->finish(static_cast<std::uint32_t>(arg(1)));
-                        result = 1;
-                    }
-                } else if (!(found->second.access & (found->second.thread ? 0x840U : 0x1400U)))
+                if (!(found->second.access & (found->second.thread ? 0x840U : 0x1400U)))
                     fail(5);
                 else if (symbol == (found->second.thread ? "GetThreadId" : "GetProcessId"))
                     result = found->second.thread && found->second.remote_tid ? found->second.remote_tid
@@ -3215,9 +3280,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
                 return std::nullopt;
             }
             const auto rights = found->second.access;
-            if ((symbol == "TerminateProcess" && !(rights & 1)) ||
-                ((symbol == "GetProcessId" || symbol == "GetExitCodeProcess" || symbol == "GetPriorityClass") &&
-                 !(rights & 0x1400))) {
+            if ((symbol == "GetProcessId" || symbol == "GetExitCodeProcess" || symbol == "GetPriorityClass") &&
+                !(rights & 0x1400)) {
                 fail(5);
                 call.return_to(state, result);
                 return std::nullopt;
@@ -3229,23 +3293,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
                 result = 1;
             } else if (symbol == "GetProcessId" || symbol == "GetThreadId")
                 result = static_cast<std::uint32_t>(child.pid);
-            else if (symbol == "TerminateProcess") {
-                if (child.exited)
-                    fail(5);
-                else if (trace_process_protocol() && std::fprintf(stderr,"process_terminate parent=%d target=%d remote=0 code=%u\n",::getpid(),static_cast<int>(child.pid),static_cast<std::uint32_t>(arg(1)))<0)
-                    fail(5);
-                else if (::kill(child.pid, SIGKILL))
-                    fail(5);
-                else {
-                    child.terminated = true;
-                    child.have_result = true;
-                    child.success = true;
-                    child.exit_code = static_cast<std::uint32_t>(arg(1));
-                    if (found->second.record)
-                        found->second.record->finish(child.exit_code);
-                    result = 1;
-                }
-            } else if (symbol == "WaitForInputIdle") {
+            else if (symbol == "WaitForInputIdle") {
                 if (!child.gui) {
                     last_error_ = 1471;
                     result = UINT32_MAX;

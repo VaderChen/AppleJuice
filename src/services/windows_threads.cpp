@@ -17,12 +17,15 @@
 #include <unistd.h>
 #endif
 #include "x64arm/windows_services.hpp"
+#include "windows_forced_thread_stop.hpp"
 #include "srw_trace.hpp"
 #include "resident_service_policy.hpp"
 #include "guest_crt_state.h"
 #include "windows_loader_lock.hpp"
 #include "x64arm/guest_address_policy.hpp"
 #include "x64arm/windows_unwind.hpp"
+#include "x64arm/thread_context.hpp"
+#include "x64arm/security_access.hpp"
 #include "x64arm/interpreter.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/unicode.hpp"
@@ -36,6 +39,15 @@
 #include "monotonic_clock.hpp"
 namespace x64arm {
 namespace {
+
+// 完整排程與 resident worker 選取共用防飢餓規則；只在既有排程邊界判定。
+// 一般優先序的持鎖工作超過 50 ms 未取得執行機會時，須能與持續就緒的
+// 競爭者輪替；MMCSS 的即時優先序仍可高於這個暫時提升。
+int dispatch_priority(const GuestThread& thread,std::uint32_t process_class,bool background,std::uint64_t now) {
+    const auto priority=thread.effective_priority(process_class,background);
+    return now>=thread.last_dispatch_ticks && now-thread.last_dispatch_ticks>=UINT64_C(500000)
+        ?std::max(priority,15):priority;
+}
 
 // 明確啟用的冷邊界診斷；每個 stream 最多 2 MiB，格式為固定八個 uint64。
 // 前三筆固定為 header／計數／狀態；資料從 byte 192 開始。診斷失敗不得影響客體。
@@ -436,6 +448,14 @@ std::uint32_t WindowsServices::thread_context_bytes(std::uint64_t id, std::vecto
 }
 std::span<const WindowsServiceDescriptor> thread_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+                                                      {"ntdll.dll", "NtCreateThread", 8},
+                                                      {"ntdll.dll", "ZwCreateThread", 8},
+                                                      {"ntdll.dll", "NtCreateThreadEx", 11},
+                                                      {"ntdll.dll", "ZwCreateThreadEx", 11},
+                                                      {"ntdll.dll", "RtlCreateUserThread", 10},
+                                                      {"ntdll.dll", "NtTerminateThread", 2},
+                                                      {"ntdll.dll", "ZwTerminateThread", 2},
+                                                      {"ntdll.dll", "RtlExitUserThread", 1},
                                                       {"avrt.dll", "AvSetMmThreadCharacteristicsA", 2},
                                                       {"avrt.dll", "AvSetMmThreadCharacteristicsW", 2},
                                                       {"avrt.dll", "AvSetMmThreadPriority", 2},
@@ -966,7 +986,7 @@ std::vector<GuestState *> WindowsServices::parallel_contexts(GuestState &state) 
     std::vector<Candidate> candidates;
     for (const auto& [id,entry] : live_threads())
         if (id != threads_.current && entry->status == ThreadStatus::Runnable && !entry->suspended)
-            candidates.push_back({entry->effective_priority(runtime_.process_priority_class,runtime_.process_background),entry->wake_pending,
+            candidates.push_back({dispatch_priority(*entry,runtime_.process_priority_class,runtime_.process_background,now_ticks),entry->wake_pending,
                 sticky_enabled && entry->parallel_slice_deadline>now_ticks,id<=parallel_cursor_,id,entry});
     std::sort(candidates.begin(),candidates.end(),[](const Candidate& left,const Candidate& right){
         if(left.priority!=right.priority)return left.priority>right.priority;
@@ -1004,7 +1024,8 @@ std::vector<GuestState *> WindowsServices::parallel_contexts(GuestState &state) 
         // 保留原 slot 的執行緒不推進輪替游標，也不重設時間片；新取得 slot 者從現在起算一個時間片。
         if(!candidate.sticky){
             parallel_cursor_ = id;
-            thread.parallel_slice_deadline=now_ticks+slice_ticks*static_cast<unsigned>(std::max(candidate.priority,1));
+            thread.parallel_slice_deadline=now_ticks+slice_ticks*static_cast<unsigned>(std::max(
+                thread.effective_priority(runtime_.process_priority_class,runtime_.process_background),1));
         }
         thread.wake_pending=false;thread.last_dispatch_ticks=now_ticks;
     }
@@ -1096,7 +1117,7 @@ bool WindowsServices::resident_select_control_request(GuestState& state,GuestMem
         if(runtime_.image.base)
             last_error_=static_cast<std::uint32_t>(memory.load(
                 GuestAddress{x86_?state.fs_base+0x34:state.gs_base+0x68},32));
-        schedule(state,memory);
+        schedule(state,memory,true);
         return threads_.current!=previous;
     }
     return false;
@@ -1939,7 +1960,7 @@ WindowsServices::CompletionResult WindowsServices::poll_completion(GuestState& s
                 memory.store(GuestAddress{at+3*unit},32,packet.bytes);
             }
             memory.store(GuestAddress{arg(3)},32,count);
-            for (std::size_t i=0;i<count;++i)packets.pop_front();
+            for (std::size_t i=0;i<count;++i){complete_wait_packet(packets.front().wait_packet);packets.pop_front();}
             return {1,0,true,false};
         }
         const auto packet = packets.front();
@@ -1966,7 +1987,7 @@ WindowsServices::CompletionResult WindowsServices::poll_completion(GuestState& s
             memory.store(GuestAddress{key},bits,packet.key);
             memory.store(GuestAddress{overlapped},bits,packet.overlapped);
         }
-        packets.pop_front();
+        complete_wait_packet(packet.wait_packet);packets.pop_front();
         const std::uint32_t error = !packet.status ? 0
             : packet.status==0xc0000017 ? 8 : packet.status==0xc0000005 ? 998
             : packet.status==0xc0000022 ? 5 : packet.status==0xc0000054 ? 33
@@ -2089,7 +2110,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
     }
     {
         WakePollScope poll_measurement("poll_registry_notifications");
-        poll_registry_notifications();
+        poll_registry_notifications(true,{},0,&memory);
         poll_guest_services(memory);
     }
     {
@@ -2103,6 +2124,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
     {
         {WakePollScope poll_measurement("refresh_memory_resource_notifications");(void)refresh_memory_resource_notifications();}
         WakePollScope poll_measurement("poll_registered_waits");
+        poll_wait_completion_packets(memory);
         poll_registered_waits(memory);
     }
     {
@@ -2190,6 +2212,7 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             }else if(const auto target=this->thread_id(handle))possible=threads_.items.at(target).status==ThreadStatus::Exited;
             else if(const auto child=process_signaled(handle))possible=*child;
             else if(const auto file=file_io_signaled(handle))possible=*file;
+            else if(const auto key=registry_key_signaled(handle))possible=*key;
             any|=possible;every&=possible;
             if(all?!every:any)break;
         }
@@ -2393,6 +2416,7 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
                         auto& signal=runtime_.wait_state(event->second);signaled=signal.signaled();if(signaled)signal.consume_signal();
                     }
                 }else if(const auto file=file_io_signaled(handle))signaled=*file;
+                else if(const auto key=registry_key_signaled(handle))signaled=*key;
                 else signaled=true; // handle 在等待期間被關閉，由共用查詢流程回報錯誤。
                 wait.signaled=signaled;
                 if(signaled || wait.deadline<=runtime_.clock_ticks){wait.timed_out=!signaled;thread.status=ThreadStatus::Runnable;}
@@ -2517,6 +2541,8 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
                     signaled = *child;
                 else if (const auto file = file_io_signaled(wait.handles[i]))
                     signaled = *file;
+                else if (const auto key = registry_key_signaled(wait.handles[i]))
+                    signaled = *key;
                 else
                     valid = false;
                 if (signaled) {
@@ -2554,8 +2580,10 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             }
         }
         if (wait.kind == ThreadWaitKind::Completion) {
-            const auto completion = poll_completion(thread.context,memory,wait.handles[0],wait.all,
-                                                    wait.deadline<=runtime_.clock_ticks);
+            const bool native=wait.handles.size()>1;
+            const auto completion = native?poll_native_completion(thread.context,memory,wait.handles[0],wait.all,wait.deadline<=runtime_.clock_ticks):
+                poll_completion(thread.context,memory,wait.handles[0],wait.all,wait.deadline<=runtime_.clock_ticks);
+            if(native && completion.ready)thread.last_native_status=static_cast<std::uint32_t>(completion.value);
             ready=completion.ready;result=completion.value;guest_return=completion.guest_return;
             if (completion.error)
                 memory.store(GuestAddress{thread.teb+(x86_?0x34:0x68)},32,completion.error);
@@ -2719,7 +2747,7 @@ void WindowsServices::sync_fls_mirrors(GuestMemory &memory) noexcept {
         if (thread.status != ThreadStatus::Exited && thread.teb)
             sync_fls_mirror(memory, thread.teb, id == threads_.current ? runtime_.fls_values : thread.fls_values);
 }
-void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
+void WindowsServices::schedule(GuestState &state, GuestMemory &memory, bool control_requests_only) {
     startup_profile::Scope measurement("scheduler", "schedule");
     resident_wait_deadline_=UINT64_MAX; // 排程會解析逾時；下次計算喚醒期限時重新記錄。
     notify_concurrency_changed(); // 等待完成與 runnable 集合只在協調執行緒更新。
@@ -2793,9 +2821,7 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
                     continue;
                 if (first_runnable == threads_.items.end())
                     first_runnable = candidate;
-                auto priority = thread.effective_priority(runtime_.process_priority_class, runtime_.process_background);
-                if (now_ticks - thread.last_dispatch_ticks >= UINT64_C(500000))
-                    priority = std::max(priority, 15);
+                const auto priority = dispatch_priority(thread,runtime_.process_priority_class,runtime_.process_background,now_ticks);
                 if (priority >= 15 && priority > best) {
                     best = priority;
                     chosen = candidate;
@@ -2813,11 +2839,12 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
             }
 
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_PARALLEL
-        if (resident_execution_depth_ && parallel_workers() > 1) {
-            // 完整控制待辦（API／語義／故障）由協調者先承接；不能先啟動
+        if (control_requests_only && resident_execution_depth_ && parallel_workers() > 1) {
+            // 明確排空控制待辦（API／語義／故障）時由協調者先承接；不能先啟動
             // 少數可運算客體，再讓其餘客體空等下一個排程期限。
             // 待辦之間依有效優先序選取，同優先序保留輪替，沿下方唯一的 TLS／回呼／例外切換流程；
-            // worker 可完成的服務保持平行，不在這裡搶回協調者。
+            // worker 可完成的服務保持平行，不在這裡搶回協調者。一般時間片
+            // 排程仍按防飢餓規則選取，不能讓持續呼叫 API 的競爭者壓過持鎖工作。
             auto request = threads_.items.upper_bound(threads_.current);
             int request_priority=0;
             for (std::size_t n = 0; n < threads_.items.size(); ++n) {
@@ -2850,20 +2877,29 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory) {
             }
             ++candidate;
         }
-        if(awakened!=threads_.items.end() && (chosen==threads_.items.end() ||
+        if(!control_requests_only && awakened!=threads_.items.end() && (chosen==threads_.items.end() ||
            awakened_priority>chosen->second.effective_priority(runtime_.process_priority_class,runtime_.process_background)))
             chosen=awakened;
         // 只投遞事件而未喚醒更高優先序工作時，沿用目前執行緒尚未到期的時間片。
         std::uint64_t kept_slice = UINT64_MAX;
         if (std::exchange(threads_.interrupt_poll, false)) {
             const auto current = threads_.items.find(threads_.current);
-            if (current != threads_.items.end() && current->second.status == ThreadStatus::Runnable &&
+            if (!control_requests_only && current != threads_.items.end() && current->second.status == ThreadStatus::Runnable &&
                 !current->second.suspended && threads_.slice_deadline != UINT64_MAX &&
                 detail::monotonic_ticks() < threads_.slice_deadline &&
                 (awakened==threads_.items.end() || awakened_priority<=
                  current->second.effective_priority(runtime_.process_priority_class,runtime_.process_background))) {
                 chosen = current;
                 kept_slice = threads_.slice_deadline;
+            }
+        }
+        // 已完成的私有 I/O 必須先退出保留的原生交易框架，才能解除其他
+        // Registry consumer 的門閂並恢復多 worker。這不是一般客體優先權提升；
+        // await_registry_io 的 stop／服務入口會立即返回外層，不在此啟動新 API。
+        if(registry_io_busy_ && registry_io_ready()){
+            const auto owner=threads_.items.find(registry_io_owner_);
+            if(owner!=threads_.items.end() && owner->second.status==ThreadStatus::Runnable && !owner->second.suspended){
+                chosen=owner;kept_slice=UINT64_MAX;
             }
         }
         if (chosen != threads_.items.end() && chosen->second.status == ThreadStatus::Runnable &&
@@ -3307,6 +3343,7 @@ std::optional<std::uint32_t> WindowsServices::finish_thread(GuestState &state, G
     (void)emit_debug_event(state, memory, debugger::ExitThread{code});
     const auto retired_id=threads_.current,retired_stack=thread.stack_base,retired_size=thread.stack_size;
     const auto retired_teb=thread.teb,retired_exceptions=thread.exception_area;
+    const bool owned_stack=thread.owns_stack;
     const auto fiber = thread.fiber, stack = thread.fiber_stack_allocation;
     thread.fiber = 0;
     thread.fiber_stack_allocation = 0;
@@ -3320,11 +3357,15 @@ std::optional<std::uint32_t> WindowsServices::finish_thread(GuestState &state, G
     // thread object／退出碼仍由 handle 保留；執行用記憶體在切離原堆疊後回收。
     // 正常返回、ExitThread 與 TerminateThread 共用此流程，避免累積短命 worker。
     if(retired_id!=1){
-        if(retired_size && memory.mapped(GuestAddress{retired_stack}))memory.unmap(GuestAddress{retired_stack},static_cast<std::size_t>(retired_size));
-        runtime_.virtual_page_protections.erase(runtime_.virtual_page_protections.lower_bound(retired_stack),runtime_.virtual_page_protections.lower_bound(retired_stack+retired_size));
+        if(owned_stack){
+            if(retired_size && memory.mapped(GuestAddress{retired_stack}))memory.unmap(GuestAddress{retired_stack},static_cast<std::size_t>(retired_size));
+            runtime_.virtual_page_protections.erase(runtime_.virtual_page_protections.lower_bound(retired_stack),runtime_.virtual_page_protections.lower_bound(retired_stack+retired_size));
+        }
         if(retired_teb)guest_heap_flush_thread_cache(memory,retired_teb);
         if(retired_teb && memory.mapped(GuestAddress{retired_teb}))memory.unmap(GuestAddress{retired_teb},x86_?0x4000:GUEST_CRT_TEB_SIZE);
         if(retired_exceptions && memory.mapped(GuestAddress{retired_exceptions}))memory.unmap(GuestAddress{retired_exceptions},0x20000);
+        if(thread.static_tls_size)memory.unmap(GuestAddress{thread.static_tls_base},static_cast<std::size_t>(thread.static_tls_size));
+        thread.static_tls_base=thread.static_tls_size=0;
         thread.stack_size=0;thread.teb=0;thread.exception_area=0;thread.errno_cell=0;
     }
     return std::nullopt;
@@ -3365,10 +3406,12 @@ std::optional<std::uint32_t> WindowsServices::exit_thread(GuestState &state, Gue
         runtime_.fls_values[i] = 0;
     }
     sync_current_fls_mirror(memory);
-    for (const auto callback : runtime_.image.tls_callbacks)
-        callbacks.push_back({callback, {runtime_.image.base, 3, 0}, true});
-    auto module_callbacks = module_thread_callbacks(3);
-    callbacks.insert(callbacks.end(), module_callbacks.begin(), module_callbacks.end());
+    if (!exiting.skip_thread_attach) {
+        for (const auto callback : runtime_.image.tls_callbacks)
+            callbacks.push_back({callback, {runtime_.image.base, 3, 0}, true});
+        auto module_callbacks = module_thread_callbacks(3);
+        callbacks.insert(callbacks.end(), module_callbacks.begin(), module_callbacks.end());
+    }
     callbacks.push_back({resolve("internal-com-error", "CleanupThread").value, {}});
     if (!callbacks.empty()) {
         start_loader_callbacks(state, memory, std::move(callbacks), Continuation::ThreadExit, code);
@@ -3378,42 +3421,56 @@ std::optional<std::uint32_t> WindowsServices::exit_thread(GuestState &state, Gue
 }
 std::uint64_t WindowsServices::create_guest_thread(const GuestState &state, GuestMemory &memory, std::uint64_t entry,
                                                    std::uint64_t parameter, std::uint64_t requested,
-                                                   std::uint32_t flags_value) {
+                                                   std::uint32_t flags_value,const GuestThreadBootstrap* bootstrap) {
     // 建立數量由可用記憶體限制，不能把仍有 handle 的已退出物件當成執行名額。
     if (threads_.next_id>UINT32_MAX) {
         last_error_ = 8;
         return 0;
     }
+    const bool external_stack=bootstrap && bootstrap->context.has_value();
     const auto unaligned_size=std::max(UINT64_C(65536), requested ? requested : runtime_.image.stack_size);
     if(unaligned_size>UINT64_MAX-65535){last_error_=8;return 0;}
-    const auto stack_size = (unaligned_size + 65535) & ~UINT64_C(65535);
-    if (stack_size > memory.remaining_capacity() || (x86_?0x24000U:0x20000U+GUEST_CRT_TEB_SIZE) > memory.remaining_capacity()-stack_size) {
+    const auto stack_size = external_stack?bootstrap->stack_high-bootstrap->stack_low:(unaligned_size + 65535) & ~UINT64_C(65535);
+    const auto allocated_stack=external_stack?0:stack_size;
+    // 建立時的靜態 TLS 使用執行緒自有區塊，失敗或退出可完整回收；不污染共用單調 arena。
+    struct TlsBlock {const RuntimeImage* image;std::uint32_t slot;std::uint64_t offset;};
+    std::vector<TlsBlock> tls_blocks;
+    std::uint64_t tls_size=64*(x86_?4U:8U);
+    const auto add_tls=[&](const RuntimeImage& image,std::uint32_t slot){
+        const auto alignment=std::max<std::uint64_t>(16,image.tls_alignment);
+        if(!std::has_single_bit(alignment) || alignment>65536)throw std::invalid_argument("靜態 TLS 對齊無效");
+        const auto size=std::max<std::uint64_t>(1,image.tls_data.size()+image.tls_zero);
+        if(size>memory.limit() || tls_size>memory.limit()-size || tls_size+size>UINT64_MAX-alignment)throw std::bad_alloc();
+        tls_size=(tls_size+alignment-1)&~(alignment-1);tls_blocks.push_back({&image,slot,tls_size});tls_size+=size;
+    };
+    if(runtime_.image.tls_index)add_tls(runtime_.image,0);
+    for(const auto& [module_base,module]:runtime_.loaded_modules){(void)module_base;if(module.tls_slot!=UINT32_MAX)add_tls(module.image,module.tls_slot);}
+    tls_size=(tls_size+4095)&~UINT64_C(4095);
+    const auto metadata_size=0x30000+tls_size;
+    const auto stack_offset=(std::max(UINT64_C(0x100000),metadata_size)+65535)&~UINT64_C(65535);
+    const auto metadata_allocated=(x86_?0x24000U:0x20000U+GUEST_CRT_TEB_SIZE)+tls_size;
+    if (allocated_stack > memory.remaining_capacity() || metadata_allocated > memory.remaining_capacity()-allocated_stack) {
         last_error_ = 8;
         return 0;
     } else {
         const auto id = threads_.next_id;
+        const auto span=external_stack?metadata_size:stack_offset+stack_size;
         auto base = UINT64_C(0x3010000000) + id * 0x1000000; // x64 TEB／堆疊區塊位於 MMU 視窗內。
-        if (x86_) {
-            base = 0x60000000;
-            while (base + 0x100000 + stack_size <= 0x70000000 &&
-                   !memory.range_available(GuestAddress{base}, 0x100000 + stack_size))
-                base += 0x10000;
-            if (base + 0x100000 + stack_size > 0x70000000) {
-                last_error_ = 8;
-                return 0;
+        const auto reserved_end=[&](std::uint64_t first,std::uint64_t end){
+            const auto& reservations=runtime_.virtual_regions;
+            const auto next=reservations.lower_bound(first);auto high=first;
+            if(next!=reservations.begin()){
+                const auto previous=std::prev(next);
+                high=std::max(high,previous->first+previous->second.size);
             }
+            if(next!=reservations.end() && next->first<end)high=std::max(high,next->first+next->second.size);
+            return high;
+        };
+        if (x86_) {
+            const auto gap=find_guest_address_gap(memory,UINT64_C(0x60000000),span,UINT64_C(0x70000000),reserved_end);
+            if(!gap){last_error_=8;return 0;}
+            base=gap->value;
         }else{
-            const auto reserved_end=[&](std::uint64_t first,std::uint64_t end){
-                const auto& reservations=runtime_.virtual_regions;
-                const auto next=reservations.lower_bound(first);auto high=first;
-                if(next!=reservations.begin()){
-                    const auto previous=std::prev(next);
-                    high=std::max(high,previous->first+previous->second.size);
-                }
-                if(next!=reservations.end() && next->first<end)high=std::max(high,next->first+next->second.size);
-                return high;
-            };
-            const auto span=0x100000+stack_size;
             if(prefer_low_guest_stack()){
                 if(const auto low=find_guest_address_gap(memory,UINT64_C(0x60000000),span,UINT64_C(0x100000000),reserved_end))base=low->value;
             }
@@ -3432,32 +3489,52 @@ std::uint64_t WindowsServices::create_guest_thread(const GuestState &state, Gues
         thread.teb = base;
         thread.errno_cell = base + (x86_?0x3ff0:GUEST_CRT_ERRNO_OFFSET);
         thread.exception_area = base + 0x10000;
-        thread.security_descriptor = synchronization_descriptor(GuestMemory{}, 0).bytes;
+        thread.security_descriptor = bootstrap?bootstrap->security_descriptor:synchronization_descriptor(GuestMemory{}, 0).bytes;
         thread.pseudo_access = created_thread_pseudo_access(thread.security_descriptor);
         thread.public_id=allocate_thread_identifier(id);
-        thread.stack_base = base + 0x100000;
+        thread.stack_base = external_stack?bootstrap->stack_low:base + stack_offset;
         thread.stack_size = stack_size;
+        thread.owns_stack = !external_stack;
+        thread.skip_thread_attach = bootstrap && bootstrap->skip_thread_attach;
+        thread.static_tls_base=base+0x30000;
+        thread.static_tls_size=tls_size;
+        thread.hidden_from_debugger = bootstrap && bootstrap->hidden_from_debugger;
         thread.entry = entry;
         thread.suspended = (flags_value & 4) ? 1 : 0;
-        memory.map(GuestAddress{base}, x86_?0x4000:GUEST_CRT_TEB_SIZE, read_write);
-        memory.map(GuestAddress{thread.exception_area}, 0x20000, read_write);
-        memory.map(GuestAddress{thread.stack_base}, static_cast<std::size_t>(stack_size), read_write);
-        initialize_stack_guard(memory,thread.stack_base,stack_size,thread.stack_guard);
+        std::array<std::pair<std::uint64_t,std::uint64_t>,4> allocations{};std::size_t allocated=0;
+        std::uint64_t result=0;
+        const auto map=[&](std::uint64_t address,std::uint64_t size){memory.map(GuestAddress{address},static_cast<std::size_t>(size),read_write);allocations[allocated++]={address,size};};
+        const auto stack_base=thread.stack_base;
+        try {
+        map(base,x86_?0x4000:GUEST_CRT_TEB_SIZE);
+        map(thread.exception_area,0x20000);
+        map(thread.static_tls_base,tls_size);
+        if (!external_stack) {
+            map(thread.stack_base,stack_size);
+            initialize_stack_guard(memory,thread.stack_base,stack_size,thread.stack_guard);
+        }
         const auto stack_top = thread.stack_base + stack_size;
         thread.context.rip = thread_start_;
         const std::uint8_t width = x86_ ? 32 : 64;
         const unsigned unit = x86_ ? 4 : 8;
+        if (external_stack)
+            thread.context = *bootstrap->context;
+        thread.context.rip=thread_start_;
         if (x86_) {
             thread.context.fs_base = base;
-            thread.context.reg(Gpr::Rsp) = stack_top - 8;
-            memory.store(GuestAddress{stack_top - 8}, 32, thread_return_.value);
-            memory.store(GuestAddress{stack_top - 4}, 32, parameter);
+            if (!external_stack) {
+                thread.context.reg(Gpr::Rsp) = stack_top - 8;
+                memory.store(GuestAddress{stack_top - 8}, 32, thread_return_.value);
+                memory.store(GuestAddress{stack_top - 4}, 32, parameter);
+            }
             memory.store(GuestAddress{base}, 32, UINT32_MAX);
         } else {
             thread.context.gs_base = base;
-            thread.context.reg(Gpr::Rsp) = stack_top - 40;
-            thread.context.reg(Gpr::Rcx) = parameter;
-            memory.store(GuestAddress{stack_top - 40}, 64, thread_return_.value);
+            if (!external_stack) {
+                thread.context.reg(Gpr::Rsp) = stack_top - 40;
+                thread.context.reg(Gpr::Rcx) = parameter;
+                memory.store(GuestAddress{stack_top - 40}, 64, thread_return_.value);
+            }
         }
         memory.store(GuestAddress{base + unit}, width, stack_top);
         memory.store(GuestAddress{base + 2 * unit}, width, thread.stack_guard.limit(thread.stack_base));
@@ -3466,29 +3543,38 @@ std::uint64_t WindowsServices::create_guest_thread(const GuestState &state, Gues
         memory.store(GuestAddress{base + (x86_ ? 0x24 : 0x48)}, width, thread.public_id);
         memory.store(GuestAddress{base + (x86_ ? 0x30 : 0x60)}, width, peb_base_.value);
         memory.store(GuestAddress{base + (x86_ ? 0xf94 : 0x1780)}, width, base + 0x2000);
-        const auto tls_vector = runtime_allocate(memory, {}, 64 * unit);
+        memory.store(GuestAddress{base + (x86_?0xe0cU:0x1478U)}, width, external_stack?bootstrap->stack_allocation:thread.stack_base);
+        const auto tls_vector=thread.static_tls_base;
         memory.store(GuestAddress{base + (x86_ ? 0x2c : 0x58)}, width, tls_vector);
-        if (runtime_.image.tls_index) {
-            const auto tls =
-                runtime_allocate(memory, runtime_.image.tls_data,
-                                 std::max<std::size_t>(1, runtime_.image.tls_data.size() + runtime_.image.tls_zero),
-                                 runtime_.image.tls_alignment);
-            memory.store(GuestAddress{tls_vector}, width, tls);
+        for(const auto& block:tls_blocks){
+            const auto address=tls_vector+block.offset;
+            memory.write(GuestAddress{address},block.image->tls_data);
+            memory.store(GuestAddress{tls_vector+block.slot*unit},width,address);
         }
-        initialize_thread_module_tls(memory, tls_vector);
         threads_.items.emplace(id, std::move(thread));
         sync_crt_thread_state(memory,id);
         sync_fls_mirror(memory, base, threads_.items.at(id).fls_values); // 新 TEB：全零值與目前的使用中位元圖。
-        ++threads_.next_id;
         configure_thread_record(id);
-        const auto result = runtime_.allocate_wait_handle();
-        runtime_.process_thread_handles.emplace(result, std::pair{id, false});
-        queue_debug_thread(id);
+        result = runtime_.allocate_wait_handle();
+        runtime_.process_thread_handles.emplace(result, std::pair{id, bootstrap && bootstrap->inherit});
+        if (bootstrap) {
+            runtime_.thread_handle_access[result] = bootstrap->access;
+            runtime_.handle_flags[result] = bootstrap->inherit?1U:0U;
+        }
+        if(!threads_.items.at(id).hidden_from_debugger)queue_debug_thread(id);
+        ++threads_.next_id;
         // 新增可執行執行緒後建立排程邊界，讓它有機會在下一個耗時宿主呼叫前啟動。
         // CREATE_SUSPENDED 仍維持暫停，不要求切換。
         if (!(flags_value & 4))
             threads_.yield = true;
         return result;
+        } catch (...) {
+            runtime_.process_thread_handles.erase(result);runtime_.thread_handle_access.erase(result);runtime_.handle_flags.erase(result);
+            discard_thread_record(id);threads_.items.erase(id);
+            if(!external_stack)runtime_.virtual_page_protections.erase(runtime_.virtual_page_protections.lower_bound(stack_base),runtime_.virtual_page_protections.lower_bound(stack_base+stack_size));
+            while(allocated){const auto [address,size]=allocations[--allocated];memory.unmap(GuestAddress{address},static_cast<std::size_t>(size));}
+            throw;
+        }
     }
 }
 bool WindowsServices::dispatch_user_apc(GuestState &state, GuestMemory &memory, std::uint64_t completion) {
@@ -3507,6 +3593,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
     if (service.symbol == "FreeLibraryAndExitThread")
         return invoke_module(state, memory, service);
     const WindowsCall arg(state, memory, service);
+#include "windows_native_thread.inc"
     if(service.family=="avrt.dll"){
         const auto done=[&](std::uint64_t value,std::uint32_t error=0){if(error)last_error_=error;arg.return_to(state,value);return std::optional<std::uint32_t>{};};
         auto& task=threads_.items.at(threads_.current).multimedia;
@@ -4083,25 +4170,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             }
         }
     } else if (symbol == "SetFileCompletionNotificationModes") {
-        const auto modes = static_cast<std::uint8_t>(arg(1));
-        const auto file = files_.find(arg(0));
-        const auto socket = runtime_.network.sockets.find(arg(0));
-        if (modes & ~3U)
-            fail(87);
-        else if (file == files_.end() && socket == runtime_.network.sockets.end())
-            fail(6);
-        else {
-            if (file != files_.end())
-                for (auto &[handle, item] : files_) {
-                    (void)handle;
-                    if (item.object == file->second.object)
-                        item.completion_modes |= modes;
-                }
-            if (socket != runtime_.network.sockets.end())
-                socket->second->completion_modes |= modes;
-            result = 1;
-        }
+        if(const auto value=invoke_native_file_completion(state,memory,service)){arg.return_to(state,*value);return std::nullopt;}
+        if(const auto error=set_file_completion_modes(arg(0),static_cast<std::uint8_t>(arg(1))))fail(error);
+        else result=1;
     } else if (symbol == "CreateIoCompletionPort") {
+        if(const auto value=invoke_native_file_completion(state,memory,service)){arg.return_to(state,*value);return std::nullopt;}
         const auto file = files_.find(arg(0));
         const auto socket = runtime_.network.sockets.find(arg(0));
         if (arg(1) && !runtime_.completion_ports.contains(arg(1)))
@@ -4122,19 +4195,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 result = runtime_.allocate_wait_handle();
                 runtime_.completion_ports.emplace(result, CompletionPort{});
             }
-            if (socket != runtime_.network.sockets.end() && !socket->second->completion_port) {
-                socket->second->completion_port = result;
-                socket->second->completion_key = arg(2);
-            }
-            if (file != files_.end() && !file->second.completion_port) {
-                file->second.completion_port = result;
-                file->second.completion_key = arg(2);
+            if(arg(0)!=(x86_?UINT32_MAX:UINT64_MAX)){
+                if(const auto error=bind_file_completion_port(arg(0),result,arg(2))){
+                    if(!arg(1))runtime_.completion_ports.erase(result);
+                    fail(error);
+                }
             }
         }
     } else if (symbol == "PostQueuedCompletionStatus") {
         const auto found = runtime_.completion_ports.find(arg(0));
         if (found == runtime_.completion_ports.end())
             fail(6);
+        else if (!(found->second.access&2U))fail(5);
         else if (found->second.packets.size() >= 65536)
             fail(8);
         else {
@@ -4145,6 +4217,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
         const bool extended = symbol.ends_with("Ex");
         if (!runtime_.completion_ports.contains(arg(0)))
             fail(6);
+        else if (!(runtime_.completion_ports.at(arg(0)).access&2U))fail(5);
         else if (!arg(1) || !arg(3) || (extended ? u32(2) == 0 : arg(2) == 0))
             fail(87);
         else if (extended && u32(2) > 65536)
@@ -4519,16 +4592,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 const auto security = synchronization_descriptor(memory, arg(shift));
                 if (arg(id_argument))
                     memory.check(GuestAddress{arg(id_argument)}, 4, Access::Write);
+                GuestThreadBootstrap bootstrap;bootstrap.security_descriptor=security.bytes;bootstrap.inherit=security.inherit;
                 // 起始位址由真正啟動時的 CPU 執行權限檢查；CREATE_SUSPENDED 不提前執行它。
-                result = create_guest_thread(state, memory, arg(2 + shift), arg(3 + shift), requested, flags_value);
+                result = create_guest_thread(state, memory, arg(2 + shift), arg(3 + shift), requested, flags_value,&bootstrap);
                 if (result) {
-                    runtime_.process_thread_handles.at(result).second = security.inherit;
-                    runtime_.handle_flags[result] = security.inherit ? 1U : 0U;
-                    threads_.items.at(thread_id(result)).security_descriptor = security.bytes;
-                    threads_.items.at(thread_id(result)).pseudo_access = created_thread_pseudo_access(security.bytes);
-                    std::vector<std::uint8_t>* local{};int native=-1,lock=-1;bool is_thread=false;
-                    if(const auto error=process_security_location(result,0,local,native,lock,is_thread))throw SecurityDescriptorError{error};
-                    if(native>=0){SharedEventLock guard(lock);set_shared_object_security(native,security.bytes,true);}
                     if (arg(id_argument))
                         memory.store(GuestAddress{arg(id_argument)}, 32, thread_identifier(thread_id(result)));
                 }
@@ -4545,15 +4612,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
         else {
             auto &target = threads_.items.at(id);
             result = 1;
-            if (target.status != ThreadStatus::Exited && !target.forced_stop) {
-                target.forced_stop = target.terminating = true;
-                target.exit_code = u32(1);
-                target.apcs.clear();
-                target.wait = {};
-                target.suspended = 0;
-                target.status = ThreadStatus::Runnable;
-                target.context.pending_cpu_trap = 0;
-                target.context.rip = GuestAddress{callback_return_.value + 0xa0};
+            if (detail::prepare_forced_thread_stop(target, u32(1), GuestAddress{callback_return_.value + 0xa0})) {
                 notify_concurrency_changed();
                 threads_.yield = true;
                 if (id == threads_.current) {
@@ -4640,7 +4699,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
         const auto signal = runtime_.wait_objects.find(arg(0)), waited = runtime_.wait_objects.find(arg(1));
         const auto id = thread_id(arg(1));
         const bool valid_wait = waited != runtime_.wait_objects.end() || id || process_signaled(arg(1)).has_value() ||
-                                file_io_signaled(arg(1)).has_value();
+                                file_io_signaled(arg(1)).has_value() || registry_key_signaled(arg(1)).has_value();
         if (signal == runtime_.wait_objects.end() || signal->second.kind == WaitObject::Kind::Timer || !valid_wait) {
             last_error_ = 6;
             result = UINT32_MAX;
@@ -4725,7 +4784,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             for (std::size_t i = 0; i < wait.handles.size(); ++i)
                 if ((!runtime_.wait_objects.contains(wait.handles[i]) && !thread_id(wait.handles[i]) &&
                      !process_signaled(wait.handles[i]).has_value() &&
-                     !file_io_signaled(wait.handles[i]).has_value()) ||
+                     !file_io_signaled(wait.handles[i]).has_value() && !registry_key_signaled(wait.handles[i]).has_value()) ||
                     ((!native_wait || wait.all) && std::find(wait.handles.begin(), wait.handles.begin() + static_cast<std::ptrdiff_t>(i),
                               wait.handles[i]) != wait.handles.begin() + static_cast<std::ptrdiff_t>(i)))
                     valid = false;

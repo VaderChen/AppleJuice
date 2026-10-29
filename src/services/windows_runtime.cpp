@@ -1,8 +1,10 @@
 #include "x64arm/windows_services.hpp"
+#include "service_callback_task.hpp"
 #include "guest_crt_state.h"
 #include "guest_heap_layout.hpp"
 #include "guest_tls.hpp"
 #include "windows_loader_lock.hpp"
+#include "windows_process_parameter_layout.hpp"
 #include "x64arm/startup_profile.hpp"
 #include "service_descriptor_index.hpp"
 #include "service_descriptor_catalog.hpp"
@@ -676,9 +678,10 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
         memory.store(GuestAddress{teb_base_.value+0x30},32,peb_base_.value);
         memory.store(GuestAddress{peb_base_.value+8},32,runtime_.image.base);
         memory.store(GuestAddress{peb_base_.value+0x18},32,process_heap);
-        const auto parameters=runtime_allocate(memory,{},0x2c4);
+        const auto parameter_header=detail::ProcessParameterLayout::for_x86(true).header;
+        const auto parameters=runtime_allocate(memory,{},parameter_header);
         memory.store(GuestAddress{peb_base_.value+0x10},32,parameters);
-        memory.store(GuestAddress{parameters},32,0x2c4);memory.store(GuestAddress{parameters+4},32,0x2c4);memory.store(GuestAddress{parameters+8},32,1);
+        memory.store(GuestAddress{parameters},32,parameter_header);memory.store(GuestAddress{parameters+4},32,parameter_header);memory.store(GuestAddress{parameters+8},32,1);
         for(unsigned i=0;i<3;++i)memory.store(GuestAddress{parameters+0x18+i*4},32,0x100+i);
         const auto unicode=[&](std::uint64_t offset,std::u16string_view text){const auto data=utf16_bytes(text);const auto buffer=runtime_allocate(memory,data);memory.store(GuestAddress{parameters+offset},16,data.size()-2);memory.store(GuestAddress{parameters+offset+2},16,data.size());memory.store(GuestAddress{parameters+offset+4},32,buffer);};
         unicode(0x24,u"C:\\");unicode(0x38,runtime_.image.path);unicode(0x40,read_utf16(memory,command_line_address_));
@@ -699,8 +702,9 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
     memory.store(GuestAddress{peb_base_.value + 0x10}, 64, runtime_.image.base);
     memory.store(GuestAddress{peb_base_.value + 0xb8}, 32, std::max(1U, runtime_.processor_count)); // NumberOfProcessors
     // RTL_USER_PROCESS_PARAMETERS64：供靜態 CRT 與原生 Win32 程式讀取程序資料。
-    const auto parameters=runtime_allocate(memory,{},0x448);memory.store(GuestAddress{peb_base_.value+0x20},64,parameters);
-    memory.store(GuestAddress{parameters},32,0x448);memory.store(GuestAddress{parameters+4},32,0x448);memory.store(GuestAddress{parameters+8},32,1);
+    const auto parameter_header=detail::ProcessParameterLayout::for_x86(false).header;
+    const auto parameters=runtime_allocate(memory,{},parameter_header);memory.store(GuestAddress{peb_base_.value+0x20},64,parameters);
+    memory.store(GuestAddress{parameters},32,parameter_header);memory.store(GuestAddress{parameters+4},32,parameter_header);memory.store(GuestAddress{parameters+8},32,1);
     for(unsigned i=0;i<3;++i)memory.store(GuestAddress{parameters+0x20+i*8},64,0x100+i);
     const auto unicode=[&](std::uint64_t offset,std::u16string_view text){const auto data=utf16_bytes(text);const auto buffer=runtime_allocate(memory,data);memory.store(GuestAddress{parameters+offset},16,data.size()-2);memory.store(GuestAddress{parameters+offset+2},16,data.size());memory.store(GuestAddress{parameters+offset+8},64,buffer);};
     unicode(0x38,u"C:\\");const auto argv=memory.load(GuestAddress{runtime_.wargv_cell},64);const auto image_name=memory.load(GuestAddress{argv},64);unicode(0x60,runtime_.image.path.empty()?(image_name?read_utf16(memory,GuestAddress{image_name}):std::u16string{}):runtime_.image.path);unicode(0x70,read_utf16(memory,command_line_address_));
@@ -1405,6 +1409,7 @@ void WindowsServices::discard_callbacks(std::size_t depth, GuestState& state, Gu
             runtime_.sorts.pop_back();
         }
         const auto& frame=runtime_.callbacks.back();
+        if(frame.continuation==Continuation::NestedResult && frame.value)service_callback::cancel(this,frame.value);
         if(frame.continuation==Continuation::NativeV8Operation)discard_native_v8(memory,static_cast<std::uint32_t>(frame.value));
         finish_shell_callbacks(memory,frame);
         if(frame.continuation==Continuation::CertificateFind)discard_certificate_find(state,memory,frame.value);
@@ -1543,7 +1548,11 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     }
     if(finished.loader_notification_lock){release_loader_notification();publish_loader_lock(memory,peb_base_.value,x86_,thread_identifier(runtime_.loader_owner),runtime_.loader_depth);}
     // 同後端巢狀執行由呼叫端繼續完成原操作；此時只恢復狀態與回呼結果。
-    if(finished.continuation==Continuation::NestedResult){state.reg(Gpr::Rax)=callback_value;return std::nullopt;}
+    if(finished.continuation==Continuation::NestedResult){
+        if(finished.value)service_callback::resume(this,threads_.current,finished.value,state,callback_value);
+        else state.reg(Gpr::Rax)=callback_value;
+        return std::nullopt;
+    }
     if(finished.continuation==Continuation::D3DXProgressOperation)return resume_d3dx_progress(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));
     if(finished.continuation==Continuation::D3DCompileOperation)return resume_d3d_compile(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));
     if(finished.continuation==Continuation::AutomationOperation)return resume_automation(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));
@@ -2076,7 +2085,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
     else if (symbol == "GetModuleHandleA" || symbol == "GetModuleHandleW") { if (arg(0)) fail(126); else result = runtime_.image.base; }
     else if (symbol == "GetStartupInfoA" || symbol == "GetStartupInfoW") {
         const auto size=x86_ ? 68U : 104U; memory.write(GuestAddress{arg(0)}, std::vector<std::uint8_t>(size)); memory.store(GuestAddress{arg(0)}, 32, size);
-        if(runtime_.startup_show!=UINT32_MAX){memory.store(GuestAddress{arg(0)+(x86_?44U:60U)},32,1);memory.store(GuestAddress{arg(0)+(x86_?48U:64U)},16,runtime_.startup_show);}
+        if(runtime_.native_startup_window){
+            const auto& window=*runtime_.native_startup_window;
+            for(unsigned i=0;i<8;++i)memory.store(GuestAddress{arg(0)+(x86_?16U:32U)+i*4},32,window[i]);
+            memory.store(GuestAddress{arg(0)+(x86_?48U:64U)},16,window[8]);
+            const auto index=symbol.ends_with('W')?0U:2U;
+            memory.store(GuestAddress{arg(0)+(x86_?8U:16U)},x86_?32:64,runtime_.native_startup_text[index]);
+            memory.store(GuestAddress{arg(0)+(x86_?12U:24U)},x86_?32:64,runtime_.native_startup_text[index+1]);
+            for(unsigned i=0;i<3;++i)memory.store(GuestAddress{arg(0)+(x86_?56U:80U)+i*(x86_?4U:8U)},x86_?32:64,runtime_.standard_handles[i]);
+        }
+        if(runtime_.startup_show!=UINT32_MAX){const auto flags=memory.load(GuestAddress{arg(0)+(x86_?44U:60U)},32);memory.store(GuestAddress{arg(0)+(x86_?44U:60U)},32,flags|1U);memory.store(GuestAddress{arg(0)+(x86_?48U:64U)},16,runtime_.startup_show);}
         if(runtime_.startup_handles){const auto flags=memory.load(GuestAddress{arg(0)+(x86_?44U:60U)},32);memory.store(GuestAddress{arg(0)+(x86_?44U:60U)},32,flags|0x100U);for(unsigned i=0;i<3;++i)memory.store(GuestAddress{arg(0)+(x86_?56U:80U)+i*(x86_?4U:8U)},x86_?32:64,(*runtime_.startup_handles)[i]);}
         if(runtime_.startup_reserved2_address){memory.store(GuestAddress{arg(0)+(x86_?50U:66U)},16,runtime_.startup_reserved2.size());memory.store(GuestAddress{arg(0)+(x86_?52U:72U)},x86_?32:64,runtime_.startup_reserved2_address);}
     } else if (symbol == "__p___argc") result = runtime_.argc_cell;

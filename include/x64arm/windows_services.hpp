@@ -529,6 +529,7 @@ private:
     void publish_process_information();
     void publish_thread_lifetime(std::uint64_t,std::uint32_t);
     void configure_thread_record(std::uint64_t);
+    void discard_thread_record(std::uint64_t);
     std::uint32_t memory_status_fields(GuestMemory&,std::array<std::uint64_t,6>&) const;
     std::uint32_t refresh_memory_resource_notifications(bool force=false);
     std::uint64_t memory_resource_poll_deadline_{UINT64_MAX};
@@ -649,6 +650,8 @@ private:
     void poll_file_io(GuestMemory&,bool scheduler_poll=false);
     std::optional<bool> file_io_signaled(std::uint64_t);
     void set_file_io_signaled(std::uint64_t,bool);
+    std::uint32_t bind_file_completion_port(std::uint64_t,std::uint64_t,std::uint64_t,bool = false);
+    std::uint32_t set_file_completion_modes(std::uint64_t,std::uint32_t);
     void poll_directory_notifications();
     std::optional<std::uint32_t> invoke_shell_notification(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void poll_shell_notifications(GuestMemory&);
@@ -682,8 +685,11 @@ private:
     std::optional<std::uint64_t> file_io_poll_deadline(const SharedWake*) const;
     // 原生檔案的 FlushFileBuffers 交給宿主工作執行緒執行 fsync；完成旗標由排程器輪詢。
     struct AsyncFileFlush { std::atomic<bool> done{}; std::uint32_t error{}; };
+    struct AsyncFileCopy;
     struct PendingFileIo {
-        enum class Kind { Connect, Read, Write, Transact, Flush, Lock, Directory, CommEvent } kind{};
+        enum class Kind { Connect, Read, Write, Transact, Flush, Lock, Directory, CommEvent, Copy } kind{};
+        std::shared_ptr<AsyncFileCopy> copy;
+        std::uint64_t source_handle{},source_offset{};
         std::shared_ptr<SerialTransfer> serial;
         std::shared_ptr<AsyncFileFlush> flush;
         std::shared_ptr<NamedPipe::Transaction> transaction;
@@ -702,11 +708,15 @@ private:
     // 共用即時／待命 I/O 的結果發布、事件、APC 及完成埠通知。
     static std::uint32_t file_io_status(std::uint32_t);
     void complete_file_io(GuestMemory&,PendingFileIo&,std::uint32_t);
+    std::optional<std::uint32_t> invoke_file_copy_chunk(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_fs_control(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_set_volume(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    FileVolumeLocation file_volume_location(std::uint64_t) const;
     PipeResult poll_hid_io(PendingFileIo&,GuestMemory&);
     std::vector<PendingFileIo> pending_file_io_;
     PipeResult read_directory_notification(const PendingFileIo&,GuestMemory&);
     bool close_process(std::uint64_t);
-    bool create_guest_process(GuestMemory&,const std::array<std::uint64_t,10>&,bool,bool = false,std::uint64_t = 0,unsigned = 0,unsigned = 0);
+    bool create_guest_process(GuestMemory&,const std::array<std::uint64_t,10>&,bool,bool = false,std::uint64_t = 0,unsigned = 0,unsigned = 0,const NativeProcessParameters* = nullptr);
     bool finish_guest_process_creation(GuestState&,GuestMemory&,std::uint64_t);
     void cancel_guest_process_creation(std::uint64_t);
     std::uint32_t query_association(std::uint32_t,std::uint32_t,std::u16string,const std::u16string&,std::u16string&);
@@ -745,6 +755,7 @@ private:
     std::optional<std::uint64_t> invoke_native_file_io(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint64_t> invoke_native_file_position(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint64_t> invoke_native_file_information(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint64_t> invoke_native_file_completion(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint64_t> invoke_native_mapping(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     FileInformation query_native_file_attributes(GuestState&,GuestMemory&,const std::u16string&,bool);
     void unmap_module(GuestMemory&,std::uint64_t module);
@@ -1129,6 +1140,10 @@ private:
     const WindowsServiceDescriptor* graphics_worker_service(GuestAddress) const noexcept;
     // 可直接在 worker 上執行的 D3D12 方法（命令清單錄製、描述元建立／複製、不寫客體記憶體的取值）；其餘回傳空指標。
     const WindowsServiceDescriptor* d3d12_worker_service(GuestAddress) const noexcept;
+    // x64 客體常式頁（guest_thread_x64.s）中具名常式的入口；未映射、追蹤服務或啟動剖析時為 0（同 kernel32 常式的使用條件）。
+    GuestAddress guest_thread_routine(std::string_view symbol) const noexcept;
+    // parallel_service 的靜態部分（依 stub 描述表與環境開關；x64 結果由 parallel_service 依 stub 索引快取）。
+    bool parallel_service_static(GuestAddress) const noexcept;
     static constexpr GuestAddress unresolved_base{windows_address_layout::x64.unresolved};
     std::vector<std::string> unresolved_imports_;
     static constexpr GuestAddress runtime_base{0x3002000000ULL};
@@ -1166,6 +1181,9 @@ private:
     bool graphics_service_epilogue_{};std::uint64_t last_graphics_epilogue_{};
     // 協調者本地一般服務執行中（resident_coordinated_service）：provider 要啟動客體回呼時改丟 LocalServiceRefused，交回完整路徑重做。
     bool local_plain_service_{};
+    // 協調者的 PeekMessage 抽完宿主事件仍沒有訊息時記下的期限（單調 tick，約 1 ms）：期限內訊息來源全空，worker 上的
+    // PeekMessage 直接回 FALSE（見 parallel_peek_service）。協調者只在獨占映射鎖或全停下寫入，worker 持共用鎖讀取。
+    std::uint64_t gui_peek_idle_until_{};
     // 核心已選定、尚未換入的單 slot 搶占替換者（resident_preempt_plan 回報 true 時記錄）；單槽換手選人時排除，避免同一
     // 客體執行緒同時進入兩個 slot。搶占提交或重新選取平行集合時清除。
     GuestState* resident_preempt_pending_{};
@@ -1201,7 +1219,7 @@ private:
     void wake_threads(GuestMemory& memory);
     enum class ThreadWakeScope { All, Condition, Slim, Critical, Objects, Address };
     bool resolve_thread_waits(GuestMemory&,ThreadWakeScope scope=ThreadWakeScope::All,std::uint64_t address=0);
-    void schedule(GuestState& state, GuestMemory& memory);
+    void schedule(GuestState& state, GuestMemory& memory, bool control_requests_only=false);
     // 常駐平行時協調者在其他 worker 執行中切換 slot 0 的目前客體（只做 schedule 的保存／載入，不輪詢、不選人）。
     void switch_resident_current(GuestState& state, GuestMemory& memory, std::uint64_t target);
     // slot 0 停駐：目前客體的活體狀態已存回執行緒表（見 resident_unpark）。
@@ -1217,9 +1235,21 @@ private:
     std::optional<std::uint32_t> invoke_error(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_registry(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_registry_hive(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
-    std::uint32_t flush_registry_hives();
+    std::optional<std::uint32_t> invoke_registry_notify(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<bool> registry_key_signaled(std::uint64_t) const;
+    std::uint32_t flush_registry_hives(bool explicit_flush=true);
+    std::uint32_t load_registry_hive(RegistryTransaction&,const std::u16string&,const std::u16string&,const std::u16string&,std::uint32_t);
+    std::uint32_t unload_registry_hive(RegistryTransaction&,const std::u16string&);
+    std::uint32_t save_registry_hive(const std::u16string&,HostFile&,std::uint32_t);
+    std::uint32_t restore_registry_hive(RegistryTransaction&,const std::u16string&,HostFile*,std::uint32_t,std::uint64_t);
+    std::uint32_t replace_registry_hive(RegistryTransaction&,const std::u16string&,const std::u16string&,const std::u16string&);
+    void initialize_registry_session();
+    struct RegistrySession;
+    std::shared_ptr<RegistrySession> registry_session_;
+    std::u16string registry_object_path(const GuestMemory&,std::uint64_t,bool);
     std::uint32_t commit_registry_transaction(RegistryTransaction&);
     std::map<std::u16string,std::shared_ptr<HostFile>> registry_hive_files_;
+    std::map<std::u16string,std::shared_ptr<HostFile>> registry_replacement_files_;
     std::optional<std::uint32_t> invoke_registry_security(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     const std::vector<std::uint8_t>& registry_security_descriptor(const std::u16string&);
     std::vector<std::uint8_t> registry_creation_descriptor(const std::vector<std::uint8_t>&,security::SecurityDescriptor);
@@ -1303,7 +1333,8 @@ private:
             std::uint64_t modified{};
             bool operator==(const KeySnapshot&) const = default;
         };
-        std::uint64_t key{},event{},thread{};
+        std::uint64_t key{},event{},thread{},native_iosb{},routine{},context{};
+        std::uint32_t completion_status{0x103U};
         std::u16string path;std::uint32_t filter{};bool subtree{};
         std::map<std::u16string,KeySnapshot> snapshot;
         std::map<std::u16string,std::vector<std::uint8_t>> security_snapshot;
@@ -1311,7 +1342,7 @@ private:
     };
     std::map<std::uint64_t,RegistryNotification> registry_notifications_;
     std::uint64_t next_registry_notification_{1},registry_poll_time_{};
-    void poll_registry_notifications(bool reload=true,std::u16string_view mutation={},std::uint32_t filter=0);
+    void poll_registry_notifications(bool reload=true,std::u16string_view mutation={},std::uint32_t filter=0,GuestMemory* memory=nullptr);
     struct RegisteredWait {
         std::uint64_t target{},callback{},parameter{},worker{},deadline{},completion_event{},timer_owner{},pool_instance{},power_owner{},etw_operation{},device_owner{},perflib_operation{},bluetooth_delivery{},pdh_query{};
         // 共用 100 ns 間隔，避免 PDH 的 DWORD 秒數在轉成 DWORD 毫秒時溢位。
@@ -1354,10 +1385,28 @@ private:
     void poll_timer_queues(GuestMemory&);
     void collect_timer_queues();
     std::optional<std::uint32_t> invoke_timer_queue(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
-    std::uint64_t create_guest_thread(const GuestState&,GuestMemory&,std::uint64_t,std::uint64_t,std::uint64_t,std::uint32_t);
+    std::uint64_t create_guest_thread(const GuestState&,GuestMemory&,std::uint64_t,std::uint64_t,std::uint64_t,std::uint32_t,const GuestThreadBootstrap* = nullptr);
     void initialize_stack_guard(GuestMemory&,std::uint64_t,std::uint64_t,ThreadStackGuard&);
     std::uint32_t configure_stack_guarantee(GuestState&,GuestMemory&,std::uint32_t,bool,std::uint32_t&);
     bool release_stack_guard(GuestState&,GuestMemory&,std::uint64_t);
+    struct WaitCompletionPacketState {
+        std::uint64_t target{},port{};CompletionPacket packet{};
+        enum class Phase {Idle,Armed,Queued} phase{Phase::Idle};
+        std::vector<std::uint8_t> security_descriptor;
+        bool operator==(const WaitCompletionPacketState&)const=default;
+    };
+    std::map<std::uint64_t,std::pair<std::uint64_t,std::uint32_t>> wait_completion_handles_;
+    std::map<std::uint64_t,WaitCompletionPacketState> wait_completion_packets_;
+    std::set<std::uint64_t> wait_completion_targets_;
+    std::uint64_t retain_wait_completion_target(std::uint64_t);
+    std::uint64_t retain_wait_completion_process(std::uint64_t);
+    void release_wait_completion_target(GuestMemory&,std::uint64_t);
+    void poll_wait_completion_packets(GuestMemory&);
+    void complete_wait_packet(std::uint64_t);
+    std::uint32_t cancel_wait_packet(GuestMemory&,std::uint64_t,bool);
+    bool close_wait_packet(GuestMemory&,std::uint64_t);
+    bool close_completion_port(GuestMemory&,std::uint64_t);
+    CompletionResult poll_native_completion(GuestState&,GuestMemory&,std::uint64_t,bool,bool);
     void poll_registered_waits(GuestMemory&);
     void release_registered_wait(std::uint64_t);
     std::optional<std::uint32_t> resume_registered_wait(GuestState&,GuestMemory&);
@@ -1391,9 +1440,9 @@ private:
     std::optional<std::uint32_t> invoke_mapping(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool flush_file_view(std::uint64_t,std::uint64_t);
     bool close_mapping(std::uint64_t);
-    std::uint64_t map_file_view(GuestMemory&,std::uint64_t handle,std::uint32_t access,std::uint64_t offset,std::uint64_t size,std::uint64_t address=0,bool dib=false,bool copy_override=false);
+    std::uint64_t map_file_view(GuestMemory&,std::uint64_t handle,std::uint32_t access,std::uint64_t offset,std::uint64_t size,std::uint64_t address=0,bool dib=false,bool copy_override=false,bool replace_placeholder=false,const VirtualAddressRequirements* requirements=nullptr);
     std::uint64_t map_dib_section(GuestMemory&,std::uint64_t handle,std::uint32_t offset,std::uint64_t size,std::uint64_t& view);
-    bool unmap_file_view(GuestMemory&,std::uint64_t address,bool dib=false);
+    bool unmap_file_view(GuestMemory&,std::uint64_t address,bool dib=false,std::uint32_t flags=0);
     struct CanceledHttpIo {std::shared_ptr<NativeHttp> task;process_io::Counters accounted;};
     std::vector<CanceledHttpIo> canceled_http_io_;
     void account_http_io(HttpHandle&);

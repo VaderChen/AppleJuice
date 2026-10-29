@@ -29,6 +29,13 @@ struct ThreadStackGuard {
     std::uint64_t limit(std::uint64_t base)const{return armed?base+guarantee+4096:base;}
     bool operator==(const ThreadStackGuard&) const = default;
 };
+struct GuestThreadBootstrap {
+    std::optional<GuestState> context;
+    std::uint64_t stack_low{},stack_high{},stack_allocation{};
+    std::vector<std::uint8_t> security_descriptor;
+    std::uint32_t access{0x1fffffU};
+    bool inherit{},hidden_from_debugger{},skip_thread_attach{};
+};
 struct GuestThread {
     struct SystemCallFrame {
         std::uint64_t stack{},caller{},resume{},flags{};
@@ -47,6 +54,8 @@ struct GuestThread {
     std::array<std::uint64_t,1088> tls_values{};
     std::uint64_t teb{}, exception_area{}, stack_base{}, stack_size{}, errno_cell{}, entry{};
     ThreadStackGuard stack_guard;
+    bool owns_stack{true},skip_thread_attach{};
+    std::uint64_t static_tls_base{},static_tls_size{};
     std::uint64_t fiber{},fiber_stack_allocation{},desktop_handle{};
     std::uint64_t msvc_exception_cells{},msvc_exception_area{};
     std::uint64_t impersonation_token{};

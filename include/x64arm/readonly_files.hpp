@@ -64,6 +64,7 @@ struct HostFile {
     static FileInformation descriptor_information(int descriptor);
     static bool is_null_descriptor(int descriptor);
     bool null_device() const noexcept { return null_device_; }
+    char volume_id() const noexcept { return volume_; }
     FileVolumeSpace volume_space() const;
     int duplicate_descriptor() const;
     int transfer_descriptor() const noexcept { return descriptor_; }
@@ -85,6 +86,7 @@ private:
     std::uint32_t access_{}, sharing_{7};
     bool readonly_{},delete_on_close_{},null_device_{};
     char volume_{};
+    std::uint32_t reparse_attributes_{},reparse_tag_{};
     struct RangeLock {std::uint64_t offset{},length{};bool exclusive{};std::uint32_t key{};};
     std::vector<RangeLock> locks_;
     std::shared_ptr<SharedFileLease> shared_lease_;
@@ -147,6 +149,9 @@ public:
     FileVolumeSpace volume_space(std::string path);
     std::vector<FileVolume> volumes() const;
     FileVolumeState volume_state() const;
+    FileVolumeProperties volume_properties(char volume) const;
+    std::uint32_t set_volume_label(char volume,std::u16string label);
+    std::uint32_t set_volume_object_id(char volume,const std::array<std::uint8_t,64>& value);
     const std::shared_ptr<NetworkFiles>& network_files()const noexcept{return network_files_;}
     const std::string& network_scope()const noexcept{return network_scope_;}
     bool network_path(std::string path)const;

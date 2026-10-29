@@ -83,7 +83,7 @@ bool registry_dependent_service(const WindowsServiceDescriptor& service) {
     if(family=="newdev.dll")return true;
     if(family=="user32.dll" && name.starts_with("RegisterDeviceNotification"))return true;
 
-    if((family=="ole32.dll" || family=="combase.dll") && one_of(name,{"CoCreateInstance","CoGetClassObject",
+    if((family=="ole32.dll" || family=="combase.dll") && one_of(name,{"CoCreateInstance","CoCreateInstanceEx","CoGetClassObject",
         "ProgIDFromCLSID","CLSIDFromProgID","CLSIDFromString","RoGetActivationFactory","RoActivateInstance"}))return true;
     if(family=="internal-com-rot" && name=="Register")return true;
     // 外部型別參照會惰性查詢 TypeLib 登錄，包含 COM metadata 與 Invoke。

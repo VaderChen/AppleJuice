@@ -287,7 +287,10 @@ ReadOnlyFiles::Resolved ReadOnlyFiles::resolve(std::string path, bool directory_
 #endif
             return {result.key,-1,5,true};
         }
-        mapped.key=result.key;mapped.readonly_file=true;return mapped;
+        mapped.key=result.key;mapped.readonly_file=true;
+        // 覆疊的客體卷身分屬於外層命名空間；不能沿用臨時來源解析器的 C 槽。
+        const auto state=volumes_->snapshot();const auto drive=static_cast<char>(result.key[0]>='a' && result.key[0]<='z'?result.key[0]-32:result.key[0]);
+        const auto alias=state.drives.find(drive);mapped.volume=alias==state.drives.end()?0:alias->second;return mapped;
     }
     return result;
 }
@@ -367,7 +370,7 @@ ReadOnlyFiles::Resolved ReadOnlyFiles::resolve_mapped(std::string path, bool dir
         ReadOnlyFiles source({},mounted->second);
         source.security_context_=security_context_;
         auto result=source.resolve_mapped("C:/"+(overlay_key.size()>=mounted->first.size()?overlay_key.substr(mounted->first.size()):std::string{}),directory_only,nullptr,metadata_only,depth,follow_leaf,strict_root);
-        result.key=key;result.readonly_file=true;result.volume=0;return result;
+        result.key=key;result.readonly_file=true;result.volume=volume;return result;
     }
     if(const auto file=readonly_files_.find(overlay_key);file!=readonly_files_.end()) {
         if(directory_only || leaf)return {key,-1,5,true};
@@ -378,10 +381,10 @@ ReadOnlyFiles::Resolved ReadOnlyFiles::resolve_mapped(std::string path, bool dir
             const auto parent=file->second.parent_path();
             const auto descriptor=::open(parent.c_str(),file_mode|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
             if(descriptor>=0)if(const auto error=authorize(descriptor,0x20U)){::close(descriptor);return {key,-1,error,true,{},{},error==5};}
-            return {key,descriptor,descriptor<0?(errno==ENOENT?2U:5U):0U,true,file->second,file->second.filename().string()};
+            Resolved result{key,descriptor,descriptor<0?(errno==ENOENT?2U:5U):0U,true,file->second,file->second.filename().string()};result.volume=volume;return result;
         }
         const auto descriptor=::open(file->second.c_str(),file_mode|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
-        return {key,descriptor,descriptor<0?(errno==ENOENT?2U:5U):0U,true,file->second,{},descriptor<0 && errno!=ENOENT};
+        Resolved result{key,descriptor,descriptor<0?(errno==ENOENT?2U:5U):0U,true,file->second,{},descriptor<0 && errno!=ENOENT};result.volume=volume;return result;
 #endif
     }
     auto root=!drive?root_:std::filesystem::path{};
@@ -832,7 +835,7 @@ OpenHostFile ReadOnlyFiles::open_library_reader(std::string path,const std::file
     struct stat info{};if(::fstat(fd.value,&info)<0)return {resolved.key,{},{},native_error()};
     if(!S_ISREG(info.st_mode) || info.st_size<0)return {resolved.key,{},{},193};
     auto file=std::make_shared<HostFile>(fd.value);fd.value=-1;
-    file->access_=1U;file->readonly_=true;file->network_lease_=resolved.network_lease;
+    file->access_=1U;file->readonly_=true;file->volume_=resolved.volume;file->network_lease_=resolved.network_lease;
     return {resolved.key,std::move(file),metadata(info,resolved.descriptor),0,true,resolved.host_path};
 #endif
 } catch(const std::bad_alloc&) {return {{},{},{},8};}
@@ -869,7 +872,7 @@ OpenHostFile ReadOnlyFiles::open_reader(std::string path,const std::filesystem::
     if(!S_ISREG(info.st_mode) || info.st_size<0)return {key,{},{},5,false};
     const auto details=metadata(info,descriptor.value);if(const auto error=sharing_error(details,0x80000000U,sharing))return {key,{},{},error,true};
     auto state=file_state(details,true);auto file=std::make_shared<HostFile>(descriptor.value);descriptor.value=-1;
-    file->state_=state;file->access_=0x80000000U;file->sharing_=sharing;file->readonly_=true;file->volume_=resolved.readonly_file?0:resolved.volume;file->network_lease_=resolved.network_lease;if(const auto error=attach_shared_file(*file))return {key,{},{},error,false};std::erase_if(state->opens,[](const auto& weak){return weak.expired();});state->opens.push_back(file);
+    file->state_=state;file->access_=0x80000000U;file->sharing_=sharing;file->readonly_=true;file->volume_=resolved.volume;file->network_lease_=resolved.network_lease;if(const auto error=attach_shared_file(*file))return {key,{},{},error,false};std::erase_if(state->opens,[](const auto& weak){return weak.expired();});state->opens.push_back(file);
     return {key,std::move(file),details,0,true,resolved.host_path};
 #endif
 } catch(const std::bad_alloc&) {return {{},{},{},8,false};}
@@ -1133,7 +1136,9 @@ FileInformation HostFile::information() const {
         if(static_cast<std::uint64_t>(current.st_dev)!=security_target_->identity.device || current.st_ino!=security_target_->identity.id)return {{},{},1237};
         return {{},metadata(current),0};
     }
-    return descriptor_information(descriptor_);
+    auto result=descriptor_information(descriptor_);
+    if(!result.error && reparse_tag_){result.metadata.attributes=reparse_attributes_;result.metadata.reparse_tag=reparse_tag_;}
+    return result;
 #endif
 }
 std::uint64_t HostFile::current_size() const {
@@ -1160,6 +1165,7 @@ bool HostFile::is_null_descriptor(int descriptor) {
 }
 std::uint32_t HostFile::validate_io(std::uint64_t offset,std::uint64_t length,bool writing,std::uint32_t key) const {
     if(null_device_)return 0;
+    if(reparse_tag_)return 1; // 連結本身僅提供 metadata／FSCTL，不能把宿主連結文字當作客體檔案資料。
     if(offset>INT64_MAX || length>static_cast<std::uint64_t>(INT64_MAX)-offset)return 87;
     return lock_conflict(offset,length,writing,key);
 }
@@ -1345,9 +1351,33 @@ OpenHostFile ReadOnlyFiles::open_host(std::string path,std::uint32_t access,std:
 #endif
     }
     if(!writable_)return {{},{},{},50,false};
-    if(flags_value&0x00200000U){const auto point=reparse(path);if(!point.error)return {{},{},{},50,true};}
-    const auto followed=follow_reparse(path);if(followed.second && followed.second!=50)return {{},{},{},followed.second,false};
-    if(!followed.second)path=followed.first;
+    const bool open_reparse=(flags_value&0x00200000U)!=0;
+    if(!open_reparse){const auto followed=follow_reparse(path);if(followed.second && followed.second!=50)return {{},{},{},followed.second,false};if(!followed.second)path=followed.first;}
+#if defined(__APPLE__)
+    if(open_reparse){
+        const auto point=reparse(path);
+        if(!point.error && point.kind!=3){
+            if(disposition==1)return {{},{},{},80,true};
+            if((disposition!=3 && disposition!=4) || (flags_value&0x04000000U))return {{},{},{},87,true};
+            std::string leaf;const auto parent=resolve(path,true,&leaf);FileDescriptor directory{parent.descriptor};if(parent.error)return {parent.key,{},{},parent.error,true};
+            if(parent.readonly_file)return {parent.key,{},{},5,true};
+            if(const auto error=authorize_at(directory.value,leaf,access))return {parent.key,{},{},error,true};
+            FileDescriptor descriptor{::openat(directory.value,leaf.c_str(),O_SYMLINK|O_RDONLY|O_CLOEXEC)};
+            if(descriptor.value<0)return {parent.key,{},{},native_error(),true};
+            struct stat current{};if(::fstat(descriptor.value,&current)<0)return {parent.key,{},{},native_error(),true};
+            if(!S_ISLNK(current.st_mode) || static_cast<std::uint64_t>(current.st_dev)!=point.device || current.st_ino!=point.id)return {parent.key,{},{},1237,true};
+            auto details=metadata(current);details.attributes=point.attributes;details.reparse_tag=0xa000000cU;
+            if(const auto error=sharing_error(details,access,sharing))return {parent.key,{},{},error,true};
+            auto state=file_state(details,true);auto file=std::make_shared<HostFile>(descriptor.value);descriptor.value=-1;
+            file->state_=state;file->access_=access;file->sharing_=sharing;file->volume_=parent.volume;
+            file->reparse_attributes_=details.attributes;file->reparse_tag_=details.reparse_tag;
+            if(const auto error=attach_shared_file(*file))return {parent.key,{},{},error,true};
+            std::erase_if(state->opens,[](const auto& weak){return weak.expired();});state->opens.push_back(file);
+            return {parent.key,std::move(file),details,0,true};
+        }
+        if(point.error && point.error!=4390 && point.error!=2 && point.error!=3)return {{},{},{},point.error,false};
+    }
+#endif
     const bool deleting=(flags_value&0x04000000U)!=0;
     if(deleting)access|=0x10000U;
 #if !defined(_WIN32)
@@ -1362,7 +1392,7 @@ OpenHostFile ReadOnlyFiles::open_host(std::string path,std::uint32_t access,std:
             const auto details=metadata(info,descriptor.value);if(const auto error=sharing_error(details,access,sharing))return {mapped.key,{},{},error,true};
             auto state=file_state(details,true);
             auto file=std::make_shared<HostFile>(descriptor.value);descriptor.value=-1;
-            file->state_=state;file->access_=access;file->sharing_=sharing;file->readonly_=true;file->network_lease_=mapped.network_lease;if(const auto error=attach_shared_file(*file))return {mapped.key,{},{},error,true};std::erase_if(state->opens,[](const auto& weak){return weak.expired();});state->opens.push_back(file);
+            file->state_=state;file->access_=access;file->sharing_=sharing;file->readonly_=true;file->volume_=mapped.volume;file->network_lease_=mapped.network_lease;if(const auto error=attach_shared_file(*file))return {mapped.key,{},{},error,true};std::erase_if(state->opens,[](const auto& weak){return weak.expired();});state->opens.push_back(file);
             return {mapped.key,file,file->information().metadata,0,true};
         }
     }
@@ -1391,7 +1421,7 @@ OpenHostFile ReadOnlyFiles::open_host(std::string path,std::uint32_t access,std:
 #if defined(__APPLE__)
     if(!readable && !writable)flags=(flags&~O_ACCMODE)|O_EVTONLY;
 #endif
-    if(existed && S_ISDIR(previous.st_mode)) {if(!(flags_value&0x02000000U) || writable || disposition!=3)return {parent.key,{},{},5,true};flags|=O_DIRECTORY;}
+    if(existed && S_ISDIR(previous.st_mode)) {if(!(flags_value&0x02000000U) || disposition!=3)return {parent.key,{},{},5,true};flags=(flags&~O_ACCMODE)|O_RDONLY|O_DIRECTORY;}
     FileDescriptor fd;std::vector<std::uint8_t> security;
     const bool can_create=disposition==1 || disposition==2 || disposition==4;
     if(existed && disposition!=1)fd.value=::openat(directory.value,leaf.c_str(),flags);
@@ -1437,7 +1467,7 @@ OpenHostFile ReadOnlyFiles::open_host(std::string path,std::uint32_t access,std:
         // 新建立物件依父層 CREATE 權限授予首次 handle；新 DACL 僅限制後續開啟。
     }
     if(!S_ISREG(info.st_mode) && !S_ISDIR(info.st_mode))return {parent.key,{},{},5,existed};
-    if(S_ISDIR(info.st_mode) && (!(flags_value&0x02000000U) || writable || disposition!=3))return {parent.key,{},{},5,existed};
+    if(S_ISDIR(info.st_mode) && (!(flags_value&0x02000000U) || disposition!=3))return {parent.key,{},{},5,existed};
     if(deleting && S_ISDIR(info.st_mode))return {parent.key,{},{},50,existed};
     const auto details=metadata(info,fd.value);
     if(existed && writable && (details.attributes&1U))return {parent.key,{},{},5,true};

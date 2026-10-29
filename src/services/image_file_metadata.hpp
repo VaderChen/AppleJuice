@@ -129,7 +129,8 @@ public:
         if((resource_==0)!=(resource_size_==0))invalid();if(resource_)locate(resource_,resource_size_);
     }
     const PeHeader& header()const{return header_;}
-    std::optional<std::vector<std::uint8_t>> resource(std::uint16_t type,std::uint16_t id,std::size_t maximum,std::uint16_t language=0){
+    struct ResourceLocation {std::uint64_t rva{},size{};};
+    std::optional<ResourceLocation> resource_location(std::uint16_t type,std::uint16_t id,std::size_t maximum,std::uint16_t language=0){
         if(!resource_)return {};
         std::optional<Entry> selected;
         visit(0,[&](Entry entry){if(entry.name==type || named_type(entry.name,type)){selected=entry;return false;}return true;});
@@ -147,7 +148,11 @@ public:
         const auto rva=integer(at,4),size=integer(std::uint64_t{at}+4,4);
         if(integer(std::uint64_t{at}+12,4))invalid();
         locate(rva,size);if(size>maximum)throw SecurityDescriptorError{14001};
-        std::vector<std::uint8_t> payload(static_cast<std::size_t>(size));read_rva(rva,payload);return payload;
+        return ResourceLocation{rva,size};
+    }
+    std::optional<std::vector<std::uint8_t>> resource(std::uint16_t type,std::uint16_t id,std::size_t maximum,std::uint16_t language=0){
+        const auto location=resource_location(type,id,maximum,language);if(!location)return {};
+        std::vector<std::uint8_t> payload(static_cast<std::size_t>(location->size));read_rva(location->rva,payload);return payload;
     }
 private:
     struct Section{std::uint64_t rva{},size{},raw{},raw_size{};};

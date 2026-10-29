@@ -23,6 +23,8 @@ std::span<const WindowsServiceDescriptor> registered_wait_service_descriptors(){
         {"kernel32.dll","LeaveCriticalSectionWhenCallbackReturns",2},{"kernel32.dll","FreeLibraryWhenCallbackReturns",2}
     };return table;
 }
+#include "windows_wait_completion.inc"
+
 void WindowsServices::release_registered_wait(std::uint64_t handle){
     const auto found=registered_waits_.find(handle);if(found==registered_waits_.end())return;
     const auto registration=found->second;auto& worker=threads_.items.at(registration.worker);

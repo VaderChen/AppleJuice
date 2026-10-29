@@ -42,6 +42,8 @@ std::uint32_t error(){switch(errno){case ENOENT:return 2;case ENOTDIR:return 3;c
 #if defined(__APPLE__)
 constexpr auto namespace_attribute="com.x64arm.volumes";
 constexpr auto mount_attribute="com.x64arm.volume-mount";
+constexpr auto properties_attribute="com.x64arm.volume-properties";
+constexpr std::array<std::uint8_t,8> properties_magic{'x','6','4','v','p','r',1,0};
 constexpr std::array<std::uint8_t,8> namespace_magic{'x','6','4','v','o','l',1,0};
 constexpr std::array<std::uint8_t,8> mount_magic{'x','6','4','m','n','t',1,0};
 constexpr std::size_t max_bytes=65536,max_mounts=1024;
@@ -97,7 +99,27 @@ struct FileVolumes::Impl {
 #endif
     }
     FileVolumeState defaults() const{FileVolumeState state;for(const auto& [id,root]:roots){(void)root;state.drives.emplace(id,id);}return state;}
+    FileVolumeProperties default_properties(char id) const {
+        FileVolumeProperties value;const auto& root=roots.at(id)->volume;
+        // 卷物件 ID 與掛載別名分離；未曾設定時由固定的卷身分產生。
+        for(unsigned i=0;i<8;++i){value.object_id[i]=static_cast<std::uint8_t>((root.device^UINT64_C(0x786634766f6c756d))>>(8*i));value.object_id[i+8]=static_cast<std::uint8_t>(root.inode>>(8*i));}
+        value.object_id[7]=static_cast<std::uint8_t>((value.object_id[7]&15U)|0x50U);value.object_id[8]=static_cast<std::uint8_t>((value.object_id[8]&63U)|0x80U);return value;
+    }
 #if defined(__APPLE__)
+    FileVolumeProperties load_properties(char id) const try {
+        auto value=default_properties(id);const auto stored=attribute(roots.at(id)->descriptor.value,properties_attribute);
+        if(stored.second==4390)return value;if(stored.second){value.error=stored.second;return value;}
+        Reader reader{stored.first};const auto magic=reader.take(8);if(!std::equal(magic.begin(),magic.end(),properties_magic.begin()))throw std::invalid_argument("卷屬性格式不符");
+        const auto count=reader.get(4);if(count>32)throw std::invalid_argument("卷標長度不符");
+        value.label.clear();for(std::uint64_t i=0;i<count;++i)value.label.push_back(static_cast<char16_t>(reader.get(2)));
+        const auto object=reader.take(64);std::copy(object.begin(),object.end(),value.object_id.begin());
+        if(reader.at!=reader.bytes.size())throw std::invalid_argument("卷屬性有額外資料");return value;
+    }catch(const std::invalid_argument&){FileVolumeProperties value;value.error=13;return value;}
+    std::uint32_t save_properties(char id,const FileVolumeProperties& value) const {
+        std::vector<std::uint8_t> bytes(properties_magic.begin(),properties_magic.end());put(bytes,value.label.size(),4);
+        for(const auto c:value.label)put(bytes,c,2);bytes.insert(bytes.end(),value.object_id.begin(),value.object_id.end());
+        return ::fsetxattr(roots.at(id)->descriptor.value,properties_attribute,bytes.data(),bytes.size(),0,0)<0?error():0;
+    }
     FileVolumeState load() const try {
         auto state=defaults();if(roots.empty())return state;
         const auto stored=attribute(owner(),namespace_attribute);if(stored.second==4390)return state;if(stored.second)return {{},{},stored.second};
@@ -186,6 +208,36 @@ FileVolumeState FileVolumes::snapshot() const {
     return impl_->defaults();
 #endif
 }
+FileVolumeProperties FileVolumes::properties(char volume) const try {
+    if(!impl_->roots.contains(volume)){FileVolumeProperties value;value.error=3;return value;}
+#if defined(__APPLE__)
+    Lock lock(impl_->mutex,impl_->roots.at(volume)->descriptor.value,false);
+    if(lock.error){FileVolumeProperties value;value.error=lock.error;return value;}
+    return impl_->load_properties(volume);
+#else
+    return impl_->default_properties(volume);
+#endif
+}catch(const std::bad_alloc&){FileVolumeProperties value;value.error=8;return value;}
+std::uint32_t FileVolumes::set_label(char volume,std::u16string label,bool writable) try {
+    if(!writable)return 5;if(!impl_->roots.contains(volume))return 3;
+    if(label.size()>32)return 154;
+    for(const auto c:label)if(c<32 || std::u16string_view(u"\\/:*?\"<>|").find(c)!=std::u16string_view::npos)return 123;
+#if defined(__APPLE__)
+    Lock lock(impl_->mutex,impl_->roots.at(volume)->descriptor.value,true);if(lock.error)return lock.error;
+    auto value=impl_->load_properties(volume);if(value.error)return value.error;value.label=std::move(label);return impl_->save_properties(volume,value);
+#else
+    return 50;
+#endif
+}catch(const std::bad_alloc&){return 8;}
+std::uint32_t FileVolumes::set_object_id(char volume,const std::array<std::uint8_t,64>& object,bool writable) try {
+    if(!writable)return 5;if(!impl_->roots.contains(volume))return 3;
+#if defined(__APPLE__)
+    Lock lock(impl_->mutex,impl_->roots.at(volume)->descriptor.value,true);if(lock.error)return lock.error;
+    auto value=impl_->load_properties(volume);if(value.error)return value.error;value.object_id=object;return impl_->save_properties(volume,value);
+#else
+    (void)object;return 50;
+#endif
+}catch(const std::bad_alloc&){return 8;}
 FileVolumeOpen FileVolumes::open_root(char volume,bool metadata_only) const{
 #if defined(__APPLE__)
     if(metadata_only){if(!impl_->roots.contains(volume))return {-1,3};const auto fd=::openat(impl_->roots.at(volume)->descriptor.value,".",O_SEARCH|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);return {fd,fd<0?error():0U};}

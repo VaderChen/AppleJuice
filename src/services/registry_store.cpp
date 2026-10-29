@@ -193,7 +193,7 @@ RegistryTransaction::RegistryTransaction(RegistryState& state,const std::filesys
         static_cast<unsigned long long>(cache_->hits),cache_->bytes.size(),cache_->byte_path==path && cache_->byte_stamp==stamp);
     try {
         Reader reader{data};if(reader.number(8)!=UINT64_C(0x314745524d524158))throw std::runtime_error("未知登錄格式");
-        const auto version=reader.number(4);if(version<1 || version>3)throw std::runtime_error("未知登錄版本");
+        const auto version=reader.number(4);if(version<1 || version>4)throw std::runtime_error("未知登錄版本");
         RegistryState loaded;const auto count=reader.number(4);if(count>4096)throw std::runtime_error("登錄索引過多");
         for(std::uint64_t i=0;i<count;++i){
             const auto key_path=reader.text();if(key_path.empty() || key_path[0]>6 || key_path[0]==4 || loaded.keys.contains(key_path))throw std::runtime_error("無效登錄索引");
@@ -209,8 +209,12 @@ RegistryTransaction::RegistryTransaction(RegistryState& state,const std::filesys
             if(version>=3){auto class_name=reader.text();if(!class_name.empty())loaded.classes.emplace(key_path,std::move(class_name));const auto options=reader.number(4);if(options>1)throw std::runtime_error("登錄選項無效");if(options)loaded.volatile_keys.insert(key_path);}
         }
         if(version>=3){const auto mounts=reader.number(4);if(mounts>128)throw std::runtime_error("掛載 hive 過多");
-            for(std::uint64_t i=0;i<mounts;++i){const auto mount_root=reader.text();RegistryHiveMount mount;mount.source=reader.text();mount.device=reader.number(8);mount.id=reader.number(8);mount.minor=static_cast<std::uint32_t>(reader.number(4));
-                if(!loaded.keys.contains(mount_root) || loaded.hives.contains(mount_root) || mount.source.empty() || !mount.id || (mount.minor!=3 && mount.minor!=5))throw std::runtime_error("掛載 hive 紀錄無效");loaded.hives.emplace(mount_root,std::move(mount));}}
+            for(std::uint64_t i=0;i<mounts;++i){const auto mount_root=reader.text();RegistryHiveMount mount;mount.source=reader.text();mount.device=reader.number(8);mount.id=reader.number(8);mount.minor=static_cast<std::uint32_t>(reader.number(4));if(version>=4)mount.flags=static_cast<std::uint32_t>(reader.number(4));
+                if(!loaded.keys.contains(mount_root) || loaded.hives.contains(mount_root) || mount.source.empty() || !mount.id || (mount.minor!=3 && mount.minor!=5) || (mount.flags&~4U))throw std::runtime_error("掛載 hive 紀錄無效");loaded.hives.emplace(mount_root,std::move(mount));}}
+        if(version>=4){const auto replacement_count=reader.number(4);if(replacement_count>128)throw std::runtime_error("待替換 hive 過多");
+            for(std::uint64_t i=0;i<replacement_count;++i){auto root=reader.text();const auto size=reader.number(4);
+                if(!loaded.keys.contains(root) || loaded.replacements.contains(root) || !size || size>limit || size>data.size()-reader.offset)throw std::runtime_error("待替換 hive 無效");
+                loaded.replacements.emplace(std::move(root),std::vector<std::uint8_t>(data.begin()+static_cast<std::ptrdiff_t>(reader.offset),data.begin()+static_cast<std::ptrdiff_t>(reader.offset+size)));reader.offset+=size;}}
         if(reader.offset!=data.size())throw std::runtime_error("登錄檔有未解析資料");
         loaded.handles=std::move(state.handles);loaded.next_handle=state.next_handle;state=std::move(loaded);
         if(cache_){
@@ -231,7 +235,7 @@ RegistryTransaction::~RegistryTransaction(){
 std::uint32_t RegistryTransaction::commit(){
     if(error)return error;if(path_.empty())return 0;
     RegistryTrace trace("serialize");
-    const unsigned version=state_.classes.empty() && state_.volatile_keys.empty() && state_.hives.empty()?2U:3U;
+    const unsigned version=!state_.replacements.empty() || std::any_of(state_.hives.begin(),state_.hives.end(),[](const auto& item){return item.second.flags;})?4U:state_.classes.empty() && state_.volatile_keys.empty() && state_.hives.empty()?2U:3U;
     const auto generated=[&](const std::u16string& path){return std::any_of(state_.generated_keys.begin(),state_.generated_keys.end(),[&](const auto& root){return path==root || path.starts_with(root+u"\\");});};
     const auto key_count=static_cast<std::uint64_t>(std::count_if(state_.keys.begin(),state_.keys.end(),[&](const auto& item){return !generated(item.first);}));
     std::vector<std::uint8_t> data;number(data,UINT64_C(0x314745524d524158),8);number(data,version,4);number(data,key_count,4);
@@ -244,7 +248,9 @@ std::uint32_t RegistryTransaction::commit(){
         if(version>=3){const auto item=state_.classes.find(path);text(data,item==state_.classes.end()?std::u16string{}:item->second);number(data,state_.volatile_keys.contains(path)?1:0,4);}
         if(data.size()>limit)return 8;
     }
-    if(version>=3){if(state_.hives.size()>128)return 8;number(data,state_.hives.size(),4);for(const auto& [path,mount]:state_.hives){if(!state_.keys.contains(path) || mount.source.empty() || !mount.id || (mount.minor!=3 && mount.minor!=5))return 13;text(data,path);text(data,mount.source);number(data,mount.device,8);number(data,mount.id,8);number(data,mount.minor,4);}}
+    if(version>=3){if(state_.hives.size()>128)return 8;number(data,state_.hives.size(),4);for(const auto& [path,mount]:state_.hives){if(!state_.keys.contains(path) || mount.source.empty() || !mount.id || (mount.minor!=3 && mount.minor!=5))return 13;text(data,path);text(data,mount.source);number(data,mount.device,8);number(data,mount.id,8);number(data,mount.minor,4);if(version>=4)number(data,mount.flags,4);}}
+    if(version>=4){if(state_.replacements.size()>128)return 8;number(data,state_.replacements.size(),4);
+        for(const auto& [root,bytes]:state_.replacements){if(!state_.keys.contains(root) || bytes.empty() || bytes.size()>limit)return 13;text(data,root);number(data,bytes.size(),4);data.insert(data.end(),bytes.begin(),bytes.end());if(data.size()>limit)return 8;}}
     if(data.size()>limit)return 8;
     trace.next("prepare_io");
     const auto io_path=path_;const bool want_stamp=cache_!=nullptr;

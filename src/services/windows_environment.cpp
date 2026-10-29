@@ -11,6 +11,7 @@
 #include "x64arm/registry_store.hpp"
 #include "appcontainer_identity.hpp"
 #include "x64arm/system_performance.hpp"
+#include "windows_process_parameter_layout.hpp"
 #include <algorithm>
 #include <bit>
 #include <functional>
@@ -89,6 +90,10 @@ std::vector<std::uint8_t> processor_relationships(std::uint32_t requested,unsign
 }
 std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+        {"ntdll.dll","RtlCreateProcessParameters",10},{"ntdll.dll","RtlCreateProcessParametersEx",11},
+        {"ntdll.dll","RtlCreateProcessParametersWithTemplate",12},
+        {"ntdll.dll","RtlDestroyProcessParameters",1},{"ntdll.dll","RtlNormalizeProcessParams",1},
+        {"ntdll.dll","RtlDeNormalizeProcessParams",1},
         {"userenv.dll","GetProfilesDirectoryA",2},{"userenv.dll","GetProfilesDirectoryW",2},
         {"userenv.dll","GetDefaultUserProfileDirectoryA",2},{"userenv.dll","GetDefaultUserProfileDirectoryW",2},
         {"userenv.dll","GetAllUsersProfileDirectoryA",2},{"userenv.dll","GetAllUsersProfileDirectoryW",2},
@@ -202,6 +207,7 @@ void WindowsServices::discard_policy_thread(std::uint64_t thread){
 std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     if(service.symbol.starts_with("Power") || service.symbol=="GetPwrCapabilities" || service.symbol=="SetThreadExecutionState" || service.symbol=="SetSystemPowerState" || service.symbol=="GetActivePwrScheme" || service.symbol=="EnumPwrSchemes" || service.symbol=="GetDevicePowerState")return invoke_power(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
+#include "windows_process_parameters.inc"
 #include "policy_handlers.inc"
 #include "appcontainer_handlers.inc"
     const bool wide=symbol.back()=='W' || symbol.starts_with("_w");

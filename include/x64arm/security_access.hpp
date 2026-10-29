@@ -10,6 +10,11 @@ std::uint32_t mapped_access(std::uint32_t,const AccessMapping&);
 std::uint32_t creation_access(std::uint32_t,const AccessMapping&);
 bool token_sid_matches(const VirtualToken&,const Bytes&,bool deny,bool restricting=false);
 std::uint32_t token_acl_access(const VirtualToken&,const SecurityDescriptor&,std::uint32_t,const AccessMapping&);
+struct AccessCheckResult {
+    std::uint32_t granted{},error{};
+    std::vector<TokenPrivilege> privileges;
+};
+AccessCheckResult access_check(const VirtualToken&,const SecurityDescriptor&,std::uint32_t,const AccessMapping&);
 std::uint32_t integrity_access(const VirtualToken&,const SecurityDescriptor&,std::uint32_t,const AccessMapping&);
 std::uint32_t duplicate_object_access(const VirtualToken&,const SecurityDescriptor&,std::uint32_t source,std::uint32_t desired,const AccessMapping&);
 std::uint32_t object_access(const VirtualToken&,const SecurityDescriptor&,std::uint32_t,const AccessMapping&);

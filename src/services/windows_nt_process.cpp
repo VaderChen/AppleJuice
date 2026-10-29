@@ -21,6 +21,7 @@ std::uint32_t native_status(std::uint32_t error){
 std::span<const WindowsServiceDescriptor> nt_process_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"ntdll.dll","NtQueryInformationProcess",5,0,0,0xa}, {"ntdll.dll","ZwQueryInformationProcess",5,0,0,0xa},
+        {"ntdll.dll","NtWow64QueryInformationProcess64",5,0,0,0xa}, {"ntdll.dll","ZwWow64QueryInformationProcess64",5,0,0,0xa},
         {"ntdll.dll","NtSuspendProcess",1}, {"ntdll.dll","ZwSuspendProcess",1},
         {"ntdll.dll","NtResumeProcess",1}, {"ntdll.dll","ZwResumeProcess",1},
         {"ntdll.dll","NtQueryInformationThread",5,0,0,0xa}, {"ntdll.dll","ZwQueryInformationThread",5,0,0,0xa},
@@ -100,10 +101,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_process(GuestState& stat
             if(!error && suspending && pid==process_id())schedule(state,memory);
             return result;
         }
-        const auto cls=static_cast<std::uint32_t>(call(1));const bool process=service.symbol.ends_with("Process"),setting=service.symbol.find("SetInformation")!=service.symbol.npos;
-        const auto unit=x86_?4U:8U;
+        const bool query64=service.symbol.ends_with("Wow64QueryInformationProcess64");
+        const auto cls=static_cast<std::uint32_t>(call(1));const bool process=query64 || service.symbol.ends_with("Process"),setting=service.symbol.find("SetInformation")!=service.symbol.npos;
+        const bool narrow=x86_ && !query64;const auto unit=narrow?4U:8U;
         const auto length=static_cast<std::uint32_t>(call(3));const auto output=call(2);
         if(!setting && call(4))memory.check(GuestAddress{call(4)},4,Access::Write);
+        if(query64 && cls!=0 && cls!=20 && cls!=26 && cls!=27 && cls!=58)return finish(0xc0000003U);
+        if(query64 && cls==0 && length<48){if(call(4))memory.store(GuestAddress{call(4)},32,48);return finish(0xc0000004U);}
         std::array<std::uint64_t,5> values{};std::uint32_t pid{},bits{};std::uint64_t tid{},birth{};std::uint32_t error=0;
         if(process){error=process_basic_information(memory,call(0),values,pid,bits);if(error)return finish(error==6 && !object_type(call(0)).empty()?0xc0000024U:native_status(error));}
         else {
@@ -135,8 +139,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_process(GuestState& stat
         std::vector<std::uint8_t> bytes;
         const auto put=[&](unsigned offset,unsigned width,std::uint64_t value){for(unsigned n=0;n<width;++n)bytes.at(offset+n)=static_cast<std::uint8_t>(value>>(n*8));};
         if(cls==0){
-            bytes.resize(process?unit*6U:x86_?28U:48U);put(0,4,values[0]);
-            if(x86_ && (values[1]>UINT32_MAX || values[2]>UINT32_MAX))return finish(0xc00000bbU);
+            // 32 位元程序目前沒有原生 64 位元 PEB；不得把 PEB32 位址包成 PEB64。
+            if(query64 && bits==32)return finish(0xc00000bbU);
+            bytes.resize(process?unit*6U:narrow?28U:48U);put(0,4,values[0]);
+            if(narrow && (values[1]>UINT32_MAX || values[2]>UINT32_MAX))return finish(0xc00000bbU);
             put(unit,unit,values[1]);
             if(process){put(unit*2,unit,values[2]);put(unit*3,4,values[3]);put(unit*4,unit,pid);put(unit*5,unit,values[4]);}
             else {put(unit*2,unit,pid);put(unit*3,unit,pid==process_id()?thread_identifier(tid):tid);put(unit*4,unit,values[2]);put(unit*5,4,values[3]);put(unit*5+4,4,values[4]);}
@@ -171,9 +177,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_process(GuestState& stat
             if(pid==process_id())error=local_process_information(6,values,bits,fd);
             else {std::uint32_t target_pid{};error=process_memory_target(memory,call(0),0x400U,target_pid,birth);if(error==5)error=process_memory_target(memory,call(0),0x1000U,target_pid,birth);if(!error)error=remote_process_request(memory,pid,birth,14,6,values,bits,fd);}
             if(error)return finish(native_status(error));if(values[0]<2 || values[0]>65534 || values[0]%2)return finish(0xc000000dU);
-            const auto header=x86_?8U:16U;bytes.resize(header+values[0]);
+            const auto header=narrow?8U:16U;bytes.resize(header+values[0]);
             std::size_t done=0;while(done<values[0]){const auto count=::pread(fd,bytes.data()+header+done,static_cast<std::size_t>(values[0]-done),static_cast<off_t>(done));if(count<0 && errno==EINTR)continue;if(count<=0)return finish(0xc000000dU);done+=static_cast<std::size_t>(count);}
-            put(0,2,values[0]-2);put(2,2,values[0]);put(x86_?4U:8U,unit,output+header);
+            put(0,2,values[0]-2);put(2,2,values[0]);put(narrow?4U:8U,unit,output+header);
 #else
             return finish(0xc00000bbU);
 #endif

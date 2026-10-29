@@ -13,12 +13,19 @@
 #include "x64arm/network_registry.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "registry_hive.hpp"
+#include "registry_native_status.hpp"
+#include "x64arm/windows_paths.hpp"
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 namespace x64arm {
 #include "windows_registry_io.inc"
 void WindowsServices::set_registry_file(std::filesystem::path path) {
     registry_file_=std::move(path);
     if(registry_file_.empty() || !runtime_.network.external_io) return;
+    initialize_registry_session();
     // 初始化與其他程序的讀寫共用 RegistryTransaction 的鎖及原子提交。
     RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_);
     if(transaction.error) return; // API 呼叫仍以同一後端回報實際 I/O 錯誤。
@@ -58,6 +65,8 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
         {"advapi32.dll","RegSaveKeyA",3},{"advapi32.dll","RegSaveKeyW",3},
         {"advapi32.dll","RegSaveKeyExA",4,0,0,8},{"advapi32.dll","RegSaveKeyExW",4,0,0,8},
         {"advapi32.dll","RegLoadKeyA",3},{"advapi32.dll","RegLoadKeyW",3},
+        {"advapi32.dll","RegRestoreKeyA",3,0,0,4},{"advapi32.dll","RegRestoreKeyW",3,0,0,4},
+        {"advapi32.dll","RegReplaceKeyA",4},{"advapi32.dll","RegReplaceKeyW",4},
         {"advapi32.dll","RegUnLoadKeyA",2},{"advapi32.dll","RegUnLoadKeyW",2},
         {"advapi32.dll","RegConnectRegistryA",3},{"advapi32.dll","RegConnectRegistryW",3},
         {"advapi32.dll","RegDisableReflectionKey",1},{"advapi32.dll","RegEnableReflectionKey",1},{"advapi32.dll","RegQueryReflectionKey",2},
@@ -65,12 +74,15 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
         {"ntdll.dll","NtQueryKey",5,0,0,0xa},{"ntdll.dll","NtEnumerateKey",6,0,0,0x16},
         {"ntdll.dll","NtQueryValueKey",6,0,0,0x14},{"ntdll.dll","NtEnumerateValueKey",6,0,0,0x16},{"ntdll.dll","NtSetValueKey",6,0,0,0x2c},
         {"ntdll.dll","NtQueryMultipleValueKey",6,0,0,0x4},{"ntdll.dll","NtSetInformationKey",4,0,0,0xa},
+        {"ntdll.dll","NtNotifyChangeKey",10,0,0,0x360},
+        {"ntdll.dll","NtLoadKey",2},{"ntdll.dll","NtLoadKey2",3,0,0,4},{"ntdll.dll","NtUnloadKey",1},
+        {"ntdll.dll","NtSaveKey",2},{"ntdll.dll","NtRestoreKey",3,0,0,4},{"ntdll.dll","NtReplaceKey",3},
         {"ntdll.dll","NtDeleteValueKey",2},{"ntdll.dll","NtDeleteKey",1},{"ntdll.dll","NtFlushKey",1},{"ntdll.dll","NtClose",1}
     };return table;
 }
 #include "windows_registry_hive.inc"
 #include "windows_registry_values.inc"
-void WindowsServices::poll_registry_notifications(bool reload,std::u16string_view mutation,std::uint32_t filter) {
+void WindowsServices::poll_registry_notifications(bool reload,std::u16string_view mutation,std::uint32_t filter,GuestMemory* memory) {
     if(registry_notifications_.empty())return;
     auto& registry=runtime_.registry;
     bool compare_snapshots=!registry_io_busy_ && (!reload || registry_file_.empty());
@@ -79,16 +91,20 @@ void WindowsServices::poll_registry_notifications(bool reload,std::u16string_vie
         if(now>=registry_poll_time_+100){RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return;registry_poll_time_=now;compare_snapshots=true;}
     }
     for(auto it=registry_notifications_.begin();it!=registry_notifications_.end();) {
-        const auto& watch=it->second;
+        auto& watch=it->second;
         const auto thread=threads_.items.find(watch.thread);
         const bool root=watch.key>=0x80000000U && watch.key<=0x80000006U;
-        bool changed=(!root && !registry.handles.contains(watch.key)) || (!registry_io_busy_ && !registry.keys.contains(watch.path)) ||
-            (!(watch.filter&0x10000000U) && (thread==threads_.items.end() || thread->second.status==ThreadStatus::Exited));
+        const bool closed=!root && !registry.handles.contains(watch.key);
+        const bool removed=!registry_io_busy_ && (!registry.keys.contains(watch.path) || (!root && !closed && registry.handles.at(watch.key).path!=watch.path));
+        const bool exited=thread==threads_.items.end() || thread->second.status==ThreadStatus::Exited;
+        bool changed=watch.completion_status!=0x103U || closed || removed ||
+            (!(watch.filter&0x10000000U) && exited);
         // 背景排程每個時間片都會輪詢；只有比對變更路徑或快照時才需要組出子鍵前綴。
         if(!changed && !registry_io_busy_ && ((filter&watch.filter) || compare_snapshots)) {
             const auto prefix=watch.path+u"\\";
             const auto within=[&](std::u16string_view path){return path==watch.path || (watch.subtree && path.starts_with(prefix));};
-            if((filter&watch.filter) && within(mutation))changed=true;
+            // Native LAST_SET 以值內容判定；寫入交易本身可能仍更新時間戳，不能冒充內容變更。
+            if((filter&watch.filter&(watch.native_iosb?~4U:UINT32_MAX)) && within(mutation))changed=true;
             const auto relevant=[&](std::u16string_view path){return within(path) || ((watch.filter&1) && path.starts_with(prefix) && path.find(u'\\',prefix.size())==std::u16string_view::npos);};
             // API 內的交易／變更立即比對；宿主登錄檔尚未重載時不重掃相同快照。
             // 關閉 handle 與執行緒退出仍在每次輪詢檢查。
@@ -109,10 +125,28 @@ void WindowsServices::poll_registry_notifications(bool reload,std::u16string_vie
             }
         }
         if(!changed){++it;continue;}
+        if(watch.native_iosb){
+            if(watch.completion_status==0x103U)watch.completion_status=closed?0x10bU:removed?0xc000017cU:exited?0xc0000120U:0;
+            // 沒有客體記憶體的內部寫入者只標記完成；排程入口發布 IOSB 後才通知。
+            if(!memory){++it;continue;}
+            try{const auto unit=x86_?4U:8U;memory->check(GuestAddress{watch.native_iosb},2*unit,Access::Write);
+                memory->store(GuestAddress{watch.native_iosb},static_cast<std::uint8_t>(unit*8),watch.completion_status);
+                memory->store(GuestAddress{watch.native_iosb+unit},static_cast<std::uint8_t>(unit*8),0);
+            }catch(const MemoryFault&){watch.completion_status=0xc0000005U;}
+            if(!watch.event)if(const auto key=registry.handles.find(watch.key);key!=registry.handles.end())key->second.notify_signaled=true;
+            if(!exited){
+                auto& target=thread->second;
+                if(watch.routine && !target.terminating){target.apcs.push_back({watch.routine,{watch.context,watch.native_iosb,0}});threads_.yield=true;}
+                if(target.wait.kind==ThreadWaitKind::RegistryNotify && !target.wait.handles.empty() && target.wait.handles[0]==it->first){
+                    target.wait.handles.resize(2);target.wait.handles[1]=watch.completion_status;
+                }
+            }
+        }
         if(watch.event){const auto event=runtime_.wait_objects.find(watch.event);if(event!=runtime_.wait_objects.end())event->second.set_signal(true);}
         it=registry_notifications_.erase(it);
     }
 }
+#include "windows_registry_notify.inc"
 std::u16string WindowsServices::registry_current_user_path(bool cached){
     initialize_tokens();
     const bool cache=cached && !runtime_.registry_cache_disabled && !runtime_.registry_user_cache_disabled;
@@ -131,7 +165,8 @@ std::u16string WindowsServices::registry_current_user_path(bool cached){
 std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     // 僅登錄 API 家族保留原生堆疊讓出 I/O；其他 consumer 在共同入口等待 store 門閂。
     RegistryIoScope io([&](const auto& work){await_registry_io(state,memory,work);});
-    if(service.symbol.starts_with("RegSaveKey") || service.symbol.starts_with("RegLoadKey") || service.symbol.starts_with("RegUnLoadKey") || service.symbol.starts_with("RegConnectRegistry"))return invoke_registry_hive(state,memory,service);
+    if(service.symbol=="RegNotifyChangeKeyValue" || service.symbol=="NtNotifyChangeKey")return invoke_registry_notify(state,memory,service);
+    if(service.symbol.starts_with("RegSaveKey") || service.symbol.starts_with("RegLoadKey") || service.symbol.starts_with("RegUnLoadKey") || service.symbol.starts_with("RegConnectRegistry") || service.symbol.starts_with("RegRestoreKey") || service.symbol.starts_with("RegReplaceKey") || service.symbol=="NtLoadKey" || service.symbol=="NtLoadKey2" || service.symbol=="NtUnloadKey" || service.symbol=="NtSaveKey" || service.symbol=="NtRestoreKey" || service.symbol=="NtReplaceKey")return invoke_registry_hive(state,memory,service);
     if(service.symbol=="RegGetKeySecurity" || service.symbol=="RegSetKeySecurity")return invoke_registry_security(state,memory,service);
     if(service.family=="ntdll.dll")return invoke_nt_registry(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;auto& registry=runtime_.registry;
@@ -149,17 +184,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         arg.return_to(state,0);return std::nullopt;
     }
     if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
-    if(symbol=="RegNotifyChangeKeyValue" && !arg(4)){
-        auto& thread=threads_.items.at(threads_.current);
-        if(thread.wait.kind==ThreadWaitKind::RegistryNotify && thread.wait.signaled){thread.wait={};arg.return_to(state,0);return std::nullopt;}
-    }
     const bool readonly=symbol.starts_with("RegOpen") || symbol.starts_with("RegQuery") || symbol.starts_with("RegGet") ||
         symbol.starts_with("RegEnum") || symbol=="RegCloseKey" || symbol=="RegNotifyChangeKeyValue";
     auto transaction=std::make_unique<RegistryTransaction>(registry,registry_file_,&registry_store_cache_,readonly);
     if(transaction->error){zero_failure(transaction->error);arg.return_to(state,transaction->error);return std::nullopt;}
     refresh_processor_registry(registry,memory.processor_count(),guest_processor_information(memory));
     initialize_registry_views(registry);
-    poll_registry_notifications(false);
+    poll_registry_notifications(false,{},0,&memory);
     std::vector<std::pair<std::u16string,std::uint32_t>> mutations;
     bool changed=false;
     auto before_transaction=(!key_value && registry_file_.empty()) || readonly?RegistryState{}:registry;
@@ -169,7 +200,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     } rollback{registry,before_transaction,changed,key_value};
     const auto done=[&](std::uint32_t result)->std::optional<std::uint32_t>{
         if(!result && changed){result=commit_registry_transaction(*transaction);if(result && !registry_file_.empty())registry=before_transaction;}
-        if(!result){for(const auto& [path,filter]:mutations)poll_registry_notifications(false,path,filter);poll_registry_notifications(false);}
+        if(!result){for(const auto& [path,filter]:mutations)poll_registry_notifications(false,path,filter,&memory);poll_registry_notifications(false,{},0,&memory);}
         rollback.accepted=!result;zero_failure(result);arg.return_to(state,result);return std::nullopt;
     };
     if(get_value){
@@ -205,7 +236,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     else {
         const auto found=registry.handles.find(arg(0));if(found==registry.handles.end())return done(6);handle=found->second;
     }
-    if(symbol=="RegCloseKey") {if(!predefined){registry.handles.erase(arg(0));runtime_.handle_flags.erase(arg(0));poll_registry_notifications(false);}return done(0);}
+    if(symbol=="RegCloseKey") {if(!predefined){registry.handles.erase(arg(0));runtime_.handle_flags.erase(arg(0));poll_registry_notifications(false,{},0,&memory);}return done(0);}
     if(!registry.keys.contains(handle.path))return done(1018);
     // Windows 7 起使用共享鍵及 WOW64 重導向，不再對任何鍵進行 reflection。
     // 仍驗證 handle／存活鍵及輸出記憶體；啟用或停用不改變共享鍵語義。
@@ -293,33 +324,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         if(extended){memory.store(GuestAddress{arg(3)},32,size);if(arg(6))memory.store(GuestAddress{arg(6)},32,0);if(arg(5))memory.store(GuestAddress{arg(5)},wide?16:8,0);
             if(arg(7)){const auto& path=physical_children[index];memory.store(GuestAddress{arg(7)},64,registry.modified_times.contains(path)?registry.modified_times.at(path):runtime_.filetime_base);}}
         return done(0);
-    }
-    if(symbol=="RegNotifyChangeKeyValue") {
-        const auto filter=static_cast<std::uint32_t>(arg(2));
-        if(!(handle.access&0x10))return done(5);
-        if(!(filter&15) || (filter&~0x1000000fU))return done(87);
-        if(arg(4)) {
-            const auto event=runtime_.wait_objects.find(arg(3));
-            if(event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event)return done(6);
-            if(!(event->second.access&2))return done(5);
-        }
-        if(registry_notifications_.size()>=128)return done(8);
-        RegistryNotification watch;watch.key=predefined?root:arg(0);watch.event=arg(4)?arg(3):0;watch.thread=threads_.current;
-        watch.path=handle.path;watch.filter=filter;watch.subtree=arg(1)!=0;
-        const auto prefix=handle.path+u"\\";
-        for(const auto& [path,values]:registry.keys)if(path==handle.path || (path.starts_with(prefix) && (watch.subtree || ((filter&1) && path.find(u'\\',prefix.size())==std::u16string::npos)))){
-            // 名稱／屬性／權限通知只需鍵清單，避免無用地複製完整值 payload。
-            const bool data=(filter&4U) && (path==handle.path || watch.subtree);
-            RegistryNotification::KeySnapshot snapshot;
-            if(data)snapshot.values=values;
-            if(filter&2U)snapshot.modified=registry.modified_times.contains(path)?registry.modified_times.at(path):runtime_.filetime_base;
-            watch.snapshot.emplace(path,std::move(snapshot));
-        }
-        if(filter&8U)for(const auto& [path,values]:watch.snapshot){(void)values;watch.security_snapshot.emplace(path,registry_security_descriptor(path));}
-        const auto token=next_registry_notification_++;registry_notifications_.emplace(token,std::move(watch));
-        if(arg(4))return done(0);
-        auto& thread=threads_.items.at(threads_.current);thread.wait={};thread.wait.kind=ThreadWaitKind::RegistryNotify;thread.wait.handles={token};thread.status=ThreadStatus::Waiting;
-        transaction.reset();schedule(state,memory);return std::nullopt;
     }
     const bool shell_query=symbol.starts_with("SHGetValue");
     if(shell_query || get_value || legacy_query || delete_key_value){

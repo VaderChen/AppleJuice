@@ -10,6 +10,7 @@ namespace x64arm {
 class SharedWake;
 using PipeAccessCheck=std::function<std::uint32_t(const std::vector<std::uint8_t>&)>;
 struct PipeResult { std::uint32_t bytes{}, error{}; bool pending{}; };
+struct PipePeekInfo {std::uint32_t state{},available{},messages{},message_length{};};
 struct PipeInfo { std::uint32_t mode{}, maximum{}, output_size{}, input_size{}, timeout{}, instances{}, integrity{}, policy{}; };
 // session 內的本機 IPC；訊息與位元組管道共用有界佇列，不接觸宿主具名管道。
 class NamedPipe {
@@ -34,6 +35,7 @@ public:
     std::uint32_t disconnect();
     PipeResult read(std::span<std::uint8_t> output, bool message, bool peek = false,
                     std::uint32_t* available = nullptr, std::uint32_t* remaining = nullptr);
+    PipeResult peek(std::span<std::uint8_t>,PipePeekInfo&);
     PipeResult write(std::span<const std::uint8_t> input,bool nonblocking=false,WriteCompletion* completion=nullptr);
     PipeResult flush();
     // 要求與等待回覆在同一個 session 鎖內登錄；回覆完成後不受 Disconnect 影響。
@@ -54,6 +56,7 @@ public:
     std::uint64_t identity() const;
     static Opened inherit(const std::string& session,int descriptor,std::uint64_t identity,bool server);
 private:
+    PipeResult read_impl(std::span<std::uint8_t>,bool,bool,std::uint32_t*,std::uint32_t*,PipePeekInfo*);
     struct Impl;
     explicit NamedPipe(std::shared_ptr<Impl> value);
     std::shared_ptr<Impl> impl_;

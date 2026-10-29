@@ -303,6 +303,14 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
         if(!search_directory.empty() && (standard || (flags&0x100)))candidates.emplace_back(std::u16string(search_directory)+requested);
         if(standard || (flags&0x200))candidates.emplace_back(runtime_.application_directory+requested);
         if((standard || (flags&0x400)) && !runtime_.dll_directory.empty())candidates.emplace_back(runtime_.dll_directory+requested);
+        if(standard && !runtime_.native_dll_path.empty()){
+            std::u16string_view paths=runtime_.native_dll_path;
+            while(!paths.empty()){
+                const auto end=paths.find(u';');auto directory=paths.substr(0,end);
+                if(!directory.empty()){std::u16string candidate(directory);if(candidate.back()!=u'\\' && candidate.back()!=u'/')candidate.push_back(u'\\');candidates.emplace_back(candidate+requested);}
+                if(end==paths.npos)break;paths.remove_prefix(end+1);
+            }
+        }
         if(flags&0x400)for(const auto& [cookie,path]:runtime_.added_dll_directories){(void)cookie;candidates.emplace_back(path+requested);}
         if(standard || (flags&0x800))candidates.emplace_back(u"C:\\Windows\\System32\\"+requested);
         if(standard && !runtime_.exclude_current_dll_directory)candidates.push_back(requested);

@@ -116,7 +116,9 @@ class MetalGl final:public NativeOpenGlContext {
     std::uint64_t constant_upload_skips_{},constant_upload_saved_bytes_{};
     // 鍵為數百位元組的二進位欄位串接；有序 map 每次查找要做十幾次長字串比較，改為雜湊。
     std::unordered_map<std::string,id<MTLRenderPipelineState>> graphics_pipelines_;
-    std::unordered_map<MetalFastPipelineKey,id<MTLRenderPipelineState>,MetalFastPipelineHash> fast_pipelines_;
+    std::unordered_map<MetalFastPipelineKey,MetalFastPipeline,MetalFastPipelineHash> fast_pipelines_;
+    std::unordered_map<std::uint64_t,MetalPipelineInputs> pipeline_inputs_;
+    const MetalPipelineInputs* pipeline_inputs(const GraphicsDraw&);
     std::shared_ptr<MetalBufferPool> discard_pool_{std::make_shared<MetalBufferPool>()};std::uint64_t discard_in_place_{};
     MetalTimestampPool timestamp_pool_;
     // UAV 清除的來源緩衝（見 metal_unordered_clear.inc）。

@@ -139,6 +139,8 @@ bool WindowsServices::await_heap_service(GuestState& state,GuestMemory& memory,c
         "__x64arm_create_locale_legacy","__x64arm_wcreate_locale_legacy","__x64arm_current_locale_legacy",
         "__std_exception_copy","__std_exception_destroy","_dupenv_s","_wdupenv_s",
         "_putenv","_wputenv","_putenv_s","_wputenv_s",
+        "RtlCreateProcessParameters","RtlCreateProcessParametersEx","RtlCreateProcessParametersWithTemplate","RtlDestroyProcessParameters",
+        "NtCreateUserProcess","ZwCreateUserProcess",
         "__std_type_info_name","__std_type_info_destroy_list","??1type_info@@UEAA@XZ","??1type_info@@UAE@XZ",
         "LocalAlloc","LocalReAlloc","LocalFree","LocalSize","GlobalAlloc","GlobalReAlloc","GlobalFree","GlobalSize",
         "CopyImage","CreateDIBSection","CreateCompatibleBitmap","DeleteObject",

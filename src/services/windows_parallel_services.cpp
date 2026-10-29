@@ -166,6 +166,15 @@ bool parallel_wait_service(std::string_view symbol) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_WAIT");return value && std::string_view(value)=="1";}();
     return enabled && (symbol=="WaitForSingleObject" || symbol=="WaitForSingleObjectEx");
 }
+// 訊息佇列空閒時的 PeekMessage（x64）：協調者上一次 PeekMessage 抽完宿主事件仍無訊息後約 1 ms 內，佇列、送出訊息、
+// WinEvent、滑鼠命中測試、shell 通知與 hook 全空時在 worker 直接回 FALSE（不寫 MSG、不改 LastError）。期限過後交回協調者
+// 抽宿主事件、產生計時器訊息並刷新期限，宿主輸入與 WM_TIMER 最多晚約 1 ms。所有入列（enqueue_gui_message）與送出都在
+// 協調者持獨占映射鎖或全停時進行，worker 持共用鎖讀到的空佇列不會漏掉已完成的 PostMessage。電馭判客主執行緒每秒約
+// 2.1 萬次，每次往返協調者約 5 µs（占該執行緒約 11%）。X64ARM_PARALLEL_PEEK=0 關閉。
+bool parallel_peek_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_PEEK");return !value || std::string_view(value)!="0";}();
+    return enabled && (symbol=="PeekMessageW" || symbol=="PeekMessageA");
+}
 bool parallel_tick_clock_enabled() noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_TICK_CLOCK");return !value || std::string_view(value)!="0";}();
     return enabled;
@@ -197,6 +206,9 @@ inline void spin_pause() noexcept {
 }
 namespace x64arm::detail {
 const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,GuestAddress address) noexcept;
+std::size_t stub_service_count() noexcept;
+std::size_t stub_service_index(GuestAddress stub_base,GuestAddress address) noexcept;
+std::string_view stub_service_symbol(GuestAddress stub_base,GuestAddress address) noexcept;
 // GuestMemory 的區域表（std::vector）讀取不加鎖；協調者在其他 worker 繼續執行時本地完成虛擬記憶體服務會插入／刪除
 // 區域，worker 上的服務（native_window、load／store）同時查表即可能讀到重新配置中的陣列，把客體資料寫到錯誤位置
 // （DQ3 強制平行在 13～16 秒崩潰；停用本地映射服務即不再發生）。worker 服務持共享鎖，本地映射服務持獨占鎖。
@@ -242,6 +254,21 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_PARALLEL_SERVICES");return !setting || std::string_view(setting)!="0";}();
     if(!enabled || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled() || runtime_.forced_exit_code())return false;
     if(graphics_worker_service(address) || d3d12_worker_service(address))return true; // 指標非空即可在 worker 執行。
+    // x64 其餘資格只由 stub 的描述表與固定的環境開關決定：每個 stub 第一次判定後快取，之後只查表
+    // （worker 服務每次呼叫入口與核心出口各查一次，原本每次經 name() 與十多次字串比對）。圖形與 D3D12 依裝置狀態，不快取。
+    static const std::unique_ptr<std::atomic<std::uint8_t>[]> cache=[] {
+        return std::unique_ptr<std::atomic<std::uint8_t>[]>(new std::atomic<std::uint8_t>[detail::stub_service_count()]());
+    }();
+    const auto index=x86_?SIZE_MAX:detail::stub_service_index(stub_base_,address);
+    if(!x86_){
+        if(index==SIZE_MAX)return false;
+        if(const auto known=cache[index].load(std::memory_order_relaxed))return known==2;
+    }
+    const auto eligible=parallel_service_static(address);
+    if(!x86_)cache[index].store(eligible?2:1,std::memory_order_relaxed);
+    return eligible;
+}
+bool WindowsServices::parallel_service_static(GuestAddress address) const noexcept {
     if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,address);runtime && crt_pure_worker_service(*runtime))return true;
     const auto symbol=name(address);
     if(x86_){
@@ -254,6 +281,7 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
         return win32 && context_service_arguments(symbol).has_value() && (!srw_service(symbol) || parallel_srw_enabled());
     }
     if(tick_clock_service(symbol) || msvcp_clock_service(symbol))return parallel_tick_clock_enabled();
+    if(parallel_peek_service(symbol))return true;
     if(parallel_srw_enabled() && (srw_service(symbol) || msvcp_mutex_service(symbol)))return true;
     if(thrd_tail_service(symbol) || parallel_event_service(symbol) || parallel_wait_service(symbol))return true;
     return symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue" ||
@@ -377,7 +405,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         state.rep_compare={};
         return true;
     }
-    const auto symbol=name(state.rip);
+    const auto symbol=detail::stub_service_symbol(stub_base_,state.rip);
     if(!x86_ && thrd_tail_service(symbol)){
         std::uint32_t argument=0;
         if(symbol=="_Thrd_sleep"){try{argument=msvcp_wait_milliseconds(memory,state.reg(Gpr::Rcx));}catch(...){return false;}}
@@ -543,6 +571,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
                 (void)id;if(other.status==ThreadStatus::Waiting && std::any_of(other.wait.handles.begin(),other.wait.handles.end(),same_object))return false;
             }
             for(const auto& [id,wait]:registered_waits_){(void)id;if(same_object(wait.target))return false;}
+            for(const auto& [id,wait]:wait_completion_packets_){(void)id;if(wait.phase==WaitCompletionPacketState::Phase::Armed && same_object(wait.target))return false;}
         }
         std::atomic_ref(event->second.count).store(symbol=="SetEvent"?1U:0U,std::memory_order_release);
         result=1;
@@ -759,6 +788,50 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
                 spin_pause();value=lock.load(std::memory_order_acquire);
             }
         }
+    }else if(parallel_peek_service(symbol)){
+        // (lpMsg, hWnd, min, max, flags)：hWnd 為 0、-1 或本執行緒的視窗，合法篩選範圍與 PM_NOREMOVE／PM_REMOVE；MSG 須可寫。
+        // 其餘（含錯誤回報）交回協調者。待處理項目與協調者路徑相同只看呼叫執行緒：屬於它的佇列訊息、送出回呼、WinEvent、
+        // 送出訊息、滑鼠命中測試，以及 PM_REMOVE 時可回收的 shell 通知；hook 只在取出訊息時呼叫，空結果不涉及。
+        // X64ARM_DEBUG_PEEK=1 每 65536 次在 stderr 列出交回原因累計。
+        enum Reason {Arguments,Expired,Queue,Pending,Count};
+        static std::array<std::atomic<std::uint64_t>,Count+1> reasons{};
+        static const bool debug=std::getenv("X64ARM_DEBUG_PEEK")!=nullptr;
+        const auto refuse=[&](Reason reason){
+            if(debug){reasons[reason].fetch_add(1,std::memory_order_relaxed);
+                if(!(reasons[Count].fetch_add(1,std::memory_order_relaxed)&65535U))
+                    std::fprintf(stderr,"[peek] 交回：參數=%llu 期限=%llu 佇列=%llu 待處理=%llu\n",
+                        static_cast<unsigned long long>(reasons[Arguments].load()),static_cast<unsigned long long>(reasons[Expired].load()),
+                        static_cast<unsigned long long>(reasons[Queue].load()),static_cast<unsigned long long>(reasons[Pending].load()));}
+            return false;
+        };
+        const auto window=second;
+        if(debug && reasons[Arguments].load(std::memory_order_relaxed)<4){
+            const auto* raw=pointer(sp+0x28,4,1);const auto owner=gui_.windows.find(window);
+            std::fprintf(stderr,"[peek] 參數 msg=%llx hwnd=%llx min=%u max=%u flags=%llx 視窗執行緒=%llu 呼叫者=%llu msg可寫=%d\n",
+                static_cast<unsigned long long>(first),static_cast<unsigned long long>(window),static_cast<std::uint32_t>(arguments[2]),
+                static_cast<std::uint32_t>(state.reg(Gpr::R9)),static_cast<unsigned long long>(raw?load(raw,4):UINT64_MAX),
+                static_cast<unsigned long long>(owner==gui_.windows.end()?0:owner->second.thread),static_cast<unsigned long long>(tid),pointer(first,48,2)!=nullptr);
+        }
+        if(x86_ || static_cast<std::uint32_t>(arguments[2])>65535 || static_cast<std::uint32_t>(state.reg(Gpr::R9))>65535 || sp>UINT64_MAX-0x2c)
+            return refuse(Arguments);
+        if(window && window!=UINT64_MAX){const auto owner=gui_.windows.find(window);if(owner==gui_.windows.end() || owner->second.thread!=tid)return refuse(Arguments);}
+        // 旗標與協調者路徑相同：PM_REMOVE／PM_NOYIELD 與高 16 位元的 PM_QS_* 類別遮罩（遊戲常以 PM_QS_SENDMESSAGE 只處理送出訊息）。
+        auto* raw_flags=pointer(sp+0x28,4,1);if(!raw_flags || !pointer(first,48,2))return refuse(Arguments);
+        const auto flags=static_cast<std::uint32_t>(load(raw_flags,4));const auto categories=flags>>16;
+        if((flags&0xfffcU) || (categories&~0x1dffU))return refuse(Arguments);
+        const bool remove=flags&1U;
+        if(detail::monotonic_ticks()>=gui_peek_idle_until_)return refuse(Expired);
+        if(std::any_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& message){
+               return gui_message_matches(message,tid) && (!categories || (gui_queue_category(message)&categories));}))return refuse(Queue);
+        if(std::any_of(gui_.send_callbacks.begin(),gui_.send_callbacks.end(),[&](const auto& item){return item.thread==tid;}) ||
+           std::any_of(gui_.event_queue.begin(),gui_.event_queue.end(),[&](const auto& item){
+               const auto hook=gui_.event_hooks.find(item.hook);return hook==gui_.event_hooks.end() || hook->second.owner==tid;}) ||
+           std::any_of(gui_.sent_messages.begin(),gui_.sent_messages.end(),[&](const auto& item){
+               return item.second.receiver==tid && !item.second.active && !item.second.done;}) ||
+           std::any_of(gui_.mouse_inputs.begin(),gui_.mouse_inputs.end(),[&](const auto& item){return item.second.thread==tid && !item.second.active;}) ||
+           (remove && std::any_of(gui_.shell_deliveries.begin(),gui_.shell_deliveries.end(),[&](const auto& item){
+               return item.second.thread==tid && item.second.consumed && !item.second.active && !item.second.locks;})))return refuse(Pending);
+        result=0;
     }else if(symbol=="GetCurrentThreadId")result=thread_identifier(tid);
 else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"){
         auto* output=pointer(first,8,2);if(!output)return false;

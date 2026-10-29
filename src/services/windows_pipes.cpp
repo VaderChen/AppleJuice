@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "windows_file_copy.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/security_access.hpp"
 #include "x64arm/serial.hpp"
@@ -16,6 +17,13 @@ std::uint32_t WindowsServices::file_io_status(std::uint32_t error) {
     case 3: return 0xc000003a;
     case 4: return 0xc000011f;
     case 6: return 0xc0000008;
+    case 13: return 0xc000003e;
+    case 19: return 0xc00000a2;
+    case 112: return 0xc000007f;
+    case 154: return 0xc0000086;
+    case 4390: return 0xc0000275;
+    case 4393: return 0xc0000278;
+    case 4394: return 0xc0000277;
     case 50: return 0xc00000bb;
     case 158: return 0xc000007e;
     case 267: return 0xc0000103;
@@ -166,6 +174,31 @@ std::optional<bool> WindowsServices::file_io_signaled(std::uint64_t handle) {
         return socket->second->io_signaled;
     return {};
 }
+std::uint32_t WindowsServices::bind_file_completion_port(std::uint64_t handle,std::uint64_t port,
+        std::uint64_t key,bool replace) {
+    const auto file=files_.find(handle);const auto socket=runtime_.network.sockets.find(handle);
+    if(file==files_.end() && socket==runtime_.network.sockets.end())return 6;
+    if(port && !runtime_.completion_ports.contains(port))return 6;
+    if(port && !(runtime_.completion_ports.at(port).access&2U))return 5;
+    const auto previous=file!=files_.end()?file->second.completion_port:socket->second->completion_port;
+    if(!replace && (!port || (previous && previous!=port)))return 87;
+    if(!replace && previous)return 0; // 同一關聯不得藉重複呼叫改寫 completion key。
+    if(file!=files_.end())for(auto& [id,item]:files_){
+        (void)id;if(item.object==file->second.object){item.completion_port=port;item.completion_key=port?key:0;}
+    }
+    if(socket!=runtime_.network.sockets.end()){socket->second->completion_port=port;socket->second->completion_key=port?key:0;}
+    return 0;
+}
+std::uint32_t WindowsServices::set_file_completion_modes(std::uint64_t handle,std::uint32_t modes) {
+    if(modes&~3U)return 87;
+    const auto file=files_.find(handle);const auto socket=runtime_.network.sockets.find(handle);
+    if(file==files_.end() && socket==runtime_.network.sockets.end())return 6;
+    if(file!=files_.end())for(auto& [id,item]:files_){
+        (void)id;if(item.object==file->second.object)item.completion_modes|=modes;
+    }
+    if(socket!=runtime_.network.sockets.end())socket->second->completion_modes|=modes;
+    return 0;
+}
 void WindowsServices::set_file_io_signaled(std::uint64_t handle, bool signaled) {
     if (const auto file = files_.find(handle); file != files_.end()) {
         if (signaled && (file->second.completion_modes & 2))
@@ -203,14 +236,18 @@ std::optional<std::uint64_t> WindowsServices::file_io_poll_deadline(const Shared
 void WindowsServices::cancel_file_io(GuestMemory &memory, std::uint64_t handle, std::uint64_t thread,
                                      std::uint64_t overlapped) {
     for (auto &io : pending_file_io_)
-        if (io.handle == handle && !io.done && (!thread || io.thread == thread) &&
+        if ((io.handle == handle || (io.copy && io.source_handle==handle)) && !io.done && (!thread || io.thread == thread) &&
             (!overlapped || io.overlapped == overlapped || io.native_iosb == overlapped))
-            io.result = {0, 995};
+            {if(io.copy)io.copy->cancel.store(true,std::memory_order_relaxed);else io.result = {0, 995};}
     poll_file_io(memory);
 }
 void WindowsServices::complete_file_io(GuestMemory& memory,PendingFileIo& io,std::uint32_t status) {
     const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto file=files_.find(io.handle);
+    // 宿主複製可能在 CloseHandle 返回後才停止；完成埠繫結屬於要求，不能隨 handle 消失。
+    const auto completion_port=io.copy?io.copy->completion_port:file==files_.end()?0:file->second.completion_port;
+    const auto completion_key=io.copy?io.copy->completion_key:file==files_.end()?0:file->second.completion_key;
+    const auto completion_modes=io.copy?io.copy->completion_modes:file==files_.end()?0:file->second.completion_modes;
     io.done = true;
     set_file_io_signaled(io.handle, true);
     if (io.routine && (io.notify || !io.result.error || io.result.error == 234)) {
@@ -224,7 +261,9 @@ void WindowsServices::complete_file_io(GuestMemory& memory,PendingFileIo& io,std
             threads_.yield = true;
         }
     }
-    if (io.count_pointer)
+    // count 只借用至初次呼叫返回；ERROR_IO_PENDING 後只能發布到持續存活的
+    // OVERLAPPED／IOSB。呼叫端可立即重用 count 所在的堆疊或配置。
+    if (io.count_pointer && !io.notify)
         memory.store(GuestAddress{io.count_pointer}, 32, io.result.bytes);
     if (io.overlapped || io.native_iosb) {
         if (io.overlapped) {
@@ -241,12 +280,12 @@ void WindowsServices::complete_file_io(GuestMemory& memory,PendingFileIo& io,std
                 event->second.set_signal(true);
         }
         // 同步失敗的要求不會再排入 IOCP；已回 ERROR_IO_PENDING 的要求則須交付錯誤／取消封包。
-        if (!io.routine && file != files_.end() && !(io.event & 1) &&
+        if (!io.routine && completion_port && !(io.event & 1) &&
             (io.notify || !io.result.error || io.result.error == 234) &&
-            (io.notify || io.result.error || !(file->second.completion_modes & 1))) {
-            const auto port = runtime_.completion_ports.find(file->second.completion_port);
+            (io.notify || io.result.error || !(completion_modes & 1))) {
+            const auto port = runtime_.completion_ports.find(completion_port);
             if (port != runtime_.completion_ports.end())
-                port->second.packets.push_back({file->second.completion_key,
+                port->second.packets.push_back({completion_key,
                                                 io.native_iosb ? io.native_context : io.overlapped,
                                                 status, io.result.bytes});
         }
@@ -275,6 +314,7 @@ void WindowsServices::poll_file_io(GuestMemory &memory, bool scheduler_poll) {
         struct Progress {
             PendingFileIo &io;
             ~Progress() {
+                if(io.copy)return; // 複製以實際讀／寫計數回填，不再重複計為 Other。
                 const auto kind = io.kind == PendingFileIo::Kind::Read    ? process_io::Kind::Read
                                   : io.kind == PendingFileIo::Kind::Write ? process_io::Kind::Write
                                                                           : process_io::Kind::Other;
@@ -288,14 +328,31 @@ void WindowsServices::poll_file_io(GuestMemory &memory, bool scheduler_poll) {
                                      io.io_accounted);
             }
         } progress{io};
-        if (!io.result.error && (file == files_.end() || (io.kind == PendingFileIo::Kind::Directory ? false
+        if(io.copy){
+            io.attempted=true;
+            const auto forced_error=io.result.error;
+            if(forced_error){io.copy->cancel.store(true,std::memory_order_relaxed);if(io.copy->worker.joinable())io.copy->worker.join();}
+            if(file==files_.end())io.copy->cancel.store(true,std::memory_order_relaxed);
+            if(!io.copy->done.load(std::memory_order_acquire)){io.result={0,0,true};continue;}
+            if(!io.io_recorded){process_io::record(io.copy->accounting);io.io_recorded=true;}
+            io.result={static_cast<std::uint32_t>(io.copy->result.bytes),forced_error?forced_error:io.copy->result.error};
+            if(io.result.bytes){
+                for(const auto [handle,offset]:{std::pair{io.source_handle,io.source_offset},std::pair{io.handle,io.offset}}){
+                    const auto entry=files_.find(handle);if(entry==files_.end() || !(entry->second.mode&0x30U))continue;
+                    auto& position=runtime_.win_file_positions.at(entry->second.object);const auto guard=position.lock();position=offset+io.result.bytes;
+                }
+                if(file!=files_.end() && file->second.native)file->second.metadata=file->second.native->information().metadata;
+            }
+        }
+        if (!io.copy && !io.result.error && (file == files_.end() || (io.kind == PendingFileIo::Kind::Directory ? false
                                                           : io.flush                              ? !file->second.native
                                                           : io.kind == PendingFileIo::Kind::Lock ? !file->second.native
                                                           : io.hid                               ? !file->second.hid
                                                           : io.serial                            ? !file->second.serial
                                                                                                  : !file->second.pipe)))
             io.result = {0, 995};
-        if (!io.result.error && io.flush) {
+        if(io.copy) { /* 結果已由上方完成的宿主複製要求取得。 */ }
+        else if (!io.result.error && io.flush) {
             // 宿主工作執行緒完成 fsync 後以 release 發布結果；未完成前維持 pending，不阻塞排程器。
             io.attempted = true;
             io.result = io.flush->done.load(std::memory_order_acquire) ? PipeResult{0, io.flush->error}

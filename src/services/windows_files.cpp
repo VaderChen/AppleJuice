@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "service_callback_task.hpp"
 #include "crt_os_error.hpp"
 #include "windows_file_stat.hpp"
 #include "image_file_metadata.hpp"
@@ -247,7 +248,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
                 if(opened.error)last_error_=opened.error;
                 else {
                     FileHandle file;file.key=opened.key;file.bytes=std::make_shared<const std::vector<std::uint8_t>>();file.native=opened.file;file.metadata=opened.metadata;
-                    file.sharing=dword(2);file.access=null_device?security::mapped_access(dword(1),{0x120089U,0x120116U,0x1200a0U,0x1f01ffU}):dword(1)|((dword(5)&0x04000000U)?0x10000U:0U);file.mode=(dword(5)&0x40000000U)?0U:0x20U;file.path=path;
+                    file.sharing=dword(2);file.access=null_device?security::mapped_access(dword(1),{0x120089U,0x120116U,0x1200a0U,0x1f01ffU}):dword(1)|((dword(5)&0x04000000U)?0x10000U:0U);file.mode=((dword(5)&0x40000000U)?0U:0x20U)|((dword(5)&0x20000000U)?8U:0U);file.path=path;
                     if(install(std::move(file)) && (dword(4)==2 || dword(4)==4))last_error_=opened.existed?183:0;
                 }
             } else if (info.error) last_error_=info.error;
@@ -259,7 +260,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
                     if (snapshot.error) last_error_=snapshot.error;
                     else {
                         FileHandle file;file.key=info.key;file.bytes=snapshot.bytes;file.sharing=dword(2);file.access=dword(1);
-                        file.mode=(dword(5)&0x40000000U)?0U:0x20U;file.metadata=info.metadata;file.path=path;
+                        file.mode=((dword(5)&0x40000000U)?0U:0x20U)|((dword(5)&0x20000000U)?8U:0U);file.metadata=info.metadata;file.path=path;
                         const auto identity=filesystem_.pin(path);if(identity.error)last_error_=identity.error;else {file.identity=identity.file;(void)install(std::move(file));}
                     }
                 }
@@ -274,6 +275,8 @@ std::span<const WindowsServiceDescriptor> file_service_descriptors() {
         {"ntdll.dll","NtQueryVolumeInformationFile",5},{"ntdll.dll","NtQueryDirectoryFile",11},
         {"ntdll.dll","NtQueryDirectoryFileEx",10},
         {"ntdll.dll","NtDeviceIoControlFile",10},
+        {"ntdll.dll","NtFsControlFile",10,0,0,0x2a0},{"ntdll.dll","NtCopyFileChunk",10,0,0,0x210},
+        {"ntdll.dll","NtSetVolumeInformationFile",5,0,0,0x18},
         {"kernel32.dll","GetFinalPathNameByHandleA",4},{"kernel32.dll","GetFinalPathNameByHandleW",4},{"kernel32.dll","ReOpenFile",4},{"kernel32.dll","SetFileInformationByHandle",4},
         {"kernel32.dll","SetFileValidData",2,2},
         {"kernel32.dll","GetBinaryTypeA",2},{"kernel32.dll","GetBinaryTypeW",2},
@@ -318,6 +321,9 @@ std::span<const WindowsServiceDescriptor> file_service_descriptors() {
 std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     if(service.symbol=="GetOverlappedResult" || service.symbol=="GetOverlappedResultEx")return invoke_overlapped_result(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
+    if(symbol=="NtCopyFileChunk")return invoke_file_copy_chunk(state,memory,service);
+    if(symbol=="NtSetVolumeInformationFile")return invoke_set_volume(state,memory,service);
+    if(symbol=="NtFsControlFile" || (symbol=="DeviceIoControl" && ((static_cast<std::uint32_t>(arg(1))>>16)==9 || (static_cast<std::uint32_t>(arg(1))>>16)==17)))return invoke_fs_control(state,memory,service);
     if(const auto value=invoke_native_file_position(state,memory,service)){arg.return_to(state,*value);return std::nullopt;}
     if(const auto native=invoke_native_file_information(state,memory,service)){
         arg.return_to(state,*native);return std::nullopt;
@@ -452,7 +458,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         const auto nt_error=[](std::uint32_t error)->std::uint32_t {
             switch(error){case 0:return 0;case 2:case 3:return 0xc0000034;case 5:return 0xc0000022;case 6:return 0xc0000008;case 8:return 0xc000009a;case 32:return 0xc0000043;case 87:return 0xc000000d;case 112:return 0xc000007f;default:return 0xc00000bb;}
         };
-        if(found==files_.end())status=0xc0000008;
+        if(symbol=="NtSetInformationFile" && (u32(4)==30 || u32(4)==41 || u32(4)==61)){
+            // Win32 與 NT 共用 file object 的完成埠／通知政策，也涵蓋 socket 與複製 handle。
+            const auto kind=u32(4),size=u32(3);const auto input=arg(2);
+            if(found==files_.end() && !runtime_.network.sockets.contains(arg(0)))status=0xc0000008;
+            else if(size<(kind==41?4U:2*width))status=0xc0000004;
+            else if(kind==41)status=file_io_status(set_file_completion_modes(arg(0),static_cast<std::uint32_t>(memory.load(GuestAddress{input},32))));
+            else status=file_io_status(bind_file_completion_port(arg(0),memory.load(GuestAddress{input},bits),
+                memory.load(GuestAddress{input+width},bits),kind==61));
+        }
+        else if(found==files_.end())status=0xc0000008;
         else if(control && (arg(2) || found->second.completion_port))status=0xc00000bb;
         else if(directory && arg(2) && found->second.completion_port)status=0xc000000d;
         else if(directory && (arg(1) || arg(2)) && (found->second.mode&0x30U))status=0xc000000d;
@@ -475,25 +490,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
             if(!status && file.native)file.metadata=file.native->information().metadata;
         } else if(symbol=="NtQueryVolumeInformationFile") {
             const auto kind=u32(4),capacity=u32(3);const auto output=arg(2);const auto& file=found->second;
-            const unsigned size=kind==1?24U:kind==3?24U:kind==7?32U:kind==4?8U:kind==5?16U:0U;
+            const unsigned size=kind==1?24U:kind==3?24U:kind==7?32U:kind==4?8U:kind==5?16U:kind==8?64U:0U;
             if(!size)status=0xc0000003;else if(capacity<size)status=0xc0000004;
             else if((file.pipe || (file.native && file.native->null_device())) && kind!=4)status=0xc0000010;
             else {
                 FileVolumeSpace space;if(kind==3 || kind==7){auto path=file.path;if(!(file.metadata.attributes&0x10)){const auto slash=path.find_last_of("\\/");path=slash==path.npos?".":path.substr(0,slash+1);}space=file.native?file.native->volume_space():filesystem_.volume_space(path);status=nt_error(space.error);if(!status && (!space.allocation_unit || !space.sector_size))status=0xc00000bb;}
-                FileInformation volume;
-                if(kind==1){
-                    const auto location=filesystem_.volume_location(file.path.empty()?file.key:file.path);
+                FileInformation volume;FileVolumeProperties properties;
+                if(kind==1 || kind==8){
+                    const auto location=file_volume_location(arg(0));
                     status=nt_error(location.error);
-                    if(!status){volume=filesystem_.information(windows_volume_path(location.volume));status=nt_error(volume.error);}
+                    if(!status && location.volume){properties=filesystem_.volume_properties(location.volume);status=file_io_status(properties.error);}
+                    else if(!status && kind==8)status=0xc0000010U;
+                    if(!status && kind==1){volume=location.volume?filesystem_.information(windows_volume_path(location.volume)):FileInformation{file.key,file.metadata,0};status=nt_error(volume.error);}
                 }
                 if(!status){
                     std::vector<std::uint8_t> bytes(kind==1?18U:kind==5?12U:size);
                     const auto put=[&](unsigned offset,unsigned length,std::uint64_t value){for(unsigned n=0;n<length;++n)bytes.at(offset+n)=static_cast<std::uint8_t>(value>>(n*8));};
                     if(kind==3 || kind==7){put(0,8,space.total/space.allocation_unit);put(8,8,space.available/space.allocation_unit);if(kind==7)put(16,8,space.free/space.allocation_unit);put(kind==7?24:16,4,space.allocation_unit/space.sector_size);put(kind==7?28:20,4,space.sector_size);}
                     else if(kind==4){const bool null_device=file.native && file.native->null_device();put(0,4,file.pipe?0x11U:null_device?0x15U:7U);put(4,4,file.pipe?0U:null_device?0x100U:0x20U);}
+                    else if(kind==8)bytes.assign(properties.object_id.begin(),properties.object_id.end());
                     else {
                         // 與 Win32 volume 查詢共用虛擬卷名、裝置序號及檔案系統能力。
-                        auto name=utf16_bytes(u"X64ARM");name.resize(name.size()-2);
+                        auto name=utf16_bytes(kind==1?properties.label:std::u16string{u"X64ARM"});name.resize(name.size()-2);
                         if(kind==1){put(0,8,volume.metadata.created);put(8,4,volume.metadata.device);put(12,4,name.size());}
                         else {put(0,4,2|4|(filesystem_.writable()?0U:0x80000U));put(4,4,255);put(8,4,name.size());}
                         bytes.insert(bytes.end(),name.begin(),name.end());
@@ -873,13 +891,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         memory.store(GuestAddress{arg(1)},x86_?32:64,status);memory.store(GuestAddress{arg(1)+(x86_?4U:8U)},x86_?32:64,bytes.size());result=status;
     } else if (symbol=="GetVolumeInformationByHandleW") {
         const auto found=files_.find(arg(0));
+        const auto location=file_volume_location(arg(0));
+        const auto properties=location.error || !location.volume?FileVolumeProperties{}:filesystem_.volume_properties(location.volume);
+        const auto volume=location.volume?filesystem_.information(windows_volume_path(location.volume)):found==files_.end()?FileInformation{}:FileInformation{found->second.key,found->second.metadata,0};
+        const auto label=utf16_bytes(properties.label);
         if (found==files_.end()) fail(6);
-        else if ((arg(1) && u32(2)<7) || (arg(6) && u32(7)<7)) fail(122);
+        else if(location.error || properties.error)fail(location.error?location.error:properties.error);
+        else if(volume.error)fail(volume.error);
+        else if ((arg(1) && u32(2)<label.size()/2) || (arg(6) && u32(7)<7)) fail(122);
         else {
-            if (arg(1)) memory.check(GuestAddress{arg(1)},14,Access::Write);if (arg(6)) memory.check(GuestAddress{arg(6)},14,Access::Write);
+            if (arg(1)) memory.check(GuestAddress{arg(1)},label.size(),Access::Write);if (arg(6)) memory.check(GuestAddress{arg(6)},14,Access::Write);
             for (unsigned i=3;i<=5;++i) if (arg(i)) memory.check(GuestAddress{arg(i)},4,Access::Write);
-            if (arg(1)) memory.write(GuestAddress{arg(1)},utf16_bytes(u"X64ARM"));if (arg(6)) memory.write(GuestAddress{arg(6)},utf16_bytes(u"X64ARM"));
-            if (arg(3)) memory.store(GuestAddress{arg(3)},32,found->second.metadata.device);if (arg(4)) memory.store(GuestAddress{arg(4)},32,255);
+            if (arg(1)) memory.write(GuestAddress{arg(1)},label);if (arg(6)) memory.write(GuestAddress{arg(6)},utf16_bytes(u"X64ARM"));
+            if (arg(3)) memory.store(GuestAddress{arg(3)},32,volume.metadata.device);if (arg(4)) memory.store(GuestAddress{arg(4)},32,255);
             if (arg(5)) memory.store(GuestAddress{arg(5)},32,2|4|(filesystem_.writable()?0U:0x80000U));result=1;
         }
     } else if (symbol=="GetFileInformationByHandleEx") {

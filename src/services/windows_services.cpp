@@ -2,6 +2,7 @@
 #include "parallel_mapping_lock.hpp"
 #include "x64arm/resource_usage.hpp"
 #include "x64arm/windows_services.hpp"
+#include "service_callback_task.hpp"
 #include "x64arm/windows_unwind.hpp"
 #include "guest_heap_layout.hpp"
 #include "resident_service_policy.hpp"
@@ -74,7 +75,7 @@ void WindowsServices::dump_service_counts() {
     {std::lock_guard lock(*worker_service_counts_mutex_);dump("worker",worker_service_counts_);}
     if(out!=stderr){std::fclose(out);std::rename(path.c_str(),path.substr(0,path.size()-4).c_str());}
 }
-WindowsServices::~WindowsServices(){if(service_counts_enabled_)dump_service_counts();report_guard_statistics();while(!policy_sections_.empty())discard_policy_thread(policy_sections_.begin()->second.thread);release_url_cache();
+WindowsServices::~WindowsServices(){service_callback::clear(this);if(service_counts_enabled_)dump_service_counts();report_guard_statistics();while(!policy_sections_.empty())discard_policy_thread(policy_sections_.begin()->second.thread);release_url_cache();
     if(std::getenv("X64ARM_IO_WAIT_PROFILE"))std::fprintf(stderr,"[io_wait] guest_packets=%llu guest_timeouts=%llu immediate=%llu waits=%llu\n",
         static_cast<unsigned long long>(io_wait_stats_.packets),static_cast<unsigned long long>(io_wait_stats_.timeouts),
         static_cast<unsigned long long>(io_wait_stats_.immediate),static_cast<unsigned long long>(io_wait_stats_.waits));
@@ -650,9 +651,10 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             static const bool srw_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_SRW");return !value || std::string_view(value)!="0";}();
             // 臨界區段家族同樣可獨立對照（X64ARM_GUEST_CS=0 回到原服務）。
             static const bool critical_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_CS");return !value || std::string_view(value)!="0";}();
-            // SList 家族（LOCK CMPXCHG16B）：常駐 AOT 在平行模式尚未原生化 128 位元 CAS，會不支援退出並全停單步，
-            // 比協調者本地服務（獨占映射鎖下序列化）更慢（電馭判客 Benchmark 16.1→14.2 fps）。原生化前預設關閉，X64ARM_GUEST_SLIST=1 才導向常式。
-            static const bool slist_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_SLIST");return value && std::string_view(value)=="1";}();
+            // SList 家族（LOCK CMPXCHG16B）：常駐 AOT 已以 CASPAL 原生化 128 位元 CAS（X64ARM_AOT_PAIR_CAS），在 worker 上直接完成，
+            // 不再經協調者（原本獨占映射鎖下序列化，每次往返 7～12 µs）。原生化前導向常式會不支援退出並全停單步（16.1→14.2 fps）。
+            // X64ARM_GUEST_SLIST=0 回到協調者本地服務。
+            static const bool slist_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_SLIST");return !value || std::string_view(value)!="0";}();
             const auto& routines=x86_?win32_routines:win64_routines;
             if(const auto found=routines.find(symbol);found!=routines.end() && (slist_routines || symbol.find("SList")==symbol.npos) &&
                (srw_routines || symbol.find("SRWLock")==symbol.npos) && (critical_routines || symbol.find("CriticalSection")==symbol.npos) &&
@@ -887,6 +889,11 @@ bool WindowsServices::handles(GuestAddress address) const noexcept {
     return address.value == callback_return_.value+0xa0 || address.value == callback_return_.value+0x80 || address == thread_start_ || address == thread_return_ || address == process_exit_retry_ || address == callback_return_ || address == startup_entry_ || address == exception_entry_ || (address.value >= stub_base_.value && address.value - stub_base_.value < (services.size() + runtime_service_descriptors().size()) * 16 &&
         (address.value - stub_base_.value) % 16 == 0);
 }
+GuestAddress WindowsServices::guest_thread_routine(std::string_view symbol) const noexcept {
+    if(x86_ || !guest_thread_routines_.value || !runtime_.image.base || !trace_services_.empty() || startup_profile::enabled())return GuestAddress{0};
+    for(const auto& routine:detail::guest_thread_routines)if(routine.symbol==symbol)return GuestAddress{guest_thread_routines_.value+routine.entry};
+    return GuestAddress{0};
+}
 std::string_view WindowsServices::name(GuestAddress address) const noexcept {
     if(!stock_gui_class(address.value).empty())return "Windows 控制項 WNDPROC";
     if (address.value >= unresolved_base_.value && address.value - unresolved_base_.value < unresolved_imports_.size() * 16 &&
@@ -964,6 +971,7 @@ bool WindowsServices::same_state(const WindowsServices& other) const {
     if (threads_ != other.threads_) return false;
     if(registry_notifications_!=other.registry_notifications_ || next_registry_notification_!=other.next_registry_notification_)return false;
     if(timer_workers_exhausted_!=other.timer_workers_exhausted_ || timer_queues_!=other.timer_queues_ || queue_timers_!=other.queue_timers_ || next_timer_queue_handle_!=other.next_timer_queue_handle_)return false;
+    if(wait_completion_handles_!=other.wait_completion_handles_ || wait_completion_packets_!=other.wait_completion_packets_ || wait_completion_targets_!=other.wait_completion_targets_)return false;
     if(registered_waits_!=other.registered_waits_ || wait_workers_!=other.wait_workers_ || next_registered_wait_!=other.next_registered_wait_)return false;
     if (gui_ != other.gui_) return false;
     if(font_enumerations_!=other.font_enumerations_)return false;
@@ -1185,6 +1193,19 @@ const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,G
     const auto begin=stub_base.value+services.size()*16;const auto table=runtime_service_descriptors();
     if(address.value<begin || ((address.value-begin)&15U) || (address.value-begin)/16>=table.size())return nullptr;
     return &table[(address.value-begin)/16];
+}
+// 服務 stub（固定表與延伸描述表）的索引與名稱；不是 16 位元組對齊的 stub 時索引為 SIZE_MAX、名稱為空。與 name() 對 stub 的結果
+// 相同，但略過回呼、控制項與未解析匯入等範圍判斷（worker 服務入口每次呼叫都要查）。
+std::size_t stub_service_count() noexcept {return services.size()+runtime_service_descriptors().size();}
+std::size_t stub_service_index(GuestAddress stub_base,GuestAddress address) noexcept {
+    if(address.value<stub_base.value || ((address.value-stub_base.value)&15U))return SIZE_MAX;
+    const auto index=(address.value-stub_base.value)/16;
+    return index<services.size()+runtime_service_descriptors().size()?static_cast<std::size_t>(index):SIZE_MAX;
+}
+std::string_view stub_service_symbol(GuestAddress stub_base,GuestAddress address) noexcept {
+    const auto index=stub_service_index(stub_base,address);
+    if(index==SIZE_MAX)return {};
+    return index<services.size()?services[index].name:runtime_service_descriptors()[index-services.size()].symbol;
 }
 }
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_SERVICE
@@ -1465,6 +1486,8 @@ bool plain_local_service(const WindowsServiceDescriptor& descriptor) noexcept {
     if(family=="kernel32.dll"){
         // SList 的 API 全部經協調者，在獨占映射鎖下序列化；臨界區段初始化只改鎖表與客體結構，Leave 有等待者時
         // provider 自行以 Critical 範圍喚醒（不排程）。Enter 競爭會阻塞，不在此家族。
+        // SRW lock／條件變數初始化同樣只核對沒有等待者、寫入客體字組並清除宿主鎖表項目（電馭判客 Benchmark 每秒約 180 次
+        // InitializeSRWLock 原本每次全停）；重新初始化等待中的物件等錯誤交回完整路徑回報。X64ARM_LOCAL_SYNC_INIT=0 關閉。
         // Heap*：provider 的客體級距配置以客體狀態頁的鎖（有界自旋）與 worker 上的客體 malloc 常式共存，宿主表格只有
         // 協調者改；增減映射與本地 VirtualAlloc 相同由核心在服務後更新原生 MMU。電馭判客強制平行 60 秒各約 6 萬次
         // 原本每次全停。X64ARM_LOCAL_HEAP=0 關閉。
@@ -1472,6 +1495,8 @@ bool plain_local_service(const WindowsServiceDescriptor& descriptor) noexcept {
             symbol=="QueryDepthSList" || symbol=="InitializeSListHead" || symbol=="InitializeCriticalSection" ||
             symbol=="InitializeCriticalSectionAndSpinCount" || symbol=="InitializeCriticalSectionEx" ||
             symbol=="SetCriticalSectionSpinCount" || symbol=="LeaveCriticalSection" ||
+            ((symbol=="InitializeSRWLock" || symbol=="InitializeConditionVariable") && [] {
+                const auto* value=std::getenv("X64ARM_LOCAL_SYNC_INIT");return !value || std::string_view(value)!="0";}()) ||
             local_heap_service(symbol);
     }
     // RtlGenRandom：只把宿主亂數寫入參數緩衝區並設定 LastError（電馭判客每秒約 160 次原本每次全停）。
@@ -1623,7 +1648,7 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
         if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
         const bool signal=descriptor.symbol=="Queue.Signal" || descriptor.symbol=="Fence.Signal" || descriptor.symbol=="Fence.SetEventOnCompletion";
-        if(signal && !registered_waits_.empty())return false; // 已登錄等待的回呼要在全停路徑啟動。
+        if(signal && (!registered_waits_.empty() || !wait_completion_packets_.empty()))return false; // 已登錄等待的回呼要在全停路徑啟動。
         const auto previous=threads_.current;const auto saved_error=last_error_;
         const GuestAddress error_slot{state.gs_base+0x68};
         const auto entry_error=static_cast<std::uint32_t>(memory.load(error_slot,32));
@@ -1685,6 +1710,7 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
                 }
                 if(waiters && !local_wake)return false;
                 for(const auto& [id,wait]:registered_waits_){(void)id;if(same_object(wait.target))return false;}
+                for(const auto& [id,wait]:wait_completion_packets_){(void)id;if(wait.phase==WaitCompletionPacketState::Phase::Armed && same_object(wait.target))return false;}
             }
             found->second.set_signal(symbol=="SetEvent");value=1;
             if(waiters)(void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
@@ -1707,6 +1733,7 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
                 return other!=runtime_.wait_objects.end() && found->second.identity && other->second.identity==found->second.identity;
             };
             for(const auto& [id,wait]:registered_waits_){(void)id;if(same_object(wait.target))return false;}
+                for(const auto& [id,wait]:wait_completion_packets_){(void)id;if(wait.phase==WaitCompletionPacketState::Phase::Armed && same_object(wait.target))return false;}
             bool waiters=false;
             for(const auto& [id,other]:threads_.items){
                 (void)id;if(other.status!=ThreadStatus::Waiting)continue;
@@ -1787,6 +1814,19 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
 #include "registry_service_dependencies.inc"
 bool WindowsServices::defer_registry_io_call(GuestState& state,GuestMemory& memory){
     if(!registry_io_busy_ || runtime_.forced_exit_code())return false;
+    const auto transfer=[&]{
+        // 入口尚未同步 TEB；客體 Get／SetLastError 常式可直接更新它。
+        if(runtime_.image.base)last_error_=static_cast<std::uint32_t>(memory.load(
+            GuestAddress{x86_?state.fs_base+0x34:state.gs_base+0x68},32));
+        schedule(state,memory);
+    };
+    // 私有 I/O 完成後先退回保留的 C++ 交易框架。這是續行交接，並非讓
+    // owner 以較高優先序執行一般客體；其他 API 尚未開始，原 RIP／參數可保留。
+    // 若只等一般優先序輪替，巢狀單框架中的高優先序鎖競爭者可能永久壓住 owner。
+    if(threads_.current!=registry_io_owner_ && registry_io_ready()){
+        transfer();
+        if(threads_.current!=registry_io_owner_)throw HostCallFault("已完成的登錄 I/O 沒有恢復原呼叫者");
+    }
     // owner 的 C++ 交易框架仍在外層。控制待辦的派送可能早於 cooperative_stop，
     // 必須沿 SDK 的巢狀返回契約離開這次執行，讓原框架提交或回滾。
     // 只原地返回會讓 resident 派送器反覆重派同一 RIP，並不保證到達 stop 檢查。
@@ -1808,7 +1848,7 @@ bool WindowsServices::defer_registry_io_call(GuestState& state,GuestMemory& memo
     thread.registry_deferred_wait.emplace(std::move(thread.wait));
     thread.status=ThreadStatus::Waiting;thread.wait={};
     thread.wait.kind=ThreadWaitKind::RegistryIo;
-    schedule(state,memory);return true;
+    transfer();return true;
 }
 std::optional<std::uint32_t> WindowsServices::invoke(GuestState& state, GuestMemory& memory) {
     return invoke_boundary(state,memory);
@@ -2133,7 +2173,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
         for(unsigned i=x86_?0:4;i<arguments;++i) {try {std::fprintf(stderr,"[api] arg%u=%llx\n",i,static_cast<unsigned long long>(WindowsCall(state,memory,arguments,true,wide,aggregate)(i)));}catch(const MemoryFault&) {break;}}
     }
     count_scope.phase("body");
-    const auto result = invoke_service(state, memory);
+    std::optional<std::uint32_t> result;
+    try{result=invoke_service(state,memory);}
+    catch(const service_callback::Suspended&){/* 客體回呼接續原 API；本次只發布已準備的狀態。 */}
     count_scope.phase("completion");
     // 記憶體操作可合法寫入 TEB 本身；完整入口也不得用呼叫前的快照蓋回輸出。
     if((memory_operation || string_operation) && runtime_.image.base)last_error_=static_cast<std::uint32_t>(memory.load(GuestAddress{x86_?state.fs_base+0x34:state.gs_base+0x68},32));
@@ -2178,9 +2220,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
     if (state.rip == process_exit_retry_) return finish_process(state, memory, static_cast<std::uint32_t>(state.reg(Gpr::Rcx)));
     if (state.rip == thread_start_) {
         if(await_loader(state,memory))return std::nullopt;
-        state.rip = GuestAddress{threads_.items.at(threads_.current).entry};
-        auto callbacks=module_thread_callbacks(2);
-        for (const auto target : runtime_.image.tls_callbacks) callbacks.push_back({target, {runtime_.image.base, 2, 0}, true});
+        const auto& thread=threads_.items.at(threads_.current);
+        state.rip = GuestAddress{thread.entry};
+        std::vector<GuestCallback> callbacks;
+        if(!thread.skip_thread_attach){
+            callbacks=module_thread_callbacks(2);
+            for (const auto target : runtime_.image.tls_callbacks) callbacks.push_back({target, {runtime_.image.base, 2, 0}, true});
+        }
         if (!callbacks.empty()) start_loader_callbacks(state, memory, std::move(callbacks), Continuation::Startup);
         else (void)dispatch_user_apc(state,memory,UINT64_MAX);
         return std::nullopt;

@@ -14,6 +14,9 @@ char drive_root(std::string path){
 }
 std::vector<FileVolume> ReadOnlyFiles::volumes() const{return volumes_->volumes();}
 FileVolumeState ReadOnlyFiles::volume_state() const{return volumes_->snapshot();}
+FileVolumeProperties ReadOnlyFiles::volume_properties(char volume) const{return volumes_->properties(volume);}
+std::uint32_t ReadOnlyFiles::set_volume_label(char volume,std::u16string label){return volumes_->set_label(volume,std::move(label),writable_);}
+std::uint32_t ReadOnlyFiles::set_volume_object_id(char volume,const std::array<std::uint8_t,64>& value){return volumes_->set_object_id(volume,value,writable_);}
 FileVolumeLocation ReadOnlyFiles::volume_location(std::string path,bool follow) const {
     std::string leaf;auto resolved=resolve(std::move(path),true,&leaf,true,follow);
 #if !defined(_WIN32)

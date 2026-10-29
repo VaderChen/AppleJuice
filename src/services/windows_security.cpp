@@ -175,6 +175,7 @@ std::u16string_view WindowsServices::object_type(std::uint64_t handle) const {
     if(transaction_handle(handle))return u"TmTx";
     if(job_handle(handle))return u"Job";
     if(runtime_.completion_ports.contains(handle))return u"IoCompletion";
+    if(wait_completion_handles_.contains(handle))return u"WaitCompletionPacket";
     if(mapping_handle(handle) || runtime_.process_snapshots.contains(handle))return u"Section";
     if(runtime_.registry.handles.contains(handle))return u"Key";
     if(const auto found=runtime_.wait_objects.find(handle);found!=runtime_.wait_objects.end()){
@@ -232,7 +233,12 @@ std::optional<WindowsServices::ObjectMetadata> WindowsServices::object_metadata(
         const auto id=thread_id(handle);out.access=thread_access(handle);out.identity=(std::uint64_t{process_id()}<<32)|id;
         out.handles=0;for(const auto& [h,item]:runtime_.process_thread_handles){(void)h;if(item.first==id)++out.handles;}out.pointers=out.handles+(threads_.items.contains(id)?1U:0U);
     }else if(handle>=0x100 && handle<=0x102)out.access=handle==0x100?0x120089U:0x120116U;
-    else if(runtime_.completion_ports.contains(handle))out.access=0x1f0003;
+    else if(runtime_.completion_ports.contains(handle))out.access=runtime_.completion_ports.at(handle).access;
+    else if(const auto packet=wait_completion_handles_.find(handle);packet!=wait_completion_handles_.end()){
+        out.access=packet->second.second;out.identity=packet->second.first;out.handles=0;
+        for(const auto& [h,p]:wait_completion_handles_){(void)h;if(p.first==out.identity)++out.handles;}
+        out.pointers=out.handles+(wait_completion_packets_.at(out.identity).phase!=WaitCompletionPacketState::Phase::Idle);
+    }
     else if(runtime_.process_snapshots.contains(handle))out.access=0xf001f;
     else if(runtime_.network.sockets.contains(handle)){out.access=0x1f01ff;out.identity=reinterpret_cast<std::uintptr_t>(runtime_.network.sockets.at(handle).get());out.handles=0;for(const auto& [h,socket]:runtime_.network.sockets){(void)h;if(reinterpret_cast<std::uintptr_t>(socket.get())==out.identity)++out.handles;}out.pointers=out.handles;}
     else if(runtime_.directory_searches.contains(handle))out.access=0x120089;
@@ -453,7 +459,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
         const auto type=object_type(arg(0));
         if(u32(1)==3)try{
             // 物件型別目錄與現存控制代碼共用同一份資料；不列入 GUI/GDI 這類 User handle。
-            constexpr std::array<std::u16string_view,12> types{u"Process",u"Thread",u"File",u"Token",u"PowerRequest",u"Job",u"IoCompletion",u"Section",u"Key",u"Event",u"Semaphore",u"Timer"};
+            constexpr std::array<std::u16string_view,13> types{u"Process",u"Thread",u"File",u"Token",u"PowerRequest",u"Job",u"IoCompletion",u"Section",u"Key",u"Event",u"Semaphore",u"Timer",u"WaitCompletionPacket"};
             std::vector<std::u16string_view> names(types.begin(),types.end());names.push_back(u"Mutant");const unsigned unit=x86_?4:8,header=x86_?96:104;
             std::size_t total=unit;for(auto text:names)total=(total+header+(text.size()+1)*2+unit-1)&~static_cast<std::size_t>(unit-1);
             if(arg(4))memory.store(GuestAddress{arg(4)},32,total);if(u32(3)<total)result=0xc0000004U;
@@ -1166,12 +1172,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_token(GuestState& state,Gue
             const auto& token=token_for(arg(1),8);if(token.type!=2)throw SddlError{1309};if(token.level<1)throw SddlError{1346};
             if(u32(2)&0xf0000000U)throw SddlError{1360};const auto mapping=mapping_at(arg(3));
             if(!arg(5) || !arg(6) || !arg(7))throw SddlError{87};
-            const auto size=memory.load(GuestAddress{arg(5)},32);memory.store(GuestAddress{arg(5)},32,8);if(size<8 || !arg(4))throw SddlError{122};
+            const auto size=memory.load(GuestAddress{arg(5)},32);
             const auto sd=read_descriptor(memory,arg(0),x86_,true);if(sd.data[0].empty() || sd.data[1].empty())throw SddlError{1338};
-            memory.check(GuestAddress{arg(4)},8,Access::Write);memory.check(GuestAddress{arg(6)},4,Access::Write);memory.check(GuestAddress{arg(7)},4,Access::Write);
-            const auto granted=token_acl_access(token,sd,u32(2),mapping);const bool allowed=(u32(2)==0 || granted!=0) && !(u32(2)&0x01000000U);
-            memory.store(GuestAddress{arg(4)},64,0);memory.store(GuestAddress{arg(6)},32,allowed?granted:0);memory.store(GuestAddress{arg(7)},32,allowed?1:0);
-            result=1;if(!allowed)last_error_=u32(2)&0x01000000U?1314:5;
+            const auto checked=security::access_check(token,sd,u32(2),mapping);
+            const auto needed=8+checked.privileges.size()*12;
+            memory.store(GuestAddress{arg(5)},32,needed);if(size<needed || !arg(4))throw SddlError{122};
+            memory.check(GuestAddress{arg(4)},needed,Access::Write);memory.check(GuestAddress{arg(6)},4,Access::Write);memory.check(GuestAddress{arg(7)},4,Access::Write);
+            memory.store(GuestAddress{arg(4)},64,checked.privileges.size());
+            for(std::size_t i=0;i<checked.privileges.size();++i){
+                memory.store(GuestAddress{arg(4)+8+i*12},64,checked.privileges[i].luid);
+                memory.store(GuestAddress{arg(4)+16+i*12},32,checked.privileges[i].attributes);
+            }
+            memory.store(GuestAddress{arg(6)},32,checked.granted);memory.store(GuestAddress{arg(7)},32,checked.error?0:1);
+            result=1;if(checked.error)last_error_=checked.error;
         }else if(symbol=="AdjustTokenPrivileges"){
             auto& token=token_for(arg(0),token_adjust_privileges|(arg(4)?token_query:0));
             if((!u32(1) && !arg(2)) || (arg(4) && !arg(5)))throw SddlError{87};

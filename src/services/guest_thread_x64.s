@@ -412,5 +412,25 @@ entry InterlockedFlushSList
     mov rax, r8
     ret
 end InterlockedFlushSList
+// D3D12 ID3D12Resource::GetGPUVirtualAddress：橋接物件 [this+8] 保存緩衝的 GPU 虛擬位址（紋理為 0），建立時寫入、
+// 物件存續期間不變（見 windows_d3d12.cpp 的 make_resource）。直接返回，不經服務、不離開原生碼。
+entry D3D12ResourceGetGPUVirtualAddress
+    mov rax, qword ptr [rcx + 8]
+    ret
+end D3D12ResourceGetGPUVirtualAddress
+// ID3D12DescriptorHeap::GetCPU／GPUDescriptorHandleForHeapStart（MSVC ABI：結構經 RDX 隱藏指標返回，RAX=RDX）：
+// 橋接物件 [this+8]／[this+16] 保存建立時配置的 CPU／GPU 起點（非 shader-visible 堆積 GPU 為 0），存續期間不變。
+entry D3D12HeapGetCPUDescriptorHandleForHeapStart
+    mov rax, qword ptr [rcx + 8]
+    mov qword ptr [rdx], rax
+    mov rax, rdx
+    ret
+end D3D12HeapGetCPUDescriptorHandleForHeapStart
+entry D3D12HeapGetGPUDescriptorHandleForHeapStart
+    mov rax, qword ptr [rcx + 16]
+    mov qword ptr [rdx], rax
+    mov rax, rdx
+    ret
+end D3D12HeapGetGPUDescriptorHandleForHeapStart
 .globl _guest_thread_end
 _guest_thread_end:

@@ -156,6 +156,7 @@ void WindowsServices::queue_debug_thread(std::uint64_t id){
     if(!debugger_attached())return;
     if(id>UINT32_MAX)throw HostCallFault("偵錯事件執行緒識別碼超過 DWORD");
     auto& channel=*debug_memory_;const auto& thread=threads_.items.at(id);
+    if(thread.hidden_from_debugger)return;
     channel.target->events.push(channel.transport.pid(),channel.transport.birth(),
         {channel.transport.pid(),static_cast<std::uint32_t>(id),debugger::CreateThread{0,thread.teb,thread.entry}});
     // 建立者完成 API 回傳後立即進入協調排程；新執行緒連 TLS callback 都不能先執行。
@@ -204,6 +205,8 @@ std::uint32_t WindowsServices::emit_debug_event(GuestState& state,GuestMemory& m
     auto& channel=*debug_memory_;auto& target=*channel.target;
     if(threads_.current>UINT32_MAX)throw HostCallFault("偵錯事件執行緒識別碼超過 DWORD");
     auto& thread=threads_.items.at(threads_.current);
+    // ThreadHideFromDebugger 與建立旗標共用：抑制該執行緒的事件，但程序退出仍須通知。
+    if(thread.hidden_from_debugger && !initial && !std::holds_alternative<debugger::ExitProcess>(payload))return debugger::not_handled;
     struct Saved {bool& value;bool previous;~Saved(){value=previous;}} saved{threads_.context_saved,threads_.context_saved};
     thread.context=state;threads_.context_saved=true;
     const auto sequence=target.events.push(channel.transport.pid(),channel.transport.birth(),{channel.transport.pid(),static_cast<std::uint32_t>(threads_.current),std::move(payload)});

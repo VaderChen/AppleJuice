@@ -67,6 +67,24 @@ std::uint32_t token_acl_access(const VirtualToken& token,const SecurityDescripto
     if((requested&granted)!=requested)return 0;
     return maximum?granted:requested;
 }
+AccessCheckResult access_check(const VirtualToken& token,const SecurityDescriptor& sd,std::uint32_t desired,const AccessMapping& mapping){
+    AccessCheckResult result;
+    constexpr std::uint32_t system_security=0x01000000U,write_owner=0x80000U,maximum_allowed=0x02000000U;
+    auto remaining=desired;
+    // 與虛擬權杖的公開 LUID 表共用 8／9；不查詢或授予宿主權限。
+    const auto use=[&](std::uint32_t right,std::uint64_t luid){
+        if(!(remaining&right) || !token.has_privilege(luid,true))return false;
+        remaining&=~right;result.granted|=right;result.privileges.push_back({luid,0x80000000U});return true;
+    };
+    if((desired&system_security) && !use(system_security,8)){result.error=1314;return result;}
+    (void)use(write_owner,9);
+    const auto dacl_granted=token_acl_access(token,sd,remaining,mapping)&~system_security;
+    const auto requested=remaining&~maximum_allowed;
+    if((dacl_granted&requested)!=requested || ((remaining&maximum_allowed) && !dacl_granted && !result.granted)){
+        result.granted=0;result.error=5;return result;
+    }
+    result.granted|=dacl_granted;return result;
+}
 std::uint32_t integrity_access(const VirtualToken& token,const SecurityDescriptor& sd,std::uint32_t granted,const AccessMapping& mapping){
     std::uint32_t integrity=0x2000,policy=1;
     if(!sd.data[2].empty()){
