@@ -189,6 +189,7 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"ntdll.dll","RtlLookupFunctionEntry","kernel32.dll","RtlLookupFunctionEntry"},
     {"ntdll.dll","RtlVirtualUnwind","kernel32.dll","RtlVirtualUnwind"},
     {"ntdll.dll","RtlUnwindEx","kernel32.dll","RtlUnwindEx"},
+    {"ntdll.dll","__chkstk","kernel32.dll","__chkstk"},
     {"ntdll.dll","_local_unwind","msvcrt.dll","_local_unwind"},
     {"kernel32.dll","_local_unwind","msvcrt.dll","_local_unwind"},
 };

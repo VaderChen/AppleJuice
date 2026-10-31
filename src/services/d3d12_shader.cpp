@@ -1,4 +1,5 @@
 #include "x64arm/windows_graphics.hpp"
+#include "shader_memory_cache.hpp"
 #include <vkd3d_shader.h>
 #include <spirv_msl.hpp>
 #include <algorithm>
@@ -31,7 +32,7 @@ unsigned classify(std::span<const std::uint8_t> bytes){
 }
 }
 bool graphics_modern_shader_required(std::span<const std::uint8_t> bytes){return classify(bytes)==1;}
-GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes){
+static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes){
     static std::mutex lock;const std::lock_guard guard(lock);
     if(stage!=0 && stage!=1 && stage!=5)throw std::invalid_argument("現代著色器目前支援 VS／PS／CS");
     if(!graphics_modern_shader_required(bytes))throw std::invalid_argument("著色器不是 DXIL 或 SM5.1 DXBC");
@@ -168,6 +169,52 @@ GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const 
     }
     if(stage==5)for(unsigned i=0;i<3;++i)result.threads[i]=std::max(1U,compiler.get_execution_mode_argument(spv::ExecutionModeLocalSize,i));
     compiler.rename_entry_point("main","xlatMtlMain",model);result.source=compiler.compile();result.entry="xlatMtlMain";
+    return result;
+}
+namespace {
+// 跨程序快取的記錄格式（格式版本、MSL、入口、綁定、頂點輸入、執行緒群組大小）；欄位全部以小端 32 位元長度前綴。
+constexpr std::uint32_t modern_record_version=1;
+std::vector<std::uint8_t> encode_modern_shader(const GraphicsModernShader& shader){
+    std::vector<std::uint8_t> out;out.reserve(shader.source.size()+shader.bindings.size()*28+256);
+    const auto put=[&](std::uint32_t value){const auto* bytes=reinterpret_cast<const std::uint8_t*>(&value);out.insert(out.end(),bytes,bytes+4);};
+    const auto text=[&](const std::string& value){put(static_cast<std::uint32_t>(value.size()));out.insert(out.end(),value.begin(),value.end());};
+    put(modern_record_version);text(shader.source);text(shader.entry);
+    put(static_cast<std::uint32_t>(shader.bindings.size()));
+    for(const auto& b:shader.bindings){put(b.type);put(b.slot);put(b.native_slot);put(b.counter_slot);put(b.space);put(b.count);put(b.source);}
+    put(static_cast<std::uint32_t>(shader.inputs.size()));
+    for(const auto& input:shader.inputs){text(input.semantic);put(input.index);put(input.attribute);}
+    for(const auto value:shader.threads)put(value);
+    return out;
+}
+std::optional<GraphicsModernShader> decode_modern_shader(std::span<const std::uint8_t> bytes){
+    std::size_t at=0;bool ok=true;
+    const auto get=[&]()->std::uint32_t{if(bytes.size()-at<4){ok=false;return 0;}std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);at+=4;return value;};
+    const auto text=[&]{std::string value;const auto size=get();if(!ok || bytes.size()-at<size){ok=false;return value;}
+        value.assign(reinterpret_cast<const char*>(bytes.data()+at),size);at+=size;return value;};
+    if(get()!=modern_record_version || !ok)return std::nullopt;
+    GraphicsModernShader shader;shader.source=text();shader.entry=text();
+    const auto bindings=get();if(!ok || bindings>(bytes.size()-at)/28)return std::nullopt;
+    shader.bindings.resize(bindings);
+    for(auto& b:shader.bindings){b.type=get();b.slot=get();b.native_slot=get();b.counter_slot=get();b.space=get();b.count=get();b.source=get();}
+    const auto inputs=get();if(!ok || inputs>(bytes.size()-at)/12)return std::nullopt;
+    shader.inputs.resize(inputs);
+    for(auto& input:shader.inputs){input.semantic=text();input.index=get();input.attribute=get();}
+    for(auto& value:shader.threads)value=get();
+    if(!ok || at!=bytes.size() || shader.source.empty() || shader.entry.empty())return std::nullopt;
+    return shader;
+}
+}
+// 翻譯結果只取決於（階段、bytecode）與翻譯器本身；跨程序快取命中時略過 vkd3d／SPIRV-Cross（電馭判客 PSO 載入的主要成本）。
+// 階段與格式檢查仍先做，失敗的翻譯不寫入快取。
+GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes){
+    if(stage!=0 && stage!=1 && stage!=5)throw std::invalid_argument("現代著色器目前支援 VS／PS／CS");
+    if(!graphics_modern_shader_required(bytes))throw std::invalid_argument("著色器不是 DXIL 或 SM5.1 DXBC");
+    if(!detail::shader_memory_cache_enabled())return translate_modern_shader(stage,bytes);
+    const auto key=detail::shader_cache_key(stage,bytes);
+    if(const auto cached=detail::shader_memory_cache_find(key))
+        if(auto shader=decode_modern_shader(*cached))return std::move(*shader);
+    auto result=translate_modern_shader(stage,bytes);
+    detail::shader_memory_cache_store(key,encode_modern_shader(result));
     return result;
 }
 }

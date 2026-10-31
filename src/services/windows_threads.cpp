@@ -1659,6 +1659,14 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
     // 不等待其他客體計時器，也不在正常產碼加入配額、時鐘讀取或裝置輪詢。
     if(const auto audio=wasapi_wakeup_ns())wake=wake?std::min(wake,audio):audio;
     if(const auto gpu=gpu_signal_wakeup_ns())wake=wake?std::min(wake,gpu):gpu;
+    // 等顯示緩衝的 Present（PresentRetry）：緩衝在垂直同步時釋出，沒有事件喚醒協調者；以 X64ARM_PRESENT_WAIT_POLL_US
+    // （預設 250，與 GPU 完成通知相同）輪詢，等待者的期限只是保底，不在輪詢時改動。雙人成行交錯對照：500 µs 時 35.47 對關閉 35.81 fps，
+    // 250 µs 時 35.80（喚醒延遲落在渲染執行緒的關鍵路徑上）。
+    if(!present_waits_.empty()){
+        static const std::uint64_t poll=[] {const auto* value=std::getenv("X64ARM_PRESENT_WAIT_POLL_US");
+            return std::max<std::uint64_t>(50,value?std::strtoull(value,nullptr,10):250)*1000;}();
+        wake=wake?std::min(wake,poll):poll;
+    }
     if(network_wait){
         const auto poll=external_wait_poll_limit()*100;
         wake=wake?std::min(wake,poll):poll;
@@ -2600,6 +2608,16 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             if(wait.deadline<=runtime_.clock_ticks)thread.status=ThreadStatus::Runnable;
             continue; // 重新執行原始 _locking 呼叫，保留每秒一次的嘗試次數與起始位置。
         }
+        if(wait.kind==ThreadWaitKind::PresentRetry){
+            // 顯示緩衝釋出或保底期限到：重新執行原始 Present（見 d3d11_graphics_present.inc）。只改期限以外的狀態，
+            // 未就緒時不回報變化，避免輪詢期間每次都觸發全體輪替。
+            const auto target=present_waits_.find(id);
+            if(target==present_waits_.end() || wait.deadline<=runtime_.clock_ticks || target->second->graphics_present_ready()){
+                if(target!=present_waits_.end())present_waits_.erase(target);
+                thread.status=ThreadStatus::Runnable;thread.wait={};
+            }
+            continue;
+        }
         if (wait.kind == ThreadWaitKind::HeapRetry) {
             // 等待解析可與原生 worker 並行，不能讀其活體 RIP。到期後重試完整 API，
             // 由全停服務邊界重新確認配置器已完成發布。
@@ -3160,7 +3178,8 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory, bool cont
                                     item.second.wait.kind == ThreadWaitKind::RegistryIo ||
                                     item.second.wait.kind == ThreadWaitKind::EtwTrace ||
                                     item.second.wait.kind == ThreadWaitKind::DebugEvent ||
-                                    item.second.wait.kind == ThreadWaitKind::CrtProcess);
+                                    item.second.wait.kind == ThreadWaitKind::CrtProcess ||
+                                    item.second.wait.kind == ThreadWaitKind::PresentRetry);
                         }) ||
             !runtime_.network.resolvers.empty() || !runtime_.network.pending_lookups.empty() || !runtime_.network.pending_accepts.empty() ||
             !runtime_.network.pending_socket_io.empty() || !gui_.socket_watches.empty() || !file_deadline ||
@@ -3346,6 +3365,10 @@ std::optional<std::uint32_t> WindowsServices::finish_thread(GuestState &state, G
     if (const auto tm = runtime_.tm_buffers.find(threads_.current); tm != runtime_.tm_buffers.end()) {
         (void)free_heap(memory, tm->second, state);
         runtime_.tm_buffers.erase(tm);
+    }
+    if (const auto cvt = runtime_.cvt_buffers.find(threads_.current); cvt != runtime_.cvt_buffers.end()) {
+        (void)free_heap(memory, cvt->second, state);
+        runtime_.cvt_buffers.erase(cvt);
     }
     const bool last = std::all_of(threads_.items.begin(), threads_.items.end(),
                                   [](const auto &entry) { return entry.second.status == ThreadStatus::Exited; });

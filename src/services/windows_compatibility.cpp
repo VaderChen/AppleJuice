@@ -262,7 +262,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll", "GetSystemWow64DirectoryA", 2}, {"kernel32.dll", "GetSystemWow64DirectoryW", 2},
         {"kernel32.dll", "GetWindowsDirectoryA", 2}, {"kernel32.dll", "GetWindowsDirectoryW", 2},
         {"kernel32.dll", "GetSystemWindowsDirectoryA", 2}, {"kernel32.dll", "GetSystemWindowsDirectoryW", 2},
-        {"powrprof.dll", "PowerGetActiveScheme", 2}, {"powrprof.dll", "CallNtPowerInformation", 5}, {"rpcrt4.dll", "UuidToStringA", 2}, {"rpcrt4.dll", "UuidToStringW", 2}, {"rpcrt4.dll", "RpcStringFreeA", 1}, {"rpcrt4.dll", "RpcStringFreeW", 1}, {"rpcrt4.dll", "UuidCreate", 1}, {"ole32.dll", "CoCreateGuid", 1}, {"kernel32.dll", "SetHandleCount", 1}, {"kernel32.dll", "GetThreadErrorMode", 0}, {"kernel32.dll", "SetThreadErrorMode", 2}, {"kernel32.dll", "GetErrorMode", 0}, {"kernel32.dll", "SetErrorMode", 1},
+        {"powrprof.dll", "PowerGetActiveScheme", 2}, {"powrprof.dll", "CallNtPowerInformation", 5}, {"rpcrt4.dll", "UuidToStringA", 2}, {"rpcrt4.dll", "UuidToStringW", 2}, {"rpcrt4.dll", "RpcStringFreeA", 1}, {"rpcrt4.dll", "RpcStringFreeW", 1}, {"rpcrt4.dll", "UuidCreate", 1}, {"ole32.dll", "CoCreateGuid", 1}, {"kernel32.dll", "SetHandleCount", 1}, {"kernel32.dll", "GetThreadErrorMode", 0}, {"kernel32.dll", "SetThreadErrorMode", 2}, {"kernel32.dll", "DelayLoadFailureHook", 2}, {"kernel32.dll", "__chkstk", 0}, {"kernel32.dll", "GetErrorMode", 0}, {"kernel32.dll", "SetErrorMode", 1},
         {"kernel32.dll", "WerGetFlags", 2}, {"kernel32.dll", "WerSetFlags", 1},
         {"kernel32.dll", "GetEnvironmentStringsW", 0}, {"kernel32.dll", "GetEnvironmentStringsA", 0},
         {"kernel32.dll", "FreeEnvironmentStringsW", 1}, {"kernel32.dll", "FreeEnvironmentStringsA", 1},
@@ -775,6 +775,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             memory.store(GuestAddress{arg(0)+8},8,(memory.load(GuestAddress{arg(0)+8},8)&63)|128);
         }
     } else if(symbol=="SetHandleCount")result=dword(0); // NT 系統不使用 DOS handle table 限制。
+    else if(symbol=="DelayLoadFailureHook"){
+        // 沒有可代替失敗匯入的系統 stub：與 Windows 相同回 NULL 並設 ERROR_PROC_NOT_FOUND，由延遲載入協助函式回報失敗。
+        last_error_=127;result=0;
+    }
+    else if(symbol=="__chkstk"){
+        // x64 堆疊探測：RAX 為配置大小，自呼叫端堆疊（回傳位址之上）逐頁往下確認可寫；保留 RAX 與其他暫存器，
+        // 只有 R10／R11 屬可破壞暫存器。範圍不可寫時照常產生存取違規。x86 的 _chkstk 會自行調整 ESP，語義不同。
+        if(x86_)throw HostCallFault("__chkstk 只有 x64 語義");
+        const auto size=state.reg(Gpr::Rax),top=state.reg(Gpr::Rsp)+8;
+        if(size>top)throw HostCallFault("__chkstk 配置大小超過堆疊位址");
+        for(auto page=(top-1)&~UINT64_C(4095);;page-=4096){
+            memory.check(GuestAddress{std::max(page,top-size)},1,Access::Write);
+            if(page<=top-size || page<4096)break;
+        }
+        result=size;
+    }
     else if(symbol=="GetThreadErrorMode" || symbol=="SetThreadErrorMode"){
         auto& mode=threads_.items.at(threads_.current).error_mode;
         if(symbol=="GetThreadErrorMode")result=mode.value_or(runtime_.error_mode);

@@ -5,6 +5,7 @@
 #include "guest_heap_layout.hpp"
 #include "guest_tls.hpp"
 #include "windows_loader_lock.hpp"
+#include "windows_memory_diagnostics.hpp"
 #include "windows_process_parameter_layout.hpp"
 #include "x64arm/startup_profile.hpp"
 #include "service_descriptor_index.hpp"
@@ -120,7 +121,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"crt", "_lseek", 3}, {"crt", "_lseeki64", 3,1U<<1}, {"crt", "_tell", 1}, {"crt", "_telli64", 1},
         {"crt", "fgetpos", 2}, {"crt", "fsetpos", 2}, {"crt", "fseek", 3}, {"crt", "_fseeki64", 3,1U<<1}, {"crt", "ftell", 1}, {"crt", "_ftelli64", 1},
         {"crt", "feof", 1}, {"crt", "ferror", 1}, {"crt", "clearerr", 1}, {"crt", "rewind", 1},
-        {"crt", "fgetwc", 1}, {"crt", "fputwc", 2}, {"crt", "ungetc", 2}, {"crt", "ungetwc", 2}, {"crt", "getchar", 0}, {"crt", "fgetc", 1}, {"crt", "getc", 1}, {"crt", "fgets", 3}, {"crt", "fputs", 2},
+        {"crt", "fgetwc", 1}, {"crt", "fgetws", 3}, {"crt", "fputwc", 2}, {"crt", "ungetc", 2}, {"crt", "ungetwc", 2}, {"crt", "getchar", 0}, {"crt", "fgetc", 1}, {"crt", "getc", 1}, {"crt", "fgets", 3}, {"crt", "fputs", 2},
         {"crt", "__stdio_common_vsnprintf_s", 7,1}, {"crt", "__stdio_common_vsnwprintf_s", 7,1}, {"crt", "_invalid_parameter_noinfo", 0}, {"crt", "__stdio_common_vsprintf_s", 6,1}, {"crt", "__stdio_common_vsprintf", 6,1}, {"crt", "vsnprintf", 4},
         {"crt","sprintf",2},
         {"crt","vsprintf",3},
@@ -577,15 +578,8 @@ std::uint64_t WindowsServices::runtime_allocate(GuestMemory& memory, std::span<c
         constexpr std::uint64_t granularity=65536;
         const auto capacity=std::max(granularity,(std::uint64_t{rounded}+4095)&~UINT64_C(4095));
         if(capacity>memory.remaining_capacity())throw std::bad_alloc();
-        const auto limit=user_address_limit();auto base=(runtime_.next_virtual+granularity-1)&~(granularity-1);
-        for(;;){
-            if(base>=limit || capacity>limit-base)throw std::bad_alloc();
-            auto end=base;
-            for(const auto& [at,region]:runtime_.virtual_regions)if(at<base+capacity && base<at+region.size)end=std::max(end,at+region.size);
-            if(const auto mapped=memory.query(GuestAddress{base}))end=std::max(end,mapped->base.value+mapped->size);
-            if(const auto mapped=memory.next_mapping(GuestAddress{base});mapped && mapped->base.value<base+capacity)end=std::max(end,mapped->base.value+mapped->size);
-            if(end==base)break;base=(end+granularity-1)&~(granularity-1);
-        }
+        const auto base=find_free_virtual_range(memory,capacity,granularity,granularity,user_address_limit(),runtime_.next_virtual);
+        if(!base)throw std::bad_alloc();
         memory.map(GuestAddress{base},static_cast<std::size_t>(capacity),read_write);
         runtime_.arena_base=base;runtime_.arena_capacity=capacity;runtime_.arena_next=0;offset=0;
         runtime_.next_virtual=(base+capacity+granularity-1)&~(granularity-1);
@@ -974,6 +968,10 @@ std::uint64_t guest_heap_block_size_impl(GuestMemory& memory,std::uint64_t addre
         catch(const MemoryFault&){detail<<" header_unreadable";}
         detail<<" native_mmu_pending="<<memory.native_mmu_update_pending()
             <<" borrow_generation=0x"<<memory.native_borrow_generation();
+        if(std::getenv("X64ARM_TRACE_FAULT_VIEWS")){
+            detail<<'\n';
+            x64arm::detail::trace_fault_memory_views(detail,memory,GuestAddress{address},"heap_chunk_header");
+        }
         throw HostCallFault(detail.str());
     }
     const auto cls=memory.load(GuestAddress{chunk+8},64),block=memory.load(GuestAddress{chunk+16},64);
@@ -2046,7 +2044,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
             if(detail::service_descriptor_contains<d3d9_service_descriptors>(service,reuse))return &WindowsServices::invoke_d3d9;
         if (service.family == "d3d10.dll" || service.family == "d3d10_1.dll" || service.family == "internal-d3d10" || service.family == "d3dx10_43.dll" || service.family == "d3d11.dll" || service.family == "dxgi.dll" || service.family == "internal-d3d11" || service.family == "d3dcompiler_47.dll" || service.family == "d3dcompiler_43.dll" || service.family == "d3dx11_42.dll" || service.family == "d3dx11_43.dll")
             return &WindowsServices::invoke_d3d11;
-        constexpr std::array io_names{"_umask","_umask_s","_creat", "_wcreat", "freopen", "_wfreopen", "_chsize", "_chsize_s", "_open_osfhandle", "_get_osfhandle", "_filelength", "_filelengthi64", "fgetpos", "fsetpos", "fopen_s", "_wfopen_s", "fopen", "_wfopen", "_fsopen", "_wfsopen", "_commit", "fclose", "fread", "fwrite", "fseek", "_fseeki64", "ftell", "_ftelli64", "feof", "ferror", "clearerr", "rewind", "fgetwc", "fputwc", "ungetc", "ungetwc", "getchar", "fgetc", "getc", "fgets", "fputs", "fputc", "putc", "fflush", "setvbuf", "setbuf", "_getmaxstdio", "_setmaxstdio", "_dup2", "_locking", "_dup", "_fdopen", "_wfdopen", "_close", "_read", "_write", "_open", "_wopen", "_sopen", "_wsopen", "_sopen_s", "_wsopen_s", "_lseek", "_lseeki64", "_tell", "_telli64", "_isatty", "_setmode"};
+        constexpr std::array io_names{"_umask","_umask_s","_creat", "_wcreat", "freopen", "_wfreopen", "_chsize", "_chsize_s", "_open_osfhandle", "_get_osfhandle", "_filelength", "_filelengthi64", "fgetpos", "fsetpos", "fopen_s", "_wfopen_s", "fopen", "_wfopen", "_fsopen", "_wfsopen", "_commit", "fclose", "fread", "fwrite", "fseek", "_fseeki64", "ftell", "_ftelli64", "feof", "ferror", "clearerr", "rewind", "fgetwc", "fgetws", "fputwc", "ungetc", "ungetwc", "getchar", "fgetc", "getc", "fgets", "fputs", "fputc", "putc", "fflush", "setvbuf", "setbuf", "_getmaxstdio", "_setmaxstdio", "_dup2", "_locking", "_dup", "_fdopen", "_wfdopen", "_close", "_read", "_write", "_open", "_wopen", "_sopen", "_wsopen", "_sopen_s", "_wsopen_s", "_lseek", "_lseeki64", "_tell", "_telli64", "_isatty", "_setmode"};
         if (service.family == "crt" && std::find(io_names.begin(), io_names.end(), service.symbol) != io_names.end()) return &WindowsServices::invoke_crt_io;
         if(detail::service_descriptor_contains<tls_service_descriptors>(service,reuse))return &WindowsServices::invoke_tls;
         if(service.family=="internal-msxml")return &WindowsServices::invoke_msxml;

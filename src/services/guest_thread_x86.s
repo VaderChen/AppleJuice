@@ -222,5 +222,32 @@ interlocked_word InterlockedExchangeAdd, add, 2
 interlocked_word InterlockedCompareExchange, compare, 3
 interlocked_word InterlockedExchangePointer, exchange, 2
 interlocked_word InterlockedCompareExchangePointer, compare, 3
+// D3D11／D3D10／DXGI 橋接物件的 COM AddRef／Release（stdcall，this 在 [esp+4]）：介面物件 [this+4] 指向身分共用的
+// 32 位元引用計數格。與 x64 版相同：AddRef 原子加一；Release 計數大於 1 時以 CAS 減一，否則保留原堆疊尾跳 vtable 前一格的 Release 服務。
+entry ComBridgeAddRef
+    mov ecx, dword ptr [esp+4]
+    mov edx, dword ptr [ecx+4]
+    mov eax, 1
+    lock xadd dword ptr [edx], eax
+    inc eax
+    ret 4
+end ComBridgeAddRef
+entry ComBridgeRelease
+    mov ecx, dword ptr [esp+4]
+    mov edx, dword ptr [ecx+4]
+    mov eax, dword ptr [edx]
+1:
+    cmp eax, 1
+    ja 2f
+    mov eax, dword ptr [esp+4]
+    mov eax, dword ptr [eax]
+    jmp dword ptr [eax-4]
+2:
+    lea ecx, [eax-1]
+    lock cmpxchg dword ptr [edx], ecx
+    jne 1b
+    mov eax, ecx
+    ret 4
+end ComBridgeRelease
 .globl _guest_thread_end
 _guest_thread_end:

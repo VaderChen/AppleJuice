@@ -661,6 +661,7 @@ struct RuntimeState {
         return remainder>UINT64_MAX-result?UINT64_MAX:result+remainder;
     }
     std::map<std::uint64_t,std::uint64_t> tm_buffers;
+    std::map<std::uint64_t,std::uint64_t> cvt_buffers; // 每執行緒 _ecvt／_fcvt 結果緩衝區
     std::uint32_t error_mode{};
     std::uint32_t wer_flags{};
     bool priority_boost_disabled{};

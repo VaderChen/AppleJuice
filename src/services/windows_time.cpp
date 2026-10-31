@@ -43,7 +43,7 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
         {"crt","gmtime_s",2},{"crt","localtime_s",2},{"crt","_gmtime32",1},{"crt","_localtime32",1},
         {"crt","_gmtime32_s",2},{"crt","_localtime32_s",2},{"crt","mktime",1},{"crt","_mkgmtime",1},
         {"crt","_mktime32",1},{"crt","_mkgmtime32",1},{"crt","difftime",2,3},{"crt","_difftime32",2},
-        {"crt","strftime",4},{"crt","_tzset",0},{"crt","__timezone",0},{"crt","__daylight",0},{"crt","__tzname",0},
+        {"crt","strftime",4},{"crt","_tzset",0},{"crt","__timezone",0},{"crt","__daylight",0},{"crt","__tzname",0},{"crt","_get_tzname",4},{"crt","_get_timezone",1},{"crt","_get_daylight",1},{"crt","_get_dstbias",1},
         {"crt","wcsftime",4},{"crt","_Strftime",5},{"crt","_Wcsftime",5},
         {"crt","_strftime_l",5},{"crt","_wcsftime_l",5},{"crt","_Strftime_l",6},{"crt","_Wcsftime_l",6},
         {"crt","_Getdays",0},{"crt","_Getmonths",0},{"crt","_W_Getdays",0},{"crt","_W_Getmonths",0},
@@ -445,6 +445,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
     }else if (symbol=="__timezone") result=timezone_cell;
     else if (symbol=="__daylight") result=daylight_cell;
     else if (symbol=="__tzname") result=names;
+    else if (symbol=="_get_timezone" || symbol=="_get_daylight" || symbol=="_get_dstbias") {
+        // UCRT：輸出指標為空走無效參數並回 EINVAL；值與 __timezone／__daylight 同源，客體時區 UTC 沒有日光節約偏差。
+        if(!arg(0)){error(22);invalid_parameter=true;}
+        else {memory.store(GuestAddress{arg(0)},32,symbol=="_get_dstbias"?0:memory.load(GuestAddress{symbol=="_get_timezone"?timezone_cell:daylight_cell},32));result=0;}
+    }
+    else if (symbol=="_get_tzname") {
+        // UCRT：先驗證緩衝區與大小一致才清空首字元；回傳含結尾 NUL 的長度，只查長度時緩衝區為空且大小為 0，
+        // 空間不足直接回 ERANGE（不經無效參數處理）。
+        const auto buffer=arg(1),size=arg(2);const auto index=static_cast<std::uint32_t>(arg(3));
+        if((!buffer)!=(!size)){error(22);invalid_parameter=true;}
+        else {
+            if(buffer)memory.store(GuestAddress{buffer},8,0);
+            if(!arg(0) || index>1){error(22);invalid_parameter=true;}
+            else {
+                std::vector<std::uint8_t> name;const auto pointer=memory.load(GuestAddress{names+index*(x86_?4U:8U)},x86_?32:64);
+                for(auto at=pointer;at && name.size()<4096;++at){const auto c=static_cast<std::uint8_t>(memory.load(GuestAddress{at},8));if(!c)break;name.push_back(c);}
+                name.push_back(0);memory.store(GuestAddress{arg(0)},x86_?32:64,name.size());
+                if(buffer && name.size()>size)result=34;else {if(buffer)memory.write(GuestAddress{buffer},name);result=0;}
+            }
+        }
+    }
     else if (symbol=="_tzset") { memory.store(GuestAddress{timezone_cell},32,0); memory.store(GuestAddress{daylight_cell},32,0); }
     else if (symbol=="GetTimeZoneInformation" || symbol=="GetDynamicTimeZoneInformation") {
         if(!arg(0)){last_error_=87;arg.return_to(state,UINT32_MAX);return std::nullopt;}

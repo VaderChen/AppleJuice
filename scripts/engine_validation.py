@@ -26,11 +26,55 @@ def bounded_launcher_row(row):
             raise ValueError('Launcher GUI 觀測缺少輸入或畫面身分：' + key)
 
 
+def bounded_gameplay_row(row):
+    """以原生操作、唯讀狀態與 UI 收尾核對有界遊玩，不表示 FPS 或全部遊戲通過。"""
+    if (row.get('observer') != 'launcher_ui' or row.get('criterion') != 'interactive_gameplay' or
+            row.get('backend') != 'jit' or row.get('stop_reason') != 'launcher_ui_stop' or
+            row.get('launcher_exit_code') != 0 or row.get('program_state') != 'stopped' or
+            row.get('program_exit_code') != -1 or row.get('natural_exit_code') is not None or
+            'natural_exit_code' not in row or row.get('all_producers_stopped') is not True or
+            row.get('remaining_pids') != [] or row.get('guard_stop_reason') is not None or
+            'guard_stop_reason' not in row or row.get('guard_exit_code') != 0 or
+            row.get('pressure_levels') != [1] or
+            any(row.get(key) is not True for key in ('engine_controls_applied', 'engine_unchanged',
+                'app_unchanged', 'source_settings_unchanged', 'group_stopped', 'launcher_ui_passed',
+                'readonly_diagnostics', 'all_inputs_released', 'directional_position_change'))):
+        raise ValueError('有界遊玩缺少實際操作、正常守護或 UI 收尾契約')
+    times = [row.get(key) for key in ('deadline_seconds', 'observation_seconds',
+             'first_diagnostic_seconds', 'last_diagnostic_seconds', 'maximum_diagnostic_gap_seconds')]
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or
+           not math.isfinite(value) for value in times):
+        raise ValueError('有界遊玩診斷時間不完整')
+    deadline, observed, first, last, gap = times
+    if not (30 <= deadline <= observed and 0 <= first < last <= observed and
+            first <= min(60, deadline/2) and last >= deadline-15 and 0 < gap <= 25):
+        raise ValueError('唯讀狀態未涵蓋指定遊玩區間，或超過輸入器的新鮮度期限')
+    cycles = row.get('repeat_cycle_observations', [])
+    count = row.get('requested_repeat_cycles')
+    if (row.get('input_status') != 'passed' or type(count) is not int or not 1 <= count <= 16 or
+            len(cycles) != count or [cycle.get('cycle') for cycle in cycles] != list(range(1, count+1)) or
+            any(type(cycle.get('steps')) is not int or cycle['steps'] <= 0 or
+                type(cycle.get('position_changes')) is not int or cycle['position_changes'] <= 0
+                for cycle in cycles)):
+        raise ValueError('重複操作未完成，或沒有觀測到角色位移')
+    if (type(row.get('tail_frame_counter_delta')) is not int or row['tail_frame_counter_delta'] <= 0 or
+            any(type(row.get(key)) is not int or row[key] != 0
+                for key in ('fault_context_count', 'heap_integrity_fault_count'))):
+        raise ValueError('觀測末段未持續更新，或存在已記錄的客體故障')
+    for key in ('report_sha256', 'input_sha256', 'diagnostic_sha256', 'exe_sha256', 'launcher_sha256'):
+        digest = row.get(key)
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+            raise ValueError('有界遊玩缺少已核對的來源身分：' + key)
+
+
 def bounded_gui_rows(evidence):
     rows = evidence.get('workloads', [])
     if evidence.get('smoke_run') is not False or evidence.get('backends') != ['jit'] or not rows:
         raise ValueError('缺少有界 GUI 實際觀測')
     for row in rows:
+        if row.get('criterion') == 'interactive_gameplay':
+            bounded_gameplay_row(row)
+            continue
         times = [row.get(key) for key in ('image_seconds', 'deadline_seconds', 'observation_seconds')]
         if (any(isinstance(value, bool) or not isinstance(value, (int, float)) or
                 not math.isfinite(value) for value in times) or not 0 <= times[0] <= times[1] <= times[2]):

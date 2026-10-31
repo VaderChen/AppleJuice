@@ -10,7 +10,7 @@ struct MultimediaThreadTask {
     bool operator==(const MultimediaThreadTask&) const = default;
 };
 enum class ThreadStatus { Runnable, Waiting, Exited };
-enum class ThreadWaitKind { HeapRetry, Http, Resolver, SocketSelect, Objects, Sleep, Critical, CriticalRetry, Completion, CrtLock, StandardInput, ConsoleInput, GuiSend, GuiInput, Slim, Condition, Once, LoaderRetry, ProcessInputIdle, FileIo, RegisteredWait, RegisteredWaitCompletion, TimerQueueCompletion, RegistryNotify, ThreadpoolCompletion, PowerNotificationCompletion, EtwTrace, EtwEnable, DebugEvent, MediaFoundation, ServiceControl, CrtFileRetry, CrtProcess, CrtLockRetry, NativeDevice, Perflib, HandleTransfer, ProcessCreation, RemoteThreadCreation, RegistryIo, Address };
+enum class ThreadWaitKind { HeapRetry, Http, Resolver, SocketSelect, Objects, Sleep, Critical, CriticalRetry, Completion, CrtLock, StandardInput, ConsoleInput, GuiSend, GuiInput, Slim, Condition, Once, LoaderRetry, ProcessInputIdle, FileIo, RegisteredWait, RegisteredWaitCompletion, TimerQueueCompletion, RegistryNotify, ThreadpoolCompletion, PowerNotificationCompletion, EtwTrace, EtwEnable, DebugEvent, MediaFoundation, ServiceControl, CrtFileRetry, CrtProcess, CrtLockRetry, NativeDevice, Perflib, HandleTransfer, ProcessCreation, RemoteThreadCreation, RegistryIo, Address, PresentRetry };
 struct ThreadWait {
     ThreadWaitKind kind{ThreadWaitKind::Objects};
     std::vector<std::uint64_t> handles;

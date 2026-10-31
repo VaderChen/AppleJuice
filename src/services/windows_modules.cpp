@@ -310,14 +310,30 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
         if(const auto host=windows_api_set_host(name);host!=name){const auto base=load_module(memory,utf8_to_utf16(host),flags,created,{},state);runtime_.modules.emplace(name,base);return base;}
         if(name.starts_with("api-ms-win-crt-")){const auto base=load_module(memory,u"ucrtbase.dll",flags,created,{},state);runtime_.modules.emplace(name,base);return base;}
         if(runtime_.builtin_images.size()>=windows_address_layout::module_slots)throw ModuleError(8,"內建模組數量超過固定容量");
-        // 每個引擎版本共用固定模組配置，與各程序載入順序無關。
-        static const auto bases=[] {std::set<std::string> names{"kernel32.dll","wsock32.dll"};for(const auto name:modern_crt_libraries)names.emplace(name);for(const auto name:legacy_crt_libraries)names.emplace(name);for(const auto& item:runtime_service_descriptors())if(item.family.ends_with(".dll") || item.family.ends_with(".drv") || item.family.ends_with(".ocx") || item.family.ends_with(".cpl") || item.family.ends_with(".exe"))names.emplace(item.family);std::map<std::string,std::size_t> result;for(const auto& item:names)result.emplace(item,result.size());return result;}();
-        const auto slot=bases.find(name);if(slot==bases.end() || slot->second>=windows_address_layout::module_slots)throw ModuleError(8,"內建模組沒有固定配置："+name);
-        const auto base=windows_address_layout::for_mode(memory.execution_mode()).images+slot->second*windows_address_layout::module_stride;
+        // 每個引擎版本共用固定模組配置，與各程序載入順序無關。匯出表放不進一格的模組占用連續多格：
+        // 依描述表估算 builtin_headers 的大小（4 KiB 標頭＋匯出目錄每項 10 bytes 與名稱字串、頁對齊，再加每個入口 16 bytes），
+        // 另留一頁給描述表以外的別名，避免臨界時超出。
+        static const auto bases=[] {std::set<std::string> names{"kernel32.dll","wsock32.dll"};for(const auto name:modern_crt_libraries)names.emplace(name);for(const auto name:legacy_crt_libraries)names.emplace(name);for(const auto& item:runtime_service_descriptors())if(item.family.ends_with(".dll") || item.family.ends_with(".drv") || item.family.ends_with(".ocx") || item.family.ends_with(".cpl") || item.family.ends_with(".exe"))names.emplace(item.family);
+            std::map<std::string,std::pair<std::size_t,std::size_t>,std::less<>> exports;
+            for(const auto& item:runtime_service_descriptors()){auto& entry=exports[std::string(item.family)];++entry.first;entry.second+=item.symbol.size()+1;}
+            std::map<std::string,std::pair<std::size_t,std::size_t>> result;std::size_t next=0;
+            for(const auto& item:names){
+                std::size_t span=1;
+                if(const auto found=exports.find(item);found!=exports.end()){
+                    const auto [count,strings]=found->second;
+                    const auto bytes=((4096+40+count*10+item.size()+1+strings+4095)&~std::size_t{4095})+((count*16+4095)&~std::size_t{4095})+4096;
+                    span=std::max<std::size_t>(1,(bytes+windows_address_layout::module_stride-1)/windows_address_layout::module_stride);
+                }
+                result.emplace(item,std::pair{next,span});next+=span;
+            }
+            return result;}();
+        const auto slot=bases.find(name);if(slot==bases.end() || slot->second.first+slot->second.second>windows_address_layout::module_slots)throw ModuleError(8,"內建模組沒有固定配置："+name);
+        const auto base=windows_address_layout::for_mode(memory.execution_mode()).images+slot->second.first*windows_address_layout::module_stride;
+        const auto capacity=slot->second.second*windows_address_layout::module_stride;
         const auto targets=builtin_export_targets(name);
         const auto system_calls=!x86_ && name=="ntdll.dll"?builtin_system_calls():std::map<std::uint64_t,std::uint32_t>{};
         auto headers=builtin_headers(base,name,x86_,targets,system_calls);
-        if(headers.bytes.size()>windows_address_layout::module_stride || !memory.range_available(GuestAddress{base},headers.bytes.size()))throw ModuleError(8,"內建模組固定範圍已占用");
+        if(headers.bytes.size()>capacity || !memory.range_available(GuestAddress{base},headers.bytes.size()))throw ModuleError(8,"內建模組固定範圍已占用");
         RuntimeImage image;image.base=base;image.size=headers.bytes.size();image.path=u"C:\\Windows\\System32\\"+utf8_to_utf16(name);
         image.export_names=std::move(headers.names);image.export_ordinals=std::move(headers.ordinals);
         memory.map(GuestAddress{base},headers.code,permission(Access::Read),std::span(headers.bytes).first(headers.code));

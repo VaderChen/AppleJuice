@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/interpreter.hpp"
 #include "x64arm/windows_unwind.hpp"
+#include "windows_memory_diagnostics.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -73,6 +74,7 @@ void trace_fault_memory(const GuestState& state,const GuestMemory& memory,std::u
                 if(end<=begin || end-begin<8 ||
                    std::find(starts.begin(),starts.begin()+count,begin)!=starts.begin()+count)continue;
                 starts[count++]=begin;
+                detail::trace_fault_memory_views(out,memory,GuestAddress{value},"exception");
                 for(auto address=begin;end-address>=8;){
                     out<<"[fault_page] begin=0x"<<address;
                     bool readable=true;

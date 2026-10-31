@@ -91,6 +91,35 @@ VirtualMemoryInformation WindowsServices::virtual_memory_information(const Guest
     } else if (const auto next=memory.next_mapping(GuestAddress{address})) end=std::min(end,next->base.value);
     return {base,allocation,end-base,initial,allocation_state,mode,type};
 }
+std::uint64_t WindowsServices::find_free_virtual_range(const GuestMemory& memory,std::uint64_t size,
+        std::uint64_t alignment,std::uint64_t lowest,std::uint64_t limit,std::uint64_t preferred,bool descending) const {
+    if(!size || !alignment || (alignment&(alignment-1)) || lowest>=limit || size>limit-lowest)return 0;
+    const auto mask=alignment-1;
+    const auto align_up=[&](std::uint64_t value){return value>UINT64_MAX-mask?UINT64_MAX:(value+mask)&~mask;};
+    const auto search=[&](std::uint64_t begin)->std::uint64_t {
+        while(begin>=lowest && begin<limit && size<=limit-begin){
+            bool conflict=false;auto low=begin,high=begin;
+            const auto include=[&](std::uint64_t base,std::uint64_t bytes){
+                if(base<begin+size && begin<base+bytes){conflict=true;low=std::min(low,base);high=std::max(high,base+bytes);}
+            };
+            auto region=runtime_.virtual_regions.upper_bound(begin);
+            if(region!=runtime_.virtual_regions.begin())--region;
+            for(;region!=runtime_.virtual_regions.end() && region->first<begin+size;++region)include(region->first,region->second.size);
+            if(const auto mapped=memory.query(GuestAddress{begin}))include(mapped->base.value,mapped->size);
+            if(const auto mapped=memory.next_mapping(GuestAddress{begin}))include(mapped->base.value,mapped->size);
+            if(!conflict)return begin;
+            if(descending){if(low<size || low-size<lowest)return 0;begin=(low-size)&~mask;}
+            else begin=align_up(high);
+        }
+        return 0;
+    };
+    if(descending)return search((limit-size)&~mask);
+    const auto start=align_up(std::max(lowest,preferred));
+    if(const auto found=search(start))return found;
+    // cursor 只是搜尋提示；走到位址上限後，已釋放的低位址空洞仍可使用。
+    // 第二次搜尋保留完整上界，允許空洞跨過原 cursor，不誤判為位址耗盡。
+    return start>align_up(lowest)?search(align_up(lowest)):0;
+}
 bool WindowsServices::protection_allocation_range(std::uint64_t begin,std::uint64_t end) const {
     const auto& regions=runtime_.virtual_regions;auto found=regions.upper_bound(begin);
     if(found!=regions.begin()){
@@ -179,7 +208,6 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
         const auto align=requirements && requirements->alignment?std::max(granularity,requirements->alignment):granularity;
         const auto lowest=requirements?std::max(granularity,requirements->lowest):granularity;
         const auto highest=requirements && requirements->highest?std::min(address_limit-1,requirements->highest):address_limit-1;
-        const auto align_up=[&](std::uint64_t value){return value>UINT64_MAX-(align-1)?UINT64_MAX:(value+align-1)&~(align-1);};
         if (!size || size>=address_limit || requested>=address_limit || size>address_limit-requested) fail(87);
         else if((requirements && requirements->alignment && (requirements->alignment&(requirements->alignment-1))) ||
                 (align&(align-1)) || lowest>highest || size>highest-lowest+1 || (requirements && requested && (requirements->lowest || requirements->highest || requirements->alignment)))fail(87);
@@ -217,25 +245,8 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
             const auto span=requested?round_page(requested+size)-begin:round_page(size);
             if (!requested) {
                 const bool descending=bool(type&0x100000);
-                begin=descending?(highest+1-span)&~(align-1):align_up(requirements?lowest:runtime_.next_virtual);
-                for (;;) {
-                    bool conflict=false;std::uint64_t low=begin,high=begin;
-                    // 保留區互不重疊：只有起點前一個與起點落在候選範圍內者可能衝突，以有序查詢取代全表掃描。
-                    auto overlap=regions.upper_bound(begin);
-                    if (overlap!=regions.begin()) --overlap;
-                    for (;overlap!=regions.end() && overlap->first<begin+span;++overlap) if (begin<overlap->first+overlap->second.size) {
-                        conflict=true;low=std::min(low,overlap->first);high=std::max(high,overlap->first+overlap->second.size);
-                    }
-                    if (const auto mapping=memory.query(GuestAddress{begin})) {
-                        conflict=true;low=std::min(low,mapping->base.value);high=std::max(high,mapping->base.value+mapping->size);
-                    }
-                    if (const auto mapping=memory.next_mapping(GuestAddress{begin});mapping && mapping->base.value<begin+span) {
-                        conflict=true;low=std::min(low,mapping->base.value);high=std::max(high,mapping->base.value+mapping->size);
-                    }
-                    if (!conflict) break;
-                    if (descending) {if (low<span || ((low-span)&~(align-1))<lowest) {begin=0;break;}begin=(low-span)&~(align-1);}
-                    else {begin=align_up(high);if (begin>highest || span>highest+1-begin) {begin=0;break;}}
-                }
+                begin=find_free_virtual_range(memory,span,align,lowest,highest+1,
+                    requirements?lowest:runtime_.next_virtual,descending);
             }
             auto found=region_at(begin);
             if (begin<lowest || begin>highest || span>highest+1-begin) fail(487);

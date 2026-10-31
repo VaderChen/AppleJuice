@@ -777,6 +777,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     if(l.modern && (name.starts_with("??1facet@") || name.starts_with("??1?$codecvt@"))){s.facet_locales.erase(object);put(object,s.facet_table14);return done(0);}
     if(l.modern && method=="tolower"){const bool range=name.find("PEAD")!=name.npos || name.find("PEA_W")!=name.npos || name.find("PAD")!=name.npos || name.find("PA_W")!=name.npos;
         return virtual_call(object,(l.element==1?3U:7U)+(range?0U:1U),range?std::vector<std::uint64_t>{a(0),a(1)}:std::vector<std::uint64_t>{a(0)});}
+    // ctype::widen／narrow 單字元公開包裝：與標頭內聯版本相同轉呼叫 do_widen／do_narrow（衍生 facet 的覆寫一併生效）。
+    if(l.modern && (method=="widen" || method=="narrow") && name.find("@?$ctype@")!=name.npos){
+        const bool widen=method=="widen";const auto slot=(l.element==1?8U:12U)+(widen?0U:2U);
+        return virtual_call(object,slot,widen?std::vector<std::uint64_t>{a(0)&255U}:std::vector<std::uint64_t>{a(0)&(l.element==1?255U:65535U),a(1)&255U});
+    }
     if(method.starts_with("Ctype")){
         if(method=="CtypeIs")return done((character_mask(static_cast<char16_t>(a(1)))&a(0))!=0);
         if(method=="CtypeIsRange"){
@@ -845,7 +850,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     const bool io_stream=name.find("basic_iostream@")!=name.npos;
     // VC14 ios_base 狀態（goodbit 0、eofbit 1、failbit 2、badbit 4，例外遮罩緊接其後）與格式欄位的存取子。
     const bool const_method=name.find("@QEB")!=name.npos || name.find("@QBE")!=name.npos || name.find("@IEB")!=name.npos || name.find("@IBE")!=name.npos;
-    if(class_owner.starts_with("ios_base@")){
+    // 靜態成員（_Ios_base_dtor 等）沒有 this，不讀取物件狀態。
+    if(class_owner.starts_with("ios_base@") && !stat){
         const auto state_value=static_cast<std::uint32_t>(memory.load(GuestAddress{object+l.state},32));
         if(method=="good")return done(state_value==0);
         if(method=="eof")return done((state_value&1U)!=0);
@@ -1016,6 +1022,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
             if(method=="_Osfx" || method=="flush")op.kind=method=="flush"?"ostream_flush":"ostream_suffix";
             else if(method=="write"){op.kind="ostream_write";op.output=a(0);op.limit=a(1);}
             else if(method=="put"){op.kind="ostream_put";op.output=a(0)&((1U<<(l.element*8))-1U);op.limit=1;}
+            else if(name.starts_with("??6") && name.find("V?$basic_streambuf@")!=name.npos){op.kind="ostream_buffer";op.limit=a(0);}
             else if(name.starts_with("??6")){
                 const auto locale=ptr(op.ios+l.locale),imp=locale?ptr(locale+l.locale_pointer()):0;const auto id=l.element==1?4U:7U;
                 const auto num_put=l.modern && imp && ptr(imp+3*l.p)>id?ptr(ptr(imp+2*l.p)+id*l.p):0;
@@ -1413,6 +1420,8 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
             }
             if(op.kind=="ostream_suffix")return finish(0);
             if(op.kind=="ostream_flush")return finish(op.object);
+            // operator<<(basic_streambuf*)：sentry 失敗時沒有複製任何字元，與 MSVC 相同清 width 並設 failbit（來源為空設 badbit）。
+            if(op.kind=="ostream_buffer"){memory.store(GuestAddress{op.ios+l.width},64,0);setstate(op.limit?2:4);return finish(op.object);}
             if(op.kind.starts_with("ostream_")){setstate(4);return finish(op.object);}
             setstate(2);if(op.kind=="tellg"){memory.write(GuestAddress{op.output},std::array<std::uint8_t,24>{});memory.store(GuestAddress{op.output},64,UINT64_MAX);return finish(op.output);}
             return finish(prefix?0:op.kind=="peek" || (op.kind=="istream_get" && !op.output)?l.eof():op.object);}
@@ -1444,6 +1453,44 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
         args.push_back(2);return virt(11,std::move(args),1);
     }
     if(op.kind.starts_with("ostream_")){
+        if(op.kind=="ostream_buffer"){
+            // MSVC operator<<(basic_streambuf*)：先 sgetc，之後每次 snextc，逐字元交給 rdbuf()->sputc；來源讀到 eof 或寫入失敗即停。
+            // 一個字元都沒複製設 failbit，寫入失敗加 badbit，結束時清 width。op.phase：20 取第一字元、21 取下一字元、22 寫出 op.output。
+            const auto source=op.limit;
+            const auto source_count=[&]{return ptr(source+l.count_indirect(false));};
+            const auto source_position=[&]{return ptr(source+l.next_indirect(false));};
+            const auto source_available=[&]{return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{source_count()},32)));};
+            const auto source_character=[&]{return memory.load(GuestAddress{ptr(source_position())},l.character_bits());};
+            const auto source_virtual=[&](unsigned slot,unsigned next){return callback(ptr(ptr(source)+slot*l.p),{source},next);};
+            const auto complete=[&](unsigned flags){memory.store(GuestAddress{op.ios+l.width},64,0);if(flags)setstate(flags);return finish(op.object);};
+            if(!source)return complete(4);
+            if(!op.phase)op.phase=20;
+            if(returned==31){op.output=value&l.int_mask();op.phase=22;}
+            else if(returned==32){
+                if((value&l.int_mask())==l.eof()){op.output=l.eof();op.phase=22;}
+                else if(source_available()>0){op.output=source_character();op.phase=22;}
+                else return source_virtual(6,31);
+            }else if(returned==33){
+                if((value&l.int_mask())==l.eof())return complete(op.count?4U:6U);
+                op.count=1;op.phase=21;
+            }
+            for(;;){
+                if(op.phase==20){
+                    if(source_available()<=0)return source_virtual(6,31);
+                    op.output=source_character();op.phase=22;
+                }else if(op.phase==21){
+                    if(source_available()<=0)return source_virtual(7,32);
+                    const auto position=source_position(),count=source_count();put(position,ptr(position)+l.element);
+                    memory.store(GuestAddress{count},32,memory.load(GuestAddress{count},32)-1);
+                    if(source_available()<=0)return source_virtual(6,31);
+                    op.output=source_character();op.phase=22;
+                }else{
+                    if(op.output==l.eof())return complete(op.count?0U:2U);
+                    if(available(true)<=0)return virt(3,{op.output},33);
+                    memory.store(GuestAddress{ptr(position_address(true))},l.character_bits(),op.output);consume(true);op.count=1;op.phase=21;
+                }
+            }
+        }
         if(op.kind=="ostream_number"){
             try{const auto text=format_msvcp_number(op,memory,l);op.limit=text.size();op.scratch=allocate_heap(memory,std::max<std::uint64_t>(1,op.limit*l.element));
                 if(!op.scratch)throw std::bad_alloc{};op.output=op.scratch;for(std::size_t i=0;i<text.size();++i)memory.store(GuestAddress{op.output+i*l.element},l.character_bits(),text[i]);op.kind="ostream_write";

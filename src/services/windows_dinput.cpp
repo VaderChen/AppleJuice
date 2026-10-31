@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "automation_gamepad.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/registry_store.hpp"
 #include "x64arm/windows_keyboard.hpp"
@@ -128,7 +129,7 @@ std::shared_ptr<input::Backend> WindowsServices::input_backend()const{return din
 void WindowsServices::prepare_input_backend(){
     if(!runtime_.network.external_io)return;
     if(!dinput_)dinput_=std::make_shared<DirectInputState>();
-    if(!dinput_->backend)dinput_->backend=input::make_backend();
+    if(!dinput_->backend)dinput_->backend=detail::make_input_backend();
 }
 void WindowsServices::inject_dinput(bool keyboard,unsigned object,std::int64_t value,std::uint32_t time){
     if(keyboard && object<256)gui_.injected_di_keys[object]=value?1:2;
@@ -242,7 +243,7 @@ void WindowsServices::poll_dinput(bool background){
 }
 std::optional<std::uint32_t> WindowsServices::invoke_dinput(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(!runtime_.network.external_io)throw HostCallFault("DirectInput 不能在 compare 模式使用");
-    if(!dinput_)dinput_=std::make_shared<DirectInputState>();auto& bridge=*dinput_;if(!bridge.backend)bridge.backend=input::make_backend();
+    if(!dinput_)dinput_=std::make_shared<DirectInputState>();auto& bridge=*dinput_;if(!bridge.backend)bridge.backend=detail::make_input_backend();
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const unsigned unit=x86_?4U:8U;const std::uint8_t bits=x86_?32:64;
     if(service.family=="xinput1_3.dll" || service.family=="xinput1_4.dll" || service.family=="xinput9_1_0.dll"){
 #include "windows_xinput.inc"

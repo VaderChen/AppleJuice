@@ -9,6 +9,7 @@
 #include "socket_randomize_option.hpp"
 #include "socket_multicast_options.hpp"
 #include "socket_ingress.hpp"
+#include "monotonic_clock.hpp"
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
@@ -230,9 +231,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_network_extension(GuestStat
     complete_call(state,memory,result);return std::nullopt;
 }
 
-void WindowsServices::pump_gui_network(){
+void WindowsServices::pump_gui_network(std::uint64_t only){
     // 每輪仍向核心查詢；有界批次避免每個 watch 都付出一次 poll 系統呼叫，
     // 不配置熱路徑記憶體，也不限制可監看的 socket 總數。
+    // 全量抽取（完整排程、GUI 抽取）距上次未滿 X64ARM_NETWORK_PUMP_US（預設 2000，0 為每次都抽取）就略過：每個監看要一次 poll
+    // 加 UDP 佇列 fstat，雙人成行每秒約千次、每次約 250 µs，且多在全停或協調者持獨占映射鎖時執行，worker 上的 D3D11 服務
+    // 卡在讀鎖自旋。事件最多晚這段時間記錄，等同稍後才到達，不會遺失；全體等待網路時的閒置輪詢間隔本來就是毫秒級。
+    // 只用於宿主時鐘模式；虛擬時鐘維持每次抽取。
+    // WSAEnumNetworkEvents 只抽取被查詢的 socket，不受此限（回送送出後立即查詢仍看得到 FD_READ）。
+    if(!only){
+        static const std::uint64_t interval=[] {const auto* value=std::getenv("X64ARM_NETWORK_PUMP_US");
+            return (value?std::strtoull(value,nullptr,10):UINT64_C(2000))*10;}();
+        if(interval && runtime_.host_clock){
+            const auto now=detail::monotonic_ticks();
+            if(gui_.network_pump_ticks && now-gui_.network_pump_ticks<interval)return;
+            gui_.network_pump_ticks=now;
+        }
+    }
     std::array<pollfd,128> entries;std::array<std::uint64_t,128> handles;std::size_t count=0;
     const auto flush=[&]{
         if(!count)return;
@@ -265,6 +280,7 @@ void WindowsServices::pump_gui_network(){
         count=0;
     };
     for(auto& [handle,watch]:gui_.socket_watches){
+        if(only && handle!=only)continue;
         const auto found=runtime_.network.sockets.find(handle);if(found==runtime_.network.sockets.end())continue;auto& shared=found->second->shared->data();
         if(watch.generation!=shared.watch_generation.load())continue;watch.armed|=shared.watch_rearm.exchange(0);
         handles[count]=handle;entries[count++]={found->second->descriptor,static_cast<short>(POLLIN|((watch.events&watch.armed&4)?POLLPRI:0)|((watch.connecting || (watch.armed&2))?POLLOUT:0)),0};
@@ -698,7 +714,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                 }else if(symbol=="WSAEnumNetworkEvents"){
                     const auto object=runtime_.wait_objects.find(arg(1));if(arg(1) && (object==runtime_.wait_objects.end() || object->second.kind!=WaitObject::Kind::Event || !(object->second.access&2)))fail(10022);
                     else if(!arg(2))fail(10014);
-                    else{memory.check(GuestAddress{arg(2)},44,Access::Write);pump_gui_network();std::array<std::uint8_t,44> bytes{};auto& data=socket->shared->data();const auto recorded=data.watch_recorded.exchange(0);for(unsigned i=0;i<4;++i)bytes[i]=static_cast<std::uint8_t>(recorded>>(i*8));
+                    else{memory.check(GuestAddress{arg(2)},44,Access::Write);pump_gui_network(arg(0));std::array<std::uint8_t,44> bytes{};auto& data=socket->shared->data();const auto recorded=data.watch_recorded.exchange(0);for(unsigned i=0;i<4;++i)bytes[i]=static_cast<std::uint8_t>(recorded>>(i*8));
                         for(unsigned j=0;j<10;++j){const auto error=data.watch_errors[j].load();for(unsigned i=0;i<4;++i)bytes[4+j*4+i]=static_cast<std::uint8_t>(error>>(i*8));}memory.write(GuestAddress{arg(2)},bytes);if(arg(1))object->second.set_signal(false);
                         if(std::getenv("X64ARM_TRACE_NETWORK_STATE") && recorded){
                             const auto saved_errno=errno;

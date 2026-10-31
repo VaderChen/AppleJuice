@@ -73,15 +73,19 @@ bool WindowsServices::dispatch_gui_mouse(GuestState& state,GuestMemory& memory,s
     // 先讓程式處理較早的按下事件；其中的 SetCapture／SC_MOVE 必須影響後續移動。
     if(std::any_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& message){return message.queue_priority==1 && ((message.message>=0x200 && message.message<=0x20e) || (message.message>=0xa0 && message.message<=0xad)) && gui_message_matches(message,threads_.current);}))return false;
     for(auto& [id,input]:gui_.mouse_inputs)if(input.thread==threads_.current && !input.active){
-        input.active=true;input.modal=modal;input.wait_message=wait_message;
-        if(input.native_activation){input.stage=GuiMouseInput::Stage::Commit;input.root=gui_root_window(input.message.window);
-            auto calls=activate_gui_window(input.root,false,false);start_callbacks(state,memory,std::move(calls),Continuation::GuiMouseInput,id);return true;}
-        if(gui_.capture && gui_.windows.contains(gui_.capture))input.message.window=gui_.capture;
-        const auto target=gui_.windows.find(input.message.window);
-        if(target==gui_.windows.end()){input.stage=GuiMouseInput::Stage::Commit;input.eat=true;start_callbacks(state,memory,{},Continuation::GuiMouseInput,id);return true;}
-        input.tested.push_back(input.message.window);input.root=gui_root_window(input.message.window);
-        const auto send=resolve("user32.dll",target->second.unicode?"SendMessageW":"SendMessageA").value;
-        start_callbacks(state,memory,{{send,{input.message.window,0x84,0,xy(input.message.point[0],input.message.point[1])}}},Continuation::GuiMouseInput,id);return true;
+        // 回呼未能啟動（協調者本地服務改走完整路徑重做等）時還原輸入，否則它會一直標記為處理中而不再派送。
+        const auto saved=input;
+        try {
+            input.active=true;input.modal=modal;input.wait_message=wait_message;
+            if(input.native_activation){input.stage=GuiMouseInput::Stage::Commit;input.root=gui_root_window(input.message.window);
+                auto calls=activate_gui_window(input.root,false,false);start_callbacks(state,memory,std::move(calls),Continuation::GuiMouseInput,id);return true;}
+            if(gui_.capture && gui_.windows.contains(gui_.capture))input.message.window=gui_.capture;
+            const auto target=gui_.windows.find(input.message.window);
+            if(target==gui_.windows.end()){input.stage=GuiMouseInput::Stage::Commit;input.eat=true;start_callbacks(state,memory,{},Continuation::GuiMouseInput,id);return true;}
+            input.tested.push_back(input.message.window);input.root=gui_root_window(input.message.window);
+            const auto send=resolve("user32.dll",target->second.unicode?"SendMessageW":"SendMessageA").value;
+            start_callbacks(state,memory,{{send,{input.message.window,0x84,0,xy(input.message.point[0],input.message.point[1])}}},Continuation::GuiMouseInput,id);return true;
+        }catch(...){input=saved;throw;}
     }
     return false;
 }

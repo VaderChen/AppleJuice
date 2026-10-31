@@ -164,6 +164,9 @@ public:
     // 呼叫期間由呼叫端持有跨程序鎖；返回前 GPU 已完成寫入。
     virtual void graphics_export_frame(const GraphicsView&,void*,std::size_t,std::uint32_t,std::shared_ptr<void> = {}){throw std::runtime_error("後端缺少共用影格匯出");}
     virtual void graphics_present(const GraphicsView&){throw std::runtime_error("後端缺少呈現操作");}
+    // 呈現是否不必等顯示緩衝：false 表示此刻呈現會阻塞到垂直同步釋出緩衝（CAMetalLayer 的 drawable 都在途）。
+    // 呼叫端可先讓出 vCPU 再重試；只讀原子計數。沒有緩衝佇列的後端一律為 true。
+    virtual bool graphics_present_ready() const noexcept {return true;}
     // 讓消費佇列等待先前命令；不支援 GPU 事件的後端沿用 CPU 完成等待。
     virtual void graphics_handoff(NativeGraphics&,const GraphicsView&){graphics_flush(true);}
     // 提交目前已錄製的工作並回傳完成旗標：GPU 執行到此點（含先前所有提交）後旗標為 true。

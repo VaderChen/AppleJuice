@@ -153,7 +153,9 @@ bool WindowsServices::dispatch_gui_send(GuestState& state,GuestMemory& memory,st
             std::any_of(gui_.event_queue.begin(),gui_.event_queue.end(),[&](const auto& item){
                 const auto hook=gui_.event_hooks.find(item.hook);return hook==gui_.event_hooks.end() || hook->second.owner==current;}) ||
             std::any_of(gui_.sent_messages.begin(),gui_.sent_messages.end(),[&](const auto& item){
-                return item.second.receiver==current && !item.second.active && !item.second.done;});
+                return item.second.receiver==current && !item.second.active && !item.second.done;}) ||
+            // 滑鼠輸入的命中測試同樣要啟動回呼：dispatch_gui_mouse 會先標記 active，本地模式拒絕後完整路徑就不再處理。
+            std::any_of(gui_.mouse_inputs.begin(),gui_.mouse_inputs.end(),[&](const auto& item){return item.second.thread==current && !item.second.active;});
         if(pending)throw LocalServiceRefused{};
     }
     if(const auto thread=threads_.items.find(threads_.current);thread!=threads_.items.end())thread->second.gui_pump_time=runtime_.clock_ticks;

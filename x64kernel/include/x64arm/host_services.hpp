@@ -159,6 +159,10 @@ public:
     // 正常常駐模式的唯讀時間戳來源。可由多個 worker 同時呼叫，不更新共享時間頁、
     // 排程或映射；false 不產生副作用，沿用一般語義流程。固定指令時鐘不得啟用。
     virtual bool resident_timestamp_counter(const GuestState&,const GuestMemory&,std::uint64_t&) const noexcept {return false;}
+    // worker 在核心內查 GuestMemory 區域表（native_window、read、解碼）並使用其 backing 期間，以 true／false 成對呼叫。
+    // 協調者可能在 worker 執行時本地完成虛擬記憶體服務而插入／刪除區域；服務層以同一把映射讀寫鎖排除。
+    // 必須可巢狀、不拋出，持有期間不得等待客體狀態。
+    virtual void resident_mapping_read(bool acquire) const noexcept {(void)acquire;}
     // 明確允許在此預算內延後 after_instructions；期間服務入口與映射不可變更。
     // 預設關閉，保留依賴每區塊回呼的自訂服務；仍受 instruction_slice 限制。
     virtual std::uint64_t native_chain_limit() const noexcept { return 0; }

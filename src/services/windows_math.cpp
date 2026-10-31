@@ -150,7 +150,7 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"msvbvm60.dll","_allmul",2,3},{"crt","_allmul",2,3},
         {"msvbvm60.dll","_CIatan",0},{"msvbvm60.dll","_CIcos",0},{"msvbvm60.dll","_CIexp",0},
         {"msvbvm60.dll","_CIlog",0},{"msvbvm60.dll","_CIsin",0},{"msvbvm60.dll","_CIsqrt",0},{"msvbvm60.dll","_CItan",0},
-        {"crt", "_ecvt_s", 6},{"crt","div",2},{"crt","ldiv",2},
+        {"crt", "_ecvt_s", 6},{"crt","_fcvt_s",6},{"crt","_ecvt",4},{"crt","_fcvt",4},{"crt","div",2},{"crt","ldiv",2},
         {"crt","_dtest",1},{"crt","_fdtest",1},{"crt","_ldtest",1},
         {"crt","wcstod",2},{"crt","wcstof",2},{"crt","_wtof",1},
         {"crt","_CIacos",0},{"crt","_CIasin",0},{"crt","_CIatan",0},{"crt","_CIatan2",0},
@@ -810,37 +810,65 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         }
         arg.return_to(state,secure?0U:result);return std::nullopt;
     }
-    if(symbol=="_ecvt_s"){
-        const auto value=x86_?std::bit_cast<double>(memory.load(GuestAddress{state.reg(Gpr::Rsp)+12},64)):scalar(state,2);
-        const auto count=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+20},32):arg(3)));
-        const auto decimal=x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+24},32):arg(4),sign=x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+28},32):arg(5);
-        if(!arg(0) || !arg(1) || !decimal || !sign){
-            memory.store(GuestAddress{runtime_.errno_cell},32,22);
-            if(current_invalid_parameter_handler()){start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,22);return std::nullopt;}
-            return 0xc0000417U;
-        }
-        const auto digits=static_cast<std::size_t>(std::max(count,0));
-        if(digits>1048576)throw HostCallFault("CRT 浮點字串精度超過上限");
-        memory.check(GuestAddress{decimal},4,Access::Write);memory.check(GuestAddress{sign},4,Access::Write);
-        if(digits>=arg(1)){memory.store(GuestAddress{arg(0)},8,0);memory.store(GuestAddress{runtime_.errno_cell},32,34);arg.return_to(state,34);return std::nullopt;}
-        Environment environment(0x1f80);const bool negative=std::signbit(value);int point=0;std::string mantissa;
-        if(std::isnan(value)){mantissa=negative?"1#IND":"1#QNAN";point=1;}
-        else if(std::isinf(value)){mantissa="1#INF";point=1;}
-        else if(value==0)mantissa="0";
+    // _ecvt／_fcvt 系列共用：binary64 的 17 位有效十進位表示（多餘要求位數以零補齊），依要求位數四捨五入；
+    // fraction 時要求位數為小數點後位數。與 UCRT _fptostr 相同，位數為負不捨入，進位到最高位時小數點右移。
+    struct CvtDigits {std::string mantissa;int point{};bool negative{};};
+    const auto cvt_digits=[&](double value,int count,bool fraction){
+        Environment environment(0x1f80);CvtDigits r;r.negative=std::signbit(value);
+        if(std::isnan(value)){r.mantissa=r.negative?"1#IND":"1#QNAN";r.point=1;}
+        else if(std::isinf(value)){r.mantissa="1#INF";r.point=1;}
+        else if(value==0)r.mantissa="0";
         else {
-            // binary64 的 17 位有效十進位表示；多餘要求位數以零補齊。
             std::array<char,64> formatted{};std::snprintf(formatted.data(),formatted.size(),"%.16e",std::fabs(value));
             const std::string scientific(formatted.data());const auto exponent=scientific.find('e');
             if(exponent==scientific.npos)throw HostCallFault("無法產生 CRT 十進位表示");
-            point=static_cast<int>(std::strtol(scientific.c_str()+exponent+1,nullptr,10))+1;
-            for(std::size_t i=0;i<exponent;++i)if(scientific[i]>='0' && scientific[i]<='9')mantissa.push_back(scientific[i]);
+            r.point=static_cast<int>(std::strtol(scientific.c_str()+exponent+1,nullptr,10))+1;
+            for(std::size_t i=0;i<exponent;++i)if(scientific[i]>='0' && scientific[i]<='9')r.mantissa.push_back(scientific[i]);
         }
-        const bool carry=count>=0 && digits<mantissa.size() && mantissa[digits]>='5';mantissa.resize(digits,'0');
-        if(carry){auto i=mantissa.size();while(i && mantissa[i-1]=='9'){mantissa[--i]='0';}
-            if(i)++mantissa[i-1];else {if(!mantissa.empty())mantissa[0]='1';++point;}}
-        std::vector<std::uint8_t> output(mantissa.begin(),mantissa.end());output.push_back(0);memory.write(GuestAddress{arg(0)},output);
-        memory.store(GuestAddress{decimal},32,static_cast<std::uint32_t>(point));memory.store(GuestAddress{sign},32,negative?1:0);
+        const auto requested=static_cast<std::int64_t>(count)+(fraction?r.point:0);
+        const auto digits=static_cast<std::size_t>(std::max<std::int64_t>(requested,0));
+        if(digits>1048576)throw HostCallFault("CRT 浮點字串精度超過上限");
+        const bool carry=requested>=0 && digits<r.mantissa.size() && r.mantissa[digits]>='5';r.mantissa.resize(digits,'0');
+        if(carry){auto i=r.mantissa.size();while(i && r.mantissa[i-1]=='9'){r.mantissa[--i]='0';}
+            // 進位到最高位：_ecvt 維持要求的有效位數；_fcvt 的小數位數固定，整數部分多一位，所以前面補 1。
+            if(i)++r.mantissa[i-1];else {if(fraction)r.mantissa.insert(r.mantissa.begin(),'1');else if(!r.mantissa.empty())r.mantissa[0]='1';++r.point;}}
+        return r;
+    };
+    const auto cvt_invalid=[&](std::uint64_t failure)->std::optional<std::uint32_t>{
+        memory.store(GuestAddress{runtime_.errno_cell},32,22);
+        if(current_invalid_parameter_handler()){start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,failure);return std::nullopt;}
+        return 0xc0000417U;
+    };
+    if(symbol=="_ecvt_s" || symbol=="_fcvt_s"){
+        const bool fraction=symbol=="_fcvt_s";
+        const auto value=x86_?std::bit_cast<double>(memory.load(GuestAddress{state.reg(Gpr::Rsp)+12},64)):scalar(state,2);
+        const auto count=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+20},32):arg(3)));
+        const auto decimal=x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+24},32):arg(4),sign=x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+28},32):arg(5);
+        if(!arg(0) || !arg(1) || !decimal || !sign)return cvt_invalid(22);
+        memory.check(GuestAddress{decimal},4,Access::Write);memory.check(GuestAddress{sign},4,Access::Write);
+        if(!fraction && static_cast<std::uint64_t>(std::max(count,0))>=arg(1)){memory.store(GuestAddress{arg(0)},8,0);memory.store(GuestAddress{runtime_.errno_cell},32,34);arg.return_to(state,34);return std::nullopt;}
+        const auto digits=cvt_digits(value,count,fraction);
+        if(digits.mantissa.size()>=arg(1)){memory.store(GuestAddress{arg(0)},8,0);memory.store(GuestAddress{runtime_.errno_cell},32,34);arg.return_to(state,34);return std::nullopt;}
+        std::vector<std::uint8_t> output(digits.mantissa.begin(),digits.mantissa.end());output.push_back(0);memory.write(GuestAddress{arg(0)},output);
+        memory.store(GuestAddress{decimal},32,static_cast<std::uint32_t>(digits.point));memory.store(GuestAddress{sign},32,digits.negative?1:0);
         arg.return_to(state,0);return std::nullopt;
+    }
+    if(symbol=="_ecvt" || symbol=="_fcvt"){
+        // 結果寫入每執行緒 _CVTBUFSIZE（349）緩衝區；_ecvt 位數上限 347，_fcvt 超出緩衝區回 NULL（ERANGE）。
+        constexpr std::size_t buffer_size=349;const bool fraction=symbol=="_fcvt";
+        const auto value=x86_?std::bit_cast<double>(memory.load(GuestAddress{state.reg(Gpr::Rsp)+4},64)):scalar(state,0);
+        auto count=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+12},32):arg(1)));
+        const auto decimal=x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+16},32):arg(2),sign=x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+20},32):arg(3);
+        if(!decimal || !sign)return cvt_invalid(0);
+        memory.check(GuestAddress{decimal},4,Access::Write);memory.check(GuestAddress{sign},4,Access::Write);
+        if(!fraction)count=std::min<std::int32_t>(count,static_cast<std::int32_t>(buffer_size-2));
+        auto& buffer=runtime_.cvt_buffers[threads_.current];if(!buffer)buffer=allocate_heap(memory,buffer_size);
+        if(!buffer){memory.store(GuestAddress{runtime_.errno_cell},32,12);arg.return_to(state,0);return std::nullopt;}
+        const auto digits=cvt_digits(value,count,fraction);
+        if(digits.mantissa.size()>=buffer_size){memory.store(GuestAddress{buffer},8,0);memory.store(GuestAddress{runtime_.errno_cell},32,34);arg.return_to(state,0);return std::nullopt;}
+        std::vector<std::uint8_t> output(digits.mantissa.begin(),digits.mantissa.end());output.push_back(0);memory.write(GuestAddress{buffer},output);
+        memory.store(GuestAddress{decimal},32,static_cast<std::uint32_t>(digits.point));memory.store(GuestAddress{sign},32,digits.negative?1:0);
+        arg.return_to(state,buffer);return std::nullopt;
     }
     Environment environment(x86_?static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13:state.mxcsr);
     // Win32 cdecl 依描述表讀取 4／8-byte 堆疊參數；Win64 使用 XMM。

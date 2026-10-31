@@ -265,7 +265,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
         if(std::find(stream_first_calls.begin(),stream_first_calls.end(),symbol)!=stream_first_calls.end())tracked_stream=crt_stream(arg(0));
         else if(std::find(stream_second_calls.begin(),stream_second_calls.end(),symbol)!=stream_second_calls.end())tracked_stream=crt_stream(arg(1));
         else if(symbol=="fread" || symbol=="fwrite")tracked_stream=crt_stream(arg(3));
-        else if(symbol=="fgets")tracked_stream=crt_stream(arg(2));
+        else if(symbol=="fgets" || symbol=="fgetws")tracked_stream=crt_stream(arg(2));
         else if(symbol=="getchar")tracked_stream=crt_stream(runtime_base_.value+0x800);
         else if(symbol=="freopen" || symbol=="_wfreopen")tracked_stream=crt_stream(arg(2));
     }
@@ -288,7 +288,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
         arg.return_to(state,symbol=="_chsize_s"?9U:symbol=="_lseeki64" || symbol=="_telli64" || symbol=="_filelengthi64"?UINT64_MAX:UINT32_MAX);return std::nullopt;
     }
     if(tracked_stream)if(auto* file=crt_file(tracked_stream);file && !import_crt_lowio(memory,*file)){
-        arg.return_to(state,symbol=="fread" || symbol=="fgets"?0:symbol=="fgetwc" || symbol=="fputwc" || symbol=="ungetwc"?65535U:UINT32_MAX);return std::nullopt;}
+        arg.return_to(state,symbol=="fread" || symbol=="fgets" || symbol=="fgetws"?0:symbol=="fgetwc" || symbol=="fputwc" || symbol=="ungetwc"?65535U:UINT32_MAX);return std::nullopt;}
     if(symbol=="fread" || symbol=="fwrite"){
         const auto* file=crt_file(tracked_stream);
         if(!arg(0) || !arg(3) || arg(2)>(x86_?UINT32_MAX:UINT64_MAX)/arg(1) ||
@@ -599,11 +599,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
         }
     } else {
         const bool descriptor=symbol=="_commit" || symbol=="_close" || symbol=="_isatty" || symbol=="_setmode" || symbol=="_lseeki64" || symbol=="_lseek" || symbol=="_telli64" || symbol=="_tell";
-        const auto stream=symbol=="getchar"?fd_stream(0):descriptor?fd_stream(u32(0)):crt_stream(arg(symbol=="fread"?3:symbol=="fgets"?2:(symbol=="ungetc" || symbol=="ungetwc")?1:0));
+        const auto stream=symbol=="getchar"?fd_stream(0):descriptor?fd_stream(u32(0)):crt_stream(arg(symbol=="fread"?3:symbol=="fgets" || symbol=="fgetws"?2:(symbol=="ungetc" || symbol=="ungetwc")?1:0));
         const auto base=runtime_base_.value+0x800;const bool standard=stream>=base && stream<=base+256 && (stream-base)%128==0;
         const auto found=runtime_.streams.find(stream);const bool valid=standard?standard_open_[(stream-base)/128]:found!=runtime_.streams.end();
         if(symbol=="fflush" && !arg(0))result=flush_crt_streams(memory)?0:UINT32_MAX;
-        else if(!valid)error(9,symbol=="fread" || symbol=="fgets" || symbol=="_isatty"?0:symbol=="_telli64" || symbol=="_lseeki64"?UINT64_MAX:UINT32_MAX);
+        else if(!valid)error(9,symbol=="fread" || symbol=="fgets" || symbol=="fgetws" || symbol=="_isatty"?0:symbol=="_telli64" || symbol=="_lseeki64"?UINT64_MAX:UINT32_MAX);
         else if(symbol=="fclose" || symbol=="_close")result=crt_close_file(state,memory,stream,symbol=="fclose")?0:UINT32_MAX;
         else if(symbol=="_isatty") {const auto* file=crt_file(stream);const auto record=file?crt_lowio_record(memory,file->descriptor,false):0;result=record?(memory.load(GuestAddress{record+crt_lowio::layout(x86_).flags},8)&crt_lowio::tty):0;}
         else if(symbol=="_setmode") {
@@ -629,7 +629,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
         else if(symbol=="fflush")result=flush_crt_file(memory,*crt_file(stream))?0:UINT32_MAX;
         else if(symbol=="_commit") {if(!standard && found->second.native) {const auto code=found->second.native->flush();if(code){crt_os_error::store(memory,runtime_.errno_cell,code);result=UINT32_MAX;}}}
         else if(standard && stream!=base) {
-            if(symbol=="feof" || symbol=="ferror" || symbol=="clearerr")result=0;else error(9,symbol=="fread" || symbol=="fgets"?0:UINT32_MAX);
+            if(symbol=="feof" || symbol=="ferror" || symbol=="clearerr")result=0;else error(9,symbol=="fread" || symbol=="fgets" || symbol=="fgetws"?0:UINT32_MAX);
         } else {
             auto& file=standard?runtime_.standard_input:found->second;auto position=crt_file_position(file);const auto position_guard=position.lock();
             const auto physical=static_cast<std::uint64_t>(position),logical=crt_stream_position(memory,file);
@@ -647,26 +647,47 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
             }
             else if(symbol=="feof")result=file.eof;else if(symbol=="ferror")result=file.error;
             else if(symbol=="clearerr"){file.eof=file.lowio_eof=false;file.error=false;}
-            else if(symbol=="fread" || symbol=="getchar" || symbol=="fgetc" || symbol=="getc" || symbol=="fgets" || symbol=="fgetwc") {
+            else if(symbol=="fread" || symbol=="getchar" || symbol=="fgetc" || symbol=="getc" || symbol=="fgets" || symbol=="fgetwc" || symbol=="fgetws") {
+                // fgetwc／fgetws 共用：ANSI 文字模式依目前 locale 字碼頁解出一個寬字元（失敗為 WEOF）；
+                // wait 為 false 時不等待標準輸入（fgetws 已先等整行），回傳空值表示需要等待輸入。
+                const auto read_ansi_wide=[&](bool wait)->std::optional<std::uint32_t>{
+                    std::uint32_t character=65535U;
+                    if(!file.lowio_multibyte_size){const auto& category=current_crt_locale(state,memory).categories[2];file.lowio_multibyte_page=category.codepage;file.lowio_multibyte_maximum=static_cast<std::uint8_t>(std::min<std::size_t>(std::max<std::size_t>(1,category.maximum_character_bytes),file.lowio_multibyte.size()));}
+                    const auto maximum=file.lowio_multibyte_maximum;
+                    while(file.lowio_multibyte_size<maximum){
+                        if(wait && file.standard_handle==0x100 && !file.eof && !file.lowio_eof && file.pushback.empty() && !await_standard_input(state,memory,1,file.text))return std::nullopt;
+                        const auto bytes=read_crt_file(memory,file,1,true);
+                        if(bytes.empty()){if(file.lowio_multibyte_size){file.error=true;file.lowio_multibyte_size=0;memory.store(GuestAddress{runtime_.errno_cell},32,42);}break;}
+                        file.lowio_multibyte[file.lowio_multibyte_size++]=bytes[0];
+                        const auto decoded=windows_crt_decode(std::span(file.lowio_multibyte).first(file.lowio_multibyte_size),file.lowio_multibyte_page);
+                        if(decoded.status==CrtDecodedCharacter::Status::Complete && decoded.character<=65535){character=decoded.character;file.lowio_multibyte_size=0;break;}
+                        if(decoded.status==CrtDecodedCharacter::Status::Invalid || decoded.character>65535 || file.lowio_multibyte_size==maximum){file.error=true;file.lowio_multibyte_size=0;memory.store(GuestAddress{runtime_.errno_cell},32,42);break;}
+                    }
+                    return character;
+                };
                 if(symbol=="fread") {const auto size=arg(1),count=arg(2);if(size && count){if(count>output_limit/size)throw HostCallFault("CRT 單次讀取超過上限");memory.check(GuestAddress{arg(0)},static_cast<std::size_t>(size*count),Access::Write);if(file.standard_handle==0x100 && !file.eof && !file.lowio_eof && size*count>file.pushback.size() && !await_standard_input(state,memory,size*count-file.pushback.size(),file.text))return std::nullopt;const auto bytes=read_crt_file(memory,file,static_cast<std::size_t>(size*count),true);memory.write(GuestAddress{arg(0)},bytes);result=bytes.size()/size;}}
                 else if(symbol=="fgets") {
                     const auto capacity=std::bit_cast<std::int32_t>(u32(1));if(capacity>1048576)throw HostCallFault("fgets 請求超過上限");
                     if(capacity>0){memory.check(GuestAddress{arg(0)},static_cast<std::size_t>(capacity),Access::Write);if(file.standard_handle==0x100 && !file.eof && !file.lowio_eof && file.pushback.empty() && !await_standard_input(state,memory,static_cast<std::uint64_t>(capacity-1),file.text,true))return std::nullopt;std::vector<std::uint8_t> bytes;
                         while(bytes.size()+1<static_cast<std::size_t>(capacity)){const auto part=read_crt_file(memory,file,1,true);if(part.empty())break;bytes.push_back(part[0]);if(part[0]==10)break;}
                         if(!bytes.empty() || capacity==1){bytes.push_back(0);memory.write(GuestAddress{arg(0)},bytes);result=arg(0);}}
+                } else if(symbol=="fgetws") {
+                    // 逐字元讀到換行（含）或 count-1 個字元；讀到 WEOF 即停，沒有讀到任何字元時回 NULL。
+                    const auto capacity=std::bit_cast<std::int32_t>(u32(1));if(capacity>1048576)throw HostCallFault("fgetws 請求超過上限");
+                    const bool ansi=file.text && crt_lowio::text_mode(file.lowio_extended)==crt_lowio::TextMode::Ansi;
+                    if(capacity>0){memory.check(GuestAddress{arg(0)},static_cast<std::size_t>(capacity)*2,Access::Write);
+                        if(file.standard_handle==0x100 && !file.eof && !file.lowio_eof && file.pushback.empty() && !await_standard_input(state,memory,static_cast<std::uint64_t>(capacity-1)*(ansi?1U:2U),file.text,true))return std::nullopt;
+                        std::u16string text;
+                        while(text.size()+1<static_cast<std::size_t>(capacity)){
+                            std::uint32_t character=65535U;
+                            if(ansi)character=read_ansi_wide(false).value_or(65535U);
+                            else {const auto bytes=read_crt_file(memory,file,2,true);if(bytes.size()==2)character=bytes[0]|(unsigned{bytes[1]}<<8);}
+                            if(character==65535U)break;
+                            text.push_back(static_cast<char16_t>(character));if(character==10)break;
+                        }
+                        if(!text.empty() || capacity==1){text.push_back(0);memory.write(GuestAddress{arg(0)},utf16_bytes(text));result=arg(0);}}
                 } else if(symbol=="fgetwc" && file.text && crt_lowio::text_mode(file.lowio_extended)==crt_lowio::TextMode::Ansi){
-                    result=65535U;
-                    if(!file.lowio_multibyte_size){const auto& category=current_crt_locale(state,memory).categories[2];file.lowio_multibyte_page=category.codepage;file.lowio_multibyte_maximum=static_cast<std::uint8_t>(std::min<std::size_t>(std::max<std::size_t>(1,category.maximum_character_bytes),file.lowio_multibyte.size()));}
-                    const auto maximum=file.lowio_multibyte_maximum;
-                    while(file.lowio_multibyte_size<maximum){
-                        if(file.standard_handle==0x100 && !file.eof && !file.lowio_eof && file.pushback.empty() && !await_standard_input(state,memory,1,file.text))return std::nullopt;
-                        const auto bytes=read_crt_file(memory,file,1,true);
-                        if(bytes.empty()){if(file.lowio_multibyte_size){file.error=true;file.lowio_multibyte_size=0;memory.store(GuestAddress{runtime_.errno_cell},32,42);}break;}
-                        file.lowio_multibyte[file.lowio_multibyte_size++]=bytes[0];
-                        const auto decoded=windows_crt_decode(std::span(file.lowio_multibyte).first(file.lowio_multibyte_size),file.lowio_multibyte_page);
-                        if(decoded.status==CrtDecodedCharacter::Status::Complete && decoded.character<=65535){result=decoded.character;file.lowio_multibyte_size=0;break;}
-                        if(decoded.status==CrtDecodedCharacter::Status::Invalid || decoded.character>65535 || file.lowio_multibyte_size==maximum){file.error=true;file.lowio_multibyte_size=0;memory.store(GuestAddress{runtime_.errno_cell},32,42);break;}
-                    }
+                    const auto character=read_ansi_wide(true);if(!character)return std::nullopt;result=*character;
                 } else {const bool wide=symbol=="fgetwc";const unsigned count=wide && (!file.text || crt_lowio::text_mode(file.lowio_extended)!=crt_lowio::TextMode::Ansi)?2:1;
                     if(file.standard_handle==0x100 && !file.eof && !file.lowio_eof && !file.lowio_low_surrogate && file.pushback.size()<count && !await_standard_input(state,memory,count-file.pushback.size(),file.text))return std::nullopt;
                     const auto bytes=read_crt_file(memory,file,count,true);if(bytes.empty() && file.standard_handle==0x100 && file.lowio_needed_input && !await_standard_input(state,memory,file.lowio_needed_input))return std::nullopt;result=bytes.size()!=count?(wide?65535U:UINT32_MAX):bytes[0]|(count==2?unsigned{bytes[1]}<<8:0U);

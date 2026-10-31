@@ -848,6 +848,7 @@ struct GuiStationNamespace {
     std::set<std::uint64_t> clipboard_listeners;
     std::uint32_t clipboard_sequence{1};std::optional<std::uint64_t> clipboard_native_sequence;
     std::uint64_t clipboard_poll_deadline{},scheduler_poll_deadline{};
+    std::uint64_t network_pump_ticks{}; // 上次全量抽取 socket 監看的單調時鐘（100 ns），見 pump_gui_network。
     bool clipboard_stale{},clipboard_dirty{};
     std::uint64_t clipboard_open_thread{},clipboard_open_window{},clipboard_owner{};
     std::uint32_t clipboard_next_format{0xc000};std::optional<std::u16string> clipboard_native_text{};

@@ -103,6 +103,11 @@ ResidentClockRecipe WindowsServices::resident_clock_recipe(GuestAddress address)
     return ResidentClockRecipe::None;
 }
 #endif
+namespace detail {ParallelMappingLock& parallel_mapping_mutex() noexcept;}
+// 核心在 worker 上查區域表（REP 批次、rdtsc 出口解碼）時與 worker 服務共用同一把映射讀鎖。
+void WindowsServices::resident_mapping_read(bool acquire) const noexcept {
+    if(acquire)detail::parallel_mapping_mutex().lock_shared();else detail::parallel_mapping_mutex().unlock_shared();
+}
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_TIMESTAMP
 bool WindowsServices::resident_timestamp_counter(const GuestState&,const GuestMemory& memory,std::uint64_t& result) const noexcept {
     if(!runtime_.host_clock)return false;

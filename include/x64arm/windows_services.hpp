@@ -148,6 +148,7 @@ public:
     std::uint64_t timestamp_counter(const GuestState&,GuestMemory&) override;
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_TIMESTAMP
     bool resident_timestamp_counter(const GuestState&,const GuestMemory&,std::uint64_t&) const noexcept override;
+    void resident_mapping_read(bool acquire) const noexcept override;
 #endif
     std::uint64_t native_chain_limit() const noexcept override;
 #ifdef X64ARM_HOST_SERVICES_NATIVE_TIME_SLICE
@@ -997,6 +998,8 @@ private:
     void discard_minidump(std::uint64_t,GuestMemory&,const GuestState&);
     std::optional<std::uint32_t> advance_minidump(GuestState&,GuestMemory&,std::uint64_t,std::optional<std::uint64_t> = {});
     VirtualMemoryInformation virtual_memory_information(const GuestMemory&,std::uint64_t) const;
+    std::uint64_t find_free_virtual_range(const GuestMemory&,std::uint64_t size,std::uint64_t alignment,
+        std::uint64_t lowest,std::uint64_t limit,std::uint64_t preferred,bool descending=false) const;
     std::shared_ptr<DemangleState> demangle_;
     std::shared_ptr<Msvcp100State> msvcp100_;
     void initialize_msvcp100(GuestMemory&);
@@ -1088,6 +1091,8 @@ private:
     // 套用動作（讀回、設定 fence 值、觸發事件）；同一 order 鍵（裝置）依登記順序，前一個未完成就停止該鍵。
     struct GpuSignal {std::shared_ptr<const std::atomic<bool>> done;std::uint64_t order{};std::function<void(GuestMemory&)> apply;};
     std::deque<GpuSignal> gpu_signals_;
+    // 等顯示緩衝的 Present 重試（ThreadWaitKind::PresentRetry）：執行緒 → 交換鏈的原生呈現表面；只在協調者讀寫。
+    std::map<std::uint64_t,std::shared_ptr<NativeGraphics>> present_waits_;
     // poll=false：只登記不套用（D3D12 提交執行緒不觸發事件、不改執行緒等待狀態，由客體端輪詢套用）。
     void queue_gpu_signal(GuestMemory&,std::shared_ptr<const std::atomic<bool>>,std::uint64_t,std::function<void(GuestMemory&)>,bool poll=true);
     // 待完成通知數（圖形鎖內以原子操作更新）：協調者計算喚醒期限時不取鎖讀取。WindowsServices 須可移動，不用 std::atomic 成員。
@@ -1523,7 +1528,8 @@ private:
     bool raster_draw(GuestMemory&,std::uint64_t dc,GuiDraw&);
     void sync_raster_bitmap(GuestMemory&,std::uint64_t handle);
     std::shared_ptr<NativeGui> native_gui_;
-    void pump_gui_network();
+    // only 非零時只抽取該 socket 的監看（WSAEnumNetworkEvents）；為零時全量抽取，距上次未滿 X64ARM_NETWORK_PUMP_US 則略過。
+    void pump_gui_network(std::uint64_t only=0);
     void enqueue_gui_message(GuiMessage);
     void remember_gui_message(const GuiMessage&);
     std::optional<std::uint32_t> invoke_imm(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);

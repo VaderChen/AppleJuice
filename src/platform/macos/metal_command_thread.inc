@@ -145,6 +145,7 @@ public:
         graphics_sync();inner_->graphics_export_frame(view,destination,size,pitch,std::move(owner));
     }
     void graphics_present(const GraphicsView& view) override {graphics_sync();inner_->graphics_present(view);}
+    bool graphics_present_ready() const noexcept override {return inner_->graphics_present_ready();}
     void graphics_handoff(NativeGraphics& consumer,const GraphicsView& view) override {
         graphics_sync();NativeGraphics* target=&consumer;
         if(auto* proxy=dynamic_cast<MetalCommandThread*>(target)){proxy->graphics_sync();target=&proxy->inner();}

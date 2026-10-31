@@ -432,6 +432,31 @@ entry D3D12HeapGetGPUDescriptorHandleForHeapStart
     mov rax, rdx
     ret
 end D3D12HeapGetGPUDescriptorHandleForHeapStart
+// D3D11／D3D10／DXGI 橋接物件的 COM AddRef／Release：介面物件 [this+8] 指向該物件身分共用的 32 位元引用計數格
+// （見 windows_d3d11.cpp 的 reference_count）。AddRef 只做原子加一並回傳新值；Release 在計數大於 1 時以 CAS 減一，
+// 否則（最後一次或計數異常）尾跳 vtable 前一格保存的同家族 Release 服務，由服務在圖形鎖下銷毀或回報錯誤。
+entry ComBridgeAddRef
+    mov rdx, qword ptr [rcx + 8]
+    mov eax, 1
+    lock xadd dword ptr [rdx], eax
+    inc eax
+    ret
+end ComBridgeAddRef
+entry ComBridgeRelease
+    mov rdx, qword ptr [rcx + 8]
+    mov eax, dword ptr [rdx]
+1:
+    cmp eax, 1
+    ja 2f
+    mov rax, qword ptr [rcx]
+    jmp qword ptr [rax - 8]
+2:
+    lea r8d, [rax - 1]
+    lock cmpxchg dword ptr [rdx], r8d
+    jne 1b
+    mov eax, r8d
+    ret
+end ComBridgeRelease
 // LONG 固定為 32 位元；Pointer 使用完整 64 位元。LOCK／隱含鎖定 XCHG
 // 共用既有原子指令的完整記憶體順序、故障及執行緒中斷契約。
 .macro interlocked_word name, operation
@@ -487,5 +512,24 @@ entry InterlockedCompareExchangePointer
     ret
 1:
 slow_end InterlockedCompareExchangePointer
+
+// __chkstk（kernel32／ntdll）：函式序言以任意 8 位元組對齊呼叫，不能進入要求 RSP 為 16n+8 的主機服務。
+// RAX 為要配置的位元組數；自呼叫端堆疊（RSP+8）所在頁往下逐頁讀取到目標所在頁，未映射範圍照常故障。
+// 與 MSVC 相同只使用 R10／R11 並保留 RAX；配置大小超過堆疊位址時不探測（由之後的 SUB RSP 自行故障）。
+entry __chkstk
+    lea r10, [rsp+8]
+    mov r11, r10
+    sub r11, rax
+    jb 2f
+    and r10, -4096
+1:
+    cmp r10, r11
+    jbe 2f
+    sub r10, 4096
+    test byte ptr [r10], 0
+    jmp 1b
+2:
+    ret
+end __chkstk
 .globl _guest_thread_end
 _guest_thread_end:
