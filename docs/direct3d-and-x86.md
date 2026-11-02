@@ -12,11 +12,11 @@
 
 ## Direct3D 11
 
-提供裝置與 context、資源與 view、DXBC 著色器轉譯、Draw／Dispatch 與 DXGI 呈現，包含圖形與 GPU 運算路徑。進階功能、格式及擴充介面仍須依程式需求確認；回報 feature level 不代表其全部功能均已完整支援。
+提供裝置與 context、資源與 view、DXBC 著色器轉譯、Draw／Dispatch 與 DXGI 呈現，包含圖形與 GPU 運算路徑。D3D11.1～11.4 介面轉接至同一套處理流程，著色器可於背景轉譯。進階功能、格式及擴充介面仍須依程式需求確認；回報 feature level 不代表其全部功能均已完整支援。
 
 ## Direct3D 12
 
-提供裝置、命令佇列與清單、資源與描述元、根簽章、繪圖／運算、fence 及 DXGI 呈現的功能子集，透過 Metal 執行。已有間接命令與 Bundle 路徑；DXR 光線追蹤、Mesh Shader、Work Graph 等進階功能不在完整相容承諾內。
+提供裝置、命令佇列與清單、資源與描述元、根簽章、繪圖／運算、fence 及 DXGI 呈現的功能子集，透過 Metal 執行，命令清單由獨立的提交執行緒重播。已有間接命令與 Bundle 路徑；DXR 光線追蹤、Mesh Shader、Work Graph 等進階功能不在完整相容承諾內。
 
 ## x86（32 位元 Windows）
 

@@ -59,6 +59,10 @@ python3 scripts/build_launcher.py --jobs 4
 
 상세 사용 문서는 현재 번체 중국어로 제공됩니다. x64 OpenCL과 Vulkan은 각각 macOS OpenCL.framework 및 Vulkan loader/MoltenVK를 사용합니다. 요구 사항과 제한은 [OpenCL/Vulkan](docs/opencl-vulkan-support.md)을 참고하세요.
 
+### CPU와 멀티코어
+
+32비트와 64비트 프로그램 모두 기본적으로 resident AOT를 사용합니다. Launcher에서 프로그램별로 게스트 CPU 코어 수를 설정할 수 있으며, 여러 게스트 스레드는 상주 worker에서 병렬로 실행됩니다. 2026년 11월 2일 Geekbench 7의 공식 멀티코어 8개 항목으로 측정한 결과, 싱글 코어 기준 대비 2코어에서 1.79~2.18배, 4코어에서 2.84~4.35배였습니다.
+
 ### Direct3D 9
 
 D3D9/D3D9Ex 장치, 텍스처와 버퍼, 고정 기능 및 프로그래밍 가능한 렌더링, 스왑 체인과 Metal 화면 출력을 제공합니다. 특수 형식, 장치 기능 및 렌더링 상태 조합에는 호환성 제한이 있습니다.
@@ -69,17 +73,37 @@ D3D10/D3D10.1 장치, 리소스, 셰이더, 렌더링 및 DXGI 스왑 체인을 
 
 ### Direct3D 11
 
-장치와 컨텍스트, 리소스와 뷰, DXBC 셰이더 변환, Draw/Dispatch 및 DXGI 화면 출력을 제공하며 그래픽과 GPU 연산 경로를 포함합니다. 고급 기능, 형식 및 확장 인터페이스는 프로그램의 요구 사항에 따라 확인해야 합니다. 보고된 feature level이 완전한 11.x 호환성을 의미하지는 않습니다.
+장치와 컨텍스트, 리소스와 뷰, DXBC 셰이더 변환, Draw/Dispatch 및 DXGI 화면 출력을 제공하며 그래픽과 GPU 연산 경로를 포함합니다. D3D11.1~11.4 인터페이스는 같은 처리 경로로 연결되며 셰이더는 백그라운드에서 변환할 수 있습니다. 고급 기능, 형식 및 확장 인터페이스는 프로그램의 요구 사항에 따라 확인해야 합니다. 보고된 feature level이 완전한 11.x 호환성을 의미하지는 않습니다.
 
 ### Direct3D 12
 
-장치, 명령 큐/목록, 리소스와 디스크립터, 루트 서명, 그래픽/연산, fence 및 DXGI 화면 출력의 일부 기능을 Metal로 실행합니다. 간접 명령과 Bundle 실행 경로가 있지만 DXR, Mesh Shader, Work Graph 같은 고급 기능은 완전한 호환성 보장 범위에 포함되지 않습니다.
+장치, 명령 큐/목록, 리소스와 디스크립터, 루트 서명, 그래픽/연산, fence 및 DXGI 화면 출력의 일부 기능을 Metal로 실행하며, 명령 목록은 전용 제출 스레드에서 재생합니다. 간접 명령과 Bundle 실행 경로가 있지만 DXR, Mesh Shader, Work Graph 같은 고급 기능은 완전한 호환성 보장 범위에 포함되지 않습니다.
 
 ### x86(32비트 Windows)
 
 x86_64(64비트) 외에도 x86 PE32 EXE와 해당 DLL을 로드할 수 있습니다. 32비트와 64비트 프로그램 모두 기본적으로 resident AOT를 사용합니다. 함께 제공되는 DLL의 비트 수는 EXE와 같아야 하며, 한 프로세스에서 32비트와 64비트 DLL을 혼용할 수 없습니다. x86의 API 및 그래픽 지원 범위는 x64와 다를 수 있으며, 완전한 WOW64, 16비트 프로그램, 커널 드라이버 또는 DRM 지원을 의미하지는 않습니다.
 
 자세한 범위와 사용 안내는 [Direct3D 및 x86 호환성](docs/direct3d-and-x86.md)(번체 중국어)을 참고하세요.
+
+### 기타 API
+
+- **OpenGL/WebGL**: OpenGL/WGL은 기본적으로 Metal로 렌더링하며 초기화에 실패하면 macOS OpenGL을 사용합니다. WebGL이 사용하는 EGL/GLES는 ANGLE의 Metal 백엔드에서 처리합니다.
+- **오디오**: DirectSound(3D 위치 지정 및 녹음 포함), XAudio2, WASAPI, X3DAudio를 Core Audio로 출력하며 스테레오 좌우 채널과 패닝을 유지합니다.
+- **입력**: DirectInput(포스 피드백 포함), XInput, Raw Input은 macOS 실제 입력 장치의 데이터를 사용합니다.
+- **동영상**: Media Foundation과 D3D11 DXVA의 H.264 인코딩/디코딩은 VideoToolbox 하드웨어 가속을 사용합니다. HEVC와 AV1은 아직 완료되지 않았습니다.
+
+### 실측 기록(2026년 10~11월)
+
+| 프로그램 | 주요 API | 확인 범위 |
+| --- | --- | --- |
+| Steam 클라이언트 | Chromium(CEF) | 로그인 후 메인 창 진입 및 게임 실행. 화면 지연과 메뉴 표시 문제가 남아 있음 |
+| DRAGON QUEST III HD-2D Remake | D3D11(Unreal Engine 4) | Steam으로 실행, 게임 내 이동과 전투 |
+| It Takes Two | D3D11(Unreal Engine 4) | 2인 조작 플레이 |
+| DAVE THE DIVER | D3D11(Unity) | 메인 메뉴 진입 |
+| Cyberpunk 2077 | D3D12 | 내장 벤치마크 실행 |
+| Geekbench 7 | CPU | 싱글 코어 16개와 멀티코어 8개 항목 모두 유효한 결과 |
+
+실측 기록은 당시 버전과 설정 기준이며, 전체 게임 진행, 다른 버전 또는 모든 설정에서의 동작을 의미하지 않습니다.
 
 AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 API 매개변수 조합을 완전히 지원하지 않습니다. 프로그램 로딩이나 창 표시가 성공해도 전체 프로그램의 호환성이 보장되지는 않습니다. 드라이브 매핑은 완전한 OS 샌드박스가 아니며 활성화된 서비스는 매핑된 파일이나 네트워크에 접근할 수 있습니다. 신뢰할 수 있는 프로그램만 실행하고 필요한 접근 권한을 설정하세요.
 

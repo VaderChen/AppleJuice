@@ -61,6 +61,10 @@ python3 scripts/build_launcher.py --jobs 4
 
 x64 OpenCL 與 Vulkan 分別使用 macOS OpenCL.framework 與 Vulkan loader／MoltenVK；需求與限制見 [OpenCL／Vulkan](docs/opencl-vulkan-support.md)。
 
+### CPU 與多核
+
+32／64 位元程式預設使用 resident AOT。Launcher 可依程式設定客體 CPU 核心數，多個客體執行緒由常駐 worker 並行執行。2026-11-02 以 Geekbench 7 官方多核 8 個測項量測，相對單核基準，2 核為 1.79～2.18 倍、4 核為 2.84～4.35 倍。
+
 ### Direct3D 9
 
 提供 D3D9／D3D9Ex 裝置、紋理與緩衝區、固定功能與可程式化繪圖、交換鏈及 Metal 呈現。特殊格式、裝置能力與渲染狀態組合仍有相容性邊界。
@@ -71,17 +75,37 @@ x64 OpenCL 與 Vulkan 分別使用 macOS OpenCL.framework 與 Vulkan loader／Mo
 
 ### Direct3D 11
 
-提供裝置與 context、資源與 view、DXBC 著色器轉譯、Draw／Dispatch 及 DXGI 呈現，包含圖形與 GPU 運算。進階功能、格式與擴充介面仍須依程式需求確認；feature level 不代表完整 11.x 相容。
+提供裝置與 context、資源與 view、DXBC 著色器轉譯、Draw／Dispatch 及 DXGI 呈現，包含圖形與 GPU 運算。D3D11.1～11.4 介面轉接至同一套處理流程，著色器可於背景轉譯。進階功能、格式與擴充介面仍須依程式需求確認；feature level 不代表完整 11.x 相容。
 
 ### Direct3D 12
 
-提供裝置、命令佇列／清單、資源與描述元、根簽章、繪圖／運算、fence 與 DXGI 呈現的功能子集，透過 Metal 執行。已有間接命令與 Bundle 路徑；DXR、Mesh Shader、Work Graph 等進階功能不在完整相容承諾內。
+提供裝置、命令佇列／清單、資源與描述元、根簽章、繪圖／運算、fence 與 DXGI 呈現的功能子集，透過 Metal 執行，命令清單由獨立的提交執行緒重播。已有間接命令與 Bundle 路徑；DXR、Mesh Shader、Work Graph 等進階功能不在完整相容承諾內。
 
 ### x86（32 位元 Windows）
 
 除了 x86_64（64 位元），亦可載入 x86 PE32 EXE 與相符 DLL。32／64 位元程式預設均使用 resident AOT；附帶 DLL 須與 EXE 位元數相同，同一程序不能混載 32／64 位元 DLL。x86 的 API 與圖形涵蓋範圍不保證與 x64 完全相同，也不代表完整 WOW64、16 位元程式、核心驅動程式或 DRM 均可使用。
 
 詳細範圍與使用建議見 [Direct3D 與 x86 相容性](docs/direct3d-and-x86.md)。
+
+### 其他 API
+
+- **OpenGL／WebGL**：OpenGL／WGL 預設轉為 Metal 繪製，初始化失敗時改用 macOS OpenGL；WebGL 使用的 EGL／GLES 交由 ANGLE 的 Metal 後端。
+- **音訊**：DirectSound（含 3D 定位與錄音）、XAudio2、WASAPI 與 X3DAudio 經 Core Audio 輸出，保留立體聲左右聲道與聲像。
+- **輸入**：DirectInput（含力回饋）、XInput 與 Raw Input 取用 macOS 實體輸入裝置的資料。
+- **影片**：Media Foundation 與 D3D11 DXVA 的 H.264 編解碼使用 VideoToolbox 硬體加速；HEVC 與 AV1 尚未完成。
+
+### 實測紀錄（2026-10～11）
+
+| 程式 | 主要 API | 已確認範圍 |
+| --- | --- | --- |
+| Steam 用戶端 | Chromium（CEF） | 登入並進入主視窗、啟動遊戲；介面仍有遲滯與選單顯示問題 |
+| DRAGON QUEST III HD-2D Remake | D3D11（Unreal Engine 4） | 經 Steam 啟動，可在遊戲內移動與戰鬥 |
+| It Takes Two | D3D11（Unreal Engine 4） | 雙人操作遊玩 |
+| DAVE THE DIVER | D3D11（Unity） | 進入主選單 |
+| Cyberpunk 2077 | D3D12 | 可執行內建 Benchmark |
+| Geekbench 7 | CPU | 單核 16 項與多核 8 項皆取得有效結果 |
+
+實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
 
 AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數組合並未全面支援。成功載入或顯示視窗不代表完整應用程式均可使用。磁碟映射不是完整 OS 沙箱；啟用的服務可能存取映射檔案或使用網路。請只執行信任的程式，並依需要設定存取權限。
 

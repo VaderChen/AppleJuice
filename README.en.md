@@ -59,6 +59,10 @@ The first three lines build and check the CLI; the last line builds and packages
 
 Detailed usage documents are currently in Traditional Chinese. x64 OpenCL and Vulkan use macOS OpenCL.framework and a Vulkan loader/MoltenVK respectively; see [OpenCL/Vulkan](docs/opencl-vulkan-support.md) for requirements and limitations.
 
+### CPU and multi-core
+
+Both 32-bit and 64-bit applications use resident AOT by default. Launcher can set the guest CPU core count per application, and multiple guest threads run in parallel on resident workers. Measured on November 2, 2026 with the eight official Geekbench 7 multi-core workloads, scaling relative to the single-core baseline is 1.79–2.18× with 2 cores and 2.84–4.35× with 4 cores.
+
 ### Direct3D 9
 
 Provides D3D9/D3D9Ex devices, textures and buffers, fixed-function and programmable drawing, swap chains and presentation through Metal. Special formats, device capabilities and combinations of render states still have compatibility limits.
@@ -69,17 +73,37 @@ Provides D3D10/D3D10.1 devices, resources, shaders, drawing and DXGI swap chains
 
 ### Direct3D 11
 
-Provides devices and contexts, resources and views, DXBC shader translation, Draw/Dispatch and DXGI presentation, covering graphics and GPU compute paths. Advanced features, formats and extended interfaces depend on the application's requirements; a reported feature level does not establish complete 11.x compatibility.
+Provides devices and contexts, resources and views, DXBC shader translation, Draw/Dispatch and DXGI presentation, covering graphics and GPU compute paths. D3D11.1–11.4 interfaces are routed through the same processing path, and shaders can be translated in the background. Advanced features, formats and extended interfaces depend on the application's requirements; a reported feature level does not establish complete 11.x compatibility.
 
 ### Direct3D 12
 
-Provides a subset of devices, command queues/lists, resources and descriptors, root signatures, graphics/compute, fences and DXGI presentation through Metal. Indirect commands and Bundles have execution paths; advanced features such as DXR, Mesh Shaders and Work Graphs are outside the complete-compatibility commitment.
+Provides a subset of devices, command queues/lists, resources and descriptors, root signatures, graphics/compute, fences and DXGI presentation through Metal, with command lists replayed on a dedicated submission thread. Indirect commands and Bundles have execution paths; advanced features such as DXR, Mesh Shaders and Work Graphs are outside the complete-compatibility commitment.
 
 ### x86 (32-bit Windows)
 
 Alongside x86_64 (64-bit), x86 PE32 executables and matching DLLs can be loaded. Both 32-bit and 64-bit applications use resident AOT by default. Bundled DLLs must match the EXE's bitness; a process cannot mix 32-bit and 64-bit DLLs. x86 API and graphics coverage may differ from x64, and this does not establish complete support for WOW64, 16-bit applications, kernel drivers or DRM.
 
 See [Direct3D and x86 compatibility](docs/direct3d-and-x86.md) for details and usage guidance (Traditional Chinese).
+
+### Other APIs
+
+- **OpenGL/WebGL**: OpenGL/WGL renders through Metal by default and falls back to macOS OpenGL if initialization fails; EGL/GLES used by WebGL is handled by ANGLE's Metal backend.
+- **Audio**: DirectSound (including 3D positioning and capture), XAudio2, WASAPI and X3DAudio output through Core Audio, preserving stereo left/right channels and panning.
+- **Input**: DirectInput (including force feedback), XInput and Raw Input use data from physical input devices on macOS.
+- **Video**: H.264 encoding and decoding through Media Foundation and D3D11 DXVA use VideoToolbox hardware acceleration; HEVC and AV1 are not yet complete.
+
+### Tested applications (October–November 2026)
+
+| Application | Main API | Confirmed scope |
+| --- | --- | --- |
+| Steam client | Chromium (CEF) | Signs in, opens the main window and launches games; the interface still has lag and menu display issues |
+| DRAGON QUEST III HD-2D Remake | D3D11 (Unreal Engine 4) | Launched through Steam; in-game movement and battles |
+| It Takes Two | D3D11 (Unreal Engine 4) | Two-player gameplay |
+| DAVE THE DIVER | D3D11 (Unity) | Reaches the main menu |
+| Cyberpunk 2077 | D3D12 | Runs the built-in benchmark |
+| Geekbench 7 | CPU | Valid results for all 16 single-core and 8 multi-core workloads |
+
+Test records reflect the version and settings at the time and do not establish that complete gameplay, other versions or all settings work.
 
 AppleJuice is under active development. Complete Windows support, all applications and all API parameter combinations are not fully supported. Loading a program or opening a window does not establish full application compatibility. Drive mappings are not a complete OS sandbox; enabled services may access mapped files or use the network. Run trusted programs and configure access permissions as needed.
 
