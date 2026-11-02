@@ -128,6 +128,10 @@ public:
     // 呼叫端之後會修改物件（例如加上串流輸出宣告）時使用：後端可依內容共用編譯結果，但回傳私有物件。
     virtual std::shared_ptr<GraphicsShader> graphics_shader_private(std::uint32_t stage,std::span<const std::uint8_t> bytes){return graphics_shader(stage,bytes);}
     virtual std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t,std::span<const std::uint8_t>){throw std::runtime_error("後端缺少 DXBC 著色器");}
+    // 背景準備著色器：已在快取、曾經失敗或後端不支援背景編譯時回 0（呼叫端照常同步建立）；否則啟動或沿用進行中的背景
+    // 轉譯與編譯並回傳非零票號，呼叫端可讓客體執行緒等票號完成後重試，不在持鎖的服務內編譯。
+    virtual std::uint64_t graphics_shader_prefetch(std::uint32_t,std::span<const std::uint8_t>){return 0;}
+    virtual bool graphics_shader_ticket_ready(std::uint64_t){return true;}
     // 由相容層自行產生的 MSL compute 核心（例如 DirectML 運算子）；bindings 的 slot 對應 GraphicsStage 陣列。
     virtual std::shared_ptr<GraphicsShader> graphics_compute_source(const GraphicsModernShader&){throw std::runtime_error("後端缺少 MSL compute 核心");}
     virtual std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t>){throw std::runtime_error("後端缺少取樣器");}

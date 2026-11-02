@@ -7,6 +7,7 @@
 #include "crt_library.hpp"
 #include "pe_signature.hpp"
 #include "builtin_version.hpp"
+#include "windows_nt_entry.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/windows_unwind.hpp"
@@ -14,6 +15,7 @@
 #include "x64arm/windows_sdk_modules.hpp"
 #include "x64arm/retained_capacity.hpp"
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <sstream>
 #include <cstdio>
@@ -27,6 +29,12 @@ struct ModuleError : std::runtime_error {
     std::uint32_t code;
     ModuleError(std::uint32_t value,std::string message):std::runtime_error(std::move(message)),code(value){}
 };
+void module_event(std::vector<std::string>& events,std::string event){
+    static const bool trace=[] {const auto* value=std::getenv("X64ARM_TRACE_MODULES");return value && std::string_view(value)=="1";}();
+    // 致命錯誤視窗可能讓客體無法正常退出；診斷模式即時保留失敗原因。
+    if(trace)std::fprintf(stderr,"module_event pid=%u %s\n",static_cast<unsigned>(getpid()),event.c_str());
+    events.push_back(std::move(event));
+}
 std::string module_key(std::u16string_view path) {
     auto value=utf16_to_utf8(path);std::replace(value.begin(),value.end(),'/','\\');
     for(auto& c:value)if(c>='A' && c<='Z')c=static_cast<char>(c+32);
@@ -52,7 +60,11 @@ struct BuiltinImage {
     std::map<std::string,std::uint32_t> names;
     std::map<std::uint32_t,std::uint32_t> ordinals;
 };
-BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,const std::map<std::string,std::uint64_t>& targets,const std::map<std::uint64_t,std::uint32_t>& system_calls) {
+struct BuiltinSystemCall {
+    std::uint32_t id{};
+    std::uint16_t stack_bytes{};
+};
+BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,const std::map<std::string,std::uint64_t>& targets,const std::map<std::uint64_t,BuiltinSystemCall>& system_calls,std::uint64_t x86_transition) {
     // PE 的 RVA 僅 32 位元；模組內的實際唯讀跳躍入口轉接至既有 API gateway，
     // 保留所有參數／暫存器與回傳框架。只有真正可呼叫的服務才列為匯出。
     std::map<std::uint32_t,std::uint64_t> ordinals;
@@ -104,10 +116,11 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
     std::map<std::uint64_t,std::uint32_t> entries;auto at=code;
     for(const auto& [target,ordinal]:assigned){
         (void)ordinal;entries.emplace(target,static_cast<std::uint32_t>(at));
-        if(!x86 && name=="ntdll.dll" && system_calls.contains(target)){
-            // 可複製、可攔截的標準 x64 系統服務入口；複本仍經 CPU SYSCALL 派送。
-            const std::array<std::uint8_t,16> stub{0x4c,0x8b,0xd1,0xb8,0,0,0,0,0x0f,0x05,0xc3,0x66,0x66,0x90,0x66,0x90};
-            std::copy(stub.begin(),stub.end(),bytes.begin()+static_cast<std::ptrdiff_t>(at));put(at+4,4,system_calls.at(target));
+        if(name=="ntdll.dll" && system_calls.contains(target)){
+            const auto& call=system_calls.at(target);
+            // 獨立的系統呼叫入口不依賴會被攔截改寫的原位置。
+            const auto stub=detail::nt_service_entry(x86,call.id,call.stack_bytes,x86_transition);
+            std::copy(stub.begin(),stub.end(),bytes.begin()+static_cast<std::ptrdiff_t>(at));
         }else{bytes[at]=0xff;bytes[at+1]=0x25;if(x86){put(at+2,4,base+at+6);put(at+6,4,target);}else {put(at+2,4,0);put(at+6,8,target);}}
         at+=16;
     }
@@ -331,8 +344,16 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
         const auto base=windows_address_layout::for_mode(memory.execution_mode()).images+slot->second.first*windows_address_layout::module_stride;
         const auto capacity=slot->second.second*windows_address_layout::module_stride;
         const auto targets=builtin_export_targets(name);
-        const auto system_calls=!x86_ && name=="ntdll.dll"?builtin_system_calls():std::map<std::uint64_t,std::uint32_t>{};
-        auto headers=builtin_headers(base,name,x86_,targets,system_calls);
+        std::map<std::uint64_t,BuiltinSystemCall> system_calls;
+        if(name=="ntdll.dll"){
+            for(const auto& [target,id]:builtin_system_calls())system_calls.emplace(target,BuiltinSystemCall{id,0});
+            if(x86_)for(const auto& service:runtime_service_descriptors()){
+                if(service.family!="ntdll.dll" || (!service.symbol.starts_with("Nt") && !service.symbol.starts_with("Zw")))continue;
+                const auto target=resolve(service.family,service.symbol).value;
+                system_calls.at(target).stack_bytes=detail::nt_entry_stack_bytes(service);
+            }
+        }
+        auto headers=builtin_headers(base,name,x86_,targets,system_calls,callback_return_.value+0xf8);
         if(headers.bytes.size()>capacity || !memory.range_available(GuestAddress{base},headers.bytes.size()))throw ModuleError(8,"內建模組固定範圍已占用");
         RuntimeImage image;image.base=base;image.size=headers.bytes.size();image.path=u"C:\\Windows\\System32\\"+utf8_to_utf16(name);
         image.export_names=std::move(headers.names);image.export_ordinals=std::move(headers.ordinals);
@@ -386,13 +407,14 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
     try {
         const auto select_base=[&](GuestAddress preferred,std::uint32_t size,PeArchitecture architecture){
             if(!resource_only && (architecture==PeArchitecture::X86)!=x86_)throw ModuleError(193,"DLL 與程序架構不一致");
-            if(memory.range_available(preferred,size))return preferred;
-            auto selected=runtime_.next_module_base;
-            while(!memory.range_available(GuestAddress{selected},size)){
-                if(selected>std::min<std::uint64_t>(UINT64_C(0x600000000000),user_address_limit())-size)throw ModuleError(8,"沒有 DLL 映射位址");
-                const auto mapping=memory.next_mapping(GuestAddress{selected});
-                selected=mapping?((mapping->base.value+mapping->size+65535)&~UINT64_C(65535)):selected+65536;
-            }
+            const auto limit=kernel_image_load_?UINT64_MAX:user_address_limit();
+            // DLL 與 VirtualAlloc 共用空洞搜尋，同時尊重未 commit 的保留區。
+            // preferred 不可覆蓋未載入 provider 的槽位；cursor 到頂時仍會回收低位址空洞。
+            if(preferred.value>=65536 && preferred.value<limit && size<=limit-preferred.value &&
+               find_free_virtual_range(memory,size,65536,preferred.value,preferred.value+size,preferred.value)==preferred.value)return preferred;
+            const auto selected=find_free_virtual_range(memory,size,65536,65536,
+                std::min<std::uint64_t>(UINT64_C(0x600000000000),user_address_limit()),runtime_.next_module_base);
+            if(!selected)throw ModuleError(8,"沒有 DLL 映射位址");
             return GuestAddress{selected};
         };
         parsed=parse_pe_image(*source.bytes,{},true,memory.limit(),resource_only,select_base,kernel_image_load_);
@@ -413,7 +435,7 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
         try {runtime_.resource_modules.emplace(handle,std::move(module));created.push_back(handle);}
         catch(...) {for(const auto& region:parsed.mappings)memory.unmap(GuestAddress{base+region.rva});runtime_.resource_modules.erase(handle);throw;}
         runtime_.next_module_base=std::max(runtime_.next_module_base,(base+parsed.metadata.image_size+65535)&~UINT64_C(65535));
-        runtime_.module_events.push_back("resource_load="+utf16_to_utf8(guest));return handle;
+        module_event(runtime_.module_events,"resource_load="+utf16_to_utf8(guest));return handle;
     }
     try {
         map_pe_image(memory,parsed);
@@ -449,7 +471,7 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
         });
         loaded.loading=false;runtime_.module_order.push_back(base);
         runtime_.next_module_base=std::max(runtime_.next_module_base,(base+parsed.metadata.image_size+65535)&~UINT64_C(65535));
-        std::ostringstream event;event<<"module_load="<<utf16_to_utf8(guest)<<" base=0x"<<std::hex<<base<<" size="<<std::dec<<parsed.metadata.image_size;runtime_.module_events.push_back(event.str());
+        std::ostringstream event;event<<"module_load="<<utf16_to_utf8(guest)<<" base=0x"<<std::hex<<base<<" size="<<std::dec<<parsed.metadata.image_size;module_event(runtime_.module_events,event.str());
     }catch(...) {
         if(!runtime_.loaded_modules.contains(base))for(const auto& region:parsed.mappings)if(memory.mapped(GuestAddress{base+region.rva}))memory.unmap(GuestAddress{base+region.rva});
         throw;
@@ -480,7 +502,7 @@ void WindowsServices::prepare_image_startup(GuestState& state) {
 void WindowsServices::unmap_module(GuestMemory& memory,std::uint64_t base,GuestState* state) {
     if(const auto resource=runtime_.resource_modules.find(base);resource!=runtime_.resource_modules.end()) {
         for(const auto& [address,size]:resource->second.mappings)memory.unmap(GuestAddress{address},size);
-        runtime_.module_events.push_back("resource_unload="+utf16_to_utf8(resource->second.image.path));runtime_.resource_modules.erase(resource);return;
+        module_event(runtime_.module_events,"resource_unload="+utf16_to_utf8(resource->second.image.path));runtime_.resource_modules.erase(resource);return;
     }
     const auto found=runtime_.loaded_modules.find(base);if(found==runtime_.loaded_modules.end())return;
     const auto& module=found->second;
@@ -494,7 +516,7 @@ void WindowsServices::unmap_module(GuestMemory& memory,std::uint64_t base,GuestS
         runtime_.static_tls_slots[module.tls_slot]=false;
     }
     for(const auto& [address,size]:module.mappings){memory.discard(GuestAddress{address},size);runtime_.virtual_page_protections.erase(runtime_.virtual_page_protections.lower_bound(address),runtime_.virtual_page_protections.lower_bound(address+size));}
-    runtime_.module_events.push_back("module_unload="+utf16_to_utf8(module.image.path));
+    module_event(runtime_.module_events,"module_unload="+utf16_to_utf8(module.image.path));
     runtime_.loaded_modules.erase(found);
     std::erase_if(runtime_.modules,[&](const auto& item){return item.second==base;});
     std::erase(runtime_.module_order,base);runtime_.main_dependencies.erase(base);
@@ -560,6 +582,7 @@ std::optional<std::uint32_t> WindowsServices::resume_module_operation(GuestState
     auto& operation=runtime_.module_operations.at(frame.value);
     const auto step=operation.steps.at(operation.index);
     if(step.check_result && !static_cast<std::uint32_t>(result)) {
+        module_event(runtime_.module_events,"module_error=1114 DllMain 回傳 FALSE："+utf16_to_utf8(runtime_.loaded_modules.at(step.module).image.path));
         runtime_.loaded_modules.at(step.module).attached=true;
         operation.error=1114;operation.result=0;operation.rollback=true;operation.unloading=true;
         operation.steps.clear();operation.index=0;
@@ -573,7 +596,7 @@ std::optional<std::uint32_t> WindowsServices::fail_module_initialization(GuestSt
     auto& operation=runtime_.module_operations.at(id);const auto step=operation.steps.at(operation.index);
     // DllMain 逸出的例外由載入器攔下。與回 FALSE 不同，失敗 DLL 不接收 PROCESS_DETACH。
     if(auto module=runtime_.loaded_modules.find(step.module);module!=runtime_.loaded_modules.end())module->second.attached=false;
-    runtime_.module_events.push_back("module_error=1114 DllMain 初始化例外");
+    module_event(runtime_.module_events,"module_error=1114 DllMain 初始化例外");
     operation.error=1114;operation.result=0;operation.rollback=true;operation.unloading=true;operation.steps.clear();operation.index=0;
     std::set<std::uint64_t> cleanup(operation.created.begin(),operation.created.end());
     for(auto it=runtime_.module_order.rbegin();it!=runtime_.module_order.rend();++it)if(cleanup.erase(*it))append_module_detach(operation,*it,true);
@@ -778,13 +801,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,Gu
     }catch(const ModuleError& error) {
         for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it,&state);
         last_error_=error.code;result=0;
-        runtime_.module_events.push_back("module_error="+std::to_string(error.code)+" "+error.what());
+        module_event(runtime_.module_events,"module_error="+std::to_string(error.code)+" "+error.what());
     }catch(const std::invalid_argument& error) {
         for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it,&state);
-        last_error_=193;result=0;runtime_.module_events.push_back("module_error=193 "+std::string(error.what()));
+        last_error_=193;result=0;module_event(runtime_.module_events,"module_error=193 "+std::string(error.what()));
     }catch(const std::bad_alloc&) {
         for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it,&state);
-        last_error_=8;result=0;runtime_.module_events.push_back("module_error=8 模組／TLS 配置超過客體記憶體預算");
+        last_error_=8;result=0;module_event(runtime_.module_events,"module_error=8 模組／TLS 配置超過客體記憶體預算");
     }
     if(symbol=="FreeLibraryAndExitThread")return exit_thread(state,memory,static_cast<std::uint32_t>(arg(1)));
     call.return_to(state,result);return std::nullopt;
@@ -794,8 +817,8 @@ std::pair<std::uint64_t,std::uint32_t> WindowsServices::load_kernel_image(GuestM
     std::vector<std::uint64_t> created;kernel_image_load_=true;
     struct Reset {bool& flag;~Reset(){flag=false;}} reset{kernel_image_load_};
     try{return {load_module(memory,path,8,created),0};}
-    catch(const ModuleError& error){for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it);runtime_.module_events.push_back("module_error="+std::to_string(error.code)+" "+error.what());return {0,error.code};}
-    catch(const std::invalid_argument& error){for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it);runtime_.module_events.push_back("module_error=193 "+std::string(error.what()));return {0,193};}
+    catch(const ModuleError& error){for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it);module_event(runtime_.module_events,"module_error="+std::to_string(error.code)+" "+error.what());return {0,error.code};}
+    catch(const std::invalid_argument& error){for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it);module_event(runtime_.module_events,"module_error=193 "+std::string(error.what()));return {0,193};}
     catch(const std::bad_alloc&){for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it);return {0,8};}
 }
 std::string WindowsServices::module_diagnostics() const {

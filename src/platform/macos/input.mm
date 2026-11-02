@@ -3,6 +3,7 @@
 #include <ApplicationServices/ApplicationServices.h>
 #include <IOKit/hid/IOHIDManager.h>
 #include <IOKit/hid/IOHIDKeys.h>
+#import <IOUSBHost/IOUSBHost.h>
 #include <ForceFeedback/ForceFeedback.h>
 #import <GameController/GameController.h>
 #import <CoreHaptics/CoreHaptics.h>
@@ -40,6 +41,52 @@ std::string text(CFTypeRef value){
 }
 std::int64_t number(CFTypeRef value){
     std::int64_t n=0;if(value && CFGetTypeID(value)==CFNumberGetTypeID())CFNumberGetValue(static_cast<CFNumberRef>(value),kCFNumberSInt64Type,&n);return n;
+}
+// 只跨執行緒傳遞 registry ID；IOHID 物件仍由輸入 worker 擁有。
+struct PhysicalDescriptorSource {std::uint64_t registry_id{};unsigned interface{};std::uint32_t error{50};};
+io_service_t usb_ancestor(io_service_t entry,const char* kind){
+    if(!entry)return IO_OBJECT_NULL;
+    IOObjectRetain(entry);
+    while(entry && !IOObjectConformsTo(entry,kind)){
+        io_service_t parent=IO_OBJECT_NULL;const auto status=IORegistryEntryGetParentEntry(entry,kIOServicePlane,&parent);
+        IOObjectRelease(entry);entry=status==KERN_SUCCESS?parent:IO_OBJECT_NULL;
+    }
+    return entry;
+}
+std::uint32_t physical_descriptor_error(NSError* error){
+    if(!error)return 31;
+    switch(static_cast<IOReturn>(error.code)){
+    case kIOReturnTimeout:return 121;
+    case kIOReturnAborted:return 995;
+    case kIOReturnNoDevice:case kIOReturnNotAttached:case kIOReturnNotResponding:case kIOReturnOffline:return 1167;
+    case kIOReturnExclusiveAccess:case kIOReturnNotPrivileged:case kIOReturnNotPermitted:return 5;
+    case kIOReturnBadArgument:return 87;
+    case kIOReturnNoMemory:case kIOReturnNoResources:return 8;
+    case kIOReturnUnsupported:return 50;
+    default:return 31;
+    }
+}
+std::uint32_t read_physical_descriptor(const PhysicalDescriptorSource& source,std::span<std::uint8_t> bytes,std::uint32_t& transferred){
+    transferred=0;if(bytes.empty())return 87;if(source.error)return source.error;
+    @autoreleasepool {
+        const auto matching=IORegistryEntryIDMatching(source.registry_id);
+        const auto service=matching?IOServiceGetMatchingService(MACH_PORT_NULL,matching):IO_OBJECT_NULL;
+        if(!service)return 1167;
+        NSError* failure=nil;
+        IOUSBHostDevice* device=[[IOUSBHostDevice alloc] initWithIOService:service options:IOUSBHostObjectInitOptionsNone queue:nil error:&failure interestHandler:nil];
+        IOObjectRelease(service);if(!device)return physical_descriptor_error(failure);
+        const auto capacity=std::min<std::size_t>(bytes.size(),UINT16_MAX);
+        NSMutableData* data=[NSMutableData dataWithLength:capacity];
+        if(!data){[device destroy];return 8;}
+        // HID 1.11 §7.1.1：介面 GET_DESCRIPTOR、physical type 0x23、預設 set 0。
+        // 不 capture／seize，不卸載宿主 HID 驅動；每次讀取至多等待兩秒。
+        const IOUSBDeviceRequest request{0x81,6,0x2300,static_cast<std::uint16_t>(source.interface),static_cast<std::uint16_t>(capacity)};
+        NSUInteger count=0;const bool ok=[device sendDeviceRequest:request data:data bytesTransferred:&count completionTimeout:2.0 error:&failure];
+        [device destroy];if(!ok)return physical_descriptor_error(failure);
+        if(count>capacity || count>data.length)return 31;
+        if(count)std::copy_n(static_cast<const std::uint8_t*>(data.bytes),count,bytes.begin());
+        transferred=static_cast<std::uint32_t>(count);return 0;
+    }
 }
 struct Link {
     IOHIDDeviceRef hid{};FFDeviceObjectReference ff{};FFCAPABILITIES caps{};
@@ -239,6 +286,25 @@ public:
             if(result!=kIOReturnSuccess)return result==kIOReturnNotPermitted?5U:result==kIOReturnUnsupported?50U:31U;
             if(length>=0 && static_cast<std::size_t>(length)<data.size())std::fill(data.begin()+length,data.end(),std::uint8_t{});if(report_id)bytes.front()=report_id;return 0U;}
         return 1167;
+    }
+    PhysicalDescriptorSource physical_descriptor_source(const Guid& id){
+        if(id==keyboard_.instance || id==mouse_.instance)return {};
+        for(const auto& [ref,h]:hid_){if(h.device.instance!=id)continue;if(!h.device.attached)return {0,0,1167};
+            const auto interface=usb_ancestor(IOHIDDeviceGetService(ref),"IOUSBHostInterface");if(!interface)return {};
+            CFTypeRef value=IORegistryEntryCreateCFProperty(interface,CFSTR("bInterfaceNumber"),kCFAllocatorDefault,0);
+            const auto number_value=value && CFGetTypeID(value)==CFNumberGetTypeID()?number(value):-1;
+            if(value)CFRelease(value);
+            const auto device=usb_ancestor(interface,"IOUSBHostDevice");IOObjectRelease(interface);
+            if(!device)return {};
+            std::uint64_t registry_id=0;const auto status=IORegistryEntryGetRegistryEntryID(device,&registry_id);IOObjectRelease(device);
+            if(status!=KERN_SUCCESS)return {0,0,1167};
+            if(number_value<0 || number_value>255)return {};
+            return {registry_id,static_cast<unsigned>(number_value),0};
+        }
+        return {0,0,1167};
+    }
+    std::uint32_t get_physical_descriptor(const Guid& id,std::span<std::uint8_t> bytes,std::uint32_t& transferred)override{
+        return read_physical_descriptor(physical_descriptor_source(id),bytes,transferred);
     }
     bool available(const Guid& id)override{if(id==keyboard_.instance || id==mouse_.instance)return true;for(auto& [ref,h]:hid_){(void)ref;if(h.device.instance==id)return h.device.attached;}return false;}
     void mouse_wheel(std::int32_t delta)override{if(!tap_)change(mouse_,2,delta);}

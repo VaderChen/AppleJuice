@@ -88,6 +88,25 @@ void WindowsServices::observe_gui_key(GuiMessage& message,bool injected){
     gui_.last_input_ticks=runtime_.clock_ticks;
 }
 void WindowsServices::consume_gui_input(const GuiMessage& message){
+    // WNDPROC／timer 回呼可以重入 PeekMessage，先取走系統移動迴圈的輸入。
+    // 記住實際移除的座標與結束訊號，待回呼返回後由同一個移動操作續接；
+    // PM_NOREMOVE 不經此處，Read 階段則仍由原本的 MSG 緩衝區處理。
+    for(auto& [id,move]:gui_.move_sizes){
+        (void)id;using Stage=GuiMoveSize::Stage;
+        if(move.thread!=threads_.current || gui_.capture!=move.window || gui_.capture_generation!=move.capture_generation ||
+           (move.stage!=Stage::Initialize && move.stage!=Stage::Dispatch && move.stage!=Stage::Rect && move.stage!=Stage::Position))continue;
+        const auto kind=message.message;
+        if((kind==0x200 || kind==0xa0) && !move.nested_end)move.nested_point=message.queued_cursor;
+        else if(kind==0x202 || kind==0xa2 || kind==0x1f || kind==0x215)move.nested_end=true;
+        else if((kind==0x100 || kind==0x104) && !move.nested_end){
+            if(message.wparam==27){move.cancel=true;move.nested_end=true;}
+            else if(message.wparam==13)move.nested_end=true;
+            else if(message.wparam>=37 && message.wparam<=40){
+                auto point=move.nested_point.value_or(move.point);const auto key=message.wparam;
+                point[key==37 || key==39?0:1]+=(key==37 || key==38?-1:1)*((message.modifiers&2U)?1:10);move.nested_point=point;
+            }
+        }else if(kind==18){move.quit=true;move.quit_code=static_cast<std::uint32_t>(message.wparam);move.nested_end=true;}
+    }
     if(message.keyboard_snapshot){gui_.keyboard=*message.keyboard_snapshot;return;}
     const bool mouse=message.message>=0x200 && message.message<=0x20e;
     if((message.message>=0x100 && message.message<=0x107) || mouse){
@@ -256,11 +275,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_input_api(GuestState& state
                         GuiMessage message{target,mouse_keys(gui_.input_keyboard)|(std::uint64_t{high}<<16),xy,msg};
                         message.has_point=true;message.screen_point=true;message.point=point;
                         message.modifiers=modifiers(gui_.input_keyboard);message.keyboard_snapshot=gui_.input_keyboard;message.injected=true;message.queued_time=time;message.input_extra=item.extra;
-                        if(msg==0x200 && !(item.flags&0x2000U)){
-                            if(!gui_.mouse_inputs.empty()){auto previous=std::prev(gui_.mouse_inputs.end());const auto& pending=previous->second;
-                                if(!pending.active && pending.message.injected && pending.message.window==target && pending.message.message==0x200)gui_.mouse_inputs.erase(previous);}
-                            else if(!gui_.queue.empty() && gui_.queue.back().injected && gui_.queue.back().window==target && gui_.queue.back().message==message.message)gui_.queue.pop_back();
-                        }
+                        message.mouse_no_coalesce=(item.flags&0x2000U)!=0;
                         message.queue_priority=1;queue_gui_mouse(std::move(message));
                     };
                     if(item.flags&1U)send(0x200);

@@ -4,6 +4,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <thread>
 #include "x64arm/shared_wake.hpp"
@@ -98,12 +100,24 @@ void WindowsServices::poll_registry_notifications(bool reload,std::u16string_vie
         const auto now=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
         if(now>=registry_poll_time_+100){RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return;registry_poll_time_=now;compare_snapshots=true;}
     }
+    // 交易重載／變更與 API 內明確通知仍完整比對。只有背景輪詢、同一份狀態且世代未變時，
+    // 才沿用上次確認的鍵存在性；關閉 handle、路徑替換、執行緒退出及待發布 IOSB 每次都檢查。
+    static thread_local const RegistryState* checked_registry{};
+    static thread_local std::uint64_t checked_generation{};
+    static const bool content_cache=[] {const auto* value=std::getenv("X64ARM_REGISTRY_NOTIFY_CONTENT_CACHE");
+        return !value || std::string_view(value)!="0";}();
+    const auto generation=registry_activity_generation();
+    const bool content_checked=content_cache && reload && mutation.empty() && !filter && !compare_snapshots &&
+        generation!=UINT64_MAX && checked_registry==&registry && checked_generation==generation;
     for(auto it=registry_notifications_.begin();it!=registry_notifications_.end();) {
         auto& watch=it->second;
         const auto thread=threads_.items.find(watch.thread);
         const bool root=watch.key>=0x80000000U && watch.key<=0x80000006U;
-        const bool closed=!root && !registry.handles.contains(watch.key);
-        const bool removed=!registry_io_busy_ && (!registry.keys.contains(watch.path) || (!root && !closed && registry.handles.at(watch.key).path!=watch.path));
+        const auto watched_handle=root?registry.handles.end():registry.handles.find(watch.key);
+        const bool closed=!root && watched_handle==registry.handles.end();
+        const bool replaced=!root && !closed && (watched_handle->second.path.size()!=watch.path.size() ||
+            std::memcmp(watched_handle->second.path.data(),watch.path.data(),watch.path.size()*sizeof(char16_t))!=0);
+        const bool removed=!registry_io_busy_ && ((!content_checked && !registry.keys.contains(watch.path)) || replaced);
         const bool exited=thread==threads_.items.end() || thread->second.status==ThreadStatus::Exited;
         bool changed=watch.completion_status!=0x103U || closed || removed ||
             (!(watch.filter&0x10000000U) && exited);
@@ -153,6 +167,8 @@ void WindowsServices::poll_registry_notifications(bool reload,std::u16string_vie
         if(watch.event){const auto event=runtime_.wait_objects.find(watch.event);if(event!=runtime_.wait_objects.end())event->second.set_signal(true);}
         it=registry_notifications_.erase(it);
     }
+    // I/O 讓出期間沒有核對內容，不能把「略過」登錄成有效快取。
+    if(!registry_io_busy_){checked_registry=&registry;checked_generation=generation;}
 }
 #include "windows_registry_notify.inc"
 std::u16string WindowsServices::registry_current_user_path(bool cached){

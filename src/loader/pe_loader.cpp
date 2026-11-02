@@ -177,7 +177,19 @@ void exports(const Image& image, Directory dir, RuntimeImage& runtime) {
     for(std::uint64_t i=0;i<names;++i){
         const auto index=image.integer(ordinals+i*2,2);if(index>=count)reject("export name ordinal 超出 address table");
         const auto name=image.string(image.integer(name_table+i*4,4),4096);
-        if(!runtime.export_names.emplace(name,static_cast<std::uint32_t>(ordinal_base+index)).second)reject("export 名稱重複");
+        const auto ordinal=static_cast<std::uint32_t>(ordinal_base+index);
+        const auto [existing,inserted]=runtime.export_names.emplace(name,ordinal);
+        if(!inserted && existing->second!=ordinal){
+            // 不同 ordinal 可別名到相同入口；名稱重複本身不代表衝突。
+            // 仍保留所有 ordinal，名稱採第一筆；不接受兩個不同的實際目標。
+            const auto previous=image.integer(addresses+(existing->second-ordinal_base)*4,4);
+            const auto target=image.integer(addresses+index*4,4);
+            const auto old_forwarder=runtime.export_forwarders.find(existing->second);
+            const auto new_forwarder=runtime.export_forwarders.find(ordinal);
+            const bool same_forwarder=old_forwarder!=runtime.export_forwarders.end() &&
+                new_forwarder!=runtime.export_forwarders.end() && old_forwarder->second==new_forwarder->second;
+            if(previous!=target && !same_forwarder)reject("export 同名項目指向不同目標");
+        }
     }
 }
 // Debug metadata never executes. Validate both mapped RVA and file-only records,

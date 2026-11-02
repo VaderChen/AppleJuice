@@ -31,6 +31,7 @@
 #include "x64arm/usb.hpp"
 
 namespace x64arm {
+namespace wlan {class Backend;}
 // 協調者本地一般服務的 provider 要啟動客體回呼時丟出；呼叫端恢復狀態交回完整路徑。
 struct LocalServiceRefused {};
 struct ResidentHostEnvironment;
@@ -131,6 +132,8 @@ public:
     void set_bluetooth_backend(std::shared_ptr<bluetooth::Backend>);
     void set_network_resource_backend(std::shared_ptr<network_resources::Backend>);
     void set_input_backend(std::shared_ptr<input::Backend>);
+    void set_usb_backend(std::shared_ptr<usb::Backend> backend){usb_backend_=std::move(backend);}
+    void set_wlan_backend(std::shared_ptr<wlan::Backend>);
     void set_audio_input_backend(std::shared_ptr<audio::InputBackend>);
     void set_audio_mixer_backend(std::shared_ptr<audio::MixerBackend>);
     void set_power_notification_backend(std::shared_ptr<NativePowerNotifications>);
@@ -180,6 +183,10 @@ public:
     bool resident_context_runnable(const GuestState&) const override;
     void resident_unpark(GuestState&,GuestMemory&) override;
     bool resident_resolve_waits(GuestMemory&) override;
+    // 獨占映射鎖外的前置判斷：有沒有任何等待可能在這次解析被推進（見 resident_resolve_waits）。只在協調執行緒呼叫。
+    bool resident_resolve_waits_pending(GuestMemory&);
+    // 不取共用命名空間鎖，判斷這組 handle 是否「可能」就緒（resolve_thread_waits 與前置判斷共用）。
+    bool wait_may_be_ready(const std::vector<std::uint64_t>& handles,bool all,std::uint64_t thread_id);
     bool resident_runnable_waiting(std::span<GuestState* const>) const override;
     GuestState* resident_idle_replacement(GuestState&,GuestMemory&,std::span<GuestState* const>) override;
     bool resident_block_service_impl(GuestState&,GuestMemory&,std::span<GuestState* const>,GuestState*&,int* outcome);
@@ -468,6 +475,13 @@ private:
     bool winusb_waiting() const;
     std::optional<usb::Target> usb_target(const std::u16string& path);
     std::shared_ptr<struct WinUsbState> winusb_;
+    std::shared_ptr<usb::Backend> usb_backend_;
+    usb::Backend& usb_backend()const;
+    std::shared_ptr<struct WlanState> wlan_;
+    std::shared_ptr<wlan::Backend> wlan_backend_;
+    std::optional<std::uint32_t> invoke_wlan(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    void poll_wlan(GuestMemory&);
+    bool wlan_waiting()const;
     void show_certificate_selection(std::uint64_t dialog);
     // fontsub CreateFontPackage：等待客體 allocproc 配置輸出緩衝區。
     struct FontPackageOutput {std::vector<std::uint8_t> bytes;std::uint64_t dest{},dest_size{},written{};bool operator==(const FontPackageOutput&)const=default;};
@@ -623,6 +637,9 @@ private:
     bool invoke_remote_gui(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void publish_remote_frame(std::uint64_t,NativeGraphics&,const GraphicsView&);
     void poll_remote_frames();
+    bool blit_raster(GuestMemory&,std::uint64_t,RasterSurface*,const GuiRect&,const GuiRect&,const GuiDc&,std::uint32_t,const RasterBlit&,RasterSurface* =nullptr);
+    std::shared_ptr<RasterSurface> remote_raster_snapshot(GuestMemory&,std::uint64_t);
+    std::uint32_t receive_remote_raster(GuestMemory&,std::uint32_t,std::uint32_t,std::array<std::uint64_t,5>&,int);
     std::uint32_t local_process_handle_count() const;
     std::vector<std::uint64_t> local_process_handles() const;
     std::size_t mapping_handle_count() const;
@@ -1093,6 +1110,11 @@ private:
     std::deque<GpuSignal> gpu_signals_;
     // 等顯示緩衝的 Present 重試（ThreadWaitKind::PresentRetry）：執行緒 → 交換鏈的原生呈現表面；只在協調者讀寫。
     std::map<std::uint64_t,std::shared_ptr<NativeGraphics>> present_waits_;
+    // 等背景著色器編譯的建立重試（ThreadWaitKind::ShaderRetry）：執行緒 → 圖形後端與票號；只在協調者讀寫。
+    std::map<std::uint64_t,std::pair<std::shared_ptr<NativeGraphics>,std::uint64_t>> shader_waits_;
+    // 最近一次呼叫 D3D11／DXGI Present 的執行緒（渲染執行緒）：它要的著色器照舊同步轉譯，不讓它讓出 vCPU 等背景編譯
+    //（DQ3 2 vCPU 時渲染執行緒自己建立 739 個、每次等待中位 6 ms，長幀 >100 ms 從約 28 變 76～116）。
+    std::uint64_t present_thread_{};
     // poll=false：只登記不套用（D3D12 提交執行緒不觸發事件、不改執行緒等待狀態，由客體端輪詢套用）。
     void queue_gpu_signal(GuestMemory&,std::shared_ptr<const std::atomic<bool>>,std::uint64_t,std::function<void(GuestMemory&)>,bool poll=true);
     // 待完成通知數（圖形鎖內以原子操作更新）：協調者計算喚醒期限時不取鎖讀取。WindowsServices 須可移動，不用 std::atomic 成員。
@@ -1147,6 +1169,8 @@ private:
     bool d3d11_adapter(std::uint64_t object) const;
     // worker 上的 D3D11 方法為 true；延後需要改動客體 heap 的銷毀，協調者本地路徑則可處理。
     static bool& graphics_local() noexcept {static thread_local bool value=false;return value;}
+    // 協調者在其他 worker 繼續執行時本地完成 D3D11 方法：不可排程或讓呼叫者等待（見 resident_coordinated_service）。
+    static bool& graphics_coordinator_local() noexcept {static thread_local bool value=false;return value;}
     // 目前執行緒正在 worker 上執行 D3D12 服務：程序事件紀錄（module_events）屬協調者，worker 端先暫存於 D3D12 狀態。
     static bool& d3d12_worker_context() noexcept {static thread_local bool value=false;return value;}
     // 目前執行緒是 D3D12 提交執行緒且正在重播的工作（D3D12Submitter::Job*）：invoke_d3d12 以工作參數代替客體呼叫框架。
@@ -1234,6 +1258,7 @@ private:
     mutable ConcurrentGuestCache concurrent_cache_;
     // 最近一次計算喚醒期限時最早的客體等待期限（100 ns 單調刻度）；過期即需完整排程解析逾時，schedule 後清除。
     mutable std::uint64_t resident_wait_deadline_{UINT64_MAX}; // 只在協調執行緒讀寫。
+    struct ResolveWaitStats {std::uint64_t calls{},skipped{},changed{};} resolve_wait_stats_; // 逾時路徑等待解析的次數（X64ARM_SERVICE_COUNTS 輸出）。
     std::uint64_t resident_full_poll_ticks_{}; // 上次完整排程輪詢外部完成（wake_threads）的單調時間；物件等待停駐的保險用。
     std::map<std::uint64_t,GuestAddress> resident_service_requests_;
     std::uint64_t thread_id(std::uint64_t handle) const;

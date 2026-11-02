@@ -104,6 +104,8 @@ public:
     virtual std::uint32_t set_report(const Guid&,unsigned,std::span<const std::uint8_t>){return 50;}
     // 首位元組為 report ID；成功時覆寫其餘報告內容。
     virtual std::uint32_t get_report(const Guid&,unsigned,std::span<std::uint8_t>){return 50;}
+    // 選用的 HID physical descriptor（不是 report descriptor）；成功時明列實際傳輸長度。
+    virtual std::uint32_t get_physical_descriptor(const Guid&,std::span<std::uint8_t>,std::uint32_t& transferred){transferred=0;return 50;}
     virtual bool available(const Guid&)=0;
     virtual std::uint32_t cooperative(const Guid&,bool){return 0;}
     virtual void mouse_wheel(std::int32_t){}

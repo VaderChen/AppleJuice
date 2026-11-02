@@ -31,7 +31,9 @@ const std::vector<std::uint8_t>& WindowsServices::registry_security_descriptor(c
 }
 std::vector<std::uint8_t> WindowsServices::registry_creation_descriptor(const std::vector<std::uint8_t>& parent,security::SecurityDescriptor child){
     initialize_tokens();const auto& token=runtime_.token_objects.at(effective_token_id());
-    return object_security_descriptor(security::inherit_descriptor(std::move(child),security::parse_relative_descriptor(parent),token.owner,token.primary_group,true),true,true);
+    // 登錄持久物件預設為隱含 medium；只有低於 medium 的建立者需補標籤。
+    // 明示或父層繼承的標籤照常保留，不把提升程序的 high 自動寫入機碼。
+    return object_security_descriptor(security::inherit_descriptor(std::move(child),security::parse_relative_descriptor(parent),token.owner,token.primary_group,true),true,token.integrity<0x2000U);
 }
 std::uint32_t WindowsServices::registry_security_access(const std::u16string& path,std::uint32_t desired){
     return object_security_access(registry_security_descriptor(path),desired&~0x300U,key_mapping);

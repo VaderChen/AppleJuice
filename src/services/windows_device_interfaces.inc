@@ -36,23 +36,13 @@
                 }
                 if(arg(3) && !write_interface(arg(3),found->first))return failed(1784);return finish(1);
             }
-            if(name=="SetupDiGetDeviceInterfacePropertyW"){
-                // 介面屬性存放區：FriendlyName、Enabled、ClassGuid 與所屬裝置的 InstanceId。
-                if(arg(7))return failed(1004);if(!arg(2) || !arg(3))return failed(87);if(!arg(4) && arg(5))return failed(1784);
-                const auto token=read_interface(arg(1));if(!token)return failed(87);const auto& entry=info.interfaces.at(*token);const auto& node=nodes.at(entry.node);
-                std::array<std::uint8_t,16> key{};memory.read(GuestAddress{arg(2)},key);const auto pid=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)+16},32));
-                constexpr std::array<std::uint8_t,16> interface_keys{0x6e,0x51,0x6e,0x02,0x14,0xb8,0x4b,0x41,0x83,0xcd,0x85,0x6d,0x6f,0xef,0x48,0x22};
-                constexpr std::array<std::uint8_t,16> device_keys{0xc8,0x4f,0xc3,0x78,0x4a,0x10,0xca,0x4a,0x9e,0xa4,0x52,0x4d,0x52,0x99,0x6e,0x57};
-                std::uint32_t type=0;std::vector<std::uint8_t> data;
-                const auto text=[&](const std::u16string& value){type=0x12;data=utf16_bytes(value);data.push_back(0);data.push_back(0);};
-                if(key==interface_keys && pid==2){const auto friendly=property_text(node,13);text(friendly.empty()?node.id:friendly);}
-                else if(key==interface_keys && pid==3){type=0x11;data={static_cast<std::uint8_t>(node.present?0xff:0)};}
-                else if(key==interface_keys && pid==4){type=0x0d;data.assign(entry.guid.begin(),entry.guid.end());}
-                else if(key==device_keys && pid==256)text(node.id);
-                else return failed(1168);
-                memory.check(GuestAddress{arg(3)},4,Access::Write);if(arg(6))memory.check(GuestAddress{arg(6)},4,Access::Write);
-                memory.store(GuestAddress{arg(3)},32,type);if(arg(6))memory.store(GuestAddress{arg(6)},32,data.size());
-                if(!arg(4) || static_cast<std::uint32_t>(arg(5))<data.size())return failed(122);memory.write(GuestAddress{arg(4)},data);return finish(1);
+            if(name=="SetupDiGetDeviceInterfacePropertyW" || name=="SetupDiGetDeviceInterfacePropertyKeys" || name=="SetupDiSetDeviceInterfacePropertyW"){
+                const bool keys=name.ends_with("Keys"),setting=name.starts_with("SetupDiSet");
+                if(arg(keys?5:setting?6:7))return failed(1004);
+                const auto token=read_interface(arg(1));if(!token)return failed(87);
+                // 現有別名共享同一 SymbolicLink；屬性身分跟隨該路徑的主要介面，CM 與別名集合必須一致。
+                const auto& entry=info.interfaces.at(*token);const auto& node=nodes.at(entry.node);const auto error=interface_property_call(node,node.interface_guid,false);
+                if(error)return failed(error);return finish(1);
             }
             if(name.starts_with("SetupDiGetDeviceInterfaceDetail") || name=="SetupDiOpenDeviceInterfaceRegKey" || name=="SetupDiDeleteDeviceInterfaceData"){
                 const auto token=read_interface(arg(1));if(!token)return failed(87);

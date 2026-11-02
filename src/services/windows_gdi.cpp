@@ -12,8 +12,12 @@
 #include <bit>
 #include <cmath>
 #include <cstdlib>
+#include <chrono>
+#include <cstdio>
 namespace x64arm {
 namespace {
+bool trace_gdi_calls(){static const bool enabled=std::getenv("X64ARM_TRACE_GDI_CALLS")!=nullptr;return enabled;}
+double trace_gdi_time(){return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();}
 void logical_clip(GuiDraw& draw,const GuiDc& dc,const GuiRect& rect){
     auto region=gui_transform_region_rect(gui_device_transform(dc),rect);
     if(dc.clipped)region=gui_region_combine(region,GuiRegion{dc.clip},1);
@@ -110,6 +114,8 @@ void WindowsServices::export_dib_bitmap(GuestMemory& memory,std::uint64_t handle
 }
 std::shared_ptr<RasterSurface> WindowsServices::raster_surface(GuestMemory& memory,std::uint64_t hdc,bool writing){
     const auto dc=gui_.contexts.find(hdc);if(dc==gui_.contexts.end())return {};
+    if(!writing && hdc>=0x10000000 && !gui_.windows.contains(hdc-0x10000000) && gui_.dc_objects.contains(hdc))
+        return remote_raster_snapshot(memory,hdc);
     if(writing && !printer_drawing_enabled(hdc) && !prepare_legacy_printer_page(memory,hdc))return {};
     import_dib_bitmap(memory,dc->second.bitmap);
     // 控制項也可持有離屏繪製表面；headless 不應忽略已建立的真實像素。
@@ -188,6 +194,11 @@ std::span<const WindowsServiceDescriptor> gdi_service_descriptors(){
 }
 std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};const auto si=[&](unsigned i){return std::bit_cast<std::int32_t>(d(i));};std::uint64_t result=0;
+    if(trace_gdi_calls()){
+        std::fprintf(stderr,"[gdi-call] unix=%.6f pid=%llu thread=%llu action=%.*s",trace_gdi_time(),static_cast<unsigned long long>(process_id()),static_cast<unsigned long long>(threads_.current),static_cast<int>(symbol.size()),symbol.data());
+        for(unsigned i=0;i<std::min(service.arguments,12U);++i)std::fprintf(stderr," a%u=%llx",i,static_cast<unsigned long long>(arg(i)));
+        std::fprintf(stderr,"\n");
+    }
     try {
     const auto window=arg(0)>=0x10000000?gui_.windows.find(arg(0)-0x10000000):gui_.windows.end();
     const bool known_dc=arg(0) && (gui_.contexts.contains(arg(0)) || gui_.dc_objects.contains(arg(0)) || window!=gui_.windows.end());
@@ -345,8 +356,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         else if(!si(3) || !si(4) || (reads_source && (!sw || !sh)))result=1;
         else if(reads_pattern && dc.brush==0xb005)result=1;
         else {
-            const auto dst=raster_surface(memory,arg(0)),src=reads_source?raster_surface(memory,arg(5),false):dst;
-            if(!dst || !src)last_error_=50;
+            const auto src=reads_source?raster_surface(memory,arg(5),false):std::shared_ptr<RasterSurface>{};
+            if(reads_source && !src)last_error_=50;
             else {
                 RasterBlit options;options.operation=rop;options.transparent=transparent?mode&0xffffffU:UINT32_MAX;auto& brush=options.brush;
                 const auto handle=dc.brush;brush.color=handle==0xb012?dc.dc_brush_color:gui_.brushes.contains(handle)?gui_.brushes.at(handle):handle==0xb000?0xffffff:handle==0xb001?0xc0c0c0:handle==0xb002?0x808080:handle==0xb003?0x404040:0;
@@ -360,7 +371,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
                 GuiRect source_rect{sx,sy,end(sx,sw),end(sy,sh)};bool valid=true;
                 if(reads_source){const auto transform=gui_device_transform(gui_.contexts.at(arg(5)));if(transform[1]!=0 || transform[2]!=0){last_error_=87;valid=false;}
                     else {const auto a=gui_integer_point(transform,source_rect[0],source_rect[1]),b=gui_integer_point(transform,source_rect[2],source_rect[3]);if(!a || !b){last_error_=87;valid=false;}else source_rect={(*a)[0],(*a)[1],(*b)[0],(*b)[1]};}}
-                if(valid){dst->blit(*src,{si(1),si(2),end(si(1),si(3)),end(si(2),si(4))},source_rect,target_dc,alpha?mode:UINT32_MAX,options,pattern.get());result=1;}
+                if(valid){
+                    if(trace_gdi_calls())std::fprintf(stderr,"[gdi-blit] unix=%.6f pid=%llu dst=%llx src=%llx size=%ux%u source=%d,%d,%d,%d clipped=%u clip=%d,%d,%d,%d excludes=%zu\n",trace_gdi_time(),static_cast<unsigned long long>(process_id()),static_cast<unsigned long long>(arg(0)),static_cast<unsigned long long>(arg(5)),src?src->width():0,src?src->height():0,source_rect[0],source_rect[1],source_rect[2],source_rect[3],target_dc.clipped,target_dc.clip[0],target_dc.clip[1],target_dc.clip[2],target_dc.clip[3],target_dc.excluded.size());
+                    result=blit_raster(memory,arg(0),src.get(),{si(1),si(2),end(si(1),si(3)),end(si(2),si(4))},source_rect,target_dc,alpha?mode:UINT32_MAX,options,pattern.get());
+                }
             }
         }
     }
@@ -607,6 +621,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
     }
     else throw HostCallFault("尚未實作 GDI 服務");
     }catch(const std::bad_alloc&){last_error_=8;result=(symbol=="GetPixel" || symbol=="SetPixel")?UINT32_MAX:0;}
+    if(trace_gdi_calls())std::fprintf(stderr,"[gdi-result] unix=%.6f pid=%llu thread=%llu action=%.*s result=%llx error=%u\n",trace_gdi_time(),static_cast<unsigned long long>(process_id()),static_cast<unsigned long long>(threads_.current),static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned long long>(result),last_error_);
     arg.return_to(state,result);return std::nullopt;
 }
 }

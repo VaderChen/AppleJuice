@@ -113,6 +113,11 @@ public:
     std::uint32_t rumble(const Guid& id,std::uint16_t left,std::uint16_t right)override{return worker_->call([&](NativeInput& input){return input.rumble(id,left,right);});}
     std::uint32_t set_report(const Guid& id,unsigned type,std::span<const std::uint8_t> bytes)override{return worker_->call([&](NativeInput& input){return input.set_report(id,type,bytes);});}
     std::uint32_t get_report(const Guid& id,unsigned type,std::span<std::uint8_t> bytes)override{return worker_->call([&](NativeInput& input){return input.get_report(id,type,bytes);});}
+    std::uint32_t get_physical_descriptor(const Guid& id,std::span<std::uint8_t> bytes,std::uint32_t& transferred)override{
+        // USB 控制傳輸等待留在呼叫端，不阻塞四毫秒輸入取樣／報告發布。
+        const auto source=worker_->call([&](NativeInput& input){return input.physical_descriptor_source(id);});
+        return read_physical_descriptor(source,bytes,transferred);
+    }
     std::uint32_t cooperative(const Guid& id,bool exclusive)override{return worker_->call([&](NativeInput& input){return input.cooperative(id,exclusive);});}
     void mouse_wheel(std::int32_t value)override{worker_->call([&](NativeInput& input){input.mouse_wheel(value);});}
     void horizontal_wheel(std::int32_t value)override{worker_->call([&](NativeInput& input){input.horizontal_wheel(value);});}

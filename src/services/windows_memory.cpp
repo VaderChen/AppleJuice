@@ -53,11 +53,16 @@ VirtualMemoryInformation WindowsServices::virtual_memory_information(const Guest
     const auto address=raw,address_limit=user_address_limit();const auto& regions=runtime_.virtual_regions;
     auto found=regions.upper_bound(address);if(found!=regions.begin()){--found;if(address-found->first>=found->second.size)found=regions.end();}else found=regions.end();
     const auto mapped=memory.query(GuestAddress{address});
+    const bool provider_reservation=found!=regions.end() &&
+        found->first==windows_address_layout::for_mode(memory.execution_mode()).images;
     const auto view=mapping_view_info(address);
     const bool section_image=view && (view->protection&0x1000000U);
     std::uint64_t base=address,allocation=0,end=address_limit;std::uint32_t initial=0,mode=0,allocation_state=0x10000,type=0;
     if (found!=regions.end()) {
-        allocation=found->first;initial=found->second.protection;end=allocation+found->second.size;allocation_state=0x2000;type=0x20000;
+        end=std::min(end,found->first+found->second.size);
+        if(!(provider_reservation && mapped)){
+            allocation=found->first;initial=found->second.protection;allocation_state=0x2000;type=0x20000;
+        }
     } else if (const auto next=regions.lower_bound(address);next!=regions.end()) end=std::min(end,next->first);
     if(!allocation){
         const auto stack=[&](std::uint64_t start,std::uint64_t size){if(size && address>=start && address-start<size){allocation=start;initial=4;end=std::min(end,start+size);allocation_state=0x2000;type=0x20000;}};
@@ -71,6 +76,7 @@ VirtualMemoryInformation WindowsServices::virtual_memory_information(const Guest
         if (!allocation) {
             const auto* image=module_image(address,true);allocation=image?image->base:mapped->base.value;
             initial=mode;type=image?0x1000000U:0x20000U;
+            if(image)end=std::min(end,image->base+image->size);
         }
         if(view){
             allocation=view->base;initial=view->protection&0xffU;
@@ -83,7 +89,7 @@ VirtualMemoryInformation WindowsServices::virtual_memory_information(const Guest
             mode=override->second.mode;if((mode==8 || mode==128) && !memory.is_copy_on_write(GuestAddress{address}))mode>>=1;initial=override->second.initial;auto cursor=page_address+page;
             while(cursor<end){const auto next=runtime_.virtual_page_protections.find(cursor);if(next==runtime_.virtual_page_protections.end() || next->second!=override->second)break;cursor+=page;}end=std::min(end,cursor);
         }else if(const auto next=runtime_.virtual_page_protections.upper_bound(page_address);next!=runtime_.virtual_page_protections.end())end=std::min(end,next->first);
-        while (!section_image && end<address_limit) {
+        while (!section_image && !provider_reservation && end<address_limit) {
             const auto next=memory.query(GuestAddress{end});
             if (!next || next->permissions!=mapped->permissions || next->base.value!=end || found==regions.end() || end>=found->first+found->second.size) break;
             end=std::min(found->first+found->second.size,next->base.value+next->size);
@@ -124,7 +130,11 @@ bool WindowsServices::protection_allocation_range(std::uint64_t begin,std::uint6
     const auto& regions=runtime_.virtual_regions;auto found=regions.upper_bound(begin);
     if(found!=regions.begin()){
         const auto before=std::prev(found);
-        if(begin-before->first<before->second.size)return end<=before->first+before->second.size;
+        if(begin-before->first<before->second.size){
+            if(windows_address_layout::overlaps(x86_?ExecutionMode::X86:ExecutionMode::X64,begin,1))
+                if(const auto* image=module_image(begin,true))return end<=image->base+((image->size+4095)&~UINT64_C(4095));
+            return end<=before->first+before->second.size;
+        }
     }
     // 不能從另一個映射跨入獨立 VirtualAlloc 的 reservation。
     if(found!=regions.end() && found->first<end)return false;
@@ -209,6 +219,7 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
         const auto lowest=requirements?std::max(granularity,requirements->lowest):granularity;
         const auto highest=requirements && requirements->highest?std::min(address_limit-1,requirements->highest):address_limit-1;
         if (!size || size>=address_limit || requested>=address_limit || size>address_limit-requested) fail(87);
+        else if(requested && windows_address_layout::overlaps(memory.execution_mode(),requested,size))fail(487);
         else if((requirements && requirements->alignment && (requirements->alignment&(requirements->alignment-1))) ||
                 (align&(align-1)) || lowest>highest || size>highest-lowest+1 || (requirements && requested && (requirements->lowest || requirements->highest || requirements->alignment)))fail(87);
         else if (type==0x80000U || type==0x1000000U) {
@@ -250,6 +261,7 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
             }
             auto found=region_at(begin);
             if (begin<lowest || begin>highest || span>highest+1-begin) fail(487);
+            else if(windows_address_layout::overlaps(memory.execution_mode(),begin,span))fail(487);
             else if(offered_overlap(begin,begin+span))fail(487);
             else if (reserve && (!memory.range_available(GuestAddress{begin},span) || found!=regions.end() ||
                 (regions.lower_bound(begin)!=regions.end() && regions.lower_bound(begin)->first<begin+span))) fail(487);
@@ -297,6 +309,7 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
         }
     } else if(operation==3){
         const auto address=arg(0),size=arg(1);const auto type=static_cast<std::uint32_t>(arg(2));auto found=region_at(address);
+        if(windows_address_layout::overlaps(memory.execution_mode(),address,size?size:1))return 487;
         if(mapping_view_info(address))return 487; // section view 只能由 Unmap 流程釋放，保留其物件生命週期。
         if(type==0x8001U || type==0x8002U){
             if(found==regions.end() || (address&4095U) || (size&4095U) || size>address_limit-address)fail(87);

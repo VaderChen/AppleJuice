@@ -1,6 +1,8 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -14,6 +16,11 @@ namespace x64arm::detail {
 // 讀寫雙方都以 seq_cst 先公告自己、再檢查對方（Dekker），不可能同時進入。
 class ParallelMappingLock {
 public:
+    // 統計（只在 X64ARM_SERVICE_COUNTS 設定時計時）：寫者取鎖次數、等讀者排空與持鎖時間；讀者遇到寫者的次數、等待時間與讓出次數。
+    // 由 dump_service_counts 輸出，用來分辨 worker 服務的讀鎖等待是持鎖時間長還是取鎖次數多造成。
+    struct Stats {std::atomic<std::uint64_t> writer_locks{},writer_drain_ns{},writer_hold_ns{},reader_waits{},reader_wait_ns{},reader_yields{};};
+    static Stats& stats() noexcept {static Stats value;return value;}
+    static bool timing() noexcept {static const bool value=[] {const auto* text=std::getenv("X64ARM_SERVICE_COUNTS");return text && *text;}();return value;}
     void lock_shared() noexcept {
         auto& reader=readers_[slot()];
         // 巢狀讀鎖：外層已讓寫者等待，直接累加，不可再讓步（否則與等待外層釋放的寫者互等）。
@@ -22,19 +29,29 @@ public:
             reader.count.fetch_add(1,std::memory_order_seq_cst);
             if(!writer_.load(std::memory_order_seq_cst))return;
             reader.count.fetch_sub(1,std::memory_order_release);
-            for(unsigned spins=0;writer_.load(std::memory_order_acquire);++spins)backoff(spins);
+            const auto started=timing()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+            unsigned spins=0;std::uint64_t since=0;for(;writer_.load(std::memory_order_acquire);++spins)backoff(spins,since);
+            if(timing()){auto& s=stats();s.reader_waits.fetch_add(1,std::memory_order_relaxed);
+                s.reader_wait_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count()),std::memory_order_relaxed);
+                if(spins>=256)s.reader_yields.fetch_add(spins-255,std::memory_order_relaxed);}
         }
     }
     void unlock_shared() noexcept {
         --depth_;readers_[slot()].count.fetch_sub(1,std::memory_order_release);
     }
     void lock() noexcept {
+        const auto started=timing()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         writers_.lock();
         writer_.store(1,std::memory_order_seq_cst);
+        std::uint64_t since=0;
         for(auto& reader:readers_)
-            for(unsigned spins=0;reader.count.load(std::memory_order_seq_cst);++spins)backoff(spins);
+            for(unsigned spins=0;reader.count.load(std::memory_order_seq_cst);++spins)backoff(spins,since);
+        if(timing()){hold_started_=std::chrono::steady_clock::now();
+            stats().writer_drain_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(hold_started_-started).count()),std::memory_order_relaxed);}
     }
     void unlock() noexcept {
+        if(timing()){auto& s=stats();s.writer_locks.fetch_add(1,std::memory_order_relaxed);
+            s.writer_hold_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-hold_started_).count()),std::memory_order_relaxed);}
         writer_.store(0,std::memory_order_release);
         writers_.unlock();
     }
@@ -47,15 +64,39 @@ private:
         thread_local const std::size_t index=next.fetch_add(1,std::memory_order_relaxed)%reader_slots;
         return index;
     }
-    static void backoff(unsigned spins) noexcept {
-        if(spins<256){
+    // 等待對方時先自旋 256 次 yield 指令（約零點幾微秒），之後以 sched_yield 讓出。sched_yield 會壓低優先序，同核有其他
+    // 可執行緒時可能被排出一整個時間片；寫者排空期間旗標已設，新讀者也進不來。因此 256 次之後改以 cntvct 計時、isb 間隔
+    // 自旋到上限（預設 30 µs，X64ARM_MAPPING_LOCK_SPIN_US=<微秒>；0 恢復直接讓出）才讓出：雙人成行操作中讀者等待 9.5% → 7.8%
+    //（每次 6.7 → 5.2 µs）。since 為本次等待進入限時自旋的計數器值。
+    static std::uint64_t spin_limit() noexcept {
 #if defined(__aarch64__)
-            __builtin_arm_yield();
+        static const std::uint64_t value=[] {
+            const auto* text=std::getenv("X64ARM_MAPPING_LOCK_SPIN_US");
+            const std::uint64_t microseconds=text && *text?static_cast<std::uint64_t>(std::strtoull(text,nullptr,10)):30U;
+            std::uint64_t frequency=0;asm volatile("mrs %0, cntfrq_el0":"=r"(frequency));
+            return microseconds*frequency/1000000U;
+        }();
+        return value;
+#else
+        return 0;
 #endif
-        }else std::this_thread::yield();
+    }
+    static void backoff(unsigned spins,std::uint64_t& since) noexcept {
+#if defined(__aarch64__)
+        if(spins<256){__builtin_arm_yield();return;}
+        if(const auto limit=spin_limit()){
+            std::uint64_t now=0;asm volatile("mrs %0, cntvct_el0":"=r"(now));
+            if(spins==256)since=now;
+            if(now-since<limit){__builtin_arm_isb(15);return;}
+        }
+#else
+        (void)since;if(spins<256)return;
+#endif
+        std::this_thread::yield();
     }
     std::array<Reader,reader_slots> readers_{};
     alignas(128) std::atomic<std::uint32_t> writer_{};
+    std::chrono::steady_clock::time_point hold_started_{}; // 只由持鎖者讀寫
     std::mutex writers_;
     // 只有單一實例（parallel_mapping_mutex），巢狀深度以執行緒區域變數記錄即可。
     static inline thread_local unsigned depth_{};

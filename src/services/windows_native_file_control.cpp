@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/windows_raw_input.hpp"
 #include "windows_file_copy.hpp"
 #include "x64arm/shared_wake.hpp"
 #include "x64arm/unicode.hpp"
@@ -133,7 +134,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_copy_chunk(GuestState&
     }catch(const MemoryFault&){return finish(0xc0000005U);}catch(const std::bad_alloc&){return finish(0xc0000017U);}catch(const std::system_error&){return finish(0xc000009aU);}
 }
 std::optional<std::uint32_t> WindowsServices::invoke_fs_control(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
-    const WindowsCall arg(state,memory,service);const bool native=service.symbol=="NtFsControlFile";
+    const WindowsCall arg(state,memory,service);const bool native=service.symbol=="NtFsControlFile" || service.symbol=="NtDeviceIoControlFile";
     const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto code=static_cast<std::uint32_t>(arg(native?5:1)),input_size=static_cast<std::uint32_t>(arg(native?7:3)),output_size=static_cast<std::uint32_t>(arg(native?9:5));
     const auto input=arg(native?6:2),output=arg(native?8:4),iosb=native?arg(4):0,overlap=native?0:arg(7);
@@ -188,7 +189,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_fs_control(GuestState& stat
                 }
             }
             else error=1;
-        }else if(file.serial || file.hid || file.usb || (file.native && file.native->null_device()))error=1;
+        }else if(file.hid){
+            if(service.symbol=="NtFsControlFile" || code!=0x000b019aU)error=1; // IOCTL_GET_PHYSICAL_DESCRIPTOR，METHOD_OUT_DIRECT。
+            else if(!output || !output_size)error=87;
+            else {bytes.resize(std::min<std::uint32_t>(output_size,UINT16_MAX));error=file.hid->physical_descriptor(bytes);if(!error)process_io::record(process_io::Kind::Other,bytes.size());}
+        }else if(file.serial || file.usb || (file.native && file.native->null_device()))error=1;
         else if(code==0x900a8U){ // FSCTL_GET_REPARSE_POINT
             const auto identity=file.native?file.native:file.identity;
             const auto current=identity?filesystem_.final_path(*identity,file.path.empty()?file.key:file.path):FileInformation{{},{},6};

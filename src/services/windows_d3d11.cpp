@@ -319,6 +319,10 @@ struct D3D11State {
     // 本地協調服務中引用歸零的物件：延到下一次非本地 D3D11 呼叫再銷毀（銷毀會釋放 heap）。
     std::vector<std::uint64_t> deferred_releases;
     std::size_t peak_interfaces{};
+    // 介面物件與引用計數格（各 16 bytes 的客體 heap 區塊）：物件銷毀時保留在這裡，下一次建立介面直接取用並清零，
+    // 不經 allocate_heap／free_heap 的空洞搜尋、頁計數與相鄰合併（雙人成行每幀約 40 次 CreateBuffer／Release，兩者約占協調者 2%）。
+    // 區塊仍登錄為存活配置；最後一個 D3D11 物件釋放時全部歸還。上限 4096 個。X64ARM_D3D11_SLOT_REUSE=0 關閉。
+    std::vector<std::uint64_t> free_slots;
     // 程序結束時把每個 D3D11 裝置的 Metal 後端統計（draws、encoders、GPU 忙碌時間、CPU 等待）印到 stderr，
     // 供 CPU／GPU 瓶頸判斷；只讀統計字串，不改任何狀態。
     ~D3D11State(){
@@ -498,6 +502,14 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     if(std::find(std::begin(excluded),std::end(excluded),symbol)!=std::end(excluded))return false;
     const WindowsCall arg(state,memory,service);
     const auto found=d3d11_->objects.find(arg(0));if(found==d3d11_->objects.end())return false;
+    // 著色器尚未編譯：交給背景編譯並回到完整服務路徑，由處理程式讓呼叫者等待後重試（見 d3d11_graphics_handlers.inc），
+    // 不在持映射與圖形鎖的本地／worker 服務內轉譯（雙人成行走到新區域時每個約 106 ms，期間所有 D3D11 服務停住）。
+    if(found->second.kind==Kind::Device && found->second.identity && found->second.identity->native && resident_context_key(state)!=present_thread_ &&
+       (symbol=="CreateVertexShader" || symbol=="CreatePixelShader" || symbol=="CreateComputeShader" || symbol=="CreateGeometryShader" ||
+        symbol=="CreateHullShader" || symbol=="CreateDomainShader") && arg(1) && arg(2)>0 && arg(2)<=16*1024*1024){
+        const auto stage=symbol=="CreateVertexShader"?0U:symbol=="CreatePixelShader"?1U:symbol=="CreateComputeShader"?5U:symbol=="CreateGeometryShader"?2U:symbol=="CreateHullShader"?3U:4U;
+        if(found->second.identity->native->graphics_shader_prefetch(stage,read_bytes(memory,arg(1),static_cast<std::size_t>(arg(2)))))return false;
+    }
     // DXGI 介面卡的顯示記憶體預算查詢與保留：只讀寫自帶鎖的 GPU 額度池與參數指向的客體記憶體（電馭判客每秒約 500 次）。
     if(symbol=="QueryVideoMemoryInfo" || symbol=="SetVideoMemoryReservation")return found->second.kind==Kind::Adapter;
     if(!coordinator && (symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource")){
@@ -617,6 +629,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
             notify_swap_window(id->window,id->windowed_rect[0],id->windowed_rect[1],static_cast<std::uint32_t>(id->windowed_rect[2]),static_cast<std::uint32_t>(id->windowed_rect[3]));}
         id->fullscreen=false;put_word(id->desc,x86_?48:56,1);return true;
     };
+    static const bool slot_reuse=[] {const auto* value=std::getenv("X64ARM_D3D11_SLOT_REUSE");return !value || std::string_view(value)!="0";}();
     // 遞迴釋放不經 std::function：其捕獲超過小物件緩衝，原本每個 D3D11 呼叫都多一次堆積配置。
     const auto release_object=[&](const auto& self,std::uint64_t address)->void {
         auto id=object(address).identity;const auto references=reference_count(memory,*id);
@@ -648,7 +661,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         if(id->fullscreen_output)self(self,id->fullscreen_output);
         if(id->lock_address)runtime_.critical_sections.erase(id->lock_address);
         for(const auto& [kind,pointer]:id->interfaces){(void)kind;bridge.objects.erase(pointer);}
-        for(const auto pointer:id->allocations)if(!free_heap(memory,pointer,state))throw HostCallFault("D3D11 物件配置已被客體破壞");
+        for(const auto pointer:id->allocations){
+            // 16 bytes 的存活區塊（介面物件、引用計數格）留給下一個介面重用；其他配置與被客體破壞的區塊照常處理。
+            if(slot_reuse && bridge.free_slots.size()<4096){
+                const auto live=allocations_.find(pointer);
+                if(live!=allocations_.end() && live->second==16){bridge.free_slots.push_back(pointer);continue;}
+            }
+            if(!free_heap(memory,pointer,state))throw HostCallFault("D3D11 物件配置已被客體破壞");
+        }
+        if(bridge.objects.empty() && !bridge.free_slots.empty()){auto slots=std::move(bridge.free_slots);bridge.free_slots.clear();for(const auto slot:slots)(void)free_heap(memory,slot,state);}
         if(id->current_view)self(self,id->current_view);
         if(id->texture)self(self,id->texture);
         if(id->context10){auto context=object(id->context10).identity;context->device=0;self(self,id->context10);}
@@ -698,6 +719,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         }
         bridge.vtables.emplace(key,pointer);return pointer;
     };
+    // 16 bytes 的客體區塊：先取回收槽（清零後與新配置相同），沒有才配置；槽所在頁被客體改過保護時放棄該槽。
+    const auto take_slot=[&]()->std::uint64_t {
+        while(!bridge.free_slots.empty()){
+            const auto address=bridge.free_slots.back();bridge.free_slots.pop_back();
+            static constexpr std::array<std::uint8_t,16> zero{};
+            try{memory.write(GuestAddress{address},std::span<const std::uint8_t>(zero));return address;}
+            catch(const MemoryFault&){(void)free_heap(memory,address,state);}
+        }
+        return allocate_heap(memory,16);
+    };
     const auto interface=[&](const std::shared_ptr<Identity>& id,Kind kind) {
         if(id->interfaces.contains(kind))return id->interfaces.at(kind);
         // COM 介面與紋理 array slice 的數量限制無關；配置由客體 heap、
@@ -706,11 +737,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         if(!id->counter){
             // 身分共用的引用計數格（見 reference_count），初值 1；列入 allocations 隨身分釋放。
             id->allocations.reserve(id->allocations.size()+2);
-            const auto counter=allocate_heap(memory,4);if(!counter)throw std::bad_alloc{};
+            const auto counter=take_slot();if(!counter)throw std::bad_alloc{};
             memory.store(GuestAddress{counter},32,1);id->counter=counter;id->allocations.push_back(counter);
         }
         // 介面物件：[vtable][引用計數格位址]。
-        const auto table=vtable(kind,id->api10),pointer=allocate_heap(memory,2*pointer_size);if(!pointer)throw std::bad_alloc{};
+        const auto table=vtable(kind,id->api10),pointer=take_slot();if(!pointer)throw std::bad_alloc{};
         try {
             id->interfaces.emplace(kind,pointer);bridge.objects.emplace(pointer,Object{kind,id});
             memory.store(GuestAddress{pointer},pointer_bits,table);memory.store(GuestAddress{pointer+pointer_size},pointer_bits,id->counter);
@@ -1239,8 +1270,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         const bool present=symbol=="Present" || symbol=="Present1";
         const bool change=symbol=="SetFullscreenState" || symbol=="ResizeTarget" || symbol=="ResizeBuffers" || symbol=="EnumOutputs" || symbol=="GetContainingOutput";
         if(present || change){const auto id=object(arg(0)).identity;const auto now=std::chrono::steady_clock::now();
+            // 長幀統計：相鄰 Present 間隔超過 50／100 ms 的累計次數與本段（約 5 秒）最大間隔，供操作中量測判讀卡頓
+            //（Present 只在協調者執行，以函式內靜態值累計第一個交換鏈以外也無妨，只作診斷）。
+            static std::chrono::steady_clock::time_point last_present{};static double window_gap_ms{};static unsigned long long over50{},over100{};
+            if(present){
+                if(last_present.time_since_epoch().count()){
+                    const auto gap=std::chrono::duration<double,std::milli>(now-last_present).count();
+                    window_gap_ms=std::max(window_gap_ms,gap);if(gap>50)++over50;if(gap>100)++over100;
+                }
+                last_present=now;
+            }
             if((result&0x80000000U) || change || !id->present_trace.time_since_epoch().count() || now-id->present_trace>=std::chrono::seconds(5)){
                 if(present)id->present_trace=now;
+                if(present)std::fprintf(stderr,"[dxgi] gaps max_ms=%.1f over50=%llu over100=%llu\n",window_gap_ms,over50,over100);
+                if(present)window_gap_ms=0;
                 std::fprintf(stderr,"[dxgi] %.*s this=%llx result=%llx a1=%llx a2=%llx frames=%llu fullscreen=%u\n",static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned long long>(arg(0)),static_cast<unsigned long long>(result),static_cast<unsigned long long>(arg(1)),static_cast<unsigned long long>(arg(2)),static_cast<unsigned long long>(id->frames),id->fullscreen);
                 if((result&0x80000000U) && !bridge.last_error.empty())std::fprintf(stderr,"[dxgi] error=%s\n",bridge.last_error.c_str());
             }

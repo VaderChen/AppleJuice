@@ -9,6 +9,33 @@
 #import <QuartzCore/CAShapeLayer.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <WebKit/WebKit.h>
+namespace {
+// 僅診斷開啟時讀時鐘；記錄超過 5 ms 的原生輪詢階段，不改事件順序或等待期限。
+class NativeGuiPollTrace {
+    using Clock=std::chrono::steady_clock;
+    const char* stage_;
+    bool enabled_;
+    Clock::time_point begin_{};
+    static bool enabled() noexcept {
+        static const bool value=[] {const auto* setting=std::getenv("X64ARM_TRACE_GUI_POLL");
+            return setting && *setting && std::string_view(setting)!="0";}();
+        return value;
+    }
+public:
+    explicit NativeGuiPollTrace(const char* stage):stage_(stage),enabled_(enabled()) {
+        if(enabled_)begin_=Clock::now();
+    }
+    ~NativeGuiPollTrace() {
+        if(!enabled_)return;
+        const auto elapsed=Clock::now()-begin_;
+        if(elapsed<std::chrono::milliseconds(5))return;
+        const auto duration=std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+        const auto end=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr,"[gui-poll] pid=%d stage=%s begin_us=%lld end_us=%lld duration_us=%lld\n",
+            static_cast<int>(::getpid()),stage_,static_cast<long long>(end-duration),static_cast<long long>(end),static_cast<long long>(duration));
+    }
+};
+}
 // X64ARM_TRACE_WEBVIEW：記錄 WebView2 對應 WKWebView 的導覽結果，供診斷內容未顯示等問題。
 static bool webview_trace_enabled(){static const bool enabled=std::getenv("X64ARM_TRACE_WEBVIEW")!=nullptr;return enabled;}
 @interface X64ArmWebViewDelegate : NSObject<WKNavigationDelegate>
@@ -63,6 +90,9 @@ bool offline_render_enabled(){static const bool enabled=[] {const auto* value=st
 // 自動驗證可投影到非作用中螢幕；客體仍使用自身桌面的相對座標。
 bool background_display_enabled(){return x64arm::native_background_display_enabled();}
 NSScreen* background_display(){return x64arm::native_background_display();}
+// AppKit 的 first responder 是每個 NSWindow 各自保存的狀態；建立／顯示非啟用
+// popup 也會設定它。只有 key window 的原生變更才代表客體鍵盤焦點真的移動。
+bool native_keyboard_focus(NSView* view){return view.window.keyWindow;}
 // X64ARM_DISPLAY_SIZE=<寬>x<高>：客體看到的虛擬顯示器解析度（例如 1280x720，讓預設全螢幕解析度較高的遊戲降低負載）。
 // 只改變公開給客體的桌面、工作區與顯示模式；宿主視窗依客體座標放置，不切換實體顯示器模式。
 std::optional<std::pair<std::uint32_t,std::uint32_t>> virtual_display_size(){
@@ -330,7 +360,7 @@ void native_guest_key(std::uint64_t handle,std::vector<x64arm::GuiMessage>* even
 }
 - (BOOL)isFlipped { return YES; }
 - (BOOL)acceptsFirstResponder { return YES; }
-- (BOOL)becomeFirstResponder {const BOOL result=[super becomeFirstResponder];if(result && !self.guestUpdating && self.events)self.events->push_back({self.guestHandle,0,0,0x10013});return result;}
+- (BOOL)becomeFirstResponder {const BOOL result=[super becomeFirstResponder];if(result && !self.guestUpdating && self.events && native_keyboard_focus(self))self.events->push_back({self.guestHandle,0,0,0x10013});return result;}
 - (BOOL)acceptsFirstMouse:(NSEvent*)event {(void)event;return YES;}
 - (void)drawRect:(NSRect)dirty {
     (void)dirty;
@@ -624,7 +654,7 @@ void native_guest_key(std::uint64_t handle,std::vector<x64arm::GuiMessage>* even
 - (BOOL)isOwnerDraw {return self.model && (self.model->style&15U)==11;}
 - (void)drawRect:(NSRect)dirty {if(!self.isOwnerDraw)[super drawRect:dirty];}
 - (BOOL)acceptsFirstResponder {if(!self.model || !self.events)return NO;return self.enabled;}
-- (BOOL)becomeFirstResponder {const BOOL result=[super becomeFirstResponder];if(result && !self.guestUpdating && self.events)self.events->push_back({self.guestHandle,0,0,0x10013});return result;}
+- (BOOL)becomeFirstResponder {const BOOL result=[super becomeFirstResponder];if(result && !self.guestUpdating && self.events && native_keyboard_focus(self))self.events->push_back({self.guestHandle,0,0,0x10013});return result;}
 - (BOOL)resignFirstResponder {return [super resignFirstResponder];}
 - (void)buttonMouse:(NSEvent*)event message:(unsigned)message {
     if(!self.enabled || !self.events)return;
@@ -906,10 +936,10 @@ NSDictionary* menu_bitmap_details(NSImage* image){
     self.events->push_back({[self editHandle],std::min<NSUInteger>(range.location,UINT32_MAX),std::min<NSUInteger>(NSMaxRange(range),UINT32_MAX),0x10014});
 }
 - (void)controlTextDidBeginEditing:(NSNotification*)notification {
-    if(self.updating || !self.events)return;self.events->push_back({[self editHandle],0,0,0x10013});NSControl* control=notification.object;
+    if(self.updating || !self.events || !native_keyboard_focus(notification.object))return;self.events->push_back({[self editHandle],0,0,0x10013});NSControl* control=notification.object;
     if([control.currentEditor isKindOfClass:[NSTextView class]])[self publishEditSelection:(NSTextView*)control.currentEditor];
 }
-- (void)textDidBeginEditing:(NSNotification*)notification {if(!self.updating && self.events){self.events->push_back({[self editHandle],0,0,0x10013});[self publishEditSelection:notification.object];}}
+- (void)textDidBeginEditing:(NSNotification*)notification {if(!self.updating && self.events && native_keyboard_focus(notification.object)){self.events->push_back({[self editHandle],0,0,0x10013});[self publishEditSelection:notification.object];}}
 - (void)textViewDidChangeSelection:(NSNotification*)notification {[self publishEditSelection:notification.object];}
 - (BOOL)publishIme:(NSTextView*)editor {
     if(editor.hasMarkedText){const auto range=editor.markedRange;if(range.location>editor.string.length || range.length>editor.string.length-range.location)return NO;
@@ -1252,6 +1282,16 @@ struct Window {
     GuiWindow model{};
     bool alias{},shaped{},fullscreen{};
 };
+void trace_native_pointer(const char* stage,const Window& window,NSPoint screen,NSPoint guest) {
+    static const bool enabled=std::getenv("X64ARM_TRACE_NATIVE_POINTER")!=nullptr;
+    if(!enabled)return;
+    // 診斷目前游標與原生／客體座標的對應，不影響輸入佇列或正常快速路徑。
+    const auto wall=std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto frame=window.native.frame;
+    std::fprintf(stderr,"[native-pointer] stage=%s unix_time=%.9f pid=%d window=%ld screen=%.1f,%.1f guest=%.1f,%.1f model=%d,%d frame=%.1f,%.1f,%.1f,%.1f\n",
+        stage,wall,::getpid(),static_cast<long>(window.native.windowNumber),screen.x,screen.y,guest.x,guest.y,
+        window.model.x,window.model.y,frame.origin.x,frame.origin.y,frame.size.width,frame.size.height);
+}
 void apply_window_region(Window& w){
     NSView* target=w.native?(w.native.contentView.superview?:w.native.contentView):(w.mdi_frame?:w.view);
     if(!target)return;
@@ -1283,7 +1323,10 @@ void sync_native_frame(Window& w){
     const auto screen=background_display()?:w.native.screen?:NSScreen.mainScreen;
     // AppKit 的 frame 必須位於有號 32 位元矩形內；保留客體座標，只限制原生投影的原點。
     const auto origin=NSMakePoint(std::clamp<CGFloat>(w.model.x+(background_display()?screen.frame.origin.x:0),INT32_MIN,static_cast<CGFloat>(INT32_MAX)-w.native.frame.size.width),std::clamp<CGFloat>(NSMaxY(screen.frame)-w.model.y-w.native.frame.size.height,INT32_MIN,static_cast<CGFloat>(INT32_MAX)-w.native.frame.size.height));
-    if(!NSEqualPoints(w.native.frame.origin,origin))[w.native setFrameOrigin:origin];
+    if(!NSEqualPoints(w.native.frame.origin,origin)){
+        [w.native setFrameOrigin:origin];
+        trace_native_pointer("frame",w,NSZeroPoint,NSMakePoint(w.model.x,w.model.y));
+    }
     w.delegate.updating=updating;
 }
 void create_table_view(Window& window,const NSRect& rect,X64ArmControlTarget* target) {
@@ -1441,6 +1484,7 @@ class CocoaGui final : public NativeGui {
     std::map<std::uint64_t,std::shared_ptr<RasterSurface>> graphics_surfaces_;
     NSDate* graphics_snapshot_time_{};
     std::vector<GuiMessage> events_;
+    bool prefetched_{};std::chrono::steady_clock::time_point prefetch_time_{};
     NSView* __strong mouse_target_{};
     std::filesystem::path snapshot_;
     std::filesystem::path native_snapshot_directory_;
@@ -1806,7 +1850,11 @@ public:
                 // finishLaunching 本身會排程啟用應用程式，先 deactivate 也不能取消它。
                 startup_profile::Scope measurement("gui_init","background_display");(void)background_display();
             }else {startup_profile::Scope measurement("gui_init","finish_launching");[NSApp finishLaunching];application_launched_=true;}
-            app_deactivate_observer_=[NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidResignActiveNotification object:NSApp queue:nil usingBlock:^(NSNotification* note){(void)note;interactive_activation_=false;pending_activation_=0;dirty_=true;}];
+            app_deactivate_observer_=[NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidResignActiveNotification object:NSApp queue:nil usingBlock:^(NSNotification* note){
+                (void)note;interactive_activation_=false;pending_activation_=0;mouse_target_=nil;dirty_=true;
+                // 跨應用程式失去前景時，客體仍須收到 capture 失效；不能只重設宿主啟用旗標。
+                events_.push_back({0,0,0,0x1000d});
+            }];
             {startup_profile::Scope measurement("gui_init","desktop_notifications");desktop_notifications_=make_native_desktop_notifications();}
             const char* automation_path=std::getenv("X64ARM_GUI_AUTOMATION");
             const char* automation_fd=std::getenv("X64ARM_GUI_AUTOMATION_FD");
@@ -1824,6 +1872,9 @@ public:
                 }];
             }
             if(const char* path=std::getenv("X64ARM_GUI_STATE"))state_path_=[NSString stringWithUTF8String:path];
+            // 可繼承的診斷前綴為每個宿主程序分檔，不共用或重播父程序的 UI 控制通道。
+            else if(const char* prefix=std::getenv("X64ARM_GUI_STATE_PREFIX");prefix && *prefix)
+                state_path_=[NSString stringWithFormat:@"%s-%d.json",prefix,::getpid()];
             if(const char* path=std::getenv("X64ARM_GUI_NATIVE_SNAPSHOT_DIR");path && *path){native_snapshot_directory_=path;std::filesystem::create_directories(native_snapshot_directory_);}
             // 原生 GUI 的主程序與隱藏輔助程序同屬使用者啟動的互動工作。
             // App Nap 可能停滯協作式客體排程，讓另一程序誤判它沒有回應；活動範圍隨 backend 釋放。
@@ -2660,7 +2711,8 @@ public:
             for(const auto& [handle,window]:windows_){(void)handle;if(!window.native || !window.native.visible)continue;if(!target || window.native==NSApp.keyWindow)target=&window;if(window.native==NSApp.keyWindow)break;}
             if(target){const auto& window=*target;
                 const auto point=[window.view convertPoint:[window.native convertPointFromScreen:screen] fromView:nil];
-                const auto inset=gui_frame_insets(window.model);return std::array<std::int32_t,2>{static_cast<std::int32_t>(std::clamp<CGFloat>(point.x+window.model.x+inset.left,INT32_MIN,INT32_MAX)),static_cast<std::int32_t>(std::clamp<CGFloat>(point.y+window.model.y+inset.top,INT32_MIN,INT32_MAX))};
+                const auto inset=gui_frame_insets(window.model);const std::array<std::int32_t,2> result{static_cast<std::int32_t>(std::clamp<CGFloat>(point.x+window.model.x+inset.left,INT32_MIN,INT32_MAX)),static_cast<std::int32_t>(std::clamp<CGFloat>(point.y+window.model.y+inset.top,INT32_MIN,INT32_MAX))};
+                trace_native_pointer("cursor",window,screen,NSMakePoint(result[0],result[1]));return result;
             }
             const auto height=NSScreen.screens.firstObject.frame.size.height;
             return std::array<std::int32_t,2>{static_cast<std::int32_t>(screen.x),static_cast<std::int32_t>(height-screen.y)};
@@ -2780,17 +2832,38 @@ public:
     std::vector<GuiMessage> poll(bool wait) override {
         return poll_for(wait?50000000:0);
     }
+    // 協調者在不持獨占映射鎖時先呼叫：抽取一批 AppKit 事件暫存，持鎖後的 poll_for(0) 直接取用（見 resident_coordinated_service）。
+    void prefetch_events() override {
+        if(prefetched_)return;
+        auto pending=poll_for_impl(0,false);events_=std::move(pending);prefetched_=true;prefetch_time_=std::chrono::steady_clock::now();
+    }
     std::vector<GuiMessage> poll_for(std::uint64_t nanoseconds) override {
+        return poll_for_impl(nanoseconds,true);
+    }
+    std::vector<GuiMessage> take_events(bool record_input) {
+        // 預取僅暫存；實際交給客體時才記錄，避免預取逾期重複計數，或快速取用漏記後續加入的事件。
+        if(record_input)if(const auto& timing=macos_detail::gui_timing();timing)for(const auto& queued:events_)
+            if((queued.message>=0x100 && queued.message<=0x109) || (queued.message>=0x200 && queued.message<=0x20e))
+                timing->input(queued.window,queued.message);
+        auto result=std::move(events_);events_.clear();return result;
+    }
+    std::vector<GuiMessage> poll_for_impl(std::uint64_t nanoseconds,bool record_input) {
+        const NativeGuiPollTrace poll_trace("native_poll");
         const bool wait=nanoseconds!=0;
+        // 已預先抽取且未超過 2 ms：直接回傳暫存事件，不再進 AppKit 事件迴圈；要等待或已過期則照常抽取（暫存事件一併回傳）。
+        if(prefetched_){prefetched_=false;if(!wait && std::chrono::steady_clock::now()-prefetch_time_<std::chrono::milliseconds(2))return take_events(record_input);}
         @autoreleasepool {
             // 第一次最多等待呼叫者的期限；已有待送訊息時不再額外睡眠。
             // 依原順序排空一小批事件，避免每個按鍵／滑鼠事件都重做更新與渲染輪詢。
             auto batch_deadline=std::chrono::steady_clock::time_point::max();
             for(unsigned count=0;count<64;++count){
-            NSEvent* event=[NSApp nextEventMatchingMask:NSEventMaskAny untilDate:(count==0 && events_.empty() && wait)?[NSDate dateWithTimeIntervalSinceNow:static_cast<double>(nanoseconds)*1e-9]:[NSDate distantPast] inMode:NSDefaultRunLoopMode dequeue:YES];
+            NSEvent* event;
+            {const NativeGuiPollTrace event_trace("next_event");
+                event=[NSApp nextEventMatchingMask:NSEventMaskAny untilDate:(count==0 && events_.empty() && wait)?[NSDate dateWithTimeIntervalSinceNow:static_cast<double>(nanoseconds)*1e-9]:[NSDate distantPast] inMode:NSDefaultRunLoopMode dequeue:YES];}
             if(!event)break;
             if(!count)batch_deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(4);
-            {const auto type=event.type;const bool keyboard=type==NSEventTypeKeyDown || type==NSEventTypeKeyUp || type==NSEventTypeFlagsChanged;
+            {const NativeGuiPollTrace dispatch_trace("dispatch_event");
+                const auto type=event.type;const bool keyboard=type==NSEventTypeKeyDown || type==NSEventTypeKeyUp || type==NSEventTypeFlagsChanged;
                 const bool mouse=type==NSEventTypeLeftMouseDown || type==NSEventTypeLeftMouseUp || type==NSEventTypeRightMouseDown || type==NSEventTypeRightMouseUp || type==NSEventTypeOtherMouseDown || type==NSEventTypeOtherMouseUp || type==NSEventTypeMouseMoved || type==NSEventTypeLeftMouseDragged || type==NSEventTypeRightMouseDragged || type==NSEventTypeOtherMouseDragged || type==NSEventTypeScrollWheel;
                 const bool guest=event.window && std::any_of(windows_.begin(),windows_.end(),[&](const auto& item){return item.second.native==event.window;});
                 bool delivered=false;
@@ -2833,7 +2906,7 @@ public:
             }
             if(std::chrono::steady_clock::now()>=batch_deadline)break;
             }
-            [NSApp updateWindows];
+            {const NativeGuiPollTrace update_trace("update_windows");[NSApp updateWindows];}
             if(pending_activation_ && NSApp.active){
                 const auto handle=pending_activation_;pending_activation_=0;
                 const auto found=windows_.find(handle);
@@ -2841,9 +2914,11 @@ public:
                     auto& target=found->second;target.delegate.updating=YES;[target.native makeKeyAndOrderFront:nil];target.delegate.updating=NO;apply_z_order(handle);dirty_=true;
                 }
             }
-            for(const auto& notification:desktop_notifications_->poll(desktop_time())){GuiMessage message;message.status_icon=notification;events_.push_back(std::move(message));}
+            {const NativeGuiPollTrace notification_trace("desktop_notifications");
+                for(const auto& notification:desktop_notifications_->poll(desktop_time())){GuiMessage message;message.status_icon=notification;events_.push_back(std::move(message));}}
             if(!snapshot_.empty() && !graphics_surfaces_.empty() && (!graphics_snapshot_time_ || -[graphics_snapshot_time_ timeIntervalSinceNow]>=0.5)){dirty_=true;graphics_snapshot_time_=[NSDate date];}
             if(dirty_){
+                const NativeGuiPollTrace diagnostics_trace("snapshot_diagnostics");
                 for(auto& [h,w]:windows_){if(!w.native || !w.native.visible)continue;
                     try{snapshot(w.view,snapshot_);}catch(const std::exception& error){
                         std::fprintf(stderr,"[gui] 自動快照失敗 window=%llu width=%.0f height=%.0f：%s\n",static_cast<unsigned long long>(h),static_cast<double>(w.view.bounds.size.width),static_cast<double>(w.view.bounds.size.height),error.what());
@@ -2863,10 +2938,7 @@ public:
                 capture_native_windows_async(native_snapshot_batch_,requests);
             }
             if(wait || automation_live_path_ || (action_<automation_.count && [automation_[action_][@"nonblocking"] boolValue]))automate();
-            if(const auto& timing=macos_detail::gui_timing();timing)for(const auto& queued:events_)
-                if((queued.message>=0x100 && queued.message<=0x109) || (queued.message>=0x200 && queued.message<=0x20e))
-                    timing->input(queued.window,queued.message);
-            auto result=std::move(events_);events_.clear();return result;
+            return take_events(record_input);
         }
     }
 };
@@ -2963,6 +3035,7 @@ public:
         if(real_)real_->raw_input_policy(keyboard,mouse,sink);else raw_policy_={keyboard,mouse,sink};
     }
     std::vector<GuiMessage> poll_for(std::uint64_t nanoseconds) override {return real("poll_for").poll_for(nanoseconds);}
+    void prefetch_events() override {if(real_)real_->prefetch_events();}
     std::optional<GuiFontMetrics> font_metrics(const GuiFont& font) override {return real("font_metrics").font_metrics(font);}
     std::optional<std::int32_t> text_width(const GuiFont& font,const std::u16string& text) override {return real("text_width").text_width(font,text);}
     std::optional<std::vector<std::int32_t>> text_advances(const GuiFont& font,const std::u16string& text) override {return real("text_advances").text_advances(font,text);}

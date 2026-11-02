@@ -47,10 +47,7 @@ std::array<std::uint8_t,unicast_row_size> unicast_row(const NetworkInterface& it
     return bytes;
 }
 std::array<std::uint8_t,16> interface_guid(const NetworkInterface& item){
-    // 客體介面身分由宿主名稱穩定衍生，並非冒充硬體廠商的 GUID。
-    std::array<std::uint8_t,16> value{};std::uint64_t hash=14695981039346656037ULL;
-    for(unsigned half=0;half<2;++half){for(const auto c:std::string("x64arm-interface-")+std::to_string(half)+item.name){hash^=static_cast<unsigned char>(c);hash*=1099511628211ULL;}for(unsigned i=0;i<8;++i)value[half*8+i]=static_cast<std::uint8_t>(hash>>(i*8));}
-    value[7]=(value[7]&15)|0x80;value[8]=(value[8]&63)|0x80;return value;
+    return network_interface_guid(item.name);
 }
 std::vector<std::uint8_t> interface_row(const NetworkInterface& item){
     std::vector<std::uint8_t> bytes(1352);const auto put=[&](unsigned at,std::uint64_t value,unsigned count){for(unsigned i=0;i<count;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));};

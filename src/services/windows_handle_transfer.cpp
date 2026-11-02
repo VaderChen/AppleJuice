@@ -197,7 +197,16 @@ void WindowsServices::configure_handle_transfer(){
     (void)::fcntl(transfer->descriptor,F_SETFD,FD_CLOEXEC);(void)::fcntl(transfer->descriptor,F_SETFL,O_NONBLOCK);
     sockaddr_un address{};address.sun_family=AF_UNIX;if(transfer->path.size()>=sizeof(address.sun_path))throw HostCallFault("程序 handle 通道路徑過長");
     std::memcpy(address.sun_path,transfer->path.c_str(),transfer->path.size()+1);
-    if(::bind(transfer->descriptor,reinterpret_cast<sockaddr*>(&address),sizeof(address)) || ::chmod(transfer->path.c_str(),0600))throw HostCallFault("無法綁定程序 handle 傳輸通道");
+    if(::bind(transfer->descriptor,reinterpret_cast<sockaddr*>(&address),sizeof(address))){
+        // 同 process id 的前一個程序被強制結束時，端點檔案留在 mapping session 目錄（EADDRINUSE；量測腳本 TERM 掉遊戲後立即重啟
+        // 就撞到）。以另一個 DGRAM socket 對它 connect（不送資料）：沒有程序綁定時回 ECONNREFUSED，刪掉殘留檔案重試；
+        // 仍有存活的擁有者則維持原錯誤（同一 session 不會有兩個同 id 的存活程序）。
+        bool stale=false;
+        if(errno==EADDRINUSE){const int probe=::socket(AF_UNIX,SOCK_DGRAM,0);
+            if(probe>=0){if(::connect(probe,reinterpret_cast<sockaddr*>(&address),sizeof(address))<0 && errno==ECONNREFUSED)stale=true;::close(probe);}}
+        if(!stale || ::unlink(transfer->path.c_str()) || ::bind(transfer->descriptor,reinterpret_cast<sockaddr*>(&address),sizeof(address)))throw HostCallFault("無法綁定程序 handle 傳輸通道");
+    }
+    if(::chmod(transfer->path.c_str(),0600))throw HostCallFault("無法綁定程序 handle 傳輸通道");
     configure_process_io();
     handle_transfers_=std::move(transfer);
     configure_process_identity();
@@ -418,7 +427,7 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
                 }
             if(peek>=static_cast<ssize_t>(sizeof(next)) &&
                (next.kind==6 || next.kind==7 || next.kind==11 || next.kind==12 ||
-                next.kind==14 || next.kind==15 || next.kind==18 || next.kind==family_request_kind))break;
+                next.kind==14 || next.kind==15 || next.kind==18 || next.kind==23 || next.kind==family_request_kind))break;
         }
         TransferMessage packet;sockaddr_un sender{};std::array<std::uint8_t,1232> context{};std::array<iovec,2> data{{{&packet,sizeof(packet)},{context.data(),context.size()}}};msghdr message{};
         alignas(cmsghdr) std::array<char,CMSG_SPACE(2*sizeof(int))> control{};message.msg_name=&sender;message.msg_namelen=sizeof(sender);message.msg_iov=data.data();message.msg_iovlen=data.size();message.msg_control=control.data();message.msg_controllen=control.size();
@@ -495,6 +504,12 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
                 // thread channel 的 atomic phase 決定提交或取消；已提交的建立不可被晚到的取消撤回。
                 else if(packet.options==2)poll_remote_thread_creations(memory);
             }
+        }
+        else if(packet.kind==23){
+            reply.accounting=packet.accounting;
+            reply.error=!packet.auxiliary || packet.auxiliary!=process_identity_birth()?87U:
+                receive_remote_raster(memory,packet.sender,packet.options,reply.accounting,descriptor);
+            (void)send_transfer(transfer.descriptor,path,reply);
         }
         else if(packet.kind==14 || packet.kind==15 || packet.kind==19){
             reply.accounting=packet.accounting;reply.mode=packet.mode;

@@ -512,9 +512,15 @@ bool WindowsServices::invoke_remote_gui(GuestState &state, GuestMemory &memory,
     } else if (symbol == "GetDC" || symbol == "GetWindowDC") {
         result = 0x10000000 + handle;
         gui_.dc_objects.try_emplace(result, 0xb011);
+        auto& dc=gui_.contexts[result];dc=GuiDc{};dc.display=true;
+        if(symbol=="GetWindowDC"){
+            dc.window_frame=true;dc.viewport_origin={w.x-w.client_x,w.y-w.client_y};
+        }
     } else if (symbol == "ReleaseDC") {
-        if (arg(1) == 0x10000000 + handle)
+        if (arg(1) == 0x10000000 + handle){
             result = gui_.dc_objects.erase(arg(1)) ? 1 : 0;
+            if(result){gui_.contexts.erase(arg(1));gui_.saved_contexts.erase(arg(1));}
+        }
     } else if (symbol == "WindowFromDC") {
         if (gui_.dc_objects.contains(arg(0)))
             result = handle;

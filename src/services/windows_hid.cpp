@@ -23,6 +23,8 @@ std::vector<Button> pressed(const hid::Layout& layout,unsigned type,std::span<co
 std::span<const WindowsServiceDescriptor> hid_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"hid.dll","HidD_GetHidGuid",1},{"hid.dll","HidD_GetAttributes",2},
+        {"hid.dll","HidD_GetPhysicalDescriptor",3,0,0,0x4},
+        {"hid.dll","HidD_GetNumInputBuffers",2},{"hid.dll","HidD_SetNumInputBuffers",2},{"hid.dll","HidD_FlushQueue",1},
         {"hid.dll","HidD_GetManufacturerString",3},{"hid.dll","HidD_GetProductString",3},
         {"hid.dll","HidD_GetSerialNumberString",3},{"hid.dll","HidD_GetPreparsedData",2},
         {"hid.dll","HidD_FreePreparsedData",1},{"hid.dll","HidP_GetCaps",2},
@@ -55,7 +57,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,Guest
             if(file==files_.end() || !file->second.hid)fail(6);
             else if(file->second.hid->disconnected || !file->second.hid->backend->available(file->second.hid->device.instance))fail(1167);
             else {const auto& device=file->second.hid->device;
-                if(name=="HidD_GetAttributes"){
+                if(name=="HidD_GetNumInputBuffers"){
+                    if(!arg(1))fail(87);
+                    else {memory.store(GuestAddress{arg(1)},32,file->second.hid->input_buffer_count);process_io::record(process_io::Kind::Other,4);result=1;}
+                }else if(name=="HidD_SetNumInputBuffers"){
+                    if(!file->second.hid->set_input_buffer_count(d(1)))fail(87);
+                    else {process_io::record(process_io::Kind::Other,0);result=1;}
+                }else if(name=="HidD_FlushQueue"){
+                    file->second.hid->reports.clear();process_io::record(process_io::Kind::Other,0);result=1;
+                }else if(name=="HidD_GetAttributes"){
                     if(!arg(1) || memory.load(GuestAddress{arg(1)},32)!=12)fail(87);
                     else {std::array<std::uint8_t,12> data{};put(data,0,12);put(data,4,device.vendor,2);put(data,6,device.product_id,2);put(data,8,device.version,2);memory.write(GuestAddress{arg(1)},data);process_io::record(process_io::Kind::Other,data.size());result=1;}
                 }else if(name=="HidD_GetPreparsedData"){
@@ -70,6 +80,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,Guest
                     else {std::vector<std::uint8_t> report(d(2));memory.read(GuestAddress{arg(1)},report);file->second.hid->layout.validate(type,report);if(!write)memory.check(GuestAddress{arg(1)},report.size(),Access::Write);
                         const auto error=write?file->second.hid->backend->set_report(device.instance,type,report):file->second.hid->backend->get_report(device.instance,type,report);
                         if(error)fail(error);else {if(!write)memory.write(GuestAddress{arg(1)},report);process_io::record(process_io::Kind::Other,report.size());result=1;}}
+                }else if(name=="HidD_GetPhysicalDescriptor"){
+                    if(!arg(1) || !d(2))fail(87);
+                    else {memory.check(GuestAddress{arg(1)},d(2),Access::Write);std::vector<std::uint8_t> bytes(std::min<std::uint32_t>(d(2),UINT16_MAX));
+                        const auto error=file->second.hid->physical_descriptor(bytes);
+                        if(error)fail(error);else {memory.write(GuestAddress{arg(1)},bytes);process_io::record(process_io::Kind::Other,bytes.size());result=1;}}
                 }else if(name=="HidD_GetIndexedString"){
                     // 只回答裝置登錄的 iManufacturer／iProduct／iSerialNumber；其他索引與裝置不回應時相同，回報 ERROR_GEN_FAILURE。
                     const auto index=d(1);const std::string* text=nullptr;

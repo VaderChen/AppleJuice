@@ -559,6 +559,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
         const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
         const auto record=memory.load(GuestAddress{arg(0)},bits),context=memory.load(GuestAddress{arg(0)+unit},bits);
         memory.check(GuestAddress{record},x86_?80:152,Access::Read);memory.check(GuestAddress{context},x86_?716:1232,Access::Read);
+        if(std::getenv("X64ARM_TRACE_FAULTS"))try{
+            const auto count=memory.load(GuestAddress{record+(x86_?16:24)},32);
+            std::cerr<<"[unhandled_filter] pid="<<process_id()<<" thread="<<threads_.current
+                <<" code=0x"<<std::hex<<memory.load(GuestAddress{record},32)
+                <<" address=0x"<<memory.load(GuestAddress{record+(x86_?12:16)},bits)
+                <<" parameter0=0x"<<(count?memory.load(GuestAddress{record+(x86_?20:32)},bits):0)
+                <<" context_pc=0x"<<memory.load(GuestAddress{context+(x86_?184:248)},bits)<<std::dec<<'\n';
+            const auto captured=read_context(memory,context,state);
+            trace_fault_memory(captured,memory,process_id(),threads_.current);
+        }catch(...){ /* 診斷不得改變例外篩選器的結果。 */ }
         if(runtime_.unhandled_filter){start_callbacks(state,memory,{{runtime_.unhandled_filter,{arg(0)}}},Continuation::UnhandledFilter);return std::nullopt;}
         result=1;
     }else if(x86_ && symbol=="RtlUnwind"){begin_x86_unwind(state,memory,service);return std::nullopt;

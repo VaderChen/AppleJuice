@@ -30,6 +30,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
     const auto write_transform=[&](std::uint64_t at,const GuiTransform& m){memory.check(GuestAddress{at},24,Access::Write);for(unsigned i=0;i<6;++i)memory.store(GuestAddress{at+i*4},32,std::bit_cast<std::uint32_t>(static_cast<float>(m[i])));};
     if(name=="CombineTransform"){if(!arg(0) || !arg(1) || !arg(2))return failure(87);const auto combined=gui_multiply(read_transform(arg(1)),read_transform(arg(2)));if(!gui_valid_transform(combined))return failure(87);write_transform(arg(0),combined);return finish(1);}
     const auto window=arg(0)>=0x10000000?gui_.windows.find(arg(0)-0x10000000):gui_.windows.end();
+    const auto remote=window==gui_.windows.end() && arg(0)>=0x10000000 && gui_.dc_objects.contains(arg(0))?
+        shared_gui_window(arg(0)-0x10000000):std::optional<SharedWindowInfo>{};
     const bool known=gui_.contexts.contains(arg(0)) || gui_.dc_objects.contains(arg(0)) || window!=gui_.windows.end();
     if(name=="GetObjectType"){
         const auto h=arg(0);if(gui_.metafiles.contains(h))return finish(13);if(gui_.windows_metafiles.contains(h))return finish(9);if(gui_.emf_recorders.contains(h))return finish(12);
@@ -54,6 +56,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
     const auto visible=[&]{
         std::uint32_t width=1,height=1;
         if(window!=gui_.windows.end()){width=window->second.width;height=window->second.height;}
+        else if(remote){width=remote->width;height=remote->height;}
         else if(const auto bitmap=gui_.bitmaps.find(dc.bitmap);bitmap!=gui_.bitmaps.end()){width=bitmap->second.width;height=bitmap->second.height;}
         else if(dc.display){width=1440;height=900;}
         return width && height?GuiRegion{{0,0,static_cast<std::int32_t>(width),static_cast<std::int32_t>(height)}}:GuiRegion{};
@@ -129,7 +132,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
             const auto target=gui_.regions.find(arg(1));if(target==gui_.regions.end())return failure(6);
             if(name=="GetRandomRgn"){
                 if(arg(2)!=4)return failure(87);auto region=visible();
-                if(window!=gui_.windows.end()){const auto origin=gui_client_origin(gui_,window->first);for(auto& r:region)for(unsigned i=0;i<4;++i){const auto value=static_cast<std::int64_t>(r[i])+origin[i%2];if(value<INT32_MIN || value>INT32_MAX)return failure(87);r[i]=static_cast<std::int32_t>(value);}}
+                if(window!=gui_.windows.end() || remote){const auto origin=remote?std::array<std::int64_t,2>{remote->client_x,remote->client_y}:gui_client_origin(gui_,window->first);for(auto& r:region)for(unsigned i=0;i<4;++i){const auto value=static_cast<std::int64_t>(r[i])+origin[i%2];if(value<INT32_MIN || value>INT32_MAX)return failure(87);r[i]=static_cast<std::int32_t>(value);}}
                 target->second=std::move(region);return finish(1);
             }
             const auto& region=name=="GetClipRgn"?dc.application_clip:dc.meta_clip;

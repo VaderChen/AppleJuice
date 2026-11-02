@@ -99,6 +99,7 @@ std::uint32_t write_enum_key(RegistryState& registry,const std::filesystem::path
     for(const auto& [property,entry]:node.properties)if(property!=23)values.emplace_back(entry.first,entry.second);
     return write_registry_key(registry,file,std::u16string(1,2)+u"\\SYSTEM\\CurrentControlSet\\Enum\\"+node.id,values,remove,limit);
 }
+#include "windows_device_interface_properties.inc"
 }
 struct DeviceConfigurationState {
     std::map<std::uint32_t,DeviceNode> nodes;
@@ -320,8 +321,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
             }
         }
         if(name.starts_with("CM_Locate_DevNode") && folded(read(arg(1))).starts_with(u"hid\\"))enumerate_hid=true;
+        if((name.starts_with("CM_Get_Device_Interface_Property") || name.starts_with("CM_Set_Device_Interface_Property")) && arg(0) && folded(read(arg(0))).starts_with(u"\\\\?\\hid"))enumerate_hid=true;
         refresh_device_configuration(enumerate_hid);
         const auto& nodes=device_configuration_->nodes;
+#include "windows_device_interface_property_calls.inc"
         if(name.starts_with("SetupDiClass") || name.starts_with("SetupDiGetClassDescription") || name.starts_with("SetupDiBuildClassInfoList") || name.starts_with("SetupDiOpenClassRegKey")){
 #include "windows_setup_classes.inc"
         }
@@ -443,7 +446,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
         }
         throw HostCallFault("尚未實作裝置組態服務："+std::string(name));
     }catch(const driver_store::Error& error){last_error_=error.code;return finish(0);}
-    catch(const std::invalid_argument&){last_error_=13;return finish(0);}
+    catch(const std::invalid_argument&){if(name.starts_with("CM_"))return finish(31);last_error_=13;return finish(0);}
     catch(const MemoryFault&){if(name.starts_with("Setup") || name.starts_with("Di")){last_error_=87;return finish(name.starts_with("SetupDiGetClassDevs") || name.starts_with("SetupDiCreateDeviceInfoList") || name=="SetupDiOpenDevRegKey" || name=="SetupDiOpenDeviceInterfaceRegKey"?(x86_?UINT32_MAX:UINT64_MAX):0);}return finish(3);}
     catch(const std::bad_alloc&){if(name.starts_with("Setup") || name.starts_with("Di")){last_error_=8;return finish(name.starts_with("SetupDiGetClassDevs") || name.starts_with("SetupDiCreateDeviceInfoList") || name=="SetupDiOpenDevRegKey" || name=="SetupDiOpenDeviceInterfaceRegKey"?(x86_?UINT32_MAX:UINT64_MAX):0);}return finish(2);}
 }

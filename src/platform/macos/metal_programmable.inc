@@ -44,7 +44,10 @@ std::shared_ptr<GraphicsResource> MetalGl::graphics_resource(const GraphicsResou
     else for(unsigned i=0;i<d.levels;++i){const auto pitch=graphics_format_pitch(d.format>=5 && d.format<=8?2:d.format,std::max(1U,d.width>>i),std::max(1U,d.height>>i));size+=std::uint64_t{pitch[0]}*pitch[1]*std::max(1U,d.depth>>i)*d.layers*d.samples*((d.format>=44 && d.format<=47)?2U:1U);}
     if(size>SIZE_MAX)throw std::bad_alloc{};r->lease=reserve_gpu_memory(static_cast<std::size_t>(size));
     // 實體配置向頁邊界補齊，供不同 DXGI 格式建立對齊的 texture-buffer view；邏輯長度仍為 d.width。
-    if(d.dimension==1){r->buffer=[device_ newBufferWithLength:size options:MTLResourceStorageModeShared];if(!r->buffer)throw std::bad_alloc{};std::memset(r->buffer.contents,0,size);
+    if(d.dimension==1){
+        if(metal_create_pool_enabled()){r->buffer=discard_pool_->take(static_cast<std::size_t>(size));r->recycle=discard_pool_;}
+        if(!r->buffer){r->buffer=[device_ newBufferWithLength:size options:MTLResourceStorageModeShared];if(!r->buffer)throw std::bad_alloc{};}
+        std::memset(r->buffer.contents,0,size);
         if(metal_backing_generation_enabled()){r->backing=std::make_shared<MetalBufferBacking>();r->backing->buffer=r->buffer;r->backing->lease=r->lease;}}
     else {
         auto t=[MTLTextureDescriptor new];t.pixelFormat=metal_format(d.format);if(d.format==22 || d.format==47)t.pixelFormat=MTLPixelFormatDepth32Float_Stencil8;if(d.bind&0x40){if(d.format==39)t.pixelFormat=MTLPixelFormatDepth32Float;if(d.format==53)t.pixelFormat=MTLPixelFormatDepth16Unorm;}t.width=d.width;t.height=d.height;t.depth=d.depth;t.mipmapLevelCount=d.levels;t.arrayLength=d.dimension==4?1:d.layers;t.sampleCount=d.samples;
@@ -63,11 +66,16 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_shader(std::uint32_t stage,std
     // 串流輸出簽章容器（stage 6）只保存位元組，不經快取。
     if(stage==6)return graphics_shader_create(stage,bytes);
     std::uint64_t key=UINT64_C(1469598103934665603)^stage;for(const auto value:bytes){key^=value;key*=UINT64_C(1099511628211);}
-    {
+    const auto cached_shader=[&]()->std::shared_ptr<GraphicsShader>{
         const std::lock_guard lock(shader_cache_mutex_);
         if(const auto found=shader_cache_.find(key);found!=shader_cache_.end())for(const auto& cached:found->second)
             if(cached->stage==stage && cached->bytecode.size()==bytes.size() && std::equal(cached->bytecode.begin(),cached->bytecode.end(),bytes.begin()))return cached;
-    }
+        return nullptr;
+    };
+    if(auto cached=cached_shader())return cached;
+    // 背景編譯與協調者可能同時要同一份內容：取得編譯鎖後再查一次快取，不重複轉譯。
+    const std::lock_guard compile(shader_compile_mutex_);
+    if(auto cached=cached_shader())return cached;
     auto created=graphics_shader_create(stage,bytes);
     if(auto native=std::dynamic_pointer_cast<MetalShader>(created)){
         native->content_key=key;
@@ -94,6 +102,44 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_shader(std::uint32_t stage,std
     }
     return created;
 }
+std::uint64_t MetalGl::graphics_shader_prefetch(std::uint32_t stage,std::span<const std::uint8_t> bytes){
+    // 只用於 DXBC 容器（SM4／5 與 DXIL，stage 0～5）；D3D9 legacy 與串流輸出容器照常同步建立。背景序列佇列呼叫 graphics_shader
+    // 完成 HLSLcc／SPIR-V 轉譯（Metal 程式庫本來就非同步編譯）並放進快取；呼叫端以票號等待後重試，命中快取即直接取得。
+    // 雙人成行每輪約 432 個（轉譯中位 0.9 ms、p90 約 14 ms），操作中仍持續出現；原本在協調者持獨占映射鎖並等命令執行緒排空時
+    // 同步轉譯。同成品操作中 37.97 對 36.32 fps、>50 ms 長幀中位 10 對 18。X64ARM_SHADER_ASYNC=0 關閉。
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_SHADER_ASYNC");return !value || std::string_view(value)!="0";}();
+    static const bool trace=std::getenv("X64ARM_TRACE_SHADER_ASYNC")!=nullptr;
+    if(!enabled || stage>5 || bytes.size()<32 || metal_word(bytes,0)!=0x43425844){
+        if(trace)std::fprintf(stderr,"[shader_async] prefetch skip enabled=%d stage=%u size=%zu magic=%x\n",enabled?1:0,stage,bytes.size(),bytes.size()>=4?metal_word(bytes,0):0U);
+        return 0;
+    }
+    std::uint64_t key=UINT64_C(1469598103934665603)^stage;for(const auto value:bytes){key^=value;key*=UINT64_C(1099511628211);}
+    {
+        const std::lock_guard lock(shader_cache_mutex_);
+        if(const auto found=shader_cache_.find(key);found!=shader_cache_.end())for(const auto& cached:found->second)
+            if(cached->stage==stage && cached->bytecode.size()==bytes.size() && std::equal(cached->bytecode.begin(),cached->bytecode.end(),bytes.begin())){
+                if(trace)std::fprintf(stderr,"[shader_async] prefetch cached stage=%u key=%llx\n",stage,static_cast<unsigned long long>(key));
+                return 0;
+            }
+    }
+    const std::uint64_t ticket=key?key:1;
+    const std::lock_guard lock(shader_jobs_mutex_);
+    if(shader_failed_.contains(ticket))return 0;
+    if(shader_jobs_.contains(ticket))return ticket;
+    shader_jobs_.insert(ticket);
+    if(!shader_queue_)shader_queue_=dispatch_queue_create("x64arm.shader-compile",dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_USER_INITIATED,0));
+    const auto copy=std::make_shared<std::vector<std::uint8_t>>(bytes.begin(),bytes.end());
+    const auto queued=std::chrono::steady_clock::now();
+    dispatch_async(shader_queue_,^{@autoreleasepool{
+        bool failed=false;const auto started=std::chrono::steady_clock::now();
+        try{(void)graphics_shader(stage,*copy);}catch(...){failed=true;}
+        if(trace)std::fprintf(stderr,"[shader_async] compiled stage=%u queued_ms=%.1f compile_ms=%.1f failed=%d\n",stage,
+            std::chrono::duration<double,std::milli>(started-queued).count(),std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count(),failed?1:0);
+        const std::lock_guard done(shader_jobs_mutex_);shader_jobs_.erase(ticket);if(failed)shader_failed_.insert(ticket);
+    }});
+    return ticket;
+}
+bool MetalGl::graphics_shader_ticket_ready(std::uint64_t ticket){const std::lock_guard lock(shader_jobs_mutex_);return !shader_jobs_.contains(ticket);}
 // 私有複本：共用快取中的編譯結果，但給新 serial 並清掉串流輸出狀態，供呼叫端之後自行設定。
 std::shared_ptr<GraphicsShader> MetalGl::graphics_shader_private(std::uint32_t stage,std::span<const std::uint8_t> bytes){
     auto shared=graphics_shader(stage,bytes);
@@ -103,6 +149,7 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_shader_private(std::uint32_t s
     return shared;
 }
 std::shared_ptr<GraphicsShader> MetalGl::graphics_shader_create(std::uint32_t stage,std::span<const std::uint8_t> bytes){@autoreleasepool{
+    const std::lock_guard compile(shader_compile_mutex_);
     // stage 6 是僅含輸出簽章的 SO 轉送物件；實際資料由目前綁定的 VS 產生。
     if(stage==6){
         if(bytes.size()<32 || metal_word(bytes,0)!=0x43425844 || metal_word(bytes,24)!=bytes.size())throw std::invalid_argument("SO 簽章容器不合法");
@@ -149,6 +196,7 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_compute_source(const GraphicsM
     return shader;
 }}
 std::shared_ptr<GraphicsShader> MetalGl::graphics_translate_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes,GLSLCrossDependencyData* shared){@autoreleasepool{
+    const std::lock_guard compile(shader_compile_mutex_); // 曲面細分等直接呼叫者與背景編譯共用 HLSLcc
     if(stage>5)throw std::invalid_argument("Metal 著色器階段不合法");
     // 先檢查容器與 token 邊界，避免把截斷的客體資料交給第三方解碼器。
     if(bytes.size()<32 || metal_word(bytes,0)!=0x43425844 || metal_word(bytes,24)!=bytes.size() || metal_word(bytes,28)>64 || 32ULL+4ULL*metal_word(bytes,28)>bytes.size())throw std::invalid_argument("DXBC 容器不合法");
@@ -297,7 +345,7 @@ bool MetalGl::graphics_upload_buffer(const std::shared_ptr<GraphicsResource>& de
     graphics_pending_.push_back(staging);graphics_pending_.push_back(destination);begin_commands();
     auto encoder=[commands_ blitCommandEncoder];MetalEncoderScope scope{encoder};
     [encoder copyFromBuffer:source.buffer sourceOffset:source_offset toBuffer:target.buffer destinationOffset:offset size:data.size()];
-    scope.end();if(++pending_>=metal_batch_limit())flush(false,"batch_128");return true;
+    scope.end();++pending_;batch_commit();return true;
 }
 void MetalGl::graphics_write_buffer(const std::shared_ptr<GraphicsResource>& resource,std::span<const std::uint8_t> data,std::uint32_t offset){
     auto& target=metal_resource(resource);
@@ -351,6 +399,10 @@ bool MetalGl::graphics_replace_buffer(const std::shared_ptr<GraphicsResource>& d
     }
     resource.buffer=next.buffer;resource.lease=next.lease;resource.backing=next.backing;
     resource.constant_bytes=std::move(next.constant_bytes);resource.constant_bytes_valid=next.constant_bytes_valid;
+    // 新 backing 已交給既有身分：清掉暫時替換資源的 buffer 與回收池，否則它解構時會把仍在使用的 buffer 交回池（之後被另一個
+    // CreateBuffer 取走而兩個資源共用同一 buffer）。既有身分改以替換資源的回收契約釋放。
+    if(next.recycle)resource.recycle=next.recycle;
+    next.buffer=nil;next.recycle=nullptr;next.lease=nullptr;next.backing=nullptr;
     return true;
 }
 void MetalGl::graphics_write(const GraphicsView& v,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){@autoreleasepool{
@@ -1129,7 +1181,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         graphics_pending_.push_back(d.indirect);
     }
     else if(d.indexed){auto& r=metal_resource(d.indices);const auto bpp=d.index_format==57?2U:4U;const auto offset=std::uint64_t{d.index_offset}+std::uint64_t{d.start}*bpp;if(offset+std::uint64_t{d.count}*bpp>r.desc.width)throw std::invalid_argument("索引 buffer 越界");[enc drawIndexedPrimitives:primitive indexCount:d.count indexType:bpp==2?MTLIndexTypeUInt16:MTLIndexTypeUInt32 indexBuffer:r.buffer indexBufferOffset:offset instanceCount:d.instances baseVertex:d.base_vertex baseInstance:d.start_instance];graphics_pending_.push_back(d.indices);}
-    else [enc drawPrimitives:primitive vertexStart:d.start vertexCount:d.count instanceCount:d.instances baseInstance:d.start_instance];if(enc_scope)enc_scope->end();++draws_;if(++pending_>=metal_batch_limit())flush(false,"batch_128");
+    else [enc drawPrimitives:primitive vertexStart:d.start vertexCount:d.count instanceCount:d.instances baseInstance:d.start_instance];if(enc_scope)enc_scope->end();++draws_;++pending_;batch_commit();
     if(timing_start){
         const auto end=metal_now_ns();const std::array<std::uint64_t,7> marks{timing_start,timing_prep,timing_pipeline,timing_encoder,timing_state,timing_bind,end};
         for(std::size_t i=0;i+1<marks.size();++i)draw_time_ns_[i]+=marks[i+1]-marks[i];++draw_time_count_;
@@ -1164,10 +1216,10 @@ void MetalGl::graphics_dispatch_indirect(const GraphicsStage& stage,const std::s
     if(!args.buffer || (offset&3U) || std::uint64_t{offset}+12>args.desc.width)throw std::invalid_argument("間接運算參數越界或未對齊");
     auto& shader=dynamic_cast<MetalShader&>(*stage.shader);metal_resolve_shader(device_,shader);auto e=compute_encoder();[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);
     [e dispatchThreadgroupsWithIndirectBuffer:args.buffer indirectBufferOffset:offset threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];
-    graphics_pending_.push_back(arguments);graphics_trace_dispatch(stage,{0,0,0},arguments,offset);if(metal_dispatch_sync())flush(true,"dispatch_sync");else if(++pending_>=metal_batch_limit())flush(false,"batch_128");
+    graphics_pending_.push_back(arguments);graphics_trace_dispatch(stage,{0,0,0},arguments,offset);if(metal_dispatch_sync())flush(true,"dispatch_sync");else ++pending_;batch_commit();
 }}
 void MetalGl::graphics_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){@autoreleasepool{if(metal_skip_volume_dispatch(stage))return;if(!stage.shader)throw std::invalid_argument("Dispatch 缺少 CS");auto& shader=dynamic_cast<MetalShader&>(*stage.shader);metal_resolve_shader(device_,shader);auto e=compute_encoder();
-    if(metal_labels())e.label=[NSString stringWithFormat:@"cs %016llx %ux%ux%u",static_cast<unsigned long long>(shader.content_key),groups[0],groups[1],groups[2]];[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);[e dispatchThreadgroups:MTLSizeMake(groups[0],groups[1],groups[2]) threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];graphics_trace_dispatch(stage,groups,{},0);if(metal_dispatch_sync())flush(true,"dispatch_sync");else if(++pending_>=metal_batch_limit())flush(false,"batch_128");}}
+    if(metal_labels())e.label=[NSString stringWithFormat:@"cs %016llx %ux%ux%u",static_cast<unsigned long long>(shader.content_key),groups[0],groups[1],groups[2]];[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);[e dispatchThreadgroups:MTLSizeMake(groups[0],groups[1],groups[2]) threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];graphics_trace_dispatch(stage,groups,{},0);if(metal_dispatch_sync())flush(true,"dispatch_sync");else ++pending_;batch_commit();}}
 void MetalGl::graphics_mips(const GraphicsView& v){@autoreleasepool{begin_commands(true,"mips");auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};[e generateMipmapsForTexture:metal_texture(v)];e_scope.end();graphics_pending_.push_back(v.resource);}}
 void MetalGl::graphics_handoff(NativeGraphics& consumer,const GraphicsView& view){@autoreleasepool{
     // 命令執行緒代理：先清空其佇列，再交接給底層後端。

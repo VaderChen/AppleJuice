@@ -24,6 +24,14 @@ extern "C" {
 
 namespace x64arm {
 namespace {
+// Win32 編譯器 helper 以 XMM0／XMM1 傳參、XMM0 回傳，不能套用 cdecl 的堆疊浮點 ABI。
+constexpr std::pair<std::string_view,std::string_view> sse_math_aliases[]{
+#define SSE_MATH(name) {"__libm_sse2_" #name,#name},{"__libm_sse2_" #name "f",#name "f"},{"_libm_sse2_" #name "_precise",#name}
+    SSE_MATH(acos),SSE_MATH(asin),SSE_MATH(atan),SSE_MATH(cos),SSE_MATH(exp),
+    SSE_MATH(log),SSE_MATH(log10),SSE_MATH(pow),SSE_MATH(sin),SSE_MATH(tan),
+#undef SSE_MATH
+    {"__libm_sse2_atan2","atan2"},{"_libm_sse2_sqrt_precise","sqrt"}
+};
 using ComplexKind=X64armComplexKind;
 struct ComplexOperation {
     std::string_view name;ComplexKind kind;bool single{},real{},binary{};
@@ -190,6 +198,7 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
     };
     static const auto complete=[]{
         std::vector<WindowsServiceDescriptor> result(std::begin(table),std::end(table));
+        for(const auto& [name,scalar_name]:sse_math_aliases)result.push_back({"crt",name,0});
         for(const auto& operation:complex_operations){
             // 16-byte 結果在兩種 ABI 都有第一個隱藏指標；8-byte 結果使用 RAX／EDX:EAX。
             const unsigned inputs=operation.binary?2U:1U,hidden=!operation.single && !operation.real?1U:0U;
@@ -316,6 +325,7 @@ struct ScalarMathOperation {
     FloatBinary float_binary{};
     const IntegerRounding* integer{};
     ScalarRounding rounding{ScalarRounding::General};
+    bool xmm_abi{};
     bool single() const noexcept {return float_unary || float_binary;}
 };
 const ScalarMathOperation* scalar_math_operation(const WindowsServiceDescriptor& service) {
@@ -336,6 +346,11 @@ const ScalarMathOperation* scalar_math_operation(const WindowsServiceDescriptor&
             else if(name=="round" || name=="roundf")operation.rounding=ScalarRounding::Away;
             else if(name=="nearbyint" || name=="nearbyintf")operation.rounding=ScalarRounding::Current;
             else if(name=="rint" || name=="rintf")operation.rounding=ScalarRounding::Exact;
+        }
+        for(const auto& [name,scalar_name]:sse_math_aliases){
+            const auto found=std::find_if(result.begin(),result.end(),[&](const auto& item){return item.name==scalar_name;});
+            if(found==result.end())throw std::logic_error("SSE2 CRT helper 缺少對應數學運算");
+            auto alias=*found;alias.name=name;alias.xmm_abi=true;result.push_back(alias);
         }
         return result;
     }();
@@ -362,7 +377,7 @@ unsigned scalar_math_recipe(const WindowsServiceDescriptor& service) noexcept {
     // 核心 ARM64 配方涵蓋已核准輸入與浮點模式；其餘交回同一入口的純量值服務。
     // 範圍錯誤的原生路徑須具備 resident_scalar_errors 提供的私人格位契約。
     const auto* operation=scalar_math_operation(service);
-    if(!operation)return 0;
+    if(!operation || operation->xmm_abi)return 0;
     if(operation->name=="expf")return 1;
     if(operation->name=="log2")return 2;
     if(operation->name=="logf")return 3;
@@ -466,7 +481,7 @@ static bool invoke_native_scalar_math_impl(ResidentScalarCall& call,GuestMemory&
 #endif
     try{
         // 沿 WindowsCall 的完整 Win64 框架契約；無效時不運算，交回原服務產生同一故障。
-        if(memory.execution_mode()!=ExecutionMode::X64 || call.stack%16!=8 || call.stack>UINT64_MAX-40)return false;
+        if(operation.xmm_abi || memory.execution_mode()!=ExecutionMode::X64 || call.stack%16!=8 || call.stack>UINT64_MAX-40)return false;
         std::uint64_t target{};
         if constexpr(Worker){
             // worker 僅借用不改映射／頁面快取的視窗；跨頁 home 區及 COW
@@ -538,6 +553,8 @@ void invoke_scalar_math(GuestState& state,GuestMemory& memory,const WindowsServi
 #pragma STDC FENV_ACCESS ON
 #endif
     const WindowsCall arg(state,memory,service);
+    if(operation.xmm_abi && !x86)throw HostCallFault("SSE2 CRT helper 僅提供 Win32 暫存器 ABI");
+    const bool stack_float=x86 && !operation.xmm_abi;
 #if defined(__aarch64__) && defined(__APPLE__)
     // Win64 純量取整家族共用硬體路徑；Win32 x87 ABI 沿用原來的環境與回傳流程。
     if(!x86 && operation.rounding!=ScalarRounding::General && direct_round_integral(state,operation)){
@@ -549,9 +566,9 @@ void invoke_scalar_math(GuestState& state,GuestMemory& memory,const WindowsServi
         return;
     }
 #endif
-    Environment environment(x86?static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13:state.mxcsr,boundary);
-    const auto input_double=[&](unsigned n){return x86?std::bit_cast<double>(arg(n)):scalar(state,n);};
-    const auto input_float=[&](unsigned n){return x86?std::bit_cast<float>(static_cast<std::uint32_t>(arg(n))):scalar_float(state,n);};
+    Environment environment(stack_float?static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13:state.mxcsr,boundary);
+    const auto input_double=[&](unsigned n){return stack_float?std::bit_cast<double>(arg(n)):scalar(state,n);};
+    const auto input_float=[&](unsigned n){return stack_float?std::bit_cast<float>(static_cast<std::uint32_t>(arg(n))):scalar_float(state,n);};
     if(operation.integer){
         const auto& conversion=*operation.integer;
         const auto value=round_integer(conversion.single?static_cast<double>(input_float(0)):input_double(0),conversion);
@@ -571,8 +588,16 @@ void invoke_scalar_math(GuestState& state,GuestMemory& memory,const WindowsServi
     else if(operation.double_binary)value=operation.double_binary(input_double(0),input_double(1));
     else if(operation.float_unary)single_value=operation.float_unary(input_float(0));
     else single_value=operation.float_binary(input_float(0),input_float(1));
-    const auto raised=commit_math_environment(state,memory,errno_cell,x86,environment);
-    conversion_result(state,x86,operation.single()?static_cast<double>(single_value):value,operation.single());
+    const auto raised=commit_math_environment(state,memory,errno_cell,stack_float,environment);
+    if(operation.xmm_abi){
+        const auto unmasked=math_exception_flags(raised)&~(state.mxcsr>>7)&63U;
+        if(unmasked){
+            const auto code=(unmasked&1)?0xc0000090U:(unmasked&4)?0xc000008eU:
+                (unmasked&8)?0xc0000091U:(unmasked&16)?0xc0000093U:0xc000008fU;
+            throw CpuFault(code,"SSE2 CRT helper 未遮罩的浮點例外");
+        }
+    }
+    conversion_result(state,stack_float,operation.single()?static_cast<double>(single_value):value,operation.single());
     arg.return_to(state,0);
 #ifdef X64ARM_HOST_SERVICES_COMMITTED_FP_STATUS
     // Win64 double 回傳只搬移位元；float 沿用既有 double 中介 ABI，但僅對正規值
@@ -589,7 +614,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
 #if defined(__clang__)
 #pragma STDC FENV_ACCESS ON
 #endif
-    if(scalar_math_requested())if(const auto* operation=scalar_math_operation(service)){
+    if(const auto* operation=scalar_math_operation(service);operation && (scalar_math_requested() || operation->xmm_abi)){
         invoke_scalar_math(state,memory,service,*operation,runtime_.errno_cell,x86_);return std::nullopt;
     }
     const WindowsCall arg(state, memory, service); const auto symbol = service.symbol;

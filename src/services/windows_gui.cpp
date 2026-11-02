@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "gui_lifecycle_trace.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/windows_window_state.hpp"
 #include "x64arm/windows_gui_abi.hpp"
@@ -13,15 +14,49 @@
 
 namespace x64arm {
 namespace {
+// 僅在診斷模式量測各段，保留共用 GUI pump 的既有順序及等待契約。
+class GuiPumpTrace {
+    using Clock=std::chrono::steady_clock;
+    std::uint64_t process_;
+    bool enabled_;
+    const char* stage_{"cursor_animation"};
+    Clock::time_point begin_{};
+    static bool enabled() {
+        static const bool value=[] {const auto* setting=std::getenv("X64ARM_TRACE_GUI_POLL");
+            return setting && *setting && std::string_view(setting)!="0";}();
+        return value;
+    }
+    void finish(Clock::time_point end) const {
+        const auto elapsed=end-begin_;
+        if(elapsed<std::chrono::milliseconds(5))return;
+        const auto duration=std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+        const auto wall=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr,"[gui-pump] guest_pid=%llu stage=%s begin_us=%lld end_us=%lld duration_us=%lld\n",
+            static_cast<unsigned long long>(process_),stage_,static_cast<long long>(wall-duration),
+            static_cast<long long>(wall),static_cast<long long>(duration));
+    }
+public:
+    explicit GuiPumpTrace(std::uint64_t process):process_(process),enabled_(enabled()) {
+        if(enabled_)begin_=Clock::now();
+    }
+    void next(const char* stage) {
+        if(!enabled_)return;
+        const auto now=Clock::now();finish(now);begin_=now;stage_=stage;
+    }
+    ~GuiPumpTrace() {if(enabled_)finish(Clock::now());}
+};
 constexpr std::array<std::u16string_view,23> stock_classes{u"button",u"static",u"edit",u"listbox",u"combobox",u"systreeview32",u"syslistview32",u"toolbarwindow32",u"msctls_statusbar32",u"rebarwindow32",u"scrollbar",u"msctls_progress32",u"comboboxex32",u"msctls_updown32",u"mdiclient",u"syslink",u"msctls_trackbar32",u"ime",u"systabcontrol32",u"tooltips_class32",u"sysheader32",u"sysdatetimepick32",u"sysmonthcal32"};
 constexpr std::uint64_t stock_base=windows_address_layout::x64.callbacks+0x100;
 constexpr std::uint64_t stock_base_x86=windows_address_layout::x86.callbacks+0x100;
 void trace_gui_input(std::string_view filter,const char* stage,const GuiMessage& message,std::uint64_t thread,std::uint64_t ticks) {
-    // X64ARM_TRACE_GUI_INPUT 只開按鍵紀錄，不經 X64ARM_TRACE_SERVICES（後者會關閉常駐快速路徑），
-    // 供錄製人工操作後轉成自動化腳本；unix_ms 用來與量測工具的時間軸對齊。
-    static const bool standalone=std::getenv("X64ARM_TRACE_GUI_INPUT")!=nullptr;
-    if((!standalone && filter.find("GuiInput")==filter.npos) || message.message<0x100 || message.message>0x107)return;
-    if(standalone && std::string_view(stage)!="enqueue")return;
+    // 獨立輸入追蹤不關閉 resident 快速路徑；預設只記按鍵入列，all 另記滑鼠及取出／派送。
+    // unix_ms 與宿主事件時間軸對齊；all 的追蹤輸出成本須與正式效能量測分開。
+    static const auto* standalone=std::getenv("X64ARM_TRACE_GUI_INPUT");
+    static const bool all=standalone && std::string_view(standalone)=="all";
+    const bool keyboard=message.message>=0x100 && message.message<=0x107;
+    const bool mouse=(message.message>=0x200 && message.message<=0x20e) || (message.message>=0xa0 && message.message<=0xad);
+    if((!standalone && filter.find("GuiInput")==filter.npos) || (!keyboard && !(all && mouse)))return;
+    if(standalone && !all && std::string_view(stage)!="enqueue")return;
     const auto unix_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     std::fprintf(stderr,"[gui-input] stage=%s unix_ms=%lld ticks=%llu thread=%llu hwnd=%llx message=%x key=%llx flags=%llx\n",stage,static_cast<long long>(unix_ms),
         static_cast<unsigned long long>(ticks),static_cast<unsigned long long>(thread),static_cast<unsigned long long>(message.window),
@@ -227,39 +262,68 @@ void WindowsServices::pump_mouse_tracking(){
     }
 }
 void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait_ticks) {
+    GuiPumpTrace trace(process_id());
     if(const auto found=gui_.icons.find(gui_.cursor);found!=gui_.icons.end() && !found->second.animation_sequence.empty()){
         const auto& icon=found->second;const auto step=icon_animation_step(icon,runtime_.clock_ticks>=gui_.cursor_animation_start?runtime_.clock_ticks-gui_.cursor_animation_start:0);
         if(step!=gui_.cursor_animation_step && (!native_gui_ || !interactive_station() || native_gui_->set_cursor(&icon.animation_frames.at(icon.animation_sequence[step]),gui_.cursor_count>=0)))gui_.cursor_animation_step=step;
     }
-    poll_appbars();
-    poll_power_notifications(memory);poll_dinput();poll_shell_notifications(memory);poll_desktop_notifications();
+    trace.next("appbars");poll_appbars();
+    trace.next("power");poll_power_notifications(memory);
+    trace.next("dinput");poll_dinput();
+    trace.next("shell");poll_shell_notifications(memory);
+    trace.next("desktop");poll_desktop_notifications();
+    trace.next("cursor_clip");
     if(gui_.cursor_clip){auto point=gui_.pointer_position;if(native_gui_)if(const auto current=native_gui_->cursor_position())point=*current;const auto& rect=*gui_.cursor_clip;
         const std::array<std::int32_t,2> constrained{std::clamp(point[0],rect[0],rect[2]-1),std::clamp(point[1],rect[1],rect[3]-1)};
         if(native_gui_ && point!=constrained)native_gui_->set_cursor_position(constrained[0],constrained[1]);gui_.pointer_position=constrained;}
+    trace.next("clipboard");
     // 明確的 Clipboard API 仍立即同步；事件輪詢僅為已登錄的監聽視窗查詢宿主。
     if(!gui_.clipboard_listeners.empty() && runtime_.clock_ticks>=gui_.clipboard_poll_deadline){
         gui_.clipboard_poll_deadline=runtime_.clock_ticks+160000;refresh_clipboard();
     }
-    poll_remote_frames();
-    for(auto& [key,surface]:rasters_){(void)key;surface->flush();}
-    poll_socket_lookups(memory);pump_gui_network();
+    trace.next("remote_frames");poll_remote_frames();
+    trace.next("raster_flush");for(auto& [key,surface]:rasters_){(void)key;surface->flush();}
+    trace.next("socket_lookup");poll_socket_lookups(memory);
+    trace.next("network");pump_gui_network();
+    trace.next("builtin_paint");
     // 自繪控制項先收到 WM_PAINT；stock procedure 同步回呼父視窗並回收 scratch。
     for(const auto& [handle,w]:gui_.windows)if(w.builtin && ((gui_control_class(w)==u"button" && (w.style&15)==11) || (gui_control_class(w)==u"static" && (w.style&31)==13) || (gui_control_class(w)==u"systabcontrol32" && (w.style&0x2000U))) && w.invalid && w.redraw && w.visible && gui_.windows.contains(w.parent) && gui_.windows.at(w.parent).visible){
         if(std::none_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& msg){return msg.window==handle && msg.message==15;})){GuiMessage msg{handle,0,0,15};msg.queue_priority=2;enqueue_gui_message(std::move(msg));}
     }
+    trace.next("timers");
     for(auto& [key,timer]:gui_.timers)if(timer.deadline<=runtime_.clock_ticks){if(std::none_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& m){return m.window==key.first && m.message==0x113 && m.wparam==key.second;})){GuiMessage msg{key.first,key.second,timer.procedure,0x113};msg.thread=timer.thread;msg.queue_priority=3;enqueue_gui_message(std::move(msg));}timer.deadline=gui_.timer_deadline(runtime_.clock_ticks+timer.interval,timer.coalescing_tolerance,key);}
     for(auto& [handle,w]:gui_.windows)if(w.header && w.header->filter_editing && w.header->filter_deadline && w.header->filter_deadline<=runtime_.clock_ticks){auto& control=*w.header;
         if(std::none_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& msg){return msg.window==handle && msg.message==0x10019 && msg.wparam==control.filter_item && msg.lparam==control.filter_generation;})){GuiMessage msg{handle,control.filter_item,control.filter_generation,0x10019};msg.thread=w.thread;msg.queue_priority=3;enqueue_gui_message(std::move(msg));}}
-    pump_mouse_tracking();
+    trace.next("mouse_tracking");pump_mouse_tracking();
+    trace.next("native_deadline");
     if (!native_gui_ || (!wait && wait_ticks==gui_native_poll_deferred)) return;
     // 宿主事件等待不得越過客體訊息計時器與排程 deadline；100 ns 為 Windows clock tick。
     auto bounded=wait?std::min(wait_ticks,UINT64_C(500000)):0;
     for(const auto& [key,timer]:gui_.timers){(void)key;bounded=std::min(bounded,timer.deadline>runtime_.clock_ticks?timer.deadline-runtime_.clock_ticks:0);}
     for(const auto& [handle,w]:gui_.windows){(void)handle;if(w.header && w.header->filter_editing && w.header->filter_deadline)bounded=std::min(bounded,w.header->filter_deadline>runtime_.clock_ticks?w.header->filter_deadline-runtime_.clock_ticks:0);}
     bounded=std::min(bounded,gui_.attention.deadline()>runtime_.clock_ticks?gui_.attention.deadline()-runtime_.clock_ticks:0);
+    trace.next("native_poll");
     const auto before=std::chrono::steady_clock::now();auto events=native_gui_->poll_for(bounded*100);
+    trace.next("retired");
     if(wait){const auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-before).count();if(elapsed>0){if(!runtime_.host_clock)runtime_.clock_ticks+=static_cast<std::uint64_t>(elapsed)/100;retired(memory,0);}}
+    trace.next("event_translation");
     for (auto msg : events) {
+        if(msg.message==0x1000d && !msg.wparam){
+            // 宿主應用失去前景沒有新的客體 HWND。先撤銷擷取與移動迴圈的世代，
+            // 再由原 owner 的執行緒派送 WM_CAPTURECHANGED，保留可重入通知契約。
+            const auto previous=gui_.capture;
+            if(previous){
+                gui_.capture=0;++gui_.capture_generation;
+                const auto owner=gui_.windows.find(previous);
+                if(owner!=gui_.windows.end()){
+                    if(gui_.sent_messages.size()>=8192)throw HostCallFault("滑鼠擷取通知佇列超過上限");
+                    GuiSentMessage request;request.message={previous,0,0,0x215};
+                    request.receiver=owner->second.thread;request.wide=owner->second.unicode;
+                    gui_.sent_messages.emplace(gui_.next_object++,std::move(request));
+                }
+            }
+            continue;
+        }
         if(msg.status_icon){if(const auto translated=gui_.status_icons.event(*msg.status_icon);translated && gui_.windows.contains(translated->owner))enqueue_gui_message({translated->owner,translated->wparam,translated->lparam,translated->message});continue;}
         msg.queue_priority=msg.message==15?2:1;
         if(msg.message==0x20a || msg.message==0x20e)dinput_mouse_wheel(static_cast<std::int16_t>(msg.wparam>>16),msg.message==0x20e);
@@ -390,7 +454,7 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
         if (gui_.queue.size() >= 10000) throw HostCallFault("GUI 訊息佇列超過上限");
         enqueue_gui_message(msg);
     }
-    pump_mouse_tracking();
+    trace.next("mouse_tracking_after");pump_mouse_tracking();
 }
 void WindowsServices::destroy_window(GuestState& state, GuestMemory& memory, std::uint64_t handle, bool default_proc) {
     auto& window = gui_.windows.at(handle);
@@ -546,6 +610,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
     const auto string = [&](std::uint64_t pointer) { return !pointer ? std::u16string{} : wide ? read_utf16(memory, GuestAddress{pointer}) : utf8_to_utf16_lossy(read_ansi(memory, pointer)); };
     const auto fail = [&](std::uint32_t code) { last_error_ = code; };
     const auto dispatch = [&](const GuiMessage& msg, Continuation continuation = Continuation::ReturnCallback, std::uint64_t value = 0) {
+        if(msg.message==15)detail::trace_gui_lifecycle("PaintDispatch",gui_,process_id(),threads_.current,msg.window);
         ++gui_.dispatched;
         if(begin_gui_text_thunk(state,memory,msg,wide,continuation,value))return;
         if((continuation==Continuation::Return || continuation==Continuation::ReturnCallback) && begin_gui_tooltip_relay(state,memory,msg,wide,continuation==Continuation::Return,value))return;
@@ -719,6 +784,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
         }
     } else if (symbol.starts_with("SendMessage") || symbol.starts_with("PostMessage")) {
         GuiMessage msg{arg(0),arg(2),arg(3),static_cast<std::uint32_t>(arg(1))};if(!msg.window)msg.thread=threads_.current;
+        if(msg.message==6 || msg.message==7 || msg.message==8 || msg.message==0x1f || msg.message==0x215)
+            detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,msg.window,(std::uint64_t{msg.message}<<32)|static_cast<std::uint32_t>(msg.lparam));
         if(symbol.starts_with("SendMessage") && route_gui_send(state,memory,msg,wide))return std::nullopt;
         if (msg.window && !gui_.windows.contains(msg.window)) fail(1400);
         else if (symbol.starts_with("PostMessage")) { if (gui_.queue.size() >= 10000) fail(1816); else { enqueue_gui_message(msg); result = 1; } }
@@ -744,6 +811,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
         else {
             auto& window = found->second;
             if (symbol == "ShowWindow") {
+                detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,handle,dword(1));
                 auto command=dword(1);
                 if(runtime_.startup_show!=UINT32_MAX && (!runtime_.startup_show_used || command==10)){command=runtime_.startup_show==10?1:runtime_.startup_show;runtime_.startup_show_used=true;}
                 else if(command==10)command=1;
@@ -771,7 +839,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                     if(size_changed && window.procedure){const auto packed=next==2?0:(window.width&65535U)|((window.height&65535U)<<16);
                         start_callbacks(state,memory,{{window.procedure,{handle,5,next==2?1U:next==3?2U:0U,packed}},{window.procedure,{handle,3,0,gui_move_lparam(window)}}},Continuation::Return,result);return std::nullopt;}
                 }
-            } else if (symbol == "DestroyWindow") { if(window.thread!=threads_.current)fail(5);else {destroy_window(state,memory,handle,false);return std::nullopt;} }
+            } else if (symbol == "DestroyWindow") { detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,handle);if(window.thread!=threads_.current)fail(5);else {destroy_window(state,memory,handle,false);return std::nullopt;} }
             else if (symbol == "UpdateWindow") {
                 result = 1;
                 if (window.invalid) { std::erase_if(gui_.queue, [&](const auto& msg) { return msg.window == handle && msg.message == 15; }); dispatch({handle, 0, 0, 15}, Continuation::Return, 1); return std::nullopt; }
@@ -848,6 +916,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                 invalidate_window(handle); if(arg(2))window.paint_erase=true; result = 1;
             }
             else if (symbol == "BeginPaint") {
+                detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,handle);
                 const unsigned unit=x86_?4U:8U;
                 memory.write(GuestAddress{arg(1)}, std::vector<std::uint8_t>(x86_?64:72)); memory.store(GuestAddress{arg(1)}, x86_?32:64, dc_base + handle);
                 memory.store(GuestAddress{arg(1)+unit},32,1);memory.store(GuestAddress{arg(1)+unit+12},32,window.width);memory.store(GuestAddress{arg(1)+unit+16},32,window.height);
@@ -856,6 +925,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                 gui_.contexts[dc_base+handle].clipped=false;gui_.contexts[dc_base+handle].excluded.clear();gui_.contexts[dc_base+handle].application_clip.reset();gui_.contexts[dc_base+handle].meta_clip.reset();
                 std::erase_if(gui_.queue, [&](const auto& msg) { return msg.window == handle && msg.message == 15; }); result = dc_base + handle;
             } else if (symbol == "EndPaint") {
+                detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,handle);
                 memory.check(GuestAddress{arg(1)}, x86_?64:72, Access::Read);
                 if (memory.load(GuestAddress{arg(1)}, x86_?32:64) != dc_base + handle) throw HostCallFault("EndPaint 的 PAINTSTRUCT 不符合視窗");
                 if (native_gui_) present_native_window(handle, window); ++gui_.paints; result = 1;

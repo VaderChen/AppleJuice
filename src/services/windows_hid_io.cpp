@@ -1,12 +1,17 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_raw_input.hpp"
 #include "x64arm/windows_security_attributes.hpp"
+#include "x64arm/security_access.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
 
 namespace x64arm {
 namespace {
-std::u16string folded(std::u16string_view text){std::u16string out(text);for(auto& c:out)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);return out;}
+std::u16string folded(std::u16string_view text){
+    std::u16string out(text);for(auto& c:out)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
+    // 裝置介面與 NT 檔案轉接的 DOS 裝置寫法指向同一個 collection。
+    if(out.starts_with(u"\\\\.\\"))out[2]=u'?';return out;
+}
 }
 bool hid_path(std::u16string_view text){return folded(text).starts_with(u"\\\\?\\hid#macwin_");}
 std::optional<std::uint32_t> WindowsServices::open_hid(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service,const std::u16string& path,const FileOpenArguments* arguments){
@@ -14,7 +19,8 @@ std::optional<std::uint32_t> WindowsServices::open_hid(GuestState& state,GuestMe
     const auto fail=[&](std::uint32_t error){last_error_=error;};
     try {
         const auto security=synchronization_security(memory,arg(3),x86_);
-        if(d(4)!=3 || arg(6) || (d(1)&~0xc0000003U) || (d(2)&~3U) || (d(5)&~0x40000080U))fail(87);
+        const auto access=x64arm::security::mapped_access(d(1),{0x120089U,0x120116U,0x1200a0U,0x1f01ffU});
+        if(d(4)!=3 || arg(6) || (access&~0x1f01ffU) || (d(2)&~7U) || (d(5)&~0x40000080U))fail(87);
         else if(security.error)fail(security.error);
         else if(!runtime_.network.external_io)fail(50);
         else if(files_.size()>=1024)fail(4);
@@ -24,11 +30,11 @@ std::optional<std::uint32_t> WindowsServices::open_hid(GuestState& state,GuestMe
             if(found==raw_input_->devices.end())fail(2);
             else if(found->second.preparsed.empty())fail(50);
             else {
-                const auto category=[](std::uint32_t access){return ((access&0x80000001U)?1U:0U)|((access&0x40000002U)?2U:0U);};
-                const bool conflict=std::any_of(files_.begin(),files_.end(),[&](const auto& item){return item.second.hid && item.second.hid->device.instance==found->second.device.instance && ((category(d(1))&~item.second.sharing) || (category(item.second.access)&~d(2)));});
+                const auto category=[](std::uint32_t rights){return ((rights&0x80000001U)?1U:0U)|((rights&0x40000002U)?2U:0U)|((rights&0x10000U)?4U:0U);};
+                const bool conflict=std::any_of(files_.begin(),files_.end(),[&](const auto& item){return item.second.hid && item.second.hid->device.instance==found->second.device.instance && ((category(access)&~item.second.sharing) || (category(item.second.access)&~d(2)));});
                 if(conflict)fail(32);
                 else {FileHandle file;file.hid=std::make_shared<HidFile>();file.hid->device=found->second.device;file.hid->backend=input_backend();file.hid->layout=hid::decode(found->second.preparsed);
-                    file.bytes=std::make_shared<const std::vector<std::uint8_t>>();file.key=utf16_to_utf8(found->second.name);file.path=file.key;file.access=d(1);file.sharing=d(2);file.mode=(d(5)&0x40000000U)?0U:0x20U;
+                    file.bytes=std::make_shared<const std::vector<std::uint8_t>>();file.key=utf16_to_utf8(found->second.name);file.path=file.key;file.access=access;file.sharing=d(2);file.mode=(d(5)&0x40000000U)?0U:0x20U;
                     const auto handle=runtime_.allocate_wait_handle();file.object=handle;files_.emplace(handle,std::move(file));runtime_.handle_flags[handle]=security.inherit?1U:0U;result=handle;}
             }
         }

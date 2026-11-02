@@ -19,6 +19,7 @@ std::uint32_t WindowsServices::file_io_status(std::uint32_t error) {
     case 6: return 0xc0000008;
     case 13: return 0xc000003e;
     case 19: return 0xc00000a2;
+    case 31: return 0xc0000001;
     case 112: return 0xc000007f;
     case 154: return 0xc0000086;
     case 4390: return 0xc0000275;

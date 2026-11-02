@@ -137,16 +137,22 @@ struct MetalPassSpec {
 // 池只保留 MTLBuffer，不保留 GPU 額度：入池即釋放額度（否則 Steam GPU 程序 256 MiB 額度會被池吃掉 64 MiB），
 // 取用時重新保留，失敗就改走一般配置。X64ARM_METAL_DISCARD_POOL=0 關閉就地寫入與回收池，回到每次更換新 buffer。
 bool metal_discard_pool_enabled(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_DISCARD_POOL");return !text || std::string_view(text)!="0";}();return value;}
+// 取用／歸還可能同時發生在協調者（CreateBuffer／Release 釋放身分）與 Metal 命令執行緒（在途退役釋放最後一個持有者），以 mutex 保護。
 struct MetalBufferPool {
-    std::multimap<std::size_t,id<MTLBuffer>> free;std::size_t bytes{};std::uint64_t hits{},puts{},drops{};
+    std::mutex mutex;
+    std::multimap<std::size_t,id<MTLBuffer>> free;std::size_t bytes{};std::uint64_t hits{},misses{},puts{},drops{};
     static constexpr std::size_t limit=64U<<20;
-    id<MTLBuffer> take(std::size_t length){auto it=free.find(length);if(it==free.end())return nil;auto buffer=it->second;free.erase(it);bytes-=length;++hits;return buffer;}
+    id<MTLBuffer> take(std::size_t length){const std::lock_guard lock(mutex);auto it=free.find(length);if(it==free.end()){++misses;return nil;}auto buffer=it->second;free.erase(it);bytes-=length;++hits;return buffer;}
     void put(id<MTLBuffer> buffer){
-        const auto length=static_cast<std::size_t>(buffer.length);
+        const auto length=static_cast<std::size_t>(buffer.length);const std::lock_guard lock(mutex);
         if(!length || bytes+length>limit){++drops;return;}
         free.emplace(length,buffer);bytes+=length;++puts;
     }
+    std::string statistics(){const std::lock_guard lock(mutex);return " metal_buffer_pool_hits="+std::to_string(hits)+" metal_buffer_pool_misses="+std::to_string(misses)+" metal_buffer_pool_puts="+std::to_string(puts)+" metal_buffer_pool_drops="+std::to_string(drops)+" metal_buffer_pool_bytes="+std::to_string(bytes)+" metal_buffer_pool_entries="+std::to_string(free.size());}
 };
+// CreateBuffer 建立的緩衝釋放後也交回同一個池，下一次同長度（頁對齊後）的 CreateBuffer 直接取用並清零，省掉 IOGPU 配置與釋放
+// （雙人成行每幀約 40 次 CreateBuffer／Release，協調者約 5% 時間在 IOGPUResourceCreate／Finalize）。X64ARM_METAL_CREATE_POOL=0 關閉。
+bool metal_create_pool_enabled(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_CREATE_POOL");return (!text || std::string_view(text)!="0") && metal_discard_pool_enabled() && !metal_backing_generation_enabled();}();return value;}
 class MetalPendingObjects {
     static bool indexed(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_RESOURCE_INDEX");return !text || std::string_view(text)!="0";}();return value;}
     static std::uint64_t next_batch() noexcept {static std::atomic<std::uint64_t> next{0};return next.fetch_add(1,std::memory_order_relaxed)+1;}

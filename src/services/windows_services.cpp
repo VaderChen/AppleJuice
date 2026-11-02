@@ -75,6 +75,12 @@ void WindowsServices::dump_service_counts() {
     };
     dump("boundary",service_counts_);
     {std::lock_guard lock(*worker_service_counts_mutex_);dump("worker",worker_service_counts_);}
+    {const auto& s=detail::ParallelMappingLock::stats();
+        std::fprintf(out,"[service_counts] mapping_lock writer_locks=%llu writer_hold_ns=%llu writer_drain_ns=%llu reader_waits=%llu reader_wait_ns=%llu reader_yields=%llu\n",
+            static_cast<unsigned long long>(s.writer_locks.load()),static_cast<unsigned long long>(s.writer_hold_ns.load()),static_cast<unsigned long long>(s.writer_drain_ns.load()),
+            static_cast<unsigned long long>(s.reader_waits.load()),static_cast<unsigned long long>(s.reader_wait_ns.load()),static_cast<unsigned long long>(s.reader_yields.load()));}
+    std::fprintf(out,"[service_counts] resolve_waits calls=%llu skipped=%llu changed=%llu\n",static_cast<unsigned long long>(resolve_wait_stats_.calls),
+        static_cast<unsigned long long>(resolve_wait_stats_.skipped),static_cast<unsigned long long>(resolve_wait_stats_.changed));
     if(out!=stderr){std::fclose(out);std::rename(path.c_str(),path.substr(0,path.size()-4).c_str());}
 }
 WindowsServices::~WindowsServices(){service_callback::clear(this);if(service_counts_enabled_)dump_service_counts();report_guard_statistics();while(!policy_sections_.empty())discard_policy_thread(policy_sections_.begin()->second.thread);release_url_cache();
@@ -395,6 +401,15 @@ constexpr std::array<std::uint8_t,0x90> guard_fast_code_two_way{
     0x00,0x00,0x4f,0x8d,0x1c,0xd3,0x49,0x39,0x03,0x74,0x06,0x49,0x39,0x43,0x08,0x75,
     0x02,0xff,0xe0,0xff,0x25,0x0f,0x00,0x00,0x00,0xcc,0xcc,0xcc,0xcc,0xcc,0xcc,0xcc,
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+// x86 的 GuardCFCheckFunctionPointer 以 ECX 傳目標；未命中回到同一完整檢查。
+// 組語來源：tests/tools/cfg_guard_x86.S。保留 EAX、EDX、ECX、EFLAGS 與返回堆疊；
+// 每槽同時核對高 32 位為零，空表的 UINT64_MAX 不會誤認成合法 x86 目標。
+constexpr std::array<std::uint8_t,0x49> guard_fast_code_x86{
+    0x9c,0x50,0x52,0x89,0xc8,0xc1,0xe8,0x04,0x89,0xca,0xc1,0xea,0x14,0x31,0xd0,0x25,
+    0xfe,0x0f,0x00,0x00,0x39,0x0c,0xc5,0x44,0x33,0x22,0x11,0x75,0x0c,0x83,0x3c,0xc5,
+    0x48,0x33,0x22,0x11,0x00,0x75,0x02,0xeb,0x13,0x39,0x0c,0xc5,0x4c,0x33,0x22,0x11,
+    0x75,0x0e,0x83,0x3c,0xc5,0x50,0x33,0x22,0x11,0x00,0x75,0x04,0x5a,0x58,0x9d,0xc3,
+    0x5a,0x58,0x9d,0xff,0x25,0x88,0x77,0x66,0x55};
 bool guard_two_way() noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_CFG_GUARD_WAYS");return !setting || std::string_view(setting)!="1";}();
     return enabled;
@@ -436,6 +451,12 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
     const auto& processor=native_processor_information();
     memory.set_processor_identity({processor.name,processor.nominal_mhz,processor.maximum_mhz,0});
     const auto layout=windows_address_layout::for_mode(memory.execution_mode());
+    // 保留完整的 provider／gateway 位址空間，包含尚未載入模組的空洞。
+    // 只建立虛擬保留，實際 backing 仍隨模組載入；heap、stack、VirtualAlloc 共用此保留表。
+    if(!memory.range_available(GuestAddress{layout.images},windows_address_layout::reserved_capacity))
+        throw std::invalid_argument("程式映像占用 Windows provider 保留位址");
+    runtime_.virtual_regions.emplace(layout.images,VirtualRegion{windows_address_layout::reserved_capacity,1U});
+    memory.reserve_virtual_range(GuestAddress{layout.images},windows_address_layout::reserved_capacity);
     unresolved_base_=GuestAddress{layout.unresolved};stub_base_=GuestAddress{layout.services};
     callback_return_=GuestAddress{layout.callbacks};startup_entry_=GuestAddress{layout.callbacks+0x10};exception_entry_=GuestAddress{layout.callbacks+0x20};
     thread_return_=GuestAddress{layout.callbacks+0x30};thread_start_=GuestAddress{layout.callbacks+0x40};process_exit_retry_=GuestAddress{layout.callbacks+0x50};
@@ -462,7 +483,13 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
         for(std::size_t n=0;n<size;n+=2){bytes[n]=0x0f;bytes[n+1]=0x0b;}
         // SYSENTER 返回固定入口的真正 RET；與 gateway 一次建立可執行映射，
         // 不用唯讀資料更新接口修改程式碼，返回位址仍由 CPU 做權限／故障檢查。
-        if(x86_ && base==callback_return_ && size>0xf0)bytes[0xf0]=0xc3;
+        if(x86_ && base==callback_return_ && size>=0x100){
+            bytes[0xf0]=0xc3;
+            // 由可複製的 NT 入口 CALL 進來，EDX 指向返回框架；參數在 EDX+8。
+            // CPU SYSENTER 沿用共用 NT 派送、等待、回呼與暫借堆疊恢復契約。
+            const std::array<std::uint8_t,5> transition{0x8b,0xd4,0x0f,0x34,0xc3};
+            std::copy(transition.begin(),transition.end(),bytes.begin()+0xf8);
+        }
         memory.map(base,size,read_execute,bytes);
     };
     {startup_profile::Scope gateways("services","gateways",true);
@@ -576,16 +603,28 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
         // 在載入初始化時完成配置，不在執行中改寫已被轉譯器當成常數的 CFG cell。
         static const int guard_setting=[] {const auto* setting=std::getenv("X64ARM_CFG_FAST_PATH");return setting?(std::string_view(setting)=="1"?1:0):-1;}();
         const bool guard_fast_path=guard_setting>=0?guard_setting==1:resident_translation;
-        if(!x86_ && trace_services_.empty() && guard_fast_path){
+        if(trace_services_.empty() && guard_fast_path){
             // CFG 檢查／dispatch 的客體快速路徑：以已驗證目標表避免每次間接呼叫都離開 JIT 進入服務分派。
             // 未命中仍跳到原服務 stub 做完整檢查並填表；映射撤銷或權限變更後整表清空（refresh_guard_table）。
             std::vector<std::uint8_t> code(GuestMemory::guest_page_size,0xcc);
-            if(guard_two_way())std::copy(guard_fast_code_two_way.begin(),guard_fast_code_two_way.end(),code.begin());
+            if(x86_)std::copy(guard_fast_code_x86.begin(),guard_fast_code_x86.end(),code.begin());
+            else if(guard_two_way())std::copy(guard_fast_code_two_way.begin(),guard_fast_code_two_way.end(),code.begin());
             else std::copy(guard_fast_code.begin(),guard_fast_code.end(),code.begin());
             guard_fast_code_=GuestAddress{callback_return_.value+guard_code_page_offset};
             guard_fast_table_=GuestAddress{callback_return_.value+guard_table_page_offset};
-            const auto patch=[&](std::size_t at,std::uint64_t value){for(unsigned n=0;n<8;++n)code[at+n]=static_cast<std::uint8_t>(value>>(8*n));};
-            patch(guard_check_table_slot,guard_fast_table_.value);patch(guard_dispatch_table_slot,guard_fast_table_.value);
+            const auto patch=[&](std::size_t at,std::uint64_t value,unsigned width=8){for(unsigned n=0;n<width;++n)code[at+n]=static_cast<std::uint8_t>(value>>(8*n));};
+            if(x86_){
+                for(const auto& [at,offset]:std::array<std::pair<unsigned,unsigned>,4>{{{0x17,0},{0x20,4},{0x2c,8},{0x35,12}}})
+                    patch(at,guard_fast_table_.value+offset,4);
+                patch(0x45,guard_fast_code_.value+guard_slow_check_cell,4);
+                if(!guard_two_way()){
+                    patch(0x10,guard_table_entries-1,4);
+                    // 單路模式在第一槽不符時直接走 slow，不讀表尾之外的第二槽。
+                    code[0x1c]=0x40-0x1d;code[0x26]=0x40-0x27;
+                }
+            }else{
+                patch(guard_check_table_slot,guard_fast_table_.value);patch(guard_dispatch_table_slot,guard_fast_table_.value);
+            }
             patch(guard_slow_check_cell,callback_return_.value+0x60);patch(guard_slow_dispatch_cell,callback_return_.value+0x70);
             memory.map(guard_fast_code_,GuestMemory::guest_page_size,read_execute,code);
             // 空項為全 1（非正規位址），不會與任何合法目標相等。
@@ -872,9 +911,9 @@ void WindowsServices::complete_call(GuestState& state, GuestMemory& memory, std:
 void WindowsServices::install_guard(GuestMemory& memory, const RuntimeImage& image) {
     if(!image.guard_cf)return;
     // GetProcessMitigationPolicy 的 EnableXfg 維持關閉；所有相容入口仍做實際 CFG 檢查。
-    // x64 指向客體快速路徑（已驗證目標直接通過，其餘仍由宿主完整檢查）；x86 或追蹤時直接指向服務 stub。
+    // 已驗證目標走客體快速路徑；追蹤或未啟用時保留完整服務 stub。
     const auto check=guard_fast_code_.value?guard_fast_code_.value:callback_return_.value+0x60;
-    const auto dispatch=guard_fast_code_.value?guard_fast_code_.value+0x40:callback_return_.value+0x70;
+    const auto dispatch=guard_fast_code_.value && !x86_?guard_fast_code_.value+0x40:callback_return_.value+0x70;
     for(const auto& [cell,target]:std::array<std::pair<std::uint64_t,std::uint64_t>,5>{{{image.guard_check_cell,check},{image.guard_dispatch_cell,dispatch},{image.guard_xfg_check_cell,check},{image.guard_xfg_dispatch_cell,dispatch},{image.guard_xfg_table_dispatch_cell,dispatch}}}){
         if(!cell)continue;const unsigned unit=x86_?4U:8U;std::array<std::uint8_t,8> data{};for(unsigned n=0;n<unit;++n)data[n]=static_cast<std::uint8_t>(target>>(n*8));
         // 與 IAT 一樣只在新映像初始化期間寫入；保留唯讀頁的穩定性，
@@ -973,6 +1012,7 @@ bool WindowsServices::same_state(const WindowsServices& other) const {
     if(demangle_ || other.demangle_)return false; // 客體配置回呼含共用可變狀態。
     if(device_configuration_ || other.device_configuration_)return false; // 原生裝置快照與 SetupAPI 集合不可假設為 deterministic 複本。
     if(bluetooth_ || other.bluetooth_)return false; // 原生請求、訂閱與 GATT 快取含外部生命週期。
+    if(wlan_ || other.wlan_ || wlan_backend_ || other.wlan_backend_)return false; // WLAN 工作與通知含外部生命週期，不能視為可複製狀態。
     if(machine_shutdown_ || other.machine_shutdown_)return false; // 共用關機狀態不可作 deterministic 分支等價比較。
     if(std::any_of(consoles_.begin(),consoles_.end(),[](const auto& console){return console!=nullptr;}) ||
        std::any_of(other.consoles_.begin(),other.consoles_.end(),[](const auto& console){return console!=nullptr;}))return false;
@@ -1507,6 +1547,18 @@ bool plain_local_service(const WindowsServiceDescriptor& descriptor) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_LOCAL_PLAIN_SERVICE");return !value || std::string_view(value)!="0";}();
     if(!enabled)return false;
     const auto family=descriptor.family;const auto symbol=descriptor.symbol;
+    // 純查詢／轉換：只讀參數、程序或 GUI 狀態並寫回參數緩衝區與 LastError，不啟動回呼、不阻塞、不改映射。雙人成行操作中
+    // 遊戲執行緒每幀各呼叫數次（WideCharToMultiByte 每秒約 420 次、GlobalMemoryStatusEx 與 GetForegroundWindow 等每幀一次），
+    // 原本每次全停 10～215 µs（操作中全停合計少 18%、渲染執行緒少停約 2.8%）。例外一律由 run_plain_local 還原後交回完整路徑。
+    // X64ARM_LOCAL_PURE=0 關閉。
+    static const bool pure=[] {const auto* value=std::getenv("X64ARM_LOCAL_PURE");return !value || std::string_view(value)!="0";}();
+    if(pure){
+        if(family=="kernel32.dll" && (symbol=="WideCharToMultiByte" || symbol=="MultiByteToWideChar" || symbol=="GetCurrentProcessId" ||
+           symbol=="GetSystemTime" || symbol=="GetLocalTime" || symbol=="GlobalMemoryStatusEx" || symbol=="K32GetProcessMemoryInfo"))return true;
+        if(family=="psapi.dll" && symbol=="GetProcessMemoryInfo")return true;
+        if(family=="user32.dll" && (symbol=="GetForegroundWindow" || symbol=="GetWindowThreadProcessId" || symbol=="GetSystemMetrics"))return true;
+        if(family=="crt" && (symbol=="_difftime64" || symbol=="_difftime32" || symbol=="difftime"))return true;
+    }
     if(family=="crt"){
         // 數值轉換、浮點分解、亂數，以及寫入緩衝區的格式化（不含寫檔案串流的 printf／fprintf）。
         static constexpr std::string_view names[]{"rand","srand","atof","_wtof","strtod","wcstod","strtof","wcstof",
@@ -1587,6 +1639,8 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     static const bool local_mapping=[] {const auto* value=std::getenv("X64ARM_LOCAL_MAPPING_SERVICE");return !value || std::string_view(value)!="0";}();
     if(!x86_ && (state.rip.value==callback_return_.value+0x60 || state.rip.value==callback_return_.value+0x70)){
         if(!local_cfg)return false;
+        // 暫借目前執行緒身分與還原都須在鎖內；worker 依此選取活體 TLS／FLS。
+        const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
         const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
         if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
         const auto previous=threads_.current;
@@ -1608,6 +1662,12 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         // PeekMessage 取出 WM_QUEUESYNC 後才執行 CBT hook，已有 CBT hook 時留在完整路徑。
         if(symbol.starts_with("PeekMessage") &&
            std::any_of(gui_.hooks.begin(),gui_.hooks.end(),[](const auto& item){return item.second.type==5;}))return false;
+        // 會抽取宿主事件的 GUI 服務先在不持獨占映射鎖時向 Cocoa 抽取（nextEventMatchingMask 每次約 40 µs；原本在持鎖的 pump_gui 內
+        // 執行，期間 worker 上的 D3D11 服務全在讀鎖讓出——雙人成行協調者每秒約 600 次 PeekMessage，占持鎖時間約四分之一）。
+        // 持鎖後 pump_gui 的 poll_for(0) 直接取用已抽到的事件；協調者即宿主主執行緒，AppKit 只在此執行緒使用。X64ARM_GUI_PREFETCH=0 關閉。
+        static const bool prefetch_gui=[] {const auto* value=std::getenv("X64ARM_GUI_PREFETCH");return !value || std::string_view(value)!="0";}();
+        if(prefetch_gui && native_gui_ && (symbol.starts_with("PeekMessage") || symbol.starts_with("GetMessage") || symbol.starts_with("MsgWaitForMultipleObjects") ||
+           symbol=="WaitMessage" || symbol=="GetQueueStatus" || symbol=="GetAsyncKeyState" || symbol=="GetLastInputInfo"))native_gui_->prefetch_events();
         const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
         const GuestAddress error_slot{state.gs_base+0x68};
         const auto entry_error=static_cast<std::uint32_t>(memory.load(error_slot,32));
@@ -1674,6 +1734,7 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         } restore{*this,previous,key,saved_error};
         threads_.current=key;last_error_=entry_error;
         entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,descriptor.symbol);
+        struct CoordinatorLocal {~CoordinatorLocal(){graphics_coordinator_local()=false;}} coordinator_local;graphics_coordinator_local()=true;
         const auto result=invoke_runtime(state,memory,descriptor);
         if(result)throw std::logic_error("D3D11 本地協調服務意外終止客體");
         if(last_error_!=entry_error)memory.store(error_slot,32,last_error_);
@@ -1842,6 +1903,9 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     if(descriptor.family!="kernel32.dll" || mapping==detail::ResidentMappingService::None || !local_mapping)return false;
     if((extended || allocation2) && !(allocation2 && !state.reg(Gpr::Rcx)) &&
        !current_process_handle(state.reg(Gpr::Rcx)))return false;
+    // 先排空 worker 服務，再暫借身分；Restore 必須先於 mapping_guard 解構，
+    // 避免等待取鎖或釋放鎖後的空窗讓 worker 把 TLS／FLS 寫進另一執行緒的狀態。
+    const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
     const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
     if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
     const auto previous=threads_.current;const auto saved_error=last_error_;
@@ -1852,8 +1916,6 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     } restore{*this,previous,key,saved_error};
     threads_.current=key;last_error_=entry_error;
     entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,symbol);
-    // 區域表變更期間不得有 worker 服務查表（見 parallel_mapping_mutex）。
-    const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
     refresh_guard_table(memory);
     const auto result=invoke_process_memory(state,memory,descriptor);
     if(result)throw std::logic_error("虛擬記憶體服務意外終止客體");

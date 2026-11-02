@@ -328,7 +328,20 @@
         }
         else if(symbol=="CreateVertexShader" || symbol=="CreatePixelShader" || symbol=="CreateComputeShader" || symbol=="CreateGeometryShader" || symbol=="CreateHullShader" || symbol=="CreateDomainShader"){
             graphics_handled=true;auto device=typed(arg(0),Kind::Device);if(arg(4)){output(4);write_pointer(arg(4),0);}require(arg(2)>0 && arg(2)<=16*1024*1024);if(arg(3))require(typed(arg(3),Kind::ClassLinkage)->device==device->root);const auto stage=symbol=="CreateVertexShader"?0U:symbol=="CreatePixelShader"?1U:symbol=="CreateComputeShader"?5U:symbol=="CreateGeometryShader"?2U:symbol=="CreateHullShader"?3U:4U;
-            {const auto bytes=read_bytes(memory,arg(1),static_cast<std::size_t>(arg(2)));auto reflected=std::make_shared<dxbc::Reflection>(bytes);require(!reflected->interface_slots || arg(3));auto shader=device->native->graphics_shader(stage,bytes);if(!arg(4))result=1;else {auto id=create(stage==0?Kind::VertexShader:stage==1?Kind::PixelShader:stage==2?Kind::GeometryShader:stage==3?Kind::HullShader:stage==4?Kind::DomainShader:Kind::ComputeShader,device->root);id->shader=std::move(shader);id->reflection=std::move(reflected);if(arg(3)){bind_one(id,"ClassLinkage",arg(3));typed(arg(3),Kind::ClassLinkage)->linked_shaders.push_back(id->reflection);}write_pointer(arg(4),id->root);}}
+            {const auto bytes=read_bytes(memory,arg(1),static_cast<std::size_t>(arg(2)));auto reflected=std::make_shared<dxbc::Reflection>(bytes);require(!reflected->interface_slots || arg(3));
+                // 背景編譯：著色器尚未就緒時讓呼叫者等待（ShaderRetry），其他執行緒與協調者照常執行，完成後重新執行整個建立呼叫
+                //（命中快取）。只在常駐 AOT 多 vCPU 的完整服務路徑；worker 與協調者本地路徑不可等待（資格檢查已把未就緒者交回這裡）。
+                if(resident_execution_depth_>0 && runtime_.processor_count>1 && threads_.items.size()>1 && !graphics_local() && !graphics_coordinator_local() &&
+                   threads_.current!=present_thread_)
+                    if(const auto ticket=device->native->graphics_shader_prefetch(stage,bytes)){
+                        auto& waiter=threads_.items.at(threads_.current);waiter.status=ThreadStatus::Waiting;waiter.wait={};waiter.wait.kind=ThreadWaitKind::ShaderRetry;
+                        waiter.wait.deadline=runtime_.clock_ticks+UINT64_C(300000000); // 30 秒保底，到期仍未完成就再等一輪
+                        shader_waits_[threads_.current]={device->native,ticket};record_diagnostic("d3d11_shader_wait");
+                        static const bool trace_async=std::getenv("X64ARM_TRACE_SHADER_ASYNC")!=nullptr;
+                        if(trace_async)std::fprintf(stderr,"[shader_async] wait thread=%llu stage=%u ticket=%llx\n",static_cast<unsigned long long>(threads_.current),stage,static_cast<unsigned long long>(ticket));
+                        schedule(state,memory);return std::nullopt;
+                    }
+                auto shader=device->native->graphics_shader(stage,bytes);if(!arg(4))result=1;else {auto id=create(stage==0?Kind::VertexShader:stage==1?Kind::PixelShader:stage==2?Kind::GeometryShader:stage==3?Kind::HullShader:stage==4?Kind::DomainShader:Kind::ComputeShader,device->root);id->shader=std::move(shader);id->reflection=std::move(reflected);if(arg(3)){bind_one(id,"ClassLinkage",arg(3));typed(arg(3),Kind::ClassLinkage)->linked_shaders.push_back(id->reflection);}write_pointer(arg(4),id->root);}}
         }else if(symbol=="CreateInputLayout"){
             graphics_handled=true;auto device=typed(arg(0),Kind::Device);if(arg(5)){output(5);write_pointer(arg(5),0);}require(u32(2)<=32 && arg(4)<=16*1024*1024);const dxbc::Reflection signature(read_bytes(memory,arg(3),static_cast<std::size_t>(arg(4))));std::vector<GraphicsElement> elements;std::array<std::uint32_t,32> ends{};
             for(unsigned i=0;i<u32(2);++i){const auto at=arg(1)+i*(x86_?28:32);GraphicsElement e;e.semantic=read_ansi(memory,memory.load(GuestAddress{at},pointer_bits));const auto fields=bytes32(at+pointer_size,6);e.index=fields[0];e.format=fields[1];e.slot=fields[2];e.offset=fields[3];e.classification=fields[4];e.step=fields[5];require(e.slot<32 && e.classification<2 && (!e.classification || e.step) && device->native->graphics_vertex_format_supported(e.format));if(e.offset==UINT32_MAX)e.offset=ends[e.slot];ends[e.slot]=e.offset+graphics_format_bytes(e.format);elements.push_back(e);}

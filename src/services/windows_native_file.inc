@@ -44,10 +44,20 @@ std::pair<std::uint64_t,bool> WindowsServices::native_file_entry(GuestMemory& me
     const auto name=image->export_names.find(std::string(symbol));
     if(name==image->export_names.end())throw HostCallFault("缺少 Native 檔案入口");
     const auto target=native+image->export_ordinals.at(name->second),gateway=resolve("ntdll.dll",symbol).value;
-    std::array<std::uint8_t,16> expected{},actual{};
-    const auto put=[&](unsigned at,unsigned size,std::uint64_t value){for(unsigned j=0;j<size;++j)expected[at+j]=static_cast<std::uint8_t>(value>>(j*8));};
-    if(x86_){expected[0]=0xff;expected[1]=0x25;put(2,4,target+6);put(6,4,gateway);}
-    else{expected={0x4c,0x8b,0xd1,0xb8,0,0,0,0,0x0f,0x05,0xc3,0x66,0x66,0x90,0x66,0x90};put(4,4,(gateway-stub_base_.value)/16+1);}
+    std::uint16_t stack_bytes{};
+    if(x86_){
+        static const auto stack_sizes=[] {
+            std::map<std::string_view,std::uint16_t> result;
+            for(const auto& service:runtime_service_descriptors())if(service.family=="ntdll.dll")
+                result.emplace(service.symbol,detail::nt_entry_stack_bytes(service));
+            return result;
+        }();
+        const auto service=stack_sizes.find(symbol);
+        if(service==stack_sizes.end())throw HostCallFault("缺少 Native 檔案入口描述元");
+        stack_bytes=service->second;
+    }
+    const auto expected=detail::nt_service_entry(x86_,static_cast<std::uint32_t>((gateway-stub_base_.value)/16+1),stack_bytes,callback_return_.value+0xf8);
+    std::array<std::uint8_t,16> actual{};
     memory.read(GuestAddress{target},actual);return {target,actual!=expected};
 }
 

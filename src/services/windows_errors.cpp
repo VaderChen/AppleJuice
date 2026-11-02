@@ -99,6 +99,8 @@ std::string_view system_message(std::uint32_t code) {
 }
 std::u16string format_message(const GuestMemory& memory,std::u16string_view text,std::uint64_t arguments,bool array,bool wide,bool ignore) {
     std::u16string result;
+    const unsigned unit=memory.execution_mode()==ExecutionMode::X86?4U:8U;
+    const auto bits=static_cast<std::uint8_t>(unit*8);
     for (std::size_t i=0;i<text.size();++i) {
         if (result.size()>65535) throw std::length_error("訊息過長");
         if (text[i]!='%' || i+1==text.size()) {result+=text[i];continue;}
@@ -114,8 +116,9 @@ std::u16string format_message(const GuestMemory& memory,std::u16string_view text
             }
             if (ignore) {result+=text.substr(begin,i-begin+1);continue;}
             if (!arguments) throw std::invalid_argument("缺少訊息插入參數");
-            const auto base=array?arguments:memory.load(GuestAddress{arguments},64);
-            const auto value=memory.load(GuestAddress{base+(index-1)*8U},64);
+            const auto base=array?arguments:memory.load(GuestAddress{arguments},bits);
+            const auto address=base+(index-1)*unit;
+            auto value=memory.load(GuestAddress{address},bits);
             if (pattern==u"s" || pattern==u"ls" || pattern==u"ws" || pattern==u"hs") {
                 const bool utf16=pattern==u"ls" || pattern==u"ws" || (wide && pattern!=u"hs");
                 result+=utf16?read_utf16(memory,GuestAddress{value}):utf8_to_utf16(read_ansi(memory,value));
@@ -125,6 +128,9 @@ std::u16string format_message(const GuestMemory& memory,std::u16string_view text
                 pattern.pop_back();bool long64=false;
                 if (pattern.ends_with(u"I64")) {long64=true;pattern.resize(pattern.size()-3);}
                 else if (pattern.ends_with(u"l")) pattern.pop_back();
+                // ARGUMENT_ARRAY 是 DWORD_PTR 陣列；I64 只能由 va_list 提供。
+                // Win32 的 I64 佔兩個連續 32-bit slots，不將一般指標或整數讀成 64-bit。
+                if(long64){if(array)throw std::invalid_argument("I64 訊息插入需要 va_list");value=memory.load(GuestAddress{address},64);}
                 const bool zero=!pattern.empty() && pattern[0]=='0';unsigned width=0;
                 for (const auto digit:pattern) {if (digit<'0' || digit>'9' || width>6553) throw std::invalid_argument("訊息欄寬無效");width=width*10+static_cast<unsigned>(digit-'0');}
                 auto magnitude=long64?value:static_cast<std::uint32_t>(value);bool negative=false;
@@ -268,9 +274,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,Gue
                 const auto length=bytes.size()/(wide?2:1)-1;
                 if (bytes.size()>131072) fail(234);
                 else if (flags&0x100) {
-                    memory.check(GuestAddress{arg(4)},8,Access::Write);
-                    const auto allocation=allocate_heap(memory,std::max<std::uint64_t>(bytes.size(),static_cast<std::uint32_t>(arg(5))*(wide?2ULL:1ULL)));
-                    if (!allocation) fail(8);else {memory.write(GuestAddress{allocation},bytes);runtime_.local_allocations.insert(allocation);memory.store(GuestAddress{arg(4)},64,allocation);result=length;}
+                    const auto bits=static_cast<std::uint8_t>(x86_?32:64);
+                    memory.check(GuestAddress{arg(4)},x86_?4:8,Access::Write);
+                    // 與 LocalAlloc 共用 fixed block，讓 LocalSize／LocalFree 使用相同物件生命週期。
+                    const auto allocation=allocate_gui_global(memory,std::max<std::uint64_t>(bytes.size(),static_cast<std::uint32_t>(arg(5))*(wide?2ULL:1ULL)),0);
+                    if (!allocation) fail(8);else {memory.write(GuestAddress{allocation},bytes);memory.store(GuestAddress{arg(4)},bits,allocation);result=length;}
                 } else if (static_cast<std::uint32_t>(arg(5))<=length) fail(122);
                 else {memory.write(GuestAddress{arg(4)},bytes);result=length;}
             } catch (const std::invalid_argument&) {fail(87);} catch (const std::length_error&) {fail(234);}

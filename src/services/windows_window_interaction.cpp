@@ -1,13 +1,34 @@
 #include "x64arm/windows_services.hpp"
+#include "gui_lifecycle_trace.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include <algorithm>
 #include <bit>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace x64arm {
 namespace {
 std::uint64_t xy(std::int64_t x,std::int64_t y){return (static_cast<std::uint64_t>(x)&65535U)|((static_cast<std::uint64_t>(y)&65535U)<<16);}
 std::int32_t integer(std::uint64_t value){return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(value));}
 bool button_down(unsigned message){return message==0x201 || message==0x203 || message==0x204 || message==0x206 || message==0x207 || message==0x209 || message==0x20b || message==0x20d;}
+void trace_mouse_pipeline(const char* stage,std::uint64_t process,std::uint64_t id,std::uint64_t thread,const GuiMouseInput& input) {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_TRACE_MOUSE_PIPELINE");return value && *value && std::string_view(value)!="0";}();
+    if(!enabled)return;
+    const auto wall=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::fprintf(stderr,"[mouse-pipeline] stage=%s unix_us=%lld guest_pid=%llu id=%llu thread=%llu hwnd=%llx message=%x phase=%u input_order=%llu\n",
+        stage,static_cast<long long>(wall),static_cast<unsigned long long>(process),static_cast<unsigned long long>(id),static_cast<unsigned long long>(thread),
+        static_cast<unsigned long long>(input.message.window),input.message.message,static_cast<unsigned>(input.stage),
+        static_cast<unsigned long long>(input.message.input_order));
+}
+void trace_move_size(const char* stage,std::uint64_t id,std::uint64_t thread,std::uint64_t window,
+                     std::uint64_t capture,std::uint64_t generation,std::uint64_t expected,unsigned phase,std::uint64_t value) {
+    static const bool enabled=std::getenv("X64ARM_TRACE_NATIVE_POINTER")!=nullptr;if(!enabled)return;
+    const auto wall=std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::fprintf(stderr,"[move-size] stage=%s unix_time=%.9f id=%llu thread=%llu hwnd=%llx capture=%llx generation=%llu expected=%llu phase=%u value=%llx\n",
+        stage,wall,static_cast<unsigned long long>(id),static_cast<unsigned long long>(thread),static_cast<unsigned long long>(window),static_cast<unsigned long long>(capture),
+        static_cast<unsigned long long>(generation),static_cast<unsigned long long>(expected),phase,static_cast<unsigned long long>(value));
+}
 }
 std::span<const WindowsServiceDescriptor> gui_move_size_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{{"internal-window-interaction","ReadMessage",4}};return table;
@@ -31,6 +52,7 @@ void WindowsServices::raise_gui_window(std::uint64_t handle){
     if(native_gui_)for(auto it=group.rbegin();it!=group.rend();++it)native_gui_->reorder(*it,0);
 }
 std::vector<GuestCallback> WindowsServices::activate_gui_window(std::uint64_t handle,bool mouse,bool native){
+    detail::trace_gui_lifecycle("activate",gui_,process_id(),threads_.current,handle,(mouse?1U:0U)|(native?2U:0U));
     std::vector<GuestCallback> callbacks;const auto previous=gui_.active;
     gui_.active=handle;poll_desktop_notifications();
     for(auto owner=handle,depth=UINT64_C(0);owner && depth<64;++depth){const auto entry=gui_.windows.find(owner);if(entry==gui_.windows.end() || entry->second.parent)break;entry->second.last_active_popup=handle;owner=entry->second.owner;}
@@ -49,7 +71,6 @@ std::vector<GuestCallback> WindowsServices::activate_gui_window(std::uint64_t ha
 }
 void WindowsServices::queue_gui_mouse(GuiMessage message,bool native_activation){
     const auto target=gui_.windows.find(message.window);if(target==gui_.windows.end())return;
-    if(gui_.mouse_inputs.size()>=10000)throw HostCallFault("待處理滑鼠輸入超過上限");
     if(message.queue_priority==1 && !message.input_order)message.input_order=gui_.next_input_order++;
     if(!message.injected)message.queued_time=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
     if(!native_activation){
@@ -66,8 +87,25 @@ void WindowsServices::queue_gui_mouse(GuiMessage message,bool native_activation)
         }
         message.has_point=true;message.screen_point=true;message.queued_cursor=message.point;gui_.pointer_position=message.point;
     }
+    // 原生及 SendInput 共用尚未派送的移動槽。Windows 在取訊息時才為最新位置做
+    // 命中測試；逐筆回放舊座標會讓拖曳、hover 與後續按鈕事件排在過時輸入後面。
+    // 只合併相鄰且狀態相同的移動，保留鍵盤／按鈕邊界、來源與額外資訊；已進入
+    // 回呼或已由 PeekMessage 具體化到 gui_.queue 的訊息，均不在此覆寫。
+    if(!native_activation && message.message==0x200 && !message.mouse_no_coalesce && message.input_order && !gui_.mouse_inputs.empty()){
+        auto& previous=gui_.mouse_inputs.rbegin()->second;const auto& older=previous.message;
+        if(!previous.active && !previous.native_activation && previous.thread==target->second.thread &&
+           older.message==message.message && older.window==message.window && !older.mouse_no_coalesce &&
+           older.input_order+1==message.input_order && older.injected==message.injected &&
+           older.wparam==message.wparam && older.modifiers==message.modifiers &&
+           older.keyboard_snapshot==message.keyboard_snapshot && older.input_extra==message.input_extra){
+            previous.message=std::move(message);trace_mouse_pipeline("coalesce",process_id(),gui_.mouse_inputs.rbegin()->first,previous.thread,previous);return;
+        }
+    }
+    if(gui_.mouse_inputs.size()>=10000)throw HostCallFault("待處理滑鼠輸入超過上限");
     GuiMouseInput operation;operation.message=std::move(message);operation.thread=target->second.thread;operation.native_activation=native_activation;
-    gui_.mouse_inputs.emplace(gui_.next_object++,std::move(operation));
+    const auto id=gui_.next_object++;
+    trace_mouse_pipeline("queue",process_id(),id,operation.thread,operation);
+    gui_.mouse_inputs.emplace(id,std::move(operation));
 }
 bool WindowsServices::dispatch_gui_mouse(GuestState& state,GuestMemory& memory,std::uint64_t modal,bool wait_message){
     // 先讓程式處理較早的按下事件；其中的 SetCapture／SC_MOVE 必須影響後續移動。
@@ -76,6 +114,7 @@ bool WindowsServices::dispatch_gui_mouse(GuestState& state,GuestMemory& memory,s
         // 回呼未能啟動（協調者本地服務改走完整路徑重做等）時還原輸入，否則它會一直標記為處理中而不再派送。
         const auto saved=input;
         try {
+            trace_mouse_pipeline("dispatch",process_id(),id,threads_.current,input);
             input.active=true;input.modal=modal;input.wait_message=wait_message;
             if(input.native_activation){input.stage=GuiMouseInput::Stage::Commit;input.root=gui_root_window(input.message.window);
                 auto calls=activate_gui_window(input.root,false,false);start_callbacks(state,memory,std::move(calls),Continuation::GuiMouseInput,id);return true;}
@@ -85,13 +124,14 @@ bool WindowsServices::dispatch_gui_mouse(GuestState& state,GuestMemory& memory,s
             input.tested.push_back(input.message.window);input.root=gui_root_window(input.message.window);
             const auto send=resolve("user32.dll",target->second.unicode?"SendMessageW":"SendMessageA").value;
             start_callbacks(state,memory,{{send,{input.message.window,0x84,0,xy(input.message.point[0],input.message.point[1])}}},Continuation::GuiMouseInput,id);return true;
-        }catch(...){input=saved;throw;}
+        }catch(...){input=saved;trace_mouse_pipeline("retry",process_id(),id,threads_.current,input);throw;}
     }
     return false;
 }
 std::optional<std::uint32_t> WindowsServices::resume_gui_mouse(GuestState& state,GuestMemory& memory,std::uint64_t id,std::uint64_t value){
     const auto found=gui_.mouse_inputs.find(id);if(found==gui_.mouse_inputs.end())return std::nullopt;
     auto& input=found->second;auto& message=input.message;
+    trace_mouse_pipeline("resume",process_id(),id,threads_.current,input);
     const auto callback=[&](GuiMouseInput::Stage stage,std::vector<GuestCallback> calls){input.stage=stage;start_callbacks(state,memory,std::move(calls),Continuation::GuiMouseInput,id);};
     const auto finish=[&](){const auto modal=input.modal;const bool wait=input.wait_message;gui_.mouse_inputs.erase(id);if(modal)return advance_gui_modal(state,memory,modal);if(wait)complete_call(state,memory,1);return std::optional<std::uint32_t>{};};
     if(!gui_.windows.contains(message.window))return finish();
@@ -131,6 +171,7 @@ bool WindowsServices::gui_move_size_interrupted(std::uint64_t id)const {
 }
 void WindowsServices::discard_gui_move_size(GuestMemory& memory,const GuestState& state,std::uint64_t id){
     const auto found=gui_.move_sizes.find(id);if(found==gui_.move_sizes.end())return;const auto operation=found->second;gui_.move_sizes.erase(found);
+    trace_move_size("discard",id,threads_.current,operation.window,gui_.capture,gui_.capture_generation,operation.capture_generation,static_cast<unsigned>(operation.stage),0);
     if(gui_.capture==operation.window && gui_.capture_generation==operation.capture_generation){gui_.capture=0;++gui_.capture_generation;}
     if(operation.buffer)free_heap(memory,operation.buffer,state);
 }
@@ -140,6 +181,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_move_size(GuestState& s
     return invoke_gui(state,memory,{"user32.dll","GetMessageW",4});
 }
 std::optional<std::uint32_t> WindowsServices::begin_gui_move_size(GuestState& state,GuestMemory& memory,std::uint64_t handle,std::uint32_t command,std::uint64_t point){
+    trace_move_size("begin",gui_.move_sizes.size(),threads_.current,handle,gui_.capture,gui_.capture_generation,0,command,point);
     const auto window=gui_.windows.find(handle);const auto edge=(command&0xfff0U)==0xf000U?((command&15U)?command&15U:8U):0U;
     if(window==gui_.windows.end() || !window->second.enabled || window->second.show_command!=1 || (edge && !(window->second.style&0x40000U)) || edge>8){complete_call(state,memory,0);return std::nullopt;}
     if(std::any_of(gui_.move_sizes.begin(),gui_.move_sizes.end(),[&](const auto& item){return item.second.thread==threads_.current;})){complete_call(state,memory,0);return std::nullopt;}
@@ -152,12 +194,14 @@ std::optional<std::uint32_t> WindowsServices::begin_gui_move_size(GuestState& st
     // MINMAXINFO 與 RECT 均在可重入操作自己的客體記憶體內。
     for(unsigned i=0;i<10;++i)memory.store(GuestAddress{buffer+64+i*4},32,i==6 || i==7?1U:i==8 || i==9?8192U:0U);
     const auto id=gui_.next_object++;gui_.move_sizes.emplace(id,operation);
+    trace_move_size("created",id,threads_.current,handle,gui_.capture,gui_.capture_generation,operation.capture_generation,static_cast<unsigned>(operation.stage),0);
     const auto send=resolve("user32.dll",window->second.unicode?"SendMessageW":"SendMessageA").value;
     start_callbacks(state,memory,{{send,{handle,0x24,0,buffer+64}},{resolve("user32.dll","SetCapture").value,{handle}},{send,{handle,0x231,0,0}}},Continuation::GuiMoveSize,id);return std::nullopt;
 }
 std::optional<std::uint32_t> WindowsServices::resume_gui_move_size(GuestState& state,GuestMemory& memory,std::uint64_t id,std::uint64_t value){
     const auto found=gui_.move_sizes.find(id);if(found==gui_.move_sizes.end()){complete_call(state,memory,0);return std::nullopt;}
     auto& operation=found->second;using Stage=GuiMoveSize::Stage;const auto buffer=operation.buffer,handle=operation.window;
+    trace_move_size("resume",id,threads_.current,handle,gui_.capture,gui_.capture_generation,operation.capture_generation,static_cast<unsigned>(operation.stage),value);
     const auto send=resolve("user32.dll",gui_.windows.contains(handle) && !gui_.windows.at(handle).unicode?"SendMessageA":"SendMessageW").value;
     const auto callback=[&](Stage stage,std::vector<GuestCallback> calls){operation.stage=stage;start_callbacks(state,memory,std::move(calls),Continuation::GuiMoveSize,id);};
     const auto finish=[&](){const auto quit=operation.quit;const auto code=operation.quit_code;discard_gui_move_size(memory,state,id);if(quit)start_callbacks(state,memory,{{resolve("user32.dll","PostQuitMessage").value,{code}}},Continuation::Return,0);else complete_call(state,memory,0);};
@@ -167,10 +211,16 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_move_size(GuestState& s
     };
     if(operation.stage==Stage::Exit){finish();return std::nullopt;}
     if(operation.stage==Stage::Release){if(gui_.windows.contains(handle))callback(Stage::Exit,{{send,{handle,0x232,0,0}}});else finish();return std::nullopt;}
-    bool end=operation.stage==Stage::Restore || gui_move_size_interrupted(id);
+    bool end=operation.stage==Stage::Restore || gui_move_size_interrupted(id) || (operation.nested_end && (operation.cancel || operation.quit));
     bool moved=false;
+    if(!end && operation.stage!=Stage::Rect){
+        if(operation.nested_point){operation.point=*operation.nested_point;operation.nested_point.reset();moved=true;}
+        // 同一個巢狀 pump 若取走 MOVE 與 UP，先提交最後座標，再配對退出。
+        if(operation.nested_end && !moved)end=true;
+    }
     if(operation.stage==Stage::Read && !end){
         const auto message=static_cast<unsigned>(memory.load(GuestAddress{buffer+(x86_?4:8)},32));const auto wp=memory.load(GuestAddress{buffer+(x86_?8:16)},x86_?32:64);
+        trace_move_size("message",id,threads_.current,handle,gui_.capture,gui_.capture_generation,operation.capture_generation,message,wp);
         if(static_cast<std::uint32_t>(value)==UINT32_MAX)end=true;
         else if(!value){end=true;operation.quit=true;operation.quit_code=static_cast<std::uint32_t>(wp);}
         else if(message==0x202 || message==0xa2 || message==0x1f || message==0x215)end=true;

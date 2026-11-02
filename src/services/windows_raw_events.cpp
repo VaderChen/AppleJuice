@@ -101,7 +101,14 @@ void WindowsServices::raw_input_report(const input::Report& report){
     if(layout.numbered && (report.bytes.empty() || report.bytes.front()!=report.id))return;
     if(!layout.numbered)data.push_back(0);data.insert(data.end(),report.bytes.begin(),report.bytes.end());
     if(data.size()>layout.bytes(0) || !layout.report_bytes[0][data.front()])return;data.resize(layout.bytes(0));
-    for(auto& [handle,file]:files_){(void)handle;if(file.hid && !file.hid->disconnected && file.hid->device.instance==report.device){if(file.hid->reports.size()>=32)file.hid->reports.pop_front();file.hid->reports.push_back(data);}}
+    // DuplicateHandle 共用同一個輸入佇列；一份硬體報告只加入每個 file object 一次。
+    // 另行 CreateFile 的 handle 則有自己的容量及讀取游標。
+    std::set<HidFile*> recipients;
+    for(auto& [handle,file]:files_){
+        (void)handle;
+        if(file.hid && !file.hid->disconnected && file.hid->device.instance==report.device && recipients.insert(file.hid.get()).second)
+            file.hid->enqueue_report(data);
+    }
     if(entry.type==2){std::vector<std::uint8_t> payload(8+data.size());put(payload,0,data.size());put(payload,4,1);std::copy(data.begin(),data.end(),payload.begin()+8);queue_raw_input(id->second,2,std::move(payload),static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0);}
 }
 void WindowsServices::release_raw_input(std::uint64_t packet,std::uint64_t window,std::uint64_t thread){

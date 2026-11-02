@@ -111,9 +111,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt(GuestState& state,Gue
             if(!length)return done(0);
             if(std::uint64_t{length}*2>memory.limit())return done(no_memory);
             if(reference){
-                memory.check(GuestAddress{arg(2)},24,Access::Write);memory.check(GuestAddress{arg(0)},std::uint64_t{length}*2+2,Access::Read);
+                // HSTRING_HEADER 由呼叫者提供；x86 只有 20 bytes，不可覆寫其後的堆疊資料。
+                const std::array<std::uint8_t,24> empty_header{};
+                const auto header=std::span{empty_header}.first(x86_?20:24);
+                memory.check(GuestAddress{arg(2)},header.size(),Access::Write);memory.check(GuestAddress{arg(0)},std::uint64_t{length}*2+2,Access::Read);
                 if(memory.load(GuestAddress{arg(0)+std::uint64_t{length}*2},16))return done(invalid);
-                memory.write(GuestAddress{arg(2)},std::array<std::uint8_t,24>{});memory.store(GuestAddress{arg(2)},32,reference_magic);
+                memory.write(GuestAddress{arg(2)},header);memory.store(GuestAddress{arg(2)},32,reference_magic);
                 memory.store(GuestAddress{arg(2)+4},32,length);memory.store(GuestAddress{arg(2)+8},bits,arg(0));memory.store(GuestAddress{output},bits,arg(2));
             }else {const auto handle=create(arg(0),length);memory.store(GuestAddress{output},bits,handle);}return done(0);
         }

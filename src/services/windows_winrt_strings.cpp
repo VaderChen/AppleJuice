@@ -4,7 +4,7 @@ namespace x64arm {
 WinrtString WindowsServices::winrt_string(const GuestMemory& memory,std::uint64_t handle) const {
     if(!handle)return {};
     if(const auto found=runtime_.winrt_strings.find(handle);found!=runtime_.winrt_strings.end())return found->second;
-    memory.check(GuestAddress{handle},24,Access::Read);
+    memory.check(GuestAddress{handle},x86_?20:24,Access::Read);
     if(memory.load(GuestAddress{handle},32)!=0x52534858U)throw HostCallFault("HSTRING handle 不合法");
     return {memory.load(GuestAddress{handle+8},x86_?32:64),static_cast<std::uint32_t>(memory.load(GuestAddress{handle+4},32)),0};
 }

@@ -103,7 +103,7 @@ ResidentClockRecipe WindowsServices::resident_clock_recipe(GuestAddress address)
     return ResidentClockRecipe::None;
 }
 #endif
-namespace detail {ParallelMappingLock& parallel_mapping_mutex() noexcept;}
+namespace detail {ParallelMappingLock& parallel_mapping_mutex() noexcept;void fls_trace_record(std::uint64_t,std::size_t,std::uint64_t) noexcept;}
 // 核心在 worker 上查區域表（REP 批次、rdtsc 出口解碼）時與 worker 服務共用同一把映射讀鎖。
 void WindowsServices::resident_mapping_read(bool acquire) const noexcept {
     if(acquire)detail::parallel_mapping_mutex().lock_shared();else detail::parallel_mapping_mutex().unlock_shared();
@@ -605,7 +605,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(!reading && fls_mirror_ && !mirror)return false;
         auto& values=current?runtime_.fls_values:thread.fls_values;
         if(reading){result=values[index];if(error){put(error,0,4);if(current)last_error_=0;}}
-        else {values[index]=second;if(mirror)put(mirror,second,8);result=1;}
+        else {values[index]=second;if(mirror)put(mirror,second,8);detail::fls_trace_record(tid,index,second);result=1;}
     }else if(symbol=="InitOnceBeginInitialize" || symbol=="InitOnceExecuteOnce"){
         const bool begin=symbol=="InitOnceBeginInitialize";
         if(begin && (static_cast<std::uint32_t>(second)&~1U))return false;

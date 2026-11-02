@@ -39,7 +39,7 @@
     };
     for(auto& [key,handle]:config.usb_nodes){(void)key;if(const auto found=config.nodes.find(handle);found!=config.nodes.end()){found->second.present=false;found->second.status=0x0401U;found->second.problem=45;}}
     for(auto& [key,handle]:config.usb_interfaces){(void)key;if(const auto found=config.nodes.find(handle);found!=config.nodes.end()){found->second.present=false;found->second.status=0x0401U;found->second.problem=45;}}
-    const auto list=usb::devices();std::set<std::u16string> used;config.usb_paths.clear();config.usb_targets.clear();
+    const auto list=usb_backend().devices();std::set<std::u16string> used;config.usb_paths.clear();config.usb_targets.clear();
     // 裝置介面路徑：\\?\ + 實例 ID（\ 換成 #）+ #{介面類別 GUID}，與 Windows 相同採小寫。
     constexpr std::u16string_view usb_device_interface=u"{a5dcbf10-6530-11d2-901f-00c04fb951ed}",usb_hub_interface=u"{f18a0e88-c30c-11d0-8815-00a0c906bed8}",
         winusb_interface=u"{dee824ef-729b-4a0e-9c14-b7117d33a817}";

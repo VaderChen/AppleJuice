@@ -49,6 +49,26 @@ std::uint32_t dword(std::span<const std::uint8_t> bytes,std::size_t at){
 }
 void put(std::span<std::uint8_t> bytes,std::size_t at,std::uint32_t value){for(unsigned i=0;i<4;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(8*i));}
 }
+std::vector<std::uint8_t> protect_sandbox_data(const PrivateKeyStoreContext& context,std::span<const std::uint8_t> input,std::u16string_view text,bool machine,std::span<const std::uint8_t> entropy){
+    const auto description=utf16_bytes(std::u16string(text));require(input.size()<=UINT32_MAX && description.size()<=65536,8);
+    Secret master,key;master.bytes=sandbox_data_protection_key(context,machine?"machine-data":"user-data:"+context.user_sid,machine,true);
+    std::vector<std::uint8_t> output(48+description.size());std::copy(magic.begin(),magic.end(),output.begin());
+    put(output,8,machine?4U:0U);put(output,12,static_cast<std::uint32_t>(input.size()));put(output,16,static_cast<std::uint32_t>(description.size()));
+    require(RAND_bytes(output.data()+20,28)==1,8);std::copy(description.begin(),description.end(),output.begin()+48);
+    const auto derived=derive(master.bytes,std::span(output).subspan(20,16),entropy);std::copy_n(derived.begin(),32,key.bytes.begin());
+    std::array<std::uint8_t,16> tag{};const auto ciphertext=gcm(input,key.bytes,std::span(output).subspan(36,12),output,tag,true);
+    output.insert(output.end(),ciphertext.begin(),ciphertext.end());output.insert(output.end(),tag.begin(),tag.end());return output;
+}
+UnprotectedData unprotect_sandbox_data(const PrivateKeyStoreContext& context,std::span<const std::uint8_t> input,std::span<const std::uint8_t> entropy){
+    require(input.size()>=66 && std::equal(magic.begin(),magic.end(),input.begin()));
+    const auto flags=dword(input,8),count=dword(input,12),desc=dword(input,16);
+    require((flags==0 || flags==4) && desc>=2 && !(desc%2) && desc<=65536 && std::uint64_t{48}+desc+count+16==input.size());
+    UnprotectedData result;result.description.assign(input.begin()+48,input.begin()+48+desc);require(result.description[desc-1]==0 && result.description[desc-2]==0);
+    const bool machine=flags==4;Secret master,key;master.bytes=sandbox_data_protection_key(context,machine?"machine-data":"user-data:"+context.user_sid,machine,false);
+    const auto derived=derive(master.bytes,input.subspan(20,16),entropy);std::copy_n(derived.begin(),32,key.bytes.begin());
+    std::array<std::uint8_t,16> tag{};std::copy_n(input.end()-16,16,tag.begin());
+    result.bytes=gcm(input.subspan(48+desc,count),key.bytes,input.subspan(36,12),input.first(48+desc),tag,false);return result;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_data_protection(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     const bool data=name.ends_with("Data"),encrypt=name=="CryptProtectData" || name=="CryptProtectMemory" || name=="SystemFunction040" || name=="RtlEncryptMemory";
@@ -100,24 +120,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_data_protection(GuestState&
         }
         const auto input=read_blob(arg(0)),entropy=arg(2)?read_blob(arg(2)):std::vector<std::uint8_t>{};
         if(!runtime_.network.external_io)return finish(50);
-        std::vector<std::uint8_t> output,description;Secret master,key;bool machine=false;
+        std::vector<std::uint8_t> output,description;
         if(encrypt){
-            description=utf16_bytes(arg(1)?read_utf16(memory,GuestAddress{arg(1)},32767):std::u16string{});
+            const auto text=arg(1)?read_utf16(memory,GuestAddress{arg(1)},32767):std::u16string{};description=utf16_bytes(text);
             if((flags&16U) && description.size()>2)return finish(50); // 尚未提供宿主稽核事件紀錄。
-            require(input.size()+description.size()+64<=output_limit,8);machine=(flags&4U)!=0;
-            master.bytes=sandbox_data_protection_key(private_key_context(),machine?"machine-data":"user-data:"+token_user_sid_string(effective_token_id()),machine,true);
-            output.resize(48+description.size());std::copy(magic.begin(),magic.end(),output.begin());put(output,8,machine?4U:0U);put(output,12,static_cast<std::uint32_t>(input.size()));put(output,16,static_cast<std::uint32_t>(description.size()));
-            require(RAND_bytes(output.data()+20,28)==1,8);std::copy(description.begin(),description.end(),output.begin()+48);
-            const auto derived=derive(master.bytes,std::span(output).subspan(20,16),entropy);std::copy_n(derived.begin(),32,key.bytes.begin());
-            std::array<std::uint8_t,16> tag{};const auto ciphertext=gcm(input,key.bytes,std::span(output).subspan(36,12),output,tag,true);output.insert(output.end(),ciphertext.begin(),ciphertext.end());output.insert(output.end(),tag.begin(),tag.end());
+            require(input.size()+description.size()+64<=output_limit,8);output=protect_sandbox_data(private_key_context(),input,text,(flags&4U)!=0,entropy);
         }else{
-            require(input.size()>=66 && std::equal(magic.begin(),magic.end(),input.begin()));
-            const auto stored_flags=dword(input,8),count=dword(input,12),desc=dword(input,16);
-            require((stored_flags==0 || stored_flags==4) && desc>=2 && !(desc%2) && desc<=65536 && std::uint64_t{48}+desc+count+16==input.size());
-            machine=stored_flags==4;description.assign(input.begin()+48,input.begin()+48+desc);require(description[desc-1]==0 && description[desc-2]==0);
-            master.bytes=sandbox_data_protection_key(private_key_context(),machine?"machine-data":"user-data:"+token_user_sid_string(effective_token_id()),machine,false);
-            const auto derived=derive(master.bytes,std::span(input).subspan(20,16),entropy);std::copy_n(derived.begin(),32,key.bytes.begin());
-            std::array<std::uint8_t,16> tag{};std::copy_n(input.end()-16,16,tag.begin());output=gcm(std::span(input).subspan(48+desc,count),key.bytes,std::span(input).subspan(36,12),std::span(input).first(48+desc),tag,false);
+            auto plain=unprotect_sandbox_data(private_key_context(),input,entropy);output=std::move(plain.bytes);description=std::move(plain.description);
         }
         const auto buffer=allocate(output),text=!encrypt && arg(1)?allocate(description):0;
         memory.store(GuestAddress{arg(6)},32,output.size());memory.store(GuestAddress{arg(6)+unit},bits,buffer);

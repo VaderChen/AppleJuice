@@ -2,6 +2,7 @@
 #include "service_callback_task.hpp"
 #include "crt_os_error.hpp"
 #include "windows_file_stat.hpp"
+#include "windows_nt_entry.hpp"
 #include "image_file_metadata.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_security_attributes.hpp"
@@ -352,6 +353,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
     }
     if(kernel_device_handle(arg(0)))return invoke_kernel_device_io(state,memory,service);
     if(const auto file=files_.find(arg(0));file!=files_.end() && (file->second.serial || file->second.hid || file->second.usb)){
+        if(file->second.hid && (symbol=="DeviceIoControl" || symbol=="NtDeviceIoControlFile"))return invoke_fs_control(state,memory,service);
         if(symbol.starts_with("Nt")){
             const auto iosb=arg(symbol=="NtDeviceIoControlFile" || symbol=="NtQueryDirectoryFile" || symbol=="NtQueryDirectoryFileEx"?4:1);const auto unit=x86_?4U:8U;
             memory.check(GuestAddress{iosb},2*unit,Access::Write);memory.store(GuestAddress{iosb},static_cast<std::uint8_t>(unit*8),0xc0000010);memory.store(GuestAddress{iosb+unit},static_cast<std::uint8_t>(unit*8),0);

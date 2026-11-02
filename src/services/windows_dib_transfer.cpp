@@ -128,10 +128,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_dib_transfer(GuestState& st
                     if((!pattern_used || handle!=0xb005) && (!source_used || source_visible)){
                         const GuiRect dest{coordinate(dx),coordinate(dy),coordinate(dx+width),coordinate(dy+dh)};
                         const GuiRect source{sx,coordinate(y0-band_start),coordinate(static_cast<std::int64_t>(sx)+sw),coordinate(y1-band_start)};
-                        const auto dst=raster_surface(memory,arg(0));if(!dst)throw DibError{50};const auto src=make_hardware_raster(band.width,band.height,band.pixels);
+                        const auto src=make_hardware_raster(band.width,band.height,band.pixels);
                         std::shared_ptr<RasterSurface> pattern;if(pattern_used && gui_.brush_patterns.contains(handle)){const auto& image=gui_.brush_patterns.at(handle);brush.pattern_monochrome=image.bits_per_pixel==1;pattern=make_hardware_raster(image.width,image.height,image.pixels);}
                         auto target=dc->second;if(!stretch)target.stretch_mode=3;
-                        dst->blit(*src,dest,source,target,UINT32_MAX,options,pattern.get());
+                        if(!blit_raster(memory,arg(0),src.get(),dest,source,target,UINT32_MAX,options,pattern.get()))throw DibError{last_error_};
                         result=stretch?static_cast<std::uint32_t>(source_used?(sh<0?-copied_rows:copied_rows):sh):static_cast<std::uint32_t>(dh);
                     }
                 }

@@ -129,6 +129,7 @@ std::span<const WindowsServiceDescriptor> network_diagnostic_service_descriptors
 std::span<const WindowsServiceDescriptor> credential_ui_service_descriptors();
 std::span<const WindowsServiceDescriptor> certificate_ui_service_descriptors();
 std::span<const WindowsServiceDescriptor> winusb_service_descriptors();
+std::span<const WindowsServiceDescriptor> wlan_service_descriptors();
 std::span<const WindowsServiceDescriptor> font_package_service_descriptors();
 std::span<const WindowsServiceDescriptor> mci_service_descriptors();
 std::span<const WindowsServiceDescriptor> reparse_service_descriptors();

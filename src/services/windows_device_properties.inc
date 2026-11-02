@@ -1,5 +1,9 @@
 // 與舊版 CM_DRP／SPDRP 共用來源；DEVPROPKEY 依 Windows 的 GUID + DWORD 排列。
-struct DevicePropertyKey {std::array<std::uint8_t,16> format{};std::uint32_t id{};};
+struct DevicePropertyKey {
+    std::array<std::uint8_t,16> format{};std::uint32_t id{};
+    bool operator==(const DevicePropertyKey&)const=default;
+    bool operator<(const DevicePropertyKey& other)const{return format<other.format || (format==other.format && id<other.id);}
+};
 struct UnifiedDeviceProperty {std::uint32_t type{};std::vector<std::uint8_t> bytes;};
 DevicePropertyKey read_device_property_key(const GuestMemory& memory,std::uint64_t pointer){
     DevicePropertyKey key;memory.read(GuestAddress{pointer},key.format);

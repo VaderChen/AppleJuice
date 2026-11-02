@@ -90,6 +90,7 @@ struct GuiMessage {
     std::optional<desktop::Event> status_icon{};
     bool screen_point{}; // 原生／注入輸入保留事件當時的完整螢幕座標。
     std::uint64_t input_order{}; // 命中／啟用回呼完成後，仍保留輸入到達的先後。
+    bool mouse_no_coalesce{}; // MOUSEEVENTF_MOVE_NOCOALESCE：此筆移動不可被後續座標取代。
     bool operator==(const GuiMessage&) const = default;
 };
 inline std::uint32_t gui_queue_category(const GuiMessage& message){
@@ -900,6 +901,8 @@ struct GuiMoveSize {
     std::uint64_t window{},thread{},buffer{},capture_generation{};
     std::array<std::int32_t,4> original{};
     std::array<std::int32_t,2> start{},point{};
+    std::optional<std::array<std::int32_t,2>> nested_point;
+    bool nested_end{};
     unsigned edge{};bool keyboard{},cancel{},quit{};std::uint32_t quit_code{};
     bool operator==(const GuiMoveSize&)const=default;
 };
@@ -1209,6 +1212,8 @@ public:
     virtual bool ime_convert(std::uint64_t) {return false;}
     virtual void raw_input_policy(bool,bool,bool) {}
     virtual std::vector<GuiMessage> poll_for(std::uint64_t nanoseconds) {return poll(nanoseconds!=0);}
+    // 不持服務狀態鎖時先向宿主抽取事件；之後第一次 poll_for(0) 直接回傳已抽到的事件，不再進宿主事件迴圈。
+    virtual void prefetch_events() {}
     virtual std::optional<GuiFontMetrics> font_metrics(const GuiFont&) {return std::nullopt;}
     virtual std::optional<std::int32_t> text_width(const GuiFont&,const std::u16string&) {return std::nullopt;}
     virtual std::optional<std::vector<std::int32_t>> text_advances(const GuiFont&,const std::u16string&) {return std::nullopt;}

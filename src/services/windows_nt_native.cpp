@@ -451,7 +451,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             memory.write(GuestAddress{destination},encoded);memory.store(GuestAddress{call(0)},16,converted.size()*2);return finish(0);
         }
         if(name=="RtlFreeUnicodeString"){const auto buffer=memory.load(GuestAddress{call(0)+unit},bits);if(buffer)(void)free_heap(memory,buffer,state);memory.write(GuestAddress{call(0)},std::vector<std::uint8_t>(unit*2));return finish(0);}
-        if(name=="RtlCreateHeap"){if(call(1) || call(4) || call(5) || (call(0)&~1U))return finish(0);return start("kernel32.dll","HeapCreate",{call(0),call(3),call(2)});}
+        if(name=="RtlCreateHeap"){
+            const auto flags=static_cast<std::uint32_t>(call(0));
+            if(call(1) || call(4) || call(5) || (flags&~3U))return finish(0);
+            // NT 的 HEAP_GROWABLE 不屬於 HeapCreate 旗標；可成長 heap 的 ReserveSize
+            // 是初始保留量，不能誤當最大容量。建立及後續配置仍共用私有 heap 的擁有權流程。
+            const auto reserve=call(2),commit=reserve?std::min(call(3),reserve):call(3);
+            return start("kernel32.dll","HeapCreate",{flags&1U,commit,(flags&2U)?0:reserve});
+        }
         if(name=="RtlDestroyHeap")return start("kernel32.dll","HeapDestroy",{call(0)});
         if(name=="NtMapViewOfSection" || name=="NtMapViewOfSectionEx" || name=="NtExtendSection" || name=="NtFlushVirtualMemory")return invoke_nt_section(state,memory,service);
         if(name=="NtDeleteFile"){

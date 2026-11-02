@@ -9,6 +9,7 @@
 #include "directmusic_interfaces.hpp"
 #include "dsound_interfaces.hpp"
 #include "wasapi_interfaces.hpp"
+#include "gui_lifecycle_trace.hpp"
 #include "dinput_interfaces.hpp"
 #include <algorithm>
 #include <bit>
@@ -517,6 +518,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         }
     }
     else if(symbol=="GetCapture" || symbol=="SetCapture" || symbol=="ReleaseCapture"){
+        detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,symbol=="SetCapture"?arg(0):0);
         const auto previous=gui_.capture;const auto owner=gui_.windows.find(previous);
         const bool own=owner!=gui_.windows.end() && owner->second.thread==threads_.current;
         if(symbol=="GetCapture")result=own?previous:0;
@@ -773,6 +775,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     } else if(symbol=="IsWindowEnabled" || symbol=="IsWindow" || symbol=="GetParent" || symbol=="IsIconic" || symbol=="IsZoomed"){
         const auto f=gui_.windows.find(arg(0));if(f!=gui_.windows.end()){if(symbol=="GetParent")result=f->second.parent?f->second.parent:f->second.owner;else if(symbol=="IsWindow")result=1;else if(symbol=="IsWindowEnabled")result=f->second.enabled?1:0;else if(symbol=="IsIconic")result=f->second.show_command==2;else if(symbol=="IsZoomed")result=f->second.show_command==3;}
     } else if(symbol=="SetFocus" || symbol=="GetFocus"){
+        detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,symbol=="SetFocus"?arg(0):0);
         result=gui_.focus;if(result && !input_connected(gui_.windows.at(result).thread))result=0;
         if(symbol=="SetFocus"){
             const auto found=gui_.windows.find(arg(0));
@@ -800,6 +803,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             }
         }
     } else if(symbol=="GetForegroundWindow" || symbol=="GetActiveWindow" || symbol=="SetForegroundWindow" || symbol=="SetActiveWindow"){
+        detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,symbol.starts_with("Set")?arg(0):0);
         result=gui_.active;if(result && gui_.windows.at(result).desktop_object!=thread_desktop_object(threads_.current))result=0;
         if(symbol=="GetActiveWindow" && result && !input_connected(gui_.windows.at(result).thread))result=0;
         if(symbol!="GetForegroundWindow" && symbol!="GetActiveWindow"){

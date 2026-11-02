@@ -33,6 +33,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdio>
+#include <unistd.h>
 #include <cstdlib>
 #include <functional>
 #include <limits>
@@ -40,6 +41,7 @@
 #include <sstream>
 
 namespace x64arm {
+namespace detail {void fls_trace_record(std::uint64_t,std::size_t,std::uint64_t) noexcept;}
 std::span<const WindowsServiceDescriptor> com_marshal_service_descriptors();
 std::span<const WindowsServiceDescriptor> print_dialog_service_descriptors();
 std::uint64_t WindowsServices::current_invalid_parameter_handler() const {
@@ -300,6 +302,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
             {credential_ui_service_descriptors(), true},
             {certificate_ui_service_descriptors(), true},
             {winusb_service_descriptors(), true},
+            {wlan_service_descriptors(), true},
             {font_package_service_descriptors(), true},
             {mci_service_descriptors(), false},
             {reparse_service_descriptors(), true},
@@ -1464,6 +1467,22 @@ bool WindowsServices::release_heap_block(GuestMemory& memory,std::map<std::uint6
     for(unsigned i=0;i<quick_only_count;++i)evict_heap_quick_page(memory,quick_only[i]);
     return true;
 }
+namespace {
+void trace_gui_callback_boundary(const char* stage,const GuestCallback& call,std::uint32_t process,std::uint64_t thread,
+                                 std::size_t depth,std::size_t index,std::uint64_t result=0) {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_TRACE_GUI_INPUT");return value && std::string_view(value)=="all";}();
+    if(!enabled || !call.user_mode_callback || call.arguments.size()!=4)return;
+    const auto message=call.arguments[1];
+    if(!((message>=0x100 && message<=0x107) || (message>=0x200 && message<=0x20e) || (message>=0xa0 && message<=0xad)))return;
+    // 這是已分類 user-mode callback 的進入／返回邊界；含排程、巢狀工作與追蹤成本，並非 CPU 時間。
+    const auto unix_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto monotonic_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::fprintf(stderr,"[gui-callback] stage=%s unix_ns=%lld monotonic_ns=%lld host_pid=%d guest_pid=%u thread=%llu depth=%zu index=%zu target=%llx hwnd=%llx message=%llx key=%llx flags=%llx result=%llx\n",
+        stage,static_cast<long long>(unix_ns),static_cast<long long>(monotonic_ns),static_cast<int>(::getpid()),process,static_cast<unsigned long long>(thread),depth,index,
+        static_cast<unsigned long long>(call.target),static_cast<unsigned long long>(call.arguments[0]),static_cast<unsigned long long>(message),
+        static_cast<unsigned long long>(call.arguments[2]),static_cast<unsigned long long>(call.arguments[3]),static_cast<unsigned long long>(result));
+}
+}
 void WindowsServices::enter_callback(GuestState& state, GuestMemory& memory) {
     auto& frame = runtime_.callbacks.back(); const auto& call = frame.callbacks.at(frame.index);
     if (call.arguments.size() > 16 || (call.wide_arguments >> call.arguments.size()) || (call.floating_arguments >> call.arguments.size()) ||
@@ -1490,7 +1509,8 @@ void WindowsServices::enter_callback(GuestState& state, GuestMemory& memory) {
         state=frame.saved;
         if(call.x86_register_arguments)state.reg(Gpr::Rcx)=static_cast<std::uint32_t>(call.arguments[0]);
         if(call.x86_register_arguments>1)state.reg(Gpr::Rdx)=static_cast<std::uint32_t>(call.arguments[1]);
-        state.rip=GuestAddress{call.target};state.reg(Gpr::Rsp)=sp;return;
+        state.rip=GuestAddress{call.target};state.reg(Gpr::Rsp)=sp;
+        trace_gui_callback_boundary("enter",call,process_id(),threads_.current,runtime_.callbacks.size(),frame.index);return;
     }
     const auto sp = ((original_sp - 256) & ~UINT64_C(15)) - 8;
     memory.check(GuestAddress{sp}, 168, Access::Write);
@@ -1507,6 +1527,7 @@ void WindowsServices::enter_callback(GuestState& state, GuestMemory& memory) {
             if(call.floating_arguments&(1U<<i)){state.xmm[i].fill(0);for(unsigned byte=0;byte<8;++byte)state.xmm[i][byte]=static_cast<std::uint8_t>(call.arguments[i]>>(8*byte));}
         }
     }
+    trace_gui_callback_boundary("enter",call,process_id(),threads_.current,runtime_.callbacks.size(),frame.index);
 }
 void WindowsServices::classify_callback(GuestCallback& callback, Continuation continuation) const {
     // 每次進入都依目前 GUI 註冊分類；比較器本身亦可註冊新的 callback。
@@ -1567,6 +1588,8 @@ void WindowsServices::start_loader_callbacks(GuestState& state, GuestMemory& mem
 void WindowsServices::discard_callbacks(std::size_t depth, GuestState& state, GuestMemory& memory) {
     if(depth>runtime_.callbacks.size())throw HostCallFault("callback 清理深度不合法");
     while(runtime_.callbacks.size()>depth) {
+        const auto& traced=runtime_.callbacks.back();
+        if(traced.index<traced.callbacks.size())trace_gui_callback_boundary("discard",traced.callbacks[traced.index],process_id(),threads_.current,runtime_.callbacks.size(),traced.index);
         if(runtime_.callbacks.back().continuation==Continuation::FiberDelete){const auto handle=runtime_.callbacks.back().value;runtime_.callbacks.pop_back();destroy_fiber(state,memory,handle);continue;}
         if(runtime_.callbacks.back().continuation==Continuation::Sort) {
             if(runtime_.sorts.empty())throw HostCallFault("qsort callback 清理時缺少排序狀態");
@@ -1619,7 +1642,7 @@ void WindowsServices::discard_callbacks(std::size_t depth, GuestState& state, Gu
         if(frame.continuation==Continuation::DdeOperation)discard_dde(frame.value);
         if(frame.continuation==Continuation::GdiplusStream)discard_gdiplus_stream(state,memory,frame.value);
         if(frame.continuation==Continuation::FontPackage)discard_font_package(frame.value);
-        if(frame.continuation==Continuation::WinUsbTransfer)discard_winusb(frame.value);
+        if(frame.continuation==Continuation::WinUsbTransfer || frame.continuation==Continuation::WinUsbOverlapped)discard_winusb(frame.value);
         if(frame.continuation==Continuation::ComSpyOperation)discard_com_spy(state,memory,frame.value);
         if(frame.continuation==Continuation::DemangleOperation)discard_demangle(frame.value);
         if(frame.continuation==Continuation::Msvcp100Operation)discard_msvcp100(frame.value,state,memory);
@@ -1662,6 +1685,7 @@ bool WindowsServices::reusable_sort_callback() const noexcept {
 std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state, GuestMemory& memory) {
     if (runtime_.callbacks.empty()) throw HostCallFault("callback 返回沒有對應框架");
     auto& frame = runtime_.callbacks.back();
+    if(frame.index<frame.callbacks.size())trace_gui_callback_boundary("return",frame.callbacks[frame.index],process_id(),threads_.current,runtime_.callbacks.size(),frame.index,state.reg(Gpr::Rax));
     auto callback_value=x86_ && frame.index<frame.callbacks.size() && frame.callbacks[frame.index].wide_result?(state.reg(Gpr::Rax)&UINT32_MAX)|((state.reg(Gpr::Rdx)&UINT32_MAX)<<32):state.reg(Gpr::Rax);
     if(frame.index<frame.callbacks.size() && frame.callbacks[frame.index].floating_result)
         callback_value=floating_callback_result(state,frame.callbacks[frame.index].floating_result,x86_);
@@ -1949,8 +1973,24 @@ void WindowsServices::report_crt_fast_fail(const GuestState& state,GuestMemory& 
     const auto* image=module_image(caller,true);
     std::fprintf(stderr,"crt_fast_fail pid=%u symbol=%.*s caller=0x%llx module=%s offset=0x%llx thread=%llu\n",process_id(),static_cast<int>(symbol.size()),symbol.data(),
         static_cast<unsigned long long>(caller),image?utf16_to_utf8(image->path).c_str():"?",static_cast<unsigned long long>(image?caller-image->base:0),static_cast<unsigned long long>(threads_.current));
-    // x64：依 PE unwind 資訊再回溯最多 16 層，定位呼叫 abort／fail-fast 的客體程式（x86 只回報直接呼叫者）。
-    if(x86_ || !caller)return;
+    if(!caller)return;
+    // x86 無通用 unwind metadata；只沿單調向上的 EBP chain 讀取最多 16 層。
+    // 省略 frame pointer 或鏈已損壞時停止，不把任意堆疊資料冒充返回位址。
+    if(x86_){
+        auto frame=state.reg(Gpr::Rbp)&UINT64_C(0xffffffff),previous=state.reg(Gpr::Rsp)&UINT64_C(0xffffffff);
+        for(unsigned depth=0;depth<16;++depth){
+            if((frame&3U) || frame<previous || frame>UINT32_MAX-8U || frame-previous>1024U*1024U)break;
+            try{
+                const auto next=memory.load(GuestAddress{frame},32),pc=memory.load(GuestAddress{frame+4},32);
+                const auto* frame_image=module_image(pc,true);if(!frame_image)break;
+                std::fprintf(stderr,"crt_fast_fail_frame pid=%u depth=%u module=%s offset=0x%llx ebp=0x%llx\n",process_id(),depth,utf16_to_utf8(frame_image->path).c_str(),
+                    static_cast<unsigned long long>(pc-frame_image->base),static_cast<unsigned long long>(frame));
+                previous=frame+8;frame=next;
+            }catch(const MemoryFault&){break;}
+        }
+        return;
+    }
+    // x64：依 PE unwind 資訊回溯最多 16 層。
     GuestState walk=state;walk.rip=GuestAddress{caller};walk.reg(Gpr::Rsp)=state.reg(Gpr::Rsp)+8;
     for(unsigned depth=0;depth<16;++depth){
         const auto* frame=module_image(walk.rip.value,true);if(!frame)break;
@@ -2096,6 +2136,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         if(service.family=="credui.dll")return &WindowsServices::invoke_credential_ui;
         if(service.family=="cryptui.dll")return &WindowsServices::invoke_certificate_ui;
         if(service.family=="winusb.dll")return &WindowsServices::invoke_winusb;
+        if(service.family=="wlanapi.dll")return &WindowsServices::invoke_wlan;
         if(service.family=="fontsub.dll")return &WindowsServices::invoke_font_package;
         if(detail::service_descriptor_contains<mci_service_descriptors>(service,reuse))return &WindowsServices::invoke_mci;
         if(detail::service_descriptor_contains<reparse_service_descriptors>(service,reuse))return &WindowsServices::invoke_reparse;
@@ -2188,7 +2229,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         const auto index = static_cast<std::uint32_t>(arg(0));
         if (index >= runtime_.fls_used.size() || !runtime_.fls_used[index]) {if(symbol=="FlsGetValue2")result=0;else fail(87);}
         else if (symbol == "FlsGetValue" || symbol == "FlsGetValue2") { result = runtime_.fls_values[index]; if(symbol=="FlsGetValue")last_error_ = 0; }
-        else if (symbol == "FlsSetValue") { runtime_.fls_values[index] = arg(1); result = 1; if(fls_mirror_)memory.store(GuestAddress{state.gs_base+0x1840+std::uint64_t{index}*8},64,arg(1)); }
+        else if (symbol == "FlsSetValue") { runtime_.fls_values[index] = arg(1); result = 1; if(fls_mirror_)memory.store(GuestAddress{state.gs_base+0x1840+std::uint64_t{index}*8},64,arg(1));
+            detail::fls_trace_record(threads_.current,index,arg(1)); }
         else {
             const auto callback = runtime_.fls_callbacks[index];std::vector<GuestCallback> callbacks;
             if (callback && runtime_.fls_values[index]) callbacks.push_back({callback,{runtime_.fls_values[index]}});

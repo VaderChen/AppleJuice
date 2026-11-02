@@ -7,7 +7,9 @@
 #include <cfenv>
 #include <ctime>
 #include <fcntl.h>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
@@ -1379,9 +1381,38 @@ void WindowsServices::save_resident_current(GuestState& state,GuestMemory& memor
     source.fls_values=runtime_.fls_values;
     source.tls_values=runtime_.tls_values;
 }
+namespace detail {
+// 診斷：X64ARM_TRACE_FLS=1 時回報 FLS 值不一致——換手載入前 runtime_ 有未存回執行緒表的值（遺失寫入），或執行緒結束時
+// 要傳給 FLS 回呼的值與該執行緒最後一次 FlsSetValue 不同（雙人成行曾以 vcruntime 配置中的 −1 標記呼叫 steamclient 回呼）。
+bool fls_trace_enabled() noexcept {static const bool value=std::getenv("X64ARM_TRACE_FLS")!=nullptr;return value;}
+namespace {
+std::mutex& fls_trace_mutex() noexcept {static std::mutex value;return value;}
+std::map<std::pair<std::uint64_t,std::size_t>,std::uint64_t>& fls_trace_table() noexcept {static std::map<std::pair<std::uint64_t,std::size_t>,std::uint64_t> value;return value;}
+}
+void fls_trace_record(std::uint64_t thread,std::size_t slot,std::uint64_t value) noexcept {
+    if(!fls_trace_enabled())return;
+    try{const std::lock_guard lock(fls_trace_mutex());fls_trace_table()[{thread,slot}]=value;}catch(...){}
+}
+std::optional<std::uint64_t> fls_trace_lookup(std::uint64_t thread,std::size_t slot) noexcept {
+    try{const std::lock_guard lock(fls_trace_mutex());const auto found=fls_trace_table().find({thread,slot});
+        if(found!=fls_trace_table().end())return found->second;}catch(...){}
+    return std::nullopt;
+}
+}
+namespace {
+bool trace_fls_values() noexcept {return detail::fls_trace_enabled();}
+}
 // 載入半段：目標成為目前客體，載入其狀態並重設時間片；TSC 沿用協調者的連續計數。
 void WindowsServices::load_resident_current(GuestState& state,GuestMemory& memory,std::uint64_t target_id) {
     auto& target=threads_.items.at(target_id);
+    if(trace_fls_values() && threads_.current!=target_id)
+        if(const auto outgoing=threads_.items.find(threads_.current);outgoing!=threads_.items.end())
+            for(std::size_t i=0;i<runtime_.fls_used.size();++i)
+                if(runtime_.fls_used[i] && outgoing->second.fls_values[i]!=runtime_.fls_values[i])
+                    std::fprintf(stderr,"[fls_mismatch] load outgoing=%llu target=%llu slot=%zu runtime=0x%llx saved=0x%llx parked=%d\n",
+                        static_cast<unsigned long long>(threads_.current),static_cast<unsigned long long>(target_id),i,
+                        static_cast<unsigned long long>(runtime_.fls_values[i]),static_cast<unsigned long long>(outgoing->second.fls_values[i]),
+                        resident_current_parked_?1:0);
     const auto tsc=state.tsc;
     threads_.current=target_id;
     state=target.context;
@@ -1452,6 +1483,26 @@ void WindowsServices::resident_unpark(GuestState& state,GuestMemory& memory) {
 }
 GuestState* WindowsServices::resident_idle_replacement(GuestState& parked,GuestMemory& memory,std::span<GuestState* const> active) {
     if(!resident_block_parking())return nullptr;
+    // 協調者每輪進入信箱等待前、每次本地服務回覆後都對每個停駐 slot 問一次（雙人成行每秒約 16 萬次），絕大多數沒有候選。
+    // 先不取獨占映射鎖，依與 select_resident_replacement 相同的便宜條件（Runnable、未暫停、不在 slot 上、親和性允許）掃一次
+    // 執行緒索引，沒有就直接回報；有候選才取鎖正式挑選。狀態改動都在協調者或持獨占鎖的服務，這裡漏看的候選下一輪就選到
+    //（與原本的輪詢間隔相同，resident_runnable_waiting 同樣不持映射鎖讀索引）。原本每次取鎖都讓 worker 上的服務讀鎖排空、
+    // 新讀者自旋讓出（每秒約 6 萬次讀者等待、48 萬次讓出，持鎖加排空占 18% 時間）。X64ARM_RESIDENT_IDLE_PRECHECK=0 關閉。
+    static const bool precheck=[] {const auto* value=std::getenv("X64ARM_RESIDENT_IDLE_PRECHECK");return !value || std::string_view(value)!="0";}();
+    if(precheck){
+        const auto key=resident_context_key(parked);const auto processor=parked.processor_id;bool candidate=false;
+        std::unique_lock<std::mutex> index_lock;const auto& index=resident_thread_index(index_lock);
+        for(const auto& [id,thread]:index.live){
+            if(id==threads_.current || id==key || thread->status!=ThreadStatus::Runnable || thread->suspended)continue;
+            if(processor>=64 || !(thread->affinity&(UINT64_C(1)<<processor)))continue;
+            if(std::find(active.begin(),active.end(),&thread->context)!=active.end())continue;
+            // 停在服務入口（協調者正在處理其請求）、有待處理 CPU 陷阱或已被選為搶占目標的客體，正式挑選也會排除；
+            // 這裡只讀 rip／旗標（過時值最多多取一次鎖），不讀 worker 也會改動的 resident_service_requests_。
+            if(thread->context.pending_cpu_trap || &thread->context==resident_preempt_pending_ || handles(thread->context.rip))continue;
+            candidate=true;break;
+        }
+        if(!candidate)return nullptr;
+    }
     const std::unique_lock mapping_guard{detail::parallel_mapping_mutex()};
     const auto key=resident_context_key(parked);
     auto* best=select_resident_replacement(active,parked.processor_id,key);
@@ -1486,8 +1537,73 @@ bool WindowsServices::resident_runnable_waiting(std::span<GuestState* const> act
     }
     return false;
 }
+bool WindowsServices::wait_may_be_ready(const std::vector<std::uint64_t>& handles,bool all,std::uint64_t thread_id){
+    bool any=false,every=true;
+    for(const auto handle:handles){
+        bool possible=true;
+        if(const auto object=runtime_.wait_objects.find(handle);object!=runtime_.wait_objects.end()){
+            if(object->second.shared_event)possible=object->second.signaled();
+            else if(runtime_.wait_lock_descriptor(object->second)<0)possible=runtime_.wait_ready(object->second,handles,all,thread_id);
+        }else if(const auto target=this->thread_id(handle))possible=threads_.items.at(target).status==ThreadStatus::Exited;
+        else if(const auto child=process_signaled(handle))possible=*child;
+        else if(const auto file=file_io_signaled(handle))possible=*file;
+        else if(const auto key=registry_key_signaled(handle))possible=*key;
+        any|=possible;every&=possible;
+        if(all?!every:any)break;
+    }
+    return all?every:any;
+}
+bool WindowsServices::resident_resolve_waits_pending(GuestMemory&) {
+    // 只在協調執行緒、不持映射鎖時呼叫：等待表、物件表、GUI 佇列與 Present 等待表只由協調執行緒修改，worker 只改客體
+    // 記憶體字組與原子訊號。各種類沿用 resolve_thread_waits 鎖下的前置判斷（物件用 wait_may_be_ready、Sleep 只看期限與
+    // 策略重試、條件變數／位址只看訊號、Present 重試看顯示緩衝）；其他種類一律視為待解析，所以只會多報，不會漏掉
+    // 鎖下會解析的等待。
+    const auto now=runtime_.clock_ticks;
+    if(gpu_signal_wakeup_ns()){
+        // 與 poll_gpu_signals(try_only) 相同只嘗試取圖形鎖；取不到時鎖下也會略過。
+        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);
+        if(graphics_lock.try_lock())for(const auto& signal:gpu_signals_)if(!signal.done || signal.done->load(std::memory_order_acquire))return true;
+    }
+    std::unique_lock<std::mutex> lock;const auto& index=resident_thread_index(lock);
+    for(const auto& [id,thread]:index.live){
+        if(thread->status!=ThreadStatus::Waiting)continue;
+        const auto& wait=thread->wait;
+        if(wait.deadline<=now)return true;
+        if(wait.alertable && !thread->apcs.empty())return true;
+        switch(wait.kind){
+        case ThreadWaitKind::Sleep:
+            if(!thread->callbacks.empty() && thread->callbacks.back().continuation==Continuation::PolicyRetry)return true;
+            break;
+        case ThreadWaitKind::Objects:
+            if(wait.handles.empty() || wait_may_be_ready(wait.handles,wait.all,id))return true;
+            break;
+        case ThreadWaitKind::Condition:case ThreadWaitKind::Address:
+            if(wait.signaled)return true;
+            break;
+        case ThreadWaitKind::PresentRetry:{
+            const auto target=present_waits_.find(id);
+            if(target==present_waits_.end() || target->second->graphics_present_ready())return true;
+            break;}
+        case ThreadWaitKind::ShaderRetry:{
+            const auto target=shader_waits_.find(id);
+            if(target==shader_waits_.end() || target->second.first->graphics_shader_ticket_ready(target->second.second))return true;
+            break;}
+        default:return true; // 臨界區段、SRW、GUI 輸入、檔案／網路 I/O 等維持鎖下的完整判斷（含補設等待者位元）。
+        }
+    }
+    return false;
+}
 bool WindowsServices::resident_resolve_waits(GuestMemory& memory) {
     // 與單槽換手相同在獨占映射鎖下推進時鐘並解析等待（逾時、已就緒物件），不輪詢外部裝置、不切換目前客體。
+    // 先在鎖外判斷有沒有任何等待可能被推進；都沒有就不取鎖、不走訪：期限多為輪詢（GPU 完成 250 µs、等 slot 的 runnable
+    // 5 ms 輪替），每次取獨占鎖都要等 worker 讀者排空、並讓渲染執行緒的 worker 服務停等（雙人成行協調者約 8.5% 在這裡，
+    // 取鎖排空約占一半）。時間頁仍照常刷新（update_readonly 不改映射）。X64ARM_RESIDENT_RESOLVE_PRECHECK=0 關閉。
+    static const bool precheck=[] {const auto* value=std::getenv("X64ARM_RESIDENT_RESOLVE_PRECHECK");return !value || std::string_view(value)!="0";}();
+    ++resolve_wait_stats_.calls;
+    if(precheck && !runtime_.lowio_standard_dirty){
+        if(runtime_.host_clock)retired(memory,0);
+        if(!resident_resolve_waits_pending(memory)){++resolve_wait_stats_.skipped;return false;}
+    }
     const std::unique_lock mapping_guard{detail::parallel_mapping_mutex()};
     if(runtime_.host_clock)retired(memory,0);
     // GPU 完成通知（D3D12／D3D11 fence、讀回）：與 wake_threads 的週期輪詢相同只嘗試取圖形鎖（提交執行緒持鎖重播時略過，
@@ -1503,6 +1619,7 @@ bool WindowsServices::resident_resolve_waits(GuestMemory& memory) {
         pump_gui(memory,false);
     }
     const auto changed=resolve_thread_waits(memory,ThreadWakeScope::All);
+    if(changed)++resolve_wait_stats_.changed;
     static const bool debug_park=std::getenv("X64ARM_DEBUG_PARK")!=nullptr; // 暫時診斷
     if(debug_park)std::fprintf(stderr,"[debug_park] 解析等待 changed=%d clock=%llu monotonic=%llu\n",changed?1:0,
         static_cast<unsigned long long>(runtime_.clock_ticks),static_cast<unsigned long long>(detail::monotonic_ticks()));
@@ -1667,6 +1784,8 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
             return std::max<std::uint64_t>(50,value?std::strtoull(value,nullptr,10):250)*1000;}();
         wake=wake?std::min(wake,poll):poll;
     }
+    // 等背景著色器編譯（ShaderRetry）：編譯在 GCD 佇列完成，沒有事件喚醒協調者；每 1 ms 輪詢票號。
+    if(!shader_waits_.empty())wake=wake?std::min<std::uint64_t>(wake,1000000):1000000;
     if(network_wait){
         const auto poll=external_wait_poll_limit()*100;
         wake=wake?std::min(wake,poll):poll;
@@ -2083,6 +2202,10 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
         poll_winusb(memory);
     }
     {
+        WakePollScope poll_measurement("poll_wlan");
+        poll_wlan(memory);
+    }
+    {
         WakePollScope poll_measurement("poll_dsound");
         poll_dsound();
     }
@@ -2212,22 +2335,7 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
     // WaitAll 的原子性。共用 event 讀原子訊號；本地物件、執行緒、子程序與檔案 I/O 的狀態不需共用鎖；共用 mutex 的
     // 擁有權（含 abandoned 探查）只能在鎖下判斷，視為可能就緒。schedule 在 wake_threads 之前保存喚醒 epoch，
     // 檢查後才發生的 SetEvent 不會遺失。
-    const auto may_be_ready=[&](const std::vector<std::uint64_t>& handles,bool all,std::uint64_t thread_id){
-        bool any=false,every=true;
-        for(const auto handle:handles){
-            bool possible=true;
-            if(const auto object=runtime_.wait_objects.find(handle);object!=runtime_.wait_objects.end()){
-                if(object->second.shared_event)possible=object->second.signaled();
-                else if(runtime_.wait_lock_descriptor(object->second)<0)possible=runtime_.wait_ready(object->second,handles,all,thread_id);
-            }else if(const auto target=this->thread_id(handle))possible=threads_.items.at(target).status==ThreadStatus::Exited;
-            else if(const auto child=process_signaled(handle))possible=*child;
-            else if(const auto file=file_io_signaled(handle))possible=*file;
-            else if(const auto key=registry_key_signaled(handle))possible=*key;
-            any|=possible;every&=possible;
-            if(all?!every:any)break;
-        }
-        return all?every:any;
-    };
+    const auto may_be_ready=[&](const std::vector<std::uint64_t>& handles,bool all,std::uint64_t thread_id){return wait_may_be_ready(handles,all,thread_id);};
     const auto selected_by=[&](const auto& wait){
         const bool condition=wait.kind==ThreadWaitKind::Condition && wait.handles.size()>1;
         if(scope==ThreadWakeScope::Condition)
@@ -2614,6 +2722,19 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             const auto target=present_waits_.find(id);
             if(target==present_waits_.end() || wait.deadline<=runtime_.clock_ticks || target->second->graphics_present_ready()){
                 if(target!=present_waits_.end())present_waits_.erase(target);
+                thread.status=ThreadStatus::Runnable;thread.wait={};
+            }
+            continue;
+        }
+        if(wait.kind==ThreadWaitKind::ShaderRetry){
+            // 背景著色器編譯完成或保底期限到：重新執行原始建立呼叫（見 d3d11_graphics_handlers.inc）。
+            const auto target=shader_waits_.find(id);
+            if(target==shader_waits_.end() || wait.deadline<=runtime_.clock_ticks || target->second.first->graphics_shader_ticket_ready(target->second.second)){
+                static const bool trace_async=std::getenv("X64ARM_TRACE_SHADER_ASYNC")!=nullptr;
+                if(trace_async)std::fprintf(stderr,"[shader_async] resume thread=%llu reason=%s waited_ms=%.1f\n",static_cast<unsigned long long>(id),
+                    target==shader_waits_.end()?"missing":wait.deadline<=runtime_.clock_ticks?"deadline":"ready",
+                    static_cast<double>(runtime_.clock_ticks+UINT64_C(300000000)-wait.deadline)/10000.0);
+                if(target!=shader_waits_.end())shader_waits_.erase(target);
                 thread.status=ThreadStatus::Runnable;thread.wait={};
             }
             continue;
@@ -3167,7 +3288,7 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory, bool cont
         if(file_deadline)next=std::min(next,*file_deadline);
         const bool external_wait =
             debugger_attached() || suspended_wait || policy_wait || media_foundation_waiting() || midi_input_waiting() || midi_output_waiting() || wave_output_waiting() || dsound_waiting() ||
-            wasapi_waiting() || directmusic_waiting() || dinput_waiting() || processes_waiting() || http_waiting() || bluetooth_waiting() || winusb_waiting() ||
+            wasapi_waiting() || directmusic_waiting() || dinput_waiting() || processes_waiting() || http_waiting() || bluetooth_waiting() || winusb_waiting() || wlan_waiting() ||
             shared_wait || remote_family_waiting() || perflib_remote_waiting() || remote_thread_creations_waiting() ||
             std::any_of(threads_.items.begin(), threads_.items.end(),
                         [](const auto &item) {
@@ -3179,7 +3300,8 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory, bool cont
                                     item.second.wait.kind == ThreadWaitKind::EtwTrace ||
                                     item.second.wait.kind == ThreadWaitKind::DebugEvent ||
                                     item.second.wait.kind == ThreadWaitKind::CrtProcess ||
-                                    item.second.wait.kind == ThreadWaitKind::PresentRetry);
+                                    item.second.wait.kind == ThreadWaitKind::PresentRetry ||
+                                    item.second.wait.kind == ThreadWaitKind::ShaderRetry);
                         }) ||
             !runtime_.network.resolvers.empty() || !runtime_.network.pending_lookups.empty() || !runtime_.network.pending_accepts.empty() ||
             !runtime_.network.pending_socket_io.empty() || !gui_.socket_watches.empty() || !file_deadline ||
@@ -3438,6 +3560,14 @@ std::optional<std::uint32_t> WindowsServices::exit_thread(GuestState &state, Gue
     gui_.com_initializations.erase(threads_.current);
     if(gui_.com_main_sta==threads_.current)gui_.com_main_sta=0;
     for (std::size_t i = 0; i < runtime_.fls_used.size(); ++i) {
+        if (trace_fls_values() && runtime_.fls_used[i] && runtime_.fls_callbacks[i] && runtime_.fls_values[i] == UINT64_MAX)
+            std::fprintf(stderr, "[fls_sentinel] exit thread=%llu slot=%zu callback=0x%llx last_set=%s\n", static_cast<unsigned long long>(threads_.current), i,
+                         static_cast<unsigned long long>(runtime_.fls_callbacks[i]), detail::fls_trace_lookup(threads_.current, i) ? "recorded" : "none");
+        if (trace_fls_values() && runtime_.fls_used[i])
+            if (const auto last = detail::fls_trace_lookup(threads_.current, i); last && *last != runtime_.fls_values[i])
+                std::fprintf(stderr, "[fls_mismatch] exit thread=%llu slot=%zu runtime=0x%llx last_set=0x%llx saved=0x%llx parked=%d\n",
+                             static_cast<unsigned long long>(threads_.current), i, static_cast<unsigned long long>(runtime_.fls_values[i]),
+                             static_cast<unsigned long long>(*last), static_cast<unsigned long long>(exiting.fls_values[i]), resident_current_parked_ ? 1 : 0);
         if (runtime_.fls_used[i] && runtime_.fls_callbacks[i] && runtime_.fls_values[i])
             callbacks.push_back({runtime_.fls_callbacks[i], {runtime_.fls_values[i]}});
         runtime_.fls_values[i] = 0;

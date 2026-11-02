@@ -6,9 +6,16 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "x64arm/socket_namespace.hpp"
 namespace x64arm {
+// IP Helper 與 WLAN 共用同一個由宿主介面名稱穩定衍生的客體身分。
+inline std::array<std::uint8_t,16> network_interface_guid(std::string_view name){
+    std::array<std::uint8_t,16> value{};std::uint64_t hash=14695981039346656037ULL;
+    for(unsigned half=0;half<2;++half){for(const auto c:std::string("x64arm-interface-")+std::to_string(half)+std::string(name)){hash^=static_cast<unsigned char>(c);hash*=1099511628211ULL;}for(unsigned i=0;i<8;++i)value[half*8+i]=static_cast<std::uint8_t>(hash>>(i*8));}
+    value[7]=(value[7]&15)|0x80;value[8]=(value[8]&63)|0x80;return value;
+}
 namespace socket_database {struct Job;}
 struct PendingSocketLookup {
     std::uint64_t window{},buffer{};

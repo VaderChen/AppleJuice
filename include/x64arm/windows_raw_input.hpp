@@ -18,7 +18,25 @@ struct HidFile {
     std::shared_ptr<input::Backend> backend;
     hid::Layout layout;
     std::deque<std::vector<std::uint8_t>> reports;
+    std::uint32_t input_buffer_count{32};
     bool disconnected{};
+    std::uint32_t physical_descriptor(std::vector<std::uint8_t>& bytes){
+        std::uint32_t transferred=0,error=0;
+        if(bytes.empty())error=87;
+        else if(disconnected || !backend || !backend->available(device.instance))error=1167;
+        else error=backend->get_physical_descriptor(device.instance,bytes,transferred);
+        if(!error && transferred>bytes.size())error=31;
+        bytes.resize(error?0:transferred);return error;
+    }
+    bool set_input_buffer_count(std::uint32_t count){
+        if(count<2 || count>512)return false;
+        while(reports.size()>count)reports.pop_front();
+        input_buffer_count=count;return true;
+    }
+    void enqueue_report(const std::vector<std::uint8_t>& report){
+        reports.push_back(report);
+        while(reports.size()>input_buffer_count)reports.pop_front();
+    }
 };
 struct RawInputDevice {
     input::Device device;

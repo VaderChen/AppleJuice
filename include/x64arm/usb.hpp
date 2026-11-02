@@ -32,7 +32,14 @@ struct Transfer {
     std::uint32_t error{};       // Win32 錯誤碼
     std::uint32_t transferred{};
     std::vector<std::uint8_t> data;
+    struct Packet {std::uint32_t offset{},requested{},transferred{},status{};};
+    std::vector<Packet> packets; // 等時傳輸保留每個服務間隔的長度、空洞與 USBD_STATUS。
+    std::uint64_t next_frame{};
+    bool submitted{};
 };
+// 匯流排微幀與宿主含睡眠單調時鐘的同一次取樣；host_ticks 採 100 ns 刻度。
+// accuracy_us 是取樣／邊界的不確定範圍，服務層不可把呼叫完成時間當成 USB 邊界。
+struct TimeSample {std::uint64_t microframe{},host_ticks{};std::uint32_t accuracy_us{};};
 // WinUSB 工作階段：只開啟沒有 macOS 驅動接管的介面（WinUSB 為該介面的功能驅動）。
 class Session {
 public:
@@ -45,10 +52,21 @@ public:
     // 控制傳輸（預設端點 0）；data 對 OUT 為送出內容、對 IN 為長度與接收區。
     virtual std::shared_ptr<Transfer> control(unsigned interface,std::uint8_t type,std::uint8_t request,std::uint16_t value,std::uint16_t index,std::vector<std::uint8_t> data,std::uint32_t timeout_ms)=0;
     virtual std::shared_ptr<Transfer> pipe(unsigned interface,std::uint8_t endpoint,std::vector<std::uint8_t> data,std::uint32_t timeout_ms)=0;
+    virtual std::uint32_t frame(unsigned interface,std::uint64_t& number)=0;
+    virtual std::uint32_t time_sample(unsigned interface,TimeSample& sample)=0;
+    virtual std::shared_ptr<Transfer> isoch(unsigned interface,std::uint8_t endpoint,std::vector<std::uint8_t> data,
+        std::uint32_t packet_bytes,std::uint32_t interval_microframes,std::uint64_t first_frame,bool asap,bool continue_stream)=0;
     virtual std::uint32_t abort(unsigned interface,std::uint8_t endpoint)=0;
     virtual std::uint32_t reset(unsigned interface,std::uint8_t endpoint)=0;
 };
 std::unique_ptr<Session> open(std::uint64_t registry_id,std::span<const unsigned> interfaces,std::uint32_t& error);
+// 裝置盤點與傳輸必須來自同一個後端；嵌入者也可提供自己的 USB 匯流排。
+class Backend {
+public:
+    virtual ~Backend()=default;
+    virtual std::vector<Device> devices()=0;
+    virtual std::unique_ptr<Session> open(std::uint64_t registry_id,std::span<const unsigned> interfaces,std::uint32_t& error)=0;
+};
 // 裝置介面路徑對應的開啟目標：WinUSB 函式（未被 macOS 接管的介面）或一般 USB 裝置。
 struct Target {std::uint64_t registry_id{};std::vector<unsigned> interfaces;bool winusb{};unsigned speed{};};
 // \\?\usb#… 形式的 USB 裝置介面路徑。

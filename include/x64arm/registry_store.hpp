@@ -20,6 +20,9 @@ private:
     friend void run_registry_io(const Work&);
 };
 void run_registry_io(const RegistryIoScope::Work&);
+// 程序內登錄交易的保守世代；供排程避免重查未改變的內容。UINT64_MAX 表示快取停用。
+// 各 RegistryState 仍由既有服務／I/O 門閂序列化，本世代不取代狀態鎖。
+std::uint64_t registry_activity_generation() noexcept;
 // 只供持有同一份 RegistryState 的服務使用；持久資料的變更仍由交易鎖序列化。
 struct RegistryStoreCache {
     static constexpr std::size_t byte_limit=256U*1024U;

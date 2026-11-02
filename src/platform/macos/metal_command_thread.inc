@@ -119,6 +119,9 @@ public:
     bool graphics_vertex_format_supported(std::uint32_t format) override {graphics_sync();return inner_->graphics_vertex_format_supported(format);}
     std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes) override {graphics_sync();return inner_->graphics_shader(stage,bytes);}
     std::shared_ptr<GraphicsShader> graphics_shader_private(std::uint32_t stage,std::span<const std::uint8_t> bytes) override {graphics_sync();return inner_->graphics_shader_private(stage,bytes);}
+    // 背景編譯只動 MetalGl 自帶鎖的快取與工作表，不碰編碼狀態，不必等命令執行緒排空。
+    std::uint64_t graphics_shader_prefetch(std::uint32_t stage,std::span<const std::uint8_t> bytes) override {return inner_->graphics_shader_prefetch(stage,bytes);}
+    bool graphics_shader_ticket_ready(std::uint64_t ticket) override {return inner_->graphics_shader_ticket_ready(ticket);}
     std::shared_ptr<GraphicsShader> graphics_compute_source(const GraphicsModernShader& shader) override {graphics_sync();return inner_->graphics_compute_source(shader);}
     std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t> desc) override {graphics_sync();return inner_->graphics_sampler(desc);}
     bool graphics_timestamp_supported()const override {return inner_->graphics_timestamp_supported();}

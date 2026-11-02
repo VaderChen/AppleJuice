@@ -1,4 +1,4 @@
-            graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);
+            graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);present_thread_=threads_.current;
             require(u32(1)<=4 && !(u32(2)&~0x21bU));
             // 顯示緩衝都在途時，呈現會在 nextDrawable 等到下一次垂直同步；Present 在全體靜止的服務邊界執行，等待期間
             // 所有客體執行緒一起停（DQ3 讀取畫面每幀約 12 ms，讀取執行緒近四成時間被凍結）。改讓呼叫端進入重試等待、

@@ -2,6 +2,7 @@
 #include "x64arm/security_descriptor.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -21,6 +22,12 @@
 namespace x64arm {
 namespace {
 thread_local RegistryIoScope* io_scope{};
+std::atomic<std::uint64_t> activity_generation{1};
+void advance_activity_generation() noexcept {
+    auto value=activity_generation.load(std::memory_order_relaxed);
+    while(value!=UINT64_MAX && !activity_generation.compare_exchange_weak(
+        value,value+1,std::memory_order_release,std::memory_order_relaxed)){}
+}
 constexpr std::size_t limit=32U*1024U*1024U;
 // 與共用慢服務診斷一起啟用；正常路徑不讀時鐘、不寫診斷。
 class RegistryTrace {
@@ -133,7 +140,10 @@ LazyWriter& lazy_writer(){static LazyWriter writer;return writer;}
 RegistryIoScope::RegistryIoScope(Runner runner):runner_(std::move(runner)),previous_(io_scope){io_scope=this;}
 RegistryIoScope::~RegistryIoScope(){io_scope=previous_;}
 void run_registry_io(const RegistryIoScope::Work& work){if(io_scope && io_scope->runner_)io_scope->runner_(work);else work();}
+std::uint64_t registry_activity_generation() noexcept {return activity_generation.load(std::memory_order_acquire);}
 RegistryTransaction::RegistryTransaction(RegistryState& state,const std::filesystem::path& path,RegistryStoreCache* cache,bool readonly):state_(state),path_(path),cache_(cache),readonly_(readonly){
+    // 進入與離開都失效：失敗、唯讀交易重載及例外前的部分工作也不能沿用舊內容判定。
+    advance_activity_generation();
     if(path.empty())return;
     // 只把不可變的 metadata 複本交給 I/O；worker 不讀寫 RegistryState 或 cache。
     const auto io_path=path;const auto lock_path=path.string()+".lock";
@@ -227,6 +237,7 @@ RegistryTransaction::RegistryTransaction(RegistryState& state,const std::filesys
     }catch(const SecurityDescriptorError&){error=13;}catch(const std::exception&){error=13;}
 }
 RegistryTransaction::~RegistryTransaction(){
+    advance_activity_generation();
     RegistryTrace trace("release_lock");
     // 可寫操作即使失敗也可能改過暫存狀態；下一次必須以持久資料重新建立快照。
     if(cache_ && (!readonly_ || error))cache_->valid=false;
