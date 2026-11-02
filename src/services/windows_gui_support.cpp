@@ -18,7 +18,18 @@
 namespace x64arm {
 std::uint32_t WindowsServices::system_metric(std::uint32_t index,std::uint32_t dpi) {
     switch(index){
-    case 0:case 1:case 78:case 79:{const auto area=gui_screen_area();return static_cast<std::uint32_t>((index==0 || index==78)?area[2]-area[0]:area[3]-area[1]);}
+    case 0:case 1:{const auto area=gui_screen_area();return static_cast<std::uint32_t>(index==0?area[2]-area[0]:area[3]-area[1]);}
+    case 76:case 77:case 78:case 79:{
+        // SM_*VIRTUALSCREEN 為全部顯示器的聯集；主螢幕左側或上方的螢幕使左上角為負值。
+        const auto& monitors=gui_monitors();auto bounds=monitors.front().rect;
+        for(const auto& monitor:monitors){
+            bounds[0]=std::min(bounds[0],monitor.rect[0]);bounds[1]=std::min(bounds[1],monitor.rect[1]);
+            bounds[2]=std::max(bounds[2],monitor.rect[2]);bounds[3]=std::max(bounds[3],monitor.rect[3]);
+        }
+        return static_cast<std::uint32_t>(index==76?bounds[0]:index==77?bounds[1]:index==78?bounds[2]-bounds[0]:bounds[3]-bounds[1]);
+    }
+    case 80:return static_cast<std::uint32_t>(gui_monitors().size());
+    case 81:return 1;
     case 16:case 17:{const auto area=gui_work_area();return static_cast<std::uint32_t>(index==16?area[2]-area[0]:area[3]-area[1]);}
     case 68:return gui_scale_signed_metric(gui_.mouse_drag_width,dpi);
     case 69:return gui_scale_signed_metric(gui_.mouse_drag_height,dpi);
@@ -260,8 +271,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             if(current_process_handle(process,0) || process_handle_pid(process,0x1000))fail(5);else fail(6);
         }else {gui_.observe_resources();const auto index=(flags==1 || flags==4)?1U:0U;result=std::min<std::uint64_t>(UINT32_MAX,flags>=2?gui_.resource_peaks[index]:gui_.resource_counts()[index]);last_error_=0;}
     }else if(service.family=="dwmapi.dll"){
-        // 本後端提供一般視窗，尚無 DWM redirection／玻璃合成能力；維持一致的停用狀態。
-        if(symbol=="DwmIsCompositionEnabled"){
+        // 本後端提供一般視窗，尚無 DWM redirection 與其合成查詢，維持一致的停用狀態；
+        // DwmExtendFrameIntoClientArea 的整片玻璃由原生非不透明視窗承接，客戶區依內容 alpha 合成。
+        if(symbol=="DwmExtendFrameIntoClientArea"){
+            const auto found=gui_.windows.find(arg(0));
+            if(found==gui_.windows.end())result=0x80070578U;
+            else if(!arg(1) || found->second.parent)result=0x80070057U;
+            else {
+                bool glass=false;for(unsigned i=0;i<4;++i)glass=glass || static_cast<std::int32_t>(memory.load(GuestAddress{arg(1)+4*i},32))<0;
+                if(gui_geometry_trace_enabled())std::fprintf(stderr,"[gui-geometry] pid=%u hwnd=%llx op=dwm-glass glass=%d\n",process_id(),static_cast<unsigned long long>(arg(0)),glass?1:0);
+                if(found->second.dwm_glass!=glass){found->second.dwm_glass=glass;present_gui(arg(0));}
+                result=0;
+            }
+        }
+        else if(symbol=="DwmIsCompositionEnabled"){
             if(!arg(0))result=0x80070057U;else memory.store(GuestAddress{arg(0)},32,0);
         } else if(symbol=="DwmDefWindowProc")result=0; // FALSE：交回客體一般視窗程序處理。
         else if(symbol=="DwmEnableComposition")result=d(0)>1?0x80070057U:d(0)?0x80263001U:0U;
@@ -672,7 +695,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         }
     }
     else if(symbol=="GetWindowRect"){
-        std::int32_t x=0,y=0;std::uint32_t width=1440,height=900;
+        // 桌面視窗的矩形為主顯示器；整個虛擬桌面另由 SM_*VIRTUALSCREEN 提供。
+        const auto desktop=gui_screen_area();
+        std::int32_t x=desktop[0],y=desktop[1];std::uint32_t width=static_cast<std::uint32_t>(desktop[2]-desktop[0]),height=static_cast<std::uint32_t>(desktop[3]-desktop[1]);
         if(arg(0)!=gui_.desktop){const auto f=gui_.windows.find(arg(0));if(f==gui_.windows.end()){fail(1400);arg.return_to(state,0);return std::nullopt;}const auto origin=gui_client_origin(gui_,f->second.parent);x=static_cast<std::int32_t>(f->second.x+origin[0]);y=static_cast<std::int32_t>(f->second.y+origin[1]);const auto outer=gui_outer_size(f->second);width=outer[0];height=outer[1];}
         memory.store(GuestAddress{arg(1)},32,static_cast<std::uint32_t>(x));memory.store(GuestAddress{arg(1)+4},32,static_cast<std::uint32_t>(y));memory.store(GuestAddress{arg(1)+8},32,static_cast<std::uint32_t>(x)+width);memory.store(GuestAddress{arg(1)+12},32,static_cast<std::uint32_t>(y)+height);result=1;
     } else if(symbol=="MapWindowPoints"){

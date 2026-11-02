@@ -47,6 +47,14 @@ std::span<const WindowsServiceDescriptor> resource_service_descriptors(){
     };return table;
 }
 namespace {
+// 已轉小寫的 "\\.\displayN" → N（1 起算）；格式不符回 0。
+std::uint64_t display_device_index(std::u16string_view name){
+    constexpr std::u16string_view prefix=u"\\\\.\\display";
+    if(!name.starts_with(prefix) || name.size()==prefix.size() || name.size()>prefix.size()+3)return 0;
+    std::uint64_t value=0;
+    for(const auto c:name.substr(prefix.size())){if(c<u'0' || c>u'9')return 0;value=value*10+(c-u'0');}
+    return value;
+}
 // 與現有 GDI 單一虛擬桌面一致，並非宿主螢幕 EDID／硬體時序。
 constexpr std::uint64_t display_adapter_luid=UINT64_C(0x58464d0000000001);
 constexpr unsigned display_width=1440,display_height=900,display_refresh=60;
@@ -492,14 +500,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
         auto device=arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16(read_ansi(memory,arg(0)))):std::u16string{};
         for(auto& c:device)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
         const unsigned stride=wide?2:1,size=wide?840:424;
+        // lpDevice 為 NULL 時依 iDevNum 列舉各顯示器的轉接輸出 \\.\DISPLAYn；指定裝置時回報其唯一的監視器。
+        const auto& monitors=gui_monitors();const auto adapter=device.empty()?0:display_device_index(device);
         if(!arg(2) || (d(3)&~1U))fail(87);
         else if(d(3)&1U)fail(50); // 沒有可開啟的 PnP 裝置介面路徑。
-        else if(d(1) || (!device.empty() && device!=u"\\\\.\\display1"))result=0;
+        else if(device.empty()?d(1)>=monitors.size():(!adapter || adapter>monitors.size() || d(1)))result=0;
         else if(memory.load(GuestAddress{arg(2)},32)!=size)fail(87);
-        else {memory.write(GuestAddress{arg(2)},std::vector<std::uint8_t>(size));memory.store(GuestAddress{arg(2)},32,size);
-            (void)copy_text(arg(2)+4,32,device.empty()?u"\\\\.\\DISPLAY1":u"\\\\.\\DISPLAY1\\Monitor0");
+        else {const auto index=device.empty()?std::uint64_t{d(1)}+1:adapter;const auto name=u"\\\\.\\DISPLAY"+utf8_to_utf16(std::to_string(index));
+            memory.write(GuestAddress{arg(2)},std::vector<std::uint8_t>(size));memory.store(GuestAddress{arg(2)},32,size);
+            (void)copy_text(arg(2)+4,32,device.empty()?name:name+u"\\Monitor0");
             (void)copy_text(arg(2)+4+32*stride,128,device.empty()?u"x64arm Virtual Display":u"x64arm Virtual Monitor");
-            memory.store(GuestAddress{arg(2)+4+160*stride},32,device.empty()?5:3);
+            // DISPLAY_DEVICE_ATTACHED_TO_DESKTOP＝1、PRIMARY_DEVICE＝4；監視器為 ACTIVE｜ATTACHED＝3。
+            memory.store(GuestAddress{arg(2)+4+160*stride},32,device.empty()?(monitors[index-1].primary?5U:1U):3U);
             (void)copy_text(arg(2)+8+160*stride,128,device.empty()?display_identity::instance:u"X64ARM\\MONITOR");
             if(device.empty())(void)copy_text(arg(2)+8+288*stride,128,std::u16string(u"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Class\\")+std::u16string(display_identity::class_name)+u"\\0000");result=1;}
     }else if(symbol=="ChangeDisplaySettingsA" || symbol=="ChangeDisplaySettingsW" || symbol=="ChangeDisplaySettingsExA" || symbol=="ChangeDisplaySettingsExW"){
@@ -530,38 +542,79 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
         }
     }else if(symbol.starts_with("EnumDisplaySettings")){
         const auto current_mode=native_gui_?native_gui_->current_display_mode():std::optional<GuiDisplayMode>{};
-        const auto mode_width=current_mode?current_mode->width:1440U,mode_height=current_mode?current_mode->height:900U;
-        const auto mode_rate=current_mode?(current_mode->refresh_numerator+current_mode->refresh_denominator/2)/current_mode->refresh_denominator:60U;
         auto device=arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16(read_ansi(memory,arg(0)))):std::u16string{};
         for(auto& c:device)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
+        const auto& monitors=gui_monitors();const auto index=device.empty()?1:display_device_index(device);
         const unsigned name_bytes=wide?64:32,total=wide?220:156,pixels=wide?168:104;
         if(!arg(2) || (symbol.starts_with("EnumDisplaySettingsEx") && (d(3)&~3U)))fail(87);
-        else if(!device.empty() && device!=u"\\\\.\\display1")fail(1168);
+        else if(!index || index>monitors.size())fail(1168);
         else if(d(1)!=0 && d(1)!=UINT32_MAX && d(1)!=UINT32_MAX-1)fail(259);
         else if(memory.load(GuestAddress{arg(2)+name_bytes+4},16)!=total)fail(87);
-        else {memory.write(GuestAddress{arg(2)},std::vector<std::uint8_t>(total));(void)copy_text(arg(2),32,u"\\\\.\\DISPLAY1");
+        else {
+            // 主螢幕沿用原生目前模式；其他顯示器以桌面範圍與更新率表示，dmPosition 為其虛擬桌面左上角。
+            const auto& monitor=monitors[index-1];
+            const auto mode_width=monitor.primary && current_mode?current_mode->width:static_cast<std::uint32_t>(monitor.rect[2]-monitor.rect[0]);
+            const auto mode_height=monitor.primary && current_mode?current_mode->height:static_cast<std::uint32_t>(monitor.rect[3]-monitor.rect[1]);
+            const auto mode_rate=monitor.primary && current_mode?(current_mode->refresh_numerator+current_mode->refresh_denominator/2)/current_mode->refresh_denominator:monitor.refresh;
+            memory.write(GuestAddress{arg(2)},std::vector<std::uint8_t>(total));(void)copy_text(arg(2),32,u"\\\\.\\DISPLAY"+utf8_to_utf16(std::to_string(index)));
             memory.store(GuestAddress{arg(2)+name_bytes},16,0x401);memory.store(GuestAddress{arg(2)+name_bytes+2},16,1);memory.store(GuestAddress{arg(2)+name_bytes+4},16,total);
             memory.store(GuestAddress{arg(2)+name_bytes+8},32,0x007c0020);
+            memory.store(GuestAddress{arg(2)+name_bytes+12},32,static_cast<std::uint32_t>(monitor.rect[0]));memory.store(GuestAddress{arg(2)+name_bytes+16},32,static_cast<std::uint32_t>(monitor.rect[1]));
             memory.store(GuestAddress{arg(2)+pixels-2},16,96);memory.store(GuestAddress{arg(2)+pixels},32,32);
             memory.store(GuestAddress{arg(2)+pixels+4},32,mode_width);memory.store(GuestAddress{arg(2)+pixels+8},32,mode_height);memory.store(GuestAddress{arg(2)+pixels+16},32,mode_rate);result=1;}
     }else if(symbol=="EnumDisplayMonitors"){
         if(!arg(2))fail(87);
         else if(arg(0))fail(50); // HDC 畫圖枚舉尚未提供，不能回報未套用 clipping 的成功結果。
         else {
-            memory.check(GuestAddress{arg(2)},1,Access::Execute);bool visible=true;const auto screen=gui_screen_area();
-            if(arg(1)){std::array<std::int32_t,4> rect{};for(unsigned i=0;i<4;++i)rect[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(1)+4*i},32));visible=rect[0]<rect[2] && rect[1]<rect[3] && rect[0]<screen[2] && rect[1]<screen[3] && rect[2]>screen[0] && rect[3]>screen[1];}
-            if(!visible)result=1;
-            else {const auto rect=allocate_heap(memory,16);for(unsigned i=0;i<4;++i)memory.store(GuestAddress{rect+i*4},32,static_cast<std::uint32_t>(screen[i]));
-                try{start_callbacks(state,memory,{{arg(2),{1,0,rect,arg(3)}}},Continuation::ReturnCallbackFreeHeap,rect);}
-                catch(...){(void)free_heap(memory,rect,state);throw;}return std::nullopt;}
+            memory.check(GuestAddress{arg(2)},1,Access::Execute);
+            std::optional<std::array<std::int32_t,4>> clip;
+            if(arg(1)){std::array<std::int32_t,4> rect{};for(unsigned i=0;i<4;++i)rect[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(1)+4*i},32));clip=rect;}
+            // 每台與裁切範圍相交的顯示器各回呼一次；有裁切範圍時傳入交集矩形。
+            std::vector<std::pair<std::uint64_t,std::array<std::int32_t,4>>> visible;
+            const auto& monitors=gui_monitors();
+            for(std::size_t i=0;i<monitors.size();++i){
+                auto rect=monitors[i].rect;
+                if(clip)rect={std::max(rect[0],(*clip)[0]),std::max(rect[1],(*clip)[1]),std::min(rect[2],(*clip)[2]),std::min(rect[3],(*clip)[3])};
+                if(rect[0]<rect[2] && rect[1]<rect[3])visible.emplace_back(i+1,rect);
+            }
+            if(visible.empty())result=1;
+            else {const auto rects=allocate_heap(memory,16*visible.size());std::vector<GuestCallback> calls;
+                for(std::size_t j=0;j<visible.size();++j){
+                    for(unsigned i=0;i<4;++i)memory.store(GuestAddress{rects+j*16+i*4},32,static_cast<std::uint32_t>(visible[j].second[i]));
+                    calls.push_back({arg(2),{visible[j].first,0,rects+j*16,arg(3)}});
+                }
+                try{start_callbacks(state,memory,std::move(calls),Continuation::MonitorEnumeration,rects);}
+                catch(...){(void)free_heap(memory,rects,state);throw;}return std::nullopt;}
         }
     }else if(symbol.starts_with("MonitorFrom")){
-        const auto screen=gui_screen_area();if(d(1)>2)fail(87);else if(symbol=="MonitorFromWindow"){result=gui_.windows.contains(arg(0)) || d(1)?1:0;}
-        else if(symbol=="MonitorFromPoint"){const auto x=static_cast<std::int32_t>(arg(0)),y=static_cast<std::int32_t>(arg(0)>>32);result=(x>=screen[0] && y>=screen[1] && x<screen[2] && y<screen[3]) || d(1)?1:0;}
-        else {const auto x=static_cast<std::int32_t>(memory.load(GuestAddress{arg(0)},32)),y=static_cast<std::int32_t>(memory.load(GuestAddress{arg(0)+4},32)),right=static_cast<std::int32_t>(memory.load(GuestAddress{arg(0)+8},32)),bottom=static_cast<std::int32_t>(memory.load(GuestAddress{arg(0)+12},32));result=(x<screen[2] && y<screen[3] && right>screen[0] && bottom>screen[1]) || d(1)?1:0;}
+        const auto flags=d(1);
+        if(flags>2)fail(87);
+        else if(symbol=="MonitorFromWindow"){
+            // 最小化視窗依還原位置判斷；其他程序的視窗查共用視窗表，找不到時依旗標回主螢幕或 NULL。
+            std::optional<std::array<std::int32_t,4>> rect;
+            if(arg(0)==gui_.desktop)rect=gui_screen_area();
+            else if(const auto found=gui_.windows.find(arg(0));found!=gui_.windows.end()){
+                const auto& window=found->second;
+                if(window.show_command==2 && window.normal_rect){const auto& n=*window.normal_rect;rect=std::array<std::int32_t,4>{n[0],n[1],n[0]+n[2],n[1]+n[3]};}
+                else {const auto origin=gui_client_origin(gui_,window.parent);const auto outer=gui_outer_size(window);
+                    const auto x=static_cast<std::int32_t>(window.x+origin[0]),y=static_cast<std::int32_t>(window.y+origin[1]);
+                    rect=std::array<std::int32_t,4>{x,y,x+static_cast<std::int32_t>(outer[0]),y+static_cast<std::int32_t>(outer[1])};}
+            }else if(const auto shared=shared_gui_window(arg(0))){
+                rect=std::array<std::int32_t,4>{shared->x,shared->y,shared->x+static_cast<std::int32_t>(shared->outer_width),shared->y+static_cast<std::int32_t>(shared->outer_height)};
+            }
+            result=rect?gui_monitor_from_rect(*rect,flags):flags?1:0;
+        }
+        else if(symbol=="MonitorFromPoint"){const auto x=static_cast<std::int32_t>(arg(0)),y=static_cast<std::int32_t>(arg(0)>>32);result=gui_monitor_from_rect({x,y,x,y},flags);}
+        else {std::array<std::int32_t,4> rect{};for(unsigned i=0;i<4;++i)rect[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(0)+4*i},32));result=gui_monitor_from_rect(rect,flags);}
     }else if(symbol.starts_with("GetMonitorInfo")){
-        const auto size=memory.load(GuestAddress{arg(1)},32);if(arg(0)!=1)fail(1461);else if(size!=40 && size!=(wide?104U:72U))fail(87);
-        else {memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(size),Access::Write);for(unsigned offset:{4U,20U}){const auto area=offset==4?gui_screen_area():gui_work_area();for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(1)+offset+i*4},32,static_cast<std::uint32_t>(area[i]));}memory.store(GuestAddress{arg(1)+36},32,1);if(size>40)(void)copy_text(arg(1)+40,32,u"\\\\.\\DISPLAY1");result=1;}
+        const auto& monitors=gui_monitors();
+        const auto size=memory.load(GuestAddress{arg(1)},32);if(!arg(0) || arg(0)>monitors.size())fail(1461);else if(size!=40 && size!=(wide?104U:72U))fail(87);
+        else {memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(size),Access::Write);const auto& monitor=monitors[arg(0)-1];
+            // 主螢幕工作區沿用 AppBar 調整後的結果；其他螢幕使用原生 visibleFrame。
+            const auto work=monitor.primary?gui_work_area():monitor.work;
+            for(unsigned i=0;i<4;++i){memory.store(GuestAddress{arg(1)+4+i*4},32,static_cast<std::uint32_t>(monitor.rect[i]));memory.store(GuestAddress{arg(1)+20+i*4},32,static_cast<std::uint32_t>(work[i]));}
+            memory.store(GuestAddress{arg(1)+36},32,monitor.primary?1U:0U);
+            if(size>40)(void)copy_text(arg(1)+40,32,u"\\\\.\\DISPLAY"+utf8_to_utf16(std::to_string(arg(0))));result=1;}
     }else if(symbol.starts_with("SystemParametersInfo")){
         // 與 GetSystemMetrics、AppBar 共用桌面／工作區；未支援的 action 回傳明確錯誤。
         const auto font=[&](std::uint64_t pointer){memory.write(GuestAddress{pointer},std::vector<std::uint8_t>(wide?92U:60U));memory.store(GuestAddress{pointer},32,static_cast<std::uint32_t>(-12));memory.store(GuestAddress{pointer+16},32,400);memory.store(GuestAddress{pointer+23},8,1);memory.store(GuestAddress{pointer+24},8,4);memory.store(GuestAddress{pointer+26},8,5);(void)copy_text(pointer+28,32,runtime_.network.external_io?native_ui_font_family():u"Segoe UI");};

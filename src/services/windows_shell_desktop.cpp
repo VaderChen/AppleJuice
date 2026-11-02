@@ -35,9 +35,39 @@ void WindowsServices::refresh_gui_areas(){
     if(gui_area_cached_!=std::chrono::steady_clock::time_point{} && gui_area_cache_window().count()>0 && now-gui_area_cached_<gui_area_cache_window())return;
     gui_screen_cache_=native_gui_?native_gui_->screen_area():Rect{0,0,1440,900};
     gui_work_cache_=native_gui_?native_gui_->work_area():Rect{0,0,1440,900};
+    gui_monitor_cache_=native_gui_?native_gui_->monitors():std::vector<GuiMonitor>{};
+    std::erase_if(gui_monitor_cache_,[](const GuiMonitor& m){return m.rect[0]>=m.rect[2] || m.rect[1]>=m.rect[3];});
+    if(gui_monitor_cache_.empty()){const auto& w=gui_work_cache_;gui_monitor_cache_.push_back({gui_screen_cache_,{w[0],w[1],w[0]+w[2],w[1]+w[3]},true});}
+    // HMONITOR 1 固定為主螢幕；後端若未把主螢幕排第一，保持其餘順序後移到最前。
+    std::stable_partition(gui_monitor_cache_.begin(),gui_monitor_cache_.end(),[](const GuiMonitor& m){return m.primary;});
+    gui_monitor_cache_.front().primary=true;
+    for(std::size_t i=1;i<gui_monitor_cache_.size();++i)gui_monitor_cache_[i].primary=false;
     gui_area_cached_=now;
 }
 std::array<std::int32_t,4> WindowsServices::gui_screen_area(){refresh_gui_areas();return gui_screen_cache_;}
+const std::vector<GuiMonitor>& WindowsServices::gui_monitors(){refresh_gui_areas();return gui_monitor_cache_;}
+// MonitorFromRect 契約：取交集面積最大者；沒有交集時依 MONITOR_DEFAULTTONULL／PRIMARY／NEAREST 處理。
+// 空矩形以左上角的點判斷，與 MonitorFromPoint 共用。
+std::uint64_t WindowsServices::gui_monitor_from_rect(const std::array<std::int32_t,4>& input,std::uint32_t flags){
+    const auto& monitors=gui_monitors();
+    auto rect=input;if(rect[0]>=rect[2] || rect[1]>=rect[3]){rect[2]=rect[0]+1;rect[3]=rect[1]+1;}
+    std::uint64_t best=0;std::int64_t best_area=0;
+    for(std::size_t i=0;i<monitors.size();++i){
+        const auto& m=monitors[i].rect;
+        const std::int64_t w=std::min<std::int64_t>(rect[2],m[2])-std::max<std::int64_t>(rect[0],m[0]),h=std::min<std::int64_t>(rect[3],m[3])-std::max<std::int64_t>(rect[1],m[1]);
+        if(w>0 && h>0 && w*h>best_area){best_area=w*h;best=i+1;}
+    }
+    if(best || flags==0)return best;
+    if(flags==1)return 1;
+    std::uint64_t nearest=1;std::int64_t nearest_distance=INT64_MAX;
+    for(std::size_t i=0;i<monitors.size();++i){
+        const auto& m=monitors[i].rect;
+        const auto dx=std::max<std::int64_t>({0,static_cast<std::int64_t>(m[0])-rect[2]+1,static_cast<std::int64_t>(rect[0])-m[2]+1});
+        const auto dy=std::max<std::int64_t>({0,static_cast<std::int64_t>(m[1])-rect[3]+1,static_cast<std::int64_t>(rect[1])-m[3]+1});
+        if(dx*dx+dy*dy<nearest_distance){nearest_distance=dx*dx+dy*dy;nearest=i+1;}
+    }
+    return nearest;
+}
 std::array<std::int32_t,4> WindowsServices::gui_work_area(std::uint64_t excluded){
     refresh_gui_areas();auto area=gui_work_cache_;
     area[2]+=area[0];area[3]+=area[1];

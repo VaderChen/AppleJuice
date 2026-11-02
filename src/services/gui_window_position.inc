@@ -104,6 +104,10 @@ std::optional<std::uint32_t> WindowsServices::finish_gui_window_pos(GuestState& 
             if(!moved)flags|=2U;
             if(!sized)flags|=1U;else if(flags&0x20U)flags&=~1U;
             if(!(flags&2U)){window.x=item.x;window.y=item.y;}if(!(flags&1U)){window.width=client[0];window.height=client[1];}
+            if(gui_geometry_trace_enabled()){const auto f=gui_frame_insets(window);
+                std::fprintf(stderr,"[gui-geometry] pid=%u hwnd=%llx op=setpos flags=%x after=%llx req=%d,%d %ux%u frame=%u,%u,%u,%u calc=%d model=%d,%d %ux%u\n",
+                    process_id(),static_cast<unsigned long long>(item.window),flags,static_cast<unsigned long long>(item.after),item.x,item.y,item.width,height,f.left,f.top,f.right,f.bottom,
+                    item.calculated?1:0,window.x,window.y,window.width,window.height);}
             if(flags&0x40U){window.visible=true;window.style|=0x10000000U;}if(flags&0x80U){window.visible=false;window.style&=~0x10000000U;}
             if(!(flags&4U) && item.after!=item.window) {
                 if(item.after==UINT64_MAX)window.ex_style|=8U;else if(item.after==1 || item.after==UINT64_MAX-1)window.ex_style&=~8U;
@@ -120,7 +124,7 @@ std::optional<std::uint32_t> WindowsServices::finish_gui_window_pos(GuestState& 
         // 不在每個前置回呼之間向宿主發送半完成的版面。
         for(const auto& item:op.items) {
             if(item.changed)present_gui(item.window);
-            if(native_gui_ && (item.flags&0xc0U))show_native_window(item.window,gui_.windows.at(item.window).visible);
+            if(native_gui_ && (item.flags&0xc0U))show_native_window(item.window,gui_.windows.at(item.window).visible,!(item.flags&0x10U));
         }
         op.index=0;op.phase=3;
     }

@@ -7,6 +7,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CAShapeLayer.h>
+#import <QuartzCore/CATransaction.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <WebKit/WebKit.h>
 namespace {
@@ -90,6 +91,9 @@ bool offline_render_enabled(){static const bool enabled=[] {const auto* value=st
 // 自動驗證可投影到非作用中螢幕；客體仍使用自身桌面的相對座標。
 bool background_display_enabled(){return x64arm::native_background_display_enabled();}
 NSScreen* background_display(){return x64arm::native_background_display();}
+// 客體座標的基準螢幕：背景螢幕模式以該螢幕為客體桌面；其餘以選單列所在的主螢幕左上為原點，
+// 與 Windows 主顯示器一致，其他螢幕依實際排列落在負值或主螢幕之外的座標。
+NSScreen* coordinate_screen(){return background_display()?:NSScreen.screens.firstObject?:NSScreen.mainScreen;}
 // AppKit 的 first responder 是每個 NSWindow 各自保存的狀態；建立／顯示非啟用
 // popup 也會設定它。只有 key window 的原生變更才代表客體鍵盤焦點真的移動。
 bool native_keyboard_focus(NSView* view){return view.window.keyWindow;}
@@ -350,6 +354,7 @@ void native_guest_key(std::uint64_t handle,std::vector<x64arm::GuiMessage>* even
 - (void)guestKey:(NSEvent*)event pressed:(BOOL)pressed;
 - (void)updateImeOverlay;
 @end
+static bool native_glass_window(NSWindow*);
 @implementation X64ArmGuestView
 - (void)resetCursorRects {if(self.guestCursor)[self addCursorRect:self.bounds cursor:self.guestCursor];else [super resetCursorRects];}
 - (NSString*)view:(NSView*)view stringForToolTip:(NSToolTipTag)tag point:(NSPoint)point userData:(void*)data {
@@ -368,6 +373,9 @@ void native_guest_key(std::uint64_t handle,std::vector<x64arm::GuiMessage>* even
     if(self.model && (self.model->ex_style&0x80000U) && !self.model->layered_pixels.empty()){[[NSColor clearColor] setFill];NSRectFillUsingOperation(self.bounds,NSCompositingOperationCopy);return;}
     if(self.model && ((self.model->ex_style&0x20U) || (x64arm::gui_control_class(*self.model)==u"syslink" && (self.model->style&1U)))){
         // WS_EX_TRANSPARENT 沿用已繪製的下層內容；保留此 view 的命中與輸入，不能加上宿主白底。
+        [[NSColor clearColor] setFill];NSRectFillUsingOperation(self.bounds,NSCompositingOperationCopy);
+    }else if(native_glass_window(self.window)){
+        // DWM 整片玻璃：未繪製的客戶區透明，由客體內容的 alpha 決定可見範圍。
         [[NSColor clearColor] setFill];NSRectFillUsingOperation(self.bounds,NSCompositingOperationCopy);
     }else {[(self.model && self.model->dialog ? [NSColor windowBackgroundColor] : [NSColor whiteColor]) setFill];NSRectFill(self.bounds);}
     if (!self.model) return;
@@ -690,23 +698,41 @@ void native_guest_key(std::uint64_t handle,std::vector<x64arm::GuiMessage>* even
 @property(nonatomic) x64arm::GuiWindow* model;
 @end
 @implementation X64ArmWindowDelegate
-- (void)windowDidBecomeKey:(NSNotification*)notification {(void)notification;if(self.mainMenu)NSApp.mainMenu=self.mainMenu;if(!self.updating && self.events)self.events->push_back({self.guestHandle,1,0,0x1000d});}
+- (void)windowDidBecomeKey:(NSNotification*)notification {(void)notification;if(self.mainMenu)NSApp.mainMenu=self.mainMenu;
+    if(x64arm::gui_geometry_trace_enabled())std::fprintf(stderr,"[gui-geometry] pid=%d hwnd=%llx op=key updating=%d\n",::getpid(),static_cast<unsigned long long>(self.guestHandle),self.updating?1:0);
+    if(!self.updating && self.events)self.events->push_back({self.guestHandle,1,0,0x1000d});}
 - (BOOL)windowShouldClose:(NSWindow*)sender {
     (void)sender; self.events->push_back({self.guestHandle, 0, 0, 0x10}); return NO;
 }
 - (void)publishGeometry:(NSWindow*)window state:(unsigned)state {
     if(self.updating || !self.model)return;
     const auto size=self.clientView?self.clientView.bounds.size:window.contentView.bounds.size;
-    const auto screen=background_display()?:window.screen?:NSScreen.mainScreen;
+    // y 以基準螢幕換算，不用視窗目前所在螢幕；否則副螢幕上的視窗會得到該螢幕的相對座標。
+    const auto screen=coordinate_screen();
     x64arm::GuiMessage event{self.guestHandle,state,(static_cast<std::uint64_t>(coordinate_word(size.height))<<16)|coordinate_word(size.width),0x1000c};
     event.has_point=true;event.point={static_cast<std::int32_t>(window.frame.origin.x-(background_display()?screen.frame.origin.x:0)),static_cast<std::int32_t>(NSMaxY(screen.frame)-NSMaxY(window.frame))};
+    if(x64arm::gui_geometry_trace_enabled())std::fprintf(stderr,"[gui-geometry] pid=%d hwnd=%llx op=publish state=%u size=%.0fx%.0f point=%d,%d frame=%.0fx%.0f event=%ld\n",::getpid(),
+        static_cast<unsigned long long>(self.guestHandle),state,size.width,size.height,event.point[0],event.point[1],window.frame.size.width,window.frame.size.height,static_cast<long>(NSApp.currentEvent.type));
     self.model->show_command=state==1?2:state==2?3:1;
     if(state!=1){self.model->width=static_cast<std::uint32_t>(size.width);self.model->height=static_cast<std::uint32_t>(size.height);self.model->x=event.point[0];self.model->y=event.point[1];}
     self.events->push_back(std::move(event));
 }
 - (void)windowDidResize:(NSNotification*)notification {[self publishGeometry:notification.object state:[notification.object isMiniaturized]?1:[notification.object isZoomed]?2:0];}
 - (void)windowWillMove:(NSNotification*)notification {(void)notification;self.moving=!self.updating;}
-- (void)windowDidMove:(NSNotification*)notification {if(self.moving || NSApp.currentEvent.type==NSEventTypeLeftMouseDragged){[self publishGeometry:notification.object state:[notification.object isMiniaturized]?1:self.model->show_command==3?2:0];self.moving=NO;}}
+// 輔助使用介面、系統搬移或螢幕重新排列不一定先送 windowWillMove，也要回報客體；但引擎套用座標後
+// AppKit 可能在 updating 結束才送出通知，位置與客體模型相同時即為自身移動，不回報以免反覆同步造成閃爍。
+- (void)windowDidMove:(NSNotification*)notification {
+    NSWindow* window=notification.object;if(!self.model)return;
+    const bool interactive=self.moving || NSApp.currentEvent.type==NSEventTypeLeftMouseDragged;
+    if(!interactive){
+        if(self.updating)return;
+        const auto screen=coordinate_screen();
+        const auto x=static_cast<std::int32_t>(window.frame.origin.x-(background_display()?screen.frame.origin.x:0));
+        const auto y=static_cast<std::int32_t>(NSMaxY(screen.frame)-NSMaxY(window.frame));
+        if(x==self.model->x && y==self.model->y)return;
+    }
+    [self publishGeometry:window state:[window isMiniaturized]?1:self.model->show_command==3?2:0];self.moving=NO;
+}
 - (void)windowDidMiniaturize:(NSNotification*)notification {[self publishGeometry:notification.object state:1];}
 - (void)windowDidDeminiaturize:(NSNotification*)notification {[self publishGeometry:notification.object state:self.model->restore_maximized?2:0];}
 - (void)windowWillStartLiveResize:(NSNotification*)notification {(void)notification;if(!self.updating)self.events->push_back({self.guestHandle,0,0,0x231});}
@@ -1236,12 +1262,16 @@ NSDictionary* menu_bitmap_details(NSImage* image){
 // 在客體視窗統一處理 Command，避免依賴客體是否提供 macOS 編輯選單。
 @interface X64ArmGuestWindow : NSWindow
 @property(nonatomic,copy) BOOL (^commandShortcut)(NSEvent*);
+@property(nonatomic) BOOL glass;
 @property(nonatomic) x64arm::GuiWindow* guestModel;
 @end
+static bool native_glass_window(NSWindow* window){return [window isKindOfClass:X64ArmGuestWindow.class] && ((X64ArmGuestWindow*)window).glass;}
 @implementation X64ArmGuestWindow
 - (instancetype)initWithContentRect:(NSRect)rect styleMask:(NSWindowStyleMask)style backing:(NSBackingStoreType)backing defer:(BOOL)defer {
     self=[super initWithContentRect:rect styleMask:style backing:backing defer:defer];
-    if(self)self.acceptsMouseMovedEvents=YES;
+    // Win32 的 ShowWindow／SetWindowPos 不帶系統縮放動畫；AppKit 預設的出現／消失動畫會讓選單反覆
+    // 顯示時先縮小、內容空白再放大，造成閃爍。需要動畫的客體自行呼叫 AnimateWindow。
+    if(self){self.acceptsMouseMovedEvents=YES;self.animationBehavior=NSWindowAnimationBehaviorNone;}
     return self;
 }
 - (BOOL)canBecomeKeyWindow {return self.guestModel?self.guestModel->enabled && !(self.guestModel->ex_style&0x08000000U):[super canBecomeKeyWindow];}
@@ -1280,7 +1310,8 @@ struct Window {
     NSMutableDictionary<NSNumber*,X64ArmToolbarButton*>* __strong native_toolbar_buttons{};
     std::vector<std::pair<NSToolTipTag,std::size_t>> status_tooltips{};
     GuiWindow model{};
-    bool alias{},shaped{},fullscreen{};
+    bool alias{},shaped{},fullscreen{},reveal_held{};
+    CGFloat opacity{1};
 };
 void trace_native_pointer(const char* stage,const Window& window,NSPoint screen,NSPoint guest) {
     static const bool enabled=std::getenv("X64ARM_TRACE_NATIVE_POINTER")!=nullptr;
@@ -1292,12 +1323,13 @@ void trace_native_pointer(const char* stage,const Window& window,NSPoint screen,
         stage,wall,::getpid(),static_cast<long>(window.native.windowNumber),screen.x,screen.y,guest.x,guest.y,
         window.model.x,window.model.y,frame.origin.x,frame.origin.y,frame.size.width,frame.size.height);
 }
+bool alpha_composed(const GuiWindow& model){return model.dwm_glass || model.remote_alpha;}
 void apply_window_region(Window& w){
     NSView* target=w.native?(w.native.contentView.superview?:w.native.contentView):(w.mdi_frame?:w.view);
     if(!target)return;
     if(!w.model.window_region && !w.shaped)return;
     target.wantsLayer=YES;
-    if(!w.model.window_region){w.shaped=false;target.layer.mask=nil;if(w.native){w.native.opaque=YES;w.native.backgroundColor=NSColor.windowBackgroundColor;[w.native invalidateShadow];}return;}
+    if(!w.model.window_region){w.shaped=false;target.layer.mask=nil;if(w.native){w.native.opaque=!alpha_composed(w.model);w.native.backgroundColor=alpha_composed(w.model)?NSColor.clearColor:NSColor.windowBackgroundColor;[w.native invalidateShadow];}return;}
     w.shaped=true;CGMutablePathRef path=CGPathCreateMutable();const auto outer=gui_outer_size(w.model);
     const auto sx=outer[0]?target.bounds.size.width/outer[0]:1.0,sy=outer[1]?target.bounds.size.height/outer[1]:1.0;
     for(const auto& r:*w.model.window_region){
@@ -1320,13 +1352,16 @@ void sync_native_frame(Window& w){
     w.view.frame=NSMakeRect(0,menu_height,w.model.width,w.model.height);
     if(w.menu_bar)w.menu_bar.frame=NSMakeRect(0,0,w.model.width,20);
     w.delegate.clientView=w.view;
-    const auto screen=background_display()?:w.native.screen?:NSScreen.mainScreen;
+    const auto screen=coordinate_screen();
     // AppKit 的 frame 必須位於有號 32 位元矩形內；保留客體座標，只限制原生投影的原點。
     const auto origin=NSMakePoint(std::clamp<CGFloat>(w.model.x+(background_display()?screen.frame.origin.x:0),INT32_MIN,static_cast<CGFloat>(INT32_MAX)-w.native.frame.size.width),std::clamp<CGFloat>(NSMaxY(screen.frame)-w.model.y-w.native.frame.size.height,INT32_MIN,static_cast<CGFloat>(INT32_MAX)-w.native.frame.size.height));
     if(!NSEqualPoints(w.native.frame.origin,origin)){
         [w.native setFrameOrigin:origin];
         trace_native_pointer("frame",w,NSZeroPoint,NSMakePoint(w.model.x,w.model.y));
     }
+    if(x64arm::gui_geometry_trace_enabled())std::fprintf(stderr,"[gui-geometry] pid=%d hwnd=%llx op=apply model=%d,%d %ux%u native=%.0f,%.0f %.0fx%.0f\n",::getpid(),
+        static_cast<unsigned long long>(w.delegate.guestHandle),w.model.x,w.model.y,w.model.width,w.model.height,
+        w.native.frame.origin.x,w.native.frame.origin.y,w.native.frame.size.width,w.native.frame.size.height);
     w.delegate.updating=updating;
 }
 void create_table_view(Window& window,const NSRect& rect,X64ArmControlTarget* target) {
@@ -1462,6 +1497,16 @@ class CocoaGui final : public NativeGui {
         const NSPoint point=[owner.view convertPoint:NSMakePoint(dx,owner.view.flipped?dy:owner.view.bounds.size.height-dy) toView:nil];
         [window.native setFrameTopLeftPoint:[owner.view.window convertPointToScreen:point]];
     }
+    // Win32 的 owned window 永遠在 owner 之上；owner 被啟用或重排到前面時，可見的 owned window
+    // 依客體 z-order 由上而下放回其正上方（保持彼此相對順序），再逐層處理下一層 owned window。
+    void raise_owned(std::uint64_t owner,unsigned depth=0) {
+        const auto found=windows_.find(owner);if(found==windows_.end() || !found->second.native || !found->second.native.visible || depth>8)return;
+        std::vector<std::uint64_t> raised;
+        for(const auto h:z_order_){const auto f=windows_.find(h);if(f==windows_.end() || f->second.alias || f->second.model.owner!=owner)continue;
+            auto& w=f->second;if(!w.native || !w.native.visible || w.model.parent==gui_message_parent)continue;
+            [w.native orderWindow:NSWindowAbove relativeTo:found->second.native.windowNumber];raised.push_back(h);}
+        for(const auto h:raised)raise_owned(h,depth+1);
+    }
     void apply_z_order(std::uint64_t handle) {
         const auto found=windows_.find(handle);if(found==windows_.end() || found->second.alias)return;
         auto& target=found->second;Window* above=nullptr;Window* below=nullptr;bool seen=false;
@@ -1478,6 +1523,7 @@ class CocoaGui final : public NativeGui {
             // AppKit 可能保持剛成為 key 的視窗在前；同步錨點的相對順序。
             if(above){[target.native orderWindow:NSWindowBelow relativeTo:above->native.windowNumber];[above->native orderWindow:NSWindowAbove relativeTo:target.native.windowNumber];}
             else if(below)[target.native orderWindow:NSWindowAbove relativeTo:below->native.windowNumber];
+            raise_owned(handle);if(target.model.owner)raise_owned(target.model.owner);
         } else {NSView* outer=target.mdi_frame?:target.view;if(outer.superview){NSView* anchor=above?(above->mdi_frame?:above->view):below?(below->mdi_frame?:below->view):nil;[outer.superview addSubview:outer positioned:above?NSWindowBelow:NSWindowAbove relativeTo:anchor];}}
         dirty_=true;
     }
@@ -1507,6 +1553,7 @@ class CocoaGui final : public NativeGui {
     // current_display_mode 的短期快取（見該函式）。
     std::optional<GuiDisplayMode> display_mode_cache_{};bool display_mode_cached_{};std::chrono::steady_clock::time_point display_mode_time_{};
     bool automation_input_active_{}; // 背景顯示下由自動化 window_activate 模擬的前景輸入狀態。
+    bool show_inactive_{}; // 目前的 show 來自 SWP_NOACTIVATE／SW_SHOWNA：只排入前景，不成為 key window。
     NSDate* automation_read_time_{};
     id __strong automation_input_monitor_{};
     NSMutableSet<NSEvent*>* __strong automation_posted_events_{[NSMutableSet set]};
@@ -1989,9 +2036,24 @@ public:
     }
     bool set_opacity(std::uint64_t handle,std::uint8_t alpha) override {
         @autoreleasepool {const auto found=windows_.find(handle);if(found==windows_.end() || found->second.alias)return false;
-            auto& window=found->second;const auto value=static_cast<CGFloat>(alpha)/255.0;
+            auto& window=found->second;window.opacity=static_cast<CGFloat>(alpha)/255.0;const auto value=window.reveal_held?0:window.opacity;
             if(window.native)window.native.alphaValue=value;else (window.mdi_frame?:window.view).alphaValue=value;
             dirty_=true;return true;
+        }
+    }
+    void show_inactive(std::uint64_t handle) override {show_inactive_=true;show(handle,true);show_inactive_=false;}
+    void set_input_transparent(std::uint64_t handle,bool transparent) override {
+        @autoreleasepool {const auto found=windows_.find(handle);if(found==windows_.end() || found->second.alias || !found->second.native)return;
+            found->second.native.ignoresMouseEvents=transparent;
+        }
+    }
+    bool hold_reveal(std::uint64_t handle,bool hold) override {
+        @autoreleasepool {const auto found=windows_.find(handle);if(found==windows_.end() || found->second.alias || !found->second.native)return false;
+            auto& window=found->second;
+            if(hold){if(window.reveal_held || window.native.visible)return false;window.reveal_held=true;window.native.alphaValue=0;return true;}
+            if(!window.reveal_held)return false;
+            // 客體可能長時間不回到 run loop；立即提交，讓透明度與同批子 view 幾何一起生效。
+            window.reveal_held=false;window.native.alphaValue=window.opacity;[CATransaction flush];dirty_=true;return true;
         }
     }
     std::optional<GuiThemeMetrics> theme_metrics(std::u16string_view cls,std::int32_t part,std::int32_t state,std::uint32_t dpi,std::array<std::int32_t,2> size) override {return native_theme_metrics(cls,part,state,dpi,size);}
@@ -2069,8 +2131,25 @@ public:
         written_display_mode_=display_mode_id(target?target:current);if(target)CGDisplayModeRelease(target);CGDisplayModeRelease(current);
         fullscreen_display_=display;fullscreen_window_=handle;window.fullscreen=true;apply_z_order(handle);return true;
     }
-    std::array<std::int32_t,4> work_area() override {if(const auto size=virtual_display_size())return {0,0,static_cast<std::int32_t>(size->first),static_cast<std::int32_t>(size->second)};const auto screen=background_display()?:NSScreen.mainScreen;const auto frame=screen.visibleFrame;return {static_cast<std::int32_t>(frame.origin.x-(background_display()?screen.frame.origin.x:0)),static_cast<std::int32_t>(NSMaxY(screen.frame)-NSMaxY(frame)),static_cast<std::int32_t>(frame.size.width),static_cast<std::int32_t>(frame.size.height)};}
-    std::array<std::int32_t,4> screen_area() override {if(const auto size=virtual_display_size())return {0,0,static_cast<std::int32_t>(size->first),static_cast<std::int32_t>(size->second)};const auto r=(background_display()?:NSScreen.mainScreen).frame;return {0,0,static_cast<std::int32_t>(r.size.width),static_cast<std::int32_t>(r.size.height)};}
+    std::array<std::int32_t,4> work_area() override {if(const auto size=virtual_display_size())return {0,0,static_cast<std::int32_t>(size->first),static_cast<std::int32_t>(size->second)};const auto screen=coordinate_screen();const auto frame=screen.visibleFrame;return {static_cast<std::int32_t>(frame.origin.x-screen.frame.origin.x),static_cast<std::int32_t>(NSMaxY(screen.frame)-NSMaxY(frame)),static_cast<std::int32_t>(frame.size.width),static_cast<std::int32_t>(frame.size.height)};}
+    std::array<std::int32_t,4> screen_area() override {if(const auto size=virtual_display_size())return {0,0,static_cast<std::int32_t>(size->first),static_cast<std::int32_t>(size->second)};const auto r=coordinate_screen().frame;return {0,0,static_cast<std::int32_t>(r.size.width),static_cast<std::int32_t>(r.size.height)};}
+    std::vector<x64arm::GuiMonitor> monitors() override {
+        // 虛擬解析度與背景螢幕模式只公開一台客體桌面；其餘依 NSScreen 排列換算為 Windows 虛擬桌面座標。
+        if(virtual_display_size() || background_display())return NativeGui::monitors();
+        std::vector<x64arm::GuiMonitor> result;
+        @autoreleasepool {
+            NSArray<NSScreen*>* screens=NSScreen.screens;if(!screens.count)return NativeGui::monitors();
+            const auto top=NSMaxY(screens.firstObject.frame);
+            const auto convert=[&](NSRect r)->std::array<std::int32_t,4>{
+                return {static_cast<std::int32_t>(NSMinX(r)),static_cast<std::int32_t>(top-NSMaxY(r)),static_cast<std::int32_t>(NSMaxX(r)),static_cast<std::int32_t>(top-NSMinY(r))};};
+            for(NSScreen* screen in screens){
+                x64arm::GuiMonitor monitor{convert(screen.frame),convert(screen.visibleFrame),screen==screens.firstObject,60};
+                if(@available(macOS 12.0,*)){if(screen.maximumFramesPerSecond>0)monitor.refresh=static_cast<std::uint32_t>(screen.maximumFramesPerSecond);}
+                result.push_back(monitor);
+            }
+        }
+        return result;
+    }
     std::optional<shell::Dock> shell_dock() override {return shell::dock();}
     std::uint32_t shell_reveal(std::span<const std::shared_ptr<HostFile>> files,std::uint32_t flags) override {return shell::reveal(files,flags);}
     std::vector<shell::Application> shell_applications(const std::shared_ptr<HostFile>& file,std::string_view uri) override {return shell::applications(file,uri);}
@@ -2080,6 +2159,8 @@ public:
         @autoreleasepool {const auto f=windows_.find(handle);if(f==windows_.end())return;auto& w=f->second;w.model.visible=visible;
             if(w.alias)return;
             if(w.model.parent==gui_message_parent || offline_render_enabled())visible=false;
+            if(x64arm::gui_geometry_trace_enabled() && w.native)std::fprintf(stderr,"[gui-geometry] pid=%d hwnd=%llx op=show visible=%d native_visible=%d key=%d owner=%llx style=%x ex_style=%x\n",::getpid(),
+                static_cast<unsigned long long>(handle),visible?1:0,w.native.visible?1:0,w.native.keyWindow?1:0,static_cast<unsigned long long>(w.model.owner),w.model.style,w.model.ex_style);
             if(w.native){w.delegate.updating=YES;if(visible){
                 if(w.model.show_command==2){if(!w.native.miniaturized)[w.native miniaturize:nil];w.delegate.updating=NO;dirty_=true;return;}
                 if(w.native.miniaturized)[w.native deminiaturize:nil];
@@ -2088,7 +2169,7 @@ public:
                 if([w.control isKindOfClass:[NSTableView class]] && owner!=windows_.end() && owner->second.view.window){
                     if(w.native.parentWindow!=owner->second.view.window){[w.native.parentWindow removeChildWindow:w.native];[owner->second.view.window addChildWindow:w.native ordered:NSWindowAbove];}
                     [w.native orderFront:nil];
-                }else if(automation_ || (background_display_enabled() && !interactive_activation_) || (w.model.ex_style&0x08000000U))[w.native orderFront:nil];else {[w.native makeKeyAndOrderFront:nil];if(@available(macOS 14.0,*))[NSApp activate];}
+                }else if(automation_ || show_inactive_ || (background_display_enabled() && !interactive_activation_) || (w.model.ex_style&0x08000000U))[w.native orderFront:nil];else {[w.native makeKeyAndOrderFront:nil];if(@available(macOS 14.0,*))[NSApp activate];}
                 if(!w.model.dialog && !(w.model.ex_style&0x08000000U))[w.native makeFirstResponder:w.control?w.control:w.view];
             }else {[w.native.parentWindow removeChildWindow:w.native];[w.native orderOut:nil];}w.delegate.updating=NO;}
             else {w.view.hidden=!visible;w.mdi_frame.hidden=!visible;}if(visible)apply_z_order(handle);dirty_=true;
@@ -2155,7 +2236,15 @@ public:
             }
             apply_window_region(w);
             if(model.console && model.console->window){model.console->title=model.title;w.target.updating=NO;dirty_=true;return;}
-            if(w.native){const bool transparent=w.shaped || ((model.ex_style&0x80000U) && !model.layered_pixels.empty());w.native.opaque=!transparent;w.native.backgroundColor=transparent?[NSColor clearColor]:[NSColor windowBackgroundColor];}
+            if(w.native){const bool glass=alpha_composed(model),transparent=w.shaped || glass || ((model.ex_style&0x80000U) && !model.layered_pixels.empty());w.native.opaque=!transparent;w.native.backgroundColor=transparent?[NSColor clearColor]:[NSColor windowBackgroundColor];
+                // 依 alpha 合成的無框彈出視窗不加系統陰影（DWM 亦同），陰影與圓角由客體內容繪製；
+                // 有標題列或可調框的視窗保留陰影。內容淡出後若留著舊陰影，會在透明視窗周圍殘留外框。
+                if([w.native isKindOfClass:X64ArmGuestWindow.class] && ((X64ArmGuestWindow*)w.native).glass!=glass){
+                    ((X64ArmGuestWindow*)w.native).glass=glass;w.native.hasShadow=!glass || (model.style&0x00C40000U);
+                    NSMutableArray<NSView*>* pending=[NSMutableArray arrayWithObject:w.native.contentView];
+                    while(pending.count){NSView* view=pending.lastObject;[pending removeLastObject];[view setNeedsDisplay:YES];[pending addObjectsFromArray:view.subviews];}
+                }
+            }
             if((model.ex_style&0x20U) && [w.view isKindOfClass:[X64ArmGuestView class]]){
                 // 透明子 view 使用自己的 backing，清除其背景不應清掉下層兄弟視窗的像素。
                 w.view.wantsLayer=YES;w.view.canDrawSubviewsIntoLayer=NO;w.view.layer.backgroundColor=NSColor.clearColor.CGColor;
@@ -3007,6 +3096,7 @@ public:
     bool accessibility_announcement(std::uint64_t handle,std::u16string_view text,bool important) override {return real("accessibility_announcement").accessibility_announcement(handle,text,important);}
     std::array<std::int32_t,4> work_area() override {return real("work_area").work_area();}
     std::array<std::int32_t,4> screen_area() override {return real("screen_area").screen_area();}
+    std::vector<GuiMonitor> monitors() override {return real("monitors").monitors();}
     std::vector<GuiDisplayMode> display_modes() override {return real("display_modes").display_modes();}
     std::optional<GuiDisplayMode> current_display_mode() override {return real("current_display_mode").current_display_mode();}
     bool display_fullscreen(std::uint64_t handle,bool enable,const std::optional<GuiDisplayMode>& mode) override {return real("display_fullscreen").display_fullscreen(handle,enable,mode);}
@@ -3016,6 +3106,9 @@ public:
     std::uint32_t shell_open(const std::shared_ptr<HostFile>& file,std::string_view verb,const shell::Application& application) override {return real("shell_open").shell_open(file,verb,application);}
     std::optional<shell::Application> shell_default_application(const std::shared_ptr<HostFile>& file,std::string_view verb) override {return real("shell_default_application").shell_default_application(file,verb);}
     bool set_opacity(std::uint64_t handle,std::uint8_t alpha) override {return real("set_opacity").set_opacity(handle,alpha);}
+    bool hold_reveal(std::uint64_t handle,bool hold) override {return real("hold_reveal").hold_reveal(handle,hold);}
+    void set_input_transparent(std::uint64_t handle,bool transparent) override {real("set_input_transparent").set_input_transparent(handle,transparent);}
+    void show_inactive(std::uint64_t handle) override {real("show_inactive").show_inactive(handle);}
     bool set_region(std::uint64_t handle,const std::optional<GuiRegion>& region) override {return real("set_region").set_region(handle,region);}
     void present(std::uint64_t handle,const GuiWindow& window) override {real("present").present(handle,window);}
     void destroy(std::uint64_t handle) override {real("destroy").destroy(handle);}
@@ -3044,7 +3137,20 @@ public:
     bool set_clipboard_text(const std::u16string& text) override {return real("set_clipboard_text").set_clipboard_text(text);}
     std::optional<std::uint64_t> clipboard_sequence() override {return real("clipboard_sequence").clipboard_sequence();}
     bool clear_clipboard() override {return real("clear_clipboard").clear_clipboard();}
-    std::optional<std::array<std::int32_t,2>> cursor_position() override {return real("cursor_position").cursor_position();}
+    std::optional<std::array<std::int32_t,2>> cursor_position() override {
+        // 訊息入列時記錄游標（GetMessagePos）。尚未建立原生 GUI 的程序（如只跑訊息迴圈的 Chromium renderer）
+        // 沒有視窗可換算，結果就是主螢幕左上為原點的全域座標；直接讀 CoreGraphics，不為此初始化 AppKit（每程序約 0.2 秒）。
+        // 自動操作、背景螢幕與虛擬顯示尺寸另有座標契約，仍交給完整實作。
+        static const bool plain=!std::getenv("X64ARM_GUI_AUTOMATION") && !std::getenv("X64ARM_GUI_AUTOMATION_FD") &&
+            !background_display_enabled() && !std::getenv("X64ARM_DISPLAY_SIZE");
+        if(!real_ && plain){
+            if(const auto event=CGEventCreate(nullptr)){
+                const auto point=CGEventGetLocation(event);CFRelease(event);
+                return std::array<std::int32_t,2>{static_cast<std::int32_t>(point.x),static_cast<std::int32_t>(point.y)};
+            }
+        }
+        return real("cursor_position").cursor_position();
+    }
     bool set_cursor_position(std::int32_t x,std::int32_t y) override {return real("set_cursor_position").set_cursor_position(x,y);}
     bool set_cursor(const GuiIcon* icon,bool visible) override {return real("set_cursor").set_cursor(icon,visible);}
     std::optional<bool> physical_key_state(unsigned key) override {return real("physical_key_state").physical_key_state(key);}

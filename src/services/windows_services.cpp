@@ -148,7 +148,8 @@ void WindowsServices::prepare_machine_clock(){
     const auto lifetime=runtime_.clock_ticks>=runtime_.process_creation_clock_ticks?runtime_.clock_ticks-runtime_.process_creation_clock_ticks:0;
     runtime_.machine_clock=MachineClock::open(mapping_session(),runtime_.host_clock,runtime_.clock_ticks,runtime_.local_system_filetime());
     if(runtime_.machine_clock){const auto time=runtime_.system_time_state();runtime_.clock_ticks=time.monotonic;
-        runtime_.process_creation_time=lifetime>time.filetime?0:time.filetime-lifetime;runtime_.process_creation_clock_ticks=lifetime>time.monotonic?0:time.monotonic-lifetime;}
+        runtime_.process_creation_time=lifetime>time.filetime?0:time.filetime-lifetime;runtime_.process_creation_clock_ticks=lifetime>time.monotonic?0:time.monotonic-lifetime;
+        report_child_creation_time(runtime_.process_creation_time);}
 }
 void WindowsServices::retired(GuestMemory& memory, std::uint64_t instructions) {
     if (!initialized_) return;

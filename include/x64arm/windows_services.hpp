@@ -317,6 +317,7 @@ public:
     // 螢幕／工作區查詢結果的短期快取（X64ARM_GUI_AREA_CACHE_MS，預設 100）；NSScreen 每次約 0.45 ms，Chromium 每幀都查。
     std::chrono::steady_clock::time_point gui_area_cached_{};
     std::array<std::int32_t,4> gui_screen_cache_{},gui_work_cache_{};
+    std::vector<GuiMonitor> gui_monitor_cache_;
     // 常駐熱路徑（每次服務返回、每次重新進入本體）的執行緒索引。執行緒表只增不刪：已結束者
     // 保留供 handle 與結束碼查詢，逐一走訪的成本會隨程序存活時間上升。表大小改變即重建；
     // 走訪時已結束者過半也重建，熱路徑只看未結束者。複本指向另一份執行緒表，一律重建。
@@ -637,6 +638,7 @@ private:
     bool invoke_remote_gui(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void publish_remote_frame(std::uint64_t,NativeGraphics&,const GraphicsView&);
     void poll_remote_frames();
+    void hold_remote_reveal(std::uint64_t,bool);
     bool blit_raster(GuestMemory&,std::uint64_t,RasterSurface*,const GuiRect&,const GuiRect&,const GuiDc&,std::uint32_t,const RasterBlit&,RasterSurface* =nullptr);
     std::shared_ptr<RasterSurface> remote_raster_snapshot(GuestMemory&,std::uint64_t);
     std::uint32_t receive_remote_raster(GuestMemory&,std::uint32_t,std::uint32_t,std::array<std::uint64_t,5>&,int);
@@ -1481,7 +1483,7 @@ private:
     std::uint64_t thread_desktop_object(std::uint64_t thread) const;
     bool interactive_station() const;
     void present_native_window(std::uint64_t handle,const GuiWindow& window);
-    void show_native_window(std::uint64_t handle,bool visible);
+    void show_native_window(std::uint64_t handle,bool visible,bool activate=true);
     std::optional<std::uint32_t> invoke_winstation(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_heap(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool await_heap_service(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1832,6 +1834,9 @@ private:
     bool shell_open_with_message(const GuiMessage&);
     std::array<std::int32_t,4> gui_screen_area();
     std::array<std::int32_t,4> gui_work_area(std::uint64_t excluded=0);
+    // HMONITOR 為索引＋1，1 固定為主螢幕；rect／work 為 Windows 虛擬桌面座標。
+    const std::vector<GuiMonitor>& gui_monitors();
+    std::uint64_t gui_monitor_from_rect(const std::array<std::int32_t,4>& rect,std::uint32_t flags);
     void refresh_gui_areas();
     void notify_appbars(std::uint32_t,std::uint64_t parameter=0);
     void poll_appbars();

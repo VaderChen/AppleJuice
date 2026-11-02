@@ -42,6 +42,8 @@ void set_child_result_descriptor(int descriptor);
 void report_child_input_idle();
 void report_child_job_status(std::uint32_t);
 void report_child_startup_ready();
+// 建立時間改以共用機器時鐘為基準後重新回報，父程序直接計算子程序時間時才與子程序自身一致。
+void report_child_creation_time(std::uint64_t filetime);
 void report_child_startup_failure(std::uint32_t);
 void report_child_result(std::uint32_t exit_code, bool succeeded);
 std::uint32_t host_process_id() noexcept;

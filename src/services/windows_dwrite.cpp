@@ -122,6 +122,10 @@ std::u16string folded(std::u16string value){for(auto& ch:value)if(ch>=u'A' && ch
 struct DWriteState {
     std::map<std::uint64_t,Object> objects;std::map<Kind,std::uint64_t> tables;
     std::map<std::uint64_t,std::weak_ptr<FontBlob>> files;std::uint64_t next_file{1},file_loader{};
+    // 已匯出的原生字型：以確切原生物件（含 variation）為鍵保存路徑與時間，並持有該物件避免位址被重用。
+    // 每次請求都會建立新 blob；不快取時，每次頁面載入都重新組 SFNT、計算整檔 SHA-256 並逐位元組比對副本（每個字型約 0.1～0.25 秒）。
+    struct ExportedFont {std::shared_ptr<const void> native;std::string key;std::u16string path;std::uint64_t modified{};};
+    std::map<const void*,ExportedFont> exported_fonts;
     std::map<std::uint64_t,std::uint64_t> retained_loaders;
     std::shared_ptr<FontSet> system;std::uint64_t shared_factory{};
     std::map<std::uint64_t,FontOperation> operations;std::uint64_t next_operation{1},resuming{};
@@ -510,8 +514,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_dwrite(GuestState& state,Gu
             const auto found_file=bridge.files.find(memory.load(GuestAddress{arg(1)},64));if(found_file==bridge.files.end())return finish(invalid);
             const auto data=found_file->second.lock();if(!data || data->loader)return finish(invalid);
             if(data->path.empty() && data->native_export){
-                const auto published=publish_font_file(data->contents());if(published.error)return finish(0x80070000U|published.error);
-                data->path=utf8_to_utf16(published.key);std::replace(data->path.begin(),data->path.end(),u'/',u'\\');data->modified=published.metadata.modified;
+                const auto& native=data->fonts->faces.at(0).native;
+                // 命中時只確認匯出檔仍在（一次 stat）；被清除則照原流程重新匯出。
+                if(const auto cached=native?bridge.exported_fonts.find(native.get()):bridge.exported_fonts.end();
+                   cached!=bridge.exported_fonts.end() && !filesystem_.information(cached->second.key).error){
+                    data->path=cached->second.path;data->modified=cached->second.modified;
+                }else{
+                    const auto published=publish_font_file(data->contents());if(published.error)return finish(0x80070000U|published.error);
+                    data->path=utf8_to_utf16(published.key);std::replace(data->path.begin(),data->path.end(),u'/',u'\\');data->modified=published.metadata.modified;
+                    if(native)bridge.exported_fonts.insert_or_assign(native.get(),DWriteState::ExportedFont{native,published.key,data->path,data->modified});
+                }
             }
             if(data->path.empty())return finish(invalid);
             if(method=="GetFilePathLengthFromKey"){memory.store(GuestAddress{arg(3)},32,data->path.size());return finish(0);}

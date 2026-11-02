@@ -10,6 +10,7 @@
 #include <memory>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <algorithm>
 #include "x64arm/jit_recovery.hpp"
 #include "x64arm/llvm_region.hpp"
@@ -120,9 +121,15 @@ public:
     void reclaim_retired_recovery() noexcept;
     std::size_t retired_recovery_count() const noexcept;
 private:
-    // 帶模組 AOT 站點快取的已發布區塊位移；撤銷任一區塊時只需清這些快取，不必走訪全部 recovery_。
+    // 帶模組 AOT 站點快取的已發布區塊；撤銷任一區塊時只需清這些快取，不必走訪全部 recovery_。
     // JIT 基本區塊沒有站點快取，集合為空時撤銷成本與區塊總數無關。
-    std::set<std::size_t> aot_site_offsets_;
+    // 連續陣列直接持有快取，清空時不必逐一到 recovery_ 紅黑樹查找（約六萬個模組時每次約 2 ms，
+    // JIT 客體每秒數百次失效）；位移索引供 O(1) 移除。持有 shared_ptr，漏移除也只會多清一份孤立快取。
+    struct AotSiteCache {std::size_t offset;std::shared_ptr<std::vector<resident_abi::DispatchEntry>> entries;};
+    std::vector<AotSiteCache> aot_site_caches_;
+    std::unordered_map<std::size_t,std::size_t> aot_site_positions_;
+    void remember_aot_sites(std::size_t offset,const std::shared_ptr<std::vector<resident_abi::DispatchEntry>>& entries);
+    void forget_aot_sites(std::size_t offset) noexcept;
     static constexpr std::size_t aot_runtime_pool_max_bytes=4096;
     // 池不隸屬任何客體模組；同 arena 撤銷全部程式碼時才回收，單一模組失效不破壞其他呼叫。
     std::vector<std::size_t> aot_runtime_pools_;

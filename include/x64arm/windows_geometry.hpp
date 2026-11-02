@@ -1,9 +1,12 @@
 #pragma once
 #include "x64arm/windows_gui.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 
 namespace x64arm {
+// X64ARM_TRACE_GUI_GEOMETRY=1：輸出 SetWindowPos 套用、原生幾何回報與原生套用，定位視窗尺寸來回切換；預設關閉。
+inline bool gui_geometry_trace_enabled() {static const bool enabled=std::getenv("X64ARM_TRACE_GUI_GEOMETRY")!=nullptr;return enabled;}
 // 虛擬桌面與任意 DPI 查詢共用同一組基準度量。
 inline std::uint32_t gui_scale_metric(std::uint32_t value,std::uint32_t dpi) {
     return static_cast<std::uint32_t>(std::min<std::uint64_t>((std::uint64_t{value}*dpi+48)/96,INT32_MAX));

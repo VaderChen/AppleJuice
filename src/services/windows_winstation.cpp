@@ -46,10 +46,12 @@ void WindowsServices::present_native_window(std::uint64_t handle,const GuiWindow
     if(window.desktop_object==gui_.input_desktop)native_gui_->present(handle,window);
     else{auto hidden=window;hidden.visible=false;native_gui_->present(handle,hidden);}
 }
-void WindowsServices::show_native_window(std::uint64_t handle,bool visible){
+void WindowsServices::show_native_window(std::uint64_t handle,bool visible,bool activate){
     publish_gui_window(handle);
     if(!native_gui_)return;const auto found=gui_.windows.find(handle);
-    native_gui_->show(handle,visible && found!=gui_.windows.end() && found->second.desktop_object==gui_.input_desktop);
+    const bool shown=visible && found!=gui_.windows.end() && found->second.desktop_object==gui_.input_desktop;
+    hold_remote_reveal(handle,shown);
+    if(shown && !activate)native_gui_->show_inactive(handle);else native_gui_->show(handle,shown);
 }
 std::optional<std::uint32_t> WindowsServices::invoke_winstation(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     initialize_user_objects();const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');

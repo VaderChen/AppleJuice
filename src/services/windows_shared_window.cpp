@@ -113,6 +113,16 @@ struct SharedWindowState {
     std::map<std::uint64_t, SharedWindowInfo> published;
     std::map<std::uint64_t, std::uint32_t> frames;
     std::map<std::uint64_t, std::shared_ptr<RasterSurface>> surfaces;
+    // 各影格表面建立時綁定的原生 view；view 晚於第一張影格出現或被重建時須改綁。
+    std::map<std::uint64_t, void*> surface_views;
+    // 各影格表面目前是否依 alpha 合成（所屬頂層視窗為 DWM 整片玻璃或 Chromium 透明視窗）。
+    std::map<std::uint64_t, bool> surface_glass;
+    // 依 alpha 合成的頂層視窗：影格自何時起持續完全透明，以及目前已讓滑鼠穿透者。
+    std::map<std::uint64_t, std::chrono::steady_clock::time_point> transparent_since;
+    std::set<std::uint64_t> input_transparent;
+    // 重新顯示時暫緩揭露的頂層視窗：記下當時各跨程序子視窗的影格序號，送達新影格或逾時才揭露。
+    struct RevealHold {std::chrono::steady_clock::time_point start,deadline;std::map<std::uint64_t,std::uint32_t> sequences;};
+    std::map<std::uint64_t,RevealHold> reveals;
 #if !defined(_WIN32)
     std::map<std::uint64_t,std::weak_ptr<FrameMapping>> mappings;
     std::uint64_t mapping_builds{},mapping_hits{};
@@ -308,6 +318,10 @@ void WindowsServices::unpublish_gui_window(std::uint64_t handle) {
     shared.allocated.erase(handle);
     shared.frames.erase(handle);
     shared.surfaces.erase(handle);
+    shared.surface_views.erase(handle);
+    shared.surface_glass.erase(handle);
+    shared.input_transparent.erase(handle);
+    shared.transparent_since.erase(handle);
 #if !defined(_WIN32)
     shared.mappings.erase(handle);
 #endif
@@ -615,16 +629,129 @@ void WindowsServices::publish_remote_frame(std::uint64_t handle, NativeGraphics&
     throw HostCallFault("此平台缺少共用視窗呈現");
 #endif
 }
+// 依格點抽樣判斷影格是否完全透明（RGBA／BGRA 的 alpha 皆在第 4 byte）；遇到不透明像素立即返回。
+static bool frame_fully_transparent(const void *data, std::size_t size, std::uint32_t width, std::uint32_t height, std::uint32_t stride) {
+    const auto *pixels = static_cast<const std::uint8_t *>(data);
+    const auto step_x = std::max<std::uint32_t>(1, width / 48), step_y = std::max<std::uint32_t>(1, height / 48);
+    for (auto y = step_y / 2; y < height; y += step_y)
+        for (auto x = step_x / 2; x < width; x += step_x)
+            if (const auto at = std::size_t{y} * stride + std::size_t{x} * 4 + 3; at < size && pixels[at])
+                return false;
+    return true;
+}
+// Steam 等透明選單淡出後仍維持顯示；看不見的視窗不能攔下對下方視窗的點擊。影格須持續完全透明
+// 一段時間才讓滑鼠穿透：淡入初期也有全透明影格，此時穿透會讓滑鼠事件落到下方視窗，客體判定離開而關閉選單。
+constexpr auto input_transparent_delay = std::chrono::milliseconds(400);
+static void apply_input_transparent(SharedWindowState &shared, NativeGui *native, std::uint64_t top, bool transparent) {
+    if (transparent == shared.input_transparent.contains(top))
+        return;
+    if (transparent)
+        shared.input_transparent.insert(top);
+    else
+        shared.input_transparent.erase(top);
+    if (native)
+        native->set_input_transparent(top, transparent);
+    record_diagnostic(transparent ? "remote_input_transparent" : "remote_input_opaque");
+    if (trace_shared_frames())
+        std::fprintf(stderr, "shared_frame kind=input pid=%d handle=%llu transparent=%d unix_us=%lld\n", static_cast<int>(::getpid()),
+                     static_cast<unsigned long long>(top), transparent ? 1 : 0, trace_unix_us());
+}
+// 內容由其他程序送影格的頂層視窗（例如 Chromium 選單）隱藏後，子視窗常被縮成 0×0，上一張影格也已過時。
+// 原生視窗若立即顯示，會先露出未繪製的底色與舊影格；改為透明顯示，等顯示後發布的影格匯入再揭露。
+// 只看顯示前已發布過影格的子孫視窗；自身 GDI 繪製、同程序呈現與首次尚無影格的視窗照常立即顯示。
+void WindowsServices::hold_remote_reveal(std::uint64_t handle, bool visible) {
+#if !defined(_WIN32)
+    if (!shared_windows_ || !native_gui_)
+        return;
+    auto &shared = *shared_windows_;
+    if (!visible) {
+        if (shared.reveals.erase(handle))
+            native_gui_->hold_reveal(handle, false);
+        return;
+    }
+    // 重新顯示即恢復接收滑鼠，避免沿用淡出後的穿透狀態。
+    shared.transparent_since.erase(handle);
+    apply_input_transparent(shared, native_gui_.get(), handle, false);
+    const auto found = gui_.windows.find(handle);
+    if (found == gui_.windows.end() || found->second.parent || shared.reveals.contains(handle))
+        return;
+    SharedWindowState::RevealHold hold;
+    for (const auto &[child, window] : gui_.windows) {
+        auto ancestor = window.parent;
+        for (unsigned depth = 0; ancestor && ancestor != handle && depth < 32; ++depth) {
+            const auto up = gui_.windows.find(ancestor);
+            ancestor = up == gui_.windows.end() ? 0 : up->second.parent;
+        }
+        if (child == handle || ancestor != handle)
+            continue;
+        const auto &slot = shared.table->slots[child % window_slots];
+        if (__atomic_load_n(&slot.handle, __ATOMIC_ACQUIRE) != child)
+            continue;
+        if (const auto sequence = __atomic_load_n(&slot.frame, __ATOMIC_ACQUIRE))
+            hold.sequences[child] = sequence;
+    }
+    if (hold.sequences.empty() || !native_gui_->hold_reveal(handle, true))
+        return;
+    hold.start = std::chrono::steady_clock::now();
+    hold.deadline = hold.start + std::chrono::milliseconds(250);
+    shared.reveals.emplace(handle, std::move(hold));
+    record_diagnostic("remote_reveal_held");
+#else
+    (void)handle;
+    (void)visible;
+#endif
+}
 void WindowsServices::poll_remote_frames() {
     if (!shared_windows_)
         return;
 #if !defined(_WIN32)
     auto &shared = *shared_windows_;
+    const auto reveal = [&](auto it, bool timeout) {
+        const auto reason = timeout ? "timeout" : "frame";
+        if (native_gui_)
+            native_gui_->hold_reveal(it->first, false);
+        record_diagnostic(timeout ? "remote_reveal_timeout" : "remote_reveal_frame");
+        if (trace_shared_frames())
+            std::fprintf(stderr, "shared_frame kind=reveal pid=%d handle=%llu reason=%s held_us=%lld\n", static_cast<int>(::getpid()),
+                         static_cast<unsigned long long>(it->first), reason,
+                         static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - it->second.start).count()));
+        return shared.reveals.erase(it);
+    };
+    std::vector<std::uint64_t> alpha_tops;
+    if (!shared.reveals.empty()) {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = shared.reveals.begin(); it != shared.reveals.end();)
+            it = now >= it->second.deadline || !gui_.windows.contains(it->first) ? reveal(it, true) : std::next(it);
+    }
+    if (!shared.transparent_since.empty()) {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = shared.transparent_since.begin(); it != shared.transparent_since.end();) {
+            if (!gui_.windows.contains(it->first)) {
+                shared.input_transparent.erase(it->first);
+                it = shared.transparent_since.erase(it);
+                continue;
+            }
+            if (now - it->second >= input_transparent_delay)
+                apply_input_transparent(shared, native_gui_.get(), it->first, true);
+            ++it;
+        }
+    }
     for (const auto &[handle, window] : gui_.windows) {
         publish_gui_window(handle);
         auto &slot = shared.table->slots[handle % window_slots];
         const auto sequence = __atomic_load_n(&slot.frame, __ATOMIC_ACQUIRE);
-        if (!sequence || shared.frames[handle] == sequence)
+        if (!sequence)
+            continue;
+        // 影格表面只在建立時綁定原生 view 的呈現圖層。view 晚於第一張影格建立或之後被重建時，
+        // 改綁目前的 view 並立即重新匯入最新影格；否則後續影格只寫入沒有呈現圖層的材質，視窗停在空白，
+        // 而客體只在內容改變時才送新影格。
+        const bool fresh = shared.frames[handle] != sequence;
+        const auto existing = shared.surfaces.find(handle);
+        if (!fresh && existing == shared.surfaces.end())
+            continue;
+        void *view = native_gui_ ? native_gui_->graphics_view(handle) : nullptr;
+        const bool rebind = existing != shared.surfaces.end() && existing->second && shared.surface_views[handle] != view;
+        if (!fresh && !rebind)
             continue;
         const auto name = shared.directory + "/frame-" + std::to_string(handle);
         SharedFd file{::open(name.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW)};
@@ -645,16 +772,49 @@ void WindowsServices::poll_remote_frames() {
             continue;
         const auto mapping=shared.frame_mapping(handle,file.fd,static_cast<std::size_t>(header.bytes),status);
         auto &surface = shared.surfaces[handle];
-        if (!surface || surface->width() != header.width || surface->height() != header.height) {
-            surface = make_hardware_raster(header.width, header.height, {},
-                                           native_gui_ ? native_gui_->graphics_view(handle) : nullptr);
+        const bool created = !surface || surface->width() != header.width || surface->height() != header.height || rebind;
+        if (created) {
+            surface = make_hardware_raster(header.width, header.height, {}, view);
+            shared.surface_views[handle] = view;
+            if (rebind) record_diagnostic("remote_frame_surface_rebound");
             rasters_[0x10000000 + handle] = surface;
             if (native_gui_)
                 native_gui_->graphics_surface(handle, surface);
         }
+        // 頂層視窗為 DWM 整片玻璃，或帶 WS_EX_COMPOSITED（Chromium 透明視窗）時依影格 alpha 合成：
+        // 選單淡出後留在畫面上的全透明影格、陰影與圓角不再呈現為黑色。其他視窗維持不透明呈現。
+        bool glass = false;
+        std::uint64_t top = 0;
+        for (auto ancestor = handle; ancestor;) {
+            const auto up = gui_.windows.find(ancestor);
+            if (up == gui_.windows.end())
+                break;
+            if (!up->second.parent) {
+                top = ancestor;
+                if ((up->second.ex_style & 0x02000000U) && !up->second.remote_alpha) {
+                    up->second.remote_alpha = true;
+                    alpha_tops.push_back(ancestor);
+                }
+                glass = up->second.dwm_glass || up->second.remote_alpha;
+                break;
+            }
+            ancestor = up->second.parent;
+        }
+        if (auto &applied = shared.surface_glass[handle]; created || applied != glass) {
+            surface->set_transparent(glass);
+            applied = glass;
+        }
         const auto import_begin=trace_shared_frames()?trace_unix_us():0;
         surface->import_frame(mapping->data,mapping->size,header.stride,header.format,shared.cache_frames?mapping:std::shared_ptr<void>{});
         record_diagnostic("remote_frame_imported");
+        if (top) {
+            if (glass && mapping->data && frame_fully_transparent(mapping->data, mapping->size, header.width, header.height, header.stride))
+                shared.transparent_since.try_emplace(top, std::chrono::steady_clock::now());
+            else {
+                shared.transparent_since.erase(top);
+                apply_input_transparent(shared, native_gui_.get(), top, false);
+            }
+        }
         {static std::int64_t last=0,gap=0;record_frame_timing("remote_frame_first_imported","remote_frame_max_import_gap",last,gap);}
         // 每 60 幀抽樣一次匯入影格的平均亮度（8×8 格點），判斷 GPU 程序產出的影格本身是否全黑。
         if(static std::uint64_t imported=0;(imported++%60)==0 && mapping->data && header.width && header.height){
@@ -666,11 +826,28 @@ void WindowsServices::poll_remote_frames() {
                 " luma="+std::to_string(static_cast<int>(sum/count))+" handle="+std::to_string(handle));
         }
         if(trace_shared_frames()){const auto now=trace_unix_us();
-            std::fprintf(stderr,"shared_frame kind=import pid=%d handle=%llu seq=%u previous=%u unix_us=%lld import_us=%lld\n",static_cast<int>(::getpid()),
-                static_cast<unsigned long long>(handle),published,shared.frames[handle],now,now-import_begin);}
+            // 8×8 格點的平均亮度與 alpha 範圍，判斷閃白／閃黑是否來自客體送出的影格本身。
+            double luma=0;unsigned samples=0,alpha_min=255,alpha_max=0;
+            if(const auto* pixels=static_cast<const std::uint8_t*>(mapping->data))
+                for(unsigned gy=0;gy<8;++gy)for(unsigned gx=0;gx<8;++gx){
+                    const auto at=std::size_t{(header.height*(2*gy+1))/16}*header.stride+std::size_t{(header.width*(2*gx+1))/16}*4;
+                    if(at+3>=mapping->size)continue;
+                    luma+=0.299*pixels[at+2]+0.587*pixels[at+1]+0.114*pixels[at];alpha_min=std::min<unsigned>(alpha_min,pixels[at+3]);alpha_max=std::max<unsigned>(alpha_max,pixels[at+3]);++samples;
+                }
+            std::fprintf(stderr,"shared_frame kind=import pid=%d handle=%llu seq=%u previous=%u unix_us=%lld import_us=%lld size=%ux%u luma=%d alpha=%u-%u\n",static_cast<int>(::getpid()),
+                static_cast<unsigned long long>(handle),published,shared.frames[handle],now,now-import_begin,header.width,header.height,
+                samples?static_cast<int>(luma/samples):-1,alpha_min,alpha_max);}
         shared.frames[handle] = published;
+        for (auto it = shared.reveals.begin(); it != shared.reveals.end();) {
+            const auto held = it->second.sequences.find(handle);
+            it = held != it->second.sequences.end() && held->second != published ? reveal(it, false) : std::next(it);
+        }
         (void)window;
     }
+    // 迭代 gui_.windows 時不重新呈現；新改為依 alpha 合成的頂層視窗在此同步原生透明狀態。
+    for (const auto top : alpha_tops)
+        if (gui_.windows.contains(top))
+            present_gui(top);
 #endif
 }
 } // namespace x64arm

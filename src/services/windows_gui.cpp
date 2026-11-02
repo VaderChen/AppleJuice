@@ -158,6 +158,7 @@ void WindowsServices::enable_native_gui(const std::filesystem::path& snapshot) {
 void WindowsServices::set_native_gui_backend(std::shared_ptr<NativeGui> backend) {
     if (!gui_.windows.empty()) throw HostCallFault("原生 GUI 必須在客體執行前設定");
     native_gui_ = std::move(backend);
+    gui_area_cached_ = {}; // 螢幕清單與工作區改向新後端查詢，不沿用初始化時的預設值。
     if(native_gui_)native_gui_->raw_input_policy(!raw_legacy_enabled(true),!raw_legacy_enabled(false),false);
 }
 void WindowsServices::invalidate_window(std::uint64_t handle) {
@@ -443,11 +444,16 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
             if(next==2)w.restore_maximized=old_state==3;
             w.show_command=next;w.style=(w.style&~0x21000000U)|(next==2?0x20000000U:next==3?0x01000000U:0U);
             if(next!=2){w.width=static_cast<std::uint32_t>(msg.lparam&65535);w.height=static_cast<std::uint32_t>((msg.lparam>>16)&65535);if(msg.has_point){w.x=msg.point[0];w.y=msg.point[1];}if(next==1)w.normal_rect=std::array<std::int32_t,4>{w.x,w.y,static_cast<std::int32_t>(w.width),static_cast<std::int32_t>(w.height)};}
+            if(gui_geometry_trace_enabled()){const auto f=gui_frame_insets(w);
+                std::fprintf(stderr,"[gui-geometry] pid=%u hwnd=%llx op=native state=%u old=%d,%d %ux%u model=%d,%d %ux%u frame=%u,%u,%u,%u\n",
+                    process_id(),static_cast<unsigned long long>(msg.window),next,old_x,old_y,old_width,old_height,w.x,w.y,w.width,w.height,f.left,f.top,f.right,f.bottom);}
             if(old_x!=w.x || old_y!=w.y)enqueue_gui_message({msg.window,0,gui_move_lparam(w),3});
             if(old_state!=next || old_width!=w.width || old_height!=w.height)enqueue_gui_message({msg.window,msg.wparam,next==2?0:msg.lparam,5});
             if(next!=2)invalidate_window(msg.window);continue;
         }
         if (msg.message == 5 && msg.wparam!=1) {
+            if(gui_geometry_trace_enabled())std::fprintf(stderr,"[gui-geometry] pid=%u hwnd=%llx op=native-size old=%ux%u size=%llux%llu\n",process_id(),
+                static_cast<unsigned long long>(msg.window),found->second.width,found->second.height,static_cast<unsigned long long>(msg.lparam&65535),static_cast<unsigned long long>((msg.lparam>>16)&65535));
             found->second.width = static_cast<std::uint32_t>(msg.lparam & 65535); found->second.height = static_cast<std::uint32_t>((msg.lparam >> 16) & 65535);
             invalidate_window(msg.window);
         }
@@ -832,7 +838,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                     }
                     window.show_command=next;window.visible=command!=0;
                     window.style=(window.style&~0x31000000U)|(window.visible?0x10000000U:0U)|(next==2?0x20000000U:next==3?0x01000000U:0U);
-                    present_gui(handle);if(native_gui_)show_native_window(handle,window.visible);
+                    present_gui(handle);if(native_gui_)show_native_window(handle,window.visible,command!=4 && command!=7 && command!=8);
                     if(window.visible && next!=2)invalidate_window(handle);
                     const bool size_changed=window.visible && (next!=previous || window.initial_size_pending);
                     window.initial_size_pending=false;

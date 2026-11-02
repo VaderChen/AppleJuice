@@ -448,6 +448,10 @@ struct GuiWindow {
     std::optional<std::u16string> theme_application,theme_classes;
     bool dark_mode_allowed{};
     std::uint32_t display_affinity{};
+    // DwmExtendFrameIntoClientArea 的負邊界（整片玻璃）：客戶區依內容 alpha 合成，未繪製處透明。
+    bool dwm_glass{};
+    // 帶 WS_EX_COMPOSITED 的頂層視窗由其他程序送入影格（Chromium 透明視窗）時，同樣依影格 alpha 合成。
+    bool remote_alpha{};
     std::optional<std::u16string> shutdown_reason;
     std::vector<std::uint32_t> layered_pixels; // 預乘 alpha 的客體 COLORREF；供分層視窗及 headless 讀回。
     bool layered_initialized{};std::uint8_t layered_alpha{255};std::uint32_t layered_color{};
@@ -1174,6 +1178,13 @@ struct GuiDisplayMode {
     std::uint64_t native_id{};
     bool operator==(const GuiDisplayMode&) const = default;
 };
+// 一台顯示器：rect／work 為 left, top, right, bottom，採 Windows 虛擬桌面座標（主螢幕左上為原點、y 向下）。
+struct GuiMonitor {
+    std::array<std::int32_t,4> rect{},work{};
+    bool primary{};
+    std::uint32_t refresh{60};
+    bool operator==(const GuiMonitor&) const = default;
+};
 class NativeGui {
 public:
     virtual ~NativeGui() = default;
@@ -1188,6 +1199,11 @@ public:
     virtual bool accessibility_announcement(std::uint64_t,std::u16string_view,bool) {return false;}
     virtual std::array<std::int32_t,4> work_area(){return {0,0,1440,900};}
     virtual std::array<std::int32_t,4> screen_area(){return {0,0,1440,900};}
+    // 第一筆為主螢幕；預設只回報 screen_area／work_area（work_area 為 x, y, 寬, 高）。
+    virtual std::vector<GuiMonitor> monitors(){
+        const auto screen=screen_area(),work=work_area();
+        return {GuiMonitor{screen,{work[0],work[1],work[0]+work[2],work[1]+work[3]},true}};
+    }
     virtual std::vector<GuiDisplayMode> display_modes(){return {};}
     virtual std::optional<GuiDisplayMode> current_display_mode(){return {};}
     // 模式變更限定目前程序；離開全螢幕、銷毀視窗或 backend 時恢復原模式。
@@ -1198,6 +1214,12 @@ public:
     virtual std::uint32_t shell_open(const std::shared_ptr<HostFile>&,std::string_view,const shell::Application&){return 50;}
     virtual std::optional<shell::Application> shell_default_application(const std::shared_ptr<HostFile>&,std::string_view){return {};}
     virtual bool set_opacity(std::uint64_t,std::uint8_t) {return false;}
+    // 頂層視窗暫緩揭露：hold 只在原生視窗尚未顯示時生效，之後以透明顯示到釋放為止；回傳是否改變狀態。
+    virtual bool hold_reveal(std::uint64_t,bool) {return false;}
+    // SWP_NOACTIVATE／SW_SHOWNA 等不啟用的顯示：只排入前景，不取得宿主焦點。
+    virtual void show_inactive(std::uint64_t handle) {show(handle,true);}
+    // 內容完全透明的頂層視窗不接收滑鼠，點擊交給下方視窗（同 Windows 分層視窗 alpha 為 0 的像素）。
+    virtual void set_input_transparent(std::uint64_t,bool) {}
     virtual bool set_region(std::uint64_t,const std::optional<GuiRegion>&) {return false;}
     virtual void present(std::uint64_t handle, const GuiWindow& window) = 0;
     virtual void destroy(std::uint64_t handle) = 0;

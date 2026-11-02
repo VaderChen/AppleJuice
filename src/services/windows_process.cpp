@@ -430,6 +430,10 @@ void set_child_result_descriptor(int descriptor) {
 }
 void report_child_job_status(std::uint32_t error) { send_packet(5, error); }
 void report_child_startup_ready() { send_packet(22, 0); }
+void report_child_creation_time(std::uint64_t filetime) {
+    send_packet(10, static_cast<std::uint32_t>(filetime));
+    send_packet(11, static_cast<std::uint32_t>(filetime >> 32));
+}
 void report_child_startup_failure(std::uint32_t error) { send_packet(22, error); }
 void report_child_input_idle() {
     if (!reported_idle) {
@@ -1178,6 +1182,15 @@ std::uint32_t WindowsServices::query_process_accounting(GuestMemory &memory, std
         return 0;
     if (child && child->exited)
         return 50;
+    // 直接子程序已回報建立時間與起始 CPU 基準：以宿主 proc_pid_rusage 計算，不經 IPC。
+    // 對方正在結束或尚未輪詢時不回應 IPC，原本要等滿 5 秒逾時；Steam 切頁時 browser 因此停頓約 5 秒。
+    if (!cycles && child && child->host_clock && (child->baseline_parts & 0x3fU) == 0x3fU)
+        if (const auto cpu = host_process_cpu_time(static_cast<int>(child->pid))) {
+            const auto &base = child->baseline;
+            values = {base[2], 0, cpu->kernel >= base[1] ? cpu->kernel - base[1] : 0,
+                      cpu->user >= base[0] ? cpu->user - base[0] : 0, 0};
+            return 0;
+        }
     const auto pid = child ? static_cast<std::uint32_t>(child->pid) : found->second.remote_pid;
     const auto error = remote_process_accounting(memory, pid, values);
     if (child)

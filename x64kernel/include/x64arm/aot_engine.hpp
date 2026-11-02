@@ -47,6 +47,8 @@ public:
         // 已發布來源／依賴涵蓋，以及局部撤銷、保留與安全邊界回收的累計數；不是動態分支次數。
         std::uint64_t fragment_tracked_modules{},fragment_dependencies{},fragment_source_invalidations{},fragment_invalidated_modules{};
         std::uint64_t fragment_preserved_modules{},fragment_reclaims{},fragment_deferred_modules{},fragment_deferred_arenas{};
+        // 以增量撤銷索引（來源頁、依賴反向邊、後補出口）處理的失效事件數；X64ARM_AOT_FRAGMENT_INDEX=0 時為零。
+        std::uint64_t fragment_indexed_invalidations{};
         // 常駐碼直接完成的宿主葉節點服務；仍計入 fallback_instructions，與宿主迴圈服務口徑一致。
         std::uint64_t resident_services{};
         std::uint64_t scalar_native_services{},scalar_native_retries{};
