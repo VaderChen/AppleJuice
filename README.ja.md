@@ -14,19 +14,21 @@ AppleJuice は、Apple Silicon Mac 上で対応する Windows アプリケーシ
 
 ## Geekbench 7 シングルコアの総経過時間
 
-2026 年 10 月 21 日、Apple M4 Pro、メモリ 64 GiB、macOS 27.0.1 の環境で、Geekbench 7.0.0 Pro（build 703423）の 16 個のシングルコア測定項目をテストしました。AppleJuice には Launcher 0.26.1021（build 10、エンジン `ced244119617`）を使用し、16 項目すべてを同じ実行ファイルで測定しました。
+2026 年 11 月 2 日、Apple M4 Pro、メモリ 64 GiB、macOS 27.0.1 の環境で、AppleJuice Launcher 0.26.1102（build 122）を使って Geekbench 7.0.0 Pro（build 703423）の 16 個のシングルコア測定項目を測定しました。ネイティブ ARM64 と Rosetta の値は 2026 年 10 月 23 日の測定値です。すべて順番に実行し、各プロセスは 1 コアを使用し、ウォームアップ 1 回と本測定 3 回を行いました。公式の作業量は 3 者で項目ごとに同一です。
 
 **各項目のネイティブ ARM64 の総経過時間を 1.0 としています。倍率が低いほど高速です。** 総経過時間はプロセスの起動から終了までで、初期化、キャリブレーション、ウォームアップ、本測定、プロセス内の結果書き込みを含みます。計測ツールによる入力準備、アイドル待機、終了後の後処理は含みません。4 枚のグラフは同じ Y 軸スケールを使い、それぞれ 4 項目を示します。
 
-AppleJuice は Windows x86_64 版、Rosetta は macOS x86_64 版、ネイティブ実行は macOS ARM64 版を使用します。グラフは各項目を 1 回実行した総経過時間を比較し、当時のテスト環境での性能を示しています。
+AppleJuice は Windows x86_64 版、Rosetta は macOS x86_64 版、ネイティブ実行は macOS ARM64 版を使用します。AppleJuice は有効な全プロセスの算術平均で、各項目 2 回、計 32 回です。ネイティブ ARM64 は各項目 1 回、Rosetta は HDR が 3 回の平均、その他の項目は各 1 回です。3 者の測定時期とサンプル数は異なり、外部負荷も含むため、グラフは実測結果を示すもので統計的な有意性は主張しません。総経過時間は測定値をそのまま使用し、演算効率の改善率は適用していません。
 
-![総経過時間の倍率: File Compression, Navigation, HTML5 Browser, PDF Viewer](docs/images/geekbench7-single-core-2026-10-21/chart-1.png)
+ネイティブ ARM64 版はテスト開始前のシステム情報の収集に約 4.6 秒、Rosetta は約 1.6 秒かかります。そのため一部の項目では Rosetta の総経過時間がネイティブより短くなりますが、本測定の演算時間はすべての項目でネイティブが最速です。
 
-![総経過時間の倍率: Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-single-core-2026-10-21/chart-2.png)
+![総経過時間の倍率: File Compression, Navigation, HTML5 Browser, PDF Viewer](docs/images/geekbench7-single-core-2026-11-02/chart-1.png)
 
-![総経過時間の倍率: HDR, Photo Editor, Ray Tracer, Structure from Motion](docs/images/geekbench7-single-core-2026-10-21/chart-3.png)
+![総経過時間の倍率: Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-single-core-2026-11-02/chart-2.png)
 
-![総経過時間の倍率: Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-single-core-2026-10-21/chart-4.png)
+![総経過時間の倍率: HDR, Photo Editor, Ray Tracer, Structure from Motion](docs/images/geekbench7-single-core-2026-11-02/chart-3.png)
+
+![総経過時間の倍率: Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-single-core-2026-11-02/chart-4.png)
 
 ## はじめに
 

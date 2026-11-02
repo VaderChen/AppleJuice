@@ -14,19 +14,21 @@ The complete `x64kernel/` static SDK is included; normal builds do not require t
 
 ## Geekbench 7 single-core total elapsed time
 
-The 16 single-core workloads in Geekbench 7.0.0 Pro (build 703423) were tested on October 21, 2026, on an Apple M4 Pro with 64 GiB of memory and macOS 27.0.1. AppleJuice used Launcher 0.26.1021 (build 10, engine `ced244119617`). All 16 workloads used the same executable.
+The 16 single-core workloads in Geekbench 7.0.0 Pro (build 703423) were measured on November 2, 2026, on an Apple M4 Pro with 64 GiB of memory and macOS 27.0.1, using AppleJuice Launcher 0.26.1102 (build 122). The native ARM64 and Rosetta figures are from the October 23, 2026 measurement. All runs were sequential, with one core per process, one warm-up and three measured iterations; the official workload is identical across all three for every workload.
 
 **Each workload's native ARM64 total elapsed time is normalized to 1.0; lower ratios are faster.** Total elapsed time runs from process start to exit and includes initialization, calibration, warm-up, the measured workload and result writing within the process. It excludes the measurement tool's input preparation, idle waiting and cleanup after exit. All four charts use the same Y-axis scale, with four workloads per chart.
 
-AppleJuice runs the Windows x86_64 version, Rosetta runs the macOS x86_64 version, and native execution uses the macOS ARM64 version. The charts compare total elapsed time from a single run of each workload, showing performance in the test environment at the time.
+AppleJuice runs the Windows x86_64 version, Rosetta runs the macOS x86_64 version, and native execution uses the macOS ARM64 version. AppleJuice values are the arithmetic mean of all valid runs: two per workload, 32 in total. Native ARM64 used one run per workload; Rosetta HDR is the mean of three runs and every other workload used one run. Measurement times and sample counts differ and include external load, so the charts show measured results without claiming statistical significance. Total elapsed time is taken directly from measurement; no compute-efficiency adjustment is applied.
 
-![Total elapsed time ratio: File Compression, Navigation, HTML5 Browser, PDF Viewer](docs/images/geekbench7-single-core-2026-10-21/chart-1.png)
+Before starting the tests, the native ARM64 version spends about 4.6 seconds collecting system information, versus about 1.6 seconds for Rosetta. As a result, Rosetta's total elapsed time is shorter than native for some workloads, while the measured compute time is fastest natively for every workload.
 
-![Total elapsed time ratio: Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-single-core-2026-10-21/chart-2.png)
+![Total elapsed time ratio: File Compression, Navigation, HTML5 Browser, PDF Viewer](docs/images/geekbench7-single-core-2026-11-02/chart-1.png)
 
-![Total elapsed time ratio: HDR, Photo Editor, Ray Tracer, Structure from Motion](docs/images/geekbench7-single-core-2026-10-21/chart-3.png)
+![Total elapsed time ratio: Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-single-core-2026-11-02/chart-2.png)
 
-![Total elapsed time ratio: Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-single-core-2026-10-21/chart-4.png)
+![Total elapsed time ratio: HDR, Photo Editor, Ray Tracer, Structure from Motion](docs/images/geekbench7-single-core-2026-11-02/chart-3.png)
+
+![Total elapsed time ratio: Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-single-core-2026-11-02/chart-4.png)
 
 ## Getting started
 

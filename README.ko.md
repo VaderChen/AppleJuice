@@ -14,19 +14,21 @@ AppleJuice는 Apple Silicon Mac에서 지원되는 Windows 프로그램을 실�
 
 ## Geekbench 7 싱글 코어 전체 경과 시간
 
-2026년 10월 21일 Apple M4 Pro, 메모리 64 GiB, macOS 27.0.1 환경에서 Geekbench 7.0.0 Pro(build 703423)의 싱글 코어 항목 16개를 테스트했습니다. AppleJuice는 Launcher 0.26.1021(build 10, 엔진 `ced244119617`)을 사용했으며, 16개 항목 모두 동일한 실행 파일로 측정했습니다.
+2026년 11월 2일 Apple M4 Pro, 메모리 64 GiB, macOS 27.0.1 환경에서 AppleJuice Launcher 0.26.1102(build 122)로 Geekbench 7.0.0 Pro(build 703423)의 싱글 코어 항목 16개를 측정했습니다. 네이티브 ARM64와 Rosetta 값은 2026년 10월 23일 측정값입니다. 모두 순차적으로 실행했으며, 각 프로세스는 코어 하나를 사용하고 워밍업 1회와 본 측정 3회를 수행했습니다. 공식 작업량은 세 환경에서 항목별로 동일합니다.
 
 **각 항목의 네이티브 ARM64 전체 경과 시간을 1.0으로 정규화했으며, 배수가 낮을수록 빠릅니다.** 전체 경과 시간은 프로세스 시작부터 종료까지이며 초기화, 보정, 워밍업, 본 측정 및 프로세스 내부의 결과 기록을 포함합니다. 측정 도구의 입력 준비, 유휴 대기 및 종료 후 정리는 제외합니다. 네 그래프는 동일한 Y축 범위를 사용하며 각각 네 항목을 표시합니다.
 
-AppleJuice는 Windows x86_64 버전, Rosetta는 macOS x86_64 버전, 네이티브 실행은 macOS ARM64 버전을 사용합니다. 그래프는 각 항목을 한 번 실행한 전체 경과 시간을 비교하여 당시 테스트 환경에서의 성능을 보여 줍니다.
+AppleJuice는 Windows x86_64 버전, Rosetta는 macOS x86_64 버전, 네이티브 실행은 macOS ARM64 버전을 사용합니다. AppleJuice 값은 유효한 모든 프로세스의 산술 평균으로, 항목당 2회, 총 32회입니다. 네이티브 ARM64는 항목당 1회이며, Rosetta는 HDR이 3회 평균이고 나머지 항목은 각 1회입니다. 세 환경의 측정 시기와 표본 수가 다르고 외부 부하가 포함되어 있으므로, 그래프는 실측 결과를 보여 줄 뿐 통계적 유의성을 주장하지 않습니다. 전체 경과 시간은 측정값을 그대로 사용했으며 연산 효율 개선율은 적용하지 않았습니다.
 
-![전체 경과 시간 배수: File Compression, Navigation, HTML5 Browser, PDF Viewer](docs/images/geekbench7-single-core-2026-10-21/chart-1.png)
+네이티브 ARM64 버전은 테스트 시작 전 시스템 정보를 수집하는 데 약 4.6초, Rosetta는 약 1.6초가 걸립니다. 따라서 일부 항목에서는 Rosetta의 전체 경과 시간이 네이티브보다 짧지만, 본 측정의 연산 시간은 모든 항목에서 네이티브가 가장 빠릅니다.
 
-![전체 경과 시간 배수: Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-single-core-2026-10-21/chart-2.png)
+![전체 경과 시간 배수: File Compression, Navigation, HTML5 Browser, PDF Viewer](docs/images/geekbench7-single-core-2026-11-02/chart-1.png)
 
-![전체 경과 시간 배수: HDR, Photo Editor, Ray Tracer, Structure from Motion](docs/images/geekbench7-single-core-2026-10-21/chart-3.png)
+![전체 경과 시간 배수: Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-single-core-2026-11-02/chart-2.png)
 
-![전체 경과 시간 배수: Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-single-core-2026-10-21/chart-4.png)
+![전체 경과 시간 배수: HDR, Photo Editor, Ray Tracer, Structure from Motion](docs/images/geekbench7-single-core-2026-11-02/chart-3.png)
+
+![전체 경과 시간 배수: Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-single-core-2026-11-02/chart-4.png)
 
 ## 시작하기
 

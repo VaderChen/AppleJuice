@@ -16,19 +16,21 @@
 
 ## Geekbench 7 單核心整體時間
 
-2026-10-23 更新：於 Apple M4 Pro、64 GiB 記憶體、macOS 27.0.1 測試 Geekbench 7.0.0 Pro（build 703423）的 16 個單核心測項。原生 ARM64 與 Rosetta 以相同工作負載資源重新量測，全部循序執行，每個程序使用一個核心、一次暖機及三次正式迭代。
+2026-11-02 更新：於 Apple M4 Pro、64 GiB 記憶體、macOS 27.0.1，以 Launcher 0.26.1102（build 122）重新量測 Geekbench 7.0.0 Pro（build 703423）的 16 個單核心測項；原生 ARM64 與 Rosetta 沿用 2026-10-23 的量測數值。全部循序執行，每個程序使用一個核心、一次暖機及三次正式迭代，三方官方工作量逐項相同。
 
 **各測項以自己的原生 ARM64 整體時間定為 1.0，倍率越低越快。** 整體時間從程序啟動量到結束，包含初始化、校準、暖機、正式測試及程序內結果寫入；不計入量測工具準備輸入、等待空閒與退出後清理的時間。四張圖採相同 Y 軸尺度，每張呈現四個測項。
 
-AppleJuice 執行 Windows x86_64 版本，Rosetta 執行 macOS x86_64 版本，原生執行 macOS ARM64 版本。AppleJuice 採全部有效程序的算術平均：各項四次，PDF Viewer 十二次，共 72 次。原生 ARM64 各項一次；Rosetta 的 HDR 採三次重測平均，其餘測項各一次。三方量測時段與樣本數不同，且包含外部負載，圖表呈現本輪實測狀態，不宣稱統計顯著。整體時間直接取自量測，未套用運算效率改善百分比。
+AppleJuice 執行 Windows x86_64 版本，Rosetta 執行 macOS x86_64 版本，原生執行 macOS ARM64 版本。AppleJuice 採全部有效程序的算術平均：各項兩次，共 32 次。原生 ARM64 各項一次；Rosetta 的 HDR 採三次重測平均，其餘測項各一次。三方量測時段與樣本數不同，且包含外部負載，圖表呈現實測狀態，不宣稱統計顯著。整體時間直接取自量測，未套用運算效率改善百分比。
 
-![整體時間倍率：File Compression、Navigation、HTML5 Browser、PDF Viewer](docs/images/geekbench7-single-core-2026-10-23/chart-1.png)
+原生 ARM64 版本在開始測試前收集系統資訊約需 4.6 秒，Rosetta 約需 1.6 秒，因此部分測項的 Rosetta 整體時間短於原生；各測項的正式運算時間仍以原生最快。
 
-![整體時間倍率：Photo Library、Clang、Text Processing、Asset Compression](docs/images/geekbench7-single-core-2026-10-23/chart-2.png)
+![整體時間倍率：File Compression、Navigation、HTML5 Browser、PDF Viewer](docs/images/geekbench7-single-core-2026-11-02/chart-1.png)
 
-![整體時間倍率：HDR、Photo Editor、Ray Tracer、Structure from Motion](docs/images/geekbench7-single-core-2026-10-23/chart-3.png)
+![整體時間倍率：Photo Library、Clang、Text Processing、Asset Compression](docs/images/geekbench7-single-core-2026-11-02/chart-2.png)
 
-![整體時間倍率：Game Physics、Video Encoder、Audio Encoder、Video Player](docs/images/geekbench7-single-core-2026-10-23/chart-4.png)
+![整體時間倍率：HDR、Photo Editor、Ray Tracer、Structure from Motion](docs/images/geekbench7-single-core-2026-11-02/chart-3.png)
+
+![整體時間倍率：Game Physics、Video Encoder、Audio Encoder、Video Player](docs/images/geekbench7-single-core-2026-11-02/chart-4.png)
 
 ## 開始使用
 
