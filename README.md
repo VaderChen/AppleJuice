@@ -112,11 +112,18 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | Steam | x64 | Chromium（CEF） | 登入並進入主視窗、啟動遊戲；選單正常顯示與操作，切換商店頁面約 3 秒 |
 | 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | 讀檔、對話與地圖移動，平均約 56.5 FPS |
 | 不谙世事的猫艾露莎 | x86 | RPG Maker MV | 地圖移動，平均約 57 FPS（含 1.01、1.02 舊版） |
+| 三國志X with 威力加強版 | x86 | 未知 | 顯示主選單，環境設定可開啟並返回 |
 | 小涵的暑假 | x64 | RPG Maker MV | 地圖移動，平均約 37 FPS |
 | 永恒的黄昏 | x86 | RPG Maker MV | 進入遊戲地圖並播放背景音樂，單核約 57 FPS |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | 有限範圍操作通過，FPS 未量測 |
 
 實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
+
+## 支持開發
+
+如果 AppleJuice 對你有幫助，歡迎請我喝杯咖啡，支持持續開發。
+
+[☕ Buy Me a Coffee](https://buymeacoffee.com/vaderchen)
 
 ## 授權
 
