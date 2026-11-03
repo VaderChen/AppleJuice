@@ -100,7 +100,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 
 ## 實測紀錄（2026-10～11）
 
-| 程式 | x64/x86 | 主要 API | 運作範圍 |
+| 程式 | x64/x86 | 主要運作核心 | 運作範圍 |
 | --- | --- | --- | --- |
 | Cyberpunk 2077 | x64 | D3D12 | 可執行內建 Benchmark |
 | DAVE THE DIVER | x64 | D3D11（Unity） | 進入主選單 |

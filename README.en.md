@@ -98,7 +98,7 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 
 ## Tested applications (October–November 2026)
 
-| Application | x64/x86 | Main API | Working scope |
+| Application | x64/x86 | Main runtime core | Working scope |
 | --- | --- | --- | --- |
 | Cyberpunk 2077 | x64 | D3D12 | Runs the built-in benchmark |
 | DAVE THE DIVER | x64 | D3D11 (Unity) | Reaches the main menu |
