@@ -15,7 +15,7 @@ import (
 	webview "github.com/webview/webview_go"
 )
 
-//go:embed web/index.html web/app.css web/app.js web/i18n.js web/smoke.js web/launch-smoke.js web/v8-smoke.js web/vendor/* assets/AppleJuice.png
+//go:embed web/index.html web/app.css web/app.js web/i18n.js web/smoke.js web/launch-smoke.js web/v8-smoke.js web/update-smoke.js web/vendor/* assets/AppleJuice.png
 var assets embed.FS
 
 type pathsFlag []string
@@ -108,6 +108,9 @@ func htmlDocument(smoke *smokeConfig) string {
 		if smoke.Scenario == "v8" {
 			script = "v8-smoke.js"
 		}
+		if smoke.Scenario == "update" {
+			script = "update-smoke.js"
+		}
 		js += "\nwindow.smokeConfig=" + string(config) + ";\n" + readAsset(script)
 	}
 	return strings.ReplaceAll(html, "/* APP_JS */", js)
@@ -120,6 +123,7 @@ func run() error {
 	cDrive := flag.String("c-drive", "", "新加入程式的預設 C 槽映射")
 	smokePath := flag.String("smoke", "", "原生 UI Smoke 設定檔（開發用）")
 	backgroundDisplay := flag.Bool("background-display", false, "在非焦點螢幕顯示 Launcher 與客體，不主動取得焦點")
+	updateTestVersion := flag.String("update-test-version", "", "開發測試：以指定版本檢查更新，並允許替換未公證的 App")
 	flag.Var(&add, "add", "加入 EXE，可重複指定")
 	flag.Parse()
 	if *dataDir == "" {
@@ -150,7 +154,7 @@ func run() error {
 		if err = json.Unmarshal(data, smoke); err != nil {
 			return err
 		}
-		if smoke.Scenario != "" && smoke.Scenario != "library" && smoke.Scenario != "launch" && smoke.Scenario != "settings" && smoke.Scenario != "v8" {
+		if smoke.Scenario != "" && smoke.Scenario != "library" && smoke.Scenario != "launch" && smoke.Scenario != "settings" && smoke.Scenario != "v8" && smoke.Scenario != "update" {
 			return errors.New("不支援的 Smoke 情境")
 		}
 		if smoke.TimeoutSeconds == 0 {
@@ -218,7 +222,7 @@ func run() error {
 		return errors.New("無法建立 WebView 視窗")
 	}
 	defer w.Destroy()
-	w.SetTitle("Win64 Launcher")
+	w.SetTitle("AppleJuice")
 	w.SetSize(920, 650, webview.HintMin)
 	w.SetSize(1180, 800, webview.HintNone)
 	nativeConfigure(w.Window())
@@ -226,6 +230,22 @@ func run() error {
 	finished := make(chan struct{})
 	defer close(finished)
 	var bridge *asyncBridge
+	currentVersion := applicationVersion()
+	if *updateTestVersion != "" {
+		currentVersion = *updateTestVersion
+	}
+	updates := newUpdater(currentVersion, *updateTestVersion != "", func() int { return app.Snapshot().Running }, func(target string) error {
+		if err := relaunchAfterExit(target, relaunchArguments(os.Args[1:])); err != nil {
+			return err
+		}
+		// 留時間讓介面顯示「正在重新啟動」，再結束目前程序。
+		go func() { time.Sleep(1500 * time.Millisecond); bridge.post(w.Terminate) }()
+		return nil
+	})
+	if smoke == nil || smoke.Scenario == "update" {
+		// 每次啟動在背景檢查一次；有可安裝的新版時由介面詢問是否更新。
+		updates.Start(false)
+	}
 	handleRequest := func(payload string) (any, error) {
 		// 綁定套件的原生 JSON parser 不接受未跳脫的 DEL。以 ASCII 封裝
 		// 所有 UTF-8 請求，避免按鍵、檔名或參數中的控制字元造成 RPC 消失。
@@ -334,6 +354,12 @@ func run() error {
 			return onUI(bridge, func() ([]string, error) { return nativePick(true, false, req.Data) })
 		case "diagnostics":
 			return app.Diagnostics(req.ID)
+		case "checkUpdate":
+			return updates.Start(false), nil
+		case "installUpdate":
+			return updates.Start(true), nil
+		case "updateStatus":
+			return updates.Status(), nil
 		case "reveal":
 			for _, p := range app.Snapshot().Programs {
 				if p.ID == req.ID {

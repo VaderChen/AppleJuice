@@ -416,7 +416,7 @@ $('clear-log').onclick = () => { terminals.get(state.selected)?.log?.clear(); re
 document.addEventListener('keydown', event => { if (event.metaKey && event.key.toLowerCase() === 'o') { event.preventDefault(); perform(addPrograms); } });
 document.addEventListener('dragover', event => event.preventDefault());
 document.addEventListener('drop', event => event.preventDefault());
-window.launcherReady = Promise.all([api('snapshot'), api('windowsFonts')]).then(([initial, fonts]) => { windowsFonts = fonts || []; applyState(initial); poll(); });
+window.launcherReady = Promise.all([api('snapshot'), api('windowsFonts')]).then(([initial, fonts]) => { windowsFonts = fonts || []; applyState(initial); poll(); pollUpdate(); });
 window.launcherReady.catch(error => toast(t`啟動失敗：${errorText(error)}`, true));
 
 function showGlobalTab(name) {
@@ -600,15 +600,76 @@ function previewAppearance() {
  $('global-drive-rows').replaceChildren();
  for (const [letter, path] of rows) addGlobalDrive(letter, path);
  programMenu.setAttribute('aria-label', t('程式項目'));
- render();
+ render(); renderUpdate();
 }
 for (const id of ['ui-language', 'ui-theme']) $(id).onchange = previewAppearance;
 function restoreAppearance() {
  applyAppearance(state.globalSettings?.language, state.globalSettings?.theme);
- render();
+ render(); renderUpdate();
 }
 $('app-settings-dialog').addEventListener('close', restoreAppearance);
 window.addEventListener('languagechange', () => {
  if ($('app-settings-dialog').open) previewAppearance();
  else { applyAppearance(state.globalSettings?.language, state.globalSettings?.theme); render(); }
 });
+
+// 版本更新：後端在背景偵測、下載與安裝，對話框輪詢顯示進度。
+// 啟動時的檢查若發現可安裝的新版，只詢問一次；關於頁按鈕直接進入更新流程。
+const updateBusyPhases = ['checking', 'downloading', 'verifying', 'installing', 'restarting'];
+let updateTimer = 0, updatePrompted = false, updateStatus = { phase: 'idle' };
+const megabytes = bytes => (bytes / 1048576).toFixed(1);
+function updateMessage(status) {
+  switch (status.phase) {
+    case 'checking': return t('正在檢查 GitHub 最新版本…');
+    case 'latest': return t`已是最新版本（${status.current}）`;
+    case 'available': return t`AppleJuice ${status.latest} 已發布，目前版本 ${status.current}。是否要更新？`;
+    case 'downloading': return t`正在下載 ${status.latest}…`;
+    case 'verifying': return t('正在驗證簽章與公證…');
+    case 'installing': return t('正在安裝更新…');
+    case 'restarting': return t`已更新為 ${status.latest}，正在重新啟動…`;
+    case 'unavailable': case 'error': return errorText(status.error);
+  }
+  return '';
+}
+function renderUpdate(status = updateStatus) {
+  updateStatus = status;
+  const busy = updateBusyPhases.includes(status.phase), prompt = status.phase === 'available', message = updateMessage(status);
+  setText('update-status', status.phase === 'idle' ? '' : message);
+  $('check-update').disabled = busy;
+  if (!$('update-dialog').open) return;
+  setText('update-summary', busy ? (status.latest ? `AppleJuice ${status.latest}` : '') : message);
+  $('update-progress-area').hidden = !busy;
+  setText('update-message', busy ? message : '');
+  const progress = $('update-progress');
+  if (status.phase === 'downloading' && status.total > 0) {
+    progress.max = status.total; progress.value = Math.min(status.received || 0, status.total);
+    setText('update-count', `${megabytes(status.received || 0)} / ${megabytes(status.total)} MB（${Math.floor(100 * (status.received || 0) / status.total)}%）`);
+  } else {
+    progress.removeAttribute('value'); setText('update-count', '');
+  }
+  $('update-now').hidden = !prompt;
+  $('update-later').hidden = busy;
+  setText('update-later', prompt ? t('稍後再說') : t('關閉'));
+}
+async function pollUpdate() {
+  clearTimeout(updateTimer);
+  try {
+    const status = await api('updateStatus');
+    if (status.phase === 'available' && !updatePrompted) { updatePrompted = true; $('update-dialog').showModal(); }
+    renderUpdate(status);
+    if (updateBusyPhases.includes(status.phase)) updateTimer = setTimeout(pollUpdate, 300);
+  } catch (error) {
+    renderUpdate({ phase: 'error', error: error.message || String(error) });
+  }
+}
+async function startUpdate() {
+  updatePrompted = true;
+  if (!$('update-dialog').open) $('update-dialog').showModal();
+  try { renderUpdate(await api('installUpdate')); } catch (error) { renderUpdate({ phase: 'error', error: error.message || String(error) }); return; }
+  pollUpdate();
+}
+$('check-update').onclick = startUpdate;
+$('update-now').onclick = startUpdate;
+$('update-later').onclick = () => $('update-dialog').close();
+$('update-dialog').addEventListener('cancel', event => { if (updateBusyPhases.includes(updateStatus.phase)) event.preventDefault(); });
+window.addEventListener('languagechange', () => renderUpdate());

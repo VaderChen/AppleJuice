@@ -19,6 +19,7 @@ void launcher_snapshot(void* window, const char* path);
 int launcher_visible(int pid);
 void launcher_alert(const char* text);
 void launcher_reveal(const char* path);
+char* launcher_trash(const char* path);
 int launcher_pty_utf8(int fd);
 */
 import "C"
@@ -92,6 +93,16 @@ func nativeReveal(path string) {
 	value := C.CString(path)
 	defer C.free(unsafe.Pointer(value))
 	C.launcher_reveal(value)
+}
+func nativeTrash(path string) (string, error) {
+	value := C.CString(path)
+	defer C.free(unsafe.Pointer(value))
+	result := C.launcher_trash(value)
+	if result == nil {
+		return "", errors.New("無法移到垃圾桶：" + path)
+	}
+	defer C.free(unsafe.Pointer(result))
+	return C.GoString(result), nil
 }
 func nativePTY(fd uintptr) error {
 	if C.launcher_pty_utf8(C.int(fd)) != 0 {

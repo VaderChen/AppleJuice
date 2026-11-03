@@ -181,7 +181,7 @@ void launcher_configure(void *pointer) {
     LauncherNavigationDelegate *navigation=[LauncherNavigationDelegate new];navigation.previous=web.navigationDelegate;web.navigationDelegate=navigation;
     objc_setAssociatedObject(window,@selector(navigationDelegate),navigation,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     NSMenu *menu=[NSMenu new];NSMenuItem *appItem=[NSMenuItem new];[menu addItem:appItem];NSMenu *appMenu=[NSMenu new];appItem.submenu=appMenu;
-    NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@"結束 Win64 Launcher" action:@selector(performClose:) keyEquivalent:@"q"];quit.target=window;[appMenu addItem:quit];
+    NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@"結束 AppleJuice" action:@selector(performClose:) keyEquivalent:@"q"];quit.target=window;[appMenu addItem:quit];
     NSMenuItem *edit=[NSMenuItem new];[menu addItem:edit];edit.submenu=[[NSMenu alloc] initWithTitle:@"編輯"];
     NSArray *labels=@[@"復原",@"重做",@"剪下",@"拷貝",@"貼上",@"全選"];
     NSArray *actions=@[@"undo:",@"redo:",@"cut:",@"copy:",@"paste:",@"selectAll:"];
@@ -210,6 +210,8 @@ int launcher_visible(int pid) {
     for(NSDictionary *row in windows){if([row[(id)kCGWindowOwnerPID] intValue]==pid && [row[(id)kCGWindowLayer] intValue]==0)return 1;}
     return 0;
 }
-void launcher_alert(const char *text){@autoreleasepool{NSAlert *alert=[NSAlert new];alert.messageText=@"Win64 Launcher";alert.informativeText=[NSString stringWithUTF8String:text];[alert runModal];}}
+void launcher_alert(const char *text){@autoreleasepool{NSAlert *alert=[NSAlert new];alert.messageText=@"AppleJuice";alert.informativeText=[NSString stringWithUTF8String:text];[alert runModal];}}
 void launcher_reveal(const char *path){[[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:[NSString stringWithUTF8String:path]]]];}
 int launcher_pty_utf8(int fd){struct termios settings;if(tcgetattr(fd,&settings)!=0)return -1;settings.c_iflag|=IUTF8;return tcsetattr(fd,TCSANOW,&settings);}
+// 移到垃圾桶並回傳新位置，讓更新失敗時可以移回原處。
+char* launcher_trash(const char *path){@autoreleasepool{NSURL *result=nil;NSURL *url=[NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];if(![[NSFileManager defaultManager] trashItemAtURL:url resultingItemURL:&result error:nil]||!result.path)return NULL;return strdup(result.path.fileSystemRepresentation);}}

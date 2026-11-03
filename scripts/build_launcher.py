@@ -52,10 +52,8 @@ def build_jobs(requested=None):
     override = os.environ.get('CMAKE_BUILD_PARALLEL_LEVEL')
     if override:
         return int(override)
-    cores = int(subprocess.check_output(['sysctl', '-n', 'hw.physicalcpu']))
-    memory = int(subprocess.check_output(['sysctl', '-n', 'hw.memsize']))
-    # 限制預設平行數；大型 C++ 單元每個工作約需 2 GiB。
-    return max(1, min(2, cores, memory // (2 * 1024**3)))
+    # 建置使用宿主可用核心；明確的命令列及環境設定仍優先。
+    return max(1, int(subprocess.check_output(['sysctl', '-n', 'hw.logicalcpu'])))
 
 
 def file_digest(path):
@@ -187,7 +185,7 @@ def build_launcher():
     parser.add_argument('--cross-arch-profile', type=pathlib.Path, help='TSO／4 KiB 授權 profile；未指定時沿用引擎 CMake 設定')
     parser.add_argument('--engine-build-dir', type=pathlib.Path, default=ROOT / 'build' / 'release', help='引擎建置目錄，可指定隔離的 Release 建置')
     parser.add_argument('--refresh-assets', action='store_true', help='從鎖定版本重建 xterm.js 資源')
-    parser.add_argument('--jobs', type=int, help='C++／Go 建置平行數；預設最多 2，並依核心及記憶體縮減')
+    parser.add_argument('--jobs', type=int, help='C++／Go 建置平行數；預設使用宿主可用核心數')
     parser.add_argument('--output', type=pathlib.Path, help='指定 app 輸出路徑，供隔離建置使用')
     parser.add_argument('--force-package', action='store_true', help='強制重新打包及驗證簽章')
     parser.add_argument('--with-native-v8', action='store_true', help='內建 ARM64 V8 模組、相依函式庫與 x86／x64 測試 PE')
@@ -323,7 +321,7 @@ def build_launcher():
         if args.with_native_v8:
             minimum_system = bundle_native_v8(ROOT, app, engine_build / 'x64arm_v8_host')
         info = {
-            'CFBundleName': 'Win64 Launcher', 'CFBundleDisplayName': 'Win64 Launcher',
+            'CFBundleName': 'AppleJuice', 'CFBundleDisplayName': 'AppleJuice',
             'CFBundleIdentifier': 'dev.x64arm.launcher', 'CFBundleExecutable': 'Win64Launcher',
             'CFBundleIconFile': 'AppleJuice.icns',
             'CFBundlePackageType': 'APPL', 'CFBundleVersion': str(built_at.hour * 100 + built_at.minute),

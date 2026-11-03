@@ -1012,7 +1012,29 @@ Object.assign(translations, {
     "Saved. Appearance applied; advanced settings take effect on the next launch.",
     "保存しました。表示設定は適用済み、詳細設定は次回起動時に反映されます。",
     "저장했습니다. 화면 설정은 적용되었으며 고급 설정은 다음 실행부터 적용됩니다."
-  ]
+  ],
+  "偵測版本更新": ["Check for updates", "アップデートを確認", "업데이트 확인"],
+  "版本更新": ["Software update", "アップデート", "업데이트"],
+  "立即更新": ["Update now", "今すぐアップデート", "지금 업데이트"],
+  "更新進度": ["Update progress", "アップデートの進行状況", "업데이트 진행률"],
+  "正在檢查 GitHub 最新版本…": ["Checking GitHub for the latest version…", "GitHub で最新バージョンを確認しています…", "GitHub에서 최신 버전을 확인하는 중…"],
+  "已是最新版本（{0}）": ["You're up to date ({0}).", "最新バージョンです（{0}）。", "최신 버전입니다({0})."],
+  "AppleJuice {0} 已發布，目前版本 {1}。是否要更新？": ["AppleJuice {0} is available. You have {1}. Update now?", "AppleJuice {0} が公開されています。現在のバージョンは {1} です。アップデートしますか？", "AppleJuice {0}이(가) 출시되었습니다. 현재 버전은 {1}입니다. 업데이트할까요?"],
+  "正在下載 {0}…": ["Downloading {0}…", "{0} をダウンロードしています…", "{0} 다운로드 중…"],
+  "正在驗證簽章與公證…": ["Verifying signature and notarization…", "署名と公証を確認しています…", "서명과 공증을 확인하는 중…"],
+  "正在安裝更新…": ["Installing the update…", "アップデートをインストールしています…", "업데이트를 설치하는 중…"],
+  "已更新為 {0}，正在重新啟動…": ["Updated to {0}. Restarting…", "{0} にアップデートしました。再起動しています…", "{0}(으)로 업데이트했습니다. 다시 시작하는 중…"],
+  "無法取得 GitHub 最新版本，請確認網路連線。": ["Couldn't get the latest version from GitHub. Check your network connection.", "GitHub から最新バージョンを取得できませんでした。ネットワーク接続を確認してください。", "GitHub에서 최신 버전을 가져오지 못했습니다. 네트워크 연결을 확인하세요."],
+  "最新版本沒有可用的 macOS 更新檔。": ["The latest release has no macOS update file.", "最新リリースに macOS 用のアップデートファイルがありません。", "최신 릴리스에 macOS 업데이트 파일이 없습니다."],
+  "下載的更新檔驗證失敗，已停止更新。": ["The downloaded update failed verification. The update was stopped.", "ダウンロードしたアップデートの検証に失敗したため、中止しました。", "다운로드한 업데이트 파일 검증에 실패하여 업데이트를 중단했습니다."],
+  "更新檔的簽章或公證驗證失敗，已停止更新。": ["The update's signature or notarization check failed. The update was stopped.", "アップデートの署名または公証の確認に失敗したため、中止しました。", "업데이트 파일의 서명 또는 공증 확인에 실패하여 업데이트를 중단했습니다."],
+  "安裝更新失敗，已保留目前版本。": ["Couldn't install the update. The current version was kept.", "アップデートをインストールできませんでした。現在のバージョンはそのままです。", "업데이트를 설치하지 못했습니다. 현재 버전을 유지했습니다."],
+  "目前版本不是正式版本號，無法比較更新。": ["The current version isn't a release version number, so it can't be compared for updates.", "現在のバージョンは正式なバージョン番号ではないため、アップデートを比較できません。", "현재 버전이 정식 버전 번호가 아니어서 업데이트를 비교할 수 없습니다."],
+  "開發建置不支援自動更新，請以 run.command 重新建置。": ["Development builds don't support automatic updates. Rebuild with run.command.", "開発ビルドは自動アップデートに対応していません。run.command で再ビルドしてください。", "개발 빌드는 자동 업데이트를 지원하지 않습니다. run.command로 다시 빌드하세요."],
+  "沒有權限寫入 App 所在資料夾，請改為手動下載更新。": ["No permission to write to the app's folder. Download the update manually.", "アプリのフォルダーに書き込む権限がありません。アップデートを手動でダウンロードしてください。", "앱 폴더에 쓸 권한이 없습니다. 업데이트를 직접 다운로드하세요."],
+  "請先結束執行中的程式，再更新。": ["Quit running programs before updating.", "実行中のプログラムを終了してからアップデートしてください。", "실행 중인 프로그램을 종료한 뒤 업데이트하세요."],
+  "已安裝新版，請手動重新開啟 AppleJuice。": ["The new version is installed. Reopen AppleJuice manually.", "新しいバージョンをインストールしました。AppleJuice を手動で開き直してください。", "새 버전을 설치했습니다. AppleJuice를 직접 다시 여세요."],
+  "目前不是從 App 執行，無法自動更新。": ["AppleJuice isn't running from an app bundle, so it can't update automatically.", "アプリとして実行されていないため、自動アップデートできません。", "앱으로 실행되지 않아 자동 업데이트를 할 수 없습니다."]
 });
 const supportedLanguages = ['zh-Hant', 'en', 'ja', 'ko'];
 function resolveLanguage(preference, languages = navigator.languages || [navigator.language]) {

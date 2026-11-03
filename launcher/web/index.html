@@ -1,10 +1,10 @@
 <!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
-<title>Win64 Launcher</title><style>/* APP_CSS */</style></head>
+<title>AppleJuice</title><style>/* APP_CSS */</style></head>
 <body><div class="shell">
 <aside class="sidebar">
- <div class="brand"><img class="brand-mark" src="APP_ICON_DATA" alt="" aria-hidden="true"><div>Win64<span>你的 Windows 程式庫</span></div><button id="app-settings" class="app-settings-button" aria-label="設定" title="設定"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 3-.6 2.1-1.8 1-2.2-.5-2 3.5L5 10.6v2.1l-1.6 1.5 2 3.5 2.2-.5 1.8 1L10 21h4l.6-2.8 1.8-1 2.2.5 2-3.5-1.6-1.5v-2.1l1.6-1.5-2-3.5-2.2.5-1.8-1L14 3Z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
+ <div class="brand"><img class="brand-mark" src="APP_ICON_DATA" alt="" aria-hidden="true"><div>AppleJuice<span>你的 Windows 程式庫</span></div><button id="app-settings" class="app-settings-button" aria-label="設定" title="設定"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 3-.6 2.1-1.8 1-2.2-.5-2 3.5L5 10.6v2.1l-1.6 1.5 2 3.5 2.2-.5 1.8 1L10 21h4l.6-2.8 1.8-1 2.2.5 2-3.5-1.6-1.5v-2.1l1.6-1.5-2-3.5-2.2.5-1.8-1L14 3Z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
  <div class="library-heading"><h1>程式庫</h1><span id="count" class="count">0</span></div>
  <label class="search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg><input id="search" placeholder="搜尋程式" aria-label="搜尋程式" autocomplete="off"></label>
  <div id="program-list" class="program-list" role="list" aria-label="Windows 程式"></div>
@@ -46,7 +46,7 @@
   </form><div id="config-file" class="config-file"><div><strong>獨立設定檔</strong><code id="config-path"></code></div><button id="reveal" class="text-button">在 Finder 顯示 ↗</button></div><div class="remove-row"><span id="remove-note">移出列表會保留原始 EXE 與設定檔。</span><button id="remove" class="text-button danger">移出列表</button></div></div>
   <div id="log" class="runtime-log-panel" role="tabpanel" aria-labelledby="tab-log" hidden><div class="runtime-log-view"><div class="runtime-log-bar"><strong>LOG</strong><span id="log-size">0 / 131,072 B</span><button id="clear-log" class="text-button" aria-label="清除執行輸出" disabled>清除</button></div><div class="runtime-log-body"><p id="runtime-log-empty">執行後會在此顯示程式的標準輸出與錯誤輸出。</p><pre id="runtime-log-content" tabindex="0" aria-label="執行輸出"></pre></div></div><p class="runtime-log-note">保留最新 128KB 的標準輸出與錯誤輸出。<span id="log-truncated" hidden> 已淘汰較舊內容。</span></p></div>
  </section>
- <footer class="app-footer"><span id="library-summary">選取程式，開始執行。</span><span>Win64 Launcher <span class="footer-divider">/</span> <span id="app-build-version"></span></span></footer>
+ <footer class="app-footer"><span id="library-summary">選取程式，開始執行。</span><span>AppleJuice <span class="footer-divider">/</span> <span id="app-build-version"></span></span></footer>
 </main></div>
 <div id="toast" role="status" aria-live="polite" hidden></div>
 <dialog id="analysis-dialog" class="analysis-dialog" aria-labelledby="analysis-title">
@@ -55,6 +55,13 @@
  <div id="analysis-prompt"><p>是否現在分析這個程式？</p><p class="field-help">預先分析 EXE 與同資料夾的 DLL，建立 resident AOT 快取，供啟用持久快取時使用。也可以稍後從「程式設定」開始。</p></div>
  <div id="analysis-progress-area" hidden><p id="analysis-stage" class="eyebrow" role="status"></p><div class="analysis-activity"><span id="analysis-spinner" class="analysis-spinner" aria-hidden="true"></span><span id="analysis-message" role="status" aria-live="polite">正在準備…</span></div><progress id="analysis-progress" max="1" aria-label="程式加速分析進度"></progress><p id="analysis-count" class="field-help"></p></div>
  <div class="analysis-actions"><button id="analysis-cancel" class="button secondary">稍後再說</button><button id="analysis-start" class="button primary">開始分析</button></div>
+</dialog>
+
+<dialog id="update-dialog" class="analysis-dialog" aria-labelledby="update-title">
+ <div class="dialog-heading"><h3 id="update-title">版本更新</h3></div>
+ <p id="update-summary" class="analysis-name" role="status" aria-live="polite"></p>
+ <div id="update-progress-area" hidden><div class="analysis-activity"><span class="analysis-spinner" aria-hidden="true"></span><span id="update-message" role="status" aria-live="polite"></span></div><progress id="update-progress" max="1" aria-label="更新進度"></progress><p id="update-count" class="field-help"></p></div>
+ <div class="analysis-actions"><button id="update-later" type="button" class="button secondary">稍後再說</button><button id="update-now" type="button" class="button primary">立即更新</button></div>
 </dialog>
 
 <dialog id="log-dialog"><div class="dialog-heading"><h3>引擎執行紀錄</h3><button id="close-log" class="text-button" aria-label="關閉執行紀錄">✕</button></div><p>客體程式輸出顯示在終端；這裡保留執行引擎的診斷。</p><pre id="log-content"></pre></dialog>
@@ -108,7 +115,7 @@
    <button id="add-native-v8-tests" type="button" class="button secondary">加入 V8 測試程式</button>
    <p class="field-help">儲存開關後，將 x86／x64 測試程式加入程式庫，再按執行圖示測試。結果顯示於終端與 LOG。</p>
   </section>
-  <section id="global-about" role="tabpanel" aria-labelledby="global-tab-about" hidden><h4>Win64 Launcher</h4><p id="app-version"></p><p>在 Apple Silicon 上執行 Windows x86／x64 程式，提供程式庫、獨立啟動設定與互動式終端。</p><p>Windows x86／x64 → ARM64</p></section>
+  <section id="global-about" role="tabpanel" aria-labelledby="global-tab-about" hidden><h4>AppleJuice</h4><p id="app-version"></p><p>在 Apple Silicon 上執行 Windows x86／x64 程式，提供程式庫、獨立啟動設定與互動式終端。</p><p>Windows x86／x64 → ARM64</p><div class="update-row"><button id="check-update" type="button" class="button secondary">偵測版本更新</button><span id="update-status" class="field-help" role="status"></span></div></section>
  </div></div>
  <p id="global-settings-error" role="alert" hidden></p>
  <div class="app-settings-footer"><span id="global-settings-status" role="status"></span><button id="global-settings-cancel" type="button" class="text-button">取消</button><button id="global-settings-save" type="button" class="button primary">儲存設定</button></div>
