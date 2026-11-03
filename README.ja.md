@@ -105,12 +105,12 @@ AppleJuice は開発中です。Windows 全体、すべてのアプリケーシ�
 | DRAGON QUEST III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | Steam から起動し、ゲーム内の移動と戦闘 |
 | Geekbench 7 | x64 | CPU | シングルコア 16 項目とマルチコア 8 項目で有効な結果 |
 | It Takes Two | x64 | D3D11（Unreal Engine 4） | 2 人での操作プレイ |
-| Memelis' RPG | x86 | NW.js（RPG Maker MV） | マップ移動を含む範囲限定の操作、平均約 59.5 FPS。欠けている画像は代替素材で補完 |
+| Memelis' RPG | x86 | RPG Maker MV | マップ移動を含む範囲限定の操作、平均約 59.5 FPS。欠けている画像は代替素材で補完 |
 | Steam | x64 | Chromium（CEF） | ログインしてメイン画面を開き、ゲームを起動。メニューは正常に表示・操作でき、ストアページへの切り替えは約 3 秒 |
-| 艾莉露在异世界的冒险之不死之冠 | x86 | NW.js（RPG Maker MV） | セーブデータの読み込み、会話とマップ移動、平均約 56.5 FPS |
-| 不谙世事的猫艾露莎 | x86 | NW.js（RPG Maker MV） | マップ移動、平均約 57 FPS（旧版 1.01、1.02 を含む） |
-| 小涵的暑假 | x64 | NW.js（RPG Maker MV） | マップ移動、平均約 37 FPS |
-| 勇者的粉色育女日记 | x64 | NW.js（RPG Maker MZ） | 範囲限定の操作に成功、FPS は未計測 |
+| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | セーブデータの読み込み、会話とマップ移動、平均約 56.5 FPS |
+| 不谙世事的猫艾露莎 | x86 | RPG Maker MV | マップ移動、平均約 57 FPS（旧版 1.01、1.02 を含む） |
+| 小涵的暑假 | x64 | RPG Maker MV | マップ移動、平均約 37 FPS |
+| 勇者的粉色育女日记 | x64 | RPG Maker MZ | 範囲限定の操作に成功、FPS は未計測 |
 
 記録は当時のバージョンと設定によるもので、ゲーム全体の流れ、他のバージョン、すべての設定での動作を示すものではありません。
 

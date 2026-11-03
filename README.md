@@ -107,12 +107,12 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | DRAGON QUEST III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | 經 Steam 啟動，可在遊戲內移動與戰鬥 |
 | Geekbench 7 | x64 | CPU | 單核 16 項與多核 8 項皆取得有效結果 |
 | It Takes Two | x64 | D3D11（Unreal Engine 4） | 雙人操作遊玩 |
-| Memelis' RPG | x86 | NW.js（RPG Maker MV） | 含地圖移動的有限範圍操作，平均約 59.5 FPS；部分缺圖以替代素材補上 |
+| Memelis' RPG | x86 | RPG Maker MV | 含地圖移動的有限範圍操作，平均約 59.5 FPS；部分缺圖以替代素材補上 |
 | Steam | x64 | Chromium（CEF） | 登入並進入主視窗、啟動遊戲；選單正常顯示與操作，切換商店頁面約 3 秒 |
-| 艾莉露在异世界的冒险之不死之冠 | x86 | NW.js（RPG Maker MV） | 讀檔、對話與地圖移動，平均約 56.5 FPS |
-| 不谙世事的猫艾露莎 | x86 | NW.js（RPG Maker MV） | 地圖移動，平均約 57 FPS（含 1.01、1.02 舊版） |
-| 小涵的暑假 | x64 | NW.js（RPG Maker MV） | 地圖移動，平均約 37 FPS |
-| 勇者的粉色育女日记 | x64 | NW.js（RPG Maker MZ） | 有限範圍操作通過，FPS 未量測 |
+| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | 讀檔、對話與地圖移動，平均約 56.5 FPS |
+| 不谙世事的猫艾露莎 | x86 | RPG Maker MV | 地圖移動，平均約 57 FPS（含 1.01、1.02 舊版） |
+| 小涵的暑假 | x64 | RPG Maker MV | 地圖移動，平均約 37 FPS |
+| 勇者的粉色育女日记 | x64 | RPG Maker MZ | 有限範圍操作通過，FPS 未量測 |
 
 實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
 
