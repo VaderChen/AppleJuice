@@ -129,17 +129,17 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 不谙世事的猫艾露莎 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 永恒的黄昏 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 勇者鬥惡龍III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
+| FINAL FANTASY VIII | x86 | D3D9 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
 | FINAL FANTASY IX | x64 | D3D9（Unity） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
 | Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
 | 電馭叛客 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
+| 逆轉裁判123 成步堂精選集 | x86 | D3D11（Unity） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
+| 三國志X with 威力加強版 | x86 | 未知 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
 | 雙人成行 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
 | 潛水員戴夫 | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可啟動到主畫面" title="可啟動到主畫面"> |
-| 三國志X with 威力加強版 | x86 | 未知 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可啟動到主畫面" title="可啟動到主畫面"> |
 | 特警 Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可啟動到主畫面" title="可啟動到主畫面"> |
-| FINAL FANTASY VIII | x86 | OpenGL | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、但正在處理" title="無法運作、但正在處理"> |
-| 逆轉裁判123 成步堂精選集 | x86 | D3D11（Unity） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、但正在處理" title="無法運作、但正在處理"> |
 | 天穗之咲稻姬 | x64 | D3D11 | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、但正在處理" title="無法運作、但正在處理"> |
 
 實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
