@@ -106,10 +106,12 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 | Geekbench 7 | x64 | CPU | 싱글 코어 16개와 멀티코어 8개 항목 모두 유효한 결과 |
 | It Takes Two | x64 | D3D11(Unreal Engine 4) | 2인 조작 플레이 |
 | Memelis' RPG | x86 | RPG Maker MV | 맵 이동을 포함한 제한된 범위의 조작, 평균 약 59.5 FPS. 누락된 이미지는 대체 소재로 보완 |
+| Signal Force | x86 | RPG Maker MV | 타이틀 화면과 메뉴를 완전히 표시 |
 | Steam | x64 | Chromium(CEF) | 로그인 후 메인 창 진입 및 게임 실행. 메뉴가 정상적으로 표시·조작되며 상점 페이지 전환은 약 3초 |
 | 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | 세이브 불러오기, 대화와 맵 이동, 평균 약 56.5 FPS |
 | 不谙世事的猫艾露莎 | x86 | RPG Maker MV | 맵 이동, 평균 약 57 FPS(구버전 1.01, 1.02 포함) |
 | 小涵的暑假 | x64 | RPG Maker MV | 맵 이동, 평균 약 37 FPS |
+| 永恒的黄昏 | x86 | RPG Maker MV | 게임 내 맵 진입 및 배경 음악 재생, 싱글 코어 약 57 FPS |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | 제한된 범위의 조작 통과, FPS 미측정 |
 
 실측 기록은 당시 버전과 설정 기준이며, 전체 게임 진행, 다른 버전 또는 모든 설정에서의 동작을 의미하지 않습니다.

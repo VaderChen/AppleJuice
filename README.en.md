@@ -106,10 +106,12 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 | Geekbench 7 | x64 | CPU | Valid results for all 16 single-core and 8 multi-core workloads |
 | It Takes Two | x64 | D3D11 (Unreal Engine 4) | Two-player gameplay |
 | Memelis' RPG | x86 | RPG Maker MV | Bounded play session including map movement; about 59.5 FPS on average; some missing images replaced with substitutes |
+| Signal Force | x86 | RPG Maker MV | Shows the full title screen and menu |
 | Steam | x64 | Chromium (CEF) | Signs in, opens the main window and launches games; menus display and respond correctly, and switching to the Store page takes about 3 seconds |
 | 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | Loads a save, dialogue and map movement; about 56.5 FPS on average |
 | 不谙世事的猫艾露莎 | x86 | RPG Maker MV | Map movement; about 57 FPS on average (also versions 1.01 and 1.02) |
 | 小涵的暑假 | x64 | RPG Maker MV | Map movement; about 37 FPS on average |
+| 永恒的黄昏 | x86 | RPG Maker MV | Enters the in-game map with background music; about 57 FPS on a single core |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | Bounded play session passed; FPS not measured |
 
 Test records reflect the version and settings at the time and do not establish that complete gameplay, other versions or all settings work.
