@@ -94,22 +94,22 @@ x64 OpenCL 與 Vulkan 分別使用 macOS OpenCL.framework 與 Vulkan loader／Mo
 - **輸入**：DirectInput（含力回饋）、XInput 與 Raw Input 取用 macOS 實體輸入裝置的資料。
 - **影片**：Media Foundation 與 D3D11 DXVA 的 H.264 編解碼使用 VideoToolbox 硬體加速；HEVC 與 AV1 尚未完成。
 
-### 實測紀錄（2026-10～11）
-
-| 程式 | 主要 API | 已確認範圍 |
-| --- | --- | --- |
-| Steam 用戶端 | Chromium（CEF） | 登入並進入主視窗、啟動遊戲；介面仍有遲滯與選單顯示問題 |
-| DRAGON QUEST III HD-2D Remake | D3D11（Unreal Engine 4） | 經 Steam 啟動，可在遊戲內移動與戰鬥 |
-| It Takes Two | D3D11（Unreal Engine 4） | 雙人操作遊玩 |
-| DAVE THE DIVER | D3D11（Unity） | 進入主選單 |
-| Cyberpunk 2077 | D3D12 | 可執行內建 Benchmark |
-| Geekbench 7 | CPU | 單核 16 項與多核 8 項皆取得有效結果 |
-
-實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
-
 AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數組合並未全面支援。成功載入或顯示視窗不代表完整應用程式均可使用。磁碟映射不是完整 OS 沙箱；啟用的服務可能存取映射檔案或使用網路。請只執行信任的程式，並依需要設定存取權限。
 
 儲存庫包含 `src/`、`include/`、`launcher/`、`cmake/`、必要建置腳本、`third_party/`、`x64kernel/` 與使用文件。
+
+## 實測紀錄（2026-10～11）
+
+| 程式 | x64/x86 | 主要 API | 運作範圍 |
+| --- | --- | --- | --- |
+| Steam 用戶端 | x64 | Chromium（CEF） | 登入並進入主視窗、啟動遊戲；選單正常顯示與操作，切換商店頁面約 3 秒 |
+| DRAGON QUEST III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | 經 Steam 啟動，可在遊戲內移動與戰鬥 |
+| It Takes Two | x64 | D3D11（Unreal Engine 4） | 雙人操作遊玩 |
+| DAVE THE DIVER | x64 | D3D11（Unity） | 進入主選單 |
+| Cyberpunk 2077 | x64 | D3D12 | 可執行內建 Benchmark |
+| Geekbench 7 | x64 | CPU | 單核 16 項與多核 8 項皆取得有效結果 |
+
+實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
 
 ## 授權
 

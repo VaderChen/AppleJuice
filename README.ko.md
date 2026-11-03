@@ -92,22 +92,22 @@ x86_64(64비트) 외에도 x86 PE32 EXE와 해당 DLL을 로드할 수 있습니
 - **입력**: DirectInput(포스 피드백 포함), XInput, Raw Input은 macOS 실제 입력 장치의 데이터를 사용합니다.
 - **동영상**: Media Foundation과 D3D11 DXVA의 H.264 인코딩/디코딩은 VideoToolbox 하드웨어 가속을 사용합니다. HEVC와 AV1은 아직 완료되지 않았습니다.
 
-### 실측 기록(2026년 10~11월)
-
-| 프로그램 | 주요 API | 확인 범위 |
-| --- | --- | --- |
-| Steam 클라이언트 | Chromium(CEF) | 로그인 후 메인 창 진입 및 게임 실행. 화면 지연과 메뉴 표시 문제가 남아 있음 |
-| DRAGON QUEST III HD-2D Remake | D3D11(Unreal Engine 4) | Steam으로 실행, 게임 내 이동과 전투 |
-| It Takes Two | D3D11(Unreal Engine 4) | 2인 조작 플레이 |
-| DAVE THE DIVER | D3D11(Unity) | 메인 메뉴 진입 |
-| Cyberpunk 2077 | D3D12 | 내장 벤치마크 실행 |
-| Geekbench 7 | CPU | 싱글 코어 16개와 멀티코어 8개 항목 모두 유효한 결과 |
-
-실측 기록은 당시 버전과 설정 기준이며, 전체 게임 진행, 다른 버전 또는 모든 설정에서의 동작을 의미하지 않습니다.
-
 AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 API 매개변수 조합을 완전히 지원하지 않습니다. 프로그램 로딩이나 창 표시가 성공해도 전체 프로그램의 호환성이 보장되지는 않습니다. 드라이브 매핑은 완전한 OS 샌드박스가 아니며 활성화된 서비스는 매핑된 파일이나 네트워크에 접근할 수 있습니다. 신뢰할 수 있는 프로그램만 실행하고 필요한 접근 권한을 설정하세요.
 
 저장소에는 `src/`, `include/`, `launcher/`, `cmake/`, 필수 빌드 스크립트, `third_party/`, `x64kernel/` 및 사용 문서가 포함되어 있습니다.
+
+## 실측 기록(2026년 10~11월)
+
+| 프로그램 | x64/x86 | 주요 API | 동작 범위 |
+| --- | --- | --- | --- |
+| Steam 클라이언트 | x64 | Chromium(CEF) | 로그인 후 메인 창 진입 및 게임 실행. 메뉴가 정상적으로 표시·조작되며 상점 페이지 전환은 약 3초 |
+| DRAGON QUEST III HD-2D Remake | x64 | D3D11(Unreal Engine 4) | Steam으로 실행, 게임 내 이동과 전투 |
+| It Takes Two | x64 | D3D11(Unreal Engine 4) | 2인 조작 플레이 |
+| DAVE THE DIVER | x64 | D3D11(Unity) | 메인 메뉴 진입 |
+| Cyberpunk 2077 | x64 | D3D12 | 내장 벤치마크 실행 |
+| Geekbench 7 | x64 | CPU | 싱글 코어 16개와 멀티코어 8개 항목 모두 유효한 결과 |
+
+실측 기록은 당시 버전과 설정 기준이며, 전체 게임 진행, 다른 버전 또는 모든 설정에서의 동작을 의미하지 않습니다.
 
 ## 라이선스
 

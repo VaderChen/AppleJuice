@@ -92,22 +92,22 @@ See [Direct3D and x86 compatibility](docs/direct3d-and-x86.md) for details and u
 - **Input**: DirectInput (including force feedback), XInput and Raw Input use data from physical input devices on macOS.
 - **Video**: H.264 encoding and decoding through Media Foundation and D3D11 DXVA use VideoToolbox hardware acceleration; HEVC and AV1 are not yet complete.
 
-### Tested applications (October–November 2026)
-
-| Application | Main API | Confirmed scope |
-| --- | --- | --- |
-| Steam client | Chromium (CEF) | Signs in, opens the main window and launches games; the interface still has lag and menu display issues |
-| DRAGON QUEST III HD-2D Remake | D3D11 (Unreal Engine 4) | Launched through Steam; in-game movement and battles |
-| It Takes Two | D3D11 (Unreal Engine 4) | Two-player gameplay |
-| DAVE THE DIVER | D3D11 (Unity) | Reaches the main menu |
-| Cyberpunk 2077 | D3D12 | Runs the built-in benchmark |
-| Geekbench 7 | CPU | Valid results for all 16 single-core and 8 multi-core workloads |
-
-Test records reflect the version and settings at the time and do not establish that complete gameplay, other versions or all settings work.
-
 AppleJuice is under active development. Complete Windows support, all applications and all API parameter combinations are not fully supported. Loading a program or opening a window does not establish full application compatibility. Drive mappings are not a complete OS sandbox; enabled services may access mapped files or use the network. Run trusted programs and configure access permissions as needed.
 
 The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required build scripts, `third_party/`, `x64kernel/` and user documentation.
+
+## Tested applications (October–November 2026)
+
+| Application | x64/x86 | Main API | Working scope |
+| --- | --- | --- | --- |
+| Steam client | x64 | Chromium (CEF) | Signs in, opens the main window and launches games; menus display and respond correctly, and switching to the Store page takes about 3 seconds |
+| DRAGON QUEST III HD-2D Remake | x64 | D3D11 (Unreal Engine 4) | Launched through Steam; in-game movement and battles |
+| It Takes Two | x64 | D3D11 (Unreal Engine 4) | Two-player gameplay |
+| DAVE THE DIVER | x64 | D3D11 (Unity) | Reaches the main menu |
+| Cyberpunk 2077 | x64 | D3D12 | Runs the built-in benchmark |
+| Geekbench 7 | x64 | CPU | Valid results for all 16 single-core and 8 multi-core workloads |
+
+Test records reflect the version and settings at the time and do not establish that complete gameplay, other versions or all settings work.
 
 ## License
 
