@@ -122,6 +122,7 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 | Cyberpunk 2077 | x64 | D3D12 | Runs the built-in benchmark |
 | DAVE THE DIVER | x64 | D3D11 (Unity) | Reaches the main menu |
 | DRAGON QUEST III HD-2D Remake | x64 | D3D11 (Unreal Engine 4) | Launched through Steam; in-game movement and battles |
+| FINAL FANTASY IX | x64 | D3D9 (Unity) | Shows the main menu and enters the game; movement, dialogue and lighting the candle in the opening room |
 | Geekbench 7 | x64 | CPU | Valid results for all 16 single-core and 8 multi-core workloads |
 | It Takes Two | x64 | D3D11 (Unreal Engine 4) | Two-player gameplay |
 | Memelis' RPG | x86 | RPG Maker MV | Bounded play session including map movement; about 59.5 FPS on average; some missing images replaced with substitutes |

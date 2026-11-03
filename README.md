@@ -135,6 +135,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 永恒的黄昏 | x86 | RPG Maker MV | 進入遊戲地圖並播放背景音樂，單核約 57 FPS |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | 有限範圍操作通過，FPS 未量測 |
 | 勇者鬥惡龍III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | 經 Steam 啟動，可在遊戲內移動與戰鬥 |
+| 最終幻想IX | x64 | D3D9（Unity） | 顯示主選單並進入遊戲，可在開場房間移動、對話與點火 |
 
 實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
 
