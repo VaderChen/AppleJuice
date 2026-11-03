@@ -32,6 +32,24 @@ AppleJuice 執行 Windows x86_64 版本，Rosetta 執行 macOS x86_64 版本，�
 
 ![整體時間倍率：Game Physics、Video Encoder、Audio Encoder、Video Player](docs/images/geekbench7-single-core-2026-11-02/chart-4.png)
 
+## Geekbench 7 多核心整體時間
+
+2026-11-03 於同一台 Apple M4 Pro（macOS 27.0.1），以 Launcher 0.26.1103（build 1052，即 GitHub Release 版本）量測 Geekbench 7.0.0 Pro（build 703423）官方提供多核模式的 8 個測項，分別以 4 核與 2 核執行。三方使用相同的 worker 數、一次暖機及三次正式迭代，官方工作量逐項相同；同一核心數的原生 ARM64、Rosetta 與本專案在同一時段交錯量測。
+
+計算方式與單核圖相同：**各測項以自己的原生 ARM64 整體時間定為 1.0，倍率越低越快**，整體時間從程序啟動量到結束。4 核與 2 核共四張圖採相同 Y 軸尺度，每張呈現四個測項。
+
+本專案各項兩次取算術平均，原生 ARM64 與 Rosetta 各一次；正式量測前三方各先暖機一次，不計入結果。量測期間主機另有其他程式在執行；執行期間負載異常升高、受其他工作干擾的結果已排除並重新量測。圖表呈現實測狀態，不宣稱統計顯著。
+
+與單核相同，原生 ARM64 版本收集系統資訊較久，因此 File Compression、Text Processing、HDR 的 Rosetta 整體時間短於原生；各測項的正式運算時間仍以原生最快。
+
+![4 核整體時間倍率：File Compression、Photo Library、Clang、Text Processing](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-1.png)
+
+![4 核整體時間倍率：Asset Compression、HDR、Photo Editor、Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-2.png)
+
+![2 核整體時間倍率：File Compression、Photo Library、Clang、Text Processing](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-1.png)
+
+![2 核整體時間倍率：Asset Compression、HDR、Photo Editor、Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-2.png)
+
 ## 開始使用
 
 準備 Apple Silicon Mac、Xcode Command Line Tools、CMake 3.24+、Ninja、Python 3、Perl、make、Go 1.23+ 與 MinGW x64 GCC（`x86_64-w64-mingw32-gcc`）。前端資源已隨附，一般建置不需 Node.js；首次 Go 建置需要網路連線或 module 快取。

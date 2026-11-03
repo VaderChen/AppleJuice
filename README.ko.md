@@ -30,6 +30,24 @@ AppleJuice는 Windows x86_64 버전, Rosetta는 macOS x86_64 버전, 네이티�
 
 ![전체 경과 시간 배수: Game Physics, Video Encoder, Audio Encoder, Video Player](docs/images/geekbench7-single-core-2026-11-02/chart-4.png)
 
+## Geekbench 7 멀티코어 전체 경과 시간
+
+2026년 11월 3일 동일한 Apple M4 Pro(macOS 27.0.1)에서 Launcher 0.26.1103(build 1052, GitHub Release 버전)으로 Geekbench 7.0.0 Pro(build 703423)가 공식적으로 멀티코어 모드를 제공하는 8개 항목을 4코어와 2코어로 각각 측정했습니다. 세 환경은 동일한 워커 수, 워밍업 1회와 본 측정 3회를 사용했으며 공식 작업량은 항목별로 동일합니다. 같은 코어 수의 네이티브 ARM64, Rosetta, AppleJuice는 같은 시간대에 번갈아 측정했습니다.
+
+계산 방식은 싱글 코어 그래프와 같습니다. **각 항목의 네이티브 ARM64 전체 경과 시간을 1.0으로 정규화했으며, 배수가 낮을수록 빠릅니다.** 전체 경과 시간은 프로세스 시작부터 종료까지입니다. 4코어와 2코어의 네 그래프는 동일한 Y축 범위를 사용하며 각각 네 항목을 표시합니다.
+
+AppleJuice 값은 항목당 2회의 산술 평균이며, 네이티브 ARM64와 Rosetta는 각 1회입니다. 본 측정 전에 세 환경 모두 워밍업을 1회 실행했으며 결과에는 포함하지 않았습니다. 측정 중 호스트에서는 다른 프로그램도 실행 중이었으며, 실행 중 다른 작업으로 부하가 크게 오른 결과는 제외하고 다시 측정했습니다. 그래프는 실측 결과를 보여 줄 뿐 통계적 유의성을 주장하지 않습니다.
+
+싱글 코어와 마찬가지로 네이티브 ARM64 버전은 시스템 정보 수집에 시간이 더 걸리므로 File Compression, Text Processing, HDR에서는 Rosetta의 전체 경과 시간이 네이티브보다 짧습니다. 본 측정의 연산 시간은 모든 항목에서 네이티브가 가장 빠릅니다.
+
+![4코어 전체 경과 시간 배수: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-1.png)
+
+![4코어 전체 경과 시간 배수: Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-2.png)
+
+![2코어 전체 경과 시간 배수: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-1.png)
+
+![2코어 전체 경과 시간 배수: Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-2.png)
+
 ## 시작하기
 
 Apple Silicon Mac, Xcode Command Line Tools, CMake 3.24 이상, Ninja, Python 3, Perl, make, Go 1.23 이상 및 MinGW x64 GCC(`x86_64-w64-mingw32-gcc`)가 필요합니다. 프런트엔드 리소스가 포함되어 있어 일반 빌드에는 Node.js가 필요하지 않습니다. 첫 Go 빌드에는 네트워크 연결 또는 모듈 캐시가 필요합니다.
