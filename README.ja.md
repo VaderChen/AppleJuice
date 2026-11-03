@@ -32,21 +32,21 @@ AppleJuice は Windows x86_64 版、Rosetta は macOS x86_64 版、ネイティ�
 
 ## Geekbench 7 マルチコアの総経過時間
 
-2026 年 11 月 3 日、同じ Apple M4 Pro（macOS 27.0.1）で、Launcher 0.26.1103（build 1052、GitHub Release 版）を使い、Geekbench 7.0.0 Pro（build 703423）が公式にマルチコアモードを提供する 8 項目を 4 コアと 2 コアでそれぞれ測定しました。3 者は同じワーカー数、ウォームアップ 1 回と本測定 3 回を使い、公式の作業量は項目ごとに同一です。同じコア数のネイティブ ARM64、Rosetta、AppleJuice は同じ時間帯に交互に測定しました。
+2026 年 11 月 3 日、同じ Apple M4 Pro（macOS 27.0.1）で、Launcher 0.26.1103（build 1052、GitHub Release 版）を使い、Geekbench 7.0.0 Pro（build 703423）が公式にマルチコアモードを提供する 8 項目を 2 コアと 4 コアでそれぞれ測定しました。3 者は同じワーカー数、ウォームアップ 1 回と本測定 3 回を使い、公式の作業量は項目ごとに同一です。同じコア数のネイティブ ARM64、Rosetta、AppleJuice は同じ時間帯に交互に測定しました。
 
-算出方法はシングルコアのグラフと同じです。**各項目のネイティブ ARM64 の総経過時間を 1.0 としています。倍率が低いほど高速です。** 総経過時間はプロセスの起動から終了までです。4 コアと 2 コアの計 4 枚のグラフは同じ Y 軸スケールを使い、それぞれ 4 項目を示します。
+算出方法はシングルコアのグラフと同じです。**各項目のネイティブ ARM64 の総経過時間を 1.0 としています。倍率が低いほど高速です。** 総経過時間はプロセスの起動から終了までです。2 コアと 4 コアの計 4 枚のグラフは同じ Y 軸スケールを使い、それぞれ 4 項目を示します。
 
 AppleJuice は各項目 2 回の算術平均、ネイティブ ARM64 と Rosetta は各 1 回です。本測定の前に 3 者とも 1 回ウォームアップし、結果には含めていません。測定中はホストで他のプログラムも動作していました。実行中に他の作業の影響で負荷が大きく上昇した結果は除外し、測定し直しています。グラフは実測結果を示すもので、統計的な有意性は主張しません。
 
 シングルコアと同様に、ネイティブ ARM64 版はシステム情報の収集に時間がかかるため、File Compression、Text Processing、HDR では Rosetta の総経過時間がネイティブより短くなっています。本測定の演算時間はすべての項目でネイティブが最速です。
 
-![4 コアの総経過時間の倍率: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-1.png)
-
-![4 コアの総経過時間の倍率: Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-2.png)
-
 ![2 コアの総経過時間の倍率: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-1.png)
 
 ![2 コアの総経過時間の倍率: Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-2.png)
+
+![4 コアの総経過時間の倍率: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-1.png)
+
+![4 コアの総経過時間の倍率: Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-2.png)
 
 ## はじめに
 

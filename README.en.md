@@ -32,21 +32,21 @@ Before starting the tests, the native ARM64 version spends about 4.6 seconds col
 
 ## Geekbench 7 multi-core total elapsed time
 
-On November 3, 2026, on the same Apple M4 Pro (macOS 27.0.1), the 8 workloads that Geekbench 7.0.0 Pro (build 703423) officially offers in multi-core mode were measured with Launcher 0.26.1103 (build 1052, the GitHub Release build), once with 4 cores and once with 2 cores. All three use the same worker count, one warm-up and three measured iterations, and the official workload is identical for every workload. For each core count, native ARM64, Rosetta and AppleJuice were measured interleaved in the same session.
+On November 3, 2026, on the same Apple M4 Pro (macOS 27.0.1), the 8 workloads that Geekbench 7.0.0 Pro (build 703423) officially offers in multi-core mode were measured with Launcher 0.26.1103 (build 1052, the GitHub Release build), once with 2 cores and once with 4 cores. All three use the same worker count, one warm-up and three measured iterations, and the official workload is identical for every workload. For each core count, native ARM64, Rosetta and AppleJuice were measured interleaved in the same session.
 
-The method matches the single-core charts: **each workload's native ARM64 total elapsed time is normalized to 1.0; lower ratios are faster.** Total elapsed time runs from process start to exit. The four charts for 4 and 2 cores share the same Y-axis scale, with four workloads per chart.
+The method matches the single-core charts: **each workload's native ARM64 total elapsed time is normalized to 1.0; lower ratios are faster.** Total elapsed time runs from process start to exit. The four charts for 2 and 4 cores share the same Y-axis scale, with four workloads per chart.
 
 AppleJuice values are the arithmetic mean of two runs per workload; native ARM64 and Rosetta used one run each. Each of the three ran one warm-up before measurement, which is not counted. Other programs were running on the host during measurement; results where host load rose sharply during a run because of other work were excluded and measured again. The charts show measured results without claiming statistical significance.
 
 As in the single-core results, the native ARM64 version spends longer collecting system information, so Rosetta's total elapsed time is shorter than native for File Compression, Text Processing and HDR, while the measured compute time is fastest natively for every workload.
 
-![4-core total elapsed time ratio: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-1.png)
-
-![4-core total elapsed time ratio: Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-2.png)
-
 ![2-core total elapsed time ratio: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-1.png)
 
 ![2-core total elapsed time ratio: Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-2.png)
+
+![4-core total elapsed time ratio: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-1.png)
+
+![4-core total elapsed time ratio: Asset Compression, HDR, Photo Editor, Ray Tracer](docs/images/geekbench7-multi-core-2026-11-03/4-core/chart-2.png)
 
 ## Getting started
 
