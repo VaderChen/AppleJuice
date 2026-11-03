@@ -100,12 +100,12 @@ AppleJuice は開発中です。Windows 全体、すべてのアプリケーシ�
 
 | アプリケーション | x64/x86 | 主な API | 動作範囲 |
 | --- | --- | --- | --- |
-| Steam クライアント | x64 | Chromium（CEF） | ログインしてメイン画面を開き、ゲームを起動。メニューは正常に表示・操作でき、ストアページへの切り替えは約 3 秒 |
-| DRAGON QUEST III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | Steam から起動し、ゲーム内の移動と戦闘 |
-| It Takes Two | x64 | D3D11（Unreal Engine 4） | 2 人での操作プレイ |
-| DAVE THE DIVER | x64 | D3D11（Unity） | メインメニューまで |
 | Cyberpunk 2077 | x64 | D3D12 | 内蔵ベンチマークを実行 |
+| DAVE THE DIVER | x64 | D3D11（Unity） | メインメニューまで |
+| DRAGON QUEST III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | Steam から起動し、ゲーム内の移動と戦闘 |
 | Geekbench 7 | x64 | CPU | シングルコア 16 項目とマルチコア 8 項目で有効な結果 |
+| It Takes Two | x64 | D3D11（Unreal Engine 4） | 2 人での操作プレイ |
+| Steam | x64 | Chromium（CEF） | ログインしてメイン画面を開き、ゲームを起動。メニューは正常に表示・操作でき、ストアページへの切り替えは約 3 秒 |
 
 記録は当時のバージョンと設定によるもので、ゲーム全体の流れ、他のバージョン、すべての設定での動作を示すものではありません。
 

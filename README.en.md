@@ -100,12 +100,12 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 
 | Application | x64/x86 | Main API | Working scope |
 | --- | --- | --- | --- |
-| Steam client | x64 | Chromium (CEF) | Signs in, opens the main window and launches games; menus display and respond correctly, and switching to the Store page takes about 3 seconds |
-| DRAGON QUEST III HD-2D Remake | x64 | D3D11 (Unreal Engine 4) | Launched through Steam; in-game movement and battles |
-| It Takes Two | x64 | D3D11 (Unreal Engine 4) | Two-player gameplay |
-| DAVE THE DIVER | x64 | D3D11 (Unity) | Reaches the main menu |
 | Cyberpunk 2077 | x64 | D3D12 | Runs the built-in benchmark |
+| DAVE THE DIVER | x64 | D3D11 (Unity) | Reaches the main menu |
+| DRAGON QUEST III HD-2D Remake | x64 | D3D11 (Unreal Engine 4) | Launched through Steam; in-game movement and battles |
 | Geekbench 7 | x64 | CPU | Valid results for all 16 single-core and 8 multi-core workloads |
+| It Takes Two | x64 | D3D11 (Unreal Engine 4) | Two-player gameplay |
+| Steam | x64 | Chromium (CEF) | Signs in, opens the main window and launches games; menus display and respond correctly, and switching to the Store page takes about 3 seconds |
 
 Test records reflect the version and settings at the time and do not establish that complete gameplay, other versions or all settings work.
 

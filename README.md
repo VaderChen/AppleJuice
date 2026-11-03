@@ -102,12 +102,12 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 
 | 程式 | x64/x86 | 主要 API | 運作範圍 |
 | --- | --- | --- | --- |
-| Steam 用戶端 | x64 | Chromium（CEF） | 登入並進入主視窗、啟動遊戲；選單正常顯示與操作，切換商店頁面約 3 秒 |
-| DRAGON QUEST III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | 經 Steam 啟動，可在遊戲內移動與戰鬥 |
-| It Takes Two | x64 | D3D11（Unreal Engine 4） | 雙人操作遊玩 |
-| DAVE THE DIVER | x64 | D3D11（Unity） | 進入主選單 |
 | Cyberpunk 2077 | x64 | D3D12 | 可執行內建 Benchmark |
+| DAVE THE DIVER | x64 | D3D11（Unity） | 進入主選單 |
+| DRAGON QUEST III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | 經 Steam 啟動，可在遊戲內移動與戰鬥 |
 | Geekbench 7 | x64 | CPU | 單核 16 項與多核 8 項皆取得有效結果 |
+| It Takes Two | x64 | D3D11（Unreal Engine 4） | 雙人操作遊玩 |
+| Steam | x64 | Chromium（CEF） | 登入並進入主視窗、啟動遊戲；選單正常顯示與操作，切換商店頁面約 3 秒 |
 
 實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
 
