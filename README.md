@@ -118,24 +118,26 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 
 ## 實測紀錄（2026-10～11）
 
-| 程式 | x64/x86 | 主要運作核心 | 運作範圍 |
-| --- | --- | --- | --- |
-| 7-Zip | x64 | Win32 GUI | 以圖形介面壓縮、解壓縮與測試，解壓內容與原檔一致；語言設定可保存 |
-| FINAL FANTASY IX | x64 | D3D9（Unity） | 顯示主選單並進入遊戲，可在開場房間移動、對話與點火 |
-| Geekbench 7 | x64 | CPU | 單核 16 項與多核 8 項皆取得有效結果 |
-| Memelis' RPG | x86 | RPG Maker MV | 含地圖移動的有限範圍操作，平均約 59.5 FPS；部分缺圖以替代素材補上 |
-| Steam | x64 | Chromium（CEF） | 登入並進入主視窗、啟動遊戲；選單正常顯示與操作，切換商店頁面約 3 秒 |
-| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | 讀檔、對話與地圖移動，平均約 56.5 FPS |
-| 不谙世事的猫艾露莎 | x86 | RPG Maker MV | 地圖移動，平均約 57 FPS（含 1.01、1.02 舊版） |
-| 電馭叛客 2077 | x64 | D3D12 | 可執行內建 Benchmark |
-| 潛水員戴夫 | x64 | D3D11（Unity） | 進入主選單 |
-| 三國志X with 威力加強版 | x86 | 未知 | 顯示主選單，環境設定可開啟並返回 |
-| 雙人成行 | x64 | D3D11（Unreal Engine 4） | 雙人操作遊玩 |
-| 特警 Signal Force | x86 | RPG Maker MV | 顯示完整標題與選單 |
-| 小涵的暑假 | x64 | RPG Maker MV | 地圖移動，平均約 37 FPS |
-| 永恒的黄昏 | x86 | RPG Maker MV | 進入遊戲地圖並播放背景音樂，單核約 57 FPS |
-| 勇者的粉色育女日记 | x64 | RPG Maker MZ | 有限範圍操作通過，FPS 未量測 |
-| 勇者鬥惡龍III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | 經 Steam 啟動，可在遊戲內移動與戰鬥 |
+| 程式 | x64/x86 | 主要運作核心 | 支援程度 |
+| --- | --- | --- | :---: |
+| 7-Zip | x64 | Win32 GUI | ✅ |
+| FINAL FANTASY IX | x64 | D3D9（Unity） | ⭕ |
+| Geekbench 7 | x64 | CPU | ✅ |
+| Memelis' RPG | x86 | RPG Maker MV | ✅ |
+| Steam | x64 | Chromium（CEF） | ⭕ |
+| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | ✅ |
+| 不谙世事的猫艾露莎 | x86 | RPG Maker MV | ✅ |
+| 電馭叛客 2077 | x64 | D3D12 | ⭕ |
+| 潛水員戴夫 | x64 | D3D11（Unity） | ⚠️ |
+| 三國志X with 威力加強版 | x86 | 未知 | ⚠️ |
+| 雙人成行 | x64 | D3D11（Unreal Engine 4） | ⭕ |
+| 特警 Signal Force | x86 | RPG Maker MV | ⚠️ |
+| 小涵的暑假 | x64 | RPG Maker MV | ⭕ |
+| 永恒的黄昏 | x86 | RPG Maker MV | ✅ |
+| 勇者的粉色育女日记 | x64 | RPG Maker MZ | ⭕ |
+| 勇者鬥惡龍III HD-2D Remake | x64 | D3D11（Unreal Engine 4） | ✅ |
+
+❌ 完全無法運作　⚠️ 可啟動到主畫面　⭕ 可運作、效率不高　✅ 運作良好
 
 實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
 

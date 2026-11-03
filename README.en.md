@@ -116,24 +116,26 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 
 ## Tested applications (October–November 2026)
 
-| Application | x64/x86 | Core technology | Working scope |
-| --- | --- | --- | --- |
-| 7-Zip | x64 | Win32 GUI | Compresses, extracts and tests archives in the GUI; extracted files match the originals; language setting persists |
-| Cyberpunk 2077 | x64 | D3D12 | Runs the built-in benchmark |
-| DAVE THE DIVER | x64 | D3D11 (Unity) | Reaches the main menu |
-| DRAGON QUEST III HD-2D Remake | x64 | D3D11 (Unreal Engine 4) | Launched through Steam; in-game movement and battles |
-| FINAL FANTASY IX | x64 | D3D9 (Unity) | Shows the main menu and enters the game; movement, dialogue and lighting the candle in the opening room |
-| Geekbench 7 | x64 | CPU | Valid results for all 16 single-core and 8 multi-core workloads |
-| It Takes Two | x64 | D3D11 (Unreal Engine 4) | Two-player gameplay |
-| Memelis' RPG | x86 | RPG Maker MV | Bounded play session including map movement; about 59.5 FPS on average; some missing images replaced with substitutes |
-| Romance of the Three Kingdoms X with Power Up Kit | x86 | Unknown | Shows the main menu; the settings screen opens and returns |
-| Signal Force | x86 | RPG Maker MV | Shows the full title screen and menu |
-| Steam | x64 | Chromium (CEF) | Signs in, opens the main window and launches games; menus display and respond correctly, and switching to the Store page takes about 3 seconds |
-| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | Loads a save, dialogue and map movement; about 56.5 FPS on average |
-| 不谙世事的猫艾露莎 | x86 | RPG Maker MV | Map movement; about 57 FPS on average (also versions 1.01 and 1.02) |
-| 小涵的暑假 | x64 | RPG Maker MV | Map movement; about 37 FPS on average |
-| 永恒的黄昏 | x86 | RPG Maker MV | Enters the in-game map with background music; about 57 FPS on a single core |
-| 勇者的粉色育女日记 | x64 | RPG Maker MZ | Bounded play session passed; FPS not measured |
+| Application | x64/x86 | Core technology | Support level |
+| --- | --- | --- | :---: |
+| 7-Zip | x64 | Win32 GUI | ✅ |
+| Cyberpunk 2077 | x64 | D3D12 | ⭕ |
+| DAVE THE DIVER | x64 | D3D11 (Unity) | ⚠️ |
+| DRAGON QUEST III HD-2D Remake | x64 | D3D11 (Unreal Engine 4) | ✅ |
+| FINAL FANTASY IX | x64 | D3D9 (Unity) | ⭕ |
+| Geekbench 7 | x64 | CPU | ✅ |
+| It Takes Two | x64 | D3D11 (Unreal Engine 4) | ⭕ |
+| Memelis' RPG | x86 | RPG Maker MV | ✅ |
+| Romance of the Three Kingdoms X with Power Up Kit | x86 | Unknown | ⚠️ |
+| Signal Force | x86 | RPG Maker MV | ⚠️ |
+| Steam | x64 | Chromium (CEF) | ⭕ |
+| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | ✅ |
+| 不谙世事的猫艾露莎 | x86 | RPG Maker MV | ✅ |
+| 小涵的暑假 | x64 | RPG Maker MV | ⭕ |
+| 永恒的黄昏 | x86 | RPG Maker MV | ✅ |
+| 勇者的粉色育女日记 | x64 | RPG Maker MZ | ⭕ |
+
+❌ Does not work · ⚠️ Launches to the main screen · ⭕ Works, with limited performance · ✅ Works well
 
 Test records reflect the version and settings at the time and do not establish that complete gameplay, other versions or all settings work.
 

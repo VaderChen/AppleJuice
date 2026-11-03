@@ -116,24 +116,26 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 
 ## 실측 기록(2026년 10~11월)
 
-| 프로그램 | x64/x86 | 주요 동작 코어 | 동작 범위 |
-| --- | --- | --- | --- |
-| 7-Zip | x64 | Win32 GUI | GUI에서 압축·해제·테스트, 해제 결과가 원본과 일치. 언어 설정 유지 |
-| Geekbench 7 | x64 | CPU | 싱글 코어 16개와 멀티코어 8개 항목 모두 유효한 결과 |
-| It Takes Two | x64 | D3D11(Unreal Engine 4) | 2인 조작 플레이 |
-| Memelis' RPG | x86 | RPG Maker MV | 맵 이동을 포함한 제한된 범위의 조작, 평균 약 59.5 FPS. 누락된 이미지는 대체 소재로 보완 |
-| Romance of the Three Kingdoms X with Power Up Kit | x86 | 알 수 없음 | 메인 메뉴 표시, 환경 설정을 열고 돌아올 수 있음 |
-| Signal Force | x86 | RPG Maker MV | 타이틀 화면과 메뉴를 완전히 표시 |
-| Steam | x64 | Chromium(CEF) | 로그인 후 메인 창 진입 및 게임 실행. 메뉴가 정상적으로 표시·조작되며 상점 페이지 전환은 약 3초 |
-| 데이브 더 다이버 | x64 | D3D11(Unity) | 메인 메뉴 진입 |
-| 드래곤 퀘스트 III HD-2D Remake | x64 | D3D11(Unreal Engine 4) | Steam으로 실행, 게임 내 이동과 전투 |
-| 사이버펑크 2077 | x64 | D3D12 | 내장 벤치마크 실행 |
-| 파이널 판타지 IX | x64 | D3D9(Unity) | 메인 메뉴 표시 후 게임 진입, 첫 방에서 이동·대화·촛대 점화 |
-| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | 세이브 불러오기, 대화와 맵 이동, 평균 약 56.5 FPS |
-| 不谙世事的猫艾露莎 | x86 | RPG Maker MV | 맵 이동, 평균 약 57 FPS(구버전 1.01, 1.02 포함) |
-| 小涵的暑假 | x64 | RPG Maker MV | 맵 이동, 평균 약 37 FPS |
-| 永恒的黄昏 | x86 | RPG Maker MV | 게임 내 맵 진입 및 배경 음악 재생, 싱글 코어 약 57 FPS |
-| 勇者的粉色育女日记 | x64 | RPG Maker MZ | 제한된 범위의 조작 통과, FPS 미측정 |
+| 프로그램 | x64/x86 | 주요 동작 코어 | 지원 수준 |
+| --- | --- | --- | :---: |
+| 7-Zip | x64 | Win32 GUI | ✅ |
+| Geekbench 7 | x64 | CPU | ✅ |
+| It Takes Two | x64 | D3D11(Unreal Engine 4) | ⭕ |
+| Memelis' RPG | x86 | RPG Maker MV | ✅ |
+| Romance of the Three Kingdoms X with Power Up Kit | x86 | 알 수 없음 | ⚠️ |
+| Signal Force | x86 | RPG Maker MV | ⚠️ |
+| Steam | x64 | Chromium(CEF) | ⭕ |
+| 데이브 더 다이버 | x64 | D3D11(Unity) | ⚠️ |
+| 드래곤 퀘스트 III HD-2D Remake | x64 | D3D11(Unreal Engine 4) | ✅ |
+| 사이버펑크 2077 | x64 | D3D12 | ⭕ |
+| 파이널 판타지 IX | x64 | D3D9(Unity) | ⭕ |
+| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | ✅ |
+| 不谙世事的猫艾露莎 | x86 | RPG Maker MV | ✅ |
+| 小涵的暑假 | x64 | RPG Maker MV | ⭕ |
+| 永恒的黄昏 | x86 | RPG Maker MV | ✅ |
+| 勇者的粉色育女日记 | x64 | RPG Maker MZ | ⭕ |
+
+❌ 전혀 동작하지 않음 · ⚠️ 메인 화면까지 실행 · ⭕ 동작하지만 효율이 낮음 · ✅ 원활히 동작
 
 실측 기록은 당시 버전과 설정 기준이며, 전체 게임 진행, 다른 버전 또는 모든 설정에서의 동작을 의미하지 않습니다.
 
