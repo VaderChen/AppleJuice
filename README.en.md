@@ -100,6 +100,7 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 
 | Application | x64/x86 | Core technology | Working scope |
 | --- | --- | --- | --- |
+| 7-Zip | x64 | Win32 GUI | Compresses, extracts and tests archives in the GUI; extracted files match the originals; language setting persists |
 | Cyberpunk 2077 | x64 | D3D12 | Runs the built-in benchmark |
 | DAVE THE DIVER | x64 | D3D11 (Unity) | Reaches the main menu |
 | DRAGON QUEST III HD-2D Remake | x64 | D3D11 (Unreal Engine 4) | Launched through Steam; in-game movement and battles |

@@ -100,6 +100,7 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 
 | 프로그램 | x64/x86 | 주요 동작 코어 | 동작 범위 |
 | --- | --- | --- | --- |
+| 7-Zip | x64 | Win32 GUI | GUI에서 압축·해제·테스트, 해제 결과가 원본과 일치. 언어 설정 유지 |
 | Geekbench 7 | x64 | CPU | 싱글 코어 16개와 멀티코어 8개 항목 모두 유효한 결과 |
 | It Takes Two | x64 | D3D11(Unreal Engine 4) | 2인 조작 플레이 |
 | Memelis' RPG | x86 | RPG Maker MV | 맵 이동을 포함한 제한된 범위의 조작, 평균 약 59.5 FPS. 누락된 이미지는 대체 소재로 보완 |
