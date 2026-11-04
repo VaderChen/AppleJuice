@@ -137,12 +137,12 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 | It Takes Two | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | Phoenix Wright: Ace Attorney Trilogy | x86 | D3D11 (Unity) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | Romance of the Three Kingdoms X with Power Up Kit | x86 | Unknown | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
+| Sakuna: Of Rice and Ruin | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | Steam | x64 | Chromium (CEF) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | DAVE THE DIVER | x64 | D3D11 (Unity) | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="Launches to the main screen" title="Launches to the main screen"> |
 | Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="Launches to the main screen" title="Launches to the main screen"> |
-| Sakuna: Of Rice and Ruin | x64 | D3D11 | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="Does not work yet; being worked on" title="Does not work yet; being worked on"> |
 
 Test records reflect the version and settings at the time and do not establish that complete gameplay, other versions or all settings work.
 
