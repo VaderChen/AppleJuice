@@ -22,6 +22,8 @@ AppleJuice runs the Windows x86_64 version, Rosetta runs the macOS x86_64 versio
 
 Before starting the tests, the native ARM64 version spends about 4.6 seconds collecting system information, versus about 1.6 seconds for Rosetta. As a result, Rosetta's total elapsed time is shorter than native for some workloads, while the measured compute time is fastest natively for every workload.
 
+**Clang progress update:** AppleJuice's total elapsed time dropped from **17.96 s to 12.83 s, 28.56% shorter**, and its ratio to native went from **1.55× to 1.11×**. This figure is the mean of four valid measured runs of the build adopted so far; only the AppleJuice Clang bar was updated, and the native/Rosetta baselines and other workloads keep their original data.
+
 ![Total elapsed time ratio: File Compression, Navigation, HTML5 Browser, PDF Viewer](docs/images/geekbench7-single-core-2026-11-02/chart-1.png)
 
 ![Total elapsed time ratio: Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-single-core-2026-11-02/chart-2.png)
@@ -39,6 +41,8 @@ The method matches the single-core charts: **each workload's native ARM64 total 
 AppleJuice values are the arithmetic mean of two runs per workload; native ARM64 and Rosetta used one run each. Each of the three ran one warm-up before measurement, which is not counted. Other programs were running on the host during measurement; results where host load rose sharply during a run because of other work were excluded and measured again. The charts show measured results without claiming statistical significance.
 
 As in the single-core results, the native ARM64 version spends longer collecting system information, so Rosetta's total elapsed time is shorter than native for File Compression, Text Processing and HDR, while the measured compute time is fastest natively for every workload.
+
+**Clang progress update:** Re-measured with the same adopted build as the single-core progress chart, the 2-core total elapsed time dropped from **90.54 s to 79.34 s, 12.37% shorter**, and the 4-core time from **55.33 s to 50.15 s, 9.37% shorter**. The ratios to native went from **2.19× to 1.92×** and from **2.12× to 1.92×** respectively. For each core count, one warm-up process ran first, followed by the mean of two valid measured processes; each process ran one warm-up and three measured iterations with 8 GiB of guest memory. Only the AppleJuice Clang bars were updated; the other workloads and the native/Rosetta baselines keep their original data. The old and new measurements were taken at different times and the new runs included background guest load; no builds or separate probes were detected interfering, and no claim of statistical significance is made.
 
 ![2-core total elapsed time ratio: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-1.png)
 

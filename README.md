@@ -24,6 +24,8 @@ AppleJuice 執行 Windows x86_64 版本，Rosetta 執行 macOS x86_64 版本，�
 
 原生 ARM64 版本在開始測試前收集系統資訊約需 4.6 秒，Rosetta 約需 1.6 秒，因此部分測項的 Rosetta 整體時間短於原生；各測項的正式運算時間仍以原生最快。
 
+**Clang 進度更新：** AppleJuice 整體時間由 **17.96 秒降至 12.83 秒，縮短 28.56%**，原生正規化倍率由 **1.55× 降至 1.11×**。此項採截至目前已採用成品的四次有效正式程序平均；僅更新 Clang 的 AppleJuice 圖柱，原生／Rosetta 基準與其他測項維持原資料。
+
 ![整體時間倍率：File Compression、Navigation、HTML5 Browser、PDF Viewer](docs/images/geekbench7-single-core-2026-11-02/chart-1.png)
 
 ![整體時間倍率：Photo Library、Clang、Text Processing、Asset Compression](docs/images/geekbench7-single-core-2026-11-02/chart-2.png)
@@ -41,6 +43,8 @@ AppleJuice 執行 Windows x86_64 版本，Rosetta 執行 macOS x86_64 版本，�
 本專案各項兩次取算術平均，原生 ARM64 與 Rosetta 各一次；正式量測前三方各先暖機一次，不計入結果。量測期間主機另有其他程式在執行；執行期間負載異常升高、受其他工作干擾的結果已排除並重新量測。圖表呈現實測狀態，不宣稱統計顯著。
 
 與單核相同，原生 ARM64 版本收集系統資訊較久，因此 File Compression、Text Processing、HDR 的 Rosetta 整體時間短於原生；各測項的正式運算時間仍以原生最快。
+
+**Clang 進度更新：** 以單核進度圖相同的已採用成品補測，2 核整體時間由 **90.54 秒降至 79.34 秒，縮短 12.37%**；4 核由 **55.33 秒降至 50.15 秒，縮短 9.37%**。原生正規化倍率分別由 **2.19× 降至 1.92×**、**2.12× 降至 1.92×**。每個核心數先暖機一個程序，再取兩次有效正式程序平均；每個程序一次暖機及三次正式迭代，客體記憶體為 8 GiB。僅更新 Clang 的 AppleJuice 圖柱，其他測項與原生／Rosetta 基準沿用原資料；新舊量測時段不同，新量測含背景客體負載，未偵測編譯或獨立探針干擾，不宣稱統計顯著。
 
 ![2 核整體時間倍率：File Compression、Photo Library、Clang、Text Processing](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-1.png)
 

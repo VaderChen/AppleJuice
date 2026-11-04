@@ -22,6 +22,8 @@ AppleJuice는 Windows x86_64 버전, Rosetta는 macOS x86_64 버전, 네이티�
 
 네이티브 ARM64 버전은 테스트 시작 전 시스템 정보를 수집하는 데 약 4.6초, Rosetta는 약 1.6초가 걸립니다. 따라서 일부 항목에서는 Rosetta의 전체 경과 시간이 네이티브보다 짧지만, 본 측정의 연산 시간은 모든 항목에서 네이티브가 가장 빠릅니다.
 
+**Clang 진행 상황:** AppleJuice의 전체 경과 시간은 **17.96초에서 12.83초로 28.56% 단축**되었고, 네이티브 대비 배수는 **1.55×에서 1.11×**로 낮아졌습니다. 이 값은 현재까지 채택된 빌드로 수행한 유효 본 측정 프로세스 4회의 평균입니다. Clang의 AppleJuice 막대만 갱신했으며 네이티브/Rosetta 기준값과 다른 항목은 기존 데이터를 그대로 사용합니다.
+
 ![전체 경과 시간 배수: File Compression, Navigation, HTML5 Browser, PDF Viewer](docs/images/geekbench7-single-core-2026-11-02/chart-1.png)
 
 ![전체 경과 시간 배수: Photo Library, Clang, Text Processing, Asset Compression](docs/images/geekbench7-single-core-2026-11-02/chart-2.png)
@@ -39,6 +41,8 @@ AppleJuice는 Windows x86_64 버전, Rosetta는 macOS x86_64 버전, 네이티�
 AppleJuice 값은 항목당 2회의 산술 평균이며, 네이티브 ARM64와 Rosetta는 각 1회입니다. 본 측정 전에 세 환경 모두 워밍업을 1회 실행했으며 결과에는 포함하지 않았습니다. 측정 중 호스트에서는 다른 프로그램도 실행 중이었으며, 실행 중 다른 작업으로 부하가 크게 오른 결과는 제외하고 다시 측정했습니다. 그래프는 실측 결과를 보여 줄 뿐 통계적 유의성을 주장하지 않습니다.
 
 싱글 코어와 마찬가지로 네이티브 ARM64 버전은 시스템 정보 수집에 시간이 더 걸리므로 File Compression, Text Processing, HDR에서는 Rosetta의 전체 경과 시간이 네이티브보다 짧습니다. 본 측정의 연산 시간은 모든 항목에서 네이티브가 가장 빠릅니다.
+
+**Clang 진행 상황:** 싱글 코어 진행 차트와 같은 채택 빌드로 다시 측정한 결과 2코어 전체 경과 시간은 **90.54초에서 79.34초로 12.37% 단축**되었고, 4코어는 **55.33초에서 50.15초로 9.37% 단축**되었습니다. 네이티브 대비 배수는 각각 **2.19×에서 1.92×**, **2.12×에서 1.92×**로 낮아졌습니다. 코어 수마다 먼저 워밍업 프로세스를 1회 실행한 뒤 유효 본 측정 프로세스 2회의 평균을 사용했습니다. 각 프로세스는 워밍업 1회와 본 측정 3회를 수행했으며 게스트 메모리는 8 GiB입니다. Clang의 AppleJuice 막대만 갱신했으며 다른 항목과 네이티브/Rosetta 기준값은 기존 데이터를 그대로 사용합니다. 기존 측정과 새 측정은 시간대가 다르며 새 측정에는 백그라운드 게스트 부하가 있었습니다. 빌드나 별도 프로브의 간섭은 감지되지 않았지만 통계적 유의성을 주장하지는 않습니다.
 
 ![2코어 전체 경과 시간 배수: File Compression, Photo Library, Clang, Text Processing](docs/images/geekbench7-multi-core-2026-11-03/2-core/chart-1.png)
 
