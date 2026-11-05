@@ -134,11 +134,11 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 | 파이널 판타지 VIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활히 동작" title="원활히 동작"> |
 | 파이널 판타지 IX | x64 | D3D9(Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활히 동작" title="원활히 동작"> |
 | 역전재판 123 나루호도 셀렉션 | x86 | D3D11(Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활히 동작" title="원활히 동작"> |
+| 천수의 사쿠나히메 | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활히 동작" title="원활히 동작"> |
 | It Takes Two | x64 | D3D11(Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | Romance of the Three Kingdoms X with Power Up Kit | x86 | 알 수 없음 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | Steam | x64 | Chromium(CEF) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | 사이버펑크 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
-| 천수의 사쿠나히메 | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="메인 화면까지 실행" title="메인 화면까지 실행"> |

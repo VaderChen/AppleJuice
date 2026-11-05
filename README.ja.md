@@ -134,11 +134,11 @@ AppleJuice は開発中です。Windows 全体、すべてのアプリケーシ�
 | ファイナルファンタジーVIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
 | ファイナルファンタジーIX | x64 | D3D9（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
 | 逆転裁判123 成歩堂セレクション | x86 | D3D11（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
+| 天穂のサクナヒメ | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
 | It Takes Two | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | サイバーパンク2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | 三國志X with パワーアップキット | x86 | 不明 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
-| 天穂のサクナヒメ | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | デイヴ・ザ・ダイバー | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="メイン画面まで起動" title="メイン画面まで起動"> |

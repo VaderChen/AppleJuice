@@ -134,10 +134,10 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 | FINAL FANTASY VIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | FINAL FANTASY IX | x64 | D3D9 (Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Phoenix Wright: Ace Attorney Trilogy | x86 | D3D11 (Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
+| Sakuna: Of Rice and Ruin | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Cyberpunk 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | It Takes Two | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | Romance of the Three Kingdoms X with Power Up Kit | x86 | Unknown | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
-| Sakuna: Of Rice and Ruin | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | Steam | x64 | Chromium (CEF) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
