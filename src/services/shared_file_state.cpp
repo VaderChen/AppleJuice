@@ -115,8 +115,24 @@ struct SharedFileState::Storage {
         }
         update_pending(h);
     }
+    // 呼叫者持有紀錄鎖。最後一個參與者離開、沒有開啟／待刪除／範圍鎖時移除兩份紀錄，
+    // 避免長駐命名空間每開過一個檔案就累積約 2.5 MB。open() 的鎖順序是 directory → 紀錄，
+    // 這裡反向只能用非阻塞 directory 鎖；正在載入的程序持有 directory 鎖時保留紀錄給它沿用。
+    void retire(){
+        auto& h=*data;
+        if(h.pending || std::any_of(h.owners.begin(),h.owners.begin()+h.owner_count,[](const auto& v){return v.count;}) || std::any_of(h.opens.begin(),h.opens.begin()+h.open_count,[](const auto& v){return v.count;}))return;
+        if(ranges){clean_ranges();if(std::atomic_ref(ranges->count).load(std::memory_order_acquire))return;}
+        const auto suffix=std::to_string(h.device)+"-"+std::to_string(h.inode);
+        const auto range_name="file-ranges-v2-"+suffix+"-"+std::to_string(h.created),lifetime_name="file-lifetime-"+suffix;
+        if(range_directory<0 || ::flock(range_directory,LOCK_EX|LOCK_NB))return;
+        // 只刪除仍指向本紀錄 inode 的名稱，不碰已被重建或替換的同名紀錄。
+        const auto remove=[&](int fd,const std::string& name){struct stat opened{},entry{};
+            if(fd>=0 && !::fstat(fd,&opened) && !::fstatat(range_directory,name.c_str(),&entry,AT_SYMLINK_NOFOLLOW) && opened.st_dev==entry.st_dev && opened.st_ino==entry.st_ino)(void)::unlinkat(range_directory,name.c_str(),0);};
+        remove(range_descriptor,range_name);remove(descriptor,lifetime_name);
+        (void)::flock(range_directory,LOCK_UN);
+    }
     ~Storage(){
-        if(registered && data)try{Guard guard(*this);reap(*data);for(std::size_t i=0;i<data->owner_count;++i){auto& owner=data->owners[i];if(owner.pid==pid && owner.birth==birth && owner.count){--owner.count;break;}}cleanup();}catch(...){}
+        if(registered && data)try{Guard guard(*this);reap(*data);for(std::size_t i=0;i<data->owner_count;++i){auto& owner=data->owners[i];if(owner.pid==pid && owner.birth==birth && owner.count){--owner.count;break;}}cleanup();retire();}catch(...){}
         for(const auto& [index,fd]:directories){(void)index;::close(fd);}if(ranges)::munmap(ranges,sizeof(RangeHeader));if(range_descriptor>=0)::close(range_descriptor);if(range_directory>=0)::close(range_directory);if(data)::munmap(data,sizeof(Header));if(descriptor>=0)::close(descriptor);
     }
 #endif

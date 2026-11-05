@@ -26,9 +26,20 @@
                             else {require(source->multisample==target->multisample);object.native->graphics_copy(target->native_view,source->native_view,{0,0,0},{});}
                             arg.return_to(state,0);return std::nullopt;
                         }
+                        // 同格式、不縮放且兩端都是 GPU 資源的 StretchRect：直接在命令串流中 blit 區域，不等候 GPU、不經 CPU 回讀／
+                        // 反 twiddle／重新上傳（原本每次都 graphics_read 等候在途命令）。順序由命令串流保證；
+                        // 濾鏡在等大小時不影響結果。縮放、格式轉換與 UpdateSurface 仍走下方 CPU 路徑。X64ARM_D3D9_GPU_STRETCH=0 關閉。
+                        static const bool gpu_stretch=[] {const auto* value=std::getenv("X64ARM_D3D9_GPU_STRETCH");return !value || std::string_view(value)!="0";}();
+                        if(gpu_stretch && !update && source!=target && source->native_view.resource && target->native_view.resource && source->format==target->format &&
+                           area[2]-area[0]==destination[2]-destination[0] && area[3]-area[1]==destination[3]-destination[1]){
+                            object.native->graphics_copy(target->native_view,source->native_view,{destination[0],destination[1],0},{area[0],area[1],0,area[2],area[3],1});
+                            surface_changed(*target);arg.return_to(state,0);return std::nullopt;
+                        }
+                        // 診斷：X64ARM_TRACE_D3D9_LOCK=1 一併列出 CPU 路徑的 StretchRect／UpdateSurface（前 32 次與之後每 1024 次）。
+                        static const bool trace_transfer=std::getenv("X64ARM_TRACE_D3D9_LOCK")!=nullptr;
+                        if(trace_transfer){static std::uint64_t transfers=0;if(++transfers<=32 || !(transfers&1023))std::fprintf(stderr,"[d3d9-transfer] n=%llu op=%s src=%ux%u fmt=%u pool=%u usage=0x%x native=%d dst=%ux%u fmt=%u pool=%u usage=0x%x native=%d area=%u,%u,%u,%u dest=%u,%u,%u,%u filter=%u\n",
+                            static_cast<unsigned long long>(transfers),update?"update":"stretch",source->width,source->height,source->format,source->pool,source->usage,source->native_view.resource?1:0,
+                            target->width,target->height,target->format,target->pool,target->usage,target->native_view.resource?1:0,area[0],area[1],area[2],area[3],destination[0],destination[1],destination[2],destination[3],update?0U:u(5));}
                         read_surface(*source);converted=texture_image::transform(source->pixels,native_format(source->format),{source->width,source->height,1},{area[0],area[1],0,area[2],area[3],1},destination_format,{destination[2]-destination[0],destination[3]-destination[1],1},!update && u(5)==2?3:2);
                     }
-                    // 共用格式轉換與子區域寫入；GPU 表面保留未覆寫區域。
-                    const auto width=destination[2]-destination[0],height=destination[3]-destination[1];const auto pitch=graphics_format_pitch(destination_format,width,height);
-                    if(target->native_view.resource)object.native->graphics_write_region(target->native_view,converted,pitch[0],pitch[0]*pitch[1],{destination[0],destination[1],0,destination[2],destination[3],1});
-                    else {const auto block=graphics_format_bc_family(destination_format)?4U:1U;require(!(destination[0]%block) && !(destination[1]%block));const auto row=graphics_format_pitch(destination_format,target->width,target->height),unit=graphics_format_pitch(destination_format,block,block);for(unsigned y=0;y<pitch[1];++y)std::copy_n(converted.data()+std::size_t(y)*pitch[0],pitch[0],target->pixels.data()+std::size_t(destination[1]/block+y)*row[0]+std::size_t(destination[0]/block)*unit[0]);}
+                    write_surface_region(*target,converted,{destination[0],destination[1],0,destination[2],destination[3],1});

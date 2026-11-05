@@ -58,5 +58,4 @@ struct NativeChainContext {
 extern "C" void x64arm_native_chain(GuestState*,GuestMemory*,NativeChainNode*,NativeChainContext*);
 // 單次執行與串接共用同一份已發布 body；此入口保存宿主 ABI 並接回 BR X22 出口。
 extern "C" std::uint64_t x64arm_native_single(GuestState*,GuestMemory*,void (*body)(),unsigned scopes=0);
-extern "C" void x64arm_native_llvm();
 }

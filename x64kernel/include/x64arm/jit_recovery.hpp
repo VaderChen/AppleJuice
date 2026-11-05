@@ -59,12 +59,10 @@ struct Arm64Recovery {
     const Arm64RecoverySite* find(std::size_t word) const noexcept;
     bool valid(std::span<const std::uint32_t> words) const noexcept;
 };
-struct LlvmFaultState;
 struct JitRecoveryLocation {
     GuestAddress rip;
     std::uintptr_t bailout_pc{};
     std::uint32_t completed{};
     std::uint32_t state{};
-    const LlvmFaultState* llvm{};
 };
 }

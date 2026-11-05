@@ -516,16 +516,17 @@ std::vector<PeImport> imports(const Image& image, Directory directory, PeMetadat
     const auto width = metadata.pointer_bytes();
     const auto ordinal_bit = UINT64_C(1) << (width * 8 - 1);
     if (!directory.rva) return {};
-    const auto end = std::uint64_t{directory.rva} + directory.size;
-    bool terminated = false;
     std::vector<PeImport> result;
     std::set<std::uint64_t> slots;
     unsigned descriptors = 0;
-    for (auto at = std::uint64_t{directory.rva}; end - at >= 20; at += 20) {
+    // 匯入表由全零描述子終止；部分連結器的目錄大小不包含終止項目。
+    // 依映像實際映射與獨立項目上限遍歷，不把宣告長度當成陣列終點。
+    for (auto at = std::uint64_t{directory.rva}; ; at += 20) {
         if (++descriptors > 256) reject("匯入描述子超過 256 項上限");
+        image.check(at, 20);
         const auto original = image.integer(at, 4), timestamp = image.integer(at + 4, 4);
         const auto forward = image.integer(at + 8, 4), dll_rva = image.integer(at + 12, 4), first = image.integer(at + 16, 4);
-        if (!(original | timestamp | forward | dll_rva | first)) { terminated = true; break; }
+        if (!(original | timestamp | forward | dll_rva | first)) break;
         if ((timestamp || forward) && (!inventory_only || !original)) reject("尚未支援 bound import 或 forwarder chain");
         if (!dll_rva || !first) reject("匯入描述子缺少名稱或 IAT");
         const auto dll = image.string(dll_rva);
@@ -562,7 +563,6 @@ std::vector<PeImport> imports(const Image& image, Directory directory, PeMetadat
         }
         if (!thunk_end) reject("匯入 thunk 缺少終止項目");
     }
-    if (!terminated) reject("import directory 缺少終止描述子");
     return result;
 }
 std::vector<PeDelayImport> delay_imports(const Image& image,Directory directory,
@@ -585,13 +585,14 @@ std::vector<PeDelayImport> delay_imports(const Image& image,Directory directory,
         if(target<preferred)reject("delay IAT 初始 thunk 不在映像內");
         image.executable(target-preferred,1,"delay IAT 初始 thunk 不在 executable section");
     };
-    const auto end=std::uint64_t{directory.rva}+directory.size;
-    bool terminated=false;unsigned descriptors=0;
-    for(auto at=std::uint64_t{directory.rva};end-at>=32;at+=32){
+    unsigned descriptors=0;
+    // 與一般匯入一致：大小欄位不取代終止描述子，逐項核對映射邊界。
+    for(auto at=std::uint64_t{directory.rva};;at+=32){
         if(++descriptors>256)reject("delay import 描述子超過 256 項上限");
+        image.check(at,32);
         std::array<std::uint64_t,8> fields{};
         for(unsigned n=0;n<fields.size();++n)fields[n]=image.integer(at+n*4,4);
-        if(std::all_of(fields.begin(),fields.end(),[](auto value){return value==0;})){terminated=true;break;}
+        if(std::all_of(fields.begin(),fields.end(),[](auto value){return value==0;}))break;
         const auto attributes=fields[0],name=fields[1],handle=fields[2],iat=fields[3],lookup=fields[4];
         const auto bound=fields[5],unload=fields[6],timestamp=fields[7];
         if(attributes!=1)reject("delay import 僅支援 RVA descriptor attributes=1");
@@ -629,7 +630,6 @@ std::vector<PeDelayImport> delay_imports(const Image& image,Directory directory,
         }
         if(!thunk_end)reject("delay import thunk 缺少終止項目");
     }
-    if(!terminated)reject("delay import directory 缺少終止描述子");
     return result;
 }
 ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::optional<GuestAddress> image_base, bool dll, std::size_t memory_limit, bool resource_only, bool inventory_only, const PeImageBaseSelector& select_base = {}, bool native_subsystem = false, bool section_only = false) {
@@ -672,8 +672,8 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
         if (stack_commit > stack_size || stack_size > memory_limit - image_size)
             reject("堆疊提交量、保留量或客體總容量超過支援範圍");
     }
-    // native subsystem 只開放給核心驅動宿主載入的 DLL 型映像。
-    if (!inventory_only && !section_only && file.u16(opt + 68) != 3 && file.u16(opt + 68) != 2 && !(native_subsystem && dll && file.u16(opt + 68) == 1)) reject("只支援 Windows console／GUI subsystem");
+    // 一般 DLL 也可能標記 NATIVE；後面依匯入契約區分 Win32 模組與驅動。
+    if (!inventory_only && !section_only && file.u16(opt + 68) != 3 && file.u16(opt + 68) != 2 && !(dll && file.u16(opt + 68) == 1)) reject("只支援 Windows console／GUI subsystem");
     if (!resource_only && !inventory_only && !section_only && (file.u16(opt + 70) & 0x1000U)) reject("尚未支援 AppContainer 映像");
     if (directory_count > 16 || std::uint64_t{directory_count} * 8 + directory_offset > optional_size) reject("data directory 數目超過 optional header");
     const auto table = opt + optional_size;
@@ -766,6 +766,13 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
     parsed.metadata.architecture = x86 ? PeArchitecture::X86 : PeArchitecture::X64;
     // 先解析匯入，避免重定位或 IAT patch 改變之後的解析內容。
     parsed.imports=imports(image,directories[1],parsed.metadata,inventory_only);
+    if(!inventory_only && !section_only && !resource_only && !native_subsystem && file.u16(opt+68)==1){
+        const bool win32=std::any_of(parsed.imports.begin(),parsed.imports.end(),[](const auto& imported){
+            auto name=imported.dll;for(auto& c:name)if(c>='A' && c<='Z')c=static_cast<char>(c-'A'+'a');
+            return name=="kernel32.dll" || name=="kernelbase.dll" || name.starts_with("api-ms-win-core-") || name.starts_with("ext-ms-win-kernel32-");
+        });
+        if(!win32)reject("native subsystem 驅動須由驅動宿主載入");
+    }
     std::vector<Directory> delay_tables;
     parsed.delay_imports=delay_imports(image,directories[13],parsed.imports,preferred,pointer_size,delay_tables);
     if(inventory_only)return parsed;

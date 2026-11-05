@@ -1,6 +1,13 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "mf_interfaces.hpp"
+#include "mf_image_layout.h"
+#include "guest_mf_image.hpp"
+#include "guest_mf_image_code.hpp"
+#include "mf_buffer_layout.h"
+#include "guest_mf_buffer.hpp"
+#include "guest_mf_buffer_code.hpp"
+#include "x64arm/pe_loader.hpp"
 #include "mf_h264.hpp"
 #include "pcm_wave_file.hpp"
 #include "mp4_video.hpp"
@@ -18,6 +25,30 @@
 #include <set>
 
 namespace x64arm {
+void mf_buffer::initialize(GuestMemory& memory,std::map<std::uint64_t,RuntimeImage>& images,bool x86,std::uint64_t gateway){
+    const auto bytes=x86?std::span<const std::uint8_t>{image_x86}:std::span<const std::uint8_t>{image_x64};
+    const auto base=gateway+image_offset;auto parsed=parse_pe_image(bytes,GuestAddress{base},true,memory.limit());
+    if(!parsed.imports.empty() || !parsed.delay_imports.empty() || parsed.metadata.image_size>0x10000)
+        throw std::logic_error("MF buffer 常式包含外部相依或超出常駐映像範圍");
+    for(const auto& [address,image]:images)if(base<address+image.size && address<base+parsed.metadata.image_size)
+        throw std::logic_error("MF buffer 常式與既有常駐映像重疊");
+    auto image=parsed.runtime;image.path=u"[guest-mf-buffer]";image.export_names.clear();image.export_ordinals.clear();
+    for(const auto& [name,ordinal]:parsed.runtime.export_names)image.export_names.emplace(name,parsed.runtime.export_ordinals.at(ordinal));
+    for(auto& mapping:parsed.mappings)mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
+    map_pe_image(memory,parsed);images.emplace(base,std::move(image));
+}
+void mf_image::initialize(GuestMemory& memory,std::map<std::uint64_t,RuntimeImage>& images,bool x86,std::uint64_t gateway){
+    const auto bytes=x86?std::span<const std::uint8_t>{image_x86}:std::span<const std::uint8_t>{image_x64};
+    const auto base=gateway+image_offset;auto parsed=parse_pe_image(bytes,GuestAddress{base},true,memory.limit());
+    if(!parsed.imports.empty() || !parsed.delay_imports.empty() || parsed.metadata.image_size>0x10000)
+        throw std::logic_error("MF 影像常式包含外部相依或超出常駐映像範圍");
+    for(const auto& [address,image]:images)if(base<address+image.size && address<base+parsed.metadata.image_size)
+        throw std::logic_error("MF 影像常式與既有常駐映像重疊");
+    auto image=parsed.runtime;image.path=u"[guest-mf-image]";image.export_names.clear();image.export_ordinals.clear();
+    for(const auto& [name,ordinal]:parsed.runtime.export_names)image.export_names.emplace(name,parsed.runtime.export_ordinals.at(ordinal));
+    for(auto& mapping:parsed.mappings)mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
+    map_pe_image(memory,parsed);images.emplace(base,std::move(image));
+}
 namespace {
 using mf::Guid;
 constexpr std::uint32_t invalid=0x80070057U,pointer_error=0x80004003U,no_interface=0x80004002U,
@@ -32,6 +63,10 @@ struct ByteStreamState {
     std::shared_ptr<HostFile> file;
     std::uint64_t position{};std::uint32_t capabilities{};bool closed{};
 };
+struct FileSourceState {
+    std::shared_ptr<HostFile> file;PcmWaveStream wave;std::uint64_t base{},external_stream{};
+};
+#include "mf_guest_bytestream.hpp"
 struct SinkWriterState {
     std::shared_ptr<ByteStreamState> stream;
     std::uint64_t base{};
@@ -48,10 +83,22 @@ struct SinkWriterState {
     struct Notice {bool final;std::uint64_t context;std::uint32_t status;};
     std::deque<Notice> notices;
 };
+// 宿主與常駐程式共用同一份 buffer 狀態，不在服務邊界另複製或掃描物件。
+template<unsigned Bits> class BufferCell {
+    GuestMemory* memory_{};std::uint64_t address_{},local_{};
+public:
+    BufferCell(std::uint64_t value=0):local_(value){}
+    operator std::uint64_t()const{return memory_?memory_->load(GuestAddress{address_},Bits):local_;}
+    BufferCell& operator=(std::uint64_t value){if constexpr(Bits==32)value=static_cast<std::uint32_t>(value);if(memory_)memory_->store(GuestAddress{address_},Bits,value);else local_=value;return *this;}
+    BufferCell& operator=(const BufferCell& other){return *this=static_cast<std::uint64_t>(other);}
+    void bind(GuestMemory& memory,std::uint64_t address){memory_=&memory;address_=address;memory_->store(GuestAddress{address_},Bits,local_);}
+    std::uint32_t operator++(){if(memory_)return static_cast<std::uint32_t>(memory_->atomic_rmw(GuestAddress{address_},Bits,GuestMemory::AtomicRmw::Add,1)+1);return static_cast<std::uint32_t>(++local_);}
+    std::uint32_t operator--(){if(memory_)return static_cast<std::uint32_t>(memory_->atomic_rmw(GuestAddress{address_},Bits,GuestMemory::AtomicRmw::Add,UINT32_MAX)-1);return static_cast<std::uint32_t>(--local_);}
+};
 struct Object {
-    mf::Kind kind{};std::uint32_t refs{1};std::map<mf::Kind,std::uint64_t> pointers;std::map<Guid,Value> attributes;
-    std::uint64_t allocation{},data{},parent{},state{},callback{},result_object{},queue_owner{};
-    std::uint32_t maximum{},length{},locks{},flags{},status{},identifier{};
+    mf::Kind kind{};BufferCell<32> refs{1};std::map<mf::Kind,std::uint64_t> pointers;std::map<Guid,Value> attributes;
+    std::uint64_t allocation{},parent{},state{},callback{},result_object{},queue_owner{};BufferCell<64> data{};
+    BufferCell<32> maximum{},length{},locks{};std::uint32_t flags{},status{},identifier{};
     std::optional<std::uint64_t> time,duration;
     Guid extended{};Value value;
     std::vector<std::uint64_t> children;std::vector<bool> selected;std::uint64_t current_type{};
@@ -68,6 +115,8 @@ struct Object {
     unsigned input_credit{},output_credit{};std::int64_t lower_bound{INT64_MIN},upper_bound{INT64_MAX};
     std::shared_ptr<audio::Buffer> capture;std::unique_ptr<audio::Input> input;std::uint64_t read_frames{},pending_token{};
     std::shared_ptr<SinkWriterState> writer;
+    std::shared_ptr<FileSourceState> file_source;
+    bool file_read_active{},flush_pending{};std::uint64_t file_read_generation{};
     std::shared_ptr<ByteStreamState> byte_stream;
 
 };
@@ -99,6 +148,7 @@ void WindowsServices::poll_media_foundation(GuestMemory& memory){
         bool complete=item.closed || !item.request_pending;
         if(item.kind==mf::Transform)complete=(!item.decoding.valid() || item.decoding.wait_for(std::chrono::seconds(0))==std::future_status::ready) && (!item.encoding.valid() || item.encoding.wait_for(std::chrono::seconds(0))==std::future_status::ready);
         else if(item.request_pending){const auto found=media_foundation_->objects.find(item.parent);if(found==media_foundation_->objects.end() || found->second.object->closed)complete=true;
+            else if(found->second.object->file_source)complete=true;
             else if(const auto capture=found->second.object->capture){std::lock_guard lock(capture->mutex);complete=capture->capture_failed || capture->captured_frames>item.read_frames;}}
         if(complete)ready.push_back(pointer);
     }
@@ -146,6 +196,8 @@ std::span<const WindowsServiceDescriptor> media_foundation_service_descriptors()
         std::vector<WindowsServiceDescriptor> result{
             {"mfplat.dll","MFStartup",2,0,0,3},{"mfplat.dll","MFShutdown",0},
             {"mfplat.dll","MFGetSystemTime",0},{"mfplat.dll","MFFrameRateToAverageTimePerFrame",3,0,0,3},
+            {"mfplat.dll","MFGetStrideForBitmapInfoHeader",3,0,0,3},{"mfplat.dll","MFGetPlaneSize",4,0,0,7},
+            {"mfplat.dll","MFCalculateImageSize",4,0,0,6},{"mfplat.dll","MFCopyImage",6,0,0,0x3a},
             {"mfplat.dll","MFCreateAttributes",2,0,0,2},{"mfplat.dll","MFCreateMediaType",1},
             {"mfplat.dll","MFCreateSample",1},{"mfplat.dll","MFCreateMemoryBuffer",2,0,0,1},
             {"mfplat.dll","MFCreateAlignedMemoryBuffer",3,0,0,3},{"mfplat.dll","MFCreateMediaBufferWrapper",4,0,0,6},
@@ -156,15 +208,43 @@ std::span<const WindowsServiceDescriptor> media_foundation_service_descriptors()
             {"mfplat.dll","MFCreateDXGIDeviceManager",2},{"mfplat.dll","MFLockDXGIDeviceManager",2},{"mfplat.dll","MFUnlockDXGIDeviceManager",0},
             {"mfplat.dll","MFCreateDXGISurfaceBuffer",5,0,0,12},
             {"mf.dll","MFGetService",4},{"mfplat.dll","MFTEnum",7,0,1,2},{"mfplat.dll","MFTEnumEx",6,0,1,2},{"mf.dll","MFEnumDeviceSources",3},{"mf.dll","MFCreateDeviceSource",2},
-            {"mfreadwrite.dll","MFCreateSourceReaderFromMediaSource",3},{"mfreadwrite.dll","MFCreateSinkWriterFromURL",4},{"mfplat.dll","MFCreateFile",5,0,0,7},{"internal-mf","PipelinePoll",1}};
+            {"mfplat.dll","MFCreateSourceResolver",1},{"mfreadwrite.dll","MFCreateSourceReaderFromURL",3},{"mfreadwrite.dll","MFCreateSourceReaderFromByteStream",3},{"mfreadwrite.dll","MFCreateSourceReaderFromMediaSource",3},{"mfreadwrite.dll","MFCreateSinkWriterFromURL",4},{"mfplat.dll","MFCreateFile",5,0,0,7},{"internal-mf","PipelinePoll",1},
+            {"internal-mf","BufferDestroy",1},{"internal-mf","B_LockHost",4},{"internal-mf","B_UnlockHost",1}};
         std::set<std::string_view> names;const auto append=[&](const auto& methods){for(const auto& m:methods)if(names.insert(m.name).second)result.push_back({"internal-mf",m.name,m.args,m.wide,m.aggregate,m.narrow});};
-        append(mf::common);for(unsigned k=0;k<=mf::ByteStream;++k)append(mf::methods(static_cast<mf::Kind>(k)));
+        append(mf::common);for(unsigned k=0;k<=mf::Resolver;++k)append(mf::methods(static_cast<mf::Kind>(k)));
         return result;
     }();return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    // 純影像工具保留完整宿主回退，不配置 COM／解碼器狀態。
+    if(service.symbol=="MFGetStrideForBitmapInfoHeader" || service.symbol=="MFGetPlaneSize" || service.symbol=="MFCalculateImageSize" || service.symbol=="MFCopyImage"){
+        const WindowsCall a(state,memory,service);const auto d=[&](unsigned i){return static_cast<std::uint32_t>(a(i));};std::uint32_t status=0;
+        if(service.symbol=="MFCopyImage"){
+            if(d(4) && d(5)){
+                if(!a(0) || !a(2))status=MF_IMAGE_POINTER;
+                else{
+                    auto dest=a(0),src=a(2);const auto mask=x86_?UINT64_C(0xffffffff):UINT64_MAX;
+                    const auto ds=static_cast<std::int64_t>(static_cast<std::int32_t>(d(1))),ss=static_cast<std::int64_t>(static_cast<std::int32_t>(d(3)));
+                    std::array<std::uint8_t,4096> bytes{};
+                    for(std::uint32_t y=0;y<d(5);++y){
+                        for(std::uint64_t x=0;x<d(4);){const auto count=std::min<std::uint64_t>(bytes.size(),d(4)-x);const auto span=std::span<std::uint8_t>{bytes}.first(count);
+                            memory.read(GuestAddress{(src+x)&mask},span);memory.write(GuestAddress{(dest+x)&mask},span);x+=count;}
+                        dest=(dest+static_cast<std::uint64_t>(ds))&mask;src=(src+static_cast<std::uint64_t>(ss))&mask;
+                    }
+                }
+            }
+        }else if(service.symbol=="MFGetStrideForBitmapInfoHeader"){
+            if(!a(2))status=MF_IMAGE_POINTER;else {MfImageLong value=0;status=mf_image_stride(d(0),d(1),&value);if(!status)memory.store(GuestAddress{a(2)},32,static_cast<std::uint32_t>(value));}
+        }else if(!a(3))status=MF_IMAGE_POINTER;
+        else {
+            memory.store(GuestAddress{a(3)},32,0);MfImageWord format=d(0),size=0;const bool bitmap=service.symbol=="MFCalculateImageSize";
+            if(bitmap){if(!a(0))status=MF_IMAGE_POINTER;else {std::array<std::uint8_t,16> id{};memory.read(GuestAddress{a(0)},id);format=mf_image_guid_format(id.data());}}
+            if(!status){status=mf_image_size(format,d(1),d(2),bitmap,&size);if(!status)memory.store(GuestAddress{a(3)},32,size);}
+        }
+        a.return_to(state,status);return std::nullopt;
+    }
     if(!media_foundation_)media_foundation_=std::make_shared<MediaFoundationState>();auto& bridge=*media_foundation_;
-    const WindowsCall arg(state,memory,service);const auto name=service.symbol;const auto bits=static_cast<std::uint8_t>(x86_?32:64);const auto unit=bits/8U;
+    const WindowsCall arg(state,memory,service);const auto name=service.symbol=="B_LockHost"?std::string_view{"B_Lock"}:service.symbol=="B_UnlockHost"?std::string_view{"B_Unlock"}:service.symbol;const auto bits=static_cast<std::uint8_t>(x86_?32:64);const auto unit=bits/8U;
     const auto d=[&](unsigned n){return static_cast<std::uint32_t>(arg(n));};
     const auto require=[](bool test,std::uint32_t code=invalid){if(!test)throw Failure{code};};
     const auto check=[&](std::uint64_t p,std::size_t size){require(p!=0,pointer_error);memory.check(GuestAddress{p},size,Access::Write);};
@@ -180,9 +260,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
     const auto hold=[&](std::uint64_t p){if(!p)return;if(const auto found=bridge.objects.find(p);found!=bridge.objects.end()){require(found->second.object->refs<UINT32_MAX);++found->second.object->refs;}else callbacks.push_back({foreign_method(p,1),{p}});};
     std::function<void(std::uint64_t)> release;
     std::function<void(const std::shared_ptr<Object>&)> close_source;
-    release=[&](std::uint64_t p){
-        if(!p)return;const auto found=bridge.objects.find(p);if(found==bridge.objects.end()){callbacks.push_back({foreign_method(p,2),{p}});return;}
-        auto item=found->second.object;if(--item->refs)return;
+    const auto destroy=[&](std::uint64_t p){
+        auto item=entry(p).object;
         if(item->kind==mf::Reader && !item->disconnect_source && item->parent && bridge.objects.contains(item->parent) && close_source)close_source(bridge.objects.at(item->parent).object);
         for(const auto& [kind,pointer]:item->pointers){(void)kind;bridge.objects.erase(pointer);runtime_.critical_sections.erase(pointer);(void)free_heap(memory,pointer,state);}
         for(const auto& [key,value]:item->attributes){(void)key;if(value.type==13)release(value.scalar);}
@@ -192,6 +271,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
         for(const auto child:item->children)release(child);for(const auto event:item->events)release(event);
         if(item->allocation)(void)free_heap(memory,item->allocation,state);
     };
+    release=[&](std::uint64_t p){
+        if(!p)return;const auto found=bridge.objects.find(p);if(found==bridge.objects.end()){callbacks.push_back({foreign_method(p,2),{p}});return;}
+        if(!--found->second.object->refs)destroy(p);
+    };
     const auto create=[&](const std::shared_ptr<Object>& item,mf::Kind kind){
         if(item->pointers.contains(kind))return item->pointers.at(kind);
         require(bridge.objects.size()<16384,0x8007000eU);
@@ -200,10 +283,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
             if(mf::attributes(kind) && kind!=mf::Attributes)methods.insert(methods.end(),std::begin(mf::methods_Attributes),std::end(mf::methods_Attributes));
             const auto extra=mf::methods(kind);methods.insert(methods.end(),extra.begin(),extra.end());
             const auto table=runtime_allocate(memory,{},methods.size()*unit);
-            for(std::size_t n=0;n<methods.size();++n)put(table+n*unit,resolve("internal-mf",methods[n].name).value,bits);
+            const auto image=runtime_.builtin_images.find(callback_return_.value+mf_buffer::image_offset);
+            for(std::size_t n=0;n<methods.size();++n){
+                auto address=resolve("internal-mf",methods[n].name).value;
+                if(kind==mf::Buffer && image!=runtime_.builtin_images.end()){
+                    const auto method=n<3?std::string{"Buffer"}+std::string(methods[n].name):std::string(methods[n].name);
+                    if(const auto found=image->second.export_names.find(method);found!=image->second.export_names.end())address=image->first+found->second;
+                }
+                put(table+n*unit,address,bits);
+            }
             bridge.tables.emplace(kind,table);
         }
-        const auto p=allocate(unit);put(p,bridge.tables.at(kind),bits);item->pointers.emplace(kind,p);bridge.objects.emplace(p,Entry{item,kind});return p;
+        const auto p=allocate(kind==mf::Buffer?MF_BUFFER_BYTES:unit);put(p,bridge.tables.at(kind),bits);
+        if(kind==mf::Buffer){
+            memory.fill(GuestAddress{p+8},0,MF_BUFFER_BYTES-8);
+            item->refs.bind(memory,p+MF_BUFFER_REFS);item->locks.bind(memory,p+MF_BUFFER_LOCKS);item->data.bind(memory,p+MF_BUFFER_DATA);
+            item->maximum.bind(memory,p+MF_BUFFER_MAXIMUM);item->length.bind(memory,p+MF_BUFFER_LENGTH);
+            put(p+MF_BUFFER_DESTROY,resolve("internal-mf","BufferDestroy").value,bits);
+            put(p+MF_BUFFER_LOCK_HOST,resolve("internal-mf","B_LockHost").value,bits);
+            put(p+MF_BUFFER_UNLOCK_HOST,resolve("internal-mf","B_UnlockHost").value,bits);
+            put(p+MF_BUFFER_QUERY_HOST,resolve("internal-mf","QueryInterface").value,bits);
+        }
+        item->pointers.emplace(kind,p);bridge.objects.emplace(p,Entry{item,kind});return p;
     };
     const auto make=[&](mf::Kind kind){auto item=std::make_shared<Object>();item->kind=kind;return create(item,kind);};
     const auto query=[&](std::uint64_t p,const Guid& iid,std::uint64_t output){
@@ -239,7 +340,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
     };
     const auto get=[&](const Object& item,const Guid& key,std::uint32_t type=0)->const Value&{const auto found=item.attributes.find(key);require(found!=item.attributes.end(),missing);require(!type || type==found->second.type,type_error);return found->second;};
     const auto memory_buffer=[&](std::uint32_t size,std::uint32_t mask){
-        require(mask<=8191 && (mask&(mask+1))==0);const auto p=make(mf::Buffer);auto item=object(p,mf::Buffer);item->allocation=allocate(static_cast<std::size_t>(size)+mask);item->data=(item->allocation+mask)&~static_cast<std::uint64_t>(mask);item->maximum=size;return p;
+        require(mask<=8191 && (mask&(mask+1))==0);const auto p=make(mf::Buffer);auto item=object(p,mf::Buffer);item->allocation=allocate(static_cast<std::size_t>(size)+mask);item->data=(item->allocation+mask)&~static_cast<std::uint64_t>(mask);item->maximum=size;put(p+MF_BUFFER_PLAIN,1);return p;
     };
     const auto flip=[](std::vector<std::uint8_t>& bytes,const Object& item){if(item.bottom_up && item.surface->format!=103){const auto pitch=item.surface->row_pitch,height=item.surface->height;for(unsigned y=0;y<height/2;++y)for(unsigned x=0;x<pitch;++x)std::swap(bytes[static_cast<std::size_t>(y)*pitch+x],bytes[static_cast<std::size_t>(height-y-1)*pitch+x]);}};
     std::function<void(Object&,bool,bool)> map_buffer;
@@ -260,10 +361,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
         // callback 期間保留 result；callback 結束後才釋放佇列持有的引用。
         callbacks.push_back({resolve("internal-mf","Release").value,{p}});
     };
+    #include "mf_guest_bytestream_helpers.inc"
     #include "mf_pipeline_helpers.inc"
     #include "mf_sink_helpers.inc"
+    #include "mf_file_source_helpers.inc"
     std::uint64_t result=0;
     try {
+        #include "mf_file_source_exports.inc"
+        else
         #include "mf_bytestream_exports.inc"
         else
         #include "mf_sink_exports.inc"
@@ -293,7 +398,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
         }else if(name=="MFCreateMemoryBuffer" || name=="MFCreateAlignedMemoryBuffer"){
             const auto output=arg(name=="MFCreateMemoryBuffer"?1:2);out(output);put(output,memory_buffer(d(0),name=="MFCreateMemoryBuffer"?0:d(1)),bits);
         }else if(name=="MFCreateMediaBufferWrapper"){
-            out(arg(3));auto parent=object(arg(0),mf::Buffer);require(d(1)<=parent->length && d(2)<=parent->length-d(1));map_buffer(*parent,true,false);const auto p=make(mf::Buffer);auto item=object(p,mf::Buffer);hold(arg(0));item->parent=arg(0);item->identifier=d(1);item->data=parent->data+d(1);item->length=item->maximum=d(2);put(arg(3),p,bits);
+            out(arg(3));auto parent=object(arg(0),mf::Buffer);require(d(1)<=parent->length && d(2)<=parent->length-d(1));map_buffer(*parent,true,false);const auto p=make(mf::Buffer);auto item=object(p,mf::Buffer);hold(arg(0));item->parent=arg(0);item->identifier=d(1);item->data=parent->data+d(1);item->length=item->maximum=d(2);put(p+MF_BUFFER_PLAIN,memory.load(GuestAddress{arg(0)+MF_BUFFER_PLAIN},32));put(arg(3),p,bits);
         }else if(name=="MFCreateAsyncResult"){
             out(arg(3));const auto p=make(mf::Async);auto item=object(p,mf::Async);hold(arg(0));hold(arg(1));hold(arg(2));item->result_object=arg(0);item->callback=arg(1);item->state=arg(2);put(arg(3),p,bits);
         }else if(name=="MFInvokeCallback"){
@@ -327,6 +432,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
             if(name=="QueryInterface")query(arg(0),guid(arg(1)),arg(2));
             else if(name=="AddRef"){hold(arg(0));result=item->refs;}
             else if(name=="Release"){result=item->refs-1;release(arg(0));}
+            else if(name=="BufferDestroy"){require(item->kind==mf::Buffer && !item->refs);destroy(arg(0));}
             #include "mf_bytestream_methods.inc"
             #include "mf_sink_methods.inc"
             #include "mf_pipeline_methods.inc"

@@ -13,6 +13,10 @@
                     if(!characters.empty()){const auto face=native_resolve_font(model);require(bool(face));glyphs=native_font_glyph_indices(*face,characters);}for(auto glyph:glyphs)(void)font_glyph(font,glyph);
 
                 }else if(method=="DrawTextA" || method=="DrawTextW"){
+                    if(d3dx_font_empty_text(memory,arg(2),static_cast<std::int32_t>(u(3)),method.ends_with("W"))){
+                        result=0;
+                        if(std::getenv("X64ARM_TRACE_D3D9_FONT"))std::fprintf(stderr,"[d3d9-font-empty] count=%d wide=%u\n",static_cast<std::int32_t>(u(3)),method.ends_with("W")?1U:0U);
+                    }else{
                     require(arg(4));const auto flags=u(5);const std::array<std::uint64_t,5> arguments{font->font_dc,arg(2),arg(3),arg(4),flags};const auto text_symbol=method.ends_with("W")?"DrawTextW":"DrawTextA";
                     if(flags&0x400)result=font_format(text_symbol,arguments);
                     else {
@@ -42,6 +46,7 @@
                         const auto texture=font_texture(font,"FontDraw",width,height,rgba,canvas);const bool owned=!arg(1);auto sprite=owned?create(Kind::Sprite,font->parent):get(arg(1),Kind::Sprite);require(sprite->parent==font->parent);
                         try{if(owned)sprite_begin(sprite,16);sprite_enqueue(sprite,texture,{0,0,static_cast<int>(canvas[0]),static_cast<int>(canvas[1])},{0,0,0,0},{static_cast<float>(left),static_cast<float>(top),0,1},u(6));if(owned)sprite_end(sprite);}
                         catch(...){if(owned)release(sprite->root);throw;}if(owned)release(sprite->root);
+                    }
                     }
                 }else if(method=="OnLostDevice"){for(const auto& [key,pointer]:font->font_textures){(void)key;release(pointer);}font->font_textures.clear();font->font_bounds.clear();font->font_draw_cache.clear();}
                 else if(method=="OnResetDevice"){font->font_bounds.clear();font->font_draw_cache.clear();}

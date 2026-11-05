@@ -23,6 +23,7 @@
 #include "srw_trace.hpp"
 #include "resident_service_policy.hpp"
 #include "guest_crt_state.h"
+#include "guest_once_layout.h"
 #include "windows_loader_lock.hpp"
 #include "x64arm/guest_address_policy.hpp"
 #include "x64arm/windows_unwind.hpp"
@@ -1421,7 +1422,7 @@ void WindowsServices::load_resident_current(GuestState& state,GuestMemory& memor
     if(!(mask&(UINT64_C(1)<<state.processor_id)))state.processor_id=static_cast<std::uint32_t>(std::countr_zero(mask));
     runtime_.callbacks=std::move(target.callbacks);
     runtime_.sorts=std::move(target.sorts);
-    exceptions_.stack=std::move(target.exceptions);
+    exceptions_.stack=std::move(target.exceptions);sync_msvc_uncaught(memory);
     runtime_.fls_values=target.fls_values;
     runtime_.tls_values=target.tls_values;
     runtime_.errno_cell=target.errno_cell;
@@ -1704,6 +1705,40 @@ void WindowsServices::after_resident_interrupt(GuestState& state,GuestMemory& me
 #endif
     after_resident_parallel(state,memory);
 }
+// 診斷用：列出每條未結束客體執行緒的狀態、等待種類、剩餘期限、目前 RIP／API 與等待中的物件。只讀排程表，不改狀態。
+void WindowsServices::trace_guest_thread_waits(std::FILE* out,const GuestMemory* memory) const {
+#if !defined(_WIN32)
+    const auto ticks=detail::monotonic_ticks();
+    for(const auto& [id,thread]:threads_.items){
+        if(thread.status==ThreadStatus::Exited)continue;
+        std::fprintf(out,"  id=%llu status=%d suspended=%d kind=%d remaining_ms=%lld name=%s rip=0x%llx api=%s\n",
+            static_cast<unsigned long long>(id),static_cast<int>(thread.status),thread.suspended?1:0,static_cast<int>(thread.wait.kind),
+            thread.wait.deadline==UINT64_MAX?-1LL:static_cast<long long>((thread.wait.deadline>ticks?thread.wait.deadline-ticks:0)/10000),
+            utf16_to_utf8(thread.description).c_str(),static_cast<unsigned long long>(thread.context.rip.value),
+            handles(thread.context.rip)?std::string(name(thread.context.rip)).c_str():"");
+        if(memory){
+            // 起始常式與堆疊頂端 24 個 qword（離線再依模組範圍篩出返回位址）；讀不到的頁停止。
+            std::fprintf(out,"    entry=0x%llx rsp=0x%llx stack=",static_cast<unsigned long long>(thread.entry),static_cast<unsigned long long>(thread.context.gpr[4]));
+            for(unsigned i=0;i<24;++i){
+                try{std::fprintf(out,"%llx ",static_cast<unsigned long long>(memory->load(GuestAddress{thread.context.gpr[4]+i*8ULL},64)));}
+                catch(...){break;}
+            }
+            std::fputc('\n',out);
+        }
+        for(const auto handle:thread.wait.handles){
+            const auto object=runtime_.wait_objects.find(handle);
+            if(object==runtime_.wait_objects.end()){std::fprintf(out,"    handle=0x%llx (非等待物件)\n",static_cast<unsigned long long>(handle));continue;}
+            const auto& state_object=runtime_.wait_state(object->second);
+            std::fprintf(out,"    handle=0x%llx kind=%d signaled=%d manual=%d count=%u shared_fd=%d name=%s\n",
+                static_cast<unsigned long long>(handle),static_cast<int>(object->second.kind),state_object.signaled()?1:0,
+                state_object.manual_reset?1:0,state_object.count,runtime_.wait_lock_descriptor(object->second),
+                utf16_to_utf8(object->second.name).c_str());
+        }
+    }
+#else
+    (void)out;(void)memory;
+#endif
+}
 std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState* const> contexts) const {
     std::size_t runnable=0,exited=0;std::uint64_t deadline=UINT64_MAX;bool socket_select=false,gui_wait=false;
     {
@@ -1828,25 +1863,8 @@ std::uint64_t WindowsServices::resident_parallel_wakeup_ns(std::span<GuestState*
         if(now_ms-previous>=3000 && last_dump.compare_exchange_strong(previous,now_ms)){
             const auto path=std::string(idle_dump_directory)+"/resident-idle-"+std::to_string(::getpid())+".log";
             if(auto* out=std::fopen(path.c_str(),"a")){
-                const auto ticks=detail::monotonic_ticks();
                 std::fprintf(out,"resident_idle unix_ms=%lld wake_ns=%llu threads=%zu\n",now_ms,static_cast<unsigned long long>(wake),threads_.items.size());
-                for(const auto& [id,thread]:threads_.items){
-                    if(thread.status==ThreadStatus::Exited)continue;
-                    std::fprintf(out,"  id=%llu status=%d suspended=%d kind=%d remaining_ms=%lld name=%s rip=0x%llx api=%s\n",
-                        static_cast<unsigned long long>(id),static_cast<int>(thread.status),thread.suspended?1:0,static_cast<int>(thread.wait.kind),
-                        thread.wait.deadline==UINT64_MAX?-1LL:static_cast<long long>((thread.wait.deadline>ticks?thread.wait.deadline-ticks:0)/10000),
-                        utf16_to_utf8(thread.description).c_str(),static_cast<unsigned long long>(thread.context.rip.value),
-                        handles(thread.context.rip)?std::string(name(thread.context.rip)).c_str():"");
-                    for(const auto handle:thread.wait.handles){
-                        const auto object=runtime_.wait_objects.find(handle);
-                        if(object==runtime_.wait_objects.end()){std::fprintf(out,"    handle=0x%llx (非等待物件)\n",static_cast<unsigned long long>(handle));continue;}
-                        const auto& state_object=runtime_.wait_state(object->second);
-                        std::fprintf(out,"    handle=0x%llx kind=%d signaled=%d manual=%d count=%u shared_fd=%d name=%s\n",
-                            static_cast<unsigned long long>(handle),static_cast<int>(object->second.kind),state_object.signaled()?1:0,
-                            state_object.manual_reset?1:0,state_object.count,runtime_.wait_lock_descriptor(object->second),
-                            utf16_to_utf8(object->second.name).c_str());
-                    }
-                }
+                trace_guest_thread_waits(out);
                 std::fclose(out);
             }
         }
@@ -2142,6 +2160,22 @@ WindowsServices::CompletionResult WindowsServices::poll_completion(GuestState& s
 void WindowsServices::wake_threads(GuestMemory &memory) {
     startup_profile::Scope measurement("scheduler", "wake_threads");
     resident_full_poll_ticks_=detail::monotonic_ticks();
+#if !defined(_WIN32)
+    // 診斷：X64ARM_TRACE_THREAD_DUMP=<目錄> 時，完整排程每 10 秒傾印一次各客體執行緒的等待（不論是否閒置），
+    // 用來追查仍在繪製但某條工作執行緒不再前進的停滯（resident 不再逐指令計數，THREAD_CYCLES 追蹤不會觸發）。
+    static const char* const thread_dump_directory=std::getenv("X64ARM_TRACE_THREAD_DUMP");
+    if(thread_dump_directory){
+        static long long last_thread_dump=0;
+        const auto now_ms=static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        if(now_ms-last_thread_dump>=10000){
+            last_thread_dump=now_ms;
+            if(auto* out=std::fopen((std::string(thread_dump_directory)+"/threads-"+std::to_string(::getpid())+".log").c_str(),"a")){
+                std::fprintf(out,"thread_dump unix_ms=%lld current=%llu threads=%zu\n",now_ms,static_cast<unsigned long long>(threads_.current),threads_.items.size());
+                trace_guest_thread_waits(out,&memory);std::fclose(out);
+            }
+        }
+    }
+#endif
     WakePollScope wake_measurement("wake_threads");
     process_io::Scope io_scope(runtime_.io_counters, io_publisher_.get());
     {
@@ -2157,6 +2191,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
         poll_handle_transfers(memory);
     }
     poll_remote_thread_creations(memory);
+    poll_remote_gui_messages(memory);
     {
         WakePollScope poll_measurement("poll_job_termination");
         poll_job_termination(memory);
@@ -2195,6 +2230,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
     }
     {
         WakePollScope poll_measurement("poll_wave_output");
+        poll_xaudio();
         poll_wave_output(memory);
     }
     {
@@ -3100,7 +3136,7 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory, bool cont
                 state.processor_id = static_cast<std::uint32_t>(std::countr_zero(mask));
             runtime_.callbacks = std::move(target.callbacks);
             runtime_.sorts = std::move(target.sorts);
-            exceptions_.stack = std::move(target.exceptions);
+            exceptions_.stack = std::move(target.exceptions);sync_msvc_uncaught(memory);
             if (switching) {
                 runtime_.fls_values = target.fls_values;
                 runtime_.tls_values = target.tls_values;
@@ -3208,6 +3244,7 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory, bool cont
         next = std::min(next, memory_resource_poll_deadline_);
         next = std::min(next, etw_next_deadline());
         next = std::min(next, machine_shutdown_deadline());
+        next = std::min(next, gui_caret_deadline());
         for (const auto &[id, track] : gui_.mouse_tracking) {
             const auto thread = threads_.items.find(id);
             if ((track.flags & 1) && thread != threads_.items.end() && thread->second.status == ThreadStatus::Waiting &&
@@ -3287,9 +3324,9 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory, bool cont
         const auto file_deadline=file_io_poll_deadline(gui_polling ? nullptr : wake.get());
         if(file_deadline)next=std::min(next,*file_deadline);
         const bool external_wait =
-            debugger_attached() || suspended_wait || policy_wait || media_foundation_waiting() || midi_input_waiting() || midi_output_waiting() || wave_output_waiting() || dsound_waiting() ||
+            debugger_attached() || suspended_wait || policy_wait || media_foundation_waiting() || midi_input_waiting() || midi_output_waiting() || wave_output_waiting() || dsound_waiting() || xaudio_waiting() ||
             wasapi_waiting() || directmusic_waiting() || dinput_waiting() || processes_waiting() || http_waiting() || bluetooth_waiting() || winusb_waiting() || wlan_waiting() ||
-            shared_wait || remote_family_waiting() || perflib_remote_waiting() || remote_thread_creations_waiting() ||
+            shared_wait || remote_family_waiting() || remote_gui_messages_waiting() || perflib_remote_waiting() || remote_thread_creations_waiting() ||
             std::any_of(threads_.items.begin(), threads_.items.end(),
                         [](const auto &item) {
                             return item.second.status == ThreadStatus::Waiting &&
@@ -3306,7 +3343,7 @@ void WindowsServices::schedule(GuestState &state, GuestMemory &memory, bool cont
             !runtime_.network.resolvers.empty() || !runtime_.network.pending_lookups.empty() || !runtime_.network.pending_accepts.empty() ||
             !runtime_.network.pending_socket_io.empty() || !gui_.socket_watches.empty() || !file_deadline ||
             !change_notifications_.empty() || address_notification_waiting() ||
-            (!registry_file_.empty() && !registry_notifications_.empty()) || !guest_service_waits_.empty();
+            (!registry_file_.empty() && (!registry_notifications_.empty() || printer_form_notifications_waiting())) || !guest_service_waits_.empty();
         if (runtime_.host_clock && external_wait && external_wait_spin_ticks()) {
             if (!spin_deadline)
                 spin_deadline = runtime_.clock_ticks + external_wait_spin_ticks();
@@ -3395,7 +3432,7 @@ std::optional<std::uint32_t> WindowsServices::force_finish_thread(GuestState &st
     runtime_.tls_values.fill(0);
     thread.apcs.clear();
     thread.wait = {};
-    exceptions_.stack.clear();
+    exceptions_.stack.clear();sync_msvc_uncaught(memory);
     (void)revoke_com_classes(memory, id, false);
     (void)retire_com_context(state, memory, id, false);
     (void)retire_com_error(state, memory, id, false);
@@ -3701,6 +3738,10 @@ std::uint64_t WindowsServices::create_guest_thread(const GuestState &state, Gues
             thread.desktop_handle = parent->second.desktop_handle;
         thread.affinity = runtime_.process_affinity;
         thread.context.segments = state.segments;
+        // Windows 使用者執行緒的初始浮點狀態：x87 控制字 0x27F（53 位精度、例外全遮罩）、MXCSR 0x1F80；
+        // 不繼承建立者，也不是 FNINIT 的 0x37F。帶 CONTEXT 的外部堆疊路徑在下方改用呼叫者提供的狀態。
+        thread.context.x87_control = 0x027f;
+        thread.context.mxcsr = 0x1f80;
         thread.teb = base;
         thread.errno_cell = base + (x86_?0x3ff0:GUEST_CRT_ERRNO_OFFSET);
         thread.exception_area = base + 0x10000;
@@ -3802,6 +3843,44 @@ bool WindowsServices::dispatch_user_apc(GuestState &state, GuestMemory &memory, 
     start_callbacks(state, memory, {std::move(callback)}, Continuation::UserApc, completion);
     return true;
 }
+void WindowsServices::publish_once_cache(GuestMemory& memory,std::uint64_t address,const OnceInitialization& once) {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_AOT_ONCE_LOWERING");return !value || std::string_view(value)!="0";}();
+    static_assert(X64ARM_ONCE_CACHE_POINTER_OFFSET>=(X64ARM_TLS_SLOTS+7)/8);
+    static_assert((X64ARM_ONCE_CACHE_COUNT&(X64ARM_ONCE_CACHE_COUNT-1))==0);
+    static_assert(X64ARM_ONCE_CACHE_POINTER_OFFSET+8<=GuestMemory::guest_page_size);
+    static_assert(X64ARM_ONCE_CACHE_BYTES<=65536);
+    if(!enabled || x86_ || !guest_tls_bitmap_.value)return;
+    const auto pointer=GuestAddress{guest_tls_bitmap_.value+X64ARM_ONCE_CACHE_POINTER_OFFSET};
+    auto table=memory.load(pointer,64);
+    if(table==1)return;
+    if(!table){
+        if(!once.complete || once.owner)return;
+        // 沿用既有 heap 的清零、容量、映射與程序生命週期，不另建資源管理。
+        // 配置失敗停用鏡像，API 的成功／失敗及 LastError 不受加速表影響。
+        table=allocate_heap(memory,X64ARM_ONCE_CACHE_BYTES);
+        memory.atomic_rmw(pointer,64,GuestMemory::AtomicRmw::Exchange,table?table:1);
+        if(!table)return;
+    }
+    const auto word=address>>3;
+    const auto index=(word^(word>>X64ARM_ONCE_CACHE_BITS))&(X64ARM_ONCE_CACHE_COUNT-1);
+    const auto slot=table+index*X64ARM_ONCE_CACHE_STRIDE;
+    const auto tag=memory.load(GuestAddress{slot},64);
+    if(!once.complete || once.owner){
+        if(tag==address)memory.atomic_rmw(GuestAddress{slot},64,GuestMemory::AtomicRmw::Exchange,0);
+        return;
+    }
+    const auto value=once.context|UINT64_C(2);
+    if(tag==address && memory.load(GuestAddress{slot+8},64)==value)return;
+    static const bool trace=[] {const auto* value=std::getenv("X64ARM_AOT_ONCE_CACHE_TRACE");return value && std::string_view(value)=="1";}();
+    if(trace)std::fprintf(stderr,"[once-cache-miss] object=%llx previous=%llx\n",
+                         static_cast<unsigned long long>(address),static_cast<unsigned long long>(tag));
+    // 協調者是唯一寫入者。先撤銷 tag，發布完整 context，最後再發布物件身分。
+    // 快路徑還須比較物件字組，碰撞、重設與不同世代不能拿到舊 context。
+    memory.atomic_rmw(GuestAddress{slot},64,GuestMemory::AtomicRmw::Exchange,0);
+    memory.atomic_rmw(GuestAddress{slot+8},64,GuestMemory::AtomicRmw::Exchange,value);
+    memory.atomic_rmw(GuestAddress{slot},64,GuestMemory::AtomicRmw::Exchange,address);
+}
+
 std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, GuestMemory &memory,
                                                             const WindowsServiceDescriptor &service) {
     if(service.symbol=="Beep")return invoke_wave_output(state,memory,service);
@@ -4301,11 +4380,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             if (once.owner || has_waiters())
                 throw HostCallFault("不可直接重設使用中的 INIT_ONCE");
             once = {};
+            publish_once_cache(memory,address,once);
         }
         if (symbol == "InitOnceInitialize") {
             if (once.owner || has_waiters())
                 throw HostCallFault("不可重設使用中的 INIT_ONCE");
             once = {};
+            publish_once_cache(memory,address,once);
             memory.store(GuestAddress{address}, once_width, 0);
         } else if (symbol == "InitOnceExecuteOnce") {
             if (arg(3))
@@ -4322,6 +4403,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 else {
                     memory.store(GuestAddress{context}, 64, 0);
                     once.owner = threads_.current;
+                    publish_once_cache(memory,address,once);
                     memory.store(GuestAddress{address}, once_width, 1);
                     threads_.items.at(threads_.current).wait = {};
                     start_callbacks(state, memory, {{arg(1), {address, arg(2), context}}}, Continuation::InitOnce,
@@ -4353,6 +4435,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 fail(31);
             else if (!once.owner) {
                 once.owner = threads_.current;
+                publish_once_cache(memory,address,once);
                 memory.store(GuestAddress{address}, once_width, 1);
                 memory.store(GuestAddress{arg(2)}, 32, 1);
                 if (arg(3))
@@ -4384,6 +4467,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 result = 1;
             }
         }
+        publish_once_cache(memory,address,once);
     } else if (symbol == "SetFileCompletionNotificationModes") {
         if(const auto value=invoke_native_file_completion(state,memory,service)){arg.return_to(state,*value);return std::nullopt;}
         if(const auto error=set_file_completion_modes(arg(0),static_cast<std::uint8_t>(arg(1))))fail(error);
@@ -4951,10 +5035,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 else if (!--mutex.recursion)
                     mutex.owner = 0;
             } else if (object.kind == WaitObject::Kind::Semaphore) {
-                if (object.count == object.maximum)
-                    error = 298;
-                else
-                    ++object.count;
+                error = object.release_semaphore(1);
             } else
                 object.set_signal(true);
             if (error) {

@@ -206,7 +206,22 @@ MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDesc
     const auto input_bytes=vertices*d.instances*vs.output_varyings.size()*16,output_bytes=output_vertices*gs.output_varyings.size()*16;
     if(vertices>UINT32_MAX || output_vertices>UINT32_MAX || input_bytes>512*1024*1024 || output_bytes>512*1024*1024)throw std::bad_alloc{};
     const auto count_bytes=std::uint64_t{primitives}*d.instances*4;auto lease=reserve_gpu_memory(input_bytes+output_bytes+count_bytes);
-    auto inputs=[device_ newBufferWithLength:input_bytes options:MTLResourceStorageModePrivate];auto outputs=[device_ newBufferWithLength:output_bytes options:gs.stream_output.empty()?MTLResourceStorageModePrivate:MTLResourceStorageModeShared];auto counts=[device_ newBufferWithLength:count_bytes options:MTLResourceStorageModeShared];
+    // 幾何暫存 buffer 每次繪製都新建的成本很高（AGXBuffer／IOGPUResourceCreate）。
+    // 依儲存模式分池、長度捨入到 2 的冪後重用；持有者掛在本批次的待釋放清單，批次完成才歸還池，在途期間不重用。
+    // 內容不需清零：capture 只寫被引用的頂點、GS 只讀被引用的頂點，counts 與 results 每格都由 compute 寫入。X64ARM_METAL_GEOMETRY_POOL=0 關閉。
+    static const bool geometry_pool=[] {const auto* value=std::getenv("X64ARM_METAL_GEOMETRY_POOL");return !value || std::string_view(value)!="0";}();
+    const auto scratch=[&](std::uint64_t bytes,bool shared)->id<MTLBuffer> {
+        const auto options=shared?MTLResourceStorageModeShared:MTLResourceStorageModePrivate;
+        if(!geometry_pool)return [device_ newBufferWithLength:bytes options:options];
+        const auto length=std::max<std::uint64_t>(4096,std::bit_ceil(std::max<std::uint64_t>(bytes,1)));
+        const auto& pool=shared?geometry_shared_pool_:geometry_private_pool_;
+        id<MTLBuffer> buffer=pool->take(static_cast<std::size_t>(length));
+        if(!buffer)buffer=[device_ newBufferWithLength:length options:options];
+        if(!buffer)return nil;
+        auto holder=std::make_shared<MetalPooledBuffer>();holder->buffer=buffer;holder->pool=pool;graphics_pending_.push_back(holder);
+        return buffer;
+    };
+    auto inputs=scratch(input_bytes,false);auto outputs=scratch(output_bytes,!gs.stream_output.empty());auto counts=scratch(count_bytes,true);
     if(!inputs || !outputs || !counts)throw std::bad_alloc{};pending_leases_.push_back(std::move(lease));
     begin_commands(true,"geometry");auto pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.renderTargetWidth=1;pass.renderTargetHeight=1;pass.defaultRasterSampleCount=1;pass.renderTargetArrayLength=1;
     auto capture=[commands_ renderCommandEncoderWithDescriptor:pass];MetalEncoderScope capture_scope{capture};if(!capture)throw std::runtime_error("幾何 capture encoder 建立失敗");[capture setRenderPipelineState:p->capture];

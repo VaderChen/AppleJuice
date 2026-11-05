@@ -342,7 +342,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_tree_selection(GuestSta
 }
 void WindowsServices::discard_gui_control(std::uint64_t token){
     const auto found=gui_.control_operations.find(token);if(found==gui_.control_operations.end())return;
-    if(found->second.clipboard_opened && gui_.clipboard_open_thread==found->second.thread){gui_.clipboard_open_thread=gui_.clipboard_open_window=0;if(gui_.clipboard_dirty)notify_clipboard();}
+    if(found->second.clipboard_opened && gui_.clipboard_open_thread==found->second.thread){(void)clipboard_notice(ClipboardNoticeAction::Close,0,found->second.thread);gui_.clipboard_open_thread=gui_.clipboard_open_window=0;if(gui_.clipboard_dirty)notify_clipboard();}
     if(found->second.calendar && found->second.calendar->callback_active){const auto window=gui_.windows.find(found->second.message.window);if(window!=gui_.windows.end() && window->second.calendar && window->second.calendar->callback_depth)--window->second.calendar->callback_depth;}
     if(found->second.header && found->second.header->filter_buffer)gui_.control_notification_buffers.push_back(found->second.header->filter_buffer);
     if(found->second.header && found->second.header->drag_image){const auto& paint=*found->second.header;

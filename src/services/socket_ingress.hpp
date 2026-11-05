@@ -89,6 +89,7 @@ inline ssize_t socket_receive_buffer(const NativeSocket& socket,void* bytes,std:
 }
 // Deferred 是內部有界工作／鎖競爭，呼叫者必須協同重試，不能當成完整空快照。
 inline bool socket_readiness(const NativeSocket& socket,pollfd& entry)try{
+    if((entry.events&POLLIN) && !socket.deferred_accepts.empty())entry.revents|=POLLIN;
     if(socket.type!=SOCK_DGRAM || !(entry.events&POLLIN))return false;
     // 原生 socket 沒有資料，且共享佇列狀態檔自上次完整檢查後沒有變動（其他程序放入資料報必經 pwrite 而改變 mtime）時，
     // 直接沿用上次的空／可讀結果，不取跨程序紀錄鎖、不讀佇列標頭。標記在完整檢查之前取得：檢查期間的寫入只會讓下一次重查。

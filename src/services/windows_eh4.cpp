@@ -12,29 +12,44 @@ std::uint32_t frame_offset(std::uint32_t ebp,std::int32_t offset) {
 }
 struct Scope {std::int32_t parent;std::uint32_t filter,handler;};
 Scope scope(const GuestMemory& memory,const Eh4Operation& operation,std::int32_t level) {
-    if(level<0 || level>=4096)throw HostCallFault("Win32 SEH scope 索引不合法或超過 4096");
-    const auto at=static_cast<std::uint64_t>(operation.scope)+operation.scope_header+static_cast<unsigned>(level)*12;
-    if(at>UINT32_MAX-11)throw HostCallFault("Win32 SEH scope 位址溢位");
-    Scope entry{signed_dword(memory,at),dword(memory,at+4),dword(memory,at+8)};
+    if(level<0 || static_cast<unsigned>(level)>=operation.scope_count)throw HostCallFault("Win32 unwind scope 索引不合法");
+    const auto width=operation.cxx_unwind?8U:12U;
+    const auto at=static_cast<std::uint64_t>(operation.scope)+operation.scope_header+static_cast<unsigned>(level)*width;
+    if(at>UINT32_MAX-(width-1))throw HostCallFault("Win32 unwind scope 位址溢位");
+    Scope entry{signed_dword(memory,at),operation.cxx_unwind?0:dword(memory,at+4),dword(memory,at+width-4)};
     if(entry.parent!=operation.root_level && (entry.parent<0 || entry.parent>=level))throw HostCallFault("Win32 SEH scope 未向外層推進");
     return entry;
 }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_eh4(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     if(!x86_)throw HostCallFault("EH3／EH4 registration handler 僅適用 Win32");
-    const WindowsCall arg(state,memory,service);Eh4Operation operation;operation.entry=state;
-    operation.local_only=service.symbol=="_local_unwind2" || service.symbol=="_seh_longjmp_unwind";
+    Eh4Operation operation;operation.entry=state;operation.cxx_unwind=service.symbol=="__CxxLongjmpUnwind";
+    operation.callee_cleanup=operation.cxx_unwind || service.symbol=="_seh_longjmp_unwind";
+    const WindowsCall arg(state,memory,service.arguments,operation.callee_cleanup);
+    operation.local_only=operation.cxx_unwind || service.symbol=="_local_unwind2" || service.symbol=="_seh_longjmp_unwind";
     operation.legacy3=service.symbol!="_except_handler4_common";operation.arguments=service.arguments;
     const unsigned start=operation.legacy3?0:2;
     if(operation.legacy3){operation.root_level=-1;operation.scope_header=0;operation.level=operation.parent=operation.target=-1;}
     else{operation.cookie=static_cast<std::uint32_t>(arg(0));operation.checker=static_cast<std::uint32_t>(arg(1));}
     if(operation.local_only){
-        if(service.symbol=="_seh_longjmp_unwind"){
+        if(operation.cxx_unwind || service.symbol=="_seh_longjmp_unwind"){
             memory.check(GuestAddress{arg(0)},64,Access::Read);operation.frame=dword(memory,arg(0)+24);operation.target=signed_dword(memory,arg(0)+28);
         }else{operation.frame=static_cast<std::uint32_t>(arg(0));operation.target=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(1)));}
-        if(operation.frame==UINT32_MAX){arg.return_to(state,0);return std::nullopt;}
+        if(operation.cxx_unwind){
+            // _setjmp3 的 UnwindData[0] 是 x86 FuncInfo 絕對位址，並非 Win64 RVA。
+            const auto info=dword(memory,arg(0)+40);const auto* image=module_image(info,true);
+            if(!image || info<image->base || info-image->base>image->size || image->size-(info-image->base)<12)
+                throw HostCallFault("Win32 C++ longjmp 的 FuncInfo 不在所屬映像內");
+            const auto magic=dword(memory,info)&0x1fffffffU;
+            if(magic<0x19930520U || magic>0x19930522U)throw HostCallFault("Win32 C++ longjmp 的 FuncInfo 版本不合法");
+            operation.scope_count=dword(memory,info+4);operation.scope=dword(memory,info+8);
+            const auto bytes=static_cast<std::uint64_t>(operation.scope_count)*8;
+            if(operation.scope_count>65536 || (bytes && (operation.scope<image->base || operation.scope-image->base>image->size || bytes>image->size-(operation.scope-image->base))))
+                throw HostCallFault("Win32 C++ longjmp 的 unwind map 超出映像");
+            if(bytes)memory.check(GuestAddress{operation.scope},bytes,Access::Read);
+        }else if(operation.frame==UINT32_MAX){arg.return_to(state,0);return std::nullopt;}
         operation.unwinding=true;operation.disposition=0;
-        if(operation.target<operation.root_level || operation.target>=4096)throw HostCallFault("Win32 local unwind 終止索引不合法");
+        if(operation.target<operation.root_level || (operation.target>=0 && static_cast<unsigned>(operation.target)>=operation.scope_count))throw HostCallFault("Win32 local unwind 終止索引不合法");
     }else{
         operation.record=static_cast<std::uint32_t>(arg(start));operation.frame=static_cast<std::uint32_t>(arg(start+1));
         operation.context=static_cast<std::uint32_t>(arg(start+2));operation.dispatcher=static_cast<std::uint32_t>(arg(start+3));
@@ -47,9 +62,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_eh4(GuestState& state,Guest
     if(!operation.local_only)memory.check(GuestAddress{operation.record},80,Access::Read);
     if(operation.context || !operation.legacy3)memory.check(GuestAddress{operation.context},716,Access::Read);
     if(!operation.local_only && dword(memory,operation.record+16)>15)throw HostCallFault("Win32 EH4 例外參數過多");
-    operation.ebp=operation.frame+16;operation.scope=dword(memory,operation.frame+8);
+    operation.ebp=operation.frame+(operation.cxx_unwind?12:16);
+    if(!operation.cxx_unwind)operation.scope=dword(memory,operation.frame+8);
     if(!operation.legacy3){operation.scope^=dword(memory,operation.cookie);memory.check(GuestAddress{operation.scope},16,Access::Read);}
-    operation.level=signed_dword(memory,operation.frame+12);
+    operation.level=signed_dword(memory,operation.frame+(operation.cxx_unwind?8:12));
+    if(operation.cxx_unwind && (operation.level<operation.target || (operation.level>=0 && static_cast<unsigned>(operation.level)>=operation.scope_count)))
+        throw HostCallFault("Win32 C++ longjmp 的目前 state 不合法");
     if(!operation.local_only)operation.unwinding=(dword(memory,operation.record+4)&0x66U)!=0;
     const auto sp=state.reg(Gpr::Rsp);
     if(sp<low+32ULL)throw HostCallFault("Win32 EH4 callback 堆疊不足");
@@ -84,14 +102,14 @@ std::optional<std::uint32_t> WindowsServices::resume_eh4(GuestState& state,Guest
         return callback(std::move(checks));
     };
     const auto finish=[&]() -> std::optional<std::uint32_t> {
-        const auto saved=operation.entry;const auto value=operation.disposition;const auto arguments=operation.arguments;
+        const auto saved=operation.entry;const auto value=operation.disposition;const auto arguments=operation.arguments;const auto cleanup=operation.callee_cleanup;
         runtime_.eh4_operations.erase(token);state=saved;
-        WindowsCall(state,memory,WindowsServiceDescriptor{"crt","SEH scope continuation",arguments}).return_to(state,value);return std::nullopt;
+        WindowsCall(state,memory,arguments,cleanup).return_to(state,value);return std::nullopt;
     };
     try {
         // steps == 0 代表新進入，還沒有排程 cookie callback。
         if(!operation.steps++)return cookies(Eh4Operation::AfterCookies::Walk);
-        if(operation.steps>8192)throw HostCallFault("Win32 EH4 callback 過多");
+        if(operation.steps>2ULL*operation.scope_count+16)throw HostCallFault("Win32 unwind callback 過多");
         if(operation.phase==Eh4Operation::Phase::Cookies) {
             if(operation.after_cookies==Eh4Operation::AfterCookies::Return)return finish();
             if(operation.after_cookies==Eh4Operation::AfterCookies::Transfer) {
@@ -103,7 +121,7 @@ std::optional<std::uint32_t> WindowsServices::resume_eh4(GuestState& state,Guest
                 if(copy.exception_depth) {
                     if(copy.exception_depth>exceptions_.stack.size())throw HostCallFault("Win32 EH4 catch 例外深度不合法");
                     leave_x86_exception_handler(memory,exceptions_.stack[copy.exception_depth-1]);
-                    discard_callbacks(copy.callback_depth,state,memory);exceptions_.stack.resize(copy.exception_depth-1);
+                    discard_callbacks(copy.callback_depth,state,memory);exceptions_.stack.resize(copy.exception_depth-1);sync_msvc_uncaught(memory);
                 }
                 runtime_.eh4_operations.erase(token);state=restored;state.reg(Gpr::Rbp)=copy.ebp;state.reg(Gpr::Rsp)=sp;state.rip=GuestAddress{copy.handler};return std::nullopt;
             }
@@ -116,15 +134,19 @@ std::optional<std::uint32_t> WindowsServices::resume_eh4(GuestState& state,Guest
             }
             operation.level=operation.parent;
         } else if(operation.phase==Eh4Operation::Phase::GlobalUnwind || operation.phase==Eh4Operation::Phase::Finally) {
-            operation.level=signed_dword(memory,operation.frame+12);
+            operation.level=signed_dword(memory,operation.frame+(operation.cxx_unwind?8:12));
         }
         const bool local_unwind=operation.unwinding || operation.phase==Eh4Operation::Phase::GlobalUnwind || operation.phase==Eh4Operation::Phase::Finally;
         while(operation.level!=operation.root_level && (!local_unwind || operation.level!=operation.target)) {
-            if(++operation.steps>8192)throw HostCallFault("Win32 EH4 scope 鏈過長");
+            if(++operation.steps>2ULL*operation.scope_count+16)throw HostCallFault("Win32 unwind scope 鏈過長");
             const auto entry=scope(memory,operation,operation.level);operation.parent=entry.parent;
             if(local_unwind) {
-                memory.store(GuestAddress{operation.frame+12},32,static_cast<std::uint32_t>(entry.parent));operation.level=entry.parent;
-                if(!entry.filter) {operation.phase=Eh4Operation::Phase::Finally;operation.called=true;return callback({{entry.handler,{}}});}
+                memory.store(GuestAddress{operation.frame+(operation.cxx_unwind?8:12)},32,static_cast<std::uint32_t>(entry.parent));operation.level=entry.parent;
+                if(!entry.filter && (!operation.cxx_unwind || entry.handler)) {
+                    operation.phase=Eh4Operation::Phase::Finally;operation.called=true;GuestCallback action{entry.handler,{}};
+                    if(operation.cxx_unwind)action.exception_policy=GuestExceptionPolicy::NoexceptCpp;
+                    return callback({std::move(action)});
+                }
             } else {
                 if(entry.filter) {operation.phase=Eh4Operation::Phase::Filter;operation.called=true;return callback({{entry.filter,{}}});}
                 operation.level=entry.parent;

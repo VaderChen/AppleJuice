@@ -1,5 +1,6 @@
 #pragma once
 #include "x64arm/windows_com_marshal.hpp"
+#include "x64arm/windows_com_agile.hpp"
 #include "x64arm/process_io.hpp"
 #include "x64arm/certificates.hpp"
 #include "x64arm/http.hpp"
@@ -65,6 +66,8 @@ struct RuntimeFunctionTable {
     std::uint32_t count{};
     std::uint32_t capacity{};
     std::uint64_t handle{};
+    std::uint64_t identifier{},callback{},context{};
+    std::u16string out_of_process_callback;
     bool operator==(const RuntimeFunctionTable&) const = default;
 };
 enum class MsvcExceptionKind : unsigned { BadCast,BadTypeid,NonRtti,Exception,BadAlloc,BadFunction,LogicError,LengthError,OutOfRange,RuntimeError,RegexError,InvalidArgument,OverflowError,SystemError,IosFailure,BadException,FutureError,ImproperLock,Count };
@@ -81,12 +84,12 @@ struct Eh4Operation {
     std::uint64_t pointers{};
     std::int32_t level{-2}, parent{-2}, target{-2};
     // EH3 沒有 cookie header，scope 鏈以 -1 結束；EH4 使用 16-byte header 與 -2。
-    std::int32_t root_level{-2};unsigned scope_header{16};
+    std::int32_t root_level{-2};unsigned scope_header{16},scope_count{4096};
     unsigned arguments{6};
     std::uint32_t disposition{1};
     std::size_t exception_depth{}, callback_depth{};
     unsigned steps{};
-    bool unwinding{}, called{},legacy3{},local_only{};
+    bool unwinding{}, called{},legacy3{},local_only{},cxx_unwind{},callee_cleanup{};
     bool operator==(const Eh4Operation&) const = default;
 };
 struct CrtJumpOperation {
@@ -126,7 +129,7 @@ struct ModuleOperation {
     std::uint32_t thread_exit_code{};
     bool operator==(const ModuleOperation&) const = default;
 };
-enum class Continuation { ComBindOperation, D3DXProgressOperation, D3DCompileOperation, Msvcp100Operation, UnwindConsolidate, CrtAssertion, CrtFatalDialog, GuiMouseInput, GuiMoveSize, ThemeTextOperation, MdiMoveOperation, StorageOperation, StorageCopyOperation, GuiGrayString, ComOperation, AutomationOperation, DirectInputEnumeration, StackWalkOperation, DemangleOperation, Eh4Operation, GuiAsyncSend, GuiAsyncCallback, GuiWaitMessage, DWriteOperation, CrtNewResult, CrtNewRetry, CrtInvalidNewMode, GuiSendTimeout, AccessibleOperation, SafeArrayOperation, OleStreamCopy, PrintAbort, UnhandledFilter, FiberDelete, UserApc, GuiIntegerText, WindowEnumeration, LocaleEnumeration, RegistryBooleanResult, ResourceEnumeration, MetafileEnumeration, GuiWinEvent, FileTransfer, ReturnUntilFalse, Return, Startup, InitTermE, Exit, ThreadExit, ReturnCallback, Exception, ContinueException, SehFilter, GuiNcCreate, GuiCreate, GuiDialogInit, GuiModalInit, GuiModalDispatch, GuiModalEnd, GuiDestroy, GuiDestroyDefault, GuiMenuInit, GuiMenuFinish, GuiSentMessage, GuiControlOperation, CrtExit, Sort, OleVariantClear, OleVariantCopy, ModuleOperation, OleReleaseStgMedium, MsvcCopy, MsvcUnwind, MsvcCatch, MsvcDestroy, GuiWindowPos, GuiWindowNcCalc, GuiHook, GuiMsgFilterSystem, GuiModalSystemFilter, GuiModalFilter, GuiCbtCreate, GuiCreationNcCreate, GuiCreationNcCalc, GuiCreationCreate, GuiCreationFinish, GuiCreationAbort, GuiDialogProc, GuiBusyHook, GuiBusyResult, OleClipboardOperation, GuiPropertySheet, GuiCbtAction, FontEnumeration, OnExitTable, InitOnce, RegisteredWait, ReturnCallbackFreeHeap, NtCloseResult, ReturnZeroFreeHeap, CertificateDecodeAllocation, CertificateFind, SymbolFunctionEntry, MiniDumpOperation, EtwCallback, EtwProcess, WinrtOperation, NativeV8Operation, NativeOperation, TypeLibraryInvoke, TypeLibraryAddress, PrintDialogOperation, PrintPropertyPageOperation, ShellItemOperation, ComMarshalOperation, OleDragLoop, OleDragTarget, ComProxyDispatch, ComErrorSet, ComErrorRetire, RestrictedError, WinrtOriginSetup, WinrtOriginFinish, GuiDragDetection, ComContextOperation, MediaFoundationQuery, InitTerm, ReturnUntilFailure, ServiceMain, ServiceControl, GuiTextThunk, BeepTone, PolicyRetry, OlePersistence, CrtLongjmp, ComRotOperation, PerflibOperation, MciWait, ConsoleControl, TaskDialogOperation, DdeOperation, ComSpyOperation, GdiplusStream, FontPackage, WinUsbTransfer, WinUsbOverlapped, KernelRequest, SehFinally, MsiOperation, EsentOperation, NestedResult, MonitorEnumeration };
+enum class Continuation { GuiClipboardNotification, GuiBeginPaint, SocketAccept, ComAgileOperation, FunctionTableLookup, ExceptionFunctionLookup, CapturePreviousContext, GuiOpenIcon, ComBindOperation, D3DXProgressOperation, D3DCompileOperation, Msvcp100Operation, UnwindConsolidate, CrtAssertion, CrtFatalDialog, GuiMouseInput, GuiMoveSize, ThemeTextOperation, MdiMoveOperation, StorageOperation, StorageCopyOperation, GuiGrayString, ComOperation, AutomationOperation, DirectInputEnumeration, StackWalkOperation, DemangleOperation, Eh4Operation, GuiAsyncSend, GuiAsyncCallback, GuiWaitMessage, DWriteOperation, CrtNewResult, CrtNewRetry, CrtInvalidNewMode, GuiSendTimeout, AccessibleOperation, SafeArrayOperation, OleStreamCopy, PrintAbort, UnhandledFilter, FiberDelete, UserApc, GuiIntegerText, WindowEnumeration, LocaleEnumeration, RegistryBooleanResult, ResourceEnumeration, MetafileEnumeration, GuiWinEvent, FileTransfer, ReturnUntilFalse, Return, Startup, InitTermE, Exit, ThreadExit, ReturnCallback, Exception, ContinueException, SehFilter, GuiNcCreate, GuiCreate, GuiDialogInit, GuiModalInit, GuiModalDispatch, GuiModalEnd, GuiDestroy, GuiDestroyDefault, GuiMenuInit, GuiMenuFinish, GuiSentMessage, GuiControlOperation, CrtExit, Sort, OleVariantClear, OleVariantCopy, ModuleOperation, OleReleaseStgMedium, MsvcCopy, MsvcUnwind, MsvcCatch, MsvcDestroy, GuiWindowPos, GuiWindowNcCalc, GuiHook, GuiMsgFilterSystem, GuiModalSystemFilter, GuiModalFilter, GuiCbtCreate, GuiCreationNcCreate, GuiCreationNcCalc, GuiCreationCreate, GuiCreationFinish, GuiCreationAbort, GuiDialogProc, GuiBusyHook, GuiBusyResult, OleClipboardOperation, GuiPropertySheet, GuiCbtAction, FontEnumeration, OnExitTable, InitOnce, RegisteredWait, ReturnCallbackFreeHeap, NtCloseResult, ReturnZeroFreeHeap, CertificateDecodeAllocation, CertificateFind, SymbolFunctionEntry, MiniDumpOperation, EtwCallback, EtwProcess, WinrtOperation, NativeV8Operation, NativeOperation, TypeLibraryInvoke, TypeLibraryAddress, PrintDialogOperation, PageSetupStart, PageSetupResult, PageSetupHook, PageSetupPaint, PrintPropertyPageOperation, ShellItemOperation, ComMarshalOperation, OleDragLoop, OleDragTarget, ComProxyDispatch, ComErrorSet, ComErrorRetire, RestrictedError, WinrtOriginSetup, WinrtOriginFinish, GuiDragDetection, ComContextOperation, MediaFoundationQuery, InitTerm, ReturnUntilFailure, ServiceMain, ServiceControl, GuiTextThunk, BeepTone, PolicyRetry, OlePersistence, CrtLongjmp, ComRotOperation, PerflibOperation, MciWait, ConsoleControl, TaskDialogOperation, DdeOperation, ComSpyOperation, GdiplusStream, FontPackage, WinUsbTransfer, WinUsbOverlapped, KernelRequest, SehFinally, MsiOperation, EsentOperation, NestedResult, MonitorEnumeration, GuiRetrievedMessage };
 struct GuiHookFrame {
     std::vector<std::uint64_t> handles,scratch;
     std::size_t index{};
@@ -148,6 +151,8 @@ struct CallbackFrame {
     std::uint32_t user_seh_boundary{UINT32_MAX};
     std::uint64_t initializer_next{}, initializer_end{};
     std::optional<GuestState> unwind_target{};
+    std::uint64_t gui_erase_window{};
+    std::optional<std::vector<std::array<std::int32_t,4>>> gui_erase_clip;
     bool operator==(const CallbackFrame&) const = default;
 };
 struct CrtIoLock {
@@ -225,6 +230,13 @@ struct WaitObject {
     // 資源條件由本輪同一份全系統 snapshot 更新；不把另一程序不同時間的半組
     // 低／高訊號混成可同時滿足的 WaitAll。shared event 僅提供傳輸生命週期與喚醒。
     bool signaled()const noexcept{return kind==Kind::MemoryResource?count!=0:shared_event?shared_event->signaled():count!=0;}
+    std::uint32_t available_count()const noexcept{return shared_event?shared_event->count():count;}
+    std::uint32_t release_semaphore(std::uint32_t increment,std::uint32_t* previous=nullptr,bool saturate=false){
+        if(shared_event)return shared_event->release(increment,previous,saturate);
+        if(!increment || increment>INT32_MAX)return 87;
+        if(increment>maximum-count){if(!saturate)return 298;increment=maximum-count;}
+        if(previous)*previous=count;count+=increment;return 0;
+    }
     void set_signal(bool value){if(kind==Kind::MemoryResource)count=value?1U:0U;if(shared_event)shared_event->set(value);else count=value?1U:0U;}
     void consume_signal()noexcept{if(kind==Kind::MemoryResource)return;if(shared_event)shared_event->consume_locked();else if(!manual_reset && count)--count;}
     bool operator==(const WaitObject&) const = default;
@@ -525,9 +537,11 @@ struct RuntimeState {
     const WaitObject& wait_state(const WaitObject& object)const{return object.identity?wait_states.at(object.identity):object;}
     bool wait_signaled(const WaitObject& object,const std::vector<std::uint64_t>& handles,bool all)const {
         const auto& signal=wait_state(object);if(!signal.signaled())return false;
-        if(all && signal.kind==WaitObject::Kind::Semaphore && object.identity){
-            std::uint32_t required=0;for(auto handle:handles){const auto entry=wait_objects.find(handle);if(entry!=wait_objects.end() && entry->second.identity==object.identity)++required;}
-            return signal.count>=required;
+        if(all && signal.kind==WaitObject::Kind::Semaphore){
+            std::uint32_t required=0;for(auto handle:handles){const auto entry=wait_objects.find(handle);if(entry==wait_objects.end() || entry->second.kind!=WaitObject::Kind::Semaphore)continue;
+                const auto& other=wait_state(entry->second);
+                if((object.identity && entry->second.identity==object.identity) || &other==&signal || (signal.shared_event && other.shared_event && signal.shared_event->same_object(*other.shared_event)))++required;}
+            return signal.available_count()>=required;
         }
         return true;
     }
@@ -535,7 +549,7 @@ struct RuntimeState {
     std::map<std::uint64_t,std::pair<std::vector<std::string>,std::size_t>> volume_mount_searches;
     std::map<std::uint64_t, MutexObject> mutex_objects;
     int wait_lock_descriptor(const WaitObject& object)const {
-        if(object.shared_event)return object.shared_event->lock_descriptor();
+        if(const auto& signal=wait_state(object);signal.shared_event)return signal.shared_event->lock_descriptor();
         if(object.kind==WaitObject::Kind::Mutex){const auto& mutex=mutex_objects.at(object.mutex);if(mutex.shared)return mutex.shared->lock_descriptor();}
         return -1;
     }
@@ -702,6 +716,7 @@ struct RuntimeState {
     std::map<std::uint64_t,WinrtModule> winrt_modules;
     std::uint64_t winrt_empty_string{};
     ComMarshalBridge com_marshal;
+    ComAgileBridge com_agile;
     ComContextBridge com_contexts;
     ComBindBridge com_bind;
     ComRotBridge com_rot;

@@ -7,6 +7,9 @@
 #include "crt_library.hpp"
 #include "pe_signature.hpp"
 #include "builtin_version.hpp"
+#include "builtin_provider_families.hpp"
+#include "builtin_export_aliases.hpp"
+#include "builtin_constant_exports.hpp"
 #include "windows_nt_entry.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
@@ -64,9 +67,29 @@ struct BuiltinSystemCall {
     std::uint32_t id{};
     std::uint16_t stack_bytes{};
 };
+const auto& builtin_layouts(){
+    static const auto bases=[] {std::set<std::string> names{"kernel32.dll","wsock32.dll"};for(const auto name:modern_crt_libraries)names.emplace(name);for(const auto name:legacy_crt_libraries)names.emplace(name);for(const auto& item:runtime_service_descriptors())if(item.family.ends_with(".dll") || item.family.ends_with(".drv") || item.family.ends_with(".ocx") || item.family.ends_with(".cpl") || item.family.ends_with(".exe"))names.emplace(item.family);
+            for(const auto& alias:detail::service_export_aliases)names.emplace(alias.family);
+            std::map<std::string,std::pair<std::size_t,std::size_t>,std::less<>> exports;
+            for(const auto& item:runtime_service_descriptors()){auto& entry=exports[std::string(item.family)];++entry.first;entry.second+=item.symbol.size()+1;}
+            for(const auto& alias:detail::service_export_aliases){auto& entry=exports[std::string(alias.family)];++entry.first;entry.second+=alias.symbol.size()+1;}
+            std::map<std::string,std::pair<std::size_t,std::size_t>> result;std::size_t next=0;
+            for(const auto& item:names){
+                std::size_t span=1;
+                if(const auto found=exports.find(item);found!=exports.end()){
+                    const auto [count,strings]=found->second;
+                    const auto constants=detail::builtin_constant_exports(item);const auto data_count=constants.size();std::size_t data_names=0;for(const auto& c:constants)data_names+=c.name.size()+1;
+                    const auto bytes=((4096+(data_count?4096:0)+40+(count+data_count)*10+item.size()+1+strings+data_names+4095)&~std::size_t{4095})+((count*16+4095)&~std::size_t{4095})+4096;
+                    span=std::max<std::size_t>(1,(bytes+windows_address_layout::module_stride-1)/windows_address_layout::module_stride);
+                }
+                result.emplace(item,std::pair{next,span});next+=span;
+            }
+            return result;}();
+    return bases;
+}
 BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,const std::map<std::string,std::uint64_t>& targets,const std::map<std::uint64_t,BuiltinSystemCall>& system_calls,std::uint64_t x86_transition) {
     // PE 的 RVA 僅 32 位元；模組內的實際唯讀跳躍入口轉接至既有 API gateway，
-    // 保留所有參數／暫存器與回傳框架。只有真正可呼叫的服務才列為匯出。
+    // 保留所有參數／暫存器與回傳框架；資料匯出另置於唯讀區段。
     std::map<std::uint32_t,std::uint64_t> ordinals;
     std::map<std::uint64_t,std::uint32_t> assigned;
     for(const auto& [symbol,target]:targets)if(symbol.starts_with('#')){
@@ -83,8 +106,15 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
         }
         names.emplace(symbol,found->second);
     }
-    const std::size_t count=ordinals.empty()?0:ordinals.rbegin()->first;
-    constexpr std::size_t nt=0x80,optional=nt+24,edata=4096;
+    const auto constants=detail::builtin_constant_exports(name);std::map<std::uint32_t,std::uint32_t> data_ordinals;
+    for(std::size_t i=0;i<constants.size();++i){
+        while(ordinals.contains(next) || data_ordinals.contains(next))++next;
+        if(next>65535 || (i+1)*8>4096 || names.contains(constants[i].name))throw ModuleError(8,"內建 DLL 常數匯出超過容量或重複");
+        names.emplace(constants[i].name,next);data_ordinals.emplace(next++,detail::builtin_constant_rva+static_cast<std::uint32_t>(i*8));
+    }
+    const std::size_t count=std::max(ordinals.empty()?0:ordinals.rbegin()->first,data_ordinals.empty()?0:data_ordinals.rbegin()->first);
+    constexpr std::size_t nt=0x80,optional=nt+24;
+    const std::size_t edata=constants.empty()?4096:8192;
     const auto functions=edata+40,names_at=functions+count*4,indices=names_at+names.size()*4,dll_name=indices+names.size()*2;
     auto strings_end=dll_name+name.size()+1;for(const auto& [symbol,ordinal]:names){(void)ordinal;strings_end+=symbol.size()+1;}
     const auto resource_at=(strings_end+4095)&~std::size_t{4095};
@@ -93,7 +123,7 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
     const auto size=(code+assigned.size()*16+4095)&~std::size_t{4095};
     BuiltinImage result;result.code=code;result.bytes.resize(size);auto& bytes=result.bytes;
     const auto put=[&](std::size_t offset,unsigned width,std::uint64_t value){for(unsigned i=0;i<width;++i)bytes.at(offset+i)=static_cast<std::uint8_t>(value>>(i*8));};
-    put(0,2,0x5a4d);put(0x3c,4,nt);put(nt,4,0x4550);put(nt+4,2,x86?0x14c:0x8664);put(nt+6,2,assigned.empty()?2:3);
+    put(0,2,0x5a4d);put(0x3c,4,nt);put(nt,4,0x4550);put(nt+4,2,x86?0x14c:0x8664);put(nt+6,2,(assigned.empty()?2:3)+(constants.empty()?0:1));
     put(nt+20,2,x86?224:240);put(nt+22,2,x86?0x2102:0x2022);
     put(optional,2,x86?0x10b:0x20b);put(optional+4,4,size-code);put(optional+8,4,code-4096);put(optional+20,4,code);
     put(optional+(x86?28:24),x86?4:8,base);put(optional+32,4,4096);put(optional+36,4,512);
@@ -106,9 +136,12 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
     const auto section_header=[&](std::size_t at,std::string_view label,std::size_t rva,std::size_t length,std::uint32_t flags){
         std::copy(label.begin(),label.end(),bytes.begin()+static_cast<std::ptrdiff_t>(at));put(at+8,4,length);put(at+12,4,rva);put(at+16,4,length);put(at+20,4,rva);put(at+36,4,flags);
     };
-    section_header(section,".edata",4096,resource_at-4096,0x40000040);
-    section_header(section+40,".rsrc",resource_at,code-resource_at,0x40000040);
-    if(!assigned.empty())section_header(section+80,".text",code,size-code,0x60000020);
+    const auto exports_section=section+(constants.empty()?0U:40U);
+    if(!constants.empty())section_header(section,".rdata",detail::builtin_constant_rva,4096,0x40000040);
+    section_header(exports_section,".edata",edata,resource_at-edata,0x40000040);
+    section_header(exports_section+40,".rsrc",resource_at,code-resource_at,0x40000040);
+    if(!assigned.empty())section_header(exports_section+80,".text",code,size-code,0x60000020);
+    for(std::size_t i=0;i<constants.size();++i)put(detail::builtin_constant_rva+i*8,constants[i].bytes,constants[i].value);
     std::copy(resource.begin(),resource.end(),bytes.begin()+static_cast<std::ptrdiff_t>(resource_at));
     std::copy(name.begin(),name.end(),bytes.begin()+static_cast<std::ptrdiff_t>(dll_name));
     put(edata+12,4,dll_name);put(edata+16,4,1);put(edata+20,4,count);put(edata+24,4,names.size());
@@ -125,6 +158,7 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
         at+=16;
     }
     for(const auto& [ordinal,target]:ordinals){const auto rva=entries.at(target);put(functions+(ordinal-1)*4,4,rva);result.ordinals.emplace(ordinal,rva);}
+    for(const auto& [ordinal,rva]:data_ordinals){put(functions+(ordinal-1)*4,4,rva);result.ordinals.emplace(ordinal,rva);}
     at=dll_name+name.size()+1;std::size_t index=0;
     for(const auto& [symbol,ordinal]:names){
         put(names_at+index*4,4,at);put(indices+index*2,2,ordinal-1);std::copy(symbol.begin(),symbol.end(),bytes.begin()+static_cast<std::ptrdiff_t>(at));at+=symbol.size()+1;++index;
@@ -133,15 +167,24 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
     return result;
 }
 }
+GuestAddress WindowsServices::builtin_constant_address(std::string_view family,std::string_view symbol)const{
+    const auto constants=detail::builtin_constant_exports(family);
+    const auto value=std::find_if(constants.begin(),constants.end(),[&](const auto& item){return item.name==symbol;});if(value==constants.end())return GuestAddress{};
+    const auto& layouts=builtin_layouts();const auto slot=layouts.find(std::string(family));if(slot==layouts.end())return GuestAddress{};
+    return GuestAddress{windows_address_layout::for_mode(x86_?ExecutionMode::X86:ExecutionMode::X64).images+slot->second.first*windows_address_layout::module_stride+detail::builtin_constant_rva+static_cast<std::uint64_t>(value-constants.begin())*8};
+}
 bool WindowsServices::builtin_module(std::string_view name) const {
     if(angle_module(name))return native_angle_!=nullptr;
     if(native_library_module(name))return native_libraries_.enabled(name);
     if(const auto host=windows_api_set_host(name);host!=name)return builtin_module(host);
+    if(const auto family=detail::builtin_provider_family(name);family!=name)return builtin_module(family);
     if(crt_library(name))return true;
     if(name=="kernel32.dll" || name=="wsock32.dll" || name.starts_with("api-ms-win-core-") || name.starts_with("api-ms-win-appmodel-runtime-"))return true;
     static const auto families=[] {
         std::set<std::string_view> result;
         for(const auto& service:runtime_service_descriptors())result.emplace(service.family);
+        // 只有轉發匯出的 DLL 也是真正的內建模組；與匯出解析共用同一張表。
+        for(const auto& alias:detail::service_export_aliases)result.emplace(alias.family);
         return result;
     }();
     return families.contains(name);
@@ -230,6 +273,7 @@ std::uint64_t WindowsServices::module_export(GuestMemory& memory,std::uint64_t h
         const auto found=std::find_if(runtime_.modules.begin(),runtime_.modules.end(),[&](const auto& item){return item.second==handle;});
         if(found==runtime_.modules.end())throw ModuleError(127,"沒有此模組的匯出");
         const auto name=ordinal?"#"+std::to_string(*ordinal):std::string(symbol);
+        if(image && ordinal){const auto entry=image->export_ordinals.find(*ordinal);if(entry!=image->export_ordinals.end() && !detail::builtin_constant_exports(found->first).empty() && entry->second>=detail::builtin_constant_rva && entry->second<detail::builtin_constant_rva+4096)return handle+entry->second;}
         if(image){
             std::uint32_t number=ordinal.value_or(0);bool native=false;
             if(!ordinal){const auto exported=image->export_names.find(std::string(symbol));if(exported!=image->export_names.end()){number=exported->second;native=symbol.starts_with("Nt") || symbol.starts_with("Zw");}}
@@ -321,25 +365,13 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
     if((bare || key=="c:\\windows\\system32\\"+name || (angle_module(name) && native_angle_)) && builtin_module(name)) {
         if(runtime_.signature_policy && native_library_module(name))throw ModuleError(577,"原生第三方模組不符合程序簽章政策");
         if(const auto host=windows_api_set_host(name);host!=name){const auto base=load_module(memory,utf8_to_utf16(host),flags,created,{},state);runtime_.modules.emplace(name,base);return base;}
+        if(const auto host=detail::builtin_provider_family(name);host!=name){const auto base=load_module(memory,utf8_to_utf16(host),flags,created,{},state);runtime_.modules.emplace(name,base);return base;}
         if(name.starts_with("api-ms-win-crt-")){const auto base=load_module(memory,u"ucrtbase.dll",flags,created,{},state);runtime_.modules.emplace(name,base);return base;}
         if(runtime_.builtin_images.size()>=windows_address_layout::module_slots)throw ModuleError(8,"內建模組數量超過固定容量");
         // 每個引擎版本共用固定模組配置，與各程序載入順序無關。匯出表放不進一格的模組占用連續多格：
         // 依描述表估算 builtin_headers 的大小（4 KiB 標頭＋匯出目錄每項 10 bytes 與名稱字串、頁對齊，再加每個入口 16 bytes），
-        // 另留一頁給描述表以外的別名，避免臨界時超出。
-        static const auto bases=[] {std::set<std::string> names{"kernel32.dll","wsock32.dll"};for(const auto name:modern_crt_libraries)names.emplace(name);for(const auto name:legacy_crt_libraries)names.emplace(name);for(const auto& item:runtime_service_descriptors())if(item.family.ends_with(".dll") || item.family.ends_with(".drv") || item.family.ends_with(".ocx") || item.family.ends_with(".cpl") || item.family.ends_with(".exe"))names.emplace(item.family);
-            std::map<std::string,std::pair<std::size_t,std::size_t>,std::less<>> exports;
-            for(const auto& item:runtime_service_descriptors()){auto& entry=exports[std::string(item.family)];++entry.first;entry.second+=item.symbol.size()+1;}
-            std::map<std::string,std::pair<std::size_t,std::size_t>> result;std::size_t next=0;
-            for(const auto& item:names){
-                std::size_t span=1;
-                if(const auto found=exports.find(item);found!=exports.end()){
-                    const auto [count,strings]=found->second;
-                    const auto bytes=((4096+40+count*10+item.size()+1+strings+4095)&~std::size_t{4095})+((count*16+4095)&~std::size_t{4095})+4096;
-                    span=std::max<std::size_t>(1,(bytes+windows_address_layout::module_stride-1)/windows_address_layout::module_stride);
-                }
-                result.emplace(item,std::pair{next,span});next+=span;
-            }
-            return result;}();
+        // 別名與只有轉發的模組同樣納入估算，另留一頁給其餘合成匯出。
+        const auto& bases=builtin_layouts();
         const auto slot=bases.find(name);if(slot==bases.end() || slot->second.first+slot->second.second>windows_address_layout::module_slots)throw ModuleError(8,"內建模組沒有固定配置："+name);
         const auto base=windows_address_layout::for_mode(memory.execution_mode()).images+slot->second.first*windows_address_layout::module_stride;
         const auto capacity=slot->second.second*windows_address_layout::module_stride;

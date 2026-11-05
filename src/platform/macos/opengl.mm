@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <set>
 #include <stdexcept>
 namespace x64arm {
 namespace {
@@ -27,6 +28,7 @@ class MacOpenGl final:public NativeOpenGlContext {
     std::array<Upload,4> arrays_;
     std::shared_ptr<GpuMemoryReservation> surface_memory_;
     std::map<GLuint,std::map<GLint,std::shared_ptr<GpuMemoryReservation>>> texture_memory_;
+    std::set<GLint> rejected_proxy_levels_;
     std::array<GLenum,8> saved_errors_{};std::size_t saved_error_count_{};
     bool list_definition_{},compiling_list_{},primitive_open_{},pending_end_{},primitive_batchable_{};
     const bool list_batch_enabled_=std::getenv("X64ARM_GL_DISABLE_LIST_BATCHING")==nullptr;
@@ -170,7 +172,7 @@ public:
         case GlOperation::AlphaFunc:glAlphaFunc(u(0),f(1));break;
         case GlOperation::DepthFunc:glDepthFunc(u(0));break;case GlOperation::DepthRange:glDepthRange(d(0),d(1));break;case GlOperation::DepthMask:glDepthMask(static_cast<GLboolean>(u(0)));break;
         case GlOperation::ColorMask:glColorMask(static_cast<GLboolean>(u(0)!=0),static_cast<GLboolean>(u(1)!=0),static_cast<GLboolean>(u(2)!=0),static_cast<GLboolean>(u(3)!=0));break;
-        case GlOperation::LineWidth:glLineWidth(f(0));break;case GlOperation::PixelZoom:glPixelZoom(f(0),f(1));break;
+        case GlOperation::LineWidth:glLineWidth(f(0));break;case GlOperation::PointSize:glPointSize(f(0));break;case GlOperation::IndexMask:glIndexMask(u(0));break;case GlOperation::PixelZoom:glPixelZoom(f(0),f(1));break;
         case GlOperation::RenderMode:return static_cast<std::uint32_t>(glRenderMode(u(0)));
         case GlOperation::ShadeModel:glShadeModel(u(0));break;case GlOperation::Hint:glHint(u(0),u(1));break;
         case GlOperation::Viewport:glViewport(n(0),n(1),n(2),n(3));break;case GlOperation::Scissor:glScissor(n(0),n(1),n(2),n(3));break;
@@ -191,8 +193,12 @@ public:
         case GlOperation::GetTexEnviv:glGetTexEnviv(u(0),u(1),reinterpret_cast<GLint*>(output.data()));break;
         case GlOperation::GetTexEnvfv:glGetTexEnvfv(u(0),u(1),reinterpret_cast<GLfloat*>(output.data()));break;
         case GlOperation::TextureCombine:throw std::invalid_argument("D3D texture combine 僅提供 Metal 後端");
-        case GlOperation::GetTexLevelParameteriv:glGetTexLevelParameteriv(u(0),n(1),u(2),reinterpret_cast<GLint*>(output.data()));break;
-        case GlOperation::GetTexLevelParameterfv:glGetTexLevelParameterfv(u(0),n(1),u(2),reinterpret_cast<GLfloat*>(output.data()));break;
+        case GlOperation::GetTexLevelParameteriv:case GlOperation::GetTexLevelParameterfv:{
+            preserve_driver_errors();
+            if(op==GlOperation::GetTexLevelParameteriv)glGetTexLevelParameteriv(u(0),n(1),u(2),reinterpret_cast<GLint*>(output.data()));
+            else glGetTexLevelParameterfv(u(0),n(1),u(2),reinterpret_cast<GLfloat*>(output.data()));
+            if(!preserve_driver_errors() && u(0)==GL_PROXY_TEXTURE_2D && rejected_proxy_levels_.contains(n(1)))std::memset(output.data(),0,4);
+            break;}
         case GlOperation::BindTexture:glBindTexture(u(0),u(1));break;
         case GlOperation::IsTexture:return glIsTexture(u(0));
         case GlOperation::GenTextures:glGenTextures(n(0),reinterpret_cast<GLuint*>(output.data()));break;
@@ -201,7 +207,17 @@ public:
             preserve_driver_errors();
             // List 內的 TexImage 會在 replay 才修改物件，尚不能追蹤此資源生命週期；明確拒絕，不假記帳。
             if(list_definition_){remember_error(GL_INVALID_OPERATION);break;}
-            if(u(0)==GL_PROXY_TEXTURE_2D){glTexImage2D(u(0),n(1),n(2),n(3),n(4),n(5),u(6),u(7),nullptr);preserve_driver_errors();break;}
+            if(u(0)==GL_PROXY_TEXTURE_2D){
+                GLint maximum=0;glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maximum);
+                const bool oversized=n(3)>=0 && n(4)>=0 && (n(5)==0 || n(5)==1) &&
+                    (static_cast<std::int64_t>(n(3))>static_cast<std::int64_t>(maximum)+2*n(5) || static_cast<std::int64_t>(n(4))>static_cast<std::int64_t>(maximum)+2*n(5));
+                // OpenGL 2.1 §3.8.11：容量不足清零指定 proxy level，不產生錯誤。
+                // CGL 對過大尺寸會回 INVALID_VALUE；以空影像保留其格式／型別／level 驗證，查詢時補回清零狀態。
+                glTexImage2D(u(0),n(1),n(2),oversized?0:n(3),oversized?0:n(4),n(5),u(6),u(7),nullptr);
+                if(!preserve_driver_errors()){
+                    if(oversized)rejected_proxy_levels_.insert(n(1));else rejected_proxy_levels_.erase(n(1));
+                }
+                break;}
             if(u(0)!=GL_TEXTURE_2D){remember_error(GL_INVALID_ENUM);break;}
             GLint maximum=0;glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maximum);const auto pixel_bytes=texture_pixel_bytes(n(2));
             if(!pixel_bytes || n(1)<0 || n(1)>static_cast<GLint>(std::bit_width(static_cast<unsigned>(maximum))-1) || n(5)<0 || n(5)>1 || n(3)<0 || n(4)<0 || n(3)>maximum+2*n(5) || n(4)>maximum+2*n(5)){remember_error(GL_INVALID_VALUE);break;}
@@ -219,6 +235,10 @@ public:
             if(data.empty() && n(4)>0 && n(5)>0){remember_error(GL_INVALID_OPERATION);break;}
             glTexSubImage2D(u(0),n(1),n(2),n(3),n(4),n(5),u(6),u(7),data.empty()?nullptr:data.data());break;
         case GlOperation::TexParameterf:glTexParameterf(u(0),u(1),f(2));break;case GlOperation::TexParameteri:glTexParameteri(u(0),u(1),n(2));break;
+        case GlOperation::CopyTexSubImage2D:glCopyTexSubImage2D(u(0),n(1),n(2),n(3),n(4),n(5),n(6),n(7));break;
+        case GlOperation::GetTexParameteriv:glGetTexParameteriv(u(0),u(1),reinterpret_cast<GLint*>(output.data()));break;
+        case GlOperation::GetTexParameterfv:glGetTexParameterfv(u(0),u(1),reinterpret_cast<GLfloat*>(output.data()));break;
+        case GlOperation::PolygonOffset:glPolygonOffset(f(0),f(1));break;
         case GlOperation::PixelStorei:glPixelStorei(u(0),n(1));break;
         case GlOperation::NewList:{glNewList(u(0),u(1));GLint index=0,mode=0;glGetIntegerv(GL_LIST_INDEX,&index);glGetIntegerv(GL_LIST_MODE,&mode);list_definition_=index!=0;compiling_list_=list_definition_ && mode==GL_COMPILE;break;}
         case GlOperation::EndList:glEndList();list_definition_=false;compiling_list_=false;break;case GlOperation::GenLists:return glGenLists(n(0));

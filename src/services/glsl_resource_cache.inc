@@ -13,9 +13,9 @@ struct ShaderResourceReader {
     std::string text(){const auto value=data();return {reinterpret_cast<const char*>(value.data()),value.size()};}
 };
 std::vector<std::uint8_t> encode_shader_resource(const GlslResult& result){
-    ShaderResourceWriter out;out.text("glsl-msl-1");out.text(result.log);out.number(static_cast<std::uint32_t>(result.stages.size()));
+    ShaderResourceWriter out;out.text("glsl-msl-2");out.text(result.log);out.number(static_cast<std::uint32_t>(result.stages.size()));
     for(const auto& stage:result.stages){out.number(stage.stage);out.number(stage.buffer_index);
-        for(const auto* text:{&stage.msl,&stage.flipped_msl,&stage.entry,&stage.clip_mask,&stage.point_size_enabled})out.text(*text);
+        for(const auto* text:{&stage.msl,&stage.flipped_msl,&stage.entry,&stage.clip_mask,&stage.point_size_enabled,&stage.point_size_value})out.text(*text);
         out.data(stage.initial_uniforms);out.number(static_cast<std::uint32_t>(stage.attributes.size()));
         for(const auto& a:stage.attributes){out.text(a.name);out.number(a.location);out.number(a.components);out.number(a.columns);}
         out.number(static_cast<std::uint32_t>(stage.uniforms.size()));for(const auto& u:stage.uniforms){out.text(u.name);for(const auto n:{u.type,u.components,u.columns,u.count,u.offset,u.array_stride,u.matrix_stride})out.number(n);}
@@ -23,10 +23,10 @@ std::vector<std::uint8_t> encode_shader_resource(const GlslResult& result){
     }return out.bytes;
 }
 GlslResult decode_shader_resource(std::span<const std::uint8_t> bytes){
-    ShaderResourceReader in{bytes};if(in.text()!="glsl-msl-1")throw std::invalid_argument("著色器快取版本不合法");
+    ShaderResourceReader in{bytes};if(in.text()!="glsl-msl-2")throw std::invalid_argument("著色器快取版本不合法");
     GlslResult result;result.log=in.text();const auto stages=in.number();if(stages>2)throw std::invalid_argument("著色器快取 stage 過多");
     for(unsigned i=0;i<stages;++i){GlslStage stage;stage.stage=in.number();if(stage.stage!=0x8b31 && stage.stage!=0x8b30)throw std::invalid_argument("著色器快取 stage 不合法");stage.buffer_index=in.number();
-        stage.msl=in.text();stage.flipped_msl=in.text();stage.entry=in.text();stage.clip_mask=in.text();stage.point_size_enabled=in.text();
+        stage.msl=in.text();stage.flipped_msl=in.text();stage.entry=in.text();stage.clip_mask=in.text();stage.point_size_enabled=in.text();stage.point_size_value=in.text();
         const auto initial=in.data();stage.initial_uniforms.assign(initial.begin(),initial.end());
         const auto attributes=in.count();for(unsigned n=0;n<attributes;++n){GlslAttribute a;a.name=in.text();a.location=in.number();a.components=in.number();a.columns=in.number();stage.attributes.push_back(std::move(a));}
         const auto uniforms=in.count();for(unsigned n=0;n<uniforms;++n){GlslUniform u;u.name=in.text();u.type=in.number();u.components=in.number();u.columns=in.number();u.count=in.number();u.offset=in.number();u.array_stride=in.number();u.matrix_stride=in.number();stage.uniforms.push_back(std::move(u));}
@@ -37,7 +37,7 @@ GlslResult decode_shader_resource(std::span<const std::uint8_t> bytes){
 }
 template<class Compile> GlslResult cached_shader_resource(std::span<const GlslSource> sources,bool link,Compile&& compile){
     const auto directory=generated_resource_cache_directory();if(directory.empty())return compile();
-    ShaderResourceWriter identity;identity.text("x64arm-glsl-resource-1");identity.text(X64ARM_GLSL_RESOURCE_REVISION);identity.number(link?1:0);
+    ShaderResourceWriter identity;identity.text("x64arm-glsl-resource-2");identity.text(X64ARM_GLSL_RESOURCE_REVISION);identity.number(link?1:0);
     identity.number(static_cast<std::uint32_t>(sources.size()));for(const auto& source:sources){identity.number(source.stage);identity.text(source.source);identity.text(source.preamble);}
     GlslResult compiled;
     const auto resource=ResourceCache(directory).get_or_create(identity.bytes,[&]{compiled=compile();return compiled.success?encode_shader_resource(compiled):std::vector<std::uint8_t>{};});

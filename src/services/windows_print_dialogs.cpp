@@ -37,6 +37,7 @@ std::vector<std::uint8_t> devnames(bool wide){
 std::span<const WindowsServiceDescriptor> print_dialog_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"comdlg32.dll","PrintDlgExA",1},{"comdlg32.dll","PrintDlgExW",1},
+        {"comdlg32.dll","PageSetupDlgA",1},{"comdlg32.dll","PageSetupDlgW",1},{"internal-page-setup","DialogProc",4},
         {"comctl32.dll","CreatePropertySheetPageA",1},{"comctl32.dll","CreatePropertySheetPageW",1},{"comctl32.dll","DestroyPropertySheetPage",1},
         {"internal-print-dialog","RootProc",4},{"internal-print-dialog","GeneralProc",4},
         {"internal-print-services","QueryInterface",3},{"internal-print-services","AddRef",1},{"internal-print-services","Release",1},
@@ -86,14 +87,24 @@ std::uint64_t WindowsServices::release_print_services(GuestState& state,GuestMem
     const auto found=gui_.print_services.find(object);if(found==gui_.print_services.end() || !found->second.references)return 0;
     const auto references=--found->second.references;if(!references){gui_.print_services.erase(found);(void)free_heap(memory,object,state);}return references;
 }
+std::array<std::uint64_t,2> WindowsServices::allocate_printer_globals(GuestState& state,GuestMemory& memory,bool wide,const PrinterSettings& settings){
+    std::array<std::uint64_t,2> handles{};
+    const auto discard=[&]{for(const auto h:handles)if(h){const auto at=gui_.global_memory.at(h).address;gui_.global_memory.erase(h);(void)free_heap(memory,at,state);}};
+    try {
+        const std::array buffers{printer_devmode(wide,settings),devnames(wide)};
+        for(unsigned i=0;i<2;++i){if(gui_.global_memory.size()>=65536){discard();return {};}
+            const auto at=allocate_heap(memory,buffers[i].size());if(!at){discard();return {};}
+            const auto h=gui_.next_object++;gui_.global_memory.emplace(h,GuiGlobalMemory{at,buffers[i].size(),2,0,false});handles[i]=h;memory.write(GuestAddress{at},buffers[i]);}
+        return handles;
+    }catch(...){discard();throw;}
+}
 std::uint32_t WindowsServices::commit_print_dialog(GuestState& state,GuestMemory& memory,GuiPrintDialog& dialog){
     const Layout layout(x86_);const auto bits=static_cast<std::uint8_t>(x86_?32:64);const auto p=dialog.request;
     std::vector<std::uint64_t> new_handles;std::uint64_t dc{};
     const auto discard=[&]{if(dc){delete_printer_dc(dc);gui_.contexts.erase(dc);}for(const auto h:new_handles){const auto at=gui_.global_memory.at(h).address;gui_.global_memory.erase(h);(void)free_heap(memory,at,state);}};
-    const auto global=[&](std::span<const std::uint8_t> data){if(gui_.global_memory.size()>=65536)return std::uint64_t{};const auto at=allocate_heap(memory,data.size());if(!at)return std::uint64_t{};memory.write(GuestAddress{at},data);const auto h=gui_.next_object++;gui_.global_memory.emplace(h,GuiGlobalMemory{at,data.size(),2,0,false});new_handles.push_back(h);return h;};
     try {
         for(const auto offset:{layout.mode,layout.names}){const auto h=memory.load(GuestAddress{p+offset},bits);if(h){const auto f=gui_.global_memory.find(h);if(f==gui_.global_memory.end() || f->second.locks || f->second.clipboard_owned)return handle_error;}}
-        const auto mode=global(printer_devmode(dialog.wide,dialog.settings)),names=global(devnames(dialog.wide));
+        const auto globals=allocate_printer_globals(state,memory,dialog.wide,dialog.settings);const auto mode=globals[0],names=globals[1];for(const auto h:globals)if(h)new_handles.push_back(h);
         if(!mode || !names){discard();return 0x8007000eU;}
         if(dialog.flags&0x300U){dc=create_printer_dc(memory,gui_.global_memory.at(mode).address,dialog.wide,(dialog.flags&0x100U)==0);if(!dc){const auto error=hresult(last_error_);discard();return error;}}
         // Vista 起 RETURNDC 的 DC 保存真正份數；沒有 USEDEVMODECOPIES 時，
@@ -116,8 +127,14 @@ void WindowsServices::refresh_print_settings(std::uint64_t root){
     auto& data=gui_.print_dialogs.at(root);const auto child=[&](unsigned id)->GuiWindow&{return gui_.windows.at(gui_child(data.general,id));};
     if(const auto copies=integer(child(0x482).title);copies && *copies>=1 && *copies<=99)data.settings.copies=*copies;
     data.settings.collate=child(0x411).check!=0;data.flags=(data.flags&~0x30U)|(data.settings.collate?0x10U:0U)|(child(0x410).check?0x20U:0U);
-    data.settings.width=child(0x471).selection==1?794:816;data.settings.height=child(0x471).selection==1?1123:1056;
-    if(child(0x472).selection==1)std::swap(data.settings.width,data.settings.height);data.settings.monochrome=child(0x412).check!=0;
+    const auto& paper=child(0x471);unsigned error=0;const auto forms=available_printer_settings(error);
+    if(!error && paper.selection>=0 && static_cast<std::size_t>(paper.selection)<paper.items.size()){
+        const auto id=paper.items[static_cast<std::size_t>(paper.selection)].data;
+        for(const auto& form:forms)if(form.paper==id){data.settings.paper=form.paper;data.settings.form=form.form;data.settings.paper_width=form.paper_width;data.settings.paper_height=form.paper_height;break;}
+    }
+    data.settings.width=static_cast<unsigned>((std::uint64_t{data.settings.paper_width}*96+12700)/25400);
+    data.settings.height=static_cast<unsigned>((std::uint64_t{data.settings.paper_height}*96+12700)/25400);
+    data.settings.landscape=child(0x472).selection==1;if(data.settings.landscape)std::swap(data.settings.width,data.settings.height);data.settings.monochrome=child(0x412).check!=0;
 }
 void WindowsServices::select_print_page(std::uint64_t root,std::uint32_t selected){
     auto& data=gui_.print_dialogs.at(root);data.selected=selected;
@@ -126,6 +143,7 @@ void WindowsServices::select_print_page(std::uint64_t root,std::uint32_t selecte
     for(std::size_t i=0;i<=data.pages.size();++i)if(const auto h=gui_child(root,static_cast<std::uint32_t>(0x5000+i));h){gui_.windows.at(h).check=selected==i;present_gui(h);}
 }
 std::optional<std::uint32_t> WindowsServices::invoke_print_dialog(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol.starts_with("PageSetupDlg") || service.family=="internal-page-setup")return invoke_page_setup(state,memory,service);
     const WindowsCall arg(state,memory,service);const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     if(service.family=="internal-print-services"){
@@ -194,6 +212,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_print_dialog(GuestState& st
         if(pages){if(!get(layout.handles,true))return finish(pointer_error);memory.check(GuestAddress{get(layout.handles,true)},pages*unit,Access::Read);std::set<std::uint64_t> unique;
             for(std::uint64_t i=0;i<pages;++i){const auto h=memory.load(GuestAddress{get(layout.handles,true)+i*unit},bits);const auto f=gui_.property_pages.find(h);if(f==gui_.property_pages.end() || f->second.used || f->second.phase || !unique.insert(h).second)return finish(handle_error);data.pages.push_back(f->second);}}
         if(data.flags&0x400U){const auto error=commit_print_dialog(state,memory,data);return finish(error);}
+        unsigned forms_error=0;auto forms=available_printer_settings(forms_error);if(forms_error)return finish(hresult(forms_error));
+        if(!data.settings.paper)forms.push_back(data.settings);
         if(gui_.print_dialogs.size()>=64)return finish(0x8007000eU);
         data.target=start==UINT32_MAX?0:static_cast<std::uint32_t>(start+1);data.callback_unknown=get(layout.callback,true);if(data.callback_unknown)(void)method(memory,x86_,data.callback_unknown,0);
         data.result=allocate_gui_scratch(memory,data.scratch,{},64);data.notification=allocate_gui_scratch(memory,data.scratch,{},32);
@@ -218,8 +238,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_print_dialog(GuestState& st
         const auto file=add(g,0x410,u"button",u"列印至檔案（PDF）",12,232,230,26,3);gui_.windows.at(file).check=(data.flags&0x20U)!=0;gui_set_window_enabled(gui_.windows.at(file),(data.flags&0x80000U)==0);gui_.windows.at(file).visible=(data.flags&0x100000U)==0;present_gui(file);
         const auto mono=add(g,0x412,u"button",u"灰階",260,232,100,26,3);gui_.windows.at(mono).check=data.settings.monochrome;present_gui(mono);
         const auto paper=add(g,0x471,u"combobox",u"",12,270,160,26,3),orientation=add(g,0x472,u"combobox",u"",200,270,160,26,3);
-        gui_.windows.at(paper).items={{gui_.next_item++,0,0,u"Letter",0},{gui_.next_item++,0,0,u"A4",0}};gui_.windows.at(paper).selection=data.settings.width==794 || data.settings.height==794?1:0;
-        gui_.windows.at(orientation).items={{gui_.next_item++,0,0,u"直向",0},{gui_.next_item++,0,0,u"橫向",0}};gui_.windows.at(orientation).selection=data.settings.width>data.settings.height?1:0;present_gui(paper);present_gui(orientation);
+        for(const auto& form:forms){auto& control=gui_.windows.at(paper);if(form.paper==data.settings.paper)control.selection=static_cast<int>(control.items.size());control.items.push_back({gui_.next_item++,0,form.paper,form.form.empty()?u"自訂尺寸":form.form,0});}
+        gui_.windows.at(orientation).items={{gui_.next_item++,0,0,u"直向",0},{gui_.next_item++,0,0,u"橫向",0}};gui_.windows.at(orientation).selection=data.settings.landscape?1:0;present_gui(paper);present_gui(orientation);
         add(root,499,u"static",u"",12,static_cast<int>(dialog.height)-90,dialog.width-24,26);
         add(root,1,u"button",u"列印",static_cast<int>(dialog.width)-286,static_cast<int>(dialog.height)-48,80,28,1);add(root,2,u"button",u"取消",static_cast<int>(dialog.width)-196,static_cast<int>(dialog.height)-48,80,28);add(root,0x3021,u"button",u"套用",static_cast<int>(dialog.width)-106,static_cast<int>(dialog.height)-48,80,28);
         memory.store(GuestAddress{p+layout.action},32,0);gui_.print_dialogs.emplace(root,std::move(data));auto& stored=gui_.print_dialogs.at(root);stored.phase=1;

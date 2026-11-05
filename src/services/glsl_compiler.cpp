@@ -97,17 +97,19 @@ static GlslResult link_glsl_uncached(std::span<const GlslSource> sources){std::l
     }
     std::vector<std::unique_ptr<glslang::TShader>> adjusted_shaders;std::unique_ptr<glslang::TProgram> adjusted;std::vector<GlslSource> adjusted_sources;
     std::string prefix="x64arm_native_";while(std::any_of(sources.begin(),sources.end(),[&](const auto& source){return source.source.find(prefix)!=std::string::npos;}))prefix+="x";
-    if(clip_count || point_size){
+    if(program.getIntermediate(EShLangVertex)){
         adjusted=std::make_unique<glslang::TProgram>();adjusted_sources.assign(sources.begin(),sources.end());bool wrapper=false;
         for(auto& source:adjusted_sources){if(source.stage==0x8b31){source.preamble="#define main "+prefix+"main\n";
-            if(!wrapper){source.source+="\n#undef main\n";if(clip_count)source.source+="uniform uint "+prefix+"clip_mask;\n";if(point_size)source.source+="uniform int "+prefix+"point_size;\n";
+            if(!wrapper){source.source+="\n#undef main\n";if(clip_count)source.source+="uniform uint "+prefix+"clip_mask;\n";if(point_size)source.source+="uniform int "+prefix+"point_size;\n";source.source+="uniform float "+prefix+"point_size_value;\n";
                 source.source+="void "+prefix+"main();\nvoid main(){"+prefix+"main();";
                 for(unsigned i=0;i<clip_count;++i)source.source+="if(("+prefix+"clip_mask & "+std::to_string(1U<<i)+"u)==0u)gl_ClipDistance["+std::to_string(i)+"]=1.;";
-                if(point_size)source.source+="if("+prefix+"point_size==0)gl_PointSize=1.;";source.source+="}\n";wrapper=true;}
+                // 未寫入 PointSize 的 shader 也須使用 context 的點大小；程式點大小啟用時才採 shader 輸出。
+                if(point_size)source.source+="if("+prefix+"point_size==0)";
+                source.source+="gl_PointSize="+prefix+"point_size_value;gl_PointSize=clamp(floor(gl_PointSize+0.5),1.,64.);}\n";wrapper=true;}
         }auto shader=parse(source,true,result.log);if(!shader)return result;adjusted->addShader(shader.get());adjusted_shaders.push_back(std::move(shader));}
         if(!adjusted->link(static_cast<EShMessages>(EShMsgSpvRules|EShMsgVulkanRules)) || !map_interfaces(*adjusted)){result.log+=adjusted->getInfoLog();return result;}
     }
-    for(const auto stage:{0x8b31U,0x8b30U})if(auto* intermediate=(adjusted?adjusted.get():&program)->getIntermediate(language(stage))){auto translated=translate(*intermediate,stage,defaults[stage]);if(stage==0x8b31){if(clip_count)translated.clip_mask=prefix+"clip_mask";if(point_size)translated.point_size_enabled=prefix+"point_size";}result.stages.push_back(std::move(translated));}
+    for(const auto stage:{0x8b31U,0x8b30U})if(auto* intermediate=(adjusted?adjusted.get():&program)->getIntermediate(language(stage))){auto translated=translate(*intermediate,stage,defaults[stage]);if(stage==0x8b31){if(clip_count)translated.clip_mask=prefix+"clip_mask";if(point_size)translated.point_size_enabled=prefix+"point_size";translated.point_size_value=prefix+"point_size_value";}result.stages.push_back(std::move(translated));}
     result.success=!result.stages.empty();
 }catch(const std::exception& e){result.log+=e.what();result.stages.clear();}return result;}
 #if defined(__APPLE__)

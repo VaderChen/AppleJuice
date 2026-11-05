@@ -2,6 +2,7 @@
 #include "x64arm/crypto.hpp"
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <string_view>
 namespace x64arm::legacy_crypto {
 struct Algorithm {
@@ -29,12 +30,29 @@ inline bool supported(const Algorithm& a,std::uint32_t provider){
     if(provider==1 && ((a.id>=0x800c && a.id<=0x800e) || (a.id>=0x660e && a.id<=0x6610)))return false;
     return !a.cipher || CryptoCipher::available(cipher_name(a,1));
 }
-struct Provider {std::uint32_t type;const char* name;const char* description;};
+struct Provider {
+    std::uint32_t type;const char* name;const char* description;
+    std::uint32_t rsa_default{1024},session_default{128},session_max{128};bool triple_des{true};
+};
 inline constexpr Provider providers[]{
     {1,"Microsoft Enhanced Cryptographic Provider v1.0","RSA Full (Signature and Key Exchange)"},
-    {24,"Microsoft Enhanced RSA and AES Cryptographic Provider","RSA Full and AES"}
+    {24,"Microsoft Enhanced RSA and AES Cryptographic Provider","RSA Full and AES"},
+    {1,"Microsoft Base Cryptographic Provider v1.0","RSA Full (Signature and Key Exchange)",512,40,56,false},
+    {1,"Microsoft Strong Cryptographic Provider","RSA Full (Signature and Key Exchange)"}
 };
 inline bool rsa(std::uint32_t algorithm){return algorithm==0x2400 || algorithm==0xa400;}
+inline const Provider* provider(std::uint32_t type,std::string_view name={}){
+    const auto found=std::find_if(std::begin(providers),std::end(providers),[&](const auto& p){return p.type==type && (name.empty() || name==p.name);});
+    return found==std::end(providers)?nullptr:found;
+}
+inline std::optional<Algorithm> algorithm_for(std::uint32_t id,const LegacyCryptProvider& context){
+    const auto* item=find(id);const auto* policy=provider(context.type,context.name);
+    if(!item || !policy || !supported(*item,context.type) || (!policy->triple_des && (id==0x6603 || id==0x6609)))return {};
+    auto result=*item;
+    if(rsa(id))result.default_bits=policy->rsa_default;
+    if(id==0x6602 || id==0x6801){result.default_bits=policy->session_default;result.max_bits=policy->session_max;}
+    return result;
+}
 inline std::uint32_t key_bits(const Algorithm& a,std::size_t size){
     return a.id==0x6601?size==8?56U:0U:a.id==0x6603?size==24?168U:0U:a.id==0x6609?size==16?112U:0U:static_cast<std::uint32_t>(size*8);
 }

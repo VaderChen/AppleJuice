@@ -158,6 +158,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_mouse(GuestState& state
         }
     }
     if(!input.eat && !input.native_activation){
+        classify_gui_click(memory,message,input.hit);
         const bool wheel=message.message==0x20a || message.message==0x20e;
         if(input.hit!=1 && !wheel){message.message-=0x160U;message.wparam=static_cast<std::uint32_t>(input.hit)|(message.wparam&0xffff0000U);message.lparam=xy(message.point[0],message.point[1]);}
         else {const auto origin=wheel?std::array<std::int64_t,2>{}:gui_client_origin(gui_,message.window);message.lparam=xy(message.point[0]-origin[0],message.point[1]-origin[1]);}

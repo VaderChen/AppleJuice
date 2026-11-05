@@ -1,7 +1,11 @@
 // D3D9 COM ABI；參照 Microsoft d3d9.h 與 MinGW-w64 宣告。
 #pragma once
 namespace x64arm::d3d9_abi {
-enum class Kind { Factory, Device, Surface, Texture, CubeTexture, VertexBuffer, IndexBuffer, SwapChain, Mesh, Blob, PRT, VertexShader, PixelShader, VertexDeclaration, ConstantTable, Sprite, Font, StateBlock, Effect, EffectPool, RenderToSurface, XFile, XEnum, XData, Gutter, Skin, AnimSet, CompressedSet, AnimController, PRTComp, RenderToEnvMap, PRTEngine, VolumeTexture, Volume };
+enum class Kind { Factory, Device, Surface, Texture, CubeTexture, VertexBuffer, IndexBuffer, SwapChain, Mesh, Blob, PRT, VertexShader, PixelShader, VertexDeclaration, ConstantTable, Sprite, Font, StateBlock, Effect, EffectPool, RenderToSurface, XFile, XEnum, XData, Gutter, Skin, AnimSet, CompressedSet, AnimController, PRTComp, RenderToEnvMap, PRTEngine, VolumeTexture, Volume, Query };
+constexpr WindowsServiceDescriptor queryMethods[]{
+{"internal-d3d9","Query.QueryInterface",3},{"internal-d3d9","Query.AddRef",1},{"internal-d3d9","Query.Release",1},
+{"internal-d3d9","Query.GetDevice",2},{"internal-d3d9","Query.GetType",1},{"internal-d3d9","Query.GetDataSize",1},
+{"internal-d3d9","Query.Issue",2},{"internal-d3d9","Query.GetData",4}};
 constexpr WindowsServiceDescriptor renderToSurfaceMethods[]{
 {"internal-d3d9","RenderToSurface.QueryInterface",3},{"internal-d3d9","RenderToSurface.AddRef",1},{"internal-d3d9","RenderToSurface.Release",1},
 {"internal-d3d9","RenderToSurface.GetDevice",2},{"internal-d3d9","RenderToSurface.GetDesc",2},

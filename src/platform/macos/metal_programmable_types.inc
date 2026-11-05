@@ -150,6 +150,11 @@ struct MetalBufferPool {
     }
     std::string statistics(){const std::lock_guard lock(mutex);return " metal_buffer_pool_hits="+std::to_string(hits)+" metal_buffer_pool_misses="+std::to_string(misses)+" metal_buffer_pool_puts="+std::to_string(puts)+" metal_buffer_pool_drops="+std::to_string(drops)+" metal_buffer_pool_bytes="+std::to_string(bytes)+" metal_buffer_pool_entries="+std::to_string(free.size());}
 };
+// 在途期間保活、批次完成時歸還池的暫存 buffer（幾何階段的輸入／輸出／計數）。
+struct MetalPooledBuffer final:GraphicsObject {
+    id<MTLBuffer> buffer;std::shared_ptr<MetalBufferPool> pool;
+    ~MetalPooledBuffer() override {if(pool && buffer)pool->put(buffer);}
+};
 // CreateBuffer 建立的緩衝釋放後也交回同一個池，下一次同長度（頁對齊後）的 CreateBuffer 直接取用並清零，省掉 IOGPU 配置與釋放
 // （雙人成行每幀約 40 次 CreateBuffer／Release，協調者約 5% 時間在 IOGPUResourceCreate／Finalize）。X64ARM_METAL_CREATE_POOL=0 關閉。
 bool metal_create_pool_enabled(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_CREATE_POOL");return (!text || std::string_view(text)!="0") && metal_discard_pool_enabled() && !metal_backing_generation_enabled();}();return value;}
@@ -403,6 +408,8 @@ MTLPixelFormat metal_format(std::uint32_t f){
     case 76:case 77:return MTLPixelFormatBC3_RGBA;case 78:return MTLPixelFormatBC3_RGBA_sRGB;
     case 79:case 80:return MTLPixelFormatBC4_RUnorm;case 81:return MTLPixelFormatBC4_RSnorm;
     case 82:case 83:return MTLPixelFormatBC5_RGUnorm;case 84:return MTLPixelFormatBC5_RGSnorm;
+    case 85:return MTLPixelFormatB5G6R5Unorm;case 86:return MTLPixelFormatBGR5A1Unorm;
+    case 115:return MTLPixelFormatABGR4Unorm; // CPU 傳輸時調整 alpha nibble 的位置。
     case 94:case 95:return MTLPixelFormatBC6H_RGBUfloat;case 96:return MTLPixelFormatBC6H_RGBFloat;
     case 97:case 98:return MTLPixelFormatBC7_RGBAUnorm;case 99:return MTLPixelFormatBC7_RGBAUnorm_sRGB;
     case 87:case 88:case 90:case 92:return MTLPixelFormatBGRA8Unorm;case 91:case 93:return MTLPixelFormatBGRA8Unorm_sRGB;

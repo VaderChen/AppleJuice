@@ -94,7 +94,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_fiber(GuestState& state,Gue
             source.context=state;source.callbacks=std::move(runtime_.callbacks);source.sorts=std::move(runtime_.sorts);source.exceptions=std::move(exceptions_.stack);source.fls_values=runtime_.fls_values;
             if(x86_)source.exception_list=memory.load(GuestAddress{thread.teb},32);source.active_thread=0;
             const auto previous=state;state=destination.context;thread_state(state,previous);if(x86_ && !destination.float_switch)floating_state(state,previous);
-            runtime_.callbacks=std::move(destination.callbacks);runtime_.sorts=std::move(destination.sorts);exceptions_.stack=std::move(destination.exceptions);runtime_.fls_values=destination.fls_values;sync_fls_mirror(memory,thread.teb,runtime_.fls_values);
+            runtime_.callbacks=std::move(destination.callbacks);runtime_.sorts=std::move(destination.sorts);exceptions_.stack=std::move(destination.exceptions);sync_msvc_uncaught(memory);runtime_.fls_values=destination.fls_values;sync_fls_mirror(memory,thread.teb,runtime_.fls_values);
             for(auto& frame:runtime_.callbacks)thread_state(frame.saved,previous);
             destination.active_thread=threads_.current;destination.last_thread=threads_.current;thread.fiber=target->first;
             memory.store(GuestAddress{fiber_cell},bits,thread.fiber);memory.store(GuestAddress{thread.teb+unit},bits,destination.stack_base+destination.stack_size);memory.store(GuestAddress{thread.teb+unit*2},bits,destination.stack_guard.limit(destination.stack_base));

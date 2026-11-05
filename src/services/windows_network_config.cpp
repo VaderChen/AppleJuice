@@ -484,6 +484,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& 
         }catch(const MemoryFault&){result=87;}catch(const std::bad_alloc&){result=8;}
         arg.return_to(state,result);return std::nullopt;
     }
+    if(symbol=="GetIpAddrTable"){
+        try{
+            if(!arg(1)){arg.return_to(state,87);return {};}
+            const auto capacity=memory.load(GuestAddress{arg(1)},32);memory.check(GuestAddress{arg(1)},4,Access::Write);
+            auto& config=*runtime_.network.configuration;
+            if(!refresh_configuration(config,runtime_.network.external_io,false,false))result=232;
+            else{
+                std::vector<std::array<std::uint8_t,24>> rows;
+                for(const auto& item:config.interfaces){bool primary=true;
+                    for(const auto& address:item.addresses){
+                        if(address.bytes.size()<8 || address.bytes[0]!=2 || address.prefix>32)continue;
+                        std::array<std::uint8_t,24> row{};std::copy_n(address.bytes.begin()+4,4,row.begin());
+                        for(unsigned i=0;i<4;++i){row[4+i]=static_cast<std::uint8_t>(item.index>>(i*8));const auto bits=std::min(8U,address.prefix>i*8?address.prefix-i*8:0U);row[8+i]=static_cast<std::uint8_t>(bits?0xffU<<(8-bits):0);}
+                        row[12]=1;row[16]=row[17]=0xff;row[22]=static_cast<std::uint8_t>((primary?1U:0U)|(item.dhcp_enabled?4U:0U)|(item.status==1?0U:8U));primary=false;rows.push_back(row);
+                    }
+                }
+                if(arg(2))std::stable_sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){return std::lexicographical_compare(a.begin(),a.begin()+4,b.begin(),b.begin()+4);});
+                const auto size=4+rows.size()*24;memory.store(GuestAddress{arg(1)},32,size);
+                if(!arg(0) || capacity<size)result=122;
+                else {memory.check(GuestAddress{arg(0)},size,Access::Write);memory.store(GuestAddress{arg(0)},32,rows.size());for(std::size_t i=0;i<rows.size();++i)memory.write(GuestAddress{arg(0)+4+i*24},rows[i]);}
+            }
+        }catch(const MemoryFault&){result=87;}catch(const std::bad_alloc&){result=8;}
+        arg.return_to(state,result);return {};
+    }
     if(symbol=="GetAdaptersInfo" || symbol=="GetNetworkParams" || symbol=="GetIfEntry" || symbol=="GetIfTable"){
         try{
             auto& config=*runtime_.network.configuration;

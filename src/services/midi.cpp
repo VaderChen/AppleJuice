@@ -4,7 +4,98 @@
 #include <stdexcept>
 #include <map>
 #include <cmath>
+#include "directmusic_sequence.hpp"
 namespace x64arm::midi {
+void SoundBank::set_patch(std::size_t index,std::uint32_t patch){
+    if(index>=instruments.size() || (patch&~0x807f7f7fU))throw std::invalid_argument("DLS 樂器編號無效");
+    auto& item=instruments[index];if(item.header>bytes.size() || bytes.size()-item.header<12)throw std::invalid_argument("DLS 樂器標頭無效");
+    const auto bank=(patch&0x80000000U)|((patch>>8)&0x7f7f),program=patch&127U;
+    for(unsigned i=0;i<4;++i){bytes[item.header+4+i]=static_cast<std::uint8_t>(bank>>(8*i));bytes[item.header+8+i]=static_cast<std::uint8_t>(program>>(8*i));}item.patch=patch;
+}
+SoundBank parse_sound_bank(std::span<const std::uint8_t> bytes){
+    using namespace directmusic_file;
+    if(bytes.size()>256*1024*1024)throw std::invalid_argument("DLS 音色庫超過大小上限");
+    const auto roots=chunks(bytes);if(roots.size()!=1 || roots[0].id!="RIFF" || tag(roots[0].bytes)!="DLS ")throw std::invalid_argument("不是 DLS 音色庫");
+    SoundBank bank;bank.bytes.assign(bytes.begin(),bytes.end());unsigned expected=UINT32_MAX;
+    for(const auto& c:chunks(roots[0].bytes.subspan(4))){
+        if(c.id=="dlid"){if(c.bytes.size()!=16)throw std::invalid_argument("DLS GUID 無效");std::copy(c.bytes.begin(),c.bytes.end(),bank.id.begin());}
+        else if(c.id=="colh")expected=static_cast<unsigned>(number(c.bytes,0));
+        else if(c.id=="LIST" && tag(c.bytes)=="lins")for(const auto& instrument:chunks(c.bytes.subspan(4))){
+            if(instrument.id!="LIST" || tag(instrument.bytes)!="ins ")throw std::invalid_argument("DLS 樂器清單無效");SoundBank::Instrument item;bool found=false;
+            for(const auto& part:chunks(instrument.bytes.subspan(4))){
+                if(part.id=="insh"){const auto locale=number(part.bytes,4),patch=number(part.bytes,8);if((locale&~UINT64_C(0x80007f7f)) || patch>127)throw std::invalid_argument("DLS 樂器編號無效");item.patch=static_cast<std::uint32_t>((locale&0x80000000U)|((locale&0x7f7f)<<8)|patch);item.header=static_cast<std::size_t>(part.bytes.data()-bytes.data());found=true;}
+                else if(part.id=="LIST" && tag(part.bytes)=="INFO")for(const auto& text:chunks(part.bytes.subspan(4)))if(text.id=="INAM")for(auto character:text.bytes){if(!character)break;item.name.push_back(static_cast<char16_t>(character));}
+            }if(!found)throw std::invalid_argument("DLS 樂器缺少標頭");bank.instruments.push_back(std::move(item));
+        }
+    }
+    if(bank.instruments.empty() || bank.instruments.size()!=expected)throw std::invalid_argument("DLS 樂器數量不符");
+    // Core Audio 會把奇數長度 INFO 字串的 RIFF pad 誤認成下一個 chunk。
+    // 將已存在的零 pad 納入字串長度；總長、pool offset、音樂與版權資料均不變。
+    std::function<void(Bytes,bool,unsigned)> normalize=[&](Bytes data,bool info,unsigned depth){
+        if(depth>16)throw std::invalid_argument("DLS RIFF 巢狀層數過多");
+        for(const auto& c:chunks(data)){
+            if(c.id=="RIFF" || c.id=="LIST")normalize(c.bytes.subspan(4),tag(c.bytes)=="INFO",depth+1);
+            else if(info && (c.bytes.size()&1) && c.bytes.back()==0){const auto offset=static_cast<std::size_t>(c.bytes.data()-bytes.data());if(bytes[offset+c.bytes.size()]==0){const auto size=c.bytes.size()+1;for(unsigned i=0;i<4;++i)bank.bytes[offset-4+i]=static_cast<std::uint8_t>(size>>(8*i));}}
+        }
+    };normalize(bytes,false,0);return bank;
+}
+SoundBank SoundBank::select_instrument(std::size_t index,std::span<const NoteRange> ranges) const {
+    using namespace directmusic_file;using Buffer=std::vector<std::uint8_t>;
+    if(index>=instruments.size())throw std::invalid_argument("DLS 樂器索引無效");
+    for(const auto& r:ranges)if(r.low>r.high || r.high>127)throw std::invalid_argument("DLS 音域無效");
+    const auto append=[](Buffer& dst,Bytes src){if(src.size()>256*1024*1024-dst.size())throw std::invalid_argument("DLS 音色庫過大");dst.insert(dst.end(),src.begin(),src.end());};
+    const auto write=[](Buffer& dst,std::size_t at,std::uint32_t v){if(at>dst.size() || dst.size()-at<4)throw std::invalid_argument("DLS 寫入欄位無效");for(unsigned i=0;i<4;++i)dst[at+i]=static_cast<std::uint8_t>(v>>(8*i));};
+    const auto pack=[&](std::string_view id,Bytes data){Buffer out(id.begin(),id.end());out.resize(8);write(out,4,static_cast<std::uint32_t>(data.size()));append(out,data);if(data.size()&1)out.push_back(0);return out;};
+    const auto root=chunks(bytes);if(root.size()!=1 || root[0].id!="RIFF" || tag(root[0].bytes)!="DLS ")throw std::invalid_argument("DLS 音色庫根區塊無效");
+    const auto top=chunks(root[0].bytes.subspan(4));Bytes selected,pool,waves;
+    for(const auto& c:top){
+        if(c.id=="LIST" && tag(c.bytes)=="lins"){const auto list=chunks(c.bytes.subspan(4));if(!selected.empty() || index>=list.size())throw std::invalid_argument("DLS 樂器清單無效");selected=list[index].bytes;if(list[index].id!="LIST" || tag(selected)!="ins ")throw std::invalid_argument("DLS 樂器區塊無效");}
+        else if(c.id=="ptbl"){if(!pool.empty())throw std::invalid_argument("DLS 重複波形索引");pool=c.bytes;}
+        else if(c.id=="LIST" && tag(c.bytes)=="wvpl"){if(!waves.empty())throw std::invalid_argument("DLS 重複波形池");waves=c.bytes.subspan(4);}
+    }
+    if(selected.empty() || pool.empty())throw std::invalid_argument("DLS 樂器或波形索引缺失");
+    const auto pool_header=number(pool,0),cue_count=number(pool,4);
+    if(pool_header<8 || pool_header>pool.size() || cue_count>(pool.size()-pool_header)/4)throw std::invalid_argument("DLS 波形索引截斷");
+    std::map<std::uint32_t,Bytes> wave_chunks;
+    for(const auto& w:chunks(waves)){if(w.id!="LIST" || tag(w.bytes)!="wave")throw std::invalid_argument("DLS 波形區塊無效");wave_chunks.emplace(static_cast<std::uint32_t>(w.bytes.data()-waves.data()-8),w.bytes);}
+    Buffer instrument{'i','n','s',' '},wavepool{'w','v','p','l'},regions{'l','r','g','n'};std::vector<std::uint32_t> offsets;std::map<std::uint32_t,std::uint32_t> remap;
+    std::uint32_t region_count=0,original_regions=0;std::size_t header_offset=0;bool has_regions=false;
+    const auto parts=chunks(selected.subspan(4));
+    for(const auto& part:parts)if(part.id=="LIST" && tag(part.bytes)=="lrgn"){
+        if(has_regions)throw std::invalid_argument("DLS 重複音域清單");has_regions=true;
+        for(const auto& region:chunks(part.bytes.subspan(4))){
+            if(region.id!="LIST" || (tag(region.bytes)!="rgn " && tag(region.bytes)!="rgn2"))throw std::invalid_argument("DLS 音域區塊無效");
+            const auto fields=chunks(region.bytes.subspan(4));bool include=ranges.empty(),range_found=false,link_found=false;std::uint32_t cue=0;std::size_t link_offset=0;
+            for(const auto& f:fields)if(f.id=="rgnh"){
+                if(range_found)throw std::invalid_argument("DLS 重複音域標頭");range_found=true;const auto low=number(f.bytes,0,2),high=number(f.bytes,2,2);if(low>high || high>127)throw std::invalid_argument("DLS 音域界線無效");
+                for(const auto& r:ranges)include=include || (r.low<=high && r.high>=low);
+            }else if(f.id=="wlnk"){
+                if(link_found)throw std::invalid_argument("DLS 重複波形連結");link_found=true;cue=static_cast<std::uint32_t>(number(f.bytes,8));link_offset=static_cast<std::size_t>(f.bytes.data()-region.bytes.data())+8;
+            }
+            ++original_regions;if(!range_found || !link_found || cue>=cue_count)throw std::invalid_argument("DLS 音域連結無效");if(!include)continue;
+            const auto offset=static_cast<std::uint32_t>(number(pool,static_cast<std::size_t>(pool_header+cue*4)));const auto wave=wave_chunks.find(offset);if(wave==wave_chunks.end())throw std::invalid_argument("DLS 波形索引未指向波形");
+            if(!remap.contains(offset)){remap.emplace(offset,static_cast<std::uint32_t>(offsets.size()));offsets.push_back(static_cast<std::uint32_t>(wavepool.size()-4));append(wavepool,pack("LIST",wave->second));}
+            Buffer data(region.bytes.begin(),region.bytes.end());write(data,link_offset,remap.at(offset));append(regions,pack("LIST",data));++region_count;
+        }
+    }
+    for(const auto& part:parts){
+        if(part.id=="insh"){
+            if(header_offset || number(part.bytes,0)!=original_regions || part.bytes.size()<12)throw std::invalid_argument("DLS 音域數量不符");
+            header_offset=instrument.size()+8;Buffer data(part.bytes.begin(),part.bytes.end());write(data,0,region_count);append(instrument,pack(part.id,data));
+        }else if(part.id=="LIST" && tag(part.bytes)=="lrgn")append(instrument,pack("LIST",regions));
+        else append(instrument,pack(part.id,part.bytes));
+    }
+    if(!header_offset || !has_regions)throw std::invalid_argument("DLS 樂器缺少標頭或音域");
+    Buffer list{'l','i','n','s'};append(list,pack("LIST",instrument));Buffer table(8+offsets.size()*4);write(table,0,8);write(table,4,static_cast<std::uint32_t>(offsets.size()));for(std::size_t i=0;i<offsets.size();++i)write(table,8+i*4,offsets[i]);
+    Buffer body{'D','L','S',' '};for(const auto& c:top){
+        if(c.id=="colh"){Buffer count(4);write(count,0,1);append(body,pack(c.id,count));}
+        else if(c.id=="LIST" && tag(c.bytes)=="lins")append(body,pack("LIST",list));
+        else if(c.id=="ptbl")append(body,pack(c.id,table));
+        else if(c.id=="LIST" && tag(c.bytes)=="wvpl")append(body,pack("LIST",wavepool));
+        else append(body,pack(c.id,c.bytes));
+    }
+    return parse_sound_bank(pack("RIFF",body));
+}
 namespace {
 struct Reader {
     std::span<const std::uint8_t> bytes;std::size_t at{};
@@ -17,6 +108,7 @@ struct Raw {std::uint64_t tick;std::uint32_t tempo;std::uint8_t status,first,sec
 }
 Sequence parse(std::span<const std::uint8_t> bytes){
     if(bytes.size()>16*1024*1024)throw std::invalid_argument("MIDI exceeds 16 MiB");
+    if(bytes.size()>=4 && std::equal(bytes.begin(),bytes.begin()+4,"RIFF"))return parse_directmusic(bytes);
     Reader r{bytes};if(r.number(4)!=0x4d546864)throw std::invalid_argument("not a standard MIDI file");
     const auto size=r.number(4);if(size<6)throw std::invalid_argument("invalid MIDI header");Reader h{r.take(size)};
     const auto format=h.number(2),tracks=h.number(2),division=h.number(2);

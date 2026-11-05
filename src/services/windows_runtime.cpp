@@ -2,14 +2,17 @@
 #include "x64arm/interpreter.hpp"
 #include "service_callback_task.hpp"
 #include "guest_crt_state.h"
+#include "crt_format_contract.h"
 #include "guest_heap_layout.hpp"
 #include "guest_tls.hpp"
+#include "gui_paint_region.hpp"
 #include "windows_loader_lock.hpp"
 #include "windows_memory_diagnostics.hpp"
 #include "windows_process_parameter_layout.hpp"
 #include "x64arm/startup_profile.hpp"
 #include "service_descriptor_index.hpp"
 #include "service_descriptor_catalog.hpp"
+namespace x64arm::detail {const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress,GuestAddress) noexcept;}
 #include "windows_crt_character.hpp"
 #include "windows_locale_data.hpp"
 #include "crt_os_error.hpp"
@@ -55,6 +58,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"kernel32.dll", "InitializeCriticalSection", 1}, {"kernel32.dll", "DeleteCriticalSection", 1},
         {"kernel32.dll", "EnterCriticalSection", 1}, {"kernel32.dll", "LeaveCriticalSection", 1},
         {"kernel32.dll", "SetUnhandledExceptionFilter", 1}, {"kernel32.dll", "Sleep", 1},
+        {"kernel32.dll", "FatalAppExitA", 2}, {"kernel32.dll", "FatalAppExitW", 2},
         {"kernel32.dll", "GetProcessUserModeExceptionPolicy", 1}, {"kernel32.dll", "SetProcessUserModeExceptionPolicy", 1},
         {"kernel32.dll", "VirtualQuery", 3},
         {"kernel32.dll", "GetModuleHandleA", 1}, {"kernel32.dll", "GetModuleHandleW", 1},
@@ -81,7 +85,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"kernel32.dll", "RtlMoveMemory", 3}, {"ntdll.dll", "RtlMoveMemory", 3}, {"crt", "memcpy", 3}, {"crt", "memmove", 3}, {"crt", "memset", 3}, {"crt", "memcmp", 3},
         {"crt", "strlen", 1}, {"crt", "strcmp", 2}, {"crt", "strncmp", 3}, {"crt", "strcpy", 2}, {"crt", "strncpy", 3},
         {"crt", "strcat", 2}, {"crt", "strncat", 3}, {"crt", "wcscat", 2}, {"crt", "wcsncat", 3},
-        {"crt", "_get_stream_buffer_pointers", 4}, {"crt", "__acrt_iob_func", 1}, {"crt", "__iob_func", 0}, {"crt", "fflush", 1}, {"crt", "setvbuf", 4}, {"crt", "setbuf", 2}, {"crt", "_getmaxstdio", 0}, {"crt", "_setmaxstdio", 1}, {"crt", "_dup2", 2}, {"crt", "_locking", 3},
+        {"crt", "_get_stream_buffer_pointers", 4}, {"crt", "__acrt_iob_func", 1}, {"crt", "__iob_func", 0}, {"crt", "fflush", 1}, {"crt", "_flushall", 0}, {"crt", "_fcloseall", 0}, {"crt", "setvbuf", 4}, {"crt", "setbuf", 2}, {"crt", "_getmaxstdio", 0}, {"crt", "_setmaxstdio", 1}, {"crt", "_dup2", 2}, {"crt", "_locking", 3},
         {"crt", "puts", 1}, {"crt", "putchar", 1}, {"crt", "printf", 1}, {"crt", "fprintf", 2},
         {"crt", "vprintf", 2}, {"crt", "wprintf", 1}, {"crt", "vwprintf", 2}, {"crt", "fwprintf", 2}, {"crt", "vfwprintf", 3}, {"crt", "vfprintf", 3}, {"crt", "__stdio_common_vfprintf", 5,1}, {"crt", "__stdio_common_vfprintf_s", 5,1}, {"crt", "__stdio_common_vfwprintf_s", 5,1}, {"crt", "__stdio_common_vfwprintf", 5,1}, {"crt", "snprintf", 3},
         {"crt","__conio_common_vcprintf",4,1},{"crt","__conio_common_vcprintf_s",4,1},{"crt","__conio_common_vcprintf_p",4,1},
@@ -94,6 +98,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"kernel32.dll", "RaiseFailFastException", 3},
         {"kernel32.dll", "RtlAddFunctionTable", 3,1U<<2}, {"ntdll.dll", "RtlAddFunctionTable", 3,1U<<2},
         {"kernel32.dll", "RtlDeleteFunctionTable", 1}, {"ntdll.dll", "RtlDeleteFunctionTable", 1},
+        {"kernel32.dll", "RtlInstallFunctionTableCallback", 6}, {"ntdll.dll", "RtlInstallFunctionTableCallback", 6},
         {"ntdll.dll", "RtlAddGrowableFunctionTable", 6},
         {"ntdll.dll", "RtlGrowFunctionTable", 2}, {"ntdll.dll", "RtlDeleteGrowableFunctionTable", 1},
         {"kernel32.dll", "RaiseException", 4}, {"kernel32.dll", "AddVectoredExceptionHandler", 2}, {"kernel32.dll", "RemoveVectoredExceptionHandler", 1},
@@ -102,7 +107,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"crt", "_local_unwind", 2},
         {"user32.dll", "RegisterClassW", 1}, {"user32.dll", "RegisterClassExW", 1}, {"user32.dll", "RegisterClassA", 1}, {"user32.dll", "RegisterClassExA", 1},
         {"user32.dll", "CreateWindowExW", 12}, {"user32.dll", "CreateWindowExA", 12}, {"user32.dll", "DefWindowProcW", 4}, {"user32.dll", "DefWindowProcA", 4},
-        {"user32.dll", "ShowWindow", 2}, {"user32.dll", "UpdateWindow", 1}, {"user32.dll", "DestroyWindow", 1},
+        {"user32.dll", "ShowWindow", 2}, {"user32.dll", "OpenIcon", 1}, {"user32.dll", "UpdateWindow", 1}, {"user32.dll", "DestroyWindow", 1},
         {"user32.dll", "PostQuitMessage", 1}, {"user32.dll", "GetMessageW", 4}, {"user32.dll", "GetMessageA", 4},
         {"user32.dll", "PeekMessageW", 5}, {"user32.dll", "PeekMessageA", 5}, {"user32.dll", "TranslateMessage", 1},
         {"user32.dll", "DispatchMessageW", 1}, {"user32.dll", "DispatchMessageA", 1}, {"user32.dll", "SendMessageTimeoutA",7},{"user32.dll", "SendMessageTimeoutW",7},{"user32.dll", "SendMessageW", 4}, {"user32.dll", "SendMessageA", 4},
@@ -266,6 +271,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
             {d3d9_service_descriptors(), false},
             {d3d11_service_descriptors(), false},
             {dsound_service_descriptors(), false},
+            {xaudio_service_descriptors(), false},
             {wasapi_service_descriptors(), false},
             {media_foundation_service_descriptors(), false},
             {dinput_service_descriptors(), false},
@@ -552,11 +558,13 @@ Formatted format(const GuestMemory& memory,std::u16string_view specification,boo
                 large.resize(static_cast<std::size_t>(count));return large;
             };
             std::string number;
-            if(integer){auto value_bits=value;if(integer_bits<64)value_bits&=(UINT64_C(1)<<integer_bits)-1;pattern+="ll";pattern+=static_cast<char>(conversion);
-                if(conversion==u'd' || conversion==u'i'){if(integer_bits<64 && (value_bits&(UINT64_C(1)<<(integer_bits-1))))value_bits|=~((UINT64_C(1)<<integer_bits)-1);number=render(static_cast<long long>(std::bit_cast<std::int64_t>(value_bits)));}
-                else number=render(static_cast<unsigned long long>(value_bits));
-            }else if(floating){pattern+=static_cast<char>(conversion);number=render(std::bit_cast<double>(value));}
-            else {pattern="%"+flags+std::to_string(std::max(width,static_cast<int>(pointer_size*2)))+"."+std::to_string(pointer_size*2)+"llX";number=render(static_cast<unsigned long long>(value));}
+            if(floating){pattern+=static_cast<char>(conversion);number=render(std::bit_cast<double>(value));}
+            else {
+                unsigned numeric_flags=0;for(const auto flag:flags)numeric_flags|=x64arm_crt_format_flag(static_cast<unsigned char>(flag));
+                auto digits=x64arm_crt_integer(value,integer_bits,conversion,numeric_flags,static_cast<unsigned>(width),precision,pointer_size);
+                number.append(digits.spaces,' ');number.append(digits.prefix,digits.prefix_count);number.append(digits.zeros,'0');
+                while(digits.count)number+=digits.digits[--digits.count];number.append(digits.trailing,' ');
+            }
             if(floating && three_digit_exponents){const auto exponent=number.find_first_of("eE");if(exponent!=number.npos && exponent+4==number.size() && (number[exponent+1]=='+' || number[exponent+1]=='-'))number.insert(exponent+2,1,'0');}
             rendered.assign(number.begin(),number.end());
             if(floating && decimal_symbol!=u".")if(const auto point=rendered.find(u'.');point!=rendered.npos){
@@ -569,6 +577,65 @@ Formatted format(const GuestMemory& memory,std::u16string_view specification,boo
     }
     return result;
 }
+// 格式讀取與 ABI 解包共用同一實作；只讀客體記憶體，不提交 errno、回呼或輸出。
+// 強制內聯保留既有單核入口的資料流，worker 只省去服務協調。
+__attribute__((always_inline)) inline Formatted format_arguments(const GuestState& state,const GuestMemory& memory,
+        const WindowsCall& arg,const CrtFormatLayout& layout,std::uint64_t fmt,
+        std::uint64_t options,bool x86_,const CrtLocaleObject& locale,std::u16string& specification){
+    const auto& [common,common_stream,common_buffer,stream,standard_output,counting,
+                 wide,secure,limited,unbounded,va,underscore,format_index,console,positional,explicit_locale]=layout;
+    unsigned index=format_index+1+(explicit_locale?1U:0U);
+    std::uint64_t list=va?arg(common?format_index+2:index):0;
+    if(wide)specification=read_utf16(memory,GuestAddress{fmt});
+    else {const auto bytes=read_ansi(memory,fmt);for(const auto c:bytes)specification.push_back(static_cast<unsigned char>(c));}
+    const auto read_argument=[&](unsigned size){
+        if(va){const auto value=memory.load(GuestAddress{list},static_cast<std::uint8_t>(size*8));list+=x86_?size:8;return value;}
+        if(x86_){const auto value=memory.load(GuestAddress{state.reg(Gpr::Rsp)+4ULL*(index+1)},static_cast<std::uint8_t>(size*8));index+=size/4;return value;}return arg(index++);
+    };
+    const auto decimal=windows_crt_numeric(locale.categories[4]).decimal;
+    const auto run=[&](bool inspect,const std::function<std::uint64_t(unsigned,unsigned,FormatArgumentKind)>& next){
+        return format(memory,specification,wide,wide && (!common || (options&4)),x86_?4:8,common?(options&0x10)!=0:underscore,
+                      positional,inspect,locale.categories[2],decimal,next);
+    };
+    struct Argument {unsigned size{},position{};FormatArgumentKind kind{};std::uint64_t value{};};
+    std::vector<Argument> slots;bool indexed=false;
+    if(positional){
+        std::vector<Argument> uses;
+        (void)run(true,[&](unsigned size,unsigned position,FormatArgumentKind kind){uses.push_back({size,position,kind,0});indexed|=position!=0;return UINT64_C(0);});
+        if(indexed){
+            for(const auto& use:uses){
+                if(!use.position)throw FormatError{22};if(slots.size()<use.position)slots.resize(use.position);
+                auto& slot=slots[use.position-1];if(slot.size && (slot.size!=use.size || slot.kind!=use.kind))throw FormatError{22};slot=use;
+            }
+            // 先依參數次序讀取完整 ABI，x86 的 double／I64 佔兩個 stack slot。
+            for(auto& slot:slots){if(!slot.size)throw FormatError{22};slot.value=read_argument(slot.size);}
+        }
+    }
+    return run(false,[&](unsigned size,unsigned position,FormatArgumentKind){return indexed?slots.at(position-1).value:read_argument(size);});
+
+}
+struct CrtBufferOutput {
+    std::vector<std::uint8_t> bytes;
+    std::uint64_t result{};
+    unsigned invalid_parameter{},errno_after_write{};
+};
+__attribute__((always_inline)) inline CrtBufferOutput format_buffer_output(const Formatted& formatted,
+        const CrtFormatLayout& layout,std::uint64_t capacity,std::uint64_t limit,std::uint64_t options,bool x86){
+    const auto& text=formatted.text;CrtBufferOutput output;
+    const unsigned mode=(layout.secure?X64ARM_FMT_SECURE:0U)|(layout.limited?X64ARM_FMT_LIMITED:0U)|
+        (layout.common_buffer?X64ARM_FMT_COMMON:0U)|(layout.underscore?X64ARM_FMT_LEGACY:0U);
+    const auto plan=x64arm_crt_buffer_plan(text.size(),formatted.failed,capacity,limit,x86?UINT32_MAX:UINT64_MAX,options,mode);
+    output.result=plan.result;output.invalid_parameter=plan.invalid_parameter;output.errno_after_write=plan.errno_after_write;
+    if(plan.invalid_parameter)return output;
+    const auto length=plan.length;
+    if(capacity){
+        auto& bytes=output.bytes;bytes.reserve(static_cast<std::size_t>((length+1)*(layout.wide?2:1)));
+        for(std::uint64_t i=0;i<length;++i){bytes.push_back(static_cast<std::uint8_t>(text[i]));if(layout.wide)bytes.push_back(static_cast<std::uint8_t>(text[i]>>8));}
+        if(plan.terminate)bytes.resize(bytes.size()+(layout.wide?2:1));
+    }
+    return output;
+}
+
 }
 std::uint64_t WindowsServices::runtime_allocate(GuestMemory& memory, std::span<const std::uint8_t> bytes, std::size_t size, std::size_t alignment) {
     size = std::max({std::size_t{1}, size, bytes.size()});
@@ -636,6 +703,11 @@ void WindowsServices::initialize_runtime(GuestMemory& memory, std::u16string_vie
     runtime_.wenviron_cell = runtime_base_.value + 64;
     // 舊 MSVCRT 的資料匯出在第一個 locale 呼叫前即須可由 IAT 讀取。
     memory.store(GuestAddress{runtime_base_.value+128},32,1);
+    runtime_.ctype_table=allocate_heap(memory,514U);
+    if(!runtime_.ctype_table)throw std::bad_alloc{};
+    const auto& initial_ctype=windows_crt_character_table(CrtLocaleCategory{});
+    for(unsigned c=0;c<257;++c)memory.store(GuestAddress{runtime_.ctype_table+2*c},16,initial_ctype.masks[c]);
+    memory.store(GuestAddress{runtime_base_.value+136},x86_?32:64,runtime_.ctype_table+2);
     initialize_crt_lowio(memory);
     configure_runtime_arguments(memory,command_line,command_line_address_.value);
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
@@ -672,6 +744,9 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
     publish_loader_lock(memory,peb_base_.value,x86_,0,0);
     (void)process_debugger::self(memory,peb_base_,runtime_.network.external_io);
     if(initial_thread)memory.map(exception_base_, 16 * 8192, read_write);
+    // 初始執行緒與 CreateThread 相同採 Windows 使用者執行緒的初始浮點狀態（x87 控制字 0x27F、MXCSR 0x1F80），
+    // 而非 FNINIT 的 0x37F；CRT 之後的 _controlfp／_fpreset 照常覆寫。
+    if(initial_thread){state.x87_control=0x027f;state.mxcsr=0x1f80;}
     if (x86_) {
         state.segments={0x23,0x1b,0x23,0x23,0x3b,0};
         if(initial_thread){
@@ -692,7 +767,7 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
         memory.store(GuestAddress{parameters},32,parameter_header);memory.store(GuestAddress{parameters+4},32,parameter_header);memory.store(GuestAddress{parameters+8},32,1);
         for(unsigned i=0;i<3;++i)memory.store(GuestAddress{parameters+0x18+i*4},32,0x100+i);
         const auto unicode=[&](std::uint64_t offset,std::u16string_view text){const auto data=utf16_bytes(text);const auto buffer=runtime_allocate(memory,data);memory.store(GuestAddress{parameters+offset},16,data.size()-2);memory.store(GuestAddress{parameters+offset+2},16,data.size());memory.store(GuestAddress{parameters+offset+4},32,buffer);};
-        unicode(0x24,u"C:\\");unicode(0x38,runtime_.image.path);unicode(0x40,read_utf16(memory,command_line_address_));
+        unicode(0x24,runtime_.current_directory);unicode(0x38,runtime_.image.path);unicode(0x40,read_utf16(memory,command_line_address_));
         const auto vector=runtime_allocate(memory,{},64*4);memory.store(GuestAddress{teb_base_.value+0x2c},32,vector);
         memory.store(GuestAddress{teb_base_.value+0xf94},32,teb_base_.value+0x2000);
         if(runtime_.image.tls_index){
@@ -719,7 +794,7 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
     memory.store(GuestAddress{parameters},32,parameter_header);memory.store(GuestAddress{parameters+4},32,parameter_header);memory.store(GuestAddress{parameters+8},32,1);
     for(unsigned i=0;i<3;++i)memory.store(GuestAddress{parameters+0x20+i*8},64,0x100+i);
     const auto unicode=[&](std::uint64_t offset,std::u16string_view text){const auto data=utf16_bytes(text);const auto buffer=runtime_allocate(memory,data);memory.store(GuestAddress{parameters+offset},16,data.size()-2);memory.store(GuestAddress{parameters+offset+2},16,data.size());memory.store(GuestAddress{parameters+offset+8},64,buffer);};
-    unicode(0x38,u"C:\\");const auto argv=memory.load(GuestAddress{runtime_.wargv_cell},64);const auto image_name=memory.load(GuestAddress{argv},64);unicode(0x60,runtime_.image.path.empty()?(image_name?read_utf16(memory,GuestAddress{image_name}):std::u16string{}):runtime_.image.path);unicode(0x70,read_utf16(memory,command_line_address_));
+    unicode(0x38,runtime_.current_directory);const auto argv=memory.load(GuestAddress{runtime_.wargv_cell},64);const auto image_name=memory.load(GuestAddress{argv},64);unicode(0x60,runtime_.image.path.empty()?(image_name?read_utf16(memory,GuestAddress{image_name}):std::u16string{}):runtime_.image.path);unicode(0x70,read_utf16(memory,command_line_address_));
     memory.store(GuestAddress{teb_base_.value + 0x1780}, 64, teb_base_.value + 0x2000);
     const auto tls_vector = runtime_allocate(memory, {}, 64 * 8);
     memory.store(GuestAddress{teb_base_.value + 0x58}, 64, tls_vector);
@@ -1498,6 +1573,14 @@ void WindowsServices::enter_callback(GuestState& state, GuestMemory& memory) {
         memory.store(GuestAddress{write.address},32,(previous&~write.clear_mask)|write.value);
     }
     retain_shell_callback(frame,call);
+    if(call.gui_erase_window){
+        const auto found=gui_.windows.find(call.gui_erase_window);
+        if(found!=gui_.windows.end()){
+            auto& dc=gui_.contexts[0x10000000+call.gui_erase_window];
+            frame.gui_erase_clip=dc.paint_clip;frame.gui_erase_window=call.gui_erase_window;
+            dc.paint_clip=gui_update_region(found->second);gui_refresh_dc_clip(dc);found->second.paint_erase=false;
+        }
+    }
     const auto original_sp = frame.saved.reg(Gpr::Rsp);
     if (original_sp < 256) throw HostCallFault("callback 堆疊不足");
     if (x86_) {
@@ -1596,6 +1679,7 @@ void WindowsServices::discard_callbacks(std::size_t depth, GuestState& state, Gu
             runtime_.sorts.pop_back();
         }
         const auto& frame=runtime_.callbacks.back();
+        if(frame.gui_erase_window)finish_gui_erase_callback(frame,0);
         if(frame.continuation==Continuation::NestedResult && frame.value)service_callback::cancel(this,frame.value);
         if(frame.continuation==Continuation::NativeV8Operation)discard_native_v8(memory,static_cast<std::uint32_t>(frame.value));
         finish_shell_callbacks(memory,frame);
@@ -1611,6 +1695,8 @@ void WindowsServices::discard_callbacks(std::size_t depth, GuestState& state, Gu
         if(frame.continuation==Continuation::OlePersistence)(void)free_heap(memory,frame.value,state);
         if(frame.continuation==Continuation::WinrtOperation)discard_winrt_operation(state,memory,frame.value);
         if(frame.continuation==Continuation::ComMarshalOperation)discard_com_marshal(state,memory,frame.value);
+        if(frame.continuation==Continuation::SocketAccept)discard_socket_accept(state,memory,frame.value);
+        if(frame.continuation==Continuation::ComAgileOperation)discard_com_agile(state,memory,frame.value);
         if(frame.continuation==Continuation::ShellItemOperation)discard_shell_item(state,memory,frame.value);
         if(frame.continuation==Continuation::ComBindOperation)discard_com_bind(state,memory,frame.value);
         if(frame.continuation==Continuation::ComRotOperation)discard_com_rot(state,memory,frame.value);
@@ -1669,6 +1755,7 @@ void WindowsServices::discard_callbacks(std::size_t depth, GuestState& state, Gu
         if(frame.continuation==Continuation::GuiHook)release_gui_scratch(memory,state,frame.hook.scratch);
         if(frame.continuation==Continuation::InitOnce){
             const WindowsCall call(frame.saved,memory,4);auto& once=runtime_.once_initializations.at(call(0));once={};
+            publish_once_cache(memory,call(0),once);
             memory.store(GuestAddress{call(0)},x86_?32:64,0);(void)free_heap(memory,frame.value,state);
         }
         if(frame.loader_notification_lock){release_loader_notification();publish_loader_lock(memory,peb_base_.value,x86_,thread_identifier(runtime_.loader_owner),runtime_.loader_depth);}
@@ -1689,6 +1776,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     auto callback_value=x86_ && frame.index<frame.callbacks.size() && frame.callbacks[frame.index].wide_result?(state.reg(Gpr::Rax)&UINT32_MAX)|((state.reg(Gpr::Rdx)&UINT32_MAX)<<32):state.reg(Gpr::Rax);
     if(frame.index<frame.callbacks.size() && frame.callbacks[frame.index].floating_result)
         callback_value=floating_callback_result(state,frame.callbacks[frame.index].floating_result,x86_);
+    if(frame.gui_erase_window){finish_gui_erase_callback(frame,callback_value);frame.gui_erase_window=0;frame.gui_erase_clip.reset();}
     // 排序／搜尋在同一 API 呼叫中反覆使用相同比較器。保留其父狀態與
     // 參數容器，下一次進入才一次還原 GuestState；巢狀呼叫仍另建框架。
     // GUI／Shell、Win32 SEH 及 unwind 特殊框架沿用一般生命週期。
@@ -1715,12 +1803,13 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     // 框架即將離開堆疊；移交其參數與保留資源，無需配置並複製容器。
     const auto finished = std::move(frame); runtime_.callbacks.pop_back(); state = finished.saved;
     finish_shell_callbacks(memory,finished);
+    if(finished.continuation==Continuation::GuiClipboardNotification){last_error_=static_cast<std::uint32_t>(finished.value);return std::nullopt;}
     if(finished.continuation==Continuation::UnwindConsolidate){
         if(!finished.unwind_target)throw HostCallFault("unwind consolidation 缺少目標 CONTEXT");
         memory.check(GuestAddress{callback_value},1,Access::Execute);
         state=*finished.unwind_target;state.rip=GuestAddress{callback_value};
         if(finished.value>exceptions_.stack.size())throw HostCallFault("unwind consolidation 例外深度不符");
-        exceptions_.stack.resize(static_cast<std::size_t>(finished.value));return std::nullopt;
+        exceptions_.stack.resize(static_cast<std::size_t>(finished.value));sync_msvc_uncaught(memory);return std::nullopt;
     }
     if(finished.continuation==Continuation::CrtAssertion || finished.continuation==Continuation::CrtFatalDialog){
         (void)free_heap(memory,finished.value,state);
@@ -1731,11 +1820,24 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
         const auto code=finished.continuation==Continuation::CrtFatalDialog?255U:3U;
         record_job_exit(code);(void)emit_debug_event(state,memory,debugger::ExitProcess{code});return code;
     }
+    if(finished.continuation==Continuation::GuiBeginPaint){
+        const unsigned unit=x86_?4U:8U;
+        const auto dc=memory.load(GuestAddress{finished.value},x86_?32:64);
+        if(dc<0x10000000 || !gui_.windows.contains(dc-0x10000000)){last_error_=1400;complete_call(state,memory,0);return std::nullopt;}
+        memory.store(GuestAddress{finished.value+unit},32,callback_value?0:1);
+        complete_call(state,memory,dc);return std::nullopt;
+    }
+    if(finished.continuation==Continuation::GuiOpenIcon){
+        if(!callback_value || !gui_.windows.contains(finished.value)){complete_call(state,memory,0);return std::nullopt;}
+        start_callbacks(state,memory,{{resolve("user32.dll","ShowWindow").value,{finished.value,9}}},Continuation::Return,1);return std::nullopt;
+    }
     if(finished.continuation==Continuation::NtCloseResult){
         complete_call(state,memory,callback_value?0U:last_error_==6?0xc0000008U:last_error_==5?0xc0000022U:0xc0000001U);return std::nullopt;
     }
     if(finished.loader_notification_lock){release_loader_notification();publish_loader_lock(memory,peb_base_.value,x86_,thread_identifier(runtime_.loader_owner),runtime_.loader_depth);}
     // 同後端巢狀執行由呼叫端繼續完成原操作；此時只恢復狀態與回呼結果。
+    if(finished.continuation==Continuation::FunctionTableLookup || finished.continuation==Continuation::ExceptionFunctionLookup || finished.continuation==Continuation::CapturePreviousContext)
+        return finish_function_lookup(state,memory,finished.continuation,callback_value);
     if(finished.continuation==Continuation::NestedResult){
         if(finished.value)service_callback::resume(this,threads_.current,finished.value,state,callback_value);
         else state.reg(Gpr::Rax)=callback_value;
@@ -1753,6 +1855,8 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     if(finished.continuation==Continuation::NativeV8Operation)return resume_native_v8(state,memory,static_cast<std::uint32_t>(finished.value),static_cast<std::uint32_t>(callback_value));
     if(finished.continuation==Continuation::WinrtOperation)return resume_winrt_operation(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::ComMarshalOperation)return resume_com_marshal(state,memory,finished.value,callback_value);
+    if(finished.continuation==Continuation::SocketAccept)return resume_socket_accept(state,memory,finished.value,callback_value);
+    if(finished.continuation==Continuation::ComAgileOperation)return resume_com_agile(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::ShellItemOperation)return resume_shell_item(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));
     if(finished.continuation==Continuation::ComBindOperation)return resume_com_bind(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::ComRotOperation)return resume_com_rot(state,memory,finished.value,callback_value);
@@ -1866,6 +1970,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
        finished.continuation==Continuation::GuiCreationNcCalc || finished.continuation==Continuation::GuiCreationCreate || finished.continuation==Continuation::GuiCreationFinish ||
        finished.continuation==Continuation::GuiCreationAbort)return resume_gui_creation(state,memory,finished,callback_value);
     if(finished.continuation==Continuation::FileTransfer)return advance_file_transfer(state,memory,finished.value,callback_value);
+    if(finished.continuation==Continuation::PageSetupStart || finished.continuation==Continuation::PageSetupResult || finished.continuation==Continuation::PageSetupHook || finished.continuation==Continuation::PageSetupPaint)return resume_page_setup(state,memory,finished,callback_value);
     if(finished.continuation==Continuation::PrintDialogOperation)return resume_print_dialog(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::PrintPropertyPageOperation)return resume_property_page(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::GuiPropertySheet)return resume_property_sheet(state,memory,finished,callback_value);
@@ -1887,6 +1992,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
         const bool success=static_cast<std::uint32_t>(callback_value)!=0 && !(context&3);
         once.owner=0;once.complete=success;once.context=success?context:0;
         memory.store(GuestAddress{call(0)},width,success?context|2:0);
+        publish_once_cache(memory,call(0),once);
         if(success && call(3))memory.store(GuestAddress{call(3)},width,context);
         if(callback_value && (context&3))last_error_=87;
         complete_call(state,memory,success);return std::nullopt;
@@ -1923,7 +2029,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     if (finished.continuation == Continuation::Exception) return resume_exception(state, memory, callback_value);
     if (finished.continuation == Continuation::ContinueException) {
         if (exceptions_.stack.empty()) throw HostCallFault("繼續例外 callback 缺少派送狀態");
-        state=read_context(memory,exceptions_.stack.back().context,finished.saved);exceptions_.stack.pop_back();return std::nullopt;
+        state=read_context(memory,exceptions_.stack.back().context,finished.saved);exceptions_.stack.pop_back();sync_msvc_uncaught(memory);return std::nullopt;
     }
     if (finished.continuation == Continuation::SehFilter) return seh_filter_result(state, memory, callback_value);
     if (finished.continuation == Continuation::SehFinally) return seh_finally_result(state, memory);
@@ -2078,6 +2184,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         if(detail::service_descriptor_contains<security_service_descriptors>(service,reuse))return &WindowsServices::invoke_security;
         if (service.family == "internal-dmusic" || service.family == "dmusic.dll" || service.family == "dmime.dll" || service.family == "dmloader.dll") return &WindowsServices::invoke_directmusic;
         if (service.family == "dsound.dll" || service.family == "internal-dsound") return &WindowsServices::invoke_dsound;
+        if (service.family == "internal-xaudio" || service.family == "xaudio2_7.dll" || service.family == "xaudio2_8.dll" || service.family == "xaudio2_9.dll") return &WindowsServices::invoke_xaudio;
         if (service.family == "mmdevapi.dll" || service.family == "audioses.dll" || service.family == "internal-wasapi") return &WindowsServices::invoke_wasapi;
         if (service.family == "mfplat.dll" || service.family == "mf.dll" || service.family == "mfreadwrite.dll" || service.family == "internal-mf") return &WindowsServices::invoke_media_foundation;
         if(detail::service_descriptor_contains<dinput_service_descriptors>(service,reuse))return &WindowsServices::invoke_dinput;
@@ -2086,7 +2193,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
             if(detail::service_descriptor_contains<d3d9_service_descriptors>(service,reuse))return &WindowsServices::invoke_d3d9;
         if (service.family == "d3d10.dll" || service.family == "d3d10_1.dll" || service.family == "internal-d3d10" || service.family == "d3dx10_43.dll" || service.family == "d3d11.dll" || service.family == "dxgi.dll" || service.family == "internal-d3d11" || service.family == "d3dcompiler_47.dll" || service.family == "d3dcompiler_43.dll" || service.family == "d3dx11_42.dll" || service.family == "d3dx11_43.dll")
             return &WindowsServices::invoke_d3d11;
-        constexpr std::array io_names{"_umask","_umask_s","_creat", "_wcreat", "freopen", "_wfreopen", "_chsize", "_chsize_s", "_open_osfhandle", "_get_osfhandle", "_filelength", "_filelengthi64", "fgetpos", "fsetpos", "fopen_s", "_wfopen_s", "fopen", "_wfopen", "_fsopen", "_wfsopen", "_commit", "fclose", "fread", "fwrite", "fseek", "_fseeki64", "ftell", "_ftelli64", "feof", "ferror", "clearerr", "rewind", "fgetwc", "fgetws", "fputwc", "ungetc", "ungetwc", "getchar", "fgetc", "getc", "fgets", "fputs", "fputc", "putc", "fflush", "setvbuf", "setbuf", "_getmaxstdio", "_setmaxstdio", "_dup2", "_locking", "_dup", "_fdopen", "_wfdopen", "_close", "_read", "_write", "_open", "_wopen", "_sopen", "_wsopen", "_sopen_s", "_wsopen_s", "_lseek", "_lseeki64", "_tell", "_telli64", "_isatty", "_setmode"};
+        constexpr std::array io_names{"_umask","_umask_s","_creat", "_wcreat", "freopen", "_wfreopen", "_chsize", "_chsize_s", "_open_osfhandle", "_get_osfhandle", "_filelength", "_filelengthi64", "fgetpos", "fsetpos", "fopen_s", "_wfopen_s", "fopen", "_wfopen", "_fsopen", "_wfsopen", "_commit", "fclose", "fread", "fwrite", "fseek", "_fseeki64", "ftell", "_ftelli64", "feof", "ferror", "clearerr", "rewind", "fgetwc", "fgetws", "fputwc", "ungetc", "ungetwc", "getchar", "fgetc", "getc", "fgets", "fputs", "fputc", "putc", "fflush", "_flushall", "_fcloseall", "setvbuf", "setbuf", "_getmaxstdio", "_setmaxstdio", "_dup2", "_locking", "_dup", "_fdopen", "_wfdopen", "_close", "_read", "_write", "_open", "_wopen", "_sopen", "_wsopen", "_sopen_s", "_wsopen_s", "_lseek", "_lseeki64", "_tell", "_telli64", "_isatty", "_setmode"};
         if (service.family == "crt" && std::find(io_names.begin(), io_names.end(), service.symbol) != io_names.end()) return &WindowsServices::invoke_crt_io;
         if(detail::service_descriptor_contains<tls_service_descriptors>(service,reuse))return &WindowsServices::invoke_tls;
         if(service.family=="internal-msxml")return &WindowsServices::invoke_msxml;
@@ -2145,7 +2252,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         if(detail::service_descriptor_contains<environment_service_descriptors>(service,reuse))return &WindowsServices::invoke_environment;
         if(detail::service_descriptor_contains<memory_service_descriptors>(service,reuse))return &WindowsServices::invoke_memory;
         if (service.family == "iphlpapi.dll" || service.family=="winhttp.dll" || service.family=="dhcpcsvc.dll") return &WindowsServices::invoke_network_config;
-        if (service.family == "ws2_32.dll" || service.family=="mswsock.dll") return &WindowsServices::invoke_network;
+        if (service.family == "ws2_32.dll" || service.family=="mswsock.dll" || service.family=="dnsapi.dll") return &WindowsServices::invoke_network;
         if (service.family == "mpr.dll") return &WindowsServices::invoke_mpr;
         if(detail::service_descriptor_contains<dpapi_service_descriptors>(service,reuse))return &WindowsServices::invoke_dpapi;
         if(detail::service_descriptor_contains<certificate_find_service_descriptors>(service,reuse))return &WindowsServices::invoke_certificate_find;
@@ -2190,7 +2297,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         });
         handler=slot.handler;format_service=slot.format;
     }else {handler=classify(service);format_service=!handler && crt_format_symbol(service.symbol);}
-    if(handler)return (this->*handler)(state,memory,service);
+    if(handler){
+        const bool gdi=(service.family=="gdi32.dll" || service.family=="msimg32.dll" || handler==&WindowsServices::invoke_gdi) &&
+            service.symbol!="GdiFlush" && service.symbol!="GdiGetBatchLimit" && service.symbol!="GdiSetBatchLimit";
+        const bool batchable=gdi && begin_gdi_batch_call(memory,service);
+        const auto result=(this->*handler)(state,memory,service);
+        if(gdi)(void)end_gdi_batch_call(memory,batchable); // 隱式 flush 不改寫目前 API 的結果。
+        return result;
+    }
     const WindowsCall arg(state, memory, service);
     // 不可變 descriptor 已判定所屬 provider，格式化不再逐次穿過 TLS、heap 等家族。
     // 關閉開關仍走原分類順序，兩條路徑共用同一次 ABI 檢查與格式化本體。
@@ -2220,7 +2334,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
                 memory.store(GuestAddress{thread.teb+tls_offset(index)},x86_?32:64,0);
         }
     };
-    if (symbol == "FlsAlloc") {
+    if(symbol=="FatalAppExitA" || symbol=="FatalAppExitW"){
+        // 共用客體訊息框與程序結束流程，保留關閉對話框後才終止的順序。
+        start_callbacks(state,memory,{
+            {resolve("user32.dll",symbol.ends_with('W')?"MessageBoxW":"MessageBoxA").value,{0,arg(1),0,0x2010}},
+            {resolve("kernel32.dll","ExitProcess").value,{0x40000015U}}
+        },Continuation::Return,0);return std::nullopt;
+    }else if (symbol == "FlsAlloc") {
         if (arg(0)) memory.check(GuestAddress{arg(0)}, 1, Access::Execute);
         result = UINT32_MAX;
         for (std::size_t i = 0; i < runtime_.fls_used.size(); ++i) if (!runtime_.fls_used[i]) {
@@ -2411,17 +2531,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
             }
         }
     } else if(symbol=="__dllonexit") {
-        memory.check(GuestAddress{arg(1)},8,Access::Write);memory.check(GuestAddress{arg(2)},8,Access::Write);
-        const auto begin=memory.load(GuestAddress{arg(1)},64),end=memory.load(GuestAddress{arg(2)},64);
-        if(!arg(0) || end<begin || (end-begin)%8 || end-begin>=4096*8U)result=0;
+        const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+        if(!arg(1) || !arg(2)){arg.return_to(state,0);return std::nullopt;}
+        memory.check(GuestAddress{arg(1)},unit,Access::Write);memory.check(GuestAddress{arg(2)},unit,Access::Write);
+        const auto begin=memory.load(GuestAddress{arg(1)},bits),end=memory.load(GuestAddress{arg(2)},bits);
+        if(!arg(0) || !begin || !end || end<begin || (end-begin)%unit || end-begin>=4096*unit)result=0;
         else {
-            memory.check(GuestAddress{arg(0)},1,Access::Execute);
-            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(end-begin+8));
-            if(end!=begin)memory.read(GuestAddress{begin},std::span(bytes).first(bytes.size()-8));
+            // VC 的 DLL 啟動程式可先 EncodePointer；此 API 只保存指標，呼叫方在退出時解碼並呼叫。
+            // 不將不透明值作 Execute 檢查，也不在此處解碼或執行。
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(end-begin+unit));
+            if(end!=begin)memory.read(GuestAddress{begin},std::span(bytes).first(bytes.size()-unit));
             const auto target=allocate_heap(memory,bytes.size());
-            if(target){memory.write(GuestAddress{target},bytes);memory.store(GuestAddress{target+end-begin},64,arg(0));
-                if(begin && allocations_.contains(begin))(void)free_heap(memory,begin,state);
-                memory.store(GuestAddress{arg(1)},64,target);memory.store(GuestAddress{arg(2)},64,target+bytes.size());result=arg(0);
+            if(target){memory.write(GuestAddress{target},bytes);memory.store(GuestAddress{target+end-begin},bits,arg(0));
+                if(begin && (allocations_.contains(begin) || guest_heap_contains(begin)))(void)free_heap(memory,begin,state);
+                memory.store(GuestAddress{arg(1)},bits,target);memory.store(GuestAddress{arg(2)},bits,target+bytes.size());result=arg(0);
             }
         }
     } else if (symbol == "_c_exit")result=0; // quick cleanup 不執行 onexit；共用 CRT 串流採直接 I/O，沒有待 flush 緩衝。
@@ -2597,14 +2720,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
     } else if (symbol == "_recalloc") {
         // MSVC：以 count×size 重新配置；乘積溢位為 ENOMEM，NULL 視同 calloc，大小 0 釋放，擴增部分清零。
         const auto found = allocations_.find(arg(0));
-        if(arg(0) && found==allocations_.end())throw HostCallFault("_recalloc 收到非配置起始地址");
+        const bool guest=guest_heap_contains(arg(0));
+        if(arg(0) && !guest && found==allocations_.end())throw HostCallFault("_recalloc 收到非配置起始地址");
         const auto count=arg(1),unit=arg(2);
         if(unit && count>heap_max_request/unit)memory.store(GuestAddress{runtime_.errno_cell},32,12);
         else {
-            const std::uint64_t size=count*unit,previous=arg(0)?found->second:0;
+            const std::uint64_t size=count*unit,previous=arg(0)?(guest?guest_heap_block_size(memory,arg(0)):found->second):0;
             if(arg(0) && !size)(void)free_heap(memory,arg(0),state);
             else {
-                result=arg(0)?reallocate_heap(memory,arg(0),size,state):allocate_heap(memory,size);
+                if(guest){
+                    result=size<=previous?arg(0):guest_heap_allocate(memory,size);
+                    if(!result)result=allocate_heap(memory,size);
+                    if(result && result!=arg(0)){
+                        memory.move(GuestAddress{result},GuestAddress{arg(0)},static_cast<std::size_t>(previous));
+                        guest_heap_free(memory,arg(0));
+                    }
+                }else result=arg(0)?reallocate_heap(memory,arg(0),size,state):allocate_heap(memory,size);
                 if(!result && retry_allocation(size))return std::nullopt;
                 if(result && size>previous)memory.fill(GuestAddress{result+previous},0,static_cast<std::size_t>(size-previous));
             }
@@ -2708,11 +2839,74 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
     } else throw HostCallFault("尚未實作此執行階段服務：" + std::string(symbol));
     arg.return_to(state, result); return std::nullopt;
 }
+#ifdef X64ARM_HOST_SERVICES_PARALLEL_SERVICE
+bool WindowsServices::parallel_crt_format_service(GuestAddress address)const noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_AOT_WORKER_CRT_FORMAT");return !value || std::string_view(value)!="0";}();
+    if(!enabled || x86_)return false;
+    const auto* descriptor=detail::runtime_stub_descriptor(stub_base_,address);
+    if(!descriptor || descriptor->family!="crt" || !crt_format_symbol(descriptor->symbol))return false;
+    const auto layout=crt_format_layout(*descriptor);
+    return !layout.stream && !layout.console;
+}
+bool WindowsServices::invoke_parallel_crt_format(GuestState& state,GuestMemory& memory,std::uint64_t tid){
+    // 呼叫者已持有共用映射鎖並核對 context 身分；locale 表與 CRT 待完成作業
+    // 由協調者在獨占鎖／全停時修改。worker 不借用 threads_.current。
+    const auto pending=runtime_.crt_io_operations.find(tid);
+    if(pending!=runtime_.crt_io_operations.end() && std::any_of(pending->second.begin(),pending->second.end(),
+        [](const auto& operation){return operation.id!=0;}))return false;
+    const auto* descriptor=detail::runtime_stub_descriptor(stub_base_,state.rip);
+    if(!descriptor)return false;
+    struct Chunk {std::uint8_t* data;std::size_t size;};std::vector<Chunk> chunks;
+    std::vector<std::uint8_t> bytes;std::uint64_t result=0;std::optional<WindowsCall> call;
+    try {
+        call.emplace(state,memory,*descriptor);const auto& arg=*call;const auto layout=crt_format_layout(*descriptor);
+        const auto destination=layout.counting?0:arg(layout.common_buffer?1:0);
+        const auto capacity=layout.counting?0:layout.unbounded?output_limit:arg(layout.common_buffer?2:1);
+        const auto limit=layout.limited?arg(layout.common_buffer?3:2):capacity;
+        const auto fmt=arg(layout.format_index),options=layout.common?arg(0):0;
+        if(!fmt || (layout.common && (options&~UINT64_C(0x37))) || (layout.limited && !limit) ||
+           (!layout.counting && ((layout.secure && (!destination || !capacity)) || (!destination && capacity))))return false;
+        auto locale_handle=layout.common || layout.explicit_locale?arg(layout.format_index+1):0;
+        if(!locale_handle){const auto thread=runtime_.crt_thread_locales.find(tid);locale_handle=thread==runtime_.crt_thread_locales.end()?runtime_.crt_current_locale:thread->second;}
+        static const CrtLocaleObject initial_locale{};const auto* locale=&initial_locale;
+        if(locale_handle){const auto found=runtime_.crt_locales.find(locale_handle);if(found==runtime_.crt_locales.end())return false;locale=&found->second;}
+        std::u16string specification;
+        const auto formatted=format_arguments(state,memory,arg,layout,fmt,options,false,*locale,specification);
+        // errno、無效參數回呼及故障都交回既有 provider；此時還沒有客體副作用。
+        if(formatted.encoding_error || formatted.failed)return false;
+        result=formatted.text.size();
+        const auto sp=state.reg(Gpr::Rsp);
+        if(sp>UINT64_MAX-8)return false;
+        (void)memory.load(GuestAddress{sp},64);
+        if(!layout.counting && (destination || capacity)){
+            auto output=format_buffer_output(formatted,layout,capacity,limit,options,false);
+            if(output.invalid_parameter || output.errno_after_write || output.bytes.size()>UINT64_MAX-destination)return false;
+            if(destination<sp+8 && destination+output.bytes.size()>sp)return false;
+            // 先驗證全部輸出視窗，排除 COW、可執行寫入與外部 backing。
+            // 提交只寫已借用的原生頁，不改映射、不在半途回報「尚未處理」。
+            for(std::size_t offset=0;offset<output.bytes.size();){
+                const auto window=memory.native_window(GuestAddress{destination+offset},2);
+                if(!window.data || !window.after)return false;
+                const auto count=std::min(window.after,output.bytes.size()-offset);
+                chunks.push_back({window.data,count});offset+=count;
+            }
+            result=output.result;bytes=std::move(output.bytes);
+        }
+    }catch(const MemoryFault&){return false;}
+     catch(const HostCallFault&){return false;}
+     catch(const FormatError&){return false;}
+     catch(const std::bad_alloc&){return false;}
+    std::size_t offset=0;
+    for(const auto& chunk:chunks){std::memcpy(chunk.data,bytes.data()+offset,chunk.size);offset+=chunk.size;}
+    call->return_to(state,result);return true;
+}
+#endif
 std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& state,GuestMemory& memory,
                                                           const WindowsServiceDescriptor& service,const WindowsCall& arg){
     std::uint64_t result=0;
+    const auto layout=crt_format_layout(service);
     const auto [common,common_stream,common_buffer,stream,standard_output,counting,
-                wide,secure,limited,unbounded,va,underscore,format_index,console,positional,explicit_locale]=crt_format_layout(service);
+                wide,secure,limited,unbounded,va,underscore,format_index,console,positional,explicit_locale]=layout;
     const auto destination=stream || counting || console?0:arg(common_buffer?1:0),capacity=stream || counting || console?0:unbounded?output_limit:arg(common_buffer?2:1);
     const auto limit=limited?arg(common_buffer?3:2):capacity;const auto fmt=arg(format_index);const auto options=common?arg(0):0;
     const auto invalid_format=[&](unsigned error)->std::optional<std::uint32_t>{
@@ -2731,34 +2925,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& stat
     if(limited && !destination && !capacity && !limit){arg.return_to(state,0);return std::nullopt;}
     if(!stream && !counting && !console && ((secure && (!destination || !capacity)) || (!destination && capacity)))return invalid_format(22);
     if(limited && !limit){memory.store(GuestAddress{destination},wide?16:8,0);arg.return_to(state,UINT32_MAX);return std::nullopt;}
-    unsigned index=format_index+1+(explicit_locale?1U:0U);std::uint64_t list=va?arg(common?format_index+2:index):0;
-    std::u16string specification;if(wide)specification=read_utf16(memory,GuestAddress{fmt});else {const auto bytes=read_ansi(memory,fmt);for(const auto c:bytes)specification.push_back(static_cast<unsigned char>(c));}
-    Formatted formatted;
-    const auto read_argument=[&](unsigned size){
-        if(va){const auto value=memory.load(GuestAddress{list},static_cast<std::uint8_t>(size*8));list+=x86_?size:8;return value;}
-        if(x86_){const auto value=memory.load(GuestAddress{state.reg(Gpr::Rsp)+4ULL*(index+1)},static_cast<std::uint8_t>(size*8));index+=size/4;return value;}return arg(index++);
-    };
-    try {
-        const auto decimal=windows_crt_numeric(locale->categories[4]).decimal;
-        const auto run=[&](bool inspect,const std::function<std::uint64_t(unsigned,unsigned,FormatArgumentKind)>& next){
-            return format(memory,specification,wide,wide && (!common || (options&4)),x86_?4:8,common?(options&0x10)!=0:underscore,
-                          positional,inspect,locale->categories[2],decimal,next);
-        };
-        struct Argument {unsigned size{},position{};FormatArgumentKind kind{};std::uint64_t value{};};
-        std::vector<Argument> slots;bool indexed=false;
-        if(positional){
-            std::vector<Argument> uses;
-            (void)run(true,[&](unsigned size,unsigned position,FormatArgumentKind kind){uses.push_back({size,position,kind,0});indexed|=position!=0;return UINT64_C(0);});
-            if(indexed){
-                for(const auto& use:uses){
-                    if(!use.position)throw FormatError{22};if(slots.size()<use.position)slots.resize(use.position);
-                    auto& slot=slots[use.position-1];if(slot.size && (slot.size!=use.size || slot.kind!=use.kind))throw FormatError{22};slot=use;
-                }
-                // 先依參數次序讀取完整 ABI，x86 的 double／I64 佔兩個 stack slot。
-                for(auto& slot:slots){if(!slot.size)throw FormatError{22};slot.value=read_argument(slot.size);}
-            }
-        }
-        formatted=run(false,[&](unsigned size,unsigned position,FormatArgumentKind){return indexed?slots.at(position-1).value:read_argument(size);});
+    std::u16string specification;Formatted formatted;
+    try {formatted=format_arguments(state,memory,arg,layout,fmt,options,x86_,*locale,specification);
     }catch(const FormatError& error){
         // 無效格式會進入 invalid parameter 處理（多半終止程序）；保留格式字串供相容性診斷。
         std::fprintf(stderr,"crt_format_invalid pid=%u symbol=%.*s errno=%u format=%s\n",process_id(),static_cast<int>(service.symbol.size()),service.symbol.data(),error.code,utf16_to_utf8(specification.substr(0,240)).c_str());
@@ -2769,16 +2937,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& stat
         const auto error=text.empty()?0:write_crt_console(text,wide);
         if(error){memory.store(GuestAddress{runtime_.errno_cell},32,error==109?32:9);result=UINT32_MAX;}
     }else if(!stream && !counting){
-        const bool legacy=!secure && (common_buffer?(options&1)!=0:underscore);
         if(!destination && !capacity){arg.return_to(state,result);return std::nullopt;}
-        if(secure && !limited && text.size()>=capacity)return invalid_format(34);
-        if(limited && limit>=(capacity) && limit!=(x86_?UINT32_MAX:UINT64_MAX) && text.size()>=capacity)return invalid_format(34);
-        const auto available=capacity?capacity-(legacy?0U:1U):0;auto length=std::min<std::uint64_t>(text.size(),available);if(limited)length=std::min(length,limit);
-        if(capacity){std::vector<std::uint8_t> bytes;bytes.reserve(static_cast<std::size_t>((length+1)*(wide?2:1)));for(std::uint64_t i=0;i<length;++i){bytes.push_back(static_cast<std::uint8_t>(text[i]));if(wide)bytes.push_back(static_cast<std::uint8_t>(text[i]>>8));}if(length<capacity)bytes.resize(bytes.size()+(wide?2:1));memory.write(GuestAddress{destination},bytes);}
-        if(limited && length<text.size())result=UINT32_MAX;
-        else if(legacy && text.size()>capacity)result=UINT32_MAX;
-        else if(common_buffer && !secure && !legacy && !(options&2) && text.size()>=capacity)result=UINT32_MAX;
-        if(!capacity && legacy){memory.store(GuestAddress{runtime_.errno_cell},32,34);result=UINT32_MAX;}
+        const auto output=format_buffer_output(formatted,layout,capacity,limit,options,x86_);
+        if(output.invalid_parameter)return invalid_format(output.invalid_parameter);
+        if(capacity)memory.write(GuestAddress{destination},output.bytes);
+        if(output.errno_after_write)memory.store(GuestAddress{runtime_.errno_cell},32,output.errno_after_write);
+        result=output.result;
     }else if(stream){
         std::uint64_t written=0;
         if(wide)written=write_crt_wide_stream(state,memory,target,text);

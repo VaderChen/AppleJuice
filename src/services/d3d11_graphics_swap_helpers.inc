@@ -3,11 +3,11 @@
             require(swap->native->graphics_samples_supported(format,samples) && (samples==1 || !(usage&0x400)));
             std::vector<std::uint64_t> buffers,resolved;const auto device=object(swap->device).identity;
             // GetBuffer 傳回真正的 MSAA 資源；呈現前才解析成單一 sample。
-            const auto make_buffer=[&](unsigned sample_count){GraphicsResourceDesc d;d.dimension=3;d.width=width;d.height=height;d.format=format;d.samples=sample_count;d.bind=0x28|((usage&0x400)?0x80U:0U);auto native=swap->native->graphics_resource(d);auto texture=create(Kind::Texture,device->root);texture->resource=std::move(native);texture->texture_desc={width,height,1,1,format,sample_count,0,0,d.bind,0,0};texture->desc.resize(44);for(unsigned j=0;j<11;++j)put_word(texture->desc,4*j,texture->texture_desc[j]);return texture->root;};
+            const auto make_buffer=[&](unsigned sample_count){GraphicsResourceDesc d;d.dimension=3;d.width=width;d.height=height;d.format=format;d.samples=sample_count;d.bind=0x28|((usage&0x400)?0x80U:0U);auto native=swap->native->graphics_resource(d);auto texture=create(Kind::Texture,device->root);texture->resource=std::move(native);texture->texture_desc={width,height,1,1,format,sample_count,0,0,d.bind,0,0};texture->desc.resize(44);for(unsigned j=0;j<11;++j)put_word(texture->desc,4*j,texture->texture_desc[j]);retain(texture->root);release(texture->root);return texture->root;};
             try{for(unsigned i=0;i<count;++i)buffers.push_back(make_buffer(samples));if(samples>1)resolved.push_back(make_buffer(1));if(gui_.windows.contains(swap->window))swap->native->drawable(native_gui_?native_gui_->graphics_view(swap->window):nullptr,width,height);}
-            catch(...){for(auto pointer:buffers)release(pointer);for(auto pointer:resolved)release(pointer);throw;}
-            auto previous=std::move(swap->bindings["Backbuffers"]);swap->bindings["Backbuffers"]=std::move(buffers);for(auto pointer:previous)release(pointer);
-            previous=std::move(swap->bindings["PresentResolve"]);swap->bindings["PresentResolve"]=std::move(resolved);for(auto pointer:previous)release(pointer);
+            catch(...){for(auto pointer:buffers)release_internal(pointer);for(auto pointer:resolved)release_internal(pointer);throw;}
+            auto previous=std::move(swap->bindings["Backbuffers"]);swap->bindings["Backbuffers"]=std::move(buffers);for(auto pointer:previous)release_internal(pointer);
+            previous=std::move(swap->bindings["PresentResolve"]);swap->bindings["PresentResolve"]=std::move(resolved);for(auto pointer:previous)release_internal(pointer);
             swap->present_frame.reset();swap->present_spare.reset();
         };
         const auto make_swap=[&](const std::shared_ptr<Identity>& device,std::uint64_t factory,std::uint64_t address,std::uint64_t window,bool desc1,std::uint64_t fullscreen_desc=0,std::uint64_t restricted=0){

@@ -13,6 +13,7 @@ typedef unsigned long long Word;
 typedef int (*Compare)(const void *, const void *);
 #define EXPORT __declspec(dllexport)
 #define INLINE static __attribute__((always_inline)) inline
+#include "guest_crt_format.h"
 
 EXPORT void (*volatile host_qsort)(void *, Size, Size, Compare);
 EXPORT void *(*volatile host_bsearch)(const void *, const void *, Size, Size, Compare);

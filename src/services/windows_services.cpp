@@ -6,8 +6,17 @@
 #include "x64arm/windows_unwind.hpp"
 #include "guest_heap_layout.hpp"
 #include "resident_service_policy.hpp"
+#include "gui_timing_layout.h"
 #include "crt_library.hpp"
 #include "builtin_export_aliases.hpp"
+#include "builtin_provider_families.hpp"
+#include "msvcp90_string_exports.hpp"
+#include "msvcp90_stream_exports.hpp"
+#include "guest_mf_image.hpp"
+#include "guest_mf_buffer.hpp"
+#include "guest_xaudio.hpp"
+#include "guest_d3d9_formats.hpp"
+#include "guest_com_agile.hpp"
 #include "windows_scalar_math.hpp"
 #include "guest_scalar_math_code.hpp"
 #include "guest_thread_code.hpp"
@@ -18,6 +27,7 @@
 #include "x64arm/entry_runtime_profile.hpp"
 #include "x64arm/interpreter.hpp"
 #include "windows_crt_character.hpp"
+#include "windows_locale_data.hpp"
 #include "monotonic_clock.hpp"
 #include "x64arm/windows_api_sets.hpp"
 #include "x64arm/windows_raw_input.hpp"
@@ -364,6 +374,7 @@ constexpr std::uint64_t guest_memory_page_offset=0x80000;
 constexpr std::uint64_t guest_scalar_math_page_offset=0x81000;
 constexpr std::uint64_t guest_thread_page_offset=0x82000;
 constexpr std::uint64_t guest_tls_bitmap_page_offset=X64ARM_TLS_BITMAP_PAGE_OFFSET;
+static_assert(X64ARM_GUI_TIMING_PAGE_OFFSET>=guest_tls_bitmap_page_offset+GuestMemory::guest_page_size);
 constexpr std::uint64_t guest_io_page_offset=0x8b000;
 // CFG 客體快速路徑：常式頁與 4096 項已驗證目標表（直接映射，整個目標位址比對）。
 // 檢查入口在 +0x00（rcx 為目標，命中 ret），dispatch 入口在 +0x40（rax 為目標，命中 jmp rax）；
@@ -497,6 +508,7 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
         gateway(stub_base_,(services.size()+runtime_service_descriptors().size())*16);
         gateway(unresolved_base_,4096*16); // 與 bind_import 的已登錄數量上限一致。
         gateway(callback_return_,4096); // 內部回呼與 stock WNDPROC 同一入口頁。
+        initialize_gui_timing(memory);
         static const bool guest_io=[] {const auto* setting=std::getenv("X64ARM_GUEST_IO_COMPLETION");
             return !setting || std::string_view(setting)!="0";}();
         if(detail::io_wait_fastpath_enabled() && guest_io && trace_services_.empty() && !startup_profile::enabled()){
@@ -538,9 +550,24 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             if(bitmap_patch+bitmap_width>code.size() || (x86_ && guest_tls_bitmap_.value>UINT32_MAX))
                 throw std::logic_error("TLS 配置位元圖位址修補超出常式或 Win32 範圍");
             for(unsigned n=0;n<bitmap_width;++n)bytes[bitmap_patch+n]=static_cast<std::uint8_t>(guest_tls_bitmap_.value>>(8*n));
+            if(!x86_)for(const auto patch:detail::guest_thread_once_cache_patches){
+                if(patch+8>code.size())throw std::logic_error("INIT_ONCE 鏡像位址修補超出常式");
+                for(unsigned n=0;n<8;++n)bytes[patch+n]=static_cast<std::uint8_t>(guest_tls_bitmap_.value>>(8*n));
+            }
+            const auto language_patch=x86_?detail::guest_thread_x86_language_groups_patch:detail::guest_thread_language_groups_patch;
+            if(language_patch+4>code.size())throw std::logic_error("NLS 語言群組位元圖超出客體常式");
+            const auto language_groups=windows_nls_language_group_mask();
+            for(unsigned n=0;n<4;++n)bytes[language_patch+n]=static_cast<std::uint8_t>(language_groups>>(8*n));
+            const auto timing_patches=x86_?std::span<const std::size_t>{detail::guest_thread_x86_gui_timing_patches}:
+                                           std::span<const std::size_t>{detail::guest_thread_gui_timing_patches};
+            for(const auto patch:timing_patches){
+                if(patch+bitmap_width>code.size())throw std::logic_error("GUI 時序常式位址修補超界");
+                for(unsigned n=0;n<bitmap_width;++n)bytes[patch+n]=static_cast<std::uint8_t>(gui_timing_cell_.value>>(8*n));
+            }
             const auto patch_services=[&](const auto& routines,unsigned width){for(const auto& routine:routines){
                 if(!routine.slot)continue;
-                const auto found=std::find_if(table.begin(),table.end(),[&](const auto& d){return d.family=="kernel32.dll" && d.symbol==routine.symbol;});
+                const auto family=routine.symbol.starts_with("Gdi")?"gdi32.dll":"kernel32.dll";
+                const auto found=std::find_if(table.begin(),table.end(),[&](const auto& d){return d.family==family && d.symbol==routine.symbol;});
                 if(found==table.end() || routine.slot+width>code.size())throw std::logic_error("客體執行緒常式的原服務或慢路徑不存在");
                 const auto stub=stub_base_.value+(services.size()+static_cast<std::size_t>(found-table.begin()))*16;
                 if(width==4 && stub>UINT32_MAX)throw std::logic_error("客體執行緒常式的原服務超出 Win32 範圍");
@@ -599,6 +626,20 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             memory.map(guest_scalar_math_routines_,GuestMemory::guest_page_size,read_execute,bytes);
         }
         initialize_guest_crt_algorithms(memory,GuestAddress{stub_base_.value+services.size()*16});
+        initialize_guest_msvcp90(memory);
+        initialize_guest_com_agile(memory);
+        static const bool mf_image_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_MF_IMAGE");return !v || std::string_view(v)!="0";}();
+        if(mf_image_lowering && trace_services_.empty() && !startup_profile::enabled())
+            mf_image::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value);
+        static const bool mf_buffer_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_MF_BUFFER");return !v || std::string_view(v)!="0";}();
+        if(mf_buffer_lowering && trace_services_.empty() && !startup_profile::enabled())
+            mf_buffer::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value);
+        static const bool xaudio_lowering_enabled=[] {const auto* v=std::getenv("X64ARM_GUEST_XAUDIO");return !v || std::string_view(v)!="0";}();
+        if(xaudio_lowering_enabled && trace_services_.empty() && !startup_profile::enabled())
+            xaudio_lowering::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value);
+        static const bool d3d9_formats_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_D3D9_FORMATS");return !v || std::string_view(v)!="0";}();
+        if(d3d9_formats_lowering && trace_services_.empty() && !startup_profile::enabled() && !std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))
+            d3d9_formats::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value);
         // 常駐執行器直接接續已驗證目標，省去完整服務邊界；明確 0／1 仍可覆寫。
         // 傳統平行批次曾因頻繁喚醒增加成本，呼叫端未選定常駐執行器時維持原預設。
         // 在載入初始化時完成配置，不在執行中改寫已被轉譯器當成常數的 CFG cell。
@@ -690,6 +731,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     if(angle_module(lower) && (!native_angle_ || !native_angle_->supports(symbol))){if(!required)return GuestAddress{};throw std::invalid_argument("ANGLE Metal 入口未啟用："+lower+"!"+std::string(symbol));}
     if(native_library_module(lower) && !native_libraries_.enabled(lower)){if(!required)return GuestAddress{};throw std::invalid_argument("原生函式庫代理未啟用："+lower+"!"+std::string(symbol));}
     if(const auto host=windows_api_set_host(lower);host!=lower)lower=host;
+    if(const auto family=detail::builtin_provider_export_family(lower,symbol);family!=lower)lower=family;
     if(lower=="ntdll.dll" && symbol.starts_with("Zw")){const auto native=std::string("Nt")+std::string(symbol.substr(2));if(const auto target=resolve_service(lower,native,false);target.value)return target; }
     static const auto aliases=[] {
         std::map<std::pair<std::string_view,std::string_view>,const detail::ServiceExportAlias*> index;
@@ -701,6 +743,18 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         const auto& alias=*found->second;lower=alias.target_family;symbol=alias.target_symbol;
     }
     if (lower == "wsock32.dll") lower = "ws2_32.dll";
+    if(lower=="ws2_32.dll" && (symbol=="htons" || symbol=="ntohs" || symbol=="htonl" || symbol=="ntohl")){
+        static const bool enabled=[] {const auto* value=std::getenv("X64ARM_GUEST_WINSOCK_BYTEORDER");return !value || std::string_view(value)!="0";}();
+        if(enabled){const auto target=guest_thread_routine(symbol.ends_with('s')?"WinsockSwap16":"WinsockSwap32");if(target.value)return target;}
+    }
+    if(lower=="user32.dll" && (symbol=="GetDoubleClickTime" || symbol=="SetDoubleClickTime" || symbol=="GetCaretBlinkTime" || symbol=="SetCaretBlinkTime")){
+        static const bool timing_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_GUI_TIMING");return !value || std::string_view(value)!="0";}();
+        if(timing_routines){const auto target=guest_thread_routine(symbol);if(target.value)return target;}
+    }
+    if(lower=="gdi32.dll" && (symbol=="GdiFlush" || symbol=="GdiGetBatchLimit" || symbol=="GdiSetBatchLimit")){
+        static const bool batch_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_GDI_BATCH");return !value || std::string_view(value)!="0";}();
+        if(batch_routines){const auto target=guest_thread_routine(symbol);if(target.value)return target;}
+    }
     // 舊版 CNG 匯入程式庫亦經 NCrypt provider 匯出 BCrypt 入口。
     if(lower=="ncrypt.dll" && symbol.starts_with("BCrypt"))lower="bcrypt.dll";
     if(lower=="oleaut32.dll" && symbol.starts_with('#')) {
@@ -729,11 +783,16 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             // 七個純量／指標 Interlocked API 留在客體原子指令路徑；不把自旋迴圈的每次 CAS 送回協調者。
             // 此開關僅供同一成品比對；SList 的獨立契約與開關保持原樣。
             static const bool interlocked_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_INTERLOCKED");return !value || std::string_view(value)!="0";}();
+            static const bool language_routines=[] {const auto* value=std::getenv("X64ARM_GUEST_LANGUAGE_GROUPS");return !value || std::string_view(value)!="0";}();
+            static const bool once_routines=[] {const auto* value=std::getenv("X64ARM_AOT_ONCE_LOWERING");return !value || std::string_view(value)!="0";}();
             const auto& routines=x86_?win32_routines:win64_routines;
             if(const auto found=routines.find(symbol);found!=routines.end() && (slist_routines || symbol.find("SList")==symbol.npos) &&
                (interlocked_routines || !symbol.starts_with("Interlocked") || symbol.find("SList")!=symbol.npos) &&
                (srw_routines || symbol.find("SRWLock")==symbol.npos) && (critical_routines || symbol.find("CriticalSection")==symbol.npos) &&
-               (fls_mirror_ || !symbol.starts_with("FlsGetValue")))
+               (fls_mirror_ || !symbol.starts_with("FlsGetValue")) &&
+               (once_routines || !symbol.starts_with("InitOnce")) &&
+               symbol!="GetDoubleClickTime" && symbol!="SetDoubleClickTime" && symbol!="GetCaretBlinkTime" && symbol!="SetCaretBlinkTime" && !symbol.starts_with("Gdi") &&
+               (language_routines || symbol!="IsValidLanguageGroup"))
                 return GuestAddress{guest_thread_routines_.value+found->second};
         }
         // 程序堆積的 HeapAlloc／HeapFree：與 malloc／free 同頁共用配置區；X64ARM_GUEST_HEAPALLOC=0 回到原服務（同成品對照）。
@@ -753,6 +812,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     if(lower=="d3dx10_43.dll")for(const auto& entry:math_service_descriptors())
         if(entry.family=="d3dx9_43.dll" && entry.symbol==symbol){lower="d3dx9_43.dll";break;}
     const auto family = crt_library(lower) ? "crt" : lower;
+    if(const auto data=builtin_constant_address(lower,symbol);data.value)return data;
     if(lower=="msvcp100.dll" || lower=="msvcp140.dll")if(const auto data=msvcp100_data(symbol,lower=="msvcp140.dll");data.value)return data;
     if(lower=="msvcrt.dll"){
         if(symbol=="__pioinfo")return GuestAddress{runtime_.lowio_table};
@@ -778,6 +838,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             std::begin(detail::crt_export_aliases),std::end(detail::crt_export_aliases));
         if(const auto found=common_aliases.find(symbol);found!=common_aliases.end())symbol=found->second;
         if(symbol=="_iob")return GuestAddress{runtime_base_.value+0x800};
+        if(symbol=="_ctype")return GuestAddress{runtime_.ctype_table};
         const std::array data{
             std::pair{"__argc", 0U}, std::pair{"__argv", 8U},
             std::pair{"__wargv", 56U}, std::pair{"__initenv", 112U},
@@ -786,7 +847,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             std::pair{"_commode", 32U}, std::pair{"_acmdln", 48U}, std::pair{"_wcmdln", 104U},
             // 軟體 x87 除法不具有早期 Pentium FDIV 缺陷；保留 CRT 可寫資料 ABI。
             std::pair{"_adjust_fdiv", 72U}, std::pair{"_timezone",80U},
-            std::pair{"_daylight",84U}, std::pair{"_tzname",88U}, std::pair{"__mb_cur_max",128U}
+            std::pair{"_daylight",84U}, std::pair{"_tzname",88U}, std::pair{"__mb_cur_max",128U}, std::pair{"_pctype",136U}
         };
         for (const auto& [name, offset] : data) if (symbol == name) return GuestAddress{runtime_base_.value + offset};
     }
@@ -807,6 +868,32 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     // 客體端常式只取代匯入位址；追蹤服務時維持宿主入口，讓每次呼叫仍可觀察。
     const auto routine=[&](std::size_t index){
         const auto& descriptor=runtime_service_descriptors()[index];
+        if(descriptor.family=="crt" && descriptor.symbol=="_getdrive"){
+            static const bool enabled=[] {const auto* v=std::getenv("X64ARM_GUEST_CRT_DIRECTORY");return !v || std::string_view(v)!="0";}();
+            if(enabled){const auto entry=guest_thread_routine("CrtGetDrive");if(entry.value)return entry;}
+        }
+        // 使用既有執行緒常式的 resident AOT 路徑；停用 lowering／追蹤時保留完整 EH provider。
+        if(descriptor.symbol=="__uncaught_exception" || descriptor.symbol=="?uncaught_exception@std@@YA_NXZ" ||
+           descriptor.symbol=="__uncaught_exceptions" || descriptor.symbol=="?uncaught_exceptions@std@@YAHXZ"){
+            static const bool enabled=[] {const auto* v=std::getenv("X64ARM_GUEST_CXX_EXCEPTION_STATE");return !v || std::string_view(v)!="0";}();
+            if(enabled){const bool count=descriptor.symbol=="__uncaught_exceptions" || descriptor.symbol=="?uncaught_exceptions@std@@YAHXZ";
+                const auto entry=guest_thread_routine(count?"CxxUncaughtCount":"CxxUncaughtAny");if(entry.value)return entry;}
+        }
+        if((descriptor.family=="msvcp90.dll" || descriptor.family=="crt") && trace_services_.empty()){
+            const auto image=runtime_.builtin_images.find(callback_return_.value+msvcp90_string::image_offset);
+            if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
+                return GuestAddress{image->first+entry->second};
+        }
+        if(descriptor.family=="mfplat.dll" && trace_services_.empty()){
+            const auto image=runtime_.builtin_images.find(callback_return_.value+mf_image::image_offset);
+            if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
+                return GuestAddress{image->first+entry->second};
+        }
+        if(descriptor.family=="internal-com-agile" && trace_services_.empty()){
+            const auto image=runtime_.builtin_images.find(callback_return_.value+com_agile::image_offset);
+            if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
+                return GuestAddress{image->first+entry->second};
+        }
         if(guest_crt_algorithms_.base && trace_services_.empty() && descriptor.family=="crt")
             if(const auto found=guest_crt_algorithms_.export_names.find(std::string(descriptor.symbol));
                found!=guest_crt_algorithms_.export_names.end())
@@ -840,6 +927,8 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
         }
         // 別名不必另有同名 descriptor；依共用目錄列舉後，由 resolve_service 核對實際目標。
         for(const auto& alias:detail::service_export_aliases)index[alias.family].emplace(alias.symbol);
+        for(const auto& symbol:index["dbghelp.dll"])
+            if(detail::builtin_provider_export_family("imagehlp.dll",symbol)=="dbghelp.dll")index["imagehlp.dll"].emplace(symbol);
         for(const auto& [ordinal,name]:detail::ole_ordinal_exports){(void)name;index["oleaut32.dll"].emplace("#"+std::to_string(ordinal));}
         for(const auto& service:math_service_descriptors())if(service.family=="d3dx9_43.dll")index["d3dx10_43.dll"].emplace(service.symbol);
         // CRT 別名仍經 resolve_service 選擇版本及 x86 ABI；只加入既有可列舉名稱。
@@ -873,6 +962,10 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
             for(const auto& [name,entry]:guest_crt_algorithms_.export_names){
                 (void)name;if(target.value==guest_crt_algorithms_.base+entry)return true;
             }
+        if(const auto image=runtime_.builtin_images.find(callback_return_.value+msvcp90_string::image_offset);image!=runtime_.builtin_images.end())
+            for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
+        if(const auto image=runtime_.builtin_images.find(callback_return_.value+mf_image::image_offset);image!=runtime_.builtin_images.end())
+            for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
         return false;
     };
     const auto add_family=[&](std::string_view name){
@@ -883,7 +976,7 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
             if(target.value && (handles(target) || guest_entry(target)))result.try_emplace(symbol,target.value);
         }
     };
-    add_family(windows_api_set_host(family));
+    add_family(detail::builtin_provider_family(windows_api_set_host(family)));
     if(crt_library(family))add_family("crt");
     return result;
 }
@@ -1097,7 +1190,7 @@ unsigned WindowsServices::runtime_compute_boundary(GuestAddress address) const n
             "InitializeSRWLock","AcquireSRWLockExclusive","AcquireSRWLockShared",
             "TryAcquireSRWLockExclusive","TryAcquireSRWLockShared","ReleaseSRWLockExclusive","ReleaseSRWLockShared"};
         constexpr std::array identity_operations{"GetCurrentThreadId","GetCurrentProcessId","GetCurrentThread","GetCurrentProcess"};
-        constexpr std::array allocation_operations{"malloc","calloc","realloc","_recalloc","free","_msize",
+        constexpr std::array allocation_operations{"malloc","calloc","realloc","_recalloc","free","_msize","__dllonexit",
             "_aligned_malloc","_aligned_realloc","_aligned_free","_aligned_offset_malloc",
             "_aligned_offset_realloc","_aligned_recalloc","_aligned_offset_recalloc","_aligned_msize"};
         static const bool cs_boundary=[] {const auto* setting=std::getenv("X64ARM_CS_BOUNDARY");return !setting || std::string_view(setting)!="0";}();
@@ -1120,6 +1213,17 @@ unsigned WindowsServices::runtime_compute_boundary(GuestAddress address) const n
             "wcstod","wcstof","wcstol","wcstoul","wcstoll","wcstoull","_wcstoi64","_wcstoui64"};
         constexpr std::array conversion_operations{"strtod","strtof","strtol","strtoul","strtoll","strtoull","_strtoi64","_strtoui64",
             "wcstod","wcstof","wcstol","wcstoul","wcstoll","wcstoull","_wcstoi64","_wcstoui64"};
+        constexpr std::array pointer_operations{"EncodePointer","DecodePointer","RtlEncodePointer","RtlDecodePointer","_encode_pointer","_decode_pointer","_encoded_null"};
+        constexpr std::array caret_operations{"CreateCaret","DestroyCaret","ShowCaret","HideCaret","SetCaretPos","GetCaretPos"};
+        static const bool region_boundary=[] {const auto* value=std::getenv("X64ARM_GUI_REGION_BOUNDARY");return !value || std::string_view(value)!="0";}();
+        constexpr std::array region_operations{"ValidateRect","ValidateRgn","ExcludeUpdateRgn"};
+        constexpr std::array shell_text_operations{"PathFindNextComponentA","PathFindNextComponentW",
+            "StrCmpA","StrCmpW","StrCmpIA","StrCmpIW","StrCmpNA","StrCmpNW","StrCmpNIA","StrCmpNIW",
+            "StrStrA","StrStrW","StrStrIA","StrStrIW","StrStrNW","StrStrNIW"};
+        constexpr std::array image_codec_queries{"GdipGetImageEncodersSize","GdipGetImageEncoders","GdipGetImageDecodersSize","GdipGetImageDecoders",
+            "GdipGetEncoderParameterListSize","GdipGetEncoderParameterList"};
+        constexpr std::array automation_date_operations{"VarUdateFromDate","VarDateFromUdate","VarDateFromUdateEx",
+            "VariantTimeToSystemTime","SystemTimeToVariantTime","VariantTimeToDosDateTime","DosDateTimeToVariantTime"};
         std::vector<std::uint8_t> result(runtime_table.size());
         for(std::size_t index=0;index<runtime_table.size();++index){
             const auto& descriptor=runtime_table[index];
@@ -1128,6 +1232,19 @@ unsigned WindowsServices::runtime_compute_boundary(GuestAddress address) const n
                ((descriptor.family=="kernel32.dll" || descriptor.family=="ntdll.dll") && descriptor.symbol=="RtlMoveMemory"))result[index]=1;
             else if(descriptor.family=="crt" &&
                     std::find(string_operations.begin(),string_operations.end(),descriptor.symbol)!=string_operations.end())result[index]=2;
+            else if(resident_compute && descriptor.family=="user32.dll" &&
+                    std::find(caret_operations.begin(),caret_operations.end(),descriptor.symbol)!=caret_operations.end())result[index]=12;
+            else if(resident_compute && region_boundary && descriptor.family=="user32.dll" &&
+                    std::find(region_operations.begin(),region_operations.end(),descriptor.symbol)!=region_operations.end())result[index]=12;
+            else if(resident_compute && ((descriptor.family=="oleaut32.dll" &&
+                    std::find(automation_date_operations.begin(),automation_date_operations.end(),descriptor.symbol)!=automation_date_operations.end()) ||
+                    ((descriptor.family=="kernel32.dll" || descriptor.family=="version.dll") &&
+                     (descriptor.symbol=="VerLanguageNameA" || descriptor.symbol=="VerLanguageNameW"))))result[index]=13;
+            else if(resident_compute && std::find(pointer_operations.begin(),pointer_operations.end(),descriptor.symbol)!=pointer_operations.end())result[index]=14;
+            // HID parser 僅處理客體預解析資料與報告緩衝區；裝置 IO 的 HidD_* 保留宿主服務。
+            else if(resident_compute && ((descriptor.family=="msvcp90.dll" && !msvcp90_stream::family(descriptor.symbol) && !descriptor.symbol.starts_with("?_Fiopen@")) || (descriptor.family=="hid.dll" && descriptor.symbol.starts_with("HidP_")) ||
+                    (descriptor.family=="shlwapi.dll" && std::find(shell_text_operations.begin(),shell_text_operations.end(),descriptor.symbol)!=shell_text_operations.end()) ||
+                    (descriptor.family=="gdiplus.dll" && std::find(image_codec_queries.begin(),image_codec_queries.end(),descriptor.symbol)!=image_codec_queries.end())))result[index]=15;
             else if(scalar_math_operation(descriptor))result[index]=3;
             else if(descriptor.family=="kernel32.dll" &&
                     std::find(thread_operations.begin(),thread_operations.end(),descriptor.symbol)!=thread_operations.end())result[index]=4;
@@ -1292,8 +1409,15 @@ bool WindowsServices::resident_service(GuestAddress address) const noexcept {
         const auto begin=stub_base_.value+services.size()*16;
         if(address.value>=begin && !((address.value-begin)&15U) && graphics_context_service((address.value-begin)/16))return true;
     }
+    // 第一次初始化編碼金鑰需要隨機來源，保留宿主慢路徑；其後只做程序狀態讀取與 rotate／xor。
+    if(runtime_compute_boundary(address)==14 && !runtime_.pointer_cookie)return false;
     // 與 invoke 使用相同動態資格；x86 先納入無等待／回呼的 heap 計算邊界。
-    if(x86_)return x86_heap_compute_boundary(address);
+    if(x86_){
+        const auto boundary=runtime_compute_boundary(address);
+        if(boundary==12 || boundary==13 || boundary==14 || boundary==15)return initialized_ && trace_services_.empty() && !startup_profile::enabled() &&
+            !runtime_.forced_exit_code() && !threads_.yield && runtime_.heap_locks.empty() && exceptions_.stack.empty();
+        return x86_heap_compute_boundary(address);
+    }
     if(!trace_services_.empty() || startup_profile::enabled() || runtime_.forced_exit_code())return false;
     // 只推進排序／搜尋狀態並準備下一個比較器，沒有在宿主內執行巢狀客體碼。
     // 由共用葉節點邊界物化完整狀態；映射／排程變動與例外仍交既有核心處理。
@@ -1303,10 +1427,12 @@ bool WindowsServices::resident_service(GuestAddress address) const noexcept {
     }
     const auto boundary=runtime_compute_boundary(address);
     // 程序期間固定的家族政策與開關一次物化；共用一個初始化守衛。
+    if((boundary==12 || boundary==13 || boundary==14 || boundary==15) && (!initialized_ || threads_.yield ||
+       !runtime_.heap_locks.empty() || !exceptions_.stack.empty()))return false;
     // 一般呼叫直接索引，動態資格仍在上方逐次核對。
     static const auto policies=[] {
         const auto enabled=[](const char* name){const auto* value=std::getenv(name);return !value || std::string_view(value)!="0";};
-        struct Policies {std::array<bool,12> classes{};bool indexed{};};
+        struct Policies {std::array<bool,16> classes{};bool indexed{};};
         Policies policy;
         policy.indexed=enabled("X64ARM_RESIDENT_COMPUTE_SERVICES");
         if(!policy.indexed)return policy;
@@ -1322,7 +1448,7 @@ bool WindowsServices::resident_service(GuestAddress address) const noexcept {
         result[7]=crt_character_requested();
         // 0 與固定 Heap／格式化類別 8 保持關閉；9～11 只可能來自
         // 已通過位址、對齊及 descriptor 範圍檢查的延伸表。
-        result[9]=result[10]=result[11]=true;
+        result[9]=result[10]=result[11]=result[12]=result[13]=result[14]=result[15]=true;
         return policy;
     }();
     if(policies.indexed)return boundary<policies.classes.size() && policies.classes[boundary];
@@ -1359,7 +1485,8 @@ bool WindowsServices::resident_service_host_fp(GuestAddress address) const noexc
     // 非 C locale 可進入 ICU；沿用 SDK 的宿主 FP 邊界，不假設外部函式完全不碰浮點環境。
     // 數值轉換自行套用客體捨入模式，日期轉換會進宿主 libc，沿用完整 FP 邊界。
     // 純整數的 counter／tick／FILETIME 查詢不切換 FPCR，也不重建客體 FP 核准狀態。
-    return boundary==3 || boundary==7 || (!x86_ && (boundary==10 || boundary==11));
+    // Shell 語系比較也會進 ICU，與同類的 locale 服務一起保存宿主浮點環境。
+    return boundary==3 || boundary==7 || boundary==13 || boundary==15 || (!x86_ && (boundary==10 || boundary==11));
 }
 #endif
 #ifdef X64ARM_HOST_SERVICES_MANAGED_FP
@@ -1572,13 +1699,18 @@ bool plain_local_service(const WindowsServiceDescriptor& descriptor) noexcept {
             "time","_time64","_time32","strcpy_s","strncpy_s","strcat_s","strncat_s","wcscpy_s","wcsncpy_s","wcscat_s","wcsncat_s"};
         return symbol.starts_with("__stdio_common_vs") || std::find(std::begin(names),std::end(names),symbol)!=std::end(names);
     }
-    if(family=="user32.dll")
+    if(family=="user32.dll"){
         // PeekMessage：協調者即宿主主執行緒，可在其他 worker 執行時抽取宿主事件、比對佇列。會啟動回呼的情況
         // （送出訊息、事件 hook、WM_QUEUESYNC 的 CBT hook）在移除任何事件前拒絕（見 dispatch_gui_send 與下方檢查）。
         // 電馭判客強制平行 60 秒有 57 萬次 PeekMessageW 原本每次都全停。X64ARM_LOCAL_PEEK_MESSAGE=0 關閉。
+        // 鍵盤／輸入狀態與可見性查詢：與 PeekMessage 相同只抽取宿主事件、讀寫 GUI 狀態表（GetAsyncKeyState 清除「上次以來按過」位元），
+        // 不啟動回呼，高頻查詢不必每次全體靜止。X64ARM_LOCAL_INPUT_QUERY=0 關閉。
+        if((symbol=="GetAsyncKeyState" || symbol=="GetKeyboardState" || symbol=="GetLastInputInfo" || symbol=="IsWindowVisible") && [] {
+                const auto* value=std::getenv("X64ARM_LOCAL_INPUT_QUERY");return !value || std::string_view(value)!="0";}())return true;
         return symbol=="GetCursorPos" || symbol=="IsIconic" || symbol=="IsZoomed" || symbol=="IsWindow" || symbol=="IsWindowEnabled" ||
             ((symbol=="PeekMessageW" || symbol=="PeekMessageA") && [] {
                 const auto* value=std::getenv("X64ARM_LOCAL_PEEK_MESSAGE");return !value || std::string_view(value)!="0";}());
+    }
     if(family=="gdi32.dll")return symbol=="PtInRegion" || symbol=="RectInRegion" || symbol=="GetRgnBox";
     if(family=="kernel32.dll"){
         // SList 的 API 全部經協調者，在獨占映射鎖下序列化；臨界區段初始化只改鎖表與客體結構，Leave 有等待者時
@@ -1600,7 +1732,7 @@ bool plain_local_service(const WindowsServiceDescriptor& descriptor) noexcept {
     // 位元組序轉換與 WSAGetLastError 只讀參數或執行緒錯誤碼。雙人成行遊戲中網路執行緒每秒約 640 次原本每次全停（約 33 ms／秒）。
     // X64ARM_LOCAL_WINSOCK=0 關閉。
     if(family=="ws2_32.dll")return (symbol=="WSAEnumNetworkEvents" || symbol=="WSAGetLastError" || symbol=="ntohs" || symbol=="htons" ||
-        symbol=="ntohl" || symbol=="htonl" || symbol=="__WSAFDIsSet") && [] {const auto* value=std::getenv("X64ARM_LOCAL_WINSOCK");return !value || std::string_view(value)!="0";}();
+        symbol=="ntohl" || symbol=="htonl" || symbol=="WSAHtonl" || symbol=="WSAHtons" || symbol=="WSANtohl" || symbol=="WSANtohs" || symbol=="__WSAFDIsSet") && [] {const auto* value=std::getenv("X64ARM_LOCAL_WINSOCK");return !value || std::string_view(value)!="0";}();
     // RtlGenRandom：只把宿主亂數寫入參數緩衝區並設定 LastError（電馭判客每秒約 160 次原本每次全停）。
     if(family=="advapi32.dll")return symbol=="SystemFunction036";
     // MSVCP 的純讀取時鐘：只讀宿主單調時鐘與固定頻率。
@@ -1660,9 +1792,9 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
         // loader lock 的釋放會通知等待載入的執行緒，留在完整路徑。
         if(symbol.find("CriticalSection")!=std::string_view::npos && state.reg(Gpr::Rcx)==peb_base_.value+0x800)return false;
-        // PeekMessage 取出 WM_QUEUESYNC 後才執行 CBT hook，已有 CBT hook 時留在完整路徑。
+        // 取出訊息後才執行 GETMESSAGE／CBT hook；必須在改動佇列前選擇可啟動回呼的完整路徑。
         if(symbol.starts_with("PeekMessage") &&
-           std::any_of(gui_.hooks.begin(),gui_.hooks.end(),[](const auto& item){return item.second.type==5;}))return false;
+           std::any_of(gui_.hooks.begin(),gui_.hooks.end(),[](const auto& item){return item.second.type==3 || item.second.type==5;}))return false;
         // 會抽取宿主事件的 GUI 服務先在不持獨占映射鎖時向 Cocoa 抽取（nextEventMatchingMask 每次約 40 µs；原本在持鎖的 pump_gui 內
         // 執行，期間 worker 上的 D3D11 服務全在讀鎖讓出——雙人成行協調者每秒約 600 次 PeekMessage，占持鎖時間約四分之一）。
         // 持鎖後 pump_gui 的 poll_for(0) 直接取用已抽到的事件；協調者即宿主主執行緒，AppKit 只在此執行緒使用。X64ARM_GUI_PREFETCH=0 關閉。
@@ -1776,6 +1908,33 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         if(result)throw std::logic_error("D3D12 本地協調服務意外終止客體");
         if(last_error_!=entry_error)memory.store(error_slot,32,last_error_);
         if(signal)(void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
+        ++state.tsc;state.rep_compare={};
+        return true;
+    }
+    // D3D9 裝置方法：D3D9 沒有 worker 版，所有呼叫原本都要全體靜止再由協調者執行（呼叫頻率極高，
+    // 占映射一致全停的大宗）。資格見 d3d9_local_eligible：只收純狀態、綁定、Draw 與 Begin／EndScene／Clear，
+    // 失去最後綁定的物件延後到下一次完整呼叫銷毀；鎖順序、執行緒身分與 LastError 契約與 D3D11 本地路徑相同。
+    // x86 沿用 D3D11 的平行圖形開關。X64ARM_LOCAL_D3D9=0 關閉。
+    static const bool local_d3d9=[] {const auto* value=std::getenv("X64ARM_LOCAL_D3D9");return !value || std::string_view(value)!="0";}();
+    if(local_d3d9 && (!x86_ || x86_graphics_parallel_enabled()) && descriptor.family=="internal-d3d9"){
+        const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
+        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+        if(!d3d9_local_eligible(state,memory,descriptor))return false;
+        const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
+        const auto teb=x86_?state.fs_base:state.gs_base;
+        if(thread==threads_.items.end() || thread->second.teb!=teb)return false;
+        const auto previous=threads_.current;const auto saved_error=last_error_;
+        const GuestAddress error_slot{teb+(x86_?X64ARM_TLS_X86_ERROR_OFFSET:X64ARM_TLS_X64_ERROR_OFFSET)};
+        const auto entry_error=static_cast<std::uint32_t>(memory.load(error_slot,32));
+        struct Restore {
+            WindowsServices& self;std::uint64_t previous,current;std::uint32_t error;
+            ~Restore(){self.d3d9_local_call_=false;self.threads_.current=previous;if(current!=previous)self.last_error_=error;}
+        } restore{*this,previous,key,saved_error};
+        threads_.current=key;last_error_=entry_error;d3d9_local_call_=true;
+        entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,descriptor.symbol);
+        const auto result=invoke_runtime(state,memory,descriptor);
+        if(result)throw std::logic_error("D3D9 本地協調服務意外終止客體");
+        if(last_error_!=entry_error)memory.store(error_slot,32,last_error_);
         ++state.tsc;state.rep_compare={};
         return true;
     }
@@ -2048,6 +2207,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
         (state.rip.value-runtime_begin)%16==0?&runtime_table[(state.rip.value-runtime_begin)/16]:nullptr;
     const auto boundary=runtime_compute_boundary(state.rip);
     const bool memory_operation=boundary==1,string_operation=boundary==2;
+    if(runtime_descriptor && (boundary==12 || boundary==13 || boundary==15 || (boundary==14 && runtime_.pointer_cookie)) && trace_services_.empty() && !startup_profile::enabled() &&
+       !runtime_.forced_exit_code() && !threads_.yield && runtime_.heap_locks.empty() && exceptions_.stack.empty()){
+        // 純狀態／日期家族使用常駐 ARM64 服務入口；ABI、輸出範圍、LastError 與故障沿用同一 provider。
+        // 日期及 locale 轉換經 SDK 的宿主 FP 保存邊界，Win32 仍保留 x87 與 stdcall 契約。
+        const auto error_address=x86_?state.fs_base+0x34:state.gs_base+0x68;
+        if(runtime_.image.base)last_error_=static_cast<std::uint32_t>(memory.load(GuestAddress{error_address},32));
+        const auto entry_error=last_error_;const auto result=invoke_runtime(state,memory,*runtime_descriptor);
+        if(runtime_.image.base && last_error_!=entry_error)memory.store(GuestAddress{error_address},32,last_error_);
+        return result;
+    }
     if(runtime_descriptor && trace_services_.empty() && !startup_profile::enabled() && !runtime_.forced_exit_code() &&
        graphics_context_service((state.rip.value-runtime_begin)/16)){
         // 與完整入口相同同步 TEB LastError（含 x86）；裝置鎖等待等排程由 provider 更新 concurrency epoch，
@@ -2292,6 +2461,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
     try{result=invoke_service(state,memory);}
     catch(const service_callback::Suspended&){/* 客體回呼接續原 API；本次只發布已準備的狀態。 */}
     count_scope.phase("completion");
+    if(!result && !gui_.clipboard_notifications.empty())dispatch_clipboard_notifications(state,memory);
     // 記憶體操作可合法寫入 TEB 本身；完整入口也不得用呼叫前的快照蓋回輸出。
     if((memory_operation || string_operation) && runtime_.image.base)last_error_=static_cast<std::uint32_t>(memory.load(GuestAddress{x86_?state.fs_base+0x34:state.gs_base+0x68},32));
     if(tracing)std::fprintf(stderr,"[api] %.*s rax=%llx last_error=%u errno=%llu\n",static_cast<int>(service_name.size()),service_name.data(),static_cast<unsigned long long>(state.reg(Gpr::Rax)),last_error_,static_cast<unsigned long long>(memory.load(GuestAddress{runtime_.errno_cell},32)));

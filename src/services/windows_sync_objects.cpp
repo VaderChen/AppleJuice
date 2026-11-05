@@ -29,8 +29,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_sync_object(GuestState& sta
         else {
             auto& object=runtime_.wait_state(handle->second);const auto increment=std::bit_cast<std::int32_t>(u32(1));
             if(increment<=0)error=87;
-            else if(u32(1)>object.maximum-object.count)error=298;
-            else {if(arg(2))memory.store(GuestAddress{arg(2)},32,object.count);object.count+=u32(1);result=1;}
+            else {if(arg(2))memory.check(GuestAddress{arg(2)},4,Access::Write);std::uint32_t previous{};
+                error=object.release_semaphore(u32(1),&previous);if(!error){if(arg(2))memory.store(GuestAddress{arg(2)},32,previous);result=1;}}
         }
     } else {
         const bool create=api.starts_with("Create"),extended=api.find("Ex")!=std::string_view::npos;
@@ -55,21 +55,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_sync_object(GuestState& sta
             if(std::any_of(runtime_.mutex_objects.begin(),runtime_.mutex_objects.end(),[&](const auto& item){return item.second.name==name;}))error=6;
             if(std::any_of(runtime_.wait_objects.begin(),runtime_.wait_objects.end(),[&](const auto& item){return !item.second.identity && item.second.kind==WaitObject::Kind::Event && item.second.name==name;}))error=6;
         }
-        const bool existed=existing!=runtime_.wait_states.end();
-        if(!error && !create && !existed)error=2;
-        if(!error && create && !existed && !timer && (std::bit_cast<std::int32_t>(u32(1))<0 || std::bit_cast<std::int32_t>(u32(2))<=0 || u32(1)>u32(2)))error=87;
+        const bool local_new=existing==runtime_.wait_states.end(),external=!timer && !name.empty();bool existed=!local_new;
+        if(!error && !create && !existed && !external)error=2;
+        if(!error && create && !existed && !timer && !external && (std::bit_cast<std::int32_t>(u32(1))<0 || std::bit_cast<std::int32_t>(u32(2))<=0 || u32(1)>u32(2)))error=87;
         if(!error && runtime_.wait_objects.size()>=process_handle_limit)error=8;
         if(!error) try {
-            if(existed)access=synchronization_access(existing->second.security_descriptor,raw_access,all_access);
-            const auto handle=runtime_.allocate_wait_handle(),identity=existed?existing->first:handle;
-            if(!existed) {
-                WaitObject object;object.kind=kind;object.name=std::move(name);object.maximum=timer?1U:u32(2);object.count=timer?0U:u32(1);object.manual_reset=timer && (flags&1U);object.security_descriptor=synchronization_descriptor(memory,arg(0),false).bytes;
+            if(existed){const auto& saved=existing->second;access=synchronization_access(saved.shared_event?shared_object_security(saved.shared_event->descriptor()):saved.security_descriptor,raw_access,all_access);}
+            const auto handle=runtime_.allocate_wait_handle(),identity=local_new?handle:existing->first;
+            if(local_new) {
+                WaitObject object;object.kind=kind;object.name=name;object.maximum=timer?1U:u32(2);object.count=timer?0U:u32(1);object.manual_reset=timer && (flags&1U);
+                if(external){
+                    const auto factory=[&]{return synchronization_descriptor(memory,arg(0),false).bytes;};
+                    const auto opened=open_shared_semaphore(mapping_session(),name,create,u32(1),u32(2),create?ObjectSecurityFactory{factory}:ObjectSecurityFactory{});
+                    if(opened.error)throw SecurityDescriptorError{opened.error};object.shared_event=opened.event;object.maximum=opened.event->maximum();object.count=0;existed=opened.existed;
+                    if(existed)access=synchronization_access(shared_object_security(opened.event->descriptor()),raw_access,all_access);
+                }else object.security_descriptor=synchronization_descriptor(memory,arg(0),false).bytes;
                 runtime_.wait_states.emplace(identity,std::move(object));
             }
             try {
                 WaitObject object;object.kind=kind;object.identity=identity;object.access=access;
                 runtime_.wait_objects.emplace(handle,std::move(object));if(inherit)runtime_.handle_flags.emplace(handle,1);
-            } catch(...) {runtime_.wait_objects.erase(handle);runtime_.handle_flags.erase(handle);if(!existed)runtime_.wait_states.erase(identity);throw;}
+            } catch(...) {runtime_.wait_objects.erase(handle);runtime_.handle_flags.erase(handle);if(local_new)runtime_.wait_states.erase(identity);throw;}
             result=handle;if(create)last_error_=existed?183U:0U;
         }catch(const SecurityDescriptorError& failure){error=failure.code;}
     }

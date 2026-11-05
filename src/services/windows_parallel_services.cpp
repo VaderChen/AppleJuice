@@ -274,6 +274,7 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
     return eligible;
 }
 bool WindowsServices::parallel_service_static(GuestAddress address) const noexcept {
+    if(parallel_crt_format_service(address))return true;
     if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,address);runtime && crt_pure_worker_service(*runtime))return true;
     const auto symbol=name(address);
     if(x86_){
@@ -439,6 +440,12 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     }
     if(found==threads_.items.end() || found->second.teb!=teb)return false;
     auto& thread=found->second;const auto tid=found->first;const bool current=tid==threads_.current;
+    if(parallel_crt_format_service(state.rip)){
+        const auto completed=invoke_parallel_crt_format(state,memory,tid);
+        count_scope.accepted=completed;
+        if(completed)state.rep_compare={};
+        return completed;
+    }
     const unsigned unit=x86_?4U:8U;
     const auto error_offset=static_cast<unsigned>(x86_?X64ARM_TLS_X86_ERROR_OFFSET:X64ARM_TLS_X64_ERROR_OFFSET);
     // 所有存取先驗證。native_window 排除 COW、可執行寫入、外部 backing 及跨映射；
@@ -549,8 +556,8 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     }else if(parallel_wait_service(symbol)){
         if(symbol=="WaitForSingleObjectEx" && static_cast<std::uint32_t>(arguments[2]))return false; // 可警示：APC 由協調者投遞。
         const auto object=runtime_.wait_objects.find(first);
-        if(object==runtime_.wait_objects.end() || object->second.shared_event || !(object->second.access&0x100000U))return false;
-        auto& waited=object->second;const bool poll=!static_cast<std::uint32_t>(second);
+        if(object==runtime_.wait_objects.end() || runtime_.wait_lock_descriptor(object->second)>=0 || !(object->second.access&0x100000U))return false;
+        auto& waited=runtime_.wait_state(object->second);const bool poll=!static_cast<std::uint32_t>(second);
         std::atomic_ref signal(waited.count);
         if(waited.kind==WaitObject::Kind::Event){
             if(waited.manual_reset){if(signal.load(std::memory_order_acquire))result=0;else if(poll)result=0x102;else return false;}

@@ -72,6 +72,16 @@
                 else {publish_remote_frame(swap->window,*swap->native,composed);record_diagnostic("d3d11_present_remote");}
                 std::swap(swap->present_frame,swap->present_spare);
                 if(gpu_handoff)swap->native->graphics_handoff(*producer,shared_view);else swap->native->graphics_flush(true);
+                // Flip model 成功呈現後解除 back buffer 0 的管線綁定與 COM 強參照。
+                // TEST、失敗及 DO_NOT_SEQUENCE 不改綁定；deferred context 的錄製狀態也不受影響。
+                const auto effect=word(swap->desc,x86_?52:60);
+                if((effect==3 || effect==4) && !(u32(2)&2U)) {
+                    const std::array buffers{swap->bindings.at("Backbuffers")[0]};
+                    for(const auto& [pointer,entry]:bridge.objects)
+                        if(entry.kind==Kind::Context && entry.identity->root==pointer &&
+                           !entry.identity->context_type && entry.identity->device==swap->device)
+                            remove_conflicts(entry.identity,buffers,{});
+                }
                 ++swap->frames;++bridge.graphics_frames;swap->present_ticks=runtime_.clock_ticks;
                 // 診斷：X64ARM_TRACE_GRAPHICS_STATS=1 每 600 幀輸出一次裝置的 Metal 後端統計（GPU 忙碌、CPU 等待、encoder 數），
                 // 遊戲被強制結束時也有資料；統計字串由命令執行緒代理同步後讀取。

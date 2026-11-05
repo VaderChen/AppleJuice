@@ -27,8 +27,10 @@ std::uint32_t WindowsServices::legacy_crypto_provider(GuestMemory& memory,const 
     }
     if(symbol.starts_with("CryptEnumProvider")){
         if(arg(1) || !arg(3) || !arg(5))return fail(87);if(u32(2))return fail(0x80090009);
-        if(u32(0)>=std::size(providers))return fail(259);
-        const auto& provider=providers[u32(0)];const auto* name=symbol.starts_with("CryptEnumProviderTypes")?provider.description:provider.name;
+        const bool types=symbol.starts_with("CryptEnumProviderTypes");std::vector<const Provider*> catalog;
+        for(const auto& item:providers)if(!types || std::none_of(catalog.begin(),catalog.end(),[&](const auto* p){return p->type==item.type;}))catalog.push_back(&item);
+        if(u32(0)>=catalog.size())return fail(259);
+        const auto& provider=*catalog[u32(0)];const auto* name=types?provider.description:provider.name;
         const auto bytes=symbol.back()=='W'?utf16_bytes(utf8_to_utf16(name)):text(name);
         memory.check(GuestAddress{arg(3)},4,Access::Write);const auto result=write(bytes,arg(4),arg(5));memory.store(GuestAddress{arg(3)},32,provider.type);return result;
     }
@@ -63,9 +65,9 @@ std::uint32_t WindowsServices::legacy_crypto_provider(GuestMemory& memory,const 
     const auto parameter=u32(1),flags=u32(4);
     if(parameter==1 || parameter==22){
         if(flags!=1 && flags!=2 && flags!=0)return fail(0x80090009);
-        std::vector<const Algorithm*> catalog;for(const auto& a:algorithms)if(supported(a,provider.type))catalog.push_back(&a);
+        std::vector<Algorithm> catalog;for(const auto& a:algorithms)if(const auto entry=algorithm_for(a.id,provider))catalog.push_back(*entry);
         auto& cursor=parameter==1?provider.algorithm_cursor:provider.extended_cursor;const auto index=flags==1?0:cursor;
-        if(index>=catalog.size())return fail(259);const auto& a=*catalog[index];Bytes bytes(parameter==1?32:88);
+        if(index>=catalog.size())return fail(259);const auto& a=catalog[index];Bytes bytes(parameter==1?32:88);
         put(bytes,0,a.id);put(bytes,4,a.default_bits);
         if(parameter==1){put(bytes,8,static_cast<std::uint32_t>(std::strlen(a.name)+1));std::copy_n(a.name,std::strlen(a.name),bytes.begin()+12);}
         else {put(bytes,8,a.min_bits);put(bytes,12,a.max_bits);put(bytes,20,static_cast<std::uint32_t>(std::strlen(a.name)+1));std::copy_n(a.name,std::strlen(a.name),bytes.begin()+24);

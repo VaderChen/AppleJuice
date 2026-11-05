@@ -24,7 +24,7 @@ std::uint32_t WindowsServices::legacy_crypto_cipher(GuestMemory& memory,const Wi
     if(symbol=="CryptGenKey"){
         const auto provider=runtime_.crypt_providers.find(arg(0));if(provider==runtime_.crypt_providers.end())return fail(6);
         const auto flags=u32(2)&0xffffU;const auto id=u32(1)==1?0xa400U:u32(1)==2?0x2400U:u32(1);
-        const auto* a=find(id);if(!a || (!a->cipher && !rsa(id)) || !supported(*a,provider->second.type))return fail(bad_algorithm);
+        const auto a=algorithm_for(id,provider->second);if(!a || (!a->cipher && !rsa(id)))return fail(bad_algorithm);
         if(flags&~0x15U)return fail(bad_flags);if(!arg(3))return fail(87);if(runtime_.legacy_crypto_keys.size()>=4096)return fail(8);
         const auto bits=(u32(2)>>16)?u32(2)>>16:a->default_bits;
         if(bits<a->min_bits || bits>a->max_bits || bits%(rsa(id)?16U:(id==0x6601 || id==0x6603 || id==0x6609)?1U:8U))return fail(bad_data);
@@ -55,7 +55,10 @@ std::uint32_t WindowsServices::legacy_crypto_cipher(GuestMemory& memory,const Wi
         case 10:{if(key.algorithm!=0x6602 && key.algorithm!=0x6801)return fail(bad_type);const auto value=blob(arg(2),16-key.secret.size());if(!value)return fail(bad_data);key.salt=*value;return 1;}
         case 3:case 4:case 5:case 19:{
             const auto value=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)},32));
-            if(u32(1)==19){if(key.algorithm!=0x6602)return fail(bad_type);if(!value || value>1024)return fail(bad_data);key.effective_bits=value;return 1;}
+            if(u32(1)==19){if(key.algorithm!=0x6602)return fail(bad_type);
+                const auto context=runtime_.crypt_providers.find(key.provider);const auto* policy=context==runtime_.crypt_providers.end()?nullptr:legacy_crypto::provider(context->second.type,context->second.name);
+                const auto maximum=policy && policy->session_max<128?policy->session_max:1024U;
+                if(!value || value>maximum)return fail(bad_data);key.effective_bits=value;return 1;}
             if(a->block==1)return fail(bad_type);
             if(u32(1)==3){if(value!=1)return fail(bad_data);key.padding=value;}
             else if(u32(1)==4){if(value!=1 && value!=2)return fail(bad_data);key.mode=value;}

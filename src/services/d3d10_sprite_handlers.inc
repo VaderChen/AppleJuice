@@ -90,6 +90,8 @@
                     else {const auto count=static_cast<std::int32_t>(u32(2));require(count>=-1 && count<=65536);std::u16string text;if(symbol.ends_with("W")){if(count<0)text=read_utf16(memory,GuestAddress{arg(1)});else for(int i=0;i<count;++i)text.push_back(static_cast<char16_t>(memory.load(GuestAddress{arg(1)+static_cast<unsigned>(i)*2},16)));}else {std::string text8;if(count<0)text8=read_ansi(memory,arg(1));else {const auto bytes=read_bytes(memory,arg(1),static_cast<unsigned>(count));text8.assign(bytes.begin(),bytes.end());}text=utf8_to_utf16_lossy(text8);}for(unsigned i=0;i<text.size();++i){unsigned cp=text[i];if(cp>=0xd800 && cp<=0xdbff && i+1<text.size() && text[i+1]>=0xdc00 && text[i+1]<=0xdfff)cp=0x10000+((cp-0xd800)<<10)+(text[++i]-0xdc00);characters.push_back(cp);}}
                     if(!characters.empty()){const auto face=native_resolve_font(model);require(bool(face));glyphs=native_font_glyph_indices(*face,characters);}for(auto glyph:glyphs)(void)font_glyph(font,glyph);
                 }else if(symbol=="Font10DrawA" || symbol=="Font10DrawW"){
+                    if(d3dx_font_empty_text(memory,arg(2),static_cast<std::int32_t>(u32(3)),symbol.ends_with("W")))result=0;
+                    else{
                     require(arg(4));const auto flags=u32(5);const std::array<std::uint64_t,5> call{font->font_dc,arg(2),arg(3),arg(4),flags};const auto text_symbol=symbol.ends_with("W")?"DrawTextW":"DrawTextA";
                     if(flags&0x400){result=font_format(text_symbol,call);}
                     else {
@@ -113,6 +115,7 @@
                         }
                         auto sprite=arg(1)?typed(arg(1),Kind::Sprite10):create(Kind::Sprite10,font->device);require(sprite->device==font->device);const bool owned=!arg(1);if(owned){sprite_begin(sprite,8);sprite->sprite.projection={2/viewport[2],0,0,0,0,2/viewport[3],0,0,0,0,1,0,-1,-1,0,1};}else require(sprite->sprite.active);
                         const auto key="FontDraw";if(const auto previous=binding(font,key)){release(previous);font->bindings.erase(key);}const auto texture=font_texture(font,key,width,height,rgba,canvas);D3D10SpriteItem item;item.world={static_cast<float>(canvas[0]),0,0,0,0,static_cast<float>(canvas[1]),0,0,0,0,1,0,left+canvas[0]*.5f,viewport[3]-top-canvas[1]*.5f,.5f,1};const auto color=read_bytes(memory,arg(6),16);std::memcpy(item.color.data(),color.data(),16);item.texture=texture;hold(texture);item.retained=true;sprite->sprite.items.push_back(item);if(owned){sprite_end(sprite);release(sprite->root);}else if(sprite->sprite.items.size()>=sprite->sprite.capacity)sprite_flush(sprite);
+                    }
                     }
                 }else throw std::invalid_argument("D3DX10 字型方法無效");
             }

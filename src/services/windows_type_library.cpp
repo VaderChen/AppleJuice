@@ -3,6 +3,7 @@
 #include "x64arm/registry_store.hpp"
 #include "x64arm/unicode.hpp"
 #include "type_library_guest.hpp"
+#include "service_callback_task.hpp"
 #include "x64arm/pe_loader.hpp"
 #include <algorithm>
 #include <charconv>
@@ -90,7 +91,7 @@ std::span<const WindowsServiceDescriptor> type_library_service_descriptors(){
         {"internal-type-compiler","QueryInterface",3},{"internal-type-compiler","AddRef",1},{"internal-type-compiler","Release",1},
         {"internal-type-compiler","Bind",7},{"internal-type-compiler","BindType",5},
         {"oleaut32.dll","LoadTypeLib",2},{"oleaut32.dll","LoadRegTypeLib",5},{"oleaut32.dll","LoadTypeLibEx",3},
-        {"oleaut32.dll","UnRegisterTypeLib",5},
+        {"oleaut32.dll","UnRegisterTypeLib",5},{"oleaut32.dll","RegisterTypeLib",3},
         {"internal-type-library","QueryInterface",3},{"internal-type-library","AddRef",1},{"internal-type-library","Release",1},
         {"internal-type-library","GetTypeInfoCount",1},{"internal-type-library","GetTypeInfo",3},{"internal-type-library","GetTypeInfoType",3},
         {"internal-type-library","GetTypeInfoOfGuid",3},{"internal-type-library","GetLibAttr",2},{"internal-type-library","GetTypeComp",2},
@@ -218,7 +219,7 @@ std::uint32_t WindowsServices::release_type_library(GuestState& state,GuestMemor
     bridge.views.erase(found);(void)free_heap(memory,object,state);
     if(info)(void)release_type_library(state,memory,library);return 0;
 }
-void WindowsServices::register_type_library(std::uint64_t pointer){
+void WindowsServices::register_type_library(std::uint64_t pointer,std::u16string_view path,std::u16string_view help_directory){
     const auto& view=runtime_.type_libraries.views.at(pointer);const auto& lib=*view.data;
     if(!registry_file_.empty() && !runtime_.network.external_io)failure(registry_error);
     RegistryTransaction transaction(runtime_.registry,registry_file_);if(transaction.error)failure(registry_error);
@@ -234,12 +235,12 @@ void WindowsServices::register_type_library(std::uint64_t pointer){
         if(next.bytes-previous+bytes.size()>output_limit || (old==values.end() && next.values>=4096))failure(nomemory);
         next.bytes=next.bytes-previous+bytes.size();if(old==values.end())++next.values;values[name]={1,std::move(bytes),{}};
     };
-    auto registered_path=wide(view.path);std::replace(registered_path.begin(),registered_path.end(),u'/',u'\\');
+    auto registered_path=path.empty()?wide(view.path):std::u16string(path);std::replace(registered_path.begin(),registered_path.end(),u'/',u'\\');
     set(version,wide(lib.doc.name));set(version+u"\\"+hex(lib.lcid)+(x86_?u"\\win32":u"\\win64"),registered_path);
     set(version+u"\\flags",hex(lib.flags&~8U));
     auto help=lib.help_file;
     if(help.empty() || (help.find(':')==help.npos && !help.starts_with('/') && !help.starts_with('\\')))help=library_directory(view.path)+help;
-    auto directory=wide(library_directory(help));std::replace(directory.begin(),directory.end(),u'/',u'\\');
+    auto directory=help_directory.empty()?wide(library_directory(help)):std::u16string(help_directory);std::replace(directory.begin(),directory.end(),u'/',u'\\');
     set(version+u"\\helpdir",directory);
     bool interfaces=false;
     for(const auto& type:lib.types){
@@ -279,6 +280,20 @@ std::u16string WindowsServices::registered_type_library(const WindowsGuid& guid,
 }
 std::optional<std::uint32_t> WindowsServices::invoke_type_library(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;auto& bridge=runtime_.type_libraries;
+    if(name=="RegisterTypeLib" && arg(0) && !bridge.views.contains(arg(0))){
+#include "type_library_register_external.inc"
+    }
+    if(name=="RegisterTypeLib"){
+        std::uint32_t result=0;
+        try{
+            if(!arg(0) || !arg(1))failure(0x80070057U);
+            if(!bridge.views.contains(arg(0)))failure(0x80028029U);
+            const auto path=read_utf16(memory,GuestAddress{arg(1)});if(path.empty())failure(0x80070057U);
+            const auto help=arg(2)?read_utf16(memory,GuestAddress{arg(2)}):std::u16string{};
+            register_type_library(arg(0),path,help);
+        }catch(const typelib::Error& error){result=error.code;}catch(const MemoryFault&){result=0x80070057U;}catch(const std::bad_alloc&){result=0x8007000eU;}
+        arg.return_to(state,result);return std::nullopt;
+    }
     if(name=="UnRegisterTypeLib"){
         // 移除 TypeLib\{libid}\{major.minor}\{lcid}\{win16|win32|win64}；該版本沒有其他 LCID 時一併移除版本鍵，
         // 該 LIBID 沒有其他版本時移除 GUID 鍵。刪除經 RegDeleteTreeW／RegDeleteKeyW，沿用登錄日誌與 ACL。

@@ -26,6 +26,10 @@ struct StringCompareForm {
 void execute_string_compare(StringCompareForm,GuestState&,GuestMemory&,std::uint64_t rip);
 // 私有穩定頁的有界批次；呼叫者保證 Relaxed 及允許延後排程回呼。
 std::uint64_t execute_rep_compare(StringCompareForm,GuestState&,GuestMemory&,std::uint64_t budget);
+// 常駐 REP 家族共用的穩定頁 lowering。多客體使用逐元素 acquire 讀取，不跨越第一個停止元素；
+// 呼叫者持有映射讀鎖。正常路徑只受 CX、頁界線與位址回繞限制，metered 僅供獨立觀察模式。
+// 亦接受不帶 REP 的單元素形式；零計數完成一次空指令。無可用視窗時不提交，回傳零交回精確慢路徑。
+std::uint64_t execute_resident_compare(StringCompareForm,GuestState&,GuestMemory&,std::uint64_t budget,bool metered,bool shared);
 // 原生單元素路徑：記憶體檢查失敗時完全不提交，回到 CPU 故障派送。
 extern "C" std::uint64_t jit_string_compare(GuestState*,GuestMemory*,unsigned control,std::uint64_t rip) noexcept;
 void restore_rep_compare_fault(GuestState&) noexcept;

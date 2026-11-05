@@ -5,7 +5,8 @@
 namespace x64arm {
 std::uint64_t WindowsServices::queue_http_callback(const GuestState& state,GuestMemory& memory,std::uint64_t handle,std::uint32_t status,std::span<const std::uint8_t> information,std::uint64_t context,bool ready){
     const auto found=runtime_.http.handles.find(handle);
-    if(found==runtime_.http.handles.end() || !found->second.callback || !(found->second.callback_flags&status))return 0;
+    if(found==runtime_.http.handles.end() || !found->second.callback)return 0;
+    if(found->second.inet?!context:!(found->second.callback_flags&status))return 0;
     if(registered_waits_.size()>=64)throw std::bad_alloc{};
     // callback 使用共用工作執行緒；宿主 PAC 執行緒不會直接進入客體程式碼。
     const auto worker=acquire_wait_worker(state,memory,65536);if(!worker)throw std::bad_alloc{};
@@ -20,7 +21,9 @@ std::uint64_t WindowsServices::queue_http_callback(const GuestState& state,Guest
         wait.callback_batch={{found->second.callback,{handle,context,status,payload,information.size()}}};
         if(payload)wait.callback_storage.push_back(payload);
         registered_waits_.emplace(id,std::move(wait));wait_workers_[worker]=id;
-        http_callbacks_.emplace(id,HttpCallbackOperation{handle,{},ready});
+        std::vector<std::uint64_t> dependencies;
+        if(found->second.inet)for(const auto& [previous,operation]:http_callbacks_)if(operation.handle==handle)dependencies.push_back(previous);
+        http_callbacks_.emplace(id,HttpCallbackOperation{handle,std::move(dependencies),ready});
         auto& thread=threads_.items.at(worker);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::RegisteredWait;
         return id;
     }catch(...){if(id){http_callbacks_.erase(id);registered_waits_.erase(id);}if(payload)free_heap(memory,payload,state);wait_workers_[worker]=0;throw;}
@@ -72,7 +75,7 @@ void WindowsServices::close_http_callbacks(GuestState& state,GuestMemory& memory
     const unsigned unit=x86_?4:8;std::vector<std::uint8_t> bytes(unit);
     for(unsigned i=0;i<unit;++i)bytes[i]=static_cast<std::uint8_t>(handle>>(i*8));
     const auto found=runtime_.http.handles.find(handle);if(found==runtime_.http.handles.end())return;
-    if(const auto closing=queue_http_callback(state,memory,handle,0x800,bytes,found->second.context))http_callbacks_.at(closing).dependencies=std::move(dependencies);
+    if(const auto closing=queue_http_callback(state,memory,handle,found->second.inet?70U:0x800U,bytes,found->second.context))http_callbacks_.at(closing).dependencies=std::move(dependencies);
 }
 std::optional<std::uint32_t> WindowsServices::invoke_autoproxy(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const auto symbol=service.symbol;

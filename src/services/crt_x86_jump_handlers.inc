@@ -78,7 +78,7 @@ std::optional<std::uint32_t> WindowsServices::resume_x86_longjmp(GuestState& sta
         const auto depth=runtime_.callbacks.back().exception_depth;
         if(depth>exceptions_.stack.size())throw HostCallFault("Win32 longjmp callback 例外深度不合法");
         for(std::size_t i=exceptions_.stack.size();i>depth;--i)leave_x86_exception_handler(memory,exceptions_.stack[i-1]);
-        discard_callbacks(runtime_.callbacks.size()-1,state,memory);exceptions_.stack.resize(depth);
+        discard_callbacks(runtime_.callbacks.size()-1,state,memory);exceptions_.stack.resize(depth);sync_msvc_uncaught(memory);
     }
     memory.store(GuestAddress{restored.fs_base},32,operation.registration);
     state=restored;return std::nullopt;

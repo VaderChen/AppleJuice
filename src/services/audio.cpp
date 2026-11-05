@@ -29,6 +29,18 @@ void Buffer::capture(std::span<const float> in,unsigned input_rate){
 }
 void Buffer::render(std::span<float> out,unsigned output_rate) {
     std::fill(out.begin(),out.end(),0.0F);
+    if(source){
+        source->render(out,output_rate);
+        {std::lock_guard lock(mutex);rendered_frames+=out.size()/2;
+            for(std::size_t i=0;i+1<out.size();i+=2){
+                rendered_left_peak=std::max(rendered_left_peak,std::abs(out[i]));
+                rendered_right_peak=std::max(rendered_right_peak,std::abs(out[i+1]));
+            }
+            rendered_peak=std::max(rendered_left_peak,rendered_right_peak);
+        }
+        if(out.size()/2 && progress_notify)progress_notify();
+        return;
+    }
     // 先宣告通知守衛，讓所有返回路徑都先釋放下面的音訊鎖，再喚醒協調者。
     struct ProgressNotification {
         const std::function<void()>& notify;

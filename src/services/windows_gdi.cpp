@@ -7,6 +7,7 @@
 #include "x64arm/windows_userdraw.hpp"
 #include "x64arm/windows_palette.hpp"
 #include "x64arm/windows_fonts.hpp"
+#include "gdi_batch_layout.h"
 #include <unicode/utf8.h>
 #include <algorithm>
 #include <bit>
@@ -24,6 +25,52 @@ void logical_clip(GuiDraw& draw,const GuiDc& dc,const GuiRect& rect){
     if(!dc.excluded.empty())region=gui_region_combine(region,dc.excluded,4);
     draw.clipped=true;draw.clip=gui_region_bounds(region);draw.excluded=gui_region_combine(GuiRegion{draw.clip},region,4);
 }
+}
+std::uint64_t WindowsServices::gdi_batch_cell() const {
+    if(!runtime_.image.base)return 0;
+    const auto thread=threads_.items.find(threads_.current);
+    const auto teb=thread==threads_.items.end()?teb_base_.value:thread->second.teb;
+    return teb?teb+(x86_?X64ARM_GDI_BATCH_X86_OFFSET:X64ARM_GDI_BATCH_X64_OFFSET):0;
+}
+void WindowsServices::mark_gdi_surface(GuestMemory& memory,std::uint64_t key){
+    auto& batch=gdi_batches_[threads_.current];const bool empty=batch.surfaces.empty();batch.surfaces.insert(key);
+    if(empty)if(const auto cell=gdi_batch_cell())memory.store(GuestAddress{cell+X64ARM_GDI_BATCH_PENDING_OFFSET},32,1);
+}
+std::uint32_t WindowsServices::gdi_batch_limit(GuestMemory& memory,std::optional<std::uint32_t> value){
+    const auto cell=gdi_batch_cell();auto& batch=gdi_batches_[threads_.current];
+    const auto stored=cell?static_cast<std::uint32_t>(memory.load(GuestAddress{cell},32)):batch.limit;
+    const auto previous=stored?stored:X64ARM_GDI_BATCH_DEFAULT;
+    if(value){batch.limit=*value?*value:X64ARM_GDI_BATCH_DEFAULT;if(cell)memory.store(GuestAddress{cell},32,batch.limit);}
+    return previous;
+}
+bool WindowsServices::flush_gdi_batch(GuestMemory& memory){
+    const auto found=gdi_batches_.find(threads_.current);if(found==gdi_batches_.end() || found->second.surfaces.empty())return true;
+    auto pending=std::move(found->second.surfaces);found->second.surfaces.clear();found->second.calls=0;bool success=true;
+    // 僅完成呼叫執行緒碰過的表面；不遍歷或發布其他執行緒的 DIB。
+    // 繪製及讀回沿用既有 Metal／DIB codec，包含掃描列方向、色表與 padding。
+    for(const auto key:pending)if(const auto surface=rasters_.find(key);surface!=rasters_.end()){
+        try{surface->second->flush(true);if(gui_.bitmaps.contains(key))sync_raster_bitmap(memory,key);}
+        catch(const std::bad_alloc&){last_error_=8;success=false;}
+        catch(const std::runtime_error&){last_error_=31;success=false;}
+    }
+    if(const auto cell=gdi_batch_cell())memory.store(GuestAddress{cell+X64ARM_GDI_BATCH_PENDING_OFFSET},32,0);
+    return success;
+}
+bool WindowsServices::begin_gdi_batch_call(GuestMemory& memory,const WindowsServiceDescriptor& service){
+    // 只有 BOOL 繪圖可延後；其他 GDI 操作在進入 provider 前完成既有批次。
+    // 此邊界共用於文字、路徑、圖像及繪圖狀態，物件切換後可直接讀 DIB。
+    static constexpr std::string_view names[]{"BitBlt","StretchBlt","PatBlt","AlphaBlend","GdiAlphaBlend",
+        "TransparentBlt","GradientFill","GdiGradientFill","TextOutA","TextOutW","ExtTextOutA","ExtTextOutW",
+        "LineTo","Polyline","PolylineTo","Polygon","PolyPolygon","PolyPolyline","PolyBezier","PolyBezierTo",
+        "Rectangle","Ellipse","RoundRect","Arc","ArcTo","Chord","Pie","AngleArc","FillPath","StrokePath","StrokeAndFillPath","SetPixelV"};
+    const bool batchable=(service.family=="gdi32.dll" || service.family=="msimg32.dll") && std::find(std::begin(names),std::end(names),service.symbol)!=std::end(names);
+    if(!batchable)(void)flush_gdi_batch(memory);
+    return batchable;
+}
+bool WindowsServices::end_gdi_batch_call(GuestMemory& memory,bool batchable){
+    const auto found=gdi_batches_.find(threads_.current);if(found==gdi_batches_.end() || found->second.surfaces.empty())return true;
+    if(!batchable || ++found->second.calls>=gdi_batch_limit(memory))return flush_gdi_batch(memory);
+    return true;
 }
 GuiFont gui_font(const GuiState& gui, std::uint64_t handle) {
     GuiFont font;
@@ -119,7 +166,7 @@ std::shared_ptr<RasterSurface> WindowsServices::raster_surface(GuestMemory& memo
     if(writing && !printer_drawing_enabled(hdc) && !prepare_legacy_printer_page(memory,hdc))return {};
     import_dib_bitmap(memory,dc->second.bitmap);
     // 控制項也可持有離屏繪製表面；headless 不應忽略已建立的真實像素。
-    if(!native_gui_){const auto found=rasters_.find(dc->second.bitmap?dc->second.bitmap:hdc);return found==rasters_.end()?std::shared_ptr<RasterSurface>{}:found->second;}
+    if(!native_gui_){const auto key=dc->second.bitmap?dc->second.bitmap:hdc;const auto found=rasters_.find(key);if(found!=rasters_.end() && writing)mark_gdi_surface(memory,key);return found==rasters_.end()?std::shared_ptr<RasterSurface>{}:found->second;}
     const auto window=hdc>=0x10000000?gui_.windows.find(hdc-0x10000000):gui_.windows.end();
     std::uint64_t key=hdc,resource=0;std::uint32_t width=0,height=0;std::span<const std::uint32_t> pixels;void* view=nullptr;
     if(window!=gui_.windows.end()){width=window->second.width;height=window->second.height;view=native_gui_->graphics_view(window->first);}
@@ -144,7 +191,7 @@ std::shared_ptr<RasterSurface> WindowsServices::raster_surface(GuestMemory& memo
     }
     if(window==gui_.windows.end()){auto& bitmap=gui_.bitmaps.at(key);if((bitmap.dib_address && (created || bitmap.dib_upload_pending)) || (bitmap.raw_alpha && created)){surface->set_dib_alpha(bitmap.dib_address && bitmap.bits_per_pixel==32);surface->upload(bitmap.pixels,true);bitmap.dib_upload_pending=false;}}
     if(shared)raster_shared_.insert(key);else raster_shared_.erase(key);
-    rasters_[key]=surface;return surface;
+    rasters_[key]=surface;if(writing)mark_gdi_surface(memory,key);return surface;
 }
 void WindowsServices::sync_raster_bitmap(GuestMemory& memory,std::uint64_t handle){
     import_dib_bitmap(memory,handle);
@@ -189,7 +236,8 @@ std::span<const WindowsServiceDescriptor> gdi_service_descriptors(){
         {"msimg32.dll","GradientFill",6,0,0,52},{"gdi32.dll","GdiGradientFill",6,0,0,52},
         {"gdi32.dll","ExtTextOutA",8},{"gdi32.dll","ExtTextOutW",8},{"gdi32.dll","TextOutA",5},{"gdi32.dll","TextOutW",5},
         {"gdi32.dll","GetPixel",3},{"gdi32.dll","SetPixel",4},{"gdi32.dll","MoveToEx",4},{"gdi32.dll","LineTo",3},{"gdi32.dll","Polyline",3},
-        {"gdi32.dll","CreatePen",3},{"gdi32.dll","Rectangle",5}
+        {"gdi32.dll","CreatePen",3},{"gdi32.dll","Rectangle",5},
+        {"gdi32.dll","GdiGetBatchLimit",0},{"gdi32.dll","GdiSetBatchLimit",1}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -203,7 +251,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
     const auto window=arg(0)>=0x10000000?gui_.windows.find(arg(0)-0x10000000):gui_.windows.end();
     const bool known_dc=arg(0) && (gui_.contexts.contains(arg(0)) || gui_.dc_objects.contains(arg(0)) || window!=gui_.windows.end());
 #include "gdi_palette_handlers.inc"
-    const bool uses_dc=symbol!="GdiFlush" && symbol!="CreateBrushIndirect" && symbol!="CreateHatchBrush" && symbol!="CreatePatternBrush" && symbol!="CreateBitmap" && symbol!="CreateDIBSection" && symbol!="CreatePen" && symbol!="DeleteObject" && symbol!="TranslateCharsetInfo" && symbol!="CreateDCA" && symbol!="CreateDCW" && symbol!="CreateICA" && symbol!="CreateICW" && symbol!="CreateCompatibleDC" && symbol!="DeleteDC" && symbol!="GetBitmapBits" && symbol!="SetBitmapBits";
+    const bool uses_dc=symbol!="GdiFlush" && symbol!="GdiGetBatchLimit" && symbol!="GdiSetBatchLimit" && symbol!="CreateBrushIndirect" && symbol!="CreateHatchBrush" && symbol!="CreatePatternBrush" && symbol!="CreateBitmap" && symbol!="CreateDIBSection" && symbol!="CreatePen" && symbol!="DeleteObject" && symbol!="TranslateCharsetInfo" && symbol!="CreateDCA" && symbol!="CreateDCW" && symbol!="CreateICA" && symbol!="CreateICW" && symbol!="CreateCompatibleDC" && symbol!="DeleteDC" && symbol!="GetBitmapBits" && symbol!="SetBitmapBits";
     // 非 HDC 參數、未知 handle 與 DeleteDC 使用局部狀態，不能讓查詢製造有效 DC。
     GuiDc unused_dc;auto existing_dc=gui_.contexts.find(arg(0));
     if(uses_dc && known_dc && existing_dc==gui_.contexts.end())existing_dc=gui_.contexts.try_emplace(arg(0)).first;
@@ -267,7 +315,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         if(!known_dc)last_error_=6;else if(!arg(1))last_error_=87;
         else {memory.check(GuestAddress{arg(1)},4,Access::Write);last_error_=2015;} // 虛擬顯示裝置目前沒有關聯的 ICC 檔。
     }
-    else if(symbol=="GdiFlush"){for(auto& [key,surface]:rasters_){surface->flush(true);if(gui_.bitmaps.contains(key) && gui_.bitmaps.at(key).dib_address)sync_raster_bitmap(memory,key);}result=1;}
+    else if(symbol=="GdiFlush")result=flush_gdi_batch(memory);
+    else if(symbol=="GdiGetBatchLimit" || symbol=="GdiSetBatchLimit"){
+        (void)flush_gdi_batch(memory);
+        if(symbol=="GdiGetBatchLimit")result=gdi_batch_limit(memory);
+        else result=gdi_batch_limit(memory,d(0));
+    }
     else if(symbol=="CreateBrushIndirect"){
         if(!arg(0))last_error_=87;
         else {

@@ -87,12 +87,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_digest(GuestState& state,Gu
             const auto [pointer,count]=package_info(wide,list,list?"":text(arg(0),wide));memory.store(GuestAddress{arg(1)},static_cast<std::uint8_t>(unit*8),pointer);if(list)memory.store(GuestAddress{arg(0)},32,count);
         }else if(symbol.starts_with("AcquireCredentialsHandle")){
             const auto use=static_cast<std::uint32_t>(arg(2));require(use>=1 && use<=3 && !arg(3) && !arg(5) && !arg(6),digest::unsupported);
-            output_sites(arg(7),0,arg(8));require(arg(4),digest::no_credentials);require(all.credentials.size()<1024 && all.next<=UINT32_MAX,no_memory);
-            const auto at=arg(4);memory.check(GuestAddress{at},x86_?28U:48U,Access::Read);const auto flags=memory.load(GuestAddress{at+(x86_?24U:44U)},32);require(flags==1 || flags==2,invalid_parameter);
-            const auto counted=[&](unsigned index){const unsigned offset=x86_?index*8:index*16;const auto pointer=memory.load(GuestAddress{at+offset},static_cast<std::uint8_t>(unit*8)),length=memory.load(GuestAddress{at+offset+unit},32);require(length<=4096 && (!length || pointer),invalid_parameter);
-                if(!length)return std::string{};if(flags==2)return utf16_to_utf8(read_utf16_counted(memory,GuestAddress{pointer},length));std::string value(length,'\0');memory.read(GuestAddress{pointer},{reinterpret_cast<std::uint8_t*>(value.data()),value.size()});return utf16_to_utf8(cp1252_to_utf16(value));};
-            digest::Credentials credentials;credentials.user=counted(0);credentials.domain=counted(1);require(!credentials.user.empty() && credentials.user.find('\0')==credentials.user.npos && credentials.domain.find('\0')==credentials.domain.npos,invalid_parameter);
-            auto password=counted(2);require(password.find('\0')==password.npos,invalid_parameter);credentials.password=std::make_shared<digest::Secret>(std::move(password));credentials.use=use;
+            output_sites(arg(7),0,arg(8));require(all.credentials.size()<1024 && all.next<=UINT32_MAX,no_memory);
+            digest::Credentials credentials;credentials.use=use;
+            if(!arg(4)){
+                initialize_tokens();const auto& token=runtime_.token_objects.at(effective_token_id());require(bool(token.network_password),digest::no_credentials);
+                credentials.user=utf16_to_utf8(token.network_user);credentials.domain=utf16_to_utf8(token.network_domain);
+                credentials.password=std::make_shared<digest::Secret>(utf16_to_utf8(token.network_password->value));
+            }else{
+                const auto at=arg(4);memory.check(GuestAddress{at},x86_?28U:48U,Access::Read);const auto flags=memory.load(GuestAddress{at+(x86_?24U:44U)},32);require(flags==1 || flags==2,invalid_parameter);
+                const auto counted=[&](unsigned index){const unsigned offset=x86_?index*8:index*16;const auto pointer=memory.load(GuestAddress{at+offset},static_cast<std::uint8_t>(unit*8)),length=memory.load(GuestAddress{at+offset+unit},32);require(length<=4096 && (!length || pointer),invalid_parameter);
+                    if(!length)return std::string{};if(flags==2)return utf16_to_utf8(read_utf16_counted(memory,GuestAddress{pointer},length));std::string value(length,'\0');memory.read(GuestAddress{pointer},{reinterpret_cast<std::uint8_t*>(value.data()),value.size()});return utf16_to_utf8(cp1252_to_utf16(value));};
+                credentials.user=counted(0);credentials.domain=counted(1);require(!credentials.user.empty() && credentials.user.find('\0')==credentials.user.npos && credentials.domain.find('\0')==credentials.domain.npos,invalid_parameter);
+                auto password=counted(2);require(password.find('\0')==password.npos,invalid_parameter);credentials.password=std::make_shared<digest::Secret>(std::move(password));
+            }
             if(arg(0))require(text(arg(0),symbol.ends_with('W'))==credentials.user,0x80090306);
             const auto id=all.next;all.credentials.emplace(id,std::move(credentials));++all.next;handle(memory,arg(7),id);if(arg(8))memory.store(GuestAddress{arg(8)},64,INT64_MAX);
         }else if(symbol=="FreeCredentialsHandle"){

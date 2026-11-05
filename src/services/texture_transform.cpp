@@ -75,7 +75,6 @@ std::vector<std::uint8_t> transform(std::span<const std::uint8_t> source,
     valid(mode>=1 && mode<=5 && !(filter&~0x7f000fU));
     for(unsigned i=0;i<3;++i)valid(size[i] && target[i] && box[i]<box[i+3] && box[i+3]<=size[i]);
     const std::array cropped{box[3]-box[0],box[4]-box[1],box[5]-box[2]};
-    if(mode==1)valid(cropped==target);
     valid(std::uint64_t{target[0]}*target[1]*target[2]<=32U*1024U*1024U);
     valid(std::uint64_t{size[0]}*size[1]*cropped[2]<=32U*1024U*1024U);
     // DirectXTex 的數值轉換需要具體型別；typeless 資源仍保留原格式，
@@ -83,6 +82,20 @@ std::vector<std::uint8_t> transform(std::span<const std::uint8_t> source,
     const auto typed=[](std::uint32_t format){return MakeTypelessFLOAT(MakeTypelessUNORM(static_cast<DXGI_FORMAT>(format)));};
     const auto sf=typed(source_format),df=typed(target_format);
     size_t row{},slice{};checked(ComputePitch(sf,size[0],size[1],row,slice));valid(source.size()>=slice*size[2]);
+    // 無尺寸／色域轉換時保留原始位元；尤其不可重壓縮未變動的 BC 區塊。
+    const unsigned block=IsCompressed(sf)?4U:1U;
+    if(sf==df && cropped==target && !(filter&~0x7000fU) &&
+        !(box[0]%block) && !(box[1]%block) &&
+        (!(box[3]%block) || box[3]==size[0]) && (!(box[4]%block) || box[4]==size[1])){
+        size_t target_row{},target_slice{},unit_row{},unit_slice{};
+        checked(ComputePitch(df,target[0],target[1],target_row,target_slice));
+        checked(ComputePitch(df,block,block,unit_row,unit_slice));
+        std::vector<std::uint8_t> result(target_slice*target[2]);
+        for(unsigned z=0;z<target[2];++z)for(unsigned y=0;y<(target[1]+block-1)/block;++y)
+            std::memcpy(result.data()+z*target_slice+y*target_row,
+                source.data()+(box[2]+z)*slice+(box[1]/block+y)*row+(box[0]/block)*unit_row,target_row);
+        return result;
+    }
     unsigned flags=mode<=2?TEX_FILTER_POINT:mode==3?TEX_FILTER_LINEAR:mode==4?TEX_FILTER_TRIANGLE:TEX_FILTER_BOX;
     flags|=(filter&0x70000U)>>12;
     const auto input_flags=static_cast<TEX_FILTER_FLAGS>((filter&0x200000U)?TEX_FILTER_SRGB_IN:0);
@@ -102,7 +115,14 @@ std::vector<std::uint8_t> transform(std::span<const std::uint8_t> source,
         else for(unsigned y=0;y<cropped[1];++y)std::memcpy(pixels.data()+static_cast<size_t>(y)*cropped[0]*4,input.pixels+(box[1]+y)*input.rowPitch+box[0]*16,static_cast<size_t>(cropped[0])*16);
         Image cropped_image{cropped[0],cropped[1],DXGI_FORMAT_R32G32B32A32_FLOAT,static_cast<size_t>(cropped[0])*16,pixels.size()*4,reinterpret_cast<std::uint8_t*>(pixels.data())};
         if(cropped[0]!=target[0] || cropped[1]!=target[1]){
-            if(mode==5){
+            if(mode==1){
+                // NONE 不縮放，來源外的目的像素為透明黑。
+                std::vector<float> copied(static_cast<size_t>(target[0])*target[1]*4);
+                for(unsigned y=0;y<std::min(cropped[1],target[1]);++y)
+                    std::memcpy(copied.data()+static_cast<size_t>(y)*target[0]*4,
+                        pixels.data()+static_cast<size_t>(y)*cropped[0]*4,std::min(cropped[0],target[0])*16ULL);
+                pixels=std::move(copied);
+            }else if(mode==5){
                 // 非正方形 mip 尾端會出現 2×1 → 1×1；DirectXTex Resize 的
                 // BOX 僅接受兩軸同時減半，故在共用浮點資料上計算實際面積權重。
                 std::vector<float> filtered(static_cast<size_t>(target[0])*target[1]*4);
@@ -142,7 +162,8 @@ std::vector<std::uint8_t> transform(std::span<const std::uint8_t> source,
         std::vector<float> pixels(static_cast<size_t>(target[0])*target[1]*4);
         const double scale=static_cast<double>(cropped[2])/target[2],center=(z+0.5)*scale-0.5;
         const auto blend=[&](int layer,double weight){const auto& values=slices.at(static_cast<size_t>(edge(layer)));for(size_t i=0;i<pixels.size();++i)pixels[i]+=values[i]*static_cast<float>(weight);};
-        if(mode<=2 || cropped[2]==target[2])blend(static_cast<int>(std::floor(center+0.5)),1);
+        if(mode==1){if(z<cropped[2])blend(static_cast<int>(z),1);}
+        else if(mode==2 || cropped[2]==target[2])blend(static_cast<int>(std::floor(center+0.5)),1);
         else if(mode==5){const double lo=z*scale,hi=(z+1)*scale;for(int i=static_cast<int>(std::floor(lo));i<static_cast<int>(std::ceil(hi));++i)blend(i,(std::min(hi,i+1.0)-std::max(lo,static_cast<double>(i)))/scale);}
         else {const double radius=mode==4?std::max(1.0,scale):1.0;double sum=0;for(int i=static_cast<int>(std::ceil(center-radius));i<=static_cast<int>(std::floor(center+radius));++i)sum+=std::max(0.0,1-std::abs(i-center)/radius);for(int i=static_cast<int>(std::ceil(center-radius));i<=static_cast<int>(std::floor(center+radius));++i)blend(i,std::max(0.0,1-std::abs(i-center)/radius)/sum);}
         Image input{target[0],target[1],DXGI_FORMAT_R32G32B32A32_FLOAT,static_cast<size_t>(target[0])*16,pixels.size()*4,reinterpret_cast<std::uint8_t*>(pixels.data())};

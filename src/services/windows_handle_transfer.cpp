@@ -253,6 +253,15 @@ std::uint32_t WindowsServices::export_transfer_handle(std::uint64_t handle,Inher
     if(export_mapping_handle(handle,item) || export_job_handle(handle,item) || export_process_handle(handle,item))return 0;
     if(const auto found=runtime_.wait_objects.find(handle);found!=runtime_.wait_objects.end()){
         auto& event=found->second;
+        if(event.kind==WaitObject::Kind::Semaphore){
+            auto& signal=runtime_.wait_state(event);
+            if(!signal.shared_event){
+                const auto name="transfer-semaphore-"+std::to_string(host_process_id())+"-"+std::to_string(runtime_.allocate_wait_handle());
+                const auto opened=open_shared_semaphore(mapping_session(),std::u16string(name.begin(),name.end()),true,signal.count,signal.maximum,[&]{return signal.security_descriptor;});
+                if(opened.error)return opened.error;signal.shared_event=opened.event;
+            }
+            item.type=10;item.access=event.access;item.descriptor=signal.shared_event->descriptor();item.lifetime=signal.shared_event;return 0;
+        }
         if(event.kind==WaitObject::Kind::Mutex){
             auto& mutex=runtime_.mutex_objects.at(event.mutex);
             if(!mutex.shared){const auto text=std::string("transfer-mutex-")+std::to_string(host_process_id())+"-"+std::to_string(event.mutex)+"-"+std::to_string(runtime_.allocate_wait_handle());const auto opened=open_shared_mutex(mapping_session(),std::u16string(text.begin(),text.end()),true,mutex.owner,mutex.recursion,[&]{return mutex.security_descriptor;});if(opened.error)return opened.error;mutex.shared=opened.mutex;}
@@ -280,6 +289,12 @@ void WindowsServices::import_transfer_handle(const InheritedHandle& item){
 #endif
         try{if(item.access&~0xf01ffU)throw SecurityDescriptorError{5};const auto id=attach_shared_token(SharedToken::inherit(item.descriptor));runtime_.token_handles.emplace(item.handle,item.access);runtime_.token_handle_objects.emplace(item.handle,id);}
         catch(const SecurityDescriptorError&){throw HostCallFault("傳輸權杖物件無效");}
+    }
+    else if(item.type==10){
+        const auto opened=inherit_shared_semaphore(mapping_session(),item.descriptor);if(opened.error)throw HostCallFault("無法接收傳輸 semaphore");
+        if(item.access&~0x1f0003U)throw HostCallFault("傳輸 semaphore 權限無效");
+        WaitObject object;object.kind=WaitObject::Kind::Semaphore;object.shared_event=opened.event;object.maximum=opened.event->maximum();object.access=item.access;
+        runtime_.wait_objects.emplace(item.handle,std::move(object));
     }
     else if(item.type==7){import_process_handle(item);}
     else if(item.type==6){
@@ -488,12 +503,13 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
         else if(packet.kind==family_request_kind){
             reply.reserved=family_protocol;reply.auxiliary=process_identity_birth();
             const auto caller=process_identity::query(packet.sender);
-            reply.error=packet.reserved!=family_protocol || !packet.sequence || !packet.options || !packet.flags || packet.flags>60000 ||
+            reply.error=packet.reserved!=family_protocol || !packet.sequence || !packet.options || (packet.options!=3 && (!packet.flags || packet.flags>60000)) ||
                 !packet.auxiliary || packet.auxiliary!=reply.auxiliary || !caller.live({packet.sender,packet.handle})?87U:0U;
             if(!reply.error)reply.error=packet.options==1?
                 queue_perflib_remote(packet.sender,packet.handle,packet.sequence,packet.type,packet.flags,packet.accounting,packet.mode,descriptor,state_descriptor):
                 packet.options==2 && state_descriptor<0?
-                receive_remote_thread_creation(memory,packet.sender,packet.handle,packet.sequence,packet.type,packet.flags,packet.accounting,packet.mode,descriptor):50U;
+                receive_remote_thread_creation(memory,packet.sender,packet.handle,packet.sequence,packet.type,packet.flags,packet.accounting,packet.mode,descriptor):
+                packet.options==3 && !descriptor_count?receive_remote_gui_message(packet.sender,packet.handle,packet.sequence,packet.type,packet.flags,packet.accounting,packet.mode):50U;
             // 已接受的請求由客體 worker 執行及回覆，不能在排入工作時回傳 API 成功。
             if(reply.error)(void)send_transfer(transfer.descriptor,path,reply);
         }
@@ -503,6 +519,7 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
                 if(packet.options==1)cancel_perflib_remote(packet.sender,packet.handle,packet.sequence);
                 // thread channel 的 atomic phase 決定提交或取消；已提交的建立不可被晚到的取消撤回。
                 else if(packet.options==2)poll_remote_thread_creations(memory);
+                else if(packet.options==3)cancel_remote_gui_message(packet.sender,packet.handle,packet.sequence);
             }
         }
         else if(packet.kind==23){
@@ -553,7 +570,7 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
             (void)send_transfer(transfer.descriptor,path,reply);
         }
         else if(packet.kind==1){
-            if(descriptor<0 || packet.type<1 || (packet.type>7 && packet.type!=9) || packet.flags&~1U)reply.error=87;
+            if(descriptor<0 || packet.type<1 || (packet.type>7 && packet.type!=9 && packet.type!=10) || packet.flags&~1U)reply.error=87;
             else if(transfer.imports.size()>=1024 || files_.size()+runtime_.wait_objects.size()>=process_handle_limit)reply.error=8;
             else {
                 item.handle=runtime_.allocate_wait_handle();item.type=packet.type;item.access=packet.access;item.flags=packet.flags;item.mode=packet.mode;item.pipe_mode=packet.pipe_mode;item.auxiliary=packet.auxiliary;item.descriptor=descriptor;descriptor=-1;
@@ -654,11 +671,11 @@ std::uint32_t WindowsServices::begin_remote_family_request(std::uint32_t pid,std
     sequence=0;
 #if !defined(_WIN32)
     if(!runtime_.network.external_io || !handle_transfers_ || !process_identity_birth())return 50;
-    if(!pid || !birth || !family || !timeout || timeout>60000 || (state_descriptor>=0 && descriptor<0))return 87;
+    if(!pid || !birth || !family || (family!=3 && (!timeout || timeout>60000)) || (state_descriptor>=0 && descriptor<0))return 87;
     if(!process_identity::query(pid).live({pid,birth}))return 87;
     auto& transfer=*handle_transfers_;if(transfer.family_requests.size()>=1024 || !transfer.next_sequence || transfer.next_sequence==UINT64_MAX)return 8;
     try{
-        auto request=std::make_shared<FamilyRequest>();request->birth=birth;request->deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(timeout);
+        auto request=std::make_shared<FamilyRequest>();request->birth=birth;request->deadline=timeout?std::chrono::steady_clock::now()+std::chrono::milliseconds(timeout):std::chrono::steady_clock::time_point::max();
         const auto duplicate=[](int input){if(input<0)return -1;int output;do{output=::fcntl(input,F_DUPFD_CLOEXEC,0);}while(output<0 && errno==EINTR);return output;};
         if(descriptor>=0){request->descriptor=duplicate(descriptor);if(request->descriptor<0)return 6;}
         if(state_descriptor>=0){request->state_descriptor=duplicate(state_descriptor);if(request->state_descriptor<0)return 6;}
@@ -684,8 +701,8 @@ WindowsServices::RemoteFamilyResult WindowsServices::poll_remote_family_request(
         }transfer.family_requests.erase(key);return result;
     };
     if(!runtime_.network.external_io && request->packet.kind!=11)return finish({true,50,{},0});
-    if(request->packet.kind==11){
-        // Resume 的回覆可能先於子程序快速退出；已確認的操作不可因隨後
+    if(request->packet.kind==11 || (request->packet.kind==family_request_kind && request->packet.options==3 && request->sent)){
+        // Resume／視窗訊息的回覆可能先於子程序快速退出；已確認的操作不可因隨後
         // 的退出被改判失敗。回覆仍核對請求的 birth，排除 PID 重用。
         poll_handle_transfers(memory,true);
         if(const auto reply=transfer.replies.find(key);reply!=transfer.replies.end()){

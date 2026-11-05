@@ -20,8 +20,8 @@ float4 light_vertex(const device V& v,float4 eye,constant float4x4& normal,
  return clamp(float4(color,v.diffuse.a),0.0f,1.0f);
 }
 struct O {float4 position [[position]];float4 color;float4 texcoord;float4 secondary;float eyeZ;float point [[point_size]];};
-vertex O vertex_main(const device V* v [[buffer(0)]],constant float4x4& m [[buffer(1)]],constant float4x4& model [[buffer(2)]],constant float4x4& normal [[buffer(3)]],constant Light* lights [[buffer(4)]],constant float4& flags [[buffer(5)]],uint id [[vertex_id]]){
- O o;o.secondary=float4(0);o.eyeZ=(model*v[id].position).z;o.position=m*v[id].position;o.position.z=(o.position.z+o.position.w)*0.5;o.color=flags.x!=0?light_vertex(v[id],model*v[id].position,normal,lights,flags):clamp(v[id].color,0.0f,1.0f);o.texcoord=v[id].texcoord;o.point=1;return o;
+vertex O vertex_main(const device V* v [[buffer(0)]],constant float4x4& m [[buffer(1)]],constant float4x4& model [[buffer(2)]],constant float4x4& normal [[buffer(3)]],constant Light* lights [[buffer(4)]],constant float4& flags [[buffer(5)]],constant float& pointSize [[buffer(6)]],uint id [[vertex_id]]){
+ O o;o.secondary=float4(0);o.eyeZ=(model*v[id].position).z;o.position=m*v[id].position;o.position.z=(o.position.z+o.position.w)*0.5;o.color=flags.x!=0?light_vertex(v[id],model*v[id].position,normal,lights,flags):clamp(v[id].color,0.0f,1.0f);o.texcoord=v[id].texcoord;o.point=pointSize;return o;
 }
 float4 d3d_texture_argument(uint selector,float4 diffuse,float4 texture,float4 factor){float4 value=(selector&15)==2?texture:(selector&15)==3?factor:diffuse;if(selector&32)value=value.aaaa;if(selector&16)value=1-value;return value;}
 fragment float4 fragment_main(O in [[stage_in]],texture2d<float> tex [[texture(0)]],sampler sample [[sampler(0)]],constant uint4& textureMode [[buffer(0)]],constant float4* fog [[buffer(1)]],constant float4* fixedState [[buffer(2)]]){

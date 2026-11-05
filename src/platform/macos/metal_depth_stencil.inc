@@ -46,7 +46,8 @@ void metal_depth_transfer(id<MTLDevice> device,id<MTLCommandQueue> queue,const G
 id<MTLTexture> metal_shader_texture(const GraphicsView& view){
     auto& resource=metal_resource(view.resource);auto texture=resource.texture;if(!texture)return nil;
     const auto format=view.format?view.format:resource.desc.format;
-    const bool rgb32=format>=5 && format<=8;const bool stencil=format==22 || format==47;auto type=texture.textureType;
+    const bool rgb32=format>=5 && format<=8;const bool stencil=format==22 || format==47;
+    const bool replicate_red=(view.flags&graphics_view_replicate_red)!=0,red_only=(view.flags&graphics_view_red_only)!=0;auto type=texture.textureType;
     // 單層資源也能建立 array view；著色器取樣維度由 view 決定，不能依 layer 數推斷。
     switch(view.dimension){case 2:type=MTLTextureType2D;break;case 3:type=MTLTextureType2DArray;break;
         case 4:type=MTLTextureType2D;break;case 5:type=MTLTextureType2DArray;break;
@@ -61,10 +62,16 @@ id<MTLTexture> metal_shader_texture(const GraphicsView& view){
     std::uint32_t slices=view.slices && view.slices<=layers-slice?view.slices:layers-slice;
     if(volume || type==MTLTextureType2D || type==MTLTextureType2DMultisample)slices=1;else if(type==MTLTextureTypeCube)slices=6;
     const std::uint32_t mips=std::max(1U,resource.desc.levels),level=std::min(view.level,mips-1),levels=view.levels && view.levels<=mips-level?view.levels:mips-level;
-    if(level || levels!=resource.desc.levels || slice || (!volume && slices!=resource.desc.layers) || pixel_format!=texture.pixelFormat || stencil || rgb32 || type!=texture.textureType)
-    return resource.shader_view((__bridge const void*)texture,{2,static_cast<std::uint32_t>(pixel_format),static_cast<std::uint32_t>(type),(rgb32?1U:0U)|(stencil?2U:0U),level|(levels<<16),slice|(slices<<16)},[&]()->id<MTLTexture>{
+    if(level || levels!=resource.desc.levels || slice || (!volume && slices!=resource.desc.layers) || pixel_format!=texture.pixelFormat || stencil || rgb32 || replicate_red || red_only || type!=texture.textureType)
+    return resource.shader_view((__bridge const void*)texture,{2,static_cast<std::uint32_t>(pixel_format),static_cast<std::uint32_t>(type),(rgb32?1U:0U)|(stencil?2U:0U)|(replicate_red?4U:0U)|(red_only?8U:0U),level|(levels<<16),slice|(slices<<16)},[&]()->id<MTLTexture>{
         id<MTLTexture> made=nil;
-        if(rgb32){
+        if(replicate_red){
+            const auto swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleRed,MTLTextureSwizzleRed,MTLTextureSwizzleRed);
+            made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(level,levels) slices:NSMakeRange(slice,slices) swizzle:swizzle];
+        }else if(red_only){
+            const auto swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleZero,MTLTextureSwizzleZero,MTLTextureSwizzleOne);
+            made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(level,levels) slices:NSMakeRange(slice,slices) swizzle:swizzle];
+        }else if(rgb32){
             const auto swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleOne);
             made=[texture newTextureViewWithPixelFormat:pixel_format textureType:type levels:NSMakeRange(level,levels) slices:NSMakeRange(slice,slices) swizzle:swizzle];
         }else if(stencil){

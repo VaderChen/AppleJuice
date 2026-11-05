@@ -186,6 +186,13 @@ void WindowsServices::poll_dinput(bool background){
     const auto now=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
     std::vector<std::pair<input::Event,std::uint32_t>> events;events.reserve(native_events.size()+bridge.injected_events.size());
     static const auto keyboard_id=input::keyboard().instance,mouse_id=input::mouse().instance;
+    // 注入前已輪詢後台；尚未派送的注入事件早於這次新收到的實體事件。
+    // 先發布注入，再讓實體變化接管，避免舊 key-down 覆蓋新的 key-up。
+    for(const auto& [event,time]:bridge.injected_events){(void)time;
+        if(event.device==keyboard_id && event.object<256)gui_.injected_di_keys[event.object]=event.value?1:2;
+        if(event.device==mouse_id && event.object>=3 && event.object<11)gui_.injected_di_buttons[event.object-3]=event.value?1:2;
+    }
+    events.insert(events.end(),bridge.injected_events.begin(),bridge.injected_events.end());bridge.injected_events.clear();
     for(const auto& event:native_events){
         if(event.device==keyboard_id && event.object<256){
             gui_.injected_di_keys[event.object]=0;
@@ -203,11 +210,6 @@ void WindowsServices::poll_dinput(bool background){
         raw_input_event(event);events.push_back({event,now});
     }
     for(const auto& report:bridge.backend->reports())raw_input_report(report);
-    for(const auto& [event,time]:bridge.injected_events){(void)time;
-        if(event.device==keyboard_id && event.object<256)gui_.injected_di_keys[event.object]=event.value?1:2;
-        if(event.device==mouse_id && event.object>=3 && event.object<11)gui_.injected_di_buttons[event.object-3]=event.value?1:2;
-    }
-    events.insert(events.end(),bridge.injected_events.begin(),bridge.injected_events.end());bridge.injected_events.clear();
     for(auto& device:devices){
         if(device.instance==keyboard_id)for(unsigned i=0;i<device.values.size() && i<256;++i)if(gui_.injected_di_keys[i])device.values[i]=gui_.injected_di_keys[i]==1?1:0;
         if(device.instance==mouse_id)for(unsigned i=3;i<device.values.size() && i<11;++i)if(gui_.injected_di_buttons[i-3])device.values[i]=gui_.injected_di_buttons[i-3]==1?1:0;

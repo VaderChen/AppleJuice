@@ -93,6 +93,7 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
 #include "windows_registry_hive.inc"
 #include "windows_registry_values.inc"
 void WindowsServices::poll_registry_notifications(bool reload,std::u16string_view mutation,std::uint32_t filter,GuestMemory* memory) {
+    poll_printer_form_notifications(reload);
     if(registry_notifications_.empty())return;
     auto& registry=runtime_.registry;
     bool compare_snapshots=!registry_io_busy_ && (!reload || registry_file_.empty());

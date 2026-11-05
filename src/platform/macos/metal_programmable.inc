@@ -56,7 +56,8 @@ std::shared_ptr<GraphicsResource> MetalGl::graphics_resource(const GraphicsResou
         if((d.bind&0x80) && (t.pixelFormat==MTLPixelFormatR32Uint || t.pixelFormat==MTLPixelFormatR32Sint)){
             if(@available(macOS 14.0,*))t.usage|=MTLTextureUsageShaderAtomic;
         }
-        if(metal_depth_format(t.pixelFormat) && d.dimension!=3)throw std::invalid_argument("深度／模板資源需要二維紋理");
+        // D3D Texture1D 使用高度為 1 的 Metal 二維紋理，沿用同一深度平面與陣列切片流程。
+        if(metal_depth_format(t.pixelFormat) && d.dimension!=2 && d.dimension!=3)throw std::invalid_argument("深度／模板資源需要一維或二維紋理");
         t.storageMode=metal_depth_format(t.pixelFormat) || d.samples>1?MTLStorageModePrivate:MTLStorageModeShared;
         r->texture=[device_ newTextureWithDescriptor:t];if(!r->texture)throw std::bad_alloc{};
     }
@@ -309,6 +310,8 @@ std::shared_ptr<GraphicsSampler> MetalGl::graphics_sampler(std::span<const std::
     if(bytes.size()!=52)throw std::invalid_argument("取樣器結構長度不合法");auto d=[MTLSamplerDescriptor new];const auto filter=metal_word(bytes,0);d.minFilter=(filter&0x10)?MTLSamplerMinMagFilterLinear:MTLSamplerMinMagFilterNearest;d.magFilter=(filter&4)?MTLSamplerMinMagFilterLinear:MTLSamplerMinMagFilterNearest;d.mipFilter=(filter&1)?MTLSamplerMipFilterLinear:MTLSamplerMipFilterNearest;
     d.sAddressMode=metal_address(metal_word(bytes,4));d.tAddressMode=metal_address(metal_word(bytes,8));d.rAddressMode=metal_address(metal_word(bytes,12));d.maxAnisotropy=(filter&0x40)?std::clamp(metal_word(bytes,20),1U,16U):1;
     if(filter&0x80)d.compareFunction=static_cast<MTLCompareFunction>(metal_word(bytes,24)-1);d.lodMinClamp=metal_float(bytes,44);d.lodMaxClamp=metal_float(bytes,48);
+    if(@available(macOS 26.0,*))d.lodBias=metal_float(bytes,16);
+    else if(metal_float(bytes,16)!=0)throw std::invalid_argument("此 macOS 版本不支援取樣器 LOD bias");
     if(metal_float(bytes,28)==1 && metal_float(bytes,32)==1 && metal_float(bytes,36)==1 && metal_float(bytes,40)==1)d.borderColor=MTLSamplerBorderColorOpaqueWhite;else d.borderColor=metal_float(bytes,40)==0?MTLSamplerBorderColorTransparentBlack:MTLSamplerBorderColorOpaqueBlack;
     return cached_sampler(d);
 }}
@@ -405,6 +408,17 @@ bool MetalGl::graphics_replace_buffer(const std::shared_ptr<GraphicsResource>& d
     next.buffer=nil;next.recycle=nullptr;next.lease=nullptr;next.backing=nullptr;
     return true;
 }
+// DXGI B4G4R4A4 的低位是 B；Metal ABGR4 的低位是 A。
+// 保留每列及每個 volume plane 的獨立列距，只轉換有效像素。
+std::vector<std::uint8_t> metal_bgra4_transfer(std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image,std::uint32_t w,std::uint32_t h,std::uint32_t z,bool upload){
+    std::vector<std::uint8_t> result(std::size_t{w}*h*z*2);
+    for(unsigned plane=0;plane<z;++plane)for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){
+        const auto at=std::size_t{plane}*image+std::size_t{y}*row+x*2;const unsigned value=data[at]|(unsigned{data[at+1]}<<8);
+        const unsigned converted=upload?((value<<4)|(value>>12)):((value>>4)|(value<<12));
+        const auto out=((std::size_t{plane}*h+y)*w+x)*2;result[out]=static_cast<std::uint8_t>(converted);result[out+1]=static_cast<std::uint8_t>(converted>>8);
+    }
+    return result;
+}
 void MetalGl::graphics_write(const GraphicsView& v,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){@autoreleasepool{
     graphics_trace_upload("write",v,data);
     auto& r=metal_resource(v.resource);if(r.buffer){const auto size=v.count?v.count:r.desc.width-v.first;if(std::uint64_t{v.first}+size>r.desc.width || data.size()<size)throw std::invalid_argument("緩衝區寫入越界");graphics_write_buffer(v.resource,data.first(size),v.first);return;}
@@ -414,6 +428,7 @@ void MetalGl::graphics_write(const GraphicsView& v,std::span<const std::uint8_t>
     if(metal_depth_format(r.texture.pixelFormat)){std::vector<std::uint8_t> source(data.begin(),data.end());metal_depth_transfer(device_,queue_,v,source,row,{0,0,w,h},true);return;}
     if(r.texture.storageMode==MTLStorageModePrivate)throw std::invalid_argument("MSAA 紋理不能直接 CPU 寫入");
     std::vector<std::uint8_t> expanded;if(r.desc.format>=5 && r.desc.format<=8){expanded=metal_rgb32_expand(data,row,image,w,h,z);data=expanded;row=w*16;image=row*h;}
+    else if(r.desc.format==115){expanded=metal_bgra4_transfer(data,row,image,w,h,z,true);data=expanded;row=w*2;image=row*h;}
     [r.texture replaceRegion:MTLRegionMake3D(0,0,0,w,h,z) mipmapLevel:v.level slice:v.slice withBytes:data.data() bytesPerRow:row bytesPerImage:z>1?image:0];
 }}
 void MetalGl::graphics_write_discard(const GraphicsView& v,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){@autoreleasepool{
@@ -460,6 +475,7 @@ void MetalGl::graphics_write_region(const GraphicsView& v,std::span<const std::u
     if(metal_depth_format(r.texture.pixelFormat)){if(box[2] || z!=1)throw std::invalid_argument("深度紋理區域不合法");std::vector<std::uint8_t> source(data.begin(),data.end());metal_depth_transfer(device_,queue_,v,source,row,{box[0],box[1],w,h},true);return;}
     if(r.texture.storageMode==MTLStorageModePrivate)throw std::invalid_argument("MSAA 紋理不能直接 CPU 寫入");
     std::vector<std::uint8_t> expanded;if(r.desc.format>=5 && r.desc.format<=8){expanded=metal_rgb32_expand(data,row,image,w,h,z);data=expanded;row=w*16;image=row*h;}
+    else if(r.desc.format==115){expanded=metal_bgra4_transfer(data,row,image,w,h,z,true);data=expanded;row=w*2;image=row*h;}
     [r.texture replaceRegion:MTLRegionMake3D(box[0],box[1],box[2],w,h,z) mipmapLevel:v.level slice:v.slice withBytes:data.data() bytesPerRow:row bytesPerImage:z>1?image:0];
 }}
 // 描述元表需要被間接引用的配置常駐：以 MTLResidencySet（macOS 15+）記錄，表綁定前提交變更。
@@ -526,7 +542,7 @@ std::vector<std::uint8_t> MetalGl::graphics_read(const GraphicsView& v){@autorel
     if(r.texture.storageMode==MTLStorageModePrivate)throw std::invalid_argument("MSAA 讀回需要對應 resolve 格式");if(r.desc.format>=5 && r.desc.format<=8){
         std::vector<std::uint8_t> expanded(std::size_t{w}*h*z*16);[r.texture getBytes:expanded.data() bytesPerRow:w*16 bytesPerImage:z>1?w*h*16:0 fromRegion:MTLRegionMake3D(0,0,0,w,h,z) mipmapLevel:v.level slice:v.slice];
         for(std::size_t i=0;i<std::size_t{w}*h*z;++i)std::memcpy(data.data()+i*12,expanded.data()+i*16,12);return data;
-    }[r.texture getBytes:data.data() bytesPerRow:row bytesPerImage:z>1?row*pitch[1]:0 fromRegion:MTLRegionMake3D(0,0,0,w,h,z) mipmapLevel:v.level slice:v.slice];return data;
+    }[r.texture getBytes:data.data() bytesPerRow:row bytesPerImage:z>1?row*pitch[1]:0 fromRegion:MTLRegionMake3D(0,0,0,w,h,z) mipmapLevel:v.level slice:v.slice];if(r.desc.format==115)return metal_bgra4_transfer(data,row,row*h,w,h,z,false);return data;
 }}
 // Shared 緩衝在完成旗標之後即可由 CPU 直接讀取；不經 wait_resource（它會提交目前批次並等待所有使用同一緩衝的批次）。
 // 其他資源沿用 graphics_read。資格判斷見 metal_completed_readable。
@@ -542,7 +558,7 @@ std::vector<std::uint8_t> MetalGl::graphics_read_completed(const GraphicsView& v
 // 深度／模板、MSAA 與 RGB32（實體為 RGBA32）不走此路徑，由呼叫端沿用讀寫路徑。
 bool metal_copy_buffer_texture_eligible(const GraphicsView& texture,const GraphicsView& buffer,std::uint64_t offset,std::uint32_t row,std::uint32_t image,const std::array<std::uint32_t,6>& box){
     const auto* t=dynamic_cast<const MetalResource*>(texture.resource.get());const auto* b=dynamic_cast<const MetalResource*>(buffer.resource.get());
-    if(!t || !b || !t->texture || !b->buffer || t->desc.samples!=1 || metal_depth_format(t->texture.pixelFormat) || (t->desc.format>=5 && t->desc.format<=8) ||
+    if(!t || !b || !t->texture || !b->buffer || t->desc.samples!=1 || metal_depth_format(t->texture.pixelFormat) || t->desc.format==115 || (t->desc.format>=5 && t->desc.format<=8) ||
        texture.level>=t->desc.levels || texture.slice>=t->desc.layers)return false;
     const auto w=std::max(1U,t->desc.width>>texture.level),h=std::max(1U,t->desc.height>>texture.level),z=std::max(1U,t->desc.depth>>texture.level);
     if(box[0]>=box[3] || box[1]>=box[4] || box[2]>=box[5] || box[3]>w || box[4]>h || box[5]>z)return false;

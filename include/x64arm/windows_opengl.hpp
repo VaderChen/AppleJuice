@@ -23,7 +23,7 @@ enum class GlOperation {
     CreateShader,ShaderSource,CompileShader,GetShaderiv,GetShaderInfoLog,DeleteShader,CreateProgram,AttachShader,DetachShader,BindAttribLocation,LinkProgram,GetProgramiv,GetProgramInfoLog,DeleteProgram,UseProgram,GetUniformLocation,Uniform1fv,Uniform2fv,Uniform3fv,Uniform4fv,Uniform1iv,Uniform2iv,Uniform3iv,Uniform4iv,UniformMatrix4fv,GenBuffers,BindBuffer,BufferData,BufferSubData,DeleteBuffers,BindBufferBase,EnableVertexAttribArray,DisableVertexAttribArray,VertexAttribPointer,VertexAttrib1f,VertexAttrib3f,VertexAttrib4f,VertexAttribDivisor,DrawArraysInstanced,DrawElementsInstanced,GenFramebuffers,BindFramebuffer,DeleteFramebuffers,FramebufferTexture2D,CheckFramebufferStatus,DrawBuffers,ActiveTexture,GenerateMipmap,BlendEquationSeparate,BlendFuncSeparate,PolygonMode,
     GenVertexArrays,BindVertexArray,DeleteVertexArrays,IsVertexArray,IsBuffer,GetBufferParameteriv,GetBufferSubData,CopyBufferSubData,
     GetVertexAttribiv,GetVertexAttribfv,GetVertexAttribPointerv,VertexAttrib2f,GetTexLevelParameteriv,GetTexLevelParameterfv,IsTexture,
-    ColorMask,LineWidth,PixelZoom,RenderMode
+    ColorMask,LineWidth,PixelZoom,RenderMode,CopyTexSubImage2D,GetTexParameteriv,GetTexParameterfv,PolygonOffset,PointSize,IndexMask
 };
 struct OpenGlRendererInfo { std::string vendor,renderer,version;bool accelerated{}; };
 struct OpenGlBuffer {std::vector<std::uint8_t> bytes;std::uint32_t name{},usage{0x88e4};bool created{};};

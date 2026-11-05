@@ -1,6 +1,7 @@
 #pragma once
 #include "x64arm/native_application.hpp"
 #include "x64arm/startup_profile.hpp"
+#include "window_space.hpp"
 #import <AppKit/AppKit.h>
 #include <stdexcept>
 #include <cstdlib>
@@ -11,9 +12,10 @@
 
 namespace x64arm {
 // 所有 AppKit presenter 共用同一背景螢幕，子程序仍沿用 Launcher 的固定 ID。
-inline bool native_background_display_enabled(){const char* value=std::getenv("X64ARM_GUI_BACKGROUND_DISPLAY");return value && std::string_view(value)=="1";}
+inline bool native_background_display_enabled(){const char* value=std::getenv("X64ARM_GUI_BACKGROUND_DISPLAY");return native_window_space_uuid() || (value && std::string_view(value)=="1");}
 inline NSScreen* native_background_display(){
     if(!native_background_display_enabled())return nil;
+    if(native_window_space_uuid())return native_window_space_screen();
     static NSScreen* selected=[]()->NSScreen*{
         NSArray<NSScreen*>* screens=NSScreen.screens;NSScreen* active=NSScreen.mainScreen;
         // 同一次 Launcher 執行固定使用它已選定的螢幕，所有子程序沿用。
@@ -49,8 +51,7 @@ inline void prepare_native_application() {
     [NSUserDefaults.standardUserDefaults registerDefaults:@{@"ApplePersistenceIgnoreState":@YES,@"NSQuitAlwaysKeepsWindows":@NO}];}
     {startup_profile::Scope measurement("gui_init","shared_application");[NSApplication sharedApplication];}
     startup_profile::Scope policy_measurement("gui_init","activation_policy");
-    const auto* background=std::getenv("X64ARM_GUI_BACKGROUND_DISPLAY");
-    const auto policy=native_application_role()==NativeApplicationRole::Child || (background && std::string_view(background)=="1")
+    const auto policy=native_application_role()==NativeApplicationRole::Child || native_background_display_enabled()
         ?NSApplicationActivationPolicyAccessory:NSApplicationActivationPolicyRegular;
     // 重複設定既有角色可能回傳 NO；以設定後的角色判斷，避免第二個 presenter 誤判失敗。
     if(![NSApp setActivationPolicy:policy] && NSApp.activationPolicy!=policy)

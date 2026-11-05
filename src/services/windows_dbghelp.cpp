@@ -5,7 +5,7 @@
 
 namespace x64arm {
 namespace {
-enum class WalkStep {Start,Function,RegisteredFunction,Module,Read};
+enum class WalkStep {Start,Function,BuiltinFunction,RegisteredFunction,Module,Read};
 struct WalkOperation {
     WindowsServiceDescriptor service;GuestState cursor,caller;
     std::uint64_t scratch{},function{},module{},result{},read_address{},process{};unsigned read_size{};
@@ -57,7 +57,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_stack_walk(GuestState& stat
             token=bridge.next++;try{bridge.operations.emplace(token,std::move(operation));}catch(...){(void)free_heap(memory,operation.scratch,state);token=0;throw;}
         }else{
             auto& operation=bridge.operations.at(token);
-            if(operation.step==WalkStep::RegisteredFunction){discard_symbol_callback(operation.process);operation.step=WalkStep::Function;operation.function=operation.result;}
+            if(operation.step==WalkStep::BuiltinFunction){operation.function=operation.result;operation.module=memory.load(GuestAddress{operation.scratch+56},64);operation.step=WalkStep::Module;}
+            else if(operation.step==WalkStep::RegisteredFunction){discard_symbol_callback(operation.process);operation.step=WalkStep::Function;operation.function=operation.result;}
             else if(operation.step==WalkStep::Function)operation.function=operation.result;
             else if(operation.step==WalkStep::Module)operation.module=operation.result;
             else {
@@ -75,6 +76,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_stack_walk(GuestState& stat
                 if(!have_function){
                     operation.function=0;operation.module=0;
                     if(arg(6))return callback(WalkStep::Function,6,{arg(1),operation.cursor.rip.value});
+                    if(operation.amd64 && function_table_callback(operation.cursor.rip.value)){
+                        operation.step=WalkStep::BuiltinFunction;memory.store(GuestAddress{operation.scratch+56},64,0);
+                        start_callbacks(state,memory,{{resolve("ntdll.dll","RtlLookupFunctionEntry").value,{operation.cursor.rip.value,operation.scratch+56,0}}},Continuation::StackWalkOperation,token);return {};
+                    }
                     if(operation.amd64)if(const auto* image=unwind_image(memory,operation.cursor.rip.value))if(const auto* entry=lookup_function(*image,operation.cursor.rip.value))operation.function=image->function_table+static_cast<std::uint64_t>(entry-image->functions.data())*12;
                     have_function=true;
                 }
@@ -97,7 +102,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_stack_walk(GuestState& stat
                     // 共用 CPU 執行時的 AMD64 unwind 語義，包含 prolog／epilog／chained metadata。
                     // 非本程序的回呼式非 leaf unwind 尚未支援，不能改讀本程序而給出錯誤框架。
                     if(arg(5) || !current_process_handle(arg(1)))return finish(false);
-                    const auto* image=unwind_image(memory,operation.cursor.rip.value);if(!image)image=symbol_image();if(!image || image->base!=operation.module)return finish(false);
+                    const auto* image=unwind_image(memory,operation.cursor.rip.value,operation.function);if(!image)image=symbol_image();if(!image || image->base!=operation.module)return finish(false);
                     auto selected=*image;selected.functions={{static_cast<std::uint32_t>(memory.load(GuestAddress{operation.function},32)),static_cast<std::uint32_t>(memory.load(GuestAddress{operation.function+4},32)),static_cast<std::uint32_t>(memory.load(GuestAddress{operation.function+8},32))}};selected.function_table=operation.function;
                     const auto& entry=selected.functions.front();if(entry.begin>=entry.end || entry.end>selected.size || operation.cursor.rip.value-selected.base<entry.begin || operation.cursor.rip.value-selected.base>=entry.end)return finish(false);
                     operation.caller=virtual_unwind(memory,selected,operation.cursor.rip.value,operation.cursor,0).caller;

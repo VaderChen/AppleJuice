@@ -152,6 +152,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_path(GuestState& state,
             if(arg(1)<1 || arg(1)>5)return fail(87);
             GuiRegion old;if(dc.application_clip)old=*dc.application_clip;else {int width=1440,height=900;if(const auto bitmap=gui_.bitmaps.find(dc.bitmap);bitmap!=gui_.bitmaps.end()){width=static_cast<int>(bitmap->second.width);height=static_cast<int>(bitmap->second.height);}else if(window!=gui_.windows.end()){width=static_cast<int>(window->second.width);height=static_cast<int>(window->second.height);}else if(arg(0)>=0x10000000){if(const auto remote=shared_gui_window(arg(0)-0x10000000)){width=static_cast<int>(remote->width);height=static_cast<int>(remote->height);}}old={{0,0,width,height}};}
             auto applied=arg(1)==5?region:gui_region_combine(old,region,static_cast<unsigned>(arg(1)));auto effective=dc.meta_clip?gui_region_combine(applied,*dc.meta_clip,1):applied;
+            if(dc.paint_clip)effective=gui_region_combine(effective,*dc.paint_clip,1);
             const auto bounds=gui_region_bounds(effective);auto excluded=gui_region_combine(GuiRegion{bounds},effective,4);dc.application_clip=std::move(applied);dc.clipped=true;dc.clip=bounds;dc.excluded=std::move(excluded);dc.path={};return done(1);
         }
         GuiRegion interior,edge;if(fill && dc.brush!=0xb005)interior=native_path_region(working.points,dc.poly_fill_mode);if(outline && pen_width)edge=native_path_region(stroke(working.points),2);

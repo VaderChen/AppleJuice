@@ -99,10 +99,62 @@ void update(Object& o){
 struct DirectSoundState {
     std::map<std::uint64_t,std::shared_ptr<Object>> objects;
     std::map<unsigned,std::uint64_t> tables;
+    std::map<std::string_view,std::uint64_t> trace_calls;
     struct Enumeration { std::uint64_t guid{},primary{},description{},endpoint{},empty{}; };
     std::map<std::pair<unsigned,std::string>,std::vector<Enumeration>> enumerations;
+    struct ForeignDevice {std::uint64_t native{};std::uint32_t references{};};
+    std::map<std::uint64_t,ForeignDevice> foreign_devices;
+    struct BindingProbe {std::uint64_t thread{};std::set<std::uint64_t> devices;};
+    std::vector<std::shared_ptr<BindingProbe>> binding_probes;
     std::uint32_t locks{};
 };
+std::string WindowsServices::retain_dsound_device(GuestState& state,GuestMemory& memory,std::uint64_t pointer){
+    if(!dsound_)throw std::invalid_argument("DirectSound 裝置不存在");
+    auto& bridge=*dsound_;
+    const auto native=[&](std::uint64_t address){const auto it=bridge.objects.find(address);if(it==bridge.objects.end() || !it->second->device || it->second->capture || !it->second->initialized)throw std::invalid_argument("DirectSound 播放裝置無效");return it->second;};
+    if(bridge.objects.contains(pointer)){auto o=native(pointer);if(o->references==UINT32_MAX)throw std::invalid_argument("DirectSound 引用計數溢位");auto host=o->context->host;++o->references;return host;}
+    if(!has_nested_runner())throw std::invalid_argument("DirectSound 客體裝置需要回呼執行範圍");
+    const auto method=[&](unsigned slot){const std::uint8_t bits=x86_?32:64;const auto table=memory.load(GuestAddress{pointer},bits);const auto target=memory.load(GuestAddress{table+slot*(bits/8)},bits);memory.check(GuestAddress{target},1,Access::Execute);return target;};
+    const auto existing=bridge.foreign_devices.find(pointer);std::uint64_t source{};
+    if(existing!=bridge.foreign_devices.end()){if(existing->second.references==UINT32_MAX)throw std::invalid_argument("DirectSound 包裝引用溢位");source=existing->second.native;}
+    else {
+        // 包裝介面不公開宿主端點。以正式 GetCaps 回呼辨識它委派的內建裝置，
+        // 不讀取包裝物件的私有欄位；多個不同來源不能推定為同一裝置。
+        if(bridge.binding_probes.size()>=32)throw std::invalid_argument("DirectSound 裝置委派過深");
+        auto probe=std::make_shared<DirectSoundState::BindingProbe>();probe->thread=threads_.current;
+        const auto target=method(4),scratch=allocate_heap(memory,96);if(!scratch)throw std::bad_alloc{};bool scratch_owned=true;
+        try {
+            memory.write(GuestAddress{scratch},std::array<std::uint8_t,96>{});memory.store(GuestAddress{scratch},32,96);bridge.binding_probes.push_back(probe);
+            const auto result=static_cast<std::uint32_t>(call_guest_nested(state,memory,target,{pointer,scratch}));
+            std::erase(bridge.binding_probes,probe);(void)free_heap(memory,scratch,state);scratch_owned=false;
+            if(result&0x80000000U || probe->devices.size()!=1)throw std::invalid_argument("DirectSound 包裝未委派至唯一內建裝置");source=*probe->devices.begin();
+        }catch(...){std::erase(bridge.binding_probes,probe);if(scratch_owned)(void)free_heap(memory,scratch,state);throw;}
+    }
+    auto o=native(source);if(o->references==UINT32_MAX)throw std::invalid_argument("DirectSound 引用計數溢位");auto host=o->context->host;
+    const auto addref=method(1);auto [entry,inserted]=bridge.foreign_devices.try_emplace(pointer,DirectSoundState::ForeignDevice{source,0});(void)inserted;
+    ++o->references;++entry->second.references;
+    try {(void)call_guest_nested(state,memory,addref,{pointer});}
+    catch(...){auto it=bridge.foreign_devices.find(pointer);if(it!=bridge.foreign_devices.end() && !--it->second.references)bridge.foreign_devices.erase(it);release_dsound_object(state,memory,source);throw;}
+    if(std::getenv("X64ARM_TRACE_DMUSIC"))std::fprintf(stderr,"[dsound-binding] wrapper=0x%llx native=0x%llx\n",static_cast<unsigned long long>(pointer),static_cast<unsigned long long>(source));
+    return host;
+}
+std::uint32_t WindowsServices::release_dsound_object(GuestState& state,GuestMemory& memory,std::uint64_t pointer){
+    auto& bridge=*dsound_;
+    if(const auto it=bridge.foreign_devices.find(pointer);it!=bridge.foreign_devices.end()){
+        const auto source=it->second.native;const std::uint8_t bits=x86_?32:64;const auto table=memory.load(GuestAddress{pointer},bits),target=memory.load(GuestAddress{table+2*(bits/8)},bits);
+        if(!--it->second.references)bridge.foreign_devices.erase(it);
+        std::uint32_t result{};try{result=static_cast<std::uint32_t>(call_guest_nested(state,memory,target,{pointer}));}catch(...){release_dsound_object(state,memory,source);throw;}
+        release_dsound_object(state,memory,source);return result;
+    }
+    auto o=bridge.objects.at(pointer);if(--o->references)return o->references;
+    o->output.reset();o->input.reset();
+    if(std::getenv("X64ARM_TRACE_AUDIO")){auto& pcm=*o->pcm;std::lock_guard lock(pcm.mutex);if(pcm.rendered_frames)std::fprintf(stderr,"[dsound-output] handle=%llu channels=%u rate=%u bits=%u frames=%llu peak_left=%g peak_right=%g\n",static_cast<unsigned long long>(pointer),pcm.channels,pcm.rate,pcm.bits,static_cast<unsigned long long>(pcm.rendered_frames),static_cast<double>(pcm.rendered_left_peak),static_cast<double>(pcm.rendered_right_peak));}
+    for(auto child:o->links)release_dsound_object(state,memory,child);
+    for(const auto& effect:o->effects)if(effect.object)release_dsound_object(state,memory,effect.object);
+    if(o->samples->data && o->samples.use_count()==1)(void)free_heap(memory,o->samples->data,state);
+    for(auto [key,p]:o->interfaces){(void)key;bridge.objects.erase(p);(void)free_heap(memory,p,state);}
+    return 0;
+}
 std::span<const WindowsServiceDescriptor> dsound_service_descriptors(){
     static const auto table=[] {
         std::vector<WindowsServiceDescriptor> result{{"dsound.dll","DirectSoundCreate",3},{"dsound.dll","DirectSoundCreate8",3},{"dsound.dll","DirectSoundEnumerateA",2},{"dsound.dll","DirectSoundEnumerateW",2},{"dsound.dll","GetDeviceID",2}};
@@ -165,10 +217,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dsound(GuestState& state,Gu
         const auto f=read_pcm_wave_format(memory,p);if(!f)throw std::invalid_argument("unsupported PCM format");
         pcm.channels=f->channels;pcm.bits=f->bits;pcm.rate=pcm.frequency=f->rate;pcm.floating=f->floating;
     };
-    std::function<void(std::uint64_t)> release;
-    release=[&](std::uint64_t pointer){auto o=bridge.objects.at(pointer);if(--o->references)return;o->output.reset();o->input.reset();
-        if(std::getenv("X64ARM_TRACE_AUDIO")){auto& pcm=*o->pcm;std::lock_guard lock(pcm.mutex);if(pcm.rendered_frames)std::fprintf(stderr,"[dsound-output] handle=%llu channels=%u rate=%u bits=%u frames=%llu peak_left=%g peak_right=%g\n",static_cast<unsigned long long>(pointer),pcm.channels,pcm.rate,pcm.bits,static_cast<unsigned long long>(pcm.rendered_frames),static_cast<double>(pcm.rendered_left_peak),static_cast<double>(pcm.rendered_right_peak));}
-        for(auto child:o->links)release(child);for(const auto& effect:o->effects)if(effect.object)release(effect.object);if(o->samples->data && o->samples.use_count()==1)(void)free_heap(memory,o->samples->data,state);for(auto [key,p]:o->interfaces){(void)key;bridge.objects.erase(p);(void)free_heap(memory,p,state);}};
+    const auto release=[&](std::uint64_t pointer){return release_dsound_object(state,memory,pointer);};
     const auto instantiate=[&](Guid cls,Guid iid,bool factory){
         auto o=std::make_shared<Object>();o->cls=cls;o->factory=factory;o->duplex=!factory && cls==dsound::duplex_clsid;o->capture=cls==dsound::capture_clsid || cls==dsound::capture_clsid8;o->device=!factory && !o->duplex;o->version8=cls==dsound::clsid8 || cls==dsound::capture_clsid8;o->initialized=false;
         if(iid!=unknown && (factory?iid!=dsound::factory_iid:o->duplex?iid!=dsound::duplex_iid:o->capture?iid!=dsound::capture_iid:iid!=sound && !(o->version8 && iid==sound8)))throw std::invalid_argument("DirectSound IID 無效");return create(o);
@@ -259,7 +308,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dsound(GuestState& state,Gu
                 if(p){++o.references;write(arg(2),p,bits);}else result=no_interface;
             }else if(name=="AddRef")result=++o.references;
             else if(name=="Release"){
-                result=--o.references;if(!result){++o.references;release(arg(0));}
+                result=release(arg(0));
             }else if(o.effect){
                 std::lock_guard lock(pcm.mutex);
                 if(name=="FX_GetAllParameters"){const auto words=o.effect->parameters();check_out(arg(1),static_cast<unsigned>(words.size()*4));for(std::size_t i=0;i<words.size();++i)write(arg(1)+i*4,words[i]);}
@@ -385,7 +434,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_dsound(GuestState& state,Gu
                 else if(name=="VerifyCertification")write(arg(1),1); // DS_UNCERTIFIED.
                 else if(name=="DeviceCaps"){
                     if(read(arg(1),0)!=96)result=invalid;
-                    else {check_out(arg(1),96);for(unsigned i=4;i<96;i+=4)write(arg(1)+i,0);write(arg(1)+4,0x00000f0f);write(arg(1)+8,100);write(arg(1)+12,200000);write(arg(1)+16,1);}
+                    else {check_out(arg(1),96);for(unsigned i=4;i<96;i+=4)write(arg(1)+i,0);write(arg(1)+4,0x00000f0f);write(arg(1)+8,100);write(arg(1)+12,200000);write(arg(1)+16,1);
+                        for(auto it=bridge.binding_probes.rbegin();it!=bridge.binding_probes.rend();++it)if((*it)->thread==threads_.current){(*it)->devices.insert(o.canonical);break;}}
                 }else result=unsupported;
             }else if(name=="C_Start"){
                 if(arg(1)&~UINT64_C(1))result=invalid;else {if(!o.input){try{o.input=audio::open_input(o.pcm);}catch(const std::runtime_error&){result=no_driver;}}if(!result){std::lock_guard lock(pcm.mutex);pcm.looping=arg(1)!=0;pcm.playing=true;pcm.capture_failed=false;}}
@@ -463,12 +513,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_dsound(GuestState& state,Gu
                         }
                     }
                 }else if(name=="Unlock"){
-                    if(!o.locked || arg(1)!=o.lock_first || arg(2)!=o.lock_bytes1 || arg(3)!=o.lock_second || arg(4)!=o.lock_bytes2)result=invalid;
+                    if(!o.locked || arg(1)!=o.lock_first || arg(2)>o.lock_bytes1 || arg(3)!=o.lock_second || arg(4)>o.lock_bytes2)result=invalid;
                     else {
-                        // Validate both guest ranges before publishing data to the render callback.
-                        memory.check(GuestAddress{o.lock_first},o.lock_bytes1,Access::Read);if(o.lock_bytes2)memory.check(GuestAddress{o.lock_second},o.lock_bytes2,Access::Read);
-                        if(!o.capture)memory.read(GuestAddress{o.lock_first},std::span(pcm.pcm).subspan(static_cast<std::size_t>(o.lock_first-o.data),o.lock_bytes1));
-                        if(!o.capture && o.lock_bytes2)memory.read(GuestAddress{o.lock_second},std::span(pcm.pcm).first(o.lock_bytes2));o.locked=false;
+                        // Unlock 接收實際寫入長度，可能少於 Lock 範圍；零長度仍須配對原指標。
+                        // 先驗證兩段，再一次發布至共用混音緩衝區，不讀取尚未交付的尾端。
+                        const auto first=static_cast<std::size_t>(arg(2)),second=static_cast<std::size_t>(arg(4));
+                        if(first)memory.check(GuestAddress{o.lock_first},first,Access::Read);if(second)memory.check(GuestAddress{o.lock_second},second,Access::Read);
+                        if(!o.capture && first)memory.read(GuestAddress{o.lock_first},std::span(pcm.pcm).subspan(static_cast<std::size_t>(o.lock_first-o.data),first));
+                        if(!o.capture && second)memory.read(GuestAddress{o.lock_second},std::span(pcm.pcm).first(second));o.locked=false;
                         for(const auto& [p,child]:bridge.objects)if(p==child->canonical && child.get()!=&o && child->samples==o.samples){std::lock_guard child_lock(child->pcm->mutex);child->pcm->pcm=pcm.pcm;}
                     }
                 }else if(name=="N_SetNotificationPositions"){
@@ -501,6 +553,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_dsound(GuestState& state,Gu
         }
     }catch(const std::bad_alloc&){result=0x8007000eU;}
      catch(const std::invalid_argument&){result=invalid;}
+    // 獨立、有界的音訊診斷，不啟用會停用常駐 API 快路徑的全服務追蹤。
+    static const bool trace=std::getenv("X64ARM_TRACE_DSOUND")!=nullptr;
+    if(trace){
+        const auto count=++bridge.trace_calls[name];
+        if(count<=16 || (count&(count-1))==0){
+            std::ostringstream line;line<<"[dsound-call] method="<<name<<" count="<<count<<" result=0x"<<std::hex<<result<<" args=";
+            for(unsigned i=0;i<service.arguments;++i){if(i)line<<',';line<<arg(i);}
+            if(service.arguments){const auto it=bridge.objects.find(arg(0));if(it!=bridge.objects.end()){
+                const auto& object=*it->second;auto& pcm=*object.pcm;std::lock_guard lock(pcm.mutex);
+                const auto silence=pcm.bits==8?128:0;
+                line<<std::dec<<" buffer="<<object.canonical<<" primary="<<object.primary<<" locked="<<object.locked<<" bytes="<<pcm.pcm.size()
+                    <<" non_silence_bytes="<<std::count_if(pcm.pcm.begin(),pcm.pcm.end(),[&](auto b){return b!=silence;})
+                    <<" playing="<<pcm.playing<<" volume="<<object.volume<<" gain="<<pcm.left<<','<<pcm.right<<" cursor="<<pcm.cursor;
+            }}
+            std::fprintf(stderr,"%s\n",line.str().c_str());
+        }
+    }
     arg.return_to(state,result);return std::nullopt;
 }
 }

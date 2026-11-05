@@ -92,6 +92,51 @@ std::optional<Locale> numbered(std::uint32_t id){
     const auto name=locale_name(id);if(name.empty() || locale_code(name)!=id)return {};
     auto value=named(name);if(!value)return {};value->id=id;return value;
 }
+// 舊式 LGRPID 分類與 LCID 共用宿主 NLS 目錄；不另安裝或載入 Windows 語言包。
+// 自訂／中性 locale 仍由 EnumSystemLocalesEx 提供，不冒用具體地區的 LCID。
+constexpr std::u16string_view language_group_names[]{
+    u"Western Europe and United States",u"Central Europe",u"Baltic",u"Greek",u"Cyrillic",
+    u"Turkic",u"Japanese",u"Korean",u"Traditional Chinese",u"Simplified Chinese",u"Thai",
+    u"Hebrew",u"Arabic",u"Vietnamese",u"Indic",u"Georgian",u"Armenian"};
+unsigned language_group(const Locale& locale){
+    const auto language=locale.id&0x3ffU;
+    switch(language){
+    case 4:return locale.id==0x404 || locale.id==0xc04 || locale.id==0x1404?9:10;
+    case 0x11:return 7;case 0x12:return 8;case 0x1e:return 11;case 0xd:return 12;
+    case 0x2a:return 14;case 0x37:return 16;case 0x2b:return 17;
+    case 5:case 0xe:case 0x15:case 0x18:case 0x1b:case 0x1c:case 0x24:case 0x2e:return 2;
+    case 0x25:case 0x26:case 0x27:return 3;
+    default:break;
+    }
+    auto name=utf16_to_utf8(locale.name);std::replace(name.begin(),name.end(),'-','_');
+    UScriptCode scripts[8]{};UErrorCode error=U_ZERO_ERROR;
+    const auto count=uscript_getCode(name.c_str(),scripts,8,&error);
+    if(U_FAILURE(error) || count!=1)return 0;
+    switch(scripts[0]){
+    case USCRIPT_LATIN:
+        if(language==0x1f || language==0x2c || language==0x43 || language==0x42)return 6;
+        return language==0x1a?2:1;
+    case USCRIPT_GREEK:return 4;
+    case USCRIPT_CYRILLIC:return 5;
+    case USCRIPT_ARABIC:case USCRIPT_SYRIAC:case USCRIPT_THAANA:return 13;
+    case USCRIPT_DEVANAGARI:case USCRIPT_BENGALI:case USCRIPT_GURMUKHI:case USCRIPT_GUJARATI:
+    case USCRIPT_ORIYA:case USCRIPT_TAMIL:case USCRIPT_TELUGU:case USCRIPT_KANNADA:
+    case USCRIPT_MALAYALAM:case USCRIPT_SINHALA:return 15;
+    default:return 0; // 新字體不捏造成舊式 Windows 語言群組。
+    }
+}
+const std::array<std::vector<std::uint32_t>,std::size(language_group_names)>& language_group_locales(){
+    static const auto groups=[] {
+        std::array<std::vector<std::uint32_t>,std::size(language_group_names)> result;
+        for(const auto& [name,locale]:locales()){
+            (void)name;
+            if(locale.neutral || locale.name.empty() || locale.id==0x1000 || !numbered(locale.id))continue;
+            if(const auto group=language_group(locale))result[group-1].push_back(locale.id);
+        }
+        for(auto& ids:result){std::sort(ids.begin(),ids.end());ids.erase(std::unique(ids.begin(),ids.end()),ids.end());}
+        return result;
+    }();return groups;
+}
 // ANSI NLS uses the locale code page unless LOCALE_USE_CP_ACP is set.
 const char* ansi_encoding(const Locale& locale,bool acp=false){
     if(acp)return "UTF-8";
@@ -341,6 +386,12 @@ std::uint16_t character_type(char16_t code,unsigned type){
 }
 
 }
+std::uint32_t windows_nls_language_group_mask(){
+    static const auto mask=[] {std::uint32_t result=0;const auto& groups=language_group_locales();
+        for(unsigned i=0;i<groups.size();++i)if(!groups[i].empty())result|=1U<<i;
+        return result;
+    }();return mask;
+}
 std::optional<CrtLocaleCategory> windows_crt_codepage(std::uint32_t page){
     static std::mutex lock;
     static std::map<std::uint32_t,CrtLocaleCategory> cache;
@@ -544,6 +595,10 @@ const CrtCharacterTable& windows_crt_character_table(const CrtLocaleCategory& lo
     }return cache.emplace(key,std::move(table)).first->second;
 }
 bool windows_locale_name_valid(std::u16string_view name){return named(name).has_value();}
+std::optional<int> windows_nls_compare(std::u16string_view left,std::u16string_view right,std::uint32_t id,std::uint32_t flags){
+    const auto locale=numbered(id);if(!locale || flags&~compare_flags)return {};
+    return collate_strings(std::u16string(left),std::u16string(right),*locale,flags);
+}
 std::optional<std::array<std::uint32_t,3>> windows_locale_digit_substitution(std::uint32_t id){
     const auto locale=numbered(id&~0x80000000U);if(!locale)return {};
     const auto primary=locale->id&0x3ffU;const auto native=locale_information(*locale,0x13,false);
@@ -650,9 +705,14 @@ std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
         {"kernel32.dll","ConvertDefaultLocale",1},{"kernel32.dll","CompareStringA",6},{"kernel32.dll","LCMapStringA",6},{"kernel32.dll","GetStringTypeA",5},{"kernel32.dll","GetStringTypeExA",5},{"kernel32.dll","CompareStringW",6},{"kernel32.dll","CompareStringEx",9},{"kernel32.dll","CompareStringOrdinal",5},
         {"kernel32.dll","LCMapStringW",6},{"kernel32.dll","LCMapStringEx",9},
         {"kernel32.dll","FoldStringA",5},{"kernel32.dll","FoldStringW",5},
+        {"kernel32.dll","VerLanguageNameA",3},{"kernel32.dll","VerLanguageNameW",3},
+        {"version.dll","VerLanguageNameA",3},{"version.dll","VerLanguageNameW",3},
         {"kernel32.dll","GetStringTypeW",4},{"kernel32.dll","GetStringTypeExW",5},
         {"kernel32.dll","LocaleNameToLCID",2},{"kernel32.dll","LCIDToLocaleName",4},{"kernel32.dll","ResolveLocaleName",3},
         {"kernel32.dll","IsValidLocaleName",1},{"kernel32.dll","IsValidLocale",2},
+        {"kernel32.dll","IsValidLanguageGroup",2},
+        {"kernel32.dll","EnumSystemLanguageGroupsA",3},{"kernel32.dll","EnumSystemLanguageGroupsW",3},
+        {"kernel32.dll","EnumLanguageGroupLocalesA",4},{"kernel32.dll","EnumLanguageGroupLocalesW",4},
         {"kernel32.dll","EnumSystemLocalesA",2},{"kernel32.dll","EnumSystemLocalesW",2},{"kernel32.dll","EnumSystemLocalesEx",4},
         {"kernel32.dll","GetCalendarInfoA",6},{"kernel32.dll","GetCalendarInfoW",6},{"kernel32.dll","GetCalendarInfoEx",7},
         {"kernel32.dll","EnumCalendarInfoA",4},{"kernel32.dll","EnumCalendarInfoW",4},
@@ -712,6 +772,8 @@ void WindowsServices::sync_crt_thread_states(GuestMemory& memory){
     // 資料匯出表示程序 locale；啟用個別執行緒 locale 時，不可覆寫程序值。
     const auto global=runtime_.crt_current_locale;
     memory.store(GuestAddress{runtime_base_.value+128},32,global?memory.load(GuestAddress{crt_max_address(memory,runtime_.crt_locales.at(global),x86_)},32):1);
+    const auto ctype=global?runtime_.crt_locales.at(global).storage+2*(x86_?4U:8U)+352+544+2:runtime_.ctype_table+2;
+    memory.store(GuestAddress{runtime_base_.value+136},x86_?32:64,ctype);
     // 客體執行與服務由同一排程器串行；發布新表後才釋放舊 locale。
     for(const auto& [id,thread]:threads_.items){(void)thread;sync_crt_thread_state(memory,id);}
 }
@@ -1181,6 +1243,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             return finish(static_cast<std::uint32_t>(result.size()));
         }catch(const MemoryFault&){return fail(998);}catch(const std::bad_alloc&){return fail(14);}
     }
+    if(name=="VerLanguageNameA" || name=="VerLanguageNameW"){
+        const bool wide=name.ends_with('W');const auto capacity=static_cast<std::uint32_t>(arg(2));
+        if(!capacity)return finish(0);if(!arg(1))return fail(87);
+        try{
+            std::u16string value=u"Language Neutral";
+            // 這個 API 接受 LANGID，不把 0 或未知識別碼替換為使用者預設 locale。
+            const auto id=static_cast<std::uint32_t>(arg(0));
+            if(id && id<=0xffffU)if(const auto locale=numbered(id))if(const auto info=locale_information(*locale,0x72,false))value=info->text;
+            if(wide){value.resize(std::min<std::size_t>(value.size(),capacity-1));memory.write(GuestAddress{arg(1)},utf16_bytes(value));return finish(static_cast<std::uint32_t>(value.size()));}
+            auto bytes=ansi_output(value,"UTF-8");bytes.resize(std::min<std::size_t>(bytes.size(),capacity-1));const auto count=bytes.size();bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);return finish(static_cast<std::uint32_t>(count));
+        }catch(const MemoryFault&){return fail(998);}catch(const std::bad_alloc&){return fail(14);}
+    }
     if(name=="GetLocaleInfoA" || name=="GetLocaleInfoW" || name=="GetLocaleInfoEx"){
         const bool wide=name!="GetLocaleInfoA",extended=name=="GetLocaleInfoEx";
         const auto flags=static_cast<std::uint32_t>(arg(1)),type=flags&0xffffU;const auto capacity=static_cast<std::int32_t>(arg(3));
@@ -1498,6 +1572,46 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         if(flags&0x800U)for(std::size_t i=0;i+1<bytes.size();i+=2)std::swap(bytes[i],bytes[i+1]);
         if(!capacity)return finish(required);if(static_cast<std::uint32_t>(capacity)<required)return fail(122);
         memory.write(GuestAddress{arg(4)},bytes);return finish(required);
+    }
+    if(name=="IsValidLanguageGroup"){
+        const auto group=static_cast<std::uint32_t>(arg(0)),flags=static_cast<std::uint32_t>(arg(1));
+        return finish((flags==1 || flags==2) && group && group<=std::size(language_group_names) &&
+                      (windows_nls_language_group_mask()&(1U<<(group-1))));
+    }
+    if(name.starts_with("EnumSystemLanguageGroups") || name.starts_with("EnumLanguageGroupLocales")){
+        const bool groups=name.starts_with("EnumSystem"),wide=name.ends_with('W');
+        const auto group=groups?0U:static_cast<std::uint32_t>(arg(1));
+        auto flags=static_cast<std::uint32_t>(arg(groups?1:2));
+        if(!arg(0) || (!groups && (!group || group>std::size(language_group_names))))return fail(87);
+        if(groups && !flags)flags=1;
+        if(groups?(flags!=1 && flags!=2):flags!=0)return fail(1004);
+        memory.check(GuestAddress{arg(0)},1,Access::Execute);
+        const auto encode=[&](std::u16string_view text){if(wide)return utf16_bytes(text);
+            auto bytes=utf16_to_utf8(text);std::vector<std::uint8_t> result(bytes.begin(),bytes.end());result.push_back(0);return result;};
+        struct Item{std::uint32_t id;std::vector<std::uint8_t> number,name;};std::vector<Item> items;
+        const auto& catalog=language_group_locales();
+        if(groups){
+            for(unsigned i=0;i<catalog.size();++i)if(!catalog[i].empty()){
+                char hex[9]{};std::snprintf(hex,sizeof hex,"%x",i+1);
+                items.push_back({i+1,encode(utf8_to_utf16(hex)),encode(language_group_names[i])});
+            }
+        }else for(const auto id:catalog[group-1]){
+            char hex[9]{};std::snprintf(hex,sizeof hex,"%08x",id);items.push_back({id,encode(utf8_to_utf16(hex)),{}});
+        }
+        std::size_t size=0;for(const auto& item:items)size+=item.number.size()+item.name.size();
+        if(!size)return finish(1);
+        const auto buffer=allocate_heap(memory,size);if(!buffer)return fail(8);
+        auto at=buffer;std::vector<GuestCallback> callbacks;
+        try{
+            for(const auto& item:items){
+                const auto number=at;memory.write(GuestAddress{at},item.number);at+=item.number.size();
+                if(groups){const auto label=at;memory.write(GuestAddress{at},item.name);at+=item.name.size();
+                    callbacks.push_back({arg(0),{item.id,number,label,flags,arg(2)}});
+                }else callbacks.push_back({arg(0),{group,item.id,number,arg(3)}});
+            }
+            start_callbacks(state,memory,std::move(callbacks),Continuation::LocaleEnumeration,buffer);
+        }catch(...){(void)free_heap(memory,buffer,state);throw;}
+        return std::nullopt;
     }
     if(name=="IsValidLocaleName")return finish(named(requested()).has_value());
     if(name=="IsValidLocale"){

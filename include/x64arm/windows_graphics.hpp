@@ -111,9 +111,12 @@ class NativeGraphics {
 public:
     virtual ~NativeGraphics()=default;
     virtual bool fixed_vertex_supported()const noexcept{return false;}
+    // 固定管線與可程式化管線使用相同的硬體可見度計數；空資源解除目前繪製的查詢。
+    virtual void graphics_fixed_visibility(const std::shared_ptr<GraphicsResource>& resource,std::uint32_t){if(resource)throw std::runtime_error("後端缺少固定管線可見度查詢");}
     virtual void graphics_fixed_targets(const GraphicsView&,const GraphicsView&){throw std::runtime_error("後端缺少固定管線繪製表面切換");}
     // enable、reference、read/write mask，接續正／背面的 compare、fail、zfail、pass（D3D enum）。
     virtual bool graphics_fixed_texture(const GraphicsView&){return false;}
+    virtual bool graphics_fixed_sampler(const std::shared_ptr<GraphicsSampler>&){return false;}
     virtual void graphics_fixed_stencil(const std::array<std::uint32_t,12>&){throw std::runtime_error("後端缺少固定管線雙面 stencil");}
     virtual void graphics_fixed_draw(const FixedGraphicsDraw&){throw std::runtime_error("後端缺少固定管線頂點處理");}
     virtual std::shared_ptr<GraphicsResource> graphics_resource(const GraphicsResourceDesc&){throw std::runtime_error("後端缺少可程式化資源");}

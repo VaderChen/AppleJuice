@@ -1,5 +1,6 @@
 #pragma once
 #include "x64arm/memory.hpp"
+#include "x64arm/network.hpp"
 #include "socket_send_control.hpp"
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
@@ -36,6 +37,20 @@ inline int copy_accept_options(int source,int target){
     int value=0;socklen_t size=sizeof(value);if(::getsockopt(source,IPPROTO_TCP,TCP_NODELAY,&value,&size)<0 || ::setsockopt(target,IPPROTO_TCP,TCP_NODELAY,&value,size)<0)return -1;
     const auto flags=::fcntl(source,F_GETFL),target_flags=::fcntl(target,F_GETFL);if(flags<0 || target_flags<0 || ::fcntl(target,F_SETFL,(target_flags&~O_NONBLOCK)|(flags&O_NONBLOCK))<0)return -1;
     return 0;
+}
+// accept、WSAAccept、AcceptEx 共用：CF_DEFER 保留的連線先於新的原生佇列項目。
+// 原生呼叫永不堵住協調者；呼叫端負責客體等待、事件重新啟用與選項繼承。
+inline int accept_socket_connection(NativeSocket& listener,sockaddr* peer=nullptr,socklen_t* size=nullptr){
+    if(!listener.deferred_accepts.empty()){
+        auto connection=listener.deferred_accepts.front();
+        if(peer && ::getpeername(connection->descriptor,peer,size)<0)return -1;
+        const auto fd=connection->descriptor;connection->descriptor=-1;listener.deferred_accepts.pop_front();return fd;
+    }
+    const auto flags=::fcntl(listener.descriptor,F_GETFL);
+    if(flags<0 || ::fcntl(listener.descriptor,F_SETFL,flags|O_NONBLOCK)<0)return -1;
+    const auto fd=::accept(listener.descriptor,peer,size);const auto error=errno;
+    if(::fcntl(listener.descriptor,F_SETFL,flags)<0){const auto restore_error=errno;if(fd>=0)::close(fd);errno=restore_error;return -1;}
+    errno=error;return fd;
 }
 struct Address {sockaddr_storage storage{};socklen_t size{};};
 inline bool same_endpoint(const sockaddr* first,const sockaddr* second){

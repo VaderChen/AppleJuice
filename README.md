@@ -6,7 +6,7 @@
 
 儲存庫隨附完整的 `x64kernel/` 靜態 SDK；一般建置不需要核心來源。核心另由 AppleJuiceKernel 提供。靜態連結後的執行檔與 Launcher 套件均屬 AppleJuice 可發布範圍，散布時須保留適用授權。
 
-目前維護 resident AOT 的單核與多核執行路徑。**LLVM 執行後端與舊 JIT 已廢棄，保留但不再維護。** `--backend jit` 是既有介面名稱，預設仍選擇 resident AOT。
+目前維護 resident AOT 的單核與多核執行路徑。**LLVM 執行後端與舊 JIT 已移除。** `--backend jit` 是既有介面名稱，預設仍選擇 resident AOT。
 
 ## 專案目標與特色
 
@@ -145,6 +145,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
 | 潛水員戴夫 | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可啟動到主畫面" title="可啟動到主畫面"> |
 | 特警 Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可啟動到主畫面" title="可啟動到主畫面"> |
+| 光與影：33號遠征隊 | x64 | D3D12（Unreal Engine 5） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、但正在處理" title="無法運作、但正在處理"> |
 
 實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
 

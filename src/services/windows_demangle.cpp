@@ -60,6 +60,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_demangle(GuestState& state,
     const WindowsCall call(state,memory,service);const auto name=service.symbol;
     const auto done=[&](std::uint64_t result)->std::optional<std::uint32_t>{call.return_to(state,result);return std::nullopt;};
     const unsigned unit=x86_?4U:8U;const std::uint8_t bits=x86_?32:64;
+    if(name=="__clean_type_info_names_internal") {
+        // VC8～VC12 的根節點與子節點皆為 {名稱配置指標, 下一節點}，不是 VC14 SLIST。
+        const auto root=call(0);memory.check(GuestAddress{root},2*unit,Access::Write);
+        std::vector<std::uint64_t> blocks;std::set<std::uint64_t> seen{root};
+        for(auto node=memory.load(GuestAddress{offset(root,unit)},bits);node;node=memory.load(GuestAddress{offset(node,unit)},bits)) {
+            if(blocks.size()>=131072 || node%unit || !seen.insert(node).second)
+                throw HostCallFault("CRT 舊型別名稱清單含循環或無效節點");
+            memory.check(GuestAddress{node},2*unit,Access::Read);
+            const auto value=memory.load(GuestAddress{node},bits);
+            if(value){if(!seen.insert(value).second)throw HostCallFault("CRT 舊型別名稱清單重複配置");blocks.push_back(value);}
+            blocks.push_back(node);
+        }
+        for(const auto block:blocks) {
+            if(guest_heap_contains(block)){if(!guest_heap_block_size(memory,block))throw HostCallFault("CRT 舊型別名稱配置已失效");}
+            else if(!allocations_.contains(block))throw HostCallFault("CRT 舊型別名稱不是有效配置");
+        }
+        memory.store(GuestAddress{offset(root,unit)},bits,0);
+        for(const auto block:blocks)if(!free_heap(memory,block,state))throw HostCallFault("CRT 舊型別名稱釋放失敗");
+        return done(0);
+    }
     if(name.starts_with("__std_type_info_")) {
         if(name=="__std_type_info_destroy_list") {
             const auto root=call(0);slist::check(memory,root,x86_,Access::Write);

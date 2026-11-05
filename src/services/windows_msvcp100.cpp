@@ -84,6 +84,7 @@ unsigned character_mask(char16_t c){
 }
 }
 struct Msvcp100State {
+    std::uint64_t file_table9{},ifstream_table9{},ifstream_vb9{};
     std::map<std::string,std::uint64_t,std::less<>> data;
     std::map<std::string,std::uint64_t,std::less<>> data14;
     std::map<std::uint64_t,Operation> operations;
@@ -116,6 +117,13 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
     s.ctype_table=table({"FacetDelete"});
     s.buffer_table=table({"StreamDelete","StreamLock","StreamUnlock","StreamOverflow","StreamPbackfail","StreamShowmany","StreamUnderflow","StreamUflow","StreamXsgetn","StreamXsputn","StreamSeekoff","StreamSeekpos","StreamSetbuf","StreamSync","StreamImbue"});
     s.ios_table=table({"IosDelete"});
+    const auto table9=[&](std::initializer_list<const char*> names){
+        const auto address=runtime_allocate(memory,{},(names.size()+1)*l.p)+l.p;unsigned i=0;
+        for(const auto name:names)put(address+i++*l.p,resolve("internal-msvcp90",std::string(name)+(x86_?"32":"64")).value);return address;
+    };
+    s.file_table9=table9({"FileDelete","FileOverflow","FilePbackfail","StreamShowmany","FileUnderflow","FileUflow","FileXsgetn","FileXsgetnSafe","FileXsputn","FileSeekoff","FileSeekpos","FileSetbuf","FileSync","FileImbue"});
+    s.ifstream_table9=table9({"FileIosDelete"});s.ifstream_vb9=runtime_allocate(memory,{},8);
+    const Layout vc9(x86_,false,1,true);memory.store(GuestAddress{s.ifstream_vb9+4},32,2*l.p+vc9.file_size());
     for(const auto name:{"??_7ios_base@std@@6B@","??_7?$basic_ios@GU?$char_traits@G@std@@@std@@6B@","??_7?$basic_istream@GU?$char_traits@G@std@@@std@@6B@"})s.data.emplace(name,s.ios_table);
     for(const auto& [name,value]:std::array<std::pair<const char*,std::uint64_t>,3>{{
         {"?id@?$ctype@G@std@@2V0locale@2@A",1},{"?id@?$codecvt@GDH@std@@2V0locale@2@A",2},{"?_BADOFF@std@@3_JB",UINT64_MAX}}}){
@@ -130,6 +138,12 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
     s.iostream_vb=runtime_allocate(memory,{},16);memory.store(GuestAddress{s.iostream_vb+4},32,24);
     memory.store(GuestAddress{s.iostream_vb+8},32,static_cast<std::uint32_t>(-16));memory.store(GuestAddress{s.iostream_vb+12},32,8);
     msvc_rtti::Storage rtti(l.p);std::vector<std::pair<std::uint64_t,std::uint32_t>> rtti_tables;
+    msvc_rtti::Shape file_shape;file_shape.bases={{msvcp_detail::stream_type("filebuf",false),1},{msvcp_detail::stream_type("streambuf",false),0}};
+    rtti_tables.emplace_back(s.file_table9-l.p,rtti.add(file_shape));
+    msvc_rtti::Shape input_file_shape;input_file_shape.flags=1;input_file_shape.offset=2*l.p+vc9.file_size();
+    input_file_shape.bases={{msvcp_detail::stream_type("ifstream",false),4},{msvcp_detail::stream_type("istream",false),3},
+        {msvcp_detail::stream_type("ios",false),2,0,0,4,80},{".?AVios_base@std@@",1,0,0,4},{".?AV?$_Iosb@H@std@@",0,static_cast<std::int32_t>(l.p),0,4}};
+    rtti_tables.emplace_back(s.ifstream_table9-l.p,rtti.add(input_file_shape));
     const auto modern_table=[&](char element,std::initializer_list<const char*> names,msvc_rtti::Shape shape=msvc_rtti::Shape{}){
         const auto storage=runtime_allocate(memory,{},(names.size()+1)*l.p),address=storage+l.p;unsigned i=0;
         for(const auto name:names)put(address+i++*l.p,resolve("internal-msvcp140",std::string(1,element)+name+(x86_?"32":"64")).value);
@@ -285,7 +299,7 @@ std::optional<std::uint32_t> WindowsServices::finish_msvcp_callback_exception(Gu
     exceptions_.stack.at(captured_depth).protected_callback_depth=SIZE_MAX;(void)msvc_exception_cells(state,memory,false,true);
     if(op.kind=="exception_capture"){op.exception_record=std::move(record);++op.copy_failures;prepare_msvcp_exception_capture(state,memory,frame.value);return resume_msvcp100(state,memory,frame.value,0);}
     if(op.ios){
-        const Layout l(x86_,op.modern,op.element);const auto at=op.ios+l.state;
+        const Layout l(x86_,op.modern,op.element,op.service.family=="msvcp90.dll" || op.service.family=="internal-msvcp90");const auto at=op.ios+l.state;
         const bool suffix=op.callback==52;
         const bool body=op.callback!=10 && op.callback!=11 && !suffix;const auto flags=memory.load(GuestAddress{at},32)|(body?4U:0U);if(body)memory.store(GuestAddress{at},32,flags);
         op.rethrow_exception=!suffix && (!body || (memory.load(GuestAddress{at+4},32)&4U));op.throw_failure=false;op.exception_record=std::move(record);op.callback=0;
@@ -321,7 +335,7 @@ void WindowsServices::discard_msvcp100(std::uint64_t token,GuestState& state,Gue
 
 std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall call(state,memory,service);auto& s=*msvcp100_;const auto l=msvcp_detail::abi(x86_,service);const auto bits=static_cast<std::uint8_t>(l.p*8);
-    const auto name=service.symbol;const bool internal=service.family=="internal-msvcp100" || service.family=="internal-msvcp140";
+    const auto name=service.symbol;const bool internal=service.family=="internal-msvcp100" || service.family=="internal-msvcp140" || service.family=="internal-msvcp90";
     if(l.modern && !s.global14)s.global14=s.classic14;
     const auto global=l.modern?s.global14:s.global;
     const auto& tables=s.tables14[l.element==1?0:1];const auto buffer_table=l.modern?tables.buffer:s.buffer_table,ios_table=l.modern?tables.ios:s.ios_table;
@@ -335,10 +349,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     const auto refs=[&](std::uint64_t imp){return memory.load(GuestAddress{imp+l.p},l.reference_bits());};
     const auto put_refs=[&](std::uint64_t imp,std::uint64_t n){memory.store(GuestAddress{imp+l.p},l.reference_bits(),n);};
     const auto virtual_call=[&](std::uint64_t self,unsigned slot,std::vector<std::uint64_t> args)->std::optional<std::uint32_t>{
-        args.insert(args.begin(),self);GuestCallback cb{ptr(ptr(self)+slot*l.p),std::move(args)};cb.x86_register_arguments=x86_?1:0;
+        args.insert(args.begin(),self);GuestCallback cb{ptr(ptr(self)+l.slot(slot)*l.p),std::move(args)};cb.x86_register_arguments=x86_?1:0;
         start_callbacks(state,memory,{std::move(cb)},Continuation::ReturnCallback);return {};
     };
     const auto new_locale=[&]{const auto loc=allocate_heap(memory,l.locale_size());if(!loc)throw std::bad_alloc{};memory.fill(GuestAddress{loc},0,l.locale_size());put(loc+l.locale_pointer(),global);put_refs(global,refs(global)+1);return loc;};
+#include "msvcp90_file_handlers.inc"
     if(method=="FacetRetire"){
         Operation op;op.service=service;op.modern=true;op.element=l.element;op.kind="retire_facet";op.object=a(0);
         const auto token=s.next++;s.operations.emplace(token,std::move(op));return resume_msvcp100(state,memory,token,0);
@@ -419,11 +434,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
     }
     if(method=="ThrowBadAlloc"){throw_msvc_exception(state,memory,service,MsvcExceptionKind::BadAlloc);return {};}
     if(method=="generic_category" || method=="system_category" || method=="iostream_category")return done(s.error_categories[method=="generic_category"?0:method=="system_category"?1:2]);
-    if(method=="_Winerror_map")return done(windows_generic_error_condition(static_cast<std::uint32_t>(a(0))).value_or(0));
+    const bool winerror_string=method=="_Winerror_map" && name.find("@@YAHH@Z")==std::string_view::npos;
+    if(method=="_Winerror_map" && !winerror_string)return done(windows_generic_error_condition(static_cast<std::uint32_t>(a(0))).value_or(0));
     // std::_Winerror_message：與 STL 相同以 FormatMessageA（FROM_SYSTEM｜IGNORE_INSERTS）取系統訊息，回傳字元數。
     if(method=="_Winerror_message"){start_callbacks(state,memory,{{resolve("kernel32.dll","FormatMessageA").value,{0x1200,0,a(0)&UINT32_MAX,0,a(1),a(2)&UINT32_MAX,0}}},Continuation::ReturnCallback);return {};}
-    if(method=="_Syserror_map"){
-        const auto text=windows_generic_error_message(static_cast<std::uint32_t>(a(0)));
+    if(method=="_Syserror_map" || winerror_string){
+        const auto code=winerror_string?windows_generic_error_condition(static_cast<std::uint32_t>(a(0))).value_or(0):static_cast<std::uint32_t>(a(0));
+        const auto text=windows_generic_error_message(code);
+        if(service.family!="msvcp140.dll" && text=="unknown error")return done(0);
         if(const auto found=s.generic_error_messages.find(text);found!=s.generic_error_messages.end())return done(found->second);
         std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);const auto address=runtime_allocate(memory,bytes);
         s.generic_error_messages.emplace(text,address);return done(address);
@@ -931,7 +949,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
             memory.store(GuestAddress{output},64,UINT64_MAX);return done(output);
         }
     }
-    if(input_stream && const_method && method=="gcount")return done(memory.load(GuestAddress{object+8},64),true);
+    if(input_stream && const_method && method=="gcount")return done(memory.load(GuestAddress{object+l.count_offset()},l.stream_bits()),!l.legacy);
     if(io_stream && method=="swap"){
         // basic_iostream::swap 即 basic_istream::swap：交換 ios_base（狀態、例外遮罩、格式、精度、寬度、iword／pword、回呼、locale）、
         // basic_ios 的 tie 與 fill 以及 gcount；rdbuf 不交換。
@@ -964,7 +982,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         put(base+l.locale,new_locale());put(base+l.ios_size,a(0));memory.store(GuestAddress{base+l.ios_size+2*l.p},l.character_bits(),' ');
         if(!io_stream && static_cast<std::uint8_t>(a(1)))put(base+l.p,1);
         if(!a(0))memory.store(GuestAddress{base+l.state},32,4);
-        if(!output_stream)memory.store(GuestAddress{object+8},64,0);return done(object);
+        if(!output_stream)memory.store(GuestAddress{object+l.count_offset()},l.stream_bits(),0);return done(object);
     }
     if(method=="clear" || method=="setstate"){
         auto value=static_cast<std::uint32_t>(a(0));if(method=="setstate")value|=static_cast<std::uint32_t>(memory.load(GuestAddress{object+l.state},32));
@@ -1009,7 +1027,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
         else op.objects.push_back(object);
     }else if(method=="sgetc" || method=="snextc" || method=="uflow" || method=="StreamUflow"){}
     else if(method=="sputc"){op.output=a(0)&((1U<<(l.element*8))-1U);}
-    else if(method=="sputn"){op.output=a(0);op.limit=a(1);}
+    else if(method=="sputn" || method=="sgetn"){op.output=a(0);op.limit=a(1);}
     else if(method=="xsgetn" || method=="xsputn" || method=="StreamXsgetn" || method=="StreamXsputn"){
         op.kind=method=="xsputn" || method=="StreamXsputn"?"write":"read";op.output=a(0);op.limit=a(1);if(op.limit>INT64_MAX)op.limit=0;
     }else if(input_stream || output_stream){
@@ -1049,24 +1067,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
                 if(method=="seekp"){std::array<std::uint8_t,24> position{};memory.read(GuestAddress{x86_?state.reg(Gpr::Rsp)+4:a(0)},position);memory.write(GuestAddress{op.scratch+24},position);}
             }else throw HostCallFault("未知 STL ostream 操作");
         }else if(method=="read"){
-            op.kind="istream_read";op.output=a(0);op.limit=a(1);memory.store(GuestAddress{object+8},64,0);
+            op.kind="istream_read";op.output=a(0);op.limit=l.stream_bits()==32?static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(a(1)))):a(1);memory.store(GuestAddress{object+l.count_offset()},l.stream_bits(),0);
         }else if(method=="tellg"){
             op.kind="tellg";op.output=a(0);op.scratch=allocate_heap(memory,24);if(!op.scratch)throw std::bad_alloc{};
-        }else if(method=="seekg" && name.find("@_JH@Z")!=name.npos){
+        }else if(method=="seekg" && (name.find("@_JH@Z")!=name.npos || (l.legacy && name.find("@JH@Z")!=name.npos))){
             op.kind="seekg_offset";op.output=a(0);op.limit=static_cast<std::uint32_t>(a(1));op.scratch=allocate_heap(memory,24);if(!op.scratch)throw std::bad_alloc{};
         }else if(method=="_Ipfx"){op.kind="prefix";op.skip=!a(0);}
         else if(method=="get" && (name.ends_with("XZ") || name.ends_with("@AEAD@Z") || name.ends_with("@AAD@Z") || name.ends_with("@AEA_W@Z") || name.ends_with("@AA_W@Z"))){
             // get() 回 int_type；get(char&) 成功時寫入字元並回 *this。皆以 noskip sentry 讀一個字元並設定 gcount。
-            op.kind="istream_get";op.output=name.ends_with("XZ")?0:a(0);memory.store(GuestAddress{object+8},64,0);}
-        else if(method=="putback"){op.kind="putback";op.output=a(0)&((1U<<(l.element*8))-1U);memory.store(GuestAddress{object+8},64,0);
+            op.kind="istream_get";op.output=name.ends_with("XZ")?0:a(0);memory.store(GuestAddress{object+l.count_offset()},l.stream_bits(),0);}
+        else if(method=="putback"){op.kind="putback";op.output=a(0)&((1U<<(l.element*8))-1U);memory.store(GuestAddress{object+l.count_offset()},l.stream_bits(),0);
             // C++11 起 putback 先清除 eofbit，再建立 noskip sentry。
             const auto at=op.ios+l.state;memory.store(GuestAddress{at},32,memory.load(GuestAddress{at},32)&~1U);}
         else if(name.starts_with("??5")){op.kind="number";op.output=a(0);op.floating=name.find("AAM@")!=name.npos || name.find("AEAM@")!=name.npos;op.unsigned_integer=name.find("AAI@")!=name.npos || name.find("AEAI@")!=name.npos;op.skip=true;}
         else if(method=="peek" || method=="ignore"){
-            memory.store(GuestAddress{object+8},64,0);
+            memory.store(GuestAddress{object+l.count_offset()},l.stream_bits(),0);
             if(method=="ignore"){op.limit=a(0);if(op.limit>INT64_MAX)op.limit=0;op.output=a(1)&l.int_mask();}
         }
-        else if(method=="getline"){op.output=a(0);op.limit=a(1);if(op.limit>INT64_MAX)op.limit=0;memory.store(GuestAddress{object+8},64,0);}
+        else if(method=="getline"){op.output=a(0);op.limit=a(1);if(op.limit>INT64_MAX)op.limit=0;memory.store(GuestAddress{object+l.count_offset()},l.stream_bits(),0);}
         else if(method=="seekg"){
             op.output=x86_?state.reg(Gpr::Rsp)+4:a(0);op.scratch=allocate_heap(memory,48);
             std::array<std::uint8_t,24> position{};memory.read(GuestAddress{op.output},position);memory.write(GuestAddress{op.scratch+24},position);
@@ -1076,7 +1094,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp100(GuestState& state,
 }
 
 std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,GuestMemory& memory,std::uint64_t token,std::uint64_t value){
-    auto& s=*msvcp100_;auto& op=s.operations.at(token);const Layout l(x86_,op.modern,op.element);const auto bits=static_cast<std::uint8_t>(l.p*8);
+    auto& s=*msvcp100_;auto& op=s.operations.at(token);const Layout l(x86_,op.modern,op.element,op.service.family=="msvcp90.dll" || op.service.family=="internal-msvcp90");const auto bits=static_cast<std::uint8_t>(l.p*8);
     const WindowsCall call(state,memory,op.service);
     const auto ptr=[&](std::uint64_t at){return memory.load(GuestAddress{at},bits);};
     const auto put=[&](std::uint64_t at,std::uint64_t v){memory.store(GuestAddress{at},bits,v);};
@@ -1099,7 +1117,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
         }
         if(op.locked){
             op.locked=false;op.completed=true;op.final_result=result;op.final_wide=wide;
-            GuestCallback cb{ptr(ptr(op.buffer)+2*l.p),{op.buffer}};cb.x86_register_arguments=x86_?1:0;cb.exception_policy=GuestExceptionPolicy::NoexceptCpp;
+            GuestCallback cb{l.legacy?resolve("kernel32.dll","LeaveCriticalSection").value:ptr(ptr(op.buffer)+2*l.p),{l.legacy?ptr(op.buffer+l.p):op.buffer}};cb.x86_register_arguments=x86_ && !l.legacy?1:0;cb.exception_policy=GuestExceptionPolicy::NoexceptCpp;
             start_callbacks(state,memory,{std::move(cb)},Continuation::Msvcp100Operation,token);return {};
         }
         if(op.caught_exception_base!=SIZE_MAX){
@@ -1138,8 +1156,10 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
         else if(op.kind=="global_locale" || op.kind=="copy_locale" || op.kind=="retire_facet" || (op.kind=="num_put" && next==21) || op.kind=="exception_destroy" || op.kind=="exception_release" || op.kind=="destroy_ios" || op.kind=="destroy_buffer" || op.kind=="destroy_locale_imp" || op.kind=="clone_locale_imp" || op.kind=="add_locale_facet")cb.exception_policy=GuestExceptionPolicy::NoexceptCpp;
         start_callbacks(state,memory,{std::move(cb)},Continuation::Msvcp100Operation,token);return {};
     };
-    const auto virt=[&](unsigned slot,std::vector<std::uint64_t> args,unsigned next){args.insert(args.begin(),op.buffer);
-        return callback(ptr(ptr(op.buffer)+slot*l.p),std::move(args),next,true,slot==8 || slot==9 || slot==10 || slot==12?4U:0U,slot==5 || slot==8 || slot==9);};
+    const auto virt=[&](unsigned slot,std::vector<std::uint64_t> args,unsigned next){
+        if(l.legacy && (slot==1 || slot==2))return callback(resolve("kernel32.dll",slot==1?"EnterCriticalSection":"LeaveCriticalSection").value,{ptr(op.buffer+l.p)},next,false);
+        args.insert(args.begin(),op.buffer);
+        return callback(ptr(ptr(op.buffer)+l.slot(slot)*l.p),std::move(args),next,true,!l.legacy && (slot==8 || slot==9 || slot==10 || slot==12)?4U:0U,!l.legacy && (slot==5 || slot==8 || slot==9));};
     const auto count_address=[&](bool output){return ptr(op.buffer+l.count_indirect(output));};
     const auto position_address=[&](bool output){return ptr(op.buffer+l.next_indirect(output));};
     const auto available=[&](bool output){return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{count_address(output)},32)));};
@@ -1149,6 +1169,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
     // _Osfx 的同步失敗會設定 badbit，但其 noexcept 邊界吞掉例外遮罩觸發的 failure。
     if(returned==52 && static_cast<std::uint32_t>(value)==UINT32_MAX){const auto at=op.ios+l.state;memory.store(GuestAddress{at},32,memory.load(GuestAddress{at},32)|4U);}
     if(op.completed)return finish(op.final_result,op.final_wide);
+#include "msvcp90_file_resume.inc"
     if(op.kind=="ostream_suffix")return finish(0);
     if(op.kind=="retire_facet"){
         if(!op.phase){op.phase=1;return callback(ptr(ptr(op.object)+2*l.p),{op.object},1);}
@@ -1382,7 +1403,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
         if(available(true)<=0)return virt(3,{op.output},1);
         memory.store(GuestAddress{ptr(position_address(true))},l.character_bits(),op.output);consume(true);return finish(op.output);
     }
-    if(op.kind=="sputn")return returned?finish(value,true):virt(9,{op.output,op.limit},1);
+    if(op.kind=="sputn" || op.kind=="sgetn")return returned?finish(value,!l.legacy):virt(op.kind=="sputn"?9:8,{op.output,op.limit},1);
     if(op.kind=="uflow" || op.kind=="StreamUflow"){
         if(returned && (value&l.int_mask())==l.eof())return finish(l.eof());
         if(returned){const auto c=memory.load(GuestAddress{ptr(position_address(false))},l.character_bits());consume(false);return finish(c);}
@@ -1433,11 +1454,11 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
                 const auto name="?flush@?$basic_ostream@"+character+"U?$char_traits@"+character+"@std@@@std@@"+(x86_?"QAEAAV":"QEAAAEAV")+"12@XZ";
                 return callback(resolve("msvcp140.dll",name).value,{tied},11);
             }
-            if(tied_buffer && !memory.load(GuestAddress{op.tie_ios+l.state},32))return callback(ptr(ptr(tied_buffer)+13*l.p),{tied_buffer},11);
+            if(tied_buffer && !memory.load(GuestAddress{op.tie_ios+l.state},32))return callback(ptr(ptr(tied_buffer)+l.slot(13)*l.p),{tied_buffer},11);
         }
     }
     if(op.kind=="seekg"){
-        if(returned==1){if(memory.load(GuestAddress{op.scratch},64)==UINT64_MAX && !memory.load(GuestAddress{op.scratch+8},64))setstate(2);return finish(op.object);}
+        if(returned==1){if((l.stream_bits()==32?memory.load(GuestAddress{op.scratch},32)==UINT32_MAX:memory.load(GuestAddress{op.scratch},64)==UINT64_MAX) && !memory.load(GuestAddress{op.scratch+8},64))setstate(2);return finish(op.object);}
         if(memory.load(GuestAddress{op.ios+l.state},32)&6U)return finish(op.object);
         std::vector<std::uint64_t> args{op.scratch};
         if(x86_)for(unsigned i=0;i<6;++i)args.push_back(memory.load(GuestAddress{op.scratch+24+4*i},32));else args.push_back(op.scratch+24);
@@ -1446,7 +1467,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
     if(op.kind=="seekp" || op.kind=="tellp"){
         const bool query=op.kind=="tellp";
         if(returned==1){if(query){memory.move(GuestAddress{op.output},GuestAddress{op.scratch},24);return finish(op.output);}
-            if(memory.load(GuestAddress{op.scratch},64)+memory.load(GuestAddress{op.scratch+8},64)==UINT64_MAX)setstate(2);return finish(op.object);}
+            if((l.stream_bits()==32?static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(memory.load(GuestAddress{op.scratch},32)))):memory.load(GuestAddress{op.scratch},64))+memory.load(GuestAddress{op.scratch+8},64)==UINT64_MAX)setstate(2);return finish(op.object);}
         if(memory.load(GuestAddress{op.ios+l.state},32)&6U || !op.buffer){if(query){memory.write(GuestAddress{op.output},std::array<std::uint8_t,24>{});memory.store(GuestAddress{op.output},64,UINT64_MAX);}return finish(query?op.output:op.object);}
         if(query)return virt(10,{op.scratch,0,1,2},1);
         std::vector<std::uint64_t> args{op.scratch};if(x86_)for(unsigned i=0;i<6;++i)args.push_back(memory.load(GuestAddress{op.scratch+24+i*4},32));else args.push_back(op.scratch+24);
@@ -1520,13 +1541,15 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
         return virt(9,{op.output,op.limit},1);
     }
     if(op.kind=="istream_read"){
-        if(returned==1){const auto count=value<=op.limit?value:0;memory.store(GuestAddress{op.object+8},64,count);if(count!=op.limit)setstate(3);return finish(op.object);}
-        if(!op.limit || op.limit>INT64_MAX)return finish(op.object);return virt(8,{op.output,op.limit},1);
+        if(returned==1){const auto count=value<=op.limit?value:0;memory.store(GuestAddress{op.object+l.count_offset()},l.stream_bits(),count);if(count!=op.limit)setstate(3);return finish(op.object);}
+        if(!op.limit || op.limit>INT64_MAX)return finish(op.object);
+        if(l.legacy)return callback(ptr(ptr(op.buffer)+7*l.p),{op.buffer,op.output,x86_?UINT32_MAX:UINT64_MAX,op.limit},1);
+        return virt(8,{op.output,op.limit},1);
     }
     if(op.kind=="tellg" || op.kind=="seekg_offset"){
         const bool query=op.kind=="tellg";
         if(returned==1){if(query){memory.move(GuestAddress{op.output},GuestAddress{op.scratch},24);return finish(op.output);}
-            if(memory.load(GuestAddress{op.scratch},64)+memory.load(GuestAddress{op.scratch+8},64)==UINT64_MAX)setstate(2);return finish(op.object);}
+            if((l.stream_bits()==32?static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(memory.load(GuestAddress{op.scratch},32)))):memory.load(GuestAddress{op.scratch},64))+memory.load(GuestAddress{op.scratch+8},64)==UINT64_MAX)setstate(2);return finish(op.object);}
         return virt(10,{op.scratch,query?0:op.output,query?1:op.limit,1},1);
     }
     if(op.kind=="istream_get"){
@@ -1535,7 +1558,7 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
         else if(available(false)>0){c=memory.load(GuestAddress{ptr(position_address(false))},l.character_bits());consume(false);}
         else return virt(7,{},22);
         if(c==l.eof()){setstate(3);return finish(op.output?op.object:l.eof());}
-        memory.store(GuestAddress{op.object+8},64,1);if(op.output)memory.store(GuestAddress{op.output},l.character_bits(),c);
+        memory.store(GuestAddress{op.object+l.count_offset()},l.stream_bits(),1);if(op.output)memory.store(GuestAddress{op.output},l.character_bits(),c);
         return finish(op.output?op.object:c);
     }
     if(op.kind=="putback"){
@@ -1555,13 +1578,13 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
     if(op.kind=="ignore"){
         if(returned==20){
             if((value&l.int_mask())==l.eof()){setstate(1);return finish(op.object);}
-            ++op.count;memory.store(GuestAddress{op.object+8},64,op.count);
+            ++op.count;memory.store(GuestAddress{op.object+l.count_offset()},l.stream_bits(),op.count);
             if((value&l.int_mask())==op.output)return finish(op.object);
         }
         while(op.limit==INT64_MAX || op.count<op.limit){
             if(available(false)<=0)return virt(7,{},20);
             const auto c=memory.load(GuestAddress{ptr(position_address(false))},l.character_bits());consume(false);
-            ++op.count;memory.store(GuestAddress{op.object+8},64,op.count);
+            ++op.count;memory.store(GuestAddress{op.object+l.count_offset()},l.stream_bits(),op.count);
             if(c==op.output)return finish(op.object);
         }
         return finish(op.object);
@@ -1608,12 +1631,12 @@ std::optional<std::uint32_t> WindowsServices::resume_msvcp100(GuestState& state,
             op.skip=false;if(prefix)return complete_input(false);
             if(line){
                 if(c=='\n'){
-                    memory.store(GuestAddress{op.object+8},64,op.count+1);
+                    memory.store(GuestAddress{op.object+l.count_offset()},l.stream_bits(),op.count+1);
                     if(available(false)>0){consume(false);if(op.limit)memory.store(GuestAddress{op.output+op.count*l.element},l.character_bits(),0);return finish(op.object);}
                     op.kind="getline_delimiter";return virt(7,{},3);
                 }
                 if(!op.limit || op.count+1>=op.limit){setstate(2);return complete_input(false);}
-                memory.store(GuestAddress{op.output+op.count*l.element},l.character_bits(),c);++op.count;memory.store(GuestAddress{op.object+8},64,op.count);
+                memory.store(GuestAddress{op.output+op.count*l.element},l.character_bits(),c);++op.count;memory.store(GuestAddress{op.object+l.count_offset()},l.stream_bits(),op.count);
             }else if(number){
                 const bool digit=c>='0' && c<='9';const bool sign=(c=='+' || c=='-') && (op.text.empty() || (op.floating && (op.text.back()=='e' || op.text.back()=='E')));
                 const auto flags=memory.load(GuestAddress{op.ios+l.flags},32)&0xe00U;

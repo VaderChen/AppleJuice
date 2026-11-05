@@ -61,6 +61,8 @@ struct HttpState {
     std::uint64_t next{0x68000000};
     std::map<std::uint64_t,HttpHandle> handles;
     std::map<std::uint64_t,std::uint64_t> connection_probes;
+    // WinINet 延伸錯誤屬於呼叫執行緒；不能讓另一個請求覆蓋目前執行緒的回應。
+    std::map<std::uint64_t,std::pair<std::uint32_t,std::string>> last_responses;
     std::string nearest_server;
     HttpState()=default;
     HttpState(const HttpState&);

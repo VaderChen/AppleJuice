@@ -1,6 +1,7 @@
 #include "metal_shared_frame.hpp"
 #include "metal_command_encoder.hpp"
 #include "metal_gpu_counter.hpp"
+#include "metal_frame_timing.hpp"
 #include "metal_stencil.hpp"
 #include "metal_gl_shared_names.hpp"
 #include "packed_float.hpp"
@@ -15,6 +16,7 @@
 #include "x64arm/graphics_index_range.hpp"
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
+#include "../../services/graphics_view_flags.hpp"
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CATransaction.h>
 #include <algorithm>
@@ -67,8 +69,9 @@ struct State {
     Fog fog;unsigned fog_hint{0x1100},perspective_hint{0x1100};
     GlStencil stencil;
     std::array<double,2> depth_range{0,1};double depth_clear{1};bool depth_write{true};
+    std::array<float,2> polygon_offset{};
     // glColorMask 位元依 R、G、B、A；線寬依 ALIASED_LINE_WIDTH_RANGE=[1,1] 柵格化，但保留查詢值。
-    unsigned color_mask{15};float line_width{1};std::array<float,2> pixel_zoom{1,1};unsigned render_mode{0x1c00};
+    unsigned color_mask{15},index_mask{UINT32_MAX};float line_width{1},point_size{1};std::array<float,2> pixel_zoom{1,1};unsigned render_mode{0x1c00};
     unsigned texture_color_op{4},texture_alpha_op{4},texture_arguments{0x80000000U|2U|(1U<<6)|(2U<<12)|(1U<<18)};
     bool texture_combine_enabled{};
     std::array<TextureEnvironment,32> environments{};unsigned alpha_func{0x207};float alpha_ref{};
@@ -113,15 +116,19 @@ class MetalGl final:public NativeOpenGlContext {
     std::vector<std::shared_ptr<GpuMemoryReservation>> pending_leases_;
     // 固定與可程式化 OpenGL 共用 context 配額，不隨 program 數目相乘。
     BoundedCache<id<MTLRenderPipelineState>> gl_pipelines_{2U<<20,metal_cache_entries("X64ARM_METAL_GL_PIPELINE_CACHE_ENTRIES",512)};
-    bool fixed_targets_set_{};GraphicsView fixed_color_,fixed_depth_,fixed_texture_;
+    bool fixed_targets_set_{};GraphicsView fixed_color_,fixed_depth_,fixed_texture_;std::shared_ptr<GraphicsSampler> fixed_sampler_;
     std::array<std::uint32_t,12> fixed_stencil_{};
+    std::shared_ptr<GraphicsResource> fixed_visibility_;std::uint32_t fixed_visibility_offset_{};
     GlSharedNames<Texture,true> textures_;
     struct TextureLevelInfo {unsigned width{},height{},format{};std::array<unsigned,4> bits{};unsigned depth{};};
     std::map<unsigned,TextureLevelInfo> proxy_levels_;
     void texture_level(GlOperation,std::span<const std::uint64_t>,std::span<std::uint8_t>);
     MetalPendingObjects graphics_pending_;
-    struct Flight {id<MTLCommandBuffer> command;std::vector<std::shared_ptr<GpuMemoryReservation>> leases;MetalPendingObjects objects;std::shared_ptr<std::atomic<bool>> done;std::shared_ptr<MetalFenceRelays> relays;};
+    struct Flight {id<MTLCommandBuffer> command;std::vector<std::shared_ptr<GpuMemoryReservation>> leases;MetalPendingObjects objects;std::vector<Texture> textures;std::shared_ptr<std::atomic<bool>> done;std::shared_ptr<MetalFenceRelays> relays;};
     std::deque<Flight> flights_;
+    // glDeleteTextures 後仍可能被已編碼／在途命令引用的紋理（連同 GPU 額度）：送出時掛到該批次，批次完成才釋放，
+    // 不必為刪除整個同步等 GPU（D3D9 每次把第 0 層貼圖設為 NULL 都會刪除名稱 1）。X64ARM_METAL_DELETE_SYNC=1 恢復同步。
+    std::vector<Texture> retired_textures_;
     std::size_t flight_limit_{3},flight_peak_{};bool flight_explicit_{};
     std::uint64_t wait_count_{},wait_ns_{},resource_wait_count_{};
     std::uint64_t constant_upload_skips_{},constant_upload_saved_bytes_{};
@@ -130,7 +137,8 @@ class MetalGl final:public NativeOpenGlContext {
     std::unordered_map<MetalFastPipelineKey,MetalFastPipeline,MetalFastPipelineHash> fast_pipelines_;
     std::unordered_map<std::uint64_t,MetalPipelineInputs> pipeline_inputs_;
     const MetalPipelineInputs* pipeline_inputs(const GraphicsDraw&);
-    std::shared_ptr<MetalBufferPool> discard_pool_{std::make_shared<MetalBufferPool>()};std::uint64_t discard_in_place_{};
+    std::shared_ptr<MetalBufferPool> discard_pool_{std::make_shared<MetalBufferPool>()};
+    std::shared_ptr<MetalBufferPool> geometry_private_pool_{std::make_shared<MetalBufferPool>()},geometry_shared_pool_{std::make_shared<MetalBufferPool>()};std::uint64_t discard_in_place_{};
     MetalTimestampPool timestamp_pool_;
     // UAV 清除的來源緩衝（見 metal_unordered_clear.inc）。
     struct ClearSource {std::array<std::uint8_t,16> pattern{};unsigned size{};id<MTLBuffer> buffer;std::uint64_t used{};};
@@ -190,6 +198,13 @@ class MetalGl final:public NativeOpenGlContext {
     // 已取得與已上屏（presentedHandler）的 drawable 數：差值達 maximumDrawableCount-1 時，下一次 nextDrawable 要等垂直同步釋出。
     std::atomic<std::uint64_t> drawables_acquired_{};std::shared_ptr<std::atomic<std::uint64_t>> drawables_presented_=std::make_shared<std::atomic<std::uint64_t>>(0);
     std::uint64_t drawable_limit_{2};
+    std::shared_ptr<macos_detail::GuiTiming> timing_=macos_detail::gui_timing();
+    std::uint64_t timing_surface_=timing_?timing_->surface():0,timing_frame_{};
+    macos_detail::MetalFrameTiming trace_frame(id<MTLCommandBuffer> command,double request){
+        if(!timing_)return {};
+        macos_detail::MetalFrameTiming record{timing_,timing_surface_,++timing_frame_,width_,height_,request,CACurrentMediaTime()};
+        record.submit(command);return record;
+    }
     std::uint64_t draws_{},submissions_{},list_bytes_{};unsigned pending_{};
     GlOperation active_operation_{};
     void error(unsigned e){if(std::getenv("X64ARM_GL_TRACE"))std::fprintf(stderr,"[gl-error] operation=%u error=0x%x\n",static_cast<unsigned>(active_operation_),e);if(!error_)error_=e;}
@@ -273,7 +288,7 @@ class MetalGl final:public NativeOpenGlContext {
             if(flights_.size()>=flight_limit_)retire_front(true);
             // 在 commit 之前配置追蹤節點；資源／額度保留至 GPU 完成，避免非同步重用。
             flights_.emplace_back();auto& flight=flights_.back();flight.command=commands_;
-            flight.leases=std::move(pending_leases_);flight.objects=std::move(graphics_pending_);
+            flight.leases=std::move(pending_leases_);flight.objects=std::move(graphics_pending_);flight.textures=std::move(retired_textures_);retired_textures_.clear();
             // 完成旗標供 D3D11 事件查詢輪詢；回呼只寫旗標，不觸碰後端狀態。
             flight.done=commands_done_?std::move(commands_done_):std::make_shared<std::atomic<bool>>(false);commands_done_=nullptr;auto done=flight.done;
             flight.relays=commands_relays_?std::move(commands_relays_):std::make_shared<MetalFenceRelays>();commands_relays_=nullptr;auto relays=flight.relays;
@@ -286,7 +301,16 @@ class MetalGl final:public NativeOpenGlContext {
             if(commands_gpu_work_)track_gpu_commands(commands_);[commands_ commit];commands_=nil;pending_leases_.clear();graphics_pending_.clear();pending_=0;++submissions_;
             flight_peak_=std::max(flight_peak_,flights_.size());
         }
-        if(wait)while(!flights_.empty())retire_front(true);
+        // 沒有開啟中的命令時，退役紋理隨最後一個在途批次釋放（同一佇列依序完成）；沒有在途批次即可直接釋放。
+        if(!retired_textures_.empty()){
+            if(flights_.empty())retired_textures_.clear();
+            else{auto& last=flights_.back().textures;for(auto& texture:retired_textures_)last.push_back(std::move(texture));retired_textures_.clear();}
+        }
+        if(wait){
+            while(!flights_.empty())retire_front(true);
+            // 明確同步已完成全部 GPU 使用；釋放暫存額度，非同步批次仍共用上傳 chunk。
+            upload_chunk_.reset();upload_chunk_used_=0;
+        }
     }
     void wait_resource(const std::shared_ptr<GraphicsResource>& resource){
         materialize_clears();
@@ -324,10 +348,10 @@ class MetalGl final:public NativeOpenGlContext {
     static MTLBlendFactor blend(unsigned x){switch(x){case 0:return MTLBlendFactorZero;case 1:return MTLBlendFactorOne;case 0x300:return MTLBlendFactorSourceColor;case 0x301:return MTLBlendFactorOneMinusSourceColor;case 0x302:return MTLBlendFactorSourceAlpha;case 0x303:return MTLBlendFactorOneMinusSourceAlpha;case 0x304:return MTLBlendFactorDestinationAlpha;case 0x305:return MTLBlendFactorOneMinusDestinationAlpha;case 0x306:return MTLBlendFactorDestinationColor;case 0x307:return MTLBlendFactorOneMinusDestinationColor;default:return MTLBlendFactorSourceAlphaSaturated;}}
     id<MTLRenderPipelineState> pipeline(bool clear,bool color_write=true,bool fixed=false,MTLPixelFormat color_format=MTLPixelFormatBGRA8Unorm,MTLPixelFormat depth_format=MTLPixelFormatDepth32Float_Stencil8,unsigned samples=1){
         const bool blending=!clear && state_.enabled.contains(0xbe2);const std::uint64_t flags=(blending?1ULL:0ULL)|(std::uint64_t{state_.blend_src}<<1)|(std::uint64_t{state_.blend_dst}<<16)|(color_write?1ULL<<40:0)|(fixed?1ULL<<41:0)|(std::uint64_t{state_.color_mask&15U}<<42);
-        MetalPipelineKey fields;fields<<'f'<<flags<<color_format<<depth_format<<samples;const auto& key=fields.str();
+        MetalPipelineKey fields;fields<<'f'<<flags<<color_format<<depth_format<<samples<<gl_.src_alpha<<gl_.dst_alpha<<gl_.equation_rgb<<gl_.equation_alpha;const auto& key=fields.str();
         if(const auto found=gl_pipelines_.get(key))return *found;
         auto desc=[MTLRenderPipelineDescriptor new];desc.vertexFunction=[library_ newFunctionWithName:fixed?@"fixed_vertex_main":@"vertex_main"];desc.fragmentFunction=[library_ newFunctionWithName:@"fragment_main"];desc.colorAttachments[0].pixelFormat=color_format;desc.depthAttachmentPixelFormat=depth_format;desc.stencilAttachmentPixelFormat=depth_format==MTLPixelFormatDepth32Float_Stencil8?depth_format:MTLPixelFormatInvalid;desc.sampleCount=samples;
-        auto attachment=desc.colorAttachments[0];attachment.blendingEnabled=blending;attachment.sourceRGBBlendFactor=blend(state_.blend_src);attachment.sourceAlphaBlendFactor=blend(state_.blend_src);attachment.destinationRGBBlendFactor=blend(state_.blend_dst);attachment.destinationAlphaBlendFactor=blend(state_.blend_dst);attachment.writeMask=color_write?((state_.color_mask&1U?MTLColorWriteMaskRed:MTLColorWriteMaskNone)|(state_.color_mask&2U?MTLColorWriteMaskGreen:MTLColorWriteMaskNone)|(state_.color_mask&4U?MTLColorWriteMaskBlue:MTLColorWriteMaskNone)|(state_.color_mask&8U?MTLColorWriteMaskAlpha:MTLColorWriteMaskNone)):MTLColorWriteMaskNone;
+        auto attachment=desc.colorAttachments[0];attachment.blendingEnabled=blending;attachment.sourceRGBBlendFactor=blend(state_.blend_src);attachment.sourceAlphaBlendFactor=blend(gl_.src_alpha);attachment.destinationRGBBlendFactor=blend(state_.blend_dst);attachment.destinationAlphaBlendFactor=blend(gl_.dst_alpha);const auto equation=[](unsigned v){switch(v){case 0x800a:return MTLBlendOperationSubtract;case 0x800b:return MTLBlendOperationReverseSubtract;case 0x8007:return MTLBlendOperationMin;case 0x8008:return MTLBlendOperationMax;default:return MTLBlendOperationAdd;}};attachment.rgbBlendOperation=equation(gl_.equation_rgb);attachment.alphaBlendOperation=equation(gl_.equation_alpha);attachment.writeMask=color_write?((state_.color_mask&1U?MTLColorWriteMaskRed:MTLColorWriteMaskNone)|(state_.color_mask&2U?MTLColorWriteMaskGreen:MTLColorWriteMaskNone)|(state_.color_mask&4U?MTLColorWriteMaskBlue:MTLColorWriteMaskNone)|(state_.color_mask&8U?MTLColorWriteMaskAlpha:MTLColorWriteMaskNone)):MTLColorWriteMaskNone;
         NSError* e=nil;auto p=[device_ newRenderPipelineStateWithDescriptor:desc error:&e];if(!p)throw std::runtime_error(std::string("Metal GL pipeline: ")+e.localizedDescription.UTF8String);gl_pipelines_.put(key,p);return p;
     }
     MTLScissorRect scissor(bool enabled,unsigned width=0,unsigned height=0){
@@ -338,7 +362,7 @@ class MetalGl final:public NativeOpenGlContext {
         return {static_cast<NSUInteger>(x),static_cast<NSUInteger>(clip_height-top),static_cast<NSUInteger>(right-x),static_cast<NSUInteger>(top-y)};
     }
     void draw(std::span<const Vertex> vertices,MTLPrimitiveType primitive,bool clearing=false,unsigned clear_mask=0,const FixedGraphicsDraw* fixed=nullptr){
-        id<MTLTexture> render_color=fixed_targets_set_?metal_resource(fixed_color_.resource).texture:(state_.draw_buffer==0x404?front_:color_);
+        id<MTLTexture> render_color=fixed_targets_set_?[&]{auto view=fixed_color_;view.level=0;view.levels=view.resource->desc.levels;view.slice=0;view.slices=view.resource->desc.layers;return metal_shader_texture(view);}():(state_.draw_buffer==0x404?front_:color_);
         id<MTLTexture> render_depth=fixed_targets_set_?(fixed_depth_.resource?metal_resource(fixed_depth_.resource).texture:nil):depth_;
         const unsigned target_width=fixed_targets_set_?std::max(1U,fixed_color_.resource->desc.width>>fixed_color_.level):width_;
         const unsigned target_height=fixed_targets_set_?std::max(1U,fixed_color_.resource->desc.height>>fixed_color_.level):height_;
@@ -353,9 +377,12 @@ class MetalGl final:public NativeOpenGlContext {
         begin_commands();pending_leases_.push_back(std::move(lease));
         auto pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=render_color;pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionStore;pass.depthAttachment.texture=render_depth;pass.depthAttachment.loadAction=MTLLoadActionLoad;pass.depthAttachment.storeAction=MTLStoreActionStore;pass.stencilAttachment.texture=render_depth.pixelFormat==MTLPixelFormatDepth32Float_Stencil8?render_depth:nil;pass.stencilAttachment.loadAction=MTLLoadActionLoad;pass.stencilAttachment.storeAction=MTLStoreActionStore;
         if(fixed_targets_set_){pass.colorAttachments[0].level=fixed_color_.level;pass.colorAttachments[0].slice=fixed_color_.slice;graphics_pending_.push_back(fixed_color_.resource);if(fixed_depth_.resource){pass.depthAttachment.level=pass.stencilAttachment.level=fixed_depth_.level;pass.depthAttachment.slice=pass.stencilAttachment.slice=fixed_depth_.slice;graphics_pending_.push_back(fixed_depth_.resource);}}
+        if(!clearing && fixed_visibility_){pass.visibilityResultBuffer=metal_resource(fixed_visibility_).buffer;graphics_pending_.push_back(fixed_visibility_);}
         auto enc=[commands_ renderCommandEncoderWithDescriptor:pass];MetalEncoderScope enc_scope{enc};[enc setRenderPipelineState:p];[enc setDepthStencilState:ds];[enc setStencilReferenceValue:clearing?state_.stencil.clear:fixed_targets_set_?(fixed_stencil_[1]&255):state_.stencil.reference];[enc setScissorRect:clip];
+        if(!clearing && fixed_visibility_)[enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:fixed_visibility_offset_];
         const auto& v=state_.viewport;[enc setViewport:clearing?MTLViewport{0,0,static_cast<double>(target_width),static_cast<double>(target_height),0,1}:MTLViewport{static_cast<double>(v[0]),static_cast<double>(target_height)-v[1]-v[3],static_cast<double>(v[2]),static_cast<double>(v[3]),state_.depth_range[0],state_.depth_range[1]}];
         [enc setCullMode:state_.enabled.contains(0xb44)&&!clearing?(state_.cull_face==0x404?MTLCullModeFront:MTLCullModeBack):MTLCullModeNone];[enc setFrontFacingWinding:state_.front_face==0x901?MTLWindingCounterClockwise:MTLWindingClockwise];
+        if(!clearing && primitive==MTLPrimitiveTypeTriangle && state_.enabled.contains(0x8037))[enc setDepthBias:state_.polygon_offset[1] slopeScale:state_.polygon_offset[0] clamp:0];
         if(fixed){[enc setVertexBuffer:buffer offset:0 atIndex:0];[enc setVertexBytes:fixed->transforms.data() length:sizeof(fixed->transforms) atIndex:1];[enc setVertexBytes:fixed->viewport_size.data() length:sizeof(fixed->viewport_size) atIndex:2];}
         else {
         const auto m=clearing?identity():multiply(matrices_[1].back(),matrices_[0].back());[enc setVertexBuffer:buffer offset:0 atIndex:0];[enc setVertexBytes:m.data() length:sizeof(m) atIndex:1];
@@ -364,6 +391,7 @@ class MetalGl final:public NativeOpenGlContext {
         unsigned light_mask=0;for(unsigned i=0;i<8;++i)if(state_.enabled.contains(0x4000+i))light_mask|=1U<<i;
         const Vec lighting_flags{!clearing && state_.enabled.contains(0xb50)?1.F:0.F,state_.enabled.contains(0xba1)?1.F:0.F,static_cast<float>(light_mask),0};
         [enc setVertexBytes:state_.lights.data() length:sizeof(state_.lights) atIndex:4];[enc setVertexBytes:lighting_flags.data() length:sizeof(lighting_flags) atIndex:5];
+        const float point_size=std::clamp(std::round(state_.point_size),1.F,64.F);[enc setVertexBytes:&point_size length:sizeof(point_size) atIndex:6];
         }
         const auto& fog=state_.fog;const std::array<Vec,2> fog_uniform{{fog.color,{fog.density,fog.start,fog.end,!clearing && state_.enabled.contains(0xb60)?static_cast<float>(fog.mode):0}}};
         [enc setFragmentBytes:fog_uniform.data() length:sizeof(fog_uniform) atIndex:1];
@@ -374,7 +402,7 @@ class MetalGl final:public NativeOpenGlContext {
             const unsigned required=texture?std::min(t.max_level,static_cast<unsigned>(texture.mipmapLevelCount-1))+1:0;id<MTLTexture> sampled=(texture && (t.min<=0x2601 || mip_levels>=required))?texture:textures_.at(UINT32_MAX).native;
             // MAX_LEVEL 限制資源可見的 mip 範圍，而不只是 sampler LOD；各向異性 footprint 不得讀到未定義層。
             if(sampled==texture && required<texture.mipmapLevelCount){sampled=[texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0,required) slices:NSMakeRange(0,1)];if(!sampled)throw std::runtime_error("Metal mip view 建立失敗");}
-            [enc setFragmentTexture:sampled atIndex:0];[enc setFragmentSamplerState:cached_sampler_state(sampler) atIndex:0];
+            [enc setFragmentTexture:sampled atIndex:0];if(fixed_targets_set_ && fixed_sampler_){[enc setFragmentSamplerState:dynamic_cast<MetalSampler&>(*fixed_sampler_).sampler atIndex:0];graphics_pending_.push_back(fixed_sampler_);}else [enc setFragmentSamplerState:cached_sampler_state(sampler) atIndex:0];
         }
         auto color_op=state_.texture_color_op,alpha_op=state_.texture_alpha_op;const auto& environment=state_.environments[gl_.active_texture];
         if(environment.mode){const auto format=t.formats.contains(0)?t.formats.at(0):0;const bool alpha=format==4 || format==0x1908 || format==0x8058 || format==0x881a || format==0x8814;
@@ -427,6 +455,11 @@ class MetalGl final:public NativeOpenGlContext {
         else if(pname==0xb45)values={static_cast<double>(state_.cull_face)};else if(pname==0xb46)values={static_cast<double>(state_.front_face)};else if(pname==0xb70)vector(state_.depth_range);
         else if(pname==0xc23)values={state_.color_mask&1U?1.:0.,state_.color_mask&2U?1.:0.,state_.color_mask&4U?1.:0.,state_.color_mask&8U?1.:0.};
         else if(pname==0xb21)values={state_.line_width};else if(pname==0x846e || pname==0xb22)values={1,1};else if(pname==0xb23)values={0};
+        else if(pname==0xb11)values={state_.point_size};else if(pname==0x846d)values={1,64};else if(pname==0xb12)values={1,1};else if(pname==0xb13)values={0};
+        // 本後端的像素格式為 RGBA；索引遮罩仍須完整保存、查詢與還原，且不影響 RGBA 寫入。
+        else if(pname==0xc21)values={static_cast<double>(state_.index_mask)};
+        else if(pname==0x8642)values={state_.enabled.contains(pname)?1.:0.};
+        else if(pname==0x8038 || pname==0x2a00)values={state_.polygon_offset[pname==0x8038?0:1]};
         else if(pname==0xd16)values={state_.pixel_zoom[0]};else if(pname==0xd17)values={state_.pixel_zoom[1]};else if(pname==0xc40)values={static_cast<double>(state_.render_mode)};
         else if(pname==0xb72)values={state_.depth_write?1.:0.};else if(pname==0xb73)values={state_.depth_clear};else if(pname==0xb74)values={static_cast<double>(state_.depth_func)};
         else if(pname>=0xb91 && pname<=0xb98){const auto& st=state_.stencil;const std::array values_by_name{st.clear,st.function,st.read_mask,st.fail,st.depth_fail,st.pass,st.reference,st.write_mask};values={static_cast<double>(std::bit_cast<std::int32_t>(values_by_name[pname-0xb91]))};}
@@ -435,7 +468,7 @@ class MetalGl final:public NativeOpenGlContext {
         else if(pname>=0xba3 && pname<=0xba5)values={static_cast<double>(matrices_[pname-0xba3].size())};
         else if(pname==0xd36)values={32};else if(pname==0xd38 || pname==0xd39)values={2};else if(pname==0xd3a)values={16384,16384};
         else if(pixel_.contains(pname))values={static_cast<double>(pixel_[pname])};
-        else if(lighting_cap(pname) || pname==0xb71 || pname==0xb90 || pname==0xbc0 || pname==0xbe2 || pname==0xc11 || pname==0xde1 || pname==0xb44 || pname==0xb60)values={state_.enabled.contains(pname)?1.:0.};
+        else if(lighting_cap(pname) || pname==0xb71 || pname==0xb90 || pname==0xbc0 || pname==0xbe2 || pname==0xc11 || pname==0xde1 || pname==0xb44 || pname==0xb60 || pname==0x8037 || pname==0x2a01 || pname==0x2a02)values={state_.enabled.contains(pname)?1.:0.};
         else if(pname==0xb02){values={state_.normal[0],state_.normal[1],state_.normal[2]};}
         else if(pname==0xd31)values={8};else if(pname==0xb53)values={.2,.2,.2,1};
         else if(pname==0xb51 || pname==0xb52)values={0};else if(pname==0xb55)values={0x408};else if(pname==0xb56)values={0x1602};
@@ -445,7 +478,7 @@ class MetalGl final:public NativeOpenGlContext {
         else if(pname==0xb65)values={static_cast<double>(state_.fog.mode)};else if(pname==0xc54)values={static_cast<double>(state_.fog_hint)};else if(pname==0xc50)values={static_cast<double>(state_.perspective_hint)};
         else {error(0x500);return;}
         const unsigned size=op==GlOperation::GetDoublev?8:op==GlOperation::GetBooleanv?1:4;if(values.size()*size>out.size())throw std::invalid_argument("GL query bounds");
-        for(std::size_t i=0;i<values.size();++i){const auto n=values[i];std::uint64_t value=0;if(op==GlOperation::GetDoublev)value=std::bit_cast<std::uint64_t>(n);else if(op==GlOperation::GetFloatv)value=std::bit_cast<std::uint32_t>(static_cast<float>(n));else if(op==GlOperation::GetBooleanv)value=n!=0;else {const auto scaled=(pname==0xb00 || pname==0xc22 || pname==0xb66 || pname==0xb53 || pname==0xb02 || pname==0xbc2)?n*2147483647.:n;const auto safe=std::isfinite(scaled)?std::clamp(std::round(scaled),-2147483648.,2147483647.):0.;value=static_cast<std::uint32_t>(static_cast<std::int32_t>(safe));}std::memcpy(out.data()+i*size,&value,size);}
+        for(std::size_t i=0;i<values.size();++i){const auto n=values[i];std::uint64_t value=0;if(op==GlOperation::GetDoublev)value=std::bit_cast<std::uint64_t>(n);else if(op==GlOperation::GetFloatv)value=std::bit_cast<std::uint32_t>(static_cast<float>(n));else if(op==GlOperation::GetBooleanv)value=n!=0;else if(pname==0xc21)value=state_.index_mask;else {const auto scaled=(pname==0xb00 || pname==0xc22 || pname==0xb66 || pname==0xb53 || pname==0xb02 || pname==0xbc2)?n*2147483647.:n;const auto safe=std::isfinite(scaled)?std::clamp(std::round(scaled),-2147483648.,2147483647.):0.;value=static_cast<std::uint32_t>(static_cast<std::int32_t>(safe));}std::memcpy(out.data()+i*size,&value,size);}
     }
 public:
     MetalGl(void* view,unsigned w,unsigned h){@autoreleasepool{
@@ -470,23 +503,23 @@ public:
         return !layer_ || !interval_ || drawables_acquired_.load(std::memory_order_relaxed)-drawables_presented_->load(std::memory_order_acquire)<drawable_limit_;
     }
     bool swap_interval(std::int32_t n)override{if(n<0 || n>1)return false;if(n)finish_immediate_present();interval_=n;if(layer_)layer_.displaySyncEnabled=n!=0;return true;}
-    bool swap()override{@autoreleasepool{bind();if(layer_)raster_overlays(true);begin_commands();auto front_copy=[commands_ blitCommandEncoder];MetalEncoderScope front_copy_scope{front_copy};[front_copy copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:front_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];front_copy_scope.end();if(layer_ && !interval_ && immediate_present_enabled() && !immediate_unavailable_){
+    bool swap()override{@autoreleasepool{const auto request=timing_ && layer_?CACurrentMediaTime():0;bind();if(layer_)raster_overlays(true);begin_commands();auto front_copy=[commands_ blitCommandEncoder];MetalEncoderScope front_copy_scope{front_copy};[front_copy copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:front_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];front_copy_scope.end();if(layer_ && !interval_ && immediate_present_enabled() && !immediate_unavailable_){
             if(!immediate_presenter_)try{immediate_presenter_=std::make_unique<MetalImmediatePresenter>(device_,layer_,width_,height_);}catch(const std::bad_alloc&){immediate_unavailable_=true;}
             if(immediate_presenter_){
                 const auto index=immediate_presenter_->prepare();auto encoder=[commands_ blitCommandEncoder];MetalEncoderScope scope{encoder};
                 [encoder copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
                           sourceSize:MTLSizeMake(width_,height_,1) toTexture:immediate_presenter_->texture(index)
                     destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
-                scope.end();auto ready=commands_;flush(false);immediate_presenter_->publish(index,ready);return true;
+                scope.end();auto ready=commands_;const auto timing=trace_frame(ready,request);flush(false);immediate_presenter_->publish(index,ready,timing);return true;
             }
         }
         if(layer_){auto drawable=[layer_ nextDrawable];if(!drawable)return false;
             drawables_acquired_.fetch_add(1,std::memory_order_relaxed);
             {auto presented=drawables_presented_;[drawable addPresentedHandler:^(id<MTLDrawable>){presented->fetch_add(1,std::memory_order_release);}];}
-            begin_commands();auto enc=[commands_ blitCommandEncoder];MetalEncoderScope enc_scope{enc};[enc copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:drawable.texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];enc_scope.end();[commands_ presentDrawable:drawable];}flush(false);return true;}}
+            begin_commands();auto enc=[commands_ blitCommandEncoder];MetalEncoderScope enc_scope{enc};[enc copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:drawable.texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];enc_scope.end();trace_frame(commands_,request).present(drawable);[commands_ presentDrawable:drawable];}flush(false);return true;}}
     OpenGlRendererInfo info()const override{return {"MacWin",std::string(device_.name.UTF8String)+" (Metal)","1.1 MacWin Metal subset",true};}
     std::string string(unsigned name)override{const auto i=info();switch(name){case 0x1f00:return i.vendor;case 0x1f01:return i.renderer;case 0x1f02:return i.version;case 0x1f03:return {};case 0x8b8c:return "4.60 MacWin GLSL compiler";default:error(0x500);return {};}}
-    std::string statistics()const override{return "opengl_backend=metal opengl_metal_draws="+std::to_string(draws_)+" opengl_metal_submissions="+std::to_string(submissions_)+" opengl_metal_inflight="+std::to_string(flights_.size())+" opengl_metal_inflight_limit="+std::to_string(flight_limit_)+" opengl_metal_inflight_peak="+std::to_string(flight_peak_)+" opengl_metal_render_encoders="+std::to_string(render_encoders_)+" opengl_metal_encoder_breaks="+[&]{std::string text;for(const auto& [why,count]:encoder_breaks_)text+=why+":"+std::to_string(count)+",";return text.empty()?std::string("none"):text;}()+" opengl_metal_coalesced_draws="+std::to_string(coalesced_draws_)+" metal_compute_encoders="+std::to_string(compute_encoders_)+" metal_coalesced_dispatches="+std::to_string(coalesced_dispatches_)+" metal_binds_skipped="+std::to_string(binds_skipped_)+" metal_binds_set="+std::to_string(binds_set_)+" metal_clears_folded="+std::to_string(clears_folded_)+" metal_clears_encoded="+std::to_string(clears_encoded_)+" metal_draw_timed="+std::to_string(draw_time_count_)+" metal_draw_ns="+[&]{std::string text;for(const auto value:draw_time_ns_)text+=std::to_string(value)+",";return text;}()+" opengl_metal_gpu_busy_ns="+std::to_string(gpu_busy_ns_->load(std::memory_order_relaxed))+" opengl_metal_waits="+std::to_string(wait_count_)+" opengl_metal_wait_ns="+std::to_string(wait_ns_)+" glsl_compiles="+std::to_string(gl_.compiles)+" glsl_links="+std::to_string(gl_.links)+" glsl_compile_ns="+std::to_string(gl_.compile_ns)+" glsl_link_ns="+std::to_string(gl_.link_ns)+" opengl_metal_resource_waits="+std::to_string(resource_wait_count_)+" gl_buffer_uploads="+std::to_string(gl_.buffer_uploads)+" gl_buffer_upload_bytes="+std::to_string(gl_.buffer_upload_bytes)+" gl_direct_vertex_bindings="+std::to_string(gl_.direct_vertex_bindings)+" gl_direct_index_draws="+std::to_string(gl_.direct_index_draws)+" gl_converted_vertices="+std::to_string(gl_.converted_vertices)+cache_statistics()+discard_pool_->statistics()+"\n";}
+    std::string statistics()const override{return "opengl_backend=metal opengl_metal_draws="+std::to_string(draws_)+" opengl_metal_submissions="+std::to_string(submissions_)+" opengl_metal_inflight="+std::to_string(flights_.size())+" opengl_metal_inflight_limit="+std::to_string(flight_limit_)+" opengl_metal_inflight_peak="+std::to_string(flight_peak_)+" opengl_metal_render_encoders="+std::to_string(render_encoders_)+" opengl_metal_encoder_breaks="+[&]{std::string text;for(const auto& [why,count]:encoder_breaks_)text+=why+":"+std::to_string(count)+",";return text.empty()?std::string("none"):text;}()+" opengl_metal_coalesced_draws="+std::to_string(coalesced_draws_)+" metal_compute_encoders="+std::to_string(compute_encoders_)+" metal_coalesced_dispatches="+std::to_string(coalesced_dispatches_)+" metal_binds_skipped="+std::to_string(binds_skipped_)+" metal_binds_set="+std::to_string(binds_set_)+" metal_clears_folded="+std::to_string(clears_folded_)+" metal_clears_encoded="+std::to_string(clears_encoded_)+" metal_draw_timed="+std::to_string(draw_time_count_)+" metal_draw_ns="+[&]{std::string text;for(const auto value:draw_time_ns_)text+=std::to_string(value)+",";return text;}()+" opengl_metal_gpu_busy_ns="+std::to_string(gpu_busy_ns_->load(std::memory_order_relaxed))+" opengl_metal_waits="+std::to_string(wait_count_)+" opengl_metal_wait_ns="+std::to_string(wait_ns_)+" glsl_compiles="+std::to_string(gl_.compiles)+" glsl_links="+std::to_string(gl_.links)+" glsl_compile_ns="+std::to_string(gl_.compile_ns)+" glsl_link_ns="+std::to_string(gl_.link_ns)+" opengl_metal_resource_waits="+std::to_string(resource_wait_count_)+" gl_buffer_uploads="+std::to_string(gl_.buffer_uploads)+" gl_buffer_upload_bytes="+std::to_string(gl_.buffer_upload_bytes)+" gl_direct_vertex_bindings="+std::to_string(gl_.direct_vertex_bindings)+" gl_direct_index_draws="+std::to_string(gl_.direct_index_draws)+" gl_converted_vertices="+std::to_string(gl_.converted_vertices)+cache_statistics()+discard_pool_->statistics()+" metal_stream_output_gpu_draws="+std::to_string(stream_gpu_draws_)+" metal_stream_output_gpu_bytes="+std::to_string(stream_gpu_bytes_)+"\n";}
     void array(unsigned index,int size,unsigned type,std::span<const std::uint8_t> bytes,bool enabled)override{if(index>=4 || size<1 || size>4)throw std::invalid_argument("GL array");auto& a=arrays_[index];a.size=size;a.type=type;a.enabled=enabled;a.bytes.assign(bytes.begin(),bytes.end());}
     std::string capture(const std::filesystem::path& path)override{@autoreleasepool{flush(true);std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width_)*height_*4);[color_ getBytes:pixels.data() bytesPerRow:width_*4 fromRegion:MTLRegionMake2D(0,0,width_,height_) mipmapLevel:0];auto bitmap=[[NSBitmapImageRep alloc] initWithBitmapDataPlanes:nullptr pixelsWide:width_ pixelsHigh:height_ bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace bitmapFormat:NSBitmapFormatAlphaNonpremultiplied bytesPerRow:width_*4 bitsPerPixel:32];if(!bitmap)throw std::bad_alloc{};for(std::size_t i=0;i<pixels.size();i+=4){std::swap(pixels[i],pixels[i+2]);}std::memcpy(bitmap.bitmapData,pixels.data(),pixels.size());if(!path.parent_path().empty())std::filesystem::create_directories(path.parent_path());if(![[bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:[NSString stringWithUTF8String:path.c_str()] atomically:YES])throw std::runtime_error("Metal PNG capture failed");return "opengl_capture="+path.string()+" backend=metal\n";}}
     bool programmable()const noexcept override{return true;}
@@ -504,8 +537,10 @@ public:
     std::shared_ptr<OpenGlBuffer> bound_buffer(std::uint32_t target)override{return gl_buffer(target);}
     bool fixed_vertex_supported()const noexcept override{return true;}
     void graphics_fixed_targets(const GraphicsView& color,const GraphicsView& depth)override{if(!color.resource || !metal_resource(color.resource).texture)throw std::invalid_argument("固定管線需要色彩繪製表面");fixed_color_=color;fixed_depth_=depth;fixed_targets_set_=true;}
+    bool graphics_fixed_sampler(const std::shared_ptr<GraphicsSampler>& sampler)override{fixed_sampler_=sampler;return true;}
     bool graphics_fixed_texture(const GraphicsView& view)override{if(view.resource && (view.resource->desc.dimension!=3 || view.resource->desc.layers!=1 || view.resource->desc.samples!=1))return false;fixed_texture_=view;return true;}
     void graphics_fixed_stencil(const std::array<std::uint32_t,12>& state)override{fixed_stencil_=state;}
+    void graphics_fixed_visibility(const std::shared_ptr<GraphicsResource>& resource,std::uint32_t offset)override{if(resource && (!metal_resource(resource).buffer || offset%8 || std::uint64_t{offset}+8>resource->desc.width))throw std::invalid_argument("固定管線可見度槽無效");fixed_visibility_=resource;fixed_visibility_offset_=offset;}
     void graphics_fixed_draw(const FixedGraphicsDraw& input)override{@autoreleasepool{
         if(input.topology<1 || input.topology>6 || input.viewport_size[0]<=0 || input.viewport_size[1]<=0)throw std::invalid_argument("固定管線圖元／viewport 不合法");
         for(auto index:input.indices)if(index>=input.vertices.size())throw std::invalid_argument("固定管線索引越界");
@@ -613,7 +648,7 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     const auto u=[&](unsigned i){return static_cast<unsigned>(a[i]);};const auto n=[&](unsigned i){return static_cast<std::int32_t>(u(i));};const auto f=[&](unsigned i){return std::bit_cast<float>(u(i));};const auto d=[&](unsigned i){return std::bit_cast<double>(a[i]);};
     const auto vector=[&](unsigned count,bool wide=false){Vec value{0,0,0,1};for(unsigned i=0;i<count;++i)value[i]=static_cast<float>(number(data,i*(wide?8:4),wide?0x140a:0x1406));return value;};
     if(op==GlOperation::GetError){if(begun_){error(0x502);return 0;}const auto e=error_;error_=0;return e;}
-    if(compiling_ && !replaying_ && op!=GlOperation::IsTexture && op!=GlOperation::GetTexLevelParameteriv && op!=GlOperation::GetTexLevelParameterfv && !(op==GlOperation::TexImage2D && u(0)==0x8064) && op!=GlOperation::EndList && op!=GlOperation::NewList && op!=GlOperation::GenLists && op!=GlOperation::DeleteLists && op!=GlOperation::GenTextures && op!=GlOperation::DeleteTextures && op!=GlOperation::GetIntegerv && op!=GlOperation::GetFloatv && op!=GlOperation::GetDoublev && op!=GlOperation::GetBooleanv && op!=GlOperation::IsEnabled && op!=GlOperation::GetTexEnviv && op!=GlOperation::GetTexEnvfv && op!=GlOperation::ReadPixels && op!=GlOperation::PixelStorei && op!=GlOperation::PushClientAttrib && op!=GlOperation::PopClientAttrib){
+    if(compiling_ && !replaying_ && op!=GlOperation::IsTexture && op!=GlOperation::GetTexLevelParameteriv && op!=GlOperation::GetTexLevelParameterfv && !(op==GlOperation::TexImage2D && u(0)==0x8064) && op!=GlOperation::EndList && op!=GlOperation::NewList && op!=GlOperation::GenLists && op!=GlOperation::DeleteLists && op!=GlOperation::GenTextures && op!=GlOperation::DeleteTextures && op!=GlOperation::GetIntegerv && op!=GlOperation::GetFloatv && op!=GlOperation::GetDoublev && op!=GlOperation::GetBooleanv && op!=GlOperation::IsEnabled && op!=GlOperation::GetTexEnviv && op!=GlOperation::GetTexEnvfv && op!=GlOperation::GetTexParameteriv && op!=GlOperation::GetTexParameterfv && op!=GlOperation::ReadPixels && op!=GlOperation::PixelStorei && op!=GlOperation::PushClientAttrib && op!=GlOperation::PopClientAttrib){
         if(op==GlOperation::TexImage2D || op==GlOperation::TexSubImage2D || op==GlOperation::DrawArrays || op==GlOperation::DrawElements){error(0x502);return 0;}
         const auto bytes=sizeof(Command)+a.size_bytes()+data.size();if(list_bytes_+bytes>32*1024*1024)throw std::bad_alloc{};
         lists_[compiling_].push_back({op,{a.begin(),a.end()},{data.begin(),data.end()}});list_bytes_+=bytes;if(compile_mode_==0x1300)return 0;
@@ -635,8 +670,8 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     case GlOperation::Clear:{if(u(0)&~0x4500U){error(0x501);break;}if(!u(0))break;const auto z=static_cast<float>(state_.depth_clear*2-1);const std::array<Vertex,3> v{{{{-1,-1,z,1},state_.clear,{0,0,0,1}},{{3,-1,z,1},state_.clear,{0,0,0,1}},{{-1,3,z,1},state_.clear,{0,0,0,1}}}};draw(v,MTLPrimitiveTypeTriangle,true,u(0));break;}
     case GlOperation::CullFace:if(u(0)!=0x404 && u(0)!=0x405 && u(0)!=0x408)error(0x500);else state_.cull_face=u(0);break;
     case GlOperation::FrontFace:if(u(0)!=0x900 && u(0)!=0x901)error(0x500);else state_.front_face=u(0);break;
-    case GlOperation::Enable:case GlOperation::Disable:{const auto cap=u(0);if(cap!=0xb71 && cap!=0xb90 && cap!=0xbc0 && cap!=0xbe2 && cap!=0xc11 && cap!=0xde1 && cap!=0xb44 && cap!=0xb60 && !lighting_cap(cap)){error(0x500);break;}if(op==GlOperation::Enable){state_.enabled.insert(cap);if(cap==0xb57)track_color();}else state_.enabled.erase(cap);break;}
-    case GlOperation::IsEnabled:if(u(0)!=0xb71 && u(0)!=0xb90 && u(0)!=0xbc0 && u(0)!=0xbe2 && u(0)!=0xc11 && u(0)!=0xde1 && u(0)!=0xb44 && u(0)!=0xb60 && !lighting_cap(u(0))){error(0x500);return 0;}return state_.enabled.contains(u(0));
+    case GlOperation::Enable:case GlOperation::Disable:{const auto cap=u(0);if(cap!=0xb71 && cap!=0xb90 && cap!=0xbc0 && cap!=0xbe2 && cap!=0xc11 && cap!=0xde1 && cap!=0xb44 && cap!=0xb60 && cap!=0x8037 && cap!=0x2a01 && cap!=0x2a02 && !lighting_cap(cap)){error(0x500);break;}if(op==GlOperation::Enable){state_.enabled.insert(cap);if(cap==0xb57)track_color();}else state_.enabled.erase(cap);break;}
+    case GlOperation::IsEnabled:if(u(0)!=0xb71 && u(0)!=0xb90 && u(0)!=0xbc0 && u(0)!=0xbe2 && u(0)!=0xc11 && u(0)!=0xde1 && u(0)!=0xb44 && u(0)!=0xb60 && u(0)!=0x8037 && u(0)!=0x2a01 && u(0)!=0x2a02 && !lighting_cap(u(0))){error(0x500);return 0;}return state_.enabled.contains(u(0));
     case GlOperation::BlendFunc:if(!factor(u(0)) || !factor(u(1)) || u(1)==0x308)error(0x500);else {state_.blend_src=u(0);state_.blend_dst=u(1);}break;
     case GlOperation::StencilFunc:if(u(0)<0x200 || u(0)>0x207)error(0x500);else {state_.stencil.function=u(0);state_.stencil.reference=static_cast<unsigned>(std::clamp(n(1),0,255));state_.stencil.read_mask=u(2);}break;
     case GlOperation::StencilMask:state_.stencil.write_mask=u(0);break;
@@ -647,6 +682,8 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     case GlOperation::DepthMask:state_.depth_write=u(0)!=0;break;
     case GlOperation::ColorMask:state_.color_mask=(u(0)?1U:0U)|(u(1)?2U:0U)|(u(2)?4U:0U)|(u(3)?8U:0U);break;
     case GlOperation::LineWidth:if(!(f(0)>0))error(0x501);else state_.line_width=f(0);break;
+    case GlOperation::PointSize:if(!(f(0)>0))error(0x501);else state_.point_size=f(0);break;
+    case GlOperation::IndexMask:state_.index_mask=u(0);break;
     case GlOperation::PixelZoom:state_.pixel_zoom={f(0),f(1)};break;
     case GlOperation::RenderMode:{
         // 只有 GL_RENDER 可用：沒有 glSelectBuffer／glFeedbackBuffer，進入 SELECT／FEEDBACK 依規格回報 INVALID_OPERATION。
@@ -701,14 +738,42 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     case GlOperation::TextureCombine:if(u(0)<2 || u(0)>4 || u(1)<2 || u(1)>4)error(0x500);else{state_.texture_color_op=u(0);state_.texture_alpha_op=u(1);state_.texture_arguments=a.size()>2?u(2):(0x80000000U|2U|(1U<<6)|(2U<<12)|(1U<<18));state_.texture_combine_enabled=a.size()>3 && u(3);state_.environments[gl_.active_texture].mode=0;}break;
     case GlOperation::IsTexture:{const auto found=textures_.find(u(0));return u(0)!=0 && u(0)!=UINT32_MAX && found!=textures_.end() && found->second.created;}
     case GlOperation::GenTextures:if(n(0)<0 || static_cast<std::size_t>(u(0))*4>output.size())error(0x501);else if(u(0)>4096-textures_.size())throw std::bad_alloc{};else for(unsigned i=0;i<u(0);++i){while(textures_.contains(next_texture_) && next_texture_!=UINT32_MAX)++next_texture_;if(next_texture_==UINT32_MAX)throw std::bad_alloc{};const auto name=next_texture_++;textures_.try_emplace(name);std::memcpy(output.data()+i*4,&name,4);}break;
-    case GlOperation::DeleteTextures:if(n(0)<0 || static_cast<std::size_t>(u(0))*4>data.size())error(0x501);else {flush(true);for(unsigned i=0;i<u(0);++i){unsigned id;std::memcpy(&id,data.data()+i*4,4);if(id && id!=UINT32_MAX){textures_.erase(id);for(auto& unit:gl_.texture_units)if(unit==id)unit=0;if(state_.binding==id)state_.binding=0;}}}break;
+    case GlOperation::DeleteTextures:if(n(0)<0 || static_cast<std::size_t>(u(0))*4>data.size())error(0x501);else {static const bool delete_sync=[] {const auto* value=std::getenv("X64ARM_METAL_DELETE_SYNC");return value && std::string_view(value)=="1";}();if(delete_sync)flush(true);for(unsigned i=0;i<u(0);++i){unsigned id;std::memcpy(&id,data.data()+i*4,4);if(id && id!=UINT32_MAX){if(const auto found=textures_.find(id);found!=textures_.end()){if(!delete_sync && (found->second.native || found->second.lease))retired_textures_.push_back(std::move(found->second));textures_.erase(found);}for(auto& unit:gl_.texture_units)if(unit==id)unit=0;if(state_.binding==id)state_.binding=0;}}if(retired_textures_.size()>=1024)flush(false,"delete_textures");}break;
+    case GlOperation::PolygonOffset:state_.polygon_offset={f(0),f(1)};break;
+    case GlOperation::GetTexParameteriv:case GlOperation::GetTexParameterfv:{
+        if(u(0)!=0xde1){error(0x500);break;}const auto& t=textures_[state_.binding];std::array<float,4> values{};unsigned count=1;
+        switch(u(1)){
+        case 0x2800:values[0]=static_cast<float>(t.mag);break;case 0x2801:values[0]=static_cast<float>(t.min);break;
+        case 0x2802:values[0]=static_cast<float>(t.s);break;case 0x2803:values[0]=static_cast<float>(t.t);break;
+        case 0x813d:values[0]=static_cast<float>(t.max_level);break;case 0x84fe:values[0]=static_cast<float>(t.anisotropy);break;
+        case 0x1004:count=4;break;case 0x8066:case 0x8067:values[0]=1;break;
+        case 0x8072:values[0]=0x2901;break;case 0x813a:values[0]=-1000;break;case 0x813b:values[0]=1000;break;
+        case 0x813c:case 0x884c:case 0x8191:break;case 0x884b:values[0]=0x1909;break;case 0x884d:values[0]=0x203;break;
+        default:error(0x500);break;}
+        if(output.size()<count*4)throw std::invalid_argument("texture query bounds");
+        for(unsigned i=0;i<count;++i){if(op==GlOperation::GetTexParameterfv)std::memcpy(output.data()+i*4,&values[i],4);else{const auto value=static_cast<std::int32_t>(values[i]);std::memcpy(output.data()+i*4,&value,4);}}break;
+    }
+    case GlOperation::CopyTexSubImage2D:{
+        if(u(0)!=0xde1){error(0x500);break;}if(n(1)<0 || u(1)>14 || n(2)<0 || n(3)<0 || n(6)<0 || n(7)<0){error(0x501);break;}
+        auto& texture=textures_[state_.binding];if(!texture.native || !texture.formats.contains(u(1))){error(0x502);break;}
+        const auto width=std::max<NSUInteger>(1,texture.native.width>>u(1)),height=std::max<NSUInteger>(1,texture.native.height>>u(1));
+        if(u(2)>width || u(3)>height || u(6)>width-u(2) || u(7)>height-u(3)){error(0x501);break;}
+        if(!u(6) || !u(7))break;
+        // 先保存來源像素，再更新目的紋理；重疊、FBO 與預設 framebuffer 共用讀回及格式轉換。
+        std::vector<std::uint8_t> pixels(static_cast<std::size_t>(u(6))*u(7)*4);
+        auto saved=pixel_;struct Restore {decltype(pixel_)& target;decltype(pixel_) saved;~Restore(){target=std::move(saved);}} restore{pixel_,std::move(saved)};
+        pixel_.clear();pixel_[0xd05]=pixel_[0xcf5]=1;
+        const std::array<std::uint64_t,6> read{a[4],a[5],a[6],a[7],0x1908,0x1401};
+        const auto old_error=error_;error_=0;execute(GlOperation::ReadPixels,read,{},pixels);const auto read_error=error_;error_=old_error?old_error:read_error;if(read_error)break;
+        const std::array<std::uint64_t,8> write{a[0],a[1],a[2],a[3],a[6],a[7],0x1908,0x1401};gl_texture(write,pixels,true);break;
+    }
     case GlOperation::TexParameteri:case GlOperation::TexParameterf:{if(u(1)==0x84fe){const auto value=op==GlOperation::TexParameterf?f(2):static_cast<float>(n(2));if(u(0)!=0xde1)error(0x500);else if(!std::isfinite(value) || value<1)error(0x501);else textures_[state_.binding].anisotropy=static_cast<unsigned>(std::clamp(value,1.F,16.F));break;}if(op==GlOperation::TexParameterf && (!std::isfinite(f(2)) || f(2)<0 || f(2)>65535)){error(0x500);break;}const auto value=op==GlOperation::TexParameteri?u(2):static_cast<unsigned>(f(2));if(u(0)!=0xde1){error(0x500);break;}auto& t=textures_[state_.binding];if(u(1)==0x813d){if(value>INT32_MAX)error(0x501);else t.max_level=value;}else if(u(1)==0x2801){if(value!=0x2600 && value!=0x2601 && (value<0x2700 || value>0x2703))error(0x500);else t.min=value;}else if(u(1)==0x2800){if(value!=0x2600 && value!=0x2601)error(0x500);else t.mag=value;}else if(u(1)==0x2802 || u(1)==0x2803){if(value!=0x2901 && value!=0x812f && value!=0x812d && value!=0x8370)error(0x500);else (u(1)==0x2802?t.s:t.t)=value;}else error(0x500);break;}
     case GlOperation::GetTexLevelParameteriv:case GlOperation::GetTexLevelParameterfv:texture_level(op,a,output);break;
     case GlOperation::TexImage2D:case GlOperation::TexSubImage2D:gl_texture(a,data,op==GlOperation::TexSubImage2D);break;
     case GlOperation::PixelStorei:if((u(0)<0xcf0 || u(0)>0xcf5) && (u(0)<0xd00 || u(0)>0xd05))error(0x500);else if(n(1)<0 || ((u(0)&15)==5 && u(1)!=1 && u(1)!=2 && u(1)!=4 && u(1)!=8))error(0x501);else pixel_[u(0)]=(u(0)&15)<=1?(u(1)?1:0):n(1);break;
     case GlOperation::PushClientAttrib:if(pixel_stack_.size()>=16)error(0x503);else pixel_stack_.push_back((u(0)&1)?pixel_:std::map<unsigned,int>{});break;
     case GlOperation::PopClientAttrib:if(pixel_stack_.empty())error(0x504);else {if(!pixel_stack_.back().empty())pixel_=pixel_stack_.back();pixel_stack_.pop_back();}break;
-    case GlOperation::PushAttrib:if(u(0)!=0xfffffU && (u(0)&~0xcfdedU))error(0x501);else if(attributes_.size()>=16)error(0x503);else {
+    case GlOperation::PushAttrib:if(u(0)!=0xfffffU && (u(0)&~0xcfdefU))error(0x501);else if(attributes_.size()>=16)error(0x503);else {
         AttributeSnapshot snapshot;snapshot.mask=u(0);snapshot.state=state_;
         snapshot.programmable={gl_.src_alpha,gl_.dst_alpha,gl_.equation_rgb,gl_.equation_alpha,gl_.polygon_mode};snapshot.current_attributes=gl_.attribute_values;
         if(u(0)&0x40000){
@@ -720,9 +785,11 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     case GlOperation::PopAttrib:if(attributes_.empty())error(0x504);else {const auto snapshot=std::move(attributes_.back());attributes_.pop_back();const auto mask=snapshot.mask;const auto& s=snapshot.state;
         if(mask==0xfffffU)state_=s;
         if(mask&1)gl_.attribute_values=snapshot.current_attributes;
+        if(mask&2)state_.point_size=s.point_size;
+        if(mask&0x4000)state_.index_mask=s.index_mask;
         if(mask&0x4000){gl_.src_alpha=snapshot.programmable[0];gl_.dst_alpha=snapshot.programmable[1];gl_.equation_rgb=snapshot.programmable[2];gl_.equation_alpha=snapshot.programmable[3];}
-        if(mask&8)state_.read_buffer=s.read_buffer;
-        if(mask&0x20){gl_.polygon_mode=snapshot.programmable[4];state_.cull_face=s.cull_face;state_.front_face=s.front_face;state_.enabled.erase(0xb44);if(s.enabled.contains(0xb44))state_.enabled.insert(0xb44);}
+        if(mask&0x20)state_.read_buffer=s.read_buffer;
+        if(mask&8){state_.polygon_offset=s.polygon_offset;for(const unsigned cap:{0x8037U,0x2a01U,0x2a02U}){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}gl_.polygon_mode=snapshot.programmable[4];state_.cull_face=s.cull_face;state_.front_face=s.front_face;state_.enabled.erase(0xb44);if(s.enabled.contains(0xb44))state_.enabled.insert(0xb44);}
 
         if(mask&0x40000){
             gl_.active_texture=snapshot.active;gl_.texture_units=snapshot.units;state_.binding=s.binding;state_.environments=s.environments;

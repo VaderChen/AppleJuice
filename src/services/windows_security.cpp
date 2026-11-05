@@ -31,6 +31,7 @@ std::span<const WindowsServiceDescriptor> security_service_descriptors() {
         {"advapi32.dll","GetNamedSecurityInfoA",8},{"advapi32.dll","GetNamedSecurityInfoW",8},
         {"advapi32.dll","SetNamedSecurityInfoA",7},{"advapi32.dll","SetNamedSecurityInfoW",7},
         {"advapi32.dll","SetEntriesInAclA",4},{"advapi32.dll","SetEntriesInAclW",4},{"advapi32.dll","GetExplicitEntriesFromAclA",3},{"advapi32.dll","GetExplicitEntriesFromAclW",3},{"advapi32.dll","BuildExplicitAccessWithNameA",5},{"advapi32.dll","BuildExplicitAccessWithNameW",5},{"advapi32.dll","BuildTrusteeWithNameA",2},{"advapi32.dll","BuildTrusteeWithNameW",2},{"advapi32.dll","BuildTrusteeWithSidA",2},{"advapi32.dll","BuildTrusteeWithSidW",2},{"advapi32.dll","GetTrusteeNameA",1},{"advapi32.dll","GetTrusteeNameW",1},{"advapi32.dll","GetTrusteeTypeA",1},{"advapi32.dll","GetTrusteeTypeW",1},{"advapi32.dll","GetTrusteeFormA",1},{"advapi32.dll","GetTrusteeFormW",1},
+        {"advapi32.dll","GetEffectiveRightsFromAclA",3},{"advapi32.dll","GetEffectiveRightsFromAclW",3},
         {"advapi32.dll","IsValidAcl",1},{"advapi32.dll","GetAclInformation",4},{"advapi32.dll","SetAclInformation",4},
         {"advapi32.dll","GetAce",3},{"advapi32.dll","DeleteAce",2},{"advapi32.dll","AddAce",5},{"advapi32.dll","FindFirstFreeAce",2},
         {"advapi32.dll","AddAccessAllowedAce",4},{"advapi32.dll","AddAccessAllowedAceEx",5},
@@ -297,6 +298,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
             if(explicit_entry){memory.store(GuestAddress{arg(0)},32,u32(2));memory.store(GuestAddress{arg(0)+4},32,u32(3));memory.store(GuestAddress{arg(0)+8},32,u32(4));}
             memory.store(GuestAddress{trustee+unit+4},32,symbol.starts_with("BuildTrusteeWithSid")?0U:1U);memory.store(GuestAddress{trustee+name_offset},bits,arg(1));
         }
+    }else if(symbol.starts_with("GetEffectiveRightsFromAcl")){
+        try{
+            if(!arg(0) || !arg(1) || !arg(2))throw SddlError{87};
+            memory.check(GuestAddress{arg(2)},4,Access::Write);initialize_tokens();
+            const auto& primary=runtime_.token_objects.at(1);
+            const auto trustee=read_trustee(memory,arg(1),x86_,symbol.ends_with('W'),[&](std::string_view name){
+                if(const auto account=security::resolve_account(name,primary.user.sid))return account->sid;
+                return security_trustee_name(name);
+            });
+            std::vector<std::vector<std::uint8_t>> memberships{trustee,sddl_sid("WD")};
+            // 帳號群組與登入工作階段不同：不把互動式、Authenticated Users 或權限加入有效 ACL 權利。
+            if(trustee==primary.user.sid)for(const auto& group:primary.groups){
+                const auto account=security::find_account(group.sid);
+                if(account && (account->type==2 || account->type==4))memberships.push_back(group.sid);
+            }
+            const auto acl=read_acl(memory,arg(0));std::uint32_t granted=0,denied=0;
+            for(const auto offset:acl.offsets){
+                const auto ace=basic_ace(std::span{acl.bytes}.subspan(offset));
+                if(ace.type==1 && (ace.flags&16U))throw SddlError{1336};
+                if(ace.flags&8U || ace.type>1)continue;
+                if(std::find(memberships.begin(),memberships.end(),ace.sid)==memberships.end())continue;
+                if(ace.type==1)denied|=ace.mask;else granted|=ace.mask;
+            }
+            memory.store(GuestAddress{arg(2)},32,granted&~denied);result=0;
+        }catch(const SddlError& error){result=error.code;}catch(const MemoryFault&){result=998;}catch(const std::bad_alloc&){result=8;}
     }else if(symbol.starts_with("SetEntriesInAcl") || symbol.starts_with("GetExplicitEntriesFromAcl")){
         const bool setting=symbol.starts_with("Set");const unsigned unit=x86_?4:8,entry_size=x86_?32:48,trustee_offset=x86_?12:16,name_offset=x86_?16:24;const std::uint8_t bits=x86_?32:64;
         try {
@@ -633,7 +659,7 @@ std::vector<std::uint8_t> encode_virtual_token(const VirtualToken& token){
     std::vector<std::uint8_t> bytes;
     const auto number=[&](std::uint32_t value){const auto offset=bytes.size();bytes.resize(offset+4);token_put(bytes,offset,value);};
     const auto blob=[&](const std::vector<std::uint8_t>& value){number(static_cast<std::uint32_t>(value.size()));bytes.insert(bytes.end(),value.begin(),value.end());};
-    number(0x354b5458);number(token.type);number(token.level);number(token.integrity);number(token.session);
+    number(token.network_password?0x364b5458:0x354b5458);number(token.type);number(token.level);number(token.integrity);number(token.session);
     number(static_cast<std::uint32_t>(token.application_model));
     number((token.restriction_check?1U:0U)|(token.write_restricted?2U:0U)|(token.sandbox_inert?4U:0U)|(token.virtualization_enabled?8U:0U)|(token.child_process_restricted?16U:0U));
     number(token.user.attributes);blob(token.user.sid);blob(token.owner);blob(token.primary_group);blob(token.default_dacl);blob(token.object_descriptor);
@@ -642,6 +668,11 @@ std::vector<std::uint8_t> encode_virtual_token(const VirtualToken& token){
     number(static_cast<std::uint32_t>(token.privileges.size()));
     for(const auto& privilege:token.privileges){number(static_cast<std::uint32_t>(privilege.luid));number(static_cast<std::uint32_t>(privilege.luid>>32));number(privilege.attributes);}
     number(static_cast<std::uint32_t>(token.modified_id));number(static_cast<std::uint32_t>(token.modified_id>>32));
+    if(token.network_password){
+        for(const auto* value:std::array<const std::u16string*,3>{&token.network_user,&token.network_domain,&token.network_password->value}){
+            number(static_cast<std::uint32_t>(value->size()));for(const auto c:*value){bytes.push_back(static_cast<std::uint8_t>(c));bytes.push_back(static_cast<std::uint8_t>(c>>8));}
+        }
+    }
     return bytes;
 }
 std::optional<VirtualToken> decode_virtual_token(std::span<const std::uint8_t> bytes){
@@ -651,7 +682,7 @@ std::optional<VirtualToken> decode_virtual_token(std::span<const std::uint8_t> b
         const auto number=[&](){if(bytes.size()-cursor<4)throw SddlError{13};std::uint32_t value=0;for(unsigned i=0;i<4;++i)value|=std::uint32_t{bytes[cursor++]}<<(i*8);return value;};
         const auto blob=[&](){const auto size=number();if(size>bytes.size()-cursor)throw SddlError{13};std::vector<std::uint8_t> value(bytes.data()+cursor,bytes.data()+cursor+size);cursor+=size;return value;};
         const auto valid_sid=[](const std::vector<std::uint8_t>& sid){return sid.size()>=8 && sid[0]==1 && sid[1]<=15 && sid.size()==8U+4U*sid[1];};
-        const auto version=number();if(version!=0x314b5458 && version!=0x324b5458 && version!=0x334b5458 && version!=0x344b5458 && version!=0x354b5458)throw SddlError{13};VirtualToken token;token.type=number();token.level=number();token.integrity=number();token.session=number();
+        const auto version=number();if(version!=0x314b5458 && version!=0x324b5458 && version!=0x334b5458 && version!=0x344b5458 && version!=0x354b5458 && version!=0x364b5458)throw SddlError{13};VirtualToken token;token.type=number();token.level=number();token.integrity=number();token.session=number();
         const auto model=version!=0x314b5458 && !legacy_lsa?number():legacy_lsa?0U:1U;if(model>1)throw SddlError{13};token.application_model=static_cast<ApplicationModel>(model);const auto flags=number();
         if((token.type!=1 && token.type!=2) || token.level>3 || token.integrity>0x5000 || (flags&~(version>=0x334b5458?31U:15U)))throw SddlError{13};
         token.restriction_check=flags&1;token.write_restricted=flags&2;token.sandbox_inert=flags&4;token.virtualization_enabled=flags&8;
@@ -660,11 +691,18 @@ std::optional<VirtualToken> decode_virtual_token(std::span<const std::uint8_t> b
         if(!valid_sid(token.user.sid) || !valid_sid(token.owner) || !valid_sid(token.primary_group) || token.object_descriptor.size()<20)throw SddlError{13};
         for(auto* list:{&token.groups,&token.restricted}){const auto count=number();if(count>1024)throw SddlError{13};for(unsigned i=0;i<count;++i){const auto attributes=number();auto sid=blob();if(!valid_sid(sid))throw SddlError{13};list->push_back({std::move(sid),attributes});}}
         if(version>=0x344b5458 || (version==0x324b5458 && legacy_lsa)){const auto wide=[&](){const auto low=number(),high=number();return std::uint64_t{low}|(std::uint64_t{high}<<32);};token.authentication_id=wide();token.source_id=wide();token.expires=wide();if(bytes.size()-cursor<8)throw SddlError{13};std::copy_n(bytes.begin()+static_cast<std::ptrdiff_t>(cursor),8,token.source.begin());cursor+=8;}
-        if(version==0x354b5458){
+        if(version>=0x354b5458){
             const auto count=number();if(count>privilege_names.size())throw SddlError{13};std::set<std::uint64_t> seen;
             for(unsigned i=0;i<count;++i){const auto low=number(),high=number(),attributes=number();const auto luid=std::uint64_t{low}|(std::uint64_t{high}<<32);
                 if(luid<2 || luid>=2+privilege_names.size() || (attributes&~0x80000003U) || !seen.insert(luid).second)throw SddlError{13};token.privileges.push_back({luid,attributes});}
             const auto low=number(),high=number();token.modified_id=std::uint64_t{low}|(std::uint64_t{high}<<32);
+        }
+        if(version==0x364b5458){
+            token.network_password=std::make_shared<authentication::Secret>();
+            for(auto* value:{&token.network_user,&token.network_domain,&token.network_password->value}){
+                const auto count=number();if(count>4096 || count>(bytes.size()-cursor)/2)throw SddlError{13};
+                value->reserve(count);for(unsigned i=0;i<count;++i){value->push_back(static_cast<char16_t>(bytes[cursor]|(std::uint16_t{bytes[cursor+1]}<<8)));cursor+=2;}
+            }
         }
         if(cursor!=bytes.size())throw SddlError{13};(void)stored_token_descriptor(token.object_descriptor);return token;
     }catch(const SddlError&){return {};}catch(const std::out_of_range&){return {};}

@@ -1,18 +1,21 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
+#include "guest_heap_cache_layout.h"
 
 namespace x64arm::detail::guest_heap_layout {
 // 與客體配置常式及宿主補充器共用；worker 只消耗已存在的 chunk。
 inline constexpr std::uint64_t guest_heap_chunk=0x40000,guest_heap_header=64,
     guest_heap_magic=0x50414548343658abULL,guest_heap_small_limit=4096,
     guest_heap_limit=65536,guest_heap_reservation=UINT64_C(0x100000000),
-    guest_heap_aligned_header=16;
+    guest_heap_aligned_header=X64ARM_GUEST_HEAP_ALIGNED_HEADER;
 inline constexpr unsigned guest_heap_heads=0x40;
-// x64 每執行緒級距快取（TEB 的 CRT 私有頁，與 guest_scalar_math_x64.s 相同）：級距 1～64 的串列頭 +0x4600+class*8、
+// x64 每執行緒級距快取（TEB 的 CRT 私有頁）：涵蓋 1 KiB payload 與對齊標頭，串列頭 +0x4600+class*8、
 // 數量 +0x4810+class（每級距至多 32）。只有該執行緒的客體常式讀寫；宿主在執行緒結束時歸還全域串列。
-inline constexpr std::uint64_t guest_heap_cache_offset=0x4600,guest_heap_cache_count_offset=0x4810;
-inline constexpr unsigned guest_heap_cache_classes=64,guest_heap_cache_limit=32;
+inline constexpr std::uint64_t guest_heap_cache_offset=X64ARM_GUEST_HEAP_CACHE_HEAD_OFFSET,
+    guest_heap_cache_count_offset=X64ARM_GUEST_HEAP_CACHE_COUNT_OFFSET;
+inline constexpr unsigned guest_heap_cache_classes=X64ARM_GUEST_HEAP_CACHE_CLASSES,
+    guest_heap_cache_limit=X64ARM_GUEST_HEAP_CACHE_LIMIT;
 constexpr std::uint64_t guest_heap_class(std::uint64_t size) {
     return size<=guest_heap_small_limit?std::max(UINT64_C(1),(size+15)/16):
         256+(size-guest_heap_small_limit+255)/256;

@@ -29,6 +29,7 @@ constexpr Command commands[]{
     {"glCullFace",GlOperation::CullFace,1,0,0},
     {"glFrontFace",GlOperation::FrontFace,1,0,0},
     {"glPolygonMode",GlOperation::PolygonMode,2,0,0},
+    {"glPolygonOffset",GlOperation::PolygonOffset,2,3,0},
     {"glCreateShader",GlOperation::CreateShader,1,0,0},
     {"glShaderSource",GlOperation::ShaderSource,4,0,0},
     {"glCompileShader",GlOperation::CompileShader,1,0,0},
@@ -126,6 +127,8 @@ constexpr Command commands[]{
     {"glDepthRange",GlOperation::DepthRange,2,0,3},
     {"glColorMask",GlOperation::ColorMask,4,0,0},
     {"glLineWidth",GlOperation::LineWidth,1,1,0},
+    {"glPointSize",GlOperation::PointSize,1,1,0},
+    {"glIndexMask",GlOperation::IndexMask,1,0,0},
     {"glPixelZoom",GlOperation::PixelZoom,2,3,0},
     {"glRenderMode",GlOperation::RenderMode,1,0,0},
     {"glShadeModel",GlOperation::ShadeModel,1,0,0},
@@ -160,6 +163,9 @@ constexpr Command commands[]{
     {"glDeleteTextures",GlOperation::DeleteTextures,2,0,0},
     {"glTexImage2D",GlOperation::TexImage2D,9,0,0},
     {"glTexSubImage2D",GlOperation::TexSubImage2D,9,0,0},
+    {"glCopyTexSubImage2D",GlOperation::CopyTexSubImage2D,8,0,0},
+    {"glGetTexParameteriv",GlOperation::GetTexParameteriv,3,0,0},
+    {"glGetTexParameterfv",GlOperation::GetTexParameterfv,3,0,0},
     {"glTexParameterf",GlOperation::TexParameterf,3,4,0},
     {"glTexParameteri",GlOperation::TexParameteri,3,0,0},
     {"glTexEnvi",GlOperation::TexEnvi,3,0,0},
@@ -223,7 +229,7 @@ unsigned query_size(std::uint32_t p){
     default:break;}
     // 只對已知 scalar query 提供儲存空間，避免驅動寫出未知長度。
     switch(p){
-    case 0xd16:case 0xd17:
+    case 0xd16:case 0xd17:case 0x8038:case 0x2a00:case 0x8037:case 0x2a01:case 0x2a02:
     case 0xb01:case 0xb08:case 0xb10:case 0xb11:case 0xb13:case 0xb20:case 0xb21:case 0xb23:case 0xb24:case 0xb25:case 0xb30:case 0xb31:case 0xb32:
     case 0xb41:case 0xb42:case 0xb43:case 0xb44:case 0xb45:case 0xb46:case 0xb50:case 0xb51:case 0xb52:case 0xb54:case 0xb55:case 0xb56:case 0xb57:
     case 0xb60:case 0xb61:case 0xb62:case 0xb63:case 0xb64:case 0xb65:case 0xb71:case 0xb72:case 0xb73:case 0xb74:case 0xb90:case 0xb91:case 0xb92:case 0xb93:case 0xb94:case 0xb95:case 0xb96:case 0xb97:case 0xb98:
@@ -231,7 +237,7 @@ unsigned query_size(std::uint32_t p){
     case 0xc00:case 0xc01:case 0xc02:case 0xc11:case 0xc20:case 0xc21:case 0xc30:case 0xc31:case 0xc32:case 0xc33:case 0xc40:case 0xc50:case 0xc51:case 0xc52:case 0xc53:case 0xc54:
     case 0xcf0:case 0xcf1:case 0xcf2:case 0xcf3:case 0xcf4:case 0xcf5:case 0xd00:case 0xd01:case 0xd02:case 0xd03:case 0xd04:case 0xd05:
     case 0xd30:case 0xd31:case 0xd32:case 0xd33:case 0xd34:case 0xd35:case 0xd36:case 0xd37:case 0xd38:case 0xd39:case 0xd3b:case 0xd50:case 0xd51:case 0xd52:case 0xd53:case 0xd54:case 0xd55:case 0xd56:case 0xd57:case 0xd58:case 0xd59:
-    case 0x85b5:case 0x8f36:case 0x8f37:case 0x8a28:
+    case 0x85b5:case 0x8f36:case 0x8f37:case 0x8a28:case 0x8642:
     case 0x84ff:case 0x8b4d:case 0x8872:case 0x8b4c:case 0x8869:case 0x8cdf:case 0x8824:case 0x8b8d:case 0x8894:case 0x8895:case 0x84e0:case 0x821b:case 0x821c:case 0x821d:
     case 0xde0:case 0xde1:case 0x8068:case 0x8069:case 0x8074:case 0x8075:case 0x8076:case 0x8078:case 0x8086:case 0x8087:case 0x8088:case 0x808a:case 0x808b:case 0x808c:case 0x808d:case 0x808e:case 0x808f:case 0x8090:case 0x8091:case 0x8092:case 0x8093:return 1;
     default:return 0;}
@@ -257,7 +263,7 @@ std::span<const WindowsServiceDescriptor> opengl_service_descriptors(){
         const WindowsServiceDescriptor extra[]{
             {"opengl32.dll","wglCreateContext",1},{"opengl32.dll","wglDeleteContext",1},{"opengl32.dll","wglShareLists",2},{"opengl32.dll","wglMakeCurrent",2},
             {"opengl32.dll","wglGetCurrentContext",0},{"opengl32.dll","wglGetCurrentDC",0},{"opengl32.dll","wglGetProcAddress",1},
-            {"opengl32.dll","wglSwapIntervalEXT",1},{"opengl32.dll","wglGetSwapIntervalEXT",0},
+            {"opengl32.dll","wglSwapIntervalEXT",1},{"opengl32.dll","wglGetSwapIntervalEXT",0},{"opengl32.dll","wglSwapLayerBuffers",2},
             {"opengl32.dll","wglGetExtensionsStringARB",1},{"opengl32.dll","wglChoosePixelFormatARB",6},
             {"opengl32.dll","wglGetPixelFormatAttribivARB",6},{"opengl32.dll","wglGetPixelFormatAttribfvARB",6},{"opengl32.dll","wglCreateContextAttribsARB",3},
             {"opengl32.dll","glGetStringi",2},{"opengl32.dll","glGetPointerv",2},{"opengl32.dll","glGetString",1},{"opengl32.dll","glVertexPointer",4},{"opengl32.dll","glColorPointer",4},{"opengl32.dll","glNormalPointer",3},{"opengl32.dll","glTexCoordPointer",4},
@@ -362,8 +368,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
     if(!h){if(symbol=="wglSwapIntervalEXT" || symbol=="wglGetSwapIntervalEXT")last_error_=1425;else if(symbol=="SwapBuffers" || symbol.starts_with("wgl"))last_error_=6;return finish(0);}
     auto& c=opengl_.contexts.at(h);++c.calls;
     const auto upload=[&](unsigned index,std::int32_t size,std::uint32_t type,std::span<const std::uint8_t> bytes,bool enabled){try{c.native->array(index,size,type,bytes,enabled);return true;}catch(const std::bad_alloc&){error(c,out_of_memory);return false;}};
-    if(symbol=="SwapBuffers"){
+    if(symbol=="SwapBuffers" || symbol=="wglSwapLayerBuffers"){
         if(arg(0)!=c.dc || !gui_.windows.contains(c.window)){last_error_=6;return finish(0);}
+        // 目前公開的 pixel format 只有雙緩衝主平面，PFD 的 overlay／underlay 數皆為零。
+        // 空集合不交換；指定不存在的平面失敗，不能將主平面交換當作所有平面已完成。
+        if(symbol=="wglSwapLayerBuffers"){
+            if(d(1)&~1U){last_error_=87;return finish(0);}
+            if(!d(1))return finish(1);
+        }
         if(c.beginning){error(c,invalid_operation);last_error_=87;return finish(0);}
         const auto& w=gui_.windows.at(c.window);try{c.native->drawable(native_gui_?native_gui_->graphics_view(c.window):nullptr,std::max(1U,w.width),std::max(1U,w.height));}catch(const std::bad_alloc&){last_error_=8;return finish(0);}
         const auto interval=window_interval(c.window);if(c.interval!=interval && !c.native->swap_interval(interval)){last_error_=31;return finish(0);}c.interval=interval;
@@ -513,6 +525,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
     }else if(symbol=="glTexEnviv" || symbol=="glTexEnvfv" || symbol=="glGetTexEnviv" || symbol=="glGetTexEnvfv"){
         if(d(0)!=0x2300 || (d(1)!=0x2200 && d(1)!=0x2201)){error(c,invalid_enum);return finish(0);}
         const auto bytes=d(1)==0x2201?16U:4U;if(symbol.starts_with("glGet"))set_output(arg(2),bytes);else set_input(arg(2),bytes);
+    }else if(symbol=="glGetTexParameteriv" || symbol=="glGetTexParameterfv"){
+        unsigned count=1;switch(d(1)){
+        case 0x1004:count=4;break;
+        case 0x2800:case 0x2801:case 0x2802:case 0x2803:case 0x8072:case 0x8066:case 0x8067:
+        case 0x813a:case 0x813b:case 0x813c:case 0x813d:case 0x84fe:case 0x884b:case 0x884c:case 0x884d:case 0x8191:break;
+        default:error(c,invalid_enum);return finish(0);}
+        set_output(arg(2),count*4);
     }else if(symbol=="glTexImage2D" || symbol=="glTexSubImage2D"){
         const bool sub=symbol=="glTexSubImage2D",proxy=!sub && d(0)==0x8064;const unsigned wi=sub?4:3,hi=sub?5:4;
         if(n(wi)<0 || n(hi)<0 || (!proxy && (n(wi)>16384 || n(hi)>16384))){error(c,invalid_value);return finish(0);}if(!proxy && arg(8)){const auto bytes=pixel_bytes(c.client,n(wi),n(hi),d(6),d(7),false);if(!bytes){error(c,invalid_enum);return finish(0);}set_input(arg(8),*bytes);}

@@ -13,7 +13,7 @@ struct GlslUniform {
 struct GlslSampler { std::string name;std::uint32_t texture{},sampler{},count{1}; };
 struct GlslStage {
     std::uint32_t stage{},buffer_index{};
-    std::string msl,flipped_msl,entry,clip_mask,point_size_enabled;
+    std::string msl,flipped_msl,entry,clip_mask,point_size_enabled,point_size_value;
     std::vector<GlslAttribute> attributes;
     std::vector<GlslUniform> uniforms;
     std::vector<GlslSampler> samplers;

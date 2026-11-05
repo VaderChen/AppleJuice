@@ -259,7 +259,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,Gue
         const auto flags=static_cast<std::uint32_t>(arg(0));const bool wide=service.symbol.back()=='W';
         const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
         if (flags&~0x3fffU || !(flags&0x1c00) || ((flags&0x400) && (flags&0x1800))) fail(87);
-        else if (arg(3) && arg(3)!=0x409 && !(flags&0x400)) fail(1815);
+        // LANG_NEUTRAL 的預設／系統預設是資源選擇規則，不能當成不存在的具體語言。
+        // 內建系統訊息的預設資源為英文，明確指定其他具體語言仍回報資源不存在。
+        else if (arg(3) && arg(3)!=0x400 && arg(3)!=0x800 && arg(3)!=0x409 && !(flags&0x400)) fail(1815);
         else {
             std::u16string text;
             if (flags&0x400) text=wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(read_ansi(memory,arg(1)));

@@ -76,7 +76,8 @@ template<class T> struct Cf {
     Cf(const Cf&)=delete;
 };
 #endif
-inline std::vector<std::uint8_t> encode(const GraphicsResourceDesc& d,std::uint32_t format,const std::function<std::vector<std::uint8_t>(unsigned)>& read){
+struct EncodeOptions {double quality{-1};std::uint32_t tiff_compression{1};};
+inline std::vector<std::uint8_t> encode(const GraphicsResourceDesc& d,std::uint32_t format,const std::function<std::vector<std::uint8_t>(unsigned)>& read,EncodeOptions options={}){
     if(format==4)return dds(d,read);
     // 一般影像格式保存第一個 2D 子資源；DDS 才能完整保存 array／volume。
     if(d.dimension!=3 || d.samples!=1 || !d.width || !d.height || std::uint64_t{d.width}*d.height>64U*1024U*1024U)
@@ -86,7 +87,7 @@ inline std::vector<std::uint8_t> encode(const GraphicsResourceDesc& d,std::uint3
         throw Error(0x88982f80U,"影像編碼器不支援此紋理像素格式；可改存 DDS");
     if(bytes.size()!=std::uint64_t{d.width}*d.height*4)throw Error(0x80070057U,"影像像素長度不符");
     for(std::size_t i=0;i<bytes.size();i+=4){if(d.format>=87)std::swap(bytes[i],bytes[i+2]);if(d.format==88 || d.format==93)bytes[i+3]=255;}
-    if(format==10)return tiff_rgba(d,bytes);
+    if(format==10 && options.tiff_compression==1)return tiff_rgba(d,bytes);
 #ifdef __APPLE__
     CFStringRef type=nullptr;
     switch(format){case 0:type=CFSTR("com.microsoft.bmp");break;case 1:type=CFSTR("public.jpeg");break;case 3:type=CFSTR("public.png");break;case 10:type=CFSTR("public.tiff");break;case 11:type=CFSTR("com.compuserve.gif");break;default:throw Error(0x88982f50U,"沒有對應的原生影像編碼器");}
@@ -99,7 +100,21 @@ inline std::vector<std::uint8_t> encode(const GraphicsResourceDesc& d,std::uint3
     if(!image.value || !data.value)throw std::bad_alloc{};
     Cf destination(CGImageDestinationCreateWithData(data.value,type,1,nullptr));
     if(!destination.value)throw Error(0x88982f50U,"原生影像編碼器不可用");
-    CGImageDestinationAddImage(destination.value,image.value,nullptr);
+    Cf properties(CFDictionaryCreateMutable(nullptr,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks));
+    if(!properties.value)throw std::bad_alloc{};
+    if(format==1 && options.quality>=0){
+        if(options.quality>1)throw Error(0x80070057U,"JPEG 品質參數超出範圍");
+        Cf quality(CFNumberCreate(nullptr,kCFNumberDoubleType,&options.quality));if(!quality.value)throw std::bad_alloc{};
+        CFDictionarySetValue(properties.value,kCGImageDestinationLossyCompressionQuality,quality.value);
+    }
+    if(format==10){
+        Cf tiff(CFDictionaryCreateMutable(nullptr,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks));
+        auto value=static_cast<std::int32_t>(options.tiff_compression);Cf compression(CFNumberCreate(nullptr,kCFNumberSInt32Type,&value));
+        if(!tiff.value || !compression.value)throw std::bad_alloc{};
+        CFDictionarySetValue(tiff.value,kCGImagePropertyTIFFCompression,compression.value);
+        CFDictionarySetValue(properties.value,kCGImagePropertyTIFFDictionary,tiff.value);
+    }
+    CGImageDestinationAddImage(destination.value,image.value,properties.value);
     if(!CGImageDestinationFinalize(destination.value))throw Error(0x80004005U,"原生影像編碼失敗");
     const auto* begin=CFDataGetBytePtr(data.value);
     return {begin,begin+CFDataGetLength(data.value)};

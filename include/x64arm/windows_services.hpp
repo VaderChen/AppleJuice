@@ -2,6 +2,7 @@
 #include "x64arm/host_services.hpp"
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 #include <unordered_map>
@@ -105,6 +106,7 @@ struct DataProtectionState;
 struct WinmmMidiOutput;
 struct WinmmMidiInput;
 struct WinmmWaveOutput;
+struct XAudioState;
 struct WinmmBeepTone;
 struct AcmState;
 struct WinmmWaveInput;
@@ -188,6 +190,7 @@ public:
     // 不取共用命名空間鎖，判斷這組 handle 是否「可能」就緒（resolve_thread_waits 與前置判斷共用）。
     bool wait_may_be_ready(const std::vector<std::uint64_t>& handles,bool all,std::uint64_t thread_id);
     bool resident_runnable_waiting(std::span<GuestState* const>) const override;
+    void trace_guest_thread_waits(std::FILE* out,const GuestMemory* memory=nullptr) const;
     GuestState* resident_idle_replacement(GuestState&,GuestMemory&,std::span<GuestState* const>) override;
     bool resident_block_service_impl(GuestState&,GuestMemory&,std::span<GuestState* const>,GuestState*&,int* outcome);
 #endif
@@ -356,7 +359,8 @@ public:
     void set_registry_file(std::filesystem::path path);
     std::string process_diagnostics() const;
     std::uint32_t process_id() const noexcept;
-    void set_process_directory(std::u16string directory);
+    void set_process_directory(GuestMemory&,std::u16string directory);
+    std::uint32_t change_current_directory(GuestMemory&,std::u16string directory);
     std::string video_diagnostics() const;
     std::string opengl_diagnostics() const;
     std::string dsound_diagnostics() const;
@@ -636,6 +640,12 @@ private:
     void unpublish_gui_window(std::uint64_t);
     std::optional<SharedWindowInfo> shared_gui_window(std::uint64_t,bool enforce_job=true);
     bool invoke_remote_gui(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    bool invoke_remote_gui_message(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::uint32_t receive_remote_gui_message(std::uint32_t,std::uint64_t,std::uint64_t,std::uint32_t,std::uint32_t,const std::array<std::uint64_t,5>&,std::uint32_t);
+    void cancel_remote_gui_message(std::uint32_t,std::uint64_t,std::uint64_t);
+    void poll_remote_gui_messages(GuestMemory&);
+    void reply_remote_gui_message(std::uint64_t);
+    bool remote_gui_messages_waiting()const;
     void publish_remote_frame(std::uint64_t,NativeGraphics&,const GraphicsView&);
     void poll_remote_frames();
     void hold_remote_reveal(std::uint64_t,bool);
@@ -778,6 +788,8 @@ private:
     bool processes_waiting();
     const RuntimeImage* module_image(std::uint64_t address, bool containing = false) const;
     const RuntimeImage* unwind_image(GuestMemory&,std::uint64_t pc,std::uint64_t function_entry = 0);
+    const RuntimeFunctionTable* function_table_callback(std::uint64_t pc) const;
+    std::optional<std::uint32_t> finish_function_lookup(GuestState&,GuestMemory&,Continuation,std::uint64_t);
     std::optional<std::uint32_t> invoke_function_table(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_eh4(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_eh4(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
@@ -785,6 +797,7 @@ private:
     std::uint64_t find_module(std::u16string_view name) const;
     GuestAddress resolve_service(std::string_view,std::string_view,bool required) const;
     std::map<std::string,std::uint64_t> builtin_export_targets(std::string_view) const;
+    GuestAddress builtin_constant_address(std::string_view,std::string_view) const;
     std::map<std::uint64_t,std::uint32_t> builtin_system_calls() const;
     std::uint64_t load_module(GuestMemory&, std::u16string name, std::uint32_t flags, std::vector<std::uint64_t>& created, std::u16string_view search_directory = {}, GuestState* = nullptr);
     std::uint64_t module_export(GuestMemory&, std::uint64_t module, std::string_view symbol, std::optional<std::uint16_t> ordinal, std::vector<std::uint64_t>& created, unsigned depth = 0, GuestState* = nullptr);
@@ -955,12 +968,21 @@ private:
     std::optional<std::uint32_t> invoke_printing(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_spooler(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void printing_changed(unsigned);
+    void poll_printer_form_notifications(bool reload);
+    bool printer_form_notifications_waiting()const;
+    unsigned read_printer_settings(GuestMemory&,std::uint64_t,bool,PrinterSettings&);
+    std::vector<PrinterSettings> available_printer_settings(unsigned&);
     std::optional<std::uint32_t> invoke_print_dialog(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_print_dialog(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     std::optional<std::uint32_t> invoke_property_page(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_property_page(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     std::optional<GuiPropertyPage> read_property_page(GuestMemory&,std::uint64_t,bool,std::uint32_t&);
     std::uint32_t commit_print_dialog(GuestState&,GuestMemory&,GuiPrintDialog&);
+    std::optional<std::uint32_t> invoke_page_setup(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> resume_page_setup(GuestState&,GuestMemory&,const CallbackFrame&,std::uint64_t);
+    std::optional<std::uint32_t> page_setup_message(GuestState&,GuestMemory&,std::uint64_t,const GuiMessage&);
+    std::uint32_t commit_page_setup(GuestState&,GuestMemory&,const GuiPageSetup&);
+    std::array<std::uint64_t,2> allocate_printer_globals(GuestState&,GuestMemory&,bool,const PrinterSettings&);
     std::uint64_t release_print_services(GuestState&,GuestMemory&,std::uint64_t);
     void select_print_page(std::uint64_t,std::uint32_t);
     void refresh_print_settings(std::uint64_t);
@@ -1087,10 +1109,16 @@ private:
     std::optional<std::uint32_t> invoke_winmm_midi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_directmusic(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     void poll_dsound();
+    std::string retain_dsound_device(GuestState&,GuestMemory&,std::uint64_t);
+    std::uint32_t release_dsound_object(GuestState&,GuestMemory&,std::uint64_t);
     bool dsound_waiting() const;
     void poll_directmusic();
     bool directmusic_waiting() const;
     std::shared_ptr<DirectSoundState> dsound_;
+    std::shared_ptr<XAudioState> xaudio_;
+    std::optional<std::uint32_t> invoke_xaudio(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    void poll_xaudio();
+    bool xaudio_waiting() const;
     std::shared_ptr<WasapiState> wasapi_;
     std::shared_ptr<MediaFoundationState> media_foundation_;
     std::optional<std::uint32_t> invoke_media_foundation(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1167,6 +1195,8 @@ private:
     std::optional<std::uint32_t> invoke_d3d11_full(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     // coordinator=true：協調者持獨占映射鎖，可配置／釋放 heap；worker（共用鎖）維持持久映射重用的限制。
     bool d3d11_local_eligible(const GuestState&,GuestMemory&,const WindowsServiceDescriptor&,bool coordinator=false) const;
+    // D3D9 裝置方法能否在其他 worker 執行期間由協調者本地完成（見 resident_coordinated_service）；只讀物件表，不改狀態。
+    bool d3d9_local_eligible(const GuestState&,GuestMemory&,const WindowsServiceDescriptor&) const;
     // object 是 DXGI 介面卡（只在協調者建立，worker 可不取圖形鎖查詢）。
     bool d3d11_adapter(std::uint64_t object) const;
     // worker 上的 D3D11 方法為 true；延後需要改動客體 heap 的銷毀，協調者本地路徑則可處理。
@@ -1197,8 +1227,12 @@ private:
     const WindowsServiceDescriptor* d3d12_worker_service(GuestAddress) const noexcept;
     // x64 客體常式頁（guest_thread_x64.s）中具名常式的入口；未映射、追蹤服務或啟動剖析時為 0（同 kernel32 常式的使用條件）。
     GuestAddress guest_thread_routine(std::string_view symbol) const noexcept;
+    // 只發布既有 once_initializations 的已完成狀態，不建立第二套初始化／等待契約。
+    void publish_once_cache(GuestMemory&,std::uint64_t,const OnceInitialization&);
     // parallel_service 的靜態部分（依 stub 描述表與環境開關；x64 結果由 parallel_service 依 stub 索引快取）。
     bool parallel_service_static(GuestAddress) const noexcept;
+    bool parallel_crt_format_service(GuestAddress) const noexcept;
+    bool invoke_parallel_crt_format(GuestState&,GuestMemory&,std::uint64_t);
     static constexpr GuestAddress unresolved_base{windows_address_layout::x64.unresolved};
     std::vector<std::string> unresolved_imports_;
     static constexpr GuestAddress runtime_base{0x3002000000ULL};
@@ -1236,6 +1270,8 @@ private:
     bool graphics_service_epilogue_{};std::uint64_t last_graphics_epilogue_{};
     // 協調者本地一般服務執行中（resident_coordinated_service）：provider 要啟動客體回呼時改丟 LocalServiceRefused，交回完整路徑重做。
     bool local_plain_service_{};
+    // 協調者本地 D3D9 服務執行中：物件銷毀（可能釋放客體 heap、啟動私有資料回呼）延到下一次完整 D3D9 呼叫。
+    bool d3d9_local_call_{};
     // 協調者的 PeekMessage 抽完宿主事件仍沒有訊息時記下的期限（單調 tick，約 1 ms）：期限內訊息來源全空，worker 上的
     // PeekMessage 直接回 FALSE（見 parallel_peek_service）。協調者只在獨占映射鎖或全停下寫入，worker 持共用鎖讀取。
     std::uint64_t gui_peek_idle_until_{};
@@ -1475,7 +1511,7 @@ private:
     std::optional<std::uint32_t> finish_user_callback_exception(GuestState&,GuestMemory&);
     std::optional<std::uint32_t> resume_exception(GuestState& state, GuestMemory& memory, std::uint64_t result);
     void prepare_handler(GuestMemory& memory, ExceptionDispatch& dispatch, const ExceptionWalkFrame& frame, bool target);
-    bool append_exception_frame(GuestMemory& memory, ExceptionDispatch& dispatch);
+    std::optional<bool> append_exception_frame(GuestState&, GuestMemory& memory, ExceptionDispatch& dispatch);
     std::optional<std::uint32_t> advance_x86_exception(GuestState& state, GuestMemory& memory);
     void begin_x86_unwind(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     void leave_x86_exception_handler(GuestMemory& memory, ExceptionDispatch& dispatch);
@@ -1539,7 +1575,27 @@ private:
     bool export_mapping_handle(std::uint64_t,InheritedHandle&) const;
     void import_mapping_handle(const InheritedHandle&);
     GuiState gui_;
+    GuestAddress gui_timing_cell_{};
+    void initialize_gui_timing(GuestMemory&,bool shared=false);
+    std::uint32_t gui_timing(const GuestMemory&,unsigned) const;
+    void set_gui_timing(GuestMemory&,unsigned,std::uint32_t);
+    bool gui_input_connected(std::uint64_t,std::uint64_t) const;
+    GuiCaret* gui_caret(std::uint64_t);
+    void draw_gui_caret(GuestMemory&,GuiCaret&,bool);
+    void pump_gui_carets(GuestMemory&);
+    void paint_gui_caret(GuestMemory&,std::uint64_t,bool);
+    std::uint64_t gui_caret_deadline() const;
+    std::optional<std::uint32_t> invoke_gui_caret(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    void classify_gui_click(GuestMemory&,GuiMessage&,std::int32_t=1,bool=false);
     std::map<std::uint64_t,std::shared_ptr<RasterSurface>> rasters_;
+    struct GdiBatch {std::set<std::uint64_t> surfaces;std::uint32_t calls{},limit{};};
+    std::map<std::uint64_t,GdiBatch> gdi_batches_;
+    std::uint64_t gdi_batch_cell() const;
+    void mark_gdi_surface(GuestMemory&,std::uint64_t);
+    bool flush_gdi_batch(GuestMemory&);
+    std::uint32_t gdi_batch_limit(GuestMemory&,std::optional<std::uint32_t> = {});
+    bool begin_gdi_batch_call(GuestMemory&,const WindowsServiceDescriptor&);
+    bool end_gdi_batch_call(GuestMemory&,bool);
     std::map<std::uint64_t,std::pair<std::vector<std::uint8_t>,GuiBitmap>> bitmap_templates_;
     std::map<std::uint64_t,std::shared_ptr<RasterSurface>> raster_templates_;
     std::set<std::uint64_t> raster_shared_;
@@ -1574,6 +1630,8 @@ private:
     std::optional<std::uint64_t> gui_edit_input(GuestMemory&,const GuiMessage&,bool);
     void refresh_clipboard(bool local = false);
     void notify_clipboard();
+    GuiClipboardNoticeResult clipboard_notice(ClipboardNoticeAction,std::uint64_t=0,std::uint64_t=0,std::optional<std::uint64_t> = {});
+    void dispatch_clipboard_notifications(GuestState&,GuestMemory&);
     void pump_mouse_tracking();
     void pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait_ticks=500000);
     void poll_desktop_notifications();
@@ -1821,7 +1879,10 @@ private:
     void crt_exception_data(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t,bool);
     std::optional<std::uint32_t> resume_msvc(GuestState&,GuestMemory&,const CallbackFrame&,std::uint64_t);
     std::optional<std::uint32_t> start_msvc_catch(GuestState&,GuestMemory&);
+    void begin_msvc_unwind(GuestState&,GuestMemory&);
     std::uint64_t msvc_exception_cells(GuestState&,GuestMemory&,bool create,bool refresh=false);
+    std::uint32_t msvc_uncaught_count() const noexcept;
+    void sync_msvc_uncaught(GuestMemory&) const;
     std::optional<std::uint32_t> invoke_gui_extra(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_common_dialog(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_gui_busy(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1858,7 +1919,7 @@ private:
     std::uint64_t type_library_info(GuestMemory&,std::uint64_t,std::uint32_t,bool native=false);
     std::uint64_t reference_type_library(GuestState&,GuestMemory&,std::uint64_t,std::uint32_t);
     std::uint32_t release_type_library(GuestState&,GuestMemory&,std::uint64_t);
-    void register_type_library(std::uint64_t);
+    void register_type_library(std::uint64_t,std::u16string_view path={},std::u16string_view help_directory={});
     std::u16string registered_type_library(const std::array<std::uint8_t,16>&,std::uint16_t,std::uint16_t,std::uint32_t);
     std::optional<std::uint32_t> resume_automation(GuestState&,GuestMemory&,std::uint64_t,std::uint32_t);
     void discard_automation(GuestState&,GuestMemory&,std::uint64_t);
@@ -1914,6 +1975,11 @@ private:
     void discard_com_marshal(GuestState&,GuestMemory&,std::uint64_t);
     std::vector<GuestCallback> retire_com_marshal(GuestMemory&,std::uint64_t,bool=true);
     std::uint64_t create_com_marshaler(GuestState&,GuestMemory&,std::uint64_t,bool=false);
+    std::optional<std::uint32_t> invoke_com_agile(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> resume_com_agile(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t=0);
+    void discard_com_agile(GuestState&,GuestMemory&,std::uint64_t);
+    std::uint64_t com_agile_owner(std::uint64_t,std::uint64_t)const;
+    void initialize_guest_com_agile(GuestMemory&);
     std::uint64_t create_context_enumerator(GuestState&,GuestMemory&,com_context::Enumeration);
     std::uint64_t begin_context_operation(ComContextOperation);
 
@@ -1930,6 +1996,8 @@ private:
     void shell_browse_refresh(std::uint64_t handle);
     std::uint64_t shell_make_pidl(GuestMemory& memory, std::u16string path);
     void invalidate_window(std::uint64_t handle);
+    void update_window_region(std::uint64_t handle,GuiRegion region);
+    void finish_gui_erase_callback(const CallbackFrame&,std::uint64_t result);
     void erase_window(std::uint64_t handle,bool destroy_menus=true);
     void destroy_window(GuestState& state, GuestMemory& memory, std::uint64_t handle, bool default_proc);
     std::optional<std::uint32_t> invoke_gui(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
@@ -2100,6 +2168,10 @@ private:
     std::optional<std::uint32_t> invoke_tls(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_digest(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_network(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_socket_accept(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> resume_socket_accept(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
+    void discard_socket_accept(GuestState&,GuestMemory&,std::uint64_t);
+    std::uint64_t publish_accepted_socket(GuestMemory&,const ConditionalAccept&);
     std::optional<std::uint32_t> invoke_memory(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_certificate(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_certificate_decode(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -2188,6 +2260,7 @@ private:
     // 具有 Windows 函式表的共用 CRT 客體模組；供正常呼叫、SEH 與 JIT 函式範圍查詢。
     RuntimeImage guest_crt_algorithms_;
     void initialize_guest_crt_algorithms(GuestMemory&, GuestAddress runtime_stubs);
+    void initialize_guest_msvcp90(GuestMemory&);
     void sync_crt_thread_state(GuestMemory&, std::uint64_t id);
     void sync_crt_thread_states(GuestMemory&);
     GuestAddress guest_heap_state_{};std::uint64_t guest_heap_base_{},guest_heap_size_{},guest_heap_next_{};

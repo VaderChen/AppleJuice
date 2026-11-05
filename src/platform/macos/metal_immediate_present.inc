@@ -7,6 +7,7 @@ class MetalImmediatePresenter {
         id<MTLCommandBuffer> ready;
         std::shared_ptr<GpuMemoryReservation> lease;
         std::uint64_t sequence{};
+        macos_detail::MetalFrameTiming timing;
         Use use{Use::Free};
     };
     id<MTLCommandQueue> queue_;
@@ -33,7 +34,7 @@ class MetalImmediatePresenter {
                     // 等待 drawable 時不持有 mutex；客體可以繼續更新最新快照。
                     auto drawable=[layer_ nextDrawable];
                     if(!drawable)throw std::runtime_error("Metal 非同步 drawable 無法取得");
-                    unsigned index=0;std::uint64_t sequence=0;id<MTLCommandBuffer> ready;
+                    unsigned index=0;std::uint64_t sequence=0;id<MTLCommandBuffer> ready;macos_detail::MetalFrameTiming timing;
                     {
                         std::unique_lock lock(mutex_);
                         wake_.wait(lock,[&]{return stopping_ || pending_.has_value();});
@@ -41,6 +42,7 @@ class MetalImmediatePresenter {
                         index=*pending_;pending_.reset();slots_[index].use=Use::Reading;
                         ready=slots_[index].ready;
                         sequence=slots_[index].sequence;
+                        timing=slots_[index].timing;
                     }
                     // ready 已 commit，且包含 producer 的 GPU 交接及畫面快照複製。
                     // 此等待發生於呈現執行緒；客體下一幀不用等螢幕更新。
@@ -54,7 +56,7 @@ class MetalImmediatePresenter {
                               sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1)
                                  toTexture:drawable.texture destinationSlice:0 destinationLevel:0
                          destinationOrigin:MTLOriginMake(0,0,0)];
-                    scope.end();[command presentDrawable:drawable];track_gpu_commands(command);
+                    scope.end();timing.present(drawable);[command presentDrawable:drawable];track_gpu_commands(command);
                     [command commit];[command waitUntilCompleted];
                     if(command.status==MTLCommandBufferStatusError)throw std::runtime_error("Metal 非同步呈現執行失敗");
                     {
@@ -96,10 +98,11 @@ public:
         throw std::runtime_error("Metal 呈現快照生命週期不一致");
     }
     id<MTLTexture> texture(unsigned index)const{return slots_[index].texture;}
-    void publish(unsigned index,id<MTLCommandBuffer> ready){
+    void publish(unsigned index,id<MTLCommandBuffer> ready,const macos_detail::MetalFrameTiming& timing){
         std::lock_guard lock(mutex_);
         // 即使呈現執行緒先失敗，也保留已提交的最後寫入，finish 才能等到 GPU 釋放快照。
         slots_[index].ready=ready;
+        slots_[index].timing=timing;
         if(!failure_.empty())throw std::runtime_error(failure_);
         slots_[index].use=Use::Pending;slots_[index].sequence=++submitted_;pending_=index;wake_.notify_one();
     }

@@ -20,7 +20,7 @@ const auto source_create=[&](const Object& attributes){
     auto desc=object(presentation,mf::Presentation);desc->children={descriptor};desc->selected={true};source->children={presentation};return p;
 };
 const auto source_start=[&](const std::shared_ptr<Object>& source){
-    require(!source->closed,shutdown);if(!source->input)source->input=audio_input_backend_?audio_input_backend_->open(source->capture):audio::open_input(source->capture);
+    require(!source->closed,shutdown);if(source->file_source){source->streaming=true;return;}if(!source->input)source->input=audio_input_backend_?audio_input_backend_->open(source->capture):audio::open_input(source->capture);
     require(bool(source->input),0x80004005U);{std::lock_guard lock(source->capture->mutex);require(!source->capture->capture_failed,0x80004005U);source->capture->playing=true;}source->streaming=true;
 };
 const auto source_stop=[&](const std::shared_ptr<Object>& source){if(source->capture){std::lock_guard lock(source->capture->mutex);source->capture->playing=false;}source->streaming=false;};
@@ -45,8 +45,19 @@ const auto bytes_sample=[&](std::span<const std::uint8_t> bytes,std::optional<st
     require(bytes.size()<=256U*1024U*1024U);const auto buffer=memory_buffer(static_cast<std::uint32_t>(bytes.size()),0);auto b=object(buffer,mf::Buffer);memory.write(GuestAddress{b->data},bytes);b->length=b->maximum;
     const auto p=make(mf::Sample);auto sample=object(p,mf::Sample);sample->children={buffer};sample->time=time;sample->duration=duration;return p;
 };
-const auto captured_sample=[&](const std::shared_ptr<Object>& source,std::uint64_t& cursor){
-    require(!source->closed,shutdown);std::vector<std::uint8_t> bytes;std::uint64_t begin{},count{};unsigned rate{},frame_bytes{};bool discontinuity=false;
+const auto captured_sample=[&](const std::shared_ptr<Object>& source,std::uint64_t& cursor,bool completing=false){
+    require(!source->closed || completing,shutdown);
+    if(source->file_source){
+        const auto& file=*source->file_source;const auto& format=file.wave.format;const auto frames=file.wave.bytes/format.align;
+        if(cursor>=frames)return UINT64_C(0);const auto count=std::min<std::uint64_t>(frames-cursor,std::max(1U,format.rate/100)),begin=cursor;
+        auto at=file.base+file.wave.offset+cursor*format.align;std::vector<std::uint8_t> bytes;
+        if(file.external_stream)bytes=external_stream_samples(file.external_stream,at,static_cast<std::size_t>(count*format.align));
+        else {bytes.resize(static_cast<std::size_t>(count*format.align));auto remaining=std::span(bytes);
+            while(!remaining.empty()){const auto r=file.file->read(remaining,at);require(!r.error && r.bytes && r.bytes<=remaining.size(),0x80070000U|((r.error?r.error:38)&0xffffU));at+=r.bytes;remaining=remaining.subspan(r.bytes);}
+        }
+        const auto sample=bytes_sample(bytes,begin*10000000U/format.rate,count*10000000U/format.rate);cursor+=count;return sample;
+    }
+    std::vector<std::uint8_t> bytes;std::uint64_t begin{},count{};unsigned rate{},frame_bytes{};bool discontinuity=false;
     {std::lock_guard lock(source->capture->mutex);const auto& buffer=*source->capture;require(!buffer.capture_failed,0x80004005U);rate=buffer.rate;frame_bytes=buffer.frame_bytes();const auto ring=buffer.pcm.size()/frame_bytes;const auto total=buffer.captured_frames;
         if(total-cursor>ring){cursor=total-ring;discontinuity=true;}begin=cursor;count=std::min<std::uint64_t>(total-cursor,std::max(1U,rate/100));if(!count)return UINT64_C(0);
         bytes.resize(static_cast<std::size_t>(count)*frame_bytes);for(std::uint64_t n=0;n<count;++n)std::copy_n(buffer.pcm.begin()+static_cast<std::ptrdiff_t>(((cursor+n)%ring)*frame_bytes),frame_bytes,bytes.begin()+static_cast<std::ptrdiff_t>(n*frame_bytes));cursor+=count;

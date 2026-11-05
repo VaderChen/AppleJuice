@@ -16,6 +16,9 @@
 namespace x64arm {
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+static_assert(std::atomic<std::uint16_t>::is_always_lock_free);
+static_assert(offsetof(SharedSocketData,connect_result)==58 && offsetof(SharedSocketData,bound_size)==60);
+static_assert(offsetof(SharedSocketData,watch_generation)==64 && sizeof(SharedSocketData)==128);
 static_assert(sizeof(SharedSocketData)<=socket_detail::DatagramQueue::default_base);
 static_assert(sizeof(SharedSocketData)<=socket_detail::receive_options_offset);
 SharedSocketState::SharedSocketState(int inherited_descriptor):descriptor_(inherited_descriptor>=0?socket_detail::SocketStateAccess::duplicate_descriptor(inherited_descriptor):-1){

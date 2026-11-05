@@ -91,6 +91,7 @@ struct GuiMessage {
     bool screen_point{}; // 原生／注入輸入保留事件當時的完整螢幕座標。
     std::uint64_t input_order{}; // 命中／啟用回呼完成後，仍保留輸入到達的先後。
     bool mouse_no_coalesce{}; // MOUSEEVENTF_MOVE_NOCOALESCE：此筆移動不可被後續座標取代。
+    std::optional<std::uint32_t> mouse_time{}; // 原生事件發生時間；雙擊不能以批次取出時間判斷。
     bool operator==(const GuiMessage&) const = default;
 };
 inline std::uint32_t gui_queue_category(const GuiMessage& message){
@@ -476,6 +477,8 @@ struct GuiWindow {
     // ShowOwnedPopups(FALSE) 經 WM_SHOWWINDOW 隱藏的擁有者彈出視窗，等待 SW_PARENTOPENING 恢復。
     bool owned_popup_hidden{};
     bool paint_frame{},paint_erase{},internal_paint{};
+    // invalid 且未指定區域表示整個工作區，沿用系統／控制項的全區失效流程。
+    std::optional<GuiRegion> update_region;
     std::optional<GuiRegion> window_region;
     std::u16string class_name{};
     std::uint64_t parent{}, owner{}, id{}, dialog_proc{}, font{0xb011},last_active_popup{};
@@ -574,6 +577,22 @@ struct GuiBitmap {
     std::vector<std::uint32_t> dib_palette{}; // COLORREF；RGBQUAD 與邏輯調色盤在 API 邊界轉換。
     bool operator==(const GuiBitmap&) const = default;
 };
+struct GuiCaret {
+    std::uint64_t window{},bitmap{},generation{},deadline{UINT64_MAX};
+    std::int32_t x{},y{};
+    std::uint32_t width{1},height{1},hidden{1},painting{},interval{500};
+    bool drawn{};
+    GuiBitmap mask;
+    bool operator==(const GuiCaret&) const = default;
+};
+struct GuiMouseClick {
+    std::uint64_t window{},detail{};
+    std::uint32_t message{},time{};
+    std::int32_t hit{};
+    std::array<std::int32_t,2> point{};
+    bool released{},valid{};
+    bool operator==(const GuiMouseClick&) const = default;
+};
 GuiBitmap decode_dib_bitmap(std::span<const std::uint8_t> bytes);
 struct GuiPathPoint {double x{},y{};std::uint8_t type{};bool operator==(const GuiPathPoint&)const=default;};
 struct GuiPath {unsigned state{};bool new_figure{true};std::vector<GuiPathPoint> points;bool operator==(const GuiPath&)const=default;};
@@ -582,6 +601,8 @@ struct GuiDc {
     std::uint32_t graphics_mode{1},map_mode{1};GuiTransform world{gui_identity};
     std::array<std::int32_t,2> window_origin{},viewport_origin{},window_extent{1,1},viewport_extent{1,1};
     std::optional<GuiRegion> application_clip,meta_clip;
+    // BeginPaint 的系統裁剪；應用程式的 SelectClipRgn／RestoreDC 不得擴張它。
+    std::optional<GuiRegion> paint_clip;
     bool display{};
     std::uint64_t bitmap{},font{0xb011},pen{0xb007},brush{0xb000},palette{0xb00f},palette_generation{};std::uint32_t color{},background{0xffffff},mode{2},alignment{};
     std::int32_t x{},y{};
@@ -642,6 +663,7 @@ struct GuiSentMessage {
     std::uint64_t power_notification{};
     std::optional<GuestCallback> rpc{};
     std::uint64_t rpc_error_pointer{},proxy_operation{};
+    std::uint64_t remote_birth{},remote_sequence{};std::uint32_t remote_process{};bool remote_server{},remote_replied{};
     bool operator==(const GuiSentMessage&) const = default;
 };
 struct GuiSendCallback {
@@ -840,6 +862,18 @@ struct GuiClipboardOperation {
     std::map<std::uint32_t,std::pair<std::uint32_t,std::uint64_t>> prepared;
     bool operator==(const GuiClipboardOperation&) const = default;
 };
+enum class ClipboardNoticeAction { Poll, Mutation, Publish, Viewer, AddViewer, RemoveViewer, Open, Close };
+struct GuiClipboardNoticeState {
+    std::uint64_t viewer{},publication{},native_sequence{},open_birth{},open_thread{},open_window{};
+    std::uint32_t sequence{1},open_process{};
+    bool native_known{};
+    bool operator==(const GuiClipboardNoticeState&) const = default;
+};
+struct GuiClipboardNoticeResult {
+    GuiClipboardNoticeState state;
+    std::uint64_t previous{},forward{};
+    std::uint32_t error{};bool notify{};
+};
 struct GuiStationNamespace {
     std::map<std::uint16_t,GuiAtom> global_atoms;
     std::map<std::u16string,std::uint16_t> global_atom_names;
@@ -850,7 +884,9 @@ struct GuiStationNamespace {
     std::map<std::uint32_t,std::uint32_t> clipboard_types;
     std::uint64_t clipboard_ole_object{},clipboard_ole_thread{},clipboard_ole_generation{};
     std::vector<GuiClipboardEntry> clipboard_ole_entries;
-    std::set<std::uint64_t> clipboard_listeners;
+    std::set<std::uint64_t> clipboard_listeners,clipboard_viewers;
+    GuiClipboardNoticeState clipboard_notices;
+    std::uint64_t clipboard_seen_publication{};
     std::uint32_t clipboard_sequence{1};std::optional<std::uint64_t> clipboard_native_sequence;
     std::uint64_t clipboard_poll_deadline{},scheduler_poll_deadline{};
     std::uint64_t network_pump_ticks{}; // 上次全量抽取 socket 監看的單調時鐘（100 ns），見 pump_gui_network。
@@ -886,6 +922,15 @@ struct GuiPrintDialog {
     std::vector<std::uint64_t> scratch{};
     GuiMessage pending{};
     bool operator==(const GuiPrintDialog&)const=default;
+};
+struct GuiPageSetup {
+    std::uint64_t request{},window{},hook{},paint_hook{},source{},instance{},owner{},locale_buffer{},paint_buffer{},paint_dc{},preview{};
+    std::uint32_t flags{},paint_stage{};bool wide{},painting{};
+    PrinterSettings settings{};
+    std::array<std::int32_t,4> margins{},minimum{};
+    std::vector<PrinterSettings> forms;
+    std::vector<std::uint64_t> scratch;
+    bool operator==(const GuiPageSetup&)const=default;
 };
 struct GuiPrintServices {
     std::uint32_t references{1};std::uint64_t window{};bool wide{true};
@@ -932,6 +977,8 @@ struct GuiWindowPositionOperation {
     bool operator==(const GuiWindowPositionOperation&) const = default;
 };
 struct GuiState : GuiStationNamespace {
+    // 沙盒顯示模式：寬、高、色深、更新率；不更動宿主或其他程序的桌面。
+    std::optional<std::array<std::uint32_t,4>> display_mode,display_registry_mode;
     // 最多五筆待確認認證；僅保存綁定虛擬 SID 的加密資料，不保留額外明文密碼。
     std::vector<GuiCredentialConfirmation> credential_confirmations;
     std::shared_ptr<const GuiCalendarLocale> calendar_locale;
@@ -1032,6 +1079,7 @@ struct GuiState : GuiStationNamespace {
     std::map<std::uint64_t,GuiPropertySheet> property_sheets;
     std::map<std::uint64_t,GuiPropertyPage> property_pages;
     std::map<std::uint64_t,GuiPrintDialog> print_dialogs;
+    std::map<std::uint64_t,GuiPageSetup> page_setups;
     std::map<std::uint64_t,GuiPrintServices> print_services;
     std::uint64_t print_services_vtable{};
     std::vector<std::uint64_t> z_order;
@@ -1073,9 +1121,11 @@ struct GuiState : GuiStationNamespace {
     std::vector<GuiHotKey> hotkeys;
     std::map<std::uint64_t,GuiKeyboardTranslation> keyboard_translation;
     std::uint64_t last_input_ticks{};
-    std::uint64_t caret_window{},caret_bitmap{},cursor{0xd000+32512};
+    std::map<std::uint64_t,GuiCaret> carets;
+    std::map<std::uint64_t,GuiMouseClick> mouse_clicks;
+    std::uint64_t caret_generation{},cursor{0xd000+32512};
     std::uint64_t cursor_animation_start{};std::uint32_t cursor_animation_step{};
-    std::int32_t caret_x{},caret_y{},cursor_count{};bool caret_visible{};
+    std::int32_t cursor_count{};
     std::uint64_t focus{}, active{}, capture{}, next_item{0x200000}, desktop{0x100};
     KeyVersionedMap<std::uint64_t,std::uint64_t> dc_objects{};
     std::map<std::uint64_t,std::vector<GuiDc>> saved_contexts;
@@ -1100,6 +1150,7 @@ struct GuiState : GuiStationNamespace {
     std::map<std::uint64_t,std::uint64_t> system_menus{};
     std::map<std::uint64_t,GuiMenuTrack> menu_tracks{};
     std::map<std::uint64_t,GuiSentMessage> sent_messages{};
+    std::map<std::uint64_t,std::vector<GuiMessage>> clipboard_notifications;
     std::vector<GuiSendCallback> send_callbacks{};
     std::map<std::uint64_t,GuiAsyncSend> async_sends{};
     std::map<std::pair<std::uint64_t,std::uint64_t>,std::uint64_t> message_wait_deadlines{};

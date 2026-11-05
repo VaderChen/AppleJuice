@@ -1,6 +1,7 @@
 // Win32 執行緒區域常式：每次讀取當前 FS 的 TEB；stdcall 參數由被呼叫端清除。
 // 只使用 volatile EAX／ECX／EDX 與旗標，保留非 volatile 暫存器及浮點狀態。
 #include "guest_tls_layout.h"
+#include "gdi_batch_layout.h"
 .intel_syntax noprefix
 .text
 .macro entry name
@@ -249,5 +250,174 @@ entry ComBridgeRelease
     mov eax, ecx
     ret 4
 end ComBridgeRelease
+// stdcall ABI 與 32-bit TEB；常用的本程序查詢留在 resident AOT，其他 PID 回到共用 provider。
+entry GetProcessVersion
+    mov eax, dword ptr [esp+4]
+    test eax, eax
+    jz 1f
+    cmp eax, dword ptr fs:[0x20]
+    jne 9f
+1:
+    mov edx, dword ptr fs:[0x30]
+    mov edx, dword ptr [edx+8]
+    cmp word ptr [edx], 0x5a4d
+    jne 9f
+    mov eax, dword ptr [edx+60]
+    cmp eax, -77
+    ja 9f
+    add edx, eax
+    jc 9f
+    cmp dword ptr [edx], 0x4550
+    jne 9f
+    cmp word ptr [edx+24], 0x10b
+    jne 9f
+    movzx eax, word ptr [edx+72]
+    shl eax, 16
+    movzx edx, word ptr [edx+74]
+    or eax, edx
+    ret 4
+9:
+slow_end GetProcessVersion
+// cdecl 零參數查詢；計數由共用 EH／fiber 邊界發布，保留 LastError。
+entry CxxUncaughtCount
+    mov eax, dword ptr fs:[X64ARM_CXX_X86_UNCAUGHT_OFFSET]
+    ret
+end CxxUncaughtCount
+entry CxxUncaughtAny
+    mov eax, dword ptr fs:[X64ARM_CXX_X86_UNCAUGHT_OFFSET]
+    test eax, eax
+    setne al
+    movzx eax, al
+    ret
+end CxxUncaughtAny
+// CRT 的目前磁碟由共用 PEB CurrentDirectory 取得；cdecl、保留 LastError 與浮點狀態。
+entry CrtGetDrive
+    mov ecx, dword ptr fs:[0x30]
+    mov ecx, dword ptr [ecx+0x10]
+    test ecx, ecx
+    jz 1f
+    cmp word ptr [ecx+0x24], 4
+    jb 1f
+    mov edx, dword ptr [ecx+0x28]
+    test edx, edx
+    jz 1f
+    test byte ptr [ecx+8], 1
+    jnz 2f
+    add edx, ecx
+2:
+    cmp word ptr [edx+2], 58
+    jne 1f
+    movzx eax, word ptr [edx]
+    or eax, 32
+    sub eax, 97
+    cmp eax, 25
+    ja 1f
+    inc eax
+    ret
+1:
+    xor eax, eax
+    ret
+end CrtGetDrive
+
+// Winsock 純數值轉換；保留 LastError，無指標存取或宿主服務。
+entry WinsockSwap16
+    mov eax, dword ptr [esp+4]
+    rol ax, 8
+    movzx eax, ax
+    ret 4
+end WinsockSwap16
+entry WinsockSwap32
+    mov eax, dword ptr [esp+4]
+    bswap eax
+    ret 4
+end WinsockSwap32
+
+// DWORD 參數與不可變 NLS 目錄沿用宿主查詢；保留 stdcall 堆疊及 LastError。
+entry IsValidLanguageGroup
+    mov ecx, dword ptr [esp+4]
+    sub ecx, 1
+    cmp ecx, 16
+    ja 1f
+    mov edx, dword ptr [esp+8]
+    sub edx, 1
+    cmp edx, 1
+    ja 1f
+    .byte 0xb8 // mov eax, imm32
+Llanguage_groups_patch:
+    .long 0
+    bt eax, ecx
+    setc al
+    movzx eax, al
+    ret 8
+1:
+    xor eax, eax
+    ret 8
+end IsValidLanguageGroup
+.set _guest_language_groups_patch, Llanguage_groups_patch - _guest_IsValidLanguageGroup
+.macro gui_timing name, offset, setter
+entry \name
+    .byte 0xba // mov edx, 客體時序指標槽
+Lgui_timing_\name:
+    .long 0
+    mov edx, dword ptr [edx]
+.if \setter
+    mov eax, dword ptr [esp+4]
+.if \offset == 0
+    mov ecx, 500
+    test eax, eax
+    cmovz eax, ecx
+    mov ecx, 5000
+    cmp eax, ecx
+    cmova eax, ecx
+.endif
+    mov dword ptr [edx+\offset], eax
+    mov eax, 1
+    ret 4
+.else
+    mov eax, dword ptr [edx+\offset]
+    ret
+.endif
+end \name
+.globl _guest_\name\()_gui_timing_patch
+.set _guest_\name\()_gui_timing_patch, Lgui_timing_\name - _guest_\name
+.endm
+gui_timing GetDoubleClickTime, 0, 0
+gui_timing GetCaretBlinkTime, 4, 0
+gui_timing SetDoubleClickTime, 0, 1
+gui_timing SetCaretBlinkTime, 4, 1
+// 與 x64／宿主服務共用狀態，慢路徑保留原始 stdcall 堆疊。
+entry GdiFlush
+    cmp dword ptr fs:[X64ARM_GDI_BATCH_X86_OFFSET+X64ARM_GDI_BATCH_PENDING_OFFSET], 0
+    jne 1f
+    mov eax, 1
+    ret
+1:
+slow_end GdiFlush
+
+entry GdiGetBatchLimit
+    cmp dword ptr fs:[X64ARM_GDI_BATCH_X86_OFFSET+X64ARM_GDI_BATCH_PENDING_OFFSET], 0
+    jne 1f
+    mov eax, dword ptr fs:[X64ARM_GDI_BATCH_X86_OFFSET]
+    mov edx, X64ARM_GDI_BATCH_DEFAULT
+    test eax, eax
+    cmovz eax, edx
+    ret
+1:
+slow_end GdiGetBatchLimit
+
+entry GdiSetBatchLimit
+    cmp dword ptr fs:[X64ARM_GDI_BATCH_X86_OFFSET+X64ARM_GDI_BATCH_PENDING_OFFSET], 0
+    jne 1f
+    mov eax, dword ptr fs:[X64ARM_GDI_BATCH_X86_OFFSET]
+    mov ecx, dword ptr [esp+4]
+    mov edx, X64ARM_GDI_BATCH_DEFAULT
+    test eax, eax
+    cmovz eax, edx
+    test ecx, ecx
+    cmovz ecx, edx
+    mov dword ptr fs:[X64ARM_GDI_BATCH_X86_OFFSET], ecx
+    ret 4
+1:
+slow_end GdiSetBatchLimit
 .globl _guest_thread_end
 _guest_thread_end:

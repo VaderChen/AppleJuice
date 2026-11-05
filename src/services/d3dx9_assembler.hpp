@@ -107,7 +107,10 @@ class Assembler {
             const unsigned count=name=="defb"?1:4;if(operands.size()!=count+1)fail("常數宣告數量不符");
             operand(operands[0],true,encoded);opcode=name=="def"?81:name=="defi"?48:47;
             const unsigned expected=name=="def"?2:name=="defi"?7:14;if(((encoded[0]>>28)&7U)!= (expected&7U) || ((encoded[0]>>8)&24U)!=(expected&24U))fail("常數暫存器類型不符");
-            for(unsigned i=1;i<=count;++i){char* end=nullptr;const auto& value=operands[i];
+            for(unsigned i=1;i<=count;++i){char* end=nullptr;auto value=operands[i];
+                // 前處理器可在一元正負號後補空白；只接回符號與數值，
+                // 不把數值內部的空白合併成另一個合法常數。
+                if(name!="defb" && value.size()>1 && (value[0]=='-' || value[0]=='+'))value=value.substr(0,1)+trim(value.substr(1));
                 if(name=="defb"){if(value!="true" && value!="false" && value!="0" && value!="1")fail("無效布林常數");encoded.push_back(value=="true" || value=="1");}
                 else if(name=="defi"){const auto v=std::strtoll(value.c_str(),&end,0);if(end!=value.c_str()+value.size() || v<INT32_MIN || v>INT32_MAX)fail("無效整數常數");encoded.push_back(static_cast<std::uint32_t>(v));}
                 else{const float v=std::strtof(value.c_str(),&end);if(end!=value.c_str()+value.size())fail("無效浮點常數");encoded.push_back(std::bit_cast<std::uint32_t>(v));}}

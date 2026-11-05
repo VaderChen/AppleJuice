@@ -1,4 +1,5 @@
 #include "x64arm/audio.hpp"
+#include "audio_device.hpp"
 #include <AudioUnit/AudioUnit.h>
 #include <CoreAudio/CoreAudio.h>
 #include <stdexcept>
@@ -109,13 +110,13 @@ unsigned channels(AudioDeviceID device,AudioObjectPropertyScope scope){
     if(AudioObjectGetPropertyData(device,&address,0,nullptr,&size,list)!=noErr)return 0;
     unsigned total=0;for(UInt32 i=0;i<list->mNumberBuffers;++i)total+=list->mBuffers[i].mNumberChannels;return total;
 }
+} // namespace
 AudioDeviceID device_for(std::string_view uid){
     CFStringRef text=CFStringCreateWithBytes(nullptr,reinterpret_cast<const UInt8*>(uid.data()),static_cast<CFIndex>(uid.size()),kCFStringEncodingUTF8,false);if(!text)return kAudioObjectUnknown;
     AudioDeviceID device=kAudioObjectUnknown;AudioValueTranslation translation{&text,sizeof(text),&device,sizeof(device)};UInt32 size=sizeof(translation);
     const AudioObjectPropertyAddress address{kAudioHardwarePropertyDeviceForUID,kAudioObjectPropertyScopeGlobal,kAudioObjectPropertyElementMain};
     const auto status=AudioObjectGetPropertyData(kAudioObjectSystemObject,&address,0,nullptr,&size,&translation);CFRelease(text);
     return status==noErr?device:kAudioObjectUnknown;
-}
 }
 std::unique_ptr<Output> open_output(std::shared_ptr<Buffer> buffer,std::string_view uid){
     if(uid.empty())return open_output(std::move(buffer));

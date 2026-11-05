@@ -1,0 +1,6 @@
+#pragma once
+// 與 TLS／CRT 共用 TEB，避開既有槽位。零值代表本實作的預設批次上限。
+#define X64ARM_GDI_BATCH_DEFAULT 310
+#define X64ARM_GDI_BATCH_X86_OFFSET 0x3fc0
+#define X64ARM_GDI_BATCH_X64_OFFSET 0x4040
+#define X64ARM_GDI_BATCH_PENDING_OFFSET 4

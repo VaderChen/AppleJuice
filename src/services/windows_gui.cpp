@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "gui_lifecycle_trace.hpp"
+#include "gui_paint_region.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/windows_window_state.hpp"
 #include "x64arm/windows_gui_abi.hpp"
@@ -162,11 +163,27 @@ void WindowsServices::set_native_gui_backend(std::shared_ptr<NativeGui> backend)
     if(native_gui_)native_gui_->raw_input_policy(!raw_legacy_enabled(true),!raw_legacy_enabled(false),false);
 }
 void WindowsServices::invalidate_window(std::uint64_t handle) {
-    auto& window = gui_.windows.at(handle); window.invalid = true;
+    auto& window = gui_.windows.at(handle); window.invalid = true;window.update_region.reset();
     if (window.visible && std::none_of(gui_.queue.begin(), gui_.queue.end(), [&](const auto& msg) { return msg.window == handle && msg.message == 15; }))
         { GuiMessage msg{handle,0,0,15};msg.queue_priority=2;enqueue_gui_message(std::move(msg)); }
 }
+void WindowsServices::update_window_region(std::uint64_t handle,GuiRegion region) {
+    auto& window=gui_.windows.at(handle);window.invalid=!region.empty();window.update_region=std::move(region);
+    if(!window.invalid)window.paint_erase=false;
+    if(!window.invalid && !window.internal_paint)
+        std::erase_if(gui_.queue,[&](const auto& msg){return msg.window==handle && msg.message==15;});
+    else if(window.visible && std::none_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& msg){return msg.window==handle && msg.message==15;})){
+        GuiMessage msg{handle,0,0,15};msg.queue_priority=2;enqueue_gui_message(std::move(msg));
+    }
+}
+void WindowsServices::finish_gui_erase_callback(const CallbackFrame& frame,std::uint64_t result) {
+    const auto found=gui_.windows.find(frame.gui_erase_window);if(found==gui_.windows.end())return;
+    auto& dc=gui_.contexts[0x10000000+frame.gui_erase_window];dc.paint_clip=frame.gui_erase_clip;gui_refresh_dc_clip(dc);
+    if(!result && found->second.invalid)found->second.paint_erase=true;
+}
 void WindowsServices::erase_window(std::uint64_t handle,bool destroy_menus) {
+    std::erase_if(gui_.carets,[&](const auto& entry){return entry.second.window==handle;});
+    std::erase_if(gui_.mouse_clicks,[&](const auto& entry){return entry.second.window==handle;});
     gui_.status_icons.erase_owner(handle);gui_.attention.erase(handle);
     if(native_gui_){(void)native_gui_->status_icons(gui_.status_icons.values());(void)native_gui_->attention(handle,false,false);}
     gui_.native_attention_windows.erase(handle);
@@ -221,7 +238,7 @@ void WindowsServices::erase_window(std::uint64_t handle,bool destroy_menus) {
         std::erase_if(gui_.clipboard_order,[&](auto format){return !gui_.clipboard.contains(format);});
         std::erase_if(gui_.clipboard_types,[&](const auto& entry){return !gui_.clipboard.contains(entry.first);});
     }
-    gui_.clipboard_listeners.erase(handle);for(auto& [id,station]:gui_.station_namespaces){(void)id;station.clipboard_listeners.erase(handle);}
+    gui_.clipboard_listeners.erase(handle);gui_.clipboard_viewers.erase(handle);for(auto& [id,station]:gui_.station_namespaces){(void)id;station.clipboard_listeners.erase(handle);station.clipboard_viewers.erase(handle);}
     gui_.saved_contexts.erase(dc_base+handle);gui_.contexts.erase(dc_base+handle);gui_.dc_objects.erase(dc_base+handle);std::erase_if(gui_.scroll_info,[&](const auto& entry){return entry.first.first==handle;});gui_.system_menus.erase(handle);
     if(gui_.focus==handle)gui_.focus=0;if(gui_.active==handle)gui_.active=0;if(gui_.capture==handle)gui_.capture=0;
     std::erase_if(gui_.timers,[&](const auto& entry){return entry.first.first==handle;});
@@ -229,18 +246,34 @@ void WindowsServices::erase_window(std::uint64_t handle,bool destroy_menus) {
     for(const auto parent:calendar_parents)present_gui(parent);
 }
 void WindowsServices::notify_clipboard(){
+    const auto update=clipboard_notice(ClipboardNoticeAction::Publish,0,0,gui_.clipboard_native_sequence);
+    gui_.clipboard_sequence=update.state.sequence;gui_.clipboard_seen_publication=update.state.publication;
     for(const auto hwnd:gui_.clipboard_listeners)if(gui_.windows.contains(hwnd))enqueue_gui_message({hwnd,0,0,0x31d});
     gui_.clipboard_dirty=false;
+    if(update.state.viewer)gui_.clipboard_notifications[threads_.current].push_back({update.state.viewer,0,0,0x308});
+}
+void WindowsServices::dispatch_clipboard_notifications(GuestState& state,GuestMemory& memory){
+    const auto found=gui_.clipboard_notifications.find(threads_.current);if(found==gui_.clipboard_notifications.end())return;
+    if(local_plain_service_)throw LocalServiceRefused{};
+    std::vector<GuestCallback> callbacks;
+    for(const auto& message:found->second)callbacks.push_back({resolve("user32.dll","SendMessageW").value,{message.window,message.message,message.wparam,message.lparam}});
+    gui_.clipboard_notifications.erase(found);
+    if(!callbacks.empty())start_callbacks(state,memory,std::move(callbacks),Continuation::GuiClipboardNotification,last_error_);
 }
 void WindowsServices::refresh_clipboard(bool local){
-    bool changed=false;
-    if(native_gui_ && interactive_station())if(const auto sequence=native_gui_->clipboard_sequence()){
-        changed=gui_.clipboard_native_sequence && *gui_.clipboard_native_sequence!=*sequence;
-        if(!local && (changed || !gui_.clipboard_native_sequence))gui_.clipboard_native_text=native_gui_->clipboard_text();
-        gui_.clipboard_native_sequence=sequence;
+    std::optional<std::uint64_t> native;
+    if(native_gui_ && interactive_station())native=native_gui_->clipboard_sequence();
+    const auto update=clipboard_notice(local?ClipboardNoticeAction::Mutation:ClipboardNoticeAction::Poll,0,0,native);
+    gui_.clipboard_sequence=update.state.sequence;
+    const bool changed=gui_.clipboard_seen_publication!=update.state.publication;
+    gui_.clipboard_native_sequence=native;
+    if(local){gui_.clipboard_dirty=true;return;}
+    if(native_gui_ && interactive_station() && (changed || !gui_.clipboard_native_text))gui_.clipboard_native_text=native_gui_->clipboard_text();
+    if(changed){
+        gui_.clipboard_seen_publication=update.state.publication;gui_.clipboard_stale=true;gui_.clipboard_owner=0;
+        for(const auto hwnd:gui_.clipboard_listeners)if(gui_.windows.contains(hwnd))enqueue_gui_message({hwnd,0,0,0x31d});
     }
-    if(local){++gui_.clipboard_sequence;gui_.clipboard_dirty=true;}
-    else if(changed){++gui_.clipboard_sequence;gui_.clipboard_stale=true;gui_.clipboard_owner=0;notify_clipboard();}
+    if(update.notify && update.state.viewer)gui_.clipboard_notifications[threads_.current].push_back({update.state.viewer,0,0,0x308});
 }
 void WindowsServices::pump_mouse_tracking(){
     if(gui_.mouse_tracking.empty())return;
@@ -279,10 +312,12 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
         if(native_gui_ && point!=constrained)native_gui_->set_cursor_position(constrained[0],constrained[1]);gui_.pointer_position=constrained;}
     trace.next("clipboard");
     // 明確的 Clipboard API 仍立即同步；事件輪詢僅為已登錄的監聽視窗查詢宿主。
-    if(!gui_.clipboard_listeners.empty() && runtime_.clock_ticks>=gui_.clipboard_poll_deadline){
+    if((!gui_.clipboard_listeners.empty() || !gui_.clipboard_viewers.empty()) && runtime_.clock_ticks>=gui_.clipboard_poll_deadline){
+        if(local_plain_service_)throw LocalServiceRefused{};
         gui_.clipboard_poll_deadline=runtime_.clock_ticks+160000;refresh_clipboard();
     }
     trace.next("remote_frames");poll_remote_frames();
+    trace.next("carets");pump_gui_carets(memory);
     trace.next("raster_flush");for(auto& [key,surface]:rasters_){(void)key;surface->flush();}
     trace.next("socket_lookup");poll_socket_lookups(memory);
     trace.next("network");pump_gui_network();
@@ -300,6 +335,7 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
     if (!native_gui_ || (!wait && wait_ticks==gui_native_poll_deferred)) return;
     // 宿主事件等待不得越過客體訊息計時器與排程 deadline；100 ns 為 Windows clock tick。
     auto bounded=wait?std::min(wait_ticks,UINT64_C(500000)):0;
+    const auto caret_deadline=gui_caret_deadline();bounded=std::min(bounded,caret_deadline>runtime_.clock_ticks?caret_deadline-runtime_.clock_ticks:0);
     for(const auto& [key,timer]:gui_.timers){(void)key;bounded=std::min(bounded,timer.deadline>runtime_.clock_ticks?timer.deadline-runtime_.clock_ticks:0);}
     for(const auto& [handle,w]:gui_.windows){(void)handle;if(w.header && w.header->filter_editing && w.header->filter_deadline)bounded=std::min(bounded,w.header->filter_deadline>runtime_.clock_ticks?w.header->filter_deadline-runtime_.clock_ticks:0);}
     bounded=std::min(bounded,gui_.attention.deadline()>runtime_.clock_ticks?gui_.attention.deadline()-runtime_.clock_ticks:0);
@@ -334,7 +370,18 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
             gui_.last_input_ticks=runtime_.clock_ticks;
             const auto key=[&](unsigned code,bool down){auto& value=gui_.async_keyboard[code];if(down && !(value&0x80))value|=1;value=static_cast<std::uint8_t>((value&1U)|(down?0x80U:0));};
             if(!physical_key){key(16,(msg.modifiers&1) || gui_.injected_keys[16]==1);key(17,(msg.modifiers&2) || gui_.injected_keys[17]==1);key(18,(msg.modifiers&4) || gui_.injected_keys[18]==1);}
-            if(msg.message==0x100 || msg.message==0x101 || msg.message==0x104 || msg.message==0x105)observe_gui_key(msg,false);
+            if(msg.message==0x100 || msg.message==0x101 || msg.message==0x104 || msg.message==0x105){
+                observe_gui_key(msg,msg.injected);
+                // 原生視窗注入沿用 SendInput 的 DirectInput 後台；保留按住／放開狀態，
+                // 不讓實體鍵盤快照抹掉尚未收到實體事件的注入輸入。
+                if(msg.injected && msg.wparam!=0xe7 && msg.wparam<256){
+                    auto scan=static_cast<unsigned>((msg.lparam>>16)&255U);
+                    if(msg.lparam&0x1000000U)scan|=0xe000U;
+                    if(!scan || msg.wparam==19)scan=windows_map_virtual_key(static_cast<unsigned>(msg.wparam),4);
+                    if(scan)inject_dinput(true,(scan&0xff00U)==0xe100U?0xc5U:(scan&255U)|((scan&0xff00U)?0x80U:0),
+                        msg.message==0x100 || msg.message==0x104?1:0,static_cast<std::uint32_t>(runtime_.clock_ticks/10000));
+                }
+            }
             if(physical_mouse || msg.message==0x10004){key(1,msg.wparam&1);key(2,msg.wparam&2);key(4,msg.wparam&16);key(5,msg.wparam&32);key(6,msg.wparam&64);}
         }
         // 實體按鍵的 Raw Input 來自宿主鍵盤狀態輪詢；注入（自動化）按鍵沒有實體狀態，比照 SendInput 在此產生。
@@ -365,6 +412,14 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
         }
         const auto found = gui_.windows.find(msg.window); if (found == gui_.windows.end()) continue;
         auto& w=found->second;if(w.desktop_object!=gui_.input_desktop)continue;
+        if(msg.message>=0xa0 && msg.message<=0xad){
+            if(!msg.injected)msg.queued_time=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
+            classify_gui_click(memory,msg,static_cast<std::int32_t>(msg.wparam));
+        }
+        if(msg.message==0x10009 || msg.message==0x10006){
+            if(!msg.injected)msg.queued_time=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
+            classify_gui_click(memory,msg,1,true);
+        }
         if(msg.message==0x1000d){
             if(msg.wparam && gui_.active!=msg.window && !(w.ex_style&0x08000000U))queue_gui_mouse(msg,true);
             continue;
@@ -607,9 +662,11 @@ std::optional<std::uint32_t> WindowsServices::advance_gui_modal(GuestState& stat
     }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
+    if(service.symbol=="InvalidateRect" || service.symbol=="InvalidateRgn")return invoke_graphics_compat(state,memory,service);
     if(invoke_remote_gui(state,memory,service))return std::nullopt;
     if(service.symbol.starts_with("SendMessageCallback") || service.symbol.starts_with("SendNotifyMessage") || service.symbol=="WaitMessage")return invoke_gui_async(state,memory,service);
     if(intercept_gui_cbt(state,memory,service))return std::nullopt;
+    if(invoke_remote_gui_message(state,memory,service))return std::nullopt;
     const WindowsCall arg(state, memory, service); const auto symbol = service.symbol;
     const auto dword = [&](unsigned index) { return static_cast<std::uint32_t>(arg(index)); };
     const bool wide = symbol.ends_with('W');
@@ -625,8 +682,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
             if(window.procedure && (window.paint_frame || window.paint_erase)){
                 std::vector<GuestCallback> callbacks;
                 if(window.paint_frame)callbacks.push_back({window.procedure,{msg.window,0x85,1,0}});
-                if(window.paint_erase)callbacks.push_back({window.procedure,{msg.window,0x14,dc_base+msg.window,0}});
-                window.paint_frame=false;window.paint_erase=false;
+                if(window.paint_erase)callbacks.push_back(gui_erase_callback(window.procedure,msg.window));
+                window.paint_frame=false;
                 callbacks.push_back({window.procedure,{msg.window,15,msg.wparam,msg.lparam}});
                 start_callbacks(state,memory,std::move(callbacks),continuation,value);return;
             }
@@ -748,6 +805,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                     remember_gui_message(*found);gui_write_message(memory, arg(0), *found); result = peek || found->message != 18 ? 1 : 0;
                     const bool queuesync=found->message==0x23 && remove;
                     if (remove) gui_.queue.erase(found);
+                    if(start_gui_hooks(state,memory,3,0,remove?1U:0U,arg(0),Continuation::GuiRetrievedMessage,result|(queuesync?2U:0U),wide))return std::nullopt;
                     if(queuesync && start_gui_hooks(state,memory,5,2,0,0,Continuation::Return,result))return std::nullopt;
                     break;
                 }
@@ -816,7 +874,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
         if (found == gui_.windows.end()) fail(dc_call ? 6 : 1400);
         else {
             auto& window = found->second;
-            if (symbol == "ShowWindow") {
+            if (symbol == "OpenIcon") {
+                if(window.show_command!=2)result=1;
+                else {start_callbacks(state,memory,{{resolve("user32.dll","SendMessageW").value,{handle,0x13,0,0}}},Continuation::GuiOpenIcon,handle);return std::nullopt;}
+            } else if (symbol == "ShowWindow") {
                 detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,handle,dword(1));
                 auto command=dword(1);
                 if(runtime_.startup_show!=UINT32_MAX && (!runtime_.startup_show_used || command==10)){command=runtime_.startup_show==10?1:runtime_.startup_show;runtime_.startup_show_used=true;}
@@ -862,7 +923,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                     window.owned_popup_hidden=!arg(2);
                     start_callbacks(state,memory,{{resolve("user32.dll","ShowWindow").value,{handle,arg(2)?4U:0U}}},Continuation::Return,0);return std::nullopt;
                 }
-                if (dword(1) == 0x81 || dword(1)==0x86) result = 1;
+                if (dword(1) == 0x13 || dword(1) == 0x81 || dword(1)==0x86) result = 1;
                 else if(dword(1)>=0x245 && dword(1)<=0x247 && promote_pointer_message(handle,arg(2),dword(1)))result=0;
                 else if(dword(1)==0x84)result=gui_window_hit(gui_,handle,static_cast<std::int16_t>(arg(3)),static_cast<std::int16_t>(arg(3)>>16));
                 else if(dword(1)==0x21){
@@ -907,7 +968,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                     if(proc && !(flags&1))callbacks.push_back({proc,{handle,5,window.show_command==2?1U:window.show_command==3?2U:0U,(window.width&65535U)|((window.height&65535U)<<16)}});
                     start_callbacks(state,memory,std::move(callbacks),Continuation::Return,0);return std::nullopt;
                 }
-                else if (dword(1) == 15) { window.invalid = false; std::erase_if(gui_.queue, [&](const auto& msg) { return msg.window == handle && msg.message == 15; }); }
+                else if (dword(1) == 15) { window.invalid = false;window.update_region.reset();window.paint_erase=false;window.internal_paint=false; std::erase_if(gui_.queue, [&](const auto& msg) { return msg.window == handle && msg.message == 15; }); }
+                else if(dword(1)==0x14){
+                    const auto* cls=gui_class_record(window.class_name);
+                    if(cls && cls->background){
+                        const auto scratch=allocate_heap(memory,16);if(!scratch){fail(8);complete_call(state,memory,0);return std::nullopt;}
+                        memory.write(GuestAddress{scratch},std::array<std::uint8_t,16>{});
+                        memory.store(GuestAddress{scratch+8},32,window.width);memory.store(GuestAddress{scratch+12},32,window.height);
+                        start_callbacks(state,memory,{{resolve("user32.dll","FillRect").value,{arg(2),scratch,cls->background}}},Continuation::ReturnCallbackFreeHeap,scratch);return std::nullopt;
+                    }
+                }
                 else if(const auto control=gui_control_message(memory,{handle,arg(2),arg(3),dword(1)},wide))result=*control;
                 else if (dword(1) == 12) { window.title = string(arg(3)); present_gui(handle); result = 1; }
                 else if(dword(1)==14)result=wide?window.title.size():utf16_to_utf8(window.title).size();
@@ -917,25 +987,29 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                 }
             } else if (symbol == "GetClientRect") {
                 memory.write(GuestAddress{arg(1)}, std::array<std::uint8_t, 16>{}); memory.store(GuestAddress{arg(1) + 8}, 32, window.width); memory.store(GuestAddress{arg(1) + 12}, 32, window.height); result = 1;
-            } else if (symbol == "InvalidateRect" || symbol == "InvalidateRgn") {
-                // 尚無 HRGN 後端；區域失效以整個視窗失效處理，只增加重繪，不遺漏更新。
-                invalidate_window(handle); if(arg(2))window.paint_erase=true; result = 1;
-            }
-            else if (symbol == "BeginPaint") {
+            } else if (symbol == "BeginPaint") {
                 detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,handle);
-                const unsigned unit=x86_?4U:8U;
-                memory.write(GuestAddress{arg(1)}, std::vector<std::uint8_t>(x86_?64:72)); memory.store(GuestAddress{arg(1)}, x86_?32:64, dc_base + handle);
-                memory.store(GuestAddress{arg(1)+unit},32,1);memory.store(GuestAddress{arg(1)+unit+12},32,window.width);memory.store(GuestAddress{arg(1)+unit+16},32,window.height);
-                window.invalid = false; window.drawing.clear();
-                if(gui_.contexts[dc_base+handle].window_frame){gui_.contexts[dc_base+handle]=GuiDc{};gui_.dc_objects[dc_base+handle]=0xb011;}
-                gui_.contexts[dc_base+handle].clipped=false;gui_.contexts[dc_base+handle].excluded.clear();gui_.contexts[dc_base+handle].application_clip.reset();gui_.contexts[dc_base+handle].meta_clip.reset();
-                std::erase_if(gui_.queue, [&](const auto& msg) { return msg.window == handle && msg.message == 15; }); result = dc_base + handle;
+                const unsigned unit=x86_?4U:8U;const auto region=gui_update_region(window),client=gui_client_region(window);
+                const auto bounds=gui_region_bounds(region);const bool erase=window.paint_erase && !region.empty();
+                memory.write(GuestAddress{arg(1)},std::vector<std::uint8_t>(x86_?64:72));memory.store(GuestAddress{arg(1)},x86_?32:64,dc_base+handle);
+                paint_gui_caret(memory,handle,true);
+                memory.store(GuestAddress{arg(1)+unit},32,erase);
+                for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(1)+unit+4+i*4},32,static_cast<std::uint32_t>(bounds[i]));
+                // 局部重繪必須留下先前命令；實體 raster 表面本來就保留像素。
+                if(region==client && !region.empty())window.drawing.clear();
+                window.invalid=false;window.update_region.reset();window.paint_erase=false;window.internal_paint=false;
+                auto& dc=gui_.contexts[dc_base+handle];
+                if(dc.window_frame){dc=GuiDc{};gui_.dc_objects[dc_base+handle]=0xb011;}
+                dc.application_clip.reset();dc.meta_clip.reset();dc.paint_clip=region;gui_refresh_dc_clip(dc);
+                std::erase_if(gui_.queue,[&](const auto& msg){return msg.window==handle && msg.message==15;});result=dc_base+handle;
+                if(erase && window.procedure){start_callbacks(state,memory,{{window.procedure,{handle,0x14,result,0}}},Continuation::GuiBeginPaint,arg(1));return std::nullopt;}
             } else if (symbol == "EndPaint") {
                 detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,handle);
                 memory.check(GuestAddress{arg(1)}, x86_?64:72, Access::Read);
                 if (memory.load(GuestAddress{arg(1)}, x86_?32:64) != dc_base + handle) throw HostCallFault("EndPaint 的 PAINTSTRUCT 不符合視窗");
                 if (native_gui_) present_native_window(handle, window); ++gui_.paints; result = 1;
-                gui_.contexts[dc_base+handle].clipped=false;gui_.contexts[dc_base+handle].excluded.clear();gui_.contexts[dc_base+handle].application_clip.reset();gui_.contexts[dc_base+handle].meta_clip.reset();
+                auto& dc=gui_.contexts[dc_base+handle];dc.application_clip.reset();dc.meta_clip.reset();dc.paint_clip.reset();gui_refresh_dc_clip(dc);
+                paint_gui_caret(memory,handle,false);
             } else if (symbol == "SetTextColor") { result = window.text_color; window.text_color = static_cast<std::uint32_t>(arg(1)); }
             else if (symbol == "SetBkMode") { if (dword(1) == 1 || dword(1) == 2) { result = window.background_mode; window.background_mode = static_cast<std::uint32_t>(arg(1)); } }
             else if (symbol == "FillRect") {

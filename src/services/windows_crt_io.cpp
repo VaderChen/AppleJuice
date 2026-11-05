@@ -275,12 +275,29 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
     if(descriptor_call && symbol!="_get_osfhandle" && symbol!="_isatty")lock_row(u32(0));
     if(symbol=="_dup2")lock_row(u32(1));
     if(tracked_stream)lock_stream(tracked_stream);
-    if(symbol=="fflush" && !arg(0)){
-        for(unsigned fd=1;fd<3;++fd)lock_stream(crt_stream(runtime_base_.value+0x800+fd*128));
-        for(const auto& [stream,file]:runtime_.streams)if(file.stdio && file.writable)lock_stream(stream);
+    const bool flush_all=symbol=="_flushall",close_all=symbol=="_fcloseall";
+    std::vector<std::uint64_t> all_streams;
+    if(flush_all || close_all || (symbol=="fflush" && !arg(0))){
+        if(!close_all)for(unsigned fd=flush_all?0U:1U;fd<3;++fd)
+            if(standard_open_[fd])all_streams.push_back(crt_stream(runtime_base_.value+0x800+fd*128));
+        for(const auto& [stream,file]:runtime_.streams)
+            if(file.stdio && (close_all?file.stdio_slot>=3:flush_all || file.writable))all_streams.push_back(stream);
+        // freopen 的標準串流亦存在 streams 表內，只取得一次鎖並計數一次。
+        std::sort(all_streams.begin(),all_streams.end());all_streams.erase(std::unique(all_streams.begin(),all_streams.end()),all_streams.end());
+        for(const auto stream:all_streams)lock_stream(stream);
     }
     const CrtIoScope io_scope(*this,state,memory,io_locks);
     if(!io_scope)return std::nullopt;
+    if(flush_all || close_all){
+        std::uint32_t count=0;bool success=true;
+        for(const auto stream:all_streams)if(auto* file=crt_file(stream)){
+            ++count;
+            // 沿用 FILE／lowio、文字轉換、pushback、commit 及關閉流程；單一失敗仍繼續其餘串流。
+            const bool done=close_all?crt_close_file(state,memory,stream,true):flush_crt_file(memory,*file,true);
+            success=done && success;
+        }
+        arg.return_to(state,close_all && !success?UINT32_MAX:count);return std::nullopt;
+    }
     if(descriptor_call)if(auto* file=crt_file(crt_descriptor_stream(u32(0)));file && !import_crt_lowio(memory,*file)){
         arg.return_to(state,symbol=="_isatty"?0:symbol=="_get_osfhandle" || symbol=="_lseeki64" || symbol=="_telli64" || symbol=="_filelengthi64"?UINT64_MAX:UINT32_MAX);return std::nullopt;}
     if(descriptor_call && symbol!="_close" && symbol!="_get_osfhandle" && symbol!="_isatty" && symbol!="_setmode")if(const auto* file=crt_file(crt_descriptor_stream(u32(0)));file && file->os_handle && !files_.contains(file->os_handle)){

@@ -27,12 +27,16 @@ bool WindowsServices::pending_gui_send(std::uint64_t thread,bool callbacks) cons
 }
 void WindowsServices::cancel_gui_send(std::uint64_t token,std::uint32_t error) {
     const auto found=gui_.sent_messages.find(token);if(found==gui_.sent_messages.end())return;
+    if(found->second.remote_sequence){auto& request=found->second;if(!request.remote_server)cancel_remote_family_request(request.remote_process,request.remote_sequence);request.error=error;request.result=0;request.done=true;request.active=false;return;}
     if(found->second.done){found->second.active=false;if(!found->second.sender)gui_.sent_messages.erase(found);return;}
     if(found->second.kind!=GuiSentMessage::Kind::Synchronous){queue_gui_send_callback(found->second,0);gui_.sent_messages.erase(found);return;}
     if(!found->second.sender && !found->second.abandoned && !found->second.rpc)discard_gui_control_notify(found->second.message);
     found->second.error=error;found->second.result=0;found->second.done=true;found->second.active=false;
 }
 void WindowsServices::cancel_gui_thread(std::uint64_t thread,GuestMemory& memory,const GuestState& state) {
+    gdi_batches_.erase(thread);
+    gui_.clipboard_notifications.erase(thread);
+    if(gui_.clipboard_open_thread==thread){(void)clipboard_notice(ClipboardNoticeAction::Close,0,thread);gui_.clipboard_open_thread=gui_.clipboard_open_window=0;if(gui_.clipboard_dirty)notify_clipboard();}
     std::vector<std::uint64_t> text_operations;
     for(const auto& [token,operation]:gui_text_thunks_)if(operation.thread==thread)text_operations.push_back(token);
     for(const auto token:text_operations)discard_gui_text_thunk(memory,state,token);
@@ -49,6 +53,8 @@ void WindowsServices::cancel_gui_thread(std::uint64_t thread,GuestMemory& memory
     release_raw_input(0,0,thread);
     std::erase_if(gui_.hotkeys,[&](const auto& entry){return entry.thread==thread;});
     gui_.keyboard_translation.erase(thread);
+    if(const auto caret=gui_.carets.find(thread);caret!=gui_.carets.end()){draw_gui_caret(memory,caret->second,false);gui_.carets.erase(caret);}
+    gui_.mouse_clicks.erase(thread);
     std::erase_if(gui_.send_callbacks,[&](const auto& entry){return entry.thread==thread;});
     std::erase_if(gui_.async_sends,[&](const auto& entry){return entry.second.thread==thread;});
     std::vector<std::uint64_t> creations;
@@ -81,6 +87,7 @@ void WindowsServices::cancel_gui_thread(std::uint64_t thread,GuestMemory& memory
             ++it;continue;
         }
         if(request.sender==thread){
+            if(request.remote_sequence && !request.remote_server)cancel_remote_family_request(request.remote_process,request.remote_sequence);
             if(request.active && request.receiver!=thread){request.sender=0;if(request.timed || request.rpc)request.abandoned=true;++it;}
             else {if(!request.sender && !request.rpc)discard_gui_control_notify(request.message);it=gui_.sent_messages.erase(it);}
         }else {if(request.receiver==thread){

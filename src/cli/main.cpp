@@ -558,7 +558,7 @@ int main(int argc, char** argv) {
 #endif
                 report_child_job_status(error);if(error){program.services.report_process_accounting();report_child_result(error,true);return 0;}
             }
-            if(!startup_suspended && !process_directory.empty())program.services.set_process_directory(std::move(process_directory));
+            if(!startup_suspended && !process_directory.empty())program.services.set_process_directory(program.memory,std::move(process_directory));
             if(program.memory.execution_mode()==ExecutionMode::X86 && program.state.fs_base)program.memory.store(GuestAddress{program.state.fs_base+0x20},32,program.services.process_id());
             if(program.state.gs_base)program.memory.store(GuestAddress{program.state.gs_base+0x40},64,program.services.process_id());
 
@@ -587,7 +587,7 @@ int main(int argc, char** argv) {
             // PE 載入完成與客體執行之前建立：暫停期間不執行客體碼也不會有視窗，父程序不再為它阻塞。
             // 初始化失敗時子程序隨後結束，與 Windows 程序初始化失敗的語義一致。
             if (native_gui){startup_profile::Scope measurement("startup","native_gui_init",true);program.services.enable_native_gui(gui_snapshot);}
-            if(startup_suspended && !process_directory.empty())program.services.set_process_directory(std::move(process_directory));
+            if(startup_suspended && !process_directory.empty())program.services.set_process_directory(program.memory,std::move(process_directory));
             complete_pe_load(program);
             *diagnostics << format_pe(program.metadata);
             *diagnostics << "unresolved_imports=" << program.services.unresolved_imports().size() << '\n';

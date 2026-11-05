@@ -28,7 +28,7 @@ bool succeeded(std::uint64_t result){return !(result&0x80000000U);}
 }
 std::span<const WindowsServiceDescriptor> com_proxy_service_descriptors(){
     static const auto table=[] {
-        std::vector<WindowsServiceDescriptor> entries{{"internal-com-proxy","Marshal",5},{"internal-com-proxy","Dispatch",1},{"internal-com-proxy","Retire",1},{"internal-com-proxy","ReleaseAt",2}};
+        std::vector<WindowsServiceDescriptor> entries{{"internal-com-proxy","Marshal",5},{"internal-com-proxy","Dispatch",1},{"internal-com-proxy","Retire",1},{"internal-com-proxy","ReleaseAt",2},{"internal-com-proxy","CallAt",3}};
         for(const auto& method:com_proxy::methods)entries.push_back({"internal-com-proxy",method.symbol,method.arguments,method.wide_arguments,0,method.narrow_arguments});
         return entries;
     }();return table;
@@ -170,6 +170,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_proxy(GuestState& state
                 }
                 op.pin_apartment=entry->key.apartment;op.proxy=op.object;op.object=entry->key.original;op.receiver=entry->key.owner;
             }
+        }else if(service.symbol=="CallAt"){
+            // 公寓內的一參數 HRESULT 回呼；沿用 COM 的排程、取消及返回契約。
+            op.type=Type::Callback;op.receiver=call(0);op.object=call(1);op.arguments={call(2)};
+            if(!op.object){call.return_to(state,pointer_error);return std::nullopt;}
+            if(!handles(GuestAddress{op.object}))memory.check(GuestAddress{op.object},1,Access::Execute);
         }else if(service.symbol=="Retire" || service.symbol=="ReleaseAt"){
             op.type=Type::Retire;
             if(service.symbol=="ReleaseAt")op.retirement=bridge.objects.retire_owned({call(0),call(1)}).retirement;else op.retirement=call(0);
@@ -225,6 +230,8 @@ std::optional<std::uint32_t> WindowsServices::advance_com_proxy_dispatch(GuestSt
                     // 入口與 stack 準備成功後才把引用交給真正的 Release。
                     if(!bridge.objects.start_retirement(op.retirement))throw HostCallFault("COM retirement ownership 不一致");op.retirement_started=true;return std::nullopt;
                 }
+            }else if(op.type==Type::Callback){
+                op.stage=Stage::Invoke;invoke({op.object,op.arguments});return std::nullopt;
             }else if(op.type==Type::Marshal){
                 op.exported.reserve(1);op.retirements.reserve(4);op.stage=Stage::Invoke;
                 if(op.kind==Kind::Unknown){
@@ -357,6 +364,7 @@ std::optional<std::uint32_t> WindowsServices::resume_com_proxy_dispatch(GuestSta
         else {op.exported.push_back({op.sender,result});op.stage=Stage::Fields;}
     }else if(op.stage==Stage::Invoke){
         if(op.type==Type::Retire){if(op.retirement_started)(void)bridge.objects.finish_retirement(op.retirement);op.retirement_started=false;op.stage=Stage::Release;}
+        else if(op.type==Type::Callback){op.result=static_cast<std::uint32_t>(result);op.stage=Stage::Release;}
         else if(op.type==Type::Marshal){
             // AddRef 的 ULONG 高位不是 HRESULT；來源實際引用已經取得。
             if(op.marshal_query_output){

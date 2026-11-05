@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include "x64arm/windows_transform.hpp"
+#include "gui_paint_region.hpp"
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> gdi_state_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
@@ -62,13 +63,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
         return width && height?GuiRegion{{0,0,static_cast<std::int32_t>(width),static_cast<std::int32_t>(height)}}:GuiRegion{};
     };
     const auto effective=[&](const GuiDc& value,bool bounded){
-        std::optional<GuiRegion> region=value.application_clip;
-        if(value.meta_clip)region=region?gui_region_combine(*region,*value.meta_clip,1):value.meta_clip;
+        auto region=gui_dc_clip(value);
         if(!region)return visible();return bounded?gui_region_combine(*region,visible(),1):*region;
     };
     const auto update=[&](GuiDc& value){
-        value.clipped=value.application_clip.has_value() || value.meta_clip.has_value();value.excluded.clear();
-        if(value.clipped){const auto region=effective(value,false);value.clip=gui_region_bounds(region);value.excluded=gui_region_combine(GuiRegion{value.clip},region,4);}
+        gui_refresh_dc_clip(value);
     };
     const auto write_rect=[&](std::uint64_t at,const GuiRect& rect){memory.check(GuestAddress{at},16,Access::Write);for(unsigned i=0;i<4;++i)memory.store(GuestAddress{at+i*4},32,static_cast<std::uint32_t>(rect[i]));};
     try{
@@ -121,7 +120,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
             if(!level || found==gui_.saved_contexts.end())return failure(87);auto& saved=found->second;
             const auto index=level>0?static_cast<std::int64_t>(level)-1:static_cast<std::int64_t>(saved.size())+level;
             if(index<0 || static_cast<std::uint64_t>(index)>=saved.size())return failure(87);
-            const auto restored=saved[static_cast<std::size_t>(index)];dc=restored;saved.resize(static_cast<std::size_t>(index));
+            auto restored=saved[static_cast<std::size_t>(index)];restored.paint_clip=dc.paint_clip;update(restored);dc=std::move(restored);saved.resize(static_cast<std::size_t>(index));
             if(window!=gui_.windows.end()){window->second.text_color=dc.color;window->second.background_mode=dc.mode;}
             gui_.dc_objects[arg(0)]=dc.font;return finish(1);
         }
@@ -146,7 +145,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
             return finish(!gui_rect_empty(r) && !gui_region_combine(region,gui_transform_region_rect(gui_device_transform(dc),r),1).empty());
         }
         GuiDc changed=dc;
-        if(name=="SetMetaRgn"){changed.meta_clip=effective(dc,false);changed.application_clip.reset();}
+        if(name=="ExcludeUpdateRgn"){
+            const auto target=gui_.windows.find(arg(1));if(target==gui_.windows.end())return failure(1400);
+            auto region=gui_update_region(target->second);
+            if(window!=gui_.windows.end() && window->first!=target->first){
+                const auto source_origin=gui_client_origin(gui_,target->first),dc_origin=gui_client_origin(gui_,window->first);
+                for(auto& r:region)for(unsigned i=0;i<4;++i){const auto value=static_cast<std::int64_t>(r[i])+source_origin[i%2]-dc_origin[i%2];if(value<INT32_MIN || value>INT32_MAX)return failure(87);r[i]=static_cast<std::int32_t>(value);}
+            }
+            changed.application_clip=gui_region_combine(dc.application_clip.value_or(visible()),region,4);
+        }
+        else if(name=="SetMetaRgn"){changed.meta_clip=gui_dc_clip(dc,false).value_or(visible());changed.application_clip.reset();}
         else if(name=="SelectClipRgn" || name=="ExtSelectClipRgn"){
             const auto mode=name=="SelectClipRgn"?5:static_cast<unsigned>(arg(2));
             if(mode<1 || mode>5 || (!arg(1) && mode!=5))return failure(87);

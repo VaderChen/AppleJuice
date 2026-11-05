@@ -2,6 +2,8 @@
 // 只使用 volatile GPR；不變更 XMM、非 volatile GPR 或 RSP（RET 除外）。
 // TLS 的 64 個內建槽與 1024 個擴充槽沿用 WindowsServices 的既有配置。
 #include "guest_tls_layout.h"
+#include "guest_once_layout.h"
+#include "gdi_batch_layout.h"
 .intel_syntax noprefix
 .text
 .macro entry name
@@ -109,6 +111,72 @@ Lslot_\name:
     .quad 0
 end \name
 .endm
+
+// 只有 provider 已發布、物件字組也相符的已完成結果可直接返回。
+// 初始化、回呼、等待、重試及重新使用物件的狀態轉移仍走原服務。
+// volatile 暫存器保留 RCX/RDX/R8/R9，任何 miss 都能用原參數尾跳。
+.macro once_completed name, begin
+entry \name
+.if \begin
+    test edx, -2
+    jne 9f
+    test r8b, 3
+    jne 9f
+.endif
+    test cl, 7
+    jne 9f
+    test r9b, 7
+    jne 9f
+    mov rax, rcx
+    shr rax, 3
+    // 折疊高位，避免不同配置區中相同低位偏移的物件持續互相逐出。
+    mov r11, rax
+    shr r11, X64ARM_ONCE_CACHE_BITS
+    xor rax, r11
+    and eax, X64ARM_ONCE_CACHE_COUNT-1
+    shl eax, 4
+    .byte 0x49, 0xbb // mov r11, imm64；沿既有頁位址修補，不保留外部重定位。
+Lonce_patch\@:
+    .quad 0
+.set _guest_\name\()_once_cache_patch, Lonce_patch\@ - _guest_\name
+    mov r11, qword ptr [r11+X64ARM_ONCE_CACHE_POINTER_OFFSET]
+    cmp r11, 1
+    jbe 9f
+    add r11, rax
+    cmp qword ptr [r11], rcx
+    jne 9f
+    mov r10, qword ptr [r11+8]
+    cmp qword ptr [r11], rcx
+    jne 9f
+    // 同值 CAS 同時核對物件世代與可寫性；不以純讀省略 provider 的 Write 契約。
+    mov rax, r10
+    lock cmpxchg qword ptr [rcx], r10
+    jne 9f
+.if \begin
+    // 先驗證全部輸出再提交，失敗 CAS 也不改變原值。
+    xor eax, eax
+    lock cmpxchg dword ptr [r8], eax
+.endif
+    test r9, r9
+    je 1f
+    xor eax, eax
+    lock cmpxchg qword ptr [r9], rax
+1:
+.if \begin
+    mov dword ptr [r8], 0
+.endif
+    test r9, r9
+    je 2f
+    and r10, -4
+    mov qword ptr [r9], r10
+2:
+    mov eax, 1
+    ret
+9:
+slow_end \name
+.endm
+once_completed InitOnceBeginInitialize, 1
+once_completed InitOnceExecuteOnce, 0
 
 entry AcquireSRWLockExclusive
     xor eax, eax
@@ -531,5 +599,167 @@ entry __chkstk
 2:
     ret
 end __chkstk
+// 本程序版本直接讀目前 TEB／PEB 與 PE 標頭；遠端 PID、損毀標頭由宿主完整流程承接。
+entry GetProcessVersion
+    test ecx, ecx
+    jz 1f
+    cmp ecx, dword ptr gs:[0x40]
+    jne 9f
+1:
+    mov rdx, qword ptr gs:[0x60]
+    mov rdx, qword ptr [rdx+0x10]
+    cmp word ptr [rdx], 0x5a4d
+    jne 9f
+    mov eax, dword ptr [rdx+60]
+    cmp eax, -77
+    ja 9f
+    add rdx, rax
+    cmp dword ptr [rdx], 0x4550
+    jne 9f
+    cmp word ptr [rdx+24], 0x20b
+    jne 9f
+    movzx eax, word ptr [rdx+72]
+    shl eax, 16
+    movzx edx, word ptr [rdx+74]
+    or eax, edx
+    ret
+9:
+slow_end GetProcessVersion
+// 共用 EH／fiber 邊界發布的目前計數；僅使用 volatile RAX 與旗標。
+entry CxxUncaughtCount
+    mov eax, dword ptr gs:[X64ARM_CXX_X64_UNCAUGHT_OFFSET]
+    ret
+end CxxUncaughtCount
+entry CxxUncaughtAny
+    mov eax, dword ptr gs:[X64ARM_CXX_X64_UNCAUGHT_OFFSET]
+    test eax, eax
+    setne al
+    movzx eax, al
+    ret
+end CxxUncaughtAny
+// 與 x86／宿主查詢相同，讀取 Win64 PEB 的 CurrentDirectory，無宿主呼叫。
+entry CrtGetDrive
+    mov rcx, qword ptr gs:[0x60]
+    mov rcx, qword ptr [rcx+0x20]
+    test rcx, rcx
+    jz 1f
+    cmp word ptr [rcx+0x38], 4
+    jb 1f
+    mov rdx, qword ptr [rcx+0x40]
+    test rdx, rdx
+    jz 1f
+    test byte ptr [rcx+8], 1
+    jnz 2f
+    add rdx, rcx
+2:
+    cmp word ptr [rdx+2], 58
+    jne 1f
+    movzx eax, word ptr [rdx]
+    or eax, 32
+    sub eax, 97
+    cmp eax, 25
+    ja 1f
+    inc eax
+    ret
+1:
+    xor eax, eax
+    ret
+end CrtGetDrive
+
+// Winsock 純數值轉換；保留 LastError，無指標存取或宿主服務。
+entry WinsockSwap16
+    mov eax, ecx
+    rol ax, 8
+    movzx eax, ax
+    ret
+end WinsockSwap16
+entry WinsockSwap32
+    mov eax, ecx
+    bswap eax
+    ret
+end WinsockSwap32
+
+// 不可變 NLS 目錄的群組位元圖由同一份宿主資料修補，查詢不離開常駐執行。
+entry IsValidLanguageGroup
+    sub ecx, 1
+    cmp ecx, 16
+    ja 1f
+    sub edx, 1
+    cmp edx, 1
+    ja 1f
+    .byte 0xb8 // mov eax, imm32
+Llanguage_groups_patch:
+    .long 0
+    bt eax, ecx
+    setc al
+    movzx eax, al
+    ret
+1:
+    xor eax, eax
+    ret
+end IsValidLanguageGroup
+.set _guest_language_groups_patch, Llanguage_groups_patch - _guest_IsValidLanguageGroup
+.macro gui_timing name, offset, setter
+entry \name
+    .byte 0x48,0xb8 // movabs rax, 客體時序指標槽
+Lgui_timing_\name:
+    .quad 0
+    mov rax, qword ptr [rax]
+.if \setter
+.if \offset == 0
+    mov edx, 500
+    test ecx, ecx
+    cmovz ecx, edx
+    mov edx, 5000
+    cmp ecx, edx
+    cmova ecx, edx
+.endif
+    mov dword ptr [rax+\offset], ecx
+    mov eax, 1
+.else
+    mov eax, dword ptr [rax+\offset]
+.endif
+    ret
+end \name
+.globl _guest_\name\()_gui_timing_patch
+.set _guest_\name\()_gui_timing_patch, Lgui_timing_\name - _guest_\name
+.endm
+gui_timing GetDoubleClickTime, 0, 0
+gui_timing GetCaretBlinkTime, 4, 0
+gui_timing SetDoubleClickTime, 0, 1
+gui_timing SetCaretBlinkTime, 4, 1
+// 空批次直接讀寫目前 TEB；有待發布的像素則保留 ABI 尾跳共用 GDI provider。
+entry GdiFlush
+    cmp dword ptr gs:[X64ARM_GDI_BATCH_X64_OFFSET+X64ARM_GDI_BATCH_PENDING_OFFSET], 0
+    jne 1f
+    mov eax, 1
+    ret
+1:
+slow_end GdiFlush
+
+entry GdiGetBatchLimit
+    cmp dword ptr gs:[X64ARM_GDI_BATCH_X64_OFFSET+X64ARM_GDI_BATCH_PENDING_OFFSET], 0
+    jne 1f
+    mov eax, dword ptr gs:[X64ARM_GDI_BATCH_X64_OFFSET]
+    mov edx, X64ARM_GDI_BATCH_DEFAULT
+    test eax, eax
+    cmovz eax, edx
+    ret
+1:
+slow_end GdiGetBatchLimit
+
+entry GdiSetBatchLimit
+    cmp dword ptr gs:[X64ARM_GDI_BATCH_X64_OFFSET+X64ARM_GDI_BATCH_PENDING_OFFSET], 0
+    jne 1f
+    mov eax, dword ptr gs:[X64ARM_GDI_BATCH_X64_OFFSET]
+    mov edx, X64ARM_GDI_BATCH_DEFAULT
+    test eax, eax
+    cmovz eax, edx
+    test ecx, ecx
+    cmovz ecx, edx
+    mov dword ptr gs:[X64ARM_GDI_BATCH_X64_OFFSET], ecx
+    ret
+1:
+slow_end GdiSetBatchLimit
 .globl _guest_thread_end
 _guest_thread_end:

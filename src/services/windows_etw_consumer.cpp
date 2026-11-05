@@ -8,7 +8,7 @@ std::optional<std::uint32_t> WindowsServices::finish_etw_exception(GuestState& s
     const auto dispatch=exceptions_.stack.back();const auto found=etw_processes_.find(dispatch.etw_thread);
     if(found==etw_processes_.end())throw HostCallFault("ETW 例外邊界沒有 ProcessTrace operation");const auto saved=found->second.saved;
     if(x86_)memory.store(GuestAddress{saved.fs_base},32,dispatch.etw_seh_boundary);
-    discard_callbacks(dispatch.etw_callback_depth,state,memory);discard_etw_process(state,memory,dispatch.etw_thread);exceptions_.stack.resize(dispatch.etw_exception_depth);
+    discard_callbacks(dispatch.etw_callback_depth,state,memory);discard_etw_process(state,memory,dispatch.etw_thread);exceptions_.stack.resize(dispatch.etw_exception_depth);sync_msvc_uncaught(memory);
     state=saved;threads_.items.at(dispatch.etw_thread).wait={};complete_call(state,memory,998);return {};
 }
 void WindowsServices::discard_etw_process(GuestState& state,GuestMemory& memory,std::uint64_t thread){

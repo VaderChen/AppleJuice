@@ -7,11 +7,28 @@
 #include <span>
 #include <string>
 #include <vector>
+#include "x64arm/audio_effects.hpp"
 namespace x64arm::midi {
 struct Event {std::uint64_t frame{};std::uint8_t status{},first{},second{};std::vector<std::uint8_t> sysex{};};
 struct Tempo {std::uint32_t music{};std::uint64_t frame{};double bpm{120};};
 struct TimeSignature {std::uint32_t music{};std::uint8_t beats{4},beat{4};std::uint16_t grids{4};};
+struct SoundBank {
+    struct NoteRange {std::uint32_t low{},high{127};};
+    struct Instrument {std::uint32_t patch{};std::u16string name;std::size_t header{};};
+    std::vector<std::uint8_t> bytes;
+    std::vector<Instrument> instruments;
+    std::array<std::uint8_t,16> id{};
+    void set_patch(std::size_t index,std::uint32_t patch);
+    SoundBank select_instrument(std::size_t index,std::span<const NoteRange> ranges={}) const;
+};
+SoundBank parse_sound_bank(std::span<const std::uint8_t>);
 struct Sequence {
+    struct Segment {
+        bool present{};
+        std::uint32_t repeats{},start{},loop_start{},loop_end{},resolution{};
+        struct Bank {std::array<std::uint8_t,16> id{};std::u16string filename;};
+        std::vector<Bank> banks;
+    } segment;
     std::vector<Event> events;
     std::vector<Tempo> tempos{{0,0,120}};
     std::vector<TimeSignature> signatures{{0,4,4,4}};
@@ -19,12 +36,14 @@ struct Sequence {
     std::uint64_t frame_at(std::uint32_t music) const;
     std::uint32_t music_at(std::uint64_t frame) const;
 };
-// Standard MIDI file format 0/1, PPQ division; timeline is 48 kHz.
+// 標準 MIDI 0／1 與 RIFF DirectMusic 樂段；共用 48 kHz 時間軸。
 Sequence parse(std::span<const std::uint8_t> bytes);
 std::vector<Event> chase(const Sequence&,std::uint64_t frame);
 struct Stream;
 struct Playback {
     std::mutex mutex;
+    std::string output_device;
+    std::vector<std::shared_ptr<audio::Effect>> effects;
     std::shared_ptr<const Sequence> sequence;
     std::size_t next{};
     std::uint64_t position{},elapsed{};
@@ -92,6 +111,8 @@ public:
     virtual ~Output()=default;
     virtual bool short_message(std::uint8_t status,std::uint8_t first,std::uint8_t second)=0;
     virtual bool system_exclusive(std::span<const std::uint8_t> bytes)=0;
+    virtual bool load_sound_bank(std::shared_ptr<const SoundBank>)=0;
+    virtual bool unload_sound_bank(const std::shared_ptr<const SoundBank>&)=0;
 };
 struct InputDevice {std::uint32_t endpoint{};std::string name;};
 struct InputPacket {std::uint32_t milliseconds{};std::vector<std::uint8_t> bytes;bool overflow{};};

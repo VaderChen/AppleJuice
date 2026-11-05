@@ -82,9 +82,18 @@ std::vector<GuestCallback> WindowsServices::retire_com_context(GuestState& state
     const auto owner=(initialized->second&2U)?thread:0;
     if(!owner && std::any_of(gui_.com_initializations.begin(),gui_.com_initializations.end(),
         [&](const auto& row){return row.first!=thread && row.second>=16 && !(row.second&2U);}))return {};
-    auto result=runtime_.com_contexts.contexts.retire(owner);if(!result.disposal)return {};
+    std::vector<GuestCallback> pending;
+    const auto token=runtime_.com_contexts.contexts.current(owner);
+    // 延遲封送的原始引用不能帶出已結束的公寓；agile 來源本身不受此限制。
+    if(token)for(auto& [address,reference]:runtime_.com_agile.objects){
+        (void)address;if(reference.context!=*token || reference.agile || !reference.source)continue;
+        if(callbacks)pending.push_back({context_method(memory,reference.source,2),{reference.source}});
+        reference.source=0;
+    }
+    auto result=runtime_.com_contexts.contexts.retire(owner);if(!result.disposal)return pending;
     (void)free_heap(memory,result.disposal->token,state);
-    return callbacks?release_context_properties(memory,result.disposal->properties):std::vector<GuestCallback>{};
+    if(callbacks){auto properties=release_context_properties(memory,result.disposal->properties);pending.insert(pending.end(),properties.begin(),properties.end());}
+    return pending;
 }
 std::vector<GuestCallback> WindowsServices::release_context_enumerator(GuestState& state,GuestMemory& memory,std::uint64_t object){
     auto& enums=runtime_.com_contexts.enumerators;const auto found=enums.find(object);if(found==enums.end())return {};

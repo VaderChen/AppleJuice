@@ -12,6 +12,7 @@
 #include "appcontainer_identity.hpp"
 #include "x64arm/system_performance.hpp"
 #include "windows_native_process_parameters.hpp"
+#include "crt_os_error.hpp"
 #include <algorithm>
 #include <bit>
 #include <functional>
@@ -111,7 +112,7 @@ std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
         {"kernel32.dll","NeedCurrentDirectoryForExePathA",1},{"kernel32.dll","NeedCurrentDirectoryForExePathW",1},
         {"kernel32.dll","GetEnvironmentStrings",0},{"kernel32.dll","GetEnvironmentStringsA",0},{"kernel32.dll","GetEnvironmentStringsW",0},
         {"kernel32.dll","FreeEnvironmentStringsA",1},{"kernel32.dll","FreeEnvironmentStringsW",1},
-        {"kernel32.dll","SetCurrentDirectoryA",1},{"kernel32.dll","SetCurrentDirectoryW",1},{"crt","_chdir",1},{"crt","_wchdir",1},
+        {"kernel32.dll","SetCurrentDirectoryA",1},{"kernel32.dll","SetCurrentDirectoryW",1},{"crt","_chdir",1},{"crt","_wchdir",1},{"crt","_chdrive",1},
         {"kernel32.dll","GetNumaHighestNodeNumber",1},{"kernel32.dll","GetPhysicallyInstalledSystemMemory",1},
         {"kernel32.dll","GetNumaNodeProcessorMask",2},{"kernel32.dll","GetNumaNodeProcessorMaskEx",2},
         {"kernel32.dll","GetNumaAvailableMemoryNode",2},{"kernel32.dll","GetNumaAvailableMemoryNodeEx",2},
@@ -198,6 +199,33 @@ void WindowsServices::rebuild_crt_environment(GuestMemory& memory,const GuestSta
     runtime_.environment_values=std::move(values);
     if (runtime_.environment_allocation && runtime_.environment_allocation!=runtime_.initial_environ) free_heap(memory,runtime_.environment_allocation,state);
     runtime_.environment_allocation=base;
+}
+// CLI 啟動、Win32 及 CRT 共用同一份工作目錄；PEB 字串供 resident AOT 查詢使用。
+// 緩衝區只在容量不足時成長，避免切換目錄逐次消耗程序 arena。
+std::uint32_t WindowsServices::change_current_directory(GuestMemory& memory,std::u16string directory){
+    auto published=directory;if(!published.empty() && published.back()!=u'\\')published+=u'\\';
+    if(published.size()>32766)return 206;
+    const auto bytes=utf16_bytes(published);
+    const auto layout=detail::ProcessParameterLayout::for_x86(x86_);const auto bits=static_cast<std::uint8_t>(layout.unit*8);
+    const auto parameters=runtime_.image.base?memory.load(GuestAddress{peb_base_.value+(x86_?0x10U:0x20U)},bits):0;
+    std::uint64_t field=0,buffer=0,capacity=0;bool normalized=true;
+    if(parameters){
+        normalized=(memory.load(GuestAddress{parameters+8},32)&1U)!=0;
+        field=parameters+layout.strings[0];memory.check(GuestAddress{field},layout.unit*2,Access::Write);
+        capacity=memory.load(GuestAddress{field+2},16);buffer=memory.load(GuestAddress{field+layout.unit},bits);
+        if(buffer && !normalized)buffer+=parameters;
+        if(!buffer || capacity<bytes.size()){
+            capacity=std::min<std::size_t>(65534,std::max<std::size_t>({520,bytes.size(),static_cast<std::size_t>(capacity)*2}));
+            buffer=runtime_allocate(memory,{},capacity);
+        }
+        memory.check(GuestAddress{buffer},bytes.size(),Access::Write);
+    }
+    const auto error=filesystem_.set_current_directory(utf16_to_utf8(directory));if(error)return error;
+    if(field){
+        memory.write(GuestAddress{buffer},bytes);memory.store(GuestAddress{field},16,bytes.size()-2);
+        memory.store(GuestAddress{field+2},16,capacity);memory.store(GuestAddress{field+layout.unit},bits,normalized?buffer:buffer-parameters);
+    }
+    runtime_.current_directory=std::move(directory);return 0;
 }
 void WindowsServices::discard_policy_thread(std::uint64_t thread){
     const auto now=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -640,22 +668,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
             else if(capacity<required) {memory.store(GuestAddress{size},32,required);last_error_=extended?234:111;}
             else {memory.write(GuestAddress{buffer},bytes);memory.store(GuestAddress{size},32,required-1);result=1;}
         }
-    } else if (symbol.starts_with("SetCurrentDirectory") || symbol=="_chdir" || symbol=="_wchdir") {
-        const bool crt=symbol.front()=='_';std::uint32_t directory_error=0;
-        if(!arg(0))directory_error=87;
+    } else if (symbol.starts_with("SetCurrentDirectory") || symbol=="_chdir" || symbol=="_wchdir" || symbol=="_chdrive") {
+        const bool crt=symbol.front()=='_',drive=symbol=="_chdrive";std::uint32_t directory_error=0;
+        const auto number=static_cast<std::int32_t>(arg(0));const bool invalid=drive?(number<1 || number>26):!arg(0);
+        if(invalid)directory_error=drive?15:87;
         else try {
-            const auto input=text(0);
+            const auto input=drive?std::u16string{static_cast<char16_t>(u'A'+number-1),u':'}:text(0);
             if(input.empty())directory_error=123;
             else {
-                const auto directory=normalized_windows_path(input,runtime_.current_directory);
-                const auto error=filesystem_.set_current_directory(utf16_to_utf8(directory));
-                if(error)directory_error=error;else {runtime_.current_directory=directory;result=1;}
+                const auto directory=normalized_windows_path(full_windows_environment_path(input,runtime_.current_directory,runtime_.environment),runtime_.current_directory);
+                directory_error=change_current_directory(memory,directory);
+                if(!directory_error){
+                    result=1;
+                    if(crt && !drive && directory.size()>=2 && directory[1]==u':'){
+                        const auto key=std::u16string{u'=',windows_path_upper(directory[0]),u':'};
+                        runtime_.environment[key]={key,directory};
+                    }
+                }
             }
         } catch(const std::invalid_argument&) {directory_error=123;}
+          catch(const std::bad_alloc&) {directory_error=8;}
         if(crt){
             result=directory_error?UINT32_MAX:0;
-            if(directory_error)memory.store(GuestAddress{runtime_.errno_cell},32,directory_error==87?22:directory_error==5?13:2);
-            if(!arg(0)){
+            if(directory_error)crt_os_error::store(memory,runtime_.errno_cell,directory_error);
+            if(invalid){
                 if(current_invalid_parameter_handler()){start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,result);return std::nullopt;}
                 return 0xc0000409U;
             }

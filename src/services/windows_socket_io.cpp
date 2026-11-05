@@ -71,7 +71,7 @@ std::uint32_t disconnect_socket(NativeSocket& socket,bool reuse) {
        ::setsockopt(socket.descriptor,SOL_SOCKET,SO_REUSEADDR,&enabled,sizeof(enabled))<0 ||
        ::setsockopt(next,SOL_SOCKET,SO_REUSEADDR,&enabled,sizeof(enabled))<0)return close_next(socket_error(errno));
     (void)::shutdown(socket.descriptor,SHUT_RDWR);::close(socket.descriptor);socket.descriptor=next;
-    socket.accepted_at=UINT64_MAX;socket.accept_listener=0;socket.accept_context=socket.connect_context=socket.listening=false;socket.reusable=true;socket.send_shutdown=false;
+    socket.accepted_at=UINT64_MAX;socket.accept_listener=0;socket.accept_context=socket.connect_context=socket.listening=false;socket.reusable=true;socket.send_shutdown=false;socket.shared->data().connect_result.store(0);
     const auto address=native_address(local);if(!address.size)return 10022;
     if(::bind(next,reinterpret_cast<const sockaddr*>(&address.storage),address.size)<0)return socket_error(errno);
     if(::setsockopt(next,SOL_SOCKET,SO_REUSEADDR,&original_reuse,sizeof(original_reuse))<0)return socket_error(errno);
@@ -158,6 +158,8 @@ void WindowsServices::poll_socket_io(GuestMemory& memory) {
                     const auto address=native_address(io.address);const auto flags=::fcntl(fd,F_GETFL);
                     if(flags<0 || ::fcntl(fd,F_SETFL,flags|O_NONBLOCK)<0)io.error=socket_error(errno);
                     else {const auto status=::connect(fd,reinterpret_cast<const sockaddr*>(&address.storage),address.size),error=errno;io.started=true;
+                        socket.shared->data().connect_result.store(!status?2:((error==EINPROGRESS || error==EALREADY || error==EINTR)?1:static_cast<std::uint16_t>(socket_error(error))));
+                        if(const auto watch=gui_.socket_watches.find(io.socket);watch!=gui_.socket_watches.end())watch->second.connecting=true;
                         if(std::getenv("X64ARM_TRACE_NETWORK_STATE")){
                             char host[NI_MAXHOST]{},port[NI_MAXSERV]{};
                             if(!::getnameinfo(reinterpret_cast<const sockaddr*>(&address.storage),address.size,host,sizeof(host),port,sizeof(port),NI_NUMERICHOST|NI_NUMERICSERV))
@@ -172,8 +174,12 @@ void WindowsServices::poll_socket_io(GuestMemory& memory) {
                     }
                 }
                 if(!io.error && !io.connected){pollfd entry{fd,POLLOUT,0};const auto ready=::poll(&entry,1,0);if(ready<0)io.error=socket_error(errno);else if(!ready)continue;
-                    else{int error=0;socklen_t size=sizeof(error);if(::getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&size)<0)io.error=socket_error(errno);else if(error)io.error=socket_error(error);else io.connected=true;}
+                    else{const auto recorded=socket.shared->data().connect_result.load();int error=0;socklen_t size=sizeof(error);
+                        if(recorded>2)io.error=recorded;
+                        else if(recorded==2)io.connected=true;
+                        else if(::getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&size)<0)io.error=socket_error(errno);else if(error)io.error=socket_error(error);else io.connected=true;}
                 }
+                if(io.error || io.connected)socket.shared->data().connect_result.store(static_cast<std::uint16_t>(io.error?io.error:2));
                 if(!io.error && io.connected){socket.accepted_at=socket.accepted_at==UINT64_MAX?socket_clock_ticks():socket.accepted_at;socket.connect_context=false;socket.reusable=false;
                     if(io.transferred<io.data.size()){const auto size=::send(fd,io.data.data()+io.transferred,io.data.size()-io.transferred,send_flags(0));
                         if(size<0){if(errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR)continue;io.error=socket_error(errno);}
@@ -186,7 +192,8 @@ void WindowsServices::poll_socket_io(GuestMemory& memory) {
                 gui_.socket_watches.erase(io.socket);
             }else{
                 const bool sending=io.kind==PendingSocketIo::Kind::Send;const auto address=native_address(io.address);sockaddr_storage source{};
-                const auto available=io.data.size()-io.transferred;
+                const auto remaining=io.data.size()-io.transferred;
+                const auto available=sending && io.send_chunk?std::min<std::size_t>(remaining,io.send_chunk):remaining;
                 // 零長度 receive 在資料／EOF 到達時完成，不消耗該資料。
                 if(!sending && !available && socket.type!=SOCK_DGRAM){pollfd entry{fd,static_cast<short>(io.flags&1?POLLPRI:POLLIN),0};if(::poll(&entry,1,0)<=0)continue;}
                 const int flags=sending?send_flags(io.flags):MSG_DONTWAIT|(io.flags&1?MSG_OOB:0)|(io.flags&2?MSG_PEEK:0);
@@ -201,6 +208,11 @@ void WindowsServices::poll_socket_io(GuestMemory& memory) {
                     if(!io.error && socket.type==SOCK_STREAM && (sending || (io.flags&8)) && size && io.transferred<io.data.size())continue;
                 }
             }
+        }
+        if(!io.error && io.transmit_file && (io.transmit_flags&1U) && found!=network.sockets.end()){
+            io.error=disconnect_socket(*found->second,(io.transmit_flags&2U)!=0);
+            for(auto& pending:network.pending_socket_io)if(&pending!=&io && pending.socket==io.socket && !pending.done)pending.error=995;
+            gui_.socket_watches.erase(io.socket);
         }
         io.done=true;
         if(std::getenv("X64ARM_TRACE_NETWORK_STATE")){
@@ -229,7 +241,7 @@ void WindowsServices::poll_socket_io(GuestMemory& memory) {
 std::optional<std::uint32_t> WindowsServices::invoke_socket_io(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;auto& network=runtime_.network;
     const bool controlling=symbol=="WSAIoctl",messaging=symbol=="WSASendMsg",message_receive=symbol=="WSARecvMsg",connect=symbol=="ConnectEx",disconnect=symbol=="DisconnectEx",sending=symbol.starts_with("WSASend"),addressed=messaging || message_receive || symbol=="WSASendTo" || symbol=="WSARecvFrom";
-    const bool extension=connect || disconnect;const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
+    const bool transmit=symbol=="TransmitFile",extension=connect || disconnect || transmit;const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
     const auto d=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
     std::uint64_t result=extension?0:UINT32_MAX;const auto fail=[&](std::uint32_t error){last_error_=error;result=extension?0:UINT32_MAX;};
     try {
@@ -240,8 +252,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_socket_io(GuestState& state
             auto& socket=*found->second;PendingSocketIo io;io.socket=arg(0);io.thread=threads_.current;io.port=socket.completion_port;io.key=socket.completion_key;
             const auto wait_synchronous=[&]{auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::FileIo;thread.wait.handles={arg(0)};schedule(state,memory);};
             const bool synchronous_control=controlling && (!socket.overlapped || (!arg(7) && !arg(8)));
-            if((disconnect && !arg(1)) || synchronous_control){
-                const auto kind=controlling?PendingSocketIo::Kind::Control:PendingSocketIo::Kind::Disconnect;
+            if((disconnect && !arg(1)) || (transmit && !arg(4)) || synchronous_control){
+                const auto kind=controlling?PendingSocketIo::Kind::Control:transmit?PendingSocketIo::Kind::Send:PendingSocketIo::Kind::Disconnect;
                 auto pending=std::find_if(network.pending_socket_io.begin(),network.pending_socket_io.end(),[&](const auto& item){return item.socket==arg(0) && item.thread==threads_.current && item.kind==kind && !item.overlapped;});
                 if(pending!=network.pending_socket_io.end()){
                     poll_socket_io(memory);
@@ -251,15 +263,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_socket_io(GuestState& state
                     if(error)fail(error);else{result=controlling?0:1;if(controlling)memory.store(GuestAddress{arg(6)},32,transferred);}complete_call(state,memory,result);return std::nullopt;
                 }
             }
-            io.kind=controlling?PendingSocketIo::Kind::Control:connect?PendingSocketIo::Kind::Connect:disconnect?PendingSocketIo::Kind::Disconnect:sending?PendingSocketIo::Kind::Send:PendingSocketIo::Kind::Receive;
-            const auto overlapped_index=controlling?7U:message_receive?3U:messaging?4U:connect?6U:disconnect?1U:addressed?7U:5U;
+            io.kind=controlling?PendingSocketIo::Kind::Control:connect?PendingSocketIo::Kind::Connect:disconnect?PendingSocketIo::Kind::Disconnect:(sending || transmit)?PendingSocketIo::Kind::Send:PendingSocketIo::Kind::Receive;
+            const auto overlapped_index=transmit?4U:controlling?7U:message_receive?3U:messaging?4U:connect?6U:disconnect?1U:addressed?7U:5U;
             io.overlapped=synchronous_control?0:arg(overlapped_index);io.routine=synchronous_control || extension?0:arg(controlling?8U:message_receive?4U:messaging?5U:addressed?8U:6U);
-            std::uint32_t error=0;std::uint64_t count_pointer=controlling?arg(6):message_receive?arg(2):connect?(arg(3)?arg(5):0):disconnect?0:arg(3);
-            if((!disconnect && !controlling && !io.overlapped) || (controlling && io.routine && !io.overlapped))error=10022;
+            std::uint32_t error=0;std::uint64_t count_pointer=transmit?0:controlling?arg(6):message_receive?arg(2):connect?(arg(3)?arg(5):0):disconnect?0:arg(3);
+            if((!transmit && !disconnect && !controlling && !io.overlapped) || (controlling && io.routine && !io.overlapped))error=10022;
             else if(io.overlapped && !socket.overlapped)error=10022;
             else if(network.pending_socket_io.size()>=1024)error=10055;
             else if(io.overlapped && (std::any_of(network.pending_socket_io.begin(),network.pending_socket_io.end(),[&](const auto& p){return !p.done && p.overlapped==io.overlapped;}) || std::any_of(network.pending_accepts.begin(),network.pending_accepts.end(),[&](const auto& p){return !p.done && p.overlapped==io.overlapped;})))error=10022;
-            if(!error && controlling){
+            if(!error && transmit){
+#include "windows_transmit_file.inc"
+            }else if(!error && controlling){
                 if(!count_pointer)error=10014;
                 else if(prepare_filter_control(socket,memory,d(1),arg(2),d(3),arg(4),d(5),io,output_limit)<0)error=socket_error(errno);
             }else if(!error && extension){

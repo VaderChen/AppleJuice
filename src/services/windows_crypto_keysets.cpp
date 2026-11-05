@@ -26,8 +26,10 @@ std::uint32_t decode(const Bytes& bytes,Keys& keys){
 }
 std::uint64_t WindowsServices::acquire_crypto_provider(std::string container,std::string name,std::uint32_t type,std::uint32_t flags){
     using namespace legacy_crypto;const auto fail=[&](std::uint32_t error){last_error_=error;return UINT64_C(0);};
-    const auto catalog=std::find_if(std::begin(providers),std::end(providers),[&](const auto& p){return p.type==type;});if(catalog==std::end(providers))return fail(0x80090014);
-    if(!name.empty() && name!=catalog->name)return fail(0x80090013);if(flags&~0xf0000078U || ((flags&24U)==24U))return fail(0x80090009);
+    if(!legacy_crypto::provider(type))return fail(0x80090014);
+    const auto* catalog=legacy_crypto::provider(type,name);
+    if(!catalog){const bool known=std::any_of(std::begin(providers),std::end(providers),[&](const auto& p){return name==p.name;});return fail(known?0x8009001bU:0x80090013U);}
+    if(flags&~0xf0000078U || ((flags&24U)==24U))return fail(0x80090009);
     const auto verify=flags&0xf0000000U;if(verify && verify!=0xf0000000U)return fail(0x80090009);
     if(verify && (!container.empty() || (flags&24U)))return fail(0x80090016);
     if(container.size()>4096 || container.find('\0')!=container.npos)return fail(87);

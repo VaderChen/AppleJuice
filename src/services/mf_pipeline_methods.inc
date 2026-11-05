@@ -105,12 +105,13 @@ else if(name.starts_with("V_")){
     }
 }else if(name.starts_with("C_")){
     require(item->kind==mf::Source,no_interface);require(!item->closed,shutdown);
-    if(name=="C_GetCharacteristics")put(arg(1),5);
+    if(name=="C_GetCharacteristics")put(arg(1),item->file_source?6:5);
     else if(name=="C_CreatePresentationDescriptor"){
-        out(arg(1));const auto original=object(item->children.at(0),mf::Presentation);const auto p=make(mf::Presentation);auto clone=object(p,mf::Presentation);clone->children=original->children;clone->selected=original->selected;for(const auto child:clone->children)hold(child);put(arg(1),p,bits);
+        out(arg(1));const auto original=object(item->children.at(0),mf::Presentation);const auto p=make(mf::Presentation);auto clone=object(p,mf::Presentation);clone->children=original->children;clone->selected=original->selected;for(const auto child:clone->children)hold(child);for(const auto& [key,value]:original->attributes)set(*clone,key,value);put(arg(1),p,bits);
     }else if(name=="C_Start"){
-        const auto presentation=object(arg(1),mf::Presentation);require(presentation->children.size()==1 && presentation->selected.at(0),0xc00d36b2U);require(!arg(2) || guid(arg(2))==Guid{},0xc00d36c5U);const auto position=read_value(arg(3));require(position.type==0 || (position.type==20 && position.scalar==0),0xc00d36b2U);
+        const auto presentation=object(arg(1),mf::Presentation);require(presentation->children.size()==1 && presentation->selected.at(0),0xc00d36b2U);require(!arg(2) || guid(arg(2))==Guid{},0xc00d36c5U);const auto position=read_value(arg(3));require(position.type==0 || (position.type==20 && std::bit_cast<std::int64_t>(position.scalar)>=0 && (item->file_source || position.scalar==0)),0xc00d36b2U);
         source_start(item);if(!item->state){const auto p=make(mf::MediaStream);auto stream=object(p,mf::MediaStream);stream->parent=item->pointers.at(mf::Source);hold(stream->parent);stream->children={presentation->children.at(0)};hold(stream->children.at(0));item->state=p;Value value;value.type=13;value.scalar=p;queue_event(item,205,value);}else {Value value;value.type=13;value.scalar=item->state;queue_event(item,206,value);}
+        if(item->file_source && position.type==20){const auto& wave=item->file_source->wave;const auto frame=static_cast<__uint128_t>(position.scalar)*wave.format.rate/10000000U;object(item->state,mf::MediaStream)->read_frames=static_cast<std::uint64_t>(std::min<__uint128_t>(frame,wave.bytes/wave.format.align));}
         queue_event(item,201);queue_event(object(item->state,mf::MediaStream),202);
     }else if(name=="C_Stop" || name=="C_Pause"){require(item->streaming,0xc00d3e82U);source_stop(item);queue_event(item,name=="C_Stop"?207:209);if(item->state)queue_event(object(item->state,mf::MediaStream),name=="C_Stop"?208:210);}
     else if(name=="C_Shutdown")object_shutdown(item);
@@ -123,26 +124,36 @@ else if(name.starts_with("V_")){
     require(item->kind==mf::Reader,no_interface);auto source=object(item->parent,mf::Source);require(!source->closed,shutdown);
     const auto stream=[&](unsigned n,bool all=false){require(d(n)==0 || d(n)==0xfffffffdU || (all && d(n)==0xfffffffeU),0xc00d36b3U);};
     if(name=="L_GetStreamSelection"){stream(1);put(arg(2),item->selected.at(0));}
-    else if(name=="L_SetStreamSelection"){stream(1,true);require(!item->request_pending,0xc00d36b2U);item->selected[0]=d(2)!=0;}
+    else if(name=="L_SetStreamSelection"){stream(1,true);require(!item->request_pending && !item->file_read_active,0xc00d36b2U);item->selected[0]=d(2)!=0;}
     else if(name=="L_GetNativeMediaType" || name=="L_GetCurrentMediaType"){stream(1);const bool native=name=="L_GetNativeMediaType";out(arg(native?3:2));if(native)require(d(2)==0,0xc00d36b9U);const auto p=native?source_type(source):item->current_type;hold(p);put(arg(native?3:2),p,bits);}
-    else if(name=="L_SetCurrentMediaType"){stream(1);require(!arg(2));const auto type=object(arg(3),mf::MediaType),native=object(source_type(source),mf::MediaType);for(const auto& [key,value]:native->attributes)require(get(*type,key)==value,0xc00d36b4U);require(!item->request_pending,0xc00d36b2U);hold(arg(3));release(item->current_type);item->current_type=arg(3);}
-    else if(name=="L_SetCurrentPosition")throw Failure{0xc00d36b2U}; // Live capture 不宣告可 seek。
+    else if(name=="L_SetCurrentMediaType"){
+        stream(1);require(!arg(2));require(!item->request_pending && !item->file_read_active,0xc00d36b2U);const auto type=object(arg(3),mf::MediaType),native=object(source_type(source),mf::MediaType);
+        require(get(*type,mf::MF_MT_MAJOR_TYPE)==get(*native,mf::MF_MT_MAJOR_TYPE) && get(*type,mf::MF_MT_SUBTYPE)==get(*native,mf::MF_MT_SUBTYPE),0xc00d36b4U);
+        for(const auto& [key,value]:type->attributes)if(native->attributes.contains(key))require(native->attributes.at(key)==value,0xc00d36b4U);
+        const auto p=copy_media_type(source_type(source));for(const auto& [key,value]:type->attributes)set(*object(p,mf::MediaType),key,value);release(item->current_type);item->current_type=p;
+    }
+    else if(name=="L_SetCurrentPosition"){
+        require(source->file_source!=nullptr,0xc00d36b2U);require(!item->request_pending && !item->file_read_active,0xc00d36b2U);require(guid(arg(1))==Guid{},0xc00d36c5U);
+        const auto position=read_value(arg(2));require(position.type==20 && std::bit_cast<std::int64_t>(position.scalar)>=0);
+        const auto& wave=source->file_source->wave;const auto frame=static_cast<__uint128_t>(position.scalar)*wave.format.rate/10000000U;
+        item->read_frames=static_cast<std::uint64_t>(std::min<__uint128_t>(frame,wave.bytes/wave.format.align));
+    }
     else if(name=="L_ReadSample"){
-        stream(1,true);require(!(d(2)&~1U));require(item->selected.at(0),0xc00d36b2U);require(!item->request_pending,0xc00d36b2U);
+        stream(1,true);require(!(d(2)&~1U));require(!item->flush_pending,0xc00d36b5U);require(item->selected.at(0),0xc00d36b2U);require(!item->request_pending,0xc00d36b2U);
         if(item->callback){require(!arg(3) && !arg(4) && !arg(5) && !arg(6));source_start(source);item->request_pending=true;hold_job(item);}
         else {
-            out(arg(6));check(arg(4),4);check(arg(5),8);if(arg(3))put(arg(3),0);put(arg(4),0);put(arg(5),0,64);source_start(source);const auto p=captured_sample(source,item->read_frames);
-            if(p){put(arg(6),p,bits);put(arg(5),*object(p,mf::Sample)->time,64);}
-            else if(d(2)&1)put(arg(4),2);
+            out(arg(6));check(arg(4),4);if(arg(5))check(arg(5),8);if(arg(3))put(arg(3),0);put(arg(4),0);if(arg(5))put(arg(5),0,64);source_start(source);const auto p=captured_sample(source,item->read_frames);
+            if(p){put(arg(6),p,bits);if(arg(5))put(arg(5),*object(p,mf::Sample)->time,64);}
+            else if(source->file_source || (d(2)&1))put(arg(4),2);
             else {auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::MediaFoundation;thread.wait.handles={arg(0)};schedule(state,memory);return std::nullopt;}
         }
     }else if(name=="L_Flush"){
-        stream(1,true);item->request_pending=false;{std::lock_guard lock(source->capture->mutex);item->read_frames=source->capture->captured_frames;}
-        if(item->callback)callbacks.push_back({foreign_method(item->callback,4),{item->callback,0}});
+        stream(1,true);item->request_pending=false;++item->generation;if(source->capture){std::lock_guard lock(source->capture->mutex);item->read_frames=source->capture->captured_frames;}
+        if(item->file_read_active)item->flush_pending=true;else if(item->callback)callbacks.push_back({foreign_method(item->callback,4),{item->callback,0}});
     }else if(name=="L_GetServiceForStream"){
         out(arg(4));require(d(1)==UINT32_MAX,0xc00d36b3U);require(guid(arg(2))==Guid{},0xc00d36d4U);query(item->parent,guid(arg(3)),arg(4));
     }else if(name=="L_GetPresentationAttribute"){
-        if(d(1)==UINT32_MAX && guid(arg(2))==mf::MF_SOURCE_READER_MEDIASOURCE_CHARACTERISTICS)write_value(arg(3),value32(5));
+        if(d(1)==UINT32_MAX && guid(arg(2))==mf::MF_SOURCE_READER_MEDIASOURCE_CHARACTERISTICS)write_value(arg(3),value32(source->file_source?6:5));
         else if(d(1)==UINT32_MAX)write_value(arg(3),get(*object(source->children.at(0),mf::Presentation),guid(arg(2))));else {stream(1);write_value(arg(3),get(*object(object(source->children.at(0),mf::Presentation)->children.at(0),mf::Stream),guid(arg(2))));}
     }else throw Failure{no_interface};
 }

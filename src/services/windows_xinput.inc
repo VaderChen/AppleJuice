@@ -4,7 +4,7 @@ const auto xinput_result=[&]() -> std::uint32_t {
     // GetAudioDeviceIds（1_4）／GetDSoundAudioDeviceGuids（1_3）／#100 GetStateEx／#108 GetCapabilitiesEx（1_4）。
     const bool capabilities_ex=name=="#108";
     const auto index=static_cast<std::uint32_t>(arg(capabilities_ex?1:0));
-    const unsigned output_index=name=="XInputGetCapabilities"?2:name=="XInputGetBatteryInformation" || name=="XInputGetKeystroke" || name=="XInputGetDSoundAudioDeviceGuids"?2:capabilities_ex?3:1;
+    const unsigned output_index=name=="XInputGetCapabilities"?2:name=="XInputGetBatteryInformation" || name=="XInputGetKeystroke"?2:capabilities_ex?3:1;
     const auto output=name=="XInputEnable" || name=="XInputGetAudioDeviceIds"?0:arg(output_index);
     if(name=="XInputEnable"){bridge.xinput_enabled=arg(0)!=0;return 0U;}
     const bool any_index=name=="XInputGetKeystroke" && index==0xffU;

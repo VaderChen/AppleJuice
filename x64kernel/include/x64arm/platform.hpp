@@ -13,7 +13,12 @@
 #include <unordered_map>
 #include <algorithm>
 #include "x64arm/jit_recovery.hpp"
-#include "x64arm/llvm_region.hpp"
+// 原由已移除的 llvm_region.hpp 間接提供；保留給既有消費端。
+#include "x64arm/ir.hpp"
+#include "x64arm/native_chain.hpp"
+#include <charconv>
+#include <cstdlib>
+#include <string_view>
 #include "x64arm/host_features.hpp"
 
 namespace x64arm {
@@ -49,11 +54,9 @@ private:
     friend class AotEngine;
     friend class NativeMemoryScope;
     friend struct JitMemoryTestAccess;
-    static std::shared_ptr<const PreparedBlock> prepare_llvm_block(const std::shared_ptr<const LlvmRegion>&);
     static std::shared_ptr<const PreparedBlock> prepare_aot_module(const std::shared_ptr<const AotModule>&);
     void (*aot_module_entry(std::size_t offset,std::uint32_t word_offset) const)();
     void (*aot_module_entry(std::size_t offset,GuestAddress rip) const)();
-    LlvmRegion::Function llvm_entry(std::size_t offset) const;
     // share_recovery：呼叫端不保留 canonical 恢復表（例如未啟用 SMAP）時，直接把同一份表交給發布重定位，省去兩次複製；
     // 呼叫端之後持有的即為已重定位的表，restore／execution_limit 只依 id 與完成數，不受字位置影響。
     static std::shared_ptr<const PreparedBlock> prepare_unscoped_block(std::vector<std::uint32_t>& words,bool chained,std::shared_ptr<Arm64Recovery>& recovery,const std::shared_ptr<const Arm64CodeDescription>& description={},bool share_recovery=false);
@@ -104,7 +107,7 @@ private:
     std::set<std::pair<std::size_t,std::size_t>> free_sizes_;
     // 發布序號跨 arena 回收保持遞增，供取樣排除同位址已換成另一段程式碼的情況。
     std::uint64_t publication_serial_{};
-    struct PublishedRecovery {std::size_t bytes;bool chained;std::uint8_t body_words;std::shared_ptr<const Arm64Recovery> table;std::uint64_t serial;std::shared_ptr<const PreparedBlock> read_fallback;bool llvm_native{};std::shared_ptr<const LlvmRegion> llvm{};std::shared_ptr<const AotModule> aot_module{};std::shared_ptr<std::vector<resident_abi::DispatchEntry>> aot_sites{};};
+    struct PublishedRecovery {std::size_t bytes;bool chained;std::uint8_t body_words;std::shared_ptr<const Arm64Recovery> table;std::uint64_t serial;std::shared_ptr<const PreparedBlock> read_fallback;std::shared_ptr<const AotModule> aot_module{};std::shared_ptr<std::vector<resident_abi::DispatchEntry>> aot_sites{};};
     std::map<std::size_t,PublishedRecovery> recovery_;
     // 每頁獨立發布不可變排序表；訊號處理器只讀固定目錄與該頁快照，不碰 std::map。
     // 新模組只更新涵蓋的頁，不因逐次發布而複製整個 arena 的恢復資料。

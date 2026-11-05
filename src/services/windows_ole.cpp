@@ -24,6 +24,7 @@ std::span<const WindowsServiceDescriptor> ole_service_descriptors(){
         {"oleaut32.dll","SysStringByteLen",1},{"oleaut32.dll","SysAllocStringByteLen",2},
         {"oleaut32.dll","VarBstrCat",3},{"oleaut32.dll","VarBstrCmp",4,0,0,0xc},
         {"oleaut32.dll","VariantTimeToSystemTime",2,1},{"oleaut32.dll","SystemTimeToVariantTime",2},
+        {"oleaut32.dll","VarUdateFromDate",3,1},{"oleaut32.dll","VarDateFromUdate",3},{"oleaut32.dll","VarDateFromUdateEx",4},
         {"oleaut32.dll","VariantTimeToDosDateTime",3,1},{"oleaut32.dll","DosDateTimeToVariantTime",3},
         {"oleaut32.dll","VariantInit",1},{"oleaut32.dll","VariantClear",1},{"oleaut32.dll","VariantCopy",2},
         {"oleaut32.dll","VariantCopyInd",2},{"oleaut32.dll","VariantChangeType",4},{"oleaut32.dll","VariantChangeTypeEx",5},{"oleaut32.dll","VarCmp",4},
@@ -153,6 +154,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole(GuestState& state,Guest
     }
     if(name=="IUnknown_QueryService"){
         return invoke_com_class(state,memory,service);
+    }
+    if(name=="VarUdateFromDate"){
+        std::uint64_t raw=arg(0);if(!x86_){raw=0;for(unsigned i=0;i<8;++i)raw|=std::uint64_t{state.xmm[0][i]}<<(i*8);}
+        const auto fields=automation::time_fields(std::bit_cast<double>(raw));if(!fields || !arg(2))return done(e_invalidarg);
+        using namespace std::chrono;const auto& f=*fields;
+        const auto ordinal=(sys_days{year{static_cast<int>(f[0])}/month{f[1]}/day{f[3]}}-sys_days{year{static_cast<int>(f[0])}/1/1}).count()+1;
+        memory.check(GuestAddress{arg(2)},18,Access::Write);for(unsigned i=0;i<8;++i)memory.store(GuestAddress{arg(2)+i*2},16,f[i]);
+        memory.store(GuestAddress{arg(2)+16},16,static_cast<std::uint64_t>(ordinal));return done(0);
+    }
+    if(name=="VarDateFromUdate" || name=="VarDateFromUdateEx"){
+        const bool extended=name=="VarDateFromUdateEx";const auto output=arg(extended?3:2);
+        if(!arg(0) || !output)return done(e_invalidarg);
+        std::array<unsigned,8> fields{};for(unsigned i=0;i<8;++i)fields[i]=static_cast<unsigned>(memory.load(GuestAddress{arg(0)+i*2},16));
+        const auto value=automation::date_value(fields);if(!value)return done(e_invalidarg);
+        const auto flags=static_cast<std::uint32_t>(arg(extended?2:1));const auto date=(flags&1U)?std::abs(*value-std::trunc(*value)):(flags&2U)?std::trunc(*value):*value;
+        memory.store(GuestAddress{output},64,std::bit_cast<std::uint64_t>(date));return done(0);
     }
     if(name=="VariantTimeToSystemTime" || name=="VariantTimeToDosDateTime"){
         std::uint64_t raw=arg(0);if(!x86_){raw=0;for(unsigned i=0;i<8;++i)raw|=static_cast<std::uint64_t>(state.xmm[0][i])<<(i*8);}

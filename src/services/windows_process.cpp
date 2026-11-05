@@ -821,7 +821,7 @@ std::uint32_t WindowsServices::adopt_initial_process_parameters(GuestState& stat
         }
         configure_runtime_arguments(memory,text(native.strings[3]),command);
         configure_initial_environment(memory,state,environment);
-        if(!directory.empty())set_process_directory(std::move(directory));
+        if(!directory.empty())set_process_directory(memory,std::move(directory));
         configure_native_startup(memory,native,parameters);
         return 0;
     }catch(const detail::NativeProcessError& error){return error.status;}
@@ -880,6 +880,7 @@ void WindowsServices::configure_processes(ProcessOptions options, GuestMemory &m
     }
     processes_ = std::make_shared<ProcessState>();
     processes_->options = std::move(options);
+    initialize_gui_timing(memory,true);
     processes_->identity = host_process_id();
     if(const auto initial=threads_.items.find(1);initial!=threads_.items.end())initial->second.public_id=process_id();
     const auto pid_offset = x86_ ? 0x20U : 0x40U;
@@ -1621,7 +1622,7 @@ void WindowsServices::import_process_handles(const std::string &encoded) {
         else if (item.type == 4)
             import_job_handle(item);
         else if (item.type == 3 || item.type == 5 || item.type == 6 || item.type == 7 || item.type == 8 ||
-                 item.type == 9) {
+                 item.type == 9 || item.type == 10) {
             import_transfer_handle(item);
             continue;
         } else
@@ -1635,10 +1636,9 @@ void WindowsServices::import_process_handles(const std::string &encoded) {
     throw HostCallFault("此平台不支援繼承 handle");
 #endif
 }
-void WindowsServices::set_process_directory(std::u16string directory) {
-    if (directory != u"C:\\" && filesystem_.set_current_directory(utf16_to_utf8(directory)))
+void WindowsServices::set_process_directory(GuestMemory& memory,std::u16string directory) {
+    if (change_current_directory(memory,std::move(directory)))
         throw std::invalid_argument("客體子程序工作目錄無效");
-    runtime_.current_directory = std::move(directory);
 }
 std::uint32_t WindowsServices::kernel_pseudo_access(bool thread) const {
     // Vista 之後的自身 pseudo handle 是既有完整能力；重新 Open 才依物件 DACL 授權。
@@ -2076,11 +2076,13 @@ std::span<const WindowsServiceDescriptor> process_service_descriptors() {
         {"ntdll.dll", "NtCreateUserProcess", 11, 0, 0, 0xcc},
         {"ntdll.dll", "ZwCreateUserProcess", 11, 0, 0, 0xcc},
         {"advapi32.dll", "CreateProcessAsUserW", 11, 0, 0, 0x60},
+        {"advapi32.dll", "CreateProcessWithLogonW", 11},
         {"kernel32.dll", "CreateProcessAsUserW", 11, 0, 0, 0x60},
         {"advapi32.dll", "CreateProcessAsUserA", 11, 0, 0, 0x60},
         {"kernel32.dll", "OpenProcess", 3, 0, 0, 0x7},
         {"kernel32.dll", "GetExitCodeProcess", 2},
         {"kernel32.dll", "GetProcessId", 1},
+        {"kernel32.dll", "GetProcessVersion", 1},
         {"kernel32.dll", "CheckRemoteDebuggerPresent", 2},
         {"kernel32.dll", "GetProcessIoCounters", 2},
         {"kernel32.dll", "SetProcessAffinityMask", 2},
@@ -3006,6 +3008,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
                                                              const WindowsServiceDescriptor &service) {
 #include "windows_native_user_process.inc"
 #include "windows_native_process_only.inc"
+#include "windows_process_logon.inc"
     if(service.symbol.starts_with("Pss")){
 #include "windows_pss_snapshot.inc"
     }
@@ -3037,7 +3040,50 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
     };
 #include "windows_application_restart.inc"
 #include "windows_process_termination.inc"
-    if (symbol == "GetProcessIoCounters") {
+    if (symbol == "GetProcessVersion") {
+        // 版本取自目標 EXE 的 OptionalHeader.SubsystemVersion，不是宿主或 Windows 版本。
+        // 遠端查詢沿用具身分／權限核對的 PEB 與客體記憶體協定，亦相容既有執行中的程序。
+        const auto pid=static_cast<std::uint32_t>(arg(0));std::uint64_t handle=0,scratch=0;
+        struct VersionError {std::uint32_t code;};
+        try {
+            std::uint64_t base=runtime_.image.base;std::uint32_t target_bits=x86_?32U:64U;
+            if(pid && pid!=process_id()){
+#if !defined(_WIN32)
+                if(!processes_)throw VersionError{87};
+                auto record=ProcessRecord::open(mapping_session(),pid,false);
+                if(!record || !record->alive())throw VersionError{87};
+                std::uint32_t access{};{SharedEventLock lock(record->descriptor);access=kernel_security_access(shared_object_security(record->descriptor),0x410U,false);}
+                handle=runtime_.allocate_wait_handle();processes_->handles.emplace(handle,Handle{{},false,access,pid,record,record->data->birth});
+                std::array<std::uint64_t,5> info{};std::uint32_t found_pid{};
+                if(const auto error=process_basic_information(memory,handle,info,found_pid,target_bits))throw VersionError{error};
+                if(x86_ && target_bits!=32)throw VersionError{299};
+                scratch=allocate_heap(memory,16);if(!scratch)throw VersionError{8};
+                std::uint64_t copied{};const auto size=target_bits/8U;
+                if(const auto error=process_memory_copy(memory,handle,info[1]+(target_bits==32?8U:16U),scratch,size,false,copied))throw VersionError{error};
+                if(copied!=size)throw VersionError{299};base=memory.load(GuestAddress{scratch},static_cast<std::uint8_t>(target_bits));
+#else
+                throw VersionError{87};
+#endif
+            }
+            const auto read=[&](std::uint64_t offset,unsigned bits){
+                if(offset>UINT64_MAX-base)throw VersionError{193};
+                if(!handle)return memory.load(GuestAddress{base+offset},static_cast<std::uint8_t>(bits));
+                std::uint64_t copied{};const auto size=bits/8U;
+                if(const auto error=process_memory_copy(memory,handle,base+offset,scratch,size,false,copied))throw VersionError{error};
+                if(copied!=size)throw VersionError{299};return memory.load(GuestAddress{scratch},static_cast<std::uint8_t>(bits));
+            };
+            if(!base || read(0,16)!=0x5a4d)throw VersionError{193};
+            const auto pe=read(60,32);if(pe>UINT32_MAX-76U || read(pe,32)!=0x4550)throw VersionError{193};
+            const auto magic=read(pe+24,16);if(magic!=0x10b && magic!=0x20b)throw VersionError{193};
+            result=(read(pe+72,16)<<16)|read(pe+74,16);
+        }catch(const VersionError& error){fail(error.code);}catch(const SecurityDescriptorError& error){fail(error.code);}
+        catch(const MemoryFault&){fail(998);}catch(const std::bad_alloc&){fail(8);}
+        if(scratch)free_heap(memory,scratch,state);
+#if !defined(_WIN32)
+        if(handle)processes_->handles.erase(handle);
+#endif
+        call.return_to(state,result);return std::nullopt;
+    } else if (symbol == "GetProcessIoCounters") {
         if (!arg(1))
             fail(87);
         else

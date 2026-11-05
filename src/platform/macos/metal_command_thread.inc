@@ -106,6 +106,7 @@ public:
     bool fixed_vertex_supported()const noexcept override {return inner_->fixed_vertex_supported();}
     void graphics_fixed_targets(const GraphicsView& color,const GraphicsView& depth) override {graphics_sync();inner_->graphics_fixed_targets(color,depth);}
     bool graphics_fixed_texture(const GraphicsView& view) override {graphics_sync();return inner_->graphics_fixed_texture(view);}
+    bool graphics_fixed_sampler(const std::shared_ptr<GraphicsSampler>& sampler) override {graphics_sync();return inner_->graphics_fixed_sampler(sampler);}
     void graphics_fixed_stencil(const std::array<std::uint32_t,12>& state) override {graphics_sync();inner_->graphics_fixed_stencil(state);}
     void graphics_fixed_draw(const FixedGraphicsDraw& draw) override {graphics_sync();inner_->graphics_fixed_draw(draw);}
     // 建立資源只配置新的 Metal 物件（GPU 記憶體額度有自己的鎖），不碰編碼狀態，不必等佇列清空。

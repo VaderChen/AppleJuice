@@ -2,6 +2,7 @@
 #include "x64arm/cross_architecture.hpp"
 #include "x64arm/shared_event.hpp"
 #include "x64arm/shared_wake.hpp"
+#include "shared_object_lifetime.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
@@ -18,6 +19,8 @@
 #include <sstream>
 #include <system_error>
 #if !defined(_WIN32)
+#include <ctime>
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/mman.h>
@@ -100,6 +103,50 @@ std::shared_ptr<Session> session(std::string path = {},int inherited_descriptor=
     result->owner=header[1]!=0;result->wake=SharedWake::open(path);
     return result;
 }
+bool reclaim_name(std::string_view name,std::string_view prefix){
+    return name.size()==prefix.size()+6 && name.starts_with(prefix) &&
+        std::all_of(name.begin()+static_cast<std::ptrdiff_t>(prefix.size()),name.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='z')||(c>='A'&&c<='Z');});
+}
+// 建立者異常結束（SIGKILL、當機）時沒有執行 ~Session，命名空間會留在暫存目錄。
+// 新 owner 建立後回收同一目錄中已無參與者的引擎自建命名空間：參與者都持有 .lifetime 的
+// shared flock，程序結束時由核心釋放，因此只靠非阻塞 exclusive flock 判定，不靠 PID、年齡或容量。
+// 鎖順序與 session() 相同（directory → .lifetime）；先改名為 x64arm-reclaim-* 再刪除，中斷後下次接續。
+// 此回收也涵蓋全域暫存目錄；保留建立未滿 60 秒、使用中、非引擎建立或權限不符者。
+void reclaim_stale_sessions(const std::filesystem::path& own) noexcept {
+    try{
+        struct Fd {int value;~Fd(){if(value>=0)::close(value);}};
+        const auto root=own.parent_path();const auto own_name=own.filename().native();
+        Fd root_fd{::open(root.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC)};if(root_fd.value<0)return;
+        const auto listing_fd=::fcntl(root_fd.value,F_DUPFD_CLOEXEC,0);if(listing_fd<0)return;
+        const auto listing=::fdopendir(listing_fd);if(!listing){::close(listing_fd);return;}
+        std::vector<std::string> stale,tombs;
+        while(const auto* entry=::readdir(listing)){
+            const std::string_view name(entry->d_name);if(name==own_name)continue;
+            if(reclaim_name(name,"x64arm-mapping-"))stale.emplace_back(name);else if(reclaim_name(name,"x64arm-reclaim-"))tombs.emplace_back(name);
+        }
+        ::closedir(listing);
+        const auto now=::time(nullptr);
+        for(const auto& name:stale){
+            Fd folder{::openat(root_fd.value,name.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW)};struct stat info{},lease_info{},current{};
+            if(folder.value<0 || ::fstat(folder.value,&info) || info.st_uid!=::geteuid() || (info.st_mode&077) || ::flock(folder.value,LOCK_EX|LOCK_NB))continue;
+            Fd lease{::openat(folder.value,".lifetime",O_RDONLY|O_CLOEXEC|O_NOFOLLOW)};std::array<std::uint64_t,2> header{};
+            // 標頭與 session() 寫入的 .lifetime 相同；header[1]==1 才是引擎 mkdtemp 建立的命名空間。
+            if(lease.value<0 || ::fstat(lease.value,&lease_info) || !S_ISREG(lease_info.st_mode) || lease_info.st_uid!=::geteuid() || (lease_info.st_mode&077) ||
+               lease_info.st_nlink!=1 || lease_info.st_size!=sizeof(header) || ::pread(lease.value,header.data(),sizeof(header),0)!=sizeof(header) ||
+               header[0]!=UINT64_C(0x31534e4d52413458) || header[1]!=1 || now-lease_info.st_mtime<60 || ::flock(lease.value,LOCK_EX|LOCK_NB))continue;
+            if(::fstatat(root_fd.value,name.c_str(),&current,AT_SYMLINK_NOFOLLOW) || current.st_dev!=info.st_dev || current.st_ino!=info.st_ino)continue;
+            auto tomb="x64arm-reclaim-"+name.substr(name.size()-6);
+            if(::renameat(root_fd.value,name.c_str(),root_fd.value,tomb.c_str()))continue;
+            tombs.push_back(std::move(tomb));
+        }
+        for(const auto& name:tombs){
+            struct stat info{};
+            if(::fstatat(root_fd.value,name.c_str(),&info,AT_SYMLINK_NOFOLLOW) || !S_ISDIR(info.st_mode) || info.st_uid!=::geteuid() || (info.st_mode&077))continue;
+            // remove_all 只移除符號連結本身，不走訪連結目標。
+            std::error_code ignored;std::filesystem::remove_all(root/name,ignored);
+        }
+    }catch(...){ /* 回收失敗不影響啟動；下次建立 owner 時再試。 */ }
+}
 int font_directory(const Session& ns) {
     if(::mkdirat(ns.directory,"fonts",0700) && errno!=EEXIST)return -1;
     const auto descriptor=::openat(ns.directory,"fonts",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
@@ -121,6 +168,7 @@ struct MappingWindow {
     ~MappingWindow(){if(data!=MAP_FAILED)::munmap(data,static_cast<std::size_t>(size));}
 };
 #include "windows_image_section_storage.inc"
+static_assert(image_record_offset+image_record_size<=detail::named_object_mapping_hint_offset && detail::named_object_mapping_hint_offset+sizeof(detail::NamedObjectHolderHint)<=data_offset);
 struct Mapping {
     std::shared_ptr<Session> name_space;
     std::shared_ptr<void> file_lifetime;
@@ -206,6 +254,13 @@ Opened open_mapping(const std::shared_ptr<Session>& ns, std::u16string_view name
         if (!created && errno != EEXIST) return {{}, os_error()};
     }
     if (result->descriptor < 0) result->descriptor = ::openat(ns->directory, result->name.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if(!created && result->named && !internal) {
+        result->descriptor=detail::reopen_live_named_object(ns->path.string(),ns->directory,result->name,result->descriptor);
+        if(result->descriptor<0 && errno==ENOENT && create) {
+            result->descriptor=::openat(ns->directory,result->name.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+            created=result->descriptor>=0;
+        }
+    }
     if (result->descriptor < 0) return {{}, os_error()};
     struct PendingName {
         int directory;const std::string& name;bool enabled;
@@ -237,6 +292,8 @@ Opened open_mapping(const std::shared_ptr<Session>& ns, std::u16string_view name
         if(result->image && !write_image_section(result->descriptor,*result->image,
             {static_cast<const std::uint8_t*>(image_source->data),static_cast<std::size_t>(image_source->size)})){
             const auto error=os_error();(void)::unlinkat(ns->directory,result->name.c_str(),0);return {{},error};}
+        // 建立者即持有者：其他程序開啟這個具名 section 時先核對此提示，免完整掃描。
+        detail::named_object_record_holder(result->descriptor,detail::named_object_mapping_hint_offset,::getpid(),result->descriptor);
     } else {
         struct stat info{};
         if (::fstat(result->descriptor,&info) || !S_ISREG(info.st_mode) || info.st_uid != ::geteuid() || (info.st_mode & 077) ||
@@ -372,7 +429,7 @@ std::string WindowsServices::mapping_session() {
     if(!runtime_.network.external_io)throw HostCallFault("共用映射不支援 deterministic compare");
 #if !defined(_WIN32)
     if (!mappings_) mappings_ = std::make_shared<FileMappingState>();
-    if (!mappings_->name_space) mappings_->name_space = session();
+    if (!mappings_->name_space) {mappings_->name_space = session();reclaim_stale_sessions(mappings_->name_space->path);}
     // session 可先於 initialize 建立或匯入；正式檔案系統建立後才完成一次掛載。
     if(!initialized_ || filesystem_.shared_session()==mappings_->name_space->path.native())return mappings_->name_space->path.string();
     const auto fonts=font_directory(*mappings_->name_space);

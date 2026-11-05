@@ -41,6 +41,11 @@ void WindowsServices::refresh_gui_areas(){
     // HMONITOR 1 固定為主螢幕；後端若未把主螢幕排第一，保持其餘順序後移到最前。
     std::stable_partition(gui_monitor_cache_.begin(),gui_monitor_cache_.end(),[](const GuiMonitor& m){return m.primary;});
     gui_monitor_cache_.front().primary=true;
+    if(gui_.display_mode){
+        const auto& mode=*gui_.display_mode;gui_screen_cache_={0,0,static_cast<std::int32_t>(mode[0]),static_cast<std::int32_t>(mode[1])};
+        gui_work_cache_=gui_screen_cache_;gui_monitor_cache_.front().rect=gui_screen_cache_;
+        gui_monitor_cache_.front().work=gui_screen_cache_;gui_monitor_cache_.front().refresh=mode[3];
+    }
     for(std::size_t i=1;i<gui_monitor_cache_.size();++i)gui_monitor_cache_[i].primary=false;
     gui_area_cached_=now;
 }

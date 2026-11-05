@@ -30,6 +30,7 @@ struct GuestCallback {
         bool operator==(const Writeback32&) const = default;
     };
     std::vector<Writeback32> writebacks{};
+    std::uint64_t gui_erase_window{}; // USER32 背景擦除的系統裁剪與結果回寫。
     bool operator==(const GuestCallback&) const = default;
 };
 }

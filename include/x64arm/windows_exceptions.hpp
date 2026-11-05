@@ -20,6 +20,11 @@ struct MsvcCatch {
     std::int32_t target_state{-1},catch_state{-1},rethrow_state{-2};
     bool active{},catching{},copy_virtual{},entered_catch{};
     bool compressed{};std::array<std::uint64_t,2> continuations{};unsigned continuation_count{};
+    // Win32 由 registration 的 state 與 SavedESP 復原；不套用 Win64 UNWIND_INFO。
+    std::uint32_t registration{},saved_stack{};
+    std::int32_t catch_high{-1},resume_state{-1};
+    std::size_t callback_depth{},exception_depth{};
+    bool local_unwound{};
     bool operator==(const MsvcCatch&) const=default;
 };
 struct ExceptionDispatch {
@@ -33,6 +38,8 @@ struct ExceptionDispatch {
     std::size_t walk_callback_depth{}, walk_exception_depth{};
     std::size_t walk_scope_index{};
     std::uint64_t unwind_context{};
+    std::uint64_t function_query_pc{},function_query_entry{},unwind_origin_pc{},unwind_origin_sp{};
+    bool function_query_ready{};
     std::uint64_t target_ip{}, return_value{};
     std::uint64_t consolidate_record{}, consolidate_context{};
     GuestState consolidate_origin;

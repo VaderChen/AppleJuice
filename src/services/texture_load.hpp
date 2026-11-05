@@ -53,6 +53,19 @@ inline Decoded decode(std::span<const std::uint8_t> bytes){
         out.file_format=4;decode_dds(bytes,d,out.pixels);
         return out;
     }
+    // RT_BITMAP 及 .dib 沒有 BITMAPFILEHEADER，補上容器後沿用原生解碼器。
+    const auto dib_header=bytes.size()>=4?get32(bytes,0):0;
+    if(dib_header==12 || dib_header==40 || dib_header==52 || dib_header==56 || dib_header==108 || dib_header==124){
+        if(bytes.size()<dib_header)throw Error(0x88760b59U,"DIB 標頭遭截斷");
+        const auto bits=unsigned(bytes[dib_header==12?10:14])|(unsigned(bytes[dib_header==12?11:15])<<8);
+        const auto compression=dib_header==12?0:get32(bytes,16),used=dib_header==12?0:get32(bytes,32);
+        const auto colors=used?used:bits<=8?1U<<bits:0;
+        const std::uint64_t offset=14ULL+dib_header+(dib_header==40?(compression==3?12:compression==6?16:0):0)+std::uint64_t(colors)*(dib_header==12?3:4);
+        if(offset>bytes.size()+14ULL || bytes.size()>512U*1024U*1024U-14)throw Error(0x88760b59U,"DIB 色盤或資料長度不合法");
+        std::vector<std::uint8_t> bitmap(bytes.size()+14);bitmap[0]='B';bitmap[1]='M';
+        put(bitmap,2,static_cast<unsigned>(bitmap.size()));put(bitmap,10,static_cast<unsigned>(offset));
+        std::copy(bytes.begin(),bytes.end(),bitmap.begin()+14);auto decoded=decode(bitmap);decoded.file_format=6;return decoded;
+    }
 #ifdef __APPLE__
     Cf data(CFDataCreate(nullptr,bytes.data(),static_cast<CFIndex>(bytes.size())));if(!data.value)throw std::bad_alloc{};
     Cf source(CGImageSourceCreateWithData(data.value,nullptr));if(!source.value)throw Error(0x88760b59U,"影像格式無法辨識");

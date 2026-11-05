@@ -40,7 +40,10 @@ struct Layout {
     void validate(unsigned type,std::span<const std::uint8_t> report)const;
     std::uint32_t value(const Field&,unsigned,std::span<const std::uint8_t>)const;
     std::int32_t scaled_value(const Field&,unsigned,std::span<const std::uint8_t>)const;
+    std::uint32_t set_scaled_value(const Field&,unsigned,std::int32_t,std::span<std::uint8_t>)const;
     void value(const Field&,unsigned,std::uint32_t,std::span<std::uint8_t>)const;
+    void get_value_array(const Field&,unsigned,std::span<const std::uint8_t>,std::span<std::uint8_t>)const;
+    void set_value_array(const Field&,unsigned,std::span<std::uint8_t>,std::span<const std::uint8_t>)const;
     const Field* find(unsigned type,Usage usage,unsigned link,std::uint8_t report,bool button,unsigned* element=nullptr)const;
 };
 Layout parse(std::span<const std::uint8_t> descriptor,Usage top={});

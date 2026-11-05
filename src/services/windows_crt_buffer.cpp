@@ -79,7 +79,6 @@ bool WindowsServices::crt_close_file(GuestState& state,GuestMemory& memory,std::
     stream=crt_stream(stream);auto* file=crt_file(stream);
     if(!file){memory.store(GuestAddress{runtime_.errno_cell},32,9);return false;}
     bool success=!flush || flush_crt_file(memory,*file);
-    if(flush && file->commit_on_close && file->writable && file->native)if(const auto code=file->native->flush()){if(success)crt_os_error::store(memory,runtime_.errno_cell,code);success=false;}
     if(file->buffer.owned)(void)free_heap(memory,file->buffer.address,state);
     if(file->stdio_slot>=3 && file->stdio_slot!=UINT32_MAX)runtime_.stdio_slots.erase(file->stdio_slot);
     const auto base=runtime_base_.value+0x800;
@@ -133,7 +132,11 @@ bool WindowsServices::flush_crt_file(GuestMemory& memory,CrtFile& file,bool disc
         auto position=crt_file_position(file);const auto guard=position.lock();if(static_cast<std::uint64_t>(position)==buffer.end)position=static_cast<std::uint64_t>(position)-(buffer.used-buffer.cursor);
         buffer.used=buffer.cursor=0;buffer.direction=CrtFile::Buffer::Direction::None;
     }
-    if(discard_input)file.pushback.clear();crt_buffer_fields(memory,file);return true;
+    if(discard_input)file.pushback.clear();crt_buffer_fields(memory,file);
+    if(file.commit_on_close && file.writable && file.native)if(const auto code=file.native->flush()){
+        file.error=true;crt_os_error::store(memory,runtime_.errno_cell,code);return false;
+    }
+    return true;
 }
 bool WindowsServices::flush_crt_streams(GuestMemory& memory) {
     bool result=true;

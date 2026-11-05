@@ -1,5 +1,6 @@
 #include "x64arm/shared_event.hpp"
 #include "x64arm/shared_wake.hpp"
+#include "shared_object_lifetime.hpp"
 #include "x64arm/host_services.hpp"
 #include <algorithm>
 #include <chrono>
@@ -25,12 +26,17 @@
 namespace x64arm {
 namespace {
 constexpr std::uint64_t event_magic=0x544e564552413458ULL;
+constexpr std::uint64_t semaphore_magic=0x504d455352413458ULL;
+constexpr std::uint64_t mutex_magic=0x5854554d52413458ULL;
 constexpr std::size_t page_size=4096;
 struct EventHeader {
     std::uint64_t signature{event_magic},references{};
     std::uint32_t manual{},signal{},characters{};
     std::array<char16_t,260> name{};
+    std::uint32_t maximum{}; // event 原有尾端 padding；舊版 event 的欄位與大小不變。
 };
+static_assert(sizeof(EventHeader)==552 && offsetof(EventHeader,maximum)==548);
+static_assert(sizeof(EventHeader)<=detail::named_object_page_hint_offset);
 static_assert(std::atomic_ref<std::uint32_t>::is_always_lock_free);
 std::uint32_t error_code(){return errno==ENOENT?2U:errno==EACCES || errno==EPERM?5U:errno==ENOMEM || errno==ENOSPC?8U:87U;}
 std::string object_name(std::u16string_view name) {
@@ -38,10 +44,24 @@ std::string object_name(std::u16string_view name) {
     for(auto c:name){a=(a^c)*1099511628211ULL;b=(b^(c+1U))*0x100000001b3ULL;}
     std::ostringstream out;out<<"section-"<<std::hex<<std::setw(16)<<std::setfill('0')<<a<<std::setw(16)<<b;return out.str();
 }
+#if !defined(_WIN32)
+// 呼叫端持有命名空間鎖；只核對正在開啟的物件，不掃描或清除整個 session。
+// references 無法在 SIGKILL／_exit 時遞減。macOS 的核心檔案引用查詢同時辨識
+// 舊版引擎的 fd、繼承／傳輸中的 fd 及映射，無須改變已執行程序的共享格式。
+int open_object_file(const std::string& session,int directory,const std::string& name,bool create,bool& created) {
+    created=false;
+    int file=::openat(directory,name.c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW);
+    file=detail::reopen_live_named_object(session,directory,name,file);
+    if(file>=0 || errno!=ENOENT || !create)return file;
+    file=::openat(directory,name.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+    created=file>=0;return file;
+}
+#endif
 }
 struct SharedEventStorage {
     std::shared_ptr<SharedWake> wake;
     int directory{-1},file{-1};EventHeader* data{};std::string name;bool counted{};
+    std::array<std::uint64_t,2> identity{};
     ~SharedEventStorage() {
 #if !defined(_WIN32)
         if(data) {
@@ -64,6 +84,18 @@ SharedEventLock::~SharedEventLock(){
 }
 bool SharedEvent::manual_reset()const noexcept{return storage_->data->manual!=0;}
 bool SharedEvent::signaled()const noexcept{return std::atomic_ref(storage_->data->signal).load(std::memory_order_acquire)!=0;}
+std::uint32_t SharedEvent::count()const noexcept{return std::atomic_ref(storage_->data->signal).load(std::memory_order_acquire);}
+std::uint32_t SharedEvent::maximum()const noexcept{return storage_->data->maximum;}
+bool SharedEvent::same_object(const SharedEvent& other)const noexcept{return storage_->identity==other.storage_->identity;}
+std::uint32_t SharedEvent::release(std::uint32_t increment,std::uint32_t* previous,bool saturate){
+    if(storage_->data->signature!=semaphore_magic)return 6;
+    if(!increment || increment>INT32_MAX)return 87;
+    {SharedEventLock lock(storage_->directory);const auto before=count(),available=maximum()-before;
+     if(increment>available){if(!saturate)return 298;increment=available;}
+     if(previous)*previous=before;
+     std::atomic_ref(storage_->data->signal).store(before+increment,std::memory_order_release);}
+    if(increment && storage_->wake)storage_->wake->notify();return 0;
+}
 int SharedEvent::descriptor()const noexcept{return storage_->file;}
 int SharedEvent::lock_descriptor()const noexcept{return storage_->directory;}
 void SharedEvent::set(bool value){
@@ -79,24 +111,28 @@ void SharedEvent::set(bool value){
         std::fprintf(stderr,"[shared_event] pid=%d us=%lld op=%s manual=%u name=%s\n",static_cast<int>(::getpid()),us,value?"set":"reset",header.manual,name.c_str());
     }
 }
-void SharedEvent::consume_locked()noexcept{if(!manual_reset())std::atomic_ref(storage_->data->signal).store(0,std::memory_order_release);}
-OpenSharedEvent inherit_shared_event(const std::string& session,int descriptor) {
+void SharedEvent::consume_locked()noexcept{
+    if(storage_->data->signature==semaphore_magic){const auto before=count();if(before)std::atomic_ref(storage_->data->signal).store(before-1,std::memory_order_release);}
+    else if(!manual_reset())std::atomic_ref(storage_->data->signal).store(0,std::memory_order_release);
+}
+static OpenSharedEvent inherit_shared_signal(const std::string& session,int descriptor,bool semaphore) {
 #if defined(_WIN32)
-    (void)session;(void)descriptor;return {{},50};
+    (void)session;(void)descriptor;(void)semaphore;return {{},50};
 #else
     auto storage=std::make_shared<SharedEventStorage>();storage->file=descriptor;(void)::fcntl(descriptor,F_SETFD,FD_CLOEXEC);
     storage->directory=::open(session.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);struct stat info{};
     if(storage->directory<0 || ::fstat(storage->directory,&info) || info.st_uid!=::geteuid() || (info.st_mode&077))return {{},5};
     SharedEventLock lock(storage->directory);EventHeader header;
-    if(::fstat(descriptor,&info) || !S_ISREG(info.st_mode) || info.st_uid!=::geteuid() || (info.st_mode&077) || info.st_size!=page_size || ::pread(descriptor,&header,sizeof(header),0)!=sizeof(header) || header.signature!=event_magic || !header.characters || header.characters>=260)return {{},6};
+    if(::fstat(descriptor,&info) || !S_ISREG(info.st_mode) || info.st_uid!=::geteuid() || (info.st_mode&077) || info.st_size!=page_size || ::pread(descriptor,&header,sizeof(header),0)!=sizeof(header) || header.signature!=(semaphore?semaphore_magic:event_magic) || !header.characters || header.characters>=260 || (semaphore && (!header.maximum || header.maximum>INT32_MAX || header.signal>header.maximum)))return {{},6};
+    storage->identity={static_cast<std::uint64_t>(info.st_dev),static_cast<std::uint64_t>(info.st_ino)};
     const auto mapped=::mmap(nullptr,page_size,PROT_READ|PROT_WRITE,MAP_SHARED,descriptor,0);if(mapped==MAP_FAILED)return {{},8};
     storage->data=static_cast<EventHeader*>(mapped);storage->name=object_name(std::u16string_view(header.name.data(),header.characters));
     ++storage->data->references;storage->counted=true;storage->wake=SharedWake::open(session);return {std::make_shared<SharedEvent>(std::move(storage)),0,false};
 #endif
 }
-OpenSharedEvent open_shared_event(const std::string& session,std::u16string name,bool create,bool manual,bool initial,const ObjectSecurityFactory& security) {
+static OpenSharedEvent open_shared_signal(const std::string& session,std::u16string name,bool create,bool manual,std::uint32_t initial,std::uint32_t maximum,bool semaphore,const ObjectSecurityFactory& security) {
 #if defined(_WIN32)
-    (void)session;(void)name;(void)create;(void)manual;(void)initial;(void)security;return {{},50};
+    (void)session;(void)name;(void)create;(void)manual;(void)initial;(void)maximum;(void)semaphore;(void)security;return {{},50};
 #else
     if(name.starts_with(u"Local\\"))name.erase(0,6);
     if(name.empty() || name.size()>=260 || name.find(u'\\',name.starts_with(u"Global\\")?7:0)!=name.npos)return {{},123};
@@ -104,24 +140,31 @@ OpenSharedEvent open_shared_event(const std::string& session,std::u16string name
     storage->directory=::open(session.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);struct stat info{};
     if(storage->directory<0 || ::fstat(storage->directory,&info) || info.st_uid!=::geteuid() || (info.st_mode&077))return {{},5};
     SharedEventLock lock(storage->directory);bool created=false;
-    if(create){storage->file=::openat(storage->directory,storage->name.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);created=storage->file>=0;if(!created && errno!=EEXIST)return {{},error_code()};}
-    if(storage->file<0)storage->file=::openat(storage->directory,storage->name.c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW);
+    storage->file=open_object_file(session,storage->directory,storage->name,create,created);
     if(storage->file<0)return {{},error_code()};
     if(created) {
-        EventHeader header;header.manual=manual;header.signal=initial;header.characters=static_cast<std::uint32_t>(name.size());std::copy(name.begin(),name.end(),header.name.begin());
+        if(semaphore && (!maximum || maximum>INT32_MAX || initial>maximum)){(void)::unlinkat(storage->directory,storage->name.c_str(),0);return {{},87};}
+        EventHeader header;header.signature=semaphore?semaphore_magic:event_magic;header.manual=manual;header.signal=initial;header.maximum=maximum;header.characters=static_cast<std::uint32_t>(name.size());std::copy(name.begin(),name.end(),header.name.begin());
         if(::ftruncate(storage->file,page_size) || ::pwrite(storage->file,&header,sizeof(header),0)!=sizeof(header)) {const auto error=error_code();(void)::unlinkat(storage->directory,storage->name.c_str(),0);return {{},error};}
         try {if(security)set_shared_object_security(storage->file,security());}
         catch(...) {(void)::unlinkat(storage->directory,storage->name.c_str(),0);throw;}
+        // 建立者即持有者：第一個從其他程序開啟的呼叫者可免完整掃描。
+        detail::named_object_record_holder(storage->file,detail::named_object_page_hint_offset,::getpid(),storage->file);
     }
     if(::fstat(storage->file,&info) || !S_ISREG(info.st_mode) || info.st_uid!=::geteuid() || (info.st_mode&077) || info.st_size!=page_size)return {{},6};
+    storage->identity={static_cast<std::uint64_t>(info.st_dev),static_cast<std::uint64_t>(info.st_ino)};
     auto mapped=::mmap(nullptr,page_size,PROT_READ|PROT_WRITE,MAP_SHARED,storage->file,0);
     if(mapped==MAP_FAILED){const auto error=error_code();if(created)(void)::unlinkat(storage->directory,storage->name.c_str(),0);return {{},error};}
     storage->data=static_cast<EventHeader*>(mapped);const auto& header=*storage->data;
-    if(header.signature!=event_magic || header.characters!=name.size() || !std::equal(name.begin(),name.end(),header.name.begin()))return {{},6};
+    if(header.signature!=(semaphore?semaphore_magic:event_magic) || header.characters!=name.size() || !std::equal(name.begin(),name.end(),header.name.begin()) || (semaphore && (!header.maximum || header.maximum>INT32_MAX || header.signal>header.maximum)))return {{},6};
     ++storage->data->references;storage->counted=true;storage->wake=SharedWake::open(session);
     return {std::make_shared<SharedEvent>(std::move(storage)),0,!created};
 #endif
 }
+OpenSharedEvent inherit_shared_event(const std::string& session,int descriptor){return inherit_shared_signal(session,descriptor,false);}
+OpenSharedEvent inherit_shared_semaphore(const std::string& session,int descriptor){return inherit_shared_signal(session,descriptor,true);}
+OpenSharedEvent open_shared_event(const std::string& session,std::u16string name,bool create,bool manual,bool initial,const ObjectSecurityFactory& security){return open_shared_signal(session,std::move(name),create,manual,initial,1,false,security);}
+OpenSharedEvent open_shared_semaphore(const std::string& session,std::u16string name,bool create,std::uint32_t initial,std::uint32_t maximum,const ObjectSecurityFactory& security){return open_shared_signal(session,std::move(name),create,false,initial,maximum,true,security);}
 std::vector<std::uint8_t> shared_object_security(int descriptor,bool thread) {
 #if defined(__APPLE__) || defined(__linux__)
     const auto name=thread?"user.x64arm.thread-security-v1":"user.x64arm.object-security-v1";
@@ -163,12 +206,12 @@ void set_shared_object_security(int descriptor,const std::vector<std::uint8_t>& 
 #endif
 }
 namespace {
-constexpr std::uint64_t mutex_magic=0x5854554d52413458ULL;
 struct MutexHeader {
     std::uint64_t signature{mutex_magic},references{},process{},thread{};
     std::uint32_t recursion{},abandoned{},characters{};
     std::array<char16_t,260> name{};
 };
+static_assert(sizeof(MutexHeader)<=detail::named_object_page_hint_offset);
 }
 struct SharedMutexStorage {
     int directory{-1},file{-1};MutexHeader* data{};std::string name;bool counted{},lease{};
@@ -247,13 +290,13 @@ OpenSharedMutex open_shared_mutex(const std::string& session,std::u16string name
     storage->directory=::open(session.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);struct stat info{};
     if(storage->directory<0 || ::fstat(storage->directory,&info) || info.st_uid!=::geteuid() || (info.st_mode&077))return {{},5};
     SharedEventLock lock(storage->directory);bool created=false;
-    if(create){storage->file=::openat(storage->directory,storage->name.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);created=storage->file>=0;if(!created && errno!=EEXIST)return {{},error_code()};}
-    if(storage->file<0)storage->file=::openat(storage->directory,storage->name.c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW);
+    storage->file=open_object_file(session,storage->directory,storage->name,create,created);
     if(storage->file<0)return {{},error_code()};
     if(created){
         MutexHeader header;header.characters=static_cast<std::uint32_t>(name.size());std::copy(name.begin(),name.end(),header.name.begin());
         if(::ftruncate(storage->file,page_size) || ::pwrite(storage->file,&header,sizeof header,0)!=sizeof header){const auto error=error_code();(void)::unlinkat(storage->directory,storage->name.c_str(),0);return {{},error};}
         try{if(security)set_shared_object_security(storage->file,security());}catch(...){(void)::unlinkat(storage->directory,storage->name.c_str(),0);throw;}
+        detail::named_object_record_holder(storage->file,detail::named_object_page_hint_offset,::getpid(),storage->file);
     }
     MutexHeader header;
     if(::fstat(storage->file,&info) || !S_ISREG(info.st_mode) || info.st_uid!=::geteuid() || (info.st_mode&077) || info.st_size!=page_size || ::pread(storage->file,&header,sizeof header,0)!=sizeof header || header.signature!=mutex_magic || header.characters!=name.size() || !std::equal(name.begin(),name.end(),header.name.begin()))return {{},6};

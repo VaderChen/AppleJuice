@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/resource_usage.hpp"
+#include "x64arm/process_identity.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/unicode.hpp"
 #include "window_presentation_fault.hpp"
@@ -210,6 +211,7 @@ void WindowsServices::initialize_shared_windows() {
     shared_windows_ = std::move(value);
 #endif
 }
+#include "windows_clipboard_notifications.inc"
 std::uint64_t WindowsServices::allocate_gui_window() {
     initialize_shared_windows();
     if (!shared_windows_)

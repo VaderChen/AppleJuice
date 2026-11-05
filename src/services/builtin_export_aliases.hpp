@@ -7,7 +7,12 @@ namespace x64arm::detail {
 // Windows CRT 的 long double 與 double 同為 binary64；名稱、參數及回傳 ABI
 // 完全相同的入口共用實作與 resident AOT 配方。不要依字尾猜測混合型別的 ABI。
 inline constexpr std::pair<std::string_view,std::string_view> crt_export_aliases[]{
-    {"_calloc_crt","calloc"},{"_calloc_base","calloc"},{"__set_app_type","_set_app_type"},
+    {"_malloc_crt","malloc"},{"_malloc_base","malloc"},
+    {"_calloc_crt","calloc"},{"_calloc_base","calloc"},
+    {"_realloc_crt","realloc"},{"_realloc_base","realloc"},
+    {"_recalloc_crt","_recalloc"},{"_recalloc_base","_recalloc"},
+    {"_free_base","free"},{"_msize_base","_msize"},
+    {"__CppXcptFilter","_seh_filter_dll"},{"__set_app_type","_set_app_type"},
     {"getwc","fgetwc"},{"putwc","fputwc"},{"strtoumax","strtoull"},{"strtoimax","strtoll"},
     {"_hypot","hypot"},{"__p__timezone","__timezone"},{"__p__daylight","__daylight"},{"__p__tzname","__tzname"},
     {"acosl","acos"},{"acoshl","acosh"},{"asinl","asin"},{"asinhl","asinh"},
@@ -30,6 +35,18 @@ inline constexpr std::pair<std::string_view,std::string_view> crt_export_aliases
 // 固定名稱／序號別名是解析與匯出列舉的共用來源，不探測空序號。
 struct ServiceExportAlias { std::string_view family, symbol, target_family, target_symbol; };
 inline constexpr ServiceExportAlias service_export_aliases[]{
+    // OpenGL32 的傳統 WGL 匯出沿用 GDI 的 pixel format 與實際呈現服務。
+    {"opengl32.dll","wglChoosePixelFormat","gdi32.dll","ChoosePixelFormat"},
+    {"opengl32.dll","wglDescribePixelFormat","gdi32.dll","DescribePixelFormat"},
+    {"opengl32.dll","wglGetPixelFormat","gdi32.dll","GetPixelFormat"},
+    {"opengl32.dll","wglSetPixelFormat","gdi32.dll","SetPixelFormat"},
+    {"opengl32.dll","wglSwapBuffers","gdi32.dll","SwapBuffers"},
+    {"ole32.dll","RoGetAgileReference","combase.dll","RoGetAgileReference"},
+    // Vista EVR 影像工具與 Windows 7 起的 MFPlat 共用 ABI、語義及常駐入口。
+    {"mf.dll","MFCreateSourceResolver","mfplat.dll","MFCreateSourceResolver"},
+    {"evr.dll","MFGetStrideForBitmapInfoHeader","mfplat.dll","MFGetStrideForBitmapInfoHeader"},
+    {"evr.dll","MFGetPlaneSize","mfplat.dll","MFGetPlaneSize"},
+    {"evr.dll","MFCopyImage","mfplat.dll","MFCopyImage"},
     // MSI 的序號匯出與具名 API 共用同一實作及 ABI。
     {"msi.dll","#7","msi.dll","MsiCloseAllHandles"},
     {"msi.dll","#8","msi.dll","MsiCloseHandle"},
@@ -262,6 +279,7 @@ inline constexpr std::pair<std::uint16_t,std::string_view> ole_ordinal_exports[]
     {159,"VarSub"},
     {161,"LoadTypeLib"},
     {162,"LoadRegTypeLib"},
+    {163,"RegisterTypeLib"},
     {167,"VarXor"},
     {173,"VarNeg"},
     {174,"VarNot"},
@@ -283,6 +301,9 @@ inline constexpr std::pair<std::uint16_t,std::string_view> ole_ordinal_exports[]
     {277,"VarUI4FromStr"},
     {313,"VarBstrCat"},
     {314,"VarBstrCmp"},
+    {319,"VarDateFromUdateEx"},
+    {330,"VarDateFromUdate"},
+    {331,"VarUdateFromDate"},
     {339,"VarI8FromStr"},
     {368,"VarBstrFromI8"},
     {369,"VarBstrFromUI8"},

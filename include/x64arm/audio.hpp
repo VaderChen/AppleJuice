@@ -10,8 +10,16 @@
 #include "x64arm/audio_effects.hpp"
 
 namespace x64arm::audio {
+// 宿主擁有的音訊圖與 PCM 共用同一輸出裝置；即時回呼不可存取客體記憶體。
+class RenderSource {
+public:
+    virtual ~RenderSource() = default;
+    virtual void render(std::span<float> stereo,unsigned output_rate) noexcept=0;
+};
 // Host callback only reads this owned PCM copy, never guest memory.
 struct Buffer {
+    // 在 open_output 前設定，輸出存活期間不變。非空時由來源產生立體聲。
+    std::shared_ptr<RenderSource> source;
     std::mutex mutex;
     std::vector<std::uint8_t> pcm;
     unsigned channels{2}, bits{16}, rate{44100}, frequency{44100};

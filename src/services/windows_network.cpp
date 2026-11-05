@@ -4,6 +4,7 @@
 #include "socket_address.hpp"
 #include "socket_address_text.hpp"
 #include "socket_database.hpp"
+#include "dns_query.hpp"
 #include "socket_message.hpp"
 #include "socket_fragmentation_option.hpp"
 #include "socket_randomize_option.hpp"
@@ -37,10 +38,12 @@
 namespace x64arm {
 NetworkState::NetworkState(const NetworkState& other) : external_io(other.external_io),configuration(other.configuration),startups(other.startups),next_socket(other.next_socket),addresses(other.addresses),service_buffers(other.service_buffers) {
     next_lookup=other.next_lookup;namespace_lookups=other.namespace_lookups;completion_flags=other.completion_flags;completion_errors=other.completion_errors;
-    if (!other.resolvers.empty() || !other.duplications.empty() || !other.pending_lookups.empty() || !other.sockets.empty() || !other.pending_accepts.empty() || !other.pending_socket_io.empty()) throw std::logic_error("無法複製含有使用中網路連線的執行狀態");
+    next_conditional_accept=other.next_conditional_accept;
+    if (!other.conditional_accepts.empty() || !other.resolvers.empty() || !other.duplications.empty() || !other.pending_lookups.empty() || !other.sockets.empty() || !other.pending_accepts.empty() || !other.pending_socket_io.empty()) throw std::logic_error("無法複製含有使用中網路連線的執行狀態");
 }
 NetworkState& NetworkState::operator=(const NetworkState& other) {if (this!=&other) {*this=NetworkState(other);}return *this;}
 bool NetworkState::operator==(const NetworkState& other) const {
+    if(next_conditional_accept!=other.next_conditional_accept || conditional_accepts!=other.conditional_accepts)return false;
     return resolvers==other.resolvers && namespace_lookups==other.namespace_lookups && duplications==other.duplications && next_lookup==other.next_lookup && pending_lookups==other.pending_lookups && pending_accepts==other.pending_accepts && pending_socket_io==other.pending_socket_io && completion_flags==other.completion_flags && completion_errors==other.completion_errors && external_io==other.external_io && configuration==other.configuration && startups==other.startups && next_socket==other.next_socket && addresses==other.addresses && service_buffers==other.service_buffers && sockets==other.sockets;
 }
 namespace {
@@ -108,6 +111,7 @@ void WindowsServices::poll_network_io(GuestMemory& memory){
             const auto listener=network.sockets.find(io.listener),accepted=network.sockets.find(io.accepted);
             if(listener==network.sockets.end() || accepted==network.sockets.end()){io.error=995;continue;}
             if(io.connected && !io.receive_size)continue;
+            if(!io.connected && !listener->second->deferred_accepts.empty()){ready[index-first]=true;continue;}
             const auto fd=(io.connected?accepted:listener)->second->descriptor;
             if(fd<0){ready[index-first]=true;continue;}
             slots[polled_count]=index-first;entries[polled_count++]={fd,POLLIN,0};
@@ -136,12 +140,9 @@ void WindowsServices::poll_network_io(GuestMemory& memory){
         const auto listener=network.sockets.find(io.listener),accepted=network.sockets.find(io.accepted);
         if(listener==network.sockets.end() || accepted==network.sockets.end())io.error=995;
         if(!io.error && !io.connected){
-            const auto fd=listener->second->descriptor;const auto flags=::fcntl(fd,F_GETFL);
-            if(flags<0 || ::fcntl(fd,F_SETFL,flags|O_NONBLOCK)<0)io.error=socket_error(errno);
-            else{
-                sockaddr_storage peer{};socklen_t size=sizeof(peer);const auto connected=::accept(fd,reinterpret_cast<sockaddr*>(&peer),&size);const auto error=errno;
-                if(::fcntl(fd,F_SETFL,flags)<0){if(connected>=0)::close(connected);io.error=socket_error(errno);}
-                else if(connected<0){if(error==EAGAIN || error==EWOULDBLOCK || error==EINTR)continue;io.error=socket_error(error);}
+            {
+                sockaddr_storage peer{};socklen_t size=sizeof(peer);const auto connected=accept_socket_connection(*listener->second,reinterpret_cast<sockaddr*>(&peer),&size);const auto error=errno;
+                if(connected<0){if(error==EAGAIN || error==EWOULDBLOCK || error==EINTR)continue;io.error=socket_error(error);}
                 else{
                     if(::fcntl(connected,F_SETFD,FD_CLOEXEC)<0 || copy_accept_options(accepted->second->descriptor,connected)<0){io.error=socket_error(errno);::close(connected);}
                     else{auto& socket=*accepted->second;::close(socket.descriptor);socket.descriptor=connected;socket.accept_listener=io.listener;socket.accepted_at=socket_clock_ticks();socket.accept_context=false;socket.reusable=false;socket.set_bound_address({});io.connected=true;
@@ -262,11 +263,18 @@ void WindowsServices::pump_gui_network(std::uint64_t only){
 #ifdef __APPLE__
             if((watch.events&watch.armed&4) && socket_urgent_ready(fd))entry.revents|=POLLPRI;
 #endif
-            if(!entry.revents)continue;
+            const auto connection=shared.connect_result.load();
+            if(!entry.revents && !(watch.connecting && connection>=2))continue;
             const auto post=[&](std::uint32_t event,std::uint32_t error=0){if(watch.generation!=shared.watch_generation.load() || !(watch.events&watch.armed&event))return;
                 if(watch.event_handle){shared.watch_errors[static_cast<unsigned>(std::countr_zero(event))].store(error);shared.watch_recorded.fetch_or(event);const auto object=runtime_.wait_objects.find(watch.event_handle);if(object!=runtime_.wait_objects.end() && object->second.kind==WaitObject::Kind::Event)object->second.set_signal(true);}
                 else{if(gui_.queue.size()>=10000)return;enqueue_gui_message({watch.window,handle,event|(static_cast<std::uint64_t>(error)<<16),watch.message});}watch.armed&=~event;};
-            if(watch.connecting && (entry.revents&(POLLOUT|POLLERR|POLLHUP))){int error=0;socklen_t length=sizeof(error);if(::getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&length)<0)error=errno;watch.connecting=false;watch.connected=!error;if(!error)found->second->accepted_at=socket_clock_ticks();post(16,socket_error(error));}
+            if(watch.connecting && (connection>=2 || (entry.revents&(POLLOUT|POLLERR|POLLHUP)))){
+                std::uint32_t error=connection>2?connection:0;
+                if(connection<2){int native_error=0;socklen_t length=sizeof(native_error);if(::getsockopt(fd,SOL_SOCKET,SO_ERROR,&native_error,&length)<0)native_error=errno;error=socket_error(native_error);shared.connect_result.store(static_cast<std::uint16_t>(error?error:2));}
+                watch.connecting=false;watch.connected=!error;
+                if(!error && found->second->accepted_at==UINT64_MAX)found->second->accepted_at=socket_clock_ticks();
+                post(16,error);
+            }
             const bool datagram=found->second->type==SOCK_DGRAM;
             if((watch.connected || datagram) && (entry.revents&POLLOUT))post(2);
             if((entry.revents&POLLPRI) && !(entry.revents&(POLLERR|POLLHUP)))post(4);
@@ -293,6 +301,9 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         {"iphlpapi.dll","GetAdaptersAddresses",5},
         {"iphlpapi.dll","GetExtendedTcpTable",6,0,0,60},{"iphlpapi.dll","GetTcpTable",3,0,0,4},
         {"iphlpapi.dll","GetAdaptersInfo",2},{"iphlpapi.dll","GetNetworkParams",2},
+        {"iphlpapi.dll","GetIpAddrTable",3},
+        {"dnsapi.dll","DnsQuery_A",6},{"dnsapi.dll","DnsQuery_W",6},{"dnsapi.dll","DnsQuery_UTF8",6},
+        {"dnsapi.dll","DnsFree",2},{"dnsapi.dll","DnsRecordListFree",2},
         {"iphlpapi.dll","IpReleaseAddress",1},{"iphlpapi.dll","IpRenewAddress",1},
         {"iphlpapi.dll","GetIfEntry",1},{"iphlpapi.dll","GetIfTable",3},
         {"iphlpapi.dll","GetIfTable2",1},{"iphlpapi.dll","GetIfTable2Ex",2},{"iphlpapi.dll","GetIfEntry2",1},{"iphlpapi.dll","FreeMibTable",1},{"iphlpapi.dll","GetInterfaceInfo",2},
@@ -318,16 +329,17 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         {"ws2_32.dll","WSAAsyncGetProtoByName",5},{"ws2_32.dll","WSAAsyncGetProtoByNumber",5},
         {"ws2_32.dll","WSAAsyncGetServByName",6},{"ws2_32.dll","WSAAsyncGetServByPort",6},{"ws2_32.dll","WSACancelAsyncRequest",1},
         {"ws2_32.dll","inet_addr",1},{"ws2_32.dll","inet_ntoa",1},{"ws2_32.dll","WSAAsyncSelect",4},{"ws2_32.dll","WSAEventSelect",3},{"ws2_32.dll","WSAEnumNetworkEvents",3},{"ws2_32.dll","WSACreateEvent",0},{"ws2_32.dll","WSAStartup",2},{"ws2_32.dll","WSACleanup",0},{"ws2_32.dll","WSAGetLastError",0},{"ws2_32.dll","WSASetLastError",1},
-        {"mswsock.dll","AcceptEx",8},{"mswsock.dll","GetAcceptExSockaddrs",8},{"mswsock.dll","ConnectEx",7},{"mswsock.dll","DisconnectEx",4},
+        {"mswsock.dll","AcceptEx",8},{"mswsock.dll","GetAcceptExSockaddrs",8},{"mswsock.dll","ConnectEx",7},{"mswsock.dll","DisconnectEx",4},{"mswsock.dll","TransmitFile",7},
         {"ws2_32.dll","AcceptEx",8},{"ws2_32.dll","GetAcceptExSockaddrs",8},{"ws2_32.dll","WSAGetOverlappedResult",5},
         {"ws2_32.dll","WSAEnumProtocolsA",3},{"ws2_32.dll","WSAEnumProtocolsW",3},
         {"ws2_32.dll","WSCEnumProtocols",4},{"ws2_32.dll","WSCGetProviderPath",4},
         {"ws2_32.dll","WSADuplicateSocketA",3},{"ws2_32.dll","WSADuplicateSocketW",3},{"ws2_32.dll","WSASocketA",6},{"ws2_32.dll","WSASocketW",6},{"ws2_32.dll","WSAIoctl",9},
         {"ws2_32.dll","socket",3},{"ws2_32.dll","closesocket",1},{"ws2_32.dll","bind",3},{"ws2_32.dll","connect",3},
         {"ws2_32.dll","WSAConnect",7,0,0,4},
-        {"ws2_32.dll","listen",2},{"ws2_32.dll","accept",3},{"ws2_32.dll","shutdown",2},{"ws2_32.dll","getsockname",3},{"ws2_32.dll","getpeername",3},
+        {"ws2_32.dll","listen",2},{"ws2_32.dll","WSAAccept",5},{"ws2_32.dll","accept",3},{"ws2_32.dll","shutdown",2},{"ws2_32.dll","getsockname",3},{"ws2_32.dll","getpeername",3},
         {"ws2_32.dll","send",4},{"ws2_32.dll","recv",4},{"ws2_32.dll","sendto",6},{"ws2_32.dll","recvfrom",6},
         {"ws2_32.dll","select",5},{"ws2_32.dll","ioctlsocket",3},{"ws2_32.dll","setsockopt",5},{"ws2_32.dll","getsockopt",5},
+        {"ws2_32.dll","WSAHtonl",3},{"ws2_32.dll","WSAHtons",3},{"ws2_32.dll","WSANtohl",3},{"ws2_32.dll","WSANtohs",3},
         {"ws2_32.dll","htonl",1},{"ws2_32.dll","htons",1},{"ws2_32.dll","ntohl",1},{"ws2_32.dll","ntohs",1},
         {"ws2_32.dll","__WSAFDIsSet",2},{"ws2_32.dll","getaddrinfo",4},{"ws2_32.dll","freeaddrinfo",1},{"ws2_32.dll","gethostname",2},
         {"ws2_32.dll","GetAddrInfoW",4},{"ws2_32.dll","FreeAddrInfoW",1},{"ws2_32.dll","GetNameInfoW",7},
@@ -347,12 +359,15 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         {"ws2_32.dll","WSALookupServiceNextA",4},{"ws2_32.dll","WSALookupServiceNextW",4},{"ws2_32.dll","WSALookupServiceEnd",1}
     };return table;
 }
+#include "windows_socket_accept.inc"
 std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+#include "windows_dns.inc"
+    if(service.symbol=="accept" || service.symbol=="WSAAccept")return invoke_socket_accept(state,memory,service);
     if(service.symbol.starts_with("WSALookupService") || service.symbol.starts_with("WSASetService") || service.symbol.starts_with("WSAEnumNameSpaceProviders"))return invoke_socket_namespace(state,memory,service);
     if(service.symbol=="WSAPoll" || service.symbol=="WSASendDisconnect")return invoke_socket_poll(state,memory,service);
     if(service.symbol.starts_with("WSAAsyncGet") || service.symbol=="WSACancelAsyncRequest" || service.symbol=="gethostbyname" || service.symbol=="gethostbyaddr" || service.symbol=="getservbyname" || service.symbol=="getservbyport" || service.symbol=="getprotobyname" || service.symbol=="getprotobynumber")return invoke_socket_database(state,memory,service);
     if(service.symbol=="AcceptEx" || service.symbol=="GetAcceptExSockaddrs" || service.symbol=="WSAGetOverlappedResult")return invoke_network_extension(state,memory,service);
-    if(service.symbol=="ConnectEx" || service.symbol=="DisconnectEx")return invoke_socket_io(state,memory,service);
+    if(service.symbol=="ConnectEx" || service.symbol=="DisconnectEx" || service.symbol=="TransmitFile")return invoke_socket_io(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;auto& network=runtime_.network;
     const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
     if(symbol=="WSAIoctl" && multicast_filter_ioctl(static_cast<std::uint32_t>(arg(1))))return invoke_socket_io(state,memory,service);
@@ -410,7 +425,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
         const int enabled=1;
         if (::setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&enabled,sizeof(enabled))<0) {fail(socket_error(errno));return;}
 #endif
-        sockaddr_storage peer{};socklen_t peer_size=sizeof(peer);if(::getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peer_size)==0)value->accepted_at=socket_clock_ticks();
+        sockaddr_storage peer{};socklen_t peer_size=sizeof(peer);if(::getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peer_size)==0){value->accepted_at=socket_clock_ticks();value->shared->data().connect_result.store(2);}
         result=network.next_socket++;network.sockets.emplace(result,std::move(value));runtime_.handle_flags[result]=1;
     };
     try {
@@ -468,6 +483,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
             if (count>1024) fail(10022);
             else for (std::uint64_t i=0;i<count;++i) if (memory.load(GuestAddress{arg(1)+unit+i*unit},bits)==arg(0)) result=1;
         } else if (!network.startups) fail(10093);
+        else if(symbol=="WSAHtonl" || symbol=="WSANtohl" || symbol=="WSAHtons" || symbol=="WSANtohs"){
+            if(!network.sockets.contains(arg(0)))fail(10038);
+            else if(!arg(2))fail(10014);
+            else {const bool short_value=symbol.ends_with('s');memory.store(GuestAddress{arg(2)},short_value?16:32,short_value?htons(static_cast<std::uint16_t>(arg(1))):htonl(u32(1)));}
+        }
     else if (symbol=="WSACleanup") {if (--network.startups==0) {cancel_socket_lookups();network.namespace_lookups.clear();cancel_network_io(memory);for(const auto& [handle,socket]:network.sockets){(void)socket;runtime_.handle_flags.erase(handle);}for(const auto& [handle,watch]:gui_.socket_watches){const auto socket=network.sockets.find(handle);if(socket!=network.sockets.end() && watch.generation==socket->second->shared->data().watch_generation.load())socket->second->shared->data().watch_generation.fetch_add(1);}network.sockets.clear();network.duplications.clear();network.completion_flags.clear();network.completion_errors.clear();gui_.socket_watches.clear();}}
         else if(symbol=="WSADuplicateSocketA" || symbol=="WSADuplicateSocketW"){
             const auto socket=network.sockets.find(arg(0));
@@ -704,13 +724,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                 const auto socket=found->second;const auto fd=socket->descriptor;
                 const auto register_watch=[&]{auto& data=socket->shared->data();const auto generation=data.watch_generation.fetch_add(1)+1;data.watch_rearm.store(0);data.watch_recorded.store(0);for(auto& error:data.watch_errors)error.store(0);
                     std::erase_if(gui_.socket_watches,[&](const auto& entry){const auto other=network.sockets.find(entry.first);return entry.first!=arg(0) && other!=network.sockets.end() && other->second->shared==socket->shared;});return generation;};
+                const auto initialize_watch=[&](std::uint64_t generation,std::uint32_t events)->GuiSocketWatch&{
+                    auto& watch=gui_.socket_watches[arg(0)];watch={};watch.generation=generation;watch.events=watch.armed=events;
+                    sockaddr_storage peer{};socklen_t size=sizeof(peer);watch.connected=::getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&size)==0;
+                    // 已連線、正在握手或已失敗的非阻塞連線，都須在晚登記時交付結果。
+                    watch.connecting=!socket->listening && (watch.connected || socket->shared->data().connect_result.load()!=0);
+                    return watch;
+                };
                 if(symbol=="WSAEventSelect"){
                     const auto events=u32(2);const auto object=runtime_.wait_objects.find(arg(1));
                     if(events&~0x3fU)fail(10045);
                     else if(events && (object==runtime_.wait_objects.end() || object->second.kind!=WaitObject::Kind::Event || !(object->second.access&2)))fail(10022);
                     else{const auto flags_value=::fcntl(fd,F_GETFL);if(flags_value<0 || ::fcntl(fd,F_SETFL,flags_value|O_NONBLOCK)<0)fail(socket_error(errno));
                         else{const auto generation=register_watch();if(!events)gui_.socket_watches.erase(arg(0));
-                        else{auto& watch=gui_.socket_watches[arg(0)];const auto connecting=watch.connecting;watch={};watch.generation=generation;watch.connecting=connecting;watch.event_handle=arg(1);watch.events=watch.armed=events;sockaddr_storage peer{};socklen_t size=sizeof(peer);watch.connected=::getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&size)==0;}}}
+                        else initialize_watch(generation,events).event_handle=arg(1);}}
                 }else if(symbol=="WSAEnumNetworkEvents"){
                     const auto object=runtime_.wait_objects.find(arg(1));if(arg(1) && (object==runtime_.wait_objects.end() || object->second.kind!=WaitObject::Kind::Event || !(object->second.access&2)))fail(10022);
                     else if(!arg(2))fail(10014);
@@ -722,7 +749,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                         }}
                 }else if(symbol=="WSAAsyncSelect"){
                     if(u32(3)&~0x3fU || (u32(3) && !gui_.windows.contains(arg(1))))fail(10022);
-                    else {const auto flags_value=::fcntl(fd,F_GETFL);if(flags_value<0 || ::fcntl(fd,F_SETFL,flags_value|O_NONBLOCK)<0)fail(socket_error(errno));else{const auto generation=register_watch();if(!u32(3))gui_.socket_watches.erase(arg(0));else {auto& watch=gui_.socket_watches[arg(0)];const auto connecting=watch.connecting;watch={};watch.generation=generation;watch.connecting=connecting;watch.window=arg(1);watch.message=u32(2);watch.events=u32(3);watch.armed=u32(3);sockaddr_storage peer{};socklen_t peer_size=sizeof(peer);if(::getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peer_size)==0)watch.connected=true;}}}
+                    else {const auto flags_value=::fcntl(fd,F_GETFL);if(flags_value<0 || ::fcntl(fd,F_SETFL,flags_value|O_NONBLOCK)<0)fail(socket_error(errno));else{const auto generation=register_watch();if(!u32(3))gui_.socket_watches.erase(arg(0));else {auto& watch=initialize_watch(generation,u32(3));watch.window=arg(1);watch.message=u32(2);}}}
                 }
                 else if(symbol=="WSARecvMsg"){
                     if(socket->type!=SOCK_DGRAM && socket->type!=SOCK_RAW)fail(10045);
@@ -825,22 +852,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                             errno=saved_errno;
                         }
                         if(extended && arg(4) && (!status || errno==EINPROGRESS))memory.store(GuestAddress{arg(4)},32,0);
-                        if(connecting && gui_.socket_watches.contains(arg(0)) && (!status || errno==EINPROGRESS))gui_.socket_watches.at(arg(0)).connecting=true;
+                        if(connecting && (!status || errno==EINPROGRESS || errno==EALREADY)){
+                            socket->shared->data().connect_result.store(status?1:2);
+                            if(gui_.socket_watches.contains(arg(0)))gui_.socket_watches.at(arg(0)).connecting=true;
+                        }
                         if (status<0) fail(errno==EINPROGRESS?10035U:socket_error(errno));else if(connecting)socket->accepted_at=socket_clock_ticks();else{sockaddr_storage local{};socklen_t size=sizeof(local);if(::getsockname(fd,reinterpret_cast<sockaddr*>(&local),&size)==0)socket->set_bound_address(address_bytes(reinterpret_cast<sockaddr*>(&local)));}}
                 } else if (symbol=="listen") {if (::listen(fd,sint(1))<0) fail(socket_error(errno));else socket->listening=true;}
                 else if (symbol=="shutdown") {if (u32(1)>2) fail(10022);else if (::shutdown(fd,sint(1))<0) fail(socket_error(errno));else if(u32(1))socket->send_shutdown=true;}
-                else if (symbol=="getsockname" || symbol=="getpeername" || symbol=="accept") {
-                    const bool accept=symbol=="accept";const auto pointer=arg(1),size_pointer=arg(2);
-                    if(accept)socket->shared->data().watch_rearm.fetch_or(8);
-                    const auto capacity=pointer?memory.load(GuestAddress{size_pointer},32):0;const auto required=socket->family==AF_INET6?28U:16U;
-                    if ((!pointer && !accept) || (pointer && capacity<required)) fail(10014);
+                else if (symbol=="getsockname" || symbol=="getpeername") {
+                    const auto pointer=arg(1),size_pointer=arg(2);
+                    const auto required=socket->family==AF_INET6?28U:16U;
+                    if(!pointer || !size_pointer || memory.load(GuestAddress{size_pointer},32)<required)fail(10014);
                     else {
-                        if (pointer) {memory.check(GuestAddress{pointer},required,Access::Write);memory.check(GuestAddress{size_pointer},4,Access::Write);}
+                        memory.check(GuestAddress{pointer},required,Access::Write);memory.check(GuestAddress{size_pointer},4,Access::Write);
                         sockaddr_storage address{};socklen_t size=sizeof(address);auto* native=reinterpret_cast<sockaddr*>(&address);
-                        const auto status=accept?::accept(fd,native,&size):symbol=="getsockname"?::getsockname(fd,native,&size ) : ::getpeername(fd,native,&size);
-                        if (status<0) fail(socket_error(errno));
-                        else {if (pointer) {const auto bytes=address_bytes(native);memory.write(GuestAddress{pointer},bytes);memory.store(GuestAddress{size_pointer},32,bytes.size());}
-                            if (accept) {make_socket(status,socket->family,socket->type,socket->protocol);if(result!=UINT64_MAX && gui_.socket_watches.contains(arg(0))){auto watch=gui_.socket_watches.at(arg(0));watch.connecting=false;watch.connected=true;watch.armed=watch.events;watch.recorded=0;watch.errors={};watch.generation=network.sockets.at(result)->shared->data().watch_generation.fetch_add(1)+1;gui_.socket_watches[result]=watch;const auto flags_value=::fcntl(status,F_GETFL);if(flags_value>=0)(void)::fcntl(status,F_SETFL,flags_value|O_NONBLOCK);}}}
+                        const auto status=symbol=="getsockname"?::getsockname(fd,native,&size) : ::getpeername(fd,native,&size);
+                        if(status<0)fail(socket_error(errno));
+                        else {const auto bytes=address_bytes(native);memory.write(GuestAddress{pointer},bytes);memory.store(GuestAddress{size_pointer},32,bytes.size());}
                     }
                 } else if (symbol=="ioctlsocket" || symbol=="WSAIoctl") {
                     const bool extended=symbol=="WSAIoctl",input=u32(1)==0x8004667e;const auto pointer=extended && !input?arg(4):arg(2);
@@ -854,7 +882,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                             const std::array<std::uint8_t,16> connect{0xb9,0x07,0xa2,0x25,0xf3,0xdd,0x60,0x46,0x8e,0xe9,0x76,0xe5,0x8c,0x74,0x06,0x3e},disconnect{0x11,0x2e,0xda,0x7f,0x30,0x86,0x6f,0x43,0xa0,0x31,0xf5,0x36,0xa6,0xee,0xc1,0x57};
                             const std::array<std::uint8_t,16> sendmsg{0x12,0xe7,0x41,0xa4,0x4f,0x75,0xca,0x43,0x84,0xa7,0x0d,0xee,0x44,0xcf,0x60,0x6d};
                             const std::array<std::uint8_t,16> recvmsg{0xc8,0xd7,0x89,0xf6,0x1f,0x6f,0x6b,0x43,0x8a,0x53,0xe5,0x4f,0xe3,0x51,0xc3,0x22};
-                            const char* name=guid==recvmsg?"WSARecvMsg":guid==sendmsg?"WSASendMsg":guid==accept?"AcceptEx":guid==addresses?"GetAcceptExSockaddrs":guid==connect?"ConnectEx":guid==disconnect?"DisconnectEx":nullptr;
+                            auto transmit=accept;transmit[0]=0xf0;
+                            const char* name=guid==transmit?"TransmitFile":guid==recvmsg?"WSARecvMsg":guid==sendmsg?"WSASendMsg":guid==accept?"AcceptEx":guid==addresses?"GetAcceptExSockaddrs":guid==connect?"ConnectEx":guid==disconnect?"DisconnectEx":nullptr;
                             if(!name)fail(10045);else{memory.store(GuestAddress{arg(4)},x86_?32:64,resolve("mswsock.dll",name).value);memory.store(GuestAddress{arg(6)},32,width);}
                         }
                     } else if (u32(1)==0x8004667e) {
@@ -995,6 +1024,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                             fail(socket_error(native_error));
                         }
                         else if (get) {
+                            if(level==SOL_SOCKET && option==SO_ERROR && integer && socket->shared->data().connect_result.load()==1)
+                                socket->shared->data().connect_result.store(static_cast<std::uint16_t>(socket_error(integer)));
                             if(send_buffer && socket->shared->data().zero_send_buffer.load())integer=0;
                             const auto number=timeout?static_cast<std::uint32_t>(time.tv_sec*1000+time.tv_usec/1000):linger_value?
                                 (static_cast<std::uint32_t>(linger_option.l_linger)<<16)|static_cast<std::uint16_t>(linger_option.l_onoff!=0):

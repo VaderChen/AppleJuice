@@ -1,10 +1,39 @@
 #pragma once
 #include "pcm_wave_format.hpp"
+#include "service_callback_task.hpp"
 #include "x64arm/riff_chunk.hpp"
 #include <vector>
 
 namespace x64arm {
 struct PcmWaveFile {PcmWaveFormat format;std::span<const std::uint8_t> samples;};
+struct PcmWaveStream {PcmWaveFormat format;std::uint64_t offset{},bytes{};};
+// 檔案來源沿用相同格式與 RIFF 規則，只讀 metadata；音訊依需求從既有 HostFile 取樣。
+template<class Read> service_callback::Task<std::optional<PcmWaveStream>> parse_pcm_wave_stream_async(std::uint64_t size,Read read){
+    if(size<12)co_return std::optional<PcmWaveStream>{};std::array<std::uint8_t,12> header{};co_await read(0,std::span(header));
+    if(riff::word(header)!=riff::riff_id || riff::word(std::span(header).subspan(8))!=0x45564157)co_return std::optional<PcmWaveStream>{};
+    const auto end=std::uint64_t{riff::word(std::span(header).subspan(4))}+8;if(end<12 || end>size)co_return std::optional<PcmWaveStream>{};
+    std::optional<PcmWaveFormat> format;std::optional<PcmWaveStream> stream;
+    for(std::uint64_t at=12;at<end;){
+        if(end-at<8)co_return std::optional<PcmWaveStream>{};std::array<std::uint8_t,8> chunk{};co_await read(at,std::span(chunk));
+        riff::Chunk part;try{part=riff::chunk(chunk,at,end);}catch(const std::invalid_argument&){co_return std::optional<PcmWaveStream>{};}
+        const auto id=part.id,count=part.size;const auto payload=part.data;
+        if(id==0x20746d66){
+            if(format || count<16 || count>274)co_return std::optional<PcmWaveStream>{};std::array<std::uint8_t,274> bytes{};auto data=std::span(bytes).first(count);co_await read(payload,data);
+            format=parse_pcm_wave_format(data,true,true,100,384000,{64,32,false,true});if(!format)co_return std::optional<PcmWaveStream>{};
+        }else if(id==0x61746164){if(stream)co_return std::optional<PcmWaveStream>{};stream=PcmWaveStream{{},payload,count};}
+        at=part.next;
+    }
+    if(!format || !stream || stream->bytes%format->align)co_return std::optional<PcmWaveStream>{};stream->format=*format;co_return stream;
+}
+struct PcmWaveReadReady {
+    bool await_ready()const noexcept{return true;}
+    void await_suspend(std::coroutine_handle<>)const noexcept{}
+    void await_resume()const noexcept{}
+};
+template<class Read> std::optional<PcmWaveStream> parse_pcm_wave_stream(std::uint64_t size,Read read){
+    auto task=parse_pcm_wave_stream_async(size,[&](std::uint64_t at,std::span<std::uint8_t> bytes){read(at,bytes);return PcmWaveReadReady{};});
+    task.address().resume();return task.take();
+}
 // 所有音效來源共用 RIFF 界線、偶數對齊、格式與完整 frame 驗證。
 inline std::optional<PcmWaveFile> parse_pcm_wave_file(std::span<const std::uint8_t> bytes,bool allow_empty=false){
     if(bytes.size()<12 || riff::word(bytes)!=riff::riff_id || riff::word(bytes.subspan(8))!=0x45564157)return {};

@@ -67,6 +67,13 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_hook(GuestState& state,
     if(finished.hook.continuation==Continuation::ReturnCallback) {
         complete_call(state,memory,result);return std::nullopt;
     }
+    if(finished.hook.continuation==Continuation::GuiRetrievedMessage){
+        // WH_GETMESSAGE 可改 MSG，但 LRESULT 不取代 GetMessage／PeekMessage 的 BOOL。
+        // WM_QUEUESYNC 仍沿原有 CBT 通知；兩種 hook 都不能吞掉已取出的訊息。
+        const auto value=finished.hook.value&1U;
+        if((finished.hook.value&2U) && start_gui_hooks(state,memory,5,2,0,0,Continuation::Return,value))return std::nullopt;
+        complete_call(state,memory,value);return std::nullopt;
+    }
     // 後續 modal/menu continuation 必須取得 hook 的 LRESULT，且保留 API 的
     // 原始呼叫框架；不可將其當成一般 callback queue 自動呼叫下一個 hook。
     auto continuation=finished;continuation.continuation=finished.hook.continuation;
@@ -107,7 +114,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_hooks(GuestState& state,Gue
         else if(!thread && !arg(2))fail(1428);
         else if(arg(2) && !module_image(arg(2)))fail(126);
         else if(type==6 && thread)fail(1429);
-        else if(type!=-1 && type!=6 && type!=5)fail(50); // 尚無事件來源的 hook 不宣稱安裝成功。
+        else if(type!=-1 && type!=3 && type!=6 && type!=5)fail(50); // 尚無事件來源的 hook 不宣稱安裝成功。
         else if(gui_.hooks.size()>=4096)fail(8);
         else {
             memory.check(GuestAddress{arg(1)},1,Access::Execute);

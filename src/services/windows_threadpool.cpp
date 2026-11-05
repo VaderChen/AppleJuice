@@ -97,7 +97,7 @@ void WindowsServices::poll_threadpool(GuestMemory& memory){
         bool signaled=false;
         if(object.kind==PoolKind::Wait){
             const auto target=runtime_.wait_objects.find(object.target);
-            SharedEventLock lock(target!=runtime_.wait_objects.end() && target->second.shared_event?target->second.shared_event->lock_descriptor():-1);
+            SharedEventLock lock(target!=runtime_.wait_objects.end()?runtime_.wait_lock_descriptor(target->second):-1);
             if(target!=runtime_.wait_objects.end())signaled=runtime_.wait_state(target->second).signaled();
             else if(const auto id=thread_id(object.target))signaled=threads_.items.at(id).status==ThreadStatus::Exited;
             else if(const auto exited=process_signaled(object.target))signaled=*exited;

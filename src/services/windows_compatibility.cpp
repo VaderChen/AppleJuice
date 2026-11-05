@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "crt_os_error.hpp"
 #include "bluetooth_sdp.hpp"
 #include "virtual_firmware.hpp"
 #include "x3daudio.hpp"
@@ -175,7 +176,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll","CancelIo",1},{"kernel32.dll","CancelIoEx",2},
         {"kernel32.dll","EncodePointer",1},{"kernel32.dll","DecodePointer",1},
         {"ntdll.dll","RtlEncodePointer",1},{"ntdll.dll","RtlDecodePointer",1},
-        {"crt","_encode_pointer",1},{"crt","_decode_pointer",1},
+        {"crt","_encode_pointer",1},{"crt","_decode_pointer",1},{"crt","_encoded_null",0},
         {"kernel32.dll","LocalFlags",1},{"kernel32.dll","LocalSize",1},{"kernel32.dll","LocalHandle",1},
         {"kernel32.dll", "SetConsoleCtrlHandler", 2},
         {"kernel32.dll", "GetSystemDefaultLangID", 0},{"kernel32.dll", "GetUserDefaultLangID", 0},{"kernel32.dll", "GetThreadUILanguage", 0},{"kernel32.dll", "GetUserDefaultUILanguage", 0},
@@ -214,6 +215,8 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"crt", "btowc", 1}, {"crt", "wctob", 1}, {"crt", "mbrtowc", 4}, {"crt", "mbrlen", 3}, {"crt", "mbtowc", 3}, {"crt", "mblen", 2}, {"crt", "mbsinit", 1},
         {"crt", "_lock_locales", 0}, {"crt", "_unlock_locales", 0}, {"crt", "_lock_file", 1}, {"crt", "_unlock_file", 1}, {"crt", "fputc", 2}, {"crt", "putc", 2}, {"crt", "_write", 3},
         {"crt", "_fullpath", 3}, {"crt", "_wfullpath", 3}, {"crt", "_getcwd", 2}, {"crt", "_wgetcwd", 2},
+        {"crt", "_getdrive", 0}, {"crt", "_getdcwd", 3}, {"crt", "_wgetdcwd", 3},
+        {"crt", "_getdcwd_nolock", 3}, {"crt", "_wgetdcwd_nolock", 3},
         {"kernel32.dll", "GetCurrentDirectoryA", 2}, {"kernel32.dll", "GetCurrentDirectoryW", 2},
         {"kernel32.dll", "GetFullPathNameA", 4}, {"kernel32.dll", "GetFullPathNameW", 4},
         {"user32.dll","CharToOemA",2},{"user32.dll","CharToOemW",2},
@@ -281,7 +284,15 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"shlwapi.dll", "PathIsRelativeA", 1}, {"shlwapi.dll", "PathIsRelativeW", 1},
         {"shlwapi.dll", "PathFindExtensionA", 1}, {"shlwapi.dll", "PathFindExtensionW", 1},
         {"shlwapi.dll", "PathFindFileNameA", 1}, {"shlwapi.dll", "PathFindFileNameW", 1},
+        {"shlwapi.dll", "PathFindNextComponentA", 1}, {"shlwapi.dll", "PathFindNextComponentW", 1},
         {"shlwapi.dll", "PathIsUNCA", 1}, {"shlwapi.dll", "PathIsUNCW", 1},
+        {"shlwapi.dll", "StrCmpA", 2}, {"shlwapi.dll", "StrCmpW", 2},
+        {"shlwapi.dll", "StrCmpIA", 2}, {"shlwapi.dll", "StrCmpIW", 2},
+        {"shlwapi.dll", "StrCmpNA", 3}, {"shlwapi.dll", "StrCmpNW", 3},
+        {"shlwapi.dll", "StrCmpNIA", 3}, {"shlwapi.dll", "StrCmpNIW", 3},
+        {"shlwapi.dll", "StrStrA", 2}, {"shlwapi.dll", "StrStrW", 2},
+        {"shlwapi.dll", "StrStrIA", 2}, {"shlwapi.dll", "StrStrIW", 2},
+        {"shlwapi.dll", "StrStrNW", 3}, {"shlwapi.dll", "StrStrNIW", 3},
         {"kernel32.dll", "CreateSemaphoreA", 4}, {"kernel32.dll", "CreateSemaphoreW", 4}, {"kernel32.dll", "ReleaseSemaphore", 3},
         {"kernel32.dll", "CreateSemaphoreExA", 6,0,0,54}, {"kernel32.dll", "CreateSemaphoreExW", 6,0,0,54},
         {"kernel32.dll", "OpenSemaphoreA", 3,0,0,3}, {"kernel32.dll", "OpenSemaphoreW", 3,0,0,3},
@@ -502,7 +513,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         }
         if(callers)while(result<capacity){memory.store(GuestAddress{output(result)},width,0);++result;}
         else if(arg(3))memory.store(GuestAddress{arg(3)},32,hash);
-    }else if(symbol=="EncodePointer" || symbol=="DecodePointer" || symbol=="RtlEncodePointer" || symbol=="RtlDecodePointer" || symbol=="_encode_pointer" || symbol=="_decode_pointer") {
+    }else if(symbol=="EncodePointer" || symbol=="DecodePointer" || symbol=="RtlEncodePointer" || symbol=="RtlDecodePointer" || symbol=="_encode_pointer" || symbol=="_decode_pointer" || symbol=="_encoded_null") {
         if(!runtime_.pointer_cookie) {
             std::array<std::uint8_t,8> bytes{};
             if(!random_bytes(bytes))throw HostCallFault("無法取得程序指標編碼金鑰");
@@ -510,12 +521,69 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             runtime_.pointer_cookie|=UINT64_C(0x8000000000000000);
         }
         const auto rotation=static_cast<int>(runtime_.pointer_cookie&63);
-        const bool encode=symbol=="EncodePointer" || symbol=="RtlEncodePointer" || symbol=="_encode_pointer";
+        const bool encode=symbol=="EncodePointer" || symbol=="RtlEncodePointer" || symbol=="_encode_pointer" || symbol=="_encoded_null";
+        const auto value=symbol=="_encoded_null"?0:arg(0);
         if(x86_) {
             const auto cookie=static_cast<std::uint32_t>(runtime_.pointer_cookie);
-            const auto pointer=static_cast<std::uint32_t>(arg(0));
+            const auto pointer=static_cast<std::uint32_t>(value);
             result=encode?std::rotr(pointer^cookie,rotation&31):std::rotl(pointer,rotation&31)^cookie;
-        } else result=encode?std::rotr(arg(0)^runtime_.pointer_cookie,rotation):std::rotl(arg(0),rotation)^runtime_.pointer_cookie;
+        } else result=encode?std::rotr(value^runtime_.pointer_cookie,rotation):std::rotl(value,rotation)^runtime_.pointer_cookie;
+    }else if(symbol.starts_with("StrCmp") || symbol.starts_with("StrStr")){
+        const bool wide=symbol.ends_with('W'),compare=symbol.starts_with("StrCmp");
+        const bool ignore=symbol.find('I')!=symbol.npos,bounded=symbol.find('N')!=symbol.npos;
+        const auto decode=[](std::string_view bytes){const auto value=windows_nls_decode(bytes,65001,false);if(!value)throw HostCallFault("Shell 字串碼頁轉換失敗");return *value;};
+        // N 比較沿用 CompareString 的明確長度契約；搜尋的 N 則限制匹配起點。
+        const auto read=[&](std::uint64_t pointer,std::int32_t count){
+            if(count<0)return wide?read_utf16(memory,GuestAddress{pointer}):decode(read_ansi(memory,pointer));
+            if(static_cast<std::uint32_t>(count)>output_limit/(wide?2U:1U))throw HostCallFault("Shell 字串比較超過上限");
+            if(wide){std::u16string text(static_cast<std::size_t>(count),0);for(std::size_t i=0;i<text.size();++i)text[i]=static_cast<char16_t>(memory.load(GuestAddress{pointer+i*2},16));return text;}
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(count));memory.read(GuestAddress{pointer},bytes);
+            return decode(std::string_view(reinterpret_cast<const char*>(bytes.data()),bytes.size()));
+        };
+        if(compare){
+            if(!arg(0) || !arg(1)){last_error_=87;result=static_cast<std::uint32_t>(-2);}
+            else {
+                const auto count=bounded?static_cast<std::int32_t>(arg(2)):-1;
+                const auto compared=windows_nls_compare(read(arg(0),count),read(arg(1),count),0x409,ignore?1:0);
+                if(compared)result=static_cast<std::uint32_t>(*compared);else {last_error_=87;result=static_cast<std::uint32_t>(-2);}
+            }
+        }else if(arg(0) && arg(1) && (!bounded || dword(2))){
+            if(wide){
+                const auto text=read_utf16(memory,GuestAddress{arg(0)}),pattern=read_utf16(memory,GuestAddress{arg(1)});
+                const auto starts=bounded?std::min<std::size_t>(text.size(),dword(2)):text.size();
+                if(!pattern.empty())for(std::size_t at=0;at<starts && pattern.size()<=text.size()-at;++at){
+                    const auto candidate=std::u16string_view(text).substr(at,pattern.size());
+                    const bool match=ignore?windows_nls_compare(candidate,pattern,0x409,1)==0:candidate==pattern;
+                    if(match){result=arg(0)+at*2;break;}
+                }
+            }else {
+                const auto text=read_ansi(memory,arg(0)),pattern=read_ansi(memory,arg(1));
+                const auto decoded=decode(pattern);
+                // ACP 為 UTF-8；保留原始位元組位移，且不把多位元組字元中段當成起點。
+                if(!pattern.empty())for(std::size_t at=0;at<text.size() && pattern.size()<=text.size()-at;){
+                    const auto candidate=decode(std::string_view(text).substr(at,pattern.size()));
+                    if(windows_nls_compare(candidate,decoded,0x409,ignore?1:0)==0){result=arg(0)+at;break;}
+                    const auto tail=std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(text.data()+at),text.size()-at);
+                    const auto character=windows_crt_decode(tail,65001);at+=character.status==CrtDecodedCharacter::Status::Complete?character.bytes:1;
+                }
+            }
+        }
+    }else if(symbol.starts_with("PathFindNextComponent")){
+        const bool wide=symbol.ends_with('W');const auto unit=wide?2U:1U;
+        if(arg(0) && memory.load(GuestAddress{arg(0)},static_cast<std::uint8_t>(unit*8))){
+            std::uint64_t at=0;
+            for(;;++at){
+                if(at>=output_limit/unit)throw HostCallFault("Shell 路徑超過上限");
+                const auto value=memory.load(GuestAddress{arg(0)+at*unit},static_cast<std::uint8_t>(unit*8));
+                if(!value)break;
+                if(value=='\\'){
+                    ++at;
+                    if(memory.load(GuestAddress{arg(0)+at*unit},static_cast<std::uint8_t>(unit*8))=='\\')++at;
+                    break;
+                }
+            }
+            result=arg(0)+at*unit;
+        }
     }else if(symbol.starts_with("PathFindExtension") || symbol.starts_with("PathFindFileName") || symbol.starts_with("PathIsRelative") || symbol.starts_with("PathIsUNC")){
         const bool wide=symbol.ends_with('W');
         // ANSI 的索引仍是原始位元組位移；不可經 UTF-8 解碼改變返回指標。
@@ -802,14 +870,33 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         else {if(arg(1))memory.store(GuestAddress{arg(1)},32,mode.value_or(runtime_.error_mode));mode=dword(0);result=1;}
     }
     else if (symbol == "GetErrorMode" || symbol == "SetErrorMode") {result=runtime_.error_mode;if (symbol=="SetErrorMode") runtime_.error_mode=dword(0);}
-    else if (symbol == "_getcwd" || symbol == "_wgetcwd" || symbol == "_fullpath" || symbol == "_wfullpath" || symbol.starts_with("GetFullPathName") || symbol.starts_with("GetCurrentDirectory")) {
-        const bool crt = symbol.front() == '_', current = symbol.ends_with("getcwd") || symbol.starts_with("GetCurrentDirectory");
-        const bool wide = symbol == "_wgetcwd" || symbol == "_wfullpath" || symbol.back() == 'W';
+    else if(symbol=="_getdrive"){
+        const auto& path=runtime_.current_directory;const auto drive=path.empty()?0:windows_path_upper(path[0]);
+        result=path.size()>=2 && path[1]==u':' && drive>=u'A' && drive<=u'Z'?static_cast<unsigned>(drive-u'A'+1):0U;
+    }
+    else if (symbol == "_getcwd" || symbol == "_wgetcwd" || symbol.find("getdcwd")!=symbol.npos || symbol == "_fullpath" || symbol == "_wfullpath" || symbol.starts_with("GetFullPathName") || symbol.starts_with("GetCurrentDirectory")) {
+        const bool crt = symbol.front() == '_', drive_query=symbol.find("getdcwd")!=symbol.npos;
+        const bool current = drive_query || symbol.ends_with("getcwd") || symbol.starts_with("GetCurrentDirectory");
+        const bool wide = symbol.starts_with("_w") || symbol.back() == 'W';
+        auto destination=crt?arg(drive_query?1:0):arg(current?1:2);
+        const auto capacity=crt?(current?dword(drive_query?2:1):arg(2)):dword(current?0:1);
+        const auto drive=drive_query?static_cast<std::int32_t>(arg(0)):0;
+        const auto invalid=[&](unsigned code,unsigned dos)->std::optional<std::uint32_t>{
+            memory.store(GuestAddress{runtime_.errno_cell},32,code);memory.store(GuestAddress{crt_os_error::cell(runtime_.errno_cell)},32,dos);
+            if(current_invalid_parameter_handler()){
+                start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,0);return std::nullopt;
+            }
+            return 0xc0000409U;
+        };
+        if(crt && current && (static_cast<std::int32_t>(capacity)<0 || (destination && !static_cast<std::uint32_t>(capacity))))return invalid(22,0);
+        if(drive_query && (drive<0 || drive>26 || (drive && filesystem_.information(std::string(1,static_cast<char>('A'+drive-1))+":/").error)))
+            return invalid(13,15);
         const auto pointer = current ? 0 : crt ? arg(1) : arg(0);
         std::u16string path;bool device=false;
         try {
             auto input=pointer ? (wide ? read_utf16(memory,GuestAddress{pointer}) : utf8_to_utf16(read_ansi(memory,pointer))) : std::u16string{};
-            if(current || (crt && input.empty())) path=runtime_.current_directory;
+            if(drive_query && drive)path=full_windows_environment_path(std::u16string{static_cast<char16_t>(u'A'+drive-1),u':'},runtime_.current_directory,runtime_.environment);
+            else if(current || (crt && input.empty())) path=runtime_.current_directory;
             else {
                 device=windows_dos_device(input)!=0;
                 path=full_windows_environment_path(std::move(input),runtime_.current_directory,runtime_.environment);
@@ -820,13 +907,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         if (wide) bytes = utf16_bytes(path);
         else { const auto text = utf16_to_utf8(path); bytes.assign(text.begin(), text.end()); bytes.push_back(0); }
         const auto count = bytes.size() / (wide ? 2U : 1U);
-        auto destination = crt ? arg(0) : arg(current ? 1 : 2); const auto capacity = crt ? arg(current ? 1 : 2) : dword(current ? 0 : 1);
         if (crt && !destination) {
-            destination = allocate_heap(memory, bytes.size());
+            // NULL buffer 至少配置要求的字元數；不足以容納路徑時擴大，沿用 CRT heap／free。
+            const auto requested=current?static_cast<std::uint64_t>(static_cast<std::uint32_t>(capacity))*(wide?2U:1U):bytes.size();
+            destination = allocate_heap(memory, std::max<std::uint64_t>(bytes.size(),requested));
             if (!destination) { memory.store(GuestAddress{runtime_.errno_cell}, 32, 12); result = 0; }
             else { memory.write(GuestAddress{destination}, bytes); result = destination; }
         } else if (capacity < count || !destination) {
-            if (crt) { memory.store(GuestAddress{runtime_.errno_cell}, 32, 34); result = 0; }
+            if (crt) { memory.store(GuestAddress{runtime_.errno_cell}, 32, 34); if(current)memory.store(GuestAddress{crt_os_error::cell(runtime_.errno_cell)},32,122);result = 0; }
             else result = count;
         } else {
             if (!crt && !current && arg(3)) memory.check(GuestAddress{arg(3)}, x86_?4:8, Access::Write);

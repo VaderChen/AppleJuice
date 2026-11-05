@@ -15,6 +15,10 @@ bool bad_flags(std::uint32_t flags){return !com_marshal::valid_flags(flags);}
 }
 std::span<const WindowsServiceDescriptor> com_marshal_service_descriptors(){
     static constexpr WindowsServiceDescriptor rows[]{
+        {"combase.dll","RoGetAgileReference",4,0,0,1},
+        {"internal-com-agile","QueryInterface",3},{"internal-com-agile","AddRef",1},{"internal-com-agile","Release",1},
+        {"internal-com-agile","Resolve",3},{"internal-com-agile","ResolveHost",3},{"internal-com-agile","Destroy",1},
+        {"internal-com-agile","Prepare",1},{"internal-com-agile","ReleasePacket",1},{"internal-com-agile","Cleanup",1},
         {"ole32.dll","CoCreateFreeThreadedMarshaler",2},{"combase.dll","CoCreateFreeThreadedMarshaler",2},
         {"ole32.dll","CoAllowSetForegroundWindow",2},{"ole32.dll","CoGetStandardMarshal",6},{"combase.dll","CoGetStandardMarshal",6},
         {"ole32.dll","CoMarshalInterface",6},{"combase.dll","CoMarshalInterface",6},
@@ -121,6 +125,7 @@ std::optional<std::uint32_t> WindowsServices::resume_com_marshal(GuestState& sta
     if(op.held){op.held=false;return callback({resolve("internal-com-proxy","ReleaseAt").value,{op.owner,op.reference}},99);}return finish(op.error);
 }
 std::optional<std::uint32_t> WindowsServices::invoke_com_marshal(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol=="RoGetAgileReference" || service.family=="internal-com-agile")return invoke_com_agile(state,memory,service);
     const WindowsCall arg(state,memory,service);auto& bridge=runtime_.com_marshal;const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);const auto name=service.symbol;
     const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto output=[&](std::uint64_t p,std::size_t size){if(!p)throw MemoryFault(GuestAddress{p},Access::Write,size,"COM 輸出為空");memory.check(GuestAddress{p},size,Access::Write);};

@@ -2,7 +2,11 @@
 #include "x64arm/native_pdf.hpp"
 #include "x64arm/windows_printing.hpp"
 #include "x64arm/unicode.hpp"
+#include "x64arm/registry_store.hpp"
+#include "x64arm/windows_security_attributes.hpp"
+#include "printer_forms.hpp"
 #include <algorithm>
+#include <chrono>
 #include <unistd.h>
 #include <ctime>
 namespace x64arm {
@@ -15,21 +19,52 @@ struct PrintingState {
         std::vector<std::uint8_t> spool;std::vector<std::size_t> page_ends;bool explicit_pages{};
         std::string output;std::u16string title;std::uint64_t submitted{};std::vector<GuiBitmap> pages;std::uint64_t bytes{};
     };
-    struct Notice {std::uint64_t printer{};unsigned filter{},changes{};};
+    struct Notice {
+        std::uint64_t printer{};unsigned filter{},changes{};
+        std::vector<printer_forms::Form> forms;
+        std::array<std::uint64_t,3> revisions{};
+    };
     std::map<std::uint64_t,Device> devices,handles;std::map<std::uint64_t,Notice> notices;unsigned next_job{1};
+    std::uint64_t form_poll_time{};
 };
-unsigned read_printer_settings(GuestMemory& memory,std::uint64_t address,bool wide,PrinterSettings& device){
+std::vector<PrinterSettings> WindowsServices::available_printer_settings(unsigned& error){
+    RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
+    error=transaction.error;if(error)return {};
+    std::vector<PrinterSettings> result;for(const auto& form:printer_forms::all(runtime_.registry))if(printer_forms::printable(form))result.push_back(printer_forms::settings(form));return result;
+}
+unsigned WindowsServices::read_printer_settings(GuestMemory& memory,std::uint64_t address,bool wide,PrinterSettings& target){
     if(!address)return 0;const auto size_offset=wide?68U:36U,field_offset=size_offset+4;
     const auto word=[&](unsigned offset){return static_cast<unsigned>(memory.load(GuestAddress{address+offset},16));};
     const auto size=word(size_offset);if(size<field_offset+32)return 87;if(word(size_offset+2))return 50;memory.check(GuestAddress{address},size,Access::Read);
-    const auto fields=static_cast<unsigned>(memory.load(GuestAddress{address+field_offset},32));if(fields&~0xff1fU)return 50;
-    const auto body=field_offset+4;unsigned paper=(device.width==794 || device.height==794)?9:1,orientation=device.width>device.height?2:1;
-    if(fields&1)orientation=word(body);if(fields&2)paper=word(body+2);if((orientation!=1 && orientation!=2) || (paper!=1 && paper!=9))return 87;
-    if(fields&12)return 50;if((fields&16) && word(body+8)!=100)return 50;if(fields&0x100){device.copies=word(body+10);if(!device.copies || device.copies>99)return 87;}
+    const auto fields=static_cast<unsigned>(memory.load(GuestAddress{address+field_offset},32));if(fields&~0x1ff1fU)return 50;
+    auto device=target;const auto body=field_offset+4;unsigned orientation=device.landscape?2:1;
+    if(fields&1)orientation=word(body);if(orientation!=1 && orientation!=2)return 87;
+    if(fields&(2U|0x10000U)){
+        unsigned error=0;const auto forms=available_printer_settings(error);if(error)return error;
+        const PrinterSettings* selected=nullptr;const auto paper=fields&2?word(body+2):0;
+        if(paper){for(const auto& form:forms)if(form.paper==paper){selected=&form;break;}}
+        else if(fields&0x10000U){
+            const auto offset=body+26,units=wide?2U:1U;if(size<offset+32*units)return 87;
+            std::u16string text;std::string bytes;bool terminated=false;
+            for(unsigned i=0;i<32;++i){const auto c=memory.load(GuestAddress{address+offset+i*units},wide?16:8);if(!c){terminated=true;break;}if(wide)text.push_back(static_cast<char16_t>(c));else bytes.push_back(static_cast<char>(c));}
+            if(!terminated)return 87;if(!wide)text=utf8_to_utf16(bytes);
+            for(const auto& form:forms)if(printer_forms::fold(form.form)==printer_forms::fold(text)){selected=&form;break;}
+        }
+        if(selected){device.paper=selected->paper;device.form=selected->form;device.paper_width=selected->paper_width;device.paper_height=selected->paper_height;}
+        else if((fields&12U)!=12U)return 1902;
+    }
+    if(fields&12U){
+        if((fields&12U)==4U)return 87;const auto w=word(body+6);if(!w || w>32767)return 87;
+        if(fields&4U){const auto h=word(body+4);if(!h || h>32767)return 87;device.paper_height=h*100;}
+        device.paper=0;device.form.clear();device.paper_width=w*100;
+    }
+    if((fields&16) && word(body+8)!=100)return 50;if(fields&0x100){device.copies=word(body+10);if(!device.copies || device.copies>99)return 87;}
     if((fields&0x200) && word(body+12)!=7)return 50;if((fields&0x400) && word(body+14)!=96)return 50;if((fields&0x1000) && word(body+18)!=1)return 50;
     if((fields&0x2000) && word(body+20)!=96)return 50;if((fields&0x4000) && word(body+22)!=1)return 50;if(fields&0x8000){const auto value=word(body+24);if(value>1)return 87;device.collate=value!=0;}
     if(fields&0x800){const auto color=word(body+16);if(color!=1 && color!=2)return 87;device.monochrome=color==1;}
-    device.width=paper==1?816:794;device.height=paper==1?1056:1123;if(orientation==2)std::swap(device.width,device.height);return 0;
+    device.width=printer_forms::pixels(device.paper_width);device.height=printer_forms::pixels(device.paper_height);
+    if(!device.width || !device.height || std::uint64_t{device.width}*device.height>32U*1024U*1024U)return 8;
+    device.landscape=orientation==2;if(device.landscape)std::swap(device.width,device.height);target=std::move(device);return 0;
 }
 bool WindowsServices::is_printer_dc(std::uint64_t dc)const{return printing_ && printing_->devices.contains(dc);}
 bool WindowsServices::printer_drawing_enabled(std::uint64_t dc)const{if(!is_printer_dc(dc))return true;const auto& device=printing_->devices.at(dc);return device.active && device.page && !device.cancelled && !device.information;}
@@ -72,6 +107,10 @@ std::span<const WindowsServiceDescriptor> printing_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"gdi32.dll","StartDocA",2},{"gdi32.dll","StartDocW",2},{"gdi32.dll","StartPage",1},{"gdi32.dll","EndPage",1},{"gdi32.dll","EndDoc",1},{"gdi32.dll","AbortDoc",1},{"gdi32.dll","CancelDC",1},{"gdi32.dll","SetAbortProc",2},
         {"winspool.drv","GetDefaultPrinterA",2},{"winspool.drv","GetDefaultPrinterW",2},
+        {"winspool.drv","EnumFormsA",6},{"winspool.drv","EnumFormsW",6},{"winspool.drv","GetFormA",6},{"winspool.drv","GetFormW",6},
+        {"winspool.drv","AddFormA",3},{"winspool.drv","AddFormW",3},{"winspool.drv","SetFormA",4},{"winspool.drv","SetFormW",4},{"winspool.drv","DeleteFormA",2},{"winspool.drv","DeleteFormW",2},
+        {"spoolss.dll","EnumFormsA",6},{"spoolss.dll","EnumFormsW",6},{"spoolss.dll","GetFormA",6},{"spoolss.dll","GetFormW",6},
+        {"spoolss.dll","AddFormA",3},{"spoolss.dll","AddFormW",3},{"spoolss.dll","SetFormA",4},{"spoolss.dll","SetFormW",4},{"spoolss.dll","DeleteFormA",2},{"spoolss.dll","DeleteFormW",2},
         {"winspool.drv","EnumPrintersA",7},{"winspool.drv","EnumPrintersW",7},{"winspool.drv","OpenPrinterA",3},{"winspool.drv","OpenPrinterW",3},{"winspool.drv","ClosePrinter",1},
         {"winspool.drv","GetPrinterA",5},{"winspool.drv","GetPrinterW",5},{"winspool.drv","GetPrinterDriverA",6},{"winspool.drv","GetPrinterDriverW",6},
         {"winspool.drv","DocumentPropertiesA",6},{"winspool.drv","DocumentPropertiesW",6},{"winspool.drv","DeviceCapabilitiesA",5},{"winspool.drv","DeviceCapabilitiesW",5},
@@ -205,11 +244,33 @@ struct PrinterBuffer {
 }
 std::vector<std::uint8_t> printer_devmode(bool wide,const PrinterSettings& device){
     PrinterBuffer buffer(wide?220:156,0,true,wide);const std::u16string_view name=u"Win64 PDF";for(unsigned i=0;i<name.size();++i)buffer.put(i*(wide?2:1),name[i],wide?2:1);
-    const unsigned offset=wide?64:32,body=offset+12;buffer.put(offset,0x401,2);buffer.put(offset+2,1,2);buffer.put(offset+4,buffer.bytes.size(),2);buffer.put(offset+8,0xff13);
-    buffer.put(body,device.width>device.height?2:1,2);buffer.put(body+2,(device.width==794 || device.height==794)?9:1,2);buffer.put(body+8,100,2);buffer.put(body+10,device.copies,2);buffer.put(body+12,7,2);buffer.put(body+14,96,2);buffer.put(body+16,device.monochrome?1:2,2);buffer.put(body+18,1,2);buffer.put(body+20,96,2);buffer.put(body+22,1,2);buffer.put(body+24,device.collate?1:0,2);return buffer.bytes;
+    const unsigned offset=wide?64:32,body=offset+12;buffer.put(offset,0x401,2);buffer.put(offset+2,1,2);buffer.put(offset+4,buffer.bytes.size(),2);buffer.put(offset+8,0xff13U|(device.form.empty()?12U:0x10000U));
+    buffer.put(body,device.landscape?2:1,2);buffer.put(body+2,device.paper,2);buffer.put(body+4,(device.paper_height+50)/100,2);buffer.put(body+6,(device.paper_width+50)/100,2);
+    buffer.put(body+8,100,2);buffer.put(body+10,device.copies,2);buffer.put(body+12,7,2);buffer.put(body+14,96,2);buffer.put(body+16,device.monochrome?1:2,2);buffer.put(body+18,1,2);buffer.put(body+20,96,2);buffer.put(body+22,1,2);buffer.put(body+24,device.collate?1:0,2);
+    if(wide){for(unsigned i=0;i<std::min<std::size_t>(31,device.form.size());++i)buffer.put(body+26+i*2,device.form[i],2);}
+    else {const auto text=utf16_to_utf8(device.form);for(unsigned i=0;i<std::min<std::size_t>(31,text.size());++i)buffer.put(body+26+i,static_cast<std::uint8_t>(text[i]),1);}
+    return buffer.bytes;
 }
 void WindowsServices::printing_changed(unsigned changes){
     if(!printing_)return;for(auto& [handle,notice]:printing_->notices){notice.changes|=notice.filter&changes;if(notice.changes){const auto event=runtime_.wait_objects.find(handle);if(event!=runtime_.wait_objects.end())event->second.set_signal(true);}}
+}
+bool WindowsServices::printer_form_notifications_waiting()const{
+    return printing_ && std::any_of(printing_->notices.begin(),printing_->notices.end(),[](const auto& n){return n.second.filter&0x70000U;});
+}
+void WindowsServices::poll_printer_form_notifications(bool reload){
+    if(registry_io_busy_ || !printer_form_notifications_waiting())return;
+    if(reload){
+        const auto now=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        if(now<printing_->form_poll_time+100)return;printing_->form_poll_time=now;
+        RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return;
+    }
+    const auto forms=printer_forms::all(runtime_.registry);const auto revisions=printer_forms::revisions(runtime_.registry);
+    for(auto& [handle,notice]:printing_->notices)if(notice.filter&0x70000U){
+        unsigned changes=printer_forms::changes(notice.forms,forms);
+        for(unsigned i=0;i<3;++i)if(notice.revisions[i]!=revisions[i])changes|=0x10000U<<i;
+        notice.forms=forms;notice.revisions=revisions;notice.changes|=notice.filter&changes;
+        if(notice.changes){const auto event=runtime_.wait_objects.find(handle);if(event!=runtime_.wait_objects.end())event->second.set_signal(true);}
+    }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');const unsigned unit=x86_?4:8;const auto width=static_cast<std::uint8_t>(unit*8);
@@ -242,6 +303,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
         if(const auto found=printing_->handles.find(arg(0));found!=printing_->handles.end() && found->second.active)printing_changed(0x400);
         if(!printing_->handles.erase(arg(0)))return fail(6);for(auto it=printing_->notices.begin();it!=printing_->notices.end();)if(it->second.printer==arg(0)){runtime_.wait_objects.erase(it->first);it=printing_->notices.erase(it);}else ++it;return finish(1);
     }
+#include "windows_printer_forms.inc"
     if(name.starts_with("StartDocPrinter") || name=="StartPagePrinter" || name=="WritePrinter" || name=="EndPagePrinter" || name=="EndDocPrinter" || name=="AbortPrinter"){
         const auto found=printing_->handles.find(arg(0));if(found==printing_->handles.end())return fail(6);auto& device=found->second;
         if(!(device.access&8U))return fail(5);
@@ -290,11 +352,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
         if(!printing_->notices.erase(arg(0)))return fail(6);runtime_.wait_objects.erase(arg(0));return finish(1);
     }
     if(name=="FindNextPrinterChangeNotification"){
+        poll_printer_form_notifications(true);
         const auto found=printing_->notices.find(arg(0));if(found==printing_->notices.end() || !runtime_.wait_objects.contains(arg(0)))return fail(6);if(arg(2) || arg(3))return fail(50);if(arg(1))memory.store(GuestAddress{arg(1)},32,found->second.changes);found->second.changes=0;runtime_.wait_objects.at(arg(0)).set_signal(false);return finish(1);
     }
     if(name=="FindFirstPrinterChangeNotification"){
         if(!printing_->handles.contains(arg(0)))return fail(6);if(d(2) || arg(3))return fail(50);if(!d(1) || (d(1)&~0x7777ffffU))return fail(87);if(printing_->notices.size()>=256)return fail(8);
-        const auto handle=runtime_.allocate_wait_handle();WaitObject event;event.kind=WaitObject::Kind::Event;event.manual_reset=true;event.access=0x100000;runtime_.wait_objects.emplace(handle,event);printing_->notices.emplace(handle,PrintingState::Notice{arg(0),d(1),0});return finish(handle);
+        PrintingState::Notice notice;notice.printer=arg(0);notice.filter=d(1);
+        if(notice.filter&0x70000U){RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return fail(transaction.error);notice.forms=printer_forms::all(runtime_.registry);notice.revisions=printer_forms::revisions(runtime_.registry);}
+        const auto handle=runtime_.allocate_wait_handle();WaitObject event;event.kind=WaitObject::Kind::Event;event.manual_reset=true;event.access=0x100000;runtime_.wait_objects.emplace(handle,event);printing_->notices.emplace(handle,std::move(notice));return finish(handle);
     }
     if(name.starts_with("DocumentProperties")){
         const auto found=printing_->handles.find(arg(1));if(found==printing_->handles.end())return fail(6);if(arg(2) && !printer_name(arg(2)))return fail(1801);if(!d(5))return finish(wide?220:156);if(d(5)&~10U)return fail(50);PrinterSettings device=found->second;
@@ -302,11 +367,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
     }
     if(name.starts_with("DeviceCapabilities")){
         if(!available || !printer_name(arg(0)))return fail(1801);if(arg(1) && !string(arg(1)).empty() && string(arg(1))!=u"FILE:")return fail(1796);PrintingState::Device device;if(const auto error=read_printer_settings(memory,arg(4),wide,device))return fail(error);
+        unsigned form_error=0;const auto forms=available_printer_settings(form_error);if(form_error)return fail(form_error);
         const auto capability=static_cast<unsigned>(arg(2));unsigned count=0;std::vector<std::uint8_t> bytes;
         const auto push=[&](unsigned value,unsigned size){for(unsigned i=0;i<size;++i)bytes.push_back(static_cast<std::uint8_t>(value>>(i*8)));};
-        const auto fixed=[&](std::u16string_view text,unsigned length){for(unsigned i=0;i<length;++i)push(i<text.size()?text[i]:0,wide?2:1);};
-        switch(capability){case 1:return finish(0xff13);case 4:return finish(2100|(2794U<<16));case 5:return finish(2159|(2970U<<16));case 7:case 9:case 30:return finish(0);case 8:return finish(wide?220:156);case 10:return finish(0x401);case 11:case 15:case 22:case 32:return finish(1);case 18:return finish(99);case 17:return finish(90);
-            case 2:push(1,2);push(9,2);count=2;break;case 3:for(const unsigned value:{2159U,2794U,2100U,2970U})push(value,4);count=2;break;case 6:push(7,2);count=1;break;case 12:fixed(u"Automatic",24);count=1;break;case 13:push(96,4);push(96,4);count=1;break;case 16:case 29:fixed(u"Letter",64);fixed(u"A4",64);count=2;break;case 35:push(1,4);count=1;break;default:return fail(50);}
+        const auto fixed=[&](std::u16string_view text,unsigned length){if(wide){for(unsigned i=0;i<length;++i)push(i<text.size()?text[i]:0,2);}
+            else{const auto bytes=utf16_to_utf8(text);for(unsigned i=0;i<length;++i)push(i<bytes.size()?static_cast<unsigned char>(bytes[i]):0,1);}};
+        switch(capability){case 1:return finish(0x1ff1f);case 4:return finish(3|(3U<<16));case 5:return finish(32767|(32767U<<16));case 7:case 9:case 30:return finish(0);case 8:return finish(wide?220:156);case 10:return finish(0x401);case 11:case 15:case 22:case 32:return finish(1);case 18:return finish(99);case 17:return finish(90);
+            case 2:for(const auto& form:forms)push(form.paper,2);count=static_cast<unsigned>(forms.size());break;
+            case 3:for(const auto& form:forms){push((form.paper_width+50)/100,4);push((form.paper_height+50)/100,4);}count=static_cast<unsigned>(forms.size());break;
+            case 6:push(7,2);count=1;break;case 12:fixed(u"Automatic",24);count=1;break;case 13:push(96,4);push(96,4);count=1;break;
+            case 16:case 29:for(const auto& form:forms)fixed(form.form,64);count=static_cast<unsigned>(forms.size());break;case 35:push(1,4);count=1;break;default:return fail(50);}
         if(arg(3))memory.write(GuestAddress{arg(3)},bytes);return finish(count);
     }
     const bool enumeration=name.starts_with("EnumPrinters"),driver=name.starts_with("GetPrinterDriver"),job=name.starts_with("GetJob");

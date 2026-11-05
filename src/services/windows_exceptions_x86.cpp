@@ -23,7 +23,7 @@ void WindowsServices::prune_x86_exception_callbacks(GuestState& state,GuestMemor
         // x86 personality 可在 RtlUnwind 後直接恢復 ESP 並跳往 catch；被跨越的主機回呼一併丟棄。
         if(!depth || depth>exceptions_.stack.size())throw HostCallFault("Win32 SEH callback 深度不合法");
         leave_x86_exception_handler(memory,exceptions_.stack[depth-1]);
-        discard_callbacks(runtime_.callbacks.size()-1,state,memory);exceptions_.stack.resize(depth-1);
+        discard_callbacks(runtime_.callbacks.size()-1,state,memory);exceptions_.stack.resize(depth-1);sync_msvc_uncaught(memory);
     }
 }
 std::optional<std::uint32_t> WindowsServices::advance_x86_exception(GuestState& state,GuestMemory& memory){
@@ -38,7 +38,8 @@ std::optional<std::uint32_t> WindowsServices::advance_x86_exception(GuestState& 
         if((dispatch.etw_thread && dispatch.etw_callback_depth>dispatch.protected_callback_depth) || (dispatch.user_callback_depth!=SIZE_MAX && dispatch.user_callback_depth>dispatch.protected_callback_depth))dispatch.protected_callback_depth=SIZE_MAX;
         else{dispatch.etw_thread=0;dispatch.user_callback_depth=SIZE_MAX;}
     }
-    while(dispatch.x86_next!=UINT32_MAX && (!unwind || dispatch.x86_next!=dispatch.x86_target)){
+    while(dispatch.x86_next!=UINT32_MAX && (!unwind || dispatch.x86_next!=dispatch.x86_target ||
+          (dispatch.msvc.active && !dispatch.msvc.local_unwound))){
         if(!unwind && dispatch.user_callback_depth!=SIZE_MAX && dispatch.x86_next==runtime_.callbacks[dispatch.user_callback_depth].user_seh_boundary)break;
         if(!unwind && dispatch.etw_thread && dispatch.x86_next==dispatch.etw_seh_boundary)break;
         if(!unwind && dispatch.protected_callback_depth!=SIZE_MAX && dispatch.x86_next==runtime_.callbacks[dispatch.protected_callback_depth].user_seh_boundary)break;
@@ -81,13 +82,14 @@ std::optional<std::uint32_t> WindowsServices::advance_x86_exception(GuestState& 
     if(dispatch.x86_target && dispatch.x86_next!=dispatch.x86_target)throw HostCallFault("Win32 unwind 找不到目標框架");
     if(dispatch.etw_thread)return finish_etw_exception(state,memory);
     if(dispatch.protected_callback_depth!=SIZE_MAX)return finish_protected_callback_exception(state,memory);
+    if(dispatch.msvc.active)return start_msvc_catch(state,memory);
     if(dispatch.restore_jump){
         const auto buffer=dispatch.x86_jump_buffer;const auto restored=dispatch.target_context;
-        state=read_context(memory,dispatch.context,dispatch.original);exceptions_.stack.pop_back();
+        state=read_context(memory,dispatch.context,dispatch.original);exceptions_.stack.pop_back();sync_msvc_uncaught(memory);
         return finish_x86_longjmp(state,memory,buffer,restored);
     }
     state=read_context(memory,dispatch.context,dispatch.original);state.reg(Gpr::Rax)=dispatch.return_value;
-    exceptions_.stack.pop_back();return std::nullopt;
+    exceptions_.stack.pop_back();sync_msvc_uncaught(memory);return std::nullopt;
 }
 void WindowsServices::begin_x86_unwind(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto target=static_cast<std::uint32_t>(arg(0));const auto record=arg(2),value=arg(3);

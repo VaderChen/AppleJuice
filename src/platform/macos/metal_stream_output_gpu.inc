@@ -1,6 +1,7 @@
 // 前一階段輸出簽章建立的 SO 只轉送 VS 結果，完整圖元數可由 IA 推得。
 // GPU 以 uint 搬移位元，保留多 buffer 同步溢位、SKIP、stride 尾端及追加游標。
-bool metal_stream_output_gpu_enabled(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_STREAM_OUTPUT_GPU");return text && std::string_view(text)=="1";}();return value;}
+// 預設沿用 GPU 搬移；不適用的 GS／配置仍回退 CPU。設定為 0 可作同成品對照。
+bool metal_stream_output_gpu_enabled(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_STREAM_OUTPUT_GPU");return !text || std::string_view(text)!="0";}();return value;}
 bool MetalGl::graphics_stream_output(const GraphicsDraw& draw,const MetalShader& shader,id<MTLBuffer> vertices,
                                     unsigned invocations,unsigned capacity,unsigned width){@autoreleasepool{
     if(!metal_stream_output_gpu_enabled() || shader.stage!=0 || !width || capacity%width)return false;

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <deque>
 #include <atomic>
 #include <array>
 #include <map>
@@ -29,6 +30,9 @@ struct SharedSocketData {
     std::uint64_t accept_listener{},accepted_at{UINT64_MAX};
     bool overlapped{true},accept_context{},connect_context{},listening{},reusable{},send_shutdown{};
     std::array<std::uint8_t,28> bound_address{};
+    // 使用既有對齊空間，不移動共享頁其他欄位；連線生命週期不依附通知登記。
+    // 0 尚未連線，1 等待握手，2 已連線，其餘為 Winsock 錯誤碼。
+    std::atomic<std::uint16_t> connect_result{};
     std::uint32_t bound_size{};
     std::atomic<std::uint64_t> watch_generation{};
     std::atomic<std::uint32_t> watch_rearm{},watch_recorded{};
@@ -60,6 +64,8 @@ struct NativeSocket {
     bool &accept_context,&connect_context,&listening,&reusable,&send_shutdown;
     std::uint8_t completion_modes{};
     bool io_signaled{true};
+    // CF_DEFER 保留已完成握手的連線；accept／WSAAccept 共用，重複的本程序 handle 亦共用。
+    std::deque<std::shared_ptr<NativeSocket>> deferred_accepts;
     // UDP 共享佇列上次完整檢查（空或有封包）時狀態檔的身分與時間；原生 socket 無資料且狀態檔未變時沿用該結果。
     mutable std::array<std::int64_t,6> datagram_idle_stamp{};
     mutable bool datagram_idle{},datagram_ready{};
@@ -129,6 +135,8 @@ struct PendingSocketIo {
     enum class Kind {Connect,Disconnect,Send,Receive,Control} kind{};
     std::uint64_t socket{},thread{},overlapped{},event{},routine{},port{},key{},address_pointer{},address_size_pointer{};
     std::uint32_t flags{},error{},transferred{},result_flags{};
+    std::uint32_t transmit_flags{},send_chunk{};
+    bool transmit_file{};
     bool started{},connected{},done{},notify{},addressed{},attempted{},io_recorded{};
     std::uint64_t io_accounted{};
     std::uint64_t message_pointer{},control_pointer{};
@@ -143,7 +151,15 @@ inline std::uint32_t socket_io_status(std::uint32_t error){
 inline std::uint32_t socket_io_error(std::uint32_t status){
     switch(status){case 0:return 0;case 0x103:return 996;case 0xc0000120:return 995;case 0xc000020d:return 10054;case 0xc0000241:return 10053;case 0xc000009a:return 10055;case 0xc00000b5:return 10060;case 0xc0000236:return 10061;case 0xc000023c:return 10051;case 0xc000023d:return 10065;case 0xc000020c:return 10057;case 0x80000005:return 10040;default:return 10022;}
 }
+struct ConditionalAccept {
+    std::uint64_t listener_handle{},address{},address_size{},scratch{};
+    std::shared_ptr<NativeSocket> listener,accepted;
+    std::vector<std::uint8_t> peer;
+    bool operator==(const ConditionalAccept&) const = default;
+};
 struct NetworkState {
+    std::uint64_t next_conditional_accept{1};
+    std::map<std::uint64_t,ConditionalAccept> conditional_accepts;
     std::map<std::uint64_t,socket_namespace::Lookup> namespace_lookups;
     std::map<std::uint32_t,SocketDuplication> duplications;
     std::map<std::uint64_t,PendingSocketLookup> pending_lookups;

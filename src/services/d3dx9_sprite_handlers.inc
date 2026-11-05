@@ -58,7 +58,7 @@
             // GPU 字型貼圖採與既有固定管線上傳相同的 RGBA8 格式，避免換格式改變取樣進位。
             auto texture=make_texture(device,padded?canvas[0]:width,padded?canvas[1]:height,1,padded?1:0,padded?32:21,padded?0:1);
             if(padded)d3dx_font_upload_padded(*device->native,texture->native_view,width,height,rgba);
-            else {auto surface=get(texture->back,Kind::Surface);surface->pixels=rgba;for(std::size_t i=0;i<rgba.size();i+=4)std::swap(surface->pixels[i],surface->pixels[i+2]);}
+            else {auto surface=get(texture->back,Kind::Surface);surface->pixels=rgba;for(std::size_t i=0;i<rgba.size();i+=4)std::swap(surface->pixels[i],surface->pixels[i+2]);write_surface(*surface);}
             if(auto it=font->font_textures.find(key);it!=font->font_textures.end())release(it->second);font->font_textures[key]=texture->root;return texture->root;
         };
         const auto font_glyph=[&](const std::shared_ptr<Object>& font,unsigned glyph){

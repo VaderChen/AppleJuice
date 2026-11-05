@@ -9,6 +9,7 @@
 #include "d3d9_perf.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
+#include "x64arm/windows_geometry.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -40,6 +41,11 @@ extern "C" {
 #include "d3dx9_effect.hpp"
 #include "d3d9_shader.hpp"
 #include "d3d9_formats.hpp"
+#include "graphics_view_flags.hpp"
+#include "guest_d3d9_formats.hpp"
+#include "guest_d3d9_formats_code.hpp"
+#include "d3d9_constant_state.hpp"
+#include "x64arm/pe_loader.hpp"
 #include "d3dx_mesh.hpp"
 #include "d3dx_atlas.hpp"
 #include "d3dx_sh.hpp"
@@ -49,8 +55,21 @@ extern "C" {
 #include "x64arm/windows_fonts.hpp"
 #include "x64arm/raster_surface.hpp"
 #include "hlsl_include.hpp"
+#include "d3d9_frame_capture.hpp"
 
 namespace x64arm {
+void d3d9_formats::initialize(GuestMemory& memory,std::map<std::uint64_t,RuntimeImage>& images,bool x86,std::uint64_t gateway){
+    const auto bytes=x86?std::span<const std::uint8_t>{image_x86}:std::span<const std::uint8_t>{image_x64};
+    const auto base=gateway+image_offset;auto parsed=parse_pe_image(bytes,GuestAddress{base},true,memory.limit());
+    if(!parsed.imports.empty() || !parsed.delay_imports.empty() || parsed.metadata.image_size>0x10000)
+        throw std::logic_error("D3D9 格式常式包含外部相依或超出常駐映像範圍");
+    for(const auto& [address,image]:images)if(base<address+image.size && address<base+parsed.metadata.image_size)
+        throw std::logic_error("D3D9 格式常式與既有常駐映像重疊");
+    auto image=parsed.runtime;image.path=u"[guest-d3d9-formats]";image.export_names.clear();image.export_ordinals.clear();
+    for(const auto& [name,ordinal]:parsed.runtime.export_names)image.export_names.emplace(name,parsed.runtime.export_ordinals.at(ordinal));
+    for(auto& mapping:parsed.mappings)mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
+    map_pe_image(memory,parsed);images.emplace(base,std::move(image));
+}
 namespace {
 using namespace d3d9_abi;
 constexpr std::uint32_t invalid=0x8876086cU, unavailable=0x8876086aU, out_of_memory=0x8007000eU, no_interface=0x80004002U;
@@ -65,12 +84,13 @@ float real(std::uint32_t value){return std::bit_cast<float>(value);}
 Vector color(std::uint32_t value){return {float((value>>16)&255)/255,float((value>>8)&255)/255,float(value&255)/255,float(value>>24)/255};}
 std::uint32_t word(std::span<const std::uint8_t> data,std::size_t at){std::uint32_t value{};std::memcpy(&value,data.data()+at,4);return value;}
 void put(std::span<std::uint8_t> data,std::size_t at,std::uint32_t value){std::memcpy(data.data()+at,&value,4);}
-bool color_format(std::uint32_t value){return value==21 || value==22;}
-bool render_color_format(unsigned value){return color_format(value) || value==32 || value==35 || value==36 || (value>=111 && value<=116);}
-unsigned depth_format(unsigned value){switch(value){case 71:case 77:return 40;case 75:return 20;case 80:return 55;default:return 0;}}
+bool color_format(std::uint32_t value){return d9_color(value);}
+bool render_color_format(unsigned value){return d9_render_color(value);}
+unsigned depth_format(unsigned value){return d9_depth_format(value);}
 
-std::span<const WindowsServiceDescriptor> methods(Kind kind,bool ex=false){if(ex){if(kind==Kind::Factory)return factoryExMethods;if(kind==Kind::Device)return deviceExMethods;if(kind==Kind::SwapChain)return swapChainExMethods;}switch(kind){case Kind::PRTEngine:return prtEngineMethods;case Kind::RenderToEnvMap:return renderEnvMethods;case Kind::PRTComp:return prtCompMethods;case Kind::AnimSet:return animationSetMethods;case Kind::CompressedSet:return compressedSetMethods;case Kind::AnimController:return animationControllerMethods;case Kind::Skin:return skinMethods;case Kind::Gutter:return gutterMethods;case Kind::XFile:return fileMethods;case Kind::XEnum:return fileEnumMethods;case Kind::XData:return fileDataMethods;case Kind::RenderToSurface:return renderToSurfaceMethods;case Kind::Effect:return effectMethods;case Kind::EffectPool:return effectPoolMethods;case Kind::StateBlock:return stateBlockMethods;case Kind::Sprite:return spriteMethods;case Kind::Font:return fontMethods;case Kind::ConstantTable:return constantTableMethods;case Kind::VertexShader:return vertexShaderMethods;case Kind::PixelShader:return pixelShaderMethods;case Kind::VertexDeclaration:return vertexDeclarationMethods;case Kind::PRT:return prtMethods;case Kind::Mesh:return meshMethods;case Kind::Blob:return blobMethods;case Kind::Factory:return factoryMethods;case Kind::Device:return deviceMethods;case Kind::Surface:return surfaceMethods;case Kind::Texture:return textureMethods;case Kind::CubeTexture:return cubeTextureMethods;case Kind::VolumeTexture:return volumeTextureMethods;case Kind::Volume:return volumeMethods;case Kind::VertexBuffer:return vertexBufferMethods;case Kind::IndexBuffer:return indexBufferMethods;case Kind::SwapChain:return swapChainMethods;}return {};}
+std::span<const WindowsServiceDescriptor> methods(Kind kind,bool ex=false){if(ex){if(kind==Kind::Factory)return factoryExMethods;if(kind==Kind::Device)return deviceExMethods;if(kind==Kind::SwapChain)return swapChainExMethods;}switch(kind){case Kind::Query:return queryMethods;case Kind::PRTEngine:return prtEngineMethods;case Kind::RenderToEnvMap:return renderEnvMethods;case Kind::PRTComp:return prtCompMethods;case Kind::AnimSet:return animationSetMethods;case Kind::CompressedSet:return compressedSetMethods;case Kind::AnimController:return animationControllerMethods;case Kind::Skin:return skinMethods;case Kind::Gutter:return gutterMethods;case Kind::XFile:return fileMethods;case Kind::XEnum:return fileEnumMethods;case Kind::XData:return fileDataMethods;case Kind::RenderToSurface:return renderToSurfaceMethods;case Kind::Effect:return effectMethods;case Kind::EffectPool:return effectPoolMethods;case Kind::StateBlock:return stateBlockMethods;case Kind::Sprite:return spriteMethods;case Kind::Font:return fontMethods;case Kind::ConstantTable:return constantTableMethods;case Kind::VertexShader:return vertexShaderMethods;case Kind::PixelShader:return pixelShaderMethods;case Kind::VertexDeclaration:return vertexDeclarationMethods;case Kind::PRT:return prtMethods;case Kind::Mesh:return meshMethods;case Kind::Blob:return blobMethods;case Kind::Factory:return factoryMethods;case Kind::Device:return deviceMethods;case Kind::Surface:return surfaceMethods;case Kind::Texture:return textureMethods;case Kind::CubeTexture:return cubeTextureMethods;case Kind::VolumeTexture:return volumeTextureMethods;case Kind::Volume:return volumeMethods;case Kind::VertexBuffer:return vertexBufferMethods;case Kind::IndexBuffer:return indexBufferMethods;case Kind::SwapChain:return swapChainMethods;}return {};}
 Guid iid(Kind kind){switch(kind){
+case Kind::Query:return {0x60,0x14,0x77,0xd9,0x95,0xa6,0x26,0x4f,0xbb,0xd3,0x27,0xb8,0x40,0xb5,0x41,0xcc};
 case Kind::AnimSet:return {0x3a,0x8e,0x4e,0xfa,0x86,0x97,0x7d,0x40,0x8b,0x4c,0x59,0x95,0x89,0x37,0x64,0xaf};
 case Kind::CompressedSet:return {0x0d,0x48,0xc2,0x6c,0x08,0x38,0x39,0x47,0x9f,0x88,0xde,0x49,0xfa,0xcd,0x8d,0x4c};
 case Kind::RenderToEnvMap:return {0x4b,0x1b,0x3f,0x31,0xb0,0xc7,0xa2,0x4f,0x9d,0x9d,0x8d,0x38,0x0b,0x64,0x38,0x5e};case Kind::PRTEngine:return {0x78,0x42,0x3a,0x68,0x5f,0xcd,0x24,0x4d,0x90,0xad,0xc4,0xe1,0xb6,0x85,0x5d,0x53};case Kind::PRTComp:return {0x65,0xd4,0x58,0xa7,0x8d,0xfe,0xad,0x45,0x9c,0xf0,0xd0,0x1e,0x56,0x26,0x6a,0x07};case Kind::AnimController:return {0xec,0x48,0x89,0xac,0x6d,0xf8,0xe2,0x43,0x96,0xde,0x31,0xfc,0x35,0xf9,0x6d,0x9e};case Kind::Skin:return {0x40,0xa5,0xea,0x11,0xa6,0xf9,0x49,0x4d,0xae,0x6a,0xe1,0x92,0x21,0xf7,0x0c,0xc4};case Kind::Gutter:return {0xec,0x01,0x8f,0x83,0x29,0x97,0x27,0x45,0xaa,0xdb,0xdf,0x70,0xad,0xe7,0xfe,0xa9};case Kind::XFile:case Kind::XEnum:case Kind::XData:return {static_cast<std::uint8_t>(kind==Kind::XFile?0xf9:kind==Kind::XEnum?0xfc:0xfd),0x8c,0xf0,0xce,0x4f,0x7b,0x29,0x44,0x96,0x24,0x2a,0x69,0x0a,0x93,0x32,0x01};case Kind::RenderToSurface:return {0x46,0xf3,0x85,0x69,0x3d,0x2c,0xb3,0x43,0xbe,0x8b,0xda,0xae,0x8a,0x03,0xd8,0x94};case Kind::Effect:return {0xb3,0xb4,0xce,0xf6,0x4c,0x4e,0xdd,0x40,0xb8,0x83,0x8d,0x8d,0xe5,0xea,0x0c,0xd5};case Kind::EffectPool:return {0x04,0xab,0x37,0x95,0x50,0x32,0x2e,0x41,0x82,0x13,0xfc,0xd2,0xf8,0x67,0x79,0x33};case Kind::StateBlock:return {0xe5,0x4f,0x7c,0xb0,0x0d,0x31,0xa8,0x4b,0xa2,0x3c,0x4f,0x0f,0x20,0x6f,0x21,0x8b};case Kind::Sprite:return {0x2d,0x76,0x0b,0xba,0x28,0x7d,0xec,0x43,0xb9,0xdc,0x2f,0x84,0x44,0x3b,0x06,0x14};case Kind::Font:return {0x70,0xbb,0x9d,0xd7,0x21,0x5f,0x36,0x4d,0xbb,0xc2,0xff,0x52,0x5c,0x21,0x3c,0xdc};case Kind::Factory:return iidFactory;case Kind::Device:return iidDevice;case Kind::Surface:return iidSurface;case Kind::Texture:return iidTexture;case Kind::CubeTexture:return iidCubeTexture;case Kind::VolumeTexture:return iidVolumeTexture;case Kind::Volume:return iidVolume;case Kind::VertexBuffer:return iidVertexBuffer;case Kind::IndexBuffer:return iidIndexBuffer;case Kind::SwapChain:return iidSwapChain;case Kind::VertexShader:return {0x7e,0x55,0xc5,0xef,0x65,0x62,0x13,0x46,0x8a,0x94,0x43,0x85,0x78,0x89,0xeb,0x36};case Kind::PixelShader:return {0xdc,0xdb,0x3b,0x6d,0x2,0x5b,0x15,0x44,0xb8,0x52,0xce,0x5e,0x8b,0xcc,0xb2,0x89};case Kind::VertexDeclaration:return {0x9c,0xc5,0x13,0xdd,0xfa,0x36,0x98,0x40,0xa8,0xfb,0xc7,0xed,0x39,0xdc,0x85,0x46};case Kind::ConstantTable:case Kind::Mesh:case Kind::Blob:case Kind::PRT:return {};}return {};}
@@ -85,7 +105,14 @@ struct D3DLight {std::uint32_t type{3};Vector diffuse{1,1,1,0},specular{},ambien
 static_assert(sizeof(D3DLight)==104);
 unsigned texture_slot(unsigned slot){require(slot<16 || (slot>=257 && slot<=260));return slot<16?slot:slot-241;}
 struct D3DStream {std::uint64_t buffer{};unsigned offset{},stride{};};
+struct QuerySlot {std::shared_ptr<GraphicsResource> buffer;std::uint32_t offset{};};
 struct Object {
+    std::shared_ptr<D3D9FrameCapture> frame_capture;
+    unsigned query_type{};bool query_active{},query_issued{};
+    std::shared_ptr<const std::atomic<bool>> query_fence;
+    std::shared_ptr<const GraphicsTimestampFuture> query_timestamp,query_begin;
+    std::vector<QuerySlot> query_slots;std::vector<std::weak_ptr<Object>> active_queries;
+    std::shared_ptr<GraphicsResource> visibility_pool;std::uint32_t visibility_cursor{};
     std::shared_ptr<d3dx_animation::Set> animation_set;
     std::shared_ptr<d3dx_animation::Controller> animation_controller;
     std::shared_ptr<d3dx_skin::Info> skin;
@@ -94,12 +121,17 @@ struct Object {
     std::shared_ptr<d3d9_xfile::Templates> x_templates;
     std::shared_ptr<d3d9_xfile::Document> x_document;unsigned x_index{};
     GraphicsView native_view;unsigned multisample{};bool lockable{};
-    std::shared_ptr<GraphicsResource> cached_resource,cached_fixed_resource;
-    std::vector<std::vector<std::uint8_t>> cached_pixels,cached_fixed_pixels;
+    std::shared_ptr<GraphicsResource> cached_resource;
+    std::vector<std::vector<std::uint8_t>> cached_pixels;
+    bool texture_pixels_dirty{true};
     std::array<std::uint64_t,8> helper_refs{};
     Kind kind{};std::uint64_t root{},parent{},back{},window{},focus{},mapped{},draws{},frames{},texture{},vertex_buffer{},index_buffer{},chain{},creator{};
     std::uint32_t device_type{1},references{1},width{},height{},depth{1},format{22},pool{2},flags{},lock_flags{},fvf{},priority{},bound{},usage{},stream_offset{},stream_stride{},lock_count{},latency{3};
     bool ex{},implicit{},scene{},auto_depth{},lock_writable{},software_vertex{};
+    bool fullscreen{};std::uint32_t windowed_style{},windowed_ex_style{};
+    std::array<std::int32_t,4> windowed_rect{};std::optional<std::array<std::uint32_t,4>> windowed_insets;
+    std::vector<std::uint64_t> swap_buffers;GraphicsView flip_front;
+    std::optional<GuiDisplayMode> presentation_mode;
     std::array<std::uint64_t,19> extra_textures{};
     std::array<D3DStream,15> extra_streams{};
     std::array<unsigned,16> stream_frequency=[](){std::array<unsigned,16> v;v.fill(1);return v;}();
@@ -117,7 +149,7 @@ struct Object {
     std::shared_ptr<d3dx9::Constants> constant_table;
     std::shared_ptr<GraphicsShader> shader;
     std::map<std::string,std::shared_ptr<GraphicsShader>> fixed_shaders;
-    std::array<std::array<std::vector<std::uint8_t>,3>,2> constants;
+    D3D9ConstantState constants;
     std::shared_ptr<GpuMemoryReservation> storage;
     std::shared_ptr<NativeOpenGlContext> native;
     std::vector<std::uint8_t> presentation,pixels;
@@ -126,10 +158,19 @@ struct Object {
     std::array<std::int32_t,4> scissor{};
     std::array<float,17> material{1,1,1,1,1,1,1,1};
     std::map<unsigned,D3DLight> lights;std::map<unsigned,bool> light_enabled;
-    std::map<std::uint32_t,std::uint32_t> sampler=[](){std::map<std::uint32_t,std::uint32_t> result;for(unsigned slot=0;slot<20;++slot)for(auto [key,value]:std::map<unsigned,unsigned>{{1,1},{2,1},{3,1},{5,1},{6,1},{7,0},{10,1}})result[slot*32+key]=value;return result;}(),stage{{1,4},{2,2},{3,1},{4,2},{5,2},{6,1},{28,1},{33,1},{36,1},{65,1},{68,1},{97,1},{100,1},{129,1},{132,1},{161,1},{164,1},{193,1},{196,1},{225,1},{228,1}};
+    std::map<std::uint32_t,std::uint32_t> sampler=[](){std::map<std::uint32_t,std::uint32_t> result;for(unsigned slot=0;slot<20;++slot)for(auto [key,value]:std::map<unsigned,unsigned>{{1,1},{2,1},{3,1},{5,1},{6,1},{7,0},{8,0},{9,0},{10,1},{11,0}})result[slot*32+key]=value;return result;}(),stage{{1,4},{2,2},{3,1},{4,2},{5,2},{6,1},{28,1},{33,1},{36,1},{65,1},{68,1},{97,1},{100,1},{129,1},{132,1},{161,1},{164,1},{193,1},{196,1},{225,1},{228,1}};
     std::map<std::uint32_t,Matrix> transforms{{2,identity()},{3,identity()},{256,identity()}};
-    std::map<std::uint32_t,std::uint32_t> render{{48,0},{60,0xffffffff},{128,0},{129,0},{130,0},{131,0},{132,0},{133,0},{134,0},{135,0},{136,1},{152,0},{176,0},{7,0},{8,3},{9,2},{14,1},{15,0},{24,0},{25,8},{26,0},{19,2},{20,1},{22,3},{23,4},{27,0},{28,0},{29,0},{52,0},{53,1},{54,1},{55,1},{56,8},{57,0},{58,0xffffffff},{59,0xffffffff},{185,0},{186,1},{187,1},{188,1},{189,8},{137,1},{139,0},{141,1},{142,1},{143,0},{145,1},{146,2},{147,0},{148,0},{151,0},{167,0},{168,15},{171,1},{174,0},{206,0}};
+    std::map<std::uint32_t,std::uint32_t> render{{48,0},{60,0xffffffff},{128,0},{129,0},{130,0},{131,0},{132,0},{133,0},{134,0},{135,0},{136,1},{152,0},{176,0},{7,0},{8,3},{9,2},{14,1},{15,0},{24,0},{25,8},{26,0},{19,2},{20,1},{22,3},{23,4},{27,0},{28,0},{29,0},{52,0},{53,1},{54,1},{55,1},{56,8},{57,0},{58,0xffffffff},{59,0xffffffff},{185,0},{186,1},{187,1},{188,1},{189,8},{137,1},{139,0},{141,1},{142,1},{143,0},{145,1},{146,2},{147,0},{148,0},{151,0},{167,0},{168,15},{171,1},{174,0},{194,0},{206,0},{207,2},{208,1},{209,1}};
 };
+// 共用 D3D9 → D3D11 sampler 描述，固定與可程式化管線使用相同 LOD 契約。
+std::vector<std::uint8_t> sampler_desc(const Object& device,unsigned slot,unsigned lod,unsigned levels){
+    const auto state=[&](unsigned key){return device.sampler.at(slot*32+key);};std::vector<std::uint8_t> data(52);
+    put(data,0,(state(6)>=2?0x10U:0U)|(state(5)>=2?4U:0U)|(state(7)==2?1U:0U)|((state(6)==3 || state(5)==3)?0x40U:0U));
+    put(data,4,state(1));put(data,8,state(2));put(data,12,state(3));put(data,16,state(8));put(data,20,state(10));put(data,24,1);
+    const auto first=std::min(levels-1,std::max(lod,state(9)))-lod;put(data,44,bits(static_cast<float>(first)));
+    put(data,48,bits(static_cast<float>(state(7)?levels-lod-1:first)));return data;
+}
+unsigned srgb_view_format(unsigned format,bool srgb){if(!srgb)return format;switch(format){case 28:return 29;case 87:return 91;case 88:return 93;case 71:return 72;case 74:return 75;case 77:return 78;default:return format;}}
 std::uint64_t call(Object& device,GlOperation op,std::initializer_list<std::uint64_t> args={},std::span<const std::uint8_t> input={},std::span<std::uint8_t> output={}){
     return device.native->execute(op,std::span(args.begin(),args.size()),input,output);
 }
@@ -139,8 +180,8 @@ void check_gpu(Object& device){require(!call(device,GlOperation::GetError),unava
 void caps(GuestMemory& memory,std::uint64_t address){
     // SM3 共用 bytecode→Metal、16 組頂點串流、像素與頂點紋理階段。
     std::array<std::uint32_t,76> values{};
-    values[0]=1;values[3]=0x20000000;values[5]=0x80000001U;values[7]=0x90400;values[8]=0x70;values[9]=0x1000000;
-    values[15]=0x14805;values[16]=values[17]=0x07000700;values[19]=0x15;values[22]=values[23]=16384;values[25]=2048;values[26]=16384;values[27]=16;values[28]=bits(1.e10F);values[35]=1;values[36]=15;values[37]=values[38]=1;
+    values[0]=1;values[3]=0x20000000;values[5]=0x80000001U;values[7]=0x90400;values[8]=0x220970;values[9]=0x1000000;
+    values[15]=0x14805;values[16]=values[17]=0x07000700;values[19]=0x17;values[22]=values[23]=16384;values[25]=2048;values[26]=16384;values[27]=16;values[28]=bits(1.e10F);values[35]=1;values[36]=15;values[37]=values[38]=1;
     values[10]=255;values[11]=values[12]=0x7ff;values[14]=8;values[34]=0x1ff;
     values[39]=0x18;values[40]=8;values[42]=4;values[43]=255;values[44]=bits(1);values[45]=349525;values[46]=1048575;values[47]=16;values[48]=256;values[58]=1;values[60]=4;
     values[49]=0xfffe0300U;values[50]=256;values[51]=0xffff0300U;values[52]=bits(8);values[53]=0x41;values[62]=1;values[63]=24;values[64]=32;values[65]=4;
@@ -175,7 +216,11 @@ struct D3DXPRTEngineOperation {
     WindowsServiceDescriptor service{};std::uint64_t id{},thread{},stack{},callback{},context{};
     std::shared_ptr<Object> target,total;std::shared_ptr<std::vector<float>> output;std::unique_ptr<NativeProgressJob> worker;
 };
-struct D3D9State {std::map<std::uint64_t,D3DXPRTEngineOperation> prt_engine_operations;std::map<std::uint64_t,D3DXPRTCompOperation> prt_comp_operations;std::map<std::uint64_t,D3DXFillOperation> fill_operations;std::map<std::uint64_t,D3DXHierarchyOperation> hierarchy_operations;std::map<std::uint64_t,D3DXAtlasOperation> atlas_operations;std::uint64_t next_atlas_operation{};std::map<std::uint64_t,std::shared_ptr<Object>> objects;std::map<std::pair<Kind,bool>,std::uint64_t> tables;std::vector<std::string> completed;D3D9Perf perf;};
+struct D3D9State {std::map<std::uint64_t,D3DXPRTEngineOperation> prt_engine_operations;std::map<std::uint64_t,D3DXPRTCompOperation> prt_comp_operations;std::map<std::uint64_t,D3DXFillOperation> fill_operations;std::map<std::uint64_t,D3DXHierarchyOperation> hierarchy_operations;std::map<std::uint64_t,D3DXAtlasOperation> atlas_operations;std::uint64_t next_atlas_operation{};std::map<std::uint64_t,std::shared_ptr<Object>> objects;std::map<std::pair<Kind,bool>,std::uint64_t> tables;std::vector<std::string> completed;D3D9Perf perf;
+    std::uint64_t texture_cache_fast_hits{},texture_cache_compares{},texture_cache_compare_bytes{},texture_cache_uploads{};
+    // 協調者本地呼叫中失去最後引用與綁定的物件，依發生順序在下一次完整 D3D9 呼叫銷毀（子物件先於父物件）。
+    std::vector<std::uint64_t> deferred_destroys;
+};
 void WindowsServices::discard_d3dx_progress(GuestState& state,GuestMemory& memory,std::uint64_t key){if(d3d9_){if(const auto found=d3d9_->fill_operations.find(key);found!=d3d9_->fill_operations.end() && found->second.temporary)(void)free_heap(memory,found->second.temporary,state);d3d9_->prt_engine_operations.erase(key);d3d9_->prt_comp_operations.erase(key);d3d9_->fill_operations.erase(key);d3d9_->atlas_operations.erase(key);d3d9_->hierarchy_operations.erase(key);}}
 std::optional<std::uint32_t> WindowsServices::resume_d3dx_progress(GuestState& state,GuestMemory& memory,std::uint64_t key,std::uint32_t result){
     if(d3d9_ && d3d9_->prt_engine_operations.contains(key)){auto& operation=d3d9_->prt_engine_operations.at(key);if(operation.thread!=threads_.current)throw HostCallFault("PRT 模擬回呼執行緒不符");operation.worker->reply(result);const auto service=operation.service;return invoke_d3d9(state,memory,service);}
@@ -190,6 +235,7 @@ std::string WindowsServices::d3d9_diagnostics()const{
     if(!d3d9_)return {};std::ostringstream out;for(const auto& line:d3d9_->completed)out<<line;
     for(const auto& [address,value]:d3d9_->objects)if(value->kind==Kind::Device)out<<"d3d9_backend=Metal device="<<address<<" draws="<<value->draws<<" frames="<<value->frames<<'\n';
     out<<"d3d9_live_interfaces="<<d3d9_->objects.size()<<'\n';
+    out<<"d3d9_texture_cache_fast_hits="<<d3d9_->texture_cache_fast_hits<<" d3d9_texture_cache_compares="<<d3d9_->texture_cache_compares<<" d3d9_texture_cache_compare_bytes="<<d3d9_->texture_cache_compare_bytes<<" d3d9_texture_cache_uploads="<<d3d9_->texture_cache_uploads<<'\n';
     if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))for(const auto& [address,value]:d3d9_->objects)out<<"d3d9_live_object="<<address<<" kind="<<static_cast<unsigned>(value->kind)<<" references="<<value->references<<" bound="<<value->bound<<" bytes="<<value->pixels.size()<<'\n';
     return out.str();
 }
@@ -205,7 +251,14 @@ std::span<const WindowsServiceDescriptor> d3d9_service_descriptors(){
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXAssembleShaderFromFileW",6},{family,"D3DXAssembleShaderFromFileA",6},{family,"D3DXAssembleShader",7}})value.push_back(entry);
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXCompileShaderFromFileW",9},{family,"D3DXCompileShaderFromFileA",9},{family,"D3DXCompileShader",10}})value.push_back(entry);
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXGetShaderInputSemantics",3},{family,"D3DXGetShaderOutputSemantics",3},{family,"D3DXGetShaderSize",1},{family,"D3DXGetShaderVersion",1}})value.push_back(entry);
-        for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXGetImageInfoFromFileW",2},{family,"D3DXGetImageInfoFromFileA",2},{family,"D3DXGetImageInfoFromFileInMemory",3}})value.push_back(entry);
+        for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXGetImageInfoFromFileW",2},{family,"D3DXGetImageInfoFromFileA",2},{family,"D3DXGetImageInfoFromFileInMemory",3},{family,"D3DXGetImageInfoFromResourceA",3},{family,"D3DXGetImageInfoFromResourceW",3}})value.push_back(entry);
+        for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{
+            WindowsServiceDescriptor{family,"D3DXLoadSurfaceFromMemory",10},{family,"D3DXLoadSurfaceFromSurface",8},
+            {family,"D3DXLoadSurfaceFromFileA",8},{family,"D3DXLoadSurfaceFromFileW",8},{family,"D3DXLoadSurfaceFromFileInMemory",9},
+            {family,"D3DXLoadSurfaceFromResourceA",9},{family,"D3DXLoadSurfaceFromResourceW",9},
+            {family,"D3DXLoadVolumeFromMemory",11},{family,"D3DXLoadVolumeFromVolume",8},
+            {family,"D3DXLoadVolumeFromFileA",8},{family,"D3DXLoadVolumeFromFileW",8},{family,"D3DXLoadVolumeFromFileInMemory",9},
+            {family,"D3DXLoadVolumeFromResourceA",9},{family,"D3DXLoadVolumeFromResourceW",9}})value.push_back(entry);
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXValidMesh",3},{family,"D3DXCleanMesh",6}})value.push_back(entry);
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXFillTexture",3},{family,"D3DXFillCubeTexture",3},{family,"D3DXSHProjectCubeMap",5}})value.push_back(entry);
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXComputeNormalMap",6},{family,"D3DXCreateTexture",8},{family,"D3DXCreateTextureFromFileW",3},{family,"D3DXCreateTextureFromFileA",3},{family,"D3DXCreateTextureFromFileExW",14},{family,"D3DXCreateTextureFromFileExA",14},{family,"D3DXCreateTextureFromFileInMemory",4},{family,"D3DXCreateTextureFromFileInMemoryEx",15},{family,"D3DXCreateTextureFromResourceW",4},{family,"D3DXCreateTextureFromResourceA",4},{family,"D3DXCreateTextureFromResourceExW",15},{family,"D3DXCreateTextureFromResourceExA",15}})value.push_back(entry);
@@ -219,10 +272,36 @@ std::span<const WindowsServiceDescriptor> d3d9_service_descriptors(){
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXCreateKeyframedAnimationSet",7,2},{family,"D3DXCreateCompressedAnimationSet",7,2},{family,"D3DXCreateAnimationController",5}})value.push_back(entry);
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXLoadMeshHierarchyFromXA",7},{family,"D3DXLoadMeshHierarchyFromXW",7},{family,"D3DXLoadMeshHierarchyFromXInMemory",8}})value.push_back(entry);
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXCreateVolumeTexture",9},{family,"D3DXCreateVolumeTextureFromFileW",3},{family,"D3DXCreateVolumeTextureFromFileA",3},{family,"D3DXCreateVolumeTextureFromFileExW",15},{family,"D3DXCreateVolumeTextureFromFileExA",15},{family,"D3DXCreateVolumeTextureFromFileInMemory",4},{family,"D3DXCreateVolumeTextureFromFileInMemoryEx",16},{family,"D3DXCreateVolumeTextureFromResourceW",4},{family,"D3DXCreateVolumeTextureFromResourceA",4},{family,"D3DXCreateVolumeTextureFromResourceExW",16},{family,"D3DXCreateVolumeTextureFromResourceExA",16}})value.push_back(entry);
-        for(auto kind:{Kind::VolumeTexture,Kind::Volume,Kind::PRTEngine,Kind::RenderToEnvMap,Kind::PRTComp,Kind::AnimSet,Kind::CompressedSet,Kind::AnimController,Kind::Skin,Kind::Gutter,Kind::XFile,Kind::XEnum,Kind::XData,Kind::RenderToSurface,Kind::Factory,Kind::Device,Kind::Surface,Kind::Texture,Kind::CubeTexture,Kind::VertexBuffer,Kind::IndexBuffer,Kind::SwapChain,Kind::Mesh,Kind::Blob,Kind::PRT,Kind::VertexShader,Kind::PixelShader,Kind::VertexDeclaration,Kind::ConstantTable,Kind::Sprite,Kind::Font,Kind::StateBlock,Kind::Effect,Kind::EffectPool})for(auto entry:methods(kind))value.push_back(entry);
+        for(auto kind:{Kind::VolumeTexture,Kind::Volume,Kind::PRTEngine,Kind::RenderToEnvMap,Kind::PRTComp,Kind::AnimSet,Kind::CompressedSet,Kind::AnimController,Kind::Skin,Kind::Gutter,Kind::XFile,Kind::XEnum,Kind::XData,Kind::RenderToSurface,Kind::Factory,Kind::Device,Kind::Surface,Kind::Texture,Kind::CubeTexture,Kind::VertexBuffer,Kind::IndexBuffer,Kind::SwapChain,Kind::Mesh,Kind::Blob,Kind::PRT,Kind::VertexShader,Kind::PixelShader,Kind::VertexDeclaration,Kind::ConstantTable,Kind::Sprite,Kind::Font,Kind::StateBlock,Kind::Effect,Kind::EffectPool,Kind::Query})for(auto entry:methods(kind))value.push_back(entry);
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXLoadMeshFromXW",8},{family,"D3DXLoadMeshFromXA",8},{family,"D3DXLoadMeshFromXInMemory",9}})value.push_back(entry);
         for(auto kind:{Kind::Factory,Kind::Device,Kind::SwapChain})for(auto entry:methods(kind,true))value.push_back(entry);return value;}();return table;
 }
+// 協調者本地 D3D9 服務資格（見 resident_coordinated_service）：所有 D3D9 呼叫本來就只在協調者執行，在其他 worker
+// 繼續執行時本地完成不新增並行。只收裝置的純狀態 Set／Get、綁定、Draw、Begin／EndScene 與 Clear：只改 D3D9 物件表與
+// 同步 Metal 編碼，不建立物件、不配置 heap、不碰視窗或呈現，也不啟動客體回呼；失去最後綁定的物件延後銷毀。
+// 建立／Release／Lock／Present／Reset、D3DX、私有資料與狀態區塊錄製中一律交回完整路徑。只讀物件表，不改狀態。
+bool WindowsServices::d3d9_local_eligible(const GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) const try {
+    if(!d3d9_ || d3d9_->deferred_destroys.size()>=256)return false;
+    const auto dot=service.symbol.find('.');if(dot==std::string_view::npos)return false;
+    const auto prefix=service.symbol.substr(0,dot),method=service.symbol.substr(dot+1);
+    if(prefix!="Device" && prefix!="DeviceEx")return false;
+    static constexpr std::string_view methods[]{
+        "SetRenderState","GetRenderState","SetSamplerState","GetSamplerState","SetTextureStageState","GetTextureStageState",
+        "SetViewport","GetViewport","SetScissorRect","GetScissorRect","SetTransform","GetTransform","MultiplyTransform",
+        "SetStreamSourceFreq","GetStreamSourceFreq","SetMaterial","GetMaterial","SetLight","GetLight","LightEnable","GetLightEnable",
+        "SetClipPlane","GetClipPlane",
+        "SetVertexShaderConstantF","SetVertexShaderConstantI","SetVertexShaderConstantB",
+        "SetPixelShaderConstantF","SetPixelShaderConstantI","SetPixelShaderConstantB",
+        "GetVertexShaderConstantF","GetVertexShaderConstantI","GetVertexShaderConstantB",
+        "GetPixelShaderConstantF","GetPixelShaderConstantI","GetPixelShaderConstantB",
+        "SetStreamSource","SetIndices","SetTexture","SetVertexDeclaration","SetVertexShader","SetPixelShader",
+        "DrawPrimitive","DrawIndexedPrimitive","DrawPrimitiveUP","DrawIndexedPrimitiveUP","BeginScene","EndScene","Clear"};
+    if(std::find(std::begin(methods),std::end(methods),method)==std::end(methods))return false;
+    const WindowsCall arg(state,memory,service);
+    const auto found=d3d9_->objects.find(arg(0));
+    // 狀態區塊錄製中的 Set* 改寫錄製副本的綁定與遮罩，維持完整路徑。
+    return found!=d3d9_->objects.end() && found->second && found->second->kind==Kind::Device && !found->second->recording;
+}catch(const MemoryFault&){return false;}catch(const HostCallFault&){return false;}
 std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(!runtime_.network.external_io)throw HostCallFault("Direct3D 9 Metal 裝置不支援 deterministic compare");
     if(!d3d9_)d3d9_=std::make_shared<D3D9State>();auto& bridge=*d3d9_;
@@ -258,6 +337,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
     const auto output=[&](unsigned i){store_pointer(arg(i),0);};
     const auto get=[&](std::uint64_t address,Kind kind){const auto it=bridge.objects.find(address);require(it!=bridge.objects.end() && it->second->kind==kind);return it->second;};
     const auto get_texture=[&](std::uint64_t address){const auto it=bridge.objects.find(address);require(it!=bridge.objects.end() && texture_kind(it->second->kind));return it->second;};
+#include "graphics_fullscreen_window.inc"
     std::function<std::uint32_t(std::uint64_t)> release;
     std::function<void(const std::shared_ptr<Object>&)> destroy;
     const auto hold=[&](const std::shared_ptr<Object>& value){require(value->references<UINT32_MAX);
@@ -275,6 +355,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
     const auto unbind=[&](Object& device){for(auto& shader:device.shaders)drop_binding(shader);drop_binding(device.vertex_declaration);drop_binding(device.texture);for(auto& texture:device.extra_textures)drop_binding(texture);drop_binding(device.vertex_buffer);drop_binding(device.index_buffer);for(auto& stream:device.extra_streams){drop_binding(stream.buffer);stream.offset=stream.stride=0;}device.stream_frequency.fill(1);device.stream_offset=device.stream_stride=0;};
     const auto saved_bindings=[](const Object& value){std::array<std::uint64_t,40> pointers{value.shaders[0],value.shaders[1],value.vertex_declaration,value.texture,value.vertex_buffer,value.index_buffer};std::copy(value.extra_textures.begin(),value.extra_textures.end(),pointers.begin()+6);for(unsigned i=0;i<15;++i)pointers[25+i]=value.extra_streams[i].buffer;return pointers;};
     destroy=[&](const std::shared_ptr<Object>& value){
+        // 協調者本地呼叫時其他 worker 仍在執行：銷毀可能釋放客體 heap、還原全螢幕視窗或啟動私有資料回呼，
+        // 物件已無引用與綁定，延到下一次完整 D3D9 呼叫依序銷毀（與 D3D11 本地路徑的延後銷毀契約相同）。
+        if(d3d9_local_call_){bridge.deferred_destroys.push_back(value->root);return;}
         if(value->animation_set){auto& set=*value->animation_set;if(set.guest_name)(void)free_heap(memory,set.guest_name,state);for(const auto& animation:set.animations)if(animation.guest_name)(void)free_heap(memory,animation.guest_name,state);}
         if(value->animation_controller){for(auto pointer:value->animation_controller->sets)release(pointer);for(const auto& track:value->animation_controller->tracks)if(track.set)release(track.set);}
         if(value->skin)for(auto& bone:value->skin->bones){if(bone.guest_name)(void)free_heap(memory,bone.guest_name,state);if(bone.guest_offset)(void)free_heap(memory,bone.guest_offset,state);}
@@ -289,7 +372,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
         for(const auto& [key,pointer]:value->font_textures){(void)key;release(pointer);}
         if(value->font_dc){auto it=gui_.contexts.find(value->font_dc);if(it!=gui_.contexts.end()){if(it->second.bitmap)gui_.bitmaps.erase(it->second.bitmap);gui_.contexts.erase(it);}gui_.fonts.erase(value->font_handle);}
         if(value->kind==Kind::Mesh){if(value->vertex_buffer)release(value->vertex_buffer);if(value->index_buffer)release(value->index_buffer);}
-        if(value->kind==Kind::Device){unbind_targets(*value);if(value->recording)unbind(*value->recording);unbind(*value);if(bridge.completed.size()<64)bridge.completed.push_back("d3d9_backend=Metal draws="+std::to_string(value->draws)+" frames="+std::to_string(value->frames)+"\n");}
+        if(value->kind==Kind::Device){require(restore_graphics_fullscreen(*value),unavailable);unbind_targets(*value);if(value->recording)unbind(*value->recording);unbind(*value);if(bridge.completed.size()<64)bridge.completed.push_back("d3d9_backend=Metal draws="+std::to_string(value->draws)+" frames="+std::to_string(value->frames)+"\n");
+            for(auto address:value->swap_buffers)if(address!=value->back){const auto back=get(address,Kind::Surface);require(!back->references);if(back->mapped)(void)free_heap(memory,back->mapped,state);bridge.objects.erase(address);(void)free_heap(memory,address,state);}}
         if(value->chain){auto chain=get(value->chain,Kind::SwapChain);require(!chain->references);bridge.objects.erase(chain->root);(void)free_heap(memory,chain->root,state);}
         if(!value->subresources.empty()){for(auto address:value->subresources){auto surface=get(address,value->kind==Kind::VolumeTexture?Kind::Volume:Kind::Surface);require(!surface->references);if(surface->mapped)(void)free_heap(memory,surface->mapped,state);bridge.objects.erase(address);(void)free_heap(memory,address,state);}}
         else if(value->back){const auto back=get(value->back,Kind::Surface);require(!back->references);if(back->mapped)(void)free_heap(memory,back->mapped,state);bridge.objects.erase(back->root);(void)free_heap(memory,back->root,state);}
@@ -303,46 +387,110 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
         if(value->parent)release(value->parent);return 0;
     };
     const auto create=[&](Kind kind,std::uint64_t parent=0,bool implicit=false,bool ex=false){
-        require(bridge.objects.size()<2048,out_of_memory);
+        // COM 物件數不設固定上限；客體 heap、宿主配置及 GPU backing 各自保留實際額度檢查。
         const auto key=std::pair{kind,ex};if(!bridge.tables.contains(key)){auto entries=methods(kind,ex);const auto address=runtime_allocate(memory,{},entries.size()*ps);
-            for(std::size_t i=0;i<entries.size();++i)memory.store(GuestAddress{address+i*ps},pb,resolve(entries[i].family,entries[i].symbol).value);bridge.tables[key]=address;}
-        auto value=std::make_shared<Object>();value->root=allocate_heap(memory,ps);require(value->root!=0,out_of_memory);value->kind=kind;value->ex=ex;value->implicit=implicit;value->references=implicit?0:1;
-        try{bridge.objects.emplace(value->root,value);memory.store(GuestAddress{value->root},pb,bridge.tables.at(key));}
+            for(std::size_t i=0;i<entries.size();++i){
+                auto target=resolve(entries[i].family,entries[i].symbol).value;
+                static const bool constants_enabled=[] {const auto* v=std::getenv("X64ARM_GUEST_D3D9_CONSTANTS");return !v || std::string_view(v)!="0";}();
+                if(kind==Kind::Factory || (kind==Kind::Device && constants_enabled && !std::getenv("X64ARM_TRACE_D3D9_CONSTANTS")))if(const auto image=runtime_.builtin_images.find(callback_return_.value+d3d9_formats::image_offset);image!=runtime_.builtin_images.end()){
+                    const auto name=entries[i].symbol.substr(entries[i].symbol.find('.')+1);
+                    if(const auto found=image->second.export_names.find(std::string(name));found!=image->second.export_names.end())target=image->first+found->second;
+                }
+                memory.store(GuestAddress{address+i*ps},pb,target);
+            }bridge.tables[key]=address;}
+        auto value=std::make_shared<Object>();value->root=allocate_heap(memory,kind==Kind::Device?D9_CONSTANT_DEVICE_BYTES:ps);require(value->root!=0,out_of_memory);value->kind=kind;value->ex=ex;value->implicit=implicit;value->references=implicit?0:1;
+        try{
+            bridge.objects.emplace(value->root,value);memory.store(GuestAddress{value->root},pb,bridge.tables.at(key));
+            if(kind==Kind::Device){
+                memory.fill(GuestAddress{value->root+8},0,D9_CONSTANT_DEVICE_BYTES-8);
+                value->constants.bind(memory,value->root+D9_CONSTANT_DATA);
+                for(const auto& entry:methods(kind,ex)){
+                    const auto name=entry.symbol.substr(entry.symbol.find('.')+1);
+                    if(name.find("ShaderConstant")==name.npos)continue;
+                    const auto stage=name.find("Pixel")!=name.npos?1U:0U,register_set=name.back()=='F'?0U:name.back()=='I'?1U:2U;
+                    const auto method=stage*6+register_set*2+(name.starts_with("Get")?1U:0U);
+                    memory.store(GuestAddress{value->root+D9_CONSTANT_HOST+method*8},pb,resolve(entry.family,entry.symbol).value);
+                }
+            }
+        }
         catch(...){bridge.objects.erase(value->root);(void)free_heap(memory,value->root,state);throw;}
         value->parent=parent;if(parent && !implicit)hold(bridge.objects.at(parent));return value;
     };
 #include "d3d9_state_block.inc"
+    const auto set_constants=[&](Object& device,unsigned stage,unsigned register_set,unsigned first,std::span<const std::uint8_t> bytes){
+        const auto stride=d9_constant_stride(register_set),limit=d9_constant_limit(stage,register_set);
+        require(first<=limit && bytes.size()%stride==0 && bytes.size()/stride<=limit-first);
+        auto& target=device.recording?*device.recording:device;
+        target.constants.write(stage,register_set,first*stride,bytes);
+        if(device.recording)for(unsigned i=0;i<bytes.size()/stride;++i)target.state_mask.emplace(5+stage*3+register_set,first+i);
+    };
+    const auto visibility_slot=[&](Object& device){
+        std::erase_if(device.active_queries,[](const auto& weak){const auto query=weak.lock();return !query || !query->query_active;});
+        QuerySlot slot;if(device.active_queries.empty())return slot;
+        if(!device.visibility_pool || device.visibility_cursor+8>65536){GraphicsResourceDesc desc;desc.width=65536;device.visibility_pool=device.native->graphics_resource(desc);device.native->graphics_write(GraphicsView{device.visibility_pool},std::vector<std::uint8_t>(65536),0,0);device.visibility_cursor=0;}
+        slot={device.visibility_pool,device.visibility_cursor};device.visibility_cursor+=8;
+        for(auto& weak:device.active_queries)if(auto query=weak.lock())query->query_slots.push_back(slot);
+        return slot;
+    };
     const auto make_texture=[&](const std::shared_ptr<Object>& device,unsigned width,unsigned height,unsigned levels,unsigned usage,unsigned format,unsigned pool,bool cube=false,unsigned depth=1,bool volume=false){
-        require(!cube || (width==height && !volume));require(depth && (!volume || (depth<=2048 && width<=2048 && height<=2048)));require(width && height && width<=16384 && height<=16384 && pool<=3 && (!device->ex || pool!=1));const auto native=native_format(format);const auto maximum=static_cast<unsigned>(std::bit_width(std::max({width,height,depth})));if(!levels)levels=maximum;require(levels<=maximum);require(usage==0 || ((usage==0x200 || (usage==1 && render_color_format(format))) && pool==0),unavailable);
+        require(!cube || (width==height && !volume));require(depth && (!volume || (depth<=2048 && width<=2048 && height<=2048)));require(width && height && width<=16384 && height<=16384 && pool<=3 && (!device->ex || pool!=1));const auto native=native_format(format);const auto maximum=static_cast<unsigned>(std::bit_width(std::max({width,height,depth})));const bool depth_texture=d9_raw_depth(format);if(!levels)levels=depth_texture?1:maximum;require(levels<=maximum);require(depth_texture?(usage==2 && pool==0 && levels==1 && !volume):(usage==0 || ((usage==0x200 || (usage==1 && render_color_format(format))) && pool==0)),unavailable);
         require(!volume || usage!=1);auto texture=create(volume?Kind::VolumeTexture:cube?Kind::CubeTexture:Kind::Texture,device->root);texture->depth=depth;texture->width=width;texture->height=height;texture->levels=levels;texture->format=format;texture->pool=pool;texture->usage=usage;
-        try{if(usage==1){GraphicsResourceDesc desc;desc.dimension=3;desc.width=width;desc.height=height;desc.levels=levels;desc.layers=cube?6:1;desc.format=native;desc.bind=0x28;desc.misc=cube?4:0;texture->native_view={device->native->graphics_resource(desc),native,0,levels,0,desc.layers};texture->native_view.dimension=cube?9:4;}
+        try{if(usage==1 || depth_texture){GraphicsResourceDesc desc;desc.dimension=3;desc.width=width;desc.height=height;desc.levels=levels;desc.layers=cube?6:1;desc.format=native;desc.bind=depth_texture?0x48:0x28;desc.misc=cube?4:0;texture->native_view={device->native->graphics_resource(desc),native,0,levels,0,desc.layers};texture->native_view.dimension=cube?9:4;}
             texture->subresources.reserve(levels*(cube?6U:1U));for(unsigned face=0;face<(cube?6U:1U);++face)for(unsigned level=0;level<levels;++level){auto surface=create(volume?Kind::Volume:Kind::Surface,texture->root,true);surface->depth=std::max(1U,depth>>level);texture->subresources.push_back(surface->root);if(!face && !level)texture->back=surface->root;surface->width=std::max(1U,width>>level);surface->height=std::max(1U,height>>level);surface->format=format;surface->pool=pool;surface->usage=usage;if(texture->native_view.resource)surface->native_view={texture->native_view.resource,native,level,1,face,1};const auto pitch=graphics_format_pitch(native,surface->width,surface->height);const auto size=std::size_t(pitch[0])*pitch[1]*surface->depth;surface->storage=reserve_gpu_memory(size);surface->pixels.resize(size);}}
         catch(...){release(texture->root);throw;}return texture;
     };
     const auto surface_device=[&](const Object& surface){auto owner=bridge.objects.at(surface.parent);if(texture_kind(owner->kind))owner=bridge.objects.at(owner->parent);require(owner->kind==Kind::Device);return owner;};
-    const auto read_surface=[&](Object& surface){if(surface.native_view.resource){require(!surface.multisample);surface.pixels=surface_device(surface)->native->graphics_read(surface.native_view);}};
-    const auto write_surface=[&](Object& surface){if(surface.native_view.resource){const auto pitch=graphics_format_pitch(surface.native_view.format,surface.width,surface.height);surface_device(surface)->native->graphics_write(surface.native_view,surface.pixels,pitch[0],pitch[0]*pitch[1]);}};
+    // 內容失效與 D3D9 dirty region 分開；NO_DIRTY_UPDATE 仍可能改變取樣內容。
+    // surface／volume 的別名一律回到同一個 texture，不另建資源或狀態快取。
+    const auto surface_changed=[&](const Object& surface){auto parent=bridge.objects.at(surface.parent);if(texture_kind(parent->kind))parent->texture_pixels_dirty=true;};
+    const auto read_surface=[&](Object& surface){if(surface.native_view.resource){require(!surface.multisample);surface.pixels=surface_device(surface)->native->graphics_read(surface.native_view);surface_changed(surface);}};
+    const auto write_surface=[&](Object& surface){surface_changed(surface);if(surface.native_view.resource){const auto pitch=graphics_format_pitch(surface.native_view.format,surface.width,surface.height);surface_device(surface)->native->graphics_write(surface.native_view,surface.pixels,pitch[0],pitch[0]*pitch[1]);}};
+    // D3D9 與 D3DX 共用區域寫入，GPU／CPU 資源均保留區域以外的資料。
+    const auto write_surface_region=[&](Object& surface,std::span<const std::uint8_t> data,std::array<unsigned,6> box){
+        const auto format=native_format(surface.format),block=graphics_format_bc_family(format)?4U:1U;
+        require(!surface.mapped && !surface.multisample);
+        require(box[0]<box[3] && box[1]<box[4] && box[2]<box[5] && box[3]<=surface.width && box[4]<=surface.height && box[5]<=surface.depth);
+        require(!(box[0]%block) && !(box[1]%block) && (!(box[3]%block) || box[3]==surface.width) && (!(box[4]%block) || box[4]==surface.height));
+        const auto pitch=graphics_format_pitch(format,box[3]-box[0],box[4]-box[1]);
+        const auto slice=std::size_t(pitch[0])*pitch[1];require(data.size()==slice*(box[5]-box[2]));
+        if(surface.native_view.resource){require(slice<=UINT32_MAX);surface_device(surface)->native->graphics_write_region(surface.native_view,data,pitch[0],static_cast<std::uint32_t>(slice),box);surface_changed(surface);return;}
+        const auto row=graphics_format_pitch(format,surface.width,surface.height),unit=graphics_format_pitch(format,block,block);
+        require(surface.pixels.size()>=std::size_t(row[0])*row[1]*surface.depth);
+        for(unsigned z=0;z<box[5]-box[2];++z)for(unsigned y=0;y<pitch[1];++y)
+            std::memcpy(surface.pixels.data()+(std::size_t(box[2]+z)*row[1]+box[1]/block+y)*row[0]+std::size_t(box[0]/block)*unit[0],data.data()+z*slice+std::size_t(y)*pitch[0],pitch[0]);
+        surface_changed(surface);
+    };
     const auto target_size=[&](const Object& device){auto target=get(device.render_targets[0],Kind::Surface);return std::array<unsigned,2>{target->width,target->height};};
-    const auto fixed_targets=[&](Object& device){auto color=get(device.render_targets[0],Kind::Surface);GraphicsView depth;if(device.depth_target)depth=get(device.depth_target,Kind::Surface)->native_view;device.native->graphics_fixed_targets(color->native_view,depth);};
+    const auto fixed_targets=[&](Object& device){auto color=get(device.render_targets[0],Kind::Surface);GraphicsView depth;if(device.depth_target)depth=get(device.depth_target,Kind::Surface)->native_view;auto target=color->native_view;target.format=srgb_view_format(target.format,device.render.at(194));device.native->graphics_fixed_targets(target,depth);};
     static const bool resource_cache=[] {const auto* value=std::getenv("X64ARM_D3D9_RESOURCE_CACHE");return !value || std::string_view(value)!="0";}();
-    // 快取不可變內容快照；任何 CPU 寫入都以完整內容比較偵測，舊 GPU 資源留給在途命令。
-    const auto texture_resource=[&](Object& device,Object& texture,bool fixed=false){
-        if(texture.native_view.resource)return texture.native_view.resource;
+    static const bool texture_dirty_cache=[] {const auto* value=std::getenv("X64ARM_D3D9_TEXTURE_DIRTY_CACHE");return !value || std::string_view(value)!="0";}();
+    // 未寫入時共用不可變快照；失效後仍比對內容，避免相同資料重複上傳。
+    // 新內容建立新 GPU 資源，保留在途命令、故障後重試及所有 mapped 檢查。
+    const auto texture_resource=[&](Object& device,Object& texture,bool srgb=false){
+        // Metal 的 packed 格式沒有 sRGB view；需要解碼時沿用 RGBA8 內容快照。
+        // 先讀回目前 GPU 內容，避免把曾被繪製的紋理誤當成未變動的 CPU 快取。
+        if(texture.native_view.resource){
+            if(!srgb || !d9_packed_color(texture.format))return texture.native_view.resource;
+            for(const auto surface:texture.subresources)read_surface(*get(surface,Kind::Surface));
+        }
         const bool cube=texture.kind==Kind::CubeTexture,volume=texture.kind==Kind::VolumeTexture;
-        GraphicsResourceDesc d;d.dimension=volume?4:3;d.depth=texture.depth;d.width=texture.width;d.height=texture.height;d.format=fixed || (volume && graphics_format_bc_family(sampled_format(texture.format)))?28:sampled_format(texture.format);d.bind=8;d.levels=texture.levels;d.layers=cube?6:1;d.misc=cube?4:0;
-        auto& cached=fixed?texture.cached_fixed_resource:texture.cached_resource;auto& pixels=fixed?texture.cached_fixed_pixels:texture.cached_pixels;
+        // 固定與可程式化管線共用原生取樣格式；通道排列由 Metal view 承接，
+        // 不為固定管線逐張轉成浮點再編碼 RGBA8。3D BC 仍需既有解壓路徑。
+        GraphicsResourceDesc d;d.dimension=volume?4:3;d.depth=texture.depth;d.width=texture.width;d.height=texture.height;d.format=volume && graphics_format_bc_family(sampled_format(texture.format))?28:sampled_format(texture.format);d.bind=8;d.levels=texture.levels;d.layers=cube?6:1;d.misc=cube?4:0;
+        auto& cached=texture.cached_resource;auto& pixels=texture.cached_pixels;
         bool same=resource_cache && cached && pixels.size()==texture.subresources.size();
-        for(std::size_t i=0;i<texture.subresources.size();++i){const auto surface=get(texture.subresources[i],volume?Kind::Volume:Kind::Surface);require(!surface->mapped);if(same && pixels[i]!=surface->pixels)same=false;}
-        if(same)return cached;
+        const bool compare=!texture_dirty_cache || texture.texture_pixels_dirty;
+        for(std::size_t i=0;i<texture.subresources.size();++i){const auto surface=get(texture.subresources[i],volume?Kind::Volume:Kind::Surface);require(!surface->mapped);if(same && compare){++bridge.texture_cache_compares;bridge.texture_cache_compare_bytes+=surface->pixels.size();if(pixels[i]!=surface->pixels)same=false;}}
+        if(same){if(!compare)++bridge.texture_cache_fast_hits;texture.texture_pixels_dirty=false;return cached;}
         auto native=device.native->graphics_resource(d);std::vector<std::vector<std::uint8_t>> snapshots;
         if(resource_cache)snapshots.reserve(texture.subresources.size());
         for(unsigned face=0;face<d.layers;++face)for(unsigned level=0;level<d.levels;++level){const auto surface=get(texture.subresources.at(face*d.levels+level),volume?Kind::Volume:Kind::Surface);const auto pitch=graphics_format_pitch(d.format,surface->width,surface->height);auto bytes=sampled_pixels(surface->pixels,texture.format);if(d.format!=sampled_format(texture.format))bytes=texture_image::transform(bytes,sampled_format(texture.format),{surface->width,surface->height,surface->depth},{0,0,0,surface->width,surface->height,surface->depth},d.format,{surface->width,surface->height,surface->depth},1);device.native->graphics_write(GraphicsView{native,d.format,level,1,face},bytes,pitch[0],pitch[0]*pitch[1]);if(resource_cache)snapshots.push_back(surface->pixels);}
-        if(resource_cache){cached=native;pixels=std::move(snapshots);}return native;
+        ++bridge.texture_cache_uploads;if(resource_cache){cached=native;pixels=std::move(snapshots);texture.texture_pixels_dirty=false;}return native;
     };
     const auto upload=[&](Object& device,Object& texture){
         require(texture.kind!=Kind::VolumeTexture,unavailable);call(device,GlOperation::BindTexture,{0xde1,1});call(device,GlOperation::TexParameteri,{0xde1,0x813d,texture.levels-1});
         device.native->graphics_fixed_texture({});
-        if(resource_cache && (!texture.native_view.resource || texture.native_view.format==28 || texture.native_view.format==87)){auto native=texture_resource(device,texture,true);GraphicsView view{native,native->desc.format,0,texture.levels};view.dimension=4;if(device.native->graphics_fixed_texture(view))return;}
+        {auto native=texture_resource(device,texture,device.sampler.at(11)!=0);GraphicsView view{native,srgb_view_format(native->desc.format,device.sampler.at(11)),texture.lod,texture.levels-texture.lod};view.dimension=4;if(d9_raw_depth(texture.format))view.flags|=texture.format==0x5a544e49U?graphics_view_replicate_red:graphics_view_red_only;if(device.native->graphics_fixed_texture(view))return;}
         for(unsigned level=0;level<texture.levels;++level){
             const auto surface=get(texture.subresources.at(level),Kind::Surface);require(!surface->mapped);read_surface(*surface);auto rgba=sampled_pixels(surface->pixels,texture.format);
             rgba=texture_image::transform(rgba,sampled_format(texture.format),{surface->width,surface->height,1},{0,0,0,surface->width,surface->height,1},28,{surface->width,surface->height,1},1);
@@ -366,49 +514,112 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
         if(area){auto bytes=read(area,16);std::memcpy(rect.data(),bytes.data(),16);}
         require(rect[0]>=0 && rect[1]>=0 && rect[2]>rect[0] && rect[3]>rect[1] && static_cast<std::uint32_t>(rect[2])<=surface.width && static_cast<std::uint32_t>(rect[3])<=surface.height);
         const auto format=native_format(surface.format),block=graphics_format_bc_family(format)?4U:1U;const auto pitch=graphics_format_pitch(format,surface.width,surface.height),unit_pitch=graphics_format_pitch(format,block,block);require(!(static_cast<unsigned>(rect[0])%block) && !(static_cast<unsigned>(rect[1])%block) && (!(static_cast<unsigned>(rect[2])%block) || static_cast<unsigned>(rect[2])==surface.width) && (!(static_cast<unsigned>(rect[3])%block) || static_cast<unsigned>(rect[3])==surface.height));
+        // 診斷：X64ARM_TRACE_D3D9_LOCK=1 列出前 32 次與之後每 1024 次鎖定的資源種類、池、用途、格式、旗標與範圍。
+        static const bool trace_lock=std::getenv("X64ARM_TRACE_D3D9_LOCK")!=nullptr;
+        if(trace_lock){static std::uint64_t locks=0;if(++locks<=32 || !(locks&1023))std::fprintf(stderr,"[d3d9-lock] n=%llu parent=%u pool=%u usage=0x%x lockable=%d native=%d format=%u size=%ux%u flags=0x%x rect=%d,%d,%d,%d\n",
+            static_cast<unsigned long long>(locks),static_cast<unsigned>(parent->kind),surface.pool,surface.usage,surface.lockable?1:0,surface.native_view.resource?1:0,surface.format,surface.width,surface.height,flags,rect[0],rect[1],rect[2],rect[3]);}
         read_surface(surface);surface.mapped=allocate_heap(memory,surface.pixels.size());require(surface.mapped!=0,out_of_memory);surface.lock_flags=flags;memory.write(GuestAddress{surface.mapped},surface.pixels);
         memory.store(GuestAddress{address},32,pitch[0]);store_pointer(address+ps,surface.mapped+std::uint64_t{static_cast<unsigned>(rect[1])/block}*pitch[0]+std::uint64_t{static_cast<unsigned>(rect[0])/block}*unit_pitch[0]);
     };
     const auto surface_unlock=[&](Object& surface){require(surface.mapped!=0);if(!(surface.lock_flags&0x10)){surface.pixels=read(surface.mapped,surface.pixels.size());write_surface(surface);}(void)free_heap(memory,surface.mapped,state);surface.mapped=0;};
-    const auto display=[&](std::uint64_t address){const std::array<std::uint32_t,4> mode{1440,900,60,22};require(address!=0);memory.write(GuestAddress{address},std::span(reinterpret_cast<const std::uint8_t*>(mode.data()),sizeof(mode)));};
-    const auto display_ex=[&](std::uint64_t mode,std::uint64_t rotation){
-        require(mode || rotation);if(mode){require(memory.load(GuestAddress{mode},32)==24);const std::array<std::uint32_t,6> data{24,1440,900,60,22,1};memory.write(GuestAddress{mode},std::span(reinterpret_cast<const std::uint8_t*>(data.data()),24));}
+    const auto current_mode=[&](){if(native_gui_)if(auto mode=native_gui_->current_display_mode())return *mode;
+        const auto rect=gui_screen_area();return GuiDisplayMode{static_cast<std::uint32_t>(rect[2]-rect[0]),static_cast<std::uint32_t>(rect[3]-rect[1]),60,1};};
+    const auto display_modes=[&](){auto modes=native_gui_?native_gui_->display_modes():std::vector<GuiDisplayMode>{};if(modes.empty())modes.push_back(current_mode());return modes;};
+    const auto mode_rate=[](const GuiDisplayMode& mode){return mode.refresh_denominator?static_cast<std::uint32_t>((std::uint64_t{mode.refresh_numerator}+mode.refresh_denominator/2)/mode.refresh_denominator):0U;};
+    const auto display=[&](std::uint64_t address,const std::optional<GuiDisplayMode>& selected={}){const auto mode=selected.value_or(current_mode());const std::array<std::uint32_t,4> data{mode.width,mode.height,mode_rate(mode),22};require(address!=0);memory.write(GuestAddress{address},std::span(reinterpret_cast<const std::uint8_t*>(data.data()),sizeof(data)));};
+    const auto display_ex=[&](std::uint64_t address,std::uint64_t rotation,const std::optional<GuiDisplayMode>& selected={}){
+        require(address || rotation);if(address){require(memory.load(GuestAddress{address},32)==24);const auto mode=selected.value_or(current_mode());const std::array<std::uint32_t,6> data{24,mode.width,mode.height,mode_rate(mode),22,mode.scanline};memory.write(GuestAddress{address},std::span(reinterpret_cast<const std::uint8_t*>(data.data()),24));}
         if(rotation)memory.store(GuestAddress{rotation},32,1);
     };
     const auto present=[&](Object& device,std::uint64_t source,std::uint64_t destination,std::uint64_t window,std::uint64_t dirty,std::uint32_t flags){
         require(!device.scene && !source && !destination && (!window || window==device.window) && !dirty && !flags);require(gui_.windows.contains(device.window));
         if(device.device_type==4){++device.frames;return;}
-        device.native->bind();auto back=get(device.back,Kind::Surface);if(back->multisample)device.native->graphics_resolve(device.native->graphics_drawable(false),back->native_view,back->native_view.format);require(device.native->swap(),unavailable);++device.frames;
+        device.native->bind();auto back=get(device.back,Kind::Surface);require(!back->mapped);const auto drawable=device.native->graphics_drawable(false);
+        if(back->multisample)device.native->graphics_resolve(drawable,back->native_view,back->native_view.format);
+        else if(word(device.presentation,24)==2 || device.swap_buffers.size()>1)device.native->graphics_copy(drawable,back->native_view,{0,0,0},{0,0,0,device.width,device.height,1});
+        require(device.native->swap(),unavailable);++device.frames;
         if(const auto* directory=std::getenv("X64ARM_D3D9_CAPTURE_DIR");directory && *directory){bool capture=device.frames==1;if(const auto* frames=std::getenv("X64ARM_D3D9_CAPTURE_FRAMES")){std::istringstream input(frames);std::string token;while(std::getline(input,token,',')){char* end=nullptr;const auto frame=std::strtoull(token.c_str(),&end,10);if(end && !*end && frame==device.frames)capture=true;}}if(capture){if(std::getenv("X64ARM_D3D9_CAPTURE_SURFACES"))for(const auto& [id,surface]:bridge.objects)if(surface->kind==Kind::Surface && (surface->usage&1) && !surface->multisample && surface->native_view.resource && surface_device(*surface)->root==device.root){const auto bytes=device.native->graphics_read(surface->native_view);std::ofstream out(std::filesystem::path(directory)/("surface-"+std::to_string(id)+"-frame-"+std::to_string(device.frames)+"-format-"+std::to_string(surface->native_view.format)+"-"+std::to_string(surface->width)+"x"+std::to_string(surface->height)+".bin"),std::ios::binary);out.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));}(void)device.native->capture(std::filesystem::path(directory)/("device-"+std::to_string(device.root)+(device.frames==1?std::string{}:"-frame-"+std::to_string(device.frames))+".png"));}}
+        if(D3D9FrameCapture::enabled()){if(!device.frame_capture)device.frame_capture=std::make_shared<D3D9FrameCapture>();device.frame_capture->presented(device.root,device.frames);}
+        const bool flip=word(device.presentation,24)==2;
+        if(flip || device.swap_buffers.size()>1){
+            auto next=flip?std::move(device.flip_front):std::move(back->native_view);
+            if(flip)device.flip_front=std::move(back->native_view);
+            for(std::size_t i=1;i<device.swap_buffers.size();++i)get(device.swap_buffers[i-1],Kind::Surface)->native_view=std::move(get(device.swap_buffers[i],Kind::Surface)->native_view);
+            get(device.swap_buffers.back(),Kind::Surface)->native_view=std::move(next);fixed_targets(device);
+        }
         graphics_close_after_present(device.window,device.frames,[&](std::uint64_t target){enqueue_gui_message({target,0,0,0x10});return true;});
     };
-    const auto setup=[&](Object& device,std::uint64_t address,bool preserve=false){
+    const auto setup=[&](Object& device,std::uint64_t address,bool preserve=false,std::uint64_t ex_mode=0,bool extended=false){
         require(address!=0);const unsigned pointer_offset=x86_?28:32,tail=pointer_offset+ps;auto pp=read(address,x86_?56:64);const auto n=[&](unsigned at){return word(pp,at);};
+        memory.check(GuestAddress{address},pp.size(),Access::Write);
         const auto window=memory.load(GuestAddress{address+pointer_offset},pb);const auto target=window?window:device.focus;
+        const bool windowed=n(tail)!=0;const auto count=std::max(1U,n(12)),effect=n(24);
         // 無呈現視窗但明確指定尺寸的裝置仍可執行離屏資源／軟體網格處理。
-        require((target && gui_.windows.contains(target)) || (!target && n(0) && n(4) && n(tail)==1));
+        require((target && gui_.windows.contains(target)) || (!target && n(0) && n(4) && windowed));
+        require(windowed || (n(0) && n(4) && n(8) && device.focus && gui_.windows.contains(device.focus) && !gui_.windows.at(device.focus).parent));
         const auto width=n(0)?n(0):gui_.windows.at(target).width,height=n(4)?n(4):gui_.windows.at(target).height,format=n(8)?n(8):22;
         require(width && height && width<=16384 && height<=16384 && std::uint64_t{width}*height<=64*1024*1024);
-        require(color_format(format) && n(12)<=1 && (!n(16) || (n(16)>=2 && n(16)<=16 && n(24)==1)) && !n(20) && (n(24)==1 || n(24)==3) && n(tail+0)==1 && n(tail+4)<=1);
-        // DISCARD_DEPTHSTENCIL 允許 Present 後丟棄深度；保留內容仍符合其未定義內容契約。
-        require(!(n(tail+12)&~2U) && !n(tail+16)); // 尚未提供 lockable backbuffer 或全螢幕刷新率。
+        require(color_format(format) && count<=(device.ex?30U:3U) && effect>=1 && effect<=3 && (effect!=3 || count==1));
+        require((!n(16) || (n(16)>=2 && n(16)<=16 && effect==1)) && !n(20));
+        require(!(n(tail+12)&~3U) && (!(n(tail+12)&1U) || !n(16)) && (!windowed || !n(tail+16)));
         require(!n(tail+4) || depth_format(n(tail+8)),unavailable);
         require(n(tail+20)==0 || n(tail+20)==1 || n(tail+20)==0x80000000U,unavailable);
+        std::optional<GuiDisplayMode> mode;unsigned scanline=0;
+        if(extended){require(windowed?!ex_mode:bool(ex_mode));if(ex_mode){const auto data=read(ex_mode,24);require(word(data,0)==24 && word(data,4)==width && word(data,8)==height && word(data,16)==format && word(data,12)==n(tail+16) && word(data,20)<=2);scanline=word(data,20);}}
+        if(!windowed){
+            const auto current=current_mode();for(const auto& candidate:display_modes())if(candidate.width==width && candidate.height==height && (!n(tail+16) || n(tail+16)==mode_rate(candidate)) && (!scanline || scanline==candidate.scanline)){
+                if(!mode || candidate.native_id==current.native_id)mode=candidate;
+            }
+            require(bool(mode),unavailable);
+            for(const auto& [pointer,other]:bridge.objects){(void)pointer;require(other->kind!=Kind::Device || other->root==device.root || !other->fullscreen,unavailable);}
+        }
         auto native=make_metal_opengl(native_gui_ && target && device.device_type!=4?native_gui_->graphics_view(target):nullptr,width,height);require(bool(native),unavailable);
         require(native->swap_interval(n(tail+20)==0x80000000U?0:1),unavailable);
+        require(native->graphics_samples_supported(87,n(16)?n(16):1),unavailable);
+        if(n(tail+4))require(native->graphics_samples_supported(depth_format(n(tail+8)),n(16)?n(16):1),unavailable);
+        // FLIP 的前景與全部後景各有實際 backing；呈現只沿用 Metal 的 copy／swap。
+        GraphicsResourceDesc desc;desc.dimension=3;desc.width=width;desc.height=height;desc.format=87;desc.samples=n(16)?n(16):1;desc.bind=0x20;
+        std::vector<GraphicsView> views;views.reserve(count);
+        for(unsigned i=0;i<count;++i)views.push_back(effect==2 || count>1 || n(16)?GraphicsView{native->graphics_resource(desc),desc.format}:native->graphics_drawable(false));
+        GraphicsView front,depth_view;
+        if(effect==2)front={native->graphics_resource(desc),desc.format};
+        if(n(tail+4)){desc.format=depth_format(n(tail+8));desc.bind=0x40;depth_view={native->graphics_resource(desc),desc.format};native->graphics_clear(depth_view,{1,0,0,0},n(tail+8)==75?3:1);}
+        auto slots=device.swap_buffers;if(slots.empty())slots.push_back(device.back);std::vector<std::uint64_t> created;auto depth_id=device.depth_back;bool committed=false;
+        try{
+        while(slots.size()<count){auto surface=create(Kind::Surface,device.root,true);created.push_back(surface->root);slots.push_back(surface->root);}
+        if(n(tail+4) && !depth_id){depth_id=create(Kind::Surface,device.root,true)->root;created.push_back(depth_id);}
+        if(device.fullscreen && (windowed || target!=device.window))require(restore_graphics_fullscreen(device),unavailable);
+        const auto old_window=device.window;device.window=target;
+        if(!windowed && !enter_graphics_fullscreen(device,mode)){device.window=old_window;throw Failure{unavailable};}
         unbind_targets(device);
-        if(!preserve){unbind(device);for(auto& stage:device.constants)for(auto& values:stage)values.clear();device.sampler=Object{}.sampler;device.stage={{1,4},{2,2},{3,1},{4,2},{5,2},{6,1},{28,1},{33,1},{36,1},{65,1},{68,1},{97,1},{100,1},{129,1},{132,1},{161,1},{164,1},{193,1},{196,1},{225,1},{228,1}};}
+        if(!preserve){unbind(device);device.constants.clear();device.sampler=Object{}.sampler;device.stage={{1,4},{2,2},{3,1},{4,2},{5,2},{6,1},{28,1},{33,1},{36,1},{65,1},{68,1},{97,1},{100,1},{129,1},{132,1},{161,1},{164,1},{193,1},{196,1},{225,1},{228,1}};}
         device.native=std::move(native);device.window=target;device.width=width;device.height=height;device.format=format;device.auto_depth=n(tail+4)!=0;
+        device.presentation_mode=mode;device.flip_front=std::move(front);device.depth_back=depth_id;
+        for(std::size_t i=count;i<slots.size();++i){auto surface=get(slots[i],Kind::Surface);if(surface->references)surface->implicit=false;else{bridge.objects.erase(surface->root);(void)free_heap(memory,surface->root,state);}}
+        slots.resize(count);device.swap_buffers=std::move(slots);committed=true;
         if(!preserve){device.render=Object{}.render;device.render[7]=device.auto_depth?1U:0U;
         device.transforms={{2,identity()},{3,identity()},{256,identity()}};device.fvf=0;
         device.viewport={0,0,width,height,bits(0),bits(1)};device.scissor={0,0,static_cast<std::int32_t>(width),static_cast<std::int32_t>(height)};}
-        put(pp,0,width);put(pp,4,height);put(pp,8,format);put(pp,12,1);device.presentation=pp;memory.write(GuestAddress{address},pp);
-        auto back=get(device.back,Kind::Surface);back->width=width;back->height=height;back->format=format;back->pool=0;back->usage=1;back->multisample=n(16);back->native_view=device.native->graphics_drawable(false);if(back->multisample){GraphicsResourceDesc desc;desc.dimension=3;desc.width=width;desc.height=height;desc.format=87;desc.samples=back->multisample;desc.bind=0x20;back->native_view={device.native->graphics_resource(desc),desc.format};}bind_target(device.render_targets[0],back->root);
-        if(device.auto_depth){if(!device.depth_back)device.depth_back=create(Kind::Surface,device.root,true)->root;auto depth=get(device.depth_back,Kind::Surface);depth->width=width;depth->height=height;depth->format=n(tail+8);depth->pool=0;depth->usage=2;depth->multisample=n(16);GraphicsResourceDesc desc;desc.dimension=3;desc.width=width;desc.height=height;desc.format=depth_format(depth->format);desc.samples=n(16)?n(16):1;desc.bind=0x40;depth->native_view={device.native->graphics_resource(desc),desc.format};device.native->graphics_clear(depth->native_view,{1,0,0,0},depth->format==75?3:1);bind_target(device.depth_target,depth->root);}
+        put(pp,0,width);put(pp,4,height);put(pp,8,format);put(pp,12,count);device.presentation=pp;memory.write(GuestAddress{address},pp);
+        for(unsigned i=0;i<count;++i){auto back=get(device.swap_buffers[i],Kind::Surface);back->width=width;back->height=height;back->format=format;back->pool=0;back->usage=1;back->multisample=n(16);back->lockable=n(tail+12)&1U;back->native_view=std::move(views[i]);back->pixels.clear();}
+        bind_target(device.render_targets[0],device.back);
+        if(device.auto_depth){auto depth=get(device.depth_back,Kind::Surface);depth->width=width;depth->height=height;depth->format=n(tail+8);depth->pool=0;depth->usage=2;depth->multisample=n(16);depth->native_view=std::move(depth_view);bind_target(device.depth_target,depth->root);}
+        else if(device.depth_back)get(device.depth_back,Kind::Surface)->native_view={};
         fixed_targets(device);
+        }catch(...){if(!committed)for(auto pointer:created){bridge.objects.erase(pointer);(void)free_heap(memory,pointer,state);}throw;}
     };
     std::uint64_t result=0;
     try {
+        // 完整呼叫（全停或單核）開始時，依發生順序銷毀協調者本地呼叫延後的物件；仍無引用與綁定者才銷毀，
+        // 私有資料回呼併入本次呼叫收尾啟動。
+        if(!d3d9_local_call_ && !bridge.deferred_destroys.empty()){
+            const auto pending=std::exchange(bridge.deferred_destroys,{});
+            for(const auto address:pending)
+                if(const auto found=bridge.objects.find(address);found!=bridge.objects.end() && !found->second->references && !found->second->bound){
+                    const auto object=found->second; // destroy 會從表中移除，不能傳入表內元素的參照。
+                    destroy(object);
+                }
+        }
 const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_windows_path(utf8_to_utf16(path),runtime_.current_directory));};
 #include "d3dx9_mesh_handlers.inc"
         if(mesh_handled){}
@@ -416,12 +627,15 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
             const bool ex=symbol=="Direct3DCreate9Ex";if(ex)output(1);require(u(0)==32,unavailable);{auto native=make_metal_opengl(nullptr,1,1);require(bool(native),unavailable);auto factory=create(Kind::Factory,0,false,ex);factory->native=std::move(native);if(ex)store_pointer(arg(1),factory->root);else result=factory->root;}
         }else {
             const auto dot=symbol.find('.');require(dot!=std::string_view::npos);const auto prefix=symbol.substr(0,dot);symbol.remove_prefix(dot+1);
-            const auto kind=prefix.starts_with("Factory")?Kind::Factory:prefix.starts_with("Device")?Kind::Device:prefix.starts_with("SwapChain")?Kind::SwapChain:prefix=="StateBlock"?Kind::StateBlock:prefix=="VertexShader"?Kind::VertexShader:prefix=="PixelShader"?Kind::PixelShader:prefix=="VertexDeclaration"?Kind::VertexDeclaration:prefix=="Texture"?Kind::Texture:prefix=="CubeTexture"?Kind::CubeTexture:prefix=="VolumeTexture"?Kind::VolumeTexture:prefix=="Volume"?Kind::Volume:prefix=="VertexBuffer"?Kind::VertexBuffer:prefix=="IndexBuffer"?Kind::IndexBuffer:Kind::Surface;auto value=get(arg(0),kind);const bool recording=kind==Kind::Device && value->recording && recordable(symbol);auto& object=recording?*value->recording:*value;
+            const auto kind=prefix.starts_with("Factory")?Kind::Factory:prefix.starts_with("Device")?Kind::Device:prefix.starts_with("SwapChain")?Kind::SwapChain:prefix=="Query"?Kind::Query:prefix=="StateBlock"?Kind::StateBlock:prefix=="VertexShader"?Kind::VertexShader:prefix=="PixelShader"?Kind::PixelShader:prefix=="VertexDeclaration"?Kind::VertexDeclaration:prefix=="Texture"?Kind::Texture:prefix=="CubeTexture"?Kind::CubeTexture:prefix=="VolumeTexture"?Kind::VolumeTexture:prefix=="Volume"?Kind::Volume:prefix=="VertexBuffer"?Kind::VertexBuffer:prefix=="IndexBuffer"?Kind::IndexBuffer:Kind::Surface;auto value=get(arg(0),kind);const bool recording=kind==Kind::Device && value->recording && recordable(symbol);auto& object=recording?*value->recording:*value;
             if(symbol=="QueryInterface"){
                 output(2);Guid requested{};memory.read(GuestAddress{arg(1)},requested);if(!supports(kind,requested,object.ex))result=no_interface;
                 else {hold(value);store_pointer(arg(2),object.root);}
             }else if(symbol=="AddRef")result=hold(value);
             else if(symbol=="Release")result=release(object.root);
+            else if(kind==Kind::Query){
+#include "d3d9_query_handlers.inc"
+            }
             else if(kind==Kind::StateBlock){
                 if(symbol=="GetDevice"){output(1);hold(get(object.parent,Kind::Device));store_pointer(arg(1),object.parent);}
                 else if(symbol=="Capture")capture_state(value,*get(object.parent,Kind::Device));
@@ -441,33 +655,33 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
             }
             else if(kind==Kind::Factory){
                 if(symbol=="GetAdapterModeCountEx" || symbol=="EnumAdapterModesEx"){
-                    require(!u(1) && arg(2));auto filter=read(arg(2),12);const bool valid=word(filter,0)==12 && word(filter,4)==22 && word(filter,8)<=1;
-                    if(symbol=="GetAdapterModeCountEx")result=valid?1:0;else{require(valid && !u(3));display_ex(arg(4),0);}
+                    require(!u(1) && arg(2));auto filter=read(arg(2),12);const bool valid=word(filter,0)==12 && word(filter,4)==22 && word(filter,8)<=2;
+                    auto modes=display_modes();if(word(filter,8))std::erase_if(modes,[&](const auto& mode){return mode.scanline!=word(filter,8);});
+                    if(symbol=="GetAdapterModeCountEx")result=valid?modes.size():0;else{require(valid && u(3)<modes.size());display_ex(arg(4),0,modes[u(3)]);}
                 }else if(symbol=="GetAdapterDisplayModeEx"){require(!u(1));display_ex(arg(2),arg(3));}
                 else if(symbol=="GetAdapterLUID"){require(!u(1) && arg(2));memory.store(GuestAddress{arg(2)},64,0x583634414d544c01ULL);}
                 else if(symbol=="GetAdapterCount")result=1;
-                else if(symbol=="GetAdapterModeCount")result=u(1)==0 && u(2)==22?1:0;
+                else if(symbol=="GetAdapterModeCount")result=u(1)==0 && u(2)==22?display_modes().size():0;
                 else if(symbol=="GetAdapterMonitor")result=u(1)==0?1:0;
                 else if(symbol=="GetAdapterIdentifier"){
                     require(!u(1) && !(u(2)&~2U) && arg(3));std::vector<std::uint8_t> data(x86_?1100:1104);
                     const auto text=[&](unsigned offset,unsigned size,std::string source){source.resize(std::min<std::size_t>(source.size(),size-1));std::copy(source.begin(),source.end(),data.begin()+offset);};
                     text(0,512,"x64arm Metal");text(512,512,object.native->info().renderer);text(1024,32,"\\\\.\\DISPLAY1");put(data,1064,0x106b);std::copy(iidFactory.begin(),iidFactory.end(),data.begin()+1080);memory.write(GuestAddress{arg(3)},data);
                 }else if(symbol=="GetAdapterDisplayMode"){require(!u(1));display(arg(2));}
-                else if(symbol=="EnumAdapterModes"){require(!u(1) && u(2)==22 && !u(3));display(arg(4));}
+                else if(symbol=="EnumAdapterModes"){require(!u(1) && u(2)==22);const auto modes=display_modes();require(u(3)<modes.size());display(arg(4),modes[u(3)]);}
                 else if(symbol=="GetDeviceCaps"){require(!u(1) && (u(2)==1 || u(2)==4) && arg(3));caps(memory,arg(3));memory.store(GuestAddress{arg(3)},32,u(2));}
-                else if(symbol=="CheckDeviceType")require(!u(1) && (u(2)==1 || u(2)==4) && u(3)==22 && (color_format(u(4)) || (!u(4) && u(5))) && u(5),unavailable);
+                else if(symbol=="CheckDeviceType")result=d9_check_type(u(1),u(2),u(3),u(4),u(5));
                 else if(symbol=="CheckDeviceFormat"){
-                    require(!u(1) && (u(2)==1 || u(2)==4) && u(3)==22,unavailable);const auto usage=u(4),type=u(5),format=u(6);require(type==1 || type==3 || type==4 || type==5,unavailable);
-                    if(usage&2)require(type==1 && usage==2 && depth_format(format),unavailable);
-                    else {require(!(usage&~0x1a0201U) && (!(usage&1) || render_color_format(format)),unavailable);(void)native_format(format);if(type==1)require(!(usage&~0x80001U) && render_color_format(format),unavailable);if(type==4)require(usage==0 || usage==0x200,unavailable);}
-                }else if(symbol=="CheckDepthStencilMatch")require(!u(1) && (u(2)==1 || u(2)==4) && u(3)==22 && render_color_format(u(4)) && depth_format(u(5)),unavailable);
+                    if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d9-format] adapter=%u device=%u display=%u usage=%08x type=%u format=%08x\n",u(1),u(2),u(3),u(4),u(5),u(6));
+                    result=d9_check_format(u(1),u(2),u(3),u(4),u(5),u(6));
+                }else if(symbol=="CheckDepthStencilMatch")result=d9_check_depth(u(1),u(2),u(3),u(4),u(5));
                 else if(symbol=="CheckDeviceMultiSampleType"){
-                    if(arg(6))memory.store(GuestAddress{arg(6)},32,0);require(!u(1) && (u(2)==1 || u(2)==4) && u(4) && (!u(5) || (u(5)>=2 && u(5)<=16)),unavailable);const auto format=depth_format(u(3))?depth_format(u(3)):render_color_format(u(3))?native_format(u(3)):0;require(format && object.native->graphics_samples_supported(format,u(5)?u(5):1),unavailable);if(arg(6))memory.store(GuestAddress{arg(6)},32,1);
-                }else if(symbol=="CheckDeviceFormatConversion")require(!u(1) && (u(2)==1 || u(2)==4) && color_format(u(3)) && u(3)==u(4),unavailable);
+                    if(arg(6))memory.store(GuestAddress{arg(6)},32,0);require(!u(1) && (u(2)==1 || u(2)==4) && (!u(5) || (u(5)>=2 && u(5)<=16)),unavailable);const auto format=depth_format(u(3))?depth_format(u(3)):render_color_format(u(3))?native_format(u(3)):0;require(format && object.native->graphics_samples_supported(format,u(5)?u(5):1),unavailable);if(arg(6))memory.store(GuestAddress{arg(6)},32,1);
+                }else if(symbol=="CheckDeviceFormatConversion")result=d9_check_conversion(u(1),u(2),u(3),u(4));
                 else if(symbol=="CreateDevice" || symbol=="CreateDeviceEx"){
-                    const auto out=symbol=="CreateDeviceEx"?7U:6U;output(out);if(out==7)require(!arg(6));const auto processing=u(4)&0xe0U;require(!u(1) && (u(2)==1 || u(2)==4) && (processing==0x20 || processing==0x40 || processing==0x80) && !(u(4)&~0x8e6U),unavailable);require(!arg(3) || gui_.windows.contains(arg(3)));
-                    auto device=create(Kind::Device,object.root,false,object.ex);device->creator=threads_.current;device->focus=arg(3);device->flags=u(4);device->device_type=u(2);device->software_vertex=processing==0x20;
-                    try{device->chain=create(Kind::SwapChain,device->root,true,object.ex)->root;device->back=create(Kind::Surface,device->root,true)->root;setup(*device,arg(5));}
+                    const auto out=symbol=="CreateDeviceEx"?7U:6U;output(out);const auto processing=u(4)&0xe0U;require(!u(1) && (u(2)==1 || u(2)==4) && (processing==0x20 || processing==0x40 || processing==0x80) && !(u(4)&~0x8e6U),unavailable);require(!arg(3) || gui_.windows.contains(arg(3)));
+                    auto device=create(Kind::Device,object.root,false,object.ex);device->creator=threads_.current;device->focus=arg(3);device->flags=u(4);memory.store(GuestAddress{device->root+D9_CONSTANT_FLAGS},32,device->flags&4U);device->device_type=u(2);device->software_vertex=processing==0x20;
+                    try{device->chain=create(Kind::SwapChain,device->root,true,object.ex)->root;device->back=create(Kind::Surface,device->root,true)->root;setup(*device,arg(5),false,out==7?arg(6):0,out==7);}
                     catch(...){release(device->root);throw;}
                     store_pointer(arg(out),device->root);
                 }else if(symbol=="RegisterSoftwareDevice")result=unavailable;
@@ -485,7 +699,7 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                 else if(symbol=="UnlockRect")surface_unlock(object);
                 else if(symbol=="GetContainer"){
                     output(2);auto parent=bridge.objects.at(object.parent);Guid requested{};memory.read(GuestAddress{arg(1)},requested);
-                    if(parent->kind==Kind::Device && object.root==parent->back)parent=get(parent->chain,Kind::SwapChain);
+                    if(parent->kind==Kind::Device && std::find(parent->swap_buffers.begin(),parent->swap_buffers.end(),object.root)!=parent->swap_buffers.end())parent=get(parent->chain,Kind::SwapChain);
                     if(!supports(parent->kind,requested,parent->ex))result=no_interface;
                     else{hold(parent);store_pointer(arg(2),parent->root);}
                 }
@@ -493,10 +707,10 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
             }else if(kind==Kind::SwapChain){
                 auto device=get(object.parent,Kind::Device);
                 if(symbol=="Present")present(*device,arg(1),arg(2),arg(3),arg(4),u(5));
-                else if(symbol=="GetBackBuffer"){output(3);require(!u(1) && !u(2));auto back=get(device->back,Kind::Surface);hold(back);store_pointer(arg(3),back->root);}
+                else if(symbol=="GetBackBuffer"){output(3);require(u(1)<device->swap_buffers.size() && !u(2));auto back=get(device->swap_buffers[u(1)],Kind::Surface);hold(back);store_pointer(arg(3),back->root);}
                 else if(symbol=="GetDevice"){output(1);hold(device);store_pointer(arg(1),device->root);}
-                else if(symbol=="GetDisplayMode")display(arg(1));
-                else if(symbol=="GetDisplayModeEx")display_ex(arg(1),arg(2));
+                else if(symbol=="GetDisplayMode")display(arg(1),device->presentation_mode);
+                else if(symbol=="GetDisplayModeEx")display_ex(arg(1),arg(2),device->presentation_mode);
                 else if(symbol=="GetPresentParameters"){require(arg(1)!=0);memory.write(GuestAddress{arg(1)},device->presentation);}
                 else if(symbol=="GetLastPresentCount"){require(arg(1)!=0);memory.store(GuestAddress{arg(1)},32,static_cast<std::uint32_t>(device->frames));}
                 else throw HostCallFault("尚未實作 Direct3D 9 swap chain 方法："+std::string(symbol));
@@ -551,31 +765,36 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                 }else throw HostCallFault("尚未實作 Direct3D 9 texture 方法："+std::string(symbol));
             }else {
                 if(symbol=="CreateStateBlock"){output(2);require(!object.recording && u(1)>=1 && u(1)<=3);auto block=create(Kind::StateBlock,object.root);block->state_mask=state_mask(object,u(1));capture_state(block,object);store_pointer(arg(2),block->root);}
-                else if(symbol=="BeginStateBlock"){require(!object.recording);auto record=std::make_shared<Object>(object);record->saved.reset();record->state_mask.clear();for(auto pointer:saved_bindings(*record))if(pointer)++bridge.objects.at(pointer)->bound;object.recording=std::move(record);}
-                else if(symbol=="EndStateBlock"){output(1);require(bool(object.recording));auto block=create(Kind::StateBlock,object.root);block->state_mask=object.recording->state_mask;capture_state(block,*object.recording);unbind(*object.recording);object.recording.reset();store_pointer(arg(1),block->root);}
+                else if(symbol=="BeginStateBlock"){require(!object.recording);auto record=std::make_shared<Object>(object);record->saved.reset();record->state_mask.clear();for(auto pointer:saved_bindings(*record))if(pointer)++bridge.objects.at(pointer)->bound;object.recording=std::move(record);memory.store(GuestAddress{object.root+D9_CONSTANT_FLAGS},32,(object.flags&4U)|1U);}
+                else if(symbol=="EndStateBlock"){output(1);require(bool(object.recording));auto block=create(Kind::StateBlock,object.root);block->state_mask=object.recording->state_mask;capture_state(block,*object.recording);unbind(*object.recording);object.recording.reset();memory.store(GuestAddress{object.root+D9_CONSTANT_FLAGS},32,object.flags&4U);store_pointer(arg(1),block->root);}
                 else if(symbol=="TestCooperativeLevel")require(gui_.windows.contains(object.window));
                 else if(symbol=="GetAvailableTextureMem"){const auto stats=gpu_memory_stats();result=std::min<std::uint64_t>(UINT32_MAX,stats.limit-stats.used);}
                 else if(symbol=="GetDirect3D"){output(1);auto factory=get(object.parent,Kind::Factory);hold(factory);store_pointer(arg(1),factory->root);}
+                else if(symbol=="CreateQuery"){
+                    if(arg(2))output(2);const auto type=u(1);require(type>=8 && type<=12,unavailable);
+                    require(type<10 || object.native->graphics_timestamp_supported(),unavailable);
+                    if(arg(2)){auto query=create(Kind::Query,object.root);query->query_type=type;store_pointer(arg(2),query->root);}
+                }
                 else if(symbol=="GetDeviceCaps"){require(arg(1)!=0);caps(memory,arg(1));memory.store(GuestAddress{arg(1)},32,object.device_type);}
-                else if(symbol=="GetDisplayMode"){require(!u(1));display(arg(2));}
+                else if(symbol=="GetDisplayMode"){require(!u(1));display(arg(2),object.presentation_mode);}
                 else if(symbol=="GetCreationParameters"){
                     require(arg(1)!=0);memory.check(GuestAddress{arg(1)},12+ps,Access::Write);memory.store(GuestAddress{arg(1)},32,0);memory.store(GuestAddress{arg(1)+4},32,object.device_type);store_pointer(arg(1)+8,object.focus);memory.store(GuestAddress{arg(1)+8+ps},32,object.flags);
                 }else if(symbol=="GetNumberOfSwapChains")result=1;
                 else if(symbol=="GetSwapChain"){output(2);require(!u(1));auto chain=get(object.chain,Kind::SwapChain);hold(chain);store_pointer(arg(2),chain->root);}
                 else if(symbol=="Reset" || symbol=="ResetEx"){
-                    const bool preserve=symbol=="ResetEx";require(!object.scene && object.creator==threads_.current);if(preserve)require(!arg(2));
+                    const bool preserve=symbol=="ResetEx";require(!object.scene && object.creator==threads_.current);
                     if(!preserve){require(!get(object.back,Kind::Surface)->references && !get(object.chain,Kind::SwapChain)->references && (!object.depth_back || !get(object.depth_back,Kind::Surface)->references));for(const auto& [address,entry]:bridge.objects){(void)address;require(!resource(entry->kind) || entry->parent!=object.root || entry->pool!=0 || !entry->references);}}
-                    setup(object,arg(1),preserve);for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(1)+4*i},32,0);
+                    setup(object,arg(1),preserve,preserve?arg(2):0,preserve);for(unsigned i=0;i<4;++i)if(i!=2 || !object.fullscreen)memory.store(GuestAddress{arg(1)+4*i},32,0);
                 }else if(symbol=="Present" || symbol=="PresentEx")present(object,arg(1),arg(2),arg(3),arg(4),symbol=="PresentEx"?u(5):0);
-                else if(symbol=="GetDisplayModeEx"){require(!u(1));display_ex(arg(2),arg(3));}
+                else if(symbol=="GetDisplayModeEx"){require(!u(1));display_ex(arg(2),arg(3),object.presentation_mode);}
                 else if(symbol=="CheckDeviceState"){require(gui_.windows.contains(arg(1)));result=gui_.windows.at(arg(1)).visible?0:0x08760878U;}
                 else if(symbol=="SetMaximumFrameLatency"){require(u(1)<=20);object.latency=u(1)?u(1):3;} // 同步 Present 目前至多一個待完成 frame，符合此上限。
                 else if(symbol=="GetMaximumFrameLatency"){require(arg(1)!=0);memory.store(GuestAddress{arg(1)},32,object.latency);}
                 else if(symbol=="GetBackBuffer" || symbol=="GetRenderTarget" || symbol=="GetDepthStencilSurface"){
-                    const bool backbuffer=symbol=="GetBackBuffer",depth=symbol=="GetDepthStencilSurface";const unsigned dest=backbuffer?4:depth?1:2;output(dest);require(depth || (backbuffer?(!u(1) && !u(2) && !u(3)):u(1)<4));const auto address=depth?object.depth_target:backbuffer?object.back:object.render_targets[u(1)];require(address!=0,0x88760866U);auto surface=get(address,Kind::Surface);hold(surface);store_pointer(arg(dest),address);
+                    const bool backbuffer=symbol=="GetBackBuffer",depth=symbol=="GetDepthStencilSurface";const unsigned dest=backbuffer?4:depth?1:2;output(dest);require(depth || (backbuffer?(!u(1) && u(2)<object.swap_buffers.size() && !u(3)):u(1)<4));const auto address=depth?object.depth_target:backbuffer?object.swap_buffers[u(2)]:object.render_targets[u(1)];require(address!=0,0x88760866U);auto surface=get(address,Kind::Surface);hold(surface);store_pointer(arg(dest),address);
                 }else if(symbol=="SetRenderTarget" || symbol=="SetDepthStencilSurface"){
                     const bool depth=symbol=="SetDepthStencilSurface";const auto address=arg(depth?1:2);require(depth || (u(1)<4 && (u(1) || address)));if(address){auto surface=get(address,Kind::Surface);require(surface_device(*surface)->root==object.root && (surface->usage&(depth?2U:1U)) && surface->native_view.resource && !surface->mapped);}
-                    bind_target(depth?object.depth_target:object.render_targets[u(1)],address);if(!depth && address){auto surface=get(address,Kind::Surface);object.viewport={0,0,surface->width,surface->height,bits(0),bits(1)};}
+                    bind_target(depth?object.depth_target:object.render_targets[u(1)],address);if(!depth && address){auto surface=get(address,Kind::Surface);object.viewport={0,0,surface->width,surface->height,bits(0),bits(1)};object.scissor={0,0,static_cast<std::int32_t>(surface->width),static_cast<std::int32_t>(surface->height)};}
                 }else if(symbol=="CreateRenderTarget" || symbol=="CreateDepthStencilSurface"){
                     output(7);const bool depth=symbol=="CreateDepthStencilSurface";const auto format=depth?depth_format(u(3)):render_color_format(u(3))?native_format(u(3)):0;require(u(1) && u(2) && u(1)<=16384 && u(2)<=16384 && format && !u(5) && u(6)<=1 && !arg(8));require(u(4)==0 || (u(4)>=2 && u(4)<=16));require(depth || !u(6) || !u(4));const auto samples=u(4)?u(4):1;require(object.native->graphics_samples_supported(format,samples),unavailable);
                     auto surface=create(Kind::Surface,object.root);try{surface->width=u(1);surface->height=u(2);surface->format=u(3);surface->usage=depth?2:1;surface->pool=0;surface->multisample=u(4);surface->lockable=!depth && u(6);GraphicsResourceDesc desc;desc.dimension=3;desc.width=u(1);desc.height=u(2);desc.format=format;desc.samples=samples;desc.bind=depth?0x40:0x20;surface->native_view={object.native->graphics_resource(desc),format};}catch(...){release(surface->root);throw;}store_pointer(arg(7),surface->root);
@@ -616,7 +835,7 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                 }else if(symbol=="SetSamplerState" || symbol=="GetSamplerState" || symbol=="SetTextureStageState" || symbol=="GetTextureStageState"){
                     const bool sampler=symbol.find("Sampler")!=std::string_view::npos,write=symbol.starts_with("Set");const auto slot=sampler?texture_slot(u(1)):u(1);require(sampler || slot<8);auto& values=sampler?object.sampler:object.stage;const auto state_key=u(2)+slot*32;require(values.contains(state_key));
                     if(!write){require(arg(3)!=0);memory.store(GuestAddress{arg(3)},32,values.at(state_key));}
-                    else{const auto key=u(2),v=u(3);bool valid=false;if(sampler){if(key==1 || key==2 || key==3)valid=v==1 || v==3;else if(key==7)valid=v<=2;else if(key==10)valid=v>=1 && v<=16;else valid=v>=1 && v<=3;}
+                    else{const auto key=u(2),v=u(3);bool valid=false;if(sampler){if(key==1 || key==2 || key==3)valid=v>=1 && v<=3;else if(key==7)valid=v<=2;else if(key==8)valid=std::isfinite(real(v));else if(key==9)valid=true;else if(key==11)valid=v<=1;else if(key==10)valid=v>=1 && v<=16;else valid=v>=1 && v<=3;}
                         else if(u(1))valid=(key==1 || key==4) && v==1;else if(key==1)valid=v>=1 && v<=4;else if(key==4)valid=v>=1 && v<=4;else if(key==28)valid=v==1;else valid=(v&15)<=3 && !(v&~0x3fU);
                         require(valid,unavailable);values[state_key]=v;}
                 }else if(symbol=="CreateOffscreenPlainSurface"){
@@ -625,24 +844,26 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
 
 #include "d3d9_surface_transfer.inc"
                 }else if(symbol=="GetRenderTargetData"){
-                    auto source=get(arg(1),Kind::Surface),target=get(arg(2),Kind::Surface);auto owner=bridge.objects.at(target->parent);if(owner->kind==Kind::Texture)owner=get(owner->parent,Kind::Device);require(surface_device(*source)->root==object.root && (source->usage&1) && !source->multisample && owner->root==object.root && target->pool==2 && !target->mapped && source->width==target->width && source->height==target->height && source->format==target->format);target->pixels=object.native->graphics_read(source->native_view);if(source->format==22)for(std::size_t i=3;i<target->pixels.size();i+=4)target->pixels[i]=255;
+                    auto source=get(arg(1),Kind::Surface),target=get(arg(2),Kind::Surface);auto owner=bridge.objects.at(target->parent);if(owner->kind==Kind::Texture)owner=get(owner->parent,Kind::Device);require(surface_device(*source)->root==object.root && (source->usage&1) && !source->multisample && owner->root==object.root && target->pool==2 && !target->mapped && source->width==target->width && source->height==target->height && source->format==target->format);target->pixels=object.native->graphics_read(source->native_view);if(source->format==22)for(std::size_t i=3;i<target->pixels.size();i+=4)target->pixels[i]=255;surface_changed(*target);
                 }else if(symbol=="BeginScene"){require(!object.scene);object.scene=true;}
                 else if(symbol=="EndScene"){require(object.scene);object.scene=false;call(object,GlOperation::Flush);check_gpu(object);}
                 else if(symbol=="Clear"){
-                    require(u(3) && !(u(3)&~7U) && (!(u(3)&6) || object.depth_target));if(u(3)&4)require(get(object.depth_target,Kind::Surface)->format==75);fixed_targets(object);const auto size=target_size(object);const auto z=real(u(5));require(std::isfinite(z) && z>=0 && z<=1);require(!u(1) || (arg(2) && u(1)<=65536));
+                    require(u(3) && !(u(3)&~7U) && (!(u(3)&6) || object.depth_target));if(u(3)&4){const auto format=get(object.depth_target,Kind::Surface)->format;require(format==75 || format==0x5a544e49U);}fixed_targets(object);const auto size=target_size(object);const auto z=real(u(5));require(std::isfinite(z) && z>=0 && z<=1);require(!u(1) || (arg(2) && u(1)<=65536));
                     std::vector<std::array<std::int32_t,4>> rects;const auto& v=object.viewport;
                     const std::array<std::int32_t,4> viewport{static_cast<std::int32_t>(v[0]),static_cast<std::int32_t>(v[1]),static_cast<std::int32_t>(v[0]+v[2]),static_cast<std::int32_t>(v[1]+v[3])};
+                    auto bounds=viewport;bounds[2]=std::min(bounds[2],static_cast<std::int32_t>(size[0]));bounds[3]=std::min(bounds[3],static_cast<std::int32_t>(size[1]));
+                    if(object.render.at(174)){bounds[0]=std::max(bounds[0],object.scissor[0]);bounds[1]=std::max(bounds[1],object.scissor[1]);bounds[2]=std::min(bounds[2],object.scissor[2]);bounds[3]=std::min(bounds[3],object.scissor[3]);}
                     if(u(1)){auto bytes=read(arg(2),std::size_t{u(1)}*16);rects.resize(u(1));std::memcpy(rects.data(),bytes.data(),bytes.size());for(const auto& r:rects)require(r[2]>=r[0] && r[3]>=r[1]);}else rects.push_back(viewport);
-                    auto rgba=color(u(4));call(object,GlOperation::ClearColor,{bits(rgba[0]),bits(rgba[1]),bits(rgba[2]),bits(rgba[3])});call(object,GlOperation::ClearDepth,{std::bit_cast<std::uint64_t>(static_cast<double>(z))});call(object,GlOperation::DepthMask,{1});call(object,GlOperation::ClearStencil,{u(6)});toggle(object,0xc11,true);
-                    for(auto r:rects){r[0]=std::max(r[0],viewport[0]);r[1]=std::max(r[1],viewport[1]);r[2]=std::min(r[2],viewport[2]);r[3]=std::min(r[3],viewport[3]);if(r[2]<=r[0] || r[3]<=r[1])continue;
+                    call(object,GlOperation::ColorMask,{1,1,1,1});auto rgba=color(u(4));call(object,GlOperation::ClearColor,{bits(rgba[0]),bits(rgba[1]),bits(rgba[2]),bits(rgba[3])});call(object,GlOperation::ClearDepth,{std::bit_cast<std::uint64_t>(static_cast<double>(z))});call(object,GlOperation::DepthMask,{1});call(object,GlOperation::ClearStencil,{u(6)});toggle(object,0xc11,true);
+                    for(auto r:rects){r[0]=std::max(r[0],bounds[0]);r[1]=std::max(r[1],bounds[1]);r[2]=std::min(r[2],bounds[2]);r[3]=std::min(r[3],bounds[3]);if(r[2]<=r[0] || r[3]<=r[1])continue;
                         call(object,GlOperation::Scissor,{static_cast<unsigned>(r[0]),size[1]-static_cast<unsigned>(r[3]),static_cast<unsigned>(r[2]-r[0]),static_cast<unsigned>(r[3]-r[1])});call(object,GlOperation::Clear,{((u(3)&1)?0x4000U:0U)|((u(3)&2)?0x100U:0U)|((u(3)&4)?0x400U:0U)});if(u(3)&1)for(unsigned slot=1;slot<4;++slot)if(object.render_targets[slot]){auto target=get(object.render_targets[slot],Kind::Surface);object.native->graphics_fixed_targets(target->native_view,{});call(object,GlOperation::Clear,{0x4000});}fixed_targets(object);}
                     check_gpu(object);
                 }else if(symbol=="SetViewport" || symbol=="GetViewport"){
                     require(arg(1)!=0);if(symbol=="GetViewport")memory.write(GuestAddress{arg(1)},std::span(reinterpret_cast<const std::uint8_t*>(object.viewport.data()),24));
-                    else{auto data=read(arg(1),24);std::array<std::uint32_t,6> v{};std::memcpy(v.data(),data.data(),24);require(v[2] && v[3] && std::uint64_t{v[0]}+v[2]<=target_size(object)[0] && std::uint64_t{v[1]}+v[3]<=target_size(object)[1] && std::isfinite(real(v[4])) && std::isfinite(real(v[5])) && real(v[4])>=0 && real(v[5])<=1 && real(v[4])<=real(v[5]));object.viewport=v;}
+                    else{auto data=read(arg(1),24);std::array<std::uint32_t,6> v{};std::memcpy(v.data(),data.data(),24);const auto size=target_size(*value);require(v[2] && v[3] && std::uint64_t{v[0]}+v[2]<=size[0] && std::uint64_t{v[1]}+v[3]<=size[1] && std::isfinite(real(v[4])) && std::isfinite(real(v[5])) && real(v[4])>=0 && real(v[5])<=1 && real(v[4])<=real(v[5]));object.viewport=v;}
                 }else if(symbol=="SetScissorRect" || symbol=="GetScissorRect"){
                     require(arg(1)!=0);if(symbol=="GetScissorRect")memory.write(GuestAddress{arg(1)},std::span(reinterpret_cast<const std::uint8_t*>(object.scissor.data()),16));
-                    else{auto data=read(arg(1),16);std::array<std::int32_t,4> r{};std::memcpy(r.data(),data.data(),16);require(r[0]>=0 && r[1]>=0 && r[2]>r[0] && r[3]>r[1] && static_cast<unsigned>(r[2])<=target_size(object)[0] && static_cast<unsigned>(r[3])<=target_size(object)[1]);object.scissor=r;}
+                    else{auto data=read(arg(1),16);std::array<std::int32_t,4> r{};std::memcpy(r.data(),data.data(),16);const auto size=target_size(*value);const bool valid=r[0]>=0 && r[1]>=0 && r[2]>r[0] && r[3]>r[1] && static_cast<unsigned>(r[2])<=size[0] && static_cast<unsigned>(r[3])<=size[1];if(!valid && std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d9-scissor] rect=%d,%d,%d,%d target=%ux%u\n",r[0],r[1],r[2],r[3],size[0],size[1]);require(valid);object.scissor=r;}
                 }else if(symbol=="SetTransform" || symbol=="GetTransform" || symbol=="MultiplyTransform"){
                     require(arg(2) && (u(1)==2 || u(1)==3 || (u(1)>=16 && u(1)<24) || (u(1)>=256 && u(1)<512)));auto& matrix=object.transforms.try_emplace(u(1),identity()).first->second;
                     if(symbol=="GetTransform")memory.write(GuestAddress{arg(2)},std::span(reinterpret_cast<const std::uint8_t*>(matrix.data()),64));
@@ -652,7 +873,7 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                 }else if(symbol=="SetRenderState" || symbol=="GetRenderState"){
                     // DITHERENABLE 影響 16-bit 表面；目前 32-bit target 保留可查詢／state block 還原的值，不改變色彩。
                     require(object.render.contains(u(1)));if(symbol=="GetRenderState"){require(arg(2)!=0);memory.store(GuestAddress{arg(2)},32,object.render.at(u(1)));}
-                    else{const auto key=u(1),v=u(2);bool valid=false;switch(key){case 7:valid=v<=1;break;case 8:valid=v==3;break;case 9:valid=v==1 || v==2;break;case 14:case 15:case 26:case 27:case 174:case 52:case 185:valid=v<=1;break;case 19:case 20:valid=v>=1 && v<=11;break;case 22:valid=v>=1 && v<=3;break;case 23:case 25:case 53:case 54:case 55:case 56:case 186:case 187:case 188:case 189:valid=v>=1 && v<=8;break;case 24:valid=v<=255;break;case 28:case 48:case 128:case 129:case 130:case 131:case 132:case 133:case 134:case 135:case 152:case 176:case 206:valid=v==0;break;case 151:valid=v<=3 || v==256;break;case 167:case 29:case 137:case 141:case 142:case 143:valid=v<=1;break;case 60:case 139:case 57:case 58:case 59:valid=true;break;case 145:case 146:case 147:case 148:valid=v<=2;break;case 168:valid=v==15;break;case 136:case 171:valid=v==1;break;}require(valid,unavailable);object.render[key]=v;}
+                    else{const auto key=u(1),v=u(2);bool valid=false;switch(key){case 7:valid=v<=1;break;case 8:valid=v==3;break;case 9:valid=v==1 || v==2;break;case 14:case 15:case 26:case 27:case 174:case 52:case 185:valid=v<=1;break;case 19:case 20:case 207:case 208:valid=v>=1 && v<=11;break;case 22:valid=v>=1 && v<=3;break;case 23:case 25:case 53:case 54:case 55:case 56:case 186:case 187:case 188:case 189:valid=v>=1 && v<=8;break;case 24:valid=v<=255;break;case 28:case 48:case 128:case 129:case 130:case 131:case 132:case 133:case 134:case 135:case 152:case 176:valid=v==0;break;case 151:valid=v<=3 || v==256;break;case 167:case 29:case 137:case 141:case 142:case 143:valid=v<=1;break;case 60:case 139:case 57:case 58:case 59:valid=true;break;case 145:case 146:case 147:case 148:valid=v<=2;break;case 168:valid=v<=15;break;case 171:case 209:valid=v>=1 && v<=5;break;case 194:case 206:valid=v<=1;break;case 136:valid=v==1;break;}require(valid,unavailable);object.render[key]=v;}
                 }else if(symbol=="SetFVF"){
                     if(u(1)){auto data=fvf_decl(u(1));auto decl=create(Kind::VertexDeclaration,object.root);decl->pixels=std::move(data);++decl->bound;drop_binding(object.vertex_declaration);object.vertex_declaration=decl->root;release(decl->root);object.fvf=u(1);}
                 }else if(symbol=="GetFVF"){require(arg(1)!=0);memory.store(GuestAddress{arg(1)},32,object.fvf);}
@@ -668,13 +889,15 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                 }else if(symbol=="GetVertexShader" || symbol=="GetPixelShader" || symbol=="GetVertexDeclaration"){
                     output(1);const auto pointer=symbol=="GetVertexDeclaration"?object.vertex_declaration:object.shaders[symbol=="GetPixelShader"?1:0];if(pointer){hold(bridge.objects.at(pointer));store_pointer(arg(1),pointer);}
                 }else if(symbol.starts_with("SetVertexShaderConstant") || symbol.starts_with("SetPixelShaderConstant") || symbol.starts_with("GetVertexShaderConstant") || symbol.starts_with("GetPixelShaderConstant")){
-                    const bool pixel=symbol.find("Pixel")!=symbol.npos,write=symbol.starts_with("Set");const auto register_set=symbol.back()=='F'?0U:symbol.back()=='I'?1U:2U;const unsigned limit=register_set?16U:pixel?224U:256U,stride=register_set==2?4U:16U;require(u(1)<=limit && u(3)<=limit-u(1));auto& values=object.constants[pixel?1:0][register_set];if(values.empty())values.resize(limit*stride);if(u(3)){const auto offset=u(1)*stride,size=u(3)*stride;if(write){auto data=read(arg(2),size);std::copy(data.begin(),data.end(),values.begin()+offset);if(std::getenv("X64ARM_TRACE_D3D9_CONSTANTS")){std::fprintf(stderr,"[d3d9 constants] %s set=%u first=%u count=%u",pixel?"PS":"VS",register_set,u(1),u(3));for(unsigned at=0;at<size;at+=4)std::fprintf(stderr," %08x",word(data,at));std::fprintf(stderr,"\n");}}else memory.write(GuestAddress{arg(2)},std::span(values).subspan(offset,size));}
+                    const bool pixel=symbol.find("Pixel")!=symbol.npos,write=symbol.starts_with("Set");const auto register_set=symbol.back()=='F'?0U:symbol.back()=='I'?1U:2U;const unsigned stage=pixel?1U:0U,limit=d9_constant_limit(stage,register_set),stride=d9_constant_stride(register_set);require(u(1)<=limit && u(3)<=limit-u(1));if(u(3)){const auto offset=u(1)*stride,size=u(3)*stride;if(write){auto data=read(arg(2),size);set_constants(*value,stage,register_set,u(1),data);if(std::getenv("X64ARM_TRACE_D3D9_CONSTANTS")){std::fprintf(stderr,"[d3d9 constants] %s set=%u first=%u count=%u",pixel?"PS":"VS",register_set,u(1),u(3));for(unsigned at=0;at<size;at+=4)std::fprintf(stderr," %08x",word(data,at));std::fprintf(stderr,"\n");}}else memory.write(GuestAddress{arg(2)},object.constants.read(stage,register_set,offset,size));}
                 }
                 else if(symbol=="DrawPrimitiveUP" || symbol=="DrawIndexedPrimitiveUP" || symbol=="DrawPrimitive" || symbol=="DrawIndexedPrimitive"){
+                    // scene 配對仍由 BeginScene／EndScene 驗證；一般 D3D9 執行環境也接受
+                    // 配對區段外的 Draw，離屏貼圖合成不應因此被丟棄。四種入口共用此契約。
                     const bool up=symbol.ends_with("UP"),indexed=symbol.find("Indexed")!=std::string_view::npos,rhw=(object.fvf&0xe)==4;
                     const auto type=u(1),primitives=up?u(indexed?4:2):u(indexed?6:3),stride=up?u(indexed?8:4):object.stream_stride;
                     if(object.device_type==4){
-                        require(object.scene && type>=1 && type<=6 && (!indexed || type!=1) && primitives<=349525);
+                        require(type>=1 && type<=6 && (!indexed || type!=1) && primitives<=349525);
                         if(up){drop_binding(object.vertex_buffer);object.stream_offset=object.stream_stride=0;if(indexed)drop_binding(object.index_buffer);}
                         ++object.draws;arg.return_to(state,0);return std::nullopt;
                     }
@@ -684,7 +907,7 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                     }
                     require(!object.shaders[1],unavailable);
                     const auto position_format=object.fvf&0x400e;const bool blended_fvf=position_format>=6 && position_format<=14;
-                    require(object.scene && object.fvf && type>=1 && type<=6 && (!indexed || type!=1) && (position_format==2 || blended_fvf || rhw));require(primitives<=349525);
+                    require(object.fvf && type>=1 && type<=6 && (!indexed || type!=1) && (position_format==2 || blended_fvf || rhw));require(primitives<=349525);
                     const auto clear_up=[&](){if(up){drop_binding(object.vertex_buffer);object.stream_offset=object.stream_stride=0;if(indexed)drop_binding(object.index_buffer);}};
                     if(!primitives){clear_up();arg.return_to(state,0);return std::nullopt;}
                     const std::uint32_t count=type==1?primitives:type==2?primitives*2:type==3?primitives+1:type==4?primitives*3:primitives+2;
@@ -741,7 +964,10 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                     const bool two_sided=object.render.at(185) && type>=4;object.native->graphics_fixed_stencil({object.render.at(52),object.render.at(57),object.render.at(58),object.render.at(59),object.render.at(56),object.render.at(53),object.render.at(54),object.render.at(55),object.render.at(two_sided?189:56),object.render.at(two_sided?186:53),object.render.at(two_sided?187:54),object.render.at(two_sided?188:55)});
                     call(object,GlOperation::DepthRange,{std::bit_cast<std::uint64_t>(rhw?0.:static_cast<double>(real(v[4]))),std::bit_cast<std::uint64_t>(rhw?1.:static_cast<double>(real(v[5])))});call(object,GlOperation::Viewport,{v[0],target_dimensions[1]-v[1]-v[3],v[2],v[3]});toggle(object,0xb71,object.render.at(7));call(object,GlOperation::DepthFunc,{0x1ff+object.render.at(23)});call(object,GlOperation::DepthMask,{object.render.at(14)});
                     toggle(object,0xb60,object.render.at(28));toggle(object,0xbc0,object.render.at(15));call(object,GlOperation::AlphaFunc,{0x1ff+object.render.at(25),bits(static_cast<float>(object.render.at(24))/255)});
-                    toggle(object,0xbe2,object.render.at(27));const std::array<unsigned,11> blend{0,1,0x300,0x301,0x302,0x303,0x304,0x305,0x306,0x307,0x308};call(object,GlOperation::BlendFunc,{blend[object.render.at(19)-1],blend[object.render.at(20)-1]});
+                    toggle(object,0xbe2,object.render.at(27));const std::array<unsigned,11> blend{0,1,0x300,0x301,0x302,0x303,0x304,0x305,0x306,0x307,0x308};const bool separate_alpha=object.render.at(206)!=0;
+                    call(object,GlOperation::BlendFuncSeparate,{blend[object.render.at(19)-1],blend[object.render.at(20)-1],blend[object.render.at(separate_alpha?207:19)-1],blend[object.render.at(separate_alpha?208:20)-1]});
+                    const std::array<unsigned,5> equations{0x8006,0x800a,0x800b,0x8007,0x8008};call(object,GlOperation::BlendEquationSeparate,{equations[object.render.at(171)-1],equations[object.render.at(separate_alpha?209:171)-1]});
+                    const auto mask=object.render.at(168);call(object,GlOperation::ColorMask,{mask&1,mask&2,mask&4,mask&8});
                     toggle(object,0xb44,object.render.at(22)!=1);call(object,GlOperation::FrontFace,{0x900});call(object,GlOperation::CullFace,{object.render.at(22)==2?0x404U:0x405U});
                     toggle(object,0xc11,object.render.at(174));const auto& r=object.scissor;call(object,GlOperation::Scissor,{static_cast<unsigned>(r[0]),target_dimensions[1]-static_cast<unsigned>(r[3]),static_cast<unsigned>(r[2]-r[0]),static_cast<unsigned>(r[3]-r[1])});
                     const bool textured=object.texture && object.stage.at(1)!=1;toggle(object,0xde1,textured);
@@ -749,21 +975,27 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                     const auto uses_texture=[&](unsigned op,unsigned first,unsigned second){return ((op==2 || op==4) && (first&15U)==2) || ((op==3 || op==4) && (second&15U)==2);};
                     const bool combine=object.stage.at(1)!=1 && (textured || !uses_texture(object.stage.at(1),object.stage.at(2),object.stage.at(3)));
                     call(object,GlOperation::TextureCombine,{object.stage.at(1)==1?2U:object.stage.at(1),object.stage.at(4)==1?3U:object.stage.at(4),0x80000000U|object.stage.at(2)|(object.stage.at(3)<<6)|(object.stage.at(5)<<12)|((object.stage.at(4)==1?1U:object.stage.at(6))<<18),combine?1U:0U});
-                    if(textured){upload(object,*get(object.texture,Kind::Texture));
-                        call(object,GlOperation::TexParameteri,{0xde1,0x2802,object.sampler.at(1)==1?0x2901U:0x812fU});call(object,GlOperation::TexParameteri,{0xde1,0x2803,object.sampler.at(2)==1?0x2901U:0x812fU});
+                    if(textured){auto texture=get(object.texture,Kind::Texture);upload(object,*texture);
+                        const bool configured=object.native->graphics_fixed_sampler(object.native->graphics_sampler(sampler_desc(object,0,texture->lod,texture->levels)));
+                        require(configured || (!object.sampler.at(8) && !object.sampler.at(9)),unavailable);
+                        call(object,GlOperation::TexParameteri,{0xde1,0x2802,object.sampler.at(1)==1?0x2901U:object.sampler.at(1)==2?0x8370U:0x812fU});call(object,GlOperation::TexParameteri,{0xde1,0x2803,object.sampler.at(2)==1?0x2901U:object.sampler.at(2)==2?0x8370U:0x812fU});
                         call(object,GlOperation::TexParameteri,{0xde1,0x84fe,(object.sampler.at(5)==3 || object.sampler.at(6)==3)?object.sampler.at(10):1U});
                         const auto mip=object.sampler.at(7),linear=object.sampler.at(6)>=2?1U:0U;call(object,GlOperation::TexParameteri,{0xde1,0x2801,mip?0x2700U+(mip==2?2U:0U)+linear:0x2600U+linear});call(object,GlOperation::TexParameteri,{0xde1,0x2800,object.sampler.at(5)==1?0x2600U:0x2601U});check_gpu(object);}
+                    const auto visibility=visibility_slot(object);object.native->graphics_fixed_visibility(visibility.buffer,visibility.offset);
+                    struct VisibilityReset {NativeGraphics& native;~VisibilityReset(){native.graphics_fixed_visibility({},0);}} visibility_reset{*object.native};
                     if(gpu_vertices)object.native->graphics_fixed_draw({packed,indexed?std::span<const std::uint32_t>(packed_indices):std::span<const std::uint32_t>{},{drawing_world,object.transforms.at(2),object.transforms.at(3)},{static_cast<float>(v[2]),static_cast<float>(v[3])},drawing_type});
                     else {
                     const std::array<unsigned,6> modes{0,1,3,4,5,6};call(object,GlOperation::Begin,{modes[drawing_type-1]});
                     for(const auto& entry:packed){call(object,GlOperation::TexCoord4fv,{},std::span(reinterpret_cast<const std::uint8_t*>(entry.texcoord.data()),16));call(object,GlOperation::Color4fv,{},std::span(reinterpret_cast<const std::uint8_t*>(entry.color.data()),16));call(object,GlOperation::Vertex4fv,{},std::span(reinterpret_cast<const std::uint8_t*>(entry.position.data()),16));}
                     call(object,GlOperation::End);}
-                    check_gpu(object);++object.draws;clear_up();
+                    check_gpu(object);
+#include "d3d9_fixed_capture.inc"
+                    ++object.draws;clear_up();
                 }else throw HostCallFault("尚未實作 Direct3D 9 device 方法："+std::string(symbol));
                 if(recording)record_state(object,symbol,u(1),u(2),u(3));
             }
         }
-    }catch(const Failure& error){result=(service.symbol=="Direct3DCreate9" || service.symbol=="FactoryEx.GetAdapterModeCountEx")?0:error.value;if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d9] %s HRESULT=%08x (%s:%u)\n",std::string(service.symbol).c_str(),error.value,error.where.file_name(),error.where.line());}
+    }catch(const Failure& error){result=(service.symbol=="Direct3DCreate9" || service.symbol=="FactoryEx.GetAdapterModeCountEx")?0:error.value;if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d9] %s HRESULT=%08x arg1=%llx arg2=%llx arg3=%llx (%s:%u)\n",std::string(service.symbol).c_str(),error.value,static_cast<unsigned long long>(arg(1)),static_cast<unsigned long long>(arg(2)),static_cast<unsigned long long>(arg(3)),error.where.file_name(),error.where.line());}
     catch(const texture_image::Error& error){result=error.hresult;if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d9] %s: %s\n",std::string(service.symbol).c_str(),error.what());}
     catch(const std::bad_alloc&){result=service.symbol=="Direct3DCreate9"?0:out_of_memory;}
     catch(const std::invalid_argument& error){result=invalid;if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d9] %s: %s\n",std::string(service.symbol).c_str(),error.what());}
@@ -772,7 +1004,11 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
     for(auto it=bridge.fill_operations.begin();it!=bridge.fill_operations.end();)if(it->second.thread==threads_.current && it->second.stack==state.reg(Gpr::Rsp) && it->second.service.symbol==service.symbol){if(it->second.temporary)(void)free_heap(memory,it->second.temporary,state);it=bridge.fill_operations.erase(it);}else ++it;
     for(auto it=bridge.hierarchy_operations.begin();it!=bridge.hierarchy_operations.end();)if(it->second.thread==threads_.current && it->second.stack==state.reg(Gpr::Rsp) && it->second.service.symbol==service.symbol){for(auto pointer:it->second.owned)release(pointer);for(auto pointer:it->second.temporaries)(void)free_heap(memory,pointer,state);it=bridge.hierarchy_operations.erase(it);}else ++it;
     for(auto it=bridge.atlas_operations.begin();it!=bridge.atlas_operations.end();)if(it->second.thread==threads_.current && it->second.stack==state.reg(Gpr::Rsp) && it->second.service.symbol==service.symbol)it=bridge.atlas_operations.erase(it);else ++it;
-    if(!private_callbacks.empty()){start_callbacks(state,memory,std::move(private_callbacks),Continuation::Return,result);return std::nullopt;}
+    if(!private_callbacks.empty()){
+        // 本地資格只收不建立私有資料、不銷毀物件的方法（銷毀已延後），此處不應有回呼。
+        if(d3d9_local_call_)throw std::logic_error("D3D9 協調者本地服務不得啟動客體回呼");
+        start_callbacks(state,memory,std::move(private_callbacks),Continuation::Return,result);return std::nullopt;
+    }
     arg.return_to(state,result);return std::nullopt;
 }
 }

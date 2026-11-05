@@ -22,7 +22,7 @@ cmake --preset release -DAPPLEJUICE_KERNEL_ROOT=vendor/x64kernel
 
 ## 執行後端與快取
 
-`--backend jit` 是 resident AOT 的相容名稱；Launcher、CLI、預編譯及效能量測均使用 resident AOT。舊 JIT／LLVM 執行後端已封閉，只保留原始碼參考。`X64ARM_JIT_MODULE_AOT=0` 或要求啟用舊 LLVM 的設定會明確報錯；`=1` 仍可使用。`--backend interpreter` 保留直譯器。
+`--backend jit` 是 resident AOT 的相容名稱；Launcher、CLI、預編譯及效能量測均使用 resident AOT。舊 JIT／LLVM 執行後端已移除。`X64ARM_JIT_MODULE_AOT=0` 或要求啟用舊 LLVM 的設定會明確報錯；`=1` 仍可使用。`--backend interpreter` 保留直譯器。
 
 正常 resident AOT 搭配宿主時計時，未指定 `--max-instructions` 時預設沒有指令配額或時間片。明確指定有限 `--max-instructions` 時使用獨立觀察模式；其他執行模式仍保留既有指令配額。這些設定不改變 `--memory-limit-mib` 的記憶體上限。
 

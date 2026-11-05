@@ -786,18 +786,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,Gu
     }
     if(service.symbol.starts_with("Interlocked")){
         const bool pointer=service.symbol.ends_with("Pointer");const unsigned unit=pointer && !x86_?8U:4U;
-        memory.check(GuestAddress{call(0)},unit,Access::Read);memory.check(GuestAddress{call(0)},unit,Access::Write);
-        auto* data=memory.native_pointer(GuestAddress{call(0)},unit,read_write);
-        if(!data || call(0)%unit)throw HostCallFault("Interlocked 需要自然對齊且連續的客體記憶體");
-        const auto exchange=[&]<class T>(T* location){
-            std::atomic_ref<T> value(*location);const auto symbol=service.symbol;
-            if(symbol=="InterlockedIncrement")return static_cast<std::uint64_t>(value.fetch_add(1)+T{1});
-            if(symbol=="InterlockedDecrement")return static_cast<std::uint64_t>(value.fetch_sub(1)-T{1});
-            if(symbol=="InterlockedExchangeAdd")return static_cast<std::uint64_t>(value.fetch_add(static_cast<T>(call(1))));
-            if(symbol.find("CompareExchange")!=symbol.npos){auto expected=static_cast<T>(call(2));value.compare_exchange_strong(expected,static_cast<T>(call(1)));return static_cast<std::uint64_t>(expected);}
-            return static_cast<std::uint64_t>(value.exchange(static_cast<T>(call(1))));
+        const auto symbol=service.symbol;const auto bits=static_cast<std::uint8_t>(unit*8);
+        const auto mask=unit==8?UINT64_MAX:UINT64_C(0xffffffff);std::uint64_t result=0;
+        // 常用路徑仍走客體 LOCK 指令的 resident AOT。此宿主慢路徑由協調者
+        // 停止其他客體 worker 後呼叫，沿用 SDK 的跨頁／未對齊原子記憶體契約。
+        const auto operation=[&](GuestMemory::AtomicRmw op,std::uint64_t value,std::uint64_t expected=0){
+            return memory.atomic_rmw(GuestAddress{call(0)},bits,op,value,expected);
         };
-        const auto result=unit==8?exchange(static_cast<std::uint64_t*>(data)):exchange(static_cast<std::uint32_t*>(data));
+        if(symbol=="InterlockedIncrement")result=(operation(GuestMemory::AtomicRmw::Add,1)+1)&mask;
+        else if(symbol=="InterlockedDecrement")result=(operation(GuestMemory::AtomicRmw::Add,mask)-1)&mask;
+        else if(symbol=="InterlockedExchangeAdd")result=operation(GuestMemory::AtomicRmw::Add,call(1));
+        else if(symbol.find("CompareExchange")!=symbol.npos)result=operation(GuestMemory::AtomicRmw::CompareExchange,call(1),call(2));
+        else result=operation(GuestMemory::AtomicRmw::Exchange,call(1));
         call.return_to(state,result);return std::nullopt;
     }
     const auto saved_error=last_error_;const unsigned pointer_unit=x86_?4U:8U;const auto pointer_bits=static_cast<std::uint8_t>(pointer_unit*8);

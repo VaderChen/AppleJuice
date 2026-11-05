@@ -1,29 +1,11 @@
 #include "x64arm/windows_services.hpp"
 #include <algorithm>
+#include "gui_message_contract.hpp"
 
 namespace x64arm {
 namespace {
 constexpr std::size_t send_limit=8192;
-bool pointer_message(std::uint32_t message,std::uint64_t wparam) {
-    // WM_USER 以下的系統訊息與標準控制項訊息由 Windows 定義指標生命週期。
-    // 判斷訊息契約，不把碰巧落在客體位址範圍的整數當成指標。
-    if(message==0x219)return (wparam&0x8000)!=0; // WM_DEVICECHANGE
-    if(message==0x218)return wparam==0x8013; // PBT_POWERSETTINGCHANGE
-    switch(message){
-        case 1:case 12:case 13:case 0x1a:case 0x1b: // CREATE／文字／設定
-        case 0x24:case 0x2b:case 0x2c:case 0x2d:case 0x39: // owner draw
-        case 0x46:case 0x47:case 0x4a:case 0x4e:case 0x53:case 0x7c:case 0x7d:
-        case 0x81:case 0x83:case 0x87: // nonclient／MSG
-        case 0xb0:case 0xb2:case 0xb3:case 0xb4:case 0xc2:case 0xc4:case 0xcb: // Edit
-        case 0xe3:case 0xe9:case 0xea:case 0xeb: // Scrollbar
-        case 0x140:case 0x143:case 0x145:case 0x148:case 0x14a:case 0x14c:case 0x14d:case 0x152:case 0x158:case 0x164: // ComboBox
-        case 0x180:case 0x181:case 0x189:case 0x18c:case 0x18d:case 0x18f:case 0x191:case 0x192:case 0x196:case 0x198:case 0x1a2: // ListBox
-        case 0x213:case 0x214:case 0x216:case 0x220:case 0x229:
-        case 0x22a:case 0x22b:case 0x22c:case 0x22d:case 0x22e:
-        case 0x2e0:case 0x2e4:case 0x30c:case 0x33f:return true;
-        default:return false;
-    }
-}
+
 }
 
 void WindowsServices::queue_gui_send_callback(const GuiSentMessage& request,std::uint64_t result) {
@@ -34,6 +16,7 @@ void WindowsServices::queue_gui_send_callback(const GuiSentMessage& request,std:
 void WindowsServices::finish_gui_send(GuestMemory& memory,std::uint64_t token,std::uint64_t result) {
     const auto found=gui_.sent_messages.find(token);if(found==gui_.sent_messages.end())return;
     auto& request=found->second;
+    if(request.remote_sequence && request.remote_server){if(!request.done)request.result=result;request.done=true;request.active=false;reply_remote_gui_message(token);return;}
     if(request.device_owner)finish_device_notification(threads_.items.at(threads_.current).context,memory,request.device_owner);
     if(request.kind!=GuiSentMessage::Kind::Synchronous){
         queue_gui_send_callback(request,result);
@@ -55,7 +38,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_async(GuestState& state
         ThreadWait wait;wait.gui_new_only=true;wait_gui_input(state,memory,std::move(wait));return std::nullopt;
     }
     const auto message=static_cast<std::uint32_t>(call(1));
-    if(pointer_message(message,call(2))){last_error_=1159;call.return_to(state,0);return std::nullopt;}
+    if(gui_pointer_message(message,call(2))){last_error_=1159;call.return_to(state,0);return std::nullopt;}
     GuiAsyncSend operation;operation.message={call(0),call(2),call(3),message};operation.wide=service.symbol.ends_with('W');operation.thread=threads_.current;
     if(service.symbol.starts_with("SendMessageCallback")){operation.kind=GuiSentMessage::Kind::Callback;operation.callback=call(4);operation.data=call(5);}
     if(operation.callback && !handles(GuestAddress{operation.callback}))memory.check(GuestAddress{operation.callback},1,Access::Execute);

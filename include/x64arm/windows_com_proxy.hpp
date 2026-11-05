@@ -23,7 +23,7 @@ struct ComProxyField {
     bool operator==(const ComProxyField&) const = default;
 };
 struct ComProxyOperation {
-    enum class Type { Method,Marshal,Retire } type{Type::Method};
+    enum class Type { Method,Marshal,Retire,Callback } type{Type::Method};
     enum class Stage { Begin,Borrow,Invoke,Fields,Export,Release,Done } stage{Stage::Begin};
     std::uint64_t sender{},receiver{},object{},proxy{},retirement{},error_pointer{},rpc{},frame_stack{},frame_rip{};
     std::uint64_t result{},scratch_error{},marshal_recipient{},pin_apartment{},marshal_query_output{};

@@ -228,12 +228,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_rtti(GuestState& state,Gues
     const auto throw_exception=[&](unsigned kind,std::uint64_t custom_message=0,std::uint32_t error_code=0,bool random_error=false){throw_msvc_exception(state,memory,service,static_cast<MsvcExceptionKind>(kind),custom_message,error_code,0,random_error);};
     // VC10～VC12 exception 物件採 vptr、訊息指標、擁有權欄位；
     // x86 成員使用 ECX this 與 callee-pop，x64 使用統一暫存器 ABI。
-    if(symbol.starts_with("??0exception@") || symbol.starts_with("??1exception@") || symbol.starts_with("??0bad_") || symbol.starts_with("??1bad_") || symbol.starts_with("?what@exception@") || symbol.starts_with("?_type_info_dtor_internal_method@")){
+    if(symbol.starts_with("??0exception@") || symbol.starts_with("??1exception@") || symbol.starts_with("??4exception@") || symbol.starts_with("??0bad_") || symbol.starts_with("??1bad_") || symbol.starts_with("?what@exception@") || symbol.starts_with("?_type_info_dtor_internal_method@")){
         const bool ctor=symbol.starts_with("??0"),copy=ctor && (symbol.find("AEBV01")!=std::string_view::npos || symbol.find("ABV01")!=std::string_view::npos);
+        const bool default_ctor=ctor && symbol.ends_with("@XZ"),assignment=symbol.starts_with("??4");
         const bool borrowed=ctor && (symbol.find("AEBQEBDH@Z")!=std::string_view::npos || symbol.find("ABQBDH@Z")!=std::string_view::npos);
-        const WindowsCall method(state,memory,(x86_?(ctor?1U:0U):(ctor?2U:1U))+(borrowed?1U:0U));
+        const WindowsCall method(state,memory,((ctor && !default_ctor) || assignment?1U:0U)+(x86_?0U:1U)+(borrowed?1U:0U));
         const auto object=x86_?static_cast<std::uint32_t>(state.reg(Gpr::Rcx)):method(0);
-        const auto argument=ctor?method(x86_?0U:1U):0;
+        const auto argument=(ctor && !default_ctor) || assignment?method(x86_?0U:1U):0;
         if(symbol.starts_with("?_type_info_dtor_internal_method@")){
             const auto cached=memory.load(GuestAddress{object+unit},bits);
             if(cached && allocations_.contains(cached))(void)free_heap(memory,cached,state);
@@ -241,7 +242,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_rtti(GuestState& state,Gues
         }else{
             ensure_exception_types();const auto& data=runtime_.cxx_exceptions;
             const auto kind=symbol.find("bad_cast@")!=std::string_view::npos?BadCast:symbol.find("bad_typeid@")!=std::string_view::npos?BadTypeid:Exception;
-            if(ctor){
+            if(assignment){
+                if(object!=argument){crt_exception_data(state,memory,object+unit,object+unit,true);crt_exception_data(state,memory,argument+unit,object+unit,false);}
+            }else if(ctor){
                 memory.check(GuestAddress{object},3*unit,Access::Write);
                 if(copy)crt_exception_data(state,memory,argument+unit,object+unit,false);
                 else{

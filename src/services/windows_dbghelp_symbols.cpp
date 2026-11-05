@@ -216,6 +216,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_symbols(GuestState&
         }else if(name=="SymUnloadModule64"){
             if(!session.images.erase(arg(1)))fail(487);else {session.modules.erase(arg(1));result=1;}
         }else if(name=="SymFunctionTableAccess64"){
+            if(current_process_handle(arg(0)) && function_table_callback(arg(1))){
+                const auto scratch=allocate_heap(memory,8);if(!scratch)throw std::bad_alloc{};
+                try{start_callbacks(state,memory,{{resolve("ntdll.dll","RtlLookupFunctionEntry").value,{arg(1),scratch,0}}},Continuation::ReturnCallbackFreeHeap,scratch);}catch(...){(void)free_heap(memory,scratch,state);throw;}return {};
+            }
             // 真正可讀取的已映射／動態 CPU unwind table 優先；離線符號檔沒有客體 function table。
             if(auto* module=containing(session,arg(1));module && current_process_handle(arg(0)))if(const auto* image=unwind_image(memory,arg(1)))if(const auto* entry=lookup_function(*image,arg(1));entry && image->function_table)
                 result=image->function_table+static_cast<std::uint64_t>(entry-image->functions.data())*12;

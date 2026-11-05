@@ -33,6 +33,8 @@ std::span<const WindowsServiceDescriptor> hid_service_descriptors(){
         {"hid.dll","HidP_SetUsageValue",8},{"hid.dll","HidP_SetUsages",8},
         {"hid.dll","HidP_GetUsageValue",8},{"hid.dll","HidP_GetUsages",8},
         {"hid.dll","HidP_GetScaledUsageValue",8},{"hid.dll","HidP_GetUsagesEx",7},
+        {"hid.dll","HidP_SetScaledUsageValue",8},
+        {"hid.dll","HidP_GetUsageValueArray",9},{"hid.dll","HidP_SetUsageValueArray",9},
         {"hid.dll","HidP_InitializeReportForID",5},
         {"hid.dll","HidD_GetFeature",3},{"hid.dll","HidD_SetFeature",3},{"hid.dll","HidD_GetInputReport",3},{"hid.dll","HidD_SetOutputReport",3},
         {"hid.dll","HidD_GetIndexedString",4},{"hid.dll","HidP_GetSpecificButtonCaps",7},{"hid.dll","HidP_GetSpecificValueCaps",7}};return table;
@@ -125,10 +127,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,Guest
             if(!arg(2))throw hid::Error(hid::buffer_too_small);memory.check(GuestAddress{arg(2)},4,Access::Write);const auto capacity=memory.load(GuestAddress{arg(2)},32);memory.store(GuestAddress{arg(2)},32,values.size());
             if(capacity<values.size() || (!arg(1) && !values.empty()))throw hid::Error(hid::buffer_too_small);
             std::vector<std::uint8_t> data(values.size()*8);unsigned i=0;for(const auto [index,value]:values){put(data,i*8,index,2);put(data,i*8+4,value);++i;}memory.write(GuestAddress{arg(1)},data);
-        }else if(name=="HidP_GetUsageValue" || name=="HidP_SetUsageValue" || name=="HidP_GetScaledUsageValue"){
-            const auto layout=layout_at(arg(5));const bool write=name=="HidP_SetUsageValue";auto report=report_at(6,7,layout,d(0),write);unsigned element=0;
+        }else if(name=="HidP_GetUsageValueArray" || name=="HidP_SetUsageValueArray"){
+            const auto layout=layout_at(arg(6));const bool write=name=="HidP_SetUsageValueArray";auto report=report_at(7,8,layout,d(0),write);unsigned element=0;
+            const auto field=layout.find(d(0),{static_cast<std::uint16_t>(d(1)),static_cast<std::uint16_t>(d(3))},static_cast<std::uint16_t>(d(2)),report[0],false,&element);
+            if(!field)throw hid::Error(hid::usage_not_found);
+            const auto capacity=static_cast<std::uint16_t>(d(5));if(!arg(4))throw hid::Error(hid::buffer_too_small);
+            const auto count=field->value_count(element);const auto length=(std::uint64_t{field->width}*count+7)/8;
+            if(field->range || !field->variable() || count<=1)throw hid::Error(hid::not_value_array);
+            if(length>capacity)throw hid::Error(hid::buffer_too_small);
+            std::vector<std::uint8_t> values(static_cast<std::size_t>(length));
+            if(write){memory.read(GuestAddress{arg(4)},values);layout.set_value_array(*field,element,report,values);memory.write(GuestAddress{arg(7)},report);}
+            else {memory.check(GuestAddress{arg(4)},values.size(),Access::Write);layout.get_value_array(*field,element,report,values);memory.write(GuestAddress{arg(4)},values);}
+        }else if(name=="HidP_GetUsageValue" || name=="HidP_SetUsageValue" || name=="HidP_GetScaledUsageValue" || name=="HidP_SetScaledUsageValue"){
+            const auto layout=layout_at(arg(5));const bool write=name=="HidP_SetUsageValue" || name=="HidP_SetScaledUsageValue";auto report=report_at(6,7,layout,d(0),write);unsigned element=0;
             const auto field=layout.find(d(0),{static_cast<std::uint16_t>(d(1)),static_cast<std::uint16_t>(d(3))},static_cast<std::uint16_t>(d(2)),report[0],false,&element);if(!field)throw hid::Error(hid::usage_not_found);
-            if(write){layout.value(*field,element,d(4),report);memory.write(GuestAddress{arg(6)},report);}
+            if(write){if(name=="HidP_SetScaledUsageValue")result=layout.set_scaled_value(*field,element,static_cast<std::int32_t>(d(4)),report);
+                else layout.value(*field,element,d(4),report);memory.write(GuestAddress{arg(6)},report);}
             else memory.store(GuestAddress{arg(4)},32,name=="HidP_GetScaledUsageValue"?static_cast<std::uint32_t>(layout.scaled_value(*field,element,report)):layout.value(*field,element,report));
         }else if(name=="HidP_GetUsagesEx"){
             const auto layout=layout_at(arg(4));const auto report=report_at(5,6,layout,d(0),false);

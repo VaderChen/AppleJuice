@@ -18,6 +18,10 @@ void WindowsServices::initialize_guest_crt_algorithms(GuestMemory& memory, Guest
         const auto* value=std::getenv("X64ARM_GUEST_CRT_TEXT");
         return !value || std::string_view(value)!="0";
     }();
+    static const bool format_enabled=[] {
+        const auto* value=std::getenv("X64ARM_AOT_CRT_FORMAT_LOWERING");
+        return !value || std::string_view(value)!="0";
+    }();
     // 既有最後一頁是 +0x96000 的 locale 鎖；新模組佔用其後獨立的頁面。
     constexpr std::uint64_t offset=0x98000;
     static_assert(offset+detail::guest_crt_image_size<=windows_address_layout::gateway_capacity);
@@ -27,7 +31,7 @@ void WindowsServices::initialize_guest_crt_algorithms(GuestMemory& memory, Guest
     image.function_table=image.base+detail::guest_crt_function_table;
     for(const auto& row:detail::guest_crt_unwind)image.functions.push_back({row.begin,row.end,row.unwind});
     for(const auto& row:detail::guest_crt_routines)
-        if(!row.text || text_enabled)image.export_names.emplace(row.symbol,row.entry);
+        if((!row.text || text_enabled) && (!row.format || format_enabled))image.export_names.emplace(row.symbol,row.entry);
     std::vector<std::vector<std::uint8_t>> bytes;
     bytes.reserve(detail::guest_crt_sections.size());
     for(const auto& section:detail::guest_crt_sections){
@@ -75,7 +79,9 @@ void WindowsServices::initialize_guest_crt_algorithms(GuestMemory& memory, Guest
 }
 
 std::optional<std::uint32_t> WindowsServices::start_sort(GuestState& state, GuestMemory& memory, bool search) {
-    const WindowsCall arg(state, memory, search?5:4);
+    // qsort／bsearch 都是 cdecl；空集合及單筆的直接返回也由呼叫端清理參數。
+    // 比較器返回沿 complete_call 的 CRT descriptor，兩條路徑須保持相同 ABI。
+    const WindowsCall arg(state, memory, search?5:4, false);
     if(search) {
         if(!arg(2) || !arg(3)){arg.return_to(state,0);return std::nullopt;}
         if(arg(2)>output_limit/arg(3) || runtime_.sorts.size()>=32)throw HostCallFault("bsearch 大小或巢狀深度超過上限");

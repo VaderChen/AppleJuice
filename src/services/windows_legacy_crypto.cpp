@@ -93,8 +93,8 @@ std::uint32_t WindowsServices::legacy_crypto_call(GuestMemory& memory,const Wind
         memory.check(GuestAddress{arg(5)},x86_?4:8,Access::Write);
         const auto blob=read(arg(1),u32(2));auto key=import_rsa(blob);
         if(!key && blob.size()>=12 && blob[0]==8 && blob[1]==2 && !blob[2] && !blob[3]){
-            const auto* algorithm=legacy_crypto::find(word(blob,4));const auto size=word(blob,8);
-            if(!algorithm || !algorithm->cipher || !legacy_crypto::supported(*algorithm,provider->second.type))return fail(bad_algorithm);
+            const auto algorithm=legacy_crypto::algorithm_for(word(blob,4),provider->second);const auto size=word(blob,8);
+            if(!algorithm || !algorithm->cipher)return fail(bad_algorithm);
             const auto bits=legacy_crypto::key_bits(*algorithm,size);
             if(size!=blob.size()-12 || bits<algorithm->min_bits || bits>algorithm->max_bits)return fail(bad_data);
             key.emplace();key->algorithm=algorithm->id;key->bits=bits;key->secret.assign(blob.begin()+12,blob.end());key->iv.resize(algorithm->block>1?algorithm->block:0);

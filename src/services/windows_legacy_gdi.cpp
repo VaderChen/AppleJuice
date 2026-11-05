@@ -46,6 +46,12 @@ constexpr std::size_t metafile_limit=64U*1024U*1024U;
 std::uint64_t WindowsServices::nested_service(GuestState& state,GuestMemory& memory,std::string_view family,std::string_view symbol,std::initializer_list<std::uint64_t> arguments){
     // 經正式服務入口呼叫，固定 kernel32 表與延伸 descriptor 表共用相同分派、ABI 與追蹤。
     static const auto index=[]{std::map<std::pair<std::string_view,std::string_view>,const WindowsServiceDescriptor*> out;for(const auto& d:runtime_service_descriptors())out.try_emplace({d.family,d.symbol},&d);return out;}();
+    // GdiFlush 的公開入口解析為客體批次常式（X64ARM_GUEST_GDI_BATCH），不是宿主服務入口，不能在此框架執行；
+    // 巢狀呼叫者（緩衝繪製取位元、GDI+ 圖形結束）需要的是宿主端完成呼叫執行緒的批次表面，直接沿用同一實作。
+    if(family=="gdi32.dll" && symbol=="GdiFlush"){
+        if(arguments.size())throw HostCallFault("巢狀服務參數形式不符");
+        return flush_gdi_batch(memory)?1U:0U;
+    }
     if(const auto found=index.find({family,symbol});found!=index.end()){
         const auto& descriptor=*found->second;
         // narrow 參數只截取低 32 位、caller cleanup 只影響返回後的堆疊；兩者不改變此框架的參數位置。

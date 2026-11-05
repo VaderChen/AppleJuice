@@ -33,7 +33,7 @@
         const auto remove_conflicts=[&](const std::shared_ptr<Identity>& context,std::span<const std::uint64_t> outputs,std::string_view preserved){
             for(auto& [name,values]:context->bindings){
                 if(name==preserved || !(name.ends_with("ShaderResources") || name.ends_with("UnorderedAccessViews") || name=="StreamOutput" || name=="Vertices" || name=="Index" || name.ends_with("ConstantBuffers") || name=="Targets" || name=="Depth"))continue;
-                for(auto& pointer:values)if(pointer && std::any_of(outputs.begin(),outputs.end(),[&](auto output_view){return overlaps(pointer,output_view);})){const auto previous=pointer;pointer=0;if(!context->weak_bindings)release(previous);}
+                for(auto& pointer:values)if(pointer && std::any_of(outputs.begin(),outputs.end(),[&](auto output_view){return overlaps(pointer,output_view);})){const auto previous=pointer;pointer=0;if(!context->weak_bindings)release_binding(*context,name,previous);}
             }
         };
         const auto nonconflicting=[&](std::span<const std::uint64_t> values){for(std::size_t i=0;i<values.size();++i)for(std::size_t j=0;j<i;++j)if(overlaps(values[i],values[j]))return false;return true;};

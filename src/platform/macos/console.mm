@@ -147,6 +147,7 @@ public:
             window_=[[NSWindow alloc] initWithContentRect:content
                 styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable
                 backing:NSBackingStoreBuffered defer:NO];window_.releasedWhenClosed=NO;
+            native_place_window_in_space(window_);
             view_=[[X64ArmConsoleView alloc] initWithFrame:NSMakeRect(0,0,720,450)];view_.model=&state_;
             view_.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;window_.contentView=view_;window_.acceptsMouseMovedEvents=YES;
             window_.contentMinSize=NSMakeSize(9,18);window_.contentResizeIncrements=NSMakeSize(9,18);

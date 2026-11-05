@@ -154,7 +154,7 @@ bool WindowsServices::dispatch_cpu_exception(GuestState& state, GuestMemory& mem
     prune_x86_exception_callbacks(state,memory);
     if(emit_debug_event(state,memory,debugger::Exception{code,0,0,state.rip.value,{},true})==debugger::handled)return true;
     const bool module_functions=std::any_of(runtime_.loaded_modules.begin(),runtime_.loaded_modules.end(),[](const auto& entry){return !entry.second.image.functions.empty();}) ||
-        std::any_of(runtime_.dynamic_function_tables.begin(),runtime_.dynamic_function_tables.end(),[](const auto& entry){return entry.count!=0;});
+        std::any_of(runtime_.dynamic_function_tables.begin(),runtime_.dynamic_function_tables.end(),[](const auto& entry){return entry.count!=0 || entry.callback;});
     const bool etw_callback=std::any_of(runtime_.callbacks.begin(),runtime_.callbacks.end(),[](const auto& frame){return frame.continuation==Continuation::EtwProcess;});
     if (!runtime_.image.base || (!etw_callback && runtime_.image.functions.empty() && !module_functions && (!x86_ || memory.load(GuestAddress{state.fs_base},32)==UINT32_MAX) && exceptions_.vectors.empty() && !runtime_.unhandled_filter)) {
         if(!debugger_attached())return false;
@@ -229,9 +229,9 @@ void WindowsServices::begin_exception(GuestState& state, GuestMemory& memory, st
     memory.store(GuestAddress{dispatch.pointers},bits,dispatch.record);memory.store(GuestAddress{dispatch.pointers+unit},bits,dispatch.context);
     exceptions_.stack.reserve(16);
     if(code==0xe06d7363U && parameters.size()>=3)for(auto& outer:exceptions_.stack)if(outer.msvc_owned_object && outer.msvc_owned_object==parameters[1]){dispatch.msvc_owned_object=outer.msvc_owned_object;outer.msvc_owned_object=0;break;}
-    exceptions_.stack.push_back(std::move(dispatch)); state.rip = exception_entry_;
+    exceptions_.stack.push_back(std::move(dispatch));sync_msvc_uncaught(memory); state.rip = exception_entry_;
 }
-bool WindowsServices::append_exception_frame(GuestMemory& memory, ExceptionDispatch& dispatch) {
+std::optional<bool> WindowsServices::append_exception_frame(GuestState& state,GuestMemory& memory, ExceptionDispatch& dispatch) {
     while(handles(dispatch.walk.rip)) {
         if(dispatch.walk.rip.value==callback_return_.value+0xe0){
             const auto& calls=threads_.items.at(threads_.current).system_calls;const auto found=std::find_if(calls.rbegin(),calls.rend(),[&](const auto& frame){return dispatch.walk.reg(Gpr::Rsp)==frame.stack+8;});
@@ -303,10 +303,18 @@ bool WindowsServices::append_exception_frame(GuestMemory& memory, ExceptionDispa
     if(dispatch.frames.size()>=256)throw HostCallFault("例外堆疊超過 256 frames");
     if(dispatch.walk.reg(Gpr::Rsp)<memory.load(GuestAddress{dispatch.walk.gs_base+16},64) || dispatch.walk.reg(Gpr::Rsp)>=memory.load(GuestAddress{dispatch.walk.gs_base+8},64))throw HostCallFault("例外堆疊超出 TEB StackLimit／StackBase");
     const auto pc=dispatch.walk.rip.value-(dispatch.unwound?1U:0U);
-    const auto* image=unwind_image(memory,pc);
+    const auto* callback=function_table_callback(pc);
+    if(callback && (!dispatch.function_query_ready || dispatch.function_query_pc!=pc)){
+        dispatch.function_query_pc=pc;dispatch.function_query_entry=0;dispatch.function_query_ready=false;
+        start_callbacks(state,memory,{{callback->callback,{pc,callback->context}}},Continuation::ExceptionFunctionLookup);
+        return std::nullopt;
+    }
+    const auto entry=callback?dispatch.function_query_entry:0;
+    const auto* image=callback && !entry?nullptr:unwind_image(memory,pc,entry);
     // 未登錄的 leaf code 仍可由 return slot 展開，但不可套用其他映像的 metadata。
     static const RuntimeImage leaf_image;
     const auto unwind=virtual_unwind(memory,image?*image:leaf_image,pc,dispatch.walk,3);
+    dispatch.function_query_ready=false;
     if(unwind.caller.reg(Gpr::Rsp)<=dispatch.walk.reg(Gpr::Rsp))throw HostCallFault("例外 unwind 未向上推進堆疊");
     dispatch.frames.push_back({dispatch.walk,pc,unwind,dispatch.walk_callback_depth,dispatch.walk_exception_depth,dispatch.walk_scope_index});
     dispatch.walk_scope_index=0;return true;
@@ -328,7 +336,7 @@ std::optional<std::uint32_t> WindowsServices::finish_user_callback_exception(Gue
     if(depth>=runtime_.callbacks.size())throw HostCallFault("GUI 例外邊界沒有 callback 框架");
     const auto saved=runtime_.callbacks[depth].saved;const auto exception_depth=runtime_.callbacks[depth].exception_depth;
     // Legacy filter 直接回到 callback 邊界，不跨邊界執行外層 SEH，也不假裝客體已清理資源。
-    discard_callbacks(depth+1,state,memory);exceptions_.stack.resize(exception_depth);
+    discard_callbacks(depth+1,state,memory);exceptions_.stack.resize(exception_depth);sync_msvc_uncaught(memory);
     state=saved;state.reg(Gpr::Rax)=0;return resume_callback(state,memory);
 }
 bool WindowsServices::callback_protects_exception(const CallbackFrame& frame,std::uint32_t code)const{
@@ -352,13 +360,14 @@ std::optional<std::uint32_t> WindowsServices::advance_exception(GuestState& stat
         if (dispatch.index < dispatch.vectors.size()) { call(dispatch.vectors[dispatch.index++], {dispatch.pointers}); return std::nullopt; }
         // RoOriginateError 在 API 內 raise 並 catch；VEH 仍看得到真實 EXCEPTION_RECORD。
         // 僅標記我們建立的 frame，不能吞掉 guest 自己 RaiseException 的同碼例外。
-        if(dispatch.winrt_origination){state=dispatch.original;exceptions_.stack.pop_back();return std::nullopt;}
+        if(dispatch.winrt_origination){state=dispatch.original;exceptions_.stack.pop_back();sync_msvc_uncaught(memory);return std::nullopt;}
         dispatch.stage = ExceptionStage::Search; dispatch.index = 0;
     }
     if(x86_ && (dispatch.stage==ExceptionStage::Search || dispatch.stage==ExceptionStage::Unwind))return advance_x86_exception(state,memory);
     if (dispatch.stage == ExceptionStage::Search) {
         while (dispatch.frames.size() < 256) {
-            if(!append_exception_frame(memory,dispatch)) {
+            const auto appended=append_exception_frame(state,memory,dispatch);if(!appended)return std::nullopt;
+            if(!*appended) {
                 if(dispatch.user_callback_depth!=SIZE_MAX)return finish_user_callback_exception(state,memory);
                 if(dispatch.module_operation || dispatch.module_continue || dispatch.etw_thread || dispatch.protected_callback_depth!=SIZE_MAX) {
                     // 目標是主機載入器，不屬任何 guest frame，因此不設 TARGET_UNWIND。
@@ -392,7 +401,7 @@ std::optional<std::uint32_t> WindowsServices::advance_exception(GuestState& stat
             const bool proceed=dispatch.module_continue;
             state=dispatch.module_context;
             discard_callbacks(callbacks+(proceed?1U:0U),state,memory);
-            exceptions_.stack.resize(depth);
+            exceptions_.stack.resize(depth);sync_msvc_uncaught(memory);
             if(proceed)return resume_loader_notification_exception(state,memory,callbacks);
             return fail_module_initialization(state,memory,operation);
         }
@@ -418,7 +427,7 @@ std::optional<std::uint32_t> WindowsServices::advance_exception(GuestState& stat
             start_callbacks(state,memory,{{callback,{record}}},Continuation::UnwindConsolidate,depth);
             runtime_.callbacks.back().unwind_target=resumed;return std::nullopt;
         }
-        exceptions_.stack.resize(depth);return std::nullopt;
+        exceptions_.stack.resize(depth);sync_msvc_uncaught(memory);return std::nullopt;
     }
     if (dispatch.stage == ExceptionStage::Unhandled) {
         if(dispatch.protected_callback_depth!=SIZE_MAX)return finish_protected_callback_exception(state,memory);
@@ -435,7 +444,7 @@ std::optional<std::uint32_t> WindowsServices::advance_exception(GuestState& stat
             for(std::uint64_t i=0;i<count;++i)event.parameters.push_back(memory.load(GuestAddress{dispatch.record+(x86_?20:32)+i*(x86_?4:8)},x86_?32:64));
             disposition=emit_debug_event(state,memory,std::move(event));
         }
-        exceptions_.stack.pop_back();
+        exceptions_.stack.pop_back();sync_msvc_uncaught(memory);
         if(disposition==debugger::handled)return std::nullopt;
         (void)emit_debug_event(state,memory,debugger::ExitProcess{code==0xe06d7363U?3U:code});return code==0xe06d7363U?3U:code;
     }
@@ -454,6 +463,7 @@ std::optional<std::uint32_t> WindowsServices::resume_exception(GuestState& state
         for (const auto& handler : exceptions_.continue_vectors) callbacks.push_back({handler.second,{dispatch.pointers}});
         if (!callbacks.empty()) start_callbacks(state,memory,std::move(callbacks),Continuation::ContinueException);
         else exceptions_.stack.pop_back();
+        sync_msvc_uncaught(memory);
         return std::nullopt;
     }
     if(x86_ && (dispatch.stage==ExceptionStage::Search || dispatch.stage==ExceptionStage::Unwind)){
@@ -466,7 +476,10 @@ std::optional<std::uint32_t> WindowsServices::resume_exception(GuestState& state
                 dispatch.x86_next=static_cast<std::uint32_t>(memory.load(GuestAddress{collided},32));
                 if(dispatch.x86_next!=UINT32_MAX && dispatch.x86_next<=collided)throw HostCallFault("Win32 collided unwind 未向上推進");
                 memory.store(GuestAddress{dispatch.original.fs_base},32,dispatch.x86_next);
-            }else if(result==1)memory.store(GuestAddress{dispatch.original.fs_base},32,dispatch.x86_next);
+            }else if(result==1){
+                if(dispatch.msvc.active && dispatch.x86_frame==dispatch.x86_target)dispatch.x86_next=dispatch.x86_target;
+                else memory.store(GuestAddress{dispatch.original.fs_base},32,dispatch.x86_next);
+            }
             else throw HostCallFault("Win32 unwind handler disposition 不合法");
         }else{
             if(dispatch.x86_frame==dispatch.x86_nested){dispatch.x86_nested=0;dispatch.flags&=~0x10U;}
@@ -547,7 +560,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
     const WindowsCall arg(state, memory, service); const auto symbol = service.symbol;
     if(x86_ && (symbol.find("setjmp")!=std::string_view::npos || symbol=="longjmp" || symbol=="_longjmpex"))return invoke_x86_jump(state,memory,service);
     if(!x86_ && symbol=="_setjmp3")throw HostCallFault("_setjmp3 僅適用 Win32 CRT ABI");
-    if(symbol=="RtlAddFunctionTable" || symbol=="RtlDeleteFunctionTable" || symbol=="RtlAddGrowableFunctionTable" || symbol=="RtlGrowFunctionTable" || symbol=="RtlDeleteGrowableFunctionTable")return invoke_function_table(state,memory,service);
+    if(symbol=="RtlInstallFunctionTableCallback" || symbol=="RtlAddFunctionTable" || symbol=="RtlDeleteFunctionTable" || symbol=="RtlAddGrowableFunctionTable" || symbol=="RtlGrowFunctionTable" || symbol=="RtlDeleteGrowableFunctionTable")return invoke_function_table(state,memory,service);
     std::uint64_t result = 0;
     auto& vectors=symbol.find("Continue")!=std::string_view::npos ? exceptions_.continue_vectors : exceptions_.vectors;
     if(symbol=="DebugBreak"){
@@ -590,20 +603,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
         if(!target) {
             // 無 SEH 的形式仍須丟棄被跨越的主機 callback，避免日後返回過期框架。
             while(!runtime_.callbacks.empty() && restored.reg(Gpr::Rsp)>=((runtime_.callbacks.back().saved.reg(Gpr::Rsp)-256)&~UINT64_C(15))) {
-                exceptions_.stack.resize(runtime_.callbacks.back().exception_depth);discard_callbacks(runtime_.callbacks.size()-1,state,memory);
+                exceptions_.stack.resize(runtime_.callbacks.back().exception_depth);sync_msvc_uncaught(memory);discard_callbacks(runtime_.callbacks.size()-1,state,memory);
             }
             state=restored;return std::nullopt;
         }
-        auto caller=state;arg.return_to(caller,0);
-        const std::array<std::uint64_t,1> parameters{buffer};begin_exception(caller,memory,0x80000026U,0,parameters);
-        auto& dispatch=exceptions_.stack.back();dispatch.unwound=true;
-        while(append_exception_frame(memory,dispatch)) {
+        const bool resuming=!exceptions_.stack.empty() && exceptions_.stack.back().unwind_origin_pc==state.rip.value && exceptions_.stack.back().unwind_origin_sp==state.reg(Gpr::Rsp);
+        if(!resuming){
+            auto caller=state;arg.return_to(caller,0);
+            const std::array<std::uint64_t,1> parameters{buffer};begin_exception(caller,memory,0x80000026U,0,parameters);
+            auto& dispatch=exceptions_.stack.back();dispatch.unwound=true;dispatch.unwind_origin_pc=state.rip.value;dispatch.unwind_origin_sp=state.reg(Gpr::Rsp);
+        }
+        auto& dispatch=exceptions_.stack.back();
+        for(;;) {
+            const auto appended=append_exception_frame(state,memory,dispatch);if(!appended)return {};if(!*appended)break;
             const auto& frame=dispatch.frames.back();
             if(frame.unwind.establisher==target)break;
             if(frame.unwind.establisher>target)throw HostCallFault("longjmp 目標堆疊順序不合法");
             dispatch.walk=frame.unwind.caller;dispatch.unwound=true;
         }
         if(dispatch.frames.empty() || dispatch.frames.back().unwind.establisher!=target)throw HostCallFault("longjmp 目標框架不在目前堆疊內");
+        dispatch.unwind_origin_pc=dispatch.unwind_origin_sp=0;
         begin_unwind(state,memory,dispatch.frames.size()-1,restored.rip.value,restored.reg(Gpr::Rax));
         dispatch.target_context=restored;dispatch.restore_jump=true;return std::nullopt;
     } else if (symbol == "AddVectoredExceptionHandler" || symbol == "AddVectoredContinueHandler") {
@@ -645,6 +664,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
         auto caller = state; arg.return_to(caller,state.reg(Gpr::Rax));
         // 共用入口已彈出 CRT wrapper；再依實際 unwind metadata 取得上一層框架。
         if(symbol=="__crtCapturePreviousContext" && !x86_) {
+            if(const auto* table=function_table_callback(caller.rip.value)){
+                start_callbacks(state,memory,{{table->callback,{caller.rip.value,table->context}}},Continuation::CapturePreviousContext);return {};
+            }
             if(const auto* image=unwind_image(memory,caller.rip.value);image && lookup_function(*image,caller.rip.value))
                 caller=virtual_unwind(memory,*image,caller.rip.value,caller,0).caller;
         }
@@ -654,6 +676,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
         memory.store(GuestAddress{arg(1)},x86_?32:64,result);
     } else if (symbol == "RtlLookupFunctionEntry") {
         if(arg(2))memory.check(GuestAddress{arg(2)},216,Access::Write);
+        if(const auto* table=function_table_callback(arg(0))){
+            memory.check(GuestAddress{arg(1)},8,Access::Write);
+            start_callbacks(state,memory,{{table->callback,{arg(0),table->context}}},Continuation::FunctionTableLookup);return {};
+        }
         if (const auto* image=unwind_image(memory,arg(0));image) {
             if(const auto* function=lookup_function(*image,arg(0))) {
                 memory.store(GuestAddress{arg(1)}, 64, image->base);
@@ -687,7 +713,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
         if(symbol=="RtlUnwindEx" && arg(5))memory.check(GuestAddress{arg(5)},216,Access::Write);
         const bool in_search=!exceptions_.stack.empty() && exceptions_.stack.back().stage==ExceptionStage::Search &&
             std::any_of(exceptions_.stack.back().frames.begin(),exceptions_.stack.back().frames.end(),[&](const auto& f){return f.unwind.establisher==target;});
-        if(!in_search) {
+        const bool resuming=!exceptions_.stack.empty() && exceptions_.stack.back().unwind_origin_pc==state.rip.value && exceptions_.stack.back().unwind_origin_sp==state.reg(Gpr::Rsp);
+        if(!in_search && !resuming) {
             std::vector<std::uint64_t> parameters;std::uint32_t code=0xc0000027,flags_value=0;
             if(record) {
                 code=static_cast<std::uint32_t>(memory.load(GuestAddress{record},32));flags_value=static_cast<std::uint32_t>(memory.load(GuestAddress{record+4},32))&1U;
@@ -695,14 +722,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
                 for(std::uint64_t i=0;i<count;++i)parameters.push_back(memory.load(GuestAddress{record+32+i*8},64));
             }
             auto caller=state;arg.return_to(caller,0);begin_exception(caller,memory,code,flags_value,parameters);
-            auto& walking=exceptions_.stack.back();walking.unwound=true;
-            while(append_exception_frame(memory,walking)) {
+            auto& walking=exceptions_.stack.back();walking.unwound=true;walking.unwind_origin_pc=state.rip.value;walking.unwind_origin_sp=state.reg(Gpr::Rsp);
+        }
+        if(!in_search){
+            auto& walking=exceptions_.stack.back();
+            for(;;) {
+                const auto appended=append_exception_frame(state,memory,walking);if(!appended)return {};if(!*appended)break;
                 const auto& frame=walking.frames.back();if(frame.unwind.establisher==target)break;
                 if(frame.unwind.establisher>target)throw HostCallFault("RtlUnwindEx 目標堆疊順序不合法");
                 walking.walk=frame.unwind.caller;walking.unwound=true;
             }
         }
         auto& dispatch = exceptions_.stack.back();
+        dispatch.unwind_origin_pc=dispatch.unwind_origin_sp=0;
         dispatch.unwind_context=output_context;
         const auto frame = std::find_if(dispatch.frames.begin(), dispatch.frames.end(), [&](const auto& f) { return f.unwind.establisher == target; });
         if (frame == dispatch.frames.end()) throw HostCallFault("RtlUnwindEx 目標框架不在搜尋鏈內");

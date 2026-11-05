@@ -11,6 +11,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <chrono>
@@ -19,6 +20,7 @@
 #include <future>
 #include <mutex>
 #include <thread>
+#include <string_view>
 #include <pthread.h>
 #include <pthread/qos.h>
 
@@ -139,7 +141,7 @@ class NativeInput final:public Backend {
     Device keyboard_{keyboard()},mouse_{mouse()};std::map<IOHIDDeviceRef,Hid> hid_;std::vector<Event> events_;
     std::vector<Report> reports_;
     std::set<Guid> pointer_dirty_;
-    CGPoint cursor_{};bool have_cursor_{},exclusive_mouse_{};
+    CGPoint cursor_{};bool have_cursor_{},exclusive_mouse_{},physical_input_{true};
     void change(Device& d,unsigned object,std::int64_t value){
         if(object>=d.values.size())return;
         if(d.objects[object].relative){if(!value)return;d.values[object]+=value;}
@@ -148,6 +150,7 @@ class NativeInput final:public Backend {
         pointer_dirty_.insert(d.instance);
     }
     void sample(){
+        if(!physical_input_)return;
         for(unsigned code=0;code<scan_codes.size();++code)if(scan_codes[code])change(keyboard_,scan_codes[code],CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState,static_cast<CGKeyCode>(code))?1:0);
         for(unsigned button=0;button<8;++button)change(mouse_,button+3,CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState,static_cast<CGMouseButton>(button))?1:0);
         const auto event=CGEventCreate(nullptr);if(event){const auto point=CGEventGetLocation(event);CFRelease(event);if(have_cursor_ && !exclusive_mouse_){change(mouse_,0,static_cast<std::int64_t>(std::llround(point.x-cursor_.x)));change(mouse_,1,static_cast<std::int64_t>(std::llround(point.y-cursor_.y)));}cursor_=point;have_cursor_=true;}
@@ -234,13 +237,16 @@ class NativeInput final:public Backend {
     std::shared_ptr<Link> link(const Guid& id){for(auto& [ref,h]:hid_){(void)ref;if(h.device.instance==id && h.device.attached && h.link->ff)return h.link;}return {};}
 public:
     NativeInput(){
+        // 與 GUI 自動化沿用相同契約；停用實體鍵鼠時仍保留裝置與客體注入狀態。
+        const char* manual=std::getenv("X64ARM_GUI_AUTOMATION_ALLOW_INPUT");
+        physical_input_=!(std::getenv("X64ARM_GUI_AUTOMATION") || std::getenv("X64ARM_GUI_AUTOMATION_FD")) || (manual && std::string_view(manual)=="1");
         loop_=CFRunLoopGetCurrent();CFRetain(loop_);manager_=IOHIDManagerCreate(kCFAllocatorDefault,kIOHIDOptionsTypeNone);
         if(manager_){IOHIDManagerSetDeviceMatching(manager_,nullptr);
             IOHIDManagerRegisterDeviceMatchingCallback(manager_,[](void* c,IOReturn,void*,IOHIDDeviceRef d){static_cast<NativeInput*>(c)->add(d);},this);
             IOHIDManagerRegisterDeviceRemovalCallback(manager_,[](void* c,IOReturn,void*,IOHIDDeviceRef d){auto& h=static_cast<NativeInput*>(c)->hid_;if(h.contains(d))h.at(d).device.attached=false;},this);
             IOHIDManagerRegisterInputValueCallback(manager_,[](void* c,IOReturn,void*,IOHIDValueRef v){static_cast<NativeInput*>(c)->value(v);},this);
             IOHIDManagerScheduleWithRunLoop(manager_,loop_,kCFRunLoopDefaultMode);IOHIDManagerOpen(manager_,kIOHIDOptionsTypeNone);auto devices=IOHIDManagerCopyDevices(manager_);if(devices){std::vector<const void*> refs(static_cast<std::size_t>(CFSetGetCount(devices)));CFSetGetValues(devices,refs.data());for(auto ref:refs)add(static_cast<IOHIDDeviceRef>(const_cast<void*>(ref)));CFRelease(devices);}}
-        if(CGPreflightListenEventAccess()){const auto mask=CGEventMaskBit(kCGEventKeyDown)|CGEventMaskBit(kCGEventKeyUp)|CGEventMaskBit(kCGEventFlagsChanged)|CGEventMaskBit(kCGEventLeftMouseDown)|CGEventMaskBit(kCGEventLeftMouseUp)|CGEventMaskBit(kCGEventRightMouseDown)|CGEventMaskBit(kCGEventRightMouseUp)|CGEventMaskBit(kCGEventOtherMouseDown)|CGEventMaskBit(kCGEventOtherMouseUp)|CGEventMaskBit(kCGEventMouseMoved)|CGEventMaskBit(kCGEventLeftMouseDragged)|CGEventMaskBit(kCGEventRightMouseDragged)|CGEventMaskBit(kCGEventOtherMouseDragged)|CGEventMaskBit(kCGEventScrollWheel);
+        if(physical_input_ && CGPreflightListenEventAccess()){const auto mask=CGEventMaskBit(kCGEventKeyDown)|CGEventMaskBit(kCGEventKeyUp)|CGEventMaskBit(kCGEventFlagsChanged)|CGEventMaskBit(kCGEventLeftMouseDown)|CGEventMaskBit(kCGEventLeftMouseUp)|CGEventMaskBit(kCGEventRightMouseDown)|CGEventMaskBit(kCGEventRightMouseUp)|CGEventMaskBit(kCGEventOtherMouseDown)|CGEventMaskBit(kCGEventOtherMouseUp)|CGEventMaskBit(kCGEventMouseMoved)|CGEventMaskBit(kCGEventLeftMouseDragged)|CGEventMaskBit(kCGEventRightMouseDragged)|CGEventMaskBit(kCGEventOtherMouseDragged)|CGEventMaskBit(kCGEventScrollWheel);
             tap_=CGEventTapCreate(kCGSessionEventTap,kCGHeadInsertEventTap,kCGEventTapOptionListenOnly,mask,event,this);if(tap_){source_=CFMachPortCreateRunLoopSource(nullptr,tap_,0);CFRunLoopAddSource(loop_,source_,kCFRunLoopDefaultMode);}}
         sample();events_.clear();
     }
@@ -309,7 +315,7 @@ public:
     bool available(const Guid& id)override{if(id==keyboard_.instance || id==mouse_.instance)return true;for(auto& [ref,h]:hid_){(void)ref;if(h.device.instance==id)return h.device.attached;}return false;}
     void mouse_wheel(std::int32_t delta)override{if(!tap_)change(mouse_,2,delta);}
     void horizontal_wheel(std::int32_t delta)override{if(!tap_ && delta && events_.size()<65536)events_.push_back({mouse_.instance,11,delta});}
-    void cursor_warped()override{const auto event=CGEventCreate(nullptr);if(event){cursor_=CGEventGetLocation(event);have_cursor_=true;CFRelease(event);}}
+    void cursor_warped()override{if(!physical_input_)return;const auto event=CGEventCreate(nullptr);if(event){cursor_=CGEventGetLocation(event);have_cursor_=true;CFRelease(event);}}
     bool observes_wheel()const override{return tap_!=nullptr;}
     std::uint32_t cooperative(const Guid& id,bool exclusive)override{
         if(id==mouse_.instance && exclusive!=exclusive_mouse_){if(exclusive){if(!tap_ || CGAssociateMouseAndMouseCursorPosition(false)!=kCGErrorSuccess)return 0x80070005U;if(CGDisplayHideCursor(CGMainDisplayID())!=kCGErrorSuccess){CGAssociateMouseAndMouseCursorPosition(true);return 0x80070005U;}}else {CGAssociateMouseAndMouseCursorPosition(true);CGDisplayShowCursor(CGMainDisplayID());have_cursor_=false;}exclusive_mouse_=exclusive;}

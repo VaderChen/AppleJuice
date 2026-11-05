@@ -6,7 +6,7 @@
 
 namespace x64arm {
 // 僅保留明確的編譯錯誤，避免舊呼叫端靜默啟用退役後端。
-// 完整舊宣告留於 src/jit/legacy_jit_reference.hpp；SDK 不編入任何 JitEngine 實作。
+// 舊 JIT 的宣告與實作來源均已移除；SDK 不編入任何 JitEngine 實作。
 class JitEngine final {
 public:
     JitEngine() = delete;

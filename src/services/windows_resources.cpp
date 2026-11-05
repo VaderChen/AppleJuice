@@ -515,53 +515,68 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
             (void)copy_text(arg(2)+8+160*stride,128,device.empty()?display_identity::instance:u"X64ARM\\MONITOR");
             if(device.empty())(void)copy_text(arg(2)+8+288*stride,128,std::u16string(u"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Class\\")+std::u16string(display_identity::class_name)+u"\\0000");result=1;}
     }else if(symbol=="ChangeDisplaySettingsA" || symbol=="ChangeDisplaySettingsW" || symbol=="ChangeDisplaySettingsExA" || symbol=="ChangeDisplaySettingsExW"){
-        // User32 桌面模式查詢與 DXGI 共用原生目前模式；本入口只接受現有模式，實際 DXGI 切換由交換鏈持有。
-        const auto current_mode=native_gui_?native_gui_->current_display_mode():std::optional<GuiDisplayMode>{};
-        const auto mode_width=current_mode?current_mode->width:1440U,mode_height=current_mode?current_mode->height:900U;
-        const auto mode_rate=current_mode?(current_mode->refresh_numerator+current_mode->refresh_denominator/2)/current_mode->refresh_denominator:60U;
-        if(job_ui_restrictions()&0x10U){last_error_=5;arg.return_to(state,static_cast<std::uint32_t>(-1));return std::nullopt;}
-        const bool extended=symbol.starts_with("ChangeDisplaySettingsEx");
-        const auto mode=arg(extended?1:0);const auto flags=d(extended?3:1);std::u16string device;
-        if(extended && arg(0))device=wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16(read_ansi(memory,arg(0)));
+        const bool extended=symbol.starts_with("ChangeDisplaySettingsEx");const auto mode=arg(extended?1:0);const auto flags=d(extended?3:1);
+        const auto native=native_gui_?native_gui_->current_display_mode():std::optional<GuiDisplayMode>{};
+        const std::array<std::uint32_t,4> original{native?native->width:1440U,native?native->height:900U,32U,native?(native->refresh_numerator+native->refresh_denominator/2)/native->refresh_denominator:60U};
+        auto selected=mode?gui_.display_mode.value_or(original):gui_.display_registry_mode.value_or(original);
+        auto device=extended && arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16(read_ansi(memory,arg(0)))):std::u16string{};
         for(auto& c:device)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
-        result=0;
-        if(extended && (arg(2) || arg(4) || (!device.empty() && device!=u"\\\\.\\display1")))result=static_cast<std::uint32_t>(-5);
-        else if(flags&~0x7000031fU)result=static_cast<std::uint32_t>(-4);
-        else if(((flags&0x10000008U) && !(flags&1U)) || (flags&0x300U)==0x300U)result=static_cast<std::uint32_t>(-4);
-        else if(mode){const unsigned prefix=wide?64:32,pixels=wide?168:104,total=wide?220:156;
-            if(memory.load(GuestAddress{mode+prefix+4},16)<total)result=static_cast<std::uint32_t>(-5);
-            else {const auto fields=memory.load(GuestAddress{mode+prefix+8},32);
-                if((fields&0x40000U) && memory.load(GuestAddress{mode+pixels},32)!=32)result=static_cast<std::uint32_t>(-2);
-                if((fields&0x80000U) && memory.load(GuestAddress{mode+pixels+4},32)!=mode_width)result=static_cast<std::uint32_t>(-2);
-                if((fields&0x100000U) && memory.load(GuestAddress{mode+pixels+8},32)!=mode_height)result=static_cast<std::uint32_t>(-2);
-                if((fields&0x400000U) && memory.load(GuestAddress{mode+pixels+16},32)>1 && memory.load(GuestAddress{mode+pixels+16},32)!=mode_rate)result=static_cast<std::uint32_t>(-2);
-                if((fields&0x200000U) && memory.load(GuestAddress{mode+pixels+12},32))result=static_cast<std::uint32_t>(-2);
-                if(fields&~0x7c0020U)result=static_cast<std::uint32_t>(-5);
-                if((fields&0x20U) && memory.load(GuestAddress{mode+prefix+12},64))result=static_cast<std::uint32_t>(-2);
+        if(job_ui_restrictions()&0x10U){last_error_=5;result=static_cast<std::uint32_t>(-1);}
+        else if(extended && (arg(2) || arg(4) || (!device.empty() && device!=u"\\\\.\\display1")))result=static_cast<std::uint32_t>(-5);
+        else if((flags&~0x7000031fU) || ((flags&0x10000008U) && !(flags&1U)) || (flags&0x300U)==0x300U)result=static_cast<std::uint32_t>(-4);
+        else {
+            if(mode){const unsigned prefix=wide?64:32,pixels=wide?168:104,total=wide?212:148;
+                if(memory.load(GuestAddress{mode+prefix+4},16)<total)result=static_cast<std::uint32_t>(-5);
+                else {const auto fields=memory.load(GuestAddress{mode+prefix+8},32);
+                    for(const auto [flag,index,offset]:std::array<std::array<unsigned,3>,4>{{{0x80000,0,4},{0x100000,1,8},{0x40000,2,0},{0x400000,3,16}}})
+                        if(fields&flag)selected[index]=static_cast<std::uint32_t>(memory.load(GuestAddress{mode+pixels+offset},32));
+                    if(selected[3]<=1)selected[3]=original[3];
+                    if(selected[0]<320 || selected[1]<200 || selected[0]>16384 || selected[1]>16384 || (selected[2]!=16 && selected[2]!=32) || (selected[3]!=60 && selected[3]!=original[3]))result=static_cast<std::uint32_t>(-2);
+                    if(((fields&0x200000U) && memory.load(GuestAddress{mode+pixels+12},32)) || ((fields&0x20U) && memory.load(GuestAddress{mode+prefix+12},64)))result=static_cast<std::uint32_t>(-2);
+                    if(fields&~0x7c00a0U)result=static_cast<std::uint32_t>(-5);
+                    if((fields&0x80U) && memory.load(GuestAddress{mode+prefix+20},32))result=static_cast<std::uint32_t>(-2);
+                }
+            }
+            if(!result && !(flags&2U)){
+                if(flags&1U)gui_.display_registry_mode=selected;
+                if(!(flags&0x10000000U)){
+                    const auto previous=gui_.display_mode.value_or(original);gui_.display_mode=selected;gui_area_cached_={};
+                    if(previous!=selected)for(const auto& [window,item]:gui_.windows)if(!item.parent && !item.destroying)
+                        enqueue_gui_message({window,selected[2],selected[0]|(std::uint64_t{selected[1]}<<16),0x7e});
+                }
             }
         }
     }else if(symbol.starts_with("EnumDisplaySettings")){
-        const auto current_mode=native_gui_?native_gui_->current_display_mode():std::optional<GuiDisplayMode>{};
+        const auto native=native_gui_?native_gui_->current_display_mode():std::optional<GuiDisplayMode>{};
         auto device=arg(0)?(wide?read_utf16(memory,GuestAddress{arg(0)}):utf8_to_utf16(read_ansi(memory,arg(0)))):std::u16string{};
         for(auto& c:device)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
         const auto& monitors=gui_monitors();const auto index=device.empty()?1:display_device_index(device);
         const unsigned name_bytes=wide?64:32,total=wide?220:156,pixels=wide?168:104;
         if(!arg(2) || (symbol.starts_with("EnumDisplaySettingsEx") && (d(3)&~3U)))fail(87);
         else if(!index || index>monitors.size())fail(1168);
-        else if(d(1)!=0 && d(1)!=UINT32_MAX && d(1)!=UINT32_MAX-1)fail(259);
-        else if(memory.load(GuestAddress{arg(2)+name_bytes+4},16)!=total)fail(87);
+        else if(memory.load(GuestAddress{arg(2)+name_bytes+4},16)<total-8)fail(87);
         else {
-            // 主螢幕沿用原生目前模式；其他顯示器以桌面範圍與更新率表示，dmPosition 為其虛擬桌面左上角。
+            const auto supplied=std::min<unsigned>(total,static_cast<unsigned>(memory.load(GuestAddress{arg(2)+name_bytes+4},16)));
             const auto& monitor=monitors[index-1];
-            const auto mode_width=monitor.primary && current_mode?current_mode->width:static_cast<std::uint32_t>(monitor.rect[2]-monitor.rect[0]);
-            const auto mode_height=monitor.primary && current_mode?current_mode->height:static_cast<std::uint32_t>(monitor.rect[3]-monitor.rect[1]);
-            const auto mode_rate=monitor.primary && current_mode?(current_mode->refresh_numerator+current_mode->refresh_denominator/2)/current_mode->refresh_denominator:monitor.refresh;
-            memory.write(GuestAddress{arg(2)},std::vector<std::uint8_t>(total));(void)copy_text(arg(2),32,u"\\\\.\\DISPLAY"+utf8_to_utf16(std::to_string(index)));
-            memory.store(GuestAddress{arg(2)+name_bytes},16,0x401);memory.store(GuestAddress{arg(2)+name_bytes+2},16,1);memory.store(GuestAddress{arg(2)+name_bytes+4},16,total);
+            std::array<std::uint32_t,4> original{monitor.primary && native?native->width:static_cast<std::uint32_t>(monitor.rect[2]-monitor.rect[0]),monitor.primary && native?native->height:static_cast<std::uint32_t>(monitor.rect[3]-monitor.rect[1]),32U,monitor.primary && native?(native->refresh_numerator+native->refresh_denominator/2)/native->refresh_denominator:monitor.refresh};
+            auto selected=original;std::vector<std::array<std::uint32_t,4>> modes{original};
+            const auto add=[&](std::array<std::uint32_t,4> candidate){if(std::find(modes.begin(),modes.end(),candidate)==modes.end())modes.push_back(candidate);};
+            if(monitor.primary){
+                if(native_gui_)for(const auto& entry:native_gui_->display_modes())for(const auto depth:{32U,16U})add({entry.width,entry.height,depth,(entry.refresh_numerator+entry.refresh_denominator/2)/entry.refresh_denominator});
+                // 常見桌面解析度由沙盒的視窗／交換鏈實際承載，不切換宿主顯示器。
+                for(const auto size:std::array<std::array<unsigned,2>,18>{{{640,480},{800,600},{1024,768},{1152,864},{1280,720},{1280,800},{1280,960},{1280,1024},{1366,768},{1440,900},{1600,900},{1600,1200},{1680,1050},{1920,1080},{1920,1200},{2560,1440},{2560,1600},{3840,2160}}})
+                    if(size[0]<=original[0] && size[1]<=original[1])for(const auto depth:{32U,16U})add({size[0],size[1],depth,60});
+                if(d(1)==UINT32_MAX)selected=gui_.display_mode.value_or(original);
+                else if(d(1)==UINT32_MAX-1)selected=gui_.display_registry_mode.value_or(original);
+            }
+            if(d(1)<UINT32_MAX-1){if(d(1)>=modes.size()){fail(259);arg.return_to(state,result);return std::nullopt;}selected=modes[d(1)];}
+            memory.write(GuestAddress{arg(2)},std::vector<std::uint8_t>(supplied));(void)copy_text(arg(2),32,u"\\\\.\\DISPLAY"+utf8_to_utf16(std::to_string(index)));
+            memory.store(GuestAddress{arg(2)+name_bytes},16,0x401);memory.store(GuestAddress{arg(2)+name_bytes+2},16,1);memory.store(GuestAddress{arg(2)+name_bytes+4},16,supplied);
             memory.store(GuestAddress{arg(2)+name_bytes+8},32,0x007c0020);
             memory.store(GuestAddress{arg(2)+name_bytes+12},32,static_cast<std::uint32_t>(monitor.rect[0]));memory.store(GuestAddress{arg(2)+name_bytes+16},32,static_cast<std::uint32_t>(monitor.rect[1]));
-            memory.store(GuestAddress{arg(2)+pixels-2},16,96);memory.store(GuestAddress{arg(2)+pixels},32,32);
-            memory.store(GuestAddress{arg(2)+pixels+4},32,mode_width);memory.store(GuestAddress{arg(2)+pixels+8},32,mode_height);memory.store(GuestAddress{arg(2)+pixels+16},32,mode_rate);result=1;}
+            memory.store(GuestAddress{arg(2)+pixels-2},16,96);memory.store(GuestAddress{arg(2)+pixels},32,selected[2]);
+            memory.store(GuestAddress{arg(2)+pixels+4},32,selected[0]);memory.store(GuestAddress{arg(2)+pixels+8},32,selected[1]);memory.store(GuestAddress{arg(2)+pixels+16},32,selected[3]);result=1;
+        }
     }else if(symbol=="EnumDisplayMonitors"){
         if(!arg(2))fail(87);
         else if(arg(0))fail(50); // HDC 畫圖枚舉尚未提供，不能回報未套用 clipping 的成功結果。

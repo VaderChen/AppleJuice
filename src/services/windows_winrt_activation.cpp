@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/registry_store.hpp"
 #include "x64arm/unicode.hpp"
+#include "xaudio_interfaces.hpp"
 #include <algorithm>
 
 namespace x64arm {
@@ -110,6 +111,9 @@ std::optional<std::uint32_t> WindowsServices::start_activation_module(GuestState
         start_callbacks(state,memory,{{resolve("kernel32.dll","LoadLibraryExW").value,{path_pointer,0,0}}},Continuation::WinrtOperation,scratch);return std::nullopt;
 }
 bool WindowsServices::begin_inproc_com(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    // 已實作的 XAudio2 系統類別走內建工廠；不採用 C 槽既有的再散布二進位。
+    // 程序自己 CoRegisterClassObject 的工廠仍由上層先處理。
+    if(xaudio::is_class(memory,WindowsCall(state,memory,service)(0)))return false;
     const WindowsCall arg(state,memory,service);const bool create=service.symbol=="CoCreateInstance";
     const auto done=[&](std::uint32_t value){arg.return_to(state,value);return true;};
     std::uint64_t scratch=0;

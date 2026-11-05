@@ -5,12 +5,13 @@
 #include "http_proxy_configuration.hpp"
 #include "internet_connection.hpp"
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <stdexcept>
 #include <system_error>
 
 namespace x64arm {
-HttpState::HttpState(const HttpState& other):next(other.next),nearest_server(other.nearest_server){if(!other.handles.empty() || !other.connection_probes.empty() || other.cache_active)throw std::logic_error("無法複製使用中的 WinHTTP session");}
+HttpState::HttpState(const HttpState& other):next(other.next),last_responses(other.last_responses),nearest_server(other.nearest_server){if(!other.handles.empty() || !other.connection_probes.empty() || other.cache_active)throw std::logic_error("無法複製使用中的 WinHTTP session");}
 HttpState& HttpState::operator=(const HttpState& other){if(this!=&other)*this=HttpState(other);return *this;}
 namespace {
 struct HttpError {std::uint32_t code;};
@@ -46,6 +47,9 @@ std::span<const WindowsServiceDescriptor> http_service_descriptors(){
         {"wininet.dll","HttpEndRequestA",4},{"wininet.dll","HttpEndRequestW",4},{"wininet.dll","InternetWriteFile",4},{"wininet.dll","InternetCrackUrlA",4},{"wininet.dll","InternetCrackUrlW",4},
         {"wininet.dll","HttpAddRequestHeadersA",4},{"wininet.dll","HttpAddRequestHeadersW",4},
         {"wininet.dll","InternetSetOptionA",4},{"wininet.dll","InternetSetOptionW",4},{"wininet.dll","InternetQueryOptionA",4},{"wininet.dll","InternetQueryOptionW",4},
+        {"wininet.dll","InternetSetOptionExA",5},{"wininet.dll","InternetSetOptionExW",5},
+        {"wininet.dll","InternetSetStatusCallback",2},{"wininet.dll","InternetSetStatusCallbackA",2},{"wininet.dll","InternetSetStatusCallbackW",2},
+        {"wininet.dll","InternetSetFilePointer",5},{"wininet.dll","InternetGetLastResponseInfoA",3},{"wininet.dll","InternetGetLastResponseInfoW",3},
         {"wininet.dll","InternetReadFile",4},{"wininet.dll","InternetQueryDataAvailable",4},{"wininet.dll","HttpQueryInfoA",5},{"wininet.dll","HttpQueryInfoW",5},{"wininet.dll","InternetCloseHandle",1},
         {"winhttp.dll","WinHttpOpen",5},{"winhttp.dll","WinHttpConnect",4},{"winhttp.dll","WinHttpOpenRequest",7},
         {"winhttp.dll","WinHttpSetTimeouts",5},{"winhttp.dll","WinHttpAddRequestHeaders",4},{"winhttp.dll","WinHttpSendRequest",7},
@@ -110,7 +114,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
         else if(symbol=="InternetReadFile")symbol="WinHttpReadData";
         else if(symbol=="InternetQueryDataAvailable")symbol="WinHttpQueryDataAvailable";
     }
-    const auto d=[&](unsigned n){return static_cast<std::uint32_t>(arg(n));};const unsigned unit=x86_?4:8;const std::uint8_t pointer_bits=x86_?32:64;std::uint64_t result=0;
+    const auto d=[&](unsigned n){return static_cast<std::uint32_t>(arg(n));};const unsigned unit=x86_?4:8;const std::uint8_t pointer_bits=x86_?32:64;std::uint64_t result=0;bool completed=false;
     auto& handles=runtime_.http.handles;
     const auto text=[&](std::uint64_t address,std::uint32_t length=UINT32_MAX){
         if(!address){if(length && length!=UINT32_MAX)throw HttpError{87};return std::u16string{};}
@@ -118,20 +122,47 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
         if(length==UINT32_MAX)return read_utf16(memory,GuestAddress{address},65536);if(length>65536)throw HttpError{87};
         std::u16string value;value.reserve(length);for(unsigned i=0;i<length;++i)value.push_back(static_cast<char16_t>(memory.load(GuestAddress{address+i*2},16)));return value;
     };
-    const auto insert=[&](HttpHandle object){if(handles.size()>=4096)throw HttpError{8};const auto handle=runtime_.http.next++;handles.emplace(handle,std::move(object));return handle;};
+    const auto insert=[&](HttpHandle object){
+        if(handles.size()>=4096)throw HttpError{8};
+        if(object.parent){const auto& parent=handles.at(object.parent);object.callback=parent.callback;object.callback_flags=parent.callback_flags;}
+        const auto handle=runtime_.http.next++;auto& inserted=handles.emplace(handle,std::move(object)).first->second;
+        if(inserted.inet && inserted.parent){std::vector<std::uint8_t> bytes(unit);for(unsigned i=0;i<unit;++i)bytes[i]=static_cast<std::uint8_t>(handle>>(i*8));queue_http_callback(state,memory,handle,60,bytes,inserted.context);}
+        return handle;
+    };
+    const auto notify=[&](HttpHandle& request,std::uint32_t status,std::uint32_t count){
+        if(!request.inet || !request.callback || !request.context)return;
+        const auto found=std::find_if(handles.begin(),handles.end(),[&](auto& item){return &item.second==&request;});if(found==handles.end())return;
+        std::array<std::uint8_t,4> bytes{};for(unsigned i=0;i<4;++i)bytes[i]=static_cast<std::uint8_t>(count>>(i*8));
+        queue_http_callback(state,memory,found->first,status,(status==31 || status==41)?std::span<const std::uint8_t>(bytes):std::span<const std::uint8_t>{},request.context);
+    };
     const auto start=[&](HttpHandle& request){
         request.io_accounted={};
         if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許 WinHTTP 外部 I/O");
         if(request.inet){request.pending=read_http_cache(request);if(request.pending){request.cache_hit=true;return;}if(request.cache_flags&0x01000000U)throw HttpError{2};}
-        request.cache_hit=false;request.pending=start_native_http(request.input);if(!request.pending)throw HttpError{50};
+        request.cache_hit=false;notify(request,30,0);request.pending=start_native_http(request.input);if(!request.pending)throw HttpError{50};
     };
-    const auto remember_server=[&](const HttpHandle& request){
+    const auto remember_server=[&](HttpHandle& request){
+        if(request.inet){
+            runtime_.http.last_responses[threads_.current]={request.response.error,request.response.error?request.response.status_line:std::string{}};
+            notify(request,31,static_cast<std::uint32_t>(request.input.body.size()));notify(request,40,0);notify(request,41,static_cast<std::uint32_t>(request.response.body.size()));
+        }
         if(request.inet && request.received && !request.response.error){const auto host=internet_connection::url_host(request.response.effective_url.empty()?request.input.url:request.response.effective_url);if(host)runtime_.http.nearest_server=*host;}
     };
     try {
         if(service.symbol=="InternetQueryDataAvailable" && (d(2) || arg(3)))throw HttpError{87};
         if(service.symbol=="InternetReadFile" || service.symbol=="InternetWriteFile"){if(!arg(3))throw HttpError{87};memory.store(GuestAddress{arg(3)},32,0);}
-        if(symbol.starts_with("InternetGetConnectedState")){
+        if(symbol.starts_with("InternetGetLastResponseInfo")){
+            if(!arg(0) || !arg(2))throw HttpError{87};
+            memory.check(GuestAddress{arg(0)},4,Access::Write);memory.check(GuestAddress{arg(2)},4,Access::Write);
+            const auto capacity=memory.load(GuestAddress{arg(2)},32);const auto found=runtime_.http.last_responses.find(threads_.current);
+            const auto code=found==runtime_.http.last_responses.end()?0U:found->second.first;
+            const auto message=found==runtime_.http.last_responses.end()?std::string{}:found->second.second;
+            const auto chars=ansi?message.size():wide_latin(message).size();memory.store(GuestAddress{arg(0)},32,code);
+            if(!arg(1) || capacity<=chars){memory.store(GuestAddress{arg(2)},32,chars+1);throw HttpError{122};}
+            if(ansi){std::vector<std::uint8_t> bytes(message.begin(),message.end());bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);}
+            else memory.write(GuestAddress{arg(1)},utf16_bytes(wide_latin(message)));
+            memory.store(GuestAddress{arg(2)},32,chars);result=1;
+        }else if(symbol.starts_with("InternetGetConnectedState")){
             // 依宿主網路設定：有已啟用、非回送且有預設閘道的介面即為 LAN 連線（一般 PC 回報 LAN｜RAS_INSTALLED）；否則 OFFLINE。
             const bool extended=symbol.starts_with("InternetGetConnectedStateEx");
             if(!arg(0) || d(extended?3:1))throw HttpError{87};
@@ -201,7 +232,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
         }else{
             const auto found=handles.find(arg(0));if(found==handles.end() || found->second.kind==HttpHandle::Kind::Probe)throw HttpError{6};auto& object=found->second;
             const auto require=[&](HttpHandle::Kind kind){if(object.kind!=kind)throw HttpError{12018};};
-            if(symbol=="WinHttpCloseHandle"){
+            if(symbol.starts_with("InternetSetStatusCallback")){
+                if(!object.inet)throw HttpError{12018};if(object.pending)throw HttpError{12019};
+                if(arg(1))memory.check(GuestAddress{arg(1)},1,Access::Execute);
+                result=object.callback;object.callback=arg(1);completed=true;
+            }else if(symbol=="InternetSetFilePointer"){
+                require(HttpHandle::Kind::Request);
+                if(!object.inet || !object.received)throw HttpError{12019};
+                if(object.cache_flags&0x04000000U)throw HttpError{12016};
+                if(object.input.method!="GET" && object.input.method!="HEAD")throw HttpError{12016};
+                if(d(3)>2)throw HttpError{87};
+                const auto raw=arg(2)?(memory.load(GuestAddress{arg(2)},32)<<32)|d(1):static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(d(1))));
+                const auto distance=std::bit_cast<std::int64_t>(raw);const auto base=d(3)==0?UINT64_C(0):d(3)==1?static_cast<std::uint64_t>(object.cursor):static_cast<std::uint64_t>(object.response.body.size());
+                if(distance<0 && (UINT64_C(0)-raw)>base)throw HttpError{131};
+                if(distance>=0 && static_cast<std::uint64_t>(distance)>static_cast<std::uint64_t>(INT64_MAX)-base)throw HttpError{87};
+                const auto position=base+raw;if(!arg(2) && position>UINT32_MAX)throw HttpError{87};
+                if(arg(2))memory.store(GuestAddress{arg(2)},32,position>>32);
+                object.cursor=static_cast<std::size_t>(position);result=static_cast<std::uint32_t>(position);last_error_=0;completed=true;
+            }else if(symbol=="WinHttpCloseHandle"){
                 std::vector<std::uint64_t> closing{arg(0)};for(std::size_t i=0;i<closing.size();++i)for(const auto& [id,item]:handles)if(item.parent==closing[i])closing.push_back(id);for(auto id:closing){
                     close_http_callbacks(state,memory,id);
                     auto& request=handles.at(id);if(request.pending){request.pending->cancel();account_http_io(request);
@@ -224,7 +272,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 }else id=pending->second;
                 auto item=handles.find(id);if(item==handles.end()){object.opening.erase(threads_.current);throw HttpError{6};}auto& request=item->second;
                 if(!request.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={id};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
-                request.response=request.pending->take();account_http_io(request);request.pending.reset();object.opening.erase(threads_.current);if(request.response.error){const auto error=request.response.error;handles.erase(id);throw HttpError{error};}
+                request.response=request.pending->take();account_http_io(request);request.pending.reset();object.opening.erase(threads_.current);if(request.inet && request.response.error)runtime_.http.last_responses[threads_.current]={request.response.error,request.response.status_line};if(request.response.error){const auto error=request.response.error;handles.erase(id);throw HttpError{error};}
                 request.received=request.sent=true;cache_http_response(request);remember_server(request);result=id;
             }else if(symbol=="WinHttpSetOption" || symbol=="WinHttpQueryOption"){
                 #include "winhttp_options.inc"
@@ -290,7 +338,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                         object.input.headers=std::move(headers);object.input.body=std::move(body);object.total=d(4);object.cursor=0;object.response={};object.sent=true;object.received=false;start(object);
                     }
                     if(!object.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={arg(0)};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
-                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.response.error)throw HttpError{object.response.error};object.received=true;cache_http_response(object);remember_server(object);result=1;
+                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;cache_http_response(object);remember_server(object);result=1;
                 }
                 else if(symbol=="HttpSendRequestEx"){
                     // INTERNET_BUFFERS 提供首段標頭、資料與 dwBufferTotal；其餘資料由 InternetWriteFile 補齊，HttpEndRequest 才送出。dwBufferTotal 為 0 時以實際寫入量為準。
@@ -314,7 +362,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                     if(arg(1))throw HttpError{87};
                     if(!object.pending){if(!object.sent || object.received || (object.total && object.input.body.size()!=object.total))throw HttpError{12019};object.total=static_cast<std::uint32_t>(object.input.body.size());start(object);}
                     if(!object.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={arg(0)};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
-                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.response.error)throw HttpError{object.response.error};object.received=true;cache_http_response(object);remember_server(object);result=1;
+                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;cache_http_response(object);remember_server(object);result=1;
                 }
                 else if(symbol=="WinHttpSendRequest"){
                     if(object.pending || (object.sent && object.total!=d(5)))throw HttpError{12019};if(d(5)>16*1024*1024 || d(4)>d(5) || (d(4) && !arg(3)))throw HttpError{87};
@@ -327,9 +375,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 }else if(symbol=="WinHttpReceiveResponse"){
                     if(arg(1))throw HttpError{87};if(!object.sent || object.received || object.input.body.size()!=object.total)throw HttpError{12019};
                     if(!object.pending)throw HttpError{12019};if(!object.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={arg(0)};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
-                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.response.error)throw HttpError{object.response.error};object.received=true;cache_http_response(object);remember_server(object);result=1;
+                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;cache_http_response(object);remember_server(object);result=1;
                 }else if(symbol=="WinHttpReadData" || symbol=="WinHttpQueryDataAvailable"){
-                    if(!object.received)throw HttpError{12019};const bool read=symbol=="WinHttpReadData";const auto count=read?std::min<std::size_t>(d(2),object.response.body.size()-object.cursor):object.response.body.size()-object.cursor;const auto output=arg(read?3:1);if(!output && (read || !inet))throw HttpError{87};if(output)memory.check(GuestAddress{output},4,Access::Write);
+                    if(!object.received)throw HttpError{12019};const bool read=symbol=="WinHttpReadData";const auto count=read?std::min<std::size_t>(d(2),object.response.body.size()-std::min(object.cursor,object.response.body.size())):object.response.body.size()-std::min(object.cursor,object.response.body.size());const auto output=arg(read?3:1);if(!output && (read || !inet))throw HttpError{87};if(output)memory.check(GuestAddress{output},4,Access::Write);
                     if(read && count){memory.check(GuestAddress{arg(1)},count,Access::Write);memory.write(GuestAddress{arg(1)},std::span(object.response.body).subspan(object.cursor,count));object.cursor+=count;}if(output)memory.store(GuestAddress{output},32,count);result=1;
                 }else if(symbol=="WinHttpQueryHeaders"){
                     const auto buffer=arg(inet?2:3),length_pointer=arg(inet?3:4),index_pointer=arg(inet?4:5);
@@ -351,6 +399,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
             }
         }
     }catch(const HttpError& error){last_error_=error.code;}catch(const http_proxy::Error& error){last_error_=error.code;}catch(const SecurityDescriptorError& error){last_error_=error.code;}catch(const MemoryFault&){last_error_=998;}catch(const std::bad_alloc&){last_error_=8;}
+    if(!completed && (symbol=="InternetSetFilePointer" || symbol.starts_with("InternetSetStatusCallback")))result=(symbol=="InternetSetFilePointer" || x86_)?UINT32_MAX:UINT64_MAX;
     arg.return_to(state,result);return std::nullopt;
 }
 }

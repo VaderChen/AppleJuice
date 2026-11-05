@@ -2,6 +2,7 @@
 // 有限正規輸入以整數有效位做分段餘數；零回傳保留被除數符號。
 // 非有限值、非零次正規輸入、零除數、次正規結果及過大指數差尾跳原 CRT。
 // 慢路徑尚未改寫 XMM0／XMM1／RSP；不猜測 errno、NaN 或浮點環境語義。
+#include "guest_heap_cache_layout.h"
 .intel_syntax noprefix
 .text
 .macro remainder name, width, fraction, max_exponent
@@ -482,29 +483,29 @@ Lsmall\@:
     cmove rax, r9
 Lclass\@:
 .endm
-// 每執行緒級距快取（TEB 的 CRT 私有頁，常數與 guest_heap_layout.hpp 相同）：級距 1～64 的空閒區塊以區塊首 8 bytes
+// 每執行緒級距快取（TEB 的 CRT 私有頁，共用 guest_heap_cache_layout.h）：涵蓋 1 KiB payload 與對齊標頭，空閒區塊以首 8 bytes
 // 串接，串列頭 gs:[0x4600+class*8]、數量 gs:[0x4810+class]（每級距至多 32）。配置先取、釋放先放，命中時不碰全域鎖；
 // 只有本執行緒讀寫；宿主在執行緒結束時歸還全域串列，HeapWalk 將其視為空閒。rax 為級距。
 .macro heap_cache_pop got, miss, block, scratch
-    cmp rax, 64
+    cmp rax, X64ARM_GUEST_HEAP_CACHE_CLASSES
     ja \miss
-    mov \block, qword ptr gs:[rax*8 + 0x4600]
+    mov \block, qword ptr gs:[rax*8 + X64ARM_GUEST_HEAP_CACHE_HEAD_OFFSET]
     test \block, \block
     je \miss
     mov \scratch, qword ptr [\block]
-    mov qword ptr gs:[rax*8 + 0x4600], \scratch
-    dec byte ptr gs:[rax + 0x4810]
+    mov qword ptr gs:[rax*8 + X64ARM_GUEST_HEAP_CACHE_HEAD_OFFSET], \scratch
+    dec byte ptr gs:[rax + X64ARM_GUEST_HEAP_CACHE_COUNT_OFFSET]
     jmp \got
 .endm
 .macro heap_cache_push pointer, miss, scratch
-    cmp rax, 64
+    cmp rax, X64ARM_GUEST_HEAP_CACHE_CLASSES
     ja \miss
-    cmp byte ptr gs:[rax + 0x4810], 32
+    cmp byte ptr gs:[rax + X64ARM_GUEST_HEAP_CACHE_COUNT_OFFSET], X64ARM_GUEST_HEAP_CACHE_LIMIT
     jae \miss
-    mov \scratch, qword ptr gs:[rax*8 + 0x4600]
+    mov \scratch, qword ptr gs:[rax*8 + X64ARM_GUEST_HEAP_CACHE_HEAD_OFFSET]
     mov qword ptr [\pointer], \scratch
-    mov qword ptr gs:[rax*8 + 0x4600], \pointer
-    inc byte ptr gs:[rax + 0x4810]
+    mov qword ptr gs:[rax*8 + X64ARM_GUEST_HEAP_CACHE_HEAD_OFFSET], \pointer
+    inc byte ptr gs:[rax + X64ARM_GUEST_HEAP_CACHE_COUNT_OFFSET]
 .endm
 .p2align 6
 .globl _guest_malloc
@@ -560,12 +561,12 @@ _guest__aligned_malloc:
     cmp rcx, qword ptr [r10 + 24]
     ja Laligned_malloc_slow
     mov rax, rcx
-    mov r9d, 1
-    test rax, rax
-    cmove rax, r9
-    add rax, 16
+    // 入口已拒絕零大小；標頭與 payload 使用和 free 相同的級距。
+    add rax, X64ARM_GUEST_HEAP_ALIGNED_HEADER
     jc Laligned_malloc_slow
     heap_size_class
+    heap_cache_pop Laligned_malloc_hit, Laligned_malloc_global, r8, r11
+Laligned_malloc_global:
     heap_lock _aligned_malloc, r9d
     mov r8, qword ptr [r10 + rax*8 + 0x40]
     test r8, r8
@@ -573,9 +574,10 @@ _guest__aligned_malloc:
     mov r11, qword ptr [r8]
     mov qword ptr [r10 + rax*8 + 0x40], r11
     mov dword ptr [r10], 0
+Laligned_malloc_hit:
     mov qword ptr [r8], rcx
     mov qword ptr [r8 + 8], rdx
-    lea rax, [r8 + 16]
+    lea rax, [r8 + X64ARM_GUEST_HEAP_ALIGNED_HEADER]
     ret
 Laligned_malloc_empty:
     mov dword ptr [r10], 0

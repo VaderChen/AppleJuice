@@ -49,7 +49,7 @@ void WindowsServices::poll_registered_waits(GuestMemory& memory){
         // 共用事件以 acquire 原子讀取探查。未發訊且尚未逾時不需進入命名空間鎖；
         // 真正消耗自動重設事件或決定逾時前，仍在鎖內重新檢查，避免多個 waiter 重複領取。
         if(object!=runtime_.wait_objects.end() && !runtime_.wait_state(object->second).signaled() && wait.deadline>runtime_.clock_ticks)continue;
-        SharedEventLock lock(object!=runtime_.wait_objects.end() && object->second.shared_event?object->second.shared_event->lock_descriptor():-1);
+        SharedEventLock lock(object!=runtime_.wait_objects.end()?runtime_.wait_lock_descriptor(object->second):-1);
         if(object!=runtime_.wait_objects.end())signaled=runtime_.wait_state(object->second).signaled();
         else if(const auto id=thread_id(wait.target))signaled=threads_.items.at(id).status==ThreadStatus::Exited;
         else if(const auto result=process_signaled(wait.target))signaled=*result;

@@ -32,11 +32,7 @@
             if(!native_gui_ || found==gui_.windows.end() || found->second.parent || !found->second.visible || found->second.show_command==2)return 0x887a0022U;
             auto mode=native_gui_->current_display_mode();if(word(swap->desc,x86_?56:64)&2U)mode=closest_display_mode(swap->target_mode);if(!mode)return not_found;
             if(!target)target=create_output(device_adapter(object(swap->device).identity));else hold(target);
-            if(!native_gui_->display_fullscreen(swap->window,true,mode)){release(target);return 0x887a0022U;}
-            auto& window=found->second;
-            if(!swap->fullscreen){swap->windowed_rect={window.x,window.y,static_cast<std::int32_t>(window.width),static_cast<std::int32_t>(window.height)};swap->windowed_style=window.style;swap->windowed_ex_style=window.ex_style;swap->windowed_insets=window.frame_insets;}
+            if(!enter_graphics_fullscreen(*swap,mode)){release(target);return 0x887a0022U;}
             const auto previous=swap->fullscreen_output;swap->fullscreen_output=target;if(previous)release(previous);
-            window.style=(window.style&~0x00cf0000U)|0x80000000U;window.frame_insets=std::array<std::uint32_t,4>{};
-            const auto rect=gui_screen_area();notify_swap_window(swap->window,rect[0],rect[1],static_cast<std::uint32_t>(rect[2]-rect[0]),static_cast<std::uint32_t>(rect[3]-rect[1]));
-            swap->fullscreen=true;swap->target_mode=display_mode_bytes(*mode,word(swap->desc,16));put_word(swap->desc,x86_?48:56,0);return 0;
+            swap->target_mode=display_mode_bytes(*mode,word(swap->desc,16));put_word(swap->desc,x86_?48:56,0);return 0;
         };

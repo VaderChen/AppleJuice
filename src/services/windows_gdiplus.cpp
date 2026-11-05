@@ -1,5 +1,8 @@
 #include "x64arm/windows_services.hpp"
 #include "texture_load.hpp"
+#include "gdiplus_codecs.hpp"
+#include "x64arm/unicode.hpp"
+#include "x64arm/windows_paths.hpp"
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
@@ -22,7 +25,7 @@ struct GdiplusState {
     std::uint64_t next_token{1};
     unsigned startups{};
     // GdipLoadImageFromStream：以 IStream::Read 分段讀入，完成後由共用影像解碼器轉成 32bppARGB。
-    struct StreamLoad {std::uint64_t stream{},output{},buffer{};std::vector<std::uint8_t> bytes;};
+    struct StreamLoad {std::uint64_t stream{},output{},buffer{};std::vector<std::uint8_t> bytes;bool saving{};std::size_t offset{};std::uint32_t sent{};};
     std::map<std::uint64_t,StreamLoad> loads;std::uint64_t next_load{1};
 };
 namespace {
@@ -42,6 +45,22 @@ std::uint32_t unpremultiply(std::uint32_t pargb){
     const auto scale=[&](unsigned shift){return std::min(255U,(((pargb>>shift)&255U)*255U+a/2U)/a)<<shift;};
     return (a<<24)|scale(16)|scale(8)|scale(0);
 }
+template<class Allocate,class Release>
+std::uint32_t decode_bitmap(GdiplusState& g,GuestMemory& memory,std::span<const std::uint8_t> bytes,std::uint64_t output,std::uint8_t pointer_bits,Allocate allocate,Release release){
+    texture_image::Decoded image;
+    try{image=texture_image::decode(bytes);}catch(const texture_image::Error&){return unknown_image_format;}
+    if(image.desc.format!=28 || image.pixels.empty())return unknown_image_format;
+    auto& pixels=image.pixels.front();for(std::size_t i=0;i+3<pixels.size();i+=4)std::swap(pixels[i],pixels[i+2]);
+    GdiplusState::Bitmap bitmap{image.desc.width,image.desc.height,argb32,static_cast<std::int64_t>(image.desc.width)*4,0,true};
+    memory.check(GuestAddress{output},pointer_bits/8,Access::Write);
+    bitmap.scan0=allocate(pixels.size());if(!bitmap.scan0)return out_of_memory;
+    std::uint64_t handle=0;
+    try{
+        memory.write(GuestAddress{bitmap.scan0},pixels);handle=allocate(16U);
+        if(!handle){release(bitmap.scan0);return out_of_memory;}
+        g.bitmaps.emplace(handle,bitmap);memory.store(GuestAddress{output},pointer_bits,handle);return ok;
+    }catch(...){if(handle){g.bitmaps.erase(handle);release(handle);}release(bitmap.scan0);throw;}
+}
 }
 std::span<const WindowsServiceDescriptor> gdiplus_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
@@ -55,6 +74,12 @@ std::span<const WindowsServiceDescriptor> gdiplus_service_descriptors(){
         {"gdiplus.dll","GdipDrawImageI",4},{"gdiplus.dll","GdipDrawImageRectI",6},
         {"gdiplus.dll","GdipLoadImageFromStream",2},{"gdiplus.dll","GdipLoadImageFromStreamICM",2},
         {"gdiplus.dll","GdipCreateBitmapFromStream",2},{"gdiplus.dll","GdipCreateBitmapFromStreamICM",2},
+        {"gdiplus.dll","GdipGetImageEncodersSize",2},{"gdiplus.dll","GdipGetImageEncoders",3},
+        {"gdiplus.dll","GdipGetImageDecodersSize",2},{"gdiplus.dll","GdipGetImageDecoders",3},
+        {"gdiplus.dll","GdipGetEncoderParameterListSize",3},{"gdiplus.dll","GdipGetEncoderParameterList",4},
+        {"gdiplus.dll","GdipSaveImageToFile",4},{"gdiplus.dll","GdipSaveImageToStream",4},
+        {"gdiplus.dll","GdipLoadImageFromFile",2},{"gdiplus.dll","GdipLoadImageFromFileICM",2},
+        {"gdiplus.dll","GdipCreateBitmapFromFile",2},{"gdiplus.dll","GdipCreateBitmapFromFileICM",2},
         {"gdiplus.dll","GdipBitmapLockBits",5},{"gdiplus.dll","GdipBitmapUnlockBits",2},
         {"gdiplus.dll","GdipGetImagePaletteSize",2},{"gdiplus.dll","GdipGetImagePalette",3},{"gdiplus.dll","GdipGetImageGraphicsContext",2}
     };return table;
@@ -92,6 +117,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
         if(symbol=="GdiplusNotificationHook"){if(!arg(0))return finish(invalid_parameter);memory.store(GuestAddress{arg(0)},pointer_bits,g.next_token++);return finish(ok);}
         if(symbol=="GdiplusNotificationUnhook")return finish(0);
         if(!g.startups)return finish(not_initialized);
+        if(symbol=="GdipGetImageEncodersSize" || symbol=="GdipGetImageDecodersSize"){
+            if(!arg(0) || !arg(1))return finish(invalid_parameter);
+            memory.check(GuestAddress{arg(0)},4,Access::Write);memory.check(GuestAddress{arg(1)},4,Access::Write);
+            memory.store(GuestAddress{arg(0)},32,gdiplus_codec::codecs.size());
+            memory.store(GuestAddress{arg(1)},32,gdiplus_codec::information(x86_,0).size());return finish(ok);
+        }
+        if(symbol=="GdipGetImageEncoders" || symbol=="GdipGetImageDecoders"){
+            if(!arg(2) || u32(0)!=gdiplus_codec::codecs.size())return finish(invalid_parameter);
+            const auto bytes=gdiplus_codec::information(x86_,arg(2));if(u32(1)!=bytes.size())return finish(invalid_parameter);
+            memory.write(GuestAddress{arg(2)},bytes);return finish(ok);
+        }
+        if(symbol=="GdipLoadImageFromFile" || symbol=="GdipLoadImageFromFileICM" || symbol=="GdipCreateBitmapFromFile" || symbol=="GdipCreateBitmapFromFileICM"){
+            if(!arg(0) || !arg(1))return finish(invalid_parameter);memory.store(GuestAddress{arg(1)},pointer_bits,0);
+            const auto path=read_utf16(memory,GuestAddress{arg(0)});if(path.empty())return finish(invalid_parameter);
+            const auto opened=filesystem_.open_reader(utf16_to_utf8(normalized_windows_path(path,runtime_.current_directory)));
+            if(opened.error)return finish(opened.error==2 || opened.error==3?10:opened.error==5?12:7);
+            const auto info=opened.file->information();if(info.error)return finish(7);if(info.metadata.size>stream_limit)return finish(out_of_memory);
+            std::vector<std::uint8_t> bytes(info.metadata.size);const auto io=opened.file->read(bytes,0);
+            if(io.error || io.bytes!=bytes.size())return finish(7);
+            return finish(decode_bitmap(g,memory,bytes,arg(1),pointer_bits,[&](auto size){return allocate_heap(memory,size);},release_handle));
+        }
         // 解碼後的影像固定是點陣圖；CreateBitmapFromStream 與 LoadImageFromStream 共用同一 IStream 讀取流程。
         if(symbol=="GdipLoadImageFromStream" || symbol=="GdipLoadImageFromStreamICM" || symbol=="GdipCreateBitmapFromStream" || symbol=="GdipCreateBitmapFromStreamICM"){
             if(!arg(0) || !arg(1))return finish(invalid_parameter);
@@ -118,6 +164,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
             g.bitmaps[handle]=bitmap;memory.store(GuestAddress{arg(5)},pointer_bits,handle);return finish(ok);
         }
         const auto bitmap_of=[&](std::uint64_t handle)->GdiplusState::Bitmap*{const auto found=g.bitmaps.find(handle);return found==g.bitmaps.end()?nullptr:&found->second;};
+        const auto codec_of=[&](std::uint64_t pointer){gdiplus_codec::Guid id{};memory.read(GuestAddress{pointer},id);return gdiplus_codec::find(id);};
+        if(symbol=="GdipGetEncoderParameterListSize" || symbol=="GdipGetEncoderParameterList"){
+            if(!bitmap_of(arg(0)) || !arg(1))return finish(invalid_parameter);const auto* codec=codec_of(arg(1));if(!codec)return finish(unknown_image_format);
+            const bool jpeg=codec->format==1,tiff=codec->format==10;const unsigned header=x86_?4:8,entry=x86_?28:32;
+            const auto size=(jpeg || tiff)?header+entry+8:header;
+            if(symbol=="GdipGetEncoderParameterListSize"){if(!arg(2))return finish(invalid_parameter);memory.store(GuestAddress{arg(2)},32,size);return finish(ok);}
+            if(!arg(3))return finish(invalid_parameter);if(u32(2)<size)return finish(insufficient_buffer);
+            const auto out=arg(3);memory.fill(GuestAddress{out},0,size);memory.store(GuestAddress{out},32,jpeg || tiff?1:0);
+            if(jpeg || tiff){
+                const auto parameter=out+header,values=parameter+entry;memory.write(GuestAddress{parameter},jpeg?gdiplus_codec::quality:gdiplus_codec::compression);
+                memory.store(GuestAddress{parameter+16},32,jpeg?1:2);memory.store(GuestAddress{parameter+20},32,jpeg?6:4);
+                memory.store(GuestAddress{parameter+24},pointer_bits,values);memory.store(GuestAddress{values},32,jpeg?0:2);memory.store(GuestAddress{values+4},32,jpeg?100:6);
+            }
+            return finish(ok);
+        }
         const auto address_of=[&](const GdiplusState::Bitmap& b,std::uint32_t x,std::uint32_t y){
             return b.scan0+static_cast<std::uint64_t>(static_cast<std::int64_t>(y)*b.stride)+static_cast<std::uint64_t>(x)*pixel_bytes(b.format);
         };
@@ -137,6 +198,42 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
             if(format==rgb24)return 0xff000000U|static_cast<std::uint32_t>(memory.load(GuestAddress{at},16))|(static_cast<std::uint32_t>(memory.load(GuestAddress{at+2},8))<<16);
             const auto value=static_cast<std::uint32_t>(memory.load(GuestAddress{at},32));return format==rgb32?(value|0xff000000U):format==pargb32?unpremultiply(value):value;
         };
+        if(symbol=="GdipSaveImageToFile" || symbol=="GdipSaveImageToStream"){
+            const auto* b=bitmap_of(arg(0));if(!b || !arg(1) || !arg(2))return finish(invalid_parameter);if(b->lock)return finish(object_busy);
+            const auto* codec=codec_of(arg(2));if(!codec)return finish(unknown_image_format);
+            texture_image::EncodeOptions options;
+            if(codec->format==1)options.quality=.75;
+            if(arg(3)){
+                const auto count=memory.load(GuestAddress{arg(3)},32);if(count>64)return finish(invalid_parameter);
+                bool quality_seen=false,compression_seen=false;
+                for(unsigned i=0;i<count;++i){
+                    const auto at=arg(3)+(x86_?4U:8U)+i*(x86_?28U:32U);gdiplus_codec::Guid id{};memory.read(GuestAddress{at},id);
+                    const auto number=memory.load(GuestAddress{at+16},32),type=memory.load(GuestAddress{at+20},32),value=memory.load(GuestAddress{at+24},pointer_bits);
+                    if(number!=1 || type!=4 || !value)return finish(invalid_parameter);const auto scalar=memory.load(GuestAddress{value},32);
+                    if(id==gdiplus_codec::quality && codec->format==1){if(quality_seen || scalar>100)return finish(invalid_parameter);quality_seen=true;options.quality=static_cast<double>(scalar)/100;}
+                    else if(id==gdiplus_codec::compression && codec->format==10){if(compression_seen || (scalar!=2 && scalar!=6))return finish(invalid_parameter);compression_seen=true;options.tiff_compression=scalar==2?5:1;}
+                    else return finish(not_implemented);
+                }
+            }
+            const auto count=std::uint64_t{b->width}*b->height;if(count>stream_limit/4)return finish(out_of_memory);
+            std::vector<std::uint8_t> pixels(static_cast<std::size_t>(count)*4);
+            for(unsigned y=0;y<b->height;++y)for(unsigned x=0;x<b->width;++x){const auto color=read_pixel(*b,x,y);const auto at=(std::size_t{y}*b->width+x)*4;for(unsigned n=0;n<4;++n)pixels[at+n]=static_cast<std::uint8_t>(color>>(n*8));}
+            GraphicsResourceDesc description;description.dimension=3;description.width=b->width;description.height=b->height;description.format=87;
+            auto bytes=texture_image::encode(description,codec->format,[&](unsigned){return std::move(pixels);},options);
+            if(symbol=="GdipSaveImageToFile"){
+                const auto path=read_utf16(memory,GuestAddress{arg(1)});if(path.empty())return finish(invalid_parameter);
+                const auto opened=filesystem_.open_host(utf16_to_utf8(normalized_windows_path(path,runtime_.current_directory)),0x40000000U,2,0x80,0);
+                if(opened.error)return finish(opened.error==5?12:7);const auto written=opened.file->write(bytes,0);
+                return finish(written.error || written.bytes!=bytes.size()?7:ok);
+            }
+            const auto table=memory.load(GuestAddress{arg(1)},pointer_bits),write=memory.load(GuestAddress{table+(x86_?16U:32U)},pointer_bits);
+            if(!write)return finish(invalid_parameter);
+            const auto buffer=allocate_heap(memory,stream_chunk+8);if(!buffer)return finish(out_of_memory);
+            const auto id=g.next_load++;auto& operation=g.loads.emplace(id,GdiplusState::StreamLoad{arg(1),0,buffer,std::move(bytes),true}).first->second;
+            operation.sent=static_cast<std::uint32_t>(std::min<std::size_t>(stream_chunk,operation.bytes.size()));
+            memory.write(GuestAddress{buffer},std::span(operation.bytes).first(operation.sent));memory.store(GuestAddress{buffer+stream_chunk},32,0);
+            start_callbacks(state,memory,{{write,{operation.stream,buffer,operation.sent,buffer+stream_chunk}}},Continuation::GdiplusStream,id);return std::nullopt;
+        }
         if(symbol=="GdipBitmapLockBits"){
             auto* b=bitmap_of(arg(0));const auto data=arg(4);if(!b || !data)return finish(invalid_parameter);if(b->lock)return finish(wrong_state);
             std::array<std::int32_t,4> rect{0,0,static_cast<std::int32_t>(b->width),static_cast<std::int32_t>(b->height)};
@@ -256,6 +353,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
             return finish(ok);
         }
     }catch(const MemoryFault&){return finish(invalid_parameter);}catch(const std::bad_alloc&){return finish(out_of_memory);}
+    catch(const texture_image::Error&){return finish(generic_error);}catch(const std::invalid_argument&){return finish(invalid_parameter);}
     return finish(not_implemented);
 }
 std::optional<std::uint32_t> WindowsServices::resume_gdiplus_stream(GuestState& state,GuestMemory& memory,std::uint64_t id,std::uint64_t value){
@@ -267,6 +365,13 @@ std::optional<std::uint32_t> WindowsServices::resume_gdiplus_stream(GuestState& 
     try{
         const auto status=static_cast<std::uint32_t>(value);if(status&0x80000000U)return finish(generic_error);
         const auto count=static_cast<std::uint32_t>(memory.load(GuestAddress{load.buffer+stream_chunk},32));
+        if(load.saving){
+            if(count!=load.sent)return finish(generic_error);load.offset+=count;if(load.offset==load.bytes.size())return finish(ok);
+            load.sent=static_cast<std::uint32_t>(std::min<std::size_t>(stream_chunk,load.bytes.size()-load.offset));
+            memory.write(GuestAddress{load.buffer},std::span(load.bytes).subspan(load.offset,load.sent));memory.store(GuestAddress{load.buffer+stream_chunk},32,0);
+            const auto table=memory.load(GuestAddress{load.stream},pointer_bits),write=memory.load(GuestAddress{table+(x86_?16U:32U)},pointer_bits);
+            start_callbacks(state,memory,{{write,{load.stream,load.buffer,load.sent,load.buffer+stream_chunk}}},Continuation::GdiplusStream,id);return std::nullopt;
+        }
         if(count>stream_chunk || load.bytes.size()+count>stream_limit)return finish(count>stream_chunk?generic_error:out_of_memory);
         if(count){const auto at=load.bytes.size();load.bytes.resize(at+count);memory.read(GuestAddress{load.buffer},std::span(load.bytes).subspan(at));}
         if(count && status==0){
@@ -275,17 +380,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gdiplus_stream(GuestState& 
             memory.store(GuestAddress{load.buffer+stream_chunk},32,0);
             start_callbacks(state,memory,{{read,{load.stream,load.buffer,stream_chunk,load.buffer+stream_chunk}}},Continuation::GdiplusStream,id);return std::nullopt;
         }
-        texture_image::Decoded image;
-        try{image=texture_image::decode(load.bytes);}catch(const texture_image::Error&){return finish(unknown_image_format);}
-        if(image.desc.format!=28 || image.pixels.empty())return finish(unknown_image_format);
-        const auto width=image.desc.width,height=image.desc.height;auto& pixels=image.pixels.front();
-        // RGBA（非預乘）轉成 GDI+ 32bppARGB 的 BGRA 記憶體順序。
-        for(std::size_t i=0;i+3<pixels.size();i+=4)std::swap(pixels[i],pixels[i+2]);
-        GdiplusState::Bitmap bitmap{width,height,argb32,static_cast<std::int64_t>(width)*4,0,true};
-        bitmap.scan0=allocate_heap(memory,pixels.size());if(!bitmap.scan0)return finish(out_of_memory);
-        memory.write(GuestAddress{bitmap.scan0},pixels);
-        const auto handle=allocate_heap(memory,16);if(!handle){(void)free_heap(memory,bitmap.scan0,state);return finish(out_of_memory);}
-        g.bitmaps[handle]=bitmap;memory.store(GuestAddress{load.output},pointer_bits,handle);return finish(ok);
+        return finish(decode_bitmap(g,memory,load.bytes,load.output,pointer_bits,[&](auto size){return allocate_heap(memory,size);},[&](auto at){(void)free_heap(memory,at,state);}));
     }catch(const MemoryFault&){return finish(invalid_parameter);}catch(const std::bad_alloc&){return finish(out_of_memory);}
 }
 void WindowsServices::discard_gdiplus_stream(GuestState& state,GuestMemory& memory,std::uint64_t id){

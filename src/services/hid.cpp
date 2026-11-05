@@ -171,6 +171,46 @@ void Layout::value(const Field& f,unsigned element,std::uint32_t value,std::span
     }
     for(unsigned i=0;i<f.width;++i){const auto bit=(at+i)&7U;auto& byte=report[(at+i)/8];byte=static_cast<std::uint8_t>((byte&~(1U<<bit))|(((value>>i)&1U)<<bit));}
 }
+std::uint32_t Layout::set_scaled_value(const Field& f,unsigned element,std::int32_t physical,std::span<std::uint8_t> report)const{
+    if(!f.width || f.width>32)throw Error(bad_log_phy_values);
+    const std::int64_t low=f.minimum,high=f.minimum<0?std::int64_t{f.maximum}:std::int64_t{static_cast<std::uint32_t>(f.maximum)};
+    const auto raw_low=f.minimum<0?-(INT64_C(1)<<(f.width-1)):0;
+    const auto raw_high=f.minimum<0?(INT64_C(1)<<(f.width-1))-1:(INT64_C(1)<<f.width)-1;
+    if(low>=high || low<raw_low || high>raw_high)throw Error(bad_log_phy_values);
+    std::int64_t first=low,last=high;
+    if(f.physical_minimum || f.physical_maximum){
+        first=f.physical_minimum;last=first<0?std::int64_t{f.physical_maximum}:std::int64_t{static_cast<std::uint32_t>(f.physical_maximum)};
+        if(first>=last)throw Error(bad_log_phy_values);
+    }
+    if(physical<first || physical>last){
+        if(!(f.flags&0x40U))throw Error(value_out_of_range);
+        // Null 必須使用邏輯範圍外、仍可由欄位位寬表示的值。
+        const auto null=high<raw_high?high+1:low>raw_low?low-1:raw_high+1;
+        if(null>raw_high)throw Error(value_out_of_range);
+        value(f,element,static_cast<std::uint32_t>(null),report);return null_value;
+    }
+    const auto logical=low+static_cast<std::int64_t>((static_cast<__int128>(physical-first)*(high-low))/(last-first));
+    value(f,element,static_cast<std::uint32_t>(logical),report);return success;
+}
+namespace {
+std::pair<unsigned,unsigned> array_bits(const Field& field,unsigned element,std::size_t report_size,std::size_t array_size){
+    if(field.button || field.range || !field.variable() || element>=field.count || field.value_count(element)<=1)throw Error(not_value_array);
+    const auto count=std::uint64_t{field.width}*field.value_count(element),start=std::uint64_t{field.offset}+std::uint64_t{element}*field.width;
+    if(start+count>report_size*8)throw Error(invalid_length);
+    if((count+7)/8>array_size)throw Error(buffer_too_small);
+    return {static_cast<unsigned>(start),static_cast<unsigned>(count)};
+}
+}
+void Layout::get_value_array(const Field& field,unsigned element,std::span<const std::uint8_t> report,std::span<std::uint8_t> values)const{
+    const auto [start,count]=array_bits(field,element,report.size(),values.size());
+    std::fill_n(values.begin(),(count+7)/8,0);
+    for(unsigned bit=0;bit<count;++bit)values[bit/8]|=static_cast<std::uint8_t>(((report[(start+bit)/8]>>((start+bit)&7U))&1U)<<(bit&7U));
+}
+void Layout::set_value_array(const Field& field,unsigned element,std::span<std::uint8_t> report,std::span<const std::uint8_t> values)const{
+    const auto [start,count]=array_bits(field,element,report.size(),values.size());
+    for(unsigned bit=0;bit<count;++bit){const auto shift=(start+bit)&7U;auto& byte=report[(start+bit)/8];
+        byte=static_cast<std::uint8_t>((byte&~(1U<<shift))|(((values[bit/8]>>(bit&7U))&1U)<<shift));}
+}
 const Field* Layout::find(unsigned type,Usage wanted,unsigned link,std::uint8_t report,bool button,unsigned* element)const{
     if(type>=3)throw Error(invalid_type);bool wrong_report=false;
     for(const auto& f:fields)if(f.type==type && f.button==button && (!link || f.link==link)){

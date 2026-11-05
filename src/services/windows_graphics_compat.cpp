@@ -3,6 +3,7 @@
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/windows_transform.hpp"
 #include "rounded_region.hpp"
+#include "gui_paint_region.hpp"
 #include <algorithm>
 
 namespace x64arm {
@@ -13,7 +14,8 @@ std::span<const WindowsServiceDescriptor> graphics_compat_service_descriptors() 
         {"gdi32.dll","CombineRgn",4},{"gdi32.dll","OffsetRgn",3},{"gdi32.dll","GetRgnBox",2},
         {"gdi32.dll","PtInRegion",3},{"gdi32.dll","RectInRegion",2},{"gdi32.dll","EqualRgn",2},{"gdi32.dll","GetRegionData",3},
         {"user32.dll","GetWindowRgn",2},{"user32.dll","GetWindowRgnBox",2},{"user32.dll","SetWindowRgn",3},
-        {"user32.dll","RedrawWindow",4},{"user32.dll","ValidateRect",2},
+        {"user32.dll","RedrawWindow",4},{"user32.dll","ValidateRect",2},{"user32.dll","ValidateRgn",2},
+        {"user32.dll","GetUpdateRgn",3},{"user32.dll","ExcludeUpdateRgn",2},
         {"user32.dll","CopyRect",2},{"user32.dll","SetRect",5},{"user32.dll","SetRectEmpty",1},
         {"user32.dll","EqualRect",2},{"user32.dll","IsRectEmpty",1},{"user32.dll","PtInRect",2,2},
         {"user32.dll","InflateRect",3},{"user32.dll","IntersectRect",3},{"user32.dll","UnionRect",3},{"user32.dll","SubtractRect",3},
@@ -34,6 +36,7 @@ void WindowsServices::clear_layered_content(std::uint64_t handle){
     found->second.layered_pixels.clear();rasters_.erase(0x10000000U+handle);if(native_gui_)native_gui_->graphics_surface(handle,{});
 }
 std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    if(service.symbol=="ExcludeUpdateRgn")return invoke_gdi_state(state,memory,service);
     if(invoke_remote_gui(state,memory,service))return std::nullopt;
     const WindowsCall arg(state,memory,service);
     const auto symbol=service.symbol;
@@ -174,46 +177,48 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
                 else {memory.check(GuestAddress{arg(2)},bytes,Access::Write);memory.store(GuestAddress{arg(2)},32,32);memory.store(GuestAddress{arg(2)+4},32,1);memory.store(GuestAddress{arg(2)+8},32,region.size());memory.store(GuestAddress{arg(2)+12},32,region.size()*16);write_rect(arg(2)+16,gui_region_bounds(region));for(std::size_t i=0;i<region.size();++i)write_rect(arg(2)+32+i*16,region[i]);result=bytes;}
             }
         }catch(const std::bad_alloc&){fail(8);}catch(const std::length_error&){fail(8);}
-    } else if(symbol=="RedrawWindow" || symbol=="ValidateRect"){
-        const auto flags=symbol=="ValidateRect"?0x48U:static_cast<std::uint32_t>(arg(3));
+    } else if(symbol=="RedrawWindow" || symbol=="ValidateRect" || symbol=="ValidateRgn" ||
+              symbol=="InvalidateRect" || symbol=="InvalidateRgn"){
+        const bool validating=symbol.starts_with("Validate"),invalidating=symbol.starts_with("Invalidate");
+        const auto flags=validating?0x48U:invalidating?(0x41U|(arg(2)?4U:0U)):static_cast<std::uint32_t>(arg(3));
         const bool desktop=!arg(0) || arg(0)==gui_.desktop;
         if(flags&~0xfffU)fail(87);
         else if(!desktop && !gui_.windows.contains(arg(0)))fail(1400);
-        else if(symbol=="RedrawWindow" && arg(2))fail(50); // HRGN 後端尚未提供。
-        else {
-            std::optional<std::array<std::int32_t,4>> rect;
-            if(arg(1)){std::array<std::int32_t,4> r{};for(unsigned i=0;i<4;++i)r[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(1)+i*4},32));rect=r;}
+        else try {
+            std::optional<GuiRegion> region;
+            const auto hrgn=symbol=="RedrawWindow"?arg(2):symbol.ends_with("Rgn")?arg(1):0;
+            if(hrgn){const auto found=gui_.regions.find(hrgn);if(found==gui_.regions.end()){fail(6);complete_call(state,memory,0);return std::nullopt;}region=found->second;}
+            else if(arg(1) && !symbol.ends_with("Rgn")){
+                GuiRect rect{};for(unsigned i=0;i<4;++i)rect[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(1)+i*4},32));
+                region=gui_rect_empty(rect)?GuiRegion{}:GuiRegion{rect};
+            }
             std::vector<std::uint64_t> windows;
             if(desktop){for(const auto& [h,w]:gui_.windows)if(!w.parent)windows.push_back(h);}else windows.push_back(arg(0));
             for(std::size_t i=0;i<windows.size();++i){const auto& parent=gui_.windows.at(windows[i]);if(!(flags&0x40) && ((flags&0x80) || !(parent.style&0x02000000U)))for(const auto& [h,w]:gui_.windows)if(w.parent==windows[i] && std::find(windows.begin(),windows.end(),h)==windows.end())windows.push_back(h);}
-            bool supported=true,empty=false;
-            if(rect){
-                empty=(*rect)[0]>=(*rect)[2] || (*rect)[1]>=(*rect)[3];
-                // 現有 GUI 更新狀態以整個 client area 為單位；不把部分 Validate 假裝成全區成功。
-                if(!empty && (flags&9U)){
-                    if(desktop)supported=false;
-                    else {const auto& w=gui_.windows.at(arg(0));
-                        if((*rect)[2]<=0 || (*rect)[3]<=0 || (*rect)[0]>=static_cast<std::int64_t>(w.width) || (*rect)[1]>=static_cast<std::int64_t>(w.height))empty=true;
-                        else supported=(*rect)[0]<=0 && (*rect)[1]<=0 && (*rect)[2]>=static_cast<std::int64_t>(w.width) && (*rect)[3]>=static_cast<std::int64_t>(w.height);
-                    }
-                }
-            }
-            if((flags&0x300) && std::any_of(windows.begin(),windows.end(),[&](auto h){return gui_.windows.at(h).thread!=threads_.current;}))supported=false;
-            if(!supported)fail(50);
+            if((flags&0x300) && std::any_of(windows.begin(),windows.end(),[&](auto h){return gui_.windows.at(h).thread!=threads_.current;}))fail(50);
             else {
-                std::vector<GuestCallback> callbacks;
+                // 先以現有 GDI 區域後端完成聯集／差集；子視窗換成自己的 client 座標。
+                const auto origin=desktop?std::array<std::int64_t,2>{}:gui_client_origin(gui_,arg(0));
+                std::vector<GuiRegion> changes;changes.reserve(windows.size());std::vector<bool> affected;
                 for(const auto h:windows){
-                    auto& w=gui_.windows.at(h);const auto proc=w.procedure;
-                    if(!empty && (flags&1)){invalidate_window(h);if(flags&4)w.paint_erase=true;if(flags&0x400)w.paint_frame=true;}
-                    if(flags&0x20)w.paint_erase=false;if(flags&0x800)w.paint_frame=false;
+                    const auto& w=gui_.windows.at(h);auto input=region.value_or(gui_client_region(w));
+                    if(region && (desktop || h!=arg(0))){const auto child=gui_client_origin(gui_,h);
+                        for(auto& rect:input)for(unsigned i=0;i<4;++i){const auto v=static_cast<std::int64_t>(rect[i])+origin[i%2]-child[i%2];if(v<INT32_MIN || v>INT32_MAX)throw std::invalid_argument("更新區域座標溢位");rect[i]=static_cast<std::int32_t>(v);}}
+                    input=gui_region_combine(input,gui_client_region(w),1);affected.push_back(!input.empty());auto updated=gui_update_region(w);
+                    if(flags&1)updated=gui_region_combine(updated,input,2);
+                    if(flags&8)updated=gui_region_combine(updated,input,4);
+                    changes.push_back(std::move(updated));
+                }
+                std::vector<GuestCallback> callbacks;
+                for(std::size_t i=0;i<windows.size();++i){const auto h=windows[i];auto& w=gui_.windows.at(h);const auto proc=w.procedure;
                     if(flags&2)w.internal_paint=true;if(flags&0x10)w.internal_paint=false;
-                    if(!empty && (flags&8)){w.invalid=false;w.paint_erase=false;std::erase_if(gui_.queue,[&](const auto& msg){return msg.window==h && msg.message==15 && !w.internal_paint;});}
-                    if(flags&0x10)std::erase_if(gui_.queue,[&](const auto& msg){return msg.window==h && msg.message==15 && !w.invalid;});
-                    if(w.internal_paint && w.visible && std::none_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& msg){return msg.window==h && msg.message==15;})){GuiMessage msg{h,0,0,15};msg.queue_priority=2;enqueue_gui_message(std::move(msg));}
+                    update_window_region(h,std::move(changes[i]));
+                    if((flags&1) && affected[i] && w.invalid){if(flags&4)w.paint_erase=true;if(flags&0x400)w.paint_frame=true;}
+                    if(flags&0x20)w.paint_erase=false;if((flags&8) && (flags&0x800))w.paint_frame=false;
                     if((flags&0x300) && proc && w.invalid){
                         if(w.paint_frame)callbacks.push_back({proc,{h,0x85,1,0}});
-                        if(w.paint_erase)callbacks.push_back({proc,{h,0x14,0x10000000+h,0}});
-                        w.paint_frame=false;w.paint_erase=false;
+                        if(w.paint_erase)callbacks.push_back(gui_erase_callback(proc,h));
+                        w.paint_frame=false;
                     }
                     if((flags&0x100) && proc && (w.invalid || w.internal_paint)){
                         w.internal_paint=false;std::erase_if(gui_.queue,[&](const auto& msg){return msg.window==h && msg.message==15;});callbacks.push_back({proc,{h,15,0,0}});
@@ -222,7 +227,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
                 if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,1);return std::nullopt;}
                 result=1;
             }
-        }
+        }catch(const std::bad_alloc&){fail(8);}catch(const std::length_error&){fail(8);}catch(const std::invalid_argument&){fail(87);}
     } else if(symbol=="SetLayeredWindowAttributes" || symbol=="GetLayeredWindowAttributes") {
         const auto found=gui_.windows.find(arg(0));
         if(found==gui_.windows.end())fail(1400);
@@ -324,15 +329,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
         if(found==gui_.windows.end())fail(1400);
         else {
             auto& window=found->second;
-            if(symbol=="GetUpdateRect") {
-                result=window.invalid?1:0;
-                if(arg(1)) {
-                    memory.write(GuestAddress{arg(1)},std::array<std::uint8_t,16>{});
-                    if(window.invalid){memory.store(GuestAddress{arg(1)+8},32,window.width);memory.store(GuestAddress{arg(1)+12},32,window.height);}
+            if(symbol=="GetUpdateRect" || symbol=="GetUpdateRgn") {
+                const auto region=gui_update_region(window);
+                result=symbol=="GetUpdateRect"?!region.empty():gui_region_kind(region);
+                if(symbol=="GetUpdateRgn"){
+                    const auto target=gui_.regions.find(arg(1));if(target==gui_.regions.end()){fail(6);complete_call(state,memory,0);return std::nullopt;}
+                    target->second=region;
+                }else if(arg(1)){
+                    const auto bounds=gui_region_bounds(region);memory.check(GuestAddress{arg(1)},16,Access::Write);
+                    for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(1)+i*4},32,static_cast<std::uint32_t>(bounds[i]));
                 }
-                if(result && arg(2) && window.procedure) {
-                    // 擦除是客體 WNDPROC 的同步 callback；不能用成功回傳代替。
-                    start_callbacks(state,memory,{{window.procedure,{arg(0),0x14,UINT64_C(0x10000000)+arg(0),0}}},Continuation::Return,1);
+                if(!region.empty() && arg(2) && window.procedure && window.paint_erase) {
+                    start_callbacks(state,memory,{gui_erase_callback(window.procedure,arg(0))},Continuation::Return,result);
                     return std::nullopt;
                 }
             } else if(symbol.starts_with("GetWindowLong") || symbol.starts_with("SetWindowLong")) {

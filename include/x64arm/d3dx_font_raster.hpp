@@ -9,6 +9,12 @@
 #include <string_view>
 
 namespace x64arm {
+// 沒有輸入字元時不建立光柵／貼圖或排入 sprite，保留既有 DC、矩形及裝置狀態。
+// 正數 Count 仍可能包含嵌入的 NUL；只對零長度與 -1 終止字串判斷空輸入。
+inline bool d3dx_font_empty_text(GuestMemory& memory,std::uint64_t text,std::int32_t count,bool wide){
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3DX_FONT_EMPTY_DRAW");return !value || std::string_view(value)!="0";}();
+    return enabled && (!count || (count==-1 && text && !memory.load(GuestAddress{text},wide?16:8)));
+}
 // 快取的是完整排版結果及像素；每次仍建立原有 D3DX 貼圖／sprite 身分。
 // 保留 memory DC 的最後繪製像素，避免 GetDC／GetPixel 觀察到舊內容。
 class D3dxFontDrawCache {

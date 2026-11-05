@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/unicode.hpp"
 #include <algorithm>
 #include <new>
 
@@ -22,6 +23,13 @@ void refresh_table(const GuestMemory& memory,RuntimeFunctionTable& table) {
     image.functions=std::move(functions);
 }
 }
+const RuntimeFunctionTable* WindowsServices::function_table_callback(std::uint64_t pc) const {
+    if(x86_)return nullptr;
+    if(const auto* module=module_image(pc,true);module && lookup_function(*module,pc))return nullptr;
+    for(const auto& table:runtime_.dynamic_function_tables)
+        if(table.callback && pc>=table.image.base && pc<table.range_end)return &table;
+    return nullptr;
+}
 const RuntimeImage* WindowsServices::unwind_image(GuestMemory& memory,std::uint64_t pc,std::uint64_t function_entry) {
     const auto* module=module_image(pc,true);
     if(module && lookup_function(*module,pc,function_entry))return module;
@@ -29,6 +37,14 @@ const RuntimeImage* WindowsServices::unwind_image(GuestMemory& memory,std::uint6
         auto& image=table.image;
         const auto address=image.function_table;
         if(pc<image.base || pc>=table.range_end)continue;
+        if(table.callback){
+            // 回呼返回的指標只用於此次查詢，不持久快取其內容或假設它位於原表範圍。
+            if(!function_entry)continue;
+            auto selected=table;selected.image.function_table=function_entry;selected.count=1;
+            refresh_table(memory,selected);
+            if(!lookup_function(selected.image,pc,function_entry))return nullptr;
+            image.function_table=function_entry;image.functions=std::move(selected.image.functions);return &image;
+        }
         if(function_entry && (function_entry<address || (function_entry-address)%12 || (function_entry-address)/12>=table.count))continue;
         refresh_table(memory,table);
         if(lookup_function(image,pc,function_entry))return &image;
@@ -37,6 +53,20 @@ const RuntimeImage* WindowsServices::unwind_image(GuestMemory& memory,std::uint6
 }
 std::optional<std::uint32_t> WindowsServices::invoke_function_table(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);const auto address=arg(0);bool result=false;
+    if(service.symbol=="RtlInstallFunctionTableCallback"){
+        const auto base=arg(1),callback=arg(3);const auto length=static_cast<std::uint32_t>(arg(2));
+        if(!x86_ && (address&3U)==3U && callback && length && base<=UINT64_MAX-length &&
+           std::none_of(runtime_.dynamic_function_tables.begin(),runtime_.dynamic_function_tables.end(),[&](const auto& entry){return entry.identifier==address || (!entry.handle && entry.image.function_table==address);} )){
+            try{
+                memory.check(GuestAddress{callback},1,Access::Execute);
+                RuntimeFunctionTable table;table.identifier=address;table.callback=callback;table.context=arg(4);
+                table.image.base=base;table.image.size=length;table.range_end=base+length;
+                if(arg(5))table.out_of_process_callback=read_utf16(memory,GuestAddress{arg(5)},32767);
+                runtime_.dynamic_function_tables.push_back(std::move(table));result=true;
+            }catch(const MemoryFault&){}catch(const std::bad_alloc&){}
+        }
+        arg.return_to(state,result);return {};
+    }
     if(service.symbol=="RtlAddGrowableFunctionTable") {
         std::uint32_t status=0xc000000dU;
         const auto entries=arg(1),base=arg(4),end=arg(5);
@@ -70,7 +100,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_function_table(GuestState& 
         arg.return_to(state,0);return std::nullopt;
     }
     if(!x86_ && service.symbol=="RtlDeleteFunctionTable") {
-        const auto found=std::find_if(runtime_.dynamic_function_tables.begin(),runtime_.dynamic_function_tables.end(),[&](const auto& table){return !table.handle && table.image.function_table==address;});
+        const auto found=std::find_if(runtime_.dynamic_function_tables.begin(),runtime_.dynamic_function_tables.end(),[&](const auto& table){return table.callback?table.identifier==address:!table.handle && table.image.function_table==address;});
         if(found!=runtime_.dynamic_function_tables.end()){runtime_.dynamic_function_tables.erase(found);result=true;}
     }
     else if(!x86_ && service.symbol=="RtlAddFunctionTable") {
@@ -88,5 +118,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_function_table(GuestState& 
     }
     // BOOLEAN 失敗沒有 Win32 LastError 契約。
     arg.return_to(state,result?1:0);return std::nullopt;
+}
+std::optional<std::uint32_t> WindowsServices::finish_function_lookup(GuestState& state,GuestMemory& memory,Continuation mode,std::uint64_t entry){
+    if(mode==Continuation::ExceptionFunctionLookup){
+        auto& dispatch=exceptions_.stack.back();dispatch.function_query_entry=entry;dispatch.function_query_ready=true;return {};
+    }
+    const WindowsCall call(state,memory,mode==Continuation::FunctionTableLookup?3U:1U);
+    if(mode==Continuation::FunctionTableLookup){
+        std::uint64_t result=0;
+        if(entry)if(const auto* image=unwind_image(memory,call(0),entry)){memory.store(GuestAddress{call(1)},64,image->base);result=entry;}
+        call.return_to(state,result);return {};
+    }
+    auto caller=state;call.return_to(caller,state.reg(Gpr::Rax));
+    if(entry)if(const auto* image=unwind_image(memory,caller.rip.value,entry))caller=virtual_unwind(memory,*image,caller.rip.value,caller,0,entry).caller;
+    write_context(memory,call(0),caller);call.return_to(state,0);return {};
 }
 }

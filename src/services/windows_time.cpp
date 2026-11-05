@@ -51,7 +51,7 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
         {"kernel32.dll","SystemTimeToTzSpecificLocalTime",3},{"kernel32.dll","TzSpecificLocalTimeToSystemTime",3},
         {"kernel32.dll","GetSystemTimes",3},{"kernel32.dll","GetDynamicTimeZoneInformation",1},{"kernel32.dll","GetTimeZoneInformation",1},{"kernel32.dll","GetTimeZoneInformationForYear",3},
         {"advapi32.dll","EnumDynamicTimeZoneInformation",2},{"advapi32.dll","GetDynamicTimeZoneInformationEffectiveYears",3},{"kernel32.dll","GetSystemTime",1},{"kernel32.dll","GetLocalTime",1}
-        ,{"kernel32.dll","SetSystemTime",1},{"kernel32.dll","GetSystemTimeAdjustment",3},{"kernel32.dll","SetSystemTimeAdjustment",2}
+        ,{"kernel32.dll","SetSystemTime",1},{"kernel32.dll","SetLocalTime",1},{"kernel32.dll","GetSystemTimeAdjustment",3},{"kernel32.dll","SetSystemTimeAdjustment",2}
         ,{"kernel32.dll","FileTimeToLocalFileTime",2},{"kernel32.dll","LocalFileTimeToFileTime",2}
         ,{"kernel32.dll","FileTimeToSystemTime",2},{"kernel32.dll","SystemTimeToFileTime",2},{"kernel32.dll","CompareFileTime",2}
         ,{"kernel32.dll","FileTimeToDosDateTime",3},{"kernel32.dll","DosDateTimeToFileTime",3}
@@ -168,7 +168,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
         else result=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
         call.return_to(state,result);return std::nullopt;
     }
-    if(service.symbol=="SetSystemTime" || service.symbol=="GetSystemTimeAdjustment" || service.symbol=="SetSystemTimeAdjustment"){
+    if((service.symbol=="SetSystemTime" || service.symbol=="SetLocalTime") || service.symbol=="GetSystemTimeAdjustment" || service.symbol=="SetSystemTimeAdjustment"){
         const WindowsCall call(state,memory,service);
         const auto finish=[&](unsigned value,unsigned error=0){if(error)last_error_=error;call.return_to(state,value);return std::optional<std::uint32_t>{};};
         try{
@@ -181,7 +181,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
         }
         refresh_file_security_context();
         const auto& token=runtime_.token_objects.at(effective_token_id());
-        const bool setting=service.symbol=="SetSystemTime";
+        const bool setting=(service.symbol=="SetSystemTime" || service.symbol=="SetLocalTime");
         if(!token.has_privilege(12,!setting))return finish(0,1314);
         auto now=runtime_.system_filetime();
         if(setting){

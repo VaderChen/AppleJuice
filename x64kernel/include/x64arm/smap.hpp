@@ -9,8 +9,8 @@
 
 namespace x64arm {
 // 磁碟格式不包含 C++ 物件、宿主指標或返回堆疊。
+// AotLlvm 對應已移除的 LLVM 區域記錄；保留編號維持磁碟格式，讀到時一律視為無效。
 enum class CompilationBackend : std::uint8_t { Jit, Aot, AotLlvm, ResidentAot };
-class LlvmRegion;
 class AotModule;
 class SmapCache {
 public:
@@ -33,8 +33,6 @@ public:
     std::optional<Restored> restore(std::uint64_t rip, bool fragment, const GuestMemory& memory,
                                   GuestAddress sentinel, const HostServices* services) const;
     void remember(const IrBlock&, const std::vector<std::uint32_t>&, bool fragment, const GuestMemory&, const Arm64Recovery* recovery=nullptr, CompilationBackend backend=CompilationBackend::Jit);
-    bool remember_llvm(const std::shared_ptr<const LlvmRegion>&,const GuestMemory&);
-    std::shared_ptr<const LlvmRegion> restore_llvm(std::uint64_t,const GuestMemory&,GuestAddress sentinel,const HostServices*)const;
     using Policy=std::array<std::uint8_t,32>;
     static Policy source_identity(std::span<const std::uint8_t>);
     // 執行中引擎的產碼身分（CodeDirectory 與宿主產碼能力）；記憶體快取以此區隔不同引擎版本。
@@ -72,7 +70,6 @@ private:
         std::size_t size() const { if(encoded)return length;
             if(!payload)return 0;
             const auto& p=*payload;
-            if(backend==CompilationBackend::AotLlvm){std::size_t bytes=22+p.llvm_payload.size();for(const auto& node:p.nodes)bytes+=9+node.bytes.size();return bytes;}
             if(backend==CompilationBackend::ResidentAot){std::size_t bytes=56+p.llvm_payload.size();for(const auto& node:p.nodes)bytes+=9+node.bytes.size();return bytes;}
             std::size_t bytes=17+p.words.size()*4+p.nodes.size()*2+p.recovery.sites.size()*3;
             if(p.recovery.explicit_ids)bytes+=5+p.recovery.rips.size()*14;
@@ -83,7 +80,7 @@ private:
     std::vector<std::uint8_t> read_record(const Record&) const;
     // 視窗欄位低 6 bits 保存原寬度，bit 6 區分直接 MMU，bit 7 區分 x86。
     // 診斷模式不載入直接存取產物；舊受檢記錄仍保留原格式。
-    // 0：基本區塊，1：原生串接 fragment，2：LLVM，3/4：resident AOT 普通／精確本體。
+    // 0：基本區塊，1：原生串接 fragment，2：已移除的 LLVM 區域（只拒絕舊記錄），3/4：resident AOT 普通／精確本體。
     using Key=std::tuple<std::uint64_t,std::uint8_t,MemoryOrdering,unsigned>;
     struct LoadedFile {
         std::map<Key,Record> records;std::size_t bytes{},size{},segments{},entries{};

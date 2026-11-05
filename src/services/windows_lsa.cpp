@@ -116,11 +116,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_lsa(GuestState& state,Guest
             if(logon32){
                 if(!arg(0) || !arg(5) || static_cast<std::uint32_t>(arg(4))>3)throw Failure{0xc000000dU};out(arg(5),unit);write(arg(5),0);type=static_cast<std::uint32_t>(arg(3));
                 if(type!=2 && type!=3 && type!=4 && type!=5 && type!=7 && type!=8 && type!=9)throw Failure{0xc000000dU};
-                // NULL 密碼的內建服務帳號、網路保留密碼與 new-credentials 尚無原生對應。
-                if(!arg(2) || type==8 || type==9)throw Failure{0xc00000bbU};
+                // NULL 密碼的內建服務帳號仍需原生服務帳號 provider。
+                if(!arg(2))throw Failure{0xc00000bbU};
                 const auto text=[&](std::uint64_t p){return name.ends_with('W')?read_utf16(memory,GuestAddress{p}):utf8_to_utf16_lossy(read_ansi(memory,p,32767));};
                 user=text(arg(0));if(arg(1))domain=text(arg(1));
                 if(name.ends_with('W'))password.value=read_utf16(memory,GuestAddress{arg(2)});else{authentication::ByteSecret raw;raw.value=read_ansi(memory,arg(2),131068);try{password.value=utf8_to_utf16(raw.value);}catch(const std::invalid_argument&){throw Failure{0xc000000dU};}}
+                if(user.empty() || user.size()>4096 || domain.size()>4096 || password.value.size()>4096)throw Failure{0xc000000dU};
+                if(type==9){
+                    if(arg(4)!=0 && arg(4)!=3)throw Failure{0xc000000dU};
+                    initialize_tokens();collect_tokens();if(runtime_.token_handles.size()>=1024 || runtime_.lsa.sessions.size()>=1024)throw Failure{0xc000009aU};
+                    const auto [id,error]=allocate_luid();if(error)throw Failure{0xc000009aU};
+                    auto token=runtime_.token_objects.at(effective_token_id());token.type=1;token.authentication_id=id;token.source=source;
+                    token.network_user=user;token.network_domain=domain;token.network_password=std::make_shared<authentication::Secret>();token.network_password->value=std::move(password.value);
+                    const auto object=runtime_.next_token_object++,handle=runtime_.allocate_wait_handle();
+                    try{runtime_.token_objects.emplace(object,std::move(token));runtime_.token_handles.emplace(handle,0xf01ff);runtime_.token_handle_objects.emplace(handle,object);runtime_.handle_flags.emplace(handle,0);
+                        runtime_.lsa.sessions.emplace(id,LsaSession{id,now(),9,1,user,domain,user,runtime_.token_objects.at(object).user.sid});
+                    }catch(...){runtime_.token_objects.erase(object);runtime_.token_handles.erase(handle);runtime_.token_handle_objects.erase(handle);runtime_.handle_flags.erase(handle);runtime_.lsa.sessions.erase(id);throw;}new_token=handle;
+                    write(arg(5),handle);arg.return_to(state,1);return {};
+                }
             }else{
                 connection();for(const auto index:{8U,11U})out(arg(index),unit);for(const auto index:{9U,13U})out(arg(index),4);out(arg(10),8);out(arg(12),x86_?32:48);
                 if(!arg(1) || !arg(7))throw Failure{0xc000000dU};const auto origin=ansi_counted(memory,arg(1),x86_);(void)origin;
@@ -137,6 +150,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_lsa(GuestState& state,Guest
             if(verified.status){if(!logon32)write(arg(13),verified.substatus,32);throw Failure{logon32 && verified.substatus?verified.substatus:verified.status};}
             if(!verified.identity || verified.identity->name.empty() || verified.identity->groups.size()>1024)throw Failure{0xc000006dU};
             const auto [handle,error]=logon_token(type,*verified.identity,source,source_id);if(error)throw Failure{error};new_token=handle;
+            if(type==8){auto& token=runtime_.token_objects.at(runtime_.token_handle_objects.at(handle));token.network_user=user;token.network_domain=domain;token.network_password=std::make_shared<authentication::Secret>();token.network_password->value=std::move(password.value);}
             if(logon32){write(arg(5),handle);}else{
                 const auto& session=runtime_.lsa.sessions.at(runtime_.token_objects.at(runtime_.token_handle_objects.at(handle)).authentication_id);
                 std::vector<std::uint8_t> profile(x86_?112:160);put(profile,0,2);put(profile,4,1,2);put(profile,8,session.time,8);put(profile,16,INT64_MAX,8);put(profile,24,INT64_MAX,8);

@@ -1,0 +1,6 @@
+// GUI 時序常式與宿主服務共用的客體資料頁，與可執行常式分離。
+#pragma once
+#define X64ARM_GUI_TIMING_PAGE_OFFSET 0x84000
+#define X64ARM_GUI_TIMING_LOCAL_OFFSET 8
+#define X64ARM_GUI_DOUBLE_CLICK_OFFSET 0
+#define X64ARM_GUI_CARET_BLINK_OFFSET 4

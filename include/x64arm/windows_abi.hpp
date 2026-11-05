@@ -196,6 +196,7 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors();
 std::span<const WindowsServiceDescriptor> d3d9_service_descriptors();
 std::span<const WindowsServiceDescriptor> d3d11_service_descriptors();
 std::span<const WindowsServiceDescriptor> dsound_service_descriptors();
+std::span<const WindowsServiceDescriptor> xaudio_service_descriptors();
 std::span<const WindowsServiceDescriptor> wasapi_service_descriptors();
 std::span<const WindowsServiceDescriptor> media_foundation_service_descriptors();
 std::span<const WindowsServiceDescriptor> dinput_service_descriptors();

@@ -9,10 +9,10 @@
 #include <arm_neon.h>
 #endif
 namespace x64arm::audio::detail {
-template<unsigned Bits> inline float pcm_sample(const std::uint8_t* p){
+template<unsigned Bits,bool ClampFloat=true> inline float pcm_sample(const std::uint8_t* p){
     if constexpr(Bits==8)return (static_cast<float>(*p)-128.F)/128.F;
     if constexpr(Bits==16){const auto raw=static_cast<std::uint16_t>(p[0]|(static_cast<unsigned>(p[1])<<8));return static_cast<float>(static_cast<std::int16_t>(raw))/32768.F;}
-    if constexpr(Bits==32){std::uint32_t raw=0;for(unsigned n=0;n<4;++n)raw|=std::uint32_t{p[n]}<<(n*8);const auto value=std::bit_cast<float>(raw);return std::isfinite(value)?std::clamp(value,-1.F,1.F):0.F;}
+    if constexpr(Bits==32){std::uint32_t raw=0;for(unsigned n=0;n<4;++n)raw|=std::uint32_t{p[n]}<<(n*8);const auto value=std::bit_cast<float>(raw);return std::isfinite(value)?(ClampFloat?std::clamp(value,-1.F,1.F):value):0.F;}
 }
 #if defined(__aarch64__)
 template<unsigned Bits> inline float32x4_t pcm_four(const std::uint8_t* p){
