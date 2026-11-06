@@ -180,7 +180,25 @@ template<class Read> static void metal_trace_stencil_draw(const GraphicsDraw& dr
 }
 // 請求視窗內的 compute dispatch：CS、群組數或間接參數、UAV／SRV 與常數緩衝雜湊，與 draw 追蹤寫在同一檔案。
 void MetalGl::graphics_trace_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups,const std::shared_ptr<GraphicsResource>& arguments,std::uint32_t offset){
-    auto* out=metal_stencil_trace();if(!out || !metal_trace_window() || !stage.shader)return;
+    auto* out=metal_stencil_trace();if(!out || !stage.shader)return;
+    // X64ARM_GRAPHICS_TRACE_ALL_DISPATCH：請求視窗外也列每個 dispatch 的精簡紀錄（著色器、群組數、UAV／前 8 個 SRV 與尺寸），
+    // 追只跑一次的初始化 pass 用；命中 X64ARM_GRAPHICS_TRACE_CK 的 dispatch 照常輸出完整內容。
+    if(!metal_trace_window()){
+        static const bool all_dispatch=std::getenv("X64ARM_GRAPHICS_TRACE_ALL_DISPATCH")!=nullptr;
+        if(!all_dispatch)return;
+        char compact_key[17];std::snprintf(compact_key,sizeof compact_key,"%016llx",static_cast<unsigned long long>(dynamic_cast<const MetalShader&>(*stage.shader).content_key));
+        static const char* const compact_ck=std::getenv("X64ARM_GRAPHICS_TRACE_CK");
+        if(!compact_ck || std::string_view(compact_ck).find(compact_key)==std::string_view::npos){
+            auto& line=*out;line<<"cd ck="<<compact_key<<" g="<<groups[0]<<','<<groups[1]<<','<<groups[2];
+            const auto describe=[&](const char* tag,unsigned index,const GraphicsView& v){
+                if(!v.resource)return;const auto& desc=v.resource->desc;
+                line<<' '<<tag<<index<<'='<<v.resource.get()<<':'<<v.format<<':'<<v.level<<':'<<v.slice<<'/'<<desc.dimension<<':'<<desc.width<<'x'<<desc.height;
+            };
+            for(unsigned i=0;i<stage.unordered.size();++i)describe("u",i,stage.unordered[i]);
+            for(unsigned i=0;i<stage.resources.size() && i<8;++i)describe("t",i,stage.resources[i]);
+            line<<'\n';return;
+        }
+    }
     auto& o=*out;std::vector<std::string> extra;const auto read=[this](const GraphicsView& view){return graphics_read(view);};
     const auto view=[&](const GraphicsView& v){o<<v.resource.get()<<':'<<v.format<<':'<<v.level<<':'<<v.slice;if(v.first || v.count)o<<'+'<<v.first<<'#'<<v.count;};
     {char key[17];std::snprintf(key,sizeof key,"%016llx",static_cast<unsigned long long>(dynamic_cast<const MetalShader&>(*stage.shader).content_key));
@@ -234,6 +252,29 @@ void MetalGl::graphics_trace_dispatch(const GraphicsStage& stage,std::array<std:
             }catch(const std::exception&){o<<' '<<name<<i<<"sum=?";}
         };
         for(unsigned i=0;i<stage.resources.size();++i)summary("t",i,stage.resources[i]);
+        // 貼圖輸入（RGBA16F）：實際內容的總和、最亮點與中心值，並存縮圖；追初始化資料是否正確。
+        for(unsigned i=0;i<stage.resources.size() && i<4;++i){
+            const auto& v=stage.resources[i];if(!v.resource || v.resource->desc.dimension!=3)continue;
+            const auto format=v.format?v.format:v.resource->desc.format;const auto& desc=v.resource->desc;
+            o<<" kt"<<i<<'='<<v.resource.get()<<':'<<desc.width<<'x'<<desc.height<<":f"<<format<<":levels"<<desc.levels;
+            if(format==10 && desc.width<=2048 && desc.height<=2048){
+                try{
+                    const auto bytes=read(v);const unsigned w=std::max(1U,desc.width>>v.level),h=std::max(1U,desc.height>>v.level);
+                    if(bytes.size()>=std::size_t{w}*h*8){
+                        float peak=-INFINITY;unsigned px=0,py=0;double sum=0;std::size_t bad=0,nonzero=0;
+                        for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){
+                            __fp16 c[4];std::memcpy(c,bytes.data()+(std::size_t{y}*w+x)*8,8);
+                            const float l=0.3F*float(c[0])+0.59F*float(c[1])+0.11F*float(c[2]);
+                            if(!std::isfinite(l)){++bad;continue;}
+                            sum+=l;if(l!=0.0F)++nonzero;if(l>peak){peak=l;px=x;py=y;}
+                        }
+                        __fp16 mid[4];std::memcpy(mid,bytes.data()+(std::size_t{h/2}*w+w/2)*8,8);
+                        o<<":sum"<<sum<<":peak"<<peak<<'@'<<px<<','<<py<<":nonzero"<<nonzero<<":bad"<<bad<<":mid"<<float(mid[0])<<','<<float(mid[1])<<','<<float(mid[2])<<','<<float(mid[3]);
+                    }
+                }catch(const std::exception&){o<<":read?";}
+                metal_trace_target(o,"k",i,v,read);
+            }
+        }
         static const char* const offsets=std::getenv("X64ARM_GRAPHICS_TRACE_CK_AT");
         // UAV 紋理（dispatch 完成後）：R16_FLOAT 列平均／最小／最大與非有限值數；其他格式列前 64 個 32 位元字組。
         for(unsigned i=0;i<stage.unordered.size();++i){
@@ -284,7 +325,47 @@ void MetalGl::graphics_trace_dispatch(const GraphicsStage& stage,std::array<std:
     o<<'\n';for(const auto& line:extra)o<<line<<'\n';
 }
 // 請求視窗內 4 KB 以下緩衝的上傳內容（前 32 個 32 位元值），與 dispatch／draw 紀錄同序，用來比對上傳與讀取是否一致。
+void MetalGl::graphics_trace_clear(const GraphicsView& view,const std::array<std::uint32_t,4>& values,bool floating){
+    static const bool all_writes=std::getenv("X64ARM_GRAPHICS_TRACE_ALL_DISPATCH")!=nullptr;
+    if(!all_writes || !view.resource)return;
+    auto* compact=metal_stencil_trace();if(!compact)return;
+    *compact<<"cu res="<<view.resource.get()<<" first="<<view.first<<" count="<<view.count<<" fmt="<<view.format<<" flags="<<view.flags<<" float="<<floating<<" v="<<values[0]<<','<<values[1]<<','<<values[2]<<','<<values[3]<<'\n';
+}
+// 診斷：X64ARM_GRAPHICS_TRACE_CK_PRE=<內容雜湊,…>：命中的 dispatch 編碼前先列出 UAV 緩衝與目前內容（會提交並等待 GPU）。
+void MetalGl::graphics_trace_dispatch_pre(const GraphicsStage& stage){
+    static const char* const keys=std::getenv("X64ARM_GRAPHICS_TRACE_CK_PRE");
+    if(!keys || !stage.shader)return;
+    auto* out=metal_stencil_trace();if(!out)return;
+    char key[17];std::snprintf(key,sizeof key,"%016llx",static_cast<unsigned long long>(dynamic_cast<const MetalShader&>(*stage.shader).content_key));
+    if(std::string_view(keys).find(key)==std::string_view::npos)return;
+    *out<<"pre ck="<<key;
+    for(unsigned i=0;i<stage.unordered.size();++i){
+        const auto& v=stage.unordered[i];if(!v.resource || v.resource->desc.dimension!=1)continue;
+        try{
+            const auto bytes=graphics_read(GraphicsView{v.resource});*out<<" u"<<i<<'='<<v.resource.get()<<'+'<<v.first<<'#'<<v.count<<':';
+            for(std::size_t at=v.first;at+4<=bytes.size() && at<v.first+32;at+=4){std::uint32_t raw;std::memcpy(&raw,bytes.data()+at,4);*out<<raw<<',';}
+        }catch(const std::exception&){*out<<" u"<<i<<"=?";}
+    }
+    *out<<'\n';
+}
+void MetalGl::graphics_trace_copy(const GraphicsView& dst,const GraphicsView& src){
+    static const bool all_writes=std::getenv("X64ARM_GRAPHICS_TRACE_ALL_DISPATCH")!=nullptr;
+    if(!all_writes || !dst.resource || dst.resource->desc.dimension==1)return;
+    auto* compact=metal_stencil_trace();if(!compact)return;
+    const auto& desc=dst.resource->desc;
+    *compact<<"cw kind=copy res="<<dst.resource.get()<<' '<<desc.width<<'x'<<desc.height<<":f"<<desc.format<<" level="<<dst.level<<" slice="<<dst.slice<<" src="<<src.resource.get()<<'\n';
+}
 void MetalGl::graphics_trace_upload(const char* kind,const GraphicsView& view,std::span<const std::uint8_t> data){
+    // X64ARM_GRAPHICS_TRACE_ALL_DISPATCH：貼圖寫入的精簡紀錄（內容是否全零），追資料何時寫入。
+    {
+        static const bool all_writes=std::getenv("X64ARM_GRAPHICS_TRACE_ALL_DISPATCH")!=nullptr;
+        if(all_writes && view.resource && view.resource->desc.dimension!=1){
+            if(auto* compact=metal_stencil_trace()){
+                std::size_t nonzero=0;for(const auto byte:data)nonzero+=byte!=0;const auto& desc=view.resource->desc;
+                *compact<<"cw kind="<<kind<<" res="<<view.resource.get()<<' '<<desc.width<<'x'<<desc.height<<":f"<<(view.format?view.format:desc.format)<<" level="<<view.level<<" slice="<<view.slice<<" bytes="<<data.size()<<" nonzero="<<nonzero<<'\n';
+            }
+        }
+    }
     auto* out=metal_stencil_trace();if(!out || !view.resource || view.resource->desc.dimension!=1 || view.resource->desc.width>4096 || !metal_trace_window())return;
     auto& o=*out;o<<"upload kind="<<kind<<" res="<<view.resource.get()<<" first="<<view.first<<" bytes="<<data.size()<<" data=";
     for(std::size_t at=0;at+4<=data.size() && at<128;at+=4){std::uint32_t value;std::memcpy(&value,data.data()+at,4);o<<value<<',';}

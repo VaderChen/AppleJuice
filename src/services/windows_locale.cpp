@@ -1,3 +1,4 @@
+#include <set>
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_security_attributes.hpp"
@@ -684,6 +685,7 @@ std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
         {"crt","_create_locale",2},{"crt","_wcreate_locale",2},{"crt","_free_locale",1},{"crt","__free_locale",1},{"crt","_get_current_locale",0},{"crt","_configthreadlocale",1},
         {"crt","__x64arm_create_locale_legacy",2},{"crt","__x64arm_wcreate_locale_legacy",2},{"crt","__x64arm_current_locale_legacy",0},
         {"crt","_mbsrchr",2},{"crt","_mbsrchr_l",3},{"crt","_mbschr",2},{"crt","_mbschr_l",3},
+        {"crt","_mbspbrk",2},{"crt","_mbspbrk_l",3},{"crt","_mbscspn",2},{"crt","_mbscspn_l",3},{"crt","_mbsspn",2},{"crt","_mbsspn_l",3},{"crt","_mbsspnp",2},{"crt","_mbsspnp_l",3},
         {"crt","isleadbyte",1},{"crt","_isleadbyte_l",2},{"crt","_ismbblead_l",2},{"crt","_ismbbtrail_l",2},
         {"crt","_setmbcp",1},{"crt","_getmbcp",0},
         {"crt","__p___mb_cur_max",0},{"crt","___mb_cur_max_l_func",1},
@@ -1090,7 +1092,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             const auto mbc=crt_mbc_address(memory,current_crt_locale(state,memory),x86_);
             return returned(memory.load(GuestAddress{mbc+8},32)?memory.load(GuestAddress{mbc+4},32):0);
         }
-        const bool search=name.starts_with("_mbsrchr") || name.starts_with("_mbschr");
+        const bool set_scan=name.starts_with("_mbspbrk") || name.starts_with("_mbscspn") || name.starts_with("_mbsspn");
+        const bool search=set_scan || name.starts_with("_mbsrchr") || name.starts_with("_mbschr");
         if(search || name=="isleadbyte" || name=="_isleadbyte_l" || name.starts_with("_ismbb")){
             const auto* selected=&current_crt_locale(state,memory);
             if(name.ends_with("_l") && arg(search?2:1)){
@@ -1109,6 +1112,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
                 return returned(value<256 && (name.find("trail")!=name.npos?locale.trail[value]:locale.lead[value]));
             }
             if(!arg(0))return invalid(22);
+            if(set_scan){
+                if(!arg(1))return invalid(22);
+                // 逐多位元組字元比對：前導位元組後接 NUL 時以字串結束處理。
+                const auto character=[&](std::uint64_t at,unsigned& count){
+                    auto value=static_cast<unsigned>(memory.load(GuestAddress{at},8));count=1;
+                    if(value && locale.lead[value]){
+                        const auto next=static_cast<unsigned>(memory.load(GuestAddress{at+1},8));
+                        if(!next){value=0;}else{value=(value<<8)|next;count=2;}
+                    }
+                    return value;
+                };
+                std::set<unsigned> members;unsigned count=1;
+                for(std::uint64_t offset=0;offset<output_limit;offset+=count){const auto value=character(arg(1)+offset,count);if(!value)break;members.insert(value);}
+                const bool first_member=name.starts_with("_mbspbrk") || name.starts_with("_mbscspn");
+                const bool want_pointer=name.starts_with("_mbspbrk") || name.starts_with("_mbsspnp");
+                for(std::uint64_t offset=0;offset<output_limit;offset+=count){
+                    const auto value=character(arg(0)+offset,count);
+                    if(!value)return returned(want_pointer?0:offset);
+                    if(members.contains(value)==first_member)return returned(want_pointer?arg(0)+offset:offset);
+                }
+                throw HostCallFault("CRT 多位元組掃描找不到終止字元");
+            }
             const bool reverse=name.starts_with("_mbsrchr");
             const auto target=static_cast<std::uint32_t>(arg(1));std::uint64_t match=0;
             const auto sought=locale.maximum_character_bytes==1?target&255U:target;

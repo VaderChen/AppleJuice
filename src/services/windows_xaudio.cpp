@@ -154,7 +154,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
             if(com && arg(1))result=0x80040110U;else if(com && !(d(2)&1))result=0x80040154U;
             else if(com && !com_apartment(threads_.current))result=0x800401f0U;
             else if(com && iid(arg(3))!=xaudio::iid27 && iid(arg(3))!=xaudio::unknown)result=no_interface;
-            else {if(!com)require(!(d(1)&~1U) && d(2));put(out,new_engine(com?7:service.family=="xaudio2_8.dll"?8:9,!com),bits);}
+            // XAudio2Create 的旗標：DEBUG_ENGINE、STOP_ENGINE_WHEN_IDLE、1024_QUANTUM、NO_VIRTUAL_AUDIO_CLIENT。處理器 0 是 Windows 10 標頭的 XAUDIO2_USE_DEFAULT_PROCESSOR，內建混音由宿主排程，不受此值影響。
+            else {if(!com)require(!(d(1)&~UINT32_C(0x1a001)));put(out,new_engine(com?7:service.family=="xaudio2_8.dll"?8:9,!com),bits);}
         }else {
             if(name=="Work" || name=="Render" || name=="Complete"){
                 const auto found=bridge.objects.find(arg(0));

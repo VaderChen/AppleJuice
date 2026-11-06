@@ -30,6 +30,13 @@ if(X64ARM_RELEASE_IPO AND NOT X64ARM_SANITIZERS)
     message(STATUS "工具鏈不支援 IPO，使用一般 Release 最佳化：${X64ARM_IPO_DETAIL}")
   endif()
 endif()
+# Release 成品不內嵌建置機路徑：__FILE__、source_location 與 FetchContent 來源都改為相對路徑。
+# 須在建立任何目標前設定；建置目錄常位於來源樹內，先列來源再列建置目錄才符合各版 clang 的比對順序。
+if(NOT MSVC)
+  add_compile_options(
+    "$<$<CONFIG:Release>:-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.>"
+    "$<$<CONFIG:Release>:-ffile-prefix-map=${PROJECT_BINARY_DIR}=./build>")
+endif()
 include(cmake/AppleJuiceKernel.cmake)
 include(cmake/Dependencies.cmake)
 include(cmake/MicrosoftDemangle.cmake)
@@ -89,7 +96,7 @@ endfunction()
 
 add_library(x64arm_windows STATIC src/loader/pe_loader.cpp src/services/windows_services.cpp src/services/windows_runtime.cpp src/services/windows_crt_lowio.cpp src/services/process_startup_data.cpp src/services/windows_unwind.cpp src/services/windows_exceptions.cpp src/services/windows_exceptions_x86.cpp src/services/windows_heap.cpp
     src/services/windows_shared_window.cpp src/services/windows_remote_raster.cpp src/services/windows_winstation.cpp src/services/windows_gui.cpp src/services/windows_gui_support.cpp src/services/windows_gui_extra.cpp src/services/windows_common_dialogs.cpp src/services/windows_print_dialogs.cpp src/services/windows_page_setup.cpp src/services/windows_menus.cpp
-    src/services/windows_gui_threads.cpp src/services/windows_gui_remote_messages.cpp src/services/windows_gui_text.cpp src/services/windows_gui_async.cpp src/services/windows_window_interaction.cpp src/services/windows_controls.cpp src/services/windows_gdi.cpp src/services/windows_gdi_text.cpp src/services/windows_userdraw.cpp src/services/windows_dib_transfer.cpp src/services/windows_gdiplus.cpp src/services/windows_ribbon.cpp src/services/windows_task_dialog.cpp src/services/windows_opencl.cpp src/services/windows_vulkan.cpp src/services/windows_directml.cpp src/services/windows_msvcp_pmr.cpp src/services/windows_webview2.cpp src/services/windows_d3d12.cpp src/services/windows_dxcore.cpp src/services/windows_crt_io.cpp src/services/windows_crt_buffer.cpp src/services/unicode.cpp src/services/readonly_files.cpp)
+    src/services/windows_gui_threads.cpp src/services/windows_gui_remote_messages.cpp src/services/windows_gui_text.cpp src/services/windows_gui_async.cpp src/services/windows_window_interaction.cpp src/services/windows_controls.cpp src/services/windows_gdi.cpp src/services/windows_gdi_text.cpp src/services/windows_userdraw.cpp src/services/windows_dib_transfer.cpp src/services/windows_gdiplus.cpp src/services/windows_ribbon.cpp src/services/windows_task_dialog.cpp src/services/windows_opencl.cpp src/services/windows_vulkan.cpp src/services/windows_directml.cpp src/services/windows_msvcp_pmr.cpp src/services/windows_msvcp_special_math.cpp src/services/windows_webview2.cpp src/services/windows_d3d12.cpp src/services/windows_dxcore.cpp src/services/windows_crt_io.cpp src/services/windows_crt_buffer.cpp src/services/unicode.cpp src/services/readonly_files.cpp)
 target_include_directories(x64arm_windows PUBLIC include PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_sources(x64arm_windows PRIVATE src/services/network_resources.cpp src/services/network_files.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_region.cpp)
@@ -348,7 +355,6 @@ endif()
 target_sources(x64arm_windows PRIVATE src/services/shared_policy.cpp)
 add_executable(x64arm src/cli/main.cpp src/cli/benchmark.cpp src/cli/api_audit.cpp)
 target_include_directories(x64arm PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_compile_definitions(x64arm PRIVATE X64ARM_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures")
 target_link_libraries(x64arm PRIVATE x64arm_jit x64arm_windows x64arm_options)
 if(X64ARM_IPO_AVAILABLE)
   # 保留 Debug／sanitizer 與 scalar_fp 的嚴格浮點設定；僅跨檔內聯既有實作。

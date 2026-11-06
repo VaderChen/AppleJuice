@@ -47,6 +47,7 @@ type Program struct {
 type Settings struct {
 	CPUCores        uint32 `json:"cpuCores,omitempty"`
 	GpuMemoryMiB    uint64 `json:"gpuMemoryMiB"`
+	GpuDefaultsVersion uint32 `json:"gpuDefaultsVersion"`
 	Arguments       string `json:"arguments"`
 	WorkDir         string `json:"workDir"`
 	CDrive          string `json:"cDrive"`
@@ -63,6 +64,7 @@ type GlobalSettings struct {
 	CompilerWorkers      uint32            `json:"compilerWorkers"`
 	CPUCoresX64          uint32            `json:"cpuCoresX64"`
 	CPUCoresX86          uint32            `json:"cpuCoresX86"`
+	CPUDefaultsVersion   uint32            `json:"cpuDefaultsVersion"`
 	OpenGLBackend        string            `json:"openGLBackend"`
 	Language             string            `json:"language"`
 	Theme                string            `json:"theme"`
@@ -218,7 +220,7 @@ func inspectProgram(path string) (Program, error) {
 		return Program{}, errors.New("不支援此 EXE 的子系統")
 	}
 	digest := sha256.Sum256([]byte(path))
-	return Program{Version: 1, ID: hex.EncodeToString(digest[:16]), Name: filepath.Base(path), Path: path, Kind: kind, Architecture: architecture, Settings: Settings{GpuMemoryMiB: gpuMemoryDefaultMiB, WorkDir: filepath.Dir(path), Writable: true, MaxInstructions: defaultMaxInstructions}}, nil
+	return Program{Version: 1, ID: hex.EncodeToString(digest[:16]), Name: filepath.Base(path), Path: path, Kind: kind, Architecture: architecture, Settings: Settings{GpuMemoryMiB: gpuMemoryDefaultMiB, GpuDefaultsVersion: gpuMemoryDefaultsVersion, WorkDir: filepath.Dir(path), Writable: true, MaxInstructions: defaultMaxInstructions}}, nil
 }
 
 type libraryIndex struct {
@@ -286,7 +288,8 @@ func NewApp(engine, dataDir, cDrive string) (*App, error) {
 			}
 			p.MaxInstructions = instructionBudget(p.MaxInstructions)
 			originalGPUMemory := p.GpuMemoryMiB
-			p.GpuMemoryMiB = normalizeGPUMemory(p.GpuMemoryMiB, limits)
+			p.GpuMemoryMiB = migratedGPUMemory(p.GpuMemoryMiB, p.GpuDefaultsVersion, limits)
+			p.GpuDefaultsVersion = gpuMemoryDefaultsVersion
 			if p.GpuMemoryMiB != originalGPUMemory {
 				a.gpuMemoryMigrations[p.ID] = true
 			}
@@ -316,8 +319,8 @@ func NewApp(engine, dataDir, cDrive string) (*App, error) {
 	}
 	a.library.OpenGLBackend = normalizeOpenGLBackend(defaults.OpenGLBackend)
 	a.library.CompilerWorkers = normalizeCompilerWorkers(defaults.CompilerWorkers)
-	a.library.CPUCoresX64 = normalizeCPUCount(defaults.CPUCoresX64, a.cpuLimits.X64Max, a.cpuLimits.X64Max)
-	a.library.CPUCoresX86 = normalizeCPUCount(defaults.CPUCoresX86, a.cpuLimits.X86Max, min(defaultX86CPUCores, a.cpuLimits.X86Max))
+	a.library.CPUCoresX64 = normalizeCPUCount(migratedCPUCoresX64(defaults.CPUCoresX64, defaults.CPUDefaultsVersion, a.cpuLimits.X64Max), a.cpuLimits.X64Max, min(defaultCPUCores, a.cpuLimits.X64Max))
+	a.library.CPUCoresX86 = normalizeCPUCount(defaults.CPUCoresX86, a.cpuLimits.X86Max, min(defaultCPUCores, a.cpuLimits.X86Max))
 	if cDrive != "" {
 		a.library.CDrive = cDrive
 	}
@@ -735,11 +738,11 @@ func validateGlobalSettings(settings GlobalSettings) (GlobalSettings, error) {
 		return GlobalSettings{}, errors.New("編譯執行緒數必須介於 0 與 8")
 	}
 	limits := systemCPULimits()
-	x64, err := validateCPUCount(settings.CPUCoresX64, limits.X64Max, limits.X64Max, "x64")
+	x64, err := validateCPUCount(settings.CPUCoresX64, limits.X64Max, min(defaultCPUCores, limits.X64Max), "x64")
 	if err != nil {
 		return GlobalSettings{}, err
 	}
-	x86, err := validateCPUCount(settings.CPUCoresX86, limits.X86Max, min(defaultX86CPUCores, limits.X86Max), "x86")
+	x86, err := validateCPUCount(settings.CPUCoresX86, limits.X86Max, min(defaultCPUCores, limits.X86Max), "x86")
 	if err != nil {
 		return GlobalSettings{}, err
 	}
@@ -767,6 +770,7 @@ func validateGlobalSettings(settings GlobalSettings) (GlobalSettings, error) {
 	}
 	out := GlobalSettings{NativeV8Bridge: settings.NativeV8Bridge, NativeLibraryBridge: settings.NativeLibraryBridge, CompilerWorkers: settings.CompilerWorkers, CPUCoresX64: x64, CPUCoresX86: x86, OpenGLBackend: backend, CDrive: c, Drives: map[string]string{}, Language: language, Theme: theme}
 	out.WindowsFont = font
+	out.CPUDefaultsVersion = cpuDefaultsVersion
 	out.CertificateRootsFile, out.CertificateRootsPath = settings.CertificateRootsFile, certificatePath
 	for key, value := range settings.Drives {
 		letter := strings.ToUpper(strings.TrimSuffix(key, ":"))

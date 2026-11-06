@@ -1,7 +1,9 @@
             const bool constructs=name.starts_with("SetupDiGetClassDevs") || name.starts_with("SetupDiCreateDeviceInfoList") || name=="SetupDiOpenDevRegKey" || name=="SetupDiOpenDeviceInterfaceRegKey";
             const auto failed=[&](std::uint32_t error){last_error_=error;return finish(constructs?(x86_?UINT32_MAX:UINT64_MAX):0);};
-            const auto registry_path=[&](const DeviceNode& node,bool driver){return folded(std::u16string(1,2)+(driver?u"\\system\\currentcontrolset\\control\\class\\"+node.class_guid+u"\\0000":u"\\system\\currentcontrolset\\enum\\"+node.id));};
+            const auto registry_path=[](const DeviceNode& node,bool driver){return device_key_path(node,driver);};
             const auto ensure_registry=[&](const DeviceNode& node,bool driver)->std::uint32_t{
+                // 有 hardware 值表的節點：硬體鍵只放這些值，內容不同時覆寫；其他節點與驅動鍵維持只補缺少的值。
+                if(!driver && !node.hardware.empty())return sync_hardware_key(runtime_.registry,registry_file_,&registry_store_cache_,node,output_limit);
                 // 裝置鍵通常已完整存在；沿用登錄快取，只有實際寫入才使快取失效。
                 auto& registry=runtime_.registry;RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_);if(transaction.error)return transaction.error;
                 const auto path=registry_path(node,driver);auto values=registry.keys.contains(path)?registry.keys.at(path):std::map<std::u16string,RegistryValue>{};
@@ -71,6 +73,9 @@
                         }
                     }
                 }
+                // SetupDiGetClassDevs* 成功時清除 last error：常見寫法以 ERROR_NO_MORE_ITEMS != GetLastError() 當列舉迴圈條件，
+                // 且在第一次列舉前就檢查；上一輪列舉留下的 259 不可讓新集合一筆都不走。
+                if(!empty)last_error_=0;
                 const auto handle=existing?existing:configuration.next_set++;configuration.sets.insert_or_assign(handle,std::move(info));configuration.next_interface=next_interface;return finish(handle);
             }
 #include "windows_device_installation.inc"
@@ -115,7 +120,7 @@
             }
             if(name=="SetupDiEnumDeviceInfo"){
                 if(arg(1)>=info.nodes.size())return failed(259);
-                if(!write_node(arg(2),info.nodes[static_cast<std::size_t>(arg(1))]))return failed(1784);return finish(1);
+                if(!write_node(arg(2),info.nodes[static_cast<std::size_t>(arg(1))]))return failed(1784);last_error_=0;return finish(1);
             }
 #include "windows_device_interfaces.inc"
             const auto checked_node=read_node(arg(1));if(!checked_node)return failed(87);const auto node_handle=*checked_node;

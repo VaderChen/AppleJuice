@@ -1006,7 +1006,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             else if(close_source && (runtime_.handle_flags[source_handle]&2U))fail(5);
             else if(!arg(2))result=1;
             else if(!(dword(6)&2U) && (security::mapped_access(dword(4),{0x120089U,0x120116U,0x1200a0U,0x1f01ffU})&~security::mapped_access(file->second.access,{0x120089U,0x120116U,0x1200a0U,0x1f01ffU})))fail(5);
-            else if(files_.size()>=1024)fail(4);
+            else if(!file_table_has_room(files_.size()))fail(8);
             else {
                 if(arg(3))memory.check(GuestAddress{arg(3)},x86_?4:8,Access::Write);
                 const auto handle=runtime_.allocate_wait_handle();
@@ -1145,7 +1145,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             auto& mutex=runtime_.mutex_objects.at(handle->second.mutex);
             if(mutex.shared){SharedEventLock lock(mutex.shared->lock_descriptor());const auto error=mutex.shared->release_locked(threads_.current);if(error)fail(error);else result=1;}
             else if(mutex.owner!=threads_.current || !mutex.recursion)fail(288);
-            else {if(!--mutex.recursion)mutex.owner=0;result=1;}
+            else {
+                trace_event_operation('M',arg(0),threads_.current,memory.load(GuestAddress{state.reg(Gpr::Rsp)},x86_?32:64));
+                if(!--mutex.recursion){mutex.owner=0;hand_off_released_mutex(memory,handle->second.mutex);}
+                result=1;
+            }
         }
     } else if(symbol.starts_with("CreateEvent") || symbol.starts_with("OpenEvent")) {
         const bool create=symbol.starts_with("Create"),extended=symbol.starts_with("CreateEventEx");bool valid=true,inherit=!create && arg(1);
@@ -1172,7 +1176,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         const auto found=runtime_.wait_objects.find(arg(0));
         if(found==runtime_.wait_objects.end() || (found->second.kind!=WaitObject::Kind::Event && found->second.kind!=WaitObject::Kind::MemoryResource))fail(6);
         else if(!(found->second.access&2U))fail(5);
-        else {found->second.set_signal(symbol=="SetEvent");result=1;}
+        else {
+            found->second.set_signal(symbol=="SetEvent");result=1;
+            trace_event_operation(symbol=="SetEvent"?'S':'R',arg(0),threads_.current,memory.load(GuestAddress{state.reg(Gpr::Rsp)},x86_?32:64));
+            // 持互斥鎖時喚醒等待者：與本地路徑相同地讓被喚醒者先跑（單核與全停路徑；排程的 awakened 會選到加權的被喚醒者）。
+            static const bool wake_handoff=[] {const auto* value=std::getenv("X64ARM_MUTEX_WAKE_HANDOFF");return !value || std::string_view(value)!="0";}();
+            if(symbol=="SetEvent" && wake_handoff && !found->second.shared_event && owns_local_mutex(threads_.current) &&
+               resolve_thread_waits(memory,ThreadWakeScope::Objects)){
+                const auto self=threads_.items.at(threads_.current).effective_priority(runtime_.process_priority_class,runtime_.process_background);
+                const bool eligible=std::any_of(threads_.items.begin(),threads_.items.end(),[&](const auto& item){
+                    return item.second.wake_pending && item.second.status==ThreadStatus::Runnable && !item.second.suspended &&
+                        item.second.effective_priority(runtime_.process_priority_class,runtime_.process_background)>=self;});
+                if(eligible)threads_.yield=threads_.prefer_awakened=true;
+            }
+        }
     } else if(symbol=="___lc_locale_name_func" || symbol=="__pctype_func") {
         return invoke_locale(state,memory,service);
     } else if(symbol=="iswctype" || symbol=="_isctype" || symbol=="wctype") {

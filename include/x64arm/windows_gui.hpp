@@ -1056,6 +1056,7 @@ struct GuiState : GuiStationNamespace {
     std::uint64_t update_lock{};
     // ActivateKeyboardLayout 為各執行緒選定的 HKL；未選定時沿用宿主目前輸入法。
     std::map<std::uint64_t,std::uint64_t> thread_keyboard_layouts;
+    std::vector<std::uint64_t> loaded_keyboard_layouts;
     std::uint64_t process_keyboard_layout{};
     std::map<std::uint64_t,GuiShellItem> shell_items;
     std::map<std::uint64_t,GuiShellItemEnumerator> shell_item_enumerators;

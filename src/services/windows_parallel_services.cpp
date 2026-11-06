@@ -11,11 +11,13 @@
 #include "x64arm/gpu_memory.hpp"
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
 #include <thread>
+#include <vector>
 
 namespace x64arm {
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_HEAP
@@ -180,6 +182,15 @@ bool parallel_peek_service(std::string_view symbol) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_PEEK");return !value || std::string_view(value)!="0";}();
     return enabled && (symbol=="PeekMessageW" || symbol=="PeekMessageA");
 }
+// SetThreadPriority／GetThreadPriority（x64）：只讀寫目標 GuestThread::priority，與完整路徑的 provider 相同寫入後不排程。此欄位只在協調者選人
+// （持獨占映射鎖或全停）與等待解析時讀取，新值與完整路徑一樣在下次選人生效；worker 持共用鎖以原子操作讀寫，同一目標可由多個 worker 同時設定。
+// 目標正在其他 slot 執行也只改欄位，不影響該 slot。宿主 QoS（execution_policy）只看 MMCSS 與程序優先序類別，不受此欄位影響。
+// 無效 handle、存取權與參數錯誤交回協調者回報 LastError（本地路徑見 plain_local_service）。33 號遠征隊 200 秒約 35.7 萬次，
+// 工作執行緒多半設定自身。X64ARM_PARALLEL_THREAD_PRIORITY=0 關閉。
+bool thread_priority_worker_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_THREAD_PRIORITY");return !value || std::string_view(value)!="0";}();
+    return enabled && (symbol=="SetThreadPriority" || symbol=="GetThreadPriority");
+}
 bool parallel_tick_clock_enabled() noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_TICK_CLOCK");return !value || std::string_view(value)!="0";}();
     return enabled;
@@ -218,6 +229,7 @@ std::string_view stub_service_symbol(GuestAddress stub_base,GuestAddress address
 // 區域，worker 上的服務（native_window、load／store）同時查表即可能讀到重新配置中的陣列，把客體資料寫到錯誤位置
 // （DQ3 強制平行在 13～16 秒崩潰；停用本地映射服務即不再發生）。worker 服務持共享鎖，本地映射服務持獨占鎖。
 ParallelMappingLock& parallel_mapping_mutex() noexcept {static ParallelMappingLock lock;return lock;}
+std::shared_lock<ParallelMappingLock>*& d3d11_worker_mapping_guard() noexcept {thread_local std::shared_lock<ParallelMappingLock>* value{};return value;}
 }
 namespace x64arm {
 // CRT memcpy／memmove／memset 只讀寫呼叫者傳入的客體範圍：較長的複製在單核時於常駐框架內執行，平行時若交回協調者，
@@ -227,14 +239,49 @@ bool crt_memory_worker_service(std::string_view symbol) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_CRT_MEMORY");return !value || std::string_view(value)!="0";}();
     return enabled && (symbol=="memcpy" || symbol=="memmove" || symbol=="memset");
 }
+// CRT strcpy／strncpy：與 memcpy 相同的範圍規則，由來源讀到 NUL、補零後先取得目的每一頁的原生視窗再一次寫入，COW、跨映射、可執行頁、覆蓋返回槽
+// 或超過 provider 上限（1 MiB）時，在寫入前交回協調者（本地路徑見 plain_local_service）。33 號遠征隊 200 秒 strncpy 約 2.4 萬次。
+// X64ARM_PARALLEL_CRT_STRING_COPY=0 關閉（x64）。
+bool crt_string_copy_worker_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_CRT_STRING_COPY");return !value || std::string_view(value)!="0";}();
+    return enabled && (symbol=="strcpy" || symbol=="strncpy");
+}
+// 原生視窗以客體頁為單位：逐頁取得範圍內的全部片段，任何一頁不符回 false，呼叫端尚未寫入即可交回協調者。
+using NativeSegments=std::vector<std::pair<std::uint8_t*,std::size_t>>;
+static bool collect_native_segments(GuestMemory& memory,std::uint64_t address,std::uint64_t size,unsigned access,NativeSegments& out){
+    out.clear();
+    while(size){
+        const auto window=memory.native_window(GuestAddress{address},access);
+        if(!window.data || !window.after)return false;
+        const auto part=std::min<std::uint64_t>(window.after,size);
+        // 同一映射內相鄰的頁合成一段：後續一次 memmove／memset 完成，不必逐頁呼叫。
+        if(!out.empty() && out.back().first+out.back().second==window.data)out.back().second+=static_cast<std::size_t>(part);
+        else out.emplace_back(window.data,static_cast<std::size_t>(part));
+        address+=part;size-=part;
+    }
+    return true;
+}
 // CRT 唯讀的寬字串搜尋／比較、記憶體比較與浮點分類：只讀參數與客體記憶體，不寫 errno、LastError 或其他程序狀態，也不配置。
 // worker 上直接呼叫同一 provider（invoke_runtime）；無效指標或字串超過上限等故障一律交回協調者完整重做，
 // 返回前沒有任何副作用，可安全重放。DQ3 強制平行每秒數千次，原本每次都讓全體 worker 靜止。
 // X64ARM_PARALLEL_CRT_PURE=0 關閉。
 bool crt_pure_worker_service(const WindowsServiceDescriptor& descriptor) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_CRT_PURE");return !value || std::string_view(value)!="0";}();
-    static constexpr std::string_view names[]{"wcsstr","wcschr","wcsrchr","wcscmp","wcsncmp","_finite","_isnan","memcmp"};
+    static constexpr std::string_view names[]{"wcsstr","wcschr","wcsrchr","wcscmp","wcsncmp","_finite","_isnan","memcmp",
+        // 窄字串同一性質（33 號遠征隊 strstr 200 秒約 3 千次）；超過上限與無效指標同樣交回協調者回報。
+        "strstr","strchr","strrchr","strlen","strcmp","strncmp","strnlen","wcslen","wcsnlen","memchr"};
     return enabled && descriptor.family=="crt" && std::find(std::begin(names),std::end(names),descriptor.symbol)!=std::end(names);
+}
+// CRT rand／srand 與帶輸出指標的 modf 家族：不寫 errno、LastError，也不配置，原本每次都要交回協調者取獨占鎖（33 號遠征隊每幀 rand 約 180 次、
+// modff 約 9 次，取鎖時所有 worker 服務都要等）。亂數狀態以 CAS 更新；輸出頁是寫入時複製時交回協調者本地路徑。
+// X64ARM_PARALLEL_CRT_COMPUTE=0 關閉；亂數診斷開啟時留在原路徑才記得到。
+bool crt_random_worker_service(const WindowsServiceDescriptor& descriptor) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_CRT_COMPUTE");return (!value || std::string_view(value)!="0") && !std::getenv("X64ARM_CRT_RANDOM_DIAGNOSTIC");}();
+    return enabled && descriptor.family=="crt" && (descriptor.symbol=="rand" || descriptor.symbol=="srand");
+}
+bool crt_split_worker_service(const WindowsServiceDescriptor& descriptor) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_CRT_COMPUTE");return !value || std::string_view(value)!="0";}();
+    return enabled && descriptor.family=="crt" && (descriptor.symbol=="modff" || descriptor.symbol=="modf");
 }
 // worker 上的 D3D11 寫入型方法（Get*、Check*、Map）只把結果寫到參數指向的位置。先核對每個參數值（含堆疊參數）
 // 起算 4 KiB 的首尾頁都不是寫入時複製頁：共用映射鎖下不得私有化頁面（會改區域表與原生 MMU）。核對不通過或讀取
@@ -275,7 +322,8 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
 }
 bool WindowsServices::parallel_service_static(GuestAddress address) const noexcept {
     if(parallel_crt_format_service(address))return true;
-    if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,address);runtime && crt_pure_worker_service(*runtime))return true;
+    if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,address);runtime &&
+       (crt_pure_worker_service(*runtime) || (!x86_ && (crt_random_worker_service(*runtime) || crt_split_worker_service(*runtime)))))return true;
     const auto symbol=name(address);
     if(x86_){
         static const bool win32=[] {const auto* value=std::getenv("X64ARM_X86_PARALLEL_SERVICES");return !value || std::string_view(value)!="0";}();
@@ -290,6 +338,7 @@ bool WindowsServices::parallel_service_static(GuestAddress address) const noexce
     if(parallel_peek_service(symbol))return true;
     if(parallel_srw_enabled() && (srw_service(symbol) || msvcp_mutex_service(symbol)))return true;
     if(thrd_tail_service(symbol) || parallel_event_service(symbol) || parallel_wait_service(symbol))return true;
+    if(thread_priority_worker_service(symbol) || crt_string_copy_worker_service(symbol))return true;
     return symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue" ||
         symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
         symbol=="InitOnceBeginInitialize" || symbol=="InitOnceExecuteOnce" ||
@@ -323,7 +372,7 @@ ResidentServiceProgress WindowsServices::resident_parallel_service(GuestState& s
 bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory& memory,bool& retry,
                                                   std::span<GuestState* const> active) {
     if(!parallel_service(state.rip))return false;
-    const std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
+    std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
     struct CountScope {
         WindowsServices& self;std::uint64_t rip;std::chrono::steady_clock::time_point start;
         bool accepted{true};
@@ -353,7 +402,18 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(!d3d11_local_eligible(state,memory,descriptor) || !graphics_worker_outputs_private(state,memory,descriptor))return false;
         count_scope.accepted=true;
         struct Local {~Local(){graphics_local()=false;}} local;graphics_local()=true;
-        if(invoke_d3d11(state,memory,descriptor))throw std::logic_error("worker 上的 D3D11 服務意外終止客體");
+        // Draw*／Dispatch* 的前置路徑可提早放開映射鎖；其他方法不必多寫一次執行緒區域變數。
+        const bool may_release_mapping=descriptor.symbol.front()=='D';
+        struct MappingGuardScope {bool set;~MappingGuardScope(){if(set)detail::d3d11_worker_mapping_guard()=nullptr;}} mapping_guard_scope{may_release_mapping};
+        if(may_release_mapping)detail::d3d11_worker_mapping_guard()=&mapping_guard;
+        try{
+            if(invoke_d3d11(state,memory,descriptor))throw std::logic_error("worker 上的 D3D11 服務意外終止客體");
+        }catch(const detail::D3D11RelockMapping&){
+            // 鎖序是映射 → 圖形：先放開圖形鎖才能等映射鎖。這次呼叫不再提早放開，由完整路徑重新拋出前置路徑的例外。
+            detail::d3d11_worker_mapping_guard()=nullptr;
+            graphics_lock.unlock();mapping_guard.lock();lock_graphics(graphics_lock);
+            if(invoke_d3d11(state,memory,descriptor))throw std::logic_error("worker 上的 D3D11 服務意外終止客體");
+        }
         state.rep_compare={};
         return true;
     }
@@ -408,6 +468,32 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         std::optional<std::uint32_t> result;
         try{result=invoke_runtime(state,memory,*runtime);}catch(...){return false;}
         if(result)throw std::logic_error("worker 上的 CRT 唯讀服務意外終止客體");
+        state.rep_compare={};
+        return true;
+    }
+    if(const auto* runtime=x86_?nullptr:detail::runtime_stub_descriptor(stub_base_,state.rip);runtime && crt_random_worker_service(*runtime)){
+        try{
+            const WindowsCall arg(state,memory,*runtime);std::atomic_ref random(runtime_.random_state);std::uint64_t value=0;
+            if(runtime->symbol=="srand")random.store(static_cast<std::uint32_t>(arg(0)),std::memory_order_relaxed);
+            else{
+                auto current=random.load(std::memory_order_relaxed);std::uint32_t next=0;
+                do{next=current*214013U+2531011U;}while(!random.compare_exchange_weak(current,next,std::memory_order_relaxed));
+                value=(next>>16)&32767U;
+            }
+            arg.return_to(state,value);
+        }catch(...){return false;}
+        state.rep_compare={};
+        return true;
+    }
+    if(const auto* runtime=x86_?nullptr:detail::runtime_stub_descriptor(stub_base_,state.rip);runtime && crt_split_worker_service(*runtime)){
+        std::optional<std::uint32_t> result;
+        try{
+            const WindowsCall arg(state,memory,*runtime);const auto output=arg(1);
+            // 共用映射鎖下不得私有化頁面；跨頁的輸出兩頁都要核對。
+            if(memory.is_copy_on_write(GuestAddress{output}) || memory.is_copy_on_write(GuestAddress{output+7}))return false;
+            result=invoke_runtime(state,memory,*runtime);
+        }catch(...){return false;}
+        if(result)throw std::logic_error("worker 上的 CRT 分解服務意外終止客體");
         state.rep_compare={};
         return true;
     }
@@ -586,6 +672,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             for(const auto& [id,wait]:wait_completion_packets_){(void)id;if(wait.phase==WaitCompletionPacketState::Phase::Armed && same_object(wait.target))return false;}
         }
         std::atomic_ref(event->second.count).store(symbol=="SetEvent"?1U:0U,std::memory_order_release);
+        trace_event_operation(symbol=="SetEvent"?'s':'r',first,resident_context_key(state),0);
         result=1;
     }else if(symbol=="GetLastError" || symbol=="SetLastError"){
         auto* error=pointer(thread.teb+error_offset,4,symbol=="GetLastError"?1U:2U);if(!error)return false;
@@ -714,24 +801,12 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             // 原生視窗以客體頁為單位：先逐頁取得目的（可寫）與來源（可讀）的全部片段，任何一頁不符就在寫入前
             // 交回協調者；寫入不得覆蓋返回位址槽。過大的範圍（>64 MiB）也交回，避免片段表過長。
             if(count>UINT64_C(64)<<20 || destination>UINT64_MAX-count || (destination<sp+unit && destination+count>sp))return false;
-            using Segments=std::vector<std::pair<std::uint8_t*,std::size_t>>;
-            thread_local Segments target_segments,source_segments;
-            const auto collect=[&](std::uint64_t address,std::uint64_t size,unsigned access,Segments& out){
-                out.clear();
-                while(size){
-                    const auto window=memory.native_window(GuestAddress{address},access);
-                    if(!window.data || !window.after)return false;
-                    const auto part=std::min<std::uint64_t>(window.after,size);
-                    out.emplace_back(static_cast<std::uint8_t*>(window.data),static_cast<std::size_t>(part));
-                    address+=part;size-=part;
-                }
-                return true;
-            };
-            if(!collect(destination,count,2,target_segments))return false;
+            thread_local NativeSegments target_segments,source_segments;
+            if(!collect_native_segments(memory,destination,count,2,target_segments))return false;
             if(symbol=="memset"){
                 for(const auto& [data,size]:target_segments)std::memset(data,static_cast<int>(static_cast<std::uint8_t>(second)),size);
             }else{
-                if(second>UINT64_MAX-count || !collect(second,count,1,source_segments))return false;
+                if(second>UINT64_MAX-count || !collect_native_segments(memory,second,count,1,source_segments))return false;
                 // 目的在來源之後且重疊時由尾端往前分段複製，維持 memmove 語義；片段內交給 std::memmove。
                 const bool backward=destination>second && destination<second+count;
                 std::size_t ti=0,si=0,to=0,so=0;
@@ -754,6 +829,47 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             }
         }
         result=destination;
+    }else if(!x86_ && crt_string_copy_worker_service(symbol)){
+        // 與 provider 相同先把來源讀進暫存（strncpy 在 NUL 之後補零、不一定有終止字元；strcpy 含 NUL），之後才寫目的，
+        // 重疊範圍的結果也相同。全部驗證通過前沒有副作用，可由協調者完整重做。
+        const bool bounded=symbol=="strncpy";constexpr std::uint64_t provider_limit=UINT64_C(1048576);
+        const auto destination=first,source=second,limit=bounded?arguments[2]:provider_limit+1;
+        if(bounded && (limit>provider_limit || limit>UINT64_MAX-source))return false;
+        thread_local std::vector<std::uint8_t> copied;thread_local NativeSegments target_segments;
+        copied.clear();
+        bool terminated=false;
+        for(std::uint64_t offset=0;offset<limit && !terminated;){
+            if(offset>UINT64_MAX-source)return false;
+            const auto window=memory.native_window(GuestAddress{source+offset},1);
+            if(!window.data || !window.after)return false;
+            const auto part=std::min<std::uint64_t>(window.after,limit-offset);
+            const auto* nul=static_cast<const std::uint8_t*>(std::memchr(window.data,0,static_cast<std::size_t>(part)));
+            const auto used=nul?static_cast<std::uint64_t>(nul-window.data):part;
+            copied.insert(copied.end(),window.data,window.data+used);
+            terminated=nul!=nullptr;offset+=part;
+        }
+        if(bounded)copied.resize(static_cast<std::size_t>(limit),0);
+        else{if(!terminated)return false;copied.push_back(0);}
+        const std::uint64_t size=copied.size();
+        if(size){
+            if(destination>UINT64_MAX-size || (destination<sp+unit && destination+size>sp))return false;
+            if(!collect_native_segments(memory,destination,size,2,target_segments))return false;
+            std::size_t written=0;
+            for(const auto& [data,part]:target_segments){std::memcpy(data,copied.data()+written,part);written+=part;}
+        }
+        result=destination;
+    }else if(!x86_ && thread_priority_worker_service(symbol)){
+        // 與 provider 相同的 handle 與存取權語義，但 pseudo handle 依呼叫者身分解析（thread_id／thread_access 以 threads_.current 解析，
+        // worker 上指向別的執行緒）；實體 handle 的查表不依賴目前執行緒。
+        const bool setting=symbol=="SetThreadPriority",pseudo=first==UINT64_MAX-1;
+        const auto target_id=pseudo?tid:thread_id(first);
+        if(!target_id || !((pseudo?thread.pseudo_access:thread_access(first))&(setting?0x420U:0x840U)))return false;
+        std::atomic_ref priority(threads_.items.at(target_id).priority);
+        if(setting){
+            const auto value=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(second));
+            if((value<-2 || value>2) && value!=-15 && value!=15)return false;
+            priority.store(value,std::memory_order_relaxed);result=1;
+        }else result=static_cast<std::uint32_t>(priority.load(std::memory_order_relaxed));
     }else if(!x86_ && msvcp_mutex_service(symbol)){
         // 版面與協調者 msvcp_sync_handlers 相同：+0 型別、+16 SRW 字組、+72 擁有者執行緒編號、+76 持有數。
         // SRW 字組以 worker SRW 的同一編碼 CAS（bit0 獨占、bit1 宿主有等待者）；擁有者與持有數只由持有者寫入。

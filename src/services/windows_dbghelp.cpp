@@ -135,6 +135,8 @@ std::span<const WindowsServiceDescriptor> dbghelp_service_descriptors() {
         {"dbghelp.dll","UnDecorateSymbolName",4,0,0,12},{"dbghelp.dll","UnDecorateSymbolNameW",4,0,0,12},
         {"dbghelp.dll","StackWalk64",9,0,0,1},{"dbghelp.dll","StackWalk",9,0,0,1},
         {"dbghelp.dll","SymSetOptions",1},{"dbghelp.dll","SymGetOptions",0},
+        {"dbghelp.dll","ImageNtHeader",1},{"dbghelp.dll","ImageDirectoryEntryToData",4},{"dbghelp.dll","ImageDirectoryEntryToDataEx",5},
+        {"dbghelp.dll","ImageRvaToSection",3},{"dbghelp.dll","ImageRvaToVa",4},
         {"dbghelp.dll","SymInitialize",3},{"dbghelp.dll","SymInitializeW",3},
         {"dbghelp.dll","SymCleanup",1},{"dbghelp.dll","SymRefreshModuleList",1},
         {"dbghelp.dll","SymSetSearchPath",2},{"dbghelp.dll","SymSetSearchPathW",2},
@@ -163,6 +165,60 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp(GuestState& state,G
         return path;
     };
     const auto snapshot=[&](SymbolSession& session){refresh_symbol_modules(session,memory);};
+    if(name.starts_with("Image")){
+        // PE 標頭工具：呼叫端傳入已映射的映像或檔案 view；非 PE 回 NULL 與 ERROR_BAD_EXE_FORMAT。
+        const auto nt_header=[&](std::uint64_t base)->std::uint64_t{
+            if(!base || memory.load(GuestAddress{base},16)!=0x5a4dU)return 0;
+            const auto offset=memory.load(GuestAddress{base+0x3c},32);
+            if(offset>=UINT64_C(0x10000000) || memory.load(GuestAddress{base+offset},32)!=0x4550U)return 0;
+            return base+offset;
+        };
+        const auto section_of=[&](std::uint64_t nt,std::uint64_t rva)->std::uint64_t{
+            const auto count=memory.load(GuestAddress{nt+6},16),optional=memory.load(GuestAddress{nt+20},16);
+            const auto first=nt+24+optional;
+            for(std::uint64_t i=0;i<count;++i){
+                const auto section=first+i*40;
+                const auto start=memory.load(GuestAddress{section+12},32),virtual_size=memory.load(GuestAddress{section+8},32),raw=memory.load(GuestAddress{section+16},32);
+                if(rva>=start && rva<start+std::max(virtual_size,raw))return section;
+            }
+            return 0;
+        };
+        if(name=="ImageNtHeader"){result=nt_header(arg(0));if(!result)last_error_=193;}
+        else if(name=="ImageRvaToSection"){const auto nt=arg(0)?arg(0):nt_header(arg(1));result=nt?section_of(nt,static_cast<std::uint32_t>(arg(2))):0;if(!result)last_error_=193;}
+        else if(name=="ImageRvaToVa"){
+            const auto nt=arg(0)?arg(0):nt_header(arg(1));const auto rva=static_cast<std::uint32_t>(arg(2));
+            const auto section=nt?section_of(nt,rva):0;
+            if(!section)last_error_=193;
+            else{
+                const auto start=memory.load(GuestAddress{section+12},32),raw=memory.load(GuestAddress{section+20},32);
+                result=arg(1)+raw+(rva-start);
+                if(arg(3))memory.store(GuestAddress{arg(3)},x86_?32:64,section);
+            }
+        }else{
+            const bool extended=name=="ImageDirectoryEntryToDataEx";
+            const auto base=arg(0);const bool mapped_as_image=static_cast<std::uint8_t>(arg(1))!=0;const auto entry=static_cast<std::uint16_t>(arg(2));const auto size_out=arg(3);
+            if(extended && arg(4))memory.store(GuestAddress{arg(4)},x86_?32:64,0);
+            const auto nt=nt_header(base);
+            if(!nt)last_error_=193;
+            else{
+                const auto magic=memory.load(GuestAddress{nt+24},16);const std::uint64_t directories=nt+24+(magic==0x20b?112U:96U);
+                const auto limit=memory.load(GuestAddress{nt+24+(magic==0x20b?108U:92U)},32);
+                if(entry<limit){
+                    const auto rva=memory.load(GuestAddress{directories+entry*8ULL},32),size=memory.load(GuestAddress{directories+entry*8ULL+4},32);
+                    if(rva && size){
+                        if(size_out)memory.store(GuestAddress{size_out},32,size);
+                        if(mapped_as_image)result=base+rva;
+                        else if(const auto section=section_of(nt,rva)){
+                            result=base+memory.load(GuestAddress{section+20},32)+(rva-memory.load(GuestAddress{section+12},32));
+                            if(extended && arg(4))memory.store(GuestAddress{arg(4)},x86_?32:64,section);
+                        }
+                    }
+                }
+                if(!result)last_error_=0;
+            }
+        }
+        arg.return_to(state,result);return std::nullopt;
+    }
     if(name=="SymSetOptions")result=runtime_.symbol_options=static_cast<std::uint32_t>(arg(0));
     else if(name=="SymGetOptions")result=runtime_.symbol_options;
     else if(name=="SymInitialize" || name=="SymInitializeW"){

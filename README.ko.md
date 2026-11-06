@@ -141,9 +141,9 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 | 사이버펑크 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
+| 클레르 옵스퀴르: 33 원정대 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="메인 화면까지 실행" title="메인 화면까지 실행"> |
 | 데이브 더 다이버 | x64 | D3D11(Unity) | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="메인 화면까지 실행" title="메인 화면까지 실행"> |
-| 클레르 옵스퀴르: 33 원정대 | x64 | D3D12 (Unreal Engine 5) | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="동작하지 않지만 작업 중" title="동작하지 않지만 작업 중"> |
 
 실측 기록은 당시 버전과 설정 기준이며, 전체 게임 진행, 다른 버전 또는 모든 설정에서의 동작을 의미하지 않습니다.
 

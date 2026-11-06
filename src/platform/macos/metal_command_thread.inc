@@ -1,6 +1,6 @@
 // D3D11 立即 context 的 Metal 命令執行緒：繪製、運算、寫入、複製與清除依序排入專用宿主執行緒，客體執行緒
-// 不必等 Metal 編碼完成即可繼續處理下一批狀態與客體程式碼。其餘方法（讀回、建立資源與著色器、fence、
-// 時間戳、呈現與交接、提交）先等佇列清空再於呼叫端執行緒同步執行，因此同一時間只有一個執行緒操作底層
+// 不必等 Metal 編碼完成即可繼續處理下一批狀態與客體程式碼；查詢用的 fence、時間戳與非等待提交也依序排入。其餘方法（讀回、
+// 建立著色器、呈現與交接、等待提交）先等佇列清空再於呼叫端執行緒同步執行，因此同一時間只有一個執行緒操作底層
 // 後端，後端本身不需要額外的鎖。背景執行緒的例外延到下一次同步時在呼叫端拋出。
 // graphics_*_retained 只保留參照：呼叫端保證參照內容在下一次 graphics_sync() 前不變（D3D11 繪製狀態快取）。
 // 依序完成時設定的 fence 中繼旗標：命令執行緒處理到 fence 時才掛到當下 command buffer 的完成回呼。
@@ -27,35 +27,9 @@ public:
     }
     NativeOpenGlContext& inner() noexcept {return *inner_;}
     std::uint64_t graphics_ticket()const override {return queued_.load(std::memory_order_acquire);}
-    void graphics_sync() override {graphics_sync_until(queued_.load(std::memory_order_acquire));}
-    void graphics_sync_until(std::uint64_t ticket) override {
-        if(on_worker())return;
-        const auto target=std::min(ticket,queued_.load(std::memory_order_acquire));
-        if(completed_.load(std::memory_order_acquire)<target){
-            // 統計：需要等待命令執行緒的同步次數與等待時間（隨 statistics 輸出，供判斷客體端是否被編碼速度卡住）。
-            const auto wait_begin=std::chrono::steady_clock::now();
-            struct WaitStat {std::atomic<std::uint64_t>& count;std::atomic<std::uint64_t>& ns;std::chrono::steady_clock::time_point begin;
-                ~WaitStat(){count.fetch_add(1,std::memory_order_relaxed);
-                    ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count()),std::memory_order_relaxed);}
-            } wait_stat{sync_waits_,sync_wait_ns_,wait_begin};
-            // 繪製編碼通常數微秒內完成：先短暫自旋，避免每次同步都經 futex。
-            for(unsigned i=0;i<20000 && completed_.load(std::memory_order_acquire)<target;++i)
-#if defined(__aarch64__)
-                __builtin_arm_yield();
-#else
-                ;
-#endif
-            if(completed_.load(std::memory_order_acquire)<target){
-                std::unique_lock lock(mutex_);waiting_=true;
-                idle_cv_.wait(lock,[&]{return completed_.load(std::memory_order_acquire)>=target;});
-                waiting_=false;
-            }
-        }
-        if(failed_.load(std::memory_order_acquire)){
-            std::exception_ptr error;{std::lock_guard lock(mutex_);error=std::exchange(error_,nullptr);failed_.store(false,std::memory_order_release);}
-            if(error)std::rethrow_exception(error);
-        }
-    }
+    void graphics_sync() override {sync_through(queued_.load(std::memory_order_acquire),full_waits_);}
+    // 序號 0 不等待，只取回命令執行緒延後的例外。
+    void graphics_sync_until(std::uint64_t ticket) override {sync_through(ticket,until_waits_);}
     // 非同步：只依呼叫當下的參數，資料在排入時複製。
     void graphics_write(const GraphicsView& view,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image) override {
         post([this,view,bytes=std::vector<std::uint8_t>(data.begin(),data.end()),row,image]{inner_->graphics_write(view,bytes,row,image);});
@@ -109,8 +83,12 @@ public:
     bool graphics_fixed_sampler(const std::shared_ptr<GraphicsSampler>& sampler) override {graphics_sync();return inner_->graphics_fixed_sampler(sampler);}
     void graphics_fixed_stencil(const std::array<std::uint32_t,12>& state) override {graphics_sync();inner_->graphics_fixed_stencil(state);}
     void graphics_fixed_draw(const FixedGraphicsDraw& draw) override {graphics_sync();inner_->graphics_fixed_draw(draw);}
-    // 建立資源只配置新的 Metal 物件（GPU 記憶體額度有自己的鎖），不碰編碼狀態，不必等佇列清空。
-    std::shared_ptr<GraphicsResource> graphics_resource(const GraphicsResourceDesc& desc) override {return inner_->graphics_resource(desc);}
+    // 建立資源只配置新的 Metal 物件（GPU 記憶體額度有自己的鎖），不碰編碼狀態，不必等佇列清空。額度不足時才補救：非等待提交排入後，已完成批次的回收
+    // 在命令執行緒稍後才執行，這裡先排空佇列（放掉工作持有的資源），再提交一次回收已完成批次，然後重試；仍失敗才讓 bad_alloc 往外傳。
+    std::shared_ptr<GraphicsResource> graphics_resource(const GraphicsResourceDesc& desc) override {
+        try{return inner_->graphics_resource(desc);}
+        catch(const std::bad_alloc&){graphics_sync();inner_->graphics_flush(false);return inner_->graphics_resource(desc);}
+    }
     void graphics_post(std::function<void(NativeGraphics&)> task) override {post([this,task=std::move(task)]{task(*inner_);});}
     // 零複製緩衝別名與 graphics_resource 相同只建立新的 Metal 物件，不碰編碼狀態，不必等佇列清空（電馭判客 CreateCommittedResource1
     // 原本每次在協調者上等編碼執行緒排空，約 0.3 ms）。
@@ -162,7 +140,14 @@ public:
     std::shared_ptr<const std::atomic<bool>> graphics_fence_pending() override {
         auto relay=std::make_shared<std::atomic<bool>>(false);post([this,relay]{metal_fence_relay(*inner_,relay,false);});return relay;
     }
-    void graphics_flush(bool wait) override {graphics_sync();inner_->graphics_flush(wait);}
+    // 非等待提交（D3D11 Flush／GetData）：依序排在先前的命令之後，不先排空。先前排入的 fence 與時間戳已掛上當下的批次，
+    // 這次提交涵蓋它們，完成回呼直接觸發中繼旗標，呼叫端不必等編碼。等待版本維持同步。例外與其他排入工作相同，
+    // 延到下一次同步時拋出。需要提交先於返回的呼叫端（共用貼圖的 Flush）自行接著 graphics_sync。
+    // X64ARM_METAL_ASYNC_QUERY_FLUSH=0 恢復先排空再於呼叫端提交（同引擎對照）。
+    void graphics_flush(bool wait) override {
+        if(wait || !async_query_flush_){graphics_sync();inner_->graphics_flush(wait);return;}
+        post([this]{@autoreleasepool{inner_->graphics_flush(false);}});
+    }
     OpenGlShareResult share_objects(NativeOpenGlContext& source) override {
         graphics_sync();NativeOpenGlContext* target=&source;
         if(auto* proxy=dynamic_cast<MetalCommandThread*>(target)){proxy->graphics_sync();target=&proxy->inner();}
@@ -185,14 +170,49 @@ public:
         const_cast<MetalCommandThread*>(this)->graphics_sync();
         // 內層字串以換行結尾；欄位接在同一行，換行放回最後。
         auto text=inner_->statistics();while(!text.empty() && (text.back()=='\n' || text.back()==' '))text.pop_back();
-        return text+" metal_command_sync_waits="+std::to_string(sync_waits_.load(std::memory_order_relaxed))+
-            " metal_command_sync_wait_ns="+std::to_string(sync_wait_ns_.load(std::memory_order_relaxed))+
+        const auto until_count=until_waits_.count.load(std::memory_order_relaxed),until_ns=until_waits_.ns.load(std::memory_order_relaxed);
+        const auto full_count=full_waits_.count.load(std::memory_order_relaxed),full_ns=full_waits_.ns.load(std::memory_order_relaxed);
+        // metal_command_sync_waits／_wait_ns 維持兩組合計（既有判讀與 D3D12 彙整沿用）；until 是等指定序號（繪製快取、D3D12 繪製池），full 是全排空。
+        return text+" metal_command_sync_waits="+std::to_string(until_count+full_count)+
+            " metal_command_sync_wait_ns="+std::to_string(until_ns+full_ns)+
+            " metal_command_sync_until_waits="+std::to_string(until_count)+" metal_command_sync_until_wait_ns="+std::to_string(until_ns)+
+            " metal_command_sync_full_waits="+std::to_string(full_count)+" metal_command_sync_full_wait_ns="+std::to_string(full_ns)+
             " metal_command_busy_ns="+std::to_string(busy_ns_.load(std::memory_order_relaxed))+" metal_command_tasks="+std::to_string(completed_.load(std::memory_order_relaxed))+"\n";
     }
     std::string capture(const std::filesystem::path& path) override {graphics_sync();return inner_->capture(path);}
     GraphicsView graphics_drawable(bool depth) override {graphics_sync();return inner_->graphics_drawable(depth);}
 private:
     static bool& on_worker() noexcept {static thread_local bool value=false;return value;}
+    // 統計：需要等待命令執行緒的同步次數與等待時間，依來源分組（隨 statistics 輸出，供判斷客體端是否被編碼速度卡住）。
+    // 只在確實要等待時才計數與取時間，不必等待的同步不增加成本。
+    struct SyncWaits {std::atomic<std::uint64_t> count{},ns{};};
+    void sync_through(std::uint64_t ticket,SyncWaits& waits) {
+        if(on_worker())return;
+        const auto target=std::min(ticket,queued_.load(std::memory_order_acquire));
+        if(completed_.load(std::memory_order_acquire)<target){
+            const auto wait_begin=std::chrono::steady_clock::now();
+            struct WaitStat {SyncWaits& waits;std::chrono::steady_clock::time_point begin;
+                ~WaitStat(){waits.count.fetch_add(1,std::memory_order_relaxed);
+                    waits.ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count()),std::memory_order_relaxed);}
+            } wait_stat{waits,wait_begin};
+            // 繪製編碼通常數微秒內完成：先短暫自旋，避免每次同步都經 futex。
+            for(unsigned i=0;i<20000 && completed_.load(std::memory_order_acquire)<target;++i)
+#if defined(__aarch64__)
+                __builtin_arm_yield();
+#else
+                ;
+#endif
+            if(completed_.load(std::memory_order_acquire)<target){
+                std::unique_lock lock(mutex_);waiting_=true;
+                idle_cv_.wait(lock,[&]{return completed_.load(std::memory_order_acquire)>=target;});
+                waiting_=false;
+            }
+        }
+        if(failed_.load(std::memory_order_acquire)){
+            std::exception_ptr error;{std::lock_guard lock(mutex_);error=std::exchange(error_,nullptr);failed_.store(false,std::memory_order_release);}
+            if(error)std::rethrow_exception(error);
+        }
+    }
     template<class Task> void post(Task&& task) {
         if(on_worker()){task();return;}
         bool wake=false;
@@ -262,10 +282,12 @@ private:
     std::mutex mutex_;std::condition_variable cv_,idle_cv_;
     std::deque<std::function<void()>> queue_;
     const bool legacy_idle_spin_=[] {const auto* value=std::getenv("X64ARM_METAL_LEGACY_IDLE_SPIN");return value && std::string_view(value)=="1";}();
+    const bool async_query_flush_=[] {const auto* value=std::getenv("X64ARM_METAL_ASYNC_QUERY_FLUSH");return !value || std::string_view(value)!="0";}();
     const std::int64_t idle_spin_ns_=[] {const auto* value=std::getenv("X64ARM_METAL_COMMAND_SPIN_US");
         if(!value || !*value)return std::int64_t{20000};const auto us=std::strtoll(value,nullptr,10);return us<0?std::int64_t{0}:std::min<std::int64_t>(us,1000)*1000;}();
     std::uint64_t submitted_{},taken_{};
-    std::atomic<std::uint64_t> completed_{},queued_{},sync_waits_{},sync_wait_ns_{},busy_ns_{};
+    std::atomic<std::uint64_t> completed_{},queued_{},busy_ns_{};
+    SyncWaits until_waits_,full_waits_;
     std::atomic<bool> failed_{},stop_requested_{};
     bool stopping_{},sleeping_{},waiting_{};
     std::exception_ptr error_;

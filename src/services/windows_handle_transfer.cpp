@@ -571,7 +571,7 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
         }
         else if(packet.kind==1){
             if(descriptor<0 || packet.type<1 || (packet.type>7 && packet.type!=9 && packet.type!=10) || packet.flags&~1U)reply.error=87;
-            else if(transfer.imports.size()>=1024 || files_.size()+runtime_.wait_objects.size()>=process_handle_limit)reply.error=8;
+            else if(transfer.imports.size()>=1024 || !file_table_has_room(files_.size()+runtime_.wait_objects.size()))reply.error=8;
             else {
                 item.handle=runtime_.allocate_wait_handle();item.type=packet.type;item.access=packet.access;item.flags=packet.flags;item.mode=packet.mode;item.pipe_mode=packet.pipe_mode;item.auxiliary=packet.auxiliary;item.descriptor=descriptor;descriptor=-1;
                 try {import_transfer_handle(item);reply.handle=item.handle;transfer.imports.emplace(key,item.handle);}catch(const HostCallFault& failure){reply.error=50;if(std::getenv("X64ARM_TRACE_HANDLE_TRANSFER"))std::fprintf(stderr,"[handle_import_error] pid=%u sender=%u type=%u handle=%llx access=%x detail=%s\n",process_id(),packet.sender,item.type,static_cast<unsigned long long>(item.handle),item.access,failure.what());}

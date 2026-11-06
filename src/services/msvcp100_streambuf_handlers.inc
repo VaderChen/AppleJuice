@@ -1,3 +1,4 @@
+if(service.family=="msvcp140.dll" && msvcp_detail::c_export(symbol))return invoke_msvcp100(state,memory,service);
 // VC10 的 streambuf 以間接指標保存 get／put 區域；filebuf 可令它們指向 FILE 欄位。
 // 因此不能直接覆寫內嵌 rpos／wpos，必須沿 prpos／pwpos 操作。
 if((service.family=="msvcp100.dll" || service.family=="msvcp140.dll") && symbol.find("basic_streambuf@")!=symbol.npos && (symbol.starts_with("?_Init@") || symbol.starts_with("?_Pninc@") || symbol.starts_with("?_Gndec@") || symbol.starts_with("?_Gninc@") || symbol.starts_with("?_Gnpreinc@") || symbol.starts_with("?_Gnavail@") || symbol.starts_with("?_Pnavail@") || symbol.starts_with("?pbump@") || symbol.starts_with("?gbump@") || symbol.starts_with("?setg@") || symbol.starts_with("?setbuf@") || symbol.starts_with("?sync@") || symbol.starts_with("?showmanyc@") || symbol.starts_with("?imbue@"))){

@@ -12,7 +12,13 @@ void metal_buffer_shader(MetalShader& shader,const char* entry=nullptr){
             "    if(view.z == 12) { uint base = (index + view.x) * 3; return vec<T,4>(resource.read(base).x, resource.read(base+1).x, resource.read(base+2).x, T(1)); }\n"
             "    return resource.read(index + view.x);\n}\n"
             "template<typename T, access A> void x64arm_buffer_write(texture_buffer<T,A> resource, uint4 view, uint index, vec<T,4> value) {\n"
-            "    if(index < view.y) { if(view.z == 12) { uint base = (index + view.x) * 3; resource.write(vec<T,4>(value.x), base); resource.write(vec<T,4>(value.y), base+1); resource.write(vec<T,4>(value.z), base+2); } else resource.write(value, index + view.x); resource.fence(); }\n}\n#endif\n"+shader.source;
+            "    if(index < view.y) { if(view.z == 12) { uint base = (index + view.x) * 3; resource.write(vec<T,4>(value.x), base); resource.write(vec<T,4>(value.y), base+1); resource.write(vec<T,4>(value.z), base+2); } else resource.write(value, index + view.x); resource.fence(); }\n}\n"
+            // D3D 的 store_uav_typed 永遠寫四分量；來源暫存器在 Metal 可能是較短的宣告（輸入 semantic 常見），轉成 UAV 元素型別後補滿。
+            "template<typename T, access A, typename U> void x64arm_buffer_write(texture_buffer<T,A> resource, uint4 view, uint index, vec<U,4> value) { x64arm_buffer_write(resource, view, index, vec<T,4>(value)); }\n"
+            "template<typename T, access A, typename U> void x64arm_buffer_write(texture_buffer<T,A> resource, uint4 view, uint index, vec<U,3> value) { x64arm_buffer_write(resource, view, index, vec<T,4>(vec<T,3>(value), T(0))); }\n"
+            "template<typename T, access A, typename U> void x64arm_buffer_write(texture_buffer<T,A> resource, uint4 view, uint index, vec<U,2> value) { x64arm_buffer_write(resource, view, index, vec<T,4>(vec<T,2>(value), T(0), T(0))); }\n"
+            "template<typename T, access A, typename S, typename = enable_if_t<is_scalar_v<S>>> void x64arm_buffer_write(texture_buffer<T,A> resource, uint4 view, uint index, S value) { x64arm_buffer_write(resource, view, index, vec<T,4>(T(value))); }\n"
+            "#endif\n"+shader.source;
 }
 std::array<std::uint32_t,4> metal_buffer_view_info(const GraphicsView& view){
     if(!view.resource || view.resource->desc.dimension!=1)return {};

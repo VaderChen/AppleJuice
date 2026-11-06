@@ -48,6 +48,8 @@ python3 scripts/build_launcher.py --engine-build-dir build/release \
 ## 散布成品
 
 
-散布完整 Launcher app 時保留內部目錄、簽章及 `Contents/Resources/Licenses/`。單獨散布 CLI 亦需附帶適用授權。不要封裝個人設定、客體程式、Windows 磁碟資料、憑證或私鑰。
+散布完整 Launcher app 時保留內部目錄、簽章及 `Contents/Resources/Licenses/`；該目錄由封裝腳本收集 `LICENSE*.md`、`COMMERCIAL-LICENSE.md`、`THIRD-PARTY-NOTICES.md`、第三方授權（含 `third_party/` 子目錄）與核心授權。單獨散布 CLI 亦需附帶適用授權。不要封裝個人設定、客體程式、Windows 磁碟資料、憑證或私鑰。
+
+Release 建置不內嵌建置機路徑。`x64arm bench` 需要的 fixture 不隨公開來源與成品提供，須以 `--fixtures <目錄>` 指定。
 
 本機預設為 ad-hoc 簽署；Developer ID 與公證須自行準備並完成，見[macOS 簽署](macos-signing.md)。授權見[適用範圍](licensing.md)及[第三方聲明](../THIRD-PARTY-NOTICES.md)。

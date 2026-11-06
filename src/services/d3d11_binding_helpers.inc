@@ -1,6 +1,6 @@
         const auto read_views=[&](std::uint64_t address,unsigned count,Kind kind,const std::shared_ptr<Identity>& context){
             std::vector<std::uint64_t> values(count);
-            for(unsigned i=0;i<count;++i){values[i]=address?memory.load(GuestAddress{address+i*pointer_size},pointer_bits):0;if(values[i]){auto id=typed(values[i],kind);require(id->device==context->device && !id->offered && (!id->texture || !object(id->texture).identity->offered));}}
+            for(unsigned i=0;i<count;++i){values[i]=address?memory.load(GuestAddress{address+i*pointer_size},pointer_bits):0;if(values[i]){auto id=typed(values[i],kind);require(d3d11_bindable(*context,*id,texture_of));}}
             return values;
         };
         const auto get_views=[&](const std::shared_ptr<Identity>& context,const std::string& name,unsigned start,unsigned count,std::uint64_t output_address){
@@ -8,17 +8,14 @@
             for(unsigned i=0;i<count;++i){const auto pointer=binding(context,name,start+i);if(pointer)hold(pointer);write_pointer(output_address+i*pointer_size,pointer);}
         };
         // 只取 view 所屬資源的位址，不複製 GraphicsView：綁定與 OMSet* 會拿每個輸入對所有輸出逐一比對。
-        const auto view_resource=[&](std::uint64_t pointer)->const GraphicsResource* {
-            const auto& id=*object(pointer).identity;return id.graphics_view.resource?id.graphics_view.resource.get():id.resource.get();
-        };
+        const auto view_resource=[&](std::uint64_t pointer)->const GraphicsResource* {return d3d11_view_resource(*object(pointer).identity);};
         const auto overlaps=[&](std::uint64_t first,std::uint64_t second){
             if(!first || !second)return false;
             // 不同資源必不重疊；資源缺失時沿用 view_of 的驗證與錯誤。
             if(first!=second)if(const auto ra=view_resource(first),rb=view_resource(second);ra && rb && ra!=rb)return false;
             const auto a=view_of(first),b=view_of(second);if(a.resource!=b.resource)return false;
+            if(d3d11_views_disjoint(a,b))return false;
             if(a.resource->desc.dimension==1)return true; // Buffer 在 D3D11 中只有一個 subresource。
-            if(a.level>=b.level+b.levels || b.level>=a.level+a.levels)return false;
-            if(a.resource->desc.dimension!=4 && (a.slice>=b.slice+b.slices || b.slice>=a.slice+a.slices))return false;
             const auto readonly=[&](std::uint64_t output_view,const GraphicsView& output,std::uint64_t input_view,const GraphicsView& input){
                 if(object(output_view).kind!=Kind::DepthView || object(input_view).kind!=Kind::ShaderResource)return false;
                 const bool stencil=input.format==22 || input.format==47;return bool(output.flags&(stencil?2U:1U));

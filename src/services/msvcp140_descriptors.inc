@@ -756,3 +756,4 @@
 {"internal-msvcp140","WTimePutDoPut32",8,0,0,0,false},
 {"internal-msvcp140","DTimePutDoPut64",8,0,0,0,false},
 {"internal-msvcp140","WTimePutDoPut64",8,0,0,0,false},
+#include "msvcp_iostream_descriptors.inc"

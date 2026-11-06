@@ -2,6 +2,7 @@
 """建置 Go + WebView 啟動器，打包原生 macOS app 與 x64arm 引擎。"""
 import argparse
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -19,6 +20,33 @@ from build_pe_fixtures import prepare_console_fixture
 from engine_validation import from_evidence, from_state
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+THIRD_PARTY_LICENSE_NAMES = ('LICENSE*', '*-LICENSE', '*-PATENTS', 'COPYING*', 'NOTICE*')
+
+
+def license_files():
+    """回傳 {Contents/Resources/Licenses 內的相對路徑: 來源}。
+
+    散布時須保留授權全文與第三方聲明（LICENSE.md 第 4 節）。third_party 逐層收集，
+    子目錄維持相對路徑，多個同名 LICENSE 才不會互相覆蓋。
+    """
+    required = [ROOT / 'LICENSE.md', ROOT / 'THIRD-PARTY-NOTICES.md']
+    missing = [path.name for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError('缺少授權文件 ' + '、'.join(missing) + '，保留既有 Launcher')
+    third_party = ROOT / 'third_party'
+    candidates = [(ROOT, path) for path in (*required, *ROOT.glob('*LICENSE*.md'))]
+    for folder in (ROOT / 'launcher/licenses', ROOT / 'launcher/web/vendor'):
+        candidates += [(folder, path) for path in folder.glob('*LICENSE')]
+    candidates += [(third_party, path) for path in third_party.rglob('*')
+                   if any(fnmatch.fnmatchcase(path.name, name) for name in THIRD_PARTY_LICENSE_NAMES)]
+    files = {}
+    for base, path in candidates:
+        if not path.is_file() or path.name.startswith('._') or path.suffix == '.bak':
+            continue
+        name = path.relative_to(base).as_posix()
+        if files.setdefault(name, path) != path:
+            raise RuntimeError(f'授權檔名衝突：{name}（{files[name]}、{path}）')
+    return files
 
 
 def read_cache(directory):
@@ -80,8 +108,7 @@ def bundle_inputs(engine_build, identity, signing_prefix, profile):
     for folder in ('web', 'assets'):
         files.update(path for path in (ROOT / 'launcher' / folder).rglob('*')
                      if path.is_file() and not path.name.startswith(('.', '_')))
-    for folder in ('launcher/licenses', 'launcher/web/vendor', 'third_party'):
-        files.update((ROOT / folder).glob('*LICENSE'))
+    files.update(license_files().values())
     kernel_root = pathlib.Path(read_cache(engine_build).get('APPLEJUICE_KERNEL_ROOT', ROOT / 'x64kernel'))
     files.add(kernel_root / 'manifest.json')
     files.update(path for path in (kernel_root / 'share/AppleJuiceKernel/licenses').glob('*') if path.is_file())
@@ -307,11 +334,9 @@ def build_launcher():
         licenses.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / 'launcher' / 'assets' / 'AppleJuice.icns',
                      licenses.parent / 'AppleJuice.icns')
-        for source in [ROOT / 'launcher' / 'licenses', ROOT / 'launcher' / 'web' / 'vendor', ROOT / 'third_party']:
-            for license_file in source.glob('*LICENSE'):
-                if license_file.name.startswith('._'):
-                    continue
-                shutil.copy2(license_file, licenses / license_file.name)
+        for name, license_file in license_files().items():
+            (licenses / name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(license_file, licenses / name)
         kernel_root = pathlib.Path(cache.get('APPLEJUICE_KERNEL_ROOT', ROOT / 'x64kernel'))
         kernel_licenses = kernel_root / 'share/AppleJuiceKernel/licenses'
         if not (kernel_licenses / 'LICENSE.md').is_file():

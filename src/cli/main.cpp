@@ -45,7 +45,7 @@ void usage() {
         "  x64arm audit-pe <EXE或DLL>（唯讀 JSON 匯入／匯出與 API 登錄盤點）\n"
         "  x64arm inspect-pe <檔案.exe>（載入檢查與未解析匯入清單，不執行客體）\n"
         "  x64arm compare <檔案.bin|檔案.exe> [對應的載入參數]\n"
-        "  x64arm bench --suite core [--samples <3..1000>] [--fixtures <目錄>]\n"
+        "  x64arm bench --suite core [--samples <3..1000>] [--fixtures <目錄，預設為目前目錄下的 tests/fixtures>]\n"
         "PE 選項：--command-line <完整 Windows 命令列>、--fs-root <共享目錄>\n"
         "檔案模式：--fs-mode read-only|read-write；read-write 允許修改映射目錄。\n"
         "附加磁碟：--drive D=/目錄，可重複指定 D-Z；子程序繼承映射。\n"
@@ -205,7 +205,8 @@ int main(int argc, char** argv) {
         }
         if (command == "bench") {
             unsigned samples = 25;
-            std::filesystem::path fixtures = X64ARM_FIXTURES;
+            // 相對於目前目錄：成品不內嵌建置機路徑，也不隨附這些 fixture。
+            std::filesystem::path fixtures = "tests/fixtures";
             std::set<std::string_view> options;
             for (int i = 2; i < argc; i += 2) {
                 const std::string_view option = argv[i];

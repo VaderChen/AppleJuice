@@ -191,6 +191,8 @@ public:
     bool wait_may_be_ready(const std::vector<std::uint64_t>& handles,bool all,std::uint64_t thread_id);
     bool resident_runnable_waiting(std::span<GuestState* const>) const override;
     void trace_guest_thread_waits(std::FILE* out,const GuestMemory* memory=nullptr) const;
+    // 診斷（X64ARM_TRACE_THREAD_DUMP）：事件操作環形紀錄，傾印時列出等待中 handle 最近的操作。
+    void trace_event_operation(char operation,std::uint64_t handle,std::uint64_t thread,std::uint64_t caller) const;
     GuestState* resident_idle_replacement(GuestState&,GuestMemory&,std::span<GuestState* const>) override;
     bool resident_block_service_impl(GuestState&,GuestMemory&,std::span<GuestState* const>,GuestState*&,int* outcome);
 #endif
@@ -434,6 +436,7 @@ private:
     std::optional<std::uint32_t> invoke_user_session(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool window_update_locked(std::uint64_t) const;
     std::uint64_t selected_keyboard_layout(std::uint64_t thread) const;
+    std::vector<std::uint64_t> keyboard_layouts() const;
     std::uint32_t touch_injection_feedback_{};
     void deliver_pointer_sample(const input::PointerSample&);
     bool promote_pointer_message(std::uint64_t window,std::uint64_t wparam,std::uint32_t message);
@@ -892,6 +895,7 @@ private:
     std::optional<std::uint32_t> invoke_vulkan(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_directml(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_msvcp_pmr(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_msvcp_special_math(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_task_dialog(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_task_dialog(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     bool begin_ribbon_com(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1266,6 +1270,12 @@ private:
     std::size_t parallel_thread_count_{};
     std::uint64_t parallel_cursor_{};
     std::uint64_t resident_object_wake_after_{}; // 服務邊界下一次解析物件等待的單調時鐘（100 ns）。
+    std::uint64_t object_wait_order_{}; // 物件等待的進入序號來源。
+    GuestState* mutex_wake_handoff_{}; // 本地路徑判定「持互斥鎖 SetEvent 喚醒等待者」，交由單槽換手完成。
+    bool owns_local_mutex(std::uint64_t thread) const;
+    std::uint64_t object_wait_entry_order(GuestThread& thread,const GuestState& state);
+    bool mutex_has_waiters(std::uint64_t mutex) const;
+    void hand_off_released_mutex(GuestMemory& memory,std::uint64_t mutex);
     // 上一個服務是 D3D11 裝置內容輕量入口時，常駐服務收尾的等待解析與排程限流（見 after_resident_parallel）。
     bool graphics_service_epilogue_{};std::uint64_t last_graphics_epilogue_{};
     // 協調者本地一般服務執行中（resident_coordinated_service）：provider 要啟動客體回呼時改丟 LocalServiceRefused，交回完整路徑重做。
@@ -1308,6 +1318,7 @@ private:
     bool dispatch_user_apc(GuestState&,GuestMemory&,std::uint64_t completion);
     struct CompletionResult {std::uint32_t value{},error{};bool ready{},guest_return{};};
     CompletionResult poll_completion(GuestState&,GuestMemory&,std::uint64_t handle,bool extended,bool expired);
+    void advance_waitable_timers();
     void wake_threads(GuestMemory& memory);
     enum class ThreadWakeScope { All, Condition, Slim, Critical, Objects, Address };
     bool resolve_thread_waits(GuestMemory&,ThreadWakeScope scope=ThreadWakeScope::All,std::uint64_t address=0);

@@ -23,6 +23,10 @@ struct DeviceNode {
     std::map<std::uint32_t,std::pair<std::u16string,RegistryValue>> properties;
     // 驅動軟體鍵（Control\Class\{guid}\0000）專屬值，例如 WDDM 的 OpenCLDriverName。
     std::map<std::u16string,RegistryValue> software;
+    // 硬體鍵（Enum\<id>\Device Parameters）專屬值，例如監視器的 EDID。非空的節點才使用該鍵，且只寫這些值。
+    std::map<std::u16string,RegistryValue> hardware;
+    // 驅動鍵的執行個體編號（Control\Class\{guid}\<編號>）。
+    std::u16string driver_instance{u"0000"};
     std::array<std::uint8_t,16> guid{};
     std::array<std::uint8_t,16> interface_guid{};
     std::vector<std::array<std::uint8_t,16>> interface_aliases;
@@ -99,12 +103,32 @@ std::uint32_t write_enum_key(RegistryState& registry,const std::filesystem::path
     for(const auto& [property,entry]:node.properties)if(property!=23)values.emplace_back(entry.first,entry.second);
     return write_registry_key(registry,file,std::u16string(1,2)+u"\\SYSTEM\\CurrentControlSet\\Enum\\"+node.id,values,remove,limit);
 }
+// 驅動鍵與硬體鍵的摺疊路徑。有 hardware 值表的節點使用 Device Parameters；其餘節點維持 Enum\<id>，在同一鍵讀取屬性。
+std::u16string device_key_path(const DeviceNode& node,bool driver){
+    return folded(std::u16string(1,2)+(driver?u"\\system\\currentcontrolset\\control\\class\\"+node.class_guid+u"\\"+node.driver_instance:
+        u"\\system\\currentcontrolset\\enum\\"+node.id+(node.hardware.empty()?u"":u"\\device parameters")));
+}
+// 同步 hardware 值表：內容相同只走唯讀交易（沿用登錄快取），不同才寫入，讓顯示器尺寸改變時覆寫舊值。
+// 登錄交易持有跨程序鎖，不可巢狀；呼叫端須在開啟自己的交易之前呼叫。
+std::uint32_t sync_hardware_key(RegistryState& registry,const std::filesystem::path& file,RegistryStoreCache* cache,const DeviceNode& node,std::size_t limit){
+    {
+        RegistryTransaction view(registry,file,cache,true);if(view.error)return view.error;
+        const auto key=registry.keys.find(device_key_path(node,false));
+        if(key!=registry.keys.end() && std::all_of(node.hardware.begin(),node.hardware.end(),[&](const auto& item){
+            const auto value=key->second.find(item.first);return value!=key->second.end() && value->second==item.second;}))return 0;
+    }
+    const std::vector<std::pair<std::u16string,RegistryValue>> values(node.hardware.begin(),node.hardware.end());
+    return write_registry_key(registry,file,std::u16string(1,2)+u"\\SYSTEM\\CurrentControlSet\\Enum\\"+node.id+u"\\Device Parameters",values,{},limit);
+}
 #include "windows_device_interface_properties.inc"
 }
 struct DeviceConfigurationState {
     std::map<std::uint32_t,DeviceNode> nodes;
     std::map<input::Guid,std::uint32_t> hid_nodes;
     std::map<std::u16string,std::uint32_t> bluetooth_nodes;
+    // 監視器：顯示器序號（0 起算）→ devnode，拔除後保留為不存在；monitors 為最近一次同步的顯示器狀態。
+    std::vector<std::uint32_t> monitor_nodes;
+    std::vector<GuiMonitor> monitors;
     // USB：IOKit registry ID／介面編號 → devnode，主控制器 locationID → devnode；拔除後保留為不存在。
     std::vector<std::pair<std::string,std::uint32_t>> usb_paths; // IOService 路徑 → USB devnode
     std::map<std::u16string,usb::Target> usb_targets;           // 摺疊後的裝置介面路徑 → 開啟目標
@@ -132,6 +156,44 @@ struct DeviceConfigurationState {
     std::map<std::uint64_t,Notification> notifications;
     std::uint64_t next_notification{0x6c000000},poll_deadline{};
 };
+namespace {
+// 監視器掛在顯示配接器下；沒有配接器時掛在 root。
+std::uint32_t monitor_parent_node(const DeviceConfigurationState& config){return config.nodes.contains(2)?2U:1U;}
+// 通知條件涵蓋監視器：全部介面類別、監視器介面、全部執行個體或指定的監視器執行個體。
+bool watches_monitor_nodes(const DeviceConfigurationState::Notification& n){
+    if(n.type==0)return (n.flags&1U)!=0 || n.guid==display_identity::monitor_interface_guid;
+    return n.type==2 && ((n.flags&2U)!=0 || folded(n.instance).starts_with(display_identity::monitor_instance_prefix));
+}
+// 監視器節點與 EnumDisplayDevices 共用 gui_monitors() 的序號（第 n 台＝\\.\DISPLAYn）。每台保持穩定代號，
+// 拔除後比照序列埠保留為不存在，讓集合與通知看到同一個移除狀態；顯示器狀態未變時不重建。
+// 取得 monitors 在原生 GUI 下會建立延遲的 AppKit，由呼叫端依可見性決定是否同步（見 sees_monitor_nodes）。
+void sync_monitor_nodes(DeviceConfigurationState& config,const std::vector<GuiMonitor>& monitors){
+    if(config.monitors==monitors)return;
+    const bool initial=config.monitor_nodes.empty();
+    for(std::size_t index=0;index<monitors.size();++index){
+        if(index>=config.monitor_nodes.size()){
+            while(config.nodes.contains(config.next_dynamic_node)){if(config.next_dynamic_node==UINT32_MAX)throw std::bad_alloc{};++config.next_dynamic_node;}
+            if(config.next_dynamic_node==UINT32_MAX)throw std::bad_alloc{};config.monitor_nodes.push_back(config.next_dynamic_node++);
+        }
+        const auto number=static_cast<std::uint32_t>(index+1);const auto& monitor=monitors[index];
+        DeviceNode node;node.id=display_identity::monitor_instance(number);node.enumerator=u"DISPLAY";node.parent=monitor_parent_node(config);
+        node.present=true;node.status=0x000aU; // DN_DRIVER_LOADED｜DN_STARTED；由顯示配接器列舉，不是 root 裝置。
+        node.class_guid=display_identity::monitor_class_name;node.guid=display_identity::monitor_class_guid;node.driver_instance=display_identity::monitor_driver_instance(number);
+        node.interface_guid=display_identity::monitor_interface_guid;node.interface_path=display_identity::monitor_interface_path(number);
+        text_property(node,1,u"DeviceDesc",std::u16string(display_identity::monitor_name));text_property(node,2,u"HardwareID",u"MONITOR\\"+display_identity::monitor_hardware_id(number),true);
+        text_property(node,8,u"Class",u"Monitor");text_property(node,9,u"ClassGUID",node.class_guid);text_property(node,10,u"Driver",node.class_guid+u"\\"+node.driver_instance);
+        text_property(node,23,u"EnumeratorName",node.enumerator);
+        // display_name 必須保留大寫 EDID：客體會以區分大小寫的比對尋找這個值名稱。
+        const auto edid=display_identity::monitor_edid(number,static_cast<std::uint32_t>(monitor.rect[2]-monitor.rect[0]),static_cast<std::uint32_t>(monitor.rect[3]-monitor.rect[1]),monitor.refresh);
+        RegistryValue value;value.type=3;value.bytes.assign(edid.begin(),edid.end());value.display_name=u"EDID";node.hardware.emplace(u"edid",std::move(value));
+        config.nodes.insert_or_assign(config.monitor_nodes[index],std::move(node));
+    }
+    for(std::size_t index=monitors.size();index<config.monitor_nodes.size();++index){auto& removed=config.nodes.at(config.monitor_nodes[index]);removed.present=false;removed.status=0x2401;removed.problem=45;}
+    // 首次建立是延遲盤點，不是熱插拔：併入既有通知的基準快照，不發抵達事件。之後新增的監視器才算真正的抵達。
+    if(initial)for(auto& [owner,n]:config.notifications){(void)owner;for(const auto handle:config.monitor_nodes)n.present.emplace(handle,true);}
+    config.monitors=monitors;
+}
+}
 void WindowsServices::refresh_device_configuration(bool enumerate_hid){
         if(!device_configuration_){
             auto configuration=std::make_shared<DeviceConfigurationState>();DeviceNode root;root.id=u"HTREE\\ROOT\\0";root.enumerator=u"HTREE";root.status=0x0009;
@@ -149,7 +211,7 @@ void WindowsServices::refresh_device_configuration(bool enumerate_hid){
                 // 顯示配接器的裝置介面：GUID_DISPLAY_DEVICE_ARRIVAL，並以 GUID_DEVINTERFACE_DISPLAY_ADAPTER 為別名；D3DKMTOpenAdapterFromDeviceName 接受此路徑。
                 display.interface_guid={0x80,0x51,0xa0,0x1c,0x99,0xa6,0x0a,0x45,0x9a,0x0c,0xde,0x4f,0xbe,0x3d,0xdd,0x89};
                 display.interface_aliases={{0x1d,0x20,0x45,0x5b,0xf2,0xf2,0x3b,0x4f,0x85,0xbb,0x30,0xff,0x1f,0x95,0x35,0x99}};
-                display.interface_path=u"\\\\?\\ROOT#X64ARM_DISPLAY#0000#{1ca05180-a699-450a-9a0c-de4fbe3ddd89}";
+                display.interface_path=display_identity::adapter_interface_path;
                 text_property(display,1,u"DeviceDesc",utf8_to_utf16(info.renderer));text_property(display,2,u"HardwareID",u"ROOT\\X64ARM_DISPLAY",true);
                 text_property(display,3,u"CompatibleIDs",u"ROOT\\X64ARM_DISPLAY",true);text_property(display,5,u"Service",display.service);
                 text_property(display,8,u"Class",u"Display");text_property(display,9,u"ClassGUID",display.class_guid);
@@ -256,6 +318,10 @@ void WindowsServices::refresh_device_configuration(bool enumerate_hid){
             number_property(node,11,u"ConfigFlags",0);number_property(node,16,u"Capabilities",0);config.nodes.insert_or_assign(held->second,std::move(node));
         }
     }
+    // 監視器節點的首次建立由 invoke_device_configuration 依可見性決定。這裡只在節點已建立，或已有通知會看到監視器時才同步；
+    // 只走到這裡的呼叫（查 HID、開 USB 裝置等）不可碰 gui_monitors()，否則無視窗程序會因此建立 AppKit。
+    if(!config.monitor_nodes.empty() || std::any_of(config.notifications.begin(),config.notifications.end(),[](const auto& item){return watches_monitor_nodes(item.second);}))
+        sync_monitor_nodes(config,gui_monitors());
     // 映射消失亦須更新既有 devnode，讓列舉與通知看到同一個移除狀態。
     for(auto& [id,node]:device_configuration_->nodes){
         if(node.enumerator==u"ROOT" && node.service==u"x64armSerial" && !serial_ports_.contains(id-0x10000U)){
@@ -324,6 +390,46 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
         if((name.starts_with("CM_Get_Device_Interface_Property") || name.starts_with("CM_Set_Device_Interface_Property")) && arg(0) && folded(read(arg(0))).starts_with(u"\\\\?\\hid"))enumerate_hid=true;
         refresh_device_configuration(enumerate_hid);
         const auto& nodes=device_configuration_->nodes;
+        // 監視器節點要取得 gui_monitors()，原生 GUI 下會建立延遲的 AppKit（每程序約 0.12～0.23 秒），只查 HID、USB 或顯示配接器的無視窗程序不可付這個成本。
+        // 節點尚未建立時，只有下列看得到監視器的呼叫才建立；之後由 refresh_device_configuration 持續同步。以 DEVINST、集合或介面 token 為輸入的入口
+        // （CM_Get_Parent、CM_Get_DevNode_*、CM_Open_DevNode_Key、SetupDiEnum* 等）不列入：監視器的這些值只可能來自已建立的節點，且監視器沒有子節點，CM_Get_Parent 不會回傳它。
+        const auto sees_monitor_nodes=[&]()->bool{
+            const auto monitor_guid=[&](std::uint64_t pointer){
+                std::array<std::uint8_t,16> guid{};if(pointer)memory.read(GuestAddress{pointer},guid);
+                return guid==display_identity::monitor_class_guid || guid==display_identity::monitor_interface_guid;
+            };
+            const auto starts=[&](std::uint64_t pointer,std::u16string_view prefix){return pointer && folded(read(pointer)).starts_with(prefix);};
+            // Monitor 類別、監視器介面或全部類別；指定其他列舉子（USB、HID 等）時看不到監視器。
+            if(name.starts_with("SetupDiGetClassDevs")){
+                const auto enumerator=folded(read(arg(1)));if(!enumerator.empty() && !enumerator.starts_with(u"display"))return false;
+                return (arg(3)&4U)!=0 || monitor_guid(arg(0));
+            }
+            // 依身分開啟；建立裝置也要看得到，才能回報實例已存在。
+            if(name=="SetupDiOpenDeviceInfoA" || name=="SetupDiOpenDeviceInfoW" || name=="SetupDiCreateDeviceInfoA" || name=="SetupDiCreateDeviceInfoW")return starts(arg(1),display_identity::monitor_instance_prefix);
+            if(name=="SetupDiOpenDeviceInterfaceA" || name=="SetupDiOpenDeviceInterfaceW")return starts(arg(1),display_identity::monitor_interface_prefix);
+            // 類別盤點與名稱查詢讀取由節點產生的類別資料。
+            if(name.starts_with("SetupDiBuildClassInfoList"))return true;
+            if(name.starts_with("SetupDiClassGuidsFromName"))return folded(read(arg(0)))==u"monitor";
+            if(name.starts_with("SetupDiClassNameFromGuid") || name.starts_with("SetupDiGetClassDescription"))return monitor_guid(arg(0));
+            if(name.starts_with("SetupDiOpenClassRegKey"))return !arg(0) || monitor_guid(arg(0));
+            if(name.starts_with("CM_Locate_DevNode"))return starts(arg(1),display_identity::monitor_instance_prefix);
+            // 走訪裝置樹：只有監視器的父節點之下才看得到；root 底下的第一個子節點是顯示配接器，走到這一步不必建立。
+            if(name=="CM_Get_Child")return arg(1)==monitor_parent_node(*device_configuration_);
+            if(name=="CM_Get_Sibling"){const auto item=nodes.find(static_cast<std::uint32_t>(arg(1)));return item!=nodes.end() && item->second.parent==monitor_parent_node(*device_configuration_);}
+            if(name.starts_with("CM_Get_Device_ID_List")){
+                const bool size=name.find("_Size")!=name.npos;const auto flags=static_cast<std::uint32_t>(arg(size?2:3));
+                if(!(flags&0x203U))return true; // 沒有列舉子、服務或類別篩選：列出全部節點。監視器沒有服務名稱，服務篩選看不到。
+                const auto filter=folded(read(arg(size?1:0)));
+                return ((flags&1U) && filter==u"display") || ((flags&0x200U) && filter==display_identity::monitor_class_name);
+            }
+            if(name.starts_with("CM_Get_Device_Interface_List")){
+                const bool size=name.find("_Size")!=name.npos;
+                return monitor_guid(arg(size?1:0)) || starts(arg(size?2:1),display_identity::monitor_instance_prefix);
+            }
+            if(name.starts_with("CM_Get_Device_Interface_Property") || name.starts_with("CM_Set_Device_Interface_Property"))return starts(arg(0),display_identity::monitor_interface_prefix);
+            return false;
+        };
+        if(device_configuration_->monitor_nodes.empty() && sees_monitor_nodes())sync_monitor_nodes(*device_configuration_,gui_monitors());
 #include "windows_device_interface_property_calls.inc"
         if(name.starts_with("SetupDiClass") || name.starts_with("SetupDiGetClassDescription") || name.starts_with("SetupDiBuildClassInfoList") || name.starts_with("SetupDiOpenClassRegKey")){
 #include "windows_setup_classes.inc"
@@ -417,10 +523,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
             if(!arg(4))return finish(3);if(arg(3)>1)return finish(31);if(arg(5)&~0x301U || (arg(5)&0x300U)==0x300U)return finish(4);
             if(arg(2) || (arg(5)&0x300U))return finish(52);if(arg(1)&~0x20119U)return finish(51);
             if(runtime_.registry.handles.size()>=4096)return finish(2);memory.check(GuestAddress{arg(4)},x86_?4:8,Access::Write);
-            auto& registry=runtime_.registry;RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_);if(transaction.error)return finish(51);
+            auto& registry=runtime_.registry;
+            // 有 hardware 值表的節點：硬體鍵只放這些值，下面的屬性補寫分支因鍵已存在而不會執行。
+            if(!(arg(5)&1) && !node.hardware.empty() && sync_hardware_key(registry,registry_file_,&registry_store_cache_,node,output_limit))return finish(51);
+            RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_);if(transaction.error)return finish(51);
             // 裝置鍵通常已存在；沿用快取避免每次都重新解析整個登錄檔，只有實際寫入才使快取失效。
             bool committed=false;
-            const auto path=folded(std::u16string(1,2)+((arg(5)&1)?u"\\system\\currentcontrolset\\control\\class\\"+node.class_guid+u"\\0000":u"\\system\\currentcontrolset\\enum\\"+node.id));
+            const auto path=device_key_path(node,(arg(5)&1)!=0);
             if((arg(5)&1) && node.class_guid.empty())return finish(46);
             const auto missing_software=(arg(5)&1) && std::any_of(node.software.begin(),node.software.end(),[&](const auto& item){
                 const auto key=registry.keys.find(path);return key==registry.keys.end() || !key->second.contains(item.first);});

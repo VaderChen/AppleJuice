@@ -9,6 +9,9 @@
 #include "guest_mf_buffer_code.hpp"
 #include "x64arm/pe_loader.hpp"
 #include "mf_h264.hpp"
+#include "mf_mp4_demux.hpp"
+#include "mf_audio_transcoder.hpp"
+#include "mf_video_output.hpp"
 #include "pcm_wave_file.hpp"
 #include "mp4_video.hpp"
 #include "x64arm/audio.hpp"
@@ -21,6 +24,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <optional>
 #include <set>
 
@@ -65,8 +69,10 @@ struct ByteStreamState {
 };
 struct FileSourceState {
     std::shared_ptr<HostFile> file;PcmWaveStream wave;std::uint64_t base{},external_stream{};
+    std::shared_ptr<const mf::Mp4Movie> movie; // 非空時為 MP4 來源，wave 不使用。
 };
 #include "mf_guest_bytestream.hpp"
+#include "mf_session_state.hpp"
 struct SinkWriterState {
     std::shared_ptr<ByteStreamState> stream;
     std::uint64_t base{};
@@ -118,7 +124,11 @@ struct Object {
     std::shared_ptr<FileSourceState> file_source;
     bool file_read_active{},flush_pending{};std::uint64_t file_read_generation{};
     std::shared_ptr<ByteStreamState> byte_stream;
-
+    std::vector<std::uint64_t> media_streams; // MP4 來源的 MediaStream，與 Source 互持到 Shutdown。
+    // Topology／TopologyNode：輸出持有下游引用，輸入是下游對上游的弱參照。
+    struct NodeLink {std::uint64_t node{};std::uint32_t index{};};
+    std::uint64_t topo_id{};std::uint32_t node_type{};std::vector<NodeLink> outputs,inputs;std::map<std::uint32_t,std::uint64_t> output_prefs,input_prefs;
+    std::shared_ptr<SessionState> session;bool event_dispatching{};
 };
 struct Entry {std::shared_ptr<Object> object;mf::Kind kind;};
 }
@@ -128,6 +138,10 @@ struct MediaFoundationState {
     std::uint64_t shared_manager{},next_device_handle{0x10000},next_query{1};std::uint32_t manager_locks{},next_reset_token{1};
     struct Query {std::shared_ptr<Object> manager;std::uint64_t handle{},generation{},output{},owner{};bool locking{};std::uint64_t scratch{},service_pointer{};unsigned service_stage{};std::uint32_t service_status{};};
     std::map<std::uint64_t,Query> queries;
+    std::uint64_t next_topology_id{1};
+    // MFPutWorkItem 系列：由 poll_media_foundation 派送到客體工作執行緒。
+    struct WorkItem {std::uint64_t result{},invoke{},callback{};};
+    std::deque<WorkItem> work_items;
 };
 bool WindowsServices::media_foundation_ready(std::uint64_t pointer,std::uint64_t thread) const {
     (void)thread;
@@ -138,13 +152,33 @@ bool WindowsServices::media_foundation_ready(std::uint64_t pointer,std::uint64_t
     return item.kind==mf::Manager?!item.lock_handle:item.closed || !item.events.empty();
 }
 bool WindowsServices::media_foundation_waiting() const {
-    if(!media_foundation_)return false;for(const auto& [id,thread]:threads_.items){(void)id;if(thread.status==ThreadStatus::Waiting && thread.wait.kind==ThreadWaitKind::MediaFoundation && !thread.wait.handles.empty()){const auto found=media_foundation_->objects.find(thread.wait.handles.front());if(found!=media_foundation_->objects.end() && found->second.object->kind==mf::Reader)return true;}}for(const auto& [pointer,entry]:media_foundation_->objects){(void)pointer;if(entry.kind==entry.object->kind && entry.object->job_held)return true;}return false;
+    if(!media_foundation_)return false;if(!media_foundation_->work_items.empty())return true;for(const auto& [id,thread]:threads_.items){(void)id;if(thread.status==ThreadStatus::Waiting && thread.wait.kind==ThreadWaitKind::MediaFoundation && !thread.wait.handles.empty()){const auto found=media_foundation_->objects.find(thread.wait.handles.front());if(found!=media_foundation_->objects.end() && (found->second.object->kind==mf::Reader || found->second.object->kind==mf::Session))return true;}}for(const auto& [pointer,entry]:media_foundation_->objects){(void)pointer;if(entry.kind==entry.object->kind && entry.object->job_held)return true;}return false;
 }
 void WindowsServices::poll_media_foundation(GuestMemory& memory){
     if(!media_foundation_ || threads_.items.empty() || registered_waits_.size()>=64)return;
-    std::vector<std::uint64_t> ready;
+    const auto dispatch=[&](std::vector<GuestCallback> batch){
+        if(registered_waits_.size()>=64)return false;const auto saved_error=last_error_;
+        const auto worker=acquire_wait_worker(threads_.items.at(threads_.current).context,memory,std::max(UINT64_C(65536),runtime_.image.stack_size));last_error_=saved_error;if(!worker)return false;
+        RegisteredWait work;work.worker=worker;work.callback_batch=std::move(batch);work.armed=false;work.ready=true;work.closing=true;work.work_item=true;
+        const auto id=next_registered_wait_++;registered_waits_.emplace(id,std::move(work));wait_workers_[worker]=id;
+        auto& thread=threads_.items.at(worker);thread.status=ThreadStatus::Runnable;thread.wait={};return true;
+    };
+    auto& work_items=media_foundation_->work_items;
+    while(!work_items.empty()){
+        const auto item=work_items.front();
+        if(!dispatch({{item.invoke,{item.callback,item.result}},{resolve("internal-mf","Release").value,{item.result}}}))return;
+        work_items.pop_front();
+    }
+    std::vector<std::uint64_t> ready,session_pumps,session_events;
     for(const auto& [pointer,entry]:media_foundation_->objects){
-        const auto& item=*entry.object;if(entry.kind!=item.kind || !item.job_held || item.poll_queued)continue;
+        const auto& item=*entry.object;if(entry.kind!=item.kind || !item.job_held)continue;
+        if(item.kind==mf::Session){
+            if(item.closed)continue;
+            if(item.callback && !item.events.empty() && !item.event_dispatching)session_events.push_back(pointer);
+            if(!item.poll_queued && item.session->pump_ready(runtime_.clock_ticks))session_pumps.push_back(pointer);
+            continue;
+        }
+        if(item.poll_queued)continue;
         bool complete=item.closed || !item.request_pending;
         if(item.kind==mf::Transform)complete=(!item.decoding.valid() || item.decoding.wait_for(std::chrono::seconds(0))==std::future_status::ready) && (!item.encoding.valid() || item.encoding.wait_for(std::chrono::seconds(0))==std::future_status::ready);
         else if(item.request_pending){const auto found=media_foundation_->objects.find(item.parent);if(found==media_foundation_->objects.end() || found->second.object->closed)complete=true;
@@ -152,12 +186,17 @@ void WindowsServices::poll_media_foundation(GuestMemory& memory){
             else if(const auto capture=found->second.object->capture){std::lock_guard lock(capture->mutex);complete=capture->capture_failed || capture->captured_frames>item.read_frames;}}
         if(complete)ready.push_back(pointer);
     }
+    for(const auto pointer:session_events){
+        if(!dispatch({{resolve("internal-mf","SessionDeliver").value,{pointer}}}))return;
+        media_foundation_->objects.at(pointer).object->event_dispatching=true;
+    }
+    for(const auto pointer:session_pumps){
+        if(!dispatch({{resolve("internal-mf","SessionPump").value,{pointer}}}))return;
+        media_foundation_->objects.at(pointer).object->poll_queued=true;
+    }
     for(const auto pointer:ready){
-        if(registered_waits_.size()>=64)break;const auto saved_error=last_error_;
-        const auto worker=acquire_wait_worker(threads_.items.at(threads_.current).context,memory,std::max(UINT64_C(65536),runtime_.image.stack_size));last_error_=saved_error;if(!worker)break;
-        RegisteredWait work;work.worker=worker;work.callback_batch.push_back({resolve("internal-mf","PipelinePoll").value,{pointer}});work.armed=false;work.ready=true;work.closing=true;work.work_item=true;
-        const auto id=next_registered_wait_++;registered_waits_.emplace(id,std::move(work));wait_workers_[worker]=id;media_foundation_->objects.at(pointer).object->poll_queued=true;
-        auto& thread=threads_.items.at(worker);thread.status=ThreadStatus::Runnable;thread.wait={};
+        if(!dispatch({{resolve("internal-mf","PipelinePoll").value,{pointer}}}))break;
+        media_foundation_->objects.at(pointer).object->poll_queued=true;
     }
 }
 void WindowsServices::discard_media_foundation_query(std::uint64_t token,GuestMemory& memory,GuestState& state){
@@ -209,9 +248,12 @@ std::span<const WindowsServiceDescriptor> media_foundation_service_descriptors()
             {"mfplat.dll","MFCreateDXGISurfaceBuffer",5,0,0,12},
             {"mf.dll","MFGetService",4},{"mfplat.dll","MFTEnum",7,0,1,2},{"mfplat.dll","MFTEnumEx",6,0,1,2},{"mf.dll","MFEnumDeviceSources",3},{"mf.dll","MFCreateDeviceSource",2},
             {"mfplat.dll","MFCreateSourceResolver",1},{"mfreadwrite.dll","MFCreateSourceReaderFromURL",3},{"mfreadwrite.dll","MFCreateSourceReaderFromByteStream",3},{"mfreadwrite.dll","MFCreateSourceReaderFromMediaSource",3},{"mfreadwrite.dll","MFCreateSinkWriterFromURL",4},{"mfplat.dll","MFCreateFile",5,0,0,7},{"internal-mf","PipelinePoll",1},
+            {"mf.dll","MFCreateMediaSession",2},{"mf.dll","MFCreateTopology",1},{"mf.dll","MFCreateTopologyNode",2,0,0,1},{"mf.dll","MFCreateSampleGrabberSinkActivate",3},{"mf.dll","MFCreateAudioRendererActivate",1},
+            {"mfplat.dll","MFCreateCollection",1},{"mfplat.dll","MFPutWorkItem",3,0,0,1},{"mfplat.dll","MFPutWorkItem2",4,0,0,3},{"mfplat.dll","MFPutWorkItemEx",2,0,0,1},{"mfplat.dll","MFPutWorkItemEx2",3,0,0,3},
+            {"internal-mf","SessionPump",1},{"internal-mf","SessionPumpDone",1},{"internal-mf","SessionDeliver",1},
             {"internal-mf","BufferDestroy",1},{"internal-mf","B_LockHost",4},{"internal-mf","B_UnlockHost",1}};
         std::set<std::string_view> names;const auto append=[&](const auto& methods){for(const auto& m:methods)if(names.insert(m.name).second)result.push_back({"internal-mf",m.name,m.args,m.wide,m.aggregate,m.narrow});};
-        append(mf::common);for(unsigned k=0;k<=mf::Resolver;++k)append(mf::methods(static_cast<mf::Kind>(k)));
+        append(mf::common);for(unsigned k=0;k<=mf::StreamVolume;++k)append(mf::methods(static_cast<mf::Kind>(k)));
         return result;
     }();return table;
 }
@@ -259,9 +301,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
     const auto foreign_method=[&](std::uint64_t p,unsigned slot){require(p!=0,pointer_error);const auto table=memory.load(GuestAddress{p},bits);return memory.load(GuestAddress{table+slot*unit},bits);};
     const auto hold=[&](std::uint64_t p){if(!p)return;if(const auto found=bridge.objects.find(p);found!=bridge.objects.end()){require(found->second.object->refs<UINT32_MAX);++found->second.object->refs;}else callbacks.push_back({foreign_method(p,1),{p}});};
     std::function<void(std::uint64_t)> release;
-    std::function<void(const std::shared_ptr<Object>&)> close_source;
+    std::function<void(const std::shared_ptr<Object>&)> close_source,close_session;
     const auto destroy=[&](std::uint64_t p){
         auto item=entry(p).object;
+        if(item->session && close_session)close_session(item);
         if(item->kind==mf::Reader && !item->disconnect_source && item->parent && bridge.objects.contains(item->parent) && close_source)close_source(bridge.objects.at(item->parent).object);
         for(const auto& [kind,pointer]:item->pointers){(void)kind;bridge.objects.erase(pointer);runtime_.critical_sections.erase(pointer);(void)free_heap(memory,pointer,state);}
         for(const auto& [key,value]:item->attributes){(void)key;if(value.type==13)release(value.scalar);}
@@ -269,6 +312,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
         release(item->attribute_store);release(item->input_attributes);release(item->output_attributes);release(item->output_type);release(item->pending_token);
         release(item->parent);release(item->state);release(item->callback);release(item->result_object);release(item->current_type);
         for(const auto child:item->children)release(child);for(const auto event:item->events)release(event);
+        for(const auto stream:item->media_streams)release(stream);
+        for(const auto& link:item->outputs)if(link.node){
+            if(const auto target=bridge.objects.find(link.node);target!=bridge.objects.end() && link.index<target->second.object->inputs.size())target->second.object->inputs[link.index]={};
+            release(link.node);
+        }
+        for(const auto& [index,type]:item->output_prefs){(void)index;release(type);}for(const auto& [index,type]:item->input_prefs){(void)index;release(type);}
         if(item->allocation)(void)free_heap(memory,item->allocation,state);
     };
     release=[&](std::uint64_t p){
@@ -313,12 +362,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
         else if(iid==mf::iid_Generator && (item->kind==mf::Transform || item->kind==mf::Source || item->kind==mf::MediaStream))pointer=create(item,mf::Generator);
         else if(iid==mf::iid_Shutdown && item->kind==mf::Transform)pointer=create(item,mf::Shutdown);
         else if(item->kind==mf::Stream && iid==mf::iid_TypeHandler)pointer=create(item,mf::TypeHandler);
+        else if(item->kind==mf::Session && (iid==mf::iid_Clock || iid==mf::iid_PresentationClock))pointer=create(item,mf::Clock);
+        else if(item->kind==mf::Session && iid==mf::iid_Generator)pointer=item->pointers.at(mf::Session);
+        else if(item->kind==mf::Session && iid==mf::iid_RateControl)pointer=create(item,mf::RateControl);
+        else if(item->kind==mf::Session && iid==mf::iid_RateSupport)pointer=create(item,mf::RateSupport);
+        else if(item->kind==mf::Session && iid==mf::iid_GetService)pointer=create(item,mf::GetService);
         else if(item->surface && (iid==mf::iid_Surface || iid==mf::iid_TwoD || iid==mf::iid_TwoD2))pointer=create(item,iid==mf::iid_Surface?mf::Surface:iid==mf::iid_TwoD?mf::TwoD:mf::TwoD2);
         else throw Failure{no_interface};hold(pointer);put(output,pointer,bits);
     };
     const auto read_value=[&](std::uint64_t p){
         require(p!=0,pointer_error);memory.check(GuestAddress{p},x86_?16:24,Access::Read);Value v;v.type=static_cast<std::uint32_t>(memory.load(GuestAddress{p},16));
-        switch(v.type){case 0:break;case 19:v.scalar=memory.load(GuestAddress{p+8},32);break;case 20:case 21:case 5:v.scalar=memory.load(GuestAddress{p+8},64);break;
+        switch(v.type){case 0:break;case 4:case 19:v.scalar=memory.load(GuestAddress{p+8},32);break;case 20:case 21:case 5:v.scalar=memory.load(GuestAddress{p+8},64);break;
         case 13:v.scalar=memory.load(GuestAddress{p+8},bits);break;case 72:v.id=guid(memory.load(GuestAddress{p+8},bits));break;
         case 31:v.text=read_utf16(memory,GuestAddress{memory.load(GuestAddress{p+8},bits)});break;
         case 0x1011:{const auto size=memory.load(GuestAddress{p+8},32);v.blob=data(memory.load(GuestAddress{p+(x86_?12:16)},bits),size);break;}
@@ -326,7 +380,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
     };
     const auto write_value=[&](std::uint64_t p,const Value& v){
         check(p,x86_?16:24);memory.write(GuestAddress{p},std::vector<std::uint8_t>(x86_?16:24));put(p,v.type,16);
-        switch(v.type){case 0:break;case 19:put(p+8,v.scalar);break;case 20:case 21:case 5:put(p+8,v.scalar,64);break;case 13:hold(v.scalar);put(p+8,v.scalar,bits);break;
+        switch(v.type){case 0:break;case 4:case 19:put(p+8,v.scalar);break;case 20:case 21:case 5:put(p+8,v.scalar,64);break;case 13:hold(v.scalar);put(p+8,v.scalar,bits);break;
         case 72:{const auto id=allocate(16);memory.write(GuestAddress{id},v.id);put(p+8,id,bits);break;}
         case 31:{const auto bytes=utf16_bytes(v.text);const auto text=allocate(bytes.size());memory.write(GuestAddress{text},bytes);put(p+8,text,bits);break;}
         case 0x1011:{const auto blob=allocate(v.blob.size());memory.write(GuestAddress{blob},v.blob);put(p+8,v.blob.size());put(p+(x86_?12:16),blob,bits);break;}
@@ -364,10 +418,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
     #include "mf_guest_bytestream_helpers.inc"
     #include "mf_pipeline_helpers.inc"
     #include "mf_sink_helpers.inc"
+    #include "mf_session_source_helpers.inc"
     #include "mf_file_source_helpers.inc"
+    #include "mf_session_helpers.inc"
     std::uint64_t result=0;
     try {
         #include "mf_file_source_exports.inc"
+        else
+        #include "mf_session_exports.inc"
         else
         #include "mf_bytestream_exports.inc"
         else
@@ -436,6 +494,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
             #include "mf_bytestream_methods.inc"
             #include "mf_sink_methods.inc"
             #include "mf_pipeline_methods.inc"
+            #include "mf_session_methods.inc"
             else if(name.starts_with("A_")){
                 require(mf::attributes(item->kind),no_interface);
                 auto& lock=runtime_.critical_sections[item->pointers.at(item->kind)];
@@ -506,7 +565,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
             }else if(name.starts_with("E_")){
                 require(item->kind==mf::Event,no_interface);if(name=="E_GetType")put(arg(1),item->identifier);else if(name=="E_GetStatus")put(arg(1),item->status);else if(name=="E_GetExtendedType"){check(arg(1),16);memory.write(GuestAddress{arg(1)},item->extended);}else if(name=="E_GetValue")write_value(arg(1),item->value);
             }else if(name.starts_with("Q_")){
-                require(item->kind==mf::Queue || item->kind==mf::Transform || item->kind==mf::Source || item->kind==mf::MediaStream,no_interface);require(!item->closed,shutdown);
+                require(item->kind==mf::Queue || item->kind==mf::Transform || item->kind==mf::Source || item->kind==mf::MediaStream || item->kind==mf::Session,no_interface);require(!item->closed,shutdown);
                 if(name=="Q_GetEvent"){
                     out(arg(2));require(d(1)<=1);require(!item->callback,0xc00d36daU);
                     if(item->events.empty()){
@@ -514,11 +573,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
                     }
                     const auto p=item->events.front();item->events.pop_front();put(arg(2),p,bits);
                 }
-                else if(name=="Q_BeginGetEvent"){require(arg(1)!=0);require(!item->callback,0xc00d36daU);hold(arg(1));hold(arg(2));item->callback=arg(1);item->state=arg(2);deliver(arg(0),item);}
+                else if(name=="Q_BeginGetEvent"){require(arg(1)!=0);require(!item->callback,0xc00d36daU);hold(arg(1));hold(arg(2));item->callback=arg(1);item->state=arg(2);if(item->kind==mf::Session)session_sync_job(item);else deliver(arg(0),item);}
                 else if(name=="Q_EndGetEvent"){out(arg(2));auto async=object(arg(1),mf::Async);require(bridge.objects.contains(async->queue_owner) && entry(async->queue_owner).object==item && async->result_object);const auto p=async->result_object;async->result_object=0;put(arg(2),p,bits);}
                 else if(name=="Q_QueueEvent"){(void)object(arg(1),mf::Event);hold(arg(1));item->events.push_back(arg(1));deliver(arg(0),item);}
-                else if(name=="Q_QueueEventParamVar" || name=="Q_QueueEventParamUnk"){Value value;if(name=="Q_QueueEventParamVar")value=arg(4)?read_value(arg(4)):Value{};else {value.type=13;value.scalar=arg(4);}item->events.push_back(event(d(1),guid(arg(2)),d(3),std::move(value)));deliver(arg(0),item);}
-                else if(name=="Q_Shutdown"){item->closed=true;for(const auto p:item->events)release(p);item->events.clear();release(item->state);release(item->callback);item->state=item->callback=0;}
+                else if(name=="Q_QueueEventParamVar" || name=="Q_QueueEventParamUnk"){Value value;if(name=="Q_QueueEventParamVar")value=arg(4)?read_value(arg(4)):Value{};else {value.type=13;value.scalar=arg(4);}item->events.push_back(event(d(1),guid(arg(2)),d(3),std::move(value)));if(item->kind==mf::Session)session_sync_job(item);else deliver(arg(0),item);}
+                else if(name=="Q_Shutdown"){require(item->kind==mf::Queue,no_interface);item->closed=true;for(const auto p:item->events)release(p);item->events.clear();release(item->state);release(item->callback);item->state=item->callback=0;}
             }else if(name.starts_with("G_")){
                 require(item->kind==mf::Manager,no_interface);
                 if(name=="G_ResetDevice"){

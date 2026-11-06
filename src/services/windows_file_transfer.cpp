@@ -46,7 +46,7 @@ std::optional<std::uint32_t> WindowsServices::start_file_transfer(GuestState& st
     if(flags&~supported)return fail(50);
     if(cancel && memory.load(GuestAddress{cancel},32))return fail(1235);
     if(callback && !handles(GuestAddress{callback}))memory.check(GuestAddress{callback},1,Access::Execute);
-    if(file_transfers_.size()>=128 || files_.size()>4094)return fail(8);
+    if(file_transfers_.size()>=128 || !file_table_has_room(files_.size(),2))return fail(8);
     const auto input_access=0x80000000U|((flags&4U)?0x40000000U:0U);
     const auto input=filesystem_.open_host(source,input_access,3,0,7);if(input.error)return fail(input.error);
     if(input.metadata.attributes&0x10U)return fail(5);

@@ -116,7 +116,7 @@ std::optional<std::uint32_t> WindowsServices::open_usb(GuestState& state,GuestMe
         if(d(4)!=3 || arg(6) || (access&~0x1f01ffU) || (d(2)&~7U) || (d(5)&~0x40000080U))fail(87);
         else if(security.error)fail(security.error);
         else if(!runtime_.network.external_io)fail(50);
-        else if(files_.size()>=1024)fail(4);
+        else if(!file_table_has_room(files_.size()))fail(8);
         else if(const auto target=usb_target(normalized);!target)fail(2);
         // WinUSB 裝置一次只允許一個 handle。
         else if(std::any_of(files_.begin(),files_.end(),[&](const auto& item){return item.second.usb && item.second.usb->target.registry_id==target->registry_id && item.second.usb->target.interfaces==target->interfaces;}))fail(5);

@@ -1,3 +1,5 @@
+#include "parallel_mapping_lock.hpp"
+#include "x64arm/entry_runtime_profile.hpp"
 #include <cstdio>
 #include "x64arm/resource_usage.hpp"
 #include <cstdlib>
@@ -118,6 +120,8 @@ struct D3D11DrawCache {
     std::uint64_t layout{},index{},depth{},blend{},depth_state{},raster{};
     std::uint64_t ticket{}; // 最後一次以參照交給後端的命令序號（同步後端恆為 0）。
 };
+// 固定名稱綁定的節點指標（8 個共用名稱＋6 stage 各 5 個名稱＋繪製狀態 5 個名稱，見 d3d11_setter_front_path.inc）。
+using D3D11FixedBindings=std::array<std::vector<std::uint64_t>*,43>;
 struct Identity {
     std::map<std::pair<std::string,std::uint32_t>,std::pair<std::uint32_t,std::uint64_t>> class_instances;
     std::map<std::string,std::uint32_t> class_types;
@@ -163,6 +167,9 @@ struct Identity {
     GraphicsView graphics_view;
     std::vector<GraphicsElement> layout;
     std::map<std::string,std::vector<std::uint64_t>> bindings;
+    // 前置快路徑的 bindings 節點快取：std::map 節點位址穩定，依名稱存取與快取指向同一向量。只建立在非弱綁定的 D3D11 裝置內容上
+    //（D3D10 sprite 會整份換掉的是弱綁定內容）；bindings 整體被移走時（clear_bindings）要一併清掉。
+    std::unique_ptr<D3D11FixedBindings> fixed_bindings;
     // 多份輪流使用：Metal 命令執行緒可能仍以參照讀取先前繪製的那幾份（見 draw_state）。
     // 輪流使用的繪製狀態快取（實際份數見 d3d11_draw_cache_count，上限 32）。
     std::array<std::unique_ptr<D3D11DrawCache>,32> draw_caches;unsigned draw_slot{};
@@ -194,7 +201,9 @@ struct Identity {
     std::shared_ptr<GraphicsResource> visibility_pool; // 裝置內容：目前的可見度池。
     std::uint32_t visibility_cursor{}; // 裝置內容：池內下一個可用位元組。
     bool visibility_pooled{}; // 查詢：本次 Begin 使用共用池。
-    std::uint32_t query_polls{}; // GetData 以 DONOTFLUSH 連續輪詢的次數；超過門檻仍提交，避免永不完成。
+    std::uint32_t query_polls{}; // GetData 連續輪詢仍未完成的次數；達門檻時的保底提交見 GetData，避免永不完成。
+    std::uint64_t query_end_ticket{}; // 查詢：End 排入命令後的命令序號（0：同步後端，或延遲內容的 End 尚未重播）。
+    std::uint64_t flush_ticket{}; // 立即內容：最後一次非等待提交排入後的命令序號；不大於此值的命令都已被提交涵蓋。
     bool query_active{},query_ready{},fullscreen{};
     std::uint64_t fullscreen_output{};
     std::array<std::int32_t,4> windowed_rect{};
@@ -325,6 +334,9 @@ struct D3D11State {
     std::uint64_t graphics_draws{},graphics_dispatches{},graphics_frames{};
     std::uint64_t linkage_draws{},linkage_cache_hits{},linkage_uploads{},linkage_readback_bytes{};
     std::uint64_t destroyed_objects{},draw_cache_full{},draw_cache_incremental{};
+    // 診斷：狀態設定前置快路徑完成與交回完整路徑的次數（見 d3d11_setter_front_path.inc）。
+    std::uint64_t setter_front_hits{},setter_front_fallbacks{};
+    std::uint64_t draw_front_hits{},draw_front_fallbacks{};
     // 診斷：遊戲內各 D3D11 方法建立後端資源的次數（隨 X64ARM_TRACE_GRAPHICS_STATS 輸出）。
     std::map<std::string,std::uint64_t,std::less<>> resource_creations;
     // 本地協調服務中引用歸零的物件：延到下一次非本地 D3D11 呼叫再銷毀（銷毀會釋放 heap）。
@@ -345,6 +357,10 @@ struct D3D11State {
         }catch(...){}
     }
 };
+namespace {
+#include "d3d11_setter_front_path.inc"
+#include "d3d11_draw_front_path.inc"
+}
 void WindowsServices::discard_d3d_compile(GuestState& state,GuestMemory& memory,std::uint64_t key){
     if(!d3d11_)return;const auto at=d3d11_->compilations.find(key);if(at==d3d11_->compilations.end())return;
     if(at->second.scratch)(void)free_heap(memory,at->second.scratch,state);
@@ -413,6 +429,8 @@ std::string WindowsServices::video_diagnostics() const {
     out<<"video_backend=VideoToolbox hardware_sessions="<<d3d11_->hardware_sessions<<" decoded_frames="<<d3d11_->decoded_frames<<" live_interfaces="<<d3d11_->objects.size()<<" peak_interfaces="<<d3d11_->peak_interfaces<<'\n';
     if(d3d11_->graphics_draws || d3d11_->graphics_dispatches || d3d11_->graphics_frames)out<<"d3d11_backend=Metal draws="<<d3d11_->graphics_draws<<" dispatches="<<d3d11_->graphics_dispatches<<" frames="<<d3d11_->graphics_frames<<'\n';
     if(d3d11_->draw_cache_full || d3d11_->draw_cache_incremental)out<<"d3d11_draw_cache full="<<d3d11_->draw_cache_full<<" incremental="<<d3d11_->draw_cache_incremental<<" destroyed="<<d3d11_->destroyed_objects<<'\n';
+    if(d3d11_->setter_front_hits || d3d11_->setter_front_fallbacks)out<<"d3d11_setter_front hits="<<d3d11_->setter_front_hits<<" fallbacks="<<d3d11_->setter_front_fallbacks<<'\n';
+    if(d3d11_->draw_front_hits || d3d11_->draw_front_fallbacks)out<<"d3d11_draw_front hits="<<d3d11_->draw_front_hits<<" fallbacks="<<d3d11_->draw_front_fallbacks<<'\n';
     if(d3d11_->linkage_draws)out<<"d3d11_linkage draws="<<d3d11_->linkage_draws<<" cache_hits="<<d3d11_->linkage_cache_hits<<" uploads="<<d3d11_->linkage_uploads<<" readback_bytes="<<d3d11_->linkage_readback_bytes<<'\n';
     if(std::getenv("X64ARM_TRACE_GRAPHICS_LIFETIME"))for(const auto& [pointer,entry]:d3d11_->objects){const auto& id=*entry.identity;out<<"d3d11_live pointer="<<pointer<<" root="<<id.root<<" kind="<<static_cast<unsigned>(entry.kind)<<" counter=0x"<<std::hex<<id.counter<<std::dec<<" device="<<id.device<<" texture="<<id.texture<<"\n";}
     if(!d3d11_->last_error.empty())out<<"video_error="<<d3d11_->last_error<<'\n';
@@ -563,14 +581,47 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     return !(device->second.identity->protected_threads && device->second.identity->lock_address);
 }catch(const MemoryFault&){return false;}catch(const HostCallFault&){return false;}
 std::recursive_mutex& WindowsServices::graphics_mutex() noexcept {static std::recursive_mutex value;return value;}
-// 前置快速路徑：完整分派函式內聯了上百個方法與數十個繪製狀態暫存物件，堆疊框架約 336 KB，每次呼叫都要逐頁探測
+// 前置快速路徑：完整分派函式內聯了上百個方法與數十個繪製狀態暫存物件，堆疊框架很大，每次呼叫都要逐頁探測
 // 堆疊與初始化；遊戲內 D3D11 呼叫約八成是 COM AddRef／Release 與 GetDesc（DQ3 每秒十餘萬次），在進入完整函式前
 // 以相同語義完成：AddRef 與非最後一次 Release 只改引用計數；GetDesc 只把建立時保存的描述寫回客體，並遵守
 // 多執行緒保護裝置的鎖（被其他執行緒持有時交回完整路徑等待）。其餘情況（找不到物件、最後一次 Release 需要銷毀、
 // 延後銷毀清單待處理、比對模式）一律交給完整路徑，例外與錯誤回報不變。X64ARM_D3D11_FRONT_PATH=0 關閉。
+// IA／*Set* 狀態設定同樣先走前置路徑（d3d11_setter_front_path.inc）；X64ARM_D3D11_SETTER_FRONT_PATH=0 只關閉這一段。
 std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     static const bool front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_FRONT_PATH");return !value || std::string_view(value)!="0";}();
+    static const bool setter_front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_SETTER_FRONT_PATH");return front_path && (!value || std::string_view(value)!="0");}();
+    static const bool draw_front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_DRAW_FRONT_PATH");return front_path && (!value || std::string_view(value)!="0");}();
     const auto symbol=service.symbol;
+    if(const auto setter=setter_front_path?d3d11_setter_method(symbol):D3D11SetterMethod{};setter.kind!=D3D11Setter::None && d3d11_ && service.family=="internal-d3d11"){
+        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+        auto& bridge=*d3d11_;
+        if(runtime_.network.external_io && (graphics_local() || bridge.deferred_releases.empty())){
+            const WindowsCall arg(state,memory,service);
+            if(d3d11_setter_front_path(bridge,memory,arg,setter,x86_)){++bridge.setter_front_hits;arg.return_to(state,0);return std::nullopt;}
+            ++bridge.setter_front_fallbacks;
+        }
+    }
+    if(const auto method=draw_front_path?d3d11_draw_method(symbol):D3D11DrawMethod::None;method!=D3D11DrawMethod::None && d3d11_ && service.family=="internal-d3d11"){
+        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+        auto& bridge=*d3d11_;
+        if(runtime_.network.external_io && (graphics_local() || bridge.deferred_releases.empty())){
+            const WindowsCall arg(state,memory,service);
+            std::array<std::uint64_t,6> values{};for(unsigned i=0;i<std::min<unsigned>(service.arguments,values.size());++i)values[i]=arg(i);
+            // 繪製不碰客體記憶體，卻可能等命令執行緒：通過資格後放開 worker 持有的映射共用鎖，寫者不必等這段（否則所有 worker 服務都跟著等）。
+            // 返回位址先讀好；x86 由 return_to 處理堆疊參數，維持持鎖。
+            auto* const guard=x86_?nullptr:detail::d3d11_worker_mapping_guard();std::uint64_t return_target=0;
+            const auto release_mapping=[&]{if(guard){return_target=memory.load(GuestAddress{state.reg(Gpr::Rsp)},64);guard->unlock();}};
+            const bool done=!d3d11_front_exception && d3d11_draw_front_path(bridge,values,method,symbol,release_mapping);
+            if(done){
+                ++bridge.draw_front_hits;
+                if(guard && !guard->owns_lock()){state.rip=GuestAddress{return_target};state.reg(Gpr::Rax)=0;state.reg(Gpr::Rsp)+=8;}
+                else arg.return_to(state,0);
+                return std::nullopt;
+            }
+            ++bridge.draw_front_fallbacks;
+            if(guard && !guard->owns_lock())throw detail::D3D11RelockMapping{};
+        }
+    }
     const bool com=symbol=="AddRef" || symbol=="Release";
     const bool desc=!com && (symbol=="BufferGetDesc" || symbol=="Texture1DGetDesc" || symbol=="Texture3DGetDesc" || symbol=="GraphicsGetDesc");
     if(front_path && (com || desc) && d3d11_ &&
@@ -789,6 +840,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
     std::uint64_t result=0;
 #include "d3d11_graphics_void.inc"
     try {
+        if(d3d11_front_exception){const auto error=std::exchange(d3d11_front_exception,nullptr);std::rethrow_exception(error);}
         if(!graphics_local() && !bridge.deferred_releases.empty()){
             auto pending=std::move(bridge.deferred_releases);bridge.deferred_releases.clear();
             for(const auto& [address,internal]:pending)release_object(release_object,address,internal);
@@ -1269,7 +1321,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
       catch(const video::VideoCodecError& error){result=failure;bridge.last_error=error.what();}
       catch(const video::DxvaH264Error& error){result=not_supported;bridge.last_error=error.what();}
       catch(const WindowPresentationFault& error){result=0x887a0001U;bridge.last_error=error.what();record_diagnostic("d3d11_present_fault");set_diagnostic("d3d11_present_fault_last",error.what());if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] %.*s: %s\n",static_cast<int>(symbol.size()),symbol.data(),error.what());}
-      catch(const std::invalid_argument& error){bridge.last_error=error.what();if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] %.*s: %s\n",static_cast<int>(symbol.size()),symbol.data(),error.what());if(void_methods.contains(symbol))throw HostCallFault(bridge.last_error);result=invalid;}
+      catch(const std::invalid_argument& error){bridge.last_error=error.what();if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] %.*s: %s\n",static_cast<int>(symbol.size()),symbol.data(),error.what());if(void_methods.contains(symbol)){
+            // 診斷：X64ARM_TRACE_SHADER_FAILURE_DIR=<目錄> 時把繪製／分派的著色器編譯失敗寫成檔案並略過這次呼叫，一輪收集所有失敗的著色器；正常執行仍視為內部錯誤。
+            static const char* const failure_dir=std::getenv("X64ARM_TRACE_SHADER_FAILURE_DIR");
+            if(!failure_dir || bridge.last_error.find("Metal 著色器編譯失敗")==std::string::npos)throw HostCallFault(bridge.last_error);
+            const auto digest=std::hash<std::string>{}(bridge.last_error);
+            char name[32];std::snprintf(name,sizeof name,"/%016zx.txt",digest);
+            if(auto* out=std::fopen((std::string(failure_dir)+name).c_str(),"wb")){std::fwrite(bridge.last_error.data(),1,bridge.last_error.size(),out);std::fclose(out);}
+        }
+        result=invalid;}
     if(effect_compile){const auto hresult=original_arg(service.symbol.find("FromFile")!=std::string_view::npos?11:13);if(hresult)memory.store(GuestAddress{hresult},32,result);}
     if(symbol.starts_with("D3DX11GetImageInfoFrom") || symbol.starts_with("D3DX11CreateTextureFrom") || symbol.starts_with("D3DX11CreateShaderResourceViewFrom")){
         const bool info=symbol.starts_with("D3DX11GetImageInfo"),file=symbol.find("FromFile")!=std::string_view::npos;

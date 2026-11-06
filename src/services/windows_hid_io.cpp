@@ -23,7 +23,7 @@ std::optional<std::uint32_t> WindowsServices::open_hid(GuestState& state,GuestMe
         if(d(4)!=3 || arg(6) || (access&~0x1f01ffU) || (d(2)&~7U) || (d(5)&~0x40000080U))fail(87);
         else if(security.error)fail(security.error);
         else if(!runtime_.network.external_io)fail(50);
-        else if(files_.size()>=1024)fail(4);
+        else if(!file_table_has_room(files_.size()))fail(8);
         else {
             prepare_input_backend();if(!raw_input_)raw_input_=std::make_shared<RawInputState>();poll_dinput();
             const auto name=folded(path);const auto found=std::find_if(raw_input_->devices.begin(),raw_input_->devices.end(),[&](const auto& item){return item.second.device.attached && folded(item.second.name)==name;});

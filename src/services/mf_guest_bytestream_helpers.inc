@@ -11,6 +11,13 @@ const auto external_stream_metadata=[&](std::uint64_t pointer){
             GuestByteStreamAccess::check(co_await service_callback::call(access.method(3),{pointer,scratch}));
             if((m.load(GuestAddress{scratch},32)&5)!=5)throw Failure{0xc00d36b2U};
             const auto size=co_await access.position(4),base=co_await access.position(6);if(base>size)throw Failure{0xc00d36c4U};
+            std::array<std::uint8_t,8> head{};if(size-base>=8)co_await access.read(base,head);
+            if(mf::mp4_signature(head)){
+                auto movie=std::make_shared<FileSourceState>();movie->base=base;movie->external_stream=pointer;
+                try{movie->movie=co_await mf::read_mp4_movie_async(size-base,[&](std::uint64_t at,std::span<std::uint8_t> bytes){return access.read(base+at,bytes);});}
+                catch(const std::invalid_argument&){throw Failure{0xc00d36c4U};}
+                co_return movie;
+            }
             const auto parsed=co_await parse_pcm_wave_stream_async(size-base,[&](std::uint64_t at,std::span<std::uint8_t> bytes){return access.read(base+at,bytes);});
             if(!parsed)throw Failure{0xc00d36c4U};auto source=std::make_shared<FileSourceState>();source->wave=*parsed;source->base=base;source->external_stream=pointer;co_return source;
         });

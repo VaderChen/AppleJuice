@@ -353,7 +353,7 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
     const auto name=basename(key);const bool bare=key.find('\\')==key.npos;
     // VC 的可再散發 DLL 支援 app-local 部署；以整個客體模組維持 C++ ABI，
     // 不將同一個 DLL 的物件、資料匯出與函式拆給兩個不同 provider。
-    const bool redistributable=name=="msvcp140.dll" || name=="msvcp140_1.dll" || name=="vcruntime140.dll" || name=="vcruntime140_1.dll";
+    const bool redistributable=name=="msvcp140.dll" || name=="msvcp140_1.dll" || name=="msvcp140_2.dll" || name=="vcruntime140.dll" || name=="vcruntime140_1.dll";
     if(bare && redistributable && (!(flags&0xf00) || (flags&0x200))) {
         const auto local=runtime_.application_directory+requested;
         auto source=read_module_file(state,memory,local);
@@ -362,6 +362,10 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
         const bool unavailable=source.error==5 && !source.access_denied;
         if(source.error!=2 && source.error!=3 && !unavailable)throw ModuleError(source.error,"無法讀取 app-local 執行階段："+name);
     }
+    // 遊戲隨附的 XAudio2 可再散布版（常以完整路徑或延遲匯入載入）改由內建實作承接：混音在宿主執行，不占客體 vCPU。
+    // API 與 xaudio2_9.dll 相同。X64ARM_BUILTIN_XAUDIO_REDIST=0 改回載入遊戲自帶的 DLL。
+    static const bool builtin_xaudio_redist=[] {const auto* value=std::getenv("X64ARM_BUILTIN_XAUDIO_REDIST");return !value || std::string_view(value)!="0";}();
+    if(builtin_xaudio_redist && name=="xaudio2_9redist.dll"){const auto base=load_module(memory,u"xaudio2_9.dll",flags,created,{},state);runtime_.modules.emplace(name,base);return base;}
     if((bare || key=="c:\\windows\\system32\\"+name || (angle_module(name) && native_angle_)) && builtin_module(name)) {
         if(runtime_.signature_policy && native_library_module(name))throw ModuleError(577,"原生第三方模組不符合程序簽章政策");
         if(const auto host=windows_api_set_host(name);host!=name){const auto base=load_module(memory,utf8_to_utf16(host),flags,created,{},state);runtime_.modules.emplace(name,base);return base;}

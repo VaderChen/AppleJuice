@@ -1,4 +1,7 @@
 #pragma once
+#include <array>
+#include <initializer_list>
+#include <string>
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_version.hpp"
 #include <algorithm>
@@ -20,15 +23,31 @@ inline Bytes node(std::u16string_view key,bool text,const Bytes& value,std::uint
 }
 inline Bytes string(std::u16string_view key,std::u16string_view value){return node(key,true,utf16_bytes(value),static_cast<std::uint16_t>(value.size()+1));}
 }
+// 引擎內建 VC++ 執行階段對外公開的版本；RT_VERSION 與 Runtimes 登錄機碼共用。
+inline constexpr std::array<std::uint32_t,4> vc_runtime_version{14,44,35211,0};
+// 系統 DLL 回報 Windows 版本；VC 可再散發 DLL 的版本屬於各自的工具組，程式會拿它判斷執行階段是否夠新。
+inline std::array<std::uint32_t,4> builtin_file_version(std::string_view name){
+    std::string lower(name);for(auto& c:lower)if(c>='A' && c<='Z')c=static_cast<char>(c+32);
+    const std::string_view text=lower;
+    const auto has=[&](std::initializer_list<std::string_view> prefixes){for(const auto prefix:prefixes)if(text.starts_with(prefix))return true;return false;};
+    if(has({"msvcp140","vcruntime140","concrt140","vcomp140","vccorlib140","mfc140","mfcm140"}))return vc_runtime_version;
+    if(has({"msvcp120","msvcr120","vcomp120","mfc120"}))return {12,0,40664,0};
+    if(has({"msvcp110","msvcr110","vcomp110","mfc110"}))return {11,0,61135,400};
+    if(has({"msvcp100","msvcr100","vcomp100","mfc100"}))return {10,0,40219,473};
+    if(has({"msvcp90","msvcr90","vcomp90","mfc90"}))return {9,0,30729,9625};
+    if(has({"msvcp80","msvcr80","vcomp80","mfc80"}))return {8,0,50727,6229};
+    return {windows_version_major,windows_version_minor,windows_version_build,windows_version_revision};
+}
 // 載入映像 RT_VERSION 與檔案版本查詢共用同一份 provider metadata。
 inline std::vector<std::uint8_t> builtin_version_info(std::string_view name){
     using namespace builtin_version_detail;
     Bytes fixed(52);put(fixed,0,4,0xfeef04bd);put(fixed,4,4,0x10000);
-    const auto ms=(windows_version_major<<16)|windows_version_minor;
-    const auto ls=(windows_version_build<<16)|windows_version_revision;
+    const auto file_version=builtin_file_version(name);
+    const auto ms=(file_version[0]<<16)|file_version[1];
+    const auto ls=(file_version[2]<<16)|file_version[3];
     put(fixed,8,4,ms);put(fixed,12,4,ls);put(fixed,16,4,ms);put(fixed,20,4,ls);
     put(fixed,24,4,0x3f);put(fixed,32,4,0x40004);put(fixed,36,4,2);
-    const auto version=utf8_to_utf16(std::to_string(windows_version_major)+"."+std::to_string(windows_version_minor)+"."+std::to_string(windows_version_build)+"."+std::to_string(windows_version_revision));
+    const auto version=utf8_to_utf16(std::to_string(file_version[0])+"."+std::to_string(file_version[1])+"."+std::to_string(file_version[2])+"."+std::to_string(file_version[3]));
     const auto filename=utf8_to_utf16(name);
     const auto strings=node(u"StringFileInfo",true,{},0,{node(u"040904B0",true,{},0,{
         string(u"CompanyName",u"MacWin"),string(u"FileDescription",u"MacWin Windows API provider"),

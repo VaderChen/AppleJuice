@@ -12,6 +12,7 @@
 #include "x64arm/interpreter.hpp"
 #include "x64arm/registry_store.hpp"
 #include "processor_registry.hpp"
+#include "vc_runtime_registry.hpp"
 #include "x64arm/network_registry.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "registry_hive.hpp"
@@ -217,6 +218,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     auto transaction=std::make_unique<RegistryTransaction>(registry,registry_file_,&registry_store_cache_,readonly);
     if(transaction->error){zero_failure(transaction->error);arg.return_to(state,transaction->error);return std::nullopt;}
     refresh_processor_registry(registry,memory.processor_count(),guest_processor_information(memory));
+    refresh_vc_runtime_registry(registry);
     initialize_registry_views(registry);
     poll_registry_notifications(false,{},0,&memory);
     std::vector<std::pair<std::u16string,std::uint32_t>> mutations;

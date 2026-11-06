@@ -141,9 +141,9 @@ AppleJuice は開発中です。Windows 全体、すべてのアプリケーシ�
 | 三國志X with パワーアップキット | x86 | 不明 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
+| Clair Obscur: Expedition 33 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | デイヴ・ザ・ダイバー | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="メイン画面まで起動" title="メイン画面まで起動"> |
 | 特警シグナルフォース | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="メイン画面まで起動" title="メイン画面まで起動"> |
-| Clair Obscur: Expedition 33 | x64 | D3D12 (Unreal Engine 5) | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="動作しないが対応中" title="動作しないが対応中"> |
 
 記録は当時のバージョンと設定によるもので、ゲーム全体の流れ、他のバージョン、すべての設定での動作を示すものではありません。
 

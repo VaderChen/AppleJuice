@@ -51,7 +51,7 @@ else if(name=="MFCreateSourceReaderFromMediaSource"){
             try {
                 auto source=object(target->parent,mf::Source);
                 if(!target->file_read_active){require(!source->closed,shutdown);target->file_read_active=true;target->file_read_generation=target->generation;}
-                sample=captured_sample(source,target->read_frames,true);if(source->closed){release(sample);sample=0;throw Failure{shutdown};}
+                sample=source->file_source && source->file_source->movie?movie_sample(source,*target):captured_sample(source,target->read_frames,true);if(source->closed){release(sample);sample=0;throw Failure{shutdown};}
                 if(!sample && source->file_source)flags=2;else require(sample!=0,0xc00d36b2U);
             }catch(const Failure& error){status=error.code;}
             const bool cancelled=!target->request_pending || target->file_read_generation!=target->generation;
@@ -61,7 +61,11 @@ else if(name=="MFCreateSourceReaderFromMediaSource"){
             if(!cancelled && target->kind==mf::Reader){
                 const auto time=sample?*object(sample,mf::Sample)->time:0;
                 callbacks.push_back({foreign_method(target->callback,3),{target->callback,status,0,status?1U:flags,time,sample},false,false,1U<<4});if(sample)callbacks.push_back({resolve("internal-mf","Release").value,{sample}});
-            }else if(!cancelled && !target->closed){if(sample){if(target->pending_token){Value token;token.type=13;token.scalar=target->pending_token;set(*object(sample,mf::Sample),mf::MFSampleExtension_Token,token);}Value value;value.type=13;value.scalar=sample;queue_event(target,301,value);release(sample);}else if(flags&2U){queue_event(target,204);queue_event(object(target->parent,mf::Source),211);}else queue_event(target,1,{},status);}
+            }else if(!cancelled && !target->closed){if(sample){if(target->pending_token){Value token;token.type=13;token.scalar=target->pending_token;set(*object(sample,mf::Sample),mf::MFSampleExtension_Token,token);}Value value;value.type=13;value.scalar=sample;queue_event(target,213,value);release(sample);}
+                else if(flags&2U){
+                    queue_event(target,212);target->flags|=1U;auto source=object(target->parent,mf::Source);
+                    if(!source->file_source || !source->file_source->movie || std::all_of(source->media_streams.begin(),source->media_streams.end(),[&](std::uint64_t p){return object(p,mf::MediaStream)->flags&1U;}))queue_event(source,211);
+                }else queue_event(target,1,{},status);}
             release(target->pending_token);target->pending_token=0;
         }
         if(target->flush_pending){target->flush_pending=false;if(target->callback)callbacks.push_back({foreign_method(target->callback,4),{target->callback,0}});}

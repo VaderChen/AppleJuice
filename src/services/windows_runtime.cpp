@@ -123,7 +123,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"crt", "fopen", 2}, {"crt", "fopen_s", 3}, {"crt", "_wfopen_s", 3}, {"crt", "_commit", 1}, {"crt", "_fsopen", 3}, {"crt", "_wfsopen", 3}, {"crt", "fclose", 1}, {"crt", "fread", 4}, {"crt", "fwrite", 4},
         {"crt","_chsize",2},{"crt","_chsize_s",2,1U<<1},{"crt","_open_osfhandle",2},{"crt","_filelength",1},{"crt","_filelengthi64",1},
         {"crt", "_creat", 2}, {"crt", "_wcreat", 2}, {"crt", "freopen", 3}, {"crt", "_wfreopen", 3}, {"crt", "_dup", 1}, {"crt", "_fdopen", 2}, {"crt", "_wfdopen", 2}, {"crt", "_close", 1}, {"crt", "_read", 3},
-        {"crt", "_open", 3}, {"crt", "_wopen", 3}, {"crt", "_sopen", 4}, {"crt", "_wsopen", 4}, {"crt", "_sopen_s", 5}, {"crt", "_wsopen_s", 5},
+        {"crt", "_open", 3}, {"crt", "_wopen", 3}, {"crt", "_sopen", 4}, {"crt", "_wsopen", 4}, {"crt", "_sopen_s", 5}, {"crt", "_wsopen_s", 5}, {"crt", "_sopen_dispatch", 6}, {"crt", "_wsopen_dispatch", 6}, {"crt", "tmpfile", 0}, {"crt", "tmpfile_s", 1},
         {"crt","_umask",1},{"crt","_umask_s",2},
         {"crt", "_lseek", 3}, {"crt", "_lseeki64", 3,1U<<1}, {"crt", "_tell", 1}, {"crt", "_telli64", 1},
         {"crt", "fgetpos", 2}, {"crt", "fsetpos", 2}, {"crt", "fseek", 3}, {"crt", "_fseeki64", 3,1U<<1}, {"crt", "ftell", 1}, {"crt", "_ftelli64", 1},
@@ -149,6 +149,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"crt","_scwprintf",1},
         {"crt","_vscwprintf",2},
         {"crt","__stdio_common_vswprintf",6,1},{"crt","__stdio_common_vswprintf_s",6,1},
+        {"crt","__stdio_common_vsprintf_p",6,1},{"crt","__stdio_common_vswprintf_p",6,1},{"crt","__stdio_common_vfprintf_p",5,1},{"crt","__stdio_common_vfwprintf_p",5,1},
         {"crt", "signal", 2}, {"crt", "__getmainargs", 5}, {"crt", "__wgetmainargs", 5}, {"crt", "__C_specific_handler", 4},
         {"kernel32.dll", "__C_specific_handler", 4}, {"ntdll.dll", "__C_specific_handler", 4},
         {"crt", "setjmp", 1}, {"crt", "_setjmp", 2}, {"crt", "__intrinsic_setjmp", 1},
@@ -179,6 +180,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
             {directml_export_service_descriptors(), true},
             {directml_object_service_descriptors(), false},
             {msvcp_pmr_service_descriptors(), true},
+            {msvcp_special_math_service_descriptors(), true},
             {webview2_loader_service_descriptors(), true},
             {webview2_object_service_descriptors(), false},
             {d3d12_export_service_descriptors(), true},
@@ -383,7 +385,7 @@ std::vector<std::uint8_t> bytes_of(std::string_view value) {
 }
 bool crt_format_symbol(std::string_view symbol) noexcept {
     if(symbol.starts_with("__conio_common_vc") || symbol.starts_with("_cprintf") || symbol.starts_with("_cwprintf") || symbol.starts_with("_vcprintf") || symbol.starts_with("_vcwprintf"))return true;
-    return symbol=="printf" || symbol=="vprintf" || symbol=="wprintf" || symbol=="vwprintf" || symbol=="fwprintf" || symbol=="vfwprintf" || symbol=="fprintf" || symbol=="vfprintf" || symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf" || symbol=="__stdio_common_vfprintf_s" || symbol=="__stdio_common_vfwprintf_s" || symbol=="snprintf" || symbol=="vsnprintf" || symbol.starts_with("__stdio_common_vs") || symbol=="sprintf" || symbol=="vsprintf" || symbol=="sprintf_s" || symbol=="vsprintf_s" || symbol=="swprintf_s" || symbol=="vswprintf_s" || symbol=="_snprintf" || symbol=="_vsnprintf" || symbol=="_snwprintf" || symbol=="_vsnwprintf" || symbol=="_snprintf_s" || symbol=="_vsnprintf_s" || symbol=="_snwprintf_s" || symbol=="_vsnwprintf_s" || symbol=="_scprintf" || symbol=="_vscprintf" || symbol=="_scwprintf" || symbol=="_vscwprintf";
+    return symbol=="printf" || symbol=="vprintf" || symbol=="wprintf" || symbol=="vwprintf" || symbol=="fwprintf" || symbol=="vfwprintf" || symbol=="fprintf" || symbol=="vfprintf" || symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf" || symbol=="__stdio_common_vfprintf_s" || symbol=="__stdio_common_vfwprintf_s" || symbol=="__stdio_common_vfprintf_p" || symbol=="__stdio_common_vfwprintf_p" || symbol=="snprintf" || symbol=="vsnprintf" || symbol.starts_with("__stdio_common_vs") || symbol=="sprintf" || symbol=="vsprintf" || symbol=="sprintf_s" || symbol=="vsprintf_s" || symbol=="swprintf_s" || symbol=="vswprintf_s" || symbol=="_snprintf" || symbol=="_vsnprintf" || symbol=="_snwprintf" || symbol=="_vsnwprintf" || symbol=="_snprintf_s" || symbol=="_vsnprintf_s" || symbol=="_snwprintf_s" || symbol=="_vsnwprintf_s" || symbol=="_scprintf" || symbol=="_vscprintf" || symbol=="_scwprintf" || symbol=="_vscwprintf";
 }
 struct CrtFormatLayout {
     bool common{},common_stream{},common_buffer{},stream{},standard_output{},counting{};
@@ -398,7 +400,7 @@ CrtFormatLayout parse_crt_format_layout(std::string_view symbol){
     result.explicit_locale=symbol.ends_with("_l");if(result.explicit_locale)symbol.remove_suffix(2);
     result.positional=symbol.ends_with("_p");
     // *_s 串流版本只多格式驗證（無效格式走 invalid parameter），輸出語義與一般串流版本相同。
-    result.common_stream=symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf" || symbol=="__stdio_common_vfprintf_s" || symbol=="__stdio_common_vfwprintf_s";
+    result.common_stream=symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf" || symbol=="__stdio_common_vfprintf_s" || symbol=="__stdio_common_vfwprintf_s" || symbol=="__stdio_common_vfprintf_p" || symbol=="__stdio_common_vfwprintf_p";
     result.common_buffer=result.common && !result.common_stream && !result.console;
     result.standard_output=symbol=="printf" || symbol=="vprintf" || symbol=="wprintf" || symbol=="vwprintf";
     result.stream=result.standard_output || symbol=="fwprintf" || symbol=="vfwprintf" || symbol=="fprintf" || symbol=="vfprintf" || result.common_stream;
@@ -2149,6 +2151,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         if(service.family=="vulkan-1.dll")return &WindowsServices::invoke_vulkan;
         if(service.family=="directml.dll" || service.family=="internal-directml")return &WindowsServices::invoke_directml;
         if(service.family=="msvcp140_1.dll" || service.family=="internal-msvcp140_1")return &WindowsServices::invoke_msvcp_pmr;
+        if(service.family=="msvcp140_2.dll")return &WindowsServices::invoke_msvcp_special_math;
         if(service.family=="webview2loader.dll" || service.family=="internal-webview2")return &WindowsServices::invoke_webview2;
         if(service.family=="d3d12.dll" || service.family=="internal-d3d12")return &WindowsServices::invoke_d3d12;
         if(service.family=="dxcore.dll" || service.family=="internal-dxcore")return &WindowsServices::invoke_dxcore;
@@ -2193,7 +2196,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
             if(detail::service_descriptor_contains<d3d9_service_descriptors>(service,reuse))return &WindowsServices::invoke_d3d9;
         if (service.family == "d3d10.dll" || service.family == "d3d10_1.dll" || service.family == "internal-d3d10" || service.family == "d3dx10_43.dll" || service.family == "d3d11.dll" || service.family == "dxgi.dll" || service.family == "internal-d3d11" || service.family == "d3dcompiler_47.dll" || service.family == "d3dcompiler_43.dll" || service.family == "d3dx11_42.dll" || service.family == "d3dx11_43.dll")
             return &WindowsServices::invoke_d3d11;
-        constexpr std::array io_names{"_umask","_umask_s","_creat", "_wcreat", "freopen", "_wfreopen", "_chsize", "_chsize_s", "_open_osfhandle", "_get_osfhandle", "_filelength", "_filelengthi64", "fgetpos", "fsetpos", "fopen_s", "_wfopen_s", "fopen", "_wfopen", "_fsopen", "_wfsopen", "_commit", "fclose", "fread", "fwrite", "fseek", "_fseeki64", "ftell", "_ftelli64", "feof", "ferror", "clearerr", "rewind", "fgetwc", "fgetws", "fputwc", "ungetc", "ungetwc", "getchar", "fgetc", "getc", "fgets", "fputs", "fputc", "putc", "fflush", "_flushall", "_fcloseall", "setvbuf", "setbuf", "_getmaxstdio", "_setmaxstdio", "_dup2", "_locking", "_dup", "_fdopen", "_wfdopen", "_close", "_read", "_write", "_open", "_wopen", "_sopen", "_wsopen", "_sopen_s", "_wsopen_s", "_lseek", "_lseeki64", "_tell", "_telli64", "_isatty", "_setmode"};
+        constexpr std::array io_names{"_sopen_dispatch","_wsopen_dispatch","tmpfile","tmpfile_s","_umask","_umask_s","_creat", "_wcreat", "freopen", "_wfreopen", "_chsize", "_chsize_s", "_open_osfhandle", "_get_osfhandle", "_filelength", "_filelengthi64", "fgetpos", "fsetpos", "fopen_s", "_wfopen_s", "fopen", "_wfopen", "_fsopen", "_wfsopen", "_commit", "fclose", "fread", "fwrite", "fseek", "_fseeki64", "ftell", "_ftelli64", "feof", "ferror", "clearerr", "rewind", "fgetwc", "fgetws", "fputwc", "ungetc", "ungetwc", "getchar", "fgetc", "getc", "fgets", "fputs", "fputc", "putc", "fflush", "_flushall", "_fcloseall", "setvbuf", "setbuf", "_getmaxstdio", "_setmaxstdio", "_dup2", "_locking", "_dup", "_fdopen", "_wfdopen", "_close", "_read", "_write", "_open", "_wopen", "_sopen", "_wsopen", "_sopen_s", "_wsopen_s", "_lseek", "_lseeki64", "_tell", "_telli64", "_isatty", "_setmode"};
         if (service.family == "crt" && std::find(io_names.begin(), io_names.end(), service.symbol) != io_names.end()) return &WindowsServices::invoke_crt_io;
         if(detail::service_descriptor_contains<tls_service_descriptors>(service,reuse))return &WindowsServices::invoke_tls;
         if(service.family=="internal-msxml")return &WindowsServices::invoke_msxml;
@@ -2251,6 +2254,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         if(detail::service_descriptor_contains<reparse_service_descriptors>(service,reuse))return &WindowsServices::invoke_reparse;
         if(detail::service_descriptor_contains<environment_service_descriptors>(service,reuse))return &WindowsServices::invoke_environment;
         if(detail::service_descriptor_contains<memory_service_descriptors>(service,reuse))return &WindowsServices::invoke_memory;
+        if (service.family == "iphlpapi.dll" && (service.symbol.starts_with("Icmp") || service.symbol.ends_with("ThreadCompartmentId"))) return &WindowsServices::invoke_network;
         if (service.family == "iphlpapi.dll" || service.family=="winhttp.dll" || service.family=="dhcpcsvc.dll") return &WindowsServices::invoke_network_config;
         if (service.family == "ws2_32.dll" || service.family=="mswsock.dll" || service.family=="dnsapi.dll") return &WindowsServices::invoke_network;
         if (service.family == "mpr.dll") return &WindowsServices::invoke_mpr;

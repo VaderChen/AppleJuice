@@ -138,6 +138,17 @@ std::uint64_t frames_at(std::uint64_t periods,unsigned rate){
     return periods/engine_periods_per_second*rate+
         (periods%engine_periods_per_second*rate+engine_periods_per_second-1)/engine_periods_per_second;
 }
+// 裝置管線：真實音訊引擎會先把資料從端點緩衝取進自己的混音與硬體 FIFO，GetCurrentPadding 不含這一段。
+// 宿主上客體音訊執行緒補資料可能晚 20～40 ms（單核時要與主執行緒共用 vCPU），只填到要求延遲的遊戲佇列太淺，
+// 一次排程延遲就欠載。串流跑過之後，回報量扣掉 3 個引擎週期（30 ms）的管線，遊戲會多寫這段，實際佇列因此多出同樣的餘裕。
+// 開始前的預填照實回報；IAudioClock 位置仍是實際播放量。X64ARM_AUDIO_WASAPI_FIFO=0 關閉。
+std::uint64_t wasapi_padding(const Stream& s){
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_AUDIO_WASAPI_FIFO");return !value || std::string_view(value)!="0";}();
+    const auto queued=s.pcm->pcm.size()/s.pcm->frame_bytes();
+    if(!enabled || (!s.started && !s.clock_frames))return queued;
+    const auto pipeline=frames_at(3,s.format.rate);
+    return queued>pipeline?queued-pipeline:0;
+}
 // 自動重設事件會合併多個到期週期；客體逐包填入時，尚有完整週期空間就保留一次追補通知。
 // 只在協調者更新 Windows 物件；音訊 callback 不碰客體記憶體、handle 或排程狀態。
 void signal_stream(Stream& s,RuntimeState& runtime,bool catchup=false){
@@ -495,7 +506,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                     }
                 }else if(!s.initialized)result=not_initialized;
                 else if(name=="A_GetBufferSize")put(arg(1),s.capacity);
-                else if(name=="A_GetCurrentPadding")put(arg(1),pcm.pcm.size()/pcm.frame_bytes());
+                else if(name=="A_GetCurrentPadding")put(arg(1),wasapi_padding(s));
                 else if(name=="A_GetStreamLatency")put(arg(1),(static_cast<std::uint64_t>(s.capacity)*10000000+s.format.rate-1)/s.format.rate,64);
                 else if(name=="A_SetEventHandle"){
                     if(!(s.flags&0x40000U))result=0x88890011U;else if(s.started)result=not_stopped;else {const auto event=runtime_.wait_objects.find(arg(1));if(event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event || !(event->second.access&2U))result=invalid;else s.event=arg(1);}
@@ -518,7 +529,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                         const auto p=create(control,SessionControl);++s.session->controls;put(arg(2),p,bits);
                     }else put(arg(2),make(service_kind,object->stream),bits);
                 }else if(name=="R_GetBuffer"){
-                    out(2);if(s.locked)result=out_of_order;else if(d(1)>s.capacity-pcm.pcm.size()/pcm.frame_bytes())result=too_large;
+                    out(2);if(s.locked)result=out_of_order;else if(d(1)>s.capacity-wasapi_padding(s))result=too_large;
                     else if(d(1)){s.locked=true;s.requested=d(1);put(arg(2),s.data,bits);}
                 }else if(name=="R_ReleaseBuffer"){
                     if(d(2)&~2U)result=invalid;else if(!s.locked){if(d(1))result=out_of_order;}else if(d(1)>s.requested)result=invalid_size;
@@ -544,7 +555,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                         }
                         pcm.pcm.insert(pcm.pcm.end(),bytes.begin(),bytes.end());s.locked=false;s.requested=0;
                         if(frames && s.started && s.event &&
-                           s.capacity-pcm.pcm.size()/pcm.frame_bytes()>=frames_at(1,s.format.rate))
+                           s.capacity-wasapi_padding(s)>=frames_at(1,s.format.rate))
                             signal_stream(s,runtime_,true);
                         if(audio_stats_enabled() && frames){const auto now=std::chrono::steady_clock::now();if(s.started)s.stats.max_release_gap=std::max(s.stats.max_release_gap,elapsed_ms(s.stats.last_release,now));s.stats.last_release=now;++s.stats.releases;s.stats.frames+=frames;
                             const auto& thread=threads_.items.at(threads_.current);s.stats.thread=threads_.current;

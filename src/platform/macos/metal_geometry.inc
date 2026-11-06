@@ -195,7 +195,12 @@ MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDesc
     }
     std::uint64_t vertices=std::uint64_t{d.start}+d.count;
     id<MTLBuffer> indices=nil;
-    if(d.indexed){flush(true);auto& resource=metal_resource(d.indices);indices=resource.buffer;const auto bytes=d.index_format==57?2U:4U;
+    if(d.indexed){auto& resource=metal_resource(d.indices);
+        // 要在 CPU 掃索引範圍：只有索引緩衝可能有未完成的 GPU 寫入時才等全部 GPU 工作，否則每個幾何繪製都會把 GPU 排空。
+        // CPU 寫入已在呼叫端完成；待完成的上傳與複製由 gpu_written 記錄，UAV／串流輸出目標一律等待。X64ARM_METAL_GS_INDEX_NOWAIT=0 恢復每次等待。
+        static const bool index_nowait=[] {const auto* value=std::getenv("X64ARM_METAL_GS_INDEX_NOWAIT");return !value || std::string_view(value)!="0";}();
+        if(!index_nowait || resource.gpu_written || (resource.desc.bind&0x90) || !resource.buffer.contents){flush(true);resource.gpu_written=false;}
+        indices=resource.buffer;const auto bytes=d.index_format==57?2U:4U;
         if(std::uint64_t{d.index_offset}+(std::uint64_t{d.start}+d.count)*bytes>resource.desc.width)throw std::invalid_argument("幾何索引範圍越界");vertices=0;
         auto data=static_cast<const std::uint8_t*>(indices.contents)+d.index_offset+std::uint64_t{d.start}*bytes;
         if(d.count){const auto range=graphics_index_range(std::span<const std::uint8_t>(data,std::size_t(d.count)*bytes),bytes);if(std::int64_t{range.minimum}+d.base_vertex<0)throw std::invalid_argument("幾何索引 base vertex 越界");vertices=static_cast<std::uint64_t>(std::int64_t{range.maximum}+d.base_vertex)+1;}

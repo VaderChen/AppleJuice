@@ -59,12 +59,13 @@ bool MetalGl::graphics_clear_unordered(const GraphicsView& view,std::array<std::
     std::array<std::uint8_t,16> pattern{};unsigned size=0;
     if(!metal_unordered_clear_pattern(view,values,floating,pattern,size))return false;
     const auto& desc=view.resource->desc;
+    graphics_trace_clear(view,values,floating);
     if(metal_gpu_unordered_clear()){
         auto& r=metal_resource(view.resource);
         const bool uniform=std::all_of(pattern.begin(),pattern.begin()+size,[&](std::uint8_t b){return b==pattern[0];});
         if(r.buffer && view.first%4==0 && view.count%4==0 && std::uint64_t{view.first}+view.count<=r.buffer.length){
             // 緩衝：依命令順序以 blit 填值（單一位元組樣式）或從清除來源分段複製。
-            begin_commands(true,"clear_unordered_buffer");auto e=[commands_ blitCommandEncoder];MetalEncoderScope scope{e};
+            begin_commands(true,"clear_unordered_buffer");auto e=[commands_ blitCommandEncoder];MetalEncoderScope scope{e};if(metal_labels()){e.label=@"clear-uav-buffer";hang_note("clear-uav-buffer");}
             if(uniform)[e fillBuffer:r.buffer range:NSMakeRange(view.first,view.count) value:pattern[0]];
             else{
                 auto source=metal_clear_source(pattern,size,view.count);const auto chunk=source.length/size*size;
@@ -78,7 +79,7 @@ bool MetalGl::graphics_clear_unordered(const GraphicsView& view,std::array<std::
             const std::size_t row=std::size_t{w}*size;
             if(row<=metal_clear_source_limit){
                 auto source=metal_clear_source(pattern,size,row*h);const auto rows=std::max<std::size_t>(1,std::min<std::size_t>(h,source.length/row));
-                begin_commands(true,"clear_unordered_texture");auto e=[commands_ blitCommandEncoder];MetalEncoderScope scope{e};
+                begin_commands(true,"clear_unordered_texture");auto e=[commands_ blitCommandEncoder];MetalEncoderScope scope{e};if(metal_labels()){e.label=@"clear-uav-texture";hang_note("clear-uav-texture");}
                 const auto fill=[&](unsigned slice,unsigned depth){
                     for(unsigned y=0;y<h;y+=static_cast<unsigned>(rows)){
                         const auto band=static_cast<unsigned>(std::min<std::size_t>(rows,h-y));

@@ -28,7 +28,8 @@ struct GraphicsStreamStatistics {std::uint64_t written{},needed{};};
 // 6～9 為 D3D12 描述元表（bindless 大陣列）：6 SRV 貼圖、7 UAV 貼圖、8 SRV 緩衝、9 UAV 緩衝，以 (space, slot) 對應根簽章範圍。
 // count：描述元表宣告的描述元數（~0U 為無界；0 表示非描述元表）。
 // source：D3D12 離散 UAV 緩衝暫存器超出 u7 時改用未占用的 slot，這裡保存原始暫存器（UINT32_MAX 表示未重新對應）。
-struct GraphicsBinding {std::uint32_t type{},slot{},native_slot{},counter_slot{UINT32_MAX},space{},count{},source{UINT32_MAX};};
+// dimension：著色器宣告的貼圖維度（數值同 D3D_SRV_DIMENSION，0 表示未知）。
+struct GraphicsBinding {std::uint32_t type{},slot{},native_slot{},counter_slot{UINT32_MAX},space{},count{},source{UINT32_MAX},dimension{};};
 struct GraphicsInput {std::string semantic;std::uint32_t index{},attribute{};};
 struct GraphicsLegacyShader {std::string source,entry;std::vector<GraphicsBinding> bindings;std::vector<GraphicsInput> inputs;};
 GraphicsLegacyShader graphics_legacy_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes);

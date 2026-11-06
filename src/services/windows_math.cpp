@@ -6,6 +6,8 @@
 #include "x64arm/x87_fp.hpp"
 #include "x64arm/unicode.hpp"
 #include "d3dx_sh.hpp"
+#include "windows_locale_data.hpp"
+#include <limits>
 extern "C" {
 #include "softfloat.h"
 }
@@ -188,13 +190,14 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"crt", "expf", 1}, {"crt", "exp2f", 1}, {"crt", "expm1f", 1}, {"crt", "logf", 1}, {"crt", "log2f", 1}, {"crt", "log10f", 1}, {"crt", "log1pf", 1},
         {"crt", "floorf", 1}, {"crt", "ceilf", 1}, {"crt", "roundf", 1}, {"crt", "truncf", 1}, {"crt", "fabsf", 1}, {"crt", "nearbyintf", 1}, {"crt", "rintf", 1},
         {"crt", "atan2f", 2}, {"crt", "powf", 2}, {"crt", "fmodf", 2}, {"crt", "remainderf", 2}, {"crt", "hypotf", 2}, {"crt", "_hypotf", 2},
-        {"crt", "copysignf", 2}, {"crt", "fminf", 2}, {"crt", "fmaxf", 2}, {"crt", "nextafterf", 2}, {"crt", "fdimf", 2},
+        {"crt", "copysignf", 2}, {"crt", "fminf", 2}, {"crt", "fmaxf", 2}, {"crt", "nextafterf", 2}, {"crt", "nexttowardf", 2, 2}, {"crt", "logbf", 1}, {"crt", "fdimf", 2},
         {"crt", "fmaf", 3}, {"crt", "frexpf", 2}, {"crt", "modff", 2}, {"crt", "ldexpf", 2}, {"crt", "scalbnf", 2},
         {"crt", "_j0", 1,1}, {"crt", "_j1", 1,1}, {"crt", "_jn", 2,2}, {"crt", "_y0", 1,1}, {"crt", "_y1", 1,1}, {"crt", "_yn", 2,2},
         {"crt", "_finite", 1,1}, {"crt", "_isnan", 1,1},
         {"crt", "lrint", 1,1}, {"crt", "lrintf", 1}, {"crt", "lrintl", 1,1}, {"crt", "llrint", 1,1}, {"crt", "llrintf", 1}, {"crt", "llrintl", 1,1}, {"crt", "lround", 1,1}, {"crt", "lroundf", 1}, {"crt", "lroundl", 1,1}, {"crt", "llround", 1,1}, {"crt", "llroundf", 1}, {"crt", "llroundl", 1,1},
         {"crt", "atof", 1}, {"crt", "atoi", 1}, {"crt", "atol", 1}, {"crt", "_atoi64", 1},
-        {"crt", "_strtoi64", 3}, {"crt", "_strtoui64", 3}, {"crt", "strtol", 3}, {"crt", "strtoul", 3}, {"crt", "strtoll", 3}, {"crt", "strtoull", 3}, {"crt", "strtod", 2}, {"crt", "strtof", 2}
+        {"crt", "_strtoi64", 3}, {"crt", "_strtoui64", 3}, {"crt", "strtol", 3}, {"crt", "strtoul", 3}, {"crt", "strtoll", 3}, {"crt", "strtoull", 3}, {"crt", "strtod", 2}, {"crt", "strtof", 2},
+        {"crt", "_strtod_l", 3}, {"crt", "_strtold_l", 3}, {"crt", "_strtof_l", 3}, {"crt", "_atof_l", 2}, {"crt", "_wcstod_l", 3}, {"crt", "_wcstold_l", 3}, {"crt", "_wcstof_l", 3}, {"crt", "_wtof_l", 2}
     };
     static const auto complete=[]{
         std::vector<WindowsServiceDescriptor> result(std::begin(table),std::end(table));
@@ -260,7 +263,7 @@ static const std::pair<std::string_view,FloatUnary> math_float_unary[]{
     {"sinf",std::sin},{"cosf",std::cos},{"tanf",std::tan},{"asinf",std::asin},{"acosf",std::acos},{"atanf",std::atan},
     {"sinhf",std::sinh},{"coshf",std::cosh},{"tanhf",std::tanh},{"sqrtf",std::sqrt},{"cbrtf",std::cbrt},
     {"asinhf",std::asinh},{"acoshf",std::acosh},{"atanhf",std::atanh},{"erff",std::erf},{"erfcf",std::erfc},
-    {"expf",std::exp},{"exp2f",std::exp2},{"expm1f",std::expm1},{"logf",std::log},{"log2f",std::log2},{"log10f",std::log10},{"log1pf",std::log1p},
+    {"expf",std::exp},{"exp2f",std::exp2},{"expm1f",std::expm1},{"logf",std::log},{"logbf",std::logb},{"log2f",std::log2},{"log10f",std::log10},{"log1pf",std::log1p},
     {"floorf",std::floor},{"ceilf",std::ceil},{"roundf",std::round},{"truncf",std::trunc},{"fabsf",std::fabs},{"nearbyintf",std::nearbyint},{"rintf",std::rint}};
 using FloatBinary=float(*)(float,float);
 static const std::pair<std::string_view,FloatBinary> math_float_binary[]{
@@ -610,6 +613,7 @@ void invoke_scalar_math(GuestState& state,GuestMemory& memory,const WindowsServi
     (void)raised;
 #endif
 }
+void windows_floating_return(GuestState& state,bool x86,double value,bool single){conversion_result(state,x86,value,single);}
 std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
 #if defined(__clang__)
 #pragma STDC FENV_ACCESS ON
@@ -617,7 +621,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
     if(const auto* operation=scalar_math_operation(service);operation && (scalar_math_requested() || operation->xmm_abi)){
         invoke_scalar_math(state,memory,service,*operation,runtime_.errno_cell,x86_);return std::nullopt;
     }
-    const WindowsCall arg(state, memory, service); const auto symbol = service.symbol;
+    const WindowsCall arg(state, memory, service); auto symbol = service.symbol;
+    // 浮點轉換的 _l 版本共用同一套解析，只把小數點換成指定 locale 的符號。
+    char16_t conversion_decimal=u'.';
+    if(symbol.ends_with("_l")){
+        static constexpr std::pair<std::string_view,std::string_view> localized[]{{"_strtod_l","strtod"},{"_strtold_l","strtod"},{"_strtof_l","strtof"},{"_atof_l","atof"},{"_wcstod_l","wcstod"},{"_wcstold_l","wcstod"},{"_wcstof_l","wcstof"},{"_wtof_l","_wtof"}};
+        for(const auto& [name,base]:localized)if(symbol==name){
+            const auto handle=arg(service.arguments-1);
+            if(handle)if(const auto found=runtime_.crt_locales.find(handle);found!=runtime_.crt_locales.end()){const auto decimal=windows_crt_numeric(found->second.categories[4]).decimal;if(decimal.size()==1)conversion_decimal=decimal[0];}
+            symbol=base;break;
+        }
+    }
     if(const auto* operation=complex_operation(symbol)){
         const auto execute=[&]<class T>(){
             constexpr bool single=sizeof(T)==4;
@@ -662,6 +676,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
             state.x87_instruction_pointer=state.x87_data_pointer=0;
             state.x87_opcode=state.x87_code_selector=state.x87_data_selector=0;}
         arg.return_to(state,0);return std::nullopt;
+    }
+    if(symbol=="nexttowardf"){
+        // Windows 的 long double 與 double 同為 binary64。
+        const float from=x86_?std::bit_cast<float>(static_cast<std::uint32_t>(arg(0))):scalar_float(state,0);
+        const double to=x86_?std::bit_cast<double>(arg(1)):scalar(state,1);
+        float value=from;
+        if(std::isnan(from) || std::isnan(to))value=std::numeric_limits<float>::quiet_NaN();
+        else if(static_cast<double>(from)==to)value=static_cast<float>(to);
+        else value=std::nextafter(from,to>static_cast<double>(from)?std::numeric_limits<float>::infinity():-std::numeric_limits<float>::infinity());
+        conversion_result(state,x86_,value,true);arg.return_to(state,0);return std::nullopt;
     }
     if(symbol=="_dpcomp" || symbol=="_fdpcomp" || symbol=="ilogb" || symbol=="ilogbf"){
         const unsigned width=(symbol=="_fdpcomp" || symbol=="ilogbf")?32U:64U;
@@ -945,6 +969,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
             std::string text;
             if(wide){for(const auto c:read_utf16(memory,GuestAddress{arg(0)}))text.push_back(c<128?static_cast<char>(c):'\x7f');}
             else text=read_ansi(memory,arg(0));
+            if(conversion_decimal!=u'.' && conversion_decimal<128)for(auto& c:text){if(c=='.')c='\x7f';else if(c==static_cast<char>(conversion_decimal))c='.';}
             char* end = nullptr;
             const bool plain = symbol == "atof" || symbol=="_wtof" || symbol == "atoi" || symbol == "atol" || symbol == "_atoi64";
             if (!plain && arg(1)) memory.check(GuestAddress{arg(1)},x86_?4:8,Access::Write);

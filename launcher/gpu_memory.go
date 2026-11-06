@@ -8,7 +8,12 @@ import (
 
 const (
 	gpuMemoryStepMiB    uint64 = 512
-	gpuMemoryDefaultMiB uint64 = 4096
+	// 額度只是上限，不會預先占用。UE5 大型遊戲（33 號遠征隊）開場就用到 6～8 GiB，
+	// 舊預設 4096 會讓遊戲以「顯示記憶體不足」結束；上限仍不超過系統記憶體的一半。
+	gpuMemoryDefaultMiB uint64 = 16384
+	// 舊版把預設值 4096 存進個別程式設定，分不出是否使用者自選；版本低於此值的 4096 視為舊預設。
+	gpuMemoryDefaultsVersion uint32 = 1
+	gpuMemoryLegacyDefaultMiB uint64 = 4096
 )
 
 type GPUMemoryLimits struct {
@@ -58,6 +63,13 @@ func validateGPUMemory(value uint64) (uint64, error) {
 }
 
 // 缺少或低於新刻度的舊容量採用預設；其餘向下對齊上限，保留有效自訂容量。
+func migratedGPUMemory(value uint64, version uint32, limits GPUMemoryLimits) uint64 {
+	if version < gpuMemoryDefaultsVersion && value == gpuMemoryLegacyDefaultMiB {
+		return limits.DefaultMiB
+	}
+	return normalizeGPUMemory(value, limits)
+}
+
 func normalizeGPUMemory(value uint64, limits GPUMemoryLimits) uint64 {
 	if value < limits.MinMiB {
 		return limits.DefaultMiB

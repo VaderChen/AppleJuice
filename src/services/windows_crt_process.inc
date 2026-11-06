@@ -70,6 +70,67 @@ if(symbol=="_cwait"){
 #else
 if(symbol=="_cwait"){error(10,6);crt_call.return_to(state,invalid);return std::nullopt;}
 #endif
+#if !defined(_WIN32)
+if(symbol=="_pclose"){
+    // 關閉管線端後等待子程序，回傳值與 _cwait 相同是子程序的結束狀態。
+    if(!processes_ || !processes_->crt_pipes.contains(crt_call(0))){error(22);crt_call.return_to(state,invalid);return std::nullopt;}
+    const auto child=processes_->crt_pipes.at(crt_call(0));processes_->crt_pipes.erase(crt_call(0));
+    (void)nested_service(state,memory,"crt","fclose",{crt_call(0)});
+    auto& pending=processes_->crt_waits[threads_.current];pending={child,0,false};return finish_wait(pending);
+}
+if(symbol=="_popen" || symbol=="_wpopen"){
+    const bool wide_text=symbol=="_wpopen";
+    if(!crt_call(0) || !crt_call(1)){error(22);crt_call.return_to(state,0);return std::nullopt;}
+    const auto command=wide_text?read_utf16(memory,GuestAddress{crt_call(0)}):utf8_to_utf16(read_ansi(memory,crt_call(0)));
+    const auto mode=wide_text?read_utf16(memory,GuestAddress{crt_call(1)},16):utf8_to_utf16(read_ansi(memory,crt_call(1),16));
+    // 模式必須以 r 或 w 開頭，可再帶 t／b。
+    bool valid_mode=!mode.empty() && (mode[0]==u'r' || mode[0]==u'w');
+    for(std::size_t i=1;i<mode.size();++i)if(mode[i]!=u't' && mode[i]!=u'b')valid_mode=false;
+    if(!valid_mode){error(22);crt_call.return_to(state,0);return std::nullopt;}
+    const bool reading=mode[0]==u'r';
+    const auto comspec_entry=runtime_.environment.find(u"COMSPEC");
+    const auto processor=comspec_entry!=runtime_.environment.end()?normalized_windows_path(comspec_entry->second.second,runtime_.current_directory):std::u16string{};
+    if(processor.empty() || filesystem_.information(utf16_to_utf8(processor)).error){error(2);crt_call.return_to(state,0);return std::nullopt;}
+    const auto image_bytes=utf16_bytes(processor),line_bytes=utf16_bytes(quote_windows_argument(processor)+u" /c "+command);
+    const unsigned pointer=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(pointer*8);
+    const auto scratch=allocate_heap(memory,512+image_bytes.size()+line_bytes.size());
+    if(!scratch){error(12);crt_call.return_to(state,0);return std::nullopt;}
+    std::uint64_t stream=0;
+    try{
+        for(unsigned i=0;i<512;++i)memory.store(GuestAddress{scratch+i},8,0);
+        const auto startup=scratch,process=scratch+128,attributes=scratch+192,read_end=scratch+240,write_end=scratch+248,text=scratch+256;
+        const auto application=scratch+512,line=application+image_bytes.size();
+        memory.write(GuestAddress{application},image_bytes);memory.write(GuestAddress{line},line_bytes);
+        memory.store(GuestAddress{attributes},32,x86_?12U:24U);memory.store(GuestAddress{attributes+(x86_?8U:16U)},32,1);
+        if(!nested_service(state,memory,"kernel32.dll","CreatePipe",{read_end,write_end,attributes,0}))os_error(last_error_);
+        else{
+            const auto reader=memory.load(GuestAddress{read_end},bits),writer=memory.load(GuestAddress{write_end},bits);
+            const auto ours=reading?reader:writer,theirs=reading?writer:reader;
+            (void)nested_service(state,memory,"kernel32.dll","SetHandleInformation",{ours,1,0});
+            memory.store(GuestAddress{startup},32,x86_?68U:104U);memory.store(GuestAddress{startup+(x86_?44U:60U)},32,0x100U); // STARTF_USESTDHANDLES
+            const auto standard=[&](std::uint32_t which){return nested_service(state,memory,"kernel32.dll","GetStdHandle",{which});};
+            const auto input=reading?standard(0xfffffff6U):theirs,output=reading?theirs:standard(0xfffffff5U),failure=standard(0xfffffff4U);
+            memory.store(GuestAddress{startup+(x86_?56U:80U)},bits,input);memory.store(GuestAddress{startup+(x86_?60U:88U)},bits,output);memory.store(GuestAddress{startup+(x86_?64U:96U)},bits,failure);
+            const bool created=create_guest_process(memory,{application,line,0,0,1,0x400U,0,0,startup,process},true);
+            (void)nested_service(state,memory,"kernel32.dll","CloseHandle",{theirs});
+            if(!created){os_error(last_error_);(void)nested_service(state,memory,"kernel32.dll","CloseHandle",{ours});}
+            else{
+                const auto child=memory.load(GuestAddress{process},bits);close(memory.load(GuestAddress{process+pointer},bits));
+                const bool binary=mode.find(u'b')!=mode.npos;
+                const auto descriptor=nested_service(state,memory,"crt","_open_osfhandle",{ours,(reading?0U:1U)|(binary?0x8000U:0x4000U)});
+                std::vector<std::uint8_t> text_mode{static_cast<std::uint8_t>(reading?'r':'w'),static_cast<std::uint8_t>(binary?'b':'t'),0};
+                memory.write(GuestAddress{text},text_mode);
+                if(static_cast<std::uint32_t>(descriptor)!=UINT32_MAX)stream=nested_service(state,memory,"crt","_fdopen",{descriptor,text});
+                if(stream)processes_->crt_pipes[stream]=child;else close(child);
+            }
+        }
+    }catch(...){(void)free_heap(memory,scratch,state);throw;}
+    (void)free_heap(memory,scratch,state);
+    crt_call.return_to(state,stream);return std::nullopt;
+}
+#else
+if(symbol=="_pclose" || symbol=="_popen" || symbol=="_wpopen"){error(2);crt_call.return_to(state,symbol=="_pclose"?invalid:0);return std::nullopt;}
+#endif
 const bool wide=symbol.starts_with("_w");
 const bool system=symbol=="system" || symbol=="_wsystem";
 const bool exec=symbol.starts_with("_exec") || symbol.starts_with("_wexec");

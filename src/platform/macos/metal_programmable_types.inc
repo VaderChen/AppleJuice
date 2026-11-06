@@ -203,6 +203,9 @@ struct MetalResource final:GraphicsResource {
     id<MTLBuffer> buffer;id<MTLTexture> texture;
     std::shared_ptr<GpuMemoryReservation> lease;
     std::shared_ptr<MetalBufferBacking> backing;
+    // 自上次全部等待以來，這個緩衝是否可能有 GPU 複製寫入尚未完成（CPU 直接寫入不算）。
+    // CPU 需要讀取內容的路徑（幾何著色器的索引範圍）只在此時才等 GPU；UAV／串流輸出目標另依 bind 判斷。
+    bool gpu_written{};
     // 被 DISCARD 更換下來的舊 backing：最後一個持有者（flight 或更換點）釋放時交回池。
     std::shared_ptr<MetalBufferPool> recycle;
     // 被 D3D12 描述元表引用時加入的 residency set；資源釋放時一併移除。
@@ -269,6 +272,26 @@ struct MetalPendingLibrary {
 };
 // 診斷：X64ARM_METAL_LABELS=1 時以著色器內容雜湊標記 encoder（Metal System Trace 可依標籤彙總 GPU 時間）。
 inline bool metal_labels() noexcept {static const bool enabled=std::getenv("X64ARM_METAL_LABELS")!=nullptr;return enabled;}
+// 診斷 X64ARM_METAL_GPU_PROFILE=<檔案>（須同時設 X64ARM_METAL_LABELS=1）：每個 encoder 一個命令緩衝，依標籤累計 GPU 時間，每 5 秒附加一份累計表到檔案。
+// 診斷 X64ARM_METAL_PASS_TRACE=<檔案>：依序記錄 encoder（X 換 pass 細項、R 繪製、C 運算、E 結束原因、P 呈現），用來分析哪些 pass 能合併。
+// X64ARM_METAL_PASS_TRACE_FROM=<第幾次呈現> 之後才記錄，上限約 40 萬行。
+inline unsigned& metal_pass_trace_frames() noexcept {static unsigned value=0;return value;}
+inline std::FILE* metal_pass_trace() noexcept {
+    static std::FILE* const file=[]()->std::FILE* {const auto* path=std::getenv("X64ARM_METAL_PASS_TRACE");return path?std::fopen(path,"w"):nullptr;}();
+    if(!file)return nullptr;
+    static const unsigned from=[] {const auto* text=std::getenv("X64ARM_METAL_PASS_TRACE_FROM");return text?static_cast<unsigned>(std::strtoul(text,nullptr,10)):0U;}();
+    static unsigned lines=0;
+    return metal_pass_trace_frames()>=from && ++lines<400000?file:nullptr;
+}
+inline const char* metal_gpu_profile_path() noexcept {static const char* path=std::getenv("X64ARM_METAL_GPU_PROFILE");return path;}
+inline bool metal_gpu_profile() noexcept {return metal_gpu_profile_path()!=nullptr && metal_labels();}
+inline void metal_gpu_profile_add(const std::string& key,double seconds,std::uint64_t vertices,std::uint64_t vertex_ticks,std::uint64_t fragment_ticks){
+    struct Entry {double seconds{};std::uint64_t count{},vertices{},vertex_ticks{},fragment_ticks{};};
+    static std::mutex mutex;static std::map<std::string,Entry> totals;static double last_dump=0;
+    const std::lock_guard lock(mutex);auto& entry=totals[key];entry.seconds+=seconds;++entry.count;entry.vertices+=vertices;entry.vertex_ticks+=vertex_ticks;entry.fragment_ticks+=fragment_ticks;
+    const double now=CFAbsoluteTimeGetCurrent();if(now-last_dump<5)return;last_dump=now;
+    if(auto* file=std::fopen(metal_gpu_profile_path(),"a")){std::fprintf(file,"=== %.3f\n",now+kCFAbsoluteTimeIntervalSince1970);for(const auto& [name,value]:totals)std::fprintf(file,"%.6f %llu %llu %llu %llu %s\n",value.seconds,static_cast<unsigned long long>(value.count),static_cast<unsigned long long>(value.vertices),static_cast<unsigned long long>(value.vertex_ticks),static_cast<unsigned long long>(value.fragment_ticks),name.c_str());std::fclose(file);}
+}
 struct MetalShader final:GraphicsShader {
     std::vector<std::uint8_t> bytecode;
     std::shared_ptr<MetalPendingLibrary> pending;
@@ -280,6 +303,7 @@ struct MetalShader final:GraphicsShader {
     std::uint64_t content_key{}; // 著色器位元組內容雜湊（快取鍵）；X64ARM_METAL_LABELS=1 時作為 encoder 標籤。
     bool writes_depth{};
     bool non_point_checked{};
+    signed char uav_write_only{-1}; // 首次需要時由 bytecode 判定（見 metal_dxbc_uav_write_only）。
     std::vector<MetalVarying> input_varyings,output_varyings;
     unsigned geometry_input{},geometry_output{},geometry_max{},geometry_instances{1};
     unsigned buffer_views_slot{UINT32_MAX};
@@ -415,6 +439,30 @@ MTLPixelFormat metal_format(std::uint32_t f){
     case 87:case 88:case 90:case 92:return MTLPixelFormatBGRA8Unorm;case 91:case 93:return MTLPixelFormatBGRA8Unorm_sRGB;
     default:throw std::invalid_argument("Metal 尚未映射 DXGI 格式："+std::to_string(f));
     }
+}
+// 像素著色器的 UAV 是否全部只寫：掃描 DXBC（SHEX／SHDR）每條指令。STORE_UAV_TYPED／STORE_RAW／STORE_STRUCTURED 以外只要有 UAV 運算元就視為讀取
+// （讀取、原子、計數器都在內）；帶 ROV 或 globally coherent 的宣告同樣回傳 false。立即值偶然長得像 UAV 運算元只會少合併，不影響正確性。無法解析時回傳 false。
+bool metal_dxbc_uav_write_only(std::span<const std::uint8_t> bytes){
+    const auto word=[&](std::size_t at){std::uint32_t value{};std::memcpy(&value,bytes.data()+at,4);return value;};
+    if(bytes.size()<32 || std::memcmp(bytes.data(),"DXBC",4))return false;
+    const auto chunks=word(28);if(chunks>64 || 32+std::uint64_t{chunks}*4>bytes.size())return false;
+    for(std::uint32_t c=0;c<chunks;++c){
+        const std::uint64_t chunk=word(32+c*4);if(chunk+8>bytes.size())return false;
+        const auto kind=word(chunk);if(kind!=0x58454853U && kind!=0x52444853U)continue;
+        const std::uint64_t size=word(chunk+4),data=chunk+8;if(data+size>bytes.size() || size<8)return false;
+        const std::uint64_t count=std::min<std::uint64_t>(word(data+4),size/4);
+        std::uint64_t at=2;
+        for(;at<count;){
+            const auto token=word(data+at*4);const unsigned opcode=token&0x7ffU;std::uint64_t length=(token>>24)&0x7fU;
+            if(opcode==53){if(at+1>=count)return false;length=word(data+(at+1)*4);if(length<2)return false;at+=length;continue;} // CUSTOMDATA：長度在下一個 token。
+            if(!length)return false;
+            if(opcode>=156 && opcode<=158){if(token&0x30000U)return false;at+=length;continue;}
+            if(opcode!=164 && opcode!=166 && opcode!=168)for(std::uint64_t n=1;n<length && at+n<count;++n)if(((word(data+(at+n)*4)>>12)&0xffU)==30U)return false;
+            at+=length;
+        }
+        return at==count; // 走訪必須剛好停在結尾，否則視為無法解析。
+    }
+    return false;
 }
 MTLVertexFormat metal_vertex_format(std::uint32_t f){
     switch(f){case 2:return MTLVertexFormatFloat4;case 6:return MTLVertexFormatFloat3;case 16:return MTLVertexFormatFloat2;case 41:return MTLVertexFormatFloat;

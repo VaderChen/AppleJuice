@@ -15,6 +15,8 @@
 #include "gui_timing_layout.h"
 #include "x64arm/raster_surface.hpp"
 #include "x64arm/windows_transform.hpp"
+#include <atomic>
+#include <cstdio>
 #include <algorithm>
 #include <bit>
 #include <limits>
@@ -122,7 +124,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"user32.dll","GetForegroundWindow",0},{"user32.dll","GetActiveWindow",0},{"user32.dll","GetLastActivePopup",1},{"user32.dll","SetForegroundWindow",1},{"user32.dll","SetActiveWindow",1},
         {"user32.dll","LoadIconA",2},{"user32.dll","LoadIconW",2},{"user32.dll","DestroyIcon",1},{"user32.dll","DestroyCursor",1},
         {"user32.dll","CreateIconIndirect",1},{"user32.dll","CopyIcon",1},{"user32.dll","GetIconInfo",2},
-        {"user32.dll","BringWindowToTop",1},{"user32.dll","WindowFromDC",1},{"user32.dll","GetDC",1},{"user32.dll","GetWindowDC",1},{"user32.dll","ReleaseDC",2},{"user32.dll","GetSysColor",1},{"user32.dll","GetSysColorBrush",1},
+        {"user32.dll","BringWindowToTop",1},{"user32.dll","WindowFromDC",1},{"user32.dll","GetDC",1},{"user32.dll","GetDCEx",3},{"user32.dll","GetWindowDC",1},{"user32.dll","ReleaseDC",2},{"user32.dll","GetSysColor",1},{"user32.dll","GetSysColorBrush",1},
         {"user32.dll","GetDoubleClickTime",0},{"user32.dll","SetDoubleClickTime",1},{"user32.dll","GetCaretBlinkTime",0},{"user32.dll","SetCaretBlinkTime",1},{"user32.dll","GetMessageTime",0},{"user32.dll","GetMessagePos",0},{"user32.dll","GetMessageExtraInfo",0},{"user32.dll","SetMessageExtraInfo",1},
         {"user32.dll","GetWindowThreadProcessId",2},{"user32.dll","GetGuiResources",2},
         {"user32.dll","RegisterWindowMessageA",1},{"user32.dll","RegisterWindowMessageW",1},
@@ -505,7 +507,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             if(wide)memory.write(GuestAddress{arg(0)},utf16_bytes(name));else {const auto bytes=utf16_to_utf8(name);std::vector<std::uint8_t> value(bytes.begin(),bytes.end());value.push_back(0);memory.write(GuestAddress{arg(0)},value);}result=1;}
     }else if(symbol=="GetKeyboardLayoutList"){
         if(s32(arg(0))<0 || (d(0) && !arg(1)))fail(87);
-        else {std::vector<std::uint32_t> layouts{0x04090409};if(native_gui_)for(const auto& method:native_input_methods())layouts.push_back(method.layout);
+        else {std::vector<std::uint32_t> layouts;for(const auto layout:keyboard_layouts())layouts.push_back(static_cast<std::uint32_t>(layout));
             if(!d(0))result=layouts.size();else {result=std::min<std::size_t>(layouts.size(),d(0));memory.check(GuestAddress{arg(1)},result*(x86_?4:8),Access::Write);for(unsigned i=0;i<result;++i)memory.store(GuestAddress{arg(1)+i*(x86_?4:8)},x86_?32:64,layouts[i]);}}
     }
     else if(symbol=="GetKeyboardState"){memory.write(GuestAddress{arg(0)},gui_.keyboard);result=1;}
@@ -801,7 +803,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             return std::nullopt;
         }
     } else if(symbol=="IsWindowEnabled" || symbol=="IsWindow" || symbol=="GetParent" || symbol=="IsIconic" || symbol=="IsZoomed"){
-        const auto f=gui_.windows.find(arg(0));if(f!=gui_.windows.end()){if(symbol=="GetParent")result=f->second.parent?f->second.parent:f->second.owner;else if(symbol=="IsWindow")result=1;else if(symbol=="IsWindowEnabled")result=f->second.enabled?1:0;else if(symbol=="IsIconic")result=f->second.show_command==2;else if(symbol=="IsZoomed")result=f->second.show_command==3;}
+        const auto f=gui_.windows.find(arg(0));
+        // CEF GPU 程序的 eglCreateWindowSurface 靠 IsWindow 判斷視窗有效，失敗就整個退出、Steam 介面消失。事後無法重現，每程序留少量紀錄。
+        if(symbol=="IsWindow" && f==gui_.windows.end() && arg(0)>=0x10000 && arg(0)<0x0fffffff){
+            static std::atomic<unsigned> reported{0};
+            if(reported.fetch_add(1,std::memory_order_relaxed)<32)std::fprintf(stderr,"[iswindow_invalid] pid=%u thread=%llu hwnd=0x%llx\n",process_id(),static_cast<unsigned long long>(threads_.current),static_cast<unsigned long long>(arg(0)));
+        }
+        if(f!=gui_.windows.end()){if(symbol=="GetParent")result=f->second.parent?f->second.parent:f->second.owner;else if(symbol=="IsWindow")result=1;else if(symbol=="IsWindowEnabled")result=f->second.enabled?1:0;else if(symbol=="IsIconic")result=f->second.show_command==2;else if(symbol=="IsZoomed")result=f->second.show_command==3;}
     } else if(symbol=="SetFocus" || symbol=="GetFocus"){
         detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,symbol=="SetFocus"?arg(0):0);
         result=gui_.focus;if(result && !input_connected(gui_.windows.at(result).thread))result=0;
@@ -899,7 +907,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         if(arg(0)==0x10000000U)result=gui_.desktop;
         else if(arg(0)>=0x10000000U && gui_.windows.contains(arg(0)-0x10000000U))result=arg(0)-0x10000000U;
         else if(!gui_.contexts.contains(arg(0)))fail(6);
-    }else if(symbol=="GetWindowDC"){
+    }else if(symbol=="GetWindowDC" || (symbol=="GetDCEx" && (d(2)&1U))){
         const auto found=gui_.windows.find(arg(0));
         if(arg(0) && arg(0)!=gui_.desktop && found==gui_.windows.end())fail(1400);
         else{
@@ -913,11 +921,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             gui_.contexts[result]=std::move(context);gui_.dc_objects[result]=0xb011;gui_.saved_contexts.erase(result);
         }
     }
-    else if(symbol=="GetDC"){
+    else if(symbol=="GetDC" || symbol=="GetDCEx"){
         if(arg(0) && !gui_.windows.contains(arg(0)))fail(1400);
         else {
             result=0x10000000+arg(0);gui_.dc_objects.try_emplace(result,0xb011);
             if(const auto context=gui_.contexts.find(result);context!=gui_.contexts.end() && context->second.window_frame){context->second=GuiDc{};gui_.dc_objects[result]=0xb011;}
+            // DCX_INTERSECTRGN／DCX_EXCLUDERGN 以既有 GDI 剪裁區流程套用（hrgnClip==1 表示整個視窗）。
+            if(symbol=="GetDCEx" && (d(2)&0xc0U) && arg(1) && arg(1)!=1)
+                (void)nested_service(state,memory,"gdi32.dll","ExtSelectClipRgn",{result,arg(1),(d(2)&0x80U)?1U:4U});
         }
     }
     else if(symbol=="ReleaseDC"){

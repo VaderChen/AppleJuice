@@ -19,6 +19,7 @@ struct ThreadWait {
     bool all{}, alertable{};
     bool shared{}, critical{}, signaled{}, timed_out{};
     bool slim_timed{}; // 共用 SRW 等待的限時介面：取得回 true，逾時回 false。
+    std::uint64_t order{}; // 物件等待的進入序號：互斥鎖、自動重設 event 與 semaphore 依先進先出交付。
     std::uint64_t gui_window{},gui_drag_detection{},gui_move_size{};
     std::uint32_t gui_min{},gui_max{},gui_mask{UINT32_MAX};bool gui_new_only{},gui_callbacks{true};
     bool operator==(const ThreadWait&) const = default;
@@ -83,6 +84,8 @@ struct GuestThread {
     }
     // 等待剛完成而尚未 dispatch；與 Windows 可停用的動態優先序提升分開。
     bool wake_pending{};
+    // slot 0 停駐等待被撤銷、回到 API 入口重新執行時保留原排隊位置（只在同一呼叫點、同一堆疊沿用一次）。
+    struct RevokedWait {std::uint64_t order{},rip{},rsp{};bool operator==(const RevokedWait&) const = default;} revoked_wait{};
     std::uint64_t last_dispatch_ticks{}; // 上次被排程執行的單調時鐘（100 ns），防餓死提升用。
     // 常駐平行 worker slot 的時間片期限（單調時鐘 100 ns）：期限內重新選取客體時保留原 slot，避免每次集合都輪替。
     std::uint64_t parallel_slice_deadline{};
@@ -126,6 +129,7 @@ struct ThreadRuntime {
     std::uint64_t slice_deadline{UINT64_MAX}; // 宿主時鐘模式的時間片上限，單位 100 ns。
     HostInstructionBudget host_instruction_budget;
     bool yield{};
+    bool prefer_awakened{}; // 這次讓出是為了被喚醒者：同優先序時也選它，不走一般輪替。
     // 常駐中斷返回的排程：完整輪詢外部事件與逾時，但時間片未到期時續跑目前執行緒，不強制輪替。
     bool interrupt_poll{};
     bool operator==(const ThreadRuntime&) const = default;

@@ -52,7 +52,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_control(GuestState& st
         }
         if(name=="ReOpenFile"){
             const auto access=static_cast<std::uint32_t>(arg(1)),sharing=static_cast<std::uint32_t>(arg(2)),flags=static_cast<std::uint32_t>(arg(3));
-            if(sharing&~7U)return failed(87);if((access&~0xc01f01bfU) || (flags&~0xde200000U))return failed(50);if(files_.size()>=1024)return failed(4);
+            if(sharing&~7U)return failed(87);if((access&~0xc01f01bfU) || (flags&~0xde200000U))return failed(50);if(!file_table_has_room(files_.size()))return failed(8);
             const auto category=[](std::uint32_t rights){return ((rights&(0x80000000U|1U|0x20U))?1U:0U)|((rights&(0x40000000U|2U|4U))?2U:0U)|((rights&0x10000U)?4U:0U);};const auto requested=access|((flags&0x04000000U)?0x10000U:0U);
             for(const auto& [other,peer]:files_){(void)other;if(peer.metadata.id==file.metadata.id && peer.metadata.device==file.metadata.device && ((category(requested)&~peer.sharing) || (category(peer.access)&~sharing)))return failed(32);}
             const auto opened=filesystem_.reopen(*original,file.path,access,sharing,flags);if(opened.error)return failed(opened.error);

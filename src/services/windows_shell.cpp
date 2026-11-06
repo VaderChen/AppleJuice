@@ -388,6 +388,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
             }
             if(symbol=="PropVariantClear" || symbol=="PropVariantCopy"){
                 if(!arg(0) || (symbol=="PropVariantCopy" && !arg(1)))return finish(pointer_error);
+                // VT_UNKNOWN／VT_DISPATCH 持有介面：清除時 Release，複製時 AddRef（媒體事件值常用這個型別）。
+                const auto interface_variant=[&](std::uint64_t address){const auto type=memory.load(GuestAddress{address},16);return type==13 || type==9;};
+                if(symbol=="PropVariantClear" && interface_variant(arg(0))){
+                    memory.check(GuestAddress{arg(0)},size,Access::Write);const auto pointer=memory.load(GuestAddress{arg(0)+8},bits);
+                    memory.write(GuestAddress{arg(0)},std::vector<std::uint8_t>(size));
+                    if(pointer){const auto table=memory.load(GuestAddress{pointer},bits);start_callbacks(state,memory,{{memory.load(GuestAddress{table+2*unit},bits),{pointer}}},Continuation::Return,0);return std::nullopt;}
+                    return finish(0);
+                }
+                if(symbol=="PropVariantCopy" && interface_variant(arg(1))){
+                    memory.check(GuestAddress{arg(0)},size,Access::Write);std::vector<std::uint8_t> copy(size);memory.read(GuestAddress{arg(1)},copy);memory.write(GuestAddress{arg(0)},copy);
+                    const auto pointer=memory.load(GuestAddress{arg(1)+8},bits);
+                    if(pointer){const auto table=memory.load(GuestAddress{pointer},bits);start_callbacks(state,memory,{{memory.load(GuestAddress{table+unit},bits),{pointer}}},Continuation::Return,0);return std::nullopt;}
+                    return finish(0);
+                }
                 if(symbol=="PropVariantClear")return finish(clear_variant(arg(0)));
                 if(arg(0)==arg(1))return finish(0);const auto value=read_variant(arg(1));const auto error=clear_variant(arg(0));if(error)return finish(error);write_variant(arg(0),value);return finish(0);
             }

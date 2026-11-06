@@ -5,7 +5,7 @@
 #include <cstdint>
 namespace x64arm::mf {
 using Guid=std::array<std::uint8_t,16>;
-enum Kind:unsigned {Attributes,Buffer,Sample,MediaType,Async,Event,Queue,Stream,Presentation,TypeHandler,Manager,Surface,Activate,TwoD,TwoD2,Transform,Generator,Shutdown,Source,MediaStream,Reader,Writer,ByteStream,Resolver};
+enum Kind:unsigned {Attributes,Buffer,Sample,MediaType,Async,Event,Queue,Stream,Presentation,TypeHandler,Manager,Surface,Activate,TwoD,TwoD2,Transform,Generator,Shutdown,Source,MediaStream,Reader,Writer,ByteStream,Resolver,Topology,TopologyNode,Session,Clock,RateControl,RateSupport,Collection,GetService,SimpleVolume,StreamVolume};
 constexpr Guid guid(std::uint32_t a,std::uint16_t b,std::uint16_t c,std::array<std::uint8_t,8> d){return {static_cast<std::uint8_t>(a),static_cast<std::uint8_t>(a>>8),static_cast<std::uint8_t>(a>>16),static_cast<std::uint8_t>(a>>24),static_cast<std::uint8_t>(b),static_cast<std::uint8_t>(b>>8),static_cast<std::uint8_t>(c),static_cast<std::uint8_t>(c>>8),d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7]};}
 constexpr Guid unknown=guid(0,0,0,{0xc0,0,0,0,0,0,0,0x46});
 constexpr Guid iid_Attributes=guid(0x2cd2d921,0xc447,0x44a7,{0xa1,0x3c,0x4a,0xda,0xbf,0xc2,0x47,0xe3});
@@ -117,7 +117,57 @@ constexpr Guid MFSampleExtension_CleanPoint=guid(0x9cdf01d8,0xa0f0,0x43ba,{0xb0,
 constexpr Guid MFSampleExtension_DecodeTimestamp=guid(0x73a954d4,0x9e2,0x4861,{0xbe,0xfc,0x94,0xbd,0x97,0xc0,0x8e,0x6e});
 constexpr Guid native_h264_encoder=guid(0x8a33afc7,0x18db,0x4b95,{0xaa,0x51,0x40,0xb4,0x68,0xe9,0x12,0x8a});
 constexpr Guid native_h264=guid(0x189f281a,0xad94,0x4bf7,{0xb4,0x45,0x3a,0xda,0x7e,0x9d,0x43,0xcb});
-inline bool attributes(Kind k){return k==Attributes || k==Sample || k==MediaType || k==Event || k==Stream || k==Presentation || k==Activate;}
-inline std::span<const Method> methods(Kind k){switch(k){case Resolver:return methods_Resolver;case ByteStream:return methods_ByteStream;case Writer:return methods_Writer;case Reader:return methods_Reader;case MediaStream:return methods_MediaStream;case Source:return methods_Source;case Shutdown:return methods_Shutdown;case Generator:return methods_Generator;case Transform:return methods_Transform;case TwoD:return methods_TwoD;case TwoD2:return methods_TwoD2;case Attributes:return methods_Attributes;case Buffer:return methods_Buffer;case Sample:return methods_Sample;case MediaType:return methods_MediaType;case Async:return methods_Async;case Event:return methods_Event;case Queue:return methods_Queue;case Stream:return methods_Stream;case Presentation:return methods_Presentation;case TypeHandler:return methods_TypeHandler;case Manager:return methods_Manager;case Surface:return methods_Surface;case Activate:return methods_Activate;}return {};}
-inline Guid iid(Kind k){switch(k){case Resolver:return iid_Resolver;case ByteStream:return iid_ByteStream;case Writer:return iid_Writer;case Reader:return iid_Reader;case MediaStream:return iid_MediaStream;case Source:return iid_Source;case Shutdown:return iid_Shutdown;case Generator:return iid_Generator;case Transform:return iid_Transform;case TwoD:return iid_TwoD;case TwoD2:return iid_TwoD2;case Attributes:return iid_Attributes;case Buffer:return iid_Buffer;case Sample:return iid_Sample;case MediaType:return iid_MediaType;case Async:return iid_Async;case Event:return iid_Event;case Queue:return iid_Queue;case Stream:return iid_Stream;case Presentation:return iid_Presentation;case TypeHandler:return iid_TypeHandler;case Manager:return iid_Manager;case Surface:return iid_Surface;case Activate:return iid_Activate;}return {};}
+constexpr Guid iid_Topology=guid(0x83cf873a,0xf6da,0x4bc8,{0x82,0x3f,0xba,0xcf,0xd5,0x5d,0xc4,0x33});
+constexpr Method methods_Topology[]={{"TP_GetTopologyID",2},{"TP_AddNode",2},{"TP_RemoveNode",2},{"TP_GetNodeCount",2},{"TP_GetNode",3,0,0,2},{"TP_Clear",1},{"TP_CloneFrom",2},{"TP_GetNodeByID",3,2},{"TP_GetSourceNodeCollection",2},{"TP_GetOutputNodeCollection",2}};
+constexpr Guid iid_TopologyNode=guid(0x83cf873a,0xf6da,0x4bc8,{0x82,0x3f,0xba,0xcf,0xd5,0x5d,0xc4,0x30});
+constexpr Method methods_TopologyNode[]={{"TN_SetObject",2},{"TN_GetObject",2},{"TN_GetNodeType",2},{"TN_GetTopoNodeID",2},{"TN_SetTopoNodeID",2,2},{"TN_GetInputCount",2},{"TN_GetOutputCount",2},{"TN_ConnectOutput",4,0,0,10},{"TN_DisconnectOutput",2,0,0,2},{"TN_GetInput",4,0,0,2},{"TN_GetOutput",4,0,0,2},{"TN_SetOutputPrefType",3,0,0,2},{"TN_GetOutputPrefType",3,0,0,2},{"TN_SetInputPrefType",3,0,0,2},{"TN_GetInputPrefType",3,0,0,2},{"TN_CloneFrom",2}};
+constexpr Guid iid_Session=guid(0x90377834,0x21d0,0x4dee,{0x82,0x14,0xba,0x2e,0x3e,0x6c,0x11,0x27});
+constexpr Method methods_Session[]={{"Q_GetEvent",3,0,0,2},{"Q_BeginGetEvent",3,0,0,0},{"Q_EndGetEvent",3,0,0,0},{"Q_QueueEventParamVar",5,0,0,10},{"MS_SetTopology",3,0,0,2},{"MS_ClearTopologies",1},{"MS_Start",3},{"MS_Pause",1},{"MS_Stop",1},{"MS_Close",1},{"MS_Shutdown",1},{"MS_GetClock",2},{"MS_GetSessionCapabilities",2},{"MS_GetFullTopology",4,4,0,2}};
+constexpr Guid iid_Clock=guid(0x2eb1e945,0x18b8,0x4139,{0x9b,0x1a,0xd5,0xd5,0x84,0x81,0x85,0x30});
+constexpr Guid iid_PresentationClock=guid(0x868ce85c,0x8ea9,0x4f55,{0xab,0x82,0xb0,0x09,0xa9,0x10,0xa8,0x05});
+constexpr Method methods_Clock[]={{"CK_GetClockCharacteristics",2},{"CK_GetCorrelatedTime",4,0,0,2},{"CK_GetContinuityKey",2},{"CK_GetState",3,0,0,2},{"CK_GetProperties",2},{"CK_SetTimeSource",2},{"CK_GetTimeSource",2},{"CK_GetTime",2},{"CK_AddClockStateSink",2},{"CK_RemoveClockStateSink",2},{"CK_Start",2,2},{"CK_Stop",1},{"CK_Pause",1}};
+constexpr Guid iid_RateControl=guid(0x88ddcd21,0x03c3,0x4275,{0x91,0xed,0x55,0xee,0x39,0x29,0x32,0x8f});
+constexpr Method methods_RateControl[]={{"RC_SetRate",3,0,0,2},{"RC_GetRate",3}};
+constexpr Guid iid_RateSupport=guid(0x0a9ccdbc,0xd797,0x4563,{0x96,0x67,0x94,0xec,0x5d,0x79,0x29,0x2d});
+constexpr Method methods_RateSupport[]={{"RS_GetSlowestRate",4,0,0,6},{"RS_GetFastestRate",4,0,0,6},{"RS_IsRateSupported",4,0,0,2}};
+constexpr Guid iid_Collection=guid(0x5bc8a76b,0x869a,0x46a3,{0x9b,0x03,0xfa,0x21,0x8a,0x66,0xae,0xbe});
+constexpr Method methods_Collection[]={{"CL_GetElementCount",2},{"CL_GetElement",3,0,0,2},{"CL_AddElement",2},{"CL_RemoveElement",3,0,0,2},{"CL_InsertElementAt",3,0,0,2},{"CL_RemoveAllElements",1}};
+constexpr Guid iid_GetService=guid(0xfa993888,0x4383,0x415a,{0xa9,0x30,0xdd,0x47,0x2a,0x8c,0xf6,0xf7});
+constexpr Method methods_GetService[]={{"GS_GetService",4}};
+constexpr Guid iid_SimpleVolume=guid(0x089edf13,0xcf71,0x4338,{0x8d,0x13,0x9e,0x56,0x9d,0xbd,0xc3,0x19});
+constexpr Method methods_SimpleVolume[]={{"SV_SetMasterVolume",2},{"SV_GetMasterVolume",2},{"SV_SetMute",2,0,0,2},{"SV_GetMute",2}};
+constexpr Guid iid_StreamVolume=guid(0x76b1bbdb,0x4ec8,0x4f36,{0xb1,0x06,0x70,0xa9,0x31,0x6d,0xf5,0x93});
+constexpr Method methods_StreamVolume[]={{"AV_GetChannelCount",2},{"AV_SetChannelVolume",3,0,0,2},{"AV_GetChannelVolume",3,0,0,2},{"AV_SetAllVolumes",3,0,0,2},{"AV_GetAllVolumes",3,0,0,2}};
+// IMFClockStateSink 與 IMFSampleGrabberSinkCallback 的客體 vtable 槽位。
+inline constexpr unsigned sink_clock_start=3,sink_clock_stop=4,sink_clock_pause=5,sink_clock_restart=6,sink_clock_rate=7,sink_set_clock=8,sink_process_sample=9,sink_shutdown=10,sink_process_sample_ex=11;
+constexpr Guid iid_SampleGrabberCallback2=guid(0xca86aa50,0xc46e,0x429e,{0xab,0x27,0x90,0xd0,0x95,0xa7,0xa7,0xd5});
+constexpr Guid MF_TOPONODE_SOURCE=guid(0x835c58ec,0xe075,0x4bc7,{0xbc,0xba,0x4d,0xe0,0x00,0xdf,0x9a,0xe6});
+constexpr Guid MF_TOPONODE_PRESENTATION_DESCRIPTOR=guid(0x835c58ed,0xe075,0x4bc7,{0xbc,0xba,0x4d,0xe0,0x00,0xdf,0x9a,0xe6});
+constexpr Guid MF_TOPONODE_STREAM_DESCRIPTOR=guid(0x835c58ee,0xe075,0x4bc7,{0xbc,0xba,0x4d,0xe0,0x00,0xdf,0x9a,0xe6});
+constexpr Guid MF_TOPONODE_NOSHUTDOWN_ON_REMOVE=guid(0x14932f9c,0x9087,0x4bb4,{0x84,0x12,0x51,0x67,0x14,0x5c,0xbe,0x04});
+constexpr Guid MF_EVENT_TOPOLOGY_STATUS=guid(0x30c5018d,0x9a53,0x454b,{0xad,0x9e,0x6d,0x5f,0x8f,0xa7,0xc4,0x3b});
+constexpr Guid MF_EVENT_SESSIONCAPS=guid(0x7e5ebcd0,0x11b8,0x4abe,{0xaf,0xad,0x10,0xf6,0x59,0x9a,0x7f,0x42});
+constexpr Guid MF_EVENT_SESSIONCAPS_DELTA=guid(0x7e5ebcd1,0x11b8,0x4abe,{0xaf,0xad,0x10,0xf6,0x59,0x9a,0x7f,0x42});
+constexpr Guid MF_EVENT_PRESENTATION_TIME_OFFSET=guid(0x5ad914d1,0x9b45,0x4a8d,{0xa2,0xc0,0x81,0xd1,0xe5,0x0b,0xfb,0x07});
+constexpr Guid MF_SAMPLEGRABBERSINK_IGNORE_CLOCK=guid(0x0efda2c0,0x2b69,0x4e2e,{0xab,0x8d,0x46,0xdc,0xbf,0xf7,0xd2,0x5d});
+constexpr Guid MF_SAMPLEGRABBERSINK_SAMPLE_TIME_OFFSET=guid(0x62e3d776,0x8100,0x4e03,{0xa6,0xe8,0xbd,0x38,0x57,0xac,0x9c,0x47});
+constexpr Guid MF_RATE_CONTROL_SERVICE=guid(0x866fa297,0xb802,0x4bf8,{0x9d,0xc9,0x5e,0x3b,0x6a,0x9f,0x53,0xc9});
+constexpr Guid MR_STREAM_VOLUME_SERVICE=guid(0xf8b5fa2f,0x32ef,0x46f5,{0xb1,0x72,0x13,0x21,0x21,0x2f,0xb2,0xc4});
+constexpr Guid MR_POLICY_VOLUME_SERVICE=guid(0x1abaa2ac,0x9d3b,0x47c6,{0xab,0x48,0xc5,0x95,0x06,0xde,0x78,0x4d});
+constexpr Guid MF_MT_ALL_SAMPLES_INDEPENDENT=guid(0xc9173739,0x5e56,0x461c,{0xb7,0x13,0x46,0xfb,0x99,0x5c,0xb9,0x5f});
+constexpr Guid MF_MT_USER_DATA=guid(0xb6bc765f,0x4c3b,0x40a4,{0xbd,0x51,0x25,0x35,0xb6,0x6f,0xe0,0x9d});
+constexpr Guid MF_MT_AAC_PAYLOAD_TYPE=guid(0xbfbabe79,0x7434,0x4d1c,{0x94,0xf0,0x72,0xa3,0xb9,0xe1,0x71,0x88});
+constexpr Guid MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION=guid(0x7632f0e6,0x9538,0x4d61,{0xac,0xda,0xea,0x29,0xc8,0xc1,0x44,0x56});
+constexpr Guid aac=guid(0x1610,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+constexpr Guid hevc=guid(0x43564548,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+constexpr Guid yv12=guid(0x32315659,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+constexpr Guid iyuv=guid(0x56555949,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+constexpr Guid i420=guid(0x30323449,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+constexpr Guid yuy2=guid(0x32595559,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+constexpr Guid uyvy=guid(0x59565955,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+constexpr Guid rgb32=guid(22,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+constexpr Guid argb32=guid(21,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+inline bool attributes(Kind k){return k==Attributes || k==Sample || k==MediaType || k==Event || k==Stream || k==Presentation || k==Activate || k==Topology || k==TopologyNode;}
+inline std::span<const Method> methods(Kind k){switch(k){case Topology:return methods_Topology;case TopologyNode:return methods_TopologyNode;case Session:return methods_Session;case Clock:return methods_Clock;case RateControl:return methods_RateControl;case RateSupport:return methods_RateSupport;case Collection:return methods_Collection;case GetService:return methods_GetService;case SimpleVolume:return methods_SimpleVolume;case StreamVolume:return methods_StreamVolume;case Resolver:return methods_Resolver;case ByteStream:return methods_ByteStream;case Writer:return methods_Writer;case Reader:return methods_Reader;case MediaStream:return methods_MediaStream;case Source:return methods_Source;case Shutdown:return methods_Shutdown;case Generator:return methods_Generator;case Transform:return methods_Transform;case TwoD:return methods_TwoD;case TwoD2:return methods_TwoD2;case Attributes:return methods_Attributes;case Buffer:return methods_Buffer;case Sample:return methods_Sample;case MediaType:return methods_MediaType;case Async:return methods_Async;case Event:return methods_Event;case Queue:return methods_Queue;case Stream:return methods_Stream;case Presentation:return methods_Presentation;case TypeHandler:return methods_TypeHandler;case Manager:return methods_Manager;case Surface:return methods_Surface;case Activate:return methods_Activate;}return {};}
+inline Guid iid(Kind k){switch(k){case Topology:return iid_Topology;case TopologyNode:return iid_TopologyNode;case Session:return iid_Session;case Clock:return iid_PresentationClock;case RateControl:return iid_RateControl;case RateSupport:return iid_RateSupport;case Collection:return iid_Collection;case GetService:return iid_GetService;case SimpleVolume:return iid_SimpleVolume;case StreamVolume:return iid_StreamVolume;case Resolver:return iid_Resolver;case ByteStream:return iid_ByteStream;case Writer:return iid_Writer;case Reader:return iid_Reader;case MediaStream:return iid_MediaStream;case Source:return iid_Source;case Shutdown:return iid_Shutdown;case Generator:return iid_Generator;case Transform:return iid_Transform;case TwoD:return iid_TwoD;case TwoD2:return iid_TwoD2;case Attributes:return iid_Attributes;case Buffer:return iid_Buffer;case Sample:return iid_Sample;case MediaType:return iid_MediaType;case Async:return iid_Async;case Event:return iid_Event;case Queue:return iid_Queue;case Stream:return iid_Stream;case Presentation:return iid_Presentation;case TypeHandler:return iid_TypeHandler;case Manager:return iid_Manager;case Surface:return iid_Surface;case Activate:return iid_Activate;}return {};}
 }

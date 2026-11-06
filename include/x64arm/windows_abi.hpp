@@ -96,6 +96,7 @@ std::span<const WindowsServiceDescriptor> opencl_service_descriptors();
 std::span<const WindowsServiceDescriptor> vulkan_service_descriptors();
 std::span<const WindowsServiceDescriptor> directml_export_service_descriptors();
 std::span<const WindowsServiceDescriptor> msvcp_pmr_service_descriptors();
+std::span<const WindowsServiceDescriptor> msvcp_special_math_service_descriptors();
 std::span<const WindowsServiceDescriptor> directml_object_service_descriptors();
 std::span<const WindowsServiceDescriptor> webview2_loader_service_descriptors();
 std::span<const WindowsServiceDescriptor> webview2_object_service_descriptors();

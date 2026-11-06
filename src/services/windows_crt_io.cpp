@@ -521,17 +521,42 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
             else if(!crt_attach_stream(memory,*file))result=0;
             else {file->commit_on_close=parsed->commit<0?memory.load(GuestAddress{runtime_.commode_cell},32)!=0:parsed->commit!=0;}}
 
-    } else if(symbol=="_open" || symbol=="_wopen" || symbol=="_sopen" || symbol=="_wsopen" || symbol=="_sopen_s" || symbol=="_wsopen_s") {
-        const bool secure=symbol.ends_with("_s"),shared=symbol.find("sopen")!=symbol.npos;
-        const unsigned first=secure?1U:0U;
-        if(secure && arg(0))memory.store(GuestAddress{arg(0)},32,UINT32_MAX);
+    } else if(symbol=="tmpfile" || symbol=="tmpfile_s") {
+        // 在 TMP 目錄建立唯一暫存檔，以 w+bD 開啟（關閉時刪除），共用 _tempnam 與 fopen 的命名、權限與串流契約。
+        const bool secure=symbol=="tmpfile_s";
+        if(secure && !arg(0)){
+            error(22,22);
+            if(current_invalid_parameter_handler()){start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,22);return std::nullopt;}
+            return 0xc0000417U;
+        }
+        if(secure)memory.store(GuestAddress{arg(0)},x86_?32:64,0);
+        const auto scratch=allocate_heap(memory,16);
+        if(!scratch)error(12,secure?12:0);
+        else{
+            memory.write(GuestAddress{scratch},std::vector<std::uint8_t>{'t',0,0,0,'w','+','b','D',0});
+            const auto path=nested_service(state,memory,"crt","_tempnam",{0,scratch});
+            const auto stream=path?nested_service(state,memory,"crt","fopen",{path,scratch+4}):0;
+            if(path)(void)free_heap(memory,path,state);
+            (void)free_heap(memory,scratch,state);
+            if(secure){
+                if(stream){memory.store(GuestAddress{arg(0)},x86_?32:64,stream);result=0;}
+                else result=memory.load(GuestAddress{runtime_.errno_cell},32);
+            }else result=stream;
+        }
+    } else if(symbol=="_open" || symbol=="_wopen" || symbol=="_sopen" || symbol=="_wsopen" || symbol=="_sopen_s" || symbol=="_wsopen_s" || symbol=="_sopen_dispatch" || symbol=="_wsopen_dispatch") {
+        // UCRT 內部的 _sopen_dispatch(path,oflag,shflag,pmode,pfh,bSecure) 參數順序不同，回傳 errno，語義由 bSecure 決定。
+        const bool dispatch=symbol.ends_with("_dispatch");
+        const bool secure=dispatch?u32(5)!=0:symbol.ends_with("_s"),shared=symbol.find("sopen")!=symbol.npos;
+        const unsigned first=!dispatch && secure?1U:0U;
+        const auto descriptor_out=dispatch?arg(4):secure?arg(0):0;
+        if(descriptor_out)memory.store(GuestAddress{descriptor_out},32,UINT32_MAX);
         const auto flags_value=u32(first+1),share=shared?u32(first+2):0x40U;
         const auto translation=crt_lowio::open_translation(flags_value,static_cast<std::uint32_t>(memory.load(GuestAddress{runtime_.fmode_cell},32)));
         const auto mode=(secure || (flags_value&0x100))?u32(first+(shared?3:2)):0x180U;
         // 一般 open／sopen 保留舊 CRT 契約，只採用 owner read/write bits；_s 版本才驗證完整 pmode。
-        const bool bad=(secure && !arg(0)) || !arg(first) || (flags_value&~0x7c7ffU) || (flags_value&3)==3 || !crt_lowio::valid_open_translation(translation) || (share!=0x10 && share!=0x20 && share!=0x30 && share!=0x40 && share!=0x80) || (secure && (mode&~0x180U));
+        const bool bad=((secure || dispatch) && !descriptor_out) || !arg(first) || (flags_value&~0x7c7ffU) || (flags_value&3)==3 || !crt_lowio::valid_open_translation(translation) || (share!=0x10 && share!=0x20 && share!=0x30 && share!=0x40 && share!=0x80) || (secure && (mode&~0x180U));
         if(bad){
-            error(22,secure?22:UINT32_MAX);
+            error(22,secure || dispatch?22:UINT32_MAX);
             if(secure){
                 if(current_invalid_parameter_handler()){start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,22);return std::nullopt;}
                 return 0xc0000417U;
@@ -544,7 +569,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
             file.sharing=share==0x10?0:share==0x20?1:share==0x30?2:share==0x80?(file.writable?0:1):3;
             const auto disposition=(flags_value&0x100)?(flags_value&0x400)?1U:(flags_value&0x200)?2U:4U:(flags_value&0x200)?5U:3U;
             open(path,std::move(file),disposition,(((mode&~runtime_.crt_umask)&0x80)?0x80U:1U)|((flags_value&0x1000U)?0x100U:0U)|((flags_value&0x40U)?0x04000000U:0U),translation&0x70000U);
-            if(secure){if(result){memory.store(GuestAddress{arg(0)},32,runtime_.streams.at(result).descriptor);result=0;}else result=memory.load(GuestAddress{runtime_.errno_cell},32);}
+            if(secure || dispatch){if(result){memory.store(GuestAddress{descriptor_out},32,runtime_.streams.at(result).descriptor);result=0;}else result=memory.load(GuestAddress{runtime_.errno_cell},32);}
             else result=result?runtime_.streams.at(result).descriptor:UINT32_MAX;
         }
     } else if(symbol.starts_with("?_Fiopen@std@@") || symbol=="fopen" || symbol=="_wfopen" || symbol=="_fsopen" || symbol=="_wfsopen" || symbol=="fopen_s" || symbol=="_wfopen_s") {

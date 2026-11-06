@@ -124,8 +124,54 @@ class MetalGl final:public NativeOpenGlContext {
     std::map<unsigned,TextureLevelInfo> proxy_levels_;
     void texture_level(GlOperation,std::span<const std::uint64_t>,std::span<std::uint8_t>);
     MetalPendingObjects graphics_pending_;
-    struct Flight {id<MTLCommandBuffer> command;std::vector<std::shared_ptr<GpuMemoryReservation>> leases;MetalPendingObjects objects;std::vector<Texture> textures;std::shared_ptr<std::atomic<bool>> done;std::shared_ptr<MetalFenceRelays> relays;};
+    // 診斷（X64ARM_METAL_LABELS）：本批次編碼過的命令；GPU 不完成時列出，間接命令另讀出參數（GPU 端可能才寫入）。
+    struct HangBinding {std::string tag;id<MTLBuffer> buffer;std::uint64_t first{},count{};unsigned format{};};
+    struct HangLabel {std::string name;id<MTLBuffer> buffer;std::uint64_t offset{};unsigned words{};std::vector<HangBinding> bindings{};std::uint64_t vertices{};};
+    // GPU 剖析的階段時間戳：頂點（分箱）與片段各自的起訖，只在剖析模式配置。
+    id<MTLCounterSampleBuffer> hang_samples_;
+    id<MTLCounterSampleBuffer> gpu_profile_samples(){
+        static id<MTLCounterSet> counters=nil;static bool checked=false;
+        if(!checked){checked=true;if([device_ supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary])for(id<MTLCounterSet> set in device_.counterSets)if([set.name isEqualToString:MTLCommonCounterSetTimestamp])counters=set;}
+        if(!counters)return nil;
+        auto descriptor=[MTLCounterSampleBufferDescriptor new];descriptor.counterSet=counters;descriptor.sampleCount=4;descriptor.storageMode=MTLStorageModeShared;
+        NSError* error=nil;return [device_ newCounterSampleBufferWithDescriptor:descriptor error:&error];
+    }
+    // GPU 剖析的鍵：第一個標籤（去掉 dispatch 群組數），加上 draw 次數級距與第一個 draw 的著色器。
+    static std::string metal_gpu_profile_key(const std::vector<HangLabel>& labels){
+        if(labels.empty())return {};
+        std::string key=labels.front().name;
+        if(key.rfind("cs ",0)==0){if(const auto last=key.rfind(' ');last>2)key.resize(last);return key;}
+        unsigned draws=0;const std::string* first_draw=nullptr;
+        for(const auto& label:labels)if(label.name.rfind("draw",0)==0 || label.name=="indirect-draw"){if(!draws)first_draw=&label.name;++draws;}
+        if(!draws)return key;
+        if(key.rfind("pass",0)!=0)key="pass ?";
+        if(draws<=2 && first_draw)return key+" "+*first_draw;
+        unsigned bucket=4;while(bucket<draws)bucket*=4;
+        return key+" draws<="+std::to_string(bucket);
+    }
+    struct Flight {id<MTLCommandBuffer> command;std::vector<std::shared_ptr<GpuMemoryReservation>> leases;MetalPendingObjects objects;std::vector<Texture> textures;std::shared_ptr<std::atomic<bool>> done;std::shared_ptr<MetalFenceRelays> relays;std::vector<HangLabel> labels;};
     std::deque<Flight> flights_;
+    std::vector<HangLabel> hang_labels_;
+    void hang_note(const std::string& name,id<MTLBuffer> buffer=nil,std::uint64_t offset=0,unsigned words=0){hang_labels_.push_back({name,buffer,offset,words});}
+    static std::string hang_describe(const HangLabel& label){
+        auto text=label.name;
+        if(label.buffer && label.buffer.contents && label.offset+label.words*4<=label.buffer.length){
+            const auto* values=reinterpret_cast<const std::uint32_t*>(static_cast<const std::uint8_t*>(label.buffer.contents)+label.offset);
+            text+=" args=";for(unsigned i=0;i<label.words;++i)text+=(i?",":"")+std::to_string(values[i]);
+        }else if(label.buffer)text+=" args=private";
+        for(const auto& binding:label.bindings){
+            text+=" {"+binding.tag+" fmt"+std::to_string(binding.format)+" len"+std::to_string(binding.buffer.length)+" first"+std::to_string(binding.first)+" count"+std::to_string(binding.count);
+            if(binding.buffer.contents){
+                const auto end=std::min<std::uint64_t>(binding.buffer.length,binding.count?binding.first+binding.count:binding.buffer.length);
+                const auto* bytes=static_cast<const std::uint8_t*>(binding.buffer.contents);std::uint32_t top=0;std::uint64_t nonzero=0;
+                for(auto at=binding.first;at+4<=end;at+=4){std::uint32_t value;std::memcpy(&value,bytes+at,4);top=std::max(top,value);nonzero+=value!=0;}
+                text+=" umax"+std::to_string(top)+" nz"+std::to_string(nonzero)+" head";
+                for(auto at=binding.first;at+4<=end && at<binding.first+48;at+=4){std::uint32_t value;std::memcpy(&value,bytes+at,4);text+=","+std::to_string(value);}
+            }
+            text+="}";
+        }
+        return text;
+    }
     // glDeleteTextures 後仍可能被已編碼／在途命令引用的紋理（連同 GPU 額度）：送出時掛到該批次，批次完成才釋放，
     // 不必為刪除整個同步等 GPU（D3D9 每次把第 0 層貼圖設為 NULL 都會刪除名稱 1）。X64ARM_METAL_DELETE_SYNC=1 恢復同步。
     std::vector<Texture> retired_textures_;
@@ -209,7 +255,7 @@ class MetalGl final:public NativeOpenGlContext {
     GlOperation active_operation_{};
     void error(unsigned e){if(std::getenv("X64ARM_GL_TRACE"))std::fprintf(stderr,"[gl-error] operation=%u error=0x%x\n",static_cast<unsigned>(active_operation_),e);if(!error_)error_=e;}
     // 連續繪製沿用的 render encoder 與其附件鍵；任何其他編碼、提交前都先結束。
-    id<MTLRenderCommandEncoder> open_render_;std::vector<std::uintptr_t> open_render_key_;std::uint64_t coalesced_draws_{},render_encoders_{};
+    id<MTLRenderCommandEncoder> open_render_;std::vector<std::uintptr_t> open_render_key_;std::vector<const GraphicsResource*> open_render_uavs_;std::uint64_t coalesced_draws_{},render_encoders_{};
     // 目前 render encoder 已設定的固定功能狀態（見 graphics_draw）；未設定的項目為空／-1，換 encoder 時整份重設。
     struct RenderShadow {
         id<MTLRenderPipelineState> pipeline;id<MTLDepthStencilState> depth;std::int64_t stencil{-1};std::optional<std::array<float,4>> blend;
@@ -234,7 +280,7 @@ class MetalGl final:public NativeOpenGlContext {
     // 診斷：記錄每次結束沿用中 render encoder 的原因（統計字串輸出），找出切斷合併的來源。
     std::map<std::string,std::uint64_t> encoder_breaks_;
     void end_open_render(const char* why=nullptr){
-        if(open_render_){++encoder_breaks_[why?why:"other"];metal_chain_update(open_render_);[open_render_ endEncoding];open_render_=nil;open_render_key_.clear();++bind_generation_;}
+        if(open_render_){++encoder_breaks_[why?why:"other"];if(auto* trace=metal_pass_trace())std::fprintf(trace,"E why=%s draws=%llu\n",why?why:"other",static_cast<unsigned long long>(coalesced_draws_));metal_chain_update(open_render_);[open_render_ endEncoding];open_render_=nil;open_render_key_.clear();open_render_uavs_.clear();++bind_generation_;}
         if(open_compute_){metal_chain_update(open_compute_);[open_compute_ endEncoding];open_compute_=nil;}
     }
     // 連續 dispatch 共用的 compute encoder（序列 dispatch：每個 dispatch 等前一個完成才開始，等同 D3D12 dispatch 間的 UAV 屏障）；
@@ -243,22 +289,32 @@ class MetalGl final:public NativeOpenGlContext {
     id<MTLComputeCommandEncoder> compute_encoder(){
         static const bool coalesce=[] {const auto* text=std::getenv("X64ARM_METAL_COMPUTE_COALESCE");return !text || std::string_view(text)!="0";}();
         if(open_compute_ && coalesce){++coalesced_dispatches_;return open_compute_;}
-        begin_commands(true,"dispatch");open_compute_=[commands_ computeCommandEncoder];if(!open_compute_)throw std::runtime_error("Metal command encoder 建立失敗");
+        begin_commands(true,"dispatch");open_compute_=[commands_ computeCommandEncoder];if(!open_compute_)throw std::runtime_error("Metal command encoder 建立失敗");if(auto* trace=metal_pass_trace())std::fprintf(trace,"C\n");
         metal_chain_wait(open_compute_);++compute_encoders_;return open_compute_;
     }
-    void ensure_commands(bool gpu_work){if(!commands_){commands_=[queue_ commandBuffer];commands_gpu_work_=false;}if(!commands_)throw std::runtime_error("Metal command buffer 建立失敗");commands_gpu_work_|=gpu_work;}
+    void ensure_commands(bool gpu_work){if(!commands_){
+            // 診斷：X64ARM_METAL_LABELS 時保留每個 encoder 的執行狀態，GPU 錯誤訊息可指出是哪個 encoder（標籤含著色器內容雜湊）。
+            static const bool encoder_status=std::getenv("X64ARM_METAL_LABELS")!=nullptr;
+            if(encoder_status){auto descriptor=[MTLCommandBufferDescriptor new];descriptor.errorOptions=MTLCommandBufferErrorOptionEncoderExecutionStatus;commands_=[queue_ commandBufferWithDescriptor:descriptor];}
+            else commands_=[queue_ commandBuffer];
+            commands_gpu_work_=false;}if(!commands_)throw std::runtime_error("Metal command buffer 建立失敗");commands_gpu_work_|=gpu_work;}
     // D3D12 描述元表使用後建立的 encoder 串接 fence（見 metal_command_encoder.hpp）；nil 表示未啟用。
     id<MTLFence> encoder_chain_fence_;
-    // 批次提交對齊 render pass（X64ARM_METAL_BATCH_PASS=1 開啟，預設關閉）：累計命令數到上限時若 render encoder 還開著，不在 pass 中間
-    // 提交，改在 pass 自然結束（begin_commands）時補提交。雙人成行實測：每幀 render encoder 66.7 → 61、提交 7.3 → 5，但 GPU 忙碌
-    // 15.2～16.0 → 16.8～17.1 ms，幀率差異在誤差內（+0.2～+0.7），因此不預設開啟；X64ARM_METAL_BATCH=1024 的大批次雖讓 GPU 忙碌
-    // 降到 10.1 ms，卻因提交太晚讓 CPU 每幀等 GPU 5 ms（36 對 45 fps）。
-    static bool batch_pass_aligned(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_BATCH_PASS");return text && std::string_view(text)=="1";}();return value;}
+    // 批次提交對齊 render pass（X64ARM_METAL_BATCH_PASS=0 關閉）：累計命令數到上限時若 render encoder 還開著，不在 pass 中間提交，
+    // 改在 pass 自然結束（begin_commands）時補提交。否則一個大 pass 每 128 個命令就被切開，每段都要重新載入／寫回整張附件。
+    // 33 號遠征隊 720p：每幀 render encoder 141 → 121、提交 23.6 → 9.4，GPU 忙碌約少 9%，CPU 等 GPU 約少 2 ms。
+    // X64ARM_METAL_BATCH=1024 的大批次不同：雙人成行提交太晚，CPU 每幀多等 GPU 5 ms（36 對 45 fps）。
+    static bool batch_pass_aligned(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_BATCH_PASS");return !text || std::string_view(text)!="0";}();return value;}
     bool flushing_{};
-    void batch_commit(){if(pending_>=metal_batch_limit() && (!open_render_ || !batch_pass_aligned()))flush(false,"batch_128");}
+    // 單一 pass 命令太多時仍要提交，否則 GPU 要等到 pass 結束才開工（FF8 大部分繪製都在同一個 pass，完全對齊時平均約少 3%）。
+    // X64ARM_METAL_BATCH_PASS_LIMIT=<命令數>。
+    static std::uint32_t batch_pass_limit(){static const std::uint32_t value=[] {const auto* text=std::getenv("X64ARM_METAL_BATCH_PASS_LIMIT");return text?static_cast<std::uint32_t>(std::strtoul(text,nullptr,10)):1024U;}();return value;}
+    void batch_commit(){if(pending_>=metal_batch_limit() && (!open_render_ || !batch_pass_aligned() || pending_>=batch_pass_limit()))flush(false,"batch_128");}
     void begin_commands(bool gpu_work=true,const char* why=nullptr){
         const bool had_render=open_render_!=nil;end_open_render(why);
-        if(had_render && !flushing_ && batch_pass_aligned() && pending_>=metal_batch_limit())flush(false,"batch_pass");
+        // GPU 剖析：每個 encoder 各用一個命令緩衝並等它完成，命令緩衝不重疊，時間才能歸屬到 encoder 標籤（FPS 不可比較）。
+        if(metal_gpu_profile() && commands_ && !flushing_ && !hang_labels_.empty())flush(true,"gpu_profile");
+        else if(had_render && !flushing_ && batch_pass_aligned() && pending_>=metal_batch_limit())flush(false,"batch_pass");
         materialize_clears();ensure_commands(gpu_work);metal_encoder_chain=encoder_chain_fence_;}
     // 延後的 render target 清除（見 graphics_clear）：下一個 render pass 附加同一目標且尺寸相同時改用該附件的 load action，
     // 其他任何編碼、提交或 CPU 等待之前都先補編碼成獨立清除 pass。目標以 MetalRenderTarget 的 view 物件比對。
@@ -273,10 +329,46 @@ class MetalGl final:public NativeOpenGlContext {
     void retire_front(bool wait){
         auto command=flights_.front().command;
         if(wait && command.status<MTLCommandBufferStatusCompleted){
-            const auto begin=std::chrono::steady_clock::now();[command waitUntilCompleted];++wait_count_;
+            const auto begin=std::chrono::steady_clock::now();
+            // 診斷：X64ARM_METAL_LABELS 時定期回報等不到完成的命令緩衝（Committed＝排隊中、Scheduled＝GPU 執行中）與在途清單。
+            static const bool watch_hang=std::getenv("X64ARM_METAL_LABELS")!=nullptr;
+            if(watch_hang){
+                auto next_report=begin+std::chrono::seconds(15);
+                while(command.status<MTLCommandBufferStatusCompleted){
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    if(std::chrono::steady_clock::now()<next_report)continue;
+                    if(next_report==begin+std::chrono::seconds(15) && !flights_.front().labels.empty()){
+                        // 只列第一次：卡住的著色器就在最前面批次的這份清單裡。
+                        std::string names;for(const auto& flight:flights_){names+=" || "+std::string(flight.command.label?flight.command.label.UTF8String:"?")+":"+std::to_string(static_cast<int>(flight.command.status));for(const auto& label:flight.labels)names+=" | "+hang_describe(label);}
+                        std::fprintf(stderr,"[metal-hang-labels] count=%zu%s\n",flights_.front().labels.size(),names.c_str());
+                    }
+                    next_report+=std::chrono::seconds(30);
+                    std::string report;for(const auto& flight:flights_)report+=" "+std::to_string(static_cast<int>(flight.command.status))+":"+(flight.command.label?flight.command.label.UTF8String:"?");
+                    std::fprintf(stderr,"[metal-hang] waited=%llds flights=%zu%s open=%s\n",static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-begin).count()),flights_.size(),report.c_str(),commands_?"yes":"no");std::fflush(stderr);
+                }
+            }
+            [command waitUntilCompleted];++wait_count_;
             wait_ns_+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count());
         }
-        if(command.status==MTLCommandBufferStatusError)throw std::runtime_error("Metal GPU command failed："+std::string(command.error.localizedDescription.UTF8String));
+        if(command.status==MTLCommandBufferStatusError){
+            std::string detail;
+            // 真正出錯的 encoder 不一定在最前面的命令緩衝；掃過所有在途批次，故障者排在最前面。
+            std::string faulted;
+            for(const auto& flight:flights_){
+                [flight.command waitUntilCompleted];
+                if(flight.command.status!=MTLCommandBufferStatusError)continue;
+                detail+=" {"+std::string(flight.command.label?flight.command.label.UTF8String:"?")+" code="+std::to_string(static_cast<long>(flight.command.error.code))+"}";
+                if(!flight.labels.empty()){
+                    std::string names;for(const auto& label:flight.labels)names+=" | "+hang_describe(label);
+                    std::fprintf(stderr,"[metal-fault-labels] %s count=%zu%s\n",flight.command.label?flight.command.label.UTF8String:"?",flight.labels.size(),names.c_str());
+                }
+                if(NSArray* encoders=flight.command.error.userInfo[MTLCommandBufferEncoderInfoErrorKey])for(id<MTLCommandBufferEncoderInfo> info in encoders){
+                    if(info.errorState==MTLCommandEncoderErrorStateFaulted)faulted+=" [faulted "+std::string(info.label?info.label.UTF8String:"?")+"]";
+                    else if(info.errorState==MTLCommandEncoderErrorStatePending)faulted+=" [pending "+std::string(info.label?info.label.UTF8String:"?")+"]";
+                }
+            }
+            throw std::runtime_error("Metal GPU command failed："+std::string(command.error.localizedDescription.UTF8String)+faulted+detail);
+        }
         flights_.pop_front();
     }
     void reap(){while(!flights_.empty() && flights_.front().command.status>=MTLCommandBufferStatusCompleted)retire_front(false);}
@@ -287,17 +379,30 @@ class MetalGl final:public NativeOpenGlContext {
         if(commands_){
             if(flights_.size()>=flight_limit_)retire_front(true);
             // 在 commit 之前配置追蹤節點；資源／額度保留至 GPU 完成，避免非同步重用。
-            flights_.emplace_back();auto& flight=flights_.back();flight.command=commands_;
+            flights_.emplace_back();auto& flight=flights_.back();flight.command=commands_;flight.labels=std::move(hang_labels_);hang_labels_.clear();
             flight.leases=std::move(pending_leases_);flight.objects=std::move(graphics_pending_);flight.textures=std::move(retired_textures_);retired_textures_.clear();
             // 完成旗標供 D3D11 事件查詢輪詢；回呼只寫旗標，不觸碰後端狀態。
             flight.done=commands_done_?std::move(commands_done_):std::make_shared<std::atomic<bool>>(false);commands_done_=nullptr;auto done=flight.done;
             flight.relays=commands_relays_?std::move(commands_relays_):std::make_shared<MetalFenceRelays>();commands_relays_=nullptr;auto relays=flight.relays;
             // GPU 忙碌時間累計供診斷（CPU／GPU 瓶頸判斷）；只讀命令緩衝時間戳，不觸碰後端狀態。
             auto gpu_ns=gpu_busy_ns_;
+            const std::string profile_key=metal_gpu_profile()?metal_gpu_profile_key(flight.labels):std::string{};
+            std::uint64_t profile_vertices=0;for(const auto& label:flight.labels)profile_vertices+=label.vertices;
+            id<MTLCounterSampleBuffer> profile_samples=hang_samples_;hang_samples_=nil;
             [commands_ addCompletedHandler:^(id<MTLCommandBuffer> buffer){
                 const auto start=buffer.GPUStartTime,end=buffer.GPUEndTime;
+                if(!profile_key.empty() && end>start){
+                    std::uint64_t vertex_ticks=0,fragment_ticks=0;
+                    if(profile_samples){NSData* resolved=[profile_samples resolveCounterRange:NSMakeRange(0,4)];
+                        if(resolved && resolved.length>=4*sizeof(MTLCounterResultTimestamp)){const auto* stamps=static_cast<const MTLCounterResultTimestamp*>(resolved.bytes);
+                            if(stamps[0].timestamp!=MTLCounterErrorValue && stamps[1].timestamp>stamps[0].timestamp)vertex_ticks=stamps[1].timestamp-stamps[0].timestamp;
+                            if(stamps[2].timestamp!=MTLCounterErrorValue && stamps[3].timestamp>stamps[2].timestamp)fragment_ticks=stamps[3].timestamp-stamps[2].timestamp;}}
+                    metal_gpu_profile_add(profile_key,end-start,profile_vertices,vertex_ticks,fragment_ticks);
+                }
                 if(end>start){gpu_ns->fetch_add(static_cast<std::uint64_t>((end-start)*1e9),std::memory_order_relaxed);metal_stall_note("gpu_command_buffer",static_cast<std::uint64_t>((end-start)*1e6));}
                 done->store(true,std::memory_order_release);relays->fire();}];
+            static const bool label_commands=std::getenv("X64ARM_METAL_LABELS")!=nullptr;
+            if(label_commands)commands_.label=[NSString stringWithFormat:@"%s#%llu",why,static_cast<unsigned long long>(submissions_)];
             if(commands_gpu_work_)track_gpu_commands(commands_);[commands_ commit];commands_=nil;pending_leases_.clear();graphics_pending_.clear();pending_=0;++submissions_;
             flight_peak_=std::max(flight_peak_,flights_.size());
         }
@@ -595,6 +700,9 @@ public:
     void graphics_capture(const GraphicsDraw&);
     void graphics_trace_dispatch(const GraphicsStage&,std::array<std::uint32_t,3>,const std::shared_ptr<GraphicsResource>&,std::uint32_t);
     void graphics_trace_upload(const char*,const GraphicsView&,std::span<const std::uint8_t>);
+    void graphics_trace_copy(const GraphicsView&,const GraphicsView&);
+    void graphics_trace_clear(const GraphicsView&,const std::array<std::uint32_t,4>&,bool);
+    void graphics_trace_dispatch_pre(const GraphicsStage&);
     void graphics_capture_present(const GraphicsView&);
     void graphics_export_frame(const GraphicsView&,void*,std::size_t,std::uint32_t,std::shared_ptr<void>)override;
     void graphics_flush(bool wait)override{flush(wait);}

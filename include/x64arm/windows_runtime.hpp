@@ -243,6 +243,10 @@ struct WaitObject {
 };
 // 單一程序的 handle 上限：Windows 每個程序最多 2^24（16,777,216）個 handle。
 inline constexpr std::size_t process_handle_limit=std::size_t{1}<<24;
+// 檔案類 handle 表（WindowsServices::files_）是否還放得下 needed 個新項目，同樣以單一程序 handle 上限為界。
+// 放不下時呼叫端回 ERROR_NOT_ENOUGH_MEMORY（8），與 wait 物件等其他 handle 表一致。
+[[nodiscard]] constexpr bool file_table_has_room(std::size_t current,std::size_t needed=1) noexcept {return current<=process_handle_limit && needed<=process_handle_limit-current;}
+static_assert(file_table_has_room(process_handle_limit-1) && !file_table_has_room(process_handle_limit) && file_table_has_room(process_handle_limit-2,2) && !file_table_has_room(process_handle_limit-1,2) && !file_table_has_room(process_handle_limit+1) && !file_table_has_room(0,process_handle_limit+1));
 // wait 物件 handle 表：沿用 std::map 介面，另外維護計時器 handle 索引。
 // 排程器每個時間片只需處理計時器；索引讓成本與計時器數量相關，而不是與全部 handle 數量相關。
 // kind 只在建立時設定（插入後不改變），因此由 emplace／erase 維護即可。

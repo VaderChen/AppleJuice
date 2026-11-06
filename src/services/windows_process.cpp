@@ -468,6 +468,7 @@ struct ProcessState {
     std::uint32_t identity{1}, parent{};
     struct CrtWait {std::uint64_t handle{},status{};bool cwait{};};
     std::map<std::uint64_t,CrtWait> crt_waits;
+    std::map<std::uint64_t,std::uint64_t> crt_pipes; // _popen 的 FILE* 對應子程序 handle。
     struct PssSnapshot {std::vector<std::uint8_t> process;std::array<std::uint64_t,12> performance{};std::uint64_t storage{};std::uint32_t flags{};bool vm{};};
     std::map<std::uint64_t,PssSnapshot> pss_snapshots;
 #if !defined(_WIN32)
@@ -1584,18 +1585,18 @@ std::string WindowsServices::process_diagnostics() const {
 }
 void WindowsServices::import_process_handles(const std::string &encoded) {
 #if !defined(_WIN32)
+    // 父程序傳來的清單不會觸發下列大小與描述符檢查，所以不另設項目上限：第 N 項放在描述符 199+N，
+    // create_guest_process 在描述符達到 OPEN_MAX 時不啟動子程序，最多 10040 項、每項最多 76 位元組，約 745 KiB。
     if (encoded.size() > 1024 * 1024)
         throw HostCallFault("繼承清單過大");
     std::istringstream stream(encoded);
     std::string row;
-    std::size_t count = 0;
     while (std::getline(stream, row, ';')) {
         std::replace(row.begin(), row.end(), ',', ' ');
         std::istringstream entry(row);
         InheritedHandle item;
         std::string extra;
-        if (++count > 4096 ||
-            !(entry >> item.handle >> item.type >> item.access >> item.flags >> item.mode >> item.pipe_mode >>
+        if (!(entry >> item.handle >> item.type >> item.access >> item.flags >> item.mode >> item.pipe_mode >>
               item.auxiliary >> item.descriptor) ||
             (entry >> extra) ||
             (item.type == 8 ? (item.handle < 0x100 || item.handle > 0x102) : item.handle < 0x1000) ||
@@ -2057,6 +2058,7 @@ std::span<const WindowsServiceDescriptor> process_service_descriptors() {
         {"crt","_execv",2},{"crt","_execve",3},{"crt","_execvp",2},{"crt","_execvpe",3},
         {"crt","_wexecv",2},{"crt","_wexecve",3},{"crt","_wexecvp",2},{"crt","_wexecvpe",3},
         {"crt","_cwait",3},{"crt","system",1},{"crt","_wsystem",1},
+        {"crt","_popen",2},{"crt","_wpopen",2},{"crt","_pclose",1},
         {"kernel32.dll", "DebugActiveProcess", 1},
         {"kernel32.dll", "DebugActiveProcessStop", 1},
         {"kernel32.dll", "WaitForDebugEvent", 2},
@@ -2813,38 +2815,43 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
                                 argv.push_back(item.data());
                             argv.push_back(nullptr);
                             posix_spawn_file_actions_t actions;
-                            ::posix_spawn_file_actions_init(&actions);
-                            if(passed_image.fd>=0){::posix_spawn_file_actions_adddup2(&actions,passed_image.fd,192);::posix_spawn_file_actions_addclose(&actions,passed_image.fd);}
-                            if(passed_startup.fd>=0){::posix_spawn_file_actions_adddup2(&actions,passed_startup.fd,193);::posix_spawn_file_actions_addclose(&actions,passed_startup.fd);}
-                            ::posix_spawn_file_actions_adddup2(&actions, passed_result, 198);
-                            ::posix_spawn_file_actions_addclose(&actions, passed_result);
+                            // 傳遞上限：libSystem 的 adddup2／addclose 對 >= OPEN_MAX（sys/syslimits.h 的 10240，不隨 RLIMIT_NOFILE 放寬）的描述符
+                            // 回 EBADF 且不加入動作（已呼叫本機 libSystem 核對）。忽略的話子程序少了描述符，會在匯入或啟動時中止，所以任一動作失敗就不啟動。
+                            // 繼承項目的來源放在目標 200+N 之上，最多約 5000 項（200+2N < 10240）；低位描述符被占用時更少，
+                            // 10240 以下全部占滿時連不繼承 handle 也無法建立子程序。
+                            int action_error = ::posix_spawn_file_actions_init(&actions);
+                            const auto add_close = [&](int descriptor) {
+                                if (!action_error)
+                                    action_error = ::posix_spawn_file_actions_addclose(&actions, descriptor);
+                            };
+                            const auto move_descriptor = [&](int descriptor, int destination) {
+                                if (!action_error)
+                                    action_error = ::posix_spawn_file_actions_adddup2(&actions, descriptor, destination);
+                                add_close(descriptor);
+                            };
+                            if(passed_image.fd>=0)move_descriptor(passed_image.fd,192);
+                            if(passed_startup.fd>=0)move_descriptor(passed_startup.fd,193);
+                            move_descriptor(passed_result, 198);
                             const auto transfer_target=[&](int fd){return (fd>=192 && fd<=198) ||
                                 (fd>=200 && static_cast<std::size_t>(fd-200)<passed.size());};
                             if (!transfer_target(pipes[0]))
-                                ::posix_spawn_file_actions_addclose(&actions, pipes[0]);
+                                add_close(pipes[0]);
                             if (!transfer_target(pipes[1]))
-                                ::posix_spawn_file_actions_addclose(&actions, pipes[1]);
-                            for (std::size_t i = 0; i < passed.size(); ++i) {
-                                ::posix_spawn_file_actions_adddup2(&actions, passed[i], static_cast<int>(200 + i));
-                                ::posix_spawn_file_actions_addclose(&actions, passed[i]);
-                            }
-                            ::posix_spawn_file_actions_adddup2(&actions, passed_environment, 195);
-                            ::posix_spawn_file_actions_addclose(&actions, passed_environment);
-                            ::posix_spawn_file_actions_adddup2(&actions, passed_session, 194);
-                            ::posix_spawn_file_actions_addclose(&actions, passed_session);
-                            ::posix_spawn_file_actions_adddup2(&actions, passed_token, 196);
-                            ::posix_spawn_file_actions_addclose(&actions, passed_token);
-                            if (passed_job >= 0) {
-                                ::posix_spawn_file_actions_adddup2(&actions, passed_job, 197);
-                                ::posix_spawn_file_actions_addclose(&actions, passed_job);
-                            }
+                                add_close(pipes[1]);
+                            for (std::size_t i = 0; i < passed.size(); ++i)
+                                move_descriptor(passed[i], static_cast<int>(200 + i));
+                            move_descriptor(passed_environment, 195);
+                            move_descriptor(passed_session, 194);
+                            move_descriptor(passed_token, 196);
+                            if (passed_job >= 0)
+                                move_descriptor(passed_job, 197);
                             // 子引擎與本程序是同一個已授權引擎。本程序已在 4 KiB 頁面時直接以相同頁面大小啟動子程序，
                             // 省去子程序啟動後再以 4 KiB 屬性重新 exec 一次（每個子程序約 15–25 ms）。
                             // 屬性不可用或帶屬性的啟動失敗時，退回原本的啟動方式，由子程序自行切換。
                             auto spawned = -1;
                             launch.event("spawn_begin");
 #if defined(__APPLE__) && defined(__aarch64__)
-                            if (::getpagesize() == 4096) {
+                            if (!action_error && ::getpagesize() == 4096) {
                                 using SetPages = int (*)(posix_spawnattr_t *);
                                 static const auto set_pages = reinterpret_cast<SetPages>(
                                     ::dlsym(RTLD_DEFAULT, "posix_spawnattr_set_4k_page_size_np"));
@@ -2857,7 +2864,9 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
                                 }
                             }
 #endif
-                            if (spawned)
+                            if (action_error)
+                                spawned = action_error;
+                            else if (spawned)
                                 spawned = ::posix_spawn(&child->pid, settings.engine.c_str(), &actions, nullptr,
                                                         argv.data(), environment.data());
                             if (!spawned)
@@ -2881,7 +2890,9 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
                             ::close(passed_environment);
                             if (spawned) {
                                 child->pid = -1;
-                                fail(spawned == ENOENT ? 2 : 5);
+                                // E2BIG：繼承清單加環境變數超過 kern.argmax；EBADF：描述符達到 OPEN_MAX。子程序尚未啟動，
+                                // 都回資源不足。這是本流程的慣例，不是 Windows 的查證結果。
+                                fail(spawned == ENOENT ? 2 : (spawned == E2BIG || spawned == ENOMEM || spawned == EBADF) ? 8 : 5);
                             } else {
                                 auto record = ProcessRecord::open(mapping_session(),
                                                                   static_cast<std::uint32_t>(child->pid), true);

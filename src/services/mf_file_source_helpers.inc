@@ -24,10 +24,14 @@ const auto file_source_create=[&](const std::shared_ptr<ByteStreamState>& stream
         require(!stream->closed,shutdown);require((stream->capabilities&5)==5,0xc00d36b2U);
         file=std::make_shared<FileSourceState>();file->file=stream->file;file->base=stream->position;
         const auto size=file->file->current_size();require(file->base<=size,0xc00d36c4U);
-        const auto parsed=parse_pcm_wave_stream(size-file->base,[&](std::uint64_t at,std::span<std::uint8_t> bytes){
+        const auto read=[&](std::uint64_t at,std::span<std::uint8_t> bytes){
             while(!bytes.empty()){const auto r=file->file->read(bytes,file->base+at);require(!r.error && r.bytes && r.bytes<=bytes.size(),sink_io_error(r.error?r.error:38));at+=r.bytes;bytes=bytes.subspan(r.bytes);}
-        });require(parsed.has_value(),0xc00d36c4U);file->wave=*parsed;
+        };
+        std::array<std::uint8_t,8> head{};if(size-file->base>=8)read(0,head);
+        if(mf::mp4_signature(head)){try{file->movie=mf::read_mp4_movie(size-file->base,read);}catch(const std::invalid_argument&){throw Failure{0xc00d36c4U};}}
+        else {const auto parsed=parse_pcm_wave_stream(size-file->base,read);require(parsed.has_value(),0xc00d36c4U);file->wave=*parsed;}
     }
+    if(file->movie){try{return movie_source_create(std::move(file),external);}catch(const std::invalid_argument&){throw Failure{0xc00d36c4U};}}
     const auto p=make(mf::Source),type=make(mf::MediaType),descriptor=make(mf::Stream),presentation=make(mf::Presentation);
     auto source=object(p,mf::Source);source->file_source=std::move(file);source->parent=external;hold(external);source->children={presentation};const auto& format=source->file_source->wave.format;
     auto native=object(type,mf::MediaType);set(*native,mf::MF_MT_MAJOR_TYPE,valueguid(mf::MFMediaType_Audio));set(*native,mf::MF_MT_SUBTYPE,valueguid(format.floating?mf::ieee:mf::pcm));
@@ -40,6 +44,8 @@ const auto source_from_byte_stream=[&](std::uint64_t pointer){
 };
 const auto reader_create=[&](std::uint64_t source_pointer,std::uint64_t options){
     auto source=object(source_pointer,mf::Source);require(!source->closed,shutdown);
+    // Reader 目前只讀取單串流 PCM；MP4 由 Media Session 自行解多工與解碼。
+    require(!source->file_source || !source->file_source->movie,0xc00d36c4U);
     // 先驗證選項，再建立持有來源的物件，錯誤不洩漏來源引用。
     std::shared_ptr<Object> attributes;if(options){attributes=entry(options).object;const auto cb=attributes->attributes.find(mf::MF_SOURCE_READER_ASYNC_CALLBACK);if(cb!=attributes->attributes.end())require(cb->second.type==13,type_error);}
     const auto p=make(mf::Reader);auto reader=object(p,mf::Reader);reader->parent=source_pointer;hold(source_pointer);reader->selected={true};reader->current_type=source_type(source);hold(reader->current_type);

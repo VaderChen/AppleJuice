@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_keyboard.hpp"
 #include "x64arm/windows_pointer.hpp"
+#include "x64arm/unicode.hpp"
 #include <algorithm>
 
 namespace x64arm {
@@ -9,9 +10,17 @@ namespace {
 // 注入觸控裝置的固定識別；不對應任何宿主硬體。
 constexpr input::Guid injected_touch_device{'x','6','4','a','r','m','-','t','o','u','c','h','-','i','n','j'};
 }
+// 系統預設、宿主輸入法與本程序載入的配置；GetKeyboardLayoutList、Activate／Load／Unload 共用同一份清單。
+std::vector<std::uint64_t> WindowsServices::keyboard_layouts() const {
+    std::vector<std::uint64_t> layouts{0x04090409};
+    const auto add=[&](std::uint64_t layout){if(std::find(layouts.begin(),layouts.end(),layout)==layouts.end())layouts.push_back(layout);};
+    if(native_gui_)for(const auto& method:native_input_methods())add(method.layout);
+    for(const auto layout:gui_.loaded_keyboard_layouts)add(layout);
+    return layouts;
+}
 std::span<const WindowsServiceDescriptor> user_session_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
-        {"user32.dll","LockWindowUpdate",1},{"user32.dll","ActivateKeyboardLayout",2},
+        {"user32.dll","LockWindowUpdate",1},{"user32.dll","ActivateKeyboardLayout",2},{"user32.dll","LoadKeyboardLayoutA",2},{"user32.dll","LoadKeyboardLayoutW",2},{"user32.dll","UnloadKeyboardLayout",1},
         {"user32.dll","InitializeTouchInjection",2},{"user32.dll","InjectTouchInput",2}
     };return table;
 }
@@ -47,11 +56,33 @@ std::optional<std::uint32_t> WindowsServices::invoke_user_session(GuestState& st
                 else if(gui_.update_lock && gui_.update_lock!=arg(0))fail(5); // 同時只允許鎖定一個視窗。
                 else {gui_.update_lock=arg(0);result=1;}
             }
+        }else if(symbol=="LoadKeyboardLayoutA" || symbol=="LoadKeyboardLayoutW"){
+            // KLID 是 8 位十六進位文字；低 16 位元為語言，高 16 位元為配置變體。沒有變體時 HKL 高低字相同。
+            const auto text=!arg(0)?std::u16string{}:symbol.back()=='W'?read_utf16(memory,GuestAddress{arg(0)},16):utf8_to_utf16(read_ansi(memory,arg(0),16));
+            std::uint32_t identifier=0;bool valid=text.size()==8;
+            for(const auto c:text){const int digit=c>=u'0' && c<=u'9'?c-u'0':c>=u'a' && c<=u'f'?c-u'a'+10:c>=u'A' && c<=u'F'?c-u'A'+10:-1;if(digit<0)valid=false;identifier=identifier*16+static_cast<unsigned>(digit<0?0:digit);}
+            if(!valid || !(identifier&0xffffU)){fail(87);arg.return_to(state,0);return std::nullopt;}
+            const std::uint64_t layout=(identifier>>16)?(UINT64_C(0xf000)+(identifier>>16))<<16|(identifier&0xffffU):(identifier&0xffffU)*UINT64_C(0x10001);
+            const auto known=keyboard_layouts();
+            if(std::find(known.begin(),known.end(),layout)==known.end())gui_.loaded_keyboard_layouts.push_back(layout);
+            const auto flags=u32(1);
+            if(flags&1U)(void)nested_service(state,memory,"user32.dll","ActivateKeyboardLayout",{layout,flags&0x108U}); // KLF_ACTIVATE
+            result=layout;
+        }else if(symbol=="UnloadKeyboardLayout"){
+            const auto mask=x86_?UINT64_C(0xffffffff):UINT64_MAX;const auto layout=arg(0)&mask;
+            const auto known=keyboard_layouts();
+            if(std::find(known.begin(),known.end(),layout)==known.end())fail(87);
+            else{
+                // 系統與宿主輸入法的配置一直存在；只卸載本程序載入的配置，並還原已選用它的執行緒。
+                std::erase(gui_.loaded_keyboard_layouts,layout);
+                if(gui_.process_keyboard_layout==layout)gui_.process_keyboard_layout=0;
+                std::erase_if(gui_.thread_keyboard_layouts,[&](const auto& item){return item.second==layout;});
+                result=1;
+            }
         }else if(symbol=="ActivateKeyboardLayout"){
             const auto flags=u32(1);
             if(flags&~(0x8U|0x100U|0x10000U|0x40000000U)){fail(87);arg.return_to(state,0);return std::nullopt;} // KLF_REORDER、SETFORPROCESS、SHIFTLOCK、RESET
-            std::vector<std::uint64_t> layouts{0x04090409};
-            if(native_gui_)for(const auto& method:native_input_methods())if(std::find(layouts.begin(),layouts.end(),method.layout)==layouts.end())layouts.push_back(method.layout);
+            const auto layouts=keyboard_layouts();
             auto current=selected_keyboard_layout(threads_.current);
             if(!current){current=0x04090409;if(native_gui_)for(const auto& method:native_input_methods())if(method.current){current=method.layout;break;}}
             const auto mask=x86_?UINT64_C(0xffffffff):UINT64_MAX;auto target=arg(0)&mask;

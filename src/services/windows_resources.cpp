@@ -95,7 +95,7 @@ std::uint32_t display_config_call(GuestMemory& memory,const WindowsCall& arg,std
         memory.read(GuestAddress{arg(0)},std::span(bytes).first(20));
         if(type==1){const auto name=utf16_bytes(u"\\\\.\\DISPLAY1");std::copy(name.begin(),name.end(),bytes.begin()+20);}
         else if(type==2){
-            // 沒有 EDID／可開啟的 Windows PnP 路徑；名稱由虛擬顯示器指定。
+            // DisplayConfig 尚未接上監視器共用身分（display_identity）：monitorDevicePath 留空、edidIdsValid＝0，名稱由虛擬顯示器指定。
             display_put(bytes,20,2);display_put(bytes,24,UINT32_MAX);
             const auto name=utf16_bytes(u"x64arm Virtual Monitor");std::copy(name.begin(),name.end(),bytes.begin()+36);
         }else if(type==3){display_put(bytes,20,display_width);display_put(bytes,24,display_height);display_signal(bytes,32);}
@@ -503,17 +503,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
         // lpDevice 為 NULL 時依 iDevNum 列舉各顯示器的轉接輸出 \\.\DISPLAYn；指定裝置時回報其唯一的監視器。
         const auto& monitors=gui_monitors();const auto adapter=device.empty()?0:display_device_index(device);
         if(!arg(2) || (d(3)&~1U))fail(87);
-        else if(d(3)&1U)fail(50); // 沒有可開啟的 PnP 裝置介面路徑。
         else if(device.empty()?d(1)>=monitors.size():(!adapter || adapter>monitors.size() || d(1)))result=0;
         else if(memory.load(GuestAddress{arg(2)},32)!=size)fail(87);
         else {const auto index=device.empty()?std::uint64_t{d(1)}+1:adapter;const auto name=u"\\\\.\\DISPLAY"+utf8_to_utf16(std::to_string(index));
             memory.write(GuestAddress{arg(2)},std::vector<std::uint8_t>(size));memory.store(GuestAddress{arg(2)},32,size);
             (void)copy_text(arg(2)+4,32,device.empty()?name:name+u"\\Monitor0");
-            (void)copy_text(arg(2)+4+32*stride,128,device.empty()?u"x64arm Virtual Display":u"x64arm Virtual Monitor");
+            (void)copy_text(arg(2)+4+32*stride,128,device.empty()?u"x64arm Virtual Display":display_identity::monitor_name);
             // DISPLAY_DEVICE_ATTACHED_TO_DESKTOP＝1、PRIMARY_DEVICE＝4；監視器為 ACTIVE｜ATTACHED＝3。
             memory.store(GuestAddress{arg(2)+4+160*stride},32,device.empty()?(monitors[index-1].primary?5U:1U):3U);
-            (void)copy_text(arg(2)+8+160*stride,128,device.empty()?display_identity::instance:u"X64ARM\\MONITOR");
-            if(device.empty())(void)copy_text(arg(2)+8+288*stride,128,std::u16string(u"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Class\\")+std::u16string(display_identity::class_name)+u"\\0000");result=1;}
+            // 監視器身分與 SetupAPI／CM 的 devnode 共用。EDD_GET_DEVICE_INTERFACE_NAME：DeviceID 改放裝置介面路徑，可接 SetupAPI。
+            const auto monitor_number=static_cast<std::uint32_t>(index);const bool interface_name=(d(3)&1U)!=0;
+            (void)copy_text(arg(2)+8+160*stride,128,device.empty()?std::u16string(interface_name?display_identity::adapter_interface_path:display_identity::instance):
+                interface_name?display_identity::monitor_interface_path(monitor_number):display_identity::monitor_device_id(monitor_number));
+            (void)copy_text(arg(2)+8+288*stride,128,device.empty()?std::u16string(u"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Class\\")+std::u16string(display_identity::class_name)+u"\\0000":display_identity::monitor_device_key(monitor_number));result=1;}
     }else if(symbol=="ChangeDisplaySettingsA" || symbol=="ChangeDisplaySettingsW" || symbol=="ChangeDisplaySettingsExA" || symbol=="ChangeDisplaySettingsExW"){
         const bool extended=symbol.starts_with("ChangeDisplaySettingsEx");const auto mode=arg(extended?1:0);const auto flags=d(extended?3:1);
         const auto native=native_gui_?native_gui_->current_display_mode():std::optional<GuiDisplayMode>{};

@@ -8,8 +8,22 @@
 #include "x64arm/shared_wake.hpp"
 #include "x64arm/startup_profile.hpp"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <string_view>
 
 namespace x64arm {
+namespace {
+// 管道建立失敗的診斷，預設輸出供事後判讀。未設定 X64ARM_TRACE_PIPE_CREATE 時只略過具名管道路徑的輪詢常態
+// （CreateFile／CreateNamedPipe 的 2、5、231）；CreatePipe 沒有輪詢常態，任何失敗都輸出。
+// 設為 0 全部關閉，設為其他值連輪詢常態也輸出。
+void trace_pipe_create_failure(std::uint32_t pid,std::string_view api,std::uint32_t error,std::size_t files){
+    static const char* const setting=std::getenv("X64ARM_TRACE_PIPE_CREATE");
+    if(setting && setting[0]=='0' && !setting[1])return;
+    if(!setting && api!="CreatePipe" && (error==2 || error==5 || error==231))return;
+    std::fprintf(stderr,"[pipe_create_failure] pid=%u api=%.*s error=%u files=%zu\n",pid,static_cast<int>(api.size()),api.data(),error,files);
+}
+}
 std::uint32_t WindowsServices::file_io_status(std::uint32_t error) {
     switch (error) {
     case 1: return 0xc0000010;
@@ -536,8 +550,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
             fail(87);
         else if (!runtime_.network.external_io)
             fail(50);
-        else if (files_.size() > 1022)
-            fail(4);
+        else if (!file_table_has_room(files_.size(), 2))
+            fail(8);
         else {
             const auto first = runtime_.allocate_wait_handle(), second = runtime_.allocate_wait_handle();
             try {
@@ -581,6 +595,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
                     runtime_.handle_flags.erase(id);
                 }
         }
+        if (!result)
+            trace_pipe_create_failure(process_id(), symbol, last_error_, files_.size());
     } else if (symbol.starts_with("CreateNamedPipe") || symbol.starts_with("CreateFile")) {
         const bool server = symbol.starts_with("CreateNamedPipe");
         NamedPipe::Opened opened;
@@ -597,8 +613,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
                 opened.error = 87;
             else if (!runtime_.network.external_io)
                 opened.error = 50;
-            else if (files_.size() >= 1024)
-                opened.error = 4;
+            else if (!file_table_has_room(files_.size()))
+                opened.error = 8;
             else if (server && (u32(1) & ~0xc10c0003U))
                 opened.error = 87;
             else if (rights & 0x1000000U)
@@ -648,6 +664,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
             opened.error = 8;
         }
         if (opened.error) {
+            trace_pipe_create_failure(process_id(), symbol, opened.error, files_.size());
             last_error_ = opened.error;
             result = x86_ ? UINT32_MAX : UINT64_MAX;
         } else {

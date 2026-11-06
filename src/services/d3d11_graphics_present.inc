@@ -88,8 +88,8 @@
                 static const bool trace_stats=[] {const auto* value=std::getenv("X64ARM_TRACE_GRAPHICS_STATS");return value && std::string_view(value)=="1";}();
                 if(trace_stats && swap->frames%600==0){
                     std::string creations;for(const auto& [name,count]:bridge.resource_creations)creations+=name+":"+std::to_string(count)+",";
-                    std::fprintf(stderr,"[d3d11_metal] frames=%llu draws=%llu d3d11_resource_creations=%s %s\n",static_cast<unsigned long long>(bridge.graphics_frames),
-                        static_cast<unsigned long long>(bridge.graphics_draws),creations.empty()?"none":creations.c_str(),producer->statistics().c_str());
+                    std::fprintf(stderr,"[d3d11_metal] frames=%llu draws=%llu draw_cache_full=%llu draw_cache_incremental=%llu destroyed_objects=%llu setter_front_hits=%llu setter_front_fallbacks=%llu draw_front_hits=%llu draw_front_fallbacks=%llu d3d11_resource_creations=%s %s\n",static_cast<unsigned long long>(bridge.graphics_frames),
+                        static_cast<unsigned long long>(bridge.graphics_draws),static_cast<unsigned long long>(bridge.draw_cache_full),static_cast<unsigned long long>(bridge.draw_cache_incremental),static_cast<unsigned long long>(bridge.destroyed_objects),static_cast<unsigned long long>(bridge.setter_front_hits),static_cast<unsigned long long>(bridge.setter_front_fallbacks),static_cast<unsigned long long>(bridge.draw_front_hits),static_cast<unsigned long long>(bridge.draw_front_fallbacks),creations.empty()?"none":creations.c_str(),producer->statistics().c_str());
                 }
                 graphics_close_after_present(swap->window,swap->frames,[&](std::uint64_t target){if(!gui_.windows.contains(target))return false;enqueue_gui_message({target,0,0,0x10});return true;});
             }

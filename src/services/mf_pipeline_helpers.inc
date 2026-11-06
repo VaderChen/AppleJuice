@@ -35,6 +35,7 @@ const auto object_shutdown=[&](const std::shared_ptr<Object>& target){
     for(const auto p:target->events)release(p);target->events.clear();release(target->callback);release(target->state);target->callback=0;
     // MediaSource／MediaStream 的互持引用只在 Shutdown 後解除。
     if(target->kind==mf::Source && target->state && bridge.objects.contains(target->state)){auto stream=entry(target->state).object;const auto source=stream->parent;stream->parent=0;stream->closed=true;release(source);}target->state=0;
+    if(target->kind==mf::Source){auto streams=std::move(target->media_streams);target->media_streams.clear();for(const auto p:streams){auto stream=object(p,mf::MediaStream);const auto source=stream->parent;stream->parent=0;stream->closed=true;release(source);release(p);}}
 };
 close_source=[&](const std::shared_ptr<Object>& source){if(!source->closed)object_shutdown(source);};
 const auto queue_event=[&](const std::shared_ptr<Object>& target,std::uint32_t type,Value value=Value{},std::uint32_t status=0){

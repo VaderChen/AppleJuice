@@ -72,7 +72,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_serial(GuestState& state,Gu
             if(!number || d(2) || d(4)!=3 || arg(6) || !(d(1)&0xc0000000U) || (d(1)&~0xc0000000U) || (d(5)&~0x40000080U))error(87);
             else if(security.error)error(security.error);
             else if(!runtime_.network.external_io)error(50);
-            else if(files_.size()>=1024)error(4);
+            else if(!file_table_has_room(files_.size()))error(8);
             else {
                 scan_serial_ports();
                 const auto key="COM"+std::to_string(*number);const auto found=serial_ports_.find(*number);

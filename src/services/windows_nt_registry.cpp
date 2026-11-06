@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/registry_store.hpp"
 #include "processor_registry.hpp"
+#include "vc_runtime_registry.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/unicode.hpp"
 #include "registry_native_status.hpp"
@@ -30,6 +31,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_registry(GuestState& sta
     const bool readonly=symbol.starts_with("NtOpen") || symbol.starts_with("NtQuery") || symbol.starts_with("NtEnumerate") || symbol=="NtFlushKey";
     RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_,readonly);if(transaction.error)return finish(native_io_error(transaction.error));
     refresh_processor_registry(registry,memory.processor_count(),guest_processor_information(memory));
+    refresh_vc_runtime_registry(registry);
     initialize_registry_views(registry);
     poll_registry_notifications(false,{},0,&memory);bool changed=false;std::vector<std::pair<std::u16string,std::uint32_t>> mutations;
     const auto original=registry_file_.empty() || readonly?RegistryState{}:registry;

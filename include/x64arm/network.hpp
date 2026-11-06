@@ -172,6 +172,8 @@ struct NetworkState {
     std::map<std::uint64_t,std::pair<std::uint64_t,std::uint32_t>> completion_errors;
 
     bool external_io{true};
+    std::set<std::uint64_t> icmp_handles;
+    std::uint64_t next_icmp_handle{0x71000000};
     std::shared_ptr<NetworkConfiguration> configuration{std::make_shared<NetworkConfiguration>()};
     std::uint32_t startups{};
     std::uint64_t next_socket{0x90000};

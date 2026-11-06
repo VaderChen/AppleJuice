@@ -3,10 +3,12 @@ else if(name.starts_with("V_")){
     if(name=="V_ActivateObject"){
         out(arg(2));if(!item->result_object){
             if(item->identifier==1 || item->identifier==3){require(item->identifier==3?video::hardware_encode_supported(video::Codec::H264):video::hardware_decode_supported(video::Codec::H264),0xc00d3704U);const auto p=make(mf::Transform);auto transform=object(p,mf::Transform);transform->identifier=item->identifier;transform->attribute_store=make(mf::Attributes);transform->input_attributes=make(mf::Attributes);transform->output_attributes=make(mf::Attributes);set(*object(transform->attribute_store,mf::Attributes),mf::MF_TRANSFORM_ASYNC,value32(1));item->result_object=p;}
-            else if(item->identifier==2)item->result_object=source_create(*item);else throw Failure{invalid};
+            else if(item->identifier==2)item->result_object=source_create(*item);
+            else if(item->identifier==4 || item->identifier==5)throw Failure{0x80004001U}; // sink 只在 Media Session 拓撲內啟用，尚未提供獨立 IMFMediaSink。
+            else throw Failure{invalid};
         }query(item->result_object,guid(arg(1)),arg(2));
     }else if(name=="V_DetachObject"){release(item->result_object);item->result_object=0;}
-    else if(name=="V_ShutdownObject"){if(item->result_object){auto target=entry(item->result_object).object;if(!target->closed)object_shutdown(target);release(item->result_object);item->result_object=0;}}
+    else if(name=="V_ShutdownObject"){if(item->identifier==4 && !item->closed){item->closed=true;if(item->callback)callbacks.push_back({foreign_method(item->callback,mf::sink_shutdown),{item->callback}});}if(item->result_object){auto target=entry(item->result_object).object;if(!target->closed)object_shutdown(target);release(item->result_object);item->result_object=0;}}
 }else if(name.starts_with("Z_")){
     require(item->kind==mf::Transform,no_interface);
     if(name=="Z_Shutdown")object_shutdown(item);
@@ -108,12 +110,13 @@ else if(name.starts_with("V_")){
     if(name=="C_GetCharacteristics")put(arg(1),item->file_source?6:5);
     else if(name=="C_CreatePresentationDescriptor"){
         out(arg(1));const auto original=object(item->children.at(0),mf::Presentation);const auto p=make(mf::Presentation);auto clone=object(p,mf::Presentation);clone->children=original->children;clone->selected=original->selected;for(const auto child:clone->children)hold(child);for(const auto& [key,value]:original->attributes)set(*clone,key,value);put(arg(1),p,bits);
-    }else if(name=="C_Start"){
+    }else if(name=="C_Start" && item->file_source && item->file_source->movie)movie_source_start(item,arg(1),arg(2),arg(3));
+    else if(name=="C_Start"){
         const auto presentation=object(arg(1),mf::Presentation);require(presentation->children.size()==1 && presentation->selected.at(0),0xc00d36b2U);require(!arg(2) || guid(arg(2))==Guid{},0xc00d36c5U);const auto position=read_value(arg(3));require(position.type==0 || (position.type==20 && std::bit_cast<std::int64_t>(position.scalar)>=0 && (item->file_source || position.scalar==0)),0xc00d36b2U);
         source_start(item);if(!item->state){const auto p=make(mf::MediaStream);auto stream=object(p,mf::MediaStream);stream->parent=item->pointers.at(mf::Source);hold(stream->parent);stream->children={presentation->children.at(0)};hold(stream->children.at(0));item->state=p;Value value;value.type=13;value.scalar=p;queue_event(item,205,value);}else {Value value;value.type=13;value.scalar=item->state;queue_event(item,206,value);}
         if(item->file_source && position.type==20){const auto& wave=item->file_source->wave;const auto frame=static_cast<__uint128_t>(position.scalar)*wave.format.rate/10000000U;object(item->state,mf::MediaStream)->read_frames=static_cast<std::uint64_t>(std::min<__uint128_t>(frame,wave.bytes/wave.format.align));}
         queue_event(item,201);queue_event(object(item->state,mf::MediaStream),202);
-    }else if(name=="C_Stop" || name=="C_Pause"){require(item->streaming,0xc00d3e82U);source_stop(item);queue_event(item,name=="C_Stop"?207:209);if(item->state)queue_event(object(item->state,mf::MediaStream),name=="C_Stop"?208:210);}
+    }else if(name=="C_Stop" || name=="C_Pause"){require(item->streaming,0xc00d3e82U);source_stop(item);queue_event(item,name=="C_Stop"?207:209);if(item->state)queue_event(object(item->state,mf::MediaStream),name=="C_Stop"?208:210);for(const auto p:item->media_streams)queue_event(object(p,mf::MediaStream),name=="C_Stop"?208:210);}
     else if(name=="C_Shutdown")object_shutdown(item);
 }else if(name.starts_with("W_")){
     require(item->kind==mf::MediaStream,no_interface);require(!item->closed,shutdown);

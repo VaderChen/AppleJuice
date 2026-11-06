@@ -13,7 +13,10 @@
 #include "monotonic_clock.hpp"
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -299,6 +302,8 @@ void WindowsServices::pump_gui_network(std::uint64_t only){
 std::span<const WindowsServiceDescriptor> network_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
         {"iphlpapi.dll","GetAdaptersAddresses",5},
+        {"iphlpapi.dll","GetCurrentThreadCompartmentId",0},{"iphlpapi.dll","SetCurrentThreadCompartmentId",1},
+        {"iphlpapi.dll","IcmpCreateFile",0},{"iphlpapi.dll","IcmpCloseHandle",1},{"iphlpapi.dll","IcmpSendEcho",8},{"iphlpapi.dll","IcmpParseReplies",2},
         {"iphlpapi.dll","GetExtendedTcpTable",6,0,0,60},{"iphlpapi.dll","GetTcpTable",3,0,0,4},
         {"iphlpapi.dll","GetAdaptersInfo",2},{"iphlpapi.dll","GetNetworkParams",2},
         {"iphlpapi.dll","GetIpAddrTable",3},
@@ -370,6 +375,78 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
     if(service.symbol=="ConnectEx" || service.symbol=="DisconnectEx" || service.symbol=="TransmitFile")return invoke_socket_io(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;auto& network=runtime_.network;
     const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
+    // 只有預設網路隔離艙（compartment 1）。
+    if(symbol=="GetCurrentThreadCompartmentId"){arg.return_to(state,1);return std::nullopt;}
+    if(symbol=="SetCurrentThreadCompartmentId"){arg.return_to(state,static_cast<std::uint32_t>(arg(0))==1?0U:87U);return std::nullopt;}
+    if(symbol.starts_with("Icmp")){
+        std::uint64_t result=0;
+        const auto handle_error=[&](std::uint32_t code){last_error_=code;};
+        if(symbol=="IcmpCreateFile"){
+            if(!network.external_io){handle_error(65);arg.return_to(state,x86_?UINT64_C(0xffffffff):UINT64_MAX);return std::nullopt;}
+            result=network.next_icmp_handle+=4;network.icmp_handles.insert(result);
+        }else if(symbol=="IcmpCloseHandle"){
+            if(network.icmp_handles.erase(arg(0)))result=1;else handle_error(6);
+        }else if(symbol=="IcmpParseReplies"){
+            // IcmpSendEcho 已填好回覆；回傳回覆筆數，失敗狀態寫在第一筆的 Status。
+            result=arg(0) && memory.load(GuestAddress{arg(0)+4},32)==0?1U:0U;
+            if(!result && arg(0))handle_error(static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+4},32)));
+        }else{
+            // ICMP_ECHO_REPLY：x64 為 40 bytes、Win32 為 28 bytes；資料接在結構之後。
+            const auto reply=arg(5);const auto request_size=static_cast<std::uint32_t>(arg(3))&0xffffU,reply_size=static_cast<std::uint32_t>(arg(6)),timeout=static_cast<std::uint32_t>(arg(7));
+            const std::uint32_t header=x86_?28U:40U;
+            if(!network.icmp_handles.contains(arg(0)))handle_error(6);
+            else if(!reply || reply_size<header+request_size+8)handle_error(122);
+            else{
+                std::vector<std::uint8_t> packet(8+request_size);
+                packet[0]=8;
+                static std::uint16_t sequence=0;const auto serial=++sequence;
+                const auto identifier=static_cast<std::uint16_t>(process_id());
+                packet[4]=static_cast<std::uint8_t>(identifier>>8);packet[5]=static_cast<std::uint8_t>(identifier);packet[6]=static_cast<std::uint8_t>(serial>>8);packet[7]=static_cast<std::uint8_t>(serial);
+                if(request_size)memory.read(GuestAddress{arg(2)},std::span<std::uint8_t>(packet).subspan(8));
+                std::uint32_t sum=0;for(std::size_t i=0;i+1<packet.size();i+=2)sum+=static_cast<std::uint32_t>(packet[i]<<8|packet[i+1]);
+                if(packet.size()&1U)sum+=static_cast<std::uint32_t>(packet.back())<<8;
+                while(sum>>16)sum=(sum&0xffffU)+(sum>>16);
+                sum=~sum&0xffffU;packet[2]=static_cast<std::uint8_t>(sum>>8);packet[3]=static_cast<std::uint8_t>(sum);
+                const int descriptor=::socket(AF_INET,SOCK_DGRAM,IPPROTO_ICMP);
+                std::uint32_t status=11050; // IP_GENERAL_FAILURE
+                std::uint32_t round_trip=0,reply_bytes=0,from=0;unsigned time_to_live=64;
+                std::vector<std::uint8_t> received(65536);std::size_t data_offset=0;
+                if(descriptor>=0){
+                    if(arg(4)){const int ttl=static_cast<int>(memory.load(GuestAddress{arg(4)},8));if(ttl)(void)::setsockopt(descriptor,IPPROTO_IP,IP_TTL,&ttl,sizeof ttl);}
+                    sockaddr_in target{};target.sin_len=sizeof target;target.sin_family=AF_INET;target.sin_addr.s_addr=static_cast<std::uint32_t>(arg(1));
+                    const auto started=std::chrono::steady_clock::now();
+                    if(::sendto(descriptor,packet.data(),packet.size(),0,reinterpret_cast<const sockaddr*>(&target),sizeof target)>=0){
+                        // 等待回應期間只佔用這個服務呼叫，時間由呼叫端的逾時限制。
+                        status=11010; // IP_REQ_TIMED_OUT
+                        pollfd waiter{descriptor,POLLIN,0};
+                        if(::poll(&waiter,1,static_cast<int>(std::min<std::uint32_t>(timeout,INT32_MAX)))>0){
+                            sockaddr_in source{};socklen_t source_size=sizeof source;
+                            const auto count=::recvfrom(descriptor,received.data(),received.size(),0,reinterpret_cast<sockaddr*>(&source),&source_size);
+                            if(count>=8){
+                                const std::size_t skip=(received[0]>>4)==4?static_cast<std::size_t>(received[0]&15U)*4:0;
+                                if(skip+8<=static_cast<std::size_t>(count) && received[skip]==0){
+                                    if(skip)time_to_live=received[8];
+                                    data_offset=skip+8;reply_bytes=static_cast<std::uint32_t>(count-static_cast<ssize_t>(data_offset));status=0;from=source.sin_addr.s_addr;
+                                    round_trip=static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count());
+                                }else if(skip+8<=static_cast<std::size_t>(count))status=received[skip]==3?11003:11013; // 目的不可達／TTL 過期
+                            }
+                        }
+                    }
+                    ::close(descriptor);
+                }
+                memory.check(GuestAddress{reply},reply_size,Access::Write);
+                const auto data=reply+header;const auto stored=std::min<std::uint32_t>(reply_bytes,reply_size-header);
+                memory.store(GuestAddress{reply},32,from);memory.store(GuestAddress{reply+4},32,status);memory.store(GuestAddress{reply+8},32,round_trip);
+                memory.store(GuestAddress{reply+12},16,stored);memory.store(GuestAddress{reply+14},16,1);
+                memory.store(GuestAddress{reply+16},bits,data);
+                const auto options=reply+16+unit;
+                memory.store(GuestAddress{options},8,time_to_live);memory.store(GuestAddress{options+1},8,0);memory.store(GuestAddress{options+2},8,0);memory.store(GuestAddress{options+3},8,0);memory.store(GuestAddress{options+unit},bits,0);
+                if(stored)memory.write(GuestAddress{data},std::vector<std::uint8_t>(received.begin()+static_cast<std::ptrdiff_t>(data_offset),received.begin()+static_cast<std::ptrdiff_t>(data_offset+stored)));
+                if(status)handle_error(status);else result=1;
+            }
+        }
+        arg.return_to(state,result);return std::nullopt;
+    }
     if(symbol=="WSAIoctl" && multicast_filter_ioctl(static_cast<std::uint32_t>(arg(1))))return invoke_socket_io(state,memory,service);
     if(symbol=="send" || symbol=="sendto" || symbol=="WSASend" || symbol=="WSASendTo" || symbol=="WSASendMsg")if(const auto socket=network.sockets.find(arg(0));network.startups && socket!=network.sockets.end() && socket->second->send_shutdown){last_error_=10058;arg.return_to(state,UINT32_MAX);return std::nullopt;}
     if(symbol=="WSASendMsg"){const auto socket=network.sockets.find(arg(0));if(socket!=network.sockets.end() && socket->second->overlapped && arg(4))return invoke_socket_io(state,memory,service);}

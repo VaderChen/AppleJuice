@@ -32,6 +32,11 @@ struct StreamAbi {
     std::uint32_t int_mask()const{return element==1?UINT32_MAX:0xffffU;}
     std::uint8_t character_bits()const{return static_cast<std::uint8_t>(element*8);}
 };
+// STL 的 C 匯出名稱不含類別字樣，由此併入 VC10／VC14 共用流程。
+inline bool c_export(std::string_view name){
+    return name=="_Cosh" || name=="_LCosh" || name=="_FCosh" || name=="_Sinh" || name=="_LSinh" || name=="_FSinh" || name=="_Exp" || name=="_LExp" || name=="_FExp" ||
+        name=="_Dtest" || name=="_LDtest" || name=="_FDtest" || name=="_Getctype" || name=="_Getcvt" || name=="_Lock_shared_ptr_spin_lock" || name=="_Unlock_shared_ptr_spin_lock";
+}
 inline bool modern(const WindowsServiceDescriptor& service){return service.family=="msvcp140.dll" || service.family=="internal-msvcp140";}
 inline unsigned element(const WindowsServiceDescriptor& service){
     if(service.family=="internal-msvcp90")return 1U;
