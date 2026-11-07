@@ -68,7 +68,7 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
         {"advapi32.dll","RegDeleteKeyA",2},{"advapi32.dll","RegDeleteKeyW",2},
         {"advapi32.dll","RegDeleteKeyExA",4,0,0,0xc},{"advapi32.dll","RegDeleteKeyExW",4,0,0,0xc},
         {"advapi32.dll","RegDeleteTreeA",2},{"advapi32.dll","RegDeleteTreeW",2},
-        {"shlwapi.dll","SHGetValueA",6},{"shlwapi.dll","SHGetValueW",6},
+        {"shlwapi.dll","SHGetValueA",6},{"shlwapi.dll","SHGetValueW",6},{"shlwapi.dll","SHRegGetUSValueA",8},{"shlwapi.dll","SHRegGetUSValueW",8},
         {"shlwapi.dll","SHDeleteKeyA",2},{"shlwapi.dll","SHDeleteKeyW",2},
         {"advapi32.dll","RegNotifyChangeKeyValue",5,0,0,0x16},{"advapi32.dll","RegCloseKey",1},
         {"advapi32.dll","RegFlushKey",1},
@@ -189,6 +189,32 @@ std::u16string WindowsServices::registry_current_user_path(bool cached){
     return path;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    // SHRegGetUSValue：先查 HKCU（除非要求略過）、再查 HKLM，都沒有才用預設資料；查詢沿用 SHGetValue 的完整語義。
+    // 參數放進呼叫框架（x64 的第 5、6 個與 Win32 的堆疊槽都屬於被呼叫端），在狀態副本上執行，不影響真正的返回。
+    if(service.symbol=="SHRegGetUSValueA" || service.symbol=="SHRegGetUSValueW"){
+        static constexpr WindowsServiceDescriptor shell_a{"shlwapi.dll","SHGetValueA",6},shell_w{"shlwapi.dll","SHGetValueW",6};
+        const WindowsCall arg(state,memory,service);
+        const auto subkey=arg(0),value=arg(1),type=arg(2),data=arg(3),size=arg(4),fallback=arg(6);
+        const bool ignore_user=static_cast<std::uint32_t>(arg(5))!=0;const auto fallback_size=static_cast<std::uint32_t>(arg(7));
+        std::uint32_t capacity=0;
+        if(size){memory.check(GuestAddress{size},4,Access::Write);capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{size},32));}
+        const auto query=[&](std::uint32_t root){
+            if(size)memory.store(GuestAddress{size},32,capacity);
+            GuestState probe=state;const auto sp=state.reg(Gpr::Rsp);
+            if(x86_){const std::array<std::uint64_t,6> values{root,subkey,value,type,data,size};for(unsigned i=0;i<6;++i)memory.store(GuestAddress{sp+4+i*4},32,values[i]);}
+            else{probe.reg(Gpr::Rcx)=UINT64_C(0xffffffff00000000)|root;probe.reg(Gpr::Rdx)=subkey;probe.reg(Gpr::R8)=value;probe.reg(Gpr::R9)=type;memory.store(GuestAddress{sp+0x28},64,data);memory.store(GuestAddress{sp+0x30},64,size);}
+            if(invoke_registry(probe,memory,service.symbol.ends_with("W")?shell_w:shell_a))throw std::logic_error("SHGetValue 意外終止客體");
+            return static_cast<std::uint32_t>(probe.reg(Gpr::Rax));
+        };
+        auto result=ignore_user?2U:query(0x80000001U);
+        if(result==2)result=query(0x80000002U);
+        if(result==2 && fallback && fallback_size && size){
+            const auto count=std::min(capacity,fallback_size);std::vector<std::uint8_t> bytes(count);
+            memory.read(GuestAddress{fallback},bytes);if(count){memory.check(GuestAddress{data},count,Access::Write);memory.write(GuestAddress{data},bytes);}
+            memory.store(GuestAddress{size},32,count);result=0;
+        }
+        arg.return_to(state,result);return std::nullopt;
+    }
     // 僅登錄 API 家族保留原生堆疊讓出 I/O；其他 consumer 在共同入口等待 store 門閂。
     RegistryIoScope io([&](const auto& work){await_registry_io(state,memory,work);});
     if(service.symbol=="NtApphelpCacheControl" || service.symbol=="ZwApphelpCacheControl"){

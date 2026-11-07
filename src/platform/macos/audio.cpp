@@ -1,4 +1,5 @@
 #include "x64arm/audio.hpp"
+#include "audio_capture.hpp"
 #include "audio_device.hpp"
 #include <AudioUnit/AudioUnit.h>
 #include <CoreAudio/CoreAudio.h>
@@ -22,6 +23,7 @@ class CoreAudioOutput final : public Output {
     const bool trace_enabled_=std::getenv("X64ARM_TRACE_AUDIO")!=nullptr;
     std::unique_ptr<std::array<TraceWindow,512>> trace_=trace_enabled_?std::make_unique<std::array<TraceWindow,512>>():nullptr;
     TraceWindow trace_current_{};std::uint64_t trace_count_{},trace_frames_{};
+    std::unique_ptr<OutputCapture> capture_;
     void observe(std::span<const float> samples){
         if(!trace_enabled_)return;
         for(std::size_t i=0;i+1<samples.size();i+=2){
@@ -42,6 +44,7 @@ class CoreAudioOutput final : public Output {
         if(data->mNumberBuffers!=1 || !data->mBuffers[0].mData || data->mBuffers[0].mDataByteSize<frames*2*sizeof(float))return kAudio_ParamError;
         self.buffer_->render({static_cast<float*>(data->mBuffers[0].mData),static_cast<std::size_t>(frames)*2},self.rate_);
         self.observe({static_cast<const float*>(data->mBuffers[0].mData),static_cast<std::size_t>(frames)*2});
+        if(self.capture_)self.capture_->push({static_cast<const float*>(data->mBuffers[0].mData),static_cast<std::size_t>(frames)*2});
         return noErr;
     }
     void close() {if(unit_){AudioOutputUnitStop(unit_);AudioUnitUninitialize(unit_);AudioComponentInstanceDispose(unit_);unit_=nullptr;}}
@@ -50,6 +53,7 @@ public:
     explicit CoreAudioOutput(std::shared_ptr<Buffer> buffer,AudioDeviceID device=kAudioObjectUnknown):buffer_(std::move(buffer)) {
         // 呼叫端（例如 WASAPI 的 Initialize）已持有 buffer mutex；本單元的轉譯回呼在建構完成前尚未啟動，直接讀取即可，不可再上鎖。
         if(buffer_->streaming && buffer_->rate>=8000 && buffer_->rate<=192000)rate_=buffer_->rate;
+        capture_=OutputCapture::open("coreaudio",rate_,this);
         AudioComponentDescription desc{};desc.componentType=kAudioUnitType_Output;desc.componentSubType=device==kAudioObjectUnknown?kAudioUnitSubType_DefaultOutput:kAudioUnitSubType_HALOutput;desc.componentManufacturer=kAudioUnitManufacturer_Apple;
         const auto component=AudioComponentFindNext(nullptr,&desc);
         if(!component || AudioComponentInstanceNew(component,&unit_)!=noErr)throw std::runtime_error("Core Audio output unavailable");

@@ -89,7 +89,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"user32.dll","SetClipboardData",2},{"user32.dll","GetClipboardData",1},{"user32.dll","GetClipboardOwner",0},
         {"user32.dll","IsClipboardFormatAvailable",1},{"user32.dll","RegisterClipboardFormatA",1},{"user32.dll","RegisterClipboardFormatW",1},
         {"kernel32.dll","GlobalMemoryStatus",1},{"kernel32.dll","GlobalMemoryStatusEx",1},
-        {"kernel32.dll","GetThreadTimes",5},{"kernel32.dll","GetProcessTimes",5},{"kernel32.dll","QueryProcessCycleTime",2},{"user32.dll","GetCursorPos",1},{"user32.dll","SetCursorPos",2},{"user32.dll","GetCursorInfo",1},{"user32.dll","GetCursor",0},
+        {"kernel32.dll","GetThreadTimes",5},{"kernel32.dll","GetProcessTimes",5},{"kernel32.dll","QueryProcessCycleTime",2},{"user32.dll","GetCursorPos",1},{"user32.dll","GetPhysicalCursorPos",1},{"user32.dll","SetPhysicalCursorPos",2},{"user32.dll","SetCursorPos",2},{"user32.dll","GetCursorInfo",1},{"user32.dll","GetCursor",0},
         {"user32.dll","LoadImageA",6},{"user32.dll","LoadImageW",6},
         {"user32.dll","DisableProcessWindowsGhosting",0},
         {"user32.dll","ShutdownBlockReasonCreate",2},{"user32.dll","ShutdownBlockReasonQuery",3},{"user32.dll","ShutdownBlockReasonDestroy",1},
@@ -1010,7 +1010,34 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         for(const auto [offset,value]:std::array<std::pair<unsigned,std::int32_t>,10>{{{0,metrics.height},{4,metrics.ascent},{8,metrics.descent},{16,metrics.external_leading},{20,metrics.average_width},{24,metrics.maximum_width},{28,font.weight?font.weight:400},{32,0},{36,96},{40,96}}})memory.store(GuestAddress{p+offset},32,static_cast<std::uint32_t>(value));
         const auto chars=wide?2U:1U;memory.store(GuestAddress{p+44},static_cast<std::uint8_t>(chars*8),32);memory.store(GuestAddress{p+44+chars},static_cast<std::uint8_t>(chars*8),wide?65535:255);memory.store(GuestAddress{p+44+chars*2},static_cast<std::uint8_t>(chars*8),'?');memory.store(GuestAddress{p+44+chars*3},static_cast<std::uint8_t>(chars*8),' ');
         const auto flags=p+44+chars*4;memory.store(GuestAddress{flags},8,font.italic?1:0);memory.store(GuestAddress{flags+1},8,font.underline?1:0);memory.store(GuestAddress{flags+2},8,font.strikeout?1:0);memory.store(GuestAddress{flags+3},8,(font.pitch_family&0xf0)|4|(metrics.fixed_pitch?0:1));memory.store(GuestAddress{flags+4},8,font.charset);result=1;
-    } else if(symbol=="GetDeviceCaps"){if(const auto cap=printer_device_cap(arg(0),d(1)))result=*cap;else switch(d(1)){case 8:result=static_cast<std::uint32_t>(gui_screen_area()[2]);break;case 10:result=static_cast<std::uint32_t>(gui_screen_area()[3]);break;case 12:result=gui_.display_mode?(*gui_.display_mode)[2]:32;break;case 14:result=1;break;case 88:case 90:result=96;break;case 38:result=0;break;default:result=0;}}
+    } else if(symbol=="GetDeviceCaps"){if(const auto cap=printer_device_cap(arg(0),d(1)))result=*cap;else {
+        // 顯示 DC。實體尺寸與現代 Windows 相同由解析度與 96 DPI 推算（遊戲用 HORZSIZE／VERTSIZE 算螢幕比例，回 0 會得到 NaN）。
+        const auto screen=gui_screen_area();
+        const auto millimeters=[](std::int64_t pixels){return static_cast<std::uint32_t>((pixels*254+480)/960);};
+        const std::uint32_t minus_one=UINT32_MAX;
+        switch(d(1)){
+        case 0:result=0x4000;break;                       // DRIVERVERSION
+        case 2:result=1;break;                            // TECHNOLOGY：DT_RASDISPLAY
+        case 4:result=millimeters(screen[2]);break;       // HORZSIZE
+        case 6:result=millimeters(screen[3]);break;       // VERTSIZE
+        case 8:case 118:result=static_cast<std::uint32_t>(screen[2]);break; // HORZRES、DESKTOPHORZRES
+        case 10:case 117:result=static_cast<std::uint32_t>(screen[3]);break; // VERTRES、DESKTOPVERTRES
+        case 12:result=gui_.display_mode?(*gui_.display_mode)[2]:32;break; // BITSPIXEL
+        case 14:result=1;break;                           // PLANES
+        case 16:case 18:case 24:result=minus_one;break;   // NUMBRUSHES、NUMPENS、NUMCOLORS：超過 8 位元色時為 -1
+        case 28:result=0x1ff;break;                       // CURVECAPS
+        case 30:result=0xfe;break;                        // LINECAPS
+        case 32:result=0xff;break;                        // POLYGONALCAPS
+        case 34:result=0x7e07;break;                      // TEXTCAPS
+        case 36:result=1;break;                           // CLIPCAPS：CP_RECTANGLE
+        case 40:case 42:result=36;break;                  // ASPECTX、ASPECTY
+        case 44:result=51;break;                          // ASPECTXY
+        case 88:case 90:result=96;break;                  // LOGPIXELSX、LOGPIXELSY
+        case 108:result=24;break;                         // COLORRES
+        case 116:result=gui_.display_mode && (*gui_.display_mode)[3]?(*gui_.display_mode)[3]:60;break; // VREFRESH
+        default:result=0;break;                           // RASTERCAPS 與印表機專用項目等：沒有對應能力
+        }
+    }}
     else return invoke_gui_extra(state,memory,service);
     arg.return_to(state,result);return std::nullopt;
 }

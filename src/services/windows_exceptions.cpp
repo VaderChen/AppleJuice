@@ -149,6 +149,7 @@ bool WindowsServices::dispatch_cpu_trap(GuestState& state,GuestMemory& memory,st
     return dispatch_cpu_exception(state,memory,code);
 }
 bool WindowsServices::dispatch_cpu_exception(GuestState& state, GuestMemory& memory, std::uint32_t code) {
+    d3d11_stream_quiesced();
     // 核心驅動映像內的特權 I/O 指令由虛擬平台模擬後續跑；未模擬者仍依 #GP 交給例外處理。
     if(code==0xc0000096U && emulate_kernel_instruction(state,memory))return true;
     prune_x86_exception_callbacks(state,memory);
@@ -165,6 +166,7 @@ bool WindowsServices::dispatch_cpu_exception(GuestState& state, GuestMemory& mem
     begin_exception(state, memory, code, 0, {}); return true;
 }
 bool WindowsServices::dispatch_fault(GuestState& state, GuestMemory& memory, const MemoryFault& fault) {
+    d3d11_stream_quiesced();
     trace_fault_memory(state,memory,process_id(),threads_.current);
     struct Refresh { WindowsServices& self;GuestMemory& memory;~Refresh(){self.refresh_guard_table(memory);} } refresh{*this,memory};
     prune_x86_exception_callbacks(state,memory);

@@ -24,7 +24,7 @@ enum class D3D11DrawScope:std::uint8_t {All,Graphics,Compute};
 GraphicsDraw& d3d11_draw_state(D3D11State& bridge,const std::shared_ptr<Identity>& context,const D3D11DrawScope scope,const std::string_view symbol){
     static const std::array<std::string,6> stage_names{"VS","PS","GS","HS","DS","CS"};
     const auto require=[&](bool value){if(!value)throw std::invalid_argument("D3D11 參數或狀態不合法："+std::string(symbol));};
-    const auto object=[&](std::uint64_t address)->const Object& {const auto found=bridge.objects.find(address);if(found==bridge.objects.end())throw HostCallFault("D3D11 COM 物件已釋放或位址無效");return found->second;};
+    const auto object=[&](std::uint64_t address)->const Object& {const auto found=bridge.objects.find_fast(address);if(found==bridge.objects.end())throw HostCallFault("D3D11 COM 物件已釋放或位址無效");return found->second;};
     const auto typed=[&](std::uint64_t address,Kind kind)->const std::shared_ptr<Identity>& {const auto& value=object(address);if(value.kind!=kind)throw HostCallFault("D3D11 COM 介面類型不符");return value.identity;};
     const auto view_of=[&](std::uint64_t pointer){if(!pointer)return GraphicsView{};const auto& id=*object(pointer).identity;require(bool(id.resource) || bool(id.graphics_view.resource));return id.graphics_view.resource?id.graphics_view:GraphicsView{id.resource,id.resource->desc.format,0,id.resource->desc.levels,0,id.resource->desc.layers};};
     const auto binding=[&](const std::shared_ptr<Identity>& owner,const std::string& name,std::size_t index=0)->std::uint64_t{const auto found=owner->bindings.find(name);return found!=owner->bindings.end() && index<found->second.size()?found->second[index]:0;};
@@ -99,7 +99,7 @@ GraphicsDraw& d3d11_draw_state(D3D11State& bridge,const std::shared_ptr<Identity
         }
         // D3D11.1 常數緩衝範圍：位移以 16 位元組常數計，256 位元組對齊，符合 Metal 的緩衝位移要求。
         for(unsigned i=0;i<14;++i)target.constant_offsets[i]=context->constant_first[stage][i]*16U;
-        if(shader_pointer){const auto shader_id=object(shader_pointer).identity;
+        if(shader_pointer){const auto& shader_id=object(shader_pointer).identity;
             if(shader_id->reflection && shader_id->reflection->linkage){
                 require(!context->context_type);const auto& linked=*shader_id->reflection->linkage;
                 // 同一引擎的效能 A/B 可關閉快取，保留原有逐 draw 讀回／上傳路徑。
@@ -178,11 +178,11 @@ thread_local std::exception_ptr d3d11_front_exception;
 template<class ReleaseMapping>
 [[gnu::noinline]] bool d3d11_draw_front_path(D3D11State& bridge,const std::array<std::uint64_t,6>& arg,const D3D11DrawMethod method,const std::string_view symbol,const ReleaseMapping& release_mapping) try {
     if(!d3d11_direct_draw_enabled())return false;
-    const auto self=bridge.objects.find(arg[0]);
+    const auto self=bridge.objects.find_fast(arg[0]);
     if(self==bridge.objects.end() || self->second.kind!=Kind::Context || !self->second.identity)return false;
     const auto& context=self->second.identity;
     if(context->kind!=Kind::Context || context->api10 || context->weak_bindings || context->context_type || !context->native)return false;
-    const auto device=context->device?bridge.objects.find(context->device):self;
+    const auto device=context->device?bridge.objects.find_fast(context->device):self;
     if(device==bridge.objects.end() || !device->second.identity ||
        (device->second.identity->protected_threads && device->second.identity->lock_address))return false;
     if(const auto& predicate=d3d11_fixed_slots(*context,d3d11_slot_predicate);!predicate.empty() && predicate.front())return false;
@@ -192,19 +192,19 @@ template<class ReleaseMapping>
     const auto visibility_ready=[&]{
         const auto& slots=d3d11_fixed_slots(*context,d3d11_slot_visibility);
         if(slots.empty() || !slots.front())return true;
-        const auto found=bridge.objects.find(slots.front());
+        const auto found=bridge.objects.find_fast(slots.front());
         if(found==bridge.objects.end() || !found->second.identity)return false;
         query=found->second.identity.get();
         return query->visibility_pooled && query->sequence<8192;
     };
     const auto arguments=[&](std::uint32_t size)->const GraphicsResource* {
-        const auto found=bridge.objects.find(arg[1]);
+        const auto found=bridge.objects.find_fast(arg[1]);
         if(found==bridge.objects.end() || found->second.kind!=Kind::BufferObject || !found->second.identity || !found->second.identity->resource)return nullptr;
         const auto& id=*found->second.identity;const auto& desc=id.resource->desc;const auto offset=u32(2);
         if(id.device!=context->device || !(desc.misc&0x10U) || (offset&3U) || std::uint64_t{offset}+size>desc.width)return nullptr;
         return id.resource.get();
     };
-    const auto argument_resource=[&]()->const std::shared_ptr<GraphicsResource>& {return bridge.objects.find(arg[1])->second.identity->resource;};
+    const auto argument_resource=[&]()->const std::shared_ptr<GraphicsResource>& {return bridge.objects.find_fast(arg[1])->second.identity->resource;};
     const auto submit_draw=[&](GraphicsDraw& draw){
         if(query)d3d11_pooled_visibility(bridge,*context,*query,draw);
         context->native->graphics_draw_retained(draw);

@@ -127,6 +127,7 @@ struct ThreadRuntime {
     std::map<std::u16string,std::uint32_t> multimedia_task_indices;
     std::uint64_t current{1}, next_id{2}, remaining{4096};
     std::uint64_t slice_deadline{UINT64_MAX}; // 宿主時鐘模式的時間片上限，單位 100 ns。
+    std::uint64_t preempt_not_before{}; // 剛釋放互斥鎖：這個時間點（100 ns）前的服務邊界不換人，見 ReleaseMutex。
     HostInstructionBudget host_instruction_budget;
     bool yield{};
     bool prefer_awakened{}; // 這次讓出是為了被喚醒者：同優先序時也選它，不走一般輪替。

@@ -1,6 +1,7 @@
 #include "x64arm/debug_transport.hpp"
 #include "x64arm/process_debugger.hpp"
 #include "fast_poll.hpp"
+#include "unix_socket_endpoint.hpp"
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -91,7 +92,7 @@ struct Transport::Impl {
 #endif
         endpoint=root/("debug-"+std::to_string(own_pid));const auto location=address(endpoint);
         Descriptor fd(::socket(AF_UNIX,SOCK_STREAM,0));require(fd.value>=0,errno);configure(fd.value);
-        checked(::bind(fd.value,reinterpret_cast<const sockaddr*>(&location),sizeof(location)));
+        checked(detail::bind_unix_endpoint(fd.value,location,SOCK_STREAM));
         // bind 成功後才取得端點所有權；失敗不能刪除另一個工作中的端點。
         if(::lstat(endpoint.c_str(),&status)!=0){const int error=errno;::unlink(endpoint.c_str());fail(error);}
         device=status.st_dev;inode=status.st_ino;owns_endpoint=true;

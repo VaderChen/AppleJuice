@@ -580,25 +580,42 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
             memory.store(GuestAddress{arg(2)+pixels+4},32,selected[0]);memory.store(GuestAddress{arg(2)+pixels+8},32,selected[1]);memory.store(GuestAddress{arg(2)+pixels+16},32,selected[3]);result=1;
         }
     }else if(symbol=="EnumDisplayMonitors"){
+        // hdc 非空：只回呼與 DC 可見區相交的顯示器，回呼收到同一個 HDC，裁切矩形與傳入的矩形都是 DC 座標。螢幕 DC（GetDC(NULL)）的原點在虛擬螢幕原點。
+        const auto dc=arg(0);bool dc_valid=true;
+        std::array<std::int32_t,2> origin{};std::optional<std::array<std::int32_t,4>> dc_visible;
+        if(dc){
+            const auto window=dc>=0x10000000?dc-0x10000000:UINT64_MAX;
+            if(window!=0 && window!=gui_.desktop){
+                if(const auto found=gui_.windows.find(window);found!=gui_.windows.end()){
+                    const auto client=gui_client_origin(gui_,window);origin={static_cast<std::int32_t>(client[0]),static_cast<std::int32_t>(client[1])};
+                    dc_visible=std::array<std::int32_t,4>{origin[0],origin[1],origin[0]+static_cast<std::int32_t>(found->second.width),origin[1]+static_cast<std::int32_t>(found->second.height)};
+                }else dc_valid=false;
+            }
+            if(const auto context=gui_.contexts.find(dc);dc_valid && context!=gui_.contexts.end() && context->second.clipped){
+                const auto& c=context->second.clip;const std::array<std::int32_t,4> device{c[0]+origin[0],c[1]+origin[1],c[2]+origin[0],c[3]+origin[1]};
+                dc_visible=dc_visible?std::array<std::int32_t,4>{std::max((*dc_visible)[0],device[0]),std::max((*dc_visible)[1],device[1]),std::min((*dc_visible)[2],device[2]),std::min((*dc_visible)[3],device[3])}:device;
+            }
+        }
         if(!arg(2))fail(87);
-        else if(arg(0))fail(50); // HDC 畫圖枚舉尚未提供，不能回報未套用 clipping 的成功結果。
+        else if(!dc_valid)fail(6);
         else {
             memory.check(GuestAddress{arg(2)},1,Access::Execute);
             std::optional<std::array<std::int32_t,4>> clip;
-            if(arg(1)){std::array<std::int32_t,4> rect{};for(unsigned i=0;i<4;++i)rect[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(1)+4*i},32));clip=rect;}
+            if(arg(1)){std::array<std::int32_t,4> rect{};for(unsigned i=0;i<4;++i)rect[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(1)+4*i},32));clip=std::array<std::int32_t,4>{rect[0]+origin[0],rect[1]+origin[1],rect[2]+origin[0],rect[3]+origin[1]};}
             // 每台與裁切範圍相交的顯示器各回呼一次；有裁切範圍時傳入交集矩形。
             std::vector<std::pair<std::uint64_t,std::array<std::int32_t,4>>> visible;
             const auto& monitors=gui_monitors();
             for(std::size_t i=0;i<monitors.size();++i){
                 auto rect=monitors[i].rect;
                 if(clip)rect={std::max(rect[0],(*clip)[0]),std::max(rect[1],(*clip)[1]),std::min(rect[2],(*clip)[2]),std::min(rect[3],(*clip)[3])};
-                if(rect[0]<rect[2] && rect[1]<rect[3])visible.emplace_back(i+1,rect);
+                if(dc_visible)rect={std::max(rect[0],(*dc_visible)[0]),std::max(rect[1],(*dc_visible)[1]),std::min(rect[2],(*dc_visible)[2]),std::min(rect[3],(*dc_visible)[3])};
+                if(rect[0]<rect[2] && rect[1]<rect[3])visible.emplace_back(i+1,std::array<std::int32_t,4>{rect[0]-origin[0],rect[1]-origin[1],rect[2]-origin[0],rect[3]-origin[1]});
             }
             if(visible.empty())result=1;
             else {const auto rects=allocate_heap(memory,16*visible.size());std::vector<GuestCallback> calls;
                 for(std::size_t j=0;j<visible.size();++j){
                     for(unsigned i=0;i<4;++i)memory.store(GuestAddress{rects+j*16+i*4},32,static_cast<std::uint32_t>(visible[j].second[i]));
-                    calls.push_back({arg(2),{visible[j].first,0,rects+j*16,arg(3)}});
+                    calls.push_back({arg(2),{visible[j].first,dc,rects+j*16,arg(3)}});
                 }
                 try{start_callbacks(state,memory,std::move(calls),Continuation::MonitorEnumeration,rects);}
                 catch(...){(void)free_heap(memory,rects,state);throw;}return std::nullopt;}

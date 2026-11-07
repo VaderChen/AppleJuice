@@ -1,3 +1,4 @@
+#include "unix_socket_endpoint.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/startup_profile.hpp"
 #include "x64arm/shared_wake.hpp"
@@ -197,15 +198,7 @@ void WindowsServices::configure_handle_transfer(){
     (void)::fcntl(transfer->descriptor,F_SETFD,FD_CLOEXEC);(void)::fcntl(transfer->descriptor,F_SETFL,O_NONBLOCK);
     sockaddr_un address{};address.sun_family=AF_UNIX;if(transfer->path.size()>=sizeof(address.sun_path))throw HostCallFault("程序 handle 通道路徑過長");
     std::memcpy(address.sun_path,transfer->path.c_str(),transfer->path.size()+1);
-    if(::bind(transfer->descriptor,reinterpret_cast<sockaddr*>(&address),sizeof(address))){
-        // 同 process id 的前一個程序被強制結束時，端點檔案留在 mapping session 目錄（EADDRINUSE；量測腳本 TERM 掉遊戲後立即重啟
-        // 就撞到）。以另一個 DGRAM socket 對它 connect（不送資料）：沒有程序綁定時回 ECONNREFUSED，刪掉殘留檔案重試；
-        // 仍有存活的擁有者則維持原錯誤（同一 session 不會有兩個同 id 的存活程序）。
-        bool stale=false;
-        if(errno==EADDRINUSE){const int probe=::socket(AF_UNIX,SOCK_DGRAM,0);
-            if(probe>=0){if(::connect(probe,reinterpret_cast<sockaddr*>(&address),sizeof(address))<0 && errno==ECONNREFUSED)stale=true;::close(probe);}}
-        if(!stale || ::unlink(transfer->path.c_str()) || ::bind(transfer->descriptor,reinterpret_cast<sockaddr*>(&address),sizeof(address)))throw HostCallFault("無法綁定程序 handle 傳輸通道");
-    }
+    if(detail::bind_unix_endpoint(transfer->descriptor,address,SOCK_DGRAM))throw HostCallFault("無法綁定程序 handle 傳輸通道");
     if(::chmod(transfer->path.c_str(),0600))throw HostCallFault("無法綁定程序 handle 傳輸通道");
     configure_process_io();
     handle_transfers_=std::move(transfer);

@@ -615,6 +615,8 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             }
             guest_memory_routines_=GuestAddress{callback_return_.value+guest_memory_page_offset};
             memory.map(guest_memory_routines_,GuestMemory::guest_page_size,read_execute,bytes);
+            // D3D11 命令串流的環狀緩衝與共用區：合成呼叫框架與參數副本要能以客體位址讀取。放在保留範圍之後、直接 MMU 視窗頂端前的 13 MiB 空隙，不影響客體位址配置。
+            d3d11_stream_setup(memory,callback_return_.value+windows_address_layout::gateway_capacity);
         }
         // PE32 沒有客體常式頁；process heap 的小型配置仍可由服務端使用同一套 chunk 級距配置區。
         if(x86_)(void)guest_heap_setup(memory);
@@ -1832,6 +1834,8 @@ bool plain_local_service(const WindowsServiceDescriptor& descriptor) noexcept {
 }
 }
 bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory& memory) {
+    // 協調服務代表客體已恢復（全停之後的命令串流暫停可以解除）；串流失敗時走全停，由完整服務邊界重新拋出。
+    if(d3d11_stream_){d3d11_stream_resume();if(d3d11_stream_failed())return false;}
     static const bool debug_park=std::getenv("X64ARM_DEBUG_PARK")!=nullptr; // 暫時診斷：偵測執行目前執行緒的過期副本
     if(debug_park){
         const auto key=resident_context_key(state);const auto found=threads_.items.find(key);
@@ -1972,6 +1976,8 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     // 不切換 context、不排程、不執行客體回呼。X64ARM_LOCAL_GRAPHICS_SERVICE=0 關閉。
     static const bool local_graphics=[] {const auto* value=std::getenv("X64ARM_LOCAL_GRAPHICS_SERVICE");return !value || std::string_view(value)!="0";}();
     if(local_graphics && (!x86_ || x86_graphics_parallel_enabled()) && graphics_local_service((state.rip.value-begin)/16)){
+        // 先等 D3D11 命令串流清空（取映射鎖之前，見 d3d11_command_stream.inc）。裝置建立不依賴佇列，不必等。
+        d3d11_stream_coordinated(state,device_creation_service(detail::stub_service_symbol(stub_base_,state.rip)));
         // 鎖順序與 worker 服務相同：映射 → D3D11。反過來會與持映射共用鎖、等待 D3D11 鎖的 worker 互鎖
         // （DQ3 強制平行讀檔時整個程序停住）。COW 等映射變動期間不得有 worker 服務查表（見 parallel_mapping_mutex）。
         const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
@@ -2325,6 +2331,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
     // 協調者已接手此執行緒的完整 provider；成功、等待與例外均由同一流程完成。
     // worker 的窄服務不經這裡，也不能提早清掉尚未處理的協調請求。
     resident_service_requests_.erase(threads_.current);graphics_service_epilogue_=false;
+    d3d11_stream_quiesced();d3d11_stream_rethrow();
 #ifdef X64ARM_HOST_SERVICES_MANAGED_FP
     if(registry_io_busy_ && environment){environment->restore();environment=nullptr;}
 #endif

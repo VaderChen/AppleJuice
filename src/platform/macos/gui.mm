@@ -2235,7 +2235,8 @@ public:
         if(!window.native.visible || window.native.miniaturized)return false;
         const auto display=coordinate_display();const auto current=CGDisplayCopyDisplayMode(display);if(!current)return false;
         CGDisplayModeRef target=nullptr;
-        if(desired && desired->native_id!=display_mode_id(current)){
+        // 虛擬顯示器：客體看到的解析度由 X64ARM_DISPLAY_SIZE 決定，獨占全螢幕也不得切換實體顯示器模式。
+        if(desired && !virtual_display_size() && desired->native_id!=display_mode_id(current)){
             const auto modes=CGDisplayCopyAllDisplayModes(display,nullptr);if(modes){for(CFIndex i=0;i<CFArrayGetCount(modes);++i){const auto mode=static_cast<CGDisplayModeRef>(const_cast<void*>(CFArrayGetValueAtIndex(modes,i)));if(display_mode_id(mode)==desired->native_id){target=CGDisplayModeRetain(mode);break;}}CFRelease(modes);}
             if(!target || !configure_display(display,target)){if(target)CGDisplayModeRelease(target);CGDisplayModeRelease(current);return false;}
         }

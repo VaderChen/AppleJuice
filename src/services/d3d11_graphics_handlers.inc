@@ -118,6 +118,208 @@
 #include "d3d11_reflection_handlers.inc"
 #include "d3d11_class_handlers.inc"
         if(graphics_handled){}
+        // 熱門方法排在最前面：鏈上的條件都依方法名稱互斥，順序不影響語義；UE 每幀約 4000 次完整路徑呼叫，原本每次要先比對約 300 個名稱。
+        else if(symbol=="Begin" || symbol=="End" || symbol=="GetData"){
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context),query=object(arg(1)).identity;require(query->device==context->device && query->query_size);const auto type=word(query->desc,0);
+            if(symbol=="Begin"){
+                require(binding(context,"Predicate")!=arg(1));require(type!=0 && type!=2 && !query->query_active);query->query_active=true;query->query_ready=false;query->sequence=0;
+                if(type==6 || type==7){auto stats=context->stream_statistics;submit(context,{[query,stats](auto& native){native.graphics_post([query,stats](auto&){query->stream_begin=*stats;});}},false);}
+                if(type==1 || type==5){require(!binding(context,"Visibility"));submit(context,{[query](auto&){query->query_ready=false;}},false);
+                    query->visibility_pooled=type==1 && !context->context_type && d3d11_visibility_pool_enabled();query->visibility_segments.clear();
+                    // 立即內容 OCCLUSION 改用共用池，建立時不再配置每查詢緩衝；延遲內容等其他用途在第一次 Begin 時補配置。
+                    if(!query->visibility_pooled && !query->resource){GraphicsResourceDesc resource;resource.width=65536;query->resource=context->native->graphics_resource(resource);}
+                    if(!query->visibility_pooled){const auto view=view_of(arg(1));query->visibility_planned=0;visibility_zero(context,query,view,0);}
+                    bind_one(context,"Visibility",arg(1));}
+            }else if(symbol=="End"){
+                require(binding(context,"Predicate")!=arg(1));require(type==0 || type==2 || query->query_active);query->query_active=false;query->query_ready=false;query->query_fence.reset();query->query_timestamp.reset();query->query_polls=0;query->query_end_ticket=0;const auto sequence=query->sequence;
+                // 事件查詢：提交後取完成旗標，GetData 輪詢旗標。Chromium／ANGLE 以此當 fence，每幀數十次；
+                // 同步等待 GPU 閒置會把 GPU 程序卡在每次 End（Steam 實測每次約 0.4 ms）。
+                static const bool trace_state=std::getenv("X64ARM_TRACE_GRAPHICS_STATE")!=nullptr;
+                if(trace_state){static std::array<std::uint32_t,8> ends{};if(type<ends.size() && ++ends[type]%500==1)std::fprintf(stderr,"[d3d11_query_end] type=%u count=%u\n",type,ends[type]);}
+                // End 的命令序號在執行端記錄：延遲內容的 End 於 ExecuteCommandList 重播時才排入立即內容的命令佇列。
+                if(type==0){submit(context,{[query](auto& native){std::fill(query->query_data.begin(),query->query_data.end(),0);put_word(query->query_data,0,1);query->query_fence=native.graphics_fence_pending();query->query_end_ticket=native.graphics_ticket();}},false);}
+                // 時間戳與 disjoint：在提交點記錄 GPU 時間戳，GetData 輪詢完成旗標後填入。
+                else if(type==2 || type==3){submit(context,{[query](auto& native){std::fill(query->query_data.begin(),query->query_data.end(),0);query->query_timestamp=native.graphics_timestamp_future();query->query_end_ticket=native.graphics_ticket();}},false);}
+                // 遮蔽／遮蔽判定：原本在 End 同步 flush 並讀回（UE4 每秒上百次、每次等 GPU 約 0.4 ms），
+                // 改為提交後取完成旗標，GetData 看到旗標完成才讀回累加；型別 6／7 仍走同步統計。
+                else if(type==1 || type==5){submit(context,{[query,sequence](auto& native){std::fill(query->query_data.begin(),query->query_data.end(),0);query->query_pending_sequence=sequence;query->query_fence=native.graphics_fence_pending();query->query_end_ticket=native.graphics_ticket();}},false);}
+                else submit(context,{[query,type,sequence,stats=context->stream_statistics](auto& native){
+                    native.graphics_flush(true);std::fill(query->query_data.begin(),query->query_data.end(),0);
+                    if(type==2){const auto stamp=native.graphics_timestamp();std::memcpy(query->query_data.data(),&stamp.ticks,8);}
+                    else if(type==3){const auto stamp=native.graphics_timestamp();std::memcpy(query->query_data.data(),&stamp.frequency,8);put_word(query->query_data,8,stamp.disjoint?1U:0U);}
+                    else if(type==1 || type==5){const auto samples=native.graphics_read(GraphicsView{query->resource});std::uint64_t total=0;for(unsigned i=0;i<sequence;++i){std::uint64_t value=0;std::memcpy(&value,samples.data()+i*8,8);total+=value;}if(type==5)put_word(query->query_data,0,total?1:0);else std::memcpy(query->query_data.data(),&total,8);}
+                    if(type==6 || type==7){const auto written=stats->written-query->stream_begin.written,needed=stats->needed-query->stream_begin.needed;if(type==7)put_word(query->query_data,0,written<needed);else {std::memcpy(query->query_data.data(),&written,8);std::memcpy(query->query_data.data()+8,&needed,8);}}
+                    query->query_ready=true;
+                }},false);
+                if(type==1 || type==5)bind_one(context,"Visibility",0);
+            }else {require(!context->context_type);
+                if(query->query_fence && query->query_fence->load(std::memory_order_acquire)){
+                    if(type==1 || type==5){
+                        // fence 已完成：只讀本查詢的取樣範圍，不等待同一緩衝上較新的批次，也不排空命令執行緒。
+                        std::uint64_t total=0;
+                        const auto add=[&](const std::shared_ptr<GraphicsResource>& buffer,std::uint32_t base,std::uint64_t count){
+                            if(!count)return;GraphicsView view{buffer};view.first=base;view.count=static_cast<std::uint32_t>(count*8);
+                            const auto samples=context->native->graphics_read_completed(view);
+                            for(std::size_t i=0;i<count && (i+1)*8<=samples.size();++i){std::uint64_t value=0;std::memcpy(&value,samples.data()+i*8,8);total+=value;}
+                        };
+                        if(query->visibility_pooled)for(const auto& segment:query->visibility_segments)add(segment.buffer,segment.base,segment.count);
+                        else add(query->resource,0,query->query_pending_sequence);
+                        std::fill(query->query_data.begin(),query->query_data.end(),0);
+                        if(type==5)put_word(query->query_data,0,total?1U:0U);else std::memcpy(query->query_data.data(),&total,8);
+                    }
+                    query->query_ready=true;query->query_fence.reset();
+                }
+                if(query->query_timestamp && query->query_timestamp->done.load(std::memory_order_acquire)){
+                    const auto& stamp=query->query_timestamp->value;
+                    if(type==2)std::memcpy(query->query_data.data(),&stamp.ticks,8);
+                    else {std::memcpy(query->query_data.data(),&stamp.frequency,8);put_word(query->query_data,8,stamp.disjoint?1U:0U);}
+                    query->query_ready=true;query->query_timestamp.reset();
+                }
+                // D3D11 契約：未完成回 S_FALSE；GetData 沒帶 D3D11_ASYNC_GETDATA_DONOTFLUSH 才隱含提交，End 已被先前的提交涵蓋就不重複（見 flush_covering）。
+                // 連續輪詢 32 次仍未完成的保底，避免永不完成：沒帶旗標者實際提交一次（涵蓋提交曾失敗等未預期情況）；帶旗標者只在 End 尚未被任何提交涵蓋時
+                // 提交，相當於 runtime 自行送出命令（Flush 文件），其餘輪詢不提交。X64ARM_D3D11_QUERY_DONOTFLUSH_BACKSTOP=0 帶旗標時完全不提交（可能如文件所述永遠未完成）。
+                if(!query->query_ready){
+                    static const bool donotflush_backstop=[] {const auto* value=std::getenv("X64ARM_D3D11_QUERY_DONOTFLUSH_BACKSTOP");return !value || std::string_view(value)!="0";}();
+                    const bool backstop=++query->query_polls>=32U;if(backstop)query->query_polls=0;
+                    if(!(u32(4)&1U))flush_covering(context,backstop?0:query->query_end_ticket);
+                    else if(backstop && donotflush_backstop)flush_covering(context,query->query_end_ticket);
+                    result=1;
+                }
+                else{require(!arg(2) || u32(3)==query->query_size);if(arg(2))memory.write(GuestAddress{arg(2)},query->query_data);}}
+        }
+        else if(symbol.size()>2 && (symbol.starts_with("VS") || symbol.starts_with("PS") || symbol.starts_with("GS") || symbol.starts_with("HS") || symbol.starts_with("DS") || symbol.starts_with("CS")) && (symbol.substr(2).starts_with("Set") || symbol.substr(2).starts_with("Get"))){
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const auto stage=stage_index(symbol);const auto what=std::string(symbol.substr(5));const auto name=stage_names[stage]+what;const bool set=symbol.substr(2).starts_with("Set");
+            if(what=="Shader"){
+                const auto instances_name=stage_names[stage]+"ClassInstances";
+                if(set){
+                    require(u32(3)<=256 && (!u32(3) || arg(2)));std::vector<std::uint64_t> instances(u32(3));
+                    const auto shader=arg(1)?object(arg(1)).identity:std::shared_ptr<Identity>{};
+                    if(shader)require(d3d11_shader_bindable(*context,*shader,object(arg(1)).kind,stage,u32(3)));
+                    for(unsigned i=0;i<u32(3);++i){instances[i]=memory.load(GuestAddress{arg(2)+i*pointer_size},pointer_bits);const auto instance=typed(instances[i],Kind::ClassInstance);require(shader && binding(instance,"ClassLinkage")==binding(shader,"ClassLinkage"));}
+                    bind(context,instances_name,0,instances,256);
+                    // bind 已確保至少有這次設定的槽位；釋放 class instance 不改動 context 的 bindings 結構，可直接走訪同一向量。
+                    for(auto& slots=context->bindings[instances_name];auto& slot:std::span(slots).subspan(u32(3)))if(const auto old=slot){slot=0;if(!context->weak_bindings)release_binding(*context,instances_name,old);}
+                    bind_one(context,name,arg(1));
+                }else{
+                    const auto pointer=binding(context,name);if(arg(1)){if(pointer)hold(pointer);write_pointer(arg(1),pointer);}
+                    const auto shader=pointer?object(pointer).identity:std::shared_ptr<Identity>{};const auto count=shader && shader->reflection?shader->reflection->interface_slots:0U;
+                    if(arg(3)){const auto capacity=static_cast<unsigned>(memory.load(GuestAddress{arg(3)},32));if(arg(2))for(unsigned i=0;i<std::min(capacity,count);++i){const auto instance=binding(context,instances_name,i);if(instance)hold(instance);write_pointer(arg(2)+i*pointer_size,instance);}memory.store(GuestAddress{arg(3)},32,count);}
+                }
+            }
+            else {const auto limit=what=="ConstantBuffers"?14U:what=="Samplers"?16U:what=="UnorderedAccessViews"?8U:128U;require(u32(1)<=limit && u32(2)<=limit-u32(1));if(set){
+                const auto kind=what=="ConstantBuffers"?Kind::BufferObject:what=="Samplers"?Kind::Sampler:what=="UnorderedAccessViews"?Kind::Unordered:Kind::ShaderResource;
+                auto values=read_views(arg(3),u32(2),kind,context);
+                if(what=="ShaderResources")for(auto& value:values)if(value && outputs_conflict(context,value))value=0;
+                if(what=="UnorderedAccessViews"){
+                    if(nonconflicting(values)){const auto counts=counter_values(values,arg(4));
+                        for(auto pointer:values)if(pointer)hold(pointer);
+                        remove_conflicts(context,values,{});bind(context,name,u32(1),values,limit);
+                        for(auto pointer:values)if(pointer)release(pointer);reset_counters(context,counts);
+                    }
+                    else bridge.last_error="重疊的 CS UAV 綁定已拒絕";
+                }else{bind(context,name,u32(1),values,limit);
+                    if(what=="ConstantBuffers")d3d11_reset_constant_ranges(*context,stage,u32(1),u32(2));}
+            }else get_views(context,name,u32(1),u32(2),arg(3));}
+        }
+        else if((symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource" || symbol=="Map" || symbol=="Unmap") && object(arg(1)).identity->resource){
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context),resource=object(arg(1)).identity;require(resource->device==context->device);
+            if(symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource")drop_persistent(resource);
+            if(symbol=="CopyResource" || symbol=="CopySubresourceRegion"){const bool full=symbol=="CopyResource";auto source=object(arg(full?2:6)).identity;require(source->device==context->device && bool(source->resource));const auto& d=resource->resource->desc;const auto& s=source->resource->desc;if(std::getenv("X64ARM_TRACE_GRAPHICS_STATE"))std::fprintf(stderr,"[d3d11_copy] %.*s dst=%u/%u/%u/%u/%u/%u/%u/%u src=%u/%u/%u/%u/%u/%u/%u/%u\n",static_cast<int>(symbol.size()),symbol.data(),d.dimension,d.width,d.height,d.depth,d.levels,d.layers,d.format,d.samples,s.dimension,s.width,s.height,s.depth,s.levels,s.layers,s.format,s.samples);require(d.dimension==s.dimension && d.samples==s.samples && copy_compatible(d.format,s.format));if(full){require(resource->subresource_maps.empty() && source->subresource_maps.empty());require(d.width==s.width && d.height==s.height && d.depth==s.depth && d.levels==s.levels && d.layers==s.layers);for(unsigned i=0;i<d.levels*d.layers;++i){const auto dst=subresource(resource,i),src=subresource(source,i);submit(context,{[dst,src](auto& native){native.graphics_copy(dst,src,{0,0,0},{});}});}}else{require(!resource->subresource_maps.contains(u32(2)) && !source->subresource_maps.contains(u32(7)));std::array<std::uint32_t,6> box{};if(arg(8)){const auto values=bytes32(arg(8),6);std::copy(values.begin(),values.end(),box.begin());}const auto dst=subresource(resource,u32(2)),src=subresource(source,u32(7));const std::array origin{u32(3),u32(4),u32(5)};submit(context,{[dst,src,origin,box](auto& native){native.graphics_copy(dst,src,origin,box);}});}}
+            else if(symbol=="UpdateSubresource"){
+                require(!resource->subresource_maps.contains(u32(2)));auto view=subresource(resource,u32(2));const auto& d=resource->resource->desc;
+                std::array<std::uint32_t,6> box{0,0,0,d.dimension==1?d.width:std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level),std::max(1U,d.depth>>view.level)};
+                if(arg(3)){const auto values=bytes32(arg(3),6);std::copy(values.begin(),values.end(),box.begin());}
+                // 空 box 是規範中的 no-op，不能讀取 pSrcData；非空區域保留其外部的既有像素。
+                if(box[0]<box[3] && box[1]<box[4] && box[2]<box[5]){
+                    const auto update_require=[&](bool value,const char* what){
+                        if(!value)throw std::invalid_argument(std::string("D3D11 UpdateSubresource ")+what+"：dimension="+std::to_string(d.dimension)+" format="+std::to_string(d.format)+" size="+std::to_string(d.width)+"x"+std::to_string(d.height)+"x"+std::to_string(d.depth)+" level="+std::to_string(view.level)+" bind="+std::to_string(d.bind)+
+                            " box="+std::to_string(box[0])+","+std::to_string(box[1])+","+std::to_string(box[2])+","+std::to_string(box[3])+","+std::to_string(box[4])+","+std::to_string(box[5])+" row="+std::to_string(u32(5))+" image="+std::to_string(u32(6)));
+                    };
+                    // 小於一個區塊的 BC mip 實體上佔完整 4×4 區塊，區塊對齊的大小要裁回 mip 的邏輯大小（與複製相同）。
+                    if(d.dimension!=1 && graphics_format_bc_family(d.format)){
+                        const auto mip_width=std::max(1U,d.width>>view.level),mip_height=std::max(1U,d.height>>view.level);
+                        if(box[3]>mip_width && box[3]<=((mip_width+3U)&~3U))box[3]=mip_width;
+                        if(box[4]>mip_height && box[4]<=((mip_height+3U)&~3U))box[4]=mip_height;
+                    }
+                    update_require(box[3]<=(d.dimension==1?d.width:std::max(1U,d.width>>view.level)) && box[4]<=std::max(1U,d.height>>view.level) && box[5]<=std::max(1U,d.depth>>view.level),"區域超出子資源");
+                    update_require(!(d.dimension==1 && (d.bind&4) && arg(3)) || (partial_constant_update && !(box[0]&15U) && !(box[3]&15U)),"常數緩衝區部分更新不合法");
+                    const auto w=box[3]-box[0],h=box[4]-box[1],z=box[5]-box[2];
+                    const auto pitch=d.dimension==1?std::array{w,h}:graphics_format_pitch(d.format,w,h);const auto line=pitch[0];
+                    // 只有一列時來源列距沒有作用，呼叫端可以傳 0。
+                    const auto row=d.dimension==1?w:(u32(5)?u32(5):pitch[1]==1?line:0U),image=d.dimension==1?w:u32(6);
+                    update_require(row>=line && (z==1 || image>=std::uint64_t{row}*pitch[1]),"來源列距不足");
+                    const auto size=std::uint64_t{image}*(z-1)+std::uint64_t{row}*(pitch[1]-1)+line;require(size<=512*1024*1024);
+                    const auto data=read_bytes(memory,arg(4),static_cast<std::size_t>(size));
+                    const bool region=arg(3)!=0;submit(context,{[view,data,row,image,box,region](auto& native){if(region)native.graphics_write_region(view,data,row,image,box);else native.graphics_write(view,data,row,image);}});
+                }
+            }
+            else if(symbol=="Map"){const auto& d=resource->resource->desc;const auto usage=word(resource->desc,d.dimension==1?4:d.dimension==2?16:d.dimension==4?20:28),access=word(resource->desc,d.dimension==1?12:d.dimension==2?24:d.dimension==4?28:36);const auto type=u32(3);require(!resource->offered && !resource->subresource_maps.contains(u32(2)) && type>=1 && type<=5 && !(u32(4)&~0x100000U) && ((usage==3 && type<=3) || (usage==2 && type>=2)) && (!(type==1 || type==3) || (access&0x20000)) && (!(type>=2) || (access&0x10000)));auto view=subresource(resource,u32(2));
+                const bool persistent=persistent_maps_enabled && usage==2 && (type==4 || type==5) && !context->context_type;
+                const auto kept=persistent?resource->persistent_maps.find(u32(2)):resource->persistent_maps.end();
+                std::uint64_t pointer=0;std::size_t mapped_size=0;
+                if(kept!=resource->persistent_maps.end()){pointer=kept->second.pointer;mapped_size=kept->second.size;}
+                else{
+                    // WRITE_DISCARD 的內容未定義，不必清零或讀回：UE 每幀十多次第一次對應動態緩衝，清零占這段服務大部分時間。
+                    static const bool map_zero=[] {const auto* value=std::getenv("X64ARM_D3D11_MAP_ZERO");return value && std::string_view(value)=="1";}();
+                    if(type==4 && discard_enabled && !context->context_type){
+                        const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));const auto size=std::uint64_t{pitch[0]}*pitch[1]*std::max(1U,d.depth>>view.level);require(size<=512U*1024U*1024U);
+                        mapped_size=static_cast<std::size_t>(size);pointer=allocate_heap(memory,mapped_size);if(!pointer)throw std::bad_alloc{};resource->allocations.push_back(pointer);
+                        if(map_zero)memory.write(GuestAddress{pointer},std::vector<std::uint8_t>(mapped_size));
+                    }else{
+                        auto data=context->native->graphics_read(view);if(type==4)std::fill(data.begin(),data.end(),0);
+                        pointer=allocate_heap(memory,data.size());if(!pointer)throw std::bad_alloc{};resource->allocations.push_back(pointer);memory.write(GuestAddress{pointer},data);mapped_size=data.size();
+                    }
+                    if(persistent)resource->persistent_maps.emplace(u32(2),Identity::PersistentMap{pointer,mapped_size});
+                }
+                resource->subresource_maps.emplace(u32(2),Identity::SubresourceMap{pointer,mapped_size,type});write_pointer(arg(5),pointer);const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));memory.store(GuestAddress{arg(5)+pointer_size},32,pitch[0]);memory.store(GuestAddress{arg(5)+pointer_size+4},32,pitch[0]*pitch[1]);}
+            else {const auto found=resource->subresource_maps.find(u32(2));require(found!=resource->subresource_maps.end());const auto mapping=found->second;if(mapping.type!=1){const auto view=subresource(resource,u32(2));
+                    const auto kept_map=resource->persistent_maps.find(u32(2));const bool persistent=kept_map!=resource->persistent_maps.end() && kept_map->second.pointer==mapping.pointer;
+                    // 持久區塊直接以短期唯讀視圖上傳，不另複製一份；視圖只在本次呼叫內使用。
+                    std::vector<std::uint8_t> copied;std::span<const std::uint8_t> data;
+                    if(persistent){data=memory.readable_prefix(GuestAddress{mapping.pointer},mapping.size);if(data.size()<mapping.size)data={};}
+                    if(data.empty()){copied=read_bytes(memory,mapping.pointer,mapping.size);data=copied;}
+                    if(mapping.type==4 && discard_enabled && !context->context_type)context->native->graphics_write_discard(view,data,0,0);
+                    else if(mapping.type==5 && persistent)context->native->graphics_write_no_overwrite(view,data,0,0);
+                    else context->native->graphics_write(view,data,0,0);}const auto kept=resource->persistent_maps.find(u32(2));if(kept==resource->persistent_maps.end() || kept->second.pointer!=mapping.pointer){require(free_heap(memory,mapping.pointer,state));std::erase(resource->allocations,mapping.pointer);}resource->subresource_maps.erase(found);}
+        }
+        else if(symbol=="IASetInputLayout" || symbol=="IAGetInputLayout" || symbol=="RSSetState" || symbol=="RSGetState"){
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const std::string name=symbol.starts_with("IA")?"Layout":"Raster";if(symbol.find("Set")!=symbol.npos)bind_one(context,name,arg(1));else{auto ptr=binding(context,name);if(ptr)hold(ptr);write_pointer(arg(1),ptr);}
+        }
+        else if(symbol=="OMSetRenderTargets" || symbol=="OMGetRenderTargets" || symbol=="OMSetRenderTargetsAndUnorderedAccessViews" || symbol=="OMGetRenderTargetsAndUnorderedAccessViews"){
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const bool extended=symbol.find("Unordered")!=symbol.npos,set=symbol.starts_with("OMSet");
+            const auto rt_count=u32(1),start=extended?u32(4):rt_count,uav_count=extended?u32(5):0U;
+            if(!set){require(rt_count<=8 && start<=8 && uav_count<=8-start);get_views(context,"Targets",0,rt_count,arg(2));get_views(context,"Depth",0,1,arg(3));if(extended)get_views(context,"PSUnorderedAccessViews",start,uav_count,arg(6));}
+            else if((rt_count==UINT32_MAX || rt_count<=8) && (uav_count==UINT32_MAX || (start<=8 && uav_count<=8-start)) &&
+                    (rt_count==UINT32_MAX || uav_count==UINT32_MAX || start>=rt_count)){
+                const bool keep_rt=rt_count==UINT32_MAX,keep_uav=uav_count==UINT32_MAX;
+                std::array<std::uint64_t,8> targets{},unordered{};std::uint64_t depth=0;
+                if(keep_rt){for(unsigned i=0;i<8;++i)targets[i]=binding(context,"Targets",i);depth=binding(context,"Depth");}
+                else {const auto views=read_views(arg(2),rt_count,Kind::RenderTarget,context);std::copy(views.begin(),views.end(),targets.begin());depth=arg(3);if(depth)require(typed(depth,Kind::DepthView)->device==context->device);}
+                auto requested=keep_uav?std::vector<std::uint64_t>{}:read_views(extended?arg(6):0,uav_count,Kind::Unordered,context);
+                if(keep_uav){for(unsigned i=0;i<8;++i)unordered[i]=binding(context,"PSUnorderedAccessViews",i);}
+                else std::copy(requested.begin(),requested.end(),unordered.begin()+start);
+                std::vector<std::uint64_t> fresh;if(!keep_rt){fresh.assign(targets.begin(),targets.end());fresh.push_back(depth);}fresh.insert(fresh.end(),requested.begin(),requested.end());
+                if(nonconflicting(fresh) && target_dimensions(targets,depth)){
+                    const auto counts=counter_values(requested,extended && !keep_uav?arg(7):0);
+                    if(keep_rt && !keep_uav)for(unsigned i=0;i<8;++i)if(i>=start || std::any_of(requested.begin(),requested.end(),[&](auto view){return overlaps(targets[i],view);}))targets[i]=0;
+                    if(keep_uav && !keep_rt)for(unsigned i=0;i<8;++i)if(i<rt_count || std::any_of(fresh.begin(),fresh.end(),[&](auto view){return overlaps(unordered[i],view);}))unordered[i]=0;
+                    // 保留旗標忽略對應輸入指標；先保存 COM 強參照，再解除舊的衝突。
+                    for(auto pointer:targets)if(pointer)hold(pointer);for(auto pointer:unordered)if(pointer)hold(pointer);if(depth)hold(depth);
+                    remove_conflicts(context,fresh,{});bind(context,"Targets",0,targets,8);bind(context,"PSUnorderedAccessViews",0,unordered,8);bind_one(context,"Depth",depth);
+                    for(auto pointer:targets)if(pointer)release(pointer);for(auto pointer:unordered)if(pointer)release(pointer);if(depth)release(depth);reset_counters(context,counts);
+                }else bridge.last_error="OM 輸出尺寸不符或 subresource 重疊，保留原綁定";
+            }else bridge.last_error="OM 輸出槽位不合法，保留原綁定";
+        }
+        else if(symbol=="OMSetBlendState" || symbol=="OMGetBlendState" || symbol=="OMSetDepthStencilState" || symbol=="OMGetDepthStencilState"){
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const bool blend=symbol.find("Blend")!=symbol.npos,set=symbol.find("Set")!=symbol.npos;const std::string name=blend?"Blend":"DepthState";
+            if(set){bind_one(context,name,arg(1));if(blend){context->blend_factor={1,1,1,1};if(arg(2)){auto bytes=read_bytes(memory,arg(2),16);std::memcpy(context->blend_factor.data(),bytes.data(),16);}context->sample_mask=u32(3);}else context->stencil_reference=u32(2);}
+            else{if(arg(1)){auto ptr=binding(context,name);if(ptr)hold(ptr);write_pointer(arg(1),ptr);}if(blend){if(arg(2))memory.write(GuestAddress{arg(2)},std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(context->blend_factor.data()),16});if(arg(3))memory.store(GuestAddress{arg(3)},32,context->sample_mask);}else if(arg(2))memory.store(GuestAddress{arg(2)},32,context->stencil_reference);}
+        }
+        else if(symbol=="RSSetViewports" || symbol=="RSGetViewports" || symbol=="RSSetScissorRects" || symbol=="RSGetScissorRects"){
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const bool set=symbol.find("Set")!=symbol.npos,viewport=symbol.find("Viewports")!=symbol.npos;const auto count=set?u32(1):static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)},32));require(count<=16);
+            if(set){if(viewport){context->viewports.resize(count);for(unsigned i=0;i<count;++i){const auto data=read_bytes(memory,arg(2)+24*i,24);std::memcpy(context->viewports[i].data(),data.data(),24);require(context->viewports[i][2]>=0 && context->viewports[i][3]>=0 && context->viewports[i][4]>=0 && context->viewports[i][5]<=1);}}else{context->scissors.resize(count);for(unsigned i=0;i<count;++i){const auto data=read_bytes(memory,arg(2)+16*i,16);std::memcpy(context->scissors[i].data(),data.data(),16);}}}
+            else {const auto total=viewport?context->viewports.size():context->scissors.size();memory.store(GuestAddress{arg(1)},32,total);if(arg(2))for(unsigned i=0;i<std::min<std::size_t>(count,total);++i){const auto* data=viewport?reinterpret_cast<const std::uint8_t*>(context->viewports[i].data()):reinterpret_cast<const std::uint8_t*>(context->scissors[i].data());memory.write(GuestAddress{arg(2)+i*(viewport?24:16)},std::span<const std::uint8_t>{data,viewport?24U:16U});}}
+        }
         else if(symbol=="GetPrivateData" || symbol=="SetPrivateData" || symbol=="SetPrivateDataInterface"){
             graphics_handled=true;auto id=object(arg(0)).identity;const auto guid=read_guid(memory,arg(1));
             if(symbol=="GetPrivateData"){require(arg(2)!=0);const auto capacity=memory.load(GuestAddress{arg(2)},32);std::vector<std::uint8_t> value;if(id->private_interfaces.contains(guid)){const auto pointer=id->private_interfaces.at(guid);value.resize(pointer_size);std::memcpy(value.data(),&pointer,pointer_size);}else if(id->private_data.contains(guid))value=id->private_data.at(guid);else result=not_found;
@@ -253,39 +455,6 @@
             for(const auto& input:signature.signatures[0])if(input.system!=6 && input.system!=8)require(std::any_of(elements.begin(),elements.end(),[&](const auto& e){return e.semantic==input.name && e.index==input.index;}));if(!arg(5))result=1;else {auto id=create(Kind::Layout,device->root);id->layout=std::move(elements);write_pointer(arg(5),id->root);}
         }else if(symbol=="CreateBlendState" || symbol=="CreateDepthStencilState" || symbol=="CreateRasterizerState" || symbol=="CreateSamplerState"){
             graphics_handled=true;auto device=typed(arg(0),Kind::Device);if(arg(2)){output(2);write_pointer(arg(2),0);}const bool blend=symbol=="CreateBlendState",depth=symbol=="CreateDepthStencilState",sampler=symbol=="CreateSamplerState";auto desc=read_bytes(memory,arg(1),blend?264:depth?52:sampler?52:40);std::shared_ptr<GraphicsSampler> native;if(sampler)native=device->native->graphics_sampler(desc);if(!arg(2))result=1;else{auto id=create(blend?Kind::Blend:depth?Kind::DepthState:sampler?Kind::Sampler:Kind::Raster,device->root);id->desc=std::move(desc);id->sampler=std::move(native);write_pointer(arg(2),id->root);}
-        }else if(symbol.size()>2 && (symbol.starts_with("VS") || symbol.starts_with("PS") || symbol.starts_with("GS") || symbol.starts_with("HS") || symbol.starts_with("DS") || symbol.starts_with("CS")) && (symbol.substr(2).starts_with("Set") || symbol.substr(2).starts_with("Get"))){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const auto stage=stage_index(symbol);const auto what=std::string(symbol.substr(5));const auto name=stage_names[stage]+what;const bool set=symbol.substr(2).starts_with("Set");
-            if(what=="Shader"){
-                const auto instances_name=stage_names[stage]+"ClassInstances";
-                if(set){
-                    require(u32(3)<=256 && (!u32(3) || arg(2)));std::vector<std::uint64_t> instances(u32(3));
-                    const auto shader=arg(1)?object(arg(1)).identity:std::shared_ptr<Identity>{};
-                    if(shader)require(d3d11_shader_bindable(*context,*shader,object(arg(1)).kind,stage,u32(3)));
-                    for(unsigned i=0;i<u32(3);++i){instances[i]=memory.load(GuestAddress{arg(2)+i*pointer_size},pointer_bits);const auto instance=typed(instances[i],Kind::ClassInstance);require(shader && binding(instance,"ClassLinkage")==binding(shader,"ClassLinkage"));}
-                    bind(context,instances_name,0,instances,256);
-                    // bind 已確保至少有這次設定的槽位；釋放 class instance 不改動 context 的 bindings 結構，可直接走訪同一向量。
-                    for(auto& slots=context->bindings[instances_name];auto& slot:std::span(slots).subspan(u32(3)))if(const auto old=slot){slot=0;if(!context->weak_bindings)release_binding(*context,instances_name,old);}
-                    bind_one(context,name,arg(1));
-                }else{
-                    const auto pointer=binding(context,name);if(arg(1)){if(pointer)hold(pointer);write_pointer(arg(1),pointer);}
-                    const auto shader=pointer?object(pointer).identity:std::shared_ptr<Identity>{};const auto count=shader && shader->reflection?shader->reflection->interface_slots:0U;
-                    if(arg(3)){const auto capacity=static_cast<unsigned>(memory.load(GuestAddress{arg(3)},32));if(arg(2))for(unsigned i=0;i<std::min(capacity,count);++i){const auto instance=binding(context,instances_name,i);if(instance)hold(instance);write_pointer(arg(2)+i*pointer_size,instance);}memory.store(GuestAddress{arg(3)},32,count);}
-                }
-            }
-            else {const auto limit=what=="ConstantBuffers"?14U:what=="Samplers"?16U:what=="UnorderedAccessViews"?8U:128U;require(u32(1)<=limit && u32(2)<=limit-u32(1));if(set){
-                const auto kind=what=="ConstantBuffers"?Kind::BufferObject:what=="Samplers"?Kind::Sampler:what=="UnorderedAccessViews"?Kind::Unordered:Kind::ShaderResource;
-                auto values=read_views(arg(3),u32(2),kind,context);
-                if(what=="ShaderResources")for(auto& value:values)if(value && outputs_conflict(context,value))value=0;
-                if(what=="UnorderedAccessViews"){
-                    if(nonconflicting(values)){const auto counts=counter_values(values,arg(4));
-                        for(auto pointer:values)if(pointer)hold(pointer);
-                        remove_conflicts(context,values,{});bind(context,name,u32(1),values,limit);
-                        for(auto pointer:values)if(pointer)release(pointer);reset_counters(context,counts);
-                    }
-                    else bridge.last_error="重疊的 CS UAV 綁定已拒絕";
-                }else{bind(context,name,u32(1),values,limit);
-                    if(what=="ConstantBuffers")d3d11_reset_constant_ranges(*context,stage,u32(1),u32(2));}
-            }else get_views(context,name,u32(1),u32(2),arg(3));}
         }else if(symbol=="SetPredication" || symbol=="GetPredication"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);
             if(symbol=="SetPredication"){
@@ -295,8 +464,6 @@
                 if(arg(1)){const auto pointer=binding(context,"Predicate");if(pointer)hold(pointer);write_pointer(arg(1),pointer);}
                 if(arg(2))memory.store(GuestAddress{arg(2)},32,context->predicate_value);
             }
-        }else if(symbol=="IASetInputLayout" || symbol=="IAGetInputLayout" || symbol=="RSSetState" || symbol=="RSGetState"){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const std::string name=symbol.starts_with("IA")?"Layout":"Raster";if(symbol.find("Set")!=symbol.npos)bind_one(context,name,arg(1));else{auto ptr=binding(context,name);if(ptr)hold(ptr);write_pointer(arg(1),ptr);}
         }else if(symbol=="IASetVertexBuffers" || symbol=="IAGetVertexBuffers"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);require(u32(1)<=32 && u32(2)<=32-u32(1));if(symbol=="IASetVertexBuffers"){std::vector<std::uint64_t> values(u32(2));for(unsigned i=0;i<u32(2);++i){values[i]=arg(3)?memory.load(GuestAddress{arg(3)+i*pointer_size},pointer_bits):0;if(values[i] && outputs_conflict(context,values[i]))values[i]=0;context->strides[u32(1)+i]=arg(4)?static_cast<std::uint32_t>(memory.load(GuestAddress{arg(4)+4*i},32)):0;context->offsets[u32(1)+i]=arg(5)?static_cast<std::uint32_t>(memory.load(GuestAddress{arg(5)+4*i},32)):0;}bind(context,"Vertices",u32(1),values,32);}
             else for(unsigned i=0;i<u32(2);++i){if(arg(3)){const auto ptr=binding(context,"Vertices",u32(1)+i);if(ptr)hold(ptr);write_pointer(arg(3)+i*pointer_size,ptr);}if(arg(4))memory.store(GuestAddress{arg(4)+4*i},32,context->strides[u32(1)+i]);if(arg(5))memory.store(GuestAddress{arg(5)+4*i},32,context->offsets[u32(1)+i]);}
@@ -316,38 +483,6 @@
                 // 重設與 SO 繪製共用後台佇列；不能在呼叫端覆寫仍被前一筆繪製使用的游標。
                 for(unsigned i=0;i<count;++i)if(values[i] && offsets[i]!=UINT32_MAX){auto resource=object(values[i]).identity->resource;const auto offset=offsets[i];submit(context,{[resource,offset](auto& native){native.graphics_post([resource,offset](auto&){resource->stream_cursor=offset;resource->stream_vertices=0;});}},false);}
             }else if(arg(2))for(unsigned i=0;i<count;++i){const auto pointer=binding(context,"StreamOutput",i);if(pointer)hold(pointer);write_pointer(arg(2)+i*pointer_size,pointer);}
-        }else if(symbol=="OMSetRenderTargets" || symbol=="OMGetRenderTargets" || symbol=="OMSetRenderTargetsAndUnorderedAccessViews" || symbol=="OMGetRenderTargetsAndUnorderedAccessViews"){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const bool extended=symbol.find("Unordered")!=symbol.npos,set=symbol.starts_with("OMSet");
-            const auto rt_count=u32(1),start=extended?u32(4):rt_count,uav_count=extended?u32(5):0U;
-            if(!set){require(rt_count<=8 && start<=8 && uav_count<=8-start);get_views(context,"Targets",0,rt_count,arg(2));get_views(context,"Depth",0,1,arg(3));if(extended)get_views(context,"PSUnorderedAccessViews",start,uav_count,arg(6));}
-            else if((rt_count==UINT32_MAX || rt_count<=8) && (uav_count==UINT32_MAX || (start<=8 && uav_count<=8-start)) &&
-                    (rt_count==UINT32_MAX || uav_count==UINT32_MAX || start>=rt_count)){
-                const bool keep_rt=rt_count==UINT32_MAX,keep_uav=uav_count==UINT32_MAX;
-                std::array<std::uint64_t,8> targets{},unordered{};std::uint64_t depth=0;
-                if(keep_rt){for(unsigned i=0;i<8;++i)targets[i]=binding(context,"Targets",i);depth=binding(context,"Depth");}
-                else {const auto views=read_views(arg(2),rt_count,Kind::RenderTarget,context);std::copy(views.begin(),views.end(),targets.begin());depth=arg(3);if(depth)require(typed(depth,Kind::DepthView)->device==context->device);}
-                auto requested=keep_uav?std::vector<std::uint64_t>{}:read_views(extended?arg(6):0,uav_count,Kind::Unordered,context);
-                if(keep_uav){for(unsigned i=0;i<8;++i)unordered[i]=binding(context,"PSUnorderedAccessViews",i);}
-                else std::copy(requested.begin(),requested.end(),unordered.begin()+start);
-                std::vector<std::uint64_t> fresh;if(!keep_rt){fresh.assign(targets.begin(),targets.end());fresh.push_back(depth);}fresh.insert(fresh.end(),requested.begin(),requested.end());
-                if(nonconflicting(fresh) && target_dimensions(targets,depth)){
-                    const auto counts=counter_values(requested,extended && !keep_uav?arg(7):0);
-                    if(keep_rt && !keep_uav)for(unsigned i=0;i<8;++i)if(i>=start || std::any_of(requested.begin(),requested.end(),[&](auto view){return overlaps(targets[i],view);}))targets[i]=0;
-                    if(keep_uav && !keep_rt)for(unsigned i=0;i<8;++i)if(i<rt_count || std::any_of(fresh.begin(),fresh.end(),[&](auto view){return overlaps(unordered[i],view);}))unordered[i]=0;
-                    // 保留旗標忽略對應輸入指標；先保存 COM 強參照，再解除舊的衝突。
-                    for(auto pointer:targets)if(pointer)hold(pointer);for(auto pointer:unordered)if(pointer)hold(pointer);if(depth)hold(depth);
-                    remove_conflicts(context,fresh,{});bind(context,"Targets",0,targets,8);bind(context,"PSUnorderedAccessViews",0,unordered,8);bind_one(context,"Depth",depth);
-                    for(auto pointer:targets)if(pointer)release(pointer);for(auto pointer:unordered)if(pointer)release(pointer);if(depth)release(depth);reset_counters(context,counts);
-                }else bridge.last_error="OM 輸出尺寸不符或 subresource 重疊，保留原綁定";
-            }else bridge.last_error="OM 輸出槽位不合法，保留原綁定";
-        }else if(symbol=="OMSetBlendState" || symbol=="OMGetBlendState" || symbol=="OMSetDepthStencilState" || symbol=="OMGetDepthStencilState"){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const bool blend=symbol.find("Blend")!=symbol.npos,set=symbol.find("Set")!=symbol.npos;const std::string name=blend?"Blend":"DepthState";
-            if(set){bind_one(context,name,arg(1));if(blend){context->blend_factor={1,1,1,1};if(arg(2)){auto bytes=read_bytes(memory,arg(2),16);std::memcpy(context->blend_factor.data(),bytes.data(),16);}context->sample_mask=u32(3);}else context->stencil_reference=u32(2);}
-            else{if(arg(1)){auto ptr=binding(context,name);if(ptr)hold(ptr);write_pointer(arg(1),ptr);}if(blend){if(arg(2))memory.write(GuestAddress{arg(2)},std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(context->blend_factor.data()),16});if(arg(3))memory.store(GuestAddress{arg(3)},32,context->sample_mask);}else if(arg(2))memory.store(GuestAddress{arg(2)},32,context->stencil_reference);}
-        }else if(symbol=="RSSetViewports" || symbol=="RSGetViewports" || symbol=="RSSetScissorRects" || symbol=="RSGetScissorRects"){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const bool set=symbol.find("Set")!=symbol.npos,viewport=symbol.find("Viewports")!=symbol.npos;const auto count=set?u32(1):static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)},32));require(count<=16);
-            if(set){if(viewport){context->viewports.resize(count);for(unsigned i=0;i<count;++i){const auto data=read_bytes(memory,arg(2)+24*i,24);std::memcpy(context->viewports[i].data(),data.data(),24);require(context->viewports[i][2]>=0 && context->viewports[i][3]>=0 && context->viewports[i][4]>=0 && context->viewports[i][5]<=1);}}else{context->scissors.resize(count);for(unsigned i=0;i<count;++i){const auto data=read_bytes(memory,arg(2)+16*i,16);std::memcpy(context->scissors[i].data(),data.data(),16);}}}
-            else {const auto total=viewport?context->viewports.size():context->scissors.size();memory.store(GuestAddress{arg(1)},32,total);if(arg(2))for(unsigned i=0;i<std::min<std::size_t>(count,total);++i){const auto* data=viewport?reinterpret_cast<const std::uint8_t*>(context->viewports[i].data()):reinterpret_cast<const std::uint8_t*>(context->scissors[i].data());memory.write(GuestAddress{arg(2)+i*(viewport?24:16)},std::span<const std::uint8_t>{data,viewport?24U:16U});}}
         }else if(symbol=="Draw" || symbol=="DrawIndexed" || symbol=="DrawInstanced" || symbol=="DrawIndexedInstanced"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);auto& draw=draw_state(context);draw.count=u32(1);draw.indexed=symbol.find("Indexed")!=symbol.npos;const bool instanced=symbol.find("Instanced")!=symbol.npos;draw.instances=instanced?u32(2):1;draw.start=u32(instanced?3:2);if(draw.indexed)draw.base_vertex=static_cast<std::int32_t>(u32(instanced?4:3));if(instanced)draw.start_instance=u32(draw.indexed?5:4);assign_visibility(context,draw);
             // 立即模式且未設 predicate 時直接執行：submit 對立即 context 本來就同步呼叫，包成 std::function 只多一次
@@ -395,59 +530,7 @@
         // Flush 文件的 ClearState＋Flush 後立即配置若額度不足，由代理的 graphics_resource 同步、提交後重試。仍記錄序號，讓之後的 GetData 知道 End 已被涵蓋。
         else if(symbol=="Flush"){graphics_handled=true;auto context=typed(arg(0),Kind::Context);require(!context->context_type);flush_explicit(context);}
         else if(symbol=="GenerateMips"){graphics_handled=true;auto context=typed(arg(0),Kind::Context);const auto view=view_of(arg(1));submit(context,{[view](auto& native){native.graphics_mips(view);}});}
-        else if((symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource" || symbol=="Map" || symbol=="Unmap") && object(arg(1)).identity->resource){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context),resource=object(arg(1)).identity;require(resource->device==context->device);
-            if(symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource")drop_persistent(resource);
-            if(symbol=="CopyResource" || symbol=="CopySubresourceRegion"){const bool full=symbol=="CopyResource";auto source=object(arg(full?2:6)).identity;require(source->device==context->device && bool(source->resource));const auto& d=resource->resource->desc;const auto& s=source->resource->desc;if(std::getenv("X64ARM_TRACE_GRAPHICS_STATE"))std::fprintf(stderr,"[d3d11_copy] %.*s dst=%u/%u/%u/%u/%u/%u/%u/%u src=%u/%u/%u/%u/%u/%u/%u/%u\n",static_cast<int>(symbol.size()),symbol.data(),d.dimension,d.width,d.height,d.depth,d.levels,d.layers,d.format,d.samples,s.dimension,s.width,s.height,s.depth,s.levels,s.layers,s.format,s.samples);require(d.dimension==s.dimension && d.samples==s.samples && copy_compatible(d.format,s.format));if(full){require(resource->subresource_maps.empty() && source->subresource_maps.empty());require(d.width==s.width && d.height==s.height && d.depth==s.depth && d.levels==s.levels && d.layers==s.layers);for(unsigned i=0;i<d.levels*d.layers;++i){const auto dst=subresource(resource,i),src=subresource(source,i);submit(context,{[dst,src](auto& native){native.graphics_copy(dst,src,{0,0,0},{});}});}}else{require(!resource->subresource_maps.contains(u32(2)) && !source->subresource_maps.contains(u32(7)));std::array<std::uint32_t,6> box{};if(arg(8)){const auto values=bytes32(arg(8),6);std::copy(values.begin(),values.end(),box.begin());}const auto dst=subresource(resource,u32(2)),src=subresource(source,u32(7));const std::array origin{u32(3),u32(4),u32(5)};submit(context,{[dst,src,origin,box](auto& native){native.graphics_copy(dst,src,origin,box);}});}}
-            else if(symbol=="UpdateSubresource"){
-                require(!resource->subresource_maps.contains(u32(2)));auto view=subresource(resource,u32(2));const auto& d=resource->resource->desc;
-                std::array<std::uint32_t,6> box{0,0,0,d.dimension==1?d.width:std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level),std::max(1U,d.depth>>view.level)};
-                if(arg(3)){const auto values=bytes32(arg(3),6);std::copy(values.begin(),values.end(),box.begin());}
-                // 空 box 是規範中的 no-op，不能讀取 pSrcData；非空區域保留其外部的既有像素。
-                if(box[0]<box[3] && box[1]<box[4] && box[2]<box[5]){
-                    const auto update_require=[&](bool value,const char* what){
-                        if(!value)throw std::invalid_argument(std::string("D3D11 UpdateSubresource ")+what+"：dimension="+std::to_string(d.dimension)+" format="+std::to_string(d.format)+" size="+std::to_string(d.width)+"x"+std::to_string(d.height)+"x"+std::to_string(d.depth)+" level="+std::to_string(view.level)+" bind="+std::to_string(d.bind)+
-                            " box="+std::to_string(box[0])+","+std::to_string(box[1])+","+std::to_string(box[2])+","+std::to_string(box[3])+","+std::to_string(box[4])+","+std::to_string(box[5])+" row="+std::to_string(u32(5))+" image="+std::to_string(u32(6)));
-                    };
-                    // 小於一個區塊的 BC mip 實體上佔完整 4×4 區塊，區塊對齊的大小要裁回 mip 的邏輯大小（與複製相同）。
-                    if(d.dimension!=1 && graphics_format_bc_family(d.format)){
-                        const auto mip_width=std::max(1U,d.width>>view.level),mip_height=std::max(1U,d.height>>view.level);
-                        if(box[3]>mip_width && box[3]<=((mip_width+3U)&~3U))box[3]=mip_width;
-                        if(box[4]>mip_height && box[4]<=((mip_height+3U)&~3U))box[4]=mip_height;
-                    }
-                    update_require(box[3]<=(d.dimension==1?d.width:std::max(1U,d.width>>view.level)) && box[4]<=std::max(1U,d.height>>view.level) && box[5]<=std::max(1U,d.depth>>view.level),"區域超出子資源");
-                    update_require(!(d.dimension==1 && (d.bind&4) && arg(3)) || (partial_constant_update && !(box[0]&15U) && !(box[3]&15U)),"常數緩衝區部分更新不合法");
-                    const auto w=box[3]-box[0],h=box[4]-box[1],z=box[5]-box[2];
-                    const auto pitch=d.dimension==1?std::array{w,h}:graphics_format_pitch(d.format,w,h);const auto line=pitch[0];
-                    // 只有一列時來源列距沒有作用，呼叫端可以傳 0。
-                    const auto row=d.dimension==1?w:(u32(5)?u32(5):pitch[1]==1?line:0U),image=d.dimension==1?w:u32(6);
-                    update_require(row>=line && (z==1 || image>=std::uint64_t{row}*pitch[1]),"來源列距不足");
-                    const auto size=std::uint64_t{image}*(z-1)+std::uint64_t{row}*(pitch[1]-1)+line;require(size<=512*1024*1024);
-                    const auto data=read_bytes(memory,arg(4),static_cast<std::size_t>(size));
-                    const bool region=arg(3)!=0;submit(context,{[view,data,row,image,box,region](auto& native){if(region)native.graphics_write_region(view,data,row,image,box);else native.graphics_write(view,data,row,image);}});
-                }
-            }
-            else if(symbol=="Map"){const auto& d=resource->resource->desc;const auto usage=word(resource->desc,d.dimension==1?4:d.dimension==2?16:d.dimension==4?20:28),access=word(resource->desc,d.dimension==1?12:d.dimension==2?24:d.dimension==4?28:36);const auto type=u32(3);require(!resource->offered && !resource->subresource_maps.contains(u32(2)) && type>=1 && type<=5 && !(u32(4)&~0x100000U) && ((usage==3 && type<=3) || (usage==2 && type>=2)) && (!(type==1 || type==3) || (access&0x20000)) && (!(type>=2) || (access&0x10000)));auto view=subresource(resource,u32(2));
-                const bool persistent=persistent_maps_enabled && usage==2 && (type==4 || type==5) && !context->context_type;
-                const auto kept=persistent?resource->persistent_maps.find(u32(2)):resource->persistent_maps.end();
-                std::uint64_t pointer=0;std::size_t mapped_size=0;
-                if(kept!=resource->persistent_maps.end()){pointer=kept->second.pointer;mapped_size=kept->second.size;}
-                else{
-                    std::vector<std::uint8_t> data;if(type==4 && discard_enabled && !context->context_type){const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));const auto size=std::uint64_t{pitch[0]}*pitch[1]*std::max(1U,d.depth>>view.level);require(size<=512U*1024U*1024U);data.resize(static_cast<std::size_t>(size));}else{data=context->native->graphics_read(view);if(type==4)std::fill(data.begin(),data.end(),0);}
-                    pointer=allocate_heap(memory,data.size());if(!pointer)throw std::bad_alloc{};resource->allocations.push_back(pointer);memory.write(GuestAddress{pointer},data);mapped_size=data.size();
-                    if(persistent)resource->persistent_maps.emplace(u32(2),Identity::PersistentMap{pointer,mapped_size});
-                }
-                resource->subresource_maps.emplace(u32(2),Identity::SubresourceMap{pointer,mapped_size,type});write_pointer(arg(5),pointer);const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));memory.store(GuestAddress{arg(5)+pointer_size},32,pitch[0]);memory.store(GuestAddress{arg(5)+pointer_size+4},32,pitch[0]*pitch[1]);}
-            else {const auto found=resource->subresource_maps.find(u32(2));require(found!=resource->subresource_maps.end());const auto mapping=found->second;if(mapping.type!=1){const auto view=subresource(resource,u32(2));
-                    const auto kept_map=resource->persistent_maps.find(u32(2));const bool persistent=kept_map!=resource->persistent_maps.end() && kept_map->second.pointer==mapping.pointer;
-                    // 持久區塊直接以短期唯讀視圖上傳，不另複製一份；視圖只在本次呼叫內使用。
-                    std::vector<std::uint8_t> copied;std::span<const std::uint8_t> data;
-                    if(persistent){data=memory.readable_prefix(GuestAddress{mapping.pointer},mapping.size);if(data.size()<mapping.size)data={};}
-                    if(data.empty()){copied=read_bytes(memory,mapping.pointer,mapping.size);data=copied;}
-                    if(mapping.type==4 && discard_enabled && !context->context_type)context->native->graphics_write_discard(view,data,0,0);
-                    else if(mapping.type==5 && persistent)context->native->graphics_write_no_overwrite(view,data,0,0);
-                    else context->native->graphics_write(view,data,0,0);}const auto kept=resource->persistent_maps.find(u32(2));if(kept==resource->persistent_maps.end() || kept->second.pointer!=mapping.pointer){require(free_heap(memory,mapping.pointer,state));std::erase(resource->allocations,mapping.pointer);}resource->subresource_maps.erase(found);}
-        }else if(symbol=="ResolveSubresource"){
+        else if(symbol=="ResolveSubresource"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context),destination=object(arg(1)).identity,source=object(arg(3)).identity;
             require(destination->device==context->device && source->device==context->device && bool(destination->resource) && bool(source->resource));
             require(destination->resource->desc.dimension==3 && word(destination->desc,28)==0 && !destination->subresource_maps.contains(u32(2)) && !source->subresource_maps.contains(u32(4)) && !destination->offered && !source->offered);
@@ -630,75 +713,7 @@
         else if(symbol=="CreateQuery" || symbol=="CreatePredicate"){
             graphics_handled=true;auto device=typed(arg(0),Kind::Device);if(arg(2)){output(2);write_pointer(arg(2),0);}auto desc=read_bytes(memory,arg(1),8);const auto type=word(desc,0);require(symbol!="CreatePredicate" || type==5 || type==7);require(!(word(desc,4)&~1U) && (!word(desc,4) || type==5));if(((type==2 || type==3) && !device->native->graphics_timestamp_supported()) || (type!=0 && type!=1 && type!=2 && type!=3 && type!=5 && type!=6 && type!=7)){result=not_supported;}else if(!arg(2))result=1;else{auto id=create(symbol=="CreatePredicate"?Kind::Predicate:Kind::Query,device->root);id->desc=desc;id->query_size=type==0 || type==5 || type==7?4:type==3?16:type==4?88:type>=6?16:8;id->query_data.resize(id->query_size);if(type==5 || (type==1 && !d3d11_visibility_pool_enabled())){GraphicsResourceDesc resource;resource.width=65536;id->resource=device->native->graphics_resource(resource);++bridge.resource_creations[std::string(symbol)];}write_pointer(arg(2),id->root);}
         }else if(symbol=="GetDataSize"){graphics_handled=true;result=object(arg(0)).identity->query_size;}
-        else if(symbol=="Begin" || symbol=="End" || symbol=="GetData"){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context),query=object(arg(1)).identity;require(query->device==context->device && query->query_size);const auto type=word(query->desc,0);
-            if(symbol=="Begin"){
-                require(binding(context,"Predicate")!=arg(1));require(type!=0 && type!=2 && !query->query_active);query->query_active=true;query->query_ready=false;query->sequence=0;
-                if(type==6 || type==7){auto stats=context->stream_statistics;submit(context,{[query,stats](auto& native){native.graphics_post([query,stats](auto&){query->stream_begin=*stats;});}},false);}
-                if(type==1 || type==5){require(!binding(context,"Visibility"));submit(context,{[query](auto&){query->query_ready=false;}},false);
-                    query->visibility_pooled=type==1 && !context->context_type && d3d11_visibility_pool_enabled();query->visibility_segments.clear();
-                    // 立即內容 OCCLUSION 改用共用池，建立時不再配置每查詢緩衝；延遲內容等其他用途在第一次 Begin 時補配置。
-                    if(!query->visibility_pooled && !query->resource){GraphicsResourceDesc resource;resource.width=65536;query->resource=context->native->graphics_resource(resource);}
-                    if(!query->visibility_pooled){const auto view=view_of(arg(1));query->visibility_planned=0;visibility_zero(context,query,view,0);}
-                    bind_one(context,"Visibility",arg(1));}
-            }else if(symbol=="End"){
-                require(binding(context,"Predicate")!=arg(1));require(type==0 || type==2 || query->query_active);query->query_active=false;query->query_ready=false;query->query_fence.reset();query->query_timestamp.reset();query->query_polls=0;query->query_end_ticket=0;const auto sequence=query->sequence;
-                // 事件查詢：提交後取完成旗標，GetData 輪詢旗標。Chromium／ANGLE 以此當 fence，每幀數十次；
-                // 同步等待 GPU 閒置會把 GPU 程序卡在每次 End（Steam 實測每次約 0.4 ms）。
-                static const bool trace_state=std::getenv("X64ARM_TRACE_GRAPHICS_STATE")!=nullptr;
-                if(trace_state){static std::array<std::uint32_t,8> ends{};if(type<ends.size() && ++ends[type]%500==1)std::fprintf(stderr,"[d3d11_query_end] type=%u count=%u\n",type,ends[type]);}
-                // End 的命令序號在執行端記錄：延遲內容的 End 於 ExecuteCommandList 重播時才排入立即內容的命令佇列。
-                if(type==0){submit(context,{[query](auto& native){std::fill(query->query_data.begin(),query->query_data.end(),0);put_word(query->query_data,0,1);query->query_fence=native.graphics_fence_pending();query->query_end_ticket=native.graphics_ticket();}},false);}
-                // 時間戳與 disjoint：在提交點記錄 GPU 時間戳，GetData 輪詢完成旗標後填入。
-                else if(type==2 || type==3){submit(context,{[query](auto& native){std::fill(query->query_data.begin(),query->query_data.end(),0);query->query_timestamp=native.graphics_timestamp_future();query->query_end_ticket=native.graphics_ticket();}},false);}
-                // 遮蔽／遮蔽判定：原本在 End 同步 flush 並讀回（UE4 每秒上百次、每次等 GPU 約 0.4 ms），
-                // 改為提交後取完成旗標，GetData 看到旗標完成才讀回累加；型別 6／7 仍走同步統計。
-                else if(type==1 || type==5){submit(context,{[query,sequence](auto& native){std::fill(query->query_data.begin(),query->query_data.end(),0);query->query_pending_sequence=sequence;query->query_fence=native.graphics_fence_pending();query->query_end_ticket=native.graphics_ticket();}},false);}
-                else submit(context,{[query,type,sequence,stats=context->stream_statistics](auto& native){
-                    native.graphics_flush(true);std::fill(query->query_data.begin(),query->query_data.end(),0);
-                    if(type==2){const auto stamp=native.graphics_timestamp();std::memcpy(query->query_data.data(),&stamp.ticks,8);}
-                    else if(type==3){const auto stamp=native.graphics_timestamp();std::memcpy(query->query_data.data(),&stamp.frequency,8);put_word(query->query_data,8,stamp.disjoint?1U:0U);}
-                    else if(type==1 || type==5){const auto samples=native.graphics_read(GraphicsView{query->resource});std::uint64_t total=0;for(unsigned i=0;i<sequence;++i){std::uint64_t value=0;std::memcpy(&value,samples.data()+i*8,8);total+=value;}if(type==5)put_word(query->query_data,0,total?1:0);else std::memcpy(query->query_data.data(),&total,8);}
-                    if(type==6 || type==7){const auto written=stats->written-query->stream_begin.written,needed=stats->needed-query->stream_begin.needed;if(type==7)put_word(query->query_data,0,written<needed);else {std::memcpy(query->query_data.data(),&written,8);std::memcpy(query->query_data.data()+8,&needed,8);}}
-                    query->query_ready=true;
-                }},false);
-                if(type==1 || type==5)bind_one(context,"Visibility",0);
-            }else {require(!context->context_type);
-                if(query->query_fence && query->query_fence->load(std::memory_order_acquire)){
-                    if(type==1 || type==5){
-                        // fence 已完成：只讀本查詢的取樣範圍，不等待同一緩衝上較新的批次，也不排空命令執行緒。
-                        std::uint64_t total=0;
-                        const auto add=[&](const std::shared_ptr<GraphicsResource>& buffer,std::uint32_t base,std::uint64_t count){
-                            if(!count)return;GraphicsView view{buffer};view.first=base;view.count=static_cast<std::uint32_t>(count*8);
-                            const auto samples=context->native->graphics_read_completed(view);
-                            for(std::size_t i=0;i<count && (i+1)*8<=samples.size();++i){std::uint64_t value=0;std::memcpy(&value,samples.data()+i*8,8);total+=value;}
-                        };
-                        if(query->visibility_pooled)for(const auto& segment:query->visibility_segments)add(segment.buffer,segment.base,segment.count);
-                        else add(query->resource,0,query->query_pending_sequence);
-                        std::fill(query->query_data.begin(),query->query_data.end(),0);
-                        if(type==5)put_word(query->query_data,0,total?1U:0U);else std::memcpy(query->query_data.data(),&total,8);
-                    }
-                    query->query_ready=true;query->query_fence.reset();
-                }
-                if(query->query_timestamp && query->query_timestamp->done.load(std::memory_order_acquire)){
-                    const auto& stamp=query->query_timestamp->value;
-                    if(type==2)std::memcpy(query->query_data.data(),&stamp.ticks,8);
-                    else {std::memcpy(query->query_data.data(),&stamp.frequency,8);put_word(query->query_data,8,stamp.disjoint?1U:0U);}
-                    query->query_ready=true;query->query_timestamp.reset();
-                }
-                // D3D11 契約：未完成回 S_FALSE；GetData 沒帶 D3D11_ASYNC_GETDATA_DONOTFLUSH 才隱含提交，End 已被先前的提交涵蓋就不重複（見 flush_covering）。
-                // 連續輪詢 32 次仍未完成的保底，避免永不完成：沒帶旗標者實際提交一次（涵蓋提交曾失敗等未預期情況）；帶旗標者只在 End 尚未被任何提交涵蓋時
-                // 提交，相當於 runtime 自行送出命令（Flush 文件），其餘輪詢不提交。X64ARM_D3D11_QUERY_DONOTFLUSH_BACKSTOP=0 帶旗標時完全不提交（可能如文件所述永遠未完成）。
-                if(!query->query_ready){
-                    static const bool donotflush_backstop=[] {const auto* value=std::getenv("X64ARM_D3D11_QUERY_DONOTFLUSH_BACKSTOP");return !value || std::string_view(value)!="0";}();
-                    const bool backstop=++query->query_polls>=32U;if(backstop)query->query_polls=0;
-                    if(!(u32(4)&1U))flush_covering(context,backstop?0:query->query_end_ticket);
-                    else if(backstop && donotflush_backstop)flush_covering(context,query->query_end_ticket);
-                    result=1;
-                }
-                else{require(!arg(2) || u32(3)==query->query_size);if(arg(2))memory.write(GuestAddress{arg(2)},query->query_data);}}
-        }
-        else if(symbol=="DXGIGetDebugInterface1"){
+                else if(symbol=="DXGIGetDebugInterface1"){
             // 未安裝圖形工具（DXGI 除錯層）的 Windows 回 E_NOINTERFACE；Flags 保留須為 0。
             graphics_handled=true;output(2);write_pointer(arg(2),0);result=u32(0)?invalid:no_interface;
         }

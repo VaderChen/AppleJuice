@@ -91,11 +91,11 @@ D3D11SetterMethod d3d11_setter_method(std::string_view symbol) noexcept {
 }
 // 依 bind 核對一個待綁定的值。多留一次呼叫可能持有的餘裕，內部計數溢位交回完整路徑回報。
 const Object* d3d11_front_value(const D3D11State& bridge,const Identity& context,std::uint64_t value) noexcept {
-    const auto found=bridge.objects.find(value);
+    const auto found=bridge.objects.find_fast(value);
     if(found==bridge.objects.end() || !found->second.identity)return nullptr;
     const auto& id=*found->second.identity;
     const Identity* texture=nullptr;
-    if(id.texture){const auto owner=bridge.objects.find(id.texture);if(owner==bridge.objects.end() || !owner->second.identity)return nullptr;texture=owner->second.identity.get();}
+    if(id.texture){const auto owner=bridge.objects.find_fast(id.texture);if(owner==bridge.objects.end() || !owner->second.identity)return nullptr;texture=owner->second.identity.get();}
     if(id.api10 || id.internal_references>UINT32_MAX-128U || !d3d11_bindable(context,id,[&](std::uint64_t)->const Identity& {return *texture;}))return nullptr;
     return &found->second;
 }
@@ -107,13 +107,13 @@ bool d3d11_front_no_output_conflict(D3D11State& bridge,Identity& context,std::sp
     std::size_t count=0;
     for(const auto key:{d3d11_slot_targets,d3d11_slot_depth,d3d11_slot_ps_uav,d3d11_slot_cs_uav,d3d11_slot_stream})
         for(const auto pointer:d3d11_fixed_slots(context,key))if(pointer){
-            const auto found=bridge.objects.find(pointer);
+            const auto found=bridge.objects.find_fast(pointer);
             if(found==bridge.objects.end() || !found->second.identity || count==outputs.size())return false;
             outputs[count++]=found->second.identity.get();
         }
     if(!count)return true;
     for(const auto value:values)if(value){
-        const auto& id=*bridge.objects.find(value)->second.identity; // 呼叫端已核對存在。
+        const auto& id=*bridge.objects.find_fast(value)->second.identity; // 呼叫端已核對存在。
         const auto* resource=d3d11_view_resource(id);if(!resource)return false;
         for(std::size_t i=0;i<count;++i){
             const auto& output=*outputs[i];const auto* other=d3d11_view_resource(output);if(!other)return false;
@@ -126,7 +126,7 @@ bool d3d11_front_no_output_conflict(D3D11State& bridge,Identity& context,std::sp
 // 綁定解除後物件是否仍存活：內部計數足以撐過這次呼叫的所有釋放，或客體仍持有（計數不會在持圖形鎖時歸零：客體常式只做
 // 非最後一次 Release，最後一次要經服務取鎖）。可能是最後一次釋放的銷毀與延後銷毀留給完整路徑。
 bool d3d11_front_release_keeps_alive(const D3D11State& bridge,GuestMemory& memory,std::uint64_t pointer,std::size_t releases){
-    const auto found=bridge.objects.find(pointer);
+    const auto found=bridge.objects.find_fast(pointer);
     if(found==bridge.objects.end() || !found->second.identity)return false;
     const auto& id=*found->second.identity;
     return id.internal_references && (id.internal_references>releases || reference_count(memory,id));
@@ -138,18 +138,18 @@ bool d3d11_front_bind(D3D11State& bridge,GuestMemory& memory,std::vector<std::ui
         changed=true;if(old && !d3d11_front_release_keeps_alive(bridge,memory,old,values.size()))return false;
     }
     if(!changed)return true; // 綁定未變：完整路徑的持有與釋放淨變化為零，draw_state 也會因原始指標相同而略過。
-    const auto references=[&](std::uint64_t pointer)->std::uint32_t& {return bridge.objects.find(pointer)->second.identity->internal_references;};
+    const auto references=[&](std::uint64_t pointer)->std::uint32_t& {return bridge.objects.find_fast(pointer)->second.identity->internal_references;};
     d3d11_commit_bindings(slots,start,values,limit,false,[&](std::uint64_t value){++references(value);},[&](std::uint64_t old){--references(old);});
     return true;
 }
 // 回傳 true 表示已完成並可直接回到客體（void 方法與完整路徑相同以 0 返回）；false 時未改可觀察狀態。
 // 呼叫端持圖形鎖，且已比照前置路徑核對 compare 模式與延後銷毀清單。
 [[gnu::noinline]] bool d3d11_setter_front_path(D3D11State& bridge,GuestMemory& memory,const WindowsCall& arg,const D3D11SetterMethod method,const bool x86) try {
-    const auto self=bridge.objects.find(arg(0));
+    const auto self=bridge.objects.find_fast(arg(0));
     if(self==bridge.objects.end() || self->second.kind!=Kind::Context || !self->second.identity)return false;
     auto& context=*self->second.identity;
     if(context.kind!=Kind::Context || context.api10 || context.weak_bindings)return false;
-    const auto device=context.device?bridge.objects.find(context.device):self;
+    const auto device=context.device?bridge.objects.find_fast(context.device):self;
     if(device==bridge.objects.end() || !device->second.identity ||
        (device->second.identity->protected_threads && device->second.identity->lock_address))return false;
     const auto u32=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};

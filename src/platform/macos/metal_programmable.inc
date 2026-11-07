@@ -270,7 +270,7 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_translate_shader(std::uint32_t
         else if(auto prefixed=reflection.inputs.find("_"+name);prefixed!=reflection.inputs.end())slot=prefixed->second;
         else if(shared)for(const auto& [key,v]:reflection.inputs)if(key.ends_with("_"+name)){slot=v;break;}
         // signature 可保留已最佳化移除的輸入；未產生 Metal 宣告就不建立 fetch。
-        if(slot)shader->inputs.push_back({input.semanticName,input.ui32SemanticIndex,*slot});
+        if(slot)shader->inputs.push_back({input.semanticName,input.ui32SemanticIndex,*slot,input.eComponentType==INOUT_COMPONENT_UINT32?1U:input.eComponentType==INOUT_COMPONENT_SINT32?2U:0U});
     }
     if(shared)return shader;
     // 診斷：X64ARM_DUMP_MSL=<目錄> 保存轉譯後的 MSL（檔名含階段與序號，與繪製追蹤的 vs／ps／cs 編號相同）。
@@ -879,7 +879,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     {
         // D3D 規則的寬容處理，以修正後的副本重入（只有少數繪製，電馭判客 Benchmark 每秒約十餘次；原本拋錯會中止整次
         // ExecuteCommandLists 的其餘命令）：(1) 雙來源混色時只有 RT0 有效，RT1～7 忽略；(2) 輸入佈局引用未綁定的
-        // 頂點緩衝時讀到 0，改綁全零緩衝、stride 0。
+        // 頂點緩衝時讀到 0，改綁全零緩衝、stride 0；(3) 頂點著色器要的輸入不在佈局裡（只有除錯層會報錯，繪製照常），同樣讀到 0。
         const bool dual=[&]{if(!d.stages[1].shader || d.blend.empty() || !metal_word(d.blend,8))return false;for(const auto offset:{12U,16U,24U,28U}){const auto factor=metal_word(d.blend,offset);if(factor>=16 && factor<=19)return true;}return false;}();
         // 對照開關：X64ARM_METAL_DUAL_SOURCE_LENIENT=0、X64ARM_METAL_ZERO_VERTEX=0 恢復拋錯。
         static const bool lenient_dual=[] {const auto* value=std::getenv("X64ARM_METAL_DUAL_SOURCE_LENIENT");return !value || std::string_view(value)!="0";}();
@@ -887,11 +887,13 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         static const bool skip_dual=[] {const auto* value=std::getenv("X64ARM_METAL_DUAL_SOURCE_LENIENT");return value && std::string_view(value)=="skip";}();
         static const bool zero_vertex=[] {const auto* value=std::getenv("X64ARM_METAL_ZERO_VERTEX");return !value || std::string_view(value)!="0";}();
         const bool extra_targets=lenient_dual && dual && std::any_of(d.targets.begin()+1,d.targets.end(),[](const auto& view){return bool(view.resource);});
-        std::uint32_t unbound=0;
+        std::uint32_t unbound=0;std::vector<GraphicsElement> missing;
         if(zero_vertex && inputs)for(const auto& [attribute,index]:inputs->inputs){const auto slot=d.layout[index].slot;if(!d.vertices[slot].resource)unbound|=1U<<slot;}
         else if(zero_vertex)for(const auto& input:d.stages[0].shader->inputs){
             const auto it=std::find_if(d.layout.begin(),d.layout.end(),[&](const auto& e){return e.semantic==input.semantic && e.index==input.index;});
             if(it!=d.layout.end() && it->slot<32 && !d.vertices[it->slot].resource)unbound|=1U<<it->slot;
+            // DXGI 格式：R32G32B32A32 的 FLOAT／UINT／SINT，須與著色器宣告的型別相容。
+            if(it==d.layout.end())missing.push_back({input.semantic,input.index,input.component==1?3U:input.component==2?4U:2U,0,0,0,0});
         }
         // 診斷：X64ARM_TRACE_DUAL_SOURCE=1 列出多綁目標的雙來源繪製（著色器內容雜湊、RT0 混色因子、各目標格式），每組只列一次。
         static const bool trace_dual=std::getenv("X64ARM_TRACE_DUAL_SOURCE")!=nullptr;
@@ -906,12 +908,18 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
             }
         }
         if(extra_targets && skip_dual)return;
-        if(extra_targets || unbound){
+        if(extra_targets || unbound || !missing.empty()){
             auto fixed=std::make_unique<GraphicsDraw>(d);
             if(extra_targets)for(unsigned i=1;i<fixed->targets.size();++i)fixed->targets[i]={};
-            if(unbound){
+            if(unbound || !missing.empty()){
                 if(!zero_vertices_){GraphicsResourceDesc zero;zero.dimension=1;zero.width=4096;zero.bind=1;zero_vertices_=graphics_resource(zero);}
                 for(unsigned slot=0;slot<32;++slot)if(unbound&(1U<<slot))fixed->vertices[slot]=GraphicsVertexBuffer{zero_vertices_,0,0};
+                // 缺少的輸入接到一個佈局與緩衝都沒用到的槽。
+                for(auto& element:missing){
+                    unsigned slot=31;
+                    while(slot && (fixed->vertices[slot].resource || std::any_of(fixed->layout.begin(),fixed->layout.end(),[&](const auto& e){return e.slot==slot;})))--slot;
+                    element.slot=slot;fixed->vertices[slot]=GraphicsVertexBuffer{zero_vertices_,0,0};fixed->layout.push_back(std::move(element));
+                }
             }
             graphics_draw(*fixed);return;
         }

@@ -40,9 +40,11 @@ public:
     void unlock_shared() noexcept {
         --depth_;readers_[slot()].count.fetch_sub(1,std::memory_order_release);
     }
+    // 這條執行緒是否持獨占鎖（等背景工作前核對，避免與被擋住的讀者互等）。
+    bool held_exclusive() const noexcept {return exclusive_;}
     void lock() noexcept {
         const auto started=timing()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-        writers_.lock();
+        writers_.lock();exclusive_=true;
         writer_.store(1,std::memory_order_seq_cst);
         std::uint64_t since=0;
         for(auto& reader:readers_)
@@ -54,7 +56,7 @@ public:
         if(timing()){auto& s=stats();s.writer_locks.fetch_add(1,std::memory_order_relaxed);
             s.writer_hold_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-hold_started_).count()),std::memory_order_relaxed);}
         writer_.store(0,std::memory_order_release);
-        writers_.unlock();
+        exclusive_=false;writers_.unlock();
     }
 private:
     static constexpr std::size_t reader_slots=64;
@@ -101,6 +103,7 @@ private:
     std::mutex writers_;
     // 只有單一實例（parallel_mapping_mutex），巢狀深度以執行緒區域變數記錄即可。
     static inline thread_local unsigned depth_{};
+    static inline thread_local bool exclusive_{};
 };
 // worker 服務入口持有的映射共用鎖（其他路徑為空）：D3D11 繪製前置路徑通過資格後可提早放開，之後不再碰客體記憶體。
 // 放開後才失敗時拋 D3D11RelockMapping：完整路徑要讀客體記憶體，由 worker 入口依鎖序（映射 → 圖形）重新取鎖後再呼叫一次。

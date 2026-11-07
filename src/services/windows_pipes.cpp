@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "windows_file_copy.hpp"
+#include "service_callback_task.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/security_access.hpp"
 #include "x64arm/serial.hpp"
@@ -522,8 +523,46 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_lock(GuestState& state
         auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::FileIo;thread.wait.handles={io.handle};schedule(state,memory);return std::nullopt;
     }catch(const MemoryFault&){return finish(998);}catch(const std::bad_alloc&){return finish(8);}
 }
+// CallNamedPipe：開啟、忙碌時等待一次、切換訊息讀取模式、交易、關閉。每一步都走既有服務，阻塞與跨程序語義沿用同一份實作。
+std::optional<std::uint32_t> WindowsServices::invoke_call_named_pipe(GuestState& entry_state,GuestMemory& entry_memory,const WindowsServiceDescriptor& service){
+    return service_callback::invoke<std::optional<std::uint32_t>>(
+        this,threads_.current,entry_state,entry_memory,"CallNamedPipe",
+        [this](GuestState& state,GuestMemory& memory,std::uint64_t target,std::vector<std::uint64_t> args,std::uint64_t id){
+            start_callbacks(state,memory,{{target,std::move(args)}},Continuation::NestedResult,id);
+        },
+        [this,service](GuestState& state,GuestMemory& memory)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(state,memory,service);
+            const auto done=[&](std::uint32_t value){call.return_to(state,value);return std::optional<std::uint32_t>{};};
+            const bool wide=service.symbol.ends_with('W');
+            const auto invalid=x86_?UINT64_C(0xffffffff):UINT64_MAX;
+            const auto name=call(0),input=call(1),output=call(3),read=call(5);
+            const auto input_size=static_cast<std::uint32_t>(call(2)),output_size=static_cast<std::uint32_t>(call(4)),timeout=static_cast<std::uint32_t>(call(6));
+            const auto create=resolve("kernel32.dll",wide?"CreateFileW":"CreateFileA").value;
+            auto pipe=co_await service_callback::call_value(create,{name,0xc0000000U,0,0,3,0x80,0});
+            if(pipe==invalid){
+                (void)co_await service_callback::call(resolve("kernel32.dll",wide?"WaitNamedPipeW":"WaitNamedPipeA").value,{name,timeout});
+                pipe=co_await service_callback::call_value(create,{name,0xc0000000U,0,0,3,0x80,0});
+                if(pipe==invalid)co_return done(0);
+            }
+            const auto close=resolve("kernel32.dll","CloseHandle").value;
+            const auto scratch=allocate_heap(memory,4);
+            if(!scratch){(void)co_await service_callback::call(close,{pipe});last_error_=8;co_return done(0);}
+            memory.store(GuestAddress{scratch},32,2);// PIPE_READMODE_MESSAGE | PIPE_WAIT
+            const auto set_mode=co_await service_callback::call(resolve("kernel32.dll","SetNamedPipeHandleState").value,{pipe,scratch,0,0});
+            auto error=last_error_;(void)free_heap(memory,scratch,state);
+            std::uint32_t result=0;
+            if(static_cast<std::uint32_t>(set_mode)){
+                result=static_cast<std::uint32_t>(co_await service_callback::call(resolve("kernel32.dll","TransactNamedPipe").value,{pipe,input,input_size,output,output_size,read,0}));
+                error=last_error_;
+            }
+            (void)co_await service_callback::call(close,{pipe});
+            last_error_=error;
+            co_return done(result);
+        });
+}
 std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, GuestMemory &memory,
                                                              const WindowsServiceDescriptor &service,const FileOpenArguments* arguments) {
+    if(service.symbol=="CallNamedPipeA" || service.symbol=="CallNamedPipeW")return invoke_call_named_pipe(state,memory,service);
     if(service.symbol=="LockFile" || service.symbol=="UnlockFile" || service.symbol=="LockFileEx" || service.symbol=="UnlockFileEx")return invoke_file_lock(state,memory,service);
     if(service.symbol=="GetOverlappedResult" || service.symbol=="GetOverlappedResultEx")return invoke_overlapped_result(state,memory,service);
     const WindowsCall frame(state, memory, service);

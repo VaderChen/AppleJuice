@@ -97,7 +97,7 @@ x64 OpenCL 與 Vulkan 分別使用 macOS OpenCL.framework 與 Vulkan loader／Mo
 
 ### Direct3D 11
 
-提供裝置與 context、資源與 view、DXBC 著色器轉譯、Draw／Dispatch 及 DXGI 呈現，包含圖形與 GPU 運算。D3D11.1～11.4 介面轉接至同一套處理流程，著色器可於背景轉譯。進階功能、格式與擴充介面仍須依程式需求確認；feature level 不代表完整 11.x 相容。
+提供裝置與 context、資源與 view、DXBC 著色器轉譯、Draw／Dispatch 及 DXGI 呈現，包含圖形與 GPU 運算。D3D11.1～11.4 介面轉接至同一套處理流程，著色器可於背景轉譯。進階功能、格式與擴充介面仍須依程式需求確認；feature level 不代表完整 11.x 相容。多 vCPU 時，不回傳結果的方法會經命令串流交由獨立執行緒依序執行，減少繪圖執行緒的等待（`X64ARM_D3D11_STREAM=0` 關閉）。
 
 ### Direct3D 12
 
@@ -120,7 +120,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 
 儲存庫包含 `src/`、`include/`、`launcher/`、`cmake/`、必要建置腳本、`third_party/`、`x64kernel/` 與使用文件。
 
-## 實測紀錄（2026-10～11）
+## 實測紀錄 / 2026-11-07 / 共 18 款遊戲
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="無法運作、但正在處理" title="無法運作、但正在處理"> 無法運作、但正在處理　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="可啟動到主畫面" title="可啟動到主畫面"> 可啟動到主畫面　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="可運作、效率不高" title="可運作、效率不高"> 可運作、效率不高　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="運作良好" title="運作良好"> 運作良好
 
@@ -146,6 +146,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 光與影：33號遠征隊 | x64 | D3D11（Unreal Engine 5） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
 | 潛水員戴夫 | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可啟動到主畫面" title="可啟動到主畫面"> |
 | 特警 Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可啟動到主畫面" title="可啟動到主畫面"> |
+| 古墓奇兵：崛起 | x64 | D3D11 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可啟動到主畫面" title="可啟動到主畫面"> |
 
 實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
 

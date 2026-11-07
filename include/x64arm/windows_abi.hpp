@@ -177,6 +177,7 @@ std::span<const WindowsServiceDescriptor> certificate_decode_service_descriptors
 std::span<const WindowsServiceDescriptor> certificate_key_service_descriptors();
 std::span<const WindowsServiceDescriptor> certificate_find_service_descriptors();
 std::span<const WindowsServiceDescriptor> dpapi_service_descriptors();
+std::span<const WindowsServiceDescriptor> credential_service_descriptors();
 std::span<const WindowsServiceDescriptor> memory_service_descriptors();
 std::span<const WindowsServiceDescriptor> network_service_descriptors();
 std::span<const WindowsServiceDescriptor> mpr_service_descriptors();

@@ -306,6 +306,7 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_PARALLEL_SERVICES");return !setting || std::string_view(setting)!="0";}();
     if(!enabled || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled() || runtime_.forced_exit_code())return false;
     if(graphics_worker_service(address) || d3d12_worker_service(address))return true; // 指標非空即可在 worker 執行。
+    if(d3d11_stream_ && d3d11_stream_worker_stub(address))return true; // Present 排入命令串流，或先等佇列清空再交回協調者。
     // x64 其餘資格只由 stub 的描述表與固定的環境開關決定：每個 stub 第一次判定後快取，之後只查表
     // （worker 服務每次呼叫入口與核心出口各查一次，原本每次經 name() 與十多次字串比對）。圖形與 D3D12 依裝置狀態，不快取。
     static const std::unique_ptr<std::atomic<std::uint8_t>[]> cache=[] {
@@ -372,6 +373,12 @@ ResidentServiceProgress WindowsServices::resident_parallel_service(GuestState& s
 bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory& memory,bool& retry,
                                                   std::span<GuestState* const> active) {
     if(!parallel_service(state.rip))return false;
+    // D3D11 命令串流：分類與 drain 都在取映射鎖之前，見 d3d11_command_stream.inc。
+    if(d3d11_stream_){
+        const auto step=d3d11_stream_entry(state,memory);
+        if(step==D3D11StreamStep::Done)return true;
+        if(step==D3D11StreamStep::Refuse || step==D3D11StreamStep::Coordinator)return false;
+    }
     std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
     struct CountScope {
         WindowsServices& self;std::uint64_t rip;std::chrono::steady_clock::time_point start;
@@ -402,6 +409,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(!d3d11_local_eligible(state,memory,descriptor) || !graphics_worker_outputs_private(state,memory,descriptor))return false;
         count_scope.accepted=true;
         struct Local {~Local(){graphics_local()=false;}} local;graphics_local()=true;
+        const auto stream_context=state.reg(Gpr::Rcx);const auto stream_teb=state.gs_base;
         // Draw*／Dispatch* 的前置路徑可提早放開映射鎖；其他方法不必多寫一次執行緒區域變數。
         const bool may_release_mapping=descriptor.symbol.front()=='D';
         struct MappingGuardScope {bool set;~MappingGuardScope(){if(set)detail::d3d11_worker_mapping_guard()=nullptr;}} mapping_guard_scope{may_release_mapping};
@@ -414,6 +422,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             graphics_lock.unlock();mapping_guard.lock();lock_graphics(graphics_lock);
             if(invoke_d3d11(state,memory,descriptor))throw std::logic_error("worker 上的 D3D11 服務意外終止客體");
         }
+        if(d3d11_stream_ && !x86_ && mapping_guard.owns_lock())d3d11_stream_claim(memory,stream_context,stream_teb);
         state.rep_compare={};
         return true;
     }

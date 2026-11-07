@@ -13,6 +13,7 @@ inline constexpr std::pair<std::string_view,std::string_view> crt_export_aliases
     {"_recalloc_crt","_recalloc"},{"_recalloc_base","_recalloc"},
     {"_free_base","free"},{"_msize_base","_msize"},
     {"__CppXcptFilter","_seh_filter_dll"},{"__set_app_type","_set_app_type"},
+    {"_wcsicoll","_wcsicmp"},{"_wcsnicoll","_wcsnicmp"},{"_stricoll","_stricmp"},{"_strnicoll","_strnicmp"}, // C／POSIX locale 的排序即不分大小寫比較。
     {"getwc","fgetwc"},{"putwc","fputwc"},{"strtoumax","strtoull"},{"strtoimax","strtoll"},
     {"_hypot","hypot"},{"__p__timezone","__timezone"},{"__p__daylight","__daylight"},{"__p__tzname","__tzname"},
     {"acosl","acos"},{"acoshl","acosh"},{"asinl","asin"},{"asinhl","asinh"},

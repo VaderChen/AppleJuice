@@ -1,4 +1,5 @@
 #include "x64arm/midi.hpp"
+#include "audio_capture.hpp"
 #include "audio_device.hpp"
 #include <AudioUnit/AudioUnit.h>
 #include <AudioToolbox/AudioToolbox.h>
@@ -17,6 +18,7 @@ namespace x64arm::midi {
 namespace {
 class Synth final:public Output {
     AudioUnit synth_{},output_{};std::shared_ptr<Playback> playback_;double sample_time_{};
+    std::unique_ptr<audio::OutputCapture> capture_;
     struct BankUnit {AudioUnit unit{};std::shared_ptr<const SoundBank> bank;std::string path;};
     std::vector<BankUnit> banks_;std::array<unsigned,16> bank_msb_{},bank_lsb_{},program_{};
     std::array<std::array<std::uint8_t,3>,16*131> controls_{};
@@ -66,6 +68,7 @@ class Synth final:public Output {
                 const auto* samples=static_cast<const float*>(buffer.mData);const auto count=std::min<std::size_t>(buffer.mDataByteSize/sizeof(float),static_cast<std::size_t>(frames)*buffer.mNumberChannels);
                 for(std::size_t n=0;n<count;++n){const auto peak=std::abs(samples[n]);self.playback_->rendered_peak=std::max(self.playback_->rendered_peak,peak);const auto channel=data->mNumberBuffers==1?n%2:i%2;self.playback_->rendered_channel_peak[channel]=std::max(self.playback_->rendered_channel_peak[channel],peak);}}
         }
+        if(self.capture_ && data->mNumberBuffers==2 && data->mBuffers[0].mData && data->mBuffers[1].mData)self.capture_->push_planar(static_cast<const float*>(data->mBuffers[0].mData),static_cast<const float*>(data->mBuffers[1].mData),frames);
         return noErr;
     }
     static void check(OSStatus status){if(status!=noErr)throw std::runtime_error("Core Audio MIDI synthesizer unavailable: "+std::to_string(status));}
@@ -82,6 +85,7 @@ public:
             check(AudioUnitSetProperty(synth_,kAudioUnitProperty_StreamFormat,kAudioUnitScope_Output,0,&f,sizeof(f)));
             check(AudioUnitSetProperty(output_,kAudioUnitProperty_StreamFormat,kAudioUnitScope_Input,0,&f,sizeof(f)));
             UInt32 maximum=4096;check(AudioUnitSetProperty(synth_,kAudioUnitProperty_MaximumFramesPerSlice,kAudioUnitScope_Global,0,&maximum,sizeof(maximum)));
+            capture_=audio::OutputCapture::open("midi",48000,this);
             AURenderCallbackStruct callback{render,this};check(AudioUnitSetProperty(output_,kAudioUnitProperty_SetRenderCallback,kAudioUnitScope_Input,0,&callback,sizeof(callback)));
             check(AudioUnitInitialize(synth_));check(AudioUnitInitialize(output_));check(AudioOutputUnitStart(output_));
         }catch(...){close();throw;}

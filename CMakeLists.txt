@@ -247,7 +247,7 @@ target_sources(x64arm_windows PRIVATE src/services/windows_serial.cpp src/platfo
 target_sources(x64arm_windows PRIVATE src/services/windows_console.cpp src/platform/console.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_wave_input.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_winmm_mixer.cpp)
-target_sources(x64arm_windows PRIVATE src/services/windows_legacy_crypto_provider.cpp src/services/windows_crypto_keysets.cpp src/services/private_key_store.cpp src/services/windows_dpapi.cpp src/services/crypto_aead.cpp src/services/windows_legacy_crypto_cipher.cpp src/services/crypto_cipher.cpp)
+target_sources(x64arm_windows PRIVATE src/services/windows_legacy_crypto_provider.cpp src/services/windows_crypto_keysets.cpp src/services/private_key_store.cpp src/services/windows_dpapi.cpp src/services/windows_credentials.cpp src/services/crypto_aead.cpp src/services/windows_legacy_crypto_cipher.cpp src/services/crypto_cipher.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_nt_registry.cpp src/services/windows_registry_security.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_creation.cpp src/services/windows_dialog.cpp src/services/windows_property_sheet.cpp src/services/windows_cbt_actions.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_ui_helpers.cpp src/services/windows_gray_string.cpp)

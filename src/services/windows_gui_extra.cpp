@@ -442,7 +442,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
                 if(native_gui_ && interactive_station())if(const auto idle=native_gui_->input_idle_milliseconds()){const auto now=runtime_.clock_ticks/10000;tick=std::max(tick,now-std::min(now,*idle));}
                 memory.store(GuestAddress{arg(0)+4},32,static_cast<std::uint32_t>(tick));result=1;}
         }catch(const MemoryFault&){fail(998);}
-    } else if(symbol=="SetCursorPos"){
+    } else if(symbol=="SetCursorPos" || symbol=="SetPhysicalCursorPos"){ // 虛擬桌面固定 96 DPI，實體座標與邏輯座標相同。
         if(!interactive_station() || gui_.input_desktop!=thread_desktop_object(threads_.current) || (gui_.station_handle && !(gui_.user_handles.at(gui_.station_handle).access&0x10)))fail(5);
         else {auto x=signed_word(arg(0)),y=signed_word(arg(1));if(gui_.cursor_clip){const auto& rect=*gui_.cursor_clip;x=std::clamp(x,rect[0],rect[2]-1);y=std::clamp(y,rect[1],rect[3]-1);}
             if(native_gui_ && !native_gui_->set_cursor_position(x,y))fail(5);else{gui_.pointer_position={x,y};if(native_gui_)dinput_cursor_warped();result=1;}}
@@ -452,7 +452,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
         else {memory.check(GuestAddress{arg(0)},size,Access::Write);if(native_gui_)if(const auto position=native_gui_->cursor_position())gui_.pointer_position=*position;
             memory.store(GuestAddress{arg(0)+4},32,gui_.cursor && gui_.cursor_count>=0?1:0);memory.store(GuestAddress{arg(0)+8},x86_?32:64,gui_.cursor);
             memory.store(GuestAddress{arg(0)+point},32,static_cast<std::uint32_t>(gui_.pointer_position[0]));memory.store(GuestAddress{arg(0)+point+4},32,static_cast<std::uint32_t>(gui_.pointer_position[1]));result=1;}
-    } else if (symbol == "GetCursorPos") {
+    } else if (symbol == "GetCursorPos" || symbol == "GetPhysicalCursorPos") {
         if (!arg(0)) fail(87);
         else {
             memory.check(GuestAddress{arg(0)}, 8, Access::Write);

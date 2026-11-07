@@ -95,7 +95,7 @@ D3D10/D3D10.1 장치, 리소스, 셰이더, 렌더링 및 DXGI 스왑 체인을 
 
 ### Direct3D 11
 
-장치와 컨텍스트, 리소스와 뷰, DXBC 셰이더 변환, Draw/Dispatch 및 DXGI 화면 출력을 제공하며 그래픽과 GPU 연산 경로를 포함합니다. D3D11.1~11.4 인터페이스는 같은 처리 경로로 연결되며 셰이더는 백그라운드에서 변환할 수 있습니다. 고급 기능, 형식 및 확장 인터페이스는 프로그램의 요구 사항에 따라 확인해야 합니다. 보고된 feature level이 완전한 11.x 호환성을 의미하지는 않습니다.
+장치와 컨텍스트, 리소스와 뷰, DXBC 셰이더 변환, Draw/Dispatch 및 DXGI 화면 출력을 제공하며 그래픽과 GPU 연산 경로를 포함합니다. D3D11.1~11.4 인터페이스는 같은 처리 경로로 연결되며 셰이더는 백그라운드에서 변환할 수 있습니다. 고급 기능, 형식 및 확장 인터페이스는 프로그램의 요구 사항에 따라 확인해야 합니다. 보고된 feature level이 완전한 11.x 호환성을 의미하지는 않습니다. vCPU가 여러 개일 때 반환값이 없는 메서드는 명령 스트림을 거쳐 전용 스레드에서 순서대로 실행되어 렌더링 스레드의 대기가 줄어듭니다(`X64ARM_D3D11_STREAM=0`으로 끔).
 
 ### Direct3D 12
 
@@ -118,7 +118,7 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 
 저장소에는 `src/`, `include/`, `launcher/`, `cmake/`, 필수 빌드 스크립트, `third_party/`, `x64kernel/` 및 사용 문서가 포함되어 있습니다.
 
-## 실측 기록(2026년 10~11월)
+## 실측 기록 / 2026-11-07 / 게임 총 18개
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="동작하지 않지만 작업 중" title="동작하지 않지만 작업 중"> 동작하지 않지만 작업 중 · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="메인 화면까지 실행" title="메인 화면까지 실행"> 메인 화면까지 실행 · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> 동작하지만 효율이 낮음 · <img src="docs/images/support-levels/good.png" width="16" height="16" alt="원활히 동작" title="원활히 동작"> 원활히 동작
 
@@ -144,6 +144,7 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 | 클레르 옵스퀴르: 33 원정대 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="메인 화면까지 실행" title="메인 화면까지 실행"> |
 | 데이브 더 다이버 | x64 | D3D11(Unity) | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="메인 화면까지 실행" title="메인 화면까지 실행"> |
+| 라이즈 오브 더 툼 레이더 | x64 | D3D11 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="메인 화면까지 실행" title="메인 화면까지 실행"> |
 
 실측 기록은 당시 버전과 설정 기준이며, 전체 게임 진행, 다른 버전 또는 모든 설정에서의 동작을 의미하지 않습니다.
 

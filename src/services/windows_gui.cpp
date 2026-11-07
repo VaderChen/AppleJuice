@@ -189,7 +189,7 @@ void WindowsServices::erase_window(std::uint64_t handle,bool destroy_menus) {
     gui_.native_attention_windows.erase(handle);
     cancel_power_notifications(handle);
     erase_mdi_window(handle);
-    gui_.window_themes.erase(handle);for(auto& [theme,data]:gui_.themes){(void)theme;if(data.window==handle)data.window=0;}
+    gui_.window_themes.erase(handle);gui_.dialog_textures.erase(handle);for(auto& [theme,data]:gui_.themes){(void)theme;if(data.window==handle)data.window=0;}
     release_raw_input(0,handle);
     std::erase_if(gui_.hotkeys,[&](const auto& entry){return entry.window==handle;});
     std::vector<std::uint64_t> canceled_sends;

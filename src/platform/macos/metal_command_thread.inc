@@ -203,9 +203,9 @@ private:
                 ;
 #endif
             if(completed_.load(std::memory_order_acquire)<target){
-                std::unique_lock lock(mutex_);waiting_=true;
+                std::unique_lock lock(mutex_);++waiting_; // 可能同時有多個等待者（D3D11 命令串流的 Present 前同步不持圖形鎖）。
                 idle_cv_.wait(lock,[&]{return completed_.load(std::memory_order_acquire)>=target;});
-                waiting_=false;
+                --waiting_;
             }
         }
         if(failed_.load(std::memory_order_acquire)){
@@ -289,7 +289,7 @@ private:
     std::atomic<std::uint64_t> completed_{},queued_{},busy_ns_{};
     SyncWaits until_waits_,full_waits_;
     std::atomic<bool> failed_{},stop_requested_{};
-    bool stopping_{},sleeping_{},waiting_{};
+    bool stopping_{},sleeping_{};unsigned waiting_{};
     std::exception_ptr error_;
     std::thread worker_;
 };

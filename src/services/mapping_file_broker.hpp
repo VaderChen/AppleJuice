@@ -1,6 +1,7 @@
 #pragma once
 // 命名 section 傳遞真正的檔案描述符，保留 rename／unlink 後的 inode。
 // 此服務僅等待 FD 請求；不掃描檔案、不執行背景清理。
+#include "unix_socket_endpoint.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -55,7 +56,7 @@ struct Broker {
         sockaddr_un location{};
         if(name.size()>=32 || !address(path,location))throw std::runtime_error("section FD socket 路徑過長");
         server.value=::socket(AF_UNIX,SOCK_STREAM,0);if(server.value<0)throw std::runtime_error("section FD socket 建立失敗");socket_options(server.value);
-        if(::bind(server.value,reinterpret_cast<sockaddr*>(&location),sizeof(location)) || ::listen(server.value,16))throw std::runtime_error("section FD socket 監聽失敗");
+        if(detail::bind_unix_endpoint(server.value,location,SOCK_STREAM) || ::listen(server.value,16))throw std::runtime_error("section FD socket 監聽失敗");
         int stop[2];if(::pipe(stop)){::unlink(path.c_str());throw std::runtime_error("section FD 停止通道建立失敗");}
         read_stop.value=stop[0];write_stop.value=stop[1];(void)::fcntl(stop[0],F_SETFD,FD_CLOEXEC);(void)::fcntl(stop[1],F_SETFD,FD_CLOEXEC);
         try{worker=std::thread([this,file]{

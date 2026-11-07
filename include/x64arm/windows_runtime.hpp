@@ -709,7 +709,7 @@ struct RuntimeState {
     std::uint32_t crt_multibyte_codepage{65001};
     std::vector<CallbackFrame> callbacks;
     std::vector<std::uint64_t> exit_callbacks,quick_exit_callbacks;
-    std::uint64_t purecall_handler{};
+    std::uint64_t purecall_handler{},terminate_handler{};
     std::uint64_t tls_exit_callback{};
     std::array<bool, 1088> tls_used{};
     std::array<std::uint64_t, 1088> tls_values{};

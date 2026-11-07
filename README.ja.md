@@ -95,7 +95,7 @@ D3D10／D3D10.1 のデバイス、リソース、シェーダー、描画、DXGI
 
 ### Direct3D 11
 
-デバイスとコンテキスト、リソースとビュー、DXBC シェーダー変換、Draw／Dispatch、DXGI 表示を提供し、描画と GPU 計算の経路を含みます。D3D11.1～11.4 のインターフェイスは同じ処理経路に接続し、シェーダーはバックグラウンドで変換できます。高度な機能、形式、拡張インターフェイスはアプリケーションの要件に応じて確認が必要です。feature level の表示は 11.x 全体の互換性を示しません。
+デバイスとコンテキスト、リソースとビュー、DXBC シェーダー変換、Draw／Dispatch、DXGI 表示を提供し、描画と GPU 計算の経路を含みます。D3D11.1～11.4 のインターフェイスは同じ処理経路に接続し、シェーダーはバックグラウンドで変換できます。高度な機能、形式、拡張インターフェイスはアプリケーションの要件に応じて確認が必要です。feature level の表示は 11.x 全体の互換性を示しません。複数 vCPU では、戻り値のないメソッドをコマンドストリーム経由で専用スレッドが順に実行し、描画スレッドの待ちを減らします（`X64ARM_D3D11_STREAM=0` で無効）。
 
 ### Direct3D 12
 
@@ -118,7 +118,7 @@ AppleJuice は開発中です。Windows 全体、すべてのアプリケーシ�
 
 リポジトリには `src/`、`include/`、`launcher/`、`cmake/`、必要なビルドスクリプト、`third_party/`、`x64kernel/` と使用ドキュメントを含みます。
 
-## 動作確認の記録（2026 年 10～11 月）
+## 動作確認の記録 / 2026-11-07 / 全 18 本のゲーム
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作しないが対応中" title="動作しないが対応中"> 動作しないが対応中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="メイン画面まで起動" title="メイン画面まで起動"> メイン画面まで起動　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="動作するが効率は低い" title="動作するが効率は低い"> 動作するが効率は低い　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好に動作" title="良好に動作"> 良好に動作
 
@@ -144,6 +144,7 @@ AppleJuice は開発中です。Windows 全体、すべてのアプリケーシ�
 | Clair Obscur: Expedition 33 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | デイヴ・ザ・ダイバー | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="メイン画面まで起動" title="メイン画面まで起動"> |
 | 特警シグナルフォース | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="メイン画面まで起動" title="メイン画面まで起動"> |
+| ライズ オブ ザ トゥームレイダー | x64 | D3D11 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="メイン画面まで起動" title="メイン画面まで起動"> |
 
 記録は当時のバージョンと設定によるもので、ゲーム全体の流れ、他のバージョン、すべての設定での動作を示すものではありません。
 

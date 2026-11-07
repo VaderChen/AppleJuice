@@ -1,4 +1,4 @@
-            graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);present_thread_=threads_.current;
+            graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);if(!d3d11_on_stream_thread)present_thread_=threads_.current;
             require(u32(1)<=4 && !(u32(2)&~0x21bU));
             // 顯示緩衝都在途時，呈現會在 nextDrawable 等到下一次垂直同步；Present 在全體靜止的服務邊界執行，等待期間
             // 所有客體執行緒一起停（DQ3 讀取畫面每幀約 12 ms，讀取執行緒近四成時間被凍結）。改讓呼叫端進入重試等待、
@@ -6,7 +6,7 @@
             // 協調者每 0.25 ms 輪詢等待者；單 vCPU 與依指令預算切時間片的執行要到時間片結束才重新檢查，維持原本的阻塞呈現。
             // X64ARM_PRESENT_WAIT=0 關閉。
             static const bool present_wait=[] {const auto* value=std::getenv("X64ARM_PRESENT_WAIT");return !value || std::string_view(value)!="0";}();
-            if(present_wait && !(u32(2)&1) && resident_execution_depth_>0 && runtime_.processor_count>1 && threads_.items.size()>1 &&
+            if(!d3d11_on_stream_thread && present_wait && !(u32(2)&1) && resident_execution_depth_>0 && runtime_.processor_count>1 && threads_.items.size()>1 &&
                gui_.windows.contains(swap->window) && !swap->native->graphics_present_ready()){
                 std::erase_if(present_waits_,[&](const auto& entry){const auto waiter=threads_.items.find(entry.first);
                     return waiter==threads_.items.end() || waiter->second.status!=ThreadStatus::Waiting || waiter->second.wait.kind!=ThreadWaitKind::PresentRetry;});
@@ -42,6 +42,21 @@
                 }
                 auto producer=object(swap->device).identity->native;
                 static const bool gpu_handoff=[] {const auto* value=std::getenv("X64ARM_METAL_PRESENT_HANDOFF");return !value || std::string_view(value)=="1";}();
+                // 命令串流：整段呈現依序交給命令執行緒（只碰 GPU 資源，不碰客體記憶體），串流執行緒不必等它把前面的繪製編碼完。交換鏈其他方法都走完整服務，那裡會先等呈現做完。
+                const bool stream_present=d3d11_on_stream_thread && gpu_handoff && dirty.empty() && !scroll && view.resource->desc.samples==1 && gui_.windows.contains(swap->window);
+                if(stream_present){
+                    d3d11_stream_post_present(producer,[swap,producer,view,shared_view,interval=u32(1)?1:0]{
+                        producer->graphics_handoff(*swap->native,shared_view);
+                        swap->native->swap_interval(interval);
+                        if(!swap->present_spare){auto desc=view.resource->desc;desc.samples=1;desc.levels=desc.layers=1;desc.bind=0x28;swap->present_spare=swap->native->graphics_resource(desc);}
+                        const GraphicsView composed{swap->present_spare,view.format,0,1,0,1};
+                        swap->native->graphics_copy(composed,view,{},{});
+                        swap->native->graphics_present(composed);
+                        std::swap(swap->present_frame,swap->present_spare);
+                        swap->native->graphics_handoff(*producer,shared_view);
+                    });
+                    record_diagnostic("d3d11_present_local");
+                }else{
                 if(gpu_handoff)producer->graphics_handoff(*swap->native,shared_view);else producer->graphics_flush(true);
                 swap->native->swap_interval(u32(1)?1:0);
                 if(view.resource->desc.samples>1){auto resolved=view_of(swap->bindings.at("PresentResolve")[0]);swap->native->graphics_resolve(resolved,view,view.resource->desc.format);view=resolved;}
@@ -72,6 +87,7 @@
                 else {publish_remote_frame(swap->window,*swap->native,composed);record_diagnostic("d3d11_present_remote");}
                 std::swap(swap->present_frame,swap->present_spare);
                 if(gpu_handoff)swap->native->graphics_handoff(*producer,shared_view);else swap->native->graphics_flush(true);
+                }
                 // Flip model 成功呈現後解除 back buffer 0 的管線綁定與 COM 強參照。
                 // TEST、失敗及 DO_NOT_SEQUENCE 不改綁定；deferred context 的錄製狀態也不受影響。
                 const auto effect=word(swap->desc,x86_?52:60);
@@ -88,6 +104,7 @@
                 static const bool trace_stats=[] {const auto* value=std::getenv("X64ARM_TRACE_GRAPHICS_STATS");return value && std::string_view(value)=="1";}();
                 if(trace_stats && swap->frames%600==0){
                     std::string creations;for(const auto& [name,count]:bridge.resource_creations)creations+=name+":"+std::to_string(count)+",";
+                    d3d11_stream_trace();
                     std::fprintf(stderr,"[d3d11_metal] frames=%llu draws=%llu draw_cache_full=%llu draw_cache_incremental=%llu destroyed_objects=%llu setter_front_hits=%llu setter_front_fallbacks=%llu draw_front_hits=%llu draw_front_fallbacks=%llu d3d11_resource_creations=%s %s\n",static_cast<unsigned long long>(bridge.graphics_frames),
                         static_cast<unsigned long long>(bridge.graphics_draws),static_cast<unsigned long long>(bridge.draw_cache_full),static_cast<unsigned long long>(bridge.draw_cache_incremental),static_cast<unsigned long long>(bridge.destroyed_objects),static_cast<unsigned long long>(bridge.setter_front_hits),static_cast<unsigned long long>(bridge.setter_front_fallbacks),static_cast<unsigned long long>(bridge.draw_front_hits),static_cast<unsigned long long>(bridge.draw_front_fallbacks),creations.empty()?"none":creations.c_str(),producer->statistics().c_str());
                 }

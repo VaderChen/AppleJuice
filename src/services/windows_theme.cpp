@@ -11,7 +11,7 @@ std::span<const WindowsServiceDescriptor> theme_service_descriptors() {
         {"uxtheme.dll","OpenThemeData",2},{"uxtheme.dll","OpenThemeDataEx",3},{"uxtheme.dll","OpenThemeDataForDpi",3},
         {"uxtheme.dll","GetWindowTheme",1},{"uxtheme.dll","CloseThemeData",1},{"uxtheme.dll","SetWindowTheme",3},
         {"uxtheme.dll","SetWindowThemeAttribute",4},{"uxtheme.dll","GetThemeAppProperties",0},{"uxtheme.dll","SetThemeAppProperties",1},
-        {"uxtheme.dll","EnableTheming",1},{"uxtheme.dll","GetCurrentThemeName",6},
+        {"uxtheme.dll","EnableTheming",1},{"uxtheme.dll","EnableThemeDialogTexture",2},{"uxtheme.dll","IsThemeDialogTextureEnabled",1},{"uxtheme.dll","GetCurrentThemeName",6},
         {"uxtheme.dll","DrawThemeBackground",6},{"uxtheme.dll","DrawThemeBackgroundEx",6},
         {"uxtheme.dll","DrawThemeText",9},{"uxtheme.dll","DrawThemeTextEx",9},
         {"uxtheme.dll","GetThemeBackgroundContentRect",6},{"uxtheme.dll","GetThemePartSize",7},
@@ -102,6 +102,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_theme(GuestState& state,Gue
         if(window==gui_.windows.end())last_error_=1400;
         else if(!arg(1))last_error_=87;
         else {memory.check(GuestAddress{arg(1)},24,Access::Read);last_error_=50;}
+    }else if(name=="EnableThemeDialogTexture") {
+        // ETDT_DISABLE 1、ETDT_ENABLE 2、ETDT_USETABTEXTURE 4、ETDT_USEAEROWIZARDTABTEXTURE 8；停用與啟用不可同時指定。
+        const auto flags=static_cast<std::uint32_t>(arg(1));
+        if(!gui_.windows.contains(arg(0)))result=0x80070006U; // E_HANDLE
+        else if((flags&~0xfU) || (flags&3U)==3U)result=0x80070057U; // E_INVALIDARG
+        else {gui_.dialog_textures[arg(0)]=flags;result=0;}
+    }else if(name=="IsThemeDialogTextureEnabled") {
+        const auto found=gui_.dialog_textures.find(arg(0));result=found!=gui_.dialog_textures.end() && (found->second&2U);
     }else if(name=="EnableTheming") {
         if(arg(0) && !native)result=e_notimpl;
         else if(gui_.theme_enabled!=(arg(0)!=0)){

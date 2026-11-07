@@ -1195,6 +1195,27 @@ private:
     std::optional<std::uint32_t> resume_d3d_compile(GuestState&, GuestMemory&, std::uint64_t, std::uint32_t);
     void discard_d3d_compile(GuestState&, GuestMemory&, std::uint64_t);
     std::optional<std::uint32_t> invoke_d3d11(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
+    // D3D11 命令串流（見 d3d11_command_stream.inc）。entry 在 worker 服務入口、取映射鎖之前呼叫。
+    enum class D3D11StreamStep:std::uint8_t {Continue,Done,Refuse,Coordinator};
+    D3D11StreamStep d3d11_stream_entry(GuestState&,GuestMemory&);
+    unsigned d3d11_stream_release(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    bool d3d11_stream_object_eligible(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,bool update,std::uint32_t& width);
+    bool d3d11_stream_get_targets(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    void d3d11_stream_claim(GuestMemory&,std::uint64_t context,std::uint64_t teb);
+    void d3d11_stream_drain() noexcept;
+    void d3d11_stream_resume() noexcept;
+    void d3d11_stream_loop(GuestMemory&,struct D3D11CommandStream&);
+    void d3d11_stream_rethrow();
+    bool d3d11_stream_failed() const noexcept;
+    void d3d11_stream_setup(GuestMemory&,std::uint64_t guest_base);
+    void d3d11_stream_quiesced() noexcept;
+    void d3d11_stream_full_service_sync(const WindowsServiceDescriptor&) noexcept;
+    bool d3d11_stream_present_eligible(const GuestState&) const;
+    void d3d11_stream_prepare_present(struct D3D11CommandStream&,std::uint64_t swap_pointer);
+    template<class Work> void d3d11_stream_post_present(const std::shared_ptr<class NativeOpenGlContext>&,Work);
+    bool d3d11_stream_worker_stub(GuestAddress) const noexcept;
+    void d3d11_stream_coordinated(const GuestState&,bool device_creation) noexcept;
+    void d3d11_stream_trace() const noexcept;
     // 完整 D3D11 分派（巨型函式，堆疊框架約 336 KB）；invoke_d3d11 先以前置快速路徑處理最常見的簡單方法。
     std::optional<std::uint32_t> invoke_d3d11_full(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     // coordinator=true：協調者持獨占映射鎖，可配置／釋放 heap；worker（共用鎖）維持持久映射重用的限制。
@@ -1222,7 +1243,21 @@ private:
     static void lock_graphics(std::unique_lock<std::recursive_mutex>& lock){
         if(lock.try_lock())return;
         const auto start=std::chrono::steady_clock::now();
-        graphics_waiters().fetch_add(1,std::memory_order_relaxed);lock.lock();graphics_waiters().fetch_sub(1,std::memory_order_relaxed);
+        graphics_waiters().fetch_add(1,std::memory_order_relaxed);
+        // 持有者多半只持幾微秒（D3D11 命令串流每筆約 1 µs）：先自旋約 30 µs，進核心等待的喚醒延遲遠大於這段。
+        bool acquired=false;
+#if defined(__aarch64__)
+        {
+            std::uint64_t now=0,frequency=0,since=0;asm volatile("mrs %0, cntvct_el0":"=r"(since));asm volatile("mrs %0, cntfrq_el0":"=r"(frequency));
+            const auto limit=frequency*30U/1000000U;
+            do{
+                for(unsigned i=0;i<16 && !acquired;++i){__builtin_arm_yield();acquired=lock.try_lock();}
+                asm volatile("mrs %0, cntvct_el0":"=r"(now));
+            }while(!acquired && now-since<limit);
+        }
+#endif
+        if(!acquired)lock.lock();
+        graphics_waiters().fetch_sub(1,std::memory_order_relaxed);
         graphics_wait_ns()+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count());
     }
     // 可直接在 worker 上執行的 D3D11 方法；輸出頁另核對 COW，不符資格回傳空指標。
@@ -2138,6 +2173,7 @@ private:
     bool x86_heap_compute_boundary(GuestAddress address) const noexcept;
     std::shared_ptr<struct LdapState> ldap_;
     std::optional<std::uint32_t> invoke_ldap(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_call_named_pipe(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_compatibility(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_crt_character(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,
                                                    const ResidentHostEnvironment* = nullptr);
@@ -2150,6 +2186,7 @@ private:
     bool fill_random(GuestMemory& memory, std::uint64_t address, std::uint64_t size);
     bool random_bytes(std::span<std::uint8_t> bytes);
     std::optional<std::uint32_t> invoke_dpapi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_credentials(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint32_t data_protection_audit(std::u16string_view,std::span<const std::uint8_t>,std::uint32_t,bool,std::uint32_t status=0);
     std::uint32_t legacy_crypto_call(GuestMemory&,const WindowsCall&,std::string_view);
     std::uint64_t acquire_crypto_provider(std::string,std::string,std::uint32_t,std::uint32_t);
@@ -2386,5 +2423,7 @@ private:
     bool initialized_{};
     // 最後宣告：解構時最先等提交執行緒結束，它仍會使用上方的 D3D12 狀態與 GPU 通知佇列。
     std::shared_ptr<struct D3D12Submitter> d3d12_submitter_;
+    // 同樣最後宣告：解構時先停止 D3D11 命令串流執行緒，它仍會使用 d3d11_ 與客體記憶體。
+    std::shared_ptr<struct D3D11CommandStream> d3d11_stream_;
 };
 }

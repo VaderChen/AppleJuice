@@ -306,7 +306,7 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         {"iphlpapi.dll","IcmpCreateFile",0},{"iphlpapi.dll","IcmpCloseHandle",1},{"iphlpapi.dll","IcmpSendEcho",8},{"iphlpapi.dll","IcmpParseReplies",2},
         {"iphlpapi.dll","GetExtendedTcpTable",6,0,0,60},{"iphlpapi.dll","GetTcpTable",3,0,0,4},
         {"iphlpapi.dll","GetAdaptersInfo",2},{"iphlpapi.dll","GetNetworkParams",2},
-        {"iphlpapi.dll","GetIpAddrTable",3},
+        {"iphlpapi.dll","GetIpAddrTable",3},{"iphlpapi.dll","GetIpForwardTable",3},
         {"dnsapi.dll","DnsQuery_A",6},{"dnsapi.dll","DnsQuery_W",6},{"dnsapi.dll","DnsQuery_UTF8",6},
         {"dnsapi.dll","DnsFree",2},{"dnsapi.dll","DnsRecordListFree",2},
         {"iphlpapi.dll","IpReleaseAddress",1},{"iphlpapi.dll","IpRenewAddress",1},

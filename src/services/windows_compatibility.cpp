@@ -161,7 +161,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"advapi32.dll","InitiateShutdownA",5},{"advapi32.dll","InitiateShutdownW",5},
         {"shell32.dll", "CommandLineToArgvW", 2}, {"kernel32.dll", "LocalFree", 1},
         {"kernel32.dll","LocalAlloc",2},{"kernel32.dll","LocalLock",1},{"kernel32.dll","LocalUnlock",1},
-        {"kernel32.dll","LocalReAlloc",3},
+        {"kernel32.dll","LocalReAlloc",3},{"faultrep.dll","ReportFault",2},
         {"kernel32.dll","RtlCaptureStackBackTrace",4},{"ntdll.dll","RtlCaptureStackBackTrace",4},
         {"kernel32.dll","CaptureStackBackTrace",4},
         {"ntdll.dll","RtlGetCallersAddress",2},
@@ -172,6 +172,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll","GetNamedPipeClientProcessId",2},{"kernel32.dll","GetNamedPipeServerProcessId",2},
         {"kernel32.dll","GetNamedPipeHandleStateA",7},{"kernel32.dll","GetNamedPipeHandleStateW",7},
         {"kernel32.dll","WaitNamedPipeA",2},{"kernel32.dll","WaitNamedPipeW",2},
+        {"kernel32.dll","CallNamedPipeA",7},{"kernel32.dll","CallNamedPipeW",7},
         {"kernel32.dll","LockFile",5},{"kernel32.dll","UnlockFile",5},{"kernel32.dll","LockFileEx",6},{"kernel32.dll","UnlockFileEx",5},
         {"kernel32.dll","CancelIo",1},{"kernel32.dll","CancelIoEx",2},
         {"kernel32.dll","EncodePointer",1},{"kernel32.dll","DecodePointer",1},
@@ -343,6 +344,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     if(service.symbol.starts_with("CM_") || service.symbol.starts_with("SetupDi") || service.symbol.starts_with("SetupGetInf") || service.symbol.starts_with("SetupCopyOEMInf") ||
        service.symbol.starts_with("SetupUninstallOEMInf") || service.family=="newdev.dll")return invoke_device_configuration(state,memory,service);
     if(service.family=="wldap32.dll")return invoke_ldap(state,memory,service);
+    // 沒有 Windows 錯誤回報（Dr. Watson）服務：回報 frrvErrNoDW，呼叫端照常走自己的崩潰處理。
+    if(service.symbol=="ReportFault"){WindowsCall(state,memory,service).return_to(state,4);return std::nullopt;}
     const auto module_api=service.symbol;
     if(service.family=="x3daudio1_7.dll"){const WindowsCall call(state,memory,service);const auto result=x3daudio::invoke(memory,call,state,module_api=="X3DAudioInitialize",x86_);call.return_to(state,result);return std::nullopt;}
     if(module_api.starts_with("BluetoothSdp")){const WindowsCall call(state,memory,service);call.return_to(state,bluetooth_sdp::invoke(memory,call,module_api,x86_));return std::nullopt;}

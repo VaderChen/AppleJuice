@@ -120,7 +120,7 @@ std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
         {"crt","?before@type_info@@QEBA_NAEBV1@@Z",2},{"crt","?before@type_info@@QBE_NABV1@@Z",1},
         {"crt","?raw_name@type_info@@QEBAPEBDXZ",1},{"crt","?raw_name@type_info@@QBEPBDXZ",0},
         {"crt","_seh_filter_dll",2},{"crt","_seh_filter_exe",2},{"crt","_amsg_exit",1},{"crt","_assert",3},{"crt","_wassert",3},{"crt","_except_handler3",4},{"crt","_except_handler4_common",6},
-        {"crt","_set_error_mode",1},{"crt","_set_purecall_handler",1},{"crt","_get_purecall_handler",0},
+        {"crt","_set_error_mode",1},{"crt","_set_purecall_handler",1},{"crt","_get_purecall_handler",0},{"crt","set_terminate",1},{"crt","_get_terminate",0},
         {"crt","_local_unwind2",2},{"crt","_seh_longjmp_unwind",1},{"crt","__CxxLongjmpUnwind",1},{"crt","_abnormal_termination",0},
         {"crt","__unDName",6},{"crt","__unDNameEx",7},{"crt","__std_type_info_destroy_list",1},{"crt","__clean_type_info_names_internal",1},
         {"crt","__std_type_info_name",2},{"crt","__std_type_info_compare",2},{"crt","__std_type_info_hash",1}
@@ -362,6 +362,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,Gues
         return invoke_msvc(state,memory,WindowsServiceDescriptor{"crt","_XcptFilter",2});
     }
     if(symbol=="__unDName" || symbol=="__unDNameEx" || symbol=="__clean_type_info_names_internal" || symbol.starts_with("__std_type_info_"))return invoke_demangle(state,memory,service);
+    if(symbol=="set_terminate" || symbol=="_get_terminate"){
+        const auto previous=runtime_.terminate_handler;
+        if(symbol=="set_terminate")runtime_.terminate_handler=arg(0);
+        arg.return_to(state,previous);return std::nullopt;
+    }
+    if((symbol=="?terminate@@YAXXZ" || symbol=="terminate" || symbol=="__std_terminate") && runtime_.terminate_handler){
+        // 處理常式不應返回；返回時與 abort 相同以 3 結束。
+        start_callbacks(state,memory,{{runtime_.terminate_handler,{}}},Continuation::Exit,3);return std::nullopt;
+    }
     if(symbol=="_set_purecall_handler" || symbol=="_get_purecall_handler"){
         const auto previous=runtime_.purecall_handler;
         if(symbol=="_set_purecall_handler")runtime_.purecall_handler=arg(0);

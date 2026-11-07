@@ -291,6 +291,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
             {certificate_key_service_descriptors(), false},
             {certificate_find_service_descriptors(), false},
             {dpapi_service_descriptors(), false},
+            {credential_service_descriptors(), false},
             {dbghelp_symbol_service_descriptors(), false},
             {minidump_service_descriptors(), false},
             {heap_service_descriptors(), false},
@@ -384,6 +385,8 @@ std::vector<std::uint8_t> bytes_of(std::string_view value) {
     std::vector<std::uint8_t> bytes(value.begin(), value.end()); bytes.push_back(0); return bytes;
 }
 bool crt_format_symbol(std::string_view symbol) noexcept {
+    // scanf 家族走 windows_crt_scan：名稱也是 __stdio_common_vs 開頭，當成 printf 會把輸出參數的指標寫回來源字串。
+    if(symbol.find("scanf")!=symbol.npos)return false;
     if(symbol.starts_with("__conio_common_vc") || symbol.starts_with("_cprintf") || symbol.starts_with("_cwprintf") || symbol.starts_with("_vcprintf") || symbol.starts_with("_vcwprintf"))return true;
     return symbol=="printf" || symbol=="vprintf" || symbol=="wprintf" || symbol=="vwprintf" || symbol=="fwprintf" || symbol=="vfwprintf" || symbol=="fprintf" || symbol=="vfprintf" || symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf" || symbol=="__stdio_common_vfprintf_s" || symbol=="__stdio_common_vfwprintf_s" || symbol=="__stdio_common_vfprintf_p" || symbol=="__stdio_common_vfwprintf_p" || symbol=="snprintf" || symbol=="vsnprintf" || symbol.starts_with("__stdio_common_vs") || symbol=="sprintf" || symbol=="vsprintf" || symbol=="sprintf_s" || symbol=="vsprintf_s" || symbol=="swprintf_s" || symbol=="vswprintf_s" || symbol=="_snprintf" || symbol=="_vsnprintf" || symbol=="_snwprintf" || symbol=="_vsnwprintf" || symbol=="_snprintf_s" || symbol=="_vsnprintf_s" || symbol=="_snwprintf_s" || symbol=="_vsnwprintf_s" || symbol=="_scprintf" || symbol=="_vscprintf" || symbol=="_scwprintf" || symbol=="_vscwprintf";
 }
@@ -2259,6 +2262,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         if (service.family == "ws2_32.dll" || service.family=="mswsock.dll" || service.family=="dnsapi.dll") return &WindowsServices::invoke_network;
         if (service.family == "mpr.dll") return &WindowsServices::invoke_mpr;
         if(detail::service_descriptor_contains<dpapi_service_descriptors>(service,reuse))return &WindowsServices::invoke_dpapi;
+        if(detail::service_descriptor_contains<credential_service_descriptors>(service,reuse))return &WindowsServices::invoke_credentials;
         if(detail::service_descriptor_contains<certificate_find_service_descriptors>(service,reuse))return &WindowsServices::invoke_certificate_find;
         if(detail::service_descriptor_contains<certificate_key_service_descriptors>(service,reuse))return &WindowsServices::invoke_certificate_key;
         if(detail::service_descriptor_contains<certificate_decode_service_descriptors>(service,reuse))return &WindowsServices::invoke_certificate_decode;

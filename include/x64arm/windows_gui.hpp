@@ -1073,6 +1073,7 @@ struct GuiState : GuiStationNamespace {
     bool theme_enabled{true};
     std::map<std::uint64_t,GuiThemeData> themes{};
     std::map<std::uint64_t,std::uint64_t> window_themes{};
+    std::map<std::uint64_t,std::uint32_t> dialog_textures{}; // EnableThemeDialogTexture 的 ETDT_* 旗標。
     std::map<std::uint64_t,GuiThemeText> theme_text_operations{};
     std::map<std::uint64_t,GuiCbtAction> cbt_actions;
     std::map<std::uint64_t,std::pair<std::uint64_t,std::string>> cbt_replay;

@@ -95,7 +95,7 @@ Provides D3D10/D3D10.1 devices, resources, shaders, drawing and DXGI swap chains
 
 ### Direct3D 11
 
-Provides devices and contexts, resources and views, DXBC shader translation, Draw/Dispatch and DXGI presentation, covering graphics and GPU compute paths. D3D11.1–11.4 interfaces are routed through the same processing path, and shaders can be translated in the background. Advanced features, formats and extended interfaces depend on the application's requirements; a reported feature level does not establish complete 11.x compatibility.
+Provides devices and contexts, resources and views, DXBC shader translation, Draw/Dispatch and DXGI presentation, covering graphics and GPU compute paths. D3D11.1–11.4 interfaces are routed through the same processing path, and shaders can be translated in the background. Advanced features, formats and extended interfaces depend on the application's requirements; a reported feature level does not establish complete 11.x compatibility. With multiple vCPUs, methods that return nothing go through a command stream and run in order on a dedicated thread, so the rendering thread waits less (`X64ARM_D3D11_STREAM=0` turns it off).
 
 ### Direct3D 12
 
@@ -118,7 +118,7 @@ AppleJuice is under active development. Complete Windows support, all applicatio
 
 The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required build scripts, `third_party/`, `x64kernel/` and user documentation.
 
-## Tested applications (October–November 2026)
+## Tested applications / 2026-11-07 / 18 games
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="Does not work yet; being worked on" title="Does not work yet; being worked on"> Does not work yet; being worked on · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="Launches to the main screen" title="Launches to the main screen"> Launches to the main screen · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Works, with limited performance" title="Works, with limited performance"> Works, with limited performance · <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> Works well
 
@@ -144,6 +144,7 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 | Clair Obscur: Expedition 33 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | DAVE THE DIVER | x64 | D3D11 (Unity) | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="Launches to the main screen" title="Launches to the main screen"> |
 | Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="Launches to the main screen" title="Launches to the main screen"> |
+| Rise of the Tomb Raider | x64 | D3D11 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="Launches to the main screen" title="Launches to the main screen"> |
 
 Test records reflect the version and settings at the time and do not establish that complete gameplay, other versions or all settings work.
 

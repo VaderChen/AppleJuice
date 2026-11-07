@@ -484,6 +484,42 @@ std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& 
         }catch(const MemoryFault&){result=87;}catch(const std::bad_alloc&){result=8;}
         arg.return_to(state,result);return std::nullopt;
     }
+    if(symbol=="GetIpForwardTable"){
+        // MIB_IPFORWARDTABLE：由目前介面的位址與閘道產生（子網路、本機與預設路由），位址維持網路位元組順序。
+        try{
+            if(!arg(1)){arg.return_to(state,87);return {};}
+            const auto capacity=memory.load(GuestAddress{arg(1)},32);memory.check(GuestAddress{arg(1)},4,Access::Write);
+            auto& config=*runtime_.network.configuration;
+            if(!refresh_configuration(config,runtime_.network.external_io,false,false))result=232;
+            else{
+                std::vector<std::array<std::uint8_t,56>> rows;
+                const auto add=[&](const std::array<std::uint8_t,4>& destination,const std::array<std::uint8_t,4>& mask,const std::array<std::uint8_t,4>& next,std::uint32_t index,std::uint32_t type){
+                    std::array<std::uint8_t,56> row{};std::copy(destination.begin(),destination.end(),row.begin());std::copy(mask.begin(),mask.end(),row.begin()+4);std::copy(next.begin(),next.end(),row.begin()+12);
+                    const auto word=[&](unsigned offset,std::uint32_t value){for(unsigned i=0;i<4;++i)row[offset+i]=static_cast<std::uint8_t>(value>>(i*8));};
+                    word(16,index);word(20,type);word(24,3);word(36,25); // 類型 3 直接、4 間接；協定 3 為網管設定；躍點 25。
+                    for(unsigned offset=40;offset<56;offset+=4)word(offset,UINT32_MAX); // 未使用的 Metric2～5 為 -1。
+                    rows.push_back(row);
+                };
+                for(const auto& item:config.interfaces){
+                    if(item.status!=1)continue;
+                    for(const auto& address:item.addresses){
+                        if(address.bytes.size()<8 || address.bytes[0]!=2 || address.prefix>32)continue;
+                        std::array<std::uint8_t,4> ip{},mask{},network{};std::copy_n(address.bytes.begin()+4,4,ip.begin());
+                        for(unsigned i=0;i<4;++i){const auto bits=std::min(8U,address.prefix>i*8?address.prefix-i*8:0U);mask[i]=static_cast<std::uint8_t>(bits?0xffU<<(8-bits):0U);network[i]=ip[i]&mask[i];}
+                        add(network,mask,ip,item.index,3);
+                        if(address.prefix<32)add(ip,{0xff,0xff,0xff,0xff},ip,item.index,3);
+                    }
+                    for(const auto& gateway:item.gateways)add({},{},gateway,item.index,4);
+                }
+                if(arg(2))std::stable_sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){return std::lexicographical_compare(a.begin(),a.begin()+4,b.begin(),b.begin()+4);});
+                const auto size=4+rows.size()*56;
+                if(rows.empty())result=232;
+                else if(!arg(0) || capacity<size){memory.store(GuestAddress{arg(1)},32,size);result=122;}
+                else {memory.check(GuestAddress{arg(0)},size,Access::Write);memory.store(GuestAddress{arg(0)},32,rows.size());for(std::size_t i=0;i<rows.size();++i)memory.write(GuestAddress{arg(0)+4+i*56},rows[i]);memory.store(GuestAddress{arg(1)},32,size);}
+            }
+        }catch(const MemoryFault&){result=87;}catch(const std::bad_alloc&){result=8;}
+        arg.return_to(state,result);return {};
+    }
     if(symbol=="GetIpAddrTable"){
         try{
             if(!arg(1)){arg.return_to(state,87);return {};}

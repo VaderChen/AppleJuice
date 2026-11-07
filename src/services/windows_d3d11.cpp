@@ -1,5 +1,10 @@
 #include "parallel_mapping_lock.hpp"
 #include "x64arm/entry_runtime_profile.hpp"
+#include <pthread.h>
+#include <pthread/qos.h>
+#include <time.h>
+#include <thread>
+#include "x64arm/entry_runtime_profile.hpp"
 #include <cstdio>
 #include "x64arm/resource_usage.hpp"
 #include <cstdlib>
@@ -320,6 +325,35 @@ struct D3DCompileOperation {
     bool closing{},closed{};
 };
 
+// COM 介面指標 → 物件。UE 每幀查表約 9 萬次（每次繪製十多次、每次狀態設定數次）；unordered_map 要取餘數再追指標，
+// find_fast 先查直接對映快取，命中只需比對一次。快取存 iterator：插入造成 rehash 時全部清除，刪除時清掉對應項。
+// find_fast 會寫快取，只可在持圖形鎖的路徑使用；未持鎖的路徑維持一般 find（不寫入）。
+class D3D11ObjectTable : public std::unordered_map<std::uint64_t,Object> {
+    using Base=std::unordered_map<std::uint64_t,Object>;
+    static constexpr std::size_t cache_size=4096;
+    struct Entry {std::uint64_t key{};Base::iterator value{};};
+    mutable std::array<Entry,cache_size> cache_{};
+    static std::size_t index(std::uint64_t key) noexcept {return static_cast<std::size_t>((key>>4)^(key>>16))&(cache_size-1);}
+public:
+    iterator find_fast(std::uint64_t key) {
+        auto& entry=cache_[index(key)];
+        if(key && entry.key==key)return entry.value;
+        const auto found=Base::find(key);
+        if(key && found!=Base::end())entry=Entry{key,found};
+        return found;
+    }
+    const_iterator find_fast(std::uint64_t key) const {return const_cast<D3D11ObjectTable*>(this)->find_fast(key);}
+    template<class... Arguments> auto emplace(Arguments&&... arguments){
+        const auto buckets=bucket_count();
+        auto result=Base::emplace(std::forward<Arguments>(arguments)...);
+        if(bucket_count()!=buckets)cache_.fill(Entry{});
+        return result;
+    }
+    size_type erase(std::uint64_t key){
+        auto& entry=cache_[index(key)];if(entry.key==key)entry=Entry{};
+        return Base::erase(key);
+    }
+};
 struct D3D11SharedResource {std::weak_ptr<GraphicsResource> resource;std::weak_ptr<NativeOpenGlContext> producer;std::vector<std::uint8_t> desc;};
 struct D3D11State {
     std::map<std::uint32_t,D3D11SharedResource> shared_resources;
@@ -327,7 +361,7 @@ struct D3D11State {
     std::map<std::uint64_t,D3DCompileOperation> compilations;
     std::uint64_t next_compilation{};
     // 每個 D3D11 呼叫都以介面指標查表數次；順序不影響語義（迭代點皆為全體掃描或唯一匹配）。
-    std::unordered_map<std::uint64_t,Object> objects;
+    D3D11ObjectTable objects;
     std::map<std::pair<Kind,bool>,std::uint64_t> vtables;
     std::uint64_t hardware_sessions{}, decoded_frames{};
     std::string last_error;
@@ -361,6 +395,7 @@ namespace {
 #include "d3d11_setter_front_path.inc"
 #include "d3d11_draw_front_path.inc"
 }
+#include "d3d11_command_stream.inc"
 void WindowsServices::discard_d3d_compile(GuestState& state,GuestMemory& memory,std::uint64_t key){
     if(!d3d11_)return;const auto at=d3d11_->compilations.find(key);if(at==d3d11_->compilations.end())return;
     if(at->second.scratch)(void)free_heap(memory,at->second.scratch,state);
@@ -530,7 +565,7 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     static constexpr std::string_view excluded[]{"QueryInterface","FinishCommandList","ExecuteCommandList"};
     if(std::find(std::begin(excluded),std::end(excluded),symbol)!=std::end(excluded))return false;
     const WindowsCall arg(state,memory,service);
-    const auto found=d3d11_->objects.find(arg(0));if(found==d3d11_->objects.end())return false;
+    const auto found=d3d11_->objects.find_fast(arg(0));if(found==d3d11_->objects.end())return false;
     // 著色器尚未編譯：交給背景編譯並回到完整服務路徑，由處理程式讓呼叫者等待後重試（見 d3d11_graphics_handlers.inc），
     // 不在持映射與圖形鎖的本地／worker 服務內轉譯（雙人成行走到新區域時每個約 106 ms，期間所有 D3D11 服務停住）。
     if(found->second.kind==Kind::Device && found->second.identity && found->second.identity->native && resident_context_key(state)!=present_thread_ &&
@@ -543,11 +578,11 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     if(symbol=="QueryVideoMemoryInfo" || symbol=="SetVideoMemoryReservation")return found->second.kind==Kind::Adapter;
     if(!coordinator && (symbol=="CopyResource" || symbol=="CopySubresourceRegion" || symbol=="UpdateSubresource")){
         // 寫入目的資源會撤銷持久映射並釋放客體 heap；在任何副作用之前交回完整服務邊界。
-        const auto destination=d3d11_->objects.find(arg(1));
+        const auto destination=d3d11_->objects.find_fast(arg(1));
         if(destination!=d3d11_->objects.end() && !destination->second.identity->persistent_maps.empty())return false;
     }
     if(symbol=="Map" || symbol=="Unmap"){
-        const auto resource=d3d11_->objects.find(arg(1));
+        const auto resource=d3d11_->objects.find_fast(arg(1));
         if(found->second.kind==Kind::Context && found->second.identity->context_type){
             // 延遲內容：Map／Unmap 要配置或釋放錄製用的客體 heap，worker 上交回協調者；
             // 本地 Map 開啟時在協調者本地完成（與本地 CreateBuffer 相同只配置 heap 並錄製命令），否則走完整路徑。
@@ -565,6 +600,8 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
             else{const auto mapped=id.subresource_maps.find(subresource);if(mapped==id.subresource_maps.end() || mapped->second.pointer!=kept->second.pointer)return false;}
         }
     }
+    // 交換鏈的全螢幕狀態查詢（UE 每幀一次）只讀狀態；要取回輸出時會持有物件參照，交完整路徑。
+    if(symbol=="GetFullscreenState")return found->second.kind==Kind::SwapChain && !arg(2);
     // 只限裝置、裝置內容、資源與 view、著色器、佈局、狀態物件、查詢與 class linkage；交換鏈、工廠、輸出、
     // DXGI 裝置、多執行緒鎖、反射、命令列表與 D3D10 物件仍走完整服務。
     switch(found->second.kind){
@@ -577,7 +614,7 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     }
     const auto& id=*found->second.identity;
     if(id.api10)return false;
-    const auto device=id.device?d3d11_->objects.find(id.device):found;if(device==d3d11_->objects.end())return false;
+    const auto device=id.device?d3d11_->objects.find_fast(id.device):found;if(device==d3d11_->objects.end())return false;
     return !(device->second.identity->protected_threads && device->second.identity->lock_address);
 }catch(const MemoryFault&){return false;}catch(const HostCallFault&){return false;}
 std::recursive_mutex& WindowsServices::graphics_mutex() noexcept {static std::recursive_mutex value;return value;}
@@ -588,6 +625,8 @@ std::recursive_mutex& WindowsServices::graphics_mutex() noexcept {static std::re
 // 延後銷毀清單待處理、比對模式）一律交給完整路徑，例外與錯誤回報不變。X64ARM_D3D11_FRONT_PATH=0 關閉。
 // IA／*Set* 狀態設定同樣先走前置路徑（d3d11_setter_front_path.inc）；X64ARM_D3D11_SETTER_FRONT_PATH=0 只關閉這一段。
 std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    // 完整服務要看到佇列裡所有命令的結果（worker、協調者本地與串流執行緒自己都是本地路徑，各有處理）。
+    if(d3d11_stream_ && !graphics_local())d3d11_stream_full_service_sync(service);
     static const bool front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_FRONT_PATH");return !value || std::string_view(value)!="0";}();
     static const bool setter_front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_SETTER_FRONT_PATH");return front_path && (!value || std::string_view(value)!="0");}();
     static const bool draw_front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_DRAW_FRONT_PATH");return front_path && (!value || std::string_view(value)!="0");}();
@@ -630,14 +669,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
         auto& bridge=*d3d11_;
         if(runtime_.network.external_io && (graphics_local() || bridge.deferred_releases.empty())){
             const WindowsCall arg(state,memory,service);
-            if(const auto found=bridge.objects.find(arg(0));found!=bridge.objects.end() && found->second.identity){
+            if(const auto found=bridge.objects.find_fast(arg(0));found!=bridge.objects.end() && found->second.identity){
                 auto& id=*found->second.identity;
                 if(symbol=="AddRef"){
                     if(const auto count=adjust_references(memory,id,true)){arg.return_to(state,*count);return std::nullopt;}
                 }else if(symbol=="Release"){
                     if(const auto count=adjust_references(memory,id,false,1)){arg.return_to(state,*count);return std::nullopt;}
                 }else{
-                    const auto device=id.device?bridge.objects.find(id.device):found;
+                    const auto device=id.device?bridge.objects.find_fast(id.device):found;
                     if(device!=bridge.objects.end() && device->second.identity &&
                        !(device->second.identity->protected_threads && device->second.identity->lock_address)){
                         memory.write(GuestAddress{arg(1)},id.desc);
@@ -670,7 +709,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
     const auto u32=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
     const auto output=[&](unsigned i){memory.check(GuestAddress{arg(i)},pointer_size,Access::Write);};
     const auto object=[&](std::uint64_t address)->Object& {
-        const auto found=bridge.objects.find(address);if(found==bridge.objects.end())throw HostCallFault("D3D11 COM 物件已釋放或位址無效");return found->second;
+        const auto found=bridge.objects.find_fast(address);if(found==bridge.objects.end())throw HostCallFault("D3D11 COM 物件已釋放或位址無效");return found->second;
     };
     const auto typed=[&](std::uint64_t address,Kind kind)->std::shared_ptr<Identity> {
         auto& value=object(address);if(value.kind!=kind)throw HostCallFault("D3D11 COM 介面類型不符");return value.identity;
@@ -705,6 +744,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         else if(!adjust_references(memory,*id,false))throw HostCallFault("D3D11 COM 物件引用計數已為零");
         if(id->internal_references || reference_count(memory,*id))return;
         ++bridge.destroyed_objects;
+        // 位址可能被新物件重用，命令串流不得再認得這個內容（協調者本地路徑的銷毀不經全停）。
+        if(id->kind==Kind::Context && d3d11_stream_)d3d11_stream_->context.store(0,std::memory_order_relaxed);
+        // 位址也可能變成別的緩衝：可排入更新的緩衝要重新核對。
+        if(d3d11_stream_)d3d11_stream_->update_epoch.fetch_add(1,std::memory_order_release);
         // 裝置銷毀時輸出 Metal 後端統計（draws、encoders、GPU 忙碌時間、CPU 等待），供 CPU／GPU 瓶頸判斷。
         if(id->kind==Kind::Device && id->native && !id->api10)
             std::fprintf(stderr,"[d3d11_metal] device=0x%llx frames=%llu %s\n",static_cast<unsigned long long>(id->root),
