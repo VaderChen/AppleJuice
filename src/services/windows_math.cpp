@@ -160,7 +160,7 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"msvbvm60.dll","_allmul",2,3},{"crt","_allmul",2,3},
         {"msvbvm60.dll","_CIatan",0},{"msvbvm60.dll","_CIcos",0},{"msvbvm60.dll","_CIexp",0},
         {"msvbvm60.dll","_CIlog",0},{"msvbvm60.dll","_CIsin",0},{"msvbvm60.dll","_CIsqrt",0},{"msvbvm60.dll","_CItan",0},
-        {"crt", "_ecvt_s", 6},{"crt","_fcvt_s",6},{"crt","_ecvt",4},{"crt","_fcvt",4},{"crt","div",2},{"crt","ldiv",2},
+        {"crt", "_ecvt_s", 6},{"crt","_fcvt_s",6},{"crt","_ecvt",4},{"crt","_fcvt",4},{"crt","div",2},{"crt","ldiv",2},{"crt","lldiv",3},{"crt","imaxdiv",3},
         {"crt","_dtest",1},{"crt","_fdtest",1},{"crt","_ldtest",1},
         {"crt","wcstod",2},{"crt","wcstof",2},{"crt","_wtof",1},
         {"crt","_CIacos",0},{"crt","_CIasin",0},{"crt","_CIatan",0},{"crt","_CIatan2",0},
@@ -170,7 +170,7 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"crt","_ftol",0},{"crt","_ftol2",0},{"crt","_ftol2_sse",0},
         {"crt","_clear87",0},{"crt","_clearfp",0},{"crt","_status87",0},{"crt","_statusfp",0},{"crt","_statusfp2",2},
         {"crt", "fetestexcept", 1}, {"crt", "feclearexcept", 1}, {"crt", "_dclass", 1}, {"crt", "_fdclass", 1}, {"crt", "_ldclass", 1}, {"crt", "_fpclass", 1}, {"crt", "_fpclassf", 1}, {"crt", "_dsign", 1}, {"crt", "_fdsign", 1}, {"crt", "_ldsign", 1}, {"crt", "_control87", 2}, {"crt", "_controlfp", 2}, {"crt","_controlfp_s",3},
-        {"crt","__fpe_flt_rounds",0},{"crt","_fpreset",0},
+        {"crt","__fpe_flt_rounds",0},{"crt","_fpreset",0},{"crt","_except1",6,12},
         {"crt","_dpcomp",2,3},{"crt","_fdpcomp",2},{"crt","ilogb",1,1},{"crt","ilogbf",1},
         {"crt", "acos", 1,1}, {"crt", "acosh", 1,1}, {"crt", "asin", 1,1}, {"crt", "asinh", 1,1},
         {"crt", "atan", 1,1}, {"crt", "atanh", 1,1}, {"crt", "cbrt", 1,1}, {"crt", "ceil", 1,1},
@@ -183,7 +183,7 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"crt", "atan2", 2,3}, {"crt", "copysign", 2,3}, {"crt", "_copysign", 2,3}, {"crt", "fdim", 2,3},
         {"crt", "fmax", 2,3}, {"crt", "fmin", 2,3}, {"crt", "fmod", 2,3}, {"crt", "hypot", 2,3},
         {"crt", "nextafter", 2,3}, {"crt", "pow", 2,3}, {"crt", "remainder", 2,3}, {"crt", "fma", 3,7},
-        {"crt", "frexp", 2,1}, {"crt", "modf", 2,1}, {"crt", "ldexp", 2,1}, {"crt", "scalbn", 2,1},
+        {"crt", "nan", 1}, {"crt", "nanl", 1}, {"crt", "nanf", 1}, {"crt", "frexp", 2,1}, {"crt", "modf", 2,1}, {"crt", "ldexp", 2,1}, {"crt", "scalbn", 2,1},
         {"crt", "sinf", 1}, {"crt", "cosf", 1}, {"crt", "tanf", 1}, {"crt", "asinf", 1}, {"crt", "acosf", 1}, {"crt", "atanf", 1},
         {"crt", "sinhf", 1}, {"crt", "coshf", 1}, {"crt", "tanhf", 1}, {"crt", "sqrtf", 1}, {"crt", "cbrtf", 1},
         {"crt", "asinhf", 1}, {"crt", "acoshf", 1}, {"crt", "atanhf", 1}, {"crt", "erff", 1}, {"crt", "erfcf", 1},
@@ -197,7 +197,7 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"crt", "lrint", 1,1}, {"crt", "lrintf", 1}, {"crt", "lrintl", 1,1}, {"crt", "llrint", 1,1}, {"crt", "llrintf", 1}, {"crt", "llrintl", 1,1}, {"crt", "lround", 1,1}, {"crt", "lroundf", 1}, {"crt", "lroundl", 1,1}, {"crt", "llround", 1,1}, {"crt", "llroundf", 1}, {"crt", "llroundl", 1,1},
         {"crt", "atof", 1}, {"crt", "atoi", 1}, {"crt", "atol", 1}, {"crt", "_atoi64", 1},
         {"crt", "_strtoi64", 3}, {"crt", "_strtoui64", 3}, {"crt", "strtol", 3}, {"crt", "strtoul", 3}, {"crt", "strtoll", 3}, {"crt", "strtoull", 3}, {"crt", "strtod", 2}, {"crt", "strtof", 2},
-        {"crt", "_strtod_l", 3}, {"crt", "_strtold_l", 3}, {"crt", "_strtof_l", 3}, {"crt", "_atof_l", 2}, {"crt", "_wcstod_l", 3}, {"crt", "_wcstold_l", 3}, {"crt", "_wcstof_l", 3}, {"crt", "_wtof_l", 2}
+        {"crt", "strtold", 2}, {"crt", "wcstold", 2}, {"crt", "_strtod_l", 3}, {"crt", "_strtold_l", 3}, {"crt", "_strtof_l", 3}, {"crt", "_atof_l", 2}, {"crt", "_wcstod_l", 3}, {"crt", "_wcstold_l", 3}, {"crt", "_wcstof_l", 3}, {"crt", "_wtof_l", 2}
     };
     static const auto complete=[]{
         std::vector<WindowsServiceDescriptor> result(std::begin(table),std::end(table));
@@ -252,11 +252,22 @@ static const std::pair<std::string_view, Unary> math_double_unary[]{
     {"nearbyint",std::nearbyint},{"rint",std::rint},{"round",std::round},{"sin",std::sin},{"sinh",std::sinh},
     {"sqrt",std::sqrt},{"tan",std::tan},{"tanh",std::tanh},{"tgamma",std::tgamma},{"lgamma",std::lgamma},{"trunc",std::trunc}
 };
+// 宿主 libm 的 fmod／remainder 在 y＝0 或 x＝±∞ 時只回 NaN，不舉起 invalid 也不設定 errno；
+// Windows CRT 與 x87 FPREM 會舉起 invalid（errno＝EDOM）並回 x86 預設 NaN。共用給數學表與 x87 _CIfmod。
+template<class T,class Bits>
+T ieee_remainder_domain(T x,T y,T(*function)(T,T),Bits indefinite){
+    if(!std::isnan(x) && !std::isnan(y) && (std::isinf(x) || y==T{})){std::feraiseexcept(FE_INVALID);return std::bit_cast<T>(indefinite);}
+    return function(x,y);
+}
+double ieee_fmod(double x,double y){return ieee_remainder_domain<double>(x,y,static_cast<double(*)(double,double)>(std::fmod),UINT64_C(0xfff8000000000000));}
+double ieee_remainder(double x,double y){return ieee_remainder_domain<double>(x,y,static_cast<double(*)(double,double)>(std::remainder),UINT64_C(0xfff8000000000000));}
+float ieee_fmodf(float x,float y){return ieee_remainder_domain<float>(x,y,static_cast<float(*)(float,float)>(std::fmod),UINT32_C(0xffc00000));}
+float ieee_remainderf(float x,float y){return ieee_remainder_domain<float>(x,y,static_cast<float(*)(float,float)>(std::remainder),UINT32_C(0xffc00000));}
 using Binary = double(*)(double,double);
 static const std::pair<std::string_view, Binary> math_double_binary[]{
     {"atan2",std::atan2},{"copysign",std::copysign},{"_copysign",std::copysign},{"fdim",std::fdim},
-    {"fmax",std::fmax},{"fmin",std::fmin},{"fmod",std::fmod},{"hypot",std::hypot},
-    {"nextafter",std::nextafter},{"pow",std::pow},{"remainder",std::remainder}
+    {"fmax",std::fmax},{"fmin",std::fmin},{"fmod",ieee_fmod},{"hypot",std::hypot},
+    {"nextafter",std::nextafter},{"pow",std::pow},{"remainder",ieee_remainder}
 };
 using FloatUnary=float(*)(float);
 static const std::pair<std::string_view,FloatUnary> math_float_unary[]{
@@ -267,7 +278,7 @@ static const std::pair<std::string_view,FloatUnary> math_float_unary[]{
     {"floorf",std::floor},{"ceilf",std::ceil},{"roundf",std::round},{"truncf",std::trunc},{"fabsf",std::fabs},{"nearbyintf",std::nearbyint},{"rintf",std::rint}};
 using FloatBinary=float(*)(float,float);
 static const std::pair<std::string_view,FloatBinary> math_float_binary[]{
-    {"atan2f",std::atan2},{"powf",std::pow},{"fmodf",std::fmod},{"remainderf",std::remainder},{"hypotf",std::hypot},{"_hypotf",std::hypot},
+    {"atan2f",std::atan2},{"powf",std::pow},{"fmodf",ieee_fmodf},{"remainderf",ieee_remainderf},{"hypotf",std::hypot},{"_hypotf",std::hypot},
     {"copysignf",std::copysign},{"fminf",std::fmin},{"fmaxf",std::fmax},{"nextafterf",std::nextafter},{"fdimf",std::fdim}};
 struct IntegerRounding {
     std::string_view name;
@@ -376,6 +387,9 @@ bool scalar_math_requested() noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_SCALAR_MATH");return !setting || std::string_view(setting)!="0";}();
     return enabled;
 }
+bool scalar_math_xmm_abi(const WindowsServiceDescriptor& service) noexcept {
+    try{const auto* operation=scalar_math_operation(service);return operation && operation->xmm_abi;}catch(...){return false;}
+}
 unsigned scalar_math_recipe(const WindowsServiceDescriptor& service) noexcept {
     // 核心 ARM64 配方涵蓋已核准輸入與浮點模式；其餘交回同一入口的純量值服務。
     // 範圍錯誤的原生路徑須具備 resident_scalar_errors 提供的私人格位契約。
@@ -412,6 +426,21 @@ unsigned scalar_math_recipe(const WindowsServiceDescriptor& service) noexcept {
         return !setting || std::string_view(setting)!="0";
     }();
     if(range_native && operation->name=="acos")return 21;
+    // 固定方向家族共用核心 FRINT 配方，特殊值仍由原服務處理。
+    static const bool fixed_round_recipes=[] {
+        const auto* setting=std::getenv("X64ARM_SCALAR_FIXED_ROUND_RECIPES");
+        return !setting || std::string_view(setting)!="0";
+    }();
+    if(fixed_round_recipes){
+        if(operation->name=="floorf")return 22;
+        if(operation->name=="floor")return 23;
+        if(operation->name=="ceilf")return 24;
+        if(operation->name=="ceil")return 25;
+        if(operation->name=="truncf")return 26;
+        if(operation->name=="trunc")return 27;
+        if(operation->name=="roundf")return 28;
+        if(operation->name=="round")return 29;
+    }
     return 0;
 }
 namespace {
@@ -484,9 +513,21 @@ static bool invoke_native_scalar_math_impl(ResidentScalarCall& call,GuestMemory&
 #endif
     try{
         // 沿 WindowsCall 的完整 Win64 框架契約；無效時不運算，交回原服務產生同一故障。
-        if(operation.xmm_abi || memory.execution_mode()!=ExecutionMode::X64 || call.stack%16!=8 || call.stack>UINT64_MAX-40)return false;
+        // Win32 只接受 SSE2 helper 的暫存器 ABI：返回位址 4 位元組、沒有堆疊參數與 home 區。
+        const bool win32=memory.execution_mode()==ExecutionMode::X86;
+        if(win32){if(!operation.xmm_abi || call.stack>UINT64_C(0xfffffffb))return false;}
+        else if(operation.xmm_abi || memory.execution_mode()!=ExecutionMode::X64 || call.stack%16!=8 || call.stack>UINT64_MAX-40)return false;
         std::uint64_t target{};
-        if constexpr(Worker){
+        if(win32){
+            if constexpr(Worker){
+                const auto stack=memory.native_window(GuestAddress{call.stack},permission(Access::Read));
+                if(!stack.data || stack.after<4)return false;
+                std::uint32_t value{};std::memcpy(&value,stack.data,4);target=value;
+            }else{
+                memory.check(GuestAddress{call.stack},4,Access::Read);
+                target=memory.load(GuestAddress{call.stack},32);
+            }
+        }else if constexpr(Worker){
             // worker 僅借用不改映射／頁面快取的視窗；跨頁 home 區及 COW
             // 等未核准存取交回協調者，保留原 WindowsCall 的故障契約。
             const auto stack=memory.native_window(GuestAddress{call.stack},permission(Access::Read));
@@ -503,6 +544,7 @@ static bool invoke_native_scalar_math_impl(ResidentScalarCall& call,GuestMemory&
 #if defined(__aarch64__) && defined(__APPLE__)
         if(operation.rounding!=ScalarRounding::General && direct_round_integral(call.first,result,mxcsr,operation)){
             call.integer=0;call.result=result;call.width=width;call.mxcsr=mxcsr;call.next=target;
+            if(win32)call.stack-=4;
             call.environment.retain();return true;
         }
 #endif
@@ -518,6 +560,8 @@ static bool invoke_native_scalar_math_impl(ResidentScalarCall& call,GuestMemory&
         else if(operation.float_unary)single_value=operation.float_unary(input_float(0));
         else single_value=operation.float_binary(input_float(0),input_float(1));
         const auto raised=static_cast<unsigned>(Environment::raised());
+        // SSE2 helper 遇未遮罩例外由完整服務拋 STATUS_FLOAT_*；這裡尚未提交任何狀態，直接交回。
+        if(operation.xmm_abi && (math_exception_flags(raised)&~(call.mxcsr>>7)&63U))return false;
         mxcsr|=math_exception_flags(raised);
         const auto error=math_error(raised,environment.error());
         // errno 與完整入口相同：先寫 errno 格位，再由核心提交回傳值與返回堆疊。
@@ -534,6 +578,8 @@ static bool invoke_native_scalar_math_impl(ResidentScalarCall& call,GuestMemory&
         }
         if(!operation.integer)result=scalar_result_bits(operation.single()?static_cast<double>(single_value):value,operation.single());
         call.integer=integer;call.result=result;call.width=width;call.mxcsr=mxcsr;call.next=target;
+        // 核心提交時固定以 call.stack+8 作為新 RSP（Win64 返回位址）；Win32 只彈出 4 位元組。
+        if(win32)call.stack-=4;
         const auto magnitude=std::bit_cast<std::uint32_t>(single_value)&0x7fffffffU;
         const bool exact_return=operation.integer || !operation.single() || !magnitude ||
             (magnitude>=0x00800000U && magnitude<0x7f800000U);
@@ -614,6 +660,52 @@ void invoke_scalar_math(GuestState& state,GuestMemory& memory,const WindowsServi
 #endif
 }
 void windows_floating_return(GuestState& state,bool x86,double value,bool single){conversion_result(state,x86,value,single);}
+// Win32 CRT x87 暫存器 ABI（_CI* 以 ST0／ST1 進、ST0 出；_ftol* 以 ST0 進、EAX／EDX 出）。協調者以目前執行緒、
+// worker 以呼叫執行緒的 errno 格位共用同一實作。
+std::optional<std::uint32_t> WindowsServices::invoke_x87_crt_math(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service,std::uint64_t errno_cell) {
+#if defined(__clang__)
+#pragma STDC FENV_ACCESS ON
+#endif
+    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
+    if(!x86_)throw HostCallFault("此 CRT 特殊呼叫慣例僅提供 x86");
+    check_x87_pending(state);
+    const bool integral=symbol.starts_with("_ftol");
+    // 整數轉換完全由 SoftFloat 處理，不讀寫宿主 FPCR／FPSR 或 errno。
+    std::optional<Environment> environment;
+    if(!integral)environment.emplace(static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13);
+    struct SoftEnvironment {
+        uint_fast8_t rounding{softfloat_roundingMode},tininess{softfloat_detectTininess},exceptions{softfloat_exceptionFlags};
+        explicit SoftEnvironment(unsigned control){constexpr uint_fast8_t modes[]{softfloat_round_near_even,softfloat_round_min,softfloat_round_max,softfloat_round_minMag};softfloat_roundingMode=modes[(control>>10)&3];softfloat_detectTininess=softfloat_tininess_afterRounding;softfloat_exceptionFlags=0;}
+        ~SoftEnvironment(){softfloat_roundingMode=rounding;softfloat_detectTininess=tininess;softfloat_exceptionFlags=exceptions;}
+    } soft_environment(state.x87_control);
+    const auto top=(state.x87_status>>11)&7U;unsigned raised=0;bool stack_fault=false;
+    const auto read=[&](unsigned logical){const auto index=(top+logical)&7U;if(((state.x87_tag>>(index*2))&3U)==3){raised|=1;stack_fault=true;return extFloat80_t{UINT64_C(0xc000000000000000),0xffff};}const auto value=state.x87[index];if(!(value.sign_exponent&0x7fffU) && value.significand)raised|=2;return extFloat80_t{value.significand,value.sign_exponent};};
+    const auto first=read(0);const bool binary_input=symbol=="_CIatan2" || symbol=="_CIfmod" || symbol=="_CIpow";
+    std::uint64_t integer=0;double value=0;
+    if(integral)integer=static_cast<std::uint64_t>(extF80_to_i64_r_minMag(first,true));
+    else {
+        const auto a=std::bit_cast<double>(extF80_to_f64(first).v);
+        if(binary_input){const auto b=std::bit_cast<double>(extF80_to_f64(read(1)).v);value=symbol=="_CIatan2"?std::atan2(b,a):symbol=="_CIfmod"?ieee_fmod(b,a):std::pow(b,a);}
+        else {using Function=double(*)(double);static const std::pair<std::string_view,Function> functions[]{
+            {"_CIacos",std::acos},{"_CIasin",std::asin},{"_CIatan",std::atan},{"_CIcos",std::cos},{"_CIcosh",std::cosh},{"_CIexp",std::exp},{"_CIlog",std::log},{"_CIlog10",std::log10},{"_CIsin",std::sin},{"_CIsinh",std::sinh},{"_CIsqrt",std::sqrt},{"_CItan",std::tan},{"_CItanh",std::tanh}};
+            bool found=false;for(const auto& [name,function]:functions)if(symbol==name){value=function(a);found=true;break;}if(!found)throw HostCallFault("未知的 CRT x87 數學入口");}
+    }
+    const auto host=integral?0:Environment::raised();const auto soft=softfloat_exceptionFlags;
+    if((host&FE_INVALID) || (soft&softfloat_flag_invalid))raised|=1;
+    if((host&FE_DIVBYZERO) || (soft&softfloat_flag_infinite))raised|=4;
+    if((host&FE_OVERFLOW) || (soft&softfloat_flag_overflow))raised|=8;
+    if((host&FE_UNDERFLOW) || (soft&softfloat_flag_underflow))raised|=16;
+    if((host&FE_INEXACT) || (soft&softfloat_flag_inexact))raised|=32;
+    state.x87_status=static_cast<std::uint16_t>(state.x87_status|raised|(stack_fault?0x40:0));if(stack_fault)state.x87_status&=~0x200U;
+    if(!integral){
+        const auto error=errno?(errno==EDOM?33:errno==ERANGE?34:22):(raised&1)?33:(raised&28)?34:0;
+        if(error)memory.store(GuestAddress{errno_cell},32,static_cast<unsigned>(error));
+    }
+    if(raised&~static_cast<unsigned>(state.x87_control)&63U){state.x87_status|=0x8080;check_x87_pending(state);}
+    if(integral || binary_input){state.x87_tag=static_cast<std::uint16_t>(state.x87_tag|(3U<<(top*2)));state.x87_status=static_cast<std::uint16_t>((state.x87_status&~0x3800U)|(((top+1)&7U)<<11));}
+    if(!integral){const auto destination=(state.x87_status>>11)&7U;const auto out=f64_to_extF80({std::bit_cast<std::uint64_t>(value)});state.x87[destination]={out.signif,out.signExp};state.x87_tag=static_cast<std::uint16_t>((state.x87_tag&~(3U<<(destination*2)))|(x87_tag(state.x87[destination])<<(destination*2)));}
+    arg.return_to(state,integer,integral);return std::nullopt;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
 #if defined(__clang__)
 #pragma STDC FENV_ACCESS ON
@@ -622,6 +714,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         invoke_scalar_math(state,memory,service,*operation,runtime_.errno_cell,x86_);return std::nullopt;
     }
     const WindowsCall arg(state, memory, service); auto symbol = service.symbol;
+    // Windows 的 long double 就是 double：strtold／wcstold 與 strtod／wcstod 同語義。
+    if(symbol=="strtold")symbol="strtod";else if(symbol=="wcstold")symbol="wcstod";
     // 浮點轉換的 _l 版本共用同一套解析，只把小數點換成指定 locale 的符號。
     char16_t conversion_decimal=u'.';
     if(symbol.ends_with("_l")){
@@ -733,6 +827,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         if(errno || (raised&(FE_INVALID|FE_DIVBYZERO|FE_OVERFLOW|FE_UNDERFLOW)))memory.store(GuestAddress{runtime_.errno_cell},32,errno==EDOM || (raised&FE_INVALID)?33:34);
         conversion_result(state,x86_,value,single);arg.return_to(state,0);return std::nullopt;
     }
+    if(symbol=="lldiv" || symbol=="imaxdiv"){
+        // 16-byte POD 以隱藏指標回傳：x64 為 RCX＋RDX／R8，x86 cdecl 依序放在堆疊。
+        const auto stack=state.reg(Gpr::Rsp);
+        const auto output=x86_?memory.load(GuestAddress{stack+4},32):arg(0);
+        const auto numerator=std::bit_cast<std::int64_t>(x86_?memory.load(GuestAddress{stack+8},64):arg(1));
+        const auto denominator=std::bit_cast<std::int64_t>(x86_?memory.load(GuestAddress{stack+16},64):arg(2));
+        if(!denominator || (numerator==INT64_MIN && denominator==-1)){
+            (void)write_standard_output(2,std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>("integer division error\n"),23));
+            return 3;
+        }
+        memory.store(GuestAddress{output},64,std::bit_cast<std::uint64_t>(numerator/denominator));
+        memory.store(GuestAddress{output+8},64,std::bit_cast<std::uint64_t>(numerator%denominator));
+        arg.return_to(state,output);return std::nullopt;
+    }
     if(symbol=="div" || symbol=="ldiv"){
         const auto numerator=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(0)));
         const auto denominator=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(1)));
@@ -752,46 +860,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         if(symbol=="_statusfp2"){if(arg(0))memory.store(GuestAddress{arg(0)},32,x87);if(arg(1))memory.store(GuestAddress{arg(1)},32,sse);arg.return_to(state,0);}
         else {if(symbol.starts_with("_clear")){state.mxcsr&=~63U;if(x86_)state.x87_status&=0x7f00;}else if(x86_)check_x87_pending(state);arg.return_to(state,x87|sse);}return std::nullopt;
     }
-    if(symbol.starts_with("_CI") || symbol=="_ftol" || symbol=="_ftol2" || symbol=="_ftol2_sse"){
-        if(!x86_)throw HostCallFault("此 CRT 特殊呼叫慣例僅提供 x86");
-        check_x87_pending(state);
-        const bool integral=symbol.starts_with("_ftol");
-        // 整數轉換完全由 SoftFloat 處理，不讀寫宿主 FPCR／FPSR 或 errno。
-        std::optional<Environment> environment;
-        if(!integral)environment.emplace(static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13);
-        struct SoftEnvironment {
-            uint_fast8_t rounding{softfloat_roundingMode},tininess{softfloat_detectTininess},exceptions{softfloat_exceptionFlags};
-            explicit SoftEnvironment(unsigned control){constexpr uint_fast8_t modes[]{softfloat_round_near_even,softfloat_round_min,softfloat_round_max,softfloat_round_minMag};softfloat_roundingMode=modes[(control>>10)&3];softfloat_detectTininess=softfloat_tininess_afterRounding;softfloat_exceptionFlags=0;}
-            ~SoftEnvironment(){softfloat_roundingMode=rounding;softfloat_detectTininess=tininess;softfloat_exceptionFlags=exceptions;}
-        } soft_environment(state.x87_control);
-        const auto top=(state.x87_status>>11)&7U;unsigned raised=0;bool stack_fault=false;
-        const auto read=[&](unsigned logical){const auto index=(top+logical)&7U;if(((state.x87_tag>>(index*2))&3U)==3){raised|=1;stack_fault=true;return extFloat80_t{UINT64_C(0xc000000000000000),0xffff};}const auto value=state.x87[index];if(!(value.sign_exponent&0x7fffU) && value.significand)raised|=2;return extFloat80_t{value.significand,value.sign_exponent};};
-        const auto first=read(0);const bool binary_input=symbol=="_CIatan2" || symbol=="_CIfmod" || symbol=="_CIpow";
-        std::uint64_t integer=0;double value=0;
-        if(integral)integer=static_cast<std::uint64_t>(extF80_to_i64_r_minMag(first,true));
-        else {
-            const auto a=std::bit_cast<double>(extF80_to_f64(first).v);
-            if(binary_input){const auto b=std::bit_cast<double>(extF80_to_f64(read(1)).v);value=symbol=="_CIatan2"?std::atan2(b,a):symbol=="_CIfmod"?std::fmod(b,a):std::pow(b,a);}
-            else {using Function=double(*)(double);static const std::pair<std::string_view,Function> functions[]{
-                {"_CIacos",std::acos},{"_CIasin",std::asin},{"_CIatan",std::atan},{"_CIcos",std::cos},{"_CIcosh",std::cosh},{"_CIexp",std::exp},{"_CIlog",std::log},{"_CIlog10",std::log10},{"_CIsin",std::sin},{"_CIsinh",std::sinh},{"_CIsqrt",std::sqrt},{"_CItan",std::tan},{"_CItanh",std::tanh}};
-                bool found=false;for(const auto& [name,function]:functions)if(symbol==name){value=function(a);found=true;break;}if(!found)throw HostCallFault("未知的 CRT x87 數學入口");}
-        }
-        const auto host=integral?0:Environment::raised();const auto soft=softfloat_exceptionFlags;
-        if((host&FE_INVALID) || (soft&softfloat_flag_invalid))raised|=1;
-        if((host&FE_DIVBYZERO) || (soft&softfloat_flag_infinite))raised|=4;
-        if((host&FE_OVERFLOW) || (soft&softfloat_flag_overflow))raised|=8;
-        if((host&FE_UNDERFLOW) || (soft&softfloat_flag_underflow))raised|=16;
-        if((host&FE_INEXACT) || (soft&softfloat_flag_inexact))raised|=32;
-        state.x87_status=static_cast<std::uint16_t>(state.x87_status|raised|(stack_fault?0x40:0));if(stack_fault)state.x87_status&=~0x200U;
-        if(!integral){
-            const auto error=errno?(errno==EDOM?33:errno==ERANGE?34:22):(raised&1)?33:(raised&28)?34:0;
-            if(error)memory.store(GuestAddress{runtime_.errno_cell},32,static_cast<unsigned>(error));
-        }
-        if(raised&~static_cast<unsigned>(state.x87_control)&63U){state.x87_status|=0x8080;check_x87_pending(state);}
-        if(integral || binary_input){state.x87_tag=static_cast<std::uint16_t>(state.x87_tag|(3U<<(top*2)));state.x87_status=static_cast<std::uint16_t>((state.x87_status&~0x3800U)|(((top+1)&7U)<<11));}
-        if(!integral){const auto destination=(state.x87_status>>11)&7U;const auto out=f64_to_extF80({std::bit_cast<std::uint64_t>(value)});state.x87[destination]={out.signif,out.signExp};state.x87_tag=static_cast<std::uint16_t>((state.x87_tag&~(3U<<(destination*2)))|(x87_tag(state.x87[destination])<<(destination*2)));}
-        arg.return_to(state,integer,integral);return std::nullopt;
-    }
+    if(symbol.starts_with("_CI") || symbol=="_ftol" || symbol=="_ftol2" || symbol=="_ftol2_sse")return invoke_x87_crt_math(state,memory,service,runtime_.errno_cell);
     if(symbol=="fetestexcept" || symbol=="feclearexcept") {
         constexpr std::array<std::uint32_t,6> bits{0x10,0x80000,8,4,2,1};std::uint32_t result=0;
         const auto requested=static_cast<std::uint32_t>(arg(0));
@@ -817,6 +886,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         if(x86_)raw=memory.load(GuestAddress{state.reg(Gpr::Rsp)+4},static_cast<std::uint8_t>(width));
         else for(unsigned n=0;n<width/8;++n)raw|=std::uint64_t{state.xmm[0][n]}<<(n*8);
         arg.return_to(state,x64arm_sign_float_bits(raw,width));return std::nullopt;
+    }
+    if(symbol=="_except1"){
+        // UCRT 數學錯誤入口 _except1(fpe, op, arg, res, cw, unused)：fpe 位元 1 溢位、2 下溢、4 除零、8 無效、0x10 不精確；
+        // cw 是呼叫端進入前的控制字（Win32 為 x87 格式，Win64 為 MXCSR 格式）。全部被遮罩時依 IEEE 預設調整結果並設定
+        // 狀態旗標；任一未遮罩則以對應 STATUS_FLOAT_* 拋出軟體例外（接續執行時同樣回傳 res）。最後恢復控制字並回傳 res。
+        const auto fpe=static_cast<std::uint32_t>(arg(0))&0x1fU;
+        double value=x86_?std::bit_cast<double>(arg(3)):scalar(state,3);
+        const auto cw=static_cast<std::uint32_t>(arg(4));
+        // 統一成 x87 格式：遮罩位元 0～5、捨入 10～11、精度 8～9、無限控制 12。
+        const auto control=x86_?cw&0x1f3fU:(((cw>>7)&0x3fU)|((cw>>3)&0xc00U));
+        // fpe 與控制字遮罩位元：溢位 OM=8、下溢 UM=0x10、除零 ZM=4、無效 IM=1、不精確 PM=0x20。
+        constexpr std::array<std::pair<std::uint32_t,std::uint32_t>,5> kinds{{{1,8},{2,0x10},{4,4},{8,1},{0x10,0x20}}};
+        constexpr std::array<std::uint32_t,5> codes{0xc0000091U,0xc0000093U,0xc000008eU,0xc0000090U,0xc000008fU};
+        std::uint32_t raised=0,exception=0;
+        for(std::size_t i=0;i<kinds.size();++i){
+            if(!(fpe&kinds[i].first))continue;
+            if(!(control&kinds[i].second)){if(!exception)exception=codes[i];}else raised|=kinds[i].second;
+        }
+        if(!exception){
+            if(fpe&1)value=std::signbit(value)?-std::numeric_limits<double>::infinity():std::numeric_limits<double>::infinity();
+            else if(fpe&2)value=std::signbit(value)?-0.0:0.0;
+            // 狀態位元與遮罩位元同位置（MXCSR 0～5、x87 狀態字 0～5）；已遮罩不設定 ES。
+            state.mxcsr|=raised;if(x86_)state.x87_status=static_cast<std::uint16_t>(state.x87_status|raised);
+        }
+        const auto rounding=(control>>10)&3U;
+        state.mxcsr=(state.mxcsr&~0x7f80U)|((control&0x3fU)<<7)|(rounding<<13);
+        if(x86_)state.x87_control=static_cast<std::uint16_t>((state.x87_control&~0x1f3fU)|control);
+        conversion_result(state,x86_,value,false);
+        if(!exception){arg.return_to(state,0);return std::nullopt;}
+        // 例外紀錄不附 _FPIEEE_RECORD 參數；遊戲常見的 __except 篩選只看例外碼。
+        auto caller=state;arg.return_to(caller,0);
+        if(emit_debug_event(caller,memory,debugger::Exception{exception,0,0,caller.rip.value,{},true})!=debugger::handled)
+            begin_exception(caller,memory,exception,0,{});
+        state=caller;return std::nullopt;
     }
     if(symbol=="_control87" || symbol=="_controlfp" || symbol=="_controlfp_s") {
         const bool secure=symbol=="_controlfp_s";const unsigned first=secure?1U:0U;
@@ -930,7 +1033,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
     bool handled = false, single = false; float float_value=0;
 
 
-    for(const auto& [name,function]:math_float_unary)if(symbol==name){float_value=function(input_float(0));single=handled=true;break;}
+    // nan(tag)：tag 是字串指標，決定 quiet NaN 的 payload；不讀浮點參數。
+    const auto nan_tag=[&]{return arg(0)?read_ansi(memory,arg(0)):std::string{};};
+    if(symbol=="nanf"){float_value=std::nanf(nan_tag().c_str());single=handled=true;}
+    if(!handled)for(const auto& [name,function]:math_float_unary)if(symbol==name){float_value=function(input_float(0));single=handled=true;break;}
     if(!handled)for(const auto& [name,function]:math_float_binary)if(symbol==name){float_value=function(input_float(0),input_float(1));single=handled=true;break;}
     if(!handled && (symbol=="fmaf" || symbol=="frexpf" || symbol=="modff" || symbol=="ldexpf" || symbol=="scalbnf")){
         const auto f=input_float(0);single=handled=true;
@@ -947,6 +1053,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
     }
     if (!handled) {
         if (symbol == "fma") value = std::fma(x,y,input_double(2));
+        else if (symbol == "nan" || symbol == "nanl") value = std::nan(nan_tag().c_str());
         else if (symbol == "frexp") { int exponent = 0; value = std::frexp(x,&exponent); memory.store(GuestAddress{arg(1)},32,static_cast<std::uint32_t>(exponent)); }
         else if (symbol == "modf") { double integral = 0; value = std::modf(x,&integral); memory.store(GuestAddress{arg(1)},64,std::bit_cast<std::uint64_t>(integral)); }
         else if (symbol == "ldexp" || symbol == "scalbn") value = std::ldexp(x,std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(1))));

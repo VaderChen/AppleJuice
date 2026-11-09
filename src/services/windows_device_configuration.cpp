@@ -130,6 +130,7 @@ struct DeviceConfigurationState {
     std::vector<std::uint32_t> monitor_nodes;
     std::vector<GuiMonitor> monitors;
     // USB：IOKit registry ID／介面編號 → devnode，主控制器 locationID → devnode；拔除後保留為不存在。
+    std::optional<std::vector<usb::Device>> usb_snapshot;
     std::vector<std::pair<std::string,std::uint32_t>> usb_paths; // IOService 路徑 → USB devnode
     std::map<std::u16string,usb::Target> usb_targets;           // 摺疊後的裝置介面路徑 → 開啟目標
     std::map<std::uint64_t,std::uint32_t> usb_nodes;std::map<std::pair<std::uint64_t,unsigned>,std::uint32_t> usb_interfaces;std::map<std::uint32_t,std::uint32_t> usb_controllers;
@@ -201,18 +202,18 @@ void WindowsServices::refresh_device_configuration(bool enumerate_hid){
             root.guid={0x7d,0xe9,0x36,0x4d,0x25,0xe3,0xce,0x11,0xbf,0xc1,0x08,0x00,0x2b,0xe1,0x03,0x18};
             text_property(root,1,u"DeviceDesc",u"x64arm Virtual Machine");text_property(root,8,u"Class",u"System");
             text_property(root,9,u"ClassGUID",root.class_guid);text_property(root,23,u"EnumeratorName",root.enumerator);configuration->nodes.emplace(1,std::move(root));
-            // 客體只看到實際可用的相容層裝置，不冒充宿主 PCI／USB 硬體。
+            // 客體只看到實際可用的相容層裝置；顯示配接器的身分與 DXGI 回報一致，不冒充其他廠商的硬體。
             // 只需名稱時不建立 Metal 裝置（首次約 50 ms）；名稱無法確定時沿用建立裝置取得的資訊。
             auto identity=metal_opengl_identity();
             if(!identity)if(const auto native=make_metal_opengl(nullptr,1,1)){const auto info=native->info();identity=std::pair{info.renderer,info.vendor};}
             if(identity){
-                struct {std::string renderer,vendor;} info{identity->first,identity->second};DeviceNode display;display.id=display_identity::instance;display.enumerator=u"ROOT";display.service=u"x64armMetal";display.parent=1;display.status=0x000b;
+                struct {std::string renderer,vendor;} info{identity->first,identity->second};DeviceNode display;display.id=display_identity::instance;display.enumerator=u"PCI";display.service=u"x64armMetal";display.parent=1;display.status=0x000b;
                 display.class_guid=display_identity::class_name;display.guid=display_identity::class_guid;
                 // 顯示配接器的裝置介面：GUID_DISPLAY_DEVICE_ARRIVAL，並以 GUID_DEVINTERFACE_DISPLAY_ADAPTER 為別名；D3DKMTOpenAdapterFromDeviceName 接受此路徑。
                 display.interface_guid={0x80,0x51,0xa0,0x1c,0x99,0xa6,0x0a,0x45,0x9a,0x0c,0xde,0x4f,0xbe,0x3d,0xdd,0x89};
                 display.interface_aliases={{0x1d,0x20,0x45,0x5b,0xf2,0xf2,0x3b,0x4f,0x85,0xbb,0x30,0xff,0x1f,0x95,0x35,0x99}};
                 display.interface_path=display_identity::adapter_interface_path;
-                text_property(display,1,u"DeviceDesc",utf8_to_utf16(info.renderer));text_property(display,2,u"HardwareID",u"ROOT\\X64ARM_DISPLAY",true);
+                text_property(display,1,u"DeviceDesc",utf8_to_utf16(info.renderer));text_property(display,2,u"HardwareID",std::u16string(display_identity::adapter_hardware_id)+u'\0'+u"ROOT\\X64ARM_DISPLAY",true);
                 text_property(display,3,u"CompatibleIDs",u"ROOT\\X64ARM_DISPLAY",true);text_property(display,5,u"Service",display.service);
                 text_property(display,8,u"Class",u"Display");text_property(display,9,u"ClassGUID",display.class_guid);
                 text_property(display,10,u"Driver",display.class_guid+u"\\0000");text_property(display,12,u"Mfg",utf8_to_utf16(info.vendor));
@@ -388,7 +389,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
         }
         if(name.starts_with("CM_Locate_DevNode") && folded(read(arg(1))).starts_with(u"hid\\"))enumerate_hid=true;
         if((name.starts_with("CM_Get_Device_Interface_Property") || name.starts_with("CM_Set_Device_Interface_Property")) && arg(0) && folded(read(arg(0))).starts_with(u"\\\\?\\hid"))enumerate_hid=true;
-        refresh_device_configuration(enumerate_hid);
+        // 只讀既有裝置資訊集合成員的呼叫：集合成員在 SetupDiGetClassDevs 等建立時取快照（與 Windows 相同），走訪介面與取介面路徑
+        // 不必重新盤點宿主裝置（每次約 0.2 ms：IOKit USB、序列埠、藍牙與登錄同步，且在協調者全停下執行）。《古墓奇兵：暗影》手把輪詢
+        // 每秒約 50 次 SetupDiEnumDeviceInterfaces／SetupDiGetDeviceInterfaceDetailW，原本每次重建整棵 devnode 樹。節點只標成不存在、
+        // 不刪除（setup 建立者除外，略過重建時也不會被刪），集合引用的節點仍有效。X64ARM_SETUPAPI_SET_SNAPSHOT=0 關閉。
+        static const bool set_snapshot=[] {const auto* value=std::getenv("X64ARM_SETUPAPI_SET_SNAPSHOT");return !value || std::string_view(value)!="0";}();
+        const bool set_member_read=set_snapshot && device_configuration_ &&
+            (name=="SetupDiEnumDeviceInterfaces" || name=="SetupDiGetDeviceInterfaceDetailW" || name=="SetupDiGetDeviceInterfaceDetailA" ||
+             name=="SetupDiEnumDeviceInfo" || name=="SetupDiDestroyDeviceInfoList");
+        if(!set_member_read)refresh_device_configuration(enumerate_hid);
         const auto& nodes=device_configuration_->nodes;
         // 監視器節點要取得 gui_monitors()，原生 GUI 下會建立延遲的 AppKit（每程序約 0.12～0.23 秒），只查 HID、USB 或顯示配接器的無視窗程序不可付這個成本。
         // 節點尚未建立時，只有下列看得到監視器的呼叫才建立；之後由 refresh_device_configuration 持續同步。以 DEVINST、集合或介面 token 為輸入的入口

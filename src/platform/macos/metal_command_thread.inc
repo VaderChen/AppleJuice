@@ -1,7 +1,7 @@
 // D3D11 立即 context 的 Metal 命令執行緒：繪製、運算、寫入、複製與清除依序排入專用宿主執行緒，客體執行緒
-// 不必等 Metal 編碼完成即可繼續處理下一批狀態與客體程式碼；查詢用的 fence、時間戳與非等待提交也依序排入。其餘方法（讀回、
-// 建立著色器、呈現與交接、等待提交）先等佇列清空再於呼叫端執行緒同步執行，因此同一時間只有一個執行緒操作底層
-// 後端，後端本身不需要額外的鎖。背景執行緒的例外延到下一次同步時在呼叫端拋出。
+// 不必等 Metal 編碼完成即可繼續處理下一批狀態與客體程式碼；查詢用的 fence、時間戳與非等待提交也依序排入。
+// 讀回、呈現、交接及等待提交先等佇列清空，再於呼叫端執行緒同步執行。
+// 獨立 DXBC 著色器建立沿用背景轉譯的鎖與快取。背景編碼例外延到下一次同步時在呼叫端拋出。
 // graphics_*_retained 只保留參照：呼叫端保證參照內容在下一次 graphics_sync() 前不變（D3D11 繪製狀態快取）。
 // 依序完成時設定的 fence 中繼旗標：命令執行緒處理到 fence 時才掛到當下 command buffer 的完成回呼。
 struct MetalFenceRelays {
@@ -59,10 +59,14 @@ public:
     void graphics_resolve(const GraphicsView& target,const GraphicsView& source,std::uint32_t format) override {
         post([this,target,source,format]{inner_->graphics_resolve(target,source,format);});
     }
+    bool graphics_temporal_upscale_supported() override {return inner_->graphics_temporal_upscale_supported();}
+    void graphics_temporal_upscale(const GraphicsTemporalUpscale& upscale) override {post([this,upscale]{inner_->graphics_temporal_upscale(upscale);});}
+    void graphics_temporal_upscale_release(std::uint64_t history) override {post([this,history]{inner_->graphics_temporal_upscale_release(history);});}
     void graphics_clear(const GraphicsView& view,std::array<float,4> color,std::uint32_t flags) override {
         post([this,view,color,flags]{inner_->graphics_clear(view,color,flags);});
     }
     void graphics_mips(const GraphicsView& view) override {post([this,view]{inner_->graphics_mips(view);});}
+    void graphics_uav_barrier() override {post([this]{inner_->graphics_uav_barrier();});}
     void graphics_draw(const GraphicsDraw& draw) override {
         auto copy=std::make_shared<const GraphicsDraw>(draw);post([this,copy]{inner_->graphics_draw(*copy);});
     }
@@ -94,12 +98,38 @@ public:
     // 原本每次在協調者上等編碼執行緒排空，約 0.3 ms）。
     std::shared_ptr<GraphicsResource> graphics_buffer_alias(std::shared_ptr<void> owner,std::span<std::uint8_t> bytes) override {return inner_->graphics_buffer_alias(std::move(owner),bytes);}
     void graphics_submission_depth(std::uint32_t depth) override {graphics_sync();inner_->graphics_submission_depth(depth);}
-    bool graphics_samples_supported(std::uint32_t format,std::uint32_t samples) override {graphics_sync();return inner_->graphics_samples_supported(format,samples);}
-    bool graphics_vertex_format_supported(std::uint32_t format) override {graphics_sync();return inner_->graphics_vertex_format_supported(format);}
-    std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes) override {graphics_sync();return inner_->graphics_shader(stage,bytes);}
+    static bool direct_capability_queries(){
+        static const bool enabled=[] {
+            const auto* value=std::getenv("X64ARM_METAL_DIRECT_CAPS");
+            return !value || std::string_view(value)!="0";
+        }();
+        return enabled;
+    }
+    // 格式與取樣能力只讀固定映射表與 MTLDevice，不依賴已排入的命令。
+    bool graphics_samples_supported(std::uint32_t format,std::uint32_t samples) override {
+        if(!direct_capability_queries())graphics_sync();
+        return inner_->graphics_samples_supported(format,samples);
+    }
+    bool graphics_vertex_format_supported(std::uint32_t format) override {
+        if(!direct_capability_queries())graphics_sync();
+        return inner_->graphics_vertex_format_supported(format);
+    }
+    std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes) override {
+        // 建立 DXBC／DXIL 只讀 bytecode 與裝置，和背景 prefetch 共用具備同步保護的入口。
+        // 私有複本還會讀取繪圖執行緒更新的函式狀態，仍由下方 graphics_shader_private 等編碼完成。
+        static const bool independent=[] {
+            const auto* value=std::getenv("X64ARM_METAL_INDEPENDENT_SHADER");
+            return !value || std::string_view(value)!="0";
+        }();
+        if(!independent || !metal_independent_shader(stage,bytes))graphics_sync();
+        return inner_->graphics_shader(stage,bytes);
+    }
     std::shared_ptr<GraphicsShader> graphics_shader_private(std::uint32_t stage,std::span<const std::uint8_t> bytes) override {graphics_sync();return inner_->graphics_shader_private(stage,bytes);}
     // 背景編譯只動 MetalGl 自帶鎖的快取與工作表，不碰編碼狀態，不必等命令執行緒排空。
-    std::uint64_t graphics_shader_prefetch(std::uint32_t stage,std::span<const std::uint8_t> bytes) override {return inner_->graphics_shader_prefetch(stage,bytes);}
+    std::uint64_t graphics_shader_prefetch(std::uint32_t stage,std::span<const std::uint8_t> bytes,
+                                           const std::shared_ptr<SharedWake>& wake) override {
+        return inner_->graphics_shader_prefetch(stage,bytes,wake);
+    }
     bool graphics_shader_ticket_ready(std::uint64_t ticket) override {return inner_->graphics_shader_ticket_ready(ticket);}
     std::shared_ptr<GraphicsShader> graphics_compute_source(const GraphicsModernShader& shader) override {graphics_sync();return inner_->graphics_compute_source(shader);}
     std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t> desc) override {graphics_sync();return inner_->graphics_sampler(desc);}
@@ -203,9 +233,15 @@ private:
                 ;
 #endif
             if(completed_.load(std::memory_order_acquire)<target){
-                std::unique_lock lock(mutex_);++waiting_; // 可能同時有多個等待者（D3D11 命令串流的 Present 前同步不持圖形鎖）。
-                idle_cv_.wait(lock,[&]{return completed_.load(std::memory_order_acquire)>=target;});
-                --waiting_;
+                if(native_ticket_wait_){
+                    // 等已發布的完成序號，避免與排入、取出工作共用佇列鎖。
+                    for(auto done=completed_.load(std::memory_order_acquire);done<target;done=completed_.load(std::memory_order_acquire))
+                        completed_.wait(done,std::memory_order_acquire);
+                }else{
+                    std::unique_lock lock(mutex_);++waiting_;
+                    idle_cv_.wait(lock,[&]{return completed_.load(std::memory_order_acquire)>=target;});
+                    --waiting_;
+                }
             }
         }
         if(failed_.load(std::memory_order_acquire)){
@@ -274,7 +310,8 @@ private:
             task=nullptr;
             if(task_start){const auto spent=clock_gettime_nsec_np(CLOCK_UPTIME_RAW)-task_start;busy_ns_.fetch_add(spent,std::memory_order_relaxed);metal_stall_note("encoder_task",spent/1000);}
             completed_.fetch_add(1,std::memory_order_acq_rel);
-            {std::lock_guard lock(mutex_);if(waiting_)idle_cv_.notify_all();}
+            if(native_ticket_wait_)completed_.notify_all();
+            else{std::lock_guard lock(mutex_);if(waiting_)idle_cv_.notify_all();}
         }
     }
     std::shared_ptr<NativeOpenGlContext> inner_;
@@ -283,6 +320,7 @@ private:
     std::deque<std::function<void()>> queue_;
     const bool legacy_idle_spin_=[] {const auto* value=std::getenv("X64ARM_METAL_LEGACY_IDLE_SPIN");return value && std::string_view(value)=="1";}();
     const bool async_query_flush_=[] {const auto* value=std::getenv("X64ARM_METAL_ASYNC_QUERY_FLUSH");return !value || std::string_view(value)!="0";}();
+    const bool native_ticket_wait_=[] {const auto* value=std::getenv("X64ARM_METAL_NATIVE_TICKET_WAIT");return !value || std::string_view(value)!="0";}();
     const std::int64_t idle_spin_ns_=[] {const auto* value=std::getenv("X64ARM_METAL_COMMAND_SPIN_US");
         if(!value || !*value)return std::int64_t{20000};const auto us=std::strtoll(value,nullptr,10);return us<0?std::int64_t{0}:std::min<std::int64_t>(us,1000)*1000;}();
     std::uint64_t submitted_{},taken_{};

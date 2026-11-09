@@ -190,6 +190,16 @@ std::optional<bool> WindowsServices::file_io_signaled(std::uint64_t handle) {
         return socket->second->io_signaled;
     return {};
 }
+bool WindowsServices::resident_file_wait_pending(std::uint64_t handle) const noexcept {
+    static const bool enabled=[] {
+        const auto* value=std::getenv("X64ARM_RESIDENT_BLOCK_FILE_WAIT");
+        return !value || std::string_view(value)!="0";
+    }();
+    if(!enabled)return false;
+    // 協調者獨佔寫入 I/O 狀態。單槽只登記等待；完成與逾時由既有排程器解析。
+    const auto file=files_.find(handle);
+    return file!=files_.end() && !file->second.io_signaled;
+}
 std::uint32_t WindowsServices::bind_file_completion_port(std::uint64_t handle,std::uint64_t port,
         std::uint64_t key,bool replace) {
     const auto file=files_.find(handle);const auto socket=runtime_.network.sockets.find(handle);
@@ -560,9 +570,98 @@ std::optional<std::uint32_t> WindowsServices::invoke_call_named_pipe(GuestState&
             co_return done(result);
         });
 }
+// 16 位元時代留下的檔案 API，全部組合自 Win32 檔案入口，不另立一套檔案語義。HFILE 是 32 位元，失敗回 HFILE_ERROR（-1）。
+std::optional<std::uint32_t> WindowsServices::invoke_legacy_file(GuestState& entry_state,GuestMemory& entry_memory,const WindowsServiceDescriptor& service){
+    return service_callback::invoke<std::optional<std::uint32_t>>(
+        this,threads_.current,entry_state,entry_memory,"LegacyFile",
+        [this](GuestState& state,GuestMemory& memory,std::uint64_t target,std::vector<std::uint64_t> args,std::uint64_t id){
+            start_callbacks(state,memory,{{target,std::move(args)}},Continuation::NestedResult,id);
+        },
+        [this,service](GuestState& state,GuestMemory& memory)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(state,memory,service);
+            const auto symbol=service.symbol;
+            constexpr std::uint32_t hfile_error=UINT32_MAX;
+            const auto done=[&](std::uint32_t value){call.return_to(state,value);return std::optional<std::uint32_t>{};};
+            const auto invalid=x86_?UINT64_C(0xffffffff):UINT64_MAX;
+            const auto api=[&](std::string_view name){return resolve("kernel32.dll",name).value;};
+            // OF_* 的存取與共用模式對應 CreateFile；相容模式視同不拒絕共用。
+            const auto open_file=[&](std::uint64_t name,std::uint32_t mode,std::uint32_t creation){
+                const std::uint32_t access=(mode&3U)==1U?0x40000000U:(mode&3U)==2U?0xc0000000U:0x80000000U;
+                std::uint32_t share=3;
+                switch(mode&0x70U){case 0x10U:share=0;break;case 0x20U:share=1;break;case 0x30U:share=2;break;default:break;}
+                return service_callback::call_value(api("CreateFileA"),{name,access,share,0,creation,0x80,0});
+            };
+            if(symbol=="_lclose")co_return done(static_cast<std::uint32_t>(co_await service_callback::call(api("CloseHandle"),{call(0)}))?0U:hfile_error);
+            if(symbol=="_llseek")co_return done(static_cast<std::uint32_t>(co_await service_callback::call(api("SetFilePointer"),{call(0),call(1),0,call(2)})));
+            if(symbol=="_lopen" || symbol=="_lcreat"){
+                const auto opened=symbol=="_lopen"?co_await open_file(call(0),static_cast<std::uint32_t>(call(1)),3):
+                    co_await service_callback::call_value(api("CreateFileA"),{call(0),0xc0000000U,3,0,2,static_cast<std::uint32_t>(call(1))&7U,0});
+                co_return done(opened==invalid?hfile_error:static_cast<std::uint32_t>(opened));
+            }
+            if(symbol=="_lread" || symbol=="_hread" || symbol=="_lwrite" || symbol=="_hwrite"){
+                const bool writing=symbol.ends_with("write");
+                const auto size=static_cast<std::uint32_t>(call(2));
+                // 寫入 0 位元組的語義是把檔案截斷在目前位置。
+                if(writing && !size)co_return done(static_cast<std::uint32_t>(co_await service_callback::call(api("SetEndOfFile"),{call(0)}))?0U:hfile_error);
+                const auto scratch=allocate_heap(memory,4);
+                if(!scratch){last_error_=8;co_return done(hfile_error);}
+                const auto succeeded=static_cast<std::uint32_t>(co_await service_callback::call(api(writing?"WriteFile":"ReadFile"),{call(0),call(1),size,scratch,0}));
+                const auto error=last_error_;const auto moved=static_cast<std::uint32_t>(memory.load(GuestAddress{scratch},32));
+                (void)free_heap(memory,scratch,state);last_error_=error;
+                co_return done(succeeded?moved:hfile_error);
+            }
+            // OpenFile：OFSTRUCT 為 cBytes、fFixedDisk、nErrCode(2)、Reserved1(2)、Reserved2(2)、szPathName[128]，共 136 位元組。
+            // OF_PROMPT 對應的「找不到檔案」對話框不顯示（等同 SEM_NOOPENFILEERRORBOX），直接回報失敗；OF_CANCEL 只影響該對話框。
+            const auto info=call(1);const auto mode=static_cast<std::uint32_t>(call(2));
+            if(!info){last_error_=87;co_return done(hfile_error);}
+            constexpr std::uint32_t of_parse=0x100,of_delete=0x200,of_verify=0x400,of_create=0x1000,of_exist=0x4000,of_reopen=0x8000;
+            const auto path=info+8;constexpr std::uint32_t path_size=128;
+            memory.check(GuestAddress{info},136,Access::Write);
+            memory.store(GuestAddress{info},8,136);memory.store(GuestAddress{info+2},16,0);
+            const auto name=mode&of_reopen?path:call(0);
+            if(!name){last_error_=87;memory.store(GuestAddress{info+2},16,87);co_return done(hfile_error);}
+            const auto fail=[&]{memory.store(GuestAddress{info+2},16,last_error_);return done(hfile_error);};
+            if(mode&of_parse){
+                (void)co_await service_callback::call(api("GetFullPathNameA"),{name,path_size,path,0});
+                const auto drive=static_cast<std::uint32_t>(co_await service_callback::call(api("GetDriveTypeA"),{path}));
+                memory.store(GuestAddress{info+1},8,drive!=2?1:0);// DRIVE_REMOVABLE 以外視為固定磁碟
+                co_return done(0);
+            }
+            std::uint64_t handle=0;
+            if(mode&of_create){
+                handle=co_await open_file(name,mode,2);
+                if(handle==invalid)co_return fail();
+                (void)co_await service_callback::call(api("GetFullPathNameA"),{name,path_size,path,0});
+            }else{
+                const auto length=static_cast<std::uint32_t>(co_await service_callback::call(api("SearchPathA"),{0,name,0,path_size,path,0}));
+                if(!length || length>path_size){if(length>path_size)last_error_=206;co_return fail();}
+                if(mode&of_delete){
+                    if(!static_cast<std::uint32_t>(co_await service_callback::call(api("DeleteFileA"),{path})))co_return fail();
+                    co_return done(1);
+                }
+                handle=co_await open_file(path,mode,3);
+                if(handle==invalid)co_return fail();
+                // Reserved1／Reserved2 保存開檔時的 DOS 日期時間，OF_VERIFY 依此判斷檔案是否變動。
+                const auto scratch=allocate_heap(memory,12);
+                if(!scratch){(void)co_await service_callback::call(api("CloseHandle"),{handle});last_error_=8;co_return fail();}
+                (void)co_await service_callback::call(api("GetFileTime"),{handle,0,0,scratch});
+                (void)co_await service_callback::call(api("FileTimeToDosDateTime"),{scratch,scratch+8,scratch+10});
+                const auto date=memory.load(GuestAddress{scratch+8},16),time=memory.load(GuestAddress{scratch+10},16);
+                (void)free_heap(memory,scratch,state);
+                if((mode&of_verify) && (mode&of_reopen) && (memory.load(GuestAddress{info+4},16)!=date || memory.load(GuestAddress{info+6},16)!=time)){
+                    (void)co_await service_callback::call(api("CloseHandle"),{handle});
+                    last_error_=2;co_return fail();
+                }
+                memory.store(GuestAddress{info+4},16,date);memory.store(GuestAddress{info+6},16,time);
+            }
+            if(mode&of_exist){(void)co_await service_callback::call(api("CloseHandle"),{handle});co_return done(1);}
+            co_return done(static_cast<std::uint32_t>(handle));
+        });
+}
 std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, GuestMemory &memory,
                                                              const WindowsServiceDescriptor &service,const FileOpenArguments* arguments) {
     if(service.symbol=="CallNamedPipeA" || service.symbol=="CallNamedPipeW")return invoke_call_named_pipe(state,memory,service);
+    if(service.symbol=="OpenFile" || service.symbol=="_lopen" || service.symbol=="_lcreat" || service.symbol=="_lclose" || service.symbol=="_lread" || service.symbol=="_hread" || service.symbol=="_lwrite" || service.symbol=="_hwrite" || service.symbol=="_llseek")return invoke_legacy_file(state,memory,service);
     if(service.symbol=="LockFile" || service.symbol=="UnlockFile" || service.symbol=="LockFileEx" || service.symbol=="UnlockFileEx")return invoke_file_lock(state,memory,service);
     if(service.symbol=="GetOverlappedResult" || service.symbol=="GetOverlappedResultEx")return invoke_overlapped_result(state,memory,service);
     const WindowsCall frame(state, memory, service);

@@ -840,7 +840,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_directml(GuestState& state,
             std::vector<std::shared_ptr<DirectMLState::Compiled>> ops;for(const auto op:init->second)ops.push_back(dml.compiled.at(op));
             const auto contents=table->second.contents;bool needed=false;for(const auto& op:ops)if(!op->owned.empty() || !op->constants.empty())needed=true;
             if(!needed)return finish(0);
-            const bool recorded=d3d12_record(list,[state_ptr,ops,contents,runtime_of](NativeGraphics& native,const std::function<std::shared_ptr<GraphicsResource>(std::uint64_t)>& resource_of){
+            const bool recorded=d3d12_record(memory,list,[state_ptr,ops,contents,runtime_of](NativeGraphics& native,const std::function<std::shared_ptr<GraphicsResource>(std::uint64_t)>& resource_of){
                 const auto& arrays=contents->input_arrays;
                 for(std::size_t j=0;j<ops.size();++j){
                     auto& runtime=runtime_of(*ops[j],native);
@@ -866,7 +866,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_directml(GuestState& state,
         if(compiled==dml.compiled.end()){report("RecordDispatch 參數不合法");return finish(0);}
         // 執行時才讀取綁定範圍的內容、編譯核心（每個 Metal 後端一份）並依序 dispatch。
         auto job=compiled->second;const auto contents=table->second.contents;
-        const bool recorded=d3d12_record(list,[job,contents,runtime_of](NativeGraphics& native,const std::function<std::shared_ptr<GraphicsResource>(std::uint64_t)>& resource_of){
+        const bool recorded=d3d12_record(memory,list,[job,contents,runtime_of](NativeGraphics& native,const std::function<std::shared_ptr<GraphicsResource>(std::uint64_t)>& resource_of){
             auto& runtime=runtime_of(*job,native);const auto& inputs=contents->inputs;const auto& outputs=contents->outputs;
             const auto view=[&](const DirectMLState::Ref& ref)->GraphicsView{
                 switch(ref.kind){

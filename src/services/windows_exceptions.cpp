@@ -9,6 +9,7 @@
 #include <iostream>
 #include <sstream>
 
+namespace x64arm::detail {const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,GuestAddress address) noexcept;}
 namespace x64arm {
 namespace {
 void trace_fault_memory(const GuestState& state,const GuestMemory& memory,std::uint64_t pid,std::uint64_t thread) noexcept {
@@ -174,6 +175,25 @@ bool WindowsServices::dispatch_fault(GuestState& state, GuestMemory& memory, con
     if(std::getenv("X64ARM_TRACE_FAULTS"))std::cerr<<"[fault] rip=0x"<<std::hex<<state.rip.value<<" address=0x"<<fault.address.value<<" access="<<static_cast<unsigned>(fault.access)
         <<" teb=0x"<<(x86_?state.fs_base:state.gs_base)<<" rax=0x"<<state.reg(Gpr::Rax)<<" rbx=0x"<<state.reg(Gpr::Rbx)<<" rcx=0x"<<state.reg(Gpr::Rcx)<<" rdx=0x"<<state.reg(Gpr::Rdx)
         <<" rsi=0x"<<state.reg(Gpr::Rsi)<<" rdi=0x"<<state.reg(Gpr::Rdi)<<" r8=0x"<<state.reg(Gpr::R8)<<" rsp=0x"<<state.reg(Gpr::Rsp)<<std::dec<<'\n';
+    if(std::getenv("X64ARM_TRACE_FAULTS")){
+        // 堆疊前 24 個指標寬的值：沒有符號時用來找呼叫者。
+        std::cerr<<"[fault_stack]"<<std::hex;
+        for(unsigned i=0;i<24;++i)try{std::cerr<<" 0x"<<memory.load(GuestAddress{state.reg(Gpr::Rsp)+i*(x86_?4U:8U)},x86_?32:64);}catch(const std::exception&){break;}
+        std::cerr<<" below:";
+        for(unsigned i=16;i>=1;--i)try{std::cerr<<" 0x"<<memory.load(GuestAddress{state.reg(Gpr::Rsp)-i*(x86_?4U:8U)},x86_?32:64);}catch(const std::exception&){break;}
+        std::cerr<<" code:";
+        for(unsigned i=0;i<32;++i)try{std::cerr<<' '<<memory.load(GuestAddress{fault.address.value+i},8);}catch(const std::exception&){std::cerr<<" (不可讀)";break;}
+        std::cerr<<std::dec<<'\n';
+        // X64ARM_TRACE_FAULT_PEEK=<十六進位位址,…>：故障時順便列出這些客體位址的 32 位元值。
+        if(const char* peek=std::getenv("X64ARM_TRACE_FAULT_PEEK")){
+            std::cerr<<"[fault_peek]"<<std::hex;
+            for(const char* cursor=peek;*cursor;){char* next=nullptr;const auto address=std::strtoull(cursor,&next,16);if(next==cursor)break;
+                try{const auto value=memory.load(GuestAddress{address},32);std::cerr<<" 0x"<<address<<"=0x"<<value;
+                    if(const auto* descriptor=detail::runtime_stub_descriptor(stub_base_,GuestAddress{value}))std::cerr<<'('<<descriptor->family<<'!'<<descriptor->symbol<<" args="<<std::dec<<static_cast<unsigned>(descriptor->arguments)<<std::hex<<')';}catch(const std::exception&){std::cerr<<" 0x"<<address<<"=?";}
+                cursor=*next==','?next+1:next;}
+            std::cerr<<std::dec<<'\n';
+        }
+    }
     if(release_stack_guard(state,memory,fault.address.value)){
         constexpr std::uint32_t overflow=0xc00000fdU;
         if(emit_debug_event(state,memory,debugger::Exception{overflow,0,0,state.rip.value,{},true})==debugger::handled)return true;

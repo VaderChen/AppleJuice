@@ -43,6 +43,35 @@ void metal_depth_transfer(id<MTLDevice> device,id<MTLCommandQueue> queue,const G
     }
 }
 
+// GPU 專用顏色紋理（渲染目標／UAV，Private 儲存以啟用無損壓縮）的 CPU 傳輸：經 Shared staging 緩衝與 blit，
+// 與深度平面傳輸相同在呼叫端 wait_resource 之後以同一佇列提交並等待完成。row／image 為客體資料的列與平面間距。
+bool metal_private_targets() noexcept {
+    // 渲染目標與 UAV 紋理預設 Shared（Apple GPU 不能壓縮）。2026-11-09《暗影》1080p 4 vCPU 開關各兩輪 55.3 → 55.75 FPS，
+    // 在雜訊內，且 CPU 寫入這類紋理改為同步 blit，預設關閉；X64ARM_METAL_PRIVATE_TARGETS=1 開啟。
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_METAL_PRIVATE_TARGETS");return value && std::string_view(value)=="1";}();
+    return enabled;
+}
+void metal_private_color_transfer(id<MTLDevice> device,id<MTLCommandQueue> queue,id<MTLTexture> texture,std::uint32_t level,std::uint32_t slice,
+    std::span<std::uint8_t> data,std::uint32_t row,std::uint32_t image,MTLRegion region,bool upload){
+    const auto planes=static_cast<std::size_t>(region.size.depth),rows=static_cast<std::size_t>(region.size.height);
+    if(!image)image=static_cast<std::uint32_t>(std::size_t{row}*rows);
+    const std::size_t length=std::size_t{image}*(planes-1)+std::size_t{row}*rows;
+    if(!length || data.size()<length)throw std::invalid_argument("Private 紋理傳輸資料不足");
+    auto lease=reserve_gpu_memory(length);
+    auto buffer=[device newBufferWithLength:length options:MTLResourceStorageModeShared];if(!buffer)throw std::bad_alloc{};
+    if(upload)std::memcpy(buffer.contents,data.data(),length);
+    auto command=[queue commandBuffer];if(!command)throw std::runtime_error("Private 紋理 command buffer 建立失敗");
+    auto encoder=[command blitCommandEncoder];MetalEncoderScope scope{encoder};if(!encoder)throw std::runtime_error("Private 紋理 blit encoder 建立失敗");
+    const NSUInteger per_image=texture.textureType==MTLTextureType3D?image:0;
+    if(upload)[encoder copyFromBuffer:buffer sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:per_image sourceSize:region.size
+                            toTexture:texture destinationSlice:slice destinationLevel:level destinationOrigin:region.origin];
+    else [encoder copyFromTexture:texture sourceSlice:slice sourceLevel:level sourceOrigin:region.origin sourceSize:region.size
+                         toBuffer:buffer destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:per_image];
+    scope.end();track_gpu_commands(command);[command commit];[command waitUntilCompleted];
+    if(command.status==MTLCommandBufferStatusError)throw std::runtime_error("Private 紋理傳輸失敗："+std::string(command.error.localizedDescription.UTF8String));
+    if(!upload)std::memcpy(data.data(),buffer.contents,length);
+}
+
 id<MTLTexture> metal_shader_texture(const GraphicsView& view){
     auto& resource=metal_resource(view.resource);auto texture=resource.texture;if(!texture)return nil;
     const auto format=view.format?view.format:resource.desc.format;
@@ -61,6 +90,7 @@ id<MTLTexture> metal_shader_texture(const GraphicsView& view){
     const std::uint32_t layers=std::max(1U,resource.desc.layers),slice=volume?0:std::min(view.slice,layers-1);
     std::uint32_t slices=view.slices && view.slices<=layers-slice?view.slices:layers-slice;
     if(volume || type==MTLTextureType2D || type==MTLTextureType2DMultisample)slices=1;else if(type==MTLTextureTypeCube)slices=6;
+    else if(type==MTLTextureTypeCubeArray)slices=std::max(6U,slices/6*6); // Metal 要求 Cube 陣列的 slice 數是 6 的倍數。
     const std::uint32_t mips=std::max(1U,resource.desc.levels),level=std::min(view.level,mips-1),levels=view.levels && view.levels<=mips-level?view.levels:mips-level;
     if(level || levels!=resource.desc.levels || slice || (!volume && slices!=resource.desc.layers) || pixel_format!=texture.pixelFormat || stencil || rgb32 || replicate_red || red_only || type!=texture.textureType)
     return resource.shader_view((__bridge const void*)texture,{2,static_cast<std::uint32_t>(pixel_format),static_cast<std::uint32_t>(type),(rgb32?1U:0U)|(stencil?2U:0U)|(replicate_red?4U:0U)|(red_only?8U:0U),level|(levels<<16),slice|(slices<<16)},[&]()->id<MTLTexture>{

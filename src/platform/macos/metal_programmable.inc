@@ -61,7 +61,10 @@ std::shared_ptr<GraphicsResource> MetalGl::graphics_resource(const GraphicsResou
         }
         // D3D Texture1D 使用高度為 1 的 Metal 二維紋理，沿用同一深度平面與陣列切片流程。
         if(metal_depth_format(t.pixelFormat) && d.dimension!=2 && d.dimension!=3)throw std::invalid_argument("深度／模板資源需要一維或二維紋理");
-        t.storageMode=metal_depth_format(t.pixelFormat) || d.samples>1?MTLStorageModePrivate:MTLStorageModeShared;
+        // 渲染目標／UAV 的顏色紋理只由 GPU 存取（CPU 讀寫經 metal_private_color_transfer），改 Private 讓 Apple GPU 做無損壓縮、
+        // 減少每個 render pass 載入／寫回附件的頻寬。其餘（可能直接 CPU 寫入的貼圖、staging）維持 Shared。
+        const bool gpu_target=metal_private_targets() && d.samples==1 && (d.bind&(0x20U|0x80U));
+        t.storageMode=metal_depth_format(t.pixelFormat) || d.samples>1 || gpu_target?MTLStorageModePrivate:MTLStorageModeShared;
         r->texture=[device_ newTextureWithDescriptor:t];if(!r->texture)throw std::bad_alloc{};
     }
     return r;
@@ -106,14 +109,15 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_shader(std::uint32_t stage,std
     }
     return created;
 }
-std::uint64_t MetalGl::graphics_shader_prefetch(std::uint32_t stage,std::span<const std::uint8_t> bytes){
+std::uint64_t MetalGl::graphics_shader_prefetch(std::uint32_t stage,std::span<const std::uint8_t> bytes,
+                                              const std::shared_ptr<SharedWake>& wake){
     // 只用於 DXBC 容器（SM4／5 與 DXIL，stage 0～5）；D3D9 legacy 與串流輸出容器照常同步建立。背景序列佇列呼叫 graphics_shader
     // 完成 HLSLcc／SPIR-V 轉譯（Metal 程式庫本來就非同步編譯）並放進快取；呼叫端以票號等待後重試，命中快取即直接取得。
     // 雙人成行每輪約 432 個（轉譯中位 0.9 ms、p90 約 14 ms），操作中仍持續出現；原本在協調者持獨占映射鎖並等命令執行緒排空時
     // 同步轉譯。同成品操作中 37.97 對 36.32 fps、>50 ms 長幀中位 10 對 18。X64ARM_SHADER_ASYNC=0 關閉。
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_SHADER_ASYNC");return !value || std::string_view(value)!="0";}();
     static const bool trace=std::getenv("X64ARM_TRACE_SHADER_ASYNC")!=nullptr;
-    if(!enabled || stage>5 || bytes.size()<32 || metal_word(bytes,0)!=0x43425844){
+    if(!enabled || !metal_independent_shader(stage,bytes)){
         if(trace)std::fprintf(stderr,"[shader_async] prefetch skip enabled=%d stage=%u size=%zu magic=%x\n",enabled?1:0,stage,bytes.size(),bytes.size()>=4?metal_word(bytes,0):0U);
         return 0;
     }
@@ -129,17 +133,29 @@ std::uint64_t MetalGl::graphics_shader_prefetch(std::uint32_t stage,std::span<co
     const std::uint64_t ticket=key?key:1;
     const std::lock_guard lock(shader_jobs_mutex_);
     if(shader_failed_.contains(ticket))return 0;
-    if(shader_jobs_.contains(ticket))return ticket;
-    shader_jobs_.insert(ticket);
+    if(const auto job=shader_jobs_.find(ticket);job!=shader_jobs_.end()){
+        if(wake)job->second=wake;
+        return ticket;
+    }
     if(!shader_queue_)shader_queue_=dispatch_queue_create("x64arm.shader-compile",dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_USER_INITIATED,0));
     const auto copy=std::make_shared<std::vector<std::uint8_t>>(bytes.begin(),bytes.end());
+    shader_jobs_.emplace(ticket,wake);
     const auto queued=std::chrono::steady_clock::now();
     dispatch_async(shader_queue_,^{@autoreleasepool{
         bool failed=false;const auto started=std::chrono::steady_clock::now();
         try{(void)graphics_shader(stage,*copy);}catch(...){failed=true;}
         if(trace)std::fprintf(stderr,"[shader_async] compiled stage=%u queued_ms=%.1f compile_ms=%.1f failed=%d\n",stage,
             std::chrono::duration<double,std::milli>(started-queued).count(),std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count(),failed?1:0);
-        const std::lock_guard done(shader_jobs_mutex_);shader_jobs_.erase(ticket);if(failed)shader_failed_.insert(ticket);
+        std::shared_ptr<SharedWake> notify;
+        {
+            const std::lock_guard done(shader_jobs_mutex_);
+            auto job=shader_jobs_.find(ticket);
+            notify=std::move(job->second);
+            shader_jobs_.erase(job);
+            if(failed)try{shader_failed_.insert(ticket);}catch(const std::bad_alloc&){}
+        }
+        // 先發布票號完成，再通知已登記等待的協調者。
+        if(notify)notify->notify();
     }});
     return ticket;
 }
@@ -217,68 +233,103 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_translate_shader(std::uint32_t
         output.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));
         if(!output)throw std::runtime_error("無法保存 DXBC 診斷資料");
     }
-    if((stage==3 || stage==4) && !shared){auto shader=std::make_shared<MetalShader>();shader->stage=stage;shader->serial=++shader_serial_;shader->bytecode.assign(bytes.begin(),bytes.end());return shader;}
-    struct Reflection final:HLSLccReflection {
-        std::map<std::string,std::uint32_t> constants,buffers,textures,inputs;
-        std::array<std::uint32_t,3> threads{1,1,1};std::string error;
-        std::array<unsigned,4> tessellation{};
-        void OnTessellationInfo(unsigned partition,unsigned winding,unsigned factor,unsigned patches)override{tessellation={partition,winding,factor,patches};}
-        void OnDiagnostics(const std::string& message,int,bool bad)override{if(bad)error+=message;}
-        void OnInputBinding(const std::string& name,int bind)override{
-            // Metal 的宣告使用 input.SEMANTIC；DXBC signature 只保存 SEMANTIC。
-            // 使用轉譯器分配的位置，不能由原始暫存器編號推測活躍 attribute。
-            const auto key=name.starts_with("input.")?name.substr(6):name;
-            inputs[key]=static_cast<std::uint32_t>(bind);
+    if((stage==3 || stage==4) && !shared){
+        auto shader=std::make_shared<MetalShader>();shader->stage=stage;shader->serial=++shader_serial_;shader->bytecode.assign(bytes.begin(),bytes.end());
+        // HS／DS 要和前一階段一起翻譯（細分管線建立時才做）；這裡先單獨翻譯一次取得暫存器綁定表，
+        // D3D12 依綁定表決定要解析哪些根參數，描述元池也依它複製槽位。單獨翻譯失敗時維持空表（D3D11 不依賴此表）。
+        try{GLSLCrossDependencyData local;if(auto translated=std::dynamic_pointer_cast<MetalShader>(graphics_translate_shader(stage,bytes,&local)))shader->bindings=translated->bindings;}
+        catch(const std::exception&){}
+        return shader;
+    }
+    const auto translate=[&]{
+        struct Reflection final:HLSLccReflection {
+            std::map<std::string,std::uint32_t> constants,buffers,textures,inputs;
+            std::array<std::uint32_t,3> threads{1,1,1};std::string error;
+            std::array<unsigned,4> tessellation{};
+            void OnTessellationInfo(unsigned partition,unsigned winding,unsigned factor,unsigned patches)override{tessellation={partition,winding,factor,patches};}
+            void OnDiagnostics(const std::string& message,int,bool bad)override{if(bad)error+=message;}
+            void OnInputBinding(const std::string& name,int bind)override{
+                // Metal 的宣告使用 input.SEMANTIC；DXBC signature 只保存 SEMANTIC。
+                // 使用轉譯器分配的位置，不能由原始暫存器編號推測活躍 attribute。
+                const auto key=name.starts_with("input.")?name.substr(6):name;
+                inputs[key]=static_cast<std::uint32_t>(bind);
+            }
+            void OnConstantBufferBinding(const std::string& name,int bind)override{constants[name]=static_cast<std::uint32_t>(bind);}
+            void OnBufferBinding(const std::string& name,int bind,bool)override{buffers[name]=static_cast<std::uint32_t>(bind);}
+            void OnTextureBinding(const std::string& name,int bind,int,bool,HLSLCC_TEX_DIMENSION,bool)override{textures[name]=static_cast<std::uint32_t>(bind);}
+            void OnThreadGroupSize(unsigned x,unsigned y,unsigned z)override{threads={x,y,z};}
+        } reflection;
+        GLSLShader translated;GLSLCrossDependencyData deps;HLSLccSamplerPrecisionInfo precision;
+        std::vector<std::uint32_t> aligned((bytes.size()+3)/4);std::memcpy(aligned.data(),bytes.data(),bytes.size());
+        if(!TranslateHLSLFromMem(reinterpret_cast<const char*>(aligned.data()),HLSLCC_FLAG_INOUT_SEMANTIC_NAMES|HLSLCC_FLAG_UNIFORM_BUFFER_OBJECT|HLSLCC_FLAG_TRANSLATE_MATRICES|(shared?HLSLCC_FLAG_METAL_TESSELLATION:0),LANG_METAL,nullptr,shared?shared:&deps,precision,reflection,&translated))throw std::invalid_argument("DXBC 至 Metal 轉譯失敗："+reflection.error);
+        if(!reflection.error.empty())throw std::invalid_argument("DXBC 至 Metal 語義不支援："+reflection.error);
+        auto shader=std::make_shared<MetalShader>();shader->stage=stage;shader->threads=reflection.threads;
+        // D3D 的 SV_InstanceID 從 0 起算，不含 StartInstanceLocation；Metal 的 [[instance_id]] 含 base instance，要讓 HLSLcc 產生的減法生效。
+        shader->source="#define UNITY_SUPPORT_INDIRECT_BUFFERS 1\n"+translated.sourceCode;
+        shader->tessellation=reflection.tessellation;
+        metal_shader_varyings(*shader,translated.reflection);if(stage==2)metal_geometry_metadata(*shader,bytes);
+        const auto matching=[&](const std::map<std::string,std::uint32_t>& names,const std::string& name)->std::uint32_t{auto it=names.find(name);if(it!=names.end())return it->second;for(const auto& [key,slot]:names)if(key=="_"+name || key.ends_with(name))return slot;throw std::invalid_argument("Metal 反射找不到資源："+name);};
+        // DXBC 資源陣列的名稱可含 [n]，Metal 宣告會將括號改成底線。
+        // 每個實際宣告獨立查表，不能假定 HLSL 暫存器與 Metal binding 連續。
+        const auto samplers=metal_sampler_bindings(shader->source);
+        const auto has_name=[&](const auto& map,const std::string& name){return map.contains(name) || map.contains("_"+name) || (shared && std::any_of(map.begin(),map.end(),[&](const auto& item){return item.first.ends_with("_"+name);}));};
+        for(const auto& binding:translated.reflection.psResourceBindings){
+            const auto type=static_cast<unsigned>(binding.eType);
+            std::string base=binding.name;for(auto& character:base)if(character=='[' || character==']')character='_';
+            for(unsigned j=0;j<binding.ui32BindCount;++j){std::uint32_t native=0,kind=0;const auto name=base+(j?std::to_string(j):std::string{});
+                if(type==0){auto constant=name;if(!constant.empty() && constant[0]=='$')constant=(shared?"":stage==0?"V":stage==1?"F":stage==2?"G":"")+constant.substr(1);native=matching(reflection.constants,constant);kind=0;}
+                else if(type==3){if(!has_name(samplers,name) && !has_name(samplers,"x64arm_sampler_"+name))continue;native=matching(samplers,name);kind=2;}
+                else if(has_name(reflection.textures,name)){native=matching(reflection.textures,name);kind=type==4?5:1;}
+                else if(has_name(reflection.buffers,name)){native=matching(reflection.buffers,name);kind=ShaderInfo::ResourceTypeToResourceGroup(binding.eType)==RGROUP_UAV?4:3;}
+                else continue;
+                shader->bindings.push_back({kind,binding.ui32BindPoint+j,native&0xffff,(native>>16)?(native>>16)-1:UINT32_MAX,0,0,UINT32_MAX,static_cast<std::uint32_t>(binding.eDimension)});
+            }
         }
-        void OnConstantBufferBinding(const std::string& name,int bind)override{constants[name]=static_cast<std::uint32_t>(bind);}
-        void OnBufferBinding(const std::string& name,int bind,bool)override{buffers[name]=static_cast<std::uint32_t>(bind);}
-        void OnTextureBinding(const std::string& name,int bind,int,bool,HLSLCC_TEX_DIMENSION,bool)override{textures[name]=static_cast<std::uint32_t>(bind);}
-        void OnThreadGroupSize(unsigned x,unsigned y,unsigned z)override{threads={x,y,z};}
-    } reflection;
-    GLSLShader translated;GLSLCrossDependencyData deps;HLSLccSamplerPrecisionInfo precision;
-    std::vector<std::uint32_t> aligned((bytes.size()+3)/4);std::memcpy(aligned.data(),bytes.data(),bytes.size());
-    if(!TranslateHLSLFromMem(reinterpret_cast<const char*>(aligned.data()),HLSLCC_FLAG_INOUT_SEMANTIC_NAMES|HLSLCC_FLAG_UNIFORM_BUFFER_OBJECT|HLSLCC_FLAG_TRANSLATE_MATRICES|(shared?HLSLCC_FLAG_METAL_TESSELLATION:0),LANG_METAL,nullptr,shared?shared:&deps,precision,reflection,&translated))throw std::invalid_argument("DXBC 至 Metal 轉譯失敗："+reflection.error);
-    if(!reflection.error.empty())throw std::invalid_argument("DXBC 至 Metal 語義不支援："+reflection.error);
-    auto shader=std::make_shared<MetalShader>();shader->stage=stage;shader->serial=++shader_serial_;shader->threads=reflection.threads;shader->source=translated.sourceCode;
-    shader->bytecode.assign(bytes.begin(),bytes.end());shader->tessellation=reflection.tessellation;
-    if(shared){if(const char* folder=std::getenv("X64ARM_DUMP_DXBC");folder && *folder){std::ofstream out(std::filesystem::path(folder)/("tess-stage-"+std::to_string(stage)+".metal"));out<<shader->source;}}
+        metal_texture1d_shader(*shader);
+        if(!shared)metal_buffer_shader(*shader);
+        for(const auto& input:translated.reflection.psInputSignatures){
+            if(input.eSystemValueType!=NAME_UNDEFINED)continue;
+            const auto name=input.semanticName+std::to_string(input.ui32SemanticIndex);std::optional<std::uint32_t> slot;
+            if(auto it=reflection.inputs.find(name);it!=reflection.inputs.end())slot=it->second;
+            else if(auto prefixed=reflection.inputs.find("_"+name);prefixed!=reflection.inputs.end())slot=prefixed->second;
+            else if(shared)for(const auto& [key,v]:reflection.inputs)if(key.ends_with("_"+name)){slot=v;break;}
+            // signature 可保留已最佳化移除的輸入；未產生 Metal 宣告就不建立 fetch。
+            if(slot)shader->inputs.push_back({input.semanticName,input.ui32SemanticIndex,*slot,input.eComponentType==INOUT_COMPONENT_UINT32?1U:input.eComponentType==INOUT_COMPONENT_SINT32?2U:0U});
+        }
+        return shader;
+    };
+    // 共享結果只用於獨立翻譯；VS／HS／DS 的合成與幾何階段仍走各自的相依流程。
+    std::optional<detail::ShaderCacheKey> cache_key;
+    if(!shared && stage!=2 && detail::shader_memory_cache_enabled())
+        cache_key=detail::shader_cache_key(0x10000U|stage,bytes);
+    std::shared_ptr<MetalShader> shader;
+    if(cache_key)try{
+        if(const auto cached=detail::shader_memory_cache_find(*cache_key)){
+            auto decoded=std::make_shared<MetalShader>();
+            if(decode_metal_hlslcc_shader(*cached,*decoded))shader=std::move(decoded);
+        }
+    }catch(const std::bad_alloc&){}
+    if(!shader){
+        shader=translate();
+        if(cache_key)try{detail::shader_memory_cache_store(*cache_key,encode_metal_hlslcc_shader(*shader));}catch(const std::bad_alloc&){}
+    }
+    shader->stage=stage;shader->serial=++shader_serial_;shader->bytecode.assign(bytes.begin(),bytes.end());
     shader->writes_depth=stage==1 && metal_writes_depth(shader->source);
-    metal_shader_varyings(*shader,translated.reflection);if(stage==2)metal_geometry_metadata(*shader,bytes);
-    const auto matching=[&](const std::map<std::string,std::uint32_t>& names,const std::string& name)->std::uint32_t{auto it=names.find(name);if(it!=names.end())return it->second;for(const auto& [key,slot]:names)if(key=="_"+name || key.ends_with(name))return slot;throw std::invalid_argument("Metal 反射找不到資源："+name);};
-    // DXBC 資源陣列的名稱可含 [n]，Metal 宣告會將括號改成底線。
-    // 每個實際宣告獨立查表，不能假定 HLSL 暫存器與 Metal binding 連續。
-    const auto samplers=metal_sampler_bindings(shader->source);
-    const auto has_name=[&](const auto& map,const std::string& name){return map.contains(name) || map.contains("_"+name) || (shared && std::any_of(map.begin(),map.end(),[&](const auto& item){return item.first.ends_with("_"+name);}));};
-    for(const auto& binding:translated.reflection.psResourceBindings){
-        const auto type=static_cast<unsigned>(binding.eType);
-        std::string base=binding.name;for(auto& character:base)if(character=='[' || character==']')character='_';
-        for(unsigned j=0;j<binding.ui32BindCount;++j){std::uint32_t native=0,kind=0;const auto name=base+(j?std::to_string(j):std::string{});
-            if(type==0){auto constant=name;if(!constant.empty() && constant[0]=='$')constant=(shared?"":stage==0?"V":stage==1?"F":stage==2?"G":"")+constant.substr(1);native=matching(reflection.constants,constant);kind=0;}
-            else if(type==3){if(!has_name(samplers,name) && !has_name(samplers,"x64arm_sampler_"+name))continue;native=matching(samplers,name);kind=2;}
-            else if(has_name(reflection.textures,name)){native=matching(reflection.textures,name);kind=type==4?5:1;}
-            else if(has_name(reflection.buffers,name)){native=matching(reflection.buffers,name);kind=ShaderInfo::ResourceTypeToResourceGroup(binding.eType)==RGROUP_UAV?4:3;}
-            else continue;
-            shader->bindings.push_back({kind,binding.ui32BindPoint+j,native&0xffff,(native>>16)?(native>>16)-1:UINT32_MAX,0,0,UINT32_MAX,static_cast<std::uint32_t>(binding.eDimension)});
-        }
-    }
-    metal_texture1d_shader(*shader);
-    if(!shared)metal_buffer_shader(*shader);
-    for(const auto& input:translated.reflection.psInputSignatures){
-        if(input.eSystemValueType!=NAME_UNDEFINED)continue;
-        const auto name=input.semanticName+std::to_string(input.ui32SemanticIndex);std::optional<std::uint32_t> slot;
-        if(auto it=reflection.inputs.find(name);it!=reflection.inputs.end())slot=it->second;
-        else if(auto prefixed=reflection.inputs.find("_"+name);prefixed!=reflection.inputs.end())slot=prefixed->second;
-        else if(shared)for(const auto& [key,v]:reflection.inputs)if(key.ends_with("_"+name)){slot=v;break;}
-        // signature 可保留已最佳化移除的輸入；未產生 Metal 宣告就不建立 fetch。
-        if(slot)shader->inputs.push_back({input.semanticName,input.ui32SemanticIndex,*slot,input.eComponentType==INOUT_COMPONENT_UINT32?1U:input.eComponentType==INOUT_COMPONENT_SINT32?2U:0U});
-    }
+    if(shared){if(const char* folder=std::getenv("X64ARM_DUMP_DXBC");folder && *folder){std::ofstream out(std::filesystem::path(folder)/("tess-stage-"+std::to_string(stage)+".metal"));out<<shader->source;}}
     if(shared)return shader;
+    // VS 接到 GS 時可以只輸出自訂 varying，裁切位置由 GS 產生。
+    const bool intermediate=stage==0 && std::none_of(shader->output_varyings.begin(),shader->output_varyings.end(),[](const auto& v){return v.system==NAME_POSITION;});
+    static const bool separate_vertex_mad=[] {const auto* value=std::getenv("X64ARM_METAL_VERTEX_SEPARATE_MAD");return !value || std::string_view(value)!="0";}();
+    if(stage==0 && !intermediate && separate_vertex_mad){
+        // DXBC MAD 允許分開捨入。與明列 MUL、ADD 的頂點程式採用同一捨入方式，讓深度前置遍與等深度材質遍一致。
+        // 快取保存原始轉譯結果。每次載入時套用此規則，已快取的頂點程式也會一起生效。
+        metal_replace(shader->source,"#if !(__HAVE_FMA__)","#if 1");
+        shader->source.insert(0,"#pragma clang fp contract(off)\n");
+    }
     // 診斷：X64ARM_DUMP_MSL=<目錄> 保存轉譯後的 MSL（檔名含階段與序號，與繪製追蹤的 vs／ps／cs 編號相同）。
     if(const char* folder=std::getenv("X64ARM_DUMP_MSL");folder && *folder){std::ofstream out(std::filesystem::path(folder)/("stage"+std::to_string(stage)+"-"+std::to_string(shader->serial)+".metal"));out<<shader->source;}
     if(stage==2){shader->geometry_original=shader->source;shader->source=metal_geometry_clean(shader->source);}
-    // VS 接到 GS 時可以只輸出自訂 varying，裁切位置由 GS 產生。
     // 仍編譯驗證 VS 主體，真正執行沿用幾何管線的 rasterization-disabled capture。
-    const bool intermediate=stage==0 && std::none_of(shader->output_varyings.begin(),shader->output_varyings.end(),[](const auto& v){return v.system==NAME_POSITION;});
     // 此路徑先由原始 EXE A/B 驗證；開關不影響 GPU 執行位置或浮點模式。
     if(stage==5)if(const auto* compact=std::getenv("X64ARM_METAL_COMPUTE_LOOP_COMPACTION");compact && std::string_view(compact)=="1"){
         unsigned block=1;if(const auto* value=std::getenv("X64ARM_METAL_COMPUTE_LOOP_BLOCK")){const auto parsed=std::string_view(value);if(parsed=="2")block=2;else if(parsed=="4")block=4;else if(parsed=="8")block=8;else if(parsed=="16")block=16;}
@@ -429,9 +480,13 @@ void MetalGl::graphics_write(const GraphicsView& v,std::span<const std::uint8_t>
     const auto w=std::max(1U,r.desc.width>>v.level),h=std::max(1U,r.desc.height>>v.level),z=std::max(1U,r.desc.depth>>v.level);
     const auto pitch=graphics_format_pitch(r.desc.format,w,h);if(!row)row=pitch[0];if(!image)image=row*pitch[1];if(row<pitch[0] || image<row*pitch[1] || data.size()<std::uint64_t{image}*(z-1)+std::uint64_t{row}*(pitch[1]-1)+pitch[0])throw std::invalid_argument("紋理寫入越界");
     if(metal_depth_format(r.texture.pixelFormat)){std::vector<std::uint8_t> source(data.begin(),data.end());metal_depth_transfer(device_,queue_,v,source,row,{0,0,w,h},true);return;}
-    if(r.texture.storageMode==MTLStorageModePrivate)throw std::invalid_argument("MSAA 紋理不能直接 CPU 寫入");
+    if(r.texture.storageMode==MTLStorageModePrivate && r.desc.samples>1)throw std::invalid_argument("MSAA 紋理不能直接 CPU 寫入");
     std::vector<std::uint8_t> expanded;if(r.desc.format>=5 && r.desc.format<=8){expanded=metal_rgb32_expand(data,row,image,w,h,z);data=expanded;row=w*16;image=row*h;}
     else if(r.desc.format==115){expanded=metal_bgra4_transfer(data,row,image,w,h,z,true);data=expanded;row=w*2;image=row*h;}
+    if(r.texture.storageMode==MTLStorageModePrivate){
+        std::vector<std::uint8_t> source(data.begin(),data.end());
+        metal_private_color_transfer(device_,queue_,r.texture,v.level,v.slice,source,row,z>1?image:0,MTLRegionMake3D(0,0,0,w,h,z),true);return;
+    }
     [r.texture replaceRegion:MTLRegionMake3D(0,0,0,w,h,z) mipmapLevel:v.level slice:v.slice withBytes:data.data() bytesPerRow:row bytesPerImage:z>1?image:0];
 }}
 void MetalGl::graphics_write_discard(const GraphicsView& v,std::span<const std::uint8_t> data,std::uint32_t row,std::uint32_t image){@autoreleasepool{
@@ -477,9 +532,13 @@ void MetalGl::graphics_write_region(const GraphicsView& v,std::span<const std::u
     if(row<line || (z>1 && image<plane) || data.size()<std::uint64_t{image}*(z-1)+std::uint64_t{row}*(pitch[1]-1)+line)throw std::invalid_argument("紋理區域來源資料不足");
     wait_resource(v.resource);
     if(metal_depth_format(r.texture.pixelFormat)){if(box[2] || z!=1)throw std::invalid_argument("深度紋理區域不合法");std::vector<std::uint8_t> source(data.begin(),data.end());metal_depth_transfer(device_,queue_,v,source,row,{box[0],box[1],w,h},true);return;}
-    if(r.texture.storageMode==MTLStorageModePrivate)throw std::invalid_argument("MSAA 紋理不能直接 CPU 寫入");
+    if(r.texture.storageMode==MTLStorageModePrivate && r.desc.samples>1)throw std::invalid_argument("MSAA 紋理不能直接 CPU 寫入");
     std::vector<std::uint8_t> expanded;if(r.desc.format>=5 && r.desc.format<=8){expanded=metal_rgb32_expand(data,row,image,w,h,z);data=expanded;row=w*16;image=row*h;}
     else if(r.desc.format==115){expanded=metal_bgra4_transfer(data,row,image,w,h,z,true);data=expanded;row=w*2;image=row*h;}
+    if(r.texture.storageMode==MTLStorageModePrivate){
+        std::vector<std::uint8_t> source(data.begin(),data.end());
+        metal_private_color_transfer(device_,queue_,r.texture,v.level,v.slice,source,row,z>1?image:0,MTLRegionMake3D(box[0],box[1],box[2],w,h,z),true);return;
+    }
     [r.texture replaceRegion:MTLRegionMake3D(box[0],box[1],box[2],w,h,z) mipmapLevel:v.level slice:v.slice withBytes:data.data() bytesPerRow:row bytesPerImage:z>1?image:0];
 }}
 // 描述元表需要被間接引用的配置常駐：以 MTLResidencySet（macOS 15+）記錄，表綁定前提交變更。
@@ -543,10 +602,16 @@ std::vector<std::uint8_t> MetalGl::graphics_read(const GraphicsView& v){@autorel
     wait_resource(v.resource);auto& r=metal_resource(v.resource);if(r.buffer){const auto count=v.count?v.count:r.desc.width-v.first;if(std::uint64_t{v.first}+count>r.desc.width)throw std::invalid_argument("緩衝區讀回越界");auto* p=static_cast<std::uint8_t*>(r.buffer.contents)+v.first;return {p,p+count};}
     const auto w=std::max(1U,r.desc.width>>v.level),h=std::max(1U,r.desc.height>>v.level),z=std::max(1U,r.desc.depth>>v.level);const auto pitch=graphics_format_pitch(r.desc.format,w,h);const auto row=pitch[0];std::vector<std::uint8_t> data(static_cast<std::size_t>(row)*pitch[1]*z);
     if(metal_depth_format(r.texture.pixelFormat)){metal_depth_transfer(device_,queue_,v,data,row,{0,0,w,h},false);return data;}
-    if(r.texture.storageMode==MTLStorageModePrivate)throw std::invalid_argument("MSAA 讀回需要對應 resolve 格式");if(r.desc.format>=5 && r.desc.format<=8){
-        std::vector<std::uint8_t> expanded(std::size_t{w}*h*z*16);[r.texture getBytes:expanded.data() bytesPerRow:w*16 bytesPerImage:z>1?w*h*16:0 fromRegion:MTLRegionMake3D(0,0,0,w,h,z) mipmapLevel:v.level slice:v.slice];
+    if(r.texture.storageMode==MTLStorageModePrivate && r.desc.samples>1)throw std::invalid_argument("MSAA 讀回需要對應 resolve 格式");
+    const bool private_color=r.texture.storageMode==MTLStorageModePrivate;
+    const auto fetch=[&](std::span<std::uint8_t> target,std::uint32_t bytes_per_row,std::uint32_t bytes_per_image){
+        if(private_color)metal_private_color_transfer(device_,queue_,r.texture,v.level,v.slice,target,bytes_per_row,z>1?bytes_per_image:0,MTLRegionMake3D(0,0,0,w,h,z),false);
+        else [r.texture getBytes:target.data() bytesPerRow:bytes_per_row bytesPerImage:z>1?bytes_per_image:0 fromRegion:MTLRegionMake3D(0,0,0,w,h,z) mipmapLevel:v.level slice:v.slice];
+    };
+    if(r.desc.format>=5 && r.desc.format<=8){
+        std::vector<std::uint8_t> expanded(std::size_t{w}*h*z*16);fetch(expanded,w*16,w*h*16);
         for(std::size_t i=0;i<std::size_t{w}*h*z;++i)std::memcpy(data.data()+i*12,expanded.data()+i*16,12);return data;
-    }[r.texture getBytes:data.data() bytesPerRow:row bytesPerImage:z>1?row*pitch[1]:0 fromRegion:MTLRegionMake3D(0,0,0,w,h,z) mipmapLevel:v.level slice:v.slice];if(r.desc.format==115)return metal_bgra4_transfer(data,row,row*h,w,h,z,false);return data;
+    }fetch(data,row,row*pitch[1]);if(r.desc.format==115)return metal_bgra4_transfer(data,row,row*h,w,h,z,false);return data;
 }}
 // Shared 緩衝在完成旗標之後即可由 CPU 直接讀取；不經 wait_resource（它會提交目前批次並等待所有使用同一緩衝的批次）。
 // 其他資源沿用 graphics_read。資格判斷見 metal_completed_readable。
@@ -810,6 +875,32 @@ static std::uint64_t metal_now_ns(){return clock_gettime_nsec_np(CLOCK_UPTIME_RA
 // 只關閉繪製計畫與頂點輸入解析快取（每次繪製照常組管線與頂點描述，管線仍以快速鍵查找）。兩者皆供同一執行檔對照。
 static bool metal_fast_pipeline_key(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_FAST_PIPELINE_KEY");return !text || std::string_view(text)!="0";}();return value;}
 static bool metal_fast_draw_plan(){static const bool value=metal_fast_pipeline_key() && [] {const auto* text=std::getenv("X64ARM_METAL_FAST_DRAW_PLAN");return !text || std::string_view(text)!="0";}();return value;}
+static bool metal_pipeline_fifo(){
+    static const bool enabled=[] {
+        const auto* value=std::getenv("X64ARM_METAL_PIPELINE_FIFO");
+        return !value || std::string_view(value)!="0";
+    }();
+    return enabled;
+}
+// 管線可重建。只在未命中時維護插入順序，達上限先移除最早的一筆。
+template<class Cache,class Order,class Key,class Value>
+static void metal_cache_pipeline(Cache& cache,Order& order,const Key& key,Value&& value){
+    static const auto limit=metal_cache_entries("X64ARM_METAL_D3D_PIPELINE_CACHE_ENTRIES",2048);
+    if(!limit)return;
+    if(cache.size()>=limit){
+        cache.erase(order.front());
+        order.pop_front();
+    }
+    try{
+        order.push_back(key);
+        try{
+            if(!cache.emplace(order.back(),std::forward<Value>(value)).second)order.pop_back();
+        }catch(...){
+            order.pop_back();
+            throw;
+        }
+    }catch(const std::bad_alloc&){}
+}
 const MetalPipelineInputs* MetalGl::pipeline_inputs(const GraphicsDraw& d){
     if(!d.pipeline_serial || !metal_fast_draw_plan())return nullptr;
     if(pipeline_inputs_.size()>4096)pipeline_inputs_.clear();
@@ -920,6 +1011,10 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
                     while(slot && (fixed->vertices[slot].resource || std::any_of(fixed->layout.begin(),fixed->layout.end(),[&](const auto& e){return e.slot==slot;})))--slot;
                     element.slot=slot;fixed->vertices[slot]=GraphicsVertexBuffer{zero_vertices_,0,0};fixed->layout.push_back(std::move(element));
                 }
+                if(!missing.empty()){
+                    fixed->pipeline_serial=0;
+                    fixed->pipeline_layout_serial=0;
+                }
             }
             graphics_draw(*fixed);return;
         }
@@ -959,14 +1054,33 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     }
     if(d.visibility){pass.visibilityResultBuffer=metal_resource(d.visibility).buffer;graphics_pending_.push_back(d.visibility);}
     if((!width || !height) && std::any_of(d.stages[1].unordered.begin(),d.stages[1].unordered.end(),[](const auto& view){return bool(view.resource);})){for(const auto& viewport:d.viewports){width=std::max(width,static_cast<unsigned>(std::max(0.0F,std::ceil(viewport[0]+viewport[2]))));height=std::max(height,static_cast<unsigned>(std::max(0.0F,std::ceil(viewport[1]+viewport[3]))));}pass.renderTargetWidth=width;pass.renderTargetHeight=height;pass.defaultRasterSampleCount=1;}
-    // D3D12 PSO 快速鍵：PSO 序號已決定著色器、輸入佈局與混色／深度／光柵狀態，另比對實際附件格式、取樣數、圖元類別
-    // 與佈局用到的頂點跨距；命中時略過完整鍵（約 1 KB 位元組串）的組字、雜湊與比對。未命中仍以完整鍵查找或建立。
+    // 診斷：X64ARM_TRACE_METAL_VIEWPORTS=1 時列出每種「附件尺寸＋viewport＋scissor」組合第一次出現的時間點，用來核對視口與附件是否一致。
+    {static const bool trace_viewports=std::getenv("X64ARM_TRACE_METAL_VIEWPORTS")!=nullptr;
+        if(trace_viewports){static std::set<std::array<float,10>> seen;std::array<float,10> tuple{static_cast<float>(width),static_cast<float>(height),static_cast<float>(desc.sampleCount),static_cast<float>(d.viewports.size())};
+            if(!d.viewports.empty()){tuple[4]=d.viewports[0][0];tuple[5]=d.viewports[0][1];tuple[6]=d.viewports[0][2];tuple[7]=d.viewports[0][3];}
+            if(!d.scissors.empty()){tuple[8]=static_cast<float>(d.scissors[0][2]);tuple[9]=static_cast<float>(d.scissors[0][3]);}
+            if(seen.size()<256 && seen.insert(tuple).second)std::fprintf(stderr,"[metal_viewport] target=%.0fx%.0f samples=%.0f count=%.0f viewport=%.1f,%.1f,%.1f,%.1f scissor_br=%.0f,%.0f tess=%d gs=%d\n",tuple[0],tuple[1],tuple[2],tuple[3],tuple[4],tuple[5],tuple[6],tuple[7],tuple[8],tuple[9],d.stages[3].shader?1:0,d.stages[2].shader?1:0);}}
+    // D3D12 PSO 與 D3D11 不可變狀態共用快速鍵，另比對實際附件格式、取樣數、圖元類別及頂點跨距。
+    // 未命中仍以完整鍵查找或建立。
     // 細分與幾何路徑需要完整鍵，不走快速鍵。命中時也沿用繪製計畫（MetalFastPipeline），略過著色器解析、混色／頂點描述重建與頂點槽位指派；
     // 開關見 metal_fast_pipeline_key／metal_fast_draw_plan。
-    const bool fast=metal_fast_pipeline_key() && d.pipeline_serial && !tessellated && !d.stages[2].shader;
+    static const bool d3d11_fast=[] {
+        const auto* value=std::getenv("X64ARM_D3D11_FAST_PIPELINE_KEY");
+        return !value || std::string_view(value)!="0";
+    }();
+    const bool immutable_d3d11=d3d11_fast && d.pipeline_layout_serial && (d.blend.empty() || d.pipeline_blend_serial);
+    const bool fast=metal_fast_pipeline_key() && (d.pipeline_serial || immutable_d3d11) &&
+        !tessellated && !d.stages[2].shader;
     MetalFastPipelineKey fast_key;id<MTLRenderPipelineState> pipeline=nil;const MetalFastPipeline* plan=nullptr;
     if(fast){
-        fast_key.serial=d.pipeline_serial;for(unsigned i=0;i<fast_key.colors.size();++i)fast_key.colors[i]=static_cast<std::uint32_t>(desc.colorAttachments[i].pixelFormat);
+        fast_key.serial=d.pipeline_serial;
+        if(!fast_key.serial){
+            fast_key.serial=dynamic_cast<const MetalShader&>(*d.stages[0].shader).serial;
+            fast_key.layout_serial=d.pipeline_layout_serial;
+            fast_key.blend_serial=d.pipeline_blend_serial;
+            if(d.stages[1].shader)fast_key.pixel_serial=dynamic_cast<const MetalShader&>(*d.stages[1].shader).serial;
+        }
+        for(unsigned i=0;i<fast_key.colors.size();++i)fast_key.colors[i]=static_cast<std::uint32_t>(desc.colorAttachments[i].pixelFormat);
         fast_key.depth=static_cast<std::uint32_t>(desc.depthAttachmentPixelFormat);fast_key.stencil=static_cast<std::uint32_t>(desc.stencilAttachmentPixelFormat);
         fast_key.samples=static_cast<std::uint32_t>(desc.sampleCount);fast_key.topology=raster_topology;fast_key.alpha={d.alpha_function,d.alpha_reference};
         for(const auto& e:d.layout)if(e.slot<fast_key.strides.size())fast_key.strides[e.slot]=d.vertices[e.slot].stride;
@@ -1043,9 +1157,10 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     struct {std::uint64_t bits{};void insert(unsigned v){if(v<64)bits|=std::uint64_t{1}<<v;}bool contains(unsigned v)const{return v<64 && ((bits>>v)&1U);}} occupied;
     for(const auto& b:d.stages[0].shader->bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9)){occupied.insert(b.native_slot);if(b.counter_slot!=UINT32_MAX)occupied.insert(b.counter_slot);}const auto views_slot=dynamic_cast<MetalShader&>(*d.stages[0].shader).buffer_views_slot;if(views_slot!=UINT32_MAX)occupied.insert(views_slot);int next=30;
     std::uint32_t input_attributes=0;const auto first_use=[&](unsigned attribute){const auto bit=1U<<attribute;const bool fresh=!(input_attributes&bit);input_attributes|=bit;return fresh;};std::vector<std::array<std::uint32_t,4>> fetched; // attribute、D3D slot、offset、大小。
+    std::uint32_t constant_slots=0; // 步進率 0 的逐實例資料：所有實例共用同一筆，對應 Metal 常數步進。
     const auto add_input=[&](std::uint32_t attribute,const GraphicsElement& e){
         if(e.slot>=32 || !d.vertices[e.slot].resource)throw std::invalid_argument("頂點緩衝區未綁定");if(slots[e.slot]<0){while(next>=0 && occupied.contains(static_cast<unsigned>(next)))--next;if(next<0)throw std::invalid_argument("Metal 頂點與常數 buffer binding 配額不足");slots[e.slot]=next--;}
-        const auto s=static_cast<unsigned>(slots[e.slot]);vertex.attributes[attribute].format=metal_vertex_format(e.format);vertex.attributes[attribute].offset=e.offset;vertex.attributes[attribute].bufferIndex=s;vertex.layouts[s].stride=d.vertices[e.slot].stride;vertex.layouts[s].stepFunction=e.classification?MTLVertexStepFunctionPerInstance:MTLVertexStepFunctionPerVertex;vertex.layouts[s].stepRate=e.classification?std::max(1U,e.step):1;
+        const auto s=static_cast<unsigned>(slots[e.slot]);vertex.attributes[attribute].format=metal_vertex_format(e.format);vertex.attributes[attribute].offset=e.offset;vertex.attributes[attribute].bufferIndex=s;vertex.layouts[s].stride=d.vertices[e.slot].stride;vertex.layouts[s].stepFunction=e.classification?MTLVertexStepFunctionPerInstance:MTLVertexStepFunctionPerVertex;vertex.layouts[s].stepRate=e.classification?std::max(1U,e.step):1;if(e.classification && !e.step)constant_slots|=1U<<e.slot;
         fetched.push_back({attribute,e.slot,e.offset,graphics_format_bytes(e.format)});
     };
     // PSO 的頂點輸入解析（pipeline_inputs）可用時直接取對應的佈局項；否則逐項比對語意並檢查 attribute。
@@ -1054,12 +1169,13 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     // D3D11 允許 stride 0（每個頂點讀同一筆；UE4 沒有頂點色的網格綁定 stride 0 的空顏色緩衝）與 offset＋大小超出 stride 的
     // attribute；Metal 頂點描述兩者都在建 pipeline 時驗證失敗並直接 abort。stride 0 改為常數步進，以 attribute 涵蓋範圍
     // （4 位元組對齊）當 stride；超出 stride 的 attribute 改綁到另一個 buffer index，offset 併入該 binding 的 buffer offset。
+    // 步進率 0 的逐實例資料同樣不前進，走相同的常數步進；D3D11 的 stride 在這條路徑不參與讀取位置。
     {
         std::array<std::uint32_t,32> extent{};for(const auto& a:fetched)extent[a[1]]=std::max(extent[a[1]],a[2]+a[3]);
-        for(unsigned i=0;i<32;++i)if(slots[i]>=0 && !d.vertices[i].stride){auto& layout=vertex.layouts[static_cast<unsigned>(slots[i])];layout.stepFunction=MTLVertexStepFunctionConstant;layout.stepRate=0;layout.stride=std::max(4U,(extent[i]+3U)&~3U);}
+        for(unsigned i=0;i<32;++i)if(slots[i]>=0 && (!d.vertices[i].stride || (constant_slots>>i)&1U)){auto& layout=vertex.layouts[static_cast<unsigned>(slots[i])];layout.stepFunction=MTLVertexStepFunctionConstant;layout.stepRate=0;layout.stride=std::max(4U,(extent[i]+3U)&~3U);}
         std::array<bool,32> kept{};
         for(const auto& a:fetched){
-            const auto stride=d.vertices[a[1]].stride;if(!stride || a[2]+a[3]<=stride){kept[a[1]]=true;continue;}
+            const auto stride=d.vertices[a[1]].stride;if(!stride || (constant_slots>>a[1])&1U || a[2]+a[3]<=stride){kept[a[1]]=true;continue;}
             auto found=std::find_if(shifted.begin(),shifted.end(),[&](const auto& b){return b[1]==a[1] && b[2]==a[2];});
             if(found==shifted.end()){
                 while(next>=0 && occupied.contains(static_cast<unsigned>(next)))--next;if(next<0)throw std::invalid_argument("Metal 頂點與常數 buffer binding 配額不足");
@@ -1098,8 +1214,22 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     const auto& k=key.str();if(const auto found=graphics_pipelines_.find(k);found!=graphics_pipelines_.end())pipeline=found->second;else {
         // 未命中才記錄（建立失敗時 Metal 可能直接 abort，用量快照留下最後一個嘗試的頂點佈局）。
         {std::string text="vs="+std::to_string(dynamic_cast<MetalShader&>(*d.stages[0].shader).serial)+" topology="+std::to_string(d.topology);for(const auto& e:d.layout)text+=" "+e.semantic+std::to_string(e.index)+":f"+std::to_string(e.format)+"@"+std::to_string(e.slot)+"+"+std::to_string(e.offset)+(e.classification?"i"+std::to_string(e.step):"")+"/s"+std::to_string(e.slot<32?d.vertices[e.slot].stride:0);set_diagnostic("metal_pipeline_last",text);record_diagnostic("metal_pipelines_created");}
-        NSError* error=nil;pipeline=[device_ newRenderPipelineStateWithDescriptor:desc.make() error:&error];if(!pipeline)throw std::invalid_argument("Metal D3D pipeline："+std::string(error.localizedDescription.UTF8String));if(graphics_pipelines_.size()>2048){graphics_pipelines_.clear();fast_pipelines_.clear();}graphics_pipelines_[k]=pipeline;}
-    if(fast){if(fast_pipelines_.size()>2048)fast_pipelines_.clear();fast_pipelines_.emplace(fast_key,MetalFastPipeline{pipeline,slots,shifted,layered});}
+        NSError* error=nil;pipeline=[device_ newRenderPipelineStateWithDescriptor:desc.make() error:&error];
+        if(!pipeline)throw std::invalid_argument("Metal D3D pipeline："+std::string(error.localizedDescription.UTF8String));
+        if(metal_pipeline_fifo())metal_cache_pipeline(graphics_pipelines_,graphics_pipeline_order_,k,pipeline);
+        else {
+            if(graphics_pipelines_.size()>2048){graphics_pipelines_.clear();fast_pipelines_.clear();}
+            graphics_pipelines_[k]=pipeline;
+        }
+    }
+    if(fast){
+        MetalFastPipeline value{pipeline,slots,shifted,layered};
+        if(metal_pipeline_fifo())metal_cache_pipeline(fast_pipelines_,fast_pipeline_order_,fast_key,std::move(value));
+        else {
+            if(fast_pipelines_.size()>2048)fast_pipelines_.clear();
+            fast_pipelines_.emplace(fast_key,std::move(value));
+        }
+    }
     }
     const auto timing_pipeline=timing_start?metal_now_ns():0;
     MetalDepthSpec depth;depth.depthCompareFunction=d.depth_state.empty()?MTLCompareFunctionLess:metal_word(d.depth_state,0)?static_cast<MTLCompareFunction>(metal_word(d.depth_state,8)-1):MTLCompareFunctionAlways;depth.depthWriteEnabled=d.depth_state.empty() || (metal_word(d.depth_state,0) && metal_word(d.depth_state,4));
@@ -1120,7 +1250,11 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         if(pixel->uav_write_only<0)pixel->uav_write_only=metal_dxbc_uav_write_only(pixel->bytecode)?1:0;
         return pixel->uav_write_only==1;
     };
-    const bool coalesce=coalesce_enabled && !tessellated && !geometry.function && (!draw_uav_count || (uav_write_coalesce && uav_write_only()));
+    // D3D12 的 draw 間 UAV 不保證順序（應用程式以 UAV barrier 指定，barrier 會結束含 UAV 的 encoder），有讀取或原子操作的像素 UAV
+    // 也可留在同一 encoder：《暗影》遮擋剔除每幀約 80 個 240×135 的 UAV draw 原本各開一個 pass。X64ARM_METAL_EXPLICIT_UAV_COALESCE=0 關閉。
+    static const bool explicit_uav_coalesce=[] {const auto* value=std::getenv("X64ARM_METAL_EXPLICIT_UAV_COALESCE");return !value || std::string_view(value)!="0";}();
+    const bool coalesce=coalesce_enabled && !tessellated && !geometry.function &&
+        (!draw_uav_count || (uav_write_coalesce && uav_write_only()) || (explicit_uav_coalesce && d.explicit_uav_order));
     std::vector<std::uintptr_t> pass_key;
     if(coalesce){
         const auto object=[](id value){return reinterpret_cast<std::uintptr_t>((__bridge void*)value);};
@@ -1266,7 +1400,10 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
             auto& r=metal_resource(resource);[enc setVertexBuffer:r.buffer offset:offset atIndex:index];graphics_pending_.push_back(resource);
             if(e)*e=bind_key(resource.get(),offset,nullptr,false);++binds_set_;
         };
-        for(unsigned i=0;i<32;++i)if(slots[i]>=0){const auto& v=d.vertices[i];if(v.resource && v.offset>=v.resource->desc.width)throw std::invalid_argument("頂點 buffer offset 越界");bind_vertex(v.resource,v.offset,static_cast<unsigned>(slots[i]));}
+        for(unsigned i=0;i<32;++i)if(slots[i]>=0){const auto& v=d.vertices[i];if(v.resource && v.offset>=v.resource->desc.width)throw std::invalid_argument("頂點 buffer offset 越界");
+            // 步進率 0 的逐實例資料固定讀 StartInstanceLocation 那一筆；Metal 常數步進不看 base instance，由 binding offset 補上。
+            const bool constant_instance=d.start_instance && v.stride && std::any_of(d.layout.begin(),d.layout.end(),[i](const auto& e){return e.slot==i && e.classification && !e.step;});
+            bind_vertex(v.resource,std::uint64_t{v.offset}+(constant_instance?std::uint64_t{d.start_instance}*v.stride:0U),static_cast<unsigned>(slots[i]));}
         for(const auto& b:shifted){const auto& v=d.vertices[b[1]];bind_vertex(v.resource,std::uint64_t{v.offset}+b[2],b[0]);}
     }
     const auto timing_bind=timing_start?metal_now_ns():0;
@@ -1276,10 +1413,11 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         for(const auto& hang_item:d.stages)if(const auto* hang_shader=dynamic_cast<const MetalShader*>(hang_item.shader.get())){std::snprintf(hang_key,sizeof hang_key," s%u:%016llx",static_cast<unsigned>(hang_shader->stage),static_cast<unsigned long long>(hang_shader->content_key));hang_name+=hang_key;}
         hang_note(hang_name);hang_labels_.back().vertices=std::uint64_t{d.count}*std::max(1U,d.instances);
     }
-    if(tessellated){const auto& p=*tessellation.pipeline;for(unsigned instance=0;instance<d.instances;++instance){
+    if(tessellated){const auto& p=*tessellation.pipeline;graphics_pending_.insert(graphics_pending_.end(),tessellation.holders.begin(),tessellation.holders.end());for(unsigned instance=0;instance<d.instances;++instance){
         const std::uint64_t first=std::uint64_t{instance}*tessellation.count;
         [enc setVertexBuffer:tessellation.controls offset:first*p.control_count*p.control_stride atIndex:p.domain_control_slot];
         [enc setVertexBuffer:tessellation.patches offset:first*p.patch_stride atIndex:p.domain_patch_slot];
+        if(tessellation.raw_factors)[enc setVertexBuffer:tessellation.raw_factors offset:first*p.raw_factor_stride atIndex:p.domain_raw_factor_slot];
         [enc setTessellationFactorBuffer:tessellation.factors offset:first*p.factor_stride instanceStride:0];
         [enc drawPatches:p.control_count patchStart:0 patchCount:tessellation.count patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:std::uint64_t{d.start_instance}+instance];
     }}
@@ -1389,3 +1527,4 @@ void MetalGl::graphics_export_frame(const GraphicsView& view,void* bytes,std::si
     // 影格鎖釋放前完成寫入；消費端讀完才允許下一幀覆寫。
     flush(true);
 }}
+#include "metal_temporal_upscale.inc"

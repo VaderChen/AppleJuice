@@ -19,6 +19,7 @@ private:
     std::vector<Report> reports_;
     std::vector<PointerSample> pointers_;
     std::shared_ptr<const Snapshot> snapshot_;
+    bool observes_physical_input_{};
     std::thread thread_;
 
     template<class T> static void append(std::vector<T>& target,std::vector<T> source,std::size_t limit){
@@ -45,7 +46,7 @@ public:
             @autoreleasepool {
                 std::unique_ptr<NativeInput> input;
                 // 初始化由前景 API 同步等待；先沿用呼叫端 QoS 完成 HID／framework 載入，避免背景 I/O 節流造成優先權反轉。
-                try{input=std::make_unique<NativeInput>();publish(*input);const auto error=pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND,0);if(error)throw std::system_error(error,std::generic_category(),"無法設定輸入執行緒背景 QoS");ready.set_value();}
+                try{input=std::make_unique<NativeInput>();observes_physical_input_=input->observes_physical_input();publish(*input);const auto error=pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND,0);if(error)throw std::system_error(error,std::generic_category(),"無法設定輸入執行緒背景 QoS");ready.set_value();}
                 catch(...){ready.set_exception(std::current_exception());return;}
                 auto next=std::chrono::steady_clock::now();
                 for(;;){
@@ -77,6 +78,15 @@ public:
         auto result=task->get_future();
         {std::lock_guard lock(mutex_);commands_.emplace_back([task](NativeInput& input){(*task)(input);});}
         wake_.notify_one();return result.get();
+    }
+    void cursor_warped(){
+        static const bool fast=[] {
+            const auto* value=std::getenv("X64ARM_INPUT_CURSOR_WARP_FAST");
+            return !value || std::string_view(value)!="0";
+        }();
+        // 取樣模式在 ready 之前發布，之後固定。未取樣實體游標時無基準可重設。
+        if(fast && !observes_physical_input_)return;
+        call([](NativeInput& input){input.cursor_warped();});
     }
     std::shared_ptr<const Snapshot> snapshot()const{std::lock_guard lock(mutex_);return snapshot_;}
     std::vector<Event> poll(){std::lock_guard lock(mutex_);std::vector<Event> out;out.swap(events_);return out;}
@@ -121,7 +131,7 @@ public:
     std::uint32_t cooperative(const Guid& id,bool exclusive)override{return worker_->call([&](NativeInput& input){return input.cooperative(id,exclusive);});}
     void mouse_wheel(std::int32_t value)override{worker_->call([&](NativeInput& input){input.mouse_wheel(value);});}
     void horizontal_wheel(std::int32_t value)override{worker_->call([&](NativeInput& input){input.horizontal_wheel(value);});}
-    void cursor_warped()override{worker_->call([&](NativeInput& input){input.cursor_warped();});}
+    void cursor_warped()override{worker_->cursor_warped();}
     // AppKit 對話框留在 UI 呼叫端，不移到背景 run loop。
     std::uint32_t control_panel(const Guid& id)override{return NativeInput::control_panel_ui(id);}
     std::uint32_t configure(std::vector<Action>& actions,bool edit)override{return NativeInput::configure_ui(actions,edit);}

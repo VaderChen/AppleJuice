@@ -6,15 +6,18 @@ struct MetalBufferBacking final:GraphicsObject {
 };
 // D3D11 pipeline 狀態的快取鍵：以固定寬度的二進位欄位串接，取代每次繪圖的 ostringstream 格式化（DQ3 每次 DrawIndexed 約 42 µs 的主要成分）。
 // 鍵只作 map 查找與串接，不被解析；相同欄位序列產生相同位元組。
-// D3D12 PSO 的快速管線鍵（見 graphics_draw）：serial 為 GraphicsDraw::pipeline_serial；strides 只填輸入佈局用到的槽位。
+// serial 為 D3D12 PSO 序號，或 D3D11 頂點著色器序號（另有佈局、混色與像素著色器序號）。
+// strides 只填輸入佈局用到的槽位。
 struct MetalFastPipelineKey {
-    std::uint64_t serial{};std::array<std::uint32_t,8> colors{};std::uint32_t depth{},stencil{},samples{},topology{};std::array<std::uint32_t,2> alpha{};
+    std::uint64_t serial{},layout_serial{},blend_serial{},pixel_serial{};
+    std::array<std::uint32_t,8> colors{};std::uint32_t depth{},stencil{},samples{},topology{};std::array<std::uint32_t,2> alpha{};
     std::array<std::uint32_t,32> strides{};
     bool operator==(const MetalFastPipelineKey&)const=default;
 };
 struct MetalFastPipelineHash {
     std::size_t operator()(const MetalFastPipelineKey& key)const noexcept{
         std::uint64_t hash=key.serial*0x9E3779B97F4A7C15ULL;const auto mix=[&](std::uint64_t value){hash^=value+0x9E3779B97F4A7C15ULL+(hash<<6)+(hash>>2);};
+        if(key.layout_serial){mix(key.layout_serial);mix(key.blend_serial);mix(key.pixel_serial);}
         for(const auto value:key.colors)mix(value);mix(key.depth);mix(key.stencil);mix(key.samples);mix(key.topology);mix(key.alpha[0]);mix(key.alpha[1]);
         for(const auto value:key.strides)mix(value);
         return static_cast<std::size_t>(hash);
@@ -141,7 +144,8 @@ bool metal_discard_pool_enabled(){static const bool value=[] {const auto* text=s
 struct MetalBufferPool {
     std::mutex mutex;
     std::multimap<std::size_t,id<MTLBuffer>> free;std::size_t bytes{};std::uint64_t hits{},misses{},puts{},drops{};
-    static constexpr std::size_t limit=64U<<20;
+    const std::size_t limit;
+    explicit MetalBufferPool(std::size_t capacity=std::size_t{64}<<20):limit(capacity){}
     id<MTLBuffer> take(std::size_t length){const std::lock_guard lock(mutex);auto it=free.find(length);if(it==free.end()){++misses;return nil;}auto buffer=it->second;free.erase(it);bytes-=length;++hits;return buffer;}
     void put(id<MTLBuffer> buffer){
         const auto length=static_cast<std::size_t>(buffer.length);const std::lock_guard lock(mutex);
@@ -327,14 +331,19 @@ struct MetalTessellationPipeline {
     unsigned control_slot{},patch_slot{},factor_slot{},info_slot{},vertex_id_slot{};
     unsigned domain_control_slot{30},domain_patch_slot{29};
     unsigned control_stride{},patch_stride{},factor_stride{},control_count{},input_count{},group_patches{};
+    unsigned raw_factor_slot{UINT32_MAX},domain_raw_factor_slot{UINT32_MAX},raw_factor_stride{};
     std::array<unsigned,4> settings{};
     bool captured{};
+    // direct：逐頂點輸入由 GPU 直接讀原始緩衝（索引走 stage-in 索引步進），不經 CPU 收集；uses_vertex_id：VS 讀 SV_VertexID，要由 CPU 準備編號。
+    bool direct{},uses_vertex_id{true};unsigned index_slot{};
     std::map<std::string,std::array<unsigned,2>> control_fields,patch_fields;
 };
 struct MetalTessellationDraw {
     std::shared_ptr<MetalTessellationPipeline> pipeline;
-    id<MTLBuffer> controls,patches,factors;
+    id<MTLBuffer> controls,patches,factors,raw_factors;
     unsigned count{};
+    // 暫存緩衝的持有者：細分輸出要活到使用它的 render pass 所屬批次完成才能回到池裡。
+    std::vector<std::shared_ptr<GraphicsObject>> holders;
 };
 struct MetalGeometryPipeline {
     std::shared_ptr<GraphicsShader> vertex,geometry;
@@ -481,6 +490,9 @@ MTLVertexFormat metal_vertex_format(std::uint32_t f){
     throw std::invalid_argument("Metal 頂點格式不支援：DXGI="+std::to_string(f));
 }
 std::uint32_t metal_word(std::span<const std::uint8_t> data,std::size_t offset){std::uint32_t v{};if(offset+4>data.size())throw std::invalid_argument("图形結構超出範圍");std::memcpy(&v,data.data()+offset,4);return v;}
+bool metal_independent_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes){
+    return stage<=5 && bytes.size()>=32 && metal_word(bytes,0)==0x43425844;
+}
 float metal_float(std::span<const std::uint8_t> data,std::size_t offset){return std::bit_cast<float>(metal_word(data,offset));}
 MetalResource& metal_resource(const std::shared_ptr<GraphicsResource>& r){auto* p=dynamic_cast<MetalResource*>(r.get());if(!p)throw std::invalid_argument("圖形資源不屬於 Metal 後端");return *p;}
 // graphics_read_completed 的直接讀取資格：Shared 儲存的緩衝。命令執行緒代理也用此判斷決定可否不排空佇列，

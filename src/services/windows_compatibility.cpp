@@ -173,6 +173,8 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll","GetNamedPipeHandleStateA",7},{"kernel32.dll","GetNamedPipeHandleStateW",7},
         {"kernel32.dll","WaitNamedPipeA",2},{"kernel32.dll","WaitNamedPipeW",2},
         {"kernel32.dll","CallNamedPipeA",7},{"kernel32.dll","CallNamedPipeW",7},
+        {"kernel32.dll","OpenFile",3},{"kernel32.dll","_lopen",2},{"kernel32.dll","_lcreat",2},{"kernel32.dll","_lclose",1},
+        {"kernel32.dll","_lread",3},{"kernel32.dll","_hread",3},{"kernel32.dll","_lwrite",3},{"kernel32.dll","_hwrite",3},{"kernel32.dll","_llseek",3},
         {"kernel32.dll","LockFile",5},{"kernel32.dll","UnlockFile",5},{"kernel32.dll","LockFileEx",6},{"kernel32.dll","UnlockFileEx",5},
         {"kernel32.dll","CancelIo",1},{"kernel32.dll","CancelIoEx",2},
         {"kernel32.dll","EncodePointer",1},{"kernel32.dll","DecodePointer",1},
@@ -482,7 +484,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     const auto crt_fail = [&](unsigned error) { memory.store(GuestAddress{runtime_.errno_cell}, 32, error); result = UINT32_MAX; };
     if(symbol=="CreateNamedPipeA" || symbol=="CreateNamedPipeW") {
         return invoke_file_io(state,memory,service);
-    }else if(symbol.find("NamedPipe")!=symbol.npos || symbol=="CancelIo" || symbol=="CancelIoEx" || symbol=="LockFileEx" || symbol=="UnlockFileEx" || symbol=="LockFile" || symbol=="UnlockFile") {
+    }else if(symbol.find("NamedPipe")!=symbol.npos || symbol=="OpenFile" || symbol=="_lopen" || symbol=="_lcreat" || symbol=="_lclose" || symbol=="_lread" || symbol=="_hread" || symbol=="_lwrite" || symbol=="_hwrite" || symbol=="_llseek" || symbol=="CancelIo" || symbol=="CancelIoEx" || symbol=="LockFileEx" || symbol=="UnlockFileEx" || symbol=="LockFile" || symbol=="UnlockFile") {
         return invoke_file_io(state,memory,service);
     }else if(symbol=="RtlCaptureStackBackTrace" || symbol=="CaptureStackBackTrace" || symbol=="RtlGetCallersAddress") {
         const std::uint8_t width=x86_?32:64;const unsigned bytes=width/8;

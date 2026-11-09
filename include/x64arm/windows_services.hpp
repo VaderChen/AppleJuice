@@ -91,6 +91,7 @@ struct OpenclState;
 using D3D12Replay=std::function<void(NativeGraphics&,const std::function<std::shared_ptr<GraphicsResource>(std::uint64_t)>&)>;
 struct VulkanState;
 struct DirectMLState;
+struct XessState;
 struct PmrState;
 struct WebView2State;
 struct D3D12State;
@@ -146,7 +147,7 @@ public:
 #ifdef X64ARM_HOST_SERVICES_PARALLEL_SERVICE
     bool parallel_service(GuestAddress) const noexcept override;
     bool invoke_parallel_service(GuestState&,GuestMemory&) override;
-    bool invoke_parallel_service_impl(GuestState&,GuestMemory&,bool&,std::span<GuestState* const> = {});
+    bool invoke_parallel_service_impl(GuestState&,GuestMemory&,ResidentServiceProgress&,std::span<GuestState* const> = {});
 #endif
     ExecutionPolicy execution_policy(const GuestState&) const override;
     void after_parallel_instructions(GuestState&,GuestMemory&,std::span<const std::uint64_t>) override;
@@ -485,6 +486,8 @@ private:
     std::shared_ptr<struct WinUsbState> winusb_;
     std::shared_ptr<usb::Backend> usb_backend_;
     usb::Backend& usb_backend()const;
+    // 協調者本地 SetupDiGetClassDevs 在取獨占映射鎖前先列舉的 USB 拓撲（IOKit 每次數毫秒）；下一次裝置盤點取用後清空。只由協調者讀寫。
+    std::optional<std::vector<usb::Device>> usb_prefetch_;
     std::shared_ptr<struct WlanState> wlan_;
     std::shared_ptr<wlan::Backend> wlan_backend_;
     std::optional<std::uint32_t> invoke_wlan(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -692,6 +695,7 @@ private:
     bool serial_ports_scanned_{};
     void poll_file_io(GuestMemory&,bool scheduler_poll=false);
     std::optional<bool> file_io_signaled(std::uint64_t);
+    bool resident_file_wait_pending(std::uint64_t) const noexcept;
     void set_file_io_signaled(std::uint64_t,bool);
     std::uint32_t bind_file_completion_port(std::uint64_t,std::uint64_t,std::uint64_t,bool = false);
     std::uint32_t set_file_completion_modes(std::uint64_t,std::uint32_t);
@@ -869,6 +873,7 @@ private:
     std::shared_ptr<OpenclState> opencl_;
     std::shared_ptr<VulkanState> vulkan_;
     std::shared_ptr<DirectMLState> directml_;
+    std::shared_ptr<XessState> xess_;
     std::shared_ptr<PmrState> msvcp_pmr_;
     std::shared_ptr<WebView2State> webview2_;
     std::shared_ptr<D3D12State> d3d12_;
@@ -881,19 +886,21 @@ private:
     std::optional<std::uint32_t> invoke_d3d12(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     // worker 上的 COM 引用計數：AddRef 與不會歸零的 Release 只改計數；歸零（銷毀物件）回傳 false 交回協調者。
     bool d3d12_worker_reference(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    bool d3d12_worker_descriptor_transfer(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     // MSVCP 絕對時間（_timespec64／xtime）到 Win32 等待毫秒數；已過期為 0。
     std::uint32_t msvcp_wait_milliseconds(GuestMemory&,std::uint64_t) const;
     // worker 上的 Resource.Map／Unmap：不需等 GPU 也不需讀回、輸出指標不在寫入時複製頁時完成，否則回傳 false 交回協調者。
     bool d3d12_worker_map(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool d3d12_queue(std::uint64_t) const;
     // DirectML 等建立在 D3D12 上的 API：錄製於命令清單、於 ExecuteCommandLists 重播時以裝置的共用後端執行。
-    bool d3d12_record(std::uint64_t list,D3D12Replay replay);
+    bool d3d12_record(GuestMemory&,std::uint64_t list,D3D12Replay replay);
     std::uint64_t d3d12_device_of(std::uint64_t object) const;
     bool d3d12_resource_width(std::uint64_t resource,std::uint64_t& width) const;
     std::optional<std::uint32_t> invoke_webview2(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_opencl(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_vulkan(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_directml(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_xess(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_msvcp_pmr(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_msvcp_special_math(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_task_dialog(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1173,6 +1180,7 @@ private:
     void release_pointer_input(std::uint64_t,std::uint64_t);
     std::optional<std::uint32_t> invoke_pointer_input(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void refresh_raw_input(const std::vector<input::Device>&);
+    bool raw_input_injecting_{}; // 正在處理注入（SendInput／自動化）事件：前景判定不看宿主視窗。
     void raw_input_event(const input::Event&);
     void raw_input_report(const input::Report&);
     void raw_input_keyboard(const GuiMessage&,std::uint32_t,std::uint64_t,std::uint64_t=0);
@@ -2130,6 +2138,8 @@ private:
     bool enter_gui_hook(GuestState&,GuestMemory&,GuiHookFrame,std::int32_t code,std::uint64_t wparam,std::uint64_t lparam);
     std::optional<std::uint32_t> resume_gui_hook(GuestState&,GuestMemory&,const CallbackFrame&,std::uint64_t);
     std::optional<std::uint32_t> invoke_crt_io(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
+    bool invoke_parallel_crt_file(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,std::uint64_t thread,std::uint64_t errno_cell);
+    std::shared_ptr<std::mutex> crt_file_worker_mutex_{std::make_shared<std::mutex>()};
     FilePositionReference crt_file_position(CrtFile& file);
     CrtFile* crt_file(std::uint64_t stream);
     void initialize_crt_lowio(GuestMemory&);
@@ -2162,7 +2172,7 @@ private:
     void crt_buffer_fields(GuestMemory&,CrtFile&);
     bool flush_crt_file(GuestMemory&,CrtFile&,bool discard_input=true);
     bool flush_crt_streams(GuestMemory&);
-    std::vector<std::uint8_t> read_crt_file(GuestMemory& memory, CrtFile& file, std::size_t size, bool stream = false);
+    std::vector<std::uint8_t> read_crt_file(GuestMemory& memory,CrtFile& file,std::size_t size,bool stream=false,std::uint64_t worker_errno=0);
     std::uint64_t write_crt_file(GuestMemory& memory, CrtFile& file, std::span<const std::uint8_t> bytes, bool stream = false);
     std::uint64_t write_crt_stream(GuestMemory& memory, std::uint64_t stream, std::span<const std::uint8_t> bytes);
     std::uint64_t write_crt_wide_stream(GuestState&,GuestMemory&, std::uint64_t stream, std::u16string_view text);
@@ -2173,6 +2183,7 @@ private:
     bool x86_heap_compute_boundary(GuestAddress address) const noexcept;
     std::shared_ptr<struct LdapState> ldap_;
     std::optional<std::uint32_t> invoke_ldap(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_legacy_file(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_call_named_pipe(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_compatibility(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_crt_character(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,
@@ -2183,6 +2194,7 @@ private:
     std::optional<std::uint32_t> invoke_crt_string(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_crt_scan(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_math(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_x87_crt_math(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,std::uint64_t errno_cell);
     bool fill_random(GuestMemory& memory, std::uint64_t address, std::uint64_t size);
     bool random_bytes(std::span<std::uint8_t> bytes);
     std::optional<std::uint32_t> invoke_dpapi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -2294,8 +2306,9 @@ private:
     std::uint32_t last_error_{};
     std::string trace_services_;
     // 診斷：X64ARM_SERVICE_COUNTS=1 時統計每個服務入口的呼叫次數與累計宿主時間（協調者／managed 與 worker 分列），結束時輸出。
-    struct ServiceCount {std::uint64_t calls{},ns{};};
-    bool service_counts_enabled_{};std::string service_counts_directory_;
+    // refused：worker 端拒絕、交回協調者（診斷 X64ARM_SERVICE_COUNTS 開啟時才累計）。
+    struct ServiceCount {std::uint64_t calls{},ns{},cpu_ns{},mapping_wait_ns{},refused{};};
+    bool service_counts_enabled_{};unsigned worker_service_sample_bits_{};std::string service_counts_directory_;
     std::unordered_map<std::uint64_t,ServiceCount> service_counts_,worker_service_counts_;
     std::shared_ptr<std::mutex> worker_service_counts_mutex_{std::make_shared<std::mutex>()};
     std::uint64_t service_count_events_{};std::chrono::steady_clock::time_point service_count_dumped_{};

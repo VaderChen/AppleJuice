@@ -185,6 +185,8 @@ bool d3d11_front_bind(D3D11State& bridge,GuestMemory& memory,std::vector<std::ui
     }
     case D3D11Setter::InputLayout:{
         const auto value=arg(1);if(value && !d3d11_front_value(bridge,context,value))return false;
+        {static const bool trace_layout=std::getenv("X64ARM_TRACE_D3D11_LAYOUT")!=nullptr;static std::atomic<unsigned> traced{};
+            if(trace_layout && traced.fetch_add(1,std::memory_order_relaxed)<4000)std::fprintf(stderr,"[d3d11_layout] set front context=%p value=%llx elements=%zu\n",static_cast<const void*>(&context),static_cast<unsigned long long>(value),value?d3d11_front_value(bridge,context,value)->identity->layout.size():0U);}
         const std::array values{value};
         return d3d11_front_bind(bridge,memory,d3d11_fixed_slots(context,d3d11_slot_layout),0,values,1);
     }

@@ -98,6 +98,21 @@ std::vector<unsigned> metal_free_buffers(const MetalShader& shader,const std::ar
 std::pair<unsigned,unsigned> metal_input_primitives(unsigned topology,unsigned count){
     switch(topology){case 1:return {count,1};case 2:return {count/2,2};case 3:return {count>1?count-1:0,2};case 4:return {count/3,3};case 5:return {count>2?count-2:0,3};case 10:return {count/4,4};case 11:return {count>3?count-3:0,4};case 12:return {count/6,6};default:throw std::invalid_argument("幾何輸入 topology 尚未映射");}
 }
+// 幾何與細分的暫存 buffer 每次繪製都新建的成本很高（AGXBuffer／IOGPUResourceCreate）。
+// 依儲存模式分池、長度捨入到 2 的冪後重用；持有者掛在批次的待釋放清單，批次完成才歸還池，在途期間不重用。
+// 內容不需清零：capture 只寫被引用的頂點、GS 只讀被引用的頂點，counts 與 results 每格都由 compute 寫入；細分輸出同樣每格由 kernel 寫入。X64ARM_METAL_GEOMETRY_POOL=0 關閉。
+std::shared_ptr<MetalPooledBuffer> MetalGl::graphics_scratch_buffer(std::uint64_t bytes,bool shared){
+    static const bool geometry_pool=[] {const auto* value=std::getenv("X64ARM_METAL_GEOMETRY_POOL");return !value || std::string_view(value)!="0";}();
+    const auto options=shared?MTLResourceStorageModeShared:MTLResourceStorageModePrivate;
+    auto holder=std::make_shared<MetalPooledBuffer>();
+    if(!geometry_pool){holder->buffer=[device_ newBufferWithLength:std::max<std::uint64_t>(bytes,1) options:options];return holder->buffer?holder:nullptr;}
+    const auto length=std::max<std::uint64_t>(4096,std::bit_ceil(std::max<std::uint64_t>(bytes,1)));
+    const auto& pool=shared?geometry_shared_pool_:geometry_private_pool_;
+    holder->buffer=pool->take(static_cast<std::size_t>(length));
+    if(!holder->buffer)holder->buffer=[device_ newBufferWithLength:length options:options];
+    if(!holder->buffer)return nullptr;
+    holder->pool=pool;return holder;
+}
 MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDescriptor* descriptor,const std::array<int,32>& slots,const std::vector<std::array<std::uint32_t,3>>& shifted,const std::string& layout_key){@autoreleasepool{
     auto& vs=dynamic_cast<MetalShader&>(*d.stages[0].shader);auto& original_gs=dynamic_cast<MetalShader&>(*d.stages[2].shader);
     MetalShader passthrough;auto* selected=&original_gs;
@@ -138,6 +153,9 @@ MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDesc
         if(instance_id.empty()){instance_id="x64InstanceID";extra+=",uint x64InstanceID [[instance_id]]";}
         extra+=",device float4* x64Captured [[buffer("+std::to_string(p->capture_buffer)+")]],constant uint2& x64CaptureParams [[buffer("+std::to_string(p->capture_params)+")]]";
         capture.insert(fn.end,extra);
+        // VS 本體依 D3D 語義把 mtl_VertexID／mtl_InstanceID 減去基底；擷取位置以含基底的原值計算，先保存。
+        if(vertex_id=="mtl_VertexID"){metal_replace(capture,"mtl_VertexID = mtl_VertexID - mtl_BaseVertex;","const uint x64RawVertexID = mtl_VertexID;\nmtl_VertexID = mtl_VertexID - mtl_BaseVertex;");vertex_id="x64RawVertexID";}
+        if(instance_id=="mtl_InstanceID"){metal_replace(capture,"mtl_InstanceID = mtl_InstanceID - mtl_BaseInstance;","const uint x64RawInstanceID = mtl_InstanceID;\nmtl_InstanceID = mtl_InstanceID - mtl_BaseInstance;");instance_id="x64RawInstanceID";}
         std::string writes="if("+vertex_id+" < x64CaptureParams.x) { uint x64At=(("+instance_id+"-x64CaptureParams.y)*x64CaptureParams.x+"+vertex_id+")*"+std::to_string(vs.output_varyings.size())+";\n";
         for(unsigned i=0;i<vs.output_varyings.size();++i)writes+="x64Captured[x64At+"+std::to_string(i)+"]="+metal_pack_varying(vs.output_varyings[i],"output."+vs.output_varyings[i].name)+";\n";
         writes+="} return;";metal_replace(capture,"return output;",writes);
@@ -211,21 +229,7 @@ MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDesc
     const auto input_bytes=vertices*d.instances*vs.output_varyings.size()*16,output_bytes=output_vertices*gs.output_varyings.size()*16;
     if(vertices>UINT32_MAX || output_vertices>UINT32_MAX || input_bytes>512*1024*1024 || output_bytes>512*1024*1024)throw std::bad_alloc{};
     const auto count_bytes=std::uint64_t{primitives}*d.instances*4;auto lease=reserve_gpu_memory(input_bytes+output_bytes+count_bytes);
-    // 幾何暫存 buffer 每次繪製都新建的成本很高（AGXBuffer／IOGPUResourceCreate）。
-    // 依儲存模式分池、長度捨入到 2 的冪後重用；持有者掛在本批次的待釋放清單，批次完成才歸還池，在途期間不重用。
-    // 內容不需清零：capture 只寫被引用的頂點、GS 只讀被引用的頂點，counts 與 results 每格都由 compute 寫入。X64ARM_METAL_GEOMETRY_POOL=0 關閉。
-    static const bool geometry_pool=[] {const auto* value=std::getenv("X64ARM_METAL_GEOMETRY_POOL");return !value || std::string_view(value)!="0";}();
-    const auto scratch=[&](std::uint64_t bytes,bool shared)->id<MTLBuffer> {
-        const auto options=shared?MTLResourceStorageModeShared:MTLResourceStorageModePrivate;
-        if(!geometry_pool)return [device_ newBufferWithLength:bytes options:options];
-        const auto length=std::max<std::uint64_t>(4096,std::bit_ceil(std::max<std::uint64_t>(bytes,1)));
-        const auto& pool=shared?geometry_shared_pool_:geometry_private_pool_;
-        id<MTLBuffer> buffer=pool->take(static_cast<std::size_t>(length));
-        if(!buffer)buffer=[device_ newBufferWithLength:length options:options];
-        if(!buffer)return nil;
-        auto holder=std::make_shared<MetalPooledBuffer>();holder->buffer=buffer;holder->pool=pool;graphics_pending_.push_back(holder);
-        return buffer;
-    };
+    const auto scratch=[&](std::uint64_t bytes,bool shared)->id<MTLBuffer> {auto holder=graphics_scratch_buffer(bytes,shared);if(!holder)return nil;graphics_pending_.push_back(holder);return holder->buffer;};
     auto inputs=scratch(input_bytes,false);auto outputs=scratch(output_bytes,!gs.stream_output.empty());auto counts=scratch(count_bytes,true);
     if(!inputs || !outputs || !counts)throw std::bad_alloc{};pending_leases_.push_back(std::move(lease));
     begin_commands(true,"geometry");auto pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.renderTargetWidth=1;pass.renderTargetHeight=1;pass.defaultRasterSampleCount=1;pass.renderTargetArrayLength=1;

@@ -105,6 +105,7 @@
                 if(trace_stats && swap->frames%600==0){
                     std::string creations;for(const auto& [name,count]:bridge.resource_creations)creations+=name+":"+std::to_string(count)+",";
                     d3d11_stream_trace();
+                    std::fprintf(stderr,"[d3d11_map] discard_calls=%llu discard_bytes=%llu no_overwrite_calls=%llu no_overwrite_bytes=%llu\n",static_cast<unsigned long long>(bridge.unmap_calls[4]),static_cast<unsigned long long>(bridge.unmap_bytes[4]),static_cast<unsigned long long>(bridge.unmap_calls[5]),static_cast<unsigned long long>(bridge.unmap_bytes[5]));
                     std::fprintf(stderr,"[d3d11_metal] frames=%llu draws=%llu draw_cache_full=%llu draw_cache_incremental=%llu destroyed_objects=%llu setter_front_hits=%llu setter_front_fallbacks=%llu draw_front_hits=%llu draw_front_fallbacks=%llu d3d11_resource_creations=%s %s\n",static_cast<unsigned long long>(bridge.graphics_frames),
                         static_cast<unsigned long long>(bridge.graphics_draws),static_cast<unsigned long long>(bridge.draw_cache_full),static_cast<unsigned long long>(bridge.draw_cache_incremental),static_cast<unsigned long long>(bridge.destroyed_objects),static_cast<unsigned long long>(bridge.setter_front_hits),static_cast<unsigned long long>(bridge.setter_front_fallbacks),static_cast<unsigned long long>(bridge.draw_front_hits),static_cast<unsigned long long>(bridge.draw_front_fallbacks),creations.empty()?"none":creations.c_str(),producer->statistics().c_str());
                 }

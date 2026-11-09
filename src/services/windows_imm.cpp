@@ -1,3 +1,4 @@
+#include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
@@ -169,6 +170,22 @@ std::span<const WindowsServiceDescriptor> imm_service_descriptors(){
         {"imm32.dll","ImmReSizeIMCC",2},{"imm32.dll","ImmGetIMCCSize",1},{"imm32.dll","ImmGetIMCCLockCount",1}};return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_imm(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    // IME 視窗的訊息回傳 TRUE，有目標視窗時轉送給它；其他訊息回傳 FALSE。
+    if(service.symbol=="ImmIsUIMessageA" || service.symbol=="ImmIsUIMessageW"){
+        return service_callback::invoke<std::optional<std::uint32_t>>(
+            this,threads_.current,state,memory,"ImmIsUIMessage",
+            [this](GuestState& state,GuestMemory& memory,std::uint64_t target,std::vector<std::uint64_t> args,std::uint64_t id){
+                start_callbacks(state,memory,{{target,std::move(args)}},Continuation::NestedResult,id);
+            },
+            [this,service=service](GuestState& state,GuestMemory& memory)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(state,memory,service);
+                const auto message=static_cast<std::uint32_t>(call(1));
+                const bool ime=(message>=0x10DU && message<=0x10FU) || message==0x281U || message==0x282U || message==0x284U || message==0x285U || message==0x287U;
+                if(ime && call(0))(void)co_await service_callback::call(resolve("user32.dll",service.symbol.ends_with('W')?"SendMessageW":"SendMessageA").value,{call(0),message,call(2),call(3)});
+                call.return_to(state,ime?1U:0U);
+                co_return std::optional<std::uint32_t>{};
+            });
+    }
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;std::uint64_t result=0;
     const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
     const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};

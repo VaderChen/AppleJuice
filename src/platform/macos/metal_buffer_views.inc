@@ -23,7 +23,13 @@ void metal_buffer_shader(MetalShader& shader,const char* entry=nullptr){
 std::array<std::uint32_t,4> metal_buffer_view_info(const GraphicsView& view){
     if(!view.resource || view.resource->desc.dimension!=1)return {};
     const auto& d=view.resource->desc;
-    const auto stride=d.stride?d.stride:graphics_format_bytes(view.format);
+    // 根描述元沒有 stride，也沒有硬體邊界：元素上限以 4 位元組估算（不會小於實際元素數），元素內的欄位位移不設限。
+    if(view.stride==graphics_view_stride_unknown){
+        if(view.first>d.width)throw std::invalid_argument("緩衝區 view 的起點不合法");
+        const auto bytes=view.count?view.count:d.width-view.first;
+        return {view.first/4,bytes/4,UINT32_MAX,(view.flags&1)?bytes:bytes/4};
+    }
+    const auto stride=view.stride?view.stride:d.stride?d.stride:graphics_format_bytes(view.format);
     if(!stride || view.first>d.width)throw std::invalid_argument("緩衝區 view 的 stride／起點不合法");
     const auto count=view.count?view.count:d.width-view.first;
     if(count>d.width-view.first || view.first%stride || count%stride)throw std::invalid_argument("緩衝區 view 範圍不合法");

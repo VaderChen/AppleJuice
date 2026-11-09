@@ -1,6 +1,9 @@
+#include "windows_scalar_math.hpp"
 #include <shared_mutex>
 #include "x64arm/windows_services.hpp"
 #include <chrono>
+#include <cerrno>
+#include <ctime>
 #include "x64arm/startup_profile.hpp"
 #include "x64arm/entry_runtime_profile.hpp"
 #include "monotonic_clock.hpp"
@@ -9,6 +12,7 @@
 #include "guest_tls.hpp"
 #include "parallel_mapping_lock.hpp"
 #include "x64arm/gpu_memory.hpp"
+#include "windows_display_identity.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -20,6 +24,8 @@
 #include <vector>
 
 namespace x64arm {
+bool d3d12_worker_residency_service(std::string_view symbol) noexcept;
+
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_HEAP
 ResidentHeapOperation WindowsServices::resident_heap_recipe(GuestAddress address) const noexcept {
     if(!initialized_ || !x86_ || !runtime_.host_clock || !trace_services_.empty() ||
@@ -124,6 +130,43 @@ bool WindowsServices::resident_timestamp_counter(const GuestState&,const GuestMe
 #endif
 #ifdef X64ARM_HOST_SERVICES_PARALLEL_SERVICE
 namespace {
+template<typename Progress>
+bool use_object_wait_for_worker_retry() noexcept {
+    if constexpr(requires { Progress::CompletedWithoutSignal; }){
+        static const bool enabled=[] {
+            const auto* value=std::getenv("X64ARM_RESIDENT_PRECISE_SERVICE_PROGRESS");
+            return value && std::string_view(value)=="1";
+        }();
+        return enabled;
+    }
+    return false;
+}
+template<typename Progress>
+void complete_without_progress(Progress& progress) noexcept {
+    if constexpr(requires { Progress::CompletedWithoutSignal; })progress=Progress::CompletedWithoutSignal;
+}
+// 釋放了有等待者的號誌：在 worker 完成並回報 CompletedResolve，核心 poke 協調者盡快解析等待（走逾時分支的等待解析與搶占），
+// 釋放者不必往返協調者。號誌不保證 FIFO，計數只會被等待消耗，延後解析不會漏喚。核心不支援時回 false，沿用交回協調者。
+// X64ARM_PARALLEL_ASYNC_WAKE=0 關閉。
+template<typename Progress>
+bool complete_with_resolve(Progress& progress) noexcept {
+    if constexpr(requires { Progress::CompletedResolve; }){
+        static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_ASYNC_WAKE");return !value || std::string_view(value)!="0";}();
+        if(enabled){progress=Progress::CompletedResolve;return true;}
+    }
+    return false;
+}
+template<typename Progress>
+void complete_descriptor_transfer(Progress& progress) noexcept {
+    // 公開 SDK 可獨立更新。舊版核心仍沿用 Completed 通知，避免落入未知結果的慢路徑。
+    if constexpr(requires { Progress::CompletedWithoutSignal; }){
+        static const bool independent=[] {
+            const auto* value=std::getenv("X64ARM_D3D12_DESCRIPTOR_PROGRESS");
+            return !value || std::string_view(value)!="0";
+        }();
+        if(independent)complete_without_progress(progress);
+    }
+}
 // SRW 慢路徑（客體常式 CAS 失敗、或未安裝客體常式）在 worker 完成可判定的情況：取得、Try 失敗、
 // 無等待者的釋放。有宿主等待者（bit1）的釋放、需要排隊的取得仍交協調者。X64ARM_PARALLEL_SRW=0 關閉（同成品對照）。
 bool parallel_srw_enabled() noexcept {
@@ -160,18 +203,45 @@ bool msvcp_clock_service(std::string_view symbol) noexcept {
 // 等待、跨程序物件或錯誤回報交回協調者（喚醒與錯誤碼由它處理）。執行緒的等待登記（resident_block_service 與等待服務）在
 // 協調者持獨占映射鎖時於同一段內「核對未就緒→標成等待」，worker 持共用鎖讀取，不會漏掉喚醒。電馭判客 Benchmark 每條工作
 // 執行緒每分鐘約 6 萬次 SetEvent、5 萬次 ResetEvent，排隊等協調者每次 60～110 µs。X64ARM_PARALLEL_EVENT=0 關閉。
+// 與 windows_threads.cpp 的 critical_retry_waits 同一開關（X64ARM_CRITICAL_RETRY=1）。
+bool critical_retry_waits_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_CRITICAL_RETRY");return value && std::string_view(value)=="1";}();
+    return enabled;
+}
 bool parallel_event_service(std::string_view symbol) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_EVENT");return !value || std::string_view(value)!="0";}();
     return enabled && (symbol=="SetEvent" || symbol=="ResetEvent");
 }
-// WaitForSingleObject(Ex) 的立即結果（X64ARM_PARALLEL_WAIT=1 開啟；2026-10-28 電馭判客交錯對照 31.97 → 31.35，多數等待當下仍須阻塞，
-// 先做本地嘗試反而多一道，預設關閉）：本程序 event／semaphore 已觸發就在 worker 取用（自動重設
+// WaitForSingleObject(Ex) 的立即結果（X64ARM_PARALLEL_WAIT=0 關閉；2026-11-07《古墓奇兵：崛起》三場景都變快且 CPU 較低）：本程序 event／semaphore 已觸發就在 worker 取用（自動重設
 // event 以比較交換清除、semaphore 計數減一），未觸發且逾時為 0 回傳 WAIT_TIMEOUT；要阻塞、可警示、跨程序、mutex 與其他物件交回
 // 協調者。等待登記與協調者端的觸發都在獨占映射鎖下進行，worker 持共用鎖以原子操作取用，與本地 SetEvent 相同不會漏掉喚醒。
 // 電馭判客工作執行緒每條每秒約 440 次，往返協調者每次 50～80 µs。
 bool parallel_wait_service(std::string_view symbol) noexcept {
-    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_WAIT");return value && std::string_view(value)=="1";}();
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_WAIT");return !value || std::string_view(value)!="0";}();
     return enabled && (symbol=="WaitForSingleObject" || symbol=="WaitForSingleObjectEx");
+}
+// WaitForMultipleObjects(Ex) 的立即結果（x64；預設關閉，X64ARM_PARALLEL_WAIT_MULTIPLE=1 開啟）：與 WaitForSingleObject 立即結果同一套規則，只收本程序
+// event／semaphore。WaitAny 依序取用第一個已觸發者（自動重設 event 以比較交換清除、semaphore 計數減一）；WaitAll 只收全部是手動重設 event
+// 的組合（不消耗訊號，不必跨物件原子）。全未觸發且逾時為 0 回傳 WAIT_TIMEOUT；要阻塞、可警示、重複 handle、跨程序、mutex 與其他物件交回
+// 協調者。等待登記與協調者端的觸發都在獨占映射鎖下進行，worker 持共用鎖以原子操作取用，不會漏掉喚醒。《古墓奇兵：暗影》Benchmark 每秒約
+// 2,900 次，原本每次往返協調者。2026-11-08 開關對照（2 vCPU，與 SRW 兩項同開）平均 41.8 → 全關 44.1 FPS：原本的全停兼任排程點，
+// 少了它被喚醒者要等時間片才上 vCPU（見 project-fullstop-dispatch-points），在有及時派送機制前預設關閉。
+bool parallel_wait_multiple_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_WAIT_MULTIPLE");return value && std::string_view(value)=="1";}();
+    return enabled && (symbol=="WaitForMultipleObjects" || symbol=="WaitForMultipleObjectsEx");
+}
+// 對 NULL handle 等待（x64）：Windows 立即回 WAIT_FAILED、LastError=ERROR_INVALID_HANDLE。有引擎把建立失敗的 semaphore 留成 NULL 後在工作佇列裡反覆等待，
+// 《古墓奇兵：崛起》每幀數千次；沒有別的執行緒等 vCPU 時在 worker 完成，否則交回協調者讓出 vCPU（resident_block_service）。X64ARM_PARALLEL_NULL_WAIT=0 關閉。
+// ReleaseSemaphore（x64）：本程序 semaphore 沒有等待者時在 worker 以原子加法完成，不必排給協調者、也不取獨占鎖；NULL handle 立即回失敗。
+// 有等待者（要喚醒）、執行緒池已登錄等待、跨程序物件與其他錯誤交回協調者。等待登記在協調者持獨占鎖時「核對未就緒→標成等待」，這裡持共用鎖，
+// 與本地 SetEvent 相同不會漏掉喚醒。X64ARM_PARALLEL_SEMAPHORE=0 關閉。
+bool parallel_semaphore_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_SEMAPHORE");return !value || std::string_view(value)!="0";}();
+    return enabled && symbol=="ReleaseSemaphore";
+}
+bool parallel_null_wait_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_NULL_WAIT");return !value || std::string_view(value)!="0";}();
+    return enabled && symbol=="WaitForSingleObject";
 }
 // 訊息佇列空閒時的 PeekMessage（x64）：協調者上一次 PeekMessage 抽完宿主事件仍無訊息後約 1 ms 內，佇列、送出訊息、
 // WinEvent、滑鼠命中測試、shell 通知與 hook 全空時在 worker 直接回 FALSE（不寫 MSG、不改 LastError）。期限過後交回協調者
@@ -202,6 +272,8 @@ std::optional<unsigned> context_service_arguments(std::string_view symbol) noexc
     if(symbol=="GetLastError" || symbol=="GetCurrentThreadId" || symbol=="SwitchToThread" || tick_clock_service(symbol) || msvcp_clock_service(symbol))return 0;
     if(symbol=="TlsSetValue" || symbol=="FlsSetValue" || symbol=="WaitForSingleObject")return 2;
     if(symbol=="WaitForSingleObjectEx")return 3;
+    // Sleep 只在 worker 處理 0 毫秒（與 SwitchToThread 同一讓出判斷）；非零的計時睡眠交回協調者。
+    if(symbol=="Sleep")return 1;
     if(symbol=="SetLastError" || symbol=="TlsGetValue" || symbol=="TlsGetValue2" ||
        symbol=="FlsGetValue" || symbol=="FlsGetValue2" ||
        symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency" ||
@@ -225,6 +297,13 @@ const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,G
 std::size_t stub_service_count() noexcept;
 std::size_t stub_service_index(GuestAddress stub_base,GuestAddress address) noexcept;
 std::string_view stub_service_symbol(GuestAddress stub_base,GuestAddress address) noexcept;
+bool worker_critical_object_waits() noexcept {
+#ifdef X64ARM_HOST_SERVICES_PARALLEL_SERVICE
+    return use_object_wait_for_worker_retry<ResidentServiceProgress>();
+#else
+    return false;
+#endif
+}
 // GuestMemory 的區域表（std::vector）讀取不加鎖；協調者在其他 worker 繼續執行時本地完成虛擬記憶體服務會插入／刪除
 // 區域，worker 上的服務（native_window、load／store）同時查表即可能讀到重新配置中的陣列，把客體資料寫到錯誤位置
 // （DQ3 強制平行在 13～16 秒崩潰；停用本地映射服務即不再發生）。worker 服務持共享鎖，本地映射服務持獨占鎖。
@@ -269,7 +348,10 @@ bool crt_pure_worker_service(const WindowsServiceDescriptor& descriptor) noexcep
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_CRT_PURE");return !value || std::string_view(value)!="0";}();
     static constexpr std::string_view names[]{"wcsstr","wcschr","wcsrchr","wcscmp","wcsncmp","_finite","_isnan","memcmp",
         // 窄字串同一性質（33 號遠征隊 strstr 200 秒約 3 千次）；超過上限與無效指標同樣交回協調者回報。
-        "strstr","strchr","strrchr","strlen","strcmp","strncmp","strnlen","wcslen","wcsnlen","memchr"};
+        "strstr","strchr","strrchr","strlen","strcmp","strncmp","strnlen","wcslen","wcsnlen","memchr",
+        // 不分大小寫比較（C locale）：同樣只讀；空指標要寫 errno 並可能呼叫無效參數處理常式，worker 入口先核對、有空指標就交回協調者。
+        //《古墓奇兵：暗影》Benchmark 每秒約 40 次 _wcsnicmp 原本每次全停。
+        "_strnicmp","_stricmp","_strcmpi","_wcsicmp","_wcsnicmp"};
     return enabled && descriptor.family=="crt" && std::find(std::begin(names),std::end(names),descriptor.symbol)!=std::end(names);
 }
 // CRT rand／srand 與帶輸出指標的 modf 家族：不寫 errno、LastError，也不配置，原本每次都要交回協調者取獨占鎖（33 號遠征隊每幀 rand 約 180 次、
@@ -279,9 +361,31 @@ bool crt_random_worker_service(const WindowsServiceDescriptor& descriptor) noexc
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_CRT_COMPUTE");return (!value || std::string_view(value)!="0") && !std::getenv("X64ARM_CRT_RANDOM_DIAGNOSTIC");}();
     return enabled && descriptor.family=="crt" && (descriptor.symbol=="rand" || descriptor.symbol=="srand");
 }
+// Win32 CRT x87 暫存器 ABI：floor／ceil（堆疊參數、ST0 回傳）、_CI*（ST0／ST1 進、ST0 出）與 _ftol*（ST0 進、EAX／EDX 出）。
+// x87 狀態在 worker 的 GuestState；errno 寫入呼叫執行緒自己的格位，與協調者共用同一數學實作。Win64 已由核心純量入口處理。
+//《Tomb Raider》2013 每秒約 4 萬次 floor、1.8 萬次 _CIatan2，原本每次都經協調者往返。X64ARM_PARALLEL_CRT_X87=0 關閉。
+bool crt_x87_worker_service(const WindowsServiceDescriptor& descriptor) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_CRT_X87");return !value || std::string_view(value)!="0";}();
+    if(!enabled || descriptor.family!="crt")return false;
+    const auto symbol=descriptor.symbol;
+    if(symbol.starts_with("_CI") || symbol=="_ftol" || symbol=="_ftol2" || symbol=="_ftol2_sse")return true;
+    return scalar_math_requested() && (symbol=="floor" || symbol=="ceil" || symbol=="floorf" || symbol=="ceilf");
+}
+bool parallel_sleep_zero_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_SLEEP_ZERO");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
 bool crt_split_worker_service(const WindowsServiceDescriptor& descriptor) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_CRT_COMPUTE");return !value || std::string_view(value)!="0";}();
     return enabled && descriptor.family=="crt" && (descriptor.symbol=="modff" || descriptor.symbol=="modf");
+}
+bool crt_file_worker_service(const WindowsServiceDescriptor& descriptor) noexcept {
+    static const bool enabled=[] {
+        const auto* value=std::getenv("X64ARM_PARALLEL_CRT_FILE_READ");
+        return !value || std::string_view(value)!="0";
+    }();
+    return enabled && descriptor.family=="crt" &&
+           (descriptor.symbol=="fread" || descriptor.symbol=="fseek" || descriptor.symbol=="_fseeki64");
 }
 // worker 上的 D3D11 寫入型方法（Get*、Check*、Map）只把結果寫到參數指向的位置。先核對每個參數值（含堆疊參數）
 // 起算 4 KiB 的首尾頁都不是寫入時複製頁：共用映射鎖下不得私有化頁面（會改區域表與原生 MMU）。核對不通過或讀取
@@ -324,7 +428,9 @@ bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
 bool WindowsServices::parallel_service_static(GuestAddress address) const noexcept {
     if(parallel_crt_format_service(address))return true;
     if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,address);runtime &&
-       (crt_pure_worker_service(*runtime) || (!x86_ && (crt_random_worker_service(*runtime) || crt_split_worker_service(*runtime)))))return true;
+       (crt_pure_worker_service(*runtime) || (x86_ && crt_x87_worker_service(*runtime)) ||
+        (!x86_ && (crt_random_worker_service(*runtime) || crt_split_worker_service(*runtime) ||
+                                                       crt_file_worker_service(*runtime)))))return true;
     const auto symbol=name(address);
     if(x86_){
         static const bool win32=[] {const auto* value=std::getenv("X64ARM_X86_PARALLEL_SERVICES");return !value || std::string_view(value)!="0";}();
@@ -338,7 +444,8 @@ bool WindowsServices::parallel_service_static(GuestAddress address) const noexce
     if(tick_clock_service(symbol) || msvcp_clock_service(symbol))return parallel_tick_clock_enabled();
     if(parallel_peek_service(symbol))return true;
     if(parallel_srw_enabled() && (srw_service(symbol) || msvcp_mutex_service(symbol)))return true;
-    if(thrd_tail_service(symbol) || parallel_event_service(symbol) || parallel_wait_service(symbol))return true;
+    if(thrd_tail_service(symbol) || parallel_event_service(symbol) || parallel_wait_service(symbol) || parallel_null_wait_service(symbol) || parallel_semaphore_service(symbol) ||
+       parallel_wait_multiple_service(symbol))return true;
     if(thread_priority_worker_service(symbol) || crt_string_copy_worker_service(symbol))return true;
     return symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue" ||
         symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
@@ -353,24 +460,29 @@ bool WindowsServices::parallel_service_static(GuestAddress address) const noexce
 }
 
 bool WindowsServices::invoke_parallel_service(GuestState& state,GuestMemory& memory) {
-    bool retry=false;return invoke_parallel_service_impl(state,memory,retry);
+    auto progress=ResidentServiceProgress::Completed;
+    return invoke_parallel_service_impl(state,memory,progress);
 }
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_PARALLEL
 ResidentServiceProgress WindowsServices::resident_parallel_service(GuestState& state,GuestMemory& memory) {
-    bool retry=false;
-    if(invoke_parallel_service_impl(state,memory,retry))return ResidentServiceProgress::Completed;
-    return retry?ResidentServiceProgress::Retry:ResidentServiceProgress::Coordinator;
+    return resident_parallel_service(state,memory,{});
 }
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_ACTIVE_CONTEXTS
 ResidentServiceProgress WindowsServices::resident_parallel_service(GuestState& state,GuestMemory& memory,
                                                                    std::span<GuestState* const> active) {
-    bool retry=false;
-    if(invoke_parallel_service_impl(state,memory,retry,active))return ResidentServiceProgress::Completed;
-    return retry?ResidentServiceProgress::Retry:ResidentServiceProgress::Coordinator;
+    auto progress=ResidentServiceProgress::Completed;
+    // Win64 的 Retry 只用於臨界區段。競爭改登記成真正的物件等待後，其他 API 完成不再推進重試序號。
+    if(!x86_ && use_object_wait_for_worker_retry<ResidentServiceProgress>())complete_without_progress(progress);
+    if(invoke_parallel_service_impl(state,memory,progress,active) || progress==ResidentServiceProgress::Retry)return progress;
+    // 診斷：worker 拒絕（rip 不變）依服務累計，找出每次都要往返協調者的服務與比例。
+    if(service_counts_enabled_ && parallel_service(state.rip)){
+        std::lock_guard lock(*worker_service_counts_mutex_);++worker_service_counts_[state.rip.value].refused;
+    }
+    return ResidentServiceProgress::Coordinator;
 }
 #endif
 #endif
-bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory& memory,bool& retry,
+bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory& memory,ResidentServiceProgress& progress,
                                                   std::span<GuestState* const> active) {
     if(!parallel_service(state.rip))return false;
     // D3D11 命令串流：分類與 drain 都在取映射鎖之前，見 d3d11_command_stream.inc。
@@ -379,15 +491,56 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(step==D3D11StreamStep::Done)return true;
         if(step==D3D11StreamStep::Refuse || step==D3D11StreamStep::Coordinator)return false;
     }
+    using Clock=std::chrono::steady_clock;
+    const auto cpu_time=[]() noexcept -> std::uint64_t {
+        timespec stamp{};const auto saved=errno;
+        const bool valid=clock_gettime(CLOCK_THREAD_CPUTIME_ID,&stamp)==0;
+        errno=saved;
+        return valid?static_cast<std::uint64_t>(stamp.tv_sec)*1000000000U+static_cast<std::uint64_t>(stamp.tv_nsec):0;
+    };
+    bool measure=service_counts_enabled_;
+    const auto sample_bits=measure?worker_service_sample_bits_:0U;
+    if(measure && sample_bits){
+        // 取高位避免固定每 N 次抽樣與客體重複的 API 順序產生同相位。
+        static thread_local std::uint32_t sample=1;
+        sample=sample*1664525U+1013904223U;
+        measure=(sample>>(32U-sample_bits))==0;
+    }
+    const auto before_mapping=measure && sample_bits?Clock::now():Clock::time_point{};
     std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
+    const auto start=measure?Clock::now():Clock::time_point{};
     struct CountScope {
-        WindowsServices& self;std::uint64_t rip;std::chrono::steady_clock::time_point start;
+        WindowsServices& self;std::uint64_t rip;Clock::time_point start,before_mapping;
+        std::uint64_t cpu_start;decltype(cpu_time)& cpu_time_now;
         bool accepted{true};
-        ~CountScope(){if(!accepted || !self.service_counts_enabled_)return;
-            const auto ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count());
-            std::lock_guard lock(*self.worker_service_counts_mutex_);auto& c=self.worker_service_counts_[rip];++c.calls;c.ns+=ns;}
-    } count_scope{*this,state.rip.value,service_counts_enabled_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
+        ~CountScope(){if(!accepted || start==Clock::time_point{})return;
+            const auto ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count());
+            const auto cpu_end=cpu_start?cpu_time_now():0;
+            const auto lock_ns=before_mapping==Clock::time_point{}?0U:static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(start-before_mapping).count());
+            std::lock_guard lock(*self.worker_service_counts_mutex_);auto& c=self.worker_service_counts_[rip];
+            ++c.calls;c.ns+=ns;c.mapping_wait_ns+=lock_ns;
+            if(cpu_end>=cpu_start)c.cpu_ns+=cpu_end-cpu_start;
+        }
+    } count_scope{*this,state.rip.value,start,before_mapping,measure && sample_bits?cpu_time():0,cpu_time};
     if(const auto* graphics=graphics_worker_service(state.rip)){
+        if(graphics->symbol.starts_with("AdapterGetDesc") && display_identity::parallel_graphics_descriptions()){
+            count_scope.accepted=false;
+            try{
+                const WindowsCall arg(state,memory,*graphics);
+                const auto size=display_identity::adapter_description_size(graphics->symbol,x86_);
+                const auto address=arg(1);
+                if(!size || !address || !d3d11_adapter(arg(0)))return false;
+                auto output=memory.native_private_span(GuestAddress{address},size,2);
+                if(output.empty())return false;
+                // 配接器身分與 GPU 配額沿用完整服務。物件表的建立／銷毀受映射鎖保護，
+                // 與 QueryVideoMemoryInfo 同樣不必等候 Metal 重播持有的圖形鎖。
+                const auto desc=display_identity::adapter_description(x86_,gpu_memory_stats().limit);
+                std::memcpy(output.data(),desc.data(),size);
+                arg.return_to(state,0);
+                count_scope.accepted=true;state.rep_compare={};return true;
+            }catch(const MemoryFault&){return false;}catch(const HostCallFault&){return false;}
+        }
         // DXGI 顯示記憶體預算查詢（IDXGIAdapter3::QueryVideoMemoryInfo）：只讀自帶鎖的 GPU 額度池並寫入參數指向的 32 位元組，
         // 不碰圖形物件狀態，不取圖形鎖——否則排在持鎖重播的 D3D12 提交執行緒之後（電馭判客 Benchmark 每秒約 670 次、
         // 每次約 0.58 ms，worker 合計占四成服務時間）。介面卡物件只在協調者建立。參數不符或輸出頁為 COW 時交回原路徑。
@@ -435,7 +588,23 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         const auto symbol=d3d12->symbol;
         // 描述元建立／複製（取樣器除外：要建 Metal 物件）同樣免圖形鎖：D3D12 規定為 free-threaded、應用程式不並行寫同一描述元，
         // 共用的鏡像待更新標記以無鎖點陣設定（電馭判客 Benchmark 每秒約 8 萬次 CopyDescriptors，取全域圖形鎖時每次約 2.8 µs）。
-        const bool descriptor_write=symbol=="Device.CopyDescriptors" || symbol=="Device.CopyDescriptorsSimple" || symbol=="Device.CreateConstantBufferView" ||
+        const bool descriptor_transfer=symbol=="Device.CopyDescriptors" || symbol=="Device.CopyDescriptorsSimple" || symbol=="Device.CreateConstantBufferView";
+        if(descriptor_transfer && record_unlocked){
+            static const bool direct=[] {
+                const auto* value=std::getenv("X64ARM_D3D12_DESCRIPTOR_WORKER_DIRECT");
+                return value && std::string_view(value)=="1";
+            }();
+            if(direct){
+                try{
+                    if(d3d12_worker_descriptor_transfer(state,memory,*d3d12)){
+                        complete_descriptor_transfer(progress);
+                        state.rep_compare={};
+                        return true;
+                    }
+                }catch(...){return false;}
+            }
+        }
+        const bool descriptor_write=descriptor_transfer ||
             symbol=="Device.CreateShaderResourceView" || symbol=="Device.CreateUnorderedAccessView" || symbol=="Device.CreateRenderTargetView" || symbol=="Device.CreateDepthStencilView";
         // Allocator.Reset、Queue.Wait 實作只回傳成功（重播在提交時進行，GPU 端等待由提交順序保證），同樣免鎖：
         // 取鎖時每次平均 38 µs（等其他持鎖服務）。
@@ -451,13 +620,21 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         const bool heap_start=symbol=="DescriptorHeap.GetCPUDescriptorHandleForHeapStart" || symbol=="DescriptorHeap.GetGPUDescriptorHandleForHeapStart";
         const bool allocation_info=symbol=="Device.GetResourceAllocationInfo";
         const bool fence_value=symbol=="Fence.GetCompletedValue"; // 只讀 fence 值（見 invoke_d3d12 的 Fence 分支）。
+        const bool description=symbol=="DescriptorHeap.GetDesc" || symbol=="Resource.GetDesc";
+        // 現有 UMA 路徑只讀取物件陣列及橋接層物件表。具有 fence 副作用的 EnqueueMakeResident 維持協調者路徑。
+        const bool residency=d3d12_worker_residency_service(symbol);
+        if(description){
+            const auto out=state.reg(Gpr::Rdx);
+            const auto size=symbol=="Resource.GetDesc"?56U:16U;
+            if(!out || memory.native_private_span(GuestAddress{out},size,2).empty())return false;
+        }
         if(heap_start || allocation_info){
             const auto out=state.reg(Gpr::Rdx);const auto last=out+(allocation_info?15U:7U);
             if(!out || memory.is_copy_on_write(GuestAddress{out}) || memory.is_copy_on_write(GuestAddress{last}))return false;
         }
         if(submit && !d3d12_submitter_)return false;
         const bool unlocked=record_unlocked && (symbol.starts_with("List.") || symbol=="Resource.GetGPUVirtualAddress" || symbol=="Device.GetDescriptorHandleIncrementSize" ||
-            symbol=="Allocator.Reset" || symbol=="Queue.Wait" || descriptor_write || reference || submit || map || named || heap_start || allocation_info || fence_value);
+            symbol=="Allocator.Reset" || symbol=="Queue.Wait" || descriptor_write || reference || submit || map || named || heap_start || allocation_info || fence_value || description || residency);
         std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!unlocked)lock_graphics(graphics_lock);
         if(symbol.ends_with(".AddRef") || symbol.ends_with(".Release") || symbol=="Resource.Map" || symbol=="Resource.Unmap"){
             bool done=false;
@@ -470,11 +647,19 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         std::optional<std::uint32_t> result;
         try{result=invoke_d3d12(state,memory,*d3d12);}catch(...){return false;}
         if(result)throw std::logic_error("worker 上的 D3D12 服務意外終止客體");
+        // 這三個方法只更新描述元，沒有釋放 Win32 heap 或臨界區段。Retry 的等待者由實際釋放者通知。
+        if(descriptor_transfer && unlocked)complete_descriptor_transfer(progress);
         state.rep_compare={};
         return true;
     }
     if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,state.rip);runtime && crt_pure_worker_service(*runtime)){
         std::optional<std::uint32_t> result;
+        const auto symbol=runtime->symbol;
+        if(symbol=="_strnicmp" || symbol=="_stricmp" || symbol=="_strcmpi" || symbol=="_wcsicmp" || symbol=="_wcsnicmp"){
+            // 與 provider 的錯誤分支相同條件：長度不為 0 且任一指標為空時要寫呼叫者 errno／啟動處理常式，交回協調者。
+            try{const WindowsCall arg(state,memory,*runtime);const bool bounded=symbol=="_strnicmp" || symbol=="_wcsnicmp";
+                if((!bounded || arg(2)) && (!arg(0) || !arg(1)))return false;}catch(...){return false;}
+        }
         try{result=invoke_runtime(state,memory,*runtime);}catch(...){return false;}
         if(result)throw std::logic_error("worker 上的 CRT 唯讀服務意外終止客體");
         state.rep_compare={};
@@ -535,6 +720,34 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     }
     if(found==threads_.items.end() || found->second.teb!=teb)return false;
     auto& thread=found->second;const auto tid=found->first;const bool current=tid==threads_.current;
+    if(const auto* runtime=x86_?detail::runtime_stub_descriptor(stub_base_,state.rip):nullptr;runtime && crt_x87_worker_service(*runtime)){
+        // 全部 x87 例外已遮罩且沒有待處理例外時計算中不會拋出；先核對返回位址、堆疊參數與 errno 格位，
+        // 之後的狀態提交不會再故障，不留下半套 x87 狀態給協調者重做。
+        const auto errno_cell=thread.errno_cell?thread.errno_cell:current?runtime_.errno_cell:0;
+        if(!errno_cell || (state.x87_control&0x3fU)!=0x3fU || (state.x87_status&0x80U))return false;
+        const bool x87_register=runtime->symbol.starts_with("_CI") || runtime->symbol.starts_with("_ftol");
+        const auto* operation=x87_register?nullptr:scalar_math_operation(*runtime);
+        if(!x87_register && !operation)return false;
+        std::optional<std::uint32_t> result;
+        try{
+            const auto stack_bytes=x87_register?4U:runtime->symbol.ends_with('f')?8U:12U;
+            memory.check(GuestAddress{state.reg(Gpr::Rsp)},stack_bytes,Access::Read);
+            memory.check(GuestAddress{errno_cell},4,Access::Write);
+            if(x87_register)result=invoke_x87_crt_math(state,memory,*runtime,errno_cell);
+            else invoke_scalar_math(state,memory,*runtime,*operation,errno_cell,true);
+        }catch(...){return false;}
+        if(result)throw std::logic_error("worker 上的 CRT x87 數學服務意外終止客體");
+        count_scope.accepted=true;state.rep_compare={};
+        return true;
+    }
+    if(!x86_ && (symbol=="fread" || symbol=="fseek" || symbol=="_fseeki64")){
+        const auto* descriptor=detail::runtime_stub_descriptor(stub_base_,state.rip);
+        const auto errno_cell=thread.errno_cell?thread.errno_cell:current?runtime_.errno_cell:0;
+        const bool completed=descriptor && crt_file_worker_service(*descriptor) && invoke_parallel_crt_file(state,memory,*descriptor,tid,errno_cell);
+        count_scope.accepted=completed;
+        if(completed)state.rep_compare={};
+        return completed;
+    }
     if(parallel_crt_format_service(state.rip)){
         const auto completed=invoke_parallel_crt_format(state,memory,tid);
         count_scope.accepted=completed;
@@ -603,7 +816,8 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             if(entry_runtime_profile::enabled())contention.emplace(entry_runtime_profile::Kind::Bridge,state.rip.value,"resident heap contention");
             static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_X86_HEAP_RETRY");
                 return !setting || std::string_view(setting)!="0";}();
-            retry=enabled;return false;
+            if(enabled)progress=ResidentServiceProgress::Retry;
+            return false;
         }
         struct Unlock {std::atomic_ref<std::uint32_t> lock;~Unlock(){lock.store(0,std::memory_order_release);}} unlock{lock};
         std::uint64_t address=value,cls=allocating?guest_heap_class(std::max(UINT64_C(1),value)):0;
@@ -648,20 +862,138 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         result=symbol=="GetTickCount64"?milliseconds:static_cast<std::uint32_t>(milliseconds);
     }else if(msvcp_clock_service(symbol)){
         result=symbol=="_Query_perf_frequency"?UINT64_C(10000000):detail::monotonic_ticks();
+    }else if(parallel_semaphore_service(symbol)){
+        if(!first){
+            auto* error=pointer(thread.teb+error_offset,4,2);if(!error)return false;
+            put(error,6,4);if(current)last_error_=6;
+            result=0;
+        }else{
+            const auto object=runtime_.wait_objects.find(first);
+            if(object==runtime_.wait_objects.end() || object->second.kind!=WaitObject::Kind::Semaphore || !(object->second.access&2U) || runtime_.wait_lock_descriptor(object->second)>=0)return false;
+            const auto increment=static_cast<std::uint32_t>(second);
+            if(std::bit_cast<std::int32_t>(increment)<=0)return false;
+            const auto same_object=[&](std::uint64_t handle){
+                if(handle==first)return true;
+                const auto other=runtime_.wait_objects.find(handle);
+                return other!=runtime_.wait_objects.end() && object->second.identity && other->second.identity==object->second.identity;
+            };
+            // 執行緒池登記的等待與等待完成封包只在完整排程輪詢，交回協調者；一般執行緒等待改由協調者稍後解析（complete_with_resolve）。
+            for(const auto& [id,wait]:registered_waits_){(void)id;if(same_object(wait.target))return false;}
+            for(const auto& [id,wait]:wait_completion_packets_){(void)id;if(wait.phase==WaitCompletionPacketState::Phase::Armed && same_object(wait.target))return false;}
+            bool waiters=false;
+            for(const auto& [id,other]:threads_.items){
+                (void)id;if(other.status==ThreadStatus::Waiting && std::any_of(other.wait.handles.begin(),other.wait.handles.end(),same_object)){waiters=true;break;}
+            }
+            if(waiters && !complete_with_resolve(progress))return false;
+            void* previous_count=nullptr;
+            if(arguments[2] && !(previous_count=pointer(arguments[2],4,2)))return false;
+            auto& state_object=runtime_.wait_state(object->second);
+            std::atomic_ref signal(state_object.count);auto count=signal.load(std::memory_order_acquire);
+            do{if(increment>state_object.maximum-count)return false;}while(!signal.compare_exchange_weak(count,count+increment,std::memory_order_acq_rel));
+            if(previous_count)put(previous_count,count,4);
+            result=1;
+        }
+    }else if(parallel_null_wait_service(symbol) && !first){
+        if(active.empty() || state.processor_id>=64)return false;
+        for(const auto& [id,other]:threads_.items){
+            if(id==tid || other.status!=ThreadStatus::Runnable || other.suspended ||
+               !(other.affinity&(UINT64_C(1)<<state.processor_id)))continue;
+            const bool running=id==threads_.current ||
+                std::find(active.begin(),active.end(),&other.context)!=active.end();
+            if(!running)return false; // 有可接手者：交回協調者讓出這個 vCPU。
+        }
+        auto* error=pointer(thread.teb+error_offset,4,2);if(!error)return false;
+        put(error,6,4);if(current)last_error_=6;
+        result=0xffffffffU;
+    }else if(parallel_null_wait_service(symbol) && !parallel_wait_service(symbol)){
+        return false; // 有效 handle 的等待交回協調者（鏈尾的預設分支是臨界區段，不能掉進去）。
     }else if(parallel_wait_service(symbol)){
         if(symbol=="WaitForSingleObjectEx" && static_cast<std::uint32_t>(arguments[2]))return false; // 可警示：APC 由協調者投遞。
         const auto object=runtime_.wait_objects.find(first);
-        if(object==runtime_.wait_objects.end() || runtime_.wait_lock_descriptor(object->second)>=0 || !(object->second.access&0x100000U))return false;
-        auto& waited=runtime_.wait_state(object->second);const bool poll=!static_cast<std::uint32_t>(second);
-        std::atomic_ref signal(waited.count);
-        if(waited.kind==WaitObject::Kind::Event){
-            if(waited.manual_reset){if(signal.load(std::memory_order_acquire))result=0;else if(poll)result=0x102;else return false;}
-            else{std::uint32_t expected=1;if(signal.compare_exchange_strong(expected,0,std::memory_order_acq_rel))result=0;else if(poll)result=0x102;else return false;}
-        }else if(waited.kind==WaitObject::Kind::Semaphore){
-            auto available=signal.load(std::memory_order_acquire);
-            while(available && !signal.compare_exchange_weak(available,available-1,std::memory_order_acq_rel)){}
-            if(available)result=0;else if(poll)result=0x102;else return false;
-        }else return false;
+        static const bool readonly_wait=[] {
+            const auto* value=std::getenv("X64ARM_PARALLEL_READONLY_WAIT");
+            return !value || std::string_view(value)!="0";
+        }();
+        const bool poll=!static_cast<std::uint32_t>(second);
+        if(object==runtime_.wait_objects.end()){
+            if(!readonly_wait)return false;
+            // 檔案完成狀態由協調者發布，worker 在共用映射鎖內只讀取已完成結果。
+            // 尚未完成要沿用 I/O 輪詢與逾時流程，即使呼叫端傳入零逾時。
+            const auto file=files_.find(first);
+            if(file!=files_.end()){
+                if(!file->second.io_signaled)return false;
+                result=0;
+            }else if(const auto target_thread=first==(x86_?UINT32_MAX-1:UINT64_MAX-1)?0:thread_id(first)){
+                // 客體執行緒退出由協調者發布，等待只讀狀態，不消耗訊號。
+                // 目前執行緒的 pseudo handle、遠端執行緒和真阻塞沿用完整流程。
+                if(!(thread_access(first)&0x100000U))return false;
+                if(threads_.items.at(target_thread).status==ThreadStatus::Exited)result=0;
+                else if(poll)result=0x102;
+                else return false;
+            }else return false;
+        }else{
+            if(!(object->second.access&0x100000U))return false;
+            auto& waited=runtime_.wait_state(object->second);
+            if(waited.shared_event){
+                // 只讀手動重設事件的共用訊號。會消耗訊號的物件仍由原命名空間鎖保護。
+                if(!readonly_wait || waited.kind!=WaitObject::Kind::Event || !waited.shared_event->manual_reset())return false;
+                if(waited.signaled())result=0;
+                else if(poll)result=0x102;
+                else return false;
+            }else{
+                std::atomic_ref signal(waited.count);
+                if(waited.kind==WaitObject::Kind::Event){
+                    if(waited.manual_reset){if(signal.load(std::memory_order_acquire))result=0;else if(poll)result=0x102;else return false;}
+                    else{std::uint32_t expected=1;if(signal.compare_exchange_strong(expected,0,std::memory_order_acq_rel))result=0;else if(poll)result=0x102;else return false;}
+                }else if(waited.kind==WaitObject::Kind::Semaphore){
+                    auto available=signal.load(std::memory_order_acquire);
+                    while(available && !signal.compare_exchange_weak(available,available-1,std::memory_order_acq_rel)){}
+                    if(available)result=0;else if(poll)result=0x102;else return false;
+                }else return false;
+            }
+        }
+    }else if(parallel_wait_multiple_service(symbol)){
+        if(x86_)return false;
+        const auto count=static_cast<std::uint32_t>(first);const auto list=second;
+        const bool all=static_cast<std::uint32_t>(arguments[2])!=0;const auto timeout=static_cast<std::uint32_t>(state.reg(Gpr::R9));
+        if(!count || count>64)return false; // 錯誤參數由協調者回報。
+        if(symbol=="WaitForMultipleObjectsEx"){
+            // 第五個參數 bAlertable 在 [rsp+0x28]；可警示時 APC 由協調者投遞。
+            auto* alertable=pointer(sp+0x28,4,1);if(!alertable || static_cast<std::uint32_t>(load(alertable,4)))return false;
+        }
+        auto* table=pointer(list,count*8,1);if(!table)return false;
+        std::array<std::uint64_t,64> handles{};
+        for(std::uint32_t i=0;i<count;++i){
+            handles[i]=load(static_cast<const std::uint8_t*>(table)+i*8,8);
+            for(std::uint32_t j=0;j<i;++j)if(handles[j]==handles[i])return false;
+            const auto object=runtime_.wait_objects.find(handles[i]);
+            if(object==runtime_.wait_objects.end() || !(object->second.access&0x100000U) || runtime_.wait_lock_descriptor(object->second)>=0)return false;
+            const auto& waited=runtime_.wait_state(object->second);
+            if(waited.shared_event || (waited.kind!=WaitObject::Kind::Event && waited.kind!=WaitObject::Kind::Semaphore))return false;
+            if(all && (waited.kind!=WaitObject::Kind::Event || !waited.manual_reset))return false;
+        }
+        bool ready=false;
+        if(all){
+            ready=true;
+            for(std::uint32_t i=0;i<count && ready;++i){
+                auto& waited=runtime_.wait_state(runtime_.wait_objects.find(handles[i])->second);
+                ready=std::atomic_ref(waited.count).load(std::memory_order_acquire)!=0;
+            }
+            if(ready)result=0;
+        }else for(std::uint32_t i=0;i<count && !ready;++i){
+            auto& waited=runtime_.wait_state(runtime_.wait_objects.find(handles[i])->second);
+            std::atomic_ref signal(waited.count);
+            if(waited.kind==WaitObject::Kind::Event){
+                if(waited.manual_reset)ready=signal.load(std::memory_order_acquire)!=0;
+                else{std::uint32_t expected=1;ready=signal.compare_exchange_strong(expected,0,std::memory_order_acq_rel);}
+            }else{
+                auto available=signal.load(std::memory_order_acquire);
+                while(available && !signal.compare_exchange_weak(available,available-1,std::memory_order_acq_rel)){}
+                ready=available!=0;
+            }
+            if(ready)result=i; // WAIT_OBJECT_0+i
+        }
+        if(!ready){if(timeout)return false;result=0x102;}
     }else if(parallel_event_service(symbol)){
         const auto event=runtime_.wait_objects.find(first);
         if(event==runtime_.wait_objects.end() || event->second.shared_event || !(event->second.access&2U) ||
@@ -681,7 +1013,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             for(const auto& [id,wait]:wait_completion_packets_){(void)id;if(wait.phase==WaitCompletionPacketState::Phase::Armed && same_object(wait.target))return false;}
         }
         std::atomic_ref(event->second.count).store(symbol=="SetEvent"?1U:0U,std::memory_order_release);
-        trace_event_operation(symbol=="SetEvent"?'s':'r',first,resident_context_key(state),0);
+        trace_event_operation(symbol=="SetEvent"?'s':'r',first,tid,0);
         result=1;
     }else if(symbol=="GetLastError" || symbol=="SetLastError"){
         auto* error=pointer(thread.teb+error_offset,4,symbol=="GetLastError"?1U:2U);if(!error)return false;
@@ -749,7 +1081,10 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             if(other.status==ThreadStatus::Waiting && other.wait.kind==ThreadWaitKind::Address &&
                other.wait.handles[0]==first && !other.wait.signaled)return false;
         }
-    }else if(symbol=="SwitchToThread"){
+    }else if(symbol=="SwitchToThread" || symbol=="Sleep"){
+        // Sleep(0)：有同處理器可接手的就緒執行緒才讓出，否則立即返回，與 SwitchToThread 同一判斷（Sleep 無回傳值）。
+        //《Tomb Raider》2013 工作執行緒每秒約 4 萬次 Sleep(0)，原本每次都經協調者往返。
+        if(symbol=="Sleep" && (first || !parallel_sleep_zero_enabled()))return false;
         if(active.empty() || state.processor_id>=64)return false;
         for(const auto& [id,other]:threads_.items){
             if(id==tid || other.status!=ThreadStatus::Runnable || other.suspended ||
@@ -1004,17 +1339,24 @@ else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"
             if(value==free_word){
                 if(!word.compare_exchange_strong(value,0,std::memory_order_seq_cst))return false;
                 put(recursion,1,4);put(owner,me,unit);result=1;
+            }else if(value==free_waiting && critical_retry_waits_enabled()){
+                // 不交接模式下被喚醒的等待者重新競爭：與 critical_acquire 相同保留等待者位元（計數 0），其他等待者仍由釋放者喚醒。
+                if(!word.compare_exchange_strong(value,waiter_bit,std::memory_order_seq_cst))return false;
+                put(recursion,1,4);put(owner,me,unit);result=1;
             }else if(value!=free_waiting && load(owner,unit)==me){
                 if((value&count_mask)>=count_mask-1U || depth>=count_mask)return false;
                 word.fetch_add(1,std::memory_order_seq_cst);put(recursion,depth+1U,4);result=1;
             }else if(symbol=="TryEnterCriticalSection" && value!=free_waiting)result=0;
             else{
+                // 客體常駐 Leave 可能直接釋放字組。沿單槽等待登記設等待位元，讓真正的持有者走原釋放喚醒契約。
+                if(!x86_ && use_object_wait_for_worker_retry<ResidentServiceProgress>())return false;
                 // 只有持有者正取得 worker 時，等待服務進度才可能完成；持有者尚未排程時交回共用等待流程，
                 // 不能讓等待者佔著 worker 睡到下一個排程期限，反過來阻止持有者執行 LeaveCriticalSection。
                 const auto holder_tid=load(owner,unit);
                 const auto holder=std::find_if(threads_.items.begin(),threads_.items.end(),[&](const auto& entry){return holder_tid && thread_identifier(entry.first)==holder_tid;});
-                retry=holder!=threads_.items.end() && (holder->first==threads_.current ||
-                    std::find(active.begin(),active.end(),&holder->second.context)!=active.end());
+                if(holder!=threads_.items.end() && (holder->first==threads_.current ||
+                   std::find(active.begin(),active.end(),&holder->second.context)!=active.end()))
+                    progress=ResidentServiceProgress::Retry;
                 return false;
             }
         }

@@ -4,6 +4,8 @@
 #include "guest_tls_layout.h"
 #include "guest_once_layout.h"
 #include "gdi_batch_layout.h"
+#include "d3d12_root_binding_layout.h"
+#include "d3d12_descriptor_layout.h"
 .intel_syntax noprefix
 .text
 .macro entry name
@@ -761,5 +763,187 @@ entry GdiSetBatchLimit
     ret
 1:
 slow_end GdiSetBatchLimit
+
+// D3D12 根描述元及描述元表：清單由應用程式同步錄製。在清單自己的客體緩衝內依序追加，
+// 確認有空間後才寫入，最後更新筆數。緩衝滿、停用或已關閉時，保留參數尾跳原服務。
+.macro d3d12_root_binding name, opcode
+entry \name
+    mov r10, qword ptr [rcx + X64ARM_D3D12_LIST_ROOT_BUFFER]
+    test r10, r10
+    je 1f
+    mov eax, dword ptr [r10]
+    cmp eax, X64ARM_D3D12_ROOT_BUFFER_CAPACITY
+    jae 1f
+    lea r11d, [rax + 1]
+    shl eax, X64ARM_D3D12_ROOT_BINDING_SHIFT
+    mov dword ptr [r10 + rax + X64ARM_D3D12_ROOT_BUFFER_HEADER], \opcode
+    mov dword ptr [r10 + rax + X64ARM_D3D12_ROOT_BUFFER_HEADER + 4], edx
+    mov qword ptr [r10 + rax + X64ARM_D3D12_ROOT_BUFFER_HEADER + 8], r8
+    mov dword ptr [r10], r11d
+    xor eax, eax
+    ret
+1:
+slow_end \name
+.endm
+#define D3D12_ROOT_ENTRY(method, opcode) d3d12_root_binding D3D12List##method, opcode ;
+X64ARM_D3D12_ROOT_BINDING_METHODS(D3D12_ROOT_ENTRY)
+#undef D3D12_ROOT_ENTRY
+
+// 直接繪製與根描述元共用清單緩衝。堆疊跨頁或不符合一般呼叫框架時交回宿主核對。
+.macro d3d12_draw name, opcode, indexed
+entry \name
+    mov eax, esp
+    and eax, 4095
+    cmp eax, 4096 - 48 - 8 * \indexed
+    ja 1f
+    and eax, 15
+    cmp eax, 8
+    jne 1f
+    mov r10, qword ptr [rcx + X64ARM_D3D12_LIST_ROOT_BUFFER]
+    test r10, r10
+    je 1f
+    mov eax, dword ptr [r10]
+    cmp eax, X64ARM_D3D12_ROOT_BUFFER_CAPACITY - 2
+    ja 1f
+    mov r11d, eax
+    shl r11, X64ARM_D3D12_ROOT_BINDING_SHIFT
+    add r11, r10
+    mov rax, qword ptr [rsp + 40]
+.if \indexed
+    mov rcx, qword ptr [rsp + 48]
+.endif
+    mov dword ptr [r11 + X64ARM_D3D12_ROOT_BUFFER_HEADER], \opcode
+    mov dword ptr [r11 + X64ARM_D3D12_ROOT_BUFFER_HEADER + 4], edx
+    mov dword ptr [r11 + X64ARM_D3D12_ROOT_BUFFER_HEADER + 8], r8d
+    mov dword ptr [r11 + X64ARM_D3D12_ROOT_BUFFER_HEADER + 12], r9d
+    mov dword ptr [r11 + X64ARM_D3D12_ROOT_BUFFER_HEADER + 16], eax
+.if \indexed
+    mov dword ptr [r11 + X64ARM_D3D12_ROOT_BUFFER_HEADER + 20], ecx
+.endif
+    mov eax, dword ptr [r10]
+    lea eax, [rax + 2]
+    mov dword ptr [r10], eax
+    xor eax, eax
+    ret
+1:
+slow_end \name
+.endm
+d3d12_draw D3D12ListDrawInstanced, X64ARM_D3D12_DRAW_INSTANCED, 0
+d3d12_draw D3D12ListDrawIndexedInstanced, X64ARM_D3D12_DRAW_INDEXED_INSTANCED, 1
+
+// 將檢視值在呼叫當下複製到清單。多筆、空檢視及滿緩衝仍交回完整錄製。
+.macro d3d12_input name, opcode, view, vertex
+entry \name
+.if \vertex
+    cmp r8d, 1
+    jne 1f
+.endif
+    test \view, \view
+    je 1f
+    mov r10, qword ptr [rcx + X64ARM_D3D12_LIST_ROOT_BUFFER]
+    test r10, r10
+    je 1f
+    mov eax, dword ptr [r10]
+    cmp eax, X64ARM_D3D12_ROOT_BUFFER_CAPACITY - 2
+    ja 1f
+    mov r11d, eax
+    shl r11, X64ARM_D3D12_ROOT_BINDING_SHIFT
+    add r11, r10
+    mov rax, qword ptr [\view]
+    mov rcx, qword ptr [\view + 8]
+    mov dword ptr [r11 + X64ARM_D3D12_ROOT_BUFFER_HEADER], \opcode
+.if \vertex
+    mov dword ptr [r11 + X64ARM_D3D12_ROOT_BUFFER_HEADER + 4], edx
+.endif
+    mov qword ptr [r11 + X64ARM_D3D12_ROOT_BUFFER_HEADER + 8], rax
+    mov qword ptr [r11 + X64ARM_D3D12_ROOT_BUFFER_HEADER + 16], rcx
+    mov eax, dword ptr [r10]
+    lea eax, [rax + 2]
+    mov dword ptr [r10], eax
+    xor eax, eax
+    ret
+1:
+slow_end \name
+.endm
+d3d12_input D3D12ListIASetIndexBuffer, X64ARM_D3D12_IA_INDEX_BUFFER, rdx, 0
+d3d12_input D3D12ListIASetVertexBuffers, X64ARM_D3D12_IA_VERTEX_BUFFER, r9, 1
+
+// 第二頁獨立映射。保留 Win64 呼叫框架，慢路徑仍能讀到原始參數。
+.p2align 12, 0xcc
+.macro descriptor_offset handle, low, slow
+    mov rax, \handle
+    sub rax, r11
+    cmp rax, X64ARM_D3D12_DESCRIPTOR_ARENA_HANDLES
+    jae \slow
+    test \low, X64ARM_D3D12_DESCRIPTOR_STRIDE - 1
+    jnz \slow
+    shr rax, X64ARM_D3D12_DESCRIPTOR_WORD_SHIFT
+.endm
+
+entry D3D12DeviceCreateConstantBufferView
+    test rcx, rcx
+    jz 1f
+    test rdx, rdx
+    jz 1f
+    mov r10, qword ptr [rcx + X64ARM_D3D12_DESCRIPTOR_DEVICE_ARENA]
+    test r10, r10
+    jz 1f
+    movabs r11, X64ARM_D3D12_DESCRIPTOR_ARENA_HANDLE
+    descriptor_offset r8, r8b, 1f
+    add r10, rax
+    mov rax, qword ptr [r10]
+    test rax, rax
+    jz 1f
+    mov r9d, edx
+    and r9d, 4095
+    cmp r9d, 4084
+    ja 1f
+    mov r11, qword ptr [rdx]
+    test r11, r11
+    js 1f
+    test r11b, r11b
+    jnz 1f
+    mov r9d, dword ptr [rdx + 8]
+    sub r9d, 256
+    cmp r9d, 65280
+    ja 1f
+    test r9b, r9b
+    jnz 1f
+    shr r9d, 8
+    or r11, r9
+    bts r11, 63
+    lock cmpxchg qword ptr [r10], r11
+    jne 1f
+    xor eax, eax
+    ret
+1:
+slow_end D3D12DeviceCreateConstantBufferView
+
+entry D3D12DeviceCopyDescriptorsSimple
+    test rcx, rcx
+    jz 1f
+    cmp edx, 1
+    jne 1f
+    mov r10, qword ptr [rcx + X64ARM_D3D12_DESCRIPTOR_DEVICE_ARENA]
+    test r10, r10
+    jz 1f
+    movabs r11, X64ARM_D3D12_DESCRIPTOR_ARENA_HANDLE
+    descriptor_offset r8, r8b, 1f
+    add r10, rax
+    descriptor_offset r9, r9b, 1f
+    mov r11, qword ptr [rcx + X64ARM_D3D12_DESCRIPTOR_DEVICE_ARENA]
+    mov r11, qword ptr [r11 + rax]
+    test r11, r11
+    jz 1f
+    mov rax, qword ptr [r10]
+    test rax, rax
+    jz 1f
+    lock cmpxchg qword ptr [r10], r11
+    jne 1f
+    xor eax, eax
+    ret
+1:
+slow_end D3D12DeviceCopyDescriptorsSimple
+
 .globl _guest_thread_end
 _guest_thread_end:

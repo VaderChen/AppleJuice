@@ -16,6 +16,7 @@ struct Interface {
     unsigned number{},cls{},subclass{},protocol{};
     bool claimed{}; // 已有 macOS 驅動接管（例如 HID、大量儲存）
     std::string path;  // IOService plane 路徑；其下的 HID 等服務路徑以此為前綴
+    bool operator==(const Interface&) const = default;
 };
 struct Device {
     std::uint64_t registry_id{},parent_id{}; // parent_id：上層 USB 裝置（集線器）；0 表示直接接在主控制器
@@ -24,6 +25,7 @@ struct Device {
     std::u16string product_name,vendor_name,serial;
     std::string path;
     std::vector<Interface> interfaces;
+    bool operator==(const Device&) const = default;
 };
 std::vector<Device> devices();
 // 一次非同步傳輸；完成回呼在宿主佇列更新，服務層輪詢 done 後取回結果。

@@ -53,7 +53,8 @@ inline constexpr std::uint32_t cpu_system_call_trap = 0x10000000U;
 inline constexpr std::uint32_t cpu_system_enter_trap = 0x10000001U;
 inline constexpr std::uint32_t cpu_software_interrupt_trap = 0x10000100U;
 enum class SystemCallEntry { Syscall, Sysenter, Interrupt };
-enum class ResidentServiceProgress {Completed,Retry,Coordinator};
+// CompletedResolve：服務已在 worker 完成，但釋放了有等待者的物件（號誌、手動重設事件）；worker 不等待，協調者盡快解析等待。
+enum class ResidentServiceProgress {Completed,Retry,Coordinator,CompletedResolve};
 // 含睡眠的宿主連續時鐘，毫秒自宿主開機起算；DWORD 自然回繞。
 // 核心依客體模式選擇 EAX、EDX:EAX 或 RAX，沒有參數、LastError 或共享時間頁副作用。
 enum class ResidentClockRecipe : unsigned {None=0,Milliseconds32=1,Milliseconds64=2,PerformanceCounter=3};
@@ -91,7 +92,11 @@ static_assert(sizeof(ResidentHostEnvironment)==24 && offsetof(ResidentHostEnviro
 // 成功才提交 integer、result、next、MXCSR sticky 與必要 errno。失敗必須沒有客體可見效果。
 // environment 僅借用本次呼叫；宿主 FP 一律由核心恢復。堆疊與 ABI 的檢查由服務層負責。
 // resident_scalar_recipe 的編號；核心依此選擇常駐 ARM64 配方本體。
-enum class ScalarRecipe : unsigned { None=0, ExpF=1, Log2=2, LogF=3, SinF=4, CosF=5, LRintF=6, LRint=7, LRoundF=8, LRound=9, AcosF=10, PowF=11, Hypot=12, Cos=13, Sin=14, Log=15, Exp=16, AtanF=17, Atan=18, Atan2F=19, Atan2=20, Acos=21 };
+enum class ScalarRecipe : unsigned {
+    None=0, ExpF=1, Log2=2, LogF=3, SinF=4, CosF=5, LRintF=6, LRint=7, LRoundF=8, LRound=9,
+    AcosF=10, PowF=11, Hypot=12, Cos=13, Sin=14, Log=15, Exp=16, AtanF=17, Atan=18, Atan2F=19, Atan2=20, Acos=21,
+    FloorF=22, Floor=23, CeilF=24, Ceil=25, TruncF=26, Trunc=27, RoundF=28, Round=29
+};
 // 每批原生執行借用的錯誤格位。cell 必須來自 native_pointer 的私人可寫 4-byte 範圍；
 // 非空時，客體位址與宿主指標須對應同一儲存，生命期及執行緒身分維持到批次出口。
 // 映射／執行緒變更必須沿既有世代或 concurrency_epoch 令批次退出；不支援時回傳空值。

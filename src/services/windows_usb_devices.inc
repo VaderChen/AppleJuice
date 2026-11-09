@@ -3,6 +3,11 @@
 // 已由 macOS 驅動接管的介面、集線器與複合裝置回報啟動；沒有驅動接管者為 CM_PROB_FAILED_INSTALL。
 {
     auto& config=*device_configuration_;
+    // 協調者本地 SetupDiGetClassDevs 已在鎖外預先列舉時直接取用（同一次呼叫內的拓撲），否則照常向後端查詢。
+    auto list=usb_prefetch_?std::move(*usb_prefetch_):usb_backend().devices();usb_prefetch_.reset();
+    if(!config.usb_snapshot || *config.usb_snapshot!=list){
+    // 後端每次回報目前拓撲；同一份拓撲沿用既有節點、介面路徑及開啟目標。
+    config.usb_snapshot.reset();
     const auto hex=[](unsigned value,unsigned digits){constexpr char16_t table[]=u"0123456789ABCDEF";std::u16string out(digits,u'0');for(unsigned i=0;i<digits;++i)out[digits-1-i]=table[(value>>(4*i))&15U];return out;};
     struct UsbClass {std::u16string_view name,guid,service,description;};
     const auto classify=[](unsigned cls)->UsbClass{
@@ -39,7 +44,7 @@
     };
     for(auto& [key,handle]:config.usb_nodes){(void)key;if(const auto found=config.nodes.find(handle);found!=config.nodes.end()){found->second.present=false;found->second.status=0x0401U;found->second.problem=45;}}
     for(auto& [key,handle]:config.usb_interfaces){(void)key;if(const auto found=config.nodes.find(handle);found!=config.nodes.end()){found->second.present=false;found->second.status=0x0401U;found->second.problem=45;}}
-    const auto list=usb_backend().devices();std::set<std::u16string> used;config.usb_paths.clear();config.usb_targets.clear();
+    std::set<std::u16string> used;config.usb_paths.clear();config.usb_targets.clear();
     // 裝置介面路徑：\\?\ + 實例 ID（\ 換成 #）+ #{介面類別 GUID}，與 Windows 相同採小寫。
     constexpr std::u16string_view usb_device_interface=u"{a5dcbf10-6530-11d2-901f-00c04fb951ed}",usb_hub_interface=u"{f18a0e88-c30c-11d0-8815-00a0c906bed8}",
         winusb_interface=u"{dee824ef-729b-4a0e-9c14-b7117d33a817}";
@@ -97,5 +102,7 @@
             config.nodes.insert_or_assign(child,std::move(function_node));
             config.usb_paths.emplace_back(item.path,child);
         }
+    }
+    config.usb_snapshot=std::move(list);
     }
 }

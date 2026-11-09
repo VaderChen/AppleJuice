@@ -5,6 +5,7 @@
 #include "x64arm/windows_window_state.hpp"
 #include "x64arm/windows_gui_abi.hpp"
 #include "x64arm/windows_icon.hpp"
+#include "x64arm/windows_raw_input.hpp"
 #include "x64arm/unicode.hpp"
 #include "monotonic_clock.hpp"
 #include <algorithm>
@@ -15,6 +16,14 @@
 
 namespace x64arm {
 namespace {
+std::uint64_t automation_raw_device(const RawInputState& state,bool keyboard){
+    // 視窗自動化模擬已列舉的系統鍵鼠；SendInput 仍由它自己的服務決定封包來源。
+    static const auto keyboard_id=input::keyboard().instance;
+    static const auto mouse_id=input::mouse().instance;
+    const auto found=state.identities.find(keyboard?keyboard_id:mouse_id);
+    return found==state.identities.end()?0:found->second;
+}
+
 // 僅在診斷模式量測各段，保留共用 GUI pump 的既有順序及等待契約。
 class GuiPumpTrace {
     using Clock=std::chrono::steady_clock;
@@ -385,23 +394,29 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
             if(physical_mouse || msg.message==0x10004){key(1,msg.wparam&1);key(2,msg.wparam&2);key(4,msg.wparam&16);key(5,msg.wparam&32);key(6,msg.wparam&64);}
         }
         // 實體按鍵的 Raw Input 來自宿主鍵盤狀態輪詢；注入（自動化）按鍵沒有實體狀態，比照 SendInput 在此產生。
-        if(physical_key && msg.injected)raw_input_keyboard(msg,static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0);
+        struct RawInjecting {bool& flag;bool previous;~RawInjecting(){flag=previous;}} raw_injecting{raw_input_injecting_,std::exchange(raw_input_injecting_,msg.injected)};
+        if(physical_key && msg.injected && raw_input_)
+            raw_input_keyboard(msg,static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0,automation_raw_device(*raw_input_,true));
         // 注入的滾輪同樣產生 Raw Input（RI_MOUSE_WHEEL／RI_MOUSE_HWHEEL，usButtonData 為滾動量）。
-        if((msg.message==0x20a || msg.message==0x20e) && msg.injected)
-            raw_input_mouse(0,0,0,msg.message==0x20a?0x400U:0x800U,static_cast<std::uint16_t>(msg.wparam>>16),static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0);
+        if((msg.message==0x20a || msg.message==0x20e) && msg.injected && raw_input_)
+            raw_input_mouse(0,0,0,msg.message==0x20a?0x400U:0x800U,static_cast<std::uint16_t>(msg.wparam>>16),
+                            static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0,automation_raw_device(*raw_input_,false));
         // 注入的滑鼠移動：以 Raw Input 相對位移送出（依 Raw Input 自繪游標的程式只看相對位移）。
         // 起點取視窗中央（游標置中的程式常見初始位置），之後以上一次注入位置為基準。
         if(msg.message==0x200 && msg.injected){
             const auto x=static_cast<std::int32_t>(static_cast<std::int16_t>(msg.lparam&0xffffU)),y=static_cast<std::int32_t>(static_cast<std::int16_t>((msg.lparam>>16)&0xffffU));
             if(!automation_mouse_){const auto found=gui_.windows.find(msg.window);
                 automation_mouse_=found!=gui_.windows.end()?std::pair{static_cast<std::int32_t>(found->second.width/2),static_cast<std::int32_t>(found->second.height/2)}:std::pair{x,y};}
-            raw_input_mouse(0,x-automation_mouse_->first,y-automation_mouse_->second,0,0,static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0);
+            if(raw_input_)
+                raw_input_mouse(0,x-automation_mouse_->first,y-automation_mouse_->second,0,0,
+                                static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0,automation_raw_device(*raw_input_,false));
             automation_mouse_=std::pair{x,y};
         }
         // 注入的滑鼠按鍵：RI_MOUSE_{LEFT,RIGHT,MIDDLE}_BUTTON_{DOWN,UP}。
-        if(msg.message>=0x201 && msg.message<=0x209 && msg.injected){
+        if(msg.message>=0x201 && msg.message<=0x209 && msg.injected && raw_input_){
             static constexpr std::uint16_t flags[]={0x1,0x2,0x1,0x4,0x8,0x4,0x10,0x20,0x10}; // DOWN、UP、DBLCLK（視同 DOWN）
-            raw_input_mouse(0,0,0,flags[msg.message-0x201],0,static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0);
+            raw_input_mouse(0,0,0,flags[msg.message-0x201],0,
+                            static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0,automation_raw_device(*raw_input_,false));
         }
         if((msg.message==0x100 || msg.message==0x101 || msg.message==0x104 || msg.message==0x105) && match_gui_hotkey(msg))continue;
         if((physical_key && !raw_legacy_enabled(true)) || (physical_mouse && !raw_legacy_enabled(false)))continue;
@@ -812,6 +827,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                 if (!gui_.windows.empty()) report_child_input_idle();
                 // 剛抽過宿主事件（pump_gui 未延後原生輪詢）仍沒有符合的訊息：期限內 worker 可在訊息來源全空時直接回 FALSE。
                 if (peek) {gui_peek_idle_until_=detail::monotonic_ticks()+10000;break;}
+                // 協調者本地的 GetMessage 不能阻塞：尚未取走任何訊息，交回完整路徑登記 GUI 等待。
+                if(local_plain_service_)throw LocalServiceRefused{};
                 ThreadWait wait;wait.gui_window=arg(1);wait.gui_min=dword(2);wait.gui_max=dword(3);
                 wait_gui_input(state,memory,std::move(wait));return std::nullopt;
             }

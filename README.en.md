@@ -118,7 +118,7 @@ AppleJuice is under active development. Complete Windows support, all applicatio
 
 The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required build scripts, `third_party/`, `x64kernel/` and user documentation.
 
-## Tested applications / 2026-11-07 / 18 games
+## Tested applications / 2026-11-09 / 19 games
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="Does not work yet; being worked on" title="Does not work yet; being worked on"> Does not work yet; being worked on · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="Launches to the main screen" title="Launches to the main screen"> Launches to the main screen · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Works, with limited performance" title="Works, with limited performance"> Works, with limited performance · <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> Works well
 
@@ -135,6 +135,7 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 | FINAL FANTASY IX | x64 | D3D9 (Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Phoenix Wright: Ace Attorney Trilogy | x86 | D3D11 (Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Sakuna: Of Rice and Ruin | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
+| Tomb Raider (2013) | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="Works well" title="Works well"> |
 | Cyberpunk 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | It Takes Two | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |
 | Romance of the Three Kingdoms X with Power Up Kit | x86 | Unknown | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Works, with limited performance" title="Works, with limited performance"> |

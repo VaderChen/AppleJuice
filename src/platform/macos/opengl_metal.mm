@@ -14,9 +14,12 @@
 #include "x64arm/bounded_cache.hpp"
 #include <IOKit/IOKitLib.h>
 #include "x64arm/graphics_index_range.hpp"
+#include "x64arm/shared_wake.hpp"
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #include "../../services/graphics_view_flags.hpp"
+#include "../../services/shader_memory_cache.hpp"
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CATransaction.h>
 #include <algorithm>
@@ -181,10 +184,12 @@ class MetalGl final:public NativeOpenGlContext {
     // 鍵為數百位元組的二進位欄位串接；有序 map 每次查找要做十幾次長字串比較，改為雜湊。
     std::unordered_map<std::string,id<MTLRenderPipelineState>> graphics_pipelines_;
     std::unordered_map<MetalFastPipelineKey,MetalFastPipeline,MetalFastPipelineHash> fast_pipelines_;
+    std::deque<std::string> graphics_pipeline_order_;
+    std::deque<MetalFastPipelineKey> fast_pipeline_order_;
     std::unordered_map<std::uint64_t,MetalPipelineInputs> pipeline_inputs_;
     const MetalPipelineInputs* pipeline_inputs(const GraphicsDraw&);
     std::shared_ptr<MetalBufferPool> discard_pool_{std::make_shared<MetalBufferPool>()};
-    std::shared_ptr<MetalBufferPool> geometry_private_pool_{std::make_shared<MetalBufferPool>()},geometry_shared_pool_{std::make_shared<MetalBufferPool>()};std::uint64_t discard_in_place_{};
+    std::shared_ptr<MetalBufferPool> geometry_private_pool_{std::make_shared<MetalBufferPool>(std::size_t{256}<<20)},geometry_shared_pool_{std::make_shared<MetalBufferPool>(std::size_t{256}<<20)};std::uint64_t discard_in_place_{};
     MetalTimestampPool timestamp_pool_;
     // UAV 清除的來源緩衝（見 metal_unordered_clear.inc）。
     struct ClearSource {std::array<std::uint8_t,16> pattern{};unsigned size{};id<MTLBuffer> buffer;std::uint64_t used{};};
@@ -200,11 +205,17 @@ class MetalGl final:public NativeOpenGlContext {
     std::map<std::string,id<MTLComputePipelineState>> stream_copy_pipelines_;
     std::uint64_t stream_gpu_draws_{},stream_gpu_bytes_{};
     std::map<std::string,std::shared_ptr<MetalTessellationPipeline>> tessellation_pipelines_;
+    std::map<std::string,std::string> tessellation_failures_;
+    // MetalFX 時間性升頻器：每個呼叫端歷史編號一個，格式或尺寸改變時重建（歷史隨之清空）。
+    struct TemporalScaler {std::string key;id scaler;std::array<id<MTLTexture>,4> staging{};};
+    std::map<std::uint64_t,TemporalScaler> temporal_scalers_;
     std::atomic<std::uint64_t> shader_serial_{}; // 背景編譯與協調者都會配發
     // 背景著色器編譯（X64ARM_SHADER_ASYNC）：序列佇列逐一轉譯與編譯後放進下方快取；工作表以票號（內容雜湊）登記進行中的工作，
     // 失敗的內容改由同步路徑重做以回報原錯誤。shader_compile_mutex_ 序列化所有轉譯（HLSLcc／SPIR-V），快取命中不取。
     std::recursive_mutex shader_compile_mutex_;
-    std::mutex shader_jobs_mutex_;std::unordered_set<std::uint64_t> shader_jobs_,shader_failed_;
+    std::mutex shader_jobs_mutex_;
+    std::unordered_map<std::uint64_t,std::shared_ptr<SharedWake>> shader_jobs_;
+    std::unordered_set<std::uint64_t> shader_failed_;
     dispatch_queue_t shader_queue_{};
     // 著色器依內容共用（D3D9 legacy、D3D10／11 HLSLcc、D3D12 DXIL 同一入口）：命中時回傳同一物件，轉譯與 Metal 編譯
     // 只做一次，render pipeline 快取（以 serial 為鍵）也能跨 PSO 重用。之後會修改物件的呼叫端改用 graphics_shader_private。
@@ -666,7 +677,7 @@ public:
     bool graphics_samples_supported(std::uint32_t,std::uint32_t)override;
     bool graphics_vertex_format_supported(std::uint32_t)override;
     std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t,std::span<const std::uint8_t>)override;
-    std::uint64_t graphics_shader_prefetch(std::uint32_t,std::span<const std::uint8_t>)override;
+    std::uint64_t graphics_shader_prefetch(std::uint32_t,std::span<const std::uint8_t>,const std::shared_ptr<SharedWake>&)override;
     bool graphics_shader_ticket_ready(std::uint64_t)override;
     std::shared_ptr<GraphicsShader> graphics_shader_private(std::uint32_t,std::span<const std::uint8_t>)override;
     std::shared_ptr<GraphicsShader> graphics_compute_source(const GraphicsModernShader&)override;
@@ -689,6 +700,9 @@ public:
     void graphics_copy(const GraphicsView&,const GraphicsView&,std::array<std::uint32_t,3>,std::array<std::uint32_t,6>)override;
     bool graphics_copy_buffer_texture(const GraphicsView&,const GraphicsView&,std::uint64_t,std::uint32_t,std::uint32_t,std::array<std::uint32_t,6>,bool)override;
     void graphics_resolve(const GraphicsView&,const GraphicsView&,std::uint32_t)override;
+    bool graphics_temporal_upscale_supported()override;
+    void graphics_temporal_upscale(const GraphicsTemporalUpscale&)override;
+    void graphics_temporal_upscale_release(std::uint64_t)override;
     void graphics_clear(const GraphicsView&,std::array<float,4>,std::uint32_t)override;
     bool graphics_clear_unordered(const GraphicsView&,std::array<std::uint32_t,4>,bool)override;
     void graphics_draw(const GraphicsDraw&)override;
@@ -706,6 +720,9 @@ public:
     void graphics_capture_present(const GraphicsView&);
     void graphics_export_frame(const GraphicsView&,void*,std::size_t,std::uint32_t,std::shared_ptr<void>)override;
     void graphics_flush(bool wait)override{flush(wait);}
+    // D3D12 UAV barrier：開著的 render encoder 有像素 UAV 時結束，讓 barrier 之後的 draw 在新 pass 看見寫入（同 pass 內 draw 間不保證順序）。
+    // 運算 encoder 預設依序派送，不需處理。
+    void graphics_uav_barrier()override{if(open_render_ && !open_render_uavs_.empty())end_open_render("uav_barrier");}
     // 有待提交工作就提交；回傳最新 flight 的完成旗標（同一 queue 依序完成，涵蓋先前所有提交）。
     // 不為 fence 建立空命令緩衝：那會占用 flight 名額，上限一到 flush 就同步等待，與原本等 GPU 閒置無異。
     // 查詢 End 不再逐次 commit：回傳目前 command buffer 的完成旗標，等 Present／GetData 或 flight 額度才提交。
@@ -737,6 +754,7 @@ public:
     bool graphics_stream_output(const GraphicsDraw&,const MetalShader&,id<MTLBuffer>,unsigned,unsigned,unsigned);
     std::shared_ptr<GraphicsShader> graphics_translate_shader(std::uint32_t,std::span<const std::uint8_t>,GLSLCrossDependencyData*);
     MetalTessellationDraw graphics_tessellation(const GraphicsDraw&,const std::string&);
+    std::shared_ptr<MetalPooledBuffer> graphics_scratch_buffer(std::uint64_t bytes,bool shared);
     std::uint64_t execute(GlOperation op,std::span<const std::uint64_t> a,std::span<const std::uint8_t> data,std::span<std::uint8_t> output)override;
 };
 #include "metal_gl_vertex_buffers.inc"
@@ -745,6 +763,7 @@ public:
 #include "metal_gl_stencil.inc"
 #include "metal_geometry.inc"
 #include "metal_loop_compaction.inc"
+#include "metal_shader_cache.inc"
 #include "metal_programmable.inc"
 #include "metal_timestamp.inc"
 #include "metal_graphics_capture.inc"

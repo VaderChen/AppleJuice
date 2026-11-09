@@ -197,3 +197,84 @@ string(REPLACE "${TESS_OLD}" "${TESS_NEW}" TESS_PATCHED "${TESS_TEXT}")
 if(NOT TESS_TEXT STREQUAL TESS_PATCHED)
   file(WRITE "${TESS_DECL}" "${TESS_PATCHED}")
 endif()
+
+# 域著色器讀的控制點結構與外殼著色器相同：單一分量的成員宣告成純量，存取時不能再加 swizzle。
+file(READ "${TESS_DECL}" TESS_TEXT)
+set(TESS_OLD [=[            // ...or control points
+            if ((psOperand->eType == OPERAND_TYPE_INPUT_CONTROL_POINT) && psContext->psShader->eShaderType == HULL_SHADER)]=])
+set(TESS_NEW [=[            // 域著色器的控制點同樣要記下純量，宣告流程照舊。
+            if ((psOperand->eType == OPERAND_TYPE_INPUT_CONTROL_POINT) && psContext->psShader->eShaderType == DOMAIN_SHADER && psOperand->GetNumInputElements(psContext) == 1)
+                psShader->abScalarInput[psOperand->GetRegisterSpace(psContext)][psOperand->ui32RegisterNumber] |= psOperand->GetAccessMask();
+            // ...or control points
+            if ((psOperand->eType == OPERAND_TYPE_INPUT_CONTROL_POINT) && psContext->psShader->eShaderType == HULL_SHADER)]=])
+if(NOT TESS_TEXT MATCHES "域著色器的控制點同樣要記下純量")
+  string(REPLACE "${TESS_OLD}" "${TESS_NEW}" TESS_PATCHED "${TESS_TEXT}")
+  if(TESS_TEXT STREQUAL TESS_PATCHED)
+    message(FATAL_ERROR "找不到 Metal 控制點宣告區段")
+  endif()
+  file(WRITE "${TESS_DECL}" "${TESS_PATCHED}")
+endif()
+# DS 的 stage_in 同時含控制點與 patch 常數，attribute 編號要互不重複。編號依名稱共用配置，
+# patch 常數若和控制點同名（例如都有 TEXCOORD3）就拿到同一個編號；patch 常數改用獨立的名稱空間配置。
+x64arm_hlslcc_patch(toMetalDeclaration.cpp
+  [=[                out += "In";
+
+                std::ostringstream oss;
+                oss << type << " " << name;
+
+                // VERTEX_SHADER hardcoded on purpose
+                bool keepLocation = ((psContext->flags & HLSLCC_FLAG_KEEP_VARYING_LOCATIONS) != 0);
+                uint32_t loc = psContext->psDependencies->GetVaryingLocation(name, VERTEX_SHADER, true, keepLocation, psContext->psShader->maxSemanticIndex);]=]
+  [=[                out += "In";
+
+                std::ostringstream oss;
+                oss << type << " " << name;
+
+                // VERTEX_SHADER hardcoded on purpose
+                bool keepLocation = ((psContext->flags & HLSLCC_FLAG_KEEP_VARYING_LOCATIONS) != 0);
+                const std::string x64arm_location_key = out.rfind("Mtl_PatchConstant", 0) == 0 ? "x64arm_patch_" + name : name;
+                uint32_t loc = psContext->psDependencies->GetVaryingLocation(x64arm_location_key, VERTEX_SHADER, true, keepLocation, psContext->psShader->maxSemanticIndex);]=])
+
+# PCSG 的 D3D_NAME 與指令 token 的 D3D_SB_NAME 編號不同。讀取細分係數要依簽章的語意索引，
+# 與 HS 寫入同一個係數，並保留係數陣列的相對索引。
+x64arm_hlslcc_patch(toMetalOperand.cpp
+  [=[#include <cmath>
+#include <sstream>]=]
+  [=[#include <cctype>
+#include <cmath>
+#include <sstream>
+#include <stdexcept>]=])
+x64arm_hlslcc_patch(toMetalOperand.cpp
+  [=[            const ShaderInfo::InOutSignature* psIn;
+            psContext->psShader->sInfo.GetPatchConstantSignatureFromRegister(psOperand->ui32RegisterNumber, psOperand->GetAccessMask(), &psIn);
+            *piRebase = psIn->iRebase;
+            switch (psIn->eSystemValueType)]=]
+  [=[            const ShaderInfo::InOutSignature* psIn = nullptr;
+            psContext->psShader->sInfo.GetPatchConstantSignatureFromRegister(psOperand->ui32RegisterNumber, psOperand->GetAccessMask(), &psIn);
+            if (!psIn) throw std::runtime_error("Metal missing patch constant signature");
+            *piRebase = psIn->iRebase;
+            const auto domain = psContext->psShader->sInfo.eTessDomain;
+            if (psContext->psShader->eShaderType == DOMAIN_SHADER &&
+                (domain == TESSELLATOR_DOMAIN_TRI || domain == TESSELLATOR_DOMAIN_QUAD) &&
+                psIn->eSystemValueType >= NAME_FINAL_QUAD_U_EQ_0_EDGE_TESSFACTOR &&
+                psIn->eSystemValueType <= NAME_FINAL_LINE_DENSITY_TESSFACTOR)
+            {
+                std::string semantic = psIn->semanticName;
+                for (auto& ch : semantic)
+                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                if (semantic == "sv_tessfactor" || semantic == "sv_insidetessfactor")
+                {
+                    const bool edge = semantic == "sv_tessfactor";
+                    oss << (edge ? "tessFactor.edgeTessellationFactor" : "tessFactor.insideTessellationFactor");
+                    if (edge || domain == TESSELLATOR_DOMAIN_QUAD)
+                    {
+                        oss << "[" << psIn->ui32SemanticIndex;
+                        if (psOperand->m_SubOperands[0])
+                            oss << " + " << TranslateOperand(psOperand->m_SubOperands[0].get(), TO_FLAG_INTEGER);
+                        oss << "]";
+                    }
+                    *pui32IgnoreSwizzle = 1;
+                    break;
+                }
+            }
+            switch (psIn->eSystemValueType)]=])

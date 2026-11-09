@@ -2,6 +2,7 @@
 // 自動化測試用的虛擬 XInput 控制器：X64ARM_AUTOMATION_GAMEPAD=<狀態檔> 時，在原生輸入後端的手把清單後加入一個標準控制器。
 // 狀態檔存在即視為已連接，內容為以空白分隔的 key=value：buttons（XInput 按鍵位元，0x1000 為 A）、
 // lx／ly／rx／ry（搖桿 -1～1）、lt／rt（扳機 0～1）；刪除檔案即拔除。只在測試啟用，其餘方法全部轉交原生後端。
+// X64ARM_AUTOMATION_GAMEPAD_ONLY=1 時只向該程序的 XInput 回報虛擬控制器，供重現第一個手把插槽。
 #include "x64arm/input.hpp"
 #include <chrono>
 #include <cstdlib>
@@ -10,12 +11,14 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 
 namespace x64arm::detail {
 class AutomationGamepadBackend final : public input::Backend {
     std::shared_ptr<input::Backend> inner_;
     std::string path_;
+    bool exclusive_;
     std::mutex mutex_;
     std::chrono::steady_clock::time_point checked_{};
     struct timespec modified_{};bool present_{};
@@ -41,13 +44,15 @@ class AutomationGamepadBackend final : public input::Backend {
         pad_=pad;
     }
 public:
-    AutomationGamepadBackend(std::shared_ptr<input::Backend> inner,std::string path):inner_(std::move(inner)),path_(std::move(path)){}
+    AutomationGamepadBackend(std::shared_ptr<input::Backend> inner,std::string path,bool exclusive)
+        :inner_(std::move(inner)),path_(std::move(path)),exclusive_(exclusive){}
     std::vector<input::Device> devices()override{return inner_->devices();}
     std::uint64_t device_generation()override{return inner_->device_generation();}
     std::vector<input::Event> poll()override{return inner_->poll();}
     std::vector<input::Report> reports()override{return inner_->reports();}
     std::vector<input::Gamepad> gamepads()override{
-        auto pads=inner_->gamepads();std::lock_guard lock(mutex_);refresh();if(present_)pads.push_back(pad_);return pads;
+        auto pads=exclusive_?std::vector<input::Gamepad>{}:inner_->gamepads();
+        std::lock_guard lock(mutex_);refresh();if(present_)pads.push_back(pad_);return pads;
     }
     std::uint32_t rumble(const input::Guid& device,std::uint16_t left,std::uint16_t right)override{return device==guid()?0:inner_->rumble(device,left,right);}
     std::vector<input::PointerDevice> pointer_devices()override{return inner_->pointer_devices();}
@@ -72,7 +77,10 @@ public:
 // 原生輸入後端；設定自動化手把狀態檔時再包一層虛擬控制器。
 inline std::shared_ptr<input::Backend> make_input_backend(){
     auto backend=input::make_backend();
-    if(const auto* path=std::getenv("X64ARM_AUTOMATION_GAMEPAD");path && *path)return std::make_shared<AutomationGamepadBackend>(std::move(backend),path);
+    if(const auto* path=std::getenv("X64ARM_AUTOMATION_GAMEPAD");path && *path){
+        const auto* mode=std::getenv("X64ARM_AUTOMATION_GAMEPAD_ONLY");
+        return std::make_shared<AutomationGamepadBackend>(std::move(backend),path,mode && std::string_view(mode)=="1");
+    }
     return backend;
 }
 }

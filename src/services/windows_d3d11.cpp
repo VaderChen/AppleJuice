@@ -143,6 +143,7 @@ struct Identity {
 
     Kind kind{};
     bool api10{},predicate_value{},weak_bindings{};
+    std::uint64_t pipeline_state_serial{};
     std::shared_ptr<fx10::Program> effect;
     std::shared_ptr<fx10::Type> effect_type;
     const fx10::Annotation* effect_annotation{};
@@ -366,8 +367,11 @@ struct D3D11State {
     std::uint64_t hardware_sessions{}, decoded_frames{};
     std::string last_error;
     std::uint64_t graphics_draws{},graphics_dispatches{},graphics_frames{};
+    // IDXGIOutput::TakeOwnership 的持有裝置（單一公開輸出）；ReleaseOwnership 或裝置釋放前保留。
+    std::uint64_t output_owner{};bool output_owner_exclusive{};
     std::uint64_t linkage_draws{},linkage_cache_hits{},linkage_uploads{},linkage_readback_bytes{};
     std::uint64_t destroyed_objects{},draw_cache_full{},draw_cache_incremental{};
+    std::array<std::uint64_t,6> unmap_calls{},unmap_bytes{}; // 依 Map 類型累計上傳次數與位元組（診斷 X64ARM_TRACE_GRAPHICS_STATS）。
     // 診斷：狀態設定前置快路徑完成與交回完整路徑的次數（見 d3d11_setter_front_path.inc）。
     std::uint64_t setter_front_hits{},setter_front_fallbacks{};
     std::uint64_t draw_front_hits{},draw_front_fallbacks{};
@@ -602,6 +606,9 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     }
     // 交換鏈的全螢幕狀態查詢（UE 每幀一次）只讀狀態；要取回輸出時會持有物件參照，交完整路徑。
     if(symbol=="GetFullscreenState")return found->second.kind==Kind::SwapChain && !arg(2);
+    // DXGI 工廠的 IsCurrent 只核對物件後回 TRUE（介面卡集合不會變動），不改狀態、不持參照；D3D12 遊戲主迴圈每幀一次，
+    // 原本每次全停（《古墓奇兵：暗影》中畫質 4 vCPU 每次約 52～87 µs）。
+    if(symbol=="FactoryIsCurrent")return found->second.kind==Kind::Factory;
     // 只限裝置、裝置內容、資源與 view、著色器、佈局、狀態物件、查詢與 class linkage；交換鏈、工廠、輸出、
     // DXGI 裝置、多執行緒鎖、反射、命令列表與 D3D10 物件仍走完整服務。
     switch(found->second.kind){
@@ -744,6 +751,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         else if(!adjust_references(memory,*id,false))throw HostCallFault("D3D11 COM 物件引用計數已為零");
         if(id->internal_references || reference_count(memory,*id))return;
         ++bridge.destroyed_objects;
+        if(d3d11_stream_ && !id->persistent_maps.empty()){const std::lock_guard lock(d3d11_stream_->front_dropped_mutex);d3d11_stream_->front_dropped.push_back(address);d3d11_stream_->front_epoch.fetch_add(1,std::memory_order_release);}
         // 位址可能被新物件重用，命令串流不得再認得這個內容（協調者本地路徑的銷毀不經全停）。
         if(id->kind==Kind::Context && d3d11_stream_)d3d11_stream_->context.store(0,std::memory_order_relaxed);
         // 位址也可能變成別的緩衝：可排入更新的緩衝要重新核對。
@@ -868,6 +876,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
     };
     const auto create=[&](Kind kind,std::uint64_t device=0,bool api10=false) {
         auto id=std::make_shared<Identity>();id->kind=kind;id->api10=api10 || (device && kind!=Kind::Context && object(device).identity->api10);id->root=interface(id,kind);
+        if(!id->api10 && (kind==Kind::Layout || kind==Kind::Blend)){
+            static std::atomic<std::uint64_t> serials{};
+            id->pipeline_state_serial=serials.fetch_add(1,std::memory_order_relaxed)+1;
+        }
         try {if(device)hold(device);}catch(...) {release(id->root);throw;}
         id->device=device;
         try{if(device)id->native=object(device).identity->native;
@@ -881,6 +893,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         return id;
     };
     std::uint64_t result=0;
+    // 成功進入獨占全螢幕的視窗：Windows 的獨占全螢幕視窗必為前景，方法完成後尚未啟用時補上啟用通知。
+    std::uint64_t fullscreen_activation=0;
 #include "d3d11_graphics_void.inc"
     try {
         if(d3d11_front_exception){const auto error=std::exchange(d3d11_front_exception,nullptr);std::rethrow_exception(error);}
@@ -1161,17 +1175,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
             (void)typed(arg(0),Kind::Adapter);
             if(!arg(1))result=invalid;
             else {
-                const bool extended=symbol=="AdapterGetDesc2" || symbol=="AdapterGetDesc3";
-                const std::size_t size=extended?(x86_?304U:320U):symbol=="AdapterGetDesc1"?(x86_?296U:312U):(x86_?292U:304U);
-                std::vector<std::uint8_t> desc(size);const auto name=utf16_bytes(display_identity::adapter_name);std::copy(name.begin(),name.end(),desc.begin());
-                // SIZE_T 依客體架構排列；UMA 沒有獨立顯存。搶占粒度為提交的 DMA buffer 邊界。
-                const auto shared=gpu_memory_stats().limit;
-                put_word(desc,x86_?280:288,static_cast<std::uint32_t>(x86_?std::min<std::uint64_t>(shared,UINT32_MAX):shared));
-                if(!x86_)put_word(desc,292,static_cast<std::uint32_t>(shared>>32));
-                put_word(desc,256,display_identity::vendor_id);
-                put_word(desc,x86_?284:296,static_cast<std::uint32_t>(display_identity::adapter_luid));
-                put_word(desc,x86_?288:300,static_cast<std::uint32_t>(display_identity::adapter_luid>>32));
-                memory.write(GuestAddress{arg(1)},desc);
+                const auto desc=display_identity::adapter_description(x86_,gpu_memory_stats().limit);
+                memory.write(GuestAddress{arg(1)},std::span(desc).first(display_identity::adapter_description_size(symbol,x86_)));
             }
         } else if(symbol=="QueryVideoMemoryInfo" || symbol=="SetVideoMemoryReservation") {
             (void)typed(arg(0),Kind::Adapter);
@@ -1415,6 +1420,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         }
     }
     if(finish_adapter && !(result&0x80000000U))finish_adapter();
+    if(fullscreen_activation && !(result&0x80000000U) && gui_.active!=fullscreen_activation){
+        // 與 SetForegroundWindow 相同的啟用流程（WM_NCACTIVATE／WM_ACTIVATE 回呼）；只限位於輸入桌面的頂層視窗。
+        // 呼叫者通常是渲染執行緒而非視窗執行緒，不套用 SetActiveWindow 的同輸入佇列限制。
+        const auto window=gui_.windows.find(fullscreen_activation);
+        if(window!=gui_.windows.end() && !window->second.parent && window->second.desktop_object==gui_.input_desktop){
+            auto callbacks=activate_gui_window(fullscreen_activation);
+            if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,result);return std::nullopt;}
+        }
+    }
     original_arg.return_to(state,result);return std::nullopt;
 }
 }

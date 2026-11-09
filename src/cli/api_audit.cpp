@@ -32,7 +32,7 @@ void audit_pe(const std::filesystem::path& path, std::ostream& output) {
     const auto& bytes=*source;
     const auto parsed=inspect_pe_image(bytes);
     std::string loader_error;
-    try { (void)parse_pe_image(bytes,{},parsed.dll); }
+    try { (void)parse_pe_image(bytes,{},parsed.dll,GuestMemory::maximum_capacity); }
     catch(const std::invalid_argument& error) { loader_error=error.what(); }
     const WindowsServices services;
     // 先完成解析才輸出，避免格式錯誤留下半份 JSON。

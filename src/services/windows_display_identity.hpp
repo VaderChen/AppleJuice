@@ -3,14 +3,16 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
 namespace x64arm::display_identity {
-// 相容層的 ROOT 裝置，不宣稱宿主有 PCI Windows 驅動。User32、SetupAPI、CM 與 DXGI 共用此身分。
-inline constexpr std::u16string_view instance=u"ROOT\\X64ARM_DISPLAY\\0000";
+// 顯示配接器列在 PCI 列舉器下：程式常以 SetupDiGetClassDevs(…, L"PCI", …) 找顯示卡，再以 DXGI 描述比對硬體 ID。
+// 廠商碼就是 DXGI 回報的 Apple，不冒充其他廠商。User32、SetupAPI、CM 與 DXGI 共用此身分。
+inline constexpr std::u16string_view instance=u"PCI\\VEN_106B&DEV_0000&SUBSYS_00000000&REV_00\\0&0&0000";
 // 顯示配接器的裝置介面路徑；devnode 與 EnumDisplayDevices 的 EDD_GET_DEVICE_INTERFACE_NAME 共用。
-inline constexpr std::u16string_view adapter_interface_path=u"\\\\?\\ROOT#X64ARM_DISPLAY#0000#{1ca05180-a699-450a-9a0c-de4fbe3ddd89}";
+inline constexpr std::u16string_view adapter_interface_path=u"\\\\?\\PCI#VEN_106B&DEV_0000&SUBSYS_00000000&REV_00#0&0&0000#{1ca05180-a699-450a-9a0c-de4fbe3ddd89}";
 inline constexpr std::u16string_view class_name=u"{4d36e968-e325-11ce-bfc1-08002be10318}";
 inline constexpr std::array<std::uint8_t,16> class_guid{0x68,0xe9,0x36,0x4d,0x25,0xe3,0xce,0x11,0xbf,0xc1,0x08,0x00,0x2b,0xe1,0x03,0x18};
 inline constexpr std::u16string_view provider=u"x64arm Metal";
@@ -22,8 +24,42 @@ inline constexpr std::uint64_t version_number=UINT64_C(1)<<32;
 // DXGI、DXCore 與 D3D12 使用相同的虛擬配接器 LUID。
 inline constexpr std::uint64_t adapter_luid=0x78363461;
 inline constexpr std::uint32_t vendor_id=0x106b;
+// DXGI_ADAPTER_DESC 的 DeviceId、SubSysId、Revision 均為 0（配接器描述零初始化）。
+// 程式常以描述組成 PnP 硬體 ID，再經 SetupAPI 找到裝置節點與驅動鍵，因此第一個硬體 ID 與執行個體前綴依相同數值組成。
+inline constexpr std::u16string_view adapter_hardware_id=u"PCI\\VEN_106B&DEV_0000&SUBSYS_00000000&REV_00";
 inline constexpr std::u16string_view adapter_name=u"Apple Metal / VideoToolbox 共用圖形裝置";
 inline constexpr std::string_view adapter_name_utf8="Apple Metal / VideoToolbox 共用圖形裝置";
+
+inline bool parallel_graphics_descriptions() noexcept {
+    static const bool enabled=[] {
+        const auto* value=std::getenv("X64ARM_PARALLEL_GRAPHICS_DESCRIPTIONS");
+        return !value || std::string_view(value)!="0";
+    }();
+    return enabled;
+}
+inline constexpr std::size_t adapter_description_size(std::string_view symbol,bool x86) noexcept {
+    if(symbol=="AdapterGetDesc")return x86?292U:304U;
+    if(symbol=="AdapterGetDesc1")return x86?296U:312U;
+    if(symbol=="AdapterGetDesc2" || symbol=="AdapterGetDesc3")return x86?304U:320U;
+    return 0;
+}
+inline constexpr std::array<std::uint8_t,320> adapter_description(bool x86,std::uint64_t shared_memory) noexcept {
+    std::array<std::uint8_t,320> result{};
+    for(std::size_t i=0;i<adapter_name.size();++i){
+        result[i*2]=static_cast<std::uint8_t>(adapter_name[i]);
+        result[i*2+1]=static_cast<std::uint8_t>(adapter_name[i]>>8);
+    }
+    const auto word=[&](std::size_t at,std::uint32_t value){
+        for(unsigned i=0;i<4;++i)result[at+i]=static_cast<std::uint8_t>(value>>(8*i));
+    };
+    // SIZE_T 依客體架構排列。UMA 沒有獨立顯存，搶占粒度為 DMA buffer 邊界。
+    word(256,vendor_id);
+    word(x86?280:288,static_cast<std::uint32_t>(x86?std::min<std::uint64_t>(shared_memory,UINT32_MAX):shared_memory));
+    if(!x86)word(292,static_cast<std::uint32_t>(shared_memory>>32));
+    word(x86?284:296,static_cast<std::uint32_t>(adapter_luid));
+    word(x86?288:300,static_cast<std::uint32_t>(adapter_luid>>32));
+    return result;
+}
 
 // 監視器：GUID_DEVCLASS_MONITOR 與 GUID_DEVINTERFACE_MONITOR。User32、SetupAPI 與 CM 共用下列身分。
 inline constexpr std::u16string_view monitor_class_name=u"{4d36e96e-e325-11ce-bfc1-08002be10318}";

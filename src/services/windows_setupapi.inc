@@ -6,9 +6,13 @@
                 if(!driver && !node.hardware.empty())return sync_hardware_key(runtime_.registry,registry_file_,&registry_store_cache_,node,output_limit);
                 // 裝置鍵通常已完整存在；沿用登錄快取，只有實際寫入才使快取失效。
                 auto& registry=runtime_.registry;RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_);if(transaction.error)return transaction.error;
-                const auto path=registry_path(node,driver);auto values=registry.keys.contains(path)?registry.keys.at(path):std::map<std::u16string,RegistryValue>{};
-                std::uint64_t added=0;unsigned count=0;
-                const auto add=[&](std::u16string key,const RegistryValue& value){key=folded(std::move(key));if(!values.contains(key)){values.emplace(std::move(key),value);added+=value.bytes.size();++count;}};
+                const auto path=registry_path(node,driver);const auto existing=registry.keys.find(path);
+                std::map<std::u16string,RegistryValue> additions;std::uint64_t added=0;
+                const auto add=[&](std::u16string key,const RegistryValue& value){
+                    key=folded(std::move(key));
+                    if(existing!=registry.keys.end() && existing->second.contains(key))return;
+                    if(additions.try_emplace(std::move(key),value).second)added+=value.bytes.size();
+                };
                 for(const auto& [property,value]:node.properties){(void)property;add(value.first,value.second);}
                 if(!driver && !node.port_name.empty()){
                     RegistryValue value;value.type=1;value.display_name=u"PortName";value.bytes=utf16_bytes(node.port_name);add(u"PortName",value);
@@ -19,17 +23,17 @@
                     // 與 Windows 顯示驅動鍵相同的欄位：DriverDateData（FILETIME）、DriverDesc、MatchingDeviceId 與 HardwareInformation.*。
                     const auto binary_value=[&](std::u16string key,std::vector<std::uint8_t> bytes,std::uint32_t type){RegistryValue data;data.type=type;data.display_name=key;data.bytes=std::move(bytes);add(std::move(key),data);};
                     std::vector<std::uint8_t> date(8);for(unsigned i=0;i<8;++i)date[i]=static_cast<std::uint8_t>(display_identity::date_filetime>>(i*8));binary_value(u"DriverDateData",date,3);
-                    const auto description=property_text(node,1);text_value(u"DriverDesc",description);text_value(u"MatchingDeviceId",u"root\\x64arm_display");
+                    const auto description=property_text(node,1);text_value(u"DriverDesc",description);text_value(u"MatchingDeviceId",folded(std::u16string(display_identity::adapter_hardware_id)));
                     auto wide=[&](std::u16string_view text){auto bytes=utf16_bytes(text);bytes.push_back(0);bytes.push_back(0);return bytes;};
                     binary_value(u"HardwareInformation.AdapterString",wide(display_identity::adapter_name),3);binary_value(u"HardwareInformation.ChipType",wide(description),3);
                     binary_value(u"HardwareInformation.DacType",wide(u"Integrated RAMDAC"),3);binary_value(u"HardwareInformation.BiosString",wide(u""),3);
                     std::vector<std::uint8_t> size(8);const auto shared=gpu_memory_stats().limit;for(unsigned i=0;i<8;++i)size[i]=static_cast<std::uint8_t>(shared>>(i*8));binary_value(u"HardwareInformation.qwMemorySize",size,11);
                 }
-                if(!count && registry.keys.contains(path)){transaction.unchanged();return 0;}
-                if(registry.bytes+added>output_limit || registry.values+count>4096 || registry.keys.size()+12>4096)return 8;
+                if(additions.empty() && existing!=registry.keys.end()){transaction.unchanged();return 0;}
+                if(registry.bytes+added>output_limit || registry.values+additions.size()>4096 || registry.keys.size()+12>4096)return 8;
                 const auto before=registry;
                 for(std::size_t end=1;;){registry.keys.try_emplace(path.substr(0,end));end=path.find(u'\\',end+1);if(end==path.npos)break;}
-                registry.keys[path]=std::move(values);registry.bytes+=added;registry.values+=count;
+                registry.values+=additions.size();registry.keys[path].merge(additions);registry.bytes+=added;
                 if(const auto error=transaction.commit();error){registry=before;return error;}return 0;
             };
             auto& configuration=*device_configuration_;
@@ -78,6 +82,8 @@
                 if(!empty)last_error_=0;
                 const auto handle=existing?existing:configuration.next_set++;configuration.sets.insert_or_assign(handle,std::move(info));configuration.next_interface=next_interface;return finish(handle);
             }
+            // 裝置屬性寫入後，下一次盤點重新同步宿主 USB 節點。
+            if(name.starts_with("SetupDiSetDeviceRegistryProperty"))configuration.usb_snapshot.reset();
 #include "windows_device_installation.inc"
             const auto found_set=configuration.sets.find(arg(0));if(found_set==configuration.sets.end())return failed(6);
             auto& info=found_set->second;

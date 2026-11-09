@@ -49,6 +49,8 @@ struct Engine {
     std::set<std::uint64_t> callbacks;
     std::vector<float> quantum;
     std::size_t produced{};unsigned rate{48000},fraction{},version{7};
+    unsigned lead_quanta{3};
+    std::uint64_t observed_starved_runs{};
     bool initialized{},active{true},busy{},audible_reported{};
     std::vector<std::pair<std::uint64_t,Graph::Voice>> pass_voices;
     std::uint32_t ticket{};
@@ -86,6 +88,10 @@ bool WindowsServices::xaudio_waiting()const {
 }
 void WindowsServices::poll_xaudio(){
     if(!xaudio_)return;
+    static const bool adaptive_lead=[] {
+        const auto* value=std::getenv("X64ARM_AUDIO_XAUDIO_ADAPTIVE_LEAD");
+        return !value || std::string_view(value)!="0";
+    }();
     for(auto& [p,o]:xaudio_->objects)if(o.kind==Object::EngineObject){auto& e=*o.engine;if(!e.active || !e.output || e.busy)continue;
         std::lock_guard lock(e.pcm->mutex);auto& b=*e.pcm;
         if(trace_audio() && !e.audible_reported && (b.rendered_left_peak>0 || b.rendered_right_peak>0)){
@@ -94,7 +100,12 @@ void WindowsServices::poll_xaudio(){
         }
         const auto consumed=std::min(b.pcm.size(),static_cast<std::size_t>(b.cursor)*b.frame_bytes());
         if(consumed){b.pcm.erase(b.pcm.begin(),b.pcm.begin()+static_cast<std::ptrdiff_t>(consumed));b.cursor-=static_cast<double>(consumed/b.frame_bytes());}
-        if(b.pcm.size()/b.frame_bytes()>=e.rate*3/100)continue;
+        if(adaptive_lead && b.starved_runs!=e.observed_starved_runs){
+            // 忽略開始播放時的預填缺口。穩定供應後若再欠載，逐次增加 10 ms 餘裕，最多預填 60 ms。
+            if(e.rendered>=e.rate && e.lead_quanta<6)++e.lead_quanta;
+            e.observed_starved_runs=b.starved_runs;
+        }
+        if(b.pcm.size()/b.frame_bytes()>=e.rate*e.lead_quanta/100)continue;
         if(!xaudio_->next_ticket)throw HostCallFault("XAudio2 工作序號耗盡");
         e.ticket=xaudio_->next_ticket++;wave_callbacks_.push_back({resolve("internal-xaudio","Work").value,{p,e.ticket}});e.busy=true;
     }

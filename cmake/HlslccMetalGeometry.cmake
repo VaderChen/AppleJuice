@@ -68,7 +68,7 @@ x64arm_hlslcc_patch(toMetalDeclaration.cpp
   "        default:\n            ASSERT(0);\n            break;\n    }\n    HandleOutputRedirect")
 x64arm_hlslcc_patch(toMetalDeclaration.cpp
   "if (psContext->psShader->eShaderType == PIXEL_SHADER  && !strncmp(psSig->semanticName.c_str(), \"PSIZE\", 5))"
-  "if (psContext->psShader->eShaderType == PIXEL_SHADER && !strncmp(psSig->semanticName.c_str(), \"PSIZE\", 5))")
+  "if (psContext->psShader->eShaderType == PIXEL_SHADER && !strncmp(psSig->semanticName.c_str(), \"PSIZE\", 5) && psContext->psShader->ui32MajorVersion < 4)")
 # 幾何輸入是 primitive 內的陣列，純量分量仍保留陣列索引。
 x64arm_hlslcc_patch(toMetalInstruction.cpp
   "psContext->psShader->eShaderType == COMPUTE_SHADER || (psContext->psShader->eShaderType == PIXEL_SHADER"

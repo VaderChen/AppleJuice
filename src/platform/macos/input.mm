@@ -315,6 +315,7 @@ public:
     bool available(const Guid& id)override{if(id==keyboard_.instance || id==mouse_.instance)return true;for(auto& [ref,h]:hid_){(void)ref;if(h.device.instance==id)return h.device.attached;}return false;}
     void mouse_wheel(std::int32_t delta)override{if(!tap_)change(mouse_,2,delta);}
     void horizontal_wheel(std::int32_t delta)override{if(!tap_ && delta && events_.size()<65536)events_.push_back({mouse_.instance,11,delta});}
+    bool observes_physical_input()const noexcept{return physical_input_;}
     void cursor_warped()override{if(!physical_input_)return;const auto event=CGEventCreate(nullptr);if(event){cursor_=CGEventGetLocation(event);have_cursor_=true;CFRelease(event);}}
     bool observes_wheel()const override{return tap_!=nullptr;}
     std::uint32_t cooperative(const Guid& id,bool exclusive)override{

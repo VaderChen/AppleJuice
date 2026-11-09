@@ -180,6 +180,15 @@ int main(int argc, char** argv) {
         const std::string_view command = argv[1];
         if(command=="run-pe" || command=="run-raw" || command=="compare" || command=="precompile-pe" || command=="bench")cli::reject_retired_backends();
         const auto host_files = command == "run-pe" ? prepare_host_file_limit() : HostFileLimit{};
+        // 喚醒立即重排（核心 X64ARM_RESIDENT_WAKE_ROTATION，核心本身預設關閉）：協調者解析到等待完成（GPU 完成、逾時、就緒物件）且有
+        // 可執行者等 vCPU 時立即重排，不等 5 ms 時間片，讓被喚醒的渲染／主執行緒及時上 vCPU。2026-11-08《古墓奇兵：暗影》Benchmark
+        // 2 vCPU 開關對照 44.1 → 46.6 FPS；咲稻姬 2 vCPU 與 FF8 持平。Windows 程序預設開啟，X64ARM_RESIDENT_WAKE_ROTATION=0 關閉。
+        // 核心在第一次進入平行排程時才讀取，須在建立引擎前設定。
+        if(command=="run-pe" && !std::getenv("X64ARM_RESIDENT_WAKE_ROTATION"))::setenv("X64ARM_RESIDENT_WAKE_ROTATION","1",1);
+        // 單槽搶占（核心與服務層共用 X64ARM_RESIDENT_PREEMPT_SLOT，兩者本身預設關閉）：協調者逾時要輪替時只換掉一個時間片已到期
+        //（或被剛喚醒者搶占）的 worker slot，不讓全體靜止。2026-11-08《暗影》中畫質 720p 4 vCPU 開關各兩輪 59.6 → 61.7 FPS、
+        // P99 36.7 → 33.8 ms，2 vCPU 持平。需搭配空轉保險放寬的核心（X64ARM_RESIDENT_PREEMPT_IDLE）。=0 關閉。
+        if(command=="run-pe" && !std::getenv("X64ARM_RESIDENT_PREEMPT_SLOT"))::setenv("X64ARM_RESIDENT_PREEMPT_SLOT","1",1);
 #if defined(__APPLE__)
         if(command=="run-pe"){startup_profile::Scope measurement("startup","resource_preload",true);preload_generated_resources_async();}
 #endif

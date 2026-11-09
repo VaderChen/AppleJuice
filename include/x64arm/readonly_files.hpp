@@ -64,6 +64,7 @@ struct HostFile {
     static FileInformation descriptor_information(int descriptor);
     static bool is_null_descriptor(int descriptor);
     bool null_device() const noexcept { return null_device_; }
+    bool local_stream_file() const noexcept { return descriptor_>=0 && !null_device_ && !reparse_tag_ && !network_lease_; }
     char volume_id() const noexcept { return volume_; }
     FileVolumeSpace volume_space() const;
     int duplicate_descriptor() const;

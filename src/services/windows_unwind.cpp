@@ -79,7 +79,7 @@ Info parse(const Memory& memory, const RuntimeImage& image, std::uint64_t unwind
     // 手寫 leaf assembly 可使用 CONTEXT 中的 R10/R11 保存原 RSP；
     // 依四位元暫存器編碼還原，不把編譯器的非揮發保存慣例當作載入限制。
     if (!result.frame && result.frame_offset) throw HostCallFault("unwind frame register 不合法");
-    unsigned previous = 256;bool saw_code=false;
+    bool saw_code=false;
     for (std::uint64_t i = 0; i < count;) {
         const auto offset = static_cast<unsigned>(load(4 + i * 2, 8)), opcode = static_cast<unsigned>(load(5 + i * 2, 8));
         const auto op = opcode & 15, info = opcode >> 4;
@@ -93,8 +93,8 @@ Info parse(const Memory& memory, const RuntimeImage& image, std::uint64_t unwind
             }
             ++i;continue;
         }
-        if (offset > result.prolog || offset > previous) throw HostCallFault("unwind code 順序或 prolog offset 不合法");
-        previous = offset;
+        // Windows 的 prolog 還原只比對「PC 偏移 ≥ CodeOffset」才套用，不要求 codes 遞減或落在 SizeOfProlog 內；
+        // 保護殼／混淆產生的非典型紀錄仍可載入，執行時沿 virtual_unwind 的同一規則還原。
         unsigned slots = 1; std::uint64_t argument = 0;
         switch (op) {
         // OpInfo 是完整的四位元暫存器編號；手寫 assembly 也會保存揮發暫存器。
@@ -134,8 +134,10 @@ Info parse(const Memory& memory, const RuntimeImage& image, std::uint64_t unwind
 template<class Memory>
 RuntimeFunction chain(const Memory& memory, const RuntimeImage& image, std::uint64_t address) {
     const auto begin = memory.load(GuestAddress{address}, 32), end = memory.load(GuestAddress{address + 4}, 32), unwind = memory.load(GuestAddress{address + 8}, 32);
-    if (begin >= end) throw HostCallFault("chained RUNTIME_FUNCTION 範圍不合法");
-    memory.check(GuestAddress{rva(image, begin, static_cast<std::size_t>(end - begin))}, static_cast<std::size_t>(end - begin), Access::Execute);
+    // Windows 還原 chained 紀錄只讀其 UnwindData（之後套用全部 codes），起訖範圍不參與；保護殼可留下 begin>=end 的紀錄，
+    // 此時不檢查範圍。合法範圍仍須落在可執行映像內，UnwindData 由 parse 驗證。
+    if (begin < end)
+        memory.check(GuestAddress{rva(image, begin, static_cast<std::size_t>(end - begin))}, static_cast<std::size_t>(end - begin), Access::Execute);
     return {static_cast<std::uint32_t>(begin), static_cast<std::uint32_t>(end), static_cast<std::uint32_t>(unwind)};
 }
 RuntimeFunction primary_function(const GuestMemory& memory, const RuntimeImage& image, RuntimeFunction function) {

@@ -395,6 +395,7 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_control(GuestState& sta
         auto style=static_cast<std::uint32_t>(memory.load(GuestAddress{operation.buffer+4},32));
         // 重入期間可能已有另一項變更；回傳真正提交前的值，不採用可改寫的 styleOld。
         change.previous=change.index==-16?control.style:control.ex_style;
+        const bool was_visible=control.visible;
         if(change.index==-16){
             if(!control.parent)style|=0x4000000U; // 頂層視窗保留 WS_CLIPSIBLINGS。
             if(control.style&0x20000000U)style|=0x20000000U; // 最小化狀態經 ShowWindow 還原。
@@ -408,6 +409,9 @@ std::optional<std::uint32_t> WindowsServices::resume_gui_control(GuestState& sta
         change.committed=true;
         memory.store(GuestAddress{operation.buffer},32,change.previous);memory.store(GuestAddress{operation.buffer+4},32,style);
         present_gui(operation.message.window);
+        // SetWindowLong 直接切換 WS_VISIBLE：Windows 只改可見位元（IsWindowVisible 立即反映、不送 WM_SHOWWINDOW、不啟用），
+        // 原生視窗同步顯示／隱藏但不搶焦點；否則之後的 DXGI／D3D9 獨占全螢幕找不到可見的原生視窗。
+        if(change.index==-16 && control.visible!=was_visible)show_native_window(operation.message.window,control.visible,false);
         start_callbacks(state,memory,{{resolve("user32.dll",operation.wide?"SendMessageW":"SendMessageA").value,{operation.message.window,0x7d,static_cast<std::uint64_t>(static_cast<std::int64_t>(change.index)),operation.buffer}}},Continuation::GuiControlOperation,frame.value);
         return {};
     }

@@ -10,6 +10,8 @@ struct ResidentScalarCall;
 struct ResidentScalarErrors;
 const ScalarMathOperation* scalar_math_operation(const WindowsServiceDescriptor&);
 bool scalar_math_requested() noexcept;
+// Win32 SSE2 CRT helper（XMM0／XMM1 進、XMM0 出的暫存器 ABI）；與 scalar_math_operation 使用同一登錄表。
+bool scalar_math_xmm_abi(const WindowsServiceDescriptor&) noexcept;
 // 回傳核心 ScalarRecipe 編號（0 表示沒有配方）；與 scalar_math_operation 使用同一登錄表。
 unsigned scalar_math_recipe(const WindowsServiceDescriptor&) noexcept;
 bool invoke_native_scalar_math(ResidentScalarCall&,GuestMemory&,const ScalarMathOperation&,std::uint64_t errno_cell) noexcept;

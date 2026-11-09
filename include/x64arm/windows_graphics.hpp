@@ -11,6 +11,7 @@
 #include <vector>
 
 namespace x64arm {
+class SharedWake;
 // D3D9 固定管線及 D3D11 可程式化管線共用同一 Metal context、提交與呈現。
 // pending_stamp：後端在途清單最近一次加入此物件的批次編號（Metal 在途追蹤以它略過同批重複加入，不查雜湊表）。
 struct GraphicsObject {virtual ~GraphicsObject()=default;std::uint64_t pending_stamp{};};
@@ -56,6 +57,19 @@ struct GraphicsView {
     // Append／Consume 計數器屬於 UAV view；同一資源的不同 view 不共用計數。
     std::shared_ptr<GraphicsResource> counter{};
     std::uint32_t dimension{}; // SRV 維度，保留 cube／cube array 的取樣形狀。
+    // 結構化元素大小：D3D12 的 stride 屬於 view，不屬於資源；0 表示沿用資源或格式。
+    // graphics_view_stride_unknown：根描述元沒有 stride，由著色器決定。
+    std::uint32_t stride{};
+};
+inline constexpr std::uint32_t graphics_view_stride_unknown=UINT32_MAX;
+// 時間性升頻（XeSS 等升頻 API）：抖動取樣的低解析度色彩、深度與動態向量合成高解析度輸出。
+// 動態向量以輸入像素為單位、指向上一幀；motion_scale 先換算成這個單位。exposure 可為空（1×1 曝光紋理）。
+struct GraphicsTemporalUpscale {
+    GraphicsView color,depth,motion,exposure,output;
+    std::uint32_t input_width{},input_height{},output_width{},output_height{};
+    float jitter_x{},jitter_y{},motion_scale_x{1},motion_scale_y{1},pre_exposure{1};
+    bool reset{},depth_reversed{},auto_exposure{};
+    std::uint64_t history{}; // 呼叫端的歷史編號（每個升頻情境一個）：同一個編號沿用上一幀的歷史。
 };
 // D3D12 描述元表：heap 為描述元堆積的 GPU 鏡像（貼圖每項 8 位元組 MTLResourceID；緩衝每項位址＋長度共 16 位元組），
 // offset 為此表第一個描述元在鏡像中的位元組位置。views：有界小表逐項解析的資源，後端據此宣告使用以維持危害追蹤。
@@ -99,6 +113,11 @@ struct GraphicsDraw {
     // 非零時，值相同的繪製其著色器、輸入佈局、混色／深度／光柵狀態與 sample mask 皆相同（D3D12 PSO 建立後不變），
     // 後端可據此快取管線；0 表示不保證（D3D11 等逐次比對）。
     std::uint64_t pipeline_serial{};
+    // D3D11 不可變的輸入佈局與混色物件序號。佈局序號為 0 時使用完整管線鍵。
+    std::uint64_t pipeline_layout_serial{},pipeline_blend_serial{};
+    // D3D12：draw 之間的 UAV 存取不保證順序，順序只由應用程式的 UAV barrier 指定（後端以 graphics_uav_barrier 收到）。
+    // D3D11 為 false：draw 間 UAV 依序，有讀取或原子操作的像素 UAV 每個 draw 一個 render pass。
+    bool explicit_uav_order{};
 };
 struct FixedGraphicsVertex {std::array<float,4> position,color,texcoord;std::array<float,4> secondary{};};
 struct FixedGraphicsDraw {
@@ -134,7 +153,8 @@ public:
     virtual std::shared_ptr<GraphicsShader> graphics_shader(std::uint32_t,std::span<const std::uint8_t>){throw std::runtime_error("後端缺少 DXBC 著色器");}
     // 背景準備著色器：已在快取、曾經失敗或後端不支援背景編譯時回 0（呼叫端照常同步建立）；否則啟動或沿用進行中的背景
     // 轉譯與編譯並回傳非零票號，呼叫端可讓客體執行緒等票號完成後重試，不在持鎖的服務內編譯。
-    virtual std::uint64_t graphics_shader_prefetch(std::uint32_t,std::span<const std::uint8_t>){return 0;}
+    virtual std::uint64_t graphics_shader_prefetch(std::uint32_t,std::span<const std::uint8_t>,
+                                                   const std::shared_ptr<SharedWake>& = {}){return 0;}
     virtual bool graphics_shader_ticket_ready(std::uint64_t){return true;}
     // 由相容層自行產生的 MSL compute 核心（例如 DirectML 運算子）；bindings 的 slot 對應 GraphicsStage 陣列。
     virtual std::shared_ptr<GraphicsShader> graphics_compute_source(const GraphicsModernShader&){throw std::runtime_error("後端缺少 MSL compute 核心");}
@@ -163,6 +183,9 @@ public:
     // box 是紋理端範圍（texel）。to_texture 為 true 時緩衝→紋理。格式或對齊不支援時回傳 false 且不排入任何命令。
     virtual bool graphics_copy_buffer_texture(const GraphicsView&,const GraphicsView&,std::uint64_t,std::uint32_t,std::uint32_t,std::array<std::uint32_t,6>,bool){return false;}
     virtual void graphics_resolve(const GraphicsView&,const GraphicsView&,std::uint32_t){throw std::runtime_error("後端缺少多重取樣 resolve");}
+    virtual bool graphics_temporal_upscale_supported(){return false;}
+    virtual void graphics_temporal_upscale(const GraphicsTemporalUpscale&){throw std::runtime_error("後端缺少時間性升頻");}
+    virtual void graphics_temporal_upscale_release(std::uint64_t){}
     virtual void graphics_clear(const GraphicsView&,std::array<float,4>,std::uint32_t){throw std::runtime_error("後端缺少清除操作");}
     virtual bool graphics_clear_unordered(const GraphicsView&,std::array<std::uint32_t,4>,bool){throw std::runtime_error("後端缺少 UAV 清除操作");}
     virtual void graphics_draw(const GraphicsDraw&){throw std::runtime_error("後端缺少繪製操作");}
@@ -183,6 +206,8 @@ public:
     // 不提交：回傳「目前尚未提交的命令批次」完成旗標；呼叫端（D3D11 GetData 無 DONOTFLUSH 時）再決定何時 flush。
     virtual std::shared_ptr<const std::atomic<bool>> graphics_fence_pending(){return graphics_fence();}
     virtual void graphics_flush(bool){throw std::runtime_error("後端缺少提交操作");}
+    // D3D12 UAV barrier：之後的 draw／dispatch 須看見之前的 UAV 寫入。預設不需動作（後端不合併 UAV draw 時已依序）。
+    virtual void graphics_uav_barrier(){}
     // 呼叫端保證 draw／stage 的內容在下一次 graphics_sync() 前不變時使用；非同步後端可只保留參照。預設同步執行。
     virtual void graphics_draw_retained(const GraphicsDraw& draw){graphics_draw(draw);}
     virtual void graphics_dispatch_retained(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){graphics_dispatch(stage,groups);}

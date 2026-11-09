@@ -47,7 +47,8 @@ void WindowsServices::queue_raw_input(std::uint64_t device,std::uint32_t type,st
     const auto reg=registration(*raw_input_,page,usage);if(!reg)return;
     const auto target=reg->window?reg->window:gui_.focus;const auto window=gui_.windows.find(target);
     if(window==gui_.windows.end() || window->second.desktop_object!=gui_.input_desktop)return;
-    const bool foreground=(!native_gui_ || native_gui_->input_active()) && gui_.active && gui_.windows.contains(gui_.active) && gui_.windows.at(gui_.active).desktop_object==gui_.input_desktop;
+    // 注入（SendInput／自動化）的事件不是宿主鍵盤送來的，是否在前景只看客體自己的作用中視窗：宿主視窗在背景時不該丟掉。
+    const bool foreground=(raw_input_injecting_ || !native_gui_ || native_gui_->input_active()) && gui_.active && gui_.windows.contains(gui_.active) && gui_.windows.at(gui_.active).desktop_object==gui_.input_desktop;
     if(!foreground && !(reg->flags&(0x100U|0x1000U)))return;
     const auto handle=runtime_.allocate_wait_handle();raw_input_->packets.emplace(handle,RawInputPacket{device,target,window->second.thread,type,foreground?0U:1U,std::move(payload)});
     GuiMessage message{target,foreground?0U:1U,handle,0xff};message.thread=window->second.thread;message.queue_priority=1;message.injected=true;message.queued_time=time;message.input_extra=extra;enqueue_gui_message(std::move(message));

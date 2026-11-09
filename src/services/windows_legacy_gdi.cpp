@@ -254,7 +254,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
             if(name=="D3DKMTOpenAdapterFromDeviceName"){
                 const auto at=memory.load(GuestAddress{p},pointer_bits);if(!at)return finish(invalid);auto path=read_utf16(memory,GuestAddress{at});for(auto& c:path)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
                 // 介面路徑：GUID_DISPLAY_DEVICE_ARRIVAL 或 GUID_DEVINTERFACE_DISPLAY_ADAPTER。
-                if(path!=u"\\\\?\\root#x64arm_display#0000#{1ca05180-a699-450a-9a0c-de4fbe3ddd89}" && path!=u"\\\\?\\root#x64arm_display#0000#{5b45201d-f2f2-4f3b-85bb-30ff1f953599}")return finish(invalid);
+                if(path!=u"\\\\?\\pci#ven_106b&dev_0000&subsys_00000000&rev_00#0&0&0000#{1ca05180-a699-450a-9a0c-de4fbe3ddd89}" && path!=u"\\\\?\\pci#ven_106b&dev_0000&subsys_00000000&rev_00#0&0&0000#{5b45201d-f2f2-4f3b-85bb-30ff1f953599}")return finish(invalid);
                 return finish(open(unit,unit+4));
             }
             if(name=="D3DKMTOpenAdapterFromLuid"){if((static_cast<std::uint64_t>(memory.load(GuestAddress{p+4},32))<<32|memory.load(GuestAddress{p},32))!=luid)return finish(invalid);return finish(open(8,0));}

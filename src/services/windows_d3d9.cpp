@@ -129,6 +129,7 @@ struct Object {
     std::uint32_t device_type{1},references{1},width{},height{},depth{1},format{22},pool{2},flags{},lock_flags{},fvf{},priority{},bound{},usage{},stream_offset{},stream_stride{},lock_count{},latency{3};
     bool ex{},implicit{},scene{},auto_depth{},lock_writable{},software_vertex{};
     bool fullscreen{};std::uint32_t windowed_style{},windowed_ex_style{};
+    std::optional<std::array<std::uint16_t,768>> gamma_ramp; // 裝置最後一次 SetGammaRamp 的 D3DGAMMARAMP
     std::array<std::int32_t,4> windowed_rect{};std::optional<std::array<std::uint32_t,4>> windowed_insets;
     std::vector<std::uint64_t> swap_buffers;GraphicsView flip_front;
     std::optional<GuiDisplayMode> presentation_mode;
@@ -768,6 +769,20 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                 else if(symbol=="BeginStateBlock"){require(!object.recording);auto record=std::make_shared<Object>(object);record->saved.reset();record->state_mask.clear();for(auto pointer:saved_bindings(*record))if(pointer)++bridge.objects.at(pointer)->bound;object.recording=std::move(record);memory.store(GuestAddress{object.root+D9_CONSTANT_FLAGS},32,(object.flags&4U)|1U);}
                 else if(symbol=="EndStateBlock"){output(1);require(bool(object.recording));auto block=create(Kind::StateBlock,object.root);block->state_mask=object.recording->state_mask;capture_state(block,*object.recording);unbind(*object.recording);object.recording.reset();memory.store(GuestAddress{object.root+D9_CONSTANT_FLAGS},32,object.flags&4U);store_pointer(arg(1),block->root);}
                 else if(symbol=="TestCooperativeLevel")require(gui_.windows.contains(object.window));
+                else if(symbol=="SetGammaRamp" || symbol=="GetGammaRamp"){
+                    // D3DGAMMARAMP（R、G、B 各 256 個 WORD）：裝置記住最後一次曲線，未設定時回恆等曲線；
+                    // 只有全螢幕裝置才套用到實體輸出（與 GDI SetDeviceGammaRamp、DXGI SetGammaControl 共用原生曲線）。
+                    const bool set=symbol=="SetGammaRamp";const auto ramp_at=arg(set?3:2);require(!u(1) && ramp_at!=0);
+                    memory.check(GuestAddress{ramp_at},1536,set?Access::Read:Access::Write);
+                    if(set){
+                        std::array<std::uint16_t,768> ramp{};for(unsigned i=0;i<768;++i)ramp[i]=static_cast<std::uint16_t>(memory.load(GuestAddress{ramp_at+2ULL*i},16));
+                        object.gamma_ramp=ramp;
+                        if(object.fullscreen && native_gui_){
+                            if(!runtime_.network.external_io)throw HostCallFault("原生 gamma ramp 不支援 deterministic compare");
+                            (void)native_gui_->set_gamma_ramp(ramp);
+                        }
+                    }else for(unsigned i=0;i<768;++i)memory.store(GuestAddress{ramp_at+2ULL*i},16,object.gamma_ramp?(*object.gamma_ramp)[i]:static_cast<std::uint16_t>((i%256)*257));
+                }
                 else if(symbol=="GetAvailableTextureMem"){const auto stats=gpu_memory_stats();result=std::min<std::uint64_t>(UINT32_MAX,stats.limit-stats.used);}
                 else if(symbol=="GetDirect3D"){output(1);auto factory=get(object.parent,Kind::Factory);hold(factory);store_pointer(arg(1),factory->root);}
                 else if(symbol=="CreateQuery"){

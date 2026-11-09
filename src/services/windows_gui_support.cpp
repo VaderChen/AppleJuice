@@ -59,7 +59,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"dwmapi.dll","DwmDefWindowProc",5},{"dwmapi.dll","DwmGetCompositionTimingInfo",2},{"dwmapi.dll","DwmFlush",0},
         {"user32.dll","RegisterTouchWindow",2},{"user32.dll","UnregisterTouchWindow",1},{"user32.dll","IsTouchWindow",2},
         {"user32.dll","GetTouchInputInfo",4},{"user32.dll","CloseTouchInputHandle",1},
-        {"imm32.dll","ImmCreateContext",0},{"imm32.dll","ImmDestroyContext",1},{"imm32.dll","ImmAssociateContext",2},{"imm32.dll","ImmAssociateContextEx",3},
+        {"imm32.dll","ImmIsUIMessageA",4},{"imm32.dll","ImmIsUIMessageW",4},{"imm32.dll","ImmCreateContext",0},{"imm32.dll","ImmDestroyContext",1},{"imm32.dll","ImmAssociateContext",2},{"imm32.dll","ImmAssociateContextEx",3},
         {"imm32.dll","ImmGetOpenStatus",1},{"imm32.dll","ImmSetOpenStatus",2},{"imm32.dll","ImmGetConversionStatus",3},{"imm32.dll","ImmSetConversionStatus",3},
         {"imm32.dll","ImmGetCompositionWindow",2},{"imm32.dll","ImmGetCompositionFontA",2},{"imm32.dll","ImmGetCompositionFontW",2},
         {"imm32.dll","ImmSetCandidateWindow",2},{"imm32.dll","ImmGetCandidateWindow",3},{"imm32.dll","ImmGetCompositionStringA",4},{"imm32.dll","ImmGetCompositionStringW",4},{"imm32.dll","ImmIsIME",1},

@@ -141,14 +141,27 @@ GraphicsDraw& d3d11_draw_state(D3D11State& bridge,const std::shared_ptr<Identity
     if(scope!=D3D11DrawScope::Compute){
     draw.stream_statistics=context->stream_statistics;
     refresh(cache->stream_raw,values(d3d11_slot_stream,stream_key),4,[&](auto i,auto pointer){draw.stream_targets[i]=pointer?object(pointer).identity->resource:nullptr;});
-    if(const auto ptr=single(d3d11_slot_layout,layout_key);ptr!=cache->layout){draw.layout=ptr?object(ptr).identity->layout:std::vector<GraphicsElement>{};cache->layout=ptr;}
+    if(const auto ptr=single(d3d11_slot_layout,layout_key);ptr!=cache->layout){
+        const auto* layout=ptr?object(ptr).identity.get():nullptr;
+        draw.layout=layout?layout->layout:std::vector<GraphicsElement>{};
+        draw.pipeline_layout_serial=layout?layout->pipeline_state_serial:0;
+        cache->layout=ptr;
+    }
+    // 診斷：X64ARM_TRACE_D3D11_LAYOUT=1 列出沒有輸入佈局的繪製（前 400 次）與佈局物件的元素數。
+    {static const bool trace_layout=std::getenv("X64ARM_TRACE_D3D11_LAYOUT")!=nullptr;static std::atomic<unsigned> traced{};
+        if(trace_layout && draw.layout.empty() && traced.fetch_add(1,std::memory_order_relaxed)<400){const auto ptr=single(d3d11_slot_layout,layout_key);std::fprintf(stderr,"[d3d11_layout] draw context=%p type=%u fixed=%d slot_pointer=%llx cached=%llx object_elements=%zu slot=%u\n",static_cast<void*>(context.get()),static_cast<unsigned>(context->context_type),fixed?1:0,static_cast<unsigned long long>(ptr),static_cast<unsigned long long>(cache->layout),ptr?object(ptr).identity->layout.size():0U,static_cast<unsigned>(context->draw_slot));}}
     if(const auto ptr=single(d3d11_slot_index,index_key);ptr!=cache->index){draw.indices=ptr?object(ptr).identity->resource:nullptr;cache->index=ptr;}
     // stride／offset 存在 context，指標未變也要逐槽同步。
     refresh(cache->vertex_raw,values(d3d11_slot_vertices,vertex_key),32,[&](auto i,auto pointer){draw.vertices[i]=pointer?GraphicsVertexBuffer{object(pointer).identity->resource,0,0}:GraphicsVertexBuffer{};});
     for(std::size_t i=0;i<cache->vertex_raw.size();++i)if(draw.vertices[i].resource){draw.vertices[i].stride=context->strides[i];draw.vertices[i].offset=context->offsets[i];}
     refresh(cache->target_raw,values(d3d11_slot_targets,target_key),8,[&](auto i,auto pointer){draw.targets[i]=view_of(pointer);});
     if(const auto ptr=single(d3d11_slot_depth,depth_key);ptr!=cache->depth){draw.depth=view_of(ptr);cache->depth=ptr;}
-    if(const auto ptr=single(d3d11_slot_blend,blend_key);ptr!=cache->blend){draw.blend=ptr?object(ptr).identity->desc:std::vector<std::uint8_t>{};cache->blend=ptr;}
+    if(const auto ptr=single(d3d11_slot_blend,blend_key);ptr!=cache->blend){
+        const auto* blend=ptr?object(ptr).identity.get():nullptr;
+        draw.blend=blend?blend->desc:std::vector<std::uint8_t>{};
+        draw.pipeline_blend_serial=blend?blend->pipeline_state_serial:0;
+        cache->blend=ptr;
+    }
     if(const auto ptr=single(d3d11_slot_depth_state,depth_state_key);ptr!=cache->depth_state){draw.depth_state=ptr?object(ptr).identity->desc:std::vector<std::uint8_t>{};cache->depth_state=ptr;}
     if(const auto ptr=single(d3d11_slot_raster,raster_key);ptr!=cache->raster){draw.raster=ptr?object(ptr).identity->desc:std::vector<std::uint8_t>{};cache->raster=ptr;}
     }

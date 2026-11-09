@@ -324,6 +324,8 @@ void load_config32(const Image& image,Directory dir,std::uint64_t base,RuntimeIm
         for(auto field:pointers)if(field+4<=size && offset>=field && offset<field+4)accepted=true;
         if(cfg && ((offset>=80 && offset<92) || (offset>=104 && offset<120)))accepted=true;
         for(auto field:{64U,68U,88U,160U})if(field+4<=size && offset>=field && offset<field+4)accepted=true;
+        // Return Flow Guard：沒有 RF 旗標時只是 linker 留下的欄位（見 PE32+）。
+        if(!(guard_flags&0xe0000U) && ((offset>=128 && offset<136) || (offset>=144 && offset<148)))accepted=true;
         if(!accepted && image.integer(std::uint64_t{dir.rva}+offset,1))reject("PE32 Load Config 包含尚未支援的作用中欄位，offset="+std::to_string(offset));
     }
     for(auto field:pointers)if(const auto pointer=value(field)){if(pointer<base)reject("PE32 Load Config 指標低於 image base");image.check(pointer-base,4);}
@@ -399,6 +401,8 @@ void load_config(const Image& image, Directory dir, std::uint64_t base, RuntimeI
         for (const auto pointer : pointer_offsets) if (offset >= pointer && offset < pointer + 8 && pointer + 8 <= size) accepted = true;
         if (offset>=224 && offset<230 && size>=230)accepted=true;
         if (offset >= 144 && offset < 148 && size >= 148) accepted = true;
+        // Return Flow Guard：沒有 RF 旗標時這三個指標只是 linker 留下的欄位（Windows 也沒有實際啟用 RFG），不影響執行。
+        if(!(guard_flags&0xe0000U) && ((offset>=208 && offset<224) || (offset>=232 && offset<240)))accepted=true;
         if(cfg && ((offset>=128 && offset<144) || (offset>=160 && offset<192) || (offset>=264 && offset<280)))accepted=true;
         if (!accepted && image.integer(std::uint64_t{dir.rva} + offset, 1)) reject("Load Config 包含尚未支援的作用中欄位，offset=" + std::to_string(offset));
     }
@@ -910,14 +914,15 @@ PeSectionImage parse_pe_section_image(std::span<const std::uint8_t> bytes,std::s
     return result;
 }
 PeInventory inspect_pe_image(std::span<const std::uint8_t> bytes) {
-    auto parsed=parse_pe_image_impl(bytes,{},false,GuestMemory::capacity_limit,false,true);
+    // 靜態盤點不配置客體映像；以可設定的最大客體容量為上限（保護殼映像可超過 256 MiB 預設程序容量）。
+    auto parsed=parse_pe_image_impl(bytes,{},false,GuestMemory::maximum_capacity,false,true);
     return {std::move(parsed.metadata),std::move(parsed.imports),std::move(parsed.delay_imports),
         std::move(parsed.runtime.export_names),std::move(parsed.runtime.export_ordinals),
         std::move(parsed.runtime.export_forwarders),parsed.dll};
 }
 std::optional<PeResource> read_pe_resource(std::span<const std::uint8_t> bytes,
     std::u16string_view type,std::optional<std::uint16_t> id,std::uint16_t language){
-    const auto parsed=parse_pe_image(bytes,{},false,256U*1024U*1024U,true);
+    const auto parsed=parse_pe_image(bytes,{},false,GuestMemory::maximum_capacity,true);
     const Reader file{bytes};const auto opt=std::size_t{file.u32(60)}+24;
     const bool small=file.u16(opt)==0x10b;const auto directories=opt+(small?96:112);
     if(file.u32(opt+(small?92:108))<=2)return {};

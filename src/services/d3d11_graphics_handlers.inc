@@ -9,6 +9,7 @@
                 if(target->subresource_maps.contains(it->first)){++it;continue;}
                 if(!free_heap(memory,it->second.pointer,state))throw HostCallFault("D3D11 持久映射記憶體已被客體破壞");
                 std::erase(target->allocations,it->second.pointer);it=target->persistent_maps.erase(it);
+                if(d3d11_stream_){const std::lock_guard lock(d3d11_stream_->front_dropped_mutex);d3d11_stream_->front_dropped.push_back(target->root);d3d11_stream_->front_epoch.fetch_add(1,std::memory_order_release);}
             }
         };
         // 共用物件操作，集中管理 COM 綁定的強參照與 guest pointer 寬度。
@@ -271,19 +272,32 @@
                     }
                     if(persistent)resource->persistent_maps.emplace(u32(2),Identity::PersistentMap{pointer,mapped_size});
                 }
-                resource->subresource_maps.emplace(u32(2),Identity::SubresourceMap{pointer,mapped_size,type});write_pointer(arg(5),pointer);const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));memory.store(GuestAddress{arg(5)+pointer_size},32,pitch[0]);memory.store(GuestAddress{arg(5)+pointer_size+4},32,pitch[0]*pitch[1]);}
-            else {const auto found=resource->subresource_maps.find(u32(2));require(found!=resource->subresource_maps.end());const auto mapping=found->second;if(mapping.type!=1){const auto view=subresource(resource,u32(2));
+                resource->subresource_maps.emplace(u32(2),Identity::SubresourceMap{pointer,mapped_size,type});write_pointer(arg(5),pointer);const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));memory.store(GuestAddress{arg(5)+pointer_size},32,pitch[0]);memory.store(GuestAddress{arg(5)+pointer_size+4},32,pitch[0]*pitch[1]);
+                // 下一次起走串流的前端路徑：資格與完整路徑相同的持久 WRITE_DISCARD。這次的 Unmap 仍走一般路徑。
+                {static const bool front_map=[] {const auto* value=std::getenv("X64ARM_D3D11_STREAM_FRONT_MAP");return !value || std::string_view(value)!="0";}();
+                    if(front_map && d3d11_stream_ && persistent && type==4 && discard_enabled && !u32(2) && !u32(4) && mapped_size<=D3D11CommandStream::snapshot_item_limit &&
+                       arg(0)==d3d11_stream_->context.load(std::memory_order_relaxed) && state.gs_base==d3d11_stream_->owner.load(std::memory_order_relaxed))
+                        d3d11_stream_->front_maps.insert_or_assign(arg(1),D3D11CommandStream::FrontMap{pointer,static_cast<std::uint32_t>(mapped_size),pitch[0],pitch[0]*pitch[1],false});}}
+            else {
+                // 前端路徑的對應只記在串流的擁有者私有表；別的執行緒來 Unmap（客體自行同步，擁有者此刻不在呼叫中）時轉回物件上再走一般流程。
+                if(!u32(2) && d3d11_stream_ && !resource->subresource_maps.contains(0U)){
+                    if(const auto front=d3d11_stream_->front_maps.find(arg(1));front!=d3d11_stream_->front_maps.end() && front->second.mapped){
+                        resource->subresource_maps.emplace(0U,Identity::SubresourceMap{front->second.pointer,front->second.size,4U});front->second.mapped=false;
+                    }
+                }
+                const auto found=resource->subresource_maps.find(u32(2));require(found!=resource->subresource_maps.end());const auto mapping=found->second;if(mapping.type!=1){const auto view=subresource(resource,u32(2));
                     const auto kept_map=resource->persistent_maps.find(u32(2));const bool persistent=kept_map!=resource->persistent_maps.end() && kept_map->second.pointer==mapping.pointer;
                     // 持久區塊直接以短期唯讀視圖上傳，不另複製一份；視圖只在本次呼叫內使用。
                     std::vector<std::uint8_t> copied;std::span<const std::uint8_t> data;
                     if(persistent){data=memory.readable_prefix(GuestAddress{mapping.pointer},mapping.size);if(data.size()<mapping.size)data={};}
                     if(data.empty()){copied=read_bytes(memory,mapping.pointer,mapping.size);data=copied;}
+                    if(mapping.type<bridge.unmap_calls.size()){++bridge.unmap_calls[mapping.type];bridge.unmap_bytes[mapping.type]+=data.size();}
                     if(mapping.type==4 && discard_enabled && !context->context_type)context->native->graphics_write_discard(view,data,0,0);
                     else if(mapping.type==5 && persistent)context->native->graphics_write_no_overwrite(view,data,0,0);
                     else context->native->graphics_write(view,data,0,0);}const auto kept=resource->persistent_maps.find(u32(2));if(kept==resource->persistent_maps.end() || kept->second.pointer!=mapping.pointer){require(free_heap(memory,mapping.pointer,state));std::erase(resource->allocations,mapping.pointer);}resource->subresource_maps.erase(found);}
         }
         else if(symbol=="IASetInputLayout" || symbol=="IAGetInputLayout" || symbol=="RSSetState" || symbol=="RSGetState"){
-            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const std::string name=symbol.starts_with("IA")?"Layout":"Raster";if(symbol.find("Set")!=symbol.npos)bind_one(context,name,arg(1));else{auto ptr=binding(context,name);if(ptr)hold(ptr);write_pointer(arg(1),ptr);}
+            graphics_handled=true;auto context=typed(arg(0),Kind::Context);const std::string name=symbol.starts_with("IA")?"Layout":"Raster";if(symbol.find("Set")!=symbol.npos){static const bool trace_layout=std::getenv("X64ARM_TRACE_D3D11_LAYOUT")!=nullptr;if(trace_layout && symbol=="IASetInputLayout")std::fprintf(stderr,"[d3d11_layout] set full context=%p value=%llx\n",static_cast<void*>(context.get()),static_cast<unsigned long long>(arg(1)));bind_one(context,name,arg(1));}else{auto ptr=binding(context,name);if(ptr)hold(ptr);write_pointer(arg(1),ptr);}
         }
         else if(symbol=="OMSetRenderTargets" || symbol=="OMGetRenderTargets" || symbol=="OMSetRenderTargetsAndUnorderedAccessViews" || symbol=="OMGetRenderTargetsAndUnorderedAccessViews"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);const bool extended=symbol.find("Unordered")!=symbol.npos,set=symbol.starts_with("OMSet");
@@ -439,8 +453,12 @@
                 // 背景編譯：著色器尚未就緒時讓呼叫者等待（ShaderRetry），其他執行緒與協調者照常執行，完成後重新執行整個建立呼叫
                 //（命中快取）。只在常駐 AOT 多 vCPU 的完整服務路徑；worker 與協調者本地路徑不可等待（資格檢查已把未就緒者交回這裡）。
                 if(resident_execution_depth_>0 && runtime_.processor_count>1 && threads_.items.size()>1 && !graphics_local() && !graphics_coordinator_local() &&
-                   threads_.current!=present_thread_)
-                    if(const auto ticket=device->native->graphics_shader_prefetch(stage,bytes)){
+                   threads_.current!=present_thread_){
+                    static const bool notify_ready=[] {
+                        const auto* value=std::getenv("X64ARM_SHADER_READY_WAKE");
+                        return !value || std::string_view(value)!="0";
+                    }();
+                    if(const auto ticket=device->native->graphics_shader_prefetch(stage,bytes,notify_ready?mapping_wake():nullptr)){
                         auto& waiter=threads_.items.at(threads_.current);waiter.status=ThreadStatus::Waiting;waiter.wait={};waiter.wait.kind=ThreadWaitKind::ShaderRetry;
                         waiter.wait.deadline=runtime_.clock_ticks+UINT64_C(300000000); // 30 秒保底，到期仍未完成就再等一輪
                         shader_waits_[threads_.current]={device->native,ticket};record_diagnostic("d3d11_shader_wait");
@@ -448,10 +466,14 @@
                         if(trace_async)std::fprintf(stderr,"[shader_async] wait thread=%llu stage=%u ticket=%llx\n",static_cast<unsigned long long>(threads_.current),stage,static_cast<unsigned long long>(ticket));
                         schedule(state,memory);return std::nullopt;
                     }
+                }
                 auto shader=device->native->graphics_shader(stage,bytes);if(!arg(4))result=1;else {auto id=create(stage==0?Kind::VertexShader:stage==1?Kind::PixelShader:stage==2?Kind::GeometryShader:stage==3?Kind::HullShader:stage==4?Kind::DomainShader:Kind::ComputeShader,device->root);id->shader=std::move(shader);id->reflection=std::move(reflected);if(arg(3)){bind_one(id,"ClassLinkage",arg(3));typed(arg(3),Kind::ClassLinkage)->linked_shaders.push_back(id->reflection);}write_pointer(arg(4),id->root);}}
         }else if(symbol=="CreateInputLayout"){
             graphics_handled=true;auto device=typed(arg(0),Kind::Device);if(arg(5)){output(5);write_pointer(arg(5),0);}require(u32(2)<=32 && arg(4)<=16*1024*1024);const dxbc::Reflection signature(read_bytes(memory,arg(3),static_cast<std::size_t>(arg(4))));std::vector<GraphicsElement> elements;std::array<std::uint32_t,32> ends{};
-            for(unsigned i=0;i<u32(2);++i){const auto at=arg(1)+i*(x86_?28:32);GraphicsElement e;e.semantic=read_ansi(memory,memory.load(GuestAddress{at},pointer_bits));const auto fields=bytes32(at+pointer_size,6);e.index=fields[0];e.format=fields[1];e.slot=fields[2];e.offset=fields[3];e.classification=fields[4];e.step=fields[5];require(e.slot<32 && e.classification<2 && (!e.classification || e.step) && device->native->graphics_vertex_format_supported(e.format));if(e.offset==UINT32_MAX)e.offset=ends[e.slot];ends[e.slot]=e.offset+graphics_format_bytes(e.format);elements.push_back(e);}
+            // D3D11 規定：逐頂點元素的 InstanceDataStepRate 必須為 0；逐實例元素為 0 合法，代表所有實例共用同一筆資料（不前進）。
+            // 診斷：X64ARM_TRACE_GRAPHICS_ERRORS 時列出每個元素的語意與格式，以及著色器簽章要的輸入，核對失敗原因。
+            if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS")){std::string text;for(unsigned i=0;i<u32(2);++i){const auto at=arg(1)+i*(x86_?28:32);const auto fields=bytes32(at+pointer_size,6);text+=read_ansi(memory,memory.load(GuestAddress{at},pointer_bits))+std::to_string(fields[0])+":f"+std::to_string(fields[1])+(device->native->graphics_vertex_format_supported(fields[1])?"":"!")+":s"+std::to_string(fields[2])+":o"+std::to_string(fields[3])+":c"+std::to_string(fields[4])+" ";}text+="| 簽章 ";for(const auto& input:signature.signatures[0])text+=input.name+std::to_string(input.index)+":sys"+std::to_string(input.system)+" ";std::fprintf(stderr,"[d3d11_input_layout] %s\n",text.c_str());}
+            for(unsigned i=0;i<u32(2);++i){const auto at=arg(1)+i*(x86_?28:32);GraphicsElement e;e.semantic=read_ansi(memory,memory.load(GuestAddress{at},pointer_bits));const auto fields=bytes32(at+pointer_size,6);e.index=fields[0];e.format=fields[1];e.slot=fields[2];e.offset=fields[3];e.classification=fields[4];e.step=fields[5];require(e.slot<32 && e.classification<2 && (e.classification || !e.step) && device->native->graphics_vertex_format_supported(e.format));if(e.offset==UINT32_MAX)e.offset=ends[e.slot];ends[e.slot]=e.offset+graphics_format_bytes(e.format);elements.push_back(e);}
             for(const auto& input:signature.signatures[0])if(input.system!=6 && input.system!=8)require(std::any_of(elements.begin(),elements.end(),[&](const auto& e){return e.semantic==input.name && e.index==input.index;}));if(!arg(5))result=1;else {auto id=create(Kind::Layout,device->root);id->layout=std::move(elements);write_pointer(arg(5),id->root);}
         }else if(symbol=="CreateBlendState" || symbol=="CreateDepthStencilState" || symbol=="CreateRasterizerState" || symbol=="CreateSamplerState"){
             graphics_handled=true;auto device=typed(arg(0),Kind::Device);if(arg(2)){output(2);write_pointer(arg(2),0);}const bool blend=symbol=="CreateBlendState",depth=symbol=="CreateDepthStencilState",sampler=symbol=="CreateSamplerState";auto desc=read_bytes(memory,arg(1),blend?264:depth?52:sampler?52:40);std::shared_ptr<GraphicsSampler> native;if(sampler)native=device->native->graphics_sampler(desc);if(!arg(2))result=1;else{auto id=create(blend?Kind::Blend:depth?Kind::DepthState:sampler?Kind::Sampler:Kind::Raster,device->root);id->desc=std::move(desc);id->sampler=std::move(native);write_pointer(arg(2),id->root);}

@@ -118,7 +118,7 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 
 저장소에는 `src/`, `include/`, `launcher/`, `cmake/`, 필수 빌드 스크립트, `third_party/`, `x64kernel/` 및 사용 문서가 포함되어 있습니다.
 
-## 실측 기록 / 2026-11-07 / 게임 총 18개
+## 실측 기록 / 2026-11-09 / 게임 총 19개
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="동작하지 않지만 작업 중" title="동작하지 않지만 작업 중"> 동작하지 않지만 작업 중 · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="메인 화면까지 실행" title="메인 화면까지 실행"> 메인 화면까지 실행 · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> 동작하지만 효율이 낮음 · <img src="docs/images/support-levels/good.png" width="16" height="16" alt="원활히 동작" title="원활히 동작"> 원활히 동작
 
@@ -135,6 +135,7 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 | 파이널 판타지 IX | x64 | D3D9(Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활히 동작" title="원활히 동작"> |
 | 역전재판 123 나루호도 셀렉션 | x86 | D3D11(Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활히 동작" title="원활히 동작"> |
 | 천수의 사쿠나히메 | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활히 동작" title="원활히 동작"> |
+| 툼 레이더 (2013) | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활히 동작" title="원활히 동작"> |
 | It Takes Two | x64 | D3D11(Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | Romance of the Three Kingdoms X with Power Up Kit | x86 | 알 수 없음 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | Steam | x64 | Chromium(CEF) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |

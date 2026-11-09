@@ -73,7 +73,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"crt","_crt_debugger_hook",1},{"crt","__crt_debugger_hook",1},
         {"crt", "_configure_narrow_argv", 1}, {"crt", "_initialize_narrow_environment", 0},
         {"crt", "_get_initial_narrow_environment", 0}, {"crt", "_get_initial_wide_environment", 0}, {"crt", "_set_app_type", 1}, {"crt", "_set_new_handler", 1}, {"crt", "_query_new_handler", 0}, {"crt", "_query_new_mode", 0}, {"crt", "_callnewh", 1}, {"crt", "_set_new_mode", 1}, {"crt", "_configthreadlocale", 1},
-        {"crt", "__setusermatherr", 1}, {"crt", "_set_invalid_parameter_handler", 1},{"crt","_set_thread_local_invalid_parameter_handler",1},{"crt","_getpid",0},{"crt","_msize",1},{"crt","_abs64",1},
+        {"crt", "__setusermatherr", 1}, {"crt", "_set_invalid_parameter_handler", 1},{"crt","_set_thread_local_invalid_parameter_handler",1},{"crt","_getpid",0},{"crt","_msize",1},{"crt","_abs64",1},{"crt","llabs",1},{"crt","imaxabs",1},{"crt","abs",1},{"crt","labs",1},{"crt","_rotl",2},{"crt","_rotr",2},{"crt","_lrotl",2},{"crt","_lrotr",2},{"crt","_rotl64",2},{"crt","_rotr64",2},{"crt","_byteswap_ushort",1},{"crt","_byteswap_ulong",1},{"crt","_byteswap_uint64",1},
         {"crt", "_initterm", 2}, {"crt", "_initterm_e", 2}, {"crt", "_crt_at_quick_exit", 1}, {"crt", "at_quick_exit", 1}, {"crt", "quick_exit", 1}, {"crt", "_crt_atexit", 1}, {"crt", "atexit", 1}, {"crt", "_onexit", 1},
         {"crt", "_cexit", 0}, {"crt", "exit", 1}, {"crt", "_exit", 1}, {"crt", "abort", 0}, {"crt", "_set_abort_behavior", 2},
         {"crt","raise",1},{"crt","_invalid_parameter",5},{"crt","_invalid_parameter_noinfo_noreturn",0},{"crt","_invoke_watson",5},
@@ -179,6 +179,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
             {vulkan_service_descriptors(), true},
             {directml_export_service_descriptors(), true},
             {directml_object_service_descriptors(), false},
+            {xess_service_descriptors(), true},
             {msvcp_pmr_service_descriptors(), true},
             {msvcp_special_math_service_descriptors(), true},
             {webview2_loader_service_descriptors(), true},
@@ -2153,6 +2154,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
         if(detail::service_descriptor_contains<opencl_service_descriptors>(service,reuse))return &WindowsServices::invoke_opencl;
         if(service.family=="vulkan-1.dll")return &WindowsServices::invoke_vulkan;
         if(service.family=="directml.dll" || service.family=="internal-directml")return &WindowsServices::invoke_directml;
+        if(service.family=="libxess.dll")return &WindowsServices::invoke_xess;
         if(service.family=="msvcp140_1.dll" || service.family=="internal-msvcp140_1")return &WindowsServices::invoke_msvcp_pmr;
         if(service.family=="msvcp140_2.dll")return &WindowsServices::invoke_msvcp_special_math;
         if(service.family=="webview2loader.dll" || service.family=="internal-webview2")return &WindowsServices::invoke_webview2;
@@ -2491,7 +2493,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
     else if (symbol == "_configthreadlocale") { result = static_cast<std::uint32_t>(runtime_.thread_locale); if (arg(0)) runtime_.thread_locale = static_cast<int>(arg(0)); }
     else if (symbol == "__setusermatherr") { result = runtime_.math_handler; runtime_.math_handler = arg(0); }
     else if(symbol=="_set_thread_local_invalid_parameter_handler") {auto& thread=threads_.items.at(threads_.current);result=thread.invalid_parameter_handler;thread.invalid_parameter_handler=arg(0);}
-    else if(symbol=="_abs64") {const auto value=x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+4},64):arg(0);result=(value>>63)?0-value:value;if(x86_)state.reg(Gpr::Rdx)=static_cast<std::uint32_t>(result>>32);}
+    else if(symbol=="_abs64" || symbol=="llabs" || symbol=="imaxabs") {const auto value=x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+4},64):arg(0);result=(value>>63)?0-value:value;if(x86_)state.reg(Gpr::Rdx)=static_cast<std::uint32_t>(result>>32);}
+    // Windows int／long 都是 32 位；INT_MIN 的絕對值維持 INT_MIN（與 x86 neg 相同）。
+    else if(symbol=="abs" || symbol=="labs") {const auto value=static_cast<std::uint32_t>(arg(0));result=(value>>31)?static_cast<std::uint32_t>(0U-value):value;}
+    else if(symbol=="_rotl" || symbol=="_lrotl")result=std::rotl(static_cast<std::uint32_t>(arg(0)),static_cast<std::int32_t>(arg(1)));
+    else if(symbol=="_rotr" || symbol=="_lrotr")result=std::rotr(static_cast<std::uint32_t>(arg(0)),static_cast<std::int32_t>(arg(1)));
+    else if(symbol=="_rotl64" || symbol=="_rotr64") {
+        // x86 cdecl：64 位值佔兩個堆疊格，次數在其後，結果放 EDX:EAX。
+        const auto stack=state.reg(Gpr::Rsp);
+        const auto value=x86_?memory.load(GuestAddress{stack+4},64):arg(0);
+        const auto count=static_cast<std::int32_t>(x86_?memory.load(GuestAddress{stack+12},32):arg(1));
+        result=symbol=="_rotl64"?std::rotl(value,count):std::rotr(value,count);
+        if(x86_)state.reg(Gpr::Rdx)=static_cast<std::uint32_t>(result>>32);
+    }
+    else if(symbol=="_byteswap_ushort")result=__builtin_bswap16(static_cast<std::uint16_t>(arg(0)));
+    else if(symbol=="_byteswap_ulong")result=__builtin_bswap32(static_cast<std::uint32_t>(arg(0)));
+    else if(symbol=="_byteswap_uint64") {
+        const auto value=x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+4},64):arg(0);
+        result=__builtin_bswap64(value);
+        if(x86_)state.reg(Gpr::Rdx)=static_cast<std::uint32_t>(result>>32);
+    }
     else if(symbol=="_msize" && guest_heap_contains(arg(0)))result=guest_heap_block_size(memory,arg(0));
     else if(symbol=="_msize") {const auto found=allocations_.find(arg(0));if(found!=allocations_.end())result=found->second;else {memory.store(GuestAddress{runtime_.errno_cell},32,22);result=UINT64_MAX;}}
     else if (symbol == "_set_invalid_parameter_handler") { result = runtime_.invalid_parameter_handler; runtime_.invalid_parameter_handler = arg(0); }

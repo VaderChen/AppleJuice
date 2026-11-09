@@ -24,6 +24,15 @@ void trace_crt_file_failure(std::string_view operation,const char* phase,std::st
         static_cast<int>(operation.size()),operation.data(),phase,static_cast<int>(path.size()),path.empty()?"":path.data(),
         code,native_error,static_cast<unsigned long long>(requested),static_cast<unsigned long long>(transferred),stdio_limit,stdio_used);
 }
+void commit_crt_seek(CrtFile& file,FilePositionReference position,std::uint64_t offset){
+    position=offset;
+    file.eof=file.lowio_eof=false;
+    file.pushback.clear();
+    file.lowio_low_surrogate.reset();
+    file.lowio_lookahead={10,10,10};
+    file.lowio_needed_input=0;
+    file.lowio_multibyte_size=0;
+}
 }
 FilePositionReference WindowsServices::crt_file_position(CrtFile& file) {
     if(file.os_handle){const auto found=files_.find(file.os_handle);if(found!=files_.end())return FilePositionReference{runtime_.win_file_positions.at(found->second.object)};}
@@ -95,10 +104,11 @@ std::uint64_t WindowsServices::write_crt_wide_stream(GuestState& state,GuestMemo
     while(at<written){const auto decoded=windows_crt_decode(std::span(bytes).subspan(at,static_cast<std::size_t>(written)-at),page);if(decoded.status!=CrtDecodedCharacter::Status::Complete)break;at+=decoded.bytes;characters+=decoded.character>65535?2U:1U;}
     return characters;
 }
-std::vector<std::uint8_t> WindowsServices::read_crt_file(GuestMemory& memory,CrtFile& file,std::size_t requested,bool stream) {
+std::vector<std::uint8_t> WindowsServices::read_crt_file(GuestMemory& memory,CrtFile& file,std::size_t requested,bool stream,std::uint64_t worker_errno) {
     file.lowio_error=0;
-    const auto failed=[&](std::uint32_t code){file.lowio_error=code;if(stream)file.error=true;memory.store(GuestAddress{runtime_.errno_cell},32,code);};
-    if(!import_crt_lowio(memory,file) || (file.os_handle && !files_.contains(file.os_handle))){failed(9);return {};}
+    const auto failed=[&](std::uint32_t code){file.lowio_error=code;if(stream)file.error=true;memory.store(GuestAddress{worker_errno?worker_errno:runtime_.errno_cell},32,code);};
+    // worker 已在同一把 lowio 鎖下確認客體欄位和宿主串流一致，並傳入呼叫執行緒的 errno。
+    if(!worker_errno && (!import_crt_lowio(memory,file) || (file.os_handle && !files_.contains(file.os_handle)))){failed(9);return {};}
     std::vector<std::uint8_t> output;
     if(!file.readable){failed(9);return output;}
     if(stream)import_crt_buffer(memory,file,x86_);
@@ -241,6 +251,91 @@ std::vector<std::uint8_t> WindowsServices::read_crt_file(GuestMemory& memory,Crt
     file.lowio_read_flags=static_cast<std::uint8_t>(!output.empty() && output.front()==10?4:0);publish_crt_lowio(memory,file);
     return output;
 }
+bool WindowsServices::invoke_parallel_crt_file(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service,
+                                               std::uint64_t thread,std::uint64_t errno_cell){
+    const auto stack=state.reg(Gpr::Rsp);
+    if(stack%16!=8 || memory.native_private_span(GuestAddress{stack},40,3).empty())return false;
+    const WindowsCall arg(state,memory,service);
+    const bool reading=service.symbol=="fread";
+    if(reading && (!arg(1) || !arg(2))){arg.return_to(state,0);return true;}
+
+    // 外層持共用映射鎖，關閉／改模式／註冊等待均由協調者完成。此鎖另序列化 worker 對 CRT 串流與共用檔案游標的操作。
+    // 遇到競爭即交回原 provider，避免持映射鎖等待另一個 worker。
+    const std::unique_lock lock(*crt_file_worker_mutex_,std::try_to_lock);
+    if(!lock)return false;
+    const auto stream=crt_stream(arg(reading?3:0));
+    const auto found=runtime_.streams.find(stream);
+    if(found==runtime_.streams.end())return false;
+    auto& file=found->second;
+    if(file.descriptor<3 || !file.readable || file.writable || file.text || !file.lowio_published || file.lowio_handle_override ||
+       file.lowio_handle!=file.os_handle || !(file.lowio_flags&crt_lowio::opened) || file.standard_handle ||
+       file.buffer.capacity || file.buffer.direction!=CrtFile::Buffer::Direction::None || !file.pushback.empty() || file.lowio_low_surrogate ||
+       file.lowio_lookahead!=std::array<std::uint8_t,3>{10,10,10} || !file.native || !file.native->local_stream_file())return false;
+    if(const auto held=runtime_.file_locks.find(stream);held!=runtime_.file_locks.end() && held->second.owner)return false;
+    const auto handle=files_.find(file.os_handle);
+    if(handle==files_.end() || handle->second.native!=file.native || (handle->second.metadata.attributes&0x50U) ||
+       handle->second.pipe || handle->second.serial || handle->second.hid || handle->second.usb)return false;
+    const auto position_entry=runtime_.win_file_positions.find(handle->second.object);
+    if(position_entry==runtime_.win_file_positions.end() || position_entry->second.identity())return false;
+    auto position=FilePositionReference{position_entry->second};
+
+    constexpr auto layout=crt_lowio::layout(false);
+    const auto row=crt_lowio_record(memory,file.descriptor,false);
+    if(!row || !errno_cell || memory.native_private_span(GuestAddress{row},layout.stride,3).empty() ||
+       memory.native_private_span(GuestAddress{stream},32,3).empty() || memory.native_private_span(GuestAddress{errno_cell},4,3).empty())return false;
+    const auto section=runtime_.critical_sections.find(row+layout.critical);
+    if(section==runtime_.critical_sections.end() || !section->second.guest || section->second.waiters_hint)return false;
+    const auto overlaps=[](std::uint64_t first,std::uint64_t size,std::uint64_t second,std::uint64_t length){
+        return first<second+length && second<first+size;
+    };
+    if(overlaps(stack,8,row,layout.stride) || overlaps(stack,8,stream,32) || overlaps(stack,8,errno_cell,4))return false;
+
+    std::uint64_t requested=0,next=0;
+    if(reading){
+        constexpr std::uint64_t limit=64U*1024U;
+        if(!arg(0) || arg(2)>limit/arg(1))return false;
+        requested=arg(1)*arg(2);
+        const auto output=arg(0);
+        if(memory.native_private_span(GuestAddress{output},static_cast<std::size_t>(requested),2).empty() ||
+           overlaps(output,requested,stack,8) || overlaps(output,requested,row,layout.stride) ||
+           overlaps(output,requested,stream,32) || overlaps(output,requested,errno_cell,4))return false;
+    }else{
+        const auto origin=static_cast<std::uint32_t>(arg(2));
+        if(origin>1)return false; // SEEK_END 需要目前檔案大小，沿用完整服務。
+        const auto offset=service.symbol=="fseek"?static_cast<std::int64_t>(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(1)))):
+                                                   std::bit_cast<std::int64_t>(arg(1));
+        const auto target=static_cast<__int128>(offset)+(origin?static_cast<std::uint64_t>(position):0);
+        if(target<0 || target>INT64_MAX)return false;
+        next=static_cast<std::uint64_t>(target);
+    }
+
+    // 只從無持有者、無等待者的字組取得既有 lowio 臨界區段。其他執行緒要登記等待時必須取得映射寫鎖，
+    // 因此這裡釋放時不需要喚醒等待者。直接操作 _pioinfo 的客體仍受同一把鎖保護。
+    if(memory.load(GuestAddress{section->first+8},32)!=UINT32_MAX ||
+       !critical_acquire(memory,section->first,section->second,thread,false))return false;
+    struct Release {
+        WindowsServices& services;GuestMemory& memory;std::uint64_t address;CriticalSection& section;
+        ~Release(){(void)services.critical_release(memory,address,section);}
+    } release{*this,memory,section->first,section->second};
+    if(memory.load(GuestAddress{row},64)!=file.lowio_handle || memory.load(GuestAddress{row+layout.flags},8)!=file.lowio_flags ||
+       memory.load(GuestAddress{row+layout.extended},32)!=file.lowio_extended)return false;
+    for(unsigned i=0;i<file.lowio_lookahead.size();++i)
+        if(memory.load(GuestAddress{row+layout.lookahead+i},8)!=file.lowio_lookahead[i])return false;
+
+    std::uint64_t result=0;
+    if(reading){
+        const auto bytes=read_crt_file(memory,file,static_cast<std::size_t>(requested),true,errno_cell);
+        memory.write(GuestAddress{arg(0)},bytes);
+        result=bytes.size()/arg(1);
+        publish_crt_lowio(memory,file);
+    }else{
+        commit_crt_seek(file,position,next);
+        crt_buffer_fields(memory,file);
+    }
+    arg.return_to(state,result);
+    return true;
+}
+
 std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;std::uint64_t result=0;
     const auto u32=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
@@ -752,7 +847,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
                 const auto offset=(symbol=="fseek" || symbol=="_lseek")?static_cast<std::int64_t>(std::bit_cast<std::int32_t>(u32(1))):std::bit_cast<std::int64_t>(arg(1));
                 const __int128 next=static_cast<__int128>(offset)+(u32(2)==1?(descriptor?physical:logical):u32(2)==2?(file.native?file.native->information().metadata.size:file.bytes.size()):0);
                 if(u32(2)>2 || next<0 || next>INT64_MAX || (symbol=="_lseek" && next>INT32_MAX))error(22,symbol=="_lseeki64"?UINT64_MAX:UINT32_MAX);
-                else if(!descriptor && !flush_crt_file(memory,file))result=UINT32_MAX;else {position=static_cast<std::uint64_t>(next);file.eof=file.lowio_eof=false;file.pushback.clear();file.lowio_low_surrogate.reset();file.lowio_lookahead={10,10,10};file.lowio_needed_input=0;file.lowio_multibyte_size=0;if(descriptor){file.buffer.used=file.buffer.cursor=0;file.buffer.direction=CrtFile::Buffer::Direction::None;crt_buffer_fields(memory,file);result=position;}}
+                else if(!descriptor && !flush_crt_file(memory,file))result=UINT32_MAX;else {commit_crt_seek(file,position,static_cast<std::uint64_t>(next));if(descriptor){file.buffer.used=file.buffer.cursor=0;file.buffer.direction=CrtFile::Buffer::Direction::None;crt_buffer_fields(memory,file);result=position;}}
             } else throw HostCallFault("CRT I/O 未處理的服務");
         }
     }
