@@ -35,29 +35,33 @@ std::uint32_t WindowsServices::local_primary_thread_control(std::uint32_t operat
 std::optional<std::uint32_t> WindowsServices::invoke_thread_control(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall call(state,memory,service);const bool native=service.family=="ntdll.dll";
     const auto name=native?service.symbol.substr(2):service.symbol;const auto saved_error=last_error_;
-    const bool getter=name=="GetThreadContext" || name=="Wow64GetThreadContext";
-    const bool setter=name=="SetThreadContext" || name=="Wow64SetThreadContext";
+    // NtGetContextThread／NtSetContextThread（含 Zw 別名）與 Win32 版共用存取權、暫停與 CONTEXT 驗證；
+    // 第二參數是 CONTEXT 而非暫停計數，不寫回 ULONG，錯誤改以 NTSTATUS 回報。
+    const bool getter=name=="GetThreadContext" || name=="Wow64GetThreadContext" || (native && name=="GetContextThread");
+    const bool setter=name=="SetThreadContext" || name=="Wow64SetThreadContext" || (native && name=="SetContextThread");
+    const bool context_call=native && (getter || setter);
     const bool wow64=name.starts_with("Wow64");const bool suspend=name=="SuspendThread" || name=="Wow64SuspendThread";
     const auto mode=wow64 || x86_?ExecutionMode::X86:ExecutionMode::X64;
     const auto fail=[&](std::uint32_t error){
         if(native){
+            // CONTEXT 參數錯誤（空指標、旗標、目標未暫停）為 STATUS_INVALID_PARAMETER；暫停服務的 87 表示執行緒正在結束。
             const auto status=error==5?0xc0000022U:error==6?(object_type(call(0)).empty()?0xc0000008U:0xc0000024U):
-                error==8?0xc0000017U:error==87?0xc000004bU:error==156?0xc000004aU:error==998?0xc0000005U:
-                error==128?0x80000002U:error==121?0xc00000b5U:error==50?0xc00000bbU:0xc0000001U;
+                error==8?0xc0000017U:error==87?(context_call?0xc000000dU:0xc000004bU):error==156?0xc000004aU:error==998?0xc0000005U:
+                error==128?0x80000002U:error==121?0xc00000b5U:error==50?0xc00000bbU:error==170?0xc0000008U:error==13?0xc000000dU:0xc0000001U;
             threads_.items.at(threads_.current).last_native_status=status;last_error_=saved_error;call.return_to(state,status);
         }else{last_error_=error;call.return_to(state,getter || setter?0:UINT32_MAX);}
         return std::optional<std::uint32_t>{};
     };
     const auto finish=[&](std::uint32_t value){
         if(native){
-            if(call(1))memory.store(GuestAddress{call(1)},32,value);
+            if(call(1) && !context_call)memory.store(GuestAddress{call(1)},32,value);
             threads_.items.at(threads_.current).last_native_status=0;last_error_=saved_error;
         }
         call.return_to(state,native?0:value);return std::optional<std::uint32_t>{};
     };
     try {
         // 輸出只有 ULONG，且先探測再改計數；自我暫停在寫回及 ABI 返回後才排程。
-        if(native && call(1)){
+        if(native && call(1) && !context_call){
             if(call(1)%4)return fail(128);
             memory.check(GuestAddress{call(1)},4,Access::Write);
         }
@@ -71,7 +75,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread_control(GuestState& 
         std::uint32_t flags=0,value=0;std::vector<std::uint8_t> context;
         if(getter || setter) {
             if(!call(1))return fail(87);
-            if(call(1)%(mode==ExecutionMode::X86?4U:16U))return fail(998);
+            if(call(1)%(mode==ExecutionMode::X86?4U:16U))return fail(context_call?128:998);
             memory.check(GuestAddress{call(1)},thread_context::size(mode),Access::Read);
             if(getter)memory.check(GuestAddress{call(1)},thread_context::size(mode),Access::Write);
             flags=static_cast<std::uint32_t>(memory.load(GuestAddress{call(1)+thread_context::flags_offset(mode)},32));
@@ -80,7 +84,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread_control(GuestState& 
         }
         if(id) {
             auto& thread=threads_.items.at(id);
-            if(thread.status==ThreadStatus::Exited){if(native && !suspend)return finish(0);return fail(87);}
+            if(thread.status==ThreadStatus::Exited){if(native && !suspend && !context_call)return finish(0);
+                if(context_call){threads_.items.at(threads_.current).last_native_status=0xc000004bU;last_error_=saved_error;call.return_to(state,0xc000004bU);return std::nullopt;}
+                return fail(87);}
             if(getter) {
                 if(id!=threads_.current && !thread.suspended)return fail(87);
                 context=thread_context::capture(id==threads_.current?state:thread.context,mode,flags);

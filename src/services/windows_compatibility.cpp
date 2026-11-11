@@ -15,6 +15,8 @@
 #include "x64arm/security_descriptor.hpp"
 #include "x64arm/security_access.hpp"
 #include <algorithm>
+#include <array>
+#include <random>
 #include <bit>
 #include <cctype>
 #include <cstdio>
@@ -199,24 +201,24 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll","lstrcpynA",3},{"kernel32.dll","lstrcpynW",3},
         {"kernel32.dll","lstrcatA",2},{"kernel32.dll","lstrcatW",2},
         {"crt", "__std_exception_copy", 2}, {"crt", "__std_exception_destroy", 1}, {"crt", "_strdup", 1}, {"crt", "_strnicmp", 3}, {"crt", "_stricmp", 2}, {"crt", "_strcmpi", 2}, {"crt", "_wcsicmp", 2}, {"crt", "_wcsnicmp", 3}, {"crt", "strspn", 2}, {"crt", "strcspn", 2},
-        {"crt", "isspace", 1}, {"crt", "isalnum", 1}, {"crt", "isalpha", 1},
-        {"crt", "isdigit", 1}, {"crt", "isxdigit", 1}, {"crt", "isupper", 1}, {"crt", "islower", 1},
-        {"crt", "isprint", 1}, {"crt", "isgraph", 1}, {"crt", "ispunct", 1}, {"crt", "iscntrl", 1},
-        {"crt", "iswspace", 1}, {"crt", "iswalnum", 1}, {"crt", "iswalpha", 1}, {"crt", "iswcntrl", 1},
-        {"crt", "iswdigit", 1}, {"crt", "iswxdigit", 1}, {"crt", "iswupper", 1}, {"crt", "iswlower", 1},
-        {"crt", "iswprint", 1}, {"crt", "iswgraph", 1}, {"crt", "iswpunct", 1}, {"crt", "iswblank", 1},
-        {"crt", "tolower", 1}, {"crt", "toupper", 1}, {"crt", "towlower", 1}, {"crt", "towupper", 1},
-        {"crt", "_fileno", 1}, {"crt", "_isatty", 1}, {"crt", "_get_osfhandle", 1}, {"crt", "_setmode", 2},
+        
+        
+        
+        
+        
+        
+        
+        {"crt", "_fileno", 1}, 
         {"crt", "rand_s", 1}, {"crt", "rand", 0}, {"crt", "srand", 1},
         {"crt", "qsort", 4}, {"crt", "bsearch", 5},
         {"crt", "setlocale", 2}, {"crt", "_wsetlocale", 2}, {"crt", "localeconv", 0}, {"crt", "___lc_codepage_func", 0}, {"crt", "___lc_collate_cp_func", 0},
         {"crt", "___mb_cur_max_func", 0}, {"crt", "__mb_cur_max_func", 0}, {"crt","_ismbblead",1},{"crt","_ismbbtrail",1}, {"crt", "_lock", 1}, {"crt", "_unlock", 1},
         {"crt", "__lconv_init", 0},
         {"crt", "wcrtomb", 3}, {"crt", "wctomb", 2},
-        {"crt", "___lc_locale_name_func", 0}, {"crt", "__pctype_func", 0}, {"crt", "wctype", 1},
-        {"crt", "iswctype", 2}, {"crt", "_isctype", 2}, {"crt", "isblank", 1},
+        {"crt", "___lc_locale_name_func", 0}, {"crt", "__pctype_func", 0}, 
+        
         {"crt", "btowc", 1}, {"crt", "wctob", 1}, {"crt", "mbrtowc", 4}, {"crt", "mbrlen", 3}, {"crt", "mbtowc", 3}, {"crt", "mblen", 2}, {"crt", "mbsinit", 1},
-        {"crt", "_lock_locales", 0}, {"crt", "_unlock_locales", 0}, {"crt", "_lock_file", 1}, {"crt", "_unlock_file", 1}, {"crt", "fputc", 2}, {"crt", "putc", 2}, {"crt", "_write", 3},
+        {"crt", "_lock_locales", 0}, {"crt", "_unlock_locales", 0}, {"crt", "_lock_file", 1}, {"crt", "_unlock_file", 1}, 
         {"crt", "_fullpath", 3}, {"crt", "_wfullpath", 3}, {"crt", "_getcwd", 2}, {"crt", "_wgetcwd", 2},
         {"crt", "_getdrive", 0}, {"crt", "_getdcwd", 3}, {"crt", "_wgetdcwd", 3},
         {"crt", "_getdcwd_nolock", 3}, {"crt", "_wgetdcwd_nolock", 3},
@@ -234,7 +236,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"dbgeng.dll","DebugCreate",2},{"dbgeng.dll","DebugCreateEx",3},{"dbgeng.dll","DebugConnect",3},{"dbgeng.dll","DebugConnectWide",3},
         {"tbs.dll","Tbsi_GetDeviceInfo",2},{"tbs.dll","Tbsi_Context_Create",2},{"tbs.dll","Tbsip_Context_Close",1},{"tbs.dll","Tbsip_Submit_Command",7},{"tbs.dll","Tbsi_Revoke_Attestation",0},
         {"kernel32.dll","SetFirmwareEnvironmentVariableA",4},{"kernel32.dll","SetFirmwareEnvironmentVariableW",4},{"kernel32.dll","SetFirmwareEnvironmentVariableExA",5},{"kernel32.dll","SetFirmwareEnvironmentVariableExW",5},
-        {"kernel32.dll", "AreFileApisANSI", 0}, {"kernel32.dll", "IsDBCSLeadByteEx", 2},
+        {"kernel32.dll", "IsDBCSLeadByteEx", 2},
         {"kernel32.dll", "IsWow64Process", 2}, {"kernel32.dll", "IsWow64Process2", 3},
         {"kernel32.dll", "GetCurrentProcess", 0}, {"kernel32.dll", "GetCurrentThread", 0},
         {"kernel32.dll", "DuplicateHandle", 7}, {"kernel32.dll", "GetThreadPriorityBoost", 2}, {"kernel32.dll", "SetThreadPriorityBoost", 2}, {"kernel32.dll", "GetThreadPriority", 1}, {"kernel32.dll", "SetThreadPriority", 2},
@@ -272,23 +274,24 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll", "GetSystemWow64DirectoryA", 2}, {"kernel32.dll", "GetSystemWow64DirectoryW", 2},
         {"kernel32.dll", "GetWindowsDirectoryA", 2}, {"kernel32.dll", "GetWindowsDirectoryW", 2},
         {"kernel32.dll", "GetSystemWindowsDirectoryA", 2}, {"kernel32.dll", "GetSystemWindowsDirectoryW", 2},
-        {"powrprof.dll", "PowerGetActiveScheme", 2}, {"powrprof.dll", "CallNtPowerInformation", 5}, {"rpcrt4.dll", "UuidToStringA", 2}, {"rpcrt4.dll", "UuidToStringW", 2}, {"rpcrt4.dll", "RpcStringFreeA", 1}, {"rpcrt4.dll", "RpcStringFreeW", 1}, {"rpcrt4.dll", "UuidCreate", 1}, {"ole32.dll", "CoCreateGuid", 1}, {"kernel32.dll", "SetHandleCount", 1}, {"kernel32.dll", "GetThreadErrorMode", 0}, {"kernel32.dll", "SetThreadErrorMode", 2}, {"kernel32.dll", "DelayLoadFailureHook", 2}, {"kernel32.dll", "__chkstk", 0}, {"kernel32.dll", "GetErrorMode", 0}, {"kernel32.dll", "SetErrorMode", 1},
+        {"powrprof.dll", "PowerGetActiveScheme", 2}, {"powrprof.dll", "CallNtPowerInformation", 5}, {"rpcrt4.dll", "UuidToStringA", 2}, {"rpcrt4.dll", "UuidToStringW", 2}, {"rpcrt4.dll", "RpcStringFreeA", 1}, {"rpcrt4.dll", "RpcStringFreeW", 1}, {"rpcrt4.dll", "UuidCreate", 1}, {"rpcrt4.dll", "UuidCreateSequential", 1}, {"ole32.dll", "CoFileTimeNow", 1}, {"ole32.dll", "CoGetCurrentProcess", 0}, {"ole32.dll", "CoCreateGuid", 1}, {"kernel32.dll", "SetHandleCount", 1}, {"kernel32.dll", "GetThreadErrorMode", 0}, {"kernel32.dll", "SetThreadErrorMode", 2}, {"kernel32.dll", "DelayLoadFailureHook", 2}, {"kernel32.dll", "__chkstk", 0}, {"kernel32.dll", "GetErrorMode", 0}, {"kernel32.dll", "SetErrorMode", 1},
         {"kernel32.dll", "WerGetFlags", 2}, {"kernel32.dll", "WerSetFlags", 1},
-        {"kernel32.dll", "GetEnvironmentStringsW", 0}, {"kernel32.dll", "GetEnvironmentStringsA", 0},
-        {"kernel32.dll", "FreeEnvironmentStringsW", 1}, {"kernel32.dll", "FreeEnvironmentStringsA", 1},
+        
+        
         {"kernel32.dll", "CreateWaitableTimerExA", 4,0,0,12}, {"kernel32.dll", "CreateWaitableTimerExW", 4,0,0,12},
         {"kernel32.dll", "CreateWaitableTimerA", 3,0,0,2}, {"kernel32.dll", "CreateWaitableTimerW", 3,0,0,2},
         {"kernel32.dll", "OpenWaitableTimerA", 3,0,0,3}, {"kernel32.dll", "OpenWaitableTimerW", 3,0,0,3},
         {"kernel32.dll", "IsDebuggerPresent", 0}, {"kernel32.dll", "IsProcessorFeaturePresent", 1},
         {"kernel32.dll", "GetEnabledXStateFeatures", 0}, {"ntdll.dll", "RtlGetEnabledExtendedFeatures", 1, 1},
-        {"kernel32.dll", "QueryPerformanceCounter", 1}, {"kernel32.dll", "QueryPerformanceFrequency", 1},
-        {"kernel32.dll", "GetSystemTimeAsFileTime", 1}, {"kernel32.dll", "GetTickCount", 0},
-        {"kernel32.dll", "TryEnterCriticalSection", 1},
+        
+        
+        
         {"shlwapi.dll", "PathIsRelativeA", 1}, {"shlwapi.dll", "PathIsRelativeW", 1},
         {"shlwapi.dll", "PathFindExtensionA", 1}, {"shlwapi.dll", "PathFindExtensionW", 1},
         {"shlwapi.dll", "PathFindFileNameA", 1}, {"shlwapi.dll", "PathFindFileNameW", 1},
         {"shlwapi.dll", "PathFindNextComponentA", 1}, {"shlwapi.dll", "PathFindNextComponentW", 1},
         {"shlwapi.dll", "PathIsUNCA", 1}, {"shlwapi.dll", "PathIsUNCW", 1},
+        {"shlwapi.dll", "PathGetCharTypeA", 1}, {"shlwapi.dll", "PathGetCharTypeW", 1}, {"shlwapi.dll", "StrTrimA", 2}, {"shlwapi.dll", "StrTrimW", 2},
         {"shlwapi.dll", "StrCmpA", 2}, {"shlwapi.dll", "StrCmpW", 2},
         {"shlwapi.dll", "StrCmpIA", 2}, {"shlwapi.dll", "StrCmpIW", 2},
         {"shlwapi.dll", "StrCmpNA", 3}, {"shlwapi.dll", "StrCmpNW", 3},
@@ -303,7 +306,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll", "CreateMutexExA", 4}, {"kernel32.dll", "CreateMutexExW", 4}, {"kernel32.dll", "OpenMutexA", 3}, {"kernel32.dll", "OpenMutexW", 3},
         {"kernel32.dll", "CreateEventExA", 4}, {"kernel32.dll", "CreateEventExW", 4}, {"kernel32.dll", "CreateEventA", 4}, {"kernel32.dll", "CreateEventW", 4}, {"kernel32.dll", "SetEvent", 1}, {"kernel32.dll", "ResetEvent", 1},
         {"kernel32.dll", "OpenEventA", 3}, {"kernel32.dll", "OpenEventW", 3},
-        {"kernel32.dll", "WaitForSingleObject", 2}, {"kernel32.dll", "WaitForMultipleObjects", 4},
+        
         {"setupapi.dll","SetupDiClassGuidsFromNameA",4},{"setupapi.dll","SetupDiClassGuidsFromNameExA",6},
         {"setupapi.dll","SetupDiClassGuidsFromNameW",4},{"setupapi.dll","SetupDiClassGuidsFromNameExW",6},
         {"setupapi.dll","SetupDiClassNameFromGuidA",4},{"setupapi.dll","SetupDiClassNameFromGuidExA",6},
@@ -464,6 +467,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     if(module_api=="SetDefaultDllDirectories" || module_api=="AddDllDirectory" || module_api=="RemoveDllDirectory")return invoke_module(state,memory,service);
     if(module_api.starts_with("QueryFullProcessImageName") || module_api.starts_with("GetProcessImageFileName") || module_api.starts_with("K32") || module_api.starts_with("EnumProcessModules") || module_api.starts_with("GetModule") || module_api.starts_with("LoadLibrary") || module_api.starts_with("GetDllDirectory") || module_api.starts_with("SetDllDirectory") || module_api=="GetProcAddress" || module_api=="FreeLibrary" || module_api=="DisableThreadLibraryCalls")return invoke_module(state,memory,service);
     if (service.symbol == "qsort" || service.symbol == "bsearch") return start_sort(state, memory, service.symbol=="bsearch");
+    if(service.symbol=="__chkstk"){
+        // x64 堆疊探測：呼叫端在配置區域框架前呼叫，進入時 RSP 為 16n（不是一般呼叫的 16n+8），也沒有 home area，
+        // 因此不經 WindowsCall 的框架檢查。RAX 為配置大小，自回傳位址之上逐頁往下確認可寫；保留 RAX 與其他暫存器，
+        // 只有 R10／R11 屬可破壞暫存器。範圍不可寫時照常產生存取違規。x86 的 _chkstk 會自行調整 ESP，語義不同。
+        if(x86_)throw HostCallFault("__chkstk 只有 x64 語義");
+        const auto size=state.reg(Gpr::Rax),top=state.reg(Gpr::Rsp)+8;
+        if(size>top)throw HostCallFault("__chkstk 配置大小超過堆疊位址");
+        for(auto page=(top-1)&~UINT64_C(4095);;page-=4096){
+            memory.check(GuestAddress{std::max(page,top-size)},1,Access::Write);
+            if(page<=top-size || page<4096)break;
+        }
+        state.rip=GuestAddress{memory.load(GuestAddress{state.reg(Gpr::Rsp)},64)};state.reg(Gpr::Rsp)+=8;
+        return std::nullopt;
+    }
     const WindowsCall arg(state, memory, service);
     const auto symbol = service.symbol;
     const auto dword = [&](unsigned i) { return static_cast<std::uint32_t>(arg(i)); };
@@ -588,6 +605,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
                 }
             }
             result=arg(0)+at*unit;
+        }
+    }else if(symbol.starts_with("PathGetCharType")){
+        // GCT_INVALID=0、GCT_LFNCHAR=1、GCT_SHORTCHAR=2、GCT_WILD=4、GCT_SEPARATOR=8；與 Windows 相同，非 ASCII 視為短檔名可用字元。
+        const auto c=static_cast<std::uint32_t>(symbol.ends_with('W')?arg(0)&0xffffU:arg(0)&0xffU);
+        if(c<0x20 || c=='<' || c=='>' || c=='"' || c=='|' || c=='/')result=0;
+        else if(c=='*' || c=='?')result=4;
+        else if(c=='\\' || c==':')result=8;
+        else {
+            const bool alnum=(c>='0' && c<='9') || (c>='A' && c<='Z') || (c>='a' && c<='z');
+            const bool short_name=c>=126 || alnum || ((c&1U) && c!=';') || c=='$' || c=='&' || c=='(' || c=='.' || c=='@' || c=='^' || c=='\'' || c=='`';
+            result=1U|(short_name?2U:0U);
+        }
+    }else if(symbol.starts_with("StrTrim")){
+        // 去掉前後屬於 pszTrimChars 的字元並就地前移；有移除任何字元才回 TRUE。
+        const unsigned unit=symbol.ends_with('W')?2U:1U;const auto width=static_cast<std::uint8_t>(unit*8);
+        if(arg(0) && arg(1)){
+            std::vector<std::uint32_t> trim;for(std::uint64_t i=0;;++i){if(i>=65536)throw HostCallFault("StrTrim 字元集過長");const auto c=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)+i*unit},width));if(!c)break;trim.push_back(c);}
+            std::uint64_t length=0;while(memory.load(GuestAddress{arg(0)+length*unit},width)){if(++length>=(UINT64_C(1)<<24))throw HostCallFault("StrTrim 字串過長");}
+            const auto in=[&](std::uint64_t i){return std::find(trim.begin(),trim.end(),static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+i*unit},width)))!=trim.end();};
+            std::uint64_t first=0,last=length;while(first<length && in(first))++first;while(last>first && in(last-1))--last;
+            if(first || last!=length){
+                if(first)memory.move(GuestAddress{arg(0)},GuestAddress{arg(0)+first*unit},static_cast<std::size_t>((last-first)*unit));
+                memory.store(GuestAddress{arg(0)+(last-first)*unit},width,0);result=1;
+            }
         }
     }else if(symbol.starts_with("PathFindExtension") || symbol.starts_with("PathFindFileName") || symbol.starts_with("PathIsRelative") || symbol.starts_with("PathIsUNC")){
         const bool wide=symbol.ends_with('W');
@@ -844,6 +885,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         const std::uint8_t width=x86_?32:64;memory.check(GuestAddress{arg(0)},width/8,Access::Write);
         if(!free_heap(memory,memory.load(GuestAddress{arg(0)},width),state))result=87;
         else memory.store(GuestAddress{arg(0)},width,0);
+    } else if(symbol=="UuidCreateSequential") {
+        // 第 1 版（時間式）UUID：60 位元 100ns 時間自 1582-10-15 起算，同一程序內單調遞增；不暴露宿主網卡位址，
+        // 節點改用程序內固定的隨機值並設群播位元，依文件回 RPC_S_UUID_LOCAL_ONLY（1824）。
+        static std::uint64_t last_time=0;static std::uint16_t clock_sequence=0;static std::array<std::uint8_t,6> node{};static bool seeded=false;
+        memory.check(GuestAddress{arg(0)},16,Access::Write);
+        if(!seeded){std::random_device device;for(auto& b:node)b=static_cast<std::uint8_t>(device());node[0]|=1;clock_sequence=static_cast<std::uint16_t>(device()&0x3fffU);seeded=true;}
+        auto now=runtime_.system_filetime()+UINT64_C(0x0146bf33e42c000);if(now<=last_time)now=last_time+1;last_time=now;
+        memory.store(GuestAddress{arg(0)},32,static_cast<std::uint32_t>(now));memory.store(GuestAddress{arg(0)+4},16,static_cast<std::uint16_t>(now>>32));
+        memory.store(GuestAddress{arg(0)+6},16,static_cast<std::uint16_t>(((now>>48)&0x0fffU)|0x1000U));
+        memory.store(GuestAddress{arg(0)+8},8,static_cast<std::uint8_t>((clock_sequence>>8)|0x80U));memory.store(GuestAddress{arg(0)+9},8,static_cast<std::uint8_t>(clock_sequence));
+        for(unsigned i=0;i<6;++i)memory.store(GuestAddress{arg(0)+10+i},8,node[i]);
+        result=1824;
+    } else if(symbol=="CoFileTimeNow") {
+        if(!arg(0))result=0x80070057U;else {memory.store(GuestAddress{arg(0)},64,runtime_.system_filetime());result=0;}
+    } else if(symbol=="CoGetCurrentProcess") {
+        // 每個執行緒第一次呼叫時從程序內遞增序號取得，之後固定；不會因執行緒 ID 重用而重複。
+        static std::uint32_t next=0;auto& token=threads_.items.at(threads_.current).com_process_token;if(!token)token=++next;result=token;
     } else if(symbol=="UuidCreate" || symbol=="CoCreateGuid") {
         memory.check(GuestAddress{arg(0)},16,Access::Write);
         if(!fill_random(memory,arg(0),16))result=symbol=="UuidCreate"?14U:0x8007000eU;
@@ -855,18 +913,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     else if(symbol=="DelayLoadFailureHook"){
         // 沒有可代替失敗匯入的系統 stub：與 Windows 相同回 NULL 並設 ERROR_PROC_NOT_FOUND，由延遲載入協助函式回報失敗。
         last_error_=127;result=0;
-    }
-    else if(symbol=="__chkstk"){
-        // x64 堆疊探測：RAX 為配置大小，自呼叫端堆疊（回傳位址之上）逐頁往下確認可寫；保留 RAX 與其他暫存器，
-        // 只有 R10／R11 屬可破壞暫存器。範圍不可寫時照常產生存取違規。x86 的 _chkstk 會自行調整 ESP，語義不同。
-        if(x86_)throw HostCallFault("__chkstk 只有 x64 語義");
-        const auto size=state.reg(Gpr::Rax),top=state.reg(Gpr::Rsp)+8;
-        if(size>top)throw HostCallFault("__chkstk 配置大小超過堆疊位址");
-        for(auto page=(top-1)&~UINT64_C(4095);;page-=4096){
-            memory.check(GuestAddress{std::max(page,top-size)},1,Access::Write);
-            if(page<=top-size || page<4096)break;
-        }
-        result=size;
     }
     else if(symbol=="GetThreadErrorMode" || symbol=="SetThreadErrorMode"){
         auto& mode=threads_.items.at(threads_.current).error_mode;
@@ -1144,8 +1190,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         }catch(const SecurityDescriptorError& error){fail(error.code);}
     } else if (symbol == "ReleaseMutex") {
         const auto handle=runtime_.wait_objects.find(arg(0));
+        // NtReleaseMutant 取用 handle 時不要求特定存取權（MUTEX_MODIFY_STATE 為保留位元）：只有 SYNCHRONIZE 的 handle 也能釋放，擁有權才是判準。
         if(handle==runtime_.wait_objects.end() || handle->second.kind!=WaitObject::Kind::Mutex)fail(6);
-        else if(!(handle->second.access&1U))fail(5);
         else {
             auto& mutex=runtime_.mutex_objects.at(handle->second.mutex);
             if(mutex.shared){SharedEventLock lock(mutex.shared->lock_descriptor());const auto error=mutex.shared->release_locked(threads_.current);if(error)fail(error);else result=1;}
@@ -1362,12 +1408,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         const auto page_info=windows_crt_codepage(page);
         const bool legacy_composition=codepage==0 || codepage==3 || codepage==1252;
         const bool multibyte=page!=65001 && page!=1252;
-        const auto allowed_flags=wide?(codepage==1252?0x480U:multibyte && page!=54936?0x400U:0x80U):(legacy_composition?0xfU:multibyte && page!=54936?0xbU:8U);
+        // CP_ACP／CP_OEMCP／CP_THREAD_ACP 別名解析到 UTF-8 時，舊碼頁的組合／預設字元／最佳對應旗標（WC_COMPOSITECHECK、WC_DISCARDNS、WC_SEPCHARS、
+        // WC_DEFAULTCHAR、WC_NO_BEST_FIT_CHARS）照樣接受且不影響結果（Java 啟動器以 CP_THREAD_ACP 帶 0x640）。
+        // 虛擬系統的 ACP 就是 65001：程式從 GetACP()／LOCALE_IDEFAULTANSICODEPAGE／CRT 地區碼頁取得的 65001 代表「系統 ANSI 碼頁」，
+        // 依舊碼頁寫法帶 lpDefaultChar／lpUsedDefaultChar 與上述旗標（舊版 MSVC STL 的 _Wcrtomb 以地區碼頁、&defused 逐字轉換，
+        // std::codecvt／wstring_convert 都經過它）。文件規定明確 CP_UTF8 帶這兩個指標要回 ERROR_INVALID_PARAMETER，但在 ACP=65001 的系統上
+        // 兩種用法無法區分，因此 WideCharToMultiByte 的 65001 比照別名接受；lpUsedDefaultChar 在發生替換時設為 TRUE。
+        const bool ansi_alias=codepage==0 || codepage==1 || codepage==3 || (wide && codepage==65001);
+        const auto allowed_flags=wide?(codepage==1252?0x480U:multibyte && page!=54936?0x400U:ansi_alias?0x6f0U:0x80U):(legacy_composition?0xfU:multibyte && page!=54936?0xbU:8U);
         if (!page_info) fail(87);
         else if((flags&~allowed_flags) || (!wide && (flags&3)==3))fail(1004);
         else if (count == 0 || count < -1 || capacity < 0 || !arg(2) || (!arg(4) && capacity) || arg(2)==arg(4)) fail(87);
-        // CP_UTF8 的明確參數限制不套用到 CP_ACP／CP_OEMCP 別名。
-        else if (wide && codepage==65001 && (arg(6) || arg(7))) fail(87);
         else {
             std::vector<std::uint8_t> output; std::size_t required = 0;
             try {
@@ -1384,8 +1435,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
                         if(arg(6) && page_info->lead[static_cast<unsigned char>(replacement[0])])replacement.push_back(static_cast<char>(memory.load(GuestAddress{arg(6)+1},8)));
                         auto converted=windows_nls_encode(text,page,(flags&0x400U)!=0,replacement,(flags&0x80U)!=0);if(!converted)throw std::invalid_argument("無法轉換指定碼頁");
                         output=std::move(converted->bytes);used_default=converted->used_default;
-                    }else{const auto bytes=codepage==1252?utf16_to_cp1252(text,arg(6)?static_cast<char>(memory.load(GuestAddress{arg(6)},8)):'?',used_default):utf16_to_utf8(text);output.assign(bytes.begin(),bytes.end());}
-                    if(codepage!=65001 && arg(7))memory.store(GuestAddress{arg(7)},32,used_default?1:0);required=output.size();
+                    }else if(codepage==1252){const auto bytes=utf16_to_cp1252(text,arg(6)?static_cast<char>(memory.load(GuestAddress{arg(6)},8)):'?',used_default);output.assign(bytes.begin(),bytes.end());}
+                    else {
+                        // UTF-8：沒有 WC_ERR_INVALID_CHARS 時，孤立的代理字元依 Windows（Vista 起）換成 U+FFFD；有此旗標才回 ERROR_NO_UNICODE_TRANSLATION。
+                        std::u16string repaired;
+                        if(!(flags&0x80U))for(std::size_t i=0;i<text.size();++i){
+                            const auto unit=text[i];
+                            const bool high=unit>=0xd800 && unit<=0xdbff,low=unit>=0xdc00 && unit<=0xdfff;
+                            const bool paired=high && i+1<text.size() && text[i+1]>=0xdc00 && text[i+1]<=0xdfff;
+                            if((high && !paired) || low){if(!used_default)repaired.assign(text,0,i);used_default=true;repaired.push_back(0xfffd);continue;}
+                            if(used_default){repaired.push_back(unit);if(paired)repaired.push_back(text[i+1]);}
+                            if(paired)++i;
+                        }
+                        const auto bytes=utf16_to_utf8(used_default?std::u16string_view(repaired):std::u16string_view(text));output.assign(bytes.begin(),bytes.end());
+                    }
+                    if(arg(7))memory.store(GuestAddress{arg(7)},32,used_default?1:0);required=output.size();
                 } else {
                     std::string text;
                     if (count == -1) { text = read_ansi(memory, arg(2)); text.push_back(0); }

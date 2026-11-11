@@ -336,6 +336,30 @@ bool WindowsServices::invoke_parallel_crt_file(GuestState& state,GuestMemory& me
     return true;
 }
 
+// invoke_crt_io 的描述項：登錄與處理函式放在同一個檔案（群組＝路由單位）。
+std::span<const WindowsServiceDescriptor> crt_io_service_descriptors(){
+    static constexpr WindowsServiceDescriptor table[]{
+        {"crt", "fflush", 1},{"crt", "_flushall", 0},{"crt", "_fcloseall", 0},{"crt", "setvbuf", 4},
+        {"crt", "setbuf", 2},{"crt", "_getmaxstdio", 0},{"crt", "_setmaxstdio", 1},{"crt", "_dup2", 2},
+        {"crt", "_locking", 3},{"crt", "fopen", 2},{"crt", "fopen_s", 3},{"crt", "_wfopen_s", 3},
+        {"crt", "_commit", 1},{"crt", "_fsopen", 3},{"crt", "_wfsopen", 3},{"crt", "fclose", 1},
+        {"crt", "fread", 4},{"crt", "fwrite", 4},{"crt","_chsize",2},{"crt","_chsize_s",2,1U<<1},
+        {"crt","_open_osfhandle",2},{"crt","_filelength",1},{"crt","_filelengthi64",1},{"crt", "_creat", 2},
+        {"crt", "_wcreat", 2},{"crt", "freopen", 3},{"crt", "_wfreopen", 3},{"crt", "_dup", 1},
+        {"crt", "_fdopen", 2},{"crt", "_wfdopen", 2},{"crt", "_close", 1},{"crt", "_read", 3},
+        {"crt", "_open", 3},{"crt", "_wopen", 3},{"crt", "_sopen", 4},{"crt", "_wsopen", 4},
+        {"crt", "_sopen_s", 5},{"crt", "_wsopen_s", 5},{"crt", "_sopen_dispatch", 6},{"crt", "_wsopen_dispatch", 6},
+        {"crt", "tmpfile", 0},{"crt", "tmpfile_s", 1},{"crt","_umask",1},{"crt","_umask_s",2},
+        {"crt", "_lseek", 3},{"crt", "_lseeki64", 3,1U<<1},{"crt", "_tell", 1},{"crt", "_telli64", 1},
+        {"crt", "fgetpos", 2},{"crt", "fsetpos", 2},{"crt", "fseek", 3},{"crt", "_fseeki64", 3,1U<<1},
+        {"crt", "ftell", 1},{"crt", "_ftelli64", 1},{"crt", "feof", 1},{"crt", "ferror", 1},
+        {"crt", "clearerr", 1},{"crt", "rewind", 1},{"crt", "fgetwc", 1},{"crt", "fgetws", 3},
+        {"crt", "fputwc", 2},{"crt", "ungetc", 2},{"crt", "ungetwc", 2},{"crt", "getchar", 0},
+        {"crt", "fgetc", 1},{"crt", "getc", 1},{"crt", "fgets", 3},{"crt", "fputs", 2},
+        {"crt", "_wfopen", 2},{"crt", "_isatty", 1},{"crt", "_get_osfhandle", 1},{"crt", "_setmode", 2},
+        {"crt", "fputc", 2},{"crt", "putc", 2},{"crt", "_write", 3},
+    };return table;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;std::uint64_t result=0;
     const auto u32=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};

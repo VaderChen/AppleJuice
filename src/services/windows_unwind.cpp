@@ -106,6 +106,9 @@ Info parse(const Memory& memory, const RuntimeImage& image, std::uint64_t unwind
         case 4: case 5: slots = op == 4 ? 2U : 3U; break;
         case 8: case 9: slots = op == 8 ? 2U : 3U; break;
         case 10: if (info > 1) throw HostCallFault("PUSH_MACHFRAME 不合法"); break;
+        // 11：Intel 編譯器的 AVX-512 遮罩暫存器保存（kmov k<OpInfo>, [RSP+下一槽×8]），佔 2 槽；JVM 的 jsvml.dll 等使用。
+        // Windows 載入時不驗證 unwind 資料；客體狀態不含 k 暫存器，還原時只需跳過，不影響整數／XMM 還原。
+        case 11: if (info > 7) throw HostCallFault("SAVE_KREG OpInfo 不合法"); slots = 2U; break;
         default: throw HostCallFault("未支援的 unwind opcode");
         }
         if (slots > count - i) throw HostCallFault("unwind code 額外 slot 截斷");
@@ -290,6 +293,7 @@ UnwindResult virtual_unwind(const GuestMemory& memory, const RuntimeImage& image
             case 3: sp = next.gpr[info.frame] - info.frame_offset * 16U; break;
             case 4: case 5: result.integer_sources[code.info]=checked_add(sp, code.argument);next.gpr[code.info] = memory.load(GuestAddress{result.integer_sources[code.info]}, 64); break;
             case 8: case 9: result.floating_sources[code.info]=checked_add(sp, code.argument);memory.read(GuestAddress{result.floating_sources[code.info]}, next.xmm[code.info]); break;
+            case 11: break; // 遮罩暫存器不在客體狀態內
             case 10: {
                 const auto frame = checked_add(sp, code.info * 8U);
                 next.rip = GuestAddress{memory.load(GuestAddress{frame}, 64)};

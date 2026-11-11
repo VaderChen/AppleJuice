@@ -1,10 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 namespace x64arm {
-std::span<const WindowsServiceDescriptor> reparse_service_descriptors(){
-    static constexpr WindowsServiceDescriptor entries[]{{"kernel32.dll","CreateSymbolicLinkW",3},{"kernel32.dll","CreateSymbolicLinkA",3}};
-    return entries;
-}
+// CreateSymbolicLinkA／W 登錄在檔案家族並由 invoke_file 處理；這份實作目前沒有路由（稽核發現的遮蔽，待正確性階段比對後擇一）。
 std::optional<std::uint32_t> WindowsServices::invoke_reparse(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許符號連結宿主寫入");
     const WindowsCall args(state,memory,service);std::uint32_t error=0;const bool wide=service.symbol.ends_with('W');

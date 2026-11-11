@@ -976,7 +976,19 @@ struct GuiWindowPositionOperation {
     unsigned phase{};
     bool operator==(const GuiWindowPositionOperation&) const = default;
 };
+// comctl32 視窗子類別鏈（SetWindowSubclass）：entries 由下而上，最後一筆最先收到訊息。
+struct GuiSubclassEntry {std::uint64_t procedure{},id{},reference{};bool operator==(const GuiSubclassEntry&) const = default;};
+struct GuiSubclassChain {
+    // original 是以 Unicode 視角取得的原程序（ANSI 程序為轉換 handle），供 CallWindowProcW；restore 與 restore_unicode 用來還原 GWLP_WNDPROC。
+    std::uint64_t original{},restore{};bool restore_unicode{true};
+    std::vector<GuiSubclassEntry> entries;
+    bool operator==(const GuiSubclassChain&) const = default;
+};
+// 執行中的子類別程序（每執行緒巢狀）；DefSubclassProc 依此找下一層。
+struct GuiSubclassFrame {std::uint64_t thread{},window{},procedure{},id{};std::size_t index{};bool operator==(const GuiSubclassFrame&) const = default;};
 struct GuiState : GuiStationNamespace {
+    std::map<std::uint64_t,GuiSubclassChain> subclasses;
+    std::vector<GuiSubclassFrame> subclass_frames;
     // 沙盒顯示模式：寬、高、色深、更新率；不更動宿主或其他程序的桌面。
     std::optional<std::array<std::uint32_t,4>> display_mode,display_registry_mode;
     // 最多五筆待確認認證；僅保存綁定虛擬 SID 的加密資料，不保留額外明文密碼。

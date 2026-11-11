@@ -92,6 +92,22 @@ struct MetalPipelineSpec {
         }
         return desc;
     }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+    // mesh 管線（GS 的 mesh 路徑）：附件、混色與取樣設定與一般管線相同，頂點與細分設定不適用。
+    MTLMeshRenderPipelineDescriptor* make_mesh(id<MTLFunction> object,id<MTLFunction> mesh,NSUInteger per_mesh,NSUInteger payload)const{
+        auto desc=[MTLMeshRenderPipelineDescriptor new];desc.objectFunction=object;desc.meshFunction=mesh;desc.fragmentFunction=fragmentFunction;
+        desc.rasterSampleCount=sampleCount;desc.alphaToCoverageEnabled=alphaToCoverageEnabled;
+        for(unsigned i=0;i<colorAttachments.size();++i){
+            const auto& c=colorAttachments[i];auto a=desc.colorAttachments[i];a.pixelFormat=c.pixelFormat;a.blendingEnabled=c.blendingEnabled;
+            a.sourceRGBBlendFactor=c.sourceRGBBlendFactor;a.destinationRGBBlendFactor=c.destinationRGBBlendFactor;a.rgbBlendOperation=c.rgbBlendOperation;
+            a.sourceAlphaBlendFactor=c.sourceAlphaBlendFactor;a.destinationAlphaBlendFactor=c.destinationAlphaBlendFactor;a.alphaBlendOperation=c.alphaBlendOperation;a.writeMask=c.writeMask;
+        }
+        desc.depthAttachmentPixelFormat=depthAttachmentPixelFormat;desc.stencilAttachmentPixelFormat=stencilAttachmentPixelFormat;
+        desc.payloadMemoryLength=payload;desc.maxTotalThreadsPerObjectThreadgroup=1;desc.maxTotalThreadsPerMeshThreadgroup=per_mesh;desc.maxTotalThreadgroupsPerMeshGrid=1024;
+        return desc;
+    }
+#pragma clang diagnostic pop
 };
 // 深度／stencil 狀態的純值版本：未設定的 stencil 面與 Metal 預設相同（Always、Keep、遮罩全開），快取鍵與描述物件版本一致。
 struct MetalDepthSpec {
@@ -210,6 +226,9 @@ struct MetalResource final:GraphicsResource {
     // 自上次全部等待以來，這個緩衝是否可能有 GPU 複製寫入尚未完成（CPU 直接寫入不算）。
     // CPU 需要讀取內容的路徑（幾何著色器的索引範圍）只在此時才等 GPU；UAV／串流輸出目標另依 bind 判斷。
     bool gpu_written{};
+    // 最後一次被 GPU 寫入（上傳、複製）時的主命令緩衝序號＋1；等於目前序號＋1 表示寫入就在尚未提交的主命令緩衝內。
+    // 細分因子的 compute 只有在它讀的緩衝都沒有這種寫入時，才可以排到主命令緩衝之前（見 MetalGl::side_commands_）。
+    std::uint64_t gpu_write_mark{};
     // 被 DISCARD 更換下來的舊 backing：最後一個持有者（flight 或更換點）釋放時交回池。
     std::shared_ptr<MetalBufferPool> recycle;
     // 被 D3D12 描述元表引用時加入的 residency set；資源釋放時一併移除。
@@ -289,6 +308,9 @@ inline std::FILE* metal_pass_trace() noexcept {
 }
 inline const char* metal_gpu_profile_path() noexcept {static const char* path=std::getenv("X64ARM_METAL_GPU_PROFILE");return path;}
 inline bool metal_gpu_profile() noexcept {return metal_gpu_profile_path()!=nullptr && metal_labels();}
+// 非同步剖析（X64ARM_METAL_GPU_PROFILE_ASYNC=1，搭配 X64ARM_METAL_GPU_PROFILE）：不逐 encoder 提交與等待，命令緩衝內每個繪製／運算
+// encoder 各取階段邊界時間戳，完成時依 encoder 標籤歸屬。FPS 接近一般執行，可剖析長場景；TBDR 的頂點與片段跨 pass 重疊，總和可能大於實際。
+inline bool metal_gpu_profile_async() noexcept {static const bool value=std::getenv("X64ARM_METAL_GPU_PROFILE_ASYNC")!=nullptr;return value && metal_gpu_profile();}
 inline void metal_gpu_profile_add(const std::string& key,double seconds,std::uint64_t vertices,std::uint64_t vertex_ticks,std::uint64_t fragment_ticks){
     struct Entry {double seconds{};std::uint64_t count{},vertices{},vertex_ticks{},fragment_ticks{};};
     static std::mutex mutex;static std::map<std::string,Entry> totals;static double last_dump=0;
@@ -302,6 +324,11 @@ struct MetalShader final:GraphicsShader {
     std::array<unsigned,4> tessellation{}; // 分割、繞序、最大係數、每群 patch 數。
     id<MTLFunction> function,dual_source_function,non_point_function;id<MTLComputePipelineState> compute;
     std::map<unsigned,id<MTLFunction>> alpha_functions;
+    // 與前一階段輸出對齊後的 PS 變體（鍵：缺少或改型別的輸入清單），見 metal_link_fragment。
+    std::map<std::string,id<MTLFunction>> linked_functions;
+    // 依前一階段（序號×2＋是否為 GS）快取對齊結果：值為實際使用的 PS 函式，nil 表示不需要變體。原始碼建立後不變，
+    // 不必每次繪製都以 regex 重新解析兩邊的結構（Fire Strike 命令執行緒原本約兩成時間耗在這裡）。
+    std::unordered_map<std::uint64_t,id<MTLFunction>> linked_by_producer;
     std::string source,geometry_original;
     std::uint64_t serial{};
     std::uint64_t content_key{}; // 著色器位元組內容雜湊（快取鍵）；X64ARM_METAL_LABELS=1 時作為 encoder 標籤。
@@ -355,6 +382,13 @@ struct MetalGeometryPipeline {
 struct MetalGeometryDraw {
     id<MTLFunction> function;id<MTLBuffer> vertices;
     unsigned count{};MTLPrimitiveType primitive{};
+};
+// GS 的 mesh 路徑（見 graphics_geometry_mesh）：每個 mesh 執行緒群組 per_mesh 個 GS 呼叫，每個 object 執行緒群組至多 1024 個 mesh 群組。
+// limit：單次繪製可處理的 GS 呼叫上限（不低於 compute 展開路徑的暫存上限）。
+struct MetalGeometryMesh {
+    id<MTLFunction> object,mesh;unsigned per_mesh{},per_object{};std::uint32_t limit{};
+    // vertex：VS 併入 mesh 函式；vertex_offsets：VS 的 buffer／texture／sampler 槽位在 mesh 綁定表中的位移。
+    bool vertex{};std::array<unsigned,3> vertex_offsets{};
 };
 struct MetalSampler final:GraphicsSampler {id<MTLSamplerState> sampler;};
 MTLPrimitiveTopologyClass metal_primitive_class(std::uint32_t topology){

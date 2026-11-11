@@ -118,7 +118,7 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 
 저장소에는 `src/`, `include/`, `launcher/`, `cmake/`, 필수 빌드 스크립트, `third_party/`, `x64kernel/` 및 사용 문서가 포함되어 있습니다.
 
-## 실측 기록 / 2026-11-09 / 게임 총 19개
+## 실측 기록 / 2026-11-11 / 게임 총 20개
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="동작하지 않지만 작업 중" title="동작하지 않지만 작업 중"> 동작하지 않지만 작업 중 · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="메인 화면까지 실행" title="메인 화면까지 실행"> 메인 화면까지 실행 · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> 동작하지만 효율이 낮음 · <img src="docs/images/support-levels/good.png" width="16" height="16" alt="원활히 동작" title="원활히 동작"> 원활히 동작
 
@@ -139,13 +139,15 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 | It Takes Two | x64 | D3D11(Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | Romance of the Three Kingdoms X with Power Up Kit | x86 | 알 수 없음 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | Steam | x64 | Chromium(CEF) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
+| 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | 사이버펑크 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | 클레르 옵스퀴르: 33 원정대 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
+| 라이즈 오브 더 툼 레이더 | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
+| 섀도 오브 더 툼 레이더 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="동작하지만 효율이 낮음" title="동작하지만 효율이 낮음"> |
 | Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="메인 화면까지 실행" title="메인 화면까지 실행"> |
 | 데이브 더 다이버 | x64 | D3D11(Unity) | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="메인 화면까지 실행" title="메인 화면까지 실행"> |
-| 라이즈 오브 더 툼 레이더 | x64 | D3D11 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="메인 화면까지 실행" title="메인 화면까지 실행"> |
 
 실측 기록은 당시 버전과 설정 기준이며, 전체 게임 진행, 다른 버전 또는 모든 설정에서의 동작을 의미하지 않습니다.
 

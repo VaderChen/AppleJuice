@@ -173,6 +173,8 @@ struct NetworkState {
 
     bool external_io{true};
     std::set<std::uint64_t> icmp_handles;
+    // Icmp6CreateFile 建立的 handle 只能用於 Icmp6SendEcho2；IcmpSendEcho*  只接受 IPv4 handle。
+    std::set<std::uint64_t> icmp6_handles;
     std::uint64_t next_icmp_handle{0x71000000};
     std::shared_ptr<NetworkConfiguration> configuration{std::make_shared<NetworkConfiguration>()};
     std::uint32_t startups{};

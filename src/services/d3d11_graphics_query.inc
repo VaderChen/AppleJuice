@@ -10,7 +10,9 @@
                     (id->kind==Kind::Unordered && (guid==IID_ID3D11UnorderedAccessView || guid==IID_ID3D11UnorderedAccessView1)) ||
                     (id->kind==Kind::DepthView && guid==IID_ID3D11DepthStencilView);
             }else if(id->kind==Kind::SwapChain)supported=guid==IID_IDXGISwapChain || guid==IID_IDXGISwapChain1 || guid==IID_IDXGIDeviceSubObject || guid==IID_IDXGIObject;
-            else if(id->kind==Kind::Output)supported=guid==IID_IDXGIOutput || guid==IID_IDXGIObject;
+            // IDXGIOutput1～6 共用同一份延伸虛擬表（見 d3d11_graphics_vtables.inc 的 Kind::Output）。
+            else if(id->kind==Kind::Output)supported=guid==IID_IDXGIOutput || guid==IID_IDXGIOutput1 || guid==IID_IDXGIOutput2 || guid==IID_IDXGIOutput3 ||
+                guid==IID_IDXGIOutput4 || guid==IID_IDXGIOutput5 || guid==IID_IDXGIOutput6 || guid==IID_IDXGIObject;
             else {
                 static const std::map<Kind,Guid> kinds{{Kind::ClassLinkage,IID_ID3D11ClassLinkage},{Kind::ClassInstance,IID_ID3D11ClassInstance},{Kind::VertexShader,IID_ID3D11VertexShader},{Kind::PixelShader,IID_ID3D11PixelShader},{Kind::ComputeShader,IID_ID3D11ComputeShader},{Kind::GeometryShader,IID_ID3D11GeometryShader},{Kind::HullShader,IID_ID3D11HullShader},{Kind::DomainShader,IID_ID3D11DomainShader},{Kind::Layout,IID_ID3D11InputLayout},{Kind::Sampler,IID_ID3D11SamplerState},{Kind::Blend,IID_ID3D11BlendState},{Kind::DepthState,IID_ID3D11DepthStencilState},{Kind::Raster,IID_ID3D11RasterizerState},{Kind::Query,IID_ID3D11Query},{Kind::Predicate,IID_ID3D11Predicate},{Kind::CommandList,IID_ID3D11CommandList}};
                 supported=guid==IID_ID3D11DeviceChild || (kinds.contains(id->kind) && guid==kinds.at(id->kind)) || ((id->kind==Kind::Query || id->kind==Kind::Predicate) && guid==IID_ID3D11Asynchronous) ||

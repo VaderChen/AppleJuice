@@ -38,7 +38,7 @@ std::span<const WindowsServiceDescriptor> print_dialog_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"comdlg32.dll","PrintDlgExA",1},{"comdlg32.dll","PrintDlgExW",1},
         {"comdlg32.dll","PageSetupDlgA",1},{"comdlg32.dll","PageSetupDlgW",1},{"internal-page-setup","DialogProc",4},
-        {"comctl32.dll","CreatePropertySheetPageA",1},{"comctl32.dll","CreatePropertySheetPageW",1},{"comctl32.dll","DestroyPropertySheetPage",1},
+        
         {"internal-print-dialog","RootProc",4},{"internal-print-dialog","GeneralProc",4},
         {"internal-print-services","QueryInterface",3},{"internal-print-services","AddRef",1},{"internal-print-services","Release",1},
         {"internal-print-services","GetCurrentDevMode",3},{"internal-print-services","GetCurrentPrinterName",3},{"internal-print-services","GetCurrentPortName",3}
@@ -59,6 +59,12 @@ std::optional<GuiPropertyPage> WindowsServices::read_property_page(GuestMemory& 
     if(page.width>4096 || page.height>4096)return {};
     const auto title=memory.load(GuestAddress{at+8+3*unit},bits);page.title=(page.flags&8U) && title?(wide?read_utf16(memory,GuestAddress{title}):utf8_to_utf16_lossy(read_ansi(memory,title))):layout.title;
     error=0;return page;
+}
+// invoke_property_page 的描述項：登錄與處理函式放在同一個檔案（群組＝路由單位）。
+std::span<const WindowsServiceDescriptor> property_page_service_descriptors(){
+    static constexpr WindowsServiceDescriptor table[]{
+        {"comctl32.dll","CreatePropertySheetPageA",1},{"comctl32.dll","CreatePropertySheetPageW",1},{"comctl32.dll","DestroyPropertySheetPage",1},
+    };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_property_page(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);

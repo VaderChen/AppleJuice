@@ -353,7 +353,10 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
     const auto name=basename(key);const bool bare=key.find('\\')==key.npos;
     // VC 的可再散發 DLL 支援 app-local 部署；以整個客體模組維持 C++ ABI，
     // 不將同一個 DLL 的物件、資料匯出與函式拆給兩個不同 provider。
-    const bool redistributable=name=="msvcp140.dll" || name=="msvcp140_1.dll" || name=="msvcp140_2.dll" || name=="vcruntime140.dll" || name=="vcruntime140_1.dll";
+    // 遊戲目錄自帶的 HLSL 編譯器（d3dcompiler_43／46／47）也優先載入：內建編譯器（vkd3d）不支援部分 FXC 寫法
+    //（例如展開後才成為常數的取樣偏移），遊戲隨附的編譯器才保證得到它預期的位元組碼。目錄沒有時沿用內建實作。
+    const bool redistributable=name=="msvcp140.dll" || name=="msvcp140_1.dll" || name=="msvcp140_2.dll" || name=="vcruntime140.dll" || name=="vcruntime140_1.dll" ||
+        name=="d3dcompiler_43.dll" || name=="d3dcompiler_46.dll" || name=="d3dcompiler_47.dll";
     if(bare && redistributable && (!(flags&0xf00) || (flags&0x200))) {
         const auto local=runtime_.application_directory+requested;
         auto source=read_module_file(state,memory,local);
@@ -609,6 +612,7 @@ std::optional<std::uint32_t> WindowsServices::advance_module_operation(GuestStat
     runtime_.module_operations.erase(id);
     if(!--runtime_.loader_depth)runtime_.loader_owner=0;
     publish_loader_lock(memory,peb_base_.value,x86_,thread_identifier(runtime_.loader_owner),runtime_.loader_depth);
+    publish_loader_data(memory);
     if(error)last_error_=error;
     if(end_thread)return exit_thread(state,memory,thread_exit_code);
     if(startup){if(error)return 0xc0000142U;return std::nullopt;}
@@ -683,7 +687,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,Gu
     publish_loader_lock(memory,peb_base_.value,x86_,thread_identifier(runtime_.loader_owner),runtime_.loader_depth);
     struct LoaderScope {WindowsServices& self;GuestMemory& memory;
         ~LoaderScope(){if(self.runtime_.loader_depth && !--self.runtime_.loader_depth)self.runtime_.loader_owner=0;
-            publish_loader_lock(memory,self.peb_base_.value,self.x86_,self.thread_identifier(self.runtime_.loader_owner),self.runtime_.loader_depth);}} scope{*this,memory};
+            publish_loader_lock(memory,self.peb_base_.value,self.x86_,self.thread_identifier(self.runtime_.loader_owner),self.runtime_.loader_depth);
+            try{self.publish_loader_data(memory);}catch(...){}}} scope{*this,memory};
     const WindowsCall call(state,memory,service);const auto arg=[&](unsigned i){return call(i);};
     const auto symbol=service.symbol.starts_with("K32")?service.symbol.substr(3):service.symbol;const bool wide=symbol.ends_with('W');std::uint64_t result=0;
     std::vector<std::uint64_t> created;
@@ -895,5 +900,81 @@ std::array<std::uint8_t,32> WindowsServices::image_identity(const std::filesyste
 #else
     (void)source;return SmapCache::source_identity(bytes);
 #endif
+}
+}
+
+namespace x64arm {
+// PEB->Ldr（PEB_LDR_DATA）與 LDR_DATA_TABLE_ENTRY：自行走訪模組串列的程式（防護層、反作弊、以名稱雜湊找 kernel32 匯出的載入器）
+// 由 InLoadOrder／InMemoryOrder／InInitializationOrder 串列取得 DllBase 後解析 PE 匯出表。內建系統模組有完整的 PE 標頭與匯出目錄，
+// 可直接當 DllBase。順序依 Windows 慣例：主映像、ntdll、kernel32、kernelbase、其餘內建模組、依載入順序的 DLL；
+// 初始化順序不含主映像，ntdll、kernelbase、kernel32 在前。模組集合未變時不改寫；卸載的模組自串列移除（項目記憶體不回收）。
+// X64ARM_PEB_LOADER_DATA=0 關閉（PEB->Ldr 維持 0）。
+void WindowsServices::publish_loader_data(GuestMemory& memory) {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PEB_LOADER_DATA");return !value || std::string_view(value)!="0";}();
+    if(!enabled || !runtime_.image.base || !memory.query(peb_base_))return;
+    std::vector<std::pair<std::uint64_t,const RuntimeImage*>> order;
+    const auto add=[&](std::uint64_t base,const RuntimeImage* image){
+        if(image && std::none_of(order.begin(),order.end(),[&](const auto& item){return item.first==base;}))order.emplace_back(base,image);
+    };
+    const auto builtin=[&](std::string_view name)->std::pair<std::uint64_t,const RuntimeImage*>{
+        const auto found=runtime_.modules.find(std::string(name));if(found==runtime_.modules.end())return {0,nullptr};
+        const auto image=runtime_.builtin_images.find(found->second);return image==runtime_.builtin_images.end()?std::pair<std::uint64_t,const RuntimeImage*>{0,nullptr}:std::pair{image->first,&image->second};
+    };
+    add(runtime_.image.base,&runtime_.image);
+    for(const auto name:{"ntdll.dll","kernel32.dll","kernelbase.dll"}){const auto [base,image]=builtin(name);add(base,image);}
+    for(const auto& [base,image]:runtime_.builtin_images)add(base,&image);
+    for(const auto base:runtime_.module_order)if(const auto found=runtime_.loaded_modules.find(base);found!=runtime_.loaded_modules.end())add(base,&found->second.image);
+    std::vector<std::uint64_t> bases;bases.reserve(order.size());for(const auto& item:order)bases.push_back(item.first);
+    if(runtime_.loader_data && bases==runtime_.loader_published)return;
+    const bool narrow=x86_;const unsigned unit=narrow?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+    const unsigned ldr_size=narrow?0x30U:0x58U,entry_size=narrow?0xa8U:0x120U;
+    const std::array<unsigned,3> heads=narrow?std::array<unsigned,3>{0x0c,0x14,0x1c}:std::array<unsigned,3>{0x10,0x20,0x30};
+    const std::array<unsigned,3> links{0,2*unit,4*unit};
+    if(!runtime_.loader_data){
+        runtime_.loader_data=runtime_allocate(memory,{},ldr_size);
+        memory.store(GuestAddress{runtime_.loader_data},32,ldr_size);memory.store(GuestAddress{runtime_.loader_data+4},8,1);
+        memory.store(GuestAddress{peb_base_.value+(narrow?0x0cU:0x18U)},bits,runtime_.loader_data);
+    }
+    const auto string_field=[&](std::uint64_t at,std::u16string_view text){
+        const auto bytes=utf16_bytes(text);const auto buffer=runtime_allocate(memory,bytes);
+        memory.store(GuestAddress{at},16,bytes.size()-2);memory.store(GuestAddress{at+2},16,bytes.size());memory.store(GuestAddress{at+unit},bits,buffer);
+    };
+    for(auto it=runtime_.loader_entries.begin();it!=runtime_.loader_entries.end();)
+        it=std::find(bases.begin(),bases.end(),it->first)==bases.end()?runtime_.loader_entries.erase(it):std::next(it);
+    for(const auto& [base,image]:order){
+        if(runtime_.loader_entries.contains(base))continue;
+        const auto entry=runtime_allocate(memory,{},entry_size);
+        auto path=image->path;if(path.empty())path=utf8_to_utf16(base==runtime_.image.base?std::string("main.exe"):std::string("module.dll"));
+        const auto slash=path.find_last_of(u"\\/");const auto name=slash==path.npos?path:path.substr(slash+1);
+        std::uint32_t hash=0;for(const auto c:name)hash=hash*65599U+windows_path_upper(c);
+        std::uint32_t stamp=0;
+        try{const auto header=memory.load(GuestAddress{base+0x3c},32);if(header<image->size)stamp=static_cast<std::uint32_t>(memory.load(GuestAddress{base+header+8},32));}catch(const MemoryFault&){}
+        const bool dll=base!=runtime_.image.base,dynamic=runtime_.loaded_modules.contains(base);
+        memory.store(GuestAddress{entry+6*unit},bits,base);memory.store(GuestAddress{entry+7*unit},bits,image->entry);memory.store(GuestAddress{entry+8*unit},32,image->size);
+        const auto full=narrow?0x24U:0x48U,short_name=narrow?0x2cU:0x58U,flags=narrow?0x34U:0x68U,count=narrow?0x38U:0x6cU,hash_links=narrow?0x3cU:0x70U,stamp_at=narrow?0x44U:0x80U;
+        string_field(entry+full,path);string_field(entry+short_name,name);
+        memory.store(GuestAddress{entry+flags},32,(dll?0x4U:0U)|0x4000U|(dll?0x80000U:0U));memory.store(GuestAddress{entry+count},16,0xffff);
+        memory.store(GuestAddress{entry+hash_links},bits,entry+hash_links);memory.store(GuestAddress{entry+hash_links+unit},bits,entry+hash_links);
+        memory.store(GuestAddress{entry+stamp_at},32,stamp);
+        memory.store(GuestAddress{entry+(narrow?0x80U:0xf8U)},bits,base);                 // OriginalBase
+        memory.store(GuestAddress{entry+(narrow?0x90U:0x108U)},32,hash);                // BaseNameHashValue
+        memory.store(GuestAddress{entry+(narrow?0x94U:0x10cU)},32,dynamic?4U:0U);         // LoadReason：靜態相依／動態載入
+        memory.store(GuestAddress{entry+(narrow?0x9cU:0x114U)},32,1);                   // ReferenceCount
+        runtime_.loader_entries.emplace(base,entry);
+    }
+    std::vector<std::uint64_t> initialization;
+    for(const auto name:{"ntdll.dll","kernelbase.dll","kernel32.dll"})if(const auto [base,image]=builtin(name);image)initialization.push_back(base);
+    for(const auto base:bases)if(base!=runtime_.image.base && std::find(initialization.begin(),initialization.end(),base)==initialization.end())initialization.push_back(base);
+    const auto link=[&](unsigned list,const std::vector<std::uint64_t>& sequence){
+        const auto head=runtime_.loader_data+heads[list];
+        std::vector<std::uint64_t> nodes;nodes.reserve(sequence.size()+1);nodes.push_back(head);
+        for(const auto base:sequence)nodes.push_back(runtime_.loader_entries.at(base)+links[list]);
+        for(std::size_t i=0;i<nodes.size();++i){
+            memory.store(GuestAddress{nodes[i]},bits,nodes[(i+1)%nodes.size()]);
+            memory.store(GuestAddress{nodes[i]+unit},bits,nodes[(i+nodes.size()-1)%nodes.size()]);
+        }
+    };
+    link(0,bases);link(1,bases);link(2,initialization);
+    runtime_.loader_published=std::move(bases);
 }
 }

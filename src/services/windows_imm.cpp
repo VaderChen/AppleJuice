@@ -163,7 +163,15 @@ void WindowsServices::imm_default_result(const GuiMessage& message){
     for(const auto c:data.result)enqueue_gui_message({message.window,c,1,0x102});
 }
 std::span<const WindowsServiceDescriptor> imm_service_descriptors(){
-    static constexpr WindowsServiceDescriptor table[]{{"imm32.dll","ImmGetCandidateListA",4},{"imm32.dll","ImmGetCandidateListW",4},{"imm32.dll","ImmGetCandidateListCountA",2},{"imm32.dll","ImmGetCandidateListCountW",2},{"imm32.dll","ImmSetCompositionStringA",6},{"imm32.dll","ImmSetCompositionStringW",6},{"imm32.dll","ImmNotifyIME",4},{"imm32.dll","ImmGetIMEFileNameA",3},{"imm32.dll","ImmGetIMEFileNameW",3},
+    static constexpr WindowsServiceDescriptor table[]{
+        // 自其他群組遷入：處理函式在本檔。
+        {"imm32.dll","ImmIsUIMessageA",4},{"imm32.dll","ImmIsUIMessageW",4},{"imm32.dll","ImmCreateContext",0},{"imm32.dll","ImmDestroyContext",1},
+        {"imm32.dll","ImmAssociateContext",2},{"imm32.dll","ImmAssociateContextEx",3},{"imm32.dll","ImmGetOpenStatus",1},{"imm32.dll","ImmSetOpenStatus",2},
+        {"imm32.dll","ImmGetConversionStatus",3},{"imm32.dll","ImmSetConversionStatus",3},{"imm32.dll","ImmGetCompositionWindow",2},{"imm32.dll","ImmGetCompositionFontA",2},
+        {"imm32.dll","ImmGetCompositionFontW",2},{"imm32.dll","ImmSetCandidateWindow",2},{"imm32.dll","ImmGetCandidateWindow",3},{"imm32.dll","ImmGetCompositionStringA",4},
+        {"imm32.dll","ImmGetCompositionStringW",4},{"imm32.dll","ImmIsIME",1},{"imm32.dll","ImmDisableTextFrameService",1},{"imm32.dll","ImmGetContext",1},
+        {"imm32.dll","ImmReleaseContext",2},{"imm32.dll","ImmSetCompositionWindow",2},{"imm32.dll","ImmSetCompositionFontA",2},{"imm32.dll","ImmSetCompositionFontW",2},
+        {"imm32.dll","ImmGetCandidateListA",4},{"imm32.dll","ImmGetCandidateListW",4},{"imm32.dll","ImmGetCandidateListCountA",2},{"imm32.dll","ImmGetCandidateListCountW",2},{"imm32.dll","ImmSetCompositionStringA",6},{"imm32.dll","ImmSetCompositionStringW",6},{"imm32.dll","ImmNotifyIME",4},{"imm32.dll","ImmGetIMEFileNameA",3},{"imm32.dll","ImmGetIMEFileNameW",3},
         {"imm32.dll","ImmGetDefaultIMEWnd",1},{"imm32.dll","ImmGetProperty",2},{"imm32.dll","ImmGetDescriptionA",3},{"imm32.dll","ImmGetDescriptionW",3},
         {"imm32.dll","ImmLockIMC",1},{"imm32.dll","ImmUnlockIMC",1},{"imm32.dll","ImmGetIMCLockCount",1},
         {"imm32.dll","ImmCreateIMCC",1},{"imm32.dll","ImmDestroyIMCC",1},{"imm32.dll","ImmLockIMCC",1},{"imm32.dll","ImmUnlockIMCC",1},
@@ -237,6 +245,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_imm(GuestState& state,Guest
                     if(native_gui_)native_gui_->create(result,gui_.windows.at(result));
                 }
             }
+        }
+        else if(symbol=="ImmDisableTextFrameService"){
+            // 引擎的輸入法不經 Cicero 文字服務框架（TSF），沒有框架可停用；與未載入 TSF 的 Windows 相同直接回 TRUE（0＝目前執行緒、0xffffffff＝整個程序）。
+            result=1;
         }
         else if(symbol=="ImmCreateContext"){
             if(gui_.input_contexts.size()>=4096)fail(8);else {result=gui_.next_object++;GuiImmContext context;context.thread=threads_.current;gui_.input_contexts.emplace(result,std::move(context));}

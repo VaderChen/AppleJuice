@@ -43,6 +43,7 @@ void usage() {
         "  x64arm run-raw <檔案.bin> --load-address <地址> --entry <地址> [--backend interpreter|jit]\n"
         "  x64arm run-pe <檔案.exe> [--backend interpreter|jit] [--image-base <地址>]\n"
         "  x64arm audit-pe <EXE或DLL>（唯讀 JSON 匯入／匯出與 API 登錄盤點）\n"
+        "  x64arm audit-services（唯讀 JSON：延伸服務登錄的群組、ABI、排重與路由稽核）\n"
         "  x64arm inspect-pe <檔案.exe>（載入檢查與未解析匯入清單，不執行客體）\n"
         "  x64arm compare <檔案.bin|檔案.exe> [對應的載入參數]\n"
         "  x64arm bench --suite core [--samples <3..1000>] [--fixtures <目錄，預設為目前目錄下的 tests/fixtures>]\n"
@@ -193,6 +194,10 @@ int main(int argc, char** argv) {
         if(command=="run-pe"){startup_profile::Scope measurement("startup","resource_preload",true);preload_generated_resources_async();}
 #endif
         if (command == "--help" || command == "-h" || command == "help") { usage(); return argc == 2 ? 0 : 2; }
+        if (command == "audit-services") {
+            if (argc != 2) throw std::invalid_argument("audit-services 不接受參數");
+            WindowsServices::audit_runtime_services(std::cout); return 0;
+        }
         if (command == "audit-pe") {
             if (argc != 3) throw std::invalid_argument("audit-pe 需要一個 EXE／DLL 路徑");
             audit_pe(argv[2], std::cout); return 0;

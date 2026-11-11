@@ -45,6 +45,8 @@ struct VulkanFunctions {
 }
 struct VulkanState {
     void* library{};PFN_vkGetInstanceProcAddr loader{};bool attempted{},instance_loaded{};
+    // 指標欄位位移表在建立狀態後第一次呼叫時一次算完（之後唯讀），worker 上的並行呼叫不會寫入。
+    bool offsets_prepared{};
     vulkan_detail::VulkanFunctions fn;
     std::unordered_map<std::string_view,unsigned> commands;
     std::unordered_map<std::uint32_t,int> by_stype;
@@ -161,6 +163,7 @@ public:
     std::optional<std::uint32_t> done(std::uint64_t value,bool wide=false) {result_=value;call_.return_to(state_,value,wide);return std::optional<std::uint32_t>{};}
     std::uint64_t result() const {return result_;}
     int struct_id(std::string_view name) const {const auto found=vulkan_.by_name.find(name);return found==vulkan_.by_name.end()?-1:found->second;}
+    void prepare_pointer_offsets(){for(int i=0;i<static_cast<int>(std::size(vulkan_structs));++i)(void)pointer_offsets(i);vulkan_.offsets_prepared=true;}
 private:
     struct Writeback {std::uint64_t guest;std::uint8_t* host;std::size_t size;int id;std::size_t count;std::vector<std::uint8_t> original;unsigned scalar_kind{};};
     bool read(std::uint64_t guest,std::uint8_t* host,std::size_t size) {
@@ -663,6 +666,15 @@ std::span<const WindowsServiceDescriptor> vulkan_service_descriptors() {
 #endif
 }
 
+bool WindowsServices::vulkan_worker_ready() const noexcept {
+#if defined(__APPLE__)
+    // X64ARM_TRACE_VULKAN（逐筆或統計）使用未加鎖的全域表，追蹤時全部留在協調者。
+    static const bool tracing=std::getenv("X64ARM_TRACE_VULKAN")!=nullptr;
+    return !tracing && vulkan_ && vulkan_->instance_loaded && vulkan_->offsets_prepared;
+#else
+    return false;
+#endif
+}
 std::optional<std::uint32_t> WindowsServices::invoke_vulkan(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);
 #if !defined(__APPLE__)
@@ -697,6 +709,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_vulkan(GuestState& state,Gu
     };
     host.unmap=[&memory](std::uint64_t address,std::size_t size){try{memory.unmap(GuestAddress{address},size);}catch(const std::exception&){}};
     VulkanCall call(state,memory,arg,vulkan,std::move(host));
+    if(!vulkan.offsets_prepared)call.prepare_pointer_offsets();
     // 尚未載入宿主 loader 時只允許全域命令；其他命令不可能持有有效 handle。
     static constexpr std::string_view global[]={"vkCreateInstance","vkEnumerateInstanceExtensionProperties","vkEnumerateInstanceLayerProperties","vkGetInstanceProcAddr","vkEnumerateInstanceVersion"};
     if(!vulkan.instance_loaded && !listed(global,service.symbol))return call.done(static_cast<std::uint32_t>(VK_ERROR_INITIALIZATION_FAILED));

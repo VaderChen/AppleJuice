@@ -25,6 +25,9 @@ struct GraphicsResource:GraphicsObject {
 };
 struct GraphicsStreamElement {std::string semantic;std::uint32_t index{},first{},count{},slot{},stream{};};
 struct GraphicsStreamStatistics {std::uint64_t written{},needed{};};
+// D3D11_QUERY_DATA_PIPELINE_STATISTICS 的 11 個計數（順序與欄位相同）。由後端在命令執行緒依提交順序累加；
+// 像素著色器呼叫數由查詢自己的可見度槽位在 GPU 完成後加總，不在這裡累計。
+struct GraphicsPipelineStatistics {std::uint64_t ia_vertices{},ia_primitives{},vs_invocations{},gs_invocations{},gs_primitives{},c_invocations{},c_primitives{},ps_invocations{},hs_invocations{},ds_invocations{},cs_invocations{};};
 // type：0 CBV、1 SRV 貼圖／typed buffer、2 取樣器、3 SRV 緩衝、4 UAV 緩衝、5 UAV 貼圖；
 // 6～9 為 D3D12 描述元表（bindless 大陣列）：6 SRV 貼圖、7 UAV 貼圖、8 SRV 緩衝、9 UAV 緩衝，以 (space, slot) 對應根簽章範圍。
 // count：描述元表宣告的描述元數（~0U 為無界；0 表示非描述元表）。
@@ -60,6 +63,8 @@ struct GraphicsView {
     // 結構化元素大小：D3D12 的 stride 屬於 view，不屬於資源；0 表示沿用資源或格式。
     // graphics_view_stride_unknown：根描述元沒有 stride，由著色器決定。
     std::uint32_t stride{};
+    // 計數器在 counter 資源內的位元組位移（D3D12 的 CounterOffsetInBytes；D3D11 的隱藏計數器為 0）。
+    std::uint32_t counter_offset{};
 };
 inline constexpr std::uint32_t graphics_view_stride_unknown=UINT32_MAX;
 // 時間性升頻（XeSS 等升頻 API）：抖動取樣的低解析度色彩、深度與動態向量合成高解析度輸出。
@@ -84,12 +89,15 @@ struct GraphicsStage {
     std::array<GraphicsView,8> unordered;
     std::array<std::shared_ptr<GraphicsSampler>,16> samplers;
     std::vector<GraphicsDescriptorTable> tables;
+    // 運算階段的管線統計累計目標（D3D11 CSInvocations）；其他階段不用。
+    std::shared_ptr<GraphicsPipelineStatistics> statistics;
 };
 struct GraphicsElement {std::string semantic;std::uint32_t index{},format{},slot{},offset{},classification{},step{};};
 struct GraphicsVertexBuffer {std::shared_ptr<GraphicsResource> resource;std::uint32_t stride{},offset{};};
 struct GraphicsDraw {
     std::array<std::shared_ptr<GraphicsResource>,4> stream_targets;
     std::shared_ptr<GraphicsStreamStatistics> stream_statistics;
+    std::shared_ptr<GraphicsPipelineStatistics> pipeline_statistics;
     std::array<GraphicsStage,6> stages; // VS、PS、GS、HS、DS、CS。
     std::vector<GraphicsElement> layout;
     std::array<GraphicsVertexBuffer,32> vertices;
@@ -211,6 +219,12 @@ public:
     // 呼叫端保證 draw／stage 的內容在下一次 graphics_sync() 前不變時使用；非同步後端可只保留參照。預設同步執行。
     virtual void graphics_draw_retained(const GraphicsDraw& draw){graphics_draw(draw);}
     virtual void graphics_dispatch_retained(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){graphics_dispatch(stage,groups);}
+    // 不可變快照（D3D11 延遲內容錄下的命令）：呼叫端保證內容不再改變，後端可直接持有指標排隊而不必再複製一份
+    //（GraphicsDraw 約 70 KB，原本重播時每次繪製都在呼叫執行緒複製）。預設退回一般版本。
+    virtual void graphics_draw_shared(const std::shared_ptr<const GraphicsDraw>& draw){graphics_draw(*draw);}
+    virtual void graphics_dispatch_shared(const std::shared_ptr<const GraphicsStage>& stage,std::array<std::uint32_t,3> groups){graphics_dispatch(*stage,groups);}
+    virtual void graphics_dispatch_indirect_shared(const std::shared_ptr<const GraphicsStage>& stage,const std::shared_ptr<GraphicsResource>& arguments,std::uint32_t offset){
+        graphics_dispatch_indirect(*stage,arguments,offset);}
     // 等待先前排入的非同步命令完成，並拋出其中的錯誤；同步後端為空操作。
     virtual void graphics_sync(){}
     // 把一段後端工作依序排在先前的命令之後執行（非同步後端在編碼執行緒上以內層後端呼叫；同步後端立即執行）。

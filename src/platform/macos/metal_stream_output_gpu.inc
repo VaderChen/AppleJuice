@@ -44,7 +44,7 @@ bool MetalGl::graphics_stream_output(const GraphicsDraw& draw,const MetalShader&
         for(unsigned slot=0;slot<4;++slot)if(mask&(1U<<slot)){
             graphics_pending_.push_back(draw.stream_targets[slot]);metal_resource(draw.stream_targets[slot]).constant_bytes_valid=false;
         }
-        begin_commands();auto encoder=[commands_ computeCommandEncoder];MetalEncoderScope scope{encoder};[encoder setComputePipelineState:pipeline];
+        begin_commands(true,"stream_output");auto encoder=[commands_ computeCommandEncoder];MetalEncoderScope scope{encoder};[encoder setComputePipelineState:pipeline];
         [encoder setBuffer:vertices offset:0 atIndex:0];
         for(unsigned slot=0;slot<4;++slot)[encoder setBuffer:targets[slot]?targets[slot]:vertices offset:0 atIndex:slot+1];
         const std::array<std::uint32_t,2> range{static_cast<std::uint32_t>(count),mask};

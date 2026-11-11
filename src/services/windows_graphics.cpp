@@ -152,6 +152,12 @@ static GraphicsCompilation compile_hlsl_impl(std::span<const std::uint8_t> sourc
     info.source={expanded.data(),expanded.size()};pre.macro_count=0;pre.macros=nullptr;
     const auto result=vkd3d_shader_compile(&info,&output,&messages);
     if(messages){compiled.messages+=messages;vkd3d_shader_free_messages(messages);}
+    // 診斷：X64ARM_DUMP_HLSL_FAILURES=<目錄> 保存編譯失敗的展開後原始碼與訊息（檔名為名稱／入口／profile 的雜湊）。
+    if(result<0)if(const char* folder=std::getenv("X64ARM_DUMP_HLSL_FAILURES");folder && *folder){
+        std::filesystem::create_directories(folder);
+        const auto stem=std::filesystem::path(folder)/("failed-"+std::to_string(std::hash<std::string>{}(name+entry+profile+expanded))+"-"+profile);
+        std::ofstream(stem.string()+".hlsl")<<expanded;std::ofstream(stem.string()+".txt")<<entry<<"\n"<<compiled.messages;
+    }
     if(result>=0){
         if(!linkage.interfaces.empty()){
             vkd3d_shader_dxbc_desc desc{};

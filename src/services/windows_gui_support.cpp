@@ -7,6 +7,7 @@
 #include "x64arm/windows_gui_abi.hpp"
 #include "x64arm/unicode.hpp"
 #include "directmusic_interfaces.hpp"
+#include "wic_interfaces.hpp"
 #include "dsound_interfaces.hpp"
 #include "xaudio_interfaces.hpp"
 #include "wasapi_interfaces.hpp"
@@ -59,11 +60,11 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"dwmapi.dll","DwmDefWindowProc",5},{"dwmapi.dll","DwmGetCompositionTimingInfo",2},{"dwmapi.dll","DwmFlush",0},
         {"user32.dll","RegisterTouchWindow",2},{"user32.dll","UnregisterTouchWindow",1},{"user32.dll","IsTouchWindow",2},
         {"user32.dll","GetTouchInputInfo",4},{"user32.dll","CloseTouchInputHandle",1},
-        {"imm32.dll","ImmIsUIMessageA",4},{"imm32.dll","ImmIsUIMessageW",4},{"imm32.dll","ImmCreateContext",0},{"imm32.dll","ImmDestroyContext",1},{"imm32.dll","ImmAssociateContext",2},{"imm32.dll","ImmAssociateContextEx",3},
-        {"imm32.dll","ImmGetOpenStatus",1},{"imm32.dll","ImmSetOpenStatus",2},{"imm32.dll","ImmGetConversionStatus",3},{"imm32.dll","ImmSetConversionStatus",3},
-        {"imm32.dll","ImmGetCompositionWindow",2},{"imm32.dll","ImmGetCompositionFontA",2},{"imm32.dll","ImmGetCompositionFontW",2},
-        {"imm32.dll","ImmSetCandidateWindow",2},{"imm32.dll","ImmGetCandidateWindow",3},{"imm32.dll","ImmGetCompositionStringA",4},{"imm32.dll","ImmGetCompositionStringW",4},{"imm32.dll","ImmIsIME",1},
-        {"imm32.dll","ImmGetContext",1},{"imm32.dll","ImmReleaseContext",2},{"imm32.dll","ImmSetCompositionWindow",2},{"imm32.dll","ImmSetCompositionFontA",2},{"imm32.dll","ImmSetCompositionFontW",2},
+        
+        
+        
+        
+        
         {"kernel32.dll","InterlockedFlushSList",1},{"kernel32.dll","InterlockedPushEntrySList",2},{"kernel32.dll","InterlockedPopEntrySList",1},{"kernel32.dll","QueryDepthSList",1},{"kernel32.dll","InitializeSListHead",1}, {"kernel32.dll","FindResourceA",3},{"kernel32.dll","FindResourceExA",4},{"kernel32.dll","FindResourceExW",4},{"kernel32.dll","FindResourceW",3},
         {"kernel32.dll","LoadResource",2},{"kernel32.dll","LockResource",1},{"kernel32.dll","SizeofResource",2},
         {"kernel32.dll","MulDiv",3},
@@ -98,7 +99,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"user32.dll","GetClassLongA",2},{"user32.dll","GetClassLongW",2},{"user32.dll","SetClassLongA",3},{"user32.dll","SetClassLongW",3},
         {"user32.dll","GetClassLongPtrA",2},{"user32.dll","GetClassLongPtrW",2},{"user32.dll","SetClassLongPtrA",3},{"user32.dll","SetClassLongPtrW",3},
         {"user32.dll","GetClassWord",2},{"user32.dll","SetClassWord",3},
-        {"user32.dll","GetClassNameA",3},{"user32.dll","GetClassNameW",3},
+        {"user32.dll","GetClassNameA",3},{"user32.dll","GetClassNameW",3},{"user32.dll","RealGetWindowClassA",3},{"user32.dll","RealGetWindowClassW",3},{"user32.dll","RealGetWindowClass",3},
         {"user32.dll","SetTimer",4},{"user32.dll","SetCoalescableTimer",5},{"user32.dll","KillTimer",2},{"user32.dll","GetQueueStatus",1},{"user32.dll","MsgWaitForMultipleObjects",5},{"user32.dll","MsgWaitForMultipleObjectsEx",5},
         {"user32.dll","GetKeyboardLayout",1},{"user32.dll","GetKeyboardLayoutNameA",1},{"user32.dll","GetKeyboardLayoutNameW",1},{"user32.dll","GetKeyboardLayoutList",2},{"user32.dll","TrackMouseEvent",1},{"comctl32.dll","_TrackMouseEvent",1},{"user32.dll","GetAsyncKeyState",1},{"user32.dll","GetLastInputInfo",1},{"user32.dll","GetKeyboardState",1},{"user32.dll","SetKeyboardState",1},
         {"user32.dll","CreateCaret",4},{"user32.dll","DestroyCaret",0},{"user32.dll","ShowCaret",1},{"user32.dll","HideCaret",1},{"user32.dll","SetCaretPos",2},{"user32.dll","GetCaretPos",1},
@@ -315,7 +316,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             }
         }
     }
-    else if(symbol=="GetClassNameA" || symbol=="GetClassNameW"){
+    else if(symbol=="GetClassNameA" || symbol=="GetClassNameW" || symbol.starts_with("RealGetWindowClass")){
+        // RealGetWindowClass 回傳系統控制項的基底類別；未超類別化的視窗與 GetClassName 相同（無 W 尾碼的別名為 ANSI）。
         const auto found=gui_.windows.find(arg(0));
         if(found==gui_.windows.end())fail(1400);
         else if(s32(arg(2))<=0)fail(87);
@@ -375,7 +377,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,0);return std::nullopt;}
         }}
     }
-    else if(symbol=="CoCreateInstance" || symbol=="CoGetClassObject"){if(begin_registered_com(state,memory,service))return std::nullopt;if(begin_msxml_com(state,memory,service))return std::nullopt;if(begin_ribbon_com(state,memory,service))return std::nullopt;if(dmusic::is_class(memory,arg(0)))return invoke_directmusic(state,memory,service);if(dsound::is_class(memory,arg(0)))return invoke_dsound(state,memory,service);if(xaudio::is_class(memory,arg(0)))return invoke_xaudio(state,memory,service);if(wasapi::is_class(memory,arg(0)))return invoke_wasapi(state,memory,service);if(dinput::is_class(memory,arg(0)))return invoke_dinput(state,memory,service);if(symbol=="CoGetClassObject"){memory.store(GuestAddress{arg(4)},x86_?32:64,0);arg.return_to(state,0x80040154U);return std::nullopt;}return invoke_wmi(state,memory,service);}
+    else if(symbol=="CoCreateInstance" || symbol=="CoGetClassObject"){if(begin_registered_com(state,memory,service))return std::nullopt;if(begin_msxml_com(state,memory,service))return std::nullopt;if(begin_ribbon_com(state,memory,service))return std::nullopt;if(dmusic::is_class(memory,arg(0)))return invoke_directmusic(state,memory,service);if(wic::is_class(memory,arg(0)))return invoke_wic(state,memory,service);if(dsound::is_class(memory,arg(0)))return invoke_dsound(state,memory,service);if(xaudio::is_class(memory,arg(0)))return invoke_xaudio(state,memory,service);if(wasapi::is_class(memory,arg(0)))return invoke_wasapi(state,memory,service);if(dinput::is_class(memory,arg(0)))return invoke_dinput(state,memory,service);if(symbol=="CoGetClassObject"){memory.store(GuestAddress{arg(4)},x86_?32:64,0);arg.return_to(state,0x80040154U);return std::nullopt;}return invoke_wmi(state,memory,service);}
     else if(symbol.starts_with("InitCommonControls")){if(symbol.ends_with("Ex")){if(memory.load(GuestAddress{arg(0)},32)!=8)fail(87);else result=1;}}
     else if(symbol=="DisableProcessWindowsGhosting"){
         // 此 void API 停用的是 Windows 的替身視窗；AppKit 後端本來不建立替身。

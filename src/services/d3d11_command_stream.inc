@@ -14,10 +14,56 @@
 //   完整服務若是 D3D11（invoke_d3d11 的非本地入口）才放行並等到清空。worker 或協調服務再次進入代表客體已恢復，就解除暫停。
 // - 串流執行緒沒有退路可交回協調者：擁有者只認領裝置未開多執行緒保護的立即內容，SetMultithreadProtected、Enter 與內容銷毀都走完整服務，會清除擁有者。
 // - 例外只保存第一個，之後的命令丟棄；由下一個完整服務邊界重新拋出。
-namespace detail {const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,GuestAddress address) noexcept;}
+namespace detail {const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,GuestAddress address) noexcept;std::size_t stub_service_count() noexcept;}
 enum class D3D11StreamClass:std::uint8_t {Other,Sync,NoDrain,Release,Map,GetData,GetTargets,Query,Unmap,Update,Copy,Scalar,Shader,Constants,Pointers,VertexBuffers,Viewports,Scissors,Blend,Uavs,Targets,TargetsUavs,Clear,ClearDepth,Present};
 // 目前這條宿主執行緒是串流執行緒（Present 的處理程式不能讓客體執行緒等待，也不是客體執行緒）。
 thread_local bool d3d11_on_stream_thread=false;
+struct D3D11CommandStream;
+void d3d11_stream_resident_detach(const D3D11CommandStream*) noexcept;
+// 持久映射前端路徑的對應表（擁有者私有）：固定 16384 格開放定址（乘法雜湊取高 shift 位元、線性探查），核心常駐入口（resident_d3d11_arm64.inc 類別 6／7）
+// 直接查表，格式與位移固定（下方 static_assert），格數由描述元提供。只收探查距離在 probe_limit 內的位置，核心入口查 probe_limit 格找不到就交回服務端；
+// 刪除以後移補位，不留墓碑。表太滿時不收，該資源每次都走完整路徑（計入 refused）：《崛起》地熱谷的持久映射資源超過 1024 格版本的上限時
+// 2 vCPU 46→35 FPS，所以容量要遠大於遊戲同時存在的動態資源數。
+// pending：之後的 Map 要等這個序號處理完（同資源排在環裡的 Unmap／Update／Copy，與 stream.pending 同步寫入；pending 表清除時保留，只會多一次保守的慢路徑）。
+struct D3D11FrontMapTable {
+    static constexpr std::size_t capacity=16384,probe_limit=16,shift=50;
+    static constexpr std::uint64_t multiplier=UINT64_C(0x9e3779b97f4a7c15);
+    struct Entry {std::uint64_t key{},pointer{};std::uint32_t size{},mapped{},row{},depth{};std::uint64_t pending{};std::array<std::uint8_t,24> reserved{};};
+    std::unique_ptr<Entry[]> entries=std::make_unique<Entry[]>(capacity);
+    std::size_t used{};
+    // 已佔用的鍵：插入／刪除只在服務端（核心常駐入口只查表並改 mapped），走訪時只看這些鍵，不必掃 16384 格
+    // （完整服務同步每次都要走訪；原本每次掃整張表，Ice Storm 的主執行緒七成時間耗在這裡）。
+    std::vector<std::uint64_t> keys;
+    std::uint64_t refused{};
+    static std::size_t home(std::uint64_t key) noexcept {return static_cast<std::size_t>((key*multiplier)>>shift);}
+    Entry* find(std::uint64_t key) noexcept {
+        if(!key)return nullptr;
+        for(std::size_t n=0,i=home(key);n<capacity;++n,i=(i+1)&(capacity-1)){auto& e=entries[i];if(e.key==key)return &e;if(!e.key)return nullptr;}
+        return nullptr;
+    }
+    Entry* insert(std::uint64_t key) noexcept {
+        if(auto* e=find(key))return e;
+        if(!key || used>=capacity*3/4){++refused;return nullptr;}
+        for(std::size_t n=0,i=home(key);n<probe_limit;++n,i=(i+1)&(capacity-1)){auto& e=entries[i];if(!e.key){e=Entry{};e.key=key;++used;keys.push_back(key);return &e;}}
+        ++refused;return nullptr;
+    }
+    void erase(Entry* e) noexcept {
+        if(const auto found=std::find(keys.begin(),keys.end(),e->key);found!=keys.end()){*found=keys.back();keys.pop_back();}
+        auto i=static_cast<std::size_t>(e-entries.get());entries[i]=Entry{};--used;
+        for(auto j=(i+1)&(capacity-1);entries[j].key;j=(j+1)&(capacity-1)){
+            const auto k=home(entries[j].key);
+            // k 在 (i, j] 之間（環狀）時 j 留在原位；否則移到 i 補洞。
+            if(i<=j?(i<k && k<=j):(i<k || k<=j))continue;
+            entries[i]=entries[j];entries[j]=Entry{};i=j;
+        }
+    }
+    void clear() noexcept {if(used)for(std::size_t i=0;i<capacity;++i)entries[i]=Entry{};used=0;keys.clear();}
+    // f 不可增刪鍵（只改欄位）。
+    template<class F> void for_each(F&& f){for(std::size_t k=0;k<keys.size();++k)if(auto* const e=find(keys[k]))f(*e);}
+};
+static_assert(sizeof(D3D11FrontMapTable::Entry)==64 && offsetof(D3D11FrontMapTable::Entry,pointer)==8 && offsetof(D3D11FrontMapTable::Entry,size)==16 &&
+              offsetof(D3D11FrontMapTable::Entry,mapped)==20 && offsetof(D3D11FrontMapTable::Entry,row)==24 && offsetof(D3D11FrontMapTable::Entry,depth)==28 &&
+              offsetof(D3D11FrontMapTable::Entry,pending)==32 && (UINT64_C(1)<<(64-D3D11FrontMapTable::shift))==D3D11FrontMapTable::capacity);
 struct D3D11CommandStream {
     // 環要裝得下一整幀（UE 系每幀兩萬多次）：爆發時客體才不會被壓到和串流執行緒同速。頁面用到才配置。
     static constexpr std::size_t slot_bytes=256,slot_capacity=32768,mapped_bytes=slot_capacity*slot_bytes;
@@ -53,12 +99,15 @@ struct D3D11CommandStream {
     std::atomic<std::uint64_t> constant_epoch{},constant_skips{};
     // 持久映射的前端路徑（X64ARM_D3D11_STREAM_FRONT_MAP=0 關閉）：WRITE_DISCARD 的 Map 直接回傳同一塊客體區塊，Unmap 當場把內容複製進快照區再排入，
     // 串流執行緒不必讀客體記憶體，下一次 Map 也不必等上傳完成。對應狀態只記在這張擁有者私有表；完整服務清除擁有者前轉回 subresource_maps。
-    struct FrontMap {std::uint64_t pointer{};std::uint32_t size{},row{},depth{};bool mapped{};};
-    std::unordered_map<std::uint64_t,FrontMap> front_maps;std::uint64_t front_epoch_seen{},snapshot_head{},front_owner{},front_context{};
+    D3D11FrontMapTable front_maps;std::uint64_t front_epoch_seen{},snapshot_head{},front_owner{},front_context{};
+    // 擁有者快取的 snapshot_tail：snapshot_tail 與 tail 同一條快取線、串流執行緒每筆都寫，每次 Unmap 都去讀會讓兩邊來回搶線
+    //（地熱谷 2 vCPU 核心入口版每個繪製的重播從約 2.1 µs 變成 4.2 µs）。舊值只會算出較少的可用空間，不夠時才重讀。
+    std::uint64_t snapshot_cached_tail{};
     std::mutex front_dropped_mutex;std::vector<std::uint64_t> front_dropped; // 持久映射被撤銷或銷毀的資源，擁有者下一次 Map 時移除。
     static constexpr std::size_t snapshot_bytes=std::size_t{16}<<20,snapshot_item_limit=std::size_t{1}<<20;
     std::unique_ptr<std::uint8_t[]> snapshot;
     std::atomic<std::uint64_t> front_maps_taken{},front_unmaps_taken{};
+    std::atomic<std::uint64_t> full_enqueues{}; // 全停中由協調者代擁有者排入（d3d11_stream_full_enqueue）
     std::array<Page,256> pages{};
     std::atomic<std::uint64_t> enqueued{},rejected{},drain_waits{},drain_ns{},full_waits{},full_ns{},locked_enqueues{};
     // 串流執行緒。
@@ -81,6 +130,7 @@ struct D3D11CommandStream {
     std::uint64_t foreign_presents_seen{}; // 擁有者私有：呈現會解除 back buffer 綁定，影子要失效。
     alignas(128) std::array<Entry,slot_capacity> entries;
     ~D3D11CommandStream(){
+        d3d11_stream_resident_detach(this);
         if(!started.load(std::memory_order_relaxed))return;
         stopping.store(true,std::memory_order_seq_cst);
         paused.store(0,std::memory_order_seq_cst);paused.notify_all();
@@ -88,6 +138,77 @@ struct D3D11CommandStream {
         pthread_join(thread,nullptr);
     }
 };
+// 核心的 D3D11 命令串流純量方法入口（resident_d3d11_arm64.inc）讀取的描述元：位移與組語約定一致，建立串流時填寫，銷毀時停用。
+// 定義在不參與 LTO 的 resident_d3d11_descriptor.cpp；新核心另有弱定義（只給沒有服務端的核心測試），連結後核心組語與服務共用同一份。
+// X64ARM_D3D11_STREAM_RESIDENT=0 關閉（stub 不標記、描述元不啟用）。
+struct ResidentD3D11StreamDescriptor {
+    std::uint64_t enabled{};const void* context{};const void* owner{};std::uint64_t gs_offset{};const void* failed{};const void* paused{};
+    void* head{};const void* cached_tail{};std::uint64_t slots{};void* entries{};std::uint64_t entry_size{};void* host_base{};std::uint64_t guest_base{};
+    const void* arena_head{};const void* snapshot_head{};const void* descriptors{};std::uint64_t descriptor_size{},arguments_offset{},stub_begin{};
+    const void* sleeping{};void (*wake)() noexcept{};void* enqueued{};std::uint64_t permissions_offset{};
+    std::uint64_t entries_seen{},direct_enqueues{},registered{}; // 核心入口的診斷計數（184、192；併發時為近似值）與核心登錄入口的 stub 數（200）
+    std::uint64_t relaxed_publish{}; // 208：串流執行緒以輪詢等待時，入口不必以 seq_cst 讀 sleeping
+    const std::uint8_t* classes{};std::uint64_t constant_dedup{};const void* constant_epoch{};const void* constant_epoch_seen{};void* constant_bindings{}; // 216～248
+    std::uint64_t requests[8]{}; // 256：入口登錄請求槽（核心協調者取出）
+    void* constant_skips{};       // 320
+    // 328 起：持久映射前端路徑（類別 6 Map、7 Unmap）。
+    void* front_entries{};std::uint64_t front_multiplier{};const void* front_epoch{};const void* front_epoch_seen{};const void* tail{}; // 328～360
+    void* snapshot{};const void* snapshot_tail{};std::uint64_t snapshot_bytes{},snapshot_item_limit{};void* front_maps_taken{};void* front_unmaps_taken{}; // 368～408
+    std::uint64_t kernel_features{}; // 416：核心協調者寫入的能力（bit 0：支援類別 6／7）；舊核心不寫，服務端就不把 Map／Unmap 交給核心入口。
+    std::uint64_t front_shift{},front_mask{}; // 424、432：前端映射表的雜湊位移（64−log2 格數）與索引遮罩
+    void* snapshot_cached_tail{}; // 440：擁有者快取的 snapshot_tail（不夠時才讀 376 的真正位置並更新）
+};
+static_assert(offsetof(ResidentD3D11StreamDescriptor,gs_offset)==24 && offsetof(ResidentD3D11StreamDescriptor,head)==48 &&
+              offsetof(ResidentD3D11StreamDescriptor,slots)==64 && offsetof(ResidentD3D11StreamDescriptor,guest_base)==96 &&
+              offsetof(ResidentD3D11StreamDescriptor,descriptors)==120 && offsetof(ResidentD3D11StreamDescriptor,stub_begin)==144 &&
+              offsetof(ResidentD3D11StreamDescriptor,wake)==160 && offsetof(ResidentD3D11StreamDescriptor,permissions_offset)==176 &&
+              offsetof(ResidentD3D11StreamDescriptor,entries_seen)==184 && offsetof(ResidentD3D11StreamDescriptor,direct_enqueues)==192 &&
+              offsetof(ResidentD3D11StreamDescriptor,relaxed_publish)==208 && offsetof(ResidentD3D11StreamDescriptor,classes)==216 &&
+              offsetof(ResidentD3D11StreamDescriptor,constant_bindings)==248 && offsetof(ResidentD3D11StreamDescriptor,requests)==256 &&
+              offsetof(ResidentD3D11StreamDescriptor,constant_skips)==320 && offsetof(ResidentD3D11StreamDescriptor,front_entries)==328 &&
+              offsetof(ResidentD3D11StreamDescriptor,tail)==360 && offsetof(ResidentD3D11StreamDescriptor,snapshot)==368 &&
+              offsetof(ResidentD3D11StreamDescriptor,front_unmaps_taken)==408 && offsetof(ResidentD3D11StreamDescriptor,kernel_features)==416 &&
+              offsetof(ResidentD3D11StreamDescriptor,front_mask)==432 && offsetof(ResidentD3D11StreamDescriptor,snapshot_cached_tail)==440 &&
+              sizeof(ResidentD3D11StreamDescriptor)<=512);
+static_assert(offsetof(D3D11CommandStream::Entry,service)==0 && offsetof(D3D11CommandStream::Entry,rip)==8 && offsetof(D3D11CommandStream::Entry,rcx)==16 &&
+              offsetof(D3D11CommandStream::Entry,r9)==40 && offsetof(D3D11CommandStream::Entry,rsp)==48 && offsetof(D3D11CommandStream::Entry,arena_end)==56 &&
+              offsetof(D3D11CommandStream::Entry,snapshot_at)==64 && offsetof(D3D11CommandStream::Entry,snapshot_end)==72 && offsetof(D3D11CommandStream::Entry,snapshot_size)==80 &&
+              offsetof(D3D11CommandStream::Entry,present)==88);
+static_assert(sizeof(D3D11CommandStream::ConstantBindings)==120 && offsetof(D3D11CommandStream::ConstantBindings,valid)==112);
+static_assert(D3D11CommandStream::slot_bytes==256 && sizeof(std::atomic<std::uint64_t>)==8 && sizeof(std::atomic<std::uint32_t>)==4 && sizeof(std::atomic<bool>)==1);
+extern "C" { extern std::uint8_t x64arm_resident_d3d11_stream[512]; } // resident_d3d11_descriptor.cpp（不參與 LTO）
+std::atomic<D3D11CommandStream*> d3d11_resident_stream{};
+extern "C" void x64arm_d3d11_stream_resident_wake() noexcept {
+    if(auto* stream=d3d11_resident_stream.load(std::memory_order_acquire)){stream->sleeping.store(0,std::memory_order_seq_cst);stream->sleeping.notify_one();}
+}
+ResidentD3D11StreamDescriptor& d3d11_resident_descriptor() noexcept {return *reinterpret_cast<ResidentD3D11StreamDescriptor*>(x64arm_resident_d3d11_stream);}
+void d3d11_stream_resident_detach(const D3D11CommandStream* stream) noexcept {
+    if(d3d11_resident_stream.load(std::memory_order_acquire)!=stream)return;
+    if(std::getenv("X64ARM_TRACE_GRAPHICS_STATS"))
+        std::fprintf(stderr,"[d3d11_stream_resident] registered=%llu entries=%llu direct=%llu\n",static_cast<unsigned long long>(d3d11_resident_descriptor().registered),
+            static_cast<unsigned long long>(d3d11_resident_descriptor().entries_seen),static_cast<unsigned long long>(d3d11_resident_descriptor().direct_enqueues));
+    std::atomic_ref(d3d11_resident_descriptor().enabled).store(0,std::memory_order_seq_cst);
+    d3d11_resident_stream.store(nullptr,std::memory_order_release);
+}
+// C++ 排入了有常駐入口的純量方法（入口尚未登錄）：把 stub RIP 放進描述元 256 起的 8 個請求槽，核心協調者取回信箱事件後登錄入口。
+// 每個 stub 只請求一次；槽滿時清除標記，下次再請求。
+// 送出請求的這次 worker 服務改回報 CompletedResolve（d3d11_resident_request_pending），核心隨即 poke 協調者處理；否則要等下一次協調者事件。
+thread_local bool d3d11_resident_request_pending=false;
+void d3d11_stream_resident_request(std::size_t runtime_index,std::uint64_t rip) noexcept {
+    static std::vector<std::atomic<std::uint8_t>> requested(runtime_service_descriptors().size());
+    if(runtime_index>=requested.size() || requested[runtime_index].exchange(1,std::memory_order_relaxed))return;
+    auto* slots=reinterpret_cast<std::uint64_t*>(x64arm_resident_d3d11_stream+256);
+    for(unsigned i=0;i<8;++i){std::uint64_t expected=0;
+        if(std::atomic_ref<std::uint64_t>(slots[i]).compare_exchange_strong(expected,rip,std::memory_order_acq_rel)){d3d11_resident_request_pending=true;return;}}
+    requested[runtime_index].store(0,std::memory_order_relaxed);
+}
+bool d3d11_stream_resident_enabled() noexcept {
+    static const bool enabled=[] {
+        const auto* value=std::getenv("X64ARM_D3D11_STREAM_RESIDENT");const auto* stream=std::getenv("X64ARM_D3D11_STREAM");
+        return (!value || std::string_view(value)!="0") && (!stream || std::string_view(stream)!="0");
+    }();
+    return enabled;
+}
 namespace {
 D3D11StreamClass d3d11_stream_class(std::string_view symbol) noexcept {
     constexpr std::string_view scalar[]{"IASetIndexBuffer","IASetInputLayout","IASetPrimitiveTopology","RSSetState","OMSetDepthStencilState","GenerateMips",
@@ -119,10 +240,21 @@ D3D11StreamClass d3d11_stream_class(std::string_view symbol) noexcept {
     }
     // 只讀建立時就固定的描述或物件自己的欄位，與佇列裡的命令無關；裝置建立只新增物件。協調者路徑另依 d3d11_stream_needs_drain 判斷。
     constexpr std::string_view no_drain[]{"BufferGetDesc","Texture1DGetDesc","Texture3DGetDesc","GraphicsGetDesc","TextureGetDesc","GetResource","SetPrivateData","GetFullscreenState",
-        "QueryVideoMemoryInfo","SetVideoMemoryReservation","AddRef","QueryInterface","GetDevice","GetParent","GetDesc","GetImmediateContext"};
+        "QueryVideoMemoryInfo","SetVideoMemoryReservation","AddRef","QueryInterface","GetDevice","GetParent","GetDesc","GetImmediateContext","CreateBuffer"};
     if(display_identity::adapter_description_size(symbol,false) && display_identity::parallel_graphics_descriptions())return D3D11StreamClass::NoDrain;
     if(std::find(std::begin(no_drain),std::end(no_drain),symbol)!=std::end(no_drain))return D3D11StreamClass::NoDrain;
     return D3D11StreamClass::Sync;
+}
+// Map 是否帶 D3D11_MAP_FLAG_DO_NOT_WAIT 且為 READ／WRITE／READ_WRITE：這種呼叫不等同一資源排隊中的命令，由處理程式在 GPU 仍存取時
+// 回 DXGI_ERROR_WAS_STILL_DRAWING。旗標在 [rsp+40]；worker 上持映射共用鎖讀取，協調者（擁有者停在這次服務）直接讀。
+bool d3d11_map_do_not_wait(const GuestState& state,GuestMemory& memory,const bool lock) noexcept {
+    const auto type=static_cast<std::uint32_t>(state.reg(Gpr::R9));
+    if(type<1 || type>3)return false;
+    try{
+        std::optional<std::shared_lock<detail::ParallelMappingLock>> guard;
+        if(lock)guard.emplace(detail::parallel_mapping_mutex());
+        return (static_cast<std::uint32_t>(memory.load(GuestAddress{state.reg(Gpr::Rsp)+40},32))&0x100000U)!=0;
+    }catch(...){return false;}
 }
 // 依 stub 索引查表：D3D11 以外的服務不受串流影響，不必每次比對名稱。
 const std::vector<D3D11StreamClass>& d3d11_stream_classes(){
@@ -133,6 +265,49 @@ const std::vector<D3D11StreamClass>& d3d11_stream_classes(){
     }();
     return table;
 }
+}
+// 核心常駐入口的 stub 類別表（resident_d3d11_arm64.inc）：低 4 位元 1 純量、2 Shader、3 指標陣列、4 常數緩衝綁定（高 4 位元是 stage）、
+// 5 IASetVertexBuffers；0 不走常駐入口。
+bool d3d11_stream_resident_map_enabled() noexcept {
+    static const bool enabled=[] {
+        const auto* front=std::getenv("X64ARM_D3D11_STREAM_FRONT_MAP");const auto* value=std::getenv("X64ARM_D3D11_STREAM_RESIDENT_MAP");
+        // 預設關閉：微量測每次呼叫快約 4 倍、合成幀（d3d11_call_rate 項目 15）快 3～13%，但《古墓奇兵：崛起》地熱谷 2 vCPU 交錯三輪 42.6 對 46.4 FPS。
+        // 找到遊戲變慢的原因前只在 =1 時啟用（核心需公告 kernel_features bit 0）。
+        return (!front || std::string_view(front)!="0") && value && std::string_view(value)=="1";}();
+    return enabled;
+}
+const std::vector<std::uint8_t>& d3d11_stream_resident_classes(){
+    static const std::vector<std::uint8_t> table=[]{
+        const auto descriptors=runtime_service_descriptors();std::vector<std::uint8_t> result(descriptors.size());
+        for(std::size_t i=0;i<descriptors.size();++i){
+            if(descriptors[i].family!="internal-d3d11")continue;
+            switch(d3d11_stream_classes()[i]){
+            case D3D11StreamClass::Scalar:if(descriptors[i].arguments<=6)result[i]=1;break;
+            case D3D11StreamClass::Shader:if(descriptors[i].arguments==4)result[i]=2;break;
+            case D3D11StreamClass::Pointers:if(descriptors[i].arguments==4)result[i]=3;break;
+            case D3D11StreamClass::VertexBuffers:if(descriptors[i].arguments==6)result[i]=5;break;
+            // 持久映射前端路徑的 Map(WRITE_DISCARD)／Unmap（X64ARM_D3D11_STREAM_RESIDENT_MAP=0 關閉，回到服務端的前端路徑）。
+            case D3D11StreamClass::Map:if(descriptors[i].arguments==6 && d3d11_stream_resident_map_enabled())result[i]=6;break;
+            case D3D11StreamClass::Unmap:if(descriptors[i].arguments==3 && d3d11_stream_resident_map_enabled())result[i]=7;break;
+            case D3D11StreamClass::Constants:{
+                const auto stage=d3d11_setter_method(descriptors[i]).stage;
+                if(descriptors[i].arguments==4 && stage<6)result[i]=static_cast<std::uint8_t>(4U|(static_cast<unsigned>(stage)<<4U));break;}
+            default:break;
+            }
+        }
+        return result;
+    }();
+    return table;
+}
+// 核心常駐入口的資格（resident_clock_recipe 以配方值 4 標記）。
+bool d3d11_stream_resident_scalar(std::size_t runtime_index) noexcept {
+    if(!d3d11_stream_resident_enabled())return false;
+    const auto& classes=d3d11_stream_resident_classes();
+    if(runtime_index>=classes.size() || !classes[runtime_index])return false;
+    // 類別 6／7 要核心入口認得：舊核心會把它們當成其他類別處理。
+    return (classes[runtime_index]&15U)<6 || (std::atomic_ref(d3d11_resident_descriptor().kernel_features).load(std::memory_order_acquire)&1U);
+}
+namespace {
 // 共用區配置（環狀，只有擁有者配置；串流執行緒處理完一筆就推進 arena_tail）。head==tail 代表空，所以不能剛好填滿。
 std::optional<std::uint64_t> d3d11_stream_arena_alloc(D3D11CommandStream& stream,std::size_t bytes){
     bytes=(bytes+15)&~std::size_t{15};
@@ -145,15 +320,21 @@ std::optional<std::uint64_t> d3d11_stream_arena_alloc(D3D11CommandStream& stream
     stream.arena_head=at+bytes;
     return at;
 }
-// 快照區配置（規則同共用區，只存在宿主、客體看不到）。
+// 快照區配置（規則同共用區，只存在宿主、客體看不到）。先用擁有者快取的 tail，不夠才重讀（見 snapshot_cached_tail）。
 std::optional<std::uint64_t> d3d11_stream_snapshot_alloc(D3D11CommandStream& stream,std::size_t bytes){
     bytes=(bytes+15)&~std::size_t{15};
-    const auto head=stream.snapshot_head,tail=stream.snapshot_tail.load(std::memory_order_acquire);
-    std::uint64_t at=head;
-    if(head>=tail){
-        if(D3D11CommandStream::snapshot_bytes-head<bytes){if(tail<=bytes)return std::nullopt;at=0;}
-    }else if(tail-head<=bytes)return std::nullopt;
-    stream.snapshot_head=at+bytes;
+    const auto head=stream.snapshot_head;
+    const auto place=[&](std::uint64_t tail)->std::optional<std::uint64_t>{
+        std::uint64_t at=head;
+        if(head>=tail){
+            if(D3D11CommandStream::snapshot_bytes-head<bytes){if(tail<=bytes)return std::nullopt;at=0;}
+        }else if(tail-head<=bytes)return std::nullopt;
+        return at;
+    };
+    auto at=place(stream.snapshot_cached_tail);
+    if(!at){stream.snapshot_cached_tail=stream.snapshot_tail.load(std::memory_order_acquire);at=place(stream.snapshot_cached_tail);}
+    if(!at)return std::nullopt;
+    stream.snapshot_head=*at+bytes;
     return at;
 }
 // 讀客體記憶體。locked=false 時只用頁快取，沒命中回傳 false，呼叫端取映射共用鎖後以 locked=true 重來（順便填快取；不能走原生視窗的頁用一般讀取，故障落在原呼叫點）。
@@ -176,6 +357,12 @@ bool d3d11_stream_read(D3D11CommandStream& stream,GuestMemory& memory,std::uint6
         address+=chunk;destination+=chunk;bytes-=chunk;
     }
     return true;
+}
+// 實驗（X64ARM_D3D11_STREAM_RELAXED_PUBLISH=1）：排入以 release 發布 head、relaxed 讀 sleeping，不做每筆 seq_cst 的 Dekker 往返
+// （寫入後緊接讀取要等 head 的快取線從串流執行緒的核心搶回並對外可見）；串流執行緒閒置時改為 50 µs 輪詢，不會漏掉喚醒。
+bool d3d11_stream_relaxed_publish() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_STREAM_RELAXED_PUBLISH");return value && std::string_view(value)=="1";}();
+    return enabled;
 }
 enum class D3D11StreamQueued:std::uint8_t {Done,Miss,Reject};
 // 把合成框架寫進槽內。沒有發布就沒有任何作用：Miss 由呼叫端持鎖重來，Reject（放不下、數量超限）走同步路徑重新讀取，故障落在原呼叫點。
@@ -225,7 +412,7 @@ D3D11StreamQueued d3d11_stream_enqueue(D3D11CommandStream& stream,GuestState& st
             for(auto& stage:stream.constant_bindings)stage.valid=0;
             stream.constant_epoch_seen=epoch;
         }
-        auto& stage=stream.constant_bindings[d3d11_setter_method(service.symbol).stage];
+        auto& stage=stream.constant_bindings[d3d11_setter_method(service).stage];
         const auto mask=((1U<<n)-1U)<<first;
         std::array<std::uint64_t,14> buffers{};
         // 這種命令只有一組最多 14 個指標的陣列，必定放在槽內的 arrays_offset。
@@ -274,12 +461,17 @@ D3D11StreamQueued d3d11_stream_enqueue(D3D11CommandStream& stream,GuestState& st
     if(kind==D3D11StreamClass::Query || kind==D3D11StreamClass::Unmap || kind==D3D11StreamClass::Update || kind==D3D11StreamClass::Copy){
         // 舊項目在處理完之後就沒有作用，偶爾清掉避免無限成長（位址重用時最多多等到已完成的序號，不影響正確性）。
         if(stream.pending.size()>4096){const auto done=stream.tail.load(std::memory_order_acquire);std::erase_if(stream.pending,[&](const auto& item){return item.second<=done;});}
-        stream.pending[values[1]]=head+1;
+        stream.pending[values[1]]=head+1;if(auto* const front=stream.front_maps.find(values[1]))front->pending=head+1;
         // Copy 的來源：之後 Map 寫入來源要排在這個 Copy 之後。CopyResource 的來源是第 3 個參數，CopySubresourceRegion 是第 7 個。
-        if(kind==D3D11StreamClass::Copy)stream.pending[values[service.arguments>3?6:2]]=head+1;
+        if(kind==D3D11StreamClass::Copy){const auto source=values[service.arguments>3?6:2];stream.pending[source]=head+1;if(auto* const front=stream.front_maps.find(source))front->pending=head+1;}
     }
-    stream.head.store(head+1,std::memory_order_seq_cst);
-    if(stream.sleeping.load(std::memory_order_seq_cst)){stream.sleeping.store(0,std::memory_order_seq_cst);stream.sleeping.notify_one();}
+    if(d3d11_stream_relaxed_publish()){
+        stream.head.store(head+1,std::memory_order_release);
+        if(stream.sleeping.load(std::memory_order_relaxed)){stream.sleeping.store(0,std::memory_order_relaxed);stream.sleeping.notify_one();}
+    }else{
+        stream.head.store(head+1,std::memory_order_seq_cst);
+        if(stream.sleeping.load(std::memory_order_seq_cst)){stream.sleeping.store(0,std::memory_order_seq_cst);stream.sleeping.notify_one();}
+    }
     stream.enqueued.store(stream.enqueued.load(std::memory_order_relaxed)+1,std::memory_order_relaxed);
     return D3D11StreamQueued::Done;
 }
@@ -326,6 +518,12 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
     const auto service_index=static_cast<std::size_t>(descriptor-runtime_service_descriptors().data());
     const auto kind=d3d11_stream_classes()[service_index];
     if(kind==D3D11StreamClass::Other || kind==D3D11StreamClass::NoDrain)return D3D11StreamStep::Continue;
+    const auto stub_rip=state.rip.value;
+    // 純量方法改由核心入口直接排入：C++ 排入一次後請求登錄（d3d11_stream_resident_request）。
+    const auto scalar_done=[&]{if(std::atomic_ref(d3d11_resident_descriptor().enabled).load(std::memory_order_relaxed) &&
+        d3d11_stream_resident_scalar(service_index))d3d11_stream_resident_request(service_index,stub_rip);};
+    // 前端 Map／Unmap 成功後同樣請求登錄核心入口（類別 6／7）。
+    const auto front_done=scalar_done;
     // 串流執行緒失敗：交回協調者，由完整服務邊界重新拋出。
     if(stream.failed.load(std::memory_order_relaxed))return D3D11StreamStep::Refuse;
     const bool owner=state.reg(Gpr::Rcx) && state.reg(Gpr::Rcx)==stream.context.load(std::memory_order_relaxed) && state.gs_base==stream.owner.load(std::memory_order_relaxed);
@@ -425,15 +623,16 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
     }
     if(!owner || kind==D3D11StreamClass::Sync)return sync();
     if(kind==D3D11StreamClass::Map){
-        // 同一資源的 Unmap 還沒處理時，客體不能拿到（同一塊）區塊來寫。Map 本身照常同步，不依賴其他命令。
-        if(const auto found=stream.pending.find(state.reg(Gpr::Rdx));found!=stream.pending.end())d3d11_stream_wait(stream,found->second);
+        // 同一資源的 Unmap 還沒處理時，客體不能拿到（同一塊）區塊來寫。Map 本身照常同步，不依賴其他命令。DO_NOT_WAIT 不等（見 d3d11_map_do_not_wait）。
+        if(const auto found=stream.pending.find(state.reg(Gpr::Rdx));found!=stream.pending.end() && stream.tail.load(std::memory_order_acquire)<found->second &&
+           !d3d11_map_do_not_wait(state,memory,true))d3d11_stream_wait(stream,found->second);
         if(!static_cast<std::uint32_t>(state.reg(Gpr::R8)) && static_cast<std::uint32_t>(state.reg(Gpr::R9))==4){
             if(const auto epoch=stream.front_epoch.load(std::memory_order_acquire);epoch!=stream.front_epoch_seen){
                 const std::lock_guard lock(stream.front_dropped_mutex);
-                for(const auto pointer:stream.front_dropped)if(const auto dropped=stream.front_maps.find(pointer);dropped!=stream.front_maps.end() && !dropped->second.mapped)stream.front_maps.erase(dropped);
+                for(const auto pointer:stream.front_dropped)if(auto* const dropped=stream.front_maps.find(pointer);dropped && !dropped->mapped)stream.front_maps.erase(dropped);
                 stream.front_dropped.clear();stream.front_epoch_seen=epoch;
             }
-            if(const auto found=stream.front_maps.find(state.reg(Gpr::Rdx));found!=stream.front_maps.end() && !found->second.mapped){
+            if(auto* const found=stream.front_maps.find(state.reg(Gpr::Rdx));found && !found->mapped){
                 // [sp] 返回位址、[sp+40] MapFlags、[sp+48] D3D11_MAPPED_SUBRESOURCE*。旗標只接受 0 與 DO_NOT_WAIT（這裡不會等 GPU）。
                 const auto sp=state.reg(Gpr::Rsp);std::uint64_t return_target=0;std::array<std::uint64_t,2> stack{};bool done=false;
                 {
@@ -443,15 +642,16 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
                         if(d3d11_stream_read(stream,memory,sp,&return_target,8,true) && d3d11_stream_read(stream,memory,sp+40,stack.data(),16,true) &&
                            !(static_cast<std::uint32_t>(stack[0])&~0x100000U) && stack[1] && stack[1]<=UINT64_MAX-15 &&
                            !memory.is_copy_on_write(GuestAddress{stack[1]}) && !memory.is_copy_on_write(GuestAddress{stack[1]+15})){
-                            const std::array<std::uint64_t,2> result{found->second.pointer,found->second.row|(std::uint64_t{found->second.depth}<<32)};
+                            const std::array<std::uint64_t,2> result{found->pointer,found->row|(std::uint64_t{found->depth}<<32)};
                             memory.write(GuestAddress{stack[1]},{reinterpret_cast<const std::uint8_t*>(result.data()),sizeof(result)});
                             done=true;
                         }
                     }catch(const MemoryFault&){done=false;}catch(const HostCallFault&){done=false;}
                 }
                 if(done){
-                    found->second.mapped=true;
+                    found->mapped=1;
                     stream.front_maps_taken.store(stream.front_maps_taken.load(std::memory_order_relaxed)+1,std::memory_order_relaxed);
+                    front_done();
                     state.rip=GuestAddress{return_target};state.reg(Gpr::Rax)=0;state.reg(Gpr::Rsp)=sp+8;state.rep_compare={};
                     return D3D11StreamStep::Done;
                 }
@@ -494,14 +694,15 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
         if(head-stream.cached_tail>=stream.slots){
             const auto started=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             stream.full_waits.store(stream.full_waits.load(std::memory_order_relaxed)+1,std::memory_order_relaxed);
-            d3d11_stream_wait(stream,head-stream.slots+64);
+            // 等出八分之一的空位再繼續：只等 64 格時生產端（尤其核心入口）每排幾十筆就與串流執行緒搶一次 tail 的快取線。
+            d3d11_stream_wait(stream,head-stream.slots+stream.slots/8);
             stream.full_ns.store(stream.full_ns.load(std::memory_order_relaxed)+clock_gettime_nsec_np(CLOCK_UPTIME_RAW)-started,std::memory_order_relaxed);
             stream.cached_tail=stream.tail.load(std::memory_order_acquire);
         }
     }
     stream.page_generation=memory.native_borrow_generation();
     if(kind==D3D11StreamClass::Unmap && !static_cast<std::uint32_t>(state.reg(Gpr::R8))){
-        if(const auto found=stream.front_maps.find(state.reg(Gpr::Rdx));found!=stream.front_maps.end() && found->second.mapped){
+        if(auto* const found=stream.front_maps.find(state.reg(Gpr::Rdx));found && found->mapped){
             const auto sp=state.reg(Gpr::Rsp);std::uint64_t return_target=0;
             if(!d3d11_stream_read(stream,memory,sp,&return_target,8,false)){
                 const std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
@@ -509,25 +710,26 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
             }
             // 快照區滿：等串流執行緒消化（與環滿相同，不持鎖；全停要等全部 worker 停下才會暫停串流執行緒，不會互等）。
             std::optional<std::uint64_t> at;
-            for(unsigned spins=0;!(at=d3d11_stream_snapshot_alloc(stream,found->second.size));++spins){
+            for(unsigned spins=0;!(at=d3d11_stream_snapshot_alloc(stream,found->size));++spins){
                 if(stream.failed.load(std::memory_order_relaxed))return D3D11StreamStep::Refuse;
                 if(spins<4096){d3d11_stream_pause_cpu();continue;}
                 std::this_thread::yield();
             }
             auto* const copy_to=stream.snapshot.get()+*at;
-            if(!d3d11_stream_read(stream,memory,found->second.pointer,copy_to,found->second.size,false)){
+            if(!d3d11_stream_read(stream,memory,found->pointer,copy_to,found->size,false)){
                 const std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
-                (void)d3d11_stream_read(stream,memory,found->second.pointer,copy_to,found->second.size,true);
+                (void)d3d11_stream_read(stream,memory,found->pointer,copy_to,found->size,true);
             }
             auto& entry=stream.entries[head&(stream.slots-1)];
             entry.service=descriptor;entry.rip=state.rip.value;entry.rcx=state.reg(Gpr::Rcx);entry.rdx=state.reg(Gpr::Rdx);entry.r8=0;entry.r9=0;entry.rsp=0;entry.arena_end=stream.arena_head;
-            entry.snapshot_at=*at;entry.snapshot_size=found->second.size;entry.snapshot_end=stream.snapshot_head;entry.present=false;
-            found->second.mapped=false;
+            entry.snapshot_at=*at;entry.snapshot_size=found->size;entry.snapshot_end=stream.snapshot_head;entry.present=false;
+            found->mapped=0;
             state.rip=GuestAddress{return_target};state.reg(Gpr::Rax)=0;state.reg(Gpr::Rsp)=sp+8;state.rep_compare={};
             stream.head.store(head+1,std::memory_order_seq_cst);
             if(stream.sleeping.load(std::memory_order_seq_cst)){stream.sleeping.store(0,std::memory_order_seq_cst);stream.sleeping.notify_one();}
             stream.enqueued.store(stream.enqueued.load(std::memory_order_relaxed)+1,std::memory_order_relaxed);
             stream.front_unmaps_taken.store(stream.front_unmaps_taken.load(std::memory_order_relaxed)+1,std::memory_order_relaxed);
+            front_done();
             return D3D11StreamStep::Done;
         }
     }
@@ -553,7 +755,7 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
     if(!eligible)return sync();
     if(lock_free){
         const auto queued=d3d11_stream_enqueue(stream,state,memory,*descriptor,kind,update_bytes,false);
-        if(queued==D3D11StreamQueued::Done){state.rep_compare={};return D3D11StreamStep::Done;}
+        if(queued==D3D11StreamQueued::Done){state.rep_compare={};scalar_done();return D3D11StreamStep::Done;}
         if(queued==D3D11StreamQueued::Reject){stream.rejected.store(stream.rejected.load(std::memory_order_relaxed)+1,std::memory_order_relaxed);return sync();}
     }
     // 頁快取沒命中或要看物件狀態：持共用映射鎖重來（順便填快取）；故障時放棄這一槽，走同步路徑。
@@ -577,7 +779,7 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
         }
         catch(const MemoryFault&){}catch(const HostCallFault&){}
     }
-    if(done){state.rep_compare={};return D3D11StreamStep::Done;}
+    if(done){state.rep_compare={};scalar_done();return D3D11StreamStep::Done;}
     stream.rejected.store(stream.rejected.load(std::memory_order_relaxed)+1,std::memory_order_relaxed);
     // 非持久的 Unmap 交給協調者本地路徑（要釋放 heap）；與 Map 相同只等同一資源上排隊的命令，不等整條佇列。
     if(kind==D3D11StreamClass::Unmap){
@@ -752,7 +954,11 @@ void WindowsServices::d3d11_stream_loop(GuestMemory& memory,D3D11CommandStream& 
                 if(head==tail && !stream.foreign_ready.load(std::memory_order_acquire)){
                     const auto idle_started=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
                     stream.sleeping.store(1,std::memory_order_seq_cst);
-                    if(stream.head.load(std::memory_order_seq_cst)==tail && !stream.foreign_ready.load(std::memory_order_seq_cst) && !stream.stopping.load(std::memory_order_seq_cst))stream.sleeping.wait(1,std::memory_order_seq_cst);
+                    if(d3d11_stream_relaxed_publish()){
+                        // 生產端不做 Dekker 往返：以短間隔輪詢，最多延遲一個間隔。
+                        while(stream.head.load(std::memory_order_acquire)==tail && !stream.foreign_ready.load(std::memory_order_acquire) && !stream.stopping.load(std::memory_order_acquire))
+                            std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    }else if(stream.head.load(std::memory_order_seq_cst)==tail && !stream.foreign_ready.load(std::memory_order_seq_cst) && !stream.stopping.load(std::memory_order_seq_cst))stream.sleeping.wait(1,std::memory_order_seq_cst);
                     stream.sleeping.store(0,std::memory_order_seq_cst);
                     stream.idle_ns.store(stream.idle_ns.load(std::memory_order_relaxed)+clock_gettime_nsec_np(CLOCK_UPTIME_RAW)-idle_started,std::memory_order_relaxed);
                     continue;
@@ -770,6 +976,14 @@ void WindowsServices::d3d11_stream_loop(GuestMemory& memory,D3D11CommandStream& 
             stream.paused_ns.store(stream.paused_ns.load(std::memory_order_relaxed)+clock_gettime_nsec_np(CLOCK_UPTIME_RAW)-paused_started,std::memory_order_relaxed);
             continue;
         }
+        // 整批上鎖：連續的非繪製命令共用一次映射共用鎖與圖形鎖（鎖序不變：映射 → 圖形），不再每筆各取放一次。
+        // 重播執行緒是 4 vCPU 下滿載的一段（地熱谷每幀約 2.7 萬筆、閒置 0.26 ms，繪製執行緒每幀卡在環滿 3.9 ms），每筆兩把鎖約占它 14%。
+        // 繪製與呈現照舊逐筆上鎖（繪製要能提早放開映射鎖、呈現的前置不可持鎖）；有人等圖形鎖、有寫者或全停要求時立刻放開。
+        // X64ARM_D3D11_STREAM_BATCH_LOCKS=0 改回逐筆上鎖。
+        static const bool batch_locks=[] {const auto* value=std::getenv("X64ARM_D3D11_STREAM_BATCH_LOCKS");return !value || std::string_view(value)!="0";}();
+        std::shared_lock<detail::ParallelMappingLock> outer_mapping(detail::parallel_mapping_mutex(),std::defer_lock);
+        std::unique_lock<std::recursive_mutex> outer_graphics(graphics_mutex(),std::defer_lock);
+        const auto release_outer=[&]{if(outer_graphics.owns_lock())outer_graphics.unlock();if(outer_mapping.owns_lock())outer_mapping.unlock();};
         const auto execute=[&](const D3D11CommandStream::Entry& entry){
             if(stream.failed.load(std::memory_order_relaxed))return;
             // 抽樣模式只分帳客體 worker 的同步呼叫，串流重播不混入其母體。
@@ -778,7 +992,7 @@ void WindowsServices::d3d11_stream_loop(GuestMemory& memory,D3D11CommandStream& 
                 // 前端路徑的 Unmap：內容已在快照區，不讀客體記憶體、不改對應狀態。
                 const auto started=count_replay?clock_gettime_nsec_np(CLOCK_UPTIME_RAW):0;
                 try{
-                    std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+                    std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!outer_graphics.owns_lock())lock_graphics(graphics_lock);
                     const auto context=d3d11_->objects.find_fast(entry.rcx);const auto resource=d3d11_->objects.find_fast(entry.rdx);
                     if(context==d3d11_->objects.end() || resource==d3d11_->objects.end() || !resource->second.identity->resource)throw HostCallFault("D3D11 命令串流的 Unmap 物件已不存在");
                     const auto& target=resource->second.identity->resource;
@@ -797,8 +1011,9 @@ void WindowsServices::d3d11_stream_loop(GuestMemory& memory,D3D11CommandStream& 
                 const auto started=count_replay?clock_gettime_nsec_np(CLOCK_UPTIME_RAW):0;
                 try{
                     if(entry.present)d3d11_stream_prepare_present(stream,entry.rcx);
-                    std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
-                    std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+                    std::shared_lock<detail::ParallelMappingLock> mapping_guard(detail::parallel_mapping_mutex(),std::defer_lock);
+                    if(!outer_mapping.owns_lock())mapping_guard.lock();
+                    std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!outer_graphics.owns_lock())lock_graphics(graphics_lock);
                     const bool may_release_mapping=entry.service->symbol.front()=='D';
                     struct GuardScope {bool set;~GuardScope(){if(set)detail::d3d11_worker_mapping_guard()=nullptr;}} guard_scope{may_release_mapping};
                     if(may_release_mapping)detail::d3d11_worker_mapping_guard()=&mapping_guard;
@@ -830,14 +1045,21 @@ void WindowsServices::d3d11_stream_loop(GuestMemory& memory,D3D11CommandStream& 
         const auto batch_end=std::min({head,tail+16,foreign?stream.foreign_after:head});
         while(tail<batch_end){
             const auto& entry=stream.entries[tail&(stream.slots-1)];
+            // 快照 Unmap 只需要圖形鎖，放在外層兩把鎖之下也符合鎖序；繪製（D 開頭）與呈現先放開外層，照原本逐筆流程執行。
+            const bool plain=batch_locks && !entry.present && (entry.snapshot_at!=UINT64_MAX || entry.service->symbol.front()!='D');
+            if(!plain)release_outer();
+            else if(!outer_mapping.owns_lock()){outer_mapping.lock();lock_graphics(outer_graphics);}
             execute(entry);
             ++tail;
             stream.arena_tail.store(entry.arena_end,std::memory_order_release);
             stream.snapshot_tail.store(entry.snapshot_end,std::memory_order_release);
             stream.tail.store(tail,std::memory_order_release);
             // 有人等圖形鎖就讓一下（重入鎖不公平，串流執行緒否則會立刻搶回；對方的呼叫都很短）。
+            if(outer_mapping.owns_lock() && (graphics_waiters().load(std::memory_order_relaxed) || detail::parallel_mapping_mutex().writer_waiting() ||
+               stream.paused.load(std::memory_order_relaxed)))release_outer();
             for(unsigned spins=0;spins<256 && graphics_waiters().load(std::memory_order_relaxed);++spins)d3d11_stream_pause_cpu();
         }
+        release_outer();
         stream.busy.store(0,std::memory_order_release);
     }
 }
@@ -855,19 +1077,48 @@ void WindowsServices::d3d11_stream_setup(GuestMemory& memory,const std::uint64_t
     stream->arena_base=arena_base;stream->arena_host=stream->arena->data();
     stream->drains_by_service=std::vector<std::atomic<std::uint32_t>>(runtime_service_descriptors().size());
     stream->snapshot=std::make_unique_for_overwrite<std::uint8_t[]>(D3D11CommandStream::snapshot_bytes);
+    if(!x86_ && d3d11_stream_resident_enabled() && !d3d11_resident_stream.load(std::memory_order_acquire)){
+        auto& descriptor=d3d11_resident_descriptor();
+        const GuestState probe{};const WindowsServiceDescriptor sample{};
+        descriptor.context=&stream->context;descriptor.owner=&stream->owner;
+        descriptor.gs_offset=static_cast<std::uint64_t>(reinterpret_cast<const std::uint8_t*>(&probe.gs_base)-reinterpret_cast<const std::uint8_t*>(&probe));
+        descriptor.failed=&stream->failed;descriptor.paused=&stream->paused;descriptor.head=&stream->head;descriptor.cached_tail=&stream->cached_tail;
+        descriptor.slots=stream->slots;descriptor.entries=stream->entries.data();descriptor.entry_size=sizeof(D3D11CommandStream::Entry);
+        descriptor.host_base=stream->host_base;descriptor.guest_base=stream->guest_base;
+        descriptor.arena_head=&stream->arena_head;descriptor.snapshot_head=&stream->snapshot_head;
+        descriptor.descriptors=runtime_service_descriptors().data();descriptor.descriptor_size=sizeof(WindowsServiceDescriptor);
+        descriptor.arguments_offset=static_cast<std::uint64_t>(reinterpret_cast<const std::uint8_t*>(&sample.arguments)-reinterpret_cast<const std::uint8_t*>(&sample));
+        descriptor.stub_begin=stub_base_.value+(detail::stub_service_count()-runtime_service_descriptors().size())*16;descriptor.sleeping=&stream->sleeping;descriptor.wake=&x64arm_d3d11_stream_resident_wake;
+        descriptor.enqueued=&stream->enqueued;descriptor.permissions_offset=GuestMemory::native_layout().mmu_permissions;
+        descriptor.relaxed_publish=d3d11_stream_relaxed_publish()?1:0;
+        static const bool constant_dedup=[] {const auto* value=std::getenv("X64ARM_D3D11_STREAM_CONSTANT_DEDUP");return !value || std::string_view(value)!="0";}();
+        descriptor.classes=d3d11_stream_resident_classes().data();descriptor.constant_dedup=constant_dedup?1:0;
+        descriptor.constant_epoch=&stream->constant_epoch;descriptor.constant_epoch_seen=&stream->constant_epoch_seen;
+        descriptor.constant_bindings=stream->constant_bindings.data();descriptor.constant_skips=&stream->constant_skips;
+        descriptor.front_entries=stream->front_maps.entries.get();descriptor.front_multiplier=D3D11FrontMapTable::multiplier;
+        descriptor.front_shift=D3D11FrontMapTable::shift;descriptor.front_mask=D3D11FrontMapTable::capacity-1;
+        descriptor.snapshot_cached_tail=&stream->snapshot_cached_tail;
+        descriptor.front_epoch=&stream->front_epoch;descriptor.front_epoch_seen=&stream->front_epoch_seen;descriptor.tail=&stream->tail;
+        descriptor.snapshot=stream->snapshot.get();descriptor.snapshot_tail=&stream->snapshot_tail;
+        descriptor.snapshot_bytes=D3D11CommandStream::snapshot_bytes;descriptor.snapshot_item_limit=D3D11CommandStream::snapshot_item_limit;
+        descriptor.front_maps_taken=&stream->front_maps_taken;descriptor.front_unmaps_taken=&stream->front_unmaps_taken;
+        d3d11_resident_stream.store(stream.get(),std::memory_order_release);
+        std::atomic_ref(descriptor.enabled).store(1,std::memory_order_seq_cst);
+    }
     d3d11_stream_=std::move(stream);
 }
 void WindowsServices::d3d11_stream_trace() const noexcept {
     if(!d3d11_stream_)return;
     const auto& stream=*d3d11_stream_;
-    std::fprintf(stderr,"[d3d11_stream] head=%llu tail=%llu sleeping=%u paused=%u context=0x%llx owner=0x%llx failed=%d enqueued=%llu locked=%llu rejected=%llu drains=%llu drain_ns=%llu full_waits=%llu full_ns=%llu pauses=%llu pause_ns=%llu paused_ns=%llu idle_ns=%llu present_ready_ns=%llu present_wait_ns=%llu front_maps=%llu front_unmaps=%llu constant_skips=%llu top:",
+    std::fprintf(stderr,"[d3d11_stream] head=%llu tail=%llu sleeping=%u paused=%u context=0x%llx owner=0x%llx failed=%d enqueued=%llu locked=%llu rejected=%llu drains=%llu drain_ns=%llu full_waits=%llu full_ns=%llu pauses=%llu pause_ns=%llu paused_ns=%llu idle_ns=%llu present_ready_ns=%llu present_wait_ns=%llu front_maps=%llu front_unmaps=%llu front_used=%zu front_refused=%llu constant_skips=%llu full_enqueues=%llu resident_entries=%llu resident_direct=%llu top:",
         static_cast<unsigned long long>(stream.head.load()),static_cast<unsigned long long>(stream.tail.load()),stream.sleeping.load(),stream.paused.load(),
         static_cast<unsigned long long>(stream.context.load()),static_cast<unsigned long long>(stream.owner.load()),stream.failed.load()?1:0,
         static_cast<unsigned long long>(stream.enqueued.load()),static_cast<unsigned long long>(stream.locked_enqueues.load()),static_cast<unsigned long long>(stream.rejected.load()),static_cast<unsigned long long>(stream.drain_waits.load()),
         static_cast<unsigned long long>(stream.drain_ns.load()),static_cast<unsigned long long>(stream.full_waits.load()),static_cast<unsigned long long>(stream.full_ns.load()),
         static_cast<unsigned long long>(stream.pauses.load()),static_cast<unsigned long long>(stream.pause_ns.load()),
         static_cast<unsigned long long>(stream.paused_ns.load()),static_cast<unsigned long long>(stream.idle_ns.load()),static_cast<unsigned long long>(stream.present_ready_ns.load()),static_cast<unsigned long long>(stream.present_wait_ns.load()),
-        static_cast<unsigned long long>(stream.front_maps_taken.load()),static_cast<unsigned long long>(stream.front_unmaps_taken.load()),static_cast<unsigned long long>(stream.constant_skips.load()));
+        static_cast<unsigned long long>(stream.front_maps_taken.load()),static_cast<unsigned long long>(stream.front_unmaps_taken.load()),stream.front_maps.used,static_cast<unsigned long long>(stream.front_maps.refused),static_cast<unsigned long long>(stream.constant_skips.load()),static_cast<unsigned long long>(stream.full_enqueues.load()),
+        static_cast<unsigned long long>(d3d11_resident_descriptor().entries_seen),static_cast<unsigned long long>(d3d11_resident_descriptor().direct_enqueues));
     const auto descriptors=runtime_service_descriptors();std::vector<std::pair<std::uint32_t,std::size_t>> rows;
     for(std::size_t i=0;i<stream.drains_by_service.size();++i)if(const auto value=stream.drains_by_service[i].load(std::memory_order_relaxed))rows.emplace_back(value,i);
     std::sort(rows.rbegin(),rows.rend());
@@ -918,17 +1169,74 @@ void WindowsServices::d3d11_stream_full_service_sync(const WindowsServiceDescrip
         catch(...){if(!stream.failure)stream.failure=std::current_exception();stream.failed.store(true,std::memory_order_release);}
     }
     // 前端路徑對應中的資源：下一次 Unmap 可能來自別的執行緒或走完整路徑，對應狀態轉回物件上。
-    if(d3d11_)for(auto& [pointer,map]:stream.front_maps)if(map.mapped){
-        const auto found=d3d11_->objects.find_fast(pointer);
+    if(d3d11_)stream.front_maps.for_each([&](D3D11FrontMapTable::Entry& map){
+        if(!map.mapped)return;
+        const auto found=d3d11_->objects.find_fast(map.key);
         if(found!=d3d11_->objects.end() && found->second.identity)found->second.identity->subresource_maps.emplace(0U,Identity::SubresourceMap{map.pointer,map.size,4U});
-        map.mapped=false;
-    }
+        map.mapped=0;
+    });
     stream.context.store(0,std::memory_order_relaxed);stream.owner.store(0,std::memory_order_relaxed);
+}
+// 完整路徑上擁有者自己的立即內容 Map／Unmap：與協調者本地路徑（d3d11_stream_coordinated）相同，只等同一資源排在佇列裡的命令，
+// 不排空整條佇列、不清除擁有者。可對應的資源（staging、dynamic）只會被 Copy／Update／Unmap 寫入，這些都記在 pending；讀回本身會等命令執行緒與 GPU。
+// 全停期間擁有者的待辦服務在這裡執行（《崛起》地熱谷 4 vCPU 繪製執行緒每秒約 300 次 Map(DISCARD)、20 次 Unmap 走完整路徑，每次排空 0.25～3 ms，
+// 並清除擁有者使緊接的設定也落到完整路徑）。這個資源若仍是前端對應中，先把對應狀態轉回物件，Unmap 才找得到。
+// 繪製執行緒完整路徑 Map 250→22 µs、Unmap 2～3 ms→0.2 ms；地熱谷 2 vCPU 交錯各三輪 43.5／43.6／43.6 對 43.2／43.7／41.7（平均 +1.6%，較穩定）。X64ARM_D3D11_STREAM_FULL_MAP=0 關閉。
+bool WindowsServices::d3d11_stream_owner_resource_sync(const GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_STREAM_FULL_MAP");return !value || std::string_view(value)!="0";}();
+    if(!enabled || !d3d11_stream_ || service.family!="internal-d3d11")return false;
+    auto& stream=*d3d11_stream_;
+    if(detail::parallel_mapping_mutex().held_exclusive())return false;
+    const auto kind=d3d11_stream_class(service.symbol);
+    if(kind!=D3D11StreamClass::Map && kind!=D3D11StreamClass::Unmap)return false;
+    const auto owner=stream.owner.load(std::memory_order_relaxed),context=stream.context.load(std::memory_order_relaxed);
+    if(!owner || !context || state.reg(Gpr::Rcx)!=context || state.gs_base!=owner)return false;
+    const auto resource=state.reg(Gpr::Rdx);
+    // 擁有者正停在這次服務，可以讀它的私有表；串流執行緒暫停中，要等待就先放行，等完再擋回去。DO_NOT_WAIT 的 Map 不等。
+    if(const auto found=stream.pending.find(resource);found!=stream.pending.end() && stream.tail.load(std::memory_order_acquire)<found->second &&
+       !(kind==D3D11StreamClass::Map && d3d11_map_do_not_wait(state,memory,false))){
+        stream.paused.store(0,std::memory_order_seq_cst);stream.paused.notify_one();
+        d3d11_stream_wait(stream,found->second);
+        d3d11_stream_quiesced();
+    }
+    if(d3d11_)if(auto* const map=stream.front_maps.find(resource);map && map->mapped){
+        const auto found=d3d11_->objects.find_fast(resource);
+        if(found!=d3d11_->objects.end() && found->second.identity)found->second.identity->subresource_maps.emplace(0U,Identity::SubresourceMap{map->pointer,map->size,4U});
+        map->mapped=0;
+    }
+    stream.update_epoch.fetch_add(1,std::memory_order_release);
+    return true;
+}
+// 串流擁有者在全停中交給協調者的呼叫（worker 到服務邊界時已有全停請求，就不在 worker 執行，見 aot_engine 的 worker 服務出口）：
+// 能排入命令環的方法由協調者代擁有者排入，與 worker 上的 d3d11_stream_entry 同一流程，不排空整條佇列、不清除擁有者。
+// 原本走 d3d11_stream_full_service_sync：《崛起》地熱谷 4 vCPU 繪製執行緒的設定方法每秒十多次落到這裡，每次排空約 2 ms，
+// 擁有者被清除後緊接的設定也要重新認領。擁有者停在這次服務，生產端狀態此時只有協調者會碰；排入可能要等環或快照區有空位，
+// 期間放行串流執行緒（與排空相同只在協調者等待時放行），完成後再擋回。同步類、Present 與其他方法照舊。X64ARM_D3D11_STREAM_FULL_ENQUEUE=0 關閉。
+bool WindowsServices::d3d11_stream_full_enqueue(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_STREAM_FULL_ENQUEUE");return !value || std::string_view(value)!="0";}();
+    if(!enabled || !d3d11_stream_ || service.family!="internal-d3d11" || detail::parallel_mapping_mutex().held_exclusive())return false;
+    auto& stream=*d3d11_stream_;
+    const auto owner=stream.owner.load(std::memory_order_relaxed),context=stream.context.load(std::memory_order_relaxed);
+    if(!owner || !context || state.gs_base!=owner || state.reg(Gpr::Rcx)!=context || stream.failed.load(std::memory_order_acquire))return false;
+    if(detail::runtime_stub_descriptor(stub_base_,state.rip)!=&service)return false;
+    switch(d3d11_stream_class(service.symbol)){
+    case D3D11StreamClass::Scalar:case D3D11StreamClass::Shader:case D3D11StreamClass::Constants:case D3D11StreamClass::Pointers:
+    case D3D11StreamClass::VertexBuffers:case D3D11StreamClass::Viewports:case D3D11StreamClass::Scissors:case D3D11StreamClass::Blend:
+    case D3D11StreamClass::Uavs:case D3D11StreamClass::Targets:case D3D11StreamClass::TargetsUavs:case D3D11StreamClass::Clear:
+    case D3D11StreamClass::ClearDepth:case D3D11StreamClass::Query:case D3D11StreamClass::Update:case D3D11StreamClass::Copy:
+    case D3D11StreamClass::Unmap:case D3D11StreamClass::Map:case D3D11StreamClass::Release:case D3D11StreamClass::GetData:break;
+    default:return false;
+    }
+    const auto step=d3d11_stream_entry(state,memory);
+    d3d11_stream_quiesced();
+    if(step!=D3D11StreamStep::Done)return false;
+    stream.full_enqueues.fetch_add(1,std::memory_order_relaxed);
+    return true;
 }
 // 協調者本地的 D3D11 方法（持獨占映射鎖之前）：裝置建立只新增物件，不依賴佇列；只讀物件自身狀態的方法也一樣；
 // 立即內容的 Map／Unmap 只要等同一資源上排隊的命令：可對應的資源（staging、dynamic）只會被 Copy／Update／Unmap 寫入，不能當輸出目標，這些都記在 pending；讀回本身會等命令執行緒與 GPU。
 // 對應期間客體不能對這個資源發出命令，Unmap 的上傳因此排在佇列裡較早的命令之前也不會被看到。其他方法要看到前面命令的結果。
-void WindowsServices::d3d11_stream_coordinated(const GuestState& state,const bool device_creation) noexcept {
+void WindowsServices::d3d11_stream_coordinated(const GuestState& state,GuestMemory& memory,const bool device_creation) noexcept {
     if(!d3d11_stream_ || device_creation)return;
     auto& stream=*d3d11_stream_;
     const auto* const descriptor=detail::runtime_stub_descriptor(stub_base_,state.rip);
@@ -937,7 +1245,8 @@ void WindowsServices::d3d11_stream_coordinated(const GuestState& state,const boo
     if(kind==D3D11StreamClass::NoDrain)return;
     // 擁有者正停在這次服務等回覆，這裡可以讀它的私有表。
     if((kind==D3D11StreamClass::Map || kind==D3D11StreamClass::Unmap) && state.reg(Gpr::Rcx)==stream.context.load(std::memory_order_relaxed) && state.gs_base==stream.owner.load(std::memory_order_relaxed)){
-        if(const auto found=stream.pending.find(state.reg(Gpr::Rdx));found!=stream.pending.end())d3d11_stream_wait(stream,found->second);
+        if(const auto found=stream.pending.find(state.reg(Gpr::Rdx));found!=stream.pending.end() &&
+           !(kind==D3D11StreamClass::Map && d3d11_map_do_not_wait(state,memory,false)))d3d11_stream_wait(stream,found->second);
         stream.update_epoch.fetch_add(1,std::memory_order_release);
         return;
     }

@@ -14,10 +14,10 @@ std::span<const WindowsServiceDescriptor> crt_string_service_descriptors(){
         {"ntdll.dll","RtlInitUnicodeString",2},{"ntdll.dll","RtlInitUnicodeStringEx",2},
         {"ntdll.dll","RtlInitAnsiString",2},{"ntdll.dll","RtlInitAnsiStringEx",2},{"ntdll.dll","RtlInitString",2},
         {"ntdll.dll","RtlCreateUnicodeString",2},{"ntdll.dll","RtlCreateUnicodeStringFromAsciiz",2},
-        {"ntdll.dll","RtlAnsiStringToUnicodeString",3},{"ntdll.dll","RtlUnicodeStringToAnsiString",3},
-        {"ntdll.dll","RtlFreeUnicodeString",1},{"ntdll.dll","RtlFreeAnsiString",1},{"ntdll.dll","RtlFormatCurrentUserKeyPath",1},
+        {"ntdll.dll","RtlUnicodeStringToAnsiString",3},
+        {"ntdll.dll","RtlFreeAnsiString",1},{"ntdll.dll","RtlFormatCurrentUserKeyPath",1},
         {"crt","_itoa",3},{"crt","_itoa_s",4},{"crt","_itow",3},{"crt","_itow_s",4},{"crt","_ltoa",3},{"crt","_ltoa_s",4},{"crt","_ltow",3},{"crt","_ltow_s",4},{"crt","_ultoa",3},{"crt","_ultoa_s",4},{"crt","_ultow",3},{"crt","_ultow_s",4},{"crt","_i64toa",3},{"crt","_i64toa_s",4},{"crt","_i64tow",3},{"crt","_i64tow_s",4},{"crt","_ui64toa",3},{"crt","_ui64toa_s",4},{"crt","_ui64tow",3},{"crt","_ui64tow_s",4},{"crt","_wtoi",1},{"crt","_wtol",1},{"crt","_wtoi64",1},{"crt","wcstol",3},{"crt","wcstoul",3},{"crt","wcstoll",3},{"crt","wcstoull",3},{"crt","_wcstoi64",3},{"crt","_wcstoui64",3},{"crt","mbstowcs",3},{"crt","wcstombs",3},
-        {"crt","iswdigit",1},{"crt","strpbrk",2},{"crt","wcspbrk",2},{"crt","__strncnt",2},
+        {"crt","strpbrk",2},{"crt","wcspbrk",2},{"crt","__strncnt",2},
         {"crt","mbsrtowcs",4},{"crt","wcsrtombs",4},
         {"crt","mbstowcs_s",5},{"crt","wcstombs_s",5},{"crt","mbsrtowcs_s",6},{"crt","wcsrtombs_s",6},
         {"crt","_mbstowcs_l",4},{"crt","_wcstombs_l",4},{"crt","_mbstowcs_s_l",6},{"crt","_wcstombs_s_l",6},
@@ -32,7 +32,7 @@ std::span<const WindowsServiceDescriptor> crt_string_service_descriptors(){
         {"crt","_makepath",5},{"crt","_wmakepath",5},{"crt","_makepath_s",6},{"crt","_wmakepath_s",6},
         {"crt","_splitpath",5},{"crt","_wsplitpath",5},{"crt","_splitpath_s",9},{"crt","_wsplitpath_s",9},
         {"crt","__isascii",1},{"crt","_memicmp",3},{"crt","_mbscmp",2},{"crt","_mbstrlen",1},
-        {"crt","strtok",2},{"crt","strtok_s",3},{"crt","wcstok_s",3},
+        {"crt","strtok",2},{"crt","strtok_s",3},{"crt","wcstok_s",3},{"crt","wcstok",3},{"crt","_wcstok",2},
         {"crt","sscanf",2},{"crt","sscanf_s",2},{"crt","swscanf",2},{"crt","swscanf_s",2},
         {"crt","vsscanf",3},{"crt","vsscanf_s",3},{"crt","vswscanf",3},{"crt","vswscanf_s",3},
         {"crt","_snscanf",3},{"crt","_snscanf_s",3},{"crt","_snwscanf",3},{"crt","_snwscanf_s",3},
@@ -290,8 +290,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& stat
         const auto conversion_errno=errno;errno=previous_errno;
         if(conversion_errno)memory.store(GuestAddress{runtime_.errno_cell},32,conversion_errno==ERANGE?34:22);
         if(!simple && arg(1))memory.store(GuestAddress{arg(1)},x86_?32:64,arg(0)+static_cast<std::uint64_t>(end-source.c_str())*2);
-    }else if(symbol=="iswdigit")result=static_cast<std::uint16_t>(arg(0))>=u'0' && static_cast<std::uint16_t>(arg(0))<=u'9';
-    else if(symbol=="strpbrk" || symbol=="wcspbrk"){
+    }else if(symbol=="strpbrk" || symbol=="wcspbrk"){
         const auto source=text(arg(0)),accept=text(arg(1));const auto at=source.find_first_of(accept);
         if(at!=source.npos)result=address(arg(0),at).value;
     }else if(symbol=="_wcsdup"){
@@ -342,11 +341,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& stat
             for(std::uint64_t i=0;i<count;++i){const auto c=memory.load(address(arg(1),i),width);if(!c)break;value[static_cast<std::size_t>(i)]=static_cast<char16_t>(c);}
             memory.write(GuestAddress{arg(0)},bytes(value,false));
         }result=arg(0);
-    }else if(symbol=="strtok" || symbol=="strtok_s" || symbol=="wcstok_s"){
-        const bool secure=symbol!="strtok";const auto pointer_width=static_cast<std::uint8_t>(x86_?32:64);
+    }else if(symbol=="strtok" || symbol=="strtok_s" || symbol=="wcstok_s" || symbol=="wcstok" || symbol=="_wcstok"){
+        // UCRT 的 wcstok 為 ISO 三參數版，context 為 NULL 時與舊式 _wcstok 共用執行緒內的寬字元游標（與 strtok 的窄字元游標分開）。
+        const bool secure=symbol=="strtok_s" || symbol=="wcstok_s",contextual=secure || (symbol=="wcstok" && arg(2));const auto pointer_width=static_cast<std::uint8_t>(x86_?32:64);
+        auto& thread_cursor=wide?threads_.items.at(threads_.current).wcstok_cursor:threads_.items.at(threads_.current).strtok_cursor;
         if(!arg(1) || (secure && !arg(2)))return invalid(22);
-        if(secure)memory.check(GuestAddress{arg(2)},pointer_width/8,Access::Write);
-        auto cursor=arg(0)?arg(0):secure?memory.load(GuestAddress{arg(2)},pointer_width):threads_.items.at(threads_.current).strtok_cursor;
+        if(contextual)memory.check(GuestAddress{arg(2)},pointer_width/8,Access::Write);
+        auto cursor=arg(0)?arg(0):contextual?memory.load(GuestAddress{arg(2)},pointer_width):thread_cursor;
         if(!cursor){if(secure)return invalid(22);arg.return_to(state,0);return std::nullopt;}
         const auto delimiters=text(arg(1));std::uint64_t offset=0;
         const auto read=[&]{if(offset>=maximum)throw HostCallFault("CRT 分詞範圍超過上限");return static_cast<char16_t>(memory.load(address(cursor,offset),width));};
@@ -355,7 +356,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& stat
             if(c){memory.store(address(cursor,offset),width,0);++offset;}
         }
         cursor=address(cursor,offset).value;
-        if(secure)memory.store(GuestAddress{arg(2)},pointer_width,cursor);else threads_.items.at(threads_.current).strtok_cursor=cursor;
+        if(contextual)memory.store(GuestAddress{arg(2)},pointer_width,cursor);else thread_cursor=cursor;
     }else {
         // 安全複製／串接以字元數計算容量；_TRUNCATE 保留 NUL 並回傳 STRUNCATE。
         const bool append=symbol.find("cat")!=symbol.npos,bounded=symbol.find("ncpy")!=symbol.npos || symbol.find("ncat")!=symbol.npos;

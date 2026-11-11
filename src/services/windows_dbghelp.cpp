@@ -134,7 +134,7 @@ std::span<const WindowsServiceDescriptor> dbghelp_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
         {"dbghelp.dll","UnDecorateSymbolName",4,0,0,12},{"dbghelp.dll","UnDecorateSymbolNameW",4,0,0,12},
         {"dbghelp.dll","StackWalk64",9,0,0,1},{"dbghelp.dll","StackWalk",9,0,0,1},
-        {"dbghelp.dll","SymSetOptions",1},{"dbghelp.dll","SymGetOptions",0},
+        {"dbghelp.dll","SymSetOptions",1},{"dbghelp.dll","SymGetOptions",0},{"dbghelp.dll","ImagehlpApiVersion",0},{"dbghelp.dll","ImagehlpApiVersionEx",1},
         {"dbghelp.dll","ImageNtHeader",1},{"dbghelp.dll","ImageDirectoryEntryToData",4},{"dbghelp.dll","ImageDirectoryEntryToDataEx",5},
         {"dbghelp.dll","ImageRvaToSection",3},{"dbghelp.dll","ImageRvaToVa",4},
         {"dbghelp.dll","SymInitialize",3},{"dbghelp.dll","SymInitializeW",3},
@@ -165,8 +165,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp(GuestState& state,G
         return path;
     };
     const auto snapshot=[&](SymbolSession& session){refresh_symbol_modules(session,memory);};
-    if(name.starts_with("Image")){
-        // PE 標頭工具：呼叫端傳入已映射的映像或檔案 view；非 PE 回 NULL 與 ERROR_BAD_EXE_FORMAT。
+    if(name.starts_with("Image") && !name.starts_with("Imagehlp")){
+        // PE 標頭工具（ImagehlpApiVersion* 是版本查詢，不屬此類）：呼叫端傳入已映射的映像或檔案 view；非 PE 回 NULL 與 ERROR_BAD_EXE_FORMAT。
         const auto nt_header=[&](std::uint64_t base)->std::uint64_t{
             if(!base || memory.load(GuestAddress{base},16)!=0x5a4dU)return 0;
             const auto offset=memory.load(GuestAddress{base+0x3c},32);
@@ -219,7 +219,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp(GuestState& state,G
         }
         arg.return_to(state,result);return std::nullopt;
     }
-    if(name=="SymSetOptions")result=runtime_.symbol_options=static_cast<std::uint32_t>(arg(0));
+    if(name=="ImagehlpApiVersion" || name=="ImagehlpApiVersionEx"){
+        // 回傳程式庫內固定的 API_VERSION（Major、Minor、Revision、Reserved 各 16 位元）：Windows 10 dbghelp 10.0、API_VERSION_NUMBER 12；
+        // Ex 版的呼叫端版本只供程式庫參考，不改變回傳內容。結構配置一次，之後同一位址。
+        static std::uint64_t version=0;
+        if(!version){version=allocate_heap(memory,8);if(version){memory.store(GuestAddress{version},16,10);memory.store(GuestAddress{version+2},16,0);memory.store(GuestAddress{version+4},16,12);memory.store(GuestAddress{version+6},16,0);}}
+        if(!version)fail(8);else result=version;
+    }
+    else if(name=="SymSetOptions")result=runtime_.symbol_options=static_cast<std::uint32_t>(arg(0));
     else if(name=="SymGetOptions")result=runtime_.symbol_options;
     else if(name=="SymInitialize" || name=="SymInitializeW"){
         if(!arg(0) || runtime_.symbol_sessions.contains(arg(0)))fail(87);

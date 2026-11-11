@@ -93,7 +93,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
         if(size[0]<=0 || size[1]<=0 || size[0]>16384 || size[1]>16384 || static_cast<std::uint64_t>(size[0])*static_cast<unsigned>(size[1])>output_limit/4)return done(87);
         if((flags&8U) && (static_cast<unsigned>(size[0])!=w.width || static_cast<unsigned>(size[1])!=w.height))return done(87);
         if(values[1] && values[1]!=0x10000000U)return done(6);
-        std::vector<std::uint32_t> pixels;std::shared_ptr<RasterSurface> surface;
+        std::vector<std::uint32_t> pixels;std::shared_ptr<RasterSurface> surface;bool reused=false;
         if(!values[4]){if(values[1] || values[3] || values[5] || values[7] || mode)return done(87);if(w.layered_pixels.empty())return done(87);}
         else {
             if(!mode)return done(87);const auto context=gui_.contexts.find(values[4]);if(context==gui_.contexts.end())return done(6);
@@ -111,12 +111,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_graphics_compat(GuestState&
                     if(mode==2){output=0;for(unsigned channel=0;channel<3;++channel)output|=((((color>>(channel*8))&255)*constant+127)/255)<<(channel*8);output|=(((per_pixel?color>>24:255)*constant+127)/255)<<24;}
                     pixels[static_cast<std::size_t>(y)*static_cast<unsigned>(size[0])+x]=output;
                 }
-                if(native_gui_){surface=make_hardware_raster(static_cast<unsigned>(size[0]),static_cast<unsigned>(size[1]),{},native_gui_->graphics_view(arg(0)));surface->upload(pixels,true);surface->set_transparent(true);}
+                if(native_gui_){
+                    // 尺寸不變時沿用上一次 UpdateLayeredWindow 已掛在原生視窗上的表面，只更新像素：
+                    // 每幀換新表面會讓視窗在新表面呈現前短暫空白（動畫啟動畫面閃爍），也多一次建立與掛載成本。
+                    if(!w.layered_pixels.empty())if(const auto existing=rasters_.find(0x10000000U+arg(0));existing!=rasters_.end() && existing->second &&
+                        existing->second->width()==static_cast<unsigned>(size[0]) && existing->second->height()==static_cast<unsigned>(size[1])){surface=existing->second;reused=true;}
+                    if(!surface)surface=make_hardware_raster(static_cast<unsigned>(size[0]),static_cast<unsigned>(size[1]),{},native_gui_->graphics_view(arg(0)));
+                    surface->upload(pixels,true);surface->set_transparent(true);
+                }
             }catch(const std::bad_alloc&){return done(8);}catch(const std::runtime_error&){return done(50);}
         }
         const bool moved=position[0]!=w.x || position[1]!=w.y,resized=static_cast<unsigned>(size[0])!=w.width || static_cast<unsigned>(size[1])!=w.height;
         w.x=position[0];w.y=position[1];w.width=static_cast<unsigned>(size[0]);w.height=static_cast<unsigned>(size[1]);
-        if(values[4]){w.layered_pixels=std::move(pixels);w.drawing.clear();gui_.contexts.try_emplace(0x10000000U+arg(0));gui_.dc_objects.try_emplace(0x10000000U+arg(0),0xb011);if(surface){rasters_[0x10000000U+arg(0)]=surface;native_gui_->graphics_surface(arg(0),surface);}}
+        if(values[4]){w.layered_pixels=std::move(pixels);w.drawing.clear();gui_.contexts.try_emplace(0x10000000U+arg(0));gui_.dc_objects.try_emplace(0x10000000U+arg(0),0xb011);if(surface && !reused){rasters_[0x10000000U+arg(0)]=surface;native_gui_->graphics_surface(arg(0),surface);}}
         present_gui(arg(0));if(surface)surface->flush(true);
         if(w.procedure && (moved || resized)){std::vector<GuestCallback> callbacks;if(moved)callbacks.push_back({w.procedure,{arg(0),3,0,gui_move_lparam(w)}});if(resized)callbacks.push_back({w.procedure,{arg(0),5,0,(w.width&65535U)|((w.height&65535U)<<16)}});start_callbacks(state,memory,std::move(callbacks),Continuation::Return,1);return {};}
         return done(0);

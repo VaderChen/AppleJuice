@@ -9,15 +9,24 @@ bool d3d11_direct_draw_enabled() noexcept {
     return value;
 }
 // 共用池的可見度槽位（池建立時已清零，只遞增游標，用完換新池並開新區段）。呼叫端已核對 query 用共用池且 sequence 未滿。
-void d3d11_pooled_visibility(D3D11State& bridge,Identity& context,Identity& query,GraphicsDraw& draw){
+// 共用可見度池分配一個槽位給這次繪製；查詢以區段（池、起點、槽數）記錄自己用到的槽位，不連續時另開區段。
+// 遮蔽查詢與管線統計查詢（像素著色器呼叫數）可以共用同一次繪製的槽位。
+void d3d11_pooled_slot(D3D11State& bridge,Identity& context,GraphicsDraw& draw){
     if(!context.visibility_pool || context.visibility_cursor+8>d3d11_visibility_pool_bytes){
         GraphicsResourceDesc desc;desc.width=d3d11_visibility_pool_bytes;
         context.visibility_pool=context.native->graphics_resource(desc);context.visibility_cursor=0;++bridge.resource_creations["VisibilityPool"];
     }
-    auto& segments=query.visibility_segments;
-    if(segments.empty() || segments.back().buffer!=context.visibility_pool)segments.push_back({context.visibility_pool,context.visibility_cursor,0});
     draw.visibility=context.visibility_pool;draw.visibility_offset=context.visibility_cursor;
-    context.visibility_cursor+=8;++segments.back().count;++query.sequence;
+    context.visibility_cursor+=8;
+}
+void d3d11_visibility_append(Identity& query,const GraphicsDraw& draw){
+    auto& segments=query.visibility_segments;
+    if(segments.empty() || segments.back().buffer!=draw.visibility || segments.back().base+segments.back().count*8U!=draw.visibility_offset)
+        segments.push_back({draw.visibility,draw.visibility_offset,0});
+    ++segments.back().count;
+}
+void d3d11_pooled_visibility(D3D11State& bridge,Identity& context,Identity& query,GraphicsDraw& draw){
+    d3d11_pooled_slot(bridge,context,draw);d3d11_visibility_append(query,draw);++query.sequence;
 }
 // Graphics 不更新 CS 階段，Compute 只更新 CS 階段；未更新的部分在這份快取裡維持上次內容（原始指標與解析值仍一致），只有對應的提交才會讀它。
 enum class D3D11DrawScope:std::uint8_t {All,Graphics,Compute};
@@ -138,8 +147,9 @@ GraphicsDraw& d3d11_draw_state(D3D11State& bridge,const std::shared_ptr<Identity
             }
         }
     }
+    draw.stages[5].statistics=context->pipeline_statistics;
     if(scope!=D3D11DrawScope::Compute){
-    draw.stream_statistics=context->stream_statistics;
+    draw.stream_statistics=context->stream_statistics;draw.pipeline_statistics=context->pipeline_statistics;
     refresh(cache->stream_raw,values(d3d11_slot_stream,stream_key),4,[&](auto i,auto pointer){draw.stream_targets[i]=pointer?object(pointer).identity->resource:nullptr;});
     if(const auto ptr=single(d3d11_slot_layout,layout_key);ptr!=cache->layout){
         const auto* layout=ptr?object(ptr).identity.get():nullptr;
@@ -184,6 +194,14 @@ D3D11DrawMethod d3d11_draw_method(std::string_view symbol) noexcept {
     if(symbol=="DispatchIndirect")return D3D11DrawMethod::DispatchIndirect;
     return D3D11DrawMethod::None;
 }
+D3D11DrawMethod d3d11_draw_method(const WindowsServiceDescriptor& service) noexcept {
+    static const std::vector<D3D11DrawMethod> table=[] {
+        const auto descriptors=runtime_service_descriptors();std::vector<D3D11DrawMethod> value(descriptors.size());
+        for(std::size_t i=0;i<descriptors.size();++i)value[i]=d3d11_draw_method(descriptors[i].symbol);
+        return value;
+    }();
+    return d3d11_method_by_descriptor(service,table,[](std::string_view symbol){return d3d11_draw_method(symbol);});
+}
 // 前置路徑途中的例外：同一執行緒接著走完整路徑時，在它的 try 內重新拋出。
 thread_local std::exception_ptr d3d11_front_exception;
 // 回傳 true 表示已完成並可直接回到客體（void 方法與完整路徑相同以 0 返回）。呼叫端持圖形鎖，且已比照前置路徑核對 compare 模式與延後銷毀清單。
@@ -199,6 +217,8 @@ template<class ReleaseMapping>
     if(device==bridge.objects.end() || !device->second.identity ||
        (device->second.identity->protected_threads && device->second.identity->lock_address))return false;
     if(const auto& predicate=d3d11_fixed_slots(*context,d3d11_slot_predicate);!predicate.empty() && predicate.front())return false;
+    // 進行中的管線統計查詢要為每次繪製分配可見度槽位（像素著色器呼叫數），走完整路徑。
+    if(!context->pipeline_queries.empty())return false;
     const auto u32=[&](unsigned i){return static_cast<std::uint32_t>(arg[i]);};
     // 進行中的遮蔽查詢：只處理共用池；其他查詢要在同一提交順序補清緩衝，走完整路徑。
     Identity* query=nullptr;

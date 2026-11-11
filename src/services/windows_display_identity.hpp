@@ -61,6 +61,23 @@ inline constexpr std::array<std::uint8_t,320> adapter_description(bool x86,std::
     return result;
 }
 
+// WARP（IDXGIFactory2+::EnumWarpAdapter）：Windows 8 以後永遠存在的軟體配接器，有程式假設一定拿得到（3DMark Time Spy 不檢查失敗）。
+// 依 Windows 的身分回報（Microsoft Basic Render Driver、廠商 0x1414、裝置 0x8C、DXGI_ADAPTER_FLAG_SOFTWARE），LUID 與硬體配接器不同；
+// 沒有另一套軟體光柵器，在它上面建立的裝置仍由同一個 Metal 裝置執行。沒有顯示輸出。
+inline constexpr std::uint64_t warp_adapter_luid=0x78363462;
+inline constexpr std::u16string_view warp_adapter_name=u"Microsoft Basic Render Driver";
+inline constexpr std::array<std::uint8_t,320> warp_adapter_description(bool x86,std::uint64_t shared_memory) noexcept {
+    std::array<std::uint8_t,320> result{};
+    for(std::size_t i=0;i<warp_adapter_name.size();++i){result[i*2]=static_cast<std::uint8_t>(warp_adapter_name[i]);result[i*2+1]=static_cast<std::uint8_t>(warp_adapter_name[i]>>8);}
+    const auto word=[&](std::size_t at,std::uint32_t value){for(unsigned i=0;i<4;++i)result[at+i]=static_cast<std::uint8_t>(value>>(8*i));};
+    word(256,0x1414);word(260,0x8c);
+    word(x86?280:288,static_cast<std::uint32_t>(x86?std::min<std::uint64_t>(shared_memory,UINT32_MAX):shared_memory));
+    if(!x86)word(292,static_cast<std::uint32_t>(shared_memory>>32));
+    word(x86?284:296,static_cast<std::uint32_t>(warp_adapter_luid));word(x86?288:300,static_cast<std::uint32_t>(warp_adapter_luid>>32));
+    word(x86?292:304,2); // DXGI_ADAPTER_FLAG_SOFTWARE（DESC1 起）
+    return result;
+}
+
 // 監視器：GUID_DEVCLASS_MONITOR 與 GUID_DEVINTERFACE_MONITOR。User32、SetupAPI 與 CM 共用下列身分。
 inline constexpr std::u16string_view monitor_class_name=u"{4d36e96e-e325-11ce-bfc1-08002be10318}";
 inline constexpr std::array<std::uint8_t,16> monitor_class_guid{0x6e,0xe9,0x36,0x4d,0x25,0xe3,0xce,0x11,0xbf,0xc1,0x08,0x00,0x2b,0xe1,0x03,0x18};

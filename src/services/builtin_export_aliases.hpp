@@ -178,6 +178,11 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"wsock32.dll","#1142","mswsock.dll","GetAcceptExSockaddrs"},
     {"shlwapi.dll","#437","shlwapi.dll","IsOS"},
     {"shlwapi.dll","#176","shlwapi.dll","IUnknown_QueryService"},
+    // comctl32 v6 只以序號公開的子類別函式。
+    {"comctl32.dll","#410","comctl32.dll","SetWindowSubclass"},
+    {"comctl32.dll","#411","comctl32.dll","GetWindowSubclass"},
+    {"comctl32.dll","#412","comctl32.dll","RemoveWindowSubclass"},
+    {"comctl32.dll","#413","comctl32.dll","DefSubclassProc"},
     {"shlwapi.dll","#219","shlwapi.dll","QISearch"},
     {"comctl32.dll","#17","comctl32.dll","InitCommonControls"},
     {"comctl32.dll","#344","comctl32.dll","TaskDialog"},

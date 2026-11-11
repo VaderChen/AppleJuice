@@ -1,7 +1,8 @@
         // DXGI 與 User32 共用目前公開的主顯示器；原生模式來自 Core Graphics。
         if(!graphics_handled && symbol=="EnumOutputs"){
-            graphics_handled=true;(void)typed(arg(0),Kind::Adapter);require(arg(2));output(2);write_pointer(arg(2),0);
-            if(u32(1) || !native_gui_ || !native_gui_->current_display_mode())result=not_found;else write_pointer(arg(2),create_output(arg(0)));
+            graphics_handled=true;const auto adapter=typed(arg(0),Kind::Adapter);require(arg(2));output(2);write_pointer(arg(2),0);
+            // WARP 沒有顯示輸出。
+            if(u32(1) || adapter->warp_adapter || !native_gui_ || !native_gui_->current_display_mode())result=not_found;else write_pointer(arg(2),create_output(arg(0)));
         }else if(!graphics_handled && symbol=="OutputGetDesc"){
             graphics_handled=true;(void)typed(arg(0),Kind::Output);require(arg(1));std::vector<std::uint8_t> desc(x86_?92:96);
             const auto name=utf16_bytes(u"\\\\.\\DISPLAY1");std::copy(name.begin(),name.end(),desc.begin());const auto rect=gui_screen_area();for(unsigned i=0;i<4;++i)put_word(desc,64+4*i,static_cast<std::uint32_t>(rect[i]));
@@ -16,6 +17,53 @@
             graphics_handled=true;(void)typed(arg(0),Kind::Output);require(arg(1) && arg(2));auto desired=read_bytes(memory,arg(1),28);auto format=word(desired,16);
             if(arg(3)){require(object(arg(3)).identity->kind==Kind::Device);if(!format)format=87;}else require(format!=0);
             if(!scanout_format(format))result=not_supported;else if(const auto mode=closest_display_mode(desired))memory.write(GuestAddress{arg(2)},display_mode_bytes(*mode,format));else result=not_found;
+        }else if(!graphics_handled && (symbol=="GetDisplayModeList1" || symbol=="FindClosestMatchingMode1" || symbol=="OutputGetDesc1" ||
+                                       symbol=="SupportsOverlays" || symbol=="CheckOverlaySupport" || symbol=="CheckOverlayColorSpaceSupport" ||
+                                       symbol=="CheckHardwareCompositionSupport" || symbol=="GetDisplaySurfaceData" || symbol=="GetDisplaySurfaceData1" ||
+                                       symbol=="SetDisplaySurface" || symbol=="DuplicateOutput" || symbol=="DuplicateOutput1")){
+            // IDXGIOutput1～6：模式清單與最近模式沿用 IDXGIOutput 的實作，DXGI_MODE_DESC1 比 DXGI_MODE_DESC 多一個 Stereo（不提供立體模式）。
+            // 沒有硬體疊加平面與硬體合成：SupportsOverlays 為 FALSE，疊加查詢回 DXGI_ERROR_UNSUPPORTED、旗標 0。
+            // GetDisplaySurfaceData／SetDisplaySurface 依規格只在全螢幕時有效，視窗模式回 DXGI_ERROR_INVALID_CALL。
+            // 桌面複製（DuplicateOutput）尚未實作，回 DXGI_ERROR_UNSUPPORTED（系統不支援桌面複製時的文件化結果）。
+            graphics_handled=true;(void)typed(arg(0),Kind::Output);
+            constexpr std::uint32_t invalid_call=0x887a0001U,unsupported=0x887a0004U;
+            const auto put_float=[&](std::uint64_t at,float value){memory.store(GuestAddress{at},32,std::bit_cast<std::uint32_t>(value));};
+            if(symbol=="GetDisplayModeList1"){
+                require(arg(3) && !(u32(2)&~15U));const auto capacity=memory.load(GuestAddress{arg(3)},32);
+                auto modes=native_gui_ && scanout_format(u32(1))?native_gui_->display_modes():std::vector<GuiDisplayMode>{};
+                std::erase_if(modes,[&](const auto& mode){return (mode.scanline>1 && !(u32(2)&1)) || (mode.scaling==2 && !(u32(2)&2));});
+                memory.store(GuestAddress{arg(3)},32,modes.size());
+                if(arg(4)){
+                    if(capacity<modes.size())result=0x887a0003U;
+                    else{memory.check(GuestAddress{arg(4)},modes.size()*32,Access::Write);
+                        for(std::size_t i=0;i<modes.size();++i){auto bytes=display_mode_bytes(modes[i],u32(1));bytes.resize(32);memory.write(GuestAddress{arg(4)+32*i},bytes);}}
+                }
+            }else if(symbol=="FindClosestMatchingMode1"){
+                require(arg(1) && arg(2));const auto desired1=read_bytes(memory,arg(1),32);std::vector<std::uint8_t> desired(desired1.begin(),desired1.begin()+28);auto format=word(desired,16);
+                if(arg(3)){require(object(arg(3)).identity->kind==Kind::Device);if(!format)format=87;}else require(format!=0);
+                if(word(desired1,28))result=not_found;
+                else if(!scanout_format(format))result=not_supported;
+                else if(const auto mode=closest_display_mode(desired)){auto bytes=display_mode_bytes(*mode,format);bytes.resize(32);memory.write(GuestAddress{arg(2)},bytes);}
+                else result=not_found;
+            }else if(symbol=="OutputGetDesc1"){
+                // DXGI_OUTPUT_DESC1：DXGI_OUTPUT_DESC 之後接每色位元數、色彩空間、sRGB 原色與白點、亮度（SDR 顯示）。
+                require(arg(1));const unsigned base=x86_?92U:96U;std::vector<std::uint8_t> desc(x86_?144U:152U);
+                const auto name=utf16_bytes(u"\\\\.\\DISPLAY1");std::copy(name.begin(),name.end(),desc.begin());const auto rect=gui_screen_area();for(unsigned i=0;i<4;++i)put_word(desc,64+4*i,static_cast<std::uint32_t>(rect[i]));
+                put_word(desc,80,native_gui_ && native_gui_->current_display_mode()?1:0);put_word(desc,84,1);put_word(desc,88,1);
+                put_word(desc,base,8);put_word(desc,base+4,0); // 8 位元、DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+                const std::array<float,11> color{0.64F,0.33F,0.30F,0.60F,0.15F,0.06F,0.3127F,0.3290F,0.5F,270.0F,270.0F};
+                for(unsigned i=0;i<color.size();++i)put_word(desc,base+8+4*i,std::bit_cast<std::uint32_t>(color[i]));
+                memory.write(GuestAddress{arg(1)},desc);
+            }else if(symbol=="SupportsOverlays")result=0;
+            else if(symbol=="CheckOverlaySupport"){require(arg(3));memory.store(GuestAddress{arg(3)},32,0);result=unsupported;}
+            else if(symbol=="CheckOverlayColorSpaceSupport"){require(arg(4));memory.store(GuestAddress{arg(4)},32,0);result=unsupported;}
+            else if(symbol=="CheckHardwareCompositionSupport"){require(arg(1));memory.store(GuestAddress{arg(1)},32,0);}
+            else if(symbol=="DuplicateOutput" || symbol=="DuplicateOutput1"){const unsigned out=symbol=="DuplicateOutput"?2U:5U;require(arg(out));output(out);write_pointer(arg(out),0);result=unsupported;}
+            else{
+                const bool fullscreen=std::any_of(bridge.objects.begin(),bridge.objects.end(),[](const auto& item){return item.second.kind==Kind::SwapChain && item.second.identity->fullscreen;});
+                require(arg(1));if(!fullscreen)result=invalid_call;else result=unsupported;
+            }
+            (void)put_float;
         }else if(!graphics_handled && (symbol=="GetGammaControlCapabilities" || symbol=="SetGammaControl" || symbol=="GetGammaControl" ||
                                        symbol=="WaitForVBlank" || symbol=="TakeOwnership" || symbol=="ReleaseOwnership" ||
                                        (symbol=="GetFrameStatistics" && object(arg(0)).identity->kind==Kind::Output))){

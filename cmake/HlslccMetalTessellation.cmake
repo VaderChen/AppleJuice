@@ -278,3 +278,32 @@ x64arm_hlslcc_patch(toMetalOperand.cpp
                 }
             }
             switch (psIn->eSystemValueType)]=])
+
+# 幾何著色器的 SV_PrimitiveID（vPrim）：原本兩處都只認 HS／DS，幾何階段翻成空字串（3DMark Fire Strike 的粒子 GS 以它索引結構化緩衝，
+# 產生 `AliveParticleIndices[]` 而編譯失敗）。幾何階段由 compute 包裝以參數傳入每個 invocation 的 primitive 序號（見 metal_geometry.inc）。
+x64arm_hlslcc_patch(toMetalOperand.cpp
+  [=[            else if (psContext->psShader->eShaderType == DOMAIN_SHADER) oss << "mtl_PrimitiveID";]=]
+  [=[            else if (psContext->psShader->eShaderType == DOMAIN_SHADER || psContext->psShader->eShaderType == GEOMETRY_SHADER) oss << "mtl_PrimitiveID";]=])
+x64arm_hlslcc_patch(toMetalDeclaration.cpp
+  [=[                if (psShader->eShaderType == DOMAIN_SHADER)
+                    m_StructDefinitions[""].m_Members.push_back(std::make_pair("mtl_PrimitiveID", "uint mtl_PrimitiveID [[ patch_id ]]"));]=]
+  [=[                if (psShader->eShaderType == DOMAIN_SHADER || psShader->eShaderType == GEOMETRY_SHADER)
+                    m_StructDefinitions[""].m_Members.push_back(std::make_pair("mtl_PrimitiveID", psShader->eShaderType == GEOMETRY_SHADER ? "uint mtl_PrimitiveID" : "uint mtl_PrimitiveID [[ patch_id ]]"));]=])
+
+# gather4_po_c 的運算元是「目的、座標、偏移、貼圖、取樣器、參考值」，貼圖在第 3 個；原本與 sample_d 共用分支標記第 2 個（偏移暫存器），
+# 真正的深度貼圖沒被標成陰影貼圖而宣告為 texture2d，gather_compare 編譯失敗（3DMark Fire Strike GT2／Combined 的陰影濾波）。
+x64arm_hlslcc_patch(decode.cpp
+  [=[            /* sample_d is not a shadow sampler, others need flagging */
+            if (eOpcode != OPCODE_SAMPLE_D)
+            {
+                MarkTextureAsShadow(&psShader->sInfo,
+                    psPhase->psDecl,
+                    &psInst->asOperands[2]);
+            }]=]
+  [=[            /* sample_d is not a shadow sampler; gather4_po_c's resource is operand 3 (after the offset). */
+            if (eOpcode == OPCODE_GATHER4_PO_C)
+            {
+                MarkTextureAsShadow(&psShader->sInfo,
+                    psPhase->psDecl,
+                    &psInst->asOperands[3]);
+            }]=])

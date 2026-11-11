@@ -40,6 +40,8 @@ public:
     void unlock_shared() noexcept {
         --depth_;readers_[slot()].count.fetch_sub(1,std::memory_order_release);
     }
+    // 是否有寫者正在等讀者排空：長時間持讀鎖的一方（D3D11 串流重播的整批上鎖）據此提早放開。只是提示，不保證同步。
+    bool writer_waiting() const noexcept {return writer_.load(std::memory_order_relaxed)!=0;}
     // 這條執行緒是否持獨占鎖（等背景工作前核對，避免與被擋住的讀者互等）。
     bool held_exclusive() const noexcept {return exclusive_;}
     void lock() noexcept {

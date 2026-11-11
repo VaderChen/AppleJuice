@@ -1,3 +1,4 @@
+#include "x64arm/process_identity.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/cross_architecture.hpp"
 #include "x64arm/shared_event.hpp"
@@ -245,7 +246,11 @@ Opened open_mapping(const std::shared_ptr<Session>& ns, std::u16string_view name
     auto result = std::make_shared<Mapping>(); result->name_space = ns; result->named = !name.empty();
     // 全命名空間鎖同時涵蓋 open / reference / unlink，避免 last-close 與再 open 競態。
     DirectoryLock lock(ns->directory);
-    result->name = result->named ? object_name(name) : "anonymous-" + std::to_string(::getpid()) + "-" + std::to_string(reinterpret_cast<std::uintptr_t>(result.get()));
+    // 匿名 section 名稱含出生識別：pid 重用時不會開到被強制結束的舊程序留下、仍有人持有的同名檔。
+    // fork 後的子程序沿用快取時 pid 會不同，以 pid 為鍵重新查詢。
+    thread_local std::uint32_t birth_pid{};thread_local std::uint64_t birth{};
+    if(const auto pid=static_cast<std::uint32_t>(::getpid());birth_pid!=pid){birth=process_identity::query(pid).identity.birth;birth_pid=pid;}
+    result->name = result->named ? object_name(name) : "anonymous-" + std::to_string(::getpid()) + "-" + std::to_string(birth) + "-" + std::to_string(reinterpret_cast<std::uintptr_t>(result.get()));
     if(internal){result->name="table-"+result->name;result->persistent=true;} // 與客體可開啟的命名 section 分離。
     bool created = false;
     if (create) {

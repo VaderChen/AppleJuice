@@ -645,9 +645,9 @@ std::span<const WindowsServiceDescriptor> memory_service_descriptors() {
         {"kernel32.dll","UnmapViewOfFileEx",2},{"kernel32.dll","UnmapViewOfFile2",3},
         {"kernel32.dll","VirtualAlloc",4},{"kernel32.dll","VirtualFree",3},{"kernel32.dll","VirtualQuery",3},{"kernel32.dll","VirtualQueryEx",4},
         {"kernel32.dll","VirtualAlloc2",7},{"kernel32.dll","VirtualAlloc2FromApp",7},{"kernel32.dll","VirtualAllocExNuma",6},
-        {"kernel32.dll","GetNumaHighestNodeNumber",1},{"kernel32.dll","GetNumaProcessorNode",2},{"kernel32.dll","GetNumaProcessorNodeEx",2},
-        {"kernel32.dll","GetNumaNodeProcessorMask",2},{"kernel32.dll","GetNumaNodeProcessorMaskEx",2},{"kernel32.dll","GetNumaNodeProcessorMask2",4},
-        {"kernel32.dll","GetNumaAvailableMemoryNode",2},{"kernel32.dll","GetNumaAvailableMemoryNodeEx",2},
+        {"kernel32.dll","GetNumaProcessorNode",2},{"kernel32.dll","GetNumaProcessorNodeEx",2},
+        {"kernel32.dll","GetNumaNodeProcessorMask2",4},
+        
         {"kernel32.dll","GetNumaProximityNode",2},{"kernel32.dll","GetNumaProximityNodeEx",2},
         {"kernel32.dll","DiscardVirtualMemory",2},{"kernel32.dll","PrefetchVirtualMemory",4},
         {"kernel32.dll","OfferVirtualMemory",3},{"kernel32.dll","ReclaimVirtualMemory",2},

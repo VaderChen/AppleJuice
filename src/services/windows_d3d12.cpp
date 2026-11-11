@@ -55,7 +55,7 @@ struct D3D12DrawPool {
     static void share(GraphicsView& to,const GraphicsView& from){
         share(to.resource,from.resource);share(to.counter,from.counter);
         to.format=from.format;to.level=from.level;to.levels=from.levels;to.slice=from.slice;to.slices=from.slices;
-        to.first=from.first;to.count=from.count;to.flags=from.flags;to.dimension=from.dimension;to.stride=from.stride;
+        to.first=from.first;to.count=from.count;to.flags=from.flags;to.dimension=from.dimension;to.stride=from.stride;to.counter_offset=from.counter_offset;
     }
     static bool share_enabled(){static const bool value=[] {const auto* text=std::getenv("X64ARM_D3D12_POOL_SHARE");return !text || std::string_view(text)!="0";}();return value;}
     Slot& fill(NativeGraphics& native,const GraphicsDraw& source){
@@ -167,6 +167,8 @@ struct D3D12State {
     struct DescriptorData : std::enable_shared_from_this<DescriptorData> {
         GraphicsView view;
         std::shared_ptr<GraphicsSampler> sampler;
+        // UAV 計數器：pCounterResource 物件與 CounterOffsetInBytes，綁定時解析成後端資源（計數器由 GPU 寫入）。
+        std::uint64_t counter{},counter_offset{};
         mutable std::optional<MirrorCache> mirror;
     };
     struct Descriptor {
@@ -197,7 +199,7 @@ struct D3D12State {
     struct Range {std::uint32_t type{},count{},base{},space{},offset{};};
     // visibility：D3D12_SHADER_VISIBILITY（0＝全部階段、1＝VS、5＝PS…）。同一暫存器可由不同可見度的根參數各自提供（例如 VS 與 PS 各有 b6）。
     struct Parameter {std::uint32_t type{},reg{},space{},values{},visibility{};std::vector<Range> ranges;};
-    struct StaticSampler {std::uint32_t reg{},visibility{};std::shared_ptr<GraphicsSampler> sampler;};
+    struct StaticSampler {std::uint32_t reg{},visibility{};std::shared_ptr<GraphicsSampler> sampler;std::uint32_t space{};};
     struct RootSignature {std::vector<Parameter> parameters;std::vector<StaticSampler> samplers;};
     struct Pipeline {
         bool compute{};std::uint64_t root{};std::shared_ptr<GraphicsShader> shader,pixel,geometry,hull,domain;
@@ -258,6 +260,12 @@ struct D3D12State {
     struct SwapChain {
         std::uint64_t queue{},device{},window{},factory{};std::vector<std::uint64_t> buffers;std::shared_ptr<NativeOpenGlContext> native;
         std::uint32_t width{},height{},format{},flags{},index{},interval{};std::uint64_t frames{};std::vector<std::uint8_t> desc1;
+        // IDXGISwapChain1～4 的狀態：全螢幕描述（DXGI_SWAP_CHAIN_FULLSCREEN_DESC，建立時給定）、背景色（DXGI_RGBA）、旋轉、
+        // 來源大小（預設為緩衝大小，ResizeBuffers 時重設）與最大幀延遲（可等待交換鏈預設 1）。
+        std::array<std::uint8_t,20> fullscreen{};std::array<std::uint8_t,16> background{};
+        std::uint32_t rotation{1},source_width{},source_height{},latency{1};
+        // 幀延遲等待物件（DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT）：號誌狀態的 identity；每次 Present 排入後釋放一格。
+        std::uint64_t latency_identity{};
     };
     // 物件、資源、命令清單與管線表每次服務呼叫或每次繪製都會查詢（數萬筆時 std::map 樹狀查找以快取未命中為主）：改雜湊表。
     // 沒有依序走訪；元素參照在重新雜湊後仍有效（重播的資源指標快取依此），只在建立／釋放時增刪。
@@ -711,7 +719,7 @@ constexpr std::pair<std::string_view,unsigned> swap_methods[]{
 constexpr std::array<std::array<std::uint8_t,16>,7> swap_iids{{
     {0xb8,0x2f,0xc2,0xae,0xf3,0x76,0x39,0x46,0x9b,0xe0,0x28,0xeb,0x43,0xa6,0x7a,0x2e},{0x79,0x03,0x3e,0x3d,0xde,0xf9,0x58,0x4d,0xbb,0x6c,0x18,0xd6,0x29,0x92,0xf1,0xa6},
     {0xa0,0x36,0x0d,0x31,0xe7,0xd2,0x0a,0x4c,0xaa,0x04,0x6a,0x9d,0x23,0xb8,0x88,0x6a},{0xf7,0x45,0x0a,0x79,0x42,0x0d,0x76,0x48,0x98,0x3a,0x0a,0x55,0xcf,0xe6,0xf4,0xaa},
-    {0xc4,0x2a,0xbe,0xa8,0xf8,0x19,0x46,0x49,0xb3,0x31,0x79,0x59,0x9f,0xb9,0x8d,0xe7},{0xdb,0x9b,0xd9,0x94,0xf8,0xf1,0xb0,0x4a,0xb2,0x36,0x7d,0xa0,0x17,0x0e,0xda,0xb1},
+    {0xc4,0x2a,0xbe,0xa8,0x9f,0x19,0x46,0x49,0xb3,0x31,0x79,0x59,0x9f,0xb9,0x8d,0xe7},{0xdb,0x9b,0xd9,0x94,0xf8,0xf1,0xb0,0x4a,0xb2,0x36,0x7d,0xa0,0x17,0x0e,0xda,0xb1},
     {0x5a,0x5d,0x58,0x3d,0x4a,0xbd,0x9e,0x48,0xb1,0xf4,0x3d,0xbc,0xb6,0x45,0x2f,0xfb}}}; // IDXGISwapChain4 {3D585D5A-BD4A-489E-B1F4-3DBCB6452FFB}
 constexpr std::array<std::uint8_t,16> iid_unknown{0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
 constexpr std::array<std::uint8_t,16> iid_blob{0x08,0xfb,0xa5,0x8b,0x95,0x51,0xe2,0x40,0xac,0x58,0x0d,0x98,0x9c,0x3a,0x01,0x02}; // ID3D10Blob。
@@ -1348,15 +1356,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         if(!bridge.queues.contains(queue))return finish(invalid);
         D3D12State::SwapChain swap;std::uint32_t count=0,effect=0,samples=0;
         if(modern){swap.window=arg(2);swap.width=static_cast<std::uint32_t>(load(desc,32));swap.height=static_cast<std::uint32_t>(load(desc+4,32));swap.format=static_cast<std::uint32_t>(load(desc+8,32));
-            samples=static_cast<std::uint32_t>(load(desc+16,32));count=static_cast<std::uint32_t>(load(desc+28,32));effect=static_cast<std::uint32_t>(load(desc+36,32));swap.flags=static_cast<std::uint32_t>(load(desc+44,32));swap.desc1=bytes(desc,48);}
+            samples=static_cast<std::uint32_t>(load(desc+16,32));count=static_cast<std::uint32_t>(load(desc+28,32));effect=static_cast<std::uint32_t>(load(desc+36,32));swap.flags=static_cast<std::uint32_t>(load(desc+44,32));swap.desc1=bytes(desc,48);
+            // pFullscreenDesc 為 NULL 表示視窗模式。
+            if(arg(4)){const auto full=bytes(arg(4),20);std::copy(full.begin(),full.end(),swap.fullscreen.begin());}else swap.fullscreen[16]=1;}
         else{swap.width=static_cast<std::uint32_t>(load(desc,32));swap.height=static_cast<std::uint32_t>(load(desc+4,32));swap.format=static_cast<std::uint32_t>(load(desc+16,32));
             samples=static_cast<std::uint32_t>(load(desc+28,32));count=static_cast<std::uint32_t>(load(desc+40,32));swap.window=load(desc+48,64);effect=static_cast<std::uint32_t>(load(desc+60,32));swap.flags=static_cast<std::uint32_t>(load(desc+64,32));
             swap.desc1.assign(48,0);const auto put=[&](unsigned at,std::uint32_t value){std::memcpy(swap.desc1.data()+at,&value,4);};
-            put(8,swap.format);put(16,samples);put(24,static_cast<std::uint32_t>(load(desc+36,32)));put(28,count);put(36,effect);put(44,swap.flags);}
+            put(8,swap.format);put(16,samples);put(24,static_cast<std::uint32_t>(load(desc+36,32)));put(28,count);put(36,effect);put(44,swap.flags);
+            // DXGI_SWAP_CHAIN_DESC 的 RefreshRate、ScanlineOrdering、Scaling 與 Windowed 對應全螢幕描述。
+            const auto full=bytes(desc+8,8);std::copy(full.begin(),full.end(),swap.fullscreen.begin());
+            const auto put_full=[&](unsigned at,std::uint32_t value){std::memcpy(swap.fullscreen.data()+at,&value,4);};
+            put_full(8,static_cast<std::uint32_t>(load(desc+20,32)));put_full(12,static_cast<std::uint32_t>(load(desc+24,32)));put_full(16,load(desc+56,32)?1:0);}
         const auto window=gui_.windows.find(swap.window);if(window==gui_.windows.end())return finish(invalid);
         if(!swap.width)swap.width=window->second.width;if(!swap.height)swap.height=window->second.height;
         if((effect!=3 && effect!=4) || count<2 || count>16 || samples!=1 || !swap.width || !swap.height)return finish(invalid);
-        swap.queue=queue;swap.device=bridge.objects.at(queue).device;swap.factory=arg(0);
+        swap.queue=queue;swap.device=bridge.objects.at(queue).device;swap.factory=arg(0);swap.source_width=swap.width;swap.source_height=swap.height;
         try{swap.native=make_metal_opengl(nullptr,1,1);swap_buffers(swap,count);}
         catch(const std::exception& error){runtime_.module_events.push_back(std::string("d3d12_note=CreateSwapChain 失敗：")+error.what());return finish(invalid);}
         const auto object=create(Kind::SwapChain,swap.device);bridge.swaps[object]=std::move(swap);store(out,64,object);return finish(ok);
@@ -1548,6 +1562,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 catch(const std::exception& error){note(std::string("d3d12_note=Present 失敗：")+error.what());}
                 return std::nullopt;
             }
+            // 幀延遲等待物件：Present 排入後釋放一格（狀態已因全部 handle 關閉而回收時停止追蹤）。
+            const auto release_latency=[&]{
+                if(!swap.latency_identity)return;
+                const auto semaphore=runtime_.wait_states.find(swap.latency_identity);
+                if(semaphore==runtime_.wait_states.end()){swap.latency_identity=0;return;}
+                semaphore->second.release_semaphore(1,nullptr,true);
+            };
+            // 在途上限：可等待交換鏈依 SetMaximumFrameLatency，其餘為 DXGI 預設 3。
+            const unsigned inflight_limit=(swap.flags&0x40U)?swap.latency:3U;
             if(d3d12_submitter_){
                 auto& submitter=*d3d12_submitter_;
                 D3D12Submitter::Job job;job.method=&d3d12_present_method;
@@ -1555,20 +1578,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 if(graphics_guard.owns_lock())graphics_guard.unlock(); // 等在途 Present 時提交執行緒需要圖形鎖。
                 {
                     std::unique_lock lock(submitter.mutex);
-                    if(submitter.presents>=3){
+                    if(submitter.presents>=inflight_limit){
                         const auto start=D3D12Submitter::timed()?D3D12Submitter::now_ns():0;
-                        submitter.idle.wait(lock,[&]{return submitter.presents<3;});
+                        submitter.idle.wait(lock,[&]{return submitter.presents<inflight_limit;});
                         if(start)submitter.stats.present_wait.fetch_add(D3D12Submitter::now_ns()-start,std::memory_order_relaxed);
                         D3D12Submitter::stall("guest_present_inflight",start);
                     }
                     ++submitter.presents;
                 }
                 d3d12_enqueue(submitter,std::move(job),false);
-                swap.index=(swap.index+1)%static_cast<std::uint32_t>(swap.buffers.size());++swap.frames;return finish(ok);
+                swap.index=(swap.index+1)%static_cast<std::uint32_t>(swap.buffers.size());++swap.frames;release_latency();return finish(ok);
             }
             try{present(native,*swap.native,frame_view(swap.index),u32(1),gui_.windows.contains(swap.window));}
             catch(const std::exception& error){runtime_.module_events.push_back(std::string("d3d12_note=Present 失敗：")+error.what());return finish(fail);}
-            swap.index=(swap.index+1)%static_cast<std::uint32_t>(swap.buffers.size());++swap.frames;return finish(ok);
+            swap.index=(swap.index+1)%static_cast<std::uint32_t>(swap.buffers.size());++swap.frames;release_latency();return finish(ok);
         }
         if(member=="GetBuffer"){if(!arg(3))return finish(pointer_error);store(arg(3),64,0);if(u32(1)>=swap.buffers.size())return finish(invalid);return finish(query(swap.buffers[u32(1)],arg(2),arg(3)));}
         if(member=="GetCurrentBackBufferIndex")return finish(swap.index);
@@ -1578,14 +1601,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         if(member=="GetDesc"){
             if(!arg(1))return finish(pointer_error);memory.fill(GuestAddress{arg(1)},0,72);
             const auto word=[&](unsigned at){std::uint32_t value;std::memcpy(&value,swap.desc1.data()+at,4);return value;};
-            store(arg(1),32,swap.width);store(arg(1)+4,32,swap.height);store(arg(1)+8,32,60);store(arg(1)+12,32,1);store(arg(1)+16,32,swap.format);store(arg(1)+28,32,1);
-            store(arg(1)+36,32,word(24));store(arg(1)+40,32,static_cast<std::uint32_t>(swap.buffers.size()));store(arg(1)+48,64,swap.window);store(arg(1)+56,32,1);store(arg(1)+60,32,word(36));store(arg(1)+64,32,swap.flags);return finish(ok);
+            const auto full=[&](unsigned at){std::uint32_t value;std::memcpy(&value,swap.fullscreen.data()+at,4);return value;};
+            store(arg(1),32,swap.width);store(arg(1)+4,32,swap.height);store(arg(1)+8,32,full(0));store(arg(1)+12,32,full(4));store(arg(1)+16,32,swap.format);
+            store(arg(1)+20,32,full(8));store(arg(1)+24,32,full(12));store(arg(1)+28,32,1);
+            store(arg(1)+36,32,word(24));store(arg(1)+40,32,static_cast<std::uint32_t>(swap.buffers.size()));store(arg(1)+48,64,swap.window);store(arg(1)+56,32,full(16));store(arg(1)+60,32,word(36));store(arg(1)+64,32,swap.flags);return finish(ok);
         }
         if(member=="ResizeBuffers" || member=="ResizeBuffers1"){
             const auto count=u32(1)?u32(1):static_cast<std::uint32_t>(swap.buffers.size());const auto window=gui_.windows.find(swap.window);
             swap.width=u32(2)?u32(2):window!=gui_.windows.end()?window->second.width:swap.width;swap.height=u32(3)?u32(3):window!=gui_.windows.end()?window->second.height:swap.height;
             if(u32(4))swap.format=u32(4);if(count<2 || count>16)return finish(invalid);
-            std::memcpy(swap.desc1.data()+28,&count,4);
+            std::memcpy(swap.desc1.data()+28,&count,4);swap.source_width=swap.width;swap.source_height=swap.height;
             try{swap_buffers(swap,count);}catch(const std::exception& error){runtime_.module_events.push_back(std::string("d3d12_note=ResizeBuffers 失敗：")+error.what());return finish(invalid);}
             return finish(ok);
         }
@@ -1593,13 +1618,42 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         if(member=="SetFullscreenState"){if(u32(1))report("SetFullscreenState(TRUE)");return finish(ok);}
         if(member=="GetLastPresentCount"){if(!arg(1))return finish(pointer_error);store(arg(1),32,swap.frames);return finish(ok);}
         if(member=="GetFrameStatistics")return finish(0x887a000bU); // DXGI_ERROR_FRAME_STATISTICS_DISJOINT。
-        if(member=="GetContainingOutput" || member=="GetParent" || member=="GetRestrictToOutput" || member=="GetCoreWindow"){if(arg(member=="GetParent" || member=="GetCoreWindow"?2:1))store(arg(member=="GetParent" || member=="GetCoreWindow"?2:1),64,0);return finish(member=="GetParent"?no_interface:unsupported);}
+        if(member=="GetContainingOutput" || member=="GetParent" || member=="GetCoreWindow"){if(arg(member=="GetParent" || member=="GetCoreWindow"?2:1))store(arg(member=="GetParent" || member=="GetCoreWindow"?2:1),64,0);return finish(member=="GetParent"?no_interface:unsupported);}
+        // 建立時未指定 pRestrictToOutput（本實作的 D3D12 交換鏈不接受限制輸出）：回 S_OK 與 NULL。
+        if(member=="GetRestrictToOutput"){if(!arg(1))return finish(invalid);store(arg(1),64,0);return finish(ok);}
+        if(member=="GetFullscreenDesc"){if(!arg(1))return finish(invalid);memory.write(GuestAddress{arg(1)},std::span<const std::uint8_t>(swap.fullscreen));return finish(ok);}
         if(member=="CheckColorSpaceSupport"){if(!arg(2))return finish(pointer_error);store(arg(2),32,u32(1)==0?1:0);return finish(ok);}
         if(member=="SetColorSpace1")return finish(u32(1)==0?ok:invalid);
-        if(member=="SetMaximumFrameLatency" || member=="SetBackgroundColor" || member=="SetRotation" || member=="SetSourceSize" || member=="SetMatrixTransform" || member=="SetHDRMetaData" || member=="ResizeTarget")return finish(ok);
-        if(member=="GetMaximumFrameLatency"){if(arg(1))store(arg(1),32,3);return finish(ok);}
-        if(member=="GetSourceSize"){if(arg(1))store(arg(1),32,swap.width);if(arg(2))store(arg(2),32,swap.height);return finish(ok);}
-        if(member=="GetRotation"){if(arg(1))store(arg(1),32,1);return finish(ok);}
+        // 背景色：只影響呈現區域外（DXGI_SCALING_NONE 等）露出的部分；保存供查詢。
+        if(member=="SetBackgroundColor"){if(!arg(1))return finish(invalid);const auto color=bytes(arg(1),16);std::copy(color.begin(),color.end(),swap.background.begin());return finish(ok);}
+        if(member=="GetBackgroundColor"){if(!arg(1))return finish(invalid);memory.write(GuestAddress{arg(1)},std::span<const std::uint8_t>(swap.background));return finish(ok);}
+        // 旋轉：呈現路徑不做背景緩衝旋轉，只接受 DXGI_MODE_ROTATION_IDENTITY；其他角度回 DXGI_ERROR_UNSUPPORTED。
+        if(member=="SetRotation"){if(!u32(1) || u32(1)>4)return finish(invalid);if(u32(1)!=1)return finish(unsupported);swap.rotation=u32(1);return finish(ok);}
+        if(member=="GetRotation"){if(!arg(1))return finish(invalid);store(arg(1),32,swap.rotation);return finish(ok);}
+        if(member=="SetSourceSize"){if(!u32(1) || !u32(2) || u32(1)>swap.width || u32(2)>swap.height)return finish(invalid);swap.source_width=u32(1);swap.source_height=u32(2);return finish(ok);}
+        if(member=="GetSourceSize"){if(!arg(1) || !arg(2))return finish(invalid);store(arg(1),32,swap.source_width);store(arg(2),32,swap.source_height);return finish(ok);}
+        // 最大幀延遲與等待物件只屬於以 FRAME_LATENCY_WAITABLE_OBJECT 建立的交換鏈，其餘回 DXGI_ERROR_INVALID_CALL。
+        if(member=="SetMaximumFrameLatency"){
+            if(!(swap.flags&0x40U))return finish(0x887a0001U);if(!u32(1) || u32(1)>16)return finish(invalid);
+            if(u32(1)>swap.latency && swap.latency_identity)
+                if(const auto semaphore=runtime_.wait_states.find(swap.latency_identity);semaphore!=runtime_.wait_states.end())semaphore->second.release_semaphore(u32(1)-swap.latency,nullptr,true);
+            swap.latency=u32(1);return finish(ok);
+        }
+        if(member=="GetMaximumFrameLatency"){if(!(swap.flags&0x40U))return finish(0x887a0001U);if(!arg(1))return finish(invalid);store(arg(1),32,swap.latency);return finish(ok);}
+        if(member=="GetFrameLatencyWaitableObject"){
+            // 每次呼叫回傳新 handle（呼叫端以 CloseHandle 釋放），共用同一號誌狀態；初值為目前的最大幀延遲。
+            if(!(swap.flags&0x40U) || runtime_.wait_objects.size()>=process_handle_limit)return finish(0);
+            const auto handle=runtime_.allocate_wait_handle();
+            if(!swap.latency_identity || !runtime_.wait_states.contains(swap.latency_identity)){
+                WaitObject semaphore;semaphore.kind=WaitObject::Kind::Semaphore;semaphore.maximum=16;semaphore.count=swap.latency;
+                runtime_.wait_states.emplace(handle,std::move(semaphore));swap.latency_identity=handle;
+            }
+            WaitObject object;object.kind=WaitObject::Kind::Semaphore;object.identity=swap.latency_identity;
+            runtime_.wait_objects.emplace(handle,std::move(object));return finish(handle);
+        }
+        // 3×2 轉換矩陣只屬於 CreateSwapChainForComposition 的交換鏈；HWND 交換鏈回 DXGI_ERROR_INVALID_CALL。
+        if(member=="SetMatrixTransform" || member=="GetMatrixTransform")return finish(0x887a0001U);
+        if(member=="SetHDRMetaData" || member=="ResizeTarget")return finish(ok);
         if(member=="IsTemporaryMonoSupported")return finish(0);
         report("Swap."+std::string(member));return finish(not_implemented);
     }
@@ -1773,7 +1827,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 const float alpha=s.border_colour==VKD3D_SHADER_STATIC_BORDER_COLOUR_TRANSPARENT_BLACK?0.0F:1.0F;
                 put(28,std::bit_cast<std::uint32_t>(border));put(32,std::bit_cast<std::uint32_t>(border));put(36,std::bit_cast<std::uint32_t>(border));put(40,std::bit_cast<std::uint32_t>(alpha));
                 put(44,std::bit_cast<std::uint32_t>(s.min_lod));put(48,std::bit_cast<std::uint32_t>(s.max_lod));
-                root.samplers.push_back({s.shader_register,static_cast<std::uint32_t>(s.shader_visibility),native.graphics_sampler(sampler)});
+                root.samplers.push_back({s.shader_register,static_cast<std::uint32_t>(s.shader_visibility),native.graphics_sampler(sampler),s.register_space});
             }
             vkd3d_shader_free_root_signature(&parsed);if(desc==&converted)vkd3d_shader_free_root_signature(&converted);
             if(!arg(5))return finish(false_ok);
@@ -2056,7 +2110,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             }else if(resource.dimension==1){v.first=0;v.count=static_cast<std::uint32_t>(resource.width);v.levels=1;v.format=42;}
             // 鏡像值快取隨描述元複製共用；X64ARM_D3D12_MIRROR_CACHE=0 時不填入。
             static const bool mirror_cache=[] {const auto* text=std::getenv("X64ARM_D3D12_MIRROR_CACHE");return !text || std::string_view(text)!="0";}();
-            auto data=std::make_shared<D3D12State::DescriptorData>();data->view=std::move(v);if(mirror_cache)data->mirror.emplace();target->data=std::move(data);return finish(0);
+            auto data=std::make_shared<D3D12State::DescriptorData>();data->view=std::move(v);if(mirror_cache)data->mirror.emplace();
+            // D3D12_BUFFER_UAV.CounterOffsetInBytes（UAV 描述 +24）：計數器所在的 4 位元組，需 4096 對齊（D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT）。
+            if(uav && arg(2) && bridge.resources.contains(arg(2))){data->counter=arg(2);data->counter_offset=desc && load(desc+4,32)==1?load(desc+24,64):0;}
+            target->data=std::move(data);return finish(0);
         }
         if(member=="CreateSampler"){
             auto write=write_descriptor(arg(2));if(!write || !arg(1)){write.cancel();return finish(0);}auto* const target=&write.value;
@@ -2512,6 +2569,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                     // 描述元表：依著色器的 (類型, space, register) 找到根簽章中涵蓋它的描述元表範圍，換算成鏡像位置。
                     // visibility：目前綁定階段的 D3D12_SHADER_VISIBILITY（VS＝1、PS＝5）；0 表示 compute，所有根參數皆可見。
                     const auto visible=[](std::uint32_t parameter,std::uint32_t stage){return !stage || !parameter || parameter==stage;};
+                    // UAV 計數器：描述元帶 pCounterResource 時解析計數器緩衝與位移，並記為本次寫入的資源。
+                    const auto attach_counter=[&](GraphicsView& view,const Descriptor& entry){
+                        if(!entry.data || !entry.data->counter)return;
+                        auto* const counter=resource_of(entry.data->counter);if(!counter || entry.data->counter_offset+4>counter->width)return;
+                        view.counter=gpu_resource_of(*counter,entry.data->counter,entry.data->counter_offset,4,"counter");
+                        view.counter_offset=static_cast<std::uint32_t>(entry.data->counter_offset);written.insert(entry.data->counter);
+                    };
                     const auto bind_tables=[&](GraphicsStage& stage,Roots& roots,const D3D12State::RootSignature& signature,std::uint32_t visibility){
                         stage.tables.clear();if(!stage.shader)return;
                         for(const auto& b:stage.shader->bindings){
@@ -2535,6 +2599,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                             if((entry.type!=D3D12State::Descriptor::Type::Shader && entry.type!=D3D12State::Descriptor::Type::Unordered) || !entry.resource)continue;
                                             auto* const live=resource_of(entry.resource);if(!live)continue;
                                             auto& resource=*live;auto view=entry.view();view.resource=resource.dimension==1?gpu_resource_of(resource,entry.resource,view.first,view.count?view.count:UINT64_MAX,"mirror"):resource.gpu;
+                                            if(entry.type==D3D12State::Descriptor::Type::Unordered)attach_counter(view,entry);
                                             table.views.push_back(view);if(entry.type==D3D12State::Descriptor::Type::Unordered)written.insert(entry.resource);
                                         }
                                         stage.tables.push_back(std::move(table));bound=true;break;
@@ -2555,7 +2620,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         // 使用位元：種類 0＝b、1／3＝t、2＝s、4／5＝u（UAV 重新配置時 source 為原暫存器），6～9 為描述元表模式
                         // 由 bind_tables 綁定鏡像。未知種類或暫存器超出 128 時全部解析；X64ARM_D3D12_BIND_ALL=1 恢復全部解析。
                         struct Used {std::array<std::uint64_t,2> b{},t{},s{},u{};bool all{};} used;used.all=d3d12_bind_all();
-                        if(stage.shader && !used.all)for(const auto& binding:stage.shader->bindings){
+                        // 非零 register space 與重新配置的 UAV（超出 u7）：著色器把 (類別, space, register) 放在 space 0 未占用的槽位，
+                        // source 為原始暫存器（見 d3d12_shader.cpp）。這些項目在全部參數處理完才放入（late），不會被同號的 space 0 暫存器覆寫。
+                        // 類別：0＝b、1＝t、2＝s、3＝u。
+                        const auto class_of=[](std::uint32_t type)->std::uint32_t{return type==0?0U:type==1 || type==3?1U:type==2?2U:3U;};
+                        const auto spaced_key=[](std::uint32_t cls,std::uint32_t space,std::uint32_t reg){return (std::uint64_t{cls}<<62)|(std::uint64_t{space&0x3fffffffU}<<32)|reg;};
+                        std::unordered_map<std::uint64_t,std::uint32_t> spaced;
+                        if(stage.shader)for(const auto& binding:stage.shader->bindings){
+                            if(binding.type<=5 && binding.source!=UINT32_MAX)spaced.emplace(spaced_key(class_of(binding.type),binding.space,binding.source),binding.slot);
+                            if(used.all || binding.space)continue;
                             const auto mark=[&](std::array<std::uint64_t,2>& mask,std::uint32_t reg){if(reg<128)mask[reg>>6]|=std::uint64_t{1}<<(reg&63U);else used.all=true;};
                             switch(binding.type){
                                 case 0:mark(used.b,binding.slot);break;
@@ -2567,19 +2640,37 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             }
                         }
                         const auto needs=[&](const std::array<std::uint64_t,2>& mask,std::uint32_t reg){return used.all || (reg<128 && ((mask[reg>>6]>>(reg&63U))&1U));};
-                        // 超出 u7 的離散 UAV 緩衝：著色器已改用未占用的 slot（source 為原始暫存器），全部參數處理完再放入，避免被其他暫存器覆寫。
-                        std::map<std::uint32_t,std::uint32_t> remapped;std::vector<std::pair<std::uint32_t,GraphicsView>> late;
-                        if(stage.shader)for(const auto& b:stage.shader->bindings)if(b.source!=UINT32_MAX)remapped.emplace(b.source,b.slot);
-                        const auto place_unordered=[&](std::uint32_t reg,const GraphicsView& view){
-                            if(const auto found=remapped.find(reg);found!=remapped.end())late.emplace_back(found->second,view);
-                            else if(reg<stage.unordered.size()){stage.unordered[reg]=view;touch(&StageExtent::unordered,reg);}
+                        // (類別, space, register) → 槽位：late 表示延後放入。space 0 未重新配置者槽位即暫存器，依使用位元判斷是否需要。
+                        struct Target {bool found{};std::uint32_t slot{};bool late{};};
+                        const auto target=[&](std::uint32_t cls,std::uint32_t space,std::uint32_t reg)->Target{
+                            if(!spaced.empty())if(const auto found=spaced.find(spaced_key(cls,space,reg));found!=spaced.end())return {true,found->second,true};
+                            if(space)return {};
+                            return {needs(cls==0?used.b:cls==1?used.t:cls==2?used.s:used.u,reg),reg,false};
+                        };
+                        struct Late {std::uint32_t cls{},slot{};GraphicsView view;std::shared_ptr<GraphicsResource> buffer;std::uint32_t offset{};std::shared_ptr<GraphicsSampler> sampler;};
+                        std::vector<Late> late;
+                        const auto put_constant=[&](const Target& place,const std::shared_ptr<GraphicsResource>& buffer,std::uint32_t offset){
+                            if(place.slot>=stage.constants.size())return;
+                            if(place.late){late.push_back({0,place.slot,{},buffer,offset,{}});return;}
+                            stage.constants[place.slot]=buffer;stage.constant_offsets[place.slot]=offset;touch(&StageExtent::constants,place.slot);
+                        };
+                        const auto put_view=[&](const Target& place,bool uav,const GraphicsView& view){
+                            if(place.slot>=(uav?stage.unordered.size():stage.resources.size()))return;
+                            if(place.late){late.push_back({uav?3U:1U,place.slot,view,{},0,{}});return;}
+                            if(uav){stage.unordered[place.slot]=view;touch(&StageExtent::unordered,place.slot);}
+                            else {stage.resources[place.slot]=view;touch(&StageExtent::resources,place.slot);}
+                        };
+                        const auto put_sampler=[&](const Target& place,const std::shared_ptr<GraphicsSampler>& sampler){
+                            if(place.slot>=stage.samplers.size())return;
+                            if(place.late){late.push_back({2,place.slot,{},{},0,sampler});return;}
+                            stage.samplers[place.slot]=sampler;touch(&StageExtent::samplers,place.slot);
                         };
                         for(std::uint32_t index=0;index<signature.parameters.size();++index){
                             const auto& parameter=signature.parameters[index];
                             if(!visible(parameter.visibility,visibility))continue;
-                            if(parameter.space)throw std::invalid_argument("根參數使用非零 register space");
                             if(parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS){
-                                if(parameter.reg>=stage.constants.size() || !needs(used.b,parameter.reg))continue;
+                                const auto place=target(0,parameter.space,parameter.reg);
+                                if(!place.found || place.slot>=stage.constants.size())continue;
                                 const auto& values=index<roots.constants.size()?roots.constants[index]:std::vector<std::uint8_t>{};
                                 const auto size=(std::max<std::size_t>(std::size_t{parameter.values}*4,values.size())+15U)&~std::size_t{15};
                                 if(size>constant_arena_size)throw std::invalid_argument("根常數超過暫存區大小");
@@ -2588,51 +2679,64 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                 }
                                 thread_local std::vector<std::uint8_t> padded;padded.assign(size,0);std::copy(values.begin(),values.end(),padded.begin());
                                 GraphicsView slot{constant_arena};slot.first=constant_arena_used;slot.count=static_cast<std::uint32_t>(size);native.graphics_write_unused(slot,padded);
-                                stage.constants[parameter.reg]=constant_arena;stage.constant_offsets[parameter.reg]=constant_arena_used;touch(&StageExtent::constants,parameter.reg);
+                                put_constant(place,constant_arena,constant_arena_used);
                                 constant_arena_used+=static_cast<std::uint32_t>((size+255U)&~std::size_t{255});
                             }else if(parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_CBV){
-                                if(const auto address=index<roots.views.size()?roots.views[index]:0;address && parameter.reg<stage.constants.size() && needs(used.b,parameter.reg)){const auto [buffer,at]=constant_view(address,0);stage.constants[parameter.reg]=buffer;stage.constant_offsets[parameter.reg]=at;touch(&StageExtent::constants,parameter.reg);}
+                                if(const auto address=index<roots.views.size()?roots.views[index]:0;address)
+                                    if(const auto place=target(0,parameter.space,parameter.reg);place.found){const auto [buffer,at]=constant_view(address,0);put_constant(place,buffer,at);}
                             }else if(parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_SRV || parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_UAV){
-                                if(!needs(parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_UAV?used.u:used.t,parameter.reg))continue;
+                                const bool uav=parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_UAV;
+                                const auto place=target(uav?3U:1U,parameter.space,parameter.reg);if(!place.found)continue;
                                 const auto [object,offset]=replay_resource_at(index<roots.views.size()?roots.views[index]:0);if(!object)continue;auto* const found_resource=resource_of(object);
                                 if(!found_resource)throw std::out_of_range("根參數資源不存在");auto& resource=*found_resource;
                                 GraphicsView view{gpu_resource_of(resource,object,offset,UINT64_MAX,"root_view")};view.first=static_cast<std::uint32_t>(offset);view.count=static_cast<std::uint32_t>(resource.width-offset);view.format=42;view.stride=graphics_view_stride_unknown;
-                                if(parameter.type==VKD3D_SHADER_ROOT_PARAMETER_TYPE_UAV){place_unordered(parameter.reg,view);written.insert(object);}
-                                else if(parameter.reg<stage.resources.size()){stage.resources[parameter.reg]=view;touch(&StageExtent::resources,parameter.reg);}
+                                put_view(place,uav,view);if(uav)written.insert(object);
                             }else{
                                 const auto base=index<roots.tables.size()?roots.tables[index]:0;if(!base)continue;
                                 for(const auto& range:parameter.ranges){
-                                    if(range.space)continue;
+                                    const std::uint32_t cls=range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER?2U:range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV?0U:
+                                        range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV?3U:1U;
+                                    // 非零 space 的範圍：只解析著色器實際使用、落在範圍內的 (space, register)。
+                                    std::vector<std::uint32_t> spaced_items;
+                                    if(range.space){
+                                        for(const auto& [key,slot]:spaced){(void)slot;
+                                            const auto reg=static_cast<std::uint32_t>(key);
+                                            if((key>>62)!=cls || ((key>>32)&0x3fffffffU)!=range.space || reg<range.base || (range.count!=~0U && reg-range.base>=range.count))continue;
+                                            spaced_items.push_back(reg-range.base);
+                                        }
+                                        if(spaced_items.empty())continue;
+                                    }
                                     // 共用後端最多 128 個 SRV 槽；更大的陣列只能經描述元表存取。
                                     const auto count=range.count==~0U?1U:std::min<std::uint32_t>(range.count,128);
-                                    const auto& mask=range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER?used.s:range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV?used.b:
-                                        range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV?used.u:used.t;
+                                    const auto& mask=cls==2?used.s:cls==0?used.b:cls==3?used.u:used.t;
                                     // 範圍與著色器使用位元沒有交集就不查堆積（多數範圍屬於其他階段或其他著色器）。
                                     std::array<std::uint64_t,2> wanted{};
-                                    if(!used.all)for(unsigned w=0;w<2;++w){
+                                    if(!range.space && !used.all)for(unsigned w=0;w<2;++w){
                                         const std::uint64_t low=std::max<std::uint64_t>(range.base,w*64U),high=std::min<std::uint64_t>(std::uint64_t{range.base}+count,(w+1)*64U);
                                         if(low>=high)continue;
                                         const auto from=low-w*64U,to=high-w*64U;
                                         wanted[w]=mask[w]&(to>=64?~std::uint64_t{0}:(std::uint64_t{1}<<to)-1U)&~((std::uint64_t{1}<<from)-1U);
                                     }
-                                    if(!used.all && !wanted[0] && !wanted[1])continue;
+                                    if(!range.space && !used.all && !wanted[0] && !wanted[1])continue;
                                     // 範圍內的描述元屬於同一個堆積：只查一次堆積，逐項以索引取用（超出堆積的項目視為空）。
                                     const auto [range_heap,range_first]=heap_at(base+std::uint64_t{range.offset}*descriptor_size,true);if(!range_heap)continue;
                                     std::uint64_t visited=0;
                                     // 回傳 false 表示已超出堆積，範圍內其後的項目都視為空。
                                     const auto visit=[&](std::uint32_t i)->bool{
                                         if(range_first+i>=range_heap->count)return false;
+                                        const auto place=target(cls,range.space,range.base+i);if(!place.found)return true;
                                         ++visited;Descriptor decoded;
-                                        const auto entry=&d3d12_descriptor_value(*range_heap,range_first+i,decoded);const auto reg=range.base+i;
-                                        if(range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER){if(reg<stage.samplers.size()){stage.samplers[reg]=entry->sampler();touch(&StageExtent::samplers,reg);}return true;}
-                                        if(range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV){if(reg<stage.constants.size() && entry->address){const auto [buffer,at]=constant_view(entry->address,entry->size);stage.constants[reg]=buffer;stage.constant_offsets[reg]=at;touch(&StageExtent::constants,reg);}return true;}
+                                        const auto entry=&d3d12_descriptor_value(*range_heap,range_first+i,decoded);
+                                        if(cls==2){put_sampler(place,entry->sampler());return true;}
+                                        if(cls==0){if(entry->address){const auto [buffer,at]=constant_view(entry->address,entry->size);put_constant(place,buffer,at);}return true;}
                                         if(!entry->resource)return true;auto view=entry->view();auto* const found_resource=resource_of(entry->resource);if(!found_resource)throw std::out_of_range("描述元表資源不存在");
                                         auto& resource=*found_resource;view.resource=resource.dimension==1?gpu_resource_of(resource,entry->resource,view.first,view.count?view.count:UINT64_MAX,"table"):resource.gpu;
-                                        if(range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV){place_unordered(reg,view);written.insert(entry->resource);}
-                                        else if(reg<stage.resources.size()){stage.resources[reg]=view;touch(&StageExtent::resources,reg);}
+                                        if(cls==3)attach_counter(view,*entry);
+                                        put_view(place,cls==3,view);if(cls==3)written.insert(entry->resource);
                                         return true;
                                     };
-                                    if(used.all){for(std::uint32_t i=0;i<count;++i)if(!visit(i))break;}
+                                    if(range.space){for(const auto i:spaced_items)visit(i);}
+                                    else if(used.all){for(std::uint32_t i=0;i<count;++i)if(!visit(i))break;}
                                     else for(unsigned w=0;w<2;++w){
                                         bool more=true;
                                         for(auto bits=wanted[w];bits && more;bits&=bits-1)more=visit(static_cast<std::uint32_t>(w*64U+static_cast<unsigned>(std::countr_zero(bits))-range.base));
@@ -2642,8 +2746,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                 }
                             }
                         }
-                        for(const auto& [slot,view]:late){stage.unordered[slot]=view;touch(&StageExtent::unordered,slot);}
-                        for(const auto& sampler:signature.samplers)if(visible(sampler.visibility,visibility) && sampler.reg<stage.samplers.size()){stage.samplers[sampler.reg]=sampler.sampler;touch(&StageExtent::samplers,sampler.reg);}
+                        for(const auto& item:late){
+                            if(item.cls==0){stage.constants[item.slot]=item.buffer;stage.constant_offsets[item.slot]=item.offset;touch(&StageExtent::constants,item.slot);}
+                            else if(item.cls==1){stage.resources[item.slot]=item.view;touch(&StageExtent::resources,item.slot);}
+                            else if(item.cls==2){stage.samplers[item.slot]=item.sampler;touch(&StageExtent::samplers,item.slot);}
+                            else {stage.unordered[item.slot]=item.view;touch(&StageExtent::unordered,item.slot);}
+                        }
+                        for(const auto& sampler:signature.samplers)if(visible(sampler.visibility,visibility)){
+                            auto place=target(2,sampler.space,sampler.reg);
+                            // 靜態取樣器在 space 0 沿用原本行為（不論著色器是否使用都放入），但不覆寫非零 space 項目占用的槽位。
+                            if(!sampler.space && !place.late){
+                                bool taken=false;for(const auto& item:late)if(item.cls==2 && item.slot==sampler.reg)taken=true;
+                                if(taken)continue;place={true,sampler.reg,false};
+                            }
+                            if(place.found && place.slot<stage.samplers.size()){stage.samplers[place.slot]=sampler.sampler;touch(&StageExtent::samplers,place.slot);}
+                        }
                     };
                     const auto signature_of=[&](const Roots& roots)->const D3D12State::RootSignature&{
                         const auto p=bridge.pipelines.find(pipeline);const auto r=bridge.roots.find(roots.root?roots.root:p!=bridge.pipelines.end()?p->second.root:0);

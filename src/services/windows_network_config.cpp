@@ -311,6 +311,23 @@ void WindowsServices::poll_address_notifications(GuestMemory& memory){
         runtime_.network.configuration->captured=false;runtime_.network.configuration->routes.clear();
     }
 }
+// invoke_network_config 的描述項：登錄與處理函式放在同一個檔案（群組＝路由單位）。
+std::span<const WindowsServiceDescriptor> network_config_service_descriptors(){
+    static constexpr WindowsServiceDescriptor table[]{
+        {"iphlpapi.dll","GetAdaptersAddresses",5},{"iphlpapi.dll","GetExtendedTcpTable",6,0,0,60},{"iphlpapi.dll","GetTcpTable",3,0,0,4},{"iphlpapi.dll","GetAdaptersInfo",2},
+        {"iphlpapi.dll","GetNetworkParams",2},{"iphlpapi.dll","GetIpAddrTable",3},{"iphlpapi.dll","GetIpForwardTable",3},{"iphlpapi.dll","IpReleaseAddress",1},
+        {"iphlpapi.dll","IpRenewAddress",1},{"iphlpapi.dll","GetIfEntry",1},{"iphlpapi.dll","GetIfTable",3},{"iphlpapi.dll","GetIfTable2",1},
+        {"iphlpapi.dll","GetIfTable2Ex",2},{"iphlpapi.dll","GetIfEntry2",1},{"iphlpapi.dll","FreeMibTable",1},{"iphlpapi.dll","GetInterfaceInfo",2},
+        {"iphlpapi.dll","if_indextoname",2},{"iphlpapi.dll","if_nametoindex",1},{"iphlpapi.dll","GetUnicastIpAddressTable",2},{"iphlpapi.dll","GetUnicastIpAddressEntry",1},
+        {"iphlpapi.dll","GetAnycastIpAddressTable",2},{"iphlpapi.dll","InitializeUnicastIpAddressEntry",1},{"iphlpapi.dll","ConvertInterfaceIndexToLuid",2},{"iphlpapi.dll","ConvertInterfaceLuidToIndex",2},
+        {"iphlpapi.dll","ConvertLengthToIpv4Mask",2,0,0,1},{"iphlpapi.dll","ConvertIpv4MaskToLength",2,0,0,1},{"iphlpapi.dll","ConvertInterfaceLuidToNameA",3},{"iphlpapi.dll","ConvertInterfaceLuidToNameW",3},
+        {"iphlpapi.dll","ConvertInterfaceNameToLuidA",2},{"iphlpapi.dll","ConvertInterfaceNameToLuidW",2},{"iphlpapi.dll","ConvertInterfaceAliasToLuid",2},{"iphlpapi.dll","ConvertInterfaceLuidToAlias",3},
+        {"iphlpapi.dll","ConvertInterfaceLuidToGuid",2},{"iphlpapi.dll","ConvertInterfaceGuidToLuid",2},{"winhttp.dll","WinHttpGetIEProxyConfigForCurrentUser",1},{"winhttp.dll","WinHttpGetDefaultProxyConfiguration",1},
+        {"winhttp.dll","WinHttpSetDefaultProxyConfiguration",1},{"iphlpapi.dll","GetBestRoute2",7},{"dhcpcsvc.dll","DhcpCApiInitialize",1},{"dhcpcsvc.dll","DhcpCApiCleanup",0},
+        {"dhcpcsvc.dll","DhcpRequestParams",9,(1U<<4)|(1U<<5)},{"iphlpapi.dll","GetBestInterface",2},{"iphlpapi.dll","GetBestInterfaceEx",2},{"iphlpapi.dll","NotifyAddrChange",2},
+        {"iphlpapi.dll","CancelIPChangeNotify",1},
+    };return table;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);std::uint64_t result=0;
     if(service.symbol=="ConvertLengthToIpv4Mask" || service.symbol=="ConvertIpv4MaskToLength"){
@@ -600,6 +617,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& 
             }
         }catch(const MemoryFault&){}catch(const std::invalid_argument&){}catch(const std::bad_alloc&){}
         arg.return_to(state,value);return std::nullopt;
+    }
+    if(symbol=="GetAnycastIpAddressTable"){
+        // MIB_ANYCASTIPADDRESS_TABLE：宿主介面設定不含任播位址，依位址家族檢查後回傳 NumEntries=0 的表（由 FreeMibTable 釋放）。
+        try{
+            const auto family=static_cast<std::uint16_t>(arg(0));const auto output=arg(1);
+            if(!output || (family!=0 && family!=2 && family!=23))result=87;
+            else{
+                memory.check(GuestAddress{output},x86_?4:8,Access::Write);memory.store(GuestAddress{output},x86_?32:64,0);
+                if(!refresh_configuration(*runtime_.network.configuration,runtime_.network.external_io,false))result=232;
+                else{
+                    const auto base=allocate_heap(memory,8);if(!base)result=8;
+                    else{memory.store(GuestAddress{base},64,0);runtime_.network.addresses.insert(base);memory.store(GuestAddress{output},x86_?32:64,base);}
+                }
+            }
+        }catch(const MemoryFault&){result=87;}catch(const std::bad_alloc&){result=8;}
+        arg.return_to(state,result);return std::nullopt;
     }
     if(symbol=="GetUnicastIpAddressTable" || symbol=="GetUnicastIpAddressEntry"){
         try{

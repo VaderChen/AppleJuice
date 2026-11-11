@@ -1084,7 +1084,7 @@ void complete_pe_load(PeProgram& program){
     startup_profile::Scope measurement("loader","complete_pe_load",true);
     if(!program.pending_imports)return;
     bind_pe_imports(program.memory,*program.pending_imports,[&](const PeImport& imported){return program.services.bind_image_import(program.memory,imported,program.metadata.loaded_base.value);});
-    program.services.prepare_image_startup(program.state);program.pending_imports.reset();
+    program.services.prepare_image_startup(program.state);program.services.publish_loader_data(program.memory);program.pending_imports.reset();
 }
 std::string format_pe(const PeMetadata& metadata) {
     std::ostringstream out;

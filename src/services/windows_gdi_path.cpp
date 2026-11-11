@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_gdi_path.hpp"
 #include "x64arm/windows_transform.hpp"
+#include <array>
 #include <bit>
 #include <cmath>
 namespace x64arm {
@@ -13,6 +14,7 @@ std::span<const WindowsServiceDescriptor> gdi_path_service_descriptors(){
         {"gdi32.dll","SetPolyFillMode",2},{"gdi32.dll","GetPolyFillMode",1},{"gdi32.dll","SetArcDirection",2},{"gdi32.dll","GetArcDirection",1},
         {"gdi32.dll","SetMiterLimit",3},{"gdi32.dll","GetMiterLimit",2},
         {"gdi32.dll","PolyBezier",3},{"gdi32.dll","PolyBezierTo",3},{"gdi32.dll","PolylineTo",3},{"gdi32.dll","Polygon",3},{"gdi32.dll","PolyPolygon",4},{"gdi32.dll","PolyPolyline",4},
+        {"gdi32.dll","Arc",9},{"gdi32.dll","ArcTo",9},{"gdi32.dll","Chord",9},{"gdi32.dll","Pie",9},{"gdi32.dll","AngleArc",6},{"gdi32.dll","GetCurrentPositionEx",2},
         {"gdi32.dll","RoundRect",7},{"gdi32.dll","CreatePolygonRgn",3},{"gdi32.dll","CreatePolyPolygonRgn",4},{"gdi32.dll","ExtCreateRegion",3}
     };return table;
 }
@@ -81,6 +83,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_path(GuestState& state,
         const auto window=arg(0)>=0x10000000?gui_.windows.find(arg(0)-0x10000000):gui_.windows.end();
         if(!gui_.contexts.contains(arg(0)) && !gui_.dc_objects.contains(arg(0)) && window==gui_.windows.end())return fail(6);
         auto& dc=gui_.contexts[arg(0)];const auto transform=gui_device_transform(dc);
+        if(name=="GetCurrentPositionEx"){if(!arg(1))return fail(87);memory.check(GuestAddress{arg(1)},8,Access::Write);memory.store(GuestAddress{arg(1)},32,static_cast<unsigned>(dc.x));memory.store(GuestAddress{arg(1)+4},32,static_cast<unsigned>(dc.y));return done(1);}
         if(name=="GetPolyFillMode")return done(dc.poly_fill_mode);if(name=="GetArcDirection")return done(dc.arc_direction);
         if(name=="SetPolyFillMode" || name=="SetArcDirection"){if(arg(1)<1 || arg(1)>2)return fail(87);auto& field=name=="SetPolyFillMode"?dc.poly_fill_mode:dc.arc_direction;const auto old=field;field=static_cast<unsigned>(arg(1));return done(old);}
         if(name=="SetMiterLimit" || name=="GetMiterLimit"){
@@ -142,6 +145,43 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_path(GuestState& state,
                             add(working,transform,x+rx*(std::cos(a)-sign*k*std::sin(a)),y+ry*(std::sin(a)+sign*k*std::cos(a)),4);
                             add(working,transform,x+rx*(std::cos(z)+sign*k*std::sin(z)),y+ry*(std::sin(z)-sign*k*std::cos(z)),4);add(working,transform,x+rx*std::cos(z),y+ry*std::sin(z),4);}}
                     working.points.back().type|=1;working.new_figure=true;}fill=true;outline=true;
+            }else if(name=="Arc" || name=="ArcTo" || name=="Chord" || name=="Pie" || name=="AngleArc"){
+                // 橢圓弧以每段不超過 90 度的三次 Bezier 近似。Arc／ArcTo／Chord／Pie 依 SetArcDirection（預設逆時針）從起點射線走到終點射線，
+                // 兩條射線重合時畫完整橢圓；AngleArc 依掃角正負決定方向、超過 360 度只畫一圈。ArcTo／AngleArc 先從目前位置連線到弧起點並把目前位置移到弧終點。
+                constexpr double tau=6.283185307179586;const bool angle=name=="AngleArc";double cx=0,cy=0,rx=0,ry=0,start=0,sweep=0;
+                if(angle){
+                    const auto radius=static_cast<std::int32_t>(arg(3));const auto a=std::bit_cast<float>(static_cast<std::uint32_t>(arg(4))),s=std::bit_cast<float>(static_cast<std::uint32_t>(arg(5)));
+                    if(radius<0 || !std::isfinite(a) || !std::isfinite(s))return fail(87);
+                    cx=integer(1);cy=integer(2);rx=ry=radius;start=static_cast<double>(a)*tau/360;sweep=static_cast<double>(s)*tau/360;
+                }else{
+                    const double l=std::min(integer(1),integer(3)),r=std::max(integer(1),integer(3)),t=std::min(integer(2),integer(4)),b=std::max(integer(2),integer(4));
+                    if(l==r || t==b)return done(1);
+                    cx=(l+r)/2;cy=(t+b)/2;rx=(r-l)/2;ry=(b-t)/2;
+                    // 參數角：橢圓上的點 (cx+rx·cosθ, cy−ry·sinθ) 與中心到指定點的射線同向。
+                    const auto parametric=[&](double x,double y){return std::atan2(-(y-cy)*rx,(x-cx)*ry);};
+                    start=parametric(integer(5),integer(6));const auto end=parametric(integer(7),integer(8));const bool counter=dc.arc_direction==1;
+                    sweep=counter?end-start:start-end;while(sweep<=0)sweep+=tau;while(sweep>tau)sweep-=tau;if(!counter)sweep=-sweep;
+                }
+                const auto at=[&](double theta){return std::array<double,2>{cx+rx*std::cos(theta),cy-ry*std::sin(theta)};};
+                const auto begin=at(start);const bool connected=name=="ArcTo" || angle;
+                if(connected){if(working.new_figure)add(working,transform,dc.x,dc.y,6);add(working,transform,begin[0],begin[1],2);}
+                else add(working,transform,begin[0],begin[1],6);
+                const auto magnitude=std::min(std::abs(sweep),tau);
+                if(magnitude>0){
+                    const auto segments=std::max(1U,static_cast<unsigned>(std::ceil(magnitude/(tau/4)-1e-9)));
+                    const double step=(sweep<0?-magnitude:magnitude)/segments,h=4.0/3*std::tan(step/4);double theta=start;
+                    for(unsigned i=0;i<segments;++i){
+                        // 單位圓上 P(θ)=(cosθ,sinθ)、切線 (−sinθ,cosθ)；映射到裝置座標時 y 取負號。
+                        const double next=theta+step;
+                        add(working,transform,cx+rx*(std::cos(theta)-h*std::sin(theta)),cy-ry*(std::sin(theta)+h*std::cos(theta)),4);
+                        add(working,transform,cx+rx*(std::cos(next)+h*std::sin(next)),cy-ry*(std::sin(next)-h*std::cos(next)),4);
+                        add(working,transform,cx+rx*std::cos(next),cy-ry*std::sin(next),4);theta=next;
+                    }
+                }
+                outline=true;
+                if(name=="Chord" || name=="Pie"){if(name=="Pie")add(working,transform,cx,cy,2);working.points.back().type|=1;working.new_figure=true;fill=true;}
+                else if(connected){const auto end=at(start+sweep);final_x=static_cast<int>(std::lround(end[0]));final_y=static_cast<int>(std::lround(end[1]));update_position=true;}
+                else working.new_figure=true;
             }else return fail(50);
             if(dc.path.state==1){dc.path=std::move(working);if(update_position){dc.x=final_x;dc.y=final_y;}return done(1);}
         }

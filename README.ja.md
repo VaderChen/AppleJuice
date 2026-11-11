@@ -118,7 +118,7 @@ AppleJuice は開発中です。Windows 全体、すべてのアプリケーシ�
 
 リポジトリには `src/`、`include/`、`launcher/`、`cmake/`、必要なビルドスクリプト、`third_party/`、`x64kernel/` と使用ドキュメントを含みます。
 
-## 動作確認の記録 / 2026-11-09 / 全 19 本のゲーム
+## 動作確認の記録 / 2026-11-11 / 全 20 本のゲーム
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作しないが対応中" title="動作しないが対応中"> 動作しないが対応中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="メイン画面まで起動" title="メイン画面まで起動"> メイン画面まで起動　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="動作するが効率は低い" title="動作するが効率は低い"> 動作するが効率は低い　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好に動作" title="良好に動作"> 良好に動作
 
@@ -138,14 +138,16 @@ AppleJuice は開発中です。Windows 全体、すべてのアプリケーシ�
 | トゥームレイダー（2013） | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
 | It Takes Two | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
+| 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | サイバーパンク2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | 三國志X with パワーアップキット | x86 | 不明 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | Clair Obscur: Expedition 33 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
+| ライズ オブ ザ トゥームレイダー | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
+| シャドウ オブ ザ トゥームレイダー | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
 | デイヴ・ザ・ダイバー | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="メイン画面まで起動" title="メイン画面まで起動"> |
 | 特警シグナルフォース | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="メイン画面まで起動" title="メイン画面まで起動"> |
-| ライズ オブ ザ トゥームレイダー | x64 | D3D11 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="メイン画面まで起動" title="メイン画面まで起動"> |
 
 記録は当時のバージョンと設定によるもので、ゲーム全体の流れ、他のバージョン、すべての設定での動作を示すものではありません。
 

@@ -71,6 +71,20 @@ public:
         auto copy=std::make_shared<const GraphicsDraw>(draw);post([this,copy]{inner_->graphics_draw(*copy);});
     }
     void graphics_draw_retained(const GraphicsDraw& draw) override {post([this,&draw]{inner_->graphics_draw(draw);});}
+    // 不可變快照直接排隊（X64ARM_METAL_SHARED_SNAPSHOT=0 改回複製，對照用）。
+    static bool shared_snapshots(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_SHARED_SNAPSHOT");return !text || std::string_view(text)!="0";}();return value;}
+    void graphics_draw_shared(const std::shared_ptr<const GraphicsDraw>& draw) override {
+        if(!shared_snapshots()){graphics_draw(*draw);return;}
+        post([this,draw]{inner_->graphics_draw(*draw);});
+    }
+    void graphics_dispatch_shared(const std::shared_ptr<const GraphicsStage>& stage,std::array<std::uint32_t,3> groups) override {
+        if(!shared_snapshots()){graphics_dispatch(*stage,groups);return;}
+        post([this,stage,groups]{inner_->graphics_dispatch(*stage,groups);});
+    }
+    void graphics_dispatch_indirect_shared(const std::shared_ptr<const GraphicsStage>& stage,const std::shared_ptr<GraphicsResource>& arguments,std::uint32_t offset) override {
+        if(!shared_snapshots()){graphics_dispatch_indirect(*stage,arguments,offset);return;}
+        post([this,stage,arguments,offset]{inner_->graphics_dispatch_indirect(*stage,arguments,offset);});
+    }
     void graphics_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups) override {
         auto copy=std::make_shared<const GraphicsStage>(stage);post([this,copy,groups]{inner_->graphics_dispatch(*copy,groups);});
     }
@@ -259,6 +273,9 @@ private:
         on_worker()=true;
 #if defined(__APPLE__)
         pthread_setname_np("x64arm.metal.commands");
+        // 命令執行緒餵 GPU，與 D3D11 串流執行緒同為 USER_INTERACTIVE（原本繼承建立者的 QoS）；X64ARM_METAL_COMMAND_QOS=0 關閉。
+        if(static const bool qos=[] {const auto* value=std::getenv("X64ARM_METAL_COMMAND_QOS");return !value || std::string_view(value)!="0";}();qos)
+            (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
 #endif
         for(;;){
             std::function<void()> task;

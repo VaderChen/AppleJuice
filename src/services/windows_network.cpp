@@ -301,33 +301,33 @@ void WindowsServices::pump_gui_network(std::uint64_t only){
 }
 std::span<const WindowsServiceDescriptor> network_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
-        {"iphlpapi.dll","GetAdaptersAddresses",5},
+        
         {"iphlpapi.dll","GetCurrentThreadCompartmentId",0},{"iphlpapi.dll","SetCurrentThreadCompartmentId",1},
-        {"iphlpapi.dll","IcmpCreateFile",0},{"iphlpapi.dll","IcmpCloseHandle",1},{"iphlpapi.dll","IcmpSendEcho",8},{"iphlpapi.dll","IcmpParseReplies",2},
-        {"iphlpapi.dll","GetExtendedTcpTable",6,0,0,60},{"iphlpapi.dll","GetTcpTable",3,0,0,4},
-        {"iphlpapi.dll","GetAdaptersInfo",2},{"iphlpapi.dll","GetNetworkParams",2},
-        {"iphlpapi.dll","GetIpAddrTable",3},{"iphlpapi.dll","GetIpForwardTable",3},
+        {"iphlpapi.dll","IcmpCreateFile",0},{"iphlpapi.dll","Icmp6CreateFile",0},{"iphlpapi.dll","IcmpSendEcho2",11},{"iphlpapi.dll","IcmpSendEcho2Ex",12},{"iphlpapi.dll","Icmp6SendEcho2",12},{"iphlpapi.dll","Icmp6ParseReplies",2},{"iphlpapi.dll","IcmpCloseHandle",1},{"iphlpapi.dll","IcmpSendEcho",8},{"iphlpapi.dll","IcmpParseReplies",2},
+        
+        
+        
         {"dnsapi.dll","DnsQuery_A",6},{"dnsapi.dll","DnsQuery_W",6},{"dnsapi.dll","DnsQuery_UTF8",6},
         {"dnsapi.dll","DnsFree",2},{"dnsapi.dll","DnsRecordListFree",2},
-        {"iphlpapi.dll","IpReleaseAddress",1},{"iphlpapi.dll","IpRenewAddress",1},
-        {"iphlpapi.dll","GetIfEntry",1},{"iphlpapi.dll","GetIfTable",3},
-        {"iphlpapi.dll","GetIfTable2",1},{"iphlpapi.dll","GetIfTable2Ex",2},{"iphlpapi.dll","GetIfEntry2",1},{"iphlpapi.dll","FreeMibTable",1},{"iphlpapi.dll","GetInterfaceInfo",2},
-        {"iphlpapi.dll","if_indextoname",2},{"iphlpapi.dll","if_nametoindex",1},
-        {"iphlpapi.dll","GetUnicastIpAddressTable",2},{"iphlpapi.dll","GetUnicastIpAddressEntry",1},
-        {"iphlpapi.dll","InitializeUnicastIpAddressEntry",1},
-        {"iphlpapi.dll","ConvertInterfaceIndexToLuid",2},{"iphlpapi.dll","ConvertInterfaceLuidToIndex",2},
-        {"iphlpapi.dll","ConvertLengthToIpv4Mask",2,0,0,1},{"iphlpapi.dll","ConvertIpv4MaskToLength",2,0,0,1},
-        {"iphlpapi.dll","ConvertInterfaceLuidToNameA",3},{"iphlpapi.dll","ConvertInterfaceLuidToNameW",3},
-        {"iphlpapi.dll","ConvertInterfaceNameToLuidA",2},{"iphlpapi.dll","ConvertInterfaceNameToLuidW",2},
-        {"iphlpapi.dll","ConvertInterfaceAliasToLuid",2},{"iphlpapi.dll","ConvertInterfaceLuidToAlias",3},
-        {"iphlpapi.dll","ConvertInterfaceLuidToGuid",2},{"iphlpapi.dll","ConvertInterfaceGuidToLuid",2},
-        {"winhttp.dll","WinHttpGetIEProxyConfigForCurrentUser",1},
-        {"winhttp.dll","WinHttpGetDefaultProxyConfiguration",1},{"winhttp.dll","WinHttpSetDefaultProxyConfiguration",1},
-        {"iphlpapi.dll","GetBestRoute2",7},
-        {"dhcpcsvc.dll","DhcpCApiInitialize",1},{"dhcpcsvc.dll","DhcpCApiCleanup",0},
-        {"dhcpcsvc.dll","DhcpRequestParams",9,(1U<<4)|(1U<<5)},
-        {"iphlpapi.dll","GetBestInterface",2},{"iphlpapi.dll","GetBestInterfaceEx",2},
-        {"iphlpapi.dll","NotifyAddrChange",2},{"iphlpapi.dll","CancelIPChangeNotify",1},
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         {"ws2_32.dll","WSAPoll",3},{"ws2_32.dll","WSASendDisconnect",2},
         {"ws2_32.dll","getprotobyname",1},{"ws2_32.dll","getprotobynumber",1},
         {"ws2_32.dll","WSAAsyncGetHostByName",5},{"ws2_32.dll","WSAAsyncGetHostByAddr",7},
@@ -381,54 +381,86 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
     if(symbol.starts_with("Icmp")){
         std::uint64_t result=0;
         const auto handle_error=[&](std::uint32_t code){last_error_=code;};
-        if(symbol=="IcmpCreateFile"){
+        if(symbol=="IcmpCreateFile" || symbol=="Icmp6CreateFile"){
             if(!network.external_io){handle_error(65);arg.return_to(state,x86_?UINT64_C(0xffffffff):UINT64_MAX);return std::nullopt;}
-            result=network.next_icmp_handle+=4;network.icmp_handles.insert(result);
+            result=network.next_icmp_handle+=4;(symbol=="Icmp6CreateFile"?network.icmp6_handles:network.icmp_handles).insert(result);
         }else if(symbol=="IcmpCloseHandle"){
-            if(network.icmp_handles.erase(arg(0)))result=1;else handle_error(6);
-        }else if(symbol=="IcmpParseReplies"){
-            // IcmpSendEcho 已填好回覆；回傳回覆筆數，失敗狀態寫在第一筆的 Status。
-            result=arg(0) && memory.load(GuestAddress{arg(0)+4},32)==0?1U:0U;
-            if(!result && arg(0))handle_error(static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+4},32)));
+            if(network.icmp_handles.erase(arg(0)) || network.icmp6_handles.erase(arg(0)))result=1;else handle_error(6);
+        }else if(symbol=="IcmpParseReplies" || symbol=="Icmp6ParseReplies"){
+            // IcmpSendEcho*／Icmp6SendEcho2 已填好回覆；回傳回覆筆數，失敗狀態寫在第一筆的 Status（IPv4 位移 4、IPv6 位移 28）。
+            const unsigned status_offset=symbol=="Icmp6ParseReplies"?28U:4U;
+            result=arg(0) && memory.load(GuestAddress{arg(0)+status_offset},32)==0?1U:0U;
+            if(!result && arg(0))handle_error(static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+status_offset},32)));
         }else{
-            // ICMP_ECHO_REPLY：x64 為 40 bytes、Win32 為 28 bytes；資料接在結構之後。
-            const auto reply=arg(5);const auto request_size=static_cast<std::uint32_t>(arg(3))&0xffffU,reply_size=static_cast<std::uint32_t>(arg(6)),timeout=static_cast<std::uint32_t>(arg(7));
-            const std::uint32_t header=x86_?28U:40U;
-            if(!network.icmp_handles.contains(arg(0)))handle_error(6);
+            // 參數位置：IcmpSendEcho(handle,dest,…)、IcmpSendEcho2(handle,event,apc,context,dest,…)、
+            // IcmpSendEcho2Ex／Icmp6SendEcho2(handle,event,apc,context,source,dest,…)；dest 之後依序是資料、長度、選項、回覆緩衝、緩衝大小、逾時。
+            const bool v6=symbol=="Icmp6SendEcho2",with_source=v6 || symbol=="IcmpSendEcho2Ex",async_form=symbol!="IcmpSendEcho";
+            const unsigned d=symbol=="IcmpSendEcho"?1U:with_source?5U:4U;
+            const auto event=async_form?arg(1):0,apc=async_form?arg(2):0,apc_context=async_form?arg(3):0;
+            const auto reply=arg(d+4);const auto request_size=static_cast<std::uint32_t>(arg(d+2))&0xffffU,reply_size=static_cast<std::uint32_t>(arg(d+5)),timeout=static_cast<std::uint32_t>(arg(d+6));
+            // ICMP_ECHO_REPLY：x64 為 40 bytes、Win32 為 28 bytes；ICMPV6_ECHO_REPLY 固定 36 bytes。資料接在結構之後，緩衝需另留 8 bytes 給 ICMP 錯誤訊息。
+            const std::uint32_t header=v6?36U:x86_?28U:40U;
+            const bool valid_handle=v6?network.icmp6_handles.contains(arg(0)):network.icmp_handles.contains(arg(0));
+            const auto event_object=event?runtime_.wait_objects.find(event):runtime_.wait_objects.end();
+            if(!valid_handle)handle_error(6);
+            else if(event && (event_object==runtime_.wait_objects.end() || event_object->second.kind!=WaitObject::Kind::Event))handle_error(6);
             else if(!reply || reply_size<header+request_size+8)handle_error(122);
             else{
                 std::vector<std::uint8_t> packet(8+request_size);
-                packet[0]=8;
+                packet[0]=v6?128:8;
                 static std::uint16_t sequence=0;const auto serial=++sequence;
                 const auto identifier=static_cast<std::uint16_t>(process_id());
                 packet[4]=static_cast<std::uint8_t>(identifier>>8);packet[5]=static_cast<std::uint8_t>(identifier);packet[6]=static_cast<std::uint8_t>(serial>>8);packet[7]=static_cast<std::uint8_t>(serial);
-                if(request_size)memory.read(GuestAddress{arg(2)},std::span<std::uint8_t>(packet).subspan(8));
-                std::uint32_t sum=0;for(std::size_t i=0;i+1<packet.size();i+=2)sum+=static_cast<std::uint32_t>(packet[i]<<8|packet[i+1]);
-                if(packet.size()&1U)sum+=static_cast<std::uint32_t>(packet.back())<<8;
-                while(sum>>16)sum=(sum&0xffffU)+(sum>>16);
-                sum=~sum&0xffffU;packet[2]=static_cast<std::uint8_t>(sum>>8);packet[3]=static_cast<std::uint8_t>(sum);
-                const int descriptor=::socket(AF_INET,SOCK_DGRAM,IPPROTO_ICMP);
+                if(request_size)memory.read(GuestAddress{arg(d+1)},std::span<std::uint8_t>(packet).subspan(8));
+                if(!v6){
+                    // ICMPv4 的總和檢查碼由呼叫端計算；ICMPv6 含虛擬標頭，由宿主核心填入。
+                    std::uint32_t sum=0;for(std::size_t i=0;i+1<packet.size();i+=2)sum+=static_cast<std::uint32_t>(packet[i]<<8|packet[i+1]);
+                    if(packet.size()&1U)sum+=static_cast<std::uint32_t>(packet.back())<<8;
+                    while(sum>>16)sum=(sum&0xffffU)+(sum>>16);
+                    sum=~sum&0xffffU;packet[2]=static_cast<std::uint8_t>(sum>>8);packet[3]=static_cast<std::uint8_t>(sum);
+                }
+                const auto guest_v6=[&](std::uint64_t at){
+                    // 客體 SOCKADDR_IN6：family(2)、port(2)、flowinfo(4)、addr(16)、scope_id(4)。
+                    sockaddr_in6 out{};out.sin6_len=sizeof out;out.sin6_family=AF_INET6;if(!at)return out;
+                    memory.check(GuestAddress{at},28,Access::Read);out.sin6_port=static_cast<std::uint16_t>(memory.load(GuestAddress{at+2},16));
+                    out.sin6_flowinfo=static_cast<std::uint32_t>(memory.load(GuestAddress{at+4},32));
+                    for(unsigned i=0;i<16;++i)out.sin6_addr.s6_addr[i]=static_cast<std::uint8_t>(memory.load(GuestAddress{at+8+i},8));
+                    out.sin6_scope_id=static_cast<std::uint32_t>(memory.load(GuestAddress{at+24},32));return out;};
+                const int descriptor=::socket(v6?AF_INET6:AF_INET,SOCK_DGRAM,v6?IPPROTO_ICMPV6:IPPROTO_ICMP);
                 std::uint32_t status=11050; // IP_GENERAL_FAILURE
-                std::uint32_t round_trip=0,reply_bytes=0,from=0;unsigned time_to_live=64;
+                std::uint32_t round_trip=0,reply_bytes=0,from=0;unsigned time_to_live=64;sockaddr_in6 from6{};
                 std::vector<std::uint8_t> received(65536);std::size_t data_offset=0;
                 if(descriptor>=0){
-                    if(arg(4)){const int ttl=static_cast<int>(memory.load(GuestAddress{arg(4)},8));if(ttl)(void)::setsockopt(descriptor,IPPROTO_IP,IP_TTL,&ttl,sizeof ttl);}
-                    sockaddr_in target{};target.sin_len=sizeof target;target.sin_family=AF_INET;target.sin_addr.s_addr=static_cast<std::uint32_t>(arg(1));
+                    const auto options_at=arg(d+3);
+                    if(options_at){const int ttl=static_cast<int>(memory.load(GuestAddress{options_at},8));if(ttl){if(v6)(void)::setsockopt(descriptor,IPPROTO_IPV6,IPV6_UNICAST_HOPS,&ttl,sizeof ttl);else (void)::setsockopt(descriptor,IPPROTO_IP,IP_TTL,&ttl,sizeof ttl);}}
+                    bool ready=true;
+                    if(v6){const auto source=guest_v6(arg(4));if(arg(4) && !IN6_IS_ADDR_UNSPECIFIED(&source.sin6_addr))ready=::bind(descriptor,reinterpret_cast<const sockaddr*>(&source),sizeof source)==0;}
+                    else if(with_source && static_cast<std::uint32_t>(arg(4))){sockaddr_in source{};source.sin_len=sizeof source;source.sin_family=AF_INET;source.sin_addr.s_addr=static_cast<std::uint32_t>(arg(4));ready=::bind(descriptor,reinterpret_cast<const sockaddr*>(&source),sizeof source)==0;}
+                    if(!ready)status=11008; // IP_BAD_ROUTE：來源位址不屬於本機
+                    sockaddr_storage target{};socklen_t target_size=0;
+                    if(v6){const auto value=guest_v6(arg(d));std::memcpy(&target,&value,sizeof value);target_size=sizeof value;}
+                    else {sockaddr_in value{};value.sin_len=sizeof value;value.sin_family=AF_INET;value.sin_addr.s_addr=static_cast<std::uint32_t>(arg(d));std::memcpy(&target,&value,sizeof value);target_size=sizeof value;}
                     const auto started=std::chrono::steady_clock::now();
-                    if(::sendto(descriptor,packet.data(),packet.size(),0,reinterpret_cast<const sockaddr*>(&target),sizeof target)>=0){
+                    if(ready && ::sendto(descriptor,packet.data(),packet.size(),0,reinterpret_cast<const sockaddr*>(&target),target_size)>=0){
                         // 等待回應期間只佔用這個服務呼叫，時間由呼叫端的逾時限制。
                         status=11010; // IP_REQ_TIMED_OUT
                         pollfd waiter{descriptor,POLLIN,0};
                         if(::poll(&waiter,1,static_cast<int>(std::min<std::uint32_t>(timeout,INT32_MAX)))>0){
-                            sockaddr_in source{};socklen_t source_size=sizeof source;
+                            sockaddr_storage source{};socklen_t source_size=sizeof source;
                             const auto count=::recvfrom(descriptor,received.data(),received.size(),0,reinterpret_cast<sockaddr*>(&source),&source_size);
                             if(count>=8){
-                                const std::size_t skip=(received[0]>>4)==4?static_cast<std::size_t>(received[0]&15U)*4:0;
-                                if(skip+8<=static_cast<std::size_t>(count) && received[skip]==0){
+                                // IPv4 DGRAM 會帶 IP 標頭；IPv6 一律不帶。
+                                const std::size_t skip=!v6 && (received[0]>>4)==4?static_cast<std::size_t>(received[0]&15U)*4:0;
+                                const auto echo_reply=v6?129U:0U;
+                                if(skip+8<=static_cast<std::size_t>(count) && received[skip]==echo_reply){
                                     if(skip)time_to_live=received[8];
-                                    data_offset=skip+8;reply_bytes=static_cast<std::uint32_t>(count-static_cast<ssize_t>(data_offset));status=0;from=source.sin_addr.s_addr;
+                                    data_offset=skip+8;reply_bytes=static_cast<std::uint32_t>(count-static_cast<ssize_t>(data_offset));status=0;
+                                    if(v6)std::memcpy(&from6,&source,sizeof from6);else from=reinterpret_cast<const sockaddr_in*>(&source)->sin_addr.s_addr;
                                     round_trip=static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count());
-                                }else if(skip+8<=static_cast<std::size_t>(count))status=received[skip]==3?11003:11013; // 目的不可達／TTL 過期
+                                }else if(skip+8<=static_cast<std::size_t>(count)){
+                                    const auto type=received[skip];
+                                    status=v6?(type==1?11003U:type==3?11013U:11050U):type==3?11003U:11013U; // 目的不可達／TTL 過期
+                                }
                             }
                         }
                     }
@@ -436,13 +468,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                 }
                 memory.check(GuestAddress{reply},reply_size,Access::Write);
                 const auto data=reply+header;const auto stored=std::min<std::uint32_t>(reply_bytes,reply_size-header);
-                memory.store(GuestAddress{reply},32,from);memory.store(GuestAddress{reply+4},32,status);memory.store(GuestAddress{reply+8},32,round_trip);
-                memory.store(GuestAddress{reply+12},16,stored);memory.store(GuestAddress{reply+14},16,1);
-                memory.store(GuestAddress{reply+16},bits,data);
-                const auto options=reply+16+unit;
-                memory.store(GuestAddress{options},8,time_to_live);memory.store(GuestAddress{options+1},8,0);memory.store(GuestAddress{options+2},8,0);memory.store(GuestAddress{options+3},8,0);memory.store(GuestAddress{options+unit},bits,0);
+                if(v6){
+                    // ICMPV6_ECHO_REPLY：IPV6_ADDRESS_EX（緊密排列：port、flowinfo、addr[8]、scope_id）＋Status＋RoundTripTime。
+                    memory.write(GuestAddress{reply},std::vector<std::uint8_t>(36));
+                    memory.store(GuestAddress{reply},16,from6.sin6_port);memory.store(GuestAddress{reply+2},32,from6.sin6_flowinfo);
+                    for(unsigned i=0;i<16;++i)memory.store(GuestAddress{reply+6+i},8,from6.sin6_addr.s6_addr[i]);
+                    memory.store(GuestAddress{reply+22},32,from6.sin6_scope_id);memory.store(GuestAddress{reply+28},32,status);memory.store(GuestAddress{reply+32},32,round_trip);
+                }else{
+                    memory.store(GuestAddress{reply},32,from);memory.store(GuestAddress{reply+4},32,status);memory.store(GuestAddress{reply+8},32,round_trip);
+                    memory.store(GuestAddress{reply+12},16,stored);memory.store(GuestAddress{reply+14},16,1);
+                    memory.store(GuestAddress{reply+16},bits,data);
+                    const auto options=reply+16+unit;
+                    memory.store(GuestAddress{options},8,time_to_live);memory.store(GuestAddress{options+1},8,0);memory.store(GuestAddress{options+2},8,0);memory.store(GuestAddress{options+3},8,0);memory.store(GuestAddress{options+unit},bits,0);
+                }
                 if(stored)memory.write(GuestAddress{data},std::vector<std::uint8_t>(received.begin()+static_cast<std::ptrdiff_t>(data_offset),received.begin()+static_cast<std::ptrdiff_t>(data_offset+stored)));
-                if(status)handle_error(status);else result=1;
+                if(event || apc){
+                    // 非同步形式：回覆已在呼叫期間完成，依 Windows 契約回 0／ERROR_IO_PENDING，再設定事件或排入 APC（PIO_APC_ROUTINE(context, IO_STATUS_BLOCK*, 0)）。
+                    if(event)event_object->second.set_signal(true);
+                    if(apc){
+                        const auto block=allocate_heap(memory,unit*2);
+                        if(block){memory.store(GuestAddress{block},bits,0);memory.store(GuestAddress{block+unit},bits,status?0U:1U);}
+                        threads_.items.at(threads_.current).apcs.push_back({apc,{apc_context,block,0}});threads_.yield=true;
+                    }
+                    handle_error(997);
+                }
+                else if(status)handle_error(status);else result=1;
             }
         }
         arg.return_to(state,result);return std::nullopt;

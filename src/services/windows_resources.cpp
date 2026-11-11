@@ -556,9 +556,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
         const unsigned name_bytes=wide?64:32,total=wide?220:156,pixels=wide?168:104;
         if(!arg(2) || (symbol.starts_with("EnumDisplaySettingsEx") && (d(3)&~3U)))fail(87);
         else if(!index || index>monitors.size())fail(1168);
-        else if(memory.load(GuestAddress{arg(2)+name_bytes+4},16)<total-8)fail(87);
         else {
-            const auto supplied=std::min<unsigned>(total,static_cast<unsigned>(memory.load(GuestAddress{arg(2)+name_bytes+4},16)));
+            // 輸入的 dmSize 不檢查下限（Steel Nomad 以 dmSize=0 查詢，在 Windows 上可用；Wine 亦固定寫回）：不足時寫回到 dmICMMethod
+            // 之前的固定部分（W 188、A 124 位元組）並設定 dmSize；呼叫端提供的較大結構照舊寫到其 dmSize（最多完整 DEVMODE）。
+            const auto requested=static_cast<unsigned>(memory.load(GuestAddress{arg(2)+name_bytes+4},16));
+            const auto supplied=requested>=total-8?std::min<unsigned>(total,requested):(wide?188U:124U);
             const auto& monitor=monitors[index-1];
             std::array<std::uint32_t,4> original{monitor.primary && native?native->width:static_cast<std::uint32_t>(monitor.rect[2]-monitor.rect[0]),monitor.primary && native?native->height:static_cast<std::uint32_t>(monitor.rect[3]-monitor.rect[1]),32U,monitor.primary && native?(native->refresh_numerator+native->refresh_denominator/2)/native->refresh_denominator:monitor.refresh};
             auto selected=original;std::vector<std::array<std::uint32_t,4>> modes{original};

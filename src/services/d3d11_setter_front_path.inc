@@ -89,6 +89,23 @@ D3D11SetterMethod d3d11_setter_method(std::string_view symbol) noexcept {
     if(what=="Shader")return {D3D11Setter::Shader,stage};
     return {};
 }
+// 依描述元索引快取方法分類：worker 生產端與串流執行緒每次呼叫都要判定，原本逐次比對方法名稱。
+// 不在延伸描述表內的描述元（理論上不會發生）沿用名稱判定。
+template<class Method,class Classify>
+Method d3d11_method_by_descriptor(const WindowsServiceDescriptor& service,const std::vector<Method>& table,Classify classify) noexcept {
+    const auto descriptors=runtime_service_descriptors();
+    const auto begin=reinterpret_cast<std::uintptr_t>(descriptors.data()),at=reinterpret_cast<std::uintptr_t>(&service);
+    if(at>=begin && at<begin+descriptors.size_bytes() && !((at-begin)%sizeof(WindowsServiceDescriptor)))return table[(at-begin)/sizeof(WindowsServiceDescriptor)];
+    return classify(service.symbol);
+}
+D3D11SetterMethod d3d11_setter_method(const WindowsServiceDescriptor& service) noexcept {
+    static const std::vector<D3D11SetterMethod> table=[] {
+        const auto descriptors=runtime_service_descriptors();std::vector<D3D11SetterMethod> value(descriptors.size());
+        for(std::size_t i=0;i<descriptors.size();++i)value[i]=d3d11_setter_method(descriptors[i].symbol);
+        return value;
+    }();
+    return d3d11_method_by_descriptor(service,table,[](std::string_view symbol){return d3d11_setter_method(symbol);});
+}
 // 依 bind 核對一個待綁定的值。多留一次呼叫可能持有的餘裕，內部計數溢位交回完整路徑回報。
 const Object* d3d11_front_value(const D3D11State& bridge,const Identity& context,std::uint64_t value) noexcept {
     const auto found=bridge.objects.find_fast(value);

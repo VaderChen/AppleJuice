@@ -241,7 +241,27 @@ MetalTessellationDraw MetalGl::graphics_tessellation(const GraphicsDraw& d,const
         }
         gathered.emplace_back(destination,0);
     }
-    begin_commands();auto encoder=[commands_ computeCommandEncoder];MetalEncoderScope scope{encoder};[encoder setComputePipelineState:p->compute];
+    // render encoder 開著、主命令緩衝還沒有繪製以外的 GPU 寫入，而且 VS／HS 沒有綁貼圖（貼圖可能是主緩衝稍早的繪製目標）時，
+    // compute 編進側邊命令緩衝（在主緩衝之前提交），不結束 render encoder；其餘情況照舊先結束 encoder 再編在主緩衝。
+    const auto samples_textures=[&](const GraphicsStage& stage){return std::any_of(stage.resources.begin(),stage.resources.end(),[](const auto& view){return bool(view.resource);});};
+    static const bool dump_shaders=[] {const char* folder=std::getenv("X64ARM_DUMP_DXBC");return folder && *folder;}();
+    const auto inputs_written=[&]{
+        for(const unsigned stage:{0U,3U}){
+            for(const auto& constant:d.stages[stage].constants)if(written_in_main(constant))return true;
+            for(const auto& view:d.stages[stage].resources)if(view.resource && written_in_main(view.resource))return true;
+        }
+        for(const auto& vertex:d.vertices)if(written_in_main(vertex.resource))return true;
+        return d.indexed && written_in_main(d.indices);
+    };
+    const unsigned refusal=!tessellation_coalesce()?5U:!(open_render_ && commands_)?0U:main_gpu_writes_?1U:inputs_written()?2U:
+        (main_texture_writes_ && (samples_textures(d.stages[0]) || samples_textures(d.stages[3])))?3U:(encoder_chain_fence_ || dump_shaders || dump_buffers || metal_gpu_profile())?4U:6U;
+    const bool side=refusal==6U;
+    if(refusal<5U)++tess_main_[refusal];
+    id<MTLComputeCommandEncoder> encoder=nil;
+    if(side){if(!side_commands_)side_commands_=[queue_ commandBuffer];if(!side_commands_)throw std::runtime_error("Metal command buffer 建立失敗");encoder=[side_commands_ computeCommandEncoder];++side_computes_;}
+    else{begin_commands(true,"tessellation");encoder=[commands_ computeCommandEncoder];}
+    if(!encoder)throw std::runtime_error("Metal command encoder 建立失敗");
+    MetalEncoderScope scope{encoder};[encoder setComputePipelineState:p->compute];
     std::set<unsigned> occupied{p->factor_slot,p->info_slot,p->vertex_id_slot};if(p->control_slot!=UINT32_MAX)occupied.insert(p->control_slot);if(p->patch_slot!=UINT32_MAX)occupied.insert(p->patch_slot);
     if(p->raw_factor_slot!=UINT32_MAX){occupied.insert(p->raw_factor_slot);[encoder setBuffer:result.raw_factors offset:0 atIndex:p->raw_factor_slot];}
     for(unsigned i=0;i<2;++i){auto stage=d.stages[i?3:0];stage.shader=p->stages[i];graphics_bind(nil,encoder,stage,false);for(const auto& b:stage.shader->bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9))occupied.insert(b.native_slot);}

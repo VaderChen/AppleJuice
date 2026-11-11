@@ -98,7 +98,7 @@ std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
         {"userenv.dll","GetProfilesDirectoryA",2},{"userenv.dll","GetProfilesDirectoryW",2},
         {"userenv.dll","GetDefaultUserProfileDirectoryA",2},{"userenv.dll","GetDefaultUserProfileDirectoryW",2},
         {"userenv.dll","GetAllUsersProfileDirectoryA",2},{"userenv.dll","GetAllUsersProfileDirectoryW",2},
-        {"userenv.dll","GetUserProfileDirectoryA",3},{"userenv.dll","GetUserProfileDirectoryW",3},
+        {"userenv.dll","GetUserProfileDirectoryA",3},{"userenv.dll","GetUserProfileDirectoryW",3},{"userenv.dll","GetProfileType",1},
         {"userenv.dll","CreateEnvironmentBlock",3},{"userenv.dll","DestroyEnvironmentBlock",1},
         {"userenv.dll","EnterCriticalPolicySection",1},{"userenv.dll","LeaveCriticalPolicySection",1},
         {"userenv.dll","CreateAppContainerProfile",6},{"userenv.dll","DeleteAppContainerProfile",1},
@@ -122,6 +122,11 @@ std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
         {"kernel32.dll","GetActiveProcessorCount",1},{"kernel32.dll","GetMaximumProcessorCount",1},
         {"kernel32.dll","GetCurrentProcessorNumberEx",1},{"kernel32.dll","GetCurrentProcessorNumber",0},
         {"kernel32.dll","SetThreadGroupAffinity",3},{"kernel32.dll","GetThreadGroupAffinity",2},{"kernel32.dll","GetProcessGroupAffinity",3},
+        {"kernel32.dll","CreateUmsCompletionList",1},{"kernel32.dll","DeleteUmsCompletionList",1},{"kernel32.dll","DequeueUmsCompletionListItems",3},
+        {"kernel32.dll","GetUmsCompletionListEvent",2},{"kernel32.dll","GetNextUmsListItem",1},{"kernel32.dll","CreateUmsThreadContext",1},
+        {"kernel32.dll","DeleteUmsThreadContext",1},{"kernel32.dll","QueryUmsThreadInformation",5},{"kernel32.dll","SetUmsThreadInformation",4},
+        {"kernel32.dll","EnterUmsSchedulingMode",1},{"kernel32.dll","ExecuteUmsThread",1},{"kernel32.dll","UmsThreadYield",1},
+        {"kernel32.dll","GetCurrentUmsThread",0},{"kernel32.dll","GetUmsSystemThreadInformation",2},
         {"kernel32.dll","GetComputerNameA",2},{"kernel32.dll","GetComputerNameW",2},
         {"kernel32.dll","GetComputerNameExA",3},{"kernel32.dll","GetComputerNameExW",3},
         {"netapi32.dll","DsRoleGetPrimaryDomainInformation",3},{"netapi32.dll","DsRoleFreeMemory",1},
@@ -258,6 +263,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
     if(symbol.starts_with("NeedCurrentDirectoryForExePath")){
         if(!arg(0)){last_error_=87;arg.return_to(state,0);return std::nullopt;}
         result=executable_needs_current_directory(text(0));arg.return_to(state,result);return std::nullopt;
+    }
+    if(symbol=="GetProfileType"){
+        // 虛擬使用者是本機設定檔：不是暫時（PT_TEMPORARY=1）、漫遊（PT_ROAMING=2）或強制（PT_MANDATORY=4）設定檔，旗標為 0。
+        if(!arg(0)){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+        try{memory.store(GuestAddress{arg(0)},32,0);}catch(const MemoryFault&){last_error_=998;arg.return_to(state,0);return std::nullopt;}
+        arg.return_to(state,1);return std::nullopt;
     }
     if(symbol.starts_with("GetProfilesDirectory") || symbol.starts_with("GetDefaultUserProfileDirectory") || symbol.starts_with("GetAllUsersProfileDirectory") || symbol.starts_with("GetUserProfileDirectory")){
         const auto finish=[&](bool success,unsigned error=0){if(!success)last_error_=error;arg.return_to(state,success);return std::optional<std::uint32_t>{};};
@@ -505,6 +516,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
                 result=1;
             }
         }
+    } else if(symbol.find("Ums")!=std::string_view::npos) {
+        // 使用者模式排程（UMS）：Windows 11 起系統不再支援，所有入口保留匯出但以 ERROR_NOT_SUPPORTED 失敗（指標型回傳 NULL）。
+        // 並行執行階段（ConcRT）啟動時要求整組入口都能解析，實際排程走一般執行緒；這裡採同樣的「不支援」語義，不建立 UMS 物件。
+        last_error_=50;
     } else if(symbol=="GetActiveProcessorGroupCount" || symbol=="GetMaximumProcessorGroupCount")result=1;
     else if(symbol=="GetActiveProcessorCount" || symbol=="GetMaximumProcessorCount"){
         const auto group=static_cast<std::uint16_t>(arg(0));if(group==0 || group==65535)result=runtime_.processor_count;else last_error_=87;

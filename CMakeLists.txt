@@ -96,7 +96,7 @@ endfunction()
 
 add_library(x64arm_windows STATIC src/loader/pe_loader.cpp src/services/windows_services.cpp src/services/windows_runtime.cpp src/services/windows_crt_lowio.cpp src/services/process_startup_data.cpp src/services/windows_unwind.cpp src/services/windows_exceptions.cpp src/services/windows_exceptions_x86.cpp src/services/windows_heap.cpp
     src/services/windows_shared_window.cpp src/services/windows_remote_raster.cpp src/services/windows_winstation.cpp src/services/windows_gui.cpp src/services/windows_gui_support.cpp src/services/windows_gui_extra.cpp src/services/windows_common_dialogs.cpp src/services/windows_print_dialogs.cpp src/services/windows_page_setup.cpp src/services/windows_menus.cpp
-    src/services/windows_gui_threads.cpp src/services/windows_gui_remote_messages.cpp src/services/windows_gui_text.cpp src/services/windows_gui_async.cpp src/services/windows_window_interaction.cpp src/services/windows_controls.cpp src/services/windows_gdi.cpp src/services/windows_gdi_text.cpp src/services/windows_userdraw.cpp src/services/windows_dib_transfer.cpp src/services/windows_gdiplus.cpp src/services/windows_ribbon.cpp src/services/windows_task_dialog.cpp src/services/windows_opencl.cpp src/services/windows_vulkan.cpp src/services/windows_xess.cpp src/services/windows_directml.cpp src/services/windows_msvcp_pmr.cpp src/services/windows_msvcp_special_math.cpp src/services/windows_webview2.cpp src/services/windows_d3d12.cpp src/services/windows_dxcore.cpp src/services/windows_crt_io.cpp src/services/windows_crt_buffer.cpp src/services/unicode.cpp src/services/readonly_files.cpp)
+    src/services/windows_gui_threads.cpp src/services/windows_gui_remote_messages.cpp src/services/windows_gui_text.cpp src/services/windows_gui_async.cpp src/services/windows_window_interaction.cpp src/services/windows_controls.cpp src/services/windows_gdi.cpp src/services/windows_gdi_text.cpp src/services/windows_userdraw.cpp src/services/windows_dib_transfer.cpp src/services/windows_gdiplus.cpp src/services/windows_wic.cpp src/services/windows_ribbon.cpp src/services/windows_task_dialog.cpp src/services/windows_opencl.cpp src/services/windows_vulkan.cpp src/services/windows_xess.cpp src/services/windows_directml.cpp src/services/windows_msvcp_pmr.cpp src/services/windows_msvcp_special_math.cpp src/services/windows_webview2.cpp src/services/windows_d3d12.cpp src/services/windows_dxcore.cpp src/services/windows_crt_io.cpp src/services/windows_crt_buffer.cpp src/services/unicode.cpp src/services/readonly_files.cpp)
 target_include_directories(x64arm_windows PUBLIC include PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_sources(x64arm_windows PRIVATE src/services/network_resources.cpp src/services/network_files.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_region.cpp)
@@ -256,6 +256,9 @@ target_sources(x64arm_windows PRIVATE src/services/audio_graph.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_xaudio.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_dinput.cpp src/services/dinput_effect_file.cpp src/services/input.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_d3d9.cpp src/services/windows_d3d11.cpp src/services/dxva_h264.cpp)
+# 核心常駐入口與服務端共用的描述元：不參與 LTO，定義保留在原生目的檔（LTO 會把可執行檔裡沒有原生引用的符號內部化，核心與服務端就各用一份）。
+target_sources(x64arm_windows PRIVATE src/services/resident_d3d11_descriptor.cpp)
+set_source_files_properties(src/services/resident_d3d11_descriptor.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 target_sources(x64arm_windows PRIVATE src/services/windows_graphics.cpp)
 target_sources(x64arm_windows PRIVATE src/services/graphics_index_range.cpp)
 target_link_libraries(x64arm_windows PRIVATE x64arm_hlslcc x64arm_shader_compiler)

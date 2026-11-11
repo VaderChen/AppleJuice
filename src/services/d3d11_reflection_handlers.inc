@@ -1,12 +1,15 @@
         if(symbol=="D3DReflect"){
             graphics_handled=true;output(3);write_pointer(arg(3),0);
             const auto iid=read_guid(memory,arg(2));
-            if(iid!=IID_ID3D11ShaderReflection && iid!=IID_ID3D11ShaderReflection43){complete_call(state,memory,no_interface);return std::nullopt;}
+            if(iid!=IID_ID3D11ShaderReflection && iid!=IID_ID3D11ShaderReflection47 && iid!=IID_ID3D11ShaderReflection43 && iid!=IID_ID3D12ShaderReflection){
+                if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS")){std::fprintf(stderr,"[d3d11] D3DReflect 不支援的 IID");for(const auto byte:iid)std::fprintf(stderr," %02x",static_cast<unsigned>(byte));std::fprintf(stderr,"\n");}
+                complete_call(state,memory,no_interface);return std::nullopt;}
             require(arg(1)>0 && arg(1)<=16U*1024U*1024U);
             auto reflection=std::make_shared<dxbc::Reflection>(read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1))));
             require(reflection->version!=0);
             auto id=create(Kind::Reflection);id->reflection=std::move(reflection);id->reflection_owner=id->root;
-            id->sequence=iid==IID_ID3D11ShaderReflection43?43U:47U;write_pointer(arg(3),id->root);
+            // sequence：43／47 為 d3dcompiler 版本的結構差異；1012 為 ID3D12ShaderReflection（簽章同 47，綁定描述多 Space、uID）。
+            id->sequence=iid==IID_ID3D11ShaderReflection43?43U:iid==IID_ID3D12ShaderReflection?1012U:47U;write_pointer(arg(3),id->root);
         }else if(symbol.starts_with("Reflect")){
             graphics_handled=true;auto id=object(arg(0)).identity;require(bool(id->reflection));
             auto root=typed(id->reflection_owner,Kind::Reflection);const auto& r=*id->reflection;
@@ -53,6 +56,7 @@
             }else if(symbol=="ReflectBinding" || symbol=="ReflectBindingByName"){
                 unsigned index=u32(1);if(symbol=="ReflectBindingByName"){const auto name=arg(1)?read_ansi(memory,arg(1)):std::string{};index=UINT32_MAX;for(unsigned i=0;i<r.bindings.size();++i)if(r.bindings[i].name==name){index=i;break;}}
                 require(index<r.bindings.size() && arg(2));const auto& b=r.bindings[index];write_pointer(arg(2),string(b.name));const std::array values{b.type,b.slot,b.count,b.flags,b.format,b.dimension,b.samples};words(arg(2)+pointer_size,values);
+                if(root->sequence==1012){const std::array d3d12{b.space,b.id};words(arg(2)+pointer_size+28,d3d12);}
             }else if(symbol=="ReflectInput" || symbol=="ReflectOutput" || symbol=="ReflectPatch"){
                 const auto kind=symbol=="ReflectInput"?0U:symbol=="ReflectOutput"?1U:2U;require(u32(1)<r.signatures[kind].size() && arg(2));const auto& s=r.signatures[kind][u32(1)];
                 const auto size=pointer_size+(root->sequence>=47?28U:24U);memory.fill(GuestAddress{arg(2)},0,size);write_pointer(arg(2),string(s.name));

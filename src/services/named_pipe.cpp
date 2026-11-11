@@ -272,7 +272,10 @@ NamedPipe::Opened NamedPipe::open(const std::string& session,std::u16string name
 }catch(const SecurityDescriptorError& e){return {{},e.code};}catch(const std::bad_alloc&){return {{},8};}
 NamedPipe::Pair NamedPipe::anonymous(const std::string& session,std::uint32_t size,std::span<const std::uint8_t> security){
     static std::atomic<std::uint64_t> sequence{};
-    const auto text=std::string("\\\\.\\pipe\\anonymous-")+std::to_string(::getpid())+"-"+std::to_string(sequence.fetch_add(1,std::memory_order_relaxed));
+    // 名稱含出生識別：被強制結束的舊程序留下的管道檔可能仍被其他程序（例如 Steam 繼承的 handle）連著，
+    // 只用 pid＋序號時 pid 重用的新程序會撞名而以 ERROR_ACCESS_DENIED 建立失敗。
+    const auto text=std::string("\\\\.\\pipe\\anonymous-")+std::to_string(::getpid())+"-"+std::to_string(self_birth())+"-"+
+        std::to_string(sequence.fetch_add(1,std::memory_order_relaxed));
     const std::u16string name(text.begin(),text.end());
     // nSize 是緩衝建議值；沿用有界、按需成長的共用管線佇列。
     const auto capacity=size?std::min<std::uint32_t>(size,limit-4):4096U;

@@ -47,7 +47,7 @@ class MetalImmediatePresenter {
                     // ready 已 commit，且包含 producer 的 GPU 交接及畫面快照複製。
                     // 此等待發生於呈現執行緒；客體下一幀不用等螢幕更新。
                     [ready waitUntilCompleted];
-                    if(ready.status==MTLCommandBufferStatusError)throw std::runtime_error("Metal 呈現快照執行失敗");
+                    if(ready.status==MTLCommandBufferStatusError && !metal_innocent_victim(ready))throw std::runtime_error("Metal 呈現快照執行失敗");
                     auto command=[queue_ commandBuffer];
                     auto encoder=[command blitCommandEncoder];
                     if(!command || !encoder)throw std::runtime_error("Metal 呈現複製命令建立失敗");
@@ -58,7 +58,7 @@ class MetalImmediatePresenter {
                          destinationOrigin:MTLOriginMake(0,0,0)];
                     scope.end();timing.present(drawable);[command presentDrawable:drawable];track_gpu_commands(command);
                     [command commit];[command waitUntilCompleted];
-                    if(command.status==MTLCommandBufferStatusError)throw std::runtime_error("Metal 非同步呈現執行失敗");
+                    if(command.status==MTLCommandBufferStatusError && !metal_innocent_victim(command))throw std::runtime_error("Metal 非同步呈現執行失敗");
                     {
                         std::lock_guard lock(mutex_);
                         slots_[index].ready=nil;slots_[index].use=Use::Free;++displayed_;last_displayed_=sequence;

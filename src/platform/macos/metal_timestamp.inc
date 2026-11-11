@@ -1,7 +1,7 @@
 // 原生繪圖與 ANGLE 使用相同 counter 實作；GL 工作的 queue 邊界由各自的後端維持。
 bool MetalGl::graphics_timestamp_supported()const{return metal_timestamp_supported(device_);}
 GraphicsTimestamp MetalGl::graphics_timestamp(){@autoreleasepool{
-    begin_commands();auto commands=commands_;return metal_timestamp_sample(device_,commands,[&]{flush(true);});
+    begin_commands(true,"timestamp");auto commands=commands_;return metal_timestamp_sample(device_,commands,[&]{flush(true);});
 }}
 // 非同步：取樣編在目前命令緩衝（沒有待提交工作時建立一個只含取樣的緩衝），提交後由完成回呼解析。
 // 不等待 GPU；Steam 的 Chromium 每幀約兩對 TIMESTAMP／DISJOINT 查詢，同步版每次 End 要等 GPU 閒置約 0.4 ms。
@@ -10,7 +10,7 @@ std::shared_ptr<const GraphicsTimestampFuture> MetalGl::graphics_timestamp_futur
 }
 // 把取樣編進目前命令緩衝，完成時寫入呼叫端提供的 future（命令執行緒代理先回傳 future、再依序排入此步驟）。
 void MetalGl::timestamp_into(const std::shared_ptr<GraphicsTimestampFuture>& future){@autoreleasepool{
-    begin_commands();
+    begin_commands(true,"timestamp");
     // block 擷取 C++ 參照時不複製物件：先複製 shared_ptr，回呼持有自己的所有權。
     auto target=future;
     auto sample=metal_timestamp_encode(device_,commands_,&timestamp_pool_);

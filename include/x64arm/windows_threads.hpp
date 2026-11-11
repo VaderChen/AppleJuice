@@ -19,6 +19,7 @@ struct ThreadWait {
     bool all{}, alertable{};
     bool shared{}, critical{}, signaled{}, timed_out{};
     bool slim_timed{}; // 共用 SRW 等待的限時介面：取得回 true，逾時回 false。
+    bool null_wait{}; // 對 NULL handle 自旋等待的短暫停駐（Sleep 類）：完成時回 WAIT_FAILED，LastError 已在停駐前寫成 ERROR_INVALID_HANDLE。
     std::uint64_t order{}; // 物件等待的進入序號：互斥鎖、自動重設 event 與 semaphore 依先進先出交付。
     std::uint64_t gui_window{},gui_drag_detection{},gui_move_size{};
     std::uint32_t gui_min{},gui_max{},gui_mask{UINT32_MAX};bool gui_new_only{},gui_callbacks{true};
@@ -73,7 +74,8 @@ struct GuestThread {
     std::uint32_t public_id{}; // Windows 對外身分；排程、IPC 與 CPU context 仍使用本機索引。
     std::uint64_t cycles{}; // 客體執行成本；等待不累計，與宿主牆鐘獨立。
     std::array<std::uint8_t,16> activity_id{};
-    std::uint64_t affinity{UINT64_MAX}, strtok_cursor{}, invalid_parameter_handler{};
+    std::uint64_t affinity{UINT64_MAX}, strtok_cursor{}, wcstok_cursor{}, invalid_parameter_handler{};
+    std::uint32_t com_process_token{};
     std::uint32_t suspended{}, exit_code{}, ideal_processor{};
     std::int32_t priority{};
     MultimediaThreadTask multimedia;
@@ -89,6 +91,7 @@ struct GuestThread {
     std::uint64_t last_dispatch_ticks{}; // 上次被排程執行的單調時鐘（100 ns），防餓死提升用。
     // 常駐平行 worker slot 的時間片期限（單調時鐘 100 ns）：期限內重新選取客體時保留原 slot，避免每次集合都輪替。
     std::uint64_t parallel_slice_deadline{};
+    std::uint64_t null_wait_ticks{}; // 上次對 NULL handle 等待的單調時鐘（100 ns），判定是否在自旋。
     std::uint32_t dynamic_priority_boost{};
     bool priority_boost_disabled{};
     std::uint32_t power_control{}, power_state{};

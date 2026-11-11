@@ -30,7 +30,8 @@ bool registry_dependent_service(const WindowsServiceDescriptor& service) {
     // 決定是否交易的服務控制 API，不以匯出名稱前綴取代實際 descriptor 家族。
     if(contains(registry_service_descriptors()) || contains(service_control_descriptors()))return true;
     // 列印表單與 DEVMODE 共用登錄；不能在另一筆非同步交易尚未發布時讀寫快照。
-    if(contains(printing_service_descriptors()) || contains(print_dialog_service_descriptors()))return true;
+    if(contains(printing_service_descriptors()) || contains(print_dialog_service_descriptors()) ||
+       contains(property_page_service_descriptors()))return true;
     if(family=="gdi32.dll" && one_of(name,{"CreateDCA","CreateDCW","CreateICA","CreateICW"}))return true;
 
     const bool kernel=family=="kernel32.dll" || family=="kernelbase.dll";

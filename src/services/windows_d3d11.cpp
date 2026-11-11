@@ -28,6 +28,7 @@
 #include <cstring>
 #include <chrono>
 #include <set>
+#include <shared_mutex>
 #include <unordered_map>
 #include "d3d11_guids.hpp"
 #include "d3d10_guids.hpp"
@@ -70,7 +71,8 @@ struct RecordedGraphicsCommand {
 // 快照時點與內容不變（呼叫當下的繪製狀態）。
 [[gnu::noinline]] RecordedGraphicsCommand recorded_draw(const GraphicsDraw& draw){
     auto copy=std::make_shared<const GraphicsDraw>(draw);
-    return {[copy](NativeOpenGlContext& native){native.graphics_draw(*copy);},1,0};
+    // 快照之後不再改變：重播時交給後端直接排隊，不再複製（同一命令清單可重複執行，共用同一份唯讀快照）。
+    return {[copy](NativeOpenGlContext& native){native.graphics_draw_shared(copy);},1,0};
 }
 [[gnu::noinline]] RecordedGraphicsCommand recorded_draw_auto(const GraphicsDraw& draw){
     auto copy=std::make_shared<const GraphicsDraw>(draw);
@@ -84,11 +86,11 @@ struct RecordedGraphicsCommand {
 }
 [[gnu::noinline]] RecordedGraphicsCommand recorded_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){
     auto copy=std::make_shared<const GraphicsStage>(stage);
-    return {[copy,groups](NativeOpenGlContext& native){native.graphics_dispatch(*copy,groups);},0,1};
+    return {[copy,groups](NativeOpenGlContext& native){native.graphics_dispatch_shared(copy,groups);},0,1};
 }
 [[gnu::noinline]] RecordedGraphicsCommand recorded_dispatch_indirect(const GraphicsStage& stage,std::shared_ptr<GraphicsResource> resource,std::uint32_t offset){
     auto copy=std::make_shared<const GraphicsStage>(stage);
-    return {[copy,resource=std::move(resource),offset](NativeOpenGlContext& native){native.graphics_dispatch_indirect(*copy,resource,offset);},0,1};
+    return {[copy,resource=std::move(resource),offset](NativeOpenGlContext& native){native.graphics_dispatch_indirect_shared(copy,resource,offset);},0,1};
 }
 // 繪製狀態快取輪替份數：重用某份前要等命令執行緒處理完上一次用它的繪製；份數越多越能吸收突發，但增量更新要與更舊的
 // 狀態比對。X64ARM_D3D11_DRAW_CACHES=<1～32>，預設 32：份數太少時，大量繪製突發會讓前端很快就追上命令執行緒，
@@ -188,6 +190,11 @@ struct Identity {
     std::array<std::uint32_t,4> stream_offsets{};
     std::shared_ptr<GraphicsStreamStatistics> stream_statistics{std::make_shared<GraphicsStreamStatistics>()};
     GraphicsStreamStatistics stream_begin;
+    bool warp_adapter{}; // 配接器：EnumWarpAdapter 建立的 WARP 身分（見 display_identity::warp_adapter_description）。
+    // 管線統計：內容的累計計數、查詢 Begin／End 時的快照，以及內容上進行中的管線統計查詢（root 指標）。
+    std::shared_ptr<GraphicsPipelineStatistics> pipeline_statistics{std::make_shared<GraphicsPipelineStatistics>()};
+    GraphicsPipelineStatistics pipeline_begin,pipeline_end;
+    std::vector<std::uint64_t> pipeline_queries;
     std::uint32_t topology{},index_format{42},index_offset{},sample_mask{UINT32_MAX},stencil_reference{},priority{},query_size{},context_type{};
     std::uint64_t window{},factory{},adapter{},frames{},draws{},dispatches{};
     std::vector<RecordedGraphicsCommand> commands;
@@ -196,6 +203,9 @@ struct Identity {
     std::vector<std::uint8_t> query_data;
     // 事件查詢（D3D11_QUERY_EVENT）以後端完成旗標判定就緒，End 不等待 GPU。
     std::shared_ptr<const std::atomic<bool>> query_fence;
+    // staging 資源最後一次 GPU 存取（Copy*／UpdateSubresource／Unmap 上傳）的完成旗標，依序排在該命令之後。
+    // Map 帶 D3D11_MAP_FLAG_DO_NOT_WAIT 時未完成即回 DXGI_ERROR_WAS_STILL_DRAWING；已完成的緩衝讀回不必等命令執行緒排空。
+    std::shared_ptr<const std::atomic<bool>> gpu_fence;
     std::shared_ptr<const GraphicsTimestampFuture> query_timestamp;
     // 遮蔽查詢：End 只記錄 fence 與取樣序號，GetData 在 fence 完成後才讀回可見度緩衝區。
     std::uint64_t query_pending_sequence{};
@@ -344,16 +354,33 @@ public:
         return found;
     }
     const_iterator find_fast(std::uint64_t key) const {return const_cast<D3D11ObjectTable*>(this)->find_fast(key);}
+    // 結構變動（插入、刪除）取獨占的 structure_；不持圖形鎖的查找（find_kind_unlocked）取共用鎖。worker 上的 CreateBuffer 會在只持
+    // 映射共用鎖＋圖形鎖時插入，與同樣只持映射共用鎖的介面卡查詢（AdapterGetDesc、QueryVideoMemoryInfo）並行；持圖形鎖的查找不受影響。
     template<class... Arguments> auto emplace(Arguments&&... arguments){
+        const std::unique_lock guard(structure_);
         const auto buckets=bucket_count();
         auto result=Base::emplace(std::forward<Arguments>(arguments)...);
         if(bucket_count()!=buckets)cache_.fill(Entry{});
         return result;
     }
     size_type erase(std::uint64_t key){
+        const std::unique_lock guard(structure_);
         auto& entry=cache_[index(key)];if(entry.key==key)entry=Entry{};
         return Base::erase(key);
     }
+    bool find_kind_unlocked(std::uint64_t key,Kind kind) const {
+        const std::shared_lock guard(structure_);
+        const auto found=Base::find(key);
+        return found!=Base::end() && found->second.kind==kind;
+    }
+    // 硬體配接器（不含 WARP）：worker 上的配接器描述與顯存查詢只處理硬體配接器。
+    bool find_hardware_adapter_unlocked(std::uint64_t key) const {
+        const std::shared_lock guard(structure_);
+        const auto found=Base::find(key);
+        return found!=Base::end() && found->second.kind==Kind::Adapter && found->second.identity && !found->second.identity->warp_adapter;
+    }
+private:
+    mutable std::shared_mutex structure_;
 };
 struct D3D11SharedResource {std::weak_ptr<GraphicsResource> resource;std::weak_ptr<NativeOpenGlContext> producer;std::vector<std::uint8_t> desc;};
 struct D3D11State {
@@ -384,6 +411,12 @@ struct D3D11State {
     // 不經 allocate_heap／free_heap 的空洞搜尋、頁計數與相鄰合併（雙人成行每幀約 40 次 CreateBuffer／Release，兩者約占協調者 2%）。
     // 區塊仍登錄為存活配置；最後一個 D3D11 物件釋放時全部歸還。上限 4096 個。X64ARM_D3D11_SLOT_REUSE=0 關閉。
     std::vector<std::uint64_t> free_slots;
+    // 持久映射區塊（動態資源第一次 WRITE_DISCARD 對應配置的客體 heap 區塊）：資源銷毀或映射失效時依大小保留在這裡，下一次第一次對應
+    // 同大小的子資源直接取用，不經 allocate_heap／free_heap（《崛起》繪製執行緒每幀數次建立 64 KiB 動態常數緩衝，協調者上每次配置約 68 µs）。
+    // worker 只能從這裡取（不配置 heap），見 d3d11_local_eligible。區塊仍登錄為存活配置；最後一個 D3D11 物件釋放時全部歸還。
+    // 每種大小最多 512 塊、總量 64 MiB、單塊 4 MiB 以下。X64ARM_D3D11_MAP_BLOCK_REUSE=0 關閉。
+    std::unordered_map<std::size_t,std::vector<std::uint64_t>> map_blocks;
+    std::size_t map_block_bytes{};
     // 程序結束時把每個 D3D11 裝置的 Metal 後端統計（draws、encoders、GPU 忙碌時間、CPU 等待）印到 stderr，
     // 供 CPU／GPU 瓶頸判斷；只讀統計字串，不改任何狀態。
     ~D3D11State(){
@@ -560,14 +593,44 @@ std::span<const WindowsServiceDescriptor> d3d11_service_descriptors() {
 // worker（共用映射鎖）上 Map／Unmap 只在重用既有持久映射時合格：立即內容上的 WRITE_DISCARD／NO_OVERWRITE 沿用同一
 // 客體區塊，Unmap 上傳後保留區塊，都不配置或釋放 heap（每幀數千次，是平行模式全體靜止的最大來源）。協調者
 //（coordinator=true）持獨占映射鎖，可配置與釋放 heap，Map／Unmap 與寫入持久映射資源的複製都可本地完成。
-bool WindowsServices::d3d11_adapter(std::uint64_t object) const{
-    if(!d3d11_)return false;const auto found=d3d11_->objects.find(object);return found!=d3d11_->objects.end() && found->second.kind==Kind::Adapter;
+// worker 上完成 CreateBuffer 與動態緩衝第一次 WRITE_DISCARD 對應（槽與映射區塊取自預備池，見 take_slot／map_blocks）。
+// 《崛起》地熱谷繪製執行緒每幀數次建立 64 KiB 動態常數緩衝後第一次對應，原本兩者都要往返協調者（負載下各約 100 µs）。
+// X64ARM_D3D11_WORKER_CREATE=0 關閉。
+bool d3d11_worker_create_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_WORKER_CREATE");return !value || std::string_view(value)!="0";}();
+    return enabled;
 }
+bool d3d11_map_block_reuse_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_MAP_BLOCK_REUSE");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
+bool WindowsServices::d3d11_adapter(std::uint64_t object) const{
+    if(!d3d11_)return false;return d3d11_->objects.find_hardware_adapter_unlocked(object);
+}
+// 診斷：X64ARM_TRACE_D3D11_FULL=1 時記下最近一次本地資格的拒絕原因（只供完整路徑統計）。
+thread_local const char* d3d11_local_refusal=nullptr;
 bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service,bool coordinator) const try {
-    if(!d3d11_ || d3d11_->deferred_releases.size()>=256)return false;
+    d3d11_local_refusal="other";
+    if(!d3d11_){d3d11_local_refusal="no-bridge";return false;}
+    if(d3d11_->deferred_releases.size()>=256){d3d11_local_refusal="deferred-releases";return false;}
     const auto symbol=service.symbol;
-    static constexpr std::string_view excluded[]{"QueryInterface","FinishCommandList","ExecuteCommandList"};
-    if(std::find(std::begin(excluded),std::end(excluded),symbol)!=std::end(excluded))return false;
+    // 延遲命令清單的完成與重播（以及命令清單物件的引用計數）：協調者本地可配置／釋放 heap、立即銷毀物件，與本地 Create* 相同；
+    // worker 上依下方條件完成（Fire Strike 每秒數千次，原本每次全停約 60 µs）。
+    if(symbol=="QueryInterface")return false;
+    // worker 上：FinishCommandList 只取預備槽建立命令清單物件（vtable 已快取、至少 6 個槽且頁面不是寫入時複製頁），
+    // ExecuteCommandList 只在立即內容重播；釋放進延後清單。X64ARM_D3D11_COMMAND_LIST_WORKER=0 交回協調者本地路徑。
+    if((symbol=="FinishCommandList" || symbol=="ExecuteCommandList") && !coordinator){
+        static const bool worker_lists=[] {const auto* value=std::getenv("X64ARM_D3D11_COMMAND_LIST_WORKER");return !value || std::string_view(value)!="0";}();
+        if(!worker_lists)return false;
+        const WindowsCall call(state,memory,service);
+        const auto self=d3d11_->objects.find_fast(call(0));if(self==d3d11_->objects.end() || self->second.kind!=Kind::Context || !self->second.identity)return false;
+        if(symbol=="ExecuteCommandList"){if(self->second.identity->context_type)return false;}
+        else{
+            if(!self->second.identity->context_type || !d3d11_worker_create_enabled() || d3d11_->free_slots.size()<6 || !d3d11_->vtables.contains(std::pair{Kind::CommandList,false}))return false;
+            for(std::size_t i=d3d11_->free_slots.size()-6;i<d3d11_->free_slots.size();++i)
+                if(memory.is_copy_on_write(GuestAddress{d3d11_->free_slots[i]}) || memory.is_copy_on_write(GuestAddress{d3d11_->free_slots[i]+15}))return false;
+        }
+    }
     const WindowsCall arg(state,memory,service);
     const auto found=d3d11_->objects.find_fast(arg(0));if(found==d3d11_->objects.end())return false;
     // 著色器尚未編譯：交給背景編譯並回到完整服務路徑，由處理程式讓呼叫者等待後重試（見 d3d11_graphics_handlers.inc），
@@ -588,9 +651,35 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     if(symbol=="Map" || symbol=="Unmap"){
         const auto resource=d3d11_->objects.find_fast(arg(1));
         if(found->second.kind==Kind::Context && found->second.identity->context_type){
-            // 延遲內容：Map／Unmap 要配置或釋放錄製用的客體 heap，worker 上交回協調者；
-            // 本地 Map 開啟時在協調者本地完成（與本地 CreateBuffer 相同只配置 heap 並錄製命令），否則走完整路徑。
-            if(!coordinator || resource==d3d11_->objects.end() || !resource->second.identity->resource)return false;
+            // 延遲內容：Map 的錄製區塊取自 map_blocks、Unmap 放回（見 d3d11_deferred_handlers.inc）。worker 上只在不必配置／釋放 heap 時完成：
+            // Map 要有同大小且不是寫入時複製頁的保留區塊，Unmap 要放得回去；否則交回協調者本地路徑（配置 heap 並錄製命令）。
+            // Fire Strike 錄製執行緒每秒數萬次，原本每次往返協調者。X64ARM_D3D11_DEFERRED_MAP_WORKER=0 恢復一律交回。
+            if(resource==d3d11_->objects.end() || !resource->second.identity->resource)return false;
+            if(!coordinator){
+                static const bool deferred_worker=[] {const auto* value=std::getenv("X64ARM_D3D11_DEFERRED_MAP_WORKER");return !value || std::string_view(value)!="0";}();
+                if(!deferred_worker || !d3d11_map_block_reuse_enabled())return false;
+                const auto& context=*found->second.identity;const auto& id=*resource->second.identity;const auto& d=id.resource->desc;
+                const auto index=static_cast<std::uint32_t>(arg(2));
+                if(!d.levels || index>=d.levels*d.layers)return false;
+                const auto found_map=context.deferred_maps.find(std::pair{id.root,index});
+                if(symbol=="Map"){
+                    const auto type=static_cast<std::uint32_t>(arg(3));if(type!=4 && type!=5)return false;
+                    const auto level=index%d.levels;
+                    const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>level),std::max(1U,d.height>>level));
+                    const auto size=std::uint64_t{pitch[0]}*pitch[1]*std::max(1U,d.depth>>level);
+                    if(!size || size>(std::uint64_t{4}<<20))return false;
+                    const auto blocks=d3d11_->map_blocks.find(static_cast<std::size_t>(size));
+                    if(blocks==d3d11_->map_blocks.end() || blocks->second.empty())return false;
+                    const auto block=blocks->second.back();
+                    if(memory.is_copy_on_write(GuestAddress{block}) || memory.is_copy_on_write(GuestAddress{block+size-1}))return false;
+                }else{
+                    if(found_map==context.deferred_maps.end() || !found_map->second.pointer)return false;
+                    const auto size=found_map->second.bytes.size();
+                    if(!size || size>(std::size_t{4}<<20) || d3d11_->map_block_bytes+size>(std::size_t{64}<<20))return false;
+                    const auto live=allocations_.find(found_map->second.pointer);if(live==allocations_.end() || live->second!=size)return false;
+                    if(const auto blocks=d3d11_->map_blocks.find(size);blocks!=d3d11_->map_blocks.end() && blocks->second.size()>=512)return false;
+                }
+            }
         }else if(coordinator){
             // 立即內容上的對應：一般完整服務同樣在協調執行緒執行（讀回會等命令執行緒與 GPU）。
             if(found->second.kind!=Kind::Context || found->second.identity->context_type || resource==d3d11_->objects.end() ||
@@ -599,31 +688,57 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
             if(found->second.kind!=Kind::Context || found->second.identity->context_type || resource==d3d11_->objects.end() ||
                !resource->second.identity->resource)return false;
             const auto& id=*resource->second.identity;const auto subresource=static_cast<std::uint32_t>(arg(2));
-            const auto kept=id.persistent_maps.find(subresource);if(kept==id.persistent_maps.end())return false;
-            if(symbol=="Map"){const auto type=static_cast<std::uint32_t>(arg(3));if(type!=4 && type!=5)return false;}
+            const auto kept=id.persistent_maps.find(subresource);
+            if(kept==id.persistent_maps.end()){
+                // 動態緩衝第一次 WRITE_DISCARD：同大小的保留區塊存在、頁面不是寫入時複製頁才在 worker 完成（不配置 heap）。
+                // 規格檢查不符的呼叫交協調者，由完整檢查回報錯誤。
+                if(symbol!="Map" || !d3d11_worker_create_enabled() || !d3d11_map_block_reuse_enabled())return false;
+                static const bool persistent=[] {const auto* value=std::getenv("X64ARM_D3D11_PERSISTENT_MAP");return !value || std::string_view(value)!="0";}();
+                static const bool discard=[] {const auto* value=std::getenv("X64ARM_GRAPHICS_DISCARD_RENAME");return !value || std::string_view(value)!="0";}();
+                const auto type=static_cast<std::uint32_t>(arg(3)),flags=static_cast<std::uint32_t>(arg(4));
+                const auto& d=id.resource->desc;
+                if(!persistent || !discard || type!=4 || (flags&~0x100000U) || subresource || id.offered || id.subresource_maps.contains(0) ||
+                   d.dimension!=1 || !d.width || id.desc.size()<16)return false;
+                const auto word=[&](std::size_t at){std::uint32_t value=0;std::memcpy(&value,id.desc.data()+at,4);return value;};
+                if(word(4)!=2 || !(word(12)&0x10000U))return false;
+                const auto blocks=d3d11_->map_blocks.find(d.width);
+                if(blocks==d3d11_->map_blocks.end() || blocks->second.empty())return false;
+                const auto block=blocks->second.back();
+                if(memory.is_copy_on_write(GuestAddress{block}) || memory.is_copy_on_write(GuestAddress{block+d.width-1}))return false;
+            }else if(symbol=="Map"){const auto type=static_cast<std::uint32_t>(arg(3));if(type!=4 && type!=5)return false;}
             else{const auto mapped=id.subresource_maps.find(subresource);if(mapped==id.subresource_maps.end() || mapped->second.pointer!=kept->second.pointer)return false;}
         }
+    }
+    // worker 上的 CreateBuffer：介面物件與引用計數格只取預備槽（take_slot），至少留 4 個且頁面不是寫入時複製頁。
+    if(!coordinator && symbol=="CreateBuffer"){
+        if(!d3d11_worker_create_enabled() || found->second.kind!=Kind::Device || d3d11_->free_slots.size()<4)return false;
+        for(std::size_t i=d3d11_->free_slots.size()-4;i<d3d11_->free_slots.size();++i)
+            if(memory.is_copy_on_write(GuestAddress{d3d11_->free_slots[i]}) || memory.is_copy_on_write(GuestAddress{d3d11_->free_slots[i]+15}))return false;
     }
     // 交換鏈的全螢幕狀態查詢（UE 每幀一次）只讀狀態；要取回輸出時會持有物件參照，交完整路徑。
     if(symbol=="GetFullscreenState")return found->second.kind==Kind::SwapChain && !arg(2);
     // DXGI 工廠的 IsCurrent 只核對物件後回 TRUE（介面卡集合不會變動），不改狀態、不持參照；D3D12 遊戲主迴圈每幀一次，
     // 原本每次全停（《古墓奇兵：暗影》中畫質 4 vCPU 每次約 52～87 µs）。
     if(symbol=="FactoryIsCurrent")return found->second.kind==Kind::Factory;
-    // 只限裝置、裝置內容、資源與 view、著色器、佈局、狀態物件、查詢與 class linkage；交換鏈、工廠、輸出、
-    // DXGI 裝置、多執行緒鎖、反射、命令列表與 D3D10 物件仍走完整服務。
+    // 只限裝置、裝置內容、資源與 view、著色器、佈局、狀態物件、查詢、class linkage 與命令列表；交換鏈、工廠、輸出、
+    // DXGI 裝置、多執行緒鎖、反射與 D3D10 物件仍走完整服務。
     switch(found->second.kind){
     case Kind::Device:case Kind::Context:case Kind::Texture:case Kind::BufferObject:case Kind::Texture1D:case Kind::Texture3D:
     case Kind::ShaderResource:case Kind::Unordered:case Kind::RenderTarget:case Kind::DepthView:
     case Kind::VertexShader:case Kind::PixelShader:case Kind::ComputeShader:case Kind::GeometryShader:case Kind::HullShader:case Kind::DomainShader:
     case Kind::Layout:case Kind::Blend:case Kind::DepthState:case Kind::Raster:case Kind::Sampler:case Kind::Query:case Kind::Predicate:
     case Kind::ClassLinkage:case Kind::ClassInstance:break;
+    case Kind::CommandList:{
+        static const bool command_lists=[] {const auto* value=std::getenv("X64ARM_LOCAL_COMMAND_LISTS");return !value || std::string_view(value)!="0";}();
+        if(!command_lists)return false;break;}
     default:return false;
     }
     const auto& id=*found->second.identity;
-    if(id.api10)return false;
-    const auto device=id.device?d3d11_->objects.find_fast(id.device):found;if(device==d3d11_->objects.end())return false;
-    return !(device->second.identity->protected_threads && device->second.identity->lock_address);
-}catch(const MemoryFault&){return false;}catch(const HostCallFault&){return false;}
+    if(id.api10){d3d11_local_refusal="api10";return false;}
+    const auto device=id.device?d3d11_->objects.find_fast(id.device):found;if(device==d3d11_->objects.end()){d3d11_local_refusal="no-device";return false;}
+    if(device->second.identity->protected_threads && device->second.identity->lock_address){d3d11_local_refusal="multithread-protected";return false;}
+    d3d11_local_refusal=nullptr;return true;
+}catch(const MemoryFault&){d3d11_local_refusal="fault";return false;}catch(const HostCallFault&){d3d11_local_refusal="fault";return false;}
 std::recursive_mutex& WindowsServices::graphics_mutex() noexcept {static std::recursive_mutex value;return value;}
 // 前置快速路徑：完整分派函式內聯了上百個方法與數十個繪製狀態暫存物件，堆疊框架很大，每次呼叫都要逐頁探測
 // 堆疊與初始化；遊戲內 D3D11 呼叫約八成是 COM AddRef／Release 與 GetDesc（DQ3 每秒十餘萬次），在進入完整函式前
@@ -632,13 +747,60 @@ std::recursive_mutex& WindowsServices::graphics_mutex() noexcept {static std::re
 // 延後銷毀清單待處理、比對模式）一律交給完整路徑，例外與錯誤回報不變。X64ARM_D3D11_FRONT_PATH=0 關閉。
 // IA／*Set* 狀態設定同樣先走前置路徑（d3d11_setter_front_path.inc）；X64ARM_D3D11_SETTER_FRONT_PATH=0 只關閉這一段。
 std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
-    // 完整服務要看到佇列裡所有命令的結果（worker、協調者本地與串流執行緒自己都是本地路徑，各有處理）。
-    if(d3d11_stream_ && !graphics_local())d3d11_stream_full_service_sync(service);
+    // 診斷：X64ARM_TRACE_D3D11_FULL=1 統計走完整路徑（非本地）的 D3D11 呼叫：服務、呼叫執行緒、是否串流擁有者、是否串流的立即內容、
+    // 串流是否有擁有者、Map 類型；含排空的整體耗時，每 2 秒輸出一次。
+    static const bool trace_full=std::getenv("X64ARM_TRACE_D3D11_FULL")!=nullptr;
+    struct FullTrace {std::uint64_t start{};std::string key;
+        ~FullTrace(){
+            if(!start)return;
+            static std::mutex lock;static std::map<std::string,std::pair<std::uint64_t,std::uint64_t>> totals;static std::uint64_t next=0;
+            const auto now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);const std::lock_guard guard(lock);
+            auto& entry=totals[key];++entry.first;entry.second+=now-start;
+            if(now>=next){
+                if(next){
+                    std::vector<std::pair<std::uint64_t,std::string>> rows;for(const auto& [k,v]:totals)rows.emplace_back(v.second,k+" n="+std::to_string(v.first));
+                    std::sort(rows.rbegin(),rows.rend());
+                    for(std::size_t i=0;i<std::min<std::size_t>(rows.size(),12);++i)std::fprintf(stderr,"[d3d11_full] %.2f ms %s\n",static_cast<double>(rows[i].first)/1e6,rows[i].second.c_str());
+                }
+                totals.clear();next=now+UINT64_C(2000000000);
+            }
+        }} full_trace{};
+    if(trace_full && d3d11_stream_ && !graphics_local() && service.family=="internal-d3d11"){
+        const auto& stream=*d3d11_stream_;
+        const auto owner=stream.owner.load(std::memory_order_relaxed),context=stream.context.load(std::memory_order_relaxed);
+        std::string key=std::string(service.symbol)+" tid="+std::to_string(resident_context_key(state))+(owner?(state.gs_base==owner?" owner":" other"):" no-owner")+
+            (context && state.reg(Gpr::Rcx)==context?" immediate":" ctx?");
+        if(service.symbol=="Map")key+=" type="+std::to_string(static_cast<std::uint32_t>(state.reg(Gpr::R9)));
+        // 協調者本地完成的呼叫另標記；CreateBuffer 附上用途、綁定、CPU 存取、大小級距與是否有初始資料，用來判斷能否改由 worker 完成。
+        if(graphics_coordinator_local())key+=" local";
+        if(service.symbol=="Map" && d3d11_){
+            const auto resource=d3d11_->objects.find_fast(state.reg(Gpr::Rdx));
+            if(resource!=d3d11_->objects.end() && resource->second.identity){
+                const auto& id=*resource->second.identity;
+                key+=id.kind==Kind::BufferObject?" buffer":" texture";
+                key+=id.persistent_maps.contains(static_cast<std::uint32_t>(state.reg(Gpr::R8)))?" kept":" first";
+            }
+        }
+        if(service.symbol=="CreateBuffer")try{
+            const auto desc=state.reg(Gpr::Rdx);
+            const auto width=static_cast<std::uint32_t>(memory.load(GuestAddress{desc},32));
+            char flags[48];std::snprintf(flags,sizeof flags," bind=0x%x cpu=0x%x",static_cast<unsigned>(memory.load(GuestAddress{desc+8},32)),
+                static_cast<unsigned>(memory.load(GuestAddress{desc+12},32)));
+            key+=" usage="+std::to_string(static_cast<std::uint32_t>(memory.load(GuestAddress{desc+4},32)))+flags+" size<=2^"+
+                 std::to_string(width>1?std::bit_width(width-1):0)+(state.reg(Gpr::R8)?" init":"");
+        }catch(...){}
+        key+=std::string(" refusal=")+(d3d11_local_refusal?d3d11_local_refusal:"none")+" deferred="+std::to_string(d3d11_?d3d11_->deferred_releases.size()/64*64:0);
+        full_trace.key=std::move(key);full_trace.start=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    }
+    // 全停中交給協調者的擁有者呼叫：能排入命令環的由協調者代為排入（見 d3d11_stream_full_enqueue），不排空佇列。
+    if(d3d11_stream_ && !graphics_local() && !graphics_coordinator_local() && d3d11_stream_full_enqueue(state,memory,service))return std::nullopt;
+    // 完整服務要看到佇列裡所有命令的結果（worker、協調者本地與串流執行緒自己都是本地路徑，各有處理）；擁有者自己的 Map／Unmap 只等同一資源。
+    if(d3d11_stream_ && !graphics_local() && !d3d11_stream_owner_resource_sync(state,memory,service))d3d11_stream_full_service_sync(service);
     static const bool front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_FRONT_PATH");return !value || std::string_view(value)!="0";}();
     static const bool setter_front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_SETTER_FRONT_PATH");return front_path && (!value || std::string_view(value)!="0");}();
     static const bool draw_front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_DRAW_FRONT_PATH");return front_path && (!value || std::string_view(value)!="0");}();
     const auto symbol=service.symbol;
-    if(const auto setter=setter_front_path?d3d11_setter_method(symbol):D3D11SetterMethod{};setter.kind!=D3D11Setter::None && d3d11_ && service.family=="internal-d3d11"){
+    if(const auto setter=setter_front_path?d3d11_setter_method(service):D3D11SetterMethod{};setter.kind!=D3D11Setter::None && d3d11_ && service.family=="internal-d3d11"){
         std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         auto& bridge=*d3d11_;
         if(runtime_.network.external_io && (graphics_local() || bridge.deferred_releases.empty())){
@@ -647,7 +809,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
             ++bridge.setter_front_fallbacks;
         }
     }
-    if(const auto method=draw_front_path?d3d11_draw_method(symbol):D3D11DrawMethod::None;method!=D3D11DrawMethod::None && d3d11_ && service.family=="internal-d3d11"){
+    if(const auto method=draw_front_path?d3d11_draw_method(service):D3D11DrawMethod::None;method!=D3D11DrawMethod::None && d3d11_ && service.family=="internal-d3d11"){
         std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         auto& bridge=*d3d11_;
         if(runtime_.network.external_io && (graphics_local() || bridge.deferred_releases.empty())){
@@ -739,6 +901,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         put_word(id->desc,x86_?48:56,1);return true;
     };
     static const bool slot_reuse=[] {const auto* value=std::getenv("X64ARM_D3D11_SLOT_REUSE");return !value || std::string_view(value)!="0";}();
+    // 持久映射區塊依大小保留（見 D3D11State::map_blocks）；不符合條件時由呼叫者照常 free_heap。
+    const auto keep_block=[&](std::uint64_t pointer,std::size_t size)->bool {
+        if(!d3d11_map_block_reuse_enabled() || !size || size>(std::size_t{4}<<20) || bridge.map_block_bytes+size>(std::size_t{64}<<20))return false;
+        const auto live=allocations_.find(pointer);if(live==allocations_.end() || live->second!=size)return false;
+        auto& list=bridge.map_blocks[size];if(list.size()>=512)return false;
+        list.push_back(pointer);bridge.map_block_bytes+=size;return true;
+    };
     // 遞迴釋放不經 std::function：其捕獲超過小物件緩衝，原本每個 D3D11 呼叫都多一次堆積配置。
     const auto release_object=[&](const auto& self,std::uint64_t address,bool internal=false)->void {
         auto id=object(address).identity;const auto references=reference_count(memory,*id);
@@ -784,9 +953,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
                 const auto live=allocations_.find(pointer);
                 if(live!=allocations_.end() && live->second==16){bridge.free_slots.push_back(pointer);continue;}
             }
+            // 持久映射區塊留給下一次同大小的第一次對應。
+            if(const auto kept=std::find_if(id->persistent_maps.begin(),id->persistent_maps.end(),[&](const auto& item){return item.second.pointer==pointer;});
+               kept!=id->persistent_maps.end() && keep_block(pointer,kept->second.size))continue;
             if(!free_heap(memory,pointer,state))throw HostCallFault("D3D11 物件配置已被客體破壞");
         }
         if(bridge.objects.empty() && !bridge.free_slots.empty()){auto slots=std::move(bridge.free_slots);bridge.free_slots.clear();for(const auto slot:slots)(void)free_heap(memory,slot,state);}
+        if(bridge.objects.empty() && !bridge.map_blocks.empty()){
+            auto blocks=std::move(bridge.map_blocks);bridge.map_blocks.clear();bridge.map_block_bytes=0;
+            for(const auto& [size,list]:blocks){(void)size;for(const auto block:list)(void)free_heap(memory,block,state);}
+        }
         if(id->current_view)self(self,id->current_view,true);
         if(id->texture)self(self,id->texture,id->internal_texture);
         if(id->context10){auto context=object(id->context10).identity;context->device=0;self(self,id->context10);}
@@ -844,15 +1020,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         bridge.vtables.emplace(key,pointer);return pointer;
     };
     // 16 bytes 的客體區塊：先取回收槽（清零後與新配置相同），沒有才配置；槽所在頁被客體改過保護時放棄該槽。
+    // worker 與串流執行緒（graphics_local）不配置或釋放 heap：只取預備的槽（d3d11_local_eligible 已核對數量與頁面），不足即失敗。
     const auto take_slot=[&]()->std::uint64_t {
         while(!bridge.free_slots.empty()){
             const auto address=bridge.free_slots.back();bridge.free_slots.pop_back();
             static constexpr std::array<std::uint8_t,16> zero{};
             try{memory.write(GuestAddress{address},std::span<const std::uint8_t>(zero));return address;}
-            catch(const MemoryFault&){(void)free_heap(memory,address,state);}
+            catch(const MemoryFault&){if(graphics_local())throw;(void)free_heap(memory,address,state);}
         }
+        if(graphics_local())throw std::bad_alloc{};
         return allocate_heap(memory,16);
     };
+    const auto return_slot=[&](std::uint64_t address){if(graphics_local())bridge.free_slots.push_back(address);else (void)free_heap(memory,address,state);};
     const auto interface=[&](const std::shared_ptr<Identity>& id,Kind kind) {
         if(id->interfaces.contains(kind))return id->interfaces.at(kind);
         // COM 介面與紋理 array slice 的數量限制無關；配置由客體 heap、
@@ -869,7 +1048,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         try {
             id->interfaces.emplace(kind,pointer);bridge.objects.emplace(pointer,Object{kind,id});
             memory.store(GuestAddress{pointer},pointer_bits,table);memory.store(GuestAddress{pointer+pointer_size},pointer_bits,id->counter);
-        } catch(...) {id->interfaces.erase(kind);bridge.objects.erase(pointer);(void)free_heap(memory,pointer,state);throw;}
+        } catch(...) {id->interfaces.erase(kind);bridge.objects.erase(pointer);return_slot(pointer);throw;}
         id->allocations.push_back(pointer);
         bridge.peak_interfaces=std::max(bridge.peak_interfaces,bridge.objects.size());
         return pointer;
@@ -901,6 +1080,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         if(!graphics_local() && !bridge.deferred_releases.empty()){
             auto pending=std::move(bridge.deferred_releases);bridge.deferred_releases.clear();
             for(const auto& [address,internal]:pending)release_object(release_object,address,internal);
+        }
+        // worker 上的建立方法只取預備槽（take_slot）：協調者本地與完整路徑可配置 heap，低於 256 個時補到 1024 個。
+        if(!graphics_local() && slot_reuse && d3d11_worker_create_enabled() && bridge.free_slots.size()<256 && !bridge.objects.empty()){
+            bridge.free_slots.reserve(1024);
+            while(bridge.free_slots.size()<1024){const auto slot=allocate_heap(memory,16);if(!slot)break;bridge.free_slots.push_back(slot);}
         }
         // COM 的 AddRef／Release 佔呼叫大宗，原本要先比對數百個方法名稱才命中；兩者語義與介面種類無關，先行處理。
         // 仍在同一 try 內，例外與收尾（return_to）與一般路徑相同。
@@ -1070,7 +1254,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
             else if(id->kind==Kind::Fence)supported=guid==IID_ID3D11Fence || guid==IID_ID3D11DeviceChild;
             else if(id->kind==Kind::Decoder)supported=guid==IID_ID3D11VideoDecoder || guid==IID_ID3D11DeviceChild;
             else if(id->kind==Kind::View)supported=guid==IID_ID3D11VideoDecoderOutputView || guid==IID_ID3D11View || guid==IID_ID3D11DeviceChild;
-            else if(id->kind==Kind::Reflection)supported=guid==IID_ID3D11ShaderReflection || guid==IID_ID3D11ShaderReflection43;
+            else if(id->kind==Kind::Reflection)supported=guid==IID_ID3D11ShaderReflection || guid==IID_ID3D11ShaderReflection47 || guid==IID_ID3D11ShaderReflection43 || guid==IID_ID3D12ShaderReflection;
             else if(id->kind==Kind::Blob)supported=guid==IID_ID3D10Blob;
             else if(id->kind==Kind::Factory)supported=dxgi_factory_guid(guid) || guid==IID_IDXGIObject;
             else if(id->kind==Kind::Adapter)supported=dxgi_adapter_guid(guid) || guid==IID_IDXGIObject;
@@ -1120,12 +1304,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
             const bool by_luid=symbol=="EnumAdapterByLuid";const auto riid=arg(by_luid?2:3);const unsigned out=by_luid?3U:4U;
             (void)typed(arg(0),Kind::Factory);output(out);memory.store(GuestAddress{arg(out)},pointer_bits,0);const auto guid=read_guid(memory,riid);
             if(!by_luid && u32(2)>2)result=invalid;
-            else if((by_luid && arg(1)!=display_identity::adapter_luid) || (!by_luid && u32(1)))result=not_found;
+            else if((by_luid && arg(1)!=display_identity::adapter_luid && arg(1)!=display_identity::warp_adapter_luid) || (!by_luid && u32(1)))result=not_found;
             else if(guid!=IID_IUnknown && !dxgi_adapter_guid(guid) && guid!=IID_IDXGIObject)result=no_interface;
-            else memory.store(GuestAddress{arg(out)},pointer_bits,create(Kind::Adapter,arg(0))->root);
+            else {auto adapter=create(Kind::Adapter,arg(0));adapter->warp_adapter=by_luid && arg(1)==display_identity::warp_adapter_luid;memory.store(GuestAddress{arg(out)},pointer_bits,adapter->root);}
         } else if(symbol=="EnumWarpAdapter") {
-            // 沒有軟體光柵器；不以硬體配接器冒充 WARP。
-            (void)typed(arg(0),Kind::Factory);output(2);memory.store(GuestAddress{arg(2)},pointer_bits,0);result=0x887a0004U;
+            // WARP 身分的配接器（見 display_identity::warp_adapter_description）：如實標示為軟體配接器，裝置仍由 Metal 執行。
+            (void)typed(arg(0),Kind::Factory);output(2);memory.store(GuestAddress{arg(2)},pointer_bits,0);const auto guid=read_guid(memory,arg(1));
+            if(guid!=IID_IUnknown && !dxgi_adapter_guid(guid) && guid!=IID_IDXGIObject)result=no_interface;
+            else {auto adapter=create(Kind::Adapter,arg(0));adapter->warp_adapter=true;memory.store(GuestAddress{arg(2)},pointer_bits,adapter->root);}
         } else if(symbol=="FactoryGetCreationFlags"){(void)typed(arg(0),Kind::Factory);result=0;}
         else if(symbol=="FactoryCheckFeatureSupport") {
             // DXGI_FEATURE_PRESENT_ALLOW_TEARING：可變更新率撕裂呈現不支援。
@@ -1172,10 +1358,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
             if(!parent || !supported)result=no_interface;
             else {hold(parent);memory.store(GuestAddress{arg(2)},pointer_bits,parent);}
         } else if(symbol=="AdapterGetDesc" || symbol=="AdapterGetDesc1" || symbol=="AdapterGetDesc2" || symbol=="AdapterGetDesc3") {
-            (void)typed(arg(0),Kind::Adapter);
+            const auto adapter=typed(arg(0),Kind::Adapter);
             if(!arg(1))result=invalid;
             else {
-                const auto desc=display_identity::adapter_description(x86_,gpu_memory_stats().limit);
+                const auto desc=adapter->warp_adapter?display_identity::warp_adapter_description(x86_,gpu_memory_stats().limit):display_identity::adapter_description(x86_,gpu_memory_stats().limit);
                 memory.write(GuestAddress{arg(1)},std::span(desc).first(display_identity::adapter_description_size(symbol,x86_)));
             }
         } else if(symbol=="QueryVideoMemoryInfo" || symbol=="SetVideoMemoryReservation") {

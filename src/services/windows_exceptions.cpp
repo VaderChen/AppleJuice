@@ -578,6 +578,21 @@ std::optional<std::uint32_t> WindowsServices::seh_finally_result(GuestState& sta
     }
     complete_call(state,memory,1);return std::nullopt;
 }
+// invoke_exception 的描述項：登錄與處理函式放在同一個檔案（群組＝路由單位）。
+std::span<const WindowsServiceDescriptor> exception_service_descriptors(){
+    static constexpr WindowsServiceDescriptor table[]{
+        {"crt","__crtUnhandledException",1},{"crt","__crtCapturePreviousContext",1},{"kernel32.dll", "DebugBreak", 0},{"kernel32.dll", "UnhandledExceptionFilter", 1},
+        {"kernel32.dll", "RtlUnwind", 4},{"ntdll.dll", "RtlUnwind", 4},{"kernel32.dll", "RaiseFailFastException", 3},{"kernel32.dll", "RtlAddFunctionTable", 3,1U<<2},
+        {"ntdll.dll", "RtlAddFunctionTable", 3,1U<<2},{"kernel32.dll", "RtlDeleteFunctionTable", 1},{"ntdll.dll", "RtlDeleteFunctionTable", 1},{"kernel32.dll", "RtlInstallFunctionTableCallback", 6},
+        {"ntdll.dll", "RtlInstallFunctionTableCallback", 6},{"ntdll.dll", "RtlAddGrowableFunctionTable", 6},{"ntdll.dll", "RtlGrowFunctionTable", 2},{"ntdll.dll", "RtlDeleteGrowableFunctionTable", 1},
+        {"kernel32.dll", "RaiseException", 4},{"kernel32.dll", "AddVectoredExceptionHandler", 2},{"kernel32.dll", "RemoveVectoredExceptionHandler", 1},{"kernel32.dll", "AddVectoredContinueHandler", 2},
+        {"kernel32.dll", "RemoveVectoredContinueHandler", 1},{"kernel32.dll", "RtlPcToFileHeader", 2},{"ntdll.dll", "RtlPcToFileHeader", 2},{"kernel32.dll", "RtlCaptureContext", 1},
+        {"kernel32.dll", "RtlLookupFunctionEntry", 3},{"kernel32.dll", "RtlVirtualUnwind", 8},{"kernel32.dll", "RtlUnwindEx", 6},{"crt", "_local_unwind", 2},
+        {"crt", "__C_specific_handler", 4},{"kernel32.dll", "__C_specific_handler", 4},{"ntdll.dll", "__C_specific_handler", 4},{"crt", "setjmp", 1},
+        {"crt", "_setjmp", 2},{"crt", "__intrinsic_setjmp", 1},{"crt", "_setjmpex", 2},{"crt", "__intrinsic_setjmpex", 2},
+        {"crt", "longjmp", 2},{"crt", "_setjmp3", 2},{"crt", "_longjmpex", 2},
+    };return table;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state, memory, service); const auto symbol = service.symbol;
     if(x86_ && (symbol.find("setjmp")!=std::string_view::npos || symbol=="longjmp" || symbol=="_longjmpex"))return invoke_x86_jump(state,memory,service);

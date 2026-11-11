@@ -1,3 +1,4 @@
+#include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_calendar.hpp"
 #include "x64arm/windows_gui_abi.hpp"
@@ -17,6 +18,8 @@ namespace x64arm {
 std::span<const WindowsServiceDescriptor> control_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"user32.dll","GetComboBoxInfo",2},
+        {"comctl32.dll","SetWindowSubclass",4},{"comctl32.dll","GetWindowSubclass",4},{"comctl32.dll","RemoveWindowSubclass",3},{"comctl32.dll","DefSubclassProc",4},
+        {"comctl32.dll","__x64arm_master_subclass_proc",4},
         {"comctl32.dll","ImageList_Create",5},{"comctl32.dll","ImageList_Destroy",1},
         {"comctl32.dll","ImageList_ReplaceIcon",3},{"comctl32.dll","ImageList_AddIcon",2},
         {"comctl32.dll","ImageList_AddMasked",3},{"comctl32.dll","ImageList_Add",3},{"comctl32.dll","ImageList_Replace",4},
@@ -433,8 +436,82 @@ void WindowsServices::discard_gui_control_notify(const GuiMessage& msg){
     if(finish_power_notification(msg))return;
     if(msg.message==0x4e && gui_.control_notifications.erase(msg.lparam))gui_.control_notification_buffers.push_back(msg.lparam);
 }
+namespace {
+constexpr std::string_view master_subclass_procedure="__x64arm_master_subclass_proc";
+// 鏈已清空且沒有執行中的子類別程序時，還原原本的 GWLP_WNDPROC（只在目前仍是主程序時還原，不覆蓋應用程式後來自行設定的程序）。
+void release_subclass_chain(GuiState& gui,std::uint64_t window,std::uint64_t master){
+    const auto chain=gui.subclasses.find(window);if(chain==gui.subclasses.end() || !chain->second.entries.empty())return;
+    if(std::any_of(gui.subclass_frames.begin(),gui.subclass_frames.end(),[&](const auto& frame){return frame.window==window;}))return;
+    if(const auto found=gui.windows.find(window);found!=gui.windows.end() && found->second.procedure==master){found->second.procedure=chain->second.restore;found->second.unicode=chain->second.restore_unicode;}
+    gui.subclasses.erase(chain);
+}
+}
 std::optional<std::uint32_t> WindowsServices::invoke_control_api(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol==master_subclass_procedure || service.symbol=="DefSubclassProc"){
+        // 主程序從最上層的子類別開始；DefSubclassProc 從目前執行中那一層的下一層開始，最底層之後交給原程序（CallWindowProcW 處理 ANSI 轉換）。
+        return service_callback::invoke<std::optional<std::uint32_t>>(
+            this,threads_.current,state,memory,service.symbol==master_subclass_procedure?"MasterSubclassProc":"DefSubclassProc",
+            [this](GuestState& state,GuestMemory& memory,std::uint64_t target,std::vector<std::uint64_t> args,std::uint64_t id){
+                start_callbacks(state,memory,{{target,std::move(args)}},Continuation::NestedResult,id);
+            },
+            [this,service=service,master=resolve("comctl32.dll",master_subclass_procedure).value](GuestState& state,GuestMemory& memory)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(state,memory,service);const auto window=call(0),message=call(1),wparam=call(2),lparam=call(3);const auto thread=threads_.current;
+                const bool defer=service.symbol=="DefSubclassProc";std::optional<GuiSubclassEntry> next;std::size_t next_index=0;std::uint64_t original=0;
+                if(const auto chain=gui_.subclasses.find(window);chain!=gui_.subclasses.end()){
+                    original=chain->second.original;const auto& entries=chain->second.entries;std::size_t below=entries.size();
+                    if(defer){
+                        const auto frame=std::find_if(gui_.subclass_frames.rbegin(),gui_.subclass_frames.rend(),[&](const auto& f){return f.thread==thread && f.window==window;});
+                        if(frame==gui_.subclass_frames.rend())below=0;
+                        else {
+                            // 執行中那一層若已被移除，就從它原本的位置往下找。
+                            const auto at=std::find_if(entries.begin(),entries.end(),[&](const auto& e){return e.procedure==frame->procedure && e.id==frame->id;});
+                            below=at!=entries.end()?static_cast<std::size_t>(at-entries.begin()):std::min(frame->index,entries.size());
+                        }
+                    }
+                    if(below){next=entries[below-1];next_index=below-1;}
+                }
+                std::uint64_t value=0;
+                if(next){
+                    gui_.subclass_frames.push_back({thread,window,next->procedure,next->id,next_index});
+                    value=co_await service_callback::call_value(next->procedure,{window,message,wparam,lparam,next->id,next->reference});
+                    const auto frame=std::find_if(gui_.subclass_frames.rbegin(),gui_.subclass_frames.rend(),[&](const auto& f){return f.thread==thread && f.window==window && f.procedure==next->procedure && f.id==next->id;});
+                    if(frame!=gui_.subclass_frames.rend())gui_.subclass_frames.erase(std::next(frame).base());
+                }else if(original)value=co_await service_callback::call_value(resolve("user32.dll","CallWindowProcW").value,{original,window,message,wparam,lparam});
+                else value=co_await service_callback::call_value(resolve("user32.dll","DefWindowProcW").value,{window,message,wparam,lparam});
+                // WM_NCDESTROY：與 comctl32 相同，原程序處理完後自動移除整條鏈。
+                if(!defer && static_cast<std::uint32_t>(message)==0x82)if(const auto chain=gui_.subclasses.find(window);chain!=gui_.subclasses.end())chain->second.entries.clear();
+                release_subclass_chain(gui_,window,master);
+                call.return_to(state,value);co_return std::optional<std::uint32_t>{};
+            });
+    }
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
+    if(symbol=="SetWindowSubclass" || symbol=="GetWindowSubclass" || symbol=="RemoveWindowSubclass"){
+        // 只能對目前執行緒建立的視窗操作；同一 (pfnSubclass, uIdSubclass) 再設定只更新 dwRefData。第一次設定把 GWLP_WNDPROC 換成主程序（Unicode）。
+        const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
+        const auto window=gui_.windows.find(arg(0));
+        if(symbol=="GetWindowSubclass" && arg(3))memory.store(GuestAddress{arg(3)},x86_?32:64,0);
+        if(window==gui_.windows.end() || !arg(1) || window->second.thread!=threads_.current)return finish(0);
+        const auto master=resolve("comctl32.dll",master_subclass_procedure).value;
+        auto chain=gui_.subclasses.find(arg(0));
+        if(chain!=gui_.subclasses.end() && window->second.procedure!=master && chain->second.entries.empty()){gui_.subclasses.erase(chain);chain=gui_.subclasses.end();}
+        if(symbol=="SetWindowSubclass"){
+            if(chain==gui_.subclasses.end()){
+                GuiSubclassChain created;created.original=gui_window_procedure(arg(0),true);created.restore=window->second.procedure;created.restore_unicode=window->second.unicode;
+                chain=gui_.subclasses.emplace(arg(0),std::move(created)).first;window->second.procedure=master;window->second.unicode=true;
+            }
+            auto& entries=chain->second.entries;
+            const auto found=std::find_if(entries.begin(),entries.end(),[&](const auto& e){return e.procedure==arg(1) && e.id==arg(2);});
+            if(found!=entries.end())found->reference=arg(3);
+            else {if(entries.size()>=4096)return finish(0);entries.push_back({arg(1),arg(2),arg(3)});}
+            return finish(1);
+        }
+        if(chain==gui_.subclasses.end())return finish(0);
+        auto& entries=chain->second.entries;
+        const auto found=std::find_if(entries.begin(),entries.end(),[&](const auto& e){return e.procedure==arg(1) && e.id==arg(2);});
+        if(found==entries.end())return finish(0);
+        if(symbol=="GetWindowSubclass"){if(arg(3))memory.store(GuestAddress{arg(3)},x86_?32:64,found->reference);return finish(1);}
+        entries.erase(found);release_subclass_chain(gui_,arg(0),master);return finish(1);
+    }
     const GuiControlAbi abi(x86_);
     const auto d=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
     const auto signed_value=[](std::uint64_t value){return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(value));};

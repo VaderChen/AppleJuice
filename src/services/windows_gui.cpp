@@ -676,6 +676,23 @@ std::optional<std::uint32_t> WindowsServices::advance_gui_modal(GuestState& stat
         if(dispatch_gui_modal_message(state,memory,handle,msg))return std::nullopt;
     }
 }
+// invoke_gui 的描述項：登錄與處理函式放在同一個檔案（群組＝路由單位）。
+std::span<const WindowsServiceDescriptor> gui_core_service_descriptors(){
+    static constexpr WindowsServiceDescriptor table[]{
+        {"user32.dll", "RegisterClassW", 1},{"user32.dll", "RegisterClassExW", 1},{"user32.dll", "RegisterClassA", 1},{"user32.dll", "RegisterClassExA", 1},
+        {"user32.dll", "CreateWindowExW", 12},{"user32.dll", "CreateWindowExA", 12},{"user32.dll", "DefWindowProcW", 4},{"user32.dll", "DefWindowProcA", 4},
+        {"user32.dll", "ShowWindow", 2},{"user32.dll", "AnimateWindow", 3},{"user32.dll", "OpenIcon", 1},{"user32.dll", "UpdateWindow", 1},
+        {"user32.dll", "DestroyWindow", 1},{"user32.dll", "PostQuitMessage", 1},{"user32.dll", "GetMessageW", 4},{"user32.dll", "GetMessageA", 4},
+        {"user32.dll", "PeekMessageW", 5},{"user32.dll", "PeekMessageA", 5},{"user32.dll", "TranslateMessage", 1},{"user32.dll", "DispatchMessageW", 1},
+        {"user32.dll", "DispatchMessageA", 1},{"user32.dll", "SendMessageTimeoutA",7},{"user32.dll", "SendMessageTimeoutW",7},{"user32.dll", "SendMessageW", 4},
+        {"user32.dll", "SendMessageA", 4},{"user32.dll", "SendMessageCallbackA", 6},{"user32.dll", "SendMessageCallbackW", 6},{"user32.dll", "SendNotifyMessageA", 4},
+        {"user32.dll", "SendNotifyMessageW", 4},{"user32.dll", "WaitMessage", 0},{"user32.dll", "PostThreadMessageW", 4},{"user32.dll", "PostThreadMessageA", 4},
+        {"user32.dll", "PostMessageW", 4},{"user32.dll", "PostMessageA", 4},{"user32.dll", "BeginPaint", 2},{"user32.dll", "EndPaint", 2},
+        {"user32.dll", "GetClientRect", 2},{"user32.dll", "InvalidateRect", 3},{"user32.dll", "InvalidateRgn", 3},{"user32.dll", "GetWindowLongPtrW", 2},
+        {"user32.dll", "SetWindowLongPtrW", 3},{"user32.dll", "GetWindowLongPtrA", 2},{"user32.dll", "SetWindowLongPtrA", 3},{"user32.dll", "LoadCursorW", 2},
+        {"user32.dll", "LoadCursorA", 2},{"user32.dll", "GetSystemMetrics", 1},{"gdi32.dll", "GetStockObject", 1},{"gdi32.dll", "CreateSolidBrush", 1},
+    };return table;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
     if(service.symbol=="InvalidateRect" || service.symbol=="InvalidateRgn")return invoke_graphics_compat(state,memory,service);
     if(invoke_remote_gui(state,memory,service))return std::nullopt;
@@ -891,7 +908,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
         if (found == gui_.windows.end()) fail(dc_call ? 6 : 1400);
         else {
             auto& window = found->second;
-            if (symbol == "OpenIcon") {
+            if(symbol=="AnimateWindow"){
+                // AW_HIDE=0x10000、AW_ACTIVATE=0x20000、AW_SLIDE=0x40000、AW_BLEND=0x80000、AW_CENTER=0x10；方向旗標 0xf。
+                // 逐幀動畫只影響過程畫面，最終顯示／啟用狀態與 Windows 相同（SW_HIDE／SW_SHOW／SW_SHOWNA），透過 ShowWindow 共用流程。
+                const auto flags=dword(2);const bool hide=flags&0x10000U,blend=flags&0x80000U,center=flags&0x10U;
+                const bool child=(window.style&0x40000000U)!=0;
+                if((flags&~0xf001fU) || (blend && (center || child)) || (!blend && !center && !(flags&0xfU)))fail(87);
+                else if(hide?!window.visible:window.visible)result=0;
+                else {start_callbacks(state,memory,{{resolve("user32.dll","ShowWindow").value,{handle,hide?0U:flags&0x20000U?5U:8U}}},Continuation::Return,1);return std::nullopt;}
+            } else if (symbol == "OpenIcon") {
                 if(window.show_command!=2)result=1;
                 else {start_callbacks(state,memory,{{resolve("user32.dll","SendMessageW").value,{handle,0x13,0,0}}},Continuation::GuiOpenIcon,handle);return std::nullopt;}
             } else if (symbol == "ShowWindow") {

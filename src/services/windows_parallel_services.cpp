@@ -99,9 +99,17 @@ const ResidentHeap* WindowsServices::borrow_resident_heap(GuestMemory& memory) n
 }
 #endif
 #ifdef X64ARM_HOST_SERVICES_CLOCK_RECIPE
+bool d3d11_stream_resident_scalar(std::size_t runtime_index) noexcept; // windows_d3d11.cpp
+extern thread_local bool d3d11_resident_request_pending; // windows_d3d11.cpp（d3d11_command_stream.inc）
+namespace detail {const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,GuestAddress address) noexcept;}
 ResidentClockRecipe WindowsServices::resident_clock_recipe(GuestAddress address) const noexcept {
     if(!initialized_ || !runtime_.host_clock || !trace_services_.empty() || startup_profile::enabled())
         return ResidentClockRecipe::None;
+    // D3D11 命令串流的純量方法：配方值 4 讓核心改用直接寫環的入口（resident_d3d11_arm64.inc），擁有者以外的呼叫在入口交回原服務。
+    if(!x86_)if(const auto* descriptor=detail::runtime_stub_descriptor(stub_base_,address);
+                descriptor && d3d11_stream_resident_scalar(static_cast<std::size_t>(descriptor-runtime_service_descriptors().data()))){
+        return static_cast<ResidentClockRecipe>(4);
+    }
     const auto symbol=name(address);
     if(symbol=="timeGetTime" || symbol=="GetTickCount")return ResidentClockRecipe::Milliseconds32;
     if(symbol=="GetTickCount64")return ResidentClockRecipe::Milliseconds64;
@@ -193,6 +201,10 @@ bool msvcp_mutex_service(std::string_view symbol) noexcept {
 bool tick_clock_service(std::string_view symbol) noexcept {
     return symbol=="timeGetTime" || symbol=="GetTickCount" || symbol=="GetTickCount64";
 }
+// CRT clock()：程序建立後經過的毫秒（主機時鐘下與 tick 時鐘同一單調時間軸），純讀取。原本交回協調者並觸發全停
+//（《崛起》地熱谷 2 vCPU 每秒約 74 次、4 vCPU 約 92 次，每次全停所有 vCPU 約 85～115 µs）。非主機時鐘時客體時鐘由協調者推進，交回協調者。
+// 與 tick 時鐘同一開關（X64ARM_PARALLEL_TICK_CLOCK=0 關閉）。
+bool crt_clock_service(std::string_view symbol) noexcept {return symbol=="clock";}
 // MSVCP 的 QPC 包裝（std::chrono::steady_clock）：與 worker 上的 QueryPerformanceCounter 同一單調時間軸與 10 MHz 頻率，
 // 純讀取，原本每次往返協調者（電馭判客 Benchmark 計時執行緒每分鐘約 5.6 萬次，每次約 20 µs）。與 tick 時鐘同一開關。
 bool msvcp_clock_service(std::string_view symbol) noexcept {
@@ -269,7 +281,7 @@ bool parallel_tick_clock_enabled() noexcept {
 // 仍交回協調者。Win64 沿用暫存器 ABI，不因擴充 Win32 改變原有資格。
 std::optional<unsigned> context_service_arguments(std::string_view symbol) noexcept {
     if(symbol=="HeapAlloc" || symbol=="HeapFree" || symbol=="HeapSize")return 3;
-    if(symbol=="GetLastError" || symbol=="GetCurrentThreadId" || symbol=="SwitchToThread" || tick_clock_service(symbol) || msvcp_clock_service(symbol))return 0;
+    if(symbol=="GetLastError" || symbol=="GetCurrentThreadId" || symbol=="SwitchToThread" || tick_clock_service(symbol) || crt_clock_service(symbol) || msvcp_clock_service(symbol))return 0;
     if(symbol=="TlsSetValue" || symbol=="FlsSetValue" || symbol=="WaitForSingleObject")return 2;
     if(symbol=="WaitForSingleObjectEx")return 3;
     // Sleep 只在 worker 處理 0 毫秒（與 SwitchToThread 同一讓出判斷）；非零的計時睡眠交回協調者。
@@ -392,7 +404,7 @@ bool crt_file_worker_service(const WindowsServiceDescriptor& descriptor) noexcep
 // 參數故障時交回協調者本地路徑。非指標參數落在 COW 頁只會保守地交回，不影響語義。
 bool graphics_worker_outputs_private(const GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& descriptor) noexcept {
     const auto symbol=descriptor.symbol;
-    if(symbol.find("Get")==std::string_view::npos && !symbol.starts_with("Check") && symbol!="Map")return true;
+    if(symbol.find("Get")==std::string_view::npos && !symbol.starts_with("Check") && !symbol.starts_with("Create") && symbol!="Map" && symbol!="FinishCommandList")return true;
     try{
         // COM 的 this 亦由 WindowsCall 依 Win32 stdcall／Win64 暫存器與堆疊 ABI 取得。
         const WindowsCall arg(state,memory,descriptor);
@@ -405,6 +417,20 @@ bool graphics_worker_outputs_private(const GuestState& state,GuestMemory& memory
         }
     }catch(...){return false;}
     return true;
+}
+// Vulkan 熱點呼叫（命令錄製、描述元集更新、命令緩衝開始／結束／重設、提交、fence／event 狀態）：只經轉換層讀客體參數、
+// 呼叫宿主 MoltenVK，不寫客體記憶體、不改橋接層表格（裝置、記憶體映射、surface 等都在協調者建立）、不阻塞、不啟動回呼；
+// Vulkan 規範要求應用程式自行同步同一物件，MoltenVK 依此可並行。原本每次都經協調者全停（Steel Nomad 每秒約 12 萬次，
+// 2 vCPU 時兩顆都滿、4 vCPU 反而更慢）。x86 的可分派 handle 要查改表格，留在協調者。X64ARM_WORKER_VULKAN=0 關閉。
+static bool vulkan_worker_symbol(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_WORKER_VULKAN");return !value || std::string_view(value)!="0";}();
+    if(!enabled || !symbol.starts_with("vk"))return false;
+    if(symbol.starts_with("vkCmd"))return true;
+    constexpr std::string_view names[]{"vkUpdateDescriptorSets","vkUpdateDescriptorSetWithTemplate","vkUpdateDescriptorSetWithTemplateKHR",
+        "vkBeginCommandBuffer","vkEndCommandBuffer","vkResetCommandBuffer","vkResetCommandPool","vkTrimCommandPool","vkTrimCommandPoolKHR",
+        "vkQueueSubmit","vkQueueSubmit2","vkQueueSubmit2KHR","vkGetFenceStatus","vkResetFences","vkGetEventStatus","vkSetEvent","vkResetEvent",
+        "vkResetDescriptorPool","vkResetQueryPool","vkResetQueryPoolEXT","vkFlushMappedMemoryRanges","vkInvalidateMappedMemoryRanges"};
+    return std::find(std::begin(names),std::end(names),symbol)!=std::end(names);
 }
 bool WindowsServices::parallel_service(GuestAddress address) const noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_PARALLEL_SERVICES");return !setting || std::string_view(setting)!="0";}();
@@ -436,12 +462,13 @@ bool WindowsServices::parallel_service_static(GuestAddress address) const noexce
         static const bool win32=[] {const auto* value=std::getenv("X64ARM_X86_PARALLEL_SERVICES");return !value || std::string_view(value)!="0";}();
         static const bool heap=[] {const auto* value=std::getenv("X64ARM_X86_PARALLEL_HEAP");return !value || std::string_view(value)!="0";}();
         if(symbol=="HeapAlloc" || symbol=="HeapFree" || symbol=="HeapSize")return win32 && heap && guest_heap_chunked_;
-        if(tick_clock_service(symbol))return win32 && parallel_tick_clock_enabled();
+        if(tick_clock_service(symbol) || crt_clock_service(symbol))return win32 && parallel_tick_clock_enabled();
         if(msvcp_clock_service(symbol))return false; // Win32 以 EDX:EAX 返回 64 位元值，留在協調者。
         if(symbol=="WaitForSingleObject" || symbol=="WaitForSingleObjectEx")return win32 && parallel_wait_service(symbol);
         return win32 && context_service_arguments(symbol).has_value() && (!srw_service(symbol) || parallel_srw_enabled());
     }
-    if(tick_clock_service(symbol) || msvcp_clock_service(symbol))return parallel_tick_clock_enabled();
+    if(tick_clock_service(symbol) || crt_clock_service(symbol) || msvcp_clock_service(symbol))return parallel_tick_clock_enabled();
+    if(vulkan_worker_symbol(symbol))return true; // 橋接未就緒時 worker 分支交回協調者。
     if(parallel_peek_service(symbol))return true;
     if(parallel_srw_enabled() && (srw_service(symbol) || msvcp_mutex_service(symbol)))return true;
     if(thrd_tail_service(symbol) || parallel_event_service(symbol) || parallel_wait_service(symbol) || parallel_null_wait_service(symbol) || parallel_semaphore_service(symbol) ||
@@ -488,7 +515,11 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     // D3D11 命令串流：分類與 drain 都在取映射鎖之前，見 d3d11_command_stream.inc。
     if(d3d11_stream_){
         const auto step=d3d11_stream_entry(state,memory);
-        if(step==D3D11StreamStep::Done)return true;
+        if(step==D3D11StreamStep::Done){
+            // 這次排入請求核心登錄常駐入口：回報 CompletedResolve 讓核心 poke 協調者立刻處理（見 d3d11_stream_resident_request）。
+            if(std::exchange(d3d11_resident_request_pending,false))progress=ResidentServiceProgress::CompletedResolve;
+            return true;
+        }
         if(step==D3D11StreamStep::Refuse || step==D3D11StreamStep::Coordinator)return false;
     }
     using Clock=std::chrono::steady_clock;
@@ -523,6 +554,14 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             if(cpu_end>=cpu_start)c.cpu_ns+=cpu_end-cpu_start;
         }
     } count_scope{*this,state.rip.value,start,before_mapping,measure && sample_bits?cpu_time():0,cpu_time};
+    if(!x86_)if(const auto* runtime=detail::runtime_stub_descriptor(stub_base_,state.rip);runtime && runtime->family=="vulkan-1.dll" && vulkan_worker_symbol(runtime->symbol)){
+        // 共用映射鎖下讀客體參數（轉換層的唯讀表格在協調者建立後不再變動）。讀取失敗在呼叫宿主前丟出，交回協調者重做。
+        if(!vulkan_worker_ready()){count_scope.accepted=false;return false;}
+        try{
+            if(invoke_vulkan(state,memory,*runtime))throw std::logic_error("worker 上的 Vulkan 服務意外終止客體");
+        }catch(const MemoryFault&){count_scope.accepted=false;return false;}catch(const HostCallFault&){count_scope.accepted=false;return false;}
+        state.rep_compare={};return true;
+    }
     if(const auto* graphics=graphics_worker_service(state.rip)){
         if(graphics->symbol.starts_with("AdapterGetDesc") && display_identity::parallel_graphics_descriptions()){
             count_scope.accepted=false;
@@ -769,8 +808,30 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         const auto window=memory.native_window(GuestAddress{address},access);
         return window.data && window.after>=size?window.data:nullptr;
     };
-    const auto load=[](const void* source,unsigned size){std::uint64_t value=0;std::memcpy(&value,source,size);return value;};
-    const auto put=[](void* destination,std::uint64_t value,unsigned size){std::memcpy(destination,&value,size);};
+    // 客體欄位可能同時被其他 worker 或協調者讀寫（臨界區段擁有者與遞迴次數、SRW 字組、TEB 錯誤碼等）：依長度以單一
+    // 自然寬度存取（對齊時為單次原子讀寫），不呼叫執行期長度的 memcpy。libc 對小長度可能分段複製而撕裂：x86 臨界區段
+    // 擁有者 0x80000001 釋放中被另一 worker 讀成 0x80000000，該執行緒誤判自己持有而遞迴取得，之後 Leave 中止
+    //（x86 兩執行緒競爭同一臨界區段，2 vCPU 必現；x64 擁有者為 8 位元組，未出現）。
+    const auto load=[](const void* source,unsigned size)->std::uint64_t {
+        const bool aligned=!(reinterpret_cast<std::uintptr_t>(source)&(size-1U));
+        switch(size){
+        case 1:return __atomic_load_n(static_cast<const std::uint8_t*>(source),__ATOMIC_RELAXED);
+        case 2:{if(aligned)return __atomic_load_n(static_cast<const std::uint16_t*>(source),__ATOMIC_RELAXED);std::uint16_t v;std::memcpy(&v,source,2);return v;}
+        case 4:{if(aligned)return __atomic_load_n(static_cast<const std::uint32_t*>(source),__ATOMIC_RELAXED);std::uint32_t v;std::memcpy(&v,source,4);return v;}
+        case 8:{if(aligned)return __atomic_load_n(static_cast<const std::uint64_t*>(source),__ATOMIC_RELAXED);std::uint64_t v;std::memcpy(&v,source,8);return v;}
+        default:{std::uint64_t value=0;std::memcpy(&value,source,std::min(size,8U));return value;}
+        }
+    };
+    const auto put=[](void* destination,std::uint64_t value,unsigned size){
+        const bool aligned=!(reinterpret_cast<std::uintptr_t>(destination)&(size-1U));
+        switch(size){
+        case 1:__atomic_store_n(static_cast<std::uint8_t*>(destination),static_cast<std::uint8_t>(value),__ATOMIC_RELAXED);return;
+        case 2:{const auto v=static_cast<std::uint16_t>(value);if(aligned)__atomic_store_n(static_cast<std::uint16_t*>(destination),v,__ATOMIC_RELAXED);else std::memcpy(destination,&v,2);return;}
+        case 4:{const auto v=static_cast<std::uint32_t>(value);if(aligned)__atomic_store_n(static_cast<std::uint32_t*>(destination),v,__ATOMIC_RELAXED);else std::memcpy(destination,&v,4);return;}
+        case 8:{if(aligned)__atomic_store_n(static_cast<std::uint64_t*>(destination),value,__ATOMIC_RELAXED);else std::memcpy(destination,&value,8);return;}
+        default:std::memcpy(destination,&value,std::min(size,8U));return;
+        }
+    };
     const auto sp=state.reg(Gpr::Rsp);
     auto* stack=pointer(sp,unit,1);if(!stack || sp>UINT64_MAX-unit)return false;
     const auto target=load(stack,unit);
@@ -862,9 +923,23 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         result=symbol=="GetTickCount64"?milliseconds:static_cast<std::uint32_t>(milliseconds);
     }else if(msvcp_clock_service(symbol)){
         result=symbol=="_Query_perf_frequency"?UINT64_C(10000000):detail::monotonic_ticks();
+    }else if(crt_clock_service(symbol)){
+        if(!runtime_.host_clock)return false;
+        const auto origin=runtime_.process_creation_clock_ticks,now=detail::monotonic_ticks();
+        const auto elapsed=now>=origin?(now-origin)/10000:0;
+        result=elapsed>INT32_MAX?UINT32_MAX:elapsed;
     }else if(parallel_semaphore_service(symbol)){
         if(!first){
             auto* error=pointer(thread.teb+error_offset,4,2);if(!error)return false;
+            // 有對 NULL 自旋而停駐的執行緒（見 resident_block_service 的 null_park）：仍回失敗，但累積釋放數的喚醒額度（不超過停駐數），
+            // 由協調者盡快解析，等同那個 semaphore 本來的喚醒作用。
+            if(const auto parked=null_park_.parked.load(std::memory_order_acquire)){
+                const auto add=std::max<std::uint32_t>(1,static_cast<std::uint32_t>(std::max<std::int32_t>(1,std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(second)))));
+                auto tokens=null_park_.tokens.load(std::memory_order_acquire);std::uint32_t next=0;
+                do{next=static_cast<std::uint32_t>(std::min<std::uint64_t>(std::uint64_t{tokens}+add,parked));}
+                while(next!=tokens && !null_park_.tokens.compare_exchange_weak(tokens,next,std::memory_order_acq_rel));
+                if(next!=tokens || tokens)if(!complete_with_resolve(progress))return false;
+            }
             put(error,6,4);if(current)last_error_=6;
             result=0;
         }else{
@@ -1086,14 +1161,37 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         //《Tomb Raider》2013 工作執行緒每秒約 4 萬次 Sleep(0)，原本每次都經協調者往返。
         if(symbol=="Sleep" && (first || !parallel_sleep_zero_enabled()))return false;
         if(active.empty() || state.processor_id>=64)return false;
+        // Sleep(0) 讓出後呼叫者仍就緒：排程器依優先序選人，就緒者優先序都低於呼叫者時會立即選回呼叫者，等同直接返回，
+        // 不必為此交回協調者全停。SwitchToThread 可讓給同處理器任何就緒者（含較低優先序），維持原判斷。
+        //《Tomb Raider》2013 1080p 重場景約 17% 的 Sleep(0) 拒絕屬此類。X64ARM_PARALLEL_SLEEP_ZERO_PRIORITY=0 恢復不分優先序。
+        static const bool by_priority=[] {const auto* value=std::getenv("X64ARM_PARALLEL_SLEEP_ZERO_PRIORITY");return !value || std::string_view(value)!="0";}();
+        const int caller_priority=symbol=="Sleep" && by_priority?thread.effective_priority(runtime_.process_priority_class,runtime_.process_background):INT32_MIN;
         for(const auto& [id,other]:threads_.items){
             if(id==tid || other.status!=ThreadStatus::Runnable || other.suspended ||
                !(other.affinity&(UINT64_C(1)<<state.processor_id)))continue;
+            if(other.effective_priority(runtime_.process_priority_class,runtime_.process_background)<caller_priority)continue;
             // 主 context 位於呼叫端，其餘位於執行緒表。已取得別的 worker 者是
             // running，不能當成目前處理器尚可接手的 ready 執行緒。
             const bool running=id==threads_.current ||
                 std::find(active.begin(),active.end(),&other.context)!=active.end();
-            if(!running)return false;
+            if(!running){
+                // 診斷：X64ARM_TRACE_SLEEP0=1 依擋住讓出的就緒候選狀態分類（停在服務入口、有待處理請求、CPU trap、
+                // 優先序低於呼叫者、其他），每 2^14 次輸出，用來判斷全停後是否真的換得到 vCPU。
+                static const bool trace=std::getenv("X64ARM_TRACE_SLEEP0")!=nullptr;
+                if(trace){
+                    static std::atomic<std::uint64_t> counts[6]{};
+                    const auto pending=resident_service_requests_.find(id);
+                    const unsigned kind=handles(other.context.rip)?0U:(pending!=resident_service_requests_.end() && pending->second==other.context.rip)?1U:
+                        other.context.pending_cpu_trap?2U:other.effective_priority(runtime_.process_priority_class,runtime_.process_background)<
+                        thread.effective_priority(runtime_.process_priority_class,runtime_.process_background)?3U:4U;
+                    counts[kind].fetch_add(1,std::memory_order_relaxed);
+                    if(!(counts[5].fetch_add(1,std::memory_order_relaxed)+1 & 0x3fffU))
+                        std::fprintf(stderr,"[sleep0] stub=%llu pending=%llu trap=%llu lower=%llu other=%llu\n",
+                            static_cast<unsigned long long>(counts[0].load()),static_cast<unsigned long long>(counts[1].load()),static_cast<unsigned long long>(counts[2].load()),
+                            static_cast<unsigned long long>(counts[3].load()),static_cast<unsigned long long>(counts[4].load()));
+                }
+                return false;
+            }
         }
         result=0; // 沒有可接手者；依 Windows 契約不做排程切換。
     }else if(symbol=="_control87" || symbol=="_controlfp"){
@@ -1114,12 +1212,19 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         const bool shared=symbol.ends_with("Shared");
         auto value=lock.load(std::memory_order_acquire);
         if(symbol.starts_with("Release")){
+            // SRW 不交接（X64ARM_PARALLEL_SRW_RETRY=1）：有宿主等待者（bit1）時也在 worker 釋放（保留 bit1），回報 CompletedResolve；
+            // 核心 poke 協調者解析等待（只把最早的等待者改回可執行，見 resolve_thread_waits）、喚醒停駐 slot，並以喚醒加權評估單 slot 搶占，
+            // 被喚醒者及時上 vCPU，釋放者不必往返協調者。協調者本地釋放之後只喚醒停駐 slot、不評估搶占，2 vCPU 被喚醒者要等時間片輪替。
+            static const bool retry=[] {const auto* value=std::getenv("X64ARM_PARALLEL_SRW_RETRY");return value && std::string_view(value)=="1";}();
+            bool wake=false;
             for(;;){
-                // 有等待者時須由原服務喚醒；未持有則交回原路徑回報錯誤。
-                if((value&2) || (shared?!(value>>2):!(value&1))){detail::record_srw(detail::SrwEvent::WorkerDefer);return false;}
+                // 未持有則交回原路徑回報錯誤；有等待者而不能延後解析時須由原服務喚醒。
+                if(shared?!(value>>2):!(value&1)){detail::record_srw(detail::SrwEvent::WorkerDefer);return false;}
+                if((value&2) && (!retry || !complete_with_resolve(progress))){detail::record_srw(detail::SrwEvent::WorkerDefer);return false;}
+                wake=(value&2)!=0;
                 if(lock.compare_exchange_weak(value,shared?value-Word{4}:value&~Word{1},std::memory_order_acq_rel,std::memory_order_acquire))break;
             }
-            detail::record_srw(detail::SrwEvent::WorkerRelease);
+            detail::record_srw(wake?detail::SrwEvent::HostReleaseWake:detail::SrwEvent::WorkerRelease);
         }else{
             // 取得條件與原服務相同（bit1 存在時仍可插隊取得）；Try 不等待，競爭即回 FALSE。
             const bool attempt=symbol.starts_with("Try");const bool spin=!attempt && active.size()>1;

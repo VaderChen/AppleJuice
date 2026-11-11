@@ -24,7 +24,7 @@ std::span<const WindowsServiceDescriptor> shell_service_descriptors() {
         {"internal-shell","IPropertyStore.QueryInterface",3},{"internal-shell","IPropertyStore.AddRef",1},{"internal-shell","IPropertyStore.Release",1},
         {"internal-shell","IPropertyStore.GetCount",2},{"internal-shell","IPropertyStore.GetAt",3},{"internal-shell","IPropertyStore.GetValue",3},{"internal-shell","IPropertyStore.SetValue",3},{"internal-shell","IPropertyStore.Commit",1},
         {"shell32.dll","SHGetKnownFolderPath",4},{"shell32.dll","SHGetKnownFolderIDList",4},
-        {"shell32.dll","SHGetFolderPathA",5},{"shell32.dll","SHGetFolderPathW",5},
+        {"shell32.dll","SHGetFolderPathA",5},{"shell32.dll","SHGetFolderPathW",5},{"shell32.dll","SHGetFolderPathAndSubDirA",6},{"shell32.dll","SHGetFolderPathAndSubDirW",6},{"shell32.dll","SHGetSettings",2},
         {"shfolder.dll","SHGetFolderPathA",5},{"shfolder.dll","SHGetFolderPathW",5},
         {"shell32.dll","SHFileOperationA",1},{"shell32.dll","SHFileOperationW",1},
         {"shell32.dll","SHCloneSpecialIDList",3},{"shell32.dll","SHGetSpecialFolderLocation",3},{"shell32.dll","SHGetFileInfoA",5},{"shell32.dll","SHGetFileInfoW",5},
@@ -241,6 +241,45 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W') || symbol=="SHILCreateFromPath";
     const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):utf8_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
     std::uint64_t result=0;
+    if(symbol=="SHGetSettings"){
+        // SHELLFLAGSTATE 為 4 位元組位元欄位；只改 dwMask 要求的欄位，其餘保留呼叫端內容。來源與 Windows 相同：
+        // HKCU\...\Explorer\Advanced 的 DWORD 設定，以及 Explorer\ShellState（SHELLSTATE 二進位，第 4 位元組起為第一組旗標）；沒有值時採 Windows 10 預設。
+        if(arg(0))try{
+            memory.check(GuestAddress{arg(0)},4,Access::Write);
+            auto flags=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},32));const auto mask=static_cast<std::uint32_t>(arg(1));
+            RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
+            const auto lookup=[&](std::u16string_view path,std::u16string_view name)->const RegistryValue*{
+                if(transaction.error)return nullptr;const auto key=runtime_.registry.keys.find(std::u16string(1,1)+std::u16string(path));if(key==runtime_.registry.keys.end())return nullptr;
+                for(const auto& [entry,value]:key->second){if(entry.size()!=name.size())continue;bool same=true;
+                    for(std::size_t i=0;i<name.size() && same;++i){auto c=entry[i];if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);same=c==name[i];}if(same)return &value;}
+                return nullptr;};
+            const auto dword=[&](std::u16string_view name,std::uint32_t fallback){
+                const auto* value=lookup(u"\\software\\microsoft\\windows\\currentversion\\explorer\\advanced",name);
+                if(!value || value->type!=4 || value->bytes.size()<4)return fallback;const auto& b=value->bytes;
+                return static_cast<std::uint32_t>(b[0])|static_cast<std::uint32_t>(b[1])<<8|static_cast<std::uint32_t>(b[2])<<16|static_cast<std::uint32_t>(b[3])<<24;};
+            std::uint32_t shell_state=0x20U; // fDoubleClickInWebView 預設開啟
+            if(const auto* value=lookup(u"\\software\\microsoft\\windows\\currentversion\\explorer",u"shellstate");value && value->type==3 && value->bytes.size()>=8){
+                const auto& b=value->bytes;shell_state=static_cast<std::uint32_t>(b[4])|static_cast<std::uint32_t>(b[5])<<8|static_cast<std::uint32_t>(b[6])<<16|static_cast<std::uint32_t>(b[7])<<24;}
+            const auto set=[&](std::uint32_t request,unsigned bit,bool on){if(mask&request)flags=on?flags|(1U<<bit):flags&~(1U<<bit);};
+            set(0x1,0,dword(u"hidden",2)==1);            // SSF_SHOWALLOBJECTS
+            set(0x2,1,dword(u"hidefileext",1)==0);       // SSF_SHOWEXTENSIONS
+            set(0x8000,2,(shell_state>>2)&1);            // SSF_NOCONFIRMRECYCLE
+            set(0x20,3,dword(u"showsuperhidden",0)!=0);  // SSF_SHOWSYSFILES
+            set(0x8,4,dword(u"showcompcolor",1)!=0);     // SSF_SHOWCOMPCOLOR
+            set(0x80,5,(shell_state>>5)&1);              // SSF_DOUBLECLICKINWEBVIEW
+            set(0x200,6,(shell_state>>6)&1);             // SSF_DESKTOPHTML
+            set(0x400,7,(shell_state>>7)&1);             // SSF_WIN95CLASSIC
+            set(0x800,8,dword(u"dontprettypath",0)!=0);  // SSF_DONTPRETTYPATH
+            set(0x100,9,dword(u"showattribcol",0)!=0);   // SSF_SHOWATTRIBCOL
+            set(0x1000,10,dword(u"mapnetdrvbtn",0)!=0);  // SSF_MAPNETDRVBUTTON
+            set(0x2000,11,dword(u"showinfotip",1)!=0);   // SSF_SHOWINFOTIP
+            set(0x4000,12,dword(u"hideicons",0)!=0);     // SSF_HIDEICONS
+            set(0x800000,13,dword(u"autocheckselect",0)!=0); // SSF_AUTOCHECKSELECT
+            set(0x1000000,14,dword(u"iconsonly",0)!=0);  // SSF_ICONSONLY
+            memory.store(GuestAddress{arg(0)},32,flags);
+        }catch(const MemoryFault&){}
+        arg.return_to(state,0);return std::nullopt;
+    }
     if(symbol=="SHGetMalloc" || symbol=="CoGetMalloc" || symbol.starts_with("IMalloc.")){
         const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
         const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
@@ -630,14 +669,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
             result=hresult(error);
         }
     }else if(symbol.starts_with("SHGetFolderPath") || symbol.starts_with("SHGetSpecialFolderPath")){
-        const bool special=symbol.starts_with("SHGetSpecial");const auto flags=static_cast<std::uint32_t>(arg(special?2:1));const auto output=arg(special?1:4);
-        const bool create=(flags&0x8000) || (special && arg(3));const auto path=known_folder(flags&0xff);
+        // SHGetFolderPathAndSubDir：在資料夾後接相對子目錄 pszSubDir（可多層），CSIDL_FLAG_CREATE 時連子目錄一併建立；子目錄不可為絕對路徑。
+        const bool special=symbol.starts_with("SHGetSpecial"),with_subdir=symbol.starts_with("SHGetFolderPathAndSubDir");const auto flags=static_cast<std::uint32_t>(arg(special?2:1));const auto output=arg(special?1:with_subdir?5:4);
+        const bool create=(flags&0x8000) || (special && arg(3));auto path=known_folder(flags&0xff);
         std::uint32_t error=0;
+        const auto subdir=with_subdir?read(arg(4)):std::u16string{};
         if(!output || (flags&~0xc8ffU) || (!special && (arg(2) || arg(3)>1)))error=87;
+        else if(subdir.size()>=248 || (!subdir.empty() && (subdir.front()==u'\\' || subdir.front()==u'/' || subdir.find(u':')!=subdir.npos)))error=87;
         else if(path.empty())error=50;
         else {
+            if(!subdir.empty()){path+=u'\\';for(auto c:subdir)path.push_back(c==u'/'?u'\\':c);while(path.size()>3 && path.back()==u'\\')path.pop_back();}
+            if(path.size()>=260)error=206;
             memory.store(GuestAddress{output},wide?16:8,0);
-            if(create){
+            if(error){}
+            else if(create){
                 for(std::size_t at=3;at<=path.size();++at)if(at==path.size() || path[at]==u'\\'){
                     const auto prefix=utf16_to_utf8(path.substr(0,at));const auto info=filesystem_.information(prefix);
                     if(info.error){error=filesystem_.create_directory(prefix);if(error && error!=183)break;error=0;}

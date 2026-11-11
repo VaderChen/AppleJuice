@@ -27,12 +27,20 @@
                 const auto pitch=d.dimension==1?std::array{d.width,1U}:graphics_format_pitch(d.format,std::max(1U,d.width>>view.level),std::max(1U,d.height>>view.level));
                 const auto size=std::uint64_t{pitch[0]}*pitch[1]*std::max(1U,d.depth>>view.level);require(size && size<=512U*1024U*1024U);
                 auto& map=context->deferred_maps[key];map.view=view;map.row=pitch[0];map.image=pitch[0]*pitch[1];if(type==4)map.bytes.assign(size,0);
-                const auto pointer=allocate_heap(memory,size);if(!pointer)throw std::bad_alloc{};context->allocations.push_back(pointer);map.pointer=pointer;memory.write(GuestAddress{pointer},map.bytes);
+                // 先取同大小的保留區塊（map_blocks，Unmap 時放回）：worker 只能從這裡取，d3d11_local_eligible 已核對區塊存在且不是寫入時複製頁。
+                std::uint64_t pointer=0;
+                if(const auto reuse=bridge.map_blocks.find(static_cast<std::size_t>(size));d3d11_map_block_reuse_enabled() && reuse!=bridge.map_blocks.end() && !reuse->second.empty()){
+                    pointer=reuse->second.back();reuse->second.pop_back();bridge.map_block_bytes-=static_cast<std::size_t>(size);
+                }else if(graphics_local())throw std::bad_alloc{};
+                else pointer=allocate_heap(memory,size);
+                if(!pointer)throw std::bad_alloc{};context->allocations.push_back(pointer);map.pointer=pointer;memory.write(GuestAddress{pointer},map.bytes);
                 write_pointer(arg(5),pointer);memory.store(GuestAddress{arg(5)+pointer_size},32,map.row);memory.store(GuestAddress{arg(5)+pointer_size+4},32,map.image);
             }else{
                 const auto found=context->deferred_maps.find(key);require(found!=context->deferred_maps.end() && found->second.pointer);auto& map=found->second;
                 map.bytes=read_bytes(memory,map.pointer,map.bytes.size());const auto row=map.row,image=map.image;
                 submit(context,{[view,data=map.bytes,row,image](auto& native){native.graphics_write(view,data,row,image);}});
-                require(free_heap(memory,map.pointer,state));std::erase(context->allocations,map.pointer);map.pointer=0;
+                // 區塊放回 map_blocks 給下一次同大小的 Map；放不下時照常釋放（worker 上由 d3d11_local_eligible 保證放得下）。
+                if(!keep_block(map.pointer,map.bytes.size())){if(graphics_local())throw HostCallFault("worker 上的延遲 Unmap 無法保留區塊");require(free_heap(memory,map.pointer,state));}
+                std::erase(context->allocations,map.pointer);map.pointer=0;
             }
         }

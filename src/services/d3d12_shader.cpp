@@ -85,8 +85,8 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
         }
         if(table && (d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV || d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER))
             throw std::invalid_argument("現代著色器尚不支援常數緩衝或取樣器的描述元表");
-        if(!table && d.register_space)throw std::invalid_argument("現代著色器尚不支援非零 register space 的離散描述元");
-        if(d.flags&VKD3D_SHADER_DESCRIPTOR_INFO_FLAG_UAV_COUNTER)throw std::invalid_argument("現代著色器尚不支援 UAV counter");
+        // UAV 計數器（IncrementCounter／Append 等）：離散的單一結構化 UAV 另給一個計數器 binding（見下方 counters）。
+        if((d.flags&VKD3D_SHADER_DESCRIPTOR_INFO_FLAG_UAV_COUNTER) && (table || d.count!=1))throw std::invalid_argument("現代著色器尚不支援描述元表或陣列的 UAV counter");
         vkd3d_shader_resource_binding binding{};binding.type=d.type;binding.register_space=d.register_space;binding.register_index=d.register_index;
         binding.shader_visibility=VKD3D_SHADER_VISIBILITY_ALL;binding.binding.set=0;binding.binding.count=spilled?std::max(d.count,2U):d.count;
         binding.flags=d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER?0U:buffer?VKD3D_SHADER_BINDING_FLAG_BUFFER:VKD3D_SHADER_BINDING_FLAG_IMAGE;
@@ -94,15 +94,26 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
         if(spilled){overflow.push_back(binding);overflow_descriptors.push_back(descriptor);continue;}
         binding.binding.binding=static_cast<unsigned>(bindings.size());by_binding.emplace(binding.binding.binding,descriptor);bindings.push_back(binding);
     }
+    // UAV 計數器 binding 排在所有描述元之後；SPIRV-Cross 反射到這些 binding 時配置 Metal 緩衝索引，再寫入對應 UAV 綁定的 counter_slot。
+    std::vector<vkd3d_shader_uav_counter_binding> counters;std::map<unsigned,std::pair<unsigned,unsigned>> counter_registers;
+    std::map<std::pair<unsigned,unsigned>,unsigned> counter_native;
     std::vector<std::size_t> order(overflow.size());for(std::size_t i=0;i<order.size();++i)order[i]=i;
     std::sort(order.begin(),order.end(),[&](std::size_t a,std::size_t b){return overflow[a].register_index>overflow[b].register_index;});
     for(const auto i:order){auto binding=overflow[i];binding.binding.binding=static_cast<unsigned>(bindings.size());by_binding.emplace(binding.binding.binding,overflow_descriptors[i]);bindings.push_back(binding);}
+    for(unsigned i=0;i<scan.descriptors.descriptor_count;++i){
+        const auto& d=scan.descriptors.descriptors[i];if(!(d.flags&VKD3D_SHADER_DESCRIPTOR_INFO_FLAG_UAV_COUNTER))continue;
+        vkd3d_shader_uav_counter_binding counter{};counter.register_space=d.register_space;counter.register_index=d.register_index;
+        counter.shader_visibility=VKD3D_SHADER_VISIBILITY_ALL;counter.binding.set=0;counter.binding.count=1;
+        counter.binding.binding=static_cast<unsigned>(bindings.size()+counters.size());
+        counter_registers.emplace(counter.binding.binding,std::pair<unsigned,unsigned>{d.register_space,d.register_index});counters.push_back(counter);
+    }
     // 描述元表（bindless）需要動態索引描述元陣列：開啟 EXT_descriptor_indexing，SPIRV-Cross 再以執行期陣列輸出。
     static constexpr vkd3d_shader_spirv_extension extensions[]{VKD3D_SHADER_SPIRV_EXTENSION_EXT_DESCRIPTOR_INDEXING};
     vkd3d_shader_spirv_target_info target{};target.type=VKD3D_SHADER_STRUCTURE_TYPE_SPIRV_TARGET_INFO;target.environment=VKD3D_SHADER_SPIRV_ENVIRONMENT_VULKAN_1_1;
     target.extensions=extensions;target.extension_count=1;
     vkd3d_shader_interface_info interface{};interface.type=VKD3D_SHADER_STRUCTURE_TYPE_INTERFACE_INFO;interface.next=&target;
-    interface.bindings=bindings.data();interface.binding_count=static_cast<unsigned>(bindings.size());info.next=&interface;
+    interface.bindings=bindings.data();interface.binding_count=static_cast<unsigned>(bindings.size());
+    interface.uav_counters=counters.data();interface.uav_counter_count=static_cast<unsigned>(counters.size());info.next=&interface;
     if(vkd3d_shader_compile(&info,&scan.code,&scan.messages)<0){scan.code={};throw std::invalid_argument("現代著色器轉譯失敗："+std::string(scan.messages?scan.messages:""));}
     std::vector<std::uint32_t> words(scan.code.size/4);std::memcpy(words.data(),scan.code.code,words.size()*4);
     // 診斷：X64ARM_DUMP_SPIRV=<目錄> 保存 vkd3d 輸出的 SPIR-V（檔名為內容雜湊），供 spirv-dis 檢查。
@@ -122,19 +133,44 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
     // 離散 UAV 緩衝可能來自根描述元，不能改走描述元表；暫存器超出 u7 時改用本著色器未占用的 u0–u7 slot，
     // 綁定保存原始暫存器，執行期依此放置 view。
     std::array<bool,8> uav_used{};
-    for(const auto& [binding,d]:by_binding)if(d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV && !d.table)
+    for(const auto& [binding,d]:by_binding)if(d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV && !d.table && !d.space)
         for(unsigned j=0;j<d.count;++j)if(d.register_index+j<8)uav_used[d.register_index+j]=true;
     const auto uav_slot=[&](unsigned reg)->std::pair<unsigned,unsigned>{
         if(reg<8)return {reg,UINT32_MAX};
         for(unsigned slot=0;slot<8;++slot)if(!uav_used[slot]){uav_used[slot]=true;return {slot,reg};}
         throw std::invalid_argument("現代著色器的離散 UAV 超出 8 個槽位");
     };
+    // 非零 register space 的離散描述元：共用後端的 b／t／s／u 槽位沒有 space，改用本著色器 space 0 未占用的槽位；
+    // 綁定保存原始 (space, register)，執行期依根簽章找到對應的根參數或表範圍後放入該槽位。
+    std::array<bool,15> constant_used{};std::array<bool,128> resource_used{};std::array<bool,16> sampler_used{};
+    for(const auto& [binding,d]:by_binding)if(!d.table && !d.space)for(unsigned j=0;j<d.count;++j){
+        const auto reg=d.register_index+j;
+        if(d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV && reg<constant_used.size())constant_used[reg]=true;
+        else if(d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SRV && reg<resource_used.size())resource_used[reg]=true;
+        else if(d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER && reg<sampler_used.size())sampler_used[reg]=true;
+    }
+    const auto spaced_slot=[&](vkd3d_shader_descriptor_type type)->unsigned{
+        const auto take=[](auto& used,const char* what)->unsigned{
+            for(unsigned slot=0;slot<used.size();++slot)if(!used[slot]){used[slot]=true;return slot;}
+            throw std::invalid_argument(std::string("現代著色器的非零 space ")+what+" 超出槽位");
+        };
+        if(type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV)return take(constant_used,"常數緩衝");
+        if(type==VKD3D_SHADER_DESCRIPTOR_TYPE_SRV)return take(resource_used,"SRV");
+        if(type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER)return take(sampler_used,"取樣器");
+        return take(uav_used,"UAV");
+    };
     // 依 SPIRV-Cross 反射的實際資源型別分配 Metal 索引，與宣告順序無關。
     unsigned next_buffer=0,next_texture=0,next_sampler=0;
     const auto assign=[&](const spirv_cross::SmallVector<spirv_cross::Resource>& resources,unsigned group){
         for(const auto& resource:resources){
             const auto binding=compiler.get_decoration(resource.id,spv::DecorationBinding);const auto found=by_binding.find(binding);
-            if(found==by_binding.end())throw std::invalid_argument("現代著色器資源缺少 D3D 描述元");
+            if(found==by_binding.end()){
+                const auto counter=counter_registers.find(binding);
+                if(counter==counter_registers.end() || group!=1)throw std::invalid_argument("現代著色器資源缺少 D3D 描述元");
+                spirv_cross::MSLResourceBinding mapping{};mapping.stage=model;mapping.desc_set=0;mapping.binding=binding;mapping.count=1;
+                mapping.msl_buffer=next_buffer;compiler.add_msl_resource_binding(mapping);counter_native[counter->second]=next_buffer++;
+                continue;
+            }
             const auto& d=found->second;unsigned kind=0,native=0;
             spirv_cross::MSLResourceBinding mapping{};mapping.stage=model;mapping.desc_set=0;mapping.binding=binding;mapping.count=d.count;
             if(d.table){
@@ -150,7 +186,9 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
             else {kind=2;native=next_sampler;next_sampler+=d.count;mapping.msl_sampler=native;}
             compiler.add_msl_resource_binding(mapping);
             for(unsigned j=0;j<d.count;++j){
-                const auto [slot,source]=kind==4?uav_slot(d.register_index+j):std::pair<unsigned,unsigned>{d.register_index+j,UINT32_MAX};
+                const auto reg=d.register_index+j;
+                if(d.space){result.bindings.push_back({kind,spaced_slot(d.type),native+j,UINT32_MAX,d.space,0,reg});continue;}
+                const auto [slot,source]=kind==4?uav_slot(reg):std::pair<unsigned,unsigned>{reg,UINT32_MAX};
                 result.bindings.push_back({kind,slot,native+j,UINT32_MAX,0,0,source});
             }
         }
@@ -158,6 +196,10 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
     const auto resources=compiler.get_shader_resources();
     assign(resources.uniform_buffers,0);assign(resources.storage_buffers,1);
     assign(resources.separate_images,2);assign(resources.storage_images,2);assign(resources.separate_samplers,3);
+    for(auto& b:result.bindings)if(b.type==4){
+        const auto reg=b.source!=UINT32_MAX?b.source:b.slot;
+        if(const auto found=counter_native.find({b.space,reg});found!=counter_native.end())b.counter_slot=found->second;
+    }
     if(next_buffer>31 || next_texture>128 || next_sampler>16)throw std::invalid_argument("現代著色器資源超出 Metal 綁定上限");
     if(stage==0)for(const auto& input:resources.stage_inputs){
         // 頂點屬性位置即 D3D 輸入簽章暫存器；以語意供 input layout 對應。
@@ -173,7 +215,7 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
 }
 namespace {
 // 跨程序快取的記錄格式（格式版本、MSL、入口、綁定、頂點輸入、執行緒群組大小）；欄位全部以小端 32 位元長度前綴。
-constexpr std::uint32_t modern_record_version=1;
+constexpr std::uint32_t modern_record_version=2; // 2：非零 space 與 UAV 計數器綁定。
 std::vector<std::uint8_t> encode_modern_shader(const GraphicsModernShader& shader){
     std::vector<std::uint8_t> out;out.reserve(shader.source.size()+shader.bindings.size()*28+256);
     const auto put=[&](std::uint32_t value){const auto* bytes=reinterpret_cast<const std::uint8_t*>(&value);out.insert(out.end(),bytes,bytes+4);};

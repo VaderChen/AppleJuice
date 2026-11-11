@@ -12,11 +12,14 @@
 namespace x64arm {
 namespace {
 struct NativeError {std::uint32_t status;};
+// \Device\NamedPipe\ 目錄 handle 在檔案表中的識別鍵（不對應宿主路徑）。
+constexpr std::string_view nt_pipe_root_key="\\Device\\NamedPipe\\";
 std::uint32_t nt_status(std::uint32_t error){
     switch(error){case 0:return 0;case 1:return 0xc0000010U;case 2:return 0xc0000034U;case 3:return 0xc000003aU;case 5:return 0xc0000022U;case 6:return 0xc0000008U;
     case 8:return 0xc0000017U;case 19:return 0xc00000a2U;case 24:return 0xc0000004U;case 32:return 0xc0000043U;case 33:return 0xc0000054U;case 38:return 0xc0000011U;
     case 50:return 0xc00000bbU;case 80:case 183:return 0xc0000035U;case 87:return 0xc000000dU;case 109:return 0xc000014bU;
     case 112:return 0xc000007fU;case 122:return 0xc0000023U;case 123:return 0xc0000033U;case 193:return 0xc000007bU;case 234:return 0x80000005U;case 267:return 0xc0000103U;
+    case 230:return 0xc00000adU;case 231:return 0xc00000abU;case 232:return 0xc00000b1U;case 233:return 0xc00000b0U;case 535:return 0xc00000b2U;case 536:return 0xc00000b3U;
     case 288:return 0xc0000046U;case 298:return 0xc0000047U;case 995:return 0xc0000120U;case 997:return 0x103U;case 998:return 0xc0000005U;
     case 1006:return 0xc000011eU;case 1008:return 0xc000007cU;case 1018:return 0xc000017cU;case 1117:return 0xc0000185U;case 1168:return 0xc0000225U;case 1237:return 0xc000022dU;case 1305:return 0xc0000058U;case 1306:return 0xc0000059U;
     case 1307:return 0xc000005aU;case 1308:return 0xc000005bU;case 1309:return 0xc00000a8U;case 1314:return 0xc0000061U;
@@ -72,6 +75,9 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         {"ntdll.dll","NtDuplicateObject",7,0,0,0x70},{"ntdll.dll","NtWaitForSingleObject",3,0,0,0x2},{"ntdll.dll","NtQueryMutant",5,0,0,0xa},{"ntdll.dll","NtSignalAndWaitForSingleObject",4,0,0,0x4},
         {"ntdll.dll","NtWaitForMultipleObjects",5,0,0,0xd},{"ntdll.dll","NtWaitForMultipleObjects32",5,0,0,0xd},
         {"ntdll.dll","NtSuspendThread",2},{"ntdll.dll","NtResumeThread",2},
+        // NtCreateNamedPipeFile：DesiredAccess、ShareAccess、CreateDisposition、CreateOptions、管道型態／讀取／完成模式、實例數與配額皆為 ULONG。
+        {"ntdll.dll","NtCreateNamedPipeFile",14,0,0,0x1ff2},{"ntdll.dll","ZwCreateNamedPipeFile",14,0,0,0x1ff2},
+        {"ntdll.dll","NtGetContextThread",2},{"ntdll.dll","ZwGetContextThread",2},{"ntdll.dll","NtSetContextThread",2},{"ntdll.dll","ZwSetContextThread",2},
         {"ntdll.dll","NtCreateSection",7,0,0,0x32},{"ntdll.dll","NtOpenSection",3,0,0,0x2},{"ntdll.dll","NtMapViewOfSection",10,0,0,0x380},
         {"ntdll.dll","NtFlushVirtualMemory",4},{"ntdll.dll","NtExtendSection",2},{"ntdll.dll","NtMapViewOfSectionEx",9,0,0,0x160},
         {"ntdll.dll","RtlCreateHeap",6,0,0,0x1},{"ntdll.dll","RtlDestroyHeap",1},
@@ -254,7 +260,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
         return invoke_file_readwrite(state,memory,service);
     }
     if(service.symbol=="NtLockFile" || service.symbol=="NtUnlockFile")return invoke_file_lock(state,memory,service);
-    if(service.symbol=="NtSuspendThread" || service.symbol=="NtResumeThread")return invoke_thread_control(state,memory,service);
+    if(service.symbol=="NtSuspendThread" || service.symbol=="NtResumeThread" || service.symbol.ends_with("tContextThread"))return invoke_thread_control(state,memory,service);
     const WindowsCall call(state,memory,service);const auto name=service.symbol;const auto saved_error=last_error_;const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto finish=[&](std::uint64_t status){if(name.starts_with("Nt"))threads_.items.at(threads_.current).last_native_status=static_cast<std::uint32_t>(status);last_error_=saved_error;call.return_to(state,status);return std::optional<std::uint32_t>{};};
     const auto failure=[&](std::uint32_t status){return finish(name=="RtlDosPathNameToNtPathName_U" || name=="RtlGetFullPathName_U" || name=="RtlDetermineDosPathNameType_U" || name=="RtlIsDosDeviceName_U"?0:status);};
@@ -508,8 +514,63 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             for(const auto& [offset,value]:std::array<std::pair<unsigned,std::uint64_t>,4>{{{0,m.created},{8,m.accessed},{16,m.modified},{24,m.changed}}})memory.store(GuestAddress{call(1)+offset},64,value);
             if(full){memory.store(GuestAddress{call(1)+32},64,m.allocation_size);memory.store(GuestAddress{call(1)+40},64,m.size);}memory.store(GuestAddress{call(1)+(full?48:32)},32,m.attributes);return finish(0);
         }
+        if(name=="NtCreateNamedPipeFile" || name=="ZwCreateNamedPipeFile"){
+            // 管道伺服端：NT 名稱（\Device\NamedPipe\、\??\pipe\、\DosDevices\pipe\、\GLOBAL??\pipe\）轉成 \\.\pipe\ 後沿用
+            // CreateNamedPipeW 的跨程序命名空間、安全描述元、實例數與首實例契約。FILE_CREATE 對應 FILE_FLAG_FIRST_PIPE_INSTANCE，
+            // FILE_OPEN_IF 為一般建立；FILE_OPEN（只加開既有管道的實例）與相對管道目錄 handle 的匿名管道未開放，明確回報。
+            memory.check(GuestAddress{call(0)},unit,Access::Write);memory.check(GuestAddress{call(3)},unit*2,Access::Write);
+            const auto attr=object_attributes(memory,call(2),x86_,false,true);
+            const auto access=static_cast<std::uint32_t>(call(1)),share=static_cast<std::uint32_t>(call(4)),disposition=static_cast<std::uint32_t>(call(5)),options=static_cast<std::uint32_t>(call(6));
+            const auto type=static_cast<std::uint32_t>(call(7)),read_mode=static_cast<std::uint32_t>(call(8)),completion=static_cast<std::uint32_t>(call(9)),instances=static_cast<std::uint32_t>(call(10));
+            const auto upper=[](std::u16string_view text){std::u16string out(text);for(auto& c:out)c=windows_path_upper(c);return out;};
+            std::u16string pipe;
+            if(attr.root){
+                // 相對於 \Device\NamedPipe\ 目錄 handle（kernelbase CreatePipe 與自行實作的匿名管道）：空名稱產生程序內唯一的匿名名稱。
+                const auto root=files_.find(attr.root);
+                if(root==files_.end())return finish(object_type(attr.root).empty()?0xc0000008U:0xc0000024U);
+                if(root->second.key!=nt_pipe_root_key)return finish(0xc0000024U);
+                if(attr.name.find(u'\\')!=attr.name.npos || attr.name.find(u'\0')!=attr.name.npos)return finish(0xc0000033U);
+                if(attr.name.empty()){
+                    static std::atomic<std::uint32_t> serial{0};char text[40];
+                    std::snprintf(text,sizeof text,"Win32Pipes.%08x.%08x",static_cast<unsigned>(process_id()),static_cast<unsigned>(++serial));
+                    pipe=utf8_to_utf16(text);
+                }else pipe=attr.name;
+            }else
+            for(const std::u16string_view prefix:{std::u16string_view{u"\\DEVICE\\NAMEDPIPE\\"},std::u16string_view{u"\\??\\PIPE\\"},std::u16string_view{u"\\DOSDEVICES\\PIPE\\"},std::u16string_view{u"\\GLOBAL??\\PIPE\\"}})
+                if(attr.name.size()>prefix.size() && upper(std::u16string_view(attr.name).substr(0,prefix.size()))==prefix){pipe=attr.name.substr(prefix.size());break;}
+            if(pipe.empty() || pipe.find(u'\0')!=pipe.npos)return finish(0xc0000033U);
+            const bool reading=access&(1U|0x80000000U|0x10000000U),writing=access&(2U|0x40000000U|0x10000000U);
+            if((!reading && !writing) || (share&~7U) || type>1 || read_mode>1 || completion>1 || (read_mode && !type) || !instances ||
+               (instances>254 && instances!=UINT32_MAX) || (options&~0x32U) || (options&0x30U)==0x30U)return finish(0xc000000dU);
+            if(disposition!=2 && disposition!=3)return finish(disposition==1?0xc00000bbU:0xc000000dU);
+            std::uint32_t timeout=0;
+            if(call(13)){
+                const auto interval=static_cast<std::int64_t>(memory.load(GuestAddress{call(13)},64));
+                if(interval>0)return finish(0xc000000dU);
+                timeout=static_cast<std::uint32_t>(std::min<std::uint64_t>((static_cast<std::uint64_t>(-interval)+9999)/10000,UINT32_MAX-1U));
+            }
+            const auto open_mode=(reading?1U:0U)|(writing?2U:0U)|(access&0x10c0000U)|((options&0x30U)?0U:0x40000000U)|((options&2U)?0x80000000U:0U)|(disposition==2?0x80000U:0U);
+            const auto pipe_mode=(type?4U:0U)|(read_mode?2U:0U)|(completion?1U:0U);
+            const auto full=u"\\\\.\\pipe\\"+pipe;
+            const auto at=scratch(128+full.size()*2+2);memory.write(GuestAddress{at+128},utf16_bytes(full));security(attr,at);
+            op.information=2;
+            return start("kernel32.dll","CreateNamedPipeW",{at+128,open_mode,pipe_mode,instances==UINT32_MAX?255U:instances,call(12),call(11),timeout,at});
+        }
         if(name=="NtCreateFile" || name=="NtOpenFile"){
-            const bool create=name=="NtCreateFile";const auto attr=object_attributes(memory,call(2),x86_,false,true);const auto file=path(attr);const auto options=static_cast<std::uint32_t>(call(create?8:5)),disposition=create?static_cast<std::uint32_t>(call(7)):1U;
+            const bool create=name=="NtCreateFile";const auto attr=object_attributes(memory,call(2),x86_,false,true);
+            // 管道檔案系統根目錄 \Device\NamedPipe\：回傳目錄 handle，供 NtCreateNamedPipeFile 以相對名稱建立（含匿名管道）。
+            const auto upper_name=[&]{std::u16string out(attr.name);for(auto& c:out)c=windows_path_upper(c);return out;}();
+            if(!attr.root && (upper_name==u"\\DEVICE\\NAMEDPIPE\\" || upper_name==u"\\DEVICE\\NAMEDPIPE")){
+                memory.check(GuestAddress{call(0)},unit,Access::Write);memory.check(GuestAddress{call(3)},unit*2,Access::Write);
+                FileHandle root;root.key=std::string(nt_pipe_root_key);root.path=root.key;root.metadata.attributes=0x10;root.access=static_cast<std::uint32_t>(call(1));
+                root.bytes=std::make_shared<const std::vector<std::uint8_t>>();
+                const auto handle=runtime_.allocate_wait_handle();root.object=handle;files_.emplace(handle,std::move(root));runtime_.handle_flags[handle]=(attr.flags&2U)?1U:0U;
+                memory.store(GuestAddress{call(0)},bits,handle);memory.store(GuestAddress{call(3)},bits,0);memory.store(GuestAddress{call(3)+unit},bits,1);
+                return finish(0);
+            }
+            // 以管道 handle 為根、名稱空白：開啟同一管道的另一端（kernelbase CreatePipe 取得寫入端的方式）。
+            const auto pipe_root=attr.root && attr.name.empty()?files_.find(attr.root):files_.end();
+            const auto file=pipe_root!=files_.end() && pipe_root->second.pipe?u"\\\\.\\pipe"+pipe_root->second.pipe->file_name():path(attr);const auto options=static_cast<std::uint32_t>(call(create?8:5)),disposition=create?static_cast<std::uint32_t>(call(7)):1U;
             memory.check(GuestAddress{call(0)},unit,Access::Write);memory.check(GuestAddress{call(3)},unit*2,Access::Write);
             if(disposition>5 || (options&~0x0060587fU) || (options&0x30U)==0x30U || ((options&0x30U) && !(call(1)&0x100000U)) || ((options&1U) && (options&0x40U)))return finish(0xc000000dU);
             if(create && (call(9) || call(10)))return finish(0xc00000bbU);
@@ -674,6 +735,10 @@ std::optional<std::uint32_t> WindowsServices::resume_nt_native(GuestState& state
         if(good){if(const auto file=files_.find(value);file!=files_.end()){file->second.mode=op.attributes&0x38U;if(op.allocation && file->second.native)status=nt_status(file->second.native->allocate(op.allocation));}
             if(!status)memory.store(GuestAddress{a[0]},bits,value);else {files_.erase(value);runtime_.win_file_positions.erase(value);runtime_.handle_flags.erase(value);}}
         memory.store(GuestAddress{a[3]},bits,status);memory.store(GuestAddress{a[3]+unit},bits,status?0:op.information);
+    }else if(name=="NtCreateNamedPipeFile" || name=="ZwCreateNamedPipeFile"){
+        const bool good=value!=(x86_?UINT32_MAX:UINT64_MAX) && value!=UINT64_MAX;status=good?0:status;
+        if(good)memory.store(GuestAddress{a[0]},bits,value);
+        memory.store(GuestAddress{a[3]},bits,status);memory.store(GuestAddress{a[3]+unit},bits,good?op.information:0);
     }else if(name=="NtAccessCheck"){
         if(value){
             const bool allowed=memory.load(GuestAddress{a[7]},32)!=0;

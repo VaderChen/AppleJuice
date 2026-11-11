@@ -1,4 +1,5 @@
 #pragma once
+#include <iosfwd>
 #include "x64arm/host_services.hpp"
 #include <atomic>
 #include <chrono>
@@ -57,6 +58,7 @@ struct D3D9State;
 struct D3D11State;
 struct DirectSoundState;
 struct WasapiState;
+struct WicState;
 struct MediaFoundationState;
 struct MediaSurface;
 struct DirectInputState;
@@ -227,6 +229,10 @@ public:
     static std::array<std::uint8_t,32> image_identity(const std::filesystem::path& source,std::span<const std::uint8_t> bytes);
 #endif
     static constexpr GuestAddress stub_base{windows_address_layout::x64.services};
+    // 服務登錄稽核（x64arm audit-services）：逐筆列出群組、ABI、排重結果與路由到的處理函式，並彙整同名登錄的 ABI 衝突。
+    static void audit_runtime_services(std::ostream& out);
+    // 合併後的延伸描述表（runtime_service_descriptors() 的來源）。
+    static std::span<const WindowsServiceDescriptor> runtime_service_table();
     static constexpr std::size_t output_limit = 16U * 1024U * 1024U;
     static constexpr GuestAddress command_line_address{0x3001000000ULL}; // x64 系統區塊位於 MMU 視窗內（見 GuestMemory::native_mmu_window）。
     static constexpr std::uint64_t process_heap = 0x200;
@@ -237,6 +243,8 @@ public:
     void configure_loader(const std::filesystem::path& source, bool trap_unresolved,const std::filesystem::path& directory={});
     GuestAddress bind_image_import(GuestMemory&, const PeImport&, std::uint64_t owner);
     void prepare_image_startup(GuestState&);
+    // 以目前模組集合（主映像、內建系統模組、已載入 DLL）重建 PEB->Ldr 的三條模組串列；集合未變時不改寫。
+    void publish_loader_data(GuestMemory& memory);
     std::optional<std::uint32_t> wait_for_initial_thread(GuestState&,GuestMemory&);
     void set_standard_input(std::span<const std::uint8_t> bytes);
     void set_live_standard_io(int input = 0, int output = 1, int error = 2);
@@ -899,6 +907,8 @@ private:
     std::optional<std::uint32_t> invoke_webview2(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_opencl(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_vulkan(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // Vulkan 命令錄製等熱點呼叫可在 worker 上執行（見 windows_vulkan.cpp 的 vulkan_worker_symbol）：橋接已載入宿主 loader 時為真。
+    bool vulkan_worker_ready() const noexcept;
     std::optional<std::uint32_t> invoke_directml(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_xess(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_msvcp_pmr(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1131,6 +1141,7 @@ private:
     void poll_xaudio();
     bool xaudio_waiting() const;
     std::shared_ptr<WasapiState> wasapi_;
+    std::shared_ptr<WicState> wic_;
     std::shared_ptr<MediaFoundationState> media_foundation_;
     std::optional<std::uint32_t> invoke_media_foundation(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void poll_media_foundation(GuestMemory&);
@@ -1141,6 +1152,7 @@ private:
     bool media_graphics_device(std::uint64_t) const;
     std::optional<MediaSurface> media_graphics_surface(std::uint64_t,std::uint32_t) const;
     std::optional<std::uint32_t> invoke_wasapi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_wic(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void poll_wasapi();
     void report_crt_fast_fail(const GuestState&,GuestMemory&,std::string_view);
     bool wasapi_waiting() const;
@@ -1218,11 +1230,13 @@ private:
     void d3d11_stream_setup(GuestMemory&,std::uint64_t guest_base);
     void d3d11_stream_quiesced() noexcept;
     void d3d11_stream_full_service_sync(const WindowsServiceDescriptor&) noexcept;
+    bool d3d11_stream_owner_resource_sync(const GuestState&,GuestMemory&,const WindowsServiceDescriptor&) noexcept;
+    bool d3d11_stream_full_enqueue(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool d3d11_stream_present_eligible(const GuestState&) const;
     void d3d11_stream_prepare_present(struct D3D11CommandStream&,std::uint64_t swap_pointer);
     template<class Work> void d3d11_stream_post_present(const std::shared_ptr<class NativeOpenGlContext>&,Work);
     bool d3d11_stream_worker_stub(GuestAddress) const noexcept;
-    void d3d11_stream_coordinated(const GuestState&,bool device_creation) noexcept;
+    void d3d11_stream_coordinated(const GuestState&,GuestMemory&,bool device_creation) noexcept;
     void d3d11_stream_trace() const noexcept;
     // 完整 D3D11 分派（巨型函式，堆疊框架約 336 KB）；invoke_d3d11 先以前置快速路徑處理最常見的簡單方法。
     std::optional<std::uint32_t> invoke_d3d11_full(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
@@ -1315,6 +1329,14 @@ private:
     std::uint64_t resident_object_wake_after_{}; // 服務邊界下一次解析物件等待的單調時鐘（100 ns）。
     std::uint64_t object_wait_order_{}; // 物件等待的進入序號來源。
     GuestState* mutex_wake_handoff_{}; // 本地路徑判定「持互斥鎖 SetEvent 喚醒等待者」，交由單槽換手完成。
+    // NULL handle 自旋等待的停駐者數與 ReleaseSemaphore(NULL) 累積的喚醒額度（worker 持共用鎖讀寫，協調者解析時消耗）。
+    struct NullWaitPark {
+        std::atomic<std::uint32_t> parked{},tokens{};
+        NullWaitPark()=default;
+        // 停駐狀態屬於執行中的排程，不隨服務物件複製（副本沒有停駐中的執行緒）。
+        NullWaitPark(const NullWaitPark&) noexcept {}
+        NullWaitPark& operator=(const NullWaitPark&) noexcept {return *this;}
+    } null_park_;
     bool owns_local_mutex(std::uint64_t thread) const;
     std::uint64_t object_wait_entry_order(GuestThread& thread,const GuestState& state);
     bool mutex_has_waiters(std::uint64_t mutex) const;
@@ -2176,6 +2198,10 @@ private:
     std::uint64_t write_crt_file(GuestMemory& memory, CrtFile& file, std::span<const std::uint8_t> bytes, bool stream = false);
     std::uint64_t write_crt_stream(GuestMemory& memory, std::uint64_t stream, std::span<const std::uint8_t> bytes);
     std::uint64_t write_crt_wide_stream(GuestState&,GuestMemory&, std::uint64_t stream, std::u16string_view text);
+    using RuntimeHandler=std::optional<std::uint32_t>(WindowsServices::*)(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    struct RuntimeCatalog;
+    static const RuntimeCatalog& runtime_catalog();
+    static std::string_view runtime_handler_name(RuntimeHandler handler) noexcept;
     std::optional<std::uint32_t> invoke_runtime(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_crt_format(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,const WindowsCall&);
     // 純計算 CRT 邊界：0=非此類，1=記憶體操作，2=字串操作；依 stub 位址直接索引預先分類的表。

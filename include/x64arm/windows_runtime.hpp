@@ -595,6 +595,8 @@ struct RuntimeState {
     std::uint64_t wargv_cell{}, wenviron_cell{};
     std::map<std::string, std::uint64_t> modules;
     std::map<std::uint64_t,RuntimeModule> loaded_modules;
+    // PEB->Ldr：PEB_LDR_DATA 與各模組 LDR_DATA_TABLE_ENTRY 的客體位址，及最近一次發布的模組順序（見 publish_loader_data）。
+    std::uint64_t loader_data{};std::map<std::uint64_t,std::uint64_t> loader_entries;std::vector<std::uint64_t> loader_published;
 #ifdef X64ARM_HOST_SERVICES_TRANSLATION_IMAGE
     // 主程式 EXE 的來源身分：與 DLL 相同，供 resident AOT 記憶體快取以內容雜湊辨識。
     std::optional<TranslationImage> main_translation{};

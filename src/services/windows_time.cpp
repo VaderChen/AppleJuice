@@ -22,6 +22,8 @@ extern "C" {
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> time_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+        // 自其他群組遷入：處理函式在本檔。
+        {"kernel32.dll", "QueryPerformanceCounter", 1},{"kernel32.dll", "QueryPerformanceFrequency", 1},{"kernel32.dll", "GetSystemTimeAsFileTime", 1},{"kernel32.dll", "GetTickCount", 0},
         {"crt","clock",0},
         {"crt","_ftime",1},{"crt","_ftime32",1},{"crt","_ftime64",1},
         {"crt","_ftime_s",1},{"crt","_ftime32_s",1},{"crt","_ftime64_s",1},

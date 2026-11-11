@@ -75,12 +75,40 @@ foreach(path "${vkd3d_shader_SOURCE_DIR}/libs/vkd3d-shader/hlsl.y" "${vkd3d_pars
   x64arm_vkd3d_patch("${path}"
     [=[{ "GetDimensions",      add_getdimensions_method_call, "00111111111110" }]=]
     [=[{ "GetDimensions",      add_getdimensions_method_call, "00111111111111" }]=])
+  # UAV 方法表的最終內容統一在這裡（依字母序供 bsearch）：緩衝與 RWTexture1D／2D／3D／1DArray／2DArray 的 GetDimensions、
+  # Load／Load2～4（Vkd3dSm51ResourceArrays.cmake 的 x64arm_add_uav_load_method_call）、RWStructuredBuffer 的
+  # IncrementCounter／DecrementCounter（x64arm_add_counter_method_call）、RWByteAddressBuffer 的 Interlocked*（x64arm_add_raw_interlocked_method_call）。其他修補不要再改這段文字，否則這裡會判定未套用而重複插入。
+  # 參數：目前要取代的上一版內容、新內容、上游原始文字（全新解開的來源）。
   x64arm_vkd3d_patch("${path}"
     [=[uav_methods[] =
-{]=]
+{
+    { "DecrementCounter", x64arm_add_counter_method_call, "00000000000010" },
+    { "GetDimensions", add_getdimensions_method_call, "00111011000111" },
+    { "IncrementCounter", x64arm_add_counter_method_call, "00000000000010" },
+    { "Load",  x64arm_add_uav_load_method_call, "00111011000111" },
+    { "Load2", add_raw_load_method_call, "00000000000001" },
+    { "Load3", add_raw_load_method_call, "00000000000001" },
+    { "Load4", add_raw_load_method_call, "00000000000001" },]=]
     [=[uav_methods[] =
 {
-    { "GetDimensions", add_getdimensions_method_call, "00000000000111" },]=])
+    { "DecrementCounter", x64arm_add_counter_method_call, "00000000000010" },
+    { "GetDimensions", add_getdimensions_method_call, "00111011000111" },
+    { "IncrementCounter", x64arm_add_counter_method_call, "00000000000010" },
+    { "InterlockedAdd", x64arm_add_raw_interlocked_method_call, "00000000000001" },
+    { "InterlockedAnd", x64arm_add_raw_interlocked_method_call, "00000000000001" },
+    { "InterlockedCompareExchange", x64arm_add_raw_interlocked_method_call, "00000000000001" },
+    { "InterlockedCompareStore", x64arm_add_raw_interlocked_method_call, "00000000000001" },
+    { "InterlockedExchange", x64arm_add_raw_interlocked_method_call, "00000000000001" },
+    { "InterlockedMax", x64arm_add_raw_interlocked_method_call, "00000000000001" },
+    { "InterlockedMin", x64arm_add_raw_interlocked_method_call, "00000000000001" },
+    { "InterlockedOr", x64arm_add_raw_interlocked_method_call, "00000000000001" },
+    { "InterlockedXor", x64arm_add_raw_interlocked_method_call, "00000000000001" },
+    { "Load",  x64arm_add_uav_load_method_call, "00111011000111" },
+    { "Load2", add_raw_load_method_call, "00000000000001" },
+    { "Load3", add_raw_load_method_call, "00000000000001" },
+    { "Load4", add_raw_load_method_call, "00000000000001" },]=]
+    [=[uav_methods[] =
+{]=])
 endforeach()
 x64arm_vkd3d_patch("${vkd3d_shader_SOURCE_DIR}/libs/vkd3d-shader/tpf.c"
   "        case VSIR_OP_RCP:\n        case VSIR_OP_RESINFO:"

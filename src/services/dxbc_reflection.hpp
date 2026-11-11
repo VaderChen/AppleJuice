@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <optional>
 #include <memory>
@@ -123,8 +124,12 @@ private:
         unsigned variable_stride=24,type_stride=16,binding_stride=32;
         if(major>=5){
             const auto magic=data.u32(28);
-            if((magic!=0x31314452 && magic!=0x52443131) || data.u32(32)!=60 || data.u32(36)!=24 || data.u32(52)!=12)
-                throw std::invalid_argument("DXBC RD11 格式不合法");
+            // RD11 標記：5.0 為 "RD11"（舊版編譯器亦有位元組反序），5.1 為 0x25441313。
+            if((magic!=0x31314452 && magic!=0x52443131 && magic!=0x25441313) || data.u32(32)!=60 || data.u32(36)!=24 || data.u32(52)!=12){
+                char detail[160];
+                std::snprintf(detail,sizeof detail,"DXBC RD11 格式不合法（版本 %x 標記 %x 標頭 %u 緩衝 %u 成員 %u）",data.u32(16),magic,data.u32(32),data.u32(36),data.u32(52));
+                throw std::invalid_argument(detail);
+            }
             binding_stride=data.u32(40);variable_stride=data.u32(44);type_stride=data.u32(48);interface_slots=data.u32(56);
             if((binding_stride!=32 && binding_stride!=40) || variable_stride!=40 || type_stride!=36)throw std::invalid_argument("DXBC RD11 結構長度不合法");
         }

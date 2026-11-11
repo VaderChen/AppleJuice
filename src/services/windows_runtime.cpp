@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/windows_version.hpp"
 #include "x64arm/interpreter.hpp"
 #include "service_callback_task.hpp"
 #include "guest_crt_state.h"
@@ -10,7 +11,6 @@
 #include "windows_memory_diagnostics.hpp"
 #include "windows_process_parameter_layout.hpp"
 #include "x64arm/startup_profile.hpp"
-#include "service_descriptor_index.hpp"
 #include "service_descriptor_catalog.hpp"
 namespace x64arm::detail {const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress,GuestAddress) noexcept;}
 #include "windows_crt_character.hpp"
@@ -52,27 +52,51 @@ std::uint64_t WindowsServices::current_invalid_parameter_handler() const {
     return found!=threads_.items.end() && found->second.invalid_parameter_handler?found->second.invalid_parameter_handler:runtime_.invalid_parameter_handler;
 }
 
-std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
+namespace {bool crt_format_symbol(std::string_view symbol) noexcept;}
+// 延伸服務目錄：合併後的描述表、每個群組宣告的處理函式，以及合併時的稽核紀錄。第一次使用時建立，之後唯讀。
+// 群組是登錄與路由的共同單位：描述項放在處理它的家族檔案裡，群組列直接寫出處理函式（nullptr＝invoke_runtime 的內建分支）。
+struct WindowsServices::RuntimeCatalog {
+    std::vector<WindowsServiceDescriptor> table;
+    std::vector<RuntimeHandler> group_handlers;
+    std::vector<RuntimeHandler> routes; // 每個描述項的處理函式：來源群組的宣告，加上下方明列的診斷覆寫
+    std::vector<std::uint8_t> format;   // 內建分支中屬於 CRT 格式化家族的項目
+    detail::ServiceDescriptorAudit audit;
+    // 內部組合呼叫傳入的臨時描述項不在表內：以家族＋名稱找到同一筆登錄，沒有登錄時回傳表長。
+    std::size_t find(const WindowsServiceDescriptor& service) const {
+        struct Hash {std::size_t operator()(const std::pair<std::string_view,std::string_view>& key) const noexcept {
+            const auto family=std::hash<std::string_view>{}(key.first);return family^(std::hash<std::string_view>{}(key.second)+0x9e3779b9U+(family<<6)+(family>>2));}};
+        static const auto names=[this] {
+            std::unordered_map<std::pair<std::string_view,std::string_view>,std::size_t,Hash> result;result.reserve(table.size());
+            for(std::size_t index=0;index<table.size();++index)result.emplace(std::pair{table[index].family,table[index].symbol},index);
+            return result;
+        }();
+        const auto found=names.find({service.family,service.symbol});
+        return found==names.end()?table.size():found->second;
+    }
+};
+std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {return WindowsServices::runtime_service_table();}
+std::span<const WindowsServiceDescriptor> WindowsServices::runtime_service_table() {return runtime_catalog().table;}
+const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
     static constexpr WindowsServiceDescriptor table[]{
         {"kernel32.dll", "TlsAlloc", 0}, {"kernel32.dll", "TlsFree", 1}, {"kernel32.dll", "TlsGetValue", 1}, {"kernel32.dll", "TlsGetValue2", 1}, {"kernel32.dll", "TlsSetValue", 2},
-        {"kernel32.dll", "InitializeCriticalSection", 1}, {"kernel32.dll", "DeleteCriticalSection", 1},
-        {"kernel32.dll", "EnterCriticalSection", 1}, {"kernel32.dll", "LeaveCriticalSection", 1},
-        {"kernel32.dll", "SetUnhandledExceptionFilter", 1}, {"kernel32.dll", "Sleep", 1},
+        
+        
+        {"kernel32.dll", "SetUnhandledExceptionFilter", 1}, 
         {"kernel32.dll", "FatalAppExitA", 2}, {"kernel32.dll", "FatalAppExitW", 2},
         {"kernel32.dll", "GetProcessUserModeExceptionPolicy", 1}, {"kernel32.dll", "SetProcessUserModeExceptionPolicy", 1},
-        {"kernel32.dll", "VirtualQuery", 3},
-        {"kernel32.dll", "GetModuleHandleA", 1}, {"kernel32.dll", "GetModuleHandleW", 1},
-        {"kernel32.dll", "GetCommandLineA", 0}, {"kernel32.dll", "GetCurrentThreadId", 0}, {"kernel32.dll", "GetCurrentProcessId", 0},
+        
+        
+        {"kernel32.dll", "GetCommandLineA", 0}, {"kernel32.dll", "GetCurrentProcessId", 0},
         {"kernel32.dll", "GetACP", 0}, {"kernel32.dll", "GetStartupInfoA", 1}, {"kernel32.dll", "GetStartupInfoW", 1},
         {"crt", "__p___argc", 0}, {"crt", "__p___argv", 0}, {"crt", "__p__environ", 0},
         {"crt", "_set_fmode", 1}, {"crt", "_get_fmode", 1}, {"crt", "__p__fmode", 0}, {"crt", "__p__commode", 0}, {"crt", "__p__adjust_fdiv", 0}, {"crt", "_errno", 0},
         {"crt","__crtGetShowWindowMode",0},{"crt","_get_show_window_mode",0},
         {"crt","_get_narrow_winmain_command_line",0},{"crt","_get_wide_winmain_command_line",0},
-        {"crt","__crtSetUnhandledExceptionFilter",1},{"crt","__crtUnhandledException",1},
-        {"crt","__crtCapturePreviousContext",1},{"crt","__crtTerminateProcess",1},
+        {"crt","__crtSetUnhandledExceptionFilter",1},
+        {"crt","__crtTerminateProcess",1},
         {"crt","_crt_debugger_hook",1},{"crt","__crt_debugger_hook",1},
         {"crt", "_configure_narrow_argv", 1}, {"crt", "_initialize_narrow_environment", 0},
-        {"crt", "_get_initial_narrow_environment", 0}, {"crt", "_get_initial_wide_environment", 0}, {"crt", "_set_app_type", 1}, {"crt", "_set_new_handler", 1}, {"crt", "_query_new_handler", 0}, {"crt", "_query_new_mode", 0}, {"crt", "_callnewh", 1}, {"crt", "_set_new_mode", 1}, {"crt", "_configthreadlocale", 1},
+        {"crt", "_get_initial_narrow_environment", 0}, {"crt", "_get_initial_wide_environment", 0}, {"crt", "_set_app_type", 1}, {"crt", "_set_new_handler", 1}, {"crt", "_query_new_handler", 0}, {"crt", "_query_new_mode", 0}, {"crt", "_callnewh", 1}, {"crt", "_set_new_mode", 1}, 
         {"crt", "__setusermatherr", 1}, {"crt", "_set_invalid_parameter_handler", 1},{"crt","_set_thread_local_invalid_parameter_handler",1},{"crt","_getpid",0},{"crt","_msize",1},{"crt","_abs64",1},{"crt","llabs",1},{"crt","imaxabs",1},{"crt","abs",1},{"crt","labs",1},{"crt","_rotl",2},{"crt","_rotr",2},{"crt","_lrotl",2},{"crt","_lrotr",2},{"crt","_rotl64",2},{"crt","_rotr64",2},{"crt","_byteswap_ushort",1},{"crt","_byteswap_ulong",1},{"crt","_byteswap_uint64",1},
         {"crt", "_initterm", 2}, {"crt", "_initterm_e", 2}, {"crt", "_crt_at_quick_exit", 1}, {"crt", "at_quick_exit", 1}, {"crt", "quick_exit", 1}, {"crt", "_crt_atexit", 1}, {"crt", "atexit", 1}, {"crt", "_onexit", 1},
         {"crt", "_cexit", 0}, {"crt", "exit", 1}, {"crt", "_exit", 1}, {"crt", "abort", 0}, {"crt", "_set_abort_behavior", 2},
@@ -85,7 +109,7 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"kernel32.dll", "RtlMoveMemory", 3}, {"ntdll.dll", "RtlMoveMemory", 3}, {"crt", "memcpy", 3}, {"crt", "memmove", 3}, {"crt", "memset", 3}, {"crt", "memcmp", 3},
         {"crt", "strlen", 1}, {"crt", "strcmp", 2}, {"crt", "strncmp", 3}, {"crt", "strcpy", 2}, {"crt", "strncpy", 3},
         {"crt", "strcat", 2}, {"crt", "strncat", 3}, {"crt", "wcscat", 2}, {"crt", "wcsncat", 3},
-        {"crt", "_get_stream_buffer_pointers", 4}, {"crt", "__acrt_iob_func", 1}, {"crt", "__iob_func", 0}, {"crt", "fflush", 1}, {"crt", "_flushall", 0}, {"crt", "_fcloseall", 0}, {"crt", "setvbuf", 4}, {"crt", "setbuf", 2}, {"crt", "_getmaxstdio", 0}, {"crt", "_setmaxstdio", 1}, {"crt", "_dup2", 2}, {"crt", "_locking", 3},
+        {"crt", "_get_stream_buffer_pointers", 4}, {"crt", "__acrt_iob_func", 1}, {"crt", "__iob_func", 0}, 
         {"crt", "puts", 1}, {"crt", "putchar", 1}, {"crt", "printf", 1}, {"crt", "fprintf", 2},
         {"crt", "vprintf", 2}, {"crt", "wprintf", 1}, {"crt", "vwprintf", 2}, {"crt", "fwprintf", 2}, {"crt", "vfwprintf", 3}, {"crt", "vfprintf", 3}, {"crt", "__stdio_common_vfprintf", 5,1}, {"crt", "__stdio_common_vfprintf_s", 5,1}, {"crt", "__stdio_common_vfwprintf_s", 5,1}, {"crt", "__stdio_common_vfwprintf", 5,1}, {"crt", "snprintf", 3},
         {"crt","__conio_common_vcprintf",4,1},{"crt","__conio_common_vcprintf_s",4,1},{"crt","__conio_common_vcprintf_p",4,1},
@@ -94,41 +118,41 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"crt","_cwprintf",1},{"crt","_cwprintf_l",2},{"crt","_cwprintf_s",1},{"crt","_cwprintf_s_l",2},{"crt","_cwprintf_p",1},{"crt","_cwprintf_p_l",2},
         {"crt","_vcprintf",2},{"crt","_vcprintf_l",3},{"crt","_vcprintf_s",2},{"crt","_vcprintf_s_l",3},{"crt","_vcprintf_p",2},{"crt","_vcprintf_p_l",3},
         {"crt","_vcwprintf",2},{"crt","_vcwprintf_l",3},{"crt","_vcwprintf_s",2},{"crt","_vcwprintf_s_l",3},{"crt","_vcwprintf_p",2},{"crt","_vcwprintf_p_l",3},
-        {"kernel32.dll", "DebugBreak", 0}, {"kernel32.dll", "UnhandledExceptionFilter", 1}, {"kernel32.dll", "RtlUnwind", 4}, {"ntdll.dll", "RtlUnwind", 4},
-        {"kernel32.dll", "RaiseFailFastException", 3},
-        {"kernel32.dll", "RtlAddFunctionTable", 3,1U<<2}, {"ntdll.dll", "RtlAddFunctionTable", 3,1U<<2},
-        {"kernel32.dll", "RtlDeleteFunctionTable", 1}, {"ntdll.dll", "RtlDeleteFunctionTable", 1},
-        {"kernel32.dll", "RtlInstallFunctionTableCallback", 6}, {"ntdll.dll", "RtlInstallFunctionTableCallback", 6},
-        {"ntdll.dll", "RtlAddGrowableFunctionTable", 6},
-        {"ntdll.dll", "RtlGrowFunctionTable", 2}, {"ntdll.dll", "RtlDeleteGrowableFunctionTable", 1},
-        {"kernel32.dll", "RaiseException", 4}, {"kernel32.dll", "AddVectoredExceptionHandler", 2}, {"kernel32.dll", "RemoveVectoredExceptionHandler", 1},
-        {"kernel32.dll", "AddVectoredContinueHandler", 2}, {"kernel32.dll", "RemoveVectoredContinueHandler", 1},
-        {"kernel32.dll", "RtlPcToFileHeader", 2}, {"ntdll.dll", "RtlPcToFileHeader", 2}, {"kernel32.dll", "RtlCaptureContext", 1}, {"kernel32.dll", "RtlLookupFunctionEntry", 3}, {"kernel32.dll", "RtlVirtualUnwind", 8}, {"kernel32.dll", "RtlUnwindEx", 6},
-        {"crt", "_local_unwind", 2},
-        {"user32.dll", "RegisterClassW", 1}, {"user32.dll", "RegisterClassExW", 1}, {"user32.dll", "RegisterClassA", 1}, {"user32.dll", "RegisterClassExA", 1},
-        {"user32.dll", "CreateWindowExW", 12}, {"user32.dll", "CreateWindowExA", 12}, {"user32.dll", "DefWindowProcW", 4}, {"user32.dll", "DefWindowProcA", 4},
-        {"user32.dll", "ShowWindow", 2}, {"user32.dll", "OpenIcon", 1}, {"user32.dll", "UpdateWindow", 1}, {"user32.dll", "DestroyWindow", 1},
-        {"user32.dll", "PostQuitMessage", 1}, {"user32.dll", "GetMessageW", 4}, {"user32.dll", "GetMessageA", 4},
-        {"user32.dll", "PeekMessageW", 5}, {"user32.dll", "PeekMessageA", 5}, {"user32.dll", "TranslateMessage", 1},
-        {"user32.dll", "DispatchMessageW", 1}, {"user32.dll", "DispatchMessageA", 1}, {"user32.dll", "SendMessageTimeoutA",7},{"user32.dll", "SendMessageTimeoutW",7},{"user32.dll", "SendMessageW", 4}, {"user32.dll", "SendMessageA", 4},
-        {"user32.dll", "SendMessageCallbackA", 6}, {"user32.dll", "SendMessageCallbackW", 6}, {"user32.dll", "SendNotifyMessageA", 4}, {"user32.dll", "SendNotifyMessageW", 4}, {"user32.dll", "WaitMessage", 0},
-        {"user32.dll", "PostThreadMessageW", 4},{"user32.dll", "PostThreadMessageA", 4},{"user32.dll", "PostMessageW", 4}, {"user32.dll", "PostMessageA", 4}, {"user32.dll", "BeginPaint", 2}, {"user32.dll", "EndPaint", 2},
-        {"user32.dll", "GetClientRect", 2}, {"user32.dll", "InvalidateRect", 3}, {"user32.dll", "InvalidateRgn", 3},
-        {"user32.dll", "GetWindowLongPtrW", 2}, {"user32.dll", "SetWindowLongPtrW", 3}, {"user32.dll", "GetWindowLongPtrA", 2}, {"user32.dll", "SetWindowLongPtrA", 3},
-        {"user32.dll", "LoadCursorW", 2}, {"user32.dll", "LoadCursorA", 2}, {"user32.dll", "GetSystemMetrics", 1},
-        {"gdi32.dll", "GetStockObject", 1}, {"gdi32.dll", "CreateSolidBrush", 1},
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         {"kernel32.dll", "IsDBCSLeadByte", 1},
         {"kernel32.dll", "FlsAlloc", 1}, {"kernel32.dll", "FlsFree", 1}, {"kernel32.dll", "FlsGetValue", 1}, {"kernel32.dll", "FlsGetValue2", 1}, {"kernel32.dll", "FlsSetValue", 2},
-        {"crt", "__p__acmdln", 0}, {"crt", "__p__wcmdln", 0}, {"crt", "strstr", 2}, {"crt", "strchr", 2}, {"crt", "strrchr", 2}, {"crt", "getenv", 1},
-        {"crt", "fopen", 2}, {"crt", "fopen_s", 3}, {"crt", "_wfopen_s", 3}, {"crt", "_commit", 1}, {"crt", "_fsopen", 3}, {"crt", "_wfsopen", 3}, {"crt", "fclose", 1}, {"crt", "fread", 4}, {"crt", "fwrite", 4},
-        {"crt","_chsize",2},{"crt","_chsize_s",2,1U<<1},{"crt","_open_osfhandle",2},{"crt","_filelength",1},{"crt","_filelengthi64",1},
-        {"crt", "_creat", 2}, {"crt", "_wcreat", 2}, {"crt", "freopen", 3}, {"crt", "_wfreopen", 3}, {"crt", "_dup", 1}, {"crt", "_fdopen", 2}, {"crt", "_wfdopen", 2}, {"crt", "_close", 1}, {"crt", "_read", 3},
-        {"crt", "_open", 3}, {"crt", "_wopen", 3}, {"crt", "_sopen", 4}, {"crt", "_wsopen", 4}, {"crt", "_sopen_s", 5}, {"crt", "_wsopen_s", 5}, {"crt", "_sopen_dispatch", 6}, {"crt", "_wsopen_dispatch", 6}, {"crt", "tmpfile", 0}, {"crt", "tmpfile_s", 1},
-        {"crt","_umask",1},{"crt","_umask_s",2},
-        {"crt", "_lseek", 3}, {"crt", "_lseeki64", 3,1U<<1}, {"crt", "_tell", 1}, {"crt", "_telli64", 1},
-        {"crt", "fgetpos", 2}, {"crt", "fsetpos", 2}, {"crt", "fseek", 3}, {"crt", "_fseeki64", 3,1U<<1}, {"crt", "ftell", 1}, {"crt", "_ftelli64", 1},
-        {"crt", "feof", 1}, {"crt", "ferror", 1}, {"crt", "clearerr", 1}, {"crt", "rewind", 1},
-        {"crt", "fgetwc", 1}, {"crt", "fgetws", 3}, {"crt", "fputwc", 2}, {"crt", "ungetc", 2}, {"crt", "ungetwc", 2}, {"crt", "getchar", 0}, {"crt", "fgetc", 1}, {"crt", "getc", 1}, {"crt", "fgets", 3}, {"crt", "fputs", 2},
+        {"crt", "__p__acmdln", 0}, {"crt", "__p__wcmdln", 0}, {"crt", "strstr", 2}, {"crt", "strchr", 2}, {"crt", "strrchr", 2}, 
+        
+        
+        
+        
+        
+        
+        
+        
+        
         {"crt", "__stdio_common_vsnprintf_s", 7,1}, {"crt", "__stdio_common_vsnwprintf_s", 7,1}, {"crt", "_invalid_parameter_noinfo", 0}, {"crt", "__stdio_common_vsprintf_s", 6,1}, {"crt", "__stdio_common_vsprintf", 6,1}, {"crt", "vsnprintf", 4},
         {"crt","sprintf",2},
         {"crt","vsprintf",3},
@@ -150,176 +174,198 @@ std::span<const WindowsServiceDescriptor> runtime_service_descriptors() {
         {"crt","_vscwprintf",2},
         {"crt","__stdio_common_vswprintf",6,1},{"crt","__stdio_common_vswprintf_s",6,1},
         {"crt","__stdio_common_vsprintf_p",6,1},{"crt","__stdio_common_vswprintf_p",6,1},{"crt","__stdio_common_vfprintf_p",5,1},{"crt","__stdio_common_vfwprintf_p",5,1},
-        {"crt", "signal", 2}, {"crt", "__getmainargs", 5}, {"crt", "__wgetmainargs", 5}, {"crt", "__C_specific_handler", 4},
-        {"kernel32.dll", "__C_specific_handler", 4}, {"ntdll.dll", "__C_specific_handler", 4},
-        {"crt", "setjmp", 1}, {"crt", "_setjmp", 2}, {"crt", "__intrinsic_setjmp", 1},
-        {"crt", "_setjmpex", 2}, {"crt", "__intrinsic_setjmpex", 2}, {"crt", "longjmp", 2},
-        {"crt", "_setjmp3", 2}, {"crt", "_longjmpex", 2},
+        {"crt", "signal", 2}, {"crt", "__getmainargs", 5}, {"crt", "__wgetmainargs", 5}, 
+        
+        
+        
+        
         {"crt", "__p___wargv", 0}, {"crt", "__p__wenviron", 0},
         {"crt", "__p___initenv", 0}, {"crt", "__p___winitenv", 0},
-        {"crt", "_initialize_wide_environment", 0}, {"crt", "_configure_wide_argv", 1}, {"crt", "_wfopen", 2}
+        {"crt", "_initialize_wide_environment", 0}, {"crt", "_configure_wide_argv", 1}, 
     };
-    static const auto combined = [&] {
+    static const auto catalog = [&] {
         startup_profile::Scope phase("services","descriptor_table",true);
-        const detail::ServiceDescriptorGroup groups[]{
-            {table, false},
-            {compatibility_service_descriptors(), true},
-            {crt_character_service_descriptors(), true},
-            {gui_service_descriptors(), true},
-            {gdi_service_descriptors(), true},
-            {input_service_descriptors(), true},
-            {raw_input_service_descriptors(), true},
-            {pointer_service_descriptors(), true},
-            {hid_service_descriptors(), true},
-            {icon_service_descriptors(), true},
-            {dib_transfer_service_descriptors(), true},
-            {gdiplus_service_descriptors(), true},
-            {task_dialog_service_descriptors(), true},
-            {opencl_service_descriptors(), true},
-            {vulkan_service_descriptors(), true},
-            {directml_export_service_descriptors(), true},
-            {directml_object_service_descriptors(), false},
-            {xess_service_descriptors(), true},
-            {msvcp_pmr_service_descriptors(), true},
-            {msvcp_special_math_service_descriptors(), true},
-            {webview2_loader_service_descriptors(), true},
-            {webview2_object_service_descriptors(), false},
-            {d3d12_export_service_descriptors(), true},
-            {d3d12_object_service_descriptors(), false},
-            {dxcore_export_service_descriptors(), true},
-            {dxcore_object_service_descriptors(), false},
-            {common_dialog_service_descriptors(), true},
-            {menu_service_descriptors(), true},
-            {shell_service_descriptors(), true},
-            {ole_service_descriptors(), true},
-            {ole_stream_service_descriptors(), true},
-            {storage_service_descriptors(), true},
-            {msi_service_descriptors(), true},
-            {esent_service_descriptors(), true},
-            {safearray_service_descriptors(), true},
-            {resource_service_descriptors(), true},
-            {security_service_descriptors(), true},
-            {msvc_service_descriptors(), true},
-            {control_service_descriptors(), true},
-            {userstring_service_descriptors(), true},
-            {msxml_service_descriptors(), false},
-            {ribbon_service_descriptors(), false},
-            {wmi_service_descriptors(), false},
-            {native_library_service_descriptors(), false},
-            {dbghelp_service_descriptors(), false},
-            {script_service_descriptors(), false},
-            {metafile_service_descriptors(), false},
-            {eventlog_service_descriptors(), false},
-            {http_service_descriptors(), false},
-            {fiber_service_descriptors(), false},
-            {printing_service_descriptors(), false},
-            {print_dialog_service_descriptors(), false},
-            {gdi_path_service_descriptors(), false},
-            {gdi_state_service_descriptors(), false},
-            {accessible_service_descriptors(), false},
-            {dwrite_service_descriptors(), false},
-            {registered_wait_service_descriptors(), false},
-            {math_service_descriptors(), false},
-            {crt_string_service_descriptors(), false},
-            {path_service_descriptors(), false},
-            {time_service_descriptors(), false},
-            {mapping_service_descriptors(), false},
-            {process_service_descriptors(), false},
-            {nt_process_service_descriptors(), false},
-            {nt_native_service_descriptors(), false},
-            {winrt_service_descriptors(), false},
-            {com_marshal_service_descriptors(), false},
-            {com_context_service_descriptors(), false},
-            {com_error_service_descriptors(), false},
-            {type_library_service_descriptors(), false},
-            {winrt_error_service_descriptors(), false},
-            {desktop_notification_service_descriptors(), false},
-            {gui_drag_service_descriptors(), false},
-            {gui_move_size_service_descriptors(), false},
-            {ole_drag_service_descriptors(), false},
-            {gui_rpc_service_descriptors(), false},
-            {com_proxy_service_descriptors(), false},
-            {power_notification_service_descriptors(), false},
-            {data_protection_service_descriptors(), false},
-            {application_policy_service_descriptors(), false},
-            {opengl_service_descriptors(), false},
-            {angle_service_descriptors(), false},
-            {graphics_compat_service_descriptors(), false},
-            {legacy_gdi_service_descriptors(), false},
-            {legacy_user_service_descriptors(), false},
-            {kernel_driver_service_descriptors(), false},
-            {hook_service_descriptors(), false},
-            {activation_service_descriptors(), false},
-            {theme_service_descriptors(), false},
-            {property_service_descriptors(), false},
-            {profile_service_descriptors(), false},
-            {winstation_service_descriptors(), false},
-            {version_service_descriptors(), false},
-            {locale_service_descriptors(), false},
-            {font_service_descriptors(), false},
-            {crypto_service_descriptors(), false},
-            {certificate_service_descriptors(), false},
-            {network_service_descriptors(), false},
-            {mpr_service_descriptors(), false},
-            {environment_service_descriptors(), true},
-            {thread_service_descriptors(), true},
-            {file_service_descriptors(), false},
-            {file_encryption_service_descriptors(), false},
-            {serial_service_descriptors(), false},
-            {console_service_descriptors(), false},
-            {volume_service_descriptors(), false},
-            {error_service_descriptors(), false},
-            {tls_service_descriptors(), false},
-            {registry_service_descriptors(), false},
-            {d3d9_service_descriptors(), false},
-            {d3d11_service_descriptors(), false},
-            {dsound_service_descriptors(), false},
-            {xaudio_service_descriptors(), false},
-            {wasapi_service_descriptors(), false},
-            {media_foundation_service_descriptors(), false},
-            {dinput_service_descriptors(), false},
-            {directmusic_service_descriptors(), false},
-            {memory_service_descriptors(), true},
-            {service_control_descriptors(), false},
-            {shell_memory_stream_descriptors(), false},
-            {shell_item_service_descriptors(), false},
-            {lsa_service_descriptors(), false},
-            {property_key_service_descriptors(), false},
-            {printing_escape_service_descriptors(), false},
-            {imm_service_descriptors(), false},
-            {shell_notification_service_descriptors(), false},
-            {certificate_decode_service_descriptors(), false},
-            {certificate_key_service_descriptors(), false},
-            {certificate_find_service_descriptors(), false},
-            {dpapi_service_descriptors(), false},
-            {credential_service_descriptors(), false},
-            {dbghelp_symbol_service_descriptors(), false},
-            {minidump_service_descriptors(), false},
-            {heap_service_descriptors(), false},
-            {working_set_service_descriptors(), false},
-            {anonymous_token_service_descriptors(), false},
-            {etw_service_descriptors(), false},
-            {perflib_service_descriptors(), false},
-            {pdh_service_descriptors(), true},
-            {transaction_service_descriptors(), true},
-            {system_object_service_descriptors(), true},
-            {dde_service_descriptors(), true},
-            {user_session_service_descriptors(), true},
-            {com_spy_service_descriptors(), true},
-            {url_security_service_descriptors(), true},
-            {dxva2_service_descriptors(), true},
-            {network_diagnostic_service_descriptors(), true},
-            {credential_ui_service_descriptors(), true},
-            {certificate_ui_service_descriptors(), true},
-            {winusb_service_descriptors(), true},
-            {wlan_service_descriptors(), true},
-            {font_package_service_descriptors(), true},
-            {mci_service_descriptors(), false},
-            {reparse_service_descriptors(), true},
+        struct Entry {std::span<const WindowsServiceDescriptor> descriptors;bool unique;std::string_view name;RuntimeHandler handler;};
+        const Entry entries[]{
+            {table, false, "runtime_base", nullptr},
+            {crt_io_service_descriptors(), true, "crt_io_service_descriptors", &WindowsServices::invoke_crt_io},
+            {exception_service_descriptors(), true, "exception_service_descriptors", &WindowsServices::invoke_exception},
+            {gui_core_service_descriptors(), true, "gui_core_service_descriptors", &WindowsServices::invoke_gui},
+            {network_config_service_descriptors(), true, "network_config_service_descriptors", &WindowsServices::invoke_network_config},
+            {property_page_service_descriptors(), true, "property_page_service_descriptors", &WindowsServices::invoke_property_page},
+            {compatibility_service_descriptors(), true, "compatibility_service_descriptors", &WindowsServices::invoke_compatibility},
+            {crt_character_service_descriptors(), true, "crt_character_service_descriptors", &WindowsServices::invoke_compatibility},
+            {gui_service_descriptors(), true, "gui_service_descriptors", &WindowsServices::invoke_gui_support},
+            {gdi_service_descriptors(), true, "gdi_service_descriptors", &WindowsServices::invoke_gdi},
+            {input_service_descriptors(), true, "input_service_descriptors", &WindowsServices::invoke_input_api},
+            {raw_input_service_descriptors(), true, "raw_input_service_descriptors", &WindowsServices::invoke_raw_input},
+            {pointer_service_descriptors(), true, "pointer_service_descriptors", &WindowsServices::invoke_pointer_input},
+            {hid_service_descriptors(), true, "hid_service_descriptors", &WindowsServices::invoke_hid},
+            {icon_service_descriptors(), true, "icon_service_descriptors", &WindowsServices::invoke_icon_api},
+            {dib_transfer_service_descriptors(), true, "dib_transfer_service_descriptors", &WindowsServices::invoke_dib_transfer},
+            {gdiplus_service_descriptors(), true, "gdiplus_service_descriptors", &WindowsServices::invoke_gdiplus},
+            {task_dialog_service_descriptors(), true, "task_dialog_service_descriptors", &WindowsServices::invoke_task_dialog},
+            {opencl_service_descriptors(), true, "opencl_service_descriptors", &WindowsServices::invoke_opencl},
+            {vulkan_service_descriptors(), true, "vulkan_service_descriptors", &WindowsServices::invoke_vulkan},
+            {directml_export_service_descriptors(), true, "directml_export_service_descriptors", &WindowsServices::invoke_directml},
+            {directml_object_service_descriptors(), false, "directml_object_service_descriptors", &WindowsServices::invoke_directml},
+            {xess_service_descriptors(), true, "xess_service_descriptors", &WindowsServices::invoke_xess},
+            {msvcp_pmr_service_descriptors(), true, "msvcp_pmr_service_descriptors", &WindowsServices::invoke_msvcp_pmr},
+            {msvcp_special_math_service_descriptors(), true, "msvcp_special_math_service_descriptors", &WindowsServices::invoke_msvcp_special_math},
+            {webview2_loader_service_descriptors(), true, "webview2_loader_service_descriptors", &WindowsServices::invoke_webview2},
+            {webview2_object_service_descriptors(), false, "webview2_object_service_descriptors", &WindowsServices::invoke_webview2},
+            {d3d12_export_service_descriptors(), true, "d3d12_export_service_descriptors", &WindowsServices::invoke_d3d12},
+            {d3d12_object_service_descriptors(), false, "d3d12_object_service_descriptors", &WindowsServices::invoke_d3d12},
+            {dxcore_export_service_descriptors(), true, "dxcore_export_service_descriptors", &WindowsServices::invoke_dxcore},
+            {dxcore_object_service_descriptors(), false, "dxcore_object_service_descriptors", &WindowsServices::invoke_dxcore},
+            {common_dialog_service_descriptors(), true, "common_dialog_service_descriptors", &WindowsServices::invoke_common_dialog},
+            {menu_service_descriptors(), true, "menu_service_descriptors", &WindowsServices::invoke_menu},
+            {shell_service_descriptors(), true, "shell_service_descriptors", &WindowsServices::invoke_shell},
+            {ole_service_descriptors(), true, "ole_service_descriptors", &WindowsServices::invoke_ole},
+            {ole_stream_service_descriptors(), true, "ole_stream_service_descriptors", &WindowsServices::invoke_ole_stream},
+            {storage_service_descriptors(), true, "storage_service_descriptors", &WindowsServices::invoke_storage},
+            {msi_service_descriptors(), true, "msi_service_descriptors", &WindowsServices::invoke_msi},
+            {esent_service_descriptors(), true, "esent_service_descriptors", &WindowsServices::invoke_esent},
+            {safearray_service_descriptors(), true, "safearray_service_descriptors", &WindowsServices::invoke_safearray},
+            {resource_service_descriptors(), true, "resource_service_descriptors", &WindowsServices::invoke_resource},
+            {security_service_descriptors(), true, "security_service_descriptors", &WindowsServices::invoke_security},
+            {msvc_service_descriptors(), true, "msvc_service_descriptors", &WindowsServices::invoke_msvc},
+            {control_service_descriptors(), true, "control_service_descriptors", &WindowsServices::invoke_control_api},
+            {userstring_service_descriptors(), true, "userstring_service_descriptors", &WindowsServices::invoke_userstring},
+            {msxml_service_descriptors(), false, "msxml_service_descriptors", &WindowsServices::invoke_msxml},
+            {ribbon_service_descriptors(), false, "ribbon_service_descriptors", &WindowsServices::invoke_ribbon},
+            {wmi_service_descriptors(), false, "wmi_service_descriptors", &WindowsServices::invoke_wmi},
+            {native_library_service_descriptors(), false, "native_library_service_descriptors", &WindowsServices::invoke_native_library},
+            {dbghelp_service_descriptors(), false, "dbghelp_service_descriptors", &WindowsServices::invoke_dbghelp},
+            {script_service_descriptors(), false, "script_service_descriptors", &WindowsServices::invoke_script},
+            {metafile_service_descriptors(), false, "metafile_service_descriptors", &WindowsServices::invoke_metafile},
+            {eventlog_service_descriptors(), false, "eventlog_service_descriptors", &WindowsServices::invoke_eventlog},
+            {http_service_descriptors(), false, "http_service_descriptors", &WindowsServices::invoke_http},
+            {fiber_service_descriptors(), false, "fiber_service_descriptors", &WindowsServices::invoke_fiber},
+            {printing_service_descriptors(), false, "printing_service_descriptors", &WindowsServices::invoke_printing},
+            {print_dialog_service_descriptors(), false, "print_dialog_service_descriptors", &WindowsServices::invoke_print_dialog},
+            {gdi_path_service_descriptors(), false, "gdi_path_service_descriptors", &WindowsServices::invoke_gdi_path},
+            {gdi_state_service_descriptors(), false, "gdi_state_service_descriptors", &WindowsServices::invoke_gdi_state},
+            {accessible_service_descriptors(), false, "accessible_service_descriptors", &WindowsServices::invoke_accessible},
+            {dwrite_service_descriptors(), false, "dwrite_service_descriptors", &WindowsServices::invoke_dwrite},
+            {registered_wait_service_descriptors(), false, "registered_wait_service_descriptors", &WindowsServices::invoke_registered_wait},
+            {math_service_descriptors(), false, "math_service_descriptors", &WindowsServices::invoke_math},
+            {crt_string_service_descriptors(), false, "crt_string_service_descriptors", &WindowsServices::invoke_crt_string},
+            {path_service_descriptors(), false, "path_service_descriptors", &WindowsServices::invoke_path},
+            {time_service_descriptors(), false, "time_service_descriptors", &WindowsServices::invoke_time},
+            {mapping_service_descriptors(), false, "mapping_service_descriptors", &WindowsServices::invoke_mapping},
+            {process_service_descriptors(), false, "process_service_descriptors", &WindowsServices::invoke_process},
+            {nt_process_service_descriptors(), false, "nt_process_service_descriptors", &WindowsServices::invoke_nt_process},
+            {nt_native_service_descriptors(), false, "nt_native_service_descriptors", &WindowsServices::invoke_nt_native},
+            {winrt_service_descriptors(), false, "winrt_service_descriptors", &WindowsServices::invoke_winrt},
+            {com_marshal_service_descriptors(), false, "com_marshal_service_descriptors", &WindowsServices::invoke_com_marshal},
+            {com_context_service_descriptors(), false, "com_context_service_descriptors", &WindowsServices::invoke_com_context},
+            {com_error_service_descriptors(), false, "com_error_service_descriptors", &WindowsServices::invoke_com_error},
+            {type_library_service_descriptors(), false, "type_library_service_descriptors", &WindowsServices::invoke_type_library},
+            {winrt_error_service_descriptors(), false, "winrt_error_service_descriptors", &WindowsServices::invoke_winrt_error},
+            {desktop_notification_service_descriptors(), false, "desktop_notification_service_descriptors", &WindowsServices::invoke_desktop_notification},
+            {gui_drag_service_descriptors(), false, "gui_drag_service_descriptors", &WindowsServices::invoke_gui_drag},
+            {gui_move_size_service_descriptors(), false, "gui_move_size_service_descriptors", &WindowsServices::invoke_gui_move_size},
+            {ole_drag_service_descriptors(), false, "ole_drag_service_descriptors", &WindowsServices::invoke_ole_drag},
+            {gui_rpc_service_descriptors(), false, "gui_rpc_service_descriptors", &WindowsServices::invoke_gui_rpc},
+            {com_proxy_service_descriptors(), false, "com_proxy_service_descriptors", &WindowsServices::invoke_com_proxy},
+            {power_notification_service_descriptors(), false, "power_notification_service_descriptors", &WindowsServices::invoke_power_notification},
+            {data_protection_service_descriptors(), false, "data_protection_service_descriptors", &WindowsServices::invoke_data_protection},
+            {application_policy_service_descriptors(), false, "application_policy_service_descriptors", &WindowsServices::invoke_application_policy},
+            {opengl_service_descriptors(), false, "opengl_service_descriptors", &WindowsServices::invoke_opengl},
+            {angle_service_descriptors(), false, "angle_service_descriptors", &WindowsServices::invoke_angle},
+            {graphics_compat_service_descriptors(), false, "graphics_compat_service_descriptors", &WindowsServices::invoke_graphics_compat},
+            {legacy_gdi_service_descriptors(), false, "legacy_gdi_service_descriptors", &WindowsServices::invoke_legacy_gdi},
+            {legacy_user_service_descriptors(), false, "legacy_user_service_descriptors", &WindowsServices::invoke_legacy_user},
+            {kernel_driver_service_descriptors(), false, "kernel_driver_service_descriptors", &WindowsServices::invoke_kernel_api},
+            {hook_service_descriptors(), false, "hook_service_descriptors", &WindowsServices::invoke_hooks},
+            {activation_service_descriptors(), false, "activation_service_descriptors", &WindowsServices::invoke_activation},
+            {theme_service_descriptors(), false, "theme_service_descriptors", &WindowsServices::invoke_theme},
+            {property_service_descriptors(), false, "property_service_descriptors", &WindowsServices::invoke_properties},
+            {profile_service_descriptors(), false, "profile_service_descriptors", &WindowsServices::invoke_profile},
+            {winstation_service_descriptors(), false, "winstation_service_descriptors", &WindowsServices::invoke_winstation},
+            {version_service_descriptors(), false, "version_service_descriptors", &WindowsServices::invoke_version},
+            {locale_service_descriptors(), false, "locale_service_descriptors", &WindowsServices::invoke_locale},
+            {font_service_descriptors(), false, "font_service_descriptors", &WindowsServices::invoke_fonts},
+            {crypto_service_descriptors(), false, "crypto_service_descriptors", &WindowsServices::invoke_crypto},
+            {certificate_service_descriptors(), false, "certificate_service_descriptors", &WindowsServices::invoke_certificate},
+            {network_service_descriptors(), false, "network_service_descriptors", &WindowsServices::invoke_network},
+            {mpr_service_descriptors(), false, "mpr_service_descriptors", &WindowsServices::invoke_mpr},
+            {environment_service_descriptors(), true, "environment_service_descriptors", &WindowsServices::invoke_environment},
+            {thread_service_descriptors(), true, "thread_service_descriptors", &WindowsServices::invoke_thread},
+            {file_service_descriptors(), false, "file_service_descriptors", &WindowsServices::invoke_file},
+            {file_encryption_service_descriptors(), false, "file_encryption_service_descriptors", &WindowsServices::invoke_file_encryption},
+            {serial_service_descriptors(), false, "serial_service_descriptors", &WindowsServices::invoke_serial},
+            {console_service_descriptors(), false, "console_service_descriptors", &WindowsServices::invoke_console_control},
+            {volume_service_descriptors(), false, "volume_service_descriptors", &WindowsServices::invoke_volume},
+            {error_service_descriptors(), false, "error_service_descriptors", &WindowsServices::invoke_error},
+            {tls_service_descriptors(), false, "tls_service_descriptors", &WindowsServices::invoke_tls},
+            {registry_service_descriptors(), false, "registry_service_descriptors", &WindowsServices::invoke_registry},
+            {d3d9_service_descriptors(), false, "d3d9_service_descriptors", &WindowsServices::invoke_d3d9},
+            {d3d11_service_descriptors(), false, "d3d11_service_descriptors", &WindowsServices::invoke_d3d11},
+            {dsound_service_descriptors(), false, "dsound_service_descriptors", &WindowsServices::invoke_dsound},
+            {xaudio_service_descriptors(), false, "xaudio_service_descriptors", &WindowsServices::invoke_xaudio},
+            {wasapi_service_descriptors(), false, "wasapi_service_descriptors", &WindowsServices::invoke_wasapi},
+            {wic_service_descriptors(), false, "wic_service_descriptors", &WindowsServices::invoke_wic},
+            {media_foundation_service_descriptors(), false, "media_foundation_service_descriptors", &WindowsServices::invoke_media_foundation},
+            {dinput_service_descriptors(), false, "dinput_service_descriptors", &WindowsServices::invoke_dinput},
+            {directmusic_service_descriptors(), false, "directmusic_service_descriptors", &WindowsServices::invoke_directmusic},
+            {memory_service_descriptors(), true, "memory_service_descriptors", &WindowsServices::invoke_memory},
+            {service_control_descriptors(), false, "service_control_descriptors", &WindowsServices::invoke_service_control},
+            {shell_memory_stream_descriptors(), false, "shell_memory_stream_descriptors", &WindowsServices::invoke_ole_stream},
+            {shell_item_service_descriptors(), false, "shell_item_service_descriptors", &WindowsServices::invoke_shell_item},
+            {lsa_service_descriptors(), false, "lsa_service_descriptors", &WindowsServices::invoke_lsa},
+            {property_key_service_descriptors(), false, "property_key_service_descriptors", &WindowsServices::invoke_property_keys},
+            {printing_escape_service_descriptors(), false, "printing_escape_service_descriptors", &WindowsServices::invoke_printing},
+            {imm_service_descriptors(), false, "imm_service_descriptors", &WindowsServices::invoke_imm},
+            {shell_notification_service_descriptors(), false, "shell_notification_service_descriptors", &WindowsServices::invoke_shell_notification},
+            {certificate_decode_service_descriptors(), false, "certificate_decode_service_descriptors", &WindowsServices::invoke_certificate_decode},
+            {certificate_key_service_descriptors(), false, "certificate_key_service_descriptors", &WindowsServices::invoke_certificate_key},
+            {certificate_find_service_descriptors(), false, "certificate_find_service_descriptors", &WindowsServices::invoke_certificate_find},
+            {dpapi_service_descriptors(), false, "dpapi_service_descriptors", &WindowsServices::invoke_dpapi},
+            {credential_service_descriptors(), false, "credential_service_descriptors", &WindowsServices::invoke_credentials},
+            {dbghelp_symbol_service_descriptors(), false, "dbghelp_symbol_service_descriptors", &WindowsServices::invoke_dbghelp},
+            {minidump_service_descriptors(), false, "minidump_service_descriptors", &WindowsServices::invoke_dbghelp},
+            {heap_service_descriptors(), false, "heap_service_descriptors", &WindowsServices::invoke_heap},
+            {working_set_service_descriptors(), false, "working_set_service_descriptors", &WindowsServices::invoke_memory},
+            {anonymous_token_service_descriptors(), false, "anonymous_token_service_descriptors", &WindowsServices::invoke_security},
+            {etw_service_descriptors(), false, "etw_service_descriptors", &WindowsServices::invoke_etw},
+            {perflib_service_descriptors(), false, "perflib_service_descriptors", &WindowsServices::invoke_perflib},
+            {pdh_service_descriptors(), true, "pdh_service_descriptors", &WindowsServices::invoke_pdh},
+            {transaction_service_descriptors(), true, "transaction_service_descriptors", &WindowsServices::invoke_transactions},
+            {system_object_service_descriptors(), true, "system_object_service_descriptors", &WindowsServices::invoke_system_objects},
+            {dde_service_descriptors(), true, "dde_service_descriptors", &WindowsServices::invoke_dde},
+            {user_session_service_descriptors(), true, "user_session_service_descriptors", &WindowsServices::invoke_user_session},
+            {com_spy_service_descriptors(), true, "com_spy_service_descriptors", &WindowsServices::invoke_com_spy},
+            {url_security_service_descriptors(), true, "url_security_service_descriptors", &WindowsServices::invoke_url_security},
+            {dxva2_service_descriptors(), true, "dxva2_service_descriptors", &WindowsServices::invoke_dxva2},
+            {network_diagnostic_service_descriptors(), true, "network_diagnostic_service_descriptors", &WindowsServices::invoke_network_diagnostics},
+            {credential_ui_service_descriptors(), true, "credential_ui_service_descriptors", &WindowsServices::invoke_credential_ui},
+            {certificate_ui_service_descriptors(), true, "certificate_ui_service_descriptors", &WindowsServices::invoke_certificate_ui},
+            {winusb_service_descriptors(), true, "winusb_service_descriptors", &WindowsServices::invoke_winusb},
+            {wlan_service_descriptors(), true, "wlan_service_descriptors", &WindowsServices::invoke_wlan},
+            {font_package_service_descriptors(), true, "font_package_service_descriptors", &WindowsServices::invoke_font_package},
+            {mci_service_descriptors(), false, "mci_service_descriptors", &WindowsServices::invoke_mci},
         };
-        return detail::combine_service_descriptors(groups);
+        RuntimeCatalog result;std::vector<detail::ServiceDescriptorGroup> groups;
+        groups.reserve(std::size(entries));result.group_handlers.reserve(std::size(entries));
+        for(const auto& entry:entries){groups.push_back({entry.descriptors,entry.unique,entry.name});result.group_handlers.push_back(entry.handler);}
+        result.table=detail::combine_service_descriptors(groups,&result.audit);
+        result.routes.resize(result.table.size());
+        for(std::size_t index=0;index<result.table.size();++index)result.routes[index]=result.group_handlers[result.audit.origin[index]];
+        result.format.resize(result.table.size());
+        for(std::size_t index=0;index<result.table.size();++index)result.format[index]=!result.routes[index] && crt_format_symbol(result.table[index].symbol);
+        // 診斷覆寫：X64ARM_RESIDENT_COMPUTE_SERVICES=0 時，純時鐘查詢改走通用相容入口的對照實作。
+        const auto* clock_setting=std::getenv("X64ARM_RESIDENT_COMPUTE_SERVICES");
+        if(clock_setting && std::string_view(clock_setting)=="0")
+            for(std::size_t index=0;index<result.table.size();++index){
+                const auto& item=result.table[index];
+                if(item.family=="kernel32.dll" && (item.symbol=="QueryPerformanceCounter" || item.symbol=="QueryPerformanceFrequency" ||
+                   item.symbol=="GetSystemTimeAsFileTime" || item.symbol=="GetTickCount"))result.routes[index]=&WindowsServices::invoke_compatibility;
+            }
+        return result;
     }();
-    return combined;
+    return catalog;
 }
 std::size_t ansi_length(const GuestMemory& memory,std::uint64_t pointer,std::size_t limit) {
     for(std::size_t i=0;i<=limit;){
@@ -766,6 +812,8 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
         }
         memory.store(GuestAddress{peb_base_.value+8},32,runtime_.image.base);
         memory.store(GuestAddress{peb_base_.value+0x18},32,process_heap);
+        memory.store(GuestAddress{peb_base_.value+0xa4},32,windows_version_major);memory.store(GuestAddress{peb_base_.value+0xa8},32,windows_version_minor);
+        memory.store(GuestAddress{peb_base_.value+0xac},16,windows_version_build);memory.store(GuestAddress{peb_base_.value+0xb0},32,2);
         if(initial_thread){
         const auto parameter_header=detail::ProcessParameterLayout::for_x86(true).header;
         const auto parameters=runtime_allocate(memory,{},parameter_header);
@@ -792,7 +840,11 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
     memory.store(GuestAddress{teb_base_.value + 0x60}, 64, peb_base_.value);
     }
     memory.store(GuestAddress{peb_base_.value + 0x10}, 64, runtime_.image.base);
+    memory.store(GuestAddress{peb_base_.value + 0x30}, 64, process_heap); // ProcessHeap
     memory.store(GuestAddress{peb_base_.value + 0xb8}, 32, std::max(1U, runtime_.processor_count)); // NumberOfProcessors
+    // OSMajorVersion／OSMinorVersion／OSBuildNumber／OSPlatformId：與 RtlGetVersion 相同來源（自行讀 PEB 的版本檢查與防護層會用）。
+    memory.store(GuestAddress{peb_base_.value + 0x118}, 32, windows_version_major);memory.store(GuestAddress{peb_base_.value + 0x11c}, 32, windows_version_minor);
+    memory.store(GuestAddress{peb_base_.value + 0x120}, 16, windows_version_build);memory.store(GuestAddress{peb_base_.value + 0x124}, 32, 2);
     // RTL_USER_PROCESS_PARAMETERS64：供靜態 CRT 與原生 Win32 程式讀取程序資料。
     if(initial_thread){
     const auto parameter_header=detail::ProcessParameterLayout::for_x86(false).header;
@@ -2114,199 +2166,28 @@ void WindowsServices::report_crt_fast_fail(const GuestState& state,GuestMemory& 
         catch(const MemoryFault&){break;}catch(const HostCallFault&){break;}
     }
 }
+std::string_view WindowsServices::runtime_handler_name(RuntimeHandler handler) noexcept {
+    if(!handler)return {};
+#define X(name) if(handler==static_cast<RuntimeHandler>(&WindowsServices::name))return #name;
+#include "runtime_route_names.inc"
+#undef X
+    return "未列名";
+}
 std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service) {
     // 字元家族的操作已由不可變 descriptor 索引；完整與常駐入口共用 locale／ABI 實作。
     if(crt_character_requested() && crt_character_operation(service))return invoke_crt_character(state,memory,service);
     if(service.family=="user32.dll" || service.family=="gdi32.dll")gui_.message_threads.insert(threads_.current);
-    using Handler=std::optional<std::uint32_t>(WindowsServices::*)(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
-    // API 的所屬 provider 在程序期間固定；以 stub 對應的 descriptor 直接索引。
-    // 內部組合呼叫傳入的臨時 descriptor 仍走同一分類規則，保留原優先順序。
-    const auto classify=[](const WindowsServiceDescriptor& service)->Handler {
-        static const bool clock_provider=[] {const auto* setting=std::getenv("X64ARM_RESIDENT_COMPUTE_SERVICES");return !setting || std::string_view(setting)!="0";}();
-        // 純時鐘查詢共用時間 provider；不可變 descriptor 只分類一次，
-        // 不再逐次穿過通用相容入口的裝置、權限及環境分支。
-        if(clock_provider && service.family=="kernel32.dll" &&
-           (service.symbol=="QueryPerformanceCounter" || service.symbol=="QueryPerformanceFrequency" ||
-            service.symbol=="GetSystemTimeAsFileTime" || service.symbol=="GetTickCount"))return &WindowsServices::invoke_time;
-        static std::atomic<unsigned> observations{};
-        const auto threshold=static_cast<unsigned>(2*std::bit_width(runtime_service_descriptors().size()));
-        const bool reuse=observations.fetch_add(1,std::memory_order_relaxed)>=threshold;
-        if(angle_module(service.family))return &WindowsServices::invoke_angle;
-        if(native_library_module(service.family))return &WindowsServices::invoke_native_library;
-        if(service.family=="imm32.dll")return &WindowsServices::invoke_imm;
-        if(detail::service_descriptor_contains<printing_escape_service_descriptors>(service,reuse))return &WindowsServices::invoke_printing;
-        if(detail::service_descriptor_contains<property_key_service_descriptors>(service,reuse))return &WindowsServices::invoke_property_keys;
-        if(detail::service_descriptor_contains<shell_memory_stream_descriptors>(service,reuse))return &WindowsServices::invoke_ole_stream;
-        if(detail::service_descriptor_contains<service_control_descriptors>(service,reuse))return &WindowsServices::invoke_service_control;
-        if(detail::service_descriptor_contains<input_service_descriptors>(service,reuse))return &WindowsServices::invoke_input_api;
-        if(detail::service_descriptor_contains<raw_input_service_descriptors>(service,reuse))return &WindowsServices::invoke_raw_input;
-        if(detail::service_descriptor_contains<pointer_service_descriptors>(service,reuse))return &WindowsServices::invoke_pointer_input;
-        if(detail::service_descriptor_contains<hid_service_descriptors>(service,reuse))return &WindowsServices::invoke_hid;
-        if(detail::service_descriptor_contains<icon_service_descriptors>(service,reuse))return &WindowsServices::invoke_icon_api;
-        if(detail::service_descriptor_contains<script_service_descriptors>(service,reuse))return &WindowsServices::invoke_script;
-        if(detail::service_descriptor_contains<metafile_service_descriptors>(service,reuse))return &WindowsServices::invoke_metafile;
-        if(detail::service_descriptor_contains<eventlog_service_descriptors>(service,reuse))return &WindowsServices::invoke_eventlog;
-        if(detail::service_descriptor_contains<http_service_descriptors>(service,reuse))return &WindowsServices::invoke_http;
-        if(detail::service_descriptor_contains<fiber_service_descriptors>(service,reuse))return &WindowsServices::invoke_fiber;
-        if(detail::service_descriptor_contains<dib_transfer_service_descriptors>(service,reuse))return &WindowsServices::invoke_dib_transfer;
-        if(detail::service_descriptor_contains<gdiplus_service_descriptors>(service,reuse))return &WindowsServices::invoke_gdiplus;
-        if(detail::service_descriptor_contains<task_dialog_service_descriptors>(service,reuse))return &WindowsServices::invoke_task_dialog;
-        if(detail::service_descriptor_contains<opencl_service_descriptors>(service,reuse))return &WindowsServices::invoke_opencl;
-        if(service.family=="vulkan-1.dll")return &WindowsServices::invoke_vulkan;
-        if(service.family=="directml.dll" || service.family=="internal-directml")return &WindowsServices::invoke_directml;
-        if(service.family=="libxess.dll")return &WindowsServices::invoke_xess;
-        if(service.family=="msvcp140_1.dll" || service.family=="internal-msvcp140_1")return &WindowsServices::invoke_msvcp_pmr;
-        if(service.family=="msvcp140_2.dll")return &WindowsServices::invoke_msvcp_special_math;
-        if(service.family=="webview2loader.dll" || service.family=="internal-webview2")return &WindowsServices::invoke_webview2;
-        if(service.family=="d3d12.dll" || service.family=="internal-d3d12")return &WindowsServices::invoke_d3d12;
-        if(service.family=="dxcore.dll" || service.family=="internal-dxcore")return &WindowsServices::invoke_dxcore;
-        if(detail::service_descriptor_contains<print_dialog_service_descriptors>(service,reuse))return service.family=="comctl32.dll"?&WindowsServices::invoke_property_page:&WindowsServices::invoke_print_dialog;
-        if(detail::service_descriptor_contains<printing_service_descriptors>(service,reuse))return &WindowsServices::invoke_printing;
-        if(detail::service_descriptor_contains<gdi_path_service_descriptors>(service,reuse))return &WindowsServices::invoke_gdi_path;
-        if(detail::service_descriptor_contains<gdi_state_service_descriptors>(service,reuse))return &WindowsServices::invoke_gdi_state;
-        if(service.family=="oleacc.dll" || service.family=="uiautomationcore.dll" || service.family=="internal-accessible")return &WindowsServices::invoke_accessible;
-        if(service.family=="dwrite.dll" || service.family=="internal-dwrite")return &WindowsServices::invoke_dwrite;
-        if(detail::service_descriptor_contains<registered_wait_service_descriptors>(service,reuse))return &WindowsServices::invoke_registered_wait;
-        if(service.family=="dbghelp.dll" || service.family=="dbgcore.dll")return &WindowsServices::invoke_dbghelp;
-        if(detail::service_descriptor_contains<locale_service_descriptors>(service,reuse))return &WindowsServices::invoke_locale;
-        if(detail::service_descriptor_contains<heap_service_descriptors>(service,reuse))return &WindowsServices::invoke_heap;
-        if(detail::service_descriptor_contains<anonymous_token_service_descriptors>(service,reuse))return &WindowsServices::invoke_security;
-        if(detail::service_descriptor_contains<working_set_service_descriptors>(service,reuse))return &WindowsServices::invoke_memory;
-        if(detail::service_descriptor_contains<font_service_descriptors>(service,reuse))return &WindowsServices::invoke_fonts;
-        if(detail::service_descriptor_contains<winstation_service_descriptors>(service,reuse))return &WindowsServices::invoke_winstation;
-        if(detail::service_descriptor_contains<profile_service_descriptors>(service,reuse))return &WindowsServices::invoke_profile;
-        if(detail::service_descriptor_contains<version_service_descriptors>(service,reuse))return &WindowsServices::invoke_version;
-        if(detail::service_descriptor_contains<theme_service_descriptors>(service,reuse))return &WindowsServices::invoke_theme;
-        if(detail::service_descriptor_contains<property_service_descriptors>(service,reuse))return &WindowsServices::invoke_properties;
-        if(detail::service_descriptor_contains<activation_service_descriptors>(service,reuse))return &WindowsServices::invoke_activation;
-        if(detail::service_descriptor_contains<hook_service_descriptors>(service,reuse))return &WindowsServices::invoke_hooks;
-        if(detail::service_descriptor_contains<graphics_compat_service_descriptors>(service,reuse))return &WindowsServices::invoke_graphics_compat;
-        if(detail::service_descriptor_contains<legacy_gdi_service_descriptors>(service,reuse))return &WindowsServices::invoke_legacy_gdi;
-        if(detail::service_descriptor_contains<legacy_user_service_descriptors>(service,reuse))return &WindowsServices::invoke_legacy_user;
-        if(service.family=="ntoskrnl.exe" || service.family=="hal.dll")return &WindowsServices::invoke_kernel_api;
-        if(detail::service_descriptor_contains<userstring_service_descriptors>(service,reuse))return &WindowsServices::invoke_userstring;
-        if(detail::service_descriptor_contains<control_service_descriptors>(service,reuse))return &WindowsServices::invoke_control_api;
-        if(detail::service_descriptor_contains<msvc_service_descriptors>(service,reuse))return &WindowsServices::invoke_msvc;
-        if(detail::service_descriptor_contains<resource_service_descriptors>(service,reuse))return &WindowsServices::invoke_resource;
-        if(detail::service_descriptor_contains<lsa_service_descriptors>(service,reuse))return &WindowsServices::invoke_lsa;
-        if(detail::service_descriptor_contains<security_service_descriptors>(service,reuse))return &WindowsServices::invoke_security;
-        if (service.family == "internal-dmusic" || service.family == "dmusic.dll" || service.family == "dmime.dll" || service.family == "dmloader.dll") return &WindowsServices::invoke_directmusic;
-        if (service.family == "dsound.dll" || service.family == "internal-dsound") return &WindowsServices::invoke_dsound;
-        if (service.family == "internal-xaudio" || service.family == "xaudio2_7.dll" || service.family == "xaudio2_8.dll" || service.family == "xaudio2_9.dll") return &WindowsServices::invoke_xaudio;
-        if (service.family == "mmdevapi.dll" || service.family == "audioses.dll" || service.family == "internal-wasapi") return &WindowsServices::invoke_wasapi;
-        if (service.family == "mfplat.dll" || service.family == "mf.dll" || service.family == "mfreadwrite.dll" || service.family == "internal-mf") return &WindowsServices::invoke_media_foundation;
-        if(detail::service_descriptor_contains<dinput_service_descriptors>(service,reuse))return &WindowsServices::invoke_dinput;
-        if (service.family == "d3d9.dll" || service.family == "internal-d3d9") return &WindowsServices::invoke_d3d9;
-        if(service.family=="d3dx9_42.dll" || service.family=="d3dx9_43.dll")
-            if(detail::service_descriptor_contains<d3d9_service_descriptors>(service,reuse))return &WindowsServices::invoke_d3d9;
-        if (service.family == "d3d10.dll" || service.family == "d3d10_1.dll" || service.family == "internal-d3d10" || service.family == "d3dx10_43.dll" || service.family == "d3d11.dll" || service.family == "dxgi.dll" || service.family == "internal-d3d11" || service.family == "d3dcompiler_47.dll" || service.family == "d3dcompiler_43.dll" || service.family == "d3dx11_42.dll" || service.family == "d3dx11_43.dll")
-            return &WindowsServices::invoke_d3d11;
-        constexpr std::array io_names{"_sopen_dispatch","_wsopen_dispatch","tmpfile","tmpfile_s","_umask","_umask_s","_creat", "_wcreat", "freopen", "_wfreopen", "_chsize", "_chsize_s", "_open_osfhandle", "_get_osfhandle", "_filelength", "_filelengthi64", "fgetpos", "fsetpos", "fopen_s", "_wfopen_s", "fopen", "_wfopen", "_fsopen", "_wfsopen", "_commit", "fclose", "fread", "fwrite", "fseek", "_fseeki64", "ftell", "_ftelli64", "feof", "ferror", "clearerr", "rewind", "fgetwc", "fgetws", "fputwc", "ungetc", "ungetwc", "getchar", "fgetc", "getc", "fgets", "fputs", "fputc", "putc", "fflush", "_flushall", "_fcloseall", "setvbuf", "setbuf", "_getmaxstdio", "_setmaxstdio", "_dup2", "_locking", "_dup", "_fdopen", "_wfdopen", "_close", "_read", "_write", "_open", "_wopen", "_sopen", "_wsopen", "_sopen_s", "_wsopen_s", "_lseek", "_lseeki64", "_tell", "_telli64", "_isatty", "_setmode"};
-        if (service.family == "crt" && std::find(io_names.begin(), io_names.end(), service.symbol) != io_names.end()) return &WindowsServices::invoke_crt_io;
-        if(detail::service_descriptor_contains<tls_service_descriptors>(service,reuse))return &WindowsServices::invoke_tls;
-        if(service.family=="internal-msxml")return &WindowsServices::invoke_msxml;
-        if(service.family=="internal-ribbon")return &WindowsServices::invoke_ribbon;
-        if(detail::service_descriptor_contains<wmi_service_descriptors>(service,reuse))return &WindowsServices::invoke_wmi;
-        if(detail::service_descriptor_contains<safearray_service_descriptors>(service,reuse))return &WindowsServices::invoke_safearray;
-        if(detail::service_descriptor_contains<ole_stream_service_descriptors>(service,reuse))return &WindowsServices::invoke_ole_stream;
-        if(detail::service_descriptor_contains<storage_service_descriptors>(service,reuse))return &WindowsServices::invoke_storage;
-        if(service.family=="msi.dll")return &WindowsServices::invoke_msi;
-        if(service.family=="esent.dll")return &WindowsServices::invoke_esent;
-        if(detail::service_descriptor_contains<ole_service_descriptors>(service,reuse))return &WindowsServices::invoke_ole;
-        if(detail::service_descriptor_contains<gui_drag_service_descriptors>(service,reuse))return &WindowsServices::invoke_gui_drag;
-        if(service.family=="internal-window-interaction")return &WindowsServices::invoke_gui_move_size;
-        if(service.family=="internal-ole-drag" || (service.family=="ole32.dll" && service.symbol=="DoDragDrop"))return &WindowsServices::invoke_ole_drag;
-        if(service.family=="internal-com-proxy")return &WindowsServices::invoke_com_proxy;
-        if(detail::service_descriptor_contains<gui_rpc_service_descriptors>(service,reuse))return &WindowsServices::invoke_gui_rpc;
-        if(detail::service_descriptor_contains<desktop_notification_service_descriptors>(service,reuse))return &WindowsServices::invoke_desktop_notification;
-        if(detail::service_descriptor_contains<winrt_error_service_descriptors>(service,reuse))return &WindowsServices::invoke_winrt_error;
-        if(detail::service_descriptor_contains<com_error_service_descriptors>(service,reuse))return &WindowsServices::invoke_com_error;
-        if(detail::service_descriptor_contains<type_library_service_descriptors>(service,reuse))return &WindowsServices::invoke_type_library;
-        if(detail::service_descriptor_contains<com_marshal_service_descriptors>(service,reuse))return &WindowsServices::invoke_com_marshal;
-        if(detail::service_descriptor_contains<com_context_service_descriptors>(service,reuse))return &WindowsServices::invoke_com_context;
-        if(detail::service_descriptor_contains<winrt_service_descriptors>(service,reuse))return &WindowsServices::invoke_winrt;
-        if(detail::service_descriptor_contains<power_notification_service_descriptors>(service,reuse))return &WindowsServices::invoke_power_notification;
-        if(detail::service_descriptor_contains<data_protection_service_descriptors>(service,reuse))return &WindowsServices::invoke_data_protection;
-        if(detail::service_descriptor_contains<application_policy_service_descriptors>(service,reuse))return &WindowsServices::invoke_application_policy;
-        if(detail::service_descriptor_contains<shell_notification_service_descriptors>(service,reuse))return &WindowsServices::invoke_shell_notification;
-        if(detail::service_descriptor_contains<shell_item_service_descriptors>(service,reuse))return &WindowsServices::invoke_shell_item;
-        if(detail::service_descriptor_contains<shell_service_descriptors>(service,reuse))return &WindowsServices::invoke_shell;
-        if(detail::service_descriptor_contains<registry_service_descriptors>(service,reuse))return &WindowsServices::invoke_registry;
-        if(detail::service_descriptor_contains<error_service_descriptors>(service,reuse))return &WindowsServices::invoke_error;
-        if(detail::service_descriptor_contains<volume_service_descriptors>(service,reuse))return &WindowsServices::invoke_volume;
-        if(detail::service_descriptor_contains<serial_service_descriptors>(service,reuse))return &WindowsServices::invoke_serial;
-        if(detail::service_descriptor_contains<console_service_descriptors>(service,reuse))return &WindowsServices::invoke_console_control;
-        if(detail::service_descriptor_contains<file_service_descriptors>(service,reuse))return &WindowsServices::invoke_file;
-        if(detail::service_descriptor_contains<file_encryption_service_descriptors>(service,reuse))return &WindowsServices::invoke_file_encryption;
-        if(detail::service_descriptor_contains<thread_service_descriptors>(service,reuse))return &WindowsServices::invoke_thread;
-        if(detail::service_descriptor_contains<etw_service_descriptors>(service,reuse))return &WindowsServices::invoke_etw;
-        if(detail::service_descriptor_contains<perflib_service_descriptors>(service,reuse))return &WindowsServices::invoke_perflib;
-        if(service.family=="pdh.dll")return &WindowsServices::invoke_pdh;
-        if(detail::service_descriptor_contains<transaction_service_descriptors>(service,reuse))return &WindowsServices::invoke_transactions;
-        if(detail::service_descriptor_contains<system_object_service_descriptors>(service,reuse))return &WindowsServices::invoke_system_objects;
-        if(detail::service_descriptor_contains<dde_service_descriptors>(service,reuse))return &WindowsServices::invoke_dde;
-        if(detail::service_descriptor_contains<user_session_service_descriptors>(service,reuse))return &WindowsServices::invoke_user_session;
-        if(detail::service_descriptor_contains<com_spy_service_descriptors>(service,reuse))return &WindowsServices::invoke_com_spy;
-        if(service.family=="urlmon.dll" || service.family=="internal-url-security")return &WindowsServices::invoke_url_security;
-        if(service.family=="dxva2.dll" || service.family.starts_with("internal-dxva2-"))return &WindowsServices::invoke_dxva2;
-        if(service.family=="ndfapi.dll")return &WindowsServices::invoke_network_diagnostics;
-        if(service.family=="credui.dll")return &WindowsServices::invoke_credential_ui;
-        if(service.family=="cryptui.dll")return &WindowsServices::invoke_certificate_ui;
-        if(service.family=="winusb.dll")return &WindowsServices::invoke_winusb;
-        if(service.family=="wlanapi.dll")return &WindowsServices::invoke_wlan;
-        if(service.family=="fontsub.dll")return &WindowsServices::invoke_font_package;
-        if(detail::service_descriptor_contains<mci_service_descriptors>(service,reuse))return &WindowsServices::invoke_mci;
-        if(detail::service_descriptor_contains<reparse_service_descriptors>(service,reuse))return &WindowsServices::invoke_reparse;
-        if(detail::service_descriptor_contains<environment_service_descriptors>(service,reuse))return &WindowsServices::invoke_environment;
-        if(detail::service_descriptor_contains<memory_service_descriptors>(service,reuse))return &WindowsServices::invoke_memory;
-        if (service.family == "iphlpapi.dll" && (service.symbol.starts_with("Icmp") || service.symbol.ends_with("ThreadCompartmentId"))) return &WindowsServices::invoke_network;
-        if (service.family == "iphlpapi.dll" || service.family=="winhttp.dll" || service.family=="dhcpcsvc.dll") return &WindowsServices::invoke_network_config;
-        if (service.family == "ws2_32.dll" || service.family=="mswsock.dll" || service.family=="dnsapi.dll") return &WindowsServices::invoke_network;
-        if (service.family == "mpr.dll") return &WindowsServices::invoke_mpr;
-        if(detail::service_descriptor_contains<dpapi_service_descriptors>(service,reuse))return &WindowsServices::invoke_dpapi;
-        if(detail::service_descriptor_contains<credential_service_descriptors>(service,reuse))return &WindowsServices::invoke_credentials;
-        if(detail::service_descriptor_contains<certificate_find_service_descriptors>(service,reuse))return &WindowsServices::invoke_certificate_find;
-        if(detail::service_descriptor_contains<certificate_key_service_descriptors>(service,reuse))return &WindowsServices::invoke_certificate_key;
-        if(detail::service_descriptor_contains<certificate_decode_service_descriptors>(service,reuse))return &WindowsServices::invoke_certificate_decode;
-        if(detail::service_descriptor_contains<certificate_service_descriptors>(service,reuse))return &WindowsServices::invoke_certificate;
-        if(detail::service_descriptor_contains<crypto_service_descriptors>(service,reuse))return &WindowsServices::invoke_crypto;
-        if(detail::service_descriptor_contains<opengl_service_descriptors>(service,reuse))return &WindowsServices::invoke_opengl;
-        if(detail::service_descriptor_contains<process_service_descriptors>(service,reuse))return &WindowsServices::invoke_process;
-        if(detail::service_descriptor_contains<nt_native_service_descriptors>(service,reuse))return &WindowsServices::invoke_nt_native;
-        if(detail::service_descriptor_contains<nt_process_service_descriptors>(service,reuse))return &WindowsServices::invoke_nt_process;
-        if(detail::service_descriptor_contains<mapping_service_descriptors>(service,reuse))return &WindowsServices::invoke_mapping;
-        if(detail::service_descriptor_contains<time_service_descriptors>(service,reuse))return &WindowsServices::invoke_time;
-        if(detail::service_descriptor_contains<path_service_descriptors>(service,reuse))return &WindowsServices::invoke_path;
-        if(detail::service_descriptor_contains<crt_string_service_descriptors>(service,reuse))return &WindowsServices::invoke_crt_string;
-        if(detail::service_descriptor_contains<math_service_descriptors>(service,reuse))return &WindowsServices::invoke_math;
-        if(detail::service_descriptor_contains<compatibility_service_descriptors>(service,reuse) || crt_character_operation(service))return &WindowsServices::invoke_compatibility;
-        if(detail::service_descriptor_contains<menu_service_descriptors>(service,reuse))return &WindowsServices::invoke_menu;
-        if(service.family=="comdlg32.dll" || service.family=="oledlg.dll")return &WindowsServices::invoke_common_dialog;
-        if(detail::service_descriptor_contains<gdi_service_descriptors>(service,reuse))return &WindowsServices::invoke_gdi;
-        if(detail::service_descriptor_contains<gui_service_descriptors>(service,reuse))return &WindowsServices::invoke_gui_support;
-        if (service.family == "user32.dll" || service.family == "gdi32.dll") return &WindowsServices::invoke_gui;
-        if(service.symbol=="RtlMoveMemory")return nullptr; // 記憶體搬移走共用 CRT 核心，不是例外處理服務。
-        if (service.symbol == "DebugBreak" || service.symbol == "UnhandledExceptionFilter" || service.symbol == "__crtUnhandledException" || service.symbol == "__crtCapturePreviousContext" || service.symbol == "RaiseException" || service.symbol == "RaiseFailFastException" || service.symbol == "AddVectoredExceptionHandler" || service.symbol == "RemoveVectoredExceptionHandler" || service.symbol == "AddVectoredContinueHandler" || service.symbol == "RemoveVectoredContinueHandler" || service.symbol.starts_with("Rtl") || service.symbol == "__C_specific_handler" || service.symbol == "_local_unwind" || service.symbol.find("setjmp") != std::string_view::npos || (service.symbol == "longjmp" || service.symbol == "_longjmpex"))
-            return &WindowsServices::invoke_exception;
-        return nullptr;
-    };
-    const auto table=runtime_service_descriptors();
-    // 只分類實際呼叫的 API；release/acquire 發布不可變 handler，熱路徑不取鎖。
-    struct Slot { std::atomic<bool> ready{false};std::once_flag once;Handler handler{};bool format{}; };
-    static const auto handlers=std::make_unique<Slot[]>(table.size());
+    using Handler=RuntimeHandler;
+    // 處理函式由服務目錄宣告（群組＝路由單位），以 stub 對應的 descriptor 位置直接索引；
+    // 內部組合呼叫傳入的臨時 descriptor 以家族＋名稱找到同一筆登錄。
+    const auto& catalog=runtime_catalog();const std::span<const WindowsServiceDescriptor> table=catalog.table;
     const auto descriptor_address=reinterpret_cast<std::uintptr_t>(&service),descriptor_begin=reinterpret_cast<std::uintptr_t>(table.data());
     const auto cached=descriptor_address>=descriptor_begin && descriptor_address-descriptor_begin<table.size_bytes() && (descriptor_address-descriptor_begin)%sizeof(WindowsServiceDescriptor)==0;
+    const auto entry=cached?(descriptor_address-descriptor_begin)/sizeof(WindowsServiceDescriptor):catalog.find(service);
     Handler handler{};bool format_service=false;
     static const bool format_provider=[] {const auto* setting=std::getenv("X64ARM_CRT_FORMAT_PROVIDER");return !setting || std::string_view(setting)!="0";}();
-    if(cached){
-        auto& slot=handlers[(descriptor_address-descriptor_begin)/sizeof(WindowsServiceDescriptor)];
-        if(!slot.ready.load(std::memory_order_acquire))std::call_once(slot.once,[&]{
-            slot.handler=classify(service);
-            slot.format=!slot.handler && crt_format_symbol(service.symbol);
-            slot.ready.store(true,std::memory_order_release);
-        });
-        handler=slot.handler;format_service=slot.format;
-    }else {handler=classify(service);format_service=!handler && crt_format_symbol(service.symbol);}
+    if(entry<table.size()){handler=catalog.routes[entry];format_service=catalog.format[entry]!=0;}
+    else format_service=crt_format_symbol(service.symbol);
     if(handler){
         const bool gdi=(service.family=="gdi32.dll" || service.family=="msimg32.dll" || handler==&WindowsServices::invoke_gdi) &&
             service.symbol!="GdiFlush" && service.symbol!="GdiGetBatchLimit" && service.symbol!="GdiSetBatchLimit";
@@ -2981,4 +2862,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& stat
     arg.return_to(state,result);return std::nullopt;
 }
 
+// 服務登錄稽核：把合併後的延伸描述表、各群組的排重結果與路由一次輸出成 JSON。只讀取靜態資料，不需要客體程式。
+void WindowsServices::audit_runtime_services(std::ostream& out) {
+    const auto& catalog=runtime_catalog();const std::span<const WindowsServiceDescriptor> table=catalog.table;const auto& audit=catalog.audit;
+    const auto text=[&](std::string_view value){out<<'"';for(const char c:value){if(c=='"' || c=='\\')out<<'\\';out<<c;}out<<'"';};
+    const auto abi=[&](const WindowsServiceDescriptor& d){
+        out<<"\"args\":"<<d.arguments<<",\"wide\":"<<d.wide_arguments<<",\"aggregate\":"<<d.aggregate_arguments<<",\"narrow\":"<<d.narrow_arguments
+           <<",\"caller_cleanup\":"<<(d.caller_cleanup?"true":"false");
+    };
+    const auto same_abi=[](const WindowsServiceDescriptor& a,const WindowsServiceDescriptor& b){
+        return a.arguments==b.arguments && a.wide_arguments==b.wide_arguments && a.aggregate_arguments==b.aggregate_arguments &&
+            a.narrow_arguments==b.narrow_arguments && a.caller_cleanup==b.caller_cleanup;
+    };
+    std::vector<std::size_t> kept(audit.groups.size()),dropped(audit.groups.size());
+    for(const auto group:audit.origin)++kept[group];for(const auto& item:audit.dropped)++dropped[item.group];
+    out<<"{\"schema\":1,\"count\":"<<table.size()<<",\"groups\":[";
+    for(std::size_t g=0;g<audit.groups.size();++g){
+        out<<(g?",":"")<<"\n{\"index\":"<<g<<",\"name\":";text(audit.groups[g]);
+        out<<",\"unique\":"<<(audit.unique[g]?"true":"false")<<",\"kept\":"<<kept[g]<<",\"dropped\":"<<dropped[g]<<",\"handler\":";
+        text(runtime_handler_name(catalog.group_handlers[g]));out<<'}';
+    }
+    out<<"],\"services\":[";std::size_t mismatches=0;
+    for(std::size_t i=0;i<table.size();++i){
+        const auto& d=table[i];out<<(i?",":"")<<"\n{\"index\":"<<i<<",\"family\":";text(d.family);out<<",\"symbol\":";text(d.symbol);out<<',';abi(d);
+        const auto group_route=catalog.group_handlers[audit.origin[i]];const auto declared=catalog.routes[i];mismatches+=group_route!=declared;
+        out<<",\"group\":"<<audit.origin[i]<<",\"route\":";text(runtime_handler_name(declared));
+        if(group_route!=declared){out<<",\"group_route\":";text(runtime_handler_name(group_route));}out<<'}';
+    }
+    out<<"],\"dropped\":[";bool first=true;std::size_t conflicts=0;
+    for(const auto& item:audit.dropped){
+        const auto& winner=table[item.kept];const bool conflict=!same_abi(item.descriptor,winner);conflicts+=conflict;
+        out<<(first?"":",")<<"\n{\"family\":";text(item.descriptor.family);out<<",\"symbol\":";text(item.descriptor.symbol);out<<',';abi(item.descriptor);
+        out<<",\"group\":"<<item.group<<",\"kept_index\":"<<item.kept<<",\"kept_group\":"<<audit.origin[item.kept]
+           <<",\"abi_conflict\":"<<(conflict?"true":"false")<<'}';first=false;
+    }
+    out<<"],\"abi_conflicts\":"<<conflicts<<",\"route_overrides\":"<<mismatches<<"}\n";
+}
 }
