@@ -354,6 +354,10 @@ func run() error {
 			return onUI(bridge, func() ([]string, error) { return nativePick(true, false, req.Data) })
 		case "diagnostics":
 			return app.Diagnostics(req.ID)
+		case "cacheUsage":
+			return app.CacheUsage(), nil
+		case "clearCache":
+			return app.ClearCache(req.Data)
 		case "checkUpdate":
 			return updates.Start(false), nil
 		case "installUpdate":

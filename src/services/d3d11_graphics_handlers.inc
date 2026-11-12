@@ -546,6 +546,11 @@
                         auto& waiter=threads_.items.at(threads_.current);waiter.status=ThreadStatus::Waiting;waiter.wait={};waiter.wait.kind=ThreadWaitKind::ShaderRetry;
                         waiter.wait.deadline=runtime_.clock_ticks+UINT64_C(300000000); // 30 秒保底，到期仍未完成就再等一輪
                         shader_waits_[threads_.current]={device->native,ticket};record_diagnostic("d3d11_shader_wait");
+                        static const bool trace_waits=std::getenv("X64ARM_TRACE_SHADER_WAITS")!=nullptr;
+                        if(trace_waits)std::fprintf(stderr,"shader_wait_begin pid=%llu thread=%llu ticket=0x%llx stage=%u unix_us=%llu\n",
+                            static_cast<unsigned long long>(process_id()),static_cast<unsigned long long>(threads_.current),
+                            static_cast<unsigned long long>(ticket),stage,static_cast<unsigned long long>(
+                                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
                         static const bool trace_async=std::getenv("X64ARM_TRACE_SHADER_ASYNC")!=nullptr;
                         if(trace_async)std::fprintf(stderr,"[shader_async] wait thread=%llu stage=%u ticket=%llx\n",static_cast<unsigned long long>(threads_.current),stage,static_cast<unsigned long long>(ticket));
                         schedule(state,memory);return std::nullopt;

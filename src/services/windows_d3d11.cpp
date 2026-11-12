@@ -739,7 +739,7 @@ bool WindowsServices::d3d11_local_eligible(const GuestState& state,GuestMemory& 
     if(device->second.identity->protected_threads && device->second.identity->lock_address){d3d11_local_refusal="multithread-protected";return false;}
     d3d11_local_refusal=nullptr;return true;
 }catch(const MemoryFault&){d3d11_local_refusal="fault";return false;}catch(const HostCallFault&){d3d11_local_refusal="fault";return false;}
-std::recursive_mutex& WindowsServices::graphics_mutex() noexcept {static std::recursive_mutex value;return value;}
+GraphicsMutex& WindowsServices::graphics_mutex() noexcept {static GraphicsMutex value;return value;}
 // 前置快速路徑：完整分派函式內聯了上百個方法與數十個繪製狀態暫存物件，堆疊框架很大，每次呼叫都要逐頁探測
 // 堆疊與初始化；遊戲內 D3D11 呼叫約八成是 COM AddRef／Release 與 GetDesc（DQ3 每秒十餘萬次），在進入完整函式前
 // 以相同語義完成：AddRef 與非最後一次 Release 只改引用計數；GetDesc 只把建立時保存的描述寫回客體，並遵守
@@ -801,7 +801,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
     static const bool draw_front_path=[] {const auto* value=std::getenv("X64ARM_D3D11_DRAW_FRONT_PATH");return front_path && (!value || std::string_view(value)!="0");}();
     const auto symbol=service.symbol;
     if(const auto setter=setter_front_path?d3d11_setter_method(service):D3D11SetterMethod{};setter.kind!=D3D11Setter::None && d3d11_ && service.family=="internal-d3d11"){
-        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+        std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         auto& bridge=*d3d11_;
         if(runtime_.network.external_io && (graphics_local() || bridge.deferred_releases.empty())){
             const WindowsCall arg(state,memory,service);
@@ -810,7 +810,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
         }
     }
     if(const auto method=draw_front_path?d3d11_draw_method(service):D3D11DrawMethod::None;method!=D3D11DrawMethod::None && d3d11_ && service.family=="internal-d3d11"){
-        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+        std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         auto& bridge=*d3d11_;
         if(runtime_.network.external_io && (graphics_local() || bridge.deferred_releases.empty())){
             const WindowsCall arg(state,memory,service);
@@ -834,7 +834,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
     const bool desc=!com && (symbol=="BufferGetDesc" || symbol=="Texture1DGetDesc" || symbol=="Texture3DGetDesc" || symbol=="GraphicsGetDesc");
     if(front_path && (com || desc) && d3d11_ &&
        (service.family=="internal-d3d11" || (com && service.family=="internal-d3d10"))){
-        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+        std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         auto& bridge=*d3d11_;
         if(runtime_.network.external_io && (graphics_local() || bridge.deferred_releases.empty())){
             const WindowsCall arg(state,memory,service);
@@ -860,7 +860,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11(GuestState& state,Gue
 std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     // worker 可直接執行裝置內容方法（見 graphics_worker_service）；所有 D3D11 服務在此串行化。
     // 以登記等待者的方式取鎖：D3D12 提交執行緒看到等待者就在命令之間讓出（DXGI EnumOutputs／GetDesc 原本在全停中等整段重播）。
-    std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+    std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
     if(!runtime_.network.external_io)throw HostCallFault("原生硬體裝置不能在 compare 模式建立或使用");
     if(!d3d11_)d3d11_=std::make_shared<D3D11State>();
     auto& bridge=*d3d11_;

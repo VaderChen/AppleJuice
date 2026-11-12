@@ -1444,7 +1444,7 @@ class CocoaGui final : public NativeGui {
         return CGCompleteDisplayConfiguration(config,kCGConfigureForAppOnly)==kCGErrorSuccess;
     }
     bool restore_display_mode(){
-        display_mode_cached_=false;
+        display_mode_cached_=false;display_modes_cached_=false;
         if(original_display_mode_){const auto current=CGDisplayCopyDisplayMode(fullscreen_display_);const bool ours=current && display_mode_id(current)==written_display_mode_;if(current)CGDisplayModeRelease(current);
             if(ours && written_display_mode_!=display_mode_id(original_display_mode_) && !configure_display(fullscreen_display_,original_display_mode_))return false;
             CGDisplayModeRelease(original_display_mode_);original_display_mode_=nullptr;
@@ -1642,6 +1642,7 @@ class CocoaGui final : public NativeGui {
     NSString* __strong automation_live_path_{};
     // current_display_mode 的短期快取（見該函式）。
     std::optional<GuiDisplayMode> display_mode_cache_{};bool display_mode_cached_{};std::chrono::steady_clock::time_point display_mode_time_{};
+    std::vector<GuiDisplayMode> display_modes_cache_{};bool display_modes_cached_{};std::chrono::steady_clock::time_point display_modes_time_{};
     bool automation_input_active_{}; // 背景顯示下由自動化 window_activate 模擬的前景輸入狀態。
     bool show_inactive_{}; // 目前的 show 來自 SWP_NOACTIVATE／SW_SHOWNA：只排入前景，不成為 key window。
     NSDate* automation_read_time_{};
@@ -2213,6 +2214,11 @@ public:
         return result;
     }
     std::vector<GuiDisplayMode> display_modes() override {
+        // CGDisplayCopyAllDisplayModes 同樣經 WindowServer 往返；EnumDisplaySettings／GetDisplayModeList 每次都要整份清單
+        //（2026-11-11 電馭判客 Benchmark EnumDisplaySettingsW 每秒約 100 次、每次約 77 µs，且在協調者的獨占映射鎖下，期間所有
+        // worker 服務停等）。與 current_display_mode 相同快取 250 ms，本程序切換或還原顯示模式時清除。
+        const auto requested=std::chrono::steady_clock::now();
+        if(display_modes_cached_ && requested-display_modes_time_<std::chrono::milliseconds(250))return display_modes_cache_;
         std::vector<GuiDisplayMode> result;const auto modes=CGDisplayCopyAllDisplayModes(coordinate_display(),nullptr);if(!modes)return result;
         for(CFIndex i=0;i<CFArrayGetCount(modes);++i){const auto mode=static_cast<CGDisplayModeRef>(const_cast<void*>(CFArrayGetValueAtIndex(modes,i)));if(!CGDisplayModeIsUsableForDesktopGUI(mode))continue;
             auto value=describe_display_mode(mode);if(!value.width || !value.height || value.width>16384 || value.height>16384)continue;
@@ -2224,13 +2230,14 @@ public:
             std::erase_if(result,[&](const auto& m){return m.width>size->first || m.height>size->second;});
             if(const auto current=current_display_mode();current && std::none_of(result.begin(),result.end(),[&](const auto& m){return m.width==size->first && m.height==size->second;}))result.push_back(*current);
         }
-        std::sort(result.begin(),result.end(),[](const auto& a,const auto& b){return std::tie(a.width,a.height,a.refresh_numerator)<std::tie(b.width,b.height,b.refresh_numerator);});return result;
+        std::sort(result.begin(),result.end(),[](const auto& a,const auto& b){return std::tie(a.width,a.height,a.refresh_numerator)<std::tie(b.width,b.height,b.refresh_numerator);});
+        display_modes_cache_=result;display_modes_cached_=true;display_modes_time_=requested;return result;
     }
     bool display_fullscreen(std::uint64_t handle,bool enabled,const std::optional<GuiDisplayMode>& desired={}) override {
         const auto found=windows_.find(handle);if(found==windows_.end() || !found->second.native)return !enabled && (!fullscreen_window_ || fullscreen_window_==handle) && restore_display_mode();
         if(offline_render_enabled()){found->second.fullscreen=enabled;return true;}
         auto& window=found->second;if(fullscreen_window_ && fullscreen_window_!=handle)return false;
-        display_mode_cached_=false;
+        display_mode_cached_=false;display_modes_cached_=false;
         if(!enabled){if(!restore_display_mode())return false;window.fullscreen=false;apply_z_order(handle);return true;}
         if(!window.native.visible || window.native.miniaturized)return false;
         const auto display=coordinate_display();const auto current=CGDisplayCopyDisplayMode(display);if(!current)return false;

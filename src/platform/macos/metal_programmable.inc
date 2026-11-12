@@ -88,6 +88,7 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_shader(std::uint32_t stage,std
     };
     if(auto cached=cached_shader())return cached;
     // 背景編譯與協調者可能同時要同一份內容：取得編譯鎖後再查一次快取，不重複轉譯。
+    MetalStallScope compilation_timing("shader_compile_gate",0,stage,key);
     const std::lock_guard compile(shader_compile_mutex_);
     if(auto cached=cached_shader())return cached;
     auto created=graphics_shader_create(stage,bytes);
@@ -223,6 +224,7 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_compute_source(const GraphicsM
     return shader;
 }}
 std::shared_ptr<GraphicsShader> MetalGl::graphics_translate_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes,GLSLCrossDependencyData* shared){@autoreleasepool{
+    MetalStallScope translation_timing("shader_translation",0,stage);
     const std::lock_guard compile(shader_compile_mutex_); // 曲面細分等直接呼叫者與背景編譯共用 HLSLcc
     if(stage>5)throw std::invalid_argument("Metal 著色器階段不合法");
     // 先檢查容器與 token 邊界，避免把截斷的客體資料交給第三方解碼器。
@@ -398,6 +400,7 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_translate_shader(std::uint32_t
         }];
         return shader;
     }
+    MetalStallScope validation_timing("shader_validation_sync",shader->serial,stage);
     auto library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:compilation.c_str()] options:options error:&error];
     if(!library)throw std::invalid_argument("Metal 著色器編譯失敗："+std::string(error.localizedDescription.UTF8String)+"\n"+compilation);
     if(stage==2 || intermediate)return shader;
@@ -453,11 +456,17 @@ void MetalGl::graphics_write_buffer(const std::shared_ptr<GraphicsResource>& res
     auto& target=metal_resource(resource);
     if(target.constant_bytes_match(data,offset)){++constant_upload_skips_;constant_upload_saved_bytes_+=data.size();return;}
     static const bool rename=[] {const auto* value=std::getenv("X64ARM_METAL_CONSTANT_RENAME");return !value || std::string_view(value)=="1";}();
-    if(rename && target.desc.bind==4 && !offset && data.size()==target.desc.width){
+    // 整塊寫入且緩衝仍被排隊或在飛的命令使用：換一份新的儲存（舊的留給那些命令），不必以 blit 複製而結束開啟中的 render pass。
+    // 原本只有常數緩衝（bind==4）這樣做；頂點、索引與 SRV 緩衝的整塊更新同樣適用（《崛起》地熱谷每幀 4 次上傳中斷）。
+    // 可被 GPU 寫入的緩衝（UAV 0x80、串流輸出 0x10）維持原路徑。X64ARM_METAL_BUFFER_RENAME=0 恢復只處理常數緩衝。
+    static const bool rename_all=[] {const auto* value=std::getenv("X64ARM_METAL_BUFFER_RENAME");return !value || std::string_view(value)!="0";}();
+    if(rename && (target.desc.bind==4 || (rename_all && !(target.desc.bind&0x90U) && !target.gpu_written)) && !offset && data.size()==target.desc.width){
         reap();
         const bool used=metal_batch_uses(graphics_pending_,resource) || std::any_of(flights_.begin(),flights_.end(),[&](const auto& flight){return metal_batch_uses(flight.objects,resource);});
         if(used && graphics_replace_buffer(resource,data))return;
     }
+    // 診斷：走到上傳路徑的寫入依（bind、整塊／局部）計數，隨 X64ARM_TRACE_GRAPHICS_STATS 輸出。
+    ++upload_kinds_[(static_cast<std::uint32_t>(target.desc.bind)<<1)|((!offset && data.size()==target.desc.width)?1U:0U)];
     if(!graphics_upload_buffer(resource,data,offset)){
         wait_resource(resource);std::memcpy(static_cast<std::uint8_t*>(target.buffer.contents)+offset,data.data(),data.size());
     }
@@ -1301,6 +1310,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
             std::fprintf(stderr,"[fragment-link] ps=%llu raster_stage=%u key=%s producer=%s\n",static_cast<unsigned long long>(pixel.serial),raster.stage,link_key.c_str(),outputs.c_str());
         }
         if(!function){
+            MetalStallScope link_timing("fragment_link_compile",pixel.serial,1);
             NSError* error=nil;auto options=[MTLCompileOptions new];options.fastMathEnabled=NO;
             auto library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:linked.c_str()] options:options error:&error];
             if(!library)throw std::invalid_argument("Metal PS 輸入對齊編譯失敗："+std::string(error.localizedDescription.UTF8String)+"\n"+linked);
@@ -1344,6 +1354,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         if(!cache_analysis || !shader.non_point_checked){
             const auto source=metal_nonpoint_source(shader.source);
             if(source!=shader.source && !shader.non_point_function){
+                MetalStallScope nonpoint_timing("nonpoint_compile",shader.serial,0);
                 NSError* error=nil;auto options=[MTLCompileOptions new];options.fastMathEnabled=NO;
                 auto library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()] options:options error:&error];
                 if(!library)throw std::invalid_argument("Metal 非點圖元著色器編譯失敗："+std::string(error.localizedDescription.UTF8String));
@@ -1439,6 +1450,7 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     if(!pipeline){
     key<<":samples:"<<desc.sampleCount<<":topology:"<<desc.inputPrimitiveTopology;
     const auto& k=key.str();if(const auto found=graphics_pipelines_.find(k);found!=graphics_pipelines_.end())pipeline=found->second;else {
+        MetalStallScope pipeline_timing("render_pipeline_create",dynamic_cast<MetalShader&>(*d.stages[0].shader).serial,0);
         // 未命中才記錄（建立失敗時 Metal 可能直接 abort，用量快照留下最後一個嘗試的頂點佈局）。
         {std::string text="vs="+std::to_string(dynamic_cast<MetalShader&>(*d.stages[0].shader).serial)+" topology="+std::to_string(d.topology);for(const auto& e:d.layout)text+=" "+e.semantic+std::to_string(e.index)+":f"+std::to_string(e.format)+"@"+std::to_string(e.slot)+"+"+std::to_string(e.offset)+(e.classification?"i"+std::to_string(e.step):"")+"/s"+std::to_string(e.slot<32?d.vertices[e.slot].stride:0);set_diagnostic("metal_pipeline_last",text);record_diagnostic("metal_pipelines_created");}
         NSError* error=nil;
@@ -1700,9 +1712,11 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
     graphics_capture(original);
 }}
 // 診斷：X64ARM_METAL_DISPATCH_SYNC=1 時每次 compute dispatch 後提交並等待完成，用來判斷 compute 寫入與後續讀取間的順序問題。
-static bool metal_dispatch_sync(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_DISPATCH_SYNC");return (text && std::string_view(text)=="1") || metal_gpu_profile();}();return value;}
+static bool metal_dispatch_sync(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_DISPATCH_SYNC");return (text && std::string_view(text)=="1") || (metal_gpu_profile() && !metal_gpu_profile_async());}();return value;}
 // 診斷：X64ARM_METAL_DISPATCH_COMMIT=1 每個 dispatch 後提交但不等待，GPU 卡住時最前面的批次只含一個 dispatch。
-static bool metal_dispatch_commit(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_DISPATCH_COMMIT");return (text && std::string_view(text)=="1") || metal_gpu_profile();}();return value;}
+// 非同步剖析（X64ARM_METAL_GPU_PROFILE_ASYNC）不改變提交結構：逐 dispatch 提交與同步等待只用於同步剖析，否則每幀被拆成兩百多個
+// 命令緩衝（2026-11-12《33 號遠征隊》非同步剖析 2.9 fps、每幀 223 個命令緩衝，數字不能代表正常執行）。
+static bool metal_dispatch_commit(){static const bool value=[] {const auto* text=std::getenv("X64ARM_METAL_DISPATCH_COMMIT");return (text && std::string_view(text)=="1") || (metal_gpu_profile() && !metal_gpu_profile_async());}();return value;}
 // 診斷：X64ARM_METAL_SKIP_3D_UAV=1 略過寫入 3D 紋理 UAV 的 compute（體積霧／雲等 froxel pass），用來判斷畫面異常是否來自這些 pass。
 // X64ARM_METAL_SKIP_KERNELS=<內容雜湊,…>：略過指定 compute 著色器（雜湊同追蹤檔的 ck=）。
 static bool metal_skip_volume_dispatch(const GraphicsStage& stage){
@@ -1754,7 +1768,7 @@ void MetalGl::graphics_handoff(NativeGraphics& consumer,const GraphicsView& view
     next->begin_commands(false);
     // 將待交接資源納入一般 CPU read/write 等待與 GPU 生命週期追蹤。
     // 只依賴此資源的 CPU 存取會等待事件；無關的 discard buffer 可繼續準備。
-    if(view.resource)next->graphics_pending_.push_back(view.resource);
+    if(view.resource){next->graphics_pending_.push_back(view.resource);next->note_gpu_write(view.resource);} // 等事件後才可讀：讀它的細分不排到側邊緩衝。
     [next->commands_ encodeWaitForEvent:handoff_event_ value:value];
 }}
 void MetalGl::graphics_present(const GraphicsView& v){@autoreleasepool{

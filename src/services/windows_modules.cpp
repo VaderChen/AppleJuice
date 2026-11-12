@@ -1,3 +1,4 @@
+#include "x64arm/resource_cache.hpp"
 #include "x64arm/startup_profile.hpp"
 #include "x64arm/pe_loader.hpp"
 #include "windows_loader_lock.hpp"
@@ -873,9 +874,8 @@ std::array<std::uint8_t,32> WindowsServices::image_identity(const std::filesyste
     if(!enabled || ::stat(source.c_str(),&info)<0 || !S_ISREG(info.st_mode) || static_cast<std::uint64_t>(info.st_size)!=bytes.size())
         return SmapCache::source_identity(bytes);
     static const std::filesystem::path directory=[] {
-        const auto n=::confstr(_CS_DARWIN_USER_TEMP_DIR,nullptr,0);if(!n)return std::filesystem::path{};
-        std::vector<char> text(n);::confstr(_CS_DARWIN_USER_TEMP_DIR,text.data(),n);
-        std::error_code error;auto path=std::filesystem::path(text.data())/"x64arm-identity-cache";std::filesystem::create_directories(path,error);
+        const auto base=host_user_directory(false);if(base.empty())return std::filesystem::path{};
+        std::error_code error;auto path=base/"x64arm-identity-cache";std::filesystem::create_directories(path,error);
         return error?std::filesystem::path{}:path;
     }();
     if(directory.empty())return SmapCache::source_identity(bytes);

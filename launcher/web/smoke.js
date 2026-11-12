@@ -192,7 +192,10 @@
     check('自動語言依系統偏好解析', resolveLanguage('auto', ['fr-FR', 'ja-JP']) === 'ja' && resolveLanguage('auto', ['zh-TW']) === 'zh-Hant' && resolveLanguage('auto', ['ko-KR']) === 'ko' && resolveLanguage('auto', ['de-DE']) === 'en');
     await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, language: 'zh-Hant', theme: 'forest'}})));
     await click('app-settings');
-    check('設定分頁包含 Windows 介面、CPU、GPU 與實驗性功能', [...document.querySelectorAll('[data-global-tab]')].map(button => button.dataset.globalTab).join(',') === 'general,advanced,windows,cpu,gpu,experimental,about');
+    check('設定分頁包含 Windows 介面、CPU、GPU、實驗性功能與快取', [...document.querySelectorAll('[data-global-tab]')].map(button => button.dataset.globalTab).join(',') === 'general,advanced,windows,cpu,gpu,experimental,cache,about');
+    await click('global-tab-cache'); await until(() => / GB$/.test($('cache-total').textContent), '快取用量');
+    check('快取分頁顯示 GB 總用量且每個項目有清除按鈕', !$('global-cache').hidden && $('global-general').hidden && /^\d+\.\d{2} GB$/.test($('cache-total').textContent) &&
+      [...document.querySelectorAll('#cache-list .cache-row')].every(row => row.dataset.cacheId && row.querySelector('button') && / GB$/.test(row.querySelector('output').textContent)));
     await click('global-tab-experimental');
     check('原生函式庫橋接層預設關閉', !$('global-experimental').hidden && !$('native-library-bridge').checked && !state.globalSettings.nativeLibraryBridge);
     check('V8 原型預設關閉且可加入內建測試', !$('native-v8-bridge').checked && !state.globalSettings.nativeV8Bridge && $('add-native-v8-tests').disabled === !state.nativeV8TestsReady);

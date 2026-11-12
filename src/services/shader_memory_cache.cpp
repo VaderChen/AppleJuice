@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -23,7 +24,7 @@
 namespace x64arm::detail {
 namespace {
 constexpr std::uint64_t magic_value=0x3143485334365846ULL;
-constexpr std::uint32_t version_value=1;
+constexpr std::uint32_t version_value=2;
 constexpr unsigned probe_limit=64;
 constexpr std::uint64_t slots_offset=64;
 constexpr std::uint32_t payload_limit=64U<<20;
@@ -34,6 +35,7 @@ struct Header {
     std::uint64_t capacity,data_offset;
     std::atomic<std::uint64_t> used;
     std::array<std::uint8_t,16> identity;
+    std::atomic<std::uint64_t> last_open; // 最後一次被同身分引擎開啟的時間（epoch 秒），替換槽位時取較舊者。
 };
 static_assert(sizeof(Header)<=slots_offset && std::atomic<std::uint64_t>::is_always_lock_free);
 // 記錄：完整鍵、原始／存放長度（相等表示未壓縮）與存放內容的 FNV-1a；其後緊接存放內容，8 位元組對齊。
@@ -85,39 +87,71 @@ public:
         // 約每 4 KiB 一個索引槽（256 MiB 為 65,536 槽、512 KiB）；記錄平均遠大於 4 KiB 時負載很低。
         slot_bits_=static_cast<std::uint32_t>(std::bit_width(capacity_/4096)-1);
         data_offset_=(slots_offset+(std::uint64_t{1}<<slot_bits_)*8+4095)&~std::uint64_t{4095};
-        // 名稱只含格式版本與容量；引擎身分寫在標頭，不符時解除舊名稱重建，同一設定最多保留一個區段名稱。
-        std::uint8_t material[12];std::memcpy(material,&version_value,4);std::memcpy(material+4,&capacity_,8);
-        std::array<std::uint8_t,CC_SHA256_DIGEST_LENGTH> digest{};CC_SHA256(material,sizeof material,digest.data());
-        std::string name="/x64sh";
-        for(unsigned n=0;n<10;++n){static constexpr char hex[]="0123456789abcdef";name.push_back(hex[digest[n]>>4]);name.push_back(hex[digest[n]&15]);}
-        for(unsigned attempt=0;attempt<2;++attempt){
-            if(const int fd=::shm_open(name.c_str(),O_RDWR|O_CREAT|O_EXCL,0600);fd>=0){
-                if(::ftruncate(fd,static_cast<off_t>(capacity_))!=0){::close(fd);::shm_unlink(name.c_str());return false;}
-                void* mapped=::mmap(nullptr,capacity_,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);::close(fd);
-                if(mapped==MAP_FAILED){::shm_unlink(name.c_str());return false;}
-                base_=static_cast<std::uint8_t*>(mapped);auto& h=header();
-                h.version=version_value;h.slot_bits=slot_bits_;h.capacity=capacity_;h.data_offset=data_offset_;
-                h.used.store(data_offset_,std::memory_order_relaxed);h.identity=identity;
-                h.magic.store(magic_value,std::memory_order_release);
-                return true;
-            }
-            if(errno!=EEXIST)return false;
+        // 名稱＝格式版本、容量、客體程式鍵（X64ARM_APPLICATION_CACHE_KEY，每個程式各自的區段）與槽號的雜湊。
+        // 每個程式保留兩個槽，引擎身分寫在標頭：同身分直接沿用；兩槽都被其他引擎占用時只替換較久未開啟的一個，
+        // 因此兩個引擎交替執行（候選對照、更新前後）不會互相清空，區段數量仍有上限。
+        const auto* application=std::getenv("X64ARM_APPLICATION_CACHE_KEY");const std::string_view scope=application?application:"";
+        const auto name_for=[&](std::uint32_t version,std::optional<std::uint32_t> slot){
+            CC_SHA256_CTX context;CC_SHA256_Init(&context);
+            CC_SHA256_Update(&context,&version,sizeof version);CC_SHA256_Update(&context,&capacity_,sizeof capacity_);
+            if(slot){CC_SHA256_Update(&context,&*slot,sizeof *slot);CC_SHA256_Update(&context,scope.data(),static_cast<CC_LONG>(scope.size()));}
+            std::array<std::uint8_t,CC_SHA256_DIGEST_LENGTH> digest{};CC_SHA256_Final(digest.data(),&context);
+            std::string name="/x64sh";
+            for(unsigned n=0;n<10;++n){static constexpr char hex[]="0123456789abcdef";name.push_back(hex[digest[n]>>4]);name.push_back(hex[digest[n]&15]);}
+            return name;
+        };
+        // 版本 1 是全系統單一區段：不再使用，解除名稱後由仍映射它的舊程序保留到結束。
+        {constexpr std::uint32_t legacy=1;::shm_unlink(name_for(legacy,std::nullopt).c_str());}
+        const auto now=[] {return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());};
+        enum class Attach {Matched,Other,Missing,Failed};
+        // 開啟既有區段：身分相符即沿用；否則回報最後開啟時間供替換判斷（未完成的區段視為最舊）。
+        const auto attach=[&](const std::string& name,std::uint64_t& stamp){
+            stamp=0;
             const int fd=::shm_open(name.c_str(),O_RDWR,0600);
-            if(fd<0)return false;
+            if(fd<0)return errno==ENOENT?Attach::Missing:Attach::Failed;
             struct stat status{};
-            if(::fstat(fd,&status)!=0 || static_cast<std::uint64_t>(status.st_size)<capacity_){::close(fd);::shm_unlink(name.c_str());continue;}
+            if(::fstat(fd,&status)!=0 || static_cast<std::uint64_t>(status.st_size)<capacity_){::close(fd);::shm_unlink(name.c_str());return Attach::Missing;}
             void* mapped=::mmap(nullptr,capacity_,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);::close(fd);
-            if(mapped==MAP_FAILED)return false;
+            if(mapped==MAP_FAILED)return Attach::Failed;
             base_=static_cast<std::uint8_t*>(mapped);auto& h=header();
             // 建立者在 ftruncate 與寫入 magic 之間：最多等 200 ms；逾時視為建立者已中止。
             for(unsigned wait=0;wait<200 && h.magic.load(std::memory_order_acquire)!=magic_value;++wait)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            if(h.magic.load(std::memory_order_acquire)==magic_value && h.version==version_value && h.slot_bits==slot_bits_ &&
-               h.capacity==capacity_ && h.data_offset==data_offset_ && h.identity==identity)return true;
-            // 其他引擎版本或未完成的區段：解除名稱後重建；已映射的程序保留原內容，最後一個解除映射時釋放。
-            ::munmap(mapped,capacity_);base_=nullptr;::shm_unlink(name.c_str());
+            const bool ready=h.magic.load(std::memory_order_acquire)==magic_value && h.version==version_value && h.slot_bits==slot_bits_ &&
+                h.capacity==capacity_ && h.data_offset==data_offset_;
+            if(ready && h.identity==identity){h.last_open.store(now(),std::memory_order_relaxed);return Attach::Matched;}
+            if(ready)stamp=h.last_open.load(std::memory_order_relaxed);
+            ::munmap(mapped,capacity_);base_=nullptr;return Attach::Other;
+        };
+        const auto create=[&](const std::string& name){
+            const int fd=::shm_open(name.c_str(),O_RDWR|O_CREAT|O_EXCL,0600);
+            if(fd<0)return false;
+            if(::ftruncate(fd,static_cast<off_t>(capacity_))!=0){::close(fd);::shm_unlink(name.c_str());return false;}
+            void* mapped=::mmap(nullptr,capacity_,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);::close(fd);
+            if(mapped==MAP_FAILED){::shm_unlink(name.c_str());return false;}
+            base_=static_cast<std::uint8_t*>(mapped);auto& h=header();
+            h.version=version_value;h.slot_bits=slot_bits_;h.capacity=capacity_;h.data_offset=data_offset_;
+            h.used.store(data_offset_,std::memory_order_relaxed);h.identity=identity;h.last_open.store(now(),std::memory_order_relaxed);
+            h.magic.store(magic_value,std::memory_order_release);
+            return true;
+        };
+        constexpr std::uint32_t slot_count=2;
+        std::array<std::string,slot_count> names;std::array<Attach,slot_count> state{};std::array<std::uint64_t,slot_count> stamps{};
+        for(std::uint32_t slot=0;slot<slot_count;++slot){
+            names[slot]=name_for(version_value,slot);state[slot]=attach(names[slot],stamps[slot]);
+            if(state[slot]==Attach::Matched)return true;
         }
-        return false;
+        // 建立與其他程序競爭時（EEXIST）再開啟一次：同引擎的另一個程序可能剛建立完成。
+        const auto create_or_join=[&](std::uint32_t slot){
+            if(create(names[slot]))return true;
+            std::uint64_t ignored=0;return errno==EEXIST && attach(names[slot],ignored)==Attach::Matched;
+        };
+        for(std::uint32_t slot=0;slot<slot_count;++slot)if(state[slot]==Attach::Missing && create_or_join(slot))return true;
+        if(state[0]!=Attach::Other || state[1]!=Attach::Other)return false;
+        // 兩槽都屬於其他引擎：解除較久未開啟者的名稱後重建；已映射的程序保留原內容，最後一個解除映射時釋放。
+        const std::uint32_t victim=stamps[0]<=stamps[1]?0:1;
+        ::shm_unlink(names[victim].c_str());
+        return create_or_join(victim);
     }
     std::optional<std::vector<std::uint8_t>> find(const ShaderCacheKey& key) const {
         std::uint64_t hash;std::memcpy(&hash,key.data(),8);

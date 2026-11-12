@@ -20,6 +20,11 @@ public:
     // 統計（只在 X64ARM_SERVICE_COUNTS 設定時計時）：寫者取鎖次數、等讀者排空與持鎖時間；讀者遇到寫者的次數、等待時間與讓出次數。
     // 由 dump_service_counts 輸出，用來分辨 worker 服務的讀鎖等待是持鎖時間長還是取鎖次數多造成。
     struct Stats {std::atomic<std::uint64_t> writer_locks{},writer_drain_ns{},writer_hold_ns{},reader_waits{},reader_wait_ns{},reader_yields{};};
+    // 依取得點（lock／unlock 的返回位址）分列獨占鎖的次數、排空與持有時間，找出哪個協調者路徑讓 worker 的讀鎖等待隨 vCPU 數上升。
+    // 固定 32 格、線性探查；只由持鎖者寫入（寫者互斥），dump 時為非同步取樣。位址以 atos 對回函式。
+    struct Site {std::atomic<const void*> address{};std::atomic<std::uint64_t> locks{},drain_ns{},hold_ns{};};
+    static std::array<Site,32>& sites() noexcept {static std::array<Site,32> value;return value;}
+    static std::array<Site,32>& reader_sites() noexcept {static std::array<Site,32> value;return value;}
     static Stats& stats() noexcept {static Stats value;return value;}
     static bool timing() noexcept {static const bool value=[] {const auto* text=std::getenv("X64ARM_SERVICE_COUNTS");return text && *text;}();return value;}
     void lock_shared() noexcept {
@@ -33,8 +38,16 @@ public:
             const auto started=timing()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             unsigned spins=0;std::uint64_t since=0;for(;writer_.load(std::memory_order_acquire);++spins)backoff(spins,since);
             if(timing()){auto& s=stats();s.reader_waits.fetch_add(1,std::memory_order_relaxed);
-                s.reader_wait_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count()),std::memory_order_relaxed);
-                if(spins>=256)s.reader_yields.fetch_add(spins-255,std::memory_order_relaxed);}
+                const auto waited=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());
+                s.reader_wait_ns.fetch_add(waited,std::memory_order_relaxed);
+                if(spins>=256)s.reader_yields.fetch_add(spins-255,std::memory_order_relaxed);
+                // 讀者等待依呼叫者分列（lock_shared 內嵌後為其所在函式的返回位址）：分辨是哪一類讀者被寫者擋住。
+                const void* caller=__builtin_return_address(0);
+                for(auto& site:reader_sites()){
+                    const void* address=site.address.load(std::memory_order_relaxed);
+                    if(!address && site.address.compare_exchange_strong(address,caller,std::memory_order_relaxed))address=caller;
+                    if(address==caller){site.locks.fetch_add(1,std::memory_order_relaxed);site.hold_ns.fetch_add(waited,std::memory_order_relaxed);break;}
+                }}
         }
     }
     void unlock_shared() noexcept {
@@ -44,19 +57,29 @@ public:
     bool writer_waiting() const noexcept {return writer_.load(std::memory_order_relaxed)!=0;}
     // 這條執行緒是否持獨占鎖（等背景工作前核對，避免與被擋住的讀者互等）。
     bool held_exclusive() const noexcept {return exclusive_;}
-    void lock() noexcept {
+    __attribute__((noinline)) void lock() noexcept {
         const auto started=timing()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        const void* caller=__builtin_return_address(0);
         writers_.lock();exclusive_=true;
         writer_.store(1,std::memory_order_seq_cst);
         std::uint64_t since=0;
         for(auto& reader:readers_)
             for(unsigned spins=0;reader.count.load(std::memory_order_seq_cst);++spins)backoff(spins,since);
         if(timing()){hold_started_=std::chrono::steady_clock::now();
-            stats().writer_drain_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(hold_started_-started).count()),std::memory_order_relaxed);}
+            const auto drain=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(hold_started_-started).count());
+            stats().writer_drain_ns.fetch_add(drain,std::memory_order_relaxed);
+            site_=nullptr;
+            for(auto& site:sites()){
+                const auto* address=site.address.load(std::memory_order_relaxed);
+                if(!address){site.address.store(caller,std::memory_order_relaxed);address=caller;}
+                if(address==caller){site_=&site;site.locks.fetch_add(1,std::memory_order_relaxed);site.drain_ns.fetch_add(drain,std::memory_order_relaxed);break;}
+            }
+        }
     }
     void unlock() noexcept {
         if(timing()){auto& s=stats();s.writer_locks.fetch_add(1,std::memory_order_relaxed);
-            s.writer_hold_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-hold_started_).count()),std::memory_order_relaxed);}
+            const auto hold=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-hold_started_).count());
+            s.writer_hold_ns.fetch_add(hold,std::memory_order_relaxed);if(site_)site_->hold_ns.fetch_add(hold,std::memory_order_relaxed);}
         writer_.store(0,std::memory_order_release);
         exclusive_=false;writers_.unlock();
     }
@@ -102,6 +125,7 @@ private:
     std::array<Reader,reader_slots> readers_{};
     alignas(128) std::atomic<std::uint32_t> writer_{};
     std::chrono::steady_clock::time_point hold_started_{}; // 只由持鎖者讀寫
+    Site* site_{}; // 只由持鎖者讀寫
     std::mutex writers_;
     // 只有單一實例（parallel_mapping_mutex），巢狀深度以執行緒區域變數記錄即可。
     static inline thread_local unsigned depth_{};

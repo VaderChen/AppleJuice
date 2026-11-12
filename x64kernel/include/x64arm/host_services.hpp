@@ -54,7 +54,7 @@ inline constexpr std::uint32_t cpu_system_enter_trap = 0x10000001U;
 inline constexpr std::uint32_t cpu_software_interrupt_trap = 0x10000100U;
 enum class SystemCallEntry { Syscall, Sysenter, Interrupt };
 // CompletedResolve：服務已在 worker 完成，但釋放了有等待者的物件（號誌、手動重設事件）；worker 不等待，協調者盡快解析等待。
-enum class ResidentServiceProgress {Completed,Retry,Coordinator,CompletedResolve};
+enum class ResidentServiceProgress {Completed,Retry,Coordinator,CompletedWithoutSignal,CompletedResolve};
 // 含睡眠的宿主連續時鐘，毫秒自宿主開機起算；DWORD 自然回繞。
 // 核心依客體模式選擇 EAX、EDX:EAX 或 RAX，沒有參數、LastError 或共享時間頁副作用。
 enum class ResidentClockRecipe : unsigned {None=0,Milliseconds32=1,Milliseconds64=2,PerformanceCounter=3};
@@ -283,6 +283,7 @@ public:
     virtual bool parallel_service(GuestAddress) const noexcept { return false; }
     virtual bool invoke_parallel_service(GuestState&,GuestMemory&) { return false; }
     // Retry 保證尚無客體副作用，僅等待其他 worker 釋放資源；不要求全域退出。
+    // 只有確定未釋放任何 Retry 等待的資源時，才可用 CompletedWithoutSignal 省略信箱通知。
     virtual ResidentServiceProgress resident_parallel_service(GuestState& state,GuestMemory& memory) {
         return invoke_parallel_service(state,memory)?ResidentServiceProgress::Completed:ResidentServiceProgress::Coordinator;
     }

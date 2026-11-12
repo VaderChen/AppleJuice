@@ -850,7 +850,7 @@ void WindowsServices::queue_gpu_signal(GuestMemory& memory,std::shared_ptr<const
     if(poll)poll_gpu_signals(memory);
 }
 void WindowsServices::poll_gpu_signals(GuestMemory& memory,bool try_only){
-    std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);
+    std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);
     if(!try_only)lock_graphics(graphics_lock);else if(!graphics_lock.try_lock())return;
     if(gpu_signals_.empty())return;std::set<std::uint64_t> blocked;
     for(auto it=gpu_signals_.begin();it!=gpu_signals_.end();){
@@ -968,7 +968,7 @@ void WindowsServices::d3d12_submit_loop(GuestMemory& memory,D3D12Submitter& subm
                 // 編碼同步：前端等 Metal 編碼執行緒清空佇列的次數與時間（metal_command_sync_*），量前端被同步方法卡住的程度。
                 std::uint64_t gpu_busy=0,sync_waits=0,sync_ns=0,encoders=0,coalesced=0,resource_waits=0,timed=0,encoder_busy=0,encoder_tasks=0,clears_folded=0,clears_encoded=0,gpu_waits=0,gpu_wait_ns=0,submissions=0,inflight_limit=0,inflight_peak=0;std::string breaks;std::array<std::uint64_t,6> draw_ns{};
                 if(d3d12_){
-                    const std::unique_lock<std::recursive_mutex> guard(graphics_mutex());
+                    const std::unique_lock<GraphicsMutex> guard(graphics_mutex());
                     const auto field=[](const std::string& text,std::string_view name)->std::uint64_t{
                         const auto at=text.find(name);return at==std::string::npos?0:std::strtoull(text.c_str()+at+name.size(),nullptr,10);};
                     for(const auto& [id,device]:d3d12_->devices)if(device.native){
@@ -1145,7 +1145,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         if(const auto found=d3d12_->resources.find(arg(0));found!=d3d12_->resources.end()){const std::lock_guard lock(d3d12_->resource_lock(found->first));if(!(found->second.host_shared && d3d12_map_no_wait()))ticket=found->second.submit_ticket;}
         if(ticket)d3d12_wait_ticket(*d3d12_submitter_,ticket);
     }
-    std::unique_lock<std::recursive_mutex> graphics_guard(graphics_mutex(),std::defer_lock);
+    std::unique_lock<GraphicsMutex> graphics_guard(graphics_mutex(),std::defer_lock);
     if(!d3d12_unlocked_call()){
         const auto waiting=!submit_job && D3D12Submitter::stall_us()?D3D12Submitter::now_ns():0;
         lock_graphics(graphics_guard);
@@ -1511,6 +1511,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
     if(kind==Kind::SwapChain){
         auto& swap=bridge.swaps.at(self);
         if(member=="Present" || member=="Present1"){
+            // 已呈現畫面的程序以 USER_INITIATED 承載客體（見 execution_policy 的 presented 判斷）。這個標記原本只有 D3D11 的 Present 會設，
+            // D3D12 程式（《電馭叛客》《暗影》）的 vCPU worker 因此一直留在繼承的 DEFAULT（ps -M 顯示 31T），宿主有其他負載時整輪偏慢。
+            // D3D12 不依呈現執行緒做判斷，只需要非零值；同程序若另有 D3D11 交換鏈，會由它的 Present 改寫成實際執行緒。
+            if(!__atomic_load_n(&present_thread_,__ATOMIC_RELAXED))__atomic_store_n(&present_thread_,UINT64_MAX,__ATOMIC_RELAXED);
             if(trace_graphics_errors && (swap.frames<8 || !(swap.frames%64)))std::fprintf(stderr,"[d3d12] Present frame=%llu t=%.3f sync=%u flags=%#x window=%#llx known=%d\n",static_cast<unsigned long long>(swap.frames),
                 std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),u32(1),u32(2),static_cast<unsigned long long>(swap.window),gui_.windows.contains(swap.window)?1:0);
             // 診斷：X64ARM_TRACE_GRAPHICS_STATS=1 每 64 幀輸出 Metal 後端累計統計（GPU 忙碌、CPU 等待、命令執行緒同步、encoder 斷點），與 D3D11 相同。

@@ -74,6 +74,7 @@
   <button id="global-tab-cpu" type="button" role="tab" aria-controls="global-cpu" aria-selected="false" data-global-tab="cpu" tabindex="-1">CPU</button>
   <button id="global-tab-gpu" type="button" role="tab" aria-controls="global-gpu" aria-selected="false" data-global-tab="gpu" tabindex="-1">GPU</button>
   <button id="global-tab-experimental" type="button" role="tab" aria-controls="global-experimental" aria-selected="false" data-global-tab="experimental" tabindex="-1">實驗性功能</button>
+  <button id="global-tab-cache" type="button" role="tab" aria-controls="global-cache" aria-selected="false" data-global-tab="cache" tabindex="-1">快取</button>
   <button id="global-tab-about" type="button" role="tab" aria-controls="global-about" aria-selected="false" data-global-tab="about" tabindex="-1">關於</button>
  </nav><div class="app-settings-pages">
   <section id="global-general" role="tabpanel" aria-labelledby="global-tab-general"><div class="appearance-settings">
@@ -114,6 +115,14 @@
    <p id="native-v8-availability" class="field-help"></p>
    <button id="add-native-v8-tests" type="button" class="button secondary">加入 V8 測試程式</button>
    <p class="field-help">儲存開關後，將 x86／x64 測試程式加入程式庫，再按執行圖示測試。結果顯示於終端與 LOG。</p>
+  </section>
+  <section id="global-cache" role="tabpanel" aria-labelledby="global-tab-cache" hidden><h4>快取用量</h4>
+   <p class="field-help">快取可以重新建立。清除後，程式下次啟動需要重新編譯著色器，初期畫面可能較不流暢。</p>
+   <div class="cache-total"><span>總用量</span><strong id="cache-total" role="status">—</strong></div>
+   <div id="cache-list" class="cache-list" role="list" aria-label="快取項目"></div>
+   <p id="cache-empty" class="field-help" hidden>目前沒有快取。</p>
+   <p id="cache-running" class="field-help" hidden>有程式執行中，請先停止再清除快取。</p>
+   <button id="cache-refresh" type="button" class="button secondary">重新整理</button>
   </section>
   <section id="global-about" role="tabpanel" aria-labelledby="global-tab-about" hidden><h4>AppleJuice</h4><p id="app-version"></p><p>在 Apple Silicon 上執行 Windows x86／x64 程式，提供程式庫、獨立啟動設定與互動式終端。</p><p>Windows x86／x64 → ARM64</p><div class="update-row"><button id="check-update" type="button" class="button secondary">偵測版本更新</button><span id="update-status" class="field-help" role="status"></span></div></section>
  </div></div>

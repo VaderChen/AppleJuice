@@ -254,7 +254,7 @@ MetalTessellationDraw MetalGl::graphics_tessellation(const GraphicsDraw& d,const
         return d.indexed && written_in_main(d.indices);
     };
     const unsigned refusal=!tessellation_coalesce()?5U:!(open_render_ && commands_)?0U:main_gpu_writes_?1U:inputs_written()?2U:
-        (main_texture_writes_ && (samples_textures(d.stages[0]) || samples_textures(d.stages[3])))?3U:(encoder_chain_fence_ || dump_shaders || dump_buffers || metal_gpu_profile())?4U:6U;
+        (main_texture_writes_ && (samples_textures(d.stages[0]) || samples_textures(d.stages[3])))?3U:(encoder_chain_fence_ || dump_shaders || dump_buffers || (metal_gpu_profile() && !metal_gpu_profile_async()))?4U:6U;
     const bool side=refusal==6U;
     if(refusal<5U)++tess_main_[refusal];
     id<MTLComputeCommandEncoder> encoder=nil;

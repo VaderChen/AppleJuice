@@ -212,7 +212,9 @@ bool d3d11_stream_resident_enabled() noexcept {
 namespace {
 D3D11StreamClass d3d11_stream_class(std::string_view symbol) noexcept {
     constexpr std::string_view scalar[]{"IASetIndexBuffer","IASetInputLayout","IASetPrimitiveTopology","RSSetState","OMSetDepthStencilState","GenerateMips",
-        "Draw","DrawIndexed","DrawInstanced","DrawIndexedInstanced","DrawInstancedIndirect","DrawIndexedInstancedIndirect","Dispatch","DispatchIndirect"};
+        "Draw","DrawIndexed","DrawInstanced","DrawIndexedInstanced","DrawInstancedIndirect","DrawIndexedInstancedIndirect","Dispatch","DispatchIndirect",
+        // 只帶物件指標與純量、沒有回傳值：Fire Strike 每幀數十次，原本每次都等佇列清空（一輪約 4.8 萬次排空）。
+        "DiscardView","DiscardResource","CopyStructureCount"};
     if(std::find(std::begin(scalar),std::end(scalar),symbol)!=std::end(scalar))return D3D11StreamClass::Scalar;
     if(symbol=="Begin" || symbol=="End")return D3D11StreamClass::Query;
     if(symbol=="Present")return D3D11StreamClass::Present;
@@ -268,13 +270,24 @@ const std::vector<D3D11StreamClass>& d3d11_stream_classes(){
 }
 // 核心常駐入口的 stub 類別表（resident_d3d11_arm64.inc）：低 4 位元 1 純量、2 Shader、3 指標陣列、4 常數緩衝綁定（高 4 位元是 stage）、
 // 5 IASetVertexBuffers；0 不走常駐入口。
+// 客體 vCPU 數（建立串流時設定）：Map／Unmap 常駐入口的預設值依它決定。
+std::atomic<unsigned>& d3d11_stream_guest_processors() noexcept {static std::atomic<unsigned> value{};return value;}
+// 類別表是否含 Map／Unmap（6／7）：只看前端路徑與明確關閉；實際是否登錄常駐入口由 d3d11_stream_resident_map_active 決定。
 bool d3d11_stream_resident_map_enabled() noexcept {
     static const bool enabled=[] {
         const auto* front=std::getenv("X64ARM_D3D11_STREAM_FRONT_MAP");const auto* value=std::getenv("X64ARM_D3D11_STREAM_RESIDENT_MAP");
-        // 預設關閉：微量測每次呼叫快約 4 倍、合成幀（d3d11_call_rate 項目 15）快 3～13%，但《古墓奇兵：崛起》地熱谷 2 vCPU 交錯三輪 42.6 對 46.4 FPS。
-        // 找到遊戲變慢的原因前只在 =1 時啟用（核心需公告 kernel_features bit 0）。
-        return (!front || std::string_view(front)!="0") && value && std::string_view(value)=="1";}();
+        return (!front || std::string_view(front)!="0") && !(value && std::string_view(value)=="0");}();
     return enabled;
+}
+// Map(WRITE_DISCARD)／Unmap 留在轉譯碼內完成（核心類別 6／7）。微量測每次呼叫快約 4 倍。2026-11-11《古墓奇兵：崛起》地熱谷
+//（中畫質 720p、每款程式獨立快取）：4 vCPU 50.1 → 67.7 FPS（中位 18.8 → 13.7 ms、P99 41.0 → 28.5 ms）；2 vCPU 50.4 → 47.7／47.8
+//（變慢：vCPU 少於可執行客體執行緒時，服務離開點兼任排程點，渲染執行緒每幀少約 1.1 萬次離開後其他執行緒要等時間片輪替）。
+// 3 vCPU 持平（58.2 對 58.0，敘利亞 77.2 對 71.3）。4 vCPU 重複兩輪 67.7／67.1，預設同日各輪 50.1～60.3。
+// 預設在客體 vCPU 數 ≥ 4 時開啟；X64ARM_D3D11_STREAM_RESIDENT_MAP=1 一律開啟、=0 一律關閉。
+bool d3d11_stream_resident_map_active() noexcept {
+    if(!d3d11_stream_resident_map_enabled())return false;
+    static const int forced=[] {const auto* value=std::getenv("X64ARM_D3D11_STREAM_RESIDENT_MAP");return value && std::string_view(value)=="1"?1:0;}();
+    return forced || d3d11_stream_guest_processors().load(std::memory_order_relaxed)>=4;
 }
 const std::vector<std::uint8_t>& d3d11_stream_resident_classes(){
     static const std::vector<std::uint8_t> table=[]{
@@ -282,7 +295,8 @@ const std::vector<std::uint8_t>& d3d11_stream_resident_classes(){
         for(std::size_t i=0;i<descriptors.size();++i){
             if(descriptors[i].family!="internal-d3d11")continue;
             switch(d3d11_stream_classes()[i]){
-            case D3D11StreamClass::Scalar:if(descriptors[i].arguments<=6)result[i]=1;break;
+            // CopyStructureCount 要登記目的緩衝的待處理序號（見 d3d11_stream_enqueue），不走核心入口直接排入。
+            case D3D11StreamClass::Scalar:if(descriptors[i].arguments<=6 && descriptors[i].symbol!="CopyStructureCount")result[i]=1;break;
             case D3D11StreamClass::Shader:if(descriptors[i].arguments==4)result[i]=2;break;
             case D3D11StreamClass::Pointers:if(descriptors[i].arguments==4)result[i]=3;break;
             case D3D11StreamClass::VertexBuffers:if(descriptors[i].arguments==6)result[i]=5;break;
@@ -305,7 +319,8 @@ bool d3d11_stream_resident_scalar(std::size_t runtime_index) noexcept {
     const auto& classes=d3d11_stream_resident_classes();
     if(runtime_index>=classes.size() || !classes[runtime_index])return false;
     // 類別 6／7 要核心入口認得：舊核心會把它們當成其他類別處理。
-    return (classes[runtime_index]&15U)<6 || (std::atomic_ref(d3d11_resident_descriptor().kernel_features).load(std::memory_order_acquire)&1U);
+    return (classes[runtime_index]&15U)<6 || (d3d11_stream_resident_map_active() &&
+        (std::atomic_ref(d3d11_resident_descriptor().kernel_features).load(std::memory_order_acquire)&1U));
 }
 namespace {
 // 共用區配置（環狀，只有擁有者配置；串流執行緒處理完一筆就推進 arena_tail）。head==tail 代表空，所以不能剛好填滿。
@@ -458,7 +473,9 @@ D3D11StreamQueued d3d11_stream_enqueue(D3D11CommandStream& stream,GuestState& st
     if(kind==D3D11StreamClass::ClearDepth)for(unsigned i=0;i<4;++i)entry.xmm3[i]=state.xmm[3][i];
     entry.present=kind==D3D11StreamClass::Present;
     state.rip=GuestAddress{return_target};state.reg(Gpr::Rax)=0;state.reg(Gpr::Rsp)=sp+8;
-    if(kind==D3D11StreamClass::Query || kind==D3D11StreamClass::Unmap || kind==D3D11StreamClass::Update || kind==D3D11StreamClass::Copy){
+    // CopyStructureCount 寫入目的緩衝（第 2 個參數）：之後 Map 這個緩衝要排在它之後，和 Copy 的目的相同。
+    const bool structure_count=kind==D3D11StreamClass::Scalar && service.arguments==4 && service.symbol=="CopyStructureCount";
+    if(kind==D3D11StreamClass::Query || kind==D3D11StreamClass::Unmap || kind==D3D11StreamClass::Update || kind==D3D11StreamClass::Copy || structure_count){
         // 舊項目在處理完之後就沒有作用，偶爾清掉避免無限成長（位址重用時最多多等到已完成的序號，不影響正確性）。
         if(stream.pending.size()>4096){const auto done=stream.tail.load(std::memory_order_acquire);std::erase_if(stream.pending,[&](const auto& item){return item.second<=done;});}
         stream.pending[values[1]]=head+1;if(auto* const front=stream.front_maps.find(values[1]))front->pending=head+1;
@@ -519,6 +536,9 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
     const auto kind=d3d11_stream_classes()[service_index];
     if(kind==D3D11StreamClass::Other || kind==D3D11StreamClass::NoDrain)return D3D11StreamStep::Continue;
     const auto stub_rip=state.rip.value;
+    // 客體 vCPU 數在建立串流之後才設定（set_processor_count），在這裡跟上目前的值；只在改變時寫入。
+    if(const auto processors=static_cast<unsigned>(runtime_.processor_count);d3d11_stream_guest_processors().load(std::memory_order_relaxed)!=processors)
+        d3d11_stream_guest_processors().store(processors,std::memory_order_relaxed);
     // 純量方法改由核心入口直接排入：C++ 排入一次後請求登錄（d3d11_stream_resident_request）。
     const auto scalar_done=[&]{if(std::atomic_ref(d3d11_resident_descriptor().enabled).load(std::memory_order_relaxed) &&
         d3d11_stream_resident_scalar(service_index))d3d11_stream_resident_request(service_index,stub_rip);};
@@ -543,7 +563,7 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
         bool done=false;
         {
             const std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
-            std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+            std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
             try{
                 const auto release=d3d11_stream_release(state,memory,*descriptor);
                 if(release==1)done=true;
@@ -574,7 +594,7 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
             bool done=false;
             {
                 const std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
-                std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+                std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
                 try{
                     if(d3d11_stream_present_eligible(state)){
                         const auto sp=state.reg(Gpr::Rsp);
@@ -608,7 +628,7 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
             bool done=false;
             {
                 const std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
-                std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+                std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
                 try{if(d3d11_stream_present_eligible(state))done=d3d11_stream_enqueue(stream,state,memory,*descriptor,kind,0,true)==D3D11StreamQueued::Done;}
                 catch(const MemoryFault&){}catch(const HostCallFault&){}
             }
@@ -679,7 +699,7 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
             bool done=false;
             {
                 const std::shared_lock mapping_guard(detail::parallel_mapping_mutex());
-                std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+                std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
                 try{done=d3d11_stream_get_targets(state,memory,*descriptor);}
                 catch(const MemoryFault&){}catch(const HostCallFault&){}
             }
@@ -766,7 +786,7 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
             stream.locked_enqueues.store(stream.locked_enqueues.load(std::memory_order_relaxed)+1,std::memory_order_relaxed);
             if(kind==D3D11StreamClass::Update || kind==D3D11StreamClass::Unmap || kind==D3D11StreamClass::Copy){
                 // 這幾種要看物件狀態（持久映射、緩衝大小），持圖形鎖核對；資格與大小之外不必，但很短，一起持鎖比較單純。
-                std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+                std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
                 std::uint32_t width=0;
                 eligible=d3d11_stream_object_eligible(state,memory,*descriptor,kind==D3D11StreamClass::Update,width);
                 if(eligible && kind==D3D11StreamClass::Update){
@@ -802,7 +822,7 @@ bool WindowsServices::d3d11_stream_present_eligible(const GuestState& state) con
 void WindowsServices::d3d11_stream_prepare_present(D3D11CommandStream& stream,const std::uint64_t swap_pointer){
     std::shared_ptr<NativeOpenGlContext> swap;
     {
-        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+        std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         if(const auto found=d3d11_->objects.find_fast(swap_pointer);found!=d3d11_->objects.end() && found->second.identity)swap=found->second.identity->native;
     }
     if(!swap)return;
@@ -982,7 +1002,7 @@ void WindowsServices::d3d11_stream_loop(GuestMemory& memory,D3D11CommandStream& 
         // X64ARM_D3D11_STREAM_BATCH_LOCKS=0 改回逐筆上鎖。
         static const bool batch_locks=[] {const auto* value=std::getenv("X64ARM_D3D11_STREAM_BATCH_LOCKS");return !value || std::string_view(value)!="0";}();
         std::shared_lock<detail::ParallelMappingLock> outer_mapping(detail::parallel_mapping_mutex(),std::defer_lock);
-        std::unique_lock<std::recursive_mutex> outer_graphics(graphics_mutex(),std::defer_lock);
+        std::unique_lock<GraphicsMutex> outer_graphics(graphics_mutex(),std::defer_lock);
         const auto release_outer=[&]{if(outer_graphics.owns_lock())outer_graphics.unlock();if(outer_mapping.owns_lock())outer_mapping.unlock();};
         const auto execute=[&](const D3D11CommandStream::Entry& entry){
             if(stream.failed.load(std::memory_order_relaxed))return;
@@ -992,7 +1012,7 @@ void WindowsServices::d3d11_stream_loop(GuestMemory& memory,D3D11CommandStream& 
                 // 前端路徑的 Unmap：內容已在快照區，不讀客體記憶體、不改對應狀態。
                 const auto started=count_replay?clock_gettime_nsec_np(CLOCK_UPTIME_RAW):0;
                 try{
-                    std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!outer_graphics.owns_lock())lock_graphics(graphics_lock);
+                    std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!outer_graphics.owns_lock())lock_graphics(graphics_lock);
                     const auto context=d3d11_->objects.find_fast(entry.rcx);const auto resource=d3d11_->objects.find_fast(entry.rdx);
                     if(context==d3d11_->objects.end() || resource==d3d11_->objects.end() || !resource->second.identity->resource)throw HostCallFault("D3D11 命令串流的 Unmap 物件已不存在");
                     const auto& target=resource->second.identity->resource;
@@ -1013,7 +1033,7 @@ void WindowsServices::d3d11_stream_loop(GuestMemory& memory,D3D11CommandStream& 
                     if(entry.present)d3d11_stream_prepare_present(stream,entry.rcx);
                     std::shared_lock<detail::ParallelMappingLock> mapping_guard(detail::parallel_mapping_mutex(),std::defer_lock);
                     if(!outer_mapping.owns_lock())mapping_guard.lock();
-                    std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!outer_graphics.owns_lock())lock_graphics(graphics_lock);
+                    std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!outer_graphics.owns_lock())lock_graphics(graphics_lock);
                     const bool may_release_mapping=entry.service->symbol.front()=='D';
                     struct GuardScope {bool set;~GuardScope(){if(set)detail::d3d11_worker_mapping_guard()=nullptr;}} guard_scope{may_release_mapping};
                     if(may_release_mapping)detail::d3d11_worker_mapping_guard()=&mapping_guard;
@@ -1077,6 +1097,7 @@ void WindowsServices::d3d11_stream_setup(GuestMemory& memory,const std::uint64_t
     stream->arena_base=arena_base;stream->arena_host=stream->arena->data();
     stream->drains_by_service=std::vector<std::atomic<std::uint32_t>>(runtime_service_descriptors().size());
     stream->snapshot=std::make_unique_for_overwrite<std::uint8_t[]>(D3D11CommandStream::snapshot_bytes);
+    d3d11_stream_guest_processors().store(static_cast<unsigned>(runtime_.processor_count),std::memory_order_relaxed);
     if(!x86_ && d3d11_stream_resident_enabled() && !d3d11_resident_stream.load(std::memory_order_acquire)){
         auto& descriptor=d3d11_resident_descriptor();
         const GuestState probe{};const WindowsServiceDescriptor sample{};

@@ -6,6 +6,16 @@
 #include <vector>
 
 namespace x64arm {
+// 宿主使用者快取／暫存目錄（DARWIN_USER_CACHE_DIR／TEMP_DIR）在套用應用程式範圍之前的原始位置；
+// 跨程式共用的資料（生成資源、映像身分快取）固定放這裡，不隨應用程式分開。
+std::filesystem::path host_user_directory(bool cache);
+// 依客體主程式把宿主系統快取分開：系統框架（Metal 著色器快取 com.apple.metal 等）之後使用
+// <使用者快取>/x64arm-app-<鍵>/，每個程式各有自己的容量額度，不互相淘汰。同時輸出
+// X64ARM_APPLICATION_CACHE_KEY 供著色器翻譯快取依程式分區段。須在建立執行緒與 Metal 裝置之前呼叫。
+// 2026-11-11《古墓奇兵：崛起》2 vCPU：共用且已滿（1.06 GiB）的快取下，先跑《暗影》再跑《崛起》會重編
+// 297 CPU 秒著色器、山頂 106.2 → 67.8 FPS、>50 ms 幀 0 → 58；連跑同一款只需 5 秒。
+// X64ARM_APPLICATION_CACHE_SCOPE=0 關閉（回到全部程式共用）。
+void scope_host_caches_to_application(const std::filesystem::path& executable);
 std::filesystem::path generated_resource_cache_directory();
 void preload_generated_resources();
 // 在背景執行緒預載，與 PE 載入、GUI 初始化及父程序握手重疊；之後首次取用或 flush 自然等待完成。

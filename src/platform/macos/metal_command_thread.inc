@@ -263,10 +263,10 @@ private:
             if(error)std::rethrow_exception(error);
         }
     }
-    template<class Task> void post(Task&& task) {
+    template<class Task> void post(Task&& task,const char* operation=__builtin_FUNCTION()) {
         if(on_worker()){task();return;}
         bool wake=false;
-        {std::lock_guard lock(mutex_);queue_.emplace_back(std::forward<Task>(task));queued_.store(++submitted_,std::memory_order_release);wake=sleeping_;}
+        {std::lock_guard lock(mutex_);queue_.push_back({std::forward<Task>(task),operation});queued_.store(++submitted_,std::memory_order_release);wake=sleeping_;}
         if(wake)cv_.notify_one();
     }
     void run() {
@@ -278,7 +278,8 @@ private:
             (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
 #endif
         for(;;){
-            std::function<void()> task;
+            PendingTask pending;
+            auto& task=pending.run;
             {
                 std::unique_lock lock(mutex_);
                 // 同成品診斷對照專用；正常執行不輪詢空佇列。
@@ -310,7 +311,7 @@ private:
                 // 空佇列直接等待；停止時仍依序完成已排入的命令。
                 while(queue_.empty() && !stopping_){sleeping_=true;cv_.wait(lock);sleeping_=false;}
                 if(queue_.empty())return;
-                task=std::move(queue_.front());queue_.pop_front();++taken_;
+                pending=std::move(queue_.front());queue_.pop_front();++taken_;
             }
             // 忙碌時間（執行工作，不含等待佇列）：診斷用，只在提交追蹤或繪製計時開啟時量測。
             static const bool timing=std::getenv("X64ARM_TRACE_D3D12_SUBMIT") || std::getenv("X64ARM_TRACE_METAL_DRAW_TIME") || metal_stall_threshold_us();
@@ -325,7 +326,7 @@ private:
                 else{std::lock_guard lock(mutex_);if(!error_)error_=std::current_exception();failed_.store(true,std::memory_order_release);}
             }
             task=nullptr;
-            if(task_start){const auto spent=clock_gettime_nsec_np(CLOCK_UPTIME_RAW)-task_start;busy_ns_.fetch_add(spent,std::memory_order_relaxed);metal_stall_note("encoder_task",spent/1000);}
+            if(task_start){const auto spent=clock_gettime_nsec_np(CLOCK_UPTIME_RAW)-task_start;busy_ns_.fetch_add(spent,std::memory_order_relaxed);metal_stall_note("encoder_task",spent/1000,pending.operation);}
             completed_.fetch_add(1,std::memory_order_acq_rel);
             if(native_ticket_wait_)completed_.notify_all();
             else{std::lock_guard lock(mutex_);if(waiting_)idle_cv_.notify_all();}
@@ -334,7 +335,8 @@ private:
     std::shared_ptr<NativeOpenGlContext> inner_;
     std::function<void(const std::string&)> on_error_;
     std::mutex mutex_;std::condition_variable cv_,idle_cv_;
-    std::deque<std::function<void()>> queue_;
+    struct PendingTask {std::function<void()> run;const char* operation{};};
+    std::deque<PendingTask> queue_;
     const bool legacy_idle_spin_=[] {const auto* value=std::getenv("X64ARM_METAL_LEGACY_IDLE_SPIN");return value && std::string_view(value)=="1";}();
     const bool async_query_flush_=[] {const auto* value=std::getenv("X64ARM_METAL_ASYNC_QUERY_FLUSH");return !value || std::string_view(value)!="0";}();
     const bool native_ticket_wait_=[] {const auto* value=std::getenv("X64ARM_METAL_NATIVE_TICKET_WAIT");return !value || std::string_view(value)!="0";}();

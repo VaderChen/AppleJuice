@@ -832,6 +832,56 @@ void mark_critical_waiters(std::map<std::uint64_t,CriticalSection>& sections,con
 // 平行 worker 的客體快速路徑可能同時改寫，CAS 失敗就以新值重新判定。
 namespace {
 constexpr std::uint32_t critical_free=UINT32_MAX,critical_waiters=0x40000000U,critical_free_waiting=0x7fffffffU,critical_count=0x3fffffffU;
+std::uint64_t critical_stall_threshold_us(){
+    static const auto threshold=[] {const auto* text=std::getenv("X64ARM_TRACE_CRITICAL_STALLS");
+        return text?std::clamp<std::uint64_t>(std::strtoull(text,nullptr,10),1,1000000)*1000:0;}();
+    return threshold;
+}
+}
+void WindowsServices::trace_critical_wait_begin(std::uint64_t id,const GuestState& state,GuestMemory& memory,std::uint64_t address){
+    if(!critical_stall_threshold_us())return;
+    CriticalWaitDiagnostic record;record.started_us=startup_profile::unix_us();record.address=address;
+    try{record.caller=memory.load(GuestAddress{state.reg(Gpr::Rsp)},x86_?32:64);}catch(...){}
+    critical_wait_diagnostics_[id]=record;
+    trace_critical_wait_sample(id,memory);
+}
+void WindowsServices::trace_critical_wait_sample(std::uint64_t id,GuestMemory& memory){
+    if(!critical_stall_threshold_us())return;
+    const auto found=critical_wait_diagnostics_.find(id);
+    if(found==critical_wait_diagnostics_.end() || found->second.dependency_owner)return;
+    auto& record=found->second;
+    const auto section=runtime_.critical_sections.find(record.address);
+    if(section==runtime_.critical_sections.end())return;
+    std::uint64_t owner=section->second.owner;
+    if(section->second.guest){
+        try{
+            const GuestAddress word{record.address+(x86_?4:8)};
+            const auto before=memory.load(word,32);
+            const auto public_owner=memory.load(GuestAddress{record.address+(x86_?12:16)},x86_?32:64);
+            if(before==critical_free || before==critical_free_waiting || before!=memory.load(word,32))return;
+            owner=0;
+            for(const auto& [key,thread]:threads_.items){(void)thread;if(thread_identifier(key)==public_owner){owner=key;break;}}
+        }catch(...){return;}
+    }
+    const auto thread=threads_.items.find(owner);
+    if(thread==threads_.items.end())return;
+    if(!record.initial_owner){record.initial_owner=owner;record.initial_owner_wait=thread->second.status==ThreadStatus::Waiting?static_cast<int>(thread->second.wait.kind):-1;}
+    // 只讀協調者已保存的「等待」狀態；不把執行中執行緒的舊 RIP 當成現場。
+    if(thread->second.status!=ThreadStatus::Waiting || thread->second.wait.kind!=ThreadWaitKind::ShaderRetry)return;
+    const auto shader=shader_waits_.find(owner);
+    if(shader==shader_waits_.end())return;
+    record.dependency_us=startup_profile::unix_us();record.dependency_owner=owner;record.dependency_ticket=shader->second.second;
+}
+void WindowsServices::trace_critical_wait_end(std::uint64_t id){
+    if(!critical_stall_threshold_us())return;
+    const auto found=critical_wait_diagnostics_.find(id);if(found==critical_wait_diagnostics_.end())return;
+    const auto record=found->second;critical_wait_diagnostics_.erase(found);
+    const auto ended=startup_profile::unix_us();if(ended-record.started_us<critical_stall_threshold_us())return;
+    std::fprintf(stderr,"critical_wait pid=%llu thread=%llu lock=0x%llx caller=0x%llx start_unix_us=%llu end_unix_us=%llu duration_us=%llu initial_owner=%llu initial_owner_wait=%d dependency_unix_us=%llu dependency_owner=%llu dependency_ticket=0x%llx\n",
+        static_cast<unsigned long long>(process_id()),static_cast<unsigned long long>(id),static_cast<unsigned long long>(record.address),
+        static_cast<unsigned long long>(record.caller),static_cast<unsigned long long>(record.started_us),static_cast<unsigned long long>(ended),
+        static_cast<unsigned long long>(ended-record.started_us),static_cast<unsigned long long>(record.initial_owner),record.initial_owner_wait,
+        static_cast<unsigned long long>(record.dependency_us),static_cast<unsigned long long>(record.dependency_owner),static_cast<unsigned long long>(record.dependency_ticket));
 }
 // X64ARM_GUEST_CS=0：臨界區段回到宿主欄位模型（同時停用客體常式），供同成品對照。
 bool WindowsServices::guest_critical_enabled(){static const bool enabled=[] {const auto* value=std::getenv("X64ARM_GUEST_CS");return !value || std::string_view(value)!="0";}();return enabled;}
@@ -1633,6 +1683,8 @@ bool WindowsServices::resident_block_service_impl(GuestState& state,GuestMemory&
         for(const auto handle:wait.handles)trace_event_operation('B',handle,key,memory.load(GuestAddress{state.reg(Gpr::Rsp)},pointer_bits));
     }
     thread.wait=std::move(wait);thread.status=ThreadStatus::Waiting;thread.parallel_slice_deadline=0;
+    if(thread.wait.kind==ThreadWaitKind::Critical || thread.wait.kind==ThreadWaitKind::CriticalRetry)
+        trace_critical_wait_begin(key,state,memory,thread.wait.handles[0]);
     if(null_park)null_park_.parked.fetch_add(1,std::memory_order_acq_rel);
     mark_critical_waiters(runtime_.critical_sections,thread.wait);
     // 條件睡眠釋放的 SRW 原本就有宿主等待者：把鎖交給它們（本執行緒的條件等待尚未被通知，不會被選中）。
@@ -1878,7 +1930,7 @@ bool WindowsServices::resident_resolve_waits_pending(GuestMemory&) {
     const auto now=runtime_.clock_ticks;
     if(gpu_signal_wakeup_ns()){
         // 與 poll_gpu_signals(try_only) 相同只嘗試取圖形鎖；取不到時鎖下也會略過。
-        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);
+        std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);
         if(graphics_lock.try_lock())for(const auto& signal:gpu_signals_)if(!signal.done || signal.done->load(std::memory_order_acquire))return true;
     }
     // 到期的計時器只有鎖下才會轉為訊號（advance_waitable_timers）；wait_ready 看的是訊號，所以在這裡先看期限，否則前置判斷會永遠略過。
@@ -2945,6 +2997,7 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             continue;
         auto &wait = thread.wait;
         if(scope!=ThreadWakeScope::All && !selected_by(wait))continue;
+        if(wait.kind==ThreadWaitKind::Critical || wait.kind==ThreadWaitKind::CriticalRetry)trace_critical_wait_sample(id,memory);
         if(wait.kind==ThreadWaitKind::Slim && !wait.slim_timed && srw_retry_waits() && !wait.handles.empty()){
             // 只喚醒、不取得：鎖目前可取得（獨占位元清除；獨占等待另須沒有共用持有者）才改回可執行，保留 API 入口重新執行。
             // 被喚醒者是這把鎖最後一位等待者時清除 bit1，之後由客體快速路徑取得；仍有等待者時保留，下一次釋放照常進宿主喚醒。
@@ -3326,6 +3379,12 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             // 背景著色器編譯完成或保底期限到：重新執行原始建立呼叫（見 d3d11_graphics_handlers.inc）。
             const auto target=shader_waits_.find(id);
             if(target==shader_waits_.end() || wait.deadline<=runtime_.clock_ticks || target->second.first->graphics_shader_ticket_ready(target->second.second)){
+                static const bool trace_waits=std::getenv("X64ARM_TRACE_SHADER_WAITS")!=nullptr;
+                if(trace_waits)std::fprintf(stderr,"shader_wait_end pid=%llu thread=%llu ticket=0x%llx reason=%s unix_us=%llu\n",
+                    static_cast<unsigned long long>(process_id()),static_cast<unsigned long long>(id),
+                    static_cast<unsigned long long>(target==shader_waits_.end()?0:target->second.second),
+                    target==shader_waits_.end()?"missing":wait.deadline<=runtime_.clock_ticks?"deadline":"ready",
+                    static_cast<unsigned long long>(startup_profile::unix_us()));
                 static const bool trace_async=std::getenv("X64ARM_TRACE_SHADER_ASYNC")!=nullptr;
                 if(trace_async)std::fprintf(stderr,"[shader_async] resume thread=%llu reason=%s waited_ms=%.1f\n",static_cast<unsigned long long>(id),
                     target==shader_waits_.end()?"missing":wait.deadline<=runtime_.clock_ticks?"deadline":"ready",
@@ -3355,6 +3414,7 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
                 if (chosen != retry_first.end() && chosen->second != id) continue;
             }
             if (!critical_held(memory, wait.handles[0], section) || critical_owned_by(memory, wait.handles[0], section, id)) {
+                trace_critical_wait_end(id);
                 thread.status = ThreadStatus::Runnable;
                 thread.wait = {};
             }
@@ -3466,6 +3526,7 @@ bool WindowsServices::resolve_thread_waits(GuestMemory& memory,ThreadWakeScope s
             while (parked && !null_park_.parked.compare_exchange_weak(parked, parked - 1, std::memory_order_acq_rel)) {}
         }
         if (ready) {
+            if(wait.kind==ThreadWaitKind::Critical)trace_critical_wait_end(id);
             if (!runtime_.priority_boost_disabled && !thread.priority_boost_disabled &&
                 wait.kind != ThreadWaitKind::Sleep && result != 258 && !(wait.slim_timed && !result) && thread.priority > -15 && thread.priority < 15)
                 thread.dynamic_priority_boost = 1;
@@ -5491,6 +5552,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                     thread.wait.kind = critical_retry_waits() ? ThreadWaitKind::CriticalRetry : ThreadWaitKind::Critical;
                     thread.wait.handles = {address};
                     if (critical_retry_waits()) thread.wait.order = ++object_wait_order_;
+                    trace_critical_wait_begin(threads_.current,state,memory,address);
                     schedule(state, memory);
                     return std::nullopt;
                 }

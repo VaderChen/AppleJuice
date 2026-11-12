@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <chrono>
@@ -17,9 +18,12 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <cstdio>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -374,8 +378,43 @@ void flush_generated_resources(){
 std::filesystem::path generated_resource_cache_directory(){
     if(const auto* enabled=std::getenv("X64ARM_RESOURCE_CACHE");enabled && std::string_view(enabled)=="0")return {};
     if(const auto* path=std::getenv("X64ARM_RESOURCE_CACHE_DIR");path && *path)return path;
-    const auto size=::confstr(_CS_DARWIN_USER_CACHE_DIR,nullptr,0);if(!size)return {};
-    std::vector<char> path(size);if(!::confstr(_CS_DARWIN_USER_CACHE_DIR,path.data(),path.size()))return {};
-    return std::filesystem::path(path.data())/"x64arm-generated-resources-v1";
+    const auto base=host_user_directory(true);if(base.empty())return {};
+    return base/"x64arm-generated-resources-v1";
+}
+std::filesystem::path host_user_directory(bool cache){
+    // 第一次查詢時固定；scope_host_caches_to_application 會在改變範圍之前先查詢兩者。
+    static const auto read=[](int name){
+        const auto size=::confstr(name,nullptr,0);if(!size)return std::filesystem::path{};
+        std::vector<char> path(size);if(!::confstr(name,path.data(),path.size()))return std::filesystem::path{};
+        return std::filesystem::path(path.data());
+    };
+    static const std::filesystem::path cache_directory=read(_CS_DARWIN_USER_CACHE_DIR),temp_directory=read(_CS_DARWIN_USER_TEMP_DIR);
+    return cache?cache_directory:temp_directory;
+}
+void scope_host_caches_to_application(const std::filesystem::path& executable){
+    if(const auto* enabled=std::getenv("X64ARM_APPLICATION_CACHE_SCOPE");enabled && std::string_view(enabled)=="0")return;
+    try{
+        std::error_code error;auto absolute=std::filesystem::absolute(executable,error);if(error || absolute.empty())return;
+        // 鍵＝正規化絕對路徑（ASCII 不分大小寫）的 SHA-256 前 8 位元組。
+        auto text=absolute.lexically_normal().string();
+        for(auto& value:text)if(value>='A' && value<='Z')value=static_cast<char>(value+32); // 只轉 ASCII，不受 locale 影響；Launcher 以相同規則對回程式。
+        std::array<std::uint8_t,CC_SHA256_DIGEST_LENGTH> digest{};CC_SHA256(text.data(),static_cast<CC_LONG>(text.size()),digest.data());
+        std::string key;for(unsigned n=0;n<8;++n){static constexpr char hex[]="0123456789abcdef";key.push_back(hex[digest[n]>>4]);key.push_back(hex[digest[n]&15]);}
+        (void)host_user_directory(true);(void)host_user_directory(false); // 共用資料固定在原始位置。
+        ::setenv("X64ARM_APPLICATION_CACHE_KEY",key.c_str(),1);
+        // libSystem 的目錄輔助函式：之後 confstr(DARWIN_USER_*_DIR) 回傳 <原目錄>/<後綴>/，系統框架據此放置各自的快取。
+        using Setter=bool(*)(const char*);
+        const auto setter=reinterpret_cast<Setter>(::dlsym(RTLD_DEFAULT,"_set_user_dir_suffix"));
+        if(!setter || !setter(("x64arm-app-"+key).c_str()))return;
+        // 在此程式的快取目錄留下主程式路徑，供 Launcher 的快取頁面顯示名稱與用量；已存在且相同時不重寫。
+        const auto directory=host_user_directory(true)/("x64arm-app-"+key);std::filesystem::create_directories(directory,error);
+        const auto manifest=directory/"x64arm-application.txt";const auto path=absolute.lexically_normal().string();
+        std::string existing;if(const int fd=::open(manifest.c_str(),O_RDONLY|O_CLOEXEC);fd>=0){
+            char buffer[4096];const auto size=::read(fd,buffer,sizeof buffer);::close(fd);if(size>0)existing.assign(buffer,static_cast<std::size_t>(size));
+        }
+        if(existing!=path)if(const int fd=::open(manifest.c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0600);fd>=0){
+            (void)!::write(fd,path.data(),path.size());::close(fd);
+        }
+    }catch(const std::exception&){} // 範圍設定失敗時維持共用快取，不影響執行。
 }
 }

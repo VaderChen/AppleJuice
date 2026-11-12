@@ -419,12 +419,42 @@ document.addEventListener('drop', event => event.preventDefault());
 window.launcherReady = Promise.all([api('snapshot'), api('windowsFonts')]).then(([initial, fonts]) => { windowsFonts = fonts || []; applyState(initial); poll(); pollUpdate(); });
 window.launcherReady.catch(error => toast(t`啟動失敗：${errorText(error)}`, true));
 
+// 快取用量：以 GB（十進位）顯示，每個項目可獨立清除；有程式執行中時不可清除。
+const cacheSize = bytes => t`${(bytes / 1e9).toFixed(2)} GB`;
+function renderCacheUsage(usage) {
+  const list = $('cache-list'), entries = usage?.entries || [];
+  setText('cache-total', cacheSize(usage?.totalBytes || 0));
+  $('cache-empty').hidden = entries.length > 0; $('cache-running').hidden = !usage?.running;
+  list.replaceChildren(...entries.map(entry => {
+    const row = document.createElement('div'), text = document.createElement('div'), title = document.createElement('strong'), detail = document.createElement('span');
+    const size = document.createElement('output'), clear = document.createElement('button');
+    row.className = 'cache-row'; row.setAttribute('role', 'listitem'); row.dataset.cacheId = entry.id;
+    const shared = { legacyShaders: [t`舊版共用著色器快取`, t`改為每個程式獨立之前的著色器快取，新版本不再使用。`], resources: [t`生成資源快取`, t`字型等生成資源，所有程式共用。`], identity: [t`映像身分快取`, t`EXE／DLL 的內容識別結果，所有程式共用。`] }[entry.kind];
+    title.textContent = shared ? shared[0] : entry.name || t`未知程式`;
+    detail.textContent = shared ? shared[1] : entry.path ? t`著色器快取 · ${entry.path}` : t`著色器快取`;
+    detail.title = detail.textContent; size.textContent = cacheSize(entry.bytes);
+    clear.type = 'button'; clear.className = 'text-button'; clear.textContent = t`清除`; clear.disabled = Boolean(usage.running);
+    clear.setAttribute('aria-label', t`清除 ${title.textContent}`);
+    clear.onclick = async () => {
+      clear.disabled = true;
+      try { renderCacheUsage(await api('clearCache', { data: entry.id })); toast(t`已清除快取`); }
+      catch (error) { toast(errorText(error), true); refreshCacheUsage(); }
+    };
+    text.append(title, detail); row.append(text, size, clear); return row;
+  }));
+}
+async function refreshCacheUsage() {
+  setText('cache-total', t`正在計算…`);
+  try { renderCacheUsage(await api('cacheUsage')); } catch (error) { toast(errorText(error), true); }
+}
+$('cache-refresh').onclick = refreshCacheUsage;
 function showGlobalTab(name) {
   for (const button of document.querySelectorAll('[data-global-tab]')) {
     const current = button.dataset.globalTab === name;
     button.setAttribute('aria-selected', String(current)); button.tabIndex = current ? 0 : -1;
     $('global-' + button.dataset.globalTab).hidden = !current;
   }
+  if (name === 'cache') refreshCacheUsage();
 }
 for (const button of document.querySelectorAll('[data-global-tab]')) {
   button.onclick = () => showGlobalTab(button.dataset.globalTab);

@@ -38,7 +38,12 @@
             }else{
                 const auto found=context->deferred_maps.find(key);require(found!=context->deferred_maps.end() && found->second.pointer);auto& map=found->second;
                 map.bytes=read_bytes(memory,map.pointer,map.bytes.size());const auto row=map.row,image=map.image;
-                submit(context,{[view,data=map.bytes,row,image](auto& native){native.graphics_write(view,data,row,image);}});
+                // 錄製的資料是整個子資源的完整內容（WRITE_DISCARD 從零開始、NO_OVERWRITE 接續同一份）：重播時以捨棄語義寫入，
+                // 緩衝仍被排隊中的繪製使用時換一份新的儲存，不必以 blit 複製而中斷 render pass（Fire Strike 每幀約 130 次）。
+                // X64ARM_D3D11_DEFERRED_MAP_DISCARD=0 恢復一般寫入。
+                static const bool deferred_discard=[] {const auto* value=std::getenv("X64ARM_D3D11_DEFERRED_MAP_DISCARD");return !value || std::string_view(value)!="0";}();
+                if(deferred_discard)submit(context,{[view,data=map.bytes,row,image](auto& native){native.graphics_write_discard(view,data,row,image);}});
+                else submit(context,{[view,data=map.bytes,row,image](auto& native){native.graphics_write(view,data,row,image);}});
                 // 區塊放回 map_blocks 給下一次同大小的 Map；放不下時照常釋放（worker 上由 d3d11_local_eligible 保證放得下）。
                 if(!keep_block(map.pointer,map.bytes.size())){if(graphics_local())throw HostCallFault("worker 上的延遲 Unmap 無法保留區塊");require(free_heap(memory,map.pointer,state));}
                 std::erase(context->allocations,map.pointer);map.pointer=0;

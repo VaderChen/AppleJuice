@@ -343,10 +343,14 @@ struct MetalShader final:GraphicsShader {
 void metal_resolve_shader(id<MTLDevice> device,MetalShader& shader){
     if(!shader.pending)return;
     const auto pending=shader.pending;
-    {std::unique_lock lock(pending->mutex);pending->ready.wait(lock,[&]{return pending->done;});}
+    {MetalStallScope timing("shader_library_wait",shader.serial,shader.stage);
+        std::unique_lock lock(pending->mutex);pending->ready.wait(lock,[&]{return pending->done;});}
     if(!pending->library)throw std::invalid_argument("Metal 著色器編譯失敗："+pending->error+"\n"+shader.source);
-    shader.function=[pending->library newFunctionWithName:pending->entry];if(!shader.function)throw std::invalid_argument("Metal 著色器沒有入口");
-    if(shader.stage==5){NSError* error=nil;shader.compute=[device newComputePipelineStateWithFunction:shader.function error:&error];
+    {MetalStallScope timing("shader_function_create",shader.serial,shader.stage);
+        shader.function=[pending->library newFunctionWithName:pending->entry];}
+    if(!shader.function)throw std::invalid_argument("Metal 著色器沒有入口");
+    if(shader.stage==5){MetalStallScope timing("compute_pipeline_create",shader.serial,shader.stage);
+        NSError* error=nil;shader.compute=[device newComputePipelineStateWithFunction:shader.function error:&error];
         if(!shader.compute)throw std::invalid_argument("Metal compute pipeline 建立失敗："+std::string(error.localizedDescription.UTF8String));}
     shader.pending.reset();
 }

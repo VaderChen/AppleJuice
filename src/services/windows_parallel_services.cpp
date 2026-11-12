@@ -1,4 +1,10 @@
 #include "windows_scalar_math.hpp"
+#include <string_view>
+#include <string>
+#include <cstdio>
+#include <array>
+#include <mutex>
+#include <unordered_map>
 #include <shared_mutex>
 #include "x64arm/windows_services.hpp"
 #include <chrono>
@@ -120,6 +126,83 @@ ResidentClockRecipe WindowsServices::resident_clock_recipe(GuestAddress address)
 }
 #endif
 namespace detail {ParallelMappingLock& parallel_mapping_mutex() noexcept;void fls_trace_record(std::uint64_t,std::size_t,std::uint64_t) noexcept;}
+namespace detail {
+// D3D11 串流入口的取樣計時（診斷）：每條執行緒以線性同餘數列抽 1/16，記錄牆鐘合計與四種結果的次數。
+namespace {
+struct StreamTiming {std::string name;std::uint64_t samples{},ns{},maximum{};std::array<std::uint64_t,4> steps{};};
+std::mutex& stream_timing_mutex() noexcept {static std::mutex value;return value;}
+std::unordered_map<std::uint64_t,StreamTiming>& stream_timings() noexcept {static std::unordered_map<std::uint64_t,StreamTiming> value;return value;}
+}
+// PeekMessage 空閒快取（x64）：worker 在共用映射鎖下確認「這條執行緒沒有任何待處理訊息」後，記下呼叫特徵與期限；期限內同一
+// 呼叫（同 stub、TEB、暫存器引數、堆疊位置與旗標）直接回 FALSE，不取映射鎖、不走訪 GUI 佇列。協調者執行任何服務、抽取宿主
+// 事件或入列訊息時作廢（peek_idle_invalidate），之後第一次呼叫回到持鎖路徑重新確認。期限沿用 gui_peek_idle_until_（約 1 ms），
+// 訊息最晚的可見時間與原路徑相同。返回位址與旗標每次都從客體堆疊重讀（快取的宿主指標以 native_borrow_generation 核對）。
+// 2026-11-11《電馭叛客》4 vCPU：主執行緒每秒約 2.06 萬次 PeekMessageW，等映射鎖 88 ms／秒（3 vCPU 12 ms）。
+// X64ARM_PARALLEL_PEEK_LOCKFREE=0 關閉。
+namespace {
+struct PeekIdleCache {
+    std::atomic<std::uint64_t> until{};std::atomic_flag busy{};
+    // 記錄的呼叫點：其他服務先比對這個值就離開，不讀時鐘也不碰 busy（每條 worker 的每次服務都會經過，
+    // 原本每次都讀時鐘並改寫共用的 busy，《電馭叛客》重場景每條 vCPU 約 2～3.6%）。
+    std::atomic<std::uint64_t> rip_hint{};
+    std::uint64_t rip{},gs{},rcx{},rdx{},r8{},r9{},sp{},generation{};const std::uint8_t* stack{};std::uint32_t flags{};
+};
+PeekIdleCache& peek_idle_cache() noexcept {static PeekIdleCache value;return value;}
+bool peek_idle_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_PEEK_LOCKFREE");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
+}
+void peek_idle_invalidate() noexcept {peek_idle_cache().until.store(0,std::memory_order_release);}
+void peek_idle_record(const GuestState& state,std::uint64_t generation,const std::uint8_t* stack,std::uint32_t flags,std::uint64_t until) noexcept {
+    if(!peek_idle_enabled() || !stack || (state.reg(Gpr::Rsp)&0xfffU)+0x30U>0x1000U)return; // 返回位址與旗標要在同一客體頁
+    auto& cache=peek_idle_cache();
+    if(cache.busy.test_and_set(std::memory_order_acquire))return;
+    cache.rip=state.rip.value;cache.gs=state.gs_base;cache.rcx=state.reg(Gpr::Rcx);cache.rdx=state.reg(Gpr::Rdx);cache.r8=state.reg(Gpr::R8);
+    cache.r9=state.reg(Gpr::R9);cache.sp=state.reg(Gpr::Rsp);cache.generation=generation;cache.stack=stack;cache.flags=flags;
+    cache.rip_hint.store(state.rip.value,std::memory_order_relaxed);
+    cache.until.store(until,std::memory_order_release);
+    cache.busy.clear(std::memory_order_release);
+}
+bool peek_idle_fast(GuestState& state,std::uint64_t generation) noexcept {
+    auto& cache=peek_idle_cache();
+    if(cache.rip_hint.load(std::memory_order_relaxed)!=state.rip.value)return false;
+    const auto until=cache.until.load(std::memory_order_acquire);
+    if(!until || detail::monotonic_ticks()>=until || cache.busy.test_and_set(std::memory_order_acquire))return false;
+    std::uint64_t target=0;bool hit=false;
+    if(cache.rip==state.rip.value && cache.gs==state.gs_base && cache.rcx==state.reg(Gpr::Rcx) && cache.rdx==state.reg(Gpr::Rdx) &&
+       cache.r8==state.reg(Gpr::R8) && cache.r9==state.reg(Gpr::R9) && cache.sp==state.reg(Gpr::Rsp) && cache.generation==generation){
+        std::uint32_t flags=0;std::memcpy(&flags,cache.stack+0x28,sizeof flags);std::memcpy(&target,cache.stack,sizeof target);
+        // 作廢與查核之間的競爭等同於這次呼叫發生在入列之前。
+        hit=flags==cache.flags && cache.until.load(std::memory_order_acquire)==until;
+    }
+    cache.busy.clear(std::memory_order_release);
+    if(!hit)return false;
+    state.rip=GuestAddress{target};state.reg(Gpr::Rsp)=state.reg(Gpr::Rsp)+8;state.reg(Gpr::Rax)=0;
+    return true;
+}
+bool stream_timing_sample() noexcept {
+    static thread_local std::uint32_t state=0x9e3779b9U;
+    state=state*1664525U+1013904223U;return (state>>28U)==0;
+}
+void stream_timing_record(std::uint64_t rip,std::string_view name,unsigned step,std::uint64_t ns) noexcept {
+    try{
+        const std::lock_guard lock(stream_timing_mutex());auto& entry=stream_timings()[rip];
+        if(entry.name.empty())entry.name=name;
+        ++entry.samples;entry.ns+=ns;entry.maximum=std::max(entry.maximum,ns);if(step<entry.steps.size())++entry.steps[step];
+    }catch(...){}
+}
+void stream_timing_dump(std::FILE* out) noexcept {
+    try{
+        const std::lock_guard lock(stream_timing_mutex());
+        for(const auto& [rip,entry]:stream_timings())
+            std::fprintf(out,"[service_counts]   stream_sample rip=0x%llx samples=%llu ns=%llu max_ns=%llu continue=%llu done=%llu refuse=%llu coordinator=%llu name=%s\n",
+                static_cast<unsigned long long>(rip),static_cast<unsigned long long>(entry.samples),static_cast<unsigned long long>(entry.ns),
+                static_cast<unsigned long long>(entry.maximum),static_cast<unsigned long long>(entry.steps[0]),static_cast<unsigned long long>(entry.steps[1]),
+                static_cast<unsigned long long>(entry.steps[2]),static_cast<unsigned long long>(entry.steps[3]),entry.name.c_str());
+    }catch(...){}
+}
+}
 // 核心在 worker 上查區域表（REP 批次、rdtsc 出口解碼）時與 worker 服務共用同一把映射讀鎖。
 void WindowsServices::resident_mapping_read(bool acquire) const noexcept {
     if(acquire)detail::parallel_mapping_mutex().lock_shared();else detail::parallel_mapping_mutex().unlock_shared();
@@ -512,9 +595,20 @@ ResidentServiceProgress WindowsServices::resident_parallel_service(GuestState& s
 bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory& memory,ResidentServiceProgress& progress,
                                                   std::span<GuestState* const> active) {
     if(!parallel_service(state.rip))return false;
+    // PeekMessage 空閒快取：命中時不取映射鎖（見 peek_idle_fast）。
+    if(!x86_ && detail::peek_idle_fast(state,memory.native_borrow_generation())){state.rep_compare={};return true;}
     // D3D11 命令串流：分類與 drain 都在取映射鎖之前，見 d3d11_command_stream.inc。
     if(d3d11_stream_){
+        // 統計模式（X64ARM_SERVICE_COUNTS）下以 1/16 取樣量測串流入口整段牆鐘，依方法與結果分列；一般執行不計時。
+        const bool timed=service_counts_enabled_ && detail::stream_timing_sample();
+        const auto stream_rip=state.rip;
+        const auto stream_begin=timed?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         const auto step=d3d11_stream_entry(state,memory);
+        if(timed){
+            const auto* const descriptor=detail::runtime_stub_descriptor(stub_base_,stream_rip);
+            detail::stream_timing_record(stream_rip.value,descriptor?descriptor->symbol:std::string_view{},static_cast<unsigned>(step),
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-stream_begin).count()));
+        }
         if(step==D3D11StreamStep::Done){
             // 這次排入請求核心登錄常駐入口：回報 CompletedResolve 讓核心 poke 協調者立刻處理（見 d3d11_stream_resident_request）。
             if(std::exchange(d3d11_resident_request_pending,false))progress=ResidentServiceProgress::CompletedResolve;
@@ -596,7 +690,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         }
         count_scope.accepted=false;
         // 鎖順序：映射（共用）→ D3D11。資格不符（裝置鎖、延後銷毀清單過長）時交回協調者，未改任何狀態。
-        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+        std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         const auto& descriptor=*graphics;
         if(!d3d11_local_eligible(state,memory,descriptor) || !graphics_worker_outputs_private(state,memory,descriptor))return false;
         count_scope.accepted=true;
@@ -674,7 +768,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(submit && !d3d12_submitter_)return false;
         const bool unlocked=record_unlocked && (symbol.starts_with("List.") || symbol=="Resource.GetGPUVirtualAddress" || symbol=="Device.GetDescriptorHandleIncrementSize" ||
             symbol=="Allocator.Reset" || symbol=="Queue.Wait" || descriptor_write || reference || submit || map || named || heap_start || allocation_info || fence_value || description || residency);
-        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!unlocked)lock_graphics(graphics_lock);
+        std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!unlocked)lock_graphics(graphics_lock);
         if(symbol.ends_with(".AddRef") || symbol.ends_with(".Release") || symbol=="Resource.Map" || symbol=="Resource.Unmap"){
             bool done=false;
             try{done=symbol.starts_with("Resource.Map") || symbol=="Resource.Unmap"?d3d12_worker_map(state,memory,*d3d12):d3d12_worker_reference(state,memory,*d3d12);}catch(...){return false;}
@@ -741,8 +835,11 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
     // &thread.context 到執行緒編號的對應在程序期間不變（執行緒只增不刪、std::map 節點位址固定），每條 worker 以
     // 執行緒區域快取記住最近一次查到的對應，免取全域索引鎖；TEB 不符時清快取重查。協調者自己的 GuestState
     // （slot 0）不在索引中，沿用目前執行緒。
+    // 客體執行緒多於 vCPU 時，同一條 worker 輪流執行多個客體執行緒：單一格快取每次換人都要取全域索引鎖
+    // （《電馭叛客》重場景每條 vCPU 約 3% 耗在這把鎖的喚醒）。改為依 context 位址直接對映的 16 格。
     struct IdentityCache {const WindowsServices* owner;const GuestState* state;std::uint64_t key;};
-    thread_local IdentityCache identity{};
+    thread_local std::array<IdentityCache,16> identities{};
+    auto& identity=identities[(reinterpret_cast<std::uintptr_t>(&state)>>6U)&15U];
     const auto teb=x86_?state.fs_base:state.gs_base;
     auto key=threads_.current;bool cached=identity.owner==this && identity.state==&state;
     if(cached)key=identity.key;
@@ -1409,6 +1506,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
            (remove && std::any_of(gui_.shell_deliveries.begin(),gui_.shell_deliveries.end(),[&](const auto& item){
                return item.second.thread==tid && item.second.consumed && !item.second.active && !item.second.locks;})))return refuse(Pending);
         result=0;
+        detail::peek_idle_record(state,memory.native_borrow_generation(),static_cast<const std::uint8_t*>(static_cast<const void*>(stack)),flags,gui_peek_idle_until_);
     }else if(symbol=="GetCurrentThreadId")result=thread_identifier(tid);
 else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"){
         auto* output=pointer(first,8,2);if(!output)return false;

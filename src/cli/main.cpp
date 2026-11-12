@@ -191,6 +191,8 @@ int main(int argc, char** argv) {
         // P99 36.7 → 33.8 ms，2 vCPU 持平。需搭配空轉保險放寬的核心（X64ARM_RESIDENT_PREEMPT_IDLE）。=0 關閉。
         if(command=="run-pe" && !std::getenv("X64ARM_RESIDENT_PREEMPT_SLOT"))::setenv("X64ARM_RESIDENT_PREEMPT_SLOT","1",1);
 #if defined(__APPLE__)
+        // 每個客體程式使用自己的宿主系統快取（Metal 著色器快取）與著色器翻譯快取區段；須早於預載執行緒與 Metal 裝置。
+        if(command=="run-pe" && argc>=3)scope_host_caches_to_application(argv[2]);
         if(command=="run-pe"){startup_profile::Scope measurement("startup","resource_preload",true);preload_generated_resources_async();}
 #endif
         if (command == "--help" || command == "-h" || command == "help") { usage(); return argc == 2 ? 0 : 2; }

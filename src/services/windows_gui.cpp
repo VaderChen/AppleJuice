@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstdio>
 
+namespace x64arm::detail {void peek_idle_invalidate() noexcept;}
 namespace x64arm {
 namespace {
 std::uint64_t automation_raw_device(const RawInputState& state,bool keyboard){
@@ -92,6 +93,7 @@ GuiMessage gui_read_message(const GuestMemory& memory, std::uint64_t address) {
     return result;
 }
 void WindowsServices::enqueue_gui_message(GuiMessage message) {
+    detail::peek_idle_invalidate(); // worker 的 PeekMessage 空閒快取：有新訊息入列即作廢
     if(message.queue_priority==1 && !message.input_order)message.input_order=gui_.next_input_order++;
     if(!message.injected)message.queued_time=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
     if(message.has_point && message.screen_point)gui_.pointer_position=message.point;
@@ -305,6 +307,7 @@ void WindowsServices::pump_mouse_tracking(){
     }
 }
 void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait_ticks) {
+    detail::peek_idle_invalidate(); // 抽取宿主事件可能產生訊息、回呼與滑鼠輸入
     GuiPumpTrace trace(process_id());
     if(const auto found=gui_.icons.find(gui_.cursor);found!=gui_.icons.end() && !found->second.animation_sequence.empty()){
         const auto& icon=found->second;const auto step=icon_animation_step(icon,runtime_.clock_ticks>=gui_.cursor_animation_start?runtime_.clock_ticks-gui_.cursor_animation_start:0);

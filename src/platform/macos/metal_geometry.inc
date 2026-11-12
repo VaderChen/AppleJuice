@@ -167,7 +167,8 @@ MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDesc
         for(unsigned i=0;i<vs.output_varyings.size();++i)writes+="x64Captured[x64At+"+std::to_string(i)+"]="+metal_pack_varying(vs.output_varyings[i],"output."+vs.output_varyings[i].name)+";\n";
         writes+="} return;";metal_replace(capture,"return output;",writes);
         metal_replace(capture,"vertex Mtl_VertexOut xlatMtlMain(","vertex void xlatMtlMain(");
-        library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:capture.c_str()] options:options error:&error];
+        {MetalStallScope timing("geometry_capture_library",vs.serial,0);
+        library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:capture.c_str()] options:options error:&error];}
         if(!library)throw std::invalid_argument("幾何 VS capture 編譯失敗："+std::string(error.localizedDescription.UTF8String)+"\n"+capture);
         auto pipeline=[MTLRenderPipelineDescriptor new];pipeline.vertexFunction=[library newFunctionWithName:@"xlatMtlMain"];pipeline.vertexDescriptor=descriptor;pipeline.rasterizationEnabled=NO;pipeline.inputPrimitiveTopology=MTLPrimitiveTopologyClassPoint;
         p->capture=[device_ newRenderPipelineStateWithDescriptor:pipeline error:&error];if(!p->capture)throw std::invalid_argument("幾何 VS capture pipeline："+std::string(error.localizedDescription.UTF8String));
@@ -215,9 +216,11 @@ MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDesc
         code<<"}}\n";const bool position=std::any_of(gs.output_varyings.begin(),gs.output_varyings.end(),[](const auto& v){return v.system==NAME_POSITION;});if(position){code<<"vertex Mtl_GeometryOut x64GeometryDraw(device const float4* data [[buffer(0)]],uint x64Index [[vertex_id]]){Mtl_GeometryOut output{};uint at=x64Index*"<<gs.output_varyings.size()<<";\n";
         for(unsigned i=0;i<gs.output_varyings.size();++i)code<<metal_assign_varying(gs.output_varyings[i],"output."+gs.output_varyings[i].name,"data[at+"+std::to_string(i)+"]");
         code<<"return output;}\n";}auto program=gs.geometry_output==1?code.str():metal_nonpoint_source(code.str());
-        library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:program.c_str()] options:options error:&error];
+        {MetalStallScope timing("geometry_compute_library",gs.serial,2);
+        library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:program.c_str()] options:options error:&error];}
         if(!library)throw std::invalid_argument("幾何 compute 編譯失敗："+std::string(error.localizedDescription.UTF8String)+"\n"+program);
-        p->expand=[device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"x64GeometryExpand"] error:&error];
+        {MetalStallScope timing("geometry_compute_pipeline",gs.serial,2);
+        p->expand=[device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"x64GeometryExpand"] error:&error];}
         p->draw=[library newFunctionWithName:@"x64GeometryDraw"];if(!p->expand || (position && !p->draw))throw std::invalid_argument("幾何 compute pipeline："+std::string(error.localizedDescription.UTF8String));
         if(geometry_pipelines_.size()>=128)geometry_pipelines_.clear();geometry_pipelines_[key]=p;
     }
@@ -285,7 +288,9 @@ std::shared_ptr<const MetalGeometryMesh> MetalGl::graphics_geometry_mesh(const G
     if(geometry_meshes_.size()>=256)geometry_meshes_.clear();
     auto& entry=geometry_meshes_[key];
     if(!mesh_supported_)return nullptr;
+    MetalStallScope mesh_timing("geometry_mesh_build",gs->serial,2);
     try{@autoreleasepool{
+        MetalStallScope source_timing("geometry_mesh_source",gs->serial,2);
         const unsigned width=gs->geometry_output==1?1:gs->geometry_output==3?2:3,limit_vertices=gs->geometry_max;
         if(width==1 || limit_vertices<width || limit_vertices>255)return nullptr;
         const unsigned primitives=limit_vertices-width+1;
@@ -406,8 +411,11 @@ std::shared_ptr<const MetalGeometryMesh> MetalGl::graphics_geometry_mesh(const G
         if(split)code<<"x64Mesh.set_primitive(x64Slot,X64MeshPrimitive{});";
         code<<"}}\n";
         const auto program=code.str();
+        source_timing.finish();
         NSError* error=nil;auto options=[MTLCompileOptions new];options.fastMathEnabled=NO;
-        auto library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:program.c_str()] options:options error:&error];
+        id<MTLLibrary> library=nil;
+        {MetalStallScope timing("geometry_mesh_library",gs->serial,2);
+        library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:program.c_str()] options:options error:&error];}
         if(!library)throw std::invalid_argument("幾何 mesh 編譯失敗："+std::string(error.localizedDescription.UTF8String)+"\n"+program);
         auto result=std::make_shared<MetalGeometryMesh>();
         result->object=[library newFunctionWithName:@"x64GeometryObject"];result->mesh=[library newFunctionWithName:@"x64GeometryMesh"];

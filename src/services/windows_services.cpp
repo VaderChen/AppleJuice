@@ -56,7 +56,8 @@
 #include <unordered_map>
 
 #include <shared_mutex>
-namespace x64arm::detail {ParallelMappingLock& parallel_mapping_mutex() noexcept;}
+namespace x64arm::detail {void peek_idle_invalidate() noexcept;}
+namespace x64arm::detail {ParallelMappingLock& parallel_mapping_mutex() noexcept;void stream_timing_dump(std::FILE*) noexcept;}
 namespace x64arm {
 WindowsServices::WindowsServices() {
     startup_profile::Scope phase("services","construct_body",true);
@@ -109,7 +110,14 @@ void WindowsServices::dump_service_counts() {
     {const auto& s=detail::ParallelMappingLock::stats();
         std::fprintf(out,"[service_counts] mapping_lock writer_locks=%llu writer_hold_ns=%llu writer_drain_ns=%llu reader_waits=%llu reader_wait_ns=%llu reader_yields=%llu\n",
             static_cast<unsigned long long>(s.writer_locks.load()),static_cast<unsigned long long>(s.writer_hold_ns.load()),static_cast<unsigned long long>(s.writer_drain_ns.load()),
-            static_cast<unsigned long long>(s.reader_waits.load()),static_cast<unsigned long long>(s.reader_wait_ns.load()),static_cast<unsigned long long>(s.reader_yields.load()));}
+            static_cast<unsigned long long>(s.reader_waits.load()),static_cast<unsigned long long>(s.reader_wait_ns.load()),static_cast<unsigned long long>(s.reader_yields.load()));
+        for(const auto& site:detail::ParallelMappingLock::sites())if(const auto* address=site.address.load())
+            std::fprintf(out,"[service_counts] mapping_lock_site address=%p locks=%llu drain_ns=%llu hold_ns=%llu\n",address,
+                static_cast<unsigned long long>(site.locks.load()),static_cast<unsigned long long>(site.drain_ns.load()),static_cast<unsigned long long>(site.hold_ns.load()));
+        for(const auto& site:detail::ParallelMappingLock::reader_sites())if(const auto* address=site.address.load())
+            std::fprintf(out,"[service_counts] mapping_reader_site address=%p waits=%llu wait_ns=%llu\n",address,
+                static_cast<unsigned long long>(site.locks.load()),static_cast<unsigned long long>(site.hold_ns.load()));}
+    detail::stream_timing_dump(out);
     std::fprintf(out,"[service_counts] resolve_waits calls=%llu skipped=%llu changed=%llu\n",static_cast<unsigned long long>(resolve_wait_stats_.calls),
         static_cast<unsigned long long>(resolve_wait_stats_.skipped),static_cast<unsigned long long>(resolve_wait_stats_.changed));
     if(out!=stderr){std::fclose(out);std::rename(path.c_str(),path.substr(0,path.size()-4).c_str());}
@@ -1968,6 +1976,7 @@ bool plain_local_service(const WindowsServiceDescriptor& descriptor) noexcept {
 }
 }
 bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory& memory) {
+    detail::peek_idle_invalidate(); // 協調者本地服務可能送出訊息或改 GUI 狀態
     // 協調服務代表客體已恢復（全停之後的命令串流暫停可以解除）；串流失敗時走全停，由完整服務邊界重新拋出。
     if(d3d11_stream_){d3d11_stream_resume();if(d3d11_stream_failed())return false;}
     static const bool debug_park=std::getenv("X64ARM_DEBUG_PARK")!=nullptr; // 暫時診斷：偵測執行目前執行緒的過期副本
@@ -1983,10 +1992,22 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
                 static_cast<unsigned long long>(threads_.current));
     }
     static const bool trace=std::getenv("X64ARM_TRACE_COORDINATED")!=nullptr;
+    static const std::uint64_t stall_threshold=[] {const auto* value=std::getenv("X64ARM_TRACE_COORDINATED_STALLS");
+        return value?static_cast<std::uint64_t>(std::strtoull(value,nullptr,10))*1000000U:UINT64_C(0);}();
     struct Trace {
         const WindowsServices& self;const GuestState& state;std::uint64_t rip;
-        ~Trace(){if(trace)coordinated_trace().record(self,rip,state.rip.value!=rip);}
-    } trace_scope{*this,state,state.rip.value};
+        std::uint64_t thread;
+        std::chrono::steady_clock::time_point start;
+        ~Trace(){
+            if(stall_threshold){const auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+                if(elapsed>=0 && static_cast<std::uint64_t>(elapsed)>=stall_threshold){const auto symbol=self.name(GuestAddress{rip});
+                    std::fprintf(stderr,"slow_service pid=%llu thread=%llu rip=0x%llx duration_us=%lld end_unix_us=%llu name=coordinated:%.*s\n",
+                        static_cast<unsigned long long>(self.process_id()),static_cast<unsigned long long>(thread),static_cast<unsigned long long>(rip),
+                        static_cast<long long>(elapsed/1000),static_cast<unsigned long long>(startup_profile::unix_us()),static_cast<int>(symbol.size()),symbol.data());}}
+            if(trace)coordinated_trace().record(self,rip,state.rip.value!=rip);
+        }
+    } trace_scope{*this,state,state.rip.value,stall_threshold?resident_context_key(state):0,
+        stall_threshold?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}};
     if(trace && state.rip==callback_return_){
         const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
         if(thread!=threads_.items.end()){
@@ -2136,7 +2157,7 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         // 鎖順序與 worker 服務相同：映射 → D3D11。反過來會與持映射共用鎖、等待 D3D11 鎖的 worker 互鎖
         // （DQ3 強制平行讀檔時整個程序停住）。COW 等映射變動期間不得有 worker 服務查表（見 parallel_mapping_mutex）。
         const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
-        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+        std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         // 協調者本地完成非持久 Map／Unmap、延遲內容 Map 與寫入持久映射資源的複製（配置／釋放 heap），不必全停。
         // 2026-10-24 DQ3 開啟時的 UE4 崩潰與 worker 純量／REP 路徑未持映射鎖同類（2026-10-31 修正）；修正後 DQ3 與雙人成行
         // 交錯量測皆無崩潰，改為預設開啟。X64ARM_LOCAL_GRAPHICS_MAP=0 關閉。
@@ -2179,7 +2200,7 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
             symbol.ends_with("PipelineState") || symbol.starts_with("PipelineLibrary.Load");
         const bool unlocked=d3d12_submitter_ && !table_change && symbol!="Device.CreateSampler" && symbol!="Device.CheckFeatureSupport" &&
             symbol!="Resource.WriteToSubresource" && symbol!="Resource.ReadFromSubresource"; // 子資源存取用到 Metal 後端，與重播串行。
-        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!unlocked)lock_graphics(graphics_lock);
+        std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!unlocked)lock_graphics(graphics_lock);
         struct Unlocked {bool previous;~Unlocked(){d3d12_unlocked_call()=previous;}} unlocked_scope{std::exchange(d3d12_unlocked_call(),unlocked)};
         const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
         if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
@@ -2208,7 +2229,7 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
     static const bool local_d3d9=[] {const auto* value=std::getenv("X64ARM_LOCAL_D3D9");return !value || std::string_view(value)!="0";}();
     if(local_d3d9 && (!x86_ || x86_graphics_parallel_enabled()) && descriptor.family=="internal-d3d9"){
         const std::unique_lock mapping_guard(detail::parallel_mapping_mutex());
-        std::unique_lock<std::recursive_mutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
+        std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);lock_graphics(graphics_lock);
         if(!d3d9_local_eligible(state,memory,descriptor))return false;
         const auto key=resident_context_key(state);const auto thread=threads_.items.find(key);
         const auto teb=x86_?state.fs_base:state.gs_base;
@@ -2504,6 +2525,7 @@ bool WindowsServices::defer_registry_io_call(GuestState& state,GuestMemory& memo
     transfer();return true;
 }
 std::optional<std::uint32_t> WindowsServices::invoke(GuestState& state, GuestMemory& memory) {
+    detail::peek_idle_invalidate(); // 完整服務路徑可能送出訊息或改 GUI 狀態
     return invoke_boundary(state,memory);
 }
 std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,GuestMemory& memory,

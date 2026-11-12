@@ -2,6 +2,7 @@
 #include <iosfwd>
 #include "x64arm/host_services.hpp"
 #include <atomic>
+#include <pthread.h>
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -119,6 +120,49 @@ struct PeProgram;
 struct UrlCacheState;
 struct DebugMemoryState;
 namespace debugger {struct TransportEvent;struct Frame;}
+// 所有 D3D11／DXGI 服務共用的可重入鎖。持有時間多半不到 1 µs、每秒數十萬次取放（Fire Strike 4 vCPU 時四條錄製執行緒互搶）：
+// pthread 可重入鎖每次取放都走慢路徑，競爭時 vCPU 執行緒有 12～20% 時間耗在 _pthread_mutex_firstfit_lock_slow。
+// 這裡以擁有者欄位一次 CAS 取鎖、同執行緒只加深度；取不到時由 lock_graphics 先自旋，再以 atomic wait 進核心等待。
+class GraphicsMutex {
+public:
+    GraphicsMutex()=default;GraphicsMutex(const GraphicsMutex&)=delete;GraphicsMutex& operator=(const GraphicsMutex&)=delete;
+    bool try_lock() noexcept {
+        const auto self=self_id();
+        if(owner_.load(std::memory_order_relaxed)==self){++depth_;return true;}
+        std::uintptr_t expected=0;
+        if(owner_.load(std::memory_order_relaxed) || !owner_.compare_exchange_strong(expected,self,std::memory_order_acquire,std::memory_order_relaxed))return false;
+        depth_=1;return true;
+    }
+    void lock() noexcept {
+        if(try_lock())return;
+        const auto self=self_id();
+        waiters_.fetch_add(1,std::memory_order_seq_cst);
+        for(;;){
+            auto current=owner_.load(std::memory_order_seq_cst);
+            if(!current){if(owner_.compare_exchange_strong(current,self,std::memory_order_acquire,std::memory_order_relaxed))break;continue;}
+            owner_.wait(current,std::memory_order_seq_cst);
+        }
+        waiters_.fetch_sub(1,std::memory_order_seq_cst);
+        depth_=1;
+    }
+    void unlock() noexcept {
+        if(--depth_)return;
+        owner_.store(0,std::memory_order_seq_cst);
+        if(waiters_.load(std::memory_order_seq_cst))owner_.notify_one();
+    }
+private:
+    // 執行緒識別：arm64 macOS 的 TPIDRRO_EL0 是執行緒 TSD 基底（低 3 位元是 CPU 編號），不必經 dyld stub 呼叫 pthread_self。
+    static std::uintptr_t self_id() noexcept {
+#if defined(__aarch64__) && defined(__APPLE__)
+        std::uintptr_t value;asm volatile("mrs %0, tpidrro_el0":"=r"(value));return value&~std::uintptr_t{7};
+#else
+        return reinterpret_cast<std::uintptr_t>(pthread_self());
+#endif
+    }
+    alignas(64) std::atomic<std::uintptr_t> owner_{0};
+    std::atomic<unsigned> waiters_{0};
+    unsigned depth_{0}; // 只由擁有者讀寫。
+};
 class WindowsServices final : public HostServices {
     friend struct WindowsNetworkTestAccess;
     friend struct WindowsHeapTestAccess;
@@ -1165,6 +1209,15 @@ private:
     std::map<std::uint64_t,std::shared_ptr<NativeGraphics>> present_waits_;
     // 等背景著色器編譯的建立重試（ThreadWaitKind::ShaderRetry）：執行緒 → 圖形後端與票號；只在協調者讀寫。
     std::map<std::uint64_t,std::pair<std::shared_ptr<NativeGraphics>,std::uint64_t>> shader_waits_;
+    // 只有 X64ARM_TRACE_CRITICAL_STALLS 開啟時記錄；等待結束才輸出，不在正常路徑收集事件。
+    struct CriticalWaitDiagnostic {
+        std::uint64_t started_us{},address{},caller{},initial_owner{},dependency_us{},dependency_owner{},dependency_ticket{};
+        int initial_owner_wait{-1};
+    };
+    std::map<std::uint64_t,CriticalWaitDiagnostic> critical_wait_diagnostics_;
+    void trace_critical_wait_begin(std::uint64_t,const GuestState&,GuestMemory&,std::uint64_t);
+    void trace_critical_wait_sample(std::uint64_t,GuestMemory&);
+    void trace_critical_wait_end(std::uint64_t);
     // 最近一次呼叫 D3D11／DXGI Present 的執行緒（渲染執行緒）：它要的著色器照舊同步轉譯，不讓它讓出 vCPU 等背景編譯
     //（DQ3 2 vCPU 時渲染執行緒自己建立 739 個、每次等待中位 6 ms，長幀 >100 ms 從約 28 變 76～116）。
     std::uint64_t present_thread_{};
@@ -1257,12 +1310,12 @@ private:
     // worker 上不取圖形鎖執行的 D3D12 方法（錄製、描述元、取值、提交排入）：invoke_d3d12 入口據此不取圖形鎖。
     static bool& d3d12_unlocked_call() noexcept {static thread_local bool value=false;return value;}
     // 所有 D3D11／DXGI 服務共用的鎖（可重入）：worker 上直接執行裝置內容方法時與協調者串行化。
-    static std::recursive_mutex& graphics_mutex() noexcept;
+    static GraphicsMutex& graphics_mutex() noexcept;
     // 等待圖形鎖的執行緒數：D3D12 提交執行緒在命令清單之間看到有人等待就暫時讓出（見 D3D12Submitter）。
     static std::atomic<unsigned>& graphics_waiters() noexcept {static std::atomic<unsigned> value{};return value;}
     // 目前執行緒累計等圖形鎖的時間（奈秒，只在競爭時計時）：X64ARM_TRACE_D3D12_SUBMIT 統計提交執行緒用。
     static std::uint64_t& graphics_wait_ns() noexcept {static thread_local std::uint64_t value=0;return value;}
-    static void lock_graphics(std::unique_lock<std::recursive_mutex>& lock){
+    static void lock_graphics(std::unique_lock<GraphicsMutex>& lock){
         if(lock.try_lock())return;
         const auto start=std::chrono::steady_clock::now();
         graphics_waiters().fetch_add(1,std::memory_order_relaxed);
