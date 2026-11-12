@@ -108,15 +108,15 @@ async function perform(fn) {
   try { await fn(); } catch (error) { toast(errorText(error), true); }
   finally { ++mutationVersion; busy = false; render(); }
 }
-function settingsFrom(p) { return { arguments: p.arguments, workDir: p.workDir, cDrive: p.cDrive, installRoot: p.installRoot || '', writable: p.writable, maxInstructions: p.maxInstructions, gpuMemoryMiB: p.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, cpuCores: p.cpuCores || 0 }; }
+function settingsFrom(p) { return { arguments: p.arguments, workDir: p.workDir, cDrive: p.cDrive, installRoot: p.installRoot || '', writable: p.writable, maxInstructions: p.maxInstructions, gpuMemoryMiB: p.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, cpuCores: p.cpuCores || 0, presentUpscale: p.presentUpscale === true, presentInterpolation: p.presentInterpolation === true }; }
 function readSettings() {
   const p = selected();
-  return { arguments: $('arguments').value, workDir: $('work-dir').value, cDrive: $('c-drive').value, installRoot: $('install-root').value, writable: $('writable').checked, maxInstructions: p?.maxInstructions ?? 0, gpuMemoryMiB: p?.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, cpuCores: programCPUSelection };
+  return { arguments: $('arguments').value, workDir: $('work-dir').value, cDrive: $('c-drive').value, installRoot: $('install-root').value, writable: $('writable').checked, maxInstructions: p?.maxInstructions ?? 0, gpuMemoryMiB: p?.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, cpuCores: programCPUSelection, presentUpscale: $('present-upscale').checked, presentInterpolation: $('present-interpolation').checked };
 }
 function rememberDraft() { if (currentID) drafts.set(currentID, readSettings()); }
 function loadSettings(p) {
   const s = drafts.get(p.id) || settingsFrom(p);
-  $('arguments').value = s.arguments; $('work-dir').value = s.workDir; $('c-drive').value = s.cDrive; $('install-root').value = s.installRoot || ''; $('writable').checked = s.writable;
+  $('arguments').value = s.arguments; $('work-dir').value = s.workDir; $('c-drive').value = s.cDrive; $('install-root').value = s.installRoot || ''; $('writable').checked = s.writable; $('present-upscale').checked = s.presentUpscale === true; $('present-interpolation').checked = s.presentInterpolation === true;
   loadProgramCPUChoices(s.cpuCores || 0, p.architecture);
 
 }

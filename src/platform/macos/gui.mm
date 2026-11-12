@@ -136,7 +136,16 @@ unsigned short automation_keycode(NSString* name,unichar character){
 // 只改變公開給客體的桌面、工作區與顯示模式；宿主視窗依客體座標放置，不切換實體顯示器模式。
 std::optional<std::pair<std::uint32_t,std::uint32_t>> virtual_display_size(){
     static const auto value=[]()->std::optional<std::pair<std::uint32_t,std::uint32_t>>{
-        const auto* text=std::getenv("X64ARM_DISPLAY_SIZE");if(!text || !*text)return {};
+        const auto* text=std::getenv("X64ARM_DISPLAY_SIZE");
+        if(!text || !*text){
+            // 2 倍放大：未另外指定時，客體看到實體螢幕一半大小的虛擬顯示器。
+            if(const auto scale=x64arm::native_present_upscale();scale>1){
+                const auto frame=(x64arm::native_background_display()?:NSScreen.screens.firstObject?:NSScreen.mainScreen).frame;
+                const auto width=static_cast<unsigned>(frame.size.width)/scale,height=static_cast<unsigned>(frame.size.height)/scale;
+                if(width>=320 && height>=200)return std::pair{width,height};
+            }
+            return {};
+        }
         unsigned width=0,height=0;char separator=0;
         if(std::sscanf(text,"%u%c%u",&width,&separator,&height)!=3 || (separator!='x' && separator!='X') || width<320 || height<200 || width>16384 || height>16384)return {};
         return std::pair{width,height};
@@ -766,7 +775,9 @@ static bool native_glass_window(NSWindow*);
     // y 以基準螢幕換算，不用視窗目前所在螢幕；否則副螢幕上的視窗會得到該螢幕的相對座標。
     const auto screen=coordinate_screen();
     x64arm::GuiMessage event{self.guestHandle,state,(static_cast<std::uint64_t>(coordinate_word(size.height))<<16)|coordinate_word(size.width),0x1000c};
-    event.has_point=true;event.point={static_cast<std::int32_t>(window.frame.origin.x-(background_display()?screen.frame.origin.x:0)),static_cast<std::int32_t>(NSMaxY(screen.frame)-NSMaxY(window.frame))};
+    // 2 倍放大時原生位置是客體座標的倍數（大小取自內容視圖的座標系，已是客體單位）。
+    const auto upscale=static_cast<std::int32_t>(x64arm::native_present_upscale());
+    event.has_point=true;event.point={static_cast<std::int32_t>(window.frame.origin.x-(background_display()?screen.frame.origin.x:0))/upscale,static_cast<std::int32_t>(NSMaxY(screen.frame)-NSMaxY(window.frame))/upscale};
     if(x64arm::gui_geometry_trace_enabled())std::fprintf(stderr,"[gui-geometry] pid=%d hwnd=%llx op=publish state=%u size=%.0fx%.0f point=%d,%d frame=%.0fx%.0f event=%ld\n",::getpid(),
         static_cast<unsigned long long>(self.guestHandle),state,size.width,size.height,event.point[0],event.point[1],window.frame.size.width,window.frame.size.height,static_cast<long>(NSApp.currentEvent.type));
     self.model->show_command=state==1?2:state==2?3:1;
@@ -783,8 +794,9 @@ static bool native_glass_window(NSWindow*);
     if(!interactive){
         if(self.updating)return;
         const auto screen=coordinate_screen();
-        const auto x=static_cast<std::int32_t>(window.frame.origin.x-(background_display()?screen.frame.origin.x:0));
-        const auto y=static_cast<std::int32_t>(NSMaxY(screen.frame)-NSMaxY(window.frame));
+        const auto upscale=static_cast<std::int32_t>(x64arm::native_present_upscale());
+        const auto x=static_cast<std::int32_t>(window.frame.origin.x-(background_display()?screen.frame.origin.x:0))/upscale;
+        const auto y=static_cast<std::int32_t>(NSMaxY(screen.frame)-NSMaxY(window.frame))/upscale;
         if(x==self.model->x && y==self.model->y)return;
     }
     [self publishGeometry:window state:[window isMiniaturized]?1:self.model->show_command==3?2:0];self.moving=NO;
@@ -1426,13 +1438,22 @@ void sync_native_frame(Window& w){
     }else if(!menu_height && w.menu_container){[w.view removeFromSuperview];w.native.contentView=w.view;w.menu_container=nil;w.menu_bar=nil;}
     w.view.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
     const auto size=NSMakeSize(w.model.width,w.model.height+menu_height);
-    if(!NSEqualSizes(w.native.contentView.bounds.size,size))[w.native setContentSize:size];
-    w.view.frame=NSMakeRect(0,menu_height,w.model.width,w.model.height);
+    if(const CGFloat upscale=x64arm::native_present_upscale();upscale>1){
+        // 原生內容區是客體大小的倍數，內容視圖的座標系（bounds）維持客體單位：子視圖、滑鼠與重繪座標都不變。
+        const auto native_size=NSMakeSize(size.width*upscale,size.height*upscale);
+        if(!NSEqualSizes(w.native.contentView.frame.size,native_size))[w.native setContentSize:native_size];
+        if(!NSEqualSizes(w.native.contentView.bounds.size,size))[w.native.contentView setBoundsSize:size];
+        if(w.view!=w.native.contentView)w.view.frame=NSMakeRect(0,menu_height,w.model.width,w.model.height);
+    }else{
+        if(!NSEqualSizes(w.native.contentView.bounds.size,size))[w.native setContentSize:size];
+        w.view.frame=NSMakeRect(0,menu_height,w.model.width,w.model.height);
+    }
     if(w.menu_bar)w.menu_bar.frame=NSMakeRect(0,0,w.model.width,20);
     w.delegate.clientView=w.view;
     const auto screen=coordinate_screen();
     // AppKit 的 frame 必須位於有號 32 位元矩形內；保留客體座標，只限制原生投影的原點。
-    const auto origin=NSMakePoint(std::clamp<CGFloat>(w.model.x+(background_display()?screen.frame.origin.x:0),INT32_MIN,static_cast<CGFloat>(INT32_MAX)-w.native.frame.size.width),std::clamp<CGFloat>(NSMaxY(screen.frame)-w.model.y-w.native.frame.size.height,INT32_MIN,static_cast<CGFloat>(INT32_MAX)-w.native.frame.size.height));
+    const CGFloat origin_scale=x64arm::native_present_upscale();
+    const auto origin=NSMakePoint(std::clamp<CGFloat>(w.model.x*origin_scale+(background_display()?screen.frame.origin.x:0),INT32_MIN,static_cast<CGFloat>(INT32_MAX)-w.native.frame.size.width),std::clamp<CGFloat>(NSMaxY(screen.frame)-w.model.y*origin_scale-w.native.frame.size.height,INT32_MIN,static_cast<CGFloat>(INT32_MAX)-w.native.frame.size.height));
     if(!NSEqualPoints(w.native.frame.origin,origin)){
         [w.native setFrameOrigin:origin];
         trace_native_pointer("frame",w,NSZeroPoint,NSMakePoint(w.model.x,w.model.y));

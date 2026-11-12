@@ -2,7 +2,8 @@
 // command buffer 保留已編碼的 Metal 物件；快取輪替不縮短在途命令的生命週期。
 BoundedCache<id<MTLDepthStencilState>> depth_states_{256U<<10,metal_cache_entries("X64ARM_METAL_STATE_CACHE_ENTRIES",512)};
 BoundedCache<std::shared_ptr<MetalSampler>> sampler_states_{256U<<10,metal_cache_entries("X64ARM_METAL_STATE_CACHE_ENTRIES",512)};
-std::uint64_t depth_state_hits_{},depth_state_builds_{},sampler_state_hits_{},sampler_state_builds_{};
+// 取樣器可在命令執行緒以外建立（見 metal_command_thread.inc 的 graphics_sampler），計數以原子操作累加。
+std::atomic<std::uint64_t> depth_state_hits_{},depth_state_builds_{},sampler_state_hits_{},sampler_state_builds_{};
 static std::string state_cache_key(const std::array<std::uint64_t,16>& key){return {reinterpret_cast<const char*>(key.data()),sizeof(key)};}
 std::string cache_statistics()const{
     std::string text;

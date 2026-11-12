@@ -11,6 +11,13 @@
 #include <cstring>
 
 namespace x64arm {
+// X64ARM_PRESENT_UPSCALE=2：整個客體畫面以 2 倍顯示。客體看到的是實體螢幕一半大小的虛擬顯示器（除非另以
+// X64ARM_DISPLAY_SIZE 指定），頂層視窗的原生大小與位置是客體座標的 2 倍，內容視圖的座標系維持客體單位，
+// 所以滑鼠與子視窗座標不必另外換算；3D 畫面由 MetalFX 空間放大輸出到 2 倍的顯示表面，其餘內容由系統放大。
+inline unsigned native_present_upscale(){
+    static const unsigned value=[]{const char* text=std::getenv("X64ARM_PRESENT_UPSCALE");return text && std::string_view(text)=="2"?2U:1U;}();
+    return value;
+}
 // 所有 AppKit presenter 共用同一背景螢幕，子程序仍沿用 Launcher 的固定 ID。
 inline bool native_background_display_enabled(){
     if(const char* value=std::getenv("X64ARM_GUI_BACKGROUND_DISPLAY"))return std::string_view(value)=="1";

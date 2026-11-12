@@ -413,7 +413,7 @@ std::shared_ptr<GraphicsSampler> MetalGl::graphics_sampler(std::span<const std::
     d.sAddressMode=metal_address(metal_word(bytes,4));d.tAddressMode=metal_address(metal_word(bytes,8));d.rAddressMode=metal_address(metal_word(bytes,12));d.maxAnisotropy=(filter&0x40)?std::clamp(metal_word(bytes,20),1U,16U):1;
     if(filter&0x80)d.compareFunction=static_cast<MTLCompareFunction>(metal_word(bytes,24)-1);d.lodMinClamp=metal_float(bytes,44);d.lodMaxClamp=metal_float(bytes,48);
     if(@available(macOS 26.0,*))d.lodBias=metal_float(bytes,16);
-    else if(metal_float(bytes,16)!=0)throw std::invalid_argument("此 macOS 版本不支援取樣器 LOD bias");
+    // macOS 26 以前沒有取樣器 LOD bias：忽略偏移照常建立（只影響選用的 mip 層級），不讓建立失敗。
     if(metal_float(bytes,28)==1 && metal_float(bytes,32)==1 && metal_float(bytes,36)==1 && metal_float(bytes,40)==1)d.borderColor=MTLSamplerBorderColorOpaqueWhite;else d.borderColor=metal_float(bytes,40)==0?MTLSamplerBorderColorTransparentBlack:MTLSamplerBorderColorOpaqueBlack;
     return cached_sampler(d);
 }}
@@ -1779,6 +1779,16 @@ void MetalGl::graphics_present(const GraphicsView& v){@autoreleasepool{
     if(texture.pixelFormat==MTLPixelFormatRGBA8Unorm_sRGB)texture=[texture newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
     else if(texture.pixelFormat==MTLPixelFormatBGRA8Unorm_sRGB)texture=[texture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
     if(!texture)throw std::invalid_argument("無法建立交換鏈呈現 view");
+    // 畫面內插：把這張畫面交給內插器，取得「上一張與這一張中間」的生成畫面，由 swap 先行呈現。
+    interpolated_=nil;
+    if(metal_frame_interpolation_wanted() && layer_){
+        if(!interpolation_tried_){
+            interpolation_tried_=true;interpolation_=metal_frame_interpolation_create(device_,width_,height_,color_.pixelFormat);
+            // 只有內插器建立成功的表面才強制垂直同步並停用立即呈現；不支援時維持程式原本的呈現間隔。
+            if(interpolation_){finish_immediate_present();interpolation_active_.store(true,std::memory_order_release);layer_.displaySyncEnabled=YES;}
+        }
+        if(interpolation_)interpolated_=interpolation_->encode(commands_,texture);
+    }
     if(texture.pixelFormat==color_.pixelFormat){auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};if(metal_labels()){e.label=@"blit";hang_note("blit");}[e copyFromTexture:texture sourceSlice:v.slice sourceLevel:v.level sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:color_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];e_scope.end();}
     else {
         // 以 D3D9／OpenGL 既有的紋理管線做格式轉換，避免另建呈現 renderer。

@@ -18,10 +18,14 @@
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
+#import <VideoToolbox/VideoToolbox.h>
+#import <CoreVideo/CoreVideo.h>
+#import <CoreMedia/CoreMedia.h>
 #include "../../services/graphics_view_flags.hpp"
 #include "../../services/shader_memory_cache.hpp"
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CATransaction.h>
+#include "application.hpp"
 #include <algorithm>
 #include <bit>
 #include <charconv>
@@ -132,6 +136,7 @@ id<MTLTexture> metal_shader_texture(const GraphicsView&);
 
 #include "metal_gl_program_types.inc"
 #include "metal_immediate_present.inc"
+#include "metal_frame_interpolation.inc"
 // 長幀診斷：X64ARM_TRACE_STALLS=<毫秒門檻>（未設定時關閉）時，編碼端單一工作與單一命令緩衝的 GPU 時間超過門檻就輸出一行，
 // 格式與 slow_service 相同（end_unix_us 為輸出時刻），可和 Present 時間對照。
 std::uint64_t metal_stall_threshold_us(){static const std::uint64_t value=[]()->std::uint64_t{const auto* text=std::getenv("X64ARM_TRACE_STALLS");
@@ -147,6 +152,29 @@ class MetalGl final:public NativeOpenGlContext {
     MetalSharedFrame exported_frame_;
     id<MTLDevice> device_;id<MTLCommandQueue> queue_;id<MTLLibrary> library_;
     id<MTLTexture> color_,front_,depth_;id<MTLCommandBuffer> commands_;
+    // 2 倍放大（X64ARM_PRESENT_UPSCALE=2）：呈現時以 MetalFX 空間放大把 color_ 放大到顯示表面的大小。
+    // 放大器不可用（macOS 13 以前或裝置不支援）時 present_scale_ 維持 1，由系統依視圖大小縮放。
+    id present_scaler_=nil;id<MTLTexture> present_upscaled_=nil,present_upscaled_generated_=nil;unsigned present_scale_=1;
+    // 畫面內插（見 metal_frame_interpolation.inc）：graphics_present 取得生成畫面後交給 swap 先行呈現。尺寸改變時重建。
+    std::unique_ptr<MetalFrameInterpolation> interpolation_;std::atomic<bool> interpolation_active_{false};bool interpolation_tried_=false; // interpolation_active_：這個表面已建立內插器（才強制垂直同步、每幀取兩個 drawable）。
+    id<MTLTexture> interpolated_=nil;static inline std::atomic<std::uint64_t> interpolated_frames_{0},interpolation_missed_{0};
+    CFTimeInterval present_last_=0,present_interval_=0;
+    void present_scaler_reset(unsigned w,unsigned h){
+        present_scaler_=nil;present_upscaled_=nil;present_upscaled_generated_=nil;present_scale_=1;
+        interpolation_.reset();interpolation_active_.store(false,std::memory_order_release);interpolation_tried_=false;interpolated_=nil;present_last_=0;present_interval_=0;
+        const auto scale=native_present_upscale();if(scale<2)return;
+        if(@available(macOS 13.0,*)){
+            if(![MTLFXSpatialScalerDescriptor supportsDevice:device_])return;
+            auto descriptor=[MTLFXSpatialScalerDescriptor new];descriptor.inputWidth=w;descriptor.inputHeight=h;descriptor.outputWidth=w*scale;descriptor.outputHeight=h*scale;
+            descriptor.colorTextureFormat=MTLPixelFormatBGRA8Unorm;descriptor.outputTextureFormat=MTLPixelFormatBGRA8Unorm;
+            descriptor.colorProcessingMode=MTLFXSpatialScalerColorProcessingModePerceptual;
+            id<MTLFXSpatialScaler> scaler=[descriptor newSpatialScalerWithDevice:device_];if(!scaler)return;
+            auto target=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w*scale height:h*scale mipmapped:NO];
+            target.storageMode=MTLStorageModePrivate;target.usage=scaler.outputTextureUsage|MTLTextureUsageShaderRead;
+            auto output=[device_ newTextureWithDescriptor:target],generated=[device_ newTextureWithDescriptor:target];if(!output || !generated)return;
+            present_scaler_=scaler;present_upscaled_=output;present_upscaled_generated_=generated;present_scale_=scale;
+        }
+    }
     bool commands_gpu_work_{};
     id<MTLEvent> handoff_event_;std::uint64_t handoff_value_{};
     NSView* view_{};CAMetalLayer* layer_{};
@@ -761,17 +789,20 @@ public:
     void drawable(void* raw,unsigned w,unsigned h)override{@autoreleasepool{
         if(!w || !h || w>16384 || h>16384 || std::uint64_t{w}*h>64*1024*1024)throw std::bad_alloc{};
         if(w!=width_ || h!=height_){flush(true);finish_immediate_present();auto lease=reserve_gpu_memory(static_cast<std::size_t>(w)*h*16);auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];d.storageMode=MTLStorageModeShared;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;auto color=[device_ newTextureWithDescriptor:d];auto front=[device_ newTextureWithDescriptor:d];d.pixelFormat=MTLPixelFormatDepth32Float_Stencil8;d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget;auto depth=[device_ newTextureWithDescriptor:d];if(!color || !front || !depth)throw std::bad_alloc{};
-            if(!width_){state_.viewport={0,0,static_cast<int>(w),static_cast<int>(h)};state_.scissor=state_.viewport;}width_=w;height_=h;surface_=std::move(lease);color_=color;front_=front;depth_=depth;
+            if(!width_){state_.viewport={0,0,static_cast<int>(w),static_cast<int>(h)};state_.scissor=state_.viewport;}width_=w;height_=h;surface_=std::move(lease);color_=color;front_=front;depth_=depth;present_scaler_reset(w,h);
             begin_commands();auto pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=color_;pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;pass.depthAttachment.texture=depth_;pass.depthAttachment.loadAction=MTLLoadActionClear;pass.depthAttachment.clearDepth=1;pass.depthAttachment.storeAction=MTLStoreActionStore;pass.stencilAttachment.texture=depth_;pass.stencilAttachment.loadAction=MTLLoadActionClear;pass.stencilAttachment.clearStencil=0;pass.stencilAttachment.storeAction=MTLStoreActionStore;auto enc=[commands_ renderCommandEncoderWithDescriptor:pass];MetalEncoderScope enc_scope{enc};enc_scope.end();
         }
         auto view=(__bridge NSView*)raw;if(view!=view_){finish_immediate_present();immediate_unavailable_=false;detach();if(view){view_=view;auto& use=metal_view_users[raw];if(!use.count){use.original=view.layer;use.wanted=view.wantsLayer;}++use.count;view.wantsLayer=YES;layer_=[CAMetalLayer layer];layer_.device=device_;layer_.pixelFormat=MTLPixelFormatBGRA8Unorm;layer_.framebufferOnly=NO;drawable_limit_=layer_.maximumDrawableCount>1?layer_.maximumDrawableCount-1:1;view.layer=layer_;if([view respondsToSelector:NSSelectorFromString(@"setOpenGLManaged:")])[view setValue:@YES forKey:@"openGLManaged"];}}
-        if(layer_){layer_.drawableSize=CGSizeMake(w,h);layer_.displaySyncEnabled=interval_!=0;}bind();
+        if(layer_){layer_.drawableSize=CGSizeMake(w*present_scale_,h*present_scale_);layer_.displaySyncEnabled=interval_!=0 || interpolation_active_.load(std::memory_order_relaxed);}bind();
     }}
     bool graphics_present_ready()const noexcept override{
-        return !layer_ || !interval_ || drawables_acquired_.load(std::memory_order_relaxed)-drawables_presented_->load(std::memory_order_acquire)<drawable_limit_;
+        // 畫面內插生效時一律垂直同步，且每次呈現取兩個 drawable（生成＋真實）：要有兩個空位才算就緒。
+        const auto pending=drawables_acquired_.load(std::memory_order_relaxed)-drawables_presented_->load(std::memory_order_acquire);
+        if(layer_ && interpolation_active_.load(std::memory_order_acquire))return pending+2<=std::max<std::uint64_t>(drawable_limit_,2);
+        return !layer_ || !interval_ || pending<drawable_limit_;
     }
-    bool swap_interval(std::int32_t n)override{if(n<0 || n>1)return false;if(n)finish_immediate_present();interval_=n;if(layer_)layer_.displaySyncEnabled=n!=0;return true;}
-    bool swap()override{@autoreleasepool{const auto request=timing_ && layer_?CACurrentMediaTime():0;bind();if(layer_)raster_overlays(true);begin_commands();auto front_copy=[commands_ blitCommandEncoder];MetalEncoderScope front_copy_scope{front_copy};[front_copy copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:front_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];front_copy_scope.end();if(layer_ && !interval_ && immediate_present_enabled() && !immediate_unavailable_){
+    bool swap_interval(std::int32_t n)override{if(n<0 || n>1)return false;if(n)finish_immediate_present();interval_=n;if(layer_)layer_.displaySyncEnabled=n!=0 || interpolation_active_.load(std::memory_order_relaxed);return true;}
+    bool swap()override{@autoreleasepool{const auto request=timing_ && layer_?CACurrentMediaTime():0;bind();if(layer_)raster_overlays(true);begin_commands();auto front_copy=[commands_ blitCommandEncoder];MetalEncoderScope front_copy_scope{front_copy};[front_copy copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:front_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];front_copy_scope.end();if(layer_ && !interval_ && immediate_present_enabled() && !immediate_unavailable_ && present_scale_==1 && !interpolation_active_.load(std::memory_order_relaxed)){
             if(!immediate_presenter_)try{immediate_presenter_=std::make_unique<MetalImmediatePresenter>(device_,layer_,width_,height_);}catch(const std::bad_alloc&){immediate_unavailable_=true;}
             if(immediate_presenter_){
                 const auto index=immediate_presenter_->prepare();auto encoder=[commands_ blitCommandEncoder];MetalEncoderScope scope{encoder};
@@ -781,15 +812,45 @@ public:
                 scope.end();auto ready=commands_;const auto timing=trace_frame(ready,request);flush(false);immediate_presenter_->publish(index,ready,timing);return true;
             }
         }
-        if(layer_){auto drawable=[layer_ nextDrawable];if(!drawable)return false;
-            drawables_acquired_.fetch_add(1,std::memory_order_relaxed);
-            {auto presented=drawables_presented_;[drawable addPresentedHandler:^(id<MTLDrawable>){presented->fetch_add(1,std::memory_order_release);}];}
-            begin_commands();auto enc=[commands_ blitCommandEncoder];MetalEncoderScope enc_scope{enc};[enc copyFromTexture:color_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:drawable.texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];enc_scope.end();trace_frame(commands_,request).present(drawable);[commands_ presentDrawable:drawable];}flush(false);return true;}}
+        if(layer_){
+            // 幀間隔（平滑）：畫面內插時真實畫面延後半個間隔呈現，讓生成畫面先顯示。
+            const auto now=CACurrentMediaTime();
+            if(present_last_>0){const auto delta=now-present_last_;present_interval_=present_interval_>0?present_interval_*0.8+delta*0.2:delta;}
+            present_last_=now;
+            begin_commands();
+            const auto show=[&](id<MTLTexture> source,id<MTLTexture> scaled,bool real,CFTimeInterval delay)->bool{
+                auto drawable=[layer_ nextDrawable];if(!drawable)return false;
+                drawables_acquired_.fetch_add(1,std::memory_order_relaxed);
+                {auto presented=drawables_presented_;[drawable addPresentedHandler:^(id<MTLDrawable>){presented->fetch_add(1,std::memory_order_release);}];}
+                id<MTLTexture> shown=source;unsigned shown_width=width_,shown_height=height_;
+                if(present_scale_>1){
+                    if(@available(macOS 13.0,*)){
+                        id<MTLFXSpatialScaler> scaler=present_scaler_;scaler.colorTexture=source;scaler.outputTexture=scaled;
+                        scaler.inputContentWidth=width_;scaler.inputContentHeight=height_;[scaler encodeToCommandBuffer:commands_];
+                        shown=scaled;shown_width=width_*present_scale_;shown_height=height_*present_scale_;
+                    }
+                }
+                auto enc=[commands_ blitCommandEncoder];MetalEncoderScope enc_scope{enc};[enc copyFromTexture:shown sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(shown_width,shown_height,1) toTexture:drawable.texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];enc_scope.end();
+                if(real)trace_frame(commands_,request).present(drawable);
+                else if(timing_){
+                    // 生成畫面不屬於客體提交，另記「generated」事件（frame 為其後真實畫面的序號）；presentedTime 為 0 表示未上屏。
+                    auto recorder=timing_;const auto generated_surface=timing_surface_,generated_frame=timing_frame_+1;const auto generated_width=width_,generated_height=height_;
+                    [drawable addPresentedHandler:^(id<MTLDrawable> displayed){recorder->frame("generated",generated_surface,generated_frame,generated_width,generated_height,0,0,displayed.presentedTime);}];
+                }
+                if(delay>0)[commands_ presentDrawable:drawable afterMinimumDuration:delay];else [commands_ presentDrawable:drawable];
+                return true;
+            };
+            auto generated=interpolated_;interpolated_=nil;
+            const bool inserted=generated && show(generated,present_upscaled_generated_,false,0);if(inserted)++interpolated_frames_;else if(interpolation_active_.load(std::memory_order_relaxed))++interpolation_missed_;
+            // 垂直同步下同一命令緩衝的兩個 drawable 依序各占一個更新週期（先生成、後真實），不另加最短顯示時間：
+            // 以幀間隔推算的延後會被算回下一次的幀間隔，越拖越慢（主螢幕實測真實幀率掉到 15）。
+            if(!show(color_,present_upscaled_,true,0.0))return false;
+        }flush(false);return true;}}
     OpenGlRendererInfo info()const override{return {"MacWin",std::string(device_.name.UTF8String)+" (Metal)","1.1 MacWin Metal subset",true};}
     std::string string(unsigned name)override{const auto i=info();switch(name){case 0x1f00:return i.vendor;case 0x1f01:return i.renderer;case 0x1f02:return i.version;case 0x1f03:return {};case 0x8b8c:return "4.60 MacWin GLSL compiler";default:error(0x500);return {};}}
     std::string statistics()const override{std::string reasons;for(const auto& [name,count]:gpu_write_reasons_)reasons+=name+":"+std::to_string(count)+",";
         std::string uploads;for(const auto& [key,count]:upload_kinds_)uploads+="b"+std::to_string(key>>1)+((key&1)?"full:":"part:")+std::to_string(count)+",";
-        return "opengl_metal_upload_kinds="+uploads+" opengl_metal_gpu_write_reasons="+reasons+" opengl_metal_tess_side="+std::to_string(side_computes_)+" opengl_metal_tess_main="+std::to_string(tess_main_[0])+"/"+std::to_string(tess_main_[1])+"/"+std::to_string(tess_main_[2])+"/"+std::to_string(tess_main_[3])+"/"+std::to_string(tess_main_[4])+" opengl_backend=metal opengl_metal_draws="+std::to_string(draws_)+" opengl_metal_submissions="+std::to_string(submissions_)+" opengl_metal_inflight="+std::to_string(flights_.size())+" opengl_metal_inflight_limit="+std::to_string(flight_limit_)+" opengl_metal_inflight_peak="+std::to_string(flight_peak_)+" opengl_metal_render_encoders="+std::to_string(render_encoders_)+" opengl_metal_encoder_breaks="+[&]{std::string text;for(const auto& [why,count]:encoder_breaks_)text+=why+":"+std::to_string(count)+",";return text.empty()?std::string("none"):text;}()+" opengl_metal_coalesced_draws="+std::to_string(coalesced_draws_)+" metal_compute_encoders="+std::to_string(compute_encoders_)+" metal_coalesced_dispatches="+std::to_string(coalesced_dispatches_)+" metal_binds_skipped="+std::to_string(binds_skipped_)+" metal_binds_set="+std::to_string(binds_set_)+" metal_clears_folded="+std::to_string(clears_folded_)+" metal_clears_encoded="+std::to_string(clears_encoded_)+" metal_draw_timed="+std::to_string(draw_time_count_)+" metal_draw_ns="+[&]{std::string text;for(const auto value:draw_time_ns_)text+=std::to_string(value)+",";return text;}()+" opengl_metal_gpu_busy_ns="+std::to_string(gpu_busy_ns_->load(std::memory_order_relaxed))+" opengl_metal_waits="+std::to_string(wait_count_)+" opengl_metal_wait_ns="+std::to_string(wait_ns_)+" glsl_compiles="+std::to_string(gl_.compiles)+" glsl_links="+std::to_string(gl_.links)+" glsl_compile_ns="+std::to_string(gl_.compile_ns)+" glsl_link_ns="+std::to_string(gl_.link_ns)+" opengl_metal_resource_waits="+std::to_string(resource_wait_count_)+" gl_buffer_uploads="+std::to_string(gl_.buffer_uploads)+" gl_buffer_upload_bytes="+std::to_string(gl_.buffer_upload_bytes)+" gl_direct_vertex_bindings="+std::to_string(gl_.direct_vertex_bindings)+" gl_direct_index_draws="+std::to_string(gl_.direct_index_draws)+" gl_converted_vertices="+std::to_string(gl_.converted_vertices)+cache_statistics()+discard_pool_->statistics()+" metal_stream_output_gpu_draws="+std::to_string(stream_gpu_draws_)+" metal_stream_output_gpu_bytes="+std::to_string(stream_gpu_bytes_)+" metal_geometry_mesh_draws="+std::to_string(geometry_mesh_draws_)+"\n";}
+        return "opengl_metal_interpolated="+std::to_string(interpolated_frames_.load())+"/"+std::to_string(interpolation_missed_.load())+" opengl_metal_upload_kinds="+uploads+" opengl_metal_gpu_write_reasons="+reasons+" opengl_metal_tess_side="+std::to_string(side_computes_)+" opengl_metal_tess_main="+std::to_string(tess_main_[0])+"/"+std::to_string(tess_main_[1])+"/"+std::to_string(tess_main_[2])+"/"+std::to_string(tess_main_[3])+"/"+std::to_string(tess_main_[4])+" opengl_backend=metal opengl_metal_draws="+std::to_string(draws_)+" opengl_metal_submissions="+std::to_string(submissions_)+" opengl_metal_inflight="+std::to_string(flights_.size())+" opengl_metal_inflight_limit="+std::to_string(flight_limit_)+" opengl_metal_inflight_peak="+std::to_string(flight_peak_)+" opengl_metal_render_encoders="+std::to_string(render_encoders_)+" opengl_metal_encoder_breaks="+[&]{std::string text;for(const auto& [why,count]:encoder_breaks_)text+=why+":"+std::to_string(count)+",";return text.empty()?std::string("none"):text;}()+" opengl_metal_coalesced_draws="+std::to_string(coalesced_draws_)+" metal_compute_encoders="+std::to_string(compute_encoders_)+" metal_coalesced_dispatches="+std::to_string(coalesced_dispatches_)+" metal_binds_skipped="+std::to_string(binds_skipped_)+" metal_binds_set="+std::to_string(binds_set_)+" metal_clears_folded="+std::to_string(clears_folded_)+" metal_clears_encoded="+std::to_string(clears_encoded_)+" metal_draw_timed="+std::to_string(draw_time_count_)+" metal_draw_ns="+[&]{std::string text;for(const auto value:draw_time_ns_)text+=std::to_string(value)+",";return text;}()+" opengl_metal_gpu_busy_ns="+std::to_string(gpu_busy_ns_->load(std::memory_order_relaxed))+" opengl_metal_waits="+std::to_string(wait_count_)+" opengl_metal_wait_ns="+std::to_string(wait_ns_)+" glsl_compiles="+std::to_string(gl_.compiles)+" glsl_links="+std::to_string(gl_.links)+" glsl_compile_ns="+std::to_string(gl_.compile_ns)+" glsl_link_ns="+std::to_string(gl_.link_ns)+" opengl_metal_resource_waits="+std::to_string(resource_wait_count_)+" gl_buffer_uploads="+std::to_string(gl_.buffer_uploads)+" gl_buffer_upload_bytes="+std::to_string(gl_.buffer_upload_bytes)+" gl_direct_vertex_bindings="+std::to_string(gl_.direct_vertex_bindings)+" gl_direct_index_draws="+std::to_string(gl_.direct_index_draws)+" gl_converted_vertices="+std::to_string(gl_.converted_vertices)+cache_statistics()+discard_pool_->statistics()+" metal_stream_output_gpu_draws="+std::to_string(stream_gpu_draws_)+" metal_stream_output_gpu_bytes="+std::to_string(stream_gpu_bytes_)+" metal_geometry_mesh_draws="+std::to_string(geometry_mesh_draws_)+"\n";}
     void array(unsigned index,int size,unsigned type,std::span<const std::uint8_t> bytes,bool enabled)override{if(index>=4 || size<1 || size>4)throw std::invalid_argument("GL array");auto& a=arrays_[index];a.size=size;a.type=type;a.enabled=enabled;a.bytes.assign(bytes.begin(),bytes.end());}
     std::string capture(const std::filesystem::path& path)override{@autoreleasepool{flush(true);std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width_)*height_*4);[color_ getBytes:pixels.data() bytesPerRow:width_*4 fromRegion:MTLRegionMake2D(0,0,width_,height_) mipmapLevel:0];auto bitmap=[[NSBitmapImageRep alloc] initWithBitmapDataPlanes:nullptr pixelsWide:width_ pixelsHigh:height_ bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace bitmapFormat:NSBitmapFormatAlphaNonpremultiplied bytesPerRow:width_*4 bitsPerPixel:32];if(!bitmap)throw std::bad_alloc{};for(std::size_t i=0;i<pixels.size();i+=4){std::swap(pixels[i],pixels[i+2]);}std::memcpy(bitmap.bitmapData,pixels.data(),pixels.size());if(!path.parent_path().empty())std::filesystem::create_directories(path.parent_path());if(![[bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:[NSString stringWithUTF8String:path.c_str()] atomically:YES])throw std::runtime_error("Metal PNG capture failed");return "opengl_capture="+path.string()+" backend=metal\n";}}
     bool programmable()const noexcept override{return true;}

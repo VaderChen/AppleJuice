@@ -146,7 +146,13 @@ public:
     }
     bool graphics_shader_ticket_ready(std::uint64_t ticket) override {return inner_->graphics_shader_ticket_ready(ticket);}
     std::shared_ptr<GraphicsShader> graphics_compute_source(const GraphicsModernShader& shader) override {graphics_sync();return inner_->graphics_compute_source(shader);}
-    std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t> desc) override {graphics_sync();return inner_->graphics_sampler(desc);}
+    // 取樣器建立只讀描述、查自帶鎖的取樣器快取並呼叫執行緒安全的 newSamplerStateWithDescriptor，不碰編碼狀態，
+    // 不必等命令執行緒排空（UE 每幀建立數個取樣器，原本每次等佇列清空）。X64ARM_METAL_SAMPLER_SYNC=1 恢復同步。
+    std::shared_ptr<GraphicsSampler> graphics_sampler(std::span<const std::uint8_t> desc) override {
+        static const bool sync=[] {const auto* value=std::getenv("X64ARM_METAL_SAMPLER_SYNC");return value && std::string_view(value)=="1";}();
+        if(sync)graphics_sync();
+        return inner_->graphics_sampler(desc);
+    }
     bool graphics_timestamp_supported()const override {return inner_->graphics_timestamp_supported();}
     GraphicsTimestamp graphics_timestamp() override {graphics_sync();return inner_->graphics_timestamp();}
     // 時間戳查詢（電馭判客每幀數百次）：先回傳未完成的 future，取樣由命令執行緒依序編入，前端不等佇列清空。

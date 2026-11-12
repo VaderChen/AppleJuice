@@ -54,6 +54,10 @@ type Settings struct {
 	InstallRoot        string `json:"installRoot"`
 	Writable           bool   `json:"writable"`
 	MaxInstructions    uint64 `json:"maxInstructions"`
+	// 2 倍放大顯示：程式以一半大小的虛擬螢幕執行，畫面放大到原本的顯示大小（X64ARM_PRESENT_UPSCALE=2）。
+	PresentUpscale bool `json:"presentUpscale,omitempty"`
+	// 畫面內插：每兩張畫面之間由系統生成一張中間畫面（X64ARM_PRESENT_INTERPOLATION=1）。
+	PresentInterpolation bool `json:"presentInterpolation,omitempty"`
 }
 type GlobalSettings struct {
 	CertificateRootsFile bool              `json:"certificateRootsFile"`
@@ -976,6 +980,12 @@ func (a *App) Start(id string, settings Settings, cols, rows uint16) (Snapshot, 
 	environment, err := a.engineEnvironmentLocked()
 	if err != nil {
 		return Snapshot{}, err
+	}
+	if p.PresentUpscale {
+		environment = append(environment, "X64ARM_PRESENT_UPSCALE=2")
+	}
+	if p.PresentInterpolation {
+		environment = append(environment, "X64ARM_PRESENT_INTERPOLATION=1")
 	}
 	cmd.Env = environment
 	r := &execution{id: runID, status: "running", cmd: cmd, diagnostics: diagnostics, usagePath: usagePath, output: make(chan []byte, 64), input: make(chan string, 32), done: make(chan struct{}), cancel: make(chan struct{})}

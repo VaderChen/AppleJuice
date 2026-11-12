@@ -16,7 +16,7 @@
 namespace x64arm::macos_detail {
 // 可選的實際呈現量測；每個程序分檔，回呼只保留 recorder，不保留視窗或 surface。
 class GuiTiming final {
-    enum class Kind : std::uint8_t { Submitted,Completed,Presented,Input };
+    enum class Kind : std::uint8_t { Submitted,Completed,Presented,Generated,Input }; // Generated：畫面內插生成畫面的上屏時間。
     struct Event {
         Kind kind{};
         std::uint32_t width{},height{},message{};
@@ -63,7 +63,7 @@ class GuiTiming final {
                 "\"message\":%u,\"event_time\":%.9f,\"unix_time\":%.9f}\n",
                 static_cast<unsigned long long>(sequence),::getpid(),static_cast<unsigned long long>(e.hwnd),e.message,e.host,e.wall);
         }else{
-            constexpr const char* names[]={"submitted","completed","presented"};
+            constexpr const char* names[]={"submitted","completed","presented","generated"};
             result=std::fprintf(file_,"{\"event\":\"%s\",\"sequence\":%llu,\"pid\":%d,\"surface\":%llu,\"frame\":%llu,"
                 "\"width\":%u,\"height\":%u,\"request_time\":%.9f,\"submit_time\":%.9f,"
                 "\"event_time\":%.9f,\"presented_time\":%.9f,\"gpu_start\":%.9f,"
@@ -144,6 +144,7 @@ public:
         if(event && !std::strcmp(event,"submitted"))value.kind=Kind::Submitted;
         else if(event && !std::strcmp(event,"completed"))value.kind=Kind::Completed;
         else if(event && !std::strcmp(event,"presented"))value.kind=Kind::Presented;
+        else if(event && !std::strcmp(event,"generated"))value.kind=Kind::Generated;
         else{invalid_.fetch_add(1,std::memory_order_relaxed);return;}
         value.surface=surface;value.frame=frame;value.width=width;value.height=height;
         value.request=request;value.submit=submit;value.display=display;value.gpu_start=gpu_start;value.gpu_end=gpu_end;
