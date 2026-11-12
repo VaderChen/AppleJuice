@@ -150,6 +150,7 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         ,{"ntdll.dll","LdrLoadDll",4},{"ntdll.dll","LdrGetDllHandle",4},{"ntdll.dll","LdrGetProcedureAddress",4,0,0,0x4},{"ntdll.dll","LdrUnloadDll",1}
         ,{"ntdll.dll","LdrRegisterDllNotification",4},{"ntdll.dll","LdrUnregisterDllNotification",1}
         ,{"ntdll.dll","RtlAreLongPathsEnabled",0}
+        ,{"ntdll.dll","RtlGetUnloadEventTrace",0},{"ntdll.dll","RtlGetUnloadEventTraceEx",3}
     };return table;
 }
 std::map<std::uint64_t,std::uint32_t> WindowsServices::builtin_system_calls() const {
@@ -374,6 +375,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             return start("kernel32.dll","InitOnceExecuteOnce",{call(0),call(1),call(2),call(3)});
         }
         if(name=="RtlAreLongPathsEnabled")return finish(0); // 預設登錄 LongPathsEnabled=0。
+        if(name=="RtlGetUnloadEventTrace" || name=="RtlGetUnloadEventTraceEx"){
+            // 卸載事件陣列放在客體 heap：第一次查詢時配置並填入已記錄的事件，之後由 unmap_module 逐筆更新（見 RuntimeState::unload_events）。
+            // Ex 版回傳三個「指向變數的指標」：元素大小、元素個數與陣列指標；舊版直接回傳陣列。
+            if(!runtime_.unload_trace_block){
+                const auto bytes=std::uint64_t{x86_?12U:16U}+std::uint64_t{RuntimeState::unload_event_capacity}*RuntimeState::unload_event_bytes(x86_);
+                const auto block=allocate_heap(memory,bytes);if(!block)throw NativeError{0xc0000017U};
+                memory.write(GuestAddress{block},std::vector<std::uint8_t>(static_cast<std::size_t>(bytes)));
+                runtime_.unload_trace_block=block;
+                memory.store(GuestAddress{block},32,RuntimeState::unload_event_bytes(x86_));memory.store(GuestAddress{block+4},32,RuntimeState::unload_event_capacity);
+                memory.store(GuestAddress{block+8},bits,runtime_.unload_trace_array(x86_));
+                for(const auto& event:runtime_.unload_events)runtime_.write_unload_event(memory,x86_,event);
+            }
+            if(name=="RtlGetUnloadEventTrace")return finish(runtime_.unload_trace_array(x86_));
+            if(call(0))memory.store(GuestAddress{call(0)},bits,runtime_.unload_trace_block);
+            if(call(1))memory.store(GuestAddress{call(1)},bits,runtime_.unload_trace_block+4);
+            if(call(2))memory.store(GuestAddress{call(2)},bits,runtime_.unload_trace_block+8);
+            return finish(0);
+        }
         if(name=="LdrRegisterDllNotification" || name=="LdrUnregisterDllNotification"){
             // 與映射、通知、卸載共用 loader ownership；等待後重新進入，不提前返回成功。
             if(await_loader(state,memory))return std::nullopt;

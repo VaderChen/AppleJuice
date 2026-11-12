@@ -616,6 +616,25 @@ struct RuntimeState {
     std::uint64_t next_heap_generation{1};
     std::set<std::uint64_t> main_dependencies;
     std::vector<std::uint64_t> module_order;
+    // ntdll 的 DLL 卸載事件紀錄（RtlGetUnloadEventTrace／RtlGetUnloadEventTraceEx）：與 Windows 相同保留最近 64 筆的環，
+    // 每次卸載依序號寫入 sequence%64。客體區塊在第一次查詢時配置（開頭依序是元素大小、元素個數、陣列指標，之後接陣列），
+    // 之後每次卸載同步更新。Version 兩欄未解析版本資源，維持 0。
+    struct UnloadEvent {std::uint64_t base{},size{};std::uint32_t sequence{},timestamp{},checksum{};std::u16string name;bool operator==(const UnloadEvent&) const=default;};
+    static constexpr std::uint32_t unload_event_capacity=64;
+    std::vector<UnloadEvent> unload_events;
+    std::uint32_t unload_sequence{};
+    std::uint64_t unload_trace_block{};
+    static constexpr std::uint32_t unload_event_bytes(bool x86) noexcept {return x86?0x5cU:0x68U;}
+    std::uint64_t unload_trace_array(bool x86) const noexcept {return unload_trace_block?unload_trace_block+(x86?12U:16U):0;}
+    void write_unload_event(GuestMemory& memory,bool x86,const UnloadEvent& event) const {
+        if(!unload_trace_block)return;
+        const auto unit=x86?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+        const auto at=unload_trace_array(x86)+std::uint64_t{event.sequence%unload_event_capacity}*unload_event_bytes(x86);
+        memory.store(GuestAddress{at},bits,event.base);memory.store(GuestAddress{at+unit},bits,event.size);
+        memory.store(GuestAddress{at+2*unit},32,event.sequence);memory.store(GuestAddress{at+2*unit+4},32,event.timestamp);memory.store(GuestAddress{at+2*unit+8},32,event.checksum);
+        for(std::size_t i=0;i<32;++i)memory.store(GuestAddress{at+2*unit+12+i*2},16,i<31 && i<event.name.size()?event.name[i]:0);
+        memory.store(GuestAddress{at+2*unit+12+64},32,0);memory.store(GuestAddress{at+2*unit+12+68},32,0);
+    }
     std::map<std::uint64_t,ModuleOperation> module_operations;
     std::uint64_t next_module_operation{1}, next_module_base{0x180000000ULL};
     std::uint64_t loader_owner{};

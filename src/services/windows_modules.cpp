@@ -556,6 +556,18 @@ void WindowsServices::unmap_module(GuestMemory& memory,std::uint64_t base,GuestS
         }
         runtime_.static_tls_slots[module.tls_slot]=false;
     }
+    {
+        // 卸載事件紀錄：映像丟棄前讀出 PE 標頭的 TimeDateStamp 與 CheckSum；檔名取路徑最後一段（最多 31 個字元）。
+        RuntimeState::UnloadEvent event;event.base=module.image.base;event.size=module.image.size;event.sequence=runtime_.unload_sequence++;
+        try{
+            const auto header=module.image.base+memory.load(GuestAddress{module.image.base+0x3c},32);
+            event.timestamp=static_cast<std::uint32_t>(memory.load(GuestAddress{header+8},32));event.checksum=static_cast<std::uint32_t>(memory.load(GuestAddress{header+24+64},32));
+        }catch(const MemoryFault&){}
+        const auto& path=module.image.path;const auto slash=path.find_last_of(u"\\/");event.name=slash==path.npos?path:path.substr(slash+1);
+        if(runtime_.unload_events.size()<RuntimeState::unload_event_capacity)runtime_.unload_events.push_back(event);
+        else runtime_.unload_events[event.sequence%RuntimeState::unload_event_capacity]=event;
+        try{runtime_.write_unload_event(memory,x86_,event);}catch(const MemoryFault&){}
+    }
     for(const auto& [address,size]:module.mappings){memory.discard(GuestAddress{address},size);runtime_.virtual_page_protections.erase(runtime_.virtual_page_protections.lower_bound(address),runtime_.virtual_page_protections.lower_bound(address+size));}
     module_event(runtime_.module_events,"module_unload="+utf16_to_utf8(module.image.path));
     runtime_.loaded_modules.erase(found);
