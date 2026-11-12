@@ -106,6 +106,11 @@ std::pair<std::int32_t,std::uint32_t> hit(const GuiWindow& w,std::int32_t x,std:
     std::uint32_t flags=0;if(x<0)flags|=0x800;if(y<0)flags|=0x100;if(static_cast<std::uint32_t>(std::max(0,x))>=w.width)flags|=0x400;if(static_cast<std::uint32_t>(std::max(0,y))>=w.height)flags|=0x200;
     if(flags)return {-1,flags};if(!w.header)return {-1,1};
     const auto& overflow=w.header->overflow_rectangle;if(w.header->overflow_item>=0 && x>=overflow[0] && x<overflow[2] && y>=overflow[1] && y<overflow[3])return {-1,0x4000};
+    // 分隔線本身與左右命中區都可開始縮放；不能把線右側誤當成下一欄的標題。
+    if(!(w.style&0x800U))for(std::size_t i=0;i<w.header->rectangles.size();++i){const auto& r=w.header->rectangles[i];
+        const auto bottom=(w.style&0x100U)?(r[1]+r[3])/2:r[3];
+        if(i<w.columns.size() && !(w.columns[i].format&0x100) && r[2]>r[0] && y>=r[1] && y<bottom && std::abs(static_cast<std::int64_t>(x)-r[2])<=4)return {static_cast<std::int32_t>(i),4};
+    }
     for(std::size_t i=0;i<w.header->rectangles.size();++i){const auto& r=w.header->rectangles[i];if(x>=r[0] && x<r[2] && y>=r[1] && y<r[3]){
         if((w.style&0x100U) && y>=(r[1]+r[3])/2){const auto button=filter_rectangle(w,i,true);return {static_cast<std::int32_t>(i),x>=button[0] && x<button[2]?0x20U:0x10U};}
         if(!(w.style&0x800U) && !(w.columns[i].format&0x100) && x>=r[2]-std::min(4,std::max(0,r[2]-r[0])))return {static_cast<std::int32_t>(i),4};

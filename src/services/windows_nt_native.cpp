@@ -51,6 +51,7 @@ ObjectAttributes object_attributes(const GuestMemory& memory,std::uint64_t addre
 }
 std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"ntdll.dll","RtlDisownModuleHeapAllocation",2},
 #include "concrt_sync_descriptors.inc"
         {"ntdll.dll","NtCreateFile",11,0,0,0x5e2},{"ntdll.dll","NtOpenFile",6,0,0,0x32},
         {"ntdll.dll","NtQueryAttributesFile",2},{"ntdll.dll","NtQueryFullAttributesFile",2},
@@ -263,6 +264,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
     if(service.symbol=="NtSuspendThread" || service.symbol=="NtResumeThread" || service.symbol.ends_with("tContextThread"))return invoke_thread_control(state,memory,service);
     const WindowsCall call(state,memory,service);const auto name=service.symbol;const auto saved_error=last_error_;const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto finish=[&](std::uint64_t status){if(name.starts_with("Nt"))threads_.items.at(threads_.current).last_native_status=static_cast<std::uint32_t>(status);last_error_=saved_error;call.return_to(state,status);return std::optional<std::uint32_t>{};};
+    // Microsoft 明訂：未啟用 Application Verifier 時為 no-op；不可釋放、移轉或改變配置內容。
+    if(name=="RtlDisownModuleHeapAllocation")return finish(0);
     const auto failure=[&](std::uint32_t status){return finish(name=="RtlDosPathNameToNtPathName_U" || name=="RtlGetFullPathName_U" || name=="RtlDetermineDosPathNameType_U" || name=="RtlIsDosDeviceName_U"?0:status);};
     NativeOperation op;op.symbol=name;op.saved_error=saved_error;for(unsigned i=0;i<service.arguments;++i)op.arguments[i]=call(i);
     const auto start=[&](std::string_view family,std::string_view symbol,std::vector<std::uint64_t> arguments){

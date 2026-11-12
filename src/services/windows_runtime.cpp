@@ -214,6 +214,7 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {msvcp_special_math_service_descriptors(), true, "msvcp_special_math_service_descriptors", &WindowsServices::invoke_msvcp_special_math},
             {webview2_loader_service_descriptors(), true, "webview2_loader_service_descriptors", &WindowsServices::invoke_webview2},
             {webview2_object_service_descriptors(), false, "webview2_object_service_descriptors", &WindowsServices::invoke_webview2},
+            {webbrowser_service_descriptors(), false, "webbrowser_service_descriptors", &WindowsServices::invoke_webbrowser},
             {d3d12_export_service_descriptors(), true, "d3d12_export_service_descriptors", &WindowsServices::invoke_d3d12},
             {d3d12_object_service_descriptors(), false, "d3d12_object_service_descriptors", &WindowsServices::invoke_d3d12},
             {dxcore_export_service_descriptors(), true, "dxcore_export_service_descriptors", &WindowsServices::invoke_dxcore},
@@ -1755,6 +1756,7 @@ void WindowsServices::discard_callbacks(std::size_t depth, GuestState& state, Gu
         if(frame.continuation==Continuation::ComMarshalOperation)discard_com_marshal(state,memory,frame.value);
         if(frame.continuation==Continuation::SocketAccept)discard_socket_accept(state,memory,frame.value);
         if(frame.continuation==Continuation::ComAgileOperation)discard_com_agile(state,memory,frame.value);
+        if(frame.continuation==Continuation::RecentDocument)discard_recent_document(state,memory,frame.value);
         if(frame.continuation==Continuation::ShellItemOperation)discard_shell_item(state,memory,frame.value);
         if(frame.continuation==Continuation::ComBindOperation)discard_com_bind(state,memory,frame.value);
         if(frame.continuation==Continuation::ComRotOperation)discard_com_rot(state,memory,frame.value);
@@ -1915,6 +1917,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     if(finished.continuation==Continuation::ComMarshalOperation)return resume_com_marshal(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::SocketAccept)return resume_socket_accept(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::ComAgileOperation)return resume_com_agile(state,memory,finished.value,callback_value);
+    if(finished.continuation==Continuation::RecentDocument)return resume_recent_document(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));
     if(finished.continuation==Continuation::ShellItemOperation)return resume_shell_item(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));
     if(finished.continuation==Continuation::ComBindOperation)return resume_com_bind(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::ComRotOperation)return resume_com_rot(state,memory,finished.value,callback_value);

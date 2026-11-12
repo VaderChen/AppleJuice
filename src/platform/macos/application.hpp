@@ -12,10 +12,14 @@
 
 namespace x64arm {
 // 所有 AppKit presenter 共用同一背景螢幕，子程序仍沿用 Launcher 的固定 ID。
-inline bool native_background_display_enabled(){const char* value=std::getenv("X64ARM_GUI_BACKGROUND_DISPLAY");return native_window_space_uuid() || (value && std::string_view(value)=="1");}
+inline bool native_background_display_enabled(){
+    if(const char* value=std::getenv("X64ARM_GUI_BACKGROUND_DISPLAY"))return std::string_view(value)=="1";
+    return native_window_space_uuid()!=nil;
+}
 inline NSScreen* native_background_display(){
-    if(!native_background_display_enabled())return nil;
+    // 指定桌面的螢幕與背景啟動角色獨立：正常 Launcher 也明確選定主螢幕。
     if(native_window_space_uuid())return native_window_space_screen();
+    if(!native_background_display_enabled())return nil;
     static NSScreen* selected=[]()->NSScreen*{
         NSArray<NSScreen*>* screens=NSScreen.screens;NSScreen* active=NSScreen.mainScreen;
         // 同一次 Launcher 執行固定使用它已選定的螢幕，所有子程序沿用。

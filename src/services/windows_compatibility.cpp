@@ -14,6 +14,8 @@
 #include "x64arm/windows_system_paths.hpp"
 #include "x64arm/security_descriptor.hpp"
 #include "x64arm/security_access.hpp"
+#include "x64arm/process_identity.hpp"
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <random>
@@ -229,7 +231,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"user32.dll","OemToCharA",2},{"user32.dll","OemToCharW",2},
         {"user32.dll","OemToCharBuffA",3},{"user32.dll","OemToCharBuffW",3},
         {"kernel32.dll", "MultiByteToWideChar", 6}, {"kernel32.dll", "WideCharToMultiByte", 8},
-        {"kernel32.dll", "GetLocaleInfoA", 4},{"kernel32.dll", "GetLocaleInfoW", 4},{"kernel32.dll", "IsValidCodePage", 1}, {"kernel32.dll", "GetCPInfo", 2}, {"kernel32.dll", "GetOEMCP", 0},
+        {"kernel32.dll", "GetLocaleInfoA", 4},{"kernel32.dll", "GetLocaleInfoW", 4},{"kernel32.dll", "IsValidCodePage", 1}, {"kernel32.dll", "GetCPInfo", 2}, {"kernel32.dll", "GetCPInfoExA", 3}, {"kernel32.dll", "GetCPInfoExW", 3}, {"kernel32.dll", "GetOEMCP", 0},
         {"kernel32.dll","GetLocaleInfoEx",4},
         {"kernel32.dll","GetSystemFirmwareTable",4},{"kernel32.dll","EnumSystemFirmwareTables",3},{"kernel32.dll","GetFirmwareType",1},
         {"kernel32.dll","GetFirmwareEnvironmentVariableA",4},{"kernel32.dll","GetFirmwareEnvironmentVariableW",4},{"kernel32.dll","GetFirmwareEnvironmentVariableExA",5},{"kernel32.dll","GetFirmwareEnvironmentVariableExW",5},
@@ -249,6 +251,10 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"psapi.dll","EnumProcesses",3},{"kernel32.dll","K32EnumProcesses",3},
         {"kernel32.dll","GetCurrentApplicationUserModelId",2},{"kernel32.dll","GetCurrentPackageId",2},{"kernel32.dll","GetCurrentPackageFullName",2},
         {"kernel32.dll","GetCurrentPackageFamilyName",2},{"kernel32.dll","GetCurrentPackagePath",2},
+        {"kernel32.dll","GetCurrentPackageInfo",4},{"kernel32.dll","GetCurrentPackageInfo2",5},
+        {"kernel32.dll","TryCreatePackageDependency",8,4},{"kernel32.dll","DeletePackageDependency",1},
+        {"kernel32.dll","AddPackageDependency",5},{"kernel32.dll","RemovePackageDependency",1},
+        {"kernel32.dll","GetResolvedPackageFullNameForPackageDependency",2},{"kernel32.dll","GetIdForPackageDependencyContext",2},{"kernel32.dll","GetPackageGraphRevisionId",0},
         {"psapi.dll","EnumProcessModulesEx",5},{"kernel32.dll","K32EnumProcessModulesEx",5},
         {"psapi.dll","GetModuleInformation",4},{"kernel32.dll","K32GetModuleInformation",4},
         {"kernel32.dll","QueryFullProcessImageNameA",4},{"kernel32.dll","QueryFullProcessImageNameW",4},
@@ -292,7 +298,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"shlwapi.dll", "PathFindNextComponentA", 1}, {"shlwapi.dll", "PathFindNextComponentW", 1},
         {"shlwapi.dll", "PathIsUNCA", 1}, {"shlwapi.dll", "PathIsUNCW", 1},
         {"shlwapi.dll", "PathGetCharTypeA", 1}, {"shlwapi.dll", "PathGetCharTypeW", 1}, {"shlwapi.dll", "StrTrimA", 2}, {"shlwapi.dll", "StrTrimW", 2},
-        {"shlwapi.dll", "StrCmpA", 2}, {"shlwapi.dll", "StrCmpW", 2},
+        {"shlwapi.dll", "StrCmpLogicalW", 2}, {"shlwapi.dll", "StrCmpA", 2}, {"shlwapi.dll", "StrCmpW", 2},
         {"shlwapi.dll", "StrCmpIA", 2}, {"shlwapi.dll", "StrCmpIW", 2},
         {"shlwapi.dll", "StrCmpNA", 3}, {"shlwapi.dll", "StrCmpNW", 3},
         {"shlwapi.dll", "StrCmpNIA", 3}, {"shlwapi.dll", "StrCmpNIW", 3},
@@ -487,7 +493,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     const auto sint = [&](unsigned i) { return std::bit_cast<std::int32_t>(dword(i)); };
     std::uint64_t result = 0;
     const auto fail = [&](unsigned error) { last_error_ = error; result = 0; };
+#include "windows_package_dependency.inc"
     if(symbol=="GetCurrentApplicationUserModelId"){arg.return_to(state,arg(0)?15703U:87U);return std::nullopt;}
+    if(symbol=="GetCurrentPackageInfo" || symbol=="GetCurrentPackageInfo2"){
+        // 與同家族的身分查詢一致：普通 Win32 程序沒有 MSIX package graph。
+        const unsigned shift=symbol.ends_with('2')?1U:0U;
+        if(!arg(1+shift) || (shift && arg(1)>2)){arg.return_to(state,87);return std::nullopt;}
+        if(!arg(2+shift) && memory.load(GuestAddress{arg(1+shift)},32)){arg.return_to(state,87);return std::nullopt;}
+        memory.store(GuestAddress{arg(1+shift)},32,0);if(arg(3+shift))memory.store(GuestAddress{arg(3+shift)},32,0);
+        arg.return_to(state,15700);return std::nullopt;
+    }
     if(symbol=="GetCurrentPackageId" || symbol=="GetCurrentPackageFullName" || symbol=="GetCurrentPackageFamilyName" || symbol=="GetCurrentPackagePath"){
         // PE 執行環境沒有 MSIX 套件身分；此錯誤描述目前程序的實際身分狀態。
         arg.return_to(state,arg(0)?15700U:87U);return std::nullopt;
@@ -552,7 +567,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         } else result=encode?std::rotr(value^runtime_.pointer_cookie,rotation):std::rotl(value,rotation)^runtime_.pointer_cookie;
     }else if(symbol.starts_with("StrCmp") || symbol.starts_with("StrStr")){
         const bool wide=symbol.ends_with('W'),compare=symbol.starts_with("StrCmp");
-        const bool ignore=symbol.find('I')!=symbol.npos,bounded=symbol.find('N')!=symbol.npos;
+        const bool logical=symbol=="StrCmpLogicalW";const bool ignore=logical || symbol.find('I')!=symbol.npos,bounded=symbol.find('N')!=symbol.npos;
         const auto decode=[](std::string_view bytes){const auto value=windows_nls_decode(bytes,65001,false);if(!value)throw HostCallFault("Shell 字串碼頁轉換失敗");return *value;};
         // N 比較沿用 CompareString 的明確長度契約；搜尋的 N 則限制匹配起點。
         const auto read=[&](std::uint64_t pointer,std::int32_t count){
@@ -566,7 +581,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             if(!arg(0) || !arg(1)){last_error_=87;result=static_cast<std::uint32_t>(-2);}
             else {
                 const auto count=bounded?static_cast<std::int32_t>(arg(2)):-1;
-                const auto compared=windows_nls_compare(read(arg(0),count),read(arg(1),count),0x409,ignore?1:0);
+                const auto compared=windows_nls_compare(read(arg(0),count),read(arg(1),count),0x409,(ignore?1U:0U)|(logical?8U:0U));
                 if(compared)result=static_cast<std::uint32_t>(*compared);else {last_error_=87;result=static_cast<std::uint32_t>(-2);}
             }
         }else if(arg(0) && arg(1) && (!bounded || dword(2))){
@@ -682,14 +697,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     else if(symbol.starts_with("GetLocaleInfo"))return invoke_locale(state,memory,service);
     else if(symbol=="IsValidCodePage") result=dword(0)>3 && windows_crt_codepage(dword(0)).has_value();
     else if(symbol=="GetOEMCP") result=65001;
-    else if(symbol=="GetCPInfo") {
-        const auto page=dword(0)==0 || dword(0)==1 || dword(0)==3?65001U:dword(0);const auto info=windows_crt_codepage(page);
-        if(!info || !arg(1))fail(87);
+    else if(symbol=="GetCPInfo" || symbol=="GetCPInfoExA" || symbol=="GetCPInfoExW") {
+        const bool extended=symbol!="GetCPInfo",wide=symbol.ends_with('W');
+        const auto page=dword(0)==0 || dword(0)==1 || dword(0)==3?65001U:dword(0)==2?10000U:dword(0);
+        const auto info=windows_crt_codepage(page);const auto output=arg(extended?2:1);
+        if(!info || !output)fail(87);
+        else if(extended && dword(1))fail(1004);
         else{
-            std::array<std::uint8_t,20> bytes{};bytes[0]=static_cast<std::uint8_t>(info->maximum_character_bytes);bytes[4]='?';
+            std::vector<std::uint8_t> bytes(extended?(wide?544:284):20);bytes[0]=static_cast<std::uint8_t>(info->maximum_character_bytes);bytes[4]='?';
             unsigned at=6;bool valid=true;
             for(unsigned i=0;i<256;++i)if(info->lead[i]){const auto first=i;while(i+1<256 && info->lead[i+1])++i;if(at+2>18){valid=false;break;}bytes[at++]=static_cast<std::uint8_t>(first);bytes[at++]=static_cast<std::uint8_t>(i);}
-            if(!valid)fail(87);else{memory.write(GuestAddress{arg(1)},bytes);result=1;}
+            if(extended){
+                const auto unicode=page==65001?0xfffdU:0x3fU;bytes[18]=static_cast<std::uint8_t>(unicode&255);bytes[19]=static_cast<std::uint8_t>(unicode>>8);
+                for(unsigned i=0;i<4;++i)bytes[20+i]=static_cast<std::uint8_t>(page>>(8*i));
+                std::string name="Code page "+std::to_string(page);
+                for(const auto& entry:std::array<std::pair<unsigned,const char*>,8>{{{65001,"Unicode (UTF-8)"},{1252,"Western European (Windows)"},{932,"Japanese (Shift-JIS)"},{936,"Chinese Simplified (GB2312)"},{949,"Korean"},{950,"Chinese Traditional (Big5)"},{437,"OEM United States"},{10000,"Western European (Mac)"}}})if(entry.first==page)name=std::to_string(page)+" ("+entry.second+")";
+                for(std::size_t i=0;i<name.size() && i<259;++i)bytes[24+i*(wide?2:1)]=static_cast<std::uint8_t>(name[i]);
+            }
+            if(!valid)fail(87);else{memory.write(GuestAddress{output},bytes);result=1;}
         }
     }
     else if(symbol=="GetConsoleScreenBufferInfo")return invoke_console_control(state,memory,service);

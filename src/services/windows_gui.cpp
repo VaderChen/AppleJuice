@@ -56,7 +56,7 @@ public:
     }
     ~GuiPumpTrace() {if(enabled_)finish(Clock::now());}
 };
-constexpr std::array<std::u16string_view,23> stock_classes{u"button",u"static",u"edit",u"listbox",u"combobox",u"systreeview32",u"syslistview32",u"toolbarwindow32",u"msctls_statusbar32",u"rebarwindow32",u"scrollbar",u"msctls_progress32",u"comboboxex32",u"msctls_updown32",u"mdiclient",u"syslink",u"msctls_trackbar32",u"ime",u"systabcontrol32",u"tooltips_class32",u"sysheader32",u"sysdatetimepick32",u"sysmonthcal32"};
+constexpr std::array<std::u16string_view,26> stock_classes{u"button",u"static",u"edit",u"listbox",u"combobox",u"systreeview32",u"syslistview32",u"toolbarwindow32",u"msctls_statusbar32",u"rebarwindow32",u"scrollbar",u"msctls_progress32",u"comboboxex32",u"msctls_updown32",u"mdiclient",u"syslink",u"msctls_trackbar32",u"ime",u"systabcontrol32",u"tooltips_class32",u"sysheader32",u"sysdatetimepick32",u"sysmonthcal32",u"richedit",u"richedit20a",u"richedit20w"};
 constexpr std::uint64_t stock_base=windows_address_layout::x64.callbacks+0x100;
 constexpr std::uint64_t stock_base_x86=windows_address_layout::x86.callbacks+0x100;
 void trace_gui_input(std::string_view filter,const char* stage,const GuiMessage& message,std::uint64_t thread,std::uint64_t ticks) {
@@ -117,6 +117,9 @@ void WindowsServices::remember_gui_message(const GuiMessage& message) {
     thread.message_position=static_cast<std::uint16_t>(message.queued_cursor[0])|(std::uint32_t{static_cast<std::uint16_t>(message.queued_cursor[1])}<<16);
 }
 std::uint64_t WindowsServices::stock_gui_proc(std::u16string_view name,bool wide) const {
+    auto lower=std::u16string(name);for(auto& c:lower)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
+    if(lower==u"richedit" && !runtime_.modules.contains("riched32.dll"))return 0;
+    if((lower==u"richedit20a" || lower==u"richedit20w") && !runtime_.modules.contains("riched20.dll"))return 0;
     for(std::size_t i=0;i<stock_classes.size();++i)if(name.size()==stock_classes[i].size() && std::equal(name.begin(),name.end(),stock_classes[i].begin(),[](char16_t a,char16_t b){return (a>=u'A' && a<=u'Z'?a+32:a)==b;}))return callback_return_.value+0x100+(i*2+(wide?1:0))*16;return 0;
 }
 std::u16string_view WindowsServices::stock_gui_class(std::uint64_t proc){
@@ -146,7 +149,7 @@ std::optional<std::uint64_t> WindowsServices::default_gui_control(GuestMemory& m
     if((gui_.clipboard_ole_object || gui_.clipboard_owner || !gui_.clipboard.empty()) && gui_control_class(window)==u"edit" &&
        ((message.message>=0x300 && message.message<=0x302) || (message.message==0x102 && (message.wparam==3 || message.wparam==22 || message.wparam==24))))return std::nullopt;
     if((gui_control_class(window)==u"rebarwindow32" || gui_control_class(window)==u"toolbarwindow32" || gui_control_class(window)==u"systabcontrol32") && message.message==0x4e)return std::nullopt;
-    if(gui_control_class(window)==u"syslistview32" && (message.message==0x1030 || message.message==0x1051 || message.message==0x1005 || message.message==0x104b || message.message==0x102d || message.message==0x1073))return std::nullopt;
+    if(gui_control_class(window)==u"syslistview32" && (message.message==0x7b || message.message==0x205 || message.message==0x1030 || message.message==0x1051 || message.message==0x1005 || message.message==0x104b || message.message==0x102d || message.message==0x1073))return std::nullopt;
     if(gui_control_class(window)==u"button" && (message.message==0xf5 || message.message==0x202 || (message.message==0x101 && message.wparam==32)))return std::nullopt;
     if(gui_control_class(window)==u"systabcontrol32" && (message.message==0x1330 || message.message==0x201 || message.message==0x100))return std::nullopt;
     if(gui_control_class(window)==u"systreeview32" && (message.message==0x110b || message.message==0x10010 || message.message==0x1101 || message.message==0x1102 || message.message==0x110c || message.message==0x113e || message.message==0x1001a || message.message==0x1001b))return std::nullopt;
@@ -357,6 +360,7 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
     if(wait){const auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-before).count();if(elapsed>0){if(!runtime_.host_clock)runtime_.clock_ticks+=static_cast<std::uint64_t>(elapsed)/100;retired(memory,0);}}
     trace.next("event_translation");
     for (auto msg : events) {
+        if(msg.message==0x10041){queue_webbrowser_event(msg);continue;}
         if(msg.message==0x1000d && !msg.wparam){
             // 宿主應用失去前景沒有新的客體 HWND。先撤銷擷取與移動迴圈的世代，
             // 再由原 owner 的執行緒派送 WM_CAPTURECHANGED，保留可重入通知契約。
@@ -776,6 +780,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                 if(!window.parent)window.menu=arg(9);
                 window.enabled=(arg(3)&0x8000000U)==0;
                 window.instance = arg(10); window.style = static_cast<std::uint32_t>(arg(3)); window.ex_style = static_cast<std::uint32_t>(arg(0));
+                if(!window.parent && !window.owner && gui_.process_default_layout)window.ex_style|=0x400000U;
+                if(window.parent && gui_.windows.contains(window.parent) && (gui_.windows.at(window.parent).ex_style&0x500000U)==0x400000U)window.ex_style|=0x400000U;
                 window.initial_size_pending=(window.style&0xc0000000U)==0;
                 const bool combo=window.control_class==u"combobox" || window.control_class==u"comboboxex32";
                 if(combo)window.combo_drop_height=height>24?height-24:100;
@@ -989,7 +995,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                 }
                 else if(dword(1)==0x83){
                     memory.check(GuestAddress{arg(3)},arg(2)?(x86_?52U:56U):16U,Access::Write);
-                    const auto f=gui_frame_insets(window.style,window.ex_style,window.menu!=0);
+                    const auto f=gui_default_frame_insets(window);
                     const auto left=signed32(memory.load(GuestAddress{arg(3)},32)),top=signed32(memory.load(GuestAddress{arg(3)+4},32));
                     const auto right=signed32(memory.load(GuestAddress{arg(3)+8},32)),bottom=signed32(memory.load(GuestAddress{arg(3)+12},32));
                     const auto x=std::min<std::int64_t>(right,std::int64_t{left}+f.left),y=std::min<std::int64_t>(bottom,std::int64_t{top}+f.top);

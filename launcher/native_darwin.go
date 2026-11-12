@@ -8,9 +8,13 @@ package main
 uint64_t launcher_physical_memory(void);
 uint32_t launcher_physical_processors(void);
 char* launcher_windows_fonts(void);
+char* launcher_windows_text(const void*, size_t, uint32_t);
 char* launcher_pick(int folder, int probe, const char* title, int single);
 void launcher_language(const char* language);
 void launcher_configure(void* window);
+void* launcher_primary_window(int testing);
+void launcher_close_primary_window(void);
+char* launcher_window_space_uuid(void);
 void* launcher_background_window(void);
 uint32_t launcher_background_display_id(void);
 void launcher_close_background_window(void);
@@ -68,6 +72,29 @@ func nativePick(folder, probe bool, title string, single ...bool) ([]string, err
 	return paths, err
 }
 func nativeConfigure(window unsafe.Pointer) { C.launcher_configure(window) }
+func nativePrimaryWindow(testing, normalStartup bool) (unsafe.Pointer, error) {
+	mode := C.int(0)
+	if testing {
+		mode = 1
+	}
+	if normalStartup {
+		mode |= 2
+	}
+	window := C.launcher_primary_window(mode)
+	if window == nil {
+		return nil, errors.New("無法建立主螢幕視窗或測試用第二桌面，已停止啟動")
+	}
+	return window, nil
+}
+func nativeClosePrimaryWindow() { C.launcher_close_primary_window() }
+func nativeWindowSpaceUUID() string {
+	value := C.launcher_window_space_uuid()
+	if value == nil {
+		return ""
+	}
+	defer C.free(unsafe.Pointer(value))
+	return C.GoString(value)
+}
 func nativeBackgroundWindow() (unsafe.Pointer, error) {
 	window := C.launcher_background_window()
 	if window == nil {
@@ -115,4 +142,16 @@ func nativeLanguage(language string) {
 	label := C.CString(language)
 	defer C.free(unsafe.Pointer(label))
 	C.launcher_language(label)
+}
+
+func nativeWindowsText(data []byte, codepage uint32) string {
+	if len(data) == 0 {
+		return ""
+	}
+	value := C.launcher_windows_text(unsafe.Pointer(&data[0]), C.size_t(len(data)), C.uint32_t(codepage))
+	if value == nil {
+		return ""
+	}
+	defer C.free(unsafe.Pointer(value))
+	return C.GoString(value)
 }

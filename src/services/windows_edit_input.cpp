@@ -42,6 +42,11 @@ EditLines edit_lines(const GuiWindow& window,std::uint64_t handle,NativeGui* nat
 }
 std::optional<std::uint64_t> WindowsServices::gui_edit_input(GuestMemory& memory,const GuiMessage& message,bool wide){
     auto& window=gui_.windows.at(message.window);const auto code=message.message;
+    if(window.control_class.starts_with(u"richedit")){
+        if(code==0x435){window.text_limit=message.lparam?static_cast<std::uint32_t>(message.lparam):65536U;return 0;}
+        if(code==0x445){const auto previous=window.rich_event_mask;window.rich_event_mask=static_cast<std::uint32_t>(message.lparam);return previous;}
+        if(code==0x43b)return window.rich_event_mask;
+    }
     auto& start=window.edit_start;auto& end=window.edit_end;const auto length=static_cast<std::uint32_t>(window.title.size());start=std::min(start,length);end=std::min(end,length);
     const auto position=[&](std::uint32_t at,bool to_utf16=false){return edit_position(window.title,at,wide,to_utf16);};
     const auto notify=[&](unsigned event){if(gui_.windows.contains(window.parent))enqueue_gui_message({window.parent,(std::uint64_t{event}<<16)|(window.id&65535U),message.window,0x111});};

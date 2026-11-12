@@ -139,7 +139,7 @@ std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
         {"powrprof.dll","PowerReadFriendlyName",6},{"powrprof.dll","PowerReadACValue",7},{"powrprof.dll","PowerReadDCValue",7},
         {"powrprof.dll","PowerReadACValueIndex",5},{"powrprof.dll","PowerReadDCValueIndex",5},
         {"powrprof.dll","PowerEnumerate",7},{"powrprof.dll","PowerReadDescription",6},{"powrprof.dll","GetActivePwrScheme",1},{"powrprof.dll","EnumPwrSchemes",2},{"kernel32.dll","GetDevicePowerState",2},
-        {"kernel32.dll","SetThreadExecutionState",1,0,0,1},{"kernel32.dll","SetSystemPowerState",2,0,0,3},
+        {"kernel32.dll","SetThreadExecutionState",1,0,0,1},{"kernel32.dll","SetSystemPowerState",2,0,0,3},{"powrprof.dll","SetSuspendState",3},
         {"kernel32.dll","PowerCreateRequest",1},{"kernel32.dll","PowerSetRequest",2},{"kernel32.dll","PowerClearRequest",2},
         {"advapi32.dll","EventRegister",4},{"advapi32.dll","EventUnregister",1,1},
         {"advapi32.dll","EventEnabled",2,1},{"advapi32.dll","EventProviderEnabled",3,5},
@@ -241,7 +241,7 @@ void WindowsServices::discard_policy_thread(std::uint64_t thread){
     }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
-    if(service.symbol.starts_with("Power") || service.symbol=="GetPwrCapabilities" || service.symbol=="SetThreadExecutionState" || service.symbol=="SetSystemPowerState" || service.symbol=="GetActivePwrScheme" || service.symbol=="EnumPwrSchemes" || service.symbol=="GetDevicePowerState")return invoke_power(state,memory,service);
+    if(service.symbol.starts_with("Power") || service.symbol=="GetPwrCapabilities" || service.symbol=="SetThreadExecutionState" || service.symbol=="SetSystemPowerState" || service.symbol=="SetSuspendState" || service.symbol=="GetActivePwrScheme" || service.symbol=="EnumPwrSchemes" || service.symbol=="GetDevicePowerState")return invoke_power(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
 #include "windows_process_parameters.inc"
 #include "policy_handlers.inc"

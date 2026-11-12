@@ -200,6 +200,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_dialog(GuestState& stat
         }
         window.title=title.text;window.visible=(window.style&0x10000000)!=0;window.enabled=(window.style&0x08000000)==0;
         if(window.style&0x40000000){window.parent=window.owner;window.owner=0;}
+        if(!window.parent && !window.owner && gui_.process_default_layout)window.ex_style|=0x400000U;
+        if(window.parent && gui_.windows.contains(window.parent) && (gui_.windows.at(window.parent).ex_style&0x500000U)==0x400000U)window.ex_style|=0x400000U;
         if(window.style&0x40){(void)reader.number(2);if(extended){(void)reader.number(2);(void)reader.number(1);(void)reader.number(1);}if(reader.field().ordinal)throw DialogFailure{13};}
         const auto layout=gui_dialog_layout(memory,begin,size);window.dialog_base_x=layout.base_x;window.dialog_base_y=layout.base_y;
         const auto horizontal=[&](std::int32_t v){return static_cast<std::int32_t>((static_cast<std::int64_t>(v)*layout.base_x+(v<0?-4:4))/8);};
@@ -217,6 +219,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_dialog(GuestState& stat
             if(extended){(void)reader.number(4);child.ex_style=static_cast<std::uint32_t>(reader.number(4));child.style=static_cast<std::uint32_t>(reader.number(4));}
             else {child.style=static_cast<std::uint32_t>(reader.number(4));child.ex_style=static_cast<std::uint32_t>(reader.number(4));}
             child.style|=0x40000000;child.x=reader.coordinate();child.y=reader.coordinate();child.width=reader.dimension();child.height=reader.dimension();child.id=reader.number(extended?4:2);
+            if((plans.front().window.ex_style&0x500000U)==0x400000U)child.ex_style|=0x400000U;
             const auto child_class=reader.field(),child_title=reader.field();child.class_name=child_class.text;
             if(child_class.ordinal && *child_class.ordinal>=0x80 && *child_class.ordinal<=0x85){constexpr std::u16string_view names[]{u"button",u"edit",u"static",u"listbox",u"scrollbar",u"combobox"};child.class_name=names[*child_class.ordinal-0x80];}
             child.procedure=stock_gui_proc(child.class_name,wide);child.builtin=child.procedure!=0;

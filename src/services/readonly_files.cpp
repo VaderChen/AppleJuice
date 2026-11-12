@@ -851,7 +851,10 @@ FileSnapshot ReadOnlyFiles::open_library(std::string path,const std::filesystem:
     // 與不同 ReadOnlyFiles 實例以真正的檔案身分區分／共用，不能只相信 guest key。
     try {
         auto bytes=pe_file_cache().read(opened.file->transfer_descriptor(),256U*1024U*1024U);
-        readonly_files_[key]=opened.source;
+        // 可寫磁碟內的 DLL／資源映像仍沿用該磁碟權限；載入索引不應把它永久降為唯讀。
+        // 外部 EXE 相鄰目錄及唯讀掛載繼續保留唯讀能力，核對實際路徑與 inode 後才排除 overlay。
+        if(writable_image_source(key,opened.source))readonly_files_.erase(key);
+        else readonly_files_[key]=opened.source;
         return {key,std::move(bytes),0,false,opened.source};
     }catch(const std::length_error&){return {key,{},193};}
     catch(const std::invalid_argument&){return {key,{},193};}

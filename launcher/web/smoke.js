@@ -43,59 +43,186 @@
     check('取消字型草稿不覆寫已儲存選擇', font.value === choices[1] && state.globalSettings.windowsFont === choices[1]);
     font.value = original; font.dispatchEvent(new Event('change'));await click('global-settings-save');await until(() => !$('global-settings-save').disabled, '還原 Windows 字型');
   }
+  async function checkCacheActions() {
+    const bridge = window.launcher, requests = [];
+    const empty = {entries:[],totalBytes:0,running:false};
+    const example = {entries:[{id:'program:0123456789abcdef',kind:'program',name:'測試快取',path:'/smoke/cache.exe',bytes:4096}],totalBytes:4096,running:false};
+    window.launcher = payload => {
+      const request = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(payload), c=>c.charCodeAt(0))));
+      if (request.action==='clearCache') { requests.push(request.data); return Promise.resolve(empty); }
+      return bridge(payload);
+    };
+    try {
+      renderCacheUsage(example);
+      const button = document.querySelector('.cache-delete');
+      check('快取單項使用可辨識的刪除按鈕', button.textContent===t('刪除') && getComputedStyle(button).borderTopStyle!=='none' && !button.disabled);
+      button.click(); await until(()=>requests.length===1 && !$('cache-list').children.length,'單項刪除回應');
+      check('單項刪除沿用既有服務', requests[0]===example.entries[0].id);
+      renderCacheUsage(example);
+      check('全部清除按鈕位於總用量旁', !$('cache-clear-all').disabled && $('cache-clear-all').closest('.cache-total') && $('cache-clear-all').textContent===t('全部清除'));
+      await capture('cache-delete-buttons.png');
+      $('cache-clear-all').click(); $('cache-clear-all').click();
+      await until(()=>requests.length===2 && !$('cache-list').children.length,'全部清除回應');
+      check('全部清除只送一次且空快取停用', requests[1]==='all' && $('cache-clear-all').disabled);
+      renderCacheUsage({...example,running:true});
+      check('程式執行中停用所有快取刪除按鈕', $('cache-clear-all').disabled && document.querySelector('.cache-delete').disabled);
+    } finally { window.launcher=bridge; await refreshCacheUsage(); }
+  }
+  function checkControlSizing() {
+    const selects = [...document.querySelectorAll('select')];
+    check('所有下拉選單統一為 36px 高度', selects.length > 0 && selects.every(input => Math.abs(parseFloat(getComputedStyle(input).height)-36)<1));
+    const rows = [...document.querySelectorAll('.global-drive-row')], right = rows[0].querySelector('.drive-path').getBoundingClientRect().right;
+    const rowRight = rows[0].getBoundingClientRect().right;
+    check('磁碟路徑輸入框及操作列對齊', rows.every(row => Math.abs(row.querySelector('.drive-path').getBoundingClientRect().right-right)<1 && Math.abs(row.lastElementChild.getBoundingClientRect().right-rowRight)<1));
+    check('磁碟選單、輸入框及按鈕同高且操作有外框', rows.every(row => [...row.querySelectorAll('input,select,button')].every(input => Math.abs(input.getBoundingClientRect().height-36)<1)) && rows.every(row => [...row.querySelectorAll('button')].every(button => button.classList.contains('button') && getComputedStyle(button).borderTopStyle!=='none')));
+  }
+  function checkAboutContent() {
+    const links = [...document.querySelectorAll('#global-about .about-links a')];
+    check('關於頁移除介紹並提供專案與贊助連結', links.length===2 && links[0].href==='https://github.com/VaderChen/AppleJuice' && links[1].href==='https://buymeacoffee.com/vaderchen' && !$('global-about').textContent.includes('在 Apple Silicon 上執行'));
+    const originalStatus = updateStatus;
+    renderUpdate({...originalStatus,phase:'latest',current:'0.0.0'});
+    check('頁尾不顯示已是最新版本文案', $('update-status').textContent==='');
+    renderUpdate(originalStatus);
+    check('獨立視窗提示移除指定文字與平台標籤', !$('gui-description') && !$('gui-process'));
+  }
+  async function checkSettingsDialogGeometry() {
+    $('global-tab-general').focus();
+    check('設定分頁移除選取外框',getComputedStyle($('global-tab-general')).outlineStyle==='none' && getComputedStyle($('global-tab-general')).boxShadow==='none');
+    check('Windows 字型說明與 CPU 冗長說明已移除', !$('windows-font-help') && !$('global-cpu').textContent.includes('多數遊戲在雙核表現最好'));
+    await click('global-tab-cpu');
+    check('核心資訊簡化為實體核心', $('cpu-system-cores').textContent.startsWith('實體核心：'));
+    for (const [width, height] of [[1180, 800], [960, 650]]) {
+      await api('smokeSize', {cols: width, rows: height}); await delay(120);
+      const dialog = $('app-settings-dialog'), initial = dialog.getBoundingClientRect();
+      for (const button of document.querySelectorAll('[data-global-tab]')) {
+        await click(button.id);
+        const rect = dialog.getBoundingClientRect(), footer = document.querySelector('.app-settings-footer').getBoundingClientRect();
+        check(`${width}×${height} ${button.dataset.globalTab} 分頁固定高度且按鈕不溢出`, Math.abs(rect.height-initial.height)<1 && Math.abs(rect.top-initial.top)<1 && footer.bottom <= rect.bottom && rect.height <= innerHeight-47);
+        check('更新按鈕僅在關於頁的左下角顯示', $('settings-update-actions').hidden === (button.dataset.globalTab !== 'about'));
+        if (button.dataset.globalTab === 'about') {
+          const update = $('check-update').getBoundingClientRect(), cancel = $('global-settings-cancel').getBoundingClientRect();
+          checkAboutContent();
+          await capture(`settings-about-${width}.png`);
+          check('更新按鈕位於頁尾左側', $('check-update').closest('.app-settings-footer') && update.right < cancel.left && update.top >= footer.top);
+        }
+      }
+      await click('global-tab-advanced');
+      for (let i=0; i<8; i++) await click('global-add-drive');
+      checkControlSizing();
+      check('長內容只在內容區捲動', document.querySelector('.app-settings-pages').scrollHeight > document.querySelector('.app-settings-pages').clientHeight && Math.abs(dialog.getBoundingClientRect().height-initial.height)<1);
+      await capture(`settings-fixed-${width}.png`);
+      await click('global-settings-cancel'); await click('app-settings');
+    }
+    await api('smokeSize', {cols:1180,rows:800}); await delay(100);
+  }
+  async function checkProgramCPUCapsules() {
+    await click('tab-settings');
+    const inputs = [...document.querySelectorAll('input[name="program-cpu-cores"]')], maximum = state.cpuLimits[selected().architecture === 'x86' ? 'x86Max' : 'x64Max'];
+    check('個別程式核心選項為使用全域設定與 2／4／6 膠囊', inputs.map(input => input.value).join(',') === '0,2,4,6' && inputs.every(input => input.type === 'radio') && $('program-cpu-cores-0').checked);
+    for (const input of inputs) {
+      check('個別核心選項依宿主上限停用', input.disabled === (Number(input.value)>maximum));
+      if (input.disabled) continue;
+      await click(input.id);
+      check('個別程式核心膠囊互斥', inputs.filter(input => input.checked).length === 1 && readSettings().cpuCores === Number(input.value));
+      await click('save');
+      check(`個別程式核心 ${input.value} 已保存`, (selected().cpuCores || 0) === Number(input.value));
+    }
+    await click('program-cpu-cores-0'); await click('save');
+    check('個別程式可回到使用全域設定', (selected().cpuCores || 0) === 0 && $('program-cpu-cores-0').checked);
+    await capture('program-cpu-capsules.png');
+  }
+  async function checkGPUCapsules(program) {
+    const limits = state.gpuMemoryLimits, inputs = [...document.querySelectorAll('input[name="gpu-memory"]')];
+    check('GPU 容量為 4G、6G、8G、16G 互斥膠囊', inputs.map(input => input.value).join(',') === '4096,6144,8192,16384' && inputs.every(input => input.type === 'radio') && !document.querySelector('#global-gpu input[type="range"]'));
+    check('GPU 超過系統記憶體 50% 的選項停用', inputs.every(input => input.disabled === (Number(input.value) * 1024 * 1024 > limits.systemMemoryBytes / 2)));
+    const other = state.programs.find(p => p.id !== program.id), originalOther = other?.gpuMemoryMiB;
+    for (const input of inputs.filter(input => !input.disabled)) {
+      await click(input.id);
+      check(`GPU ${input.value} 選項互斥並更新容量`, inputs.filter(input => input.checked).length === 1 && globalGPUMemoryMiB === Number(input.value));
+      await delay(200);
+      check('狀態輪詢保留 GPU 容量草稿', globalGPUMemoryMiB === Number(input.value));
+      await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存 GPU 膠囊');
+      check(`GPU ${input.value} 獨立儲存`, selected().gpuMemoryMiB === Number(input.value) && (!other || state.programs.find(p => p.id === other.id).gpuMemoryMiB === originalOther));
+      await click('app-settings-close'); await click('app-settings'); await click('global-tab-gpu');
+      check(`GPU ${input.value} 重開保留選取`, input.checked);
+    }
+    const saved = selected().gpuMemoryMiB;
+    await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: state.globalSettings, id: program.id, settings: {gpuMemoryMiB: 512}})));
+    await click('app-settings-close'); await click('app-settings'); await click('global-tab-gpu');
+    check('既有非膠囊 GPU 容量仍顯示', globalGPUMemoryMiB === 512 && !document.querySelector('input[name="gpu-memory"]:checked'));
+    await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '保留自訂 GPU 容量');
+    check('儲存其他設定不覆寫既有自訂 GPU 容量', selected().gpuMemoryMiB === 512);
+    await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: state.globalSettings, id: program.id, settings: {gpuMemoryMiB: saved}})));
+    await click('app-settings-close'); await click('app-settings'); await click('global-tab-gpu');
+    for (const maximum of [2048, 6144, 8192]) {
+      loadGPUChoices(saved, {...limits, maxMiB: maximum, systemMemoryBytes: maximum * 2 * 1024 * 1024}, false);
+      check(`GPU 系統一半容量 ${maximum} MiB 正確停用選項`, inputs.every(input => input.disabled === (Number(input.value) > maximum)));
+      const disabled = inputs.find(input => input.disabled);
+      if (disabled) { disabled.click(); check('GPU 停用選項無法改變容量', globalGPUMemoryMiB === saved); }
+    }
+    loadGPUChoices(saved, limits, false);
+    const alternate = inputs.find(input => !input.disabled && Number(input.value) !== saved);
+    if (alternate) await click(alternate.id);
+    await click('global-settings-cancel'); await click('app-settings'); await click('global-tab-gpu');
+    check('取消 GPU 草稿還原已儲存容量', globalGPUMemoryMiB === saved);
+    await capture('gpu-memory-capsules.png');
+  }
   async function checkOpenGLPreferences() {
     await click('global-tab-cpu');
     check('CPU 分頁提供兩種架構與 resident AOT 模式', !$('global-cpu').hidden && $('global-gpu').hidden && $('execution-mode').textContent.includes('Resident AOT') && $('global-cpu').textContent.includes('x86'));
     const originalCores = {x64: state.globalSettings.cpuCoresX64, x86: state.globalSettings.cpuCoresX86};
-    const compiler = $('compiler-workers');
-    check('編譯執行緒預設 2 且可調 0–8', state.globalSettings.compilerWorkers === 2 && compiler.min === '0' && compiler.max === '8' && compiler.step === '1');
+    check('編譯執行緒設定與說明已移除', !document.querySelector('#compiler-workers, #compiler-workers-value, #compiler-workers-help, label[for="compiler-workers"]'));
+    const originalWorkers = state.globalSettings.compilerWorkers;
     for (const value of [0, 4, 8, 2]) {
-      compiler.value = value; compiler.dispatchEvent(new Event('input'));
-      const label = value ? t`${value.toLocaleString(currentLanguage)} 個執行緒` : t('同步編譯');
-      check(`編譯執行緒 ${value} 即時顯示`, $('compiler-workers-value').textContent === label && compiler.getAttribute('aria-valuetext') === label);
-      await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存編譯執行緒');
-      check(`編譯執行緒儲存 ${value}`, state.globalSettings.compilerWorkers === value);
+      await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, compilerWorkers: value}})));
       await click('app-settings-close'); await click('app-settings'); await click('global-tab-cpu');
-      check(`編譯執行緒重新開啟 ${value}`, Number(compiler.value) === value);
+      await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存 CPU 設定');
+      check(`儲存其他設定保留既有編譯執行緒數 ${value}`, state.globalSettings.compilerWorkers === value);
+      await click('global-settings-cancel'); await click('app-settings'); await click('global-tab-cpu');
+      check(`取消其他設定保留既有編譯執行緒數 ${value}`, state.globalSettings.compilerWorkers === value);
     }
-    compiler.value = 0; compiler.dispatchEvent(new Event('input'));
-    await click('global-settings-cancel'); await click('app-settings'); await click('global-tab-cpu');
-    check('取消保留原編譯執行緒設定', Number(compiler.value) === 2 && state.globalSettings.compilerWorkers === 2);
+    await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, compilerWorkers: originalWorkers}})));
+    const savedCores = {};
     for (const architecture of ['x64', 'x86']) {
-      const id = 'cpu-cores-' + architecture, input = $(id), maximum = state.cpuLimits[architecture + 'Max'];
-      check(`${architecture} 核心滑桿每格 1 且不超過宿主實體核心`, input.type === 'range' && input.min === '1' && input.step === '1' && Number(input.max) === maximum && maximum <= state.cpuLimits.physicalCores && !input.disabled);
-      input.value = '1'; input.stepUp(); input.dispatchEvent(new Event('input'));
-      check(`${architecture} 核心數與無障礙文字即時更新`, Number(input.value) === Math.min(2, maximum) && $(id + '-value').textContent === t`${Number(input.value).toLocaleString(currentLanguage)} 個核心` && input.getAttribute('aria-valuetext') === $(id + '-value').textContent);
-      for (const value of [1, maximum]) {
-        input.value = value; input.dispatchEvent(new Event('input'));
+      const id = 'cpu-cores-' + architecture, maximum = state.cpuLimits[architecture + 'Max'];
+      const inputs = [...document.querySelectorAll(`input[name="${id}"]`)];
+      check(`${architecture} 提供 2、4、6 個核心的互斥膠囊`, inputs.length === 3 && inputs.map(input => input.value).join(',') === '2,4,6' && inputs.every(input => input.type === 'radio') && !$(id).querySelector('input[type="range"]'));
+      check(`${architecture} 停用超過宿主核心數的選項`, inputs.every(input => input.disabled === (Number(input.value) > maximum)));
+      for (const input of inputs.filter(input => !input.disabled)) {
+        await click(input.id);
+        const value = Number(input.value);
+        check(`${architecture} ${value} 個核心互斥且更新提示`, inputs.filter(input => input.checked).length === 1 && $(id + '-value').textContent === t`${value.toLocaleString(currentLanguage)} 個核心` && $(id + '-warning').hidden === (value <= 2));
         await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存 CPU 核心數');
-        check(`${architecture} 核心數儲存邊界 ${value}`, state.globalSettings['cpuCores' + architecture.toUpperCase()] === value);
+        check(`${architecture} 膠囊儲存 ${value}`, state.globalSettings['cpuCores' + architecture.toUpperCase()] === value);
         await click('app-settings-close'); await click('app-settings'); await click('global-tab-cpu');
-        check(`${architecture} 核心數重新開啟 ${value}`, Number(input.value) === value);
+        check(`${architecture} 膠囊重新開啟 ${value}`, input.checked);
       }
-      input.value = maximum + 1; input.dispatchEvent(new Event('input'));
-      check(`${architecture} 滑桿不接受超限核心數`, Number(input.value) === maximum);
+      savedCores[architecture] = state.globalSettings['cpuCores' + architecture.toUpperCase()];
     }
-    await capture('cpu-settings.png');
-    for (const architecture of ['x64', 'x86']) $('cpu-cores-' + architecture).value = 1;
+    for (const architecture of ['x64', 'x86']) if (!$('cpu-cores-' + architecture + '-2').disabled) await click('cpu-cores-' + architecture + '-2');
     await click('global-settings-cancel'); await click('app-settings'); await click('global-tab-cpu');
-    check('取消不儲存兩種架構的核心草稿', Number($('cpu-cores-x64').value) === state.cpuLimits.x64Max && Number($('cpu-cores-x86').value) === state.cpuLimits.x86Max);
-    for (const architecture of ['x64', 'x86']) $('cpu-cores-' + architecture).value = originalCores[architecture];
-    await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '還原 CPU 預設');
+    check('取消不儲存兩種架構的核心草稿', ['x64', 'x86'].every(architecture => globalCPUSelections[architecture] === savedCores[architecture]));
+    loadCPUChoices(state.globalSettings, {...state.cpuLimits, x64Max: 3, x86Max: 1});
+    check('低核心宿主停用無法使用的膠囊', !$('cpu-cores-x64-2').disabled && $('cpu-cores-x64-4').disabled && $('cpu-cores-x64-6').disabled && [...document.querySelectorAll('input[name="cpu-cores-x86"]')].every(input => input.disabled));
+    const beforeDisabledClick = globalCPUSelections.x86;
+    $('cpu-cores-x86-6').click();
+    check('停用選項無法改變核心數', globalCPUSelections.x86 === beforeDisabledClick);
+    await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, cpuCoresX64: 1, cpuCoresX86: 1}})));
+    await click('app-settings-close'); await click('app-settings'); await click('global-tab-cpu');
+    check('既有非膠囊核心數仍顯示且不自動選取', ['x64', 'x86'].every(architecture => globalCPUSelections[architecture] === 1 && !document.querySelector(`input[name="cpu-cores-${architecture}"]:checked`)));
+    await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '保留既有核心數');
+    check('儲存其他設定保留既有單核心', state.globalSettings.cpuCoresX64 === 1 && state.globalSettings.cpuCoresX86 === 1);
+    await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, cpuCoresX64: originalCores.x64, cpuCoresX86: originalCores.x86}})));
+    await click('app-settings-close'); await click('app-settings'); await click('global-tab-cpu');
+    await capture('cpu-settings.png');
     await click('global-tab-gpu');
-    check('GPU 分頁集中繪圖設定', !$('global-gpu').hidden && $('opengl-backend').closest('[role=tabpanel]').id === 'global-gpu' && $('gpu-memory').closest('[role=tabpanel]').id === 'global-gpu' && !$('global-advanced').querySelector('#opengl-backend'));
-    check('OpenGL 預設 auto 與三種選項', $('opengl-backend').value === 'auto' && [...$('opengl-backend').options].map(o => o.value).join(',') === 'auto,metal,legacy');
-    for (const mode of ['metal', 'legacy', 'auto']) {
-      $('opengl-backend').value = mode; await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存 OpenGL 後端');
-      check('OpenGL 儲存 ' + mode, state.globalSettings.openGLBackend === mode);
-      await click('app-settings-close'); await click('app-settings'); await click('global-tab-gpu');
-      check('OpenGL 重新開啟 ' + mode, $('opengl-backend').value === mode);
+    check('GPU 分頁已移除 OpenGL 選單並固定 AUTO', !$('global-gpu').hidden && !$('opengl-backend') && state.globalSettings.openGLBackend === 'auto');
+    for (const mode of ['metal', 'legacy']) {
+      await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, openGLBackend: mode}})));
+      check(`舊 OpenGL 設定 ${mode} 回到 AUTO`, state.globalSettings.openGLBackend === 'auto');
     }
-    $('opengl-backend').value = 'legacy'; await click('global-settings-cancel'); await click('app-settings'); await click('global-tab-gpu');
-    check('取消保留 OpenGL auto', $('opengl-backend').value === 'auto');
-    const rect = $('opengl-backend').getBoundingClientRect();
-    check('OpenGL 選單在設定頁範圍內', rect.width > 0 && rect.right <= $('app-settings-dialog').getBoundingClientRect().right);
-    await capture('opengl-settings.png');
+    await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存固定 AUTO');
+    check('儲存其他設定仍使用 AUTO', state.globalSettings.openGLBackend === 'auto');
     await click('global-tab-advanced');
     await checkCertificateRootPreferences();
   }
@@ -113,36 +240,104 @@
   }
   try {
     await window.launcherReady;
-    if (smokeConfig.scenario === 'settings' && smokeConfig.settingsTest === 'cpu-defaults') {
-      check('新設定預設 x86 雙核與 2 個編譯 worker', state.globalSettings.cpuCoresX86 === Math.min(2, state.cpuLimits.x86Max) && state.globalSettings.compilerWorkers === 2);
-      await click('app-settings'); await click('global-tab-cpu');
-      for (const workers of [0, 4, 2]) {
-        $('compiler-workers').value = workers; $('compiler-workers').dispatchEvent(new Event('input'));
-        await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存編譯 worker');
-        await click('app-settings-close'); await click('app-settings'); await click('global-tab-cpu');
-        check(`遵守 UI 明確設定的 ${workers} 個編譯 worker`, state.globalSettings.compilerWorkers === workers && Number($('compiler-workers').value) === workers);
+    if (smokeConfig.scenario === 'settings' && smokeConfig.settingsTest === 'startup') {
+      await delay(1000);
+      await api('smokeResult', {result:{passed:true,checks:['正常啟動角色載入主畫面且不操作對話框'],captures:[],state}});
+      return;
+    }
+    if (smokeConfig.scenario === 'settings' && ['order-save','order-reload'].includes(smokeConfig.settingsTest)) {
+      const reload = smokeConfig.settingsTest === 'order-reload';
+      if (!reload) {
+        await api('smokePick', {paths:smokeConfig.programs}); await click('add');
+        while ($('analysis-dialog').open) await click('analysis-cancel');
+        const ids = state.programs.map(p=>p.id), selection = state.selected;
+        async function drag(source, target, after) {
+          const from=document.querySelector(`[data-id="${source}"] .select-program`);
+          const to=document.querySelector(`[data-id="${target}"]`), box=to.getBoundingClientRect();
+          const transfer=new DataTransfer(), options={bubbles:true,cancelable:true,dataTransfer:transfer,clientX:box.left+30,clientY:after?box.bottom-5:box.top+5};
+          check('程式項目可拖曳',from.draggable);
+          from.dispatchEvent(new DragEvent('dragstart',options));
+          to.dispatchEvent(new DragEvent('dragover',options));
+          check('插入位置有提示',to.classList.contains(after?'drop-after':'drop-before'));
+          to.dispatchEvent(new DragEvent('drop',options));
+          from.dispatchEvent(new DragEvent('dragend',options));
+          await until(()=>!busy,'保存拖曳順序');
+        }
+        await drag(ids[2],ids[0],false);
+        check('向上拖曳保存順序',state.programs.map(p=>p.id).join() === [ids[2],ids[0],ids[1]].join());
+        await drag(ids[2],ids[1],true);
+        check('向下拖曳保存順序',state.programs.map(p=>p.id).join() === ids.join());
+        $('search').value='visible'; $('search').dispatchEvent(new Event('input'));
+        await drag(ids[2],ids[0],false);
+        check('篩選排序保留隱藏程式',state.programs.map(p=>p.id).join() === [ids[2],ids[0],ids[1]].join());
+        $('search').value=''; $('search').dispatchEvent(new Event('input'));
+        check('拖曳不改變選取程式',state.selected===selection);
+        check('拖曳不會啟動程式',state.programs.every(p=>!active(p)));
       }
+      check('列表順序符合保存結果',state.programs.map(p=>p.name).join() === 'visible-c.exe,visible-a.exe,hidden-b.exe');
+      await capture(reload?'library-order-reloaded.png':'library-order.png');
+      await api('smokeResult',{result:{passed:true,checks,captures,state}}); return;
+    }
+    if (smokeConfig.scenario === 'settings' && ['install-discovery','install-reload'].includes(smokeConfig.settingsTest)) {
+      const reload=smokeConfig.settingsTest==='install-reload';
+      if (!reload) {
+        await api('smokePick',{paths:smokeConfig.programs}); await click('add');
+        while ($('analysis-dialog').open) await click('analysis-cancel');
+        await click('app-settings'); await click('global-tab-advanced'); await click('global-add-drive');
+        const row=[...document.querySelectorAll('.global-drive-row')].find(row=>row.querySelector('.drive-letter')?.value==='D');
+        row.querySelector('.drive-path').value=smokeConfig.output+'/drive-d';
+        await click('global-settings-save'); await until(()=>!$('global-settings-save').disabled,'儲存測試磁碟'); await click('app-settings-close');
+        await click('tab-settings'); $('install-root').value=smokeConfig.output+'/install-root'; $('install-root').dispatchEvent(new Event('input',{bubbles:true}));
+        await click('save'); const id=selected().id;
+        await click('run'); await until(()=>['exited','failed'].includes(state.programs.find(p=>p.id===id)?.status),'安裝完成與探索',90000);
+        const installer=state.programs.find(p=>p.id===id);
+        check('Windows 安裝測試程式成功退出',installer.status==='exited' && installer.exitCode===0,JSON.stringify(installer));
+        check('安裝結束自動加入且不切換目前程式',state.selected===id && state.programs.length===4,JSON.stringify(state.programs));
+      }
+      const installed=state.programs.filter(p=>!p.path.endsWith('setup-discovery.exe'));
+      check('捷徑、無捷徑目錄與登錄安裝各加入一個程式',installed.length===3 && installed.some(p=>p.path.endsWith('installed.exe')) && installed.some(p=>p.path.endsWith('secondary.exe')) && installed.some(p=>p.path.endsWith('custom.exe')));
+      check('不加入解除安裝工具',!state.programs.some(p=>p.path.endsWith('uninstall.exe')));
+      const target=installed.find(p=>p.path.endsWith('installed.exe'));
+      check('保留 Unicode 捷徑名稱、參數與安裝映射',target.name==='測試應用程式' && target.arguments==='--from-shortcut' && target.workDir.endsWith('測試產品') && target.installRoot.endsWith('install-root') && target.cDrive===state.globalSettings.cDrive,JSON.stringify(target));
+      await capture(reload?'installed-library-reloaded.png':'installed-library.png');
+      if(reload) {
+        await choose(target.id); await click('run'); await until(()=>selected().status==='exited' || selected().status==='failed','啟動已安裝程式');
+        if(selected().status==='exited' && selected().exitCode===0) await until(()=>text(target.id).includes('installed-payload-ok'),'已安裝程式輸出');
+        check('重開後可從列表啟動且收到捷徑參數',selected().status==='exited' && selected().exitCode===0 && text(target.id).includes('installed-payload-ok'),JSON.stringify(selected()));
+        check('啟動已安裝程式不重複加入',state.programs.length===4);
+      }
+      await api('smokeResult',{result:{passed:true,checks,captures,state}}); return;
+    }
+    if (smokeConfig.scenario === 'settings' && smokeConfig.settingsTest === 'cpu-defaults') {
+      check('新設定預設 x86／x64 四核與 2 個編譯 worker', state.globalSettings.cpuCoresX64 === Math.min(4, state.cpuLimits.x64Max) && state.globalSettings.cpuCoresX86 === Math.min(4, state.cpuLimits.x86Max) && state.globalSettings.compilerWorkers === 2);
+      await click('app-settings'); await click('global-tab-cpu');
+      check('CPU 分頁已移除編譯執行緒設定', !$('compiler-workers') && !$('compiler-workers-help'));
+      await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存 CPU 預設');
+      check('儲存 CPU 設定仍保留預設編譯執行緒數', state.globalSettings.compilerWorkers === 2);
       for (const architecture of ['x64', 'x86']) {
-        const id = 'cpu-cores-' + architecture, maximum = state.cpuLimits[architecture + 'Max'];
-        for (const value of [1, Math.min(2, maximum), Math.min(3, maximum)]) {
-          $(id).value = value; $(id).dispatchEvent(new Event('input'));
-          check(`${architecture} ${value} 核依門檻顯示提示`, $(id + '-warning').hidden === (value <= 2));
+        const id = 'cpu-cores-' + architecture;
+        for (const input of document.querySelectorAll(`input[name="${id}"]`)) {
+          if (input.disabled) continue;
+          await click(input.id);
+          check(`${architecture} ${input.value} 核依門檻顯示提示`, $(id + '-warning').hidden === (Number(input.value) <= 2));
         }
       }
       await capture('cpu-core-warning.png');
-      await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存超過雙核設定');
-      check('提示不阻擋儲存超過雙核的設定', state.globalSettings.cpuCoresX86 === Math.min(3, state.cpuLimits.x86Max));
+      await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存膠囊核心設定');
+      const expectedGlobalX86 = [6, 4, 2].find(value => value <= state.cpuLimits.x86Max) || 1;
+      check('提示不阻擋儲存膠囊核心設定', state.globalSettings.cpuCoresX86 === expectedGlobalX86);
       await click('app-settings-close');
       await api('smokePick', { paths: smokeConfig.programs }); await click('add');
       await choose(state.programs[0].id); await click('tab-settings');
       const maximum = state.cpuLimits[selected().architecture === 'x86' ? 'x86Max' : 'x64Max'];
-      for (const value of [0, Math.min(2, maximum), Math.min(3, maximum)]) {
-        $('program-cpu-cores').value = value; $('program-cpu-cores').dispatchEvent(new Event('input', { bubbles: true }));
-        check(`個別程式 ${value} 核依有效值顯示提示`, $('program-cpu-warning').hidden === ((value || Math.min(3, maximum)) <= 2));
+      const choices = [0, 2, 4, 6].filter(value => value <= maximum);
+      for (const value of choices) {
+        await click('program-cpu-cores-' + value);
+        check(`個別程式 ${value} 核依有效值顯示提示`, $('program-cpu-warning').hidden === ((value || expectedGlobalX86) <= 2));
       }
       await capture('program-core-warning.png');
       await click('save'); await until(() => !busy, '儲存個別程式核心數');
-      check('提示不阻擋個別程式保存設定', selected().cpuCores === Math.min(3, maximum));
+      check('提示不阻擋個別程式保存設定', selected().cpuCores === choices.at(-1));
       await api('smokeResult', { result: { passed: true, checks, captures, state } });
       return;
     }
@@ -150,28 +345,32 @@
       const reload = smokeConfig.settingsTest === 'gpu-reload';
       if (!reload) {
         await api('smokePick', { paths: smokeConfig.programs }); await click('add');
-        check('新程式採用 4 GiB 預設並遵守系統上限', state.programs.length === 2 && state.programs.every(p => p.gpuMemoryMiB === Math.min(4096, state.gpuMemoryLimits.maxMiB)));
+        check('新程式採用目前 GPU 預設並遵守系統上限', state.programs.length === 2 && state.programs.every(p => p.gpuMemoryMiB === state.gpuMemoryLimits.defaultMiB));
       }
-      const programs = [...state.programs], values = [3072, 1024];
+      const programs = [...state.programs], values = [6144, 4096].map(value => Math.min(value, state.gpuMemoryLimits.maxMiB));
       check('跨建置測試保留兩個程式', programs.length === 2);
       for (let i = 0; i < programs.length; ++i) {
-        await choose(programs[i].id); await click('app-settings'); await click('global-tab-cpu');
+        await choose(programs[i].id);
+        if (!reload) await checkProgramCPUCapsules();
+        await click('app-settings'); await click('global-tab-cpu');
         check('執行模式顯示 Resident AOT', $('execution-mode').textContent.includes('Resident AOT'));
         await click('global-tab-gpu');
         const memory = $('gpu-memory');
-        check('GPU 刻度為 512 MiB', Number(memory.step) === 512 && Number(memory.min) === 512);
+        check('GPU 提供四個互斥容量膠囊', [...memory.querySelectorAll('input')].map(input => input.value).join(',') === '4096,6144,8192,16384');
         if (!reload) {
-          memory.value = values[i]; memory.dispatchEvent(new Event('input', { bubbles: true }));
+          await checkGPUCapsules(programs[i]);
+          if ($('gpu-memory-' + values[i])) await click('gpu-memory-' + values[i]);
+          else loadGPUChoices(values[i], state.gpuMemoryLimits, false);
           await delay(200);
-          check('狀態輪詢不覆蓋 GPU 草稿', Number(memory.value) === values[i]);
+          check('狀態輪詢不覆蓋 GPU 草稿', globalGPUMemoryMiB === values[i]);
           await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '保存 GPU');
         }
-        check(`${reload ? '重新 BUILD 後' : '儲存後'}保留個別 GPU 容量`, Number(memory.value) === values[i] && selected().gpuMemoryMiB === values[i]);
+        check(`${reload ? '重新 BUILD 後' : '儲存後'}保留個別 GPU 容量`, globalGPUMemoryMiB === values[i] && selected().gpuMemoryMiB === values[i]);
         await click('app-settings-close'); await click('tab-settings'); await click('save');
         check('主設定儲存保留 GPU 容量', selected().gpuMemoryMiB === values[i]);
       }
       await choose(programs[0].id); await click('app-settings'); await click('global-tab-gpu');
-      check('切換程式及重開設定保留 GPU 容量', Number($('gpu-memory').value) === values[0]);
+      check('切換程式及重開設定保留 GPU 容量', globalGPUMemoryMiB === values[0]);
       await capture(reload ? 'gpu-after-build.png' : 'gpu-before-build.png');
       await click('app-settings-close');
       if (reload) {
@@ -192,24 +391,24 @@
     check('自動語言依系統偏好解析', resolveLanguage('auto', ['fr-FR', 'ja-JP']) === 'ja' && resolveLanguage('auto', ['zh-TW']) === 'zh-Hant' && resolveLanguage('auto', ['ko-KR']) === 'ko' && resolveLanguage('auto', ['de-DE']) === 'en');
     await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, language: 'zh-Hant', theme: 'forest'}})));
     await click('app-settings');
-    check('設定分頁包含 Windows 介面、CPU、GPU、實驗性功能與快取', [...document.querySelectorAll('[data-global-tab]')].map(button => button.dataset.globalTab).join(',') === 'general,advanced,windows,cpu,gpu,experimental,cache,about');
+    check('設定分頁包含 Windows 介面、CPU、GPU 與快取', [...document.querySelectorAll('[data-global-tab]')].map(button => button.dataset.globalTab).join(',') === 'general,advanced,windows,cpu,gpu,cache,about');
+    await checkSettingsDialogGeometry();
     await click('global-tab-cache'); await until(() => / GB$/.test($('cache-total').textContent), '快取用量');
-    check('快取分頁顯示 GB 總用量且每個項目有清除按鈕', !$('global-cache').hidden && $('global-general').hidden && /^\d+\.\d{2} GB$/.test($('cache-total').textContent) &&
-      [...document.querySelectorAll('#cache-list .cache-row')].every(row => row.dataset.cacheId && row.querySelector('button') && / GB$/.test(row.querySelector('output').textContent)));
-    await click('global-tab-experimental');
-    check('原生函式庫橋接層預設關閉', !$('global-experimental').hidden && !$('native-library-bridge').checked && !state.globalSettings.nativeLibraryBridge);
-    check('V8 原型預設關閉且可加入內建測試', !$('native-v8-bridge').checked && !state.globalSettings.nativeV8Bridge && $('add-native-v8-tests').disabled === !state.nativeV8TestsReady);
-    await click('native-library-bridge'); await click('global-settings-save');
-    await until(() => !$('global-settings-save').disabled, '儲存橋接層');
-    check('橋接層開關已保存', state.globalSettings.nativeLibraryBridge === true);
-    await click('app-settings-close'); await click('app-settings'); await click('global-tab-experimental');
-    check('重新開啟保留橋接層', $('native-library-bridge').checked);
-    await click('native-library-bridge'); await click('global-settings-cancel');
-    await click('app-settings'); await click('global-tab-experimental');
-    check('取消不改動橋接層設定', $('native-library-bridge').checked && state.globalSettings.nativeLibraryBridge === true);
-    await click('native-library-bridge'); await click('global-settings-save');
-    await until(() => !$('global-settings-save').disabled, '關閉橋接層');
-    check('橋接層可關閉', state.globalSettings.nativeLibraryBridge === false);
+    check('快取分頁顯示 GB 總用量且每個項目有刪除按鈕', !$('global-cache').hidden && $('global-general').hidden && /^\d+\.\d{2} GB$/.test($('cache-total').textContent) &&
+      [...document.querySelectorAll('#cache-list .cache-row')].every(row => row.dataset.cacheId && row.querySelector('button.cache-delete')?.textContent === t('刪除') && getComputedStyle(row.querySelector('button')).borderTopStyle !== 'none' && / GB$/.test(row.querySelector('output').textContent)));
+    await checkCacheActions();
+    check('實驗性功能頁面與控制項已移除', !document.querySelector('#global-tab-experimental, #global-experimental, #native-library-bridge, #native-v8-bridge, #add-native-v8-tests'));
+    await click('global-tab-gpu');
+    $('global-tab-gpu').dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', bubbles: true}));
+    check('鍵盤可由 GPU 直接切換快取', !$('global-cache').hidden && document.activeElement === $('global-tab-cache'));
+    const originalLibraryBridge = state.globalSettings.nativeLibraryBridge, originalV8 = state.globalSettings.nativeV8Bridge;
+    for (const value of [true, false]) {
+      await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, nativeLibraryBridge: value}})));
+      await click('app-settings-close'); await click('app-settings');
+      await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存其他設定');
+      check(`儲存其他設定保留既有橋接值 ${value}`, state.globalSettings.nativeLibraryBridge === value && state.globalSettings.nativeV8Bridge === originalV8);
+    }
+    await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, nativeLibraryBridge: originalLibraryBridge}})));
     await click('global-tab-general');
     check('未選取程式時停用個別 GPU 容量設定', $('gpu-memory').disabled);
     check('一般頁提供五個語言選項與五種配色', $('ui-language').options.length === 5 && $('ui-theme').options.length === 5);
@@ -309,34 +508,19 @@
     check('重複加入不增加列表', state.programs.length === 4);
     await click('tab-settings'); $('arguments').value = '--profile "中文設定"'; $('arguments').dispatchEvent(new Event('input', { bubbles: true }));
     await click('app-settings'); await click('global-tab-gpu');
-    check('GPU 記憶體預設為 4 GiB 且受系統上限限制', Number($('gpu-memory').value) === Math.min(4096, state.gpuMemoryLimits.maxMiB));
-    check('GPU 容量標示目前程式且移出程式設定頁', !$('gpu-memory').disabled && $('gpu-settings-program').textContent.includes(hello.name) && !$('settings').querySelector('#gpu-memory'));
-    const memory = $('gpu-memory'), limits = state.gpuMemoryLimits;
-    check('GPU 滑桿每格 512 MiB 且上限向下對齊系統 50%', memory.type === 'range' && Number(memory.min) === 512 && Number(memory.step) === 512 && Number(memory.max) === limits.maxMiB && limits.maxMiB * 1024 * 1024 <= limits.systemMemoryBytes / 2 && (limits.maxMiB + 512) * 1024 * 1024 > limits.systemMemoryBytes / 2);
-    memory.stepUp(); memory.dispatchEvent(new Event('input', { bubbles: true }));
-    check('滑桿調整一格即時更新容量與輔助文字', Number(memory.value) === Math.min(limits.defaultMiB + 512, limits.maxMiB) && memory.getAttribute('aria-valuetext') === $('gpu-memory-value').textContent);
-    await delay(200); check('狀態輪詢保留 GPU 滑桿草稿', Number(memory.value) === Math.min(limits.defaultMiB + 512, limits.maxMiB) && selected().gpuMemoryMiB === limits.defaultMiB);
-    memory.value = '1'; check('滑桿不低於最小 512 MiB', memory.value === '512');
-    memory.stepDown(); check('滑桿不能向下跨越最小容量', memory.value === '512');
-    memory.value = String(limits.maxMiB + 512); check('滑桿不能超過系統 50%', Number(memory.value) === limits.maxMiB);
-    for (const value of [16, 33, limits.maxMiB + 512]) {
-      let rejected = false;
-      try { await api('save', { id: hello.id, settings: { ...settingsFrom(selected()), gpuMemoryMiB: value } }); } catch (error) { rejected = error.message.includes('50%'); }
-      check(`後端拒絕無效 GPU 容量 ${value}`, rejected && selected().gpuMemoryMiB === state.gpuMemoryLimits.defaultMiB);
-    }
-    for (const value of [limits.minMiB, limits.maxMiB]) {
-      memory.value = value; memory.dispatchEvent(new Event('input', { bubbles: true }));
-      await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存 GPU 容量邊界');
-      check(`GPU 滑桿邊界 ${value} 獨立儲存`, selected().gpuMemoryMiB === value && state.programs.find(p => p.id === same.id).gpuMemoryMiB === state.gpuMemoryLimits.defaultMiB);
-    }
-    $('gpu-memory').value = '512'; memory.dispatchEvent(new Event('input', { bubbles: true }));
-    await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存個別 GPU 容量');
+    check('GPU 記憶體採用目前預設且受系統上限限制', globalGPUMemoryMiB === state.gpuMemoryLimits.defaultMiB);
+    check('GPU 已移除指定文字並保留膠囊與系統資訊', !$('gpu-memory').disabled && !$('gpu-settings-program') && !$('gpu-memory-help') && !$('gpu-memory').querySelector('legend') && !$('settings').querySelector('#gpu-memory'));
+    await checkGPUCapsules(hello);
+    // 保留舊版有效自訂容量，不因控制項改版而覆寫。
+    await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: state.globalSettings, id: hello.id, settings: {gpuMemoryMiB: 512}})));
+    await click('app-settings-close'); await click('app-settings'); await click('global-tab-gpu');
+    check('既有非膠囊容量仍顯示且不自動選取', globalGPUMemoryMiB === 512 && !document.querySelector('input[name="gpu-memory"]:checked'));
+    await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '保留既有 GPU 容量');
     check('GPU 容量獨立儲存', selected().gpuMemoryMiB === 512 && state.programs.find(p => p.id === same.id).gpuMemoryMiB === state.gpuMemoryLimits.defaultMiB);
     check('GPU 儲存保留未儲存的啟動參數草稿', selected().arguments === '' && $('arguments').value === '--profile "中文設定"');
-    await click('app-settings-close'); await click('app-settings'); await click('global-tab-gpu');
-    check('重新開啟 GPU 分頁保留容量', $('gpu-memory').value === '512');
-    await capture('gpu-memory-slider.png');
-    $('gpu-memory').value = '1024'; $('opengl-backend').value = 'legacy'; await click('global-settings-cancel');
+    await capture('gpu-memory-capsules.png');
+    if (!$('gpu-memory-4096').disabled) await click('gpu-memory-4096');
+    await click('global-settings-cancel');
     check('取消 GPU 設定不改已保存容量或主畫面草稿', selected().gpuMemoryMiB === 512 && state.globalSettings.openGLBackend === 'auto' && readSettings().gpuMemoryMiB === 512 && $('arguments').value === '--profile "中文設定"');
     await click('save'); check('設定儲存回傳正確', selected().arguments === '--profile "中文設定"');
     check('另一同名 EXE 設定不受影響', state.programs.find(p => p.id === same.id).arguments === '');

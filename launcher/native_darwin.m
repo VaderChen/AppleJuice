@@ -5,6 +5,7 @@
 #import <CoreText/CoreText.h>
 #include <termios.h>
 #include <sys/sysctl.h>
+#include <dlfcn.h>
 
 uint64_t launcher_physical_memory(void) {
     return NSProcessInfo.processInfo.physicalMemory;
@@ -101,6 +102,69 @@ void launcher_close_background_window(void) {
 uint32_t launcher_background_display_id(void) {
     return [backgroundScreen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
 }
+// 正常啟動固定主螢幕；Smoke 僅使用主螢幕的第二個一般桌面，且不取得焦點。
+static NSWindow *primaryWindow;
+static BOOL testingWindow;
+static BOOL normalStartupWindow;
+static NSString *testingSpaceUUID;
+static uint64_t primarySpaceID;
+static int spaceConnection;
+static void (*moveToSpace)(int,CFArrayRef,uint64_t);
+static CFArrayRef (*copyWindowSpaces)(int,int,CFArrayRef);
+static BOOL verifyPrimarySpace(NSWindow *window) {
+    if (!primarySpaceID) return !testingWindow;
+    NSArray *ids=@[@(window.windowNumber)];
+    NSArray *membership=CFBridgingRelease(copyWindowSpaces(spaceConnection,7,(__bridge CFArrayRef)ids));
+    if([membership isEqual:@[@(primarySpaceID)]])return YES;
+    moveToSpace(spaceConnection,(__bridge CFArrayRef)ids,primarySpaceID);
+    membership=CFBridgingRelease(copyWindowSpaces(spaceConnection,7,(__bridge CFArrayRef)ids));
+    return [membership isEqual:@[@(primarySpaceID)]];
+}
+void *launcher_primary_window(int testing) {
+    [NSApplication sharedApplication];
+    testingWindow=(testing&1)!=0;normalStartupWindow=!testingWindow || (testing&2)!=0;testingSpaceUUID=nil;primarySpaceID=0;
+    NSScreen *screen=NSScreen.screens.firstObject;
+    if(!screen)return NULL;
+    void *library=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_LAZY);
+    int (*mainConnection)(void)=library?dlsym(library,"SLSMainConnectionID"):NULL;
+    CFArrayRef (*displaySpaces)(int)=library?dlsym(library,"SLSCopyManagedDisplaySpaces"):NULL;
+    moveToSpace=library?dlsym(library,"SLSMoveWindowsToManagedSpace"):NULL;
+    copyWindowSpaces=library?dlsym(library,"SLSCopySpacesForWindows"):NULL;
+    if(mainConnection && displaySpaces && moveToSpace && copyWindowSpaces) {
+        spaceConnection=mainConnection();
+        NSArray *topology=CFBridgingRelease(displaySpaces(spaceConnection));
+        CFUUIDRef uuid=CGDisplayCreateUUIDFromDisplayID([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
+        NSString *displayUUID=uuid?CFBridgingRelease(CFUUIDCreateString(NULL,uuid)):nil;
+        if(uuid)CFRelease(uuid);
+        for(NSDictionary *display in topology) {
+            if(![display[@"Display Identifier"] isEqual:displayUUID] && ![display[@"Display Identifier"] isEqual:@"Main"])continue;
+            NSMutableArray *desktops=[NSMutableArray array];
+            for(NSDictionary *space in display[@"Spaces"])if([space[@"type"] intValue]==0)[desktops addObject:space];
+            if(desktops.count<(testingWindow?2U:1U))return NULL;
+            NSDictionary *target=desktops[testingWindow?1:0];
+            if(testingWindow)testingSpaceUUID=target[@"uuid"];
+            primarySpaceID=[target[@"id64"] unsignedLongLongValue];break;
+        }
+    }
+    if(testingWindow && (!primarySpaceID || !testingSpaceUUID.length))return NULL;
+    [NSApp setActivationPolicy:normalStartupWindow?NSApplicationActivationPolicyRegular:NSApplicationActivationPolicyAccessory];
+    primaryWindow=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,1180,800)
+        styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable
+        backing:NSBackingStoreBuffered defer:NO screen:screen];
+    primaryWindow.releasedWhenClosed=NO;
+    primaryWindow.restorable=NO;
+    // 正常啟動探針沿用目前桌面的真實路徑，只將本程序視窗透明化以免佔用使用者畫面。
+    if(testing&2){primaryWindow.alphaValue=0;primaryWindow.ignoresMouseEvents=YES;}
+    if(!verifyPrimarySpace(primaryWindow)){[primaryWindow close];primaryWindow=nil;return NULL;}
+    fprintf(stderr,"launcher_window_placement testing=%d display=%u space=%llu window=%ld verified=1 no_activate=1\n",testingWindow,[screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue],(unsigned long long)primarySpaceID,(long)primaryWindow.windowNumber);
+    return (__bridge void *)primaryWindow;
+}
+void launcher_close_primary_window(void) {primaryWindow.delegate=nil;[primaryWindow close];primaryWindow=nil;}
+char *launcher_window_space_uuid(void) {
+    if(testingWindow)return strdup(testingSpaceUUID.UTF8String?:"");
+    // 桌面 1 可能沒有 UUID，交由共用平台層依目前拓樸解析主桌面。
+    return strdup(primaryWindow?"@primary":"");
+}
 static WKWebView *findWebView(NSView *view) {
     if([view isKindOfClass:WKWebView.class])return (WKWebView *)view;
     for(NSView *child in view.subviews){WKWebView *found=findWebView(child);if(found)return found;}
@@ -137,7 +201,13 @@ static WKWebView *findWebView(NSView *view) {
 @implementation LauncherNavigationDelegate
 - (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)action decisionHandler:(void (^)(WKNavigationActionPolicy))handler {
     NSString *url=action.request.URL.absoluteString;
-    // Go bridge 只供內嵌程式使用；拖放檔案或外部連結不能載入另一個頁面。
+    // 使用者點擊的 HTTP(S) 連結交給預設瀏覽器；Go bridge 永不提供給外部網頁。
+    if(action.navigationType==WKNavigationTypeLinkActivated &&
+       ([@"https" isEqualToString:action.request.URL.scheme] || [@"http" isEqualToString:action.request.URL.scheme])) {
+        handler(WKNavigationActionPolicyCancel);
+        [NSWorkspace.sharedWorkspace openURL:action.request.URL];
+        return;
+    }
     handler(!url || [url isEqualToString:@"about:blank"] ? WKNavigationActionPolicyAllow : WKNavigationActionPolicyCancel);
 }
 - (BOOL)respondsToSelector:(SEL)selector {return [super respondsToSelector:selector] || [self.previous respondsToSelector:selector];}
@@ -173,7 +243,7 @@ char *launcher_pick(int folder,int probe,const char *title,int single) {
 }
 void launcher_configure(void *pointer) {
     NSWindow *window=(__bridge NSWindow *)pointer;launcherWindow=window;
-    [NSApp setActivationPolicy:backgroundScreen?NSApplicationActivationPolicyAccessory:NSApplicationActivationPolicyRegular];
+    [NSApp setActivationPolicy:(backgroundScreen||!normalStartupWindow)?NSApplicationActivationPolicyAccessory:NSApplicationActivationPolicyRegular];
     window.appearance=[NSAppearance appearanceNamed:NSAppearanceNameAqua];window.backgroundColor=[NSColor colorWithWhite:0.97 alpha:1];
     LauncherWindowDelegate *delegate=[LauncherWindowDelegate new];delegate.previous=window.delegate;window.delegate=delegate;
     objc_setAssociatedObject(window,@selector(windowShouldClose:),delegate,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -188,13 +258,20 @@ void launcher_configure(void *pointer) {
     NSArray *keys=@[@"z",@"Z",@"x",@"c",@"v",@"a"];
     for(NSUInteger i=0;i<labels.count;i++)[edit.submenu addItemWithTitle:labels[i] action:NSSelectorFromString(actions[i]) keyEquivalent:keys[i]];
     NSApp.mainMenu=menu;
-    if(backgroundScreen) {
-        NSRect screen=backgroundScreen.visibleFrame,frame=window.frame;
+    {
+        NSScreen *targetScreen=backgroundScreen?:NSScreen.screens.firstObject;
+        NSRect screen=targetScreen.visibleFrame,frame=window.frame;
         frame.size.width=MIN(frame.size.width,screen.size.width-40);
         frame.size.height=MIN(frame.size.height,screen.size.height-40);
         frame.origin=NSMakePoint(NSMidX(screen)-frame.size.width/2,NSMidY(screen)-frame.size.height/2);
-        [window setFrame:frame display:YES];[window orderFront:nil];
-    } else {[window center];[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}
+        [window setFrame:frame display:NO];
+        if(primaryWindow && !verifyPrimarySpace(window)){[window orderOut:nil];return;}
+        // 啟動僅呈現視窗；不強制啟用 App，避免 Dock 的歷史狀態切換使用者桌面。
+        if(normalStartupWindow)[window orderWindow:NSWindowBelow relativeTo:0];
+        else [window orderFront:nil];
+        if(primaryWindow && !verifyPrimarySpace(window)){[window orderOut:nil];return;}
+        fprintf(stderr,"launcher_window_presented testing=%d normal_startup=%d policy=%ld active=%d no_activate=1\n",testingWindow,normalStartupWindow,(long)NSApp.activationPolicy,NSApp.active);
+    }
 }
 void launcher_running(int count){runningCount=count;}
 void launcher_snapshot(void *pointer,const char *path) {
@@ -206,8 +283,19 @@ void launcher_snapshot(void *pointer,const char *path) {
     }];
 }
 int launcher_visible(int pid) {
-    NSArray *windows=CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly,kCGNullWindowID));
-    for(NSDictionary *row in windows){if([row[(id)kCGWindowOwnerPID] intValue]==pid && [row[(id)kCGWindowLayer] intValue]==0)return 1;}
+    // 本機測試的客體在桌面 2；從所有桌面核對 WindowServer 視窗及歸屬，不切換桌面。
+    NSArray *windows=CFBridgingRelease(CGWindowListCopyWindowInfo(testingWindow?kCGWindowListOptionAll:kCGWindowListOptionOnScreenOnly,kCGNullWindowID));
+    for(NSDictionary *row in windows){
+        if([row[(id)kCGWindowOwnerPID] intValue]!=pid || [row[(id)kCGWindowLayer] intValue]!=0 || [row[(id)kCGWindowAlpha] doubleValue]<=0)continue;
+        CGRect bounds;if(!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)row[(id)kCGWindowBounds],&bounds) || bounds.size.width<=1 || bounds.size.height<=1)continue;
+        if(testingWindow){
+            if(!primarySpaceID || !copyWindowSpaces)return 0;
+            NSArray *ids=@[row[(id)kCGWindowNumber]];
+            NSArray *membership=CFBridgingRelease(copyWindowSpaces(spaceConnection,7,(__bridge CFArrayRef)ids));
+            if(![membership containsObject:@(primarySpaceID)])continue;
+        }
+        return 1;
+    }
     return 0;
 }
 void launcher_alert(const char *text){@autoreleasepool{NSAlert *alert=[NSAlert new];alert.messageText=@"AppleJuice";alert.informativeText=[NSString stringWithUTF8String:text];[alert runModal];}}
@@ -215,3 +303,15 @@ void launcher_reveal(const char *path){[[NSWorkspace sharedWorkspace] activateFi
 int launcher_pty_utf8(int fd){struct termios settings;if(tcgetattr(fd,&settings)!=0)return -1;settings.c_iflag|=IUTF8;return tcsetattr(fd,TCSANOW,&settings);}
 // 移到垃圾桶並回傳新位置，讓更新失敗時可以移回原處。
 char* launcher_trash(const char *path){@autoreleasepool{NSURL *result=nil;NSURL *url=[NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];if(![[NSFileManager defaultManager] trashItemAtURL:url resultingItemURL:&result error:nil]||!result.path)return NULL;return strdup(result.path.fileSystemRepresentation);}}
+
+// Windows 捷徑沿用系統字碼頁轉換，不啟動外部程式或套用宿主環境變數。
+char *launcher_windows_text(const void *bytes, size_t size, uint32_t codepage) {
+    CFStringEncoding encoding=CFStringConvertWindowsCodepageToEncoding(codepage);
+    if(encoding==kCFStringEncodingInvalidId)return NULL;
+    CFStringRef value=CFStringCreateWithBytes(NULL,bytes,size,encoding,false);
+    if(!value)return NULL;
+    CFIndex length=CFStringGetMaximumSizeForEncoding(CFStringGetLength(value),kCFStringEncodingUTF8)+1;
+    char *result=malloc(length);
+    if(result && !CFStringGetCString(value,result,length,kCFStringEncodingUTF8)){free(result);result=NULL;}
+    CFRelease(value);return result;
+}

@@ -3,6 +3,8 @@
 #include "gdiplus_codecs.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
+#include "x64arm/windows_gdi_path.hpp"
+#include "x64arm/windows_transform.hpp"
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
@@ -14,6 +16,12 @@ namespace x64arm {
 // 點陣圖像素保留在客體記憶體（Scan0 由呼叫端提供或由此配置），繪製經共用 raster surface 合成。
 // 參考：https://learn.microsoft.com/windows/win32/gdiplus/-gdiplus-flatapi-flat
 struct GdiplusState {
+    struct Path {std::vector<GuiPathPoint> points;unsigned fill{};bool new_figure{true};};
+    struct Pen {std::uint32_t color{};double width{1};unsigned unit{},start_cap{},end_cap{},join{};};
+    std::map<std::uint64_t,Path> paths;
+    std::map<std::uint64_t,Pen> pens;
+    std::map<std::uint64_t,std::uint32_t> brushes;
+    std::map<std::uint64_t,unsigned> smoothing;
     // LockBits 期間的暫存區：格式相同時直接指向像素，否則轉換到暫存緩衝並於 UnlockBits 寫回。
     struct Lock {std::uint64_t buffer{};std::uint32_t mode{},format{};std::array<std::int32_t,4> rect{};std::int64_t stride{};bool owned{};};
     struct Bitmap {std::uint32_t width{},height{},format{};std::int64_t stride{};std::uint64_t scan0{};bool owned{};std::optional<Lock> lock{};};
@@ -68,7 +76,7 @@ std::span<const WindowsServiceDescriptor> gdiplus_service_descriptors(){
         {"gdiplus.dll","GdiplusNotificationHook",1},{"gdiplus.dll","GdiplusNotificationUnhook",1},
         {"gdiplus.dll","GdipAlloc",1},{"gdiplus.dll","GdipFree",1},
         {"gdiplus.dll","GdipCreateBitmapFromScan0",6},{"gdiplus.dll","GdipBitmapSetPixel",4},{"gdiplus.dll","GdipBitmapGetPixel",4},
-        {"gdiplus.dll","GdipCloneImage",2},{"gdiplus.dll","GdipDisposeImage",1},
+        {"gdiplus.dll","GdipCloneImage",2},{"gdiplus.dll","GdipDisposeImage",1},{"gdiplus.dll","GdipCreateHBITMAPFromBitmap",3},
         {"gdiplus.dll","GdipGetImageWidth",2},{"gdiplus.dll","GdipGetImageHeight",2},{"gdiplus.dll","GdipGetImagePixelFormat",2},
         {"gdiplus.dll","GdipCreateFromHDC",2},{"gdiplus.dll","GdipDeleteGraphics",1},
         {"gdiplus.dll","GdipDrawImageI",4},{"gdiplus.dll","GdipDrawImageRectI",6},
@@ -81,7 +89,18 @@ std::span<const WindowsServiceDescriptor> gdiplus_service_descriptors(){
         {"gdiplus.dll","GdipLoadImageFromFile",2},{"gdiplus.dll","GdipLoadImageFromFileICM",2},
         {"gdiplus.dll","GdipCreateBitmapFromFile",2},{"gdiplus.dll","GdipCreateBitmapFromFileICM",2},
         {"gdiplus.dll","GdipBitmapLockBits",5},{"gdiplus.dll","GdipBitmapUnlockBits",2},
-        {"gdiplus.dll","GdipGetImagePaletteSize",2},{"gdiplus.dll","GdipGetImagePalette",3},{"gdiplus.dll","GdipGetImageGraphicsContext",2}
+        {"gdiplus.dll","GdipGetImagePaletteSize",2},{"gdiplus.dll","GdipGetImagePalette",3},{"gdiplus.dll","GdipGetImageGraphicsContext",2},
+        {"gdiplus.dll","GdipCreateBitmapFromHBITMAP",3},
+        {"gdiplus.dll","GdipCreatePath",2},{"gdiplus.dll","GdipDeletePath",1},
+        {"gdiplus.dll","GdipAddPathLine",5},{"gdiplus.dll","GdipAddPathArc",7},{"gdiplus.dll","GdipClosePathFigure",1},
+        {"gdiplus.dll","GdipCreateSolidFill",2},{"gdiplus.dll","GdipCloneBrush",2},{"gdiplus.dll","GdipDeleteBrush",1},
+        {"gdiplus.dll","GdipCreatePen1",4},{"gdiplus.dll","GdipDeletePen",1},
+        {"gdiplus.dll","GdipSetPenStartCap",2},{"gdiplus.dll","GdipSetPenEndCap",2},{"gdiplus.dll","GdipSetPenLineJoin",2},
+        {"gdiplus.dll","GdipSetSmoothingMode",2},{"gdiplus.dll","GdipGetSmoothingMode",2},
+        {"gdiplus.dll","GdipFillPath",3},{"gdiplus.dll","GdipDrawPath",3},
+        {"gdiplus.dll","GdipFillRectangle",6},{"gdiplus.dll","GdipDrawRectangle",6},
+        {"gdiplus.dll","GdipFillEllipse",6},{"gdiplus.dll","GdipDrawEllipse",6},
+        {"gdiplus.dll","GdipFillPolygon",5},{"gdiplus.dll","GdipDrawLine",6},{"gdiplus.dll","GdipDrawLineI",6}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -117,6 +136,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
         if(symbol=="GdiplusNotificationHook"){if(!arg(0))return finish(invalid_parameter);memory.store(GuestAddress{arg(0)},pointer_bits,g.next_token++);return finish(ok);}
         if(symbol=="GdiplusNotificationUnhook")return finish(0);
         if(!g.startups)return finish(not_initialized);
+#include "gdiplus_vector_handlers.inc"
         if(symbol=="GdipGetImageEncodersSize" || symbol=="GdipGetImageDecodersSize"){
             if(!arg(0) || !arg(1))return finish(invalid_parameter);
             memory.check(GuestAddress{arg(0)},4,Access::Write);memory.check(GuestAddress{arg(1)},4,Access::Write);
@@ -198,6 +218,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
             if(format==rgb24)return 0xff000000U|static_cast<std::uint32_t>(memory.load(GuestAddress{at},16))|(static_cast<std::uint32_t>(memory.load(GuestAddress{at+2},8))<<16);
             const auto value=static_cast<std::uint32_t>(memory.load(GuestAddress{at},32));return format==rgb32?(value|0xff000000U):format==pargb32?unpremultiply(value):value;
         };
+        if(symbol=="GdipCreateHBITMAPFromBitmap"){
+            const auto* b=bitmap_of(arg(0));if(!b || !arg(1))return finish(invalid_parameter);if(b->lock)return finish(object_busy);
+            memory.check(GuestAddress{arg(1)},pointer_bits/8,Access::Write);memory.store(GuestAddress{arg(1)},pointer_bits,0);
+            const auto header=allocate_heap(memory,56);if(!header)return finish(out_of_memory);
+            memory.fill(GuestAddress{header},0,56);memory.store(GuestAddress{header},32,40);memory.store(GuestAddress{header+4},32,b->width);
+            memory.store(GuestAddress{header+8},32,static_cast<std::uint32_t>(-static_cast<std::int32_t>(b->height)));
+            memory.store(GuestAddress{header+12},16,1);memory.store(GuestAddress{header+14},16,32);
+            const auto dib=nested_service(state,memory,"gdi32.dll","CreateDIBSection",{0,header,0,header+48,0,0});
+            const auto bits=memory.load(GuestAddress{header+48},pointer_bits);release_handle(header);
+            if(!dib || !bits)return finish(out_of_memory);
+            try {
+                const auto background=u32(2);
+                for(std::uint32_t y=0;y<b->height;++y)for(std::uint32_t x=0;x<b->width;++x){
+                    const auto color=read_pixel(*b,x,y),alpha=color>>24;std::uint32_t pixel=0xff000000U;
+                    for(unsigned shift:{0U,8U,16U})pixel|=(((((color>>shift)&255U)*alpha+((background>>shift)&255U)*(255U-alpha)+127U)/255U)<<shift);
+                    memory.store(GuestAddress{bits+(static_cast<std::uint64_t>(y)*b->width+x)*4},32,pixel);
+                }
+                sync_raster_bitmap(memory,dib);
+                memory.store(GuestAddress{arg(1)},pointer_bits,dib);return finish(ok);
+            }catch(...){(void)nested_service(state,memory,"gdi32.dll","DeleteObject",{dib});throw;}
+        }
         if(symbol=="GdipSaveImageToFile" || symbol=="GdipSaveImageToStream"){
             const auto* b=bitmap_of(arg(0));if(!b || !arg(1) || !arg(2))return finish(invalid_parameter);if(b->lock)return finish(object_busy);
             const auto* codec=codec_of(arg(2));if(!codec)return finish(unknown_image_format);
@@ -327,6 +368,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
                 (void)nested_service(state,memory,"gdi32.dll","SelectObject",{image.dc,image.previous});(void)nested_service(state,memory,"gdi32.dll","DeleteObject",{image.dib});(void)nested_service(state,memory,"gdi32.dll","DeleteDC",{image.dc});
             }
             if(!g.graphics.erase(arg(0)))return finish(invalid_parameter);
+            g.smoothing.erase(arg(0));
             release_handle(arg(0));return finish(ok);
         }
         if(symbol=="GdipDrawImageI" || symbol=="GdipDrawImageRectI"){

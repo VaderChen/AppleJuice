@@ -92,6 +92,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_property_sheet(GuestState& 
             arg.return_to(state,0);return std::nullopt;
         }
         if(message==0x476){arg.return_to(state,sheet.pages[sheet.selected].window);return std::nullopt;}
+        // 屬性頁只接管自身的選頁／確認流程；圖示與一般視窗訊息沿用共用預設程序。
+        if(message!=0x110 && message!=0x465 && message!=0x111 && message!=0x10 && message!=0x46e){
+            start_callbacks(state,memory,{{resolve("user32.dll",wide?"DefWindowProcW":"DefWindowProcA").value,{handle,message,arg(2),arg(3)}}},Continuation::ReturnCallback);return std::nullopt;
+        }
         if(sheet.phase){arg.return_to(state,0);return std::nullopt;}
         const auto command=arg(2)&65535U;
         if(message==0x110){sheet.action=0;return advance_property_sheet(state,memory,handle,0);}
@@ -111,8 +115,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_property_sheet(GuestState& 
     const auto size=memory.load(GuestAddress{header},32);if(size<(x86_?40U:72U) || size>1024){fail(87);return std::nullopt;}memory.check(GuestAddress{header},static_cast<std::size_t>(size),Access::Read);
     const auto flags=memory.load(GuestAddress{header+4},32),count=memory.load(GuestAddress{header+(x86_?24:40)},32),owner=memory.load(GuestAddress{header+8},bits);
     // 一般 modal 支援描述陣列及 CreatePropertySheetPage 的 handle 陣列。
-    if(flags&~UINT64_C(0x02000288)){fail(50);return std::nullopt;}
+    if(flags&~UINT64_C(0x0200028e)){fail(50);return std::nullopt;}
+    if((flags&6U)==6U){fail(87);return std::nullopt;}
     if(!count || count>128 || (owner && !gui_.windows.contains(owner))){fail(87);return std::nullopt;}
+    std::uint64_t icon{};
+    if(flags&6U){
+        const auto source=memory.load(GuestAddress{header+(x86_?16:24)},bits);
+        icon=flags&2U?source:load_gui_icon(memory,memory.load(GuestAddress{header+(x86_?12:16)},bits),source,wide,16,16,false,false,false,0x8000U);
+        if(!icon || !gui_.icons.contains(icon)){fail(flags&2U?6:last_error_);return std::nullopt;}
+    }
     GuiPropertySheet sheet;sheet.wide=wide;sheet.target=static_cast<std::size_t>(memory.load(GuestAddress{header+(x86_?28:48)},32));if(sheet.target>=count)sheet.target=0;
     std::uint32_t width=360,height=200;auto address=memory.load(GuestAddress{header+(x86_?32:56)},bits);
     try {
@@ -138,6 +149,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_property_sheet(GuestState& 
         if(width>4096 || height>4096){release_gui_scratch(memory,state,sheet.scratch);fail(87);return std::nullopt;}
         sheet.notification=allocate_gui_scratch(memory,sheet.scratch,{},32);
         const auto handle=allocate_gui_window();GuiWindow root;root.dpi_context=effective_dpi_context();root.thread=threads_.current;root.dialog=true;root.modal=true;root.owner=owner;root.class_name=u"#32770";root.style=0x80c80000U;root.procedure=resolve("user32.dll",wide?"DefDlgProcW":"DefDlgProcA").value;root.extra.resize(40);root.title=text(memory.load(GuestAddress{header+(x86_?20:32)},bits));root.width=width+16;root.height=height+90;root.x=80;root.y=80;root.default_id=1;
+        root.window_icon=icon;root.window_small_icon=icon;
         std::vector<GuiWindowCreation> plans{{handle,root,wide}};
         const auto button=[&](std::uint32_t id,const std::u16string& title,std::uint32_t x,std::uint32_t y,std::uint32_t w,std::uint32_t style,bool enabled){GuiWindow child;child.dpi_context=effective_dpi_context();child.thread=threads_.current;child.parent=handle;child.id=id;child.title=title;child.class_name=child.control_class=u"button";child.builtin=true;child.procedure=stock_gui_proc(u"button",wide);child.style=0x50010000U|style;child.visible=true;gui_set_window_enabled(child,enabled);child.x=static_cast<std::int32_t>(x);child.y=static_cast<std::int32_t>(y);child.width=w;child.height=28;plans.push_back({allocate_gui_window(),child,wide});};
         std::uint32_t x=8,y=8;for(std::size_t i=0;i<sheet.pages.size();++i){const auto& title=sheet.pages[i].title;const auto measured=native_gui_?native_gui_->text_width(GuiFont{},title).value_or(static_cast<std::int32_t>(title.size()*8)):static_cast<std::int32_t>(title.size()*8);const auto w=static_cast<std::uint32_t>(std::clamp(measured+24,60,static_cast<int>(width)));if(x+w>width+8){x=8;y+=30;}button(static_cast<std::uint32_t>(0x5000+i),title,x,y,w,0x1003U,true);x+=w+2;}

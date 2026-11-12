@@ -5,6 +5,7 @@
  */
 #include "guest_crt_state.h"
 #include "crt_float_bits.h"
+#include "text_unicode.h"
 typedef __SIZE_TYPE__ Size;
 typedef __UINTPTR_TYPE__ Address;
 typedef unsigned char Byte;
@@ -14,6 +15,13 @@ typedef int (*Compare)(const void *, const void *);
 #define EXPORT __declspec(dllexport)
 #define INLINE static __attribute__((always_inline)) inline
 #include "guest_crt_format.h"
+
+EXPORT int guest_IsTextUnicode(const void *text,int length,int *tests){
+    unsigned flags=tests?(unsigned)*tests:0xffffU;
+    const int result=x64arm_text_unicode((const unsigned char*)text,length,&flags);
+    if(tests)*tests=(int)flags;return result;
+}
+EXPORT unsigned char guest_RtlIsTextUnicode(const void *text,int length,int *tests){return (unsigned char)guest_IsTextUnicode(text,length,tests);}
 
 EXPORT void (*volatile host_qsort)(void *, Size, Size, Compare);
 EXPORT void *(*volatile host_bsearch)(const void *, const void *, Size, Size, Compare);

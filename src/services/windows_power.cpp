@@ -76,9 +76,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_power(GuestState& state,Gue
                 result=previous;
             }
         }
-    }else if(symbol=="SetSystemPowerState") {
-        // 虛擬權杖的 privilege 集合為空；遵循 SE_SHUTDOWN_NAME 必須已啟用的契約。
-        fail(1314);
+    }else if(symbol=="SetSystemPowerState" || symbol=="SetSuspendState") {
+        initialize_tokens();
+        if(!runtime_.token_objects.at(effective_token_id()).has_privilege(19,true))fail(1314);
+        else if(!runtime_.network.external_io)fail(5);
+        else {const auto error=native_suspend_system(symbol=="SetSuspendState"?bool(arg(0)&255):!arg(0),symbol=="SetSuspendState" && (arg(2)&255));if(error)fail(error);else result=1;}
     }else if(symbol=="CallNtPowerInformation" || symbol=="GetPwrCapabilities"){
         const bool capability=symbol=="GetPwrCapabilities";
         const auto finish=[&](std::uint32_t status){

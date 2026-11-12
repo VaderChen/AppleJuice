@@ -1,4 +1,6 @@
 #pragma once
+#include <variant>
+#include <tuple>
 #include <iosfwd>
 #include "x64arm/host_services.hpp"
 #include <atomic>
@@ -97,6 +99,7 @@ struct DirectMLState;
 struct XessState;
 struct PmrState;
 struct WebView2State;
+struct WebBrowserState;
 struct D3D12State;
 struct DXCoreState;
 struct MsxmlState;
@@ -928,6 +931,7 @@ private:
     std::shared_ptr<XessState> xess_;
     std::shared_ptr<PmrState> msvcp_pmr_;
     std::shared_ptr<WebView2State> webview2_;
+    std::shared_ptr<WebBrowserState> webbrowser_;
     std::shared_ptr<D3D12State> d3d12_;
     // D3D12 提交執行緒（見 windows_d3d12.cpp 的 D3D12Submitter）：第一個裝置建立時啟動，在主體成員之後宣告以最先結束。
     void d3d12_start_submitter(GuestMemory&);
@@ -949,6 +953,9 @@ private:
     std::uint64_t d3d12_device_of(std::uint64_t object) const;
     bool d3d12_resource_width(std::uint64_t resource,std::uint64_t& width) const;
     std::optional<std::uint32_t> invoke_webview2(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_webbrowser(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    bool begin_webbrowser_com(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    void queue_webbrowser_event(const GuiMessage&);
     std::optional<std::uint32_t> invoke_opencl(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_vulkan(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     // Vulkan 命令錄製等熱點呼叫可在 worker 上執行（見 windows_vulkan.cpp 的 vulkan_worker_symbol）：橋接已載入宿主 loader 時為真。
@@ -2033,6 +2040,12 @@ private:
     bool common_dialog_message(GuestMemory& memory, const GuiMessage& message,bool from_hook=false);
     void common_dialog_refresh(std::uint64_t handle);
     std::optional<std::uint32_t> invoke_shell(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_recent_document(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> resume_recent_document(GuestState&,GuestMemory&,std::uint64_t,std::uint32_t);
+    void discard_recent_document(GuestState&,GuestMemory&,std::uint64_t);
+    std::uint32_t store_recent_document(std::u16string,std::u16string,bool,std::u16string = {},std::u16string = {},int = 0);
+    struct RecentDocumentCall {std::uint64_t object{},scratch{};unsigned stage{};bool link{};std::u16string app,path,arguments,icon;int icon_index{};};
+    std::map<std::uint64_t,RecentDocumentCall> recent_document_calls_;
     std::uint32_t finish_shell_delete(GuestMemory&,const GuiShellDelete&,bool confirmed);
     std::optional<std::uint32_t> invoke_wmi(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_automation(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -2359,6 +2372,15 @@ private:
         bool io_signaled{true};
         bool manage_volume_at_open{};
     };
+    struct BackupStream {std::uint32_t type{},attributes{};std::uint64_t size{};std::vector<std::uint8_t> header,data;};
+    struct FileBackup {std::uint64_t object{},position{};std::size_t stream{};bool writing{},security{},header_complete{};std::vector<BackupStream> streams;std::vector<std::uint8_t> header,data;std::uint32_t type{},attributes{},name_size{};std::uint64_t size{};};
+    std::map<std::uint64_t,FileBackup> file_backups_;
+    std::optional<std::uint32_t> invoke_file_backup(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    using ResourceUpdateName=std::variant<std::u16string,std::uint16_t>;
+    struct ResourceUpdateValue {std::uint32_t codepage{};std::vector<std::uint8_t> bytes;};
+    struct ResourceUpdate {std::string path;std::shared_ptr<HostFile> file;std::vector<std::uint8_t> original;std::map<std::tuple<ResourceUpdateName,ResourceUpdateName,std::uint16_t>,ResourceUpdateValue> resources;};
+    std::map<std::uint64_t,ResourceUpdate> resource_updates_;
+    std::optional<std::uint32_t> invoke_resource_update(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::string stdout_, stderr_;
     std::array<int,3> live_stdio_{-1,-1,-1};
     std::array<std::shared_ptr<int>,3> inherited_stdio_{};

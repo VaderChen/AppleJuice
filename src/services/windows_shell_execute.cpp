@@ -45,10 +45,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_execute(GuestState& s
             flags=static_cast<std::uint32_t>(memory.load(GuestAddress{info+4},32));
             const auto pointer=[&](unsigned index){return memory.load(GuestAddress{info+8+index*unit},bits);};
             parent=pointer(0);verb=read(pointer(1));file=read(pointer(2));parameters=read(pointer(3));directory=read(pointer(4));
+            if(!trace_services_.empty())std::fprintf(stderr,"[shell-execute] flags=%x verb=%s file=%s parameters=%s\n",flags,utf16_to_utf8(verb).c_str(),utf16_to_utf8(file).c_str(),utf16_to_utf8(parameters).c_str());
             show=static_cast<std::uint32_t>(memory.load(GuestAddress{info+8+5*unit},32));
             instance_at=info+(x86_?32:56);process_at=info+(x86_?56:104);memory.store(GuestAddress{process_at},bits,0);
             // 靜態 verb、PIDL 與同步建立；DDE／COM extension／提權另有契約，不能假裝完成。
-            constexpr std::uint32_t supported=1U|4U|0x40U|0x100U|0x400U|0x4000U|0x8000U|0x100000U|0x800000U;
+            // CONNECTNETDRV 對本機及已映射磁碟不需建立連線；未映射路徑由共用檔案解析回報錯誤。
+            constexpr std::uint32_t supported=1U|4U|0x40U|0x80U|0x100U|0x400U|0x4000U|0x8000U|0x100000U|0x800000U;
             if(flags&~supported)throw ShellError{50};
             if(flags&1)class_name=read(memory.load(GuestAddress{info+(x86_?40:72)},bits));
             if((flags&1) && class_name.empty())throw ShellError{87};

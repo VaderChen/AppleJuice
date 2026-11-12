@@ -33,6 +33,7 @@
 #include <unicode/uenum.h>
 #include "idn_conversion.hpp"
 #include "crt_c_locale.hpp"
+#include "text_unicode.h"
 #include <mutex>
 #if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
@@ -682,6 +683,7 @@ std::optional<bool> parse_bool(std::u16string_view input,std::uint32_t lcid,bool
 }
 std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"advapi32.dll","IsTextUnicode",3},{"ntdll.dll","RtlIsTextUnicode",3},
         {"crt","_create_locale",2},{"crt","_wcreate_locale",2},{"crt","_free_locale",1},{"crt","__free_locale",1},{"crt","_get_current_locale",0},{"crt","_configthreadlocale",1},
         {"crt","__x64arm_create_locale_legacy",2},{"crt","__x64arm_wcreate_locale_legacy",2},{"crt","__x64arm_current_locale_legacy",0},
         {"crt","_mbsrchr",2},{"crt","_mbsrchr_l",3},{"crt","_mbschr",2},{"crt","_mbschr_l",3},
@@ -869,6 +871,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     const auto finish=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto fail=[&](std::uint32_t error){last_error_=error;return finish(0);};
+    if(name=="IsTextUnicode" || name=="RtlIsTextUnicode"){
+        unsigned flags=arg(2)?static_cast<unsigned>(memory.load(GuestAddress{arg(2)},32)):0xffffU;
+        const auto length=static_cast<std::int32_t>(arg(1));
+        std::array<unsigned char,512> bytes{};
+        if(length>=2)memory.read(GuestAddress{arg(0)},std::span(bytes).first(std::min<unsigned>(static_cast<unsigned>(length)&~1U,512)));
+        const auto result=x64arm_text_unicode(bytes.data(),length,&flags);
+        if(arg(2))memory.store(GuestAddress{arg(2)},32,flags);
+        return finish(static_cast<std::uint32_t>(result));
+    }
     if(service.family=="crt"){
         const auto returned=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
         const auto error=[&](unsigned code,std::uint64_t value=0){memory.store(GuestAddress{runtime_.errno_cell},32,code);return returned(value);};

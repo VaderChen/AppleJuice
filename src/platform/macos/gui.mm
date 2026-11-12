@@ -1,4 +1,5 @@
 #include "x64arm/raster_surface.hpp"
+#include "x64arm/windows_gui.hpp"
 #include "gui_timing.hpp"
 #include "application.hpp"
 #include "modifier_keys.hpp"
@@ -40,9 +41,12 @@ public:
 // X64ARM_TRACE_WEBVIEW：記錄 WebView2 對應 WKWebView 的導覽結果，供診斷內容未顯示等問題。
 static bool webview_trace_enabled(){static const bool enabled=std::getenv("X64ARM_TRACE_WEBVIEW")!=nullptr;return enabled;}
 @interface X64ArmWebViewDelegate : NSObject<WKNavigationDelegate>
+@property(nonatomic) std::vector<x64arm::GuiMessage>* events;
 @end
 @implementation X64ArmWebViewDelegate
-- (void)webView:(WKWebView*)view didFinishNavigation:(WKNavigation*)navigation {(void)navigation;if(webview_trace_enabled())std::fprintf(stderr,"[webview] finish url=%s frame=%.0fx%.0f hidden=%d window=%p\n",view.URL.absoluteString.UTF8String?:"",view.frame.size.width,view.frame.size.height,view.hiddenOrHasHiddenAncestor?1:0,(__bridge void*)view.window);
+- (void)webView:(WKWebView*)view didFinishNavigation:(WKNavigation*)navigation {(void)navigation;
+    if(self.events && view.identifier.length){std::u16string url(view.URL.absoluteString.length,u'\0');[view.URL.absoluteString getCharacters:reinterpret_cast<unichar*>(url.data()) range:NSMakeRange(0,url.size())];self.events->push_back({static_cast<std::uint64_t>(view.identifier.longLongValue),1,0,0x10041,std::move(url)});}
+if(webview_trace_enabled())std::fprintf(stderr,"[webview] finish url=%s frame=%.0fx%.0f hidden=%d window=%p\n",view.URL.absoluteString.UTF8String?:"",view.frame.size.width,view.frame.size.height,view.hiddenOrHasHiddenAncestor?1:0,(__bridge void*)view.window);
     // X64ARM_TRACE_WEBVIEW_SNAPSHOT=路徑：以 WebKit 自身快照確認內容實際繪製（與視窗是否被遮蔽無關）。
     if(const char* path=std::getenv("X64ARM_TRACE_WEBVIEW_SNAPSHOT");path && *path){
         NSString* target=[NSString stringWithUTF8String:path];
@@ -59,7 +63,6 @@ static bool webview_trace_enabled(){static const bool enabled=std::getenv("X64AR
 - (void)webView:(WKWebView*)view didFailProvisionalNavigation:(WKNavigation*)navigation withError:(NSError*)error {(void)view;(void)navigation;if(webview_trace_enabled())std::fprintf(stderr,"[webview] provisional fail %s\n",error.localizedDescription.UTF8String?:"");}
 - (void)webViewWebContentProcessDidTerminate:(WKWebView*)view {(void)view;if(webview_trace_enabled())std::fprintf(stderr,"[webview] content process terminated\n");}
 @end
-#include "x64arm/windows_gui.hpp"
 #include "x64arm/windows_control_images.hpp"
 #include "x64arm/windows_fonts.hpp"
 #include "x64arm/native_font_data.hpp"
@@ -249,6 +252,13 @@ NSView* native_window_hit(NSWindow* window,NSPoint location){
     // NSView.hitTest 接收父視圖座標；contentView 可翻轉，不能先轉成它自己的座標。
     const auto point=content.superview?[content.superview convertPoint:location fromView:nil]:[content convertPoint:location fromView:nil];
     return [content hitTest:point];
+}
+bool native_resize_border(NSWindow* window,NSPoint point){
+    if(!(window.styleMask&NSWindowStyleMaskResizable) || window.miniaturized || (window.styleMask&NSWindowStyleMaskFullScreen))return false;
+    // AppKit 的縮放命中區會向 client 內延伸；不可先交給客體 view，否則 NSWindow
+    // 收不到開始拖曳的 mouseDown。已有 client capture 的拖曳仍由原接收者完成。
+    const NSRect frame=NSMakeRect(0,0,window.frame.size.width,window.frame.size.height);
+    return NSPointInRect(point,NSInsetRect(frame,-4,-4)) && !NSPointInRect(point,NSInsetRect(frame,6,6));
 }
 NSFont* guest_font(const x64arm::GuiFont& model){return x64arm::native_gui_font(model);}
 NSString* menu_title(const std::u16string& text) {
@@ -1132,6 +1142,25 @@ NSDictionary* menu_bitmap_details(NSImage* image){
     self.events->push_back({self.guestHandle,action,[item unsignedLongLongValue],0x10010});
 }
 @end
+// Windows ListView 的右鍵通知由共用服務處理，不交給 Cocoa 的預設選單。
+@interface X64ArmListTableView : NSTableView
+@end
+@implementation X64ArmListTableView
+- (void)rightMouseDown:(NSEvent*)event{
+    X64ArmControlTarget* target=(X64ArmControlTarget*)self.delegate;if(!target.model || !target.model->enabled)return;
+    const auto row=[self rowAtPoint:[self convertPoint:event.locationInWindow fromView:nil]];
+    if(row>=0 && ![self.selectedRowIndexes containsIndex:static_cast<NSUInteger>(row)])[self selectRowIndexes:[NSIndexSet indexSetWithIndex:static_cast<NSUInteger>(row)] byExtendingSelection:NO];
+    [self.window makeFirstResponder:self];
+}
+- (void)rightMouseUp:(NSEvent*)event{
+    X64ArmControlTarget* target=(X64ArmControlTarget*)self.delegate;if(!target.model || !target.model->enabled || !target.events)return;
+    const auto point=[self.enclosingScrollView convertPoint:event.locationInWindow fromView:nil];
+    x64arm::GuiMessage input{target.guestHandle,0,static_cast<std::uint64_t>(coordinate_word(point.x))|(static_cast<std::uint64_t>(coordinate_word(point.y))<<16),0x205};
+    input.has_point=true;input.point={static_cast<std::int32_t>(point.x),static_cast<std::int32_t>(point.y)};
+    input.mouse_time=static_cast<std::uint32_t>(static_cast<std::uint64_t>(event.timestamp*1000));target.events->push_back(std::move(input));
+}
+@end
+
 @interface X64ArmNativeMenuItem : NSMenuItem
 @property(nonatomic) unsigned long long guestMenu;
 @property(nonatomic) unsigned int guestPosition;
@@ -1416,8 +1445,8 @@ void sync_native_frame(Window& w){
 void create_table_view(Window& window,const NSRect& rect,X64ArmControlTarget* target) {
     const auto& model=window.model;const auto& cls=gui_control_class(model);
     auto* scroll=[[NSScrollView alloc] initWithFrame:rect];scroll.hasVerticalScroller=YES;scroll.borderType=NSBezelBorder;scroll.autohidesScrollers=YES;
-    NSTableView* table=cls==u"systreeview32"?[[NSOutlineView alloc] initWithFrame:NSMakeRect(0,0,model.width,model.height)]:[[NSTableView alloc] initWithFrame:NSMakeRect(0,0,model.width,model.height)];
-    auto* column=[[NSTableColumn alloc] initWithIdentifier:@"text"];column.width=std::max<CGFloat>(20,model.width-4);column.dataCell=[[X64ArmCenteredTextCell alloc] initTextCell:@""];[(NSTextFieldCell*)column.dataCell setFont:[NSFont systemFontOfSize:12]];[table addTableColumn:column];table.headerView=nil;table.rowHeight=17;table.intercellSpacing=NSMakeSize(0,0);table.dataSource=target;table.delegate=target;
+    NSTableView* table=cls==u"systreeview32"?[[NSOutlineView alloc] initWithFrame:NSMakeRect(0,0,model.width,model.height)]:cls==u"syslistview32"?[[X64ArmListTableView alloc] initWithFrame:NSMakeRect(0,0,model.width,model.height)]:[[NSTableView alloc] initWithFrame:NSMakeRect(0,0,model.width,model.height)];
+    auto* column=[[NSTableColumn alloc] initWithIdentifier:@"text"];column.width=std::max<CGFloat>(20,model.width-4);column.dataCell=[[X64ArmCenteredTextCell alloc] initTextCell:@""];[(NSTextFieldCell*)column.dataCell setFont:[NSFont systemFontOfSize:12]];[table addTableColumn:column];table.headerView=nil;table.columnAutoresizingStyle=NSTableViewNoColumnAutoresizing;table.rowHeight=17;table.intercellSpacing=NSMakeSize(0,0);table.dataSource=target;table.delegate=target;
     table.allowsMultipleSelection=cls==u"syslistview32"?!(model.style&4U):cls==u"listbox" && (model.style&0x808U)!=0;
     if(cls==u"syslistview32"){table.target=target;table.action=@selector(listClicked:);table.doubleAction=@selector(doubleClicked:);scroll.hasHorizontalScroller=YES;}
     if(cls==u"systreeview32"){auto* tree=(NSOutlineView*)table;tree.outlineTableColumn=column;tree.indentationPerLevel=12;tree.dataSource=target;tree.delegate=target;
@@ -1720,14 +1749,14 @@ class CocoaGui final : public NativeGui {
                         [native_columns addObject:@{@"text":column.title,@"logical_index":@(index),@"subitem":@(index<w.model.columns.size()?w.model.columns[index].subitem:0),@"rect":@[@(rect.origin.x),@(rect.origin.y),@(rect.size.width),@(rect.size.height)]}];}}
                 NSMutableArray* toolbar=[NSMutableArray array];for(const auto& button:w.model.toolbar_buttons)[toolbar addObject:@{@"command":@(button.command),@"text":nsstring(button.text),@"image":@(button.image),@"state":@(button.state),@"style":@(button.style),@"rect":@[@(button.rectangle[0]),@(button.rectangle[1]),@(button.rectangle[2]),@(button.rectangle[3])]}];NSMutableArray* status=[NSMutableArray array];for(const auto& part:w.model.status_parts)[status addObject:@{@"text":nsstring(part.text),@"edge":@(part.edge)}];
                 NSMutableArray* drawing=[NSMutableArray array];for(const auto& draw:w.model.drawing)if(draw.kind==GuiDraw::Kind::Text)[drawing addObject:@{@"text":nsstring(draw.text),@"x":@(draw.x),@"y":@(draw.y),@"color":@(draw.color),@"font_face":nsstring(draw.font.face),@"font_height":@(draw.font.height),@"font_weight":@(draw.font.weight),@"font_italic":@(draw.font.italic),@"cell_width":@(draw.cell_width)}];
-                NSMutableArray* native_buttons=[NSMutableArray array];for(NSView* child in w.view.subviews)if([child isKindOfClass:[NSButton class]]){NSButton* b=(NSButton*)child;const bool is_toolbar=[b isKindOfClass:X64ArmToolbarButton.class];[native_buttons addObject:@{@"command":@(b.tag),@"title":b.title,@"guest_index":@(is_toolbar?[b.cell.representedObject unsignedLongLongValue]:0),@"enabled":@(b.enabled),@"checked":@(b.state!=NSControlStateValueOff),@"pressed":@(is_toolbar && ((X64ArmToolbarButton*)b).guestPressed),@"indeterminate":@(is_toolbar && ((X64ArmToolbarButton*)b).guestIndeterminate),@"has_image":@(b.image!=nil),@"font_size":@(b.font.pointSize),@"text_width":@([b.title sizeWithAttributes:@{NSFontAttributeName:b.font}].width*(is_toolbar?((X64ArmToolbarButton*)b).guestTextScale:1)),@"width":@(b.frame.size.width),@"height":@(b.frame.size.height),@"image_width":@(b.image.size.width),@"image_height":@(b.image.size.height),@"image_position":@(b.imagePosition)}];}
+                NSMutableArray* native_buttons=[NSMutableArray array];for(NSView* child in w.view.subviews)if([child isKindOfClass:[NSButton class]]){NSButton* b=(NSButton*)child;const bool is_toolbar=[b isKindOfClass:X64ArmToolbarButton.class];[native_buttons addObject:@{@"command":@(b.tag),@"title":b.title,@"guest_index":@(is_toolbar?[b.cell.representedObject unsignedLongLongValue]:0),@"enabled":@(b.enabled),@"checked":@(b.state!=NSControlStateValueOff),@"pressed":@(is_toolbar && ((X64ArmToolbarButton*)b).guestPressed),@"indeterminate":@(is_toolbar && ((X64ArmToolbarButton*)b).guestIndeterminate),@"has_image":@(b.image!=nil),@"font_size":@(b.font.pointSize),@"text_width":@([b.title sizeWithAttributes:@{NSFontAttributeName:b.font}].width*(is_toolbar?((X64ArmToolbarButton*)b).guestTextScale:1)),@"x":@(b.frame.origin.x),@"y":@(b.frame.origin.y),@"width":@(b.frame.size.width),@"height":@(b.frame.size.height),@"image_width":@(b.image.size.width),@"image_height":@(b.image.size.height),@"image_position":@(b.imagePosition)}];}
                 NSMutableArray* menu_titles=[NSMutableArray array];for(NSView* child in w.menu_bar.subviews)if([child isKindOfClass:[NSButton class]])[menu_titles addObject:((NSButton*)child).title];
                 NSMutableArray* native_tooltips=[NSMutableArray array];for(const auto& [tag,index]:w.status_tooltips){NSString* text=[(id<NSViewToolTipOwner>)w.view view:w.view stringForToolTip:tag point:NSZeroPoint userData:reinterpret_cast<void*>(index+1)];[native_tooltips addObject:@{@"part":@(index),@"text":text}];}
                 NSMutableArray* native_lines=[NSMutableArray array];if(w.editor)if(const auto lines=text_line_ranges(h))for(const auto& line:*lines)[native_lines addObject:@[@(line[0]),@(line[1])]];
                 // 分頁控制項的項目與版面矩形，供自動化點擊與診斷。
                 NSMutableArray* tabs=[NSMutableArray array];if(w.model.tab){const auto& t=*w.model.tab;for(std::size_t i=0;i<t.items.size();++i){const auto r=i<t.rectangles.size()?t.rectangles[i]:std::array<std::int32_t,4>{};[tabs addObject:@{@"text":nsstring(t.items[i].text),@"state":@(t.items[i].state),@"rect":@[@(r[0]),@(r[1]),@(r[2]),@(r[3])]}];}}
                 NSMutableDictionary* calendar=[NSMutableDictionary dictionary];if(w.model.calendar){const auto& c=*w.model.calendar;NSMutableArray* cells=[NSMutableArray array];for(const auto& cell:c.cells)[cells addObject:@{@"date":@[@(cell.date[0]),@(cell.date[1]),@(cell.date[3])],@"rect":@[@(cell.rect[0]),@(cell.rect[1]),@(cell.rect[2]),@(cell.rect[3])],@"text":nsstring(cell.text),@"selected":@(cell.selected),@"disabled":@(cell.disabled),@"action":@(cell.action),@"bold":@(cell.bold),@"row":@(cell.row),@"column":@(cell.column),@"calendar":@(cell.calendar),@"end":@[@(cell.end[0]),@(cell.end[1]),@(cell.end[3])]}];[calendar addEntriesFromDictionary:@{@"value":@[@(c.value[0]),@(c.value[1]),@(c.value[3]),@(c.value[4]),@(c.value[5]),@(c.value[6])],@"last":@[@(c.last[0]),@(c.last[1]),@(c.last[3])],@"none":@(c.none),@"open":@(c.open),@"month_window":@(c.month_window),@"calendar_count":@(c.calendar_count),@"view":@(c.view),@"border":@(c.border),@"cells":cells}];}
-                [entries addObject:@{@"handle":@(h),@"id":@(w.model.id),@"parent":@(w.model.parent),@"class":nsstring(w.model.class_name),@"control_class":nsstring(gui_control_class(w.model)),@"text":nsstring(w.model.title),@"visible":@(w.view.window.visible && !w.view.hidden),@"raster_surface":@(graphics_surfaces_.contains(h)),@"native_key":@(w.view.window.keyWindow),@"native_active":@(NSApp.active),@"native_owner_pid":@(::getpid()),@"native_window_number":@(w.view.window.windowNumber),@"native_level":@(w.native?w.native.level:0),@"native_screen_display":@([w.view.window.screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]),@"native_sharing_type":@(w.view.window.sharingType),@"display_affinity":@(w.model.display_affinity),@"native_activation_allowed":@(interactive_activation_),@"native_pending_activation":@(pending_activation_),@"native_application_launched":@(application_launched_),@"enabled":@(w.model.enabled),@"x":@(w.model.x),@"y":@(w.model.y),@"width":@(w.model.width),@"height":@(w.model.height),@"style":@(w.model.style),@"ex_style":@(w.model.ex_style),@"check":@(w.model.check),@"selection":@(w.model.selection),@"items":items,@"columns":columns,@"native_columns":native_columns,@"header_visible":@(w.model.header && w.model.visible),@"toolbar":toolbar,@"native_buttons":native_buttons,@"native_tooltips":native_tooltips,@"native_edit_line_ranges":native_lines,@"native_edit_wrap":@(w.editor && w.editor.textContainer.widthTracksTextView),@"native_edit_font_size":@(w.editor.font.pointSize),@"image_count":@(w.model.list_icons.size()),@"native_tree_rows":@([w.control isKindOfClass:NSOutlineView.class]?[(NSOutlineView*)w.control numberOfRows]:0),@"menu_titles":menu_titles,@"icon":@(w.model.icon),@"status":status,@"drawing":drawing,@"calendar":calendar,@"tabs":tabs}];}
+                [entries addObject:@{@"handle":@(h),@"id":@(w.model.id),@"parent":@(w.model.parent),@"class":nsstring(w.model.class_name),@"control_class":nsstring(gui_control_class(w.model)),@"text":nsstring(w.model.title),@"visible":@(w.view.window.visible && !w.view.hidden),@"raster_surface":@(graphics_surfaces_.contains(h)),@"native_key":@(w.view.window.keyWindow),@"native_active":@(NSApp.active),@"native_owner_pid":@(::getpid()),@"native_window_number":@(w.view.window.windowNumber),@"native_level":@(w.native?w.native.level:0),@"native_screen_display":@([w.view.window.screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]),@"native_sharing_type":@(w.view.window.sharingType),@"display_affinity":@(w.model.display_affinity),@"native_activation_allowed":@(interactive_activation_),@"native_pending_activation":@(pending_activation_),@"native_application_launched":@(application_launched_),@"enabled":@(w.model.enabled),@"x":@(w.model.x),@"y":@(w.model.y),@"width":@(w.model.width),@"height":@(w.model.height),@"style":@(w.model.style),@"ex_style":@(w.model.ex_style),@"check":@(w.model.check),@"selection":@(w.model.selection),@"items":items,@"columns":columns,@"native_columns":native_columns,@"native_frame":@[@(w.view.frame.origin.x),@(w.view.frame.origin.y),@(w.view.frame.size.width),@(w.view.frame.size.height)],@"header_visible":@(w.model.header && w.model.visible),@"toolbar":toolbar,@"native_buttons":native_buttons,@"native_tooltips":native_tooltips,@"native_edit_line_ranges":native_lines,@"native_edit_wrap":@(w.editor && w.editor.textContainer.widthTracksTextView),@"native_edit_font_size":@(w.editor.font.pointSize),@"image_count":@(w.model.list_icons.size()),@"native_tree_rows":@([w.control isKindOfClass:NSOutlineView.class]?[(NSOutlineView*)w.control numberOfRows]:0),@"menu_titles":menu_titles,@"icon":@(w.model.icon),@"status":status,@"drawing":drawing,@"calendar":calendar,@"tabs":tabs}];}
             NSData* data=[NSJSONSerialization dataWithJSONObject:@{@"windows":entries,@"actions":@(action_),@"automation_errors":automation_errors_,@"popups":popup_history_} options:NSJSONWritingPrettyPrinted error:nil];[data writeToFile:state_path_ atomically:YES];
         }
     }
@@ -1915,7 +1944,10 @@ class CocoaGui final : public NativeGui {
             else if([w.control isKindOfClass:[NSTableView class]]){auto* table=(NSTableView*)w.control;NSMutableIndexSet* rows=[NSMutableIndexSet indexSet];if(step[@"indices"]){if(![step[@"indices"] isKindOfClass:[NSArray class]])throw std::runtime_error("列表多選測試必須指定索引陣列");for(NSNumber* entry in step[@"indices"]){const auto row=entry.unsignedLongLongValue;if(row>=w.model.items.size())throw std::runtime_error("列表測試索引超出範圍");[rows addIndex:static_cast<NSUInteger>(row)];}if(rows.count>1 && !table.allowsMultipleSelection)throw std::runtime_error("單選列表不能執行多選測試");}else [rows addIndex:index];[table selectRowIndexes:rows byExtendingSelection:NO];if(gui_control_class(w.model)==u"syslistview32")[table sendAction:table.action to:table.target];}
             else if([w.control isKindOfClass:[NSComboBox class]]){[(NSComboBox*)w.control selectItemAtIndex:static_cast<NSInteger>(index)];[w.target comboBoxSelectionDidChange:[NSNotification notificationWithName:NSComboBoxSelectionDidChangeNotification object:w.control]];}
             else return;
-        }else if([operation isEqualToString:@"double_click"] && gui_control_class(w.model)==u"syslistview32" && [w.control isKindOfClass:[NSTableView class]]){
+        }else if([operation isEqualToString:@"right_click"] && gui_control_class(w.model)==u"syslistview32" && [w.control isKindOfClass:NSTableView.class]){
+            auto* table=(NSTableView*)w.control;const auto index=[step[@"index"] integerValue];if(index<0 || index>=table.numberOfRows)return;
+            const auto rect=[table rectOfRow:index];const auto point=[table convertPoint:NSMakePoint(12,NSMidY(rect)) toView:nil];
+            for(const auto type:{NSEventTypeRightMouseDown,NSEventTypeRightMouseUp}){auto* event=[NSEvent mouseEventWithType:type location:point modifierFlags:0 timestamp:0 windowNumber:table.window.windowNumber context:nil eventNumber:0 clickCount:1 pressure:1];if(type==NSEventTypeRightMouseDown)[table rightMouseDown:event];else [table rightMouseUp:event];}        }else if([operation isEqualToString:@"double_click"] && gui_control_class(w.model)==u"syslistview32" && [w.control isKindOfClass:[NSTableView class]]){
             auto* table=(NSTableView*)w.control;
             if(step[@"index"]){const auto row=[step[@"index"] unsignedLongLongValue];if(row>=w.model.items.size())return;[table selectRowIndexes:[NSIndexSet indexSetWithIndex:static_cast<NSUInteger>(row)] byExtendingSelection:NO];}
             [table sendAction:table.doubleAction to:table.target];
@@ -2064,7 +2096,7 @@ public:
         }catch(const std::bad_alloc&){} // 修改後記錄失敗時立即還原，不能留下無法回收的宿主曲線。
         const auto count=static_cast<uint32_t>(before.size()/3);(void)CGSetDisplayTransferByTable(display,count,before.data(),before.data()+count,before.data()+2*count);return false;
     }
-    ~CocoaGui() override { native_snapshot_batch_->active=false;if(automation_snapshot_)automation_snapshot_->active=false;(void)restore_display_mode();restore_gamma(); @autoreleasepool { if(activity_)[NSProcessInfo.processInfo endActivity:activity_];help_.reset();desktop_notifications_.reset();if(cursor_hidden_)[NSCursor unhide]; if(automation_input_monitor_)[NSEvent removeMonitor:automation_input_monitor_];if(app_deactivate_observer_)[NSNotificationCenter.defaultCenter removeObserver:app_deactivate_observer_];if(app_activate_observer_)[NSNotificationCenter.defaultCenter removeObserver:app_activate_observer_];for (auto& [handle, window] : windows_) { (void)handle; window.native.commandShortcut=nil;window.native.guestModel=nullptr;window.native.delegate = nil; [window.native close]; } } }
+    ~CocoaGui() override { webview_delegate_.events=nullptr; native_snapshot_batch_->active=false;if(automation_snapshot_)automation_snapshot_->active=false;(void)restore_display_mode();restore_gamma(); @autoreleasepool { if(activity_)[NSProcessInfo.processInfo endActivity:activity_];help_.reset();desktop_notifications_.reset();if(cursor_hidden_)[NSCursor unhide]; if(automation_input_monitor_)[NSEvent removeMonitor:automation_input_monitor_];if(app_deactivate_observer_)[NSNotificationCenter.defaultCenter removeObserver:app_deactivate_observer_];if(app_activate_observer_)[NSNotificationCenter.defaultCenter removeObserver:app_activate_observer_];for (auto& [handle, window] : windows_) { (void)handle; window.native.commandShortcut=nil;window.native.guestModel=nullptr;window.native.delegate = nil; [window.native close]; } } }
     void create(std::uint64_t handle, const GuiWindow& model) override {
         @autoreleasepool {
             auto& window=windows_[handle];window.model=model;std::erase(z_order_,handle);z_order_.insert(z_order_.begin(),handle);
@@ -2383,7 +2415,7 @@ public:
                         if(!created && !common_changed && index<old.toolbar_buttons.size() && old.toolbar_buttons[index]==item)continue;
                         const auto& rect=item.rectangle;
                         if(created){button=[[X64ArmToolbarButton alloc] initWithFrame:NSZeroRect];button.identifier=@"x64arm-toolbar-button";w.native_toolbar_buttons[key]=button;[w.view addSubview:button];}
-                        button.frame=NSMakeRect(rect[0],rect[1]+2,rect[2]-rect[0],rect[3]-rect[1]);
+                        button.frame=NSMakeRect(rect[0],rect[1],rect[2]-rect[0],rect[3]-rect[1]);
                         button.title=model.toolbar_text_rows?label(item.text):@"";button.toolTip=label(item.text);button.bezelStyle=NSBezelStyleRegularSquare;button.bordered=(model.style&0x800U)==0;button.font=guest_font(model.toolbar_font);
                         const auto titleWidth=[button.title sizeWithAttributes:@{NSFontAttributeName:button.font}].width,guestWidth=guest_text_width(model.toolbar_font,button.font,button.title);button.guestTextScale=titleWidth>0 && guestWidth>0?guestWidth/titleWidth:1;
                         button.buttonType=(item.style&2U)?NSButtonTypePushOnPushOff:NSButtonTypeMomentaryPushIn;
@@ -2536,15 +2568,23 @@ public:
                 "__dispatch:function(d){var e=new Event('message');e.data=d;t.dispatchEvent(e);}};})();";
             [configuration.userContentController addUserScript:[[WKUserScript alloc] initWithSource:bootstrap injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
             WKWebView* view=[[WKWebView alloc] initWithFrame:NSZeroRect configuration:configuration];
-            view.autoresizingMask=NSViewNotSizable;view.navigationDelegate=webview_delegate_;
+            view.autoresizingMask=NSViewNotSizable;view.navigationDelegate=webview_delegate_;view.identifier=[NSString stringWithFormat:@"%llu",static_cast<unsigned long long>(id)];webview_delegate_.events=&events_;
             if(webview_trace_enabled())std::fprintf(stderr,"[webview] create parent=%llu view=%s flipped=%d layer=%s\n",static_cast<unsigned long long>(parent),
                 NSStringFromClass(found->second.view.class).UTF8String,found->second.view.isFlipped?1:0,found->second.view.layer?NSStringFromClass(found->second.view.layer.class).UTF8String:"none");
             [found->second.view addSubview:view positioned:NSWindowAbove relativeTo:nil];
             webviews_[id]=view;dirty_=true;return true;
         }
     }
+    std::optional<std::array<std::int32_t,2>> list_hit_test(std::uint64_t handle,std::int32_t x,std::int32_t y) override {
+        const auto found=windows_.find(handle);if(found==windows_.end() || ![found->second.control isKindOfClass:NSTableView.class])return {};
+        auto* table=(NSTableView*)found->second.control;const auto point=[table convertPoint:NSMakePoint(x,y) fromView:found->second.view];
+        const auto row=[table rowAtPoint:point],column=[table columnAtPoint:point];std::int32_t subitem=0;
+        if(column>=0){const auto index=static_cast<std::size_t>([table.tableColumns[static_cast<NSUInteger>(column)].identifier integerValue]);if(index<found->second.model.columns.size())subitem=found->second.model.columns[index].subitem;}
+        return std::array<std::int32_t,2>{static_cast<std::int32_t>(row),subitem};
+    }
+    bool webview_loading(std::uint64_t id) override {return webview(id).loading;}
     void webview_destroy(std::uint64_t id) override {
-        @autoreleasepool {const auto found=webviews_.find(id);if(found==webviews_.end())return;[found->second stopLoading];[found->second removeFromSuperview];webviews_.erase(found);dirty_=true;}
+        @autoreleasepool {const auto found=webviews_.find(id);if(found==webviews_.end())return;found->second.navigationDelegate=nil;[found->second stopLoading];[found->second removeFromSuperview];webviews_.erase(found);dirty_=true;}
     }
     void webview_visible(std::uint64_t id,bool visible) override {if(auto* view=webview(id))view.hidden=!visible;}
     void webview_bounds(std::uint64_t id,const std::array<std::int32_t,4>& rect) override {
@@ -3070,6 +3110,7 @@ public:
                 const bool guest=event.window && std::any_of(windows_.begin(),windows_.end(),[&](const auto& item){return item.second.native==event.window;});
                 bool delivered=false;
                 const bool down=type==NSEventTypeLeftMouseDown || type==NSEventTypeRightMouseDown || type==NSEventTypeOtherMouseDown;
+                const bool native_resize=guest && mouse && !mouse_target_ && native_resize_border(event.window,event.locationInWindow);
                 if(guest && down)mouse_target_=nil;
                 // 背景只限制啟動時的顯示與程式要求；使用者親自點擊後仍須能編輯及開啟 modal。
                 // 自動化隔離中的事件不授予啟用資格，也不改變預先選定的螢幕。
@@ -3078,7 +3119,7 @@ public:
                     if(owner!=windows_.end() && owner->second.model.enabled && !(owner->second.model.ex_style&0x08000000U)){interactive_activation_=true;dirty_=true;}
                 }
                 // local monitor 由 NSApp.sendEvent 觸發；直接轉交 GuestView 也須遵守隔離。
-                if(guest && mouse && !automation_input_monitor_ && !raw_mouse_ && type!=NSEventTypeScrollWheel){
+                if(guest && mouse && !native_resize && !automation_input_monitor_ && !raw_mouse_ && type!=NSEventTypeScrollWheel){
                     const bool tracking=type==NSEventTypeLeftMouseDragged || type==NSEventTypeRightMouseDragged || type==NSEventTypeOtherMouseDragged || type==NSEventTypeLeftMouseUp || type==NSEventTypeRightMouseUp || type==NSEventTypeOtherMouseUp;
                     NSView* target=tracking && mouse_target_?mouse_target_:native_window_hit(event.window,event.locationInWindow);
                     if([target isKindOfClass:[X64ArmGuestView class]] || [target isKindOfClass:[X64ArmHeaderView class]]){
@@ -3102,7 +3143,7 @@ public:
                         }
                     }
                 }
-                if(!delivered && (!guest || !((keyboard && raw_keyboard_) || (mouse && raw_mouse_))))[NSApp sendEvent:event];
+                if(!delivered && (native_resize || !guest || !((keyboard && raw_keyboard_) || (mouse && raw_mouse_))))[NSApp sendEvent:event];
                 else if(!delivered && mouse && !automation_input_monitor_ && !raw_noactivate_ && !background_display_enabled() && (type==NSEventTypeLeftMouseDown || type==NSEventTypeRightMouseDown || type==NSEventTypeOtherMouseDown)){if(@available(macOS 14.0,*))[NSApp activate];else [NSApp activateIgnoringOtherApps:YES];[event.window makeKeyAndOrderFront:nil];}
                 if(guest && (type==NSEventTypeLeftMouseUp || type==NSEventTypeRightMouseUp || type==NSEventTypeOtherMouseUp))mouse_target_=nil;
             }
@@ -3298,6 +3339,8 @@ public:
     std::optional<std::array<std::int32_t,4>> menu_rectangle(std::uint64_t handle,std::int32_t index) override {return real("menu_rectangle").menu_rectangle(handle,index);}
     std::optional<std::uint32_t> text_line_count(std::uint64_t handle) override {return real("text_line_count").text_line_count(handle);}
     bool webview_create(std::uint64_t id,std::uint64_t parent) override {return real("webview_create").webview_create(id,parent);}
+    std::optional<std::array<std::int32_t,2>> list_hit_test(std::uint64_t handle,std::int32_t x,std::int32_t y) override {return real("list_hit_test").list_hit_test(handle,x,y);}
+    bool webview_loading(std::uint64_t id) override {return real("webview_loading").webview_loading(id);}
     void webview_destroy(std::uint64_t id) override {real("webview_destroy").webview_destroy(id);}
     void webview_visible(std::uint64_t id,bool visible) override {real("webview_visible").webview_visible(id,visible);}
     void webview_bounds(std::uint64_t id,const std::array<std::int32_t,4>& bounds) override {real("webview_bounds").webview_bounds(id,bounds);}

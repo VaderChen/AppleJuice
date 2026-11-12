@@ -215,6 +215,7 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"shell32.dll","#4","shell32.dll","SHChangeNotifyDeregister"},
     {"shell32.dll","#644","shell32.dll","SHChangeNotification_Lock"},
     {"shell32.dll","#645","shell32.dll","SHChangeNotification_Unlock"},
+    {"shell32.dll","#100","shell32.dll","SHRestricted"},
     {"shell32.dll","#89","shell32.dll","SHCloneSpecialIDList"},
     {"shell32.dll","#155","shell32.dll","ILFree"},
     {"shell32.dll","#165","shell32.dll","SHCreateDirectory"},

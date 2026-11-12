@@ -238,7 +238,7 @@ struct GuiStatusPart {
 };
 struct GuiRebarBand {
     std::uint64_t child{},data{},bitmap{};
-    std::uint32_t style{},id{},width{},min_width{},min_height{},height{},max_height{},integral{},ideal{},header{},foreground{},background{};
+    std::uint32_t style{},id{},width{},layout_width{},min_width{},min_height{},height{},max_height{},integral{},ideal{},header{},foreground{},background{};
     std::int32_t image{-1},x{},y{};std::u16string text{};
     bool operator==(const GuiRebarBand&) const = default;
 };
@@ -483,7 +483,7 @@ struct GuiWindow {
     std::u16string class_name{};
     std::uint64_t parent{}, owner{}, id{}, dialog_proc{}, font{0xb011},last_active_popup{};
     std::int32_t x{}, y{}, selection{-1};
-    std::uint32_t edit_start{},edit_end{};bool edit_modified{};
+    std::uint32_t edit_start{},edit_end{},rich_event_mask{};bool edit_modified{};
     std::optional<std::u16string> edit_undo{};
     std::uint32_t check{}, text_limit{32767};
     std::uint64_t dpi_context{UINT64_MAX};
@@ -555,7 +555,12 @@ struct GuiCreationOperation {
     std::uint64_t init_parameter{},cbt_data{},nc_data{},thread{};
     bool operator==(const GuiCreationOperation&) const = default;
 };
-inline const std::u16string& gui_control_class(const GuiWindow& window){return window.control_class.empty()?window.class_name:window.control_class;}
+inline const std::u16string& gui_control_class(const GuiWindow& window){
+    const auto& name=window.control_class.empty()?window.class_name:window.control_class;
+    // Rich Edit 的基本輸入、選取、捲動與原生呈現沿用共用 Edit 流程。
+    static const std::u16string edit=u"edit";
+    return name==u"richedit" || name==u"richedit20a" || name==u"richedit20w"?edit:name;
+}
 inline std::array<std::int32_t,4> gui_status_rectangle(const GuiWindow& window,std::size_t part){
     auto left=part && part!=255?window.status_parts[part-1].edge:0;
     auto right=part==255 || window.status_parts[part].edge<0?static_cast<std::int32_t>(window.width):window.status_parts[part].edge;
@@ -987,6 +992,7 @@ struct GuiSubclassChain {
 // 執行中的子類別程序（每執行緒巢狀）；DefSubclassProc 依此找下一層。
 struct GuiSubclassFrame {std::uint64_t thread{},window{},procedure{},id{};std::size_t index{};bool operator==(const GuiSubclassFrame&) const = default;};
 struct GuiState : GuiStationNamespace {
+    std::uint32_t process_default_layout{};
     std::map<std::uint64_t,GuiSubclassChain> subclasses;
     std::vector<GuiSubclassFrame> subclass_frames;
     // 沙盒顯示模式：寬、高、色深、更新率；不更動宿主或其他程序的桌面。
@@ -1344,6 +1350,8 @@ public:
     // 無原生後端時 create 回傳 false，其餘呼叫不產生作用。command：0 重新載入、1 停止、2 上一頁、3 下一頁。
     virtual bool webview_create(std::uint64_t,std::uint64_t) {return false;}
     virtual void webview_destroy(std::uint64_t) {}
+    virtual std::optional<std::array<std::int32_t,2>> list_hit_test(std::uint64_t,std::int32_t,std::int32_t){return {};}
+    virtual bool webview_loading(std::uint64_t) {return false;}
     virtual void webview_visible(std::uint64_t,bool) {}
     virtual void webview_bounds(std::uint64_t,const std::array<std::int32_t,4>&) {}
     virtual void webview_zoom(std::uint64_t,double) {}

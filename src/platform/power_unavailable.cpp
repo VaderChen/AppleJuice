@@ -1,5 +1,6 @@
 #include "x64arm/windows_power.hpp"
 namespace x64arm {
+std::uint32_t native_suspend_system(bool,bool){return 50;}
 std::unique_ptr<NativePowerAssertion> native_power_activity(bool){return {};}
 std::unique_ptr<NativePowerAssertion> native_power_assertion(unsigned,std::u16string_view){return {};}
 std::optional<std::array<std::uint8_t,12>> native_power_status(){return {};}

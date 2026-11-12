@@ -88,11 +88,23 @@ func (a *App) engineEnvironmentLocked() ([]string, error) {
 		}
 	}
 	environment := engineEnvironment(a.library.CompilerWorkers, a.library.OpenGLBackend, a.library.NativeLibraryBridge, host)
+	// 正常執行固定使用主螢幕桌面 1；只有測試才使用背景桌面。
+	space := a.windowSpaceUUID
+	if !a.windowSpaceTesting && space != "" {
+		if current := nativeWindowSpaceUUID(); current != "" {
+			space = current
+		}
+	}
+	background := "0"
+	if a.windowSpaceTesting || a.backgroundDisplay {
+		background = "1"
+	}
+	environment = append(environment, "X64ARM_GUI_SPACE_UUID="+space, "X64ARM_GUI_BACKGROUND_DISPLAY="+background)
 	if a.backgroundDisplay {
 		if a.backgroundDisplayID == 0 {
 			return nil, errors.New("背景螢幕尚未選定，已停止客體啟動")
 		}
-		environment = append(environment, "X64ARM_GUI_BACKGROUND_DISPLAY=1", "X64ARM_GUI_BACKGROUND_DISPLAY_ID="+strconv.FormatUint(uint64(a.backgroundDisplayID), 10))
+		environment = append(environment, "X64ARM_GUI_BACKGROUND_DISPLAY_ID="+strconv.FormatUint(uint64(a.backgroundDisplayID), 10))
 	}
 	if font := a.library.WindowsFont; font != "" && font != "auto" {
 		environment = append(environment, "X64ARM_WINDOWS_UI_FONT="+font)

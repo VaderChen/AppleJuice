@@ -101,6 +101,7 @@ std::span<const WindowsServiceDescriptor> msvcp_special_math_service_descriptors
 std::span<const WindowsServiceDescriptor> directml_object_service_descriptors();
 std::span<const WindowsServiceDescriptor> webview2_loader_service_descriptors();
 std::span<const WindowsServiceDescriptor> webview2_object_service_descriptors();
+std::span<const WindowsServiceDescriptor> webbrowser_service_descriptors();
 std::span<const WindowsServiceDescriptor> d3d12_export_service_descriptors();
 std::span<const WindowsServiceDescriptor> d3d12_object_service_descriptors();
 std::span<const WindowsServiceDescriptor> dxcore_export_service_descriptors();

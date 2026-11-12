@@ -45,15 +45,15 @@ type Program struct {
 	Settings
 }
 type Settings struct {
-	CPUCores        uint32 `json:"cpuCores,omitempty"`
-	GpuMemoryMiB    uint64 `json:"gpuMemoryMiB"`
+	CPUCores           uint32 `json:"cpuCores,omitempty"`
+	GpuMemoryMiB       uint64 `json:"gpuMemoryMiB"`
 	GpuDefaultsVersion uint32 `json:"gpuDefaultsVersion"`
-	Arguments       string `json:"arguments"`
-	WorkDir         string `json:"workDir"`
-	CDrive          string `json:"cDrive"`
-	InstallRoot     string `json:"installRoot"`
-	Writable        bool   `json:"writable"`
-	MaxInstructions uint64 `json:"maxInstructions"`
+	Arguments          string `json:"arguments"`
+	WorkDir            string `json:"workDir"`
+	CDrive             string `json:"cDrive"`
+	InstallRoot        string `json:"installRoot"`
+	Writable           bool   `json:"writable"`
+	MaxInstructions    uint64 `json:"maxInstructions"`
 }
 type GlobalSettings struct {
 	CertificateRootsFile bool              `json:"certificateRootsFile"`
@@ -157,7 +157,10 @@ type App struct {
 	runs                map[string]*execution
 	lockFile            *os.File
 	closeOnce           sync.Once
+	closing             bool
 	persistentSelected  string
+	windowSpaceUUID     string
+	windowSpaceTesting  bool
 	backgroundDisplay   bool
 	backgroundDisplayID uint32
 	mappingSessions     map[string]*launcherMappingSession
@@ -320,7 +323,7 @@ func NewApp(engine, dataDir, cDrive string) (*App, error) {
 	a.library.OpenGLBackend = normalizeOpenGLBackend(defaults.OpenGLBackend)
 	a.library.CompilerWorkers = normalizeCompilerWorkers(defaults.CompilerWorkers)
 	a.library.CPUCoresX64 = normalizeCPUCount(migratedCPUCoresX64(defaults.CPUCoresX64, defaults.CPUDefaultsVersion, a.cpuLimits.X64Max), a.cpuLimits.X64Max, min(defaultCPUCores, a.cpuLimits.X64Max))
-	a.library.CPUCoresX86 = normalizeCPUCount(defaults.CPUCoresX86, a.cpuLimits.X86Max, min(defaultCPUCores, a.cpuLimits.X86Max))
+	a.library.CPUCoresX86 = normalizeCPUCount(migratedCPUDefault(defaults.CPUCoresX86, defaults.CPUDefaultsVersion, a.cpuLimits.X86Max), a.cpuLimits.X86Max, min(defaultCPUCores, a.cpuLimits.X86Max))
 	if cDrive != "" {
 		a.library.CDrive = cDrive
 	}
@@ -463,16 +466,29 @@ func (a *App) snapshotLocked() Snapshot {
 }
 func (a *App) Snapshot() Snapshot { a.mu.Lock(); defer a.mu.Unlock(); return a.snapshotLocked() }
 func (a *App) Add(paths []string) (AddResult, error) {
+	if len(paths) > 128 {
+		return AddResult{}, errors.New("一次最多加入 128 個程式")
+	}
+	additions := make([]programAddition, len(paths))
+	for i, path := range paths {
+		additions[i].Path = path
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.addProgramsLocked(additions, true)
+}
+
+// 手動加入與安裝探索共用去重、設定保留、容量限制及原子儲存流程。
+func (a *App) addProgramsLocked(additions []programAddition, selectAdded bool) (AddResult, error) {
 	next := a.library
 	next.Programs = append([]Program{}, next.Programs...)
 	result := AddResult{Errors: []string{}}
-	if len(paths) > 128 {
-		return result, errors.New("一次最多加入 128 個程式")
+	if a.closing {
+		return result, errors.New("啟動器正在關閉")
 	}
 	selected := ""
-	for _, path := range paths {
+	for _, addition := range additions {
+		path := addition.Path
 		p, err := inspectProgram(path)
 		if err != nil {
 			result.Errors = append(result.Errors, filepath.Base(path)+"："+err.Error())
@@ -501,6 +517,15 @@ func (a *App) Add(paths []string) (AddResult, error) {
 			break
 		}
 		p.CDrive = a.library.CDrive
+		p.GpuMemoryMiB = a.gpuMemoryLimits.DefaultMiB
+		if addition.Defaults != nil {
+			p.Settings = *addition.Defaults
+			p.GpuMemoryMiB = a.gpuMemoryLimits.DefaultMiB
+			p.GpuDefaultsVersion = gpuMemoryDefaultsVersion
+		}
+		if addition.Name != "" {
+			p.Name = addition.Name
+		}
 		// 移出後重新加入相同路徑時，沿用該 EXE 的獨立設定。
 		firstAddition := false
 		if data, readErr := os.ReadFile(a.profilePath(p.ID)); readErr == nil {
@@ -510,6 +535,9 @@ func (a *App) Add(paths []string) (AddResult, error) {
 				continue
 			}
 			p.Settings = saved.Settings
+			if saved.Name != "" {
+				p.Name = saved.Name
+			}
 			p.MaxInstructions = instructionBudget(p.MaxInstructions)
 		} else if !errors.Is(readErr, os.ErrNotExist) {
 			return result, readErr
@@ -529,7 +557,7 @@ func (a *App) Add(paths []string) (AddResult, error) {
 			selected = p.ID
 		}
 	}
-	if selected != "" {
+	if selectAdded && selected != "" {
 		next.Selected = selected
 	}
 	if err := a.saveLocked(next); err != nil {
@@ -665,6 +693,7 @@ func validateSettings(settings Settings) (Settings, error) {
 	if settings.GpuMemoryMiB, err = validateGPUMemory(settings.GpuMemoryMiB); err != nil {
 		return settings, err
 	}
+	settings.GpuDefaultsVersion = gpuMemoryDefaultsVersion
 	settings.MaxInstructions = instructionBudget(settings.MaxInstructions)
 	return settings, nil
 }
@@ -686,6 +715,7 @@ func (a *App) SaveGPUMemory(id string, value uint64) error {
 		return nil
 	}
 	p.GpuMemoryMiB = value
+	p.GpuDefaultsVersion = gpuMemoryDefaultsVersion
 	if !p.Temporary {
 		if err = writeJSONAtomic(a.profilePath(id), p); err != nil {
 			return err
@@ -717,14 +747,9 @@ func normalizeAppearance(language, theme string) (string, string) {
 	}
 	return language, theme
 }
-func normalizeOpenGLBackend(mode string) string {
-	switch mode {
-	case "auto", "metal", "legacy":
-		return mode
-	default:
-		return "auto"
-	}
-}
+
+// Launcher 的 OpenGL 後端固定使用 AUTO，舊設定及外部要求不再覆寫。
+func normalizeOpenGLBackend(_ string) string { return "auto" }
 func validateGlobalSettings(settings GlobalSettings) (GlobalSettings, error) {
 	certificatePath, err := certificateRootsRelativePath(settings.CertificateRootsPath)
 	if err != nil {
@@ -747,9 +772,6 @@ func validateGlobalSettings(settings GlobalSettings) (GlobalSettings, error) {
 		return GlobalSettings{}, err
 	}
 	backend := normalizeOpenGLBackend(settings.OpenGLBackend)
-	if settings.OpenGLBackend != "" && backend != settings.OpenGLBackend {
-		return GlobalSettings{}, errors.New("不支援的 OpenGL 後端")
-	}
 	language, theme := normalizeAppearance(settings.Language, settings.Theme)
 	if (settings.Language != "" && language != settings.Language) || (settings.Theme != "" && theme != settings.Theme) {
 		return GlobalSettings{}, errors.New("不支援的語言或介面配色")
@@ -948,6 +970,7 @@ func (a *App) Start(id string, settings Settings, cols, rows uint16) (Snapshot, 
 	if p.InstallRoot != "" {
 		args = append(args, "--install-root", p.InstallRoot)
 	}
+	installation := captureInstallation(p, a.library.Drives, filepath.Join(a.dataDir, "registry.dat"))
 	cmd := exec.Command(a.engine, args...)
 	cmd.Dir = p.WorkDir
 	environment, err := a.engineEnvironmentLocked()
@@ -1033,12 +1056,15 @@ func (a *App) Start(id string, settings Settings, cols, rows uint16) (Snapshot, 
 			<-readDone
 			r.closeTerminal()
 		}
-		r.mu.Lock()
-		defer r.mu.Unlock()
 		code := cmd.ProcessState.ExitCode()
 		if cmd.ProcessState.Exited() {
 			code = guestProcessExitCode(r.diagnostics, code)
 		}
+		if installation != nil && cmd.ProcessState.Exited() && (code == 0 || code == 3010 || code == 1641) {
+			a.finishInstallation(installation, r)
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
 		r.exitCode = &code
 		switch {
 		case r.stopping:
@@ -1304,6 +1330,7 @@ func (a *App) Close() {
 func (a *App) close() {
 	a.closeAnalyses()
 	a.mu.Lock()
+	a.closing = true
 	runs := make(map[string]*execution, len(a.runs))
 	for id, r := range a.runs {
 		runs[id] = r

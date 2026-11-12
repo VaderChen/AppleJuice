@@ -17,7 +17,7 @@
       check('關於頁有偵測版本更新按鈕', !$('global-about').hidden && !$('check-update').disabled);
       $('check-update').click();
       await until(() => $('update-dialog').open && updateStatus.phase === 'latest' && $('update-summary').textContent.includes(updateStatus.current), '手動檢查結果');
-      check('手動檢查顯示已是最新版本', $('update-summary').textContent.includes(updateStatus.current) && $('update-now').hidden && !$('update-later').hidden && $('update-status').textContent === $('update-summary').textContent);
+      check('手動檢查顯示已是最新版本', $('update-summary').textContent.includes(updateStatus.current) && $('update-now').hidden && !$('update-later').hidden && $('update-status').textContent === '');
       await capture('update-latest.png');
       $('update-later').click();
       check('關閉對話框', !$('update-dialog').open);

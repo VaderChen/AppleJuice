@@ -69,7 +69,7 @@ struct BuiltinSystemCall {
     std::uint16_t stack_bytes{};
 };
 const auto& builtin_layouts(){
-    static const auto bases=[] {std::set<std::string> names{"kernel32.dll","wsock32.dll"};for(const auto name:modern_crt_libraries)names.emplace(name);for(const auto name:legacy_crt_libraries)names.emplace(name);for(const auto& item:runtime_service_descriptors())if(item.family.ends_with(".dll") || item.family.ends_with(".drv") || item.family.ends_with(".ocx") || item.family.ends_with(".cpl") || item.family.ends_with(".exe"))names.emplace(item.family);
+    static const auto bases=[] {std::set<std::string> names{"kernel32.dll","wsock32.dll","riched20.dll","riched32.dll"};for(const auto name:modern_crt_libraries)names.emplace(name);for(const auto name:legacy_crt_libraries)names.emplace(name);for(const auto& item:runtime_service_descriptors())if(item.family.ends_with(".dll") || item.family.ends_with(".drv") || item.family.ends_with(".ocx") || item.family.ends_with(".cpl") || item.family.ends_with(".exe"))names.emplace(item.family);
             for(const auto& alias:detail::service_export_aliases)names.emplace(alias.family);
             std::map<std::string,std::pair<std::size_t,std::size_t>,std::less<>> exports;
             for(const auto& item:runtime_service_descriptors()){auto& entry=exports[std::string(item.family)];++entry.first;entry.second+=item.symbol.size()+1;}
@@ -175,6 +175,7 @@ GuestAddress WindowsServices::builtin_constant_address(std::string_view family,s
     return GuestAddress{windows_address_layout::for_mode(x86_?ExecutionMode::X86:ExecutionMode::X64).images+slot->second.first*windows_address_layout::module_stride+detail::builtin_constant_rva+static_cast<std::uint64_t>(value-constants.begin())*8};
 }
 bool WindowsServices::builtin_module(std::string_view name) const {
+    if(name=="riched20.dll" || name=="riched32.dll")return true;
     if(angle_module(name))return native_angle_!=nullptr;
     if(native_library_module(name))return native_libraries_.enabled(name);
     if(const auto host=windows_api_set_host(name);host!=name)return builtin_module(host);

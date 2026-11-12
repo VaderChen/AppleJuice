@@ -91,6 +91,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"user32.dll","IsClipboardFormatAvailable",1},{"user32.dll","RegisterClipboardFormatA",1},{"user32.dll","RegisterClipboardFormatW",1},
         {"kernel32.dll","GlobalMemoryStatus",1},{"kernel32.dll","GlobalMemoryStatusEx",1},
         {"kernel32.dll","GetThreadTimes",5},{"kernel32.dll","GetProcessTimes",5},{"kernel32.dll","QueryProcessCycleTime",2},{"user32.dll","GetCursorPos",1},{"user32.dll","GetPhysicalCursorPos",1},{"user32.dll","SetPhysicalCursorPos",2},{"user32.dll","SetCursorPos",2},{"user32.dll","GetCursorInfo",1},{"user32.dll","GetCursor",0},
+        {"user32.dll","SetProcessDefaultLayout",1},{"user32.dll","GetProcessDefaultLayout",1},
         {"user32.dll","LoadImageA",6},{"user32.dll","LoadImageW",6},
         {"user32.dll","DisableProcessWindowsGhosting",0},
         {"user32.dll","ShutdownBlockReasonCreate",2},{"user32.dll","ShutdownBlockReasonQuery",3},{"user32.dll","ShutdownBlockReasonDestroy",1},
@@ -103,7 +104,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"user32.dll","SetTimer",4},{"user32.dll","SetCoalescableTimer",5},{"user32.dll","KillTimer",2},{"user32.dll","GetQueueStatus",1},{"user32.dll","MsgWaitForMultipleObjects",5},{"user32.dll","MsgWaitForMultipleObjectsEx",5},
         {"user32.dll","GetKeyboardLayout",1},{"user32.dll","GetKeyboardLayoutNameA",1},{"user32.dll","GetKeyboardLayoutNameW",1},{"user32.dll","GetKeyboardLayoutList",2},{"user32.dll","TrackMouseEvent",1},{"comctl32.dll","_TrackMouseEvent",1},{"user32.dll","GetAsyncKeyState",1},{"user32.dll","GetLastInputInfo",1},{"user32.dll","GetKeyboardState",1},{"user32.dll","SetKeyboardState",1},
         {"user32.dll","CreateCaret",4},{"user32.dll","DestroyCaret",0},{"user32.dll","ShowCaret",1},{"user32.dll","HideCaret",1},{"user32.dll","SetCaretPos",2},{"user32.dll","GetCaretPos",1},
-        {"user32.dll","SetScrollInfo",4},{"user32.dll","GetScrollInfo",3},{"user32.dll","SetCursor",1},{"user32.dll","ShowCursor",1},
+        {"user32.dll","SetScrollInfo",4},{"user32.dll","GetScrollInfo",3},{"user32.dll","GetScrollBarInfo",3},{"user32.dll","SetCursor",1},{"user32.dll","ShowCursor",1},
         {"user32.dll","GetCapture",0},{"user32.dll","SetCapture",1},{"user32.dll","ReleaseCapture",0},
         {"user32.dll","CreateDialogParamA",5},{"user32.dll","CreateDialogParamW",5},
         {"user32.dll","DefDlgProcA",4},{"user32.dll","DefDlgProcW",4},{"user32.dll","IsDialogMessageA",2},{"user32.dll","IsDialogMessageW",2},
@@ -377,7 +378,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,0);return std::nullopt;}
         }}
     }
-    else if(symbol=="CoCreateInstance" || symbol=="CoGetClassObject"){if(begin_registered_com(state,memory,service))return std::nullopt;if(begin_msxml_com(state,memory,service))return std::nullopt;if(begin_ribbon_com(state,memory,service))return std::nullopt;if(dmusic::is_class(memory,arg(0)))return invoke_directmusic(state,memory,service);if(wic::is_class(memory,arg(0)))return invoke_wic(state,memory,service);if(dsound::is_class(memory,arg(0)))return invoke_dsound(state,memory,service);if(xaudio::is_class(memory,arg(0)))return invoke_xaudio(state,memory,service);if(wasapi::is_class(memory,arg(0)))return invoke_wasapi(state,memory,service);if(dinput::is_class(memory,arg(0)))return invoke_dinput(state,memory,service);if(symbol=="CoGetClassObject"){memory.store(GuestAddress{arg(4)},x86_?32:64,0);arg.return_to(state,0x80040154U);return std::nullopt;}return invoke_wmi(state,memory,service);}
+    else if(symbol=="CoCreateInstance" || symbol=="CoGetClassObject"){if(begin_registered_com(state,memory,service))return std::nullopt;if(begin_msxml_com(state,memory,service))return std::nullopt;if(begin_webbrowser_com(state,memory,service))return std::nullopt;if(begin_ribbon_com(state,memory,service))return std::nullopt;if(dmusic::is_class(memory,arg(0)))return invoke_directmusic(state,memory,service);if(wic::is_class(memory,arg(0)))return invoke_wic(state,memory,service);if(dsound::is_class(memory,arg(0)))return invoke_dsound(state,memory,service);if(xaudio::is_class(memory,arg(0)))return invoke_xaudio(state,memory,service);if(wasapi::is_class(memory,arg(0)))return invoke_wasapi(state,memory,service);if(dinput::is_class(memory,arg(0)))return invoke_dinput(state,memory,service);if(symbol=="CoGetClassObject"){memory.store(GuestAddress{arg(4)},x86_?32:64,0);arg.return_to(state,0x80040154U);return std::nullopt;}return invoke_wmi(state,memory,service);}
     else if(symbol.starts_with("InitCommonControls")){if(symbol.ends_with("Ex")){if(memory.load(GuestAddress{arg(0)},32)!=8)fail(87);else result=1;}}
     else if(symbol=="DisableProcessWindowsGhosting"){
         // 此 void API 停用的是 Windows 的替身視窗；AppKit 後端本來不建立替身。
@@ -528,6 +529,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         if(!valid)fail(1402);
         else if(native_gui_ && interactive_station() && !native_gui_->set_cursor(selected,count>=0 && handle!=0))fail(50);
         else {gui_.cursor_animation_start=start;gui_.cursor_animation_step=step;if(set){result=gui_.cursor;gui_.cursor=handle;}else{gui_.cursor_count=count;result=static_cast<std::uint64_t>(static_cast<std::int64_t>(count));}}
+    }
+    else if(symbol=="GetScrollBarInfo"){
+        const auto found=gui_.windows.find(arg(0));const auto object=static_cast<std::int32_t>(arg(1));const auto out=arg(2);
+        if(found==gui_.windows.end())fail(1400);
+        else if(!out || memory.load(GuestAddress{out},32)!=60 || (object!=-4 && object!=-5 && object!=-6))fail(87);
+        else if(object==-4 && gui_control_class(found->second)!=u"scrollbar"){
+            start_callbacks(state,memory,{{resolve("user32.dll","SendMessageW").value,{arg(0),0xeb,0,out}}},Continuation::ReturnCallback,0);return std::nullopt;
+        }else {
+            const auto& w=found->second;const bool control=object==-4,vertical=control?(w.style&1)!=0:object==-5;
+            const auto origin=gui_client_origin(gui_,arg(0));
+            std::int64_t left=origin[0],top=origin[1],right=left+w.width,bottom=top+w.height;
+            if(!control){if(vertical){if(w.ex_style&0x4000){right=left;left-=16;}else{left=right;right+=16;}}else{top=bottom;bottom+=16;}}
+            const auto length=static_cast<std::uint32_t>(std::max<std::int64_t>(0,vertical?bottom-top:right-left));
+            const auto arrow=std::min(16U,length/2),track=length-2*arrow;
+            const auto stored=gui_.scroll_info.find({arg(0),control?2U:vertical?1U:0U});
+            const auto load=[&](unsigned at,std::uint32_t fallback){if(stored==gui_.scroll_info.end())return fallback;std::uint32_t value=0;for(unsigned i=0;i<4;++i)value|=std::uint32_t{stored->second[at+i]}<<(8*i);return value;};
+            const auto low=static_cast<std::int32_t>(load(8,0)),high=std::max(low,static_cast<std::int32_t>(load(12,100)));
+            const auto range=static_cast<std::uint64_t>(static_cast<std::int64_t>(high)-low+1),page=std::min<std::uint64_t>(load(16,0),range);
+            const auto limit=static_cast<std::int64_t>(high)-static_cast<std::int64_t>(page?page-1:0);
+            const auto pos=std::clamp<std::int64_t>(static_cast<std::int32_t>(load(20,0)),low,limit);
+            const auto thumb=std::min<std::uint64_t>(track,std::max<std::uint64_t>(8,page?track*page/range:16));
+            const auto start=arrow+(limit>low?static_cast<std::uint64_t>(pos-low)*(track-thumb)/static_cast<std::uint64_t>(limit-low):0);
+            memory.fill(GuestAddress{out},0,60);memory.store(GuestAddress{out},32,60);
+            const std::array<std::int64_t,4> rectangle{left,top,right,bottom};for(unsigned i=0;i<4;++i)memory.store(GuestAddress{out+4+i*4},32,static_cast<std::uint32_t>(rectangle[i]));
+            memory.store(GuestAddress{out+20},32,arrow);memory.store(GuestAddress{out+24},32,start);memory.store(GuestAddress{out+28},32,start+thumb);
+            const auto visible=control || (w.style&(vertical?0x100000U:0x200000U));
+            memory.store(GuestAddress{out+36},32,(!visible?0x8000U:0U)|(!w.visible || !length?0x10000U:0U)|(!w.enabled?1U:0U));
+            for(unsigned i=1;i<6;++i){std::uint32_t flags=!w.enabled || limit<=low?1:0;
+                const auto arrows=gui_.scroll_arrows.find({arg(0),control?2U:vertical?1U:0U});const auto disabled=arrows==gui_.scroll_arrows.end()?0:arrows->second;
+                if(i==1 && (pos==low || (disabled&1)))flags|=1;if(i==5 && (pos==limit || (disabled&2)))flags|=1;
+                if((i==2 && pos==low) || (i==4 && pos==limit))flags|=0x8000;
+                memory.store(GuestAddress{out+36+i*4},32,flags);
+            }result=1;
+        }
     }
     else if(symbol=="SetScrollInfo" || symbol=="GetScrollInfo" || symbol=="GetScrollPos"){
         if(!gui_.windows.contains(arg(0)))fail(1400);else if(d(1)>2)fail(87);

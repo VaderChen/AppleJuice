@@ -20,14 +20,15 @@ std::span<const WindowsServiceDescriptor> shell_service_descriptors() {
         {"shell32.dll","FindExecutableA",3},{"shell32.dll","FindExecutableW",3},
         {"shell32.dll","SHAppBarMessage",2},{"shell32.dll","SHOpenFolderAndSelectItems",4},{"shell32.dll","SHOpenWithDialog",2},
         {"shell32.dll","SHChangeNotify",4},{"shell32.dll","SHGetPropertyStoreForWindow",3},
+        {"shell32.dll","SHAddToRecentDocs",2},
         {"ole32.dll","PropVariantClear",1},{"ole32.dll","PropVariantCopy",2},{"propsys.dll","InitPropVariantFromCLSID",2},{"propsys.dll","PSCreateMemoryPropertyStore",2},{"propsys.dll","VariantCompare",2},{"propsys.dll","PropVariantToStringAlloc",2},{"propsys.dll","PropVariantToString",3},
         {"internal-shell","IPropertyStore.QueryInterface",3},{"internal-shell","IPropertyStore.AddRef",1},{"internal-shell","IPropertyStore.Release",1},
         {"internal-shell","IPropertyStore.GetCount",2},{"internal-shell","IPropertyStore.GetAt",3},{"internal-shell","IPropertyStore.GetValue",3},{"internal-shell","IPropertyStore.SetValue",3},{"internal-shell","IPropertyStore.Commit",1},
         {"shell32.dll","SHGetKnownFolderPath",4},{"shell32.dll","SHGetKnownFolderIDList",4},
-        {"shell32.dll","SHGetFolderPathA",5},{"shell32.dll","SHGetFolderPathW",5},{"shell32.dll","SHGetFolderPathAndSubDirA",6},{"shell32.dll","SHGetFolderPathAndSubDirW",6},{"shell32.dll","SHGetSettings",2},
+        {"shell32.dll","SHGetFolderPathA",5},{"shell32.dll","SHGetFolderPathW",5},{"shell32.dll","SHGetFolderPathAndSubDirA",6},{"shell32.dll","SHGetFolderPathAndSubDirW",6},{"shell32.dll","SHGetSettings",2},{"shell32.dll","SHRestricted",1},
         {"shfolder.dll","SHGetFolderPathA",5},{"shfolder.dll","SHGetFolderPathW",5},
         {"shell32.dll","SHFileOperationA",1},{"shell32.dll","SHFileOperationW",1},
-        {"shell32.dll","SHCloneSpecialIDList",3},{"shell32.dll","SHGetSpecialFolderLocation",3},{"shell32.dll","SHGetFileInfoA",5},{"shell32.dll","SHGetFileInfoW",5},
+        {"shell32.dll","SHCloneSpecialIDList",3},{"shell32.dll","SHGetSpecialFolderLocation",3},{"shell32.dll","SHGetFolderLocation",5},{"shell32.dll","SHGetFileInfoA",5},{"shell32.dll","SHGetFileInfoW",5},
         {"shell32.dll","SHGetSpecialFolderPathA",4},{"shell32.dll","SHGetSpecialFolderPathW",4},
         {"shell32.dll","SHBrowseForFolderA",1},{"shell32.dll","SHBrowseForFolderW",1},
         {"shell32.dll","SHGetPathFromIDListA",2},{"shell32.dll","SHGetPathFromIDListW",2},
@@ -42,6 +43,7 @@ std::span<const WindowsServiceDescriptor> shell_service_descriptors() {
     };return table;
 }
 namespace {
+#include "shell_restrictions.inc"
 constexpr std::uint32_t invalid_argument=0x80070057U,not_implemented=0x80004001U;
 constexpr std::uint32_t browse_selection_changed=0x10005;
 std::uint32_t hresult(std::uint32_t error){return error?0x80070000U|(error&0xffffU):0;}
@@ -71,6 +73,7 @@ std::u16string known_folder(std::uint32_t id){
         case 2:return u"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs";
         case 5:return u"C:\\Users\\User\\Documents";
         case 6:return u"C:\\Users\\User\\Favorites";
+        case 8:return u"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\Recent";
         case 0xd:return u"C:\\Users\\User\\Music";
         case 0xe:return u"C:\\Users\\User\\Videos";
         case 0x27:return u"C:\\Users\\User\\Pictures";
@@ -103,6 +106,7 @@ std::u16string known_folder(std::uint32_t id){
 std::u16string known_folder_guid(const GuestMemory& memory,std::uint64_t address){
     // 識別值來自 Microsoft KNOWNFOLDERID；路徑共用本沙箱既有 CSIDL 模型。
     static const std::map<std::array<std::uint8_t,16>,std::uint32_t> ids{
+        {{0x81,0x6f,0x09,0xae,0x1d,0x33,0x4c,0x4d,0xad,0xc9,0xe3,0xe3,0xa9,0x4a,0x6b,0xc1},8}, // Recent
         {{0x3a,0xcc,0xbf,0xb4,0x2c,0xdb,0x4c,0x42,0xb0,0x29,0x7f,0xe9,0x9a,0x87,0xc6,0x41},16}, // Desktop
         {{0xd0,0x9a,0xd3,0xfd,0x8f,0x23,0xaf,0x46,0xad,0xb4,0x6c,0x85,0x48,0x03,0x69,0xc7},5}, // Documents
         {{0x90,0xe2,0x4d,0x37,0x3f,0x12,0x65,0x45,0x91,0x64,0x39,0xc4,0x92,0x5e,0x46,0x7b},256}, // Downloads
@@ -234,7 +238,9 @@ std::uint32_t WindowsServices::finish_shell_delete(GuestMemory& memory,const Gui
     }
     return finish(0);
 }
+#include "windows_shell_recent.inc"
 std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol=="SHAddToRecentDocs")return invoke_recent_document(state,memory,service);
     if(service.symbol=="SHAppBarMessage" || service.symbol=="SHOpenFolderAndSelectItems" || service.symbol=="SHOpenWithDialog")return invoke_shell_desktop(state,memory,service);
     if(service.symbol=="SHChangeNotify")return invoke_shell_notification(state,memory,service);
     if(service.symbol.starts_with("ShellExecute") || service.symbol.starts_with("FindExecutable"))return invoke_shell_execute(state,memory,service);
@@ -568,12 +574,29 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
     }
     else if(symbol=="CoTaskMemFree" || symbol=="ILFree"){
         if(arg(0)){gui_.shell_pidls.erase(arg(0));if(!free_heap(memory,arg(0),state))last_error_=6;else gui_.task_allocations.erase(arg(0));}
-    }else if(symbol=="SHGetSpecialFolderLocation" || symbol=="SHCloneSpecialIDList"){
-        const bool clone=symbol=="SHCloneSpecialIDList";
+    }else if(symbol=="SHRestricted"){
+        const auto requested=static_cast<std::uint32_t>(arg(0));
+        const auto user=registry_current_user_path();
+        RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
+        if(transaction.error)last_error_=transaction.error;
+        else for(const auto& restriction:shell_restrictions){
+            if(restriction.id!=requested && !(requested<0x40000000U && restriction.id<0x40000000U && (requested&restriction.id)))continue;
+            for(const auto& root:std::array<std::u16string,2>{std::u16string(1,2),user}){
+                const auto key=runtime_.registry.keys.find(root+u"\\software\\microsoft\\windows\\currentversion\\policies\\"+std::u16string(restriction.group));
+                if(key==runtime_.registry.keys.end())continue;
+                const auto value=key->second.find(std::u16string(restriction.name));
+                if(value==key->second.end() || value->second.type!=4 || value->second.bytes.size()!=4)continue;
+                for(unsigned i=0;i<4;++i)result|=std::uint32_t{value->second.bytes[i]}<<(8*i);
+                break; // 機器值即使為 0 也優先於使用者值。
+            }
+            if(result)break;
+        }
+    }else if(symbol=="SHGetSpecialFolderLocation" || symbol=="SHGetFolderLocation" || symbol=="SHCloneSpecialIDList"){
+        const bool clone=symbol=="SHCloneSpecialIDList",extended=symbol=="SHGetFolderLocation";const auto output=arg(extended?4:2);
         const auto flags=static_cast<std::uint32_t>(arg(1))|(clone && arg(2)?0x8000U:0U);const auto path=known_folder(flags&0xff);
-        if((!clone && !arg(2)) || (flags&~0xc8ffU))result=invalid_argument;
+        if((!clone && !output) || (flags&~0xc8ffU) || (extended && arg(3)))result=invalid_argument;
         else {
-            if(!clone)memory.store(GuestAddress{arg(2)},x86_?32:64,0);std::uint32_t error=0;
+            if(!clone)memory.store(GuestAddress{output},x86_?32:64,0);std::uint32_t error=0;
             if(path.empty())result=not_implemented;
             else {
                 if(flags&0x8000){
@@ -584,7 +607,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
                     }
                 }else if(!(flags&0x4000)){const auto info=filesystem_.information(utf16_to_utf8(path));error=info.error;if(!error && !(info.metadata.attributes&16))error=3;}
                 if(error)result=hresult(error);
-                else {const auto pidl=shell_make_pidl(memory,path);if(pidl){if(clone){arg.return_to(state,pidl);return std::nullopt;}memory.store(GuestAddress{arg(2)},x86_?32:64,pidl);}else result=0x8007000eU;}
+                else {const auto pidl=shell_make_pidl(memory,path);if(pidl){if(clone){arg.return_to(state,pidl);return std::nullopt;}memory.store(GuestAddress{output},x86_?32:64,pidl);}else result=0x8007000eU;}
             }
         }
         if(clone)result=0; // 指標 API 的失敗值不能回傳 HRESULT。

@@ -1,3 +1,4 @@
+#include "webbrowser_abi.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_guid.hpp"
@@ -205,6 +206,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole(GuestState& state,Guest
             if(key==runtime_.registry.keys.end() || !key->second.contains(u""))continue;
             registered=lookup.value_at(root+u"\\"+path);if(!registered)return done(0x80040150U);break;
         }
+        if(!registered && value==webbrowser::clsid)registered=u"Shell.Explorer.2";
         if(!registered)return done(0x80040154U);
         const auto bytes=utf16_bytes(*registered);const auto pointer=allocate_heap(memory,bytes.size());if(!pointer)return done(e_outofmemory);
         memory.write(GuestAddress{pointer},bytes);memory.store(GuestAddress{arg(1)},bits,pointer);return done(0);
@@ -219,6 +221,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole(GuestState& state,Guest
             initialize_tokens();RegistryTextView lookup{runtime_.registry,class_registry_roots(runtime_.registry,token_user_sid_string(effective_token_id()),token_user_sid_string(1)),registry_view(0,x86_),false};
             if(!text.empty())if(const auto registered=lookup.value(text+u"\\clsid"))value=parse_windows_guid(*registered,true);
         }
+        if(!value && (name=="CLSIDFromString" || name=="CLSIDFromProgID")){auto progid=text;for(auto& c:progid)if(c>=u'A' && c<=u'Z')c+=32;if(progid==u"shell.explorer" || progid==u"shell.explorer.2")value=webbrowser::clsid;}
         if(!value)return done(rpc?1705:name=="IIDFromString"?e_invalidarg:0x800401f3U);memory.write(GuestAddress{arg(1)},*value);return done(0);
     }
     if(name=="UuidCompare" || name=="UuidEqual" || name=="UuidIsNil"){

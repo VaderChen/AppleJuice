@@ -1,4 +1,4 @@
-// 真 WKWebView 經正式設定、內建測試加入按鈕及列表執行圖示，驗證打包後端。
+// 真 WKWebView 經後端測試 API 設定與加入 PE，再由列表執行圖示驗證打包後端。
 (async () => {
   const checks = [], runs = [], captures = [];
   const deadline = Date.now() + (smokeConfig.timeoutSeconds - 2) * 1000;
@@ -9,16 +9,15 @@
   try {
     await window.launcherReady;
     check('V8 後端與雙架構測試已內建', state.nativeV8Ready && state.nativeV8TestsReady);
-    await click('app-settings'); await click('global-tab-experimental');
-    check('V8 原型預設關閉', !$('native-v8-bridge').checked && !state.globalSettings.nativeV8Bridge);
-    await click('native-v8-bridge'); await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存 V8');
-    check('V8 開關已保存', state.globalSettings.nativeV8Bridge === true);
-    await click('app-settings-close'); await click('app-settings'); await click('global-tab-experimental');
-    check('V8 重開設定保留開關', $('native-v8-bridge').checked);
-    await click('native-v8-bridge'); await click('global-settings-cancel'); await click('app-settings'); await click('global-tab-experimental');
-    check('取消保留已保存 V8', $('native-v8-bridge').checked);
-    await wait(150); await api('smokeSnapshot', {data: 'v8-settings.png'}); await until(() => api('smokeSnapshotReady', {data: 'v8-settings.png'}), 'V8 設定快照'); captures.push('v8-settings.png');
-    await click('add-native-v8-tests'); await until(() => state.programs.length === 2, '加入兩個 PE');
+    check('V8 原型預設關閉', !state.globalSettings.nativeV8Bridge);
+    await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, nativeV8Bridge: true}})));
+    await click('app-settings');
+    check('實驗性功能分頁已移除', !$('global-tab-experimental') && !$('global-experimental'));
+    await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存其他設定');
+    check('儲存其他設定保留 V8 開關', state.globalSettings.nativeV8Bridge === true);
+    await click('app-settings-close');
+    await perform(async () => applyState((await api('addNativeV8Tests')).state));
+    await until(() => state.programs.length === 2, '加入兩個 PE');
     check('內建測試為真 x86／x64 PE', state.programs.map(p => p.architecture).sort().join(',') === 'x64,x86');
     for (const p of state.programs) {
       const action = document.querySelector(`[data-id="${p.id}"] .program-action`);

@@ -21,6 +21,13 @@
 #include <mach/mach.h>
 #include <cmath>
 namespace x64arm {
+std::uint32_t native_suspend_system(bool hibernate,bool disable_wake_events){
+    // 公開 IOKit 只提供一般睡眠；不變更宿主 hibernatemode、排程喚醒或全域電源設定。
+    if(hibernate || disable_wake_events || !IOPMSleepEnabled())return 50;
+    const auto connection=IOPMFindPowerManagement(MACH_PORT_NULL);if(!connection)return 21;
+    const auto status=IOPMSleepSystem(connection);IOServiceClose(connection);
+    return status==kIOReturnSuccess?0U:status==kIOReturnNotPrivileged?1314U:status==kIOReturnNotPermitted?5U:status==kIOReturnUnsupported?50U:31U;
+}
 namespace {
 struct Release {void operator()(CFTypeRef p)const{if(p)CFRelease(p);}};
 template<class T>using Cf=std::unique_ptr<std::remove_pointer_t<T>,Release>;

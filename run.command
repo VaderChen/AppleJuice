@@ -52,5 +52,32 @@ if /usr/bin/pgrep -x Win64Launcher >/dev/null; then
     done
 fi
 
+# 清除本 App 與內嵌引擎的歷史桌面綁定；保留其他應用程式的設定。
+python3 - "$app_path" <<'PY_POLICY'
+import pathlib, plistlib, subprocess, sys, os, pwd
+app = pathlib.Path(sys.argv[1])
+def preferences(domain):
+    result = subprocess.run(['/usr/bin/defaults', 'export', domain, '-'], capture_output=True)
+    return plistlib.loads(result.stdout) if result.returncode == 0 else {}
+identifiers = []
+for bundle in [app, *(app / 'Contents/Helpers').glob('*.app')]:
+    info = plistlib.loads((bundle / 'Contents/Info.plist').read_bytes())
+    if info.get('CFBundleIdentifier'):
+        identifiers.append(info['CFBundleIdentifier'])
+bindings = preferences('com.apple.spaces').get('app-bindings', {})
+removed = [identifier for identifier in identifiers if identifier in bindings]
+if removed:
+    remaining = {key: value for key, value in bindings.items() if key not in identifiers}
+    if not all(isinstance(key, str) and isinstance(value, str) for key, value in remaining.items()):
+        raise RuntimeError('桌面綁定格式不支援，保留其他應用程式的設定')
+    values = [value for item in remaining.items() for value in item]
+    subprocess.run(['/usr/bin/defaults', 'write', 'com.apple.spaces', 'app-bindings', '-dict', *values], check=True)
+    # Dock 會快取桌面綁定。僅在實際移除舊綁定時重新載入一次；一般啟動不重複執行。
+    subprocess.run(['/usr/bin/killall', '-u', pwd.getpwuid(os.getuid()).pw_name, 'Dock'], check=False)
+for identifier in identifiers:
+    if 'AppleJuiceWindowSpaceUUID' in preferences(identifier):
+        subprocess.run(['/usr/bin/defaults', 'delete', identifier, 'AppleJuiceWindowSpaceUUID'], check=True)
+PY_POLICY
+
 print '正在啟動最新的 Win64 Launcher…'
-exec /usr/bin/open "$app_path"
+exec /usr/bin/open -g -F "$app_path"

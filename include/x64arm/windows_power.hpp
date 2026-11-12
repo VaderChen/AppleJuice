@@ -22,6 +22,7 @@ std::optional<std::array<std::uint8_t,16>> native_system_power_information();
 std::optional<std::vector<std::array<std::uint32_t,6>>> native_processor_power_information(unsigned count);
 // ACPI 角色不可得時，依實際內建電池採用 Windows 的 mobile／desktop 備援規則。
 std::optional<std::uint32_t> native_power_role();
+std::uint32_t native_suspend_system(bool hibernate,bool disable_wake_events);
 struct NativePowerSourcePreferences {
     bool present{};
     // 順序為螢幕、系統、磁碟閒置逾時，macOS 的單位為分鐘。

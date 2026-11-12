@@ -197,6 +197,23 @@ bool WindowsServices::begin_gui_control(GuestState& state,GuestMemory& memory,co
         }catch(...){if(const auto live=gui_.windows.find(message.window);live!=gui_.windows.end())live->second.invalid=true;discard_gui_control(token);throw;}
         return true;
     }
+    if(message.message==0x7b && cls==u"syslistview32" && gui_.windows.contains(window->second.parent)){
+        start_callbacks(state,memory,{{resolve("user32.dll",wide?"SendMessageW":"SendMessageA").value,{window->second.parent,0x7b,message.wparam,message.lparam}}},Continuation::ReturnCallback);return true;
+    }
+    if(message.message==0x205 && cls==u"syslistview32"){
+        const auto& view=window->second;if(!view.enabled || !gui_.windows.contains(view.parent)){complete_call(state,memory,0);return true;}
+        GuiControlOperation op;op.message=message;op.thread=threads_.current;op.wide=wide;
+        if(gui_.control_notification_buffers.empty())op.buffer=runtime_allocate(memory,{},gui_control_notification_bytes);else {op.buffer=gui_.control_notification_buffers.back();gui_.control_notification_buffers.pop_back();}
+        memory.fill(GuestAddress{op.buffer},0,gui_control_notification_bytes);
+        memory.store(GuestAddress{op.buffer},abi.bits,message.window);memory.store(GuestAddress{op.buffer+abi.unit},abi.bits,view.id);memory.store(GuestAddress{op.buffer+abi.notify_code},32,static_cast<std::uint32_t>(-5));
+        const auto x=static_cast<std::int16_t>(message.lparam),y=static_cast<std::int16_t>(message.lparam>>16);
+        const auto hit=native_gui_?native_gui_->list_hit_test(message.window,x,y).value_or(std::array<std::int32_t,2>{-1,0}):std::array<std::int32_t,2>{-1,0};
+        memory.store(GuestAddress{op.buffer+header},32,static_cast<std::uint32_t>(hit[0]));memory.store(GuestAddress{op.buffer+header+4},32,static_cast<std::uint32_t>(hit[1]));
+        memory.store(GuestAddress{op.buffer+header+20},32,static_cast<std::uint32_t>(x));memory.store(GuestAddress{op.buffer+header+24},32,static_cast<std::uint32_t>(y));
+        if(hit[0]>=0 && static_cast<std::size_t>(hit[0])<view.items.size())memory.store(GuestAddress{op.buffer+header+(abi.unit==4?28U:32U)},abi.bits,view.items[static_cast<std::size_t>(hit[0])].data);
+        const auto token=gui_.next_object++,buffer=op.buffer;gui_.control_operations.emplace(token,std::move(op));
+        start_callbacks(state,memory,{{resolve("user32.dll",wide?"SendMessageW":"SendMessageA").value,{view.parent,0x4e,view.id,buffer}}},Continuation::GuiControlOperation,token);return true;
+    }
     if(message.message==0x4e && cls==u"syslistview32" && gui_.windows.contains(window->second.parent)){
         const auto source=memory.load(GuestAddress{message.lparam},abi.bits);const auto code=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{message.lparam+abi.notify_code},32)));
         if(source==window->second.list_header && (code==-302 || code==-322)){
@@ -357,13 +374,22 @@ void WindowsServices::discard_gui_control(std::uint64_t token){
     if(found->second.owner_draw && found->second.parameter){const auto dc=0x10000000+found->second.message.window,depth=found->second.parameter;const auto saved=gui_.saved_contexts.find(dc);
         if(gui_.contexts.contains(dc) && saved!=gui_.saved_contexts.end() && saved->second.size()>=depth){gui_.contexts.at(dc)=saved->second[static_cast<std::size_t>(depth-1)];saved->second.resize(static_cast<std::size_t>(depth-1));}
     }
-    if(found->second.buffer){if(found->second.combo_end || found->second.owner_draw || found->second.tab_select || found->second.tree_select || found->second.tree || found->second.tooltip || found->second.header || found->second.calendar || found->second.style)gui_.control_notification_buffers.push_back(found->second.buffer);else discard_gui_control_notify({found->second.message.window,0,found->second.buffer,0x4e});}
+    if(found->second.buffer){if(found->second.message.message==0x205 || found->second.combo_end || found->second.owner_draw || found->second.tab_select || found->second.tree_select || found->second.tree || found->second.tooltip || found->second.header || found->second.calendar || found->second.style)gui_.control_notification_buffers.push_back(found->second.buffer);else discard_gui_control_notify({found->second.message.window,0,found->second.buffer,0x4e});}
     gui_.control_operations.erase(found);
 }
 std::optional<std::uint32_t> WindowsServices::resume_gui_control(GuestState& state,GuestMemory& memory,const CallbackFrame& frame,std::uint64_t result){
     const auto found=gui_.control_operations.find(frame.value);if(found==gui_.control_operations.end())throw HostCallFault("ListView callback 缺少操作狀態");
     try{
     auto& operation=found->second;const auto window=gui_.windows.find(operation.message.window);
+    if(operation.message.message==0x205){
+        if(!operation.phase && !result && window!=gui_.windows.end()){
+            operation.phase=1;const auto origin=gui_client_origin(gui_,operation.message.window);
+            const auto x=origin[0]+static_cast<std::int16_t>(operation.message.lparam),y=origin[1]+static_cast<std::int16_t>(operation.message.lparam>>16);
+            const auto point=static_cast<std::uint64_t>(static_cast<std::uint16_t>(x))|(static_cast<std::uint64_t>(static_cast<std::uint16_t>(y))<<16);
+            start_callbacks(state,memory,{{resolve("user32.dll",operation.wide?"SendMessageW":"SendMessageA").value,{operation.message.window,0x7b,operation.message.window,point}}},Continuation::GuiControlOperation,frame.value);return {};
+        }
+        discard_gui_control(frame.value);complete_call(state,memory,0);return {};
+    }
     if(operation.enable){
         auto& change=*operation.enable;const auto handle=operation.message.window;
         const auto finish=[&](std::uint64_t value){discard_gui_control(frame.value);complete_call(state,memory,value);};

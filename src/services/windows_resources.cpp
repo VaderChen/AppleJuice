@@ -5,6 +5,7 @@
 #include "x64arm/windows_gui_abi.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/unicode.hpp"
+#include "x64arm/file_security.hpp"
 #include <algorithm>
 #include <bit>
 #include <functional>
@@ -13,6 +14,9 @@
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> resource_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"kernel32.dll","BeginUpdateResourceA",2},{"kernel32.dll","BeginUpdateResourceW",2},
+        {"kernel32.dll","UpdateResourceA",6},{"kernel32.dll","UpdateResourceW",6},
+        {"kernel32.dll","EndUpdateResourceA",2},{"kernel32.dll","EndUpdateResourceW",2},
         {"kernel32.dll","FreeResource",1},
         {"kernel32.dll","EnumResourceTypesA",3},{"kernel32.dll","EnumResourceTypesW",3},
         {"kernel32.dll","EnumResourceNamesA",4},{"kernel32.dll","EnumResourceNamesW",4},
@@ -247,7 +251,9 @@ std::uint64_t WindowsServices::effective_dpi_context() const {
     const auto thread=threads_.items.find(threads_.current);
     return thread!=threads_.items.end() && thread->second.dpi_context?thread->second.dpi_context:gui_.dpi_context;
 }
+#include "windows_resource_update.inc"
 std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol.starts_with("BeginUpdateResource") || service.symbol.starts_with("UpdateResource") || service.symbol.starts_with("EndUpdateResource"))return invoke_resource_update(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');
     // 現代 Win32 的資源與模組同壽命；官方規格明訂此過時 API 永遠回傳 FALSE。
     if(symbol=="FreeResource"){arg.return_to(state,0);return std::nullopt;}

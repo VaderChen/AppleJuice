@@ -49,6 +49,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
     const auto dword = [&](unsigned index) { return static_cast<std::uint32_t>(arg(index)); };
     std::uint64_t result = 0;
     const auto fail = [&](std::uint32_t error) { last_error_ = error; result = 0; };
+    if(symbol=="SetProcessDefaultLayout"){
+        if(dword(0)&~1U){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+        gui_.process_default_layout=dword(0);arg.return_to(state,1);return std::nullopt;
+    }
+    if(symbol=="GetProcessDefaultLayout"){
+        if(!arg(0)){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+        memory.store(GuestAddress{arg(0)},32,gui_.process_default_layout);arg.return_to(state,1);return std::nullopt;
+    }
     const auto ui_limits=job_ui_restrictions();
     if((symbol=="GetClipboardData" && (ui_limits&2U)) || ((symbol=="SetClipboardData" || symbol=="EmptyClipboard") && (ui_limits&4U))){
         fail(5);arg.return_to(state,0);return std::nullopt;

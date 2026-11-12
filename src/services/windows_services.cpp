@@ -976,7 +976,9 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
                 return GuestAddress{image->first+entry->second};
         }
-        if(guest_crt_algorithms_.base && trace_services_.empty() && descriptor.family=="crt")
+        if(guest_crt_algorithms_.base && trace_services_.empty() && (descriptor.family=="crt" ||
+           (descriptor.family=="advapi32.dll" && descriptor.symbol=="IsTextUnicode") ||
+           (descriptor.family=="ntdll.dll" && descriptor.symbol=="RtlIsTextUnicode")))
             if(const auto found=guest_crt_algorithms_.export_names.find(std::string(descriptor.symbol));
                found!=guest_crt_algorithms_.export_names.end())
                 return GuestAddress{guest_crt_algorithms_.base+found->second};
@@ -1169,6 +1171,8 @@ std::string_view WindowsServices::name(GuestAddress address) const noexcept {
     return index < services.size() ? services[index].name : runtime_service_descriptors()[index - services.size()].symbol;
 }
 bool WindowsServices::same_state(const WindowsServices& other) const {
+    // 開啟中的更新／備份交易包含宿主檔案生命期，不視為可任意複製的 deterministic 狀態。
+    if(!resource_updates_.empty() || !other.resource_updates_.empty() || !file_backups_.empty() || !other.file_backups_.empty() || !recent_document_calls_.empty() || !other.recent_document_calls_.empty())return false;
     if(runtime_.machine_clock || other.runtime_.machine_clock)return false; // 共用機器 UTC 含跨程序狀態。
     if(detached_console_!=other.detached_console_)return false;
     if(filesystem_.certificate_roots_file()!=other.filesystem_.certificate_roots_file())return false;

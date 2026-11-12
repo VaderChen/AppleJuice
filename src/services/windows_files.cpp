@@ -7,6 +7,7 @@
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/security_access.hpp"
+#include "x64arm/file_security.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/windows_raw_input.hpp"
 #include "x64arm/shared_wake.hpp"
@@ -275,6 +276,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
 }
 std::span<const WindowsServiceDescriptor> file_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+        {"kernel32.dll","BackupRead",7},{"kernel32.dll","BackupWrite",7},{"kernel32.dll","BackupSeek",6},
         {"ntdll.dll","NtQueryInformationFile",5},{"ntdll.dll","NtSetInformationFile",5},
         {"ntdll.dll","NtQueryVolumeInformationFile",5},{"ntdll.dll","NtQueryDirectoryFile",11},
         {"ntdll.dll","NtQueryDirectoryFileEx",10},
@@ -322,7 +324,9 @@ std::span<const WindowsServiceDescriptor> file_service_descriptors() {
         {"crt","_stat",2},{"crt","_stati64",2},{"crt","_wstat",2},{"crt","_wstati64",2}
     };return table;
 }
+#include "windows_file_backup.inc"
 std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    if(service.symbol=="BackupRead" || service.symbol=="BackupWrite" || service.symbol=="BackupSeek")return invoke_file_backup(state,memory,service);
     if(service.symbol=="GetOverlappedResult" || service.symbol=="GetOverlappedResultEx")return invoke_overlapped_result(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
     if(symbol=="NtCopyFileChunk")return invoke_file_copy_chunk(state,memory,service);

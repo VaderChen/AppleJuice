@@ -5,19 +5,24 @@ import (
 	"sync"
 )
 
-// 兩種架構共用的預設核心數。超過雙核尚未最佳化：同引擎實測逆轉裁判 2 核 116.95 提交/秒、CPU 105 秒，
-// 12 核只有 69.72、CPU 202 秒；咲稻姬 12 核 50.33、CPU 146 秒，2 核約 53、CPU 115 秒。需要多核的程式可再手動調高。
-const defaultCPUCores uint32 = 2
+// x86／x64 共用四核預設，受實體核心及架構上限限制。
+const defaultCPUCores uint32 = 4
 
-// 舊版把 x64 預設存成宿主最大值，且設定表單會一次送出所有欄位，分不出是否使用者自選；
-// 版本低於此值的設定若等於最大值就視為舊預設，改用新預設。之後明確儲存的值一律保留。
-const cpuDefaultsVersion uint32 = 1
+// 第 2 版將舊全域雙核預設遷移到四核；個別程式設定不參與遷移。
+const cpuDefaultsVersion uint32 = 2
 
-func migratedCPUCoresX64(saved, savedVersion, maximum uint32) uint32 {
-	if savedVersion < cpuDefaultsVersion && saved == maximum {
+func migratedCPUDefault(saved, savedVersion, maximum uint32) uint32 {
+	if savedVersion < 2 && saved == min(uint32(2), maximum) {
 		return 0
 	}
 	return saved
+}
+
+func migratedCPUCoresX64(saved, savedVersion, maximum uint32) uint32 {
+	if savedVersion < 1 && saved == maximum {
+		return 0
+	}
+	return migratedCPUDefault(saved, savedVersion, maximum)
 }
 
 type CPULimits struct {

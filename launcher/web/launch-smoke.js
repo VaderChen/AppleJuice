@@ -6,7 +6,7 @@
   const deadline = Date.now() + (smokeConfig.timeoutSeconds - 2) * 1000;
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   const startedAt = new Date().toISOString();
-  let launched = null, logResult = null;
+  let launched = null, logResult = null, completedProgram = null;
   function check(name, condition) {
     api('smokeLog', { data: `${condition ? '通過' : '失敗'} ${name}` });
     if (!condition) throw new Error(name);
@@ -38,7 +38,7 @@
   }
   async function finish(passed, error) {
     await api('smokeResult', { result: {
-      passed, scenario: 'launch', checks, captures, program: programResult(), log: logResult, observedUsage, observedRuns,
+      passed, scenario: 'launch', checks, captures, program: completedProgram || programResult(), log: logResult, observedUsage, observedRuns,
       startedAt, completedAt: new Date().toISOString(), ...(error ? { error: String(error) } : {})
     } });
   }
@@ -62,6 +62,10 @@
     launched = selected().id;
     if (config.temporary) {
       check('選完 EXE 直接執行且不加入列表', selected().temporary && !!selected().runId && !selected().configPath && !document.querySelector(`[data-id="${launched}"]`) && !$('temporary-dialog'));
+      for (const id of ['temporary-stop', 'temporary-close']) {
+        const button = $(id), style = getComputedStyle(button);
+        check(`${id} 使用有外框的按鈕並與選單同高`, button.classList.contains('button') && parseFloat(style.borderTopWidth) >= 1 && Math.abs(button.getBoundingClientRect().height - $('temporary-session-select').getBoundingClientRect().height) < 1);
+      }
     } else {
     const prefix = '';
     await click('tab-settings');
@@ -83,12 +87,12 @@
     }
     $(prefix + 'writable').checked = config.settings.writable;
     $(prefix + 'writable').dispatchEvent(new Event('input', { bubbles: true }));
-    $('program-cpu-cores').value = config.settings.cpuCores || 0;
+    loadProgramCPUChoices(config.settings.cpuCores || 0, selected().architecture);
     $('program-cpu-cores').dispatchEvent(new Event('input', { bubbles: true }));
 
       await click('save');
       await click('app-settings'); await click('global-tab-gpu');
-      $(prefix + 'gpu-memory').value = config.settings.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB;
+      loadGPUChoices(config.settings.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, state.gpuMemoryLimits, false);
       $(prefix + 'gpu-memory').dispatchEvent(new Event('input', { bubbles: true }));
       await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存 GPU 設定');
       await click('app-settings-close');
@@ -140,7 +144,7 @@
           await until(() => api('smokeSnapshotReady', { data: 'launch-running.png' }), '執行中資源快照');
           captures.push('launch-running.png');
         }
-        await click('stop');
+        await click(config.temporary ? 'temporary-stop' : 'stop');
         await until(() => !active(selected()), '由 UI 停止客體');
         check('UI 停止客體且保留執行紀錄', selected().status === 'stopped' && !!selected().runId);
       }
@@ -185,6 +189,12 @@
       }
     } else {
       check('CLI 使用終端且不另建 LOG', $('tab-log').hidden && $('log').hidden && !terminals.get(launched)?.log);
+    }
+    if (config.temporary && config.closeTemporary) {
+      completedProgram = programResult();
+      check('結束後停止按鈕停用且關閉按鈕可操作', $('temporary-stop').disabled && !$('temporary-close').disabled);
+      await click('temporary-close');
+      check('關閉按鈕移除臨時工作階段與終端', !state.programs.some(p => p.id === launched) && !terminals.has(launched));
     }
     await finish(true);
   } catch (error) {

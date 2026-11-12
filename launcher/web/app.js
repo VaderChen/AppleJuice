@@ -93,6 +93,7 @@ let windowsFonts = [];
 let currentID = '', tab = 'workspace', listSignature = '', busy = false;
 let toastTimer, pollTimer;
 let mutationVersion = 0;
+let programCPUSelection = 0;
 const statusNames = { ready: '準備就緒', running: '執行中', stopping: '正在停止…', exited: '已結束', stopped: '已停止', failed: '執行失敗' };
 const active = p => p && ['running', 'stopping'].includes(p.status);
 const selected = () => programsByID.get(state.selected);
@@ -110,15 +111,21 @@ async function perform(fn) {
 function settingsFrom(p) { return { arguments: p.arguments, workDir: p.workDir, cDrive: p.cDrive, installRoot: p.installRoot || '', writable: p.writable, maxInstructions: p.maxInstructions, gpuMemoryMiB: p.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, cpuCores: p.cpuCores || 0 }; }
 function readSettings() {
   const p = selected();
-  return { arguments: $('arguments').value, workDir: $('work-dir').value, cDrive: $('c-drive').value, installRoot: $('install-root').value, writable: $('writable').checked, maxInstructions: p?.maxInstructions ?? 0, gpuMemoryMiB: p?.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, cpuCores: Number($('program-cpu-cores').value) };
+  return { arguments: $('arguments').value, workDir: $('work-dir').value, cDrive: $('c-drive').value, installRoot: $('install-root').value, writable: $('writable').checked, maxInstructions: p?.maxInstructions ?? 0, gpuMemoryMiB: p?.gpuMemoryMiB || state.gpuMemoryLimits.defaultMiB, cpuCores: programCPUSelection };
 }
 function rememberDraft() { if (currentID) drafts.set(currentID, readSettings()); }
 function loadSettings(p) {
   const s = drafts.get(p.id) || settingsFrom(p);
   $('arguments').value = s.arguments; $('work-dir').value = s.workDir; $('c-drive').value = s.cDrive; $('install-root').value = s.installRoot || ''; $('writable').checked = s.writable;
-  const maximum = state.cpuLimits[p.architecture === 'x86' ? 'x86Max' : 'x64Max'];
-  $('program-cpu-cores').replaceChildren(new Option(t('沿用全域設定'), '0'), ...Array.from({ length: maximum }, (_, i) => new Option(t`${i + 1} 個核心`, String(i + 1))));
-  $('program-cpu-cores').value = s.cpuCores || 0;
+  loadProgramCPUChoices(s.cpuCores || 0, p.architecture);
+
+}
+function loadProgramCPUChoices(value, architecture) {
+  programCPUSelection = value;
+  loadCapsuleChoices('program-cpu-cores', value, state.cpuLimits[architecture === 'x86' ? 'x86Max' : 'x64Max']);
+}
+for (const input of document.querySelectorAll('input[name="program-cpu-cores"]')) {
+  input.oninput = () => { if (input.checked && !input.disabled) programCPUSelection = Number(input.value); };
 }
 function updateInstallLocation(prefix = '') {
   const chosen = $(prefix + 'install-root').value;
@@ -127,7 +134,7 @@ function updateInstallLocation(prefix = '') {
 }
 function updateProgramCPUWarning() {
   const p = selected(), architecture = p?.architecture === 'x86' ? 'X86' : 'X64';
-  const cores = Number($('program-cpu-cores').value) || state.globalSettings?.['cpuCores' + architecture] || 0;
+  const cores = programCPUSelection || state.globalSettings?.['cpuCores' + architecture] || 0;
   $('program-cpu-warning').hidden = !p || cores <= 2;
 }
 function updateDirty() { const p = selected(); $('dirty').hidden = !p || JSON.stringify(readSettings()) === JSON.stringify(settingsFrom(p)); $('install-read-only').hidden = !$('install-root').value || $('writable').checked; updateInstallLocation(); updateProgramCPUWarning(); }
@@ -139,7 +146,46 @@ function applyState(next) {
  render();
 }
 function showTab(value) { tab = value; render(); if (tab === 'workspace') fitSelected(); }
+let draggingProgram = '';
+function clearProgramDrag() {
+  draggingProgram = '';
+  for (const row of $('program-list').children) row.classList.remove('dragging', 'drop-before', 'drop-after');
+}
+function wireProgramDrag(row, select, id) {
+  select.draggable = true;
+  select.addEventListener('dragstart', event => {
+    if (busy) { event.preventDefault(); return; }
+    draggingProgram = id;
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('application/x-applejuice-program', id);
+    row.classList.add('dragging');
+    closeProgramMenu();
+  });
+  select.addEventListener('dragend', () => { clearProgramDrag(); renderList(); });
+  row.addEventListener('dragover', event => {
+    if (!draggingProgram || draggingProgram === id || busy) return;
+    event.preventDefault(); event.dataTransfer.dropEffect = 'move';
+    for (const item of $('program-list').children) item.classList.remove('drop-before', 'drop-after');
+    const bounds = row.getBoundingClientRect();
+    row.classList.add(event.clientY < bounds.top + bounds.height / 2 ? 'drop-before' : 'drop-after');
+    const listBounds = $('program-list').getBoundingClientRect();
+    if (event.clientY < listBounds.top + 28) $('program-list').scrollTop -= 18;
+    if (event.clientY > listBounds.bottom - 28) $('program-list').scrollTop += 18;
+  });
+  row.addEventListener('dragleave', event => {
+    if (!row.contains(event.relatedTarget)) row.classList.remove('drop-before', 'drop-after');
+  });
+  row.addEventListener('drop', event => {
+    if (!draggingProgram) return;
+    event.preventDefault(); event.stopPropagation();
+    const source = draggingProgram, bounds = row.getBoundingClientRect();
+    const after = event.clientY >= bounds.top + bounds.height / 2;
+    clearProgramDrag();
+    if (source !== id && !busy) perform(async () => applyState(await api('moveProgram', {id: source, data: id, after})));
+  });
+}
 function renderList() {
+  if (draggingProgram) return;
   updateProgramMenu();
   const filter = $('search').value.toLocaleLowerCase();
   const visible = state.programs.filter(p => !p.temporary && (p.name.toLocaleLowerCase().includes(filter) || p.path.toLocaleLowerCase().includes(filter)));
@@ -160,6 +206,7 @@ function renderList() {
       control.onclick = () => perform(() => active(p) ? stopProgram(p.id) : startProgram(p.id)); row.append(control);
       if (active(p)) { const dot = document.createElement('i'); dot.className = 'row-dot'; row.append(dot); }
       select.addEventListener('click', () => perform(async () => { rememberDraft(); applyState(await api('select', { id: p.id })); }));
+      wireProgramDrag(row, select, p.id);
       $('program-list').append(row);
     }
   }
@@ -204,7 +251,6 @@ function render() {
   $('run-message').textContent = p.missing ? t('找不到原始 EXE，請確認磁碟已連接，或重新加入檔案。') : p.error ? t`${translateMessage(p.error)}，詳細原因可查看「執行紀錄」。` : active(p) ? (isCLI ? t('可直接輸入文字；切換程式時，終端內容會保留。') : t('程式在獨立的桌面視窗中執行。')) : p.runId ? (p.status === 'exited' ? t`程式已結束，退出碼 ${p.exitCode}。再次按下「執行」可重新啟動。` : t('程式已停止，可重新啟動。')) : t('啟動參數、工作資料夾與 C 槽映射可在「程式設定」調整。');
   if (p.temporary && ['exited', 'stopped'].includes(p.status)) $('run-message').textContent = t`本次臨時執行${p.status === 'exited' ? t`已結束，退出碼 ${p.exitCode}` : t('已停止')}，可關閉此工作階段。`;
   $('gui-title').textContent = active(p) ? t('程式正在獨立視窗執行') : t('以獨立視窗開啟');
-  $('gui-process').textContent = active(p) ? `PID ${p.pid} · Windows ${p.architecture || 'x64'} → Apple Silicon` : `Windows ${p.architecture || 'x64'} → Apple Silicon`;
   renderUsage(p);
   for (const [id, item] of terminals) { item.host.hidden = id !== p.id || !isCLI; }
   $('terminal-idle').hidden = !!p.runId; $('clear-terminal').disabled = !terminals.has(p.id);
@@ -424,6 +470,7 @@ const cacheSize = bytes => t`${(bytes / 1e9).toFixed(2)} GB`;
 function renderCacheUsage(usage) {
   const list = $('cache-list'), entries = usage?.entries || [];
   setText('cache-total', cacheSize(usage?.totalBytes || 0));
+  $('cache-clear-all').disabled = Boolean(usage?.running) || entries.length === 0;
   $('cache-empty').hidden = entries.length > 0; $('cache-running').hidden = !usage?.running;
   list.replaceChildren(...entries.map(entry => {
     const row = document.createElement('div'), text = document.createElement('div'), title = document.createElement('strong'), detail = document.createElement('span');
@@ -433,11 +480,11 @@ function renderCacheUsage(usage) {
     title.textContent = shared ? shared[0] : entry.name || t`未知程式`;
     detail.textContent = shared ? shared[1] : entry.path ? t`著色器快取 · ${entry.path}` : t`著色器快取`;
     detail.title = detail.textContent; size.textContent = cacheSize(entry.bytes);
-    clear.type = 'button'; clear.className = 'text-button'; clear.textContent = t`清除`; clear.disabled = Boolean(usage.running);
-    clear.setAttribute('aria-label', t`清除 ${title.textContent}`);
+    clear.type = 'button'; clear.className = 'button secondary cache-delete'; clear.textContent = t`刪除`; clear.disabled = Boolean(usage.running);
+    clear.setAttribute('aria-label', t`刪除 ${title.textContent}`);
     clear.onclick = async () => {
       clear.disabled = true;
-      try { renderCacheUsage(await api('clearCache', { data: entry.id })); toast(t`已清除快取`); }
+      try { renderCacheUsage(await api('clearCache', { data: entry.id })); toast(t`已刪除快取`); }
       catch (error) { toast(errorText(error), true); refreshCacheUsage(); }
     };
     text.append(title, detail); row.append(text, size, clear); return row;
@@ -448,7 +495,14 @@ async function refreshCacheUsage() {
   try { renderCacheUsage(await api('cacheUsage')); } catch (error) { toast(errorText(error), true); }
 }
 $('cache-refresh').onclick = refreshCacheUsage;
+$('cache-clear-all').onclick = async () => {
+  $('cache-clear-all').disabled = true;
+  for (const button of document.querySelectorAll('.cache-delete')) button.disabled = true;
+  try { renderCacheUsage(await api('clearCache', {data: 'all'})); toast(t`已刪除快取`); }
+  catch (error) { toast(errorText(error), true); await refreshCacheUsage(); }
+};
 function showGlobalTab(name) {
+  $('settings-update-actions').hidden = name !== 'about';
   for (const button of document.querySelectorAll('[data-global-tab]')) {
     const current = button.dataset.globalTab === name;
     button.setAttribute('aria-selected', String(current)); button.tabIndex = current ? 0 : -1;
@@ -465,42 +519,62 @@ for (const button of document.querySelectorAll('[data-global-tab]')) {
   };
 }
 function addGlobalDrive(letter, path = '') {
-  const row = document.createElement('div'); row.className = 'global-drive-row';
+  const row = document.createElement('div'); row.className = 'global-drive-row' + (letter === 'C' ? ' required-drive' : '');
   if (letter === 'C') { const label = document.createElement('label'); label.htmlFor = 'global-c-drive'; label.textContent = t('C: 必填'); row.append(label); }
   else { const select = document.createElement('select'); select.className = 'drive-letter'; select.setAttribute('aria-label', t('磁碟代號')); for (let n = 68; n <= 90; n++) { const option = document.createElement('option'); option.value = String.fromCharCode(n); option.textContent = option.value + ':'; select.append(option); } select.value = letter; row.append(select); }
   const input = document.createElement('input'); input.className = 'drive-path'; input.value = path; input.required = true; input.placeholder = t('選擇或輸入目錄'); input.setAttribute('aria-label', letter + t(': 對應目錄')); input.autocomplete = 'off'; input.spellcheck = false; if (letter === 'C') input.id = 'global-c-drive'; row.append(input);
-  const pick = document.createElement('button'); pick.type = 'button'; pick.className = 'text-button drive-pick'; pick.textContent = t('選擇…'); pick.onclick = () => perform(async () => { const paths = await api('folder', { data: t('選擇磁碟對應目錄') }); if (paths.length) input.value = paths[0]; }); row.append(pick);
-  if (letter !== 'C') { const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'text-button danger drive-remove'; remove.textContent = t('移除'); remove.onclick = () => { row.remove(); $('global-add-drive').disabled = false; }; row.append(remove); }
+  const pick = document.createElement('button'); pick.type = 'button'; pick.className = 'button secondary drive-pick'; pick.textContent = t('選擇…'); pick.onclick = () => perform(async () => { const paths = await api('folder', { data: t('選擇磁碟對應目錄') }); if (paths.length) input.value = paths[0]; }); row.append(pick);
+  if (letter !== 'C') { const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button secondary danger drive-remove'; remove.textContent = t('移除'); remove.onclick = () => { row.remove(); $('global-add-drive').disabled = false; }; row.append(remove); }
   $('global-drive-rows').append(row);
 }
 let globalGPUProgramID = '';
-function setRangeReadout(id, value) {
-  setText(id + '-value', value); $(id).setAttribute('aria-valuetext', value);
+const globalCPUSelections = {};
+let globalGPUMemoryMiB = 0;
+function loadCapsuleChoices(id, value, maximum, disabled = false) {
+  $(id).disabled = disabled;
+  for (const input of document.querySelectorAll(`input[name="${id}"]`)) {
+    input.disabled = Number(input.value) > maximum;
+    input.checked = !input.disabled && Number(input.value) === value;
+  }
 }
 function updateCPUReadouts() {
   for (const architecture of ['x64', 'x86']) {
-    const id = 'cpu-cores-' + architecture;
-    setRangeReadout(id, t`${Number($(id).value).toLocaleString(currentLanguage)} 個核心`);
-    setText(id + '-max', Number($(id).max).toLocaleString(currentLanguage));
-    $(id + '-warning').hidden = Number($(id).value) <= 2;
+    const id = 'cpu-cores-' + architecture, cores = globalCPUSelections[architecture];
+    setText(id + '-value', t`${cores.toLocaleString(currentLanguage)} 個核心`);
+    $(id + '-warning').hidden = cores <= 2;
   }
-  setText('cpu-system-cores', t`宿主實體核心：${state.cpuLimits.physicalCores.toLocaleString(currentLanguage)}`);
-  const workers = Number($('compiler-workers').value);
-  setRangeReadout('compiler-workers', workers ? t`${workers.toLocaleString(currentLanguage)} 個執行緒` : t('同步編譯'));
+  setText('cpu-system-cores', t`實體核心：${state.cpuLimits.physicalCores.toLocaleString(currentLanguage)}`);
 }
-for (const architecture of ['x64', 'x86']) $('cpu-cores-' + architecture).oninput = updateCPUReadouts;
-$('compiler-workers').oninput = updateCPUReadouts;
+function loadCPUChoices(defaults, limits) {
+  for (const architecture of ['x64', 'x86']) {
+    const cores = defaults['cpuCores' + architecture.toUpperCase()];
+    globalCPUSelections[architecture] = cores;
+    loadCapsuleChoices('cpu-cores-' + architecture, cores, limits[architecture + 'Max']);
+  }
+  updateCPUReadouts();
+}
+for (const architecture of ['x64', 'x86']) {
+  for (const input of document.querySelectorAll(`input[name="cpu-cores-${architecture}"]`)) {
+    input.onchange = () => {
+      if (input.checked && !input.disabled) { globalCPUSelections[architecture] = Number(input.value); updateCPUReadouts(); }
+    };
+  }
+}
 function updateGPUMemoryReadout() {
-  const input = $('gpu-memory'), limits = state.gpuMemoryLimits;
-  const value = Number(input.value).toLocaleString(currentLanguage) + ' MiB';
-  setRangeReadout('gpu-memory', value);
-  if (limits) {
-    setText('gpu-memory-min', limits.minMiB.toLocaleString(currentLanguage) + ' MiB');
-    setText('gpu-memory-max', limits.maxMiB.toLocaleString(currentLanguage) + ' MiB');
-    setText('gpu-memory-system', t`系統記憶體：${(limits.systemMemoryBytes / 1024 / 1024).toLocaleString(currentLanguage)} MiB · 上限 50%`);
-  }
+  const limits = state.gpuMemoryLimits;
+  setText('gpu-memory-value', globalGPUMemoryMiB.toLocaleString(currentLanguage) + ' MiB');
+  if (limits) setText('gpu-memory-system', t`系統記憶體：${(limits.systemMemoryBytes / 1024 / 1024).toLocaleString(currentLanguage)} MiB · 上限 50%`);
 }
-$('gpu-memory').oninput = updateGPUMemoryReadout;
+function loadGPUChoices(value, limits, disabled) {
+  globalGPUMemoryMiB = value;
+  loadCapsuleChoices('gpu-memory', value, Math.min(limits.maxMiB, limits.systemMemoryBytes / 2 / 1024 / 1024), disabled);
+  updateGPUMemoryReadout();
+}
+for (const input of document.querySelectorAll('input[name="gpu-memory"]')) {
+  input.onchange = () => {
+    if (input.checked && !input.disabled && !$('gpu-memory').disabled) { globalGPUMemoryMiB = Number(input.value); updateGPUMemoryReadout(); }
+  };
+}
 function updateWindowsFontPreview() {
   const font = $('windows-font').value;
   $('windows-font-preview').style.fontFamily = font === 'auto' ? '-apple-system, sans-serif' : JSON.stringify(font) + ', sans-serif';
@@ -515,38 +589,16 @@ $('app-settings').onclick = () => {
   $('windows-font').value = defaults.windowsFont || 'auto';
   updateWindowsFontPreview();
   $('ui-language').value = defaults.language || 'auto'; $('ui-theme').value = defaults.theme || 'forest';
-  $('opengl-backend').value = defaults.openGLBackend || 'auto';
-  $('compiler-workers').value = defaults.compilerWorkers ?? 2;
-  $('native-library-bridge').checked = defaults.nativeLibraryBridge === true;
-  $('native-v8-bridge').checked = defaults.nativeV8Bridge === true;
-  setText('native-v8-availability', state.nativeV8Ready ? t('V8 模組已內建，預設關閉。儲存後於下次啟動生效。') : t('此版本未包含 ARM64 V8 模組。'));
-  $('add-native-v8-tests').disabled = !state.nativeV8Ready || !state.nativeV8TestsReady;
-  for (const architecture of ['x64', 'x86']) {
-    const input = $('cpu-cores-' + architecture), key = architecture.toUpperCase();
-    input.max = state.cpuLimits[architecture + 'Max']; input.value = defaults['cpuCores' + key];
-  }
-  updateCPUReadouts();
+  loadCPUChoices(defaults, state.cpuLimits);
   const program = selected(); globalGPUProgramID = program?.id || '';
-  const limits = state.gpuMemoryLimits, memory = $('gpu-memory');
-  memory.min = limits.minMiB; memory.max = limits.maxMiB; memory.step = limits.stepMiB;
-  memory.value = program?.gpuMemoryMiB || limits.defaultMiB; memory.disabled = !program;
-  updateGPUMemoryReadout();
+  const limits = state.gpuMemoryLimits;
+  loadGPUChoices(program?.gpuMemoryMiB || limits.defaultMiB, limits, !program);
   setText('app-version', t`版本 ${state.version}`);
-  $('gpu-settings-program').textContent = program ? t`目前程式：${program.name}` : t('先從程式庫選取程式，再調整它的 GPU 記憶體。');
   addGlobalDrive('C', defaults.cDrive);
   for (const [letter, path] of Object.entries(defaults.drives || {}).sort()) addGlobalDrive(letter, path);
   $('global-add-drive').disabled = Object.keys(defaults.drives || {}).length >= 23;
   $('global-settings-error').hidden = true; $('global-settings-status').textContent = '';
   showGlobalTab('general'); $('app-settings-dialog').showModal(); $('global-tab-general').focus();
-};
-$('add-native-v8-tests').onclick = async () => {
-  $('add-native-v8-tests').disabled = true; ++mutationVersion;
-  try {
-    const result = await api('addNativeV8Tests'); applyState(result.state);
-    $('app-settings-dialog').close(); restoreAppearance();
-    if (result.errors?.length) toast(result.errors.map(translateMessage).join('\n'), true);
-  } catch (error) { $('global-settings-error').textContent = errorText(error); $('global-settings-error').hidden = false; }
-  finally { ++mutationVersion; $('add-native-v8-tests').disabled = !state.nativeV8TestsReady; }
 };
 $('global-add-drive').onclick = () => {
   const used = new Set([...document.querySelectorAll('.drive-letter')].map(input => input.value));
@@ -562,7 +614,7 @@ $('global-settings-save').onclick = async () => {
   if (!$('global-cpu-form').checkValidity()) { showGlobalTab('cpu'); $('global-cpu-form').reportValidity(); return; }
   if (!$('global-gpu-form').checkValidity()) { showGlobalTab('gpu'); $('global-gpu-form').reportValidity(); return; }
   if (!$('global-settings-form').checkValidity()) { showGlobalTab('advanced'); $('global-settings-form').reportValidity(); return; }
-  const defaults = { windowsFont: $('windows-font').value, nativeV8Bridge: $('native-v8-bridge').checked, nativeLibraryBridge: $('native-library-bridge').checked, compilerWorkers: Number($('compiler-workers').value), cpuCoresX64: Number($('cpu-cores-x64').value), cpuCoresX86: Number($('cpu-cores-x86').value), openGLBackend: $('opengl-backend').value, cDrive: $('global-c-drive').value, drives: {}, language: $('ui-language').value, theme: $('ui-theme').value };
+  const defaults = { windowsFont: $('windows-font').value, nativeV8Bridge: state.globalSettings.nativeV8Bridge === true, nativeLibraryBridge: state.globalSettings.nativeLibraryBridge === true, compilerWorkers: state.globalSettings.compilerWorkers ?? 2, cpuCoresX64: globalCPUSelections.x64, cpuCoresX86: globalCPUSelections.x86, openGLBackend: 'auto', cDrive: $('global-c-drive').value, drives: {}, language: $('ui-language').value, theme: $('ui-theme').value };
   defaults.certificateRootsFile = $('certificate-roots-file').checked;
   defaults.certificateRootsPath = $('certificate-roots-path').value;
   for (const row of document.querySelectorAll('.global-drive-row')) {
@@ -571,7 +623,7 @@ $('global-settings-save').onclick = async () => {
     defaults.drives[letter] = row.querySelector('.drive-path').value;
   }
   $('global-settings-save').disabled = true; ++mutationVersion;
-  try { applyState(await api('saveGlobalSettings', { globalSettings: defaults, id: globalGPUProgramID, settings: { gpuMemoryMiB: Number($('gpu-memory').value) } })); $('global-settings-status').textContent = t('已儲存。介面偏好已套用，執行設定於下次啟動生效。'); }
+  try { applyState(await api('saveGlobalSettings', { globalSettings: defaults, id: globalGPUProgramID, settings: { gpuMemoryMiB: globalGPUMemoryMiB } })); $('global-settings-status').textContent = t('已儲存。介面偏好已套用，執行設定於下次啟動生效。'); }
   catch (error) { $('global-settings-error').textContent = errorText(error); $('global-settings-error').hidden = false; }
   finally { ++mutationVersion; $('global-settings-save').disabled = false; }
 };
@@ -664,7 +716,7 @@ function updateMessage(status) {
 function renderUpdate(status = updateStatus) {
   updateStatus = status;
   const busy = updateBusyPhases.includes(status.phase), prompt = status.phase === 'available', message = updateMessage(status);
-  setText('update-status', status.phase === 'idle' ? '' : message);
+  setText('update-status', ['idle', 'latest'].includes(status.phase) ? '' : message);
   $('check-update').disabled = busy;
   if (!$('update-dialog').open) return;
   setText('update-summary', busy ? (status.latest ? `AppleJuice ${status.latest}` : '') : message);

@@ -7,7 +7,7 @@
 
 namespace x64arm {
 // 宿主視窗政策由所有客體程序共用；環境變數可覆寫或以空字串停用。
-// UUID 每次由當前拓樸解析，不能保存會在登入後變動的 Space 數字 ID。
+// UUID 或內部 @primary 主桌面目標由當前拓樸解析，不保存會在登入後變動的 Space 數字 ID。
 inline NSString* native_window_space_uuid() {
     static NSString* selected = []() -> NSString* {
         if (const char* value = std::getenv("X64ARM_GUI_SPACE_UUID"))
@@ -42,17 +42,22 @@ struct NativeWindowSpaces {
     struct Target { std::uint64_t id{}; NSScreen* screen{}; bool active{}; };
     Target target() const {
         NSString* uuid = native_window_space_uuid();
+        const bool primary=[uuid isEqualToString:@"@primary"];
+        CFUUIDRef mainUUID=primary?CGDisplayCreateUUIDFromDisplayID(CGMainDisplayID()):nullptr;
+        NSString* mainDisplay=mainUUID?CFBridgingRelease(CFUUIDCreateString(nullptr,mainUUID)):nil;
+        if(mainUUID)CFRelease(mainUUID);
         NSArray* topology = CFBridgingRelease(displays(connection));
         for (NSDictionary* display in topology) {
+            if(primary && ![display[@"Display Identifier"] isEqual:mainDisplay] && ![display[@"Display Identifier"] isEqual:@"Main"])continue;
             for (NSDictionary* space in display[@"Spaces"]) {
-                if (![space[@"uuid"] isEqual:uuid] || [space[@"type"] intValue] != 0) continue;
+                if ((!primary && ![space[@"uuid"] isEqual:uuid]) || [space[@"type"] intValue] != 0) continue;
                 const auto id = [space[@"id64"] unsignedLongLongValue];
                 NSScreen* selected = nil;
                 for (NSScreen* screen in NSScreen.screens) {
                     CFUUIDRef displayUUID = CGDisplayCreateUUIDFromDisplayID([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
                     NSString* name = displayUUID ? CFBridgingRelease(CFUUIDCreateString(nullptr, displayUUID)) : nil;
                     if (displayUUID) CFRelease(displayUUID);
-                    if ([name isEqual:display[@"Display Identifier"]]) { selected = screen; break; }
+                    if ([name isEqual:display[@"Display Identifier"]] || ([display[@"Display Identifier"] isEqual:@"Main"] && screen==NSScreen.screens.firstObject)) { selected = screen; break; }
                 }
                 if (!selected || !id) throw std::runtime_error("指定桌面的螢幕已離線，已停止建立視窗");
                 return {id, selected, [display[@"Current Space"][@"id64"] unsignedLongLongValue] == id};

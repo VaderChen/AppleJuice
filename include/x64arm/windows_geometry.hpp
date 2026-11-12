@@ -46,7 +46,12 @@ inline GuiInsets gui_frame_insets_for_dpi(std::uint32_t style,std::uint32_t exte
     f.left=gui_scale_metric(f.left,dpi);f.top=gui_scale_metric(f.top,dpi);
     f.right=gui_scale_metric(f.right,dpi);f.bottom=gui_scale_metric(f.bottom,dpi);return f;
 }
-inline GuiInsets gui_frame_insets(const GuiWindow& window) {if(window.frame_insets){const auto& a=*window.frame_insets;return {a[0],a[1],a[2],a[3]};}return gui_frame_insets(window.style,window.ex_style,window.menu!=0);}
+inline GuiInsets gui_default_frame_insets(const GuiWindow& window) {
+    // ComboBox 的捲軸屬於展開清單，不可增加收合欄位的非客戶區高度／寬度。
+    const auto& cls=gui_control_class(window);const bool combo=cls==u"combobox" || cls==u"comboboxex32";
+    return gui_frame_insets(window.style,window.ex_style,window.menu!=0,!combo);
+}
+inline GuiInsets gui_frame_insets(const GuiWindow& window) {if(window.frame_insets){const auto& a=*window.frame_insets;return {a[0],a[1],a[2],a[3]};}return gui_default_frame_insets(window);}
 // NCCALCSIZE 回傳的客戶區與外框共用尺寸／座標模型；不得再依 style 重複扣框。
 inline void gui_calculated_frame(GuiWindow& window,const std::array<std::int32_t,4>& outer,const std::array<std::int32_t,4>& client) {
     const auto width=std::max<std::int64_t>(0,std::int64_t{outer[2]}-outer[0]),height=std::max<std::int64_t>(0,std::int64_t{outer[3]}-outer[1]);
@@ -54,7 +59,7 @@ inline void gui_calculated_frame(GuiWindow& window,const std::array<std::int32_t
     const auto right=std::clamp<std::int64_t>(std::int64_t{outer[2]}-client[2],0,width-left),bottom=std::clamp<std::int64_t>(std::int64_t{outer[3]}-client[3],0,height-top);
     window.frame_insets=std::array{static_cast<std::uint32_t>(left),static_cast<std::uint32_t>(top),static_cast<std::uint32_t>(right),static_cast<std::uint32_t>(bottom)};
 }
-inline void gui_refresh_frame(GuiWindow& window) {const auto f=gui_frame_insets(window.style,window.ex_style,window.menu!=0);window.frame_insets=std::array{f.left,f.top,f.right,f.bottom};}
+inline void gui_refresh_frame(GuiWindow& window) {const auto f=gui_default_frame_insets(window);window.frame_insets=std::array{f.left,f.top,f.right,f.bottom};}
 inline std::array<std::uint32_t,2> gui_client_size(std::uint32_t width,std::uint32_t height,const GuiInsets& inset) {
     return {width>inset.left+inset.right?width-inset.left-inset.right:0,height>inset.top+inset.bottom?height-inset.top-inset.bottom:0};
 }

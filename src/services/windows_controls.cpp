@@ -905,17 +905,31 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
     if(gui_control_class(w)==u"rebarwindow32"){
         if(m==0x111){auto message=msg;message.window=w.parent;enqueue_gui_message(std::move(message));return 0;}
         const auto layout=[&]{
-            std::uint32_t x=0,y=0,row_height=0;const auto old_height=w.height;
+            const auto old_height=w.height;std::uint32_t y=0,used=0,row_height=0;
+            struct Cell {GuiRebarBand* band;std::uint32_t width,height;};std::vector<Cell> row;
+            // 每列最後一個可調整的 band 吸收剩餘寬度；固定 band 與偏好寬度保留。
+            const auto finish_row=[&]{
+                if(row.empty())return;
+                for(auto cell=row.rbegin();cell!=row.rend();++cell)if(!(cell->band->style&2U)){cell->width+=w.width-used;break;}
+                std::uint32_t x=0;
+                for(auto& cell:row){auto& band=*cell.band;band.x=static_cast<std::int32_t>(x);band.y=static_cast<std::int32_t>(y);band.layout_width=cell.width;
+                    if(const auto child=gui_.windows.find(band.child);child!=gui_.windows.end()){
+                        auto& control=child->second;control.parent=msg.window;control.visible=true;
+                        const auto inset=std::min(cell.width,band.header);control.x=static_cast<std::int32_t>(x+inset);control.y=static_cast<std::int32_t>(y+(row_height-cell.height)/2);
+                        control.width=cell.width-inset;control.height=cell.height;present_gui(band.child);
+                    }x+=cell.width;
+                }
+                y+=row_height;used=row_height=0;row.clear();
+            };
             for(auto& band:w.rebar_bands){
-                const auto child=gui_.windows.find(band.child);const bool visible=!(band.style&8U);if(!visible){if(child!=gui_.windows.end()){child->second.visible=false;present_gui(band.child);}continue;}
-                auto width=std::max(band.width,band.min_width+band.header),height=std::max(band.min_height,band.height);
+                const auto child=gui_.windows.find(band.child);
+                if(band.style&8U){band.layout_width=0;if(child!=gui_.windows.end()){child->second.visible=false;present_gui(band.child);}continue;}
+                const auto minimum=band.min_width+band.header;auto height=std::max(band.min_height,band.height);
                 if(!height && child!=gui_.windows.end())height=child->second.height;
-                if(x && ((band.style&1U) || band.min_width+band.header>w.width-x)){y+=row_height;x=0;row_height=0;}
-                width=std::min(width,w.width-x);band.x=static_cast<std::int32_t>(x);band.y=static_cast<std::int32_t>(y);
-                if(child!=gui_.windows.end()){auto& control=child->second;control.parent=msg.window;control.visible=true;control.x=static_cast<std::int32_t>(x+std::min(width,band.header));control.y=static_cast<std::int32_t>(y);control.width=width-std::min(width,band.header);control.height=height;present_gui(band.child);}
-                x+=width;row_height=std::max(row_height,height);
+                if(!row.empty() && ((band.style&1U) || minimum>w.width-used))finish_row();
+                const auto width=std::min(std::max(band.width,minimum),w.width-used);row.push_back({&band,width,height});used+=width;row_height=std::max(row_height,height);
             }
-            w.height=y+row_height;present_gui(msg.window);
+            finish_row();w.height=y;present_gui(msg.window);
             if(old_height!=w.height)list_notification(gui_,memory,[&]{return runtime_allocate(memory,{},notify_bytes);},msg.window,-831,-1,0);
         };
         if(m==0x40c)return w.rebar_bands.size();if(m==0x41b)return w.height;
@@ -936,7 +950,7 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
             if(mask&8)band.image=static_cast<std::int32_t>(field(abi.rebar_image,32,static_cast<std::uint32_t>(band.image)));
             if(mask&16){band.child=field(abi.rebar_child,abi.bits,band.child);if(!get && band.child){if(!gui_.windows.contains(band.child))return 0;auto ancestor=msg.window;for(unsigned depth=0;ancestor && depth<64;++depth){if(ancestor==band.child)return 0;const auto node=gui_.windows.find(ancestor);ancestor=node==gui_.windows.end()?0:node->second.parent;}if(ancestor)return 0;}}
             if(mask&32){band.min_width=static_cast<std::uint32_t>(field(abi.rebar_min_width,32,band.min_width));band.min_height=static_cast<std::uint32_t>(field(abi.rebar_min_height,32,band.min_height));if(size>=abi.rebar_integral+4){band.height=static_cast<std::uint32_t>(field(abi.rebar_height,32,band.height));band.max_height=static_cast<std::uint32_t>(field(abi.rebar_max_height,32,band.max_height));band.integral=static_cast<std::uint32_t>(field(abi.rebar_integral,32,band.integral));}}
-            if(mask&64)band.width=static_cast<std::uint32_t>(field(abi.rebar_width,32,band.width));if(mask&128)band.bitmap=field(abi.rebar_bitmap,abi.bits,band.bitmap);if(mask&256)band.id=static_cast<std::uint32_t>(field(abi.rebar_id,32,band.id));
+            if(mask&64)band.width=static_cast<std::uint32_t>(field(abi.rebar_width,32,get?band.layout_width:band.width));if(mask&128)band.bitmap=field(abi.rebar_bitmap,abi.bits,band.bitmap);if(mask&256)band.id=static_cast<std::uint32_t>(field(abi.rebar_id,32,band.id));
             if(mask&512)band.ideal=static_cast<std::uint32_t>(field(abi.rebar_ideal,32,band.ideal));if(mask&1024)band.data=field(abi.rebar_data,abi.bits,band.data);if(mask&2048)band.header=static_cast<std::uint32_t>(field(abi.rebar_header,32,band.header));
             if(get)return 1;
             if(std::max({band.width,band.height,band.min_width,band.min_height,band.header})>65535)return 0;
@@ -945,7 +959,7 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
         if(m==0x402){if(wp>=w.rebar_bands.size())return 0;const auto child=w.rebar_bands[wp].child;if(gui_.windows.contains(child)){gui_.windows.at(child).visible=false;present_gui(child);}w.rebar_bands.erase(w.rebar_bands.begin()+wp);layout();return 1;}
         if(m==0x423){if(wp>=w.rebar_bands.size())return 0;auto& band=w.rebar_bands[wp];band.style=lp?band.style&~8U:band.style|8U;layout();return 1;}
         if(m==0x427){if(wp>=w.rebar_bands.size() || lp>=w.rebar_bands.size())return 0;auto band=w.rebar_bands[wp];w.rebar_bands.erase(w.rebar_bands.begin()+wp);w.rebar_bands.insert(w.rebar_bands.begin()+static_cast<std::ptrdiff_t>(lp),std::move(band));layout();return 1;}
-        if(m==0x409 || m==0x422){if(wp>=w.rebar_bands.size())return 0;const auto& band=w.rebar_bands[wp];memory.check(GuestAddress{lp},16,Access::Write);const std::array<std::uint32_t,4> rect=m==0x422?std::array<std::uint32_t,4>{band.header,0,0,0}:std::array<std::uint32_t,4>{static_cast<std::uint32_t>(band.x),static_cast<std::uint32_t>(band.y),static_cast<std::uint32_t>(band.x)+std::max(band.width,band.min_width+band.header),static_cast<std::uint32_t>(band.y)+std::max(band.height,band.min_height)};for(unsigned n=0;n<4;++n)memory.store(GuestAddress{lp+n*4},32,rect[n]);return 1;}
+        if(m==0x409 || m==0x422){if(wp>=w.rebar_bands.size())return 0;const auto& band=w.rebar_bands[wp];memory.check(GuestAddress{lp},16,Access::Write);const std::array<std::uint32_t,4> rect=m==0x422?std::array<std::uint32_t,4>{band.header,0,0,0}:std::array<std::uint32_t,4>{static_cast<std::uint32_t>(band.x),static_cast<std::uint32_t>(band.y),static_cast<std::uint32_t>(band.x)+band.layout_width,static_cast<std::uint32_t>(band.y)+std::max(band.height,band.min_height)};for(unsigned n=0;n<4;++n)memory.store(GuestAddress{lp+n*4},32,rect[n]);return 1;}
         if(m==0x403 || m==0x404){if(memory.load(GuestAddress{lp},32)!=8+abi.unit)return 0;const auto mask=memory.load(GuestAddress{lp+4},32);if(mask&1){if(m==0x403)memory.store(GuestAddress{lp+8},abi.bits,w.list_image_lists[0]);else {const auto handle=memory.load(GuestAddress{lp+8},abi.bits);if(handle && !gui_.image_lists.contains(handle))return 0;w.list_image_lists[0]=handle;present_gui(msg.window);}}return 1;}
         if(m==5 || m==0x417){if(m==0x417){const auto left=static_cast<std::int32_t>(memory.load(GuestAddress{lp},32)),right=static_cast<std::int32_t>(memory.load(GuestAddress{lp+8},32));if(right<left || static_cast<std::int64_t>(right)-left>65535)return 0;w.width=static_cast<std::uint32_t>(right-left);}else if(const auto parent=gui_.windows.find(w.parent);parent!=gui_.windows.end())w.width=parent->second.width;layout();return 1;}
         if(m==0x2005){const auto previous=w.list_unicode;w.list_unicode=wp!=0;return previous?1:0;}if(m==0x2006)return w.list_unicode?1:0;

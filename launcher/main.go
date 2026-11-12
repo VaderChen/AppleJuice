@@ -28,6 +28,7 @@ type request struct {
 	GlobalSettings GlobalSettings  `json:"globalSettings"`
 	Action         string          `json:"action"`
 	ID             string          `json:"id"`
+	After          bool            `json:"after"`
 	RunID          string          `json:"runId"`
 	Data           string          `json:"data"`
 	Settings       Settings        `json:"settings"`
@@ -39,6 +40,7 @@ type request struct {
 }
 type smokeConfig struct {
 	Scenario       string             `json:"scenario,omitempty"`
+	StartupPolicy  string             `json:"startupPolicy,omitempty"`
 	SettingsTest   string             `json:"settingsTest,omitempty"`
 	Programs       []string           `json:"programs,omitempty"`
 	Invalid        string             `json:"invalid,omitempty"`
@@ -157,6 +159,9 @@ func run() error {
 		if smoke.Scenario != "" && smoke.Scenario != "library" && smoke.Scenario != "launch" && smoke.Scenario != "settings" && smoke.Scenario != "v8" && smoke.Scenario != "update" {
 			return errors.New("不支援的 Smoke 情境")
 		}
+		if smoke.StartupPolicy != "" && smoke.StartupPolicy != "normal" {
+			return errors.New("不支援的 Smoke 啟動政策")
+		}
 		if smoke.TimeoutSeconds == 0 {
 			smoke.TimeoutSeconds = 110
 		}
@@ -192,8 +197,8 @@ func run() error {
 		return err
 	}
 	defer app.Close()
-	app.backgroundDisplay = *backgroundDisplay
-	if smoke != nil && *backgroundDisplay {
+	app.backgroundDisplay = *backgroundDisplay && smoke == nil
+	if smoke != nil {
 		probe := false
 		smoke.ProbePickers = &probe
 	}
@@ -207,7 +212,7 @@ func run() error {
 		}
 	}
 	var w webview.WebView
-	if *backgroundDisplay {
+	if app.backgroundDisplay {
 		window, err := nativeBackgroundWindow()
 		if err != nil {
 			return err
@@ -216,7 +221,15 @@ func run() error {
 		app.backgroundDisplayID = nativeBackgroundDisplayID()
 		w = webview.NewWindow(false, window)
 	} else {
-		w = webview.New(false)
+		normalStartupProbe := smoke != nil && smoke.StartupPolicy == "normal"
+		window, err := nativePrimaryWindow(smoke != nil && !normalStartupProbe, normalStartupProbe)
+		if err != nil {
+			return err
+		}
+		defer nativeClosePrimaryWindow()
+		app.windowSpaceUUID = nativeWindowSpaceUUID()
+		app.windowSpaceTesting = smoke != nil && !normalStartupProbe
+		w = webview.NewWindow(false, window)
 	}
 	if w == nil {
 		return errors.New("無法建立 WebView 視窗")
@@ -312,6 +325,9 @@ func run() error {
 			return app.StartTemporary(paths[0])
 		case "select":
 			err := app.Select(req.ID)
+			return app.Snapshot(), err
+		case "moveProgram":
+			err := app.MoveProgram(req.ID, req.Data, req.After)
 			return app.Snapshot(), err
 		case "remove":
 			err := app.Remove(req.ID)

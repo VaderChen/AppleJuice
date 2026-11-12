@@ -187,22 +187,36 @@ func (a *App) CacheUsage() CacheUsage {
 	return usage
 }
 
-// 清除單一快取項目。執行中的程式仍開著快取檔案，清除會讓它寫回不完整的內容，因此有程式執行時拒絕。
+// 單項與全部刪除共用可辨識快取清單及執行中保護；不接受任意目錄。
 func (a *App) ClearCache(id string) (CacheUsage, error) {
-	directories, err := cacheDirectories(id)
-	if err != nil {
-		return a.CacheUsage(), err
+	ids := []string{id}
+	if id == "all" {
+		ids = nil
+		for _, entry := range a.CacheUsage().Entries {
+			ids = append(ids, entry.ID)
+		}
 	}
+	var directories []string
+	for _, entry := range ids {
+		paths, err := cacheDirectories(entry)
+		if err != nil {
+			return a.CacheUsage(), err
+		}
+		directories = append(directories, paths...)
+	}
+	err := a.removeCacheDirectories(directories)
+	return a.CacheUsage(), err
+}
+func (a *App) removeCacheDirectories(directories []string) error {
 	a.mu.Lock()
-	running := len(a.runs) > 0
-	a.mu.Unlock()
-	if running {
-		return a.CacheUsage(), errors.New("有程式執行中，請先停止再清除快取")
+	defer a.mu.Unlock()
+	if len(a.runs) > 0 {
+		return errors.New("有程式執行中，請先停止再清除快取")
 	}
 	for _, directory := range directories {
 		if err := os.RemoveAll(directory); err != nil {
-			return a.CacheUsage(), errors.New("無法清除快取：" + err.Error())
+			return errors.New("無法清除快取：" + err.Error())
 		}
 	}
-	return a.CacheUsage(), nil
+	return nil
 }
