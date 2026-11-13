@@ -20,6 +20,10 @@ std::span<const WindowsServiceDescriptor> system_object_service_descriptors(){
         {"ntdll.dll","NtGetNextThread",6},{"ntdll.dll","ZwGetNextThread",6},
         {"ntdll.dll","RtlAcquirePrivilege",4},{"ntdll.dll","RtlReleasePrivilege",1},
         {"kernel32.dll","WerRegisterRuntimeExceptionModule",2},{"kernel32.dll","WerUnregisterRuntimeExceptionModule",2},
+        {"kernel32.dll","WerRegisterFile",3},{"kernel32.dll","WerUnregisterFile",1},
+        {"kernel32.dll","WerRegisterCustomMetadata",2},{"kernel32.dll","WerUnregisterCustomMetadata",1},
+        {"kernel32.dll","WerRegisterMemoryBlock",2},{"kernel32.dll","WerUnregisterMemoryBlock",1},
+        {"kernel32.dll","WerRegisterExcludedMemoryBlock",2},{"kernel32.dll","WerUnregisterExcludedMemoryBlock",1},
         {"user32.dll","SetLastErrorEx",2},
         {"gdi32.dll","D3DKMTSetProcessSchedulingPriorityClass",2},{"gdi32.dll","D3DKMTGetProcessSchedulingPriorityClass",2},
         {"msdmo.dll","MoInitMediaType",2},{"msdmo.dll","MoFreeMediaType",1},{"msdmo.dll","MoCopyMediaType",2},
@@ -134,6 +138,47 @@ std::optional<std::uint32_t> WindowsServices::invoke_system_objects(GuestState& 
             if(found!=wer_runtime_modules_.end())return finish(0x800700B7U); // 已註冊相同模組與 context。
             if(wer_runtime_modules_.size()>=16)return finish(0x80070103U); // WER 每程序最多 16 個 runtime exception module。
             wer_runtime_modules_.emplace_back(std::move(key),arg(1));return finish(0);
+        }
+        // WER 的其他註冊：沙箱不產生錯誤報告，但保留註冊內容與 Windows 的參數檢查、上限與重複／不存在的結果。
+        // 每類最多 WER_MAX_REGISTERED_ENTRIES（512）筆；記憶體區塊每筆最多 WER_MAX_MEM_BLOCK_SIZE（64 KiB）。
+        constexpr std::size_t wer_entry_limit=512;constexpr std::uint32_t wer_invalid=0x80070057U,wer_not_found=0x80070490U,wer_exists=0x800700B7U,wer_full=0x8007000EU;
+        if(symbol=="WerRegisterFile" || symbol=="WerUnregisterFile"){
+            if(!arg(0))return finish(wer_invalid);
+            const auto path=read_utf16(memory,GuestAddress{arg(0)},260);if(path.empty() || path.size()>=260)return finish(wer_invalid);
+            auto key=path;for(auto& c:key)c=unicode_case_unit(c,true);
+            const auto found=std::find_if(wer_files_.begin(),wer_files_.end(),[&](const auto& item){return item.key==key;});
+            if(symbol=="WerUnregisterFile"){if(found==wer_files_.end())return finish(wer_not_found);wer_files_.erase(found);return finish(0);}
+            // WER_REGISTER_FILE_TYPE：使用者文件（1）、其他（2）；旗標：完成後刪除（1）、匿名資料（2）、已壓縮（4）。
+            const auto type=u32(1),flags=u32(2);if(type<1 || type>2 || (flags&~7U))return finish(wer_invalid);
+            if(found!=wer_files_.end()){found->type=type;found->flags=flags;return finish(0);}
+            if(wer_files_.size()>=wer_entry_limit)return finish(wer_full);
+            wer_files_.push_back({std::move(key),path,type,flags});return finish(0);
+        }
+        if(symbol=="WerRegisterCustomMetadata" || symbol=="WerUnregisterCustomMetadata"){
+            // 名稱須為 XML 元素名稱（字母或底線開頭，之後為字母、數字、底線、連字號或句點），最長 64 字元；值最長 128 字元。
+            if(!arg(0))return finish(wer_invalid);
+            const auto key=read_utf16(memory,GuestAddress{arg(0)},65);
+            const auto letter=[](char16_t c){return (c>=u'A' && c<=u'Z') || (c>=u'a' && c<=u'z') || c==u'_' || c>=0x80;};
+            bool valid=!key.empty() && key.size()<=64 && letter(key.front()) && !(key.size()>=3 && (key[0]|0x20)==u'x' && (key[1]|0x20)==u'm' && (key[2]|0x20)==u'l');
+            for(const auto c:key)valid=valid && (letter(c) || (c>=u'0' && c<=u'9') || c==u'-' || c==u'.');
+            if(!valid)return finish(wer_invalid);
+            const auto found=std::find_if(wer_metadata_.begin(),wer_metadata_.end(),[&](const auto& item){return item.first==key;});
+            if(symbol=="WerUnregisterCustomMetadata"){if(found==wer_metadata_.end())return finish(wer_not_found);wer_metadata_.erase(found);return finish(0);}
+            if(!arg(1))return finish(wer_invalid);
+            auto value=read_utf16(memory,GuestAddress{arg(1)},129);if(value.size()>128)return finish(wer_invalid);
+            if(found!=wer_metadata_.end()){found->second=std::move(value);return finish(0);}
+            if(wer_metadata_.size()>=wer_entry_limit)return finish(wer_full);
+            wer_metadata_.emplace_back(key,std::move(value));return finish(0);
+        }
+        if(symbol=="WerRegisterMemoryBlock" || symbol=="WerUnregisterMemoryBlock" || symbol=="WerRegisterExcludedMemoryBlock" || symbol=="WerUnregisterExcludedMemoryBlock"){
+            auto& blocks=symbol.find("Excluded")!=symbol.npos?wer_excluded_blocks_:wer_memory_blocks_;
+            if(!arg(0))return finish(wer_invalid);
+            const auto found=std::find_if(blocks.begin(),blocks.end(),[&](const auto& item){return item.first==arg(0);});
+            if(symbol.starts_with("WerUnregister")){if(found==blocks.end())return finish(wer_not_found);blocks.erase(found);return finish(0);}
+            const auto size=u32(1);if(!size || (&blocks==&wer_memory_blocks_ && size>65536))return finish(wer_invalid);
+            if(found!=blocks.end())return finish(wer_exists);
+            if(blocks.size()>=wer_entry_limit)return finish(wer_full);
+            blocks.emplace_back(arg(0),size);return finish(0);
         }
         if(symbol=="SetLastErrorEx"){last_error_=u32(0);return finish(0);}
         if(symbol.starts_with("D3DKMT")){

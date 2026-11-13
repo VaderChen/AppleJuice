@@ -10,6 +10,8 @@
 #include "x64arm/pe_loader.hpp"
 #include "mf_h264.hpp"
 #include "mf_mp4_demux.hpp"
+#include "mf_asf_demux.hpp"
+#include "x64arm/media_decode.hpp"
 #include "mf_audio_transcoder.hpp"
 #include "mf_video_output.hpp"
 #include "pcm_wave_file.hpp"
@@ -66,13 +68,18 @@ struct Value {
 struct ByteStreamState {
     std::shared_ptr<HostFile> file;
     std::uint64_t position{};std::uint32_t capabilities{};bool closed{};
+    // 非零時後端為客體 IStream（MFCreateMFByteStreamOnStream），file 為空；引用由所屬物件的 parent 持有。
+    std::uint64_t guest_stream{};
 };
 struct FileSourceState {
     std::shared_ptr<HostFile> file;PcmWaveStream wave;std::uint64_t base{},external_stream{};
     std::shared_ptr<const mf::Mp4Movie> movie; // 非空時為 MP4 來源，wave 不使用。
+    // 非空時為 ASF 來源，wave 不使用；demux 是整個來源共用的封包解多工狀態（Reader 與 MediaStream 都由此取樣）。
+    std::shared_ptr<const mf::AsfMovie> asf;std::shared_ptr<mf::AsfDemux> demux;
 };
 #include "mf_guest_bytestream.hpp"
 #include "mf_session_state.hpp"
+#include "mf_asf_decode.hpp"
 struct SinkWriterState {
     std::shared_ptr<ByteStreamState> stream;
     std::uint64_t base{};
@@ -122,7 +129,10 @@ struct Object {
     std::shared_ptr<audio::Buffer> capture;std::unique_ptr<audio::Input> input;std::uint64_t read_frames{},pending_token{};
     std::shared_ptr<SinkWriterState> writer;
     std::shared_ptr<FileSourceState> file_source;
+    // ASF Source Reader 要求過解碼輸出後建立；之後此 Reader 的讀取都經由各串流的宿主輸出佇列。
+    std::shared_ptr<AsfReaderDecode> asf_decode;
     bool file_read_active{},flush_pending{};std::uint64_t file_read_generation{};
+    std::uint32_t request_stream{}; // 多串流來源的非同步 ReadSample 所要求的串流索引；UINT32_MAX 為任一串流。
     std::shared_ptr<ByteStreamState> byte_stream;
     std::vector<std::uint64_t> media_streams; // MP4 來源的 MediaStream，與 Source 互持到 Shutdown。
     // Topology／TopologyNode：輸出持有下游引用，輸入是下游對上游的弱參照。
@@ -247,13 +257,13 @@ std::span<const WindowsServiceDescriptor> media_foundation_service_descriptors()
             {"mfplat.dll","MFCreateDXGIDeviceManager",2},{"mfplat.dll","MFLockDXGIDeviceManager",2},{"mfplat.dll","MFUnlockDXGIDeviceManager",0},
             {"mfplat.dll","MFCreateDXGISurfaceBuffer",5,0,0,12},
             {"mf.dll","MFGetService",4},{"mfplat.dll","MFTEnum",7,0,1,2},{"mfplat.dll","MFTEnumEx",6,0,1,2},{"mf.dll","MFEnumDeviceSources",3},{"mf.dll","MFCreateDeviceSource",2},
-            {"mfplat.dll","MFCreateSourceResolver",1},{"mfreadwrite.dll","MFCreateSourceReaderFromURL",3},{"mfreadwrite.dll","MFCreateSourceReaderFromByteStream",3},{"mfreadwrite.dll","MFCreateSourceReaderFromMediaSource",3},{"mfreadwrite.dll","MFCreateSinkWriterFromURL",4},{"mfplat.dll","MFCreateFile",5,0,0,7},{"internal-mf","PipelinePoll",1},
+            {"mfplat.dll","MFCreateSourceResolver",1},{"mfreadwrite.dll","MFCreateSourceReaderFromURL",3},{"mfreadwrite.dll","MFCreateSourceReaderFromByteStream",3},{"mfreadwrite.dll","MFCreateSourceReaderFromMediaSource",3},{"mfreadwrite.dll","MFCreateSinkWriterFromURL",4},{"mfplat.dll","MFCreateFile",5,0,0,7},{"mfplat.dll","MFCreateMFByteStreamOnStream",2},{"mfplat.dll","MFCreateMFByteStreamOnStreamEx",2},{"mfplat.dll","MFCreateStreamOnMFByteStream",2},{"mfplat.dll","MFCreateStreamOnMFByteStreamEx",3},{"internal-mf","PipelinePoll",1},
             {"mf.dll","MFCreateMediaSession",2},{"mf.dll","MFCreateTopology",1},{"mf.dll","MFCreateTopologyNode",2,0,0,1},{"mf.dll","MFCreateSampleGrabberSinkActivate",3},{"mf.dll","MFCreateAudioRendererActivate",1},
             {"mfplat.dll","MFCreateCollection",1},{"mfplat.dll","MFPutWorkItem",3,0,0,1},{"mfplat.dll","MFPutWorkItem2",4,0,0,3},{"mfplat.dll","MFPutWorkItemEx",2,0,0,1},{"mfplat.dll","MFPutWorkItemEx2",3,0,0,3},
             {"internal-mf","SessionPump",1},{"internal-mf","SessionPumpDone",1},{"internal-mf","SessionDeliver",1},
             {"internal-mf","BufferDestroy",1},{"internal-mf","B_LockHost",4},{"internal-mf","B_UnlockHost",1}};
         std::set<std::string_view> names;const auto append=[&](const auto& methods){for(const auto& m:methods)if(names.insert(m.name).second)result.push_back({"internal-mf",m.name,m.args,m.wide,m.aggregate,m.narrow});};
-        append(mf::common);for(unsigned k=0;k<=mf::StreamVolume;++k)append(mf::methods(static_cast<mf::Kind>(k)));
+        append(mf::common);for(unsigned k=0;k<=mf::ComStream;++k)append(mf::methods(static_cast<mf::Kind>(k)));
         return result;
     }();return table;
 }
@@ -359,9 +369,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
     const auto query=[&](std::uint64_t p,const Guid& iid,std::uint64_t output){
         out(output);const auto& source=entry(p);auto item=source.object;std::uint64_t pointer=0;
         if(iid==mf::unknown || iid==mf::iid(item->kind) || (iid==mf::iid_Attributes && mf::attributes(item->kind)))pointer=item->pointers.at(item->kind);
+        // IMFAudioMediaType：只有主類型為音訊的媒體類型提供，與 IMFMediaType 是同一個物件（GetAudioFormat 接在 IMFMediaType 的方法之後）。
+        else if(iid==mf::iid_AudioMediaType && item->kind==mf::MediaType && item->attributes.contains(mf::MF_MT_MAJOR_TYPE) && item->attributes.at(mf::MF_MT_MAJOR_TYPE).id==mf::MFMediaType_Audio)pointer=item->pointers.at(mf::MediaType);
         else if(iid==mf::iid_Generator && (item->kind==mf::Transform || item->kind==mf::Source || item->kind==mf::MediaStream))pointer=create(item,mf::Generator);
         else if(iid==mf::iid_Shutdown && item->kind==mf::Transform)pointer=create(item,mf::Shutdown);
         else if(item->kind==mf::Stream && iid==mf::iid_TypeHandler)pointer=create(item,mf::TypeHandler);
+        else if(item->kind==mf::ComStream && iid==mf::iid_SequentialStream)pointer=item->pointers.at(mf::ComStream);
         else if(item->kind==mf::Session && (iid==mf::iid_Clock || iid==mf::iid_PresentationClock))pointer=create(item,mf::Clock);
         else if(item->kind==mf::Session && iid==mf::iid_Generator)pointer=item->pointers.at(mf::Session);
         else if(item->kind==mf::Session && iid==mf::iid_RateControl)pointer=create(item,mf::RateControl);
@@ -418,6 +431,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
     #include "mf_guest_bytestream_helpers.inc"
     #include "mf_pipeline_helpers.inc"
     #include "mf_sink_helpers.inc"
+    #include "mf_asf_source_helpers.inc"
     #include "mf_session_source_helpers.inc"
     #include "mf_file_source_helpers.inc"
     #include "mf_session_helpers.inc"
@@ -557,6 +571,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
                 if(name=="T_GetMajorType"){check(arg(1),16);memory.write(GuestAddress{arg(1)},get(*item,mf::MF_MT_MAJOR_TYPE,72).id);}
                 else if(name=="T_IsCompressedFormat"){const auto found=item->attributes.find(mf::MF_MT_COMPRESSED);put(arg(1),found!=item->attributes.end() && found->second.scalar!=0);}
                 else if(name=="T_IsEqual"){auto theirs=object(arg(1),mf::MediaType);const auto equal=[&](const Guid& key){const auto a=item->attributes.find(key),b=theirs->attributes.find(key);return a!=item->attributes.end() && b!=theirs->attributes.end() && a->second==b->second;};std::uint32_t flags=0;if(equal(mf::MF_MT_MAJOR_TYPE))flags|=1;if(equal(mf::MF_MT_SUBTYPE))flags|=2;auto a=item->attributes,b=theirs->attributes;a.erase(mf::MF_MT_MAJOR_TYPE);a.erase(mf::MF_MT_SUBTYPE);b.erase(mf::MF_MT_MAJOR_TYPE);b.erase(mf::MF_MT_SUBTYPE);if(a==b)flags|=4;if(item->attributes==theirs->attributes)flags|=8;put(arg(2),flags);result=flags==15?0:1;}
+                else if(name=="T_GetAudioFormat"){
+                    // IMFAudioMediaType::GetAudioFormat：回傳由媒體類型持有的 WAVEFORMATEX 指標（不是 HRESULT）；不是音訊類型或缺少必要屬性時回 NULL。
+                    // 格式標籤取自子類型 GUID 的前 32 位元（{XXXXXXXX-0000-0010-8000-00AA00389B71} 家族），編碼器私有資料（MF_MT_USER_DATA）接在後面當 cbSize 部分。
+                    // 區塊隨媒體類型釋放；屬性可能已變更，每次呼叫重新產生。
+                    result=0;
+                    const auto scalar=[&](const Guid& key)->std::uint64_t {const auto found=item->attributes.find(key);return found==item->attributes.end()?0:found->second.scalar;};
+                    const auto major=item->attributes.find(mf::MF_MT_MAJOR_TYPE),subtype=item->attributes.find(mf::MF_MT_SUBTYPE);
+                    if(major!=item->attributes.end() && major->second.id==mf::MFMediaType_Audio && subtype!=item->attributes.end()){
+                        std::array<std::uint8_t,16> id{},base{};std::memcpy(id.data(),&subtype->second.id,16);std::memcpy(base.data(),&mf::pcm,16);
+                        std::uint32_t tag=0;std::memcpy(&tag,id.data(),4);
+                        const auto user=item->attributes.find(mf::MF_MT_USER_DATA);
+                        const std::vector<std::uint8_t> empty;const auto& extra=user!=item->attributes.end() && user->second.type==0x1011?user->second.blob:empty;
+                        if(std::equal(id.begin()+4,id.end(),base.begin()+4) && tag<=UINT16_MAX && extra.size()<=UINT16_MAX){
+                            const auto channels=scalar(mf::MF_MT_AUDIO_NUM_CHANNELS),rate=scalar(mf::MF_MT_AUDIO_SAMPLES_PER_SECOND),align=scalar(mf::MF_MT_AUDIO_BLOCK_ALIGNMENT),
+                                depth=scalar(mf::MF_MT_AUDIO_BITS_PER_SAMPLE),average=scalar(mf::MF_MT_AUDIO_AVG_BYTES_PER_SECOND);
+                            std::vector<std::uint8_t> bytes(18+extra.size());
+                            const auto word=[&](std::size_t at,std::uint64_t value,std::size_t size){for(std::size_t i=0;i<size;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(8*i));};
+                            word(0,tag,2);word(2,channels,2);word(4,rate,4);word(8,average?average:rate*align,4);word(12,align,2);word(14,depth,2);word(16,extra.size(),2);
+                            std::copy(extra.begin(),extra.end(),bytes.begin()+18);
+                            if(item->allocation){(void)free_heap(memory,item->allocation,state);item->allocation=0;}
+                            item->allocation=allocate(bytes.size());memory.write(GuestAddress{item->allocation},bytes);result=item->allocation;
+                        }
+                    }
+                }
                 else throw Failure{invalid};
             }else if(name.starts_with("R_")){
                 require(item->kind==mf::Async,no_interface);
@@ -633,7 +671,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
             }else throw Failure{no_interface};
         }
     }catch(const Failure& error){result=error.code;}catch(const MemoryFault&){result=pointer_error;}catch(const std::bad_alloc&){result=0x8007000eU;}catch(const std::invalid_argument&){result=invalid;}catch(const std::logic_error&){result=0xc00d36b2U;}catch(const std::runtime_error&){result=0x80004005U;}
+    // 診斷：X64ARM_TRACE_MEDIA_ERRORS=1 時列出回傳失敗 HRESULT 的 Media Foundation 匯出與方法（不改變行為）。
+    static const bool trace_failures=[] {const auto* value=std::getenv("X64ARM_TRACE_MEDIA_ERRORS");return value && std::string_view(value)=="1";}();
+    if(trace_failures && (result&0x80000000U) && name!="MFGetSystemTime" && name!="T_GetAudioFormat")
+        std::fprintf(stderr,"[media-foundation] %.*s 失敗 hr=0x%08x\n",static_cast<int>(name.size()),name.data(),static_cast<unsigned>(result));
     if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,result);return std::nullopt;}
-    arg.return_to(state,result,name=="MFGetSystemTime");return std::nullopt;
+    arg.return_to(state,result,name=="MFGetSystemTime" || name=="T_GetAudioFormat");return std::nullopt;
 }
 }

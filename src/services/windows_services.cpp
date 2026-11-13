@@ -17,6 +17,7 @@
 #include "guest_xaudio.hpp"
 #include "guest_d3d9_formats.hpp"
 #include "guest_com_agile.hpp"
+#include "guest_concrt_queue.hpp"
 #include "windows_scalar_math.hpp"
 #include "guest_scalar_math_code.hpp"
 #include "guest_thread_code.hpp"
@@ -710,6 +711,12 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
         static const bool d3d9_formats_lowering=[] {const auto* v=std::getenv("X64ARM_GUEST_D3D9_FORMATS");return !v || std::string_view(v)!="0";}();
         if(d3d9_formats_lowering && trace_services_.empty() && !startup_profile::enabled() && !std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))
             d3d9_formats::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value);
+        // ConcRT concurrent_queue 基底只有客體實作（宿主僅承接 bad_alloc 拋出），追蹤服務或啟動剖析時同樣映射。
+        concrt_queue::initialize(memory,runtime_.builtin_images,x86_,callback_return_.value,{
+            resolve("crt","_aligned_malloc").value,resolve("crt","_aligned_free").value,resolve("kernel32.dll","SwitchToThread").value,
+            resolve("concrt140.dll",x86_?concrt_queue::throw_exception_x86:concrt_queue::throw_exception_x64).value,
+            resolve("crt","_purecall").value,
+            resolve("msvcp140.dll",x86_?"?_Xlength_error@std@@YAXPBD@Z":"?_Xlength_error@std@@YAXPEBD@Z").value,resolve("msvcp140.dll","?_Xbad_alloc@std@@YAXXZ").value});
         // 常駐執行器直接接續已驗證目標，省去完整服務邊界；明確 0／1 仍可覆寫。
         // 傳統平行批次曾因頻繁喚醒增加成本，呼叫端未選定常駐執行器時維持原預設。
         // 在載入初始化時完成配置，不在執行中改寫已被轉譯器當成常數的 CFG cell。
@@ -971,6 +978,11 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
                 return GuestAddress{image->first+entry->second};
         }
+        if(descriptor.family=="concrt140.dll"){
+            const auto image=runtime_.builtin_images.find(callback_return_.value+concrt_queue::image_offset);
+            if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
+                return GuestAddress{image->first+entry->second};
+        }
         if(descriptor.family=="internal-com-agile" && trace_services_.empty()){
             const auto image=runtime_.builtin_images.find(callback_return_.value+com_agile::image_offset);
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
@@ -1014,7 +1026,7 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
         for(const auto& symbol:index["dbghelp.dll"])
             if(detail::builtin_provider_export_family("imagehlp.dll",symbol)=="dbghelp.dll")index["imagehlp.dll"].emplace(symbol);
         for(const auto& [ordinal,name]:detail::ole_ordinal_exports){(void)name;index["oleaut32.dll"].emplace("#"+std::to_string(ordinal));}
-        for(const auto* module:{"xaudio2_9.dll","xaudio2_9redist.dll"}){index[module].emplace("XAudio2Create");index[module].emplace("#1");}
+        for(const auto* module:{"xaudio2_9.dll","xaudio2_9redist.dll"}){index[module].emplace("XAudio2Create");index[module].emplace("#1");index[module].emplace("CreateFX");index[module].emplace("#4");}
         for(const auto& service:math_service_descriptors())if(service.family=="d3dx9_43.dll")index["d3dx10_43.dll"].emplace(service.symbol);
         // CRT 別名仍經 resolve_service 選擇版本及 x86 ABI；只加入既有可列舉名稱。
         for(const auto symbol:{"_create_locale","__create_locale","_wcreate_locale","_get_current_locale","__get_current_locale",
@@ -1051,6 +1063,8 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
         if(const auto image=runtime_.builtin_images.find(callback_return_.value+msvcp90_string::image_offset);image!=runtime_.builtin_images.end())
             for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
         if(const auto image=runtime_.builtin_images.find(callback_return_.value+mf_image::image_offset);image!=runtime_.builtin_images.end())
+            for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
+        if(const auto image=runtime_.builtin_images.find(callback_return_.value+concrt_queue::image_offset);image!=runtime_.builtin_images.end())
             for(const auto& [name,entry]:image->second.export_names){(void)name;if(target.value==image->first+entry)return true;}
         return false;
     };
@@ -2210,6 +2224,9 @@ bool WindowsServices::resident_coordinated_service(GuestState& state,GuestMemory
         if(thread==threads_.items.end() || thread->second.teb!=state.gs_base)return false;
         const bool signal=descriptor.symbol=="Queue.Signal" || descriptor.symbol=="Fence.Signal" || descriptor.symbol=="Fence.SetEventOnCompletion";
         if(signal && (!registered_waits_.empty() || !wait_completion_packets_.empty()))return false; // 已登錄等待的回呼要在全停路徑啟動。
+        // 交換鏈全螢幕狀態查詢要取回輸出（ppTarget 非空）時會持有 DXGI 輸出物件並經 D3D11／DXGI 橋接層的完整處理器
+        //（可能配置或釋放 heap），交回全停路徑；只讀狀態的每幀查詢留在本地（與 D3D11 交換鏈的本地資格相同）。
+        if(descriptor.symbol=="Swap.GetFullscreenState" && state.reg(Gpr::R8))return false;
         const auto previous=threads_.current;const auto saved_error=last_error_;
         const GuestAddress error_slot{state.gs_base+0x68};
         const auto entry_error=static_cast<std::uint32_t>(memory.load(error_slot,32));

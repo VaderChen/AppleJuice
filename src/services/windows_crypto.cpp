@@ -44,6 +44,7 @@ std::span<const WindowsServiceDescriptor> crypto_service_descriptors() {
         {"bcrypt.dll","BCryptGetProperty",6},{"bcrypt.dll","BCryptCreateHash",7},
         {"bcrypt.dll","BCryptHashData",4},{"bcrypt.dll","BCryptFinishHash",4},
         {"bcrypt.dll","BCryptDestroyHash",1},{"bcrypt.dll","BCryptDuplicateHash",5},
+        {"bcrypt.dll","BCryptDeriveKeyPBKDF2",9,32},
         {"bcrypt.dll","BCryptSetProperty",5},{"bcrypt.dll","BCryptImportKey",9},
         {"bcrypt.dll","BCryptImportKeyPair",7},{"bcrypt.dll","BCryptExportKey",7},
         {"bcrypt.dll","BCryptGenerateSymmetricKey",7},{"bcrypt.dll","BCryptGenerateKeyPair",4},
@@ -245,6 +246,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_crypto(GuestState& state,Gu
             runtime_.crypto_hashes.emplace(handle,std::move(object));
             if (arg(2)) {memory.write(GuestAddress{arg(2)},std::array<std::uint8_t,object_length>{});memory.store(GuestAddress{arg(2)},64,handle);}
             memory.store(GuestAddress{arg(1)},x86_?32:64,handle);
+        }
+    } else if (symbol=="BCryptDeriveKeyPBKDF2") {
+        // RFC 8018 PBKDF2：PRF 為以 BCRYPT_ALG_HANDLE_HMAC_FLAG 開啟的 HMAC 演算法；每個區塊 T_i = U_1 ^ … ^ U_c，
+        // U_1 = PRF(密碼, 鹽 ‖ INT(i))、U_j = PRF(密碼, U_{j-1})。以密碼金鑰化一次，之後每次複製雜湊狀態。
+        const auto algorithm=runtime_.crypto_algorithms.find(arg(0));const auto iterations=arg(5);const auto length=u32(7);
+        if (algorithm==runtime_.crypto_algorithms.end()) status=invalid_handle;
+        else if (!algorithm->second.hmac || !hash_info(algorithm->second.name) || !iterations || u32(8) || (length && !arg(6)) || (u32(2) && !arg(1)) || (u32(4) && !arg(3))) status=invalid_parameter;
+        else {
+            memory.check(GuestAddress{arg(6)},length,Access::Write);
+            const auto password=buffer(arg(1),u32(2)),salt=buffer(arg(3),u32(4));
+            const CryptoHash keyed(algorithm->second.name,true,password);
+            std::vector<std::uint8_t> derived;derived.reserve(length);
+            for (std::uint32_t block=1;derived.size()<length;++block) {
+                auto first=keyed;first.update(salt);
+                const std::array<std::uint8_t,4> index{static_cast<std::uint8_t>(block>>24),static_cast<std::uint8_t>(block>>16),static_cast<std::uint8_t>(block>>8),static_cast<std::uint8_t>(block)};
+                first.update(index);auto u=first.digest();auto t=u;
+                for (std::uint64_t round=1;round<iterations;++round) {auto next=keyed;next.update(u);u=next.digest();for (std::size_t i=0;i<t.size();++i) t[i]^=u[i];}
+                derived.insert(derived.end(),t.begin(),t.begin()+static_cast<std::ptrdiff_t>(std::min<std::size_t>(t.size(),length-derived.size())));
+            }
+            memory.write(GuestAddress{arg(6)},derived);
         }
     } else if (symbol=="BCryptDestroyHash") {
         if (!runtime_.crypto_hashes.erase(arg(0))) status=invalid_handle;

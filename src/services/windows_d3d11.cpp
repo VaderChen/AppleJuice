@@ -300,6 +300,13 @@ std::uint32_t word(std::span<const std::uint8_t> data,std::size_t at) {
 void put_word(std::vector<std::uint8_t>& data,std::size_t at,std::uint32_t value) {
     for(unsigned i=0;i<4;++i)data.at(at+i)=static_cast<std::uint8_t>(value>>(8*i));
 }
+// DXGI_SWAP_CHAIN_FULLSCREEN_DESC：RefreshRate、ScanlineOrdering、Scaling 取目標模式，Windowed 取目前全螢幕狀態。
+// IDXGISwapChain1::GetFullscreenDesc 與 D3D12 交換鏈的 GetDesc（見 dxgi_display_swap_fullscreen_desc）共用。
+std::vector<std::uint8_t> swap_fullscreen_desc(const Identity& swap) {
+    std::vector<std::uint8_t> desc(20);
+    std::copy_n(swap.target_mode.begin()+8,8,desc.begin());put_word(desc,8,word(swap.target_mode,20));put_word(desc,12,word(swap.target_mode,24));put_word(desc,16,swap.fullscreen?0:1);
+    return desc;
+}
 std::vector<std::uint8_t> decoder_config() {
     std::vector<std::uint8_t> value(100);
     for(unsigned i=0;i<3;++i)std::copy(DXVA_NoEncrypt.begin(),DXVA_NoEncrypt.end(),value.begin()+i*16);
@@ -404,6 +411,11 @@ struct D3D11State {
     std::uint64_t draw_front_hits{},draw_front_fallbacks{};
     // 診斷：遊戲內各 D3D11 方法建立後端資源的次數（隨 X64ARM_TRACE_GRAPHICS_STATS 輸出）。
     std::map<std::string,std::uint64_t,std::less<>> resource_creations;
+    // D3D12 交換鏈的顯示身分（鍵為 D3D12 交換鏈的介面指標）：沒有 Metal 後端資源的 Kind::SwapChain 身分，只保存視窗、
+    // 全螢幕狀態／輸出、目標模式與描述，讓 D3D12 交換鏈的 DXGI 顯示家族與 D3D11 交換鏈共用同一組處理器與狀態
+    //（family "internal-d3d12-swap"，見 invoke_d3d11_full）。客體不會取得這個身分的介面指標；建立／銷毀只在完整服務路徑，
+    // 讀取另在協調者本地路徑（同一執行緒）。
+    std::map<std::uint64_t,std::shared_ptr<Identity>> display_swaps;
     // 本地協調服務中引用歸零的物件：延到下一次非本地 D3D11 呼叫再銷毀（銷毀會釋放 heap）。
     std::vector<std::pair<std::uint64_t,bool>> deferred_releases;
     std::size_t peak_interfaces{};
@@ -428,6 +440,23 @@ struct D3D11State {
         }catch(...){}
     }
 };
+namespace detail {
+// D3D12 交換鏈（windows_d3d12.cpp）讀取與同步其顯示身分；只讀寫身分的描述位元組，不建立物件、不碰後端。
+// 取得目前的 DXGI_SWAP_CHAIN_FULLSCREEN_DESC（Windowed 反映實際全螢幕狀態）；沒有顯示身分時回 false。
+bool dxgi_display_swap_fullscreen_desc(const D3D11State* bridge,std::uint64_t swap,std::array<std::uint8_t,20>& desc) noexcept {
+    if(!bridge)return false;
+    const auto found=bridge->display_swaps.find(swap);if(found==bridge->display_swaps.end())return false;
+    try{const auto bytes=swap_fullscreen_desc(*found->second);std::copy(bytes.begin(),bytes.end(),desc.begin());return true;}
+    catch(...){return false;}
+}
+// D3D12 的 ResizeBuffers 完成後同步緩衝描述（與 D3D11 的 ResizeBuffers 更新相同欄位：大小、格式、數量、旗標）；
+// DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH 由 set_fullscreen 讀這份旗標。
+void dxgi_display_swap_buffers(D3D11State* bridge,std::uint64_t swap,std::uint32_t width,std::uint32_t height,std::uint32_t format,std::uint32_t count,std::uint32_t flags) noexcept {
+    if(!bridge)return;
+    const auto found=bridge->display_swaps.find(swap);if(found==bridge->display_swaps.end() || found->second->desc.size()<72)return;
+    auto& desc=found->second->desc;put_word(desc,0,width);put_word(desc,4,height);put_word(desc,16,format);put_word(desc,40,count);put_word(desc,64,flags);
+}
+}
 namespace {
 #include "d3d11_setter_front_path.inc"
 #include "d3d11_draw_front_path.inc"
@@ -1162,6 +1191,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         };
         #include "d3d10_adapter.inc"
         #include "d3d11_1_adapter.inc"
+        // D3D12 交換鏈的 DXGI 顯示家族（GetContainingOutput、Get／SetFullscreenState、GetFullscreenDesc、ResizeTarget、
+        // GetRestrictToOutput、GetParent）：this 換成它在本橋接層的顯示身分後，由下方 D3D11 交換鏈的同一組處理器執行，
+        // 全螢幕切換、視窗通知、輸出物件與收尾（fullscreen_activation、return_to）完全共用。
+        if(service.family=="internal-d3d12-swap"){
+            const auto display=bridge.display_swaps.find(original_arg(0));
+            if(symbol=="DisplayRelease"){
+                // D3D12 交換鏈最後一次 Release：銷毀顯示身分（仍在全螢幕時先還原視窗，與 D3D11 交換鏈釋放相同）。
+                // 這是 invoke_d3d12 內的中途呼叫：不寫回返回值，錯誤也不得走到下方的 return_to。
+                if(display!=bridge.display_swaps.end()){
+                    const auto identity=display->second;bridge.display_swaps.erase(display);
+                    try{release(identity->root);}
+                    catch(const std::exception& error){
+                        // 視窗無法還原（原生層拒絕）時仍要銷毀身分，否則殘留的全螢幕狀態會擋住之後的交換鏈。
+                        bridge.last_error=error.what();if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] D3D12 交換鏈顯示身分釋放：%s\n",error.what());
+                        identity->fullscreen=false;try{release(identity->root);}catch(const std::exception&){}
+                    }
+                }
+                return std::nullopt;
+            }
+            if(display==bridge.display_swaps.end())throw std::invalid_argument("D3D12 交換鏈沒有顯示身分");
+            adapt(0,display->second->root);
+        }
         bool graphics_handled=false;
 #include "d3d11_graphics_handlers.inc"
 #include "d3d10_handlers.inc"

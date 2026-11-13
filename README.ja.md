@@ -112,42 +112,48 @@ x86_64（64 ビット）に加えて、x86 PE32 の EXE と対応する DLL を�
 - **OpenGL／WebGL**：OpenGL／WGL は既定で Metal で描画し、初期化に失敗した場合は macOS の OpenGL を使用します。WebGL が使う EGL／GLES は ANGLE の Metal バックエンドで処理します。
 - **オーディオ**：DirectSound（3D 定位と録音を含む）、XAudio2、WASAPI、X3DAudio を Core Audio で出力し、ステレオの左右チャンネルとパンを保持します。
 - **入力**：DirectInput（フォースフィードバックを含む）、XInput、Raw Input は macOS の物理入力デバイスのデータを使用します。
-- **動画**：Media Foundation と D3D11 DXVA の H.264 エンコード／デコードは VideoToolbox のハードウェアアクセラレーションを使用します。HEVC と AV1 は未完成です。
+- **動画**：Media Foundation と D3D11 DXVA の H.264 エンコード／デコードは VideoToolbox のハードウェアアクセラレーションを使用します。Windows Media（ASF）の VC-1／WMV と WMA は内蔵のデコーダー専用 FFmpeg でデコードします。HEVC と AV1 は未完成です。
+- **アップスケーリング**：ゲームの XeSS は MetalFX のテンポラルアップスケーラーで実行します。ゲームが XeSS を有効にすると、Launcher のフレーム補間と 2 倍拡大は自動的に停止し、ゲームのアップスケーラーの出力を表示します。
 
 AppleJuice は開発中です。Windows 全体、すべてのアプリケーション、すべての API 引数の組み合わせには対応していません。読み込みやウィンドウの表示が成功しても、アプリケーション全体の互換性を保証するものではありません。ドライブマッピングは完全な OS サンドボックスではなく、有効なサービスはマッピング先のファイルやネットワークにアクセスする場合があります。信頼できるプログラムだけを実行し、必要に応じてアクセス権を設定してください。
 
 リポジトリには `src/`、`include/`、`launcher/`、`cmake/`、必要なビルドスクリプト、`third_party/`、`x64kernel/` と使用ドキュメントを含みます。
 
-## 動作確認の記録 / 2026-11-11 / 全 20 本のゲーム
+## 動作確認の記録 / 2026-11-13 / 全 22 本のゲーム
 
-<img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作しないが対応中" title="動作しないが対応中"> 動作しないが対応中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="メイン画面まで起動" title="メイン画面まで起動"> メイン画面まで起動　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="動作するが効率は低い" title="動作するが効率は低い"> 動作するが効率は低い　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好に動作" title="良好に動作"> 良好に動作
+<img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作不可・対応中" title="動作不可・対応中"> 動作不可・対応中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="起動可" title="起動可"> 起動可　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="低効率" title="低効率"> 低効率　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好" title="良好"> 良好　<img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="良好（MetalFX）" title="良好（MetalFX）"> 良好（MetalFX）
 
 | アプリケーション | x64/x86 | 主な動作コア | 対応状況 |
 | --- | --- | --- | :---: |
-| 7-Zip | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| Geekbench 7 | x64 | CPU | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| Memelis' RPG | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| ドラゴンクエストIII　そして伝説へ… | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| 不谙世事的猫艾露莎 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| 永恒的黄昏 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| ファイナルファンタジーVIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| ファイナルファンタジーIX | x64 | D3D9（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| 逆転裁判123 成歩堂セレクション | x86 | D3D11（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| 天穂のサクナヒメ | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| トゥームレイダー（2013） | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好に動作" title="良好に動作"> |
-| It Takes Two | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
-| Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
-| 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
-| サイバーパンク2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
-| 三國志X with パワーアップキット | x86 | 不明 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
-| 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
-| 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
-| Clair Obscur: Expedition 33 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
-| ライズ オブ ザ トゥームレイダー | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
-| シャドウ オブ ザ トゥームレイダー | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="動作するが効率は低い" title="動作するが効率は低い"> |
-| デイヴ・ザ・ダイバー | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="メイン画面まで起動" title="メイン画面まで起動"> |
-| 特警シグナルフォース | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="メイン画面まで起動" title="メイン画面まで起動"> |
+| 7-Zip | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| WinRAR | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| Geekbench 7 | x64 | CPU | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| Memelis' RPG | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| ドラゴンクエストIII　そして伝説へ… | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| 不谙世事的猫艾露莎 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| 永恒的黄昏 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| ファイナルファンタジーVIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| ファイナルファンタジーIX | x64 | D3D9（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| 逆転裁判123 成歩堂セレクション | x86 | D3D11（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| 天穂のサクナヒメ | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| トゥームレイダー（2013） | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| オクトパストラベラーII | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| Clair Obscur: Expedition 33 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="良好（MetalFX）" title="良好（MetalFX）"> |
+| ライズ オブ ザ トゥームレイダー | x64 | D3D11 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="良好（MetalFX）" title="良好（MetalFX）"> |
+| シャドウ オブ ザ トゥームレイダー | x64 | D3D12 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="良好（MetalFX）" title="良好（MetalFX）"> |
+| It Takes Two | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
+| Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
+| 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
+| サイバーパンク2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
+| 三國志X with パワーアップキット | x86 | 不明 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
+| 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
+| 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
+| デイヴ・ザ・ダイバー | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="起動可" title="起動可"> |
+| 特警シグナルフォース | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="起動可" title="起動可"> |
+| バイオハザード ヴィレッジ | x64 | D3D12（RE Engine） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="動作不可・対応中" title="動作不可・対応中"> |
+
+「良好（MetalFX）」は、Launcher のフレーム補間または 2 倍拡大（MetalFX）を有効にすると「良好」の基準を満たすことを示します。無効の場合は「低効率」です。
 
 記録は当時のバージョンと設定によるもので、ゲーム全体の流れ、他のバージョン、すべての設定での動作を示すものではありません。
 

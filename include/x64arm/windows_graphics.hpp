@@ -11,6 +11,10 @@
 #include <vector>
 
 namespace x64arm {
+// 遊戲自己的升頻（XeSS、FSR）已初始化的情境數。大於 0 時停用內建的畫面內插與 2 倍放大，由遊戲的升頻輸出畫面；
+// 遊戲銷毀升頻情境後恢復。服務層（內建 libxess／FidelityFX）增減，Metal 後端在呈現時讀取。
+inline std::atomic<int>& game_upscaler_contexts(){static std::atomic<int> count{0};return count;}
+inline bool game_upscaler_active(){return game_upscaler_contexts().load(std::memory_order_acquire)>0;}
 class SharedWake;
 // D3D9 固定管線及 D3D11 可程式化管線共用同一 Metal context、提交與呈現。
 // pending_stamp：後端在途清單最近一次加入此物件的批次編號（Metal 在途追蹤以它略過同批重複加入，不查雜湊表）。

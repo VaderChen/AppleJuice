@@ -7,6 +7,9 @@
 #include "x64arm/unicode.hpp"
 #include "x64arm/security_descriptor.hpp"
 #include "x64arm/windows_security_attributes.hpp"
+#include "x64arm/pe_loader.hpp"
+#include "guest_concrt_queue.hpp"
+#include "guest_concrt_queue_code.hpp"
 #include <algorithm>
 
 namespace x64arm {
@@ -49,10 +52,38 @@ ObjectAttributes object_attributes(const GuestMemory& memory,std::uint64_t addre
     if(pointer(2))result.name=native_string(memory,pointer(2),x86);return result;
 }
 }
+// 映射 ConcRT concurrent_queue 基底的客體常式映像；映像沒有匯入表，宿主入口在映射前寫進 guest_concrt_host[]，之後整個映像唯讀。
+void concrt_queue::initialize(GuestMemory& memory,std::map<std::uint64_t,RuntimeImage>& images,bool x86,std::uint64_t gateway,
+                              const std::array<std::uint64_t,CONCRT_QUEUE_HOST_COUNT>& host){
+    const auto bytes=x86?std::span<const std::uint8_t>{image_x86}:std::span<const std::uint8_t>{image_x64};
+    const auto base=gateway+image_offset;auto parsed=parse_pe_image(bytes,GuestAddress{base},true,memory.limit());
+    if(!parsed.imports.empty() || !parsed.delay_imports.empty() || parsed.metadata.image_size>image_capacity)
+        throw std::logic_error("Concrt 佇列常式包含外部相依或超出常駐映像範圍");
+    for(const auto& [address,image]:images)if(base<address+image.size && address<base+parsed.metadata.image_size)
+        throw std::logic_error("Concrt 佇列常式與既有常駐映像重疊");
+    const auto native=[&](std::string_view name){
+        const auto found=parsed.runtime.export_names.find(std::string(name));
+        if(found==parsed.runtime.export_names.end())throw std::logic_error("Concrt 佇列常式缺少產碼入口："+std::string(name));
+        return parsed.runtime.export_ordinals.at(found->second);
+    };
+    auto image=parsed.runtime;image.path=u"[guest-concrt-queue]";image.export_names.clear();image.export_ordinals.clear();
+    for(const auto& binding:bindings)image.export_names.emplace(std::string(x86?binding.x86:binding.x64),native(binding.native));
+    const std::uint64_t cells=native("guest_concrt_host");const unsigned unit=x86?4U:8U;
+    const auto data=std::find_if(parsed.mappings.begin(),parsed.mappings.end(),[&](const PeMapping& mapping){
+        return cells>=mapping.rva && cells-mapping.rva+unit*host.size()<=mapping.bytes.size();});
+    if(data==parsed.mappings.end())throw std::logic_error("Concrt 佇列常式的宿主入口表不在已初始化資料區");
+    for(std::size_t index=0;index<host.size();++index){
+        if(!host[index] || (x86 && host[index]>UINT32_MAX))throw std::logic_error("Concrt 佇列常式的宿主入口無效");
+        for(unsigned n=0;n<unit;++n)data->bytes[cells-data->rva+index*unit+n]=static_cast<std::uint8_t>(host[index]>>(8*n));
+    }
+    for(auto& mapping:parsed.mappings)mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
+    map_pe_image(memory,parsed);images.emplace(base,std::move(image));
+}
 std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"ntdll.dll","RtlDisownModuleHeapAllocation",2},
 #include "concrt_sync_descriptors.inc"
+#include "concrt_queue_descriptors.inc"
         {"ntdll.dll","NtCreateFile",11,0,0,0x5e2},{"ntdll.dll","NtOpenFile",6,0,0,0x32},
         {"ntdll.dll","NtQueryAttributesFile",2},{"ntdll.dll","NtQueryFullAttributesFile",2},
         {"ntdll.dll","NtQueryInformationByName",5,0,0,0x18},
@@ -150,6 +181,7 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         ,{"ntdll.dll","LdrLoadDll",4},{"ntdll.dll","LdrGetDllHandle",4},{"ntdll.dll","LdrGetProcedureAddress",4,0,0,0x4},{"ntdll.dll","LdrUnloadDll",1}
         ,{"ntdll.dll","LdrRegisterDllNotification",4},{"ntdll.dll","LdrUnregisterDllNotification",1}
         ,{"ntdll.dll","RtlAreLongPathsEnabled",0}
+        ,{"ole32.dll","CoWaitForMultipleHandles",5},{"combase.dll","CoWaitForMultipleObjects",5}
         ,{"ntdll.dll","RtlGetUnloadEventTrace",0},{"ntdll.dll","RtlGetUnloadEventTraceEx",3}
     };return table;
 }
@@ -295,6 +327,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
 #include "windows_wait_completion_native.inc"
 #include "concrt_sync_handlers.inc"
 #include "msvcp_sync_handlers.inc"
+        if(name=="CoWaitForMultipleHandles" || name=="CoWaitForMultipleObjects"){
+            // COWAIT_*：WAITALL 1、ALERTABLE 2、INPUTAVAILABLE 4、DISPATCH_CALLS 8、DISPATCH_WINDOW_MESSAGES 0x10；
+            // CWMO_*（CoWaitForMultipleObjects）：DISPATCH_CALLS 1、DISPATCH_WINDOW_MESSAGES 2。
+            const bool legacy=name=="CoWaitForMultipleHandles";const auto flags=static_cast<std::uint32_t>(call(0)),count=static_cast<std::uint32_t>(call(2));
+            if(!call(4) || (count && !call(3)) || (legacy?(flags&~0x1fU):(flags&~3U)))return finish(0x80070057U);
+            if(!count)return finish(0x80010120U); // RPC_E_NO_SYNC：沒有可等待的控制代碼。
+            memory.check(GuestAddress{call(4)},4,Access::Write);
+            // STA 的套間值是擁有執行緒 ID（MTA 為 0、未初始化為空）。STA 等待期間由等待服務處理 SendMessage 與跨套間呼叫；
+            // 要求處理視窗訊息時，有輸入就取出並分派一則訊息後以剩餘時間重新等待。WAITALL 改為只等控制代碼（MsgWait 的 WAITALL 還要求輸入）。
+            const auto apartment=com_apartment(threads_.current);const bool sta=apartment && *apartment;
+            const bool waitall=legacy && (flags&1U),alertable=legacy && (flags&2U),input=legacy && (flags&4U);
+            const bool pump=sta && !waitall && (legacy?(flags&0x10U)!=0:(flags&2U)!=0);
+            if(count>(sta && !waitall?63U:64U))return finish(0x80070057U);
+            op.attributes=(sta && !waitall?1U:0U)|(pump?2U:0U)|(waitall?4U:0U)|(alertable?8U:0U)|(input?16U:0U);
+            const auto timeout=static_cast<std::uint32_t>(call(1));op.allocation=timeout==UINT32_MAX?UINT64_MAX:runtime_.clock_ticks+std::uint64_t{timeout}*10000;
+            if(pump)scratch(x86_?28U:48U); // MSG
+            if(op.attributes&1U)return start("user32.dll","MsgWaitForMultipleObjectsEx",{count,call(3),timeout,pump || input?0x4ffU:0x40U,(alertable?2U:0U)|(input?4U:0U)});
+            return start("kernel32.dll","WaitForMultipleObjectsEx",{count,call(3),waitall?1U:0U,timeout,alertable?1U:0U});
+        }
         if(name=="RtlDetermineDosPathNameType_U" || name=="RtlIsDosDeviceName_U"){
             if(!call(0))throw NativeError{0xc000000dU};
             const auto input=path_string(call(0));
@@ -727,6 +778,33 @@ std::optional<std::uint32_t> WindowsServices::resume_nt_native(GuestState& state
         last_error_=op.saved_error;complete_call(state,memory,0);return std::nullopt;
     }
     if(name.starts_with("?_Release_chore@")){last_error_=op.saved_error;complete_call(state,memory,0);return std::nullopt;}
+    if(name=="CoWaitForMultipleHandles" || name=="CoWaitForMultipleObjects"){
+        const auto count=static_cast<std::uint32_t>(a[2]);const bool sta=op.attributes&1U,pump=op.attributes&2U,input=op.attributes&16U;
+        const auto restart=[&](std::string_view family,std::string_view symbol,std::vector<std::uint64_t> arguments){
+            const auto token=next_native_operation_++;native_operations_.emplace(token,op);start_callbacks(state,memory,{{resolve(family,symbol).value,std::move(arguments)}},Continuation::NativeOperation,token);
+        };
+        if(op.information==1){
+            // 一則訊息分派完畢：以剩餘時間重新等待（期限已過時仍做一次零等待，與 Windows 先處理訊息再檢查控制代碼相同）。
+            op.information=0;const auto now=runtime_.clock_ticks;
+            const auto remaining=op.allocation==UINT64_MAX?UINT32_MAX:static_cast<std::uint32_t>(op.allocation>now?std::min<std::uint64_t>((op.allocation-now+9999)/10000,UINT32_MAX-1):0);
+            restart("user32.dll","MsgWaitForMultipleObjectsEx",{count,a[3],remaining,0x4ffU,(op.attributes&8U?2U:0U)|(input?4U:0U)});return std::nullopt;
+        }
+        if(sta && pump && value==count){
+            // 有輸入：PeekMessageW(PM_REMOVE)→TranslateMessage→DispatchMessageW。先清空 MSG，沒有取得訊息時後兩步不做事。
+            op.information=1;memory.write(GuestAddress{op.scratch},std::vector<std::uint8_t>(x86_?28U:48U));
+            const auto token=next_native_operation_++;native_operations_.emplace(token,op);
+            start_callbacks(state,memory,{{resolve("user32.dll","PeekMessageW").value,{op.scratch,0,0,0,1}},{resolve("user32.dll","TranslateMessage").value,{op.scratch}},
+                {resolve("user32.dll","DispatchMessageW").value,{op.scratch}}},Continuation::NativeOperation,token);
+            return std::nullopt;
+        }
+        // 控制代碼索引、WAIT_ABANDONED_0+n 與 WAIT_IO_COMPLETION 都回 S_OK 並寫入原值；逾時為 RPC_S_CALLPENDING，失敗轉成 HRESULT。
+        const auto result=static_cast<std::uint32_t>(value);std::uint32_t hresult=0;
+        if(result==0x102U)hresult=0x80010115U;
+        else if(result==UINT32_MAX)hresult=last_error_?0x80070000U|(last_error_&0xffffU):0x80004005U;
+        else memory.store(GuestAddress{a[4]},32,result);
+        if(op.scratch)(void)free_heap(memory,op.scratch,state);
+        last_error_=op.saved_error;complete_call(state,memory,hresult);return std::nullopt;
+    }
     if(name.starts_with("_Mtx_") || name.starts_with("_Cnd_") || name.starts_with("_Thrd_") || name.starts_with("?_Execute_once@std@@")){
         // _Thrd_result：_Success 0、_Timedout 2、_Busy 3、_Error 4。
         std::uint64_t result=0;

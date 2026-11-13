@@ -14,6 +14,10 @@ inline constexpr std::pair<std::string_view,std::string_view> crt_export_aliases
     {"_free_base","free"},{"_msize_base","_msize"},
     {"__CppXcptFilter","_seh_filter_dll"},{"__set_app_type","_set_app_type"},
     {"_wcsicoll","_wcsicmp"},{"_wcsnicoll","_wcsnicmp"},{"_stricoll","_stricmp"},{"_strnicoll","_strnicmp"}, // C／POSIX locale 的排序即不分大小寫比較。
+    // 已支援的 C／POSIX locale 下，排序（*coll）與不分大小寫比較的 _l 版本不受 locale 參數影響；多出的 locale 參數由呼叫端清理，共用無 locale 版本。
+    {"_stricmp_l","_stricmp"},{"_strnicmp_l","_strnicmp"},{"_wcsicmp_l","_wcsicmp"},{"_wcsnicmp_l","_wcsnicmp"},
+    {"_strcoll_l","strcoll"},{"_wcscoll_l","wcscoll"},{"_strncoll","strncmp"},{"_wcsncoll","wcsncmp"},{"_strncoll_l","strncmp"},{"_wcsncoll_l","wcsncmp"},
+    {"_stricoll_l","_stricmp"},{"_wcsicoll_l","_wcsicmp"},{"_strnicoll_l","_strnicmp"},{"_wcsnicoll_l","_wcsnicmp"},
     {"getwc","fgetwc"},{"putwc","fputwc"},{"strtoumax","strtoull"},{"strtoimax","strtoll"},
     {"_hypot","hypot"},{"__p__timezone","__timezone"},{"__p__daylight","__daylight"},{"__p__tzname","__tzname"},
     {"acosl","acos"},{"acoshl","acosh"},{"asinl","asin"},{"asinhl","asinh"},
@@ -189,8 +193,9 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"comctl32.dll","#345","comctl32.dll","TaskDialogIndirect"},
     {"mmdevapi.dll","#17","mmdevapi.dll","ActivateAudioInterfaceAsync"},
     // XAudio 2.9 與 Redist 的實際匯出序號；SDK 匯入庫以序號連結，X3DAudio 與舊版共用實作。
-    // #2 CreateAudioReverb、#3 CreateAudioVolumeMeter、#4 CreateFX 內建尚未實作，不登錄入口。
+    // #2 CreateAudioReverb、#3 CreateAudioVolumeMeter 內建尚未實作，不登錄入口。
     {"xaudio2_9.dll","#1","xaudio2_9.dll","XAudio2Create"},
+    {"xaudio2_9.dll","#4","xaudio2_9.dll","CreateFX"},
     {"xaudio2_9.dll","#5","x3daudio1_7.dll","X3DAudioCalculate"},
     {"xaudio2_9.dll","#6","x3daudio1_7.dll","X3DAudioInitialize"},
     {"xaudio2_9.dll","X3DAudioCalculate","x3daudio1_7.dll","X3DAudioCalculate"},

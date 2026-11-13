@@ -210,6 +210,7 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {directml_export_service_descriptors(), true, "directml_export_service_descriptors", &WindowsServices::invoke_directml},
             {directml_object_service_descriptors(), false, "directml_object_service_descriptors", &WindowsServices::invoke_directml},
             {xess_service_descriptors(), true, "xess_service_descriptors", &WindowsServices::invoke_xess},
+            {gaming_tcui_service_descriptors(), true, "gaming_tcui_service_descriptors", &WindowsServices::invoke_gaming_tcui},
             {msvcp_pmr_service_descriptors(), true, "msvcp_pmr_service_descriptors", &WindowsServices::invoke_msvcp_pmr},
             {msvcp_special_math_service_descriptors(), true, "msvcp_special_math_service_descriptors", &WindowsServices::invoke_msvcp_special_math},
             {webview2_loader_service_descriptors(), true, "webview2_loader_service_descriptors", &WindowsServices::invoke_webview2},

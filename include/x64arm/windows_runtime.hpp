@@ -383,6 +383,19 @@ struct CompletionPacket {
     std::uint64_t bytes{}, wait_packet{};
     bool operator==(const CompletionPacket&) const = default;
 };
+// 完成封包的 NTSTATUS 對應 Win32 錯誤碼：GetQueuedCompletionStatus 的 GetLastError 與執行緒池 I/O 回呼的 IoResult 共用。
+inline std::uint32_t completion_packet_error(std::uint64_t status){
+    return !status ? 0
+        : status==0xc0000017 ? 8 : status==0xc0000005 ? 998
+        : status==0xc0000022 ? 5 : status==0xc0000054 ? 33
+        : status==0xc0000011 ? 38 : status==0x80000005 ? 234
+        : status==0xc000014b ? 109 : status==0xc00000b0 ? 233
+        : status==0xc000020d ? 64 : status==0xc0000241 ? 1236
+        : status==0xc000009a ? 1450 : status==0xc00000b5 ? 121
+        : status==0x10c ? 1022 : status==0xc0000236 ? 1225
+        : status==0xc000023c ? 1231 : status==0xc000023d ? 1232
+        : status==0xc000020c ? 1226 : status==0xc000000d ? 87 : 995;
+}
 struct CompletionPort {
     std::deque<CompletionPacket> packets;
     std::uint32_t access{0x1f0003};

@@ -239,7 +239,7 @@ function render() {
   $('cli-panel').hidden = !isCLI; $('gui-panel').hidden = isCLI;
   $('analyze').disabled = busy || p.missing || !state.engineReady || active(p);
   setText('analyze', analysisActive(p) ? t('查看分析進度') : t('程式加速分析'));
-  $('config-path').textContent = p.configPath; $('save').disabled = busy; $('remove').disabled = busy || active(p) || analysisActive(p);
+  $('config-path').textContent = p.configPath; $('save').disabled = busy; $('present-upscale').disabled = $('present-interpolation').disabled = busy; $('remove').disabled = busy || active(p) || analysisActive(p);
   $('config-file').hidden = !!p.temporary;
   $('settings-note').textContent = p.temporary ? t('本次設定不會加入程式庫，關閉後清除。') : t('每個 EXE 使用自己的設定檔，下次啟動時套用。');
   setText('save', p.temporary ? t('套用設定') : t('儲存設定'));
@@ -379,6 +379,14 @@ async function startProgram(id) {
 }
 async function stopProgram(id) { applyState(await api('stop', { id })); }
 $('save').onclick = () => perform(async () => { const id = state.selected; const next = await api('save', { id, settings: readSettings() }); drafts.delete(id); applyState(next); toast(selected()?.temporary ? t('本次設定已套用') : t('此程式的設定已儲存')); });
+// 執行頁的顯示開關：切換即寫入此程式的設定，只更新這兩項，不連帶儲存「程式設定」頁尚未儲存的草稿；於下次啟動生效。
+for (const id of ['present-upscale', 'present-interpolation']) $(id).onchange = () => perform(async () => {
+  const p = selected(); if (!p) return;
+  const display = { presentUpscale: $('present-upscale').checked, presentInterpolation: $('present-interpolation').checked };
+  const next = await api('save', { id: p.id, settings: { ...settingsFrom(p), ...display } });
+  const draft = drafts.get(p.id); if (draft) drafts.set(p.id, { ...draft, ...display });
+  applyState(next);
+});
 async function removeProgram(id) { const next = await api('remove', { id }); const item = terminals.get(id); item?.term?.dispose(); item?.host.remove(); terminals.delete(id); drafts.delete(id); applyState(next); }
 // 全域取消 WebKit 預設選單；程式列使用同一個 remove API，保留 EXE 與設定。
 const programMenu = document.createElement('div');

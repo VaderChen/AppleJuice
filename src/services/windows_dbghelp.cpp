@@ -137,6 +137,7 @@ std::span<const WindowsServiceDescriptor> dbghelp_service_descriptors() {
         {"dbghelp.dll","SymSetOptions",1},{"dbghelp.dll","SymGetOptions",0},{"dbghelp.dll","ImagehlpApiVersion",0},{"dbghelp.dll","ImagehlpApiVersionEx",1},
         {"dbghelp.dll","ImageNtHeader",1},{"dbghelp.dll","ImageDirectoryEntryToData",4},{"dbghelp.dll","ImageDirectoryEntryToDataEx",5},
         {"dbghelp.dll","ImageRvaToSection",3},{"dbghelp.dll","ImageRvaToVa",4},
+        {"imagehlp.dll","MapAndLoad",5},{"imagehlp.dll","UnMapAndLoad",1},
         {"dbghelp.dll","SymInitialize",3},{"dbghelp.dll","SymInitializeW",3},
         {"dbghelp.dll","SymCleanup",1},{"dbghelp.dll","SymRefreshModuleList",1},
         {"dbghelp.dll","SymSetSearchPath",2},{"dbghelp.dll","SymSetSearchPathW",2},
@@ -165,6 +166,59 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp(GuestState& state,G
         return path;
     };
     const auto snapshot=[&](SymbolSession& session){refresh_symbol_modules(session,memory);};
+    if(name=="MapAndLoad" || name=="UnMapAndLoad"){
+        // LOADED_IMAGE：ModuleName、hFile、MappedAddress、FileHeader、LastRvaSection、NumberOfSections、Sections、Characteristics、
+        // fSystemImage／fDOSImage／fReadOnly／Version、Links（LIST_ENTRY）、SizeOfImage。開檔、對映與釋放都經既有的 kernel32 服務。
+        const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+        const std::uint64_t module_at=0,file_at=unit,mapped_at=unit*2,header_at=unit*3,last_at=unit*4,count_at=unit*5,sections_at=unit*6,
+            characteristics_at=unit*7,flags_at=characteristics_at+4,links_at=x86_?36U:64U,size_at=x86_?44U:80U,struct_size=x86_?48U:88U;
+        const auto invalid_handle=x86_?UINT64_C(0xffffffff):UINT64_MAX;
+        if(name=="UnMapAndLoad"){
+            if(!arg(0)){fail(87);arg.return_to(state,0);return std::nullopt;}
+            const auto image=arg(0);const auto view=memory.load(GuestAddress{image+mapped_at},bits),file=memory.load(GuestAddress{image+file_at},bits),module=memory.load(GuestAddress{image+module_at},bits);
+            if(view)(void)nested_service(state,memory,"kernel32.dll","UnmapViewOfFile",{view});
+            if(file && file!=invalid_handle)(void)nested_service(state,memory,"kernel32.dll","CloseHandle",{file});
+            if(module)(void)free_heap(memory,module,state);
+            memory.write(GuestAddress{image},std::vector<std::uint8_t>(struct_size));
+            arg.return_to(state,1);return std::nullopt;
+        }
+        // (ImageName, DllPath, LoadedImage, DotDll, ReadOnly)：依 DllPath（NULL 為預設搜尋順序）以 .dll／.exe 為預設副檔名搜尋。
+        if(!arg(0) || !arg(2)){fail(87);arg.return_to(state,0);return std::nullopt;}
+        memory.check(GuestAddress{arg(2)},struct_size,Access::Write);
+        const auto extension=allocate_heap(memory,8),path=allocate_heap(memory,262);
+        struct Release {WindowsServices& self;GuestMemory& memory;const GuestState& state;std::uint64_t a,b;~Release(){if(a)(void)self.free_heap(memory,a,state);if(b)(void)self.free_heap(memory,b,state);}} release{*this,memory,state,extension,path};
+        if(!extension || !path){fail(8);arg.return_to(state,0);return std::nullopt;}
+        {const std::string_view suffix=arg(3)?".dll":".exe";memory.write(GuestAddress{extension},std::vector<std::uint8_t>(suffix.begin(),suffix.end()));memory.store(GuestAddress{extension+4},8,0);}
+        const auto length=nested_service(state,memory,"kernel32.dll","SearchPathA",{arg(1),arg(0),extension,261,path,0});
+        if(!length || length>260){if(!last_error_)last_error_=2;arg.return_to(state,0);return std::nullopt;}
+        const bool read_only=arg(4)!=0;
+        const auto file=nested_service(state,memory,"kernel32.dll","CreateFileA",{path,read_only?0x80000000U:0xc0000000U,read_only?3U:1U,0,3,0,0});
+        if(file==invalid_handle){arg.return_to(state,0);return std::nullopt;}
+        const auto cleanup_file=[&]{const auto error=last_error_;(void)nested_service(state,memory,"kernel32.dll","CloseHandle",{file});last_error_=error;};
+        const auto size=nested_service(state,memory,"kernel32.dll","GetFileSize",{file,0});
+        const auto mapping=nested_service(state,memory,"kernel32.dll","CreateFileMappingA",{file,0,read_only?2U:4U,0,0,0});
+        if(!mapping){cleanup_file();arg.return_to(state,0);return std::nullopt;}
+        const auto view=nested_service(state,memory,"kernel32.dll","MapViewOfFile",{mapping,read_only?4U:2U,0,0,0});
+        {const auto error=last_error_;(void)nested_service(state,memory,"kernel32.dll","CloseHandle",{mapping});last_error_=error;}
+        if(!view){cleanup_file();arg.return_to(state,0);return std::nullopt;}
+        // 不是 PE（缺 MZ／PE 簽章或標頭超出檔案）時回 ERROR_BAD_EXE_FORMAT 並釋放。
+        const auto offset=size>=0x40?memory.load(GuestAddress{view+0x3c},32):0;
+        const bool valid=size>=0x40 && memory.load(GuestAddress{view},16)==0x5a4dU && offset+24<=size && memory.load(GuestAddress{view+offset},32)==0x4550U;
+        if(!valid){(void)nested_service(state,memory,"kernel32.dll","UnmapViewOfFile",{view});cleanup_file();last_error_=193;arg.return_to(state,0);return std::nullopt;}
+        const auto header=view+offset;const auto sections=header+24+memory.load(GuestAddress{header+20},16);
+        const auto module_name=read_ansi(memory,path,261);const auto module=allocate_heap(memory,module_name.size()+1);
+        if(!module){(void)nested_service(state,memory,"kernel32.dll","UnmapViewOfFile",{view});cleanup_file();fail(8);arg.return_to(state,0);return std::nullopt;}
+        std::vector<std::uint8_t> name_bytes(module_name.begin(),module_name.end());name_bytes.push_back(0);memory.write(GuestAddress{module},name_bytes);
+        const auto image=arg(2);memory.write(GuestAddress{image},std::vector<std::uint8_t>(struct_size));
+        memory.store(GuestAddress{image+module_at},bits,module);memory.store(GuestAddress{image+file_at},bits,file);memory.store(GuestAddress{image+mapped_at},bits,view);
+        memory.store(GuestAddress{image+header_at},bits,header);memory.store(GuestAddress{image+last_at},bits,sections);
+        memory.store(GuestAddress{image+count_at},32,memory.load(GuestAddress{header+6},16));memory.store(GuestAddress{image+sections_at},bits,sections);
+        memory.store(GuestAddress{image+characteristics_at},32,memory.load(GuestAddress{header+22},16));
+        memory.store(GuestAddress{image+flags_at+2},8,read_only?1U:0U);
+        memory.store(GuestAddress{image+links_at},bits,image+links_at);memory.store(GuestAddress{image+links_at+unit},bits,image+links_at); // 空串列指向自己。
+        memory.store(GuestAddress{image+size_at},32,size);
+        arg.return_to(state,1);return std::nullopt;
+    }
     if(name.starts_with("Image") && !name.starts_with("Imagehlp")){
         // PE 標頭工具（ImagehlpApiVersion* 是版本查詢，不屬此類）：呼叫端傳入已映射的映像或檔案 view；非 PE 回 NULL 與 ERROR_BAD_EXE_FORMAT。
         const auto nt_header=[&](std::uint64_t base)->std::uint64_t{

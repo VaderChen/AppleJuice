@@ -17,3 +17,32 @@ struct GuestByteStreamAccess {
         }co_return 0;
     }
 };
+// 客體 IStream 的存取；ole32／shlwapi 建立的宿主 IStream 也經同一份 vtable 進入其服務。
+// status 是最後一個客體方法的 HRESULT，由呼叫端決定如何回報。
+struct StreamOutcome {std::uint32_t status{};std::uint64_t value{},object{};std::uint32_t mode{};};
+struct GuestStreamAccess {
+    GuestMemory& memory;std::uint64_t pointer{},scratch{};std::uint8_t bits{};
+    std::uint64_t method(unsigned slot)const {return memory.load(GuestAddress{memory.load(GuestAddress{pointer},bits)+slot*(bits/8U)},bits);}
+    // x86 的 64-bit 參數占兩個堆疊欄位。
+    std::vector<std::uint64_t> wide(std::uint64_t value)const {
+        if(bits==32)return {pointer,static_cast<std::uint32_t>(value),value>>32};return {pointer,value};
+    }
+    service_callback::Call seek(std::uint64_t position){auto args=wide(position);args.push_back(0);args.push_back(0);return service_callback::call(method(5),std::move(args));}
+    service_callback::Call resize(std::uint64_t size){return service_callback::call(method(6),wide(size));}
+    service_callback::Call commit(){return service_callback::call(method(8),{pointer,0});}
+    // Stat(STATFLAG_NONAME)：value 為 cbSize，mode 為 grfMode。
+    service_callback::Task<StreamOutcome> describe(){
+        const std::size_t size=bits==32?72:80;memory.fill(GuestAddress{scratch},0,size);StreamOutcome r;
+        r.status=co_await service_callback::call(method(12),{pointer,scratch,1});
+        if(!(r.status&0x80000000U)){r.value=memory.load(GuestAddress{scratch+(bits==32?8U:16U)},64);r.mode=static_cast<std::uint32_t>(memory.load(GuestAddress{scratch+(bits==32?40U:48U)},32));}
+        co_return r;
+    }
+    // 先定位到 ByteStream 自己維護的位置，再把呼叫端的 buffer 直接交給客體 Read／Write。
+    service_callback::Task<StreamOutcome> transfer(bool writing,std::uint64_t position,std::uint64_t buffer,std::uint32_t count){
+        StreamOutcome r;r.status=co_await seek(position);if(r.status&0x80000000U)co_return r;
+        memory.store(GuestAddress{scratch},32,0);
+        r.status=co_await service_callback::call(method(writing?4:3),{pointer,buffer,count,scratch});
+        if(!(r.status&0x80000000U)){r.value=memory.load(GuestAddress{scratch},32);if(r.value>count)throw Failure{0x80004005U};}
+        co_return r;
+    }
+};

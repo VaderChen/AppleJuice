@@ -152,6 +152,15 @@ RegistryTransaction::RegistryTransaction(RegistryState& state,const std::filesys
     const auto parsed_stamp=cache_?cache_->stamp:std::array<std::uint64_t,7>{};
     const auto byte_stamp=cache_?cache_->byte_stamp:std::array<std::uint64_t,7>{};
     const auto byte_size=cache_?cache_->bytes.size():0;
+    // 唯讀交易的快速路徑：登錄檔只以原子取代更新，檔案戳記（裝置、inode、大小、時間）與已解析快取相同時，
+    // 快取就是這個檔案的完整快照，不必取跨程序鎖、重開檔案或換到 I/O 執行緒。讀到的內容等同於在並行寫入之前完成的讀取。
+    // 程式每幀查詢登錄時（例如 Steam API 每秒上百次確認 Steam 是否執行），原本每次都要排隊取獨占鎖，與其他程序互相等待（實測每次約 2.5 ms）。
+    // X64ARM_REGISTRY_LOCKLESS_READ=0 恢復每次取鎖。
+    static const bool lockless_read=[] {const auto* value=std::getenv("X64ARM_REGISTRY_LOCKLESS_READ");return !value || std::string_view(value)!="0";}();
+    if(lockless_read && readonly && parsed_candidate){
+        struct stat status{};
+        if(!::lstat(path.c_str(),&status) && S_ISREG(status.st_mode) && file_stamp(status)==parsed_stamp){lockless_=true;++cache_->hits;return;}
+    }
     struct Load {
         Descriptor lock;std::uint32_t error{};std::array<std::uint64_t,7> stamp{};
         std::vector<std::uint8_t> bytes;std::int64_t read_us{};
@@ -244,6 +253,7 @@ RegistryTransaction::~RegistryTransaction(){
     if(lock_>=0){::flock(lock_,LOCK_UN);::close(lock_);}
 }
 std::uint32_t RegistryTransaction::commit(){
+    if(lockless_)throw std::logic_error("未取鎖的唯讀登錄交易不可提交");
     if(error)return error;if(path_.empty())return 0;
     RegistryTrace trace("serialize");
     const unsigned version=!state_.replacements.empty() || std::any_of(state_.hives.begin(),state_.hives.end(),[](const auto& item){return item.second.flags;})?4U:state_.classes.empty() && state_.volatile_keys.empty() && state_.hives.empty()?2U:3U;

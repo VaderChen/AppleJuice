@@ -9,6 +9,8 @@
 #include <IOKit/IOKitLib.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <algorithm>
+#include <cmath>
+#include <vector>
 #include <memory>
 #include <dlfcn.h>
 #include <chrono>
@@ -63,6 +65,17 @@ std::optional<std::uint32_t> native_power_role(){
         if(type && CFEqual(type,CFSTR(kIOPSInternalBatteryType)) && CFDictionaryGetValue(data,CFSTR(kIOPSIsPresentKey))!=kCFBooleanFalse)return 2;
     }
     return 1;
+}
+std::optional<double> native_integrated_display_inches(){
+    // CGDisplayScreenSize 依 EDID 回報實體尺寸（公釐）；只看內建顯示器，外接螢幕不算整合式顯示器。
+    std::uint32_t count=0;if(CGGetOnlineDisplayList(0,nullptr,&count)!=kCGErrorSuccess || !count)return {};
+    std::vector<CGDirectDisplayID> displays(count);if(CGGetOnlineDisplayList(count,displays.data(),&count)!=kCGErrorSuccess)return {};
+    for(std::uint32_t i=0;i<count;++i){
+        if(!CGDisplayIsBuiltin(displays[i]))continue;
+        const auto size=CGDisplayScreenSize(displays[i]);if(size.width<=0 || size.height<=0)return {};
+        return std::sqrt(size.width*size.width+size.height*size.height)/25.4;
+    }
+    return {};
 }
 std::optional<NativePowerPreferences> native_power_preferences(){
     // Apple 公開原始碼中的既有 SPI；動態查詢，缺少時不使引擎無法啟動。

@@ -26,6 +26,8 @@ inline constexpr WindowsApiSetFamily windows_api_set_families[]{
     {"api-ms-win-downlevel-ole32","ole32.dll"},{"api-ms-win-downlevel-version","version.dll"},
     {"api-ms-win-downlevel-shlwapi","shlwapi.dll"},
     {"api-ms-win-appmodel-runtime","kernel32.dll"},
+    // 多媒體計時（timeGetTime／timeBeginPeriod 等）由 winmm 承接；Xbox 遊戲 UI（TCUI）由 gamingtcui 承接。
+    {"api-ms-win-mm-time","winmm.dll"},{"api-ms-win-gaming-tcui","gamingtcui.dll"},
     // ext-ms-win：依子系統家族。
     {"ext-ms-win-ntuser-","user32.dll"},{"ext-ms-win-rtcore-ntuser-","user32.dll"},
     {"ext-ms-win-gdi-","gdi32.dll"},{"ext-ms-win-rtcore-gdi-","gdi32.dll"},
@@ -68,6 +70,8 @@ static_assert(windows_api_set_host("api-ms-win-core-com-l1-1-0.dll")=="ole32.dll
 static_assert(windows_api_set_host("api-ms-win-core-winrt-string-l1-1-0.dll")=="combase.dll");
 static_assert(windows_api_set_host("api-ms-win-security-lsalookup-ansi-l2-1-0.dll")=="advapi32.dll");
 static_assert(windows_api_set_host("api-ms-win-core-synch-l1-2-0.dll")=="kernel32.dll");
+static_assert(windows_api_set_host("api-ms-win-mm-time-l1-1-0.dll")=="winmm.dll");
+static_assert(windows_api_set_host("api-ms-win-gaming-tcui-l1-1-4.dll")=="gamingtcui.dll");
 static_assert(windows_api_set_host("ext-ms-win-ntuser-powermanagement-l1-1-0.dll")=="user32.dll");
 static_assert(windows_api_set_host("api-ms-win-crt-runtime-l1-1-0.dll")=="api-ms-win-crt-runtime-l1-1-0.dll");
 static_assert(windows_api_set_host("ext-ms-win-dxcore-l1-1-0.dll")=="ext-ms-win-dxcore-l1-1-0.dll");

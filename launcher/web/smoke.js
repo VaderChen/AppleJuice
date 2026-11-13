@@ -533,6 +533,18 @@
     $('install-root').value = ''; $('install-root').dispatchEvent(new Event('input', { bubbles: true })); await click('save');
     check('清空安裝目錄恢復預設位置', selected().installRoot === '');
     await capture('02-settings.png');
+    // 執行頁的顯示開關：切換即寫入此程式設定，不影響同名 EXE，也不連帶儲存「程式設定」頁未儲存的草稿。
+    const savedArguments = selected().arguments;
+    $('arguments').value = '--draft-only'; $('arguments').dispatchEvent(new Event('input', { bubbles: true }));
+    await click('tab-workspace'); check('顯示開關位於執行頁', !$('workspace').hidden && $('present-upscale').closest('.run-switches') !== null && $('present-upscale').getAttribute('role') === 'switch');
+    await click('present-upscale'); await click('present-interpolation');
+    check('顯示開關切換即儲存', selected().presentUpscale === true && selected().presentInterpolation === true);
+    check('顯示開關不儲存啟動參數草稿', selected().arguments === savedArguments && $('arguments').value === '--draft-only');
+    check('顯示開關不影響同名 EXE', state.programs.find(p => p.id === same.id).presentUpscale !== true && state.programs.find(p => p.id === same.id).presentInterpolation !== true);
+    await capture('run-display-switches.png');
+    await click('present-upscale'); await click('present-interpolation');
+    check('顯示開關可關閉', selected().presentUpscale !== true && selected().presentInterpolation !== true);
+    $('arguments').value = savedArguments; $('arguments').dispatchEvent(new Event('input', { bubbles: true }));
     await click('run'); await until(() => selected().status === 'exited', 'hello EXE 結束');
     await until(() => text(hello.id).includes('Hello from Windows x64 EXE on ARM64!'), '真實 EXE 輸出');
     transcripts.hello = text(hello.id);

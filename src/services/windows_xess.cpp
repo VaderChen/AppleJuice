@@ -35,7 +35,7 @@ double quality_ratio(std::uint32_t quality){
 }
 std::span<const WindowsServiceDescriptor> xess_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
-        {"libxess.dll","xessGetVersion",1},{"libxess.dll","xessGetIntelXeFXVersion",2},{"libxess.dll","xessGetProperties",3},{"libxess.dll","xessGetInputResolution",4},
+        {"libxess.dll","xessGetVersion",1},{"libxess.dll","xessGetIntelXeFXVersion",2},{"libxess.dll","xessGetProperties",3},{"libxess.dll","xessGetInputResolution",4},{"libxess.dll","xessGetOptimalInputResolution",6},
         {"libxess.dll","xessGetJitterScale",3},{"libxess.dll","xessGetVelocityScale",3},{"libxess.dll","xessSetJitterScale",3},{"libxess.dll","xessSetVelocityScale",3},
         {"libxess.dll","xessDestroyContext",1},{"libxess.dll","xessSetLoggingCallback",3},{"libxess.dll","xessIsOptimalDriver",1},{"libxess.dll","xessSelectNetworkModel",2},
         {"libxess.dll","xessSetContextParameterF",3},{"libxess.dll","xessGetProfilingData",2},{"libxess.dll","xessStartDump",2},
@@ -70,7 +70,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xess(GuestState& state,Gues
     const auto found=xess.contexts.find(arg(0));
     if(found==xess.contexts.end())return finish(xess_invalid_context);
     auto& context=found->second;
-    if(symbol=="xessDestroyContext"){(void)free_heap(memory,arg(0),state);xess.contexts.erase(found);return finish(xess_success);}
+    if(symbol=="xessDestroyContext"){if(found->second.initialized)game_upscaler_contexts().fetch_sub(1,std::memory_order_acq_rel);(void)free_heap(memory,arg(0),state);xess.contexts.erase(found);return finish(xess_success);}
     if(symbol=="xessGetIntelXeFXVersion")return finish(xess_unsupported_device);
     if(symbol=="xessIsOptimalDriver" || symbol=="xessSetLoggingCallback" || symbol=="xessSelectNetworkModel" || symbol=="xessSetContextParameterF")return finish(xess_success);
     if(symbol=="xessD3D12BuildPipelines")return finish(xess_success);
@@ -95,6 +95,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_xess(GuestState& state,Gues
         store(arg(3),32,std::max<std::uint32_t>(1,static_cast<std::uint32_t>(std::lround(width/ratio))));store(arg(3)+4,32,std::max<std::uint32_t>(1,static_cast<std::uint32_t>(std::lround(height/ratio))));
         return finish(xess_success);
     }
+    if(symbol=="xessGetOptimalInputResolution"){
+        // XeSS 1.1 起：最佳輸入解析度與動態解析度的允許範圍。MetalFX 時間性升頻器以固定輸入尺寸建立，不支援動態輸入比例，
+        // 最小與最大都等於最佳值（可為 NULL）。
+        if(!arg(1) || !arg(3))return finish(xess_invalid_argument);const auto ratio=quality_ratio(static_cast<std::uint32_t>(arg(2)));if(ratio<=0)return finish(xess_invalid_argument);
+        const auto width=static_cast<std::uint32_t>(load(arg(1),32)),height=static_cast<std::uint32_t>(load(arg(1)+4,32));if(!width || !height)return finish(xess_invalid_argument);
+        const auto input_width=std::max<std::uint32_t>(1,static_cast<std::uint32_t>(std::lround(width/ratio))),input_height=std::max<std::uint32_t>(1,static_cast<std::uint32_t>(std::lround(height/ratio)));
+        for(const auto target:{arg(3),arg(4),arg(5)})if(target){store(target,32,input_width);store(target+4,32,input_height);}
+        return finish(xess_success);
+    }
     if(symbol=="xessD3D12Init"){
         // xess_d3d12_init_params_t：outputResolution(0)、qualitySetting(8)、initFlags(12)、兩個節點遮罩(16、20)、暫存堆積與位移(24…56)、管線庫(64)。
         if(!arg(1))return finish(xess_invalid_argument);
@@ -102,6 +111,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_xess(GuestState& state,Gues
         if(!width || !height || quality_ratio(quality)<=0 || (flags&~flag_known))return finish(xess_invalid_argument);
         // MetalFX 的動態向量與輸入同解析度；輸出解析度的動態向量不支援。
         if(flags&flag_high_res_mv)return finish(xess_unsupported);
+        // 第一次初始化成功即視為遊戲啟用 XeSS：內建的補幀與 2 倍放大停用（重新初始化不重複計數）。
+        if(!context.initialized)game_upscaler_contexts().fetch_add(1,std::memory_order_acq_rel);
         context.width=width;context.height=height;context.quality=quality;context.flags=flags;context.initialized=true;return finish(xess_success);
     }
     if(symbol=="xessD3D12GetInitParams"){

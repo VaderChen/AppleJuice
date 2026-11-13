@@ -17,6 +17,8 @@ std::span<const WindowsServiceDescriptor> registered_wait_service_descriptors(){
         {"kernel32.dll","IsThreadpoolTimerSet",1},{"kernel32.dll","WaitForThreadpoolTimerCallbacks",2,0,0,0x2},{"kernel32.dll","CloseThreadpoolTimer",1},
         {"kernel32.dll","CreateThreadpoolWait",3},{"kernel32.dll","SetThreadpoolWait",3},
         {"kernel32.dll","WaitForThreadpoolWaitCallbacks",2,0,0,0x2},{"kernel32.dll","CloseThreadpoolWait",1},
+        {"kernel32.dll","CreateThreadpoolIo",4},{"kernel32.dll","StartThreadpoolIo",1},{"kernel32.dll","CancelThreadpoolIo",1},
+        {"kernel32.dll","WaitForThreadpoolIoCallbacks",2,0,0,0x2},{"kernel32.dll","CloseThreadpoolIo",1},
         {"kernel32.dll","TrySubmitThreadpoolCallback",3},{"kernel32.dll","CallbackMayRunLong",1},
         {"kernel32.dll","DisassociateCurrentThreadFromCallback",1},{"kernel32.dll","SetEventWhenCallbackReturns",2},
         {"kernel32.dll","ReleaseSemaphoreWhenCallbackReturns",3,0,0,0x4},{"kernel32.dll","ReleaseMutexWhenCallbackReturns",2},

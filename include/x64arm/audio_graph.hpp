@@ -25,11 +25,14 @@ public:
     };
     enum class EventKind {BufferStart,BufferEnd,LoopEnd,StreamEnd,CriticalError};
     struct Event {EventKind kind{};Voice voice{};std::uint64_t context{};};
-    enum class Operation {Start,Stop,Volume,ChannelVolumes,Frequency,Filter,OutputFilter,Matrix,ExitLoop};
+    enum class Operation {Start,Stop,Volume,ChannelVolumes,Frequency,Filter,OutputFilter,Matrix,ExitLoop,EnableEffect,DisableEffect};
     struct Change {
         Operation operation{};Voice voice{},destination{};float value{};
         std::vector<float> values;Filter filter;bool tails{};
+        unsigned effect{}; // EnableEffect／DisableEffect 的效果鏈索引
     };
+    // 效果鏈的一格。Effect 是立體聲 DSP，每兩聲道一個（奇數的最後一個聲道單獨處理），數量須為 (聲道數+1)/2。
+    struct EffectSlot {std::vector<std::shared_ptr<Effect>> pairs;bool enabled{true};};
     VoiceGraph();
     ~VoiceGraph() override;
     Voice create(Kind,Format,unsigned flags=0,unsigned stage=0,float maximum_ratio=2);
@@ -47,6 +50,9 @@ public:
     void change(Change,std::uint32_t set=0);
     void commit(std::uint32_t set=0);
     void set_effects(Voice,std::vector<std::shared_ptr<Effect>>);
+    // 整條效果鏈原子替換；尚未 commit 的啟用／停用隨舊鏈失效。
+    void set_effect_chain(Voice,std::vector<EffectSlot>);
+    bool effect_enabled(Voice,unsigned index) const;
     void start(bool);
     bool running() const;
     std::vector<Event> take_events();

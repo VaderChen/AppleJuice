@@ -480,6 +480,16 @@ private:
     };
     std::map<std::uint64_t,PrivilegeAcquisition> privilege_acquisitions_;
     std::vector<std::pair<std::u16string,std::uint64_t>> wer_runtime_modules_;
+    // WER 註冊（kernel32）：附加檔案、自訂中繼資料、要納入／排除傾印的記憶體區塊（回報旗標在 RuntimeState::wer_flags）。
+    struct WerFile {std::u16string key,path;std::uint32_t type{},flags{};};
+    std::vector<WerFile> wer_files_;
+    std::vector<std::pair<std::u16string,std::u16string>> wer_metadata_;
+    std::vector<std::pair<std::uint64_t,std::uint32_t>> wer_memory_blocks_,wer_excluded_blocks_;
+    // Xbox 遊戲 UI：等待 ProcessPendingGameUI 呼叫完成常式的 UI（完成常式、context、結果、是否為玩家選擇器）。
+    struct PendingGameUi {std::uint64_t routine{},context{};std::uint32_t result{};bool picker{};};
+    std::vector<PendingGameUi> pending_game_ui_;
+    // RegisterAppStateChangeNotification 配置的註冊區塊（客體位址）。
+    std::set<std::uint64_t> app_state_registrations_;
     std::map<std::uint32_t,std::uint32_t> gpu_scheduling_classes_;
     std::uint64_t open_local_thread(std::uint64_t thread,std::uint32_t rights,bool inherit);
     std::optional<std::uint32_t> invoke_system_objects(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -962,6 +972,7 @@ private:
     bool vulkan_worker_ready() const noexcept;
     std::optional<std::uint32_t> invoke_directml(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_xess(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_gaming_tcui(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_msvcp_pmr(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_msvcp_special_math(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_task_dialog(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1613,6 +1624,7 @@ private:
     void poll_timer_queues(GuestMemory&);
     void collect_timer_queues();
     std::optional<std::uint32_t> invoke_timer_queue(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::uint64_t thread_stack_reservation(std::uint64_t parameter, bool reservation) const noexcept;
     std::uint64_t create_guest_thread(const GuestState&,GuestMemory&,std::uint64_t,std::uint64_t,std::uint64_t,std::uint32_t,const GuestThreadBootstrap* = nullptr);
     void initialize_stack_guard(GuestMemory&,std::uint64_t,std::uint64_t,ThreadStackGuard&);
     std::uint32_t configure_stack_guarantee(GuestState&,GuestMemory&,std::uint32_t,bool,std::uint32_t&);

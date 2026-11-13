@@ -9,6 +9,7 @@
 #include "x64arm/unicode.hpp"
 #include "x64arm/cpu_features.hpp"
 #include "x64arm/windows_version.hpp"
+#include "x64arm/windows_power.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/windows_system_paths.hpp"
@@ -275,6 +276,8 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll","VerSetConditionMask",3,1},{"ntdll.dll","VerSetConditionMask",3,1},
         {"kernel32.dll","VerifyVersionInfoA",3,4},{"kernel32.dll","VerifyVersionInfoW",3,4},{"ntdll.dll","RtlVerifyVersionInfo",3,4},
         {"ntdll.dll","RtlGetNtVersionNumbers",3},
+        {"kernel32.dll","RegisterAppStateChangeNotification",3},{"kernel32.dll","UnregisterAppStateChangeNotification",1},
+        {"ntdll.dll","RtlGetDeviceFamilyInfoEnum",3},{"ntdll.dll","RtlConvertDeviceFamilyInfoToString",4},{"kernel32.dll","GetIntegratedDisplaySize",1},
         {"kernel32.dll", "GetSystemInfo", 1}, {"kernel32.dll", "GetNativeSystemInfo", 1},
         {"kernel32.dll", "GetSystemDirectoryA", 2}, {"kernel32.dll", "GetSystemDirectoryW", 2},
         {"kernel32.dll", "GetSystemWow64DirectoryA", 2}, {"kernel32.dll", "GetSystemWow64DirectoryW", 2},
@@ -818,6 +821,45 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     } else if (symbol == "RtlGetNtVersionNumbers") {
         // checked/free build 標記在 build DWORD 高四位；此虛擬環境為 free build。
         for(unsigned i=0;i<3;++i)if(arg(i))memory.store(GuestAddress{arg(i)},32,i==0?windows_version_major:i==1?windows_version_minor:0xf0000000U|windows_version_build);
+    } else if (symbol == "RtlGetDeviceFamilyInfoEnum" || symbol == "RtlConvertDeviceFamilyInfoToString") {
+        // 裝置家族固定為 Windows.Desktop（DEVICEFAMILYINFOENUM_DESKTOP＝3）；裝置型態依宿主平台角色：有內建電池的行動機種為
+        // Notebook（4），其餘為 Desktop（3）。UAP 資訊與 RtlGetVersion 同一版本，主.次.組建.修訂各 16 位元。
+        const bool notebook=native_power_role().value_or(1)==2;
+        if (symbol == "RtlGetDeviceFamilyInfoEnum") {
+            if(arg(0))memory.store(GuestAddress{arg(0)},64,(std::uint64_t{windows_version_major}<<48)|(std::uint64_t{windows_version_minor}<<32)|(std::uint64_t{windows_version_build}<<16)|windows_version_revision);
+            if(arg(1))memory.store(GuestAddress{arg(1)},32,3);
+            if(arg(2))memory.store(GuestAddress{arg(2)},32,notebook?4:3);
+        } else {
+            // 兩個緩衝區大小以位元組計（含結尾 NUL）；任一不足時回寫所需大小並回 STATUS_BUFFER_TOO_SMALL。
+            if(!arg(0) || !arg(1)) result=0xc000000d;
+            else {
+                const std::u16string family=u"Windows.Desktop",form=notebook?u"Notebook":u"Desktop";
+                const auto family_bytes=static_cast<std::uint32_t>((family.size()+1)*2),form_bytes=static_cast<std::uint32_t>((form.size()+1)*2);
+                const auto family_room=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},32)),form_room=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)},32));
+                memory.store(GuestAddress{arg(0)},32,family_bytes);memory.store(GuestAddress{arg(1)},32,form_bytes);
+                if(family_room<family_bytes || form_room<form_bytes || !arg(2) || !arg(3)) result=0xc0000023;
+                else {
+                    const auto write=[&](std::uint64_t at,const std::u16string& text){for(std::size_t i=0;i<=text.size();++i)memory.store(GuestAddress{at+i*2},16,i<text.size()?text[i]:0);};
+                    write(arg(2),family);write(arg(3),form);result=0;
+                }
+            }
+        }
+    } else if (symbol == "RegisterAppStateChangeNotification") {
+        // api-ms-win-core-psm-appnotify：桌面程序沒有 PLM 的暫停／恢復，回呼不會被呼叫；註冊區塊保存回呼與 context，供取消註冊。
+        if(!arg(0) || !arg(2)) result=87;
+        else {
+            const unsigned unit=x86_?4U:8U;const auto block=allocate_heap(memory,unit*2U);
+            if(!block) result=8;
+            else {memory.store(GuestAddress{block},static_cast<std::uint8_t>(unit*8),arg(0));memory.store(GuestAddress{block+unit},static_cast<std::uint8_t>(unit*8),arg(1));
+                app_state_registrations_.insert(block);memory.store(GuestAddress{arg(2)},static_cast<std::uint8_t>(unit*8),block);result=0;}
+        }
+    } else if (symbol == "UnregisterAppStateChangeNotification") {
+        if(app_state_registrations_.erase(arg(0)))(void)free_heap(memory,arg(0),state);
+    } else if (symbol == "GetIntegratedDisplaySize") {
+        // 內建顯示器的對角線英吋數；桌上型主機（只有外接螢幕）依 Windows 回報找不到。
+        if(!arg(0)) result=0x80070057U;
+        else if(const auto inches=native_integrated_display_inches()){const auto bits=std::bit_cast<std::uint64_t>(*inches);memory.store(GuestAddress{arg(0)},64,bits);result=0;}
+        else result=0x80070490U;
     } else if (symbol == "VerSetConditionMask") {
         // 每欄三位元；Windows 的多 bit 輸入只選最高有效欄，重複設定採 OR。
         result=arg(0);const auto types=dword(1)&0xffU;
@@ -885,7 +927,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             --result;
         }
     } else if (symbol == "WerGetFlags") {
-        if (arg(0)!=UINT64_MAX) result=0x80070006;else memory.store(GuestAddress{arg(1)},32,runtime_.wer_flags);
+        // 只能查詢目前程序（x86／x64 的虛擬控制代碼或指向本程序的控制代碼）。
+        if (!current_process_handle(arg(0))) result=0x80070006;else if (!arg(1)) result=0x80070057;else memory.store(GuestAddress{arg(1)},32,runtime_.wer_flags);
     } else if (symbol == "WerSetFlags") {
         if (dword(0)&~0xffU) result=0x80070057;else runtime_.wer_flags=dword(0);
     } else if(symbol=="PowerGetActiveScheme") {

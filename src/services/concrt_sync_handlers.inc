@@ -1,3 +1,10 @@
+// _Concurrent_queue_base_v4 的佇列操作由客體常式映像承接（guest_concrt_queue.c），匯入直接綁定到映像；
+// 宿主只提供 _Internal_throw_exception：MSVC 行為是拋出 std::bad_alloc（衍生類別配置分頁失敗時呼叫）。
+if (service.family == "concrt140.dll" && name.find("@_Concurrent_queue_base_v4@") != name.npos) {
+    if (!name.starts_with("?_Internal_throw_exception@")) throw HostCallFault("Concrt 佇列常式映像未映射");
+    throw_msvc_exception(state, memory, service, MsvcExceptionKind::BadAlloc);
+    return std::nullopt;
+}
 // Concrt 物件保留 v14 的儲存區大小；私有欄位採共用 SRW／CV 字組，沒有第二套等待佇列。
 if (service.family == "concrt140.dll") {
     const auto self = x86_ ? state.reg(Gpr::Rcx) & UINT32_MAX : call(0);

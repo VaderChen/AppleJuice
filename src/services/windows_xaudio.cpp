@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <set>
 #include <time.h>
@@ -41,6 +42,46 @@ constexpr Method engine_methods[]={{"RegisterForCallbacks",2},{"UnregisterForCal
 constexpr Method voice_methods[]={{"GetVoiceDetails",2},{"SetOutputVoices",2},{"SetEffectChain",2},{"EnableEffect",3,6},{"DisableEffect",3,6},{"GetEffectState",3,2},{"SetEffectParameters",5,26},{"GetEffectParameters",4,10},{"SetFilterParameters",3,4},{"GetFilterParameters",2},{"SetOutputFilterParameters",4,8},{"GetOutputFilterParameters",3},{"SetVolume",3,6},{"GetVolume",2},{"SetChannelVolumes",4,10},{"GetChannelVolumes",3,2},{"SetOutputMatrix",6,44},{"GetOutputMatrix",5,12},{"DestroyVoice",1}};
 constexpr Method source_methods[]={{"Start",3,6},{"Stop",3,6},{"SubmitSourceBuffer",3},{"FlushSourceBuffers",1},{"Discontinuity",1},{"ExitLoop",2,2},{"GetState27",2},{"SetFrequencyRatio",3,6},{"GetFrequencyRatio",2},{"SetSourceSampleRate",2,2}};
 constexpr Method factory_methods[]={{"CreateInstance",4},{"LockServer",2,2}};
+// XAPOFX 效果物件：IXAPO 與 IXAPOParameters 各一張虛擬表（物件前兩個指標），方法順序依 xapo.h。
+constexpr Method fx_methods[]={{"QueryInterface",3},{"AddRef",1},{"Release",1},{"GetRegistrationProperties",2},{"IsInputFormatSupported",4},{"IsOutputFormatSupported",4},{"Initialize",3,4},{"Reset",1},{"LockForProcess",5,10},{"UnlockForProcess",1},{"Process",6,42},{"CalcInputFrames",2,2},{"CalcOutputFrames",2,2}};
+constexpr Method fx_parameter_methods[]={{"QueryInterface",3},{"AddRef",1},{"Release",1},{"SetParameters",3,4},{"GetParameters",3,4}};
+constexpr std::uint32_t format_unsupported=0x88970001U,invalid_argument_error=0x80070057U;
+// CLSID 有兩組：XAPOFX1_x（DirectX SDK，A90BC001-E897-E897-7439-4355000000NN）與 XAudio 2.8／2.9。兩組在所有版本都接受。
+struct FxClass {xaudio::Guid legacy,current;audio::Effect::Type type;std::u16string_view name;unsigned maximum_channels,minimum_rate,maximum_rate;};
+constexpr FxClass fx_classes[]={
+    // 聲道與取樣率限制依 xapofx.h：全部只收 FLOAT32；FXEQ 取樣率 22000～48000 Hz；FXReverb 只有單聲道與立體聲。其餘沿用 XAPOBASE 的預設範圍。
+    {{0x01,0xc0,0x0b,0xa9,0x97,0xe8,0x97,0xe8,0x74,0x39,0x43,0x55,0,0,0,0},{0x17,0x11,0xe0,0xf5,0xc4,0xd6,0x5a,0x48,0xa3,0xf5,0x69,0x51,0x96,0xf3,0xdb,0xfa},audio::Effect::Type::FxEq,u"FXEQ",64,22000,48000},
+    {{0x01,0xc0,0x0b,0xa9,0x97,0xe8,0x97,0xe8,0x74,0x39,0x43,0x55,0,0,0,1},{0x16,0x79,0x13,0xc4,0xe1,0x2b,0xfd,0x46,0x85,0x99,0x44,0x15,0x36,0xf4,0x98,0x56},audio::Effect::Type::FxMasteringLimiter,u"FXMasteringLimiter",64,1000,200000},
+    {{0x01,0xc0,0x0b,0xa9,0x97,0xe8,0x97,0xe8,0x74,0x39,0x43,0x55,0,0,0,2},{0x56,0xca,0x9a,0x7d,0x68,0xcb,0x07,0x48,0xb6,0x32,0xb1,0x37,0x35,0x2e,0x85,0x96},audio::Effect::Type::FxReverb,u"FXReverb",2,1000,200000},
+    {{0x01,0xc0,0x0b,0xa9,0x97,0xe8,0x97,0xe8,0x74,0x39,0x43,0x55,0,0,0,3},{0x40,0xd7,0x39,0x50,0x36,0xf7,0x9a,0x44,0x84,0xd3,0xa5,0x62,0x02,0x55,0x7b,0x87},audio::Effect::Type::FxEcho,u"FXEcho",64,1000,200000}};
+constexpr xaudio::Guid xapo27{0x01,0xc0,0x0b,0xa9,0x97,0xe8,0x97,0xe8,0x55,0xe4,0x9e,0x47,0,0,0,0},xapo_parameters27{0x01,0xc0,0x0b,0xa9,0x97,0xe8,0x97,0xe8,0x55,0xe4,0x9e,0x47,0,0,0,1};
+constexpr xaudio::Guid xapo28{0x84,0xb9,0x10,0xa4,0x39,0x98,0x19,0x48,0xa0,0xbe,0x28,0x56,0xae,0x6b,0x3a,0xdb},xapo_parameters28{0x66,0x5c,0xd9,0x26,0xf2,0x80,0x9a,0x49,0xad,0x54,0x5a,0xe7,0xf0,0x1c,0x6d,0x98};
+// 宿主 DSP 與目前鎖定的格式。直接呼叫 IXAPO::Process 與掛進語音效果鏈用的是同一組 audio::Effect。
+struct Fx {
+    const FxClass* info{};xaudio::Guid clsid{};
+    std::vector<std::shared_ptr<audio::Effect>> pairs; // 每兩聲道一個；[0] 永遠存在並保存目前參數
+    unsigned rate{48000},channels{2},maximum_frames{};bool locked{};
+    std::uint64_t voice{}; // 非零：由這個語音的效果鏈鎖定，應用程式不能自行解鎖
+    float maximum_delay{2000};
+    Fx(const FxClass& value,const xaudio::Guid& id):info(&value),clsid(id){pairs.push_back(std::make_shared<audio::Effect>(value.type,rate));}
+    std::span<const std::uint32_t> words()const {return pairs.front()->parameters();}
+    void set(std::span<const std::uint32_t> values){
+        std::vector<std::uint32_t> copy(values.begin(),values.end());
+        // FXECHO_INITDATA 的 MaxDelay 是 Delay 的上限。
+        if(info->type==audio::Effect::Type::FxEcho && copy.size()==3){const auto delay=std::bit_cast<float>(copy[2]);if(std::isfinite(delay) && delay>maximum_delay)copy[2]=std::bit_cast<std::uint32_t>(maximum_delay);}
+        for(auto& effect:pairs)effect->set_parameters_clamped(copy);
+    }
+    bool supports(unsigned new_channels,unsigned new_rate)const {return new_channels && new_channels<=info->maximum_channels && new_rate>=info->minimum_rate && new_rate<=info->maximum_rate;}
+    void configure(unsigned new_rate,unsigned new_channels){
+        const std::vector<std::uint32_t> current(words().begin(),words().end());std::vector<std::shared_ptr<audio::Effect>> next;
+        for(unsigned i=0;i<(new_channels+1)/2;++i){next.push_back(std::make_shared<audio::Effect>(info->type,new_rate));next.back()->set_parameters(current);}
+        pairs=std::move(next);rate=new_rate;channels=new_channels;
+    }
+    void process(std::span<float> pcm){
+        for(std::size_t frame=0;frame+channels<=pcm.size();frame+=channels)for(unsigned pair=0;pair<pairs.size();++pair){
+            const auto left=pair*2,other=left+1<channels?left+1:left;float right=pcm[frame+other];pairs[pair]->process(pcm[frame+left],right);if(other!=left)pcm[frame+other]=right;}
+    }
+};
 struct Engine {
     std::shared_ptr<Graph> graph=std::make_shared<Graph>();
     std::shared_ptr<audio::Buffer> pcm=std::make_shared<audio::Buffer>();
@@ -59,7 +100,10 @@ struct Engine {
     std::uint64_t stats_wall{},stats_starved{},stats_runs{},stats_quanta{};
     std::array<std::uint32_t,6> debug{};
 };
-struct Object {enum Kind {Factory,EngineObject,Voice} kind{};std::shared_ptr<Engine> engine;Graph::Voice voice{};std::uint64_t callback{};std::uint32_t references{1};std::optional<audio::AdpcmFormat> adpcm{};};
+struct Object {enum Kind {Factory,EngineObject,Voice,Effect} kind{};std::shared_ptr<Engine> engine;Graph::Voice voice{};std::uint64_t callback{};std::uint32_t references{1};std::optional<audio::AdpcmFormat> adpcm{};
+    std::shared_ptr<Fx> fx{};            // kind==Effect
+    std::vector<std::uint64_t> chain{};  // kind==Voice：效果鏈上的效果物件，各持有一個參考
+};
 void require(bool valid){if(!valid)throw std::invalid_argument("XAudio2 呼叫參數無效");}
 std::uint64_t now(){return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
 std::uint64_t thread_cpu(){timespec value{};if(clock_gettime(CLOCK_THREAD_CPUTIME_ID,&value))throw HostCallFault("XAudio2 無法讀取音訊處理 CPU 時鐘");return static_cast<std::uint64_t>(value.tv_sec)*1000000000ULL+static_cast<std::uint64_t>(value.tv_nsec);}
@@ -80,7 +124,13 @@ std::span<const WindowsServiceDescriptor> xaudio_service_descriptors(){
         std::vector<WindowsServiceDescriptor> result{{"xaudio2_7.dll","DllGetClassObject",3},{"xaudio2_7.dll","DllCanUnloadNow",0},{"xaudio2_8.dll","XAudio2Create",3,0,0,6},{"xaudio2_9.dll","XAudio2Create",3,0,0,6}};
         for(auto methods:{std::span<const Method>(identity),std::span<const Method>(enumeration),std::span<const Method>(engine_methods),std::span<const Method>(voice_methods),std::span<const Method>(source_methods),std::span<const Method>(factory_methods)})for(const auto& m:methods)result.push_back({"internal-xaudio",m.name,m.args,0,0,m.narrow});
         result.push_back({"internal-xaudio","CreateMasteringVoice28",8,0,0,156});result.push_back({"internal-xaudio","GetState28",3,0,0,4});result.push_back({"internal-xaudio","GetChannelMask",2});
-        for(auto name:{"Work","Render","Complete"})result.push_back({"internal-xaudio",name,2,0,0,2});return result;
+        for(auto name:{"Work","Render","Complete"})result.push_back({"internal-xaudio",name,2,0,0,2});
+        // CreateFX 是 cdecl（STDAPIVCALLTYPE）。XAPOFX1_x 兩個參數；XAudio 2.8／2.9 多了初始化資料與長度。
+        for(auto module:{"xapofx1_0.dll","xapofx1_1.dll","xapofx1_2.dll","xapofx1_3.dll","xapofx1_4.dll","xapofx1_5.dll","xapofxd1_5.dll"})result.push_back({module,"CreateFX",2,0,0,0,true});
+        for(auto module:{"xaudio2_8.dll","xaudio2_9.dll"})result.push_back({module,"CreateFX",4,0,0,8,true});
+        for(const auto& m:fx_methods)result.push_back({"internal-xapofx",m.name,m.args,0,0,m.narrow});
+        for(std::size_t i=3;i<std::size(fx_parameter_methods);++i)result.push_back({"internal-xapofx",fx_parameter_methods[i].name,fx_parameter_methods[i].args,0,0,fx_parameter_methods[i].narrow});
+        return result;
     }();return table;
 }
 bool WindowsServices::xaudio_waiting()const {
@@ -152,7 +202,41 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
         const auto count=get(p),items=get(p,4,bits);require(count<=64 && (!count || items));
         for(unsigned i=0;i<count;++i){const auto at=items+i*(4+unit),flags=get(at),target=get(at,4,bits);require(!(flags&~128U));auto& o=object(target);require(o.kind==Object::Voice && o.engine==engine);result.push_back({o.voice,{},bool(flags&128U)});}return result;
     };
-    const auto effect_chain=[&](std::uint64_t p){if(p && get(p))throw HostCallFault("尚未實作 XAudio2 的客體 XAPO 效果鏈");};
+    // 效果物件可由 IXAPO 或 IXAPOParameters 介面指標（物件位址＋一個指標）辨識。
+    const auto fx_base=[&](std::uint64_t p)->std::uint64_t{
+        for(const auto base:{p,p-unit})if(const auto i=bridge.objects.find(base);i!=bridge.objects.end() && i->second.kind==Object::Effect)return base;
+        return 0;
+    };
+    const auto release_fx=[&](std::uint64_t base){auto& item=object(base);const auto left=--item.references;if(!left){bridge.objects.erase(base);(void)free_heap(memory,base,state);}return left;};
+    using Chain=std::vector<std::pair<std::uint64_t,bool>>;
+    // XAUDIO2_EFFECT_CHAIN（pack 1）。內建 XAPOFX 效果直接以宿主 DSP 掛進語音圖；應用程式自寫的客體 XAPO 仍是明確缺口。
+    const auto read_chain=[&](std::uint64_t p,unsigned channels,unsigned rate,std::uint64_t voice){Chain result;if(!p)return result;
+        const auto count=get(p),items=get(p,4,bits);require(count<=64 && (!count || items));
+        for(unsigned i=0;i<count;++i){const auto at=items+i*(unit+8);const auto base=fx_base(get(at,0,bits));
+            if(!base)throw HostCallFault("尚未實作 XAudio2 的客體 XAPO 效果鏈（僅支援內建 XAPOFX 效果）");
+            const auto& fx=*object(base).fx;
+            // XAPOFX 效果不改變聲道數；已被應用程式或其他語音鎖定的效果不能再掛入。
+            require(get(at,unit+4)==channels && fx.supports(channels,rate) && (!fx.locked || (voice && fx.voice==voice)));
+            require(std::none_of(result.begin(),result.end(),[&](const auto& v){return v.first==base;}));result.emplace_back(base,get(at,unit)!=0);
+        }return result;
+    };
+    const auto set_chain=[&](std::uint64_t pointer,const Chain& chain,unsigned rate,unsigned channels){
+        auto& voice=object(pointer);std::vector<Graph::EffectSlot> slots;
+        for(const auto& [base,enabled]:chain){auto& fx=*object(base).fx;fx.configure(rate,channels);slots.push_back({fx.pairs,enabled});}
+        voice.engine->graph->set_effect_chain(voice.voice,std::move(slots));
+        const auto old=std::move(voice.chain);voice.chain.clear();
+        for(const auto base:old){auto& fx=*object(base).fx;fx.locked=false;fx.voice=0;}
+        for(const auto& [base,enabled]:chain){auto& item=object(base);item.fx->locked=true;item.fx->voice=pointer;item.fx->maximum_frames=0;++item.references;voice.chain.push_back(base);}
+        for(const auto base:old)(void)release_fx(base);
+    };
+    const auto drop_chain=[&](Object& voice){const auto old=std::move(voice.chain);voice.chain.clear();for(const auto base:old){auto& fx=*object(base).fx;fx.locked=false;fx.voice=0;(void)release_fx(base);}};
+    const auto fx_format=[&](const Fx& fx,std::uint64_t p)->std::optional<PcmWaveFormat>{
+        if(!p)return std::nullopt;auto format=read_pcm_wave_format(memory,p,true,true,fx.info->minimum_rate,fx.info->maximum_rate,{fx.info->maximum_channels,32,true,true});
+        if(format && !format->floating)format.reset();return format;
+    };
+    const auto task_allocate=[&](std::size_t size){const auto p=allocate_heap(memory,size);if(!p)throw std::bad_alloc{};gui_.task_allocations.insert(p);memory.write(GuestAddress{p},std::vector<std::uint8_t>(size));return p;};
+    const auto words_from=[&](std::uint64_t p,std::size_t count){std::vector<std::uint32_t> values(count);memory.read(GuestAddress{p},{reinterpret_cast<std::uint8_t*>(values.data()),count*4});return values;};
+    const auto words_to=[&](std::uint64_t p,std::span<const std::uint32_t> values){check(p,values.size()*4);memory.write(GuestAddress{p},{reinterpret_cast<const std::uint8_t*>(values.data()),values.size()*4});};
     std::uint64_t result=0;
     try {
         if(name=="DllCanUnloadNow")result=bridge.objects.empty() && !bridge.locks?0:1;
@@ -167,6 +251,83 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
             else if(com && iid(arg(3))!=xaudio::iid27 && iid(arg(3))!=xaudio::unknown)result=no_interface;
             // XAudio2Create 的旗標：DEBUG_ENGINE、STOP_ENGINE_WHEN_IDLE、1024_QUANTUM、NO_VIRTUAL_AUDIO_CLIENT。處理器 0 是 Windows 10 標頭的 XAUDIO2_USE_DEFAULT_PROCESSOR，內建混音由宿主排程，不受此值影響。
             else {if(!com)require(!(d(1)&~UINT32_C(0x1a001)));put(out,new_engine(com?7:service.family=="xaudio2_8.dll"?8:9,!com),bits);}
+        }else if(name=="CreateFX"){
+            const auto out=arg(1);check(out,unit);put(out,0,bits);require(arg(0)!=0);const auto id=iid(arg(0));
+            const auto found=std::find_if(std::begin(fx_classes),std::end(fx_classes),[&](const auto& v){return v.legacy==id || v.current==id;});
+            if(found==std::end(fx_classes))result=0x80040111U;
+            else {
+                auto fx=std::make_shared<Fx>(*found,id);
+                if(service.arguments==4 && arg(2) && d(3)){
+                    // 2.8 以後的初始化資料：FXEcho 是 FXECHO_INITDATA{MaxDelay}；其餘（以及長度等於參數結構時）當作初始參數。
+                    const auto bytes=fx->words().size()*4;
+                    if(found->type==audio::Effect::Type::FxEcho && d(3)==4){const auto delay=std::bit_cast<float>(static_cast<std::uint32_t>(get(arg(2))));require(std::isfinite(delay) && delay>=1 && delay<=2000);fx->maximum_delay=delay;fx->set(std::vector<std::uint32_t>(fx->words().begin(),fx->words().end()));}
+                    else {require(d(3)==bytes);fx->set(words_from(arg(2),fx->words().size()));}
+                }
+                for(unsigned key=0;key<2;++key)if(!bridge.tables.contains(1000+key)){
+                    const auto methods=key?std::span<const Method>(fx_parameter_methods):std::span<const Method>(fx_methods);const auto table=runtime_allocate(memory,{},methods.size()*unit);
+                    for(unsigned i=0;i<methods.size();++i)put(table+i*unit,resolve("internal-xapofx",methods[i].name).value,bits);bridge.tables.emplace(1000+key,table);
+                }
+                const auto pointer=allocate_heap(memory,2*unit);if(!pointer)throw std::bad_alloc{};put(pointer,bridge.tables.at(1000),bits);put(pointer+unit,bridge.tables.at(1001),bits);
+                Object item;item.kind=Object::Effect;item.fx=std::move(fx);bridge.objects.emplace(pointer,std::move(item));put(out,pointer,bits);
+            }
+        }else if(service.family=="internal-xapofx"){
+            const auto base=fx_base(arg(0));require(base!=0);auto& o=object(base);auto& fx=*o.fx;const auto count=fx.words().size();
+            if(name=="QueryInterface"){
+                check(arg(2),unit);put(arg(2),0,bits);const auto query=iid(arg(1));
+                if(query==xaudio::unknown || query==xapo27 || query==xapo28){++o.references;put(arg(2),base,bits);}
+                else if(query==xapo_parameters27 || query==xapo_parameters28){++o.references;put(arg(2),base+unit,bits);}
+                else result=no_interface;
+            }else if(name=="AddRef")result=++o.references;
+            else if(name=="Release")result=release_fx(base);
+            else if(name=="GetRegistrationProperties"){
+                // XAPO_REGISTRATION_PROPERTIES（pack 1，1068 位元組），由呼叫端以 XAPOFree（CoTaskMemFree）釋放。
+                check(arg(1),unit);const auto p=task_allocate(1068);memory.write(GuestAddress{p},fx.clsid);memory.write(GuestAddress{p+16},utf16_bytes(fx.info->name));
+                put(p+1040,1);put(p+1048,0x1f);for(unsigned i=0;i<4;++i)put(p+1052+i*4,1);put(arg(1),p,bits);
+            }else if(name=="IsInputFormatSupported" || name=="IsOutputFormatSupported"){
+                // 輸入與輸出格式必須相同（聲道、取樣率、FLOAT32）。不支援時依 CXAPOBase 回報最接近的格式。
+                const auto other=fx_format(fx,arg(1)),requested=fx_format(fx,arg(2));
+                if(!requested || (arg(1) && (!other || other->channels!=requested->channels || other->rate!=requested->rate))){
+                    result=format_unsupported;
+                    if(arg(3)){
+                        check(arg(3),unit);unsigned channels=other?other->channels:0,rate=other?other->rate:0;
+                        if(!other){require(arg(2)!=0);channels=std::clamp<unsigned>(static_cast<unsigned>(get(arg(2),2,16)),1,fx.info->maximum_channels);rate=std::clamp<unsigned>(static_cast<unsigned>(get(arg(2),4)),fx.info->minimum_rate,fx.info->maximum_rate);}
+                        const auto p=task_allocate(18);put(p,3,16);put(p+2,channels,16);put(p+4,rate);put(p+8,rate*channels*4);put(p+12,channels*4,16);put(p+14,32,16);put(arg(3),p,bits);
+                    }
+                }
+            }else if(name=="Initialize"){
+                // IXAPO::Initialize 的資料與 CreateFX 的初始化資料同義；沒有資料時維持目前參數。
+                if(arg(1) && d(2)){
+                    if(fx.info->type==audio::Effect::Type::FxEcho && d(2)==4){const auto delay=std::bit_cast<float>(static_cast<std::uint32_t>(get(arg(1))));require(std::isfinite(delay) && delay>=1 && delay<=2000);fx.maximum_delay=delay;fx.set(std::vector<std::uint32_t>(fx.words().begin(),fx.words().end()));}
+                    else {require(d(2)==count*4);fx.set(words_from(arg(1),count));}
+                }
+            }else if(name=="Reset"){for(auto& effect:fx.pairs)effect->reset();}
+            else if(name=="LockForProcess"){
+                if(fx.locked || d(1)!=1 || d(3)!=1 || !arg(2) || !arg(4))result=invalid_argument_error;
+                else {
+                    const auto input=fx_format(fx,get(arg(2),0,bits)),output=fx_format(fx,get(arg(4),0,bits));
+                    if(!input || !output || input->channels!=output->channels || input->rate!=output->rate)result=format_unsupported;
+                    else {fx.configure(input->rate,input->channels);fx.maximum_frames=static_cast<unsigned>(std::min(get(arg(2),unit),get(arg(4),unit)));fx.locked=true;}
+                }
+            }else if(name=="UnlockForProcess"){if(!fx.voice)fx.locked=false;}
+            else if(name=="Process"){
+                // 只在鎖定後處理；輸入輸出各一個緩衝區，可為同一塊（原地處理）。
+                if(fx.locked && !fx.voice && d(1)==1 && d(3)==1 && arg(2) && arg(4)){
+                    const auto source=get(arg(2),0,bits),flags=get(arg(2),unit),frames=get(arg(2),unit+4),target=get(arg(4),0,bits);
+                    require(flags<=1 && frames<=fx.maximum_frames && frames<=(UINT64_C(1)<<24)/fx.channels);
+                    const bool silent=!flags,tail=fx.info->type==audio::Effect::Type::FxReverb || fx.info->type==audio::Effect::Type::FxEcho;
+                    std::vector<float> pcm(static_cast<std::size_t>(frames)*fx.channels);const std::span<std::uint8_t> bytes{reinterpret_cast<std::uint8_t*>(pcm.data()),pcm.size()*4};
+                    std::uint64_t output_flags=flags;
+                    if(frames && !silent){require(source && target);memory.read(GuestAddress{source},bytes);}
+                    if(!frames){}
+                    else if(!d(5)){if(!silent && source!=target)memory.write(GuestAddress{target},bytes);} // 停用：原樣通過
+                    else if(silent && !tail){}                                                         // 無尾音的效果：靜音進、靜音出，不讀寫緩衝區
+                    else {require(target!=0);fx.process(pcm);memory.write(GuestAddress{target},bytes);output_flags=1;}
+                    put(arg(4)+unit,output_flags);put(arg(4)+unit+4,frames);
+                }
+            }else if(name=="CalcInputFrames" || name=="CalcOutputFrames")result=d(1);
+            else if(name=="SetParameters"){if(arg(1) && d(2)==count*4)fx.set(words_from(arg(1),count));}
+            else if(name=="GetParameters"){if(arg(1) && d(2)==count*4)words_to(arg(1),fx.words());}
+            else throw HostCallFault("XAPOFX 方法不合法："+std::string(name));
         }else {
             if(name=="Work" || name=="Render" || name=="Complete"){
                 const auto found=bridge.objects.find(arg(0));
@@ -182,7 +343,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                 require(o.kind!=Object::Voice);result=--o.references;if(!result){
                     if(e){e->output.reset();if(trace_audio()){std::lock_guard lock(e->pcm->mutex);const auto& pcm=*e->pcm;
                         std::fprintf(stderr,"xaudio_output pid=%d version=%u rendered_frames=%llu starved_frames=%llu starved_runs=%llu peak_left=%g peak_right=%g\n",static_cast<int>(::getpid()),e->version,static_cast<unsigned long long>(pcm.rendered_frames),static_cast<unsigned long long>(pcm.starved_frames),static_cast<unsigned long long>(pcm.starved_runs),double(pcm.rendered_left_peak),double(pcm.rendered_right_peak));}
-                        std::vector<std::uint64_t> voices;for(const auto& [p,item]:bridge.objects)if(item.engine==e && item.kind==Object::Voice)voices.push_back(p);for(auto p:voices){bridge.objects.erase(p);(void)free_heap(memory,p,state);}}
+                        std::vector<std::uint64_t> voices;for(const auto& [p,item]:bridge.objects)if(item.engine==e && item.kind==Object::Voice)voices.push_back(p);for(auto p:voices){drop_chain(object(p));bridge.objects.erase(p);(void)free_heap(memory,p,state);}}
                     bridge.objects.erase(arg(0));(void)free_heap(memory,arg(0),state);
                 }
             }else if(o.kind==Object::Factory){
@@ -249,7 +410,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                         unsigned active=0,total=0,submix=0;for(const auto& [p,v]:bridge.objects)if(v.kind==Object::Voice && v.engine==e){const auto vs=e->graph->state(v.voice);if(vs.kind==Graph::Kind::Source){++total;if(vs.playing)++active;}else if(vs.kind==Graph::Kind::Submix)++submix;}
                         std::lock_guard lock(e->pcm->mutex);put(arg(1)+24,e->pcm->pcm.size());put(arg(1)+28,e->pcm->pcm.size()/8);put(arg(1)+32,e->pcm->starved_runs);put(arg(1)+36,active);put(arg(1)+40,total);put(arg(1)+44,submix);
                     }else if(name=="CreateSourceVoice" || name=="CreateSubmixVoice" || name.starts_with("CreateMasteringVoice")){
-                        check(arg(1),unit);put(arg(1),0,bits);Graph::Format format;Graph::Kind kind;unsigned flags=0,stage=0;float ratio=2;std::uint64_t callback=0,send=0;std::string device;std::optional<audio::AdpcmFormat> adpcm;
+                        check(arg(1),unit);put(arg(1),0,bits);Graph::Format format;Graph::Kind kind;unsigned flags=0,stage=0;float ratio=2;std::uint64_t callback=0,send=0,effects=0;std::string device;std::optional<audio::AdpcmFormat> adpcm;
                         if(name=="CreateSourceVoice"){
                             const auto max_rate=e->version==7?200000U:384000U;
                             if(get(arg(2),0,16)==2){
@@ -257,22 +418,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                                 require(adpcm && adpcm->rate>=1000 && adpcm->rate<=max_rate && adpcm->samples_per_block>=32 && adpcm->samples_per_block<=512 && std::ranges::equal(adpcm->coefficients,audio::adpcm_coefficients));
                                 format={adpcm->channels,adpcm->rate,16,false};
                             }else {const auto parsed=read_pcm_wave_format(memory,arg(2),true,true,1000,max_rate,{64,32,true,true});require(bool(parsed));format={parsed->channels,parsed->rate,parsed->bits,parsed->floating,parsed->channel_mask};}
-                            kind=Graph::Kind::Source;flags=d(3);ratio=fp(4);callback=arg(5);send=arg(6);effect_chain(arg(7));if(callback)for(unsigned i=0;i<7;++i)(void)method(callback,i);
-                        }else if(name=="CreateSubmixVoice"){format={d(2),d(3),32,true};kind=Graph::Kind::Submix;flags=d(4);stage=d(5);send=arg(6);effect_chain(arg(7));}
-                        else {require(!e->master && !d(4));format={d(2)?d(2):2U,d(3)?d(3):48000U,32,true};kind=Graph::Kind::Master;effect_chain(arg(6));
+                            kind=Graph::Kind::Source;flags=d(3);ratio=fp(4);callback=arg(5);send=arg(6);effects=arg(7);if(callback)for(unsigned i=0;i<7;++i)(void)method(callback,i);
+                        }else if(name=="CreateSubmixVoice"){format={d(2),d(3),32,true};kind=Graph::Kind::Submix;flags=d(4);stage=d(5);send=arg(6);effects=arg(7);}
+                        else {require(!e->master && !d(4));format={d(2)?d(2):2U,d(3)?d(3):48000U,32,true};kind=Graph::Kind::Master;effects=arg(6);
                             if(e->version==7){require(d(5)<e->devices.size());device=e->devices[d(5)].device.uid;}
                             else {if(arg(5)){const auto id=read_utf16(memory,GuestAddress{arg(5)});const auto i=std::find_if(e->devices.begin(),e->devices.end(),[&](const auto& v){return v.id==id;});require(i!=e->devices.end());device=i->device.uid;}require(d(7)<=11);}
                         }
                         require(format.rate<=(e->version==7?200000U:384000U));
                         if(kind==Graph::Kind::Master)require(format.rate%100==0);
+                        // 效果在混音取樣率上逐幀處理（語音圖先重取樣再套效果）。
+                        const auto effect_rate=kind==Graph::Kind::Master?format.rate:e->rate;const auto chain=read_chain(effects,format.channels,effect_rate,0);
                         const auto id=e->graph->create(kind,format,flags,stage,ratio);std::uint64_t p=0;
                         try {
                             if(kind!=Graph::Kind::Master)e->graph->set_sends(id,sends(e,send));
                             p=create({Object::Voice,e,id,callback});
                             bridge.objects.at(p).adpcm=std::move(adpcm);
+                            if(!chain.empty())set_chain(p,chain,effect_rate,format.channels);
                             if(kind==Graph::Kind::Master){(void)mapping_session();e->pcm->progress_notify=[wake=mapping_wake()]()noexcept{if(wake)wake->notify();};e->pcm->rate=e->pcm->frequency=e->rate=format.rate;e->pcm->channels=2;e->pcm->bits=32;e->pcm->floating=e->pcm->streaming=true;e->pcm->playing=e->active;e->pcm->pcm.reserve(e->rate*8/10);e->output=audio::open_output(e->pcm,device);require(bool(e->output));e->master=p;}
                             put(arg(1),p,bits);
-                        }catch(...){if(p){bridge.objects.erase(p);(void)free_heap(memory,p,state);}e->graph->destroy(id);throw;}
+                        }catch(...){if(p){drop_chain(object(p));bridge.objects.erase(p);(void)free_heap(memory,p,state);}e->graph->destroy(id);throw;}
                     }else throw HostCallFault("尚未實作 XAudio2 引擎方法："+std::string(name));
                 }
             }else {
@@ -283,8 +447,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                 if(name=="GetVoiceDetails"){check(arg(1),e->version==7?12:16);put(arg(1),info.creation_flags);if(e->version>=8)put(arg(1)+4,info.flags);put(arg(1)+(e->version==7?4:8),info.format.channels);put(arg(1)+(e->version==7?8:12),info.format.rate);}
                 else if(name=="GetChannelMask")put(arg(1),info.format.channels==1?4:3);
                 else if(name=="SetOutputVoices")e->graph->set_sends(o.voice,sends(e,arg(1)));
-                else if(name=="SetEffectChain"){effect_chain(arg(1));e->graph->set_effects(o.voice,{});}
-                else if(name=="EnableEffect" || name=="DisableEffect" || name=="GetEffectState" || name=="SetEffectParameters" || name=="GetEffectParameters")result=invalid; // 空效果鏈沒有合法索引；非空鏈另有明確缺口。
+                else if(name=="SetEffectChain"){const auto rate=e->master?e->rate:info.format.rate;set_chain(arg(0),read_chain(arg(1),info.format.channels,rate,arg(0)),rate,info.format.channels);}
+                else if(name=="EnableEffect" || name=="DisableEffect"){require(d(1)<o.chain.size() && d(2)!=UINT32_MAX);c.operation=name=="EnableEffect"?Graph::Operation::EnableEffect:Graph::Operation::DisableEffect;c.effect=d(1);e->graph->change(std::move(c),d(2));}
+                else if(name=="GetEffectState"){check(arg(2),4);put(arg(2),d(1)<o.chain.size() && e->graph->effect_enabled(o.voice,d(1))?1:0);}
+                else if(name=="SetEffectParameters" || name=="GetEffectParameters"){
+                    // 參數直接寫入效果物件，與 IXAPOParameters 共用同一份；OperationSet 不延後（立即生效）。
+                    require(d(1)<o.chain.size());auto& fx=*object(o.chain[d(1)]).fx;const auto count=fx.words().size();require(arg(2) && d(3)==count*4);
+                    if(name=="SetEffectParameters"){require(d(4)!=UINT32_MAX);fx.set(words_from(arg(2),count));}else words_to(arg(2),fx.words());
+                }
                 else if(name=="GetVolume")put(arg(1),std::bit_cast<std::uint32_t>(info.volume));
                 else if(name=="GetFrequencyRatio")put(arg(1),std::bit_cast<std::uint32_t>(info.ratio));
                 else if(name=="SetVolume" || name=="SetFrequencyRatio"){c.operation=name=="SetVolume"?Graph::Operation::Volume:Graph::Operation::Frequency;c.value=fp(1);require(d(2)!=UINT32_MAX);e->graph->change(std::move(c),d(2));}
@@ -310,7 +480,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                 else if(name=="Discontinuity")e->graph->discontinuity(o.voice);
                 else if(name=="GetState27" || name=="GetState28"){if(name=="GetState28")require(!(d(2)&~256U));check(arg(1),unit+12);put(arg(1),info.context,bits);put(arg(1)+unit,info.queued);put(arg(1)+unit+4,info.samples,64);}
                 else if(name=="SetSourceSampleRate"){require(d(1)<=(e->version==7?200000U:384000U));e->graph->set_sample_rate(o.voice,d(1));}
-                else if(name=="DestroyVoice"){e->graph->destroy(o.voice);if(arg(0)==e->master){e->output.reset();e->master=0;}bridge.objects.erase(arg(0));(void)free_heap(memory,arg(0),state);}
+                else if(name=="DestroyVoice"){e->graph->destroy(o.voice);drop_chain(o);if(arg(0)==e->master){e->output.reset();e->master=0;}bridge.objects.erase(arg(0));(void)free_heap(memory,arg(0),state);}
                 else throw HostCallFault("尚未實作 XAudio2 音源方法："+std::string(name));
             }
         }

@@ -59,7 +59,7 @@ std::span<const WindowsServiceDescriptor> http_service_descriptors(){
         {"winhttp.dll","WinHttpCrackUrl",4},{"winhttp.dll","WinHttpGetProxyForUrl",4},{"winhttp.dll","WinHttpDetectAutoProxyConfigUrl",2},
         {"winhttp.dll","WinHttpCreateProxyResolver",2},{"winhttp.dll","WinHttpGetProxyForUrlEx",4},
         {"winhttp.dll","WinHttpGetProxyResult",2},{"winhttp.dll","WinHttpFreeProxyResult",1},
-        {"winhttp.dll","WinHttpSetStatusCallback",4}
+        {"winhttp.dll","WinHttpSetStatusCallback",4},{"winhttp.dll","WinHttpCheckPlatform",0}
     };return table;
 }
 namespace {
@@ -94,6 +94,8 @@ bool WindowsServices::http_waiting() const {
 }
 std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.symbol=="WinHttpGetProxyForUrl" || service.symbol=="WinHttpDetectAutoProxyConfigUrl" || service.symbol=="WinHttpCreateProxyResolver" || service.symbol=="WinHttpGetProxyForUrlEx" || service.symbol=="WinHttpGetProxyResult" || service.symbol=="WinHttpFreeProxyResult" || service.symbol=="WinHttpSetStatusCallback")return invoke_autoproxy(state,memory,service);
+    // WinHttpCheckPlatform：回報目前平台是否支援 WinHTTP。本引擎提供完整的 WinHTTP 家族，固定為支援（TRUE），不改 last error。
+    if(service.symbol=="WinHttpCheckPlatform"){const WindowsCall call(state,memory,service);call.return_to(state,1);return std::nullopt;}
     if(service.symbol.find("UrlCache")!=std::string_view::npos)return invoke_url_cache(state,memory,service);
     const WindowsCall arg(state,memory,service);const bool inet=service.family=="wininet.dll",ansi=inet && (service.symbol.ends_with('A') || service.symbol=="InternetGetConnectedStateEx");
     std::string_view symbol=service.symbol;

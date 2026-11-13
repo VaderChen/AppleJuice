@@ -137,6 +137,7 @@ id<MTLTexture> metal_shader_texture(const GraphicsView&);
 #include "metal_gl_program_types.inc"
 #include "metal_immediate_present.inc"
 #include "metal_frame_interpolation.inc"
+#include "metal_interpolation_present.inc"
 // 長幀診斷：X64ARM_TRACE_STALLS=<毫秒門檻>（未設定時關閉）時，編碼端單一工作與單一命令緩衝的 GPU 時間超過門檻就輸出一行，
 // 格式與 slow_service 相同（end_unix_us 為輸出時刻），可和 Present 時間對照。
 std::uint64_t metal_stall_threshold_us(){static const std::uint64_t value=[]()->std::uint64_t{const auto* text=std::getenv("X64ARM_TRACE_STALLS");
@@ -159,10 +160,19 @@ class MetalGl final:public NativeOpenGlContext {
     std::unique_ptr<MetalFrameInterpolation> interpolation_;std::atomic<bool> interpolation_active_{false};bool interpolation_tried_=false; // interpolation_active_：這個表面已建立內插器（才強制垂直同步、每幀取兩個 drawable）。
     id<MTLTexture> interpolated_=nil;static inline std::atomic<std::uint64_t> interpolated_frames_{0},interpolation_missed_{0};
     CFTimeInterval present_last_=0,present_interval_=0;
+    // 遊戲自己的升頻（XeSS／FSR）啟用時停用內建的補幀與 2 倍放大：drawable 回到交換鏈尺寸（由系統縮放到視窗大小），
+    // 補幀器拆除；遊戲銷毀升頻情境後重建。只在狀態改變時處理，先送出並等待在途工作，避免與呈現執行緒的快照交錯。
+    bool external_upscaler_=false;
+    void sync_external_upscaler(){
+        const bool external=game_upscaler_active();if(external==external_upscaler_)return;
+        flush(true);finish_immediate_present();external_upscaler_=external;present_scaler_reset(width_,height_);
+        if(layer_){layer_.drawableSize=CGSizeMake(width_*present_scale_,height_*present_scale_);layer_.displaySyncEnabled=interval_!=0;}
+        std::fprintf(stderr,"[present] 遊戲升頻%s：內建補幀與 2 倍放大%s\n",external?"啟用":"關閉",external?"停用":"恢復");
+    }
     void present_scaler_reset(unsigned w,unsigned h){
         present_scaler_=nil;present_upscaled_=nil;present_upscaled_generated_=nil;present_scale_=1;
-        interpolation_.reset();interpolation_active_.store(false,std::memory_order_release);interpolation_tried_=false;interpolated_=nil;present_last_=0;present_interval_=0;
-        const auto scale=native_present_upscale();if(scale<2)return;
+        interpolation_presenter_.reset();present_queue_active_.store(false,std::memory_order_release);interpolation_.reset();interpolation_active_.store(false,std::memory_order_release);interpolation_tried_=false;interpolated_=nil;present_last_=0;present_interval_=0;
+        const auto scale=external_upscaler_?1U:native_present_upscale();if(scale<2)return;
         if(@available(macOS 13.0,*)){
             if(![MTLFXSpatialScalerDescriptor supportsDevice:device_])return;
             auto descriptor=[MTLFXSpatialScalerDescriptor new];descriptor.inputWidth=w;descriptor.inputHeight=h;descriptor.outputWidth=w*scale;descriptor.outputHeight=h*scale;
@@ -179,9 +189,11 @@ class MetalGl final:public NativeOpenGlContext {
     id<MTLEvent> handoff_event_;std::uint64_t handoff_value_{};
     NSView* view_{};CAMetalLayer* layer_{};
     std::unique_ptr<MetalImmediatePresenter> immediate_presenter_;
+    std::unique_ptr<MetalInterpolationPresenter> interpolation_presenter_; // 畫面內插或垂直同步時的呈現執行緒（見 metal_interpolation_present.inc）。
+    std::atomic<bool> present_queue_active_{false}; // 呈現執行緒存在（供其他執行緒的就緒查詢讀取）。
     bool immediate_unavailable_{};
     static bool immediate_present_enabled(){static const bool enabled=[] {const auto* value=std::getenv("X64ARM_METAL_IMMEDIATE_PRESENT");return !value || std::string_view(value)=="1";}();return enabled;}
-    void finish_immediate_present(){if(immediate_presenter_){immediate_presenter_->finish();immediate_presenter_->report();immediate_presenter_.reset();}}
+    void finish_immediate_present(){interpolation_presenter_.reset();present_queue_active_.store(false,std::memory_order_release);if(immediate_presenter_){immediate_presenter_->finish();immediate_presenter_->report();immediate_presenter_.reset();}}
     std::shared_ptr<GpuMemoryReservation> surface_;
     std::vector<std::shared_ptr<GpuMemoryReservation>> pending_leases_;
     // 固定與可程式化 OpenGL 共用 context 配額，不隨 program 數目相乘。
@@ -590,8 +602,11 @@ class MetalGl final:public NativeOpenGlContext {
                 done->store(true,std::memory_order_release);relays->fire();}];
             static const bool label_commands=std::getenv("X64ARM_METAL_LABELS")!=nullptr;
             if(label_commands)commands_.label=[NSString stringWithFormat:@"%s#%llu",why,static_cast<unsigned long long>(submissions_)];
-            if(side_commands_){[side_commands_ commit];side_commands_=nil;}main_gpu_writes_=0;main_uav_writes_=0;main_texture_writes_=0;
-            if(commands_gpu_work_)track_gpu_commands(commands_);[commands_ commit];commands_=nil;pending_leases_.clear();graphics_pending_.clear();pending_=0;++submissions_;
+            // GPU 卡住防護監看每個命令緩衝；診斷模式（X64ARM_METAL_LABELS）卡住時附上該批次的繪圖標籤。
+            std::function<std::string()> describe_hang;
+            if(!flight.labels.empty())describe_hang=[labels=std::make_shared<const std::vector<HangLabel>>(flight.labels)]{std::string text;for(const auto& label:*labels)text+=" | "+hang_describe(label);return text;};
+            if(side_commands_){watch_gpu_commands(side_commands_);[side_commands_ commit];side_commands_=nil;}main_gpu_writes_=0;main_uav_writes_=0;main_texture_writes_=0;
+            if(commands_gpu_work_)track_gpu_commands(commands_,describe_hang);else watch_gpu_commands(commands_,describe_hang);[commands_ commit];commands_=nil;pending_leases_.clear();graphics_pending_.clear();pending_=0;++submissions_;
             flight_peak_=std::max(flight_peak_,flights_.size());
         }
         // 沒有開啟中的命令時，退役紋理隨最後一個在途批次釋放（同一佇列依序完成）；沒有在途批次即可直接釋放。
@@ -796,9 +811,9 @@ public:
         if(layer_){layer_.drawableSize=CGSizeMake(w*present_scale_,h*present_scale_);layer_.displaySyncEnabled=interval_!=0 || interpolation_active_.load(std::memory_order_relaxed);}bind();
     }}
     bool graphics_present_ready()const noexcept override{
-        // 畫面內插生效時一律垂直同步，且每次呈現取兩個 drawable（生成＋真實）：要有兩個空位才算就緒。
+        // 畫面內插生效時由呈現執行緒送出兩張畫面；繪製端只在兩組快照都被占用時於 prepare 等待（背壓），這裡不另外擋。
+        if(layer_ && (present_queue_active_.load(std::memory_order_acquire) || interpolation_active_.load(std::memory_order_acquire)))return true;
         const auto pending=drawables_acquired_.load(std::memory_order_relaxed)-drawables_presented_->load(std::memory_order_acquire);
-        if(layer_ && interpolation_active_.load(std::memory_order_acquire))return pending+2<=std::max<std::uint64_t>(drawable_limit_,2);
         return !layer_ || !interval_ || pending<drawable_limit_;
     }
     bool swap_interval(std::int32_t n)override{if(n<0 || n>1)return false;if(n)finish_immediate_present();interval_=n;if(layer_)layer_.displaySyncEnabled=n!=0 || interpolation_active_.load(std::memory_order_relaxed);return true;}
@@ -812,8 +827,42 @@ public:
                 scope.end();auto ready=commands_;const auto timing=trace_frame(ready,request);flush(false);immediate_presenter_->publish(index,ready,timing);return true;
             }
         }
+        // 垂直同步的呈現同樣交給呈現執行緒排隊送出：DXGI 的 Present(SyncInterval=1) 是把畫面排進佇列後返回，佇列滿了才等；
+        // 繪製執行緒自己等 drawable 時，一幀沒趕上就整個更新週期無法運算（《暗影》1080p 4 核約 7% 的幀掉到 33 ms）。
+        // X64ARM_METAL_VSYNC_QUEUE=0 恢復由繪製執行緒直接取 drawable。
+        static const bool vsync_queue=[] {const auto* value=std::getenv("X64ARM_METAL_VSYNC_QUEUE");return !value || std::string_view(value)!="0";}();
+        const bool interpolating=interpolation_active_.load(std::memory_order_relaxed);
+        if(layer_ && (interpolating || (interval_ && vsync_queue))){
+            // 畫面內插：把生成畫面與真實畫面（必要時先經 2 倍放大）複製到呈現執行緒的快照後就返回，由它依序各占一個更新週期送出。
+            const unsigned shown_width=width_*present_scale_,shown_height=height_*present_scale_;
+            if(!interpolation_presenter_ || interpolation_presenter_->width()!=shown_width || interpolation_presenter_->height()!=shown_height){
+                interpolation_presenter_.reset();
+                interpolation_presenter_=std::make_unique<MetalInterpolationPresenter>(device_,layer_,shown_width,shown_height,color_.pixelFormat);present_queue_active_.store(true,std::memory_order_release);
+            }
+            auto generated=interpolated_;interpolated_=nil;
+            const auto index=interpolation_presenter_->prepare();
+            begin_commands();
+            const auto stage=[&](id<MTLTexture> source,id<MTLTexture> scaled,id<MTLTexture> target){
+                id<MTLTexture> shown=source;
+                if(present_scale_>1){
+                    if(@available(macOS 13.0,*)){
+                        id<MTLFXSpatialScaler> scaler=present_scaler_;scaler.colorTexture=source;scaler.outputTexture=scaled;
+                        scaler.inputContentWidth=width_;scaler.inputContentHeight=height_;[scaler encodeToCommandBuffer:commands_];shown=scaled;
+                    }
+                }
+                auto enc=[commands_ blitCommandEncoder];MetalEncoderScope enc_scope{enc};
+                [enc copyFromTexture:shown sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(shown_width,shown_height,1)
+                           toTexture:target destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                enc_scope.end();
+            };
+            if(generated)stage(generated,present_upscaled_generated_,interpolation_presenter_->generated(index));
+            stage(color_,present_upscaled_,interpolation_presenter_->real(index));
+            auto ready=commands_;const auto timing=trace_frame(ready,request);flush(false);
+            interpolation_presenter_->publish(index,ready,timing,generated!=nil);
+            if(generated)++interpolated_frames_;else if(interpolating)++interpolation_missed_;
+            return true;
+        }
         if(layer_){
-            // 幀間隔（平滑）：畫面內插時真實畫面延後半個間隔呈現，讓生成畫面先顯示。
             const auto now=CACurrentMediaTime();
             if(present_last_>0){const auto delta=now-present_last_;present_interval_=present_interval_>0?present_interval_*0.8+delta*0.2:delta;}
             present_last_=now;
@@ -840,10 +889,6 @@ public:
                 if(delay>0)[commands_ presentDrawable:drawable afterMinimumDuration:delay];else [commands_ presentDrawable:drawable];
                 return true;
             };
-            auto generated=interpolated_;interpolated_=nil;
-            const bool inserted=generated && show(generated,present_upscaled_generated_,false,0);if(inserted)++interpolated_frames_;else if(interpolation_active_.load(std::memory_order_relaxed))++interpolation_missed_;
-            // 垂直同步下同一命令緩衝的兩個 drawable 依序各占一個更新週期（先生成、後真實），不另加最短顯示時間：
-            // 以幀間隔推算的延後會被算回下一次的幀間隔，越拖越慢（主螢幕實測真實幀率掉到 15）。
             if(!show(color_,present_upscaled_,true,0.0))return false;
         }flush(false);return true;}}
     OpenGlRendererInfo info()const override{return {"MacWin",std::string(device_.name.UTF8String)+" (Metal)","1.1 MacWin Metal subset",true};}

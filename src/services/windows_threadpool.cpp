@@ -4,10 +4,12 @@
 
 namespace x64arm {
 namespace {
-enum class PoolKind {Work,Timer,Wait,Simple};
+enum class PoolKind {Work,Timer,Wait,Simple,Io};
 struct PoolObject {
     PoolKind kind{};std::uint64_t owner{},callback{},context{},finalizer{},target{},deadline{UINT64_MAX},absolute_due{};
     std::deque<std::uint32_t> pending;std::uint32_t period{},outstanding{},associated{};
+    // I/O：已呼叫 StartThreadpoolIo 但尚未完成的操作數，以及待交給 worker 的完成封包（與 pending 一一對應）。
+    std::uint32_t started{};std::deque<CompletionPacket> io;
     bool armed{},set{},closed{},long_running{};
 };
 struct PoolInstance {
@@ -23,6 +25,8 @@ struct ThreadpoolState {
     std::map<std::uint64_t,PoolObject> objects;
     std::map<std::uint64_t,PoolInstance> instances;
     std::uint64_t next_pool{0x110000},next_object{0xe0000},next_instance{0xf0000};
+    // 執行緒池 I/O 共用的內部完成埠：繫結的檔案以完成鍵＝TP_IO 物件送出完成封包。
+    std::uint64_t port{};
 };
 bool WindowsServices::threadpool_worker_reserved(std::uint64_t worker) const {
     return threadpool_ && threadpool_->worker_owners.contains(worker);
@@ -61,7 +65,8 @@ std::uint64_t WindowsServices::acquire_threadpool_worker(const GuestState& state
 }
 bool WindowsServices::threadpool_callbacks_pending(std::uint64_t handle) const {
     if(!threadpool_)return false;const auto found=threadpool_->objects.find(handle);
-    return found!=threadpool_->objects.end() && (!found->second.pending.empty() || found->second.associated);
+    // I/O 物件另計已開始但尚未完成的操作：完成後一定會排入回呼（含取消後的 ERROR_OPERATION_ABORTED）。
+    return found!=threadpool_->objects.end() && (!found->second.pending.empty() || found->second.associated || found->second.started);
 }
 std::uint64_t WindowsServices::threadpool_next_deadline() const {
     std::uint64_t next=UINT64_MAX;if(!threadpool_)return next;
@@ -113,6 +118,15 @@ void WindowsServices::poll_threadpool(GuestMemory& memory){
             else object.armed=false;
         }
     }
+    // 內部完成埠的封包依完成鍵交給對應的 TP_IO；物件已關閉或不存在時丟棄（Windows 關閉後不再呼叫回呼）。
+    if(pool.port)if(const auto port=runtime_.completion_ports.find(pool.port);port!=runtime_.completion_ports.end()){
+        auto& packets=port->second.packets;
+        while(!packets.empty()){
+            const auto packet=packets.front();packets.pop_front();if(packet.wait_packet)complete_wait_packet(packet.wait_packet);
+            const auto target=pool.objects.find(packet.key);if(target==pool.objects.end() || target->second.kind!=PoolKind::Io || target->second.closed)continue;
+            auto& io=target->second;if(io.started)--io.started;io.io.push_back(packet);io.pending.push_back(0);
+        }
+    }
     for(auto& [handle,object]:pool.objects){
         while(!object.pending.empty()){
             if(!object.owner && registered_waits_.size()>=64)break;
@@ -121,7 +135,11 @@ void WindowsServices::poll_threadpool(GuestMemory& memory){
             const auto instance_id=pool.next_instance++;PoolInstance instance;instance.object=handle;instance.worker=worker;instance.long_running=object.long_running;
             const auto result=object.pending.front();RegisteredWait work;work.worker=worker;work.pool_instance=instance_id;work.armed=false;work.ready=true;work.closing=true;
             auto arguments=std::vector<std::uint64_t>{instance_id,object.context};
-            if(object.kind!=PoolKind::Simple)arguments.push_back(handle);
+            if(object.kind==PoolKind::Io){
+                // PTP_WIN32_IO_CALLBACK(Instance, Context, Overlapped, IoResult, NumberOfBytesTransferred, Io)。
+                const auto packet=object.io.front();object.io.pop_front();
+                arguments.insert(arguments.end(),{packet.overlapped,completion_packet_error(packet.status),packet.bytes,handle});
+            }else if(object.kind!=PoolKind::Simple)arguments.push_back(handle);
             if(object.kind==PoolKind::Wait)arguments.push_back(result);
             work.callback_batch.push_back({object.callback,std::move(arguments)});
             pool.instances.emplace(instance_id,std::move(instance));
@@ -168,12 +186,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_threadpool(GuestState& stat
         definition.minimum=count;definition.maximum=std::max(definition.maximum,count);return finish(1);
     }
     if(name.starts_with("Create") || name=="TrySubmitThreadpoolCallback"){
-        if(!arg(0))return finish(0,87);if(!handles(GuestAddress{arg(0)}))memory.check(GuestAddress{arg(0)},1,Access::Execute);
+        // CreateThreadpoolIo 多一個前置的檔案控制代碼；其餘參數（回呼、context、環境）與其他 Create* 相同。
+        const unsigned shift=name=="CreateThreadpoolIo"?1U:0U;
+        if(!arg(shift+0))return finish(0,87);if(!handles(GuestAddress{arg(shift+0)}))memory.check(GuestAddress{arg(shift+0)},1,Access::Execute);
         if(pool.objects.size()>=4096)return finish(0,8);
-        PoolObject object;object.kind=name=="CreateThreadpoolTimer"?PoolKind::Timer:name=="CreateThreadpoolWait"?PoolKind::Wait:name=="TrySubmitThreadpoolCallback"?PoolKind::Simple:PoolKind::Work;
-        object.callback=arg(0);object.context=arg(1);
-        if(arg(2)){
-            const auto env=arg(2),version=memory.load(GuestAddress{env},32);const unsigned unit=x86_?4:8;
+        PoolObject object;object.kind=name=="CreateThreadpoolTimer"?PoolKind::Timer:name=="CreateThreadpoolWait"?PoolKind::Wait:name=="CreateThreadpoolIo"?PoolKind::Io:name=="TrySubmitThreadpoolCallback"?PoolKind::Simple:PoolKind::Work;
+        object.callback=arg(shift+0);object.context=arg(shift+1);
+        if(arg(shift+2)){
+            const auto env=arg(shift+2),version=memory.load(GuestAddress{env},32);const unsigned unit=x86_?4:8;
             if(version!=1 && version!=3)return finish(0,87);
             const unsigned flags_at=7*unit;memory.check(GuestAddress{env},version==1?flags_at+4:x86_?40U:72U,Access::Read);
             object.owner=ptr(env+unit);
@@ -185,6 +205,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_threadpool(GuestState& stat
             if(version==3 && (memory.load(GuestAddress{env+flags_at+4},32)!=1 || memory.load(GuestAddress{env+flags_at+8},32)!=(x86_?40U:72U)))return finish(0,50);
         }
         const auto handle=pool.next_object++;
+        if(object.kind==PoolKind::Io){
+            // 檔案以完成鍵＝此物件繫結到內部完成埠；已繫結到其他完成埠的檔案回 ERROR_INVALID_PARAMETER，無效控制代碼回 ERROR_INVALID_HANDLE。
+            if(!pool.port){pool.port=runtime_.allocate_wait_handle();runtime_.completion_ports.emplace(pool.port,CompletionPort{});}
+            if(const auto error=bind_file_completion_port(arg(0),pool.port,handle))return finish(0,error);
+            object.target=arg(0);
+        }
         if(object.kind==PoolKind::Simple){object.pending.push_back(0);object.closed=true;}
         pool.objects.emplace(handle,std::move(object));return finish(name=="TrySubmitThreadpoolCallback"?1U:handle);
     }
@@ -212,7 +238,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_threadpool(GuestState& stat
         instance.cleanup.push_back({resolve("kernel32.dll",api).value,std::move(arguments)});return finish();
     }
     const auto found=pool.objects.find(arg(0));if(found==pool.objects.end() || found->second.closed)throw HostCallFault("無效的 Threadpool 物件");
-    auto& object=found->second;const auto expected=name.find("Timer")!=std::string_view::npos?PoolKind::Timer:name.find("WaitCallbacks")!=std::string_view::npos || name.ends_with("Wait")?PoolKind::Wait:PoolKind::Work;
+    auto& object=found->second;const auto expected=name.find("ThreadpoolIo")!=std::string_view::npos?PoolKind::Io:name.find("Timer")!=std::string_view::npos?PoolKind::Timer:name.find("WaitCallbacks")!=std::string_view::npos || name.ends_with("Wait")?PoolKind::Wait:PoolKind::Work;
     if(object.kind!=expected)throw HostCallFault("Threadpool API 與物件類型不符");
     if(name=="SubmitThreadpoolWork"){
         if(object.pending.size()>=65536)throw HostCallFault("Threadpool 工作佇列容量不足");object.pending.push_back(0);return finish();
@@ -221,6 +247,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_threadpool(GuestState& stat
         const auto due=deadline(arg(1));object.set=arg(1)!=0;object.armed=object.set;object.deadline=due.first;object.absolute_due=due.second;object.period=static_cast<std::uint32_t>(arg(2));return finish();
     }
     if(name=="IsThreadpoolTimerSet")return finish(object.set?1U:0U);
+    if(name=="StartThreadpoolIo"){if(object.started==UINT32_MAX)throw HostCallFault("Threadpool I/O 進行中操作數溢位");++object.started;return finish();}
+    if(name=="CancelThreadpoolIo"){if(object.started)--object.started;return finish();} // 非同步操作未成功開始：撤銷 StartThreadpoolIo。
     if(name=="SetThreadpoolWait"){
         if(arg(1)){
             const auto target=runtime_.wait_objects.find(arg(1));
@@ -234,7 +262,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_threadpool(GuestState& stat
     if(name.starts_with("WaitForThreadpool")){
         auto& caller=threads_.items.at(threads_.current);
         if(caller.wait.kind!=ThreadWaitKind::ThreadpoolCompletion && arg(1)){
-            object.pending.clear();std::vector<std::uint64_t> cancel;
+            object.pending.clear();object.io.clear();std::vector<std::uint64_t> cancel;
             for(const auto& [id,wait]:registered_waits_)if(wait.pool_instance && !wait.active && pool.instances.at(wait.pool_instance).object==arg(0))cancel.push_back(id);
             for(const auto id:cancel)release_registered_wait(id);
         }

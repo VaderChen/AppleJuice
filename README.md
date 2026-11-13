@@ -114,19 +114,21 @@ x64 OpenCL 與 Vulkan 分別使用 macOS OpenCL.framework 與 Vulkan loader／Mo
 - **OpenGL／WebGL**：OpenGL／WGL 預設轉為 Metal 繪製，初始化失敗時改用 macOS OpenGL；WebGL 使用的 EGL／GLES 交由 ANGLE 的 Metal 後端。
 - **音訊**：DirectSound（含 3D 定位與錄音）、XAudio2、WASAPI 與 X3DAudio 經 Core Audio 輸出，保留立體聲左右聲道與聲像。
 - **輸入**：DirectInput（含力回饋）、XInput 與 Raw Input 取用 macOS 實體輸入裝置的資料。
-- **影片**：Media Foundation 與 D3D11 DXVA 的 H.264 編解碼使用 VideoToolbox 硬體加速；HEVC 與 AV1 尚未完成。
+- **影片**：Media Foundation 與 D3D11 DXVA 的 H.264 編解碼使用 VideoToolbox 硬體加速；Windows Media（ASF）的 VC-1／WMV 與 WMA 由內建、只含解碼器的 FFmpeg 解碼。HEVC 與 AV1 尚未完成。
+- **畫面升頻**：遊戲的 XeSS 以 MetalFX 時間性升頻執行；遊戲啟用 XeSS 時，Launcher 的畫面內插與 2 倍放大會自動停用，改由遊戲的升頻輸出。
 
 AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數組合並未全面支援。成功載入或顯示視窗不代表完整應用程式均可使用。磁碟映射不是完整 OS 沙箱；啟用的服務可能存取映射檔案或使用網路。請只執行信任的程式，並依需要設定存取權限。
 
 儲存庫包含 `src/`、`include/`、`launcher/`、`cmake/`、必要建置腳本、`third_party/`、`x64kernel/` 與使用文件。
 
-## 實測紀錄 / 2026-11-11 / 共 20 款遊戲
+## 實測紀錄 / 2026-11-13 / 共 22 款遊戲
 
-<img src="docs/images/support-levels/none.png" width="16" height="16" alt="無法運作、但正在處理" title="無法運作、但正在處理"> 無法運作、但正在處理　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="可啟動到主畫面" title="可啟動到主畫面"> 可啟動到主畫面　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="可運作、效率不高" title="可運作、效率不高"> 可運作、效率不高　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="運作良好" title="運作良好"> 運作良好
+<img src="docs/images/support-levels/none.png" width="16" height="16" alt="無法運作、處理中" title="無法運作、處理中"> 無法運作、處理中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="可開啟" title="可開啟"> 可開啟　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="效率不高" title="效率不高"> 效率不高　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="運作良好" title="運作良好"> 運作良好　<img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> 運作良好 (MetalFX)
 
 | 程式 | x64/x86 | 主要運作核心 | 支援程度 |
 | --- | --- | --- | :---: |
 | 7-Zip | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
+| WinRAR | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | Geekbench 7 | x64 | CPU | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | Memelis' RPG | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
@@ -138,18 +140,22 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 逆轉裁判123 成步堂精選集 | x86 | D3D11（Unity） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 天穗之咲稻姬 | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
 | 古墓奇兵（2013） | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
-| Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
-| 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
-| 電馭叛客 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
-| 三國志X with 威力加強版 | x86 | 未知 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
-| 雙人成行 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
-| 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
-| 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
-| 光與影：33號遠征隊 | x64 | D3D11（Unreal Engine 5） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
-| 古墓奇兵：崛起 | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
-| 古墓奇兵：暗影 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="可運作、效率不高" title="可運作、效率不高"> |
-| 潛水員戴夫 | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可啟動到主畫面" title="可啟動到主畫面"> |
-| 特警 Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可啟動到主畫面" title="可啟動到主畫面"> |
+| 歧路旅人 II | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="運作良好" title="運作良好"> |
+| 光與影：33號遠征隊 | x64 | D3D11（Unreal Engine 5） | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> |
+| 古墓奇兵：崛起 | x64 | D3D11 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> |
+| 古墓奇兵：暗影 | x64 | D3D12 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> |
+| Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 電馭叛客 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 三國志X with 威力加強版 | x86 | 未知 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 雙人成行 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 潛水員戴夫 | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可開啟" title="可開啟"> |
+| 特警 Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可開啟" title="可開啟"> |
+| 惡靈古堡 村莊 | x64 | D3D12（RE Engine） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、處理中" title="無法運作、處理中"> |
+
+「運作良好 (MetalFX)」表示開啟 Launcher 的畫面內插或 2 倍放大（MetalFX）後達到運作良好標準；未開啟時仍屬效率不高。
 
 實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
 

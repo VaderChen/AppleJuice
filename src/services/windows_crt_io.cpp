@@ -354,7 +354,7 @@ std::span<const WindowsServiceDescriptor> crt_io_service_descriptors(){
         {"crt", "fgetpos", 2},{"crt", "fsetpos", 2},{"crt", "fseek", 3},{"crt", "_fseeki64", 3,1U<<1},
         {"crt", "ftell", 1},{"crt", "_ftelli64", 1},{"crt", "feof", 1},{"crt", "ferror", 1},
         {"crt", "clearerr", 1},{"crt", "rewind", 1},{"crt", "fgetwc", 1},{"crt", "fgetws", 3},
-        {"crt", "fputwc", 2},{"crt", "ungetc", 2},{"crt", "ungetwc", 2},{"crt", "getchar", 0},
+        {"crt", "fputwc", 2},{"crt", "fputws", 2},{"crt", "ungetc", 2},{"crt", "ungetwc", 2},{"crt", "getchar", 0},
         {"crt", "fgetc", 1},{"crt", "getc", 1},{"crt", "fgets", 3},{"crt", "fputs", 2},
         {"crt", "_wfopen", 2},{"crt", "_isatty", 1},{"crt", "_get_osfhandle", 1},{"crt", "_setmode", 2},
         {"crt", "fputc", 2},{"crt", "putc", 2},{"crt", "_write", 3},
@@ -378,7 +378,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
     constexpr std::array descriptor_calls{"_read","_write","_get_osfhandle","_close","_commit","_setmode","_isatty","_lseek","_lseeki64","_tell","_telli64","_filelength","_filelengthi64","_chsize","_chsize_s","_dup","_dup2","_locking"};
     const bool descriptor_call=std::find(descriptor_calls.begin(),descriptor_calls.end(),symbol)!=descriptor_calls.end();
     constexpr std::array stream_first_calls{"fclose","fflush","fseek","_fseeki64","ftell","_ftelli64","feof","ferror","clearerr","rewind","fgetpos","fsetpos","fgetwc","fgetc","getc","setvbuf","setbuf"};
-    constexpr std::array stream_second_calls{"fputs","fputc","putc","ungetc","ungetwc","fputwc"};
+    constexpr std::array stream_second_calls{"fputs","fputc","putc","ungetc","ungetwc","fputwc","fputws"};
     std::uint64_t tracked_stream=0;
     if(!descriptor_call){
         if(std::find(stream_first_calls.begin(),stream_first_calls.end(),symbol)!=stream_first_calls.end())tracked_stream=crt_stream(arg(0));
@@ -424,7 +424,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
         arg.return_to(state,symbol=="_chsize_s"?9U:symbol=="_lseeki64" || symbol=="_telli64" || symbol=="_filelengthi64"?UINT64_MAX:UINT32_MAX);return std::nullopt;
     }
     if(tracked_stream)if(auto* file=crt_file(tracked_stream);file && !import_crt_lowio(memory,*file)){
-        arg.return_to(state,symbol=="fread" || symbol=="fgets" || symbol=="fgetws"?0:symbol=="fgetwc" || symbol=="fputwc" || symbol=="ungetwc"?65535U:UINT32_MAX);return std::nullopt;}
+        arg.return_to(state,symbol=="fread" || symbol=="fgets" || symbol=="fgetws"?0:symbol=="fgetwc" || symbol=="fputwc" || symbol=="fputws" || symbol=="ungetwc"?65535U:UINT32_MAX);return std::nullopt;}
     if(symbol=="fread" || symbol=="fwrite"){
         const auto* file=crt_file(tracked_stream);
         if(!arg(0) || !arg(3) || arg(2)>(x86_?UINT32_MAX:UINT64_MAX)/arg(1) ||
@@ -437,6 +437,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
         error(22,symbol=="fread" || symbol=="fwrite" || symbol=="fgets"?0:UINT32_MAX);
         if(current_invalid_parameter_handler()){start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,result);return std::nullopt;}
         return 0xc0000417U;
+    }
+    // fputws：字串或串流為空指標時與 UCRT 相同，設 EINVAL、呼叫無效參數處理常式並回傳 WEOF。
+    if(symbol=="fputws" && (!arg(0) || !arg(1))){
+        memory.store(GuestAddress{runtime_.errno_cell},32,22);
+        if(current_invalid_parameter_handler()){start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,65535U);return std::nullopt;}
+        arg.return_to(state,65535U);return std::nullopt;
     }
     if((symbol=="fgetwc" || symbol=="fputwc" || symbol=="ungetc" || symbol=="ungetwc") && !arg(symbol=="fgetwc"?0:1)){
         memory.store(GuestAddress{runtime_.errno_cell},32,22);const auto failure=symbol=="ungetc"?UINT32_MAX:65535U;
@@ -750,6 +756,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
         else {auto& file=stream==runtime_base_.value+0x800?runtime_.standard_input:runtime_.streams.at(stream);memory.check(GuestAddress{arg(1)},count,Access::Write);if(file.standard_handle==0x100 && !file.lowio_eof && !file.lowio_low_surrogate && count && !await_standard_input(state,memory,1,file.text))return std::nullopt;const auto bytes=read_crt_file(memory,file,count);if(bytes.empty() && file.standard_handle==0x100 && file.lowio_needed_input && !await_standard_input(state,memory,file.lowio_needed_input))return std::nullopt;memory.write(GuestAddress{arg(1)},bytes);result=file.lowio_error && bytes.empty()?UINT32_MAX:bytes.size();}
     } else if(symbol=="fputwc") {
         const std::u16string text(1,static_cast<char16_t>(arg(0)));result=write_crt_wide_stream(state,memory,arg(1),text)==1?arg(0)&65535U:65535U;
+    } else if(symbol=="fputws") {
+        // 寫入不含結尾 NUL 的寬字串；與 fputwc 共用寬字元串流寫入（依串流模式轉碼）。成功回傳 0，失敗回傳 WEOF。
+        const auto text=read_utf16(memory,GuestAddress{arg(0)});
+        result=text.empty() || write_crt_wide_stream(state,memory,arg(1),text)==text.size()?0:65535U;
     } else if(symbol=="fwrite" || symbol=="fputs" || symbol=="fputc" || symbol=="putc") {
         const bool character=symbol=="fputc" || symbol=="putc",string=symbol=="fputs";
         const auto stream=crt_stream(arg(character || string?1:3));const auto size=character || string?1:arg(1),count=character?1:string?read_ansi(memory,arg(0)).size():arg(2);

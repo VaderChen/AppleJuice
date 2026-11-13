@@ -843,7 +843,24 @@
         }else if(symbol=="CreateSwapChain" || symbol=="CreateSwapChainForHwnd"){
             graphics_handled=true;const bool modern=symbol=="CreateSwapChainForHwnd";
             // D3D12 以命令佇列作為交換鏈的裝置；由 D3D12 模組建立翻轉模型交換鏈。
-            if(d3d12_queue(arg(1)))return invoke_d3d12(state,memory,WindowsServiceDescriptor{"internal-d3d12",modern?"DXGI.CreateSwapChainForHwnd":"DXGI.CreateSwapChain",modern?7U:4U});
+            if(d3d12_queue(arg(1))){
+                // invoke_d3d12 會寫回返回值並彈出呼叫框架：之後不能再讀堆疊參數，先取出。
+                const auto factory=arg(0),description=arg(modern?3:2),window=modern?arg(2):0,fullscreen_desc=modern?arg(4):0,restricted=modern?arg(5):0,created_at=arg(modern?6:3);
+                const auto exit=invoke_d3d12(state,memory,WindowsServiceDescriptor{"internal-d3d12",modern?"DXGI.CreateSwapChainForHwnd":"DXGI.CreateSwapChain",modern?7U:4U});
+                if(exit || state.reg(Gpr::Rax) || !created_at)return exit;
+                // 交換鏈的 DXGI 顯示狀態（全螢幕、目標模式、輸出、限制輸出、父工廠）由本橋接層的顯示身分保存，與 D3D11 交換鏈共用實作。
+                // 建立時要求全螢幕而無法進入：維持視窗模式並回 DXGI_STATUS_OCCLUDED。
+                const auto created=memory.load(GuestAddress{created_at},pointer_bits);
+                if(created)try{
+                    bool occluded=false;(void)typed(factory,Kind::Factory);
+                    bridge.display_swaps[created]=make_swap(nullptr,factory,description,window,modern,fullscreen_desc,restricted,&occluded);
+                    if(occluded)state.reg(Gpr::Rax)=0x087a0001U;
+                }catch(const std::exception& error){
+                    // 顯示身分建立失敗不影響交換鏈本身的繪製與呈現；之後的顯示家族方法回 E_INVALIDARG。
+                    bridge.last_error=error.what();runtime_.module_events.push_back(std::string("d3d12_note=交換鏈顯示身分建立失敗：")+error.what());
+                }
+                return exit;
+            }
             auto factory=typed(arg(0),Kind::Factory),device=object(arg(1)).identity;require(device->kind==Kind::Device);const auto out=modern?6U:3U;output(out);write_pointer(arg(out),0);auto swap=make_swap(device,factory->root,arg(modern?3:2),modern?arg(2):0,modern,modern?arg(4):0,modern?arg(5):0);write_pointer(arg(out),swap->root);
         }else if(symbol=="MakeWindowAssociation" || symbol=="GetWindowAssociation"){
             graphics_handled=true;auto factory=typed(arg(0),Kind::Factory);if(symbol=="MakeWindowAssociation"){require(!arg(1) || gui_.windows.contains(arg(1)) || shared_gui_window(arg(1)).has_value());require(!(u32(2)&~7U));factory->window=arg(1);}else write_pointer(arg(1),factory->window);

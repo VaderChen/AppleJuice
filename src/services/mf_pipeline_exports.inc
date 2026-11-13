@@ -47,11 +47,17 @@ else if(name=="MFCreateSourceReaderFromMediaSource"){
         else {if(!target->closed){if(target->draining && target->frames.empty() && target->packets.empty()){queue_event(target,603);target->draining=false;}request_input(target);}release_job(target);}
     }else if(target->kind==mf::Reader || target->kind==mf::MediaStream){
         if(target->request_pending || target->file_read_active){
-            std::uint32_t status=0,flags=0;std::uint64_t sample=0;
+            std::uint32_t status=0,flags=0,stream_index=0;std::uint64_t sample=0;
             try {
                 auto source=object(target->parent,mf::Source);
                 if(!target->file_read_active){require(!source->closed,shutdown);target->file_read_active=true;target->file_read_generation=target->generation;}
-                sample=source->file_source && source->file_source->movie?movie_sample(source,*target):captured_sample(source,target->read_frames,true);if(source->closed){release(sample);sample=0;throw Failure{shutdown};}
+                // ASF 來源的解多工由整個來源共用：Reader 依要求的串流索引取樣，MediaStream 依自己的串流索引取樣。
+                if(source->file_source && source->file_source->asf){
+                    try{sample=target->kind==mf::Reader && target->asf_decode?asf_decoded_sample(target,source,target->request_stream,stream_index):asf_sample(source,target->kind==mf::Reader?target->request_stream:target->identifier,stream_index);}
+                    // 另一條串流的讀取尚在客體 byte stream 回呼中：保留本次要求，稍後由輪詢重新派送。
+                    catch(const mf::AsfBusy&){target->poll_queued=false;arg.return_to(state,0);return std::nullopt;}
+                }else sample=source->file_source && source->file_source->movie?movie_sample(source,*target):captured_sample(source,target->read_frames,true);
+                if(source->closed){release(sample);sample=0;throw Failure{shutdown};}
                 if(!sample && source->file_source)flags=2;else require(sample!=0,0xc00d36b2U);
             }catch(const Failure& error){status=error.code;}
             const bool cancelled=!target->request_pending || target->file_read_generation!=target->generation;
@@ -60,11 +66,11 @@ else if(name=="MFCreateSourceReaderFromMediaSource"){
 
             if(!cancelled && target->kind==mf::Reader){
                 const auto time=sample?*object(sample,mf::Sample)->time:0;
-                callbacks.push_back({foreign_method(target->callback,3),{target->callback,status,0,status?1U:flags,time,sample},false,false,1U<<4});if(sample)callbacks.push_back({resolve("internal-mf","Release").value,{sample}});
+                callbacks.push_back({foreign_method(target->callback,3),{target->callback,status,stream_index,status?1U:flags,time,sample},false,false,1U<<4});if(sample)callbacks.push_back({resolve("internal-mf","Release").value,{sample}});
             }else if(!cancelled && !target->closed){if(sample){if(target->pending_token){Value token;token.type=13;token.scalar=target->pending_token;set(*object(sample,mf::Sample),mf::MFSampleExtension_Token,token);}Value value;value.type=13;value.scalar=sample;queue_event(target,213,value);release(sample);}
                 else if(flags&2U){
                     queue_event(target,212);target->flags|=1U;auto source=object(target->parent,mf::Source);
-                    if(!source->file_source || !source->file_source->movie || std::all_of(source->media_streams.begin(),source->media_streams.end(),[&](std::uint64_t p){return object(p,mf::MediaStream)->flags&1U;}))queue_event(source,211);
+                    if(!source->file_source || (!source->file_source->movie && !source->file_source->asf) || std::all_of(source->media_streams.begin(),source->media_streams.end(),[&](std::uint64_t p){return object(p,mf::MediaStream)->flags&1U;}))queue_event(source,211);
                 }else queue_event(target,1,{},status);}
             release(target->pending_token);target->pending_token=0;
         }

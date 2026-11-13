@@ -66,7 +66,7 @@ struct VoiceGraph::Impl {
     struct Node {
         State state;float maximum_ratio{2};bool tails{},reset_samples{};
         std::array<float,maximum_channels> frame{};FilterState filter;
-        std::vector<Edge> sends;std::vector<std::shared_ptr<Effect>> effects;
+        std::vector<Edge> sends;std::vector<EffectSlot> effects;
         std::array<std::optional<Block>,maximum_packets> packets;
         std::array<unsigned,maximum_packets> queue{};unsigned head{},count{};
         double played{},advance_pending{};
@@ -100,13 +100,14 @@ struct VoiceGraph::Impl {
         case Operation::Filter:require(n.state.flags&8U);valid_filter(c.filter);break;
         case Operation::OutputFilter:require(edge(n,c.destination).use_filter);valid_filter(c.filter);break;
         case Operation::Matrix:require(c.values.size()==edge(n,c.destination).matrix.size() && std::all_of(c.values.begin(),c.values.end(),gain));break;
+        case Operation::EnableEffect:case Operation::DisableEffect:require(c.effect<n.effects.size());break;
         }
     }
     void apply(const Change& c){
         auto& n=node(c.voice);
         switch(c.operation){
         case Operation::Start:n.state.playing=true;n.tails=false;break;
-        case Operation::Stop:n.state.playing=false;n.tails=c.tails;if(!c.tails){n.filter.reset();for(auto& effect:n.effects)effect->reset();}break;
+        case Operation::Stop:n.state.playing=false;n.tails=c.tails;if(!c.tails){n.filter.reset();for(auto& slot:n.effects)for(auto& effect:slot.pairs)effect->reset();}break;
         case Operation::ExitLoop:if(n.count)n.packets[n.queue[n.head]]->exit_loop=true;break;
         case Operation::Volume:n.state.volume=c.value;break;
         case Operation::ChannelVolumes:std::copy(c.values.begin(),c.values.end(),n.state.channel_volumes.begin());break;
@@ -114,6 +115,7 @@ struct VoiceGraph::Impl {
         case Operation::Filter:n.state.filter=n.filter.parameters=c.filter;break;
         case Operation::OutputFilter:edge(n,c.destination).filter.parameters=c.filter;break;
         case Operation::Matrix:std::copy(c.values.begin(),c.values.end(),edge(n,c.destination).matrix.begin());break;
+        case Operation::EnableEffect:case Operation::DisableEffect:n.effects[c.effect].enabled=c.operation==Operation::EnableEffect;break;
         }
     }
     void finish(Voice id,Node& n,Block& b){
@@ -217,7 +219,17 @@ void VoiceGraph::commit(std::uint32_t set){
     for(const auto& [id,list]:impl_->changes)if(!set || id==set)for(const auto& c:list)impl_->validate(c);
     for(auto i=impl_->changes.begin();i!=impl_->changes.end();)if(!set || i->first==set){for(const auto& c:i->second)impl_->apply(c);i=impl_->changes.erase(i);}else ++i;
 }
-void VoiceGraph::set_effects(Voice voice,std::vector<std::shared_ptr<Effect>> effects){std::lock_guard lock(impl_->mutex);auto& n=impl_->node(voice);require(n.state.format.channels<=2 && std::all_of(effects.begin(),effects.end(),[](const auto& p){return bool(p);}));n.effects=std::move(effects);}
+void VoiceGraph::set_effects(Voice voice,std::vector<std::shared_ptr<Effect>> effects){
+    {std::lock_guard lock(impl_->mutex);require(impl_->node(voice).state.format.channels<=2);}
+    std::vector<EffectSlot> slots;for(auto& effect:effects)slots.push_back({{std::move(effect)},true});set_effect_chain(voice,std::move(slots));
+}
+void VoiceGraph::set_effect_chain(Voice voice,std::vector<EffectSlot> slots){
+    std::lock_guard lock(impl_->mutex);auto& n=impl_->node(voice);const auto pairs=(n.state.format.channels+1)/2;
+    for(const auto& slot:slots)require(slot.pairs.size()==pairs && std::all_of(slot.pairs.begin(),slot.pairs.end(),[](const auto& p){return bool(p);}));
+    for(auto& [set,list]:impl_->changes)std::erase_if(list,[&](const auto& c){return c.voice==voice && (c.operation==Operation::EnableEffect || c.operation==Operation::DisableEffect);});
+    n.effects=std::move(slots);
+}
+bool VoiceGraph::effect_enabled(Voice voice,unsigned index)const {std::lock_guard lock(impl_->mutex);const auto& n=impl_->node(voice);require(index<n.effects.size());return n.effects[index].enabled;}
 void VoiceGraph::start(bool active){std::lock_guard lock(impl_->mutex);impl_->started=active;}
 bool VoiceGraph::running()const {std::lock_guard lock(impl_->mutex);return impl_->started && !impl_->faulted;}
 std::vector<VoiceGraph::Event> VoiceGraph::take_events(){
@@ -251,7 +263,8 @@ std::size_t VoiceGraph::render_frames(std::span<float> output,unsigned rate,bool
             }
             if(n->state.flags&8U)for(unsigned c=0;c<channels;++c)n->frame[c]=n->filter.process(n->frame[c],c);
             for(unsigned c=0;c<channels;++c)n->frame[c]*=n->state.volume;
-            for(auto& effect:n->effects){float right=channels==1?n->frame[0]:n->frame[1];effect->process(n->frame[0],right);if(channels>1)n->frame[1]=right;}
+            for(auto& slot:n->effects)if(slot.enabled)for(unsigned pair=0;pair<slot.pairs.size();++pair){
+                const auto left=pair*2,other=left+1<channels?left+1:left;float right=n->frame[other];slot.pairs[pair]->process(n->frame[left],right);if(other!=left)n->frame[other]=right;}
             for(unsigned c=0;c<channels;++c)n->frame[c]*=n->state.channel_volumes[c];
             for(auto& e:n->sends){auto& destination=*impl_->nodes.at(e.destination);
                 for(unsigned d=0;d<destination.state.format.channels;++d){float sum=0;for(unsigned c=0;c<channels;++c)sum+=n->frame[c]*e.matrix[d*channels+c];if(e.use_filter)sum=e.filter.process(sum,d);destination.frame[d]+=sum;}

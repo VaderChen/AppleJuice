@@ -6,6 +6,8 @@
 #include "x64arm/shared_wake.hpp"
 #include "d3d12_root_binding_layout.h"
 #include "d3d12_descriptor_layout.h"
+#include <filesystem>
+#include <fstream>
 #include <vkd3d_shader.h>
 #include <algorithm>
 #include <atomic>
@@ -812,6 +814,11 @@ std::span<const WindowsServiceDescriptor> d3d12_object_service_descriptors(){
     }();
     return descriptors;
 }
+namespace detail {
+// D3D12 交換鏈在 D3D11／DXGI 橋接層的顯示身分（windows_d3d11.cpp 的 D3D11State::display_swaps）：讀取全螢幕描述與同步緩衝描述。
+bool dxgi_display_swap_fullscreen_desc(const D3D11State*,std::uint64_t swap,std::array<std::uint8_t,20>& desc) noexcept;
+void dxgi_display_swap_buffers(D3D11State*,std::uint64_t swap,std::uint32_t width,std::uint32_t height,std::uint32_t format,std::uint32_t count,std::uint32_t flags) noexcept;
+}
 bool WindowsServices::d3d12_queue(std::uint64_t object) const{return d3d12_ && d3d12_->queues.contains(object);}
 bool WindowsServices::d3d12_record(GuestMemory& memory,std::uint64_t list,D3D12Replay replay){
     if(!d3d12_)return false;const auto found=d3d12_->lists.find(list);if(found==d3d12_->lists.end() || !found->second.open)return false;
@@ -1339,11 +1346,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         auto& native=*bridge.devices.at(swap.device).native;
         for(const auto buffer:swap.buffers){bridge.resources.erase(buffer);bridge.objects.erase(buffer);}
         swap.buffers.clear();swap.index=0;
+        // DXGI_SWAP_CHAIN_DESC1.BufferUsage（位移 24）含 DXGI_USAGE_UNORDERED_ACCESS（0x400）時，後方緩衝允許 UAV：
+        // 資源旗標加 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS，原生紋理也要可供著色器寫入（運算著色器直接寫入後方緩衝的最後合成）。
+        std::uint32_t usage=0;if(swap.desc1.size()>=28)std::memcpy(&usage,swap.desc1.data()+24,4);
+        const bool unordered=(usage&0x400U)!=0;
         for(std::uint32_t i=0;i<count;++i){
-            D3D12State::Resource r;r.dimension=3;r.width=swap.width;r.height=swap.height;r.format=swap.format;r.flags=1;r.heap_type=1;r.desc.assign(56,0);
+            D3D12State::Resource r;r.dimension=3;r.width=swap.width;r.height=swap.height;r.format=swap.format;r.flags=unordered?5U:1U;r.heap_type=1;r.desc.assign(56,0);
             const auto put=[&](unsigned at,std::uint64_t value,unsigned size){std::memcpy(r.desc.data()+at,&value,size);};
-            put(0,3,4);put(16,swap.width,8);put(24,swap.height,4);put(28,1|(1U<<16),4);put(32,swap.format,4);put(36,1,4);put(48,1,4);
-            GraphicsResourceDesc d;d.dimension=3;d.width=swap.width;d.height=swap.height;d.format=swap.format;d.bind=0x28;r.gpu=native.graphics_resource(d);
+            put(0,3,4);put(16,swap.width,8);put(24,swap.height,4);put(28,1|(1U<<16),4);put(32,swap.format,4);put(36,1,4);put(48,r.flags,4);
+            GraphicsResourceDesc d;d.dimension=3;d.width=swap.width;d.height=swap.height;d.format=swap.format;d.bind=unordered?0xa8U:0x28U;r.gpu=native.graphics_resource(d);
             const auto object=create(Kind::Resource,swap.device);bridge.resources[object]=std::move(r);swap.buffers.push_back(object);
         }
         // 無原生 GUI（headless）時以離屏表面呈現，與 D3D11 交換鏈相同。
@@ -1388,6 +1399,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         const auto remaining=found->second.references;
         if(!remaining){
             const auto device=found->second.device;
+            // 交換鏈：先銷毀 D3D11／DXGI 橋接層的顯示身分；仍在全螢幕時還原視窗（與 D3D11 交換鏈釋放相同），並釋放它持有的輸出、介面卡與工廠。
+            if(kind==Kind::SwapChain && call)(void)invoke_d3d11_full(state,memory,WindowsServiceDescriptor{"internal-d3d12-swap","DisplayRelease",1});
             // 零複製映射撤除客體範圍；宿主記憶體由 GPU 別名持有到在途命令完成。
             const auto unmap=[&](std::uint64_t address,std::uint64_t size){try{memory.unmap(GuestAddress{address},static_cast<std::size_t>(size));}catch(const std::exception&){}};
             // 位址索引同時移除：資源與描述元堆積常逐幀建立／釋放，只在查詢時清除失效項目會讓索引無限增長、查找越來越慢。
@@ -1533,6 +1546,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             const auto present=[](NativeGraphics& producer,NativeOpenGlContext& surface,const GraphicsView& view,std::uint32_t interval,bool visible){
                 auto started=D3D12Submitter::stall_us()?D3D12Submitter::now_ns():0;
                 producer.graphics_handoff(surface,view);
+                // 診斷：X64ARM_TRACE_D3D12_PRESENT_DUMP=<目錄> 時，每 120 次呈現讀回一次當下後方緩衝（最多 8 張），
+                // 存成原始像素檔，用來分辨遊戲交出的畫面本身是否就是空的（相對於呈現路徑出錯）。
+                if(static const char* const dump=std::getenv("X64ARM_TRACE_D3D12_PRESENT_DUMP");dump && *dump){
+                    static std::atomic<unsigned> presents{},dumps{};
+                    // 間隔可由 X64ARM_TRACE_D3D12_PRESENT_DUMP_EVERY 指定（預設 120 次呈現）。
+                    static const unsigned every=[]{const char* text=std::getenv("X64ARM_TRACE_D3D12_PRESENT_DUMP_EVERY");const auto value=text?std::strtoul(text,nullptr,10):0UL;return value?static_cast<unsigned>(value):120U;}();
+                    const auto n=presents.fetch_add(1,std::memory_order_relaxed);
+                    if(n%every==every/2 && dumps.fetch_add(1,std::memory_order_relaxed)<12){
+                        try{
+                            const auto pixels=producer.graphics_read(view);
+                            std::ofstream out(std::filesystem::path(dump)/("present-"+std::to_string(n)+".raw"),std::ios::binary);
+                            out.write(reinterpret_cast<const char*>(pixels.data()),static_cast<std::streamsize>(pixels.size()));
+                            std::fprintf(stderr,"[d3d12] present dump %u bytes=%zu\n",n,pixels.size());
+                        }catch(const std::exception& error){std::fprintf(stderr,"[d3d12] present dump 失敗：%s\n",error.what());}
+                    }
+                }
                 D3D12Submitter::stall("present_producer_handoff",started);
                 if(started)started=D3D12Submitter::now_ns();
                 surface.swap_interval(interval?1:0);
@@ -1604,6 +1633,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         if(member=="GetDesc1"){if(!arg(1))return finish(pointer_error);auto desc=swap.desc1;std::memcpy(desc.data(),&swap.width,4);std::memcpy(desc.data()+4,&swap.height,4);std::memcpy(desc.data()+8,&swap.format,4);memory.write(GuestAddress{arg(1)},desc);return finish(ok);}
         if(member=="GetDesc"){
             if(!arg(1))return finish(pointer_error);memory.fill(GuestAddress{arg(1)},0,72);
+            // RefreshRate、ScanlineOrdering、Scaling 與 Windowed 取顯示身分的目前狀態（全螢幕切換、ResizeTarget 後會改變）。
+            (void)detail::dxgi_display_swap_fullscreen_desc(d3d11_.get(),self,swap.fullscreen);
             const auto word=[&](unsigned at){std::uint32_t value;std::memcpy(&value,swap.desc1.data()+at,4);return value;};
             const auto full=[&](unsigned at){std::uint32_t value;std::memcpy(&value,swap.fullscreen.data()+at,4);return value;};
             store(arg(1),32,swap.width);store(arg(1)+4,32,swap.height);store(arg(1)+8,32,full(0));store(arg(1)+12,32,full(4));store(arg(1)+16,32,swap.format);
@@ -1616,16 +1647,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             if(u32(4))swap.format=u32(4);if(count<2 || count>16)return finish(invalid);
             std::memcpy(swap.desc1.data()+28,&count,4);swap.source_width=swap.width;swap.source_height=swap.height;
             try{swap_buffers(swap,count);}catch(const std::exception& error){runtime_.module_events.push_back(std::string("d3d12_note=ResizeBuffers 失敗：")+error.what());return finish(invalid);}
+            // SwapChainFlags（ResizeBuffers 第 6 個、ResizeBuffers1 相同位置）：可等待物件旗標建立後不可變，其餘（ALLOW_MODE_SWITCH 等）更新，
+            // 並同步到顯示身分的描述（全螢幕切換依 ALLOW_MODE_SWITCH 選擇目標模式）。
+            swap.flags=(u32(5)&~0x40U)|(swap.flags&0x40U);std::memcpy(swap.desc1.data()+44,&swap.flags,4);
+            detail::dxgi_display_swap_buffers(d3d11_.get(),self,swap.width,swap.height,swap.format,count,swap.flags);
             return finish(ok);
         }
-        if(member=="GetFullscreenState"){if(arg(1))store(arg(1),32,0);if(arg(2))store(arg(2),64,0);return finish(ok);}
-        if(member=="SetFullscreenState"){if(u32(1))report("SetFullscreenState(TRUE)");return finish(ok);}
+        // DXGI 顯示家族：全螢幕狀態、目標模式、所在輸出、限制輸出與父工廠由 D3D11／DXGI 橋接層的顯示身分保存，
+        // 轉交 D3D11 交換鏈的同一組處理器（d3d11_display_handlers.inc；該處寫回返回值，完成全螢幕啟用通知）。
+        const auto display=[&](std::string_view name,unsigned count){return invoke_d3d11_full(state,memory,WindowsServiceDescriptor{"internal-d3d12-swap",name,count});};
+        if(member=="GetFullscreenState"){
+            // 不取回輸出時只讀狀態（UE 每幀一次，協調者本地路徑不取圖形鎖）；取回輸出要持有物件參照，走共用處理器。
+            if(arg(2))return display("GetFullscreenState",3);
+            std::array<std::uint8_t,20> current=swap.fullscreen;(void)detail::dxgi_display_swap_fullscreen_desc(d3d11_.get(),self,current);
+            if(arg(1)){std::uint32_t windowed;std::memcpy(&windowed,current.data()+16,4);store(arg(1),32,windowed?0:1);}
+            return finish(ok);
+        }
+        if(member=="SetFullscreenState")return display("SetFullscreenState",3);
+        if(member=="ResizeTarget")return display("ResizeTarget",2);
+        if(member=="GetContainingOutput")return display("GetContainingOutput",2);
+        if(member=="GetRestrictToOutput")return display("GetRestrictToOutput",2);
+        if(member=="GetFullscreenDesc")return display("GetFullscreenDesc",2);
+        if(member=="GetParent")return display("DxgiGetParent",3);
         if(member=="GetLastPresentCount"){if(!arg(1))return finish(pointer_error);store(arg(1),32,swap.frames);return finish(ok);}
         if(member=="GetFrameStatistics")return finish(0x887a000bU); // DXGI_ERROR_FRAME_STATISTICS_DISJOINT。
-        if(member=="GetContainingOutput" || member=="GetParent" || member=="GetCoreWindow"){if(arg(member=="GetParent" || member=="GetCoreWindow"?2:1))store(arg(member=="GetParent" || member=="GetCoreWindow"?2:1),64,0);return finish(member=="GetParent"?no_interface:unsupported);}
-        // 建立時未指定 pRestrictToOutput（本實作的 D3D12 交換鏈不接受限制輸出）：回 S_OK 與 NULL。
-        if(member=="GetRestrictToOutput"){if(!arg(1))return finish(invalid);store(arg(1),64,0);return finish(ok);}
-        if(member=="GetFullscreenDesc"){if(!arg(1))return finish(invalid);memory.write(GuestAddress{arg(1)},std::span<const std::uint8_t>(swap.fullscreen));return finish(ok);}
+        if(member=="GetCoreWindow"){if(arg(2))store(arg(2),64,0);return finish(unsupported);}
         if(member=="CheckColorSpaceSupport"){if(!arg(2))return finish(pointer_error);store(arg(2),32,u32(1)==0?1:0);return finish(ok);}
         if(member=="SetColorSpace1")return finish(u32(1)==0?ok:invalid);
         // 背景色：只影響呈現區域外（DXGI_SCALING_NONE 等）露出的部分；保存供查詢。
@@ -1657,7 +1703,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         }
         // 3×2 轉換矩陣只屬於 CreateSwapChainForComposition 的交換鏈；HWND 交換鏈回 DXGI_ERROR_INVALID_CALL。
         if(member=="SetMatrixTransform" || member=="GetMatrixTransform")return finish(0x887a0001U);
-        if(member=="SetHDRMetaData" || member=="ResizeTarget")return finish(ok);
+        if(member=="SetHDRMetaData")return finish(ok);
         if(member=="IsTemporaryMonoSupported")return finish(0);
         report("Swap."+std::string(member));return finish(not_implemented);
     }
@@ -1837,14 +1883,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             if(!arg(5))return finish(false_ok);
             const auto object=create(Kind::RootSignature,self);bridge.roots[object]=std::move(root);return finish(give(object,arg(4),arg(5)));
         }
-        if(member=="CreateGraphicsPipelineState"){
-            // D3D12_GRAPHICS_PIPELINE_STATE_DESC（x64，656 bytes）轉為共用後端的 D3D11 狀態格式。
-            if(!arg(1))return finish(invalid);
-            const auto desc=bytes(arg(1),656);
+        // D3D12_GRAPHICS_PIPELINE_STATE_DESC（x64，656 bytes）轉為共用後端的 D3D11 狀態格式。desc 是宿主端複本，
+        // 著色器與輸入配置的指標仍指向客體記憶體；CreateGraphicsPipelineState 與 CreatePipelineState（子物件串流）共用。
+        std::string pipeline_error; // 最近一次建立失敗的原因（供診斷輸出）。
+        const auto create_graphics_pipeline=[&](const std::vector<std::uint8_t>& desc,std::uint64_t riid,std::uint64_t out)->std::uint32_t{
             const auto word=[&](std::size_t at){std::uint32_t value;std::memcpy(&value,desc.data()+at,4);return value;};
             const auto quad=[&](std::size_t at){std::uint64_t value;std::memcpy(&value,desc.data()+at,8);return value;};
             // DS（40）與 HS（56）要成對；串流輸出（88）尚未對應到 D3D12。
-            if(quad(88) || !quad(8) || !quad(16) || (quad(40) && quad(48))!=(quad(56) && quad(64)))return finish(invalid);
+            // 串流輸出以條目數判定（NumEntries 為 0 時宣告指標可為任意值）。
+            const bool stream_output=quad(88) && word(96);
+            if(stream_output || !quad(8) || !quad(16) || (quad(40) && quad(48))!=(quad(56) && quad(64))){
+                pipeline_error=stream_output?"串流輸出":!quad(8) || !quad(16)?"缺少頂點著色器":"外殼／域著色器不成對";return invalid;}
             D3D12State::Pipeline pipeline;pipeline.root=quad(0);
             static std::atomic<std::uint64_t> pipeline_serials{0};pipeline.serial=pipeline_serials.fetch_add(1,std::memory_order_relaxed)+1;
             try{
@@ -1854,7 +1903,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 if(quad(72) && quad(80))pipeline.geometry=native.graphics_shader(2,bytes(quad(72),static_cast<std::size_t>(std::min<std::uint64_t>(quad(80),16U*1024U*1024U))));
                 if(quad(56) && quad(64))pipeline.hull=native.graphics_shader(3,bytes(quad(56),static_cast<std::size_t>(std::min<std::uint64_t>(quad(64),16U*1024U*1024U))));
                 if(quad(40) && quad(48))pipeline.domain=native.graphics_shader(4,bytes(quad(40),static_cast<std::size_t>(std::min<std::uint64_t>(quad(48),16U*1024U*1024U))));
-            }catch(const std::exception& error){trace("[d3d12] CreateGraphicsPipelineState 失敗：%s\n",error.what());runtime_.module_events.push_back(std::string("d3d12_note=CreateGraphicsPipelineState 失敗：")+error.what());return finish(invalid);}
+            }catch(const std::exception& error){pipeline_error=error.what();trace("[d3d12] CreateGraphicsPipelineState 失敗：%s\n",error.what());runtime_.module_events.push_back(std::string("d3d12_note=CreateGraphicsPipelineState 失敗：")+error.what());return invalid;}
             // D3D12 render target blend（40 bytes）→ D3D11（32 bytes）。
             pipeline.blend.assign(8+8*32,0);std::memcpy(pipeline.blend.data(),desc.data()+120,8);
             for(unsigned i=0;i<8;++i){const auto from=128+i*40,to=8+i*32;std::memcpy(pipeline.blend.data()+to,desc.data()+from,4);std::memcpy(pipeline.blend.data()+to+4,desc.data()+from+8,24);pipeline.blend[to+28]=desc[from+36];}
@@ -1870,8 +1919,105 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 if(element.offset==UINT32_MAX)element.offset=append[element.slot];
                 append[element.slot]=element.offset+std::max(1U,graphics_format_bytes(element.format));pipeline.layout.push_back(std::move(element));
             }
-            if(!arg(3))return finish(false_ok);
-            const auto object=create(Kind::Pipeline,self);bridge.pipelines[object]=std::move(pipeline);return finish(give(object,arg(2),arg(3)));
+            if(!out)return false_ok;
+            const auto object=create(Kind::Pipeline,self);bridge.pipelines[object]=std::move(pipeline);return give(object,riid,out);
+        };
+        const auto create_compute_pipeline=[&](std::uint64_t root,std::uint64_t code,std::uint64_t size,std::uint64_t riid,std::uint64_t out)->std::uint32_t{
+            if(!code || !size || size>16U*1024U*1024U)return invalid;
+            std::shared_ptr<GraphicsShader> shader;
+            try{shader=native.graphics_shader(5,bytes(code,static_cast<std::size_t>(size)));}
+            catch(const std::exception& error){runtime_.module_events.push_back(std::string("d3d12_note=CreateComputePipelineState 失敗：")+error.what());return invalid;}
+            if(!out)return false_ok;
+            const auto object=create(Kind::Pipeline,self);D3D12State::Pipeline compute;compute.compute=true;compute.root=root;compute.shader=std::move(shader);bridge.pipelines[object]=std::move(compute);return give(object,riid,out);
+        };
+        if(member=="CreateGraphicsPipelineState"){
+            if(!arg(1))return finish(invalid);
+            return finish(create_graphics_pipeline(bytes(arg(1),656),arg(2),arg(3)));
+        }
+        if(member=="CreatePipelineState"){
+            // ID3D12Device2::CreatePipelineState：D3D12_PIPELINE_STATE_STREAM_DESC{SizeInBytes, pPipelineStateSubobjectStream}。
+            // 串流由子物件依序組成：4 bytes 型別，內層結構依自身對齊放置，整個子物件再對齊到指標大小（CD3DX12 的 alignas(void*)）。
+            // 每種子物件至多一次；未給的狀態套用 D3D12 預設值，轉成圖形或運算管線描述後走同一條建立流程。
+            if(!arg(1))return finish(invalid);
+            const auto stream_size=load(arg(1),64),stream=load(arg(1)+8,64);
+            if(!stream || !stream_size || stream_size>(UINT64_C(1)<<20))return finish(invalid);
+            const auto data=bytes(stream,static_cast<std::size_t>(stream_size));
+            // 診斷（X64ARM_TRACE_GRAPHICS_ERRORS=1）：拒絕時印出原因與已解析的子物件型別。
+            std::string parsed_types;
+            const auto reject=[&](const char* reason,std::uint32_t value){
+                static std::atomic<unsigned> printed{0};
+                if(trace_graphics_errors && printed.fetch_add(1,std::memory_order_relaxed)<24)
+                    std::fprintf(stderr,"[d3d12] CreatePipelineState 拒絕：%s value=%u size=%llu types=%s detail=%.400s\n",reason,value,static_cast<unsigned long long>(stream_size),parsed_types.c_str(),pipeline_error.c_str());
+                return finish(invalid);
+            };
+            // 內層結構大小、對齊與在 656 bytes 圖形描述中的位移（依 d3d12.h 的 x64 版面；kSpecial 表示需轉換的子物件）。
+            constexpr std::uint16_t kSpecial=0xffff,kInvalid=0xfffe;
+            struct Subobject{std::uint16_t size,align,offset;};
+            static constexpr std::array<Subobject,30> layout{{
+                {8,8,0},{16,8,8},{16,8,24},{16,8,40},{16,8,56},{16,8,72},{16,8,kSpecial},  // ROOT_SIGNATURE、VS、PS、DS、HS、GS、CS
+                {32,8,88},{328,4,120},{4,4,448},{44,4,452},{52,4,496},{16,8,552},          // STREAM_OUTPUT、BLEND、SAMPLE_MASK、RASTERIZER、DEPTH_STENCIL、INPUT_LAYOUT
+                {4,4,568},{4,4,572},{36,4,kSpecial},{4,4,612},{8,4,616},{4,4,624},          // IB_STRIP_CUT_VALUE、PRIMITIVE_TOPOLOGY、RENDER_TARGET_FORMATS、DEPTH_STENCIL_FORMAT、SAMPLE_DESC、NODE_MASK
+                {16,8,632},{4,4,648},{56,4,kSpecial},{24,8,kSpecial},{0,0,kInvalid},       // CACHED_PSO、FLAGS、DEPTH_STENCIL1、VIEW_INSTANCING、（23 未定義）
+                {16,8,kSpecial},{16,8,kSpecial},{60,4,kSpecial},{44,4,kSpecial},{40,4,kSpecial},{16,8,kSpecial}}}; // AS、MS、DEPTH_STENCIL2、RASTERIZER1、RASTERIZER2、SERIALIZED_ROOT_SIGNATURE
+            std::vector<std::uint8_t> desc(656,0);
+            const auto put32=[&](std::size_t at,std::uint32_t value){std::memcpy(desc.data()+at,&value,4);};
+            // D3D12 預設：混合不啟用、寫入全部通道；取樣遮罩全開；實心、背面剔除、深度裁切；深度測試 LESS 並寫入；取樣 1×。
+            for(unsigned i=0;i<8;++i){const auto rt=128+i*40;put32(rt+8,2);put32(rt+12,1);put32(rt+16,1);put32(rt+20,2);put32(rt+24,1);put32(rt+28,1);put32(rt+32,4);desc[rt+36]=0x0f;}
+            put32(448,0xffffffffU);put32(452,3);put32(456,3);put32(452+24,1);
+            put32(496,1);put32(500,1);put32(504,2);desc[512]=0xff;desc[513]=0xff;
+            for(const std::size_t face:{516U,532U}){put32(face,1);put32(face+4,1);put32(face+8,1);put32(face+12,8);}
+            put32(616,1);
+            std::uint32_t seen=0;std::uint64_t compute_code=0,compute_size=0;
+            for(std::size_t at=0;at<data.size();){
+                if(data.size()-at<4)return reject("串流尾端不足一個型別",static_cast<std::uint32_t>(at));
+                std::uint32_t type;std::memcpy(&type,data.data()+at,4);
+                if(type>=layout.size() || layout[type].offset==kInvalid)return reject("未定義的子物件型別",type);
+                if(seen&(1U<<type))return reject("子物件重複",type);
+                parsed_types+=std::to_string(type)+",";
+                seen|=1U<<type;const auto& sub=layout[type];
+                const auto inner=(at+4+sub.align-1)&~std::size_t{sub.align-1U};
+                if(inner+sub.size>data.size())return reject("子物件超出串流",type);
+                const auto* const src=data.data()+inner;
+                const auto get32=[&](std::size_t offset){std::uint32_t value;std::memcpy(&value,src+offset,4);return value;};
+                const auto get64=[&](std::size_t offset){std::uint64_t value;std::memcpy(&value,src+offset,8);return value;};
+                if(sub.offset!=kSpecial)std::memcpy(desc.data()+sub.offset,src,sub.size);
+                else switch(type){
+                case 6:compute_code=get64(0);compute_size=get64(8);break;
+                case 15:std::memcpy(desc.data()+580,src,32);std::memcpy(desc.data()+576,src+32,4);break; // RT 格式在前、數量在後；圖形描述相反。
+                case 21:if(get32(52)){return reject("深度邊界測試",type);}std::memcpy(desc.data()+496,src,52);break;   // 深度邊界測試回報不支援（OPTIONS2）。
+                case 22:if(get32(0)){return reject("視角實例化",get32(0));}break;                                        // 視角實例化回報 tier 0（OPTIONS3）。
+                case 24:case 25:if(get64(0) || get64(8)){return reject("mesh／amplification shader",type);}break;                    // mesh／amplification shader 回報 tier 0（OPTIONS7）。
+                case 26:{
+                    // DEPTH_STENCIL_DESC2：前後面各自的模板遮罩；未支援各自遮罩時兩面須相同。
+                    if(get32(56) || src[32]!=src[52] || src[33]!=src[53])return reject("DEPTH_STENCIL2 深度邊界或前後遮罩不同",type);
+                    std::memcpy(desc.data()+496,src,16);desc[512]=src[32];desc[513]=src[33];
+                    std::memcpy(desc.data()+516,src+16,16);std::memcpy(desc.data()+532,src+36,16);break;
+                }
+                case 27:case 28:{
+                    // RASTERIZER1／2 的 DepthBias 為浮點；2 以 LineRasterizationMode 取代多重取樣／反鋸齒線兩個布林。
+                    float bias;std::memcpy(&bias,src+12,4);std::memcpy(desc.data()+452,src,12);
+                    put32(452+12,static_cast<std::uint32_t>(static_cast<std::int32_t>(std::lround(bias))));std::memcpy(desc.data()+452+16,src+16,12);
+                    if(type==27)std::memcpy(desc.data()+452+28,src+28,16);
+                    else{const auto line=get32(28);put32(452+28,line==2 || line==3?1U:0U);put32(452+32,line==1?1U:0U);std::memcpy(desc.data()+452+36,src+32,8);}
+                    break;
+                }
+                case 29:report(std::string(symbol)+"(SERIALIZED_ROOT_SIGNATURE)");return finish(invalid);
+                }
+                at=(inner+sub.size+7)&~std::size_t{7};
+            }
+            // 依非空的著色器位元組碼判斷管線種類（D3D12 規則）：引擎常用同一個帶齊全部子物件的串流，未用的階段給空位元組碼。
+            const auto has_shader=[&](std::size_t offset){std::uint64_t code,length;std::memcpy(&code,desc.data()+offset,8);std::memcpy(&length,desc.data()+offset+8,8);return code && length;};
+            if(compute_code && compute_size){
+                // 運算管線：圖形狀態子物件可出現但不使用；不可同時給圖形著色器。
+                if(has_shader(8) || has_shader(24) || has_shader(40) || has_shader(56) || has_shader(72))return reject("運算與圖形著色器並存",seen);
+                std::uint64_t root;std::memcpy(&root,desc.data(),8);
+                const auto result=create_compute_pipeline(root,compute_code,compute_size,arg(2),arg(3));
+                if(result==invalid)return reject("運算管線建立失敗",static_cast<std::uint32_t>(compute_size));
+                return finish(result);
+            }
+            const auto result=create_graphics_pipeline(desc,arg(2),arg(3));
+            if(result==invalid)return reject("圖形管線建立失敗",0);
+            return finish(result);
         }
         if(member=="CreateRenderTargetView" || member=="CreateDepthStencilView"){
             const bool depth=member=="CreateDepthStencilView";auto write=write_descriptor(arg(3));if(!write)return finish(0);auto* const target=&write.value;
@@ -1900,13 +2046,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         }
         if(member=="CreateComputePipelineState"){
             if(!arg(1))return finish(invalid);
-            const auto root=load(arg(1),64),code=load(arg(1)+8,64),size=load(arg(1)+16,64);
-            if(!code || !size || size>16U*1024U*1024U)return finish(invalid);
-            std::shared_ptr<GraphicsShader> shader;
-            try{shader=native.graphics_shader(5,bytes(code,static_cast<std::size_t>(size)));}
-            catch(const std::exception& error){runtime_.module_events.push_back(std::string("d3d12_note=CreateComputePipelineState 失敗：")+error.what());return finish(invalid);}
-            if(!arg(3))return finish(false_ok);
-            const auto object=create(Kind::Pipeline,self);D3D12State::Pipeline compute;compute.compute=true;compute.root=root;compute.shader=std::move(shader);bridge.pipelines[object]=std::move(compute);return finish(give(object,arg(2),arg(3)));
+            return finish(create_compute_pipeline(load(arg(1),64),load(arg(1)+8,64),load(arg(1)+16,64),arg(2),arg(3)));
         }
         // 建立資源：cpu_base 為 placed 緩衝在 CPU 可見堆積中的位址（0 表示自行配置）。
         // 零複製映射：配置宿主分頁並映入客體（配置粒度 64 KiB）；失敗回傳位址 0，呼叫端改用客體堆積後備。
@@ -2337,10 +2477,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
     }
     if(kind==Kind::Queue){
         if(member=="GetTimestampFrequency"){
-            // 與 EndQuery(TIMESTAMP) 使用同一時基：後端支援 GPU 時戳時取其頻率，否則為宿主奈秒。
-            if(!arg(1))return finish(pointer_error);std::uint64_t frequency=1000000000;
-            try{if(native.graphics_timestamp_supported())frequency=native.graphics_timestamp().frequency;}catch(const std::exception&){}
-            store(arg(1),64,frequency);return finish(ok);
+            // 與 EndQuery(TIMESTAMP) 使用同一時基：後端的 GPU 時間戳與不支援時的宿主備援都以奈秒回報（GraphicsTimestamp 預設頻率），
+            // 頻率是常數，不取樣。原本每次呼叫都取一次 GPU 時間戳，等 GPU 做完全部在途工作（RE8 每幀一次、每次約 5 ms）。
+            if(!arg(1))return finish(pointer_error);
+            store(arg(1),64,GraphicsTimestamp{}.frequency);return finish(ok);
         }
         if(member=="GetDesc"){if(arg(1)){store(arg(1),32,bridge.queues.at(self));store(arg(1)+4,32,0);store(arg(1)+8,32,0);store(arg(1)+12,32,0);}return finish(arg(1));}
         if(member=="Wait")return finish(ok);

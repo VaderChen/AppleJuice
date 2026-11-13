@@ -110,7 +110,7 @@ else if(name.starts_with("V_")){
     if(name=="C_GetCharacteristics")put(arg(1),item->file_source?6:5);
     else if(name=="C_CreatePresentationDescriptor"){
         out(arg(1));const auto original=object(item->children.at(0),mf::Presentation);const auto p=make(mf::Presentation);auto clone=object(p,mf::Presentation);clone->children=original->children;clone->selected=original->selected;for(const auto child:clone->children)hold(child);for(const auto& [key,value]:original->attributes)set(*clone,key,value);put(arg(1),p,bits);
-    }else if(name=="C_Start" && item->file_source && item->file_source->movie)movie_source_start(item,arg(1),arg(2),arg(3));
+    }else if(name=="C_Start" && item->file_source && (item->file_source->movie || item->file_source->asf))movie_source_start(item,arg(1),arg(2),arg(3));
     else if(name=="C_Start"){
         const auto presentation=object(arg(1),mf::Presentation);require(presentation->children.size()==1 && presentation->selected.at(0),0xc00d36b2U);require(!arg(2) || guid(arg(2))==Guid{},0xc00d36c5U);const auto position=read_value(arg(3));require(position.type==0 || (position.type==20 && std::bit_cast<std::int64_t>(position.scalar)>=0 && (item->file_source || position.scalar==0)),0xc00d36b2U);
         source_start(item);if(!item->state){const auto p=make(mf::MediaStream);auto stream=object(p,mf::MediaStream);stream->parent=item->pointers.at(mf::Source);hold(stream->parent);stream->children={presentation->children.at(0)};hold(stream->children.at(0));item->state=p;Value value;value.type=13;value.scalar=p;queue_event(item,205,value);}else {Value value;value.type=13;value.scalar=item->state;queue_event(item,206,value);}
@@ -125,6 +125,9 @@ else if(name.starts_with("V_")){
     else if(name=="W_RequestSample"){auto source=object(item->parent,mf::Source);require(source->streaming,0xc00d36b2U);require(!item->request_pending,0xc00d36b5U);hold(arg(1));item->pending_token=arg(1);item->request_pending=true;hold_job(item);}
 }else if(name.starts_with("L_")){
     require(item->kind==mf::Reader,no_interface);auto source=object(item->parent,mf::Source);require(!source->closed,shutdown);
+    if(source->file_source && source->file_source->asf){
+        #include "mf_asf_reader_methods.inc"
+    }else{
     const auto stream=[&](unsigned n,bool all=false){require(d(n)==0 || d(n)==0xfffffffdU || (all && d(n)==0xfffffffeU),0xc00d36b3U);};
     if(name=="L_GetStreamSelection"){stream(1);put(arg(2),item->selected.at(0));}
     else if(name=="L_SetStreamSelection"){stream(1,true);require(!item->request_pending && !item->file_read_active,0xc00d36b2U);item->selected[0]=d(2)!=0;}
@@ -159,4 +162,5 @@ else if(name.starts_with("V_")){
         if(d(1)==UINT32_MAX && guid(arg(2))==mf::MF_SOURCE_READER_MEDIASOURCE_CHARACTERISTICS)write_value(arg(3),value32(source->file_source?6:5));
         else if(d(1)==UINT32_MAX)write_value(arg(3),get(*object(source->children.at(0),mf::Presentation),guid(arg(2))));else {stream(1);write_value(arg(3),get(*object(object(source->children.at(0),mf::Presentation)->children.at(0),mf::Stream),guid(arg(2))));}
     }else throw Failure{no_interface};
+    }
 }

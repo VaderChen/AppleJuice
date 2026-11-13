@@ -22,6 +22,8 @@ std::optional<std::array<std::uint8_t,16>> native_system_power_information();
 std::optional<std::vector<std::array<std::uint32_t,6>>> native_processor_power_information(unsigned count);
 // ACPI 角色不可得時，依實際內建電池採用 Windows 的 mobile／desktop 備援規則。
 std::optional<std::uint32_t> native_power_role();
+// 宿主內建（整合式）顯示器的對角線英吋數；沒有內建顯示器（桌上型主機）或無法取得時回空值。
+std::optional<double> native_integrated_display_inches();
 std::uint32_t native_suspend_system(bool hibernate,bool disable_wake_events);
 struct NativePowerSourcePreferences {
     bool present{};

@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <map>
+#include <regex>
 #include <mutex>
 
 namespace x64arm {
@@ -34,15 +35,16 @@ unsigned classify(std::span<const std::uint8_t> bytes){
 bool graphics_modern_shader_required(std::span<const std::uint8_t> bytes){return classify(bytes)==1;}
 static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes){
     static std::mutex lock;const std::lock_guard guard(lock);
-    if(stage!=0 && stage!=1 && stage!=5)throw std::invalid_argument("現代著色器目前支援 VS／PS／CS");
     if(!graphics_modern_shader_required(bytes))throw std::invalid_argument("著色器不是 DXIL 或 SM5.1 DXBC");
     if(const char* directory=std::getenv("X64ARM_DUMP_DXBC");directory && *directory){
-        // 與 SM4／5 相同的診斷開關：保存原始容器，供 d3d12_shader_corpus 離線重現轉譯。
+        // 與 SM4／5 相同的診斷開關：保存原始容器，供 d3d12_shader_corpus 離線重現轉譯（尚未支援的階段也保存）。
         static std::atomic<std::uint64_t> sequence{};
         const auto path=std::filesystem::path(directory)/(std::to_string(getpid())+"-"+std::to_string(++sequence)+"-stage"+std::to_string(stage)+".dxil");
         std::filesystem::create_directories(path.parent_path());std::ofstream output(path,std::ios::binary);
         output.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));
     }
+    if(stage!=0 && stage!=1 && stage!=5)
+        throw std::invalid_argument("現代著色器目前支援 VS／PS／CS（階段 "+std::to_string(stage)+(stage==2?" GS":stage==3?" HS":stage==4?" DS":"")+"）");
     bool dxil=false;
     for(unsigned i=0;i<word(bytes,28);++i)if(word(bytes,word(bytes,32+4*i))==0x4c495844U)dxil=true;
     struct Scan {
@@ -211,11 +213,17 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
     }
     if(stage==5)for(unsigned i=0;i<3;++i)result.threads[i]=std::max(1U,compiler.get_execution_mode_argument(spv::ExecutionModeLocalSize,i));
     compiler.rename_entry_point("main","xlatMtlMain",model);result.source=compiler.compile();result.entry="xlatMtlMain";
+    // Metal 沒有 64 位元浮點，裝置也回報 DoublePrecisionFloatShaderOps=FALSE；DXIL 轉譯仍可能為布林轉換產生 double
+    // （例如 float(double(a<b)*double(c<d))）。整個字詞換成對應的 float 型別，這類用法的結果不變。
+    if(result.source.find("double")!=std::string::npos){
+        static const std::regex type(R"(\bdouble([234](x[234])?)?\b)");
+        result.source=std::regex_replace(result.source,type,"float$1");
+    }
     return result;
 }
 namespace {
 // 跨程序快取的記錄格式（格式版本、MSL、入口、綁定、頂點輸入、執行緒群組大小）；欄位全部以小端 32 位元長度前綴。
-constexpr std::uint32_t modern_record_version=2; // 2：非零 space 與 UAV 計數器綁定。
+constexpr std::uint32_t modern_record_version=3; // 2：非零 space 與 UAV 計數器綁定；3：double 降為 float（舊記錄可能含 Metal 不支援的 double）。
 std::vector<std::uint8_t> encode_modern_shader(const GraphicsModernShader& shader){
     std::vector<std::uint8_t> out;out.reserve(shader.source.size()+shader.bindings.size()*28+256);
     const auto put=[&](std::uint32_t value){const auto* bytes=reinterpret_cast<const std::uint8_t*>(&value);out.insert(out.end(),bytes,bytes+4);};
@@ -249,7 +257,7 @@ std::optional<GraphicsModernShader> decode_modern_shader(std::span<const std::ui
 // 翻譯結果只取決於（階段、bytecode）與翻譯器本身；跨程序快取命中時略過 vkd3d／SPIRV-Cross（電馭判客 PSO 載入的主要成本）。
 // 階段與格式檢查仍先做，失敗的翻譯不寫入快取。
 GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes){
-    if(stage!=0 && stage!=1 && stage!=5)throw std::invalid_argument("現代著色器目前支援 VS／PS／CS");
+    if(stage!=0 && stage!=1 && stage!=5)return translate_modern_shader(stage,bytes); // 尚未支援的階段：保存診斷傾印後丟出含階段的錯誤，不寫入快取。
     if(!graphics_modern_shader_required(bytes))throw std::invalid_argument("著色器不是 DXIL 或 SM5.1 DXBC");
     if(!detail::shader_memory_cache_enabled())return translate_modern_shader(stage,bytes);
     const auto key=detail::shader_cache_key(stage,bytes);

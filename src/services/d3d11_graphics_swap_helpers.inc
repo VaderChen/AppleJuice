@@ -10,21 +10,25 @@
             previous=std::move(swap->bindings["PresentResolve"]);swap->bindings["PresentResolve"]=std::move(resolved);for(auto pointer:previous)release_internal(pointer);
             swap->present_frame.reset();swap->present_spare.reset();
         };
-        const auto make_swap=[&](const std::shared_ptr<Identity>& device,std::uint64_t factory,std::uint64_t address,std::uint64_t window,bool desc1,std::uint64_t fullscreen_desc=0,std::uint64_t restricted=0){
+        // occluded 非空表示只建立顯示身分（D3D12 交換鏈用，device 為空）：不建立 Metal 後端與後方緩衝，緩衝與呈現由 D3D12 橋接層負責；
+        // 描述、目標模式、限制輸出與全螢幕進入沿用同一段。無法進入全螢幕時不丟例外，改設 *occluded 並維持視窗模式
+        //（CreateSwapChain 文件化行為：全螢幕不可用時建立視窗模式交換鏈並回 DXGI_STATUS_OCCLUDED）。
+        const auto make_swap=[&](const std::shared_ptr<Identity>& device,std::uint64_t factory,std::uint64_t address,std::uint64_t window,bool desc1,std::uint64_t fullscreen_desc=0,std::uint64_t restricted=0,bool* occluded=nullptr){
+            const bool display_only=occluded!=nullptr;
             auto desc=read_bytes(memory,address,desc1?48:x86_?60:72);std::uint32_t width=word(desc,0),height=word(desc,4),format=word(desc,desc1?8:16),count=word(desc,desc1?28:40);
             if(!desc1)window=memory.load(GuestAddress{address+(x86_?44:48)},pointer_bits);const auto local=gui_.windows.find(window);const auto remote=local==gui_.windows.end()?shared_gui_window(window):std::nullopt;require(local!=gui_.windows.end() || remote.has_value());if(!width)width=remote?remote->width:local->second.width;if(!height)height=remote?remote->height:local->second.height;if(!format)format=87;
             const auto samples=word(desc,desc1?16:28),effect=word(desc,desc1?36:x86_?52:60);
-            require(samples && (samples==1 || effect==0) && !word(desc,desc1?20:32) && (word(desc,desc1?24:36)&0x20) && (!desc1 || !word(desc,12)));
+            require(display_only || (samples && (samples==1 || effect==0) && !word(desc,desc1?20:32) && (word(desc,desc1?24:36)&0x20) && (!desc1 || !word(desc,12))));
             if(restricted)(void)typed(restricted,Kind::Output);
             const auto fs=fullscreen_desc?read_bytes(memory,fullscreen_desc,20):std::vector<std::uint8_t>{};
             const bool fullscreen=desc1?(!fs.empty() && !word(fs,16)):!word(desc,x86_?48:56);
             if(!factory)factory=object(device_adapter(device)).identity->device;
-            auto swap=create(Kind::SwapChain,device->root);swap->window=window;swap->factory=factory;if(factory)hold(factory);
+            auto swap=create(Kind::SwapChain,display_only?0:device->root);swap->window=window;swap->factory=factory;if(factory)hold(factory);
             // device 的繪製 queue 共用；HWND／尺寸／drawable 則由各交換鏈獨立持有。
-            try{swap->native=make_metal_opengl(nullptr,1,1);swap_buffers(swap,width,height,format,count,word(desc,desc1?24:36),samples);swap->desc.resize(x86_?60:72);if(!desc1)std::copy_n(desc.begin(),28,swap->desc.begin());else if(!fs.empty()){std::copy_n(fs.begin(),8,swap->desc.begin()+8);put_word(swap->desc,20,word(fs,8));put_word(swap->desc,24,word(fs,12));}put_word(swap->desc,0,width);put_word(swap->desc,4,height);put_word(swap->desc,16,format);put_word(swap->desc,28,samples);put_word(swap->desc,36,word(desc,desc1?24:36));put_word(swap->desc,40,count);std::memcpy(swap->desc.data()+(x86_?44:48),&window,pointer_size);put_word(swap->desc,x86_?48:56,1);put_word(swap->desc,x86_?52:60,word(desc,desc1?36:x86_?52:60));put_word(swap->desc,x86_?56:64,word(desc,desc1?44:x86_?56:64));
+            try{if(!display_only){swap->native=make_metal_opengl(nullptr,1,1);swap_buffers(swap,width,height,format,count,word(desc,desc1?24:36),samples);}swap->desc.resize(x86_?60:72);if(!desc1)std::copy_n(desc.begin(),28,swap->desc.begin());else if(!fs.empty()){std::copy_n(fs.begin(),8,swap->desc.begin()+8);put_word(swap->desc,20,word(fs,8));put_word(swap->desc,24,word(fs,12));}put_word(swap->desc,0,width);put_word(swap->desc,4,height);put_word(swap->desc,16,format);put_word(swap->desc,28,samples);put_word(swap->desc,36,word(desc,desc1?24:36));put_word(swap->desc,40,count);std::memcpy(swap->desc.data()+(x86_?44:48),&window,pointer_size);put_word(swap->desc,x86_?48:56,1);put_word(swap->desc,x86_?52:60,word(desc,desc1?36:x86_?52:60));put_word(swap->desc,x86_?56:64,word(desc,desc1?44:x86_?56:64));
                 swap->target_mode.assign(swap->desc.begin(),swap->desc.begin()+28);if(restricted){hold(restricted);swap->bindings["RestrictOutput"]={restricted};}
-                if(fullscreen){const auto status=set_fullscreen(swap,true,restricted);if(status)throw WindowPresentationFault("建立全螢幕交換鏈失敗");}
-                if(std::getenv("X64ARM_TRACE_DXGI_STATE"))std::fprintf(stderr,"[dxgi] create swap=%llx window=%llx size=%ux%u fullscreen=%u buffer=%p\n",static_cast<unsigned long long>(swap->root),static_cast<unsigned long long>(window),width,height,swap->fullscreen,object(swap->bindings.at("Backbuffers")[0]).identity->resource.get());
+                if(fullscreen){const auto status=set_fullscreen(swap,true,restricted);if(status){if(!display_only)throw WindowPresentationFault("建立全螢幕交換鏈失敗");*occluded=true;}}
+                if(std::getenv("X64ARM_TRACE_DXGI_STATE"))std::fprintf(stderr,"[dxgi] create swap=%llx window=%llx size=%ux%u fullscreen=%u buffer=%p\n",static_cast<unsigned long long>(swap->root),static_cast<unsigned long long>(window),width,height,swap->fullscreen,display_only?nullptr:static_cast<const void*>(object(swap->bindings.at("Backbuffers")[0]).identity->resource.get()));
             }
             catch(...){release(swap->root);throw;}return swap;
         };

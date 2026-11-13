@@ -44,6 +44,7 @@ class RegistryTransaction {
     int lock_{-1};
     RegistryStoreCache* cache_{};
     bool readonly_{};
+    bool lockless_{}; // 唯讀交易以檔案戳記確認快取仍是最新、沒有取跨程序鎖（見建構函式）；不可提交或 flush。
 public:
     std::uint32_t error{};
     RegistryTransaction(RegistryState&,const std::filesystem::path&,RegistryStoreCache* = nullptr,bool readonly = false);

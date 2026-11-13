@@ -128,7 +128,7 @@
             graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);require(arg(1));output(1);write_pointer(arg(1),0);
             if(!native_gui_ || !native_gui_->current_display_mode())result=not_found;
             else if(swap->fullscreen_output){hold(swap->fullscreen_output);write_pointer(arg(1),swap->fullscreen_output);}
-            else write_pointer(arg(1),create_output(device_adapter(object(swap->device).identity)));
+            else write_pointer(arg(1),create_output(swap_adapter(swap)));
         }else if(!graphics_handled && symbol=="GetFullscreenState"){
             graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);if(arg(1))memory.store(GuestAddress{arg(1)},32,swap->fullscreen?1:0);
             if(arg(2)){output(2);if(swap->fullscreen_output)hold(swap->fullscreen_output);write_pointer(arg(2),swap->fullscreen_output);}
@@ -136,8 +136,7 @@
             graphics_handled=true;const auto swap=typed(arg(0),Kind::SwapChain);result=set_fullscreen(swap,u32(1)!=0,arg(2));
             if(!result && u32(1))fullscreen_activation=swap->window;
         }else if(!graphics_handled && symbol=="GetFullscreenDesc"){
-            graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);require(arg(1));std::vector<std::uint8_t> desc(20);
-            std::copy_n(swap->target_mode.begin()+8,8,desc.begin());put_word(desc,8,word(swap->target_mode,20));put_word(desc,12,word(swap->target_mode,24));put_word(desc,16,swap->fullscreen?0:1);memory.write(GuestAddress{arg(1)},desc);
+            graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);require(arg(1));memory.write(GuestAddress{arg(1)},swap_fullscreen_desc(*swap));
         }else if(!graphics_handled && symbol=="ResizeTarget"){
             graphics_handled=true;auto swap=typed(arg(0),Kind::SwapChain);require(arg(1));auto desired=read_bytes(memory,arg(1),28);
             require(word(desired,0) && word(desired,4) && word(desired,0)<=16384 && word(desired,4)<=16384 && (!word(desired,8) || word(desired,12)) && word(desired,20)<=3 && word(desired,24)<=2);

@@ -1,8 +1,9 @@
-Support-level icons (none.png, menu.png, slow.png, good.png)
+Support-level icons (none.png, menu.png, slow.png, good.png, metalfx.png)
 
 Derived from Google Material Icons, round style: close, change_history and
 radio_button_unchecked (https://github.com/google/material-design-icons).
 Licensed under the Apache License, Version 2.0; see LICENSE in this folder.
 
 Modifications for AppleJuice: cropped, resized to a common visual size and
-recolored; good.png adds an inner ring to form a double circle.
+recolored; good.png adds an inner ring to form a double circle, and metalfx.png
+is good.png recolored orange.

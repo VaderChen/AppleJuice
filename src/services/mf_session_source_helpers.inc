@@ -63,7 +63,13 @@ const auto movie_source_start=[&](const std::shared_ptr<Object>& source,std::uin
     const auto presentation=object(presentation_pointer,mf::Presentation);const auto original=object(source->children.at(0),mf::Presentation);
     require(presentation->children==original->children,0xc00d36b2U);require(!format || guid(format)==Guid{},0xc00d36c5U);
     const auto position=read_value(position_pointer);require(position.type==0 || (position.type==20 && std::bit_cast<std::int64_t>(position.scalar)>=0),0xc00d36b2U);
-    const bool seek=position.type==20,was_streaming=source->streaming;source_start(source);
+    const bool seek=position.type==20,was_streaming=source->streaming;
+    // ASF：解多工由整個來源共用，跳轉（或從停止狀態重新開始）先完成；客體 byte stream 的讀取可能重新進入本呼叫，須在送出任何事件之前。
+    if(source->file_source->asf){
+        if(seek || !was_streaming)(void)asf_io(source->file_source,AsfOp::Seek,0,seek?std::bit_cast<std::int64_t>(position.scalar):0);
+        asf_select(source->file_source,presentation->selected);
+    }
+    source_start(source);
     std::vector<std::uint64_t> active;
     for(std::size_t n=0;n<presentation->children.size();++n){
         if(!presentation->selected[n])continue;const auto descriptor=presentation->children[n];
@@ -74,9 +80,13 @@ const auto movie_source_start=[&](const std::shared_ptr<Object>& source,std::uin
             source->media_streams.push_back(pointer);value.scalar=pointer;queue_event(source,205,value);
         }else{pointer=*found;value.scalar=pointer;queue_event(source,206,value);}
         if(seek){
-            auto stream=object(pointer,mf::MediaStream);const auto& samples=source->file_source->movie->tracks.at(stream->identifier).samples;std::uint64_t key=0;const auto at=std::bit_cast<std::int64_t>(position.scalar);
-            for(std::size_t i=0;i<samples.size();++i)if(samples[i].key && samples[i].time<=at)key=i;
-            stream->read_frames=key;stream->flags&=~1U;
+            auto stream=object(pointer,mf::MediaStream);
+            if(source->file_source->movie){
+                const auto& samples=source->file_source->movie->tracks.at(stream->identifier).samples;std::uint64_t key=0;const auto at=std::bit_cast<std::int64_t>(position.scalar);
+                for(std::size_t i=0;i<samples.size();++i)if(samples[i].key && samples[i].time<=at)key=i;
+                stream->read_frames=key;
+            }
+            stream->flags&=~1U;
         }else if(!was_streaming){auto stream=object(pointer,mf::MediaStream);stream->read_frames=0;stream->flags&=~1U;}
         active.push_back(pointer);
     }

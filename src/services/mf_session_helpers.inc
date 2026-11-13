@@ -86,6 +86,8 @@ const auto session_resolve=[&](std::uint64_t topology_pointer){
             std::shared_ptr<Object> requested;if(activate->output_type)requested=object(activate->output_type,mf::MediaType);
             const auto find=[&](const Guid& key,std::uint32_t type)->const Value*{if(!requested)return nullptr;const auto found=requested->attributes.find(key);return found!=requested->attributes.end() && found->second.type==type?&found->second:nullptr;};
             if(const auto* value=find(mf::MF_MT_MAJOR_TYPE,72))require(value->id==major,0xc00d5212U);
+            // Media Session 一律輸出解碼後的資料；ASF 內容是否有解碼器由同一個判斷點決定。
+            if(m->file->asf)asf_require_decoder(*native,requested.get());
             const auto subtype=find(mf::MF_MT_SUBTYPE,72)?find(mf::MF_MT_SUBTYPE,72)->id:Guid{};
             if(major==mf::MFMediaType_Video){
                 m->video=true;require(!m->renderer && m->track && m->track->video && (m->track->codec==mf::fourcc('a','v','c','1') || m->track->codec==mf::fourcc('a','v','c','3')) && video::hardware_decode_supported(video::Codec::H264),0xc00d5212U);

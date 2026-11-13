@@ -8,6 +8,10 @@ struct MetalFrameInterpolation {
     // 把 current（任何可取樣的 RGB 貼圖，內容是已編碼的顯示值）記為最新畫面，並回傳「上一張與這一張中間」的生成畫面；
     // 第一張、尚未就緒或失敗時回傳 nil。回傳的貼圖在下一次 encode 之前有效。
     virtual id<MTLTexture> encode(id<MTLCommandBuffer> commands,id<MTLTexture> current)=0;
+    // 分兩段編碼（診斷與同步模式用）：convert 只把 current 轉成內插器的來源平面並回傳是否要接著內插；
+    // interpolate 編入內插與轉回 RGB。兩段之間呼叫端可先提交並等待 GPU 完成。
+    virtual bool convert(id<MTLCommandBuffer> commands,id<MTLTexture> current)=0;
+    virtual id<MTLTexture> interpolate(id<MTLCommandBuffer> commands,id<MTLTexture> current)=0;
 };
 inline bool metal_frame_interpolation_wanted() noexcept {
     static const bool value=[] {const char* text=std::getenv("X64ARM_PRESENT_INTERPOLATION");return text && std::string_view(text)=="1";}();
@@ -18,6 +22,13 @@ public:
     MetalVideoFrameInterpolation(id<MTLDevice> device,unsigned width,unsigned height,MTLPixelFormat output_format){ try {
         // 內插器要偶數寬高：奇數尺寸的交換鏈（例如 1281×721）以少一個像素的 NV12 緩衝處理，轉換著色器依正規化座標取樣，輸出仍是原尺寸。
         const unsigned output_width=width,output_height=height;width&=~1U;height&=~1U;
+        // 內插的運算量與像素數成正比（1080p 約為 720p 的三倍多，會把 GPU 拖到真實幀率減半以下）：來源超過 1280×720 時
+        // 先等比例縮小到這個像素數再內插，生成畫面放大回原尺寸；真實畫面不經過這條路徑。X64ARM_PRESENT_INTERPOLATION_FULL=1 維持原尺寸。
+        static const bool full=[] {const char* text=std::getenv("X64ARM_PRESENT_INTERPOLATION_FULL");return text && std::string_view(text)=="1";}();
+        if(constexpr std::uint64_t limit=1280ULL*720ULL;!full && std::uint64_t{width}*height>limit){
+            const double scale=std::sqrt(static_cast<double>(limit)/(static_cast<double>(width)*height));
+            width=std::max(2U,static_cast<unsigned>(width*scale)&~1U);height=std::max(2U,static_cast<unsigned>(height*scale)&~1U);
+        }
         auto configuration=[[VTLowLatencyFrameInterpolationConfiguration alloc] initWithFrameWidth:width frameHeight:height numberOfInterpolatedFrames:1];
         if(!configuration)throw std::runtime_error("畫面內插不支援此解析度");
         NSMutableDictionary* source=[configuration.sourcePixelBufferAttributes mutableCopy];source[(id)kCVPixelBufferMetalCompatibilityKey]=@YES;
@@ -42,9 +53,12 @@ constant sampler linear_sampler(filter::linear,address::clamp_to_edge);
 fragment float4 to_luma(Out in [[stage_in]],texture2d<float> rgb [[texture(0)]]){float3 c=rgb.sample(linear_sampler,in.uv).rgb;return float4(16.0/255.0+dot(c,float3(0.2126,0.7152,0.0722))*(219.0/255.0),0,0,1);}
 fragment float4 to_chroma(Out in [[stage_in]],texture2d<float> rgb [[texture(0)]]){float3 c=rgb.sample(linear_sampler,in.uv).rgb;
     return float4(128.0/255.0+dot(c,float3(-0.114572,-0.385428,0.5))*(224.0/255.0),128.0/255.0+dot(c,float3(0.5,-0.454153,-0.045847))*(224.0/255.0),0,1);}
-fragment float4 to_rgb(Out in [[stage_in]],texture2d<float> luma [[texture(0)]],texture2d<float> chroma [[texture(1)]]){
+fragment float4 to_rgb(Out in [[stage_in]],texture2d<float> luma [[texture(0)]],texture2d<float> chroma [[texture(1)]],texture2d<float> current [[texture(2)]]){
     float y=(luma.sample(linear_sampler,in.uv).r-16.0/255.0)*(255.0/219.0);float2 c=(chroma.sample(linear_sampler,in.uv).rg-128.0/255.0)*(255.0/224.0);
-    return float4(saturate(float3(y+1.5748*c.y,y-0.187324*c.x-0.468124*c.y,y+1.8556*c.x)),1);}
+    float3 generated=saturate(float3(y+1.5748*c.y,y-0.187324*c.x-0.468124*c.y,y+1.8556*c.x));
+    // 鏡頭移動時，從畫面外移進來的邊緣區域沒有前一張的資料，內插結果是暗帶；靠近四邊 6% 的範圍漸次改用這一張真實畫面。
+    float border=min(min(in.uv.x,1.0-in.uv.x),min(in.uv.y,1.0-in.uv.y));
+    return float4(mix(current.sample(linear_sampler,in.uv).rgb,generated,smoothstep(0.02,0.06,border)),1);}
 )";
         NSError* error=nil;auto library=[device newLibraryWithSource:[NSString stringWithUTF8String:source_code] options:nil error:&error];
         if(!library)throw std::runtime_error(std::string("畫面內插的著色器編譯失敗：")+(error.localizedDescription.UTF8String?:""));
@@ -73,11 +87,18 @@ fragment float4 to_rgb(Out in [[stage_in]],texture2d<float> luma [[texture(0)]],
         for(auto& buffer:buffers_)if(buffer)CVPixelBufferRelease(buffer);
     }
     id<MTLTexture> encode(id<MTLCommandBuffer> commands,id<MTLTexture> current) override {
-        if(state_->load(std::memory_order_acquire)!=1){primed_=false;return nil;}
-        const unsigned slot=index_;index_^=1U;
-        pass(commands,luma_[slot],to_luma_,current,nil);pass(commands,chroma_[slot],to_chroma_,current,nil);
+        return convert(commands,current)?interpolate(commands,current):nil;
+    }
+    bool convert(id<MTLCommandBuffer> commands,id<MTLTexture> current) override {
+        if(state_->load(std::memory_order_acquire)!=1){primed_=false;return false;}
+        slot_=index_;index_^=1U;
+        pass(commands,luma_[slot_],to_luma_,current,nil);pass(commands,chroma_[slot_],to_chroma_,current,nil);
         ++frame_;
-        if(!primed_){primed_=true;return nil;}
+        if(!primed_){primed_=true;return false;}
+        return true;
+    }
+    id<MTLTexture> interpolate(id<MTLCommandBuffer> commands,id<MTLTexture> current) override {
+        const unsigned slot=slot_;
         auto previous=[[VTFrameProcessorFrame alloc] initWithBuffer:buffers_[slot^1U] presentationTimeStamp:CMTimeMake(static_cast<int64_t>(frame_-1)*2,120)];
         auto source=[[VTFrameProcessorFrame alloc] initWithBuffer:buffers_[slot] presentationTimeStamp:CMTimeMake(static_cast<int64_t>(frame_)*2,120)];
         auto destination=[[VTFrameProcessorFrame alloc] initWithBuffer:buffers_[2] presentationTimeStamp:CMTimeMake(static_cast<int64_t>(frame_)*2-1,120)];
@@ -85,19 +106,19 @@ fragment float4 to_rgb(Out in [[stage_in]],texture2d<float> luma [[texture(0)]],
         auto parameters=[[VTLowLatencyFrameInterpolationParameters alloc] initWithSourceFrame:source previousFrame:previous interpolationPhase:@[@0.5f] destinationFrames:@[destination]];
         if(!parameters)return nil;
         [processor_ processWithCommandBuffer:commands parameters:parameters];
-        pass(commands,output_,to_rgb_,luma_[2],chroma_[2]);
+        pass(commands,output_,to_rgb_,luma_[2],chroma_[2],current);
         return output_;
     }
 private:
-    void pass(id<MTLCommandBuffer> commands,id<MTLTexture> target,id<MTLRenderPipelineState> pipeline,id<MTLTexture> first,id<MTLTexture> second){
+    void pass(id<MTLCommandBuffer> commands,id<MTLTexture> target,id<MTLRenderPipelineState> pipeline,id<MTLTexture> first,id<MTLTexture> second,id<MTLTexture> third=nil){
         auto descriptor=[MTLRenderPassDescriptor renderPassDescriptor];descriptor.colorAttachments[0].texture=target;descriptor.colorAttachments[0].loadAction=MTLLoadActionDontCare;descriptor.colorAttachments[0].storeAction=MTLStoreActionStore;
-        auto encoder=[commands renderCommandEncoderWithDescriptor:descriptor];[encoder setRenderPipelineState:pipeline];[encoder setFragmentTexture:first atIndex:0];if(second)[encoder setFragmentTexture:second atIndex:1];
+        auto encoder=[commands renderCommandEncoderWithDescriptor:descriptor];[encoder setRenderPipelineState:pipeline];[encoder setFragmentTexture:first atIndex:0];if(second)[encoder setFragmentTexture:second atIndex:1];if(third)[encoder setFragmentTexture:third atIndex:2];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[encoder endEncoding];
     }
     std::array<CVPixelBufferRef,3> buffers_{};std::array<id<MTLTexture>,3> luma_{},chroma_{};id<MTLTexture> output_=nil;
     id<MTLRenderPipelineState> to_luma_=nil,to_chroma_=nil,to_rgb_=nil;VTFrameProcessor* processor_=nil;
     std::shared_ptr<std::atomic<int>> state_=std::make_shared<std::atomic<int>>(0);
-    unsigned index_=0;bool primed_=false;std::uint64_t frame_=0;
+    unsigned index_=0,slot_=0;bool primed_=false;std::uint64_t frame_=0;
 };
 // 不支援（系統版本、裝置或解析度超過上限）時回傳空指標。
 inline std::unique_ptr<MetalFrameInterpolation> metal_frame_interpolation_create(id<MTLDevice> device,unsigned width,unsigned height,MTLPixelFormat output_format){

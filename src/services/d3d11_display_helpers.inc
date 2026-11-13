@@ -24,6 +24,13 @@
             return *std::min_element(modes.begin(),modes.end(),[&](const auto& a,const auto& b){return score(a)<score(b);});
         };
         const auto create_output=[&](std::uint64_t adapter){auto output=create(Kind::Output,adapter);output->slice=0;return output->root;};
+        // 交換鏈所在的介面卡：D3D11 交換鏈取其裝置的介面卡。D3D12 交換鏈的顯示身分（見 make_swap 的 display_only）沒有 D3D11 裝置，
+        // 取建立它的工廠上的介面卡（與 EnumAdapters(0) 相同的物件種類），由交換鏈身分持有到銷毀。
+        const auto swap_adapter=[&](const std::shared_ptr<Identity>& swap){
+            if(swap->device)return device_adapter(object(swap->device).identity);
+            if(!swap->adapter)swap->adapter=create(Kind::Adapter,swap->factory)->root;
+            return swap->adapter;
+        };
         const auto set_fullscreen=[&](const std::shared_ptr<Identity>& swap,bool enabled,std::uint64_t target)->std::uint32_t{
             if(!enabled){if(target)return invalid;if(!restore_fullscreen(swap))return 0x887a0022U;if(swap->fullscreen_output){release(swap->fullscreen_output);swap->fullscreen_output=0;}return 0;}
             if(target)(void)typed(target,Kind::Output);
@@ -31,7 +38,7 @@
             const auto found=gui_.windows.find(swap->window);
             if(!native_gui_ || found==gui_.windows.end() || found->second.parent || !found->second.visible || found->second.show_command==2)return 0x887a0022U;
             auto mode=native_gui_->current_display_mode();if(word(swap->desc,x86_?56:64)&2U)mode=closest_display_mode(swap->target_mode);if(!mode)return not_found;
-            if(!target)target=create_output(device_adapter(object(swap->device).identity));else hold(target);
+            if(!target)target=create_output(swap_adapter(swap));else hold(target);
             if(!enter_graphics_fullscreen(*swap,mode)){release(target);return 0x887a0022U;}
             const auto previous=swap->fullscreen_output;swap->fullscreen_output=target;if(previous)release(previous);
             swap->target_mode=display_mode_bytes(*mode,word(swap->desc,16));put_word(swap->desc,x86_?48:56,0);return 0;

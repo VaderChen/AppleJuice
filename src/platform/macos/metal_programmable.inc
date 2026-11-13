@@ -270,6 +270,10 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_translate_shader(std::uint32_t
         } reflection;
         GLSLShader translated;GLSLCrossDependencyData deps;HLSLccSamplerPrecisionInfo precision;
         std::vector<std::uint32_t> aligned((bytes.size()+3)/4);std::memcpy(aligned.data(),bytes.data(),bytes.size());
+        // 診斷：X64ARM_METAL_DUMP_PENDING=<目錄> 時每次轉譯前覆寫 pending.bin（翻譯器本身崩潰時留下觸發的那支著色器）。
+        if(static const char* pending=std::getenv("X64ARM_METAL_DUMP_PENDING");pending && *pending){
+            if(auto* out=std::fopen((std::string(pending)+"/pending.bin").c_str(),"wb")){std::fwrite(bytes.data(),1,bytes.size(),out);std::fflush(out);std::fclose(out);}
+        }
         if(!TranslateHLSLFromMem(reinterpret_cast<const char*>(aligned.data()),HLSLCC_FLAG_INOUT_SEMANTIC_NAMES|HLSLCC_FLAG_UNIFORM_BUFFER_OBJECT|HLSLCC_FLAG_TRANSLATE_MATRICES|(shared?HLSLCC_FLAG_METAL_TESSELLATION:0),LANG_METAL,nullptr,shared?shared:&deps,precision,reflection,&translated))throw std::invalid_argument("DXBC 至 Metal 轉譯失敗："+reflection.error);
         if(!reflection.error.empty())throw std::invalid_argument("DXBC 至 Metal 語義不支援："+reflection.error);
         auto shader=std::make_shared<MetalShader>();shader->stage=stage;shader->threads=reflection.threads;
@@ -1779,15 +1783,22 @@ void MetalGl::graphics_present(const GraphicsView& v){@autoreleasepool{
     if(texture.pixelFormat==MTLPixelFormatRGBA8Unorm_sRGB)texture=[texture newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
     else if(texture.pixelFormat==MTLPixelFormatBGRA8Unorm_sRGB)texture=[texture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
     if(!texture)throw std::invalid_argument("無法建立交換鏈呈現 view");
+    // 遊戲的 XeSS／FSR 與內建補幀、2 倍放大互斥。
+    sync_external_upscaler();
     // 畫面內插：把這張畫面交給內插器，取得「上一張與這一張中間」的生成畫面，由 swap 先行呈現。
     interpolated_=nil;
-    if(metal_frame_interpolation_wanted() && layer_){
+    if(metal_frame_interpolation_wanted() && !external_upscaler_ && layer_){
         if(!interpolation_tried_){
             interpolation_tried_=true;interpolation_=metal_frame_interpolation_create(device_,width_,height_,color_.pixelFormat);
             // 只有內插器建立成功的表面才強制垂直同步並停用立即呈現；不支援時維持程式原本的呈現間隔。
             if(interpolation_){finish_immediate_present();interpolation_active_.store(true,std::memory_order_release);layer_.displaySyncEnabled=YES;}
         }
-        if(interpolation_)interpolated_=interpolation_->encode(commands_,texture);
+        if(interpolation_){
+            // 診斷：X64ARM_PRESENT_INTERPOLATION_SYNC=1 時先等來源平面在 GPU 上完成，再編入內插（分辨內插器是否在命令緩衝執行前就讀取來源）。
+            static const bool sync=[] {const char* text=std::getenv("X64ARM_PRESENT_INTERPOLATION_SYNC");return text && std::string_view(text)=="1";}();
+            if(!sync)interpolated_=interpolation_->encode(commands_,texture);
+            else if(interpolation_->convert(commands_,texture)){flush(true);begin_commands(true,"present");interpolated_=interpolation_->interpolate(commands_,texture);}
+        }
     }
     if(texture.pixelFormat==color_.pixelFormat){auto e=[commands_ blitCommandEncoder];MetalEncoderScope e_scope{e};if(metal_labels()){e.label=@"blit";hang_note("blit");}[e copyFromTexture:texture sourceSlice:v.slice sourceLevel:v.level sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width_,height_,1) toTexture:color_ destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];e_scope.end();}
     else {

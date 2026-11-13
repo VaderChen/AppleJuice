@@ -2157,8 +2157,8 @@ void WindowsServices::trace_guest_thread_waits(std::FILE* out,const GuestMemory*
     const auto ticks=detail::monotonic_ticks();
     for(const auto& [id,thread]:threads_.items){
         if(thread.status==ThreadStatus::Exited)continue;
-        std::fprintf(out,"  id=%llu prio=%d status=%d suspended=%d kind=%d remaining_ms=%lld name=%s rip=0x%llx api=%s\n",
-            static_cast<unsigned long long>(id),thread.effective_priority(runtime_.process_priority_class,runtime_.process_background),static_cast<int>(thread.status),thread.suspended?1:0,static_cast<int>(thread.wait.kind),
+        std::fprintf(out,"  id=%llu tid=0x%llx prio=%d status=%d suspended=%d kind=%d remaining_ms=%lld name=%s rip=0x%llx api=%s\n",
+            static_cast<unsigned long long>(id),static_cast<unsigned long long>(thread_identifier(id)),thread.effective_priority(runtime_.process_priority_class,runtime_.process_background),static_cast<int>(thread.status),thread.suspended?1:0,static_cast<int>(thread.wait.kind),
             thread.wait.deadline==UINT64_MAX?-1LL:static_cast<long long>((thread.wait.deadline>ticks?thread.wait.deadline-ticks:0)/10000),
             utf16_to_utf8(thread.description).c_str(),static_cast<unsigned long long>(thread.context.rip.value),
             handles(thread.context.rip)?std::string(name(thread.context.rip)).c_str():"");
@@ -2173,7 +2173,19 @@ void WindowsServices::trace_guest_thread_waits(std::FILE* out,const GuestMemory*
         }
         for(const auto handle:thread.wait.handles){
             const auto object=runtime_.wait_objects.find(handle);
-            if(object==runtime_.wait_objects.end()){std::fprintf(out,"    handle=0x%llx (非等待物件)\n",static_cast<unsigned long long>(handle));continue;}
+            if(object==runtime_.wait_objects.end()){
+                // 臨界區段：印出鎖字組、遞迴次數與擁有者 TID（對照各執行緒列的 tid），找出卡住的持有者。
+                const auto section=runtime_.critical_sections.find(handle);
+                if(memory && section!=runtime_.critical_sections.end()){
+                    try{
+                        std::fprintf(out,"    critical=0x%llx guest=%d word=0x%x recursion=%u owner_tid=0x%llx host_owner=%llu\n",static_cast<unsigned long long>(handle),section->second.guest?1:0,
+                            static_cast<unsigned>(memory->load(GuestAddress{handle+(x86_?4:8)},32)),static_cast<unsigned>(memory->load(GuestAddress{handle+(x86_?8:12)},32)),
+                            static_cast<unsigned long long>(memory->load(GuestAddress{handle+(x86_?12:16)},x86_?32:64)),static_cast<unsigned long long>(section->second.owner));
+                        continue;
+                    }catch(...){}
+                }
+                std::fprintf(out,"    handle=0x%llx (非等待物件)\n",static_cast<unsigned long long>(handle));continue;
+            }
             const auto& state_object=runtime_.wait_state(object->second);
             std::fprintf(out,"    handle=0x%llx kind=%d signaled=%d manual=%d count=%u shared_fd=%d name=%s\n",
                 static_cast<unsigned long long>(handle),static_cast<int>(object->second.kind),state_object.signaled()?1:0,
@@ -2659,16 +2671,7 @@ WindowsServices::CompletionResult WindowsServices::poll_completion(GuestState& s
             memory.store(GuestAddress{overlapped},bits,packet.overlapped);
         }
         complete_wait_packet(packet.wait_packet);packets.pop_front();
-        const std::uint32_t error = !packet.status ? 0
-            : packet.status==0xc0000017 ? 8 : packet.status==0xc0000005 ? 998
-            : packet.status==0xc0000022 ? 5 : packet.status==0xc0000054 ? 33
-            : packet.status==0xc0000011 ? 38 : packet.status==0x80000005 ? 234
-            : packet.status==0xc000014b ? 109 : packet.status==0xc00000b0 ? 233
-            : packet.status==0xc000020d ? 64 : packet.status==0xc0000241 ? 1236
-            : packet.status==0xc000009a ? 1450 : packet.status==0xc00000b5 ? 121
-            : packet.status==0x10c ? 1022 : packet.status==0xc0000236 ? 1225
-            : packet.status==0xc000023c ? 1231 : packet.status==0xc000023d ? 1232
-            : packet.status==0xc000020c ? 1226 : packet.status==0xc000000d ? 87 : 995;
+        const std::uint32_t error = completion_packet_error(packet.status);
         return {static_cast<std::uint32_t>(packet.status==0),error,true,guest_return};
     }
     if (!expired)return {};
@@ -4197,6 +4200,9 @@ std::optional<std::uint32_t> WindowsServices::finish_thread(GuestState &state, G
     const bool last = std::all_of(threads_.items.begin(), threads_.items.end(),
                                   [](const auto &entry) { return entry.second.status == ThreadStatus::Exited; });
     if (last) {
+        // 最後一條執行緒結束而以非 0 結束碼結束程序：與 ExitProcess／TerminateProcess 相同，一次性記錄呼叫者位置（不改變行為）。
+        if (code && code != 0xc0000409U)
+            report_crt_fast_fail(state, memory, "LastThreadExit");
         record_job_exit(code);
         (void)emit_debug_event(state, memory, debugger::ExitProcess{code});
         return code;
@@ -4334,6 +4340,16 @@ std::optional<std::uint32_t> WindowsServices::wait_for_initial_thread(GuestState
         // 描述元與共享物件通知負責喚醒；50 ms 只補查建立者死亡／交易期限與 Job。
         if(!wake || !wake->wait_for(epoch,50'000'000))std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+}
+std::uint64_t WindowsServices::thread_stack_reservation(std::uint64_t parameter, bool reservation) const noexcept {
+    // 回傳 0 代表使用執行檔標頭的預設保留大小。
+    if (!parameter || reservation)
+        return parameter;
+    const auto standard = std::max(UINT64_C(65536), runtime_.image.stack_size);
+    if (parameter <= standard)
+        return 0;
+    constexpr std::uint64_t megabyte = UINT64_C(1) << 20;
+    return parameter > UINT64_MAX - (megabyte - 1) ? parameter : (parameter + megabyte - 1) & ~(megabyte - 1);
 }
 std::uint64_t WindowsServices::create_guest_thread(const GuestState &state, GuestMemory &memory, std::uint64_t entry,
                                                    std::uint64_t parameter, std::uint64_t requested,
@@ -5535,7 +5551,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                                       static_cast<unsigned long long>(memory.load(GuestAddress{address + (x86_ ? 12 : 16)}, x86_ ? 32 : 64)),
                                       static_cast<unsigned>(memory.load(GuestAddress{address + (x86_ ? 8 : 12)}, 32)),
                                       static_cast<unsigned>(thread_identifier(threads_.current)));
-                        throw HostCallFault(std::string("執行緒未持有 critical section") + detail);
+                        // Windows 的 RtlLeaveCriticalSection 不驗證擁有者：未持有時只把 RecursionCount 減一後返回，不釋放鎖、不喚醒等待者，
+                        // 程序照常執行（屬程式的未定義用法，但常見於錯誤處理路徑，例如 Steam 用戶端程式庫）。這裡比照處理：
+                        // 不改動鎖字組與擁有者、不喚醒，只記錄一次診斷；X64ARM_STRICT_CRITICAL_SECTION=1 恢復當成致命錯誤。
+                        static const bool strict=[] {const auto* value=std::getenv("X64ARM_STRICT_CRITICAL_SECTION");return value && std::string_view(value)=="1";}();
+                        if(strict)throw HostCallFault(std::string("執行緒未持有 critical section") + detail);
+                        static std::atomic<bool> noted{false};
+                        if(!noted.exchange(true,std::memory_order_relaxed))runtime_.module_events.push_back(std::string("critical_section_note=離開未持有的 critical section")+detail);
+                        arg.return_to(state, 0);
+                        return std::nullopt;
                     }
                     if (critical_release(memory, address, section)) {
                         resolve_thread_waits(memory,ThreadWakeScope::Critical,address);
@@ -5563,12 +5587,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
         const bool remote = symbol.starts_with("CreateRemoteThread"), extended = symbol == "CreateRemoteThreadEx";
         const unsigned shift = remote ? 1 : 0, id_argument = extended ? 7 : 5 + shift;
         const auto flags_value = u32(4 + shift);
-        const auto requested = arg(1 + shift);
+        // dwStackSize：帶 STACK_SIZE_PARAM_IS_A_RESERVATION（0x10000）時是保留大小；否則只是初始提交大小，
+        // 保留大小取執行檔標頭的 SizeOfStackReserve，提交大小超過它時保留大小向上取整到 1 MiB（Windows 行為）。
+        // 原本一律當成保留大小，程式以小的提交值建立執行緒後在函式序言的堆疊探測就溢位。
+        const auto stack_parameter = arg(1 + shift);
+        const auto requested = thread_stack_reservation(stack_parameter, (flags_value & 0x10000U) != 0);
         if (remote && !process_handle_pid(arg(0), 0x43a))
             fail(process_object_type(arg(0)) == u"Process" ? 5U : 6U);
         else if (extended && arg(6))
             fail(50);
-        else if (flags_value & ~0x10004U || requested > 8U * 1024 * 1024)
+        else if (flags_value & ~0x10004U || stack_parameter > 8U * 1024 * 1024)
             fail(87);
         else {
             try {
@@ -5623,7 +5651,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             memory.store(GuestAddress{runtime_.errno_cell}, 32, 11);
             result = failed;
         } else {
-            result = create_guest_thread(state, memory, arg(0), arg(2), arg(1), 0);
+            result = create_guest_thread(state, memory, arg(0), arg(2), thread_stack_reservation(arg(1), false), 0);
             if (result)
                 threads_.items.at(thread_id(result)).crt_detached_handle = result;
             else {

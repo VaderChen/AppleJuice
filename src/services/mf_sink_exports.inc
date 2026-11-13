@@ -13,6 +13,8 @@ if(name=="MFCreateSinkWriterFromURL"){
     const auto sink=std::make_shared<SinkWriterState>();sink->mp4=container==mf::MFTranscodeContainerType_MPEG4;
     if(arg(1)){
         sink->stream=object(arg(1),mf::ByteStream)->byte_stream;require(!sink->stream->closed,shutdown);
+        // Sink Writer 以宿主檔案定位回填標頭；後端為客體 IStream 的包裝尚未承接。
+        require(!sink->stream->guest_stream,0xc00d36c4U);
         require((sink->stream->capabilities&6)==6,0x80070005U);sink->base=sink->stream->position;
     }else{
         const auto opened=filesystem_.open_host(utf16_to_utf8(path),0x40000000U,2,0,1);

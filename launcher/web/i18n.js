@@ -240,20 +240,15 @@ const translations = {
     "2 倍に拡大して表示",
     "2배 확대 표시"
   ],
-  "程式以一半的解析度繪製，再放大到原本的顯示大小，可減輕顯示卡負擔；文字與介面會較不銳利。於下次啟動生效。": [
-    "The app renders at half resolution and is upscaled to the original display size. This lowers GPU load; text and UI look less sharp. Applies on the next launch.",
-    "アプリは半分の解像度で描画し、元の表示サイズに拡大します。GPU の負荷が下がりますが、文字や UI は少しぼやけます。次回の起動から有効です。",
-    "앱이 절반 해상도로 그린 뒤 원래 표시 크기로 확대합니다. GPU 부하가 줄지만 글자와 UI는 덜 선명해집니다. 다음 실행부터 적용됩니다."
+  "顯示": [
+    "Display",
+    "表示",
+    "표시"
   ],
   "畫面內插": [
     "Frame interpolation",
     "フレーム補間",
     "프레임 보간"
-  ],
-  "在每兩張畫面之間由系統生成一張中間畫面，讓動作看起來更流暢；不需要程式本身支援。需要 macOS 26 以上，繪製解析度不超過 1920×1080；操作延遲會略為增加。於下次啟動生效。": [
-    "The system generates one in-between frame for every two rendered frames so motion looks smoother; the app does not need to support it. Requires macOS 26 or later and a render resolution of at most 1920×1080; input latency increases slightly. Applies on the next launch.",
-    "描画された 2 枚のフレームの間にシステムが中間フレームを 1 枚生成し、動きを滑らかに見せます。アプリ側の対応は不要です。macOS 26 以降と、1920×1080 以下の描画解像度が必要です。操作の遅延が少し増えます。次回の起動から有効です。",
-    "그려진 두 프레임 사이에 시스템이 중간 프레임을 하나 생성해 움직임을 더 부드럽게 보여 줍니다. 앱이 지원하지 않아도 됩니다. macOS 26 이상과 1920×1080 이하의 렌더링 해상도가 필요하며 입력 지연이 약간 늘어납니다. 다음 실행부터 적용됩니다."
   ],
   "允許程式寫入上述資料夾": [
     "Allow the app to write to these folders",
