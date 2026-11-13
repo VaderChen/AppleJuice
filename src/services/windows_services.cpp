@@ -41,6 +41,9 @@
 #include "x64arm/security_descriptor.hpp"
 #include "x64arm/security_access.hpp"
 #include "windows_profile_security.hpp"
+#include "x64arm/cpu_features.hpp"
+#include "x64arm/system_performance.hpp"
+#include "x64arm/windows_version.hpp"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -53,6 +56,7 @@
 #include <charconv>
 #include <map>
 #include <optional>
+#include <random>
 #include <tuple>
 #include <unordered_map>
 
@@ -237,6 +241,53 @@ void WindowsServices::retired(GuestMemory& memory, std::uint64_t instructions) {
         }
     }
     memory.update_readonly(GuestAddress{0x7ffe0008}, times);
+    // TickCount（KSYSTEM_TIME，0x320）與 TickCountLowDeprecated（0x000）以 15.625 ms 為一刻（TickCountMultiplier 0x0fa00000），
+    // GetTickCount 的內嵌版本以 (TickCount×Multiplier)>>24 換算毫秒；刻度改變時才改寫。
+    if(const auto tick=time.monotonic/156250;tick!=shared_user_tick_) {
+        shared_user_tick_=tick;
+        const auto low=static_cast<std::uint32_t>(tick),high=static_cast<std::uint32_t>(tick>>32);
+        std::array<std::uint8_t,12> count{};
+        for(unsigned i=0;i<4;++i){count[i]=static_cast<std::uint8_t>(low>>(i*8));count[4+i]=count[8+i]=static_cast<std::uint8_t>(high>>(i*8));}
+        memory.update_readonly(GuestAddress{0x7ffe0320}, count);
+        memory.update_readonly(GuestAddress{0x7ffe0000}, std::span(count).first(4));
+    }
+}
+// KUSER_SHARED_DATA（0x7ffe0000，唯讀）：Windows 每個程序都映射同一頁系統資料，內嵌的 GetTickCount、RtlGetNtVersionNumbers、
+// IsProcessorFeaturePresent，以及 Steam、反作弊與防護層會直接讀取。版本、產品類型、處理器功能、XState、DEP、QPC 頻率、
+// 處理器數量與時區（UTC）沿用對應 API 的同一來源；時間欄位（InterruptTime、SystemTime、TickCount）由 retired 更新。
+// QpcBypassEnabled 維持 0：客體沒有可直接讀取的 TSC 換算參數，QueryPerformanceCounter 一律經系統呼叫。
+void WindowsServices::map_shared_user_data(GuestMemory& memory) {
+    std::vector<std::uint8_t> page(GuestMemory::guest_page_size);
+    const auto put=[&](std::size_t offset,unsigned bytes,std::uint64_t value){for(unsigned i=0;i<bytes;++i)page[offset+i]=static_cast<std::uint8_t>(value>>(i*8));};
+    put(0x004,4,0x0fa00000);                                   // TickCountMultiplier：15.625 ms×2^24
+    put(0x02c,2,0x8664);put(0x02e,2,0x8664);                   // ImageNumberLow／High：AMD64（WoW64 程序看到的也是原生值）
+    constexpr std::u16string_view system_root=u"C:\\Windows";
+    for(std::size_t i=0;i<system_root.size();++i)put(0x030+i*2,2,system_root[i]);   // NtSystemRoot
+    put(0x244,4,0x200000);                                      // LargePageMinimum
+    put(0x260,4,windows_version_build);                         // NtBuildNumber
+    put(0x264,4,1);page[0x268]=1;                               // NtProductType＝NtProductWinNt（與 RtlGetVersion 的工作站相同）、ProductTypeIsValid
+    put(0x26a,2,9);                                             // NativeProcessorArchitecture＝PROCESSOR_ARCHITECTURE_AMD64
+    put(0x26c,4,windows_version_major);put(0x270,4,windows_version_minor);
+    for(unsigned index=0;index<64;++index)page[0x274+index]=virtual_processor_feature(index,x86_)?1:0;   // 與 IsProcessorFeaturePresent 相同
+    put(0x2b4,4,0x7ffeffff);put(0x2b8,4,0x80000000);           // Reserved1／Reserved3：32 位元使用者位址上限與系統範圍起點
+    page[0x2d5]=1;                                              // MitigationPolicies：NX 恆開（GetSystemDEPPolicy＝AlwaysOn）
+    put(0x2d8,4,1);                                             // ActiveConsoleId
+    std::uint64_t physical=memory.limit();
+    if(const auto snapshot=native_system_performance();!snapshot.error && snapshot.pages[3] && snapshot.pages[9])physical=snapshot.pages[3]*snapshot.pages[9];
+    put(0x2e8,4,std::min<std::uint64_t>(physical/4096,UINT32_MAX));   // NumberOfPhysicalPages（4 KiB 頁）
+    put(0x2f8,8,0xc3);                                          // TestRetInstruction
+    put(0x300,8,10000000);                                      // QpcFrequency：與 QueryPerformanceFrequency 相同
+    std::random_device random;put(0x330,4,random()|1U);         // Cookie
+    put(0x3c0,4,std::max(1U,runtime_.processor_count));page[0x3c4]=1;   // ActiveProcessorCount、ActiveGroupCount
+    // XSTATE_CONFIGURATION（0x3d8）：與 GetEnabledXStateFeatures、XSAVE 配置相同（x87、SSE、AVX 高半部）。
+    constexpr std::size_t xstate=0x3d8;
+    put(xstate,8,virtual_xstate_mask);put(xstate+0x10,4,virtual_xsave_bytes);
+    const std::array<std::pair<std::uint32_t,std::uint32_t>,3> features{{{0,160},{160,256},{virtual_ymm_offset,virtual_ymm_bytes}}};
+    for(std::size_t i=0;i<features.size();++i){put(xstate+0x18+i*8,4,features[i].first);put(xstate+0x1c+i*8,4,features[i].second);put(xstate+0x22c+i*4,4,features[i].second);}
+    put(xstate+0x228,4,virtual_xsave_bytes);                    // AllFeatureSize
+    put(xstate+0x340,4,virtual_xsave_bytes);                    // AllNonLargeFeatureSize
+    memory.map(GuestAddress{0x7ffe0000},page.size(),permission(Access::Read),page);
+    shared_user_tick_=UINT64_MAX;
 }
 void WindowsServices::set_standard_input(std::span<const std::uint8_t> bytes) {
     if (bytes.size() > output_limit) throw std::invalid_argument("stdin 快照超過 16 MiB 上限");
@@ -801,7 +852,7 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
         for(const auto directory:{"Users/User/AppData","Users/User/AppData/Local","Users/User/AppData/Local/Temp","Users/User/AppData/LocalLow","Users/User/AppData/Roaming","Users/User/Desktop","Users/User/Documents","Users/User/Downloads"})ensure_directory(filesystem_,directory);
     }
     runtime_.process_creation_time=runtime_.filetime_base;
-    memory.map(GuestAddress{0x7ffe0000}, GuestMemory::guest_page_size, permission(Access::Read));
+    map_shared_user_data(memory);
     retired(memory, 0);
 }
 std::u16string WindowsServices::map_executable(const std::filesystem::path& path) {

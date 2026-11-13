@@ -52,7 +52,7 @@ unsigned element_size(AngleType type,bool guest){switch(type){case AngleType::Vo
 std::size_t bounded_product(std::uint64_t a,std::uint64_t b){if(a>transfer_limit || (b && a>transfer_limit/b))throw HostCallFault("ANGLE 資料超過傳輸上限");return static_cast<std::size_t>(a*b);}
 struct Current {std::uint32_t display{},draw{},read{},context{},egl_error{0x3000},gl_error{};unsigned api{0x30a0};};
 struct Context {std::uint32_t display{},group{};bool pending{};};
-struct Surface {std::uint32_t display{};NSView* view;CALayer* previous;BOOL wanted{};CAMetalLayer* layer;bool pending{};};
+struct Surface {std::uint32_t display{};NSView* view;CALayer* previous;BOOL wanted{};CAMetalLayer* layer;bool pending{};std::function<bool(unsigned,unsigned,std::span<const std::uint8_t>)> present;};
 struct BufferMapping {std::uint64_t guest{};void* host{};std::size_t length{},offset{};unsigned access{},target{};};
 struct VertexPointer {std::uint64_t value{};unsigned buffer{};};
 struct HostBindingScope {std::function<void()> finish;~HostBindingScope(){finish();}};
@@ -92,6 +92,31 @@ class AngleMetal final:public NativeAngle {
     }
     std::size_t query_count(std::string_view name,unsigned pname,const std::vector<std::uint64_t>& values)const;
     std::size_t pixel_size(const AngleCommand&,const std::vector<std::uint64_t>&,bool)const;
+    // 其他程序視窗上的離屏表面：swap 完成後讀回預設 framebuffer（ES3 另存讀取／繪製 framebuffer、PIXEL_PACK 與打包狀態並還原），
+    // 翻成由上而下後交給 present。只處理此表面同時是目前繪製與讀取表面的情況；讀回本身的 GL 錯誤不外流給客體。
+    bool present_remote(Current& c,std::uint32_t id){
+        const auto found=surfaces_.find(id);if(found==surfaces_.end() || !found->second.present)return true;
+        if(c.draw!=id || c.read!=id)return true;
+        int width=0,height=0;auto* display=handle(c.display,"display");auto* surface=handle(id,"surface");
+        if(!host<unsigned>("eglQuerySurface",display,surface,0x3057,&width) || !host<unsigned>("eglQuerySurface",display,surface,0x3056,&height) || width<=0 || height<=0)return true;
+        gl_error(c,host<unsigned>("glGetError"));
+        const bool v3=es3();
+        const auto draw=integer(0x8ca6),read=v3?integer(0x8caa):draw,pack=v3?integer(0x88ed):0U,alignment=integer(0x0d05);
+        const auto row_length=v3?integer(0x0d02):0U,skip_rows=v3?integer(0x0d03):0U,skip_pixels=v3?integer(0x0d04):0U;
+        host<void>("glBindFramebuffer",0x8d40U,0U);if(v3)host<void>("glBindBuffer",0x88ebU,0U);
+        host<void>("glPixelStorei",0x0d05U,1);if(v3){host<void>("glPixelStorei",0x0d02U,0);host<void>("glPixelStorei",0x0d03U,0);host<void>("glPixelStorei",0x0d04U,0);}
+        const auto row=static_cast<std::size_t>(width)*4;std::vector<std::uint8_t> pixels(row*static_cast<std::size_t>(height));
+        host<void>("glReadPixels",0,0,width,height,0x1908U,0x1401U,static_cast<void*>(pixels.data()));
+        if(v3 && read!=draw){host<void>("glBindFramebuffer",0x8ca9U,draw);host<void>("glBindFramebuffer",0x8ca8U,read);}else host<void>("glBindFramebuffer",0x8d40U,draw);
+        host<void>("glPixelStorei",0x0d05U,static_cast<int>(alignment));
+        if(v3){host<void>("glBindBuffer",0x88ebU,pack);host<void>("glPixelStorei",0x0d02U,static_cast<int>(row_length));host<void>("glPixelStorei",0x0d03U,static_cast<int>(skip_rows));host<void>("glPixelStorei",0x0d04U,static_cast<int>(skip_pixels));}
+        (void)host<unsigned>("glGetError");
+        // GL 原點在左下；視窗影格由上而下。
+        std::vector<std::uint8_t> line(row);
+        for(int top=0,bottom=height-1;top<bottom;++top,--bottom){auto* a=pixels.data()+static_cast<std::size_t>(top)*row;auto* b=pixels.data()+static_cast<std::size_t>(bottom)*row;std::memcpy(line.data(),a,row);std::memcpy(a,b,row);std::memcpy(b,line.data(),row);}
+        bytes_out_+=pixels.size();
+        return found->second.present(static_cast<unsigned>(width),static_cast<unsigned>(height),pixels);
+    }
     void release_surface(std::uint32_t id){const auto it=surfaces_.find(id);if(it==surfaces_.end())return;auto& s=it->second;if(s.view && s.view.layer==s.layer){s.view.layer=s.previous;s.view.wantsLayer=s.wanted;[s.view setNeedsDisplay:YES];}surfaces_.erase(it);}
 public:
     explicit AngleMetal(std::shared_ptr<AngleLibrary> library):library_(std::move(library)){}
@@ -214,6 +239,7 @@ std::uint64_t AngleMetal::invoke(GuestState& state,GuestMemory& memory,const Win
         if(attributes.empty())attributes.push_back(0x3038);Surface surface;surface.display=static_cast<unsigned>(original[0]);void* native=nullptr;
         if(w.view){surface.view=(__bridge NSView*)w.view;surface.previous=surface.view.layer;surface.wanted=surface.view.wantsLayer;surface.layer=[CAMetalLayer layer];surface.layer.device=MTLCreateSystemDefaultDevice();surface.layer.pixelFormat=MTLPixelFormatBGRA8Unorm;surface.layer.drawableSize=CGSizeMake(w.width,w.height);surface.view.wantsLayer=YES;surface.view.layer=surface.layer;native=host<void*>("eglCreateWindowSurface",handle(original[0],"display"),handle(original[1],"config"),(__bridge void*)surface.layer,attributes.data());}
         else{const int offscreen[]{0x3057,static_cast<int>(w.width),0x3056,static_cast<int>(w.height),0x3038};native=host<void*>("eglCreatePbufferSurface",handle(original[0],"display"),handle(original[1],"config"),offscreen);}
+        surface.present=w.present;
         const auto id=token(native,"surface");if(id)surfaces_[id]=surface;else if(surface.view){surface.view.layer=surface.previous;surface.view.wantsLayer=surface.wanted;}return id;
     }
     if(name=="glGetBufferPointerv" || name=="glGetBufferPointervRobustANGLE"){
@@ -287,6 +313,9 @@ std::uint64_t AngleMetal::invoke(GuestState& state,GuestMemory& memory,const Win
     if(command.result==AngleType::String){if(!result)return 0;const auto* value=reinterpret_cast<const char*>(result);const auto key=std::string(value);auto found=strings_.find(key);if(found!=strings_.end())return found->second;const auto id=allocate({reinterpret_cast<const std::uint8_t*>(value),key.size()+1});strings_[key]=id;return id;}
     if(command.result==AngleType::Handle){std::string_view kind=name=="eglCreateContext"?"context":name=="glFenceSync"?"glsync":name.starts_with("eglCreateSync")?"eglsync":"surface";const auto id=token(reinterpret_cast<void*>(result),kind);if(id && kind=="context")contexts_[id]={static_cast<unsigned>(original[0]),original[2]?contexts_.at(static_cast<unsigned>(original[2])).group:id};if(id && kind=="surface")surfaces_[id].display=static_cast<unsigned>(original[0]);return id;}
     if(name=="eglMakeCurrent" && result){current.display=static_cast<unsigned>(original[0]);current.draw=static_cast<unsigned>(original[1]);current.read=static_cast<unsigned>(original[2]);current.context=static_cast<unsigned>(original[3]);}
+    // 其他程序視窗的表面：swap 後把畫面送到視窗擁有者；視窗已失效時與 Windows 相同回 EGL_BAD_NATIVE_WINDOW。
+    if(result && (name=="eglSwapBuffers" || name=="eglSwapBuffersWithDamageKHR" || name=="eglSwapBuffersWithDamageEXT" || name=="eglPostSubBufferNV") &&
+       !present_remote(current,static_cast<unsigned>(original[1]))){current.egl_error=0x300b;return 0;}
     if(name=="eglBindAPI" && result)current.api=static_cast<unsigned>(original[0]);
     if(name=="eglReleaseThread" && result)current={};
     if(name=="eglTerminate" && result)counters_.erase(static_cast<unsigned>(original[0]));

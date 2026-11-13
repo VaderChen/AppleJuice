@@ -592,7 +592,19 @@ bool WindowsServices::invoke_remote_gui(GuestState &state, GuestMemory &memory,
 
 void WindowsServices::publish_remote_frame(std::uint64_t handle, NativeGraphics& graphics, const GraphicsView& view) {
     const auto& desc=view.resource->desc;
-    const auto width=desc.width,height=desc.height,format=desc.format;
+    publish_shared_frame(handle,desc.width,desc.height,desc.format,[&](void* data,std::size_t size,std::uint32_t stride,const std::shared_ptr<void>& cache){
+        graphics.graphics_export_frame(view,data,size,stride,cache);});
+}
+// 其他程序視窗上的 ANGLE（EGL）表面：CPU 端讀回的緊密 RGBA8 列（由上而下）寫入同一份共用影格，由視窗擁有者匯入呈現。
+void WindowsServices::publish_remote_pixels(std::uint64_t handle,std::uint32_t width,std::uint32_t height,std::span<const std::uint8_t> rgba) {
+    const auto row=std::size_t{width}*4;
+    if(rgba.size()<row*height)throw HostCallFault("遠端呈現像素不足");
+    publish_shared_frame(handle,width,height,28,[&](void* data,std::size_t size,std::uint32_t stride,const std::shared_ptr<void>&){
+        auto* out=static_cast<std::uint8_t*>(data);
+        for(std::uint32_t y=0;y<height && std::size_t{y}*stride+row<=size;++y)std::memcpy(out+std::size_t{y}*stride,rgba.data()+std::size_t{y}*row,row);});
+}
+void WindowsServices::publish_shared_frame(std::uint64_t handle,std::uint32_t width,std::uint32_t height,std::uint32_t format,
+                                           const std::function<void(void*,std::size_t,std::uint32_t,const std::shared_ptr<void>&)>& write) {
     const auto window = shared_gui_window(handle);
     if (!window || window->process == process_id())
         throw WindowPresentationFault("遠端呈現 HWND 已關閉或無效");
@@ -614,7 +626,7 @@ void WindowsServices::publish_remote_frame(std::uint64_t handle, NativeGraphics&
         throw HostCallFault("共用影格配置失敗");
     const auto mapping=shared.frame_mapping(handle,file.fd,static_cast<std::size_t>(header.bytes),status);
     const auto export_begin=trace_shared_frames()?trace_unix_us():0;
-    graphics.graphics_export_frame(view,mapping->data,mapping->size,stride,shared.cache_frames?mapping:std::shared_ptr<void>{});
+    write(mapping->data,mapping->size,stride,shared.cache_frames?mapping:std::shared_ptr<void>{});
     if (::pwrite(file.fd, &header, sizeof(header), 0) != sizeof(header))
         throw HostCallFault("共用影格標頭寫入失敗");
     auto &slot = shared.table->slots[handle % window_slots];

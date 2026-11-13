@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 namespace x64arm {
 // EGL／GLES 共用客體 ABI 描述；Metal 與 D3D11 路徑不重新實作 GLES 語義。
@@ -12,7 +13,9 @@ struct AngleCommand {std::string_view name,family;AngleType result;std::vector<A
 std::span<const AngleCommand> angle_commands();
 std::span<const WindowsServiceDescriptor> angle_service_descriptors();
 bool angle_module(std::string_view);
-struct AngleWindow {void* view{};unsigned width{},height{};};
+// view：本程序的原生視窗。present 有值表示 HWND 屬於其他程序（Chromium／CEF 的 GPU 程序對瀏覽器程序的視窗繪圖）：
+// 改以離屏表面繪製，每次 swap 以由上而下、緊密排列的 RGBA8 列交給 present 送到視窗擁有者；回 false 表示視窗已失效。
+struct AngleWindow {void* view{};unsigned width{},height{};std::function<bool(unsigned,unsigned,std::span<const std::uint8_t>)> present;};
 class NativeAngle {
 public:
     virtual ~NativeAngle()=default;

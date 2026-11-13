@@ -778,6 +778,11 @@ void WindowsServices::set_processor_count(GuestMemory &memory, unsigned count) {
     // PEB NumberOfProcessors：Windows 程式與客體臨界區段常式（多處理器才自旋）讀取。
     if (peb_base_.value && memory.mapped(GuestAddress{peb_base_.value}))
         memory.store(GuestAddress{peb_base_.value + (x86_ ? 0x64 : 0xb8)}, 32, count);
+    // KUSER_SHARED_DATA ActiveProcessorCount 與 PEB 一致。
+    if (memory.mapped(GuestAddress{0x7ffe0000})) {
+        const std::array<std::uint8_t, 4> value{static_cast<std::uint8_t>(count), static_cast<std::uint8_t>(count >> 8), 0, 0};
+        memory.update_readonly(GuestAddress{0x7ffe03c0}, value);
+    }
     notify_concurrency_changed();
 }
 bool WindowsServices::set_process_affinity(GuestState &state, std::uint64_t mask) {

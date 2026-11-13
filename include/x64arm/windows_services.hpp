@@ -635,6 +635,9 @@ private:
     // GlobalMemoryStatusEx 的虛擬位址使用量要走訪全部映射與保留區；UE4 等每幀查詢時以短期快取避免每次排序。
     struct MemoryStatusCache {std::chrono::steady_clock::time_point at{},physical_at{};std::size_t regions{},modules{},resources{},capacity{};std::uint64_t used{};std::array<std::uint64_t,4> physical{};std::uint32_t physical_error{};bool valid{},physical_valid{};};
     mutable MemoryStatusCache memory_status_cache_;
+    // KUSER_SHARED_DATA（0x7ffe0000）的靜態欄位與 TickCount；TickCount 只在 15.625 ms 刻度改變時改寫。
+    void map_shared_user_data(GuestMemory&);
+    std::uint64_t shared_user_tick_{UINT64_MAX};
     std::uint32_t process_parent_id() const;
     std::uint32_t capture_process_snapshot(GuestMemory&,std::vector<ProcessSnapshot::Process>&);
     std::uint32_t capture_thread_snapshot(GuestMemory&,std::vector<ProcessSnapshot::Thread>&);
@@ -718,6 +721,8 @@ private:
     void reply_remote_gui_message(std::uint64_t);
     bool remote_gui_messages_waiting()const;
     void publish_remote_frame(std::uint64_t,NativeGraphics&,const GraphicsView&);
+    void publish_remote_pixels(std::uint64_t,std::uint32_t,std::uint32_t,std::span<const std::uint8_t>);
+    void publish_shared_frame(std::uint64_t,std::uint32_t,std::uint32_t,std::uint32_t,const std::function<void(void*,std::size_t,std::uint32_t,const std::shared_ptr<void>&)>&);
     void poll_remote_frames();
     void hold_remote_reveal(std::uint64_t,bool);
     bool blit_raster(GuestMemory&,std::uint64_t,RasterSurface*,const GuiRect&,const GuiRect&,const GuiDc&,std::uint32_t,const RasterBlit&,RasterSurface* =nullptr);
