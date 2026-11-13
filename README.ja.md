@@ -121,7 +121,7 @@ AppleJuice は開発中です。Windows 全体、すべてのアプリケーシ�
 
 ## 動作確認の記録 / 2026-11-13 / 全 22 本のゲーム
 
-<img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作不可・対応中" title="動作不可・対応中"> 動作不可・対応中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="起動可" title="起動可"> 起動可　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="低効率" title="低効率"> 低効率　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好" title="良好"> 良好　<img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="良好（MetalFX）" title="良好（MetalFX）"> 良好（MetalFX）
+<img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作不可・対応中" title="動作不可・対応中"> 動作不可・対応中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="起動可" title="起動可"> 起動可　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="低効率" title="低効率"> 低効率　<img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="良好（MetalFX）" title="良好（MetalFX）"> 良好（MetalFX）　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好" title="良好"> 良好
 
 | アプリケーション | x64/x86 | 主な動作コア | 対応状況 |
 | --- | --- | --- | :---: |

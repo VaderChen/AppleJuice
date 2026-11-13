@@ -121,7 +121,7 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 
 ## Tested applications / 2026-11-13 / 22 games
 
-<img src="docs/images/support-levels/none.png" width="16" height="16" alt="Not working (WIP)" title="Not working (WIP)"> Not working (WIP) · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="Launches" title="Launches"> Launches · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Slow" title="Slow"> Slow · <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> Works well · <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="Works well (MetalFX)" title="Works well (MetalFX)"> Works well (MetalFX)
+<img src="docs/images/support-levels/none.png" width="16" height="16" alt="Not working (WIP)" title="Not working (WIP)"> Not working (WIP) · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="Launches" title="Launches"> Launches · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Slow" title="Slow"> Slow · <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="Works well (MetalFX)" title="Works well (MetalFX)"> Works well (MetalFX) · <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> Works well
 
 | Application | x64/x86 | Core technology | Support level |
 | --- | --- | --- | :---: |
