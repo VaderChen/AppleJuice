@@ -20,6 +20,7 @@ struct PositionHeader {
     std::uint64_t magic{signature},identity{},device{},inode{},position{};
     std::uint32_t access{},sharing{},mode{},readonly{},path_size{};
     std::array<char,131072> path{};
+    std::uint32_t volume_device{}; // 使用原本 object 前的對齊空間，既有一般檔案紀錄維持大小與位置。
     std::uint64_t object{};
 };
 std::string record_name(std::uint64_t identity){return "file-position-"+std::to_string(identity);}
@@ -75,7 +76,7 @@ std::uint32_t FilePosition::publish(const std::string& session,std::uint64_t ide
 #else
     if(shared_){
         const auto guard=lock();auto& data=*shared_->data;
-        if(data.device!=metadata.device || data.inode!=metadata.inode || data.sharing!=metadata.sharing || data.mode!=metadata.mode || data.readonly!=(static_cast<std::uint32_t>(metadata.readonly)|(metadata.manage_volume_at_open?2U:0U)) || data.object!=metadata.object)return 6;
+        if(data.device!=metadata.device || data.inode!=metadata.inode || data.sharing!=metadata.sharing || data.mode!=metadata.mode || data.readonly!=(static_cast<std::uint32_t>(metadata.readonly)|(metadata.manage_volume_at_open?2U:0U)) || data.object!=metadata.object || data.volume_device!=static_cast<unsigned char>(metadata.volume_device))return 6;
         // 窄權限 handle 可先輸出；同 FILE_OBJECT 的後續合法 handle 擴充能力上限。
         // 接收端每個 handle 仍保存自身 rights，不取得其他 handle 的權限。
         data.access|=metadata.access;return 0;
@@ -84,6 +85,7 @@ std::uint32_t FilePosition::publish(const std::string& session,std::uint64_t ide
     auto storage=std::make_shared<SharedFilePosition>();if(const auto error=open_directory(*storage,session))return error;
     const auto name=record_name(identity);storage->descriptor=::openat(storage->directory,name.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);if(storage->descriptor<0)return errno==EACCES?5U:8U;
     auto header=std::make_unique<PositionHeader>();header->identity=identity;header->device=metadata.device;header->inode=metadata.inode;header->position=local_;header->access=metadata.access;header->sharing=metadata.sharing;header->mode=metadata.mode;header->readonly=static_cast<std::uint32_t>(metadata.readonly)|(metadata.manage_volume_at_open?2U:0U);header->object=metadata.object;header->path_size=static_cast<std::uint32_t>(metadata.path.size());std::copy(metadata.path.begin(),metadata.path.end(),header->path.begin());
+    header->volume_device=static_cast<unsigned char>(metadata.volume_device);
     if(::ftruncate(storage->descriptor,sizeof(PositionHeader)) || ::pwrite(storage->descriptor,header.get(),sizeof(PositionHeader),0)!=sizeof(PositionHeader)){(void)::unlinkat(storage->directory,name.c_str(),0);return 8;}
     if(const auto error=map_record(*storage)){(void)::unlinkat(storage->directory,name.c_str(),0);return error;}
     shared_=std::move(storage);return 0;
@@ -97,8 +99,9 @@ std::pair<FilePosition,std::uint32_t> FilePosition::inherit(const std::string& s
     storage->descriptor=::openat(storage->directory,record_name(identity).c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW);if(storage->descriptor<0)return {FilePosition{},6};
     if(const auto error=map_record(*storage))return {FilePosition{},error};
     PositionLock guard(storage);const auto& data=*storage->data;struct stat info{};
-    if(data.identity!=identity || ::fstat(file_descriptor,&info) || (!S_ISREG(info.st_mode) && !HostFile::is_null_descriptor(file_descriptor)) || data.device!=static_cast<std::uint64_t>(info.st_dev) || data.inode!=static_cast<std::uint64_t>(info.st_ino))return {FilePosition{},6};
-    metadata={data.device,data.inode,data.access,data.sharing,data.mode,(data.readonly&1)!=0,std::string(data.path.data(),data.path_size),data.object,(data.readonly&2)!=0};
+    if(data.volume_device && (data.volume_device<'A' || data.volume_device>'Z'))return {FilePosition{},6};
+    if(data.identity!=identity || ::fstat(file_descriptor,&info) || (!S_ISREG(info.st_mode) && !(data.volume_device && S_ISDIR(info.st_mode)) && !HostFile::is_null_descriptor(file_descriptor)) || data.device!=static_cast<std::uint64_t>(info.st_dev) || data.inode!=static_cast<std::uint64_t>(info.st_ino))return {FilePosition{},6};
+    metadata={data.device,data.inode,data.access,data.sharing,data.mode,(data.readonly&1)!=0,std::string(data.path.data(),data.path_size),data.object,(data.readonly&2)!=0,static_cast<char>(data.volume_device)};
     FilePosition result;result.shared_=std::move(storage);return {std::move(result),0};
 #endif
 }

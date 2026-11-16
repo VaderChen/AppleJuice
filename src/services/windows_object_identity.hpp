@@ -12,6 +12,7 @@ template<class Runtime>
 std::pair<std::uint64_t,std::uint64_t> object_identity(const Runtime& runtime,std::uint64_t handle,std::uint64_t fallback){
 #if !defined(_WIN32)
     int descriptor=-1;
+    if(const auto found=runtime.object_directories.find(handle);found!=runtime.object_directories.end())descriptor=found->second.object->descriptor();
     if(const auto found=runtime.wait_objects.find(handle);found!=runtime.wait_objects.end()){
         const auto& object=found->second;
         if(object.shared_event)descriptor=object.shared_event->descriptor();

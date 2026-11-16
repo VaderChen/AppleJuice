@@ -1,4 +1,4 @@
-        if(symbol=="D3DXFillTexture" || symbol=="D3DXFillCubeTexture" || symbol=="D3DXSHProjectCubeMap"){
+        if(symbol=="D3DXFillTexture" || symbol=="D3DXFillCubeTexture" || symbol=="D3DXFillVolumeTexture" || symbol=="D3DXSHProjectCubeMap"){
             texture_handled=true;mesh_handled=true;
             const auto cube_direction=[](unsigned face,float u,float v){
                 switch(face){case 0:return Vector{1,-v,-u,0};case 1:return Vector{-1,-v,u,0};case 2:return Vector{u,1,v,0};case 3:return Vector{u,-1,-v,0};case 4:return Vector{u,-v,1,0};default:return Vector{-u,-v,-1,0};}
@@ -19,17 +19,18 @@
                 for(unsigned c=0;c<3;++c){std::array<float,36> coefficients{};for(unsigned i=0;i<order*order;++i)coefficients[i]=static_cast<float>(sum[c][i]);memory.write(GuestAddress{arg(c+2)},std::span(reinterpret_cast<const std::uint8_t*>(coefficients.data()),order*order*4));
                     if(std::getenv("X64ARM_TRACE_D3DX_SH")){std::fprintf(stderr,"[d3dx9 sh] order=%u channel=%u",order,c);for(unsigned i=0;i<order*order;++i)std::fprintf(stderr," %.9g",double(coefficients[i]));std::fprintf(stderr,"\n");}}
             }else{
-                const bool cube=symbol=="D3DXFillCubeTexture";auto texture=get(arg(0),cube?Kind::CubeTexture:Kind::Texture);require(arg(1));
+                // 平面、立方與體積貼圖共用同一批次回呼狀態機；LPD3DXFILL2D／3D 的參數均為 (VECTOR4*, 座標*, texel 大小*, pData)。
+                const bool cube=symbol=="D3DXFillCubeTexture",volume=symbol=="D3DXFillVolumeTexture";const auto part=volume?Kind::Volume:Kind::Surface;auto texture=get(arg(0),cube?Kind::CubeTexture:volume?Kind::VolumeTexture:Kind::Texture);require(arg(1));
                 D3DXFillOperation* operation=nullptr;for(auto& [id,item]:bridge.fill_operations){(void)id;if(item.thread==threads_.current && item.stack==state.reg(Gpr::Rsp) && item.service.symbol==service.symbol){operation=&item;break;}}
                 if(!operation){D3DXFillOperation next;next.id=++bridge.next_atlas_operation;next.thread=threads_.current;next.stack=state.reg(Gpr::Rsp);next.service=service;operation=&bridge.fill_operations.emplace(next.id,std::move(next)).first->second;operation->temporary=allocate_heap(memory,128*48);require(operation->temporary,out_of_memory);}
-                auto& work=*operation;auto surface=get(texture->subresources.at(work.subresource),Kind::Surface);require(!surface->mapped);const auto count=surface->width*surface->height;
+                auto& work=*operation;auto surface=get(texture->subresources.at(work.subresource),part);require(!surface->mapped);const auto count=surface->width*surface->height*std::max(1U,surface->depth);
                 if(work.pixels.empty())work.pixels.resize(std::size_t(count)*16);
                 if(work.returned){for(unsigned n=0;n<work.batch;++n)memory.read(GuestAddress{work.temporary+n*48},std::span(work.pixels).subspan(std::size_t(work.index+n)*16,16));work.index+=work.batch;work.returned=false;}
-                if(work.index==count){surface->pixels=texture_image::transform(work.pixels,2,{surface->width,surface->height,1},{0,0,0,surface->width,surface->height,1},native_format(surface->format),{surface->width,surface->height,1},1);write_surface(*surface);work.pixels.clear();work.index=0;++work.subresource;}
+                if(work.index==count){const auto depth=std::max(1U,surface->depth);surface->pixels=texture_image::transform(work.pixels,2,{surface->width,surface->height,depth},{0,0,0,surface->width,surface->height,depth},native_format(surface->format),{surface->width,surface->height,depth},1);write_surface(*surface);work.pixels.clear();work.index=0;++work.subresource;}
                 if(work.subresource<texture->subresources.size()){
-                    surface=get(texture->subresources.at(work.subresource),Kind::Surface);require(!surface->mapped);const auto width=surface->width,height=surface->height,face=work.subresource/texture->levels;const float dx=1.0F/static_cast<float>(width),dy=1.0F/static_cast<float>(height);
-                    work.batch=std::min(128U,width*height-work.index);std::vector<GuestCallback> callbacks;callbacks.reserve(work.batch);
-                    for(unsigned n=0;n<work.batch;++n){const auto pixel=work.index+n;const float x=(static_cast<float>(pixel%width)+.5F)*dx,y=(static_cast<float>(pixel/width)+.5F)*dy;Vector position=cube?cube_direction(face,2*x-1,2*y-1):Vector{x,y,0,0};Vector size=cube?Vector{2*dx,2*dy,2*dx,0}:Vector{dx,dy,0,0};if(cube)size[face/2]=0;
+                    surface=get(texture->subresources.at(work.subresource),part);require(!surface->mapped);const auto width=surface->width,height=surface->height,depth=std::max(1U,surface->depth),face=work.subresource/texture->levels;const float dx=1.0F/static_cast<float>(width),dy=1.0F/static_cast<float>(height),dz=1.0F/static_cast<float>(depth);
+                    work.batch=std::min(128U,width*height*depth-work.index);std::vector<GuestCallback> callbacks;callbacks.reserve(work.batch);
+                    for(unsigned n=0;n<work.batch;++n){const auto pixel=work.index+n;const float x=(static_cast<float>(pixel%width)+.5F)*dx,y=(static_cast<float>(pixel/width%height)+.5F)*dy,z=(static_cast<float>(pixel/(width*height))+.5F)*dz;Vector position=cube?cube_direction(face,2*x-1,2*y-1):Vector{x,y,volume?z:0,0};Vector size=cube?Vector{2*dx,2*dy,2*dx,0}:Vector{dx,dy,volume?dz:0,0};if(cube)size[face/2]=0;
                         std::array<float,12> data{};std::copy_n(position.begin(),3,data.begin()+4);std::copy_n(size.begin(),3,data.begin()+8);const auto at=work.temporary+n*48;memory.write(GuestAddress{at},std::span(reinterpret_cast<const std::uint8_t*>(data.data()),48));callbacks.push_back({arg(1),{at,at+16,at+32,arg(2)}});}
                     start_callbacks(state,memory,std::move(callbacks),Continuation::D3DXProgressOperation,work.id);return std::nullopt;
                 }

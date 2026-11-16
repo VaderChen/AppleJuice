@@ -50,14 +50,14 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
         {"crt","_strftime_l",5},{"crt","_wcsftime_l",5},{"crt","_Strftime_l",6},{"crt","_Wcsftime_l",6},
         {"crt","_Getdays",0},{"crt","_Getmonths",0},{"crt","_W_Getdays",0},{"crt","_W_Getmonths",0},
         {"crt","_Gettnames",0},{"crt","_W_Gettnames",0},
-        {"kernel32.dll","SystemTimeToTzSpecificLocalTime",3},{"kernel32.dll","TzSpecificLocalTimeToSystemTime",3},
-        {"kernel32.dll","GetSystemTimes",3},{"kernel32.dll","GetDynamicTimeZoneInformation",1},{"kernel32.dll","GetTimeZoneInformation",1},{"kernel32.dll","GetTimeZoneInformationForYear",3},
+        {"kernel32.dll","SystemTimeToTzSpecificLocalTime",3},{"kernel32.dll","TzSpecificLocalTimeToSystemTime",3},{"kernel32.dll","SystemTimeToTzSpecificLocalTimeEx",3},{"kernel32.dll","TzSpecificLocalTimeToSystemTimeEx",3},
+        {"kernel32.dll","GetSystemTimes",3},{"kernel32.dll","QueryIdleProcessorCycleTime",2},{"kernel32.dll","QueryIdleProcessorCycleTimeEx",3,0,0,0x1},{"kernel32.dll","GetDynamicTimeZoneInformation",1},{"kernel32.dll","GetTimeZoneInformation",1},{"kernel32.dll","GetTimeZoneInformationForYear",3},
         {"advapi32.dll","EnumDynamicTimeZoneInformation",2},{"advapi32.dll","GetDynamicTimeZoneInformationEffectiveYears",3},{"kernel32.dll","GetSystemTime",1},{"kernel32.dll","GetLocalTime",1}
         ,{"kernel32.dll","SetSystemTime",1},{"kernel32.dll","SetLocalTime",1},{"kernel32.dll","GetSystemTimeAdjustment",3},{"kernel32.dll","SetSystemTimeAdjustment",2}
         ,{"kernel32.dll","FileTimeToLocalFileTime",2},{"kernel32.dll","LocalFileTimeToFileTime",2}
         ,{"kernel32.dll","FileTimeToSystemTime",2},{"kernel32.dll","SystemTimeToFileTime",2},{"kernel32.dll","CompareFileTime",2}
         ,{"kernel32.dll","FileTimeToDosDateTime",3},{"kernel32.dll","DosDateTimeToFileTime",3}
-        ,{"kernel32.dll","QueryUnbiasedInterruptTime",1},{"kernel32.dll","QueryUnbiasedInterruptTimePrecise",1},{"kernel32.dll","GetTickCount64",0},{"kernel32.dll","GetSystemTimePreciseAsFileTime",1}
+        ,{"kernel32.dll","QueryUnbiasedInterruptTime",1},{"kernel32.dll","QueryUnbiasedInterruptTimePrecise",1},{"kernel32.dll","QueryInterruptTime",1},{"kernel32.dll","QueryInterruptTimePrecise",1},{"kernel32.dll","GetTickCount64",0},{"kernel32.dll","GetSystemTimePreciseAsFileTime",1}
         ,{"winmm.dll","waveOutGetErrorTextA",3},{"winmm.dll","waveOutGetErrorTextW",3},{"winmm.dll","waveInGetErrorTextA",3},{"winmm.dll","waveInGetErrorTextW",3}
         ,{"winmm.dll","midiOutGetErrorTextA",3},{"winmm.dll","midiOutGetErrorTextW",3},{"winmm.dll","midiInGetErrorTextA",3},{"winmm.dll","midiInGetErrorTextW",3}
         ,{"winmm.dll","waveOutGetNumDevs",0},{"winmm.dll","waveOutGetDevCapsA",3},{"winmm.dll","waveOutGetDevCapsW",3}
@@ -66,6 +66,7 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
         ,{"winmm.dll","waveOutPause",1},{"winmm.dll","waveOutRestart",1},{"winmm.dll","waveOutReset",1}
         ,{"winmm.dll","waveOutGetPosition",3},{"winmm.dll","waveOutGetVolume",2},{"winmm.dll","waveOutSetVolume",2}
         ,{"winmm.dll","waveOutMessage",4,0,0,2}
+        ,{"winmm.dll","waveOutGetPitch",2},{"winmm.dll","waveOutSetPitch",2,0,0,2},{"winmm.dll","waveOutGetPlaybackRate",2},{"winmm.dll","waveOutSetPlaybackRate",2,0,0,2},{"winmm.dll","waveOutBreakLoop",1}
         ,{"winmm.dll","PlaySoundA",3,0,0,4},{"winmm.dll","PlaySoundW",3,0,0,4}
         ,{"winmm.dll","sndPlaySoundA",2,0,0,2},{"winmm.dll","sndPlaySoundW",2,0,0,2}
         ,{"winmm.dll","waveInGetNumDevs",0},{"winmm.dll","waveInGetDevCapsA",3},{"winmm.dll","waveInGetDevCapsW",3}
@@ -90,13 +91,16 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
         ,{"winmm.dll","midiInOpen",5},{"winmm.dll","midiInClose",1},{"winmm.dll","midiInGetID",2}
         ,{"winmm.dll","midiInPrepareHeader",3},{"winmm.dll","midiInUnprepareHeader",3},{"winmm.dll","midiInAddBuffer",3}
         ,{"winmm.dll","midiInStart",1},{"winmm.dll","midiInStop",1},{"winmm.dll","midiInReset",1}
-        ,{"winmm.dll","timeGetTime",0},{"winmm.dll","timeGetDevCaps",2}
+        ,{"winmm.dll","timeGetTime",0},{"winmm.dll","timeGetDevCaps",2},{"winmm.dll","timeGetSystemTime",2,0,0,2},{"winmm.dll","mmsystemGetVersion",0}
         ,{"winmm.dll","timeSetEvent",5},{"winmm.dll","timeKillEvent",1}
         ,{"winmm.dll","timeBeginPeriod",1},{"winmm.dll","timeEndPeriod",1}
         ,{"winmm.dll","mmioOpenA",3},{"winmm.dll","mmioOpenW",3},{"winmm.dll","mmioClose",2}
         ,{"winmm.dll","mmioGetInfo",3},{"winmm.dll","mmioSetInfo",3},{"winmm.dll","mmioAdvance",3}
         ,{"winmm.dll","mmioRead",3},{"winmm.dll","mmioWrite",3},{"winmm.dll","mmioSeek",3}
         ,{"winmm.dll","mmioDescend",4},{"winmm.dll","mmioAscend",3},{"winmm.dll","mmioCreateChunk",3}
+        ,{"winmm.dll","mmioInstallIOProcA",3},{"winmm.dll","mmioInstallIOProcW",3},{"winmm.dll","mmioSendMessage",4,0,0,2}
+        ,{"winmm.dll","mmioRenameA",4},{"winmm.dll","mmioRenameW",4},{"winmm.dll","mmioSetBuffer",4,0,0,0xc},{"winmm.dll","mmioFlush",2,0,0,2}
+        ,{"winmm.dll","mmioStringToFOURCCA",2,0,0,2},{"winmm.dll","mmioStringToFOURCCW",2,0,0,2}
     };
     return table;
 }
@@ -263,6 +267,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
         const auto pointer=allocate_heap(memory,bytes.size());if(pointer){try{if(symbol.ends_with("tnames")){snapshot.relocate(pointer);memory.write(GuestAddress{pointer},snapshot.bytes);}else memory.write(GuestAddress{pointer},bytes);}catch(...){(void)free_heap(memory,pointer,state);throw;}}
         else memory.store(GuestAddress{runtime_.errno_cell},32,12);arg.return_to(state,pointer);return std::nullopt;
     }
+    if(symbol=="QueryIdleProcessorCycleTime" || symbol=="QueryIdleProcessorCycleTimeEx"){
+        // 每個客體處理器一個 ULONG64：閒置時間（100 ns）依標稱時脈換算成週期。宿主時鐘取對應宿主邏輯處理器的閒置時間，
+        // 虛擬時鐘以 GetSystemTimes 的同一規則平均分配。*BufferLength 為位元組；不足時回報需要的長度並失敗。
+        const bool extended=symbol.ends_with("Ex");const auto length=arg(extended?1:0),buffer=arg(extended?2:1);
+        const auto processors=std::max<unsigned>(1,memory.processor_count());const auto needed=processors*8U;
+        if((extended && static_cast<std::uint16_t>(arg(0))!=0) || !length){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+        memory.check(GuestAddress{length},4,Access::Write);
+        if(!buffer || memory.load(GuestAddress{length},32)<needed){memory.store(GuestAddress{length},32,needed);last_error_=122;arg.return_to(state,0);return std::nullopt;}
+        std::vector<std::uint64_t> idle(processors,0);
+        if(runtime_.host_clock){const auto host=native_processor_cpu_times();if(host.empty()){last_error_=50;arg.return_to(state,0);return std::nullopt;}
+            for(unsigned i=0;i<processors;++i)idle[i]=host[i%host.size()].idle;}
+        else {std::uint64_t busy=0;for(const auto& [id,thread]:threads_.items){(void)id;busy+=thread.cycles;}
+            const auto total=runtime_.clock_ticks*processors;const auto free=total>busy?total-busy:0;for(auto& value:idle)value=free/processors;}
+        memory.check(GuestAddress{buffer},needed,Access::Write);
+        for(unsigned i=0;i<processors;++i)memory.store(GuestAddress{buffer+i*8U},64,idle[i]*windows_processor_mhz/10U);
+        memory.store(GuestAddress{length},32,needed);arg.return_to(state,1);return std::nullopt;
+    }
     if(symbol=="GetSystemTimes"){
         SystemCpuTime times;
         if(runtime_.host_clock)times=native_system_cpu_time();
@@ -278,6 +299,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
         for(unsigned i=0;i<3;++i)if(arg(i))memory.store(GuestAddress{arg(i)},64,values[i]);
         arg.return_to(state,1);return std::nullopt;
     }
+    if(symbol=="QueryInterruptTime" || symbol=="QueryInterruptTimePrecise") {
+        // 含睡眠期間的插斷時間（100 ns）：宿主時鐘為 mach_continuous_time，與 QPC 同一條時間軸；兩者皆無回傳值。
+        memory.store(GuestAddress{arg(0)},64,runtime_.host_clock?detail::monotonic_ticks():runtime_.clock_ticks);arg.return_to(state,0);return std::nullopt;
+    }
     if(symbol=="QueryUnbiasedInterruptTime" || symbol=="QueryUnbiasedInterruptTimePrecise") {
         if(!arg(0)){last_error_=87;arg.return_to(state,0);return std::nullopt;}
         // 宿主時鐘直接讀不含睡眠期間的硬體時間；virtual 時鐘沿用指令推進的時間軸。
@@ -287,6 +312,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
     if (service.family=="winmm.dll" || symbol=="GetTickCount64" || symbol=="GetSystemTimePreciseAsFileTime") {
         std::uint64_t result=0;
         if (symbol=="timeGetTime") result=static_cast<std::uint32_t>(runtime_.clock_ticks/10000);
+        // timeGetSystemTime：以 TIME_MS 填入與 timeGetTime 相同的毫秒值；結構太小時不寫入，仍回 TIMERR_NOERROR。
+        else if (symbol=="timeGetSystemTime") {if(arg(0) && static_cast<std::uint32_t>(arg(1))>=8){memory.check(GuestAddress{arg(0)},8,Access::Write);memory.store(GuestAddress{arg(0)},32,1);memory.store(GuestAddress{arg(0)+4},32,static_cast<std::uint32_t>(runtime_.clock_ticks/10000));}}
+        else if (symbol=="mmsystemGetVersion") result=0x030a;
         else if (symbol=="GetTickCount64") result=runtime_.clock_ticks/10000;
         else if (symbol=="GetSystemTimePreciseAsFileTime") memory.store(GuestAddress{arg(0)},64,runtime_.system_filetime());
         else if (symbol=="timeGetDevCaps") {
@@ -399,7 +427,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
                 result=secure?0:destination;
             }
         }
-    }else if(symbol=="SystemTimeToTzSpecificLocalTime" || symbol=="TzSpecificLocalTimeToSystemTime"){
+    }else if(symbol.starts_with("SystemTimeToTzSpecificLocalTime") || symbol.starts_with("TzSpecificLocalTimeToSystemTime")){
+        // Ex 版本的 DYNAMIC_TIME_ZONE_INFORMATION 前 172 位元組即 TIME_ZONE_INFORMATION；客體時區沒有逐年動態規則，與 GetTimeZoneInformationForYear 相同沿用固定規則。
         if(!arg(1) || !arg(2))last_error_=87;
         else {
             const auto input=system_time(memory,arg(1));const auto seconds=system_seconds(input);Zone zone;
@@ -410,7 +439,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
             } // 未指定時區時，使用與 GetTimeZoneInformation 相同的客體 UTC。
             std::optional<std::int64_t> converted;
             if(seconds){
-                if(symbol=="SystemTimeToTzSpecificLocalTime")converted=zone_local(*seconds,zone);
+                if(symbol.starts_with("SystemTimeToTzSpecificLocalTime"))converted=zone_local(*seconds,zone);
                 else {
                     // 秋季重複時間優先標準時間；春季不存在的牆鐘時間必須失敗。
                     for(auto bias:{zone.bias+(zone.standard[1]?zone.standard_bias:0),zone.bias+zone.daylight_bias}){

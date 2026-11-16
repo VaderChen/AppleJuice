@@ -1,5 +1,6 @@
 #pragma once
 #include "x64arm/host_services.hpp"
+#include "x64arm/guest_callback.hpp"
 #include <coroutine>
 #include <exception>
 #include <map>
@@ -76,6 +77,9 @@ struct Context {
     std::coroutine_handle<> continuation;
     std::uint64_t callback_value{};
     bool waiting{};
+    // call_native 的完整回呼規格（64 位元／浮點參數與回傳、fastcall）；只有支援的 begin 會取用並清除。
+    GuestCallback native{};
+    bool native_pending{};
     virtual ~Context()=default;
     virtual bool done() const noexcept=0;
 };
@@ -116,11 +120,14 @@ template<class Result> struct BasicCall {
     std::vector<std::uint64_t> arguments;
     Context* context{};
     GuestState saved;
+    std::optional<GuestCallback> spec{};
     bool await_ready() const noexcept{return false;}
     void await_suspend(std::coroutine_handle<> continuation){
         if(!active || active->waiting)throw HostCallFault("客體回呼沒有對應服務續行");
         context=active;saved=context->state;
+        if(spec){context->native=std::move(*spec);context->native_pending=true;}
         context->begin(context->state,*context->memory,target,std::move(arguments),context->id);
+        if(context->native_pending){context->native_pending=false;throw HostCallFault("此服務續行不支援完整回呼規格");}
         context->continuation=continuation;context->waiting=true;
     }
     Result await_resume(){
@@ -132,6 +139,8 @@ template<class Result> struct BasicCall {
 using Call=BasicCall<std::uint32_t>;
 inline Call call(std::uint64_t target,std::vector<std::uint64_t> arguments){return {target,std::move(arguments),nullptr,{}};}
 inline BasicCall<std::uint64_t> call_value(std::uint64_t target,std::vector<std::uint64_t> arguments){return {target,std::move(arguments),nullptr,{}};}
+// 依完整規格呼叫客體函式（DispCallFunc 一類需要 64 位元／浮點參數或回傳值者）；回傳值含 EDX:EAX 或 ST(0)／XMM0。
+inline BasicCall<std::uint64_t> call_native(GuestCallback spec){auto target=spec.target;auto arguments=spec.arguments;return {target,std::move(arguments),nullptr,{},std::move(spec)};}
 
 template<class T,class Factory>
 T invoke(void* service,std::uint64_t thread,GuestState& state,GuestMemory& memory,

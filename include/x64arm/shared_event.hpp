@@ -14,6 +14,7 @@ class SharedEvent {
 public:
     explicit SharedEvent(std::shared_ptr<SharedEventStorage> storage):storage_(std::move(storage)){}
     bool manual_reset() const noexcept;
+    bool exclusive() const noexcept;
     bool signaled() const noexcept;
     std::uint32_t count() const noexcept;
     std::uint32_t maximum() const noexcept;
@@ -33,7 +34,7 @@ struct SharedEventLock {
 };
 struct OpenSharedEvent {std::shared_ptr<SharedEvent> event;std::uint32_t error{};bool existed{};};
 OpenSharedEvent inherit_shared_event(const std::string& session,int descriptor);
-OpenSharedEvent open_shared_event(const std::string& session,std::u16string name,bool create,bool manual,bool initial,const ObjectSecurityFactory& security={});
+OpenSharedEvent open_shared_event(const std::string& session,std::u16string name,bool create,bool manual,bool initial,const ObjectSecurityFactory& security={},bool exclusive=false);
 // 計數訊號沿用 event 的命名空間、鎖、權限、生命週期與 SharedWake；獨立簽章防止物件類型混用。
 OpenSharedEvent open_shared_semaphore(const std::string& session,std::u16string name,bool create,std::uint32_t initial,std::uint32_t maximum,const ObjectSecurityFactory& security={});
 OpenSharedEvent inherit_shared_semaphore(const std::string& session,int descriptor);

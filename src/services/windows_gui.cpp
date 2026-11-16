@@ -114,6 +114,11 @@ void WindowsServices::remember_gui_message(const GuiMessage& message) {
     if(message.ime && gui_.input_contexts.contains(message.ime_context))gui_.input_contexts.at(message.ime_context).data=*message.ime;
     auto& thread=threads_.items.at(threads_.current);thread.message_time=message.queued_time;
     if(message.input_extra)thread.message_extra=*message.input_extra;
+    // GetCurrentInputMessageSource：入列時已標示來源者沿用；其餘原生輸入依訊息類別推得裝置，來源為硬體；非輸入訊息不可用。
+    auto device=message.source_device,origin=message.source_origin;
+    if(!device && message.queue_priority==1){const auto code=message.message;
+        if(code>=0x100 && code<=0x109)device=1;else if((code>=0x200 && code<=0x20e) || (code>=0xa0 && code<=0xad))device=2;}
+    thread.message_source_device=device;thread.message_source_origin=device?(origin?origin:std::uint8_t{1}):std::uint8_t{0};
     thread.message_position=static_cast<std::uint16_t>(message.queued_cursor[0])|(std::uint32_t{static_cast<std::uint16_t>(message.queued_cursor[1])}<<16);
 }
 std::uint64_t WindowsServices::stock_gui_proc(std::u16string_view name,bool wide) const {
@@ -255,6 +260,10 @@ void WindowsServices::erase_window(std::uint64_t handle,bool destroy_menus) {
     gui_.clipboard_listeners.erase(handle);gui_.clipboard_viewers.erase(handle);for(auto& [id,station]:gui_.station_namespaces){(void)id;station.clipboard_listeners.erase(handle);station.clipboard_viewers.erase(handle);}
     gui_.saved_contexts.erase(dc_base+handle);gui_.contexts.erase(dc_base+handle);gui_.dc_objects.erase(dc_base+handle);std::erase_if(gui_.scroll_info,[&](const auto& entry){return entry.first.first==handle;});gui_.system_menus.erase(handle);
     if(gui_.focus==handle)gui_.focus=0;if(gui_.active==handle)gui_.active=0;if(gui_.capture==handle)gui_.capture=0;
+    // Shell hook：被銷毀的登錄視窗不再收件；工作列視窗立即通知其他登錄視窗（之後的比對不會重複）。
+    gui_.shell_hook_windows.erase(handle);
+    if(const auto tracked=gui_.shell_hook_tracked.find(handle);tracked!=gui_.shell_hook_tracked.end()){
+        const auto desktop=tracked->second.desktop;gui_.shell_hook_tracked.erase(tracked);if(gui_.shell_hook_active==handle)gui_.shell_hook_active=0;notify_shell_hook(2,handle,desktop);}
     std::erase_if(gui_.timers,[&](const auto& entry){return entry.first.first==handle;});
     std::erase_if(gui_.queue, [&](const auto& msg) { return msg.window == handle; }); ++gui_.destroyed;
     for(const auto parent:calendar_parents)present_gui(parent);
@@ -312,15 +321,18 @@ void WindowsServices::pump_mouse_tracking(){
 void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait_ticks) {
     detail::peek_idle_invalidate(); // 抽取宿主事件可能產生訊息、回呼與滑鼠輸入
     GuiPumpTrace trace(process_id());
-    if(const auto found=gui_.icons.find(gui_.cursor);found!=gui_.icons.end() && !found->second.animation_sequence.empty()){
-        const auto& icon=found->second;const auto step=icon_animation_step(icon,runtime_.clock_ticks>=gui_.cursor_animation_start?runtime_.clock_ticks-gui_.cursor_animation_start:0);
+    GuiIcon system_cursor;
+    if(const auto* found=gui_.cursor?resolve_gui_cursor(gui_.cursor,system_cursor):nullptr;found && !found->animation_sequence.empty()){
+        const auto& icon=*found;const auto step=icon_animation_step(icon,runtime_.clock_ticks>=gui_.cursor_animation_start?runtime_.clock_ticks-gui_.cursor_animation_start:0);
         if(step!=gui_.cursor_animation_step && (!native_gui_ || !interactive_station() || native_gui_->set_cursor(&icon.animation_frames.at(icon.animation_sequence[step]),gui_.cursor_count>=0)))gui_.cursor_animation_step=step;
     }
     trace.next("appbars");poll_appbars();
     trace.next("power");poll_power_notifications(memory);
     trace.next("dinput");poll_dinput();
+    trace.next("joystick_capture");poll_joystick_captures();
     trace.next("shell");poll_shell_notifications(memory);
     trace.next("desktop");poll_desktop_notifications();
+    trace.next("shell_hooks");poll_shell_hooks();
     trace.next("cursor_clip");
     if(gui_.cursor_clip){auto point=gui_.pointer_position;if(native_gui_)if(const auto current=native_gui_->cursor_position())point=*current;const auto& rect=*gui_.cursor_clip;
         const std::array<std::int32_t,2> constrained{std::clamp(point[0],rect[0],rect[2]-1),std::clamp(point[1],rect[1],rect[3]-1)};
@@ -342,7 +354,7 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
         if(std::none_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& msg){return msg.window==handle && msg.message==15;})){GuiMessage msg{handle,0,0,15};msg.queue_priority=2;enqueue_gui_message(std::move(msg));}
     }
     trace.next("timers");
-    for(auto& [key,timer]:gui_.timers)if(timer.deadline<=runtime_.clock_ticks){if(std::none_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& m){return m.window==key.first && m.message==0x113 && m.wparam==key.second;})){GuiMessage msg{key.first,key.second,timer.procedure,0x113};msg.thread=timer.thread;msg.queue_priority=3;enqueue_gui_message(std::move(msg));}timer.deadline=gui_.timer_deadline(runtime_.clock_ticks+timer.interval,timer.coalescing_tolerance,key);}
+    for(auto& [key,timer]:gui_.timers)if(timer.deadline<=runtime_.clock_ticks){if(std::none_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& m){return m.window==key.first && m.message==timer.message && m.wparam==(key.second&~gui_system_timer_bit);})){GuiMessage msg{key.first,key.second&~gui_system_timer_bit,timer.procedure,timer.message};msg.thread=timer.thread;msg.queue_priority=3;enqueue_gui_message(std::move(msg));}timer.deadline=gui_.timer_deadline(runtime_.clock_ticks+timer.interval,timer.coalescing_tolerance,key);}
     for(auto& [handle,w]:gui_.windows)if(w.header && w.header->filter_editing && w.header->filter_deadline && w.header->filter_deadline<=runtime_.clock_ticks){auto& control=*w.header;
         if(std::none_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& msg){return msg.window==handle && msg.message==0x10019 && msg.wparam==control.filter_item && msg.lparam==control.filter_generation;})){GuiMessage msg{handle,control.filter_item,control.filter_generation,0x10019};msg.thread=w.thread;msg.queue_priority=3;enqueue_gui_message(std::move(msg));}}
     trace.next("mouse_tracking");pump_mouse_tracking();
@@ -354,6 +366,7 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
     for(const auto& [key,timer]:gui_.timers){(void)key;bounded=std::min(bounded,timer.deadline>runtime_.clock_ticks?timer.deadline-runtime_.clock_ticks:0);}
     for(const auto& [handle,w]:gui_.windows){(void)handle;if(w.header && w.header->filter_editing && w.header->filter_deadline)bounded=std::min(bounded,w.header->filter_deadline>runtime_.clock_ticks?w.header->filter_deadline-runtime_.clock_ticks:0);}
     bounded=std::min(bounded,gui_.attention.deadline()>runtime_.clock_ticks?gui_.attention.deadline()-runtime_.clock_ticks:0);
+    for(const auto& capture:gui_.joystick_captures)if(capture)bounded=std::min(bounded,capture->deadline>runtime_.clock_ticks?capture->deadline-runtime_.clock_ticks:0);
     trace.next("native_poll");
     const auto before=std::chrono::steady_clock::now();auto events=native_gui_->poll_for(bounded*100);
     trace.next("retired");
@@ -425,6 +438,8 @@ void WindowsServices::pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait
             raw_input_mouse(0,0,0,flags[msg.message-0x201],0,
                             static_cast<std::uint32_t>(runtime_.clock_ticks/10000),0,automation_raw_device(*raw_input_,false));
         }
+        // 非同步按鍵狀態與 Raw Input 已依實體按鍵處理；之後的同步狀態與客體訊息改用 SwapMouseButton 的邏輯按鍵。
+        swap_gui_mouse_buttons(msg);
         if((msg.message==0x100 || msg.message==0x101 || msg.message==0x104 || msg.message==0x105) && match_gui_hotkey(msg))continue;
         if((physical_key && !raw_legacy_enabled(true)) || (physical_mouse && !raw_legacy_enabled(false)))continue;
         if(msg.message==0x10004){ // 原生 tracking loop 消耗的放開事件只同步狀態，不重送客體輸入。
@@ -600,6 +615,12 @@ std::optional<std::uint32_t> WindowsServices::resume_gui(GuestState& state, Gues
 bool WindowsServices::dispatch_gui_modal_message(GuestState& state,GuestMemory& memory,std::uint64_t handle,const GuiMessage& msg) {
     const auto found=gui_.windows.find(handle);if(found==gui_.windows.end())return false;
     auto& dialog=found->second;
+    // 計時器的 TimerProc（含執行緒計時器：視窗為 NULL）與 DispatchMessage 相同照常呼叫；模態迴圈不能丟棄。
+    if(msg.message==0x113 && msg.lparam && (!msg.window || gui_.windows.contains(msg.window))){
+        if(!handles(GuestAddress{msg.lparam}))memory.check(GuestAddress{msg.lparam},1,Access::Execute);
+        GuestCallback callback{msg.lparam,{msg.window,0x113,msg.wparam,static_cast<std::uint32_t>(runtime_.clock_ticks/10000)}};
+        callback.user_mode_callback=true;start_callbacks(state,memory,{std::move(callback)},Continuation::GuiModalDispatch,handle);return true;
+    }
     const auto target=gui_.windows.find(msg.window);if(target==gui_.windows.end())return false;
     if(shell_dialog_message(state,memory,msg))return true;
     if(common_dialog_message(memory,msg))return false;
@@ -628,6 +649,7 @@ std::optional<std::uint32_t> WindowsServices::advance_gui_modal(GuestState& stat
     for(;;){
         const auto found=gui_.windows.find(handle);if(found==gui_.windows.end()){complete_call(state,memory,UINT64_MAX);return std::nullopt;}
         auto& dialog=found->second;
+        if(!dialog.ended && dialog.modal_deadline && runtime_.clock_ticks>=dialog.modal_deadline){dialog.ended=true;dialog.dialog_result=32000;}
         if(dialog.ended && dialog.shell_delete){
             auto& operation=*dialog.shell_delete;
             if(!operation.result){
@@ -671,7 +693,7 @@ std::optional<std::uint32_t> WindowsServices::advance_gui_modal(GuestState& stat
         const bool input_pending=std::any_of(gui_.queue.begin(),gui_.queue.end(),[&](const auto& msg){return gui_message_matches(msg,threads_.current);});
         pump_gui(memory,false,input_pending?gui_native_poll_deferred:0);
         const auto queued=std::find_if(gui_.queue.begin(),gui_.queue.end(),[&](const auto& msg){return gui_message_matches(msg,threads_.current);});
-        if(queued==gui_.queue.end()){wait_gui_input(state,memory,{},handle);return std::nullopt;}
+        if(queued==gui_.queue.end()){ThreadWait wait;if(dialog.modal_deadline)wait.deadline=dialog.modal_deadline;wait_gui_input(state,memory,std::move(wait),handle);return std::nullopt;}
         const auto msg=*queued;remember_gui_message(msg);consume_shell_message(msg);gui_.queue.erase(queued);
         if(msg.message==18){dialog.ended=true;dialog.dialog_result=UINT64_MAX;continue;}
         if(std::any_of(gui_.hooks.begin(),gui_.hooks.end(),[&](const auto& entry){const auto& hook=entry.second;return (hook.type==-1 || hook.type==6) && (!hook.thread || hook.thread==threads_.current);})) {
@@ -882,7 +904,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
     } else if(symbol.starts_with("SendMessageTimeout")){
         const auto flags=dword(4);const GuiMessage message{arg(0),arg(2),arg(3),dword(1)};
         if(flags&~0x2bU)fail(87);
-        else if(arg(0)==0xffff)fail(50); // 廣播與跨程序訊息尚無共用視窗 broker。
+        else if(arg(0)==0xffff){
+            // HWND_BROADCAST：依序送給本程序的所有頂層視窗（不含子視窗與訊息專用視窗），結果值取最後一個；跨程序視窗尚無共用 broker，不在範圍內。
+            if(arg(6))memory.check(GuestAddress{arg(6)},x86_?4:8,Access::Write);
+            std::vector<GuestCallback> sends;const auto target=resolve("user32.dll",wide?"SendMessageW":"SendMessageA").value;
+            for(const auto handle:gui_broadcast_targets())sends.push_back({target,{handle,arg(1),arg(2),arg(3)}});
+            if(sends.empty()){if(arg(6))memory.store(GuestAddress{arg(6)},x86_?32:64,0);result=1;}
+            else {start_callbacks(state,memory,std::move(sends),Continuation::GuiSendTimeout);return std::nullopt;}
+        }
         else {
             if(arg(6))memory.check(GuestAddress{arg(6)},x86_?4:8,Access::Write);
             if(route_gui_send(state,memory,message,wide,true,flags,dword(5),arg(6)))return std::nullopt;
@@ -891,12 +920,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
         }
     } else if (symbol.starts_with("SendMessage") || symbol.starts_with("PostMessage")) {
         GuiMessage msg{arg(0),arg(2),arg(3),static_cast<std::uint32_t>(arg(1))};if(!msg.window)msg.thread=threads_.current;
+        if(msg.window==0xffff){
+            // HWND_BROADCAST：本程序的所有頂層視窗各收一份（同 SendMessageTimeout 的範圍）；SendMessage 回傳最後一個結果。
+            const auto targets=gui_broadcast_targets();
+            if(symbol.starts_with("PostMessage")){if(gui_.queue.size()+targets.size()>10000)fail(1816);else {for(const auto handle:targets){auto copy=msg;copy.window=handle;enqueue_gui_message(copy);}result=1;}}
+            else if(!targets.empty()){std::vector<GuestCallback> sends;const auto target=resolve("user32.dll",wide?"SendMessageW":"SendMessageA").value;
+                for(const auto handle:targets)sends.push_back({target,{handle,arg(1),arg(2),arg(3)}});start_callbacks(state,memory,std::move(sends),Continuation::ReturnCallback);return std::nullopt;}
+            arg.return_to(state,result);return std::nullopt;
+        }
         if(msg.message==6 || msg.message==7 || msg.message==8 || msg.message==0x1f || msg.message==0x215)
             detail::trace_gui_lifecycle(symbol,gui_,process_id(),threads_.current,msg.window,(std::uint64_t{msg.message}<<32)|static_cast<std::uint32_t>(msg.lparam));
         if(symbol.starts_with("SendMessage") && route_gui_send(state,memory,msg,wide))return std::nullopt;
         if (msg.window && !gui_.windows.contains(msg.window)) fail(1400);
         else if (symbol.starts_with("PostMessage")) { if (gui_.queue.size() >= 10000) fail(1816); else { enqueue_gui_message(msg); result = 1; } }
-        else if (msg.window) { dispatch(msg); return std::nullopt; }
+        else if (msg.window) {
+            // 同執行緒 SendMessage 的視窗程序框架：返回前 GetCurrentInputMessageSource 回報不可用。
+            const auto depth=runtime_.callbacks.size();dispatch(msg);if(runtime_.callbacks.size()>depth)runtime_.callbacks.back().gui_sent_message=true;return std::nullopt;
+        }
     } else if (symbol == "LoadCursorW" || symbol == "LoadCursorA") {
         return invoke_icon_api(state,memory,service);
     } else if (symbol == "GetSystemMetrics") {
@@ -982,6 +1022,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
                         start_callbacks(state,memory,{{resolve("user32.dll",wide?"SendMessageW":"SendMessageA").value,{window.parent,0x21,arg(2),arg(3)}}},Continuation::ReturnCallback,0);return std::nullopt;
                     }
                     result=(window.ex_style&0x08000000U)?3U:1U;
+                }
+                else if(dword(1)==0x319){
+                    // WM_APPCOMMAND：子視窗交給父視窗，頂層視窗未處理時通知 Shell hook（HSHELL_APPCOMMAND）。
+                    if(window.parent && window.parent!=gui_message_parent && gui_.windows.contains(window.parent)){
+                        start_callbacks(state,memory,{{resolve("user32.dll",wide?"SendMessageW":"SendMessageA").value,{window.parent,0x319,arg(2),arg(3)}}},Continuation::ReturnCallback,0);return std::nullopt;
+                    }
+                    notify_shell_hook(12,arg(3),window.desktop_object);result=0;
                 }
                 else if(dword(1)==6 && (dword(2)&65535U) && !(dword(2)>>16) && gui_root_window(gui_.focus)!=handle){
                     start_callbacks(state,memory,{{resolve("user32.dll","SetFocus").value,{handle}}},Continuation::Return,0);return std::nullopt;

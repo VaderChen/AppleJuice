@@ -1,7 +1,7 @@
 // D3D9 COM ABI；參照 Microsoft d3d9.h 與 MinGW-w64 宣告。
 #pragma once
 namespace x64arm::d3d9_abi {
-enum class Kind { Factory, Device, Surface, Texture, CubeTexture, VertexBuffer, IndexBuffer, SwapChain, Mesh, Blob, PRT, VertexShader, PixelShader, VertexDeclaration, ConstantTable, Sprite, Font, StateBlock, Effect, EffectPool, RenderToSurface, XFile, XEnum, XData, Gutter, Skin, AnimSet, CompressedSet, AnimController, PRTComp, RenderToEnvMap, PRTEngine, VolumeTexture, Volume, Query };
+enum class Kind { Factory, Device, Surface, Texture, CubeTexture, VertexBuffer, IndexBuffer, SwapChain, Mesh, Blob, PRT, VertexShader, PixelShader, VertexDeclaration, ConstantTable, Sprite, Font, StateBlock, Effect, EffectPool, RenderToSurface, XFile, XEnum, XData, Gutter, Skin, AnimSet, CompressedSet, AnimController, PRTComp, RenderToEnvMap, PRTEngine, VolumeTexture, Volume, Query, MatrixStack };
 constexpr WindowsServiceDescriptor queryMethods[]{
 {"internal-d3d9","Query.QueryInterface",3},{"internal-d3d9","Query.AddRef",1},{"internal-d3d9","Query.Release",1},
 {"internal-d3d9","Query.GetDevice",2},{"internal-d3d9","Query.GetType",1},{"internal-d3d9","Query.GetDataSize",1},
@@ -63,6 +63,15 @@ constexpr WindowsServiceDescriptor constantTableMethods[]{
 {"internal-d3d9","ConstantTable.SetMatrixTranspose",4},
 {"internal-d3d9","ConstantTable.SetMatrixTransposeArray",5},
 {"internal-d3d9","ConstantTable.SetMatrixTransposePointerArray",5}};
+// ID3DXMatrixStack（vtable 順序）：IUnknown、Pop、Push、LoadIdentity、LoadMatrix、MultMatrix、MultMatrixLocal、RotateAxis(Local)、RotateYawPitchRoll(Local)、Scale(Local)、Translate(Local)、GetTop。
+constexpr WindowsServiceDescriptor matrixStackMethods[]{
+    {"internal-d3d9","MatrixStack.QueryInterface",3},{"internal-d3d9","MatrixStack.AddRef",1},{"internal-d3d9","MatrixStack.Release",1},
+    {"internal-d3d9","MatrixStack.Pop",1},{"internal-d3d9","MatrixStack.Push",1},{"internal-d3d9","MatrixStack.LoadIdentity",1},
+    {"internal-d3d9","MatrixStack.LoadMatrix",2},{"internal-d3d9","MatrixStack.MultMatrix",2},{"internal-d3d9","MatrixStack.MultMatrixLocal",2},
+    {"internal-d3d9","MatrixStack.RotateAxis",3},{"internal-d3d9","MatrixStack.RotateAxisLocal",3},
+    {"internal-d3d9","MatrixStack.RotateYawPitchRoll",4},{"internal-d3d9","MatrixStack.RotateYawPitchRollLocal",4},
+    {"internal-d3d9","MatrixStack.Scale",4},{"internal-d3d9","MatrixStack.ScaleLocal",4},
+    {"internal-d3d9","MatrixStack.Translate",4},{"internal-d3d9","MatrixStack.TranslateLocal",4},{"internal-d3d9","MatrixStack.GetTop",1}};
 constexpr WindowsServiceDescriptor blobMethods[]{
     {"internal-d3d9","Blob.QueryInterface",3},{"internal-d3d9","Blob.AddRef",1},
     {"internal-d3d9","Blob.Release",1},{"internal-d3d9","Blob.GetBufferPointer",1},

@@ -60,6 +60,7 @@ include("${PROJECT_SOURCE_DIR}/cmake/HlslccCoalesceTemps.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalOutputControlPoints.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalMergedHelpers.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalBitOps.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalPatchConstantRedirect.cmake")
 file(GLOB HLSLCC_SOURCES CONFIGURE_DEPENDS "${hlslcc_SOURCE_DIR}/src/*.cpp" "${hlslcc_SOURCE_DIR}/src/cbstring/*.c")
 # AppleDouble 是二進位中繼資料，副檔名相同也不能當成原始碼編譯。
 list(FILTER HLSLCC_SOURCES EXCLUDE REGEX "/[.]_[^/]*$")

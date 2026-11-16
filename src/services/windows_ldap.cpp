@@ -3,6 +3,7 @@
 #include "ldap_api.hpp"
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #if defined(__APPLE__) && defined(__clang__)
 // WinLDAP 需要 LDAP 協定與 BER 結果，OpenDirectory 不是可替換的 ABI；限此橋接層使用系統 OpenLDAP。
 #pragma clang diagnostic push
@@ -26,6 +27,12 @@ struct LdapMessage {
     std::shared_ptr<LdapConnection> connection;
     ~LdapMessage(){if(native)ldap_msgfree(native);}
 };
+// ber_alloc_t／ber_init 建立的編解碼元素；marks 為 ber_first_element 給客體的不透明游標（序號＋1）。
+struct LdapBer {
+    BerElement* native{};
+    std::vector<char*> marks;
+    ~LdapBer(){if(native)ber_free(native,1);}
+};
 struct LdapCursor {
     BerElement* native{};
     LDAPMessage* entry{};
@@ -41,6 +48,18 @@ struct LdapState {
     std::map<std::uint64_t,std::shared_ptr<LdapCursor>> cursors;
     std::set<std::uint64_t> strings,values;
     std::map<std::pair<unsigned,bool>,std::uint64_t> errors;
+    // 擴充家族：字串清單（ldap_value_free）、berval（ber_bvfree）、控制項與控制項陣列、分頁搜尋與 ldap_startup 實例。
+    std::set<std::uint64_t> lists,bervals,controls,control_arrays,instances;
+    std::map<std::uint64_t,std::shared_ptr<struct LdapPagedSearch>> searches;
+    std::map<std::uint64_t,std::shared_ptr<LdapBer>> bers;
+    std::uint32_t debug_flags{};
+};
+struct LdapPagedSearch {
+    std::shared_ptr<LdapConnection> connection;
+    std::string base,filter;int scope{},attributes_only{};bool has_attributes{};std::vector<std::string> attributes;
+    // 呼叫端的伺服器／用戶端控制項（深複製）與排序控制項。
+    std::vector<std::pair<std::string,std::pair<std::string,bool>>> server_controls,client_controls;
+    std::uint32_t page_time_limit{},total_size_limit{};std::string cookie;bool finished{};std::uint32_t total{};int pending{-1};
 };
 #endif
 std::optional<std::uint32_t> WindowsServices::invoke_ldap(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& descriptor){
@@ -54,15 +73,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_ldap(GuestState& state,Gues
     if(!ldap_)ldap_=std::make_shared<LdapState>();auto& data=*ldap_;
     const bool wide=name.ends_with('W');const unsigned pointer=x86_?4U:8U;const std::uint8_t bits=x86_?32:64;
     const auto ptr=[&](std::uint64_t at){return memory.load(GuestAddress{at},bits);};
-    const auto text=[&](std::uint64_t at){return at?utf16_to_utf8(wide?read_utf16(memory,GuestAddress{at}):cp1252_to_utf16(read_ansi(memory,at))):std::string{};};
+    // A 版字串以程序 ACP（UTF-8，GetACP＝65001）交換；協定上一律為 UTF-8。
+    const auto text=[&](std::uint64_t at){return at?(wide?utf16_to_utf8(read_utf16(memory,GuestAddress{at})):read_ansi(memory,at)):std::string{};};
     const auto error=[&](unsigned code,bool null=false){last_error_=code;return done(null?0:code);};
     const auto allocate=[&](std::size_t size){const auto p=allocate_heap(memory,size);if(!p)throw std::bad_alloc();return p;};
     const auto string=[&](const char* value){
         if(!value)return std::uint64_t{};const auto unicode=utf8_to_utf16_lossy(value);std::vector<std::uint8_t> bytes;
-        if(wide)bytes=utf16_bytes(unicode);else {bool replaced=false;const auto ansi=utf16_to_cp1252(unicode,'?',replaced);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
+        if(wide)bytes=utf16_bytes(unicode);else {const auto utf8=utf16_to_utf8(unicode);bytes.assign(utf8.begin(),utf8.end());bytes.push_back(0);}
         const auto p=allocate(bytes.size());memory.write(GuestAddress{p},bytes);data.strings.insert(p);return p;
     };
     try {
+#include "windows_ldap_extended.inc"
         if(name=="LdapGetLastError")return done(last_error_);
         if(name.starts_with("ldap_err2string")){
             const auto code=static_cast<unsigned>(arg(0));const auto key=std::make_pair(code,wide);auto& cached=data.errors[key];
@@ -77,10 +98,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ldap(GuestState& state,Gues
         }
         if(name=="ldap_msgfree"){
             const auto found=data.messages.find(arg(0));if(found==data.messages.end())return error(89);
-            const auto message=found->second;
-            for(auto it=data.entries.begin();it!=data.entries.end();)if(it->second.message==message){(void)free_heap(memory,it->first,state);it=data.entries.erase(it);}else ++it;
-            for(auto it=data.cursors.begin();it!=data.cursors.end();)if(it->second->message==message){(void)free_heap(memory,it->first,state);it=data.cursors.erase(it);}else ++it;
-            data.messages.erase(found);(void)free_heap(memory,arg(0),state);return done(0);
+            free_message(arg(0));return done(0);
         }
         if(name=="ldap_count_values_len"){
             if(!arg(0))return done(0);if(!data.values.contains(arg(0)))return error(89);unsigned count=0;while(ptr(arg(0)+count*pointer)){if(++count>65536)throw HostCallFault("LDAP 值清單超出容量");}return done(count);

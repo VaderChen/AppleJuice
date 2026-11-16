@@ -5,6 +5,15 @@ set -euo pipefail
 project_dir="${0:A:h}"
 app_path="$project_dir/build/launcher/Win64 Launcher.app"
 engine_path="$app_path/Contents/MacOS/x64arm-engine"
+reuse_args=(--reuse-verified)
+if (( $# )); then
+    if (( $# == 1 )) && [[ "$1" == --rebuild ]]; then
+        reuse_args=()
+    else
+        print -u2 '用法：./run.command [--rebuild]'
+        exit 2
+    fi
+fi
 
 # Finder 啟動的終端也能找到 Homebrew 與使用者安裝的建置工具。
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/go/bin:$PATH"
@@ -31,8 +40,12 @@ else
     print -u2 '將沿用既有建置設定；若未授權，x86 程式不會使用原生 MMU。'
 fi
 
-print '正在確認增量建置；沒有修改時直接沿用既有產物…'
-python3 "$project_dir/scripts/build_launcher.py" "${build_args[@]}"
+if (( ${#reuse_args[@]} )); then
+    print '正在核對已驗證 Launcher；缺少有效成品時自動建置…'
+else
+    print '正在依目前來源更新 Launcher…'
+fi
+python3 "$project_dir/scripts/build_launcher.py" "${reuse_args[@]}" "${build_args[@]}"
 
 if (( ${#build_args[@]} )); then
     if ! /usr/bin/codesign -d --entitlements - --xml "$engine_path" 2>/dev/null \
@@ -79,5 +92,5 @@ for identifier in identifiers:
         subprocess.run(['/usr/bin/defaults', 'delete', identifier, 'AppleJuiceWindowSpaceUUID'], check=True)
 PY_POLICY
 
-print '正在啟動最新的 Win64 Launcher…'
+print '正在啟動已驗證的 Win64 Launcher…'
 exec /usr/bin/open -g -F "$app_path"

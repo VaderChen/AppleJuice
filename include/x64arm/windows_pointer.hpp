@@ -10,6 +10,7 @@ struct PointerDeviceState {
     bool attached{},in_range{};
     std::uint32_t starting_id{};
     bool injected{}; // InjectTouchInput 的虛擬裝置；不隨原生裝置列舉移除。
+    std::uint32_t synthetic_type{}; // CreateSyntheticPointerDevice 的 PT_TOUCH／PT_PEN；0 為原生或 InjectTouchInput 裝置。
 };
 struct PointerPacket {
     input::PointerSample sample;

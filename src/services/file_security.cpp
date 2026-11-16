@@ -735,6 +735,7 @@ void invalidate_native_file_security_cache(){}
 NativeFileSecurityCacheStats native_file_security_cache_stats(){return {};}
 #endif
 NativeFileSecurity read_native_file_security(const HostFile& file, bool with_acl) {
+    if(file.named_stream())return read_native_file_security(file.security_file(),with_acl);
     NativeFileIdentityScope identity_scope;
 #if defined(_WIN32)
     (void)file; (void)with_acl; throw SddlError{50};

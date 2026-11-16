@@ -28,7 +28,34 @@ inline const Function* function(std::string_view name){
     static const auto index=[] {std::map<std::string_view,const Function*> out;for(const auto& f:functions())out.emplace(f.name,&f);return out;}();
     const auto it=index.find(name);return it==index.end()?nullptr:it->second;
 }
-inline auto descriptors(){std::vector<WindowsServiceDescriptor> out;for(const auto& f:functions())out.push_back({"msvcp90.dll",f.name,f.assignment?(f.x86?1U:2U):0U,0,0,0,!f.assignment});return out;}
+// VC10 沿用 VC9 的 numeric_limits 名稱與值（不依 STL 物件版面），另加 C++11 的 lowest() 與改為 struct 的 _Num_*_base 指派。
+inline auto descriptors(){
+    std::vector<WindowsServiceDescriptor> out;
+    for(const auto family:{"msvcp90.dll","msvcp100.dll"})
+        for(const auto& f:functions())out.push_back({family,f.name,f.assignment?(f.x86?1U:2U):0U,0,0,0,!f.assignment});
+    return out;
+}
+struct Modern {std::string name;unsigned type;bool lowest,x86;};
+inline const auto& modern_functions(){
+    static const auto values=[] {
+        std::vector<Modern> out;
+        for(unsigned t=0;t<std::size(types);++t){const auto code=std::string(types[t].code);out.push_back({"?lowest@?$numeric_limits@"+code+"@std@@SA"+code+"XZ",t,true,false});}
+        for(const auto base:{"_Num_base","_Num_int_base","_Num_float_base"})for(const bool x86:{true,false})
+            out.push_back({"??4"+std::string(base)+(x86?"@std@@QAEAAU01@ABU01@@Z":"@std@@QEAAAEAU01@AEBU01@@Z"),0,false,x86});
+        return out;
+    }();return values;
+}
+inline const Modern* modern_function(std::string_view name){
+    static const auto index=[] {std::map<std::string_view,const Modern*> out;for(const auto& f:modern_functions())out.emplace(f.name,&f);return out;}();
+    const auto it=index.find(name);return it==index.end()?nullptr:it->second;
+}
+// lowest()：整數為 min()，浮點為 -max()（翻轉 max 的符號位元）。
+inline std::uint64_t lowest_value(const Type& type){return type.floating?type.values[1]^(std::uint64_t{1}<<(type.bits-1)):type.values[0];}
+inline auto modern_descriptors(){
+    std::vector<WindowsServiceDescriptor> out;
+    for(const auto& f:modern_functions())out.push_back({"msvcp100.dll",f.name,f.lowest?0U:(f.x86?1U:2U),0,0,0,f.lowest});
+    return out;
+}
 struct Constant {std::string name;std::uint64_t value;unsigned bytes;};
 inline const std::vector<Constant>& constants(){
     static const auto values=[] {

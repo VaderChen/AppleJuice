@@ -4,6 +4,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace x64arm::automation {
 constexpr std::uint32_t invalid=0x80070057U, mismatch=0x80020005U,
@@ -32,4 +33,9 @@ std::optional<bool> parse_bool(std::u16string_view,std::uint32_t lcid,bool local
 std::optional<std::array<unsigned,8>> time_fields(double);
 std::optional<double> date_value(std::array<unsigned,8>);
 std::u16string bool_string(bool,std::uint32_t lcid,bool local);
+// Var<T>From<S> 名稱中的純量型別（UI1、I2、…、Cy、Date、Bool、Dec）→ VARTYPE 與值大小；未知時回 {0,0}。
+std::pair<std::uint16_t,unsigned> scalar_type(std::string_view);
+// 保留來源型別的取整：Abs 取絕對值（整數溢位時依 VarNeg 規則提升）、Fix 朝零、Int 朝負無限、Round 依 decimals 位做銀行家捨入。
+enum class Rounding : unsigned {Abs,Fix,Int,Round};
+std::uint32_t number_rounding(Rounding,const Value&,int decimals,Value&);
 }

@@ -38,7 +38,8 @@ struct Wave {
     std::uint64_t creator{},position{},begin{},end{},captured{},notify_window{};
     std::uint32_t time_format{},input_id{UINT32_MAX},output_id{UINT32_MAX},buffer_seconds{1};
     Mode mode{Mode::Stopped},paused_mode{Mode::Playing};
-    float left{1},right{1};bool shareable{},dirty{},insert_record{},input_set{},output_set{};
+    // auto_close：命令字串自動開啟的裝置，非同步播放／錄音結束後自動關閉。
+    float left{1},right{1};bool shareable{},dirty{},insert_record{},input_set{},output_set{},auto_close{};
     std::shared_ptr<audio::Buffer> buffer;
     std::unique_ptr<audio::Output> output;
     std::unique_ptr<audio::Input> input;

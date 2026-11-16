@@ -1,4 +1,5 @@
 #pragma once
+#include <utility>
 #include <string_view>
 
 namespace x64arm {
@@ -51,6 +52,12 @@ constexpr std::string_view windows_api_set_family(std::string_view name){
 }
 constexpr std::string_view windows_api_set_host(std::string_view name){
     if(name=="kernelbase.dll")return "kernel32.dll";
+    // VC++ 執行階段的 Store 版名稱（*_app.dll）與桌面版匯出相同，轉到同一份內建實作。
+    constexpr std::pair<std::string_view,std::string_view> store_runtimes[]{
+        {"vcruntime140_app.dll","vcruntime140.dll"},{"vcruntime140_1_app.dll","vcruntime140_1.dll"},{"msvcp140_app.dll","msvcp140.dll"},
+        {"msvcp140_1_app.dll","msvcp140_1.dll"},{"msvcp140_2_app.dll","msvcp140_2.dll"},{"msvcp140_atomic_wait_app.dll","msvcp140_atomic_wait.dll"},
+        {"msvcp140_codecvt_ids_app.dll","msvcp140_codecvt_ids.dll"},{"concrt140_app.dll","concrt140.dll"}};
+    for(const auto& [store,desktop]:store_runtimes)if(name==store)return desktop;
     if(!name.starts_with("api-ms-win-") && !name.starts_with("ext-ms-win-"))return name;
     const auto family=windows_api_set_family(name);
     for(const auto& entry:windows_api_set_families){
@@ -75,4 +82,5 @@ static_assert(windows_api_set_host("api-ms-win-gaming-tcui-l1-1-4.dll")=="gaming
 static_assert(windows_api_set_host("ext-ms-win-ntuser-powermanagement-l1-1-0.dll")=="user32.dll");
 static_assert(windows_api_set_host("api-ms-win-crt-runtime-l1-1-0.dll")=="api-ms-win-crt-runtime-l1-1-0.dll");
 static_assert(windows_api_set_host("ext-ms-win-dxcore-l1-1-0.dll")=="ext-ms-win-dxcore-l1-1-0.dll");
+static_assert(windows_api_set_host("vcruntime140_app.dll")=="vcruntime140.dll" && windows_api_set_host("msvcp140_app.dll")=="msvcp140.dll");
 }

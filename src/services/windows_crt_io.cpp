@@ -349,7 +349,7 @@ std::span<const WindowsServiceDescriptor> crt_io_service_descriptors(){
         {"crt", "_fdopen", 2},{"crt", "_wfdopen", 2},{"crt", "_close", 1},{"crt", "_read", 3},
         {"crt", "_open", 3},{"crt", "_wopen", 3},{"crt", "_sopen", 4},{"crt", "_wsopen", 4},
         {"crt", "_sopen_s", 5},{"crt", "_wsopen_s", 5},{"crt", "_sopen_dispatch", 6},{"crt", "_wsopen_dispatch", 6},
-        {"crt", "tmpfile", 0},{"crt", "tmpfile_s", 1},{"crt","_umask",1},{"crt","_umask_s",2},
+        {"crt", "tmpfile", 0},{"crt", "tmpfile_s", 1},{"crt", "_rmtmp", 0},{"crt","_umask",1},{"crt","_umask_s",2},
         {"crt", "_lseek", 3},{"crt", "_lseeki64", 3,1U<<1},{"crt", "_tell", 1},{"crt", "_telli64", 1},
         {"crt", "fgetpos", 2},{"crt", "fsetpos", 2},{"crt", "fseek", 3},{"crt", "_fseeki64", 3,1U<<1},
         {"crt", "ftell", 1},{"crt", "_ftelli64", 1},{"crt", "feof", 1},{"crt", "ferror", 1},
@@ -394,8 +394,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
     if(descriptor_call && symbol!="_get_osfhandle" && symbol!="_isatty")lock_row(u32(0));
     if(symbol=="_dup2")lock_row(u32(1));
     if(tracked_stream)lock_stream(tracked_stream);
-    const bool flush_all=symbol=="_flushall",close_all=symbol=="_fcloseall";
+    const bool flush_all=symbol=="_flushall",close_all=symbol=="_fcloseall",remove_temporary=symbol=="_rmtmp";
     std::vector<std::uint64_t> all_streams;
+    if(remove_temporary){for(const auto& [stream,file]:runtime_.streams)if(file.temporary_file)all_streams.push_back(stream);for(const auto stream:all_streams)lock_stream(stream);}
     if(flush_all || close_all || (symbol=="fflush" && !arg(0))){
         if(!close_all)for(unsigned fd=flush_all?0U:1U;fd<3;++fd)
             if(standard_open_[fd])all_streams.push_back(crt_stream(runtime_base_.value+0x800+fd*128));
@@ -407,6 +408,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
     }
     const CrtIoScope io_scope(*this,state,memory,io_locks);
     if(!io_scope)return std::nullopt;
+    if(remove_temporary){
+        // _rmtmp：關閉並刪除 tmpfile 建立且仍開啟的串流（沿用 fclose 的關閉與 D 模式刪除），回傳成功關閉的數量。
+        std::uint32_t count=0;
+        for(const auto stream:all_streams)if(crt_file(stream) && crt_close_file(state,memory,stream,true))++count;
+        arg.return_to(state,count);return std::nullopt;
+    }
     if(flush_all || close_all){
         std::uint32_t count=0;bool success=true;
         for(const auto stream:all_streams)if(auto* file=crt_file(stream)){
@@ -661,6 +668,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_io(GuestState& state,Gu
             memory.write(GuestAddress{scratch},std::vector<std::uint8_t>{'t',0,0,0,'w','+','b','D',0});
             const auto path=nested_service(state,memory,"crt","_tempnam",{0,scratch});
             const auto stream=path?nested_service(state,memory,"crt","fopen",{path,scratch+4}):0;
+            if(stream)if(auto* file=crt_file(stream))file->temporary_file=true;
             if(path)(void)free_heap(memory,path,state);
             (void)free_heap(memory,scratch,state);
             if(secure){

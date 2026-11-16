@@ -144,7 +144,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_minidump(GuestState& state,
             }
             snapshot.modules.push_back(std::move(item));
         };
-        if(runtime_.image.base)module(runtime_.image);for(const auto& [base,loaded]:runtime_.loaded_modules){(void)base;module(loaded.image);}for(const auto& [base,image]:runtime_.builtin_images){(void)base;module(image);}
+        if(runtime_.image.base)module(runtime_.image);for(const auto& [base,loaded]:runtime_.loaded_modules){(void)base;module(loaded.image);}for(const auto& [base,image]:runtime_.builtin_images){(void)base;if(!image.private_code)module(image);}
         if(flags&0x800){auto at=UINT64_C(0);while(at<user_address_limit()){const auto info=virtual_memory_information(memory,at);if(!info.size || info.size>user_address_limit()-at || snapshot.information.size()>=65536)throw DumpFailure{8};snapshot.information.push_back(info);at+=info.size;}}
         // 保存客體原有區域；後續回呼使用的 dumper scratch 不應混入 dump。
         for(auto at=UINT64_C(0);;){const auto mapping=memory.next_mapping(GuestAddress{at});if(!mapping)break;

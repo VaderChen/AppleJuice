@@ -7,6 +7,7 @@
 #include "msvcp90_string_exports.hpp"
 #include "msvcp90_stream_exports.hpp"
 #include "msvcp_numeric_limits.hpp"
+#include "windows_math_environment.hpp"
 #include "x64arm/x87_fp.hpp"
 #include "guest_msvcp90_string_code.hpp"
 #include "guest_tls_layout.h"
@@ -23,7 +24,7 @@ void WindowsServices::initialize_guest_msvcp90(GuestMemory& memory){
     auto parsed=parse_pe_image(bytes,GuestAddress{base},true,memory.limit());
     if(!parsed.imports.empty() || !parsed.delay_imports.empty() || msvcp90_string::image_offset+parsed.metadata.image_size>windows_address_layout::gateway_capacity)
         throw std::logic_error("VC9 常駐字串映像不符合獨立模組契約");
-    auto image=parsed.runtime;image.path=u"[guest-msvcp90]";image.export_names.clear();image.export_ordinals.clear();
+    auto image=parsed.runtime;image.private_code=true;image.path=u"[guest-msvcp90]";image.export_names.clear();image.export_ordinals.clear();
     for(const auto& entry:msvcp90_string::bindings())if(lowering && entry.x86==x86_){
         const auto name=msvcp90_string::native_name(entry);if(name.empty())continue;
         const auto found=parsed.runtime.export_names.find(name);
@@ -56,6 +57,10 @@ std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
 #include "msvcp100_streambuf_descriptors.inc"
 #include "msvcp100_descriptors.inc"
 #include "msvcp140_descriptors.inc"
+#include "msvcp_streambuf_descriptors.inc"
+#include "msvcp_iostream_member_descriptors.inc"
+#include "msvcp_num_facet_descriptors.inc"
+#include "msvcp140_misc_descriptors.inc"
         {"crt","??0exception@std@@QEAA@AEBV01@@Z",2},
         {"crt","??0exception@std@@QEAA@XZ",1},{"crt","??0exception@std@@QAE@XZ",0},
         {"crt","??4exception@std@@QEAAAEAV01@AEBV01@@Z",2},{"crt","??4exception@std@@QAEAAV01@ABV01@@Z",1},
@@ -119,6 +124,23 @@ std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
         {"crt","??9type_info@@QEBA_NAEBV0@@Z",2},{"crt","??9type_info@@QBE_NABV0@@Z",1},
         {"crt","?before@type_info@@QEBA_NAEBV1@@Z",2},{"crt","?before@type_info@@QBE_NABV1@@Z",1},
         {"crt","?raw_name@type_info@@QEBAPEBDXZ",1},{"crt","?raw_name@type_info@@QBEPBDXZ",0},
+        // VC6～VC7 的 type_info 比較回傳 int（完整 EAX），與 bool 版本共用宿主比較；name()／name(__type_info_node*) 快取反修飾名稱。
+        {"crt","??8type_info@@QEBAHAEBV0@@Z",2},{"crt","??8type_info@@QBEHABV0@@Z",1},
+        {"crt","??9type_info@@QEBAHAEBV0@@Z",2},{"crt","??9type_info@@QBEHABV0@@Z",1},
+        {"crt","?before@type_info@@QEBAHAEBV1@@Z",2},{"crt","?before@type_info@@QBEHABV1@@Z",1},
+        {"crt","?name@type_info@@QEBAPEBDXZ",1},{"crt","?name@type_info@@QBEPBDXZ",0},
+        {"crt","?name@type_info@@QEBAPEBDPEAU__type_info_node@@@Z",2},{"crt","?name@type_info@@QBEPBDPAU__type_info_node@@@Z",1},
+        {"crt","?_name_internal_method@type_info@@QEBAPEBDPEAU__type_info_node@@@Z",2},{"crt","?_name_internal_method@type_info@@QBEPBDPAU__type_info_node@@@Z",1},
+        // bad_cast／bad_typeid 的指派、預設建構閉包、__RTDynamicCast 用的私有建構子，以及 __non_rtti_object。
+        {"crt","??4bad_cast@std@@QEAAAEAV01@AEBV01@@Z",2},{"crt","??4bad_cast@std@@QAEAAV01@ABV01@@Z",1},
+        {"crt","??4bad_typeid@std@@QEAAAEAV01@AEBV01@@Z",2},{"crt","??4bad_typeid@std@@QAEAAV01@ABV01@@Z",1},
+        {"crt","??_Fbad_cast@std@@QEAAXXZ",1},{"crt","??_Fbad_cast@std@@QAEXXZ",0},{"crt","??_Fbad_typeid@std@@QEAAXXZ",1},{"crt","??_Fbad_typeid@std@@QAEXXZ",0},
+        {"crt","??0bad_cast@std@@AEAA@PEBQEBD@Z",2},{"crt","??0bad_cast@std@@AAE@PBQBD@Z",1},
+        {"crt","??0__non_rtti_object@std@@QEAA@PEBD@Z",2},{"crt","??0__non_rtti_object@std@@QAE@PBD@Z",1},
+        {"crt","??0__non_rtti_object@std@@QEAA@AEBV01@@Z",2},{"crt","??0__non_rtti_object@std@@QAE@ABV01@@Z",1},
+        {"crt","??1__non_rtti_object@std@@UEAA@XZ",1},{"crt","??1__non_rtti_object@std@@UAE@XZ",0},
+        {"crt","??4__non_rtti_object@std@@QEAAAEAV01@AEBV01@@Z",2},{"crt","??4__non_rtti_object@std@@QAEAAV01@ABV01@@Z",1},
+        {"crt","?unexpected@@YAXXZ",0},{"crt","?set_new_handler@@YAP6AXXZP6AXXZ@Z",1},
         {"crt","_seh_filter_dll",2},{"crt","_seh_filter_exe",2},{"crt","_amsg_exit",1},{"crt","_assert",3},{"crt","_wassert",3},{"crt","_except_handler3",4},{"crt","_except_handler4_common",6},
         {"crt","_set_error_mode",1},{"crt","_set_purecall_handler",1},{"crt","_get_purecall_handler",0},{"crt","set_terminate",1},{"crt","_get_terminate",0},
         {"crt","_local_unwind2",2},{"crt","_seh_longjmp_unwind",1},{"crt","__CxxLongjmpUnwind",1},{"crt","_abnormal_termination",0},
@@ -135,15 +157,19 @@ std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
         const auto strings=msvcp90_string::descriptors();all.insert(all.end(),strings.begin(),strings.end());
         const auto streams=msvcp90_stream::descriptors();all.insert(all.end(),streams.begin(),streams.end());
         const auto numeric=msvcp_numeric::descriptors();all.insert(all.end(),numeric.begin(),numeric.end());
+        const auto modern=msvcp_numeric::modern_descriptors();all.insert(all.end(),modern.begin(),modern.end());
         for(const auto& item:table)if(item.symbol.starts_with("?_Fiopen@std@@")){auto entry=item;entry.family="msvcp90.dll";all.push_back(entry);}
         // 零參數 bool 查詢不帶 STL 物件版型，各版本共用目前執行緒／fiber 的 EH 狀態。
-        for(const auto family:{"msvcp80.dll","msvcp90.dll","msvcp100.dll","msvcp110.dll","msvcp120.dll"})
+        for(const auto family:{"msvcp90.dll","msvcp100.dll","msvcp110.dll","msvcp120.dll"}) // msvcp80 經家族對應共用 msvcp90
             all.push_back({family,"?uncaught_exception@std@@YA_NXZ",0});
         for(const auto family:{"msvcp100.dll","msvcp110.dll","msvcp120.dll"})
             for(const auto& item:table)if(item.family=="msvcp140.dll" &&
                 ((item.symbol.starts_with("?_X") && !item.symbol.starts_with("?_Xregex")) || item.symbol.starts_with("?_Fiopen@std@@"))){
                 auto entry=item;entry.family=family;all.push_back(entry);
             }
+        // shared_ptr 原子操作的全域自旋鎖：VC11／VC12 與 msvcp140 同為無引數 C 匯出，共用同一個鎖旗標。
+        for(const auto family:{"msvcp110.dll","msvcp120.dll"})
+            for(const auto name:{"_Lock_shared_ptr_spin_lock","_Unlock_shared_ptr_spin_lock"})all.push_back({family,name,0,0,0,0,true});
         // _Fiopen 的路徑／openmode／sharemode ABI 相同，FILE 仍由共用 CRT 管理。
         // VC11／VC12 的字串版映射保留指標回傳 ABI；未知 errno 回傳 NULL。
         for(const auto family:{"msvcp110.dll","msvcp120.dll"})
@@ -254,9 +280,17 @@ std::uint64_t WindowsServices::msvc_exception_cells(GuestState&,GuestMemory& mem
 std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.family=="msvcp100.dll" && service.symbol.find("_Lockit@std@@")!=service.symbol.npos)return invoke_nt_native(state,memory,service);
     if(service.symbol.starts_with("?_XGetLastError@") || service.symbol.starts_with("?generic_category@") || service.symbol.starts_with("?system_category@") || service.symbol.starts_with("?iostream_category@") || service.symbol.starts_with("?_Winerror_map@") || service.symbol.starts_with("?_Winerror_message@") || service.symbol.starts_with("?_Syserror_map@") || service.symbol.starts_with("?_Throw_future_error@") || service.symbol.starts_with("?_Rethrow_future_exception@"))return invoke_msvcp100(state,memory,service);
-    if(service.symbol.starts_with("??0exception@") || service.symbol.starts_with("??1exception@") || service.symbol.starts_with("??4exception@") || service.symbol.starts_with("??0bad_") || service.symbol.starts_with("??1bad_") || service.symbol.starts_with("?what@exception@") || service.symbol.starts_with("?_type_info_dtor_internal_method@") || service.family=="x64arm.msvc" || service.symbol.starts_with("__RT") || service.symbol.starts_with("?_X") || service.symbol=="?_Random_device@std@@YAIXZ")return invoke_rtti(state,memory,service);
+    if(service.symbol.starts_with("??0exception@") || service.symbol.starts_with("??1exception@") || service.symbol.starts_with("??4exception@") || service.symbol.starts_with("??0bad_") || service.symbol.starts_with("??1bad_") ||
+       service.symbol.starts_with("??4bad_") || service.symbol.starts_with("??_Fbad_") || service.symbol.find("__non_rtti_object@")!=std::string_view::npos || service.symbol.starts_with("?what@exception@") || service.symbol.starts_with("?_type_info_dtor_internal_method@") || service.family=="x64arm.msvc" || service.symbol.starts_with("__RT") || service.symbol.starts_with("?_X") || service.symbol=="?_Random_device@std@@YAIXZ")return invoke_rtti(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
-    if(service.family=="msvcp90.dll")if(const auto* numeric=msvcp_numeric::function(symbol)){
+    if(service.family=="msvcp100.dll")if(const auto* modern=msvcp_numeric::modern_function(symbol)){
+        if(!modern->lowest){arg.return_to(state,x86_?state.reg(Gpr::Rcx)&UINT32_MAX:arg(0));return std::nullopt;}
+        const auto& type=msvcp_numeric::types[modern->type];const auto value=msvcp_numeric::lowest_value(type);
+        // -max() 是有限值，經 double 中介回傳不改變位元。
+        if(type.floating)windows_floating_return(state,x86_,type.bits==32?static_cast<double>(std::bit_cast<float>(static_cast<std::uint32_t>(value))):std::bit_cast<double>(value),type.bits==32);
+        arg.return_to(state,value,!type.floating && type.bits==64);return std::nullopt;
+    }
+    if(service.family=="msvcp90.dll" || service.family=="msvcp100.dll")if(const auto* numeric=msvcp_numeric::function(symbol)){
         if(numeric->assignment){arg.return_to(state,x86_?state.reg(Gpr::Rcx)&UINT32_MAX:arg(0));return std::nullopt;}
         const auto& type=msvcp_numeric::types[numeric->type];const auto value=type.values[numeric->operation];
         if(type.floating){
@@ -287,9 +321,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,Gues
        (service.family=="msvcp140.dll" && (symbol.find("basic_streambuf@")!=symbol.npos || symbol.find("basic_ios@")!=symbol.npos ||
         symbol.find("basic_istream@")!=symbol.npos || symbol.find("basic_ostream@")!=symbol.npos || symbol.find("basic_iostream@")!=symbol.npos ||
         symbol.find("codecvt")!=symbol.npos || symbol.find("ctype@")!=symbol.npos || symbol.find("_Locinfo@")!=symbol.npos ||
-        symbol.find("num_put@")!=symbol.npos || symbol.find("numpunct@")!=symbol.npos || symbol.find("numpunct_byname@")!=symbol.npos ||
+        symbol.find("num_put@")!=symbol.npos || symbol.find("num_get@")!=symbol.npos || symbol.find("numpunct@")!=symbol.npos ||
+        symbol.find("@threads@stdext@@")!=symbol.npos || symbol.find("ctype_base@")!=symbol.npos || symbol.find("_Timevec@")!=symbol.npos || symbol.find("_Winit@")!=symbol.npos ||
+        symbol.starts_with("?setbase@") || symbol.starts_with("?setiosflags@") || symbol.starts_with("?resetiosflags@") || symbol=="?set_new_handler@std@@YAP6AXXZP6AXXZ@Z" || symbol.find("numpunct_byname@")!=symbol.npos ||
         symbol.find("@locale@std@@")!=symbol.npos || symbol.starts_with("?__ExceptionPtr") || symbol.starts_with("?setw@") || symbol.starts_with("?setprecision@") || symbol.starts_with("?_Throw_C_error@") ||
-        symbol.starts_with("?_Throw_Cpp_error@") || symbol.find("ios_base@std@@")!=symbol.npos || symbol.find("time_put@")!=symbol.npos)))return invoke_msvcp100(state,memory,service);
+        symbol.starts_with("?_Throw_Cpp_error@") || symbol.find("ios_base@std@@")!=symbol.npos || symbol.find("time_put@")!=symbol.npos || symbol.find("time_get@")!=symbol.npos ||
+        symbol.find("_Init_locks@std@@")!=symbol.npos)))return invoke_msvcp100(state,memory,service);
     if(symbol=="__processing_throw"){
         // vcruntime 每執行緒的 _ProcessingThrow；FH4 在派送 catch 期間增減。
         const auto cells=msvc_exception_cells(state,memory,true);arg.return_to(state,cells+(x86_?8:16));return std::nullopt;
@@ -361,7 +398,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,Gues
         if(static_cast<std::uint32_t>(arg(0))!=cpp_code){arg.return_to(state,0);return std::nullopt;}
         return invoke_msvc(state,memory,WindowsServiceDescriptor{"crt","_XcptFilter",2});
     }
-    if(symbol=="__unDName" || symbol=="__unDNameEx" || symbol=="__clean_type_info_names_internal" || symbol.starts_with("__std_type_info_"))return invoke_demangle(state,memory,service);
+    if(symbol=="__unDName" || symbol=="__unDNameEx" || symbol=="__clean_type_info_names_internal" || symbol.starts_with("__std_type_info_") ||
+       symbol.starts_with("?name@type_info@@") || symbol.starts_with("?_name_internal_method@type_info@@"))return invoke_demangle(state,memory,service);
     if(symbol=="set_terminate" || symbol=="_get_terminate"){
         const auto previous=runtime_.terminate_handler;
         if(symbol=="set_terminate")runtime_.terminate_handler=arg(0);
@@ -370,6 +408,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,Gues
     if((symbol=="?terminate@@YAXXZ" || symbol=="terminate" || symbol=="__std_terminate") && runtime_.terminate_handler){
         // 處理常式不應返回；返回時與 abort 相同以 3 結束。
         start_callbacks(state,memory,{{runtime_.terminate_handler,{}}},Continuation::Exit,3);return std::nullopt;
+    }
+    if(symbol=="?unexpected@@YAXXZ"){
+        // unexpected：呼叫 set_unexpected 登錄的處理常式（與 set_unexpected 同一個 runtime 資料格），返回或未登錄時進入 terminate（處理常式後以 3 結束）。
+        std::vector<GuestCallback> callbacks;
+        if(const auto handler=memory.load(GuestAddress{runtime_base_.value+192},x86_?32:64))callbacks.push_back({handler,{}});
+        if(runtime_.terminate_handler)callbacks.push_back({runtime_.terminate_handler,{}});
+        if(callbacks.empty())return 3;
+        start_callbacks(state,memory,std::move(callbacks),Continuation::Exit,3);return std::nullopt;
+    }
+    if(symbol=="?set_new_handler@@YAP6AXXZP6AXXZ@Z"){
+        // 舊版 set_new_handler(void(*)())：不能經此登錄處理常式，只移除目前的 _set_new_handler 處理常式並回傳 NULL。
+        runtime_.new_handler=0;arg.return_to(state,0);return std::nullopt;
     }
     if(symbol=="_set_purecall_handler" || symbol=="_get_purecall_handler"){
         const auto previous=runtime_.purecall_handler;

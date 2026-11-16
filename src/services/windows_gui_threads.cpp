@@ -127,6 +127,7 @@ bool WindowsServices::route_gui_send(GuestState& state,GuestMemory& memory,const
         GuiSentMessage request;request.message=message;request.sender=threads_.current;request.receiver=target->second.thread;
         request.sender_stack=state.reg(Gpr::Rsp);request.sender_rip=state.rip.value;request.wide=wide;
         request.timed=timed;request.timeout_flags=flags;request.result_pointer=result_pointer;
+        if(const auto source=input_message_source(false)){request.source_device=static_cast<std::uint8_t>((*source)[0]);request.source_origin=static_cast<std::uint8_t>((*source)[1]);}
         if(timed && timeout)request.deadline=runtime_.clock_ticks>UINT64_MAX-static_cast<std::uint64_t>(timeout)*10000?UINT64_MAX:runtime_.clock_ticks+static_cast<std::uint64_t>(timeout)*10000;
         found=gui_.sent_messages.emplace(gui_.next_object++,std::move(request)).first;
     }

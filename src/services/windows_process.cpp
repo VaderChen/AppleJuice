@@ -1,3 +1,4 @@
+#include "system_object_identity.hpp"
 #include "x64arm/windows_services.hpp"
 #include "windows_forced_thread_stop.hpp"
 #include "x64arm/windows_cpu_time.hpp"
@@ -917,24 +918,35 @@ void WindowsServices::publish_console_identity(bool attached,bool fresh){
     }
 #endif
 }
+// 同一主控台的程序（自己與 console_identity 相同的存活程序）；控制事件分送與 GetConsoleProcessList 共用。
+std::uint32_t WindowsServices::console_members(std::vector<ConsoleMember>& members){
+    members.clear();if(!console_identity_)return 6;
+    std::vector<std::uint32_t> ids;if(const auto error=session_process_ids(ids))return error;
+    for(const auto pid:ids){
+        if(pid==process_id()){members.push_back({pid,console_group_,process_identity_birth()});continue;}
+#if !defined(_WIN32)
+        const auto record=ProcessRecord::open(mapping_session(),pid,false);if(!record || !record->alive())continue;
+        SharedEventLock lock(record->descriptor);if(record->data->console_identity!=console_identity_)continue;
+        members.push_back({pid,record->data->console_group,record->data->birth});
+#endif
+    }
+    return 0;
+}
 std::uint32_t WindowsServices::generate_console_control(GuestMemory& memory,std::uint32_t event,std::uint32_t group){
     if(event>1)return 87;
     if(!console_identity_)return 6;
     // CTRL_C 的非零群組契約是成功但不傳送，不改成 CTRL_BREAK 的群組選擇。
     if(!event && group)return 0;
-    std::vector<std::uint32_t> ids;if(const auto error=session_process_ids(ids))return error;
+    std::vector<ConsoleMember> members;if(const auto error=console_members(members))return error;
     bool matched=false;
-    for(const auto pid:ids){
-        if(pid==process_id()){
-            if(group && group!=console_group_)continue;
-            matched=true;if(const auto error=queue_console_control(memory,event))return error;continue;
-        }
+    for(const auto& member:members){
+        if(group && member.group!=group)continue;
+        matched=true;
+        if(member.pid==process_id()){if(const auto error=queue_console_control(memory,event))return error;continue;}
 #if !defined(_WIN32)
-        const auto record=ProcessRecord::open(mapping_session(),pid,false);if(!record || !record->alive())continue;
-        {SharedEventLock lock(record->descriptor);if(record->data->console_identity!=console_identity_ || (group && record->data->console_group!=group))continue;}
-        matched=true;std::array<std::uint64_t,5> values{console_identity_,group};std::uint32_t mode{};
-        const auto error=remote_process_request(memory,pid,record->data->birth,20,event,values,mode);
-        if(error && record->alive())return error;
+        std::array<std::uint64_t,5> values{console_identity_,group};std::uint32_t mode{};
+        const auto error=remote_process_request(memory,member.pid,member.birth,20,event,values,mode);
+        if(error){const auto record=ProcessRecord::open(mapping_session(),member.pid,false);if(record && record->alive())return error;}
 #endif
     }
     return group && !matched?87U:0U;
@@ -1030,6 +1042,87 @@ std::uint32_t WindowsServices::capture_thread_snapshot(GuestMemory &memory,
     }
     entries = std::move(captured);
     return 0;
+}
+std::uint32_t WindowsServices::capture_system_handles(GuestMemory& memory,std::vector<SystemHandleRecord>& entries){
+    std::vector<std::uint32_t> ids;if(const auto error=session_process_ids(ids))return error;
+    std::vector<SystemHandleRecord> captured;
+    for(auto pid:ids){
+        if(pid==process_id()){
+            std::vector<SystemHandleRecord> local;if(const auto error=local_system_handles(local))return error;
+            captured.insert(captured.end(),local.begin(),local.end());
+        }else{
+#if !defined(_WIN32)
+            const auto record=ProcessRecord::open(mapping_session(),pid,false);if(!record || !record->alive())continue;
+            auto pattern=(std::filesystem::temp_directory_path()/"x64arm-handles-XXXXXX").string();
+            std::vector<char> name(pattern.begin(),pattern.end());name.push_back(0);const auto fd=::mkstemp(name.data());if(fd<0)return 8;
+            struct Close{int fd;~Close(){::close(fd);}} cleanup{fd};
+            (void)::unlink(name.data());(void)::fcntl(fd,F_SETFD,FD_CLOEXEC);
+            if(::fchmod(fd,0600) || ::ftruncate(fd,65534))return 8;
+            std::array<std::uint64_t,5> values{};std::uint32_t bits{};
+            if(const auto error=remote_process_request(memory,pid,record->data->birth,14,14,values,bits,fd)){
+                if(!record->alive() || !remote_process_available(pid))continue;return error;
+            }
+            if(values[0]>32*1024*1024 || values[0]%32)return 13;
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(values[0]));std::size_t done=0;
+            while(done<bytes.size()){
+                const auto count=::pread(fd,bytes.data()+done,bytes.size()-done,static_cast<off_t>(done));
+                if(count<0 && errno==EINTR)continue;if(count<=0)return 13;done+=static_cast<std::size_t>(count);
+            }
+            const auto get=[&](std::size_t at,unsigned size){std::uint64_t value=0;for(unsigned n=0;n<size;++n)value|=std::uint64_t{bytes[at+n]}<<(n*8);return value;};
+            for(std::size_t at=0;at<bytes.size();at+=32){
+                SystemHandleRecord item{get(at,8),get(at+8,8),static_cast<std::uint32_t>(get(at+16,4)),static_cast<std::uint32_t>(get(at+20,4)),static_cast<std::uint16_t>(get(at+24,2)),static_cast<std::uint16_t>(get(at+26,2))};
+                if(item.pid!=pid || item.type<2 || item.type>=2+detail::system_object_types.size() || item.object<0x80000010U || item.object>0xffffffe0U || (item.object&15U) || (item.flags&~3U) || get(at+28,4))return 13;
+                captured.push_back(item);
+            }
+#else
+            return 50;
+#endif
+        }
+        if(captured.size()>1024*1024)return 8;
+    }
+    entries=std::move(captured);return 0;
+}
+std::uint32_t WindowsServices::capture_kernel_modules(GuestMemory& memory,std::vector<KernelModuleRecord>& entries){
+    std::vector<std::uint32_t> ids;if(const auto error=session_process_ids(ids))return error;
+    std::vector<KernelModuleRecord> captured;
+    for(auto pid:ids){
+        if(pid==process_id()){
+            auto local=local_kernel_modules();captured.insert(captured.end(),local.begin(),local.end());
+        }else{
+#if !defined(_WIN32)
+            const auto record=ProcessRecord::open(mapping_session(),pid,false);if(!record || !record->alive())continue;
+            auto pattern=(std::filesystem::temp_directory_path()/"x64arm-modules-XXXXXX").string();
+            std::vector<char> name(pattern.begin(),pattern.end());name.push_back(0);const auto fd=::mkstemp(name.data());if(fd<0)return 8;
+            struct Close{int fd;~Close(){::close(fd);}} cleanup{fd};
+            (void)::unlink(name.data());(void)::fcntl(fd,F_SETFD,FD_CLOEXEC);
+            if(::fchmod(fd,0600) || ::ftruncate(fd,65534))return 8;
+            std::array<std::uint64_t,5> values{};std::uint32_t bits{};
+            if(const auto error=remote_process_request(memory,pid,record->data->birth,14,13,values,bits,fd)){
+                if(!record->alive() || !remote_process_available(pid))continue;
+                return error;
+            }
+            if(values[0]>4*1024*1024)return 13;
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(values[0]));std::size_t done=0;
+            while(done<bytes.size()){
+                const auto count=::pread(fd,bytes.data()+done,bytes.size()-done,static_cast<off_t>(done));
+                if(count<0 && errno==EINTR)continue;if(count<=0)return 13;done+=static_cast<std::size_t>(count);
+            }
+            const auto get=[&](std::size_t at,unsigned size){std::uint64_t value=0;for(unsigned n=0;n<size;++n)value|=std::uint64_t{bytes[at+n]}<<(n*8);return value;};
+            for(std::size_t at=0;at<bytes.size();){
+                if(bytes.size()-at<24)return 13;
+                const auto length=get(at+20,4);if(length>65534 || length%2 || length>bytes.size()-at-24)return 13;
+                KernelModuleRecord module{get(at,8),get(at+8,8),static_cast<std::uint32_t>(get(at+16,4)),{}};
+                if(!module.base || !module.size || module.size>UINT32_MAX)return 13;
+                for(std::size_t n=0;n<length;n+=2)module.path.push_back(static_cast<char16_t>(get(at+24+n,2)));
+                captured.push_back(std::move(module));at+=24+static_cast<std::size_t>(length);
+            }
+#else
+            return 50;
+#endif
+        }
+        if(captured.size()>65535)return 8;
+    }
+    entries=std::move(captured);return 0;
 }
 std::uint32_t WindowsServices::capture_process_snapshot(GuestMemory &memory,
                                                         std::vector<ProcessSnapshot::Process> &entries) {
@@ -1286,6 +1379,56 @@ std::uint32_t WindowsServices::process_memory_target(GuestMemory &memory, std::u
     return 50;
 #endif
 }
+std::uint32_t WindowsServices::query_process_debug_state(GuestMemory& memory,std::uint64_t handle,bool& present) {
+    if(process_object_type(handle)!=u"Process")return 6;
+    const auto pid=process_handle_pid(handle,0x400U);if(!pid)return 5;
+    process_debugger::Result debug;
+    if (pid == process_id())
+        debug = debugger_attached()
+                    ? process_debugger::Result{0, true, 0, false}
+                    : process_debugger::self(memory, peb_base_, runtime_.network.external_io);
+    else {
+        if (!runtime_.network.external_io)
+            throw HostCallFault("比較模式不查詢外部程序的偵錯狀態");
+#if !defined(_WIN32)
+        const auto found = processes_->handles.find(handle);
+        auto &object = found->second;
+        if (object.exited || (object.child && object.child->exited) ||
+            (object.debug_life && object.debug_life->exited))
+            debug = {0, false, object.identity, true};
+        else {
+            debug = process_debugger::query(pid);
+            // handle 保有原程序身分；死亡／PID 重用不會變成另一個程序的旗標。
+            if (debug.error == 87 || (!debug.error && object.identity && debug.identity != object.identity))
+                debug = {0, false, object.identity, true};
+            std::error_code endpoint_error;
+            const bool guest_endpoint =
+                debug_memory_ && std::filesystem::exists(std::filesystem::path(mapping_session()) /
+                                                             ("debug-" + std::to_string(pid)),
+                                                         endpoint_error);
+            // P_TRACED 已是肯定答案；原生 debugger 可能停止整個 host，不能等待它服務 IPC。
+            if (!debug.error && !debug.exited && !debug.present && guest_endpoint) {
+                std::vector<std::uint8_t> reply;
+                debug.error = transfer_debug_memory(memory, pid, object.identity, 8, 0, 0, reply);
+                if (!debug.error) {
+                    if (reply.size() != 8 || reply[0] > 1 ||
+                        std::any_of(reply.begin() + 1, reply.end(), [](auto byte) { return byte != 0; }))
+                        debug.error = 13;
+                    else
+                        debug.present = reply[0] != 0;
+                }
+            }
+        }
+        if (debug.exited)
+            object.exited = true;
+#else
+        debug = process_debugger::query(pid);
+#endif
+    }
+    if(debug.error)return debug.error;
+    present=debug.present;return 0;
+}
+
 std::uint32_t WindowsServices::process_basic_information(GuestMemory &memory, std::uint64_t handle,
                                                          std::array<std::uint64_t, 5> &values, std::uint32_t &pid,
                                                          std::uint32_t &bits) {
@@ -1491,7 +1634,9 @@ std::uint32_t WindowsServices::local_process_thread_control(std::uint32_t operat
     return 0;
 }
 std::uint32_t WindowsServices::local_process_handle_count() const {
+    std::vector<std::uint64_t> additional;append_kernel_device_handles(additional);append_transaction_handles(additional);
     std::size_t count = power_requests_.size() + files_.size() + job_handle_count() + mapping_handle_count() +
+                        runtime_.object_directories.size() + additional.size() +
                         runtime_.wait_objects.size() + runtime_.completion_ports.size() + wait_completion_handles_.size() +
                         runtime_.process_thread_handles.size() + runtime_.token_handles.size() +
                         runtime_.process_snapshots.size() + runtime_.network.sockets.size() +
@@ -1520,9 +1665,12 @@ std::vector<std::uint64_t> WindowsServices::local_process_handles() const {
     };
     append(power_requests_);
     append(files_);
+    append_kernel_device_handles(result);
+    append_transaction_handles(result);
     append_job_handles(result);
     append_mapping_handles(result);
     append(runtime_.wait_objects);
+    append(runtime_.object_directories);
     append(runtime_.completion_ports);
     append(wait_completion_handles_);
     append(runtime_.process_thread_handles);
@@ -1602,7 +1750,7 @@ void WindowsServices::import_process_handles(const std::string &encoded) {
             (item.type == 8 ? (item.handle < 0x100 || item.handle > 0x102) : item.handle < 0x1000) ||
             item.handle > 0x7fffffff || item.descriptor < 200 || item.descriptor > 65535 || (item.flags & ~3U) ||
             files_.contains(item.handle) || mapping_handle(item.handle) ||
-            runtime_.wait_objects.contains(item.handle) || !process_object_type(item.handle).empty())
+            runtime_.wait_objects.contains(item.handle) || runtime_.object_directories.contains(item.handle) || !process_object_type(item.handle).empty())
             throw HostCallFault("繼承清單內容無效");
         if (item.type == 1) {
             auto opened =
@@ -1623,7 +1771,7 @@ void WindowsServices::import_process_handles(const std::string &encoded) {
         else if (item.type == 4)
             import_job_handle(item);
         else if (item.type == 3 || item.type == 5 || item.type == 6 || item.type == 7 || item.type == 8 ||
-                 item.type == 9 || item.type == 10) {
+                 item.type == 9 || item.type == 10 || item.type == 11) {
             import_transfer_handle(item);
             continue;
         } else
@@ -1927,6 +2075,7 @@ std::optional<WindowsServices::ObjectMetadata> WindowsServices::process_object_m
     ObjectMetadata out;
     out.access = 0x1fffffU;
     out.identity = type==u"Thread"?(std::uint64_t{process_id()}<<32)|1U:process_id();
+    out.system_key=detail::object_key(detail::system_object_type_index(type),'p',{process_id(),process_identity_birth(),type==u"Thread"?1U:0U});
 #if !defined(_WIN32)
     const auto identity = [&](const auto &item) {
         const auto pid=item.child        ? static_cast<std::uint64_t>(item.child->pid)
@@ -1939,6 +2088,8 @@ std::optional<WindowsServices::ObjectMetadata> WindowsServices::process_object_m
         if (found != processes_->handles.end()) {
             out.access = found->second.access;
             out.identity = identity(found->second);
+            if(const auto& record=found->second.record;record)
+                out.system_key=detail::object_key(detail::system_object_type_index(type),'p',{record->data->pid,record->data->birth,found->second.thread?record->data->thread_id:0U});
         }
         for (const auto &[h, item] : processes_->handles) {
             (void)h;
@@ -3126,53 +3277,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
         else
             try {
                 memory.check(GuestAddress{arg(1)}, 4, Access::Write);
-                process_debugger::Result debug;
-                if (pid == process_id())
-                    debug = debugger_attached()
-                                ? process_debugger::Result{0, true, 0, false}
-                                : process_debugger::self(memory, peb_base_, runtime_.network.external_io);
+                bool present=false;
+                const auto error=query_process_debug_state(memory,arg(0),present);
+                if (error)
+                    fail(error);
                 else {
-                    if (!runtime_.network.external_io)
-                        throw HostCallFault("比較模式不查詢外部程序的偵錯狀態");
-#if !defined(_WIN32)
-                    const auto handle = processes_->handles.find(arg(0));
-                    auto &object = handle->second;
-                    if (object.exited || (object.child && object.child->exited) ||
-                        (object.debug_life && object.debug_life->exited))
-                        debug = {0, false, object.identity, true};
-                    else {
-                        debug = process_debugger::query(pid);
-                        // handle 保有原程序身分；死亡／PID 重用不會變成另一個程序的旗標。
-                        if (debug.error == 87 || (!debug.error && object.identity && debug.identity != object.identity))
-                            debug = {0, false, object.identity, true};
-                        std::error_code endpoint_error;
-                        const bool guest_endpoint =
-                            debug_memory_ && std::filesystem::exists(std::filesystem::path(mapping_session()) /
-                                                                         ("debug-" + std::to_string(pid)),
-                                                                     endpoint_error);
-                        // P_TRACED 已是肯定答案；原生 debugger 可能停止整個 host，不能等待它服務 IPC。
-                        if (!debug.error && !debug.exited && !debug.present && guest_endpoint) {
-                            std::vector<std::uint8_t> reply;
-                            debug.error = transfer_debug_memory(memory, pid, object.identity, 8, 0, 0, reply);
-                            if (!debug.error) {
-                                if (reply.size() != 8 || reply[0] > 1 ||
-                                    std::any_of(reply.begin() + 1, reply.end(), [](auto byte) { return byte != 0; }))
-                                    debug.error = 13;
-                                else
-                                    debug.present = reply[0] != 0;
-                            }
-                        }
-                    }
-                    if (debug.exited)
-                        object.exited = true;
-#else
-                    debug = process_debugger::query(pid);
-#endif
-                }
-                if (debug.error)
-                    fail(debug.error);
-                else {
-                    memory.store(GuestAddress{arg(1)}, 32, debug.present);
+                    memory.store(GuestAddress{arg(1)}, 32, present);
                     result = 1;
                 }
             } catch (const MemoryFault &) {

@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_error_support.hpp"
+#include "service_callback_task.hpp"
 #include <algorithm>
 
 namespace x64arm {
@@ -13,6 +14,7 @@ std::span<const WindowsServiceDescriptor> winrt_error_service_descriptors(){
         {"combase.dll","RoOriginateError",2},{"combase.dll","RoOriginateErrorW",3},
         {"combase.dll","RoGetErrorReportingFlags",1},{"combase.dll","RoSetErrorReportingFlags",1},
         {"combase.dll","GetRestrictedErrorInfo",1},{"combase.dll","SetRestrictedErrorInfo",1},
+        {"combase.dll","RoGetMatchingRestrictedErrorInfo",2},{"combase.dll","IsErrorPropagationEnabled",0},{"combase.dll","RoReportFailedDelegate",2},
         {"internal-restricted-error","QueryInterface",3},{"internal-restricted-error","AddRef",1},{"internal-restricted-error","Release",1},
         {"internal-restricted-error","GetErrorDetails",5},{"internal-restricted-error","GetReference",2},
         {"internal-winrt-error","Raise",1}
@@ -74,7 +76,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_error(GuestState& sta
     const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto pointer=[&](std::uint64_t at,std::size_t size){if(!at)throw HostCallFault("WinRT 錯誤輸出指標為空");memory.check(GuestAddress{at},size,Access::Write);};
     const auto next_id=[&](){auto id=bridge.next_operation;while(!id || bridge.restricted_operations.contains(id) || bridge.origins.contains(id))++id;bridge.next_operation=id+1;return id;};
+    if(name=="RoGetMatchingRestrictedErrorInfo")return invoke_matching_restricted_error(state,memory,service);
     try{
+        if(name=="IsErrorPropagationEnabled"){
+            // 錯誤經 SetErrorInfo 通道跨 ABI 傳遞；與 RoOriginateError 共用同一組回報旗標判定。
+            return done(com_error::reporting(runtime_.com_errors.flags(),false,true).channel?1:0);
+        }
+        if(name=="RoReportFailedDelegate"){
+            // 沙箱沒有登錄的全域錯誤處理常式，也沒有附加偵錯器；Windows 在此情況只驗證參數並回 S_OK。
+            if(!arg(0) || !arg(1))return done(invalid);
+            const auto view=bridge.views.find(arg(1));
+            if(view==bridge.views.end() || view->second.kind!=ComErrorViewKind::Restricted)return done(invalid);
+            return done(0);
+        }
         if(service.family=="internal-restricted-error"){
             if(name=="QueryInterface" || name=="AddRef" || name=="Release")return invoke_com_error(state,memory,service);
             const auto view=bridge.views.find(arg(0));if(view==bridge.views.end() || view->second.kind!=ComErrorViewKind::Restricted)return done(invalid);
@@ -132,7 +146,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_error(GuestState& sta
             // 文件的 empty return 表與段落互有差異；採用 FALSE 且不報告、不改 channel。
             if(message.empty())return done(0);
             bool initialized=com_apartment(threads_.current).has_value();
-            if(!initialized)initialized=std::any_of(gui_.com_initializations.begin(),gui_.com_initializations.end(),[](const auto& row){return row.second>=16 && !(row.second&2U);});
+            if(!initialized)initialized=mta_alive();
             const auto reporting=com_error::reporting(runtime_.com_errors.flags(),false,initialized);
             if(!reporting.channel && !reporting.exception)return done(1);
             if(bridge.origins.size()>=4096)return done(0);
@@ -152,5 +166,44 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_error(GuestState& sta
     catch(const std::bad_alloc&){return done(name.starts_with("RoOriginateError")?0:no_memory);}
     catch(const HostCallFault&){return done(name.starts_with("RoOriginateError")?0:pointer_error);}
     throw HostCallFault("未知的 WinRT 錯誤資訊服務");
+}
+// RoGetMatchingRestrictedErrorInfo：取走目前執行緒的 restricted error（同 GetRestrictedErrorInfo）；HRESULT 相同時交回它，
+// 否則釋放並以 hrIn 與系統訊息建立新的錯誤物件。取得與 QueryInterface 都走既有 COM 錯誤物件流程。
+std::optional<std::uint32_t> WindowsServices::invoke_matching_restricted_error(GuestState& entry_state,GuestMemory& entry_memory,const WindowsServiceDescriptor& service){
+    return service_callback::invoke<std::optional<std::uint32_t>>(
+        this,threads_.current,entry_state,entry_memory,"RoGetMatchingRestrictedErrorInfo",
+        [this](GuestState& state,GuestMemory& memory,std::uint64_t target,std::vector<std::uint64_t> args,std::uint64_t id){
+            start_callbacks(state,memory,{{target,std::move(args)}},Continuation::NestedResult,id);
+        },
+        [this,service](GuestState& state,GuestMemory& memory)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(state,memory,service);auto& bridge=runtime_.com_error_bridge;
+            const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+            const auto done=[&](std::uint32_t value){call.return_to(state,value);return std::optional<std::uint32_t>{};};
+            const auto hr=static_cast<std::uint32_t>(call(0));const auto output=call(1);
+            if(!output)co_return done(pointer_error);
+            try{memory.check(GuestAddress{output},unit,Access::Write);memory.store(GuestAddress{output},bits,0);}catch(const MemoryFault&){co_return done(pointer_error);}
+            if(!(hr&0x80000000U))co_return done(invalid);
+            const auto scratch=allocate_heap(memory,unit+16);if(!scratch)co_return done(no_memory);
+            struct ReleaseScratch {WindowsServices& self;GuestState& state;GuestMemory& memory;std::uint64_t address;
+                ~ReleaseScratch(){(void)self.free_heap(memory,address,state);}} release_scratch{*this,state,memory,scratch};
+            memory.store(GuestAddress{scratch},bits,0);
+            const auto taken=static_cast<std::uint32_t>(co_await service_callback::call(resolve("combase.dll","GetRestrictedErrorInfo").value,{scratch}));
+            if(const auto current=memory.load(GuestAddress{scratch},bits);!taken && current){
+                const auto view=bridge.views.find(current);
+                if(view!=bridge.views.end()){if(const auto* value=runtime_.com_errors.find(view->second.object);value && value->hresult==hr){memory.store(GuestAddress{output},bits,current);co_return done(0);}}
+                (void)co_await service_callback::call(winrt_error_detail::method(memory,current,2),{current});
+            }
+            auto generic=windows_error_message(hr);if(generic.empty())generic=windows_error_message(0x80004005U);
+            com_error::Object value;value.hresult=hr;value.description=generic;value.description_present=true;
+            value.restricted_description=com_error::reported_message(hr,std::nullopt,generic);value.restricted=true;
+            std::uint64_t object=0;
+            try{object=create_com_error(state,memory,std::move(value));}catch(const std::bad_alloc&){co_return done(no_memory);}
+            memory.store(GuestAddress{scratch},bits,0);memory.write(GuestAddress{scratch+unit},winrt_error_detail::restricted_iid);
+            const auto queried=static_cast<std::uint32_t>(co_await service_callback::call(winrt_error_detail::method(memory,object,0),{object,scratch+unit,scratch}));
+            const auto restricted=memory.load(GuestAddress{scratch},bits);
+            (void)co_await service_callback::call(winrt_error_detail::method(memory,object,2),{object});
+            if(queried&0x80000000U)co_return done(queried);
+            memory.store(GuestAddress{output},bits,restricted);co_return done(0);
+        });
 }
 }

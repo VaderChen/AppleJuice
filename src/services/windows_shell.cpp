@@ -39,7 +39,7 @@ std::span<const WindowsServiceDescriptor> shell_service_descriptors() {
         {"internal-shell","IMalloc.Alloc",2},{"internal-shell","IMalloc.Realloc",3},{"internal-shell","IMalloc.Free",2},
         {"internal-shell","IMalloc.GetSize",2},{"internal-shell","IMalloc.DidAlloc",2},{"internal-shell","IMalloc.HeapMinimize",1},
         {"ole32.dll","CoTaskMemRealloc",2},{"ole32.dll","CoTaskMemAlloc",1},{"ole32.dll","CoTaskMemFree",1}
-        ,{"shell32.dll","SHGetDesktopFolder",1}
+
     };return table;
 }
 namespace {
@@ -146,12 +146,23 @@ void write_text(GuestMemory& memory,std::uint64_t address,const std::u16string& 
 }
 
 }
-std::uint64_t WindowsServices::shell_make_pidl(GuestMemory& memory,std::u16string path){
+std::u16string WindowsServices::known_folder_path(const GuestMemory& memory,std::uint64_t address){return known_folder_guid(memory,address);}
+std::uint64_t WindowsServices::shell_make_pidl(GuestMemory& memory,std::u16string path){return shell_encode_pidl(memory,u"",std::move(path),true);}
+std::uint64_t WindowsServices::shell_encode_pidl(GuestMemory& memory,std::u16string_view base,std::u16string path,bool absolute){
     if(path.empty() || path.size()>=260 || gui_.shell_pidls.size()>=8192)return 0;
-    const auto text=utf16_bytes(path);const auto address=allocate_heap(memory,text.size()+4);if(!address)return 0;
-    // PIDL 是虛擬 Shell 的 opaque SHITEMID；仍有合法 cb 與 0 結尾，配置由 CoTaskMemFree/ILFree 釋放。
-    memory.store(GuestAddress{address},16,text.size()+2);memory.write(GuestAddress{address+2},text);memory.store(GuestAddress{address+2+text.size()},16,0);
-    try{gui_.shell_pidls.emplace(address,std::move(path));}catch(...){(void)free_heap(memory,address,GuestState{});throw;}return address;
+    // PIDL 由磁碟根項目（型別 0x2F，"C:\\"）與每個路徑段（型別 0x31）組成：cb、型別、保留 0、UTF-16 名稱與 NUL，最後以 cb＝0 結尾。
+    // ILFindLastID／ILRemoveLastID／ILCombine 等分段操作因此有正確語義；配置由 CoTaskMemFree／ILFree 釋放。子 PIDL 只含 base 之後的項目。
+    std::vector<std::pair<std::uint8_t,std::u16string>> items;std::size_t start=3;
+    if(base.empty())items.push_back({0x2f,path.substr(0,3)});
+    else {if(path.size()<=base.size() || path.compare(0,base.size(),base)!=0)return 0;start=base.size()+(base.back()==u'\\'?0:1);}
+    for(std::size_t at=start;at<path.size();){auto end=path.find(u'\\',at);if(end==path.npos)end=path.size();if(end>at)items.push_back({0x31,path.substr(at,end-at)});at=end+1;}
+    if(items.empty())return 0;
+    std::vector<std::uint8_t> bytes;
+    for(const auto& [type,name]:items){const auto cb=static_cast<std::uint16_t>(4+name.size()*2+2);bytes.push_back(static_cast<std::uint8_t>(cb));bytes.push_back(static_cast<std::uint8_t>(cb>>8));
+        bytes.push_back(type);bytes.push_back(0);for(const auto c:name){bytes.push_back(static_cast<std::uint8_t>(c));bytes.push_back(static_cast<std::uint8_t>(c>>8));}bytes.push_back(0);bytes.push_back(0);}
+    bytes.push_back(0);bytes.push_back(0);
+    const auto address=allocate_heap(memory,bytes.size());if(!address)return 0;memory.write(GuestAddress{address},bytes);
+    if(!absolute)return address;try{gui_.shell_pidls.emplace(address,std::move(path));}catch(...){(void)free_heap(memory,address,GuestState{});throw;}return address;
 }
 void WindowsServices::shell_browse_refresh(std::uint64_t handle){
     auto& data=gui_.shell_browsers.at(handle);auto& list=gui_.windows.at(gui_child(handle,412));list.items.clear();list.selection=-1;
@@ -562,8 +573,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
             for(unsigned id:{1U,2U}){GuiWindow button;button.dpi_context=effective_dpi_context();button.class_name=u"button";button.id=id;button.title=id==1?u"刪除":u"取消";button.x=id==1?290:390;button.y=145;button.width=90;button.height=28;button.style=id==2?1:0;add(button);}
             return start_gui_creation(state,memory,std::move(plans));
         }
-    }else if(symbol=="SHGetDesktopFolder"){
-        if(!arg(0))result=0x80004003U;else {memory.store(GuestAddress{arg(0)},64,0);result=not_implemented;}
     }else if(symbol=="CoTaskMemAlloc"){result=allocate_heap(memory,arg(0));if(result)gui_.task_allocations.insert(result);}
     else if(symbol=="CoTaskMemRealloc"){
         if(!arg(0))result=allocate_heap(memory,arg(1));
@@ -648,12 +657,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
         if(flags&0x100){auto icon=native_stock_icon(drive?8U:folder?3U:0U,width);if(!icon)icon=GuiIcon{{},width,width,0x10001U+index};icon->system=0x10001U+index;const auto handle=store_gui_icon(std::move(*icon));memory.store(GuestAddress{output},x86_?32:64,handle);}
         result=1;
         if(flags&0x4000){
-            auto& handle=(flags&1)?gui_.shell_small_image_list:gui_.shell_large_image_list;
-            if(!gui_.image_lists.contains(handle)){
-                handle=shell_system_icons(width);if(!handle){handle=gui_.next_object++;GuiImageList images;images.width=static_cast<std::int32_t>(width);images.height=images.width;images.flags=0x21;
-                for(std::uint32_t i=0;i<3;++i)images.images.push_back(GuiIcon{{},width,width,0x10001U+i});gui_.image_lists.emplace(handle,std::move(images));}
-            }
-            result=handle;
+            result=shell_image_list(width);
         }
     }else if(symbol.starts_with("SHGetPathFromIDList")){
         const auto found=gui_.shell_pidls.find(arg(0));

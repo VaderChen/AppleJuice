@@ -139,16 +139,16 @@ struct SharedFileState::Storage {
 };
 SharedFileState::SharedFileState(std::unique_ptr<Storage> storage):storage_(std::move(storage)){}
 SharedFileState::~SharedFileState()=default;
-std::pair<std::shared_ptr<SharedFileState>,std::uint32_t> SharedFileState::open(const std::string& session,const FileMetadata& info,bool create){
+std::pair<std::shared_ptr<SharedFileState>,std::uint32_t> SharedFileState::open(const std::string& session,const FileMetadata& info,bool create,bool volume_device){
 #if !defined(__APPLE__)
-    (void)session;(void)info;(void)create;return {{},50};
+    (void)session;(void)info;(void)create;(void)volume_device;return {{},50};
 #else
     if(session.empty())return {{},0};auto storage=std::make_unique<Storage>();
     struct Fd {int value;~Fd(){if(value>=0)::close(value);}} directory{::open(session.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW)};struct stat root{};
     if(directory.value<0 || ::fstat(directory.value,&root) || root.st_uid!=::geteuid() || (root.st_mode&077))return {{},5};
     // 同一命名空間的建立／載入序列化，接收端不會讀到半初始化的 record。
     struct DirectoryGuard {int fd;explicit DirectoryGuard(int value):fd(value){while(::flock(fd,LOCK_EX)<0)if(errno!=EINTR)throw HostCallFault("無法鎖定檔案共享命名空間");}~DirectoryGuard(){(void)::flock(fd,LOCK_UN);}} directory_guard(directory.value);
-    const auto name="file-lifetime-"+std::to_string(info.device)+"-"+std::to_string(info.id);bool fresh=false;
+    const auto name=std::string(volume_device?"volume-lifetime-":"file-lifetime-")+std::to_string(info.device)+"-"+std::to_string(info.id);bool fresh=false;
     struct FreshCleanup {int directory;const std::string& name;const std::unique_ptr<Storage>& storage;const bool& fresh;bool keep{};~FreshCleanup(){if(keep || !fresh || !storage)return;struct stat opened{},entry{};if(!::fstat(storage->descriptor,&opened) && !::fstatat(directory,name.c_str(),&entry,AT_SYMLINK_NOFOLLOW) && opened.st_dev==entry.st_dev && opened.st_ino==entry.st_ino)(void)::unlinkat(directory,name.c_str(),0);}} fresh_cleanup{directory.value,name,storage,fresh};
     if(create){storage->descriptor=::openat(directory.value,name.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);fresh=storage->descriptor>=0;if(!fresh && errno!=EEXIST)return {{},error()};}
     if(storage->descriptor<0)storage->descriptor=::openat(directory.value,name.c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW);

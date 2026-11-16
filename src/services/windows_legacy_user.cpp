@@ -25,7 +25,7 @@ std::span<const WindowsServiceDescriptor> legacy_user_service_descriptors(){
         {"shell32.dll","InitNetworkAddressControl",0},{"iphlpapi.dll","ParseNetworkString",5},{"internal-netaddress","WindowProc",4},
         {"ole32.dll","IsAccelerator",4},{"ole32.dll","OleTranslateAccelerator",3},{"ole32.dll","OleCreateMenuDescriptor",2},{"ole32.dll","OleDestroyMenuDescriptor",1},
         {"ole32.dll","CoLockObjectExternal",3},
-        {"comctl32.dll","DllGetVersion",1},
+        {"comctl32.dll","DllGetVersion",1},{"shlwapi.dll","DllGetVersion",1},
         {"uxtheme.dll","BufferedPaintInit",0},{"uxtheme.dll","BufferedPaintUnInit",0},{"uxtheme.dll","BeginBufferedPaint",5},{"uxtheme.dll","EndBufferedPaint",2},
         {"uxtheme.dll","GetBufferedPaintBits",3},{"uxtheme.dll","GetBufferedPaintDC",1},{"uxtheme.dll","GetBufferedPaintTargetDC",1},{"uxtheme.dll","GetBufferedPaintTargetRect",2},
         {"uxtheme.dll","BufferedPaintClear",2},{"uxtheme.dll","BufferedPaintSetAlpha",3},
@@ -162,10 +162,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& sta
             return finish(0);
         }
         if(name=="DllGetVersion"){
-            // comctl32 v6（通用控制項 6.10），build 與虛擬 Windows 相同；DLLVERSIONINFO2 另填 ullVersion。
+            // comctl32 v6（通用控制項 6.10）、shlwapi 6.0；build 與虛擬 Windows 相同，平台為 DLLVER_PLATFORM_NT。DLLVERSIONINFO2 另填 ullVersion。
             if(!arg(0))return finish(0x80004003U);const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},32));if(size!=20 && size!=32)return finish(0x80070057U);
-            memory.store(GuestAddress{arg(0)+4},32,6);memory.store(GuestAddress{arg(0)+8},32,10);memory.store(GuestAddress{arg(0)+12},32,windows_version_build);memory.store(GuestAddress{arg(0)+16},32,2);
-            if(size==32){memory.store(GuestAddress{arg(0)+20},32,0);memory.store(GuestAddress{arg(0)+24},64,(std::uint64_t{6}<<48)|(std::uint64_t{10}<<32)|(std::uint64_t{windows_version_build}<<16));}
+            const std::uint64_t minor=service.family=="comctl32.dll"?10:0;
+            memory.store(GuestAddress{arg(0)+4},32,6);memory.store(GuestAddress{arg(0)+8},32,minor);memory.store(GuestAddress{arg(0)+12},32,windows_version_build);memory.store(GuestAddress{arg(0)+16},32,2);
+            if(size==32){memory.store(GuestAddress{arg(0)+20},32,0);memory.store(GuestAddress{arg(0)+24},64,(std::uint64_t{6}<<48)|(minor<<32)|(std::uint64_t{windows_version_build}<<16));}
             return finish(0);
         }
         if(name=="BufferedPaintInit"){++gui_.buffered_paint_inits;return finish(0);}

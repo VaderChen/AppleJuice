@@ -39,9 +39,13 @@ struct UrlCacheState {
     const WindowsServices* owner{};
     struct Borrow{std::u16string url;std::uint64_t id{};std::shared_ptr<HostFile> file;bool stream{};};
     struct Enumeration{std::vector<std::u16string> urls;std::size_t cursor{};};
+    struct GroupEnumeration{std::vector<std::uint64_t> ids;std::size_t cursor{};};
+    struct ContainerEnumeration{std::vector<url_cache::Container> items;std::size_t cursor{};};
     std::uint64_t next{0x68100000};
     std::map<std::uint64_t,Borrow> borrows;
     std::map<std::uint64_t,Enumeration> enumerations;
+    std::map<std::uint64_t,GroupEnumeration> group_enumerations;
+    std::map<std::uint64_t,ContainerEnumeration> container_enumerations;
 };
 UrlCacheState& WindowsServices::url_cache_state(){if(!url_cache_){url_cache_=std::make_shared<UrlCacheState>();url_cache_->owner=this;}else if(url_cache_->owner!=this){auto next=std::make_shared<UrlCacheState>(*url_cache_);next->owner=this;next->borrows.clear();url_cache_=std::move(next);}return *url_cache_;}
 void WindowsServices::release_url_cache()noexcept{
@@ -57,16 +61,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_url_cache(GuestState& state
     const auto emit=[&](const Entry& entry,std::uint64_t out,std::uint64_t size_pointer){if(!size_pointer)throw CacheError{87};memory.check(GuestAddress{size_pointer},4,Access::Read);memory.check(GuestAddress{size_pointer},4,Access::Write);const auto bytes=url_cache::information(entry,wide,x86_,out);const auto capacity=memory.load(GuestAddress{size_pointer},32);memory.store(GuestAddress{size_pointer},32,bytes.size());if(!out || capacity<bytes.size())throw CacheError{122};memory.check(GuestAddress{out},bytes.size(),Access::Write);memory.write(GuestAddress{out},bytes);};
     auto& local=url_cache_state();
     try{
+#include "windows_url_cache_extended.inc"
         if(symbol.starts_with("CreateUrlCacheEntry")){
             if(text(arg(0)).empty())throw CacheError{87};(void)url_cache::key(text(arg(0)));if(d(4) || !arg(3))throw CacheError{87};memory.check(GuestAddress{arg(3)},260U*width,Access::Write);const auto extension=text(arg(2));const auto path=create_file(filesystem_,extension);if(wide)memory.write(GuestAddress{arg(3)},utf16_bytes(path));else{auto name=utf16_to_utf8(path);name.push_back(0);memory.write(GuestAddress{arg(3)},std::span(reinterpret_cast<const std::uint8_t*>(name.data()),name.size()));}result=1;
         }else if(symbol=="ReadUrlCacheEntryStream" || symbol=="ReadUrlCacheEntryStreamEx"){
             const bool extended=symbol.ends_with("Ex");if(!extended && d(4))throw CacheError{87};const auto found=local.borrows.find(arg(0));if(found==local.borrows.end() || !found->second.stream)throw CacheError{6};if(!arg(3))throw CacheError{87};memory.check(GuestAddress{arg(3)},4,Access::Read);memory.check(GuestAddress{arg(3)},4,Access::Write);const auto count=memory.load(GuestAddress{arg(3)},32);if(count>output_limit)throw CacheError{87};memory.check(GuestAddress{arg(2)},static_cast<std::size_t>(count),Access::Write);std::vector<std::uint8_t> bytes(static_cast<std::size_t>(count));const auto io=found->second.file->read(bytes,extended?arg(1):d(1));require(io.error);memory.write(GuestAddress{arg(2)},std::span(bytes).first(static_cast<std::size_t>(io.bytes)));memory.store(GuestAddress{arg(3)},32,io.bytes);result=1;
-        }else if(symbol=="FindCloseUrlCache"){if(!local.enumerations.erase(arg(0)))throw CacheError{6};result=1;
+        }else if(symbol=="FindCloseUrlCache"){if(!local.enumerations.erase(arg(0)) && !local.group_enumerations.erase(arg(0)) && !local.container_enumerations.erase(arg(0)))throw CacheError{6};result=1;
         }else{
             Transaction transaction(runtime_.registry,registry_file_);auto& registry=runtime_.registry;
             if(symbol.starts_with("FindFirstUrlCacheEntry") || symbol.starts_with("FindNextUrlCacheEntry")){
                 const bool first=symbol.starts_with("FindFirst");UrlCacheState::Enumeration enumeration;UrlCacheState::Enumeration* current=nullptr;std::uint64_t handle=arg(0);
-                if(first){const auto pattern=text(arg(0));if(!pattern.empty() && pattern!=u"cookie:" && pattern!=u"visited:")throw CacheError{87};const auto index=registry.keys.find(url_cache::index);if(index!=registry.keys.end())for(const auto& [name,value]:index->second){(void)name;const auto entry=url_cache::decode(value.bytes);if(pattern.empty()?(entry.type&1)!=0:pattern==u"cookie:"?(entry.type&0x100000U)!=0:(entry.type&0x200000U)!=0)enumeration.urls.push_back(entry.url);}current=&enumeration;
+                // Ex 版：FindFirst (pattern, dwFlags, dwFilter, GroupId, info, cb, 群組屬性, cb, reserved)；FindNext (handle, info, cb, 群組屬性, cb, reserved)。
+                // dwFilter 為項目類型遮罩；GroupId 為 0 時只列舉不屬於任何群組的項目。
+                const bool extended=symbol.find("Ex")!=std::string_view::npos;const unsigned info_at=first && extended?4:1,size_at=first && extended?5:2;
+                if(extended && (first?(arg(6) || arg(7) || arg(8)):(arg(3) || arg(4) || arg(5))))throw CacheError{87};
+                if(first){const auto pattern=text(arg(0));if(!pattern.empty() && pattern!=u"cookie:" && pattern!=u"visited:")throw CacheError{87};
+                    std::vector<std::u16string> grouped;std::optional<std::vector<std::u16string>> members;
+                    if(extended){const auto metadata=url_cache::load_metadata(registry);for(const auto& group:metadata.groups){for(const auto& url:group.urls)grouped.push_back(url_cache::key(url));if(arg(3) && group.id==arg(3)){members.emplace();for(const auto& url:group.urls)members->push_back(url_cache::key(url));}}
+                        if(arg(3) && !members)throw CacheError{2};}
+                    const auto index=registry.keys.find(url_cache::index);if(index!=registry.keys.end())for(const auto& [name,value]:index->second){(void)name;const auto entry=url_cache::decode(value.bytes);
+                        bool match=pattern.empty()?(extended || (entry.type&1)!=0):pattern==u"cookie:"?(entry.type&0x100000U)!=0:(entry.type&0x200000U)!=0;
+                        if(extended && match){if(d(2) && !(entry.type&d(2)))match=false;const auto key=url_cache::key(entry.url);
+                            if(members)match=match && std::find(members->begin(),members->end(),key)!=members->end();else match=match && entry.type && std::find(grouped.begin(),grouped.end(),key)==grouped.end();}
+                        if(match)enumeration.urls.push_back(entry.url);
+                    }
+                    current=&enumeration;
                 }else{const auto found=local.enumerations.find(handle);if(found==local.enumerations.end())throw CacheError{6};current=&found->second;}
                 if(first && local.enumerations.size()>=4096)throw CacheError{8};
                 std::optional<Entry> entry;
@@ -75,7 +94,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_url_cache(GuestState& state
                     catch(const CacheError& error){if(error.code!=2 && error.code!=3)throw;}
                     ++current->cursor;
                 }
-                if(!entry)throw CacheError{259};emit(*entry,arg(1),arg(2));transaction.commit();++current->cursor;if(first){handle=local.next++;local.enumerations.emplace(handle,std::move(enumeration));}result=first?handle:1;
+                if(!entry)throw CacheError{259};emit(*entry,arg(info_at),arg(size_at));transaction.commit();++current->cursor;if(first){handle=local.next++;local.enumerations.emplace(handle,std::move(enumeration));}result=first?handle:1;
             }else if(symbol=="UnlockUrlCacheEntryStream" || symbol.starts_with("UnlockUrlCacheEntryFile")){
                 if(d(1))throw CacheError{87};auto found=local.borrows.end();if(symbol=="UnlockUrlCacheEntryStream")found=local.borrows.find(arg(0));else{const auto url=text(arg(0));found=std::find_if(local.borrows.begin(),local.borrows.end(),[&](const auto& entry){return !entry.second.stream && entry.second.url==url;});}
                 if(found==local.borrows.end() || (symbol=="UnlockUrlCacheEntryStream" && !found->second.stream))throw CacheError{6};auto entry=url_cache::get(registry,found->second.url);if(!entry)throw CacheError{2};const auto file=found->second.file;found->second.file.reset();try{retire(registry,filesystem_,*entry,found->second.id);transaction.commit();}catch(...){found->second.file=file;throw;}local.borrows.erase(found);runtime_.http.cache_active=!local.borrows.empty();result=1;

@@ -36,7 +36,7 @@ struct GuestThreadBootstrap {
     std::uint64_t stack_low{},stack_high{},stack_allocation{};
     std::vector<std::uint8_t> security_descriptor;
     std::uint32_t access{0x1fffffU};
-    bool inherit{},hidden_from_debugger{},skip_thread_attach{};
+    bool inherit{},hidden_from_debugger{},skip_thread_attach{},bypass_process_freeze{};
 };
 // 所有輸出均位於呼叫程序；入口、參數及外部堆疊則屬於目標程序。
 struct RemoteThreadOutputs {
@@ -51,6 +51,11 @@ struct GuestThread {
         std::uint64_t stack{},caller{},resume{},flags{};
         std::uint64_t expected_stack{},resume_stack{},resume_rcx{},resume_rdx{},resume_r11{};
         std::vector<std::uint8_t> saved_memory;
+        // 只有被診斷篩選器選中的呼叫才記錄返回；巢狀呼叫各自保留身分。
+        std::uint32_t traced_call{UINT32_MAX};
+        std::uint32_t call_id{UINT32_MAX};
+        // 進入核心時的啟用狀態：首次註冊不回呼，清除後也不回呼。
+        bool instrumented{};
         bool operator==(const SystemCallFrame&) const = default;
     };
     GuestState context;
@@ -74,8 +79,13 @@ struct GuestThread {
     std::uint32_t public_id{}; // Windows 對外身分；排程、IPC 與 CPU context 仍使用本機索引。
     std::uint64_t cycles{}; // 客體執行成本；等待不累計，與宿主牆鐘獨立。
     std::array<std::uint8_t,16> activity_id{};
-    std::uint64_t affinity{UINT64_MAX}, strtok_cursor{}, wcstok_cursor{}, invalid_parameter_handler{};
+    std::uint64_t affinity{UINT64_MAX}, strtok_cursor{}, wcstok_cursor{}, mbstok_cursor{}, invalid_parameter_handler{}, crt_signal_cells{};
+    // SetThreadLocale／SetThreadUILanguage／SetThreadPreferredUILanguages；0 與空清單表示沿用使用者預設。
+    std::uint32_t locale{}, ui_language{};
+    std::vector<std::u16string> preferred_ui_languages;
     std::uint32_t com_process_token{};
+    std::uint64_t com_call_context{}; // CoSwitchCallContext 設定的呼叫內容物件（不持有參照，與 Windows 相同）。
+    std::uint32_t com_cancel_enabled{}; // CoEnableCallCancellation 的巢狀次數。
     std::uint32_t suspended{}, exit_code{}, ideal_processor{};
     std::int32_t priority{};
     MultimediaThreadTask multimedia;
@@ -96,12 +106,13 @@ struct GuestThread {
     bool priority_boost_disabled{};
     std::uint32_t power_control{}, power_state{};
     bool dynamic_code_opt_out{};
-    bool hidden_from_debugger{};
+    bool hidden_from_debugger{},bypass_process_freeze{};
     std::uint32_t last_native_status{};
     std::optional<std::uint32_t> error_mode; // 未覆寫時沿用程序錯誤模式。
     std::u16string description;
     std::uint64_t gui_pump_time{},dpi_context{};
     std::uint64_t message_extra{};std::uint32_t message_time{},message_position{};
+    std::uint8_t message_source_device{},message_source_origin{}; // 最近取出訊息的 INPUT_MESSAGE_SOURCE。
     bool terminating{},forced_stop{};
     // _beginthread 傳回的 handle：常式返回時結束碼為 0，執行緒結束時由 CRT 自動關閉。
     std::uint64_t crt_detached_handle{};

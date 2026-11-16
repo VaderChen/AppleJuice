@@ -1,5 +1,5 @@
         // D3DX9 網格以共用 D3D9 buffer 保存資料，鎖定後的改動直接供 CPU 前處理使用。
-        bool mesh_handled=symbol.starts_with("RenderToSurface.") || symbol.starts_with("RenderToEnvMap.") || symbol.starts_with("Effect.") || symbol.starts_with("EffectPool.") || symbol.starts_with("Sprite.") || symbol.starts_with("Font.") || symbol.starts_with("Mesh.") || symbol.starts_with("Blob.") || symbol.starts_with("PRT.") || symbol.starts_with("PRTComp.") || symbol.starts_with("PRTEngine.") || symbol.starts_with("D3DX");
+        bool mesh_handled=symbol.starts_with("RenderToSurface.") || symbol.starts_with("RenderToEnvMap.") || symbol.starts_with("Effect.") || symbol.starts_with("EffectPool.") || symbol.starts_with("Sprite.") || symbol.starts_with("Font.") || symbol.starts_with("Mesh.") || symbol.starts_with("Blob.") || symbol.starts_with("MatrixStack.") || symbol.starts_with("PRT.") || symbol.starts_with("PRTComp.") || symbol.starts_with("PRTEngine.") || symbol.starts_with("D3DX");
         const auto declaration=[&](std::uint64_t address){
             std::vector<std::uint8_t> data;require(address!=0);
             for(unsigned i=0;i<65;++i){auto e=read(address+i*8,8);data.insert(data.end(),e.begin(),e.end());if(e[0]==255 && e[1]==0 && e[4]==17)return data;require(i<64 && e[0]==0 && e[1]==0 && e[4]<17 && e[5]==0);}
@@ -70,9 +70,35 @@
             }
             return adjacency_from_reps(ix,reps);
         };
+        // 依雙向鄰接配對共享邊並合併同位置頂點，代表點取群組最小索引；ConvertAdjacencyToPointReps 與 D3DXWeldVertices 共用。
+        const auto point_reps=[&](const Object& mesh,const std::vector<unsigned>& ix,const std::vector<unsigned>& adj){
+            require(adj.size()==ix.size());std::vector<unsigned> reps(mesh.width);for(unsigned i=0;i<mesh.width;++i)reps[i]=i;const auto p=positions(mesh);
+            const auto root=[&](unsigned v){while(reps[v]!=v){reps[v]=reps[reps[v]];v=reps[v];}return v;};
+            const auto join=[&](unsigned a,unsigned b){a=root(a);b=root(b);reps[std::max(a,b)]=std::min(a,b);};
+            for(unsigned i=0;i<ix.size();++i){const auto other=adj[i],face=i/3;if(other==UINT32_MAX)continue;require(other<mesh.height && other!=face);if(other<face)continue;
+                const auto a=ix[i],b=ix[face*3+(i%3+1)%3];unsigned edge=UINT32_MAX;double distance=std::numeric_limits<double>::infinity();
+                // UV／法線接縫可有不同頂點索引，取兩端位置誤差最小的對應邊。
+                for(unsigned j=0;j<3;++j)if(adj[other*3+j]==face){const auto c=ix[other*3+(j+1)%3],d=ix[other*3+j];double error=0;for(unsigned k=0;k<3;++k){const double x=double(p[a][k])-p[c][k],y=double(p[b][k])-p[d][k];error+=x*x+y*y;}if(error<distance){distance=error;edge=j;}}
+                require(edge!=UINT32_MAX);join(a,ix[other*3+(edge+1)%3]);join(b,ix[other*3+edge]);
+            }
+            for(unsigned i=0;i<mesh.width;++i)reps[i]=root(i);return reps;
+        };
         const auto scalar_arg=[&](unsigned i){std::uint32_t v=u(i);if(!x86_ && i<4)std::memcpy(&v,state.xmm[i].data(),4);return real(v);};
         const auto blob=[&](std::span<const std::uint8_t> bytes){auto value=create(Kind::Blob);value->pixels.assign(bytes.begin(),bytes.end());return value;};
 #include "d3dx9_loaded_mesh.inc"
+        // PE 資源（模組＋名稱；type 為 0 時依序找 RT_RCDATA、RT_BITMAP）：材質、表面、著色器、效果與網格的 FromResource 版本共用。
+        const auto d3dx_resource_bytes=[&](std::uint64_t module,std::uint64_t name,std::uint64_t type,bool wide){
+            require(name);auto found=gui_resource(memory,module,name,type?type:10,wide);if(!found && !type)found=gui_resource(memory,module,name,2,wide);
+            require(found!=0,0x80070716U);const auto size=memory.load(GuestAddress{found+4},32);require(size && size<=512U*1024U*1024U);
+            const auto* owner=resource_image(found,true);require(owner!=nullptr);return read(owner->base+memory.load(GuestAddress{found},32),size);
+        };
+        // 著色器位元碼的 ID3DXConstantTable（D3DXCompileShader 與 D3DXGetShaderConstantTable 共用）。
+        const auto make_constant_table=[&](std::span<const std::uint8_t> bytecode){
+            auto parsed=std::make_shared<d3dx9::Constants>(std::vector<std::uint8_t>(bytecode.begin(),bytecode.end()));auto table=create(Kind::ConstantTable);
+            try{table->constant_table=std::move(parsed);table->pixels=table->constant_table->data;table->mapped=allocate_heap(memory,table->pixels.size()+table->constant_table->nodes.size()*4);
+                require(table->mapped!=0,out_of_memory);memory.write(GuestAddress{table->mapped},table->pixels);}catch(...){release(table->root);throw;}
+            return table;
+        };
         bool shader_handled=false;
 #include "d3dx9_shader_handlers.inc"
 #include "d3dx9_texture_handlers.inc"
@@ -101,8 +127,9 @@
 #include "d3dx9_prt_engine_handlers.inc"
         if(concatenate_handled || render_env_handled || hierarchy_handled || animation_set_handled || animation_controller_handled || frame_handled || skin_handled || gutter_handled || save_mesh_handled || atlas_handled || file_handled || render_surface_handled || effect_handled || sprite_handled || shader_handled || prt_handled || texture_handled || clean_handled || tessellation_handled || text_mesh_handled || strips_handled){}
         else if(symbol.starts_with("D3DXLoadMeshFromX")){
-            const bool from_memory=symbol.ends_with("InMemory");const unsigned shift=from_memory?1:0;output(7+shift);for(unsigned i=3+shift;i<6+shift;++i)if(arg(i))output(i);if(arg(6+shift))memory.store(GuestAddress{arg(6+shift)},32,0);
-            std::vector<std::uint8_t> bytes;if(from_memory){require(arg(1)<=512U*1024U*1024U);bytes=read(arg(0),arg(1));}
+            // InMemory 多一個長度參數；Resource 版本為 (Module, Name, Type, ...)，多兩個參數。
+            const bool from_memory=symbol.ends_with("InMemory"),from_resource=symbol.ends_with("Resource");const unsigned shift=from_resource?2:from_memory?1:0;output(7+shift);for(unsigned i=3+shift;i<6+shift;++i)if(arg(i))output(i);if(arg(6+shift))memory.store(GuestAddress{arg(6+shift)},32,0);
+            std::vector<std::uint8_t> bytes;if(from_resource)bytes=d3dx_resource_bytes(arg(0),arg(1),arg(2),false);else if(from_memory){require(arg(1)<=512U*1024U*1024U);bytes=read(arg(0),arg(1));}
             else{const auto path=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));const auto opened=filesystem_.open_reader(d3dx_path(path));require(!opened.error,0x80070000U|opened.error);const auto meta=opened.file->information();require(!meta.error && meta.metadata.size<=512U*1024U*1024U);bytes.resize(meta.metadata.size);const auto io=opened.file->read(bytes,0);require(!io.error && io.bytes==bytes.size());}
             const auto decoded=d3d9_xfile::decompress(bytes);auto source=d3d9_xfile::Parser(decoded).parse();auto mesh=make_loaded_mesh(source,u(1+shift),arg(2+shift));std::shared_ptr<Object> adj_buffer,materials,effects;
             try{
@@ -135,6 +162,66 @@
                 for(unsigned i=0;i<sides;++i){const std::array<unsigned,3> indices{0,i+1,(i+1)%sides+1};for(unsigned c=0;c<3;++c){const auto at=(i*3+c)*2;ib->pixels[at]=static_cast<std::uint8_t>(indices[c]);ib->pixels[at+1]=static_cast<std::uint8_t>(indices[c]>>8);}}
                 if(arg(4)){std::vector<unsigned> adj(sides*3);for(unsigned face=0;face<sides;++face){adj[face*3]=(face+sides-1)%sides;adj[face*3+1]=UINT32_MAX;adj[face*3+2]=(face+1)%sides;}store_pointer(arg(4),blob(std::span(reinterpret_cast<const std::uint8_t*>(adj.data()),adj.size()*4))->root);}store_pointer(arg(3),mesh->root);
             }catch(...){release(mesh->root);throw;}
+        }else if(symbol=="D3DXCreateBox" || symbol=="D3DXCreateSphere" || symbol=="D3DXCreateCylinder" || symbol=="D3DXCreateTorus"){
+            // 基本形狀（D3DFVF_XYZ｜D3DFVF_NORMAL、16 位元索引、受管理緩衝）：Box 為六面各 4 個頂點；Sphere 以 z 軸為極軸；
+            // Cylinder 沿 z 軸，Radius1 在 -z 端、Radius2 在 +z 端，含兩端蓋；Torus 環繞 z 軸，InnerRadius 為管半徑、OuterRadius 為環中心半徑。
+            // 每個三角形依頂點法線調成由外側看為順時針（D3D 預設 D3DCULL_CCW 時的正面）；鄰接以位置相同的頂點計算。
+            constexpr float pi=3.14159265358979323846F;std::vector<Vector> points,normals;std::vector<unsigned> triangles;unsigned mesh_out=4,adjacency_out=5;
+            const auto vertex=[&](Vector p,Vector n){points.push_back(p);normals.push_back(normalize(n));return static_cast<unsigned>(points.size()-1);};
+            const auto triangle=[&](unsigned a,unsigned b,unsigned c){triangles.insert(triangles.end(),{a,b,c});};
+            if(symbol=="D3DXCreateBox"){
+                const float w=scalar_arg(1),h=scalar_arg(2),d=scalar_arg(3);require(std::isfinite(w) && std::isfinite(h) && std::isfinite(d) && w>=0 && h>=0 && d>=0);
+                const std::array<float,3> half{w/2,h/2,d/2};
+                for(const auto& [axis,sign]:std::array<std::pair<unsigned,float>,6>{{{0,-1},{1,1},{0,1},{1,-1},{2,1},{2,-1}}}){
+                    const unsigned u1=(axis+1)%3,u2=(axis+2)%3;Vector n{};n[axis]=sign;std::array<unsigned,4> corner{};
+                    for(unsigned k=0;k<4;++k){Vector p{};p[axis]=sign*half[axis];p[u1]=(k==1 || k==2?1:-1)*half[u1];p[u2]=(k>=2?1:-1)*half[u2];corner[k]=vertex(p,n);}
+                    triangle(corner[0],corner[1],corner[2]);triangle(corner[0],corner[2],corner[3]);
+                }
+            }else if(symbol=="D3DXCreateSphere"){
+                const float radius=scalar_arg(1);const auto slices=u(2),stacks=u(3);require(std::isfinite(radius) && radius>=0 && slices>=2 && stacks>=2 && slices<=65535 && stacks<=65535);
+                const auto top=vertex({0,0,radius,0},{0,0,1,0});
+                for(unsigned j=1;j<stacks;++j){const float theta=pi*static_cast<float>(j)/static_cast<float>(stacks);
+                    for(unsigned i=0;i<slices;++i){const float phi=2*pi*static_cast<float>(i)/static_cast<float>(slices);const Vector n{std::sin(theta)*std::cos(phi),std::sin(theta)*std::sin(phi),std::cos(theta),0};(void)vertex({n[0]*radius,n[1]*radius,n[2]*radius,0},n);}}
+                const auto bottom=vertex({0,0,-radius,0},{0,0,-1,0});const auto ring=[&](unsigned j,unsigned i){return 1+(j-1)*slices+i%slices;};
+                for(unsigned i=0;i<slices;++i){triangle(top,ring(1,i),ring(1,i+1));triangle(bottom,ring(stacks-1,i+1),ring(stacks-1,i));}
+                for(unsigned j=1;j+1<stacks;++j)for(unsigned i=0;i<slices;++i){triangle(ring(j,i),ring(j+1,i),ring(j+1,i+1));triangle(ring(j,i),ring(j+1,i+1),ring(j,i+1));}
+            }else if(symbol=="D3DXCreateCylinder"){
+                const float r1=scalar_arg(1),r2=scalar_arg(2),length=scalar_arg(3);const auto slices=u(4),stacks=u(5);mesh_out=6;adjacency_out=7;
+                require(std::isfinite(r1) && std::isfinite(r2) && std::isfinite(length) && r1>=0 && r2>=0 && length>=0 && slices>=2 && stacks>=1 && slices<=65535 && stacks<=65535);
+                const float half=length/2;const auto angle=[&](unsigned i){return 2*pi*static_cast<float>(i%slices)/static_cast<float>(slices);};
+                const auto top=vertex({0,0,half,0},{0,0,1,0});const auto top_ring=static_cast<unsigned>(points.size());
+                for(unsigned i=0;i<slices;++i)(void)vertex({r2*std::cos(angle(i)),r2*std::sin(angle(i)),half,0},{0,0,1,0});
+                const auto side=static_cast<unsigned>(points.size());
+                for(unsigned j=0;j<=stacks;++j){const float t=static_cast<float>(j)/static_cast<float>(stacks),z=half-length*t,r=r2+(r1-r2)*t;
+                    for(unsigned i=0;i<slices;++i)(void)vertex({r*std::cos(angle(i)),r*std::sin(angle(i)),z,0},{std::cos(angle(i))*length,std::sin(angle(i))*length,r1-r2,0});}
+                const auto bottom_ring=static_cast<unsigned>(points.size());
+                for(unsigned i=0;i<slices;++i)(void)vertex({r1*std::cos(angle(i)),r1*std::sin(angle(i)),-half,0},{0,0,-1,0});
+                const auto bottom=vertex({0,0,-half,0},{0,0,-1,0});
+                for(unsigned i=0;i<slices;++i){triangle(top,top_ring+i,top_ring+(i+1)%slices);triangle(bottom,bottom_ring+(i+1)%slices,bottom_ring+i);}
+                for(unsigned j=0;j<stacks;++j)for(unsigned i=0;i<slices;++i){const auto a=side+j*slices+i,b=side+j*slices+(i+1)%slices,c=side+(j+1)*slices+i,e=side+(j+1)*slices+(i+1)%slices;triangle(a,c,e);triangle(a,e,b);}
+            }else{
+                const float inner=scalar_arg(1),outer=scalar_arg(2);const auto sides=u(3),rings=u(4);mesh_out=5;adjacency_out=6;
+                require(std::isfinite(inner) && std::isfinite(outer) && inner>=0 && outer>=0 && sides>=3 && rings>=3 && sides<=65535 && rings<=65535);
+                for(unsigned i=0;i<rings;++i){const float theta=2*pi*static_cast<float>(i)/static_cast<float>(rings);
+                    for(unsigned j=0;j<sides;++j){const float phi=2*pi*static_cast<float>(j)/static_cast<float>(sides);const Vector n{std::cos(phi)*std::cos(theta),std::cos(phi)*std::sin(theta),std::sin(phi),0};
+                        (void)vertex({(outer+inner*std::cos(phi))*std::cos(theta),(outer+inner*std::cos(phi))*std::sin(theta),inner*std::sin(phi),0},n);}}
+                const auto at=[&](unsigned i,unsigned j){return (i%rings)*sides+j%sides;};
+                for(unsigned i=0;i<rings;++i)for(unsigned j=0;j<sides;++j){triangle(at(i,j),at(i+1,j),at(i+1,j+1));triangle(at(i,j),at(i+1,j+1),at(i,j+1));}
+            }
+            require(points.size()<=65535 && !triangles.empty());
+            for(std::size_t t=0;t<triangles.size();t+=3){
+                const auto& a=points[triangles[t]];const auto& b=points[triangles[t+1]];const auto& c=points[triangles[t+2]];
+                Vector wanted{};for(unsigned k=0;k<3;++k)for(unsigned c2=0;c2<3;++c2)wanted[c2]+=normals[triangles[t+k]][c2];
+                if(dot3(cross3(subtract(b,a),subtract(c,a)),wanted)<0)std::swap(triangles[t+1],triangles[t+2]);
+            }
+            output(mesh_out);if(arg(adjacency_out))output(adjacency_out);
+            auto mesh=make_mesh(static_cast<unsigned>(triangles.size()/3),static_cast<unsigned>(points.size()),0x220,fvf_decl(0x12),arg(0));mesh->fvf=0x12;
+            try{auto vb=get(mesh->vertex_buffer,Kind::VertexBuffer),ib=get(mesh->index_buffer,Kind::IndexBuffer);
+                for(std::size_t i=0;i<points.size();++i)for(unsigned c=0;c<3;++c){put(vb->pixels,i*24+c*4,bits(points[i][c]));put(vb->pixels,i*24+12+c*4,bits(normals[i][c]));}
+                for(std::size_t i=0;i<triangles.size();++i){ib->pixels[i*2]=static_cast<std::uint8_t>(triangles[i]);ib->pixels[i*2+1]=static_cast<std::uint8_t>(triangles[i]>>8);}
+                if(arg(adjacency_out)){const auto adj=adjacency(*mesh,0);store_pointer(arg(adjacency_out),blob(std::span(reinterpret_cast<const std::uint8_t*>(adj.data()),adj.size()*4))->root);}
+                store_pointer(arg(mesh_out),mesh->root);
+            }catch(...){release(mesh->root);throw;}
         }else if(symbol=="D3DXGetDeclLength")result=declaration(arg(0)).size()/8-1;
         else if(symbol=="D3DXGetFVFVertexSize")result=stride_of(fvf_decl(u(0)));
         else if(symbol=="D3DXCreateMesh" || symbol=="D3DXCreateMeshFVF"){
@@ -146,6 +233,8 @@
             for(unsigned face=0;face<mesh->height;++face){const auto a=ix[face*3],b=ix[face*3+1],c=ix[face*3+2];const auto n=normalize(cross3(subtract(p[b],p[a]),subtract(p[c],p[a])));
                 for(unsigned corner=0;corner<3;++corner){const auto v=ix[face*3+corner],next=ix[face*3+(corner+1)%3],prev=ix[face*3+(corner+2)%3];const auto weight=std::acos(std::clamp(dot3(normalize(subtract(p[next],p[v])),normalize(subtract(p[prev],p[v]))),-1.F,1.F));for(unsigned k=0;k<3;++k)normals[v][k]+=n[k]*weight;}}
             for(auto& n:normals)n=normalize(n);write_vectors(*mesh,3,0,normals);
+        }else if(symbol=="D3DXWeldVertices"){
+#include "d3dx9_weld_vertices.inc"
         }else if(symbol.starts_with("Mesh.")){
             auto mesh=get(arg(0),Kind::Mesh);const auto name=symbol.substr(5);
             if(name=="DrawSubset"){
@@ -203,16 +292,8 @@
                     if(arg(1)){const auto bytes=read(arg(1),std::uint64_t(mesh->width)*4);for(unsigned i=0;i<mesh->width;++i){reps[i]=word(bytes,i*4);require(reps[i]<mesh->width);}}
                     const auto out=adjacency_from_reps(ix,reps);memory.write(GuestAddress{arg(2)},std::span(reinterpret_cast<const std::uint8_t*>(out.data()),out.size()*4));
                 }else{
-                    require(arg(1));const auto bytes=read(arg(1),std::uint64_t(ix.size())*4);const auto p=positions(*mesh);
-                    const auto root=[&](unsigned v){while(reps[v]!=v){reps[v]=reps[reps[v]];v=reps[v];}return v;};
-                    const auto join=[&](unsigned a,unsigned b){a=root(a);b=root(b);reps[std::max(a,b)]=std::min(a,b);};
-                    for(unsigned i=0;i<ix.size();++i){const auto other=word(bytes,i*4),face=i/3;if(other==UINT32_MAX)continue;require(other<mesh->height && other!=face);if(other<face)continue;
-                        const auto a=ix[i],b=ix[face*3+(i%3+1)%3];unsigned edge=UINT32_MAX;double distance=std::numeric_limits<double>::infinity();
-                        // 依雙向鄰接配對共享邊；UV／法線接縫可有不同頂點索引。
-                        for(unsigned j=0;j<3;++j)if(word(bytes,(other*3+j)*4)==face){const auto c=ix[other*3+(j+1)%3],d=ix[other*3+j];double error=0;for(unsigned k=0;k<3;++k){const double x=double(p[a][k])-p[c][k],y=double(p[b][k])-p[d][k];error+=x*x+y*y;}if(error<distance){distance=error;edge=j;}}
-                        require(edge!=UINT32_MAX);join(a,ix[other*3+(edge+1)%3]);join(b,ix[other*3+edge]);
-                    }
-                    for(unsigned i=0;i<mesh->width;++i)reps[i]=root(i);memory.write(GuestAddress{arg(2)},std::span(reinterpret_cast<const std::uint8_t*>(reps.data()),reps.size()*4));
+                    require(arg(1));const auto bytes=read(arg(1),std::uint64_t(ix.size())*4);std::vector<unsigned> adj(ix.size());for(unsigned i=0;i<ix.size();++i)adj[i]=word(bytes,i*4);
+                    reps=point_reps(*mesh,ix,adj);memory.write(GuestAddress{arg(2)},std::span(reinterpret_cast<const std::uint8_t*>(reps.data()),reps.size()*4));
                 }
             }
             else if(name=="CloneMesh" || name=="CloneMeshFVF"){
@@ -235,4 +316,44 @@
             else if(name=="GetBufferSize")result=value->pixels.size();
             else if(name=="GetBufferPointer"){if(!value->mapped){value->mapped=allocate_heap(memory,std::max<std::size_t>(1,value->pixels.size()));require(value->mapped!=0,out_of_memory);memory.write(GuestAddress{value->mapped},value->pixels);}result=value->mapped;}
             else if(name=="QueryInterface"){output(2);Guid requested{};memory.read(GuestAddress{arg(1)},requested);constexpr Guid buffer_iid{0x08,0xfb,0xa5,0x8b,0x95,0x51,0xe2,0x40,0xac,0x58,0x0d,0x98,0x9c,0x3a,0x01,0x02};if(requested==unknown || requested==buffer_iid){hold(value);store_pointer(arg(2),value->root);}else result=no_interface;}
+        }else if(symbol=="D3DXCreateMatrixStack"){
+            // 堆疊放在客體記憶體（mapped，width＝容量、height＝深度），GetTop 回傳的指標可由應用程式直接讀寫。初始深度 1、單位矩陣。
+            output(1);auto stack=create(Kind::MatrixStack);
+            try{stack->mapped=allocate_heap(memory,16*64);require(stack->mapped!=0,out_of_memory);stack->width=16;stack->height=1;
+                const auto unit=identity();memory.write(GuestAddress{stack->mapped},std::span(reinterpret_cast<const std::uint8_t*>(unit.data()),64));store_pointer(arg(1),stack->root);}
+            catch(...){release(stack->root);throw;}
+        }else if(symbol.starts_with("MatrixStack.")){
+            auto stack=get(arg(0),Kind::MatrixStack);const auto name=symbol.substr(12);
+            const auto top_address=[&]{return stack->mapped+std::uint64_t{stack->height-1}*64;};
+            const auto load_matrix=[&](std::uint64_t at){Matrix m{};for(unsigned i=0;i<16;++i)m[i]=real(static_cast<std::uint32_t>(memory.load(GuestAddress{at+i*4},32)));return m;};
+            const auto store_top=[&](const Matrix& m){for(unsigned i=0;i<16;++i)memory.store(GuestAddress{top_address()+i*4},32,bits(m[i]));};
+            const auto multiply=[](const Matrix& a,const Matrix& b){Matrix r{};for(unsigned row=0;row<4;++row)for(unsigned c=0;c<4;++c){float s=0;for(unsigned k=0;k<4;++k)s+=a[row*4+k]*b[k*4+c];r[row*4+c]=s;}return r;};
+            // MultMatrix 系列：top＝top×M；Local 版本：top＝M×top（列向量慣例，與 D3DXMatrixMultiply 相同）。
+            const auto apply=[&](const Matrix& m,bool local){const auto top=load_matrix(top_address());store_top(local?multiply(m,top):multiply(top,m));};
+            const auto rotation_axis=[&](Vector axis,float angle){axis=normalize(axis);const float c=std::cos(angle),s=std::sin(angle),t=1-c;const float x=axis[0],y=axis[1],z=axis[2];
+                return Matrix{t*x*x+c,t*x*y+s*z,t*x*z-s*y,0, t*x*y-s*z,t*y*y+c,t*y*z+s*x,0, t*x*z+s*y,t*y*z-s*x,t*z*z+c,0, 0,0,0,1};};
+            // D3DXMatrixRotationYawPitchRoll：依序繞 z（roll）、x（pitch）、y（yaw）。
+            const auto yaw_pitch_roll=[&](float yaw,float pitch,float roll){
+                const float cr=std::cos(roll),sr=std::sin(roll),cp=std::cos(pitch),sp=std::sin(pitch),cy=std::cos(yaw),sy=std::sin(yaw);
+                const Matrix rz{cr,sr,0,0,-sr,cr,0,0,0,0,1,0,0,0,0,1},rx{1,0,0,0,0,cp,sp,0,0,-sp,cp,0,0,0,0,1},ry{cy,0,-sy,0,0,1,0,0,sy,0,cy,0,0,0,0,1};
+                return multiply(multiply(rz,rx),ry);};
+            const bool local=name.ends_with("Local");const auto base=local?name.substr(0,name.size()-5):name;
+            if(name=="AddRef")result=hold(stack);else if(name=="Release")result=release(stack->root);
+            else if(name=="QueryInterface"){output(2);Guid requested{};memory.read(GuestAddress{arg(1)},requested);require(requested==unknown || requested==iid(Kind::MatrixStack),no_interface);result=hold(stack);store_pointer(arg(2),stack->root);result=0;}
+            else if(name=="GetTop")result=top_address();
+            else{
+                if(name=="Push"){
+                    if(stack->height==stack->width){const auto capacity=stack->width*2;require(capacity<=65536,out_of_memory);const auto grown=reallocate_heap(memory,stack->mapped,std::uint64_t{capacity}*64,state);require(grown!=0,out_of_memory);stack->mapped=grown;stack->width=capacity;}
+                    const auto top=load_matrix(top_address());++stack->height;store_top(top);
+                }else if(name=="Pop"){if(stack->height>1)--stack->height;}
+                else if(name=="LoadIdentity")store_top(identity());
+                else if(name=="LoadMatrix"){require(arg(1));store_top(load_matrix(arg(1)));}
+                else if(base=="MultMatrix"){require(arg(1));apply(load_matrix(arg(1)),local);}
+                else if(base=="RotateAxis"){require(arg(1));Vector axis{};for(unsigned c=0;c<3;++c)axis[c]=real(static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)+c*4},32)));apply(rotation_axis(axis,scalar_arg(2)),local);}
+                else if(base=="RotateYawPitchRoll")apply(yaw_pitch_roll(scalar_arg(1),scalar_arg(2),scalar_arg(3)),local);
+                else if(base=="Scale")apply(Matrix{scalar_arg(1),0,0,0,0,scalar_arg(2),0,0,0,0,scalar_arg(3),0,0,0,0,1},local);
+                else if(base=="Translate")apply(Matrix{1,0,0,0,0,1,0,0,0,0,1,0,scalar_arg(1),scalar_arg(2),scalar_arg(3),1},local);
+                else throw HostCallFault("未知的 ID3DXMatrixStack 方法："+std::string(name));
+                result=0;
+            }
         }else if(mesh_handled)throw HostCallFault("尚未實作 D3DX9 工具入口："+std::string(symbol));

@@ -63,6 +63,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_desktop_notification(GuestS
             try{if(native_gui_ && !native_gui_->attention(window,next!=gui_.attention.values().end() && (next->second.flags&1) && next->second.phase,next!=gui_.attention.values().end() && (next->second.flags&2) && next->second.phase)){
                 gui_.attention=std::move(old);return fail(50);
             }}catch(...){gui_.attention=std::move(old);throw;}
+            // Shell hook：開始閃爍為 HSHELL_FLASH，停止（FLASHW_STOP／FlashWindow FALSE）為 HSHELL_REDRAW。
+            if(shell_hook_candidate(window))notify_shell_hook((extended?flags!=0:arg(1)!=0)?0x8006U:6U,window,found->second.desktop_object);
             poll_desktop_notifications();return done(prior);
         }
         const auto action=static_cast<std::uint32_t>(arg(0));const auto pointer=arg(1);if(!pointer || action>4)return fail(87);

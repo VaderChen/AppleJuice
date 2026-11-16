@@ -62,12 +62,22 @@ std::size_t metal_cache_entries(const char* name,std::size_t limit){
     return parsed.ec==std::errc{} && parsed.ptr==end?std::min(value,limit):limit;
 }
 Matrix identity(){Matrix m{};m[0]=m[5]=m[10]=m[15]=1;return m;}
+// glEnable／glDisable／glIsEnabled／glGet* 共用的可切換能力：ALPHA_TEST、DEPTH_TEST、BLEND、SCISSOR_TEST、TEXTURE_2D、CULL_FACE、
+// STENCIL_TEST、RESCALE_NORMAL、POLYGON_OFFSET_*、光照相關，以及 GL_AUTO_NORMAL 與 GL_MAP1_*／GL_MAP2_* 求值器開關（由 GLU NURBS 與求值器讀取）。
+bool toggle_cap(unsigned cap){
+    return cap==0xb71 || cap==0xb90 || cap==0xbc0 || cap==0xbe2 || cap==0xc11 || cap==0xde1 || cap==0xde0 || cap==0xb44 || cap==0xb60 || cap==0x8037 || cap==0x2a01 || cap==0x2a02 ||
+        lighting_cap(cap) || cap==0xd80 || (cap>=0xd90 && cap<=0xd98) || (cap>=0xdb0 && cap<=0xdb8);
+}
 Matrix multiply(const Matrix& a,const Matrix& b){Matrix m{};for(unsigned c=0;c<4;++c)for(unsigned r=0;r<4;++r)for(unsigned k=0;k<4;++k)m[c*4+r]+=a[k*4+r]*b[c*4+k];return m;}
 struct Vertex {Vec position{},color{},texcoord{},normal{},ambient{},diffuse{},specular{},emission{},shininess{};};
 static_assert(sizeof(Vertex)==9*16);
 struct Fog {Vec color{};float density{1},start{},end{1},index{};unsigned mode{0x800};};
 
-struct Texture {bool created{};id<MTLTexture> native;std::shared_ptr<GpuMemoryReservation> lease;unsigned min{0x2702},mag{0x2601},s{0x2901},t{0x2901},anisotropy{1},max_level{1000};std::map<unsigned,unsigned> formats;};
+struct Texture {bool created{};id<MTLTexture> native;std::shared_ptr<GpuMemoryReservation> lease;unsigned min{0x2702},mag{0x2601},s{0x2901},t{0x2901},anisotropy{1},max_level{1000};std::map<unsigned,unsigned> formats;
+    // GL_TEXTURE_PRIORITY 只是常駐提示；邊框色保存與查詢，Metal 取樣器僅有固定邊框色。
+    float priority{1};std::array<float,4> border{};
+    // 第一次綁定的目標（GL_TEXTURE_1D 0x0DE0／GL_TEXTURE_2D 0x0DE1）；之後綁到其他目標為 INVALID_OPERATION。1D 以高度 1 的 Metal 2D 貼圖保存。
+    unsigned target{};};
 struct TextureEnvironment {unsigned mode{};Vec color{};};
 struct GlStencil {unsigned function{0x207},reference{},read_mask{UINT32_MAX},write_mask{UINT32_MAX},fail{0x1e00},depth_fail{0x1e00},pass{0x1e00},clear{};};
 struct State {
@@ -86,6 +96,16 @@ struct State {
     unsigned depth_func{0x201},blend_src{1},blend_dst{},binding{},matrix_mode{0x1700},draw_buffer{0x405},read_buffer{0x405};
     std::array<int,4> viewport{},scissor{};
     std::set<unsigned> enabled;
+    // RGBA 像素格式下索引與邊旗標只保存、查詢與還原；光柵位置依模型視圖、投影與視埠換算成視窗座標。
+    double current_index{1},clear_index{},raster_index{1},raster_distance{};bool edge_flag{true},raster_valid{true};
+    Vec raster_position{0,0,0,1},raster_color{1,1,1,1},raster_texcoord{0,0,0,1};
+    unsigned list_base{};
+    // GL_TEXTURE_1D 的綁定；名稱 0 對應 MetalGl::texture_1d_default 槽，與 2D 的預設貼圖分開。
+    unsigned binding_1d{};
+    Vec light_model_ambient{.2F,.2F,.2F,1};bool light_model_local{},light_model_two_side{};unsigned light_model_color_control{0x81f9};
+    unsigned color_material_face{0x408},color_material_mode{0x1602};
+    // glMapGrid1／2：{分段數,起點,終點}、{u 分段,u1,u2,v 分段,v1,v2}。
+    std::array<double,3> grid1{1,0,1};std::array<double,6> grid2{1,0,1,1,0,1};
 };
 struct Command {GlOperation op;std::vector<std::uint64_t> args;std::vector<std::uint8_t> data;};
 struct Array {int size{};unsigned type{};std::vector<std::uint8_t> bytes;bool enabled{};};
@@ -320,6 +340,13 @@ class MetalGl final:public NativeOpenGlContext {
     State state_;
     GlProgrammable gl_;
     std::optional<std::uint64_t> programmable_execute(GlOperation,std::span<const std::uint64_t>,std::span<const std::uint8_t>,std::span<std::uint8_t>);
+    // 求值器（metal_evaluators.inc）：map 定義不屬於 GL_EVAL_BIT，不隨 PushAttrib 保存。
+    struct EvalMap {double u1{0},u2{1},v1{0},v2{1};unsigned uorder{1},vorder{1};std::vector<double> points;};
+    std::map<unsigned,EvalMap> eval_maps_;
+    const EvalMap& eval_map(unsigned);
+    std::array<double,4> eval_value(unsigned,double,double,std::array<double,4>*,std::array<double,4>*);
+    void eval_vertex(double,double,bool);
+    std::uint64_t evaluator(GlOperation,std::span<const std::uint64_t>,std::span<const std::uint8_t>,std::span<std::uint8_t>);
     std::shared_ptr<GlBuffer> gl_buffer(unsigned);
     std::shared_ptr<GraphicsResource> gl_buffer_resource(const std::shared_ptr<GlBuffer>&);
     void gl_buffer_update(const std::shared_ptr<GlBuffer>&,std::span<const std::uint8_t>,std::uint32_t);
@@ -330,6 +357,9 @@ class MetalGl final:public NativeOpenGlContext {
     void gl_draw(GlOperation,std::span<const std::uint64_t>,std::span<const std::uint8_t>);
     void gl_draw_once(GlOperation,std::span<const std::uint64_t>,std::span<const std::uint8_t>,bool&);
     void gl_texture(std::span<const std::uint64_t>,std::span<const std::uint8_t>,bool subimage=false);
+    // 固定管線的貼圖目標：GL_TEXTURE_2D 用 state_.binding、GL_TEXTURE_1D 用 state_.binding_1d；其他目標回傳空指標。
+    static constexpr unsigned texture_1d_default=0xfffffffeU;
+    Texture* bound_texture(unsigned target){if(target==0xde1)return &textures_[state_.binding];if(target==0xde0)return &textures_[state_.binding_1d?state_.binding_1d:texture_1d_default];return nullptr;}
     MTLRenderPassDescriptor* gl_pass(unsigned clear_mask=0);
     unsigned gl_framebuffer_status(bool read=false);
     void gl_read_pixels(std::span<const std::uint64_t>,std::span<std::uint8_t>);
@@ -701,15 +731,19 @@ class MetalGl final:public NativeOpenGlContext {
         const auto normal=normal_matrix(matrices_[0].back());[enc setVertexBytes:normal.data() length:sizeof(normal) atIndex:3];
         unsigned light_mask=0;for(unsigned i=0;i<8;++i)if(state_.enabled.contains(0x4000+i))light_mask|=1U<<i;
         const Vec lighting_flags{!clearing && state_.enabled.contains(0xb50)?1.F:0.F,state_.enabled.contains(0xba1)?1.F:0.F,static_cast<float>(light_mask),0};
-        [enc setVertexBytes:state_.lights.data() length:sizeof(state_.lights) atIndex:4];[enc setVertexBytes:lighting_flags.data() length:sizeof(lighting_flags) atIndex:5];
+        // 第 9 項傳光照模型：ambient＝全域環境光，spot.x／z＝區域觀察者與分離鏡面色。
+        std::array<Light,9> lights{};std::copy(state_.lights.begin(),state_.lights.end(),lights.begin());
+        lights[8].ambient=state_.light_model_ambient;lights[8].spot={state_.light_model_local?1.F:0.F,state_.light_model_two_side?1.F:0.F,state_.light_model_color_control==0x81fa?1.F:0.F,0};
+        [enc setVertexBytes:lights.data() length:sizeof(lights) atIndex:4];[enc setVertexBytes:lighting_flags.data() length:sizeof(lighting_flags) atIndex:5];
         const float point_size=std::clamp(std::round(state_.point_size),1.F,64.F);[enc setVertexBytes:&point_size length:sizeof(point_size) atIndex:6];
         }
         const auto& fog=state_.fog;const std::array<Vec,2> fog_uniform{{fog.color,{fog.density,fog.start,fog.end,!clearing && state_.enabled.contains(0xb60)?static_cast<float>(fog.mode):0}}};
         [enc setFragmentBytes:fog_uniform.data() length:sizeof(fog_uniform) atIndex:1];
-        unsigned enabled=0;auto& t=textures_[state_.binding];auto default_sampler=[MTLSamplerDescriptor new];[enc setFragmentTexture:textures_.at(UINT32_MAX).native atIndex:0];[enc setFragmentSamplerState:cached_sampler_state(default_sampler) atIndex:0];
-        if(!clearing && state_.enabled.contains(0xde1)){
+        const bool texture_1d=!state_.enabled.contains(0xde1) && state_.enabled.contains(0xde0);
+        unsigned enabled=0;auto& t=*bound_texture(texture_1d?0xde0U:0xde1U);auto default_sampler=[MTLSamplerDescriptor new];[enc setFragmentTexture:textures_.at(UINT32_MAX).native atIndex:0];[enc setFragmentSamplerState:cached_sampler_state(default_sampler) atIndex:0];
+        if(!clearing && (state_.enabled.contains(0xde1) || texture_1d)){
             // 依 MAX_LEVEL 檢查實際 mip 完整度；單層 D3D 紋理也能使用 mip filter。
-            enabled=1;auto sampler=[MTLSamplerDescriptor new];sampler.maxAnisotropy=t.anisotropy;sampler.minFilter=t.min==0x2600 || t.min==0x2700 || t.min==0x2702?MTLSamplerMinMagFilterNearest:MTLSamplerMinMagFilterLinear;sampler.mipFilter=t.min<=0x2601?MTLSamplerMipFilterNotMipmapped:t.min<=0x2701?MTLSamplerMipFilterNearest:MTLSamplerMipFilterLinear;auto texture=fixed_targets_set_ && fixed_texture_.resource?metal_shader_texture(fixed_texture_):t.native;unsigned mip_levels=0;if(fixed_targets_set_ && fixed_texture_.resource){mip_levels=fixed_texture_.levels;graphics_pending_.push_back(fixed_texture_.resource);}else while(t.formats.contains(mip_levels))++mip_levels;sampler.lodMaxClamp=mip_levels?static_cast<float>(std::min(t.max_level,mip_levels-1)):0;sampler.magFilter=t.mag==0x2600?MTLSamplerMinMagFilterNearest:MTLSamplerMinMagFilterLinear;sampler.sAddressMode=address_mode(t.s);sampler.tAddressMode=address_mode(t.t);
+            enabled=1;auto sampler=[MTLSamplerDescriptor new];sampler.maxAnisotropy=t.anisotropy;sampler.minFilter=t.min==0x2600 || t.min==0x2700 || t.min==0x2702?MTLSamplerMinMagFilterNearest:MTLSamplerMinMagFilterLinear;sampler.mipFilter=t.min<=0x2601?MTLSamplerMipFilterNotMipmapped:t.min<=0x2701?MTLSamplerMipFilterNearest:MTLSamplerMipFilterLinear;auto texture=fixed_targets_set_ && fixed_texture_.resource?metal_shader_texture(fixed_texture_):t.native;unsigned mip_levels=0;if(fixed_targets_set_ && fixed_texture_.resource){mip_levels=fixed_texture_.levels;graphics_pending_.push_back(fixed_texture_.resource);}else while(t.formats.contains(mip_levels))++mip_levels;sampler.lodMaxClamp=mip_levels?static_cast<float>(std::min(t.max_level,mip_levels-1)):0;sampler.magFilter=t.mag==0x2600?MTLSamplerMinMagFilterNearest:MTLSamplerMinMagFilterLinear;sampler.sAddressMode=address_mode(t.s);sampler.tAddressMode=texture_1d?MTLSamplerAddressModeClampToEdge:address_mode(t.t);
             const unsigned required=texture?std::min(t.max_level,static_cast<unsigned>(texture.mipmapLevelCount-1))+1:0;id<MTLTexture> sampled=(texture && (t.min<=0x2601 || mip_levels>=required))?texture:textures_.at(UINT32_MAX).native;
             // MAX_LEVEL 限制資源可見的 mip 範圍，而不只是 sampler LOD；各向異性 footprint 不得讀到未定義層。
             if(sampled==texture && required<texture.mipmapLevelCount){sampled=[texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0,required) slices:NSMakeRange(0,1)];if(!sampled)throw std::runtime_error("Metal mip view 建立失敗");}
@@ -744,7 +778,75 @@ class MetalGl final:public NativeOpenGlContext {
     static unsigned unit(unsigned type){switch(type){case 0x1400:case 0x1401:return 1;case 0x1402:case 0x1403:return 2;case 0x1404:case 0x1405:case 0x1406:return 4;case 0x140a:return 8;default:throw std::invalid_argument("GL scalar type");}}
     static double number(std::span<const std::uint8_t> b,std::size_t at,unsigned type){const auto size=unit(type);if(at>b.size() || size>b.size()-at)throw std::invalid_argument("GL scalar bounds");std::uint64_t n=0;std::memcpy(&n,b.data()+at,size);switch(type){case 0x1400:return static_cast<std::int8_t>(n);case 0x1401:return static_cast<std::uint8_t>(n);case 0x1402:return static_cast<std::int16_t>(n);case 0x1403:return static_cast<std::uint16_t>(n);case 0x1404:return static_cast<std::int32_t>(n);case 0x1405:return static_cast<std::uint32_t>(n);case 0x1406:return std::bit_cast<float>(static_cast<std::uint32_t>(n));default:return std::bit_cast<double>(n);}}
     void vertex(Vec position){if(!begun_){error(0x502);return;}if(vertices_.size()>=1048576)throw std::bad_alloc{};Vec tex{};for(unsigned r=0;r<4;++r)for(unsigned k=0;k<4;++k)tex[r]+=matrices_[2].back()[k*4+r]*state_.texcoord[k];const auto& material=state_.materials[0];vertices_.push_back({position,state_.color,tex,state_.normal,material.ambient,material.diffuse,material.specular,material.emission,material.shininess});}
-    void track_color(){if(state_.enabled.contains(0xb57)){auto color=state_.color;for(auto& c:color)c=std::clamp(c,0.F,1.F);for(auto& material:state_.materials)material.ambient=material.diffuse=color;}}
+    // glColorMaterial 指定的面與參數追蹤目前色彩；被追蹤的參數不受 glMaterial 改寫。
+    bool color_tracked(unsigned face,unsigned parameter)const{
+        if(!state_.enabled.contains(0xb57) || (state_.color_material_face!=0x408 && state_.color_material_face!=0x404+face))return false;
+        const auto mode=state_.color_material_mode;return mode==parameter || (mode==0x1602 && (parameter==0x1200 || parameter==0x1201));
+    }
+    void track_color(){if(!state_.enabled.contains(0xb57))return;auto color=state_.color;for(auto& c:color)c=std::clamp(c,0.F,1.F);
+        for(unsigned face=0;face<2;++face){auto& material=state_.materials[face];
+            if(color_tracked(face,0x1200))material.ambient=color;if(color_tracked(face,0x1201))material.diffuse=color;
+            if(color_tracked(face,0x1202))material.specular=color;if(color_tracked(face,0x1600))material.emission=color;}}
+    // GL 1.1 §2.12：物件座標經模型視圖、投影變換後做剪裁測試，再以視埠與深度範圍換算；顏色與紋理座標取目前值。
+    void raster_position(Vec object){
+        const auto eye=transform(matrices_[0].back(),object);const auto clip=transform(matrices_[1].back(),eye);const auto w=clip[3];
+        state_.raster_valid=w>0 && std::abs(clip[0])<=w && std::abs(clip[1])<=w && std::abs(clip[2])<=w;if(!state_.raster_valid)return;
+        const auto& v=state_.viewport;const auto& range=state_.depth_range;
+        state_.raster_position={static_cast<float>((clip[0]/w+1)*v[2]/2+v[0]),static_cast<float>((clip[1]/w+1)*v[3]/2+v[1]),static_cast<float>((range[1]-range[0])/2*(clip[2]/w)+(range[0]+range[1])/2),w};
+        const double scale=eye[3]!=0?1.0/eye[3]:1.0;state_.raster_distance=std::sqrt(eye[0]*eye[0]*scale*scale+eye[1]*eye[1]*scale*scale+eye[2]*eye[2]*scale*scale);
+        state_.raster_color=state_.color;state_.raster_index=state_.current_index;state_.raster_texcoord=transform(matrices_[2].back(),state_.texcoord);
+    }
+    // GL 1.1 §3.6.4 glBitmap：位元 1 的位置產生片段（光柵色彩與紋理座標，照常經過 alpha／模板／深度測試與混色），左下角為光柵位置減 xorig／yorig 取整；
+    // 光柵位置無效時不繪製也不前進，之後依 xmove／ymove 前進。資料依目前解包設定讀取；顯示清單內的記錄已在編譯時解包（a[7] 為 canonical 標記）。
+    static constexpr std::uint64_t canonical_bitmap=0x43414e4f4e424d50ULL;
+    std::vector<std::uint8_t> bitmap_bits(std::span<const std::uint64_t> a,std::span<const std::uint8_t> data,unsigned width,unsigned height){
+        const bool canonical=a.size()>7 && a[7]==canonical_bitmap;
+        const auto value=[&](unsigned name){const auto it=pixel_.find(name);return it==pixel_.end()?0:it->second;};
+        const unsigned lsb=canonical?0U:static_cast<unsigned>(value(0xcf1)),row=canonical?width:(value(0xcf2)>0?static_cast<unsigned>(value(0xcf2)):width);
+        const std::size_t skip_rows=canonical?0U:static_cast<std::size_t>(std::max(0,value(0xcf3))),skip_pixels=canonical?0U:static_cast<std::size_t>(std::max(0,value(0xcf4)));
+        const std::size_t align=canonical?1U:static_cast<std::size_t>(std::max(1,value(0xcf5)));const std::size_t stride=((row+7)/8+align-1)/align*align;
+        std::vector<std::uint8_t> bits(static_cast<std::size_t>(width)*height);
+        for(std::size_t y=0;y<height;++y)for(std::size_t x=0;x<width;++x){
+            const auto bit=skip_pixels+x;const auto at=(skip_rows+y)*stride+bit/8;if(at>=data.size())throw std::invalid_argument("bitmap bounds");
+            bits[y*width+x]=static_cast<std::uint8_t>((data[at]>>(lsb?bit%8:7-bit%8))&1U);
+        }
+        return bits;
+    }
+    // 顯示清單記錄 glBitmap 時改存緊密排列（MSB 先、每列位元組對齊）的位元，回放不受之後的解包設定影響。
+    std::pair<std::vector<std::uint64_t>,std::vector<std::uint8_t>> bitmap_record(std::span<const std::uint64_t> a,std::span<const std::uint8_t> data){
+        std::vector<std::uint64_t> args(std::max<std::size_t>(a.size(),8));std::copy(a.begin(),a.end(),args.begin());
+        const auto width=static_cast<std::int32_t>(static_cast<unsigned>(a[0])),height=static_cast<std::int32_t>(static_cast<unsigned>(a[1]));
+        if(width<=0 || height<=0 || data.empty())return {{a.begin(),a.end()},{data.begin(),data.end()}};
+        const auto bits=bitmap_bits(a,data,static_cast<unsigned>(width),static_cast<unsigned>(height));const auto stride=(static_cast<std::size_t>(width)+7)/8;
+        std::vector<std::uint8_t> packed(stride*static_cast<std::size_t>(height));
+        for(std::size_t y=0;y<static_cast<std::size_t>(height);++y)for(std::size_t x=0;x<static_cast<std::size_t>(width);++x)if(bits[y*static_cast<std::size_t>(width)+x])packed[y*stride+x/8]|=static_cast<std::uint8_t>(0x80U>>(x%8));
+        args[7]=canonical_bitmap;return {std::move(args),std::move(packed)};
+    }
+    void gl_bitmap(std::span<const std::uint64_t> a,std::span<const std::uint8_t> data){
+        const auto width=static_cast<std::int32_t>(static_cast<unsigned>(a[0])),height=static_cast<std::int32_t>(static_cast<unsigned>(a[1]));
+        const auto f=[&](unsigned i){return std::bit_cast<float>(static_cast<unsigned>(a[i]));};
+        if(width<0 || height<0){error(0x501);return;}if(begun_){error(0x502);return;}if(!state_.raster_valid)return;
+        const auto& v=state_.viewport;
+        if(width && height && !data.empty() && v[2]>0 && v[3]>0){
+            const auto bits=bitmap_bits(a,data,static_cast<unsigned>(width),static_cast<unsigned>(height));
+            const double x0=std::floor(state_.raster_position[0]-f(2)),y0=std::floor(state_.raster_position[1]-f(3));const auto& range=state_.depth_range;
+            const auto z=static_cast<float>(range[1]!=range[0]?(state_.raster_position[2]-(range[0]+range[1])/2)*2/(range[1]-range[0]):0);
+            // 以單位矩陣把視窗座標直接換成剪裁座標；暫停光照與剔除，片段帶光柵色彩與（已經過紋理矩陣的）光柵紋理座標。
+            struct Saved {MetalGl& gl;std::array<Matrix,3> matrices;std::set<unsigned> enabled;Vec color,texcoord;
+                ~Saved(){for(std::size_t i=0;i<3;++i)gl.matrices_[i].back()=matrices[i];gl.state_.enabled=std::move(enabled);gl.state_.color=color;gl.state_.texcoord=texcoord;gl.begun_=false;gl.vertices_.clear();}
+            } saved{*this,{matrices_[0].back(),matrices_[1].back(),matrices_[2].back()},state_.enabled,state_.color,state_.texcoord};
+            for(auto& stack:matrices_)stack.back()=identity();for(const unsigned cap:{0xb50U,0xb44U,0x8037U})state_.enabled.erase(cap);
+            state_.color=state_.raster_color;state_.texcoord=state_.raster_texcoord;
+            const auto clip=[&](double wx,double wy){return Vec{static_cast<float>((wx-v[0])*2/v[2]-1),static_cast<float>((wy-v[1])*2/v[3]-1),z,1};};
+            begun_=true;primitive_=4;vertices_.clear();
+            for(std::size_t y=0;y<static_cast<std::size_t>(height);++y)for(std::size_t x=0;x<static_cast<std::size_t>(width);++x){
+                if(!bits[y*static_cast<std::size_t>(width)+x])continue;const double px=x0+static_cast<double>(x),py=y0+static_cast<double>(y);
+                const auto a0=clip(px,py),a1=clip(px+1,py),a2=clip(px+1,py+1),a3=clip(px,py+1);vertex(a0);vertex(a1);vertex(a2);vertex(a0);vertex(a2);vertex(a3);
+            }
+            begun_=false;if(!vertices_.empty())end_primitive();
+        }
+        state_.raster_position[0]+=f(4);state_.raster_position[1]+=f(5);
+    }
     void array_vertex(unsigned i){
         for(unsigned index:{1U,2U,3U,0U}){const auto& a=arrays_[index];if(!a.enabled)continue;Vec value{0,0,0,1};for(int c=0;c<a.size;++c){auto n=number(a.bytes,(static_cast<std::size_t>(i)*static_cast<unsigned>(a.size)+static_cast<unsigned>(c))*unit(a.type),a.type);if((index==1 || index==2) && a.type!=0x1406 && a.type!=0x140a){const auto bits=unit(a.type)*8;const bool sign=(a.type&1)==0;n=std::max(-1.,n/(sign?std::pow(2.,bits-1)-1:std::pow(2.,bits)-1));}value[static_cast<unsigned>(c)]=static_cast<float>(n);}if(index==0)vertex(value);else if(index==1)state_.normal=value;else if(index==2){state_.color=value;track_color();}else state_.texcoord=value;}
     }
@@ -762,7 +864,7 @@ class MetalGl final:public NativeOpenGlContext {
         else if(pname>=0xba6 && pname<=0xba8)vector(matrices_[pname-0xba6].back());
         else if(pname==0xba2)vector(state_.viewport);else if(pname==0xc10)vector(state_.scissor);else if(pname==0xb00)vector(state_.color);else if(pname==0xb03)vector(state_.texcoord);else if(pname==0xc22)vector(state_.clear);
         else if(pname==0xc01)values={static_cast<double>(state_.draw_buffer)};else if(pname==0xc02)values={static_cast<double>(state_.read_buffer)};else if(pname==0xc32)values={1};else if(pname==0xb54)values={0x1d01};else if(pname==0xbe0)values={static_cast<double>(state_.blend_dst)};else if(pname==0xbe1)values={static_cast<double>(state_.blend_src)};
-        else if(pname==0xba0)values={static_cast<double>(state_.matrix_mode)};else if(pname==0x8069)values={static_cast<double>(state_.binding)};
+        else if(pname==0xba0)values={static_cast<double>(state_.matrix_mode)};else if(pname==0x8068)values={static_cast<double>(state_.binding_1d)};else if(pname==0x8069)values={static_cast<double>(state_.binding)};
         else if(pname==0xb45)values={static_cast<double>(state_.cull_face)};else if(pname==0xb46)values={static_cast<double>(state_.front_face)};else if(pname==0xb70)vector(state_.depth_range);
         else if(pname==0xc23)values={state_.color_mask&1U?1.:0.,state_.color_mask&2U?1.:0.,state_.color_mask&4U?1.:0.,state_.color_mask&8U?1.:0.};
         else if(pname==0xb21)values={state_.line_width};else if(pname==0x846e || pname==0xb22)values={1,1};else if(pname==0xb23)values={0};
@@ -779,17 +881,24 @@ class MetalGl final:public NativeOpenGlContext {
         else if(pname>=0xba3 && pname<=0xba5)values={static_cast<double>(matrices_[pname-0xba3].size())};
         else if(pname==0xd36)values={32};else if(pname==0xd38 || pname==0xd39)values={2};else if(pname==0xd3a)values={16384,16384};
         else if(pixel_.contains(pname))values={static_cast<double>(pixel_[pname])};
-        else if(lighting_cap(pname) || pname==0xb71 || pname==0xb90 || pname==0xbc0 || pname==0xbe2 || pname==0xc11 || pname==0xde1 || pname==0xb44 || pname==0xb60 || pname==0x8037 || pname==0x2a01 || pname==0x2a02)values={state_.enabled.contains(pname)?1.:0.};
+        else if(toggle_cap(pname))values={state_.enabled.contains(pname)?1.:0.};
+        else if(pname==0xd30)values={static_cast<double>(gl_max_eval_order)};
+        else if(pname==0xdd0)values={state_.grid1[1],state_.grid1[2]};else if(pname==0xdd1)values={state_.grid1[0]};
+        else if(pname==0xdd2)values={state_.grid2[1],state_.grid2[2],state_.grid2[4],state_.grid2[5]};else if(pname==0xdd3)values={state_.grid2[0],state_.grid2[3]};
         else if(pname==0xb02){values={state_.normal[0],state_.normal[1],state_.normal[2]};}
-        else if(pname==0xd31)values={8};else if(pname==0xb53)values={.2,.2,.2,1};
-        else if(pname==0xb51 || pname==0xb52)values={0};else if(pname==0xb55)values={0x408};else if(pname==0xb56)values={0x1602};
+        else if(pname==0xd31)values={8};else if(pname==0xb53)vector(state_.light_model_ambient);
+        else if(pname==0xb51)values={state_.light_model_local?1.:0.};else if(pname==0xb52)values={state_.light_model_two_side?1.:0.};else if(pname==0x81f8)values={static_cast<double>(state_.light_model_color_control)};
+        else if(pname==0xb55)values={static_cast<double>(state_.color_material_face)};else if(pname==0xb56)values={static_cast<double>(state_.color_material_mode)};
+        else if(pname==0xb01)values={state_.current_index};else if(pname==0xb43)values={state_.edge_flag?1.:0.};else if(pname==0xc20)values={state_.clear_index};else if(pname==0xb32)values={static_cast<double>(state_.list_base)};
+        else if(pname==0xb07)vector(state_.raster_position);else if(pname==0xb08)values={state_.raster_valid?1.:0.};else if(pname==0xb09)values={state_.raster_distance};
+        else if(pname==0xb04)vector(state_.raster_color);else if(pname==0xb05)values={state_.raster_index};else if(pname==0xb06)vector(state_.raster_texcoord);
         else if(pname==0xb66)vector(state_.fog.color);
         else if(pname==0xb61)values={state_.fog.index};else if(pname==0xb62)values={state_.fog.density};
         else if(pname==0xb63)values={state_.fog.start};else if(pname==0xb64)values={state_.fog.end};
         else if(pname==0xb65)values={static_cast<double>(state_.fog.mode)};else if(pname==0xc54)values={static_cast<double>(state_.fog_hint)};else if(pname==0xc50)values={static_cast<double>(state_.perspective_hint)};
         else {error(0x500);return;}
         const unsigned size=op==GlOperation::GetDoublev?8:op==GlOperation::GetBooleanv?1:4;if(values.size()*size>out.size())throw std::invalid_argument("GL query bounds");
-        for(std::size_t i=0;i<values.size();++i){const auto n=values[i];std::uint64_t value=0;if(op==GlOperation::GetDoublev)value=std::bit_cast<std::uint64_t>(n);else if(op==GlOperation::GetFloatv)value=std::bit_cast<std::uint32_t>(static_cast<float>(n));else if(op==GlOperation::GetBooleanv)value=n!=0;else if(pname==0xc21)value=state_.index_mask;else {const auto scaled=(pname==0xb00 || pname==0xc22 || pname==0xb66 || pname==0xb53 || pname==0xb02 || pname==0xbc2)?n*2147483647.:n;const auto safe=std::isfinite(scaled)?std::clamp(std::round(scaled),-2147483648.,2147483647.):0.;value=static_cast<std::uint32_t>(static_cast<std::int32_t>(safe));}std::memcpy(out.data()+i*size,&value,size);}
+        for(std::size_t i=0;i<values.size();++i){const auto n=values[i];std::uint64_t value=0;if(op==GlOperation::GetDoublev)value=std::bit_cast<std::uint64_t>(n);else if(op==GlOperation::GetFloatv)value=std::bit_cast<std::uint32_t>(static_cast<float>(n));else if(op==GlOperation::GetBooleanv)value=n!=0;else if(pname==0xc21)value=state_.index_mask;else {const auto scaled=(pname==0xb00 || pname==0xc22 || pname==0xb66 || pname==0xb53 || pname==0xb02 || pname==0xbc2 || pname==0xb04)?n*2147483647.:n;const auto safe=std::isfinite(scaled)?std::clamp(std::round(scaled),-2147483648.,2147483647.):0.;value=static_cast<std::uint32_t>(static_cast<std::int32_t>(safe));}std::memcpy(out.data()+i*size,&value,size);}
     }
 public:
     MetalGl(void* view,unsigned w,unsigned h){@autoreleasepool{
@@ -1026,25 +1135,32 @@ public:
 #include "metal_loop_compaction.inc"
 #include "metal_shader_cache.inc"
 #include "metal_programmable.inc"
+#include "metal_evaluators.inc"
 #include "metal_timestamp.inc"
 #include "metal_graphics_capture.inc"
 std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,std::span<const std::uint8_t> data,std::span<std::uint8_t> output){@autoreleasepool{
     active_operation_=op;
     const bool current_attribute=op==GlOperation::VertexAttrib1f || op==GlOperation::VertexAttrib2f || op==GlOperation::VertexAttrib3f || op==GlOperation::VertexAttrib4f;
-    if(begun_ && op>=GlOperation::CreateShader && !current_attribute){error(0x502);return 0;}
+    // 索引、邊旗標與 glCallLists 可出現在 glBegin／glEnd 之間；其他新增操作不可。
+    const bool evaluated_vertex=op==GlOperation::EvalCoord1d || op==GlOperation::EvalCoord2d || op==GlOperation::EvalPoint1 || op==GlOperation::EvalPoint2;
+    const bool begin_allowed=current_attribute || evaluated_vertex || op==GlOperation::Indexd || op==GlOperation::EdgeFlag || op==GlOperation::CallLists;
+    if(begun_ && op>=GlOperation::CreateShader && !begin_allowed){error(0x502);return 0;}
     if(const auto result=programmable_execute(op,a,data,output))return *result;
     const auto u=[&](unsigned i){return static_cast<unsigned>(a[i]);};const auto n=[&](unsigned i){return static_cast<std::int32_t>(u(i));};const auto f=[&](unsigned i){return std::bit_cast<float>(u(i));};const auto d=[&](unsigned i){return std::bit_cast<double>(a[i]);};
     const auto vector=[&](unsigned count,bool wide=false){Vec value{0,0,0,1};for(unsigned i=0;i<count;++i)value[i]=static_cast<float>(number(data,i*(wide?8:4),wide?0x140a:0x1406));return value;};
     if(op==GlOperation::GetError){if(begun_){error(0x502);return 0;}const auto e=error_;error_=0;return e;}
-    if(compiling_ && !replaying_ && op!=GlOperation::IsTexture && op!=GlOperation::GetTexLevelParameteriv && op!=GlOperation::GetTexLevelParameterfv && !(op==GlOperation::TexImage2D && u(0)==0x8064) && op!=GlOperation::EndList && op!=GlOperation::NewList && op!=GlOperation::GenLists && op!=GlOperation::DeleteLists && op!=GlOperation::GenTextures && op!=GlOperation::DeleteTextures && op!=GlOperation::GetIntegerv && op!=GlOperation::GetFloatv && op!=GlOperation::GetDoublev && op!=GlOperation::GetBooleanv && op!=GlOperation::IsEnabled && op!=GlOperation::GetTexEnviv && op!=GlOperation::GetTexEnvfv && op!=GlOperation::GetTexParameteriv && op!=GlOperation::GetTexParameterfv && op!=GlOperation::ReadPixels && op!=GlOperation::PixelStorei && op!=GlOperation::PushClientAttrib && op!=GlOperation::PopClientAttrib){
-        if(op==GlOperation::TexImage2D || op==GlOperation::TexSubImage2D || op==GlOperation::DrawArrays || op==GlOperation::DrawElements){error(0x502);return 0;}
+    if(compiling_ && !replaying_ && op!=GlOperation::GetMapdv && op!=GlOperation::IsTexture && op!=GlOperation::GetTexLevelParameteriv && op!=GlOperation::GetTexLevelParameterfv && !(op==GlOperation::TexImage2D && (u(0)==0x8064 || u(0)==0x8063)) && op!=GlOperation::EndList && op!=GlOperation::NewList && op!=GlOperation::GenLists && op!=GlOperation::DeleteLists && op!=GlOperation::GenTextures && op!=GlOperation::DeleteTextures && op!=GlOperation::GetIntegerv && op!=GlOperation::GetFloatv && op!=GlOperation::GetDoublev && op!=GlOperation::GetBooleanv && op!=GlOperation::IsEnabled && op!=GlOperation::GetTexEnviv && op!=GlOperation::GetTexEnvfv && op!=GlOperation::GetTexParameteriv && op!=GlOperation::GetTexParameterfv && op!=GlOperation::ReadPixels && op!=GlOperation::PixelStorei && op!=GlOperation::PushClientAttrib && op!=GlOperation::PopClientAttrib && op!=GlOperation::IsList && op!=GlOperation::GetLightfv && op!=GlOperation::GetMaterialfv){
+        if(op==GlOperation::TexImage2D || op==GlOperation::TexSubImage2D || op==GlOperation::CopyTexImage2D || op==GlOperation::DrawArrays || op==GlOperation::DrawElements){error(0x502);return 0;}
         const auto bytes=sizeof(Command)+a.size_bytes()+data.size();if(list_bytes_+bytes>32*1024*1024)throw std::bad_alloc{};
-        lists_[compiling_].push_back({op,{a.begin(),a.end()},{data.begin(),data.end()}});list_bytes_+=bytes;if(compile_mode_==0x1300)return 0;
+        if(op==GlOperation::Bitmap){auto [args,bits]=bitmap_record(a,data);lists_[compiling_].push_back({op,std::move(args),std::move(bits)});}else lists_[compiling_].push_back({op,{a.begin(),a.end()},{data.begin(),data.end()}});
+        list_bytes_+=bytes;if(compile_mode_==0x1300)return 0;
     }
     const bool attribute=op==GlOperation::Materialf || op==GlOperation::Materialfv || op==GlOperation::Color3f || op==GlOperation::Color4f || op==GlOperation::Color4fv || op==GlOperation::Color4dv || op==GlOperation::TexCoord2f || op==GlOperation::TexCoord2fv || op==GlOperation::TexCoord4fv || op==GlOperation::TexCoord4dv || op==GlOperation::Normal3f || op==GlOperation::Normal3fv || op==GlOperation::Normal3dv;
-    const bool position=op==GlOperation::Vertex2f || op==GlOperation::Vertex2i || op==GlOperation::Vertex3f || op==GlOperation::Vertex3fv || op==GlOperation::Vertex4fv || op==GlOperation::Vertex4dv;
-    if(begun_ && !attribute && !position && op!=GlOperation::End && op!=GlOperation::CallList){error(0x502);return 0;}
+    const bool position=evaluated_vertex || op==GlOperation::Vertex2f || op==GlOperation::Vertex2i || op==GlOperation::Vertex3f || op==GlOperation::Vertex3fv || op==GlOperation::Vertex4fv || op==GlOperation::Vertex4dv;
+    if(begun_ && !attribute && !position && op!=GlOperation::End && op!=GlOperation::CallList && op!=GlOperation::CallLists && op!=GlOperation::Indexd && op!=GlOperation::EdgeFlag){error(0x502);return 0;}
     try {switch(op){
+    case GlOperation::Map1d:case GlOperation::Map2d:case GlOperation::MapGrid1d:case GlOperation::MapGrid2d:case GlOperation::EvalCoord1d:case GlOperation::EvalCoord2d:
+    case GlOperation::EvalMesh1:case GlOperation::EvalMesh2:case GlOperation::EvalPoint1:case GlOperation::EvalPoint2:case GlOperation::GetMapdv:return evaluator(op,a,data,output);
     case GlOperation::Begin:if(u(0)>9)error(0x500);else {begun_=true;primitive_=u(0);vertices_.clear();}break;
     case GlOperation::End:if(!begun_)error(0x502);else {begun_=false;end_primitive();}break;
     case GlOperation::Vertex2f:vertex({f(0),f(1),0,1});break;case GlOperation::Vertex2i:vertex({static_cast<float>(n(0)),static_cast<float>(n(1)),0,1});break;
@@ -1058,8 +1174,8 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     case GlOperation::Clear:{if(u(0)&~0x4500U){error(0x501);break;}if(!u(0))break;const auto z=static_cast<float>(state_.depth_clear*2-1);const std::array<Vertex,3> v{{{{-1,-1,z,1},state_.clear,{0,0,0,1}},{{3,-1,z,1},state_.clear,{0,0,0,1}},{{-1,3,z,1},state_.clear,{0,0,0,1}}}};draw(v,MTLPrimitiveTypeTriangle,true,u(0));break;}
     case GlOperation::CullFace:if(u(0)!=0x404 && u(0)!=0x405 && u(0)!=0x408)error(0x500);else state_.cull_face=u(0);break;
     case GlOperation::FrontFace:if(u(0)!=0x900 && u(0)!=0x901)error(0x500);else state_.front_face=u(0);break;
-    case GlOperation::Enable:case GlOperation::Disable:{const auto cap=u(0);if(cap!=0xb71 && cap!=0xb90 && cap!=0xbc0 && cap!=0xbe2 && cap!=0xc11 && cap!=0xde1 && cap!=0xb44 && cap!=0xb60 && cap!=0x8037 && cap!=0x2a01 && cap!=0x2a02 && !lighting_cap(cap)){error(0x500);break;}if(op==GlOperation::Enable){state_.enabled.insert(cap);if(cap==0xb57)track_color();}else state_.enabled.erase(cap);break;}
-    case GlOperation::IsEnabled:if(u(0)!=0xb71 && u(0)!=0xb90 && u(0)!=0xbc0 && u(0)!=0xbe2 && u(0)!=0xc11 && u(0)!=0xde1 && u(0)!=0xb44 && u(0)!=0xb60 && u(0)!=0x8037 && u(0)!=0x2a01 && u(0)!=0x2a02 && !lighting_cap(u(0))){error(0x500);return 0;}return state_.enabled.contains(u(0));
+    case GlOperation::Enable:case GlOperation::Disable:{const auto cap=u(0);if(!toggle_cap(cap)){error(0x500);break;}if(op==GlOperation::Enable){state_.enabled.insert(cap);if(cap==0xb57)track_color();}else state_.enabled.erase(cap);break;}
+    case GlOperation::IsEnabled:if(!toggle_cap(u(0))){error(0x500);return 0;}return state_.enabled.contains(u(0));
     case GlOperation::BlendFunc:if(!factor(u(0)) || !factor(u(1)) || u(1)==0x308)error(0x500);else {state_.blend_src=u(0);state_.blend_dst=u(1);}break;
     case GlOperation::StencilFunc:if(u(0)<0x200 || u(0)>0x207)error(0x500);else {state_.stencil.function=u(0);state_.stencil.reference=static_cast<unsigned>(std::clamp(n(1),0,255));state_.stencil.read_mask=u(2);}break;
     case GlOperation::StencilMask:state_.stencil.write_mask=u(0);break;
@@ -1083,7 +1199,7 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
         switch(u(1)){
         case 0x1200:light.ambient=vector(4);break;case 0x1201:light.diffuse=vector(4);break;case 0x1202:light.specular=vector(4);break;
         case 0x1203:light.position=transform(matrices_[0].back(),vector(4));break;
-        case 0x1204:{auto direction=vector(3);direction[3]=0;light.direction=transform(normal_matrix(matrices_[0].back()),direction);break;}
+        case 0x1204:{auto direction=vector(3);direction[3]=0;light.direction=transform(matrices_[0].back(),direction);break;}
         case 0x1205:{const auto value=vector(1)[0];if(value<0 || value>128)error(0x501);else light.spot[0]=value;break;}
         case 0x1206:{const auto value=vector(1)[0];if(value!=180 && (value<0 || value>90))error(0x501);else {light.spot[2]=value;light.spot[1]=value==180?-1:std::cos(value*0.017453292519943295F);}break;}
         case 0x1207:case 0x1208:case 0x1209:{const auto value=vector(1)[0];if(value<0)error(0x501);else light.attenuation[u(1)-0x1207]=value;break;}
@@ -1096,9 +1212,9 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
         const auto value=op==GlOperation::Materialf?Vec{f(2),0,0,0}:vector(name==0x1601?1:name==0x1603?3:4);
         if(name==0x1601 && (value[0]<0 || value[0]>128)){error(0x501);break;}
         for(unsigned face=0;face<2;++face){if(u(0)!=0x408 && u(0)!=0x404+face)continue;auto& material=state_.materials[face];
-            if(state_.enabled.contains(0xb57) && (name==0x1200 || name==0x1201 || name==0x1602))continue;
-            switch(name){case 0x1200:material.ambient=value;break;case 0x1201:material.diffuse=value;break;case 0x1202:material.specular=value;break;
-            case 0x1600:material.emission=value;break;case 0x1601:material.shininess=value;break;case 0x1602:material.ambient=material.diffuse=value;break;case 0x1603:material.indexes=value;break;}
+            const auto set=[&](unsigned parameter,Vec& target){if(!color_tracked(face,parameter))target=value;};
+            switch(name){case 0x1200:set(0x1200,material.ambient);break;case 0x1201:set(0x1201,material.diffuse);break;case 0x1202:set(0x1202,material.specular);break;
+            case 0x1600:set(0x1600,material.emission);break;case 0x1601:material.shininess=value;break;case 0x1602:set(0x1200,material.ambient);set(0x1201,material.diffuse);break;case 0x1603:material.indexes=value;break;}
         }break;
     }
     case GlOperation::Fogf:case GlOperation::Fogi:case GlOperation::Fogfv:{
@@ -1121,29 +1237,31 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     case GlOperation::Scalef:{auto m=identity();m[0]=f(0);m[5]=f(1);m[10]=f(2);matrix()=multiply(matrix(),m);break;}
     case GlOperation::Rotatef:{const auto length=std::sqrt(f(1)*f(1)+f(2)*f(2)+f(3)*f(3));if(length==0)break;const float x=f(1)/length,y=f(2)/length,z=f(3)/length,t=f(0)*0.017453292519943295F,c=std::cos(t),s=std::sin(t),q=1-c;Matrix m{x*x*q+c,y*x*q+z*s,x*z*q-y*s,0,x*y*q-z*s,y*y*q+c,y*z*q+x*s,0,x*z*q+y*s,y*z*q-x*s,z*z*q+c,0,0,0,0,1};matrix()=multiply(matrix(),m);break;}
     case GlOperation::Ortho:case GlOperation::Frustum:case GlOperation::Perspective:{double l,r,b,t,near,far;if(op==GlOperation::Perspective){near=d(2);far=d(3);t=near*std::tan(d(0)*3.141592653589793/360);b=-t;r=t*d(1);l=-r;}else {l=d(0);r=d(1);b=d(2);t=d(3);near=d(4);far=d(5);}if(l==r || b==t || near==far || (op!=GlOperation::Ortho && (near<=0 || far<=0))){error(0x501);break;}Matrix m{};if(op==GlOperation::Ortho){m[0]=static_cast<float>(2/(r-l));m[5]=static_cast<float>(2/(t-b));m[10]=static_cast<float>(-2/(far-near));m[12]=static_cast<float>(-(r+l)/(r-l));m[13]=static_cast<float>(-(t+b)/(t-b));m[14]=static_cast<float>(-(far+near)/(far-near));m[15]=1;}else {m[0]=static_cast<float>(2*near/(r-l));m[5]=static_cast<float>(2*near/(t-b));m[8]=static_cast<float>((r+l)/(r-l));m[9]=static_cast<float>((t+b)/(t-b));m[10]=static_cast<float>(-(far+near)/(far-near));m[11]=-1;m[14]=static_cast<float>(-2*far*near/(far-near));}matrix()=multiply(matrix(),m);break;}
-    case GlOperation::BindTexture:if(u(0)!=0xde1 || u(1)==UINT32_MAX)error(0x500);else {if(!textures_.contains(u(1)) && textures_.size()>=4096)throw std::bad_alloc{};textures_.try_emplace(u(1));textures_.at(u(1)).created=true;state_.binding=u(1);}break;
+    case GlOperation::BindTexture:if((u(0)!=0xde1 && u(0)!=0xde0) || u(1)==UINT32_MAX || u(1)==texture_1d_default)error(0x500);else {
+        if(!textures_.contains(u(1)) && textures_.size()>=4096)throw std::bad_alloc{};auto& texture=textures_[u(1)];
+        if(u(1) && texture.target && texture.target!=u(0)){error(0x502);break;}texture.created=true;if(u(1))texture.target=u(0);if(u(0)==0xde1)state_.binding=u(1);else state_.binding_1d=u(1);}break;
     case GlOperation::TexEnvi:case GlOperation::TexEnvf:case GlOperation::TexEnviv:case GlOperation::TexEnvfv:case GlOperation::GetTexEnviv:case GlOperation::GetTexEnvfv:texture_environment(op,a,data,output);break;
     case GlOperation::TextureCombine:if(u(0)<2 || u(0)>4 || u(1)<2 || u(1)>4)error(0x500);else{state_.texture_color_op=u(0);state_.texture_alpha_op=u(1);state_.texture_arguments=a.size()>2?u(2):(0x80000000U|2U|(1U<<6)|(2U<<12)|(1U<<18));state_.texture_combine_enabled=a.size()>3 && u(3);state_.environments[gl_.active_texture].mode=0;}break;
     case GlOperation::IsTexture:{const auto found=textures_.find(u(0));return u(0)!=0 && u(0)!=UINT32_MAX && found!=textures_.end() && found->second.created;}
     case GlOperation::GenTextures:if(n(0)<0 || static_cast<std::size_t>(u(0))*4>output.size())error(0x501);else if(u(0)>4096-textures_.size())throw std::bad_alloc{};else for(unsigned i=0;i<u(0);++i){while(textures_.contains(next_texture_) && next_texture_!=UINT32_MAX)++next_texture_;if(next_texture_==UINT32_MAX)throw std::bad_alloc{};const auto name=next_texture_++;textures_.try_emplace(name);std::memcpy(output.data()+i*4,&name,4);}break;
-    case GlOperation::DeleteTextures:if(n(0)<0 || static_cast<std::size_t>(u(0))*4>data.size())error(0x501);else {static const bool delete_sync=[] {const auto* value=std::getenv("X64ARM_METAL_DELETE_SYNC");return value && std::string_view(value)=="1";}();if(delete_sync)flush(true);for(unsigned i=0;i<u(0);++i){unsigned id;std::memcpy(&id,data.data()+i*4,4);if(id && id!=UINT32_MAX){if(const auto found=textures_.find(id);found!=textures_.end()){if(!delete_sync && (found->second.native || found->second.lease))retired_textures_.push_back(std::move(found->second));textures_.erase(found);}for(auto& unit:gl_.texture_units)if(unit==id)unit=0;if(state_.binding==id)state_.binding=0;}}if(retired_textures_.size()>=1024)flush(false,"delete_textures");}break;
+    case GlOperation::DeleteTextures:if(n(0)<0 || static_cast<std::size_t>(u(0))*4>data.size())error(0x501);else {static const bool delete_sync=[] {const auto* value=std::getenv("X64ARM_METAL_DELETE_SYNC");return value && std::string_view(value)=="1";}();if(delete_sync)flush(true);for(unsigned i=0;i<u(0);++i){unsigned id;std::memcpy(&id,data.data()+i*4,4);if(id && id!=UINT32_MAX){if(const auto found=textures_.find(id);found!=textures_.end()){if(!delete_sync && (found->second.native || found->second.lease))retired_textures_.push_back(std::move(found->second));textures_.erase(found);}for(auto& unit:gl_.texture_units)if(unit==id)unit=0;if(state_.binding==id)state_.binding=0;if(state_.binding_1d==id)state_.binding_1d=0;}}if(retired_textures_.size()>=1024)flush(false,"delete_textures");}break;
     case GlOperation::PolygonOffset:state_.polygon_offset={f(0),f(1)};break;
     case GlOperation::GetTexParameteriv:case GlOperation::GetTexParameterfv:{
-        if(u(0)!=0xde1){error(0x500);break;}const auto& t=textures_[state_.binding];std::array<float,4> values{};unsigned count=1;
+        const auto* bound=bound_texture(u(0));if(!bound){error(0x500);break;}const auto& t=*bound;std::array<float,4> values{};unsigned count=1;
         switch(u(1)){
         case 0x2800:values[0]=static_cast<float>(t.mag);break;case 0x2801:values[0]=static_cast<float>(t.min);break;
         case 0x2802:values[0]=static_cast<float>(t.s);break;case 0x2803:values[0]=static_cast<float>(t.t);break;
         case 0x813d:values[0]=static_cast<float>(t.max_level);break;case 0x84fe:values[0]=static_cast<float>(t.anisotropy);break;
-        case 0x1004:count=4;break;case 0x8066:case 0x8067:values[0]=1;break;
+        case 0x1004:count=4;values=t.border;break;case 0x8066:values[0]=t.priority;break;case 0x8067:values[0]=1;break;
         case 0x8072:values[0]=0x2901;break;case 0x813a:values[0]=-1000;break;case 0x813b:values[0]=1000;break;
         case 0x813c:case 0x884c:case 0x8191:break;case 0x884b:values[0]=0x1909;break;case 0x884d:values[0]=0x203;break;
         default:error(0x500);break;}
         if(output.size()<count*4)throw std::invalid_argument("texture query bounds");
-        for(unsigned i=0;i<count;++i){if(op==GlOperation::GetTexParameterfv)std::memcpy(output.data()+i*4,&values[i],4);else{const auto value=static_cast<std::int32_t>(values[i]);std::memcpy(output.data()+i*4,&value,4);}}break;
+        for(unsigned i=0;i<count;++i){if(op==GlOperation::GetTexParameterfv)std::memcpy(output.data()+i*4,&values[i],4);else{const bool color=u(1)==0x1004 || u(1)==0x8066;const auto value=color?static_cast<std::int32_t>(std::clamp(std::round(static_cast<double>(values[i])*2147483647.0),-2147483648.0,2147483647.0)):static_cast<std::int32_t>(values[i]);std::memcpy(output.data()+i*4,&value,4);}}break;
     }
     case GlOperation::CopyTexSubImage2D:{
-        if(u(0)!=0xde1){error(0x500);break;}if(n(1)<0 || u(1)>14 || n(2)<0 || n(3)<0 || n(6)<0 || n(7)<0){error(0x501);break;}
-        auto& texture=textures_[state_.binding];if(!texture.native || !texture.formats.contains(u(1))){error(0x502);break;}
+        auto* bound=bound_texture(u(0));if(!bound){error(0x500);break;}if(n(1)<0 || u(1)>14 || n(2)<0 || n(3)<0 || n(6)<0 || n(7)<0 || (u(0)==0xde0 && (u(3) || u(7)!=1))){error(0x501);break;}
+        auto& texture=*bound;if(!texture.native || !texture.formats.contains(u(1))){error(0x502);break;}
         const auto width=std::max<NSUInteger>(1,texture.native.width>>u(1)),height=std::max<NSUInteger>(1,texture.native.height>>u(1));
         if(u(2)>width || u(3)>height || u(6)>width-u(2) || u(7)>height-u(3)){error(0x501);break;}
         if(!u(6) || !u(7))break;
@@ -1155,13 +1273,13 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
         const auto old_error=error_;error_=0;execute(GlOperation::ReadPixels,read,{},pixels);const auto read_error=error_;error_=old_error?old_error:read_error;if(read_error)break;
         const std::array<std::uint64_t,8> write{a[0],a[1],a[2],a[3],a[6],a[7],0x1908,0x1401};gl_texture(write,pixels,true);break;
     }
-    case GlOperation::TexParameteri:case GlOperation::TexParameterf:{if(u(1)==0x84fe){const auto value=op==GlOperation::TexParameterf?f(2):static_cast<float>(n(2));if(u(0)!=0xde1)error(0x500);else if(!std::isfinite(value) || value<1)error(0x501);else textures_[state_.binding].anisotropy=static_cast<unsigned>(std::clamp(value,1.F,16.F));break;}if(op==GlOperation::TexParameterf && (!std::isfinite(f(2)) || f(2)<0 || f(2)>65535)){error(0x500);break;}const auto value=op==GlOperation::TexParameteri?u(2):static_cast<unsigned>(f(2));if(u(0)!=0xde1){error(0x500);break;}auto& t=textures_[state_.binding];if(u(1)==0x813d){if(value>INT32_MAX)error(0x501);else t.max_level=value;}else if(u(1)==0x2801){if(value!=0x2600 && value!=0x2601 && (value<0x2700 || value>0x2703))error(0x500);else t.min=value;}else if(u(1)==0x2800){if(value!=0x2600 && value!=0x2601)error(0x500);else t.mag=value;}else if(u(1)==0x2802 || u(1)==0x2803){if(value!=0x2901 && value!=0x812f && value!=0x812d && value!=0x8370)error(0x500);else (u(1)==0x2802?t.s:t.t)=value;}else error(0x500);break;}
+    case GlOperation::TexParameteri:case GlOperation::TexParameterf:{if(u(1)==0x8066){const auto value=op==GlOperation::TexParameterf?f(2):static_cast<float>(std::max(-1.0,n(2)/2147483647.0));if(!bound_texture(u(0)))error(0x500);else bound_texture(u(0))->priority=std::clamp(value,0.F,1.F);break;}if(u(1)==0x84fe){const auto value=op==GlOperation::TexParameterf?f(2):static_cast<float>(n(2));if(!bound_texture(u(0)))error(0x500);else if(!std::isfinite(value) || value<1)error(0x501);else bound_texture(u(0))->anisotropy=static_cast<unsigned>(std::clamp(value,1.F,16.F));break;}if(op==GlOperation::TexParameterf && (!std::isfinite(f(2)) || f(2)<0 || f(2)>65535)){error(0x500);break;}const auto value=op==GlOperation::TexParameteri?u(2):static_cast<unsigned>(f(2));auto* bound=bound_texture(u(0));if(!bound){error(0x500);break;}auto& t=*bound;if(u(1)==0x813d){if(value>INT32_MAX)error(0x501);else t.max_level=value;}else if(u(1)==0x2801){if(value!=0x2600 && value!=0x2601 && (value<0x2700 || value>0x2703))error(0x500);else t.min=value;}else if(u(1)==0x2800){if(value!=0x2600 && value!=0x2601)error(0x500);else t.mag=value;}else if(u(1)==0x2802 || u(1)==0x2803){if(value!=0x2900 && value!=0x2901 && value!=0x812f && value!=0x812d && value!=0x8370)error(0x500);else (u(1)==0x2802?t.s:t.t)=value;}else error(0x500);break;}
     case GlOperation::GetTexLevelParameteriv:case GlOperation::GetTexLevelParameterfv:texture_level(op,a,output);break;
     case GlOperation::TexImage2D:case GlOperation::TexSubImage2D:gl_texture(a,data,op==GlOperation::TexSubImage2D);break;
     case GlOperation::PixelStorei:if((u(0)<0xcf0 || u(0)>0xcf5) && (u(0)<0xd00 || u(0)>0xd05))error(0x500);else if(n(1)<0 || ((u(0)&15)==5 && u(1)!=1 && u(1)!=2 && u(1)!=4 && u(1)!=8))error(0x501);else pixel_[u(0)]=(u(0)&15)<=1?(u(1)?1:0):n(1);break;
     case GlOperation::PushClientAttrib:if(pixel_stack_.size()>=16)error(0x503);else pixel_stack_.push_back((u(0)&1)?pixel_:std::map<unsigned,int>{});break;
     case GlOperation::PopClientAttrib:if(pixel_stack_.empty())error(0x504);else {if(!pixel_stack_.back().empty())pixel_=pixel_stack_.back();pixel_stack_.pop_back();}break;
-    case GlOperation::PushAttrib:if(u(0)!=0xfffffU && (u(0)&~0xcfdefU))error(0x501);else if(attributes_.size()>=16)error(0x503);else {
+    case GlOperation::PushAttrib:if(u(0)!=0xfffffU && (u(0)&~0xffdefU))error(0x501);else if(attributes_.size()>=16)error(0x503);else {
         AttributeSnapshot snapshot;snapshot.mask=u(0);snapshot.state=state_;
         snapshot.programmable={gl_.src_alpha,gl_.dst_alpha,gl_.equation_rgb,gl_.equation_alpha,gl_.polygon_mode};snapshot.current_attributes=gl_.attribute_values;
         if(u(0)&0x40000){
@@ -1172,16 +1290,20 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     }break;
     case GlOperation::PopAttrib:if(attributes_.empty())error(0x504);else {const auto snapshot=std::move(attributes_.back());attributes_.pop_back();const auto mask=snapshot.mask;const auto& s=snapshot.state;
         if(mask==0xfffffU)state_=s;
+        if(mask&0x10000){state_.grid1=s.grid1;state_.grid2=s.grid2;for(unsigned cap=0xd80;cap<=0xdb8;++cap)if(cap==0xd80 || gl_map_components(cap)){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}}
         if(mask&1)gl_.attribute_values=snapshot.current_attributes;
         if(mask&2)state_.point_size=s.point_size;
         if(mask&0x4000)state_.index_mask=s.index_mask;
+        if(mask&0x4000)state_.clear_index=s.clear_index;if(mask&0x20000)state_.list_base=s.list_base;
+        if(mask&1){state_.current_index=s.current_index;state_.edge_flag=s.edge_flag;state_.raster_valid=s.raster_valid;state_.raster_position=s.raster_position;state_.raster_color=s.raster_color;state_.raster_texcoord=s.raster_texcoord;state_.raster_index=s.raster_index;state_.raster_distance=s.raster_distance;}
+        if(mask&0x40){state_.light_model_ambient=s.light_model_ambient;state_.light_model_local=s.light_model_local;state_.light_model_two_side=s.light_model_two_side;state_.light_model_color_control=s.light_model_color_control;state_.color_material_face=s.color_material_face;state_.color_material_mode=s.color_material_mode;}
         if(mask&0x4000){gl_.src_alpha=snapshot.programmable[0];gl_.dst_alpha=snapshot.programmable[1];gl_.equation_rgb=snapshot.programmable[2];gl_.equation_alpha=snapshot.programmable[3];}
         if(mask&0x20)state_.read_buffer=s.read_buffer;
         if(mask&8){state_.polygon_offset=s.polygon_offset;for(const unsigned cap:{0x8037U,0x2a01U,0x2a02U}){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}gl_.polygon_mode=snapshot.programmable[4];state_.cull_face=s.cull_face;state_.front_face=s.front_face;state_.enabled.erase(0xb44);if(s.enabled.contains(0xb44))state_.enabled.insert(0xb44);}
 
         if(mask&0x40000){
-            gl_.active_texture=snapshot.active;gl_.texture_units=snapshot.units;state_.binding=s.binding;state_.environments=s.environments;
-            state_.enabled.erase(0xde1);if(s.enabled.contains(0xde1))state_.enabled.insert(0xde1);
+            gl_.active_texture=snapshot.active;gl_.texture_units=snapshot.units;state_.binding=s.binding;state_.binding_1d=s.binding_1d;state_.environments=s.environments;
+            for(const unsigned cap:{0xde0U,0xde1U}){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}
             // 還原參數與綁定，不回退 Push 之後更新的貼圖影像與資源。
             for(const auto& [id,p]:snapshot.texture_parameters){auto& t=textures_[id];t.min=p[0];t.mag=p[1];t.s=p[2];t.t=p[3];t.anisotropy=p[4];t.max_level=p[5];}
         }
@@ -1200,6 +1322,46 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
         std::vector<std::uint8_t> row(static_cast<std::size_t>(width_)*4);for(unsigned y=0;y<u(3);++y){const auto src_y=static_cast<std::int64_t>(n(1))+y;if(src_y<0 || src_y>=height_)continue;[(state_.read_buffer==0x404?front_:color_) getBytes:row.data() bytesPerRow:width_*4 fromRegion:MTLRegionMake2D(0,static_cast<NSUInteger>(height_-1-src_y),width_,1) mipmapLevel:0];for(unsigned x=0;x<u(2);++x){const auto src_x=static_cast<std::int64_t>(n(0))+x;if(src_x<0 || src_x>=width_)continue;const auto at=offset+y*stride+x*components,src=static_cast<std::size_t>(src_x)*4;output[at]=row[src+2];output[at+1]=row[src+1];output[at+2]=row[src];if(components==4)output[at+3]=row[src+3];}}break;}
     case GlOperation::DrawBuffer:case GlOperation::ReadBuffer:if(u(0)!=0x404 && u(0)!=0x405)error(0x500);else (op==GlOperation::DrawBuffer?state_.draw_buffer:state_.read_buffer)=u(0);break;
     case GlOperation::Flush:flush(false);break;case GlOperation::Finish:flush(true);break;
+    case GlOperation::RasterPos4dv:raster_position(vector(4,true));break;
+    case GlOperation::Bitmap:gl_bitmap(a,data);break;
+    case GlOperation::Indexd:state_.current_index=d(0);break;
+    case GlOperation::EdgeFlag:state_.edge_flag=u(0)!=0;break;
+    case GlOperation::ClearIndex:state_.clear_index=f(0);break;
+    case GlOperation::IsList:return u(0)!=0 && lists_.contains(u(0));
+    case GlOperation::ListBase:state_.list_base=u(0);break;
+    case GlOperation::CallLists:{
+        // 名稱在執行時才加上目前清單基底；展開出的 glCallList 不另行編入清單。
+        const bool saved=replaying_;replaying_=true;
+        try{for(std::size_t at=0;at+4<=data.size();at+=4){std::uint32_t offset=0;std::memcpy(&offset,data.data()+at,4);const std::array<std::uint64_t,1> list{std::uint64_t{state_.list_base+offset}};execute(GlOperation::CallList,list,{},{});}}
+        catch(...){replaying_=saved;throw;}replaying_=saved;break;}
+    case GlOperation::LightModelfv:{
+        const auto name=u(0);if(name!=0xb51 && name!=0xb52 && name!=0xb53 && name!=0x81f8){error(0x500);break;}const auto value=vector(name==0xb53?4:1);
+        if(name==0xb53)state_.light_model_ambient=value;else if(name==0xb51)state_.light_model_local=value[0]!=0;else if(name==0xb52)state_.light_model_two_side=value[0]!=0;
+        else if(value[0]!=0x81f9 && value[0]!=0x81fa)error(0x500);else state_.light_model_color_control=static_cast<unsigned>(value[0]);break;}
+    case GlOperation::GetLightfv:case GlOperation::GetMaterialfv:{
+        Vec value{};unsigned count=4;
+        if(op==GlOperation::GetLightfv){if(u(0)<0x4000 || u(0)>0x4007){error(0x500);break;}const auto& light=state_.lights[u(0)-0x4000];
+            switch(u(1)){case 0x1200:value=light.ambient;break;case 0x1201:value=light.diffuse;break;case 0x1202:value=light.specular;break;case 0x1203:value=light.position;break;
+            case 0x1204:value=light.direction;count=3;break;case 0x1205:value[0]=light.spot[0];count=1;break;case 0x1206:value[0]=light.spot[2];count=1;break;
+            case 0x1207:case 0x1208:case 0x1209:value[0]=light.attenuation[u(1)-0x1207];count=1;break;default:count=0;break;}}
+        else {if(u(0)!=0x404 && u(0)!=0x405){error(0x500);break;}const auto& material=state_.materials[u(0)-0x404];
+            switch(u(1)){case 0x1200:value=material.ambient;break;case 0x1201:value=material.diffuse;break;case 0x1202:value=material.specular;break;case 0x1600:value=material.emission;break;
+            case 0x1601:value=material.shininess;count=1;break;case 0x1603:value=material.indexes;count=3;break;default:count=0;break;}}
+        if(!count){error(0x500);break;}if(output.size()<count*4U)throw std::invalid_argument("light query bounds");std::memcpy(output.data(),value.data(),count*4U);break;}
+    case GlOperation::ColorMaterial:
+        if((u(0)!=0x404 && u(0)!=0x405 && u(0)!=0x408) || (u(1)!=0x1200 && u(1)!=0x1201 && u(1)!=0x1202 && u(1)!=0x1600 && u(1)!=0x1602))error(0x500);
+        else {state_.color_material_face=u(0);state_.color_material_mode=u(1);track_color();}break;
+    case GlOperation::CopyTexImage2D:{
+        // 先以 TexImage2D 共用驗證與配置，成功後與 CopyTexSubImage2D 共用讀回及格式轉換。
+        const std::array<std::uint64_t,8> image{a[0],a[1],a[2],a[5],a[6],a[7],0x1908,0x1401};
+        const auto old_error=error_;error_=0;gl_texture(image,{},false);const auto image_error=error_;error_=old_error?old_error:image_error;if(image_error)break;
+        const std::array<std::uint64_t,8> copy{a[0],a[1],0,0,a[3],a[4],a[5],a[6]};execute(GlOperation::CopyTexSubImage2D,copy,{},{});break;}
+    case GlOperation::PrioritizeTextures:
+        // 名稱 0 或尚未建立的貼圖依規格略過；優先權限制在 [0,1]。
+        for(std::size_t at=0;at+8<=data.size();at+=8){std::uint32_t name=0;float priority=0;std::memcpy(&name,data.data()+at,4);std::memcpy(&priority,data.data()+at+4,4);
+            const auto found=textures_.find(name);if(name && found!=textures_.end() && found->second.created)found->second.priority=std::clamp(priority,0.F,1.F);}break;
+    case GlOperation::TexParameterfv:{
+        auto* bound=bound_texture(u(0));if(!bound || u(1)!=0x1004){error(0x500);break;}auto& texture=*bound;const auto value=vector(4);for(unsigned i=0;i<4;++i)texture.border[i]=std::clamp(value[i],0.F,1.F);break;}
     default:error(0x502);break;
     }}catch(const std::invalid_argument&){error(0x501);}
     if(op==GlOperation::Color3f || op==GlOperation::Color4f || op==GlOperation::Color4fv || op==GlOperation::Color4dv)track_color();

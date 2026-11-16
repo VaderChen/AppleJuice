@@ -11,6 +11,7 @@ import pathlib
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 from zoneinfo import ZoneInfo
@@ -204,7 +205,57 @@ def handle_cleanup_error(function, path, error):
     raise error[1]
 
 
-def build_launcher():
+def repository_revision():
+    result = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'],
+                            capture_output=True, text=True, timeout=10)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def reusable_verified_launcher(destination, identity=None, profile=None):
+    """正常啟動沿用已發布成品；開發中的來源及建置目錄不取代其驗收身分。"""
+    state_path = destination.with_name('.' + destination.name + '.build-state.json')
+    try:
+        state = json.loads(state_path.read_text())
+        if 'repository_revision' not in state:
+            return False
+        revision = repository_revision()
+        if revision is not None and state['repository_revision'] != revision:
+            return False
+        engine = destination / 'Contents/MacOS/x64arm-engine'
+        digest = file_digest(engine)
+        validation = from_state(state, digest)
+        if state['outputs'] != bundle_outputs(destination):
+            return False
+        if identity is not None and state['inputs'].get('identity') != identity:
+            return False
+        if profile is not None and file_digest(pathlib.Path(profile).resolve(strict=True)) != file_digest(
+                destination / 'Contents/Helpers/x64arm.app/Contents/embedded.provisionprofile'):
+            return False
+        record = state.get('engine_evidence')
+        if record:
+            evidence_path = ROOT / record['path']
+            if file_digest(evidence_path) != record['sha256']:
+                return False
+            evidence = json.loads(evidence_path.read_text())
+            if from_evidence(evidence) != validation:
+                return False
+            linked = evidence.get('linked_sdk')
+            if linked:
+                manifest_path = ROOT / linked['manifest']
+                manifest = json.loads(manifest_path.read_text())
+                if (file_digest(manifest_path) != evidence['sdk_sha256'] or
+                        manifest.get('validation', {}).get('engine_sha256') != digest or
+                        manifest['validation'].get('built_manifest_sha256') != evidence['measured_sdk_sha256']):
+                    return False
+        # 來源可繼續開發；這裡核對實際套件、固定驗收與簽章，不把新來源冒充已建置。
+        result = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(destination)],
+                                capture_output=True, text=True, timeout=30)
+        return result.returncode == 0
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+        return False
+
+
+def build_launcher(*, reuse_only=False):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--skip-engine', action='store_true', help='沿用已建置的 Release 引擎')
     parser.add_argument('--engine-evidence', type=pathlib.Path, help='沿用同一引擎的既有直譯／JIT 驗收，僅重建前端封裝')
@@ -215,9 +266,19 @@ def build_launcher():
     parser.add_argument('--jobs', type=int, help='C++／Go 建置平行數；預設使用宿主可用核心數')
     parser.add_argument('--output', type=pathlib.Path, help='指定 app 輸出路徑，供隔離建置使用')
     parser.add_argument('--force-package', action='store_true', help='強制重新打包及驗證簽章')
+    parser.add_argument('--reuse-verified', action='store_true',
+                        help='正常啟動時優先沿用完整性與簽章相符的已驗證套件；開發更新仍可直接執行本建置腳本')
     parser.add_argument('--with-native-v8', action='store_true', help='內建 ARM64 V8 模組、相依函式庫與 x86／x64 測試 PE')
     parser.add_argument('--v8-node-root', type=pathlib.Path, default=pathlib.Path('/opt/homebrew/opt/node'), help='V8 標頭及 libnode 的相同安裝根目錄')
     args = parser.parse_args()
+    destination = (args.output or ROOT / 'build/launcher/Win64 Launcher.app').resolve()
+    if (args.reuse_verified and not any((args.force_package, args.refresh_assets,
+                                        args.with_native_v8, args.engine_evidence)) and
+            reusable_verified_launcher(destination, args.sign_identity, args.cross_arch_profile)):
+        print(f'沿用已驗證 Launcher，略過開發建置：{destination}', flush=True)
+        return True
+    if reuse_only:
+        return False
     if args.engine_evidence and (not args.skip_engine or args.with_native_v8):
         parser.error('--engine-evidence 需要 --skip-engine，且不能重新封裝 V8 引擎')
     try:
@@ -385,7 +446,8 @@ def build_launcher():
         if previous.exists():
             shutil.rmtree(previous, onerror=handle_cleanup_error)
     state = {'inputs': inputs if not args.with_native_v8 else None,
-             'outputs': bundle_outputs(destination), 'engine_smoke': engine_smoke}
+             'outputs': bundle_outputs(destination), 'engine_smoke': engine_smoke,
+             'repository_revision': repository_revision()}
     if engine_smoke.get('schema') in (2, 3):
         state['engine_validation'] = state.pop('engine_smoke')
     if evidence:
@@ -397,6 +459,9 @@ def build_launcher():
 
 
 def main():
+    # 已發布成品先做唯讀驗證，不等待另一個工作尚在編譯的封裝鎖。
+    if '--reuse-verified' in sys.argv and build_launcher(reuse_only=True):
+        return
     # Finder 重複雙擊與終端呼叫共用鎖，避免 Ninja／正式 app 被同時更新。
     lock = ROOT / 'build' / '.launcher-build.lock'
     lock.parent.mkdir(parents=True, exist_ok=True)

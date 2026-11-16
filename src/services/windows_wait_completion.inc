@@ -4,7 +4,7 @@ std::uint64_t WindowsServices::retain_wait_completion_target(std::uint64_t handl
     if(const auto at=runtime_.wait_objects.find(handle);at!=runtime_.wait_objects.end()){
         if(at->second.kind==WaitObject::Kind::Mutex)return 0;
         if(at->second.kind==WaitObject::Kind::Event || at->second.kind==WaitObject::Kind::MemoryResource){
-            InheritedHandle item;if(export_transfer_handle(handle,item))return 0;
+            InheritedHandle item;if(!at->second.shared_event && export_transfer_handle(handle,item))return 0;
         }
         copy=runtime_.allocate_wait_handle();runtime_.wait_objects.emplace(copy,at->second);
     }else if(const auto id=thread_id(handle)){

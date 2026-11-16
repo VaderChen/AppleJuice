@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
+#include "volume_device_security.hpp"
 #include <algorithm>
 
 namespace x64arm {
@@ -13,6 +14,7 @@ std::uint32_t WindowsServices::set_file_valid_data(std::uint64_t handle,std::uin
 }
 std::uint32_t WindowsServices::set_file_information(GuestMemory& memory,std::uint64_t handle,std::uint32_t kind,std::uint64_t input,std::uint32_t size){
     auto found=files_.find(handle);if(found==files_.end())return 6;auto& file=found->second;if(!file.native)return 5;
+    if(file.native->volume_device())return 1;
     const auto required=kind==0?40U:kind==3?(x86_?12U:20U):kind==4?1U:kind==5 || kind==6?8U:0U;
     if(!required)return 87;if(size<required)return 24;if(!input)return 87;memory.check(GuestAddress{input},size,Access::Read);
     std::uint32_t error=0;
@@ -53,13 +55,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_control(GuestState& st
         if(name=="ReOpenFile"){
             const auto access=static_cast<std::uint32_t>(arg(1)),sharing=static_cast<std::uint32_t>(arg(2)),flags=static_cast<std::uint32_t>(arg(3));
             if(sharing&~7U)return failed(87);if((access&~0xc01f01bfU) || (flags&~0xde200000U))return failed(50);if(!file_table_has_room(files_.size()))return failed(8);
-            const auto category=[](std::uint32_t rights){return ((rights&(0x80000000U|1U|0x20U))?1U:0U)|((rights&(0x40000000U|2U|4U))?2U:0U)|((rights&0x10000U)?4U:0U);};const auto requested=access|((flags&0x04000000U)?0x10000U:0U);
-            for(const auto& [other,peer]:files_){(void)other;if(peer.metadata.id==file.metadata.id && peer.metadata.device==file.metadata.device && ((category(requested)&~peer.sharing) || (category(peer.access)&~sharing)))return failed(32);}
-            const auto opened=filesystem_.reopen(*original,file.path,access,sharing,flags);if(opened.error)return failed(opened.error);
+            const auto category=[](std::uint32_t rights){return ((rights&(0x80000000U|1U|0x20U))?1U:0U)|((rights&(0x40000000U|2U|4U))?2U:0U)|((rights&0x10000U)?4U:0U);};auto requested=access|((flags&0x04000000U)?0x10000U:0U);
+            OpenHostFile opened;
+            if(original->volume_device()){
+                if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許重新開啟宿主卷能力");
+                if(flags&0x04000000U)return failed(87);if(!(sharing&2U))return failed(32);
+                requested=object_security_access(security::relative_descriptor(detail::volume_device_security()),access,detail::volume_access_mapping);
+                if(!filesystem_.writable() && (requested&0x000d0116U))return failed(19);
+                opened=filesystem_.open_volume(original->volume_id(),requested,sharing);
+            }else {
+                for(const auto& [other,peer]:files_){(void)other;if(peer.native && peer.native->volume_device())continue;if(peer.metadata.id==file.metadata.id && peer.metadata.device==file.metadata.device && ((category(requested)&~peer.sharing) || (category(peer.access)&~sharing)))return failed(32);}
+                opened=filesystem_.reopen(*original,file.path,access,sharing,flags);
+            }
+            if(opened.error)return failed(opened.error);
             FileHandle replacement;replacement.key=opened.key;if(file.native)replacement.native=opened.file;else replacement.identity=opened.file;replacement.metadata=file.native?opened.metadata:file.metadata;replacement.bytes=file.native?std::make_shared<const std::vector<std::uint8_t>>():file.bytes;replacement.path=opened.key;replacement.sharing=sharing;replacement.access=requested;replacement.mode=((flags&0x40000000U)?0U:0x20U)|((flags&0x20000000U)?8U:0U);
+            if(original->volume_device())replacement.metadata.attributes=0x80;
             refresh_file_security_context();replacement.manage_volume_at_open=runtime_.token_objects.at(effective_token_id()).has_privilege(28,true);
             const auto handle=runtime_.allocate_wait_handle();replacement.object=handle;runtime_.win_file_positions.emplace(handle,0);try{files_.emplace(handle,std::move(replacement));}catch(...){runtime_.win_file_positions.erase(handle);throw;}return finish(handle);
         }
+        if(original->volume_device())return failed(1); // 此 API 查詢檔案／目錄的名稱；裝置名稱使用 NtQueryObject。
         const auto flags=static_cast<std::uint32_t>(arg(3)),capacity=static_cast<std::uint32_t>(arg(2));const auto volume=flags&7U;if((flags&~15U) || (volume!=0 && volume!=1 && volume!=2 && volume!=4))return failed(87);
         const auto current=filesystem_.final_path(*original,file.path);if(current.error)return failed(current.error);auto path=utf8_to_utf16(current.key);std::replace(path.begin(),path.end(),u'/',u'\\');
         if(flags&8U){auto opened=utf8_to_utf16(file.path);std::replace(opened.begin(),opened.end(),u'/',u'\\');if(opened.size()>=3 && opened[1]==u':')path=std::move(opened);}
@@ -70,6 +84,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_control(GuestState& st
         const bool wide=name.ends_with('W');
         auto bytes=wide?utf16_bytes(path):std::vector<std::uint8_t>{};if(!wide){const auto text=utf16_to_utf8(path);bytes.assign(text.begin(),text.end());bytes.push_back(0);}
         const auto required=wide?bytes.size()/2:bytes.size();if(capacity<required)return finish(required);if(!arg(1))return failed(87);memory.write(GuestAddress{arg(1)},bytes);return finish(required-1);
-    }catch(const std::bad_alloc&){return failed(8);}catch(const std::invalid_argument&){return failed(123);}
+    }catch(const std::bad_alloc&){return failed(8);}catch(const std::invalid_argument&){return failed(123);}catch(const SecurityDescriptorError& error){return failed(error.code);}
 }
 }

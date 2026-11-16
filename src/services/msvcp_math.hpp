@@ -1,18 +1,20 @@
 #pragma once
+#include <bit>
 #include <cmath>
+#include <type_traits>
 #include <cstdint>
 #include <limits>
 
 namespace x64arm::msvcp_detail {
 // <complex> 使用的 _Cosh／_Sinh／_Exp／_Dtest。回傳碼即 MSVC 的 FP_ZERO 0、FP_INFINITE 1、FP_NAN 2、FP_NORMAL -1、FP_SUBNORMAL -2。
+// 依 IEEE 位元判斷：宿主 FPCR 可能開啟 flush-to-zero，浮點比較會把次正規數視為零。
 template<class T> std::int16_t float_class(T value){
-    switch(std::fpclassify(value)){
-    case FP_ZERO:return 0;
-    case FP_INFINITE:return 1;
-    case FP_NAN:return 2;
-    case FP_SUBNORMAL:return -2;
-    default:return -1;
-    }
+    using Raw=std::conditional_t<sizeof(T)==4,std::uint32_t,std::uint64_t>;
+    constexpr unsigned fraction_bits=sizeof(T)==4?23U:52U;constexpr Raw exponent_mask=sizeof(T)==4?0xffU:0x7ffU;
+    const auto raw=std::bit_cast<Raw>(value);const Raw exponent=(raw>>fraction_bits)&exponent_mask,fraction=raw&((Raw{1}<<fraction_bits)-1);
+    if(exponent==exponent_mask)return fraction?2:1;
+    if(!exponent)return fraction?-2:0;
+    return -1;
 }
 // x＝y·e^x·2^eoff。先把 2 的次方分離再調整尺度，中間值不會提前上溢或下溢。
 template<class T> std::int16_t scaled_exp(T& x,T y,int eoff){

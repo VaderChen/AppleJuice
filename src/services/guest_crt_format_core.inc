@@ -1,7 +1,7 @@
 /* 小輸出使用同一個有界暫存，不為格式家族各複製一份 parser。 */
 __attribute__((noinline)) static Word FORMAT_BUFFER_NAME(void* destination,Size capacity,Size limit,
         const void* specification,const void* arguments,Word options,unsigned mode) {
-    if(!specification || ((mode&X64ARM_FMT_COMMON) && (options&~0x37ULL)) ||
+    if(!specification || ((mode&X64ARM_FMT_COMMON) && (options&~X64ARM_CRT_PRINTF_OPTIONS_MASK)) ||
        ((mode&X64ARM_FMT_LIMITED) && !limit))return ~0ULL;
     if(!(mode&X64ARM_FMT_COUNT) && (((mode&X64ARM_FMT_SECURE) && (!destination || !capacity)) ||
        (!destination && capacity)))return ~0ULL;
@@ -28,6 +28,7 @@ __attribute__((noinline)) static Word FORMAT_BUFFER_NAME(void* destination,Size 
         if(width<-65536 || width>65536 || precision>65536)return ~0ULL;
         if(width<0) {flags|=X64ARM_FMT_LEFT;width=-width;}
         unsigned length=0,bits=32;
+        while(x64arm_crt_legacy_size(c,options))c=format_unit(specification,at++,wide);
         if(c=='h' || c=='l') {
             length=c;c=format_unit(specification,at++,wide);
             if(c==length) {bits=length=='h'?8:64;length|=0x100;c=format_unit(specification,at++,wide);}
@@ -42,6 +43,7 @@ __attribute__((noinline)) static Word FORMAT_BUFFER_NAME(void* destination,Size 
         } else if(c=='z' || c=='t' || c=='j' || c=='L' || c=='w' || c=='T') {
             length=c;if(c=='z' || c=='t' || c=='j')bits=64;c=format_unit(specification,at++,wide);
         }
+        while(x64arm_crt_legacy_size(c,options))c=format_unit(specification,at++,wide);
         if(c=='d' || c=='i' || c=='u' || c=='o' || c=='x' || c=='X' || c=='p') {
             if(length=='T' || (c!='p' && (length=='L' || length=='w')))return ~0ULL;
             const Word value=format_argument(&args,c=='p' || bits==64?8:4);

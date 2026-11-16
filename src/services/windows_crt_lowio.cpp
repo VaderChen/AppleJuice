@@ -59,6 +59,8 @@ std::uint64_t WindowsServices::crt_lowio_record(GuestMemory& memory,std::uint32_
             memory.store(GuestAddress{record},width,UINT64_MAX);
             for(unsigned j=0;j<3;++j)memory.store(GuestAddress{record+format.lookahead+j},8,10);
             memory.store(GuestAddress{record+format.extended},32,4);
+            // 公開 lowio 記錄的臨界區段沿用 Win32 的「已初始化、無 DebugInfo」標記。
+            memory.store(GuestAddress{critical},width,UINT64_MAX);
             memory.store(GuestAddress{critical+(x86_?4U:8U)},32,UINT32_MAX);
             CriticalSection section;section.guest=guest_critical_enabled();
             runtime_.critical_sections.emplace(critical,section);

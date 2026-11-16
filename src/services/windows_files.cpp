@@ -9,6 +9,8 @@
 #include "x64arm/security_access.hpp"
 #include "x64arm/file_security.hpp"
 #include "x64arm/windows_paths.hpp"
+#include "windows_globalroot_path.hpp"
+#include "volume_device_security.hpp"
 #include "x64arm/windows_raw_input.hpp"
 #include "x64arm/shared_wake.hpp"
 #include "x64arm/retained_capacity.hpp"
@@ -28,6 +30,15 @@
 
 namespace x64arm {
 namespace {
+std::vector<std::uint8_t> stream_information_bytes(const DirectorySnapshot& listing){
+    std::vector<std::uint8_t> bytes;std::size_t previous=0;
+    const auto put=[&](std::size_t at,std::uint64_t value,unsigned count){for(unsigned i=0;i<count;++i)bytes.at(at+i)=static_cast<std::uint8_t>(value>>(i*8));};
+    for(const auto& entry:listing.entries){
+        const auto name=utf8_to_utf16_lossy(entry.name);const auto offset=bytes.size(),extent=(24+name.size()*2+7)&~std::size_t{7};bytes.resize(offset+extent);
+        if(offset)put(previous,offset-previous,4);previous=offset;put(offset+4,name.size()*2,4);put(offset+8,entry.metadata.size,8);put(offset+16,entry.metadata.allocation_size,8);
+        for(std::size_t i=0;i<name.size();++i)put(offset+24+i*2,name[i],2);
+    }return bytes;
+}
 bool eager_file_information() {
     static const bool legacy=[] {const auto* value=std::getenv("X64ARM_FILE_OPEN_LEGACY_INFORMATION");
         return value && std::string_view(value)=="1";}();
@@ -156,6 +167,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
     try {
         if(!frame(0))return invalid(87);
         guest_path=service.symbol=="CreateFileA"?utf8_to_utf16(read_ansi(memory,frame(0))):read_utf16(memory,GuestAddress{frame(0)});
+        if(auto resolved=detail::globalroot_file_path(std::u16string_view(guest_path));!resolved.empty())guest_path=std::move(resolved);
         if(service.symbol=="CreateFile2") {
             values={frame(0),frame(1),frame(2),0,frame(3),0x80,0};
             if(const auto extended=frame(4)) {
@@ -184,11 +196,33 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_open(GuestState& state
     if(usb::interface_path(guest_path))return open_usb(state,memory,canonical,guest_path,&values);
     if(serial_port(guest_path))return invoke_serial(state,memory,canonical,&values);
     if(kernel_device_path(guest_path))return open_kernel_device(state,memory,canonical,guest_path,values);
+    if(auto target=detail::volume_device_path(guest_path);target.volume)try{
+        const auto sharing=static_cast<std::uint32_t>(values[2]),disposition=static_cast<std::uint32_t>(values[4]),flags=static_cast<std::uint32_t>(values[5]);
+        if(target.drive_alias){const auto volumes=filesystem_.volume_state();if(volumes.error)return invalid(volumes.error);
+            const auto found=volumes.drives.find(target.volume);if(found==volumes.drives.end())return invalid(2);target.volume=found->second;}
+        const auto known=filesystem_.volumes();if(std::none_of(known.begin(),known.end(),[&](const auto& item){return item.id==target.volume;}))return invalid(2);
+        if(disposition!=3 || (sharing&~7U) || (flags&0x04000000U))return invalid(87);
+        if(!(sharing&2U))return invalid(32);
+        if(flags&~0xfa3f01a7U)return invalid(87);
+        if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許開啟宿主卷能力");
+        const auto attributes=read_security_attributes(memory,values[3],x86_,false);
+        const auto access=object_security_access(security::relative_descriptor(detail::volume_device_security()),static_cast<std::uint32_t>(values[1]),detail::volume_access_mapping);
+        if(!filesystem_.writable() && (access&0x000d0116U))return invalid(19);
+        if(!file_table_has_room(files_.size()))return invalid(8);
+        auto opened=filesystem_.open_volume(target.volume,access,sharing);if(opened.error)return invalid(opened.error);
+        FileHandle file;file.native=std::move(opened.file);file.path=opened.key;file.key=opened.key;file.metadata=opened.metadata;file.metadata.attributes=0x80;
+        file.access=access;file.sharing=sharing;file.mode=((flags&0x40000000U)?0U:0x20U)|((flags&0x20000000U)?8U:0U);
+        file.bytes=std::make_shared<const std::vector<std::uint8_t>>();const auto handle=runtime_.allocate_wait_handle();file.object=handle;
+        runtime_.win_file_positions.emplace(handle,0);try{files_.emplace(handle,std::move(file));if(attributes.inherit)runtime_.handle_flags[handle]=1;}
+        catch(...){runtime_.win_file_positions.erase(handle);files_.erase(handle);throw;}
+        frame.return_to(state,handle);return std::nullopt;
+    }catch(const MemoryFault&){return invalid(87);}catch(const SecurityDescriptorError& error){return invalid(error.code);}catch(const std::bad_alloc&){return invalid(8);}
     if(!null_device && guest_path.starts_with(u"\\\\.\\")){
-        // \\.\ 是 DOS 裝置命名空間：管道、磁碟區、實體磁碟與 mailslot 走既有流程；其餘名稱不存在時如同 Windows 回報找不到檔案。
+        // \\.\ 是 DOS 裝置命名空間；未由上方 provider 承接者，僅管道與 mailslot 可交給 IPC。
         std::u16string device(guest_path.substr(4));for(auto& c:device)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
-        const bool known=device.starts_with(u"pipe\\") || device.starts_with(u"mailslot\\") || device.starts_with(u"physicaldrive") ||
-            (device.size()==2 && device[1]==u':') || device.starts_with(u"globalroot\\");
+        // GLOBALROOT 是命名空間，並不是管道 provider；已登錄驅動與卷內檔案已在上方解析。
+        // 其餘未解析的裝置如同其他不存在的 DOS 裝置，不能送進 NamedPipe::open。
+        const bool known=device.starts_with(u"pipe\\") || device.starts_with(u"mailslot\\");
         if(!known){last_error_=2;WindowsCall(state,memory,canonical).return_to(state,x86_?UINT32_MAX:UINT64_MAX);return std::nullopt;}
         return invoke_file_io(state,memory,canonical,&values);
     }
@@ -311,6 +345,9 @@ std::span<const WindowsServiceDescriptor> file_service_descriptors() {
         {"crt","_findnext32",2},{"crt","_findnext32i64",2},{"crt","_findnext64i32",2},{"crt","_findnext64",2},
         {"crt","_wfindfirst32",2},{"crt","_wfindfirst32i64",2},{"crt","_wfindfirst64i32",2},{"crt","_wfindfirst64",2},
         {"crt","_wfindnext32",2},{"crt","_wfindnext32i64",2},{"crt","_wfindnext64i32",2},{"crt","_wfindnext64",2},
+        // 舊版名稱：time_t 在 Win32 為 32 位元、Win64 為 64 位元；i64 版本另帶 64 位元檔案大小。
+        {"crt","_findfirst",2},{"crt","_findfirsti64",2},{"crt","_findnext",2},{"crt","_findnexti64",2},
+        {"crt","_wfindfirst",2},{"crt","_wfindfirsti64",2},{"crt","_wfindnext",2},{"crt","_wfindnexti64",2},
         {"crt","remove",1},{"crt","_wremove",1},{"crt","_unlink",1},{"crt","_wunlink",1},{"crt","rename",2},{"crt","_wrename",2},
         {"kernel32.dll","GetFileAttributesA",1},{"kernel32.dll","GetFileAttributesW",1},
         {"kernel32.dll","SetFileAttributesA",2},{"kernel32.dll","SetFileAttributesW",2},
@@ -325,10 +362,25 @@ std::span<const WindowsServiceDescriptor> file_service_descriptors() {
     };return table;
 }
 #include "windows_file_backup.inc"
+// 共用 FindFirstFile／CRT _findfirst 的目錄比對（Windows 萬用字元、不分大小寫）；清單方塊 LB_DIR 亦使用。
+std::pair<std::uint32_t,DirectorySearch> WindowsServices::search_directory(const std::string& path){return find_directory(filesystem_,path);}
 std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     if(service.symbol=="BackupRead" || service.symbol=="BackupWrite" || service.symbol=="BackupSeek")return invoke_file_backup(state,memory,service);
     if(service.symbol=="GetOverlappedResult" || service.symbol=="GetOverlappedResultEx")return invoke_overlapped_result(state,memory,service);
-    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
+    const WindowsCall arg(state,memory,service);auto symbol=service.symbol;
+    // 舊版 CRT 名稱（_findfirst／_findfirsti64、_stat／_stati64、_fstat…）依 time_t 寬度對應明確版本：
+    // Win32 的 time_t 為 32 位元、Win64 為 64 位元；i64 版本另帶 64 位元檔案大小。
+    std::string legacy_symbol;
+    if(service.family=="crt"){
+        std::size_t stem=std::string_view::npos;
+        if((symbol.starts_with("_find") || symbol.starts_with("_wfind")) && symbol!="_findclose")
+            stem=symbol.find("first")!=symbol.npos?symbol.find("first")+5:symbol.find("next")+4;
+        else if(symbol=="_stat" || symbol=="_stati64" || symbol=="_wstat" || symbol=="_wstati64" || symbol=="_fstat" || symbol=="_fstati64")stem=symbol.find("stat")+4;
+        if(stem!=std::string_view::npos && stem<=symbol.size()){
+            const auto suffix=symbol.substr(stem);
+            if(suffix.empty() || suffix=="i64"){legacy_symbol=std::string(symbol.substr(0,stem));legacy_symbol+=suffix.empty()?(x86_?"32":"64i32"):(x86_?"32i64":"64");symbol=legacy_symbol;}
+        }
+    }
     if(symbol=="NtCopyFileChunk")return invoke_file_copy_chunk(state,memory,service);
     if(symbol=="NtSetVolumeInformationFile")return invoke_set_volume(state,memory,service);
     if(symbol=="NtFsControlFile" || (symbol=="DeviceIoControl" && ((static_cast<std::uint32_t>(arg(1))>>16)==9 || (static_cast<std::uint32_t>(arg(1))>>16)==17)))return invoke_fs_control(state,memory,service);
@@ -356,6 +408,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         }catch(const MemoryFault&){return fail(998);}catch(const std::invalid_argument&){return fail(123);}catch(const std::bad_alloc&){return fail(8);}
     }
     if(kernel_device_handle(arg(0)))return invoke_kernel_device_io(state,memory,service);
+    if(const auto volume=files_.find(arg(0));volume!=files_.end() && volume->second.native && volume->second.native->volume_device()){
+        if(symbol=="DeviceIoControl" || symbol=="NtDeviceIoControlFile")return invoke_fs_control(state,memory,service);
+        if(symbol=="GetFileInformationByHandle" || symbol=="GetFileInformationByHandleEx" || symbol=="GetFileTime" || symbol=="SetFileTime"){
+            last_error_=1;arg.return_to(state,0);return std::nullopt;
+        }
+    }
     if(const auto file=files_.find(arg(0));file!=files_.end() && (file->second.serial || file->second.hid || file->second.usb)){
         if(file->second.hid && (symbol=="DeviceIoControl" || symbol=="NtDeviceIoControlFile"))return invoke_fs_control(state,memory,service);
         if(symbol.starts_with("Nt")){
@@ -404,6 +462,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         }catch(const MemoryFault&){return failed(998);}catch(const std::invalid_argument&){return failed(123);}catch(const std::bad_alloc&){return failed(8);}
     }
     const bool crt_find=service.family=="crt" && (symbol.starts_with("_find") || symbol.starts_with("_wfind"));
+
     if(crt_find || symbol=="_access" || symbol=="_waccess" || symbol=="_access_s" || symbol=="_waccess_s" || symbol=="_chmod" || symbol=="_wchmod"){
         const bool secure=symbol.ends_with("_s"),first=symbol.find("findfirst")!=symbol.npos,close=symbol=="_findclose";
         const auto invalid=[&]()->std::optional<std::uint32_t>{
@@ -537,7 +596,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
             const bool restart=extended?(flags&0x11U)!=0:arg(10)!=0;
             const bool single=extended?(flags&2U)!=0:arg(8)!=0;
             auto pattern=file.directory->pattern.value_or(u"*");
-            if(!(file.metadata.attributes&0x10))status=0xc0000103;
+            if((file.native && file.native->volume_device()) || !(file.metadata.attributes&0x10))status=0xc0000103;
             else if(!(file.access&(0x80000000U|1U)))status=0xc0000022;
             // INDEX_SPECIFIED 只能隨自建 IRP 傳入；此使用者模式入口沒有索引參數。
             else if(flags&~0x1bU)status=0xc000000d;
@@ -674,12 +733,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         else if(runtime_.directory_searches.size()>=1024)last_error_=8;
         else {
             const auto path=utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)}));
-            const auto file=filesystem_.information(path);
-            if(file.error)last_error_=file.error;
-            // 目前的映射檔案系統只提供一般檔案的預設資料流；目錄沒有未命名 $DATA。
-            else if(file.metadata.attributes&0x10)last_error_=38;
+            const auto listing=filesystem_.streams(path);
+            if(listing.error)last_error_=listing.error;
+            else if(listing.entries.empty())last_error_=38;
             else {
-                DirectorySearch search;search.streams=true;search.entries.push_back({"::$DATA",file.metadata});
+                DirectorySearch search;search.streams=true;search.entries=listing.entries;
                 stream_data(memory,arg(2),search.entries.front());search.cursor=1;
                 result=runtime_.allocate_wait_handle();runtime_.directory_searches.emplace(result,std::move(search));
             }
@@ -835,16 +893,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         else {
             switch (kind) {
             case 4:size=40;break;case 5:size=24;break;case 6:size=8;break;case 7:case 8:case 16:case 17:size=4;break;case 14:size=8;break;
-            case 9:size=8;break;case 18:size=104;break;case 34:size=56;break;case 35:size=8;break;case 59:size=24;break;
+            case 9:size=8;break;case 18:size=104;break;case 22:size=32;break;case 34:size=56;break;case 35:size=8;break;case 59:size=24;break;
             case 68:case 70:case 71:case 77:size=file_stat::size(kind);break;
             default:status=0xc0000003;break;
             }
             if (!status && found!=files_.end() && found->second.native && found->second.native->null_device() && kind!=5 && kind!=8 && kind!=14 && kind!=16 && kind!=17)status=0xc0000003;
+            // 卷裝置只提供實際開啟狀態；不能把能力描述元的根目錄 metadata 當成裝置檔案。
+            if (!status && found!=files_.end() && found->second.native && found->second.native->volume_device() && kind!=8 && kind!=14 && kind!=16 && kind!=17)status=0xc0000010;
             if (!status && capacity<size) status=0xc0000004;
             if (!status && (kind==4 || kind==18 || kind==34 || kind==35 || file_stat::size(kind)) && !(access&0x80U))status=0xc0000022;
             if (!status && standard && (kind==9 || kind==18))status=0xc0000010;
+            if (!status && kind==22 && (standard || !found->second.native))status=0xc0000010;
             if (!status && file_stat::size(kind) && (standard || found->second.pipe || (!found->second.native && !found->second.identity)))status=0xc0000010;
-            if (!status && found!=files_.end() && found->second.native) {
+            if (!status && found!=files_.end() && found->second.native && !found->second.native->volume_device()) {
                 const auto current=found->second.native->information();
                 if(current.error)status=current.error==5?0xc0000022U:current.error==6?0xc0000008U:0xc0000001U;
                 else found->second.metadata=current.metadata;
@@ -872,7 +933,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
                 default:break; // 未提供 NT EA；一般映射檔案支援 byte alignment。
                 }
             };
-            if(file_stat::size(kind)) {
+            if(kind==22){
+                const auto listing=filesystem_.streams(*found->second.native);
+                if(listing.error){status=listing.error==8?0xc0000017U:listing.error==5?0xc0000022U:0xc0000001U;bytes.clear();}
+                else {bytes=stream_information_bytes(listing);if(bytes.size()>capacity){bytes.clear();status=0xc0000023U;}}
+            } else if(file_stat::size(kind)) {
                 bytes=file_stat::encode(kind,info,effective);
             } else if(kind==18) {
                 fill(4,0);fill(5,40);fill(6,64);fill(7,72);fill(8,76);fill(14,80);fill(16,88);fill(17,92);
@@ -922,6 +987,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         const auto queried=kind==2 && found!=files_.end()?FileInformation{}:file_handle_information(arg(0));
         if (queried.error) fail(queried.error);
         else if (found==files_.end() && (kind==2 || kind==10 || kind==11 || kind==14 || kind==15))fail(50);
+        else if(kind==7){
+            if(found==files_.end() || !found->second.native)fail(87);
+            else if(capacity<32)fail(24);
+            else if(!output)fail(87);
+            else {const auto listing=filesystem_.streams(*found->second.native);if(listing.error)fail(listing.error);
+                else {const auto bytes=stream_information_bytes(listing);if(bytes.size()>capacity)fail(122);else {memory.write(GuestAddress{output},bytes);result=1;}}}
+        }
         else if(kind==2) {
             if(capacity<4)fail(24);else if(!output)fail(87);
             else {auto [bytes,error]=name_information(found->second);
@@ -996,7 +1068,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
             else fail(file.error);
         } else {
             const auto& info=file.metadata;
-            // MSVCRT 的 _stat／_stati64 使用 32 位元 time_t；顯式 64 版本才使用 64 位元時間。
+            // 舊版名稱已在入口換成明確版本（Win32 32 位元、Win64 64 位元 time_t）。
             const bool time64=(symbol.ends_with("64") && !symbol.ends_with("i64")) || symbol.ends_with("64i32");
             const bool size64=symbol.ends_with("i64") || (symbol.ends_with("64") && !symbol.ends_with("64i32"));
             const unsigned time_start=size64?32U:24U,time_width=time64?64U:32U;

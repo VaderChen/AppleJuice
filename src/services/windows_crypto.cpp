@@ -4,6 +4,8 @@
 #include "crypto_text.hpp"
 #include "crypto_digest.hpp"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <random>
 namespace x64arm {
 namespace {
@@ -98,7 +100,32 @@ std::optional<std::uint32_t> WindowsServices::invoke_crypto(GuestState& state,Gu
         if (count>output_limit) throw HostCallFault("單次密碼服務資料超過 16 MiB 上限");
         std::vector<std::uint8_t> bytes(count);memory.read(GuestAddress{pointer},bytes);return bytes;
     };
-    if(service.family=="wintrust.dll"){const auto result=trust_call(state,memory,arg,symbol);arg.return_to(state,result);return std::nullopt;}
+    if(service.family=="wintrust.dll"){
+        const auto result=trust_call(state,memory,arg,symbol);
+        // 獨立的唯讀診斷不關閉常駐服務，也不改變驗證結果或信任來源。
+        static const bool trace=[] {const auto* value=std::getenv("X64ARM_TRACE_WINTRUST");return value && std::string_view(value)=="1";}();
+        if(trace && (symbol=="WinVerifyTrust" || symbol=="WinVerifyTrustEx")){
+            try {
+                const auto data=arg(2);const unsigned bits=x86_?32:64;
+                const auto load=[&](std::uint64_t base,unsigned at,unsigned width=32){return memory.load(GuestAddress{base+at},static_cast<std::uint8_t>(width));};
+                const auto size=load(data,0),choice=load(data,x86_?20:32),operation=load(data,x86_?28:48);
+                const auto flags=load(data,x86_?40:72),revocation=load(data,x86_?16:28);
+                const auto settings=size>=(x86_?52U:88U)?load(data,x86_?48:80,bits):0;
+                std::string path;
+                // CLOSE 不讀取呼叫端可能已釋放的檔案資訊。
+                if(operation!=2 && operation!=4 && (choice==1 || choice==2)){
+                    const auto info=load(data,x86_?24:40,bits);
+                    const auto pointer=load(info,choice==1?(x86_?4:8):(x86_?16:24),bits);
+                    if(pointer)path=utf16_to_utf8(read_utf16(memory,GuestAddress{pointer},32768));
+                }
+                for(auto& c:path)if(static_cast<unsigned char>(c)<32)c='?';
+                std::fprintf(stderr,"[wintrust] pid=%u thread=%llu api=%.*s status=%08x choice=%llu operation=%llu flags=%llx revocation=%llu signature_settings=%u path=%s\n",
+                    process_id(),static_cast<unsigned long long>(threads_.current),static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned>(result),
+                    static_cast<unsigned long long>(choice),static_cast<unsigned long long>(operation),static_cast<unsigned long long>(flags),static_cast<unsigned long long>(revocation),settings?1U:0U,path.c_str());
+            }catch(const MemoryFault&){}catch(const std::exception&){}
+        }
+        arg.return_to(state,result);return std::nullopt;
+    }
     if(service.family=="imagehlp.dll")status=image_certificate_call(memory,arg,symbol);
     else if(symbol.starts_with("CryptBinaryToString") || symbol.starts_with("CryptStringToBinary")){
         const bool encoding=symbol.starts_with("CryptBinaryToString"),unicode=symbol.ends_with("W");

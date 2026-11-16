@@ -38,7 +38,7 @@ void mf_buffer::initialize(GuestMemory& memory,std::map<std::uint64_t,RuntimeIma
         throw std::logic_error("MF buffer 常式包含外部相依或超出常駐映像範圍");
     for(const auto& [address,image]:images)if(base<address+image.size && address<base+parsed.metadata.image_size)
         throw std::logic_error("MF buffer 常式與既有常駐映像重疊");
-    auto image=parsed.runtime;image.path=u"[guest-mf-buffer]";image.export_names.clear();image.export_ordinals.clear();
+    auto image=parsed.runtime;image.private_code=true;image.path=u"[guest-mf-buffer]";image.export_names.clear();image.export_ordinals.clear();
     for(const auto& [name,ordinal]:parsed.runtime.export_names)image.export_names.emplace(name,parsed.runtime.export_ordinals.at(ordinal));
     for(auto& mapping:parsed.mappings)mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
     map_pe_image(memory,parsed);images.emplace(base,std::move(image));
@@ -50,7 +50,7 @@ void mf_image::initialize(GuestMemory& memory,std::map<std::uint64_t,RuntimeImag
         throw std::logic_error("MF 影像常式包含外部相依或超出常駐映像範圍");
     for(const auto& [address,image]:images)if(base<address+image.size && address<base+parsed.metadata.image_size)
         throw std::logic_error("MF 影像常式與既有常駐映像重疊");
-    auto image=parsed.runtime;image.path=u"[guest-mf-image]";image.export_names.clear();image.export_ordinals.clear();
+    auto image=parsed.runtime;image.private_code=true;image.path=u"[guest-mf-image]";image.export_names.clear();image.export_ordinals.clear();
     for(const auto& [name,ordinal]:parsed.runtime.export_names)image.export_names.emplace(name,parsed.runtime.export_ordinals.at(ordinal));
     for(auto& mapping:parsed.mappings)mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
     map_pe_image(memory,parsed);images.emplace(base,std::move(image));

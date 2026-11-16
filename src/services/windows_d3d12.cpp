@@ -1202,9 +1202,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 // 電馭判客每幀上萬次，原本每次離開原生碼往返 worker 服務。X64ARM_GUEST_D3D12_GPUVA=0 關閉（含下方堆積起點）。
                 static const bool guest_gpuva=[] {const auto* value=std::getenv("X64ARM_GUEST_D3D12_GPUVA");return !value || std::string_view(value)!="0";}();
                 static const bool root_recording=[] {const auto* value=std::getenv("X64ARM_RESIDENT_D3D12_ROOT_BINDINGS");return !value || std::string_view(value)!="0";}();
-                // 獨立錄製測項有收益。整體遊戲的長幀仍待確認，暫留明確對照開關。
-                static const bool draw_recording=[] {const auto* value=std::getenv("X64ARM_RESIDENT_D3D12_DRAW_RECORDING");return value && std::string_view(value)=="1";}();
-                static const bool input_recording=[] {const auto* value=std::getenv("X64ARM_RESIDENT_D3D12_INPUT_RECORDING");return value && std::string_view(value)=="1";}();
+                // 繪製（DrawInstanced／DrawIndexedInstanced）與輸入（IASetVertexBuffers／IASetIndexBuffer）常駐錄製：
+                // 2026-11-14 電馭判客中畫質 720p 2 vCPU 開／關 45.21、44.29 對 43.99、43.67（另三輪關閉 42.7～43.2），
+                // 最低完整秒 35／33 對 29／31；《暗影》4 vCPU 末段 43.6→45.0。預設開啟，=0 關閉。
+                static const bool draw_recording=[] {const auto* value=std::getenv("X64ARM_RESIDENT_D3D12_DRAW_RECORDING");return !value || std::string_view(value)!="0";}();
+                static const bool input_recording=[] {const auto* value=std::getenv("X64ARM_RESIDENT_D3D12_INPUT_RECORDING");return !value || std::string_view(value)!="0";}();
                 // 描述元堆積的 CPU／GPU 起點同樣由客體常式讀 [this+8]／[this+16]（見 CreateDescriptorHeap）。
                 const auto routine=[&](std::string_view method)->std::uint64_t{
                     if(kind==Kind::List &&
@@ -1771,6 +1773,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             case 23:case 27:case 41:if(!zero(12))return finish(invalid);return finish(ok);
             case 32:if(!zero(8))return finish(invalid);return finish(ok);
             case 37:case 42:if(!zero(24))return finish(invalid);return finish(ok);
+            // OPTIONS14～18：查詢本身可用；目前命令列表沒有獨立正反面 stencil、
+            // 動態 depth bias／strip cut、手動寫入追蹤及 render pass 契約，GPU_UPLOAD
+            // heap 也尚未提供。明確回報 FALSE，讓呼叫端依實際能力選擇既有路徑。
+            case 43:if(!zero(12))return finish(invalid);return finish(ok);
+            case 44:case 45:case 46:if(!zero(8))return finish(invalid);return finish(ok);
+            case 47:if(!zero(4))return finish(invalid);return finish(ok);
             default:report("CheckFeatureSupport("+std::to_string(feature)+")");return finish(invalid);
             }
         }

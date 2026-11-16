@@ -16,7 +16,9 @@ std::span<const WindowsServiceDescriptor> icon_service_descriptors(){
         {"user32.dll","PrivateExtractIconsA",8},{"user32.dll","PrivateExtractIconsW",8},
         {"shell32.dll","ExtractIconA",3},{"shell32.dll","ExtractIconW",3},
         {"shell32.dll","ExtractIconExA",5},{"shell32.dll","ExtractIconExW",5},
-        {"shell32.dll","SHGetStockIconInfo",3}
+        {"shell32.dll","SHGetStockIconInfo",3},
+        // 系統游標取代（SPI_SETCURSORS 還原）與動畫游標的逐步幀資訊。
+        {"user32.dll","SetSystemCursor",2,0,0,0x2},{"user32.dll","GetCursorFrameInfo",5,0,0,0x6}
     };return table;
 }
 std::uint64_t WindowsServices::store_gui_icon(GuiIcon icon,std::uint32_t flags){
@@ -30,6 +32,12 @@ std::uint64_t WindowsServices::shell_system_icons(std::uint32_t size){
     GuiImageList images;images.width=static_cast<std::int32_t>(size);images.height=images.width;images.flags=0x21;
     for(const auto id:{0U,3U,8U}){auto icon=native_stock_icon(id,size);if(!icon)return 0;icon->system=0x10001U+static_cast<std::uint32_t>(images.images.size());images.images.push_back(std::move(*icon));}
     handle=gui_.next_object++;gui_.image_lists.emplace(handle,std::move(images));return handle;
+}
+std::uint64_t WindowsServices::shell_image_list(std::uint32_t size){
+    auto& handle=size==16?gui_.shell_small_image_list:gui_.shell_large_image_list;
+    if(gui_.image_lists.contains(handle))return handle;if(const auto native=shell_system_icons(size))return native;
+    GuiImageList images;images.width=static_cast<std::int32_t>(size);images.height=images.width;images.flags=0x21;
+    for(std::uint32_t i=0;i<3;++i)images.images.push_back(GuiIcon{{},size,size,0x10001U+i});handle=gui_.next_object++;gui_.image_lists.emplace(handle,std::move(images));return handle;
 }
 namespace {
 std::size_t stock_index(std::int32_t index){
@@ -73,6 +81,41 @@ std::optional<std::uint32_t> WindowsServices::invoke_icon_api(GuestState& state,
             if(!handle)return finish(0x80070000U|(last_error_?last_error_:1813U));
             memory.store(GuestAddress{output},static_cast<std::uint8_t>(unit*8),handle);
             return finish(0);
+        }else if(symbol=="SetSystemCursor"){
+            // 以 hcur 的內容取代 OCR_* 系統游標，並依文件以 DestroyCursor 銷毀 hcur；目前正使用該系統游標時立即更新。
+            const auto id=d(1);const auto found=gui_.icons.find(arg(0));
+            if(found==gui_.icons.end()){last_error_=1402;result=0;}
+            else if(!gui_system_cursor_id(id)){last_error_=87;result=0;}
+            else {
+                auto copy=found->second;copy.shared=false;copy.system=0;copy.is_icon=false;gui_.system_cursors.insert_or_assign(id,std::move(copy));
+                (void)nested_service(state,memory,"user32.dll","DestroyCursor",{arg(0)});
+                if(gui_.cursor==0xd000U+id)present_gui_cursor();
+                result=1;
+            }
+        }else if(symbol=="GetCursorFrameInfo"){
+            // (hCursor, reserved, istep, *rate_jiffies, *num_steps)：靜態游標回傳自身、0 jiffy、1 步；
+            // 動畫游標回傳第 istep 步的幀（共用控制代碼，原游標銷毀時回收）、該步的 jiffy 數與總步數，超出範圍回 NULL。
+            GuiIcon system;const auto known=gui_.icons.find(arg(0));
+            const GuiIcon* icon=known!=gui_.icons.end()?&known->second:resolve_gui_cursor(arg(0),system);
+            const auto step=d(2);
+            if(!icon){last_error_=1402;result=0;}
+            else if(icon->animation_sequence.empty()){
+                if(arg(3))memory.store(GuestAddress{arg(3)},32,0);if(arg(4))memory.store(GuestAddress{arg(4)},32,1);result=arg(0);
+            }else {
+                const auto steps=static_cast<std::uint32_t>(icon->animation_sequence.size());
+                if(arg(4))memory.store(GuestAddress{arg(4)},32,steps);
+                if(step>=steps){last_error_=87;result=0;}
+                else {
+                    if(arg(3))memory.store(GuestAddress{arg(3)},32,step<icon->animation_rates.size()?icon->animation_rates[step]:0U);
+                    const auto frame=icon->animation_sequence[step];const auto key=std::pair{arg(0),frame};
+                    if(const auto cached=gui_.cursor_frames.find(key);cached!=gui_.cursor_frames.end() && gui_.icons.contains(cached->second))result=cached->second;
+                    else {
+                        if(gui_.icons.size()>=8192)throw std::bad_alloc{};
+                        auto copy=icon->animation_frames.at(frame);copy.shared=true;copy.is_icon=icon->is_icon;
+                        result=gui_.next_object++;gui_.icons.emplace(result,std::move(copy));gui_.cursor_frames.insert_or_assign(key,result);
+                    }
+                }
+            }
         }else if(symbol=="CopyImage"){
             const auto type=d(1),flags=d(4),requested_width=d(2),requested_height=d(3);
             const auto finish=[&](std::uint64_t handle){arg.return_to(state,handle);return std::optional<std::uint32_t>{};};
@@ -99,7 +142,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_icon_api(GuestState& state,
                 }else {copy.stride=(width*copy.bits_per_pixel+15)/16*2;const auto handle=gui_.next_object;gui_.bitmaps.emplace(handle,std::move(copy));++gui_.next_object;result=handle;}
             }else {
                 const auto source=gui_.icons.find(arg(0));std::optional<GuiIcon> system;
-                if(source==gui_.icons.end() && type==2 && arg(0)>=0xd000 && arg(0)<0x1d000)system=native_system_cursor(static_cast<std::uint32_t>(arg(0)-0xd000));
+                if(source==gui_.icons.end() && type==2 && arg(0)>=0xd000 && gui_system_cursor_id(arg(0)-0xd000)){
+                    // 被 SetSystemCursor 取代的系統游標複製取代後的內容。
+                    const auto id=static_cast<std::uint32_t>(arg(0)-0xd000);const auto replaced=gui_.system_cursors.find(id);
+                    system=replaced!=gui_.system_cursors.end()?std::optional<GuiIcon>{replaced->second}:native_system_cursor(id);
+                }
                 if(source==gui_.icons.end() && !system)return fail(type==1?1402:1401);
                 const auto original=source!=gui_.icons.end()?source->second:*system;if(original.is_icon!=(type==1))return fail(87);
                 const auto width=requested_width?requested_width:(flags&0x40U)?system_metric(type==1?11:13):original.width;
@@ -201,5 +248,146 @@ std::optional<std::uint32_t> WindowsServices::invoke_icon_api(GuestState& state,
     }catch(const std::invalid_argument&){last_error_=193;result=scaled || symbol=="SHGetStockIconInfo"?0x8007000dU:symbol.starts_with("ExtractIconEx")?UINT32_MAX:0;}
     catch(const std::bad_alloc&){for(const auto handle:allocated){const auto icon=gui_.icons.find(handle);if(icon!=gui_.icons.end() && !icon->second.shared)gui_.icons.erase(icon);}last_error_=8;result=scaled || symbol=="SHGetStockIconInfo"?0x8007000eU:0;}
     arg.return_to(state,result);return std::nullopt;
+}
+// shell32 圖示家族：DuplicateIcon、ExtractAssociatedIcon(Ex)、FreeIconList、SHDefExtractIcon、Shell_GetImageLists、Shell_GetCachedImageIndex、
+// SHUpdateImage／SHHandleUpdateImage、SHGetIconOverlayIndex、SHLoadNonloadedIconOverlayIdentifiers、SHCreateFileExtractIconW（IExtractIconW）。
+// 圖示一律經同一個 IconSource／原生內建圖示路徑取得，與 ExtractIcon／PrivateExtractIcons 一致；A 版字串依 ACP（UTF-8）轉換。
+std::span<const WindowsServiceDescriptor> shell_icon_service_descriptors(){
+    static constexpr WindowsServiceDescriptor table[]{
+        {"shell32.dll","DuplicateIcon",2},{"shell32.dll","ExtractAssociatedIconA",3},{"shell32.dll","ExtractAssociatedIconW",3},
+        {"shell32.dll","ExtractAssociatedIconExA",4},{"shell32.dll","ExtractAssociatedIconExW",4},{"shell32.dll","FreeIconList",1,0,0,0x1},
+        {"shell32.dll","SHDefExtractIconA",6,0,0,0x26},{"shell32.dll","SHDefExtractIconW",6,0,0,0x26},{"shell32.dll","Shell_GetImageLists",2},
+        {"shell32.dll","Shell_GetCachedImageIndexA",3,0,0,0x6},{"shell32.dll","Shell_GetCachedImageIndexW",3,0,0,0x6},
+        {"shell32.dll","SHUpdateImageA",4,0,0,0xe},{"shell32.dll","SHUpdateImageW",4,0,0,0xe},{"shell32.dll","SHHandleUpdateImage",1},
+        {"shell32.dll","SHGetIconOverlayIndexA",2,0,0,0x2},{"shell32.dll","SHGetIconOverlayIndexW",2,0,0,0x2},{"shell32.dll","SHLoadNonloadedIconOverlayIdentifiers",0},
+        {"shell32.dll","SHCreateFileExtractIconW",4,0,0,0x2},
+        {"internal-extract-icon","QueryInterface",3},{"internal-extract-icon","AddRef",1},{"internal-extract-icon","Release",1},
+        {"internal-extract-icon","GetIconLocation",6,0,0,0xa},{"internal-extract-icon","Extract",6,0,0,0x24},
+    };return table;
+}
+std::optional<std::uint32_t> WindowsServices::invoke_shell_icons(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool narrow=name.ends_with('A');
+    const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+    const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
+    const auto d=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
+    const auto read=[&](std::uint64_t at)->std::u16string{if(!at)return {};return narrow?utf8_to_utf16_lossy(read_ansi(memory,at,32768)):read_utf16(memory,GuestAddress{at},32768);};
+    const auto write=[&](std::uint64_t at,const std::u16string& text,std::size_t capacity)->bool{
+        if(narrow){const auto bytes=utf16_to_utf8_lossy(text);if(bytes.size()>=capacity)return false;std::vector<std::uint8_t> data(bytes.begin(),bytes.end());data.push_back(0);memory.write(GuestAddress{at},data);return true;}
+        if(text.size()>=capacity)return false;memory.write(GuestAddress{at},utf16_bytes(text));return true;};
+    constexpr std::array<std::uint8_t,16> unknown{0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46},extract_iid{0xfa,0x14,0x02,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
+    // 由檔案（或內建圖示路徑）取指定索引、指定大小的圖示；負索引為資源 ID。找不到回 nullopt，檔案無法讀取另回報 file_error。
+    std::uint32_t file_error=0;
+    const auto load=[&](const std::u16string& path,std::int32_t index,std::uint32_t size)->std::optional<GuiIcon>{
+        file_error=0;
+        try{
+            if(is_stock_icon_path(path)){const auto ids=stock_icon_ids();const auto at=stock_index(index);if(at>=ids.size())return std::nullopt;
+                auto icon=native_stock_icon(ids[at],size);if(!icon)return std::nullopt;resize_icon(*icon,size,size);icon->is_icon=true;finish_icon(*icon);return icon;}
+            const auto file=filesystem_.open(utf16_to_utf8(path));if(file.error){file_error=file.error;return std::nullopt;}
+            IconSource source(*file.bytes);const auto at=source.index(index);if(at>=source.count())return std::nullopt;
+            auto icon=source.extract(at,size,size);icon.is_icon=true;finish_icon(icon);return icon;
+        }catch(const std::invalid_argument&){file_error=193;return std::nullopt;}};
+    const auto expand=[&](const std::u16string& text)->std::u16string{
+        GuestScratch temporary(*this,memory,state);const auto source=temporary.text(text),buffer=temporary.allocate(2*32768);if(!source || !buffer)return text;
+        const auto length=static_cast<std::uint32_t>(nested_service(state,memory,"kernel32.dll","ExpandEnvironmentStringsW",{source,buffer,32768}));
+        return length && length<=32768?read_utf16(memory,GuestAddress{buffer},32767):text;};
+    // DefaultIcon 等 "路徑,索引" 文字：去引號、%1 代表檔案本身、展開環境變數。
+    const auto location=[&](std::u16string text,const std::u16string& file)->std::pair<std::u16string,std::int32_t>{
+        std::int32_t index=0;if(const auto comma=text.find_last_of(u',');comma!=text.npos){std::size_t at=comma+1;while(at<text.size() && text[at]==u' ')++at;bool negative=false;if(at<text.size() && text[at]==u'-'){negative=true;++at;}
+            std::int64_t value=0;for(;at<text.size() && text[at]>=u'0' && text[at]<=u'9';++at)value=std::min<std::int64_t>(value*10+(text[at]-u'0'),INT32_MAX);index=static_cast<std::int32_t>(negative?-value:value);text.resize(comma);}
+        while(!text.empty() && text.back()==u' ')text.pop_back();if(text.size()>=2 && text.front()==u'"' && text.back()==u'"')text=text.substr(1,text.size()-2);
+        if(text==u"%1")return {file,index};return {expand(text),index};};
+    const auto extension_of=[](const std::u16string& path){const auto slash=path.find_last_of(u"\\/");const auto dot=path.rfind(u'.');if(dot==path.npos || (slash!=path.npos && dot<slash))return std::u16string{};
+        auto out=path.substr(dot);for(auto& c:out)c=unicode_case_unit(c,false);return out;};
+    // 檔案的圖示位置：資料夾與無關聯檔案用內建圖示；.exe／.ico／.cur 用檔案本身；其他依關聯的 DefaultIcon，最後退回執行檔圖示。flags 為 GIL_*。
+    const auto icon_location=[&](const std::u16string& path,std::uint32_t attributes,std::uint32_t& flags)->std::pair<std::u16string,std::int32_t>{
+        flags=0;if(attributes&0x10U)return {std::u16string(stock_icon_path),-(0x4000+3)};
+        const auto extension=extension_of(path);if(extension==u".exe" || extension==u".ico" || extension==u".cur"){flags=2;return {path,0};} // GIL_PERINSTANCE
+        if(!extension.empty()){std::u16string value;
+            if(!query_association(0,15,extension,u"",value)){flags=4;return location(value,path);} // GIL_PERCLASS
+            if(!query_association(0,2,extension,u"",value)){flags=4;return {value,0};}}
+        flags=4;return {std::u16string(stock_icon_path),-(0x4000+0)};};
+    try{
+        if(name=="DuplicateIcon")return done(nested_service(state,memory,"user32.dll","CopyIcon",{arg(1)}));
+        if(name=="FreeIconList")return done(0); // 16 位元相容入口：Win32 沒有可釋放的清單
+        if(name=="Shell_GetImageLists"){if(arg(0))memory.store(GuestAddress{arg(0)},bits,shell_image_list(32));if(arg(1))memory.store(GuestAddress{arg(1)},bits,shell_image_list(16));return done(1);}
+        if(name=="SHLoadNonloadedIconOverlayIdentifiers")return done(0); // 沒有登錄的覆疊識別處理常式時沒有需要載入的項目
+        if(name.starts_with("SHGetIconOverlayIndex")){
+            // 內建覆疊：IDO_SHGIOI_SHARE 1、LINK 2、SLOWFILE 3、DEFAULT 4；自訂圖示路徑沒有登錄的覆疊識別處理常式，回 -1。
+            if(!arg(0)){switch(d(1)){case 0x0fffffffU:return done(1);case 0x0ffffffeU:return done(2);case 0x0ffffffdU:return done(3);case 0x0ffffffcU:return done(4);default:return done(UINT32_MAX);}}
+            return done(UINT32_MAX);
+        }
+        if(name.starts_with("ExtractAssociatedIcon")){
+            // (HINSTANCE, 路徑 輸入輸出 MAX_PATH, WORD* 索引 輸入輸出[, WORD* 資源 ID])：先取檔案本身的圖示，其次關聯的 DefaultIcon／執行檔，最後為內建文件圖示；改寫路徑與索引為實際來源。
+            const bool ex=name.starts_with("ExtractAssociatedIconEx");if(!arg(1) || !arg(2))return done(0);const auto path=read(arg(1));
+            auto index=static_cast<std::int32_t>(static_cast<std::int16_t>(memory.load(GuestAddress{arg(2)},16)));
+            auto icon=load(path,index,32);std::u16string source=path;
+            if(!icon){std::uint32_t flags=0;const auto [where,at]=icon_location(path,0,flags);icon=load(where,at,32);source=where;index=at;}
+            if(!icon){source=std::u16string(stock_icon_path);index=-(0x4000+0);icon=load(source,index,32);}
+            if(!icon)return done(0);
+            if(source!=path)(void)write(arg(1),source,260);memory.store(GuestAddress{arg(2)},16,static_cast<std::uint16_t>(index));
+            if(ex && arg(3))memory.store(GuestAddress{arg(3)},16,static_cast<std::uint16_t>(index<0?-index:index));
+            return done(store_gui_icon(std::move(*icon)));
+        }
+        const auto extract_pair=[&](const std::u16string& file,std::int32_t index,std::uint64_t large,std::uint64_t small,std::uint32_t sizes)->std::uint32_t{
+            // SHDefExtractIcon／IExtractIcon::Extract：LOWORD 為大圖示、HIWORD 為小圖示的像素大小（0 時為 32／16）。檔案無法讀取回 E_FAIL，沒有該圖示回 S_FALSE。
+            if(large)memory.store(GuestAddress{large},bits,0);if(small)memory.store(GuestAddress{small},bits,0);
+            const auto large_size=(sizes&0xffffU)?sizes&0xffffU:32U,small_size=(sizes>>16)?sizes>>16:16U;
+            std::optional<GuiIcon> big,little;if(large)big=load(file,index,large_size);if(file_error)return 0x80004005U;if(small)little=load(file,index,small_size);if(file_error)return 0x80004005U;
+            if((large && !big) || (small && !little))return 1;
+            if(big)memory.store(GuestAddress{large},bits,store_gui_icon(std::move(*big)));if(little)memory.store(GuestAddress{small},bits,store_gui_icon(std::move(*little)));return 0;};
+        if(name.starts_with("SHDefExtractIcon")){if(!arg(0))return done(0x80070057U);return done(extract_pair(read(arg(0)),static_cast<std::int32_t>(d(1)),arg(3),arg(4),d(5)));}
+        if(name.starts_with("Shell_GetCachedImageIndex")){
+            // 把圖示加入系統大小影像清單並回傳索引（相同路徑與索引只加入一次）；取不到圖示回 -1。
+            auto key=read(arg(0));if(key.empty())return done(UINT32_MAX);const auto path=key;for(auto& c:key)c=unicode_case_unit(c,false);
+            const auto index=static_cast<std::int32_t>(d(1));key+=u"|"+utf8_to_utf16_lossy(std::to_string(index));
+            if(const auto found=gui_.shell_cached_icons.find(key);found!=gui_.shell_cached_icons.end())return done(found->second);
+            auto big=load(path,index,32),little=load(path,index,16);if(!big || !little)return done(UINT32_MAX);
+            auto& large_images=gui_.image_lists.at(shell_image_list(32)).images;auto& small_images=gui_.image_lists.at(shell_image_list(16)).images;
+            const auto slot=static_cast<std::uint32_t>(std::max(large_images.size(),small_images.size()));
+            large_images.resize(slot+1);small_images.resize(slot+1);large_images[slot]=std::move(*big);small_images[slot]=std::move(*little);
+            gui_.shell_cached_icons.emplace(std::move(key),slot);return done(slot);
+        }
+        if(name.starts_with("SHUpdateImage")){
+            // SHChangeUpdateImageIDList（1 位元組對齊）：cb、iIconIndex、iCurIndex、uFlags、dwProcessID、szName[MAX_PATH]、結尾 0；以 SHCNE_UPDATEIMAGE／SHCNF_IDLIST 通知。
+            GuestScratch temporary(*this,memory,state);const auto list=temporary.allocate(540);if(!list)return done(0);std::vector<std::uint8_t> bytes(540);
+            const auto put=[&](std::size_t at,std::uint32_t value,unsigned size){for(unsigned i=0;i<size;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
+            put(0,538,2);put(2,d(1),4);put(6,d(3),4);put(10,d(2),4);put(14,static_cast<std::uint32_t>(nested_service(state,memory,"kernel32.dll","GetCurrentProcessId",{})),4);
+            auto file=read(arg(0));if(file.size()>259)file.resize(259);for(std::size_t i=0;i<file.size();++i)put(18+i*2,file[i],2);
+            memory.write(GuestAddress{list},bytes);(void)nested_service(state,memory,"shell32.dll","SHChangeNotify",{0x8000,0,list,0});return done(0);
+        }
+        if(name=="SHHandleUpdateImage"){
+            // 同程序的通知直接回 iCurIndex；其他程序依名稱與圖示索引加入快取後回傳索引。
+            if(!arg(0) || memory.load(GuestAddress{arg(0)},16)<538)return done(UINT32_MAX);
+            const auto field=[&](unsigned at){return static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+at},32));};
+            if(field(14)==static_cast<std::uint32_t>(nested_service(state,memory,"kernel32.dll","GetCurrentProcessId",{})))return done(field(6));
+            GuestScratch temporary(*this,memory,state);std::u16string file;for(unsigned i=0;i<259;++i){const auto c=static_cast<char16_t>(memory.load(GuestAddress{arg(0)+18+i*2},16));if(!c)break;file.push_back(c);}
+            const auto text=temporary.text(file);if(!text)return done(UINT32_MAX);
+            return done(nested_service(state,memory,"shell32.dll","Shell_GetCachedImageIndexW",{text,field(2),field(10)})&UINT32_MAX);
+        }
+        if(name=="SHCreateFileExtractIconW"){
+            // (檔案, FILE_ATTRIBUTE_*, riid, ppv)：不要求檔案存在，依名稱與屬性決定圖示。
+            if(!arg(3))return done(0x80004003U);memory.store(GuestAddress{arg(3)},bits,0);if(!arg(0) || !arg(2))return done(0x80070057U);
+            std::array<std::uint8_t,16> iid{};memory.read(GuestAddress{arg(2)},iid);if(iid!=unknown && iid!=extract_iid)return done(0x80004002U);
+            if(gui_.shell_extract_icons.size()>=4096)return done(0x8007000eU);
+            if(!gui_.shell_extract_icon_vtable){const auto table=runtime_allocate(memory,{},5*unit);unsigned i=0;
+                for(const auto& entry:shell_icon_service_descriptors())if(entry.family=="internal-extract-icon")memory.store(GuestAddress{table+unit*i++},bits,resolve(entry.family,entry.symbol).value);gui_.shell_extract_icon_vtable=table;}
+            const auto object=allocate_heap(memory,unit);if(!object)return done(0x8007000eU);memory.store(GuestAddress{object},bits,gui_.shell_extract_icon_vtable);
+            gui_.shell_extract_icons.emplace(object,GuiState::ShellExtractIcon{read(arg(0)),d(1)});memory.store(GuestAddress{arg(3)},bits,object);return done(0);
+        }
+        if(service.family=="internal-extract-icon"){
+            const auto found=gui_.shell_extract_icons.find(arg(0));if(found==gui_.shell_extract_icons.end())return done(0x80010108U);auto& object=found->second;
+            if(name=="AddRef")return done(++object.references);
+            if(name=="Release"){if(--object.references)return done(object.references);gui_.shell_extract_icons.erase(found);(void)free_heap(memory,arg(0),state);return done(0);}
+            if(name=="QueryInterface"){if(!arg(2))return done(0x80004003U);memory.store(GuestAddress{arg(2)},bits,0);if(!arg(1))return done(0x80004003U);
+                std::array<std::uint8_t,16> iid{};memory.read(GuestAddress{arg(1)},iid);if(iid!=unknown && iid!=extract_iid)return done(0x80004002U);++object.references;memory.store(GuestAddress{arg(2)},bits,arg(0));return done(0);}
+            if(name=="GetIconLocation"){
+                // (uFlags, 圖示檔 輸出, cch, 索引*, GIL_* 旗標*)
+                if(!arg(2) || !d(3) || !arg(4) || !arg(5))return done(0x80070057U);std::uint32_t flags=0;const auto [where,at]=icon_location(object.path,object.attributes,flags);
+                if(!write(arg(2),where,d(3)))return done(0x8007007aU);memory.store(GuestAddress{arg(4)},32,static_cast<std::uint32_t>(at));memory.store(GuestAddress{arg(5)},32,flags);return done(0);
+            }
+            if(name=="Extract"){if(!arg(1))return done(0x80070057U);return done(extract_pair(read_utf16(memory,GuestAddress{arg(1)},32768),static_cast<std::int32_t>(d(2)),arg(3),arg(4),d(5)));}
+        }
+    }catch(const std::bad_alloc&){return done(0);}
+    throw HostCallFault("未知的 shell32 圖示服務");
 }
 }

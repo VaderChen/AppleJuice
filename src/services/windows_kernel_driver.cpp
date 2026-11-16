@@ -2,6 +2,7 @@
 #include "x64arm/unicode.hpp"
 #include "guest_service_store.hpp"
 #include "virtual_firmware.hpp"
+#include "x64arm/security_access.hpp"
 #include "x64arm/processor_information.hpp"
 #include <algorithm>
 #include <bit>
@@ -16,11 +17,11 @@ namespace x64arm {
 struct WindowsServices::KernelDriverState {
     struct Driver {std::u16string service;std::uint64_t image{},image_size{},object{},unload{};bool running{};};
     struct Device {std::uint64_t driver{};std::u16string name;};
-    struct OpenFile {std::uint64_t device{},file_object{};};
+    struct OpenFile {std::uint64_t device{},file_object{};std::uint32_t access{};};
     struct Request {
         enum class Kind {Entry,Create,Control,Close,Unload} kind{};
         std::u16string service;std::uint64_t driver{},handle{},device{},file_object{},block{},system_buffer{};
-        std::uint64_t input{},output{},returned{},overlapped{},iosb{},event{};std::uint32_t input_size{},output_size{},code{};bool nt{};
+        std::uint64_t input{},output{},returned{},overlapped{},iosb{},event{};std::uint32_t input_size{},output_size{},code{},access{};bool nt{};
         std::vector<std::uint64_t> irps;std::size_t index{};
     };
     std::map<std::u16string,Driver> drivers; // 以摺疊後的服務名稱為鍵。
@@ -76,6 +77,22 @@ WindowsServices::KernelDriverState& WindowsServices::kernel_state(){
     // 程序狀態複製（快照或子程序）時採 copy-on-write，避免兩份服務共用同一驅動狀態。
     if(!kernel_)kernel_=std::make_shared<KernelDriverState>();else if(kernel_.use_count()>1)kernel_=std::make_shared<KernelDriverState>(*kernel_);
     return *kernel_;
+}
+std::vector<WindowsServices::KernelModuleRecord> WindowsServices::local_kernel_modules() const{
+    std::vector<KernelModuleRecord> result;std::set<std::uint64_t> seen;std::map<std::uint64_t,std::uint32_t> references;
+    if(!kernel_)return result;
+    const auto append=[&](auto&& self,std::uint64_t base)->void{
+        ++references[base]; // 驅動宿主根參照及每一條實際匯入依賴，與使用者 LoadLibrary 計數分開。
+        if(!seen.insert(base).second)return;
+        const auto* image=module_image(base);if(!image)return;
+        const auto module=runtime_.loaded_modules.find(base);
+        if(module!=runtime_.loaded_modules.end())for(auto dependency:module->second.dependencies)self(self,dependency);
+        // 僅列出執行中的驅動及其實際映射依賴；內建核心 API 映像亦必須已經載入才可列出。
+        result.push_back({base,image->size,module==runtime_.loaded_modules.end()?0U:module->second.references,image->path});
+    };
+    for(const auto& [name,driver]:kernel_->drivers){(void)name;if(driver.running)append(append,driver.image);}
+    for(auto& module:result)module.references+=references.at(module.base);
+    return result;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_kernel_api(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.symbol=="RtlUnwindEx")return invoke_runtime(state,memory,{"kernel32.dll","RtlUnwindEx",6});
@@ -256,6 +273,13 @@ bool WindowsServices::kernel_device_path(std::u16string_view path) const{
     return false;
 }
 bool WindowsServices::kernel_device_handle(std::uint64_t handle) const{return kernel_ && kernel_->files.contains(handle);}
+void WindowsServices::append_kernel_device_handles(std::vector<std::uint64_t>& handles)const{
+    if(kernel_)for(const auto& [handle,item]:kernel_->files){(void)item;handles.push_back(handle);}
+}
+std::optional<WindowsServices::ObjectMetadata> WindowsServices::kernel_device_metadata(std::uint64_t handle)const{
+    if(!kernel_device_handle(handle))return {};const auto& file=kernel_->files.at(handle);
+    ObjectMetadata out;out.access=file.access;out.handles=1;out.pointers=1;out.identity=file.file_object;return out;
+}
 std::uint64_t WindowsServices::kernel_irp(GuestMemory& memory,std::uint8_t major,std::uint64_t device,std::uint64_t file_object){
     const auto block=allocate_heap(memory,irp_size+stack_size+mdl_size+security_context_size);if(!block)throw std::bad_alloc();
     memory.fill(GuestAddress{block},0,static_cast<std::size_t>(irp_size+stack_size+mdl_size+security_context_size));
@@ -327,6 +351,7 @@ std::optional<std::uint32_t> WindowsServices::open_kernel_device(GuestState& sta
     memory.store(GuestAddress{stack+0x10},32,(dispositions[disposition]<<24)|static_cast<std::uint32_t>(values[5]&0xffffffU));memory.store(GuestAddress{stack+0x1a},16,static_cast<std::uint16_t>(values[2]));
     const auto handle=runtime_.allocate_wait_handle();
     const auto id=k.next_request++;auto& request=k.requests[id];request.kind=KernelDriverState::Request::Kind::Create;request.handle=handle;request.device=device;request.file_object=file_object;request.irps={irp};
+    request.access=security::mapped_access(static_cast<std::uint32_t>(values[1]),{0x120089U,0x120116U,0x1200a0U,0x1f01ffU});
     const auto dispatch=kernel_dispatch(memory,device,0);
     if(!dispatch){memory.store(GuestAddress{irp+0x30},32,status_invalid_device_request);return resume_kernel_request(state,memory,id,status_invalid_device_request);}
     sync_kernel_shared_data(memory);
@@ -410,7 +435,7 @@ std::optional<std::uint32_t> WindowsServices::resume_kernel_request(GuestState& 
         const auto irp_status=static_cast<std::uint32_t>(memory.load(GuestAddress{request.irps[0]+0x30},32));const auto result=status==status_pending?irp_status:status;
         release();
         if(!nt_success(result)){(void)free_heap(memory,request.file_object,state);last_error_=dos(result);complete_call(state,memory,UINT64_MAX);return std::nullopt;}
-        k.files[request.handle]={request.device,request.file_object};complete_call(state,memory,request.handle);return std::nullopt;
+        k.files[request.handle]={request.device,request.file_object,request.access};complete_call(state,memory,request.handle);return std::nullopt;
     }
     if(request.kind==Kind::Close){release();(void)free_heap(memory,request.file_object,state);complete_call(state,memory,1);return std::nullopt;}
     const auto irp=request.irps[0];

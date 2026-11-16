@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/system_performance.hpp"
 #include "x64arm/unicode.hpp"
 #include "windows_etw_support.hpp"
 #include <algorithm>
@@ -102,7 +103,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_etw_controller(GuestState& 
             if(options.id==etw::Guid{}){if(mode&0x800U)return finish(87);if(!random_bytes(options.id))return finish(8);options.id[7]=(options.id[7]&15U)|64U;options.id[8]=(options.id[8]&63U)|128U;}
             auto& header=options.header;const auto size=props.get(48);if(size>1024)return finish(50);header.buffer_size=std::max(4U,size?size:64U)*1024;
             header.clock=props.get(40)?props.get(40):1U;if(header.clock>3)return finish(87);header.mode=mode|(options.file?1U:0U);header.x86=x86_;header.pointer_size=shape.unit;
-            header.processors=memory.processor_count();header.cpu_mhz=2400;header.frequency=10000000;header.start_time=etw_timestamp(2,state);header.boot_time=runtime_.filetime_base;
+            header.processors=memory.processor_count();header.cpu_mhz=windows_processor_mhz;header.frequency=10000000;header.start_time=etw_timestamp(2,state);header.boot_time=runtime_.filetime_base;
             header.start_timestamp=etw_timestamp(header.clock,state);const auto minimum=mode&0x10000000U?2U:memory.processor_count()*2;
             info.minimum=std::max(minimum,props.get(52));info.maximum=std::max(info.minimum,props.get(56)?props.get(56):64U);if(info.maximum>65536)return finish(8);
             options.buffer_limit=info.maximum;header.maximum_file_size=props.get(60);info.flush_timer=props.get(68);info.mode=header.mode;deadline(info);

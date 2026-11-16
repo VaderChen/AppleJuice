@@ -48,6 +48,7 @@ void WindowsServices::set_registry_file(std::filesystem::path path) {
 }
 std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+        {"advapi32.dll","GetCurrentHwProfileA",1},{"advapi32.dll","GetCurrentHwProfileW",1},
         {"advapi32.dll","RegDisablePredefinedCache",0},{"advapi32.dll","RegDisablePredefinedCacheEx",0},{"advapi32.dll","RegOpenCurrentUser",2,0,0,0x1},
         {"advapi32.dll","RegGetKeySecurity",4,0,0,0x2},{"advapi32.dll","RegSetKeySecurity",3,0,0,0x2},
         {"advapi32.dll","RegOpenKeyExA",5,0,0,0xc},{"advapi32.dll","RegOpenKeyExW",5,0,0,0xc},
@@ -189,6 +190,20 @@ std::u16string WindowsServices::registry_current_user_path(bool cached){
     return path;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    // SHGetValue（hkey, subkey, value, type*, data, size*）：開啟子機碼後交給 SHQueryValueEx，與 Windows 相同地把 REG_EXPAND_SZ 展開成 REG_SZ。
+    if(service.symbol=="SHGetValueA" || service.symbol=="SHGetValueW"){
+        const bool wide=service.symbol.ends_with('W');const WindowsCall arg(state,memory,service);const auto bits=static_cast<std::uint8_t>(x86_?32:64);
+        std::uint64_t key=arg(0);bool opened=false;std::uint32_t result=0;
+        {
+            GuestScratch scratch(*this,memory,state);
+            if(arg(1)){const auto slot=scratch.allocate(8);memory.store(GuestAddress{slot},bits,0);
+                result=static_cast<std::uint32_t>(nested_service(state,memory,"advapi32.dll",wide?"RegOpenKeyExW":"RegOpenKeyExA",{arg(0),arg(1),0,1,slot}));
+                if(!result){key=memory.load(GuestAddress{slot},bits);opened=true;}}
+            if(!result)result=static_cast<std::uint32_t>(nested_service(state,memory,"shlwapi.dll",wide?"SHQueryValueExW":"SHQueryValueExA",{key,arg(2),0,arg(3),arg(4),arg(5)}));
+            if(opened)(void)nested_service(state,memory,"advapi32.dll","RegCloseKey",{key});
+        }
+        arg.return_to(state,result);return std::nullopt;
+    }
     // SHRegGetUSValue：先查 HKCU（除非要求略過）、再查 HKLM，都沒有才用預設資料；查詢沿用 SHGetValue 的完整語義。
     // 參數放進呼叫框架（x64 的第 5、6 個與 Win32 的堆疊槽都屬於被呼叫端），在狀態副本上執行，不影響真正的返回。
     if(service.symbol=="SHRegGetUSValueA" || service.symbol=="SHRegGetUSValueW"){
@@ -217,6 +232,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     }
     // 僅登錄 API 家族保留原生堆疊讓出 I/O；其他 consumer 在共同入口等待 store 門閂。
     RegistryIoScope io([&](const auto& work){await_registry_io(state,memory,work);});
+    if(service.symbol=="GetCurrentHwProfileA" || service.symbol=="GetCurrentHwProfileW"){
+#include "windows_hardware_profile.inc"
+    }
     if(service.symbol=="NtApphelpCacheControl" || service.symbol=="ZwApphelpCacheControl"){
 #include "windows_apphelp_cache.inc"
     }

@@ -1,5 +1,6 @@
 #pragma once
 #include <unicode/uidna.h>
+#include <unicode/usprep.h>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -47,6 +48,25 @@ inline std::optional<std::u16string> convert(std::u16string_view source,bool asc
             if(label_size>=4 && lower(result[at])==u'x' && lower(result[at+1])==u'n' && result[at+2]==u'-' && result[at+3]==u'-')return {};
             if(end==result.npos)break;at=end+1;
         }
+    }
+    return result;
+}
+// IdnToNameprepUnicode：RFC 3491 nameprep（IDN_ALLOW_UNASSIGNED＝1）；IDN_USE_STD3_ASCII_RULES（2）另檢查各 label 只含字母、數字與不在首尾的連字號。
+inline std::optional<std::u16string> nameprep(std::u16string_view source,std::uint32_t flags){
+    if(source.empty() || source.size()>INT32_MAX)return {};
+    UErrorCode error=U_ZERO_ERROR;std::unique_ptr<UStringPrepProfile,decltype(&usprep_close)> profile(usprep_openByType(USPREP_RFC3491_NAMEPREP,&error),usprep_close);
+    if(U_FAILURE(error) || !profile)return {};
+    const auto options=(flags&1U)?USPREP_ALLOW_UNASSIGNED:USPREP_DEFAULT;
+    error=U_ZERO_ERROR;const auto size=usprep_prepare(profile.get(),source.data(),static_cast<int32_t>(source.size()),nullptr,0,options,nullptr,&error);
+    if(size<0 || (U_FAILURE(error) && error!=U_BUFFER_OVERFLOW_ERROR))return {};
+    std::u16string result(static_cast<std::size_t>(size),0);error=U_ZERO_ERROR;
+    if(size && (usprep_prepare(profile.get(),source.data(),static_cast<int32_t>(source.size()),result.data(),size,options,nullptr,&error)!=size || U_FAILURE(error)))return {};
+    if(result.empty())return {};
+    if(flags&2U)for(std::size_t at=0;at<=result.size();){
+        const auto end=std::min(result.find(u'.',at),result.size());const auto label=std::u16string_view(result).substr(at,end-at);
+        if(!label.empty() && (label.front()==u'-' || label.back()==u'-'))return {};
+        for(const auto c:label)if(!((c>=u'a'&&c<=u'z')||(c>=u'A'&&c<=u'Z')||(c>=u'0'&&c<=u'9')||c==u'-' || c>=0x80))return {};
+        at=end+1;
     }
     return result;
 }

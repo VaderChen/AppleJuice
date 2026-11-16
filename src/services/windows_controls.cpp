@@ -30,6 +30,57 @@ std::span<const WindowsServiceDescriptor> control_service_descriptors(){
         {"comctl32.dll","CreateToolbarEx",13},{"comctl32.dll","CreateStatusWindowA",4},{"comctl32.dll","CreateStatusWindowW",4}
     };return table;
 }
+// ImageList 的單張繪製（ImageList_Draw／DrawEx／DrawIndirect 共用）：ILD_MASK／ILD_IMAGE 對應 DI_MASK／DI_IMAGE；非 ILD_TRANSPARENT 時以
+// 背景色暫存筆刷先填滿；ILD_BLEND25／50 依前景色混合不透明像素。cx／cy 為 0 時取整張，source_x／source_y 是影像內的起點。
+// effect 為 IMAGELISTDRAWPARAMS.fState：ILS_SATURATE 轉灰階、ILS_ALPHA 以 alpha（0～255）整體淡化；ILS_GLOW／ILS_SHADOW 只畫本體。
+// 覆蓋遮罩（INDEXTOOVERLAYMASK，style 位元 8～11）在本體之後以透明方式畫上對應的影像。
+std::uint64_t WindowsServices::draw_image_list(GuestMemory& memory,const GuiImageList& list,std::uint32_t index,std::uint64_t dc,std::int32_t x,std::int32_t y,
+    std::uint32_t cx,std::uint32_t cy,std::uint32_t source_x,std::uint32_t source_y,std::uint32_t background,std::uint32_t foreground,std::uint32_t style,
+    std::uint32_t effect,std::uint32_t alpha){
+    if(index>=list.images.size())return 0;
+    auto icon=list.images[index];
+    // ImageList_Add 只保存 rgba；繪製前與 DrawIconEx 共用同一份 AND 遮罩／色彩平面。
+    if(icon.mask_pixels.empty() || (!icon.monochrome && icon.color_pixels.empty()))finish_icon(icon);
+    auto count=static_cast<std::size_t>(icon.width)*icon.height;
+    if(!icon.animation_sequence.empty() || icon.mask_pixels.size()!=count*(icon.monochrome?2U:1U) || (!icon.monochrome && icon.color_pixels.size()!=count)){last_error_=50;return 0;}
+    if(source_x>=icon.width || source_y>=icon.height)return 0;
+    const unsigned flags=(style&0x10U)?1U:(style&0x20U)?2U:3U;
+    if((style&6U) && !icon.monochrome){
+        const auto tint=foreground==0xff000000U || foreground==0xffffffffU?gui_system_color(13):foreground;const unsigned weight=(style&4U)?128U:64U;
+        for(std::size_t i=0;i<count;++i){if(icon.mask_pixels[i] && !icon.alpha)continue;auto& pixel=icon.color_pixels[i];const auto a=icon.alpha?pixel>>24:255U;std::uint32_t value=pixel&0xff000000U;
+            for(unsigned c=0;c<3;++c){const auto base=(pixel>>(c*8))&255U,target=((tint>>(c*8))&255U)*a/255U;value|=((base*(256U-weight)+target*weight)>>8)<<(c*8);}pixel=value;}
+    }
+    if(!icon.monochrome && (effect&4U))for(auto& pixel:icon.color_pixels){
+        const auto gray=(((pixel>>16)&255U)*77U+((pixel>>8)&255U)*150U+(pixel&255U)*29U)>>8;pixel=(pixel&0xff000000U)|(gray<<16)|(gray<<8)|gray;}
+    if(!icon.monochrome && (effect&8U) && alpha<255){
+        // 預乘 alpha：遮罩影像先轉成透明 0、不透明 255，再整體乘上 alpha。
+        if(!icon.alpha){for(std::size_t i=0;i<count;++i)icon.color_pixels[i]=icon.mask_pixels[i]?0U:(0xff000000U|(icon.color_pixels[i]&0xffffffU));icon.alpha=true;}
+        for(auto& pixel:icon.color_pixels){std::uint32_t value=0;for(unsigned c=0;c<4;++c)value|=(((pixel>>(c*8))&255U)*alpha/255U)<<(c*8);pixel=value;}
+    }
+    const auto width=std::min<std::uint32_t>(cx?cx:icon.width,icon.width-source_x),height=std::min<std::uint32_t>(cy?cy:icon.height,icon.height-source_y);
+    if(width!=icon.width || height!=icon.height){
+        const auto crop=[&](auto& values,unsigned planes){std::remove_reference_t<decltype(values)> out(static_cast<std::size_t>(width)*height*planes);
+            for(unsigned plane=0;plane<planes;++plane)for(std::uint32_t row=0;row<height;++row)for(std::uint32_t column=0;column<width;++column)
+                out[plane*width*height+row*width+column]=values[plane*count+static_cast<std::size_t>(row+source_y)*icon.width+column+source_x];
+            values=std::move(out);};
+        crop(icon.mask_pixels,icon.monochrome?2U:1U);
+        if(!icon.monochrome)crop(icon.color_pixels,1);
+        if(icon.rgba.size()==count)crop(icon.rgba,1);
+        icon.width=width;icon.height=height;icon.image.clear();count=static_cast<std::size_t>(width)*height;
+    }
+    const auto handle=gui_.next_object++;gui_.icons.emplace(handle,std::move(icon));std::uint64_t brush=0;
+    if(flags==3 && !(style&1U) && background!=0xffffffffU){brush=gui_.next_object++;gui_.brushes.emplace(brush,background&0xffffffU);}
+    std::uint64_t result=0;
+    try{result=draw_gui_icon(memory,dc,handle,x,y,width,height,flags,brush)?1:0;}catch(...){gui_.icons.erase(handle);if(brush)gui_.brushes.erase(brush);throw;}
+    gui_.icons.erase(handle);if(brush)gui_.brushes.erase(brush);
+    const auto overlay=(style>>8)&15U;
+    if(result && overlay && flags==3){
+        const auto image=list.overlays[overlay-1];
+        if(image>=0 && static_cast<std::uint32_t>(image)!=index)
+            result=draw_image_list(memory,list,static_cast<std::uint32_t>(image),dc,x,y,cx,cy,source_x,source_y,background,foreground,(style&~0xf00U)|1U,effect,alpha);
+    }
+    return result;
+}
 GuiBitmap decode_dib_bitmap(std::span<const std::uint8_t> bytes){
     const auto integer=[&](std::size_t at,unsigned size){
         if(at>bytes.size() || size>bytes.size()-at)throw HostCallFault("DIB bitmap 資料截斷");
@@ -525,6 +576,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_control_api(GuestState& sta
             result=gui_.next_object++;GuiImageList list;list.width=signed_value(arg(0));list.height=signed_value(arg(1));list.flags=d(2);gui_.image_lists.emplace(result,std::move(list));
         }
     }else if(symbol=="ImageList_Destroy"){
+        // 仍有 IImageList 參照（HIMAGELIST_QueryInterface）時只釋放建立者的參照。
+        const auto com=gui_.image_list_com.find(arg(0));
+        if(com!=gui_.image_list_com.end() && com->second.references>1 && gui_.image_lists.contains(arg(0))){--com->second.references;arg.return_to(state,1);return std::nullopt;}
+        if(com!=gui_.image_list_com.end()){(void)free_heap(memory,com->second.object,state);gui_.image_list_com.erase(com);}
         if(const auto found=gui_.image_lists.find(arg(0));found!=gui_.image_lists.end()){gui_.bitmaps.erase(found->second.image_bitmap);gui_.bitmaps.erase(found->second.mask_bitmap);}
         result=gui_.image_lists.erase(arg(0))?1:0;
         for(const auto& [handle,window]:gui_.windows)if((window.tab && window.tab->image_list==arg(0)) || (window.header && std::find(window.header->image_lists.begin(),window.header->image_lists.end(),arg(0))!=window.header->image_lists.end()) || std::find(window.list_image_lists.begin(),window.list_image_lists.end(),arg(0))!=window.list_image_lists.end())present_gui(handle);
@@ -540,33 +595,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_control_api(GuestState& sta
             else if(symbol=="ImageList_GetBkColor")result=list.background;
             else if(symbol=="ImageList_SetBkColor"){result=list.background;list.background=d(1);}
             else if(symbol=="ImageList_Draw" || symbol=="ImageList_DrawEx"){
-                // ILD_MASK／ILD_IMAGE 對應 DI_MASK／DI_IMAGE；非 ILD_TRANSPARENT 時以背景色暫存筆刷先填滿；ILD_BLEND25/50 依前景色混合不透明像素。
-                // DrawEx 的 dx／dy 是自左上角裁取的繪製範圍，不是縮放。
-                const bool ex=symbol=="ImageList_DrawEx";const auto style=d(ex?9:5);
-                if(d(1)<list.images.size()){
-                    // ImageList_Add 只保存 rgba；繪製前與 DrawIconEx 共用同一份 AND 遮罩／色彩平面。
-                    auto icon=list.images[d(1)];if(icon.mask_pixels.empty() || (!icon.monochrome && icon.color_pixels.empty()))finish_icon(icon);const auto count=static_cast<std::size_t>(icon.width)*icon.height;
-                    if(!icon.animation_sequence.empty() || icon.mask_pixels.size()!=count*(icon.monochrome?2U:1U) || (!icon.monochrome && icon.color_pixels.size()!=count))last_error_=50;
-                    else {
-                        const auto background=!ex || d(7)==0xff000000U?list.background:d(7),foreground=ex?d(8):0xff000000U;
-                        const unsigned flags=(style&0x10U)?1U:(style&0x20U)?2U:3U;
-                        if((style&6U) && !icon.monochrome){
-                            const auto tint=foreground==0xff000000U || foreground==0xffffffffU?gui_system_color(13):foreground;const unsigned weight=(style&4U)?128U:64U;
-                            for(std::size_t i=0;i<count;++i){if(icon.mask_pixels[i] && !icon.alpha)continue;auto& pixel=icon.color_pixels[i];const auto alpha=icon.alpha?pixel>>24:255U;std::uint32_t value=pixel&0xff000000U;
-                                for(unsigned c=0;c<3;++c){const auto base=(pixel>>(c*8))&255U,target=((tint>>(c*8))&255U)*alpha/255U;value|=((base*(256U-weight)+target*weight)>>8)<<(c*8);}pixel=value;}
-                        }
-                        const auto width=ex && d(5)?std::min<std::uint32_t>(d(5),icon.width):icon.width,height=ex && d(6)?std::min<std::uint32_t>(d(6),icon.height):icon.height;
-                        if(width!=icon.width || height!=icon.height){
-                            const auto crop=[&](auto& values,unsigned planes){std::remove_reference_t<decltype(values)> out(static_cast<std::size_t>(width)*height*planes);
-                                for(unsigned plane=0;plane<planes;++plane)for(std::uint32_t y=0;y<height;++y)for(std::uint32_t x=0;x<width;++x)out[plane*width*height+y*width+x]=values[plane*count+static_cast<std::size_t>(y)*icon.width+x];values=std::move(out);};
-                            crop(icon.mask_pixels,icon.monochrome?2U:1U);if(!icon.monochrome)crop(icon.color_pixels,1);if(icon.rgba.size()==count)crop(icon.rgba,1);icon.width=width;icon.height=height;icon.image.clear();
-                        }
-                        const auto handle=gui_.next_object++;gui_.icons.emplace(handle,std::move(icon));std::uint64_t brush=0;
-                        if(flags==3 && !(style&1U) && background!=0xffffffffU){brush=gui_.next_object++;gui_.brushes.emplace(brush,background&0xffffffU);}
-                        try{result=draw_gui_icon(memory,arg(2),handle,signed_value(arg(3)),signed_value(arg(4)),width,height,flags,brush)?1:0;}catch(...){gui_.icons.erase(handle);if(brush)gui_.brushes.erase(brush);throw;}
-                        gui_.icons.erase(handle);if(brush)gui_.brushes.erase(brush);
-                    }
-                }
+                // DrawEx 的 dx／dy 是自左上角裁取的繪製範圍，不是縮放；CLR_DEFAULT 背景沿用清單背景色。
+                const bool ex=symbol=="ImageList_DrawEx";
+                const auto background=!ex || d(7)==0xff000000U?list.background:d(7),foreground=ex?d(8):0xff000000U;
+                result=draw_image_list(memory,list,d(1),arg(2),signed_value(arg(3)),signed_value(arg(4)),ex?d(5):0,ex?d(6):0,0,0,background,foreground,d(ex?9:5));
             }else if(symbol=="ImageList_GetImageInfo"){
                 // comctl32 v6 以每列 4 格排列內部條帶；hbmMask 僅在 ILC_MASK 清單存在。
                 if(arg(2) && d(1)<list.images.size()){
@@ -619,15 +651,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_control_api(GuestState& sta
             window.class_name=toolbar?u"toolbarwindow32":u"msctls_statusbar32";window.control_class=window.class_name;window.procedure=stock_gui_proc(window.class_name,!toolbar && symbol.ends_with('W'));window.width=owner->second.width;window.height=toolbar?28:22;window.y=toolbar?0:static_cast<std::int32_t>(owner->second.height)-22;window.visible=(window.style&0x10000000U)!=0;
             if(toolbar){
                 window.style|=0x40000000U;
-                if(d(12)!=abi.toolbar_size || d(7)>4096 || (d(7) && !arg(6))){last_error_=87;arg.return_to(state,0);return std::nullopt;}
-                window.toolbar_struct_size=abi.toolbar_size;window.toolbar_requested_width=d(8);window.toolbar_requested_height=d(9);window.toolbar_button_width=d(8)?d(8):28;window.toolbar_button_height=d(9)?d(9):26;
+                // dwStructSize 可為 TBBUTTON 或舊版 OLDTBBUTTON（12 bytes，CreateToolbar 使用；沒有 dwData／iString）。
+                const auto stride=d(12);const bool old_buttons=stride==12;
+                if((stride!=abi.toolbar_size && !old_buttons) || d(7)>4096 || (d(7) && !arg(6))){last_error_=87;arg.return_to(state,0);return std::nullopt;}
+                window.toolbar_struct_size=stride;window.toolbar_requested_width=d(8);window.toolbar_requested_height=d(9);window.toolbar_button_width=d(8)?d(8):28;window.toolbar_button_height=d(9)?d(9):26;
                 window.toolbar_bitmap_width=d(10)?d(10):16;window.toolbar_bitmap_height=d(11)?d(11):16;
                 window.height=window.toolbar_button_height+4;
-                if(arg(6))memory.check(GuestAddress{arg(6)},static_cast<std::size_t>(d(7))*abi.toolbar_size,Access::Read);
+                if(arg(6))memory.check(GuestAddress{arg(6)},static_cast<std::size_t>(d(7))*stride,Access::Read);
                 for(std::uint32_t i=0;i<d(7);++i){
-                    const auto at=arg(6)+i*abi.toolbar_size;GuiToolbarButton button;button.image=signed_value(memory.load(GuestAddress{at},32));button.command=signed_value(memory.load(GuestAddress{at+4},32));
-                    button.state=static_cast<std::uint8_t>(memory.load(GuestAddress{at+8},8));button.style=static_cast<std::uint8_t>(memory.load(GuestAddress{at+9},8));button.data=memory.load(GuestAddress{at+abi.toolbar_data},abi.bits);
-                    const auto text=memory.load(GuestAddress{at+abi.toolbar_string},abi.bits);button.string_value=text;if(text>65535 && text!=(x86_?UINT32_MAX:UINT64_MAX))button.text=utf8_to_utf16_lossy(read_ansi(memory,text));window.toolbar_buttons.push_back(std::move(button));
+                    const auto at=arg(6)+i*stride;GuiToolbarButton button;button.image=signed_value(memory.load(GuestAddress{at},32));button.command=signed_value(memory.load(GuestAddress{at+4},32));
+                    button.state=static_cast<std::uint8_t>(memory.load(GuestAddress{at+8},8));button.style=static_cast<std::uint8_t>(memory.load(GuestAddress{at+9},8));button.data=old_buttons?0:memory.load(GuestAddress{at+abi.toolbar_data},abi.bits);
+                    const auto text=old_buttons?0:memory.load(GuestAddress{at+abi.toolbar_string},abi.bits);button.string_value=text;if(text>65535 && text!=(x86_?UINT32_MAX:UINT64_MAX))button.text=utf8_to_utf16_lossy(read_ansi(memory,text));window.toolbar_buttons.push_back(std::move(button));
                 }
                 std::optional<GuiBitmap> bitmap;
                 if(arg(5) && arg(4)!=(x86_?UINT32_MAX:UINT64_MAX)){
@@ -1273,18 +1307,45 @@ std::optional<std::uint64_t> WindowsServices::gui_control_message(GuestMemory& m
         const auto is=[&](unsigned list,unsigned cb){return m==(combo?cb:list);};
         const auto index=static_cast<std::size_t>(wp);const auto count=w.items.size();
         if(is(0x184,0x14b)){w.items.clear();w.selection=-1;if(combo)w.title.clear();return update(0);}
-        if(is(0x180,0x143) || is(0x181,0x14a)){
-            if(count>=65536)return UINT64_MAX;
-            GuiItem item;item.handle=gui_.next_item++;if(strings)item.text=read(lp);else item.data=lp;
-            const bool append=is(0x180,0x143);std::size_t at=append?count:std::min(index,count);
+        // LB_ADDSTRING／LB_INSERTSTRING 與 LB_DIR 共用：排序樣式的附加依字串排序插入，並維持目前選取。
+        const auto insert=[&](GuiItem item,bool append,std::size_t position){
+            std::size_t at=append?w.items.size():std::min(position,w.items.size());
             if(append && strings && (w.style&(combo?0x100U:2U)))at=static_cast<std::size_t>(std::lower_bound(w.items.begin(),w.items.end(),item.text,[](const auto& a,const auto& b){return a.text<b;})-w.items.begin());
             w.items.insert(w.items.begin()+static_cast<std::ptrdiff_t>(at),std::move(item));
             if(w.selection>=static_cast<std::int32_t>(at))++w.selection;
             if(multiple && w.selection<0)w.selection=0;
-            return update(at);
+            return at;
+        };
+        if(is(0x180,0x143) || is(0x181,0x14a)){
+            if(count>=65536)return UINT64_MAX;
+            GuiItem item;item.handle=gui_.next_item++;if(strings)item.text=read(lp);else item.data=lp;
+            return update(insert(std::move(item),is(0x180,0x143),index));
+        }
+        if(is(0x18d,0x145)){
+            // LB_DIR／CB_DIR：依 DDL_* 屬性加入符合樣式的檔案、「[目錄]」與「[-x-]」磁碟機，回傳最後加入項目的索引；沒有加入任何項目為 LB_ERR。
+            // DDL_READONLY 1、HIDDEN 2、SYSTEM 4、DIRECTORY 0x10、ARCHIVE 0x20、POSTMSGS 0x2000、DRIVES 0x4000、EXCLUSIVE 0x8000；預設（DDL_READWRITE）列出一般檔案。
+            const auto attributes=static_cast<std::uint32_t>(wp);auto spec=read(lp);if(spec.empty())spec=u"*.*";
+            const bool exclusive=attributes&0x8000U;const auto requested=attributes&0x37U;
+            std::vector<std::u16string> names;
+            if(!(exclusive && (attributes&0x4000U) && !requested)){   // 只排他地要磁碟機時不列檔案
+                auto [error,search]=search_directory(utf16_to_utf8(spec));
+                if(!error)for(const auto& entry:search.entries){
+                    const auto name=utf8_to_utf16(entry.name);const auto a=entry.metadata.attributes;
+                    if(name==u".")continue;
+                    if(a&0x10U){if((attributes&0x10U) && !((a&0x6U)&~requested))names.push_back(u"["+name+u"]");continue;}
+                    const bool include=exclusive?((a&requested&0x27U)!=0 || (!(requested&0x27U) && !(a&0x7U) && !(attributes&0x10U))):!((a&0x7U)&~requested);
+                    if(include)names.push_back(name);
+                }
+            }
+            if(attributes&0x4000U)for(char letter='A';letter<='Z';++letter)if(!filesystem_.information(std::string(1,letter)+":/").error)names.push_back(u"[-"+std::u16string(1,static_cast<char16_t>(letter-'A'+'a'))+u"-]");
+            if(w.items.size()+names.size()>65536)return static_cast<std::uint64_t>(-2);   // LB_ERRSPACE
+            std::optional<std::size_t> last;
+            for(auto& name:names){GuiItem item;item.handle=gui_.next_item++;item.text=std::move(name);last=insert(std::move(item),true,0);}
+            return last?update(*last):std::optional<std::uint64_t>{UINT64_MAX};
         }
         if(is(0x182,0x144)){if(index>=count)return UINT64_MAX;w.items.erase(w.items.begin()+static_cast<std::ptrdiff_t>(index));if(w.selection==static_cast<std::int32_t>(wp)){w.selection=multiple && count>1?static_cast<std::int32_t>(std::min(index,count-2)):-1;if(combo)w.title.clear();}else if(w.selection>static_cast<std::int32_t>(wp))--w.selection;return update(count-1);}
         if(is(0x18b,0x146))return count;
+        if(!combo && m==0x1b2)return std::max<std::uint64_t>(1,w.height/16); // LB_GETLISTBOXINFO：每欄可見的項目數（列高 16）
         if(is(0x188,0x147))return static_cast<std::uint64_t>(static_cast<std::int64_t>(w.selection));
         if(is(0x186,0x14e)){if(multiple)return UINT64_MAX;w.selection=index<count?static_cast<std::int32_t>(wp):-1;if(combo)w.title=w.selection>=0?w.items[index].text:std::u16string{};return update(static_cast<std::uint64_t>(static_cast<std::int64_t>(w.selection)));}
         if(is(0x18a,0x149))return index<count?(strings?(wide?w.items[index].text.size():utf16_to_utf8(w.items[index].text).size()):abi.unit):UINT64_MAX;

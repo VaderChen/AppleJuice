@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/native_console.hpp"
+#include "windows_console_encoding.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -31,7 +32,7 @@ std::string attributes(std::uint16_t value){
     return "\x1b[0;"+std::to_string(foreground)+";"+std::to_string(background)+
         ((value&0x4000)?";7":"")+((value&0x8000)?";4":"")+"m";
 }
-std::vector<ConsoleRecord> converted(std::deque<ConsoleRecord>& records,std::deque<ConsoleRecord>& pending,bool wide,std::size_t count){
+std::vector<ConsoleRecord> converted(std::deque<ConsoleRecord>& records,std::deque<ConsoleRecord>& pending,bool wide,std::size_t count,std::uint32_t page){
     std::vector<ConsoleRecord> result;result.reserve(std::min(count,records.size()));
     while(!pending.empty() && result.size()<count){result.push_back(pending.front());pending.pop_front();}
     while(!records.empty() && result.size()<count){
@@ -44,7 +45,7 @@ std::vector<ConsoleRecord> converted(std::deque<ConsoleRecord>& records,std::deq
                console_field(next,4)==console_field(record,4) && console_field(next,10,2)==console_field(record,10,2) &&
                console_field(next,16)==console_field(record,16)){text+=static_cast<char16_t>(low);records.pop_front();}
         }
-        std::string bytes;try{bytes=utf16_to_utf8(text);}catch(const std::invalid_argument&){bytes="\xef\xbf\xbd";}
+        const auto bytes=console_encode(text,page);
         for(auto byte:bytes){auto item=record;set_console_field(item,14,static_cast<unsigned char>(byte),2);
             if(result.size()<count)result.push_back(item);else pending.push_back(item);}
     }return result;
@@ -64,9 +65,10 @@ std::span<const WindowsServiceDescriptor> console_service_descriptors(){
         {"kernel32.dll","FillConsoleOutputAttribute",5},{"kernel32.dll","FillConsoleOutputCharacterA",5},{"kernel32.dll","FillConsoleOutputCharacterW",5},
         {"kernel32.dll","GetConsoleCursorInfo",2},{"kernel32.dll","SetConsoleCursorInfo",2},{"kernel32.dll","SetConsoleCursorPosition",2},
         {"kernel32.dll","SetConsoleTextAttribute",2},{"kernel32.dll","GetConsoleDisplayMode",1},
-        {"kernel32.dll","GetConsoleTitleA",2},{"kernel32.dll","GetConsoleTitleW",2},{"kernel32.dll","SetConsoleTitleA",1},{"kernel32.dll","SetConsoleTitleW",1},
+        {"kernel32.dll","GetConsoleTitleA",2},{"kernel32.dll","GetConsoleTitleW",2},{"kernel32.dll","GetConsoleOriginalTitleA",2},{"kernel32.dll","GetConsoleOriginalTitleW",2},{"kernel32.dll","SetConsoleTitleA",1},{"kernel32.dll","SetConsoleTitleW",1},
         {"kernel32.dll","FlushConsoleInputBuffer",1},{"kernel32.dll","GetNumberOfConsoleInputEvents",2},
         {"kernel32.dll","ReadConsoleInputA",4},{"kernel32.dll","ReadConsoleInputW",4},
+        {"kernel32.dll","ReadConsoleInputExA",5,0,0,0x14},{"kernel32.dll","ReadConsoleInputExW",5,0,0,0x14},
         {"kernel32.dll","WriteConsoleInputA",4},{"kernel32.dll","WriteConsoleInputW",4},
         {"kernel32.dll","PeekConsoleInputA",4},{"kernel32.dll","PeekConsoleInputW",4},
         {"kernel32.dll","ReadConsoleOutputCharacterA",5},{"kernel32.dll","ReadConsoleOutputCharacterW",5},{"kernel32.dll","ReadConsoleOutputAttribute",5}
@@ -158,6 +160,7 @@ bool WindowsServices::console_text_ready(bool line,int timeout){
                 continue;
             }
             if(editing && (c==u'\r' || c==u'\n')){
+                console_remember_command(buffer,console_input_exe(),buffer.edited_line);
                 buffer.edited_line+=u"\r\n";available=std::move(buffer.edited_line);buffer.edited_line.clear();
                 if(buffer.input_mode&4)(void)write_standard_output(1,std::array<std::uint8_t,2>{13,10});
                 if(repeats){set_console_field(record,8,repeats,2);buffer.records.push_front(record);}break;
@@ -169,7 +172,7 @@ bool WindowsServices::console_text_ready(bool line,int timeout){
                 std::string bytes;try{bytes=utf16_to_utf8(buffer.echo_input);}catch(const std::invalid_argument&){
                     for(auto unit:buffer.echo_input)bytes+=unit>=0xd800 && unit<=0xdfff?"\xef\xbf\xbd":utf16_to_utf8(std::u16string(1,unit));
                 }
-                buffer.echo_input.clear();(void)write_standard_output(1,std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()),bytes.size()));
+                buffer.echo_input.clear();(void)write_standard_output(1,std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()),bytes.size()),false,true);
             }
         }
         if(editing && (!available.empty() || buffer.eof))break;
@@ -184,12 +187,17 @@ bool WindowsServices::console_text_ready(bool line,int timeout){
     }
     live_input_eof_=buffer.eof;return !input.bytes.empty() || buffer.eof;
 }
+// 終端模式下送出不經螢幕模型的控制序列（例如 OSC 4 調色盤）。
+std::uint32_t WindowsServices::console_terminal_write(unsigned stream,std::string_view text){
+    if(stream>=3 || !consoles_[stream])return 6;
+    return terminal_write(consoles_[stream]->descriptor,text);
+}
 std::uint32_t WindowsServices::console_sync(unsigned stream,std::size_t start,std::size_t count){
     if(stream>=3 || !consoles_[stream])return 6;auto& endpoint=*consoles_[stream];auto& buffer=*endpoint.buffer;
     if(buffer.window){
         if(buffer.window->closed())return 109;if(!buffer.window->update(buffer))return 5;
         if(buffer.window_handle && gui_.windows.contains(buffer.window_handle)){
-            auto& model=gui_.windows.at(buffer.window_handle);model.width=buffer.view_columns*9U;model.height=buffer.view_rows*18U;model.title=buffer.title;
+            auto& model=gui_.windows.at(buffer.window_handle);model.width=static_cast<std::uint32_t>(buffer.view_columns)*buffer.font_width;model.height=static_cast<std::uint32_t>(buffer.view_rows)*buffer.font_height;model.title=buffer.title;
             present_gui(buffer.window_handle);
         }
         return 0;
@@ -232,7 +240,7 @@ std::uint32_t WindowsServices::write_crt_console(std::u16string_view units,bool 
             else complete+=value>=0xdc00 && value<=0xdfff?u'\ufffd':value;
         }
         text=utf16_to_utf8(complete);
-    }else {text.reserve(units.size());for(const auto value:units)text+=static_cast<char>(static_cast<std::uint8_t>(value));}
+    }else {text.reserve(units.size());for(const auto value:units)text+=static_cast<char>(static_cast<std::uint8_t>(value));text=console_output_text(screen,text);}
     if(text.empty())return 0;
     if(screen.window){if(screen.window->closed())return 109;screen.write(text);return screen.window->update(screen)?0:5;}
     const auto error=terminal_write(endpoint->descriptor,text);if(!error)screen.write(text);return error;
@@ -260,7 +268,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
         const auto character=static_cast<char16_t>(value);return write_crt_console({&character,1},wide);
     };
     try{
-        if(name=="_ungetch" || name=="_ungetwch"){
+        if(name=="GetConsoleCP" || name=="GetConsoleOutputCP" || name=="SetConsoleCP" || name=="SetConsoleOutputCP"){
+            if(!attached)fail(6);
+            else {const bool output=name.find("Output")!=name.npos;
+                if(name.starts_with("Get"))result=output?(*current)->buffer->output_codepage:(*current)->buffer->input_codepage;
+                else if(!d(0) || !windows_crt_codepage(d(0)))fail(87);
+                else {for(const auto& endpoint:consoles_)if(endpoint){auto& buffer=*endpoint->buffer;
+                        if(output)buffer.output_codepage=d(0);else buffer.input_codepage=d(0);}
+                    result=1;}
+            }
+        }else if(name=="_ungetch" || name=="_ungetwch"){
             const bool wide=name=="_ungetwch";const auto value=wide?static_cast<std::uint32_t>(static_cast<std::uint16_t>(arg(0))):d(0);
             result=wide?0xffffU:UINT32_MAX;
             if(wide){if(value!=0xffffU && !runtime_.conio_wide_pushback){runtime_.conio_wide_pushback=static_cast<std::uint16_t>(value);result=value;}}
@@ -283,7 +300,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
                 else{
                     auto& pending=wide?buffer.conio_units:buffer.conio_bytes;
                     while(pending.empty() && (!buffer.ansi_records.empty() || !buffer.records.empty())){
-                        auto records=converted(buffer.records,buffer.ansi_records,wide,1);const auto& r=records.front();if(!key(r))continue;
+                        auto records=converted(buffer.records,buffer.ansi_records,wide,1,buffer.input_codepage);const auto& r=records.front();if(!key(r))continue;
                         const auto count=console_field(r,8,2),character=console_field(r,14,wide?2:1),scan=console_field(r,12,2);
                         for(unsigned i=0;i<count;++i){if(character)pending.push_back({static_cast<std::uint16_t>(character),true});else{pending.push_back({static_cast<std::uint16_t>((console_field(r,16)&0x100)?0xe0:0),false});pending.push_back({static_cast<std::uint16_t>(scan),false});}}
                     }
@@ -301,7 +318,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
                         if(screen.window && !native_gui_ && gui_.windows.empty())enable_native_gui({});
                         GuiWindow model;model.console=(*current)->buffer;model.class_name=u"ConsoleWindowClass";model.title=screen.title;
                         model.thread=threads_.current;model.desktop_object=thread_desktop_object(model.thread);model.dpi_context=effective_dpi_context();
-                        model.procedure=resolve("user32.dll","DefWindowProcW").value;model.width=screen.view_columns*9U;model.height=screen.view_rows*18U;
+                        model.procedure=resolve("user32.dll","DefWindowProcW").value;model.width=static_cast<std::uint32_t>(screen.view_columns)*screen.font_width;model.height=static_cast<std::uint32_t>(screen.view_rows)*screen.font_height;
                         model.x=model.y=120;model.visible=screen.window!=nullptr;model.style=model.visible?0x10cf0000U:0;
                         if(!screen.window)model.parent=gui_message_parent;
                         const auto handle=allocate_gui_window();gui_.windows.emplace(handle,model);gui_.z_order.insert(gui_.z_order.begin(),handle);
@@ -318,9 +335,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
                 return 0xc0000409U;
             }
             // _cputws 先驗證整個字串，無效 UTF-16 回 EILSEQ；不消耗 _putwch 的跨呼叫 surrogate 狀態。
-            const auto encoded=name=="_cputws"?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
-            std::u16string text;for(const auto c:encoded)text+=static_cast<unsigned char>(c);
-            const auto error=write_crt_console(text,false);
+            const bool wide=name=="_cputws";std::u16string text;
+            if(wide){text=read_utf16(memory,GuestAddress{arg(0)});(void)utf16_to_utf8(text);}
+            else for(const auto c:read_ansi(memory,arg(0)))text+=static_cast<unsigned char>(c);
+            const auto error=write_crt_console(text,wide);
             if(error){memory.store(GuestAddress{runtime_.errno_cell},32,error==109?32:9);result=UINT64_MAX;}
         }else if(name=="AllocConsole"){
             if(attached)fail(5);else if(!runtime_.network.external_io)fail(50);
@@ -359,12 +377,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
             runtime_.console_input.clear();runtime_.standard_input.bytes.clear();runtime_.standard_input.position=0;
             runtime_.console_handlers.clear();runtime_.ignore_ctrl_c=false;live_input_eof_=true;result=1;
             publish_console_identity(false);
-        }else if(name.starts_with("GetConsoleTitle") || name.starts_with("SetConsoleTitle") || name=="GetConsoleDisplayMode"){
+        }else if(name.starts_with("GetConsoleTitle") || name.starts_with("GetConsoleOriginalTitle") || name.starts_with("SetConsoleTitle") || name=="GetConsoleDisplayMode"){
             if(!attached)fail(6);else {
                 const auto stream=static_cast<unsigned>(current-consoles_.begin());auto& buffer=*(*current)->buffer;
                 if(name=="GetConsoleDisplayMode"){if(!arg(0))fail(87);else {if(buffer.window)buffer.fullscreen=buffer.window->fullscreen();memory.store(GuestAddress{arg(0)},32,buffer.fullscreen?1:0);result=1;}}
                 else if(name.starts_with("Set")){if(!arg(0))fail(87);else {
-                    auto title=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},65536):utf8_to_utf16_lossy(read_ansi(memory,arg(0),65536));
+                    auto title=name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},65536):console_decode(read_ansi(memory,arg(0),65536),buffer.output_codepage);
                     buffer.title=std::move(title);std::uint32_t error=0;
                     if(buffer.window)error=console_sync(stream);
                     else {auto text=utf16_to_utf8(buffer.title);for(auto& c:text)if(c==7 || c==27 || c==0)c=' ';error=terminal_write((*current)->descriptor,"\x1b]0;"+text+"\x07");}
@@ -372,9 +390,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
                 }}else {
                     const auto count=d(1);const bool wide=name.ends_with('W');
                     if(!arg(0) || !count || count>65536)fail(87);
-                    else {const auto title=wide?std::string{}:utf16_to_utf8(buffer.title);const auto length=wide?buffer.title.size():title.size();
+                    // GetConsoleOriginalTitle 回傳主控台建立時的標題，其餘語義與 GetConsoleTitle 相同。
+                    else {const auto& source=name.starts_with("GetConsoleOriginalTitle")?buffer.original_title:buffer.title;
+                        const auto title=wide?std::string{}:console_encode(source,buffer.output_codepage);const auto length=wide?source.size():title.size();
                         const auto copied=std::min<std::size_t>(count-1,length);memory.check(GuestAddress{arg(0)},(copied+1)*(wide?2U:1U),Access::Write);
-                        if(wide){for(std::size_t i=0;i<copied;++i)memory.store(GuestAddress{arg(0)+2*i},16,buffer.title[i]);memory.store(GuestAddress{arg(0)+2*copied},16,0);}
+                        if(wide){for(std::size_t i=0;i<copied;++i)memory.store(GuestAddress{arg(0)+2*i},16,source[i]);memory.store(GuestAddress{arg(0)+2*copied},16,0);}
                         else {memory.write(GuestAddress{arg(0)},std::span(reinterpret_cast<const std::uint8_t*>(title.data()),copied));memory.store(GuestAddress{arg(0)+copied},8,0);}result=length;
                     }
                 }
@@ -389,14 +409,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
 #if !defined(_WIN32)
                     if(consoles_[0]->descriptor>=0 && ::tcflush(consoles_[0]->descriptor,TCIFLUSH)){fail(6);arg.return_to(state,result);return std::nullopt;}
 #endif
-                    if(buffer.window)(void)buffer.window->poll(0);buffer.records.clear();buffer.ansi_records.clear();buffer.terminal_input.clear();buffer.edited_line.clear();buffer.echo_input.clear();
+                    if(buffer.window)(void)buffer.window->poll(0);buffer.records.clear();buffer.ansi_records.clear();buffer.ansi_input_records.clear();buffer.terminal_input.clear();buffer.edited_line.clear();buffer.echo_input.clear();
                     runtime_.console_input.clear();runtime_.standard_input.bytes.clear();runtime_.standard_input.position=0;result=1;
                 }
             }else if(name=="GetNumberOfConsoleInputEvents"){
                 if(stream)fail(6);else if(!arg(1))fail(87);else {memory.check(GuestAddress{arg(1)},4,Access::Write);(void)console_input_ready(arg(0));memory.store(GuestAddress{arg(1)},32,buffer.records.size()+buffer.ansi_records.size());result=1;}
             }else if(name.find("ConsoleInput")!=name.npos){
-                const auto count=d(2);const bool writing=name.starts_with("Write"),peek=name.starts_with("Peek"),wide=name.ends_with('W');
-                if(!arg(3) || (count && !arg(1)) || (!count && !writing))fail(87);
+                const auto count=d(2);const bool extended=name.starts_with("ReadConsoleInputEx");const std::uint32_t flags=extended?d(4):0U;
+                const bool writing=name.starts_with("Write"),peek=name.starts_with("Peek") || (flags&1U),nowait=(flags&2U)!=0,wide=name.ends_with('W');
+                if(!arg(3) || (count && !arg(1)) || (!count && !writing) || (flags&~3U))fail(87);
                 else if(count>65536)fail(8);
                 else {
                     memory.check(GuestAddress{arg(3)},4,Access::Write);
@@ -405,18 +426,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
                         else {memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(count)*20,Access::Read);std::vector<ConsoleRecord> records(count);
                             for(unsigned i=0;i<count;++i){memory.read(GuestAddress{arg(1)+20ULL*i},records[i]);const auto type=console_field(records[i],0,2);
                                 if(type!=1 && type!=2 && type!=4 && type!=8 && type!=16){fail(87);arg.return_to(state,result);return std::nullopt;}
-                                if(!wide && type==1){const auto byte=console_field(records[i],14,1);if(byte>=128){fail(1113);arg.return_to(state,result);return std::nullopt;}set_console_field(records[i],14,byte,2);}
                             }
-                            buffer.records.insert(buffer.records.end(),records.begin(),records.end());memory.store(GuestAddress{arg(3)},32,count);result=1;
+                            if(wide)buffer.records.insert(buffer.records.end(),records.begin(),records.end());else console_decode_input(buffer,records);memory.store(GuestAddress{arg(3)},32,count);result=1;
                         }
                     }else {
                         (void)console_input_ready(arg(0));
-                        if(!peek && buffer.records.empty() && buffer.ansi_records.empty() && !buffer.eof){
+                        if(!peek && !nowait && buffer.records.empty() && buffer.ansi_records.empty() && !buffer.eof){
                             auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::ConsoleInput;thread.wait.handles={arg(0)};
                             schedule(state,memory);return std::nullopt;
                         }
                         if(!peek && buffer.eof && buffer.records.empty() && buffer.ansi_records.empty())fail(109);
-                        else {auto remaining=buffer.records,pending=buffer.ansi_records;const auto records=converted(remaining,pending,wide,count);
+                        else {auto remaining=buffer.records,pending=buffer.ansi_records;const auto records=converted(remaining,pending,wide,count,buffer.input_codepage);
                             memory.check(GuestAddress{arg(1)},records.size()*20,Access::Write);
                             for(std::size_t i=0;i<records.size();++i)memory.write(GuestAddress{arg(1)+20*i},records[i]);
                             memory.store(GuestAddress{arg(3)},32,records.size());if(!peek){buffer.records=std::move(remaining);buffer.ansi_records=std::move(pending);}
@@ -468,26 +488,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_console_control(GuestState&
             }else if(name=="SetConsoleTextAttribute"){
                 buffer.attributes=static_cast<std::uint16_t>(d(1));const auto error=console_sync(stream);if(error)fail(error);else result=1;
             }else if(name=="GetConsoleScreenBufferInfo"){
-                if(!arg(1))fail(87);else {memory.check(GuestAddress{arg(1)},22,Access::Write);memory.write(GuestAddress{arg(1)},std::vector<std::uint8_t>(22));
-                    const auto maximum=buffer.window?buffer.window->maximum_size():std::array<std::uint16_t,2>{buffer.view_columns,buffer.view_rows};
-                    for(const auto [offset,value]:std::array<std::pair<unsigned,unsigned>,11>{{{0,buffer.columns},{2,buffer.rows},{4,buffer.x},{6,buffer.y},{8,buffer.attributes},{10,buffer.left},{12,buffer.top},{14,buffer.left+buffer.view_columns-1U},{16,buffer.top+buffer.view_rows-1U},{18,std::min(maximum[0],buffer.columns)},{20,std::min(maximum[1],buffer.rows)}}}){
-                        memory.store(GuestAddress{arg(1)+offset},16,value);
-                    }result=1;
-                }
+                if(!arg(1))fail(87);else {console_write_screen_info(memory,arg(1),buffer);result=1;}
             }else {
                 const bool fill=name.starts_with("Fill"),attribute=name.ends_with("Attribute"),wide=name.ends_with('W');
                 const auto coord=d(3);const auto x=static_cast<std::int16_t>(coord),y=static_cast<std::int16_t>(coord>>16);
                 if(!arg(4) || (!fill && d(2) && !arg(1)) || x<0 || y<0 || x>=buffer.columns || y>=buffer.rows)fail(87);
                 else {memory.check(GuestAddress{arg(4)},4,Access::Write);const auto start=static_cast<std::size_t>(y)*buffer.columns+static_cast<unsigned>(x),count=std::min<std::size_t>(d(2),buffer.cells.size()-start);
-                    if(fill){const auto character=static_cast<char16_t>(wide?d(1)&0xffffU:d(1)&0xffU);
-                        if(!wide && !attribute && character>=128)fail(1113);
-                        else {for(auto i=start;i<start+count;++i){if(attribute)buffer.cells[i].attributes=static_cast<std::uint16_t>(d(1));else buffer.cells[i].character=character;}
+                    if(fill){auto character=static_cast<char16_t>(wide?d(1)&0xffffU:d(1)&0xffU);
+                        if(!wide && !attribute){const char byte=static_cast<char>(character);const auto decoded=console_decode({&byte,1},buffer.output_codepage);character=decoded.empty()?u' ' :decoded.front();}
+                        {for(auto i=start;i<start+count;++i){if(attribute)buffer.cells[i].attributes=static_cast<std::uint16_t>(d(1));else buffer.cells[i].character=character;}
                             const auto error=console_sync(stream,start,count);if(error)fail(error);else {memory.store(GuestAddress{arg(4)},32,count);result=1;}
                         }
                     }else {
                         const unsigned unit=attribute || wide?2:1;memory.check(GuestAddress{arg(1)},count*unit,Access::Write);
-                        if(!wide && !attribute && std::any_of(buffer.cells.begin()+static_cast<std::ptrdiff_t>(start),buffer.cells.begin()+static_cast<std::ptrdiff_t>(start+count),[](const auto& cell){return cell.character>=128;}))fail(1113);
-                        else {for(std::size_t i=0;i<count;++i)memory.store(GuestAddress{arg(1)+i*unit},static_cast<std::uint8_t>(unit*8),attribute?buffer.cells[start+i].attributes:buffer.cells[start+i].character);
+                        if(!wide && !attribute){std::u16string text;for(std::size_t i=0;i<count;++i)text+=buffer.cells[start+i].character;
+                            auto bytes=console_encode(text,buffer.output_codepage);bytes.resize(std::min(bytes.size(),count));
+                            memory.write(GuestAddress{arg(1)},std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()),bytes.size()));memory.store(GuestAddress{arg(4)},32,bytes.size());result=1;
+                        }else {for(std::size_t i=0;i<count;++i)memory.store(GuestAddress{arg(1)+i*unit},static_cast<std::uint8_t>(unit*8),attribute?buffer.cells[start+i].attributes:buffer.cells[start+i].character);
                             memory.store(GuestAddress{arg(4)},32,count);result=1;}
                     }
                 }

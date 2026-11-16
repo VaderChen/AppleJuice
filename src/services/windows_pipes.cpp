@@ -241,8 +241,14 @@ void WindowsServices::set_file_io_signaled(std::uint64_t handle, bool signaled) 
 }
 std::optional<std::uint64_t> WindowsServices::file_io_poll_deadline(const SharedWake* wake) const {
     auto deadline=UINT64_MAX;
+    // 目錄變更（ReadDirectoryChangesW）由 poll_file_io 依宿主監看結果完成，沒有即時性要求：有共用喚醒時最多 50 ms
+    // 核對一次，不讓整個程序退回每 1 ms 短輪詢。X64ARM_LAZY_EXTERNAL_WAIT=0 恢復短輪詢。
+    static const bool lazy_directory=[] {const auto* value=std::getenv("X64ARM_LAZY_EXTERNAL_WAIT");return !value || std::string_view(value)!="0";}();
     for(const auto& io:pending_file_io_){
         if(io.done)continue;
+        if(lazy_directory && wake && runtime_.host_clock && io.kind==PendingFileIo::Kind::Directory && io.attempted && io.result.pending && !io.result.error){
+            deadline=std::min(deadline,runtime_.clock_ticks+UINT64_C(500000));continue;
+        }
         const auto file=files_.find(io.handle);
         if(!wake || !io.attempted || !io.result.pending || io.result.error || !io.pipe_poll_deadline ||
            io.flush || io.serial || io.hid || io.kind==PendingFileIo::Kind::Lock || io.kind==PendingFileIo::Kind::Directory ||
@@ -584,9 +590,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_file(GuestState& ent
             const auto done=[&](std::uint32_t value){call.return_to(state,value);return std::optional<std::uint32_t>{};};
             const auto invalid=x86_?UINT64_C(0xffffffff):UINT64_MAX;
             const auto api=[&](std::string_view name){return resolve("kernel32.dll",name).value;};
-            // OF_* 的存取與共用模式對應 CreateFile；相容模式視同不拒絕共用。
+            // OF_* 的存取與共用模式對應 CreateFile；相容模式視同不拒絕共用。OF_CREATE 建立的新檔一律可讀寫。
             const auto open_file=[&](std::uint64_t name,std::uint32_t mode,std::uint32_t creation){
-                const std::uint32_t access=(mode&3U)==1U?0x40000000U:(mode&3U)==2U?0xc0000000U:0x80000000U;
+                const std::uint32_t access=creation==2?0xc0000000U:(mode&3U)==1U?0x40000000U:(mode&3U)==2U?0xc0000000U:0x80000000U;
                 std::uint32_t share=3;
                 switch(mode&0x70U){case 0x10U:share=0;break;case 0x20U:share=1;break;case 0x30U:share=2;break;default:break;}
                 return service_callback::call_value(api("CreateFileA"),{name,access,share,0,creation,0x80,0});
@@ -864,6 +870,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
                     result = 1;
                 }
             }
+        } else if (symbol == "GetNamedPipeClientSessionId" || symbol == "GetNamedPipeServerSessionId") {
+            // 虛擬 Windows 只有一個互動工作階段（與 WTSGetActiveConsoleSessionId 相同）；先確認另一端已連線。
+            std::uint32_t pid{};
+            if (!arg(1))
+                fail(87);
+            else if (const auto error = file->second.pipe->process_id(symbol == "GetNamedPipeClientSessionId", pid))
+                fail(error);
+            else {
+                memory.store(GuestAddress{arg(1)}, 32, 1);
+                result = 1;
+            }
+        } else if (symbol == "GetNamedPipeClientComputerNameA" || symbol == "GetNamedPipeClientComputerNameW") {
+            // 管道只在本機虛擬環境內連線：用戶端在本機時依 Windows 回 ERROR_PIPE_LOCAL。
+            std::uint32_t pid{};
+            if (const auto error = file->second.pipe->process_id(true, pid))
+                fail(error);
+            else
+                fail(229);
         } else if (symbol == "SetNamedPipeHandleState") {
             const auto mode =
                 arg(1) ? static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)}, 32)) : file->second.pipe_mode;

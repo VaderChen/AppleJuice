@@ -1,20 +1,56 @@
+#include "service_callback_task.hpp"
+#include "guest_counted_string.hpp"
 #include "x64arm/windows_services.hpp"
 #include "windows_loader_lock.hpp"
+#include "windows_nt_entry.hpp"
+#include "windows_exception_diagnostics.hpp"
 #include "windows_object_identity.hpp"
 #include "windows_file_stat.hpp"
 #include "x64arm/process_io.hpp"
 #include "x64arm/windows_paths.hpp"
+#include "windows_globalroot_path.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/security_descriptor.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/pe_loader.hpp"
+#include "x64arm/decoder.hpp"
+#include "x64arm/shared_job.hpp"
 #include "guest_concrt_queue.hpp"
 #include "guest_concrt_queue_code.hpp"
 #include <algorithm>
+#include <charconv>
 
 namespace x64arm {
 namespace {
 struct NativeError {std::uint32_t status;};
+// 原有 1／* 保留完整追蹤；逗號分隔的 NT／Zw 名稱只觀察指定呼叫，
+// 不設定 TRACE_SERVICES，避免為了診斷而停用常駐 API 路徑。
+bool trace_native_call(std::string_view symbol){
+    static const std::string selected=[] {const auto* value=std::getenv("X64ARM_TRACE_SYSCALL");return value?std::string(value):std::string{};}();
+    if(selected.empty() || selected=="0")return false;
+    if(selected=="1" || selected=="*")return true;
+    const auto normalize=[](std::string_view name){return name.starts_with("Nt") || name.starts_with("Zw")?name.substr(2):name;};
+    for(std::string_view rest=selected;!rest.empty();){
+        const auto comma=rest.find(',');auto token=rest.substr(0,comma);
+        while(!token.empty() && token.front()==' ')token.remove_prefix(1);
+        while(!token.empty() && token.back()==' ')token.remove_suffix(1);
+        if(!token.empty() && normalize(token)==normalize(symbol))return true;
+        if(comma==rest.npos)break;rest.remove_prefix(comma+1);
+    }
+    return false;
+}
+bool trace_native_thread(std::uint64_t thread){
+    // 可選的客體執行緒篩選只影響診斷，避免等待熱路徑產生大量無關快照。
+    static const auto selected=[] {
+        const auto* setting=std::getenv("X64ARM_TRACE_SYSCALL_THREAD");
+        if(!setting || !*setting)return std::uint64_t{0};
+        const std::string_view text{setting};std::uint64_t value{};
+        const auto result=std::from_chars(text.data(),text.data()+text.size(),value);
+        return result.ec==std::errc{} && result.ptr==text.data()+text.size()?value:UINT64_MAX;
+    }();
+    return !selected || selected==thread;
+}
+
 // \Device\NamedPipe\ 目錄 handle 在檔案表中的識別鍵（不對應宿主路徑）。
 constexpr std::string_view nt_pipe_root_key="\\Device\\NamedPipe\\";
 std::uint32_t nt_status(std::uint32_t error){
@@ -25,23 +61,39 @@ std::uint32_t nt_status(std::uint32_t error){
     case 230:return 0xc00000adU;case 231:return 0xc00000abU;case 232:return 0xc00000b1U;case 233:return 0xc00000b0U;case 535:return 0xc00000b2U;case 536:return 0xc00000b3U;
     case 288:return 0xc0000046U;case 298:return 0xc0000047U;case 995:return 0xc0000120U;case 997:return 0x103U;case 998:return 0xc0000005U;
     case 1006:return 0xc000011eU;case 1008:return 0xc000007cU;case 1018:return 0xc000017cU;case 1117:return 0xc0000185U;case 1168:return 0xc0000225U;case 1237:return 0xc000022dU;case 1305:return 0xc0000058U;case 1306:return 0xc0000059U;
-    case 1307:return 0xc000005aU;case 1308:return 0xc000005bU;case 1309:return 0xc00000a8U;case 1314:return 0xc0000061U;
-    case 1336:return 0xc0000077U;case 1337:return 0xc0000078U;case 1338:return 0xc0000079U;
+    case 1307:return 0xc000005aU;case 1308:return 0xc000005bU;case 1309:return 0xc00000a8U;case 1310:return 0xc000005dU;case 1314:return 0xc0000061U;case 629:return 0xc00002b3U;case 158:return 0xc000002aU;case 1349:return 0xc00000bcU;
+    case 1336:return 0xc0000077U;case 1337:return 0xc0000078U;case 1338:return 0xc0000079U;case 1344:return 0xc0000099U;
     case 1346:return 0xc00000a5U;case 1347:return 0xc00000a4U;case 1360:return 0xc00000e6U;default:return 0xc0000001U;}
 }
 struct ObjectAttributes {std::u16string name;std::uint64_t root{},security{};std::uint32_t flags{},file_qos{};};
+std::optional<std::u16string> win32_object_name(std::u16string name);
+std::u16string rooted_object_name(const RuntimeState& runtime,const ObjectAttributes& attributes,bool creating){
+    auto name=attributes.name;if(name.find(u'\0')!=name.npos)throw NativeError{0xc0000033U};
+    if(!attributes.root)return name;
+    const auto directory=runtime.object_directories.find(attributes.root);
+    if(directory==runtime.object_directories.end())throw NativeError{0xc0000008U};
+    const auto required=creating?6U:2U;if((directory->second.access&required)!=required)throw NativeError{0xc0000022U};
+    if(!name.empty() && name.front()==u'\\')throw NativeError{0xc000003bU};
+    auto root=std::u16string(directory->second.object->name());if(!name.empty()){if(root.back()!=u'\\')root+=u'\\';root+=name;}return root;
+}
 std::u16string native_string(const GuestMemory& memory,std::uint64_t address,bool x86){
     const auto length=memory.load(GuestAddress{address},16),maximum=memory.load(GuestAddress{address+2},16),buffer=memory.load(GuestAddress{address+(x86?4U:8U)},x86?32:64);
     if(length%2 || length>maximum || (length && !buffer))throw NativeError{0xc000000dU};
     std::u16string result;for(std::uint64_t n=0;n<length;n+=2)result.push_back(static_cast<char16_t>(memory.load(GuestAddress{buffer+n},16)));return result;
 }
-ObjectAttributes object_attributes(const GuestMemory& memory,std::uint64_t address,bool x86,bool optional=false,bool file_qos=false){
+ObjectAttributes object_attributes(const GuestMemory& memory,std::uint64_t address,bool x86,bool optional=false,bool file_qos=false,bool exclusive=false){
     if(!address){if(optional)return {};throw NativeError{0xc000000dU};}
+    if(std::getenv("X64ARM_TRACE_OBJECT_ATTRIBUTES")){
+        const unsigned unit=x86?4U:8U;
+        std::fprintf(stderr,"[object_attributes] address=%llx length=%llx",static_cast<unsigned long long>(address),static_cast<unsigned long long>(memory.load(GuestAddress{address},32)));
+        for(unsigned i=1;i<6;++i)std::fprintf(stderr," field%u=%llx",i,static_cast<unsigned long long>(memory.load(GuestAddress{address+i*unit},x86?32:64)));
+        std::fprintf(stderr,"\n");
+    }
     if(memory.load(GuestAddress{address},32)!=(x86?24U:48U))throw NativeError{0xc000000dU};
     const auto unit=x86?4U:8U;const auto pointer=[&](unsigned n){return memory.load(GuestAddress{address+n*unit},x86?32:64);};
     ObjectAttributes result;result.root=pointer(1);result.flags=static_cast<std::uint32_t>(pointer(3));result.security=pointer(4);
     // 檔案 SQOS 沿用共用開檔旗標；其他物件仍維持原有的拒絕契約。
-    if(result.flags&~0x1c2U)throw NativeError{0xc000000dU};
+    if(result.flags&~(exclusive?0x1e2U:0x1c2U))throw NativeError{0xc000000dU};
     if(const auto qos=pointer(5)){
         if(!file_qos)throw NativeError{0xc000000dU};
         memory.check(GuestAddress{qos},12,Access::Read);
@@ -66,7 +118,7 @@ void concrt_queue::initialize(GuestMemory& memory,std::map<std::uint64_t,Runtime
         if(found==parsed.runtime.export_names.end())throw std::logic_error("Concrt 佇列常式缺少產碼入口："+std::string(name));
         return parsed.runtime.export_ordinals.at(found->second);
     };
-    auto image=parsed.runtime;image.path=u"[guest-concrt-queue]";image.export_names.clear();image.export_ordinals.clear();
+    auto image=parsed.runtime;image.private_code=true;image.path=u"[guest-concrt-queue]";image.export_names.clear();image.export_ordinals.clear();
     for(const auto& binding:bindings)image.export_names.emplace(std::string(x86?binding.x86:binding.x64),native(binding.native));
     const std::uint64_t cells=native("guest_concrt_host");const unsigned unit=x86?4U:8U;
     const auto data=std::find_if(parsed.mappings.begin(),parsed.mappings.end(),[&](const PeMapping& mapping){
@@ -82,7 +134,10 @@ void concrt_queue::initialize(GuestMemory& memory,std::map<std::uint64_t,Runtime
 std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"ntdll.dll","RtlDisownModuleHeapAllocation",2},
+        {"kernel32.dll","BaseGetNamedObjectDirectory",1},
+        {"ntdll.dll","NtOpenDirectoryObject",3,0,0,2},{"ntdll.dll","ZwOpenDirectoryObject",3,0,0,2},
 #include "concrt_sync_descriptors.inc"
+#include "concrt_lock_descriptors.inc"
 #include "concrt_queue_descriptors.inc"
         {"ntdll.dll","NtCreateFile",11,0,0,0x5e2},{"ntdll.dll","NtOpenFile",6,0,0,0x32},
         {"ntdll.dll","NtQueryAttributesFile",2},{"ntdll.dll","NtQueryFullAttributesFile",2},
@@ -93,6 +148,8 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         {"ntdll.dll","NtReadFile",9,0,0,0x40},{"ntdll.dll","NtWriteFile",9,0,0,0x40},
         {"ntdll.dll","NtCancelIoFile",2},{"ntdll.dll","NtCancelIoFileEx",3},
         {"ntdll.dll","NtLockFile",10,0,0,0x380},{"ntdll.dll","NtUnlockFile",5,0,0,0x10},
+        {"internal-nt-event","CreateEventExW",5,0,0,0x1c},{"internal-nt-event","OpenEventW",4,0,0,0xb},
+        {"internal-nt-event","DuplicateHandle",8,0,0,0xf0},
         {"internal-nt-file","ReadFile",9,0,0,0x24},{"internal-nt-file","WriteFile",9,0,0,0x24},
         {"internal-nt-file","CreateFileW",7,0,0,0x36},{"internal-nt-file","CloseHandle",1},
         {"internal-nt-file","CancelIo",1},{"internal-nt-file","CancelIoEx",2},
@@ -147,6 +204,13 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         {"msvcp140.dll","_Query_perf_counter",0,0,0,0,true},
         {"msvcp140.dll","_Query_perf_frequency",0,0,0,0,true},
         {"msvcp140.dll","_Xtime_get_ticks",0,0,0,0,true},
+        // VC11／VC12 的 <thread>／<mutex>／<condition_variable> C 匯出：_Mtx_t／_Cnd_t 為 _Mtx_init／_Cnd_init 配置的不透明指標，
+        // _Thrd_t｛HANDLE, id｝與 xtime｛__int64 秒, long 奈秒｝和 msvcp140 相同，共用同一套同步實作。
+        {"msvcp110.dll","_Mtx_init",2,0,0,0,true},{"msvcp110.dll","_Mtx_destroy",1,0,0,0,true},{"msvcp110.dll","_Mtx_lock",1,0,0,0,true},{"msvcp110.dll","_Mtx_unlock",1,0,0,0,true},{"msvcp110.dll","_Mtx_trylock",1,0,0,0,true},{"msvcp110.dll","_Mtx_current_owns",1,0,0,0,true},{"msvcp110.dll","_Mtx_clear_owner",1,0,0,0,true},{"msvcp110.dll","_Mtx_reset_owner",1,0,0,0,true},{"msvcp110.dll","_Mtx_getconcrtcs",1,0,0,0,true},{"msvcp110.dll","_Cnd_init",1,0,0,0,true},{"msvcp110.dll","_Cnd_destroy",1,0,0,0,true},{"msvcp110.dll","_Cnd_wait",2,0,0,0,true},{"msvcp110.dll","_Cnd_timedwait",3,0,0,0,true},{"msvcp110.dll","_Cnd_signal",1,0,0,0,true},{"msvcp110.dll","_Cnd_broadcast",1,0,0,0,true},{"msvcp110.dll","_Cnd_register_at_thread_exit",3,0,0,0,true},{"msvcp110.dll","_Cnd_unregister_at_thread_exit",1,0,0,0,true},{"msvcp110.dll","_Cnd_do_broadcast_at_thread_exit",0,0,0,0,true},{"msvcp110.dll","_Thrd_detach",1,1,0,0,true},{"msvcp110.dll","_Thrd_join",2,1,0,0,true},{"msvcp110.dll","_Thrd_sleep",1,0,0,0,true},{"msvcp110.dll","_Thrd_yield",0,0,0,0,true},{"msvcp110.dll","_Thrd_start",3,0,0,0,true},{"msvcp110.dll","_Xtime_get_ticks",0,0,0,0,true},{"msvcp110.dll","_Thrd_create",3,0,0,0,true},{"msvcp110.dll","_Thrd_current",1,0,0,0,true},{"msvcp110.dll","_Thrd_equal",2,3,0,0,true},{"msvcp110.dll","_Thrd_lt",2,3,0,0,true},{"msvcp110.dll","_Xtime_diff_to_millis",1,0,0,0,true},{"msvcp110.dll","_Xtime_diff_to_millis2",2,0,0,0,true},{"msvcp110.dll","xtime_get",2,0,0,0,true},
+        {"msvcp120.dll","_Mtx_init",2,0,0,0,true},{"msvcp120.dll","_Mtx_destroy",1,0,0,0,true},{"msvcp120.dll","_Mtx_lock",1,0,0,0,true},{"msvcp120.dll","_Mtx_unlock",1,0,0,0,true},{"msvcp120.dll","_Mtx_trylock",1,0,0,0,true},{"msvcp120.dll","_Mtx_current_owns",1,0,0,0,true},{"msvcp120.dll","_Mtx_clear_owner",1,0,0,0,true},{"msvcp120.dll","_Mtx_reset_owner",1,0,0,0,true},{"msvcp120.dll","_Mtx_getconcrtcs",1,0,0,0,true},{"msvcp120.dll","_Cnd_init",1,0,0,0,true},{"msvcp120.dll","_Cnd_destroy",1,0,0,0,true},{"msvcp120.dll","_Cnd_wait",2,0,0,0,true},{"msvcp120.dll","_Cnd_timedwait",3,0,0,0,true},{"msvcp120.dll","_Cnd_signal",1,0,0,0,true},{"msvcp120.dll","_Cnd_broadcast",1,0,0,0,true},{"msvcp120.dll","_Cnd_register_at_thread_exit",3,0,0,0,true},{"msvcp120.dll","_Cnd_unregister_at_thread_exit",1,0,0,0,true},{"msvcp120.dll","_Cnd_do_broadcast_at_thread_exit",0,0,0,0,true},{"msvcp120.dll","_Thrd_detach",1,1,0,0,true},{"msvcp120.dll","_Thrd_join",2,1,0,0,true},{"msvcp120.dll","_Thrd_sleep",1,0,0,0,true},{"msvcp120.dll","_Thrd_yield",0,0,0,0,true},{"msvcp120.dll","_Thrd_start",3,0,0,0,true},{"msvcp120.dll","_Xtime_get_ticks",0,0,0,0,true},{"msvcp120.dll","_Thrd_create",3,0,0,0,true},{"msvcp120.dll","_Thrd_current",1,0,0,0,true},{"msvcp120.dll","_Thrd_equal",2,3,0,0,true},{"msvcp120.dll","_Thrd_lt",2,3,0,0,true},{"msvcp120.dll","_Xtime_diff_to_millis",1,0,0,0,true},{"msvcp120.dll","_Xtime_diff_to_millis2",2,0,0,0,true},{"msvcp120.dll","xtime_get",2,0,0,0,true},
+        {"msvcp140.dll","_Thrd_create",3,0,0,0,true},{"msvcp140.dll","_Thrd_current",1,0,0,0,true},{"msvcp140.dll","_Thrd_equal",2,3,0,0,true},{"msvcp140.dll","_Xtime_diff_to_millis",1,0,0,0,true},{"msvcp140.dll","_Xtime_diff_to_millis2",2,0,0,0,true},{"msvcp140.dll","xtime_get",2,0,0,0,true},
+        {"internal-msvcp","ThreadRunner",1},
+        {"internal-msvcp","OnceComplete",1},{"msvcp110.dll","_Call_once",2,0,0,0,true},{"msvcp110.dll","_Call_onceEx",3,0,0,0,true},{"msvcp120.dll","_Call_once",2,0,0,0,true},{"msvcp120.dll","_Call_onceEx",3,0,0,0,true},
         {"msvcp140.dll","??0_Lockit@std@@QEAA@H@Z",2},
         {"msvcp140.dll","??0_Lockit@std@@QEAA@XZ",1},
         {"msvcp140.dll","??1_Lockit@std@@QEAA@XZ",1},
@@ -183,26 +247,124 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         ,{"ntdll.dll","RtlAreLongPathsEnabled",0}
         ,{"ole32.dll","CoWaitForMultipleHandles",5},{"combase.dll","CoWaitForMultipleObjects",5}
         ,{"ntdll.dll","RtlGetUnloadEventTrace",0},{"ntdll.dll","RtlGetUnloadEventTraceEx",3}
+        // NT 同步物件、計時、APC（windows_nt_objects.inc）。
+        ,{"ntdll.dll","NtCreateEvent",5},{"ntdll.dll","NtOpenEvent",3},{"ntdll.dll","NtSetEvent",2},{"ntdll.dll","NtResetEvent",2},{"ntdll.dll","NtClearEvent",1}
+        ,{"ntdll.dll","NtQueryEvent",5},{"ntdll.dll","NtSetEventBoostPriority",1}
+        ,{"ntdll.dll","NtCreateMutant",4},{"ntdll.dll","NtOpenMutant",3},{"ntdll.dll","NtReleaseMutant",2}
+        ,{"ntdll.dll","NtCreateSemaphore",5},{"ntdll.dll","NtOpenSemaphore",3},{"ntdll.dll","NtReleaseSemaphore",3}
+        ,{"ntdll.dll","NtCreateTimer",4},{"ntdll.dll","NtOpenTimer",3},{"ntdll.dll","NtSetTimer",7},{"ntdll.dll","NtCancelTimer",2},{"ntdll.dll","NtQueryTimer",5}
+        ,{"ntdll.dll","NtSetTimerResolution",3},{"ntdll.dll","NtQueryTimerResolution",3}
+        ,{"ntdll.dll","NtDelayExecution",2},{"ntdll.dll","NtYieldExecution",0},{"ntdll.dll","NtQueryPerformanceCounter",2},{"ntdll.dll","NtQuerySystemTime",1}
+        ,{"ntdll.dll","NtSetSystemTime",2},{"ntdll.dll","NtGetTickCount",0},{"ntdll.dll","NtGetCurrentProcessorNumber",0},{"ntdll.dll","NtFlushProcessWriteBuffers",0}
+        ,{"ntdll.dll","NtTestAlert",0},{"ntdll.dll","NtQueueApcThread",5},{"ntdll.dll","NtQueueApcThreadEx",6}
+        ,{"ntdll.dll","NtAlertThreadByThreadId",1},{"ntdll.dll","NtWaitForAlertByThreadId",2}
+        // 以 CONTEXT 續行與例外派送。
+        ,{"ntdll.dll","NtContinue",2},{"ntdll.dll","NtContinueEx",2},{"ntdll.dll","NtRaiseException",3}
+        ,{"ntdll.dll","KiUserExceptionDispatcher",0},{"ntdll.dll","KiUserApcDispatcher",0}
+        ,{"internal-apc-dispatch","Invoke",3}
+        ,{"ntdll.dll","RtlRestoreContext",2},{"kernel32.dll","RtlRestoreContext",2},{"ntdll.dll","RtlRaiseException",1},{"kernel32.dll","RtlRaiseException",1},{"ntdll.dll","RtlRaiseStatus",1}
+        // 權杖、程序、Job、Atom、地區設定、電源與雜項（windows_nt_families.inc）。
+        ,{"ntdll.dll","NtQueryInformationToken",5,0,0,0xa},{"ntdll.dll","NtSetInformationToken",4,0,0,0xa}
+        ,{"ntdll.dll","NtAdjustPrivilegesToken",6,0,0,0xa},{"ntdll.dll","NtAdjustGroupsToken",6,0,0,0xa}
+        ,{"ntdll.dll","NtDuplicateToken",6,0,0,0x1a},{"ntdll.dll","NtFilterToken",6,0,0,0x2}
+        ,{"ntdll.dll","NtCompareTokens",3},{"ntdll.dll","NtPrivilegeCheck",3},{"ntdll.dll","NtImpersonateAnonymousToken",1}
+        ,{"ntdll.dll","NtAllocateLocallyUniqueId",1},{"ntdll.dll","NtAllocateUuids",4}
+        ,{"ntdll.dll","NtSetInformationProcess",4,0,0,0xa},{"ntdll.dll","NtIsProcessInJob",2}
+        ,{"ntdll.dll","NtCreateJobObject",3,0,0,0x2},{"ntdll.dll","NtOpenJobObject",3,0,0,0x2},{"ntdll.dll","NtAssignProcessToJobObject",2}
+        ,{"ntdll.dll","NtTerminateJobObject",2,0,0,0x2},{"ntdll.dll","NtQueryInformationJobObject",5,0,0,0xa},{"ntdll.dll","NtSetInformationJobObject",4,0,0,0xa}
+        ,{"ntdll.dll","NtAddAtom",3,0,0,0x2},{"ntdll.dll","NtFindAtom",3,0,0,0x2},{"ntdll.dll","NtDeleteAtom",1,0,0,0x1},{"ntdll.dll","NtQueryInformationAtom",5,0,0,0xb}
+        ,{"ntdll.dll","NtQueryDefaultLocale",2,0,0,0x1},{"ntdll.dll","NtQueryDefaultUILanguage",1},{"ntdll.dll","NtQueryInstallUILanguage",1}
+        ,{"ntdll.dll","NtPowerInformation",5,0,0,0x15},{"ntdll.dll","NtSetThreadExecutionState",2,0,0,0x1}
+        ,{"ntdll.dll","NtPulseEvent",2},{"ntdll.dll","NtQuerySemaphore",5,0,0,0xa}
+        ,{"ntdll.dll","NtLockVirtualMemory",4,0,0,0x8},{"ntdll.dll","NtUnlockVirtualMemory",4,0,0,0x8}
+        ,{"ntdll.dll","NtFlushBuffersFileEx",5,0,0,0xa},{"ntdll.dll","NtCancelSynchronousIoFile",3}
+        ,{"ntdll.dll","NtQuerySystemInformationEx",6,0,0,0x15}
+        // Rtl 轉接家族（windows_ntdll_rtl.inc）：安全描述元、SID、ACL、時間、FLS、計時器佇列、等待登錄與 heap 資訊。
+        ,{"ntdll.dll","RtlCopySid",3,0,0,0x1},{"ntdll.dll","RtlInitializeSid",3},{"ntdll.dll","RtlAllocateAndInitializeSid",11,0,0,0x3fc}
+        ,{"ntdll.dll","RtlCreateAcl",3,0,0,0x6},{"ntdll.dll","RtlAddAce",5,0,0,0x16},{"ntdll.dll","RtlGetAce",3,0,0,0x2},{"ntdll.dll","RtlDeleteAce",2,0,0,0x2}
+        ,{"ntdll.dll","RtlAddAccessAllowedAce",4,0,0,0x6},{"ntdll.dll","RtlAddAccessAllowedAceEx",5,0,0,0xe},{"ntdll.dll","RtlAddAccessDeniedAce",4,0,0,0x6},{"ntdll.dll","RtlAddAccessDeniedAceEx",5,0,0,0xe}
+        ,{"ntdll.dll","RtlAddAuditAccessAce",6,0,0,0x6},{"ntdll.dll","RtlAddAuditAccessAceEx",7,0,0,0xe},{"ntdll.dll","RtlQueryInformationAcl",4,0,0,0xc}
+        ,{"ntdll.dll","RtlCreateSecurityDescriptor",2,0,0,0x2},{"ntdll.dll","RtlSetDaclSecurityDescriptor",4},{"ntdll.dll","RtlSetSaclSecurityDescriptor",4}
+        ,{"ntdll.dll","RtlSetOwnerSecurityDescriptor",3},{"ntdll.dll","RtlSetGroupSecurityDescriptor",3},{"ntdll.dll","RtlGetOwnerSecurityDescriptor",3},{"ntdll.dll","RtlGetGroupSecurityDescriptor",3}
+        ,{"ntdll.dll","RtlGetDaclSecurityDescriptor",4},{"ntdll.dll","RtlGetSaclSecurityDescriptor",4},{"ntdll.dll","RtlGetControlSecurityDescriptor",3},{"ntdll.dll","RtlSetControlSecurityDescriptor",3}
+        ,{"ntdll.dll","RtlMakeSelfRelativeSD",3},{"ntdll.dll","RtlAbsoluteToSelfRelativeSD",3},{"ntdll.dll","RtlSelfRelativeToAbsoluteSD",11},{"ntdll.dll","RtlImpersonateSelf",1,0,0,0x1}
+        ,{"ntdll.dll","RtlLocalTimeToSystemTime",2},{"ntdll.dll","RtlSystemTimeToLocalTime",2},{"ntdll.dll","RtlFlsFree",1,0,0,0x1},{"ntdll.dll","RtlFlsSetValue",2,0,0,0x1}
+        ,{"ntdll.dll","RtlDeleteTimer",3},{"ntdll.dll","RtlDeleteTimerQueueEx",2},{"ntdll.dll","RtlUpdateTimer",4,0,0,0xc},{"ntdll.dll","RtlRegisterWait",6,0,0,0x30}
+        ,{"ntdll.dll","RtlDeregisterWait",1},{"ntdll.dll","RtlDeregisterWaitEx",2},{"ntdll.dll","RtlQueueWorkItem",3,0,0,0x4},{"ntdll.dll","RtlSetThreadErrorMode",2,0,0,0x1}
+        ,{"ntdll.dll","RtlRunOnceComplete",3,0,0,0x2},{"ntdll.dll","RtlQueryHeapInformation",5,0,0,0xa},{"ntdll.dll","RtlSetHeapInformation",4,0,0,0xa}
+        ,{"ntdll.dll","RtlEnterCriticalSection",1},{"ntdll.dll","RtlLeaveCriticalSection",1},{"ntdll.dll","RtlTryEnterCriticalSection",1},{"ntdll.dll","RtlInitializeCriticalSection",1}
+        ,{"ntdll.dll","RtlInitializeCriticalSectionAndSpinCount",2,0,0,0x2},{"ntdll.dll","RtlInitializeCriticalSectionEx",3,0,0,0x6}
+        ,{"ntdll.dll","RtlIsCriticalSectionLocked",1},{"ntdll.dll","RtlIsCriticalSectionLockedByThread",1}
+        ,{"ntdll.dll","RtlSleepConditionVariableCS",3},{"ntdll.dll","RtlSleepConditionVariableSRW",4,0,0,0x8},{"ntdll.dll","RtlRunOnceBeginInitialize",3,0,0,0x2}
+        ,{"ntdll.dll","RtlFlsAlloc",2},{"ntdll.dll","RtlFlsGetValue",2,0,0,0x1},{"ntdll.dll","RtlCreateTimerQueue",1},{"ntdll.dll","RtlCreateTimer",7,0,0,0x70}
+        ,{"ntdll.dll","RtlAdjustPrivilege",4,0,0,0x1},{"ntdll.dll","RtlAddMandatoryAce",6,0,0,0xe}
+        ,{"ntdll.dll","RtlQueryTimeZoneInformation",1},{"ntdll.dll","RtlQueryDynamicTimeZoneInformation",1},{"ntdll.dll","RtlGetSystemTimePrecise",0}
+        ,{"ntdll.dll","RtlGetCurrentDirectory_U",2,0,0,0x1},{"ntdll.dll","RtlSetCurrentDirectory_U",1},{"ntdll.dll","RtlDoesFileExists_U",1},{"ntdll.dll","RtlDosSearchPath_U",6,0,0,0x8}
+        ,{"ntdll.dll","RtlQueryEnvironmentVariable_U",3},{"ntdll.dll","RtlQueryEnvironmentVariable",6},{"ntdll.dll","RtlSetEnvironmentVariable",3},{"ntdll.dll","RtlExpandEnvironmentStrings_U",4}
+        ,{"ntdll.dll","RtlExpandEnvironmentStrings",6},{"ntdll.dll","RtlCreateEnvironment",2},{"ntdll.dll","RtlDestroyEnvironment",1},{"ntdll.dll","RtlCopySecurityDescriptor",2}
+        ,{"ntdll.dll","RtlAddAccessAllowedObjectAce",7,0,0,0xe},{"ntdll.dll","RtlAddAccessDeniedObjectAce",7,0,0,0xe},{"ntdll.dll","RtlAddAuditAccessObjectAce",9,0,0,0xe}
+        ,{"ntdll.dll","RtlNewSecurityObject",6},{"ntdll.dll","RtlNewSecurityObjectEx",8,0,0,0x20},{"ntdll.dll","RtlNewSecurityObjectWithMultipleInheritance",9,0,0,0x50}
+        ,{"ntdll.dll","RtlConvertToAutoInheritSecurityObject",6},{"ntdll.dll","RtlDeleteSecurityObject",1},{"ntdll.dll","RtlValidRelativeSecurityDescriptor",3,0,0,0x6}
+        // Ldr／Tp／Dbg／地區設定／IDN／正規化／路徑（windows_ntdll_loader.inc）。
+        ,{"ntdll.dll","TpAllocCleanupGroup",1},{"ntdll.dll","TpQueryPoolStackInformation",2},{"ntdll.dll","TpSetPoolStackInformation",2},{"ntdll.dll","TpAllocWork",4},{"ntdll.dll","TpAllocTimer",4},{"ntdll.dll","TpAllocWait",4},{"ntdll.dll","TpAllocPool",2}
+        ,{"ntdll.dll","TpSetPoolMinThreads",2,0,0,0x2},{"ntdll.dll","TpSimpleTryPost",3},{"ntdll.dll","TpCallbackMayRunLong",1}
+        ,{"ntdll.dll","LdrGetDllHandleEx",5,0,0,0x1},{"ntdll.dll","LdrAddRefDll",2,0,0,0x1},{"ntdll.dll","LdrDisableThreadCalloutsForDll",1}
+        ,{"ntdll.dll","LdrFindEntryForAddress",2},{"ntdll.dll","LdrGetDllFullName",2},{"ntdll.dll","LdrGetDllDirectory",1},{"ntdll.dll","LdrSetDllDirectory",1}
+        ,{"ntdll.dll","LdrAddDllDirectory",2},{"ntdll.dll","LdrRemoveDllDirectory",1},{"ntdll.dll","LdrSetDefaultDllDirectories",1,0,0,0x1}
+        ,{"ntdll.dll","LdrFindResource_U",4,0,0,0x4},{"ntdll.dll","LdrAccessResource",4},{"ntdll.dll","LdrProcessRelocationBlock",4,0,0,0x2}
+        ,{"ntdll.dll","LdrEnumerateLoadedModules",3},{"ntdll.dll","LdrQueryImageFileExecutionOptions",6,0,0,0x14}
+        ,{"ntdll.dll","DbgBreakPoint",0},{"ntdll.dll","DbgUserBreakPoint",0}
+        ,{"ntdll.dll","RtlLcidToLocaleName",4,0,0,0x5},{"ntdll.dll","RtlLocaleNameToLcid",3,0,0,0x4},{"ntdll.dll","RtlIsValidLocaleName",2,0,0,0x2}
+        ,{"ntdll.dll","RtlGetUserPreferredUILanguages",5,0,0,0x3},{"ntdll.dll","RtlGetSystemPreferredUILanguages",5,0,0,0x3},{"ntdll.dll","RtlGetThreadPreferredUILanguages",4,0,0,0x1}
+        ,{"ntdll.dll","RtlGetProcessPreferredUILanguages",4,0,0,0x1},{"ntdll.dll","RtlSetProcessPreferredUILanguages",3,0,0,0x1},{"ntdll.dll","RtlSetThreadPreferredUILanguages",3,0,0,0x1}
+        ,{"ntdll.dll","RtlIdnToNameprepUnicode",5,0,0,0x5},{"ntdll.dll","RtlIdnToAscii",5,0,0,0x5},{"ntdll.dll","RtlIdnToUnicode",5,0,0,0x5},{"ntdll.dll","RtlNormalizeString",5,0,0,0x5},{"ntdll.dll","RtlIsNormalizedString",4,0,0,0x5}
+        ,{"ntdll.dll","RtlConvertSidToUnicodeString",3},{"ntdll.dll","RtlEncodeSystemPointer",1},{"ntdll.dll","RtlDecodeSystemPointer",1}
+        ,{"ntdll.dll","RtlGetFullPathName_UEx",5,0,0,0x2},{"ntdll.dll","RtlGetLongestNtPathLength",0}
+        ,{"ntdll.dll","RtlDosPathNameToRelativeNtPathName_U",4},{"ntdll.dll","RtlDosPathNameToRelativeNtPathName_U_WithStatus",4},{"ntdll.dll","RtlReleaseRelativeName",1}
     };return table;
 }
-std::map<std::uint64_t,std::uint32_t> WindowsServices::builtin_system_calls() const {
-    std::map<std::uint64_t,std::uint32_t> result;const auto table=runtime_service_descriptors();
-    for(std::size_t i=0;i<table.size();++i)if(table[i].family=="ntdll.dll" && (table[i].symbol.starts_with("Nt") || table[i].symbol.starts_with("Zw"))){
-        const auto target=resolve("ntdll.dll",table[i].symbol).value;
-        result.try_emplace(target,static_cast<std::uint32_t>((target-stub_base_.value)/16+1));
-    }
-    return result;
+const WindowsServices::SystemCallTable& WindowsServices::system_call_table() const {
+    // ntdll 的 NT 入口位址在程序內固定：第一次建立後快取。原本每次 syscall 都重新解析全部描述元的位址並排序，
+    // Steam 的 GPU／瀏覽器程序取樣中占協調者可見時間。
+    if(const auto* table=system_call_cache_.table.load(std::memory_order_acquire))return *table;
+    static std::mutex build_lock;const std::lock_guard guard(build_lock);
+    if(const auto* table=system_call_cache_.table.load(std::memory_order_acquire))return *table;
+    std::map<std::uint64_t,const WindowsServiceDescriptor*> entries;
+    for(const auto& descriptor:runtime_service_descriptors())
+        if(descriptor.family=="ntdll.dll" && detail::nt_system_service(descriptor.symbol))
+            entries.try_emplace(resolve("ntdll.dll",descriptor.symbol).value,&descriptor);
+    // 系統呼叫編號＝NT 入口依位址排序的名次（從 0 起）。Windows 的 ntdll 依編號排列 stub，所以讀 stub 內 mov eax 的程式
+    // 與自行把 Zw 匯出依位址排序推算編號的程式（防護層常見做法）得到同一個編號；兩種算法在這裡也必須一致。
+    auto table=std::make_unique<SystemCallTable>();std::uint32_t rank=0;
+    for(const auto& [target,descriptor]:entries){table->numbers.emplace(target,rank++);table->targets.push_back(target);table->descriptors.push_back(descriptor);}
+    system_call_cache_.owner=std::move(table);system_call_cache_.table.store(system_call_cache_.owner.get(),std::memory_order_release);
+    return *system_call_cache_.owner;
+}
+void WindowsServices::enter_process_instrumentation(GuestState& state){
+    const auto callback=runtime_.instrumentation_callback;if(!callback)return;
+    // 這是核心返回的轉向，並非一般函式呼叫：不推入返回位址、不改 RAX／旗標。
+    // 客體負責保存暫存器及避免其回呼中的系統呼叫無限遞迴。
+    if(x86_)state.reg(Gpr::Rcx)=static_cast<std::uint32_t>(state.rip.value);
+    else {state.reg(Gpr::R10)=state.rip.value;state.reg(Gpr::Rcx)=callback;}
+    state.rip=GuestAddress{callback};
 }
 std::optional<std::uint32_t> WindowsServices::finish_system_call(GuestState& state,GuestMemory& memory){
     auto& frames=threads_.items.at(threads_.current).system_calls;if(frames.empty())throw HostCallFault("NT 系統呼叫返回缺少框架");
     const auto& frame=frames.back();if(state.reg(Gpr::Rsp)!=frame.expected_stack)throw HostCallFault("NT 系統呼叫返回堆疊不符");
+    if(frame.traced_call!=UINT32_MAX){
+        const auto& calls=system_call_table();const auto symbol=frame.traced_call<calls.descriptors.size()?calls.descriptors[frame.traced_call]->symbol:std::string_view{"unknown"};
+        std::fprintf(stderr,"[syscall_return] pid=%u thread=%llu name=%.*s pc=%llx status=%llx\n",process_id(),static_cast<unsigned long long>(threads_.current),int(symbol.size()),symbol.data(),static_cast<unsigned long long>(frame.resume),static_cast<unsigned long long>(state.reg(Gpr::Rax)&0xffffffffU));
+    }
     if(x86_)memory.write(GuestAddress{frame.stack},frame.saved_memory);else memory.store(GuestAddress{frame.stack},64,frame.caller);
     state.reg(Gpr::Rsp)=frame.resume_stack;state.reg(Gpr::Rcx)=frame.resume_rcx;state.reg(Gpr::Rdx)=frame.resume_rdx;
-    state.reg(Gpr::R11)=frame.resume_r11;state.rflags=frame.flags;state.rip=GuestAddress{frame.resume};frames.pop_back();return std::nullopt;
+    state.reg(Gpr::R11)=frame.resume_r11;state.rflags=frame.flags;state.rip=GuestAddress{frame.resume};
+    const bool instrumented=frame.instrumented;frames.pop_back();
+    if(instrumented)enter_process_instrumentation(state);return std::nullopt;
 }
 bool WindowsServices::dispatch_system_call(GuestState& state,GuestMemory& memory,SystemCallEntry entry){
     if((entry==SystemCallEntry::Syscall && x86_) || (entry==SystemCallEntry::Sysenter && !x86_))return false;
     GuestThread::SystemCallFrame frame;frame.resume=state.rip.value;frame.flags=state.rflags;
+    frame.instrumented=runtime_.instrumentation_callback!=0;
     frame.resume_stack=state.reg(Gpr::Rsp);frame.resume_rcx=state.reg(Gpr::Rcx);
     frame.resume_rdx=state.reg(Gpr::Rdx);frame.resume_r11=state.reg(Gpr::R11);
     if(entry==SystemCallEntry::Sysenter){
@@ -211,16 +373,128 @@ bool WindowsServices::dispatch_system_call(GuestState& state,GuestMemory& memory
     }
     const auto fail=[&](std::uint32_t status){
         state.reg(Gpr::Rax)=status;state.rip=GuestAddress{frame.resume};state.reg(Gpr::Rsp)=frame.resume_stack;
-        state.reg(Gpr::Rcx)=frame.resume_rcx;state.reg(Gpr::Rdx)=frame.resume_rdx;return true;
+        state.reg(Gpr::Rcx)=frame.resume_rcx;state.reg(Gpr::Rdx)=frame.resume_rdx;
+        if(frame.instrumented)enter_process_instrumentation(state);return true;
     };
-    const auto id=static_cast<std::uint32_t>(state.reg(Gpr::Rax));const auto index=id?static_cast<std::size_t>(id-1):SIZE_MAX;
-    const auto target=stub_base_.value+index*16;const auto calls=builtin_system_calls();
-    if(!id || !calls.contains(target))return fail(0xc000001cU);
+    const auto id=static_cast<std::uint32_t>(state.reg(Gpr::Rax));const auto& calls=system_call_table();
+    frame.call_id=id;
+    const std::uint64_t target=id<calls.targets.size()?calls.targets[id]:0;
+    const auto symbol=id<calls.descriptors.size()?calls.descriptors[id]->symbol:std::string_view{"unknown"};
+    const bool tracing=trace_native_call(symbol) && trace_native_thread(threads_.current);if(tracing && target)frame.traced_call=id;
+    if(tracing)std::fprintf(stderr,"[syscall_name] pid=%u thread=%llu name=%.*s\n",process_id(),static_cast<unsigned long long>(threads_.current),int(symbol.size()),symbol.data());
+    if(tracing)std::fprintf(stderr,"[syscall] pid=%u pc=%llx id=%x target=%llx known=%u r10=%llx rdx=%llx r8=%llx r9=%llx\n",process_id(),static_cast<unsigned long long>(frame.resume),id,static_cast<unsigned long long>(target),unsigned(calls.numbers.contains(target)),static_cast<unsigned long long>(state.reg(Gpr::R10)),static_cast<unsigned long long>(state.reg(Gpr::Rdx)),static_cast<unsigned long long>(state.reg(Gpr::R8)),static_cast<unsigned long long>(state.reg(Gpr::R9)));
+    if(tracing && !x86_)try{const auto sp=frame.resume_stack;std::fprintf(stderr,"[syscall_stack] a5=%llx a6=%llx a7=%llx a8=%llx a9=%llx a10=%llx\n",static_cast<unsigned long long>(memory.load(GuestAddress{sp+0x28},64)),static_cast<unsigned long long>(memory.load(GuestAddress{sp+0x30},64)),static_cast<unsigned long long>(memory.load(GuestAddress{sp+0x38},64)),static_cast<unsigned long long>(memory.load(GuestAddress{sp+0x40},64)),static_cast<unsigned long long>(memory.load(GuestAddress{sp+0x48},64)),static_cast<unsigned long long>(memory.load(GuestAddress{sp+0x50},64)));
+        // 指標參數指向的值（基址、大小、偏移等輸入輸出參數），無法讀取時略過。
+        const auto deref=[&](const char* name,std::uint64_t pointer){try{if(pointer>=0x10000)std::fprintf(stderr," *%s=%llx",name,static_cast<unsigned long long>(memory.load(GuestAddress{pointer},64)));}catch(const MemoryFault&){}};
+        std::fprintf(stderr,"[syscall_deref]");deref("rdx",state.reg(Gpr::Rdx));deref("r8",state.reg(Gpr::R8));deref("r9",state.reg(Gpr::R9));
+        deref("a6",memory.load(GuestAddress{sp+0x30},64));deref("a7",memory.load(GuestAddress{sp+0x38},64));std::fprintf(stderr,"\n");}catch(const MemoryFault&){}
+    if(tracing){
+        // 與一般 API 追蹤相同的指定地址觀測；可選擇再讀一次指標所指的 64 bytes。
+        // 僅由使用者明列的診斷地址觸發，不掃描資料區，也不改寫客體內容。
+        static const auto observed_address=[]()->std::optional<std::uint64_t>{
+            const auto* setting=std::getenv("X64ARM_TRACE_MEMORY_ADDRESS");if(!setting || !*setting)return std::nullopt;
+            std::string_view text{setting};if(text.starts_with("0x") || text.starts_with("0X"))text.remove_prefix(2);
+            std::uint64_t value{};const auto parsed=std::from_chars(text.data(),text.data()+text.size(),value,16);
+            if(parsed.ec!=std::errc{} || parsed.ptr!=text.data()+text.size())return std::nullopt;
+            return value;
+        }();
+        if(observed_address)try{
+            const auto value=memory.load(GuestAddress{*observed_address},x86_?32:64);
+            std::fprintf(stderr,"[syscall_observe] pid=%u thread=%llu address=%llx value=%llx\n",process_id(),static_cast<unsigned long long>(threads_.current),static_cast<unsigned long long>(*observed_address),static_cast<unsigned long long>(value));
+            const auto* pointer=std::getenv("X64ARM_TRACE_MEMORY_POINTER");
+            if(value && pointer && std::string_view(pointer)=="1"){
+                std::array<std::uint8_t,64> bytes{};memory.read(GuestAddress{value},bytes);
+                std::fprintf(stderr,"[syscall_observe_pointer] pid=%u thread=%llu address=%llx bytes=",process_id(),static_cast<unsigned long long>(threads_.current),static_cast<unsigned long long>(value));
+                for(const auto byte:bytes)std::fprintf(stderr,"%02x",byte);
+                std::fprintf(stderr,"\n");
+            }
+        }catch(const MemoryFault&){}
+    }
+    // 與 API 追蹤共用既有 AMD64 unwind 語義；在暫借 syscall 返回槽之前
+    // 讀取原始呼叫鏈，避免診斷只看見 internal callback。僅觀測副本，
+    // 不改客體暫存器、堆疊或例外狀態。非標準 syscall stub 無法直接 unwind 時，
+    // 另列有限範圍內、緊接 CALL 指令的堆疊候選；候選鏈不是已證實的呼叫鏈。
+    if(tracing && !x86_ && std::getenv("X64ARM_TRACE_SERVICE_UNWIND")){
+        try {
+            const auto low=memory.load(GuestAddress{state.gs_base+16},64);
+            const auto high=memory.load(GuestAddress{state.gs_base+8},64);
+            const auto* trace_code=std::getenv("X64ARM_TRACE_SERVICE_CODE");
+            const auto* register_setting=std::getenv("X64ARM_TRACE_SERVICE_REGISTERS");
+            const bool trace_registers=register_setting && *register_setting && std::string_view(register_setting)!="0";
+            std::array<std::uint64_t,16> code_ranges{};
+            unsigned code_count=0;std::size_t code_bytes=0;
+            const auto walk_chain=[&](GuestState walk,unsigned candidate){
+                for(unsigned depth=0;depth<24 && walk.rip.value;++depth){
+                    const auto sp=walk.reg(Gpr::Rsp);
+                    if(sp<low || sp>=high || handles(walk.rip))break;
+                    const auto* image=module_image(walk.rip.value,true);
+                    if(!image){std::fprintf(stderr,"[syscall_unwind_stop] pid=%u thread=%llu candidate=%u pc=%llx reason=unmapped_image\n",process_id(),static_cast<unsigned long long>(threads_.current),candidate,static_cast<unsigned long long>(walk.rip.value));break;}
+                    memory.check(walk.rip,1,Access::Execute);
+                    std::fprintf(stderr,"[%s] pid=%u thread=%llu candidate=%u depth=%u pc=%llx sp=%llx module=%s offset=%llx\n",candidate?"syscall_candidate_unwind":"syscall_unwind",process_id(),static_cast<unsigned long long>(threads_.current),candidate,depth,static_cast<unsigned long long>(walk.rip.value),static_cast<unsigned long long>(sp),utf16_to_utf8(image->path).c_str(),static_cast<unsigned long long>(walk.rip.value-image->base));
+                    // 只列出 unwind 可恢復的非揮發暫存器；不把揮發暫存器誤稱為上層參數。
+                    if(trace_registers)std::fprintf(stderr,"[syscall_unwind_registers] pid=%u thread=%llu candidate=%u depth=%u rbx=%llx rbp=%llx rsi=%llx rdi=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
+                        process_id(),static_cast<unsigned long long>(threads_.current),candidate,depth,
+                        static_cast<unsigned long long>(walk.reg(Gpr::Rbx)),static_cast<unsigned long long>(walk.reg(Gpr::Rbp)),
+                        static_cast<unsigned long long>(walk.reg(Gpr::Rsi)),static_cast<unsigned long long>(walk.reg(Gpr::Rdi)),
+                        static_cast<unsigned long long>(walk.reg(Gpr::R12)),static_cast<unsigned long long>(walk.reg(Gpr::R13)),
+                        static_cast<unsigned long long>(walk.reg(Gpr::R14)),static_cast<unsigned long long>(walk.reg(Gpr::R15)));
+                    // 動態程式碼可能與磁碟映像不同；只讀目前函式的可執行範圍，
+                    // 去重且限制單函式 32 KiB、單次 64 KiB／16 函式，不擷取資料區。
+                    if(trace_code && *trace_code && std::string_view(trace_code)!="0" && code_count<code_ranges.size()){
+                        if(const auto* function=lookup_function(*image,walk.rip.value)){
+                            const auto begin=image->base+function->begin;
+                            const auto size=std::uint64_t{function->end}-function->begin;
+                            if(function->end>function->begin && size<=32768 && code_bytes+size<=65536 &&
+                               std::find(code_ranges.begin(),code_ranges.begin()+code_count,begin)==code_ranges.begin()+code_count){
+                                try {
+                                    memory.check(GuestAddress{begin},static_cast<std::size_t>(size),Access::Execute);
+                                    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));memory.read(GuestAddress{begin},bytes);
+                                    std::fprintf(stderr,"[syscall_unwind_code] pid=%u thread=%llu begin=%llx size=%llu bytes=",process_id(),static_cast<unsigned long long>(threads_.current),static_cast<unsigned long long>(begin),static_cast<unsigned long long>(size));
+                                    for(const auto byte:bytes)std::fprintf(stderr,"%02x",byte);
+                                    std::fprintf(stderr,"\n");code_ranges[code_count++]=begin;code_bytes+=size;
+                                }catch(const MemoryFault&){}
+                            }
+                        }
+                    }
+                    walk=virtual_unwind(memory,*image,walk.rip.value,walk,0).caller;
+                    if(walk.reg(Gpr::Rsp)<=sp)break;
+                }
+            };
+            auto walk=state;
+            if(walk.reg(Gpr::Rsp)<low || walk.reg(Gpr::Rsp)>=high || high-walk.reg(Gpr::Rsp)<8)throw HostCallFault("診斷堆疊範圍無效");
+            walk.rip=GuestAddress{memory.load(GuestAddress{walk.reg(Gpr::Rsp)},64)};
+            walk.reg(Gpr::Rsp)+=8;
+            const bool direct_image=module_image(walk.rip.value,true)!=nullptr;
+            walk_chain(walk,0);
+            if(!direct_image){
+                unsigned candidates=0;
+                const auto stack=frame.resume_stack;
+                for(unsigned slot=0;slot<64 && candidates<8 && high-stack>=std::uint64_t{slot+1}*8;++slot){
+                    const auto address=stack+std::uint64_t{slot}*8;
+                    const auto pc=memory.load(GuestAddress{address},64);
+                    const auto* image=module_image(pc,true);
+                    if(!image || pc<15)continue;
+                    try {
+                        memory.check(GuestAddress{pc},1,Access::Execute);
+                        bool call=false;
+                        for(unsigned length=2;length<=15 && pc-image->base>=length;++length){
+                            const auto decoded=Decoder{}.decode_at(memory,GuestAddress{pc-length});
+                            if(decoded.status==DecodeStatus::Ok && decoded.instruction.length==length && decoded.instruction.opcode==Opcode::Call){call=true;break;}
+                        }
+                        if(!call)continue;
+                        ++candidates;
+                        std::fprintf(stderr,"[syscall_stack_candidate] pid=%u thread=%llu candidate=%u slot=%u address=%llx pc=%llx confidence=call_suffix_only\n",process_id(),static_cast<unsigned long long>(threads_.current),candidates,slot,static_cast<unsigned long long>(address),static_cast<unsigned long long>(pc));
+                        auto candidate=state;candidate.rip=GuestAddress{pc};candidate.reg(Gpr::Rsp)=address+8;
+                        walk_chain(candidate,candidates);
+                    }catch(const MemoryFault&){}catch(const HostCallFault&){}
+                }
+            }
+        }catch(const MemoryFault&){}catch(const HostCallFault&){}
+    }
+    if(!target)return fail(0xc000001cU);
     auto& frames=threads_.items.at(threads_.current).system_calls;
     if(x86_){
-        const WindowsServiceDescriptor* descriptor=nullptr;
-        for(const auto& candidate:runtime_service_descriptors())
-            if(candidate.family=="ntdll.dll" && resolve(candidate.family,candidate.symbol).value==target){descriptor=&candidate;break;}
+        const WindowsServiceDescriptor* const descriptor=calls.descriptors[id];
         if(!descriptor)throw HostCallFault("NT 系統呼叫描述元缺失");
         const auto slots=descriptor->arguments+static_cast<unsigned>(std::popcount(descriptor->wide_arguments))+
             3U*static_cast<unsigned>(std::popcount(descriptor->aggregate_arguments));
@@ -274,7 +548,19 @@ std::optional<ExecutionResult> WindowsServices::dispatch_software_interrupt(Gues
     }
     return HostServices::dispatch_software_interrupt(state,memory,vector,length);
 }
+bool nt_object_service(std::string_view symbol);
+bool nt_continuation_service(std::string_view symbol);
+bool nt_family_service(std::string_view symbol);
+bool rtl_family_service(std::string_view symbol);
+bool ntdll_loader_service(std::string_view symbol);
 std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol=="KiUserExceptionDispatcher")return finish_user_exception_entry(state,memory);
+    if(service.symbol=="KiUserApcDispatcher")return finish_user_apc_entry(state,memory);
+    if(service.family=="internal-apc-dispatch"){
+        if(runtime_.callbacks.empty() || !native_apc_continuation(runtime_.callbacks.back().continuation))
+            throw HostCallFault("APC 配接入口缺少回呼框架");
+        enter_callback(state,memory);return std::nullopt;
+    }
     if(service.family=="internal-file-apc"){
         const WindowsCall arg(state,memory,service);const auto target=arg(0),ios=arg(1);const auto saved_error=last_error_;
         const auto status=static_cast<std::uint32_t>(memory.load(GuestAddress{ios},x86_?32:64));
@@ -286,6 +572,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
         else{state.reg(Gpr::Rcx)=error;state.reg(Gpr::Rdx)=count;state.reg(Gpr::R8)=ios;}
         state.rip=GuestAddress{target};return std::nullopt;
     }
+    if(service.family=="internal-nt-event")return invoke_compatibility(state,memory,service);
     if(service.family=="internal-nt-mapping")return invoke_mapping(state,memory,service);
     if(service.family=="internal-nt-file") {
         if(service.symbol=="CreateFileW")return invoke_file_open(state,memory,service);
@@ -293,6 +580,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
         if(service.symbol=="CancelIo" || service.symbol=="CancelIoEx")return invoke_file_io(state,memory,service);
         return invoke_file_readwrite(state,memory,service);
     }
+    if(nt_object_service(service.symbol))return invoke_nt_object(state,memory,service);
+    if(nt_continuation_service(service.symbol))return invoke_nt_continuation(state,memory,service);
+    if(nt_family_service(service.symbol))return invoke_nt_family(state,memory,service);
+    if(rtl_family_service(service.symbol))return invoke_rtl_family(state,memory,service);
+    if(ntdll_loader_service(service.symbol))return invoke_ntdll_loader(state,memory,service);
     if(service.symbol=="NtLockFile" || service.symbol=="NtUnlockFile")return invoke_file_lock(state,memory,service);
     if(service.symbol=="NtSuspendThread" || service.symbol=="NtResumeThread" || service.symbol.ends_with("tContextThread"))return invoke_thread_control(state,memory,service);
     const WindowsCall call(state,memory,service);const auto name=service.symbol;const auto saved_error=last_error_;const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
@@ -316,16 +608,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             if(value.size()>=4 && windows_path_upper(value[0])==u'U' && windows_path_upper(value[1])==u'N' && windows_path_upper(value[2])==u'C' && value[3]==u'\\')value=u"\\\\"+value.substr(4);
             else if(windows_dos_path_type(value)!=WindowsDosPathType::DriveAbsolute){
                 const auto volume=u"\\\\?\\"+value;
-                if(windows_volume_letter(std::u16string_view(volume)))value=volume;
+                if(windows_volume_letter(std::u16string_view(volume)) || detail::volume_device_path(volume).volume)value=volume;
                 else value=u"\\\\.\\"+value; // DOS 裝置（含管道）交回既有共用 provider 判定。
             }
         }
-        else {bool matched=false;for(char16_t drive=u'A';drive<=u'Z';++drive){const auto device=windows_device_name(drive);if(value.starts_with(device+u"\\")){value=std::u16string{drive,u':'}+value.substr(device.size());matched=true;break;}}if(!matched && (value.size()<3 || value[1]!=u':'))throw NativeError{0xc000003bU};}
+        else if(auto resolved=detail::globalroot_file_path(std::u16string_view(value),true);!resolved.empty())value=std::move(resolved);
+        else if(value.size()>=8 && std::equal(value.begin(),value.begin()+8,u"\\Device\\",[](auto a,auto b){return windows_path_upper(a)==windows_path_upper(b);})){ 
+            // 原生裝置名稱與 DOS／GLOBALROOT 入口共用 provider；未登錄裝置由該 provider 回報不存在。
+            const auto component=value.substr(8,value.find(u'\\',8)==value.npos?value.npos:value.find(u'\\',8)-8);
+            auto folded=component;for(auto& c:folded)c=windows_path_upper(c);
+            if(folded==u"NAMEDPIPE" || folded==u"MAILSLOT")value=u"\\\\.\\"+(folded==u"NAMEDPIPE"?std::u16string(u"pipe"):std::u16string(u"mailslot"))+value.substr(8+component.size());
+            else value=u"\\\\.\\GLOBALROOT"+value;
+        }
+        else if(value.size()<3 || value[1]!=u':')throw NativeError{0xc000003bU};
         return value;
     };
     try{
+#include "windows_nt_directory_api.inc"
 #include "windows_wait_completion_native.inc"
 #include "concrt_sync_handlers.inc"
+#include "concrt_lock_handlers.inc"
 #include "msvcp_sync_handlers.inc"
         if(name=="CoWaitForMultipleHandles" || name=="CoWaitForMultipleObjects"){
             // COWAIT_*：WAITALL 1、ALERTABLE 2、INPUTAVAILABLE 4、DISPATCH_CALLS 8、DISPATCH_WINDOW_MESSAGES 0x10；
@@ -644,10 +946,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             // 以管道 handle 為根、名稱空白：開啟同一管道的另一端（kernelbase CreatePipe 取得寫入端的方式）。
             const auto pipe_root=attr.root && attr.name.empty()?files_.find(attr.root):files_.end();
             const auto file=pipe_root!=files_.end() && pipe_root->second.pipe?u"\\\\.\\pipe"+pipe_root->second.pipe->file_name():path(attr);const auto options=static_cast<std::uint32_t>(call(create?8:5)),disposition=create?static_cast<std::uint32_t>(call(7)):1U;
+            if(trace_native_call(name))std::fprintf(stderr,"[native_file_open] pid=%u api=%.*s path=%s access=%x share=%x disposition=%u options=%x attributes=%x\n",process_id(),int(name.size()),name.data(),utf16_to_utf8(file).c_str(),static_cast<unsigned>(call(1)),static_cast<unsigned>(call(create?6:4)),disposition,options,create?static_cast<unsigned>(call(5)):0U);
             memory.check(GuestAddress{call(0)},unit,Access::Write);memory.check(GuestAddress{call(3)},unit*2,Access::Write);
             if(disposition>5 || (options&~0x0060587fU) || (options&0x30U)==0x30U || ((options&0x30U) && !(call(1)&0x100000U)) || ((options&1U) && (options&0x40U)))return finish(0xc000000dU);
             if(create && (call(9) || call(10)))return finish(0xc00000bbU);
-            const bool device=file.starts_with(u"\\\\.\\");
+            const bool device=file.starts_with(u"\\\\.\\") || detail::volume_device_path(file).volume;
             // DOS 裝置不以宿主路徑預查；分享、存在與建立契約由裝置 provider 驗證。
             const auto info=device?FileInformation{}:filesystem_.information(utf16_to_utf8(file));const bool existed=device || !info.error;if(info.error && info.error!=2 && info.error!=3)return finish(nt_status(info.error));
             if(existed && (options&0x40U) && (info.metadata.attributes&0x10U))return finish(0xc00000baU);
@@ -656,8 +959,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             if(options&2U)flags|=0x80000000U;if(options&4U)flags|=0x08000000U;if(options&8U)flags|=0x20000000U;
             if(options&0x800U)flags|=0x10000000U;if(options&0x400000U)flags|=0x00100000U;
             if(!(options&0x30U))flags|=0x40000000U;if(options&0x1000U)flags|=0x04000000U;if(options&0x4000U)flags|=0x02000000U;if(options&0x200000U)flags|=0x00200000U;
+            // NT 沒有 Win32 的「未設 BACKUP_SEMANTICS 就禁止目錄」限制；
+            // 未指定 FILE_NON_DIRECTORY_FILE 時，既有共用 provider 可接受兩種型別。
+            // 這個內部旗標只開放目錄 handle，存取權與分享仍由 provider 驗證。
+            if(!(options&0x40U))flags|=0x02000000U;
             const auto at=scratch(128+file.size()*2+2);memory.write(GuestAddress{at+128},utf16_bytes(file));security(attr,at);
             unsigned win_disposition=disposition==0 || disposition==5?2U:disposition==1?3U:disposition==2?1U:disposition==3?4U:5U;
+            if(existed && (info.metadata.attributes&0x10U) && disposition==3)win_disposition=3;
             if(options&1U){if(disposition!=1 && disposition!=2 && disposition!=3)throw NativeError{0xc000000dU};if(existed && disposition==2)throw NativeError{0xc0000035U};if(!existed && disposition==1)throw NativeError{0xc0000034U};if(!existed){const auto error=filesystem_.create_directory(utf16_to_utf8(file),[&]{return file_creation_descriptor(memory,at);});if(error)throw NativeError{nt_status(error)};}flags|=0x02000000U;win_disposition=3;}
             op.information=existed?(disposition==0?0U:disposition==4 || disposition==5?3U:1U):2U;op.attributes=options;
             if(create && call(4) && op.information!=1){op.allocation=memory.load(GuestAddress{call(4)},64);if(op.allocation>INT64_MAX)throw NativeError{0xc000000dU};}
@@ -674,7 +982,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             if(attrs&~2U)return finish(0xc000000dU);const auto output=call(process?(extended?3:2):(extended?4:3));memory.check(GuestAddress{output},unit,Access::Write);op.attributes=attrs;
             return start("advapi32.dll",process?"OpenProcessToken":"OpenThreadToken",process?std::vector<std::uint64_t>{call(0),call(1),output}:std::vector<std::uint64_t>{call(0),call(1),call(2),output});
         }
-        if(name=="NtDuplicateObject"){if(call(5)&~2U)return finish(0xc000000dU);if(call(3))memory.check(GuestAddress{call(3)},unit,Access::Write);return start("kernel32.dll","DuplicateHandle",{call(0),call(1),call(2),call(3),call(4),(call(5)&2U)!=0,call(6)});}
+        if(name=="NtDuplicateObject"){
+            if(call(5)&~0x22U)return finish(0xc000000dU);
+            if(call(3))memory.check(GuestAddress{call(3)},unit,Access::Write);
+            if(call(5)&0x20U){if((call(5)&2U) || (current_process_handle(call(0)) && object_type(call(1))!=u"Event"))return finish(0xc000000dU);return start("internal-nt-event","DuplicateHandle",{call(0),call(1),call(2),call(3),call(4),0,call(6),call(5)});}
+            return start("kernel32.dll","DuplicateHandle",{call(0),call(1),call(2),call(3),call(4),(call(5)&2U)!=0,call(6)});
+        }
         if(name=="NtWaitForSingleObject" || name=="NtSignalAndWaitForSingleObject" || name.starts_with("NtWaitForMultipleObjects")){
             const bool signal=name.starts_with("NtSignal"),multiple=name.starts_with("NtWaitForMultiple");
             std::uint64_t captured=0;
@@ -712,8 +1025,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
             return start("kernel32.dll",signal?"SignalObjectAndWait":"WaitForSingleObjectEx",signal?std::vector<std::uint64_t>{call(0),call(1),millis,static_cast<std::uint8_t>(call(2))}:std::vector<std::uint64_t>{call(0),millis,static_cast<std::uint8_t>(call(1))});
         }
         if(name=="NtCreateSection" || name=="NtOpenSection"){
-            const bool create=name=="NtCreateSection";memory.check(GuestAddress{call(0)},unit,Access::Write);const auto attr=object_attributes(memory,call(2),x86_,create);if(attr.root)return finish(0xc00000bbU);
-            auto section=attr.name;if(section.starts_with(u"\\BaseNamedObjects\\"))section.erase(0,18);else if(!section.empty() && section.front()==u'\\')return finish(0xc000003bU);
+            const bool create=name=="NtCreateSection";memory.check(GuestAddress{call(0)},unit,Access::Write);const auto attr=object_attributes(memory,call(2),x86_,create);
+            auto section=rooted_object_name(runtime_,attr,create);if(!section.empty()){auto mapped=win32_object_name(section);if(!mapped)return finish(0xc000003bU);section=std::move(*mapped);}
             if(call(1)&~0xf001fU)return finish(0xc0000022U);
             if(create && call(5)!=0x8000000U && call(5)!=0 && call(5)!=0x1000000U && call(5)!=0x11000000U)return finish(0xc00000bbU);
             const auto at=scratch(128+section.size()*2+2);security(attr,at);if(!section.empty())memory.write(GuestAddress{at+128},utf16_bytes(section));op.attributes=static_cast<std::uint32_t>(call(1));op.information=attr.flags;
@@ -757,6 +1070,40 @@ std::optional<std::uint32_t> WindowsServices::resume_nt_native(GuestState& state
         last_error_ = op.saved_error;
         complete_call(state, memory, scoped ? a[0] : trying || name.starts_with("?wait_for@") ? (value & 0xffU) : 0);
         return std::nullopt;
+    }
+    // Concrt 鎖與輔助（concrt_lock_handlers.inc）的續接：取得成功才記錄擁有者／讀取者，建構子回傳 this。
+    if (name.find("reader_writer_lock@Concurrency@@") != name.npos) {
+        const auto lock = a[1]; const bool scoped_ctor = name.starts_with("??0scoped_lock"), trying = name.starts_with("?try_lock");
+        const bool read = name.find("scoped_lock_read@") != name.npos || name.starts_with("?lock_read@") || name.starts_with("?try_lock_read@");
+        if ((scoped_ctor || name.starts_with("?lock") || trying) && (!trying || (value & 0xffU))) {
+            if (read) memory.store(GuestAddress{lock + 2 * unit}, 32, memory.load(GuestAddress{lock + 2 * unit}, 32) + 1);
+            else memory.store(GuestAddress{lock}, bits, threads_.current);
+        }
+        last_error_ = op.saved_error; complete_call(state, memory, scoped_ctor ? a[0] : trying ? (value & 0xffU) : 0); return std::nullopt;
+    }
+    if (name.find("@event@Concurrency@@") != name.npos || name.starts_with("??0event@Concurrency@@") || name.starts_with("??1event@Concurrency@@")) {
+        const auto wait_timeout = x86_ ? UINT64_C(0xffffffff) : UINT64_MAX; std::uint64_t result = 0; // COOPERATIVE_WAIT_TIMEOUT
+        if (name.starts_with("??0")) { if (!value) throw HostCallFault("Concrt event 無法建立同步物件"); memory.store(GuestAddress{a[0]}, bits, value); result = a[0]; }
+        else if (name.starts_with("?wait_for_multiple@")) { if (op.scratch) (void)free_heap(memory, op.scratch, state); const auto signaled = static_cast<std::uint32_t>(value); result = signaled < a[1] ? signaled : wait_timeout; }
+        else if (name.starts_with("?wait@")) result = static_cast<std::uint32_t>(value) == 0 ? 0 : wait_timeout;
+        last_error_ = op.saved_error; complete_call(state, memory, result); return std::nullopt;
+    }
+    if (name.find("PPLLock@details@Concurrency@@") != name.npos) {
+        const auto lock = a[1]; const unsigned section = x86_ ? 32U : 56U;
+        const bool acquiring = name.starts_with("?_Acquire@") || name.starts_with("??0_Scoped_lock@");
+        if (acquiring) {
+            memory.store(GuestAddress{lock}, bits, threads_.current);
+            if (name.find("_ReentrantPPLLock@") != name.npos) { memory.store(GuestAddress{lock + section}, 32, 1); memory.store(GuestAddress{lock + section + 4}, 32, static_cast<std::uint32_t>(threads_.current)); }
+        }
+        last_error_ = op.saved_error; complete_call(state, memory, name.starts_with("??0_Scoped_lock@") ? a[0] : 0); return std::nullopt;
+    }
+    if (name.find("BlockingLock@details@Concurrency@@") != name.npos || name.find("_SpinWait@") != name.npos ||
+        name.starts_with("?Yield@Context@") || name.starts_with("?_SpinYield@Context@") || name.starts_with("?_Yield@_Context@") || name == "?wait@Concurrency@@YAXI@Z") {
+        std::uint64_t result = 0;
+        if (name.starts_with("??0")) result = a[0];
+        else if (name.starts_with("?_TryAcquire@")) result = value & 0xffU;
+        else if (name.starts_with("?_SpinOnce@")) result = 1; // 讓出後仍在等待中
+        last_error_ = op.saved_error; complete_call(state, memory, result); return std::nullopt;
     }
     if(name.find("_Lockit@std@@")!=name.npos){
         if(!op.information){
@@ -813,7 +1160,7 @@ std::optional<std::uint32_t> WindowsServices::resume_nt_native(GuestState& state
         if(name=="_Cnd_timedwait" && !value)result=last_error_==1460?2:4;
         if(name=="_Thrd_detach" && !value)result=4;
         // _Thrd_start 與 STL 相同：handle 寫回 _Thrd_t，建立失敗時 id 清為 0 並回 _Error。
-        if(name=="_Thrd_start"){memory.store(GuestAddress{a[0]},bits,value);if(!value){memory.store(GuestAddress{a[0]+unit},32,0);result=4;}}
+        if(name=="_Thrd_start" || name=="_Thrd_create"){memory.store(GuestAddress{a[0]},bits,value);if(!value){memory.store(GuestAddress{a[0]+unit},32,0);result=4;}}
         if(acquired){
             const auto address=a[name.starts_with("_Cnd_")?1:0],owner=address+(x86_?40U:72U);
             memory.store(GuestAddress{owner},32,thread_identifier(threads_.current));
@@ -893,4 +1240,11 @@ std::uint32_t WindowsServices::msvcp_wait_milliseconds(GuestMemory& memory,std::
     if(due<=now)return 0;
     return static_cast<std::uint32_t>(std::min<std::int64_t>((due-now+9999)/10000,0xfffffffe));
 }
+}
+namespace x64arm {
+#include "windows_nt_shared.inc"
+#include "windows_nt_objects.inc"
+#include "windows_nt_families.inc"
+#include "windows_ntdll_rtl.inc"
+#include "windows_ntdll_loader.inc"
 }

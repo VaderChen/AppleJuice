@@ -1,3 +1,4 @@
+#include "system_object_identity.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
@@ -37,6 +38,7 @@ std::span<const WindowsServiceDescriptor> security_service_descriptors() {
         {"advapi32.dll","AddAccessAllowedAce",4},{"advapi32.dll","AddAccessAllowedAceEx",5},
         {"advapi32.dll","AddAccessDeniedAce",4},{"advapi32.dll","AddAccessDeniedAceEx",5},
         {"advapi32.dll","AddAuditAccessAce",6},{"advapi32.dll","AddAuditAccessAceEx",7},{"advapi32.dll","AddMandatoryAce",5},
+        {"advapi32.dll","AddAccessAllowedObjectAce",7},{"advapi32.dll","AddAccessDeniedObjectAce",7},{"advapi32.dll","AddAuditAccessObjectAce",9},
         {"advapi32.dll","IsValidSecurityDescriptor",1},{"advapi32.dll","GetSecurityDescriptorLength",1},{"advapi32.dll","GetSecurityDescriptorControl",3},
         {"advapi32.dll","GetSecurityDescriptorOwner",3},{"advapi32.dll","GetSecurityDescriptorGroup",3},
         {"advapi32.dll","GetSecurityDescriptorDacl",4},{"advapi32.dll","GetSecurityDescriptorSacl",4},
@@ -66,6 +68,11 @@ std::span<const WindowsServiceDescriptor> security_service_descriptors() {
         {"ntdll.dll", "NtQueryObject", 5},{"ntdll.dll","NtSetInformationObject",4},
         {"shell32.dll", "IsUserAnAdmin", 0},
         {"advapi32.dll","ConvertStringSecurityDescriptorToSecurityDescriptorA",4},{"advapi32.dll","ConvertStringSecurityDescriptorToSecurityDescriptorW",4},
+        {"advapi32.dll","ConvertSecurityDescriptorToStringSecurityDescriptorA",5},{"advapi32.dll","ConvertSecurityDescriptorToStringSecurityDescriptorW",5},
+        {"advapi32.dll","GetAuditedPermissionsFromAclA",4},{"advapi32.dll","GetAuditedPermissionsFromAclW",4},
+        {"advapi32.dll","LookupSecurityDescriptorPartsA",7},{"advapi32.dll","LookupSecurityDescriptorPartsW",7},
+        {"advapi32.dll","BuildTrusteeWithObjectsAndNameA",6},{"advapi32.dll","BuildTrusteeWithObjectsAndNameW",6},
+        {"advapi32.dll","BuildTrusteeWithObjectsAndSidA",5},{"advapi32.dll","BuildTrusteeWithObjectsAndSidW",5},
         {"advapi32.dll","InitializeSecurityDescriptor",2},{"advapi32.dll","SetSecurityDescriptorDacl",4},
         {"advapi32.dll","InitializeAcl",3},
         {"advapi32.dll","OpenThreadToken",4},{"advapi32.dll","DuplicateToken",3},{"advapi32.dll","DuplicateTokenEx",6},
@@ -75,13 +82,16 @@ std::span<const WindowsServiceDescriptor> security_service_descriptors() {
         {"advapi32.dll","SetThreadToken",2},{"advapi32.dll","RevertToSelf",0},{"advapi32.dll","ImpersonateSelf",1},
         {"advapi32.dll","ImpersonateNamedPipeClient",1},{"advapi32.dll","ImpersonateLoggedOnUser",1},{"advapi32.dll","CreateRestrictedToken",9},
         {"advapi32.dll","SetTokenInformation",4},{"advapi32.dll","IsTokenRestricted",1},
-        {"advapi32.dll","CheckTokenMembership",3},{"advapi32.dll","AccessCheck",8},
+        {"advapi32.dll","CheckTokenMembership",3},{"advapi32.dll","AccessCheck",8},{"advapi32.dll","AccessCheckByType",11},
         {"advapi32.dll","MapGenericMask",2},{"advapi32.dll","AreAllAccessesGranted",2},{"advapi32.dll","AreAnyAccessesGranted",2},
         {"advapi32.dll", "OpenProcessToken", 3},{"advapi32.dll","LogonUserA",6},{"advapi32.dll","LogonUserW",6},
         {"advapi32.dll", "GetKernelObjectSecurity", 5},{"advapi32.dll","SetKernelObjectSecurity",3},
         {"advapi32.dll","GetSecurityInfo",8},{"advapi32.dll","SetSecurityInfo",7},
         {"advapi32.dll", "LookupPrivilegeValueA", 3}, {"advapi32.dll", "LookupPrivilegeValueW", 3},
+        {"advapi32.dll","LookupPrivilegeNameA",4},{"advapi32.dll","LookupPrivilegeNameW",4},
+        {"advapi32.dll","LookupPrivilegeDisplayNameA",5},{"advapi32.dll","LookupPrivilegeDisplayNameW",5},
         {"advapi32.dll", "AdjustTokenPrivileges", 6}, {"advapi32.dll", "GetTokenInformation", 5},
+        {"advapi32.dll","AdjustTokenGroups",6},{"advapi32.dll","PrivilegeCheck",3},
         {"advapi32.dll", "LsaOpenPolicy", 4}, {"advapi32.dll", "LsaClose", 1},
         {"advapi32.dll", "LsaAddAccountRights", 4}, {"advapi32.dll", "LsaNtStatusToWinError", 1},
         {"advapi32.dll", "LookupAccountNameA", 7}, {"advapi32.dll", "LookupAccountNameW", 7},
@@ -96,11 +106,7 @@ using namespace security;
 std::uint32_t sid_rid(const std::vector<std::uint8_t>& sid,std::size_t index){std::uint32_t value=0;for(unsigned i=0;i<4;++i)value|=static_cast<std::uint32_t>(sid.at(8+index*4+i))<<(i*8);return value;}
 bool account_domain(const std::vector<std::uint8_t>& sid){return sid.size()>=24 && std::equal(sid.begin()+2,sid.begin()+8,std::array<std::uint8_t,6>{0,0,0,0,0,5}.begin()) && sid_rid(sid,0)==21;}
 bool builtin_domain(const std::vector<std::uint8_t>& sid){return sid.size()>=12 && std::equal(sid.begin()+2,sid.begin()+8,std::array<std::uint8_t,6>{0,0,0,0,0,5}.begin()) && sid_rid(sid,0)==32;}
-std::string sid_string(const std::vector<std::uint8_t>& sid){
-    std::uint64_t authority=0;for(unsigned i=0;i<6;++i)authority=(authority<<8)|sid[2+i];std::string result="S-1-";
-    if(authority<=UINT32_MAX)result+=std::to_string(authority);else{char hex[15]{};std::snprintf(hex,sizeof hex,"0x%012llx",static_cast<unsigned long long>(authority));result+=hex;}
-    for(unsigned i=0;i<sid[1];++i)result+="-"+std::to_string(sid_rid(sid,i));return result;
-}
+std::string sid_string(const std::vector<std::uint8_t>& sid){return sddl_sid_string(sid);}
 std::vector<std::uint8_t> well_known_sid(unsigned type,const std::vector<std::uint8_t>& domain){
     // WELL_KNOWN_SID_TYPE 與 MS-DTYP 公開識別值；僅建立資料，不變更 token 或 ACL 權限。
     static const std::map<unsigned,std::string_view> fixed{
@@ -139,6 +145,19 @@ constexpr std::array<std::string_view, 35> privilege_names{
     "SeRelabelPrivilege", "SeIncreaseWorkingSetPrivilege", "SeTimeZonePrivilege", "SeCreateSymbolicLinkPrivilege",
     "SeDelegateSessionUserImpersonatePrivilege"
 };
+// 與 privilege_names 同序的英文顯示名稱（Windows 的特權常數說明）。
+constexpr std::array<std::string_view, 35> privilege_display_names{
+    "Create a token object","Replace a process level token","Lock pages in memory",
+    "Adjust memory quotas for a process","Add workstations to domain","Act as part of the operating system","Manage auditing and security log",
+    "Take ownership of files or other objects","Load and unload device drivers","Profile system performance","Change the system time",
+    "Profile single process","Increase scheduling priority","Create a pagefile",
+    "Create permanent shared objects","Back up files and directories","Restore files and directories","Shut down the system",
+    "Debug programs","Generate security audits","Modify firmware environment values","Bypass traverse checking",
+    "Force shutdown from a remote system","Remove computer from docking station","Synchronize directory service data","Enable computer and user accounts to be trusted for delegation",
+    "Perform volume maintenance tasks","Impersonate a client after authentication","Create global objects","Access Credential Manager as a trusted caller",
+    "Modify an object label","Increase a process working set","Change the time zone","Create symbolic links",
+    "Obtain an impersonation token for another user in the same session"
+};
 std::uint32_t token_access(std::uint32_t requested) {
     auto access = requested & 0x0fffffffU;
     if (requested & 0x80000000U) access |= 0x20008U; // GENERIC_READ
@@ -170,8 +189,9 @@ std::uint32_t lsa_winerror(std::uint32_t status) {
 std::u16string_view WindowsServices::object_type(std::uint64_t handle) const {
     if(handle==(x86_?UINT32_MAX-1:UINT64_MAX-1) || runtime_.process_thread_handles.contains(handle))return u"Thread";
     if(const auto type=process_object_type(handle);!type.empty())return type;
-    if((handle>=0x100 && handle<=0x102 && standard_open_[handle-0x100]) || files_.contains(handle) || runtime_.network.sockets.contains(handle) || runtime_.directory_searches.contains(handle))return u"File";
+    if((handle>=0x100 && handle<=0x102 && standard_open_[handle-0x100]) || files_.contains(handle) || kernel_device_handle(handle) || runtime_.network.sockets.contains(handle) || runtime_.directory_searches.contains(handle))return u"File";
     if(runtime_.token_handles.contains(handle))return u"Token";
+    if(runtime_.object_directories.contains(handle))return u"Directory";
     if(power_requests_.contains(handle))return u"PowerRequest";
     if(transaction_handle(handle))return u"TmTx";
     if(job_handle(handle))return u"Job";
@@ -215,11 +235,15 @@ std::pair<std::uint64_t,std::uint32_t> WindowsServices::allocate_luid(){
 #endif
 }
 std::optional<WindowsServices::ObjectMetadata> WindowsServices::object_metadata(std::uint64_t handle)const{
+    if(const auto device=kernel_device_metadata(handle))return device;
     if(const auto mapping=mapping_object_metadata(handle))return mapping;
     if(const auto job=job_object_metadata(handle))return job;
     if(const auto process=process_object_metadata(handle))return process;
     const auto type=object_type(handle);if(type.empty())return {};ObjectMetadata out;out.identity=handle;out.handles=1;out.pointers=1;
-    if(const auto file=files_.find(handle);file!=files_.end()){
+    if(const auto directory=runtime_.object_directories.find(handle);directory!=runtime_.object_directories.end()){
+        out.access=directory->second.access;out.identity=UINT64_C(0x4449520000000000)+directory->second.object->index();out.handles=0;
+        for(const auto& [id,item]:runtime_.object_directories){(void)id;if(item.object->index()==directory->second.object->index())++out.handles;}out.pointers=out.handles;
+    }else if(const auto file=files_.find(handle);file!=files_.end()){
         out.access=security::mapped_access(file->second.access,{0x120089U,0x120116U,0x1200a0U,0x1f01ffU});out.identity=file->second.object;out.handles=0;
         for(const auto& [h,item]:files_){(void)h;if(item.object==out.identity)++out.handles;}out.pointers=out.handles;
         for(const auto& io:pending_file_io_)if(const auto at=files_.find(io.handle);at!=files_.end() && at->second.object==out.identity)++out.pointers;
@@ -247,6 +271,54 @@ std::optional<WindowsServices::ObjectMetadata> WindowsServices::object_metadata(
     else if(power_requests_.contains(handle)){out.access=0x1f0003;out.identity=reinterpret_cast<std::uintptr_t>(power_requests_.at(handle).get());out.handles=0;for(const auto& [h,request]:power_requests_){(void)h;if(reinterpret_cast<std::uintptr_t>(request.get())==out.identity)++out.handles;}out.pointers=out.handles;}
     return out;
 }
+std::string WindowsServices::system_object_key(std::uint64_t handle)const{
+    const auto info=object_metadata(handle);if(!info)return {};
+    if(!info->system_key.empty())return info->system_key;
+    const auto type=detail::system_object_type_index(object_type(handle));if(!type)return {};
+    const auto local=[&](char kind,std::uint64_t identity){return detail::object_key(type,kind,{process_id(),process_identity_birth(),identity});};
+    if(const auto at=runtime_.object_directories.find(handle);at!=runtime_.object_directories.end())
+        return detail::descriptor_object_key(type,at->second.object->descriptor());
+    if(const auto at=files_.find(handle);at!=files_.end()){
+        const auto& file=at->second;
+        if(file.pipe){auto key=detail::descriptor_object_key(type,file.pipe->descriptor());key+=detail::object_key(type,'P',{file.pipe->identity(),file.pipe->server()});return key;}
+        if(const auto position=runtime_.win_file_positions.find(file.object);position!=runtime_.win_file_positions.end() && position->second.identity())
+            return detail::object_key(type,'f',{position->second.identity()});
+        return local('f',file.object);
+    }
+    if(const auto at=runtime_.token_handle_objects.find(handle);at!=runtime_.token_handle_objects.end()){
+        if(const auto shared=shared_tokens_.find(at->second);shared!=shared_tokens_.end())return detail::descriptor_object_key(type,shared->second->descriptor());
+        return local('t',at->second);
+    }
+    if(const auto at=runtime_.wait_objects.find(handle);at!=runtime_.wait_objects.end()){
+        const auto& object=at->second;const auto& signal=runtime_.wait_state(object);
+        if(signal.shared_event)return detail::descriptor_object_key(type,signal.shared_event->descriptor());
+        if(object.mutex)if(const auto mutex=runtime_.mutex_objects.find(object.mutex);mutex!=runtime_.mutex_objects.end() && mutex->second.shared)
+            return detail::descriptor_object_key(type,mutex->second.shared->descriptor());
+        return local('w',object.mutex?object.mutex:object.identity?object.identity:handle);
+    }
+    if(job_handle(handle)){InheritedHandle item;if(export_job_handle(handle,item))return detail::descriptor_object_key(type,item.descriptor);return {};}
+    if(const auto at=runtime_.registry.handles.find(handle);at!=runtime_.registry.handles.end()){
+        auto key=detail::object_key(type,'k',{});const auto& path=registry_logical_path(at->second);
+        for(auto ch:path){key.push_back(static_cast<char>(ch));key.push_back(static_cast<char>(ch>>8));}return key;
+    }
+    if(runtime_.process_thread_handles.contains(handle))return detail::object_key(type,'p',{process_id(),process_identity_birth(),thread_id(handle)});
+    if(kernel_device_handle(handle))return local('d',info->identity);
+    if(runtime_.network.sockets.contains(handle))return local('s',info->identity);
+    if(runtime_.directory_searches.contains(handle))return local('r',info->identity);
+    if(runtime_.process_snapshots.contains(handle))return local('s',info->identity);
+    return local('l',info->identity);
+}
+std::uint32_t WindowsServices::local_system_handles(std::vector<SystemHandleRecord>& output){
+    detail::SystemObjectIdentities identities(mapping_session());if(identities.error())return identities.error();
+    std::vector<SystemHandleRecord> captured;
+    for(auto handle:local_process_handles()){
+        const auto info=object_metadata(handle);const auto key=system_object_key(handle);if(!info || key.empty())return 50;
+        const auto object=identities.resolve(key);if(identities.error())return identities.error();
+        const auto at=runtime_.handle_flags.find(handle);const auto flags=at==runtime_.handle_flags.end()?0U:at->second;
+        captured.push_back({handle,object,process_id(),info->access,detail::system_object_type_index(object_type(handle)),static_cast<std::uint16_t>(((flags&1U)<<1)|((flags&2U)>>1))});
+    }
+    output=std::move(captured);return 0;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state, GuestMemory& memory,
                                                            const WindowsServiceDescriptor& service) {
     security::NativeFileIdentityScope identity_scope;
@@ -258,7 +330,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
     if(service.symbol=="GetSecurityInfo" || service.symbol=="SetSecurityInfo" || service.symbol=="GetKernelObjectSecurity" || service.symbol=="SetKernelObjectSecurity"){
         const WindowsCall call(state,memory,service);
         const bool info=service.symbol=="GetSecurityInfo" || service.symbol=="SetSecurityInfo";
-        if(((runtime_.wait_objects.contains(call(0)) || mapping_handle(call(0)) || job_handle(call(0))) && (!info || call(1)==6)) ||
+        if(((runtime_.object_directories.contains(call(0)) || runtime_.wait_objects.contains(call(0)) || mapping_handle(call(0)) || job_handle(call(0))) && (!info || call(1)==6)) ||
            (info && call(1)==7) ||
            (files_.contains(call(0)) && files_.at(call(0)).pipe && (!info || call(1)==1)) ||
            ((!process_object_type(call(0)).empty() || thread_id(call(0))) && (!info || call(1)==6)))return invoke_object_security(state,memory,service);
@@ -272,7 +344,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
        service.symbol.starts_with("SetFileSecurity") ||
        ((service.symbol=="GetSecurityInfo" || service.symbol=="SetSecurityInfo") && WindowsCall(state,memory,service)(1)==1))
         return invoke_security_descriptor(state,memory,service);
-    for(const auto name:{"GetSecurityInfo","SetSecurityInfo","SetKernelObjectSecurity","GetKernelObjectSecurity","OpenProcessToken","OpenThreadToken","DuplicateToken","DuplicateTokenEx","SetThreadToken","RevertToSelf","ImpersonateSelf","ImpersonateAnonymousToken","ImpersonateLoggedOnUser","ImpersonateNamedPipeClient","CreateRestrictedToken","SetTokenInformation","GetTokenInformation","AdjustTokenPrivileges","IsTokenRestricted","CheckTokenMembership","AccessCheck","MapGenericMask","AreAllAccessesGranted","AreAnyAccessesGranted"})
+    for(const auto name:{"GetSecurityInfo","SetSecurityInfo","SetKernelObjectSecurity","GetKernelObjectSecurity","OpenProcessToken","OpenThreadToken","DuplicateToken","DuplicateTokenEx","SetThreadToken","RevertToSelf","ImpersonateSelf","ImpersonateAnonymousToken","ImpersonateLoggedOnUser","ImpersonateNamedPipeClient","CreateRestrictedToken","SetTokenInformation","GetTokenInformation","AdjustTokenPrivileges","AdjustTokenGroups","PrivilegeCheck","IsTokenRestricted","CheckTokenMembership","AccessCheck","AccessCheckByType","MapGenericMask","AreAllAccessesGranted","AreAnyAccessesGranted"})
         if(service.symbol==name)return invoke_token(state,memory,service);
     const WindowsCall arg(state, memory, service);
     const auto u32 = [&](unsigned index) { return static_cast<std::uint32_t>(arg(index)); };
@@ -292,16 +364,37 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
         if(symbol.starts_with("GetTrustee")){
             if(symbol.starts_with("GetTrusteeName"))result=memory.load(GuestAddress{arg(0)+name_offset},bits);
             else result=memory.load(GuestAddress{arg(0)+unit+(symbol.starts_with("GetTrusteeType")?8U:4U)},32);
+        }else if(symbol.starts_with("BuildTrusteeWithObjectsAnd")){
+            // trustee 名稱欄位指向 OBJECTS_AND_SID（ObjectsPresent、兩個 GUID、pSid）或 OBJECTS_AND_NAME（ObjectsPresent、SE_OBJECT_TYPE、
+            // ObjectTypeName、InheritedObjectTypeName、ptstrName）；GUID／名稱指標為 NULL 即不設定對應的 ObjectsPresent 位元。
+            const bool by_sid=symbol.starts_with("BuildTrusteeWithObjectsAndSid");const auto objects=arg(1);
+            memory.write(GuestAddress{arg(0)},std::vector<std::uint8_t>(trustee_size));
+            if(objects){
+                std::vector<std::uint8_t> bytes(by_sid?(x86_?40U:48U):8U+3U*unit);std::uint32_t present=0;
+                const auto put_pointer=[&](std::size_t at,std::uint64_t value){for(unsigned i=0;i<unit;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
+                if(by_sid){
+                    if(arg(2)){memory.read(GuestAddress{arg(2)},std::span(bytes).subspan(4,16));present|=1;}
+                    if(arg(3)){memory.read(GuestAddress{arg(3)},std::span(bytes).subspan(20,16));present|=2;}
+                    put_pointer(x86_?36U:40U,arg(4));
+                }else{
+                    present=(arg(3)?1U:0U)|(arg(4)?2U:0U);sddl_put(bytes,4,u32(2));
+                    for(unsigned field=0;field<3;++field)put_pointer(8+field*unit,arg(3+field));
+                }
+                sddl_put(bytes,0,present);memory.write(GuestAddress{objects},bytes);
+            }
+            memory.store(GuestAddress{arg(0)+unit+4},32,by_sid?3U:4U);memory.store(GuestAddress{arg(0)+name_offset},bits,objects);
         }else {
             const bool explicit_entry=symbol.starts_with("BuildExplicitAccessWithName");const auto trustee=arg(0)+(explicit_entry?(x86_?12U:16U):0U);
             memory.write(GuestAddress{arg(0)},std::vector<std::uint8_t>(explicit_entry?(x86_?32U:48U):trustee_size));
             if(explicit_entry){memory.store(GuestAddress{arg(0)},32,u32(2));memory.store(GuestAddress{arg(0)+4},32,u32(3));memory.store(GuestAddress{arg(0)+8},32,u32(4));}
             memory.store(GuestAddress{trustee+unit+4},32,symbol.starts_with("BuildTrusteeWithSid")?0U:1U);memory.store(GuestAddress{trustee+name_offset},bits,arg(1));
         }
-    }else if(symbol.starts_with("GetEffectiveRightsFromAcl")){
+    }else if(symbol.starts_with("GetEffectiveRightsFromAcl") || symbol.starts_with("GetAuditedPermissionsFromAcl")){
+        // 有效權限取允許減拒絕；稽核權限分列成功與失敗旗標的 SYSTEM_AUDIT ACE。帶 ObjectType 的物件 ACE 只作用於子物件，不計入。
+        const bool audit=symbol.starts_with("GetAudited");
         try{
-            if(!arg(0) || !arg(1) || !arg(2))throw SddlError{87};
-            memory.check(GuestAddress{arg(2)},4,Access::Write);initialize_tokens();
+            if(!arg(0) || !arg(1) || !arg(2) || (audit && !arg(3)))throw SddlError{87};
+            memory.check(GuestAddress{arg(2)},4,Access::Write);if(audit)memory.check(GuestAddress{arg(3)},4,Access::Write);initialize_tokens();
             const auto& primary=runtime_.token_objects.at(1);
             const auto trustee=read_trustee(memory,arg(1),x86_,symbol.ends_with('W'),[&](std::string_view name){
                 if(const auto account=security::resolve_account(name,primary.user.sid))return account->sid;
@@ -313,49 +406,96 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
                 const auto account=security::find_account(group.sid);
                 if(account && (account->type==2 || account->type==4))memberships.push_back(group.sid);
             }
-            const auto acl=read_acl(memory,arg(0));std::uint32_t granted=0,denied=0;
-            for(const auto offset:acl.offsets){
-                const auto ace=basic_ace(std::span{acl.bytes}.subspan(offset));
-                if(ace.type==1 && (ace.flags&16U))throw SddlError{1336};
-                if(ace.flags&8U || ace.type>1)continue;
+            std::uint32_t granted=0,denied=0,success=0,failure=0;
+            for(const auto& bytes:acl_entries(read_acl(memory,arg(0)).bytes)){
+                const auto ace=read_ace(bytes);const auto kind=object_ace_type(ace.type)?ace.type-5U:unsigned{ace.type};
+                if(!audit && kind==1 && (ace.flags&16U))throw SddlError{1336};
+                if((ace.flags&8U) || kind>2 || (ace.objects && (ace.objects->flags&1U)))continue;
                 if(std::find(memberships.begin(),memberships.end(),ace.sid)==memberships.end())continue;
-                if(ace.type==1)denied|=ace.mask;else granted|=ace.mask;
+                if(audit){if(kind==2){if(ace.flags&0x40U)success|=ace.mask;if(ace.flags&0x80U)failure|=ace.mask;}}
+                else if(kind==1)denied|=ace.mask;else if(kind==0)granted|=ace.mask;
             }
-            memory.store(GuestAddress{arg(2)},32,granted&~denied);result=0;
+            if(audit){memory.store(GuestAddress{arg(2)},32,success);memory.store(GuestAddress{arg(3)},32,failure);}
+            else memory.store(GuestAddress{arg(2)},32,granted&~denied);
+            result=0;
         }catch(const SddlError& error){result=error.code;}catch(const MemoryFault&){result=998;}catch(const std::bad_alloc&){result=8;}
-    }else if(symbol.starts_with("SetEntriesInAcl") || symbol.starts_with("GetExplicitEntriesFromAcl")){
-        const bool setting=symbol.starts_with("Set");const unsigned unit=x86_?4:8,entry_size=x86_?32:48,trustee_offset=x86_?12:16,name_offset=x86_?16:24;const std::uint8_t bits=x86_?32:64;
+    }else if(symbol.starts_with("SetEntriesInAcl") || symbol.starts_with("GetExplicitEntriesFromAcl") || symbol.starts_with("LookupSecurityDescriptorParts")){
+        const bool setting=symbol.starts_with("Set"),lookup=symbol.starts_with("Lookup"),wide=symbol.ends_with('W');
+        const unsigned unit=x86_?4:8,entry_size=x86_?32:48,trustee_offset=x86_?12:16,trustee_size=x86_?20:32,name_offset=x86_?16:24;const std::uint8_t bits=x86_?32:64;
+        // 輸出資料（EXPLICIT_ACCESS 陣列或單一 TRUSTEE 與其 SID、名稱、OBJECTS_AND_SID）配置在同一塊，LocalFree 一次釋放。
+        struct Block {
+            std::vector<std::uint8_t> bytes;std::vector<std::pair<std::size_t,std::size_t>> pointers;
+            std::size_t append(std::span<const std::uint8_t> data){const auto at=(bytes.size()+7)&~std::size_t{7};bytes.resize(at);bytes.insert(bytes.end(),data.begin(),data.end());return at;}
+        };
+        initialize_tokens();const auto& primary=runtime_.token_objects.at(1).user.sid;
+        // names：LookupSecurityDescriptorParts 以 TRUSTEE_IS_NAME 回傳「網域\名稱」與帳號型別；查不到名稱或物件 ACE 保留 SID 形式。
+        const auto fill_trustee=[&](Block& block,std::size_t at,const ExplicitAce& ace,bool names){
+            std::uint32_t form=0,type=0;std::size_t target=0;
+            const auto account=names && !ace.objects?security::resolve_account(ace.sid,primary):std::nullopt;
+            if(account){
+                const std::string text=account->domain.empty()?std::string(account->name):std::string(account->domain)+"\\"+std::string(account->name);
+                std::vector<std::uint8_t> encoded;if(wide)encoded=utf16_bytes(utf8_to_utf16(text));else{encoded.assign(text.begin(),text.end());encoded.push_back(0);}
+                target=block.append(encoded);form=1;type=account->type;
+            }else if(ace.objects){
+                std::vector<std::uint8_t> objects(x86_?40U:48U);sddl_put(objects,0,ace.objects->flags);
+                std::copy(ace.objects->type.begin(),ace.objects->type.end(),objects.begin()+4);std::copy(ace.objects->inherited.begin(),ace.objects->inherited.end(),objects.begin()+20);
+                target=block.append(objects);block.pointers.push_back({target+(x86_?36U:40U),block.append(ace.sid)});form=3;
+            }else target=block.append(ace.sid);
+            sddl_put(block.bytes,at+unit+4,form);sddl_put(block.bytes,at+unit+8,type);block.pointers.push_back({at+name_offset,target});
+        };
+        const auto publish=[&](Block& block)->std::uint64_t{
+            const auto output=allocate_heap(memory,block.bytes.size());if(!output)throw SddlError{8};
+            for(const auto& [at,target]:block.pointers)for(unsigned i=0;i<unit;++i)block.bytes[at+i]=static_cast<std::uint8_t>((output+target)>>(i*8));
+            memory.write(GuestAddress{output},block.bytes);runtime_.local_allocations.insert(output);return output;
+        };
+        const auto explicit_block=[&](std::span<const std::uint8_t> acl,bool names)->std::pair<std::uint64_t,std::size_t>{
+            std::vector<ExplicitAce> entries;
+            for(const auto& bytes:acl_entries(acl)){auto ace=read_ace(bytes);const auto kind=object_ace_type(ace.type)?ace.type-5U:unsigned{ace.type};if(kind<=2)entries.push_back(std::move(ace));}
+            if(entries.empty())return {0,0};
+            Block block;block.bytes.resize(entries.size()*entry_size);
+            for(std::size_t i=0;i<entries.size();++i){const auto& ace=entries[i];const auto entry=i*entry_size;const auto kind=object_ace_type(ace.type)?ace.type-5U:unsigned{ace.type};
+                const auto mode=kind==0?1U:kind==1?3U:(ace.flags&0xc0)==0xc0?7U:(ace.flags&0x80)?6U:5U;
+                sddl_put(block.bytes,entry,ace.mask);sddl_put(block.bytes,entry+4,mode);sddl_put(block.bytes,entry+8,ace.flags&31U);fill_trustee(block,entry+trustee_offset,ace,names);
+            }
+            return {publish(block),entries.size()};
+        };
         try {
-            if(!arg(setting?3:2) || (!setting && !arg(1)))throw SddlError{87};
-            memory.store(GuestAddress{arg(setting?3:2)},bits,0);if(!setting)memory.store(GuestAddress{arg(1)},32,0);
-            std::vector<std::vector<std::uint8_t>> aces;std::vector<std::uint8_t> previous;
-            const auto source=arg(setting?2:0);
-            if(source){const auto acl=read_acl(memory,source);previous=acl.bytes;for(std::size_t i=0;i<acl.offsets.size();++i){const auto end=i+1<acl.offsets.size()?acl.offsets[i+1]:acl.used;aces.emplace_back(acl.bytes.begin()+static_cast<std::ptrdiff_t>(acl.offsets[i]),acl.bytes.begin()+static_cast<std::ptrdiff_t>(end));}}
-            else if(!setting)throw SddlError{1336};
-            if(setting){
-                const auto entries=read_explicit_entries(memory,arg(1),u32(0),x86_,symbol.ends_with('W'),
-                    [&](std::string_view name){return security_trustee_name(name);});
-                const auto bytes=merge_acl(previous,entries);
-                if(!bytes.empty()){
-                    const auto output=allocate_heap(memory,bytes.size());if(!output)throw SddlError{8};
-                    memory.write(GuestAddress{output},bytes);runtime_.local_allocations.insert(output);
-                    memory.store(GuestAddress{arg(3)},bits,output);
-                }
-            }else {
-                std::vector<ExplicitAce> entries;std::size_t size=aces.size()*entry_size;for(const auto& ace:aces){entries.push_back(basic_ace(ace));size+=entries.back().sid.size();}
-                if(!entries.empty()){
-                    const auto output=allocate_heap(memory,size);if(!output)throw SddlError{8};std::vector<std::uint8_t> bytes(size);std::size_t sid_at=entries.size()*entry_size;
-                    for(std::size_t i=0;i<entries.size();++i){const auto& ace=entries[i];const auto entry=i*entry_size,trustee=entry+trustee_offset;
-                        const auto mode=ace.type==0?1U:ace.type==1?3U:(ace.flags&0xc0)==0xc0?7U:(ace.flags&0x80)?6U:5U;
-                        sddl_put(bytes,entry,ace.mask);sddl_put(bytes,entry+4,mode);sddl_put(bytes,entry+8,ace.flags&31U);
-                        for(unsigned byte=0;byte<unit;++byte)bytes[trustee+name_offset+byte]=static_cast<std::uint8_t>((output+sid_at)>>(byte*8));std::copy(ace.sid.begin(),ace.sid.end(),bytes.begin()+static_cast<std::ptrdiff_t>(sid_at));sid_at+=ace.sid.size();
+            if(lookup){
+                // (ppOwner, ppGroup, pcCountOfAccessEntries, ppListOfAccessEntries, pcCountOfAuditEntries, ppListOfAuditEntries, pSD)；各輸出皆可省略。
+                for(const unsigned index:{0U,1U,3U,5U})if(arg(index)){memory.check(GuestAddress{arg(index)},unit,Access::Write);memory.store(GuestAddress{arg(index)},bits,0);}
+                for(const unsigned index:{2U,4U})if(arg(index)){memory.check(GuestAddress{arg(index)},4,Access::Write);memory.store(GuestAddress{arg(index)},32,0);}
+                const auto sd=read_descriptor(memory,arg(6),x86_,true);
+                for(const unsigned part:{0U,1U})if(arg(part) && !sd.data[part].empty()){Block block;block.bytes.resize(trustee_size);ExplicitAce ace;ace.sid=sd.data[part];fill_trustee(block,0,ace,true);memory.store(GuestAddress{arg(part)},bits,publish(block));}
+                for(const auto& [field,count,list]:{std::tuple{3U,2U,3U},std::tuple{2U,4U,5U}}){
+                    if(!sd.data[field].empty() && (arg(count) || arg(list))){
+                        auto [pointer,total]=explicit_block(sd.data[field],true);
+                        if(arg(list))memory.store(GuestAddress{arg(list)},bits,pointer);else if(pointer){runtime_.local_allocations.erase(pointer);free_heap(memory,pointer,state);}
+                        if(arg(count))memory.store(GuestAddress{arg(count)},32,total);
                     }
-                    memory.write(GuestAddress{output},bytes);runtime_.local_allocations.insert(output);memory.store(GuestAddress{arg(2)},bits,output);
                 }
-                memory.store(GuestAddress{arg(1)},32,entries.size());
+                result=0;
+            }else {
+                if(!arg(setting?3:2) || (!setting && !arg(1)))throw SddlError{87};
+                memory.store(GuestAddress{arg(setting?3:2)},bits,0);if(!setting)memory.store(GuestAddress{arg(1)},32,0);
+                const auto source=arg(setting?2:0);std::vector<std::uint8_t> previous;
+                if(source)previous=read_acl(memory,source).bytes;else if(!setting)throw SddlError{1336};
+                if(setting){
+                    const auto entries=read_explicit_entries(memory,arg(1),u32(0),x86_,wide,
+                        [&](std::string_view name){return security_trustee_name(name);});
+                    const auto bytes=merge_acl(previous,entries);
+                    if(!bytes.empty()){
+                        const auto output=allocate_heap(memory,bytes.size());if(!output)throw SddlError{8};
+                        memory.write(GuestAddress{output},bytes);runtime_.local_allocations.insert(output);
+                        memory.store(GuestAddress{arg(3)},bits,output);
+                    }
+                }else {
+                    const auto [pointer,total]=explicit_block(previous,false);
+                    if(pointer)memory.store(GuestAddress{arg(2)},bits,pointer);
+                    memory.store(GuestAddress{arg(1)},32,total);
+                }
             }
         }catch(const SddlError& error){result=error.code;}catch(const MemoryFault&){result=87;}catch(const std::invalid_argument&){result=87;}
-    }else if(symbol=="IsValidAcl" || symbol=="GetAclInformation" || symbol=="SetAclInformation" || symbol=="GetAce" || symbol=="DeleteAce" || symbol=="AddAce" || symbol=="FindFirstFreeAce" || symbol.starts_with("AddAccessAllowedAce") || symbol.starts_with("AddAccessDeniedAce") || symbol.starts_with("AddAuditAccessAce") || symbol=="AddMandatoryAce"){
+    }else if(symbol=="IsValidAcl" || symbol=="GetAclInformation" || symbol=="SetAclInformation" || symbol=="GetAce" || symbol=="DeleteAce" || symbol=="AddAce" || symbol=="FindFirstFreeAce" || symbol.starts_with("AddAccessAllowedAce") || symbol.starts_with("AddAccessDeniedAce") || symbol.starts_with("AddAuditAccessAce") || symbol=="AddMandatoryAce" || symbol.ends_with("ObjectAce")){
         try{
             if(symbol=="FindFirstFreeAce" && arg(1))memory.store(GuestAddress{arg(1)},x86_?32:64,0);
             auto acl=read_acl(memory,arg(0));
@@ -377,6 +517,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
                 if(symbol=="AddAce"){
                     if(u32(2)!=UINT32_MAX){index=u32(2);if(index>acl.offsets.size())throw SddlError{87};}if(u32(4)>65535 || (u32(4) && !arg(3)))throw SddlError{87};addition.resize(u32(4));memory.read(GuestAddress{arg(3)},addition);
                     for(std::size_t at=0;at<addition.size();){if(addition.size()-at<4)throw SddlError{87};const auto length=static_cast<unsigned>(addition[at+2])|(static_cast<unsigned>(addition[at+3])<<8);if(length<4 || (length&3) || length>addition.size()-at)throw SddlError{87};const auto type=addition[at];if(((type>=5 && type<=8) || type==11 || type==12 || type==15 || type==16) && revision<4)throw SddlError{87};at+=length;++count;}
+                }else if(symbol.ends_with("ObjectAce")){
+                    // 物件 ACE：(ACL, 版本, AceFlags, AccessMask, ObjectType, InheritedObjectType, SID[, 稽核成功, 稽核失敗])；GUID 為 NULL 即不帶該欄位。
+                    if(revision!=4)throw SddlError{87};const bool audit=symbol.starts_with("AddAudit");auto flags=u32(2);if(flags&~31U)throw SddlError{1004};
+                    if(audit){if(u32(7))flags|=0x40;if(u32(8))flags|=0x80;}
+                    AceRecord ace;ace.type=static_cast<std::uint8_t>(audit?7:symbol.starts_with("AddAccessDenied")?6:5);ace.flags=static_cast<std::uint8_t>(flags);ace.mask=u32(3);AceObjects objects;
+                    if(arg(4)){objects.flags|=1;memory.read(GuestAddress{arg(4)},std::span(objects.type));}
+                    if(arg(5)){objects.flags|=2;memory.read(GuestAddress{arg(5)},std::span(objects.inherited));}
+                    ace.objects=objects;ace.sid=read_sid(memory,arg(6));addition=encode_ace(ace);count=1;
                 }else{
                     const bool mandatory=symbol=="AddMandatoryAce",extended=mandatory || symbol.ends_with("Ex"),audit=symbol.starts_with("AddAuditAccessAce");const unsigned mask_index=extended?3U:2U,sid_index=mask_index+1;
                     auto flags=extended?u32(2):0U;if(flags&~31U)throw SddlError{1004};if(audit){if(arg(sid_index+1))flags|=0x40;if(arg(sid_index+2))flags|=0x80;}
@@ -469,10 +617,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
             }
         }catch(const SddlError& error){fail(error.code);}catch(const MemoryFault&){fail(1337);}
     }else
-    if(symbol.starts_with("ConvertStringSecurityDescriptorToSecurityDescriptor")){
+    if(symbol.starts_with("ConvertSecurityDescriptorToStringSecurityDescriptor")){
+        // (SD, SDDL 版本, SecurityInformation, 輸出字串*, 長度*)：字串以 LocalAlloc 配置，長度為含結尾 NUL 的字元數；網域相對 SID 輸出為 LA／DU 等別名。
+        if(!arg(0) || !arg(3))fail(87);else if(u32(1)!=1)fail(1305);
+        else try{
+            const auto text=sddl_text(read_descriptor(memory,arg(0),x86_,true),u32(2),machine_account_domain());const bool wide=symbol.ends_with('W');
+            std::vector<std::uint8_t> bytes;std::size_t length=0;
+            if(wide){const auto converted=utf8_to_utf16(text);bytes=utf16_bytes(converted);length=converted.size()+1;}else{bytes.assign(text.begin(),text.end());bytes.push_back(0);length=bytes.size();}
+            memory.check(GuestAddress{arg(3)},x86_?4:8,Access::Write);if(arg(4))memory.check(GuestAddress{arg(4)},4,Access::Write);
+            const auto pointer=allocate_heap(memory,bytes.size());if(!pointer)fail(8);
+            else {memory.write(GuestAddress{pointer},bytes);runtime_.local_allocations.insert(pointer);memory.store(GuestAddress{arg(3)},x86_?32:64,pointer);if(arg(4))memory.store(GuestAddress{arg(4)},32,length);result=1;}
+        }catch(const SddlError& error){fail(error.code);}catch(const MemoryFault&){fail(1338);}
+    }else if(symbol.starts_with("ConvertStringSecurityDescriptorToSecurityDescriptor")){
         if(!arg(0) || !arg(2))fail(87);else if(u32(1)!=1)fail(1305);
         else {try {
-            const auto text=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));const auto bytes=sddl_descriptor(text);
+            const auto text=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));const auto bytes=sddl_descriptor(text,machine_account_domain());
             memory.check(GuestAddress{arg(2)},x86_?4:8,Access::Write);if(arg(3))memory.check(GuestAddress{arg(3)},4,Access::Write);
             const auto pointer=allocate_heap(memory,bytes.size());if(!pointer)fail(8);else {memory.write(GuestAddress{pointer},bytes);runtime_.local_allocations.insert(pointer);memory.store(GuestAddress{arg(2)},x86_?32:64,pointer);if(arg(3))memory.store(GuestAddress{arg(3)},32,bytes.size());result=1;}
         }catch(const SddlError& error){fail(error.code);}}
@@ -485,12 +644,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
         const auto type=object_type(arg(0));
         if(u32(1)==3)try{
             // 物件型別目錄與現存控制代碼共用同一份資料；不列入 GUI/GDI 這類 User handle。
-            constexpr std::array<std::u16string_view,13> types{u"Process",u"Thread",u"File",u"Token",u"PowerRequest",u"Job",u"IoCompletion",u"Section",u"Key",u"Event",u"Semaphore",u"Timer",u"WaitCompletionPacket"};
-            std::vector<std::u16string_view> names(types.begin(),types.end());names.push_back(u"Mutant");const unsigned unit=x86_?4:8,header=x86_?96:104;
+            const auto& names=detail::system_object_types;const unsigned unit=x86_?4:8,header=x86_?96:104;
             std::size_t total=unit;for(auto text:names)total=(total+header+(text.size()+1)*2+unit-1)&~static_cast<std::size_t>(unit-1);
             if(arg(4))memory.store(GuestAddress{arg(4)},32,total);if(u32(3)<total)result=0xc0000004U;
             else {memory.check(GuestAddress{arg(2)},total,Access::Write);memory.write(GuestAddress{arg(2)},std::vector<std::uint8_t>(total));memory.store(GuestAddress{arg(2)},32,names.size());std::size_t at=unit;
-                const auto handles=local_process_handles();for(auto text:names){const auto pointer=arg(2)+at;const auto bytes=utf16_bytes(text);memory.store(GuestAddress{pointer},16,bytes.size()-2);memory.store(GuestAddress{pointer+2},16,bytes.size());memory.store(GuestAddress{pointer+(x86_?4:8)},x86_?32:64,pointer+header);memory.write(GuestAddress{pointer+header},bytes);
+                const auto handles=local_process_handles();for(auto text:names){const auto pointer=arg(2)+at;const auto bytes=utf16_bytes(text);memory.store(GuestAddress{pointer},16,bytes.size()-2);memory.store(GuestAddress{pointer+2},16,bytes.size());memory.store(GuestAddress{pointer+(x86_?4:8)},x86_?32:64,pointer+header);memory.write(GuestAddress{pointer+header},bytes);memory.store(GuestAddress{pointer+(x86_?82:90)},8,detail::system_object_type_index(text));
                     std::set<std::uint64_t> objects;unsigned open=0;for(auto handle:handles)if(object_type(handle)==text){if(const auto info=object_metadata(handle))objects.insert(info->identity);++open;}memory.store(GuestAddress{pointer+(x86_?8:16)},32,objects.size());memory.store(GuestAddress{pointer+(x86_?12:20)},32,open);at=(at+header+bytes.size()+unit-1)&~static_cast<std::size_t>(unit-1);}}
         }catch(const MemoryFault&){result=0xc0000005U;}catch(const std::bad_alloc&){result=0xc0000017U;}
         else if(type.empty())result=0xc0000008U;
@@ -509,12 +667,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
                 if(const auto found=files_.find(arg(0));found!=files_.end()){
                     const auto& file=found->second;
                     if(file.pipe)text=u"\\Device\\NamedPipe"+file.pipe->file_name();
+                    else if(file.native && file.native->volume_device())text=windows_device_name(static_cast<char16_t>(file.native->volume_id()));
                     else {
                         auto path=file.path;if(file.native){const auto final=filesystem_.final_path(*file.native,file.path);if(!final.error)path=final.key;}
                         text=utf8_to_utf16(path);std::replace(text.begin(),text.end(),u'/',u'\\');
                         if(text.size()>=3 && text[1]==u':')text=windows_device_name(text[0])+text.substr(2);
                     }
-                }else if(const auto wait_found=runtime_.wait_objects.find(arg(0));wait_found!=runtime_.wait_objects.end())text=wait_found->second.name;
+                }else if(const auto directory=runtime_.object_directories.find(arg(0));directory!=runtime_.object_directories.end())text=directory->second.object->name();
+                else if(const auto wait_found=runtime_.wait_objects.find(arg(0));wait_found!=runtime_.wait_objects.end())text=wait_found->second.name;
                 else if(mapping_handle(arg(0)))text=mapping_object_name(arg(0));
                 else if(job_handle(arg(0)))text=job_object_name(arg(0));
                 else if(const auto key_found=runtime_.registry.handles.find(arg(0));key_found!=runtime_.registry.handles.end()){
@@ -536,6 +696,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
                 const auto size=static_cast<std::uint32_t>(header+bytes.size());if(arg(4))memory.store(GuestAddress{arg(4)},32,size);
                 if(u32(3)<size)result=0xc0000004U;
                 else {memory.check(GuestAddress{arg(2)},size,Access::Write);memory.write(GuestAddress{arg(2)},std::vector<std::uint8_t>(header));
+                    if(u32(1)==2)memory.store(GuestAddress{arg(2)+(x86_?82:90)},8,detail::system_object_type_index(type));
                     if(!bytes.empty()){memory.store(GuestAddress{arg(2)},16,bytes.size()-2);memory.store(GuestAddress{arg(2)+2},16,bytes.size());memory.store(GuestAddress{arg(2)+(x86_?4U:8U)},x86_?32:64,arg(2)+header);memory.write(GuestAddress{arg(2)+header},bytes);}
                 }
             }
@@ -622,6 +783,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
             }
         } catch(const SecurityDescriptorError& error) { fail(error.code); }
           catch(const MemoryFault&) { fail(998); }
+    } else if (symbol.starts_with("LookupPrivilegeName") || symbol.starts_with("LookupPrivilegeDisplayName")) {
+        // Name：(SystemName, LUID*, Name, cchName*)；DisplayName：(SystemName, Name, DisplayName, cchDisplayName*, LanguageId*)。
+        // 長度以字元計：成功時回不含 NUL 的長度，緩衝區不足時回含 NUL 的需要長度並設 ERROR_INSUFFICIENT_BUFFER。
+        const bool wide = symbol.back() == 'W', display = symbol.starts_with("LookupPrivilegeDisplayName");
+        const auto text = [&](std::uint64_t address) {
+            return wide ? utf16_to_utf8(read_utf16(memory, GuestAddress{address}, 1024)) : read_ansi(memory, address, 1024);
+        };
+        constexpr unsigned count_index = 3U, output_index = 2U;
+        if (!arg(1) || !arg(count_index)) fail(87);
+        else if (arg(0) && !text(arg(0)).empty()) fail(50);
+        else {
+            std::size_t index = privilege_names.size();
+            if (display) {
+                const auto name = text(arg(1));
+                index = static_cast<std::size_t>(std::find_if(privilege_names.begin(), privilege_names.end(), [&](const auto candidate) { return same_name(name, candidate); }) - privilege_names.begin());
+            } else {
+                const auto luid = memory.load(GuestAddress{arg(1)}, 64);
+                if (luid >= 2 && luid < 2 + privilege_names.size()) index = static_cast<std::size_t>(luid - 2);
+            }
+            if (index >= privilege_names.size()) fail(1313); // ERROR_NO_SUCH_PRIVILEGE
+            else {
+                const auto value = display ? privilege_display_names[index] : privilege_names[index];
+                const auto capacity = static_cast<std::uint32_t>(memory.load(GuestAddress{arg(count_index)}, 32));
+                if (capacity <= value.size() || !arg(output_index)) {
+                    memory.store(GuestAddress{arg(count_index)}, 32, value.size() + 1); fail(122);
+                } else {
+                    if (wide) memory.write(GuestAddress{arg(output_index)}, utf16_bytes(utf8_to_utf16(std::string(value))));
+                    else { std::vector<std::uint8_t> bytes(value.begin(), value.end()); bytes.push_back(0); memory.write(GuestAddress{arg(output_index)}, bytes); }
+                    memory.store(GuestAddress{arg(count_index)}, 32, value.size());
+                    if (display && arg(4)) memory.store(GuestAddress{arg(4)}, 32, 0x409);
+                    result = 1;
+                }
+            }
+        }
     } else if (symbol == "LookupPrivilegeValueA" || symbol == "LookupPrivilegeValueW") {
         const bool wide = symbol.back() == 'W';
         const auto text = [&](std::uint64_t address) {
@@ -936,6 +1131,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_object_security(GuestState&
             local=&gui_.user_objects.at(handle->second.object).security_descriptor;
         }else if(!process_object_type(call(0)).empty() || thread_id(call(0))){
             const auto error=process_security_location(call(0),needed,local,native,lock,thread_security);if(error)throw SddlError{error};
+        }else if(const auto directory=runtime_.object_directories.find(call(0));directory!=runtime_.object_directories.end()){
+            if((directory->second.access&needed)!=needed)throw SddlError{5};native=directory->second.object->descriptor();lock=directory->second.object->lock_descriptor();
         }else if(mapping_handle(call(0)) || job_handle(call(0))){
             const auto error=mapping_handle(call(0))?mapping_security_location(call(0),needed,local,native,lock):job_security_location(call(0),needed,native,lock);if(error)throw SddlError{error};
         }else if(files_.contains(call(0)) && files_.at(call(0)).pipe){
@@ -982,7 +1179,14 @@ void WindowsServices::collect_tokens(){
 std::shared_ptr<SharedToken> WindowsServices::share_token(std::uint64_t id){
     if(!runtime_.network.external_io)throw SddlError{50};
     if(const auto found=shared_tokens_.find(id);found!=shared_tokens_.end())return found->second;
-    auto token=SharedToken::create(runtime_.token_objects.at(id));shared_tokens_.emplace(id,token);return token;
+    auto token=SharedToken::create(runtime_.token_objects.at(id));
+    if(std::filesystem::exists(std::filesystem::path(mapping_session())/"system-object-identities")){
+        const auto type=detail::system_object_type_index(u"Token");detail::SystemObjectIdentities ids(mapping_session());
+        if(const auto previous=ids.find(detail::object_key(type,'t',{process_id(),process_identity_birth(),id})))
+            (void)ids.resolve(detail::descriptor_object_key(type,token->descriptor()),previous);
+        if(ids.error())throw SddlError{ids.error()};
+    }
+    shared_tokens_.emplace(id,token);return token;
 }
 std::uint64_t WindowsServices::attach_shared_token(const std::shared_ptr<SharedToken>& token){
     for(const auto& [id,existing]:shared_tokens_)if(existing->identity()==token->identity()){runtime_.token_objects.at(id)=existing->read();return id;}
@@ -1011,25 +1215,28 @@ std::uint32_t WindowsServices::local_token_operation(std::uint32_t operation,int
         output=share_token(id)->descriptor();return 0;
     }catch(const SddlError& error){return error.code;}catch(const std::bad_alloc&){return 8;}
 }
+std::vector<std::uint8_t> WindowsServices::machine_account_domain(){
+    // 電腦帳號網域：主要 token 使用者 SID（S-1-5-21-x-y-z-RID）去掉 RID；非帳號網域使用者時沒有網域別名。
+    initialize_tokens();auto sid=runtime_.token_objects.at(1).user.sid;if(!account_domain(sid))return {};
+    sid.resize(24);sid[1]=4;return sid;
+}
+VirtualToken& WindowsServices::token_handle_object(std::uint64_t handle,std::uint32_t rights){
+    const auto access=runtime_.token_handles.find(handle);if(access==runtime_.token_handles.end())throw SddlError{6};
+    if((access->second&rights)!=rights)throw SddlError{5};return runtime_.token_objects.at(runtime_.token_handle_objects.at(handle));
+}
 std::optional<std::uint32_t> WindowsServices::invoke_token(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
     const auto u32=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
     const unsigned unit=x86_?4:8,stride=x86_?8:16;const std::uint8_t bits=x86_?32:64;
     std::uint64_t result=0;initialize_tokens();
-    const auto token_for=[&](std::uint64_t handle,std::uint32_t rights)->VirtualToken&{
-        const auto access=runtime_.token_handles.find(handle);if(access==runtime_.token_handles.end())throw SddlError{6};
-        if((access->second&rights)!=rights)throw SddlError{5};return runtime_.token_objects.at(runtime_.token_handle_objects.at(handle));
-    };
+    const auto token_for=[&](std::uint64_t handle,std::uint32_t rights)->VirtualToken&{return token_handle_object(handle,rights);};
     const auto new_handle=[&](std::uint64_t id,std::uint32_t rights,std::uint64_t output,bool inherit=false){
         if(!output)throw SddlError{87};memory.check(GuestAddress{output},unit,Access::Write);
         if(runtime_.token_handles.size()>=1024)throw SddlError{8};const auto handle=runtime_.allocate_wait_handle();
         runtime_.token_handles.emplace(handle,rights);runtime_.token_handle_objects.emplace(handle,id);runtime_.handle_flags[handle]=inherit?1:0;
         memory.store(GuestAddress{output},bits,handle);result=1;
     };
-    const auto mapping_at=[&](std::uint64_t address){
-        if(!address)throw SddlError{87};memory.check(GuestAddress{address},16,Access::Read);std::array<std::uint32_t,4> mapping{};
-        for(unsigned i=0;i<4;++i)mapping[i]=static_cast<std::uint32_t>(memory.load(GuestAddress{address+i*4},32));return mapping;
-    };
+    const auto mapping_at=[&](std::uint64_t address){return read_mapping(memory,address);};
     const auto granted_token_access=[&](std::uint64_t id,std::uint32_t desired,std::uint64_t caller){
         const auto mapped=token_access(desired&~0x02000000U);if(mapped&~token_all_access)throw SddlError{5};
         const auto wanted=mapped|(desired&0x02000000U);const auto& object=runtime_.token_objects.at(id);
@@ -1047,7 +1254,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_token(GuestState& state,Gue
     std::unique_ptr<SharedToken::Transaction> mutation;
     VirtualToken original;
     try {
-        const bool mutating_api=symbol=="SetTokenInformation" || symbol=="SetSecurityInfo" || symbol=="SetKernelObjectSecurity" || symbol=="AdjustTokenPrivileges";
+        const bool mutating_api=symbol=="SetTokenInformation" || symbol=="SetSecurityInfo" || symbol=="SetKernelObjectSecurity" || symbol=="AdjustTokenPrivileges" || symbol=="AdjustTokenGroups";
         if(mutating_api && runtime_.token_handle_objects.contains(arg(0))){
             const auto id=runtime_.token_handle_objects.at(arg(0));const auto shared=shared_tokens_.find(id);
             if(shared!=shared_tokens_.end()){
@@ -1207,22 +1414,37 @@ std::optional<std::uint32_t> WindowsServices::invoke_token(GuestState& state,Gue
             if(arg(0) && token.type!=2)throw SddlError{1309};if(!arg(2))throw SddlError{87};const auto sid=read_sid(memory,arg(1));
             bool member=token_sid_matches(token,sid,false);if(token.restriction_check)member=member && token_sid_matches(token,sid,false,true);
             memory.store(GuestAddress{arg(2)},32,member?1:0);result=1;
-        }else if(symbol=="AccessCheck"){
-            const auto& token=token_for(arg(1),8);if(token.type!=2)throw SddlError{1309};if(token.level<1)throw SddlError{1346};
-            if(u32(2)&0xf0000000U)throw SddlError{1360};const auto mapping=mapping_at(arg(3));
-            if(!arg(5) || !arg(6) || !arg(7))throw SddlError{87};
-            const auto size=memory.load(GuestAddress{arg(5)},32);
-            const auto sd=read_descriptor(memory,arg(0),x86_,true);if(sd.data[0].empty() || sd.data[1].empty())throw SddlError{1338};
-            const auto checked=security::access_check(token,sd,u32(2),mapping);
-            const auto needed=8+checked.privileges.size()*12;
-            memory.store(GuestAddress{arg(5)},32,needed);if(size<needed || !arg(4))throw SddlError{122};
-            memory.check(GuestAddress{arg(4)},needed,Access::Write);memory.check(GuestAddress{arg(6)},4,Access::Write);memory.check(GuestAddress{arg(7)},4,Access::Write);
-            memory.store(GuestAddress{arg(4)},64,checked.privileges.size());
-            for(std::size_t i=0;i<checked.privileges.size();++i){
-                memory.store(GuestAddress{arg(4)+8+i*12},64,checked.privileges[i].luid);
-                memory.store(GuestAddress{arg(4)+16+i*12},32,checked.privileges[i].attributes);
+        }else if(symbol=="AccessCheck" || symbol=="AccessCheckByType"){
+            // AccessCheckByType 多了 PrincipalSelfSid 與 OBJECT_TYPE_LIST；其餘引數依序後移，結果寫法相同。
+            const bool by_type=symbol=="AccessCheckByType";const unsigned shift=by_type?1U:0U,tail=by_type?3U:0U;
+            const auto& token=token_for(arg(1+shift),8);if(token.type!=2)throw SddlError{1309};if(token.level<1)throw SddlError{1346};
+            const auto desired=u32(2+shift);if(desired&0xf0000000U)throw SddlError{1360};const auto mapping=mapping_at(arg(3+tail));
+            const auto privileges=arg(4+tail),privileges_size=arg(5+tail),granted_out=arg(6+tail),status_out=arg(7+tail);
+            if(!privileges_size || !granted_out || !status_out)throw SddlError{87};
+            std::vector<security::ObjectTypeNode> types;std::vector<std::uint8_t> self;
+            if(by_type){
+                if(arg(1))self=read_sid(memory,arg(1));
+                // OBJECT_TYPE_LIST：第一個為 level 0 的物件本身，之後各層最多比前一筆深一層，最深 ACCESS_MAX_LEVEL（4）。
+                const auto count=u32(5);if(count>4096 || (count && !arg(4)))throw SddlError{87};
+                for(std::uint32_t i=0;i<count;++i){
+                    const auto at=arg(4)+std::uint64_t{i}*stride;security::ObjectTypeNode node;node.level=static_cast<std::uint16_t>(memory.load(GuestAddress{at},16));
+                    const auto guid=memory.load(GuestAddress{at+unit},bits);if(!guid)throw SddlError{87};memory.read(GuestAddress{guid},std::span(node.type));
+                    if(node.level>4 || (i==0)!=(node.level==0) || (i && node.level>types.back().level+1))throw SddlError{87};
+                    types.push_back(node);
+                }
             }
-            memory.store(GuestAddress{arg(6)},32,checked.granted);memory.store(GuestAddress{arg(7)},32,checked.error?0:1);
+            const auto size=memory.load(GuestAddress{privileges_size},32);
+            const auto sd=read_descriptor(memory,arg(0),x86_,true);if(sd.data[0].empty() || sd.data[1].empty())throw SddlError{1338};
+            const auto checked=security::access_check(token,sd,desired,mapping,types,self);
+            const auto needed=8+checked.privileges.size()*12;
+            memory.store(GuestAddress{privileges_size},32,needed);if(size<needed || !privileges)throw SddlError{122};
+            memory.check(GuestAddress{privileges},needed,Access::Write);memory.check(GuestAddress{granted_out},4,Access::Write);memory.check(GuestAddress{status_out},4,Access::Write);
+            memory.store(GuestAddress{privileges},64,checked.privileges.size());
+            for(std::size_t i=0;i<checked.privileges.size();++i){
+                memory.store(GuestAddress{privileges+8+i*12},64,checked.privileges[i].luid);
+                memory.store(GuestAddress{privileges+16+i*12},32,checked.privileges[i].attributes);
+            }
+            memory.store(GuestAddress{granted_out},32,checked.granted);memory.store(GuestAddress{status_out},32,checked.error?0:1);
             result=1;if(checked.error)last_error_=checked.error;
         }else if(symbol=="AdjustTokenPrivileges"){
             auto& token=token_for(arg(0),token_adjust_privileges|(arg(4)?token_query:0));
@@ -1250,6 +1472,56 @@ std::optional<std::uint32_t> WindowsServices::invoke_token(GuestState& state,Gue
             }
             if(changed!=token.privileges){token.privileges=std::move(changed);++token.modified_id;}
             result=1;last_error_=missing?1300:0;
+        }else if(symbol=="AdjustTokenGroups"){
+            // TOKEN_ADJUST_GROUPS（0x40）；與特權調整相同：緩衝區不足時不套用任何變更，未在權杖內的群組回 ERROR_NOT_ALL_ASSIGNED。
+            auto& token=token_for(arg(0),0x40U|(arg(4)?token_query:0));const bool reset=(arg(1)&0xffU)!=0;
+            if((!reset && !arg(2)) || (arg(4) && !arg(5)))throw SddlError{87};
+            auto changed=token.groups;std::vector<TokenSid> previous;bool missing=false;
+            const auto apply=[&](const std::vector<std::uint8_t>& sid,bool enable){
+                const auto item=std::find_if(changed.begin(),changed.end(),[&](const auto& group){return group.sid==sid;});
+                if(item==changed.end()){missing=true;return;}
+                if(!enable && (item->attributes&1U))throw SddlError{1310};      // 必要群組不可停用
+                if(enable && (item->attributes&0x10U))throw SddlError{629};     // 僅拒絕群組不可啟用
+                const auto value=(item->attributes&~4U)|(enable?4U:0U);
+                if(value!=item->attributes){previous.push_back(*item);item->attributes=value;}
+            };
+            if(reset){for(const auto& group:token.groups)if(!(group.attributes&0x10U))apply(group.sid,(group.attributes&2U)!=0);}
+            else {
+                const auto count=memory.load(GuestAddress{arg(2)},32);if(count>output_limit/stride)throw SddlError{87};
+                memory.check(GuestAddress{arg(2)},unit+static_cast<std::size_t>(count)*stride,Access::Read);
+                for(std::uint64_t i=0;i<count;++i){const auto at=arg(2)+unit+i*stride;
+                    apply(read_sid(memory,memory.load(GuestAddress{at},bits)),(memory.load(GuestAddress{at+unit},32)&4U)!=0);}
+            }
+            std::size_t needed=unit+previous.size()*stride;for(const auto& item:previous)needed+=item.sid.size();
+            if(arg(4)){
+                memory.check(GuestAddress{arg(5)},4,Access::Write);memory.store(GuestAddress{arg(5)},32,needed);
+                if(u32(3)<needed)throw SddlError{122};memory.check(GuestAddress{arg(4)},needed,Access::Write);
+                memory.store(GuestAddress{arg(4)},32,previous.size());auto sid_at=arg(4)+unit+previous.size()*stride;
+                for(std::size_t i=0;i<previous.size();++i){
+                    memory.store(GuestAddress{arg(4)+unit+i*stride},bits,sid_at);memory.store(GuestAddress{arg(4)+unit+i*stride+unit},32,previous[i].attributes);
+                    memory.write(GuestAddress{sid_at},previous[i].sid);sid_at+=previous[i].sid.size();
+                }
+            }
+            if(changed!=token.groups){token.groups=std::move(changed);++token.modified_id;}
+            result=1;last_error_=missing?1300:0;
+        }else if(symbol=="PrivilegeCheck"){
+            // PRIVILEGE_SET：PrivilegeCount、Control（PRIVILEGE_SET_ALL_NECESSARY＝1）與 LUID_AND_ATTRIBUTES[]（各 12 bytes）。
+            // 已啟用的特權標上 SE_PRIVILEGE_USED_FOR_ACCESS；匿名層級的模擬權杖不能做特權檢查。
+            const auto& token=token_for(arg(0),token_query);
+            if(token.type==2 && token.level<1)throw SddlError{1346};
+            if(!arg(1) || !arg(2))throw SddlError{998};
+            const auto count=memory.load(GuestAddress{arg(1)},32),control=memory.load(GuestAddress{arg(1)+4},32);
+            if(count>output_limit/12)throw SddlError{87};
+            memory.check(GuestAddress{arg(1)},8+static_cast<std::size_t>(count)*12,Access::Write);memory.check(GuestAddress{arg(2)},4,Access::Write);
+            std::uint64_t required=(control&1U)?count:1U;
+            for(std::uint64_t i=0;i<count;++i){
+                const auto at=arg(1)+8+i*12;const auto luid=memory.load(GuestAddress{at},64);
+                const bool enabled=std::any_of(token.privileges.begin(),token.privileges.end(),[&](const auto& item){return item.luid==luid && (item.attributes&2U);});
+                auto attributes=static_cast<std::uint32_t>(memory.load(GuestAddress{at+8},32))&~0x80000000U;
+                if(enabled){attributes|=0x80000000U;if(required)--required;}
+                memory.store(GuestAddress{at+8},32,attributes);
+            }
+            memory.store(GuestAddress{arg(2)},32,required==0?1U:0U);result=1;
         }else if(symbol=="SetTokenInformation"){
             auto& token=token_for(arg(0),0x80);const auto kind=u32(1);
             if(kind!=4 && kind!=5 && kind!=6 && kind!=12 && kind!=25 && kind!=24)throw SddlError{87};

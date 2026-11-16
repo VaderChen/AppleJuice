@@ -866,10 +866,50 @@ entry \name
 slow_end \name
 .endm
 d3d12_input D3D12ListIASetIndexBuffer, X64ARM_D3D12_IA_INDEX_BUFFER, rdx, 0
-d3d12_input D3D12ListIASetVertexBuffers, X64ARM_D3D12_IA_VERTEX_BUFFER, r9, 1
 
-// 第二頁獨立映射。保留 Win64 呼叫框架，慢路徑仍能讀到原始參數。
+// 第二頁（Win64 一律映射於獨立位址）。保留 Win64 呼叫框架，慢路徑仍能讀到原始參數。
 .p2align 12, 0xcc
+
+// IASetVertexBuffers(StartSlot, NumViews, pViews)：1～16 筆檢視拆成逐槽的單一檢視紀錄（宿主重播逐槽設定，
+// 與一次設定連續 N 槽等價）。先核對筆數、起始槽 < 32、清單緩衝夠放 2N 槽，之後才改暫存器；紀錄全部寫完
+// 才發布計數，讀檢視失敗時沒有可見的部分結果。NumViews 與 StartSlot 只用低 32 位元。空檢視、0 筆或超過
+// 16 筆、超界起始槽及滿緩衝仍交回完整錄製。
+entry D3D12ListIASetVertexBuffers
+    lea eax, [r8 - 1]
+    cmp eax, 15
+    ja 1f
+    cmp edx, 32
+    jae 1f
+    test r9, r9
+    je 1f
+    mov r10, qword ptr [rcx + X64ARM_D3D12_LIST_ROOT_BUFFER]
+    test r10, r10
+    je 1f
+    mov r11d, dword ptr [r10]
+    lea eax, [r11 + 2 * r8]
+    cmp eax, X64ARM_D3D12_ROOT_BUFFER_CAPACITY
+    ja 1f
+    mov r8d, r8d
+2:
+    mov eax, r11d
+    shl rax, X64ARM_D3D12_ROOT_BINDING_SHIFT
+    add rax, r10
+    mov rcx, qword ptr [r9]
+    mov dword ptr [rax + X64ARM_D3D12_ROOT_BUFFER_HEADER], X64ARM_D3D12_IA_VERTEX_BUFFER
+    mov dword ptr [rax + X64ARM_D3D12_ROOT_BUFFER_HEADER + 4], edx
+    mov qword ptr [rax + X64ARM_D3D12_ROOT_BUFFER_HEADER + 8], rcx
+    mov rcx, qword ptr [r9 + 8]
+    mov qword ptr [rax + X64ARM_D3D12_ROOT_BUFFER_HEADER + 16], rcx
+    add r9, 16
+    inc edx
+    add r11d, 2
+    dec r8d
+    jnz 2b
+    mov dword ptr [r10], r11d
+    xor eax, eax
+    ret
+1:
+slow_end D3D12ListIASetVertexBuffers
 .macro descriptor_offset handle, low, slow
     mov rax, \handle
     sub rax, r11

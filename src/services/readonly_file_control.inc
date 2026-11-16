@@ -1,5 +1,9 @@
 // 與 readonly_files.cpp 共用原生 descriptor、inode registry 及 DOS 屬性處理。
 FileInformation ReadOnlyFiles::final_path(const HostFile& file,std::string fallback) const {
+    if(file.stream_base_){
+        const auto parsed=file_streams::parse(fallback);const auto base=final_path(*file.stream_base_,parsed.base);if(base.error)return base;
+        const auto name=file_streams::descriptor_name(file.descriptor_);if(name.second)return {{},{},name.second};const auto visible=file.information();return {base.key+":"+name.first+":$DATA",visible.metadata,visible.error};
+    }
 #if defined(_WIN32)
     (void)file;(void)fallback;return {{},{},50};
 #else
@@ -32,6 +36,7 @@ FileInformation ReadOnlyFiles::final_path(const HostFile& file,std::string fallb
 #endif
 }
 OpenHostFile ReadOnlyFiles::reopen(const HostFile& original,std::string path,std::uint32_t access,std::uint32_t sharing,std::uint32_t flags) try {
+    if(original.volume_device_)return {{},{},{},1,false}; // 卷重新開啟須經裝置權限檢查與 open_volume。
     const auto current=final_path(original,std::move(path));if(current.error)return {current.key,{},{},current.error,false};
 #if defined(_WIN32)
     (void)access;(void)sharing;(void)flags;return {current.key,{},{},50,true};
@@ -50,6 +55,8 @@ OpenHostFile ReadOnlyFiles::reopen(const HostFile& original,std::string path,std
 #endif
 }catch(const std::bad_alloc&){return {{},{},{},8,false};}
 std::uint32_t HostFile::set_basic(std::uint64_t created,std::uint64_t accessed,std::uint64_t modified,std::uint64_t changed,std::uint32_t attributes) const {
+    if(stream_base_)return 50;
+    if(volume_device_)return 1;
     if(null_device_)return 1;
     if(readonly_)return 5;if(attributes&~0x31b7U || created==UINT64_MAX || accessed==UINT64_MAX || modified==UINT64_MAX || changed==UINT64_MAX)return 50;
 #if defined(_WIN32)
@@ -109,6 +116,7 @@ std::uint32_t HostFile::copy_template_metadata(int destination,bool directory,st
 #endif
 }
 std::uint32_t HostFile::allocate(std::uint64_t size) const {
+    if(volume_device_)return 1;
     if(null_device_)return 1;
     if(readonly_)return 5;if(size>INT64_MAX)return 87;const auto info=information();if(info.error)return info.error;if(info.metadata.attributes&0x10U)return 5;
     if(size<info.metadata.size)return truncate(size);if(size==info.metadata.allocation_size)return 0;
@@ -132,15 +140,21 @@ std::uint32_t ReadOnlyFiles::set_disposition(HostFile& file,std::string path,boo
     if(file.state_->shared){if(const auto error=file.state_->shared->sharing(0x10000U,7,file.transfer_identity(),true))return error;}
     for(const auto& weak:file.state_->opens)if(const auto peer=weak.lock())if(peer.get()!=&file && (!file.transfer_identity() || peer->transfer_identity()!=file.transfer_identity()) && !(peer->sharing_&4U))return 32;
     if(current.metadata.attributes&0x10U){const auto copy=::fcntl(file.descriptor_,F_DUPFD_CLOEXEC,0);if(copy<0)return native_error();std::unique_ptr<DIR,decltype(&::closedir)> directory(::fdopendir(copy),::closedir);if(!directory){::close(copy);return native_error();}while(const auto* entry=::readdir(directory.get()))if(std::string_view(entry->d_name)!="." && std::string_view(entry->d_name)!="..")return 145;}
-    std::string leaf;auto parent=resolve(current.key,true,&leaf);FileDescriptor directory{parent.descriptor};if(parent.error)return parent.error;
+    std::string leaf;Resolved parent;auto identity_info=current.metadata;
+    if(file.stream_base_){
+        const auto name=file_streams::descriptor_name(file.descriptor_);if(name.second)return name.second;leaf=file_streams::storage_key(name.first);
+        parent.descriptor=::fcntl(file.stream_directory_->descriptor,F_DUPFD_CLOEXEC,0);if(parent.descriptor<0)return native_error();
+        const auto storage=file.storage_information();if(storage.error){::close(parent.descriptor);return storage.error;}identity_info=storage.metadata;
+    }else parent=resolve(current.key,true,&leaf);
+    FileDescriptor directory{parent.descriptor};if(parent.error)return parent.error;
     struct stat identity{},parent_info{};if(::fstatat(directory.value,leaf.c_str(),&identity,AT_SYMLINK_NOFOLLOW)<0 || ::fstat(directory.value,&parent_info)<0)return native_error();
-    if(static_cast<std::uint64_t>(identity.st_dev)!=current.metadata.device || static_cast<std::uint64_t>(identity.st_ino)!=current.metadata.id)return 2;if(::faccessat(directory.value,".",W_OK|X_OK,0)<0)return native_error();
-    if(!file.delete_target_){auto target=std::make_shared<HostDeleteTarget>();target->leaf=leaf;target->directory=::fcntl(directory.value,F_DUPFD_CLOEXEC,0);if(target->directory<0)return native_error();target->device=current.metadata.device;target->inode=current.metadata.id;target->parent_device=static_cast<std::uint64_t>(parent_info.st_dev);target->parent_inode=static_cast<std::uint64_t>(parent_info.st_ino);target->is_directory=(current.metadata.attributes&0x10U)!=0;file.state_->targets.push_back(target);file.delete_target_=std::move(target);}
+    if(static_cast<std::uint64_t>(identity.st_dev)!=identity_info.device || static_cast<std::uint64_t>(identity.st_ino)!=identity_info.id)return 2;if(::faccessat(directory.value,".",W_OK|X_OK,0)<0)return native_error();
+    if(!file.delete_target_){auto target=std::make_shared<HostDeleteTarget>();target->leaf=leaf;target->directory=::fcntl(directory.value,F_DUPFD_CLOEXEC,0);if(target->directory<0)return native_error();target->device=identity_info.device;target->inode=identity_info.id;target->parent_device=static_cast<std::uint64_t>(parent_info.st_dev);target->parent_inode=static_cast<std::uint64_t>(parent_info.st_ino);target->is_directory=(current.metadata.attributes&0x10U)!=0;file.state_->targets.push_back(target);file.delete_target_=std::move(target);}
     else if(file.delete_target_->leaf!=leaf || file.delete_target_->parent_device!=static_cast<std::uint64_t>(parent_info.st_dev) || file.delete_target_->parent_inode!=static_cast<std::uint64_t>(parent_info.st_ino)){
         // 取消刪除後，宿主也可能更名；重新設定時固定目前仍屬於原 inode 的項目。
         FileDescriptor updated{::fcntl(directory.value,F_DUPFD_CLOEXEC,0)};if(updated.value<0)return native_error();std::swap(file.delete_target_->directory,updated.value);file.delete_target_->leaf.swap(leaf);file.delete_target_->parent_device=static_cast<std::uint64_t>(parent_info.st_dev);file.delete_target_->parent_inode=static_cast<std::uint64_t>(parent_info.st_ino);
     }
-    if(file.state_->shared){const auto info=file.information();if(info.error)return info.error;auto [index,error]=file.state_->shared->target(file.delete_target_->directory,file.delete_target_->leaf,info.metadata,file.delete_target_->is_directory);if(error)return error;file.delete_target_->shared_index=index;if(const auto code=file.state_->shared->disposition(index,true,file.transfer_identity()))return code;}
+    if(file.state_->shared){const auto info=file.storage_information();if(info.error)return info.error;auto [index,error]=file.state_->shared->target(file.delete_target_->directory,file.delete_target_->leaf,info.metadata,file.delete_target_->is_directory);if(error)return error;file.delete_target_->shared_index=index;if(const auto code=file.state_->shared->disposition(index,true,file.transfer_identity()))return code;}
     file.delete_target_->pending=true;file.state_->pending=true;return 0;
 #endif
 }catch(const std::bad_alloc&){return 8;}

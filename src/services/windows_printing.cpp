@@ -5,6 +5,7 @@
 #include "x64arm/registry_store.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "printer_forms.hpp"
+#include "service_callback_task.hpp"
 #include <algorithm>
 #include <chrono>
 #include <unistd.h>
@@ -117,8 +118,18 @@ std::span<const WindowsServiceDescriptor> printing_service_descriptors(){
         {"winspool.drv","GetJobA",6},{"winspool.drv","GetJobW",6},{"winspool.drv","FindFirstPrinterChangeNotification",4},{"winspool.drv","FindNextPrinterChangeNotification",4},{"winspool.drv","FindClosePrinterChangeNotification",1},
         {"winspool.drv","StartDocPrinterA",3},{"winspool.drv","StartDocPrinterW",3},{"winspool.drv","StartPagePrinter",1},{"winspool.drv","WritePrinter",4},{"winspool.drv","EndPagePrinter",1},{"winspool.drv","EndDocPrinter",1},{"winspool.drv","AbortPrinter",1},
         {"winspool.drv","EnumPrintProcessorDatatypesA",7},{"winspool.drv","EnumPrintProcessorDatatypesW",7},
+        {"winspool.drv","GetPrinterDataA",6},{"winspool.drv","GetPrinterDataW",6},{"winspool.drv","GetPrinterDataExA",7},{"winspool.drv","GetPrinterDataExW",7},
+        {"winspool.drv","SetPrinterDataA",5},{"winspool.drv","SetPrinterDataW",5},{"winspool.drv","SetPrinterDataExA",6},{"winspool.drv","SetPrinterDataExW",6},
+        {"winspool.drv","EnumPrinterDataA",9},{"winspool.drv","EnumPrinterDataW",9},{"winspool.drv","EnumPrinterDataExA",6},{"winspool.drv","EnumPrinterDataExW",6},
+        {"winspool.drv","EnumPrinterKeyA",5},{"winspool.drv","EnumPrinterKeyW",5},{"winspool.drv","DeletePrinterDataA",2},{"winspool.drv","DeletePrinterDataW",2},
+        {"winspool.drv","DeletePrinterDataExA",3},{"winspool.drv","DeletePrinterDataExW",3},{"winspool.drv","DeletePrinterKeyA",2},{"winspool.drv","DeletePrinterKeyW",2},
+        {"winspool.drv","EnumPortsA",6},{"winspool.drv","EnumPortsW",6},{"winspool.drv","EnumMonitorsA",6},{"winspool.drv","EnumMonitorsW",6},
+        {"winspool.drv","EnumPrintProcessorsA",7},{"winspool.drv","EnumPrintProcessorsW",7},{"winspool.drv","EnumPrinterDriversA",7},{"winspool.drv","EnumPrinterDriversW",7},
+        {"winspool.drv","GetPrinterDriverDirectoryA",6},{"winspool.drv","GetPrinterDriverDirectoryW",6},{"winspool.drv","GetPrintProcessorDirectoryA",6},{"winspool.drv","GetPrintProcessorDirectoryW",6},
+        {"winspool.drv","IsValidDevmodeA",2},{"winspool.drv","IsValidDevmodeW",2},{"winspool.drv","OpenPrinter2A",4},{"winspool.drv","OpenPrinter2W",4},
+        {"winspool.drv","SetDefaultPrinterA",1},{"winspool.drv","SetDefaultPrinterW",1},
         {"spoolss.dll","StartDocPrinterA",3},{"spoolss.dll","StartDocPrinterW",3},{"spoolss.dll","StartPagePrinter",1},{"spoolss.dll","WritePrinter",4},{"spoolss.dll","EndPagePrinter",1},{"spoolss.dll","EndDocPrinter",1},{"spoolss.dll","AbortPrinter",1},
-        {"gdi32.dll","ResetDCA",2},{"gdi32.dll","ResetDCW",2},{"gdi32.dll","ExtEscape",6}
+        {"gdi32.dll","ResetDCA",2},{"gdi32.dll","ResetDCW",2},{"gdi32.dll","ExtEscape",6},{"gdi32.dll","DrawEscape",4},{"gdi32.dll","NamedEscape",7}
     };return table;
 }
 std::span<const WindowsServiceDescriptor> printing_escape_service_descriptors(){
@@ -130,6 +141,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_printing(GuestState& state,
     const bool legacy=name=="Escape";const auto escape=legacy?static_cast<std::uint32_t>(arg(1)):0U;
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto failure=[&](unsigned error){last_error_=error;return finish(name=="CancelDC" || name.starts_with("ResetDC")?0:UINT32_MAX);};
+    if(name=="DrawEscape"){
+        // 繪圖跳脫：原生顯示與 PDF 驅動都沒有繪圖跳脫，QUERYESCSUPPORT 對任何代碼皆回報不支援，其他跳脫回 0（未實作）。
+        if(!gui_.contexts.contains(arg(0)))return failure(6);
+        if(static_cast<std::int32_t>(arg(2))<0)return failure(87);
+        if(static_cast<std::uint32_t>(arg(1))==8 && (static_cast<std::uint32_t>(arg(2))<4 || !arg(3)))return failure(87);
+        return finish(0);
+    }
+    if(name=="NamedEscape"){
+        // 依驅動名稱送出跳脫（hdc 可為 NULL）：與 ExtEscape 相同的支援集合，只有 QUERYESCSUPPORT 本身。
+        if(!arg(1))return failure(87);
+        if(arg(0) && !gui_.contexts.contains(arg(0)))return failure(6);
+        if(static_cast<std::int32_t>(arg(3))<0 || static_cast<std::int32_t>(arg(5))<0)return failure(87);
+        if(static_cast<std::uint32_t>(arg(2))==8){if(static_cast<std::uint32_t>(arg(3))<4 || !arg(4))return failure(87);return finish(memory.load(GuestAddress{arg(4)},32)==8?1:0);}
+        return finish(0);
+    }
     if(name=="ExtEscape"){
         if(!gui_.contexts.contains(arg(0)))return failure(6);
         if(static_cast<std::int32_t>(arg(2))<0 || static_cast<std::int32_t>(arg(4))<0)return failure(87);
@@ -282,6 +308,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
     const auto printer_name=[&](std::uint64_t at){auto value=string(at);for(auto& c:value)if(c>=u'A' && c<=u'Z')c+=32;return value==u"win64 pdf";};
     const bool available=native_gui_ && runtime_.network.external_io;
     if(!printing_)printing_=std::make_shared<PrintingState>();
+    if(name.find("PrinterData")!=std::string_view::npos || name.starts_with("EnumPrinterKey") || name.starts_with("DeletePrinterKey"))return invoke_printer_data(state,memory,service);
     const auto copy=[&](const PrinterBuffer& buffer,std::uint64_t target,std::uint64_t capacity,std::uint64_t needed){if(!needed)return fail(87);memory.store(GuestAddress{needed},32,buffer.bytes.size());if(capacity<buffer.bytes.size())return fail(122);if(!target && !buffer.bytes.empty())return fail(87);if(!buffer.bytes.empty())memory.write(GuestAddress{target},buffer.bytes);return finish(1);};
     if(name.starts_with("EnumPrintProcessorDatatypes")){
         if(!arg(5) || !arg(6))return fail(87);memory.store(GuestAddress{arg(6)},32,0);
@@ -289,6 +316,67 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
         if(!available || !printer_name(arg(1)))return fail(1798);
         PrinterBuffer buffer(unit*2,arg(3),x86_,wide);buffer.text(0,u"RAW");buffer.text(unit,u"TEXT");
         if(d(4)>=buffer.bytes.size() && arg(3))memory.store(GuestAddress{arg(6)},32,2);return copy(buffer,arg(3),d(4),arg(5));
+    }
+    // 虛擬列印系統的組態：連接埠 FILE:（Local Port 監視器）、列印處理器與驅動程式 Win64 PDF；列印子系統不可用時清單為空。
+    const auto environment_ok=[&](std::uint64_t at,bool all){if(!at)return true;const auto value=string(at);if(value.empty())return true;
+        auto lower=value;for(auto& c:lower)if(c>=u'A' && c<=u'Z')c+=32;if(all && lower==u"all")return true;return value==(x86_?u"Windows NT x86":u"Windows x64");};
+    const auto local_server=[&](std::uint64_t at){return !at || string(at).empty() || string(at)==u"\\\\X64ARM";};
+    const auto driver_info=[&](PrinterBuffer& buffer,unsigned level){
+        if(level==1)buffer.text(0,u"Win64 PDF");
+        else{buffer.put(0,3);buffer.text(unit,u"Win64 PDF");buffer.text(unit*2,x86_?u"Windows NT x86":u"Windows x64");buffer.text(unit*3,u"winspool.drv");buffer.text(unit*4,u"");buffer.text(unit*5,u"winspool.drv");}
+    };
+    const auto enumerate_config=[&](std::uint64_t target,std::uint64_t capacity,std::uint64_t needed,std::uint64_t returned,const PrinterBuffer& buffer,unsigned count){
+        if(!needed || !returned)return fail(87);memory.store(GuestAddress{returned},32,0);
+        if(capacity>=buffer.bytes.size() && (target || buffer.bytes.empty()))memory.store(GuestAddress{returned},32,count);return copy(buffer,target,capacity,needed);
+    };
+    if(name.starts_with("EnumPorts") || name.starts_with("EnumMonitors")){
+        if(!local_server(arg(0)))return fail(1801);const auto level=d(1);if(level!=1 && level!=2)return fail(124);
+        const bool port=name.starts_with("EnumPorts");
+        PrinterBuffer buffer(available?(level==1?unit:(port?unit*3+8:unit*3)):0,arg(2),x86_,wide);
+        if(available){
+            if(port){buffer.text(0,u"FILE:");if(level==2){buffer.text(unit,u"Local Port");buffer.text(unit*2,u"Local Port");buffer.put(unit*3,1);}} // PORT_TYPE_WRITE
+            else{buffer.text(0,u"Local Port");if(level==2){buffer.text(unit,x86_?u"Windows NT x86":u"Windows x64");buffer.text(unit*2,u"localspl.dll");}}
+        }
+        return enumerate_config(arg(2),d(3),arg(4),arg(5),buffer,available?1:0);
+    }
+    if(name.starts_with("EnumPrintProcessors") || name.starts_with("EnumPrinterDrivers")){
+        if(!local_server(arg(0)))return fail(1801);const bool drivers=name.starts_with("EnumPrinterDrivers");
+        if(!environment_ok(arg(1),drivers))return fail(1805);const auto level=d(2);if(level!=1 && !(drivers && level==2))return fail(124);
+        PrinterBuffer buffer(available?(level==1?unit:unit*6):0,arg(3),x86_,wide);
+        if(available){if(drivers)driver_info(buffer,level);else buffer.text(0,u"Win64 PDF");}
+        return enumerate_config(arg(3),d(4),arg(5),arg(6),buffer,available?1:0);
+    }
+    if(name.starts_with("GetPrinterDriverDirectory") || name.starts_with("GetPrintProcessorDirectory")){
+        if(!local_server(arg(0)))return fail(1801);if(!environment_ok(arg(1),false))return fail(1805);if(d(2)!=1)return fail(124);if(!arg(5))return fail(87);
+        const auto folder=std::u16string(name.starts_with("GetPrinterDriverDirectory")?u"C:\\Windows\\System32\\spool\\drivers\\":u"C:\\Windows\\System32\\spool\\prtprocs\\")+(x86_?u"W32X86":u"x64");
+        std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(folder);else{const auto text=utf16_to_utf8(folder);bytes.assign(text.begin(),text.end());bytes.push_back(0);}
+        memory.store(GuestAddress{arg(5)},32,bytes.size());if(d(4)<bytes.size())return fail(122);if(!arg(3))return fail(87);memory.write(GuestAddress{arg(3)},bytes);return finish(1);
+    }
+    if(name.starts_with("IsValidDevmode")){
+        // dmSize（含 dmDriverExtra）不得超過呼叫端給的大小；dmFields 指定的欄位須在有效範圍內。
+        if(!arg(0))return finish(0);const unsigned base=wide?64:32;const auto size=static_cast<std::uint64_t>(arg(1));if(size<base+8)return finish(0);
+        memory.check(GuestAddress{arg(0)},base+8,Access::Read);
+        const auto word=[&](unsigned offset){return static_cast<unsigned>(memory.load(GuestAddress{arg(0)+offset},16));};
+        const auto dm_size=word(base+4),extra=word(base+6);const unsigned minimum=wide?188:124;
+        if(dm_size<minimum || std::uint64_t{dm_size}+extra>size)return finish(0);
+        const auto fields=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+base+8},32));const auto body=base+12;
+        const auto value=[&](unsigned offset){return std::bit_cast<std::int16_t>(static_cast<std::uint16_t>(word(body+offset)));};
+        if((fields&1) && value(0)!=1 && value(0)!=2)return finish(0);
+        if((fields&2) && value(2)<=0)return finish(0);
+        if((fields&4) && value(4)<=0)return finish(0);if((fields&8) && value(6)<=0)return finish(0);
+        if((fields&16) && value(8)<=0)return finish(0);if((fields&0x100) && value(10)<=0)return finish(0);
+        if((fields&0x800) && value(16)!=1 && value(16)!=2)return finish(0);if((fields&0x1000) && (value(18)<1 || value(18)>3))return finish(0);
+        if((fields&0x8000) && value(24)!=0 && value(24)!=1)return finish(0);
+        return finish(1);
+    }
+    if(name.starts_with("OpenPrinter2")){
+        // PRINTER_OPTIONS（cbSize、dwFlags）只影響快取與連線方式；本機單一印表機與 OpenPrinter 相同。
+        if(arg(3)){memory.check(GuestAddress{arg(3)},8,Access::Read);if(memory.load(GuestAddress{arg(3)},32)<8)return fail(87);}
+        return finish(nested_service(state,memory,"winspool.drv",wide?"OpenPrinterW":"OpenPrinterA",{arg(0),arg(1),arg(2)}));
+    }
+    if(name.starts_with("SetDefaultPrinter")){
+        // 只有一台虛擬印表機：NULL 或空字串選第一台，指定名稱須存在。
+        if(!available)return fail(1801);if(arg(0) && !string(arg(0)).empty() && !printer_name(arg(0)))return fail(1801);return finish(1);
     }
     if(name.starts_with("GetDefaultPrinter")){
         if(!arg(1))return fail(87);const auto capacity=memory.load(GuestAddress{arg(1)},32);memory.store(GuestAddress{arg(1)},32,available?10:0);if(!available)return fail(2);if(capacity<10 || !arg(0))return fail(122);
@@ -386,7 +474,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
         if((level==2 || level==5) && arg(1) && !string(arg(1)).empty())return fail(50);
         if(!available || !(flags&2) || (flags&(32|0x2000000))){PrinterBuffer empty(0,target,x86_,wide);return copy(empty,target,capacity,needed);}
     }
-    if(driver){if(arg(1) && !string(arg(1)).empty() && string(arg(1))!=(x86_?u"Windows NT x86":u"Windows x64"))return fail(1805);if(level!=1 && level!=2)return fail(124);PrinterBuffer buffer(level==1?unit:unit*6,target,x86_,wide);if(level==1)buffer.text(0,u"Win64 PDF");else{buffer.put(0,3);buffer.text(unit,u"Win64 PDF");buffer.text(unit*2,x86_?u"Windows NT x86":u"Windows x64");buffer.text(unit*3,u"winspool.drv");buffer.text(unit*4,u"");buffer.text(unit*5,u"winspool.drv");}return copy(buffer,target,capacity,needed);}
+    if(driver){if(arg(1) && !string(arg(1)).empty() && string(arg(1))!=(x86_?u"Windows NT x86":u"Windows x64"))return fail(1805);if(level!=1 && level!=2)return fail(124);PrinterBuffer buffer(level==1?unit:unit*6,target,x86_,wide);driver_info(buffer,level);return copy(buffer,target,capacity,needed);}
     if(job){
         const PrintingState::Device* selected=nullptr;for(const auto* list:{&printing_->devices,&printing_->handles})for(const auto& [handle,device]:*list){(void)handle;if(device.active && device.job==d(1))selected=&device;}
         if(!selected)return fail(87);if(level!=1 && level!=2)return fail(124);const auto& device=*selected;
@@ -404,5 +492,129 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
         case 2:buffer.text(unit,u"Win64 PDF");buffer.text(unit*3,u"FILE:");buffer.text(unit*4,u"Win64 PDF");buffer.text(unit*5,u"CoreGraphics PDF");buffer.data(unit*7,printer_devmode(wide,defaults));buffer.text(unit*9,u"Win64 PDF");buffer.text(unit*10,u"RAW");buffer.put(unit*13,0x40);buffer.put(unit*13+4,1);buffer.put(unit*13+8,1);buffer.put(unit*13+24,jobs);break;
         case 4:buffer.text(0,u"Win64 PDF");buffer.put(unit*2,0x40);break;case 5:buffer.text(0,u"Win64 PDF");buffer.text(unit,u"FILE:");buffer.put(unit*2,0x40);break;case 7:buffer.put(unit,4);break;case 8:case 9:buffer.data(0,printer_devmode(wide,defaults));break;default:break;}
     if(enumeration && capacity>=buffer.bytes.size() && target)memory.store(GuestAddress{arg(6)},32,1);return copy(buffer,target,capacity,needed);
+}
+// 印表機資料（登錄 HKLM\SYSTEM\CurrentControlSet\Control\Print\Printers\Win64 PDF\<鍵>；非 Ex 版本固定為 PrinterDriverData），經客體登錄 API 存取，
+// 沿用登錄的權限、持久化與延後 I/O 契約。寫入與刪除需要 PRINTER_ACCESS_ADMINISTER；A 版名稱與字串型資料以 UTF-8（ACP）轉換。回傳 Win32 錯誤碼。
+std::optional<std::uint32_t> WindowsServices::invoke_printer_data(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    return nested_continuation(state,memory,"印表機資料",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+        const WindowsCall call(s,m,service);const auto name=service.symbol;const bool wide=name.ends_with('W');const unsigned unit=x86_?4:8;
+        const auto finish=[&](std::uint64_t value){call.return_to(s,value);return std::optional<std::uint32_t>{};};
+        std::vector<std::uint64_t> blocks;
+        struct Release {WindowsServices& self;GuestMemory& m;GuestState& s;std::vector<std::uint64_t>& blocks;~Release(){for(const auto block:blocks)(void)self.free_heap(m,block,s);}} release{*this,m,s,blocks};
+        const auto scratch=[&](std::size_t size)->std::uint64_t{const auto block=allocate_heap(m,std::max<std::size_t>(size,1));if(!block)throw std::bad_alloc{};m.fill(GuestAddress{block},0,std::max<std::size_t>(size,1));blocks.push_back(block);return block;};
+        const auto put_text=[&](std::u16string_view text){const auto bytes=utf16_bytes(text);const auto block=scratch(bytes.size());m.write(GuestAddress{block},bytes);return block;};
+        const auto string=[&](std::uint64_t at){return at?(wide?read_utf16(m,GuestAddress{at}):utf8_to_utf16(read_ansi(m,at))):std::u16string{};};
+        const auto api=[&](std::string_view symbol,std::vector<std::uint64_t> arguments)->service_callback::Task<std::uint32_t>{
+            co_return static_cast<std::uint32_t>(co_await service_callback::call_value(resolve("advapi32.dll",symbol).value,std::move(arguments)));};
+        const auto handle=printing_?printing_->handles.find(call(0)):decltype(printing_->handles.end()){};
+        if(!printing_ || handle==printing_->handles.end())co_return finish(6);
+        const bool administer=(handle->second.access&4U)!=0;
+        const bool ex=name.find("Ex")!=std::string_view::npos || name.starts_with("EnumPrinterKey") || name.starts_with("DeletePrinterKey");
+        const auto key_name=ex?string(call(1)):std::u16string(u"PrinterDriverData");
+        if(ex && !call(1))co_return finish(87);
+        std::u16string path=u"SYSTEM\\CurrentControlSet\\Control\\Print\\Printers\\Win64 PDF";if(!key_name.empty())path+=u"\\"+key_name;
+        const std::uint64_t machine=x86_?UINT64_C(0x80000002):UINT64_C(0xffffffff80000002);constexpr std::uint32_t wow64_64=0x100;
+        // 寬字元登錄資料與 A 版之間的轉換：只轉字串型別（REG_SZ、REG_EXPAND_SZ、REG_MULTI_SZ）。
+        const auto stringy=[](std::uint32_t type){return type==1 || type==2 || type==7;};
+        const auto narrow_data=[&](std::uint32_t type,std::vector<std::uint8_t> data){
+            if(wide || !stringy(type))return data;std::u16string text(data.size()/2,u'\0');for(std::size_t i=0;i<text.size();++i)text[i]=static_cast<char16_t>(data[i*2]|(data[i*2+1]<<8));
+            const auto utf8=utf16_to_utf8(text);return std::vector<std::uint8_t>(utf8.begin(),utf8.end());};
+        const auto value_bytes=[&](std::u16string_view text){std::vector<std::uint8_t> bytes;if(wide)bytes=utf16_bytes(text);else{const auto utf8=utf16_to_utf8(text);bytes.assign(utf8.begin(),utf8.end());bytes.push_back(0);}return bytes;};
+        const auto open=[&](std::uint32_t access,bool create)->service_callback::Task<std::uint64_t>{
+            const auto slot=scratch(8);const auto key_path=put_text(path);
+            const auto error=create?co_await api("RegCreateKeyExW",{machine,key_path,0,0,0,access|wow64_64,0,slot,0}):co_await api("RegOpenKeyExW",{machine,key_path,0,access|wow64_64,slot});
+            co_return error?0:m.load(GuestAddress{slot},x86_?32:64);};
+        const auto close=[&](std::uint64_t key)->service_callback::Task<std::uint32_t>{co_return co_await api("RegCloseKey",{key});};
+        struct Value {std::u16string name;std::uint32_t type{};std::vector<std::uint8_t> data;};
+        // 依登錄列舉順序取得所有值（RegQueryInfoKeyW 取得最大長度後逐一 RegEnumValueW）。
+        const auto values=[&](std::uint64_t key)->service_callback::Task<std::vector<Value>>{
+            std::vector<Value> out;const auto info=scratch(64);
+            if(co_await api("RegQueryInfoKeyW",{key,0,0,0,0,0,0,info,info+4,info+8,0,0}))co_return out;
+            const auto count=static_cast<std::uint32_t>(m.load(GuestAddress{info},32)),longest_name=static_cast<std::uint32_t>(m.load(GuestAddress{info+4},32))+1,longest_data=static_cast<std::uint32_t>(m.load(GuestAddress{info+8},32));
+            const auto name_buffer=scratch(std::size_t{longest_name}*2),data_buffer=scratch(longest_data),sizes=scratch(16);
+            for(std::uint32_t i=0;i<count;++i){
+                m.store(GuestAddress{sizes},32,longest_name);m.store(GuestAddress{sizes+4},32,longest_data);
+                if(co_await api("RegEnumValueW",{key,i,name_buffer,sizes,0,sizes+8,data_buffer,sizes+4}))break;
+                Value value;value.name=read_utf16(m,GuestAddress{name_buffer},longest_name);value.type=static_cast<std::uint32_t>(m.load(GuestAddress{sizes+8},32));
+                value.data.resize(static_cast<std::size_t>(m.load(GuestAddress{sizes+4},32)));if(!value.data.empty())m.read(GuestAddress{data_buffer},value.data);
+                out.push_back(std::move(value));
+            }
+            co_return out;};
+        if(name.starts_with("GetPrinterData")){
+            const auto value_name=string(call(ex?2:1));const auto type_out=call(ex?3:2),data_out=call(ex?4:3),needed=call(ex?6:5);const auto capacity=static_cast<std::uint32_t>(call(ex?5:4));
+            if(!needed)co_return finish(87);
+            const auto key=co_await open(0x20019,false);if(!key)co_return finish(2);
+            std::uint32_t error=0;std::vector<std::uint8_t> data;std::uint32_t type=0;
+            {const auto sizes=scratch(8);const auto value=put_text(value_name);
+                error=co_await api("RegQueryValueExW",{key,value,0,sizes,0,sizes+4});
+                if(!error){const auto size=static_cast<std::uint32_t>(m.load(GuestAddress{sizes+4},32));const auto buffer=scratch(size);
+                    error=co_await api("RegQueryValueExW",{key,value,0,sizes,buffer,sizes+4});
+                    if(!error){type=static_cast<std::uint32_t>(m.load(GuestAddress{sizes},32));data.resize(static_cast<std::size_t>(m.load(GuestAddress{sizes+4},32)));if(!data.empty())m.read(GuestAddress{buffer},data);}}}
+            (void)co_await close(key);if(error)co_return finish(error);
+            data=narrow_data(type,std::move(data));
+            m.store(GuestAddress{needed},32,data.size());if(type_out)m.store(GuestAddress{type_out},32,type);
+            if(capacity<data.size())co_return finish(234);if(!data.empty()){if(!data_out)co_return finish(87);m.write(GuestAddress{data_out},data);}
+            co_return finish(0);
+        }
+        if(name.starts_with("SetPrinterData")){
+            if(!administer)co_return finish(5);
+            const auto value_name=string(call(ex?2:1));const auto type=static_cast<std::uint32_t>(call(ex?3:2));const auto data_in=call(ex?4:3);const auto size=static_cast<std::uint32_t>(call(ex?5:4));
+            if(size && !data_in)co_return finish(87);
+            std::vector<std::uint8_t> data(size);if(size)m.read(GuestAddress{data_in},data);
+            if(!wide && stringy(type)){const auto text=utf8_to_utf16(std::string(data.begin(),data.end()));data=utf16_bytes(text);data.resize(text.size()*2);
+                if(text.empty() || text.back()!=u'\0'){data.push_back(0);data.push_back(0);}}
+            const auto key=co_await open(0x2001f,true);if(!key)co_return finish(5);
+            const auto buffer=scratch(data.size());if(!data.empty())m.write(GuestAddress{buffer},data);
+            const auto error=co_await api("RegSetValueExW",{key,put_text(value_name),0,type,buffer,data.size()});(void)co_await close(key);
+            if(!error)printing_changed(0x4);co_return finish(error);
+        }
+        if(name.starts_with("DeletePrinterData") || name.starts_with("DeletePrinterKey")){
+            if(!administer)co_return finish(5);
+            if(name.starts_with("DeletePrinterKey")){if(key_name.empty())co_return finish(87);co_return finish(co_await api("RegDeleteTreeW",{machine,put_text(path)}));}
+            const auto key=co_await open(0x2001f,false);if(!key)co_return finish(2);
+            const auto error=co_await api("RegDeleteValueW",{key,put_text(string(call(ex?2:1)))});(void)co_await close(key);co_return finish(error);
+        }
+        if(name.starts_with("EnumPrinterKey")){
+            // 子鍵名稱以 MULTI_SZ 回傳（每個名稱以 NUL 結尾，最後再一個 NUL）。
+            const auto output=call(2),needed=call(4);const auto capacity=static_cast<std::uint32_t>(call(3));if(!needed)co_return finish(87);
+            const auto key=co_await open(0x20019,false);if(!key)co_return finish(2);
+            std::vector<std::u16string> names;const auto buffer=scratch(512),size=scratch(4);
+            for(std::uint32_t i=0;;++i){m.store(GuestAddress{size},32,256);if(co_await api("RegEnumKeyExW",{key,i,buffer,size,0,0,0,0}))break;names.push_back(read_utf16(m,GuestAddress{buffer},256));}
+            (void)co_await close(key);
+            std::vector<std::uint8_t> bytes;for(const auto& item:names){const auto encoded=value_bytes(item);bytes.insert(bytes.end(),encoded.begin(),encoded.end());}
+            bytes.resize(bytes.size()+(wide?2:1),0);
+            m.store(GuestAddress{needed},32,bytes.size());if(capacity<bytes.size())co_return finish(234);if(!output)co_return finish(87);m.write(GuestAddress{output},bytes);co_return finish(0);
+        }
+        const auto key=co_await open(0x20019,false);if(!key)co_return finish(2);
+        auto all=co_await values(key);(void)co_await close(key);
+        if(name.starts_with("EnumPrinterDataEx")){
+            // PRINTER_ENUM_VALUES 陣列（pValueName、cbValueName、dwType、pData、cbData）後接名稱與資料。
+            const auto output=call(2),needed=call(4),count=call(5);const auto capacity=static_cast<std::uint32_t>(call(3));if(!needed || !count)co_return finish(87);
+            const unsigned record=x86_?20:32;PrinterBuffer buffer(static_cast<unsigned>(all.size())*record,output,x86_,wide);
+            for(std::size_t i=0;i<all.size();++i){
+                const auto at=static_cast<unsigned>(i)*record;const auto encoded=value_bytes(all[i].name);const auto data=narrow_data(all[i].type,all[i].data);
+                buffer.data(at,encoded);buffer.put(at+unit,encoded.size());buffer.put(at+unit+4,all[i].type);buffer.data(at+unit+8,data);buffer.put(at+2*unit+8,data.size());
+            }
+            m.store(GuestAddress{needed},32,buffer.bytes.size());m.store(GuestAddress{count},32,0);
+            if(capacity<buffer.bytes.size())co_return finish(234);if(!buffer.bytes.empty()){if(!output)co_return finish(87);m.write(GuestAddress{output},buffer.bytes);}
+            m.store(GuestAddress{count},32,all.size());co_return finish(0);
+        }
+        // EnumPrinterData：cbValueName 與 cbData 都是 0 時回報最大名稱與資料大小。
+        const auto index=static_cast<std::uint32_t>(call(1));const auto name_out=call(2),name_needed=call(4),type_out=call(5),data_out=call(6),data_needed=call(8);
+        const auto name_capacity=static_cast<std::uint32_t>(call(3)),data_capacity=static_cast<std::uint32_t>(call(7));
+        if(!name_needed || !data_needed)co_return finish(87);
+        if(!name_capacity && !data_capacity){
+            std::size_t longest_name=0,longest_data=0;for(const auto& value:all){longest_name=std::max(longest_name,value_bytes(value.name).size());longest_data=std::max(longest_data,narrow_data(value.type,value.data).size());}
+            if(all.empty())co_return finish(259);
+            m.store(GuestAddress{name_needed},32,longest_name);m.store(GuestAddress{data_needed},32,longest_data);co_return finish(0);
+        }
+        if(index>=all.size())co_return finish(259);
+        const auto encoded=value_bytes(all[index].name);const auto data=narrow_data(all[index].type,all[index].data);
+        m.store(GuestAddress{name_needed},32,encoded.size());m.store(GuestAddress{data_needed},32,data.size());
+        if(name_capacity<encoded.size() || data_capacity<data.size())co_return finish(234);
+        if(!name_out || (!data.empty() && !data_out))co_return finish(87);
+        m.write(GuestAddress{name_out},encoded);if(!data.empty())m.write(GuestAddress{data_out},data);if(type_out)m.store(GuestAddress{type_out},32,all[index].type);
+        co_return finish(0);
+    });
 }
 }

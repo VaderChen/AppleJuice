@@ -25,6 +25,11 @@ std::span<const WindowsServiceDescriptor> service_control_descriptors() {
         {"advapi32.dll","SetServiceStatus",2},{"advapi32.dll","QueryServiceObjectSecurity",5},{"advapi32.dll","SetServiceObjectSecurity",3},
         {"advapi32.dll","EnumServicesStatusA",8},{"advapi32.dll","EnumServicesStatusW",8},
         {"advapi32.dll","EnumServicesStatusExA",10},{"advapi32.dll","EnumServicesStatusExW",10},
+        // 目錄查詢：顯示名稱／鍵名互查、相依服務（遞移，依停止順序）、相容用的資料庫鎖定。
+        {"advapi32.dll","GetServiceDisplayNameA",4},{"advapi32.dll","GetServiceDisplayNameW",4},{"advapi32.dll","GetServiceKeyNameA",4},{"advapi32.dll","GetServiceKeyNameW",4},
+        {"advapi32.dll","EnumDependentServicesA",6,0,0,0x2},{"advapi32.dll","EnumDependentServicesW",6,0,0,0x2},
+        {"advapi32.dll","LockServiceDatabase",1},{"advapi32.dll","UnlockServiceDatabase",1},
+        {"advapi32.dll","QueryServiceLockStatusA",4,0,0,0x4},{"advapi32.dll","QueryServiceLockStatusW",4,0,0,0x4},
         {"internal-service","ServiceMainDispatch",1}
     };return table;
 }
@@ -36,14 +41,140 @@ std::array<std::uint32_t,9> service_status_words(const NativeServiceStatus& serv
 }
 namespace {
 std::u16string folded(std::u16string_view text){std::u16string value(text);for(auto& c:value)c=unicode_case_unit(c,true);return value;}
+// ENUM_SERVICE_STATUS(_PROCESS)：名稱與顯示名稱指標、SERVICE_STATUS（Ex 為 SERVICE_STATUS_PROCESS），字串接在陣列之後。
+struct EncodedServices {std::vector<std::uint8_t> bytes;std::vector<std::pair<std::size_t,std::uint64_t>> pointers;};
+std::vector<std::uint8_t> service_text(std::u16string_view value,bool wide){
+    if(wide)return utf16_bytes(value);const auto text=utf16_to_utf8(value);std::vector<std::uint8_t> part(text.begin(),text.end());part.push_back(0);return part;
+}
+std::uint64_t service_entry_size(const ServiceCatalogEntry& entry,bool ex,bool wide,bool x86){
+    return (ex?(x86?44U:56U):(x86?36U:48U))+service_text(entry.name,wide).size()+service_text(entry.display,wide).size();
+}
+EncodedServices encode_services(std::span<const ServiceCatalogEntry* const> entries,bool ex,bool wide,bool x86){
+    const unsigned unit=x86?4U:8U,entry_size=ex?(x86?44U:56U):(x86?36U:48U),status_words=ex?9U:7U;
+    EncodedServices out;out.bytes.resize(entries.size()*entry_size);
+    const auto put=[&](std::size_t at,std::uint64_t value,unsigned count){for(unsigned i=0;i<count;++i)out.bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
+    for(std::size_t n=0;n<entries.size();++n){const auto& item=*entries[n];const auto at=n*entry_size;
+        for(unsigned field=0;field<2;++field){const auto part=service_text(field?item.display:item.name,wide);out.pointers.emplace_back(at+field*unit,out.bytes.size());out.bytes.insert(out.bytes.end(),part.begin(),part.end());}
+        for(unsigned i=0;i<status_words;++i)put(at+2*unit+i*4,item.words[i],4);}
+    return out;
+}
+void write_services(GuestMemory& memory,std::uint64_t buffer,EncodedServices& encoded,bool x86){
+    if(encoded.bytes.empty())return;const unsigned unit=x86?4U:8U;
+    memory.check(GuestAddress{buffer},encoded.bytes.size(),Access::Write);
+    for(const auto& [at,offset]:encoded.pointers)for(unsigned i=0;i<unit;++i)encoded.bytes[at+i]=static_cast<std::uint8_t>((buffer+offset)>>(i*8));
+    memory.write(GuestAddress{buffer},encoded.bytes);
+}
 std::uint32_t mapped_access(std::uint32_t access,bool manager) {
     const auto read=manager?0x20015U:0x2008dU,write=manager?0x20022U:0x20002U,execute=manager?0x20009U:0x20170U,all=manager?0xf003fU:0xf01ffU;
     auto result=access&0x0fffffffU;if(access&0x80000000U)result|=read;if(access&0x40000000U)result|=write;if(access&0x20000000U)result|=execute;if(access&0x10000000U)result|=all;
     if(result&0x02000000U)result=(result&~0x02000000U)|read;return result;
 }
 }
+std::vector<ServiceCatalogEntry> WindowsServices::service_catalog_entries(){
+    // 原生唯讀服務目錄與客體 SCM 服務合併，依名稱（不分大小寫）排序；客體服務的 DependOnService 不含 SC_GROUP_IDENTIFIER 群組項目。
+    std::vector<ServiceCatalogEntry> entries;
+    if(const auto catalog=native_service_catalog())for(const auto& job:catalog->jobs)entries.push_back({job.label,job.label,{},service_status_words(job),{}});
+    RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
+    if(!transaction.error)for(const auto& [key,values]:runtime_.registry.keys){
+        if(!key.starts_with(guest_service::root+u"\\") || key.find(u'\\',guest_service::root.size()+1)!=key.npos || !guest_service::installed(values))continue;
+        try{
+            ServiceCatalogEntry entry;entry.words=guest_service::status(values);entry.name=guest_service::text(values,u"name",key.substr(guest_service::root.size()+1));
+            entry.display=guest_service::text(values,u"displayname",entry.name);entry.group=guest_service::text(values,u"group");
+            const auto depends=guest_service::bytes(values,u"dependonservice");std::u16string item;
+            for(std::size_t i=0;i+1<depends.size();i+=2){const auto c=static_cast<char16_t>(depends[i]|(unsigned{depends[i+1]}<<8));
+                if(c){item.push_back(c);continue;}if(!item.empty() && item.front()!=u'+')entry.dependencies.push_back(item);item.clear();}
+            entries.push_back(std::move(entry));
+        }catch(const SecurityDescriptorError&){}
+    }
+    std::sort(entries.begin(),entries.end(),[](const ServiceCatalogEntry& a,const ServiceCatalogEntry& b){return folded(a.name)<folded(b.name);});
+    return entries;
+}
+std::optional<std::uint32_t> WindowsServices::invoke_service_catalog(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');std::uint64_t result=0;
+    const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
+    const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer,32767));};
+    const auto find=[&](std::uint64_t handle){auto found=service_control_handles_.find(handle);return found!=service_control_handles_.end() && found->second.owner==process_id()?found:service_control_handles_.end();};
+    try {
+        if(name.starts_with("GetServiceDisplayName") || name.starts_with("GetServiceKeyName")){
+            // (hSCManager, 查詢名稱, 輸出, lpcchBuffer)：成功時 *lpcchBuffer 為不含 NUL 的長度；空間不足回報需要的長度（A 版為位元組）。
+            const bool display=name.starts_with("GetServiceDisplayName");const auto manager=find(arg(0));
+            if(manager==service_control_handles_.end() || !manager->second.manager)fail(6);
+            else if(!arg(1) || !arg(3))fail(87);
+            else if(!runtime_.network.external_io)fail(50);
+            else {
+                const auto wanted=folded(text(arg(1)));const auto entries=service_catalog_entries();
+                const auto entry=std::find_if(entries.begin(),entries.end(),[&](const auto& item){return folded(display?item.name:item.display)==wanted;});
+                if(entry==entries.end())fail(1060);
+                else {
+                    const auto value=service_text(display?entry->display:entry->name,wide);const auto length=static_cast<std::uint32_t>(value.size()/(wide?2U:1U)-1);
+                    const auto capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(3)},32));memory.check(GuestAddress{arg(3)},4,Access::Write);
+                    if(!arg(2) || capacity<=length){memory.store(GuestAddress{arg(3)},32,length);fail(122);}
+                    else {memory.write(GuestAddress{arg(2)},value);memory.store(GuestAddress{arg(3)},32,length);result=1;}
+                }
+            }
+        }else if(name.starts_with("EnumDependentServices")){
+            // 直接與間接相依於此服務者，依停止順序（較深的相依者在前）；dwServiceState 為 ACTIVE／INACTIVE／ALL。
+            const auto handle=find(arg(0));const auto wanted=static_cast<std::uint32_t>(arg(1)),capacity=static_cast<std::uint32_t>(arg(3));
+            if(handle==service_control_handles_.end() || handle->second.manager || handle->second.status_handle)fail(6);
+            else if(!(handle->second.access&8U))fail(5);
+            else if(wanted<1 || wanted>3 || !arg(4) || !arg(5) || (capacity && !arg(2)))fail(87);
+            else {
+                const auto entries=service_catalog_entries();std::vector<const ServiceCatalogEntry*> order;std::vector<std::u16string> visiting;
+                const auto visit=[&](auto& self,const std::u16string& target)->void{
+                    visiting.push_back(folded(target));
+                    for(const auto& item:entries){
+                        if(std::none_of(item.dependencies.begin(),item.dependencies.end(),[&](const auto& d){return folded(d)==folded(target);}))continue;
+                        if(std::find(order.begin(),order.end(),&item)!=order.end() || std::find(visiting.begin(),visiting.end(),folded(item.name))!=visiting.end())continue;
+                        self(self,item.name);order.push_back(&item);
+                    }
+                    visiting.pop_back();
+                };
+                visit(visit,handle->second.label);
+                std::erase_if(order,[&](const auto* item){return !(wanted==3 || (wanted==1)==(item->words[1]!=1));});
+                std::uint64_t needed=0;for(const auto* item:order)needed+=service_entry_size(*item,false,wide,x86_);
+                memory.check(GuestAddress{arg(4)},4,Access::Write);memory.check(GuestAddress{arg(5)},4,Access::Write);
+                if(needed>capacity){memory.store(GuestAddress{arg(4)},32,needed);memory.store(GuestAddress{arg(5)},32,0);fail(234);}
+                else {auto encoded=encode_services(order,false,wide,x86_);write_services(memory,arg(2),encoded,x86_);
+                    memory.store(GuestAddress{arg(4)},32,0);memory.store(GuestAddress{arg(5)},32,order.size());result=1;}
+            }
+        }else if(name=="LockServiceDatabase"){
+            const auto manager=find(arg(0));
+            if(manager==service_control_handles_.end() || !manager->second.manager)fail(6);
+            else if(!(manager->second.access&8U))fail(5);
+            else if(service_database_lock_)fail(1055); // ERROR_SERVICE_DATABASE_LOCKED
+            else {
+                initialize_tokens();const auto account=security::resolve_account(runtime_.token_objects.at(effective_token_id()).user.sid,runtime_.token_objects.at(1).user.sid);
+                const auto owner=account?utf8_to_utf16((account->domain.empty()?std::string(".")+"\\":std::string(account->domain)+"\\")+std::string(account->name)):std::u16string{};
+                service_database_lock_=ServiceDatabaseLock{runtime_.allocate_wait_handle(),runtime_.clock_ticks,owner};result=service_database_lock_->handle;
+            }
+        }else if(name=="UnlockServiceDatabase"){
+            if(!service_database_lock_ || service_database_lock_->handle!=arg(0))fail(1071); // ERROR_INVALID_SERVICE_LOCK
+            else {service_database_lock_.reset();result=1;}
+        }else if(name.starts_with("QueryServiceLockStatus")){
+            // QUERY_SERVICE_LOCK_STATUS {fIsLocked, lpLockOwner, dwLockDuration（秒）}，持有者字串接在結構之後。
+            const auto manager=find(arg(0));const auto capacity=static_cast<std::uint32_t>(arg(2));
+            if(manager==service_control_handles_.end() || !manager->second.manager)fail(6);
+            else if(!(manager->second.access&0x10U))fail(5);
+            else if(!arg(3) || (capacity && !arg(1)))fail(87);
+            else {
+                const unsigned unit=x86_?4U:8U,header=x86_?12U:24U;const auto owner=service_text(service_database_lock_?service_database_lock_->owner:u"",wide);
+                const auto needed=static_cast<std::uint32_t>(header+owner.size());memory.check(GuestAddress{arg(3)},4,Access::Write);
+                if(capacity<needed){memory.store(GuestAddress{arg(3)},32,needed);fail(122);}
+                else {
+                    std::vector<std::uint8_t> bytes(header);const auto put=[&](unsigned at,std::uint64_t value,unsigned count){for(unsigned i=0;i<count;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
+                    const auto seconds=service_database_lock_ && runtime_.clock_ticks>service_database_lock_->since?(runtime_.clock_ticks-service_database_lock_->since)/10000000U:0U;
+                    put(0,service_database_lock_?1:0,4);put(unit,arg(1)+header,unit);put(unit*2,seconds,4);bytes.insert(bytes.end(),owner.begin(),owner.end());
+                    memory.write(GuestAddress{arg(1)},bytes);memory.store(GuestAddress{arg(3)},32,needed);result=1;
+                }
+            }
+        }
+    }catch(const std::bad_alloc&){fail(8);}
+    arg.return_to(state,result);return std::nullopt;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_service_control(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');std::uint64_t result=0;
+    if(name.starts_with("GetServiceDisplayName") || name.starts_with("GetServiceKeyName") || name.starts_with("EnumDependentServices") ||
+       name=="LockServiceDatabase" || name=="UnlockServiceDatabase" || name.starts_with("QueryServiceLockStatus"))return invoke_service_catalog(state,memory,service);
     const auto existing=service_control_handles_.find(arg(0));
     bool guest=(existing!=service_control_handles_.end() && existing->second.guest) ||
         name.starts_with("CreateService") || name=="DeleteService" || name.starts_with("ChangeServiceConfig") || name.starts_with("QueryServiceConfig2") ||
@@ -145,33 +276,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_service_control(GuestState&
             else if(ex && static_cast<std::uint32_t>(arg(1))!=0)fail(124);
             else if(!needed || !returned || !type || (type&~0x3fU) || wanted<1 || wanted>3 || capacity>0x1000000 || (capacity && !buffer))fail(87);
             else {
-                struct Entry {std::u16string name,display;std::array<std::uint32_t,9> words;};std::vector<Entry> entries;
                 std::optional<std::u16string> group;if(ex && arg(9))group=text(arg(9));
-                const auto accept=[&](const std::array<std::uint32_t,9>& words,std::u16string_view member){
-                    return (words[0]&type) && (wanted==3 || (wanted==1)==(words[1]!=1)) && (!group || folded(*group)==folded(member));};
-                if(const auto catalog=native_service_catalog())for(const auto& job:catalog->jobs){
-                    const auto words=service_status_words(job);if(accept(words,u""))entries.push_back({job.label,job.label,words});}
-                RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
-                if(!transaction.error)for(const auto& [key,values]:runtime_.registry.keys){
-                    if(!key.starts_with(guest_service::root+u"\\") || key.find(u'\\',guest_service::root.size()+1)!=key.npos || !guest_service::installed(values))continue;
-                    try{const auto words=guest_service::status(values);const auto label=guest_service::text(values,u"name",key.substr(guest_service::root.size()+1));
-                        if(accept(words,guest_service::text(values,u"group")))entries.push_back({label,guest_service::text(values,u"displayname",label),words});}
-                    catch(const SecurityDescriptorError&){}
-                }
-                std::sort(entries.begin(),entries.end(),[](const Entry& a,const Entry& b){return folded(a.name)<folded(b.name);});
-                const unsigned unit=x86_?4U:8U,entry_size=ex?(x86_?44U:56U):(x86_?36U:48U),status_words=ex?9U:7U;
-                const auto encode=[&](std::u16string_view value){std::vector<std::uint8_t> part;if(wide)part=utf16_bytes(value);else {const auto s=utf16_to_utf8(value);part.assign(s.begin(),s.end());part.push_back(0);}return part;};
+                std::vector<ServiceCatalogEntry> entries;
+                for(auto& item:service_catalog_entries())
+                    if((item.words[0]&type) && (wanted==3 || (wanted==1)==(item.words[1]!=1)) && (!group || folded(*group)==folded(item.group)))entries.push_back(std::move(item));
                 const std::uint64_t start=resume?memory.load(GuestAddress{resume},32):0;
-                std::size_t index=static_cast<std::size_t>(std::min<std::uint64_t>(start,entries.size()));std::uint64_t used=0;std::vector<std::size_t> fitted;
-                for(;index<entries.size();++index){const auto size=entry_size+encode(entries[index].name).size()+encode(entries[index].display).size();if(used+size>capacity)break;used+=size;fitted.push_back(index);}
-                std::uint64_t remaining=0;for(auto i=index;i<entries.size();++i)remaining+=entry_size+encode(entries[i].name).size()+encode(entries[i].display).size();
-                std::vector<std::uint8_t> bytes(fitted.size()*entry_size);std::vector<std::pair<std::size_t,std::uint64_t>> pointers;
-                const auto put=[&](std::size_t at,std::uint64_t value,unsigned count){for(unsigned i=0;i<count;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
-                for(std::size_t n=0;n<fitted.size();++n){const auto& item=entries[fitted[n]];const auto at=n*entry_size;
-                    for(unsigned field=0;field<2;++field){const auto part=encode(field?item.display:item.name);pointers.emplace_back(at+field*unit,bytes.size());bytes.insert(bytes.end(),part.begin(),part.end());}
-                    for(unsigned i=0;i<status_words;++i)put(at+2*unit+i*4,item.words[i],4);}
+                std::size_t index=static_cast<std::size_t>(std::min<std::uint64_t>(start,entries.size()));std::uint64_t used=0;std::vector<const ServiceCatalogEntry*> fitted;
+                for(;index<entries.size();++index){const auto size=service_entry_size(entries[index],ex,wide,x86_);if(used+size>capacity)break;used+=size;fitted.push_back(&entries[index]);}
+                std::uint64_t remaining=0;for(auto i=index;i<entries.size();++i)remaining+=service_entry_size(entries[i],ex,wide,x86_);
+                auto encoded=encode_services(fitted,ex,wide,x86_);
                 memory.check(GuestAddress{needed},4,Access::Write);memory.check(GuestAddress{returned},4,Access::Write);
-                if(!bytes.empty()){memory.check(GuestAddress{buffer},bytes.size(),Access::Write);for(const auto& [at,offset]:pointers)put(at,buffer+offset,unit);memory.write(GuestAddress{buffer},bytes);}
+                write_services(memory,buffer,encoded,x86_);
                 memory.store(GuestAddress{returned},32,fitted.size());memory.store(GuestAddress{needed},32,remaining);
                 if(resume)memory.store(GuestAddress{resume},32,index<entries.size()?index:0);
                 if(index<entries.size())fail(234);else result=1;

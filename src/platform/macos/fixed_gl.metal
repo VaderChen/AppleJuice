@@ -4,9 +4,12 @@ struct V {float4 position,color,texcoord,normal,ambient,diffuse,specular,emissio
 struct Light {float4 ambient,diffuse,specular,position,direction,spot,attenuation;};
 float3 unit_vector(float3 v){float n=length(v);return n>0?v/n:float3(0);}
 float4 light_vertex(const device V& v,float4 eye,constant float4x4& normal,
-                    constant Light* lights,constant float4& flags){
+                    constant Light* lights,constant float4& flags,thread float4& secondary){
  float3 n=(normal*float4(v.normal.xyz,0)).xyz;if(flags.y!=0)n=unit_vector(n);
- float3 color=v.emission.rgb+0.2f*v.ambient.rgb;
+ // lights[8] 為光照模型：ambient＝全域環境光，spot.x＝區域觀察者，spot.z＝分離鏡面色。
+ constant Light& model=lights[8];
+ float3 viewer=model.spot.x!=0 && eye.w!=0?unit_vector(-eye.xyz/eye.w):float3(0,0,1);
+ float3 color=v.emission.rgb+model.ambient.rgb*v.ambient.rgb,specular_sum=float3(0);
  for(uint i=0;i<8;++i){if(!(uint(flags.z)&(1u<<i)))continue;
   constant Light& light=lights[i];float3 delta=light.position.w==0?light.position.xyz:light.position.xyz/light.position.w-eye.xyz/eye.w;
   float distance=length(delta);float3 direction=unit_vector(delta);float attenuation=1;
@@ -14,14 +17,16 @@ float4 light_vertex(const device V& v,float4 eye,constant float4x4& normal,
   if(light.spot.z!=180){float cosine=dot(-direction,unit_vector(light.direction.xyz));
    attenuation*=cosine<light.spot.y?0:pow(max(cosine,0.0f),light.spot.x);}
   float diffuse=max(dot(n,direction),0.0f);
-  float specular=diffuse>0?pow(max(dot(n,unit_vector(direction+float3(0,0,1))),0.0f),v.shininess.x):0;
-  color+=attenuation*(v.ambient.rgb*light.ambient.rgb+diffuse*v.diffuse.rgb*light.diffuse.rgb+specular*v.specular.rgb*light.specular.rgb);
+  float specular=diffuse>0?pow(max(dot(n,unit_vector(direction+viewer)),0.0f),v.shininess.x):0;
+  color+=attenuation*(v.ambient.rgb*light.ambient.rgb+diffuse*v.diffuse.rgb*light.diffuse.rgb);
+  specular_sum+=attenuation*specular*v.specular.rgb*light.specular.rgb;
  }
+ if(model.spot.z!=0)secondary=float4(clamp(specular_sum,0.0f,1.0f),0);else color+=specular_sum;
  return clamp(float4(color,v.diffuse.a),0.0f,1.0f);
 }
 struct O {float4 position [[position]];float4 color;float4 texcoord;float4 secondary;float eyeZ;float point [[point_size]];};
 vertex O vertex_main(const device V* v [[buffer(0)]],constant float4x4& m [[buffer(1)]],constant float4x4& model [[buffer(2)]],constant float4x4& normal [[buffer(3)]],constant Light* lights [[buffer(4)]],constant float4& flags [[buffer(5)]],constant float& pointSize [[buffer(6)]],uint id [[vertex_id]]){
- O o;o.secondary=float4(0);o.eyeZ=(model*v[id].position).z;o.position=m*v[id].position;o.position.z=(o.position.z+o.position.w)*0.5;o.color=flags.x!=0?light_vertex(v[id],model*v[id].position,normal,lights,flags):clamp(v[id].color,0.0f,1.0f);o.texcoord=v[id].texcoord;o.point=pointSize;return o;
+ O o;o.secondary=float4(0);o.eyeZ=(model*v[id].position).z;o.position=m*v[id].position;o.position.z=(o.position.z+o.position.w)*0.5;o.color=flags.x!=0?light_vertex(v[id],model*v[id].position,normal,lights,flags,o.secondary):clamp(v[id].color,0.0f,1.0f);o.texcoord=v[id].texcoord;o.point=pointSize;return o;
 }
 float4 d3d_texture_argument(uint selector,float4 diffuse,float4 texture,float4 factor){float4 value=(selector&15)==2?texture:(selector&15)==3?factor:diffuse;if(selector&32)value=value.aaaa;if(selector&16)value=1-value;return value;}
 fragment float4 fragment_main(O in [[stage_in]],texture2d<float> tex [[texture(0)]],sampler sample [[sampler(0)]],constant uint4& textureMode [[buffer(0)]],constant float4* fog [[buffer(1)]],constant float4* fixedState [[buffer(2)]]){

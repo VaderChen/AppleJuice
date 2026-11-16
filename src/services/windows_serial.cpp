@@ -17,7 +17,9 @@ std::span<const WindowsServiceDescriptor> serial_service_descriptors(){
         {"kernel32.dll","GetCommModemStatus",2},{"kernel32.dll","EscapeCommFunction",2},
         {"kernel32.dll","SetCommBreak",1},{"kernel32.dll","ClearCommBreak",1},
         {"kernel32.dll","PurgeComm",2},{"kernel32.dll","SetupComm",3},
-        {"kernel32.dll","CancelSynchronousIo",1}
+        {"kernel32.dll","CancelSynchronousIo",1},
+        {"kernel32.dll","GetCommConfig",3},{"kernel32.dll","SetCommConfig",3},{"kernel32.dll","GetCommProperties",2},
+        {"kernel32.dll","GetDefaultCommConfigA",3},{"kernel32.dll","GetDefaultCommConfigW",3},{"kernel32.dll","SetDefaultCommConfigA",3},{"kernel32.dll","SetDefaultCommConfigW",3}
     };return table;
 }
 std::optional<unsigned> WindowsServices::serial_port(std::u16string_view path){
@@ -45,7 +47,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_serial(GuestState& state,Gu
     std::uint64_t result=0;const auto fail=[&](std::uint32_t e){last_error_=e;result=0;};
     const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
     if(name=="WaitCommEvent")return invoke_file_io(state,memory,service);
+    // COMMCONFIG：dwSize、wVersion、wReserved、DCB(28)、dwProviderSubType（PST_RS232）、dwProviderOffset、dwProviderSize、wcProviderData，共 52 位元組。
+    const auto write_config=[&](std::uint64_t pointer,std::uint64_t size_pointer,const std::array<std::uint8_t,28>& dcb)->std::uint32_t{
+        if(!size_pointer)return 87;const auto capacity=memory.load(GuestAddress{size_pointer},32);memory.check(GuestAddress{size_pointer},4,Access::Write);
+        if(!pointer || capacity<52){memory.store(GuestAddress{size_pointer},32,52);return 122;}
+        std::array<std::uint8_t,52> config{};config[0]=52;config[4]=1;std::copy(dcb.begin(),dcb.end(),config.begin()+8);config[36]=1;
+        memory.write(GuestAddress{pointer},config);memory.store(GuestAddress{size_pointer},32,52);return 0;};
     try{
+        if(name.starts_with("GetDefaultCommConfig") || name.starts_with("SetDefaultCommConfig")){
+            // 預設設定以埠名稱查詢；未設定時為 9600 bps、8N1、二進位模式並啟用 DTR／RTS。
+            const auto port_name=arg(0)?(name.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},64):utf8_to_utf16(read_ansi(memory,arg(0),64))):std::u16string{};
+            const auto number=serial_port(port_name);scan_serial_ports();
+            if(!arg(0) || !arg(1))fail(87);
+            else if(!number || !serial_ports_.contains(*number))fail(2);
+            else if(name.starts_with("Get")){
+                std::array<std::uint8_t,28> dcb{};
+                if(const auto found=runtime_.serial_defaults.find(*number);found!=runtime_.serial_defaults.end())dcb=found->second;
+                else {dcb[0]=28;dcb[4]=0x80;dcb[5]=0x25;dcb[8]=0x11;dcb[9]=0x10;dcb[14]=0x00;dcb[15]=0x08;dcb[16]=0x00;dcb[17]=0x02;dcb[18]=8;dcb[21]=0x11;dcb[22]=0x13;}
+                if(const auto e=write_config(arg(1),arg(2),dcb))fail(e);else result=1;
+            }else if(static_cast<std::uint32_t>(arg(2))<36 || memory.load(GuestAddress{arg(1)+8},32)!=28)fail(87);
+            else {std::array<std::uint8_t,28> dcb{};memory.read(GuestAddress{arg(1)+8},dcb);runtime_.serial_defaults[*number]=dcb;result=1;}
+            frame.return_to(state,result);return std::nullopt;
+        }
         if(name.starts_with("BuildCommDCB")){
             if(!arg(0) || !arg(1))fail(87);
             else {
@@ -116,6 +139,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_serial(GuestState& state,Gu
                     if(arg(1))memory.check(GuestAddress{arg(1)},4,Access::Write);if(arg(2))memory.check(GuestAddress{arg(2)},12,Access::Write);
                     std::uint32_t errors=0;std::array<std::uint32_t,3> stat{};e=port.clear(errors,stat);
                     if(!e){if(arg(1))memory.store(GuestAddress{arg(1)},32,errors);if(arg(2))for(unsigned i=0;i<3;++i)memory.store(GuestAddress{arg(2)+4*i},32,stat[i]);}
+                }else if(name=="GetCommConfig"){
+                    std::array<std::uint8_t,28> dcb{};dcb[0]=28;e=port.get_state(dcb);if(!e)e=write_config(arg(1),arg(2),dcb);
+                }else if(name=="SetCommConfig"){
+                    if(!arg(1) || d(2)<36 || memory.load(GuestAddress{arg(1)+8},32)!=28)e=87;
+                    else {std::array<std::uint8_t,28> dcb{};memory.read(GuestAddress{arg(1)+8},dcb);e=port.set_state(dcb);}
+                }else if(name=="GetCommProperties"){
+                    // COMMPROP（64 位元組）：RS-232 提供者支援的所有參數、DTR／RTS／XON 流量控制、間隔與總逾時、標準與自訂鮑率。
+                    if(!arg(1))e=87;
+                    else {memory.check(GuestAddress{arg(1)},64,Access::Write);std::array<std::uint8_t,64> properties{};
+                        const auto put=[&](std::size_t at,std::uint32_t value,unsigned bytes){for(unsigned i=0;i<bytes;++i)properties[at+i]=static_cast<std::uint8_t>(value>>(8*i));};
+                        put(0,64,2);put(2,2,2);put(4,1,4);put(20,0x10000000U,4);put(24,1,4);put(28,0xff,4);put(32,0x7f,4);put(36,0x1007ffffU,4);put(40,0x000f,2);put(42,0x1f07,2);
+                        memory.write(GuestAddress{arg(1)},properties);}
                 }else throw HostCallFault("未知的序列埠服務");
                 if(e)fail(e);else {
                     const auto bytes=(name=="GetCommState" || name=="SetCommState")?28U:(name=="GetCommTimeouts" || name=="SetCommTimeouts")?20U:name=="ClearCommError"?((arg(1)?4U:0U)+(arg(2)?12U:0U)):(name=="GetCommMask" || name=="SetCommMask" || name=="GetCommModemStatus")?4U:0U;

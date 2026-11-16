@@ -309,6 +309,11 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         
         {"dnsapi.dll","DnsQuery_A",6},{"dnsapi.dll","DnsQuery_W",6},{"dnsapi.dll","DnsQuery_UTF8",6},
         {"dnsapi.dll","DnsFree",2},{"dnsapi.dll","DnsRecordListFree",2},
+        {"dnsapi.dll","DnsNameCompare_A",2},{"dnsapi.dll","DnsNameCompare_W",2},{"dnsapi.dll","DnsValidateName_A",2},{"dnsapi.dll","DnsValidateName_W",2},{"dnsapi.dll","DnsValidateName_UTF8",2},
+        {"dnsapi.dll","DnsRecordCompare",2},{"dnsapi.dll","DnsRecordSetCompare",4},{"dnsapi.dll","DnsRecordCopyEx",3},{"dnsapi.dll","DnsRecordSetCopyEx",3},{"dnsapi.dll","DnsRecordSetDetach",1},
+        {"dnsapi.dll","DnsWriteQuestionToBuffer_W",6},{"dnsapi.dll","DnsWriteQuestionToBuffer_UTF8",6},{"dnsapi.dll","DnsExtractRecordsFromMessage_W",3},{"dnsapi.dll","DnsExtractRecordsFromMessage_UTF8",3},
+        {"dnsapi.dll","DnsFlushResolverCache",0},{"dnsapi.dll","DnsFlushResolverCacheEntry_A",1},{"dnsapi.dll","DnsFlushResolverCacheEntry_W",1},{"dnsapi.dll","DnsFlushResolverCacheEntry_UTF8",1},{"dnsapi.dll","DnsGetCacheDataTable",1},
+        {"dnsapi.dll","DnsQueryConfig",6},{"dnsapi.dll","DnsQueryEx",3},{"dnsapi.dll","DnsServiceConstructInstance",10},{"dnsapi.dll","DnsServiceFreeInstance",1},
         
         
         
@@ -589,6 +594,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
         else if (symbol=="WSASetLastError") last_error_=u32(0);
         else if (symbol=="htons" || symbol=="ntohs") result=htons(static_cast<std::uint16_t>(arg(0)));
         else if (symbol=="htonl" || symbol=="ntohl") result=htonl(u32(0));
+        else if(symbol=="inet_addr"){
+            if(!arg(0)){last_error_=10014;result=UINT32_MAX;}
+            else {const auto text=read_ansi(memory,arg(0));result=text==" "?0U: ::inet_addr(text.c_str());}
+        }
+        else if(symbol=="inet_ntoa"){in_addr address{};address.s_addr=u32(0);std::array<char,INET_ADDRSTRLEN> text{};if(::inet_ntop(AF_INET,&address,text.data(),text.size())){auto& buffer=network.service_buffers[threads_.current+0x100000000ULL];if(!buffer)buffer=runtime_allocate(memory,{},INET_ADDRSTRLEN);memory.write(GuestAddress{buffer},std::span(reinterpret_cast<const std::uint8_t*>(text.data()),text.size()));result=buffer;}else fail(socket_error(errno));}
         else if(ntop || pton){
             const auto family=host_family(u32(0));
             if(family!=AF_INET && family!=AF_INET6)fail(10047);
@@ -659,8 +669,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                 if (::gethostname(name.data(),name.size()-1)<0) fail(socket_error(errno));
                 else {const auto length=std::strlen(name.data())+1;if (length>u32(1)) fail(10014);else memory.write(GuestAddress{arg(0)},{reinterpret_cast<const std::uint8_t*>(name.data()),length});}
             }
-        } else if(symbol=="inet_addr"){result=::inet_addr(read_ansi(memory,arg(0)).c_str());}
-        else if(symbol=="inet_ntoa"){in_addr address{};address.s_addr=u32(0);std::array<char,INET_ADDRSTRLEN> text{};if(::inet_ntop(AF_INET,&address,text.data(),text.size())){auto& buffer=network.service_buffers[threads_.current+0x100000000ULL];if(!buffer)buffer=runtime_allocate(memory,{},INET_ADDRSTRLEN);memory.write(GuestAddress{buffer},std::span(reinterpret_cast<const std::uint8_t*>(text.data()),text.size()));result=buffer;}else fail(socket_error(errno));}
+        }
         else if(symbol.starts_with("WSAStringToAddress")){
             const auto family=u32(1);const unsigned required=family==2?16:family==23?28:0;
             if(!required)fail(10022);

@@ -1605,7 +1605,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
       catch(const texture_image::Error& error){result=error.hresult;bridge.last_error=error.what();}
       catch(const video::VideoCodecError& error){result=failure;bridge.last_error=error.what();}
       catch(const video::DxvaH264Error& error){result=not_supported;bridge.last_error=error.what();}
-      catch(const WindowPresentationFault& error){result=0x887a0001U;bridge.last_error=error.what();record_diagnostic("d3d11_present_fault");set_diagnostic("d3d11_present_fault_last",error.what());if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] %.*s: %s\n",static_cast<int>(symbol.size()),symbol.data(),error.what());}
+      // 呈現目標視窗已關閉或不可見（例如 Chromium 的 GPU 程序對剛關閉的對話框送出最後一張畫面）：Windows 的 Present 不把它當成呼叫錯誤，
+      // 回 DXGI_STATUS_OCCLUDED（成功、畫面未顯示）。回 DXGI_ERROR_INVALID_CALL 會讓 Chromium 的合成器停止，整個 Steam 介面不再更新。
+      catch(const WindowPresentationFault& error){result=symbol=="Present" || symbol=="Present1"?0x087a0001U:0x887a0001U;bridge.last_error=error.what();record_diagnostic("d3d11_present_fault");set_diagnostic("d3d11_present_fault_last",error.what());if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] %.*s: %s\n",static_cast<int>(symbol.size()),symbol.data(),error.what());}
       catch(const std::invalid_argument& error){bridge.last_error=error.what();if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d11] %.*s: %s\n",static_cast<int>(symbol.size()),symbol.data(),error.what());if(void_methods.contains(symbol)){
             // 診斷：X64ARM_TRACE_SHADER_FAILURE_DIR=<目錄> 時把繪製／分派的著色器編譯失敗寫成檔案並略過這次呼叫，一輪收集所有失敗的著色器；正常執行仍視為內部錯誤。
             static const char* const failure_dir=std::getenv("X64ARM_TRACE_SHADER_FAILURE_DIR");

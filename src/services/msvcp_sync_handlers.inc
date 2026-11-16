@@ -25,6 +25,13 @@ if(name.find("_Lockit@std@@")!=name.npos){
     }
     return start("kernel32.dll","InitOnceExecuteOnce",{runtime_.msvcp_global_locks,resolve("internal-msvcp","GlobalLocksInit").value,runtime_.msvcp_global_locks,0});
 }
+if(service.family=="internal-msvcp" && name=="OnceComplete"){memory.store(GuestAddress{call(0)},32,2);return finish(0);}
+if(service.family=="internal-msvcp" && name=="ThreadRunner"){
+    // _Thrd_create 的 __stdcall 執行緒進入點：binder｛cdecl int(*)(void*), 引數｝讀出後即釋放，函式回傳值即執行緒結束碼。
+    const auto binder=call(0);const auto function=memory.load(GuestAddress{binder},bits),argument=memory.load(GuestAddress{binder+unit},bits);
+    (void)free_heap(memory,binder,state);
+    start_callbacks(state,memory,{{function,{argument}}},Continuation::ReturnCallback);return std::nullopt;
+}
 if(service.family=="internal-msvcp" && name=="TaskSchedulerCallback"){
     // _Task_scheduler_callback(instance, _Threadpool_chore*, work)：呼叫 chore 的 _M_callback(_M_data)。
     const auto chore=call(1);const auto callback=memory.load(GuestAddress{chore+unit},bits),data=memory.load(GuestAddress{chore+2*unit},bits);
@@ -63,7 +70,7 @@ if(service.family=="msvcp140.dll" && name.find("@Concurrency@@")!=name.npos){
         memory.store(GuestAddress{call(0)},bits,0);return start("kernel32.dll","CloseThreadpoolWork",{work});
     }
 }
-if(service.family=="msvcp140.dll"){
+if(service.family=="msvcp140.dll" || service.family=="msvcp110.dll" || service.family=="msvcp120.dll"){
     // x64：讓出／睡眠直接尾跳到 kernel32 的 SwitchToThread／Sleep（返回位址與影子空間沿用呼叫端），由該服務自行返回，
     // 不經客體回呼與回呼返回邊界（平行模式每次各多一次全停；電馭判客 Benchmark 每秒數百次）。x86 的 cdecl 與 stdcall
     // 堆疊清理不同，沿用回呼。
@@ -82,6 +89,53 @@ if(service.family=="msvcp140.dll"){
     if(name=="_Thrd_sleep"){
         if(!x86_)return tail("Sleep",milliseconds_until(call(0)));
         start_callbacks(state,memory,{{resolve("kernel32.dll","Sleep").value,{milliseconds_until(call(0))}}},Continuation::Return,0);return std::nullopt;
+    }
+    // xtime｛__int64 秒, long 奈秒｝：_Xtime_diff_to_millis 為現在到 xt 的毫秒，_Xtime_diff_to_millis2 為 xt1−xt2，負值皆為 0。
+    if(name=="_Xtime_diff_to_millis")return finish(milliseconds_until(call(0)));
+    if(name=="_Xtime_diff_to_millis2"){
+        const auto ticks=[&](std::uint64_t at){return std::bit_cast<std::int64_t>(memory.load(GuestAddress{at},64))*10000000+static_cast<std::int32_t>(memory.load(GuestAddress{at+8},32))/100;};
+        const auto difference=ticks(call(0))-ticks(call(1));return finish(difference<=0?0:static_cast<std::uint32_t>(std::min<std::int64_t>((difference+9999)/10000,INT32_MAX)));
+    }
+    if(name=="xtime_get"){
+        // 只支援 TIME_UTC（1）：填入 1970 起的秒與奈秒並回傳 base，其他 base 回 0。
+        if(static_cast<std::uint32_t>(call(1))!=1)return finish(0);
+        const auto now=runtime_.system_filetime()-UINT64_C(116444736000000000);memory.check(GuestAddress{call(0)},16,Access::Write);
+        memory.store(GuestAddress{call(0)},64,now/10000000);memory.store(GuestAddress{call(0)+8},32,(now%10000000)*100);return finish(1);
+    }
+    if(name=="_Thrd_current"){
+        // _Thrd_t｛目前執行緒的 pseudo handle, id｝：Win32 8 位元組走 EDX:EAX，Win64 16 位元組以隱藏指標回傳。
+        const auto id=thread_identifier(threads_.current);
+        if(x86_){call.return_to(state,UINT64_C(0xfffffffe)|(std::uint64_t{id}<<32),true);return std::nullopt;}
+        memory.check(GuestAddress{call(0)},16,Access::Write);memory.store(GuestAddress{call(0)},64,UINT64_MAX-1);memory.store(GuestAddress{call(0)+8},64,id);return finish(call(0));
+    }
+    if(name=="_Thrd_equal" || name=="_Thrd_lt"){
+        // 以 id 比較：Win32 以值傳遞（低 32 位元 handle、高 32 位元 id），Win64 以指標傳遞暫存複本。
+        const auto id=[&](unsigned index)->std::uint32_t{return x86_?static_cast<std::uint32_t>(call(index)>>32):static_cast<std::uint32_t>(memory.load(GuestAddress{call(index)+8},32));};
+        return finish(name=="_Thrd_equal"?id(0)==id(1):id(0)<id(1));
+    }
+    if(name=="_Call_once" || name=="_Call_onceEx"){
+        // C11 風格的 _Once_flag（初值 0）：0 未執行、1 執行中、2 完成。完成由內部進入點 OnceComplete 標記；
+        // 其他執行緒看到執行中時讓出 1 ms 後重新進入本函式，直到完成。
+        const bool extended=name=="_Call_onceEx";const auto flag=call(0);memory.check(GuestAddress{flag},4,Access::Write);
+        const auto value=memory.load(GuestAddress{flag},32);
+        if(value==2)return finish(0);
+        std::vector<GuestCallback> steps;
+        if(value==1){
+            steps.push_back({resolve("kernel32.dll","Sleep").value,{1}});
+            steps.push_back({resolve(service.family,name).value,extended?std::vector<std::uint64_t>{flag,call(1),call(2)}:std::vector<std::uint64_t>{flag,call(1)}});
+        }else {
+            memory.store(GuestAddress{flag},32,1);
+            steps.push_back({call(1),extended?std::vector<std::uint64_t>{call(2)}:std::vector<std::uint64_t>{}});
+            steps.push_back({resolve("internal-msvcp","OnceComplete").value,{flag}});
+        }
+        start_callbacks(state,memory,std::move(steps),Continuation::Return,0);return std::nullopt;
+    }
+    if(name=="_Thrd_create"){
+        // cdecl 的 _Thrd_start_t 經 __stdcall 進入點 ThreadRunner 呼叫；binder 由進入點釋放，建立結果與 _Thrd_start 相同寫回 _Thrd_t。
+        memory.check(GuestAddress{call(0)},unit*2,Access::Write);
+        const auto binder=allocate_heap(memory,unit*2);if(!binder)return finish(1);
+        memory.store(GuestAddress{binder},bits,call(1));memory.store(GuestAddress{binder+unit},bits,call(2));
+        return start("crt","_beginthreadex",{0,0,resolve("internal-msvcp","ThreadRunner").value,binder,0,call(0)+unit});
     }
     if(name=="_Thrd_start"){
         // _Thrd_t｛HANDLE, unsigned id｝；以 _beginthreadex 建立並直接寫入 id 欄位。

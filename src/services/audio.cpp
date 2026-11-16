@@ -64,6 +64,10 @@ void Buffer::render(std::span<float> out,unsigned output_rate) {
             const bool hit=(target>=previous && target<cursor) || (looping && cursor>=static_cast<double>(frames) && (cursor-previous>=static_cast<double>(frames) || target< std::fmod(cursor,static_cast<double>(frames))));
             if(hit && std::find(pending_notifications.begin(),pending_notifications.end(),n.event)==pending_notifications.end())pending_notifications.push_back(n.event);
         }
+        if(loop_remaining && loop_end>loop_begin && loop_end<=pcm.size()){
+            const auto begin=static_cast<double>(loop_begin/frame_bytes()),end=static_cast<double>(loop_end/frame_bytes());
+            if(previous<end && cursor>=end){cursor=begin+(cursor-end);loop_frames+=static_cast<std::uint64_t>(end-begin);if(loop_remaining!=UINT32_MAX)--loop_remaining;}
+        }
         if(cursor>=static_cast<double>(frames)){
             if(streaming)cursor=static_cast<double>(frames);
             else if(looping)cursor=std::fmod(cursor,static_cast<double>(frames));
@@ -78,6 +82,8 @@ void Buffer::render(std::span<float> out,unsigned output_rate) {
         std::size_t done=0;const auto requested=out.size()/2;
         while(done<requested && playing && cursor<static_cast<double>(frames)){
             const auto frame=static_cast<std::size_t>(cursor);auto count=std::min(requested-done,frames-frame);
+            // 迴圈區段的結尾也是區塊邊界，讓 advance 在同一個 frame 倒回。
+            if(loop_remaining && loop_end>loop_begin && loop_end<=pcm.size()){const auto end=static_cast<std::size_t>(loop_end/frame_bytes());if(frame<end)count=std::min(count,end-frame);}
             // 在最早通知所在 frame 結束區塊，保持未排序通知與重複 event 的原有順序。
             for(const auto& n:notifications)if(n.offset!=UINT32_MAX){const auto target=static_cast<double>(n.offset)/frame_bytes();
                 if(target>=cursor && target<cursor+static_cast<double>(count))count=std::min(count,static_cast<std::size_t>(target-cursor)+1);}

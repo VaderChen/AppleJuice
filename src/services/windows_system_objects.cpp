@@ -4,6 +4,14 @@
 #include "x64arm/unicode.hpp"
 #include <algorithm>
 
+#if !defined(_WIN32)
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+#include "windows_object_directory.inc"
+
 namespace x64arm {
 namespace {
 std::uint64_t vtable_method(const GuestMemory& memory,std::uint64_t object,unsigned slot,unsigned unit){

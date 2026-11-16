@@ -35,6 +35,30 @@ std::vector<std::uint8_t> info_bytes(const PointerPacket& packet,std::uint32_t p
     put(bytes,points+32,packet.time);put(bytes,points+36,1);put(bytes,points+44,packet.keys);put(bytes,points+48,packet.performance,8);put(bytes,points+56,packet.button_change);
     return bytes;
 }
+// POINTER_DEVICE_PROPERTY {logicalMin, logicalMax, physicalMin, physicalMax, unit, unitExponent, usagePageId, usageId}（28 bytes）。
+struct DeviceProperty {std::int32_t logical_min,logical_max,physical_min,physical_max;std::uint32_t unit,exponent;std::uint16_t page,usage;};
+std::vector<DeviceProperty> device_properties(const PointerDeviceState& d){
+    const auto& rect=d.device.logical_rectangle;const auto physical=d.device.himetric_rectangle.value_or(virtual_himetric);
+    // X／Y 為 HID Generic Desktop；物理範圍是 HIMETRIC（0.01 mm），以 SI 公分（0x11）、指數 −3（半位元組 0xD）表示。
+    std::vector<DeviceProperty> list{{rect[0],rect[2],physical[0],physical[2],0x11,0xd,1,0x30},{rect[1],rect[3],physical[1],physical[3],0x11,0xd,1,0x31},
+        {0,1024,0,1024,0,0,0xd,0x30}}; // Tip Pressure：與 POINTER_*_INFO 相同的 0～1024 正規化值。
+    if(d.device.type<=2){ // 筆：X／Y 傾角 −90～90 度、Twist 0～359 度（英制旋轉 0x14）。
+        list.push_back({-90,90,-90,90,0x14,0,0xd,0x3d});list.push_back({-90,90,-90,90,0x14,0,0xd,0x3e});list.push_back({0,359,0,359,0x14,0,0xd,0x41});
+    }else if(d.device.type==3){ // 觸控：接觸寬／高（與 X／Y 同單位）與方位角。
+        list.push_back({0,rect[2]-rect[0],0,physical[2]-physical[0],0x11,0xd,0xd,0x48});list.push_back({0,rect[3]-rect[1],0,physical[3]-physical[1],0x11,0xd,0xd,0x49});
+        list.push_back({0,359,0,359,0x14,0,0xd,0x3f});
+    }
+    return list;
+}
+std::int32_t raw_property(const PointerPacket& packet,std::uint16_t page,std::uint16_t usage){
+    const auto& s=packet.sample;
+    if(page==1)return usage==0x30?s.x:s.y;
+    switch(usage){
+    case 0x30:return static_cast<std::int32_t>(s.pressure);case 0x3d:return s.tilt_x;case 0x3e:return s.tilt_y;
+    case 0x48:return s.contact_rectangle[2]-s.contact_rectangle[0];case 0x49:return s.contact_rectangle[3]-s.contact_rectangle[1];
+    default:return static_cast<std::int32_t>(s.rotation); // Twist／Azimuth
+    }
+}
 }
 std::span<const WindowsServiceDescriptor> pointer_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
@@ -42,7 +66,14 @@ std::span<const WindowsServiceDescriptor> pointer_service_descriptors(){
         {"user32.dll","GetPointerDevices",2},{"user32.dll","GetPointerDevice",2},
         {"user32.dll","GetPointerDeviceRects",3},{"user32.dll","GetPointerType",2,0,0,1},
         {"user32.dll","GetPointerInfo",2,0,0,1},{"user32.dll","GetPointerPenInfo",2,0,0,1},
-        {"user32.dll","GetPointerTouchInfo",2,0,0,1}};return table;
+        {"user32.dll","GetPointerTouchInfo",2,0,0,1},
+        // frame／history：引擎不合併輸入，history 只有目前一筆；frame 為同一裝置目前所有接觸點（frameId 取目前訊息的值）。
+        {"user32.dll","GetPointerFrameInfo",3,0,0,1},{"user32.dll","GetPointerFramePenInfo",3,0,0,1},{"user32.dll","GetPointerFrameTouchInfo",3,0,0,1},
+        {"user32.dll","GetPointerInfoHistory",3,0,0,1},{"user32.dll","GetPointerPenInfoHistory",3,0,0,1},{"user32.dll","GetPointerTouchInfoHistory",3,0,0,1},
+        {"user32.dll","GetPointerFrameInfoHistory",4,0,0,1},{"user32.dll","GetPointerFramePenInfoHistory",4,0,0,1},{"user32.dll","GetPointerFrameTouchInfoHistory",4,0,0,1},
+        {"user32.dll","GetPointerDeviceProperties",3},{"user32.dll","GetRawPointerDeviceData",5,0,0,7},
+        // INPUT_MESSAGE_SOURCE：最近取出訊息的裝置與來源；SendMessage 期間改由 GetCIMSSM 取寄送端的來源。
+        {"user32.dll","GetCurrentInputMessageSource",1},{"user32.dll","GetCIMSSM",1}};return table;
 }
 void WindowsServices::poll_pointer_input(){
     if(!pointer_input_ || !input_backend())return;auto& state=*pointer_input_;const auto backend=input_backend();
@@ -103,7 +134,9 @@ void WindowsServices::deliver_pointer_sample(const input::PointerSample& sample)
         if(target==gui_.windows.end() || target->second.desktop_object!=gui_.input_desktop || gui_.queue.size()>=10000 || state.packets.size()>=10000)return;
         const auto token=state.next_packet++;state.packets.emplace(token,packet);
         GuiMessage event{packet.window,id|(std::uint64_t{packet.flags&0xffffU}<<16),static_cast<std::uint16_t>(packet.pixel[0])|(std::uint64_t{static_cast<std::uint16_t>(packet.pixel[1])}<<16),message};
-        event.thread=packet.thread;event.queue_priority=1;event.injected=true;event.queued_time=packet.time;event.pointer_packet=token;enqueue_gui_message(std::move(event));
+        event.thread=packet.thread;event.queue_priority=1;event.injected=true;event.queued_time=packet.time;event.pointer_packet=token;
+        const auto kind=entry.device.type;event.source_device=static_cast<std::uint8_t>(kind==3?4U:kind==4?0x10U:8U);event.source_origin=static_cast<std::uint8_t>(entry.injected?2U:1U);
+        enqueue_gui_message(std::move(event));
     };
     if(!had_range && sample.in_range)queue(0x249);
     if(sample.in_range || had_contact)queue(sample.in_contact&&!had_contact?0x246:!sample.in_contact&&had_contact?0x247:0x245);
@@ -156,6 +189,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_pointer_input(GuestState& s
                         for(unsigned i=0;i<4;++i){memory.store(GuestAddress{arg(1)+i*4},32,std::bit_cast<std::uint32_t>(physical[i]));memory.store(GuestAddress{arg(2)+i*4},32,std::bit_cast<std::uint32_t>(display[i]));}result=1;}
                 }
             }
+        }else if(name=="GetCurrentInputMessageSource" || name=="GetCIMSSM"){
+            const auto source=input_message_source(name=="GetCIMSSM");
+            if(!arg(0) || !source)fail(87);
+            else {memory.check(GuestAddress{arg(0)},8,Access::Write);memory.store(GuestAddress{arg(0)},32,(*source)[0]);memory.store(GuestAddress{arg(0)+4},32,(*source)[1]);result=1;}
+        }else if(name=="GetPointerDeviceProperties"){
+            prepare_input_backend();if(input_backend())poll_dinput();
+            const auto found=bridge.devices.find(arg(0));
+            if(found==bridge.devices.end() || !found->second.attached)fail(6);
+            else if(!arg(1))fail(87);
+            else {
+                // properties 為 NULL 時只回報數量；容量不足回報需要的數量與 ERROR_INSUFFICIENT_BUFFER。
+                const auto list=device_properties(found->second);const auto count=static_cast<std::uint32_t>(list.size());
+                const auto capacity=arg(2)?static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)},32)):0U;
+                memory.check(GuestAddress{arg(1)},4,Access::Write);
+                if(arg(2) && capacity<count){memory.store(GuestAddress{arg(1)},32,count);fail(122);}
+                else {
+                    if(arg(2)){std::vector<std::uint8_t> bytes(list.size()*28);
+                        for(std::size_t i=0;i<list.size();++i){const auto& p=list[i];const auto at=static_cast<unsigned>(i*28);
+                            put(bytes,at,std::bit_cast<std::uint32_t>(p.logical_min));put(bytes,at+4,std::bit_cast<std::uint32_t>(p.logical_max));
+                            put(bytes,at+8,std::bit_cast<std::uint32_t>(p.physical_min));put(bytes,at+12,std::bit_cast<std::uint32_t>(p.physical_max));
+                            put(bytes,at+16,p.unit);put(bytes,at+20,p.exponent);put(bytes,at+24,p.page,2);put(bytes,at+26,p.usage,2);}
+                        memory.write(GuestAddress{arg(2)},bytes);}
+                    memory.store(GuestAddress{arg(1)},32,count);result=1;
+                }
+            }
         }else {
             const auto id=static_cast<std::uint32_t>(arg(0));const auto delivered=bridge.delivered.find(threads_.current);
             const auto packet=delivered==bridge.delivered.end()?bridge.packets.end():bridge.packets.find(delivered->second);
@@ -166,15 +224,62 @@ std::optional<std::uint32_t> WindowsServices::invoke_pointer_input(GuestState& s
             }else if(packet==bridge.packets.end() || packet->second.id!=id){
                 const auto active=bridge.current.find(id);fail(active!=bridge.current.end() && active->second.thread!=threads_.current?5U:232U);
             }else if(packet->second.thread!=threads_.current)fail(5);
-            else {const auto& value=packet->second;const auto pointer_type=type(bridge.devices.at(value.device).device);
-                if((name=="GetPointerPenInfo" && pointer_type!=3) || (name=="GetPointerTouchInfo" && pointer_type!=2))fail(87);
-                else {auto bytes=info_bytes(value,pointer_type,x86_);const auto offset=static_cast<unsigned>(bytes.size());const auto& sample=value.sample;
-                    if(name=="GetPointerPenInfo"){bytes.resize(offset+24);put(bytes,offset,(sample.barrel?1U:0U)|(sample.inverted?2U:0U)|(sample.eraser?4U:0U));put(bytes,offset+4,sample.mask&15U);
+            else if(name=="GetRawPointerDeviceData"){
+                // (pointerId, historyCount, propertiesCount, properties, values)：history 只有目前一筆，寫入第一列；
+                // 每個 property 以 usage page／usage 對應裝置回報的屬性，裝置不支援者為 ERROR_INVALID_PARAMETER。
+                const auto properties=static_cast<std::uint32_t>(arg(2));const auto list=device_properties(bridge.devices.at(packet->second.device));
+                if(!properties || properties>64 || !arg(3) || !arg(4))fail(87);
+                else {
+                    std::vector<std::uint8_t> values(std::size_t{properties}*4);bool valid=true;
+                    for(std::uint32_t i=0;i<properties && valid;++i){
+                        const auto page=static_cast<std::uint16_t>(memory.load(GuestAddress{arg(3)+i*28U+24},16)),usage=static_cast<std::uint16_t>(memory.load(GuestAddress{arg(3)+i*28U+26},16));
+                        valid=std::any_of(list.begin(),list.end(),[&](const auto& p){return p.page==page && p.usage==usage;});
+                        if(valid)put(values,i*4,std::bit_cast<std::uint32_t>(raw_property(packet->second,page,usage)));
+                    }
+                    if(!valid)fail(87);else {memory.write(GuestAddress{arg(4)},values);result=1;}
+                }
+            }
+            else {
+                // 依種類組出 POINTER_INFO／POINTER_PEN_INFO／POINTER_TOUCH_INFO；種類與裝置不符時沒有內容。
+                const bool pen=name.find("PenInfo")!=name.npos,touch=name.find("TouchInfo")!=name.npos;
+                const auto build=[&](const PointerPacket& value)->std::optional<std::vector<std::uint8_t>>{
+                    const auto pointer_type=type(bridge.devices.at(value.device).device);
+                    if((pen && pointer_type!=3) || (touch && pointer_type!=2))return std::nullopt;
+                    auto bytes=info_bytes(value,pointer_type,x86_);const auto offset=static_cast<unsigned>(bytes.size());const auto& sample=value.sample;
+                    if(pen){bytes.resize(offset+24);put(bytes,offset,(sample.barrel?1U:0U)|(sample.inverted?2U:0U)|(sample.eraser?4U:0U));put(bytes,offset+4,sample.mask&15U);
                         put(bytes,offset+8,sample.pressure);put(bytes,offset+12,sample.rotation);put(bytes,offset+16,std::bit_cast<std::uint32_t>(sample.tilt_x));put(bytes,offset+20,std::bit_cast<std::uint32_t>(sample.tilt_y));}
-                    else if(name=="GetPointerTouchInfo"){bytes.resize(offset+48);put(bytes,offset+4,sample.mask&7U);const auto& rect=bridge.devices.at(value.device).device.logical_rectangle;
+                    else if(touch){bytes.resize(offset+48);put(bytes,offset+4,sample.mask&7U);const auto& rect=bridge.devices.at(value.device).device.logical_rectangle;
                         for(unsigned i=0;i<4;++i){const auto axis=i&1U;const auto contact=mapped(sample.contact_rectangle[i],rect[axis],rect[axis+2],display[axis],display[axis+2]-1);put(bytes,offset+8+i*4,std::bit_cast<std::uint32_t>(contact));put(bytes,offset+24+i*4,std::bit_cast<std::uint32_t>(contact));}
                         put(bytes,offset+40,sample.rotation);put(bytes,offset+44,sample.pressure);}
-                    memory.write(GuestAddress{arg(1)},bytes);result=1;
+                    return bytes;
+                };
+                const auto& value=packet->second;
+                const bool frame=name.starts_with("GetPointerFrame"),history=name.ends_with("History");
+                if(!frame && !history){
+                    if(const auto bytes=build(value)){memory.write(GuestAddress{arg(1)},*bytes);result=1;}else fail(87);
+                }else{
+                    // 成員：目前訊息的封包在前，其後為同一裝置、同一執行緒其他仍在範圍內的接觸點（依識別碼）。
+                    std::vector<std::vector<std::uint8_t>> members;
+                    if(auto bytes=build(value))members.push_back(std::move(*bytes));
+                    if(frame && !members.empty())for(const auto& [other,item]:bridge.current){
+                        if(other==id || item.device!=value.device || item.thread!=threads_.current || !item.sample.in_range)continue;
+                        if(auto bytes=build(item)){put(*bytes,8,value.frame);members.push_back(std::move(*bytes));}
+                    }
+                    if(members.empty())fail(87);
+                    else{
+                        // (entriesCount*, [pointerCount*], buffer)：buffer 為 NULL 時只回報數量；空間不足回 ERROR_INSUFFICIENT_BUFFER。
+                        const bool both=frame && history;const auto entries=arg(1),pointers=both?arg(2):0,buffer=arg(both?3:2);
+                        const auto pointer_total=static_cast<std::uint32_t>(members.size());
+                        const auto have_entries=static_cast<std::uint32_t>(memory.load(GuestAddress{entries},32));
+                        const auto have_pointers=both?(pointers?static_cast<std::uint32_t>(memory.load(GuestAddress{pointers},32)):0U):have_entries;
+                        if(both && !pointers)fail(87);
+                        else{
+                            memory.store(GuestAddress{entries},32,frame && !history?pointer_total:1U);if(both)memory.store(GuestAddress{pointers},32,pointer_total);
+                            if(!buffer)result=1;
+                            else if((history && have_entries<1) || (frame && have_pointers<pointer_total))fail(122);
+                            else{std::uint64_t at=buffer;for(const auto& bytes:members){memory.write(GuestAddress{at},bytes);at+=bytes.size();}result=1;}
+                        }
+                    }
                 }
             }
         }

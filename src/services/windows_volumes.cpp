@@ -56,6 +56,7 @@ std::span<const WindowsServiceDescriptor> volume_service_descriptors() {
         {"kernel32.dll", "GetDriveTypeA", 1}, {"kernel32.dll", "GetDriveTypeW", 1},
         {"kernel32.dll", "GetDiskFreeSpaceA", 5}, {"kernel32.dll", "GetDiskFreeSpaceW", 5},
         {"kernel32.dll", "GetDiskFreeSpaceExA", 4}, {"kernel32.dll", "GetDiskFreeSpaceExW", 4},
+        {"kernel32.dll", "GetDiskSpaceInformationA", 2}, {"kernel32.dll", "GetDiskSpaceInformationW", 2},
         {"kernel32.dll", "GetVolumeInformationA", 8}, {"kernel32.dll", "GetVolumeInformationW", 8},
         {"kernel32.dll", "SetVolumeLabelA", 2}, {"kernel32.dll", "SetVolumeLabelW", 2},
         {"kernel32.dll", "GetCompressedFileSizeA", 2}, {"kernel32.dll", "GetCompressedFileSizeW", 2},
@@ -280,6 +281,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_volume(GuestState& state, G
     } else if (symbol.starts_with("GetDriveType")) {
         const auto path = arg(0) ? text(0) : std::string("C:\\");
         result = filesystem_.network_path(path)?4:!mount_volume(path).second?3:1;
+    } else if (symbol.starts_with("GetDiskSpaceInformation")) {
+        // DISK_SPACE_INFORMATION：與 GetDiskFreeSpaceEx 共用卷資訊，換算成配置單位；回傳 HRESULT。
+        const auto path = arg(0) ? text(0) : std::string("C:\\");
+        if (!arg(1)) result = 0x80070057U;
+        else {
+            const auto space = filesystem_.volume_space(path);
+            if (space.error) result = 0x80070000U | (space.error & 0xffffU);
+            else {
+                const auto unit = space.allocation_unit ? space.allocation_unit : 4096U;
+                const std::array<std::uint64_t, 11> fields{space.total / unit, space.free / unit, 0, space.total / unit, space.available / unit, 0, (space.total - space.free) / unit, 0, 0, 0, 0};
+                memory.check(GuestAddress{arg(1)}, 96, Access::Write);
+                for (unsigned i = 0; i < fields.size(); ++i) memory.store(GuestAddress{arg(1) + i * 8U}, 64, fields[i]);
+                memory.store(GuestAddress{arg(1) + 88}, 32, unit / space.sector_size); memory.store(GuestAddress{arg(1) + 92}, 32, space.sector_size); result = 0;
+            }
+        }
     } else if (symbol.starts_with("GetDiskFreeSpace")) {
         const bool extended = symbol.starts_with("GetDiskFreeSpaceEx");
         const auto path = arg(0) ? text(0) : std::string("C:\\");

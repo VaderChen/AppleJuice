@@ -1,6 +1,10 @@
 /* CRT 格式輸出的共用純運算契約；宿主與客體常駐常式使用同一份規則。 */
 #pragma once
 typedef unsigned long long X64armCrtFormatWord;
+#define X64ARM_CRT_PRINTF_OPTIONS_MASK 0x3fULL
+static inline int x64arm_crt_legacy_size(unsigned c,X64armCrtFormatWord options) {
+    return (options&8) && (c=='F' || c=='N');
+}
 enum {
     X64ARM_FMT_LEFT=1, X64ARM_FMT_PLUS=2, X64ARM_FMT_SPACE=4,
     X64ARM_FMT_ALT=8, X64ARM_FMT_ZERO=16,

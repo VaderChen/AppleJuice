@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "service_callback_task.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
 #include "x64arm/windows_paths.hpp"
@@ -9,6 +10,8 @@
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> path_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+        {"kernel32.dll","wine_get_unix_file_name",1,0,0,0,true},
+        {"kernel32.dll","wine_get_dos_file_name",1,0,0,0,true},
         {"shlwapi.dll","PathCombineA",3},{"shlwapi.dll","PathCombineW",3},
         {"shlwapi.dll","PathAppendA",2},{"shlwapi.dll","PathAppendW",2},
         {"shlwapi.dll","PathRemoveFileSpecA",1},{"shlwapi.dll","PathRemoveFileSpecW",1},
@@ -19,14 +22,24 @@ std::span<const WindowsServiceDescriptor> path_service_descriptors() {
         {"shlwapi.dll","PathAddExtensionA",2},{"shlwapi.dll","PathAddExtensionW",2},
         {"shlwapi.dll","PathRemoveExtensionA",1},{"shlwapi.dll","PathRemoveExtensionW",1},
         {"shlwapi.dll","PathRenameExtensionA",2},{"shlwapi.dll","PathRenameExtensionW",2},
-        {"shlwapi.dll","AssocQueryStringA",6},{"shlwapi.dll","AssocQueryStringW",6},
+        {"shlwapi.dll","AssocQueryStringA",6,0,0,0x3},{"shlwapi.dll","AssocQueryStringW",6,0,0,0x3},
+        {"shlwapi.dll","AssocQueryStringByKeyA",6,0,0,0x3},{"shlwapi.dll","AssocQueryStringByKeyW",6,0,0,0x3},
+        {"shlwapi.dll","AssocQueryKeyA",5,0,0,0x3},{"shlwapi.dll","AssocQueryKeyW",5,0,0,0x3},
+        {"shlwapi.dll","AssocGetPerceivedType",4},{"shlwapi.dll","AssocIsDangerous",1},{"shlwapi.dll","AssocCreate",3,0,0x1},
+        {"internal-query-associations","QueryInterface",3},{"internal-query-associations","AddRef",1},{"internal-query-associations","Release",1},
+        {"internal-query-associations","Init",5,0,0,0x2},{"internal-query-associations","GetString",6,0,0,0x6},{"internal-query-associations","GetKey",5,0,0,0x6},
+        {"internal-query-associations","GetData",6,0,0,0x6},{"internal-query-associations","GetEnum",6,0,0,0x6},
         {"pathcch.dll","PathCchSkipRoot",2},{"pathcch.dll","PathCchCombineEx",5},
         {"pathcch.dll","PathCchCombine",4},{"pathcch.dll","PathCchCanonicalizeEx",4},
         {"pathcch.dll","PathCchCanonicalize",3},
         {"pathcch.dll","PathCchRemoveBackslash",2},{"pathcch.dll","PathCchRemoveBackslashEx",4},
         {"pathcch.dll","PathCchAddBackslash",2},{"pathcch.dll","PathCchAddBackslashEx",4},
         {"pathcch.dll","PathCchRemoveFileSpec",2},{"pathcch.dll","PathCchStripToRoot",2},
-        {"pathcch.dll","PathCchIsRoot",1},{"pathcch.dll","PathCchFindExtension",3}
+        {"pathcch.dll","PathCchIsRoot",1},{"pathcch.dll","PathCchFindExtension",3},
+        // 副檔名增刪改、\\?\ 前綴移除、附加路徑、配置結果的正規化／合併與 UNC 判斷（Windows 8 起的 pathcch 介面）。
+        {"pathcch.dll","PathCchAddExtension",3},{"pathcch.dll","PathCchRemoveExtension",2},{"pathcch.dll","PathCchRenameExtension",3},
+        {"pathcch.dll","PathCchStripPrefix",2},{"pathcch.dll","PathCchAppend",3},{"pathcch.dll","PathCchAppendEx",4,0,0,0x8},
+        {"pathcch.dll","PathAllocCanonicalize",3,0,0,0x2},{"pathcch.dll","PathAllocCombine",4,0,0,0x4},{"pathcch.dll","PathIsUNCEx",2}
     };return table;
 }
 namespace {
@@ -68,6 +81,11 @@ std::optional<std::size_t> root_end(std::u16string_view s) {
     if(s.front()==u'\\')return 1;
     if(drive(s))return 2+(s.size()>2 && s[2]==u'\\'?1U:0U);
     return {};
+}
+// 最後一段的副檔名起點（'.' 的位置）；沒有副檔名時為字串長度。根之前的 '.' 不算。
+std::size_t extension_at(std::u16string_view path) {
+    const auto root=root_end(path).value_or(0);const auto slash=path.find_last_of(u'\\');const auto dot=path.find_last_of(u'.');
+    return dot!=path.npos && dot>=root && (slash==path.npos || dot>slash)?dot:path.size();
 }
 std::u16string strip_extended(std::u16string s) {
     if(prefix(s,u"\\\\?\\unc\\"))return u"\\\\"+s.substr(8);
@@ -114,7 +132,7 @@ std::uint32_t canonicalize(std::u16string input,std::uint32_t flags,std::size_t 
     return output.size()>=capacity?too_small:0;
 }
 }
-std::uint32_t WindowsServices::query_association(std::uint32_t flags,std::uint32_t kind,std::u16string source,const std::u16string& extra,std::u16string& output) {
+std::uint32_t WindowsServices::query_association(std::uint32_t flags,std::uint32_t kind,std::u16string source,const std::u16string& extra,std::u16string& output,std::u16string* location) {
     const auto done=[](std::uint32_t code){return code;};
         const auto mode=flags&0x5800U;
         if(source.empty() || !kind || kind>=24 || (flags&~0x1ffffU) || (mode && (mode&(mode-1))) || ((flags&0x2000) && !(flags&0x800)))return done(invalid);
@@ -161,7 +179,7 @@ std::uint32_t WindowsServices::query_association(std::uint32_t flags,std::uint32
             }return {};
         };
         std::optional<std::u16string> value;
-        if(kind==20){if(!progid.empty() && lookup.exists(primary))value=progid;}
+        if(kind==20){if(!progid.empty() && lookup.exists(primary)){value=progid;if(location)*location=primary;}}
         else for(const auto& path:candidates){
             const auto verb=lookup.verb(path,extra),shell=path+u"\\shell\\"+verb;
             switch(kind){
@@ -187,13 +205,189 @@ std::uint32_t WindowsServices::query_association(std::uint32_t flags,std::uint32
             case 18:value=lookup.value(shell+u"\\command",u"DelegateExecute");break;
             default:break;
             }
-            if(value)break;
+            if(value){if(location)*location=path;break;}
         }
         if(!value)return done(0x80070483U);
         if((kind==3 || kind==4 || kind==11) && value->starts_with(u"@"))return done(0x80070032U);
     output=std::move(*value);return 0;
 }
+// 檔案關聯家族：AssocQueryString(ByKey)、AssocQueryKey、AssocGetPerceivedType、AssocIsDangerous、AssocCreate 與 IQueryAssociations。
+// 查詢一律交給 query_association；ByKey 與 IQueryAssociations::Init(hkProgid) 以 NtQueryKey 取得機碼名稱，轉成相對 HKEY_CLASSES_ROOT 的類別路徑。
+std::optional<std::uint32_t> WindowsServices::invoke_association(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool object=service.family=="internal-query-associations";
+    const bool wide=object || name.ends_with('W') || name=="AssocGetPerceivedType" || name=="AssocIsDangerous";
+    const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+    const std::uint64_t classes_root=x86_?0x80000000ULL:0xffffffff80000000ULL;
+    const auto done=[&](std::uint64_t value)->std::optional<std::uint32_t>{arg.return_to(state,value);return {};};
+    const auto read=[&](std::uint64_t at)->std::u16string{if(!at)return {};return wide?read_utf16(memory,GuestAddress{at},32768):utf8_to_utf16(read_ansi(memory,at,32768));};
+    const auto host=[&](std::string_view dll,std::string_view symbol,std::initializer_list<std::uint64_t> args){return nested_service(state,memory,dll,symbol,args);};
+    // 字串輸出（AssocQueryString 慣例）：*pcch 寫回含 NUL 的所需長度；輸出為 NULL 回 S_FALSE；空間不足時 NOTRUNCATE（0x20）回 E_POINTER，否則截斷並回 ERROR_INSUFFICIENT_BUFFER。
+    const auto write_string=[&](bool as_wide,std::uint32_t flags,const std::u16string& value,std::uint64_t out,std::uint64_t count)->std::uint32_t{
+        std::vector<std::uint8_t> bytes;if(as_wide)bytes=utf16_bytes(value);else {const auto text=utf16_to_utf8(value);bytes.assign(text.begin(),text.end());bytes.push_back(0);}
+        const auto width=as_wide?2U:1U,required=static_cast<std::uint32_t>(bytes.size()/width),capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{count},32));
+        memory.store(GuestAddress{count},32,required);if(!out)return 1;
+        if(capacity<required){if(flags&0x20){if(capacity)memory.store(GuestAddress{out},as_wide?16:8,0);return 0x80004003U;}memory.write(GuestAddress{out},std::span(bytes).first(capacity*width));return too_small;}
+        memory.write(GuestAddress{out},bytes);return 0;};
+    // HKEY → 相對 HKCR 的類別路徑：查登錄 handle 表的邏輯路徑；HKCR 根（代碼 0）直接取其後，HKLM／使用者的 Software\Classes 與 <SID>_Classes 取 Classes 之後。
+    const auto key_source=[&](std::uint64_t key)->std::optional<std::u16string>{
+        if(!key)return std::nullopt;if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
+        RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return std::nullopt;
+        const auto found=runtime_.registry.handles.find(key);if(found==runtime_.registry.handles.end())return std::nullopt;
+        const auto& path=registry_logical_path(found->second);if(path.size()<3 || path[1]!=u'\\')return std::nullopt;
+        if(path[0]==0)return path.substr(2);
+        auto folded=path;for(auto& c:folded)c=unicode_case_unit(c,false);
+        for(const auto marker:{std::u16string_view(u"\\software\\classes\\"),std::u16string_view(u"_classes\\")})
+            if(const auto at=folded.find(marker);at!=folded.npos && at+marker.size()<path.size())return path.substr(at+marker.size());
+        return std::nullopt;};
+    // 開啟 HKCR 下的類別機碼並寫到輸出 HKEY*。
+    const auto open_class=[&](const std::u16string& path,std::uint64_t out)->std::uint32_t{
+        GuestScratch temporary(*this,memory,state);const auto text=temporary.text(path);if(!text)return 0x8007000eU;
+        const auto status=static_cast<std::uint32_t>(host("advapi32.dll","RegOpenKeyExW",{classes_root,text,0,0x20019,out}));return status?0x80070000U|(status&0xffffU):0;};
+    // ASSOCKEY：SHELLEXECCLASS 1（有指令的類別）、APP 2（Applications\執行檔）、CLASS 3（ProgID）、BASECLASS 4。
+    const auto query_key=[&](std::uint32_t flags,std::uint32_t key,const std::u16string& source,const std::u16string& extra,std::uint64_t out)->std::uint32_t{
+        if(!out)return invalid;memory.store(GuestAddress{out},bits,0);if(source.empty() || key<1 || key>4)return invalid;
+        std::u16string value,location;
+        if(key==1){const auto status=query_association(flags,1,source,extra,value,&location);if(status)return status;return open_class(location,out);}
+        if(key==2){const auto status=query_association(flags,2,source,extra,value);if(status)return status;return open_class(u"Applications\\"+value.substr(value.find_last_of(u"\\/")+1),out);}
+        auto status=query_association(flags,20,source,extra,value,&location);
+        if(status && source.front()==u'.'){location=source;status=0;}if(status)return status;
+        if(key==3)return open_class(location,out);
+        GuestScratch temporary(*this,memory,state);const auto path=temporary.text(location),field=temporary.text(u"BaseClass"),data=temporary.allocate(520),size=temporary.allocate(4);if(!path || !field || !data || !size)return 0x8007000eU;
+        memory.store(GuestAddress{size},32,520);if(host("advapi32.dll","RegGetValueW",{classes_root,path,field,2,0,data,size})&UINT32_MAX)return 0x80070483U; // ERROR_NO_ASSOCIATION
+        return open_class(read_utf16(memory,GuestAddress{data},259),out);};
+    // ASSOCDATA：MSIDESCRIPTOR 1、NOACTIVATEHANDLER 2、HASPERUSERASSOC 4、EDITFLAGS 5、VALUE 6（pszExtra 為值名稱）。輸出為 NULL 時回 S_FALSE 與所需大小。
+    const auto query_data=[&](std::uint32_t flags,std::uint32_t data,const std::u16string& source,const std::u16string& extra,std::uint64_t out,std::uint64_t count)->std::uint32_t{
+        if(!count || source.empty())return invalid;std::u16string value,location;
+        if(query_association(flags,20,source,extra,value,&location)){if(source.front()!=u'.')return 0x80070483U;location=source;}
+        std::u16string key=location,field;
+        if(data==5)field=u"EditFlags";else if(data==6){if(extra.empty())return invalid;field=extra;}
+        else if(data==1 || data==2){std::u16string command;std::u16string at;if(query_association(flags,1,source,u"",command,&at))return 0x80070483U;
+            const auto verb=extra.empty()?std::u16string(u"open"):extra;key=at+u"\\shell\\"+verb+(data==1?u"\\command":u"\\ddeexec");field=data==1?u"command":u"NoActivateHandler";}
+        else if(data==4){std::u16string unused;return query_association(flags,20,source,extra,unused)==0 && source.front()==u'.'?0U:1U;}
+        else return 0x80070032U; // QUERYCLASSSTORE：沒有類別存放區
+        GuestScratch temporary(*this,memory,state);const auto path=temporary.text(key),name_text=temporary.text(field),size=temporary.allocate(4),type=temporary.allocate(4);if(!path || !name_text || !size || !type)return 0x8007000eU;
+        memory.store(GuestAddress{size},32,0);auto status=static_cast<std::uint32_t>(host("advapi32.dll","RegGetValueW",{classes_root,path,name_text,0xffff,type,0,size}));
+        if(status)return data==2?1U:0x80070000U|(status&0xffffU);if(data==2)return 0;
+        const auto required=static_cast<std::uint32_t>(memory.load(GuestAddress{size},32)),capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{count},32));memory.store(GuestAddress{count},32,required);
+        if(!out)return 1;if(capacity<required)return 0x80004003U;memory.store(GuestAddress{size},32,capacity);
+        status=static_cast<std::uint32_t>(host("advapi32.dll","RegGetValueW",{classes_root,path,name_text,0xffff,type,out,size}));if(status)return 0x80070000U|(status&0xffffU);
+        memory.store(GuestAddress{count},32,memory.load(GuestAddress{size},32));return 0;};
+    try{
+        if(name.starts_with("AssocQueryString")){
+            // (flags, ASSOCSTR, pszAssoc 或 hkAssoc, pszExtra, out, pcch)
+            const bool by_key=name.starts_with("AssocQueryStringByKey");if(!arg(2) || !arg(5))return done(invalid);
+            std::u16string source;if(by_key){const auto found=key_source(arg(2));if(!found)return done(invalid);source=*found;}else source=read(arg(2));
+            std::u16string value;const auto status=query_association(static_cast<std::uint32_t>(arg(0)),static_cast<std::uint32_t>(arg(1)),source,read(arg(3)),value);if(status)return done(status);
+            return done(write_string(wide,static_cast<std::uint32_t>(arg(0)),value,arg(4),arg(5)));
+        }
+        if(name.starts_with("AssocQueryKey"))return done(query_key(static_cast<std::uint32_t>(arg(0)),static_cast<std::uint32_t>(arg(1)),read(arg(2)),read(arg(3)),arg(4)));
+        if(name=="AssocGetPerceivedType"){
+            // (副檔名, PERCEIVED*, PERCEIVEDFLAG*, PWSTR* 可為 NULL)：登錄的 PerceivedType 優先（SOFTCODED 1），其次內建表（HARDCODED 2，另含 NATIVESUPPORT／GDIPLUS／WMSDK／ZIPFOLDER），
+            // 再其次 Content Type 的主類型；都沒有時為 UNSPECIFIED（-2）並回 ERROR_FILE_NOT_FOUND。
+            static constexpr std::u16string_view names[]{u"text",u"image",u"audio",u"video",u"compressed",u"document",u"system",u"application",u"gamemedia",u"contacts"};
+            struct Builtin {std::u16string_view extension;std::int32_t type;std::uint32_t flags;};
+            static constexpr Builtin builtin[]{
+                {u".txt",1,2},{u".bmp",2,0x16},{u".dib",2,0x16},{u".emf",2,0x16},{u".gif",2,0x16},{u".ico",2,0x16},{u".jfif",2,0x16},{u".jpe",2,0x16},{u".jpeg",2,0x16},{u".jpg",2,0x16},
+                {u".png",2,0x16},{u".rle",2,0x16},{u".tif",2,0x16},{u".tiff",2,0x16},{u".wmf",2,0x16},
+                {u".aif",3,0x22},{u".aifc",3,0x22},{u".aiff",3,0x22},{u".au",3,0x22},{u".m3u",3,0x22},{u".mid",3,0x22},{u".midi",3,0x22},{u".mp2",3,0x22},{u".mp3",3,0x22},
+                {u".rmi",3,0x22},{u".snd",3,0x22},{u".wav",3,0x22},{u".wax",3,0x22},{u".wma",3,0x22},
+                {u".asf",4,0x22},{u".asx",4,0x22},{u".avi",4,0x22},{u".ivf",4,0x22},{u".m1v",4,0x22},{u".mpa",4,0x22},{u".mpe",4,0x22},{u".mpeg",4,0x22},{u".mpg",4,0x22},
+                {u".mpv2",4,0x22},{u".wm",4,0x22},{u".wmv",4,0x22},{u".wvx",4,0x22},
+                {u".zip",5,0x46},{u".cab",5,0x06},{u".exe",8,0x02},{u".com",8,0x02},{u".bat",8,0x02},{u".cmd",8,0x02},{u".pif",8,0x02},{u".scr",8,0x02},{u".dll",7,0x02},{u".sys",7,0x02},
+            };
+            if(arg(1))memory.store(GuestAddress{arg(1)},32,static_cast<std::uint32_t>(-2));if(arg(2))memory.store(GuestAddress{arg(2)},32,0);if(arg(3))memory.store(GuestAddress{arg(3)},bits,0);
+            auto extension=read(arg(0));if(extension.empty() || extension.front()!=u'.')return done(invalid);for(auto& c:extension)c=unicode_case_unit(c,false);
+            std::int32_t type=-2;std::uint32_t flags=0;std::u16string type_name;
+            GuestScratch temporary(*this,memory,state);const auto key=temporary.text(extension),data=temporary.allocate(520),size=temporary.allocate(4);if(!key || !data || !size)return done(0x8007000eU);
+            const auto registry_text=[&](std::u16string_view field)->std::optional<std::u16string>{const auto name_text=temporary.text(field);if(!name_text)return std::nullopt;memory.store(GuestAddress{size},32,520);
+                if(host("advapi32.dll","RegGetValueW",{classes_root,key,name_text,2,0,data,size})&UINT32_MAX)return std::nullopt;return read_utf16(memory,GuestAddress{data},259);};
+            if(auto perceived=registry_text(u"PerceivedType")){auto folded=*perceived;for(auto& c:folded)c=unicode_case_unit(c,false);
+                for(std::size_t i=0;i<std::size(names);++i)if(folded==names[i])type=static_cast<std::int32_t>(i+1);if(type==-2)type=-3;flags=1;type_name=*perceived;}
+            if(type==-2)for(const auto& item:builtin)if(item.extension==extension){type=item.type;flags=item.flags;type_name=std::u16string(names[item.type-1]);break;}
+            if(type==-2)if(auto content=registry_text(u"Content Type")){auto folded=*content;for(auto& c:folded)c=unicode_case_unit(c,false);
+                for(const auto& [prefix,kind]:std::initializer_list<std::pair<std::u16string_view,std::int32_t>>{{u"text/",1},{u"image/",2},{u"audio/",3},{u"video/",4}})
+                    if(folded.starts_with(prefix)){type=kind;flags=1;type_name=std::u16string(names[kind-1]);break;}}
+            if(arg(1))memory.store(GuestAddress{arg(1)},32,static_cast<std::uint32_t>(type));if(arg(2))memory.store(GuestAddress{arg(2)},32,flags);
+            if(type==-2)return done(0x80070002U);
+            if(arg(3) && !type_name.empty()){auto bytes=utf16_bytes(type_name);auto block=host("ole32.dll","CoTaskMemAlloc",{bytes.size()});if(x86_)block&=UINT32_MAX;if(!block)return done(0x8007000eU);memory.write(GuestAddress{block},bytes);memory.store(GuestAddress{arg(3)},bits,block);}
+            return done(0);
+        }
+        if(name=="AssocIsDangerous"){
+            // 內建的危險副檔名，或 ProgID 的 EditFlags 含 FTA_AlwaysUnsafe（0x20000）。
+            static constexpr std::u16string_view dangerous[]{u".ade",u".adp",u".app",u".asp",u".bas",u".bat",u".cer",u".chm",u".cmd",u".cnt",u".com",u".cpl",u".crt",u".csh",u".der",u".exe",u".fxp",
+                u".gadget",u".hlp",u".hpj",u".hta",u".inf",u".ins",u".isp",u".its",u".js",u".jse",u".ksh",u".lnk",u".mad",u".maf",u".mag",u".mam",u".maq",u".mar",u".mas",u".mat",u".mau",u".mav",u".maw",
+                u".mda",u".mdb",u".mde",u".mdt",u".mdw",u".mdz",u".msc",u".msh",u".msh1",u".msh2",u".mshxml",u".msh1xml",u".msh2xml",u".msi",u".msp",u".mst",u".ops",u".pcd",u".pif",u".plg",u".prf",u".prg",
+                u".ps1",u".ps1xml",u".ps2",u".ps2xml",u".psc1",u".psc2",u".pst",u".reg",u".scf",u".scr",u".sct",u".shb",u".shs",u".tmp",u".url",u".vb",u".vbe",u".vbs",u".vsmacros",u".vsw",u".ws",u".wsc",u".wsf",u".wsh",u".xnk"};
+            auto source=read(arg(0));if(source.empty())return done(0);auto folded=source;for(auto& c:folded)c=unicode_case_unit(c,false);
+            if(std::find(std::begin(dangerous),std::end(dangerous),folded)!=std::end(dangerous))return done(1);
+            GuestScratch temporary(*this,memory,state);const auto out=temporary.allocate(4),count=temporary.allocate(4);if(!out || !count)return done(0);memory.store(GuestAddress{count},32,4);
+            if(query_data(0,5,source,u"",out,count))return done(0);return done((memory.load(GuestAddress{out},32)&0x20000U)?1U:0U);
+        }
+        if(name=="AssocCreate"){
+            // (CLSID 傳值, riid, ppv)：只支援 CLSID_QueryAssociations，介面為 IQueryAssociations 或 IUnknown。
+            constexpr std::array<std::uint8_t,16> clsid{0xfd,0x34,0x70,0xa0,0xaa,0x6c,0x54,0x49,0xac,0x3f,0x97,0xa2,0x72,0x16,0xf9,0x8a};
+            constexpr std::array<std::uint8_t,16> iid{0x90,0xa5,0x6c,0xc4,0x3f,0x3c,0xd2,0x11,0xbe,0xe6,0x00,0x00,0xf8,0x05,0xca,0x57},unknown{0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
+            if(!arg(2))return done(invalid);memory.store(GuestAddress{arg(2)},bits,0);if(!arg(1))return done(invalid);
+            std::array<std::uint8_t,16> requested{},interface_id{};memory.read(GuestAddress{arg(0)},requested);memory.read(GuestAddress{arg(1)},interface_id);
+            if(requested!=clsid)return done(0x80040111U);if(interface_id!=iid && interface_id!=unknown)return done(0x80004002U);
+            if(!query_associations_vtable_){std::vector<std::string_view> methods;for(const auto& entry:path_service_descriptors())if(entry.family=="internal-query-associations")methods.push_back(entry.symbol);
+                const auto table=runtime_allocate(memory,{},methods.size()*unit);if(!table)return done(0x8007000eU);
+                for(std::size_t i=0;i<methods.size();++i)memory.store(GuestAddress{table+i*unit},bits,resolve("internal-query-associations",methods[i]).value);query_associations_vtable_=table;}
+            const auto instance=allocate_heap(memory,unit);if(!instance)return done(0x8007000eU);memory.store(GuestAddress{instance},bits,query_associations_vtable_);
+            query_associations_.emplace(instance,QueryAssociationsObject{});memory.store(GuestAddress{arg(2)},bits,instance);return done(0);
+        }
+        if(object){
+            const auto found=query_associations_.find(arg(0));if(found==query_associations_.end())return done(0x80010108U);auto& instance=found->second;
+            if(name=="AddRef")return done(++instance.references);
+            if(name=="Release"){if(--instance.references)return done(instance.references);query_associations_.erase(found);(void)free_heap(memory,arg(0),state);return done(0);}
+            if(name=="QueryInterface"){
+                constexpr std::array<std::uint8_t,16> iid{0x90,0xa5,0x6c,0xc4,0x3f,0x3c,0xd2,0x11,0xbe,0xe6,0x00,0x00,0xf8,0x05,0xca,0x57},unknown{0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
+                if(!arg(2))return done(0x80004003U);memory.store(GuestAddress{arg(2)},bits,0);if(!arg(1))return done(0x80004003U);
+                std::array<std::uint8_t,16> requested{};memory.read(GuestAddress{arg(1)},requested);if(requested!=iid && requested!=unknown)return done(0x80004002U);
+                ++instance.references;memory.store(GuestAddress{arg(2)},bits,arg(0));return done(0);
+            }
+            if(name=="Init"){
+                // (ASSOCF 初始化旗標, pszAssoc, hkProgid, hwnd)：字串優先，否則以機碼路徑作為來源。
+                std::u16string source=read(arg(2));if(source.empty() && arg(3)){if(const auto path=key_source(arg(3)))source=*path;}
+                if(source.empty())return done(invalid);instance.source=std::move(source);instance.flags=static_cast<std::uint32_t>(arg(1));return done(0);
+            }
+            if(instance.source.empty())return done(0x8000ffffU); // E_UNEXPECTED：尚未 Init
+            const auto flags=instance.flags|static_cast<std::uint32_t>(arg(1));
+            if(name=="GetString"){if(!arg(5))return done(invalid);std::u16string value;const auto status=query_association(flags,static_cast<std::uint32_t>(arg(2)),instance.source,read(arg(3)),value);
+                if(status)return done(status);return done(write_string(true,flags,value,arg(4),arg(5)));}
+            if(name=="GetKey")return done(query_key(flags,static_cast<std::uint32_t>(arg(2)),instance.source,read(arg(3)),arg(4)));
+            if(name=="GetData")return done(query_data(flags,static_cast<std::uint32_t>(arg(2)),instance.source,read(arg(3)),arg(4),arg(5)));
+            if(name=="GetEnum"){if(arg(5))memory.store(GuestAddress{arg(5)},bits,0);return done(0x80004001U);} // Windows 亦未實作
+        }
+    }catch(const std::invalid_argument&){return done(invalid);}
+    throw HostCallFault("未知的檔案關聯服務");
+}
 std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    if(service.symbol=="wine_get_unix_file_name" || service.symbol=="wine_get_dos_file_name"){
+        const WindowsCall call(state,memory,service);std::uint64_t result=0;
+        try{
+            if(!call(0))last_error_=87;
+            else{
+                std::vector<std::uint8_t> bytes;std::uint32_t error=0;
+                if(service.symbol=="wine_get_unix_file_name"){
+                    const auto input=read_utf16(memory,GuestAddress{call(0)},32767);
+                    const auto path=full_windows_dos_path(input,runtime_.current_directory);
+                    const auto converted=filesystem_.unix_file_name(utf16_to_utf8(path));error=converted.second;
+                    if(!error){const auto text=converted.first.string();bytes.assign(text.begin(),text.end());bytes.push_back(0);}
+                }else{
+                    const auto input=read_ansi(memory,call(0),32767);std::u16string path;
+                    if(input.empty())error=123;
+                    else if(input.front()!='/')path=full_windows_dos_path(utf8_to_utf16(input),runtime_.current_directory);
+                    else{const auto converted=filesystem_.dos_file_name(input);error=converted.second;if(!error)path=utf8_to_utf16(converted.first);}
+                    if(!error)bytes=utf16_bytes(path);
+                }
+                if(error)last_error_=error;
+                else{result=allocate_heap(memory,bytes.size());if(result)memory.write(GuestAddress{result},bytes);else last_error_=8;}
+            }
+        }catch(const std::invalid_argument&){last_error_=123;}
+        call.return_to(state,result);return std::nullopt;
+    }
+    if(service.symbol.starts_with("Assoc") || service.family=="internal-query-associations")return invoke_association(state,memory,service);
     if(service.symbol.starts_with("PathStripToRoot")){
         const WindowsCall call(state,memory,service);const bool wide=service.symbol.ends_with('W');std::uint64_t result=0;
         if(call(0)){
@@ -271,19 +465,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
                 path.resize(offset);if(path.size()+extension.size()<260){path+=extension;if(wide)memory.write(GuestAddress{arg(0)},utf16_bytes(path));else{std::vector<std::uint8_t> bytes(path.begin(),path.end());bytes.push_back(0);memory.write(GuestAddress{arg(0)},bytes);}result=1;}
             }
         }
-    }else if(service.symbol.starts_with("AssocQueryString")){
-        const bool wide=service.symbol.ends_with('W');const auto flags=static_cast<std::uint32_t>(arg(0)),kind=static_cast<std::uint32_t>(arg(1));
-        const auto done=[&](std::uint32_t value)->std::optional<std::uint32_t>{arg.return_to(state,value);return {};};
-        if(!arg(2) || !arg(5))return done(invalid);
-        const auto read=[&](unsigned i){return arg(i)?(wide?read_utf16(memory,GuestAddress{arg(i)},32768):utf8_to_utf16(read_ansi(memory,arg(i),32768))):std::u16string{};};
-        std::u16string value;const auto status=query_association(flags,kind,read(2),read(3),value);if(status)return done(status);
-        std::vector<std::uint8_t> bytes;
-        if(wide)bytes=utf16_bytes(value);else{const auto text=utf16_to_utf8(value);bytes.assign(text.begin(),text.end());bytes.push_back(0);}
-        const auto width=wide?2U:1U,required=static_cast<std::uint32_t>(bytes.size()/width),capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(5)},32));
-        memory.store(GuestAddress{arg(5)},32,required);
-        if(!arg(4))return done(1);
-        if(capacity<required){if(flags&0x20){if(capacity)memory.store(GuestAddress{arg(4)},wide?16:8,0);return done(0x80004003U);}memory.write(GuestAddress{arg(4)},std::span(bytes).first(capacity*width));return done(too_small);}
-        memory.write(GuestAddress{arg(4)},bytes);
     }else if(service.symbol.starts_with("PathMatchSpec")){
 
         const bool wide=service.symbol.ends_with('W'),extended=service.symbol.starts_with("PathMatchSpecEx");const auto flags=extended?static_cast<std::uint32_t>(arg(2)):1U;
@@ -371,9 +552,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
                     if(!root_end(path))result=invalid;else if(path.size()>root){path.resize(root);changed=true;}
                 }else {
                     if(!arg(2))result=invalid;
-                    else {const auto slash=path.find_last_of(u'\\');const auto dot=path.find_last_of(u'.');
-                        const auto at=dot!=path.npos && dot>=root && (slash==path.npos || dot>slash)?dot:path.size();
-                        memory.store(GuestAddress{arg(2)},x86_?32:64,arg(0)+at*2);}
+                    else memory.store(GuestAddress{arg(2)},x86_?32:64,arg(0)+extension_at(path)*2);
                 }
                 if(!result && name!="PathCchFindExtension"){
                     if(changed)memory.write(GuestAddress{arg(0)},utf16_bytes(path));else result=1;
@@ -383,6 +562,67 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
                     }
                 }
             }
+        }
+    }else if(service.symbol=="PathCchAddExtension" || service.symbol=="PathCchRemoveExtension" || service.symbol=="PathCchRenameExtension" || service.symbol=="PathCchStripPrefix"){
+        // 就地修改，cch 規則同上。Add：已有副檔名 S_FALSE、空副檔名 S_OK 不變；Remove／StripPrefix：沒有可移除者 S_FALSE；
+        // Rename：移除原副檔名後加上新的（"" 只移除）。副檔名可帶或不帶開頭的 '.'，含檔名非法字元或其他 '.' 為 E_INVALIDARG。
+        const auto capacity=arg(1);const auto name=service.symbol;const bool takes_extension=name=="PathCchAddExtension" || name=="PathCchRenameExtension";
+        if(!arg(0) || !capacity || capacity>32768 || (takes_extension && !arg(2)))result=invalid;
+        else {
+            auto path=read_utf16(memory,GuestAddress{arg(0)});std::u16string extension;
+            if(path.size()>=capacity)result=invalid;
+            if(!result && takes_extension){
+                extension=read_utf16(memory,GuestAddress{arg(2)},32768);if(!extension.empty() && extension.front()==u'.')extension.erase(0,1);
+                if(extension.find_first_of(u"\\/:*?\"<>|.")!=extension.npos)result=invalid;
+            }
+            if(!result){
+                const auto at=extension_at(path);bool changed=false;
+                if(name=="PathCchStripPrefix"){auto stripped=strip_extended(path);if(stripped!=path){path=std::move(stripped);changed=true;}}
+                else if(name=="PathCchRemoveExtension"){if(at<path.size()){path.resize(at);changed=true;}}
+                else if(name=="PathCchAddExtension"){if(at<path.size())result=1;else if(!extension.empty()){path+=u"."+extension;changed=true;}}
+                else {if(at<path.size()){path.resize(at);changed=true;}if(!extension.empty()){path+=u"."+extension;changed=true;}}
+                if(!result){
+                    if(path.size()>=capacity)result=too_long;
+                    else if(changed)memory.write(GuestAddress{arg(0)},utf16_bytes(path));
+                    else if(name=="PathCchRemoveExtension" || name=="PathCchStripPrefix")result=1;
+                }
+            }
+        }
+    }else if(service.symbol=="PathCchAppend" || service.symbol=="PathCchAppendEx"){
+        // UNC 與 \\?\ 開頭的 pszMore 視為完整路徑並取代原路徑；其餘去掉開頭的反斜線後接在後面（中間補一個反斜線），再與 PathCchCombineEx 同樣正規化。
+        const auto capacity=arg(1);const auto flags=service.symbol.ends_with("Ex")?static_cast<std::uint32_t>(arg(3)):0U;
+        if(!arg(0) || !arg(2) || !capacity || capacity>32768)result=invalid;
+        else {
+            auto input=read_utf16(memory,GuestAddress{arg(0)});auto more=read_utf16(memory,GuestAddress{arg(2)});
+            if(more.starts_with(u"\\\\"))input=std::move(more);
+            else {
+                std::size_t skip=0;while(skip<more.size() && more[skip]==u'\\')++skip;more.erase(0,skip);
+                if(!more.empty()){if(!input.empty() && input.back()!=u'\\')input.push_back(u'\\');input+=more;}
+            }
+            std::u16string output;result=canonicalize(std::move(input),flags,static_cast<std::size_t>(capacity),output);
+            if(!result)memory.write(GuestAddress{arg(0)},utf16_bytes(output));
+        }
+    }else if(service.symbol=="PathAllocCanonicalize" || service.symbol=="PathAllocCombine"){
+        // 結果以 LocalAlloc 配置（呼叫端 LocalFree）；未指定 PATHCCH_ALLOW_LONG_PATHS 時以 MAX_PATH 為上限。失敗時輸出為 NULL。
+        const bool combine=service.symbol=="PathAllocCombine";const auto flags=static_cast<std::uint32_t>(arg(combine?2:1));const auto out=arg(combine?3:2);
+        if(!out || (!combine && !arg(0)) || (combine && !arg(0) && !arg(1)))result=invalid;
+        else {
+            memory.store(GuestAddress{out},x86_?32:64,0);
+            auto input=arg(0)?read_utf16(memory,GuestAddress{arg(0)}):std::u16string{};
+            if(combine)input=combine_path(std::move(input),arg(1)?read_utf16(memory,GuestAddress{arg(1)}):std::u16string{});
+            std::u16string output;result=canonicalize(std::move(input),flags,32768,output);
+            if(!result){
+                const auto bytes=utf16_bytes(output);const auto block=nested_service(state,memory,"kernel32.dll","LocalAlloc",{0,bytes.size()});
+                if(!block)result=0x8007000eU;else {memory.write(GuestAddress{block},bytes);memory.store(GuestAddress{out},x86_?32:64,block);}
+            }
+        }
+    }else if(service.symbol=="PathIsUNCEx"){
+        // BOOL：\\server\share 或 \\?\UNC\server\share；ppszServer 指向伺服器名稱起點。\\.\ 裝置路徑與其他 \\?\ 路徑不是 UNC。
+        if(arg(0)){
+            const auto path=read_utf16(memory,GuestAddress{arg(0)});std::size_t server=0;
+            if(prefix(path,u"\\\\?\\unc\\"))server=8;
+            else if(path.starts_with(u"\\\\") && !path.starts_with(u"\\\\?\\") && !path.starts_with(u"\\\\.\\"))server=2;
+            if(server){result=1;if(arg(1))memory.store(GuestAddress{arg(1)},x86_?32:64,arg(0)+server*2);}
         }
     }else if(service.symbol=="PathCchSkipRoot"){
         if(!arg(0) || !arg(1))result=invalid;
@@ -405,12 +645,305 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
         }
     }
     } catch(const std::invalid_argument&) {
-        if(service.symbol.starts_with("AssocQueryString"))result=invalid;
-        else if(service.symbol.starts_with("PathAddExtension") || service.symbol.starts_with("PathRemoveExtension") || service.symbol.starts_with("PathRenameExtension"))result=0;
+        if(service.symbol.starts_with("PathAddExtension") || service.symbol.starts_with("PathRemoveExtension") || service.symbol.starts_with("PathRenameExtension"))result=0;
         else if(service.symbol.starts_with("SearchPath")){last_error_=123;result=0;}
         else if(service.symbol.starts_with("PathMatchSpec"))result=service.symbol.starts_with("PathMatchSpecEx")?invalid:0;
         else{result=too_long;if(service.symbol!="PathCchSkipRoot" && arg(0) && arg(1) && arg(1)<=32768)memory.store(GuestAddress{arg(0)},16,0);}
     }
     arg.return_to(state,result);return {};
+}
+// shlwapi 路徑補充家族：與上方路徑服務共用 root_end／combine_path／canonicalize。A 版沿用本檔慣例以位元組為碼元
+// （ACP＝UTF-8，路徑分隔字元皆為 ASCII，不會落在多位元組字元中段）；W 版以 UTF-16 碼元處理。
+std::span<const WindowsServiceDescriptor> path_extra_service_descriptors() {
+    static constexpr WindowsServiceDescriptor table[]{
+#define X64ARM_PATH_PAIR(name,count) {"shlwapi.dll",name "A",count},{"shlwapi.dll",name "W",count}
+        X64ARM_PATH_PAIR("PathAddBackslash",1),X64ARM_PATH_PAIR("PathRemoveBackslash",1),X64ARM_PATH_PAIR("PathGetDriveNumber",1),
+        X64ARM_PATH_PAIR("PathIsRoot",1),X64ARM_PATH_PAIR("PathSkipRoot",1),X64ARM_PATH_PAIR("PathIsUNCServer",1),X64ARM_PATH_PAIR("PathIsUNCServerShare",1),
+        X64ARM_PATH_PAIR("PathIsPrefix",2),X64ARM_PATH_PAIR("PathCommonPrefix",3),X64ARM_PATH_PAIR("PathIsSameRoot",2),X64ARM_PATH_PAIR("PathIsFileSpec",1),
+        X64ARM_PATH_PAIR("PathStripPath",1),X64ARM_PATH_PAIR("PathRemoveBlanks",1),X64ARM_PATH_PAIR("PathQuoteSpaces",1),X64ARM_PATH_PAIR("PathGetArgs",1),
+        X64ARM_PATH_PAIR("PathRemoveArgs",1),X64ARM_PATH_PAIR("PathIsURL",1),X64ARM_PATH_PAIR("PathFindSuffixArray",3),X64ARM_PATH_PAIR("PathRelativePathTo",5),
+        X64ARM_PATH_PAIR("PathParseIconLocation",1),X64ARM_PATH_PAIR("PathIsNetworkPath",1),X64ARM_PATH_PAIR("PathIsLFNFileSpec",1),X64ARM_PATH_PAIR("PathMakePretty",1),
+        X64ARM_PATH_PAIR("PathIsDirectoryEmpty",1),X64ARM_PATH_PAIR("PathFindOnPath",2),
+        {"shlwapi.dll","PathBuildRootA",2,0,0,0x2},{"shlwapi.dll","PathBuildRootW",2,0,0,0x2},
+        X64ARM_PATH_PAIR("PathUnquoteSpaces",1),X64ARM_PATH_PAIR("PathUndecorate",1),X64ARM_PATH_PAIR("PathIsContentType",2),
+        X64ARM_PATH_PAIR("PathMakeSystemFolder",1),X64ARM_PATH_PAIR("PathUnmakeSystemFolder",1),
+        {"shlwapi.dll","PathIsSystemFolderA",2,0,0,0x2},{"shlwapi.dll","PathIsSystemFolderW",2,0,0,0x2},
+        {"shlwapi.dll","PathCompactPathExA",4,0,0,0xc},{"shlwapi.dll","PathCompactPathExW",4,0,0,0xc},{"shlwapi.dll","PathCompactPathA",3,0,0,0x4},{"shlwapi.dll","PathCompactPathW",3,0,0,0x4},
+        {"shlwapi.dll","PathSearchAndQualifyA",3,0,0,0x4},{"shlwapi.dll","PathSearchAndQualifyW",3,0,0,0x4},
+        {"shlwapi.dll","PathSetDlgItemPathA",3,0,0,0x2},{"shlwapi.dll","PathSetDlgItemPathW",3,0,0,0x2},
+#undef X64ARM_PATH_PAIR
+    };return table;
+}
+std::optional<std::uint32_t> WindowsServices::invoke_path_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');const unsigned unit=wide?2U:1U;
+    const unsigned pointer_size=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(pointer_size*8);
+    const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
+    // 讀到 NUL 為止（最多 MAX_PATH 以外的長字串亦可），A 版每個位元組一個碼元。
+    const auto read=[&](std::uint64_t at)->std::u16string{
+        std::u16string text;if(!at)return text;
+        for(std::size_t i=0;i<32768;++i){const auto c=static_cast<char16_t>(memory.load(GuestAddress{at+i*unit},static_cast<std::uint8_t>(unit*8)));if(!c)break;text.push_back(c);}
+        return text;};
+    const auto write=[&](std::uint64_t at,std::u16string_view text){
+        for(std::size_t i=0;i<text.size();++i)memory.store(GuestAddress{at+i*unit},static_cast<std::uint8_t>(unit*8),text[i]);
+        memory.store(GuestAddress{at+text.size()*unit},static_cast<std::uint8_t>(unit*8),0);};
+    const auto fold=[](char16_t c){return c>=u'a' && c<=u'z'?static_cast<char16_t>(c-32):c;};
+    // A 版碼元（位元組）與 UTF-16 互轉；需要交給宿主 W 服務或量測字元時使用，避免切開 UTF-8 字元。
+    const auto to_wide=[&](std::u16string text)->std::u16string{if(wide)return text;std::string bytes(text.begin(),text.end());return utf8_to_utf16_lossy(bytes);};
+    const auto from_wide=[&](const std::u16string& text)->std::u16string{if(wide)return text;const auto bytes=utf16_to_utf8_lossy(text);std::u16string units;for(const auto c:bytes)units.push_back(static_cast<unsigned char>(c));return units;};
+    const auto same_text=[&](std::u16string_view a,std::u16string_view b){
+        if(a.size()!=b.size())return false;for(std::size_t i=0;i<a.size();++i)if(fold(a[i])!=fold(b[i]))return false;return true;};
+    const auto host=[&](std::string_view symbol,std::initializer_list<std::uint64_t> args){return nested_service(state,memory,"kernel32.dll",symbol,args);};
+    // 兩條路徑以元件為單位的共同前綴長度（不分大小寫）；根（"C:\"、"\\server\share"）整體視為一個元件。
+    const auto common_prefix=[&](std::u16string_view a,std::u16string_view b)->std::size_t{
+        const auto root_a=root_end(a),root_b=root_end(b);
+        if(root_a.value_or(0)!=root_b.value_or(0) || !same_text(a.substr(0,root_a.value_or(0)),b.substr(0,root_b.value_or(0))))return 0;
+        std::size_t common=root_a.value_or(0),at=common;
+        while(at<a.size() && at<b.size() && fold(a[at])==fold(b[at])){
+            ++at;
+            const bool end_a=at==a.size() || a[at]==u'\\',end_b=at==b.size() || b[at]==u'\\';
+            if(end_a && end_b)common=at;
+        }
+        return common;
+    };
+    try{
+        if(name.starts_with("PathAddBackslash")){
+            // 結尾補一個反斜線並回傳 NUL 位置；空字串不變；結果會超過 MAX_PATH 時回 NULL。
+            if(!arg(0))return done(0);auto path=read(arg(0));
+            if(!path.empty() && path.back()!=u'\\'){if(path.size()+1>=260)return done(0);path.push_back(u'\\');write(arg(0),path);}
+            return done(arg(0)+path.size()*unit);
+        }
+        if(name.starts_with("PathRemoveBackslash")){
+            // 移除結尾反斜線（根除外）；回傳移除後 NUL 的位置，未移除時指向最後一個字元。
+            if(!arg(0))return done(0);auto path=read(arg(0));if(path.empty())return done(arg(0));
+            if(path.back()==u'\\' && root_end(path).value_or(0)!=path.size()){path.pop_back();write(arg(0),path);return done(arg(0)+path.size()*unit);}
+            return done(arg(0)+(path.size()-1)*unit);
+        }
+        if(name.starts_with("PathBuildRoot")){
+            const auto drive_number=static_cast<std::int32_t>(static_cast<std::uint32_t>(arg(1)));if(!arg(0))return done(0);
+            if(drive_number<0 || drive_number>25){write(arg(0),u"");return done(arg(0));}
+            write(arg(0),std::u16string{static_cast<char16_t>(u'A'+drive_number),u':',u'\\'});return done(arg(0));
+        }
+        if(name.starts_with("PathGetDriveNumber")){
+            auto path=read(arg(0));if(path.starts_with(u"\\\\?\\"))path.erase(0,4);
+            return done(drive(path)?static_cast<std::uint32_t>(fold(path[0])-u'A'):UINT32_MAX);
+        }
+        if(name.starts_with("PathIsRoot") || name.starts_with("PathSkipRoot")){
+            const auto path=read(arg(0));const auto root=root_end(path);
+            if(name.starts_with("PathSkipRoot")){
+                if(!arg(0) || !root || (drive(path) && *root==2))return done(0);return done(arg(0)+*root*unit);
+            }
+            if(path==u"\\")return done(1);
+            if(drive(path))return done(path.size()==3 && path[2]==u'\\'?1U:0U);
+            if(path.starts_with(u"\\\\") && !path.starts_with(u"\\\\?\\")){
+                // \\server 與 \\server\share（結尾沒有反斜線）為根。
+                const auto rest=std::u16string_view(path).substr(2);const auto slashes=std::count(rest.begin(),rest.end(),u'\\');
+                return done(!rest.empty() && rest.back()!=u'\\' && slashes<=1?1U:0U);
+            }
+            return done(0);
+        }
+        if(name.starts_with("PathIsUNCServerShare") || name.starts_with("PathIsUNCServer")){
+            const auto path=read(arg(0));if(!path.starts_with(u"\\\\") || path.starts_with(u"\\\\?\\"))return done(0);
+            const auto rest=std::u16string_view(path).substr(2);const auto slash=rest.find(u'\\');
+            if(name.starts_with("PathIsUNCServerShare"))return done(slash!=rest.npos && slash && slash+1<rest.size() && rest.find(u'\\',slash+1)==rest.npos?1U:0U);
+            return done(slash==rest.npos?1U:0U);
+        }
+        if(name.starts_with("PathCommonPrefix") || name.starts_with("PathIsPrefix")){
+            const bool is_prefix=name.starts_with("PathIsPrefix");const auto a=read(arg(0)),b=read(arg(1));
+            if(!arg(0) || !arg(1))return done(0);
+            const auto common=common_prefix(a,b);
+            if(is_prefix)return done(common && (common==a.size() || (common+1==a.size() && a.back()==u'\\'))?1U:0U);
+            if(arg(2))write(arg(2),a.substr(0,common));return done(common);
+        }
+        if(name.starts_with("PathIsSameRoot")){
+            const auto a=read(arg(0)),b=read(arg(1));const auto ra=root_end(a),rb=root_end(b);
+            return done(ra && rb && same_text(std::u16string_view(a).substr(0,*ra),std::u16string_view(b).substr(0,*rb))?1U:0U);
+        }
+        if(name.starts_with("PathIsFileSpec")){const auto path=read(arg(0));return done(path.find_first_of(u"\\:")==path.npos?1U:0U);}
+        if(name.starts_with("PathStripPath")){
+            auto path=read(arg(0));const auto slash=path.find_last_of(u"\\:");
+            if(slash!=path.npos && slash+1<path.size())write(arg(0),path.substr(slash+1));return done(0);
+        }
+        if(name.starts_with("PathRemoveBlanks")){
+            auto path=read(arg(0));const auto first=path.find_first_not_of(u' ');
+            path=first==path.npos?std::u16string{}:path.substr(first);while(!path.empty() && path.back()==u' ')path.pop_back();
+            if(arg(0))write(arg(0),path);return done(0);
+        }
+        if(name.starts_with("PathQuoteSpaces")){
+            // 含空白時加上雙引號（結果須小於 MAX_PATH）；回傳是否已加上引號。
+            auto path=read(arg(0));if(!arg(0) || path.find(u' ')==path.npos || path.size()+3>260)return done(0);
+            write(arg(0),u"\""+path+u"\"");return done(1);
+        }
+        if(name.starts_with("PathGetArgs") || name.starts_with("PathRemoveArgs")){
+            // 引數從第一個不在引號內的空白之後開始。
+            const auto path=read(arg(0));bool quoted=false;std::size_t space=path.size();
+            for(std::size_t i=0;i<path.size();++i){if(path[i]==u'"')quoted=!quoted;else if(path[i]==u' ' && !quoted){space=i;break;}}
+            if(name.starts_with("PathGetArgs"))return done(arg(0)+(space<path.size()?space+1:path.size())*unit);
+            if(space<path.size())write(arg(0),path.substr(0,space));return done(0);
+        }
+        if(name.starts_with("PathIsURL")){
+            const auto path=read(arg(0));const auto colon=path.find(u':');if(colon==path.npos || colon<2)return done(0);
+            for(std::size_t i=0;i<colon;++i){const auto c=path[i];
+                if(!((c>=u'a' && c<=u'z') || (c>=u'A' && c<=u'Z') || (i && ((c>=u'0' && c<=u'9') || c==u'+' || c==u'-' || c==u'.'))))return done(0);}
+            return done(1);
+        }
+        if(name.starts_with("PathFindSuffixArray")){
+            // (Path, Suffixes[], Count)：不分大小寫比對結尾，回傳相符的字尾字串指標。
+            const auto path=read(arg(0));const auto count=static_cast<std::int32_t>(static_cast<std::uint32_t>(arg(2)));
+            for(std::int32_t i=0;i<count;++i){const auto item=memory.load(GuestAddress{arg(1)+static_cast<std::uint64_t>(i)*pointer_size},bits);const auto suffix=read(item);
+                if(!suffix.empty() && suffix.size()<=path.size() && same_text(std::u16string_view(path).substr(path.size()-suffix.size()),suffix))return done(item);}
+            return done(0);
+        }
+        if(name.starts_with("PathRelativePathTo")){
+            // (Out, From, FromAttributes, To, ToAttributes)：From 不是目錄時去掉檔名；沒有共同根時回 FALSE。
+            if(!arg(0) || !arg(1) || !arg(3))return done(0);
+            auto from=read(arg(1));const auto to=read(arg(3));
+            if(!(static_cast<std::uint32_t>(arg(2))&0x10U)){const auto slash=from.find_last_of(u'\\');const auto root=root_end(from).value_or(0);from.resize(std::max(root,slash==from.npos?std::size_t{0}:slash));}
+            while(from.size()>root_end(from).value_or(0) && from.back()==u'\\')from.pop_back();
+            const auto common=common_prefix(from,to);if(!common)return done(0);
+            std::u16string result;std::size_t ups=0;
+            // 共同前綴之後 From 剩下的非空元件數，即需要的 ".." 數。
+            for(std::size_t at=common;at<from.size();){
+                while(at<from.size() && from[at]==u'\\')++at;if(at>=from.size())break;
+                ++ups;while(at<from.size() && from[at]!=u'\\')++at;
+            }
+            for(std::size_t i=0;i<ups;++i)result+=i?u"\\..":u"..";
+            auto rest=to.substr(common);if(!rest.empty() && rest.front()!=u'\\')rest.insert(rest.begin(),u'\\');
+            result=ups?result+rest:u"."+rest;if(result.size()>=260)return done(0);
+            write(arg(0),result);return done(1);
+        }
+        if(name.starts_with("PathParseIconLocation")){
+            // "檔案,索引"：截斷字串、移除引號並回傳索引（沒有逗號時為 0）。
+            auto path=read(arg(0));std::int32_t index=0;const auto comma=path.find_last_of(u',');
+            if(comma!=path.npos){bool negative=false;std::size_t at=comma+1;while(at<path.size() && path[at]==u' ')++at;
+                if(at<path.size() && path[at]==u'-'){negative=true;++at;}
+                for(;at<path.size() && path[at]>=u'0' && path[at]<=u'9';++at)index=index*10+(path[at]-u'0');if(negative)index=-index;path.resize(comma);}
+            if(path.size()>=2 && path.front()==u'"' && path.back()==u'"')path=path.substr(1,path.size()-2);
+            if(arg(0))write(arg(0),path);return done(static_cast<std::uint32_t>(index));
+        }
+        if(name.starts_with("PathIsNetworkPath")){
+            const auto path=read(arg(0));if(path.starts_with(u"\\\\"))return done(1);if(!drive(path))return done(0);
+            GuestScratch temporary(*this,memory,state);const auto text=temporary.text(std::u16string{path[0],u':',u'\\'});if(!text)return done(0);
+            return done(host("GetDriveTypeW",{text})==4?1U:0U); // DRIVE_REMOTE
+        }
+        if(name.starts_with("PathIsLFNFileSpec")){
+            // 不符合 8.3（主檔名 1～8、副檔名 0～3、無空白、至多一個點）即為長檔名。
+            const auto path=read(arg(0));const auto dot=path.find(u'.');const auto base=path.substr(0,dot);
+            const auto extension=dot==path.npos?std::u16string{}:path.substr(dot+1);
+            return done(base.empty() || base.size()>8 || extension.size()>3 || path.find(u' ')!=path.npos || extension.find(u'.')!=extension.npos?1U:0U);
+        }
+        if(name.starts_with("PathMakePretty")){
+            // 全部大寫時，第一個字元以外改成小寫；回傳是否變更。
+            auto path=read(arg(0));if(path.empty() || std::any_of(path.begin(),path.end(),[](char16_t c){return c>=u'a' && c<=u'z';}))return done(0);
+            for(std::size_t i=1;i<path.size();++i)if(path[i]>=u'A' && path[i]<=u'Z')path[i]=static_cast<char16_t>(path[i]+32);
+            write(arg(0),path);return done(1);
+        }
+        if(name.starts_with("PathIsDirectoryEmpty") || name.starts_with("PathFindOnPath")){
+            GuestScratch temporary(*this,memory,state);const auto& wide_path=to_wide;
+            if(name.starts_with("PathIsDirectoryEmpty")){
+                // 目錄中只有 . 與 .. 時為空；不是目錄時回 FALSE。
+                auto path=wide_path(read(arg(0)));if(path.empty())return done(0);if(path.back()!=u'\\')path.push_back(u'\\');
+                const auto pattern=temporary.text(path+u"*"),data=temporary.allocate(600);if(!pattern || !data)return done(0);
+                const auto attributes=static_cast<std::uint32_t>(host("GetFileAttributesW",{temporary.text(path)}));
+                if(attributes==UINT32_MAX || !(attributes&0x10U))return done(0);
+                // 沒有任何項目（包含檔案系統不列出 . 與 .. 的情況）即為空目錄。
+                auto handle=host("FindFirstFileW",{pattern,data});if(x86_)handle&=UINT32_MAX;if(handle==(x86_?UINT32_MAX:UINT64_MAX))return done(1);
+                bool empty=true;
+                do{const auto entry=read_utf16(memory,GuestAddress{data+44},260);if(entry!=u"." && entry!=u".."){empty=false;break;}}while(host("FindNextFileW",{handle,data}));
+                (void)host("FindClose",{handle});return done(empty?1U:0U);
+            }
+            // (File 輸入輸出 MAX_PATH, OtherDirs NULL 結尾陣列)：先找額外目錄，再找 PATH。
+            if(!arg(0))return done(0);const auto file=wide_path(read(arg(0)));
+            const auto found=[&](const std::u16string& candidate){
+                const auto text=temporary.text(candidate);if(!text || host("GetFileAttributesW",{text})==UINT32_MAX)return false;
+                write(arg(0),from_wide(candidate));
+                return true;};
+            if(arg(1))for(std::uint64_t i=0;;++i){const auto dir=memory.load(GuestAddress{arg(1)+i*pointer_size},bits);if(!dir)break;
+                if(found(combine_path(wide_path(read(dir)),file)))return done(1);}
+            const auto name_text=temporary.text(file),output=temporary.allocate(2*260+2);if(!name_text || !output)return done(0);
+            const auto length=host("SearchPathW",{0,name_text,0,260,output,0});
+            if(length && length<260 && found(read_utf16(memory,GuestAddress{output},260)))return done(1);
+            return done(0);
+        }
+        if(name.starts_with("PathUnquoteSpaces")){
+            // 前後皆為雙引號時移除；回傳是否移除。
+            if(!arg(0))return done(0);const auto path=read(arg(0));if(path.size()<2 || path.front()!=u'"' || path.back()!=u'"')return done(0);
+            write(arg(0),path.substr(1,path.size()-2));return done(1);
+        }
+        if(name.starts_with("PathUndecorate")){
+            // 移除檔名中副檔名前的 "[數字]" 副本編號，例如 "a[2].txt" → "a.txt"；"[" 前必須還有主檔名。
+            if(!arg(0))return done(0);auto path=read(arg(0));const auto start=path.find_last_of(u"\\/:");const auto base=start==path.npos?0:start+1;
+            auto dot=path.rfind(u'.');if(dot==path.npos || dot<base)dot=path.size();
+            if(dot>base && path[dot-1]==u']'){auto open=dot-1;while(open>base && path[open-1]>=u'0' && path[open-1]<=u'9')--open;
+                if(open>base+1 && open<dot-1 && path[open-1]==u'['){path.erase(open-1,dot-open+1);write(arg(0),path);}}
+            return done(0);
+        }
+        if(name.starts_with("PathCompactPathEx")){
+            // (out, path, cchMax, flags)：寬度為字元數（含 NUL；A 為 UTF-8 位元組），flags 必須為 0。
+            if(!arg(0) || !arg(1) || static_cast<std::uint32_t>(arg(3)))return done(0);const auto cch=static_cast<std::uint32_t>(arg(2));if(!cch || cch>32768)return done(0);
+            const auto units=[&](std::u16string_view text){return static_cast<std::int32_t>(wide?text.size():utf16_to_utf8_lossy(std::u16string(text)).size());};
+            const auto limit=static_cast<std::int32_t>(cch-1);auto result=compact_path_text(to_wide(read(arg(1))),limit,units);
+            while(!result.empty() && units(result)>limit){result.pop_back();if(!result.empty() && result.back()>=0xd800 && result.back()<=0xdbff)result.pop_back();}
+            write(arg(0),from_wide(result));return done(1);
+        }
+        if(name.starts_with("PathCompactPath")){
+            // (HDC, path 輸入輸出, 像素寬度)：以 DC 目前字型量測；HDC 為 NULL 時使用螢幕 DC。結果仍放不下時回 FALSE。
+            if(!arg(1))return done(0);auto dc=arg(0);const bool screen=!dc;
+            if(screen){dc=nested_service(state,memory,"user32.dll","GetDC",{0});if(x86_)dc&=UINT32_MAX;}
+            const auto path=to_wide(read(arg(1)));const auto result=compact_path_for_dc(dc,path,static_cast<std::int32_t>(static_cast<std::uint32_t>(arg(2))));
+            if(screen && dc)(void)nested_service(state,memory,"user32.dll","ReleaseDC",{0,dc});
+            if(result.first!=path)write(arg(1),from_wide(result.first));return done(result.second?1U:0U);
+        }
+        if(name.starts_with("PathSearchAndQualify")){
+            // 不含路徑分隔字元的名稱先以 SearchPath 尋找，找不到或含路徑時以 GetFullPathName 取完整路徑。
+            if(!arg(0) || !arg(1))return done(0);const auto cch=static_cast<std::uint32_t>(arg(2));if(!cch)return done(0);
+            GuestScratch temporary(*this,memory,state);const auto path=to_wide(read(arg(0)));const auto source=temporary.text(path),output=temporary.allocate(2*32768);if(!source || !output)return done(0);
+            std::uint64_t length=0;if(path.find_first_of(u"\\/:")==path.npos)length=host("SearchPathW",{0,source,0,32767,output,0})&UINT32_MAX;
+            if(!length || length>=32767)length=host("GetFullPathNameW",{source,32767,output,0})&UINT32_MAX;
+            if(!length || length>=32767)return done(0);const auto full=from_wide(read_utf16(memory,GuestAddress{output},32767));
+            if(full.size()>=cch)return done(0);write(arg(1),full);return done(1);
+        }
+        if(name.starts_with("PathIsContentType")){
+            // 副檔名在 HKEY_CLASSES_ROOT 的 "Content Type" 值與指定類型相同（不分大小寫）。
+            if(!arg(0) || !arg(1))return done(0);const auto path=to_wide(read(arg(0))),wanted=to_wide(read(arg(1)));
+            const auto dot=path.rfind(u'.'),slash=path.find_last_of(u"\\/");if(dot==path.npos || (slash!=path.npos && dot<slash))return done(0);
+            GuestScratch temporary(*this,memory,state);const auto key=temporary.text(path.substr(dot)),value=temporary.text(u"Content Type"),data=temporary.allocate(1024),size=temporary.allocate(4);
+            if(!key || !value || !data || !size)return done(0);memory.store(GuestAddress{size},32,1024);
+            const std::uint64_t classes_root=x86_?0x80000000ULL:0xffffffff80000000ULL;
+            if(nested_service(state,memory,"advapi32.dll","RegGetValueW",{classes_root,key,value,2,0,data,size})&UINT32_MAX)return done(0); // RRF_RT_REG_SZ
+            return done(same_text(read_utf16(memory,GuestAddress{data},511),wanted)?1U:0U);
+        }
+        if(name.starts_with("PathIsSystemFolder") || name.starts_with("PathMakeSystemFolder") || name.starts_with("PathUnmakeSystemFolder")){
+            // 系統資料夾＝目錄且具 SYSTEM 或 READONLY 屬性。IsSystemFolder 的路徑為空時改用傳入的屬性；Make 加上 SYSTEM，Unmake 移除 SYSTEM 與 READONLY。
+            const bool query=name.starts_with("PathIsSystemFolder");auto attributes=query?static_cast<std::uint32_t>(arg(1)):0U;
+            GuestScratch temporary(*this,memory,state);const auto path=arg(0)?to_wide(read(arg(0))):std::u16string{};std::uint64_t text=0;
+            if(!path.empty()){text=temporary.text(path);if(!text)return done(0);attributes=static_cast<std::uint32_t>(host("GetFileAttributesW",{text}));if(attributes==UINT32_MAX)return done(0);}
+            else if(!query)return done(0);
+            if(query)return done((attributes&0x10U) && (attributes&0x5U)?1U:0U);if(!(attributes&0x10U))return done(0);
+            auto updated=(name.starts_with("PathMake")?attributes|0x4U:attributes&~0x5U)&~0x10U;if(!updated)updated=0x80U;
+            return done(host("SetFileAttributesW",{text,updated})&UINT32_MAX?1U:0U);
+        }
+        if(name.starts_with("PathSetDlgItemPath")){
+            // 依控制項用戶區寬度與字型省略路徑後設定文字（NULL 路徑設為空字串）；WM_GETFONT 與 SetWindowText 可能回呼客體視窗程序，經 nested_continuation 續行。
+            std::u16string path;if(arg(2))path=to_wide(read(arg(2)));
+            return nested_continuation(state,memory,"PathSetDlgItemPath",[this,service,path](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(s,m,service);auto text=path;
+                const auto entry=[&](std::string_view dll,std::string_view target){const auto stub=host_service_stub(dll,target);return stub.value?stub.value:resolve(dll,target).value;};
+                const auto finish=[&]{call.return_to(s,std::uint64_t{0});return std::optional<std::uint32_t>{};};
+                const auto handle=[&](std::uint64_t value){return x86_?value&UINT32_MAX:value;};
+                const auto control=handle(co_await service_callback::call_value(entry("user32.dll","GetDlgItem"),{call(0),call(1)}));if(!control)co_return finish();
+                GuestScratch temporary(*this,m,s);const auto rect=temporary.allocate(16);if(!rect)co_return finish();
+                (void)co_await service_callback::call(entry("user32.dll","GetClientRect"),{control,rect});
+                const auto width=static_cast<std::int32_t>(static_cast<std::uint32_t>(m.load(GuestAddress{rect+8},32)))-static_cast<std::int32_t>(static_cast<std::uint32_t>(m.load(GuestAddress{rect},32)));
+                const auto font=handle(co_await service_callback::call_value(entry("user32.dll","SendMessageW"),{control,0x31,0,0})); // WM_GETFONT
+                const auto dc=handle(co_await service_callback::call_value(entry("user32.dll","GetDC"),{control}));
+                if(dc){const auto previous=font?handle(co_await service_callback::call_value(entry("gdi32.dll","SelectObject"),{dc,font})):0;
+                    text=compact_path_for_dc(dc,text,width).first;
+                    if(previous)(void)co_await service_callback::call_value(entry("gdi32.dll","SelectObject"),{dc,previous});
+                    (void)co_await service_callback::call(entry("user32.dll","ReleaseDC"),{control,dc});}
+                const auto value=temporary.text(text);if(value)(void)co_await service_callback::call(entry("user32.dll","SetWindowTextW"),{control,value});co_return finish();
+            });
+        }
+    }catch(const std::invalid_argument&){return done(0);}
+    throw HostCallFault("未知的 shlwapi 路徑補充服務");
 }
 }

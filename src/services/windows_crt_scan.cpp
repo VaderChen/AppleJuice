@@ -26,15 +26,24 @@ struct ScanInput {
 };
 }
 std::optional<std::uint32_t> WindowsServices::invoke_crt_scan(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    const WindowsCall arg(state,memory,service);const auto name=service.symbol;
-    const bool common=name.starts_with("__stdio_common_"),bounded=name.starts_with("_sn"),list=common || name.starts_with('v');
-    const bool stream=name=="__stdio_common_vfscanf" || name.starts_with("fscanf") || name.starts_with("vfscanf");
+    const WindowsCall arg(state,memory,service);auto name=service.symbol;
+    const bool common=name.starts_with("__stdio_common_");
+    // 具名 _l 版本在格式字串後多一個 locale；_fscanf_l／_sscanf_l 等前導底線版本與無底線版本同形（_snscanf 系列保留 _sn 判斷容量參數）。
+    const bool explicit_locale=!common && name.ends_with("_l");if(explicit_locale)name.remove_suffix(2);
+    if(!common && name.starts_with('_') && !name.starts_with("_sn"))name.remove_prefix(1);
+    const bool bounded=name.starts_with("_sn"),list=common || name.starts_with('v');
+    // scanf／wscanf 系列讀取 CRT 的 stdin 串流（重導向時與 fscanf(stdin) 相同）。
+    const bool standard_input=!common && (name.starts_with("scanf") || name.starts_with("wscanf") || name.starts_with("vscanf") || name.starts_with("vwscanf"));
+    const bool stream=standard_input || name=="__stdio_common_vfscanf" || name=="__stdio_common_vfwscanf" ||
+        name.starts_with("fscanf") || name.starts_with("vfscanf") || name.starts_with("fwscanf") || name.starts_with("vfwscanf");
     const bool wide=name.find("wscanf")!=name.npos;
     const auto options=common?arg(0):UINT64_C(6)|(name.ends_with("_s")?1U:0U);
     const bool secure=options&1U;const unsigned unit=wide?2U:1U;
-    const auto source=arg(common?1:0),format=arg(common?(stream?2:3):bounded?2:1);
+    const unsigned format_at=common?(stream?2U:3U):standard_input?0U:bounded?2U:1U;
+    const auto source=standard_input?runtime_base_.value+0x800:arg(common?1:0),format=arg(format_at);
     const auto limit=common && !stream?arg(2):bounded?arg(1):UINT64_MAX;
-    unsigned next=bounded?3U:2U;auto va=list?arg(common?(stream?4:5):2):0;
+    const auto locale=explicit_locale?arg(format_at+1):0;
+    unsigned next=format_at+1U+(explicit_locale?1U:0U);auto va=list?arg(common?(stream?4:5):next):0;
     std::function<void()> restore=[]{};
     const auto argument=[&](){if(!list)return arg(next++);const auto value=memory.load(GuestAddress{va},x86_?32:64);va+=x86_?4:8;return value;};
     const auto finish=[&](std::uint32_t result,std::uint32_t error=0)->std::optional<std::uint32_t>{
@@ -46,7 +55,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_scan(GuestState& state,
         return 0xc0000417U;
     };
     // CRT 目前提供 C locale；不將未知 locale 物件或未知選項當成有效設定。
-    if(!source || !format || (options&~UINT64_C(7)) || (common && arg(stream?3:4)))return invalid();
+    if(!source || !format || (options&~UINT64_C(7)) || (common && arg(stream?3:4)) || (locale && !runtime_.crt_locales.contains(locale)))return invalid();
     const auto read=[&](std::uint64_t address,std::uint64_t count){
         std::u16string result;
         for(std::uint64_t i=0;i<count;++i){

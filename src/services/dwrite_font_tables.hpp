@@ -1,9 +1,7 @@
 NativeFontFace effective_face(const NativeFontFace& face,unsigned simulations){auto out=face;out.simulations=simulations;return out;}
 // 派生 DirectWrite 介面共用實體 OpenType 資料；所有偏移先檢查再讀取。
-std::uint32_t font_be(std::span<const std::uint8_t> data,std::size_t at,unsigned width){
-    if(at>data.size() || width>data.size()-at)throw std::invalid_argument("OpenType 表格偏移無效");
-    std::uint32_t value=0;for(unsigned i=0;i<width;++i)value=(value<<8)|data[at+i];return value;
-}
+// 大端序讀取與 coverage 和 Uniscribe 共用 opentype_layout.hpp。
+std::uint32_t font_be(std::span<const std::uint8_t> data,std::size_t at,unsigned width){return opentype::read(data,at,width);}
 int font_signed(std::span<const std::uint8_t> data,std::size_t at){return static_cast<std::int16_t>(font_be(data,at,2));}
 unsigned font_stretch(const NativeFontFace& face){const auto table=native_font_table(face,0x4f532f32U);return table.size()>=8?std::clamp(font_be(table,6,2),1U,9U):5;}
 std::array<std::int32_t,23> font_metrics1(const NativeFontFace& face){
@@ -33,20 +31,14 @@ std::map<std::uint32_t,std::int32_t> font_kern_pairs(const NativeFontFace& face)
         if((coverage>>8)==0 && (coverage&1) && !(coverage&6)){const auto count=font_be(data,at+6,2);if(14+count*6>length)throw std::invalid_argument("kern 配對長度無效");for(unsigned i=0;i<count;++i){const auto p=at+14+i*6;out[font_be(data,p,4)]+=font_signed(data,p+4);}}at+=length;}
     return out;
 }
-std::vector<std::uint16_t> font_coverage(std::span<const std::uint8_t> data,std::size_t at){
-    std::vector<std::uint16_t> out;const auto format=font_be(data,at,2),count=font_be(data,at+2,2);
-    if(format==1)for(unsigned i=0;i<count;++i)out.push_back(static_cast<std::uint16_t>(font_be(data,at+4+i*2,2)));
-    else if(format==2)for(unsigned i=0;i<count;++i){const auto p=at+4+i*6;const auto a=font_be(data,p,2),b=font_be(data,p+2,2),index=font_be(data,p+4,2);if(a>b || index!=out.size())throw std::invalid_argument("GSUB coverage 無效");for(auto g=a;g<=b;++g)out.push_back(static_cast<std::uint16_t>(g));}
-    return out;
-}
+// 直排替代字形：表格中所有 vert／vrt2 功能的單一替換。
 std::map<std::uint16_t,std::uint16_t> font_vertical(const NativeFontFace& face){
-    std::map<std::uint16_t,std::uint16_t> out;const auto data=native_font_table(face,0x47535542U);if(data.size()<10)return out;
-    const auto features=font_be(data,6,2),lookups=font_be(data,8,2);std::set<unsigned> selected;
-    for(unsigned i=0;i<font_be(data,features,2);++i){const auto p=features+2+i*6,tag=font_be(data,p,4);if(tag!=0x76657274 && tag!=0x76727432)continue;const auto f=features+font_be(data,p+4,2);for(unsigned j=0;j<font_be(data,f+2,2);++j)selected.insert(font_be(data,f+4+j*2,2));}
-    for(auto id:selected){if(id>=font_be(data,lookups,2))throw std::invalid_argument("GSUB lookup 無效");const auto lookup=lookups+font_be(data,lookups+2+id*2,2),type=font_be(data,lookup,2);
-        for(unsigned i=0;i<font_be(data,lookup+4,2);++i){auto sub=lookup+font_be(data,lookup+6+i*2,2);auto actual=type;if(type==7){actual=font_be(data,sub+2,2);sub+=font_be(data,sub+4,4);}if(actual!=1)continue;
-            const auto format=font_be(data,sub,2);const auto glyphs=font_coverage(data,sub+font_be(data,sub+2,2));
-            for(unsigned j=0;j<glyphs.size();++j){if(format==1)out[glyphs[j]]=static_cast<std::uint16_t>(glyphs[j]+font_be(data,sub+4,2));else if(format==2){if(j>=font_be(data,sub+4,2))throw std::invalid_argument("GSUB substitution 無效");out[glyphs[j]]=static_cast<std::uint16_t>(font_be(data,sub+6+j*2,2));}}}}
+    std::map<std::uint16_t,std::uint16_t> out;const auto data=native_font_table(face,0x47535542U);if(!opentype::layout_table(data))return out;
+    std::set<std::uint16_t> lookups;for(const auto feature:{0x76657274U,0x76727432U})for(const auto id:opentype::feature_lookups(data,feature,0,0))lookups.insert(id);
+    for(const auto id:lookups)opentype::visit_lookup(data,id,7,[&](unsigned type,std::size_t sub){
+        if(type!=1)return false;
+        for(const auto glyph:opentype::coverage(data,sub+opentype::read(data,sub+2,2)))if(const auto mapped=opentype::single_substitution(data,sub,glyph))out[glyph]=*mapped;
+        return false;});
     return out;
 }
 std::vector<std::array<float,4>> font_palette(const NativeFontFace& face,unsigned palette){

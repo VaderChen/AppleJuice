@@ -1,5 +1,6 @@
 #include "x64arm/windows_icon.hpp"
 #import <AppKit/AppKit.h>
+#include "system_cursor.h"
 #import <ImageIO/ImageIO.h>
 
 namespace x64arm {
@@ -66,16 +67,7 @@ std::optional<GuiIcon> native_stock_icon(std::uint32_t id,std::uint32_t size){
 }
 std::optional<GuiIcon> native_system_cursor(std::uint32_t id){
     @autoreleasepool {
-        NSCursor* cursor=nil;
-        switch(id){
-            case 32512:case 32514:case 32516:case 32650:cursor=NSCursor.arrowCursor;break;
-            case 32513:cursor=NSCursor.IBeamCursor;break;case 32515:cursor=NSCursor.crosshairCursor;break;
-            case 32640:case 32642:case 32643:cursor=NSCursor.resizeLeftRightCursor;break;
-            case 32641:case 32644:cursor=NSCursor.resizeUpDownCursor;break;
-            case 32645:cursor=NSCursor.closedHandCursor;break;case 32648:cursor=NSCursor.operationNotAllowedCursor;break;
-            case 32649:cursor=NSCursor.pointingHandCursor;break;case 32651:cursor=NSCursor.contextualMenuCursor;break;
-            default:return {};
-        }
+        NSCursor* cursor=x64arm_system_cursor(id);if(!cursor)return {};
         NSRect rect={NSZeroPoint,cursor.image.size};const auto cg=[cursor.image CGImageForProposedRect:&rect context:nil hints:nil];
         auto icon=pixels(cg,static_cast<std::uint32_t>(rect.size.width),static_cast<std::uint32_t>(rect.size.height));
         if(!icon)return {};icon->is_icon=false;icon->system=id;icon->hotspot_x=static_cast<std::uint32_t>(cursor.hotSpot.x);icon->hotspot_y=static_cast<std::uint32_t>(cursor.hotSpot.y);finish_icon(*icon);return icon;

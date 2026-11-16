@@ -1,15 +1,27 @@
 #include "x64arm/windows_services.hpp"
 #include "texture_load.hpp"
 #include "gdiplus_codecs.hpp"
+#include "gdiplus_brush.hpp"
+#include "gdiplus_pixels.hpp"
+#include "gdiplus_image_attributes.hpp"
+#include "unicode_text_analysis.hpp"
+#include "windows_locale_data.hpp"
+#include "x64arm/windows_fonts.hpp"
+#include "x64arm/native_font_data.hpp"
+#include "x64arm/windows_icon.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/windows_gdi_path.hpp"
 #include "x64arm/windows_transform.hpp"
 #include <algorithm>
+#include <memory>
+#include <span>
+#include <zlib.h>
 #include <bit>
 #include <cstdlib>
 #include <map>
 #include <optional>
+#include <tuple>
 
 namespace x64arm {
 // GDI+ 平面 API：啟動／關閉、記憶體配置、記憶體點陣圖與繪製到 HDC。
@@ -17,18 +29,57 @@ namespace x64arm {
 // 參考：https://learn.microsoft.com/windows/win32/gdiplus/-gdiplus-flatapi-flat
 struct GdiplusState {
     struct Path {std::vector<GuiPathPoint> points;unsigned fill{};bool new_figure{true};};
-    struct Pen {std::uint32_t color{};double width{1};unsigned unit{},start_cap{},end_cap{},join{};};
+    // 自訂線端（座標以筆寬為單位，+Y 指向線外）：type 0 為 CustomLineCap、1 為 AdjustableArrowCap。
+    struct CustomCap {unsigned type{};Path fill{},stroke{};unsigned base_cap{},start_cap{},end_cap{},join{};double inset{},scale{1};
+        double arrow_width{},arrow_height{},middle{};bool filled{true};};
+    // 畫筆：fill 為非純色筆刷的複本（nullptr 表示以 color 純色描邊）；dashes 為 DashStyleCustom 的圖樣（筆寬倍數），
+    // compound 為複合線的分段位置（0～1），transform 套用到筆尖，alignment 0 置中、1 內縮；線端 0xff 時使用 custom_start／custom_end。
+    struct Pen {std::uint32_t color{};double width{1};unsigned unit{},start_cap{},end_cap{},join{},dash{},dash_cap{};double miter{10};std::shared_ptr<const GdiplusBrush> fill;
+        std::vector<double> dashes{};double dash_offset{};std::vector<double> compound{};GuiTransform transform{gui_identity};unsigned alignment{};
+        std::shared_ptr<const CustomCap> custom_start{},custom_end{};};
+    std::map<std::uint64_t,CustomCap> caps;
+    // 路徑迭代器：建立時的路徑內容與 subpath／marker／path type 游標（type 範圍限於最近一次 NextSubpath 的 figure）。
+    struct PathIterator {std::vector<GuiPathPoint> points{};std::size_t subpath{},marker{},type_begin{},type_end{};};
+    std::map<std::uint64_t,PathIterator> iterators;
+    // GpMatrix：(m11, m12, m21, m22, dx, dy)，與 GDI 世界變換同一種列向量配置。
+    std::map<std::uint64_t,GuiTransform> matrices;
+    // Graphics 的世界變換、頁面單位、提示與裁切（裁切以裝置座標區域保存，nullopt 為無限大）。
+    struct Graphics {GuiTransform world{1,0,0,1,0,0};unsigned page_unit{1};double page_scale{1};
+        unsigned compositing{},quality{},interpolation{},pixel_offset{},text_hint{},text_contrast{4};std::int32_t origin_x{},origin_y{};
+        std::optional<GuiRegion> clip;std::uint64_t window{};bool owned_dc{};};
+    std::map<std::uint64_t,Graphics> graphics_state;
+    std::map<std::uint64_t,std::vector<std::pair<std::uint32_t,Graphics>>> saved_graphics;std::uint32_t next_save{1};
     std::map<std::uint64_t,Path> paths;
+    // GpRegion：與 GdipGetRegionData 序列化相同的節點樹；葉節點為矩形 0x10000000、路徑 0x10000001、空 0x10000002、無限大 0x10000003，
+    // 內部節點的型別即 CombineMode 1～5。節點不可變，合併與複製共用子樹。
+    struct RegionNode {std::uint32_t type{0x10000003U};std::array<double,4> rect{};Path path;std::shared_ptr<const RegionNode> left,right;};
+    std::map<std::uint64_t,std::shared_ptr<const RegionNode>> regions;
     std::map<std::uint64_t,Pen> pens;
-    std::map<std::uint64_t,std::uint32_t> brushes;
+    std::map<std::uint64_t,GdiplusBrush> brushes;
     std::map<std::uint64_t,unsigned> smoothing;
     // LockBits 期間的暫存區：格式相同時直接指向像素，否則轉換到暫存緩衝並於 UnlockBits 寫回。
     struct Lock {std::uint64_t buffer{};std::uint32_t mode{},format{};std::array<std::int32_t,4> rect{};std::int64_t stride{};bool owned{};};
-    struct Bitmap {std::uint32_t width{},height{},format{};std::int64_t stride{};std::uint64_t scan0{};bool owned{};std::optional<Lock> lock{};};
+    // 點陣圖：索引色格式附調色盤；raw 為 ImageFormat GUID 的末位元組（MemoryBMP 0xaa、BMP 0xab、JPEG 0xae、PNG 0xaf、GIF 0xb0、TIFF 0xb1、Icon 0xb5）。
+    struct Property {std::uint32_t id{};std::uint16_t type{};std::vector<std::uint8_t> value{};};
+    struct Bitmap {std::uint32_t width{},height{},format{};std::int64_t stride{};std::uint64_t scan0{};bool owned{};std::optional<Lock> lock{};
+        std::vector<std::uint32_t> palette{};std::uint32_t palette_flags{};double dpi_x{96},dpi_y{96};std::uint8_t raw{0xaa};std::uint32_t image_flags{};std::vector<Property> properties{};};
     std::map<std::uint64_t,Bitmap> bitmaps;
+    // ImageAttributes 與 CachedBitmap（建立時複製成 32bppPARGB 的自有點陣圖）。
+    std::map<std::uint64_t,GdiplusImageAttributes> attributes;std::map<std::uint64_t,Bitmap> cached;
+    // 文字：字型家族（名稱與實體 face）、字型（家族＋em 大小＋樣式＋單位）、字型集合（已安裝或私有）、StringFormat。
+    struct FontFamily {std::u16string name{};std::vector<NativeFontFace> faces{};};
+    struct Font {FontFamily family{};double size{};unsigned style{},unit{};};
+    struct FontCollection {bool installed{};std::vector<FontFamily> families{};};
+    struct StringFormat {std::uint32_t flags{};std::uint16_t language{},digit_language{};unsigned align{},line_align{},trimming{1},hotkey{},digit_method{};bool typographic{};
+        double tab_first{};std::vector<double> tabs{};std::vector<std::pair<std::int32_t,std::int32_t>> ranges{};};
+    std::map<std::uint64_t,FontFamily> families;std::map<std::uint64_t,Font> fonts;std::map<std::uint64_t,FontCollection> collections;std::map<std::uint64_t,StringFormat> formats;
+    std::uint64_t installed_collection{},generic_default{},generic_typographic{};
+    // 字形輪廓快取（設計單位、Y 向上）：鍵為 PostScript 名稱＋模擬旗標＋字形。
+    std::map<std::tuple<std::u16string,unsigned,std::uint16_t>,std::vector<GuiPathPoint>> outlines;
     std::map<std::uint64_t,std::uint64_t> graphics; // GpGraphics → HDC。
-    // GdipGetImageGraphicsContext：以 32bpp 預乘 DIB section 承接繪圖，刪除 Graphics 時寫回點陣圖。
-    struct ImageTarget {std::uint64_t bitmap{},dc{},dib{},previous{},bits{};};
+    // GdipGetImageGraphicsContext：以 32bpp 預乘 DIB section 承接繪圖。dirty 表示 DIB 可能比點陣圖新（繪製過），
+    // held 表示 GdipGetDC 借出的 HDC 尚未歸還；讀取點陣圖前寫回、寫入點陣圖後同步到 DIB，刪除 Graphics 時最後寫回一次。
+    struct ImageTarget {std::uint64_t bitmap{},dc{},dib{},previous{},bits{};bool dirty{},held{};};
     std::map<std::uint64_t,ImageTarget> image_graphics;
     std::uint64_t next_token{1};
     unsigned startups{};
@@ -40,26 +91,20 @@ namespace {
 // GpStatus。
 constexpr std::uint32_t ok=0,generic_error=1,invalid_parameter=2,out_of_memory=3,object_busy=4,insufficient_buffer=5,not_implemented=6,wrong_state=8,unknown_image_format=13,unsupported_version=17,not_initialized=18;
 constexpr std::uint32_t stream_chunk=65536;constexpr std::size_t stream_limit=64U*1024U*1024U;
-// PixelFormat：32bppARGB、32bppPARGB、32bppRGB、24bppRGB。
-constexpr std::uint32_t argb32=0x0026200aU,pargb32=0x000e200bU,rgb32=0x00022009U,rgb24=0x00021808U;
-unsigned pixel_bytes(std::uint32_t format){return format==rgb24?3U:format==argb32 || format==pargb32 || format==rgb32?4U:0U;}
-std::uint32_t premultiply(std::uint32_t argb){
-    const auto a=argb>>24;if(a==255)return argb;
-    const auto scale=[&](unsigned shift){return ((((argb>>shift)&255U)*a+127U)/255U)<<shift;};
-    return (a<<24)|scale(16)|scale(8)|scale(0);
+// 像素格式與預乘轉換共用 gdiplus_pixels.hpp。
+constexpr std::uint32_t argb32=gdiplus_pixel::argb32,pargb32=gdiplus_pixel::pargb32,rgb32=gdiplus_pixel::rgb32,rgb24=gdiplus_pixel::rgb24;
+using gdiplus_pixel::premultiply;using gdiplus_pixel::unpremultiply;
+constexpr std::uint32_t property_not_found=19;
+// 依檔頭判斷 ImageFormat（GUID 末位元組）。
+std::uint8_t raw_format(std::span<const std::uint8_t> bytes){
+    const auto starts=[&](std::initializer_list<std::uint8_t> magic){return bytes.size()>=magic.size() && std::equal(magic.begin(),magic.end(),bytes.begin());};
+    if(starts({0x89,'P','N','G'}))return 0xaf;if(starts({0xff,0xd8}))return 0xae;if(starts({'G','I','F'}))return 0xb0;if(starts({'B','M'}))return 0xab;
+    if(starts({'I','I',42,0}) || starts({'M','M',0,42}))return 0xb1;if(starts({0,0,1,0}))return 0xb5;return 0xaa;
 }
-std::uint32_t unpremultiply(std::uint32_t pargb){
-    const auto a=pargb>>24;if(a==255 || !a)return a?pargb:0;
-    const auto scale=[&](unsigned shift){return std::min(255U,(((pargb>>shift)&255U)*255U+a/2U)/a)<<shift;};
-    return (a<<24)|scale(16)|scale(8)|scale(0);
-}
+// 以 BGRA 位元組（即小端序 0xAARRGGBB）建立 32bppARGB 點陣圖並寫出 handle；解碼與材質筆刷取回影像共用。
 template<class Allocate,class Release>
-std::uint32_t decode_bitmap(GdiplusState& g,GuestMemory& memory,std::span<const std::uint8_t> bytes,std::uint64_t output,std::uint8_t pointer_bits,Allocate allocate,Release release){
-    texture_image::Decoded image;
-    try{image=texture_image::decode(bytes);}catch(const texture_image::Error&){return unknown_image_format;}
-    if(image.desc.format!=28 || image.pixels.empty())return unknown_image_format;
-    auto& pixels=image.pixels.front();for(std::size_t i=0;i+3<pixels.size();i+=4)std::swap(pixels[i],pixels[i+2]);
-    GdiplusState::Bitmap bitmap{image.desc.width,image.desc.height,argb32,static_cast<std::int64_t>(image.desc.width)*4,0,true};
+std::uint32_t store_bitmap(GdiplusState& g,GuestMemory& memory,std::span<const std::uint8_t> pixels,std::uint32_t width,std::uint32_t height,std::uint64_t output,std::uint8_t pointer_bits,Allocate allocate,Release release,std::uint8_t raw=0xaa,std::uint32_t flags=0){
+    GdiplusState::Bitmap bitmap{width,height,argb32,static_cast<std::int64_t>(width)*4,0,true};bitmap.raw=raw;bitmap.image_flags=flags;
     memory.check(GuestAddress{output},pointer_bits/8,Access::Write);
     bitmap.scan0=allocate(pixels.size());if(!bitmap.scan0)return out_of_memory;
     std::uint64_t handle=0;
@@ -68,6 +113,16 @@ std::uint32_t decode_bitmap(GdiplusState& g,GuestMemory& memory,std::span<const 
         if(!handle){release(bitmap.scan0);return out_of_memory;}
         g.bitmaps.emplace(handle,bitmap);memory.store(GuestAddress{output},pointer_bits,handle);return ok;
     }catch(...){if(handle){g.bitmaps.erase(handle);release(handle);}release(bitmap.scan0);throw;}
+}
+template<class Allocate,class Release>
+std::uint32_t decode_bitmap(GdiplusState& g,GuestMemory& memory,std::span<const std::uint8_t> bytes,std::uint64_t output,std::uint8_t pointer_bits,Allocate allocate,Release release){
+    texture_image::Decoded image;
+    try{image=texture_image::decode(bytes);}catch(const texture_image::Error&){return unknown_image_format;}
+    if(image.desc.format!=28 || image.pixels.empty())return unknown_image_format;
+    auto& pixels=image.pixels.front();for(std::size_t i=0;i+3<pixels.size();i+=4)std::swap(pixels[i],pixels[i+2]);
+    // 解碼影像：ImageFlagsColorSpaceRGB 0x10、HasRealPixelSize 0x2000；含透明像素時 HasAlpha 0x2。
+    bool translucent=false;for(std::size_t i=3;i<pixels.size();i+=4)if(pixels[i]!=255){translucent=true;break;}
+    return store_bitmap(g,memory,pixels,image.desc.width,image.desc.height,output,pointer_bits,allocate,release,raw_format(bytes),0x2010U|(translucent?2U:0U));
 }
 }
 std::span<const WindowsServiceDescriptor> gdiplus_service_descriptors(){
@@ -100,7 +155,29 @@ std::span<const WindowsServiceDescriptor> gdiplus_service_descriptors(){
         {"gdiplus.dll","GdipFillPath",3},{"gdiplus.dll","GdipDrawPath",3},
         {"gdiplus.dll","GdipFillRectangle",6},{"gdiplus.dll","GdipDrawRectangle",6},
         {"gdiplus.dll","GdipFillEllipse",6},{"gdiplus.dll","GdipDrawEllipse",6},
-        {"gdiplus.dll","GdipFillPolygon",5},{"gdiplus.dll","GdipDrawLine",6},{"gdiplus.dll","GdipDrawLineI",6}
+        {"gdiplus.dll","GdipFillPolygon",5},{"gdiplus.dll","GdipDrawLine",6},{"gdiplus.dll","GdipDrawLineI",6},
+        // 幾何家族（gdiplus_geometry_handlers.inc）。
+        {"gdiplus.dll","GdipCreateMatrix",1},{"gdiplus.dll","GdipCreateMatrix2",7},{"gdiplus.dll","GdipCreateMatrix3",3},{"gdiplus.dll","GdipCreateMatrix3I",3},{"gdiplus.dll","GdipCloneMatrix",2},{"gdiplus.dll","GdipDeleteMatrix",1},{"gdiplus.dll","GdipSetMatrixElements",7},{"gdiplus.dll","GdipGetMatrixElements",2},{"gdiplus.dll","GdipMultiplyMatrix",3},{"gdiplus.dll","GdipTranslateMatrix",4},{"gdiplus.dll","GdipScaleMatrix",4},{"gdiplus.dll","GdipShearMatrix",4},{"gdiplus.dll","GdipRotateMatrix",3},{"gdiplus.dll","GdipInvertMatrix",1},{"gdiplus.dll","GdipTransformMatrixPoints",3},{"gdiplus.dll","GdipTransformMatrixPointsI",3},{"gdiplus.dll","GdipVectorTransformMatrixPoints",3},{"gdiplus.dll","GdipVectorTransformMatrixPointsI",3},{"gdiplus.dll","GdipIsMatrixIdentity",2},{"gdiplus.dll","GdipIsMatrixInvertible",2},{"gdiplus.dll","GdipIsMatrixEqual",3},
+        {"gdiplus.dll","GdipCreateFromHWND",2},{"gdiplus.dll","GdipCreateFromHWNDICM",2},{"gdiplus.dll","GdipCreateFromHDC2",3},{"gdiplus.dll","GdipGetDC",2},{"gdiplus.dll","GdipReleaseDC",2},{"gdiplus.dll","GdipFlush",2},{"gdiplus.dll","GdipSetWorldTransform",2},{"gdiplus.dll","GdipGetWorldTransform",2},{"gdiplus.dll","GdipResetWorldTransform",1},{"gdiplus.dll","GdipMultiplyWorldTransform",3},{"gdiplus.dll","GdipTranslateWorldTransform",4},{"gdiplus.dll","GdipScaleWorldTransform",4},{"gdiplus.dll","GdipRotateWorldTransform",3},{"gdiplus.dll","GdipSetPageUnit",2},{"gdiplus.dll","GdipGetPageUnit",2},{"gdiplus.dll","GdipSetPageScale",2},{"gdiplus.dll","GdipGetPageScale",2},{"gdiplus.dll","GdipGetDpiX",2},{"gdiplus.dll","GdipGetDpiY",2},{"gdiplus.dll","GdipSetRenderingOrigin",3},{"gdiplus.dll","GdipGetRenderingOrigin",3},
+        {"gdiplus.dll","GdipSetCompositingMode",2},{"gdiplus.dll","GdipGetCompositingMode",2},{"gdiplus.dll","GdipSetCompositingQuality",2},{"gdiplus.dll","GdipGetCompositingQuality",2},{"gdiplus.dll","GdipSetInterpolationMode",2},{"gdiplus.dll","GdipGetInterpolationMode",2},{"gdiplus.dll","GdipSetPixelOffsetMode",2},{"gdiplus.dll","GdipGetPixelOffsetMode",2},{"gdiplus.dll","GdipSetTextRenderingHint",2},{"gdiplus.dll","GdipGetTextRenderingHint",2},{"gdiplus.dll","GdipSetTextContrast",2},{"gdiplus.dll","GdipGetTextContrast",2},{"gdiplus.dll","GdipSaveGraphics",2},{"gdiplus.dll","GdipRestoreGraphics",2},{"gdiplus.dll","GdipTransformPoints",5},{"gdiplus.dll","GdipTransformPointsI",5},{"gdiplus.dll","GdipGraphicsClear",2},
+        {"gdiplus.dll","GdipSetClipRect",6},{"gdiplus.dll","GdipSetClipRectI",6},{"gdiplus.dll","GdipSetClipPath",3},{"gdiplus.dll","GdipSetClipGraphics",3},{"gdiplus.dll","GdipResetClip",1},{"gdiplus.dll","GdipTranslateClip",3},{"gdiplus.dll","GdipTranslateClipI",3},{"gdiplus.dll","GdipGetClipBounds",2},{"gdiplus.dll","GdipGetClipBoundsI",2},{"gdiplus.dll","GdipGetVisibleClipBounds",2},{"gdiplus.dll","GdipGetVisibleClipBoundsI",2},{"gdiplus.dll","GdipIsClipEmpty",2},{"gdiplus.dll","GdipIsVisibleClipEmpty",2},{"gdiplus.dll","GdipIsVisiblePoint",4},{"gdiplus.dll","GdipIsVisiblePointI",4},{"gdiplus.dll","GdipIsVisibleRect",6},{"gdiplus.dll","GdipIsVisibleRectI",6},
+        {"gdiplus.dll","GdipCreatePath2",5},{"gdiplus.dll","GdipCreatePath2I",5},{"gdiplus.dll","GdipClonePath",2},{"gdiplus.dll","GdipResetPath",1},{"gdiplus.dll","GdipStartPathFigure",1},{"gdiplus.dll","GdipClosePathFigures",1},{"gdiplus.dll","GdipGetPointCount",2},{"gdiplus.dll","GdipGetPathFillMode",2},{"gdiplus.dll","GdipSetPathFillMode",2},{"gdiplus.dll","GdipGetPathPoints",3},{"gdiplus.dll","GdipGetPathPointsI",3},{"gdiplus.dll","GdipGetPathTypes",3},{"gdiplus.dll","GdipGetPathLastPoint",2},{"gdiplus.dll","GdipTransformPath",2},{"gdiplus.dll","GdipFlattenPath",3},{"gdiplus.dll","GdipReversePath",1},{"gdiplus.dll","GdipAddPathPath",3},{"gdiplus.dll","GdipGetPathWorldBounds",4},{"gdiplus.dll","GdipGetPathWorldBoundsI",4},{"gdiplus.dll","GdipIsVisiblePathPoint",5},{"gdiplus.dll","GdipIsVisiblePathPointI",5},
+        {"gdiplus.dll","GdipAddPathLineI",5},{"gdiplus.dll","GdipAddPathLine2",3},{"gdiplus.dll","GdipAddPathLine2I",3},{"gdiplus.dll","GdipAddPathArcI",7},{"gdiplus.dll","GdipAddPathBezier",9},{"gdiplus.dll","GdipAddPathBezierI",9},{"gdiplus.dll","GdipAddPathBeziers",3},{"gdiplus.dll","GdipAddPathBeziersI",3},{"gdiplus.dll","GdipAddPathRectangle",5},{"gdiplus.dll","GdipAddPathRectangleI",5},{"gdiplus.dll","GdipAddPathRectangles",3},{"gdiplus.dll","GdipAddPathRectanglesI",3},{"gdiplus.dll","GdipAddPathEllipse",5},{"gdiplus.dll","GdipAddPathEllipseI",5},{"gdiplus.dll","GdipAddPathPolygon",3},{"gdiplus.dll","GdipAddPathPolygonI",3},{"gdiplus.dll","GdipAddPathPie",7},{"gdiplus.dll","GdipAddPathPieI",7},{"gdiplus.dll","GdipAddPathCurve",3},{"gdiplus.dll","GdipAddPathCurveI",3},{"gdiplus.dll","GdipAddPathCurve2",4},{"gdiplus.dll","GdipAddPathCurve2I",4},{"gdiplus.dll","GdipAddPathCurve3",6},{"gdiplus.dll","GdipAddPathCurve3I",6},{"gdiplus.dll","GdipAddPathClosedCurve",3},{"gdiplus.dll","GdipAddPathClosedCurveI",3},{"gdiplus.dll","GdipAddPathClosedCurve2",4},{"gdiplus.dll","GdipAddPathClosedCurve2I",4},
+        {"gdiplus.dll","GdipDrawRectangleI",6},{"gdiplus.dll","GdipFillRectangleI",6},{"gdiplus.dll","GdipDrawEllipseI",6},{"gdiplus.dll","GdipFillEllipseI",6},{"gdiplus.dll","GdipDrawLines",4},{"gdiplus.dll","GdipDrawLinesI",4},{"gdiplus.dll","GdipDrawRectangles",4},{"gdiplus.dll","GdipDrawRectanglesI",4},{"gdiplus.dll","GdipFillRectangles",4},{"gdiplus.dll","GdipFillRectanglesI",4},{"gdiplus.dll","GdipDrawPolygon",4},{"gdiplus.dll","GdipDrawPolygonI",4},{"gdiplus.dll","GdipFillPolygonI",5},{"gdiplus.dll","GdipFillPolygon2",4},{"gdiplus.dll","GdipFillPolygon2I",4},{"gdiplus.dll","GdipDrawArc",8},{"gdiplus.dll","GdipDrawArcI",8},{"gdiplus.dll","GdipDrawPie",8},{"gdiplus.dll","GdipDrawPieI",8},{"gdiplus.dll","GdipFillPie",8},{"gdiplus.dll","GdipFillPieI",8},{"gdiplus.dll","GdipDrawBezier",10},{"gdiplus.dll","GdipDrawBezierI",10},{"gdiplus.dll","GdipDrawBeziers",4},{"gdiplus.dll","GdipDrawBeziersI",4},
+        {"gdiplus.dll","GdipDrawCurve",4},{"gdiplus.dll","GdipDrawCurveI",4},{"gdiplus.dll","GdipDrawCurve2",5},{"gdiplus.dll","GdipDrawCurve2I",5},{"gdiplus.dll","GdipDrawCurve3",7},{"gdiplus.dll","GdipDrawCurve3I",7},{"gdiplus.dll","GdipDrawClosedCurve",4},{"gdiplus.dll","GdipDrawClosedCurveI",4},{"gdiplus.dll","GdipDrawClosedCurve2",5},{"gdiplus.dll","GdipDrawClosedCurve2I",5},{"gdiplus.dll","GdipFillClosedCurve",4},{"gdiplus.dll","GdipFillClosedCurveI",4},{"gdiplus.dll","GdipFillClosedCurve2",6},{"gdiplus.dll","GdipFillClosedCurve2I",6},
+        {"gdiplus.dll","GdipCreatePen2",4},{"gdiplus.dll","GdipClonePen",2},{"gdiplus.dll","GdipSetPenWidth",2},{"gdiplus.dll","GdipGetPenWidth",2},{"gdiplus.dll","GdipSetPenMiterLimit",2},{"gdiplus.dll","GdipGetPenMiterLimit",2},{"gdiplus.dll","GdipSetPenColor",2},{"gdiplus.dll","GdipGetPenColor",2},{"gdiplus.dll","GdipSetPenUnit",2},{"gdiplus.dll","GdipGetPenUnit",2},{"gdiplus.dll","GdipGetPenStartCap",2},{"gdiplus.dll","GdipGetPenEndCap",2},{"gdiplus.dll","GdipGetPenLineJoin",2},{"gdiplus.dll","GdipSetPenDashStyle",2},{"gdiplus.dll","GdipGetPenDashStyle",2},{"gdiplus.dll","GdipSetPenDashCap197819",2},{"gdiplus.dll","GdipGetPenDashCap197819",2},{"gdiplus.dll","GdipSetPenLineCap197819",4},{"gdiplus.dll","GdipGetPenFillType",2},{"gdiplus.dll","GdipGetPenBrushFill",2},{"gdiplus.dll","GdipSetPenBrushFill",2},{"gdiplus.dll","GdipGetBrushType",2},{"gdiplus.dll","GdipGetSolidFillColor",2},{"gdiplus.dll","GdipSetSolidFillColor",2},
+        // Region 家族（gdiplus_region_handlers.inc）。
+        {"gdiplus.dll","GdipCreateRegion",1},{"gdiplus.dll","GdipCreateRegionRect",2},{"gdiplus.dll","GdipCreateRegionRectI",2},{"gdiplus.dll","GdipCreateRegionPath",2},{"gdiplus.dll","GdipCreateRegionRgnData",3},{"gdiplus.dll","GdipCreateRegionHrgn",2},{"gdiplus.dll","GdipCloneRegion",2},{"gdiplus.dll","GdipDeleteRegion",1},{"gdiplus.dll","GdipSetInfinite",1},{"gdiplus.dll","GdipSetEmpty",1},{"gdiplus.dll","GdipCombineRegionRect",3},{"gdiplus.dll","GdipCombineRegionRectI",3},{"gdiplus.dll","GdipCombineRegionPath",3},{"gdiplus.dll","GdipCombineRegionRegion",3},{"gdiplus.dll","GdipTransformRegion",2},{"gdiplus.dll","GdipTranslateRegion",3},{"gdiplus.dll","GdipTranslateRegionI",3},{"gdiplus.dll","GdipGetRegionBounds",3},{"gdiplus.dll","GdipGetRegionBoundsI",3},{"gdiplus.dll","GdipGetRegionDataSize",2},{"gdiplus.dll","GdipGetRegionData",4},{"gdiplus.dll","GdipGetRegionHRgn",3},{"gdiplus.dll","GdipIsEmptyRegion",3},{"gdiplus.dll","GdipIsInfiniteRegion",3},{"gdiplus.dll","GdipIsEqualRegion",4},{"gdiplus.dll","GdipIsVisibleRegionPoint",5},{"gdiplus.dll","GdipIsVisibleRegionPointI",5},{"gdiplus.dll","GdipIsVisibleRegionRect",7},{"gdiplus.dll","GdipIsVisibleRegionRectI",7},{"gdiplus.dll","GdipGetRegionScansCount",3},{"gdiplus.dll","GdipGetRegionScans",4},{"gdiplus.dll","GdipGetRegionScansI",4},{"gdiplus.dll","GdipFillRegion",3},{"gdiplus.dll","GdipSetClipRegion",3},{"gdiplus.dll","GdipSetClipHrgn",3},{"gdiplus.dll","GdipGetClip",2},
+        // 筆刷家族（gdiplus_brush_handlers.inc）。
+        {"gdiplus.dll","GdipCreateLineBrush",6},{"gdiplus.dll","GdipCreateLineBrushI",6},{"gdiplus.dll","GdipCreateLineBrushFromRect",6},{"gdiplus.dll","GdipCreateLineBrushFromRectI",6},{"gdiplus.dll","GdipCreateLineBrushFromRectWithAngle",7},{"gdiplus.dll","GdipCreateLineBrushFromRectWithAngleI",7},{"gdiplus.dll","GdipSetLineColors",3},{"gdiplus.dll","GdipGetLineColors",2},{"gdiplus.dll","GdipGetLineRect",2},{"gdiplus.dll","GdipGetLineRectI",2},{"gdiplus.dll","GdipCreatePathGradient",4},{"gdiplus.dll","GdipCreatePathGradientI",4},{"gdiplus.dll","GdipCreatePathGradientFromPath",2},{"gdiplus.dll","GdipGetPathGradientCenterColor",2},{"gdiplus.dll","GdipSetPathGradientCenterColor",2},{"gdiplus.dll","GdipGetPathGradientCenterPoint",2},{"gdiplus.dll","GdipGetPathGradientCenterPointI",2},{"gdiplus.dll","GdipSetPathGradientCenterPoint",2},{"gdiplus.dll","GdipSetPathGradientCenterPointI",2},{"gdiplus.dll","GdipGetPathGradientFocusScales",3},{"gdiplus.dll","GdipSetPathGradientFocusScales",3},{"gdiplus.dll","GdipGetPathGradientPointCount",2},{"gdiplus.dll","GdipGetPathGradientSurroundColorCount",2},{"gdiplus.dll","GdipSetPathGradientSurroundColorsWithCount",3},{"gdiplus.dll","GdipGetPathGradientSurroundColorsWithCount",3},{"gdiplus.dll","GdipGetPathGradientRect",2},{"gdiplus.dll","GdipGetPathGradientRectI",2},{"gdiplus.dll","GdipGetPathGradientPath",2},{"gdiplus.dll","GdipSetPathGradientPath",2},{"gdiplus.dll","GdipCreateHatchBrush",4},{"gdiplus.dll","GdipGetHatchStyle",2},{"gdiplus.dll","GdipGetHatchForegroundColor",2},{"gdiplus.dll","GdipGetHatchBackgroundColor",2},{"gdiplus.dll","GdipCreateTexture",3},{"gdiplus.dll","GdipCreateTexture2",7},{"gdiplus.dll","GdipCreateTexture2I",7},{"gdiplus.dll","GdipCreateTextureIA",7},{"gdiplus.dll","GdipCreateTextureIAI",7},{"gdiplus.dll","GdipGetTextureImage",2},{"gdiplus.dll","GdipSetLineTransform",2},{"gdiplus.dll","GdipGetLineTransform",2},{"gdiplus.dll","GdipResetLineTransform",1},{"gdiplus.dll","GdipMultiplyLineTransform",3},{"gdiplus.dll","GdipTranslateLineTransform",4},{"gdiplus.dll","GdipScaleLineTransform",4},{"gdiplus.dll","GdipRotateLineTransform",3},{"gdiplus.dll","GdipSetLineWrapMode",2},{"gdiplus.dll","GdipGetLineWrapMode",2},{"gdiplus.dll","GdipSetPathGradientTransform",2},{"gdiplus.dll","GdipGetPathGradientTransform",2},{"gdiplus.dll","GdipResetPathGradientTransform",1},{"gdiplus.dll","GdipMultiplyPathGradientTransform",3},{"gdiplus.dll","GdipTranslatePathGradientTransform",4},{"gdiplus.dll","GdipScalePathGradientTransform",4},{"gdiplus.dll","GdipRotatePathGradientTransform",3},{"gdiplus.dll","GdipSetPathGradientWrapMode",2},{"gdiplus.dll","GdipGetPathGradientWrapMode",2},{"gdiplus.dll","GdipSetTextureTransform",2},{"gdiplus.dll","GdipGetTextureTransform",2},{"gdiplus.dll","GdipResetTextureTransform",1},{"gdiplus.dll","GdipMultiplyTextureTransform",3},{"gdiplus.dll","GdipTranslateTextureTransform",4},{"gdiplus.dll","GdipScaleTextureTransform",4},{"gdiplus.dll","GdipRotateTextureTransform",3},{"gdiplus.dll","GdipSetTextureWrapMode",2},{"gdiplus.dll","GdipGetTextureWrapMode",2},{"gdiplus.dll","GdipSetLineGammaCorrection",2},{"gdiplus.dll","GdipGetLineGammaCorrection",2},{"gdiplus.dll","GdipSetLineBlend",4},{"gdiplus.dll","GdipGetLineBlend",4},{"gdiplus.dll","GdipGetLineBlendCount",2},{"gdiplus.dll","GdipSetLinePresetBlend",4},{"gdiplus.dll","GdipGetLinePresetBlend",4},{"gdiplus.dll","GdipGetLinePresetBlendCount",2},{"gdiplus.dll","GdipSetLineLinearBlend",3},{"gdiplus.dll","GdipSetLineSigmaBlend",3},{"gdiplus.dll","GdipSetPathGradientGammaCorrection",2},{"gdiplus.dll","GdipGetPathGradientGammaCorrection",2},{"gdiplus.dll","GdipSetPathGradientBlend",4},{"gdiplus.dll","GdipGetPathGradientBlend",4},{"gdiplus.dll","GdipGetPathGradientBlendCount",2},{"gdiplus.dll","GdipSetPathGradientPresetBlend",4},{"gdiplus.dll","GdipGetPathGradientPresetBlend",4},{"gdiplus.dll","GdipGetPathGradientPresetBlendCount",2},{"gdiplus.dll","GdipSetPathGradientLinearBlend",3},{"gdiplus.dll","GdipSetPathGradientSigmaBlend",3},
+        // 影像家族（gdiplus_image_handlers.inc）。
+        {"gdiplus.dll","GdipGetImageBounds",3},{"gdiplus.dll","GdipGetImageDimension",3},{"gdiplus.dll","GdipGetImageFlags",2},{"gdiplus.dll","GdipGetImageHorizontalResolution",2},{"gdiplus.dll","GdipGetImageVerticalResolution",2},{"gdiplus.dll","GdipBitmapSetResolution",3},{"gdiplus.dll","GdipGetImageRawFormat",2},{"gdiplus.dll","GdipGetImageType",2},{"gdiplus.dll","GdipImageForceValidation",1},{"gdiplus.dll","GdipImageSetAbort",2},{"gdiplus.dll","GdipGraphicsSetAbort",2},{"gdiplus.dll","GdipGetNearestColor",2},{"gdiplus.dll","GdipImageGetFrameDimensionsCount",2},{"gdiplus.dll","GdipImageGetFrameDimensionsList",3},{"gdiplus.dll","GdipImageGetFrameCount",3},{"gdiplus.dll","GdipImageSelectActiveFrame",3},{"gdiplus.dll","GdipSetImagePalette",2},{"gdiplus.dll","GdipInitializePalette",5},{"gdiplus.dll","GdipCreateHalftonePalette",0},{"gdiplus.dll","GdipImageRotateFlip",2},{"gdiplus.dll","GdipCloneBitmapArea",7},{"gdiplus.dll","GdipCloneBitmapAreaI",7},{"gdiplus.dll","GdipBitmapConvertFormat",6},{"gdiplus.dll","GdipBitmapGetHistogramSize",2},{"gdiplus.dll","GdipBitmapGetHistogram",7},{"gdiplus.dll","GdipGetImageThumbnail",6},{"gdiplus.dll","GdipCreateBitmapFromGraphics",4},{"gdiplus.dll","GdipCreateBitmapFromGdiDib",3},{"gdiplus.dll","GdipCreateBitmapFromHICON",2},{"gdiplus.dll","GdipCreateHICONFromBitmap",2},{"gdiplus.dll","GdipCreateBitmapFromResource",3},{"gdiplus.dll","GdipGetPropertyCount",2},{"gdiplus.dll","GdipGetPropertyIdList",3},{"gdiplus.dll","GdipGetPropertyItemSize",3},{"gdiplus.dll","GdipGetPropertyItem",4},{"gdiplus.dll","GdipGetPropertySize",3},{"gdiplus.dll","GdipGetAllPropertyItems",4},{"gdiplus.dll","GdipRemovePropertyItem",2},{"gdiplus.dll","GdipSetPropertyItem",2},
+        // DrawImage／ImageAttributes／CachedBitmap（gdiplus_draw_image_handlers.inc）。
+        {"gdiplus.dll","GdipCreateImageAttributes",1},{"gdiplus.dll","GdipCloneImageAttributes",2},{"gdiplus.dll","GdipDisposeImageAttributes",1},{"gdiplus.dll","GdipResetImageAttributes",2},{"gdiplus.dll","GdipSetImageAttributesToIdentity",2},{"gdiplus.dll","GdipSetImageAttributesColorMatrix",6},{"gdiplus.dll","GdipSetImageAttributesThreshold",4},{"gdiplus.dll","GdipSetImageAttributesGamma",4},{"gdiplus.dll","GdipSetImageAttributesNoOp",3},{"gdiplus.dll","GdipSetImageAttributesColorKeys",5},{"gdiplus.dll","GdipSetImageAttributesOutputChannel",4},{"gdiplus.dll","GdipSetImageAttributesOutputChannelColorProfile",4},{"gdiplus.dll","GdipSetImageAttributesRemapTable",5},{"gdiplus.dll","GdipSetImageAttributesWrapMode",4},{"gdiplus.dll","GdipSetImageAttributesCachedBackground",2},{"gdiplus.dll","GdipGetImageAttributesAdjustedPalette",3},{"gdiplus.dll","GdipDrawImage",4},{"gdiplus.dll","GdipDrawImageRect",6},{"gdiplus.dll","GdipDrawImagePoints",4},{"gdiplus.dll","GdipDrawImagePointsI",4},{"gdiplus.dll","GdipDrawImagePointRect",9},{"gdiplus.dll","GdipDrawImagePointRectI",9},{"gdiplus.dll","GdipDrawImageRectRect",14},{"gdiplus.dll","GdipDrawImageRectRectI",14},{"gdiplus.dll","GdipDrawImagePointsRect",12},{"gdiplus.dll","GdipDrawImagePointsRectI",12},{"gdiplus.dll","GdipDrawImageFX",7},{"gdiplus.dll","GdipCreateCachedBitmap",3},{"gdiplus.dll","GdipDeleteCachedBitmap",1},{"gdiplus.dll","GdipDrawCachedBitmap",4},
+        // 文字家族（gdiplus_text_handlers.inc）。
+        {"gdiplus.dll","GdipNewInstalledFontCollection",1},{"gdiplus.dll","GdipNewPrivateFontCollection",1},{"gdiplus.dll","GdipDeletePrivateFontCollection",1},{"gdiplus.dll","GdipPrivateAddFontFile",2},{"gdiplus.dll","GdipPrivateAddMemoryFont",3},{"gdiplus.dll","GdipGetFontCollectionFamilyCount",2},{"gdiplus.dll","GdipGetFontCollectionFamilyList",4},{"gdiplus.dll","GdipCreateFontFamilyFromName",3},{"gdiplus.dll","GdipGetGenericFontFamilySansSerif",1},{"gdiplus.dll","GdipGetGenericFontFamilySerif",1},{"gdiplus.dll","GdipGetGenericFontFamilyMonospace",1},{"gdiplus.dll","GdipCloneFontFamily",2},{"gdiplus.dll","GdipDeleteFontFamily",1},{"gdiplus.dll","GdipGetFamilyName",3},{"gdiplus.dll","GdipIsStyleAvailable",3},{"gdiplus.dll","GdipGetEmHeight",3},{"gdiplus.dll","GdipGetCellAscent",3},{"gdiplus.dll","GdipGetCellDescent",3},{"gdiplus.dll","GdipGetLineSpacing",3},{"gdiplus.dll","GdipCreateFont",5},{"gdiplus.dll","GdipCreateFontFromLogfontW",3},{"gdiplus.dll","GdipCreateFontFromLogfontA",3},{"gdiplus.dll","GdipCreateFontFromDC",2},{"gdiplus.dll","GdipCloneFont",2},{"gdiplus.dll","GdipDeleteFont",1},{"gdiplus.dll","GdipGetFamily",2},{"gdiplus.dll","GdipGetFontSize",2},{"gdiplus.dll","GdipGetFontStyle",2},{"gdiplus.dll","GdipGetFontUnit",2},{"gdiplus.dll","GdipGetFontHeight",3},{"gdiplus.dll","GdipGetFontHeightGivenDPI",3},{"gdiplus.dll","GdipGetLogFontW",3},{"gdiplus.dll","GdipGetLogFontA",3},{"gdiplus.dll","GdipCreateStringFormat",3},{"gdiplus.dll","GdipStringFormatGetGenericDefault",1},{"gdiplus.dll","GdipStringFormatGetGenericTypographic",1},{"gdiplus.dll","GdipCloneStringFormat",2},{"gdiplus.dll","GdipDeleteStringFormat",1},{"gdiplus.dll","GdipSetStringFormatAlign",2},{"gdiplus.dll","GdipGetStringFormatAlign",2},{"gdiplus.dll","GdipSetStringFormatLineAlign",2},{"gdiplus.dll","GdipGetStringFormatLineAlign",2},{"gdiplus.dll","GdipSetStringFormatTrimming",2},{"gdiplus.dll","GdipGetStringFormatTrimming",2},{"gdiplus.dll","GdipSetStringFormatHotkeyPrefix",2},{"gdiplus.dll","GdipGetStringFormatHotkeyPrefix",2},{"gdiplus.dll","GdipSetStringFormatFlags",2},{"gdiplus.dll","GdipGetStringFormatFlags",2},{"gdiplus.dll","GdipSetStringFormatTabStops",4},{"gdiplus.dll","GdipGetStringFormatTabStopCount",2},{"gdiplus.dll","GdipGetStringFormatTabStops",4},{"gdiplus.dll","GdipSetStringFormatDigitSubstitution",3},{"gdiplus.dll","GdipGetStringFormatDigitSubstitution",3},{"gdiplus.dll","GdipSetStringFormatMeasurableCharacterRanges",3},{"gdiplus.dll","GdipGetStringFormatMeasurableCharacterRangeCount",2},{"gdiplus.dll","GdipDrawString",7},{"gdiplus.dll","GdipMeasureString",9},{"gdiplus.dll","GdipMeasureCharacterRanges",8},{"gdiplus.dll","GdipDrawDriverString",8},{"gdiplus.dll","GdipMeasureDriverString",8},{"gdiplus.dll","GdipAddPathString",8},{"gdiplus.dll","GdipAddPathStringI",8},
+        // 畫筆進階、線端、路徑迭代器與容器（gdiplus_pen_path_handlers.inc）。
+        {"gdiplus.dll","GdipSetPenDashArray",3},{"gdiplus.dll","GdipGetPenDashArray",3},{"gdiplus.dll","GdipGetPenDashCount",2},{"gdiplus.dll","GdipGetPenDashOffset",2},{"gdiplus.dll","GdipSetPenDashOffset",2},{"gdiplus.dll","GdipSetPenCompoundArray",3},{"gdiplus.dll","GdipGetPenCompoundArray",3},{"gdiplus.dll","GdipGetPenCompoundCount",2},{"gdiplus.dll","GdipSetPenTransform",2},{"gdiplus.dll","GdipGetPenTransform",2},{"gdiplus.dll","GdipResetPenTransform",1},{"gdiplus.dll","GdipMultiplyPenTransform",3},{"gdiplus.dll","GdipTranslatePenTransform",4},{"gdiplus.dll","GdipScalePenTransform",4},{"gdiplus.dll","GdipRotatePenTransform",3},{"gdiplus.dll","GdipGetPenMode",2},{"gdiplus.dll","GdipSetPenMode",2},{"gdiplus.dll","GdipSetPenCustomStartCap",2},{"gdiplus.dll","GdipGetPenCustomStartCap",2},{"gdiplus.dll","GdipSetPenCustomEndCap",2},{"gdiplus.dll","GdipGetPenCustomEndCap",2},{"gdiplus.dll","GdipCreateCustomLineCap",5},{"gdiplus.dll","GdipCloneCustomLineCap",2},{"gdiplus.dll","GdipDeleteCustomLineCap",1},{"gdiplus.dll","GdipGetCustomLineCapBaseCap",2},{"gdiplus.dll","GdipSetCustomLineCapBaseCap",2},{"gdiplus.dll","GdipGetCustomLineCapBaseInset",2},{"gdiplus.dll","GdipSetCustomLineCapBaseInset",2},{"gdiplus.dll","GdipGetCustomLineCapStrokeJoin",2},{"gdiplus.dll","GdipSetCustomLineCapStrokeJoin",2},{"gdiplus.dll","GdipSetCustomLineCapStrokeCaps",3},{"gdiplus.dll","GdipGetCustomLineCapType",2},{"gdiplus.dll","GdipGetCustomLineCapWidthScale",2},{"gdiplus.dll","GdipSetCustomLineCapWidthScale",2},{"gdiplus.dll","GdipCreateAdjustableArrowCap",4},{"gdiplus.dll","GdipGetAdjustableArrowCapHeight",2},{"gdiplus.dll","GdipSetAdjustableArrowCapHeight",2},{"gdiplus.dll","GdipGetAdjustableArrowCapWidth",2},{"gdiplus.dll","GdipSetAdjustableArrowCapWidth",2},{"gdiplus.dll","GdipGetAdjustableArrowCapMiddleInset",2},{"gdiplus.dll","GdipSetAdjustableArrowCapMiddleInset",2},{"gdiplus.dll","GdipGetAdjustableArrowCapFillState",2},{"gdiplus.dll","GdipSetAdjustableArrowCapFillState",2},{"gdiplus.dll","GdipCreatePathIter",2},{"gdiplus.dll","GdipDeletePathIter",1},{"gdiplus.dll","GdipPathIterCopyData",6},{"gdiplus.dll","GdipPathIterEnumerate",5},{"gdiplus.dll","GdipPathIterGetCount",2},{"gdiplus.dll","GdipPathIterGetSubpathCount",2},{"gdiplus.dll","GdipPathIterHasCurve",2},{"gdiplus.dll","GdipPathIterIsValid",2},{"gdiplus.dll","GdipPathIterNextMarker",4},{"gdiplus.dll","GdipPathIterNextMarkerPath",3},{"gdiplus.dll","GdipPathIterNextPathType",5},{"gdiplus.dll","GdipPathIterNextSubpath",5},{"gdiplus.dll","GdipPathIterNextSubpathPath",4},{"gdiplus.dll","GdipPathIterRewind",1},{"gdiplus.dll","GdipGetPathData",2},{"gdiplus.dll","GdipSetPathMarker",1},{"gdiplus.dll","GdipClearPathMarkers",1},{"gdiplus.dll","GdipIsOutlineVisiblePathPoint",6},{"gdiplus.dll","GdipIsOutlineVisiblePathPointI",6},{"gdiplus.dll","GdipWidenPath",4},{"gdiplus.dll","GdipWarpPath",10},{"gdiplus.dll","GdipWindingModeOutline",3},{"gdiplus.dll","GdipBeginContainer",5},{"gdiplus.dll","GdipBeginContainer2",2},{"gdiplus.dll","GdipBeginContainerI",5},{"gdiplus.dll","GdipEndContainer",2},{"gdiplus.dll","GdipResetPageTransform",1},
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -136,7 +213,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
         if(symbol=="GdiplusNotificationHook"){if(!arg(0))return finish(invalid_parameter);memory.store(GuestAddress{arg(0)},pointer_bits,g.next_token++);return finish(ok);}
         if(symbol=="GdiplusNotificationUnhook")return finish(0);
         if(!g.startups)return finish(not_initialized);
+        if(const auto target=g.image_graphics.find(arg(0));target!=g.image_graphics.end()){
+            if(symbol.starts_with("GdipDraw") || symbol.starts_with("GdipFill") || symbol=="GdipGraphicsClear")target->second.dirty=true;
+            else if(symbol=="GdipGetDC")target->second.held=true;else if(symbol=="GdipReleaseDC"){target->second.held=false;target->second.dirty=true;}
+        }
 #include "gdiplus_vector_handlers.inc"
+#include "gdiplus_geometry_handlers.inc"
+#include "gdiplus_pen_path_handlers.inc"
+#include "gdiplus_region_handlers.inc"
         if(symbol=="GdipGetImageEncodersSize" || symbol=="GdipGetImageDecodersSize"){
             if(!arg(0) || !arg(1))return finish(invalid_parameter);
             memory.check(GuestAddress{arg(0)},4,Access::Write);memory.check(GuestAddress{arg(1)},4,Access::Write);
@@ -171,15 +255,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
         if(symbol=="GdipCreateBitmapFromScan0"){
             const auto width=s32(0),height=s32(1),stride=s32(2);const auto format=u32(3);const auto scan0=arg(4);
             if(!arg(5) || width<=0 || height<=0)return finish(invalid_parameter);
-            const auto bytes=pixel_bytes(format);if(!bytes)return finish(not_implemented);
-            GdiplusState::Bitmap bitmap{static_cast<std::uint32_t>(width),static_cast<std::uint32_t>(height),format,stride,scan0,false};
+            if(!gdiplus_pixel::supported(format))return finish(invalid_parameter);const auto row_bytes=(static_cast<std::int64_t>(width)*gdiplus_pixel::bits(format)+7)/8;
+            GdiplusState::Bitmap bitmap{static_cast<std::uint32_t>(width),static_cast<std::uint32_t>(height),format,stride,scan0,false};bitmap.palette=gdiplus_pixel::default_palette(format);
             if(!scan0){
-                // 自行配置時 stride 對齊 4 bytes 並清零，等同完全透明的黑色。
-                bitmap.stride=(static_cast<std::int64_t>(width)*bytes+3)/4*4;
+                // 自行配置時 stride 對齊 4 bytes 並清零，等同完全透明的黑色（索引色為第 0 色）。
+                bitmap.stride=gdiplus_pixel::stride(format,static_cast<std::uint32_t>(width));
                 const auto size=static_cast<std::uint64_t>(bitmap.stride)*static_cast<std::uint64_t>(height);
                 bitmap.scan0=allocate_heap(memory,size);if(!bitmap.scan0)return finish(out_of_memory);
                 memory.fill(GuestAddress{bitmap.scan0},0,static_cast<std::size_t>(size));bitmap.owned=true;
-            }else if(std::abs(stride)<static_cast<std::int64_t>(width)*bytes)return finish(invalid_parameter);
+            }else if(std::abs(stride)<row_bytes)return finish(invalid_parameter);
             const auto handle=new_handle();if(!handle){if(bitmap.owned)(void)free_heap(memory,bitmap.scan0,state);return finish(out_of_memory);}
             g.bitmaps[handle]=bitmap;memory.store(GuestAddress{arg(5)},pointer_bits,handle);return finish(ok);
         }
@@ -199,25 +283,48 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
             }
             return finish(ok);
         }
-        const auto address_of=[&](const GdiplusState::Bitmap& b,std::uint32_t x,std::uint32_t y){
-            return b.scan0+static_cast<std::uint64_t>(static_cast<std::int64_t>(y)*b.stride)+static_cast<std::uint64_t>(x)*pixel_bytes(b.format);
+        // 像素以 0xAARRGGBB（非預乘）交換：row 為該列起點，編解碼與調色盤對應在 gdiplus_pixels.hpp；1／4 位元格式以位元組讀改寫。
+        const auto row_of=[&](const GdiplusState::Bitmap& b,std::uint32_t y){return b.scan0+static_cast<std::uint64_t>(static_cast<std::int64_t>(y)*b.stride);};
+        const auto address_of=[&](const GdiplusState::Bitmap& b,std::uint32_t x,std::uint32_t y){return row_of(b,y)+static_cast<std::uint64_t>(x)*gdiplus_pixel::bits(b.format)/8;};
+        const auto pixel_window=[](std::uint32_t format,std::uint32_t x){const auto bits=gdiplus_pixel::bits(format);
+            return bits<8?std::pair<std::uint64_t,std::uint32_t>{x/(8/bits),x%(8/bits)}:std::pair<std::uint64_t,std::uint32_t>{static_cast<std::uint64_t>(x)*(bits/8),0};};
+        const auto load_pixel=[&](std::uint32_t format,std::uint64_t row,std::uint32_t x,std::span<const std::uint32_t> palette)->std::uint32_t{
+            const auto [offset,index]=pixel_window(format,x);std::array<std::uint8_t,8> buffer{};const auto size=std::max(1U,gdiplus_pixel::bits(format)/8);
+            memory.read(GuestAddress{row+offset},std::span<std::uint8_t>(buffer.data(),size));return gdiplus_pixel::decode(format,buffer,index,palette);
         };
-        // 以 0xAARRGGBB 讀取一個像素（非預乘）。
-        const auto read_pixel=[&](const GdiplusState::Bitmap& b,std::uint32_t x,std::uint32_t y)->std::uint32_t{
-            const auto at=address_of(b,x,y);
-            if(b.format==rgb24){const auto bgr=static_cast<std::uint32_t>(memory.load(GuestAddress{at},16))|(static_cast<std::uint32_t>(memory.load(GuestAddress{at+2},8))<<16);return 0xff000000U|bgr;}
-            const auto value=static_cast<std::uint32_t>(memory.load(GuestAddress{at},32));
-            return b.format==rgb32?(value|0xff000000U):b.format==pargb32?unpremultiply(value):value;
+        const auto store_pixel=[&](std::uint32_t format,std::uint64_t row,std::uint32_t x,std::uint32_t color,std::span<const std::uint32_t> palette){
+            const auto [offset,index]=pixel_window(format,x);std::array<std::uint8_t,8> buffer{};const auto size=std::max(1U,gdiplus_pixel::bits(format)/8);
+            if(gdiplus_pixel::bits(format)<8)memory.read(GuestAddress{row+offset},std::span<std::uint8_t>(buffer.data(),1));
+            gdiplus_pixel::encode(format,buffer,index,color,palette);memory.write(GuestAddress{row+offset},std::span<const std::uint8_t>(buffer.data(),size));
         };
-        // 以 0xAARRGGBB（非預乘）寫入一個像素。
-        const auto store_pixel=[&](std::uint32_t format,std::uint64_t at,std::uint32_t color){
-            if(format==rgb24){memory.store(GuestAddress{at},16,color&0xffffU);memory.store(GuestAddress{at+2},8,(color>>16)&255U);}
-            else memory.store(GuestAddress{at},32,format==pargb32?premultiply(color):format==rgb32?(color|0xff000000U):color);
+        const auto read_pixel=[&](const GdiplusState::Bitmap& b,std::uint32_t x,std::uint32_t y)->std::uint32_t{return load_pixel(b.format,row_of(b,y),x,b.palette);};
+        const auto write_pixel=[&](const GdiplusState::Bitmap& b,std::uint32_t x,std::uint32_t y,std::uint32_t color){store_pixel(b.format,row_of(b,y),x,color,b.palette);};
+        // 影像 Graphics 的 DIB 與點陣圖保持同一份像素：copy_back 把 DIB（預乘）寫回點陣圖格式，mirror 把點陣圖矩形寫入 DIB。
+        const auto copy_back=[&](GdiplusState::ImageTarget& target){
+            auto* b=bitmap_of(target.bitmap);if(!b)return;(void)flush_gdi_batch(memory);sync_raster_bitmap(memory,target.dib);
+            for(std::uint32_t y=0;y<b->height;++y)for(std::uint32_t x=0;x<b->width;++x){
+                const auto raw=static_cast<std::uint32_t>(memory.load(GuestAddress{target.bits+(static_cast<std::uint64_t>(y)*b->width+x)*4},32));
+                write_pixel(*b,x,y,gdiplus_pixel::alpha(b->format)?unpremultiply(raw):raw|0xff000000U);}
+            target.dirty=false;
         };
-        const auto load_pixel=[&](std::uint32_t format,std::uint64_t at)->std::uint32_t{
-            if(format==rgb24)return 0xff000000U|static_cast<std::uint32_t>(memory.load(GuestAddress{at},16))|(static_cast<std::uint32_t>(memory.load(GuestAddress{at+2},8))<<16);
-            const auto value=static_cast<std::uint32_t>(memory.load(GuestAddress{at},32));return format==rgb32?(value|0xff000000U):format==pargb32?unpremultiply(value):value;
+        const auto mirror=[&](std::uint64_t bitmap,const std::array<std::int32_t,4>& rect){
+            const auto* b=bitmap_of(bitmap);if(!b)return;
+            for(const auto& [handle,target]:g.image_graphics){(void)handle;if(target.bitmap!=bitmap)continue;
+                for(auto y=rect[1];y<rect[1]+rect[3];++y)for(auto x=rect[0];x<rect[0]+rect[2];++x)
+                    memory.store(GuestAddress{target.bits+(static_cast<std::uint64_t>(y)*b->width+static_cast<std::uint64_t>(x))*4},32,premultiply(read_pixel(*b,static_cast<std::uint32_t>(x),static_cast<std::uint32_t>(y))));}
         };
+        {
+            // 讀取點陣圖像素的呼叫：來源點陣圖的參數位置依 API 而定。
+            const auto source=symbol.starts_with("GdipCloneBitmapArea")?arg(5):symbol.starts_with("GdipDrawImage")?arg(1):arg(0);
+            if(g.bitmaps.contains(source) && (symbol.starts_with("GdipBitmap") || symbol.starts_with("GdipCloneImage") || symbol.starts_with("GdipCloneBitmapArea") ||
+               symbol=="GdipCreateHBITMAPFromBitmap" || symbol=="GdipCreateHICONFromBitmap" || symbol.starts_with("GdipSaveImage") || symbol.starts_with("GdipCreateTexture") ||
+               symbol=="GdipGetImageGraphicsContext" || symbol.starts_with("GdipImage") || symbol=="GdipGetImageThumbnail" || symbol.starts_with("GdipDrawImage") || symbol=="GdipCreateCachedBitmap"))
+                for(auto& [handle,target]:g.image_graphics){(void)handle;if(target.bitmap==source && (target.dirty || target.held))copy_back(target);}
+        }
+#include "gdiplus_brush_handlers.inc"
+#include "gdiplus_image_handlers.inc"
+#include "gdiplus_draw_image_handlers.inc"
+#include "gdiplus_text_handlers.inc"
         if(symbol=="GdipCreateHBITMAPFromBitmap"){
             const auto* b=bitmap_of(arg(0));if(!b || !arg(1))return finish(invalid_parameter);if(b->lock)return finish(object_busy);
             memory.check(GuestAddress{arg(1)},pointer_bits/8,Access::Write);memory.store(GuestAddress{arg(1)},pointer_bits,0);
@@ -281,17 +388,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
             if(arg(1))for(unsigned i=0;i<4;++i)rect[i]=static_cast<std::int32_t>(memory.load(GuestAddress{arg(1)+i*4},32));
             const auto mode=u32(2),format=u32(3);
             if(rect[0]<0 || rect[1]<0 || rect[2]<=0 || rect[3]<=0 || static_cast<std::int64_t>(rect[0])+rect[2]>b->width || static_cast<std::int64_t>(rect[1])+rect[3]>b->height || !(mode&3U) || (mode&~7U))return finish(invalid_parameter);
-            const auto bytes=pixel_bytes(format);if(!bytes)return finish(not_implemented);
+            // 轉成索引色只允許與點陣圖同格式（共用其調色盤）。
+            if(!gdiplus_pixel::supported(format) || (gdiplus_pixel::indexed(format) && format!=b->format))return finish(invalid_parameter);
+            const auto row_bytes=(static_cast<std::int64_t>(rect[2])*gdiplus_pixel::bits(format)+7)/8;
             const unsigned data_size=x86_?24U:32U;memory.check(GuestAddress{data},data_size,Access::Write);
             GdiplusState::Lock lock{0,mode,format,rect,0,false};
             if(mode&4U){lock.stride=static_cast<std::int32_t>(memory.load(GuestAddress{data+8},32));lock.buffer=memory.load(GuestAddress{data+16},pointer_bits);
-                if(!lock.buffer || std::abs(lock.stride)<static_cast<std::int64_t>(rect[2])*bytes)return finish(invalid_parameter);}
-            else if(format==b->format){lock.buffer=address_of(*b,static_cast<std::uint32_t>(rect[0]),static_cast<std::uint32_t>(rect[1]));lock.stride=b->stride;}
-            else {lock.stride=(static_cast<std::int64_t>(rect[2])*bytes+3)/4*4;lock.buffer=allocate_heap(memory,static_cast<std::uint64_t>(lock.stride)*static_cast<std::uint32_t>(rect[3]));if(!lock.buffer)return finish(out_of_memory);lock.owned=true;}
-            const bool direct=!(mode&4U) && format==b->format;
+                if(!lock.buffer || std::abs(lock.stride)<row_bytes)return finish(invalid_parameter);}
+            const bool aligned=(static_cast<std::int64_t>(rect[0])*gdiplus_pixel::bits(format))%8==0;
+            if(mode&4U){}
+            else if(format==b->format && aligned){lock.buffer=address_of(*b,static_cast<std::uint32_t>(rect[0]),static_cast<std::uint32_t>(rect[1]));lock.stride=b->stride;}
+            else {lock.stride=gdiplus_pixel::stride(format,static_cast<std::uint32_t>(rect[2]));lock.buffer=allocate_heap(memory,static_cast<std::uint64_t>(lock.stride)*static_cast<std::uint32_t>(rect[3]));if(!lock.buffer)return finish(out_of_memory);lock.owned=true;}
+            const bool direct=!(mode&4U) && format==b->format && aligned;
             if((mode&1U) && !direct)
                 for(std::int32_t y=0;y<rect[3];++y)for(std::int32_t x=0;x<rect[2];++x)
-                    store_pixel(format,lock.buffer+static_cast<std::uint64_t>(y*lock.stride)+static_cast<std::uint64_t>(x)*bytes,read_pixel(*b,static_cast<std::uint32_t>(rect[0]+x),static_cast<std::uint32_t>(rect[1]+y)));
+                    store_pixel(format,lock.buffer+static_cast<std::uint64_t>(y*lock.stride),static_cast<std::uint32_t>(x),read_pixel(*b,static_cast<std::uint32_t>(rect[0]+x),static_cast<std::uint32_t>(rect[1]+y)),b->palette);
             memory.store(GuestAddress{data},32,static_cast<std::uint32_t>(rect[2]));memory.store(GuestAddress{data+4},32,static_cast<std::uint32_t>(rect[3]));
             memory.store(GuestAddress{data+8},32,static_cast<std::uint32_t>(lock.stride));memory.store(GuestAddress{data+12},32,format);
             memory.store(GuestAddress{data+16},pointer_bits,lock.buffer);memory.store(GuestAddress{data+(x86_?20U:24U)},pointer_bits,0);
@@ -299,20 +410,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
         }
         if(symbol=="GdipBitmapUnlockBits"){
             auto* b=bitmap_of(arg(0));if(!b || !arg(1))return finish(invalid_parameter);if(!b->lock)return finish(wrong_state);
-            const auto lock=*b->lock;b->lock.reset();const bool direct=!(lock.mode&4U) && lock.format==b->format;const auto bytes=pixel_bytes(lock.format);
+            const auto lock=*b->lock;b->lock.reset();const bool direct=!lock.owned && !(lock.mode&4U);
             if((lock.mode&2U) && !direct)
                 for(std::int32_t y=0;y<lock.rect[3];++y)for(std::int32_t x=0;x<lock.rect[2];++x)
-                    store_pixel(b->format,address_of(*b,static_cast<std::uint32_t>(lock.rect[0]+x),static_cast<std::uint32_t>(lock.rect[1]+y)),load_pixel(lock.format,lock.buffer+static_cast<std::uint64_t>(y*lock.stride)+static_cast<std::uint64_t>(x)*bytes));
+                    write_pixel(*b,static_cast<std::uint32_t>(lock.rect[0]+x),static_cast<std::uint32_t>(lock.rect[1]+y),load_pixel(lock.format,lock.buffer+static_cast<std::uint64_t>(y*lock.stride),static_cast<std::uint32_t>(x),b->palette));
+            if(lock.mode&2U)mirror(arg(0),{lock.rect[0],lock.rect[1],lock.rect[2],lock.rect[3]});
             if(lock.owned)(void)free_heap(memory,lock.buffer,state);return finish(ok);
         }
         if(symbol=="GdipGetImagePaletteSize" || symbol=="GdipGetImagePalette"){
-            // 目前支援的像素格式皆非索引色；ColorPalette 只有 Flags 與 Count=0。
-            if(!bitmap_of(arg(0)) || !arg(1))return finish(invalid_parameter);
-            if(symbol=="GdipGetImagePaletteSize"){memory.store(GuestAddress{arg(1)},32,12);return finish(ok);}
-            if(s32(2)<8)return finish(insufficient_buffer);memory.store(GuestAddress{arg(1)},32,0);memory.store(GuestAddress{arg(1)+4},32,0);return finish(ok);
+            // ColorPalette：Flags、Count、Entries；沒有調色盤時大小為 12（Count 0）。
+            const auto* b=bitmap_of(arg(0));if(!b || !arg(1))return finish(invalid_parameter);
+            const auto size=static_cast<std::uint32_t>(8+4*std::max<std::size_t>(1,b->palette.size()));
+            if(symbol=="GdipGetImagePaletteSize"){memory.store(GuestAddress{arg(1)},32,size);return finish(ok);}
+            if(s32(2)<static_cast<std::int32_t>(b->palette.empty()?8:size))return finish(insufficient_buffer);
+            memory.store(GuestAddress{arg(1)},32,b->palette_flags);memory.store(GuestAddress{arg(1)+4},32,b->palette.size());
+            for(std::size_t i=0;i<b->palette.size();++i)memory.store(GuestAddress{arg(1)+8+i*4},32,b->palette[i]);return finish(ok);
         }
         if(symbol=="GdipGetImageGraphicsContext"){
             auto* b=bitmap_of(arg(0));if(!b || !arg(1))return finish(invalid_parameter);if(b->lock)return finish(object_busy);
+            if(gdiplus_pixel::indexed(b->format) || b->format==gdiplus_pixel::gray16)return finish(out_of_memory);
             const auto dc=nested_service(state,memory,"gdi32.dll","CreateCompatibleDC",{0});if(!dc)return finish(out_of_memory);
             const auto header=allocate_heap(memory,48+8);if(!header){(void)nested_service(state,memory,"gdi32.dll","DeleteDC",{dc});return finish(out_of_memory);}
             memory.fill(GuestAddress{header},0,56);memory.store(GuestAddress{header},32,40);memory.store(GuestAddress{header+4},32,b->width);memory.store(GuestAddress{header+8},32,static_cast<std::uint32_t>(-static_cast<std::int32_t>(b->height)));
@@ -329,10 +445,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
             const auto x=s32(1),y=s32(2);
             if(x<0 || y<0 || static_cast<std::uint32_t>(x)>=b->width || static_cast<std::uint32_t>(y)>=b->height)return finish(invalid_parameter);
             if(symbol=="GdipBitmapGetPixel"){if(!arg(3))return finish(invalid_parameter);memory.store(GuestAddress{arg(3)},32,read_pixel(*b,static_cast<std::uint32_t>(x),static_cast<std::uint32_t>(y)));return finish(ok);}
-            const auto color=u32(3);const auto at=address_of(*b,static_cast<std::uint32_t>(x),static_cast<std::uint32_t>(y));
-            if(b->format==rgb24){memory.store(GuestAddress{at},16,color&0xffffU);memory.store(GuestAddress{at+2},8,(color>>16)&255U);}
-            else memory.store(GuestAddress{at},32,b->format==pargb32?premultiply(color):b->format==rgb32?(color|0xff000000U):color);
-            return finish(ok);
+            // 索引色點陣圖不能逐點設定顏色（與 Windows 相同）。
+            if(gdiplus_pixel::indexed(b->format))return finish(invalid_parameter);
+            write_pixel(*b,static_cast<std::uint32_t>(x),static_cast<std::uint32_t>(y),u32(3));mirror(arg(0),{x,y,1,1});return finish(ok);
         }
         if(symbol=="GdipGetImageWidth" || symbol=="GdipGetImageHeight" || symbol=="GdipGetImagePixelFormat"){
             const auto* b=bitmap_of(arg(0));if(!b || !arg(1))return finish(invalid_parameter);
@@ -340,10 +455,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
         }
         if(symbol=="GdipCloneImage"){
             const auto* b=bitmap_of(arg(0));if(!b || !arg(1))return finish(invalid_parameter);
-            GdiplusState::Bitmap copy=*b;copy.stride=(static_cast<std::int64_t>(b->width)*pixel_bytes(b->format)+3)/4*4;
+            GdiplusState::Bitmap copy=*b;copy.lock.reset();copy.stride=gdiplus_pixel::stride(b->format,b->width);
             const auto size=static_cast<std::uint64_t>(copy.stride)*b->height;
             copy.scan0=allocate_heap(memory,size);if(!copy.scan0)return finish(out_of_memory);copy.owned=true;
-            std::vector<std::uint8_t> row(static_cast<std::size_t>(b->width)*pixel_bytes(b->format));
+            std::vector<std::uint8_t> row(static_cast<std::size_t>((static_cast<std::uint64_t>(b->width)*gdiplus_pixel::bits(b->format)+7)/8));
             for(std::uint32_t y=0;y<b->height;++y){memory.read(GuestAddress{address_of(*b,0,y)},row);memory.write(GuestAddress{copy.scan0+static_cast<std::uint64_t>(copy.stride)*y},row);}
             const auto handle=new_handle();if(!handle){(void)free_heap(memory,copy.scan0,state);return finish(out_of_memory);}
             g.bitmaps[handle]=copy;memory.store(GuestAddress{arg(1)},pointer_bits,handle);return finish(ok);
@@ -361,41 +476,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdiplus(GuestState& state,G
         if(symbol=="GdipDeleteGraphics"){
             if(const auto target=g.image_graphics.find(arg(0));target!=g.image_graphics.end()){
                 // 先讓 GPU raster 寫回 DIB backing，再把預乘像素轉回點陣圖本身的格式。
-                const auto image=target->second;g.image_graphics.erase(target);(void)nested_service(state,memory,"gdi32.dll","GdiFlush",{});
-                if(auto* b=bitmap_of(image.bitmap))
-                    for(std::uint32_t y=0;y<b->height;++y)for(std::uint32_t x=0;x<b->width;++x)
-                        {const auto raw=static_cast<std::uint32_t>(memory.load(GuestAddress{image.bits+(static_cast<std::uint64_t>(y)*b->width+x)*4},32));store_pixel(b->format,address_of(*b,x,y),b->format==argb32 || b->format==pargb32?unpremultiply(raw):raw|0xff000000U);}
+                auto image=target->second;g.image_graphics.erase(target);copy_back(image);
                 (void)nested_service(state,memory,"gdi32.dll","SelectObject",{image.dc,image.previous});(void)nested_service(state,memory,"gdi32.dll","DeleteObject",{image.dib});(void)nested_service(state,memory,"gdi32.dll","DeleteDC",{image.dc});
             }
-            if(!g.graphics.erase(arg(0)))return finish(invalid_parameter);
+            if(!g.graphics.contains(arg(0)))return finish(invalid_parameter);
+            if(const auto info=g.graphics_state.find(arg(0));info!=g.graphics_state.end() && info->second.owned_dc)
+                (void)nested_service(state,memory,"user32.dll","ReleaseDC",{info->second.window,g.graphics.at(arg(0))});
+            g.graphics.erase(arg(0));g.graphics_state.erase(arg(0));g.saved_graphics.erase(arg(0));
             g.smoothing.erase(arg(0));
             release_handle(arg(0));return finish(ok);
         }
-        if(symbol=="GdipDrawImageI" || symbol=="GdipDrawImageRectI"){
-            const auto graphics=g.graphics.find(arg(0));const auto* b=bitmap_of(arg(1));
-            if(graphics==g.graphics.end() || !b)return finish(invalid_parameter);
-            const auto dc=gui_.contexts.find(graphics->second);if(dc==gui_.contexts.end())return finish(invalid_parameter);
-            const auto x=s32(2),y=s32(3);
-            const auto width=symbol=="GdipDrawImageRectI"?s32(4):static_cast<std::int32_t>(b->width);
-            const auto height=symbol=="GdipDrawImageRectI"?s32(5):static_cast<std::int32_t>(b->height);
-            if(!width || !height)return finish(ok);
-            // 預設合成模式為 SourceOver：ARGB 先轉成預乘後以 AC_SRC_ALPHA 混合；不透明格式直接複製。
-            const bool alpha=b->format==argb32 || b->format==pargb32;
-            std::vector<std::uint32_t> pixels(static_cast<std::size_t>(b->width)*b->height);
-            for(std::uint32_t row=0;row<b->height;++row)for(std::uint32_t column=0;column<b->width;++column){
-                const auto value=read_pixel(*b,column,row);
-                pixels[static_cast<std::size_t>(row)*b->width+column]=alpha?premultiply(value):value;
-            }
-            const auto destination=raster_surface(memory,graphics->second);if(!destination)return finish(not_implemented);
-            const auto source=make_hardware_raster(b->width,b->height,pixels);
-            auto target=dc->second;target.stretch_mode=3;
-            RasterBlit options;options.operation=0xcc;
-            destination->blit(*source,{x,y,x+width,y+height},{0,0,static_cast<std::int32_t>(b->width),static_cast<std::int32_t>(b->height)},target,
-                              alpha?0x01ff0000U:UINT32_MAX,options);
-            return finish(ok);
-        }
     }catch(const MemoryFault&){return finish(invalid_parameter);}catch(const std::bad_alloc&){return finish(out_of_memory);}
-    catch(const texture_image::Error&){return finish(generic_error);}catch(const std::invalid_argument&){return finish(invalid_parameter);}
+    catch(const texture_image::Error&){return finish(generic_error);}catch(const std::invalid_argument&){return finish(invalid_parameter);}catch(const std::length_error&){return finish(out_of_memory);}
     return finish(not_implemented);
 }
 std::optional<std::uint32_t> WindowsServices::resume_gdiplus_stream(GuestState& state,GuestMemory& memory,std::uint64_t id,std::uint64_t value){

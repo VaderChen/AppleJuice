@@ -56,6 +56,7 @@ unsigned unicode_mask(char16_t value){
     return mask;
 }
 }
+unsigned windows_crt_unicode_mask(char16_t value){return unicode_mask(value);}
 std::span<const WindowsServiceDescriptor> crt_character_service_descriptors(){
     static constexpr auto descriptors=[] {
         std::array<WindowsServiceDescriptor,character_services.size()> result{};

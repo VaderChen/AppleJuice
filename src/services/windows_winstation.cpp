@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/unicode.hpp"
+#include "service_callback_task.hpp"
 #include <algorithm>
 
 namespace x64arm {
@@ -12,7 +13,8 @@ std::span<const WindowsServiceDescriptor> winstation_service_descriptors(){
         {"user32.dll","OpenInputDesktop",3},{"user32.dll","CloseDesktop",1},{"user32.dll","GetThreadDesktop",1},{"user32.dll","SetThreadDesktop",1},{"user32.dll","SwitchDesktop",1},
         {"user32.dll","GetUserObjectInformationA",5},{"user32.dll","GetUserObjectInformationW",5},{"user32.dll","SetUserObjectInformationA",4},{"user32.dll","SetUserObjectInformationW",4},
         {"user32.dll","GetUserObjectSecurity",5},{"user32.dll","SetUserObjectSecurity",3},
-        {"user32.dll","AllowSetForegroundWindow",1},{"user32.dll","LockSetForegroundWindow",1},{"user32.dll","EnumDesktopWindows",3}
+        {"user32.dll","AllowSetForegroundWindow",1},{"user32.dll","LockSetForegroundWindow",1},{"user32.dll","EnumDesktopWindows",3},
+        {"user32.dll","EnumWindowStationsA",2},{"user32.dll","EnumWindowStationsW",2},{"user32.dll","EnumDesktopsA",3},{"user32.dll","EnumDesktopsW",3}
     };return table;
 }
 namespace {
@@ -54,7 +56,39 @@ void WindowsServices::show_native_window(std::uint64_t handle,bool visible,bool 
     if(shown && !activate)native_gui_->show_inactive(handle);else native_gui_->show(handle,shown);
 }
 std::optional<std::uint32_t> WindowsServices::invoke_winstation(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    initialize_user_objects();const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');
+    initialize_user_objects();
+    if(service.symbol.starts_with("EnumWindowStations") || service.symbol.starts_with("EnumDesktopsA") || service.symbol.starts_with("EnumDesktopsW")){
+        // EnumWindowStations(lpEnumFunc, lParam)／EnumDesktops(hwinsta, lpEnumFunc, lParam)：依名稱逐一呼叫回呼，回 FALSE 即停止；
+        // 回傳最後一個回呼的值。EnumDesktops 的 NULL 為程序的視窗站，需 WINSTA_ENUMDESKTOPS。A 版名稱沿用本檔 GetUserObjectInformationA 的轉換。
+        return nested_continuation(state,memory,"視窗站列舉",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);const auto finish=[&](std::uint64_t value){call.return_to(s,value);return std::optional<std::uint32_t>{};};
+            const bool desktops=service.symbol.starts_with("EnumDesktops"),wide=service.symbol.ends_with('W');
+            const auto callback=call(desktops?1:0),parameter=call(desktops?2:1);
+            if(!callback){last_error_=87;co_return finish(0);}
+            std::uint64_t station=0;
+            if(desktops){
+                const auto handle=gui_.user_handles.find(call(0)?call(0):gui_.station_handle);
+                if(handle==gui_.user_handles.end() || gui_.user_objects.at(handle->second.object).station!=0){last_error_=6;co_return finish(0);}
+                if(!(handle->second.access&1U)){last_error_=5;co_return finish(0);}
+                station=handle->second.object;
+            }
+            std::vector<std::u16string> names;
+            for(const auto& [id,object]:gui_.user_objects){(void)id;if(desktops?object.station==station:object.station==0)names.push_back(object.name);}
+            std::vector<std::uint64_t> blocks;
+            struct Release {WindowsServices& self;GuestMemory& m;GuestState& s;std::vector<std::uint64_t>& blocks;~Release(){for(const auto block:blocks)(void)self.free_heap(m,block,s);}} release{*this,m,s,blocks};
+            std::uint64_t result=1;
+            for(const auto& name:names){
+                std::vector<std::uint8_t> bytes;
+                if(wide)bytes=utf16_bytes(name);else{const auto ansi=utf16_to_utf8(name);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
+                const auto text=allocate_heap(m,bytes.size());if(!text){last_error_=8;co_return finish(0);}
+                blocks.push_back(text);m.write(GuestAddress{text},bytes);
+                result=static_cast<std::uint32_t>(co_await service_callback::call(callback,{text,parameter}));
+                if(!result)break;
+            }
+            co_return finish(result);
+        });
+    }
+    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');
     if(symbol=="GetUserObjectSecurity" || symbol=="SetUserObjectSecurity")return invoke_object_security(state,memory,service);
     std::uint64_t result=0;const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
     if((symbol.starts_with("CreateDesktop") || symbol=="SwitchDesktop") && (job_ui_restrictions()&0x40U)){fail(5);arg.return_to(state,result);return std::nullopt;}

@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/file_security.hpp"
 #include "x64arm/unicode.hpp"
+#include "volume_device_security.hpp"
 #include <cstdio>
 #include <cstdlib>
 
@@ -84,6 +85,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security_descriptor(
                    ((flags&0xa0000004U) && !(access&0x10040000U)))throw SecurityDescriptorError{5};
                 file=found->second.native?found->second.native:found->second.identity;
                 if(!file || found->second.pipe || found->second.serial || found->second.hid)throw SecurityDescriptorError{50};
+                if(file->volume_device())throw SecurityDescriptorError{5}; // 驅動的裝置存取政策不可透過根目錄 ACL 修改。
                 if((flags&0x20000004U) && !buffer) {
                     const auto final=filesystem_.final_path(*file,found->second.path);
                     if(final.error)throw SecurityDescriptorError{final.error};object_path=final.key;
@@ -236,21 +238,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_security_descriptor(
                 for (unsigned i=3;i<=7;++i) if (call(i)) memory.check(GuestAddress{call(i)},unit,Access::Write);
             }
             if (!runtime_.network.external_io) throw SecurityDescriptorError{50};
-            NativeFileSecurity native;
+            NativeFileSecurity native;bool volume_device=false;
             if (handle) {
                 const auto found=files_.find(call(0));
                 if (found==files_.end()) throw SecurityDescriptorError{6};
                 if (!(found->second.access&0xf0020000U)) throw SecurityDescriptorError{5}; // READ_CONTROL 或相應 generic access。
                 const auto file=found->second.native?found->second.native:found->second.identity;
                 if (!file || found->second.pipe || found->second.serial || found->second.hid) throw SecurityDescriptorError{50};
-                native=read_native_file_security(*file,flags&4U);
+                volume_device=file->volume_device();if(!volume_device)native=read_native_file_security(*file,flags&4U);
             } else {
                 if (!call(0)) throw SecurityDescriptorError{87};
                 const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{call(0)})):read_ansi(memory,call(0));
                 native=filesystem_.security_information(path,true);
                 (void)native_file_token_access(file_descriptor(native,0x17),0x20000U);
             }
-            const auto bytes=relative_descriptor(file_descriptor(native,flags));
+            const auto bytes=relative_descriptor(volume_device?detail::volume_device_security(flags):file_descriptor(native,flags));
             if (buffer) {
                 if (!call(2) || u32(3)<bytes.size()) {
                     memory.store(GuestAddress{call(4)},32,bytes.size()); throw SecurityDescriptorError{122};

@@ -70,11 +70,7 @@ void WindowsServices::discard_ole_drag(GuestState& state,GuestMemory& memory,std
     if(gui_.capture==op.capture && gui_.capture_generation==op.capture_generation){gui_.capture=0;++gui_.capture_generation;}
     if(op.default_cursor && gui_.cursor==op.default_cursor){
         gui_.cursor=op.original_cursor;
-        if(native_gui_ && interactive_station()){
-            const auto selected=gui_.icons.find(gui_.cursor);GuiIcon system;system.is_icon=false;
-            if(selected!=gui_.icons.end())(void)native_gui_->set_cursor(&selected->second,gui_.cursor_count>=0);
-            else {system.system=static_cast<std::uint32_t>(gui_.cursor-0xd000);(void)native_gui_->set_cursor(gui_.cursor?&system:nullptr,gui_.cursor_count>=0 && gui_.cursor!=0);}
-        }
+        present_gui_cursor();
     }
     if(gui_.windows.contains(op.capture))erase_window(op.capture);
     // 跨執行緒 callback 尚未開始時可取消；開始後保留 buffer 到接收者完成。

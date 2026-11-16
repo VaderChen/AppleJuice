@@ -9,6 +9,9 @@ std::span<const WindowsServiceDescriptor> winrt_service_descriptors(){
         {"combase.dll","WindowsCreateString",3},{"combase.dll","WindowsCreateStringReference",4},{"combase.dll","WindowsDeleteString",1},
         {"combase.dll","WindowsDuplicateString",2},{"combase.dll","WindowsGetStringLen",1},{"combase.dll","WindowsGetStringRawBuffer",2},
         {"combase.dll","WindowsIsStringEmpty",1},{"combase.dll","WindowsStringHasEmbeddedNull",2},{"combase.dll","WindowsCompareStringOrdinal",3},
+        {"combase.dll","WindowsConcatString",3},{"combase.dll","WindowsSubstring",3},{"combase.dll","WindowsSubstringWithSpecifiedLength",4},
+        {"combase.dll","WindowsTrimStringStart",3},{"combase.dll","WindowsTrimStringEnd",3},{"combase.dll","WindowsPreallocateStringBuffer",3},
+        {"combase.dll","WindowsPromoteStringBuffer",2},{"combase.dll","WindowsDeleteStringBuffer",1},
         {"combase.dll","RoRegisterActivationFactories",4},{"combase.dll","RoRevokeActivationFactories",1},
         {"combase.dll","RoRegisterForApartmentShutdown",3},{"combase.dll","RoUnregisterForApartmentShutdown",1},{"combase.dll","RoTransformError",3}
     };return table;
@@ -25,7 +28,7 @@ std::vector<GuestCallback> WindowsServices::retire_apartment_shutdowns(GuestMemo
     // apartment 結束時依登錄順序呼叫 IApartmentShutdown::OnUninitialize，再釋放參照。
     // STA 隨執行緒結束；MTA 在最後一個 MTA 執行緒離開時結束。apartment 為離開前的身分。
     std::vector<GuestCallback> callbacks;if(!apartment)return callbacks;
-    if(!*apartment && std::any_of(gui_.com_initializations.begin(),gui_.com_initializations.end(),[&](const auto& row){return row.first!=thread && row.second>=16 && !(row.second&2U);}))return callbacks;
+    if(!*apartment && mta_alive(thread))return callbacks;
     const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto method=[&](std::uint64_t object,unsigned slot){const auto table=memory.load(GuestAddress{object},bits);return memory.load(GuestAddress{table+std::uint64_t{slot}*unit},bits);};
     for(auto it=apartment_shutdowns_.begin();it!=apartment_shutdowns_.end();){
@@ -120,6 +123,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt(GuestState& state,Gue
                 memory.store(GuestAddress{arg(2)+4},32,length);memory.store(GuestAddress{arg(2)+8},bits,arg(0));memory.store(GuestAddress{output},bits,arg(2));
             }else {const auto handle=create(arg(0),length);memory.store(GuestAddress{output},bits,handle);}return done(0);
         }
+        if(name=="WindowsPreallocateStringBuffer"){
+            // 可寫緩衝與 HSTRING 同一配置；promote 前不是合法 HSTRING。長度 0 時回空字串且不配置。
+            if(!arg(1) || !arg(2))return done(pointer_error);
+            const auto length=static_cast<std::uint32_t>(arg(0));
+            memory.check(GuestAddress{arg(1)},bits/8,Access::Write);memory.check(GuestAddress{arg(2)},bits/8,Access::Write);
+            memory.store(GuestAddress{arg(1)},bits,0);memory.store(GuestAddress{arg(2)},bits,0);
+            if(!length){
+                if(!runtime_.winrt_empty_string){runtime_.winrt_empty_string=allocate_heap(memory,2);if(!runtime_.winrt_empty_string)throw std::bad_alloc();memory.store(GuestAddress{runtime_.winrt_empty_string},16,0);}
+                memory.store(GuestAddress{arg(1)},bits,runtime_.winrt_empty_string);return done(0);
+            }
+            const auto size=std::uint64_t{length}*2;if(size+26>memory.limit())return done(no_memory);
+            const auto handle=allocate_heap(memory,size+26);if(!handle)return done(no_memory);
+            memory.store(GuestAddress{handle+24+size},16,0);runtime_.winrt_strings.emplace(handle,WinrtString{handle+24,length,1,true});
+            memory.store(GuestAddress{arg(1)},bits,handle+24);memory.store(GuestAddress{arg(2)},bits,handle);return done(0);
+        }
         const auto value=winrt_string(memory,arg(0));
         if(name=="WindowsGetStringLen")return done(value.length);
         if(name=="WindowsIsStringEmpty")return done(value.length?0:1);
@@ -146,6 +164,59 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt(GuestState& state,Gue
         if(name=="WindowsStringHasEmbeddedNull"){
             if(!arg(1))return done(invalid);const auto data=winrt_content(memory,value);
             memory.store(GuestAddress{arg(1)},32,data.find(u'\0')!=data.npos);return done(0);
+        }
+        if(name=="WindowsPromoteStringBuffer" || name=="WindowsDeleteStringBuffer"){
+            const bool promote=name=="WindowsPromoteStringBuffer";
+            if(promote && !arg(1))return done(pointer_error);
+            if(promote)memory.store(GuestAddress{arg(1)},bits,0);
+            if(!arg(0))return done(0);
+            const auto found=runtime_.winrt_strings.find(arg(0));
+            if(found==runtime_.winrt_strings.end() || !found->second.buffer)return done(invalid);
+            if(!promote){runtime_.winrt_strings.erase(found);(void)free_heap(memory,arg(0),state);return done(0);}
+            // 呼叫者覆寫了結尾 NUL 時不可 promote（Windows 回 E_INVALIDARG，緩衝仍屬呼叫者）。
+            if(memory.load(GuestAddress{found->second.data+std::uint64_t{found->second.length}*2},16))return done(invalid);
+            found->second.buffer=false;memory.store(GuestAddress{arg(1)},bits,arg(0));return done(0);
+        }
+        if(name=="WindowsConcatString" || name=="WindowsSubstring" || name=="WindowsSubstringWithSpecifiedLength" || name=="WindowsTrimStringStart" || name=="WindowsTrimStringEnd"){
+            // 新字串一律另配置（不與來源共用），空結果為 NULL；未改變內容時沿用 Duplicate 的參照計數。
+            const bool concat=name=="WindowsConcatString",trim=name.starts_with("WindowsTrim"),sized=name.ends_with("Length");
+            const auto output=arg(sized?3:2);if(!output)return done(invalid);
+            memory.store(GuestAddress{output},bits,0);
+            const auto duplicate=[&](std::uint64_t source,const WinrtString& text)->std::uint32_t{
+                if(!text.length)return 0;
+                const auto owned=runtime_.winrt_strings.find(source);std::uint64_t handle=source;
+                if(owned!=runtime_.winrt_strings.end()){if(owned->second.references==UINT32_MAX)return no_memory;++owned->second.references;}
+                else handle=create(text.data,text.length);
+                memory.store(GuestAddress{output},bits,handle);return 0;
+            };
+            if(concat){
+                const auto other=winrt_string(memory,arg(1));
+                if(!value.length)return done(duplicate(arg(1),other));
+                if(!other.length)return done(duplicate(arg(0),value));
+                if(std::uint64_t{value.length}+other.length>UINT32_MAX)return done(0x80080011U); // MEM_E_INVALID_SIZE
+                const auto length=value.length+other.length;const auto size=std::uint64_t{length}*2;
+                if(size+26>memory.limit())return done(no_memory);
+                const auto handle=allocate_heap(memory,size+26);if(!handle)return done(no_memory);
+                memory.move(GuestAddress{handle+24},GuestAddress{value.data},std::uint64_t{value.length}*2);
+                memory.move(GuestAddress{handle+24+std::uint64_t{value.length}*2},GuestAddress{other.data},std::uint64_t{other.length}*2);
+                memory.store(GuestAddress{handle+24+size},16,0);runtime_.winrt_strings.emplace(handle,WinrtString{handle+24,length,1});
+                memory.store(GuestAddress{output},bits,handle);return done(0);
+            }
+            std::uint32_t start=0,count=value.length;
+            if(trim){
+                const auto set=winrt_content(memory,winrt_string(memory,arg(1)));if(set.empty())return done(invalid);
+                const auto text=winrt_content(memory,value);
+                if(name.ends_with("Start")){while(start<count && set.find(text[start])!=set.npos)++start;count-=start;}
+                else while(count && set.find(text[count-1])!=set.npos)--count;
+            }else {
+                start=static_cast<std::uint32_t>(arg(1));
+                if(start>value.length)return done(0x8000000bU); // E_BOUNDS
+                count=value.length-start;
+                if(sized){const auto wanted=static_cast<std::uint32_t>(arg(2));if(wanted>count)return done(0x8000000bU);count=wanted;}
+            }
+            if(!start && count==value.length)return done(duplicate(arg(0),value));
+            if(!count)return done(0);
+            memory.store(GuestAddress{output},bits,create(value.data+std::uint64_t{start}*2,count));return done(0);
         }
         if(name=="WindowsCompareStringOrdinal"){
             if(!arg(2))return done(invalid);const auto a=winrt_content(memory,value),b=winrt_content(memory,winrt_string(memory,arg(1)));

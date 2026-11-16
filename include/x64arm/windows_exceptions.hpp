@@ -31,6 +31,8 @@ struct ExceptionDispatch {
     GuestState original, walk, target_context;
     std::uint32_t code{}, flags{};
     std::uint64_t record{}, context{}, pointers{}, dispatcher{}, walk_context{};
+    // x64 核心至使用者模式的例外框架；非零時先經 ntdll 客體入口，再接共用 VEH／SEH。
+    std::uint64_t native_stack{}, native_entry{};
     std::vector<std::uint64_t> vectors;
     std::vector<ExceptionWalkFrame> frames;
     std::vector<SehScope> scopes;

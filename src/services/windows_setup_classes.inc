@@ -1,7 +1,7 @@
 // 類別盤點、名稱／GUID 查詢及 registry handle 共用實際 devnode 與安裝類別資料。
 const bool open=name.starts_with("SetupDiOpenClassRegKey"),build=name.starts_with("SetupDiBuildClassInfoList");
-const bool names=name.starts_with("SetupDiClassGuidsFromName"),extended=name.find("Ex")!=name.npos;
-const auto failed_class=[&](std::uint32_t error){last_error_=error;return finish(open?(x86_?UINT32_MAX:UINT64_MAX):0);};
+const bool names=name.starts_with("SetupDiClassGuidsFromName"),extended=!name.starts_with("CM_") && name.find("Ex")!=name.npos;
+const auto failed_class=[&](std::uint32_t error){if(name.starts_with("CM_"))return finish(error==8?2U:29U);last_error_=error;return finish(open?(x86_?UINT32_MAX:UINT64_MAX):0);};
 const auto number=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
 if(extended){
     const auto machine_index=open?3U:4U,reserved_index=open?4U:5U;
@@ -36,6 +36,9 @@ if(changed){
     if(registry.bytes>output_limit || registry.values>4096 || registry.keys.size()>4096){registry=before;return failed_class(8);}
     for(const auto& base:{root,interface_root})for(std::size_t end=1;;){registry.keys.try_emplace(base.substr(0,end));end=base.find(u'\\',end+1);if(end==base.npos){registry.keys.try_emplace(base);break;}}
     if(const auto error=transaction.commit();error){registry=before;return failed_class(error);}
+}
+if(name.starts_with("CM_")){
+#include "windows_cm_classes.inc"
 }
 if(open){
     const auto access=number(1);if((access&0x300U)==0x300U || (access&~0x20f033fU))return failed_class(87);

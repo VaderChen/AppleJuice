@@ -1,15 +1,8 @@
         // 檔案、記憶體與 PE 資源共用相同影像解碼及沙箱路徑規則。
         const auto load_d3dx_image=[&](unsigned index,bool resource,bool from_memory){
             std::vector<std::uint8_t> bytes;
-            if(resource){
-                require(arg(index+1));
-                auto found=gui_resource(memory,arg(index),arg(index+1),10,symbol.ends_with('W'));
-                if(!found)found=gui_resource(memory,arg(index),arg(index+1),2,symbol.ends_with('W'));
-                require(found!=0,0x80070716U);
-                const auto size=memory.load(GuestAddress{found+4},32);require(size && size<=512U*1024U*1024U);
-                const auto* owner=resource_image(found,true);require(owner!=nullptr);
-                bytes=read(owner->base+memory.load(GuestAddress{found},32),size);
-            }else if(from_memory){
+            if(resource)bytes=d3dx_resource_bytes(arg(index),arg(index+1),0,symbol.ends_with('W'));
+            else if(from_memory){
                 require(arg(index) && u(index+1) && u(index+1)<=512U*1024U*1024U);
                 bytes=read(arg(index),u(index+1));
             }else{

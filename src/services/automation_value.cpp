@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <memory>
+#include <tuple>
 #include <stdexcept>
 #include <locale.h>
 
@@ -128,9 +129,15 @@ std::uint32_t encode_number(const Number& n,unsigned target,Value& output,
         const auto magnitude=u64(coefficient.get());put(output,8,bits/8,n.negative?UINT64_C(0)-magnitude:magnitude);return 0;
 }
 }
+std::string number_string(const Value&);
 std::uint32_t number_convert(const Value& source,std::string_view decimal,std::uint16_t target,Value& output){
     try{
-        const auto n=number(source,decimal);const auto from=get(source,0,2);
+        const auto from=get(source,0,2);
+        // 浮點轉 DECIMAL 先取有效位數（R4 7 位、R8／DATE 15 位）再精確轉換，0.1 得到 0.1 而不是二進位展開值。
+        auto n=[&]{
+            if(target!=14 || (from!=4 && from!=5 && from!=7))return number(source,decimal);
+            Value floating=source;if(from==7)put(floating,0,2,5);return from_decimal(number_string(floating));
+        }();
         const bool minus_zero=BN_is_zero(n.numerator.get()) && ((from==4 && (get(source,8,4)>>31)) || ((from==5 || from==7) && (get(source,8,8)>>63)) || (from==8 && !decimal.empty() && decimal.front()=='-'));
         return encode_number(n,target,output,minus_zero,from==11);
     }catch(const std::invalid_argument&){return mismatch;}catch(const std::range_error&){return overflow;}catch(const std::bad_alloc&){return nomemory;}
@@ -161,5 +168,39 @@ std::optional<double> date_value(std::array<unsigned,8> fields){
 }
 std::u16string bool_string(bool b,std::uint32_t lcid,bool local){
     if(local)switch(lcid&0x3ffU){case 7:return b?u"Wahr":u"Falsch";case 12:return b?u"Vrai":u"Faux";case 10:return b?u"Verdadero":u"Falso";case 16:return b?u"Vero":u"Falso";case 22:return b?u"Verdadeiro":u"Falso";case 19:return b?u"Waar":u"Onwaar";case 29:return b?u"Sant":u"Falskt";default:break;}return b?u"True":u"False";
+}
+std::pair<std::uint16_t,unsigned> scalar_type(std::string_view name){
+    static constexpr std::array<std::tuple<std::string_view,std::uint16_t,unsigned>,14> types{{
+        {"I1",16,1},{"I2",2,2},{"I4",3,4},{"I8",20,8},
+        {"UI1",17,1},{"UI2",18,2},{"UI4",19,4},{"UI8",21,8},
+        {"R4",4,4},{"R8",5,8},{"Cy",6,8},{"Date",7,8},{"Bool",11,2},{"Dec",14,16}}};
+    for(const auto& [label,type,size]:types)if(name==label)return {type,size};return {};
+}
+std::uint32_t number_rounding(Rounding kind,const Value& source,int decimals,Value& output){
+    try{
+        const auto t=static_cast<unsigned>(get(source,0,2));
+        if(kind==Rounding::Round && decimals<0)return invalid;
+        const bool floating_type=t==4 || t==5 || t==7;
+        if(kind==Rounding::Abs){
+            // 浮點只清符號位元、DECIMAL 只清符號位元組，保留原值與 scale。
+            if(floating_type){output=source;const auto bytes=t==4?4U:8U;put(output,8,bytes,get(source,8,bytes)&~(UINT64_C(1)<<(bytes*8-1)));return 0;}
+            if(t==14){output=source;output[3]=0;return 0;}
+            auto n=number(source);n.negative=false;unsigned target=t==0 || t==11?2:t;
+            for(;;){const auto status=encode_number(n,target,output);const auto next=promote_result(target);if(status!=overflow || next==target)return status;target=next;}
+        }
+        if(t==0 || t==11){Value integer{};const auto status=number_convert(source,{},2,integer);if(status)return status;output=integer;return 0;}
+        if(!floating_type && t!=6 && t!=14){(void)number(source);output=source;return 0;}
+        const unsigned scale=kind==Rounding::Round?static_cast<unsigned>(decimals):0U;
+        // 已在要求精度內：CY 固定 4 位、DECIMAL 依自身 scale、浮點最多約 1100 位十進位小數。
+        if((t==6 && scale>=4) || (t==14 && scale>=source[2]) || (floating_type && scale>=1100)){output=source;return 0;}
+        const auto n=number(source);Number result;auto ctx=context();
+        if(kind==Rounding::Round)result.numerator=rounded(n,scale);
+        else {
+            auto remainder=big();checked(BN_div(result.numerator.get(),remainder.get(),n.numerator.get(),n.denominator.get(),ctx.get()));
+            if(kind==Rounding::Int && n.negative && !BN_is_zero(remainder.get()))checked(BN_add_word(result.numerator.get(),1));
+        }
+        result.denominator=power(scale);result.negative=n.negative && !BN_is_zero(result.numerator.get());
+        return encode_number(result,t,output,false,false,t==14?scale:0U);
+    }catch(const std::invalid_argument&){return mismatch;}catch(const std::range_error&){return overflow;}catch(const std::bad_alloc&){return nomemory;}
 }
 }

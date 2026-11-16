@@ -57,6 +57,7 @@ std::optional<std::uint32_t> WindowsServices::resume_storage(GuestState& state,G
             catch(...){const auto objects=bridge.objects;for(const auto& [handle,value]:objects)if(value.view==view_id){bridge.objects.erase(handle);(void)free_heap(memory,handle,state);}bridge.views.erase(view_id);bridge.documents.erase(document_id);operation.status=storage::no_memory;}
         }
         if(operation.held)callbacks.push_back({storage::method(memory,operation.backend,2),{operation.backend}});
+        if(operation.release_backend)callbacks.push_back({storage::method(memory,operation.backend,2),{operation.backend}});
         if(operation.scratch)(void)free_heap(memory,operation.scratch,state);if(operation.buffer)(void)free_heap(memory,operation.buffer,state);
         const auto result=operation.status?operation.status:operation.success;
         if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,result);return std::optional<std::uint32_t>{};}complete_call(state,memory,result);return std::optional<std::uint32_t>{};

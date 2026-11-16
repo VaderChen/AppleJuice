@@ -9,7 +9,7 @@ class SharedFileState : public std::enable_shared_from_this<SharedFileState> {
     void release(std::uint64_t);
 public:
     ~SharedFileState();
-    static std::pair<std::shared_ptr<SharedFileState>,std::uint32_t> open(const std::string&,const FileMetadata&,bool create);
+    static std::pair<std::shared_ptr<SharedFileState>,std::uint32_t> open(const std::string&,const FileMetadata&,bool create,bool volume_device=false);
     std::uint32_t sharing(std::uint32_t,std::uint32_t,std::uint64_t ignore=0,bool allow_pending=false);
     bool pending();
     std::pair<std::shared_ptr<SharedFileLease>,std::uint32_t> acquire(std::uint64_t,std::uint32_t,std::uint32_t,bool existing=false,std::uint32_t close_target=0);

@@ -80,6 +80,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_demangle(GuestState& state,
         for(const auto block:blocks)if(!free_heap(memory,block,state))throw HostCallFault("CRT 舊型別名稱釋放失敗");
         return done(0);
     }
+    if(name.starts_with("?name@type_info@@") || name.starts_with("?_name_internal_method@type_info@@")) {
+        // VC6～VC12 type_info：{vptr, 反修飾名稱快取, 修飾名稱}。name() 第一次呼叫時反修飾並快取；name(__type_info_node*) 另把配置
+        // 掛在模組的 {名稱配置, 下一節點} 清單（根節點之後），由 __clean_type_info_names_internal 釋放。
+        // crt 家族描述元預設由呼叫端清理；thiscall 成員改以被呼叫端清理的成員規格取參數與返回。
+        const unsigned explicit_arguments=name.ends_with("XZ")?0U:1U;const WindowsCall member(state,memory,explicit_arguments+(x86_?0U:1U));
+        const auto finish=[&](std::uint64_t result)->std::optional<std::uint32_t>{member.return_to(state,result);return std::nullopt;};
+        const auto self=x86_?state.reg(Gpr::Rcx)&UINT32_MAX:member(0);const auto node=explicit_arguments?member(x86_?0U:1U):0;
+        memory.check(GuestAddress{self},2*unit,Access::Write);
+        if(const auto cached=memory.load(GuestAddress{offset(self,unit)},bits))return finish(cached);
+        const auto raw=read_ansi(memory,offset(self,2*unit),microsoft_name_limit);
+        const auto parsed=demangle_microsoft_name(raw.empty()?std::string_view{}:std::string_view(raw).substr(1),0x2800,true);
+        if(!parsed)return finish(0);
+        auto value=*parsed;while(!value.empty() && value.back()==' ')value.pop_back();
+        const auto bytes=terminated(value);const auto allocation=allocate_heap(memory,bytes.size());if(!allocation)return finish(0);
+        try{
+            memory.write(GuestAddress{allocation},bytes);
+            if(node){memory.check(GuestAddress{node},2*unit,Access::Write);const auto entry=allocate_heap(memory,2*unit);if(!entry)throw std::bad_alloc{};
+                memory.store(GuestAddress{entry},bits,allocation);memory.store(GuestAddress{offset(entry,unit)},bits,memory.load(GuestAddress{offset(node,unit)},bits));memory.store(GuestAddress{offset(node,unit)},bits,entry);}
+        }catch(...){(void)free_heap(memory,allocation,state);throw;}
+        memory.store(GuestAddress{offset(self,unit)},bits,allocation);return finish(allocation);
+    }
     if(name.starts_with("__std_type_info_")) {
         if(name=="__std_type_info_destroy_list") {
             const auto root=call(0);slist::check(memory,root,x86_,Access::Write);

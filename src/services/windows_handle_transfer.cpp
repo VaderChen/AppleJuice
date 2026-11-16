@@ -1,3 +1,4 @@
+#include "system_object_identity.hpp"
 #include "unix_socket_endpoint.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/startup_profile.hpp"
@@ -48,6 +49,19 @@ struct TransferMessage {
     std::uint32_t kind{},sender{},error{},type{},access{},flags{},mode{},pipe_mode{},options{},reserved{};
     std::array<std::uint64_t,5> accounting{};
 };
+// 有界診斷只記錄通道生命週期，不輸出客體資料或改變請求期限。
+void trace_process_request(const char* phase,std::uint32_t pid,std::uint32_t peer,
+                           const TransferMessage& packet,std::uint32_t error=0){
+    static const bool enabled=std::getenv("X64ARM_TRACE_PROCESS_REQUESTS")!=nullptr;
+    if(!enabled)return;
+    static std::atomic<unsigned> emitted{};
+    if(emitted.fetch_add(1,std::memory_order_relaxed)>=512)return;
+    const auto now=std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::fprintf(stderr,"[process_request] us=%lld phase=%s pid=%u peer=%u kind=%u operation=%u sequence=%llu error=%u\n",
+        static_cast<long long>(now),phase,pid,peer,packet.kind,packet.options,
+        static_cast<unsigned long long>(packet.sequence),error);
+}
 using TransferKey=std::pair<std::uint32_t,std::uint64_t>;
 constexpr std::uint32_t family_request_kind=21,family_cancel_kind=22,family_protocol=0x31435052U;
 constexpr std::uint32_t duplicate_protocol=0x31505544U;
@@ -215,12 +229,24 @@ bool WindowsServices::remote_process_available(std::uint32_t pid) const {
 #endif
 }
 std::uint32_t WindowsServices::export_transfer_handle(std::uint64_t handle,InheritedHandle& item){
+    // 本地物件第一次轉成共享 backing 時，保留已由快照公開的 Object 身分。
+    // 沒有人查詢過物件身分時，不為一般 handle 傳輸新增 journal 工作。
+    std::uint32_t identity=0;
+    const bool observed=std::filesystem::exists(std::filesystem::path(mapping_session())/"system-object-identities");
+    if(observed){detail::SystemObjectIdentities ids(mapping_session());if(ids.error())return ids.error();identity=ids.find(system_object_key(handle));}
+    const auto error=export_transfer_handle_impl(handle,item);if(error || !identity)return error;
+    detail::SystemObjectIdentities ids(mapping_session());(void)ids.resolve(system_object_key(handle),identity);return ids.error();
+}
+std::uint32_t WindowsServices::export_transfer_handle_impl(std::uint64_t handle,InheritedHandle& item){
     item.handle=handle;item.flags=runtime_.handle_flags[handle];
     if(handle>=0x100 && handle<=0x102 && standard_open_[handle-0x100]){
         const auto stream=static_cast<unsigned>(handle-0x100);
         if(live_stdio_[stream]<0)return 50;
         item.type=8;item.auxiliary=stream;item.access=stream?0x40000000U:0x80000000U;
         item.descriptor=live_stdio_[stream];item.lifetime=inherited_stdio_[stream];return 0;
+    }
+    if(const auto directory=runtime_.object_directories.find(handle);directory!=runtime_.object_directories.end()){
+        item.type=11;item.access=directory->second.access;item.descriptor=directory->second.object->descriptor();item.lifetime=directory->second.object;return 0;
     }
     if(const auto file=files_.find(handle);file!=files_.end()){
         if(!file->second.pipe){
@@ -230,7 +256,9 @@ std::uint32_t WindowsServices::export_transfer_handle(std::uint64_t handle,Inher
             const auto details=source.native->information();if(details.error)return details.error;
             auto& position=runtime_.win_file_positions.at(source.object);
             const auto session=mapping_session();if(const auto error=filesystem_.publish_shared_file(*source.native))return error;
-            const FileTransferMetadata metadata{details.metadata.device,details.metadata.id,source.access,source.sharing,source.mode,!source.native->security_writable(),source.path,source.native->transfer_identity(),source.manage_volume_at_open};
+            const auto storage=source.native->storage_information();if(storage.error)return storage.error;
+            auto transfer_path=source.path;if(source.native->named_stream()){const auto current=filesystem_.final_path(*source.native,source.path);if(current.error)return current.error;transfer_path=current.key;}
+            const FileTransferMetadata metadata{storage.metadata.device,storage.metadata.id,source.access,source.sharing,source.mode,source.native->named_stream()?false:!source.native->security_writable(),transfer_path,source.native->transfer_identity(),source.manage_volume_at_open,source.native->volume_device()?source.native->volume_id():char{0}};
             const auto identity=(static_cast<std::uint64_t>(process_id())<<32)|source.object;
             if(const auto error=position.publish(session,identity,metadata))return error;
             item.type=6;item.access=source.access;item.mode=source.mode;item.pipe_mode=source.sharing;item.auxiliary=position.identity();item.descriptor=source.native->transfer_descriptor();
@@ -246,6 +274,7 @@ std::uint32_t WindowsServices::export_transfer_handle(std::uint64_t handle,Inher
     if(export_mapping_handle(handle,item) || export_job_handle(handle,item) || export_process_handle(handle,item))return 0;
     if(const auto found=runtime_.wait_objects.find(handle);found!=runtime_.wait_objects.end()){
         auto& event=found->second;
+        if(event.shared_event && event.shared_event->exclusive())return 5;
         if(event.kind==WaitObject::Kind::Semaphore){
             auto& signal=runtime_.wait_state(event);
             if(!signal.shared_event){
@@ -283,6 +312,10 @@ void WindowsServices::import_transfer_handle(const InheritedHandle& item){
         try{if(item.access&~0xf01ffU)throw SecurityDescriptorError{5};const auto id=attach_shared_token(SharedToken::inherit(item.descriptor));runtime_.token_handles.emplace(item.handle,item.access);runtime_.token_handle_objects.emplace(item.handle,id);}
         catch(const SecurityDescriptorError&){throw HostCallFault("傳輸權杖物件無效");}
     }
+    else if(item.type==11){
+        try{auto object=ObjectDirectory::inherit(mapping_session(),item.descriptor);if(item.access&~0xf000fU)throw SecurityDescriptorError{5};runtime_.object_directories.emplace(item.handle,ObjectDirectoryHandle{std::move(object),item.access});}
+        catch(const SecurityDescriptorError&){throw HostCallFault("傳輸物件目錄無效");}
+    }
     else if(item.type==10){
         const auto opened=inherit_shared_semaphore(mapping_session(),item.descriptor);if(opened.error)throw HostCallFault("無法接收傳輸 semaphore");
         if(item.access&~0x1f0003U)throw HostCallFault("傳輸 semaphore 權限無效");
@@ -296,9 +329,10 @@ void WindowsServices::import_transfer_handle(const InheritedHandle& item){
 #endif
         FileTransferMetadata metadata;auto [position,error]=FilePosition::inherit(mapping_session(),item.auxiliary,item.descriptor,metadata);
         if(error || (transfer_access(item.type,item.access)&~transfer_access(item.type,metadata.access)) || item.mode!=metadata.mode || item.pipe_mode!=metadata.sharing)throw HostCallFault("繼承檔案能力紀錄無效");
-        auto opened=filesystem_.inherit_host(item.descriptor,item.access,metadata.sharing,metadata.readonly,metadata.object);
+        auto opened=filesystem_.inherit_host(item.descriptor,item.access,metadata.sharing,metadata.readonly,metadata.object,metadata.volume_device,metadata.path);
         if(opened.error)throw HostCallFault("無法匯入原生檔案："+std::to_string(opened.error));
         FileHandle file;file.object=item.handle;file.native=std::move(opened.file);file.metadata=opened.metadata;file.access=item.access;file.sharing=metadata.sharing;file.mode=item.mode;file.path=std::move(metadata.path);file.key=file.path;file.bytes=std::make_shared<const std::vector<std::uint8_t>>();
+        if(file.native->volume_device())file.metadata.attributes=0x80;
         file.manage_volume_at_open=metadata.manage_volume_at_open;
         runtime_.win_file_positions.emplace(item.handle,std::move(position));try{files_.emplace(item.handle,std::move(file));}catch(...){runtime_.win_file_positions.erase(item.handle);throw;}
     }else if(item.type==1){
@@ -335,7 +369,8 @@ void WindowsServices::close_transfer_handle(GuestMemory& memory,std::uint64_t ha
         release(runtime_.standard_input);for(auto& stream:runtime_.standard_output)release(stream);
         for(auto& [pointer,stream]:runtime_.streams){(void)pointer;release(stream);}
         if(std::none_of(files_.begin(),files_.end(),[&](const auto& entry){return entry.second.object==object;}))runtime_.win_file_positions.erase(object);
-    }else if(close_bluetooth(handle)){}
+    }else if(runtime_.object_directories.erase(handle)){}
+    else if(close_bluetooth(handle)){}
     else if(runtime_.token_handles.erase(handle)){runtime_.token_handle_objects.erase(handle);collect_tokens();}
     else if(!close_mapping(handle) && !close_job(handle) && !close_process(handle))(void)close_wait_object(handle);
     runtime_.handle_flags.erase(handle);
@@ -522,11 +557,12 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
             (void)send_transfer(transfer.descriptor,path,reply);
         }
         else if(packet.kind==14 || packet.kind==15 || packet.kind==19){
+            trace_process_request("receive",process_id(),packet.sender,packet);
             reply.accounting=packet.accounting;reply.mode=packet.mode;
             // 每次請求仍核對建立時間，避免舊 handle 因 PID 重用操作另一程序。
             if(!packet.auxiliary || packet.auxiliary!=process_identity_birth())reply.error=87;
             else {
-                const bool needs_file=packet.kind==14?(packet.options==6 || packet.options==7 || packet.options==8 || packet.options==9 || packet.options==12):packet.kind==15 && (packet.options<=1 || packet.options==9);
+                const bool needs_file=packet.kind==14?(packet.options==6 || packet.options==7 || packet.options==8 || packet.options==9 || packet.options==12 || packet.options==13 || packet.options==14):packet.kind==15 && (packet.options<=1 || packet.options==9 || packet.options==10 || packet.options==13);
                 struct stat info{};const auto size=packet.kind==14?UINT64_C(65534):packet.options==9?UINT64_C(24):packet.accounting[1];
                 if(needs_file && (descriptor<0 || size>static_cast<std::uint64_t>(INT64_MAX) || ::fstat(descriptor,&info) || !S_ISREG(info.st_mode) || info.st_uid!=::geteuid() || (info.st_mode&077) || info.st_nlink || info.st_size<0 || static_cast<std::uint64_t>(info.st_size)!=size))reply.error=13;
                 else if(packet.kind==19){
@@ -538,7 +574,8 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
                         reply.accounting[0]=snapshot_data.size();reply.mode=x86_?32U:64U;}
                 }else reply.error=packet.kind==14?local_process_information(packet.options,reply.accounting,reply.mode,descriptor):local_memory_operation(memory,packet.options,reply.accounting,descriptor);
             }
-            (void)send_transfer(transfer.descriptor,path,reply);
+            const auto error=send_transfer(transfer.descriptor,path,reply);
+            trace_process_request("respond",process_id(),packet.sender,packet,error?static_cast<std::uint32_t>(error):reply.error);
         }
         else if(packet.kind==9){auto value=static_cast<std::uint32_t>(packet.handle);reply.error=local_process_priority_operation(packet.options,value);reply.handle=value;(void)send_transfer(transfer.descriptor,path,reply);}
         else if(packet.kind==18){
@@ -563,7 +600,7 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
             (void)send_transfer(transfer.descriptor,path,reply);
         }
         else if(packet.kind==1){
-            if(descriptor<0 || packet.type<1 || (packet.type>7 && packet.type!=9 && packet.type!=10) || packet.flags&~1U)reply.error=87;
+            if(descriptor<0 || packet.type<1 || (packet.type>7 && packet.type!=9 && packet.type!=10 && packet.type!=11) || packet.flags&~1U)reply.error=87;
             else if(transfer.imports.size()>=1024 || !file_table_has_room(files_.size()+runtime_.wait_objects.size()))reply.error=8;
             else {
                 item.handle=runtime_.allocate_wait_handle();item.type=packet.type;item.access=packet.access;item.flags=packet.flags;item.mode=packet.mode;item.pipe_mode=packet.pipe_mode;item.auxiliary=packet.auxiliary;item.descriptor=descriptor;descriptor=-1;
@@ -575,7 +612,8 @@ void WindowsServices::poll_handle_transfers(GuestMemory& memory,bool force){
             if(!reply.error && (packet.options&~3U))reply.error=87;
             if(!reply.error && ((packet.options&1U) && (item.flags&2U)))reply.error=5;
             if(!reply.error && !(packet.options&2U)){
-                if(item.type==3 || item.type==5){try{initialize_tokens();const auto all=item.type==5?0x1f0001U:0x1f0003U;const security::AccessMapping mapping{0x20001U,item.type==5?0x20001U:0x20002U,0x120000U,all};item.access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(shared_object_security(item.descriptor)),item.access,packet.access,mapping);}catch(const SecurityDescriptorError& failure){reply.error=failure.code;}}
+                if(item.type==11){try{initialize_tokens();item.access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(shared_object_security(item.descriptor)),item.access,packet.access,{0x20001U,0x2000cU,0x20002U,0xf000fU});}catch(const SecurityDescriptorError& failure){reply.error=failure.code;}}
+                else if(item.type==3 || item.type==5){try{initialize_tokens();const auto all=item.type==5?0x1f0001U:0x1f0003U;const security::AccessMapping mapping{0x20001U,item.type==5?0x20001U:0x20002U,0x120000U,all};item.access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(shared_object_security(item.descriptor)),item.access,packet.access,mapping);}catch(const SecurityDescriptorError& failure){reply.error=failure.code;}}
                 else {const auto requested=transfer_access(item.type,packet.access);if(requested&~transfer_access(item.type,item.access))reply.error=5;else item.access=requested;}
             }
             if(!reply.error && item.type==3 && item.auxiliary && (item.access&~0x100001U))reply.error=5;
@@ -629,12 +667,13 @@ std::uint32_t WindowsServices::remote_process_request(GuestMemory& memory,std::u
 #if !defined(_WIN32)
     if(!runtime_.network.external_io || !handle_transfers_ || !pid || !birth)return 50;auto& transfer=*handle_transfers_;
     TransferMessage request;request.kind=kind;request.sender=process_id();request.sequence=transfer.next_sequence++;request.options=operation;request.auxiliary=birth;request.accounting=values;request.mode=mode;
+    trace_process_request("begin",process_id(),pid,request);
     const auto path=endpoint(transfer.directory,pid);const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);bool sent=false;
     for(;;){
         if(!sent){const auto error=send_transfer(transfer.descriptor,path,request,descriptor);if(!error)sent=true;else if(error!=EAGAIN && error!=ENOBUFS && error!=ENOENT && error!=ECONNREFUSED)return 50;}
         poll_handle_transfers(memory,true);const auto found=transfer.replies.find({pid,request.sequence});
-        if(found!=transfer.replies.end()){auto reply=found->second;transfer.replies.erase(found);if(reply.descriptor>=0)::close(reply.descriptor);values=reply.message.accounting;mode=reply.message.mode;return reply.message.error;}
-        if(!remote_process_available(pid))return 87;if(std::chrono::steady_clock::now()>=deadline)return 121;
+        if(found!=transfer.replies.end()){auto reply=found->second;transfer.replies.erase(found);if(reply.descriptor>=0)::close(reply.descriptor);values=reply.message.accounting;mode=reply.message.mode;trace_process_request("complete",process_id(),pid,request,reply.message.error);return reply.message.error;}
+        if(!remote_process_available(pid))return 87;if(std::chrono::steady_clock::now()>=deadline){trace_process_request(sent?"reply_timeout":"send_timeout",process_id(),pid,request,121);return 121;}
         pollfd waiting{transfer.descriptor,POLLIN,0};(void)::poll(&waiting,1,1);
     }
 #else
@@ -1079,7 +1118,8 @@ std::optional<std::uint32_t> WindowsServices::duplicate_remote_handle(GuestState
                 auto& item=op->item;error=export_transfer_handle(arg(1),item);
                 if(!error && (arg(6)&1U) && (item.flags&2U))error=5;
                 if(!error && !(arg(6)&2U)){
-                    if(item.type==3 || item.type==5){try{initialize_tokens();const auto all=item.type==5?0x1f0001U:0x1f0003U;const security::AccessMapping mapping{0x20001U,item.type==5?0x20001U:0x20002U,0x120000U,all};item.access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(shared_object_security(item.descriptor)),item.access,static_cast<std::uint32_t>(arg(4)),mapping);}catch(const SecurityDescriptorError& failure){error=failure.code;}}
+                    if(item.type==11){try{initialize_tokens();item.access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(shared_object_security(item.descriptor)),item.access,static_cast<std::uint32_t>(arg(4)),{0x20001U,0x2000cU,0x20002U,0xf000fU});}catch(const SecurityDescriptorError& failure){error=failure.code;}}
+                    else if(item.type==3 || item.type==5){try{initialize_tokens();const auto all=item.type==5?0x1f0001U:0x1f0003U;const security::AccessMapping mapping{0x20001U,item.type==5?0x20001U:0x20002U,0x120000U,all};item.access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(shared_object_security(item.descriptor)),item.access,static_cast<std::uint32_t>(arg(4)),mapping);}catch(const SecurityDescriptorError& failure){error=failure.code;}}
                     else {const auto requested=transfer_access(item.type,static_cast<std::uint32_t>(arg(4)));if(requested&~transfer_access(item.type,item.access))error=5;else item.access=requested;}
                 }
                 if(!error && item.type==3 && item.auxiliary && (item.access&~0x100001U))error=5;

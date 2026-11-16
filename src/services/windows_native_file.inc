@@ -56,8 +56,8 @@ std::pair<std::uint64_t,bool> WindowsServices::native_file_entry(GuestMemory& me
         if(service==stack_sizes.end())throw HostCallFault("缺少 Native 檔案入口描述元");
         stack_bytes=service->second;
     }
-    const auto expected=detail::nt_service_entry(x86_,static_cast<std::uint32_t>((gateway-stub_base_.value)/16+1),stack_bytes,callback_return_.value+0xf8);
-    std::array<std::uint8_t,16> actual{};
+    const auto expected=detail::nt_service_entry(x86_,builtin_system_calls().at(gateway),stack_bytes,callback_return_.value+0xf8);
+    std::vector<std::uint8_t> actual(expected.size());
     memory.read(GuestAddress{target},actual);return {target,actual!=expected};
 }
 
@@ -374,6 +374,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_close(GuestState& entr
         else if (close_process(handle)) returned = 1;
         else if (close_wait_packet(memory,handle) || close_completion_port(memory,handle)) returned = 1;
         else if (runtime_.process_snapshots.erase(handle)) returned = 1;
+        else if (runtime_.object_directories.erase(handle)) returned = 1;
         else if (close_wait_object(handle)) returned=1;
         else if (runtime_.process_thread_handles.erase(handle)) {runtime_.thread_handle_access.erase(handle);returned = 1;}
         else if (runtime_.token_handles.erase(handle)) {runtime_.token_handle_objects.erase(handle);collect_tokens();returned = 1;}
@@ -413,7 +414,7 @@ std::optional<std::uint64_t> WindowsServices::invoke_native_file_information(Gue
     std::uint32_t native_class=type?4U:time?4U:full?18U:5U,minimum=0;
     if(extended)switch(kind){
         case 0:native_class=4;minimum=40;break;case 1:native_class=5;minimum=24;break;
-        case 2:native_class=9;minimum=4;break;case 9:native_class=35;minimum=8;break;
+        case 2:native_class=9;minimum=4;break;case 7:native_class=22;minimum=32;break;case 9:native_class=35;minimum=8;break;
         case 10:case 11:native_class=37;minimum=104;break;case 14:case 15:native_class=2;minimum=68;break;
         case 18:native_class=59;minimum=24;break;default:co_return fail(87);
     }

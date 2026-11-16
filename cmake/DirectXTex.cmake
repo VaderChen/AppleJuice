@@ -20,7 +20,7 @@ foreach(unit BC BC4BC5 BC6HBC7 DirectXTexCompress DirectXTexConvert DirectXTexDD
 endforeach()
 add_library(x64arm_directxtex STATIC ${X64ARM_DIRECTXTEX_SOURCES})
 target_sources(x64arm_directxtex PRIVATE "${directxmath_SOURCE_DIR}/SHMath/DirectXSH.cpp")
-target_sources(x64arm_directxtex PRIVATE "${PROJECT_SOURCE_DIR}/src/services/d3dx_sh.cpp")
+target_sources(x64arm_directxtex PRIVATE "${PROJECT_SOURCE_DIR}/src/services/d3dx_sh.cpp" "${PROJECT_SOURCE_DIR}/src/services/d3dx_math_native.cpp")
 target_compile_features(x64arm_directxtex PUBLIC cxx_std_17)
 target_compile_definitions(x64arm_directxtex PUBLIC USING_DIRECTX_HEADERS)
 target_include_directories(x64arm_directxtex SYSTEM PUBLIC

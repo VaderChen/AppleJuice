@@ -136,6 +136,15 @@ Ellipsis ellipsize(std::u16string_view text,int available,unsigned flags,const M
 }
 }
 
+std::u16string WindowsServices::compact_path_text(std::u16string_view path,std::int32_t available,const std::function<std::int32_t(std::u16string_view)>& measure){
+    return ellipsize(path,available,path_ellipsis,measure).text;
+}
+std::pair<std::u16string,bool> WindowsServices::compact_path_for_dc(std::uint64_t hdc,std::u16string_view path,std::int32_t width){
+    const auto context=gui_.contexts.find(hdc);const auto font=gui_font(gui_,context==gui_.contexts.end()?0xb011:context->second.font);
+    const auto metrics=native_gui_?native_gui_->font_metrics(font).value_or(fallback_font_metrics(font)):fallback_font_metrics(font);
+    const Measure measure=[&](std::u16string_view text){if(native_gui_)if(const auto value=native_gui_->text_width(font,std::u16string(text)))return *value;return coordinate(static_cast<std::int64_t>(text.size())*metrics.average_width);};
+    auto text=compact_path_text(path,std::max(0,width),measure);const bool fits=measure(text)<=width;return std::pair{std::move(text),fits};
+}
 std::optional<std::uint32_t> WindowsServices::invoke_gdi_text(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
     const auto integer=[&](unsigned index){return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(index)));};

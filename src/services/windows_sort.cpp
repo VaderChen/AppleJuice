@@ -27,7 +27,7 @@ void WindowsServices::initialize_guest_crt_algorithms(GuestMemory& memory, Guest
     static_assert(offset+detail::guest_crt_image_size<=windows_address_layout::gateway_capacity);
     RuntimeImage image;
     image.base=callback_return_.value+offset;image.size=detail::guest_crt_image_size;
-    image.path=u"[guest-crt]";
+    image.private_code=true;image.path=u"[guest-crt]";
     image.function_table=image.base+detail::guest_crt_function_table;
     for(const auto& row:detail::guest_crt_unwind)image.functions.push_back({row.begin,row.end,row.unwind});
     for(const auto& row:detail::guest_crt_routines)
@@ -78,26 +78,50 @@ void WindowsServices::initialize_guest_crt_algorithms(GuestMemory& memory, Guest
     guest_crt_algorithms_=std::move(image);
 }
 
-std::optional<std::uint32_t> WindowsServices::start_sort(GuestState& state, GuestMemory& memory, bool search) {
-    // qsort／bsearch 都是 cdecl；空集合及單筆的直接返回也由呼叫端清理參數。
+std::optional<std::uint32_t> WindowsServices::start_sort(GuestState& state, GuestMemory& memory, std::string_view symbol) {
+    // qsort／bsearch 系列都是 cdecl；空集合及單筆的直接返回也由呼叫端清理參數。
     // 比較器返回沿 complete_call 的 CRT descriptor，兩條路徑須保持相同 ABI。
-    const WindowsCall arg(state, memory, search?5:4, false);
+    // _s 版本的比較器為 (context, a, b)；_lfind／_lsearch 的元素數經 unsigned* 傳入。
+    const bool contextual=symbol.ends_with("_s"),linear=symbol.starts_with("_l"),search=linear || symbol.starts_with("bsearch");
+    const unsigned arguments=symbol=="qsort"?4U:symbol=="bsearch_s" || symbol=="_lfind_s"?6U:5U;
+    const WindowsCall arg(state, memory, arguments, false);
+    const auto invalid=[&](std::uint64_t result){
+        memory.store(GuestAddress{runtime_.errno_cell},32,22);
+        if(current_invalid_parameter_handler()){start_callbacks(state,memory,{{current_invalid_parameter_handler(),{0,0,0,0,0}}},Continuation::Return,result);return std::optional<std::uint32_t>{};}
+        arg.return_to(state,result);return std::optional<std::uint32_t>{};
+    };
+    if(linear) {
+        // (key, base, unsigned* num, width, compare[, context])
+        if(!arg(0) || !arg(2) || !arg(4))return invalid(0);
+        const auto count=static_cast<std::size_t>(memory.load(GuestAddress{arg(2)},32));const auto width=symbol=="_lfind_s"?arg(3):static_cast<std::uint64_t>(static_cast<std::uint32_t>(arg(3)));
+        if((count && !arg(1)) || !width)return invalid(0);
+        if(count>output_limit/width || runtime_.sorts.size()>=32)throw HostCallFault("_lfind 大小或巢狀深度超過上限");
+        if(count)memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(count*width),Access::Read);
+        memory.check(GuestAddress{arg(4)},1,Access::Execute);
+        SortState job;job.search=true;job.linear=true;job.append=symbol=="_lsearch";job.key=arg(0);job.base=arg(1);job.size=width;job.compare=arg(4);
+        job.right=count;job.count_cell=arg(2);job.contextual=contextual;job.context=contextual?arg(5):0;
+        if(job.append)memory.check(GuestAddress{arg(1)+count*width},static_cast<std::size_t>(width),Access::Write);
+        runtime_.sorts.push_back(std::move(job));return advance_sort(state,memory,0);
+    }
     if(search) {
         if(!arg(2) || !arg(3)){arg.return_to(state,0);return std::nullopt;}
+        if(contextual && !arg(4))return invalid(0);
         if(arg(2)>output_limit/arg(3) || runtime_.sorts.size()>=32)throw HostCallFault("bsearch 大小或巢狀深度超過上限");
         memory.check(GuestAddress{arg(0)},1,Access::Read);
         memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(arg(2)*arg(3)),Access::Read);
         memory.check(GuestAddress{arg(4)},1,Access::Execute);
         SortState job;job.search=true;job.key=arg(0);job.base=arg(1);job.size=arg(3);job.compare=arg(4);job.right=static_cast<std::size_t>(arg(2));
+        job.contextual=contextual;job.context=contextual?arg(5):0;
         runtime_.sorts.push_back(std::move(job));return advance_sort(state,memory,0);
     }
+    if(contextual && arg(1) && (!arg(0) || !arg(3)))return invalid(0);
     if (arg(1) < 2 || !arg(2)) { arg.return_to(state, 0); return std::nullopt; }
     if (arg(1) > 65536 || arg(2) > output_limit / arg(1) || runtime_.sorts.size() >= 32) throw HostCallFault("qsort 大小或巢狀深度超過上限");
     const auto count = static_cast<std::size_t>(arg(1));
     memory.check(GuestAddress{arg(0)}, static_cast<std::size_t>(arg(1) * arg(2)), Access::Read);
     memory.check(GuestAddress{arg(0)}, static_cast<std::size_t>(arg(1) * arg(2)), Access::Write);
     memory.check(GuestAddress{arg(3)}, 1, Access::Execute);
-    SortState job; job.base = arg(0); job.size = arg(2); job.compare = arg(3);
+    SortState job; job.base = arg(0); job.size = arg(2); job.compare = arg(3);job.contextual=contextual;job.context=contextual?arg(4):0;
     job.order.resize(count); job.merged.resize(count); std::iota(job.order.begin(), job.order.end(), 0);
     runtime_.sorts.push_back(std::move(job)); return advance_sort(state, memory, 0);
 }
@@ -110,9 +134,10 @@ std::optional<std::uint32_t> WindowsServices::advance_sort(GuestState& state, Gu
         runtime_.callbacks.pop_back();reuse_callback=false;
     };
     const auto compare_next=[&](std::uint64_t target,std::uint64_t left,std::uint64_t right){
-        if(!reuse_callback){start_callbacks(state,memory,{{target,{left,right}}},Continuation::Sort);return;}
+        std::vector<std::uint64_t> arguments=job.contextual?std::vector<std::uint64_t>{job.context,left,right}:std::vector<std::uint64_t>{left,right};
+        if(!reuse_callback){start_callbacks(state,memory,{{target,std::move(arguments)}},Continuation::Sort);return;}
         auto& frame=runtime_.callbacks.back();auto& call=frame.callbacks.front();
-        call.target=target;call.arguments[0]=left;call.arguments[1]=right;
+        call.target=target;call.arguments=std::move(arguments);
         call.user_mode_callback=false;classify_callback(call,Continuation::Sort);
         frame.exception_depth=exceptions_.stack.size();
         try{enter_callback(state,memory);}
@@ -123,6 +148,24 @@ std::optional<std::uint32_t> WindowsServices::advance_sort(GuestState& state, Gu
             runtime_.callbacks.pop_back();throw;
         }
     };
+    if(job.search && job.linear) {
+        // 線性搜尋：逐一比較 key 與元素；_lsearch 找不到時把 key 附加在尾端並遞增 *num。
+        if(job.waiting){
+            const auto order=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(comparison));job.waiting=false;
+            if(!order){const auto result=job.base+job.middle*job.size;release_callback();runtime_.sorts.pop_back();complete_call(state,memory,result);return std::nullopt;}
+            ++job.middle;
+        }
+        if(job.middle>=job.right){
+            std::uint64_t result=0;
+            if(job.append){
+                std::vector<std::uint8_t> bytes(static_cast<std::size_t>(job.size));memory.read(GuestAddress{job.key},bytes);
+                result=job.base+job.right*job.size;memory.write(GuestAddress{result},bytes);memory.store(GuestAddress{job.count_cell},32,job.right+1);
+            }
+            release_callback();runtime_.sorts.pop_back();complete_call(state,memory,result);return std::nullopt;
+        }
+        job.waiting=true;const auto target=job.compare,key=job.key,element=job.base+job.middle*job.size;
+        compare_next(target,key,element);return std::nullopt;
+    }
     if(job.search) {
         if(job.waiting){
             const auto order=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(comparison));

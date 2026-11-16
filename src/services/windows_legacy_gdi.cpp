@@ -1,3 +1,5 @@
+#include "windows_wmf.hpp"
+#include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/windows_palette.hpp"
@@ -25,7 +27,11 @@ std::span<const WindowsServiceDescriptor> legacy_gdi_service_descriptors(){
         {"gdi32.dll","GetMetaFileA",1},{"gdi32.dll","GetMetaFileW",1},{"gdi32.dll","DeleteMetaFile",1},
         {"gdi32.dll","D3DKMTOpenAdapterFromHdc",1},{"gdi32.dll","D3DKMTOpenAdapterFromGdiDisplayName",1},{"gdi32.dll","D3DKMTOpenAdapterFromDeviceName",1},
         {"gdi32.dll","D3DKMTOpenAdapterFromLuid",1},{"gdi32.dll","D3DKMTEnumAdapters2",1},{"gdi32.dll","D3DKMTCloseAdapter",1},
-        {"gdi32.dll","D3DKMTQueryAdapterInfo",1},{"gdi32.dll","D3DKMTQueryStatistics",1}
+        {"gdi32.dll","D3DKMTQueryAdapterInfo",1},{"gdi32.dll","D3DKMTQueryStatistics",1},
+        {"gdi32.dll","D3DKMTEnumAdapters",1},{"gdi32.dll","D3DKMTQueryVideoMemoryInfo",1},{"gdi32.dll","D3DKMTCheckOcclusion",1},
+        {"gdi32.dll","D3DKMTCreateDevice",1},{"gdi32.dll","D3DKMTDestroyDevice",1},{"gdi32.dll","D3DKMTSetQueuedLimit",1},
+        {"gdi32.dll","D3DKMTCheckVidPnExclusiveOwnership",1},{"gdi32.dll","D3DKMTSetVidPnSourceOwner",1},
+        {"gdi32.dll","D3DKMTCreateDCFromMemory",1},{"gdi32.dll","D3DKMTDestroyDCFromMemory",1}
     };return table;
 }
 namespace {
@@ -35,15 +41,22 @@ constexpr CharsetSignature charset_signatures[]{
     {0,0,{0,1,-1,-1}},{238,1,{0,2,-1,-1}},{204,2,{0,9,-1,-1}},{161,3,{0,7,-1,-1}},{162,4,{0,2,-1,-1}},{177,5,{0,11,-1,-1}},
     {178,6,{0,13,-1,-1}},{186,7,{0,2,-1,-1}},{163,8,{0,2,3,-1}},{222,16,{0,24,-1,-1}},{128,17,{48,49,50,59}},{134,18,{48,59,-1,-1}},
     {129,19,{48,56,28,59}},{136,20,{48,59,-1,-1}},{130,21,{48,56,28,-1}},{2,31,{-1,-1,-1,-1}}};
-bool valid_windows_metafile(std::span<const std::uint8_t> bytes){
-    if(bytes.size()<18)return false;const auto word=[&](std::size_t at){return static_cast<std::uint32_t>(bytes[at])|static_cast<std::uint32_t>(bytes[at+1])<<8;};
-    const auto words=word(6)|word(8)<<16;
-    return (word(0)==1 || word(0)==2) && word(2)==9 && (word(4)==0x100 || word(4)==0x300) && words>=9 && std::uint64_t{words}*2<=bytes.size();
+// WMF 標頭驗證與大小改用 windows_wmf.hpp 的共用實作。
+constexpr std::size_t metafile_limit=windows_metafile_limit;
 }
-std::size_t windows_metafile_size(std::span<const std::uint8_t> bytes){return 2*(static_cast<std::size_t>(bytes[6])|static_cast<std::size_t>(bytes[7])<<8|static_cast<std::size_t>(bytes[8])<<16|static_cast<std::size_t>(bytes[9])<<24);}
-constexpr std::size_t metafile_limit=64U*1024U*1024U;
+std::optional<std::uint32_t> WindowsServices::nested_continuation(GuestState& state,GuestMemory& memory,std::string_view kind,
+        std::function<service_callback::Task<std::optional<std::uint32_t>>(GuestState&,GuestMemory&)> factory){
+    return service_callback::invoke<std::optional<std::uint32_t>>(this,threads_.current,state,memory,kind,
+        [this](GuestState& s,GuestMemory& m,std::uint64_t target,std::vector<std::uint64_t> args,std::uint64_t id){
+            GuestCallback call{target,std::move(args)};
+            if(auto* context=service_callback::active;context && context->native_pending){call=std::move(context->native);context->native_pending=false;}
+            start_callbacks(s,m,{std::move(call)},Continuation::NestedResult,id);},std::move(factory));
 }
 std::uint64_t WindowsServices::nested_service(GuestState& state,GuestMemory& memory,std::string_view family,std::string_view symbol,std::initializer_list<std::uint64_t> arguments){
+    return nested_service(state,memory,family,symbol,std::span<const std::uint64_t>(arguments.begin(),arguments.size()));
+}
+// 引數數目在執行期才決定的轉接（例如 ntdll 的 Rtl→Win32 表格轉接）共用同一個宿主端框架。
+std::uint64_t WindowsServices::nested_service(GuestState& state,GuestMemory& memory,std::string_view family,std::string_view symbol,std::span<const std::uint64_t> arguments){
     // 經正式服務入口呼叫，固定 kernel32 表與延伸 descriptor 表共用相同分派、ABI 與追蹤。
     static const auto index=[]{std::map<std::pair<std::string_view,std::string_view>,const WindowsServiceDescriptor*> out;for(const auto& d:runtime_service_descriptors())out.try_emplace({d.family,d.symbol},&d);return out;}();
     // GdiFlush 的公開入口解析為客體批次常式（X64ARM_GUEST_GDI_BATCH），不是宿主服務入口，不能在此框架執行；
@@ -57,7 +70,9 @@ std::uint64_t WindowsServices::nested_service(GuestState& state,GuestMemory& mem
         // narrow 參數只截取低 32 位、caller cleanup 只影響返回後的堆疊；兩者不改變此框架的參數位置。
         if(descriptor.arguments!=arguments.size() || descriptor.wide_arguments || descriptor.aggregate_arguments)throw HostCallFault("巢狀服務參數形式不符");
     }
-    const auto target=resolve_service(family,symbol,false);if(!target.value)throw HostCallFault("巢狀服務尚未登錄");
+    // 優先使用描述元本身的宿主入口：匯出可能改導向客體快速常式（臨界區段、SRW、Interlocked 等），宿主端巢狀呼叫要直接到原服務。
+    auto target=host_service_stub(family,symbol);if(!target.value)target=resolve_service(family,symbol,false);
+    if(!target.value)throw HostCallFault("巢狀服務尚未登錄");
     // 返回位址指向 KUSER_SHARED_DATA 內不可執行的保留字，服務若改走客體回呼即可辨識。
     constexpr std::uint64_t sentinel=0x7ffe0ff0;const unsigned unit=x86_?4U:8U;
     const auto frame=allocate_heap(memory,static_cast<std::uint64_t>(unit)*(std::max<std::size_t>(arguments.size(),4)+2)+32);if(!frame)throw std::bad_alloc();
@@ -100,7 +115,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
     std::vector<std::uint64_t> scratch;
     struct Release {WindowsServices& self;GuestMemory& memory;const GuestState& state;std::vector<std::uint64_t>& pointers;~Release(){for(const auto p:pointers)(void)self.free_heap(memory,p,state);}} release{*this,memory,state,scratch};
     const auto temporary=[&](std::size_t size){const auto p=allocate_heap(memory,std::max<std::size_t>(size,8));if(!p)throw std::bad_alloc();scratch.push_back(p);return p;};
-    const auto invalid_handle=x86_?std::uint64_t{UINT32_MAX}:UINT64_MAX;
     try {
         if(name=="GetTextCharsetInfo" || name=="GetTextCharset"){
             if(!known_dc(arg(0)))return fail(6);
@@ -267,6 +281,105 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
                 return finish(ok);
             }
             if(name=="D3DKMTCloseAdapter")return finish(gui_.kmt_adapters.erase(static_cast<std::uint32_t>(memory.load(GuestAddress{p},32)))?ok:invalid);
+            if(name=="D3DKMTEnumAdapters"){
+                // D3DKMT_ENUMADAPTERS：NumAdapters 與 16 筆 {hAdapter, AdapterLuid, NumOfSources, bPresentMoveRegionsPreferred}。
+                const std::uint32_t count=available?1U:0U;memory.check(GuestAddress{p},4+16*20,Access::Write);memory.fill(GuestAddress{p},0,4+16*20);
+                memory.store(GuestAddress{p},32,count);
+                if(count){if(gui_.kmt_adapters.size()>=4096)return finish(0xc000009aU);const auto handle=gui_.next_kmt_adapter++;gui_.kmt_adapters.insert(handle);
+                    memory.store(GuestAddress{p+4},32,handle);memory.store(GuestAddress{p+8},32,static_cast<std::uint32_t>(luid));memory.store(GuestAddress{p+12},32,static_cast<std::uint32_t>(luid>>32));memory.store(GuestAddress{p+16},32,1);}
+                return finish(ok);
+            }
+            if(name=="D3DKMTQueryVideoMemoryInfo"){
+                // 與 DXGI IDXGIAdapter3::QueryVideoMemoryInfo 共用同一份程序 GPU 記憶體預算；欄位順序為 Budget、CurrentUsage、CurrentReservation、AvailableForReservation。
+                const auto process=memory.load(GuestAddress{p},pointer_bits);const auto adapter=static_cast<std::uint32_t>(memory.load(GuestAddress{p+unit},32));
+                const auto group=static_cast<std::uint32_t>(memory.load(GuestAddress{p+unit+4},32)),physical=static_cast<std::uint32_t>(memory.load(GuestAddress{p+48},32));
+                if((process && process!=(x86_?UINT32_MAX:UINT64_MAX)) || !gui_.kmt_adapters.contains(adapter) || group>1 || physical)return finish(invalid);
+                const auto budget=gpu_memory_budget(group==0);
+                memory.store(GuestAddress{p+16},64,budget.budget);memory.store(GuestAddress{p+24},64,budget.usage);memory.store(GuestAddress{p+32},64,budget.reservation);memory.store(GuestAddress{p+40},64,budget.available);
+                return finish(ok);
+            }
+            if(name=="D3DKMTCheckOcclusion"){
+                // 視窗最小化或不可見時，Present 會被遮蔽（STATUS_GRAPHICS_PRESENT_OCCLUDED）。
+                const auto target=gui_.windows.find(memory.load(GuestAddress{p},pointer_bits));if(target==gui_.windows.end())return finish(invalid);
+                return finish(target->second.show_command==2 || !target->second.visible?0xc01e0006U:ok);
+            }
+            if(name=="D3DKMTCreateDevice"){
+                // WDDM 2 裝置不配發舊式 DMA 命令緩衝區與配置清單（輸出為空）。
+                const auto adapter=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));if(!gui_.kmt_adapters.contains(adapter))return finish(invalid);
+                if(gui_.kmt_devices.size()>=4096)return finish(0xc000009aU);
+                const auto handle=gui_.next_kmt_device++;gui_.kmt_devices.emplace(handle,GuiState::KmtDevice{adapter});
+                memory.store(GuestAddress{p+unit+4},32,handle);
+                for(const auto offset:{x86_?12U:16U,x86_?20U:32U,x86_?28U:48U})memory.store(GuestAddress{p+offset},pointer_bits,0);
+                for(const auto offset:{x86_?16U:24U,x86_?24U:40U,x86_?32U:56U})memory.store(GuestAddress{p+offset},32,0);
+                return finish(ok);
+            }
+            if(name=="D3DKMTDestroyDevice"){
+                const auto device=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));
+                if(!gui_.kmt_devices.erase(device))return finish(invalid);
+                if(gui_.kmt_vidpn_owner==device){gui_.kmt_vidpn_owner=0;gui_.kmt_vidpn_owner_type=0;}
+                return finish(ok);
+            }
+            if(name=="D3DKMTSetQueuedLimit"){
+                // D3DKMT_SET_QUEUEDLIMIT_PRESENT 1：佇列中的 Present 上限；_VIDPNSOURCE 2：來源的待處理翻頁上限。
+                const auto device=gui_.kmt_devices.find(static_cast<std::uint32_t>(memory.load(GuestAddress{p},32)));if(device==gui_.kmt_devices.end())return finish(invalid);
+                const auto type=static_cast<std::uint32_t>(memory.load(GuestAddress{p+4},32));
+                if(type==1){device->second.present_limit=static_cast<std::uint32_t>(memory.load(GuestAddress{p+8},32));return finish(ok);}
+                if(type==2){if(memory.load(GuestAddress{p+8},32))return finish(invalid);device->second.flip_limit=static_cast<std::uint32_t>(memory.load(GuestAddress{p+12},32));return finish(ok);}
+                return finish(invalid);
+            }
+            if(name=="D3DKMTCheckVidPnExclusiveOwnership"){
+                // 只有一個 VidPn 來源（0）；由其他裝置以排他方式擁有時回報遮蔽。
+                const auto adapter=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));
+                if(!gui_.kmt_adapters.contains(adapter) || memory.load(GuestAddress{p+4},32))return finish(invalid);
+                return finish(gui_.kmt_vidpn_owner_type==2 || gui_.kmt_vidpn_owner_type==3?0xc01e0006U:ok);
+            }
+            if(name=="D3DKMTSetVidPnSourceOwner"){
+                const auto device=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32));if(!gui_.kmt_devices.contains(device))return finish(invalid);
+                const auto types=memory.load(GuestAddress{p+unit},pointer_bits),sources=memory.load(GuestAddress{p+2*unit},pointer_bits);
+                const auto count=static_cast<std::uint32_t>(memory.load(GuestAddress{p+3*unit},32));
+                if(!count){if(gui_.kmt_vidpn_owner==device){gui_.kmt_vidpn_owner=0;gui_.kmt_vidpn_owner_type=0;}return finish(ok);}   // 釋放擁有權
+                if(count!=1 || !types || !sources || memory.load(GuestAddress{sources},32))return finish(invalid);
+                const auto type=static_cast<std::uint32_t>(memory.load(GuestAddress{types},32));if(type>4)return finish(invalid);
+                if(gui_.kmt_vidpn_owner && gui_.kmt_vidpn_owner!=device && (gui_.kmt_vidpn_owner_type==2 || gui_.kmt_vidpn_owner_type==3) && type)return finish(0xc01e0007U); // STATUS_GRAPHICS_PRESENT_DENIED
+                gui_.kmt_vidpn_owner=type?device:0;gui_.kmt_vidpn_owner_type=type;return finish(ok);
+            }
+            if(name=="D3DKMTCreateDCFromMemory"){
+                // 以呼叫端記憶體（由上而下、指定 Pitch）建立 DIB 並選入相容的記憶體 DC；位元不複製，GDI 繪製直接寫回 pMemory。
+                const auto bits=memory.load(GuestAddress{p},pointer_bits);const auto format=static_cast<std::uint32_t>(memory.load(GuestAddress{p+unit},32));
+                const auto width=static_cast<std::uint32_t>(memory.load(GuestAddress{p+unit+4},32)),height=static_cast<std::uint32_t>(memory.load(GuestAddress{p+unit+8},32));
+                const auto pitch=static_cast<std::uint32_t>(memory.load(GuestAddress{p+unit+12},32));
+                const auto device_dc=memory.load(GuestAddress{p+unit+16},pointer_bits),colors=memory.load(GuestAddress{p+2*unit+16},pointer_bits);
+                std::uint16_t depth=0;std::array<std::uint32_t,4> masks{0xff0000,0xff00,0xff,0};
+                switch(format){
+                case 20:depth=24;break;                                           // D3DDDIFMT_R8G8B8
+                case 21:depth=32;masks[3]=0xff000000U;break;                      // A8R8G8B8
+                case 22:depth=32;break;                                           // X8R8G8B8
+                case 23:depth=16;masks={0xf800,0x7e0,0x1f,0};break;               // R5G6B5
+                case 24:depth=16;masks={0x7c00,0x3e0,0x1f,0};break;               // X1R5G5B5
+                case 25:depth=16;masks={0x7c00,0x3e0,0x1f,0x8000};break;          // A1R5G5B5
+                case 41:depth=8;break;                                            // P8
+                default:return finish(invalid);
+                }
+                if(!bits || !width || !height || width>16384 || height>16384 || pitch<(std::uint64_t{width}*depth+7)/8 || (depth==8 && !colors))return finish(invalid);
+                memory.check(GuestAddress{bits},static_cast<std::size_t>(pitch)*height,Access::Read);
+                std::vector<std::uint32_t> palette;
+                if(depth==8){memory.check(GuestAddress{colors},1024,Access::Read);for(unsigned i=0;i<256;++i){const auto entry=static_cast<std::uint32_t>(memory.load(GuestAddress{colors+i*4},32));palette.push_back(entry&0xffffffU);}}  // PALETTEENTRY 即 COLORREF 順序
+                const auto dc=nested_service(state,memory,"gdi32.dll","CreateCompatibleDC",{device_dc});if(!dc)return finish(0xc0000017U);
+                GuiBitmap bitmap{width,height,std::vector<std::uint32_t>(static_cast<std::size_t>(width)*height)};
+                bitmap.dib_address=bits;bitmap.dib_external=true;bitmap.stride=pitch;bitmap.bits_per_pixel=depth;bitmap.signed_height=-static_cast<std::int32_t>(height);
+                bitmap.dib_compression=depth==16 || depth==32?3U:0U;bitmap.dib_masks=masks;bitmap.dib_palette=depth==8?std::move(palette):gui_dib_palette(depth);
+                const auto handle=gui_.next_object++;gui_.bitmaps.emplace(handle,std::move(bitmap));
+                try{import_dib_bitmap(memory,handle);}catch(...){gui_.bitmaps.erase(handle);(void)nested_service(state,memory,"gdi32.dll","DeleteDC",{dc});throw;}
+                (void)nested_service(state,memory,"gdi32.dll","SelectObject",{dc,handle});
+                memory.store(GuestAddress{p+3*unit+16},pointer_bits,dc);memory.store(GuestAddress{p+4*unit+16},pointer_bits,handle);
+                return finish(ok);
+            }
+            if(name=="D3DKMTDestroyDCFromMemory"){
+                const auto dc=memory.load(GuestAddress{p},pointer_bits),bitmap=memory.load(GuestAddress{p+unit},pointer_bits);
+                const auto found=gui_.bitmaps.find(bitmap);if(found==gui_.bitmaps.end() || !found->second.dib_external || !gui_.contexts.contains(dc))return finish(invalid);
+                (void)nested_service(state,memory,"gdi32.dll","DeleteDC",{dc});(void)nested_service(state,memory,"gdi32.dll","DeleteObject",{bitmap});
+                return finish(ok);
+            }
             const auto memory_limit=gpu_memory_stats();
             if(name=="D3DKMTQueryAdapterInfo"){
                 const auto handle=static_cast<std::uint32_t>(memory.load(GuestAddress{p},32)),type=static_cast<std::uint32_t>(memory.load(GuestAddress{p+4},32));
@@ -336,23 +449,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
             std::vector<std::uint8_t> bytes;
             if(copy){const auto found=gui_.windows_metafiles.find(arg(0));if(found==gui_.windows_metafiles.end())return fail(6);bytes=found->second;}
             else if(!path)return fail(87);
-            if(path){
-                // 磁碟 metafile 經一般檔案服務存取，沿用映射、權限與共用模式。
-                const auto file=nested_service(state,memory,"kernel32.dll",wide?"CreateFileW":"CreateFileA",{path,copy?0x40000000U:0x80000000U,copy?0U:1U,0,copy?2U:3U,0x80,0});
-                if(file==invalid_handle || !file)return finish(0);
-                struct Close {WindowsServices& self;GuestState& state;GuestMemory& memory;std::uint64_t handle;~Close(){try{(void)self.nested_service(state,memory,"kernel32.dll","CloseHandle",{handle});}catch(...){}}} close{*this,state,memory,file};
-                const auto count=temporary(8);
-                if(copy){
-                    const auto buffer=temporary(bytes.size());memory.write(GuestAddress{buffer},bytes);
-                    if(!nested_service(state,memory,"kernel32.dll","WriteFile",{file,buffer,bytes.size(),count,0}) || memory.load(GuestAddress{count},32)!=bytes.size())return finish(0);
-                }else {
-                    if(!nested_service(state,memory,"kernel32.dll","GetFileSizeEx",{file,count}))return finish(0);
-                    const auto size=memory.load(GuestAddress{count},64);if(size<18 || size>metafile_limit)return fail(13);
-                    const auto buffer=temporary(static_cast<std::size_t>(size));
-                    if(!nested_service(state,memory,"kernel32.dll","ReadFile",{file,buffer,size,count,0}) || memory.load(GuestAddress{count},32)!=size)return finish(0);
-                    bytes.resize(static_cast<std::size_t>(size));memory.read(GuestAddress{buffer},bytes);
-                    if(!valid_windows_metafile(bytes))return fail(13);bytes.resize(windows_metafile_size(bytes));
-                }
+            if(copy && path){
+                // 複製到磁碟：與 CloseMetaFile 共用寫檔流程，標頭改為磁碟 metafile。
+                bytes[0]=2;bytes[1]=0;if(!write_guest_file(state,memory,wide?read_utf16(memory,GuestAddress{path}):utf8_to_utf16(read_ansi(memory,path)),bytes))return finish(0);
+            }else if(path){
+                // 磁碟 metafile 經一般檔案服務讀入，沿用映射、權限與共用模式（與 GetEnhMetaFile 共用）。
+                auto loaded=read_guest_file(state,memory,wide?read_utf16(memory,GuestAddress{path}):utf8_to_utf16(read_ansi(memory,path)),18,metafile_limit);
+                if(!loaded)return finish(0);bytes=std::move(*loaded);
+                if(!valid_windows_metafile(bytes))return fail(13);bytes.resize(windows_metafile_size(bytes));
             }
             const auto handle=gui_.next_object++;gui_.windows_metafiles.emplace(handle,std::move(bytes));return finish(handle);
         }

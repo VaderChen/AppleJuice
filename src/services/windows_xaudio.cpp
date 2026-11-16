@@ -27,7 +27,7 @@ void xaudio_lowering::initialize(GuestMemory& memory,std::map<std::uint64_t,Runt
     const auto base=gateway+image_offset;auto parsed=parse_pe_image(bytes,GuestAddress{base},true,memory.limit());
     if(!parsed.imports.empty() || !parsed.delay_imports.empty() || parsed.metadata.image_size>image_capacity)throw std::logic_error("XAudio2 常式有外部相依或超出映像範圍");
     for(const auto& [address,image]:images)if(base<address+image.size && address<base+parsed.metadata.image_size)throw std::logic_error("XAudio2 常式映像重疊");
-    auto image=parsed.runtime;image.path=u"[guest-xaudio]";image.export_names.clear();image.export_ordinals.clear();
+    auto image=parsed.runtime;image.private_code=true;image.path=u"[guest-xaudio]";image.export_names.clear();image.export_ordinals.clear();
     for(const auto& [name,ordinal]:parsed.runtime.export_names)image.export_names.emplace(name,parsed.runtime.export_ordinals.at(ordinal));
     for(auto& mapping:parsed.mappings)mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
     map_pe_image(memory,parsed);images.emplace(base,std::move(image));

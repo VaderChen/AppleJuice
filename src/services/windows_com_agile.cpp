@@ -28,7 +28,7 @@ void WindowsServices::initialize_guest_com_agile(GuestMemory& memory){
         throw std::logic_error("COM agile 常式包含外部相依或超出映像範圍");
     for(const auto& [address,image]:runtime_.builtin_images)if(base<address+image.size && address<base+parsed.metadata.image_size)
         throw std::logic_error("COM agile 常式與既有常駐映像重疊");
-    auto image=parsed.runtime;image.path=u"[guest-com-agile]";image.export_names.clear();image.export_ordinals.clear();
+    auto image=parsed.runtime;image.private_code=true;image.path=u"[guest-com-agile]";image.export_names.clear();image.export_ordinals.clear();
     for(const auto& [name,ordinal]:parsed.runtime.export_names)image.export_names.emplace(name,parsed.runtime.export_ordinals.at(ordinal));
     for(auto& mapping:parsed.mappings)mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
     map_pe_image(memory,parsed);runtime_.builtin_images.emplace(base,std::move(image));
@@ -188,7 +188,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_agile(GuestState& state
             if(arg(0)>1)return done(invalid);if(!arg(1) || !arg(2) || !arg(3))return done(pointer_error);
             ComAgileOperation op;op.kind=Kind::Create;op.options=static_cast<std::uint32_t>(arg(0));op.source=arg(2);op.output=arg(3);op.owner=threads_.current;
             memory.read(GuestAddress{arg(1)},op.iid);memory.store(GuestAddress{op.output},bits,0);
-            if(!com_apartment(threads_.current) && !std::any_of(gui_.com_initializations.begin(),gui_.com_initializations.end(),[](const auto& row){return row.second>=16 && !(row.second&2U);}))return done(not_initialized);
+            if(!com_apartment(threads_.current) && !mta_alive())return done(not_initialized);
             return begin(op);
         }
         if(name=="Cleanup"){

@@ -293,8 +293,13 @@ typedef struct {void* array;} Segment;
 typedef struct Vector Vector;
 typedef void* (*VectorAllocate)(Vector*,Size);
 typedef void (*VectorArrayOp)(void*,Size);
-struct Vector {VectorAllocate allocate;Size first_block;Size early_size;Segment* segment;Segment storage[CONCRT_VECTOR_SHORT_TABLE];};
+struct Vector {VectorAllocate allocate;Segment storage[CONCRT_VECTOR_SHORT_TABLE];Size first_block;Size early_size;Segment* segment;};
 _Static_assert(sizeof(Vector)==CONCRT_VECTOR_WORDS*sizeof(Pointer),"_Concurrent_vector_base_v4 佈局");
+/* 不能只驗證總長度：衍生類別會直接初始化與存取這些欄位。 */
+_Static_assert(__builtin_offsetof(Vector,storage)==sizeof(Pointer) &&
+    __builtin_offsetof(Vector,first_block)==4*sizeof(Pointer) &&
+    __builtin_offsetof(Vector,early_size)==5*sizeof(Pointer) &&
+    __builtin_offsetof(Vector,segment)==6*sizeof(Pointer),"ConcRT vector 欄位偏移");
 #define VECTOR_LONG_TABLE (sizeof(Size)*8)
 #define BAD_ALLOC_MARKER ((Pointer)63)
 typedef void (*HostLengthError)(const char*);

@@ -14,7 +14,11 @@ std::span<const WindowsServiceDescriptor> property_service_descriptors(){
         {"kernel32.dll","GlobalAddAtomA",1},{"kernel32.dll","GlobalAddAtomW",1},
         {"kernel32.dll","GlobalFindAtomA",1},{"kernel32.dll","GlobalFindAtomW",1},
         {"kernel32.dll","GlobalDeleteAtom",1},
-        {"kernel32.dll","GlobalGetAtomNameA",3},{"kernel32.dll","GlobalGetAtomNameW",3}
+        {"kernel32.dll","GlobalGetAtomNameA",3},{"kernel32.dll","GlobalGetAtomNameW",3},
+        // 本機（程序內）Atom 表：與全域表相同的整數／字串 atom 規則，表格只屬於本程序。
+        {"kernel32.dll","AddAtomA",1},{"kernel32.dll","AddAtomW",1},{"kernel32.dll","FindAtomA",1},{"kernel32.dll","FindAtomW",1},
+        {"kernel32.dll","DeleteAtom",1,0,0,0x1},{"kernel32.dll","GetAtomNameA",3,0,0,0x5},{"kernel32.dll","GetAtomNameW",3,0,0,0x5},
+        {"kernel32.dll","InitAtomTable",1,0,0,0x1}
     };return table;
 }
 void WindowsServices::release_gui_atom(std::uint16_t atom,const std::shared_ptr<SharedJob>& job){
@@ -26,16 +30,31 @@ void WindowsServices::release_gui_atom(std::uint16_t atom,const std::shared_ptr<
     if(name!=gui_.global_atom_names.end())gui_.global_atom_names.erase(name);
     gui_.global_atoms.erase(found);
 }
+std::uint16_t gui_atom_table_add(std::map<std::uint16_t,GuiAtom>& atoms,std::map<std::u16string,std::uint16_t>& names,std::u16string text,bool add,std::uint32_t& error){
+    error=0;
+        auto key=text;for(auto& ch:key)ch=unicode_case_unit(ch,true);
+        if(const auto found=names.find(key);found!=names.end()){
+            if(add){auto& references=atoms.at(found->second).references;if(references==UINT32_MAX){error=8;return 0;};++references;}
+            return found->second;
+        }
+        if(!add)return 0;
+        std::uint32_t id=0xc000;while(id<=65535 && atoms.contains(static_cast<std::uint16_t>(id)))++id;
+        if(id>65535){error=8;return 0;};const auto atom=static_cast<std::uint16_t>(id);
+        atoms.emplace(atom,GuiAtom{std::move(text),1});
+        try{names.emplace(std::move(key),atom);}catch(...){atoms.erase(atom);throw;}
+        return atom;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_properties(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
     const bool wide=symbol.ends_with('W'),property=service.family=="user32.dll";
     std::uint64_t result=0;
     const auto atom_job=job_atom_table();const auto atom_namespace=atom_job?atom_job->snapshot().identity:0;
     struct Failure {std::uint32_t error;};
-    const auto atom_for=[&](std::uint64_t pointer,bool add,bool property_key)->std::uint16_t {
+    // 名稱解析共用：整數 atom（指標值 ≤ 0xFFFF 或 "#十進位"）回 {atom, 空字串}，字串 atom 回 {0, 名稱}。
+    const auto parse_atom=[&](std::uint64_t pointer,bool property_key)->std::pair<std::uint16_t,std::u16string> {
         if(pointer<=65535){
-            if(property_key){if(!pointer)throw Failure{87};return static_cast<std::uint16_t>(pointer);}
-            if(pointer>=0xc000)throw Failure{87};return static_cast<std::uint16_t>(pointer);
+            if(property_key){if(!pointer)throw Failure{87};return {static_cast<std::uint16_t>(pointer),{}};}
+            if(pointer>=0xc000)throw Failure{87};return {static_cast<std::uint16_t>(pointer),{}};
         }
         std::u16string text;
         if(wide)text=read_utf16(memory,GuestAddress{pointer},255);
@@ -50,23 +69,49 @@ std::optional<std::uint32_t> WindowsServices::invoke_properties(GuestState& stat
         if(text.empty() || text.size()>255)throw Failure{87};
         if(text.front()==u'#' && text.size()>1 && std::all_of(text.begin()+1,text.end(),[](char16_t ch){return ch>=u'0' && ch<=u'9';})){
             std::uint32_t number=0;for(std::size_t i=1;i<text.size();++i){number=number*10U+static_cast<std::uint32_t>(text[i]-u'0');if(number>=0xc000)throw Failure{87};}
-            if(!number)throw Failure{87};return static_cast<std::uint16_t>(number);
+            if(!number)throw Failure{87};return {static_cast<std::uint16_t>(number),{}};
         }
+        return {0,std::move(text)};
+    };
+    const auto table_atom=[&](std::map<std::uint16_t,GuiAtom>& atoms,std::map<std::u16string,std::uint16_t>& names,std::u16string text,bool add)->std::uint16_t{
+        std::uint32_t error=0;const auto atom=gui_atom_table_add(atoms,names,std::move(text),add,error);if(error)throw Failure{error};return atom;};
+    const auto atom_for=[&](std::uint64_t pointer,bool add,bool property_key)->std::uint16_t {
+        auto [number,text]=parse_atom(pointer,property_key);if(number)return number;
         if(atom_job){std::uint32_t error=0;const auto atom=atom_job->global_atom(text,add,error);if(error && (add || error!=2))throw Failure{error};return atom;}
-        auto key=text;for(auto& ch:key)ch=unicode_case_unit(ch,true);
-        if(const auto found=gui_.global_atom_names.find(key);found!=gui_.global_atom_names.end()){
-            if(add){auto& references=gui_.global_atoms.at(found->second).references;if(references==UINT32_MAX)throw Failure{8};++references;}
-            return found->second;
-        }
-        if(!add)return 0;
-        std::uint32_t id=0xc000;while(id<=65535 && gui_.global_atoms.contains(static_cast<std::uint16_t>(id)))++id;
-        if(id>65535)throw Failure{8};const auto atom=static_cast<std::uint16_t>(id);
-        gui_.global_atoms.emplace(atom,GuiAtom{std::move(text),1});
-        try{gui_.global_atom_names.emplace(std::move(key),atom);}catch(...){gui_.global_atoms.erase(atom);throw;}
-        return atom;
+        return table_atom(gui_.global_atoms,gui_.global_atom_names,std::move(text),add);
     };
     try {
-        if(property){
+        if(service.family=="kernel32.dll" && !symbol.starts_with("Global")){
+            // 本機 Atom：AddAtom／FindAtom／DeleteAtom／GetAtomName／InitAtomTable。
+            auto& atoms=local_atoms_.atoms;auto& names=local_atoms_.names;
+            if(symbol=="InitAtomTable"){result=1;}
+            else if(symbol=="DeleteAtom"){
+                // 成功回 0；整數 atom 不在表中，刪除一律成功。失敗時回原 atom。
+                const auto atom=static_cast<std::uint16_t>(arg(0));result=0;
+                if(atom>=0xc000){
+                    const auto found=atoms.find(atom);
+                    if(found==atoms.end()){last_error_=6;result=atom;}
+                    else if(!--found->second.references){
+                        const auto name=std::find_if(names.begin(),names.end(),[&](const auto& item){return item.second==atom;});
+                        if(name!=names.end())names.erase(name);atoms.erase(found);
+                    }
+                }
+            }else if(symbol.starts_with("GetAtomName")){
+                const auto atom=static_cast<std::uint16_t>(arg(0));const auto capacity=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(2)));
+                if(!atom)throw Failure{87};if(capacity<=0)throw Failure{234};
+                std::u16string name;
+                if(atom<0xc000)name=utf8_to_utf16("#"+std::to_string(atom));
+                else {const auto found=atoms.find(atom);if(found==atoms.end())throw Failure{6};name=found->second.name;}
+                const auto limit=static_cast<std::uint32_t>(capacity)-1U;
+                if(wide){result=std::min<std::uint64_t>(name.size(),limit);memory.write(GuestAddress{arg(1)},utf16_bytes(name.substr(0,result)));}
+                else {const auto bytes=utf16_to_utf8(name);const auto count=std::min<std::size_t>(bytes.size(),limit);
+                    std::vector<std::uint8_t> output(bytes.begin(),bytes.begin()+static_cast<std::ptrdiff_t>(count));output.push_back(0);memory.write(GuestAddress{arg(1)},output);result=count;}
+            }else {
+                auto [number,text]=parse_atom(arg(0),false);
+                result=number?number:table_atom(atoms,names,std::move(text),symbol.starts_with("Add"));
+                if(!result)throw Failure{2};
+            }
+        }else if(property){
             const auto window=gui_.windows.find(arg(0));if(window==gui_.windows.end())throw Failure{1400};
             const bool set=symbol.starts_with("Set"),remove=symbol.starts_with("Remove");
             const auto atom=atom_for(arg(1),set,true);auto& properties=window->second.properties;

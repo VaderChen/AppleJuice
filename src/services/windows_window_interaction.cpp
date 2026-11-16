@@ -86,6 +86,8 @@ void WindowsServices::queue_gui_mouse(GuiMessage message,bool native_activation)
             for(unsigned i=0;i<2;++i)message.point[i]=static_cast<std::int32_t>(std::clamp<std::int64_t>(origin[i]+point[i],INT32_MIN,INT32_MAX));
         }
         message.has_point=true;message.screen_point=true;message.queued_cursor=message.point;gui_.pointer_position=message.point;
+        // GetMouseMovePointsEx：原生、SendInput 與觸控／筆轉成的移動都在合併前記錄。
+        if(message.message==0x200 && message.queue_priority==1)record_mouse_move_point(message.point[0],message.point[1],message.queued_time,message.input_extra.value_or(0));
     }
     // 原生及 SendInput 共用尚未派送的移動槽。Windows 在取訊息時才為最新位置做
     // 命中測試；逐筆回放舊座標會讓拖曳、hover 與後續按鈕事件排在過時輸入後面。

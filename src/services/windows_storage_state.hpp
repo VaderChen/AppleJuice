@@ -25,7 +25,8 @@ inline std::u16string name(const GuestMemory& memory,std::uint64_t address){
 inline void mode(std::uint32_t value,bool root,bool stream,bool creating){
     const auto allowed=3U|0x70U|(creating?create:0U)|(stream?0U:transacted)|(root && creating?convert:0U);
     if((value&~allowed) || (value&3)==3 || (value&0x70)>0x40 || ((value&create) && (value&convert)) ||
-       (!root && (value&0x70)!=0x10) || (root && !(value&transacted) && (value&0x70)!=0x10) || (root && creating && !writable(value)))throw Error{invalid_flag};
+       (!root && (value&0x70)!=0x10) || (root && !(value&transacted) && (value&0x70)!=0x10 && !((value&3)==0 && (value&0x70)==0x20 && !creating)) || // 直接模式根：獨占，或唯讀＋拒絕寫入
+       (root && creating && !writable(value)))throw Error{invalid_flag};
 }
 inline std::uint64_t method(const GuestMemory& memory,std::uint64_t object,unsigned slot){
     if(!object)throw Error{pointer_error};const auto unit=memory.execution_mode()==ExecutionMode::X86?4U:8U;
@@ -54,6 +55,7 @@ struct StorageState {
         Kind kind{Kind::Persist};Phase phase{Phase::Start};std::uint64_t backend{},document{},view{},caller{},output{},new_object{},scratch{},buffer{},offset{},backend_size{};
         std::uint32_t mode{},flags{},status{},locks{},requested{},success{},count{};std::uint64_t count_output{},previous_position{};
         bool held{},locked{},modified{},published{},append{},commit{},position_changed{};
+        bool release_backend{}; // 檔案式 Stg*：作業結束（成功或失敗）後釋放呼叫端建立 ILockBytes 時的參照
         std::vector<std::uint8_t> previous{},bytes{};std::map<std::uint64_t,compound::Document> rollback{},checkpoints{};
         std::vector<std::uint64_t> commit_views{},new_views{};compound::Document initial;
         bool operator==(const Operation&)const=default;

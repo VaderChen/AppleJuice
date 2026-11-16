@@ -9,6 +9,10 @@ inline std::string_view canonical(std::string_view name){
         {"#32","ldap_first_attributeA"},{"#33","ldap_next_attributeA"},{"#35","ldap_get_values_lenA"},
         {"#41","ldap_msgfree"},{"#46","ldap_unbind_s"},{"#50","ldap_search_sA"},{"#60","ldap_simple_bind_sA"},{"#79","ldap_value_free_len"}};
     for(const auto& [ordinal,symbol]:ordinals)if(name==ordinal){name=symbol;break;}
+    static constexpr std::pair<std::string_view,std::string_view> extended[]{
+#include "ldap_extended_ordinals.inc"
+    };
+    if(name.starts_with("#"))for(const auto& [ordinal,symbol]:extended)if(name==ordinal){name=symbol;break;}
     return name;
 }
 inline bool uses_heap(std::string_view input){

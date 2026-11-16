@@ -103,7 +103,8 @@ void WindowsServices::set_input_backend(std::shared_ptr<input::Backend> backend)
 std::span<const WindowsServiceDescriptor> dinput_service_descriptors(){
     static const auto table=[](){
         std::vector<WindowsServiceDescriptor> result{{"dinput.dll","DirectInputCreateA",4,0,0,2},{"dinput.dll","DirectInputCreateW",4,0,0,2},{"dinput.dll","DirectInputCreateEx",5,0,0,2},{"dinput.dll","GetdfDIJoystick",0},{"dinput8.dll","DirectInput8Create",5,0,0,2}};
-        for(const auto& item:std::array<WindowsServiceDescriptor,5>{{{"winmm.dll","joyGetNumDevs",0},{"winmm.dll","joyGetDevCapsA",3},{"winmm.dll","joyGetDevCapsW",3},{"winmm.dll","joyGetPos",2},{"winmm.dll","joyGetPosEx",2}}})result.push_back(item);
+        for(const auto& item:std::array<WindowsServiceDescriptor,10>{{{"winmm.dll","joyGetNumDevs",0},{"winmm.dll","joyGetDevCapsA",3},{"winmm.dll","joyGetDevCapsW",3},{"winmm.dll","joyGetPos",2},{"winmm.dll","joyGetPosEx",2},
+            {"winmm.dll","joySetCapture",4,0,0,0xe},{"winmm.dll","joyReleaseCapture",1,0,0,1},{"winmm.dll","joySetThreshold",2,0,0,3},{"winmm.dll","joyGetThreshold",2,0,0,1},{"winmm.dll","joyConfigChanged",1,0,0,1}}})result.push_back(item);
         for(auto family:{"xinput1_3.dll","xinput1_4.dll"}){
             result.push_back({family,"XInputGetState",2,0,0,1});
             result.push_back({family,"XInputSetState",2,0,0,1});
@@ -241,6 +242,90 @@ void WindowsServices::poll_dinput(bool background){
             }
             if(mapped && o.event){const auto found=runtime_.wait_objects.find(o.event);if(found!=runtime_.wait_objects.end() && found->second.kind==WaitObject::Kind::Event)found->second.set_signal(true);}
         }
+    }
+}
+// WinMM 搖桿：槽位、軸／按鍵／POV 對應與取樣值由 joyGetPos(Ex)、joyGetDevCaps 與 joySetCapture 共用，與 DirectInput 共用同一份 HID 取樣。
+struct LegacyJoystick {
+    std::vector<input::Device> devices;const input::Device* device{};
+    std::array<std::optional<std::size_t>,6> axes;std::vector<std::size_t> buttons;std::optional<std::size_t> pov;
+};
+namespace {
+// joyGetPosEx 的 dwFlags 決定回報的欄位：X、Y、Z、R、U、V、按鍵、按鍵數、POV；未選取的欄位為 0。
+std::array<std::uint32_t,11> legacy_joystick_values(const LegacyJoystick& joystick,std::uint32_t flags){
+    std::array<std::uint32_t,11> values{};const auto* device=joystick.device;if(!device)return values;
+    std::uint32_t raw_axes=0;for(unsigned axis=0;axis<6;++axis){const auto flag=axis<2?0x100000U<<axis:0x1000000U<<(axis-2);if(flags&flag)raw_axes|=1U<<axis;}
+    for(unsigned count=2;count<=6;++count){const auto flag=count<=4?0x20000U<<(count-2):0x400000U<<(count-5);if(flags&flag)raw_axes|=(1U<<count)-1;}
+    if(flags&0x10000U)raw_axes|=0x3fU;
+    const auto wanted_axes=(flags&0x3fU)|raw_axes;
+    const auto current=[&](std::size_t i,std::int64_t fallback=0){return i<device->values.size()?device->values[i]:fallback;};
+    for(unsigned axis=0;axis<6;++axis)if((wanted_axes&(1U<<axis)) && joystick.axes[axis]){
+        const auto object=*joystick.axes[axis];const auto& description=device->objects[object];const auto value=current(object);
+        if((flags&0x100U) || (raw_axes&(1U<<axis)))values[axis]=static_cast<std::uint32_t>(value);
+        else if(description.maximum>description.minimum){const auto span=static_cast<std::uint64_t>(static_cast<std::int64_t>(description.maximum)-description.minimum);
+            const auto position=static_cast<std::uint64_t>(std::clamp<std::int64_t>(value,description.minimum,description.maximum)-description.minimum);
+            values[axis]=static_cast<std::uint32_t>((position*65535U+span/2)/span);
+            // HID 沒有額外校正表時，以描述符的邏輯範圍與中心校正。
+            if((flags&0x800U) && values[axis]>=31129 && values[axis]<=34406)values[axis]=32768;
+        }
+    }
+    if(flags&0x80U){for(unsigned i=0;i<joystick.buttons.size();++i)if(current(joystick.buttons[i]))values[6]|=1U<<i;values[7]=static_cast<std::uint32_t>(std::popcount(values[6]));}
+    if(flags&0x240U){const auto value=joystick.pov?current(*joystick.pov,-1):-1;values[8]=value<0 || value>=36000?65535U:static_cast<std::uint32_t>(value);
+        if(values[8]!=65535 && !(flags&0x200U))values[8]=((values[8]+4500)/9000%4)*9000;}
+    return values;
+}
+}
+void WindowsServices::legacy_joystick(std::uint64_t id,LegacyJoystick& out){
+    auto& bridge=*dinput_;
+    poll_dinput();out.devices=bridge.backend->devices();out.device=nullptr;out.axes={};out.buttons.clear();out.pov.reset();
+    for(const auto& device:out.devices){
+        if(device.kind!=input::Kind::Joystick && device.kind!=input::Kind::Gamepad)continue;
+        if(std::find(bridge.legacy_joystick_slots.begin(),bridge.legacy_joystick_slots.end(),device.instance)!=bridge.legacy_joystick_slots.end())continue;
+        const auto free=std::find(bridge.legacy_joystick_slots.begin(),bridge.legacy_joystick_slots.end(),std::nullopt);
+        if(free!=bridge.legacy_joystick_slots.end())*free=device.instance;
+    }
+    if(id<bridge.legacy_joystick_slots.size() && bridge.legacy_joystick_slots[static_cast<std::size_t>(id)]){
+        const auto found=std::find_if(out.devices.begin(),out.devices.end(),[&](const auto& item){return item.instance==*bridge.legacy_joystick_slots[static_cast<std::size_t>(id)];});
+        if(found!=out.devices.end() && found->attached && bridge.backend->available(found->instance))out.device=&*found;
+    }
+    const auto* device=out.device;if(!device)return;
+    // 依 HID Usage 對應 X、Y、Z／Wheel、Rz、Slider、Rx，已選物件不重複。
+    constexpr std::array<std::array<std::uint16_t,5>,6> usage{{{{0x30,0x34,0,0,0}},{{0x31,0x33,0,0,0}},{{0x32,0x38,0x36,0x37,0}},{{0x35,0x36,0x37,0x34,0x33}},{{0x36,0x37,0x34,0x33,0}},{{0x33,0,0,0,0}}}};
+    auto& axes=out.axes;
+    const auto used=[&](std::size_t object){return std::any_of(axes.begin(),axes.end(),[&](const auto& selected){return selected && *selected==object;});};
+    for(unsigned axis=0;axis<axes.size();++axis){
+        for(const auto wanted:usage[axis]){if(!wanted)break;
+            for(std::size_t i=0;i<device->objects.size();++i){const auto& object=device->objects[i];
+                if(object.kind==input::ObjectKind::Axis && !object.relative && object.usage_page==1 && object.usage==wanted && !used(i)){axes[axis]=i;break;}}
+            if(axes[axis])break;
+        }
+        if(!axes[axis])for(std::size_t i=0;i<device->objects.size();++i){const auto& object=device->objects[i];
+            if(object.kind==input::ObjectKind::Axis && !object.relative && !object.usage_page && object.axis==axis && !used(i)){axes[axis]=i;break;}}
+    }
+    for(std::size_t i=0;i<device->objects.size();++i){const auto& object=device->objects[i];
+        if(object.kind==input::ObjectKind::Pov && !out.pov)out.pov=i;
+        else if(object.kind==input::ObjectKind::Button && out.buttons.size()<32)out.buttons.push_back(i);
+    }
+    std::stable_sort(out.buttons.begin(),out.buttons.end(),[&](auto a,auto b){return device->objects[a].instance<device->objects[b].instance;});
+}
+// joySetCapture：每個期限取樣一次，按鍵變化送 MM_JOYxBUTTONDOWN／UP（wParam 為 JOY_BUTTONnCHG 與目前按鍵），位置送 MM_JOYxMOVE（X、Y）
+// 與 MM_JOYxZMOVE（Z）；fChanged 時只在超過 joySetThreshold 的門檻才送，否則每個期限都送。視窗銷毀即解除擷取。
+void WindowsServices::poll_joystick_captures(){
+    for(unsigned id=0;id<gui_.joystick_captures.size();++id){
+        auto& slot=gui_.joystick_captures[id];if(!slot)continue;auto& capture=*slot;
+        const auto window=gui_.windows.find(capture.window);if(window==gui_.windows.end() || window->second.destroying){slot.reset();continue;}
+        if(runtime_.clock_ticks<capture.deadline)continue;
+        capture.deadline=runtime_.clock_ticks+capture.interval;
+        if(!dinput_ || !dinput_->backend)continue;
+        LegacyJoystick joystick;legacy_joystick(id,joystick);if(!joystick.device)continue;
+        const auto values=legacy_joystick_values(joystick,0x87);
+        const auto buttons=values[6]&0xfU,x=values[0],y=values[1],z=values[2];const auto position=(std::uint64_t{y}<<16)|x;
+        const auto post=[&](std::uint32_t message,std::uint64_t wparam,std::uint64_t lparam){if(gui_.queue.size()<10000)enqueue_gui_message({capture.window,wparam,lparam,message});};
+        for(unsigned bit=0;bit<4;++bit)if((buttons^capture.buttons)&(1U<<bit))post(((buttons>>bit)&1U?0x3b5U:0x3b7U)+id,(0x100U<<bit)|buttons,position);
+        capture.buttons=buttons;
+        const auto threshold=gui_.joystick_thresholds[id];
+        const auto distance=[](std::uint32_t a,std::uint32_t b){return a>b?a-b:b-a;};
+        if(!capture.changed || distance(x,capture.x)>threshold || distance(y,capture.y)>threshold){post(0x3a0U+id,buttons,position);capture.x=x;capture.y=y;}
+        if(joystick.axes[2] && (!capture.changed || distance(z,capture.z)>threshold)){post(0x3a2U+id,buttons,z);capture.z=z;}
     }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_dinput(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){

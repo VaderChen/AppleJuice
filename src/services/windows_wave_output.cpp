@@ -149,12 +149,26 @@ struct WinmmWaveOutput {
     std::shared_ptr<audio::Buffer> buffer;
     std::unique_ptr<audio::Output> output;
     std::uint64_t callback{},target{},instance{},completed_bytes{};
-    std::uint32_t callback_type{},volume{UINT32_MAX},device{};bool paused{};
+    std::uint32_t callback_type{},volume{UINT32_MAX},device{},rate{0x10000};bool paused{};
     struct Header {std::uint64_t data{};std::uint32_t capacity{};bool queued{};};
     struct Block {std::uint64_t header{},end{};};
+    // WHDR_BEGINLOOP 到 WHDR_ENDLOOP 的區塊範圍（pcm 位元組偏移）與 dwLoops；同時只有一段載入音訊緩衝，其餘依序等候。
+    struct Loop {std::uint64_t begin{},end{};std::uint32_t count{};};
     std::map<std::uint64_t,Header> headers;
     std::deque<Block> queue;
+    std::deque<Loop> loops;std::optional<std::uint64_t> loop_start;std::uint32_t loop_count{};
 };
+namespace {
+// 前一段迴圈已不再倒回時載入下一段；已播過結尾的迴圈略過。呼叫端持有 buffer.mutex。
+void install_wave_loop(WinmmWaveOutput& out){
+    auto& buffer=*out.buffer;
+    while(!buffer.loop_remaining && !out.loops.empty()){
+        const auto loop=out.loops.front();out.loops.pop_front();
+        if(loop.count<=1 || static_cast<std::uint64_t>(buffer.cursor)*buffer.frame_bytes()>=loop.end)continue;
+        buffer.loop_begin=loop.begin;buffer.loop_end=loop.end;buffer.loop_remaining=loop.count-1;
+    }
+}
+}
 namespace {
 std::optional<GuestCallback> notification(const WinmmWaveOutput& output,std::uint64_t handle,unsigned message,std::uint64_t header=0){
     if(!output.callback_type)return {};
@@ -185,8 +199,10 @@ void WindowsServices::poll_wave_output(GuestMemory& memory){
     const unsigned offset=x86_?16:24;
     for(auto& [handle,output]:wave_outputs_){
         if(output->queue.empty())continue;
-        std::lock_guard lock(output->buffer->mutex);auto& buffer=*output->buffer;
-        const auto consumed=buffer.playing || output->paused?static_cast<std::uint64_t>(buffer.cursor)*buffer.frame_bytes():buffer.pcm.size();
+        std::lock_guard lock(output->buffer->mutex);auto& buffer=*output->buffer;install_wave_loop(*output);
+        auto consumed=buffer.playing || output->paused?static_cast<std::uint64_t>(buffer.cursor)*buffer.frame_bytes():buffer.pcm.size();
+        // 迴圈還會倒回時，迴圈內的區塊尚未播完。
+        if(buffer.loop_remaining && buffer.loop_end>buffer.loop_begin)consumed=std::min(consumed,buffer.loop_begin);
         std::uint64_t removed=0;
         while(!output->queue.empty() && output->queue.front().end<=consumed){
             const auto block=output->queue.front();const auto flags=memory.load(GuestAddress{block.header+offset},32);
@@ -198,6 +214,8 @@ void WindowsServices::poll_wave_output(GuestMemory& memory){
             buffer.pcm.erase(buffer.pcm.begin(),buffer.pcm.begin()+static_cast<std::ptrdiff_t>(removed));
             buffer.cursor=buffer.playing || output->paused?std::max(0.0,buffer.cursor-static_cast<double>(removed/buffer.frame_bytes())):0;
             for(auto& block:output->queue)block.end-=removed;output->completed_bytes+=removed;
+            const auto shift=[&](std::uint64_t& value){value=value>=removed?value-removed:0;};
+            shift(buffer.loop_begin);shift(buffer.loop_end);for(auto& loop:output->loops){shift(loop.begin);shift(loop.end);}if(output->loop_start)shift(*output->loop_start);
         }
     }
     if(threads_.items.empty())return;
@@ -263,7 +281,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wave_output(GuestState& sta
                 auto label=mapper?std::u16string(u"Microsoft Sound Mapper"):host.name.empty()?std::u16string(u"Core Audio"):host.name;if(label.size()>31)label.resize(31);
                 std::vector<std::uint8_t> text;if(wide)text=utf16_bytes(label);else {const auto narrow=utf16_to_utf8(label);text.assign(narrow.begin(),narrow.begin()+static_cast<std::ptrdiff_t>(std::min<std::size_t>(narrow.size(),31)));}
                 put(0,1,2);put(2,mapper?2:0x64,2);put(4,0x100,4);std::copy(text.begin(),text.end(),caps.begin()+8);const unsigned at=wide?72:40;
-                put(at,0xfffff,4);put(at+4,!mapper && host.output_channels==1?1:2,2);put(at+8,0xc,4); // 11／22／44／48／96 kHz PCM；左右獨立音量。
+                put(at,0xfffff,4);put(at+4,!mapper && host.output_channels==1?1:2,2);put(at+8,0xe,4); // 11／22／44／48／96 kHz PCM；左右獨立音量、播放速率。
                 if(d(2))memory.write(GuestAddress{arg(1)},std::span(caps).first(std::min<std::size_t>(caps.size(),d(2))));
             }
         }else if(name=="waveOutOpen"){
@@ -308,12 +326,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_wave_output(GuestState& sta
                 else if(name=="waveOutReset"){
                     for(const auto& block:out->queue){const auto flags=memory.load(GuestAddress{block.header+flags_offset},32);memory.store(GuestAddress{block.header+flags_offset},32,(flags&~0x10U)|1U);out->headers.at(block.header).queued=false;notify(*out,arg(0),0x3bd,block.header);}
                     out->queue.clear();buffer.pcm.clear();buffer.cursor=0;buffer.playing=false;out->paused=false;out->completed_bytes=0;
+                    out->loops.clear();out->loop_start.reset();buffer.loop_remaining=0;buffer.loop_begin=buffer.loop_end=buffer.loop_frames=0;
                 }else if(name=="waveOutSetVolume"){out->volume=d(1);buffer.left=static_cast<float>(d(1)&65535)/65535;buffer.right=static_cast<float>(d(1)>>16)/65535;}
                 else if(name=="waveOutGetVolume"){if(!arg(1))result=11;else memory.store(GuestAddress{arg(1)},32,out->volume);}
+                // 播放速率為 16.16 固定點倍率，以重新取樣改變播放速度（WAVECAPS_PLAYBACKRATE）；裝置不支援 WAVECAPS_PITCH，音高調整為 MMSYSERR_NOTSUPPORTED。
+                else if(name=="waveOutGetPlaybackRate"){if(!arg(1))result=11;else memory.store(GuestAddress{arg(1)},32,out->rate);}
+                else if(name=="waveOutSetPlaybackRate"){
+                    const auto frequency=std::llround(static_cast<double>(buffer.rate)*d(1)/65536.0);
+                    if(!d(1) || frequency<1 || frequency>1536000)result=11;else {out->rate=d(1);buffer.frequency=static_cast<unsigned>(frequency);}
+                }else if(name=="waveOutGetPitch" || name=="waveOutSetPitch")result=8;
+                // 目前迴圈播完這一輪即結束，繼續播放後面的區塊。
+                else if(name=="waveOutBreakLoop"){buffer.loop_remaining=0;install_wave_loop(*out);}
                 else if(name=="waveOutGetPosition"){
                     if(!arg(1) || d(2)<12)result=11;
                     else {memory.check(GuestAddress{arg(1)},12,Access::Write);auto type=memory.load(GuestAddress{arg(1)},32);if(type!=1 && type!=2 && type!=4)type=4;
-                        const auto frames=out->completed_bytes/buffer.frame_bytes()+static_cast<std::uint64_t>(buffer.cursor);
+                        const auto frames=out->completed_bytes/buffer.frame_bytes()+static_cast<std::uint64_t>(buffer.cursor)+buffer.loop_frames;
                         memory.store(GuestAddress{arg(1)},32,type);memory.store(GuestAddress{arg(1)+4},32,type==1?frames*1000/buffer.rate:type==2?frames:frames*buffer.frame_bytes());}
                 }else {
                     const auto header=arg(1);
@@ -333,13 +360,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_wave_output(GuestState& sta
                         }else if(name=="waveOutWrite"){
                             if(prepared==out->headers.end() || !(flags&2U))result=34;
                             else if(prepared->second.queued)result=33;
-                            else if(flags&12U)result=8; // 多緩衝區 loop 尚未映射，不能忽略 loop 位元。
                             else if(wave_callbacks_.size()>=4096)result=7;
                             else {
                                 const auto data=memory.load(GuestAddress{header},bits);const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{header+unit},32));
                                 if(data!=prepared->second.data || size>prepared->second.capacity || size%buffer.frame_bytes())result=11;
                                 else if(size>output_limit-buffer.pcm.size())result=7;
-                                else {std::vector<std::uint8_t> bytes(size);if(size)memory.read(GuestAddress{data},bytes);buffer.pcm.insert(buffer.pcm.end(),bytes.begin(),bytes.end());out->queue.push_back({header,buffer.pcm.size()});prepared->second.queued=true;memory.store(GuestAddress{header+flags_offset},32,(flags&~1U)|0x10U);buffer.playing=!out->paused && !buffer.pcm.empty();}
+                                else {
+                                    const auto start=buffer.pcm.size();
+                                    std::vector<std::uint8_t> bytes(size);if(size)memory.read(GuestAddress{data},bytes);buffer.pcm.insert(buffer.pcm.end(),bytes.begin(),bytes.end());out->queue.push_back({header,buffer.pcm.size()});prepared->second.queued=true;memory.store(GuestAddress{header+flags_offset},32,(flags&~1U)|0x10U);
+                                    // WHDR_BEGINLOOP 記下起點與 dwLoops（播放次數），WHDR_ENDLOOP 結束範圍；沒有起點的 ENDLOOP 不構成迴圈。
+                                    if(flags&4U){out->loop_start=start;out->loop_count=static_cast<std::uint32_t>(memory.load(GuestAddress{header+(x86_?20U:28U)},32));}
+                                    if((flags&8U) && out->loop_start){out->loops.push_back({*out->loop_start,buffer.pcm.size(),out->loop_count});out->loop_start.reset();install_wave_loop(*out);}
+                                    buffer.playing=!out->paused && !buffer.pcm.empty();
+                                }
                             }
                         }else throw HostCallFault("未知的 WaveOut 服務");
                     }

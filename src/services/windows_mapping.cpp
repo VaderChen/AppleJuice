@@ -1,3 +1,4 @@
+#include "system_object_identity.hpp"
 #include "x64arm/process_identity.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/cross_architecture.hpp"
@@ -7,6 +8,7 @@
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
+#include "windows_globalroot_path.hpp"
 #include "x64arm/crypto.hpp"
 #include "x64arm/native_font_data.hpp"
 #include "x64arm/pe_section_image.hpp"
@@ -148,13 +150,41 @@ void reclaim_stale_sessions(const std::filesystem::path& own) noexcept {
         }
     }catch(...){ /* 回收失敗不影響啟動；下次建立 owner 時再試。 */ }
 }
-int font_directory(const Session& ns) {
-    if(::mkdirat(ns.directory,"fonts",0700) && errno!=EEXIST)return -1;
-    const auto descriptor=::openat(ns.directory,"fonts",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+int resource_directory(const Session& ns,const char* name) {
+    if(::mkdirat(ns.directory,name,0700) && errno!=EEXIST)return -1;
+    const auto descriptor=::openat(ns.directory,name,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
     struct stat details{};
     if(descriptor<0)return -1;
     if(::fstat(descriptor,&details) || details.st_uid!=::geteuid() || (details.st_mode&077)){::close(descriptor);errno=EACCES;return -1;}
     return descriptor;
+}
+std::pair<std::filesystem::path,std::uint32_t> publish_immutable_resource(const Session& ns,const char* directory_name,std::string_view suffix,std::span<const std::uint8_t> bytes) {
+    struct Descriptor {int value;~Descriptor(){if(value>=0)::close(value);}};
+    Descriptor directory{resource_directory(ns,directory_name)};if(directory.value<0)return {{},os_error()};
+    CryptoHash hash("SHA256",false,{});hash.update(bytes);std::string name;
+    for(const auto byte:hash.digest()){name+="0123456789abcdef"[byte>>4];name+="0123456789abcdef"[byte&15];}name+=suffix;
+    const auto valid=[&](int fd){
+        struct stat details{};if(fd<0 || ::fstat(fd,&details) || !S_ISREG(details.st_mode) || details.st_uid!=::geteuid() || (details.st_mode&0222) || static_cast<std::uint64_t>(details.st_size)!=bytes.size())return false;
+        std::array<std::uint8_t,4096> buffer{};
+        for(std::size_t offset=0;offset<bytes.size();){const auto size=std::min(buffer.size(),bytes.size()-offset);const auto got=::pread(fd,buffer.data(),size,static_cast<off_t>(offset));if(got<0 && errno==EINTR)continue;if(got!=static_cast<ssize_t>(size) || !std::equal(buffer.begin(),buffer.begin()+size,bytes.begin()+static_cast<std::ptrdiff_t>(offset)))return false;offset+=size;}
+        return true;
+    };
+    Descriptor existing{::openat(directory.value,name.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW)};
+    if(existing.value>=0){if(!valid(existing.value))return {{},5};}
+    else {
+        if(errno!=ENOENT)return {{},os_error()};
+        static std::atomic<std::uint64_t> sequence{};const auto temporary="pending-"+std::to_string(::getpid())+'-'+std::to_string(sequence++);
+        Descriptor output{::openat(directory.value,temporary.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600)};
+        if(output.value<0)return {{},os_error()};
+        struct Cleanup {int directory;const std::string& name;~Cleanup(){::unlinkat(directory,name.c_str(),0);}} cleanup{directory.value,temporary};
+        for(std::size_t offset=0;offset<bytes.size();){const auto written=::write(output.value,bytes.data()+offset,bytes.size()-offset);if(written<0 && errno==EINTR)continue;if(written<=0)return {{},os_error()};offset+=static_cast<std::size_t>(written);}
+        if(::fchmod(output.value,0400))return {{},os_error()};
+        if(::linkat(directory.value,temporary.c_str(),directory.value,name.c_str(),0)){
+            if(errno!=EEXIST)return {{},os_error()};
+            Descriptor duplicate{::openat(directory.value,name.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW)};if(!valid(duplicate.value))return {{},5};
+        }
+    }
+    return {ns.path/directory_name/name,0};
 }
 std::string object_name(std::u16string_view name) {
     std::uint64_t a = 14695981039346656037ULL, b = 0x84222325cbf29ce4ULL;
@@ -366,7 +396,7 @@ struct FileMappingState {
     struct Table {std::u16string generation;std::shared_ptr<Mapping> object;};
     struct Handle { std::shared_ptr<Mapping> object; std::uint32_t access; };
     struct View { std::shared_ptr<Mapping> object; std::uint64_t size{}, offset{}; bool copy{},dib{}; std::uint32_t protection{}; bool placeholder{}; };
-    std::shared_ptr<Session> name_space;
+    std::shared_ptr<Session> name_space,module_files;
     std::map<std::uint64_t,Handle> handles;
     std::map<std::uint64_t,View> views;
     std::map<std::u16string,Table> tables;
@@ -397,6 +427,7 @@ std::optional<WindowsServices::ObjectMetadata> WindowsServices::mapping_object_m
 #if !defined(_WIN32)
     if(!mappings_)return {};const auto at=mappings_->handles.find(handle);if(at==mappings_->handles.end())return {};const auto& object=at->second.object;
     ObjectMetadata out;out.access=at->second.access;out.identity=std::hash<std::string>{}(object->name);
+    out.system_key=detail::descriptor_object_key(detail::system_object_type_index(u"Section"),object->descriptor);
     for(const auto& [h,item]:mappings_->handles){(void)h;if(item.object->name==object->name)++out.handles;}
     out.pointers=out.handles;for(const auto& [address,view]:mappings_->views){(void)address;if(view.object->name==object->name)++out.pointers;}return out;
 #else
@@ -413,6 +444,37 @@ std::optional<WindowsServices::MappingViewInfo> WindowsServices::mapping_view_in
     (void)address;
 #endif
     return std::nullopt;
+}
+std::u16string WindowsServices::mapped_file_name(std::uint64_t address) const {
+    std::u16string path;
+    if(const auto* image=module_image(address,true);image && !image->private_code)path=image->path;
+#if !defined(_WIN32)
+    else if(mappings_){auto view=mappings_->views.upper_bound(address);if(view!=mappings_->views.begin()){--view;if(address-view->first<view->second.size)path=view->second.object->path;}}
+#endif
+    if(path.empty())return {};
+    std::replace(path.begin(),path.end(),u'/',u'\\');
+    // 映射物件保存開啟時的名稱；GLOBALROOT／卷 GUID／延伸 DOS 都可能到這裡。
+    // 先沿用檔案 provider 的卷解析，不能把合法的裝置前綴送入 DOS-only 正規化。
+    if(auto resolved=detail::globalroot_file_path(std::u16string_view(path),true);!resolved.empty())path=std::move(resolved);
+    if(path.starts_with(u"\\??\\"))path=u"\\\\?\\"+path.substr(4);
+    if(const auto volume=windows_volume_letter(std::u16string_view(path)))return windows_device_name(static_cast<char16_t>(volume))+u"\\"+path.substr(49);
+    if(path.starts_with(u"\\\\?\\")){
+        auto prefix=path.substr(4,4);for(auto& c:prefix)c=windows_path_upper(c);
+        path=prefix==u"UNC\\"?u"\\\\"+path.substr(8):path.substr(4);
+    }
+    if(path.starts_with(u"\\Device\\"))return path;
+    if(path.starts_with(u"\\\\"))return u"\\Device\\Mup\\"+path.substr(2);
+    path=normalized_windows_path(path,runtime_.current_directory);
+    // DOS 代號可改綁，卷掛載點也不一定對應字面的磁碟代號。內建映像或已移除檔案
+    // 無法再解析時保留既有名稱語義，仍核對目前代號與卷身分的關係。
+    const auto location=filesystem_.volume_location(utf16_to_utf8(path),true);
+    if(!location.error){auto relative=utf8_to_utf16(location.path);std::replace(relative.begin(),relative.end(),u'/',u'\\');return windows_device_name(static_cast<char16_t>(location.volume))+u"\\"+relative;}
+    if(path.size()>2 && path[1]==u':'){
+        auto volume=windows_path_upper(path[0]);const auto state=filesystem_.volume_state();
+        if(const auto alias=state.drives.find(static_cast<char>(volume));alias!=state.drives.end())volume=static_cast<char16_t>(alias->second);
+        return windows_device_name(volume)+path.substr(2);
+    }
+    return {};
 }
 bool WindowsServices::shared_mapping_page(std::uint64_t address) const {
 #if !defined(_WIN32)
@@ -437,7 +499,7 @@ std::string WindowsServices::mapping_session() {
     if (!mappings_->name_space) {mappings_->name_space = session();reclaim_stale_sessions(mappings_->name_space->path);}
     // session 可先於 initialize 建立或匯入；正式檔案系統建立後才完成一次掛載。
     if(!initialized_ || filesystem_.shared_session()==mappings_->name_space->path.native())return mappings_->name_space->path.string();
-    const auto fonts=font_directory(*mappings_->name_space);
+    const auto fonts=resource_directory(*mappings_->name_space,"fonts");
     if(fonts<0){const auto error=std::error_code(errno,std::generic_category());throw HostCallFault("無法準備共用字型檔案目錄："+error.message()+" (errno="+std::to_string(error.value())+")");}::close(fonts);
     filesystem_.mount_readonly("C:/Windows/Fonts/X64ARM",mappings_->name_space->path/"fonts");
     filesystem_.set_shared_session(mappings_->name_space->path.string());
@@ -464,8 +526,9 @@ int WindowsServices::mapping_session_descriptor() {
 void WindowsServices::set_mapping_session(const std::string& path,int inherited_descriptor) {
     if(!runtime_.network.external_io)throw HostCallFault("共用映射不支援 deterministic compare");
 #if !defined(_WIN32)
-    if (mappings_) throw std::invalid_argument("不能替換已使用的共用映射命名空間");
-    mappings_ = std::make_shared<FileMappingState>(); mappings_->name_space = session(path,inherited_descriptor);
+    if (mappings_ && mappings_->name_space) throw std::invalid_argument("不能替換已使用的共用映射命名空間");
+    if(!mappings_)mappings_ = std::make_shared<FileMappingState>();
+    mappings_->name_space = session(path,inherited_descriptor);
     (void)mapping_session();
 #else
     (void)path;(void)inherited_descriptor;
@@ -475,36 +538,28 @@ FileInformation WindowsServices::publish_font_file(std::span<const std::uint8_t>
     if(bytes.empty() || bytes.size()>native_font_file_limit)return {{},{},87};
 #if !defined(_WIN32)
     (void)mapping_session();
-    struct Descriptor {int value;~Descriptor(){if(value>=0)::close(value);}};
-    Descriptor directory{font_directory(*mappings_->name_space)};if(directory.value<0)return {{},{},os_error()};
-    CryptoHash hash("SHA256",false,{});hash.update(bytes);std::string name;
-    for(const auto byte:hash.digest()){name+="0123456789abcdef"[byte>>4];name+="0123456789abcdef"[byte&15];}name+=".ttf";
-    const auto valid=[&](int fd){
-        struct stat details{};if(fd<0 || ::fstat(fd,&details) || !S_ISREG(details.st_mode) || details.st_uid!=::geteuid() || (details.st_mode&0222) || static_cast<std::uint64_t>(details.st_size)!=bytes.size())return false;
-        std::array<std::uint8_t,4096> buffer{};
-        for(std::size_t offset=0;offset<bytes.size();){const auto size=std::min(buffer.size(),bytes.size()-offset);const auto got=::pread(fd,buffer.data(),size,static_cast<off_t>(offset));if(got<0 && errno==EINTR)continue;if(got!=static_cast<ssize_t>(size) || !std::equal(buffer.begin(),buffer.begin()+size,bytes.begin()+static_cast<std::ptrdiff_t>(offset)))return false;offset+=size;}
-        return true;
-    };
-    Descriptor existing{::openat(directory.value,name.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW)};
-    if(existing.value>=0){if(!valid(existing.value))return {{},{},5};}
-    else {
-        if(errno!=ENOENT)return {{},{},os_error()};
-        static std::atomic<std::uint64_t> sequence{};const auto temporary="pending-"+std::to_string(::getpid())+'-'+std::to_string(sequence++);
-        Descriptor output{::openat(directory.value,temporary.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600)};
-        if(output.value<0)return {{},{},os_error()};
-        struct Cleanup {int directory;const std::string& name;~Cleanup(){::unlinkat(directory,name.c_str(),0);}} cleanup{directory.value,temporary};
-        for(std::size_t offset=0;offset<bytes.size();){const auto written=::write(output.value,bytes.data()+offset,bytes.size()-offset);if(written<0 && errno==EINTR)continue;if(written<=0)return {{},{},os_error()};offset+=static_cast<std::size_t>(written);}
-        if(::fchmod(output.value,0400))return {{},{},os_error()};
-        if(::linkat(directory.value,temporary.c_str(),directory.value,name.c_str(),0)){
-            if(errno!=EEXIST)return {{},{},os_error()};
-            Descriptor duplicate{::openat(directory.value,name.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW)};if(!valid(duplicate.value))return {{},{},5};
-        }
-    }
-    return filesystem_.information("C:/Windows/Fonts/X64ARM/"+name);
+    const auto [path,error]=publish_immutable_resource(*mappings_->name_space,"fonts",".ttf",bytes);
+    if(error)return {{},{},error};
+    return filesystem_.information("C:/Windows/Fonts/X64ARM/"+path.filename().string());
 #else
     return {{},{},50};
 #endif
 }
+std::uint32_t WindowsServices::publish_module_file(std::u16string_view guest_path,std::span<const std::uint8_t> bytes) {
+#if !defined(_WIN32)
+    if(bytes.empty())return 87;
+    if(!mappings_)mappings_=std::make_shared<FileMappingState>();
+    // 主映像載入早於 CLI 的共享 namespace 交接；不可因此提早占用該 namespace。
+    // 生成模組另持有相同 Session 生命週期契約的私有儲存，檔案 I/O 仍走共用 provider。
+    if(!mappings_->module_files){mappings_->module_files=session();reclaim_stale_sessions(mappings_->module_files->path);}
+    const auto [path,error]=publish_immutable_resource(*mappings_->module_files,"modules",".dll",bytes);
+    if(error)return error;
+    filesystem_.mount_readonly_file(utf16_to_utf8(guest_path),path);return 0;
+#else
+    (void)guest_path;(void)bytes;return 50;
+#endif
+}
+
 std::size_t WindowsServices::mapping_handle_count() const {
 #if !defined(_WIN32)
     return mappings_?mappings_->handles.size():0;
@@ -757,9 +812,9 @@ std::uint64_t WindowsServices::map_dib_section(GuestMemory& memory,std::uint64_t
 }
 std::span<const WindowsServiceDescriptor> mapping_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
-        {"psapi.dll","GetMappedFileNameA",4},{"psapi.dll","GetMappedFileNameW",4},{"kernel32.dll","K32GetMappedFileNameA",4},{"kernel32.dll","K32GetMappedFileNameW",4},{"ntdll.dll","NtQuerySection",5},{"kernel32.dll","CreateFileMappingW",6},{"kernel32.dll","CreateFileMappingA",6},
+        {"psapi.dll","GetMappedFileNameA",4},{"psapi.dll","GetMappedFileNameW",4},{"kernel32.dll","K32GetMappedFileNameA",4},{"kernel32.dll","K32GetMappedFileNameW",4},{"ntdll.dll","NtQuerySection",5},{"kernel32.dll","CreateFileMappingW",6},{"kernel32.dll","CreateFileMappingA",6},{"kernel32.dll","CreateFileMappingNumaW",7},{"kernel32.dll","CreateFileMappingFromApp",5,1U<<3},
         {"kernel32.dll","OpenFileMappingW",3},{"kernel32.dll","OpenFileMappingA",3},
-        {"kernel32.dll","MapViewOfFile",5},{"kernel32.dll","MapViewOfFileEx",6},
+        {"kernel32.dll","MapViewOfFile",5},{"kernel32.dll","MapViewOfFileEx",6},{"kernel32.dll","MapViewOfFileExNuma",7},{"kernel32.dll","MapViewOfFileFromApp",4,1U<<2},
         {"kernel32.dll","UnmapViewOfFile",1},{"kernel32.dll","FlushViewOfFile",2}
     };return table;
 }
@@ -892,12 +947,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
         if(!current_process_handle(arg(0),0x400))fail(6);
         else if(!arg(2) || !dword(3))fail(87);
         else {
-            std::u16string path;
-            if(const auto* image=module_image(arg(1),true))path=image->path;
-            else {auto view=mappings_->views.upper_bound(arg(1));if(view!=mappings_->views.begin()){--view;if(arg(1)-view->first<view->second.size)path=view->second.object->path;}}
+            const auto path=mapped_file_name(arg(1));
             if(path.empty())fail(memory.query(GuestAddress{arg(1)})?1006:487);
-            else {std::replace(path.begin(),path.end(),u'/',u'\\');if(path.size()<2 || path[1]!=u':')path=normalized_windows_path(path,runtime_.current_directory);
-                path=windows_device_name(path[0])+path.substr(2);
+            else {
                 const bool wide=symbol.ends_with('W');const auto ansi=utf16_to_utf8(path);const auto length=wide?path.size():ansi.size(),count=std::min<std::size_t>(length,dword(3)-1);
                 if(wide)memory.write(GuestAddress{arg(2)},utf16_bytes(path.substr(0,count)));else {std::vector<std::uint8_t> bytes(ansi.begin(),ansi.begin()+static_cast<std::ptrdiff_t>(count));bytes.push_back(0);memory.write(GuestAddress{arg(2)},bytes);}
                 result=std::min<std::uint64_t>(length,dword(3));if(length>=dword(3))last_error_=122;
@@ -923,17 +975,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
         }
     }
     else if (symbol.starts_with("CreateFileMapping") || symbol.starts_with("OpenFileMapping")) {
-        const bool create = symbol.starts_with("Create"); const auto name_at = arg(create ? 5 : 2);
+        // CreateFileMappingNumaW 多一個偏好 NUMA 節點（單一節點，略過）；CreateFileMappingFromApp 以單一 64 位元大小取代高低兩半，名稱移到第 5 個參數。
+        const bool create = symbol.starts_with("Create"),from_app=symbol=="CreateFileMappingFromApp"; const auto name_at = arg(create ? (from_app?4:5) : 2);
         // Native 建立／再次開啟保留原 DesiredAccess；不能為共用 Win32 流程多要求權限，
         // 再於完成時縮小 handle。新建與既有物件均沿相同權限值，DACL 仍照原流程檢查。
         const auto create_access=create && service.family=="internal-nt-mapping"?dword(6):0xf001fU;
         const auto security=create?synchronization_descriptor(memory,arg(1)):SynchronizationDescriptor{arg(1)!=0,{}};
-        auto name = name_at ? (symbol.ends_with('W') ? read_utf16(memory,GuestAddress{name_at}) : utf8_to_utf16(read_ansi(memory,name_at))) : std::u16string{};
+        auto name = name_at ? (symbol.ends_with('W') || from_app ? read_utf16(memory,GuestAddress{name_at}) : utf8_to_utf16(read_ansi(memory,name_at))) : std::u16string{};
         if(name.starts_with(u"Local\\"))name.erase(0,6);
         const auto protection = create ? dword(2) : 0;
         const auto attributes=protection&~0xffU,mode=protection&0xffU;
         const bool image=(attributes&0x1000000U)!=0;
-        const auto size = create ? (std::uint64_t{dword(3)} << 32) | dword(4) : 0;
+        const auto size = create ? (from_app ? arg(3) : (std::uint64_t{dword(3)} << 32) | dword(4)) : 0;
         if (create && ((attributes && attributes!=0x8000000U && attributes!=0x1000000U && attributes!=0x11000000U) ||
             (mode!=2 && mode!=4 && mode!=8 && mode!=0x20U && mode!=0x40U && mode!=0x80U) ||
             (attributes==0x11000000U && mode!=2))) fail(87);
@@ -948,6 +1001,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
             const auto file = files_.find(arg(0));
             if (file == files_.end()) fail(6);
             else if (file->second.native && file->second.native->null_device()) fail(6);
+            else if (file->second.native && file->second.native->volume_device()) fail(1);
             else if (!file->second.native) fail(50);
             else if (!(file->second.access & (0x80000000U|1U|0x20U)) || (!image && (mode==4 || mode==0x40U) && !(file->second.access & (0x40000000U|2U)))) fail(5);
             else {
@@ -988,8 +1042,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
                 }
             }
         }
-    } else if (symbol == "MapViewOfFile" || symbol == "MapViewOfFileEx") {
-        result=map_file_view(memory,arg(0),dword(1),(std::uint64_t{dword(2)}<<32)|dword(3),arg(4),symbol=="MapViewOfFileEx"?arg(5):0);
+    } else if (symbol == "MapViewOfFileFromApp") {
+        // 單一 64 位元檔案位移；不指定位址。
+        result=map_file_view(memory,arg(0),dword(1),arg(2),arg(3),0);
+    } else if (symbol == "MapViewOfFile" || symbol == "MapViewOfFileEx" || symbol == "MapViewOfFileExNuma") {
+        result=map_file_view(memory,arg(0),dword(1),(std::uint64_t{dword(2)}<<32)|dword(3),arg(4),symbol!="MapViewOfFile"?arg(5):0);
     } else if (symbol == "UnmapViewOfFile") {
         result=unmap_file_view(memory,arg(0));
     } else if (symbol == "FlushViewOfFile") {

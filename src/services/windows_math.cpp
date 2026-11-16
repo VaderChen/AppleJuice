@@ -6,6 +6,7 @@
 #include "x64arm/x87_fp.hpp"
 #include "x64arm/unicode.hpp"
 #include "d3dx_sh.hpp"
+#include "d3dx_math_native.hpp"
 #include "windows_locale_data.hpp"
 #include <limits>
 extern "C" {
@@ -56,15 +57,6 @@ constexpr ComplexOperation complex_operations[]{
 const ComplexOperation* complex_operation(std::string_view name){
     for(const auto& operation:complex_operations)if(name==operation.name)return &operation;
     return nullptr;
-}
-template<class T> std::complex<T> complex_value(ComplexKind kind,std::complex<T> x,std::complex<T> y){
-#if defined(__clang__)
-#pragma STDC FENV_ACCESS ON
-#endif
-    const T input[]{x.real(),x.imag(),y.real(),y.imag()};T output[2];
-    if constexpr(sizeof(T)==4)x64arm_complex_float(kind,input,output);
-    else x64arm_complex_double(kind,input,output);
-    return {output[0],output[1]};
 }
 }
 std::span<const WindowsServiceDescriptor> math_service_descriptors() {
@@ -157,6 +149,8 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"d3dx9_43.dll","D3DXPlaneFromPointNormal",3},
         {"d3dx9_43.dll","D3DXComputeBoundingSphere",5},
         {"d3dx9_43.dll","D3DXFloat16To32Array",3},
+        // d3dx9 數學補充（d3dx_math_extras.inc）。
+        {"d3dx9_43.dll","D3DXMatrixPerspectiveFovRH",5},{"d3dx9_43.dll","D3DXMatrixPerspectiveLH",5},{"d3dx9_43.dll","D3DXMatrixPerspectiveRH",5},{"d3dx9_43.dll","D3DXMatrixPerspectiveOffCenterLH",7},{"d3dx9_43.dll","D3DXMatrixPerspectiveOffCenterRH",7},{"d3dx9_43.dll","D3DXMatrixOrthoOffCenterRH",7},{"d3dx9_43.dll","D3DXMatrixLookAtRH",4},{"d3dx9_43.dll","D3DXMatrixShadow",3},{"d3dx9_43.dll","D3DXMatrixDeterminant",1},{"d3dx9_43.dll","D3DXMatrixDecompose",4},{"d3dx9_43.dll","D3DXMatrixTransformation",7},{"d3dx9_43.dll","D3DXMatrixTransformation2D",7},{"d3dx9_43.dll","D3DXMatrixAffineTransformation",5},{"d3dx9_43.dll","D3DXMatrixAffineTransformation2D",5},{"d3dx9_43.dll","D3DXVec2BaryCentric",6},{"d3dx9_43.dll","D3DXVec3BaryCentric",6},{"d3dx9_43.dll","D3DXVec4BaryCentric",6},{"d3dx9_43.dll","D3DXVec2CatmullRom",6},{"d3dx9_43.dll","D3DXVec3CatmullRom",6},{"d3dx9_43.dll","D3DXVec4CatmullRom",6},{"d3dx9_43.dll","D3DXVec2Hermite",6},{"d3dx9_43.dll","D3DXVec3Hermite",6},{"d3dx9_43.dll","D3DXVec4Hermite",6},{"d3dx9_43.dll","D3DXVec2Transform",3},{"d3dx9_43.dll","D3DXVec2TransformCoord",3},{"d3dx9_43.dll","D3DXVec2TransformNormal",3},{"d3dx9_43.dll","D3DXVec2TransformArray",6},{"d3dx9_43.dll","D3DXVec2TransformCoordArray",6},{"d3dx9_43.dll","D3DXVec2TransformNormalArray",6},{"d3dx9_43.dll","D3DXVec3TransformArray",6},{"d3dx9_43.dll","D3DXVec3TransformCoordArray",6},{"d3dx9_43.dll","D3DXVec3TransformNormalArray",6},{"d3dx9_43.dll","D3DXVec4TransformArray",6},{"d3dx9_43.dll","D3DXPlaneTransformArray",6},{"d3dx9_43.dll","D3DXVec3Project",6},{"d3dx9_43.dll","D3DXVec3ProjectArray",9},{"d3dx9_43.dll","D3DXVec3UnprojectArray",9},{"d3dx9_43.dll","D3DXVec4Cross",4},{"d3dx9_43.dll","D3DXQuaternionRotationAxis",3},{"d3dx9_43.dll","D3DXQuaternionToAxisAngle",3},{"d3dx9_43.dll","D3DXQuaternionExp",2},{"d3dx9_43.dll","D3DXQuaternionLn",2},{"d3dx9_43.dll","D3DXQuaternionSlerp",4},{"d3dx9_43.dll","D3DXQuaternionSquad",6},{"d3dx9_43.dll","D3DXQuaternionSquadSetup",7},{"d3dx9_43.dll","D3DXQuaternionBaryCentric",6},{"d3dx9_43.dll","D3DXPlaneFromPoints",4},{"d3dx9_43.dll","D3DXPlaneIntersectLine",4},{"d3dx9_43.dll","D3DXPlaneNormalize",2},{"d3dx9_43.dll","D3DXPlaneTransform",3},{"d3dx9_43.dll","D3DXColorAdjustContrast",3},{"d3dx9_43.dll","D3DXColorAdjustSaturation",3},{"d3dx9_43.dll","D3DXFresnelTerm",2},{"d3dx9_43.dll","D3DXIntersectTri",8},{"d3dx9_43.dll","D3DXBoxBoundProbe",4},{"d3dx9_43.dll","D3DXSphereBoundProbe",4},{"d3dx9_43.dll","D3DXSHMultiply2",3},{"d3dx9_43.dll","D3DXSHMultiply3",3},{"d3dx9_43.dll","D3DXSHMultiply4",3},{"d3dx9_43.dll","D3DXSHRotateZ",4},{"d3dx9_43.dll","D3DXSHEvalDirectionalLight",8},{"d3dx9_43.dll","D3DXSHEvalSphericalLight",9},{"d3dx9_43.dll","D3DXCheckVersion",2},{"d3dx9_43.dll","D3DXDebugMute",1},{"d3dx9_43.dll","D3DXSHEvalHemisphereLight",7,0,0xc},
         {"msvbvm60.dll","_allmul",2,3},{"crt","_allmul",2,3},
         {"msvbvm60.dll","_CIatan",0},{"msvbvm60.dll","_CIcos",0},{"msvbvm60.dll","_CIexp",0},
         {"msvbvm60.dll","_CIlog",0},{"msvbvm60.dll","_CIsin",0},{"msvbvm60.dll","_CIsqrt",0},{"msvbvm60.dll","_CItan",0},
@@ -169,7 +163,7 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"crt","_CIsinh",0},{"crt","_CIsqrt",0},{"crt","_CItan",0},{"crt","_CItanh",0},
         {"crt","_ftol",0},{"crt","_ftol2",0},{"crt","_ftol2_sse",0},
         {"crt","_clear87",0},{"crt","_clearfp",0},{"crt","_status87",0},{"crt","_statusfp",0},{"crt","_statusfp2",2},
-        {"crt", "fetestexcept", 1}, {"crt", "feclearexcept", 1}, {"crt", "_dclass", 1}, {"crt", "_fdclass", 1}, {"crt", "_ldclass", 1}, {"crt", "_fpclass", 1}, {"crt", "_fpclassf", 1}, {"crt", "_dsign", 1}, {"crt", "_fdsign", 1}, {"crt", "_ldsign", 1}, {"crt", "_control87", 2}, {"crt", "_controlfp", 2}, {"crt","_controlfp_s",3},
+        {"crt", "fetestexcept", 1}, {"crt", "feclearexcept", 1}, {"crt","fegetround",0},{"crt","fesetround",1},{"crt","fegetenv",1},{"crt","fesetenv",1},{"crt","feholdexcept",1},{"crt","fegetexceptflag",2},{"crt","fesetexceptflag",2}, {"crt", "_dclass", 1}, {"crt", "_fdclass", 1}, {"crt", "_ldclass", 1}, {"crt", "_fpclass", 1}, {"crt", "_fpclassf", 1}, {"crt", "_dsign", 1}, {"crt", "_fdsign", 1}, {"crt", "_ldsign", 1}, {"crt", "_control87", 2}, {"crt", "_controlfp", 2}, {"crt","_controlfp_s",3},
         {"crt","__fpe_flt_rounds",0},{"crt","_fpreset",0},{"crt","_except1",6,12},
         {"crt","_dpcomp",2,3},{"crt","_fdpcomp",2},{"crt","ilogb",1,1},{"crt","ilogbf",1},
         {"crt", "acos", 1,1}, {"crt", "acosh", 1,1}, {"crt", "asin", 1,1}, {"crt", "asinh", 1,1},
@@ -324,7 +318,8 @@ unsigned commit_math_environment(GuestState& state,GuestMemory& memory,std::uint
     if(x86){state.x87_status=static_cast<std::uint16_t>(state.x87_status|fp_flags);if(fp_flags&~static_cast<unsigned>(state.x87_control)&63U)state.x87_status|=0x8080;}
     else state.mxcsr|=fp_flags;
     const auto error=math_error(raised,environment.error());
-    if (error) memory.store(GuestAddress{errno_cell},32,static_cast<std::uint32_t>(error));
+    // errno_cell 為 0：只提交浮點狀態（STL 的純算術不修改 errno）。
+    if (error && errno_cell) memory.store(GuestAddress{errno_cell},32,static_cast<std::uint32_t>(error));
     return static_cast<unsigned>(raised);
 }
 
@@ -660,6 +655,9 @@ void invoke_scalar_math(GuestState& state,GuestMemory& memory,const WindowsServi
 #endif
 }
 void windows_floating_return(GuestState& state,bool x86,double value,bool single){conversion_result(state,x86,value,single);}
+unsigned windows_commit_math_environment(GuestState& state,GuestMemory& memory,std::uint64_t errno_cell,bool x86,const WindowsMathEnvironment& environment){
+    return commit_math_environment(state,memory,errno_cell,x86,environment);
+}
 // Win32 CRT x87 暫存器 ABI（_CI* 以 ST0／ST1 進、ST0 出；_ftol* 以 ST0 進、EAX／EDX 出）。協調者以目前執行緒、
 // worker 以呼叫執行緒的 errno 格位共用同一實作。
 std::optional<std::uint32_t> WindowsServices::invoke_x87_crt_math(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service,std::uint64_t errno_cell) {
@@ -741,7 +739,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
             const auto output=hidden?arg(0):0;
             if(hidden)memory.check(GuestAddress{output},16,Access::Write);
             Environment environment(x86_?static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13:state.mxcsr);
-            const auto result=complex_value(operation->kind,x,y);
+            const auto result=host_complex(operation->kind,x,y);
             if(operation->real){
                 if(x86_)conversion_result(state,true,result.real(),single);
                 else {
@@ -921,6 +919,67 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
             begin_exception(caller,memory,exception,0,{});
         state=caller;return std::nullopt;
     }
+    // _controlfp 與 <fenv.h> 共用：依抽象控制字（_MCW_*）更新 MXCSR 與 x87 控制字，回傳更新後的抽象控制字（mask＝0 只讀取）。
+    const auto apply_control=[&](std::uint32_t requested,std::uint32_t mask)->std::uint32_t{
+            constexpr std::array<std::uint32_t,6> exceptions{0x10,0x80000,8,4,2,1};
+            for(unsigned i=0;i<exceptions.size();++i)if(mask&exceptions[i]) {
+                const auto bit=1U<<(7+i);state.mxcsr=(state.mxcsr&~bit)|((requested&exceptions[i])?bit:0);
+                if(x86_)state.x87_control=static_cast<std::uint16_t>((state.x87_control&~(1U<<i))|((requested&exceptions[i])?(1U<<i):0));
+            }
+            const auto rounding_mask=(mask&0x300U)<<5;
+            state.mxcsr=(state.mxcsr&~rounding_mask)|((requested<<5)&rounding_mask);
+            if(x86_) {
+                const auto rc=(mask&0x300U)<<2;state.x87_control=static_cast<std::uint16_t>((state.x87_control&~rc)|((requested<<2)&rc));
+                if(mask&0x30000U){const auto pc=requested&0x30000U;state.x87_control=static_cast<std::uint16_t>((state.x87_control&~0x300U)|(pc==0x20000?0:pc==0x10000?0x200:0x300));}
+                if(mask&0x40000U)state.x87_control=static_cast<std::uint16_t>((state.x87_control&~0x1000U)|((requested&0x40000U)?0x1000:0));
+            }
+            if(mask&0x3000000U){
+                const auto mode=requested&0x3000000U;state.mxcsr&=~0x8040U;
+                if(mode==0x1000000 || mode==0x2000000)state.mxcsr|=0x8000;
+                if(mode==0x1000000 || mode==0x3000000)state.mxcsr|=0x40;
+            }
+            std::uint32_t result=(state.mxcsr>>5)&0x300U;
+            for(unsigned i=0;i<exceptions.size();++i)if(state.mxcsr&(1U<<(7+i)))result|=exceptions[i];
+            const bool flush=state.mxcsr&0x8000,zero=state.mxcsr&0x40;
+            result|=flush?(zero?0x1000000U:0x2000000U):(zero?0x3000000U:0U);
+            if(x86_){
+                const auto pc=state.x87_control&0x300;result|=pc==0?0x20000U:pc==0x200?0x10000U:0U;if(state.x87_control&0x1000)result|=0x40000;
+                std::uint32_t x87=(state.x87_control>>2)&0x300U;for(unsigned i=0;i<exceptions.size();++i)if(state.x87_control&(1U<<i))x87|=exceptions[i];
+                if((x87^result)&0x8031fU)result|=0x80000000U;
+            }
+            return result;
+        };
+    // 抽象例外狀態（_SW_*）：MXCSR 與 x87 狀態字的旗標位置相同；只處理 FE_ALL_EXCEPT 與 _SW_DENORMAL。
+    constexpr std::array<std::uint32_t,6> fenv_exceptions{0x10,0x80000,8,4,2,1};
+    const auto fenv_status=[&]{std::uint32_t result=0;const auto flags=state.mxcsr|(x86_?state.x87_status:0U);for(unsigned n=0;n<6;++n)if(flags&(1U<<n))result|=fenv_exceptions[n];return result;};
+    const auto fenv_set_status=[&](std::uint32_t mask,std::uint32_t values){
+        for(unsigned n=0;n<6;++n)if(mask&fenv_exceptions[n]){
+            const bool on=(values&fenv_exceptions[n])!=0;state.mxcsr=on?state.mxcsr|(1U<<n):state.mxcsr&~(1U<<n);
+            if(x86_)state.x87_status=static_cast<std::uint16_t>(on?state.x87_status|(1U<<n):state.x87_status&~(1U<<n));
+        }
+    };
+    if(symbol=="fegetround" || symbol=="fesetround" || symbol=="fegetenv" || symbol=="fesetenv" || symbol=="feholdexcept" || symbol=="fegetexceptflag" || symbol=="fesetexceptflag"){
+        // fenv_t＝{_Fe_ctl 抽象控制字, _Fe_stat 抽象狀態}；捨入值 FE_* 與 _RC_* 相同，例外值 FE_* 與 _SW_* 相同。
+        const auto all=0x8031fU|(x86_?0x70000U:0U)|0x3000000U;std::uint32_t result=0;
+        if(symbol=="fegetround")result=apply_control(0,0)&0x300U;
+        else if(symbol=="fesetround"){const auto mode=static_cast<std::uint32_t>(arg(0));if(mode&~0x300U)result=1;else (void)apply_control(mode,0x300U);}
+        else if(symbol=="fegetexceptflag" || symbol=="fesetexceptflag"){
+            const auto excepts=static_cast<std::uint32_t>(arg(1))&0x1fU;
+            if(!arg(0))result=1;
+            else if(symbol=="fegetexceptflag")memory.store(GuestAddress{arg(0)},32,fenv_status()&excepts);
+            else fenv_set_status(excepts,static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},32)));
+        }else{
+            const auto env=arg(0);
+            if(!env)result=1;
+            else if(symbol=="fesetenv"){(void)apply_control(static_cast<std::uint32_t>(memory.load(GuestAddress{env},32)),all);fenv_set_status(0x8001fU,static_cast<std::uint32_t>(memory.load(GuestAddress{env+4},32)));}
+            else{
+                memory.store(GuestAddress{env},32,apply_control(0,0));memory.store(GuestAddress{env+4},32,fenv_status()&0x8001fU);
+                // feholdexcept：保存環境後清除旗標並遮罩全部例外（不停止）。
+                if(symbol=="feholdexcept"){fenv_set_status(0x8001fU,0);(void)apply_control(0x8001fU,0x8001fU);}
+            }
+        }
+        arg.return_to(state,result);return std::nullopt;
+    }
     if(symbol=="_control87" || symbol=="_controlfp" || symbol=="_controlfp_s") {
         const bool secure=symbol=="_controlfp_s";const unsigned first=secure?1U:0U;
         const auto requested=static_cast<std::uint32_t>(arg(first));
@@ -928,32 +987,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         const bool invalid=(!x86_ && (mask&0x70000U)) || (secure && (requested&mask&~0x30f031fU));
         if(secure && arg(0))memory.check(GuestAddress{arg(0)},4,Access::Write);
         if(invalid)mask=0;
-        constexpr std::array<std::uint32_t,6> exceptions{0x10,0x80000,8,4,2,1};
-        for(unsigned i=0;i<exceptions.size();++i)if(mask&exceptions[i]) {
-            const auto bit=1U<<(7+i);state.mxcsr=(state.mxcsr&~bit)|((requested&exceptions[i])?bit:0);
-            if(x86_)state.x87_control=static_cast<std::uint16_t>((state.x87_control&~(1U<<i))|((requested&exceptions[i])?(1U<<i):0));
-        }
-        const auto rounding_mask=(mask&0x300U)<<5;
-        state.mxcsr=(state.mxcsr&~rounding_mask)|((requested<<5)&rounding_mask);
-        if(x86_) {
-            const auto rc=(mask&0x300U)<<2;state.x87_control=static_cast<std::uint16_t>((state.x87_control&~rc)|((requested<<2)&rc));
-            if(mask&0x30000U){const auto pc=requested&0x30000U;state.x87_control=static_cast<std::uint16_t>((state.x87_control&~0x300U)|(pc==0x20000?0:pc==0x10000?0x200:0x300));}
-            if(mask&0x40000U)state.x87_control=static_cast<std::uint16_t>((state.x87_control&~0x1000U)|((requested&0x40000U)?0x1000:0));
-        }
-        if(mask&0x3000000U){
-            const auto mode=requested&0x3000000U;state.mxcsr&=~0x8040U;
-            if(mode==0x1000000 || mode==0x2000000)state.mxcsr|=0x8000;
-            if(mode==0x1000000 || mode==0x3000000)state.mxcsr|=0x40;
-        }
-        std::uint32_t result=(state.mxcsr>>5)&0x300U;
-        for(unsigned i=0;i<exceptions.size();++i)if(state.mxcsr&(1U<<(7+i)))result|=exceptions[i];
-        const bool flush=state.mxcsr&0x8000,zero=state.mxcsr&0x40;
-        result|=flush?(zero?0x1000000U:0x2000000U):(zero?0x3000000U:0U);
-        if(x86_){
-            const auto pc=state.x87_control&0x300;result|=pc==0?0x20000U:pc==0x200?0x10000U:0U;if(state.x87_control&0x1000)result|=0x40000;
-            std::uint32_t x87=(state.x87_control>>2)&0x300U;for(unsigned i=0;i<exceptions.size();++i)if(state.x87_control&(1U<<i))x87|=exceptions[i];
-            if((x87^result)&0x8031fU)result|=0x80000000U;
-        }
+        const auto result=apply_control(requested,mask);
         if(secure && arg(0))memory.store(GuestAddress{arg(0)},32,result);
         if(invalid){
             memory.store(GuestAddress{runtime_.errno_cell},32,22);

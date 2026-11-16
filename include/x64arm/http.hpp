@@ -56,8 +56,17 @@ struct HttpHandle {
     process_io::Counters io_accounted;
     bool operator==(const HttpHandle&) const = default;
 };
+// WinINet Cookie（RFC 6265）：domain 小寫且無前導點；expires 為 FILETIME，0 表示 session Cookie。
+struct HttpCookie {
+    std::string name,value,domain,path;
+    std::uint64_t expires{},created{};
+    bool host_only{},secure{},http_only{};
+    bool operator==(const HttpCookie&) const = default;
+};
 struct HttpState {
     bool cache_active{};
+    // WinINet session Cookie 只存在於本程序；持久 Cookie 存於登錄（url_cache::cookie_index）。
+    std::vector<HttpCookie> session_cookies;
     std::uint64_t next{0x68000000};
     std::map<std::uint64_t,HttpHandle> handles;
     std::map<std::uint64_t,std::uint64_t> connection_probes;

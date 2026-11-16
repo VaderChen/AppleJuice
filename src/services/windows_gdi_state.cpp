@@ -35,7 +35,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi_state(GuestState& state
         shared_gui_window(arg(0)-0x10000000):std::optional<SharedWindowInfo>{};
     const bool known=gui_.contexts.contains(arg(0)) || gui_.dc_objects.contains(arg(0)) || window!=gui_.windows.end();
     if(name=="GetObjectType"){
-        const auto h=arg(0);if(gui_.metafiles.contains(h))return finish(13);if(gui_.windows_metafiles.contains(h))return finish(9);if(gui_.emf_recorders.contains(h))return finish(12);
+        const auto h=arg(0);if(gui_.metafiles.contains(h))return finish(13);if(gui_.windows_metafiles.contains(h))return finish(9);if(gui_.emf_recorders.contains(h))return finish(gui_.emf_recorders.at(h).wmf?4:12); // OBJ_METADC／OBJ_ENHMETADC
         if(known)return finish(is_printer_dc(h) || window!=gui_.windows.end() || (gui_.contexts.contains(h) && gui_.contexts.at(h).display)?3:10);
         if(gui_.bitmaps.contains(h) || h==0xb015)return finish(7);
         if(gui_.regions.contains(h))return finish(8);

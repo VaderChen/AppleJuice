@@ -377,7 +377,9 @@ void load_config(const Image& image, Directory dir, std::uint64_t base, RuntimeI
     if (!dir.rva) { if(guarded)reject("GuardCF 缺少 Load Config");return; }
     if (dir.size < 4) reject("Load Config 標頭截斷");
     const auto size = image.integer(dir.rva, 4);
-    if (size < 4 || size > dir.size || size > 320) reject("尚未支援此 Load Config 大小");
+    // 新版 SDK 的 Load Config 在 320 之後還有欄位（GuardMemcpyFunctionPointer、UMA 等）。舊版 Windows 只讀自己認得的長度、
+    // 忽略其餘；這裡同樣接受較長的結構，但下方仍要求未支援的欄位為零，非零才拒絕。
+    if (size < 4 || size > dir.size || size > 1024) reject("尚未支援此 Load Config 大小");
     const bool cfg=guarded && !pre_cfg_load_config(size,dir,8);
     // CFG 由客體載入器安裝檢查／dispatch 入口，不能保留 compiler 的 no-op stub。
     // XFG 映像可在未啟用 XFG 的程序中使用 CFG 相容模式；不宣告 hash enforcement。
@@ -678,7 +680,8 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
     }
     // 一般 DLL 也可能標記 NATIVE；後面依匯入契約區分 Win32 模組與驅動。
     if (!inventory_only && !section_only && file.u16(opt + 68) != 3 && file.u16(opt + 68) != 2 && !(dll && file.u16(opt + 68) == 1)) reject("只支援 Windows console／GUI subsystem");
-    if (!resource_only && !inventory_only && !section_only && (file.u16(opt + 70) & 0x1000U)) reject("尚未支援 AppContainer 映像");
+    // AppContainer 旗標只決定 EXE 的執行環境；Windows 在一般程序中照常載入帶此旗標的 DLL（例如以資訊清單註冊的 WinRT 元件）。
+    if (!dll && !resource_only && !inventory_only && !section_only && (file.u16(opt + 70) & 0x1000U)) reject("尚未支援 AppContainer 映像");
     if (directory_count > 16 || std::uint64_t{directory_count} * 8 + directory_offset > optional_size) reject("data directory 數目超過 optional header");
     const auto table = opt + optional_size;
     file.check(0, headers); file.check(table, std::size_t{count} * 40);

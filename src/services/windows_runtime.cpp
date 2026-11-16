@@ -4,6 +4,7 @@
 #include "service_callback_task.hpp"
 #include "guest_crt_state.h"
 #include "crt_format_contract.h"
+#include "crt_nonfinite_format.hpp"
 #include "guest_heap_layout.hpp"
 #include "guest_tls.hpp"
 #include "gui_paint_region.hpp"
@@ -52,7 +53,7 @@ std::uint64_t WindowsServices::current_invalid_parameter_handler() const {
     return found!=threads_.items.end() && found->second.invalid_parameter_handler?found->second.invalid_parameter_handler:runtime_.invalid_parameter_handler;
 }
 
-namespace {bool crt_format_symbol(std::string_view symbol) noexcept;}
+namespace {bool crt_format_symbol(std::string_view symbol) noexcept;std::span<const WindowsServiceDescriptor> crt_format_variant_descriptors();}
 // 延伸服務目錄：合併後的描述表、每個群組宣告的處理函式，以及合併時的稽核紀錄。第一次使用時建立，之後唯讀。
 // 群組是登錄與路由的共同單位：描述項放在處理它的家族檔案裡，群組列直接寫出處理函式（nullptr＝invoke_runtime 的內建分支）。
 struct WindowsServices::RuntimeCatalog {
@@ -188,6 +189,7 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
         struct Entry {std::span<const WindowsServiceDescriptor> descriptors;bool unique;std::string_view name;RuntimeHandler handler;};
         const Entry entries[]{
             {table, false, "runtime_base", nullptr},
+            {crt_format_variant_descriptors(), false, "crt_format_variant_descriptors", nullptr},
             {crt_io_service_descriptors(), true, "crt_io_service_descriptors", &WindowsServices::invoke_crt_io},
             {exception_service_descriptors(), true, "exception_service_descriptors", &WindowsServices::invoke_exception},
             {gui_core_service_descriptors(), true, "gui_core_service_descriptors", &WindowsServices::invoke_gui},
@@ -210,8 +212,12 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {directml_export_service_descriptors(), true, "directml_export_service_descriptors", &WindowsServices::invoke_directml},
             {directml_object_service_descriptors(), false, "directml_object_service_descriptors", &WindowsServices::invoke_directml},
             {xess_service_descriptors(), true, "xess_service_descriptors", &WindowsServices::invoke_xess},
+            {fidelityfx_service_descriptors(), true, "fidelityfx_service_descriptors", &WindowsServices::invoke_fidelityfx},
             {gaming_tcui_service_descriptors(), true, "gaming_tcui_service_descriptors", &WindowsServices::invoke_gaming_tcui},
             {msvcp_pmr_service_descriptors(), true, "msvcp_pmr_service_descriptors", &WindowsServices::invoke_msvcp_pmr},
+            {msvcp_values_service_descriptors(), true, "msvcp_values_service_descriptors", &WindowsServices::invoke_msvcp_values},
+            {console_screen_service_descriptors(), true, "console_screen_service_descriptors", &WindowsServices::invoke_console_screen},
+            {user32_legacy_service_descriptors(), true, "user32_legacy_service_descriptors", &WindowsServices::invoke_user32_legacy},
             {msvcp_special_math_service_descriptors(), true, "msvcp_special_math_service_descriptors", &WindowsServices::invoke_msvcp_special_math},
             {webview2_loader_service_descriptors(), true, "webview2_loader_service_descriptors", &WindowsServices::invoke_webview2},
             {webview2_object_service_descriptors(), false, "webview2_object_service_descriptors", &WindowsServices::invoke_webview2},
@@ -265,6 +271,46 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {com_error_service_descriptors(), false, "com_error_service_descriptors", &WindowsServices::invoke_com_error},
             {type_library_service_descriptors(), false, "type_library_service_descriptors", &WindowsServices::invoke_type_library},
             {winrt_error_service_descriptors(), false, "winrt_error_service_descriptors", &WindowsServices::invoke_winrt_error},
+            {ntdll_misc_service_descriptors(), false, "ntdll_misc_service_descriptors", &WindowsServices::invoke_ntdll_misc},
+            {ntdll_pure_service_descriptors(), false, "ntdll_pure_service_descriptors", &WindowsServices::invoke_ntdll_pure},
+            {kernel32_extra_service_descriptors(), false, "kernel32_extra_service_descriptors", &WindowsServices::invoke_kernel32_extra},
+            {advapi32_extra_service_descriptors(), false, "advapi32_extra_service_descriptors", &WindowsServices::invoke_advapi32_extra},
+            {user32_extra_service_descriptors(), false, "user32_extra_service_descriptors", &WindowsServices::invoke_user32_extra},
+            {gdi32_extra_service_descriptors(), false, "gdi32_extra_service_descriptors", &WindowsServices::invoke_gdi32_extra},
+            {oleaut32_conversion_service_descriptors(), false, "oleaut32_conversion_service_descriptors", &WindowsServices::invoke_oleaut32_conversion},
+            {oleaut32_dispatch_service_descriptors(), false, "oleaut32_dispatch_service_descriptors", &WindowsServices::invoke_oleaut32_dispatch},
+            {crt_extra_service_descriptors(), false, "crt_extra_service_descriptors", &WindowsServices::invoke_crt_extra},
+            {crt_mbcs_service_descriptors(), false, "crt_mbcs_service_descriptors", &WindowsServices::invoke_crt_mbcs},
+            {crt_runtime_extra_service_descriptors(), false, "crt_runtime_extra_service_descriptors", &WindowsServices::invoke_crt_runtime_extra},
+            {shlwapi_string_service_descriptors(), false, "shlwapi_string_service_descriptors", &WindowsServices::invoke_shlwapi_string},
+            {shlwapi_misc_service_descriptors(), false, "shlwapi_misc_service_descriptors", &WindowsServices::invoke_shlwapi_misc},
+            {shell_path_service_descriptors(), false, "shell_path_service_descriptors", &WindowsServices::invoke_shell_paths},
+            {shell_icon_service_descriptors(), false, "shell_icon_service_descriptors", &WindowsServices::invoke_shell_icons},
+            {ole_misc_service_descriptors(), false, "ole_misc_service_descriptors", &WindowsServices::invoke_ole_misc},
+            {ntdll_table_service_descriptors(), false, "ntdll_table_service_descriptors", &WindowsServices::invoke_ntdll_tables},
+            {ntdll_tree_service_descriptors(), true, "ntdll_tree_service_descriptors", &WindowsServices::invoke_ntdll_trees},
+            {ntdll_registry_service_descriptors(), true, "ntdll_registry_service_descriptors", &WindowsServices::invoke_ntdll_registry},
+            {xstate_context_service_descriptors(), true, "xstate_context_service_descriptors", &WindowsServices::invoke_xstate_context},
+            {ntdll_sync_service_descriptors(), true, "ntdll_sync_service_descriptors", &WindowsServices::invoke_ntdll_sync},
+            {keyed_event_service_descriptors(), true, "keyed_event_service_descriptors", &WindowsServices::invoke_keyed_event},
+            {comctl_array_service_descriptors(), true, "comctl_array_service_descriptors", &WindowsServices::invoke_comctl_arrays},
+            {comctl_misc_service_descriptors(), true, "comctl_misc_service_descriptors", &WindowsServices::invoke_comctl_misc},
+            {ntdll_extras_service_descriptors(), true, "ntdll_extras_service_descriptors", &WindowsServices::invoke_ntdll_extras},
+            {kernel32_legacy_service_descriptors(), true, "kernel32_legacy_service_descriptors", &WindowsServices::invoke_kernel32_legacy},
+            {ole_user_marshal_service_descriptors(), true, "ole_user_marshal_service_descriptors", &WindowsServices::invoke_ole_user_marshal},
+            {kernelbase_extra_service_descriptors(), true, "kernelbase_extra_service_descriptors", &WindowsServices::invoke_kernelbase_extras},
+            {geo_service_descriptors(), true, "geo_service_descriptors", &WindowsServices::invoke_geo},
+            {installable_driver_service_descriptors(), true, "installable_driver_service_descriptors", &WindowsServices::invoke_installable_driver},
+            {http_helper_service_descriptors(), true, "http_helper_service_descriptors", &WindowsServices::invoke_http_helpers},
+            {glu_service_descriptors(), true, "glu_service_descriptors", &WindowsServices::invoke_glu},
+            {wts_service_descriptors(), true, "wts_service_descriptors", &WindowsServices::invoke_wts},
+            {setup_inf_service_descriptors(), true, "setup_inf_service_descriptors", &WindowsServices::invoke_setup_inf},
+            {netapi_service_descriptors(), true, "netapi_service_descriptors", &WindowsServices::invoke_netapi},
+            {iphelper_extra_service_descriptors(), true, "iphelper_extra_service_descriptors", &WindowsServices::invoke_iphelper_extras},
+            {user32_window_extra_service_descriptors(), true, "user32_window_extra_service_descriptors", &WindowsServices::invoke_user32_window_extras},
+            {path_extra_service_descriptors(), false, "path_extra_service_descriptors", &WindowsServices::invoke_path_extra},
+            {url_service_descriptors(), false, "url_service_descriptors", &WindowsServices::invoke_url},
+            {rpc_client_service_descriptors(), false, "rpc_client_service_descriptors", &WindowsServices::invoke_rpc_client},
             {desktop_notification_service_descriptors(), false, "desktop_notification_service_descriptors", &WindowsServices::invoke_desktop_notification},
             {gui_drag_service_descriptors(), false, "gui_drag_service_descriptors", &WindowsServices::invoke_gui_drag},
             {gui_move_size_service_descriptors(), false, "gui_move_size_service_descriptors", &WindowsServices::invoke_gui_move_size},
@@ -285,6 +331,9 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {theme_service_descriptors(), false, "theme_service_descriptors", &WindowsServices::invoke_theme},
             {property_service_descriptors(), false, "property_service_descriptors", &WindowsServices::invoke_properties},
             {profile_service_descriptors(), false, "profile_service_descriptors", &WindowsServices::invoke_profile},
+            {legacy_device_service_descriptors(), false, "legacy_device_service_descriptors", &WindowsServices::invoke_legacy_device},
+            {vtable_proxy_service_descriptors(), false, "vtable_proxy_service_descriptors", &WindowsServices::invoke_vtable_proxy},
+            {shell_idlist_service_descriptors(), false, "shell_idlist_service_descriptors", &WindowsServices::invoke_shell_idlist},
             {winstation_service_descriptors(), false, "winstation_service_descriptors", &WindowsServices::invoke_winstation},
             {version_service_descriptors(), false, "version_service_descriptors", &WindowsServices::invoke_version},
             {locale_service_descriptors(), false, "locale_service_descriptors", &WindowsServices::invoke_locale},
@@ -331,6 +380,16 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {heap_service_descriptors(), false, "heap_service_descriptors", &WindowsServices::invoke_heap},
             {working_set_service_descriptors(), false, "working_set_service_descriptors", &WindowsServices::invoke_memory},
             {anonymous_token_service_descriptors(), false, "anonymous_token_service_descriptors", &WindowsServices::invoke_security},
+            {private_security_service_descriptors(), true, "private_security_service_descriptors", &WindowsServices::invoke_private_security},
+            {msvcp_runtime_service_descriptors(), true, "msvcp_runtime_service_descriptors", &WindowsServices::invoke_msvcp_runtime},
+            {d3dkmt_sync_service_descriptors(), true, "d3dkmt_sync_service_descriptors", &WindowsServices::invoke_d3dkmt_sync},
+            {d3dkmt_resource_service_descriptors(), true, "d3dkmt_resource_service_descriptors", &WindowsServices::invoke_d3dkmt_resource},
+            {gdi_misc_service_descriptors(), true, "gdi_misc_service_descriptors", &WindowsServices::invoke_gdi_misc},
+            {windows_metafile_service_descriptors(), true, "windows_metafile_service_descriptors", &WindowsServices::invoke_windows_metafile},
+            {mask_blit_service_descriptors(), true, "mask_blit_service_descriptors", &WindowsServices::invoke_mask_blit},
+            {icm_service_descriptors(), true, "icm_service_descriptors", &WindowsServices::invoke_icm},
+            {mscms_service_descriptors(), true, "mscms_service_descriptors", &WindowsServices::invoke_mscms},
+            {mscms_transform_service_descriptors(), true, "mscms_transform_service_descriptors", &WindowsServices::invoke_mscms_transform},
             {etw_service_descriptors(), false, "etw_service_descriptors", &WindowsServices::invoke_etw},
             {perflib_service_descriptors(), false, "perflib_service_descriptors", &WindowsServices::invoke_perflib},
             {pdh_service_descriptors(), true, "pdh_service_descriptors", &WindowsServices::invoke_pdh},
@@ -437,13 +496,24 @@ bool crt_format_symbol(std::string_view symbol) noexcept {
     // scanf 家族走 windows_crt_scan：名稱也是 __stdio_common_vs 開頭，當成 printf 會把輸出參數的指標寫回來源字串。
     if(symbol.find("scanf")!=symbol.npos)return false;
     if(symbol.starts_with("__conio_common_vc") || symbol.starts_with("_cprintf") || symbol.starts_with("_cwprintf") || symbol.starts_with("_vcprintf") || symbol.starts_with("_vcwprintf"))return true;
-    return symbol=="printf" || symbol=="vprintf" || symbol=="wprintf" || symbol=="vwprintf" || symbol=="fwprintf" || symbol=="vfwprintf" || symbol=="fprintf" || symbol=="vfprintf" || symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf" || symbol=="__stdio_common_vfprintf_s" || symbol=="__stdio_common_vfwprintf_s" || symbol=="__stdio_common_vfprintf_p" || symbol=="__stdio_common_vfwprintf_p" || symbol=="snprintf" || symbol=="vsnprintf" || symbol.starts_with("__stdio_common_vs") || symbol=="sprintf" || symbol=="vsprintf" || symbol=="sprintf_s" || symbol=="vsprintf_s" || symbol=="swprintf_s" || symbol=="vswprintf_s" || symbol=="_snprintf" || symbol=="_vsnprintf" || symbol=="_snwprintf" || symbol=="_vsnwprintf" || symbol=="_snprintf_s" || symbol=="_vsnprintf_s" || symbol=="_snwprintf_s" || symbol=="_vsnwprintf_s" || symbol=="_scprintf" || symbol=="_vscprintf" || symbol=="_scwprintf" || symbol=="_vscwprintf";
+    if(symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf" || symbol=="__stdio_common_vfprintf_s" || symbol=="__stdio_common_vfwprintf_s" ||
+       symbol=="__stdio_common_vfprintf_p" || symbol=="__stdio_common_vfwprintf_p" || symbol.starts_with("__stdio_common_vs"))return true;
+    // 具名入口：去掉 _l、舊式雙底線、_p、_c、_s 與前導底線後，基底屬於 printf 家族即由同一格式化核心處理（形狀由 parse_crt_format_layout 決定）。
+    if(symbol.ends_with("_l"))symbol.remove_suffix(2);
+    if(symbol.starts_with("__"))symbol.remove_prefix(1);
+    for(const std::string_view suffix:{"_p","_c","_s"})if(symbol.ends_with(suffix))symbol.remove_suffix(2);
+    if(symbol.starts_with('_'))symbol.remove_prefix(1);
+    constexpr std::string_view bases[]{"printf","vprintf","wprintf","vwprintf","fprintf","vfprintf","fwprintf","vfwprintf","sprintf","vsprintf","swprintf","vswprintf",
+        "snprintf","vsnprintf","snwprintf","vsnwprintf","scprintf","vscprintf","scwprintf","vscwprintf"};
+    return std::find(std::begin(bases),std::end(bases),symbol)!=std::end(bases);
 }
 struct CrtFormatLayout {
     bool common{},common_stream{},common_buffer{},stream{},standard_output{},counting{};
     bool wide{},secure{},limited{},unbounded{},va{},underscore{};
     unsigned format_index{};
     bool console{},positional{},explicit_locale{};
+    // _c 計數版、具名位置參數緩衝區版與 _swprintf_l：UCRT 選項 0 的截斷（以 NUL 結尾、超出時回 -1）。
+    bool counted{};
 };
 CrtFormatLayout parse_crt_format_layout(std::string_view symbol){
     CrtFormatLayout result;
@@ -454,17 +524,53 @@ CrtFormatLayout parse_crt_format_layout(std::string_view symbol){
     // *_s 串流版本只多格式驗證（無效格式走 invalid parameter），輸出語義與一般串流版本相同。
     result.common_stream=symbol=="__stdio_common_vfprintf" || symbol=="__stdio_common_vfwprintf" || symbol=="__stdio_common_vfprintf_s" || symbol=="__stdio_common_vfwprintf_s" || symbol=="__stdio_common_vfprintf_p" || symbol=="__stdio_common_vfwprintf_p";
     result.common_buffer=result.common && !result.common_stream && !result.console;
-    result.standard_output=symbol=="printf" || symbol=="vprintf" || symbol=="wprintf" || symbol=="vwprintf";
-    result.stream=result.standard_output || symbol=="fwprintf" || symbol=="vfwprintf" || symbol=="fprintf" || symbol=="vfprintf" || result.common_stream;
-    result.counting=symbol=="_scprintf" || symbol=="_vscprintf" || symbol=="_scwprintf" || symbol=="_vscwprintf";
+    // 具名入口的基底：去掉舊式雙底線（__swprintf_l）、位置參數 _p、計數版 _c、安全版 _s 與前導底線，再依基底判斷參數形狀。
+    std::string_view base=symbol;bool legacy_double=false;
+    if(!result.common){
+        if(base.starts_with("__")){base.remove_prefix(1);legacy_double=true;}
+        if(result.positional)base.remove_suffix(2);
+        if(base.ends_with("_c")){base.remove_suffix(2);result.counted=true;}
+        if(base.ends_with("_s"))base.remove_suffix(2);
+        if(base.starts_with('_'))base.remove_prefix(1);
+    }
+    const bool named=!result.common && !result.console;
+    result.standard_output=named && (base=="printf" || base=="vprintf" || base=="wprintf" || base=="vwprintf");
+    result.stream=result.standard_output || result.common_stream || (named && (base=="fprintf" || base=="vfprintf" || base=="fwprintf" || base=="vfwprintf"));
+    result.counting=named && (base=="scprintf" || base=="vscprintf" || base=="scwprintf" || base=="vscwprintf");
     result.wide=symbol.find("wprintf")!=symbol.npos;result.secure=symbol.ends_with("_s");
     result.limited=result.secure && (symbol.starts_with("_sn") || symbol.starts_with("_vsn") || symbol.starts_with("__stdio_common_vsn"));
-    result.unbounded=symbol=="sprintf" || symbol=="vsprintf";
-    result.va=result.common || symbol.starts_with('v') || symbol.starts_with("_v");
+    // 沒有容量參數：sprintf／vsprintf 與舊式（不帶 count）的 swprintf／vswprintf、_swprintf、__swprintf_l，以及其 _l 版本。
+    const bool narrow_buffer=named && (base=="sprintf" || base=="vsprintf"),wide_buffer=named && (base=="swprintf" || base=="vswprintf");
+    result.unbounded=!result.secure && !result.positional && !result.counted && (narrow_buffer || (wide_buffer && (legacy_double || !result.explicit_locale)));
+    // 具名的位置參數緩衝區版（_sprintf_p、_swprintf_p）與現代 _swprintf_l（buffer, count, format, locale）採 UCRT 選項 0 的截斷。
+    if((narrow_buffer || wide_buffer) && !result.secure && (result.positional || (wide_buffer && result.explicit_locale && !legacy_double)))result.counted=true;
+    result.va=result.common || symbol.starts_with('v') || symbol.starts_with("_v") || symbol.starts_with("__v");
     result.underscore=symbol.starts_with('_');
     result.format_index=result.console?(result.common?1U:0U):result.common_buffer?(result.limited?4U:3U):result.common_stream?2:
         result.standard_output || result.counting?0:result.stream || result.unbounded?1:result.limited?3:2;
     return result;
+}
+// 具名 printf 變體（舊 msvcr* 與 msvcrt 的 _l／_p／_s／_c 版本）：參數個數＝固定參數到格式字串，再加 locale 與 va_list。
+std::span<const WindowsServiceDescriptor> crt_format_variant_descriptors(){
+    static constexpr std::string_view names[]{
+        "_printf_l","_printf_p","_printf_p_l","_printf_s_l","printf_s","_vprintf_l","_vprintf_p","_vprintf_p_l","_vprintf_s_l","vprintf_s",
+        "_wprintf_l","_wprintf_p","_wprintf_p_l","_wprintf_s_l","wprintf_s","_vwprintf_l","_vwprintf_p","_vwprintf_p_l","_vwprintf_s_l","vwprintf_s",
+        "_fprintf_l","_fprintf_p","_fprintf_p_l","_fprintf_s_l","fprintf_s","_vfprintf_l","_vfprintf_p","_vfprintf_p_l","_vfprintf_s_l","vfprintf_s",
+        "_fwprintf_l","_fwprintf_p","_fwprintf_p_l","_fwprintf_s_l","fwprintf_s","_vfwprintf_l","_vfwprintf_p","_vfwprintf_p_l","_vfwprintf_s_l","vfwprintf_s",
+        "_scprintf_l","_scprintf_p","_scprintf_p_l","_vscprintf_l","_vscprintf_p","_vscprintf_p_l",
+        "_scwprintf_l","_scwprintf_p","_scwprintf_p_l","_vscwprintf_l","_vscwprintf_p","_vscwprintf_p_l",
+        "_sprintf_l","_sprintf_p","_sprintf_p_l","_sprintf_s_l","_vsprintf_l","_vsprintf_p","_vsprintf_p_l","_vsprintf_s_l",
+        "_snprintf_c","_snprintf_c_l","_snprintf_l","_snprintf_s_l","_vsnprintf_c","_vsnprintf_c_l","_vsnprintf_l","_vsnprintf_s_l",
+        "_snwprintf_l","_snwprintf_s_l","_vsnwprintf_l","_vsnwprintf_s_l",
+        "swprintf","vswprintf","_swprintf","_vswprintf","__swprintf_l","__vswprintf_l","_swprintf_c","_swprintf_c_l","_vswprintf_c","_vswprintf_c_l",
+        "_vswprintf_l","_swprintf_p","_swprintf_p_l","_vswprintf_p","_vswprintf_p_l","_swprintf_s_l","_vswprintf_s_l"};
+    static const auto table=[]{
+        std::vector<WindowsServiceDescriptor> out;
+        for(const auto name:names){const auto layout=parse_crt_format_layout(name);
+            out.push_back({"crt",name,layout.format_index+1U+(layout.explicit_locale?1U:0U)+(layout.va?1U:0U)});}
+        return out;
+    }();
+    return table;
 }
 CrtFormatLayout crt_format_layout(const WindowsServiceDescriptor& service){
     static const bool cached=[] {const auto* setting=std::getenv("X64ARM_CRT_FORMAT_PROVIDER");return !setting || std::string_view(setting)!="0";}();
@@ -486,7 +592,7 @@ CrtFormatLayout crt_format_layout(const WindowsServiceDescriptor& service){
 struct FormatError {unsigned code;};
 struct Formatted {std::u16string text;unsigned encoding_error{};bool failed{};};
 enum class FormatArgumentKind {Integer,Floating,Pointer};
-Formatted format(const GuestMemory& memory,std::u16string_view specification,bool wide,bool wide_strings,unsigned pointer_size,bool three_digit_exponents,
+Formatted format(const GuestMemory& memory,std::u16string_view specification,bool wide,bool wide_strings,unsigned pointer_size,bool three_digit_exponents,bool legacy_msvcrt,
                  bool positional,bool inspect,const CrtLocaleCategory& locale,std::u16string_view decimal_symbol,
                  const std::function<std::uint64_t(unsigned,unsigned,FormatArgumentKind)>& next){
     Formatted result;auto& output=result.text;
@@ -507,11 +613,14 @@ Formatted format(const GuestMemory& memory,std::u16string_view specification,boo
         if(at<specification.size() && specification[at]==u'.'){++at;if(at<specification.size() && specification[at]==u'*'){++at;precision=static_cast<std::int32_t>(next(4,position(),FormatArgumentKind::Integer));}else precision=static_cast<int>(decimal());}
         if(width<-65536 || width>65536 || precision>65536)throw FormatError{22};if(width<0){flags+='-';width=-width;}
         std::u16string_view length;
+        while(at<specification.size() && x64arm_crt_legacy_size(specification[at],legacy_msvcrt?8:0))++at;
         const auto length_at=at;
         if(specification.substr(at,3)==u"I64" || specification.substr(at,3)==u"I32")at+=3;
         else if(specification.substr(at,2)==u"ll" || specification.substr(at,2)==u"hh")at+=2;
         else if(at<specification.size() && std::u16string_view(u"hlztjLIwT").find(specification[at])!=std::u16string_view::npos)++at;
-        length=specification.substr(length_at,at-length_at);if(at==specification.size())throw FormatError{22};const auto conversion=specification[at++];
+        length=specification.substr(length_at,at-length_at);
+        while(at<specification.size() && x64arm_crt_legacy_size(specification[at],legacy_msvcrt?8:0))++at;
+        if(at==specification.size())throw FormatError{22};const auto conversion=specification[at++];
         const bool integer=std::u16string_view(u"diouxX").find(conversion)!=std::u16string_view::npos;
         const bool floating=std::u16string_view(u"fFeEgGaA").find(conversion)!=std::u16string_view::npos;
         const bool string=conversion==u's' || conversion==u'S',character=conversion==u'c' || conversion==u'C';
@@ -612,14 +721,19 @@ Formatted format(const GuestMemory& memory,std::u16string_view specification,boo
                 large.resize(static_cast<std::size_t>(count));return large;
             };
             std::string number;
-            if(floating){pattern+=static_cast<char>(conversion);number=render(std::bit_cast<double>(value));}
+            bool special=false;
+            if(floating){
+                if(const auto nonfinite=detail::crt_nonfinite_format(value,static_cast<char>(conversion),flags,static_cast<unsigned>(width),precision,legacy_msvcrt,three_digit_exponents)){
+                    number=*nonfinite;special=true;
+                }else {pattern+=static_cast<char>(conversion);number=render(std::bit_cast<double>(value));}
+            }
             else {
                 unsigned numeric_flags=0;for(const auto flag:flags)numeric_flags|=x64arm_crt_format_flag(static_cast<unsigned char>(flag));
                 auto digits=x64arm_crt_integer(value,integer_bits,conversion,numeric_flags,static_cast<unsigned>(width),precision,pointer_size);
                 number.append(digits.spaces,' ');number.append(digits.prefix,digits.prefix_count);number.append(digits.zeros,'0');
                 while(digits.count)number+=digits.digits[--digits.count];number.append(digits.trailing,' ');
             }
-            if(floating && three_digit_exponents){const auto exponent=number.find_first_of("eE");if(exponent!=number.npos && exponent+4==number.size() && (number[exponent+1]=='+' || number[exponent+1]=='-'))number.insert(exponent+2,1,'0');}
+            if(floating && !special && three_digit_exponents){const auto exponent=number.find_first_of("eE");if(exponent!=number.npos && exponent+4==number.size() && (number[exponent+1]=='+' || number[exponent+1]=='-'))number.insert(exponent+2,1,'0');}
             rendered.assign(number.begin(),number.end());
             if(floating && decimal_symbol!=u".")if(const auto point=rendered.find(u'.');point!=rendered.npos){
                 std::u16string replacement;if(wide)replacement=decimal_symbol;
@@ -637,7 +751,7 @@ __attribute__((always_inline)) inline Formatted format_arguments(const GuestStat
         const WindowsCall& arg,const CrtFormatLayout& layout,std::uint64_t fmt,
         std::uint64_t options,bool x86_,const CrtLocaleObject& locale,std::u16string& specification){
     const auto& [common,common_stream,common_buffer,stream,standard_output,counting,
-                 wide,secure,limited,unbounded,va,underscore,format_index,console,positional,explicit_locale]=layout;
+                 wide,secure,limited,unbounded,va,underscore,format_index,console,positional,explicit_locale,counted]=layout;
     unsigned index=format_index+1+(explicit_locale?1U:0U);
     std::uint64_t list=va?arg(common?format_index+2:index):0;
     if(wide)specification=read_utf16(memory,GuestAddress{fmt});
@@ -648,7 +762,7 @@ __attribute__((always_inline)) inline Formatted format_arguments(const GuestStat
     };
     const auto decimal=windows_crt_numeric(locale.categories[4]).decimal;
     const auto run=[&](bool inspect,const std::function<std::uint64_t(unsigned,unsigned,FormatArgumentKind)>& next){
-        return format(memory,specification,wide,wide && (!common || (options&4)),x86_?4:8,common?(options&0x10)!=0:underscore,
+        return format(memory,specification,wide,wide && (!common || (options&4)),x86_?4:8,common?(options&0x10)!=0:underscore,common && (options&8),
                       positional,inspect,locale.categories[2],decimal,next);
     };
     struct Argument {unsigned size{},position{};FormatArgumentKind kind{};std::uint64_t value{};};
@@ -677,7 +791,7 @@ __attribute__((always_inline)) inline CrtBufferOutput format_buffer_output(const
         const CrtFormatLayout& layout,std::uint64_t capacity,std::uint64_t limit,std::uint64_t options,bool x86){
     const auto& text=formatted.text;CrtBufferOutput output;
     const unsigned mode=(layout.secure?X64ARM_FMT_SECURE:0U)|(layout.limited?X64ARM_FMT_LIMITED:0U)|
-        (layout.common_buffer?X64ARM_FMT_COMMON:0U)|(layout.underscore?X64ARM_FMT_LEGACY:0U);
+        (layout.common_buffer || layout.counted?X64ARM_FMT_COMMON:0U)|(layout.underscore?X64ARM_FMT_LEGACY:0U);
     const auto plan=x64arm_crt_buffer_plan(text.size(),formatted.failed,capacity,limit,x86?UINT32_MAX:UINT64_MAX,options,mode);
     output.result=plan.result;output.invalid_parameter=plan.invalid_parameter;output.errno_after_write=plan.errno_after_write;
     if(plan.invalid_parameter)return output;
@@ -743,6 +857,8 @@ void WindowsServices::initialize_runtime(GuestMemory& memory, std::u16string_vie
     }}
     memory.map(runtime_base_, 1024U * 1024U, read_write);
     initialize_msvcp100(memory);
+    // gdi32 的調色盤掛鉤資料：初值為 gdi32 自己的 RealizePalette／SelectPalette 入口。
+    for(unsigned i=0;i<2;++i){gdi_palette_hooks_[i]=runtime_allocate(memory,{},8);memory.store(GuestAddress{gdi_palette_hooks_[i]},x86_?32:64,resolve("gdi32.dll",i?"SelectPalette":"RealizePalette").value);}
     for (unsigned i=0;i<3;++i) {
         const auto stream=runtime_base_.value+0x800+i*48U;
         memory.store(GuestAddress{stream+24},32,i?2:1);memory.store(GuestAddress{stream+28},32,i);
@@ -762,6 +878,9 @@ void WindowsServices::initialize_runtime(GuestMemory& memory, std::u16string_vie
     const auto& initial_ctype=windows_crt_character_table(CrtLocaleCategory{});
     for(unsigned c=0;c<257;++c)memory.store(GuestAddress{runtime_.ctype_table+2*c},16,initial_ctype.masks[c]);
     memory.store(GuestAddress{runtime_base_.value+136},x86_?32:64,runtime_.ctype_table+2);
+    // _dstbias 的 CRT 初始值（夏令與標準時間差 -3600 秒）；__dstbias 回傳此格。
+    memory.store(GuestAddress{runtime_base_.value+160},32,static_cast<std::uint32_t>(-3600));
+    initialize_crt_wctype(memory);
     initialize_crt_lowio(memory);
     configure_runtime_arguments(memory,command_line,command_line_address_.value);
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
@@ -873,6 +992,7 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
     GuestThread main_thread; main_thread.affinity=runtime_.process_affinity; main_thread.context = state; main_thread.teb = teb_base_.value;
     main_thread.exception_area = exception_base_.value; main_thread.stack_base = runtime_.image.stack_base;
     main_thread.stack_size = runtime_.image.stack_size; main_thread.errno_cell = runtime_.errno_cell; main_thread.entry=runtime_.image.entry;
+    register_thread_stack_memory(memory,main_thread.stack_base,main_thread.stack_size);
     initialize_stack_guard(memory,main_thread.stack_base,main_thread.stack_size,main_thread.stack_guard);
     memory.store(GuestAddress{main_thread.teb+(x86_?8U:16U)},x86_?32:64,main_thread.stack_guard.limit(main_thread.stack_base));
     threads_.items.emplace(1, std::move(main_thread));
@@ -1641,8 +1761,12 @@ void WindowsServices::enter_callback(GuestState& state, GuestMemory& memory) {
             dc.paint_clip=gui_update_region(found->second);gui_refresh_dc_clip(dc);found->second.paint_erase=false;
         }
     }
-    const auto original_sp = frame.saved.reg(Gpr::Rsp);
-    if (original_sp < 256) throw HostCallFault("callback 堆疊不足");
+    const auto original_sp = native_apc_continuation(frame.continuation)?
+        std::min(frame.saved.reg(Gpr::Rsp),frame.value):frame.saved.reg(Gpr::Rsp);
+    if (original_sp < 256) {
+        std::ostringstream diagnostic;diagnostic<<"callback 堆疊不足：thread="<<threads_.current<<" depth="<<runtime_.callbacks.size()<<" continuation="<<static_cast<unsigned>(frame.continuation)<<" saved_rip=0x"<<std::hex<<frame.saved.rip.value<<" saved_rsp=0x"<<original_sp<<" target=0x"<<call.target;
+        throw HostCallFault(diagnostic.str());
+    }
     if (x86_) {
         const auto sp=(original_sp-256)&~UINT64_C(3);
         memory.check(GuestAddress{sp},(call.arguments.size()-call.x86_register_arguments+static_cast<unsigned>(std::popcount(call.wide_arguments))+1)*4,Access::Write);
@@ -1797,7 +1921,7 @@ void WindowsServices::discard_callbacks(std::size_t depth, GuestState& state, Gu
         if(frame.continuation==Continuation::BeepTone)discard_beep(frame.value);
         if(frame.continuation==Continuation::Eh4Operation)runtime_.eh4_operations.erase(frame.value);
         if(frame.continuation==Continuation::CrtLongjmp)runtime_.crt_jump_operations.erase(frame.value);
-        if(frame.continuation==Continuation::MetafileEnumeration)finish_metafile_enumeration(frame.value);
+        if(frame.continuation==Continuation::MetafileEnumeration)finish_metafile_enumeration(state,memory,frame.value);
         if(frame.continuation==Continuation::SafeArrayOperation){const auto locks=memory.load(GuestAddress{frame.value+8},32);if(locks)memory.store(GuestAddress{frame.value+8},32,locks-1);}
         if(frame.continuation==Continuation::CrtAssertion || frame.continuation==Continuation::CrtFatalDialog || frame.continuation==Continuation::CertificateDecodeAllocation || frame.continuation==Continuation::AccessibleOperation || frame.continuation==Continuation::OleStreamCopy || frame.continuation==Continuation::GuiIntegerText || frame.continuation==Continuation::ReturnCallbackFreeHeap || frame.continuation==Continuation::GuiBusyResult || frame.continuation==Continuation::ReturnZeroFreeHeap || frame.continuation==Continuation::MetafileEnumeration || frame.continuation==Continuation::LocaleEnumeration || frame.continuation==Continuation::RegistryBooleanResult || frame.continuation==Continuation::ResourceEnumeration)(void)free_heap(memory,frame.value,state);
         if(frame.continuation==Continuation::GuiMenuInit || frame.continuation==Continuation::GuiMenuFinish){release_gui_scratch(memory,state,frame.hook.scratch);gui_.menu_tracks.erase(frame.value);}
@@ -1968,7 +2092,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
         memory.store(GuestAddress{runtime_.errno_cell},32,22);complete_call(state,memory,UINT32_MAX);return std::nullopt;
     }
     if(finished.continuation==Continuation::GuiSendTimeout){
-        const WindowsCall call(state,memory,7);const bool destroyed=(static_cast<std::uint32_t>(call(4))&0x20U) && !gui_.windows.contains(call(0));
+        const WindowsCall call(state,memory,7);const bool destroyed=(static_cast<std::uint32_t>(call(4))&0x20U) && call(0)!=0xffff && !gui_.windows.contains(call(0));
         if(destroyed)last_error_=1400;
         if(call(6))memory.store(GuestAddress{call(6)},x86_?32:64,destroyed?0:callback_value);
         complete_call(state,memory,destroyed?0:1);return std::nullopt;
@@ -1976,6 +2100,14 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     if(finished.continuation==Continuation::UserApc){
         if(dispatch_user_apc(state,memory,finished.value))return std::nullopt;
         if(finished.value!=UINT64_MAX){if(!finished.value)last_error_=0xc0;complete_call(state,memory,finished.value);}return std::nullopt;
+    }
+    if(native_apc_continuation(finished.continuation)){
+        // APC 的 CONTEXT 屬於客體；修改後的續行與 NtContinue 共用清理契約。
+        const auto restored=read_context(memory,finished.value,finished.saved);
+        restore_user_context(state,memory,restored);
+        const bool completion_error=finished.continuation==Continuation::NativeApcIoError;
+        if(!dispatch_user_apc(state,memory,UINT64_MAX,completion_error) && completion_error)last_error_=0xc0;
+        return std::nullopt;
     }
     if(finished.continuation==Continuation::GuiIntegerText){
         const WindowsCall call(state,memory,4);const auto& message=finished.callbacks.front();const auto capacity=message.arguments[2];
@@ -2009,7 +2141,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
         if(error)last_error_=error;complete_call(state,memory,error?0:1);return std::nullopt;
     }
     if(finished.continuation==Continuation::LocaleEnumeration){(void)free_heap(memory,finished.value,state);complete_call(state,memory,1);return std::nullopt;}
-    if(finished.continuation==Continuation::MetafileEnumeration){finish_metafile_enumeration(finished.value);(void)free_heap(memory,finished.value,state);complete_call(state,memory,static_cast<std::uint32_t>(callback_value)!=0);return std::nullopt;}
+    if(finished.continuation==Continuation::MetafileEnumeration){finish_metafile_enumeration(state,memory,finished.value);(void)free_heap(memory,finished.value,state);complete_call(state,memory,static_cast<std::uint32_t>(callback_value)!=0);return std::nullopt;}
     if(finished.continuation==Continuation::SafeArrayOperation){const auto locks=memory.load(GuestAddress{finished.value+8},32);if(locks)memory.store(GuestAddress{finished.value+8},32,locks-1);complete_call(state,memory,0);return std::nullopt;}
     if(finished.continuation==Continuation::AccessibleOperation)return resume_accessible(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::OleStreamCopy)return resume_ole_stream_copy(state,memory,finished.value,static_cast<std::uint32_t>(callback_value));
@@ -2778,7 +2910,7 @@ bool WindowsServices::invoke_parallel_crt_format(GuestState& state,GuestMemory& 
         const auto capacity=layout.counting?0:layout.unbounded?output_limit:arg(layout.common_buffer?2:1);
         const auto limit=layout.limited?arg(layout.common_buffer?3:2):capacity;
         const auto fmt=arg(layout.format_index),options=layout.common?arg(0):0;
-        if(!fmt || (layout.common && (options&~UINT64_C(0x37))) || (layout.limited && !limit) ||
+        if(!fmt || (layout.common && (options&~X64ARM_CRT_PRINTF_OPTIONS_MASK)) || (layout.limited && !limit) ||
            (!layout.counting && ((layout.secure && (!destination || !capacity)) || (!destination && capacity))))return false;
         auto locale_handle=layout.common || layout.explicit_locale?arg(layout.format_index+1):0;
         if(!locale_handle){const auto thread=runtime_.crt_thread_locales.find(tid);locale_handle=thread==runtime_.crt_thread_locales.end()?runtime_.crt_current_locale:thread->second;}
@@ -2820,7 +2952,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& stat
     std::uint64_t result=0;
     const auto layout=crt_format_layout(service);
     const auto [common,common_stream,common_buffer,stream,standard_output,counting,
-                wide,secure,limited,unbounded,va,underscore,format_index,console,positional,explicit_locale]=layout;
+                wide,secure,limited,unbounded,va,underscore,format_index,console,positional,explicit_locale,counted]=layout;
     const auto destination=stream || counting || console?0:arg(common_buffer?1:0),capacity=stream || counting || console?0:unbounded?output_limit:arg(common_buffer?2:1);
     const auto limit=limited?arg(common_buffer?3:2):capacity;const auto fmt=arg(format_index);const auto options=common?arg(0):0;
     const auto invalid_format=[&](unsigned error)->std::optional<std::uint32_t>{
@@ -2831,7 +2963,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& stat
     const CrtIoScope scope(*this,state,memory,target);if(!scope)return std::nullopt;
     if(stream)if(auto* file=crt_file(target);file && (!import_crt_lowio(memory,*file) || (!wide && file->text && (file->lowio_extended&3U))))return invalid_format(22);
     if(!fmt)return invalid_format(22);
-    if(common && (options&~UINT64_C(0x37)))throw HostCallFault("CRT formatter 尚未支援 legacy MSVCRT compatibility 與未知 UCRT options");
+    if(common && (options&~X64ARM_CRT_PRINTF_OPTIONS_MASK))throw HostCallFault("CRT formatter 收到未知 UCRT options");
     auto locale_handle=common || explicit_locale?arg(format_index+1):0;
     if(!locale_handle){const auto thread=runtime_.crt_thread_locales.find(threads_.current);locale_handle=thread==runtime_.crt_thread_locales.end()?runtime_.crt_current_locale:thread->second;}
     static const CrtLocaleObject initial_locale{};const auto* locale=&initial_locale;

@@ -419,5 +419,127 @@ entry GdiSetBatchLimit
     ret 4
 1:
 slow_end GdiSetBatchLimit
+// 臨界區段（字組協定與服務層及 guest_thread_x64.s 相同，見 windows_threads.cpp）：PE32 的 LockCount 在 +4、RecursionCount 在 +8、
+// OwningThread 在 +12，擁有者為 TEB ClientId.UniqueThread（fs:[0x24]）。LockCount＝-1 未持有；持有時低 30 位元為遞迴次數−1、
+// bit30 表示宿主有等待者；0x7fffffff 為未持有但有等待者。只在無等待者時以 lock cmpxchg 取得／完全釋放，遞迴由持有者遞增／遞減。
+// loader lock（PEB+0x800）、有等待者的釋放、遞迴上限、非持有者解鎖與未持有但有等待者一律以原參數尾跳原服務（堆疊未動）。
+// 只使用 EAX／ECX／EDX；多處理器自旋借用 ESI，離開前還原。
+.macro critical_x86_loader_lock
+    mov ecx, dword ptr [esp+4]
+    mov eax, dword ptr fs:[0x30]
+    add eax, 0x800
+    cmp ecx, eax
+    je 1f
+.endm
+
+entry EnterCriticalSection
+    critical_x86_loader_lock
+    mov eax, -1
+    xor edx, edx
+    lock cmpxchg dword ptr [ecx + 4], edx
+    jne 2f
+5:
+    mov eax, dword ptr fs:[0x24]
+    mov dword ptr [ecx + 12], eax
+    mov dword ptr [ecx + 8], 1
+    ret 4
+2:
+    mov edx, dword ptr fs:[0x24]
+    cmp dword ptr [ecx + 12], edx
+    jne 3f
+    mov edx, dword ptr [ecx + 8]
+    cmp edx, 0x3ffffffe
+    jae 1f
+    inc edx
+    mov dword ptr [ecx + 8], edx
+    lock inc dword ptr [ecx + 4]
+    ret 4
+3:
+    // 他人持有：多處理器（PEB32 NumberOfProcessors>1）時先有界自旋等字組回到 -1，逾量才進原服務登記等待。只讀字組，不設等待位元。
+    mov edx, dword ptr fs:[0x30]
+    cmp dword ptr [edx + 0x64], 1
+    jbe 1f
+    push esi
+    mov esi, 4000
+4:
+    pause
+    cmp dword ptr [ecx + 4], -1
+    jne 6f
+    mov eax, -1
+    xor edx, edx
+    lock cmpxchg dword ptr [ecx + 4], edx
+    jne 6f
+    pop esi
+    jmp 5b
+6:
+    dec esi
+    jne 4b
+    pop esi
+1:
+slow_end EnterCriticalSection
+
+entry LeaveCriticalSection
+    critical_x86_loader_lock
+    mov eax, dword ptr fs:[0x24]
+    cmp dword ptr [ecx + 12], eax
+    jne 1f
+    mov edx, dword ptr [ecx + 8]
+    cmp edx, 1
+    jne 2f
+    // 先清除擁有者再釋放字組：新持有者寫入的擁有者不會被覆寫。
+    mov dword ptr [ecx + 12], 0
+    mov dword ptr [ecx + 8], 0
+    xor eax, eax
+    mov edx, -1
+    lock cmpxchg dword ptr [ecx + 4], edx
+    jne 3f
+    ret 4
+3:
+    // 有等待者：恢復擁有權，由原服務釋放並喚醒。
+    mov eax, dword ptr fs:[0x24]
+    mov dword ptr [ecx + 12], eax
+    mov dword ptr [ecx + 8], 1
+    jmp 1f
+2:
+    jb 1f
+    dec edx
+    mov dword ptr [ecx + 8], edx
+    lock dec dword ptr [ecx + 4]
+    ret 4
+1:
+slow_end LeaveCriticalSection
+
+entry TryEnterCriticalSection
+    critical_x86_loader_lock
+    mov eax, -1
+    xor edx, edx
+    lock cmpxchg dword ptr [ecx + 4], edx
+    jne 2f
+    mov eax, dword ptr fs:[0x24]
+    mov dword ptr [ecx + 12], eax
+    mov dword ptr [ecx + 8], 1
+    mov eax, 1
+    ret 4
+2:
+    cmp eax, 0x7fffffff
+    je 1f
+    mov edx, dword ptr fs:[0x24]
+    cmp dword ptr [ecx + 12], edx
+    jne 4f
+    mov edx, dword ptr [ecx + 8]
+    cmp edx, 0x3ffffffe
+    jae 1f
+    inc edx
+    mov dword ptr [ecx + 8], edx
+    lock inc dword ptr [ecx + 4]
+    mov eax, 1
+    ret 4
+4:
+    // 由其他執行緒持有：與 Windows 相同直接回 FALSE，不進服務。
+    xor eax, eax
+    ret 4
+1:
+slow_end TryEnterCriticalSection
+
 .globl _guest_thread_end
 _guest_thread_end:

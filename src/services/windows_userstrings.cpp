@@ -11,6 +11,7 @@ namespace x64arm {
 std::span<const WindowsServiceDescriptor> userstring_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
         {"user32.dll","wsprintfA",2},{"user32.dll","wsprintfW",2},{"user32.dll","wvsprintfA",3},{"user32.dll","wvsprintfW",3},
+        {"shlwapi.dll","wnsprintfA",3,0,0,0,true},{"shlwapi.dll","wnsprintfW",3,0,0,0,true},{"shlwapi.dll","wvnsprintfA",4},{"shlwapi.dll","wvnsprintfW",4},
         {"user32.dll", "CharUpperA", 1}, {"user32.dll", "CharUpperW", 1},
         {"user32.dll", "CharLowerA", 1}, {"user32.dll", "CharLowerW", 1},
         {"user32.dll", "CharUpperBuffA", 2}, {"user32.dll", "CharUpperBuffW", 2},
@@ -21,15 +22,16 @@ std::span<const WindowsServiceDescriptor> userstring_service_descriptors() {
     return table;
 }
 namespace {
-// USER32 格式子集不含浮點數及 %n；不將客體 format / va_list 傳入宿主 CRT。
+// USER32 格式子集不含浮點數及 %n；不將客體 format / va_list 傳入宿主 CRT。wsprintf（上限 1023 字元）與 shlwapi wnsprintf（上限為 cch-1）共用。
+// next(quad) 取下一個引數：quad 為 64 位元值（%I64、x64 的 %p），x86 由兩個 32 位元格組成。
 template<class Character>
-std::basic_string<Character> user32_format(const GuestMemory& memory,std::basic_string_view<Character> format,bool wide,const std::function<std::uint64_t()>& next,bool& truncated){
+std::basic_string<Character> user32_format(const GuestMemory& memory,std::basic_string_view<Character> format,bool wide,const std::function<std::uint64_t(bool)>& next,bool& truncated,std::size_t limit,bool x86){
     std::basic_string<Character> result;
-    const auto append=[&](std::basic_string_view<Character> part){const auto count=std::min<std::size_t>(part.size(),1023-result.size());result.append(part.substr(0,count));truncated|=count<part.size();};
+    const auto append=[&](std::basic_string_view<Character> part){const auto count=std::min<std::size_t>(part.size(),limit-result.size());result.append(part.substr(0,count));truncated|=count<part.size();};
     const auto from_narrow=[&](std::string_view bytes){if constexpr(sizeof(Character)==1)return std::string(bytes);else return utf8_to_utf16_lossy(bytes);};
     const auto from_wide=[&](std::u16string_view text){if constexpr(sizeof(Character)==2)return std::u16string(text);else {std::u16string clean(text);for(std::size_t i=0;i<clean.size();++i){if(clean[i]>=0xd800&&clean[i]<=0xdbff){if(i+1<clean.size()&&clean[i+1]>=0xdc00&&clean[i+1]<=0xdfff)++i;else clean[i]=0xfffd;}else if(clean[i]>=0xdc00&&clean[i]<=0xdfff)clean[i]=0xfffd;}return utf16_to_utf8(clean);}};
     for(std::size_t at=0;at<format.size();){
-        if(result.size()==1023){truncated=true;break;}
+        if(result.size()>=limit){truncated=true;break;}
         if(format[at]!='%'){result.push_back(format[at++]);continue;}++at;
         if(at<format.size()&&format[at]=='%'){result.push_back(format[at++]);continue;}
         bool left=false,prefix=false,zero=false;
@@ -43,22 +45,22 @@ std::basic_string<Character> user32_format(const GuestMemory& memory,std::basic_
         if(at==format.size())break;const auto kind=format[at++];
         const bool string=kind=='s'||kind=='S',character=kind=='c'||kind=='C';const bool number=kind=='d'||kind=='i'||kind=='u'||kind=='x'||kind=='X'||kind=='p';
         if(!string&&!character&&!number){result.push_back(kind);continue;}
-        const auto value=next();std::basic_string<Character> field;std::basic_string<Character> lead;
+        const auto value=next(number && (wide_integer || (kind=='p' && !x86)));std::basic_string<Character> field;std::basic_string<Character> lead;
         if(string||character){
             const bool source_wide=length=='l'||length=='w'||(length!='h'&&(wide?(kind=='s'||kind=='c'):(kind=='S'||kind=='C')));
             if(character){if(value || (length!='h'&&length!='l')){if(source_wide)field=from_wide(std::u16string(1,static_cast<char16_t>(value)));else field=from_narrow(std::string(1,static_cast<char>(value)));}}
             else if(!value)field=from_narrow("(null)");
-            else if(source_wide){std::u16string text;const auto limit=std::min<std::size_t>(precision.value_or(1024),1024);for(std::size_t i=0;i<limit;++i){if(i>(UINT64_MAX-value)/2)throw HostCallFault("wsprintf UTF-16 地址溢位");const auto ch=static_cast<char16_t>(memory.load(GuestAddress{value+i*2},16));if(!ch)break;text.push_back(ch);}field=from_wide(text);}
-            else {std::string text;const auto limit=std::min<std::size_t>(precision.value_or(4096),4096);for(std::size_t i=0;i<limit;++i){if(i>UINT64_MAX-value)throw HostCallFault("wsprintf ANSI 地址溢位");const auto ch=static_cast<char>(memory.load(GuestAddress{value+i},8));if(!ch)break;text.push_back(ch);}field=from_narrow(text);}
+            else if(source_wide){std::u16string text;const auto read_limit=std::min<std::size_t>(precision.value_or(1024),1024);for(std::size_t i=0;i<read_limit;++i){if(i>(UINT64_MAX-value)/2)throw HostCallFault("wsprintf UTF-16 地址溢位");const auto ch=static_cast<char16_t>(memory.load(GuestAddress{value+i*2},16));if(!ch)break;text.push_back(ch);}field=from_wide(text);}
+            else {std::string text;const auto read_limit=std::min<std::size_t>(precision.value_or(4096),4096);for(std::size_t i=0;i<read_limit;++i){if(i>UINT64_MAX-value)throw HostCallFault("wsprintf ANSI 地址溢位");const auto ch=static_cast<char>(memory.load(GuestAddress{value+i},8));if(!ch)break;text.push_back(ch);}field=from_narrow(text);}
             if(string&&precision&&field.size()>*precision)field.resize(*precision);zero=false;
         }else {
-            auto magnitude=value;const auto bits=kind=='p'||wide_integer?64U:length=='h'?16U:32U;
+            auto magnitude=value;const auto bits=(kind=='p' && !x86)||wide_integer?64U:length=='h'?16U:32U;
             if(bits<64)magnitude&=(UINT64_C(1)<<bits)-1;
             if((kind=='d'||kind=='i')&&(magnitude&(UINT64_C(1)<<(bits-1)))){lead.push_back('-');magnitude=(~magnitude+1)&(bits==64?UINT64_MAX:(UINT64_C(1)<<bits)-1);}
             const bool hex=kind=='x'||kind=='X'||kind=='p';std::array<char,32> digits{};const auto converted=std::to_chars(digits.data(),digits.data()+digits.size(),magnitude,hex?16:10);std::string text(digits.data(),converted.ptr);
             if(kind=='X'||kind=='p')for(auto& ch:text)if(ch>='a'&&ch<='f')ch=static_cast<char>(ch-'a'+'A');field=from_narrow(text);
             if(hex&&prefix){lead.push_back('0');lead.push_back(kind=='x'?'x':'X');}
-            if(kind=='p'){width=16;zero=true;}
+            if(kind=='p'){width=x86?8:16;zero=true;}
             if(precision&&field.size()<*precision)field.insert(0,*precision-field.size(),'0');
         }
         width=std::min(width,2048U);const auto occupied=lead.size()+field.size();const auto padding=width>occupied?width-occupied:0;
@@ -81,13 +83,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_userstring(GuestState& stat
     const bool wide = symbol.ends_with('W');
     std::uint64_t result = 0;
     const auto fail = [&](std::uint32_t error) { last_error_ = error; result = 0; };
-    if(symbol=="wsprintfA" || symbol=="wsprintfW" || symbol=="wvsprintfA" || symbol=="wvsprintfW"){
-        unsigned index=2;std::uint64_t va=symbol.starts_with("wvs")?arg(2):0;const bool indirect=symbol.starts_with("wvs");
-        const auto next=[&](){if(!indirect)return arg(index++);const auto value=memory.load(GuestAddress{va},64);if(va>UINT64_MAX-8)throw HostCallFault("wsprintf va_list 地址溢位");va+=8;return value;};
+    if(symbol=="wsprintfA" || symbol=="wsprintfW" || symbol=="wvsprintfA" || symbol=="wvsprintfW" || symbol.starts_with("wnsprintf") || symbol.starts_with("wvnsprintf")){
+        // wnsprintf(buffer, cch, format, ...)／wvnsprintf(buffer, cch, format, va_list)：寫入至多 cch-1 個字元並補 NUL，回傳不含 NUL 的字元數。
+        const bool bounded=symbol.starts_with("wn") || symbol.starts_with("wvn"),indirect=symbol.starts_with("wv");const unsigned shift=bounded?1U:0U;
+        const bool x86=memory.execution_mode()==ExecutionMode::X86;const unsigned slot=x86?4U:8U;
+        if(bounded && (!arg(0) || static_cast<std::int32_t>(static_cast<std::uint32_t>(arg(1)))<=0 || !arg(2))){arg.return_to(state,static_cast<std::uint32_t>(-1));return std::nullopt;}
+        const std::size_t limit=bounded?static_cast<std::uint32_t>(arg(1))-1U:1023U;
+        unsigned index=2+shift;std::uint64_t va=indirect?arg(2+shift):0;
+        const auto take=[&]()->std::uint64_t{if(!indirect)return arg(index++);if(va>UINT64_MAX-slot)throw HostCallFault("wsprintf va_list 地址溢位");const auto value=memory.load(GuestAddress{va},static_cast<std::uint8_t>(slot*8));va+=slot;return value;};
+        const std::function<std::uint64_t(bool)> next=[&](bool quad)->std::uint64_t{const auto low=take();if(!quad || !x86)return low;return (low&UINT32_MAX)|(take()<<32);};
         bool truncated=false;std::vector<std::uint8_t> output;
-        if(wide){const auto format=read_utf16(memory,GuestAddress{arg(1)},65536);const auto text=user32_format<char16_t>(memory,format,true,next,truncated);result=text.size();output=utf16_bytes(text);}
-        else {const auto format=read_ansi(memory,arg(1),65536);const auto text=user32_format<char>(memory,format,false,next,truncated);result=text.size();output.assign(text.begin(),text.end());output.push_back(0);}
-        memory.write(GuestAddress{arg(0)},output);if(truncated){last_error_=122;result=1024;}
+        if(wide){const auto format=read_utf16(memory,GuestAddress{arg(1+shift)},65536);const auto text=user32_format<char16_t>(memory,format,true,next,truncated,limit,x86);result=text.size();output=utf16_bytes(text);}
+        else {const auto format=read_ansi(memory,arg(1+shift),65536);auto text=user32_format<char>(memory,format,false,next,truncated,limit,x86);
+            // A 版的 ACP 為 UTF-8：截斷時不留下半個多位元組字元。
+            if(truncated){auto size=text.size();while(size && (static_cast<unsigned char>(text[size-1])&0xc0U)==0x80U)--size;if(size && static_cast<unsigned char>(text[size-1])>=0xc0U)text.resize(size-1);}
+            result=text.size();output.assign(text.begin(),text.end());output.push_back(0);}
+        memory.write(GuestAddress{arg(0)},output);if(truncated && !bounded){last_error_=122;result=1024;}
     } else if (symbol.starts_with("CharNext") || symbol.starts_with("CharPrev")) {
         const bool extended = symbol.ends_with("ExA"), previous = symbol.starts_with("CharPrev");
         const auto shift = extended ? 1U : 0U;

@@ -22,4 +22,6 @@ struct NativeServiceCatalog {
 std::optional<NativeServiceCatalog> native_service_catalog();
 std::optional<NativeServiceStatus> native_service_status(std::u16string_view,bool system);
 std::array<std::uint32_t,9> service_status_words(const NativeServiceStatus&);
+// 原生唯讀服務與客體 SCM 服務合併後的目錄項目；EnumServicesStatus、EnumDependentServices、GetServiceDisplayName／KeyName 共用。
+struct ServiceCatalogEntry {std::u16string name,display,group;std::array<std::uint32_t,9> words{};std::vector<std::u16string> dependencies;};
 }

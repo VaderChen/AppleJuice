@@ -13,6 +13,7 @@ struct FileTransferMetadata {
     std::string path;
     std::uint64_t object{};
     bool manage_volume_at_open{};
+    char volume_device{}; // 0 為一般檔案；否則為固定的虛擬卷身分，不隨磁碟別名改綁。
 };
 // 獨立 open 保存值；傳輸後同一 FILE_OBJECT 使用共用游標。
 class FilePosition {

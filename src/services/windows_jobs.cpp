@@ -1,3 +1,6 @@
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#endif
 #include "x64arm/windows_services.hpp"
 #include "x64arm/shared_job.hpp"
 #include "x64arm/shared_event.hpp"
@@ -200,11 +203,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_job(GuestState& state,Guest
                     }
                 }
             }
-            else if(kind!=2 && kind!=3 && kind!=4 && kind!=9)fail(50);
-            else if(setting && kind==3)fail(87);
+            else if(kind!=1 && kind!=2 && kind!=3 && kind!=4 && kind!=8 && kind!=9)fail(50);
+            else if(setting && (kind==1 || kind==3 || kind==8))fail(87);
             else if(!arg(2))fail(87);
             else {
-                const auto size=kind==2?basic:kind==9?extended:kind==4?4U:8U+snapshot.processes.size()*(x86_?4:8);
+                const auto size=kind==1?48U:kind==8?96U:kind==2?basic:kind==9?extended:kind==4?4U:8U+snapshot.processes.size()*(x86_?4:8);
                 if(!setting && arg(4))memory.store(GuestAddress{arg(4)},32,size);
                 if(!setting && kind==3 && u32(3)>=8 && u32(3)<size){
                     const auto copied=std::min<std::size_t>((u32(3)-8)/(x86_?4:8),snapshot.processes.size());memory.check(GuestAddress{arg(2)},8+copied*(x86_?4:8),Access::Write);
@@ -219,6 +222,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_job(GuestState& state,Guest
                     memory.write(GuestAddress{arg(2)},std::vector<std::uint8_t>(size));
                     if(kind==2 || kind==9){memory.store(GuestAddress{arg(2)+16},32,snapshot.flags);memory.store(GuestAddress{arg(2)+(x86_?28:40)},32,snapshot.active_limit);if(kind==9){memory.store(GuestAddress{arg(2)+(x86_?96:112)},bits,snapshot.process_memory_limit);memory.store(GuestAddress{arg(2)+(x86_?104:128)},bits,snapshot.peak_process_memory);memory.store(GuestAddress{arg(2)+(x86_?108:136)},bits,snapshot.peak_job_memory);}}
                     else if(kind==4)memory.store(GuestAddress{arg(2)},32,snapshot.ui_restrictions);
+                    else if(kind==1 || kind==8){
+                        // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION：使用者／核心時間（100 ns）、分頁錯誤與程序計數。
+                        // 本程序是成員時計入本程序的 CPU 時間；其他成員程序的時間與 I/O 計數（kind 8 的 IO_COUNTERS）沒有共用帳本，記為 0。
+                        std::uint64_t user=0,kernel=0;
+                        if(std::find(snapshot.processes.begin(),snapshot.processes.end(),process_id())!=snapshot.processes.end()){
+#if !defined(_WIN32)
+                            rusage usage{};if(!::getrusage(RUSAGE_SELF,&usage)){
+                                user=static_cast<std::uint64_t>(usage.ru_utime.tv_sec)*10000000U+static_cast<std::uint64_t>(usage.ru_utime.tv_usec)*10U;
+                                kernel=static_cast<std::uint64_t>(usage.ru_stime.tv_sec)*10000000U+static_cast<std::uint64_t>(usage.ru_stime.tv_usec)*10U;}
+#endif
+                        }
+                        memory.store(GuestAddress{arg(2)},64,user);memory.store(GuestAddress{arg(2)+8},64,kernel);
+                        memory.store(GuestAddress{arg(2)+16},64,user);memory.store(GuestAddress{arg(2)+24},64,kernel);
+                        memory.store(GuestAddress{arg(2)+36},32,snapshot.total);memory.store(GuestAddress{arg(2)+40},32,snapshot.processes.size());
+                        memory.store(GuestAddress{arg(2)+44},32,snapshot.terminated);
+                    }
                     else if(kind==3){memory.store(GuestAddress{arg(2)},32,snapshot.processes.size());memory.store(GuestAddress{arg(2)+4},32,snapshot.processes.size());for(std::size_t i=0;i<snapshot.processes.size();++i)memory.store(GuestAddress{arg(2)+8+i*(x86_?4:8)},bits,snapshot.processes[i]);}
                     result=1;
                 }

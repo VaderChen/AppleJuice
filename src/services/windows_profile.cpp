@@ -16,7 +16,9 @@ std::span<const WindowsServiceDescriptor> profile_service_descriptors(){
         {"kernel32.dll","GetPrivateProfileSectionA",4},{"kernel32.dll","GetPrivateProfileSectionW",4},
         {"kernel32.dll","GetPrivateProfileSectionNamesA",3},{"kernel32.dll","GetPrivateProfileSectionNamesW",3},
         {"kernel32.dll","WritePrivateProfileStringA",4},{"kernel32.dll","WritePrivateProfileStringW",4},
-        {"kernel32.dll","WritePrivateProfileSectionA",3},{"kernel32.dll","WritePrivateProfileSectionW",3}
+        {"kernel32.dll","WritePrivateProfileSectionA",3},{"kernel32.dll","WritePrivateProfileSectionW",3},
+        {"kernel32.dll","GetPrivateProfileStructA",5},{"kernel32.dll","GetPrivateProfileStructW",5},
+        {"kernel32.dll","WritePrivateProfileStructA",5},{"kernel32.dll","WritePrivateProfileStructW",5}
     };return table;
 }
 namespace {
@@ -85,6 +87,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_profile(GuestState& state,G
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W'),writing=symbol.starts_with("Write"),number=symbol.starts_with("GetPrivateProfileInt") || symbol.starts_with("GetProfileInt"),names=symbol.starts_with("GetPrivateProfileSectionNames");
     const bool system_profile=symbol.starts_with("GetProfile") || symbol.starts_with("WriteProfile");
     const bool section=symbol.find("Section")!=symbol.npos && !names;
+    // Get／WritePrivateProfileStruct：值為結構各位元組的十六進位文字，末尾兩位是位元組和的低八位元檢查碼。
+    const bool structure=symbol.find("Struct")!=symbol.npos;
     const auto read=[&](std::uint64_t p){return p?(wide?read_utf16(memory,GuestAddress{p}):utf8_to_utf16_lossy(read_ansi(memory,p))):std::u16string{};};
     const auto copy=[&](std::uint64_t pointer,std::uint32_t capacity,std::u16string text,bool multiple)->std::uint64_t{
         if(!pointer || !capacity)return 0;
@@ -95,12 +99,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_profile(GuestState& state,G
         else if(units>capacity){result=capacity-terminators;units=capacity;encoded.resize(units*width);std::fill(encoded.begin()+static_cast<std::ptrdiff_t>(result*width),encoded.end(),0);}
         memory.write(GuestAddress{pointer},std::span(encoded).first(units*width));return result;
     };
-    const auto filename_index=writing?(section?2U:3U):names?2U:number || section?3U:5U;
-    const bool multiple=names || section || (!writing && !number && (!arg(0) || !arg(1)));
+    const auto filename_index=structure?4U:writing?(section?2U:3U):names?2U:number || section?3U:5U;
+    const bool multiple=!structure && (names || section || (!writing && !number && (!arg(0) || !arg(1))));
     std::uint64_t result=0;
     const auto failure=[&](std::uint32_t error){
         last_error_=error;result=0;
-        if(!writing && !number)(void)copy(arg(names?0U:section?1U:3U),static_cast<std::uint32_t>(arg(names?1U:section?2U:4U)),u"",multiple);
+        if(!writing && !number && !structure)(void)copy(arg(names?0U:section?1U:3U),static_cast<std::uint32_t>(arg(names?1U:section?2U:4U)),u"",multiple);
     };
     try{
         auto path=system_profile || !arg(filename_index)?std::u16string(u"win.ini"):read(arg(filename_index));
@@ -117,7 +121,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_profile(GuestState& state,G
                 for(;;){const auto ansi=wide?std::string{}:read_ansi(memory,at);auto line=wide?read_utf16(memory,GuestAddress{at}):utf8_to_utf16_lossy(ansi);if(line.empty())break;const auto length=(wide?line.size()*2:ansi.size())+(wide?2U:1U);if(length>output_limit-total)throw ProfileFailure{223};total+=length;at+=length;if(line.find_first_of(u"\r\n")!=line.npos)throw ProfileFailure{87};replacement.push_back(std::move(line));}
             }else if(!section && arg(1)){
                 key=read(arg(1));if(key.empty() || key.find_first_of(u"\r\n=")!=key.npos)throw ProfileFailure{87};
-                value=read(arg(2));if(value.find_first_of(u"\r\n")!=value.npos)throw ProfileFailure{87};
+                if(structure && arg(2)){
+                    const auto size=static_cast<std::uint32_t>(arg(3));if(size>output_limit/2)throw ProfileFailure{87};std::vector<std::uint8_t> bytes(size);memory.read(GuestAddress{arg(2)},bytes);
+                    unsigned sum=0;constexpr char16_t digits[]=u"0123456789ABCDEF";for(const auto b:bytes){value+=digits[b>>4];value+=digits[b&15];sum+=b;}value+=digits[(sum>>4)&15];value+=digits[sum&15];
+                }else value=read(arg(2));
+                if(value.find_first_of(u"\r\n")!=value.npos)throw ProfileFailure{87};
             }
             // 新檔案採用 UTF-8 ACP；不合法 UTF-16 必須在建立或修改檔案前失敗。
             if(wide){(void)utf16_to_utf8(app);(void)utf16_to_utf8(key);(void)utf16_to_utf8(value);for(const auto& line:replacement)(void)utf16_to_utf8(line);}
@@ -142,7 +150,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_profile(GuestState& state,G
             }else {const auto file=filesystem_.open(filename);error=file.error;if(!error){if(file.bytes->size()>output_limit)throw ProfileFailure{223};bytes=*file.bytes;}}
             if(error && error!=2 && error!=3)throw ProfileFailure{error};last_error_=error;
             const Profile profile(bytes);const auto app=names?std::u16string{}:read(arg(0));
-            if(number){if(!arg(0) || !arg(1))throw ProfileFailure{87};const auto value=profile.value(app,read(arg(1)));result=!value || value->empty()?static_cast<std::uint32_t>(arg(2)):
+            if(structure){
+                if(!arg(0) || !arg(1))throw ProfileFailure{87};const auto size=static_cast<std::uint32_t>(arg(3));
+                const auto value=profile.value(app,read(arg(1)));if(!value)throw ProfileFailure{2};
+                const auto text=trim(*value);if(text.size()!=static_cast<std::size_t>(size)*2+2)throw ProfileFailure{24};
+                const auto nibble=[](char16_t c)->int{return c>=u'0'&&c<=u'9'?c-u'0':c>=u'a'&&c<=u'f'?c-u'a'+10:c>=u'A'&&c<=u'F'?c-u'A'+10:-1;};
+                std::vector<std::uint8_t> decoded;unsigned sum=0;
+                for(std::size_t i=0;i<text.size();i+=2){const auto high=nibble(text[i]),low=nibble(text[i+1]);if(high<0 || low<0)throw ProfileFailure{13};decoded.push_back(static_cast<std::uint8_t>(high*16+low));}
+                const auto check=decoded.back();decoded.pop_back();for(const auto b:decoded)sum+=b;if((sum&255U)!=check)throw ProfileFailure{13};
+                if(size){if(!arg(2))throw ProfileFailure{87};memory.write(GuestAddress{arg(2)},decoded);}
+                last_error_=0;result=1;
+            }else if(number){if(!arg(0) || !arg(1))throw ProfileFailure{87};const auto value=profile.value(app,read(arg(1)));result=!value || value->empty()?static_cast<std::uint32_t>(arg(2)):
                 system_profile && trim(*value).starts_with(u'-')?0:integer(*value);}
             else {
                 const auto output=arg(names?0U:section?1U:3U);const auto capacity=static_cast<std::uint32_t>(arg(names?1U:section?2U:4U));

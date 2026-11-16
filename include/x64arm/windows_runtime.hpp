@@ -17,6 +17,7 @@
 #include "x64arm/readonly_files.hpp"
 #include "x64arm/file_position.hpp"
 #include "x64arm/shared_event.hpp"
+#include "x64arm/object_directory.hpp"
 #include "x64arm/machine_clock.hpp"
 #include "x64arm/windows_tokens.hpp"
 #include "x64arm/windows_lsa.hpp"
@@ -29,6 +30,7 @@
 #include "x64arm/guest_callback.hpp"
 #include "x64arm/windows_com_proxy.hpp"
 #include <algorithm>
+#include <array>
 #include <map>
 #include <set>
 #include <deque>
@@ -51,6 +53,8 @@ struct RuntimeImage {
     std::map<std::string, std::uint32_t> export_names;
     std::map<std::uint32_t, std::uint32_t> export_ordinals;
     std::u16string path;
+    // 內部產碼保留函式表供執行／unwind 使用，但不是載入器 DLL 或檔案映像。
+    bool private_code{};
     std::map<std::uint32_t, std::string> export_forwarders;
     std::uint64_t entry{};
     bool large_address_aware{true};
@@ -70,7 +74,7 @@ struct RuntimeFunctionTable {
     std::u16string out_of_process_callback;
     bool operator==(const RuntimeFunctionTable&) const = default;
 };
-enum class MsvcExceptionKind : unsigned { BadCast,BadTypeid,NonRtti,Exception,BadAlloc,BadFunction,LogicError,LengthError,OutOfRange,RuntimeError,RegexError,InvalidArgument,OverflowError,SystemError,IosFailure,BadException,FutureError,ImproperLock,Count };
+enum class MsvcExceptionKind : unsigned { BadCast,BadTypeid,NonRtti,Exception,BadAlloc,BadFunction,LogicError,LengthError,OutOfRange,RuntimeError,RegexError,InvalidArgument,OverflowError,SystemError,IosFailure,BadException,FutureError,ImproperLock,ImproperSchedulerAttach,ImproperSchedulerDetach,InvalidMultipleScheduling,InvalidSchedulerPolicyKey,InvalidSchedulerPolicyThreadSpecification,InvalidSchedulerPolicyValue,MissingWait,SchedulerResourceAllocationError,Count };
 struct RuntimeCxxExceptions {
     RuntimeImage image;
     std::array<std::uint64_t,static_cast<unsigned>(MsvcExceptionKind::Count)> throw_info{},vtable{},message{};
@@ -129,7 +133,7 @@ struct ModuleOperation {
     std::uint32_t thread_exit_code{};
     bool operator==(const ModuleOperation&) const = default;
 };
-enum class Continuation { RecentDocument, GuiClipboardNotification, GuiBeginPaint, SocketAccept, ComAgileOperation, FunctionTableLookup, ExceptionFunctionLookup, CapturePreviousContext, GuiOpenIcon, ComBindOperation, D3DXProgressOperation, D3DCompileOperation, Msvcp100Operation, UnwindConsolidate, CrtAssertion, CrtFatalDialog, GuiMouseInput, GuiMoveSize, ThemeTextOperation, MdiMoveOperation, StorageOperation, StorageCopyOperation, GuiGrayString, ComOperation, AutomationOperation, DirectInputEnumeration, StackWalkOperation, DemangleOperation, Eh4Operation, GuiAsyncSend, GuiAsyncCallback, GuiWaitMessage, DWriteOperation, CrtNewResult, CrtNewRetry, CrtInvalidNewMode, GuiSendTimeout, AccessibleOperation, SafeArrayOperation, OleStreamCopy, PrintAbort, UnhandledFilter, FiberDelete, UserApc, GuiIntegerText, WindowEnumeration, LocaleEnumeration, RegistryBooleanResult, ResourceEnumeration, MetafileEnumeration, GuiWinEvent, FileTransfer, ReturnUntilFalse, Return, Startup, InitTermE, Exit, ThreadExit, ReturnCallback, Exception, ContinueException, SehFilter, GuiNcCreate, GuiCreate, GuiDialogInit, GuiModalInit, GuiModalDispatch, GuiModalEnd, GuiDestroy, GuiDestroyDefault, GuiMenuInit, GuiMenuFinish, GuiSentMessage, GuiControlOperation, CrtExit, Sort, OleVariantClear, OleVariantCopy, ModuleOperation, OleReleaseStgMedium, MsvcCopy, MsvcUnwind, MsvcCatch, MsvcDestroy, GuiWindowPos, GuiWindowNcCalc, GuiHook, GuiMsgFilterSystem, GuiModalSystemFilter, GuiModalFilter, GuiCbtCreate, GuiCreationNcCreate, GuiCreationNcCalc, GuiCreationCreate, GuiCreationFinish, GuiCreationAbort, GuiDialogProc, GuiBusyHook, GuiBusyResult, OleClipboardOperation, GuiPropertySheet, GuiCbtAction, FontEnumeration, OnExitTable, InitOnce, RegisteredWait, ReturnCallbackFreeHeap, NtCloseResult, ReturnZeroFreeHeap, CertificateDecodeAllocation, CertificateFind, SymbolFunctionEntry, MiniDumpOperation, EtwCallback, EtwProcess, WinrtOperation, NativeV8Operation, NativeOperation, TypeLibraryInvoke, TypeLibraryAddress, PrintDialogOperation, PageSetupStart, PageSetupResult, PageSetupHook, PageSetupPaint, PrintPropertyPageOperation, ShellItemOperation, ComMarshalOperation, OleDragLoop, OleDragTarget, ComProxyDispatch, ComErrorSet, ComErrorRetire, RestrictedError, WinrtOriginSetup, WinrtOriginFinish, GuiDragDetection, ComContextOperation, MediaFoundationQuery, InitTerm, ReturnUntilFailure, ServiceMain, ServiceControl, GuiTextThunk, BeepTone, PolicyRetry, OlePersistence, CrtLongjmp, ComRotOperation, PerflibOperation, MciWait, ConsoleControl, TaskDialogOperation, DdeOperation, ComSpyOperation, GdiplusStream, FontPackage, WinUsbTransfer, WinUsbOverlapped, KernelRequest, SehFinally, MsiOperation, EsentOperation, NestedResult, MonitorEnumeration, GuiRetrievedMessage };
+enum class Continuation { NativeApc, NativeApcIoError, RecentDocument, GuiClipboardNotification, GuiBeginPaint, SocketAccept, ComAgileOperation, FunctionTableLookup, ExceptionFunctionLookup, CapturePreviousContext, GuiOpenIcon, ComBindOperation, D3DXProgressOperation, D3DCompileOperation, Msvcp100Operation, UnwindConsolidate, CrtAssertion, CrtFatalDialog, GuiMouseInput, GuiMoveSize, ThemeTextOperation, MdiMoveOperation, StorageOperation, StorageCopyOperation, GuiGrayString, ComOperation, AutomationOperation, DirectInputEnumeration, StackWalkOperation, DemangleOperation, Eh4Operation, GuiAsyncSend, GuiAsyncCallback, GuiWaitMessage, DWriteOperation, CrtNewResult, CrtNewRetry, CrtInvalidNewMode, GuiSendTimeout, AccessibleOperation, SafeArrayOperation, OleStreamCopy, PrintAbort, UnhandledFilter, FiberDelete, UserApc, GuiIntegerText, WindowEnumeration, LocaleEnumeration, RegistryBooleanResult, ResourceEnumeration, MetafileEnumeration, GuiWinEvent, FileTransfer, ReturnUntilFalse, Return, Startup, InitTermE, Exit, ThreadExit, ReturnCallback, Exception, ContinueException, SehFilter, GuiNcCreate, GuiCreate, GuiDialogInit, GuiModalInit, GuiModalDispatch, GuiModalEnd, GuiDestroy, GuiDestroyDefault, GuiMenuInit, GuiMenuFinish, GuiSentMessage, GuiControlOperation, CrtExit, Sort, OleVariantClear, OleVariantCopy, ModuleOperation, OleReleaseStgMedium, MsvcCopy, MsvcUnwind, MsvcCatch, MsvcDestroy, GuiWindowPos, GuiWindowNcCalc, GuiHook, GuiMsgFilterSystem, GuiModalSystemFilter, GuiModalFilter, GuiCbtCreate, GuiCreationNcCreate, GuiCreationNcCalc, GuiCreationCreate, GuiCreationFinish, GuiCreationAbort, GuiDialogProc, GuiBusyHook, GuiBusyResult, OleClipboardOperation, GuiPropertySheet, GuiCbtAction, FontEnumeration, OnExitTable, InitOnce, RegisteredWait, ReturnCallbackFreeHeap, NtCloseResult, ReturnZeroFreeHeap, CertificateDecodeAllocation, CertificateFind, SymbolFunctionEntry, MiniDumpOperation, EtwCallback, EtwProcess, WinrtOperation, NativeV8Operation, NativeOperation, TypeLibraryInvoke, TypeLibraryAddress, PrintDialogOperation, PageSetupStart, PageSetupResult, PageSetupHook, PageSetupPaint, PrintPropertyPageOperation, ShellItemOperation, ComMarshalOperation, OleDragLoop, OleDragTarget, ComProxyDispatch, ComErrorSet, ComErrorRetire, RestrictedError, WinrtOriginSetup, WinrtOriginFinish, GuiDragDetection, ComContextOperation, MediaFoundationQuery, InitTerm, ReturnUntilFailure, ServiceMain, ServiceControl, GuiTextThunk, BeepTone, PolicyRetry, OlePersistence, CrtLongjmp, ComRotOperation, PerflibOperation, MciWait, ConsoleControl, TaskDialogOperation, DdeOperation, ComSpyOperation, GdiplusStream, FontPackage, WinUsbTransfer, WinUsbOverlapped, KernelRequest, SehFinally, MsiOperation, EsentOperation, NestedResult, MonitorEnumeration, GuiRetrievedMessage };
 struct GuiHookFrame {
     std::vector<std::uint64_t> handles,scratch;
     std::size_t index{};
@@ -137,6 +141,9 @@ struct GuiHookFrame {
     std::uint64_t value{},cbt_source{},cbt_marshaled{};std::int32_t type{};bool wide{true};
     bool operator==(const GuiHookFrame&) const = default;
 };
+inline constexpr bool native_apc_continuation(Continuation value){
+    return value==Continuation::NativeApc || value==Continuation::NativeApcIoError;
+}
 struct CallbackFrame {
     GuestState saved;
     std::vector<GuestCallback> callbacks;
@@ -153,6 +160,7 @@ struct CallbackFrame {
     std::optional<GuestState> unwind_target{};
     std::uint64_t gui_erase_window{};
     std::optional<std::vector<std::array<std::int32_t,4>>> gui_erase_clip;
+    bool gui_sent_message{}; // 同執行緒 SendMessage 進入的視窗程序：期間目前輸入來源為不可用。
     bool operator==(const CallbackFrame&) const = default;
 };
 struct CrtIoLock {
@@ -172,6 +180,7 @@ struct CrtFile {
     FileMetadata metadata{};
     std::string key{};
     bool readable{true}, writable{}, append{}, text{},commit_on_close{};
+    bool temporary_file{}; // tmpfile／tmpfile_s 建立（關閉時刪除），_rmtmp 只關閉這類串流。
     std::uint32_t descriptor{}, sharing{7};
     std::uint64_t description{}, standard_handle{}, os_handle{};
     std::vector<std::uint8_t> pushback{};
@@ -209,8 +218,12 @@ struct MultimediaFile {
     std::uint32_t io_capacity{},io_valid{},open_flags{};
     bool io_owned{},io_ready{};
     bool memory{};
+    // 自訂 I/O 程序：客體 IOProc、其 FOURCC、交給程序的內部 MMIOINFO（開啟到關閉期間保留）與是否接受 Unicode 檔名。
+    std::uint64_t procedure{},procedure_info{};std::uint32_t procedure_fourcc{};bool unicode_procedure{};
     bool operator==(const MultimediaFile&) const = default;
 };
+// mmioInstallIOProc 安裝的 I/O 程序（最近安裝者優先）。
+struct MultimediaProcedure {std::uint32_t fourcc{};std::uint64_t procedure{};bool unicode{};bool operator==(const MultimediaProcedure&) const = default;};
 struct WaitObject {
     enum class Kind { Event, Semaphore, Timer, Mutex, ChangeNotification, MemoryResource } kind{};
     std::uint32_t count{}, maximum{};
@@ -298,12 +311,16 @@ struct SortState {
     bool active{}, waiting{};
     bool search{};
     std::uint64_t key{};
+    // qsort_s／bsearch_s／_lfind_s 的比較器第一個參數是 context；_lfind／_lsearch 為線性搜尋，_lsearch 找不到時附加 key 並更新 *num。
+    std::uint64_t context{}, count_cell{};
+    bool contextual{}, linear{}, append{};
     bool operator==(const SortState&) const = default;
 };
 struct VirtualRegion {
     std::uint64_t size{};
     std::uint32_t protection{};
-    bool placeholder{},replaced_placeholder{};
+    bool placeholder{},replaced_placeholder{},write_watch{};
+    std::set<std::uint64_t> written_pages{};
     bool operator==(const VirtualRegion&) const = default;
 };
 struct VirtualAddressRequirements {
@@ -450,8 +467,13 @@ struct ComClassRegistration {
     bool pending{}, canceled{}, suspended{}, reserved{}, used{};
     bool operator==(const ComClassRegistration&) const = default;
 };
+// RpcBindingFromStringBinding 建立的用戶端 binding（字串欄位與 RpcBindingSetAuthInfoEx 設定）。
+// 用戶端 binding：字串欄位、RpcBindingSetAuthInfo(Ex) 的認證資訊（identity、QOS 版本 1 的四個欄位）、通訊逾時（0～10，預設 5）與 RpcBindingSetOption 設定。
+struct RpcBinding {std::u16string object,protocol,address,endpoint,options,principal;std::uint32_t authn_level{},authn_service{},authz_service{};
+    std::uint64_t identity{};std::array<std::uint32_t,4> qos{};bool authenticated{},qos_set{};std::uint32_t com_timeout{5};std::map<std::uint32_t,std::uint64_t> settings;
+    bool operator==(const RpcBinding&)const=default;};
 struct WinrtModule {std::u16string path{};std::uint32_t active{},references{1};bool unloading{};std::set<std::u16string> aliases{};bool operator==(const WinrtModule&)const=default;};
-struct WinrtString {std::uint64_t data{};std::uint32_t length{},references{1};bool operator==(const WinrtString&)const=default;};
+struct WinrtString {std::uint64_t data{};std::uint32_t length{},references{1};bool buffer{};bool operator==(const WinrtString&)const=default;}; // buffer：WindowsPreallocateStringBuffer 尚未 promote 的 HSTRING_BUFFER。
 struct CrtLocaleCategory {
     std::u16string name{u"C"};
     std::uint32_t codepage{}, lcid{};
@@ -522,6 +544,12 @@ struct RuntimeState {
     std::uint64_t next_token_object{2};
     LsaState lsa;
     std::set<std::uint64_t> local_allocations, wts_allocations;
+    // wtsapi32（windows_wts.cpp）：WTSFreeMemoryEx 的區塊型別、WTSOpenServer handle 與其 WTSWaitSystemEvent 事件（鍵 0 為 WTS_CURRENT_SERVER_HANDLE）、
+    // 非同步 WTSSendMessage 的執行緒 handle 與參數區塊。
+    std::map<std::uint64_t,std::uint32_t> wts_allocation_classes;
+    std::map<std::uint64_t,std::uint64_t> wts_servers;
+    std::uint64_t wts_next_server{0x57530000};
+    std::vector<std::pair<std::uint64_t,std::uint64_t>> wts_async_messages;
     std::map<std::uint64_t, AlignedAllocation> aligned_allocations;
     std::map<std::uint64_t, VirtualRegion> virtual_regions;
     struct PageProtection {std::uint32_t mode{},initial{};bool operator==(const PageProtection&) const = default;};
@@ -585,6 +613,8 @@ struct RuntimeState {
     std::map<std::uint64_t, std::pair<std::uint64_t, bool>> process_thread_handles;
     std::map<std::uint64_t,std::uint32_t> thread_handle_access;
     std::map<std::uint64_t,std::uint32_t> handle_flags;
+    std::map<std::uint64_t,ObjectDirectoryHandle> object_directories;
+    std::uint64_t named_object_directory{};
     std::int32_t thread_priority{};
     std::uint64_t next_wait_handle{0x50000};
     std::uint64_t allocate_wait_handle(){const auto handle=next_wait_handle;next_wait_handle+=4;return handle;}
@@ -672,6 +702,7 @@ struct RuntimeState {
     std::uint64_t host_clock_pending{};
     std::map<std::uint32_t,std::uint32_t> timer_periods;
     std::map<std::uint64_t,MultimediaFile> multimedia_files;
+    std::vector<MultimediaProcedure> multimedia_procedures;
     std::uint64_t filetime_base{}, timezone_name{};
     std::uint64_t process_creation_clock_ticks{},system_time_anchor_ticks{},system_time_anchor_filetime{};
     std::uint32_t system_time_increment{10000},system_time_adjustment{10000};
@@ -737,6 +768,18 @@ struct RuntimeState {
     std::array<std::uint64_t,2> crt_tmpnam_buffers{};
     std::map<std::uint64_t,CrtLocaleObject> crt_locales;
     std::uint64_t crt_current_locale{};
+    // SetProcessPreferredUILanguages 設定的程序偏好 UI 語言（以 locale 名稱保存）。
+    std::vector<std::u16string> preferred_ui_languages;
+    // SetProcessWorkingSetSizeEx 的硬性上下限旗標；預設兩者皆停用。SetSystemFileCacheSize 的設定（需要 SeIncreaseQuotaPrivilege）。
+    std::uint32_t working_set_flags{0xa};
+    // 程序共用的核心→使用者 instrumentation 入口；0 代表未註冊。
+    std::uint64_t instrumentation_callback{};
+    std::uint64_t file_cache_minimum{0x100000},file_cache_maximum{};std::uint32_t file_cache_flags{};
+    // LZInit 開啟的壓縮檔：鍵為 LZ handle（400 起，最多 16 個），保存來源 HFILE、解壓後內容與讀取位置。
+    struct LzFile {std::uint64_t file{};std::vector<std::uint8_t> data;std::uint64_t position{};bool operator==(const LzFile&)const=default;};
+    std::map<std::uint32_t,LzFile> lz_files;
+    // SetDefaultCommConfig 保存的各 COM 埠預設 DCB（28 位元組）。
+    std::map<unsigned,std::array<std::uint8_t,28>> serial_defaults;
     std::map<std::uint64_t,std::uint64_t> crt_thread_locales;
     std::map<std::uint64_t,std::uint64_t> crt_locale_query_buffers;
     std::array<std::uint8_t,8> crt_implicit_mb_decode{},crt_implicit_mb_encode{};
@@ -753,6 +796,10 @@ struct RuntimeState {
     std::map<std::uint64_t,WinrtString> winrt_strings;
     std::map<std::uint64_t,WinrtModule> winrt_modules;
     std::uint64_t winrt_empty_string{};
+    std::map<std::uint64_t,RpcBinding> rpc_bindings;
+    std::uint32_t timer_resolution{156250};bool timer_resolution_set{}; // NtSetTimerResolution（100 ns 單位）。
+    std::map<std::uint64_t,std::uint32_t> heap_compatibility; // HeapSetInformation(HeapCompatibilityInformation)：0 標準、2 LFH。
+    std::set<std::uint64_t> com_mta_usage_cookies; // CoIncrementMTAUsage：非空時 MTA 不隨最後一個 MTA 執行緒結束。
     ComMarshalBridge com_marshal;
     ComAgileBridge com_agile;
     ComContextBridge com_contexts;

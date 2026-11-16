@@ -4,6 +4,7 @@
 #include "x64arm/certificate_roots_path.hpp"
 #include "x64arm/file_reparse.hpp"
 #include "x64arm/file_volumes.hpp"
+#include "x64arm/file_streams.hpp"
 #include "x64arm/network_files.hpp"
 #include <filesystem>
 #include <functional>
@@ -57,6 +58,9 @@ struct HostFile {
     std::uint32_t allocate(std::uint64_t size) const;
     std::uint32_t set_valid_data(std::uint64_t size) const;
     FileInformation information() const;
+    FileInformation storage_information() const;
+    const HostFile& security_file() const noexcept{return stream_base_?stream_base_->security_file():*this;}
+    bool named_stream() const noexcept{return static_cast<bool>(stream_base_);}
     // 只取目前檔案大小（一次 fstat）：ReadFile／WriteFile 每次都要 EOF，information() 另讀兩個 xattr（valid data、DOS 屬性），
     // Steam 校驗檔案時每秒數萬次 ReadFile 曾因此每次多 30 µs。沒有內容 fd 時回到 information()。
     std::uint64_t current_size() const;
@@ -64,13 +68,14 @@ struct HostFile {
     static FileInformation descriptor_information(int descriptor);
     static bool is_null_descriptor(int descriptor);
     bool null_device() const noexcept { return null_device_; }
-    bool local_stream_file() const noexcept { return descriptor_>=0 && !null_device_ && !reparse_tag_ && !network_lease_; }
+    bool volume_device() const noexcept { return volume_device_; }
+    bool local_stream_file() const noexcept { return descriptor_>=0 && !null_device_ && !volume_device_ && !reparse_tag_ && !network_lease_; }
     char volume_id() const noexcept { return volume_; }
     FileVolumeSpace volume_space() const;
     int duplicate_descriptor() const;
     int transfer_descriptor() const noexcept { return descriptor_; }
     bool transferable() const;
-    bool security_writable() const noexcept { return !readonly_; }
+    bool security_writable() const noexcept { return !readonly_ && !volume_device_ && !stream_base_; }
     const std::shared_ptr<HostSecurityTarget>& security_target() const noexcept{return security_target_;}
     bool delete_pending() const;
     std::uint64_t transfer_identity() const;
@@ -82,10 +87,12 @@ private:
     int lock_descriptor_{-2};
     int range_descriptor();
     std::shared_ptr<HostSecurityTarget> security_target_;
+    std::shared_ptr<HostFile> stream_base_;
+    std::shared_ptr<file_streams::Directory> stream_directory_;
     std::shared_ptr<HostFileState> state_;
     std::shared_ptr<HostDeleteTarget> delete_target_;
     std::uint32_t access_{}, sharing_{7};
-    bool readonly_{},delete_on_close_{},null_device_{};
+    bool readonly_{},delete_on_close_{},null_device_{},volume_device_{};
     char volume_{};
     std::uint32_t reparse_attributes_{},reparse_tag_{};
     struct RangeLock {std::uint64_t offset{},length{};bool exclusive{};std::uint32_t key{};};
@@ -135,9 +142,13 @@ public:
     OpenHostFile open_library_reader(std::string path, const std::filesystem::path& application = {}, std::string_view application_guest_directory = {});
     OpenHostFile open_reader(std::string path, const std::filesystem::path& application = {}, std::string_view application_guest_directory = {}, std::uint32_t sharing = 7);
     std::string map_executable(const std::filesystem::path& path);
+    // 客體路徑與宿主 Unix 路徑互轉：只轉換既有客體映射，不新增宿主存取能力。
+    std::pair<std::filesystem::path,std::uint32_t> unix_file_name(std::string path) const;
+    std::pair<std::string,std::uint32_t> dos_file_name(const std::filesystem::path& path) const;
     // Windows DOS 名稱空間先折疊 .／..，之後仍由映射與 NOFOLLOW 限制宿主存取。
     void set_dos_path_normalization(bool enabled) noexcept { dos_path_normalization_=enabled; }
     void mount_readonly(std::string guest_directory,const std::filesystem::path& host_directory);
+    void mount_readonly_file(std::string guest_path,const std::filesystem::path& host_file);
     std::pair<std::filesystem::path,std::uint32_t> executable_path(std::string path, const std::filesystem::path& application, std::string_view application_guest_directory);
     FileInformation information(std::string path);
     // Stat 查詢沿用 metadata 與虛擬權杖；權限結果只存活於本次呼叫，不加入 metadata 快取。
@@ -148,6 +159,7 @@ public:
     std::uint32_t publish_shared_file(HostFile&);
     FileInformation target_information(std::string path);
     FileVolumeSpace volume_space(std::string path);
+    OpenHostFile open_volume(char volume,std::uint32_t access,std::uint32_t sharing);
     std::vector<FileVolume> volumes() const;
     FileVolumeState volume_state() const;
     FileVolumeProperties volume_properties(char volume) const;
@@ -163,6 +175,8 @@ public:
     std::uint32_t delete_volume_mount(std::string path);
     OpenHostFile open_directory_observer(std::string path);
     DirectorySnapshot list(std::string path);
+    DirectorySnapshot streams(std::string path);
+    DirectorySnapshot streams(const HostFile&);
     // 只為 include(name) 為真的項目查詢中繼資料；結果等同完整列舉後依名稱過濾，部分結果不寫入快取。
     DirectorySnapshot list(std::string path,const std::function<bool(std::string_view)>& include);
     bool writable() const noexcept { return writable_; }
@@ -190,7 +204,7 @@ public:
     DirectorySnapshot list_security(std::string path) const;
     security::NativeFileSecurity security_information(std::string path, bool with_acl) const;
     std::uint32_t security_access(std::string path,std::uint32_t desired) const;
-    OpenHostFile inherit_host(int descriptor,std::uint32_t access,std::uint32_t sharing,bool readonly,std::uint64_t object=0);
+    OpenHostFile inherit_host(int descriptor,std::uint32_t access,std::uint32_t sharing,bool readonly,std::uint64_t object=0,char volume_device=0,std::string path={});
     OpenHostFile reopen(const HostFile&,std::string path,std::uint32_t access,std::uint32_t sharing,std::uint32_t flags);
     std::uint32_t set_disposition(HostFile&,std::string path,bool deleting);
 private:
@@ -200,6 +214,8 @@ private:
         BoundedCache<DirectorySnapshot> directories{8U*1024U*1024U,128};
         std::optional<FileVolumeState> volumes;
     };
+    OpenHostFile open_stream(const file_streams::Path&,std::uint32_t access,std::uint32_t disposition,std::uint32_t flags,std::uint32_t sharing,const std::function<std::vector<std::uint8_t>()>& creation);
+    file_streams::Directory stream_directory(const HostFile&,bool create) const;
     struct Resolved { std::string key; int descriptor{-1}; std::uint32_t error{}; bool readonly_file{}; std::filesystem::path host_path{}; std::string security_leaf{}; bool access_denied{}; char volume{}; std::string volume_path{},mount_path{}; std::shared_ptr<void> network_lease{}; };
     Resolved resolve(std::string path, bool directory = false, std::string* leaf = nullptr, bool metadata_only = false,bool follow_leaf = false,unsigned depth = 0,bool strict_root = false) const;
     Resolved resolve_library(std::string path,const std::filesystem::path& application,std::string_view application_guest_directory,bool strict_root=false) const;
@@ -213,10 +229,10 @@ private:
     bool readonly_descriptor(int descriptor) const;
     bool readonly_identity(std::uint64_t device,std::uint64_t inode) const;
     bool writable_image_source(std::string path,const std::filesystem::path& host) const;
-    std::shared_ptr<HostFileState> file_state(const FileMetadata& metadata, bool create = false);
+    std::shared_ptr<HostFileState> file_state(const FileMetadata& metadata, bool create = false,bool volume_device = false);
     std::uint32_t attach_shared_file(HostFile&,std::uint64_t object=0,bool existing=false);
     std::string shared_session_;
-    std::uint32_t sharing_error(const FileMetadata& metadata, std::uint32_t access, std::uint32_t sharing,const HostFile* owner=nullptr);
+    std::uint32_t sharing_error(const FileMetadata& metadata, std::uint32_t access, std::uint32_t sharing,const HostFile* owner=nullptr,bool volume_device=false);
     std::uint32_t authorize(int,std::uint32_t) const;
     // 路徑逐層解析的 FILE_TRAVERSE 檢查：結果只取決於該目錄的安全資訊（ACL xattr、擁有者、模式，任何變更都會更新 ctime）
     // 與目前權杖內容，以（裝置、inode、ctime）為鍵快取；權杖內容改變時整批作廢。命中只需一次 fstat。
@@ -241,6 +257,7 @@ private:
     std::string certificate_roots_file_; // 空字串為預設關閉，不讀寫 ROOT.pem。
     std::map<std::string,std::filesystem::path> readonly_files_;
     std::map<std::string,std::filesystem::path> readonly_mounts_;
+    bool readonly_descendants(std::string_view key) const;
     std::map<std::string,std::filesystem::path> application_sources_;
     bool writable_{};
     bool dos_path_normalization_{};

@@ -11,8 +11,10 @@ namespace x64arm {
 inline void refresh_vc_runtime_registry(RegistryState& registry){
     const auto& version=vc_runtime_version;
     const std::u16string root(1,2);
-    const auto key=[&](const std::u16string& path,std::u16string display){
-        if(registry.keys.try_emplace(path).second){registry.generated_keys.insert(path);registry.volatile_keys.insert(path);}
+    // 只有 Runtimes 以下是每次重建的產生鍵（不寫入登錄檔、不可建立持久子鍵）；SOFTWARE、Microsoft 等標準上層鍵是一般持久鍵，
+    // 否則全新登錄檔的整個 HKLM\SOFTWARE 會被當成產生鍵而不保存，且其下的持久子鍵建立回 ERROR_CHILD_MUST_BE_VOLATILE。
+    const auto key=[&](const std::u16string& path,std::u16string display,bool generated=false){
+        if(registry.keys.try_emplace(path).second && generated){registry.generated_keys.insert(path);registry.volatile_keys.insert(path);}
         registry.display_names.try_emplace(path,std::move(display));
     };
     const auto put=[&](const std::u16string& leaf,std::u16string name,RegistryValue value){
@@ -33,8 +35,8 @@ inline void refresh_vc_runtime_registry(RegistryState& registry){
         key(path+=u"\\visualstudio",u"VisualStudio");
         key(path+=u"\\14.0",u"14.0");
         key(path+=u"\\vc",u"VC");
-        key(path+=u"\\runtimes",u"Runtimes");
-        key(path+=std::u16string(u"\\")+architecture,architecture);
+        key(path+=u"\\runtimes",u"Runtimes",true);
+        key(path+=std::u16string(u"\\")+architecture,architecture,true);
         dword(path,u"Installed",1);dword(path,u"Major",version[0]);dword(path,u"Minor",version[1]);dword(path,u"Bld",version[2]);dword(path,u"Rbld",version[3]);
         const auto text=utf8_to_utf16("v"+std::to_string(version[0])+"."+std::to_string(version[1])+"."+std::to_string(version[2])+".00");
         put(path,u"Version",{1,utf16_bytes(text),{}});

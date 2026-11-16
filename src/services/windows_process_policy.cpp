@@ -123,11 +123,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_process_policy(GuestState& 
                     else if(flags&12U)fail(50); // 尚未提供遠端降級及稽核事件後端。
                     else if(runtime_.dynamic_code_policy&~flags)fail(5);
                     else {
-                        bool writable_code=false;
-                        if((flags&1U) && !(runtime_.dynamic_code_policy&1U))for(auto mapping=memory.next_mapping(GuestAddress{0});mapping;mapping=memory.next_mapping(GuestAddress{mapping->base.value+mapping->size}))
-                            if((mapping->permissions&6U)==6U){writable_code=true;break;}
-                        // 不默默改既有映射，也不把仍可直接寫入的 RWX 宣告為受保護。
-                        if(writable_code)fail(50);else {runtime_.dynamic_code_policy=flags;result=1;}
+                        // 政策約束生效後的配置、改保護與跨程序寫入；既有映射仍可執行。
+                        // 不因啟動時已建立的 RWX 區段拒絕套用，也不回溯改寫其頁面保護。
+                        runtime_.dynamic_code_policy=flags;result=1;
                     }
                 }else if(policy==8){
                     if(flags&~31U)fail(87);

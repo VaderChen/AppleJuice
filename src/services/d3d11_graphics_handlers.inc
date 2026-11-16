@@ -351,7 +351,7 @@
                 // 下一次起走串流的前端路徑：資格與完整路徑相同的持久 WRITE_DISCARD。這次的 Unmap 仍走一般路徑。
                 {static const bool front_map=[] {const auto* value=std::getenv("X64ARM_D3D11_STREAM_FRONT_MAP");return !value || std::string_view(value)!="0";}();
                     if(front_map && d3d11_stream_ && persistent && type==4 && discard_enabled && !u32(2) && !u32(4) && mapped_size<=D3D11CommandStream::snapshot_item_limit &&
-                       arg(0)==d3d11_stream_->context.load(std::memory_order_relaxed) && state.gs_base==d3d11_stream_->owner.load(std::memory_order_relaxed))
+                       arg(0)==d3d11_stream_->context.load(std::memory_order_relaxed) && (x86_?state.fs_base:state.gs_base)==d3d11_stream_->owner.load(std::memory_order_relaxed))
                         if(auto* const front=d3d11_stream_->front_maps.insert(arg(1))){
                             const auto pending=d3d11_stream_->pending.find(arg(1));
                             front->pointer=pointer;front->size=static_cast<std::uint32_t>(mapped_size);front->row=pitch[0];front->depth=pitch[0]*pitch[1];front->mapped=0;

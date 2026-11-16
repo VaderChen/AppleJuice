@@ -7,6 +7,13 @@
 
 namespace x64arm {
 struct ResidentHostEnvironment;
+struct GuestState;
+class GuestMemory;
+class WindowsMathEnvironment;
+// 浮點回傳：Win32 放入 x87 ST(0)，Win64 放入 XMM0；single 時先窄化為 float。
+void windows_floating_return(GuestState& state,bool x86,double value,bool single);
+// 提交宿主運算產生的浮點例外旗標與 errno；errno_cell 為 0 時只提交旗標。
+unsigned windows_commit_math_environment(GuestState& state,GuestMemory& memory,std::uint64_t errno_cell,bool x86,const WindowsMathEnvironment& environment);
 // CRT 各數學入口共用宿主環境；客體例外的提交仍由各 ABI 處理。
 // Darwin ARM64 的 fenv 例外位等同 FPSR，RC 則需交換 x86 的向上／向下位。
 class WindowsMathEnvironment {

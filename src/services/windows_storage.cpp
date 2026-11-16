@@ -1,10 +1,15 @@
 #include "windows_storage_state.hpp"
+#include "service_callback_task.hpp"
+#include "x64arm/windows_paths.hpp"
 #include <algorithm>
 
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> storage_service_descriptors(){
     static constexpr WindowsServiceDescriptor descriptors[]{
         {"ole32.dll","StgCreateDocfileOnILockBytes",4},{"ole32.dll","StgOpenStorageOnILockBytes",6},{"ole32.dll","StgIsStorageILockBytes",1},
+        {"ole32.dll","StgCreateDocfile",4,0,0,0x6},{"ole32.dll","StgOpenStorage",6,0,0,0x14},{"ole32.dll","StgIsStorageFile",1},
+        {"ole32.dll","StgCreateStorageEx",8,0,0,0xe},{"ole32.dll","StgOpenStorageEx",8,0,0,0xe},{"ole32.dll","StgSetTimes",4},
+        {"ole32.dll","ReadClassStg",2},{"ole32.dll","WriteClassStg",2},{"ole32.dll","FmtIdToPropStgName",2},{"ole32.dll","PropStgNameToFmtId",2},
         {"internal-storage","QueryInterface",3},{"internal-storage","AddRef",1},{"internal-storage","Release",1},
         {"internal-storage","CreateStream",6},{"internal-storage","OpenStream",6},{"internal-storage","CreateStorage",6},{"internal-storage","OpenStorage",7},
         {"internal-storage","CopyTo",5},{"internal-storage","MoveElementTo",5},{"internal-storage","Commit",2},{"internal-storage","Revert",1},
@@ -57,6 +62,74 @@ std::optional<std::uint32_t> WindowsServices::invoke_storage(GuestState& state,G
     const auto done=[&](std::uint64_t result){arg.return_to(state,result);return std::optional<std::uint32_t>{};};
     const auto d=[&](unsigned index){return static_cast<std::uint32_t>(arg(index));};
     try{auto& bridge=storage_bridge();
+        if(name=="FmtIdToPropStgName" || name=="PropStgNameToFmtId"){
+            // 屬性集名稱（MS-OLEPS）：SummaryInformation 與 DocumentSummaryInformation（含使用者定義區段）為固定名稱；其他 FMTID 以 0x0005 開頭，
+            // 依位元組順序、每位元組由低位起每 5 位元取一字元（"abcdefghijklmnopqrstuvwxyz012345"），共 26 字元。反向轉換不分大小寫。
+            constexpr std::array<std::uint8_t,16> summary{0xe0,0x85,0x9f,0xf2,0xf9,0x4f,0x68,0x10,0xab,0x91,0x08,0x00,0x2b,0x27,0xb3,0xd9};
+            constexpr std::array<std::uint8_t,16> document{0x02,0xd5,0xcd,0xd5,0x9c,0x2e,0x1b,0x10,0x93,0x97,0x08,0x00,0x2b,0x2c,0xf9,0xae};
+            constexpr std::array<std::uint8_t,16> user{0x05,0xd5,0xcd,0xd5,0x9c,0x2e,0x1b,0x10,0x93,0x97,0x08,0x00,0x2b,0x2c,0xf9,0xae};
+            constexpr std::u16string_view alphabet=u"abcdefghijklmnopqrstuvwxyz012345";
+            if(!arg(0) || !arg(1))return done(storage::invalid_parameter);
+            if(name=="FmtIdToPropStgName"){
+                std::array<std::uint8_t,16> id{};memory.read(GuestAddress{arg(0)},id);std::u16string text(1,u'\x0005');
+                if(id==summary)text+=u"SummaryInformation";else if(id==document || id==user)text+=u"DocumentSummaryInformation";
+                else {unsigned bit=0;for(unsigned i=0;i<26;++i){unsigned value=0;for(unsigned k=0;k<5 && bit<128;++k,++bit)value|=((id[bit/8]>>(bit%8))&1U)<<k;text.push_back(alphabet[value]);}}
+                memory.write(GuestAddress{arg(1)},utf16_bytes(text));return done(0);
+            }
+            const auto text=read_utf16(memory,GuestAddress{arg(0)},64);if(text.empty() || text[0]!=5)return done(storage::invalid_name);
+            auto folded=text.substr(1);for(auto& c:folded)c=unicode_case_unit(c,false);
+            if(folded==u"summaryinformation"){memory.write(GuestAddress{arg(1)},summary);return done(0);}
+            if(folded==u"documentsummaryinformation"){memory.write(GuestAddress{arg(1)},document);return done(0);}
+            if(folded.size()!=26)return done(storage::invalid_name);std::array<std::uint8_t,16> id{};unsigned bit=0;
+            for(const auto c:folded){const auto at=alphabet.find(c);if(at==alphabet.npos)return done(storage::invalid_name);for(unsigned k=0;k<5 && bit<128;++k,++bit)if((at>>k)&1U)id[bit/8]|=static_cast<std::uint8_t>(1U<<(bit%8));}
+            memory.write(GuestAddress{arg(1)},id);return done(0);
+        }
+        if(name=="WriteClassStg"){if(!arg(0))return done(storage::invalid_parameter);state.rip=GuestAddress{storage::method(memory,arg(0),15)};return std::nullopt;} // 同 IStorage::SetClass 的參數配置
+        if(name=="ReadClassStg"){
+            // IStorage::Stat(STATFLAG_NONAME) 的 clsid（x86 位移 48、x64 位移 56）。
+            if(!arg(0) || !arg(1))return done(storage::invalid_parameter);
+            return nested_continuation(state,memory,"ReadClassStg",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(s,m,service);GuestScratch scratch(*this,m,s);const auto stat=scratch.allocate(96);if(!stat){call.return_to(s,std::uint64_t{storage::no_memory});co_return std::nullopt;}
+                const auto status=static_cast<std::uint32_t>(co_await service_callback::call(storage::method(m,call(0),17),{call(0),stat,1}));
+                if(!(status&0x80000000U)){std::array<std::uint8_t,16> clsid{};m.read(GuestAddress{stat+(x86_?48U:56U)},clsid);m.write(GuestAddress{call(1)},clsid);}
+                call.return_to(s,std::uint64_t{status});co_return std::nullopt;});
+        }
+        if(name=="StgSetTimes"){
+            // 以 FILE_WRITE_ATTRIBUTES 開啟後設定建立／存取／修改時間；NULL 表示不變。
+            if(!arg(0))return done(storage::invalid_parameter);
+            const auto handle=nested_service(state,memory,"kernel32.dll","CreateFileW",{arg(0),0x100,7,0,3,0x02000000,0});const auto invalid=x86_?UINT32_MAX:UINT64_MAX;
+            if((x86_?handle&UINT32_MAX:handle)==invalid)return done(0x80030000U|(last_error_&0xffffU));
+            const auto set=nested_service(state,memory,"kernel32.dll","SetFileTime",{handle,arg(1),arg(2),arg(3)})&UINT32_MAX;const auto error=last_error_;
+            (void)nested_service(state,memory,"kernel32.dll","CloseHandle",{handle});return done(set?0U:0x80030000U|(error&0xffffU));
+        }
+        if(name=="StgCreateDocfile" || name=="StgOpenStorage" || name=="StgIsStorageFile" || name=="StgCreateStorageEx" || name=="StgOpenStorageEx"){
+            // 檔案式複合文件：以同一套檔案開啟流程建立檔案 ILockBytes，交給與 *OnILockBytes 相同的作業；作業結束後釋放建立時的參照。
+            // StgCreateDocfile 的名稱為 NULL 時在暫存目錄建立檔案並加上 STGM_DELETEONRELEASE。*Ex 支援 STGFMT_STORAGE（0）、ANY（4，僅開啟）、DOCFILE（5），介面須為 IStorage。
+            const bool ex=name.ends_with("Ex"),checking=name=="StgIsStorageFile",creating=name.starts_with("StgCreate");
+            const auto output=checking?0:arg(ex?7:creating?3:5);if(!checking && !output)return done(storage::pointer_error);if(output)memory.store(GuestAddress{output},bits,0);
+            auto mode=checking?0x40U:d(1+(!creating && !ex?1:0)); // StgIsStorageFile：唯讀、共用
+            if(ex){const auto format=d(2);if(format!=0 && format!=5 && !(format==4 && !creating))return done(storage::invalid_parameter);
+                if(d(3) || (!creating && arg(5)))return done(storage::invalid_parameter);
+                if(arg(4)){const auto sector=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(4)+4},32));if(sector && sector!=512)return done(storage::invalid_parameter);}
+                std::array<std::uint8_t,16> iid{};if(!arg(6))return done(storage::invalid_parameter);memory.read(GuestAddress{arg(6)},iid);
+                constexpr std::array<std::uint8_t,16> unknown{0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};auto storage_iid=unknown;storage_iid[0]=11;if(iid!=unknown && iid!=storage_iid)return done(0x80004002U);}
+            if(!checking && !creating && !ex && (arg(1) || arg(3)))return done(storage::invalid_parameter);
+            const auto storage_mode=mode&~0x04000000U; // STGM_DELETEONRELEASE 只影響檔案生命週期
+            if(!checking)storage::mode(storage_mode,true,false,creating);
+            std::u16string path;auto file_mode=mode&0x04001073U;
+            if(arg(0))path=read_utf16(memory,GuestAddress{arg(0)},32767);
+            else if(creating){GuestScratch temporary(*this,memory,state);const auto folder=temporary.allocate(2*261),file=temporary.allocate(2*261),prefix=temporary.text(u"STG");if(!folder || !file || !prefix)return done(storage::no_memory);
+                if(!(nested_service(state,memory,"kernel32.dll","GetTempPathW",{261,folder})&UINT32_MAX) || !(nested_service(state,memory,"kernel32.dll","GetTempFileNameW",{folder,prefix,0,file})&UINT32_MAX))return done(0x80030000U|(last_error_&0xffffU));
+                path=read_utf16(memory,GuestAddress{file},260);file_mode|=0x04000000U|0x1000U;} // DELETEONRELEASE｜CREATE（GetTempFileName 已建立空檔）
+            else return done(storage::invalid_name);
+            path=normalized_windows_path(std::move(path),runtime_.current_directory);
+            std::uint64_t backend=0;const auto status=open_file_object(memory,path,file_mode,0,creating,true,backend);
+            if(status){const auto code=status&0xffffU;if((status&0xffff0000U)==0x80070000U && (code==2 || code==3 || code==5 || code==32 || code==33 || code==80))return done(0x80030000U|code);return done(status);}
+            if(bridge.operations.size()>=4096)return done(storage::no_memory);
+            StorageState::Operation operation;operation.kind=checking?StorageState::Kind::IsStorage:creating?StorageState::Kind::Create:StorageState::Kind::Open;
+            operation.backend=backend;operation.output=output;operation.mode=checking?0:(creating?storage_mode|storage::create:storage_mode);operation.release_backend=true;
+            const auto token=bridge.next_operation++;bridge.operations.emplace(token,std::move(operation));return resume_storage(state,memory,token,0);
+        }
         if(service.family=="ole32.dll"){
             const bool creating=name=="StgCreateDocfileOnILockBytes",checking=name=="StgIsStorageILockBytes";const auto output=checking?0:arg(creating?3:5);
             if(!checking && !output)return done(storage::pointer_error);if(output)memory.store(GuestAddress{output},bits,0);

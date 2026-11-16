@@ -6,6 +6,19 @@
 #include <cstdlib>
 
 namespace x64arm {
+// memcpy_s／memmove_s 與 STL char_traits::_Copy_s／_Move_s 共用：容量與筆數以元素計，回傳 errno（0 為成功）。
+// memcpy 類失敗時清空整個目的緩衝區；memmove 類保留原內容。
+std::uint32_t WindowsServices::secure_memory_copy(GuestMemory& memory,std::uint64_t destination,std::uint64_t capacity,std::uint64_t source,std::uint64_t count,unsigned unit,bool move){
+    if(!count)return 0;
+    if(!destination)return 22;
+    if(!source || count>capacity){
+        if(!move && capacity){if(capacity>output_limit/unit)throw HostCallFault("CRT 錯誤清理範圍超過上限");memory.fill(GuestAddress{destination},0,static_cast<std::size_t>(capacity*unit));}
+        return !source?22:34;
+    }
+    if(count>output_limit/unit)throw HostCallFault("CRT 記憶體複製範圍超過上限");
+    memory.move(GuestAddress{destination},GuestAddress{source},static_cast<std::size_t>(count*unit));
+    return 0;
+}
 std::span<const WindowsServiceDescriptor> crt_string_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"ntdll.dll","RtlMultiByteToUnicodeN",5},{"ntdll.dll","RtlOemToUnicodeN",5},
@@ -17,7 +30,7 @@ std::span<const WindowsServiceDescriptor> crt_string_service_descriptors(){
         {"ntdll.dll","RtlUnicodeStringToAnsiString",3},
         {"ntdll.dll","RtlFreeAnsiString",1},{"ntdll.dll","RtlFormatCurrentUserKeyPath",1},
         {"crt","_itoa",3},{"crt","_itoa_s",4},{"crt","_itow",3},{"crt","_itow_s",4},{"crt","_ltoa",3},{"crt","_ltoa_s",4},{"crt","_ltow",3},{"crt","_ltow_s",4},{"crt","_ultoa",3},{"crt","_ultoa_s",4},{"crt","_ultow",3},{"crt","_ultow_s",4},{"crt","_i64toa",3},{"crt","_i64toa_s",4},{"crt","_i64tow",3},{"crt","_i64tow_s",4},{"crt","_ui64toa",3},{"crt","_ui64toa_s",4},{"crt","_ui64tow",3},{"crt","_ui64tow_s",4},{"crt","_wtoi",1},{"crt","_wtol",1},{"crt","_wtoi64",1},{"crt","wcstol",3},{"crt","wcstoul",3},{"crt","wcstoll",3},{"crt","wcstoull",3},{"crt","_wcstoi64",3},{"crt","_wcstoui64",3},{"crt","mbstowcs",3},{"crt","wcstombs",3},
-        {"crt","strpbrk",2},{"crt","wcspbrk",2},{"crt","__strncnt",2},
+        {"crt","strpbrk",2},{"crt","wcspbrk",2},{"crt","wcsspn",2},{"crt","wcscspn",2},{"crt","__strncnt",2},
         {"crt","mbsrtowcs",4},{"crt","wcsrtombs",4},
         {"crt","mbstowcs_s",5},{"crt","wcstombs_s",5},{"crt","mbsrtowcs_s",6},{"crt","wcsrtombs_s",6},
         {"crt","_mbstowcs_l",4},{"crt","_wcstombs_l",4},{"crt","_mbstowcs_s_l",6},{"crt","_wcstombs_s_l",6},
@@ -38,7 +51,12 @@ std::span<const WindowsServiceDescriptor> crt_string_service_descriptors(){
         {"crt","_snscanf",3},{"crt","_snscanf_s",3},{"crt","_snwscanf",3},{"crt","_snwscanf_s",3},
         {"crt","__stdio_common_vsscanf",6,1},{"crt","__stdio_common_vswscanf",6,1},
         {"crt","fscanf",2},{"crt","fscanf_s",2},{"crt","vfscanf",3},{"crt","vfscanf_s",3},
-        {"crt","__stdio_common_vfscanf",5,1}
+        {"crt","__stdio_common_vfscanf",5,1},{"crt","__stdio_common_vfwscanf",5,1},
+        {"crt","scanf",1},{"crt","scanf_s",1},{"crt","wscanf",1},{"crt","wscanf_s",1},{"crt","fwscanf",2},{"crt","fwscanf_s",2},
+        {"crt","_scanf_l",2},{"crt","_scanf_s_l",2},{"crt","_wscanf_l",2},{"crt","_wscanf_s_l",2},
+        {"crt","_fscanf_l",3},{"crt","_fscanf_s_l",3},{"crt","_fwscanf_l",3},{"crt","_fwscanf_s_l",3},
+        {"crt","_sscanf_l",3},{"crt","_sscanf_s_l",3},{"crt","_swscanf_l",3},{"crt","_swscanf_s_l",3},
+        {"crt","_snscanf_l",4},{"crt","_snscanf_s_l",4},{"crt","_snwscanf_l",4},{"crt","_snwscanf_s_l",4}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -66,12 +84,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& stat
                     std::string bytes(length,'\0');memory.read(GuestAddress{source},std::span(reinterpret_cast<std::uint8_t*>(bytes.data()),bytes.size()));
                     auto value=utf8_to_utf16_lossy(bytes);data=utf16_bytes(value);data.resize(data.size()-2);
                 }else {
-                    auto value=read_utf16_counted(memory,GuestAddress{source},length/2);
-                    for(std::size_t i=0;i<value.size();++i){const auto c=value[i];
-                        if(c>=0xd800 && c<=0xdbff){if(i+1<value.size() && value[i+1]>=0xdc00 && value[i+1]<=0xdfff)++i;else value[i]=u'\ufffd';}
-                        else if(c>=0xdc00 && c<=0xdfff)value[i]=u'\ufffd';
-                    }
-                    const auto bytes=utf16_to_utf8(value);data.assign(bytes.begin(),bytes.end());
+                    const auto bytes=utf16_to_utf8_lossy(read_utf16_counted(memory,GuestAddress{source},length/2));data.assign(bytes.begin(),bytes.end());
                 }
                 std::size_t written=data.size();
                 if(!sizing){
@@ -123,11 +136,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& stat
                 // 與虛擬 GetACP／Win32 轉碼共用 UTF-8 系統碼頁；counted string 保留內嵌 NUL。
                 if(unicode)data=utf16_bytes(text);
                 else {
-                    for(std::size_t i=0;i<text.size();++i){const auto c=text[i];
-                        if(c>=0xd800 && c<=0xdbff){if(i+1<text.size() && text[i+1]>=0xdc00 && text[i+1]<=0xdfff)++i;else text[i]=u'\ufffd';}
-                        else if(c>=0xdc00 && c<=0xdfff)text[i]=u'\ufffd';
-                    }
-                    const auto source=utf16_to_utf8(text);data.assign(source.begin(),source.end());data.push_back(0);
+                    const auto source=utf16_to_utf8_lossy(text);data.assign(source.begin(),source.end());data.push_back(0);
                 }
             }catch(const std::invalid_argument&){return finish(create?0U:0xc000000dU);}
              catch(const std::bad_alloc&){return finish(create?0U:0xc0000017U);}
@@ -210,16 +219,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& stat
             if(!memory.load(address(arg(0),result),8))break;++result;
         }
     }else if(symbol=="memcpy_s" || symbol=="memmove_s" || symbol=="wmemcpy_s" || symbol=="wmemmove_s"){
-        const auto count=arg(3),capacity=arg(1);const bool move=symbol.find("move")!=symbol.npos;
-        if(count){
-            if(!arg(0))return invalid(22);
-            if(!arg(2) || count>capacity){
-                if(!move && capacity){if(capacity>output_limit/unit)throw HostCallFault("CRT 錯誤清理範圍超過上限");memory.fill(GuestAddress{arg(0)},0,static_cast<std::size_t>(capacity*unit));}
-                return invalid(!arg(2)?22:34);
-            }
-            if(count>output_limit/unit)throw HostCallFault("CRT 記憶體複製範圍超過上限");
-            memory.move(GuestAddress{arg(0)},GuestAddress{arg(2)},static_cast<std::size_t>(count*unit));
-        }
+        if(const auto error=secure_memory_copy(memory,arg(0),arg(1),arg(2),arg(3),unit,symbol.find("move")!=symbol.npos))return invalid(error);
     }else if(symbol=="__isascii")result=static_cast<std::uint32_t>(arg(0))<128;
     else if(symbol=="_memicmp" || symbol=="_mbscmp" || symbol=="_mbstrlen"){
         // 與 setlocale／___mb_cur_max_func 共用目前的 C locale；不誤用宿主 locale 或 Windows ACP。
@@ -290,6 +290,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& stat
         const auto conversion_errno=errno;errno=previous_errno;
         if(conversion_errno)memory.store(GuestAddress{runtime_.errno_cell},32,conversion_errno==ERANGE?34:22);
         if(!simple && arg(1))memory.store(GuestAddress{arg(1)},x86_?32:64,arg(0)+static_cast<std::uint64_t>(end-source.c_str())*2);
+    }else if(symbol=="wcsspn" || symbol=="wcscspn"){
+        // 與 strspn／strcspn 相同：回傳開頭連續（不）屬於集合的字元數。
+        const auto source=text(arg(0)),set=text(arg(1));
+        const auto at=symbol=="wcsspn"?source.find_first_not_of(set):source.find_first_of(set);
+        result=at==source.npos?source.size():at;
     }else if(symbol=="strpbrk" || symbol=="wcspbrk"){
         const auto source=text(arg(0)),accept=text(arg(1));const auto at=source.find_first_of(accept);
         if(at!=source.npos)result=address(arg(0),at).value;

@@ -69,6 +69,7 @@ std::optional<std::uint32_t> WindowsServices::advance_gui_async(GuestState& stat
         if(gui_.sent_messages.size()+gui_.send_callbacks.size()+gui_.async_sends.size()>=send_limit){gui_.async_sends.erase(found);last_error_=1816;complete_call(state,memory,0);return std::nullopt;}
         GuiSentMessage request;request.message=message;request.sender=threads_.current;request.receiver=target->second.thread;request.wide=operation.wide;
         request.kind=operation.kind;request.callback=operation.callback;request.callback_data=operation.data;
+        if(const auto source=input_message_source(false)){request.source_device=static_cast<std::uint8_t>((*source)[0]);request.source_origin=static_cast<std::uint8_t>((*source)[1]);}
         gui_.sent_messages.emplace(gui_.next_object++,std::move(request));
     }
     gui_.async_sends.erase(found);complete_call(state,memory,1);return std::nullopt;

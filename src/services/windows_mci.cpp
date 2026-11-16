@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "mci_wave.hpp"
+#include "service_callback_task.hpp"
 #include <algorithm>
 #include <array>
 
@@ -8,6 +9,12 @@ namespace x64arm {
 namespace {
 std::u16string fold(std::u16string value){for(auto& c:value)c=unicode_case_unit(c,false);return value;}
 std::uint32_t file_error(std::uint32_t code,bool writing=false){return code==2 || code==3?mci::file_missing:code==8?mci::memory:writing?mci::file_write:mci::file_read;}
+// mciGetDeviceID 與命令字串共用：別名、檔名，或未取別名的 waveaudio 裝置。
+std::uint32_t find_device(const MciState& bridge,std::u16string_view name){
+    const auto wanted=fold(std::u16string(name));if(wanted==u"all")return mci::all_devices;
+    for(const auto& [id,device]:bridge.devices)if((!device->alias.empty() && fold(device->alias)==wanted) || (!device->file.empty() && fold(device->file)==wanted) || (wanted==u"waveaudio" && device->alias.empty()))return id;
+    return 0;
+}
 std::u16string_view error_text(std::uint32_t code){
     switch(code){
     case 0:return u"No error";case mci::invalid_device:return u"Invalid MCI device identifier";
@@ -30,7 +37,8 @@ std::span<const WindowsServiceDescriptor> mci_service_descriptors(){
     static constexpr WindowsServiceDescriptor entries[]{
         {"winmm.dll","mciSendCommandW",4,0,0,3},{"winmm.dll","mciSendCommandA",4,0,0,3},
         {"winmm.dll","mciGetDeviceIDW",1},{"winmm.dll","mciGetDeviceIDA",1},
-        {"winmm.dll","mciGetErrorStringW",3,0,0,5},{"winmm.dll","mciGetErrorStringA",3,0,0,5}
+        {"winmm.dll","mciGetErrorStringW",3,0,0,5},{"winmm.dll","mciGetErrorStringA",3,0,0,5},
+        {"winmm.dll","mciSendStringW",4,0,0,4},{"winmm.dll","mciSendStringA",4,0,0,4},{"winmm.dll","mciExecute",1}
     };return entries;
 }
 MciState& WindowsServices::mci_state(){if(!mci_)mci_=std::make_shared<MciState>();return *mci_;}
@@ -47,9 +55,14 @@ void WindowsServices::complete_mci_transport(std::uint32_t id,std::uint32_t noti
 }
 void WindowsServices::poll_mci(){
     if(!mci_)return;
+    std::vector<std::pair<std::uint32_t,std::uint32_t>> finished;
     for(const auto& [id,item]:mci_->devices){if(!item->buffer || (item->mode!=mci::Mode::Playing && item->mode!=mci::Mode::Recording))continue;
         bool complete=false,failed=false;{std::lock_guard lock(item->buffer->mutex);complete=!item->buffer->playing;failed=item->buffer->capture_failed;}
-        if(complete)complete_mci_transport(id,failed?8U:1U);
+        if(complete)finished.emplace_back(id,failed?8U:1U);
+    }
+    for(const auto& [id,notification]:finished){
+        complete_mci_transport(id,notification);
+        if(const auto found=mci_->devices.find(id);found!=mci_->devices.end() && found->second->auto_close)mci_->devices.erase(found);
     }
 }
 bool WindowsServices::mci_waiting()const{
@@ -67,6 +80,7 @@ std::optional<std::uint32_t> WindowsServices::resume_mci_wait(GuestState& state,
 }
 
 std::optional<std::uint32_t> WindowsServices::invoke_mci(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol.starts_with("mciSendString") || service.symbol=="mciExecute")return invoke_mci_string(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');const unsigned p=x86_?4:8,bits=p*8;
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto string=[&](std::uint64_t address){if(!address)throw mci::Error(mci::missing_parameter);auto text=wide?read_utf16(memory,GuestAddress{address},32768):utf8_to_utf16_lossy(read_ansi(memory,address,32768));if(text.size()>=32768)throw mci::Error(mci::out_of_range);return text;};
@@ -80,9 +94,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mci(GuestState& state,Guest
     try{
         auto& bridge=mci_state();poll_mci();
         if(name.starts_with("mciGetDeviceID")){
-            const auto wanted=fold(string(arg(0)));if(wanted==u"all")return finish(mci::all_devices);
-            for(const auto& [id,device]:bridge.devices)if((!device->alias.empty() && fold(device->alias)==wanted) || (!device->file.empty() && fold(device->file)==wanted) || (wanted==u"waveaudio" && device->alias.empty()))return finish(id);
-            return finish(0);
+            return finish(find_device(bridge,string(arg(0))));
         }
         if(name.starts_with("mciGetErrorString")){
             const auto text=error_text(static_cast<std::uint32_t>(arg(0))&0xffffU);if(text.empty())return finish(0);
@@ -244,5 +256,221 @@ std::optional<std::uint32_t> WindowsServices::invoke_mci(GuestState& state,Guest
         }
         throw mci::Error(mci::unrecognized);
     }catch(const mci::Error& error){return finish(name.starts_with("mciGet")?0:error.code);}catch(const MemoryFault&){return finish(name.starts_with("mciGet")?0:mci::missing_parameter);}catch(const std::bad_alloc&){return finish(name.starts_with("mciGet")?0:mci::memory);}
+}
+// mciSendStringA／W 與 mciExecute：解析 MCI 命令字串（不分大小寫、雙引號字串、「裝置類型!元素」），組成與 mciSendCommandW 相同的
+// pack(1) 參數區塊並呼叫它，wait、notify、錯誤碼與裝置狀態都沿用命令介面；結果依命令表轉成字串（整數、true／false、模式、時間格式、
+// 格式標記與裝置類型名稱）。不是已開啟的別名／檔名時，除 open／close／sysinfo 外自動開啟，命令結束後關閉；非同步播放／錄音則在完成後
+// 自動關閉；自動開啟不可搭配 notify。A 版與 mciSendCommandA 相同以 UTF-8 轉換（引擎的 ACP 固定為 65001）。
+namespace {
+namespace mcis {
+constexpr std::uint32_t unrecognized_keyword=259,invalid_device_name=263,missing_command=267,param_overflow=268,bad_integer=270,
+    missing_parameter=273,type_required=287,bad_constant=290,missing_device=292,no_closing_quote=294,new_requires_alias=299,notify_auto_open=300;
+struct DeviceType {std::u16string_view name;std::uint32_t type;};
+constexpr DeviceType device_types[]{{u"vcr",513},{u"videodisc",514},{u"overlay",515},{u"cdaudio",516},{u"dat",517},{u"scanner",518},
+    {u"animation",519},{u"digitalvideo",520},{u"other",521},{u"waveaudio",522},{u"sequencer",523}};
+std::uint32_t device_type(std::u16string_view name){for(const auto& item:device_types)if(item.name==name)return item.type;return 0;}
+enum class Kind {Integer,Boolean,Mode,TimeFormat,FormatTag,DeviceType};
+struct Item {std::array<std::u16string_view,3> words;std::uint32_t item;Kind kind;std::uint32_t flags{};};
+constexpr Item status_items[]{
+    {{u"number",u"of",u"tracks"},3,Kind::Integer},{{u"media",u"present"},5,Kind::Boolean},{{u"time",u"format"},6,Kind::TimeFormat},
+    {{u"current",u"track"},8,Kind::Integer},{{u"start",u"position"},2,Kind::Integer,0x200},{{u"format",u"tag"},0x4001,Kind::FormatTag},
+    {{u"length"},1,Kind::Integer},{{u"position"},2,Kind::Integer},{{u"mode"},4,Kind::Mode},{{u"ready"},7,Kind::Boolean},
+    {{u"channels"},0x4002,Kind::Integer},{{u"samplespersec"},0x4003,Kind::Integer},{{u"bytespersec"},0x4004,Kind::Integer},
+    {{u"alignment"},0x4005,Kind::Integer},{{u"bitspersample"},0x4006,Kind::Integer},{{u"level"},0x4007,Kind::Integer},
+    {{u"input"},0x400000,Kind::Integer},{{u"output"},0x800000,Kind::Integer}};
+constexpr Item capability_items[]{
+    {{u"can",u"record"},1,Kind::Boolean},{{u"has",u"audio"},2,Kind::Boolean},{{u"has",u"video"},3,Kind::Boolean},{{u"device",u"type"},4,Kind::DeviceType},
+    {{u"uses",u"files"},5,Kind::Boolean},{{u"compound",u"device"},6,Kind::Boolean},{{u"can",u"eject"},7,Kind::Boolean},{{u"can",u"play"},8,Kind::Boolean},
+    {{u"can",u"save"},9,Kind::Boolean},{{u"inputs"},0x4001,Kind::Integer},{{u"outputs"},0x4002,Kind::Integer}};
+std::u16string decimal(std::uint64_t value){const auto text=std::to_string(value);return std::u16string(text.begin(),text.end());}
+std::u16string format_value(Kind kind,std::uint64_t value){
+    const auto dword=static_cast<std::uint32_t>(value);
+    switch(kind){
+    case Kind::Boolean:return dword?u"true":u"false";
+    case Kind::Mode:{static constexpr std::u16string_view modes[]{u"not ready",u"stopped",u"playing",u"recording",u"seeking",u"paused",u"open"};
+        return dword>=524 && dword<=530?std::u16string(modes[dword-524]):decimal(dword);}
+    case Kind::TimeFormat:return dword==0?u"milliseconds":dword==8?u"bytes":dword==9?u"samples":decimal(dword);
+    case Kind::FormatTag:return dword==1?u"pcm":decimal(dword);
+    case Kind::DeviceType:for(const auto& item:device_types)if(item.type==dword)return std::u16string(item.name);return decimal(dword);
+    default:return decimal(dword);
+    }
+}
+std::vector<std::u16string> tokenize(std::u16string_view text){
+    std::vector<std::u16string> tokens;std::size_t at=0;
+    const auto space=[](char16_t c){return c==u' ' || c==u'\t' || c==u'\r' || c==u'\n';};
+    while(at<text.size()){
+        if(space(text[at])){++at;continue;}
+        if(text[at]==u'"'){const auto end=text.find(u'"',at+1);if(end==std::u16string_view::npos)throw mci::Error(no_closing_quote);tokens.emplace_back(text.substr(at+1,end-at-1));at=end+1;continue;}
+        const auto begin=at;while(at<text.size() && !space(text[at]))++at;tokens.emplace_back(text.substr(begin,at-begin));
+    }
+    return tokens;
+}
+}
+}
+std::optional<std::uint32_t> WindowsServices::invoke_mci_string(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    return nested_continuation(state,memory,"MCI 命令字串",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+        const WindowsCall call(s,m,service);const bool execute=service.symbol=="mciExecute",wide=service.symbol.ends_with('W');
+        const unsigned p=x86_?4:8;
+        const auto finish=[&](std::uint64_t value){call.return_to(s,value);return std::optional<std::uint32_t>{};};
+        std::vector<std::uint64_t> blocks;
+        struct Release {WindowsServices& self;GuestMemory& m;GuestState& s;std::vector<std::uint64_t>& blocks;~Release(){for(const auto block:blocks)(void)self.free_heap(m,block,s);}} release{*this,m,s,blocks};
+        const auto scratch=[&](std::size_t size)->std::uint64_t{const auto block=allocate_heap(m,std::max<std::size_t>(size,1));if(!block)throw mci::Error(mci::memory);m.fill(GuestAddress{block},0,std::max<std::size_t>(size,1));blocks.push_back(block);return block;};
+        const auto put_string=[&](std::u16string_view text){const auto bytes=utf16_bytes(text);const auto block=scratch(bytes.size());m.write(GuestAddress{block},bytes);return block;};
+        const auto command=[&](std::uint32_t id,std::uint32_t message,std::uint64_t flags,std::uint64_t block)->service_callback::Task<std::uint32_t>{
+            co_return static_cast<std::uint32_t>(co_await service_callback::call_value(resolve("winmm.dll","mciSendCommandW").value,{id,message,flags,block}));
+        };
+        std::u16string result;std::uint32_t error=0,automatic=0;bool asynchronous=false;
+        try{
+            if(!call(0))throw mci::Error(mcis::missing_command);
+            const auto text=wide?read_utf16(m,GuestAddress{call(0)},32768):utf8_to_utf16_lossy(read_ansi(m,call(0),32768));
+            const auto tokens=mcis::tokenize(text);if(tokens.empty())throw mci::Error(mcis::missing_command);
+            const auto verb=fold(tokens[0]);if(tokens.size()<2)throw mci::Error(mcis::missing_device);
+            const auto& name=tokens[1];const auto folded=fold(name);
+            std::size_t at=2;std::uint64_t flags=0;const auto block=scratch(128);
+            const auto peek=[&](std::size_t k){return at+k<tokens.size()?fold(tokens[at+k]):std::u16string{};};
+            const auto take=[&](std::initializer_list<std::u16string_view> words){std::size_t k=0;for(const auto word:words){if(word.empty())break;if(peek(k)!=word)return false;++k;}at+=k;return k!=0;};
+            const auto word=[&]()->std::u16string{if(at>=tokens.size())throw mci::Error(mcis::missing_parameter);return tokens[at++];};
+            const auto number=[&]()->std::uint32_t{const auto value=word();if(value.empty() || value.size()>10)throw mci::Error(mcis::bad_integer);std::uint64_t n=0;
+                for(const auto c:value){if(c<u'0' || c>u'9')throw mci::Error(mcis::bad_integer);n=n*10+(c-u'0');}if(n>UINT32_MAX)throw mci::Error(mcis::bad_integer);return static_cast<std::uint32_t>(n);};
+            const auto common=[&]{if(take({u"notify"})){flags|=mci::notify;return true;}if(take({u"wait"})){flags|=mci::wait;return true;}if(take({u"test"})){flags|=0x20;return true;}return false;};
+            const auto store=[&](unsigned offset,unsigned bits,std::uint64_t value){m.store(GuestAddress{block+offset},static_cast<std::uint8_t>(bits),value);};
+            const auto finish_flags=[&]{if((flags&mci::notify) && !execute)store(0,p*8,call(3));};
+            // 開啟參數：「類型!元素」、已知裝置類型名稱、其餘當作元素（檔案）；new 代表沒有元素的新裝置。
+            const auto open_target=[&](std::u16string_view target,std::u16string type,std::uint64_t open_block,std::uint64_t& open_flags){
+                std::u16string element;const auto bang=target.find(u'!');const auto lower=fold(std::u16string(target));
+                if(bang!=std::u16string_view::npos){type=target.substr(0,bang);element=target.substr(bang+1);}
+                else if(!type.empty()){if(lower!=u"new")element=target;}
+                else if(mcis::device_type(lower))type=target;
+                else if(lower==u"new")throw mci::Error(mcis::type_required);
+                else element=target;
+                if(!type.empty()){open_flags|=0x2000;m.store(GuestAddress{open_block+p+4},static_cast<std::uint8_t>(p*8),put_string(type));}
+                if(!element.empty()){open_flags|=0x200;m.store(GuestAddress{open_block+2*p+4},static_cast<std::uint8_t>(p*8),put_string(element));}
+            };
+            if(verb==u"open"){
+                std::u16string type,alias;
+                while(at<tokens.size()){
+                    if(common())continue;
+                    if(take({u"type"}))type=word();else if(take({u"alias"}))alias=word();else if(take({u"shareable"}))flags|=0x100;
+                    else if(take({u"buffer"})){flags|=0x10000;store(4*p+4,32,number());}
+                    else throw mci::Error(mcis::unrecognized_keyword);
+                }
+                if(folded==u"new" && alias.empty())throw mci::Error(mcis::new_requires_alias);
+                open_target(name,type,block,flags);
+                if(!alias.empty()){flags|=0x400;store(3*p+4,p*8,put_string(alias));}
+                finish_flags();
+                if(const auto code=co_await command(0,mci::open,flags,block))throw mci::Error(code);
+                result=mcis::decimal(m.load(GuestAddress{block+p},32));
+            }else if(verb==u"sysinfo"){
+                std::uint32_t id=0,type=0;
+                if(folded==u"all")id=mci::all_devices;else if(const auto known=mcis::device_type(folded))type=known;
+                else if(!(id=find_device(mci_state(),name)))throw mci::Error(mcis::invalid_device_name);
+                bool quantity=false;
+                while(at<tokens.size()){
+                    if(common())continue;
+                    if(take({u"quantity"})){flags|=0x100;quantity=true;}else if(take({u"open"}))flags|=0x200;
+                    else if(take({u"name"})){flags|=0x400;store(2*p+4,32,number());}else if(take({u"installname"}))flags|=0x800;
+                    else throw mci::Error(mcis::unrecognized_keyword);
+                }
+                const auto output=scratch(2048);store(p,p*8,output);store(2*p,32,1024);store(2*p+8,32,type);finish_flags();
+                if(const auto code=co_await command(id,mci::sysinfo,flags,block))throw mci::Error(code);
+                result=quantity?mcis::decimal(m.load(GuestAddress{output},32)):read_utf16(m,GuestAddress{output},1024);
+            }else{
+                std::uint32_t id=folded==u"all"?mci::all_devices:find_device(mci_state(),name);
+                if(!id){
+                    if(verb==u"close")throw mci::Error(mcis::invalid_device_name);
+                    for(std::size_t i=2;i<tokens.size();++i)if(fold(tokens[i])==u"notify")throw mci::Error(mcis::notify_auto_open);
+                    const auto open_block=scratch(64);std::uint64_t open_flags=0;open_target(name,{},open_block,open_flags);
+                    if(const auto code=co_await command(0,mci::open,open_flags,open_block))throw mci::Error(code);
+                    id=automatic=static_cast<std::uint32_t>(m.load(GuestAddress{open_block+p},32));
+                }
+                std::uint32_t message=0;std::optional<mcis::Kind> kind;std::uint64_t output=0;
+                const auto range=[&]{if(take({u"from"})){flags|=mci::from;store(p,32,number());return true;}if(take({u"to"})){flags|=mci::to;store(p+4,32,number());return true;}return false;};
+                const auto item=[&](std::span<const mcis::Item> items){
+                    for(const auto& entry:items)if(take({entry.words[0],entry.words[1],entry.words[2]})){flags|=entry.flags;return &entry;}
+                    throw mci::Error(at<tokens.size()?mcis::unrecognized_keyword:mcis::missing_parameter);
+                };
+                if(verb==u"close" || verb==u"stop" || verb==u"pause" || verb==u"resume"){
+                    message=verb==u"close"?mci::close:verb==u"stop"?mci::stop:verb==u"pause"?mci::pause:mci::resume;
+                    while(at<tokens.size())if(!common())throw mci::Error(mcis::unrecognized_keyword);
+                }else if(verb==u"play" || verb==u"record" || verb==u"delete"){
+                    message=verb==u"play"?mci::play:verb==u"record"?mci::record:mci::erase;
+                    while(at<tokens.size()){
+                        if(common() || range())continue;
+                        if(verb==u"record" && take({u"insert"}))flags|=0x100;else if(verb==u"record" && take({u"overwrite"}))flags|=0x200;
+                        else throw mci::Error(mcis::unrecognized_keyword);
+                    }
+                    asynchronous=message!=mci::erase && !(flags&mci::wait);
+                }else if(verb==u"seek"){
+                    message=mci::seek;
+                    while(at<tokens.size()){
+                        if(common())continue;
+                        if(take({u"to",u"start"}))flags|=0x100;else if(take({u"to",u"end"}))flags|=0x200;else if(take({u"to"})){flags|=mci::to;store(p,32,number());}
+                        else throw mci::Error(mcis::unrecognized_keyword);
+                    }
+                }else if(verb==u"cue"){
+                    message=mci::cue;
+                    while(at<tokens.size()){if(common())continue;if(take({u"input"}))flags|=0x400000;else if(take({u"output"}))flags|=0x800000;else throw mci::Error(mcis::unrecognized_keyword);}
+                }else if(verb==u"save" || verb==u"load"){
+                    message=verb==u"save"?mci::save:mci::load;
+                    if(at<tokens.size() && peek(0)!=u"notify" && peek(0)!=u"wait"){flags|=0x100;store(p,p*8,put_string(tokens[at++]));}
+                    while(at<tokens.size())if(!common())throw mci::Error(mcis::unrecognized_keyword);
+                }else if(verb==u"info"){
+                    message=mci::info;
+                    while(at<tokens.size()){if(common())continue;if(take({u"product"}))flags|=0x100;else if(take({u"file"}))flags|=0x200;else throw mci::Error(mcis::unrecognized_keyword);}
+                    output=scratch(2048);store(p,p*8,output);store(2*p,32,1024);
+                }else if(verb==u"status"){
+                    message=mci::status;flags|=0x100;const auto* entry=item(mcis::status_items);store(2*p,32,entry->item);kind=entry->kind;
+                    while(at<tokens.size()){if(common())continue;if(take({u"track"})){flags|=0x10;store(2*p+4,32,number());}else throw mci::Error(mcis::unrecognized_keyword);}
+                }else if(verb==u"capability"){
+                    message=mci::getcaps;flags|=0x100;const auto* entry=item(mcis::capability_items);store(p+4,32,entry->item);kind=entry->kind;
+                    while(at<tokens.size())if(!common())throw mci::Error(mcis::unrecognized_keyword);
+                }else if(verb==u"set"){
+                    message=mci::set;
+                    while(at<tokens.size()){
+                        if(common())continue;
+                        if(take({u"time",u"format"})){const auto value=fold(word());flags|=0x400;
+                            store(p,32,value==u"milliseconds" || value==u"ms"?0U:value==u"bytes"?8U:value==u"samples"?9U:throw mci::Error(mcis::bad_constant));}
+                        else if(take({u"audio"})){const auto channel=fold(word());flags|=0x800;
+                            store(p+4,32,channel==u"all"?0U:channel==u"left"?1U:channel==u"right"?2U:throw mci::Error(mcis::bad_constant));
+                            const auto state_word=fold(word());flags|=state_word==u"on"?0x2000U:state_word==u"off"?0x4000U:throw mci::Error(mcis::bad_constant);}
+                        else if(take({u"any",u"input"}))flags|=0x4000000;else if(take({u"any",u"output"}))flags|=0x8000000;
+                        else if(take({u"format",u"tag"})){flags|=0x10000;const auto tag=peek(0)==u"pcm"?(++at,1U):number();store(p+16,16,tag);}
+                        else if(take({u"channels"})){flags|=0x20000;store(p+20,16,number());}
+                        else if(take({u"samplespersec"})){flags|=0x40000;store(p+24,32,number());}
+                        else if(take({u"bytespersec"})){flags|=0x80000;store(p+28,32,number());}
+                        else if(take({u"alignment"})){flags|=0x100000;store(p+32,16,number());}
+                        else if(take({u"bitspersample"})){flags|=0x200000;store(p+36,16,number());}
+                        else if(take({u"input"})){flags|=0x400000;store(p+8,32,number());}
+                        else if(take({u"output"})){flags|=0x800000;store(p+12,32,number());}
+                        else throw mci::Error(mcis::unrecognized_keyword);
+                    }
+                }else throw mci::Error(mci::unrecognized);
+                finish_flags();
+                if(const auto code=co_await command(id,message,flags,block))throw mci::Error(code);
+                if(kind)result=mcis::format_value(*kind,m.load(GuestAddress{block+p},static_cast<std::uint8_t>(message==mci::status?p*8:32)));
+                else if(output)result=read_utf16(m,GuestAddress{output},1024);
+            }
+        }catch(const mci::Error& failure){error=failure.code;}catch(const MemoryFault&){error=mci::missing_parameter;}
+        if(automatic){
+            auto& bridge=mci_state();const auto found=bridge.devices.find(automatic);
+            if(found!=bridge.devices.end()){
+                if(!error && asynchronous && found->second->mode!=mci::Mode::Stopped)found->second->auto_close=true;
+                else {const auto close_block=scratch(16);(void)co_await command(automatic,mci::close,0,close_block);}
+            }
+        }
+        if(execute){
+            if(!error)co_return finish(1);
+            auto message=std::u16string(error_text(error));if(message.empty())message=u"Unknown MCI error";
+            (void)co_await service_callback::call_value(resolve("user32.dll","MessageBoxW").value,{0,put_string(message),put_string(u"MCI"),0x10});
+            co_return finish(0);
+        }
+        if(!error && call(1)){
+            const auto capacity=static_cast<std::uint32_t>(call(2));
+            if(wide){if(capacity<result.size()+1)error=mcis::param_overflow;else m.write(GuestAddress{call(1)},utf16_bytes(result));}
+            else{const auto encoded=utf16_to_utf8(result);if(capacity<encoded.size()+1)error=mcis::param_overflow;
+                else {m.write(GuestAddress{call(1)},std::vector<std::uint8_t>(encoded.begin(),encoded.end()));m.store(GuestAddress{call(1)+encoded.size()},8,0);}}
+        }
+        co_return finish(error);
+    });
 }
 }

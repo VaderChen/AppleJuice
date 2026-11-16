@@ -26,8 +26,9 @@
 #define CONCRT_QUEUE_HOST_LENGTH_ERROR 5 /* msvcp140!std::_Xlength_error(const char*) */
 #define CONCRT_QUEUE_HOST_XBAD_ALLOC 6   /* msvcp140!std::_Xbad_alloc() */
 #define CONCRT_QUEUE_HOST_COUNT 7
-/* _Concurrent_vector_base_v4（VC14 concurrent_vector.h，TBB 2.x 衍生）：配置函式指標、_My_first_block、_My_early_size、
- * _My_segment、內嵌 _My_storage[3]；衍生類別的內嵌程式碼直接讀分段表（分段 k 起於 (1<<k)&~1、長度 1<<k，分段 0 長度 2）。 */
+/* _Concurrent_vector_base_v4（VC14 concurrent_vector.h，TBB 2.x 衍生）：配置函式指標、內嵌 _My_storage[3]、
+ * _My_first_block、_My_early_size、_My_segment；欄位依序佔指標槽 0、1～3、4、5、6。
+ * 衍生類別直接讀分段表（分段 k 起於 (1<<k)&~1、長度 1<<k，分段 0 長度 2）。 */
 #define CONCRT_VECTOR_SHORT_TABLE 3
 #define CONCRT_VECTOR_WORDS 7
 #endif

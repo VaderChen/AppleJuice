@@ -101,6 +101,7 @@ SystemPerformance native_system_performance(){
     const auto available=std::min(total,pages(std::uint64_t{statistics.free_count}+statistics.inactive_count));
     const auto wired=pages(statistics.wire_count);
     result.pages={committed,limit,committed,total,available,pages(statistics.external_page_count),wired,0,wired,4096};
+    result.swap_total_pages=swap.xsu_total/4096;result.swap_used_pages=swap.xsu_used/4096;
 #else
     result.error=50;
 #endif

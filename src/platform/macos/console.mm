@@ -46,10 +46,12 @@ static std::array<std::uint16_t,2> console_virtual_key(unsigned code,NSString* t
 - (BOOL)acceptsFirstResponder{return YES;}
 - (void)drawRect:(NSRect)dirty {
     (void)dirty;if(!self.model)return;const auto& screen=self.model->screen;
-    const CGFloat width=9,height=18;NSFont* font=[NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightRegular];
-    const auto color=[](unsigned bits)->NSColor*{const CGFloat low=bits&8?1:0.5,zero=bits&8?0.25:0;
-        if((bits&7)==7 && !(bits&8))return [NSColor colorWithCalibratedWhite:0.75 alpha:1];
-        return [NSColor colorWithCalibratedRed:bits&4?low:zero green:bits&2?low:zero blue:bits&1?low:zero alpha:1];};
+    // 儲存格大小、字面與色表都取自主控台狀態（SetCurrentConsoleFontEx／SetConsoleScreenBufferInfoEx）。
+    const CGFloat width=screen.font_width,height=screen.font_height,points=height*7/9;
+    NSFont* font=[NSFont fontWithName:x64arm::console_string(screen.font_face) size:points];
+    if(!font)font=[NSFont monospacedSystemFontOfSize:points weight:screen.font_weight>=600?NSFontWeightBold:NSFontWeightRegular];
+    const auto color=[&screen](unsigned index)->NSColor*{const auto value=screen.colors[index&15];
+        return [NSColor colorWithCalibratedRed:(value&255)/255.0 green:((value>>8)&255)/255.0 blue:((value>>16)&255)/255.0 alpha:1];};
     for(unsigned y=0;y<screen.view_rows;++y)for(unsigned x=0;x<screen.view_columns;++x){
         const auto& cell=screen.cells[static_cast<std::size_t>(y+screen.top)*screen.columns+x+screen.left];unsigned fg=cell.attributes&15,bg=(cell.attributes>>4)&15;
         if(cell.attributes&0x4000)std::swap(fg,bg);[color(bg) setFill];NSRectFill(NSMakeRect(x*width,y*height,width,height));
@@ -94,8 +96,8 @@ static std::array<std::uint16_t,2> console_virtual_key(unsigned code,NSString* t
 }
 - (void)recordMouse:(NSEvent*)event flags:(unsigned)flags {
     if(!self.model)return;const auto point=[self convertPoint:event.locationInWindow fromView:nil];x64arm::ConsoleRecord value{};
-    x64arm::set_console_field(value,0,2,2);x64arm::set_console_field(value,4,self.model->screen.left+static_cast<unsigned>(std::clamp<long>(static_cast<long>(std::floor(point.x/9)),0,self.model->screen.view_columns-1)),2);
-    x64arm::set_console_field(value,6,self.model->screen.top+static_cast<unsigned>(std::clamp<long>(static_cast<long>(std::floor(point.y/18)),0,self.model->screen.view_rows-1)),2);
+    x64arm::set_console_field(value,0,2,2);x64arm::set_console_field(value,4,self.model->screen.left+static_cast<unsigned>(std::clamp<long>(static_cast<long>(std::floor(point.x/self.model->screen.font_width)),0,self.model->screen.view_columns-1)),2);
+    x64arm::set_console_field(value,6,self.model->screen.top+static_cast<unsigned>(std::clamp<long>(static_cast<long>(std::floor(point.y/self.model->screen.font_height)),0,self.model->screen.view_rows-1)),2);
     auto buttons=static_cast<std::uint32_t>(NSEvent.pressedMouseButtons)&7U;
     if(flags&12){const auto delta=flags&8?event.scrollingDeltaX:event.scrollingDeltaY;buttons|=static_cast<std::uint32_t>(delta<0?-120:120)<<16;}
     x64arm::set_console_field(value,8,buttons);x64arm::set_console_field(value,12,x64arm::console_modifiers(event));x64arm::set_console_field(value,16,flags);
@@ -123,8 +125,8 @@ static std::array<std::uint16_t,2> console_virtual_key(unsigned code,NSString* t
 - (void)windowDidResize:(NSNotification*)notification {
     if(!self.model || self.model->updating)return;NSWindow* window=notification.object;const auto size=window.contentView.bounds.size;
     x64arm::ConsoleRecord value{};x64arm::set_console_field(value,0,4,2);
-    x64arm::set_console_field(value,4,static_cast<unsigned>(std::clamp<long>(static_cast<long>(size.width/9),1,1024)),2);
-    x64arm::set_console_field(value,6,static_cast<unsigned>(std::clamp<long>(static_cast<long>(size.height/18),1,1024)),2);self.model->events.push_back(value);
+    x64arm::set_console_field(value,4,static_cast<unsigned>(std::clamp<long>(static_cast<long>(size.width/self.model->screen.font_width),1,1024)),2);
+    x64arm::set_console_field(value,6,static_cast<unsigned>(std::clamp<long>(static_cast<long>(size.height/self.model->screen.font_height),1,1024)),2);self.model->events.push_back(value);
 }
 - (void)recordFocus:(BOOL)focused {
     if(!self.model)return;x64arm::ConsoleRecord value{};x64arm::set_console_field(value,0,16,2);x64arm::set_console_field(value,4,focused?1:0);self.model->events.push_back(value);
@@ -173,12 +175,14 @@ public:
     }
     std::array<std::uint16_t,2> maximum_size() const override {
         const auto screen=window_.screen?:NSScreen.mainScreen;const auto size=screen.visibleFrame.size;
-        return {static_cast<std::uint16_t>(std::clamp<long>(static_cast<long>(size.width/9),2,32767)),static_cast<std::uint16_t>(std::clamp<long>(static_cast<long>(size.height/18),2,32767))};
+        const auto& font=state_.screen;
+        return {static_cast<std::uint16_t>(std::clamp<long>(static_cast<long>(size.width/font.font_width),2,32767)),static_cast<std::uint16_t>(std::clamp<long>(static_cast<long>(size.height/font.font_height),2,32767))};
     }
     bool update(const ConsoleSnapshot& screen) override {
         if(!NSThread.isMainThread || state_.closed)return false;
         @autoreleasepool {state_.screen=screen;window_.title=console_string(screen.title);state_.updating=true;
-            const auto size=NSMakeSize(screen.view_columns*9,screen.view_rows*18);if(!NSEqualSizes(size,window_.contentView.bounds.size))[window_ setContentSize:size];
+            const auto cell=NSMakeSize(screen.font_width,screen.font_height);window_.contentResizeIncrements=cell;window_.contentMinSize=cell;
+            const auto size=NSMakeSize(screen.view_columns*cell.width,screen.view_rows*cell.height);if(!NSEqualSizes(size,window_.contentView.bounds.size))[window_ setContentSize:size];
             state_.updating=false;view_.needsDisplay=YES;[view_ displayIfNeeded];return true;}
     }
     std::vector<ConsoleRecord> poll(unsigned milliseconds) override {
@@ -190,6 +194,11 @@ public:
     }
     bool closed() const override{return state_.closed;}
     bool fullscreen() const override{return (window_.styleMask&NSWindowStyleMaskFullScreen)!=0;}
+    // SetConsoleDisplayMode：切換 macOS 全螢幕空間；動畫完成前 fullscreen() 仍回報原狀態。
+    bool set_fullscreen(bool enable) override {
+        if(!NSThread.isMainThread || state_.closed)return false;
+        @autoreleasepool {window_.collectionBehavior|=NSWindowCollectionBehaviorFullScreenPrimary;if(fullscreen()!=enable)[window_ toggleFullScreen:nil];return true;}
+    }
 };
 std::unique_ptr<ConsoleWindow> create_console_window(){
     if(!NSThread.isMainThread)return {};return std::make_unique<CocoaConsoleWindow>();

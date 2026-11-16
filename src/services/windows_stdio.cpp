@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/native_console.hpp"
+#include "windows_console_encoding.hpp"
 #include <algorithm>
 #include <cerrno>
 #include "x64arm/unicode.hpp"
@@ -52,7 +53,7 @@ FileInformation WindowsServices::file_handle_information(std::uint64_t handle) {
     const auto found=files_.find(handle);
     if(found==files_.end())return {{},{},6};
     auto& file=found->second;
-    if(file.pipe || file.serial || file.hid)return {{},{},1};
+    if(file.pipe || file.serial || file.hid || (file.native && file.native->volume_device()))return {{},{},1};
     if(file.native){
         auto info=file.native->information();
         if(!info.error)file.metadata=info.metadata;
@@ -141,13 +142,15 @@ bool WindowsServices::await_standard_input(GuestState& state,GuestMemory& memory
     thread.wait.kind=ThreadWaitKind::StandardInput;thread.wait.handles={count,text?1U:0U,line?1U:0U};
     schedule(state,memory);return false;
 }
-FileIoResult WindowsServices::write_standard_output(unsigned stream,std::span<const std::uint8_t> bytes,bool retained) {
+FileIoResult WindowsServices::write_standard_output(unsigned stream,std::span<const std::uint8_t> bytes,bool retained,bool unicode) {
     const auto completed=[](FileIoResult io){process_io::record(process_io::Kind::Write,io.bytes);return io;};
     if(stream<1 || stream>2 || (!retained && !standard_open_[stream]))return {0,6};
+    const auto input_size=bytes.size();std::string converted;
+    if(!unicode && console_handle(0x100+stream)){converted=console_output_text(*consoles_[stream]->buffer,std::string_view(reinterpret_cast<const char*>(bytes.data()),bytes.size()));bytes=std::span(reinterpret_cast<const std::uint8_t*>(converted.data()),converted.size());}
     if(console_handle(0x100+stream) && consoles_[stream]->buffer->window){
         auto& buffer=*consoles_[stream]->buffer;if(buffer.window->closed())return {0,109};
         buffer.write(std::string_view(reinterpret_cast<const char*>(bytes.data()),bytes.size()));
-        const auto error=console_sync(stream);return completed(error?FileIoResult{0,error}:FileIoResult{bytes.size(),0});
+        const auto error=console_sync(stream);return completed(error?FileIoResult{0,error}:FileIoResult{input_size,0});
     }
     if(live_stdio_[stream]<0) {
         if(bytes.size()>output_limit || stdout_.size()+stderr_.size()>output_limit-bytes.size())return {0,8};
@@ -162,7 +165,7 @@ FileIoResult WindowsServices::write_standard_output(unsigned stream,std::span<co
         if(!written)return completed({position,109});position+=static_cast<std::size_t>(written);
     }
     if(console_handle(0x100+stream))consoles_[stream]->buffer->write(std::string_view(reinterpret_cast<const char*>(bytes.data()),bytes.size()));
-    return completed({position,0});
+    return completed({input_size,0});
 #else
     throw HostCallFault("此宿主尚未實作即時標準輸出");
 #endif
@@ -180,7 +183,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_console(GuestState& state,G
         fail(50);
 #else
         const auto stream=static_cast<unsigned>(arg(0)-0x100);auto& console=*consoles_[stream];auto& buffer=*console.buffer;termios mode{};
-        const bool native=console.descriptor>=0;
+        // 換入的非作用中螢幕緩衝區只保存模式，不改原生終端。
+        const bool native=console.descriptor>=0 && !console_screen_swapped();
         if(native && ::tcgetattr(console.descriptor,&mode))fail(6);
         else if(symbol=="GetConsoleMode"){
             if(!arg(1))fail(87);
@@ -213,7 +217,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_console(GuestState& state,G
                     if(wide){std::u16string units;units.reserve(count);for(std::uint32_t i=0;i<count;++i)units.push_back(static_cast<char16_t>(memory.load(GuestAddress{arg(1)+2ULL*i},16)));
                         try{text=utf16_to_utf8(units);}catch(const std::invalid_argument&){fail(1113);arg.return_to(state,result);return std::nullopt;}}
                     else {text.resize(count);memory.read(GuestAddress{arg(1)},std::span(reinterpret_cast<std::uint8_t*>(text.data()),text.size()));}
-                    const auto written=write_standard_output(stream,std::span(reinterpret_cast<const std::uint8_t*>(text.data()),text.size()));
+                    const auto written=write_standard_output(stream,std::span(reinterpret_cast<const std::uint8_t*>(text.data()),text.size()),false,wide);
                     if(written.error)fail(written.error);else {if(arg(3))memory.store(GuestAddress{arg(3)},32,count);result=1;}
                 }else {
                     auto& pending=runtime_.console_input;auto& input=runtime_.standard_input;
@@ -234,7 +238,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_console(GuestState& state,G
                         std::string text;std::size_t consumed=0;
                         while(consumed<pending.size()){
                             const auto first=pending[consumed];const std::size_t units=first>=0xd800 && first<=0xdbff && consumed+1<pending.size() && pending[consumed+1]>=0xdc00 && pending[consumed+1]<=0xdfff?2:1;
-                            const auto encoded=units==1 && first>=0xd800 && first<=0xdfff?std::string("\xef\xbf\xbd"):utf16_to_utf8(std::u16string_view(pending).substr(consumed,units));if(text.size()+encoded.size()>count)break;text+=encoded;consumed+=units;
+                            const auto encoded=console_encode(units==1 && first>=0xd800 && first<=0xdfff?std::u16string_view(u"\ufffd"):std::u16string_view(pending).substr(consumed,units),buffer.input_codepage);if(text.size()+encoded.size()>count)break;text+=encoded;consumed+=units;
                         }
                         if(count && !pending.empty() && text.empty())fail(122);
                         else {memory.write(GuestAddress{arg(1)},std::span(reinterpret_cast<const std::uint8_t*>(text.data()),text.size()));copied=static_cast<std::uint32_t>(text.size());pending.erase(0,consumed);result=1;}

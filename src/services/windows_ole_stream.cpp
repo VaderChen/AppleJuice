@@ -9,6 +9,7 @@ struct OleStreamState {
         std::shared_ptr<HostFile> file;
         std::u16string path;
         std::uint32_t mode{};
+        std::uint64_t registry_key{};std::u16string registry_value; // SHOpenRegStream 的寫回目標
     };
     struct Stream {std::shared_ptr<Storage> storage;std::uint64_t position{};unsigned references{1};bool lock_bytes{};};
     std::map<std::uint64_t,Stream> streams;std::uint64_t table{},lock_table{};
@@ -69,6 +70,9 @@ void WindowsServices::detach_ole_streams(){
     }
 }
 std::uint32_t WindowsServices::open_shell_file_stream(GuestMemory& memory,std::u16string path,std::uint32_t mode,std::uint32_t attributes,bool create,std::uint64_t& output){
+    return open_file_object(memory,std::move(path),mode,attributes,create,false,output);
+}
+std::uint32_t WindowsServices::open_file_object(GuestMemory& memory,std::u16string path,std::uint32_t mode,std::uint32_t attributes,bool create,bool lock_bytes,std::uint64_t& output){
     output=0;constexpr std::uint32_t invalid=0x800300ffU;
     // 直接 IStream 支援 STGM 存取、分享、建立與刪除；交易／priority／simple 需要另一個儲存契約。
     if((mode&~0x04001073U) || (mode&3U)>2 || (mode&0x70U)>0x40U || ((mode&0x70U) && (mode&0x70U)<0x10U))return invalid;
@@ -83,10 +87,15 @@ std::uint32_t WindowsServices::open_shell_file_stream(GuestMemory& memory,std::u
     detach_ole_streams();
     auto& bridge=*ole_streams_;if(bridge.streams.size()>=65536)return 0x8007000eU;
     const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
-    if(!bridge.table){const auto table=runtime_allocate(memory,{},14*unit);unsigned i=0;for(const auto& entry:ole_stream_service_descriptors())if(entry.family=="internal-ole-stream")memory.store(GuestAddress{table+unit*i++},bits,resolve(entry.family,entry.symbol).value);bridge.table=table;}
-    OleStreamState::Stream stream;stream.storage=std::make_shared<OleStreamState::Storage>();stream.storage->file=std::move(opened.file);stream.storage->path=std::move(path);stream.storage->mode=mode;
+    const auto family=lock_bytes?"internal-ole-lockbytes":"internal-ole-stream";auto& cache=lock_bytes?bridge.lock_table:bridge.table;
+    if(!cache){const auto table=runtime_allocate(memory,{},14*unit);unsigned i=0;for(const auto& entry:ole_stream_service_descriptors())if(entry.family==family)memory.store(GuestAddress{table+unit*i++},bits,resolve(entry.family,entry.symbol).value);cache=table;}
+    OleStreamState::Stream stream;stream.lock_bytes=lock_bytes;stream.storage=std::make_shared<OleStreamState::Storage>();stream.storage->file=std::move(opened.file);stream.storage->path=std::move(path);stream.storage->mode=mode;
     const auto object=allocate_heap(memory,unit);if(!object)return 0x8007000eU;
-    try{memory.store(GuestAddress{object},bits,bridge.table);bridge.streams.emplace(object,std::move(stream));}catch(...){(void)free_heap(memory,object,GuestState{});throw;}output=object;return 0;
+    try{memory.store(GuestAddress{object},bits,cache);bridge.streams.emplace(object,std::move(stream));}catch(...){(void)free_heap(memory,object,GuestState{});throw;}output=object;return 0;
+}
+bool WindowsServices::bind_registry_stream(std::uint64_t stream,std::uint64_t key,std::u16string value){
+    detach_ole_streams();const auto found=ole_streams_->streams.find(stream);if(found==ole_streams_->streams.end() || !found->second.storage->shell_memory)return false;
+    found->second.storage->registry_key=key;found->second.storage->registry_value=std::move(value);return true;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_ole_stream(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.symbol=="ReadClassStm" || service.symbol=="WriteClassStm" || service.symbol=="OleSaveToStream" || service.symbol=="OleLoadFromStream")
@@ -125,7 +134,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_stream(GuestState& stat
             try{
                 if(count){address=allocate_heap(memory,count);if(!address)return finish(0);memory.write(GuestAddress{address},initial);}
                 gui_.global_memory.emplace(handle,GuiGlobalMemory{address,count,2,0,false});inserted=true;
-                OleStreamState::Stream stream;stream.storage=std::make_shared<OleStreamState::Storage>(OleStreamState::Storage{handle,true,true,{}, {},0});
+                OleStreamState::Stream stream;stream.storage=std::make_shared<OleStreamState::Storage>(OleStreamState::Storage{handle,true,true,{}, {},0,0,{}});
                 const auto object=create(std::move(stream));if(object)return finish(object);
             }catch(...){if(inserted)gui_.global_memory.erase(handle);if(address)(void)free_heap(memory,address,state);throw;}
             gui_.global_memory.erase(handle);if(address)(void)free_heap(memory,address,state);return finish(0);
@@ -134,7 +143,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_stream(GuestState& stat
             if(!arg(2))return finish(invalid);memory.store(GuestAddress{arg(2)},bits,0);auto handle=arg(0);bool allocated=false;
             if(handle){const auto found=gui_.global_memory.find(handle);if(found==gui_.global_memory.end() || (found->second.flags&0x100) || found->second.clipboard_owned)return finish(invalid);if(found->second.size>output_limit)return finish(out_of_memory);}
             else {if(gui_.global_memory.size()>=65536)return finish(out_of_memory);handle=gui_.next_object++;gui_.global_memory.emplace(handle,GuiGlobalMemory{0,0,2,0,false});allocated=true;}
-            try{OleStreamState::Stream stream;stream.storage=std::make_shared<OleStreamState::Storage>(OleStreamState::Storage{handle,d(1)!=0,false,{}, {},0});stream.lock_bytes=name=="CreateILockBytesOnHGlobal";const auto object=create(std::move(stream));if(!object){if(allocated)gui_.global_memory.erase(handle);return finish(out_of_memory);}memory.store(GuestAddress{arg(2)},bits,object);return finish(0);}catch(...){if(allocated)gui_.global_memory.erase(handle);throw;}
+            try{OleStreamState::Stream stream;stream.storage=std::make_shared<OleStreamState::Storage>(OleStreamState::Storage{handle,d(1)!=0,false,{}, {},0,0,{}});stream.lock_bytes=name=="CreateILockBytesOnHGlobal";const auto object=create(std::move(stream));if(!object){if(allocated)gui_.global_memory.erase(handle);return finish(out_of_memory);}memory.store(GuestAddress{arg(2)},bits,object);return finish(0);}catch(...){if(allocated)gui_.global_memory.erase(handle);throw;}
         }
         const bool get_global=name=="GetHGlobalFromStream" || name=="GetHGlobalFromILockBytes";
         if(get_global){if(!arg(1))return finish(invalid);memory.store(GuestAddress{arg(1)},bits,0);}
@@ -151,12 +160,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_stream(GuestState& stat
         if(name=="AddRef")return finish(++stream.references);
         if(name=="Release"){
             if(--stream.references)return finish(stream.references);auto storage=stream.storage;bridge.streams.erase(found);(void)free_heap(memory,arg(0),state);
+            if(storage.use_count()==1 && storage->registry_key){
+                // 登錄資料流：以 REG_BINARY 寫回目前內容後關閉機碼。
+                const auto block=gui_.global_memory.find(storage->global);GuestScratch temporary(*this,memory,state);const auto value=temporary.text(storage->registry_value);
+                if(value && block!=gui_.global_memory.end())(void)nested_service(state,memory,"advapi32.dll","RegSetValueExW",{storage->registry_key,value,0,3,block->second.address,block->second.size});
+                (void)nested_service(state,memory,"advapi32.dll","RegCloseKey",{storage->registry_key});storage->registry_key=0;
+            }
             if(storage.use_count()==1 && storage->release){const auto block=gui_.global_memory.find(storage->global);if(block!=gui_.global_memory.end()){if(block->second.address)(void)free_heap(memory,block->second.address,state);gui_.global_memory.erase(block);}}return finish(0);
         }
         if(stream.storage->file){
             if(!runtime_.network.external_io)throw HostCallFault("比較模式不能操作無法重播的原生檔案 IStream");
             auto& storage=*stream.storage;const auto info=storage.file->information();if(info.error)return finish(0x80070000U|info.error);const auto size=info.metadata.size;
             const auto io_error=[](std::uint32_t error){return error?0x80070000U|(error&65535U):0;};
+            if(name=="ReadAt" || name=="WriteAt"){
+                // 檔案 ILockBytes：在指定位移讀寫，不移動任何位置。
+                if(arg(4))memory.store(GuestAddress{arg(4)},32,0);const auto count=d(3);const bool writing=name=="WriteAt";
+                if(writing && !(storage.mode&3U))return finish(0x80030005U);if(count && !arg(2))return finish(pointer_error);if(!count)return finish(0);if(count>output_limit)return finish(out_of_memory);
+                memory.check(GuestAddress{arg(2)},count,writing?Access::Read:Access::Write);std::vector<std::uint8_t> bytes(count);if(writing)memory.read(GuestAddress{arg(2)},bytes);
+                const auto result=writing?storage.file->write(bytes,arg(1)):storage.file->read(bytes,arg(1));if(!writing && result.bytes)memory.write(GuestAddress{arg(2)},std::span(bytes).first(static_cast<std::size_t>(result.bytes)));
+                if(arg(4))memory.store(GuestAddress{arg(4)},32,result.bytes);return finish(result.error?io_error(result.error):writing && result.bytes<count?medium_full:0);
+            }
+            if(name=="Flush")return finish(io_error(storage.file->flush()));
             if(name=="Read" || name=="Write"){
                 if(arg(3))memory.store(GuestAddress{arg(3)},32,0);const auto count=d(2);const bool writing=name=="Write";
                 if((writing && !(storage.mode&3U)) || (!writing && (storage.mode&3U)==1))return finish(0x80030005U);
@@ -181,7 +205,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_stream(GuestState& stat
             if(name=="Stat"){
                 if(!arg(1))return finish(pointer_error);if(d(2)>2)return finish(invalid);memory.check(GuestAddress{arg(1)},x86_?72:80,Access::Write);
                 std::uint64_t name_pointer{};if(d(2)!=1){const auto bytes=utf16_bytes(storage.path);name_pointer=allocate_heap(memory,bytes.size());if(!name_pointer)return finish(out_of_memory);memory.write(GuestAddress{name_pointer},bytes);gui_.task_allocations.insert(name_pointer);}
-                memory.write(GuestAddress{arg(1)},std::vector<std::uint8_t>(x86_?72:80));memory.store(GuestAddress{arg(1)},bits,name_pointer);memory.store(GuestAddress{arg(1)+unit},32,2);
+                memory.write(GuestAddress{arg(1)},std::vector<std::uint8_t>(x86_?72:80));memory.store(GuestAddress{arg(1)},bits,name_pointer);memory.store(GuestAddress{arg(1)+unit},32,stream.lock_bytes?3:2); // STGTY_LOCKBYTES／STGTY_STREAM
                 const auto base=arg(1)+(x86_?8:16);memory.store(GuestAddress{base},64,size);memory.store(GuestAddress{base+8},64,info.metadata.modified);memory.store(GuestAddress{base+16},64,info.metadata.created);memory.store(GuestAddress{base+24},64,info.metadata.accessed);
                 memory.store(GuestAddress{base+32},32,storage.mode);memory.store(GuestAddress{base+36},32,3);return finish(0);
             }

@@ -1,10 +1,23 @@
 #include "x64arm/windows_userdraw.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 namespace x64arm {
+namespace {
+// 系統色彩（COLOR_*，COLORREF）：程序內共用；SetSysColors 改寫後，繪製、GetSysColor 與系統色筆刷一致取用。
+constexpr std::array<std::uint32_t,31> default_system_colors{0xc8c8c8,0,0xd1b499,0xdbcdbf,0xf0f0f0,0xffffff,0x646464,0,0,0xffffff,0xb4b4b4,0xfcf7f4,0xababab,0xd77800,0xffffff,0xf0f0f0,0xa0a0a0,0x6d6d6d,0,0,0xffffff,0x696969,0xe3e3e3,0,0xe1ffff,0,0xcc6600,0xead1b9,0xf2e4d7,0xff9933,0xf0f0f0};
+std::array<std::atomic<std::uint32_t>,31>& system_colors(){
+    static std::array<std::atomic<std::uint32_t>,31> colors;
+    static const bool initialized=[]{for(std::size_t i=0;i<colors.size();++i)colors[i].store(default_system_colors[i]);return true;}();
+    (void)initialized;return colors;
+}
+}
 std::uint32_t gui_system_color(unsigned index){
-    static constexpr std::array<std::uint32_t,31> colors{0xc8c8c8,0,0xd1b499,0xdbcdbf,0xf0f0f0,0xffffff,0x646464,0,0,0xffffff,0xb4b4b4,0xfcf7f4,0xababab,0xd77800,0xffffff,0xf0f0f0,0xa0a0a0,0x6d6d6d,0,0,0xffffff,0x696969,0xe3e3e3,0,0xe1ffff,0,0xcc6600,0xead1b9,0xf2e4d7,0xff9933,0xf0f0f0};
-    return index<colors.size()?colors[index]:0;
+    return index<default_system_colors.size()?system_colors()[index].load(std::memory_order_relaxed):0;
+}
+bool gui_set_system_color(unsigned index,std::uint32_t color){
+    if(index>=default_system_colors.size())return false;
+    system_colors()[index].store(color&0xffffffU,std::memory_order_relaxed);return true;
 }
 namespace {
 void fill(std::vector<GuiDraw>& out,int left,int top,int right,int bottom,std::uint32_t color){if(right<=left || bottom<=top)return;GuiDraw d;d.kind=GuiDraw::Kind::Fill;d.x=left;d.y=top;d.right=right;d.bottom=bottom;d.color=color;out.push_back(d);}

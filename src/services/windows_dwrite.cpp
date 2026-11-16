@@ -1,3 +1,4 @@
+#include "opentype_layout.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "windows_locale_data.hpp"

@@ -19,7 +19,7 @@ std::span<const WindowsServiceDescriptor> com_marshal_service_descriptors(){
         {"internal-com-agile","QueryInterface",3},{"internal-com-agile","AddRef",1},{"internal-com-agile","Release",1},
         {"internal-com-agile","Resolve",3},{"internal-com-agile","ResolveHost",3},{"internal-com-agile","Destroy",1},
         {"internal-com-agile","Prepare",1},{"internal-com-agile","ReleasePacket",1},{"internal-com-agile","Cleanup",1},
-        {"ole32.dll","CoCreateFreeThreadedMarshaler",2},{"combase.dll","CoCreateFreeThreadedMarshaler",2},
+        {"ole32.dll","CoCreateFreeThreadedMarshaler",2},{"combase.dll","CoCreateFreeThreadedMarshaler",2},{"combase.dll","RoGetBufferMarshaler",1},
         {"ole32.dll","CoAllowSetForegroundWindow",2},{"ole32.dll","CoGetStandardMarshal",6},{"combase.dll","CoGetStandardMarshal",6},
         {"ole32.dll","CoMarshalInterface",6},{"combase.dll","CoMarshalInterface",6},
         {"ole32.dll","CoUnmarshalInterface",3},{"combase.dll","CoUnmarshalInterface",3},
@@ -139,6 +139,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_marshal(GuestState& sta
         return done(value);
     };
     try{
+        if(name=="RoGetBufferMarshaler"){
+            // IBuffer 是 agile 物件：程序內以指標直接傳遞（與 free-threaded marshaler 同一實作），跨程序沿用該 marshaler 的標準委派。
+            output(arg(0),unit);memory.store(GuestAddress{arg(0)},bits,0);
+            const auto object=create_com_marshaler(state,memory,0);memory.store(GuestAddress{arg(0)},bits,object+unit);return done(0);
+        }
         if(name=="CoCreateFreeThreadedMarshaler"){output(arg(1),unit);memory.store(GuestAddress{arg(1)},bits,0);const auto object=create_com_marshaler(state,memory,arg(0));memory.store(GuestAddress{arg(1)},bits,object);return done(0);}
         if(name=="CoAllowSetForegroundWindow"){if(arg(1))return done(invalid);if(!arg(0))return done(pointer_error);if(gui_.foreground_locked || !interactive_station() || gui_.input_desktop!=thread_desktop_object(threads_.current) || !gui_.menu_tracks.empty())return done(0x80070005U);ComMarshalOperation op;op.kind=ComMarshalOperation::Kind::Foreground;op.object=arg(0);return begin(op);}
         using Kind=ComMarshalOperation::Kind;

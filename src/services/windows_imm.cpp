@@ -122,8 +122,9 @@ std::optional<std::uint64_t> WindowsServices::imm_control_message(GuestMemory& m
     if(command==11 || command==12){if(!pointer){last_error_=87;return 1;}if(command==12)memory.read(GuestAddress{pointer},context.composition);else memory.write(GuestAddress{pointer},context.composition);return 0;}
     last_error_=50;return 1;
 }
+bool WindowsServices::imm_disabled(std::uint64_t thread) const {return gui_.input_disabled_process || gui_.input_disabled_threads.contains(thread);}
 std::uint64_t WindowsServices::imm_window_context(std::uint64_t hwnd){
-    if(!gui_.windows.contains(hwnd))return 0;
+    if(!gui_.windows.contains(hwnd) || imm_disabled(gui_.windows.at(hwnd).thread))return 0;
     if(const auto found=gui_.input_associations.find(hwnd);found!=gui_.input_associations.end())return found->second;
     const auto thread=gui_.windows.at(hwnd).thread;auto& handle=gui_.input_defaults[thread];
     if(!handle){if(gui_.input_contexts.size()>=4096)return 0;handle=gui_.next_object++;GuiImmContext context;context.thread=thread;context.default_context=true;gui_.input_contexts.emplace(handle,std::move(context));}
@@ -131,18 +132,26 @@ std::uint64_t WindowsServices::imm_window_context(std::uint64_t hwnd){
 }
 void WindowsServices::imm_notify_composition(std::uint64_t handle,std::uint32_t flags,bool start,bool end){
     const auto context=gui_.input_contexts.find(handle);if(context==gui_.input_contexts.end())return;
-    std::uint64_t target=0;
-    if(gui_.focus && imm_window_context(gui_.focus)==handle)target=gui_.focus;
-    if(!target){const auto last=gui_.input_window_targets.find(context->second.thread);if(last!=gui_.input_window_targets.end() && imm_window_context(last->second)==handle)target=last->second;}
-    if(!target)for(const auto& [hwnd,w]:gui_.windows)if(w.thread==context->second.thread && gui_control_class(w)!=u"ime" && imm_window_context(hwnd)==handle){target=hwnd;break;}
-    if(!target)return;
+    const auto target=imm_context_window(handle);if(!target)return;
     const auto push=[&](std::uint32_t message,std::uint32_t bits){GuiMessage msg{target,0,bits,message};msg.ime=context->second.data;msg.ime_context=handle;msg.thread=context->second.thread;enqueue_gui_message(std::move(msg));};
     if(start)push(0x10d,0);push(0x10f,flags);if(end)push(0x10e,0);
     if(native_gui_){const auto& form=context->second.composition;const auto coord=[&](unsigned at){std::uint32_t value=0;for(unsigned i=0;i<4;++i)value|=std::uint32_t{form[at+i]}<<(i*8);return std::bit_cast<std::int32_t>(value);};
         (void)native_gui_->ime_mark(target,context->second.data,{coord(4),coord(8)});}
 }
+std::uint64_t WindowsServices::imm_context_window(std::uint64_t handle){
+    const auto context=gui_.input_contexts.find(handle);if(context==gui_.input_contexts.end())return 0;
+    if(gui_.focus && imm_window_context(gui_.focus)==handle)return gui_.focus;
+    if(const auto last=gui_.input_window_targets.find(context->second.thread);last!=gui_.input_window_targets.end() && imm_window_context(last->second)==handle)return last->second;
+    for(const auto& [hwnd,w]:gui_.windows)if(w.thread==context->second.thread && gui_control_class(w)!=u"ime" && imm_window_context(hwnd)==handle)return hwnd;
+    return 0;
+}
 bool WindowsServices::imm_native_message(GuiMessage& message){
     if(!message.ime || message.message!=0x10f)return false;
+    // 停用 IME 的執行緒沒有輸入內容：原生輸入法確定的文字改以一般 WM_CHAR 送達。
+    if(const auto window=gui_.windows.find(message.window);window!=gui_.windows.end() && imm_disabled(window->second.thread)){
+        for(const auto c:message.ime->result)enqueue_gui_message({message.window,c,1,0x102});
+        return true;
+    }
     const auto handle=imm_window_context(message.window);if(!handle)return true;
     auto& context=gui_.input_contexts.at(handle);auto data=*message.ime;
     if(data.text.size()>32767 || data.result.size()>32767 || data.candidate_lists.size()>32)return true;
@@ -175,9 +184,26 @@ std::span<const WindowsServiceDescriptor> imm_service_descriptors(){
         {"imm32.dll","ImmGetDefaultIMEWnd",1},{"imm32.dll","ImmGetProperty",2},{"imm32.dll","ImmGetDescriptionA",3},{"imm32.dll","ImmGetDescriptionW",3},
         {"imm32.dll","ImmLockIMC",1},{"imm32.dll","ImmUnlockIMC",1},{"imm32.dll","ImmGetIMCLockCount",1},
         {"imm32.dll","ImmCreateIMCC",1},{"imm32.dll","ImmDestroyIMCC",1},{"imm32.dll","ImmLockIMCC",1},{"imm32.dll","ImmUnlockIMCC",1},
-        {"imm32.dll","ImmReSizeIMCC",2},{"imm32.dll","ImmGetIMCCSize",1},{"imm32.dll","ImmGetIMCCLockCount",1}};return table;
+        {"imm32.dll","ImmReSizeIMCC",2},{"imm32.dll","ImmGetIMCCSize",1},{"imm32.dll","ImmGetIMCCLockCount",1},
+        {"imm32.dll","ImmGetStatusWindowPos",2},{"imm32.dll","ImmSetStatusWindowPos",2},{"imm32.dll","ImmGetGuideLineA",4,0,0,0x2},{"imm32.dll","ImmGetGuideLineW",4,0,0,0x2},
+        {"imm32.dll","ImmEnumInputContext",3,0,0,0x1},{"imm32.dll","ImmRequestMessageA",3},{"imm32.dll","ImmRequestMessageW",3},{"imm32.dll","ImmSetActiveContext",3},
+        {"imm32.dll","ImmDisableIME",1,0,0,0x1},{"imm32.dll","ImmDisableIme",1,0,0,0x1},{"imm32.dll","ImmDisableLegacyIME",0},{"imm32.dll","CtfImmIsCiceroEnabled",0}};return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_imm(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    // ImmEnumInputContext：依建立順序列舉執行緒（0＝目前、0xffffffff＝整個程序）的輸入內容，回呼傳回 FALSE 即停止。
+    if(service.symbol=="ImmEnumInputContext"){
+        return nested_continuation(state,memory,"ImmEnumInputContext",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);const auto id=static_cast<std::uint32_t>(call(0));
+            const auto thread=id==0?threads_.current:id==UINT32_MAX?0:thread_from_identifier(id);
+            if((id && id!=UINT32_MAX && !thread) || !call(1)){last_error_=87;call.return_to(s,0);co_return std::nullopt;}
+            std::vector<std::uint64_t> handles;for(const auto& [handle,context]:gui_.input_contexts)if(id==UINT32_MAX || context.thread==thread)handles.push_back(handle);
+            for(const auto handle:handles){
+                if(!gui_.input_contexts.contains(handle))continue;
+                if(!(co_await service_callback::call_value(call(1),{handle,call(2)})&0xffffffffU))break;
+            }
+            call.return_to(s,1);co_return std::nullopt;
+        });
+    }
     // IME 視窗的訊息回傳 TRUE，有目標視窗時轉送給它；其他訊息回傳 FALSE。
     if(service.symbol=="ImmIsUIMessageA" || service.symbol=="ImmIsUIMessageW"){
         return service_callback::invoke<std::optional<std::uint32_t>>(
@@ -198,7 +224,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_imm(GuestState& state,Guest
     const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
     const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
     try {
-        const auto current=[&](std::uint64_t hwnd){
+        const auto current=[&](std::uint64_t hwnd)->std::uint64_t{
+            if(imm_disabled(gui_.windows.at(hwnd).thread))return 0;
             const auto associated=gui_.input_associations.find(hwnd);if(associated!=gui_.input_associations.end())return associated->second;
             const auto thread=gui_.windows.at(hwnd).thread;auto& handle=gui_.input_defaults[thread];
             if(!handle){handle=gui_.next_object++;GuiImmContext context;context.thread=thread;context.default_context=true;gui_.input_contexts.emplace(handle,std::move(context));}
@@ -233,6 +260,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_imm(GuestState& state,Guest
             if(arg(0) && target==gui_.windows.end())fail(1400);
             else {
                 const auto thread=arg(0)?target->second.thread:threads_.current;
+                if(imm_disabled(thread)){arg.return_to(state,0);return std::nullopt;}
                 if(arg(0))gui_.input_window_targets[thread]=arg(0);
                 const auto existing=gui_.input_windows.find(thread);
                 if(existing!=gui_.input_windows.end() && gui_.windows.contains(existing->second))result=existing->second;
@@ -245,6 +273,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_imm(GuestState& state,Guest
                     if(native_gui_)native_gui_->create(result,gui_.windows.at(result));
                 }
             }
+        }
+        else if(symbol=="ImmDisableIME" || symbol=="ImmDisableIme"){
+            // 停用後該執行緒（-1 為整個程序）的 ImmGetContext／ImmGetDefaultIMEWnd 回 NULL，原生輸入法確定的文字以 WM_CHAR 送達。
+            if(d(0)==UINT32_MAX){gui_.input_disabled_process=true;result=1;}
+            else {const auto thread=d(0)?thread_from_identifier(d(0)):threads_.current;if(!thread)fail(87);else {gui_.input_disabled_threads.insert(thread);result=1;}}
+        }
+        // 引擎沒有舊式 IMM 輸入法 DLL，也不經 Cicero（TSF）文字服務框架。
+        else if(symbol=="ImmDisableLegacyIME")result=1;
+        else if(symbol=="CtfImmIsCiceroEnabled")result=0;
+        else if(symbol=="ImmSetActiveContext"){
+            // 通知視窗輸入內容啟用／停用（WM_IME_SETCONTEXT，lParam 為 ISC_SHOWUIALL）。
+            if(!gui_.windows.contains(arg(0)))fail(1400);
+            else {const auto& window=gui_.windows.at(arg(0));
+                start_callbacks(state,memory,{{resolve("user32.dll",window.unicode?"SendMessageW":"SendMessageA").value,{arg(0),0x281,arg(2)?1U:0U,0xc000000fU}}},Continuation::Return,1);return std::nullopt;}
         }
         else if(symbol=="ImmDisableTextFrameService"){
             // 引擎的輸入法不經 Cicero 文字服務框架（TSF），沒有框架可停用；與未載入 TSF 的 Windows 相同直接回 TRUE（0＝目前執行緒、0xffffffff＝整個程序）。
@@ -292,6 +334,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_imm(GuestState& state,Guest
                         else if(d(3)<bytes.size())fail(122);
                         else {memory.write(GuestAddress{arg(2)},bytes);result=bytes.size();}
                     }
+                }
+                else if(symbol=="ImmGetStatusWindowPos" || symbol=="ImmSetStatusWindowPos"){
+                    // 狀態視窗位置（POINT）；尚未設定時取得失敗。
+                    if(!arg(1))fail(87);
+                    else if(symbol=="ImmSetStatusWindowPos"){context.status_position=std::array<std::int32_t,2>{static_cast<std::int32_t>(memory.load(GuestAddress{arg(1)},32)),static_cast<std::int32_t>(memory.load(GuestAddress{arg(1)+4},32))};result=1;}
+                    else if(context.status_position){memory.store(GuestAddress{arg(1)},32,static_cast<std::uint32_t>((*context.status_position)[0]));memory.store(GuestAddress{arg(1)+4},32,static_cast<std::uint32_t>((*context.status_position)[1]));result=1;}
+                }
+                else if(symbol.starts_with("ImmGetGuideLine")){
+                    // 原生輸入法不產生 guideline：GGL_LEVEL 為 GL_LEVEL_NOGUIDELINE、GGL_INDEX 為 GL_ID_UNKNOWN，字串與私有資料長度為 0。
+                    if(d(1)<1 || d(1)>4)fail(87);else result=0;
+                }
+                else if(symbol.starts_with("ImmRequestMessage")){
+                    // WM_IME_REQUEST 送給此輸入內容目前的目標視窗並回傳其結果；沒有視窗時為 0。
+                    const auto target=imm_context_window(arg(0));
+                    if(target){start_callbacks(state,memory,{{resolve("user32.dll",symbol.ends_with('W')?"SendMessageW":"SendMessageA").value,{target,0x288,arg(1),arg(2)}}},Continuation::ReturnCallback);return std::nullopt;}
                 }
                 else if(symbol=="ImmGetOpenStatus")result=context.open;
                 else if(symbol=="ImmSetOpenStatus"){

@@ -290,6 +290,35 @@ public:
     bool page_locked(GuestAddress address) const noexcept;
     std::uint64_t locked_page_count() const noexcept;
 
+    // 工作集監測使用客體頁粒度；只有正在執行的指令可發布 FaultingPc。
+    // 解碼／預編譯只讀來源，不代表客體已取指。啟用、trim、映射修改須在 worker 停止時執行。
+    struct WorkingSetChange {std::uint64_t pc{},address{},thread{},flags{};};
+    enum class WorkingSetReadStatus {Ready,Disabled,Busy,TooSmall};
+    struct WorkingSetChanges {
+        WorkingSetReadStatus status{WorkingSetReadStatus::Disabled};
+        std::vector<WorkingSetChange> entries;
+        std::uint64_t lost{};
+        std::size_t required{};
+    };
+    void enable_working_set_watch();
+    bool working_set_watch_enabled() const noexcept {return working_set_watch_table_!=nullptr;}
+    WorkingSetChanges read_working_set_changes(std::size_t capacity);
+    std::optional<bool> working_set_resident(GuestAddress) const;
+    static std::uint32_t working_set_watch_table_offset() noexcept;
+    class ExecutionAccess {
+    public:
+        ExecutionAccess(const GuestMemory&,GuestAddress,std::uint64_t thread);
+        ~ExecutionAccess();
+        ExecutionAccess(const ExecutionAccess&)=delete;
+        ExecutionAccess& operator=(const ExecutionAccess&)=delete;
+    private:
+        friend class GuestMemory;
+        const GuestMemory* memory_{};GuestAddress pc_{};std::uint64_t thread_{};
+        ExecutionAccess* previous_{};
+        static thread_local ExecutionAccess* current_;
+    };
+    void observe_execution(GuestAddress,std::size_t) const;
+
 private:
     // 保持原有 64-byte 熱描述；頁證明另外配置，不改變 Region 步長。
     struct Region {
@@ -394,5 +423,13 @@ private:
     std::uint64_t committed_{},private_commit_{};
     std::map<std::uint64_t,std::uint64_t> virtual_reservations_;
     std::uint64_t virtual_size_{},peak_virtual_size_{};
+    struct WorkingSetWatch;
+    std::shared_ptr<WorkingSetWatch> working_set_watch_;
+    // 低 native_mmu_window 的每個 4 KiB 頁一 byte；AOT 只讀，初次觸頁沿既有精確出口發布。
+    std::uint8_t* working_set_watch_table_{};
+    void observe_memory(GuestAddress,std::size_t) const;
+    void forget_working_set_range(GuestAddress,std::size_t) const;
+    void copy_working_set_watch(const GuestMemory&);
+    bool working_set_native_ready(GuestAddress,std::size_t) const noexcept;
 };
 }

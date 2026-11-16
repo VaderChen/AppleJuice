@@ -46,6 +46,9 @@ std::span<const WindowsServiceDescriptor> transaction_service_descriptors(){
 }
 TransactionState& WindowsServices::transaction_state(){if(!transactions_)transactions_=std::make_shared<TransactionState>();return *transactions_;}
 bool WindowsServices::transactions_open()const{return transactions_ && !transactions_->handles.empty();}
+void WindowsServices::append_transaction_handles(std::vector<std::uint64_t>& handles)const{
+    if(transactions_)for(const auto& [handle,item]:transactions_->handles){(void)item;handles.push_back(handle);}
+}
 bool WindowsServices::transaction_handle(std::uint64_t handle)const{return transactions_ && transactions_->handles.contains(handle);}
 std::optional<std::pair<std::uint64_t,std::uint32_t>> WindowsServices::transaction_identity(std::uint64_t handle)const{
     if(!transaction_handle(handle))return std::nullopt;const auto& target=transactions_->handles.at(handle);

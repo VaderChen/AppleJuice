@@ -17,6 +17,12 @@ void resize_icon(GuiIcon&,std::uint32_t,std::uint32_t,bool monochrome=false);
 std::optional<GuiIcon> native_png_icon(std::span<const std::uint8_t>);
 std::optional<GuiIcon> native_stock_icon(std::uint32_t,std::uint32_t);
 std::optional<GuiIcon> native_system_cursor(std::uint32_t);
+// OCR_*／IDC_* 系統游標識別（ARROW、IBEAM、WAIT、CROSS、UPARROW、SIZE、ICON、SIZENWSE、SIZENESW、SIZEWE、SIZENS、SIZEALL、NO、HAND、
+// APPSTARTING、HELP、PIN、PERSON）；LoadCursor(NULL)、SetCursor 與 SetSystemCursor 共用。
+inline constexpr bool gui_system_cursor_id(std::uint64_t id){
+    switch(id){case 32512:case 32513:case 32514:case 32515:case 32516:case 32640:case 32641:case 32642:case 32643:case 32644:case 32645:
+    case 32646:case 32648:case 32649:case 32650:case 32651:case 32671:case 32672:return true;default:return false;}
+}
 std::span<const std::uint32_t> stock_icon_ids();
 bool stock_icon_valid(std::uint32_t);
 inline constexpr std::u16string_view stock_icon_path=u"C:\\Windows\\System32\\MacWinStockIcons.dll";

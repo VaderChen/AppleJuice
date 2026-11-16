@@ -30,6 +30,11 @@ std::span<const WindowsServiceDescriptor> nt_process_service_descriptors(){
 }
 std::uint32_t WindowsServices::local_process_information(std::uint32_t operation,std::array<std::uint64_t,5>& values,std::uint32_t& bits,int descriptor){
     bits=x86_?32U:64U;
+    if(operation==15){
+        // 來源已核對 PROCESS_SET_INFORMATION 與程序出生身分；不同指標寬度不能截斷入口。
+        if(values[1]!=bits)return 50;
+        runtime_.instrumentation_callback=values[0];return 0;
+    }
     if(operation==10 || operation==11){
         // 與 SuspendThread 共用逐執行緒計數；不以程序布林值抹去 CREATE_SUSPENDED 或巢狀暫停。
         // 程序操作逐一處理存活執行緒；已終止或計數達上限者不再增加。
@@ -37,6 +42,9 @@ std::uint32_t WindowsServices::local_process_information(std::uint32_t operation
         for(auto& [id,thread]:threads_.items){
             (void)id;if(thread.status==ThreadStatus::Exited || thread.terminating)continue;
             live=true;
+            // BYPASS_PROCESS_FREEZE 只排除整個程序的暫停／恢復；明確的
+            // SuspendThread、CREATE_SUSPENDED 與偵錯事件仍各自保留原語義。
+            if(thread.bypass_process_freeze)continue;
             if(operation==10){if(thread.suspended<127)++thread.suspended;}
             else if(thread.suspended)--thread.suspended;
         }
@@ -89,6 +97,41 @@ std::uint32_t WindowsServices::local_process_information(std::uint32_t operation
         (void)descriptor;return 50;
 #endif
     }
+    if(operation==14){
+#if !defined(_WIN32)
+        std::vector<SystemHandleRecord> handles;if(const auto error=local_system_handles(handles))return error;
+        if(handles.size()>1024*1024)return 8;
+        std::vector<std::uint8_t> bytes;bytes.reserve(handles.size()*32);
+        const auto put=[&](std::uint64_t value,unsigned size){for(unsigned n=0;n<size;++n)bytes.push_back(static_cast<std::uint8_t>(value>>(n*8)));};
+        for(const auto& item:handles){put(item.handle,8);put(item.object,8);put(item.pid,4);put(item.access,4);put(item.type,2);put(item.flags,2);put(0,4);}
+        std::size_t done=0;while(done<bytes.size()){
+            const auto count=::pwrite(descriptor,bytes.data()+done,bytes.size()-done,static_cast<off_t>(done));
+            if(count<0 && errno==EINTR)continue;if(count<=0)return 8;done+=static_cast<std::size_t>(count);
+        }
+        values[0]=bytes.size();return 0;
+#else
+        (void)descriptor;return 50;
+#endif
+    }
+    if(operation==13){
+#if !defined(_WIN32)
+        // 有界、與客體指標寬度無關的 IPC 格式；不傳遞宿主指標。
+        std::vector<std::uint8_t> bytes;
+        const auto put=[&](std::uint64_t value,unsigned size){for(unsigned n=0;n<size;++n)bytes.push_back(static_cast<std::uint8_t>(value>>(n*8)));};
+        for(const auto& module:local_kernel_modules()){
+            if(module.path.size()>32767 || bytes.size()+24+module.path.size()*2>4*1024*1024)return 8;
+            put(module.base,8);put(module.size,8);put(module.references,4);put(module.path.size()*2,4);
+            for(auto ch:module.path)put(ch,2);
+        }
+        std::size_t done=0;while(done<bytes.size()){
+            const auto count=::pwrite(descriptor,bytes.data()+done,bytes.size()-done,static_cast<off_t>(done));
+            if(count<0 && errno==EINTR)continue;if(count<=0)return 8;done+=static_cast<std::size_t>(count);
+        }
+        values[0]=bytes.size();return 0;
+#else
+        (void)descriptor;return 50;
+#endif
+    }
     const auto id=values[4]?values[4]:1U;
     if(id>UINT32_MAX)return 87;
     const auto found=threads_.items.find(id);if(found==threads_.items.end())return 6;auto& thread=found->second;
@@ -125,6 +168,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_process(GuestState& stat
         if(!setting && call(4))memory.check(GuestAddress{call(4)},4,Access::Write);
         if(query64 && cls!=0 && cls!=20 && cls!=26 && cls!=27 && cls!=58)return finish(0xc0000003U);
         if(query64 && cls==0 && length<48){if(call(4))memory.store(GuestAddress{call(4)},32,48);return finish(0xc0000004U);}
+#ifdef X64ARM_HOST_SERVICES_MEMORY_WATCH
+        if(process && !setting && (cls==15 || cls==42)){
+            std::uint32_t returned{};const auto error=process_working_set_watch(memory,call(0),false,cls==42,output,length,returned,true);
+            if(call(4) && (!error || error==122))memory.store(GuestAddress{call(4)},32,returned);
+            return finish(error==6 && !object_type(call(0)).empty()?0xc0000024U:working_set_watch_status(error));
+        }
+#endif
+        if(process && (cls==7 || cls==30)){
+            // 與 CheckRemoteDebuggerPresent 共用宿主／客體偵錯連線、存取權及 PID 出生身分。
+            // 不先要求客體資訊 IPC：已附加宿主偵錯器的程序可能處於原生停止狀態。
+            bool present=false;const auto error=query_process_debug_state(memory,call(0),present);
+            if(error)return finish(error==6 && !object_type(call(0)).empty()?0xc0000024U:native_status(error));
+            if(call(4))memory.store(GuestAddress{call(4)},32,unit);
+            if(length!=unit)return finish(0xc0000004U);
+            memory.check(GuestAddress{output},unit,Access::Write);
+            // 原生 DebugObject handle 尚未整合至偵錯通道；已附加時明確保留此缺口，
+            // 不捏造 handle，也不把真實的 attached 狀態回報為沒有偵錯物件。
+            if(cls==30 && present)return finish(0xc00000bbU);
+            memory.store(GuestAddress{output},static_cast<std::uint8_t>(unit*8),cls==7 && present?UINT64_MAX:0);
+            return finish(cls==30?0xc0000353U:0U);
+        }
         std::array<std::uint64_t,5> values{};std::uint32_t pid{},bits{};std::uint64_t tid{},birth{};std::uint32_t error=0;
         if(process){error=process_basic_information(memory,call(0),values,pid,bits);if(error)return finish(error==6 && !object_type(call(0)).empty()?0xc0000024U:native_status(error));}
         else {
@@ -165,8 +229,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_process(GuestState& stat
             put(unit,unit,values[1]);
             if(process){put(unit*2,unit,values[2]);put(unit*3,4,values[3]);put(unit*4,unit,pid);put(unit*5,unit,values[4]);}
             else {put(unit*2,unit,pid);put(unit*3,unit,pid==process_id()?thread_identifier(tid):remote_thread_identifier(pid,birth,static_cast<std::uint32_t>(tid)));put(unit*4,unit,values[2]);put(unit*5,4,values[3]);put(unit*5+4,4,values[4]);}
-        }else if(process && (cls==7 || cls==26)){
-            bytes.resize(unit);put(0,unit,cls==26 && bits==32?values[1]:0);
+        }else if(process && cls==26){
+            bytes.resize(unit);put(0,unit,bits==32?values[1]:0);
         }else if(process && cls==20){
             std::uint32_t count{};error=query_process_handle_count(memory,pid,count);if(error)return finish(native_status(error));bytes.resize(4);put(0,4,count);
         }else if(process && cls==58){

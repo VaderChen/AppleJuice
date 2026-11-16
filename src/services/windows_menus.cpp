@@ -28,7 +28,7 @@ std::span<const WindowsServiceDescriptor> menu_service_descriptors() {
         {"user32.dll","GetMenuItemInfoA",4},{"user32.dll","GetMenuItemInfoW",4},
         {"user32.dll","SetMenuItemInfoA",4},{"user32.dll","SetMenuItemInfoW",4},
         {"user32.dll","InsertMenuItemA",4},{"user32.dll","InsertMenuItemW",4},
-        {"user32.dll","CheckMenuRadioItem",5},
+        {"user32.dll","CheckMenuRadioItem",5},{"user32.dll","ChangeMenuA",5},{"user32.dll","ChangeMenuW",5},{"user32.dll","HiliteMenuItem",4},
         {"user32.dll","GetMenuInfo",2},{"user32.dll","SetMenuInfo",2},{"user32.dll","GetMenuDefaultItem",3},{"user32.dll","SetMenuDefaultItem",3},
         {"user32.dll","GetMenuContextHelpId",1},{"user32.dll","SetMenuContextHelpId",2},
         {"user32.dll","TrackPopupMenu",7},{"user32.dll","TrackPopupMenuEx",6},{"user32.dll","EndMenu",0},
@@ -169,6 +169,32 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
     const auto read=[&](std::uint64_t address){return address?(wide?read_utf16(memory,GuestAddress{address}):utf8_to_utf16_lossy(read_ansi(memory,address))):std::u16string{};};
     std::uint64_t result=0;
     const auto fail=[&](std::uint32_t error,std::uint64_t value=0){last_error_=error;result=value;};
+    if(symbol.starts_with("ChangeMenu")){
+        // 舊版 ChangeMenu(hMenu, cmd, lpszNewItem, cmdInsert, flags)：依 MF_APPEND／MF_DELETE／MF_CHANGE／MF_REMOVE
+        // 轉交同一選單模型的 Append／Delete／Modify／RemoveMenu，其餘為 InsertMenu；旗標本身不傳給目標函式。
+        const auto flags=d(4);const std::string append=wide?"AppendMenuW":"AppendMenuA",modify=wide?"ModifyMenuW":"ModifyMenuA",insert=wide?"InsertMenuW":"InsertMenuA";
+        std::uint64_t value=0;
+        if(flags&0x100U)value=nested_service(state,memory,"user32.dll",append,{arg(0),flags&~0x100U,arg(3),arg(2)});
+        else if(flags&0x200U)value=nested_service(state,memory,"user32.dll","DeleteMenu",{arg(0),arg(1),flags&~0x200U});
+        else if(flags&0x80U)value=nested_service(state,memory,"user32.dll",modify,{arg(0),arg(1),flags&~0x80U,arg(3),arg(2)});
+        else if(flags&0x1000U)value=nested_service(state,memory,"user32.dll","RemoveMenu",{arg(0),(flags&by_position)?arg(1):arg(3),flags&~0x1000U});
+        else value=nested_service(state,memory,"user32.dll",insert,{arg(0),arg(1),flags,arg(3),arg(2)});
+        arg.return_to(state,value);return std::nullopt;
+    }
+    if(symbol=="HiliteMenuItem"){
+        // MF_HILITE／MF_UNHILITE 改變項目狀態（GetMenuState 讀回），選單列重繪後反映到視窗。
+        const auto flags=d(3);
+        if(!gui_.windows.contains(arg(0)))fail(1400);
+        else if(!gui_.menus.contains(arg(1)))fail(1401);
+        else if(const auto where=find_item(gui_,arg(1),d(2),flags & by_position);!where)fail(1456);
+        else {
+            auto& item=gui_.menus.at(where->first)[where->second];
+            item.flags=(flags&0x80U)?(item.flags|0x80U):(item.flags&~0x80U);
+            if(gui_.windows.at(arg(0)).menu==arg(1))(void)nested_service(state,memory,"user32.dll","DrawMenuBar",{arg(0)});
+            result=1;
+        }
+        arg.return_to(state,result);return std::nullopt;
+    }
     if(symbol=="EndMenu"){
         // 遞迴追蹤只結束本執行緒最內層選單；不影響其他執行緒的選單。
         for(auto it=gui_.menu_tracks.rbegin();it!=gui_.menu_tracks.rend();++it)if(it->second.thread==threads_.current && it->second.active){it->second.cancel();result=1;break;}

@@ -26,6 +26,10 @@ struct Buffer {
     double cursor{};
     float left{1}, right{1};
     bool playing{}, looping{}, streaming{}, floating{};
+    // 迴圈區段（pcm 位元組偏移，frame 對齊）：游標到達 loop_end 且 loop_remaining 不為 0 時回到 loop_begin 並遞減（UINT32_MAX 為無限）；
+    // loop_frames 累計因迴圈重播而倒回的 frame 數，播放位置以此保持遞增。
+    std::uint64_t loop_begin{}, loop_end{}, loop_frames{};
+    std::uint32_t loop_remaining{};
     struct Notification { std::uint32_t offset; std::uint64_t event; };
     std::vector<Notification> notifications;
     std::vector<std::uint64_t> pending_notifications;

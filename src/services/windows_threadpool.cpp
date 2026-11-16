@@ -1,12 +1,15 @@
 #include "x64arm/windows_services.hpp"
 #include <algorithm>
 #include <deque>
+#include <set>
 
 namespace x64arm {
 namespace {
 enum class PoolKind {Work,Timer,Wait,Simple,Io};
 struct PoolObject {
     PoolKind kind{};std::uint64_t owner{},callback{},context{},finalizer{},target{},deadline{UINT64_MAX},absolute_due{};
+    // 回呼環境的 cleanup group 與取消回呼（CloseThreadpoolCleanupGroupMembers 取消待執行回呼時呼叫）。
+    std::uint64_t group{},cancel_callback{};
     std::deque<std::uint32_t> pending;std::uint32_t period{},outstanding{},associated{};
     // I/O：已呼叫 StartThreadpoolIo 但尚未完成的操作數，以及待交給 worker 的完成封包（與 pending 一一對應）。
     std::uint32_t started{};std::deque<CompletionPacket> io;
@@ -16,7 +19,8 @@ struct PoolInstance {
     std::uint64_t object{},worker{};bool associated{true},long_running{},finalized{};
     std::vector<GuestCallback> cleanup;
 };
-struct PoolDefinition {std::uint32_t minimum{},maximum{64};bool closed{};};
+// stack_reserve／stack_commit 為 0 時沿用程序映像的堆疊大小（SetThreadpoolStackInformation 之前的預設值）。
+struct PoolDefinition {std::uint32_t minimum{},maximum{64};bool closed{};std::uint64_t stack_reserve{},stack_commit{};};
 std::uint64_t add_ticks(std::uint64_t a,std::uint64_t b){return b>UINT64_MAX-a?UINT64_MAX:a+b;}
 }
 struct ThreadpoolState {
@@ -24,7 +28,8 @@ struct ThreadpoolState {
     std::map<std::uint64_t,std::uint64_t> worker_owners;
     std::map<std::uint64_t,PoolObject> objects;
     std::map<std::uint64_t,PoolInstance> instances;
-    std::uint64_t next_pool{0x110000},next_object{0xe0000},next_instance{0xf0000};
+    std::set<std::uint64_t> groups;
+    std::uint64_t next_pool{0x110000},next_object{0xe0000},next_instance{0xf0000},next_group{0x120000};
     // 執行緒池 I/O 共用的內部完成埠：繫結的檔案以完成鍵＝TP_IO 物件送出完成封包。
     std::uint64_t port{};
 };
@@ -49,9 +54,10 @@ void WindowsServices::collect_threadpools(){
     }
 }
 std::uint64_t WindowsServices::acquire_threadpool_worker(const GuestState& state,GuestMemory& memory,std::uint64_t owner){
-    const auto stack=std::max(UINT64_C(65536),runtime_.image.stack_size);
+    auto stack=std::max(UINT64_C(65536),runtime_.image.stack_size);
     if(!owner)return acquire_wait_worker(state,memory,stack);
     auto& pool=*threadpool_;const auto& definition=pool.pools.at(owner);
+    if(definition.stack_reserve)stack=std::max(UINT64_C(65536),definition.stack_reserve);
     unsigned count=0,busy=0;std::uint64_t idle=0;
     for(const auto& [worker,id]:pool.worker_owners)if(id==owner){++count;if(wait_workers_.at(worker))++busy;else idle=worker;}
     // 調低上限不終止既有回呼；完成前暫停派送新的回呼。
@@ -185,6 +191,51 @@ std::optional<std::uint32_t> WindowsServices::invoke_threadpool(GuestState& stat
         }
         definition.minimum=count;definition.maximum=std::max(definition.maximum,count);return finish(1);
     }
+    if(name=="CreateThreadpoolCleanupGroup"){
+        if(pool.groups.size()>=4096)return finish(0,8);const auto handle=pool.next_group++;pool.groups.insert(handle);return finish(handle);
+    }
+    if(name=="CloseThreadpoolCleanupGroup"){
+        // 仍屬於群組的物件改為不屬於任何群組；之後不能再以此群組建立物件。
+        if(!pool.groups.erase(arg(0)))throw HostCallFault("無效的 Threadpool cleanup group");
+        for(auto& [handle,object]:pool.objects){(void)handle;if(object.group==arg(0))object.group=0;}return finish();
+    }
+    if(name=="CloseThreadpoolCleanupGroupMembers" || name=="ThreadpoolCleanupGroupWait"){
+        // 第一階段關閉所有成員（取消時先清除待執行回呼並呼叫取消回呼），第二階段等待已開始的回呼結束；
+        // 等待沿用 WaitForThreadpool* 的完成等待，執行緒重新進入時直接檢查剩餘成員。
+        const auto group=arg(0);if(!pool.groups.contains(group))throw HostCallFault("無效的 Threadpool cleanup group");
+        auto& caller=threads_.items.at(threads_.current);
+        if(name=="CloseThreadpoolCleanupGroupMembers" && caller.wait.kind!=ThreadWaitKind::ThreadpoolCompletion){
+            std::vector<GuestCallback> callbacks;
+            for(auto it=pool.objects.begin();it!=pool.objects.end();){
+                auto& object=it->second;if(object.group!=group){++it;continue;}
+                object.closed=true;object.armed=false;
+                if(arg(1)){const bool canceled=!object.pending.empty();object.pending.clear();object.io.clear();object.started=0;
+                    if(canceled && object.cancel_callback)callbacks.push_back({object.cancel_callback,{object.context,arg(2)}});}
+                if(!object.outstanding && object.pending.empty())it=pool.objects.erase(it);else ++it;
+            }
+            collect_threadpools();
+            if(!callbacks.empty()){
+                callbacks.push_back({resolve("internal-threadpool","ThreadpoolCleanupGroupWait").value,{group}});
+                start_callbacks(state,memory,std::move(callbacks),Continuation::Return);return std::nullopt;
+            }
+        }
+        std::vector<std::uint64_t> remaining;for(const auto& [handle,object]:pool.objects)if(object.group==group)remaining.push_back(handle);
+        if(remaining.empty()){caller.wait={};return finish();}
+        caller.status=ThreadStatus::Waiting;caller.wait={};caller.wait.kind=ThreadWaitKind::ThreadpoolCompletion;caller.wait.handles=std::move(remaining);
+        schedule(state,memory);return std::nullopt;
+    }
+    if(name=="SetThreadpoolStackInformation" || name=="QueryThreadpoolStackInformation"){
+        // TP_POOL_STACK_INFORMATION：StackReserve、StackCommit（SIZE_T）；未設定時回報程序映像的堆疊大小。
+        const auto found=pool.pools.find(arg(0));if(found==pool.pools.end() || found->second.closed || !arg(1))return finish(0,87);
+        const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);auto& definition=found->second;
+        if(name=="SetThreadpoolStackInformation"){
+            const auto reserve=memory.load(GuestAddress{arg(1)},bits),commit=memory.load(GuestAddress{arg(1)+unit},bits);
+            if(!reserve || commit>reserve)return finish(0,87);definition.stack_reserve=reserve;definition.stack_commit=commit;return finish(1);
+        }
+        memory.check(GuestAddress{arg(1)},2*unit,Access::Write);
+        memory.store(GuestAddress{arg(1)},bits,definition.stack_reserve?definition.stack_reserve:runtime_.image.stack_size);
+        memory.store(GuestAddress{arg(1)+unit},bits,definition.stack_reserve?definition.stack_commit:std::min<std::uint64_t>(runtime_.image.stack_size,0x1000));return finish(1);
+    }
     if(name.starts_with("Create") || name=="TrySubmitThreadpoolCallback"){
         // CreateThreadpoolIo 多一個前置的檔案控制代碼；其餘參數（回呼、context、環境）與其他 Create* 相同。
         const unsigned shift=name=="CreateThreadpoolIo"?1U:0U;
@@ -198,9 +249,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_threadpool(GuestState& stat
             const unsigned flags_at=7*unit;memory.check(GuestAddress{env},version==1?flags_at+4:x86_?40U:72U,Access::Read);
             object.owner=ptr(env+unit);
             if(object.owner){const auto owner=pool.pools.find(object.owner);if(owner==pool.pools.end() || owner->second.closed)return finish(0,87);}
-            if(ptr(env+2*unit) || ptr(env+3*unit) || ptr(env+4*unit) || ptr(env+5*unit))return finish(0,50);
+            object.group=ptr(env+2*unit);object.cancel_callback=ptr(env+3*unit);
+            if(object.group && !pool.groups.contains(object.group))return finish(0,87);
+            if(object.cancel_callback && !handles(GuestAddress{object.cancel_callback}))memory.check(GuestAddress{object.cancel_callback},1,Access::Execute);
+            if(ptr(env+4*unit) || ptr(env+5*unit))return finish(0,50); // RaceDll 與啟用內容尚未提供。
             const auto flags=memory.load(GuestAddress{env+flags_at},32);if(flags&~3U)return finish(0,87);object.long_running=bool(flags&1U);
-            if(flags&2U)return finish(0,50); // 持續指定同一 worker 與 cleanup group 尚未提供。
+            if(flags&2U)return finish(0,50); // 持續指定同一 worker 尚未提供。
             object.finalizer=ptr(env+6*unit);if(object.finalizer && !handles(GuestAddress{object.finalizer}))memory.check(GuestAddress{object.finalizer},1,Access::Execute);
             if(version==3 && (memory.load(GuestAddress{env+flags_at+4},32)!=1 || memory.load(GuestAddress{env+flags_at+8},32)!=(x86_?40U:72U)))return finish(0,50);
         }
@@ -243,8 +297,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_threadpool(GuestState& stat
     if(name=="SubmitThreadpoolWork"){
         if(object.pending.size()>=65536)throw HostCallFault("Threadpool 工作佇列容量不足");object.pending.push_back(0);return finish();
     }
-    if(name=="SetThreadpoolTimer"){
-        const auto due=deadline(arg(1));object.set=arg(1)!=0;object.armed=object.set;object.deadline=due.first;object.absolute_due=due.second;object.period=static_cast<std::uint32_t>(arg(2));return finish();
+    if(name=="SetThreadpoolTimer" || name=="SetThreadpoolTimerEx"){
+        // Ex 版本回傳先前是否已設定且被這次呼叫取消。
+        const bool previous=object.set;const auto due=deadline(arg(1));object.set=arg(1)!=0;object.armed=object.set;object.deadline=due.first;object.absolute_due=due.second;object.period=static_cast<std::uint32_t>(arg(2));return finish(name=="SetThreadpoolTimerEx" && previous?1U:0U);
     }
     if(name=="IsThreadpoolTimerSet")return finish(object.set?1U:0U);
     if(name=="StartThreadpoolIo"){if(object.started==UINT32_MAX)throw HostCallFault("Threadpool I/O 進行中操作數溢位");++object.started;return finish();}
@@ -271,7 +326,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_threadpool(GuestState& stat
         schedule(state,memory);return std::nullopt;
     }
     if(name.starts_with("CloseThreadpool")){
-        object.closed=true;object.armed=false;if(!object.outstanding && object.pending.empty())pool.objects.erase(found);collect_threadpools();return finish();
+        object.closed=true;object.group=0;object.armed=false;if(!object.outstanding && object.pending.empty())pool.objects.erase(found);collect_threadpools();return finish();
     }
     throw HostCallFault("未知的 Threadpool API");
 }

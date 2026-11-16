@@ -4,7 +4,10 @@
 #include <vector>
 namespace x64arm {
 // GetPerformanceInfo 的十個 SIZE_T 欄位，統一以 4 KiB 客體頁表示。
-struct SystemPerformance {std::array<std::uint64_t,10> pages{};std::uint32_t error{};};
+// swap_*：宿主置換空間（對應 Windows 分頁檔），同為 4 KiB 頁；EnumPageFiles 使用。
+struct SystemPerformance {std::array<std::uint64_t,10> pages{};std::uint64_t swap_total_pages{},swap_used_pages{};std::uint32_t error{};};
+// 回報給客體的處理器標稱時脈（MHz）：ETW 記錄檔與閒置週期換算共用。
+inline constexpr std::uint32_t windows_processor_mhz=2400;
 SystemPerformance native_system_performance();
 struct MemoryResourceState {bool low{},high{};std::uint32_t error{};};
 MemoryResourceState system_memory_resource_state(const SystemPerformance&);

@@ -6,7 +6,8 @@ if (service.family == "concrt140.dll" && name.find("@_Concurrent_queue_base_v4@"
     return std::nullopt;
 }
 // Concrt 物件保留 v14 的儲存區大小；私有欄位採共用 SRW／CV 字組，沒有第二套等待佇列。
-if (service.family == "concrt140.dll") {
+// 只處理 critical_section（含 scoped_lock）與 _Condition_variable；其他 Concrt 鎖在 concrt_lock_handlers.inc。
+if (service.family == "concrt140.dll" && (name.find("critical_section@Concurrency@@") != name.npos || name.find("@_Condition_variable@details@Concurrency@@") != name.npos)) {
     const auto self = x86_ ? state.reg(Gpr::Rcx) & UINT32_MAX : call(0);
     const auto argument = [&](unsigned index) { return call(index + (x86_ ? 0U : 1U)); };
     const bool condition = name.find("@_Condition_variable@") != name.npos;

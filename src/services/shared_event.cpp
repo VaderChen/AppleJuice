@@ -62,6 +62,7 @@ struct SharedEventStorage {
     std::shared_ptr<SharedWake> wake;
     int directory{-1},file{-1};EventHeader* data{};std::string name;bool counted{};
     std::array<std::uint64_t,2> identity{};
+    std::uint64_t exclusive_owner{};
     ~SharedEventStorage() {
 #if !defined(_WIN32)
         if(data) {
@@ -74,7 +75,14 @@ struct SharedEventStorage {
 };
 SharedEventLock::SharedEventLock(int value):descriptor(value) {
 #if !defined(_WIN32)
-    if(descriptor>=0)while(::flock(descriptor,LOCK_EX)<0)if(errno!=EINTR)throw HostCallFault("無法鎖定共用事件命名空間");
+    if(descriptor>=0)while(::flock(descriptor,LOCK_EX)<0)if(errno!=EINTR){
+        // 保留真正的宿主錯誤與 fd 狀態，區分生命週期、鎖循環及資源不足；
+        // 不忽略失敗或在未取得鎖時繼續消耗共用物件。
+        const auto error=errno;struct stat info{};const bool valid=::fstat(descriptor,&info)==0;
+        throw HostCallFault("無法鎖定共用事件命名空間 fd="+std::to_string(descriptor)+
+            " errno="+std::to_string(error)+" fd_valid="+std::to_string(valid)+
+            " mode="+std::to_string(valid?info.st_mode:0));
+    }
 #endif
 }
 SharedEventLock::~SharedEventLock(){
@@ -82,6 +90,7 @@ SharedEventLock::~SharedEventLock(){
     if(descriptor>=0)(void)::flock(descriptor,LOCK_UN);
 #endif
 }
+bool SharedEvent::exclusive()const noexcept{return storage_->exclusive_owner!=0;}
 bool SharedEvent::manual_reset()const noexcept{return storage_->data->manual!=0;}
 bool SharedEvent::signaled()const noexcept{return std::atomic_ref(storage_->data->signal).load(std::memory_order_acquire)!=0;}
 std::uint32_t SharedEvent::count()const noexcept{return std::atomic_ref(storage_->data->signal).load(std::memory_order_acquire);}
@@ -115,6 +124,39 @@ void SharedEvent::consume_locked()noexcept{
     if(storage_->data->signature==semaphore_magic){const auto before=count();if(before)std::atomic_ref(storage_->data->signal).store(before-1,std::memory_order_release);}
     else if(!manual_reset())std::atomic_ref(storage_->data->signal).store(0,std::memory_order_release);
 }
+namespace {
+std::uint64_t exclusive_event_owner(int descriptor){
+#if defined(__APPLE__) || defined(__linux__)
+    std::uint64_t owner=0;
+#if defined(__APPLE__)
+    const auto size=::fgetxattr(descriptor,"user.x64arm.exclusive-owner-v1",&owner,sizeof(owner),0,0);
+#else
+    const auto size=::fgetxattr(descriptor,"user.x64arm.exclusive-owner-v1",&owner,sizeof(owner));
+#endif
+    if(size<0 && (errno==ENODATA
+#if defined(__APPLE__)
+        || errno==ENOATTR
+#endif
+        ))return 0;
+    if(size!=sizeof(owner) || !owner)throw SecurityDescriptorError{13};return owner;
+#else
+    (void)descriptor;return 0;
+#endif
+}
+void set_exclusive_event_owner(int descriptor){
+#if defined(__APPLE__) || defined(__linux__)
+    const auto owner=static_cast<std::uint64_t>(::getpid());
+#if defined(__APPLE__)
+    const auto error=::fsetxattr(descriptor,"user.x64arm.exclusive-owner-v1",&owner,sizeof(owner),0,0);
+#else
+    const auto error=::fsetxattr(descriptor,"user.x64arm.exclusive-owner-v1",&owner,sizeof(owner),0);
+#endif
+    if(error)throw SecurityDescriptorError{error_code()};
+#else
+    (void)descriptor;throw SecurityDescriptorError{50};
+#endif
+}
+}
 static OpenSharedEvent inherit_shared_signal(const std::string& session,int descriptor,bool semaphore) {
 #if defined(_WIN32)
     (void)session;(void)descriptor;(void)semaphore;return {{},50};
@@ -124,15 +166,17 @@ static OpenSharedEvent inherit_shared_signal(const std::string& session,int desc
     if(storage->directory<0 || ::fstat(storage->directory,&info) || info.st_uid!=::geteuid() || (info.st_mode&077))return {{},5};
     SharedEventLock lock(storage->directory);EventHeader header;
     if(::fstat(descriptor,&info) || !S_ISREG(info.st_mode) || info.st_uid!=::geteuid() || (info.st_mode&077) || info.st_size!=page_size || ::pread(descriptor,&header,sizeof(header),0)!=sizeof(header) || header.signature!=(semaphore?semaphore_magic:event_magic) || !header.characters || header.characters>=260 || (semaphore && (!header.maximum || header.maximum>INT32_MAX || header.signal>header.maximum)))return {{},6};
+    storage->exclusive_owner=exclusive_event_owner(descriptor);
+    if(storage->exclusive_owner && storage->exclusive_owner!=static_cast<std::uint64_t>(::getpid()))return {{},5};
     storage->identity={static_cast<std::uint64_t>(info.st_dev),static_cast<std::uint64_t>(info.st_ino)};
     const auto mapped=::mmap(nullptr,page_size,PROT_READ|PROT_WRITE,MAP_SHARED,descriptor,0);if(mapped==MAP_FAILED)return {{},8};
     storage->data=static_cast<EventHeader*>(mapped);storage->name=object_name(std::u16string_view(header.name.data(),header.characters));
     ++storage->data->references;storage->counted=true;storage->wake=SharedWake::open(session);return {std::make_shared<SharedEvent>(std::move(storage)),0,false};
 #endif
 }
-static OpenSharedEvent open_shared_signal(const std::string& session,std::u16string name,bool create,bool manual,std::uint32_t initial,std::uint32_t maximum,bool semaphore,const ObjectSecurityFactory& security) {
+static OpenSharedEvent open_shared_signal(const std::string& session,std::u16string name,bool create,bool manual,std::uint32_t initial,std::uint32_t maximum,bool semaphore,const ObjectSecurityFactory& security,bool exclusive=false) {
 #if defined(_WIN32)
-    (void)session;(void)name;(void)create;(void)manual;(void)initial;(void)maximum;(void)semaphore;(void)security;return {{},50};
+    (void)session;(void)name;(void)create;(void)manual;(void)initial;(void)maximum;(void)semaphore;(void)security;(void)exclusive;return {{},50};
 #else
     if(name.starts_with(u"Local\\"))name.erase(0,6);
     if(name.empty() || name.size()>=260 || name.find(u'\\',name.starts_with(u"Global\\")?7:0)!=name.npos)return {{},123};
@@ -146,12 +190,15 @@ static OpenSharedEvent open_shared_signal(const std::string& session,std::u16str
         if(semaphore && (!maximum || maximum>INT32_MAX || initial>maximum)){(void)::unlinkat(storage->directory,storage->name.c_str(),0);return {{},87};}
         EventHeader header;header.signature=semaphore?semaphore_magic:event_magic;header.manual=manual;header.signal=initial;header.maximum=maximum;header.characters=static_cast<std::uint32_t>(name.size());std::copy(name.begin(),name.end(),header.name.begin());
         if(::ftruncate(storage->file,page_size) || ::pwrite(storage->file,&header,sizeof(header),0)!=sizeof(header)) {const auto error=error_code();(void)::unlinkat(storage->directory,storage->name.c_str(),0);return {{},error};}
-        try {if(security)set_shared_object_security(storage->file,security());}
+        try {if(security)set_shared_object_security(storage->file,security());if(exclusive)set_exclusive_event_owner(storage->file);}
         catch(...) {(void)::unlinkat(storage->directory,storage->name.c_str(),0);throw;}
         // 建立者即持有者：第一個從其他程序開啟的呼叫者可免完整掃描。
         detail::named_object_record_holder(storage->file,detail::named_object_page_hint_offset,::getpid(),storage->file);
     }
     if(::fstat(storage->file,&info) || !S_ISREG(info.st_mode) || info.st_uid!=::geteuid() || (info.st_mode&077) || info.st_size!=page_size)return {{},6};
+    storage->exclusive_owner=exclusive_event_owner(storage->file);
+    if(exclusive && !storage->exclusive_owner)return {{},87};
+    if(storage->exclusive_owner && (!exclusive || storage->exclusive_owner!=static_cast<std::uint64_t>(::getpid())))return {{},5};
     storage->identity={static_cast<std::uint64_t>(info.st_dev),static_cast<std::uint64_t>(info.st_ino)};
     auto mapped=::mmap(nullptr,page_size,PROT_READ|PROT_WRITE,MAP_SHARED,storage->file,0);
     if(mapped==MAP_FAILED){const auto error=error_code();if(created)(void)::unlinkat(storage->directory,storage->name.c_str(),0);return {{},error};}
@@ -163,7 +210,7 @@ static OpenSharedEvent open_shared_signal(const std::string& session,std::u16str
 }
 OpenSharedEvent inherit_shared_event(const std::string& session,int descriptor){return inherit_shared_signal(session,descriptor,false);}
 OpenSharedEvent inherit_shared_semaphore(const std::string& session,int descriptor){return inherit_shared_signal(session,descriptor,true);}
-OpenSharedEvent open_shared_event(const std::string& session,std::u16string name,bool create,bool manual,bool initial,const ObjectSecurityFactory& security){return open_shared_signal(session,std::move(name),create,manual,initial,1,false,security);}
+OpenSharedEvent open_shared_event(const std::string& session,std::u16string name,bool create,bool manual,bool initial,const ObjectSecurityFactory& security,bool exclusive){return open_shared_signal(session,std::move(name),create,manual,initial,1,false,security,exclusive);}
 OpenSharedEvent open_shared_semaphore(const std::string& session,std::u16string name,bool create,std::uint32_t initial,std::uint32_t maximum,const ObjectSecurityFactory& security){return open_shared_signal(session,std::move(name),create,false,initial,maximum,true,security);}
 std::vector<std::uint8_t> shared_object_security(int descriptor,bool thread) {
 #if defined(__APPLE__) || defined(__linux__)
@@ -215,6 +262,8 @@ static_assert(sizeof(MutexHeader)<=detail::named_object_page_hint_offset);
 }
 struct SharedMutexStorage {
     int directory{-1},file{-1};MutexHeader* data{};std::string name;bool counted{},lease{};
+    // 釋放／放棄時推進 session 共用喚醒，讓其他程序等待這個 mutex 的協調者不必短輪詢。
+    std::shared_ptr<SharedWake> wake;
     ~SharedMutexStorage(){
 #if !defined(_WIN32)
         if(data){try{SharedEventLock lock(directory);if(counted && data->references && !--data->references)(void)::unlinkat(directory,name.c_str(),0);}catch(...){}::munmap(data,page_size);}
@@ -259,7 +308,7 @@ bool SharedMutex::acquire_locked(std::uint64_t thread){
 std::uint32_t SharedMutex::release_locked(std::uint64_t thread){
 #if !defined(_WIN32)
     auto& data=*storage_->data;if(!storage_->lease || data.thread!=thread || !data.recursion)return 288;
-    if(!--data.recursion){data.process=0;data.thread=0;storage_->lease=false;(void)::flock(storage_->file,LOCK_UN);}return 0;
+    if(!--data.recursion){data.process=0;data.thread=0;storage_->lease=false;(void)::flock(storage_->file,LOCK_UN);if(storage_->wake)storage_->wake->notify();}return 0;
 #else
     (void)thread;return 50;
 #endif
@@ -275,7 +324,7 @@ SharedMutexState SharedMutex::state_locked(){
 void SharedMutex::abandon(std::uint64_t thread){
 #if !defined(_WIN32)
     SharedEventLock lock(storage_->directory);auto& data=*storage_->data;
-    if(storage_->lease && data.thread==thread){data.process=0;data.thread=0;data.recursion=0;data.abandoned=1;storage_->lease=false;(void)::flock(storage_->file,LOCK_UN);}
+    if(storage_->lease && data.thread==thread){data.process=0;data.thread=0;data.recursion=0;data.abandoned=1;storage_->lease=false;(void)::flock(storage_->file,LOCK_UN);if(storage_->wake)storage_->wake->notify();}
 #else
     (void)thread;
 #endif
@@ -308,7 +357,7 @@ OpenSharedMutex open_shared_mutex(const std::string& session,std::u16string name
         return {std::make_shared<SharedMutex>(std::move(cached)),0,true};
     }
     const auto mapped=::mmap(nullptr,page_size,PROT_READ|PROT_WRITE,MAP_SHARED,storage->file,0);if(mapped==MAP_FAILED)return {{},8};
-    storage->data=static_cast<MutexHeader*>(mapped);++storage->data->references;storage->counted=true;
+    storage->data=static_cast<MutexHeader*>(mapped);++storage->data->references;storage->counted=true;storage->wake=SharedWake::open(session);
     mutex_cache[key]=storage;cache_lock.unlock();
     auto mutex=std::make_shared<SharedMutex>(storage);
     if(created && owner){(void)mutex->acquire_locked(owner);storage->data->recursion=recursion;}

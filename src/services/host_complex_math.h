@@ -14,3 +14,18 @@ void x64arm_complex_float(enum X64armComplexKind,const float input[4],float outp
 #ifdef __cplusplus
 }
 #endif
+#ifdef __cplusplus
+#include <complex>
+namespace x64arm {
+// CRT c* 函式與 STL <complex> 共用：float 版本以單精度計算，不經 double 中介。
+template<class T> std::complex<T> host_complex(enum X64armComplexKind kind,std::complex<T> x,std::complex<T> y={}){
+#if defined(__clang__)
+#pragma STDC FENV_ACCESS ON
+#endif
+    const T input[]{x.real(),x.imag(),y.real(),y.imag()};T output[2];
+    if constexpr(sizeof(T)==4)x64arm_complex_float(kind,input,output);
+    else x64arm_complex_double(kind,input,output);
+    return {output[0],output[1]};
+}
+}
+#endif

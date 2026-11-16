@@ -2,6 +2,7 @@
 #include "x64arm/shared_wake.hpp"
 #include <chrono>
 #include "x64arm/windows_services.hpp"
+#include <unicode/uchar.h>
 #include "x64arm/cpu_features.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_paths.hpp"
@@ -129,6 +130,9 @@ std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
         {"kernel32.dll","GetCurrentUmsThread",0},{"kernel32.dll","GetUmsSystemThreadInformation",2},
         {"kernel32.dll","GetComputerNameA",2},{"kernel32.dll","GetComputerNameW",2},
         {"kernel32.dll","GetComputerNameExA",3},{"kernel32.dll","GetComputerNameExW",3},
+        {"kernel32.dll","SetComputerNameA",1},{"kernel32.dll","SetComputerNameW",1},{"kernel32.dll","SetComputerNameExA",2},{"kernel32.dll","SetComputerNameExW",2},
+        {"kernel32.dll","DnsHostnameToComputerNameA",3},{"kernel32.dll","DnsHostnameToComputerNameW",3},
+        {"kernel32.dll","SetEnvironmentStringsA",1},{"kernel32.dll","SetEnvironmentStringsW",1},
         {"netapi32.dll","DsRoleGetPrimaryDomainInformation",3},{"netapi32.dll","DsRoleFreeMemory",1},
         {"netapi32.dll","NetUserGetInfo",4},{"netapi32.dll","NetGetJoinInformation",3},{"netapi32.dll","NetGetAadJoinInformation",2},{"netapi32.dll","NetFreeAadJoinInformation",1},{"netapi32.dll","NetApiBufferFree",1},{"userenv.dll","RegisterGPNotification",2},{"userenv.dll","UnregisterGPNotification",1},
         {"wtsapi32.dll","WTSRegisterSessionNotification",2},{"wtsapi32.dll","WTSUnRegisterSessionNotification",1},
@@ -344,7 +348,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
         }
     }
     else if(symbol=="WTSFreeMemory"){
-        if(arg(0)){if(!runtime_.wts_allocations.contains(arg(0)) || !free_heap(memory,arg(0),state))last_error_=87;else runtime_.wts_allocations.erase(arg(0));}
+        if(arg(0)){if(!runtime_.wts_allocations.contains(arg(0)) || !free_heap(memory,arg(0),state))last_error_=87;else {runtime_.wts_allocations.erase(arg(0));runtime_.wts_allocation_classes.erase(arg(0));}}
     }else if(symbol.starts_with("WTSQuerySessionInformation")){
         if(!arg(3) || !arg(4))last_error_=87;
         else{
@@ -381,38 +385,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
             if(const auto power=native_power_status()){memory.write(GuestAddress{arg(0)},*power);result=1;}else last_error_=50;
         }
     }else if(symbol=="NtQuerySystemInformation") {
-        if(static_cast<std::uint32_t>(arg(0))!=8)result=0xc0000003; // STATUS_INVALID_INFO_CLASS。
-        else if(runtime_.processor_count>1)result=0xc0000002; // 尚未分攤各 vCPU 的宿主 CPU 時間，不能回傳單核心大小的假資料。
-        else {
-            if(arg(3))memory.store(GuestAddress{arg(3)},32,48);
-            if(static_cast<std::uint32_t>(arg(2))<48)result=0xc0000004;
-            else if(!arg(1))result=0xc0000005;
-            else {
-                memory.check(GuestAddress{arg(1)},48,Access::Write);
-                std::uint64_t user=runtime_.clock_ticks,kernel=0,idle=0;
-                if(runtime_.host_clock) {
-                    const auto cpu=host_process_cpu_time();
-                    if(!cpu)result=0xc0000002;
-                    else {
-                        const auto current_user=cpu->user,current_kernel=cpu->kernel;
-                        if(runtime_.processor_sample_initialized) {
-                            const auto user_delta=current_user-runtime_.processor_sample_user,kernel_delta=current_kernel-runtime_.processor_sample_kernel;
-                            const auto elapsed=runtime_.clock_ticks-runtime_.processor_sample_clock;
-                            runtime_.processor_user+=user_delta;runtime_.processor_kernel+=kernel_delta;
-                            // 這個程序是單一 vCPU 的執行器；等待與未獲宿主 CPU 的時間算 idle。
-                            runtime_.processor_idle+=elapsed>user_delta+kernel_delta?elapsed-user_delta-kernel_delta:0;
-                        }
-                        runtime_.processor_sample_initialized=true;runtime_.processor_sample_clock=runtime_.clock_ticks;
-                        runtime_.processor_sample_user=current_user;runtime_.processor_sample_kernel=current_kernel;
-                        user=runtime_.processor_user;idle=runtime_.processor_idle;kernel=runtime_.processor_kernel+idle;
-                    }
-                }
-                if(!result) {
-                    memory.write(GuestAddress{arg(1)},std::array<std::uint8_t,48>{});
-                    memory.store(GuestAddress{arg(1)},64,idle);memory.store(GuestAddress{arg(1)+8},64,kernel);memory.store(GuestAddress{arg(1)+16},64,user);
-                }
-            }
-        }
+        result=query_system_information(memory,static_cast<std::uint32_t>(arg(0)),arg(1),static_cast<std::uint32_t>(arg(2)),arg(3));
     } else if(symbol=="RegisterTraceGuidsA" || symbol=="RegisterTraceGuidsW") {
         const auto count=static_cast<std::uint32_t>(arg(3));const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
         if(!arg(0) || !arg(2) || !arg(7) || (count && !arg(4)) || arg(5) || arg(6) || count>1024)result=87;
@@ -761,6 +734,67 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
                 if (remove) runtime_.crt_environment.erase(key);else runtime_.crt_environment[key]={name,value};
                 rebuild_crt_environment(memory,state);
             } else result=1;
+        }
+    } else if (symbol=="SetEnvironmentStringsA" || symbol=="SetEnvironmentStringsW") {
+        // 以新的多字串完整取代程序環境；格式與 CreateProcess 的環境區塊相同，CRT 自己的副本不受影響。
+        if (!arg(0)) last_error_=87;
+        else {
+            const unsigned width=wide?2U:1U;std::vector<std::uint8_t> bytes;
+            for(std::uint64_t at=arg(0);;at+=width){
+                std::array<std::uint8_t,2> unit{};memory.read(GuestAddress{at},std::span(unit).first(width));bytes.insert(bytes.end(),unit.begin(),unit.begin()+width);
+                const auto size=bytes.size();if(size>=2*width && std::all_of(bytes.end()-2*width,bytes.end(),[](std::uint8_t b){return b==0;}))break;
+                if(size>16U*1024U*1024U)throw HostCallFault("SetEnvironmentStrings 環境區塊超過上限");
+            }
+            if(const auto parsed=decode_guest_environment(bytes,wide)){runtime_.environment=*parsed;result=1;}else last_error_=87;
+        }
+    } else if (symbol=="DnsHostnameToComputerNameA" || symbol=="DnsHostnameToComputerNameW") {
+        // NetBIOS 名稱取第一個 label，轉大寫並截到 15 字元；緩衝區不足回 ERROR_MORE_DATA 與所需大小。
+        if (!arg(0) || !arg(2)) last_error_=87;
+        else {
+            auto name=text(0);name.resize(std::min(name.find(u'.'),name.size()));if(name.size()>15)name.resize(15);
+            for(auto& c:name)c=static_cast<char16_t>(u_toupper(c));
+            const auto bytes=encode(name);const auto required=static_cast<std::uint32_t>(bytes.size()/(wide?2U:1U));
+            const auto capacity=memory.load(GuestAddress{arg(2)},32);memory.check(GuestAddress{arg(2)},4,Access::Write);
+            if(!arg(1) || capacity<required){memory.store(GuestAddress{arg(2)},32,required);last_error_=234;}
+            else {memory.write(GuestAddress{arg(1)},bytes);memory.store(GuestAddress{arg(2)},32,required-1);result=1;}
+        }
+    } else if (symbol.starts_with("SetComputerName")) {
+        // 新名稱寫入登錄，重新開機後才生效（與 Windows 相同），GetComputerName 仍回報目前名稱。
+        // 經 RegSetKeyValueW 寫入，沿用登錄的 ACL、交易與通知契約；DNS 主機名稱同時更新 NetBIOS 名稱。
+        const bool extended=symbol.starts_with("SetComputerNameEx");const auto type=extended?static_cast<std::uint32_t>(arg(0)):4U;const unsigned index=extended?1U:0U;
+        const auto netbios=[](std::u16string_view name){
+            if(name.empty() || name.size()>15)return false;
+            for(const auto c:name)if(!((c>=u'0'&&c<=u'9')||(c>=u'a'&&c<=u'z')||(c>=u'A'&&c<=u'Z')||std::u16string_view(u"!@#$%^&')(.-_{}~").find(c)!=std::u16string_view::npos))return false;
+            return true;};
+        const auto dns=[](std::u16string_view name,bool domain){
+            if(name.empty() || name.size()>(domain?255U:63U))return false;std::size_t label=0;
+            for(const auto c:name){if(c==u'.'){if(!domain || !label)return false;label=0;continue;}
+                if(!((c>=u'0'&&c<=u'9')||(c>=u'a'&&c<=u'z')||(c>=u'A'&&c<=u'Z')||c==u'-'||c==u'_') || ++label>63)return false;}
+            return label>0;};
+        if(!arg(index) || (type!=0 && type!=1 && type!=2 && type!=4 && type!=5 && type!=6))last_error_=87;
+        else {
+            const auto name=text(index);const bool hostname=type==1 || type==5,domain=type==2 || type==6;
+            if(!(hostname?dns(name,false):domain?dns(name,true):netbios(name)))last_error_=87;
+            else {
+                const std::u16string tcpip=u"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters",computer=u"SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ComputerName";
+                std::vector<std::array<std::u16string,3>> writes;
+                if(hostname){auto converted=name.substr(0,15);for(auto& c:converted)c=static_cast<char16_t>(u_toupper(c));writes.push_back({tcpip,u"NV Hostname",name});writes.push_back({computer,u"ComputerName",converted});}
+                else if(domain)writes.push_back({tcpip,u"NV Domain",name});
+                else writes.push_back({computer,u"ComputerName",name});
+                std::vector<std::uint8_t> storage;std::vector<std::array<std::uint64_t,3>> offsets;
+                for(const auto& item:writes){std::array<std::uint64_t,3> at{};for(unsigned k=0;k<3;++k){at[k]=storage.size();const auto bytes=utf16_bytes(item[k]);storage.insert(storage.end(),bytes.begin(),bytes.end());}offsets.push_back(at);}
+                const auto buffer=allocate_heap(memory,storage.size());
+                if(!buffer)last_error_=8;
+                else {
+                    try{
+                        memory.write(GuestAddress{buffer},storage);std::vector<GuestCallback> callbacks;
+                        for(std::size_t i=0;i<writes.size();++i)callbacks.push_back({resolve("advapi32.dll","RegSetKeyValueW").value,
+                            {0x80000002U,buffer+offsets[i][0],buffer+offsets[i][1],1,buffer+offsets[i][2],(writes[i][2].size()+1)*2}});
+                        start_callbacks(state,memory,std::move(callbacks),Continuation::RegistryBooleanResult,buffer);
+                    }catch(...){(void)free_heap(memory,buffer,state);throw;}
+                    return std::nullopt;
+                }
+            }
         }
     } else if (symbol.starts_with("GetEnvironmentStrings")) {
         std::vector<std::uint8_t> bytes;

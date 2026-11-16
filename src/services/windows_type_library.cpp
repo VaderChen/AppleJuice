@@ -46,7 +46,9 @@ std::string library_directory(std::string_view path){
     const auto file=utf16_to_utf8(library_path(wide(path)).file);const auto slash=file.find_last_of("/\\");
     return slash==file.npos?std::string{}:file.substr(0,slash+1);
 }
-std::u16string registry_root(const WindowsGuid& guid){return std::u16string(1,0)+u"\\typelib\\"+folded(windows_guid_text(guid));}
+// hive 0＝HKCR；1＝HKCU\Software\Classes（RegisterTypeLibForUser）。
+std::u16string classes_root(unsigned hive){return hive?std::u16string(1,static_cast<char16_t>(hive))+u"\\software\\classes":std::u16string(1,0);}
+std::u16string registry_root(const WindowsGuid& guid,unsigned hive=0){return classes_root(hive)+u"\\typelib\\"+folded(windows_guid_text(guid));}
 const typelib::TypeInfo* by_reference(const typelib::Library& lib,std::uint32_t ref){
     const auto found=std::find_if(lib.types.begin(),lib.types.end(),[&](const auto& t){return t.reference==ref;});return found==lib.types.end()?nullptr:&*found;
 }
@@ -92,6 +94,7 @@ std::span<const WindowsServiceDescriptor> type_library_service_descriptors(){
         {"internal-type-compiler","Bind",7},{"internal-type-compiler","BindType",5},
         {"oleaut32.dll","LoadTypeLib",2},{"oleaut32.dll","LoadRegTypeLib",5},{"oleaut32.dll","LoadTypeLibEx",3},
         {"oleaut32.dll","UnRegisterTypeLib",5},{"oleaut32.dll","RegisterTypeLib",3},
+        {"oleaut32.dll","UnRegisterTypeLibForUser",5},{"oleaut32.dll","RegisterTypeLibForUser",3},{"oleaut32.dll","QueryPathOfRegTypeLib",5},
         {"internal-type-library","QueryInterface",3},{"internal-type-library","AddRef",1},{"internal-type-library","Release",1},
         {"internal-type-library","GetTypeInfoCount",1},{"internal-type-library","GetTypeInfo",3},{"internal-type-library","GetTypeInfoType",3},
         {"internal-type-library","GetTypeInfoOfGuid",3},{"internal-type-library","GetLibAttr",2},{"internal-type-library","GetTypeComp",2},
@@ -219,11 +222,11 @@ std::uint32_t WindowsServices::release_type_library(GuestState& state,GuestMemor
     bridge.views.erase(found);(void)free_heap(memory,object,state);
     if(info)(void)release_type_library(state,memory,library);return 0;
 }
-void WindowsServices::register_type_library(std::uint64_t pointer,std::u16string_view path,std::u16string_view help_directory){
+void WindowsServices::register_type_library(std::uint64_t pointer,std::u16string_view path,std::u16string_view help_directory,unsigned hive){
     const auto& view=runtime_.type_libraries.views.at(pointer);const auto& lib=*view.data;
     if(!registry_file_.empty() && !runtime_.network.external_io)failure(registry_error);
     RegistryTransaction transaction(runtime_.registry,registry_file_);if(transaction.error)failure(registry_error);
-    auto next=runtime_.registry;const auto version=registry_root(lib.guid)+u"\\"+hex(lib.major)+u"."+hex(lib.minor);
+    auto next=runtime_.registry;const auto version=registry_root(lib.guid,hive)+u"\\"+hex(lib.major)+u"."+hex(lib.minor);
     const auto set=[&](std::u16string key,std::u16string value,std::u16string name=u""){
         key=registry_view_path(std::move(key),registry_view(0,x86_));
         auto bytes=utf16_bytes(value);
@@ -246,7 +249,7 @@ void WindowsServices::register_type_library(std::uint64_t pointer,std::u16string
     for(const auto& type:lib.types){
         if(type.kind!=4 && !(type.kind==3 && (type.flags&0x100U)))continue;
         if(std::none_of(type.guid.begin(),type.guid.end(),[](auto byte){return byte!=0;}))continue;
-        const auto key=std::u16string(1,0)+u"\\interface\\"+folded(windows_guid_text(type.guid));
+        const auto key=classes_root(hive)+u"\\interface\\"+folded(windows_guid_text(type.guid));
         const auto proxy=next.keys.find(registry_view_path(key+u"\\proxystubclsid32",registry_view(0,x86_)));
         // 已安裝的自訂 proxy 由原提供者管理；不以 Automation proxy 覆寫。
         if(type.kind==3 && proxy!=next.keys.end() && proxy->second.contains(u""))continue;
@@ -256,45 +259,61 @@ void WindowsServices::register_type_library(std::uint64_t pointer,std::u16string
     }
     const auto previous=runtime_.registry;runtime_.registry=std::move(next);
     if(transaction.commit()){runtime_.registry=previous;failure(registry_error);}
-    poll_registry_notifications(false,registry_root(lib.guid),5);
-    if(interfaces)poll_registry_notifications(false,registry_view_path(std::u16string(1,0)+u"\\interface",registry_view(0,x86_)),5);
+    poll_registry_notifications(false,registry_root(lib.guid,hive),5);
+    if(interfaces)poll_registry_notifications(false,registry_view_path(classes_root(hive)+u"\\interface",registry_view(0,x86_)),5);
 }
 std::u16string WindowsServices::registered_type_library(const WindowsGuid& guid,std::uint16_t major,std::uint16_t minor,std::uint32_t lcid){
     if(!registry_file_.empty() && !runtime_.network.external_io)failure(registry_error);
     RegistryTransaction transaction(runtime_.registry,registry_file_);if(transaction.error)failure(registry_error);
-    const auto prefix=registry_root(guid)+u"\\";std::optional<unsigned> chosen;
-    for(const auto& [path,values]:runtime_.registry.keys){
-        (void)values;if(!path.starts_with(prefix))continue;const auto part=std::u16string_view(path).substr(prefix.size());
-        if(part.find(u'\\')!=part.npos)continue;const auto dot=part.find(u'.');if(dot==part.npos)continue;
-        const auto ma=unhex(part.substr(0,dot)),mi=unhex(part.substr(dot+1));if(!ma || !mi || *ma!=major || *mi<minor || *mi>0xffff)continue;
-        if(*mi==minor){chosen=minor;break;}if(!chosen || *mi>*chosen)chosen=*mi;
-    }
-    if(!chosen)failure(notregistered);const auto version=prefix+hex(major)+u"."+hex(*chosen);
-    for(const auto locale:{lcid,lcid&0x3ffU,0U})for(const auto platform:{x86_?u"win32":u"win64",x86_?u"win64":u"win32"}){
-        const auto key=runtime_.registry.keys.find(version+u"\\"+hex(locale)+u"\\"+platform);if(key==runtime_.registry.keys.end())continue;
-        const auto value=key->second.find(u"");if(value==key->second.end() || value->second.type!=1 || value->second.bytes.size()%2)continue;
-        std::u16string result;for(std::size_t at=0;at<value->second.bytes.size();at+=2){const auto c=static_cast<char16_t>(value->second.bytes[at]|unsigned(value->second.bytes[at+1])<<8);if(!c)break;result+=c;}
-        if(!result.empty())return result;
+    // 與 HKCR 合併檢視相同：每位使用者的 Software\Classes 優先於共用登錄。
+    for(const unsigned hive:{1U,0U}){
+        const auto prefix=registry_root(guid,hive)+u"\\";std::optional<unsigned> chosen;
+        for(const auto& [path,values]:runtime_.registry.keys){
+            (void)values;if(!path.starts_with(prefix))continue;const auto part=std::u16string_view(path).substr(prefix.size());
+            if(part.find(u'\\')!=part.npos)continue;const auto dot=part.find(u'.');if(dot==part.npos)continue;
+            const auto ma=unhex(part.substr(0,dot)),mi=unhex(part.substr(dot+1));if(!ma || !mi || *ma!=major || *mi<minor || *mi>0xffff)continue;
+            if(*mi==minor){chosen=minor;break;}if(!chosen || *mi>*chosen)chosen=*mi;
+        }
+        if(!chosen)continue;const auto version=prefix+hex(major)+u"."+hex(*chosen);
+        for(const auto locale:{lcid,lcid&0x3ffU,0U})for(const auto platform:{x86_?u"win32":u"win64",x86_?u"win64":u"win32"}){
+            const auto key=runtime_.registry.keys.find(version+u"\\"+hex(locale)+u"\\"+platform);if(key==runtime_.registry.keys.end())continue;
+            const auto value=key->second.find(u"");if(value==key->second.end() || value->second.type!=1 || value->second.bytes.size()%2)continue;
+            std::u16string result;for(std::size_t at=0;at<value->second.bytes.size();at+=2){const auto c=static_cast<char16_t>(value->second.bytes[at]|unsigned(value->second.bytes[at+1])<<8);if(!c)break;result+=c;}
+            if(!result.empty())return result;
+        }
     }
     failure(notregistered);
 }
 std::optional<std::uint32_t> WindowsServices::invoke_type_library(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;auto& bridge=runtime_.type_libraries;
-    if(name=="RegisterTypeLib" && arg(0) && !bridge.views.contains(arg(0))){
+    const bool per_user=name=="RegisterTypeLibForUser" || name=="UnRegisterTypeLibForUser";
+    if((name=="RegisterTypeLib" || name=="RegisterTypeLibForUser") && arg(0) && !bridge.views.contains(arg(0))){
 #include "type_library_register_external.inc"
     }
-    if(name=="RegisterTypeLib"){
+    if(name=="RegisterTypeLib" || name=="RegisterTypeLibForUser"){
         std::uint32_t result=0;
         try{
             if(!arg(0) || !arg(1))failure(0x80070057U);
             if(!bridge.views.contains(arg(0)))failure(0x80028029U);
             const auto path=read_utf16(memory,GuestAddress{arg(1)});if(path.empty())failure(0x80070057U);
             const auto help=arg(2)?read_utf16(memory,GuestAddress{arg(2)}):std::u16string{};
-            register_type_library(arg(0),path,help);
+            register_type_library(arg(0),path,help,per_user?1U:0U);
         }catch(const typelib::Error& error){result=error.code;}catch(const MemoryFault&){result=0x80070057U;}catch(const std::bad_alloc&){result=0x8007000eU;}
         arg.return_to(state,result);return std::nullopt;
     }
-    if(name=="UnRegisterTypeLib"){
+    if(name=="QueryPathOfRegTypeLib"){
+        // 與 LoadRegTypeLib 共用版本、LCID 與平台的選擇規則，回傳登錄中的路徑。
+        std::uint32_t result=0;
+        try{
+            if(!arg(0) || !arg(4))failure(0x80070057U);memory.check(GuestAddress{arg(4)},x86_?4:8,Access::Write);
+            WindowsGuid guid{};memory.read(GuestAddress{arg(0)},guid);
+            const auto path=registered_type_library(guid,static_cast<std::uint16_t>(arg(1)),static_cast<std::uint16_t>(arg(2)),static_cast<std::uint32_t>(arg(3)));
+            auto data=utf16_bytes(path);data.resize(path.size()*2);const auto text=allocate_bstr(memory,data.size(),data);if(!text)failure(0x8007000eU);
+            memory.store(GuestAddress{arg(4)},x86_?32:64,text);
+        }catch(const typelib::Error& error){result=error.code;}catch(const MemoryFault&){result=0x80070057U;}catch(const std::bad_alloc&){result=0x8007000eU;}
+        arg.return_to(state,result);return std::nullopt;
+    }
+    if(name=="UnRegisterTypeLib" || name=="UnRegisterTypeLibForUser"){
         // 移除 TypeLib\{libid}\{major.minor}\{lcid}\{win16|win32|win64}；該版本沒有其他 LCID 時一併移除版本鍵，
         // 該 LIBID 沒有其他版本時移除 GUID 鍵。刪除經 RegDeleteTreeW／RegDeleteKeyW，沿用登錄日誌與 ACL。
         const auto finish=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
@@ -315,7 +334,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_type_library(GuestState& st
                 const auto children=[&](const std::u16string& path){std::vector<std::u16string> names;const auto prefix=path+u"\\";
                     for(auto item=runtime_.registry.keys.lower_bound(prefix);item!=runtime_.registry.keys.end() && item->first.starts_with(prefix);++item){const auto rest=item->first.substr(prefix.size());if(rest.find(u'\\')==rest.npos)names.push_back(rest);}
                     return names;};
-                for(const unsigned root_hive:{1U,0U,2U}){
+                // ForUser 只處理目前使用者的 Software\Classes；一般版本依 HKCR 合併順序尋找。
+                for(const unsigned root_hive:per_user?std::vector<unsigned>{1U}:std::vector<unsigned>{1U,0U,2U}){
                     const auto root=root_hive?std::u16string(1,static_cast<char16_t>(root_hive))+u"\\software\\classes":std::u16string(1,0);
                     const auto base=registry_view_path(root+u"\\"+relative,registry_view(0,x86_));
                     if(!runtime_.registry.keys.contains(base+u"\\"+version+u"\\"+lcid+u"\\"+sys))continue;

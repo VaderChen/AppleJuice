@@ -26,6 +26,13 @@ struct ConsoleSnapshot {
     std::uint16_t columns{80},rows{25},x{},y{},attributes{7};
     std::uint16_t left{},top{},view_columns{80},view_rows{25};
     std::uint32_t cursor_size{25};bool cursor_visible{true},fullscreen{};
+    // CONSOLE_SCREEN_BUFFER_INFOEX 的色表（COLORREF 0x00BBGGRR）與彈出視窗屬性；原生視窗依此繪製。
+    std::array<std::uint32_t,16> colors{0x000000,0x800000,0x008000,0x808000,0x000080,0x800080,0x008080,0xc0c0c0,
+                                        0x404040,0xff4040,0x40ff40,0xffff40,0x4040ff,0xff40ff,0x40ffff,0xffffff};
+    std::uint16_t popup_attributes{0xf5};
+    // 目前字型：儲存格像素大小與 CONSOLE_FONT_INFOEX 的字族、粗細、字面名稱；原生視窗依此排版。
+    std::uint16_t font_width{9},font_height{18};std::uint32_t font_family{0x36},font_weight{400};
+    std::u16string font_face{u"SF Mono"};
 };
 class ConsoleWindow {
 public:
@@ -37,19 +44,29 @@ public:
     virtual void* native_view() {return nullptr;}
     virtual bool bind_native_window(void*) {return false;}
     virtual std::array<std::uint16_t,2> maximum_size() const {return {32767,32767};}
+    virtual bool set_fullscreen(bool) {return false;}
 };
 std::unique_ptr<ConsoleWindow> create_console_window();
 struct ConsoleBuffer : ConsoleSnapshot {
     struct ConioCharacter {std::uint16_t value{};bool echo{};};
     ConsoleBuffer();
-    std::deque<ConsoleRecord> records,ansi_records;
+    std::deque<ConsoleRecord> records,ansi_records,ansi_input_records;
     std::deque<ConioCharacter> conio_bytes,conio_units;
     char16_t conio_output_high{};
     std::unique_ptr<ConsoleWindow> window;
     std::uint64_t window_handle{};
     std::string terminal_input,output_utf8,escape;
     std::uint32_t input_mode{7},output_mode{7};
+    std::uint32_t input_codepage{65001},output_codepage{65001};
+    std::string output_codepage_pending;
     bool eof{};std::u16string edited_line,echo_input;
+    std::u16string original_title{title};
+    // 別名與命令歷程依執行檔名稱分組（名稱不分大小寫）；歷程只記錄行輸入模式送出的非空命令。
+    struct Alias {std::u16string source,target;};
+    struct AliasTable {std::u16string exe;std::vector<Alias> entries;};
+    struct History {std::u16string exe;std::deque<std::u16string> commands;};
+    std::vector<AliasTable> aliases;std::vector<History> histories;
+    std::uint32_t history_size{50},history_buffers{4},history_flags{};
     void resize(std::uint16_t,std::uint16_t,bool preserve_viewport=false);
     void resize_viewport(std::uint16_t,std::uint16_t);
     void reveal_cursor();

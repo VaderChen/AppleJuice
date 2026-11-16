@@ -1,3 +1,4 @@
+#include "windows_system_info_layout.hpp"
 #include "x64arm/windows_services.hpp"
 #include "crt_os_error.hpp"
 #include "bluetooth_sdp.hpp"
@@ -88,6 +89,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"wldap32.dll","#50",7,0,0,0,true},
         {"wldap32.dll","#60",3,0,0,0,true},
         {"wldap32.dll","#79",1,0,0,0,true},
+#include "ldap_extended_descriptors.inc"
 
         {"x3daudio1_7.dll","X3DAudioInitialize",3,0,0,0,true},
         {"x3daudio1_7.dll","X3DAudioCalculate",5,0,0,0,true},
@@ -154,6 +156,24 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         CM_SERVICE("CM_Get_Device_Interface_PropertyW",6,0x20),CM_SERVICE("CM_Get_Device_Interface_Property_ExW",7,0x20),
         CM_SERVICE("CM_Get_Device_Interface_Property_KeysW",4,0x8),CM_SERVICE("CM_Get_Device_Interface_Property_Keys_ExW",5,0x8),
         CM_SERVICE("CM_Set_Device_Interface_PropertyW",6,0x34),CM_SERVICE("CM_Set_Device_Interface_Property_ExW",7,0x34),
+        // CM_*_Ex：基本版加上最後一個 hMachine，窄引數遮罩與基本版相同。
+        CM_SERVICE("CM_Get_Child_Ex",4,6),CM_SERVICE("CM_Get_Parent_Ex",4,6),CM_SERVICE("CM_Get_Sibling_Ex",4,6),CM_SERVICE("CM_Get_DevNode_Status_Ex",5,12),
+        CM_SERVICE("CM_Get_Device_ID_ExA",5,13),CM_SERVICE("CM_Get_Device_ID_ExW",5,13),CM_SERVICE("CM_Get_Device_ID_Size_Ex",4,6),
+        CM_SERVICE("CM_Get_Device_ID_List_ExA",5,12),CM_SERVICE("CM_Get_Device_ID_List_ExW",5,12),CM_SERVICE("CM_Get_Device_ID_List_Size_ExA",4,4),CM_SERVICE("CM_Get_Device_ID_List_Size_ExW",4,4),
+        CM_SERVICE("CM_Get_DevNode_Registry_Property_ExA",7,35),CM_SERVICE("CM_Get_DevNode_Registry_Property_ExW",7,35),CM_SERVICE("CM_Get_DevNode_Property_ExW",7,33),
+        CM_SERVICE("CM_Locate_DevNode_ExA",4,4),CM_SERVICE("CM_Locate_DevNode_ExW",4,4),CM_SERVICE("CM_Open_DevNode_Key_Ex",7,47),
+        CM_SERVICE("CM_Get_Device_Interface_List_ExA",6,0x18),CM_SERVICE("CM_Get_Device_Interface_List_ExW",6,0x18),
+        CM_SERVICE("CM_Get_Device_Interface_List_Size_ExA",5,8),CM_SERVICE("CM_Get_Device_Interface_List_Size_ExW",5,8),
+        CM_SERVICE("CM_Reenumerate_DevNode",2,3),CM_SERVICE("CM_Reenumerate_DevNode_Ex",3,3),
+        CM_SERVICE("CM_Connect_MachineA",2,0),CM_SERVICE("CM_Connect_MachineW",2,0),CM_SERVICE("CM_Disconnect_Machine",1,0),CM_SERVICE("CM_Get_Version",0,0),CM_SERVICE("CMP_WaitNoPendingInstallEvents",1,1),
+        CM_SERVICE("CM_Enumerate_EnumeratorsA",4,9),CM_SERVICE("CM_Enumerate_EnumeratorsW",4,9),CM_SERVICE("CM_Enumerate_Enumerators_ExA",5,9),CM_SERVICE("CM_Enumerate_Enumerators_ExW",5,9),
+        CM_SERVICE("CM_Get_Device_Interface_AliasA",5,16),CM_SERVICE("CM_Get_Device_Interface_AliasW",5,16),
+        CM_SERVICE("CM_Enumerate_Classes",3,5),CM_SERVICE("CM_Enumerate_Classes_Ex",4,5),
+        CM_SERVICE("CM_Get_Class_Key_NameA",4,8),CM_SERVICE("CM_Get_Class_Key_NameW",4,8),CM_SERVICE("CM_Get_Class_Key_Name_ExA",5,8),CM_SERVICE("CM_Get_Class_Key_Name_ExW",5,8),
+        CM_SERVICE("CM_Open_Class_KeyA",6,0x2c),CM_SERVICE("CM_Open_Class_KeyW",6,0x2c),CM_SERVICE("CM_Open_Class_Key_ExA",7,0x2c),CM_SERVICE("CM_Open_Class_Key_ExW",7,0x2c),
+        CM_SERVICE("CM_Get_Class_Registry_PropertyA",7,0x22),CM_SERVICE("CM_Get_Class_Registry_PropertyW",7,0x22),CM_SERVICE("CM_Set_Class_Registry_PropertyA",6,0x1a),CM_SERVICE("CM_Set_Class_Registry_PropertyW",6,0x1a),
+        {"cfgmgr32.dll","CM_Get_DevNode_Property_Keys",4,0,0,9},{"cfgmgr32.dll","CM_Get_DevNode_Property_Keys_Ex",5,0,0,9},
+        {"cfgmgr32.dll","CM_Get_Class_PropertyW",6,0,0,32},{"cfgmgr32.dll","CM_Get_Class_Property_ExW",7,0,0,32},{"cfgmgr32.dll","CM_Get_Class_Property_Keys",4,0,0,8},{"cfgmgr32.dll","CM_Get_Class_Property_Keys_Ex",5,0,0,8},
         {"setupapi.dll","SetupDiGetDeviceInterfacePropertyW",8,0,0,0xa0},
         {"setupapi.dll","SetupDiGetDeviceInterfacePropertyKeys",6,0,0,0x28},{"setupapi.dll","SetupDiSetDeviceInterfacePropertyW",7,0,0,0x68},
         {"secur32.dll","GetUserNameExA",3},{"secur32.dll","GetUserNameExW",3},{"advapi32.dll","GetUserNameA",2},{"advapi32.dll","GetUserNameW",2},
@@ -167,7 +187,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"shell32.dll", "CommandLineToArgvW", 2}, {"kernel32.dll", "LocalFree", 1},
         {"kernel32.dll","LocalAlloc",2},{"kernel32.dll","LocalLock",1},{"kernel32.dll","LocalUnlock",1},
         {"kernel32.dll","LocalReAlloc",3},{"faultrep.dll","ReportFault",2},
-        {"kernel32.dll","RtlCaptureStackBackTrace",4},{"ntdll.dll","RtlCaptureStackBackTrace",4},
+        {"kernel32.dll","RtlCaptureStackBackTrace",4},{"ntdll.dll","RtlCaptureStackBackTrace",4},{"ntdll.dll","RtlWalkFrameChain",3},
         {"kernel32.dll","CaptureStackBackTrace",4},
         {"ntdll.dll","RtlGetCallersAddress",2},
         {"kernel32.dll","CreateNamedPipeA",8},{"kernel32.dll","CreateNamedPipeW",8},
@@ -175,6 +195,8 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll","PeekNamedPipe",6},{"kernel32.dll","TransactNamedPipe",7},
         {"kernel32.dll","SetNamedPipeHandleState",4},{"kernel32.dll","GetNamedPipeInfo",5},
         {"kernel32.dll","GetNamedPipeClientProcessId",2},{"kernel32.dll","GetNamedPipeServerProcessId",2},
+        {"kernel32.dll","GetNamedPipeClientSessionId",2},{"kernel32.dll","GetNamedPipeServerSessionId",2},
+        {"kernel32.dll","GetNamedPipeClientComputerNameA",3},{"kernel32.dll","GetNamedPipeClientComputerNameW",3},
         {"kernel32.dll","GetNamedPipeHandleStateA",7},{"kernel32.dll","GetNamedPipeHandleStateW",7},
         {"kernel32.dll","WaitNamedPipeA",2},{"kernel32.dll","WaitNamedPipeW",2},
         {"kernel32.dll","CallNamedPipeA",7},{"kernel32.dll","CallNamedPipeW",7},
@@ -187,12 +209,10 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"crt","_encode_pointer",1},{"crt","_decode_pointer",1},{"crt","_encoded_null",0},
         {"kernel32.dll","LocalFlags",1},{"kernel32.dll","LocalSize",1},{"kernel32.dll","LocalHandle",1},
         {"kernel32.dll", "SetConsoleCtrlHandler", 2},
-        {"kernel32.dll", "GetSystemDefaultLangID", 0},{"kernel32.dll", "GetUserDefaultLangID", 0},{"kernel32.dll", "GetThreadUILanguage", 0},{"kernel32.dll", "GetUserDefaultUILanguage", 0},
+        {"kernel32.dll", "GetSystemDefaultLangID", 0},{"kernel32.dll", "GetUserDefaultLangID", 0},{"kernel32.dll", "GetUserDefaultUILanguage", 0},
         {"kernel32.dll","GetSystemDefaultUILanguage",0},{"kernel32.dll","GetSystemDefaultLCID",0},
-        {"kernel32.dll","GetGeoInfoA",5},{"kernel32.dll","GetGeoInfoW",5},{"kernel32.dll","GetUserGeoID",1},{"kernel32.dll","GetUserDefaultLocaleName",2},{"kernel32.dll","GetSystemDefaultLocaleName",2},
-        {"kernel32.dll","GetUserDefaultLCID",0},{"kernel32.dll","GetThreadLocale",0},
-        {"kernel32.dll","GetThreadPreferredUILanguages",4},{"kernel32.dll","GetUserPreferredUILanguages",4},
-        {"kernel32.dll","GetSystemPreferredUILanguages",4},
+        {"kernel32.dll","GetUserDefaultLocaleName",2},{"kernel32.dll","GetSystemDefaultLocaleName",2},
+        {"kernel32.dll","GetUserDefaultLCID",0},
         {"kernel32.dll", "SetFileApisToOEM", 0},{"kernel32.dll", "SetFileApisToANSI", 0},{"kernel32.dll", "AreFileApisANSI", 0},{"kernel32.dll", "GetLargePageMinimum", 0},
         {"crt", "wcslen", 1}, {"crt", "wcsnlen", 2}, {"crt", "strnlen", 2}, {"crt", "memchr", 3},
         {"crt", "wcscmp", 2},{"crt", "wcsncmp", 3},{"crt", "wcsstr", 2},{"crt", "wcschr", 2},{"crt", "wcsrchr", 2},
@@ -213,12 +233,12 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         
         {"crt", "_fileno", 1}, 
         {"crt", "rand_s", 1}, {"crt", "rand", 0}, {"crt", "srand", 1},
-        {"crt", "qsort", 4}, {"crt", "bsearch", 5},
+        {"crt", "qsort", 4}, {"crt", "bsearch", 5}, {"crt","qsort_s",5},{"crt","bsearch_s",6},{"crt","_lfind",5},{"crt","_lfind_s",6},{"crt","_lsearch",5},
         {"crt", "setlocale", 2}, {"crt", "_wsetlocale", 2}, {"crt", "localeconv", 0}, {"crt", "___lc_codepage_func", 0}, {"crt", "___lc_collate_cp_func", 0},
         {"crt", "___mb_cur_max_func", 0}, {"crt", "__mb_cur_max_func", 0}, {"crt","_ismbblead",1},{"crt","_ismbbtrail",1}, {"crt", "_lock", 1}, {"crt", "_unlock", 1},
         {"crt", "__lconv_init", 0},
         {"crt", "wcrtomb", 3}, {"crt", "wctomb", 2},
-        {"crt", "___lc_locale_name_func", 0}, {"crt", "__pctype_func", 0}, 
+        {"crt", "___lc_locale_name_func", 0}, {"crt", "__pctype_func", 0}, {"crt", "___lc_handle_func", 0}, {"crt", "___setlc_active_func", 0}, {"crt", "___unguarded_readlc_active_add_func", 0}, 
         
         {"crt", "btowc", 1}, {"crt", "wctob", 1}, {"crt", "mbrtowc", 4}, {"crt", "mbrlen", 3}, {"crt", "mbtowc", 3}, {"crt", "mblen", 2}, {"crt", "mbsinit", 1},
         {"crt", "_lock_locales", 0}, {"crt", "_unlock_locales", 0}, {"crt", "_lock_file", 1}, {"crt", "_unlock_file", 1}, 
@@ -246,12 +266,13 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll", "SetStdHandle", 2},
         {"kernel32.dll", "ReadConsoleA", 5}, {"kernel32.dll", "ReadConsoleW", 5},
         {"kernel32.dll", "WriteConsoleA", 5}, {"kernel32.dll", "WriteConsoleW", 5}, {"kernel32.dll", "SetConsoleMode", 2},
-        {"kernel32.dll", "GetConsoleCP", 0}, {"kernel32.dll", "GetConsoleOutputCP", 0}, {"kernel32.dll", "GetConsoleMode", 2}, {"kernel32.dll", "GetFileType", 1}, {"kernel32.dll", "GetHandleInformation", 2},
+        {"kernel32.dll", "SetConsoleCP", 1}, {"kernel32.dll", "SetConsoleOutputCP", 1}, {"kernel32.dll", "GetConsoleCP", 0}, {"kernel32.dll", "GetConsoleOutputCP", 0}, {"kernel32.dll", "GetConsoleMode", 2}, {"kernel32.dll", "GetFileType", 1}, {"kernel32.dll", "GetHandleInformation", 2},
         {"kernel32.dll", "SetHandleInformation", 3},{"kernel32.dll", "GetConsoleScreenBufferInfo", 2},
         {"psapi.dll","EnumProcessModules",4},{"kernel32.dll","K32EnumProcessModules",4},
         {"psapi.dll","EnumProcesses",3},{"kernel32.dll","K32EnumProcesses",3},
         {"kernel32.dll","GetCurrentApplicationUserModelId",2},{"kernel32.dll","GetCurrentPackageId",2},{"kernel32.dll","GetCurrentPackageFullName",2},
-        {"kernel32.dll","GetCurrentPackageFamilyName",2},{"kernel32.dll","GetCurrentPackagePath",2},
+        {"kernel32.dll","GetCurrentPackageFamilyName",2},{"kernel32.dll","GetCurrentPackagePath",2},{"kernel32.dll","GetCurrentPackagePath2",3},
+        {"kernel32.dll","PackageFamilyNameFromFullName",3},{"kernel32.dll","PackageNameAndPublisherIdFromFamilyName",5},
         {"kernel32.dll","GetCurrentPackageInfo",4},{"kernel32.dll","GetCurrentPackageInfo2",5},
         {"kernel32.dll","TryCreatePackageDependency",8,4},{"kernel32.dll","DeletePackageDependency",1},
         {"kernel32.dll","AddPackageDependency",5},{"kernel32.dll","RemovePackageDependency",1},
@@ -281,9 +302,10 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll", "GetSystemInfo", 1}, {"kernel32.dll", "GetNativeSystemInfo", 1},
         {"kernel32.dll", "GetSystemDirectoryA", 2}, {"kernel32.dll", "GetSystemDirectoryW", 2},
         {"kernel32.dll", "GetSystemWow64DirectoryA", 2}, {"kernel32.dll", "GetSystemWow64DirectoryW", 2},
+        {"kernel32.dll", "GetSystemWow64Directory2A", 3, 0, 0, 0x6}, {"kernel32.dll", "GetSystemWow64Directory2W", 3, 0, 0, 0x6},
         {"kernel32.dll", "GetWindowsDirectoryA", 2}, {"kernel32.dll", "GetWindowsDirectoryW", 2},
         {"kernel32.dll", "GetSystemWindowsDirectoryA", 2}, {"kernel32.dll", "GetSystemWindowsDirectoryW", 2},
-        {"powrprof.dll", "PowerGetActiveScheme", 2}, {"powrprof.dll", "CallNtPowerInformation", 5}, {"rpcrt4.dll", "UuidToStringA", 2}, {"rpcrt4.dll", "UuidToStringW", 2}, {"rpcrt4.dll", "RpcStringFreeA", 1}, {"rpcrt4.dll", "RpcStringFreeW", 1}, {"rpcrt4.dll", "UuidCreate", 1}, {"rpcrt4.dll", "UuidCreateSequential", 1}, {"ole32.dll", "CoFileTimeNow", 1}, {"ole32.dll", "CoGetCurrentProcess", 0}, {"ole32.dll", "CoCreateGuid", 1}, {"kernel32.dll", "SetHandleCount", 1}, {"kernel32.dll", "GetThreadErrorMode", 0}, {"kernel32.dll", "SetThreadErrorMode", 2}, {"kernel32.dll", "DelayLoadFailureHook", 2}, {"kernel32.dll", "__chkstk", 0}, {"kernel32.dll", "GetErrorMode", 0}, {"kernel32.dll", "SetErrorMode", 1},
+        {"powrprof.dll", "PowerGetActiveScheme", 2}, {"powrprof.dll", "CallNtPowerInformation", 5}, {"rpcrt4.dll", "UuidToStringA", 2}, {"rpcrt4.dll", "UuidToStringW", 2}, {"rpcrt4.dll", "RpcStringFreeA", 1}, {"rpcrt4.dll", "RpcStringFreeW", 1}, {"rpcrt4.dll", "UuidCreate", 1}, {"rpcrt4.dll", "UuidCreateSequential", 1}, {"ole32.dll", "CoFileTimeNow", 1}, {"ole32.dll", "CoGetCurrentProcess", 0}, {"ole32.dll", "CoCreateGuid", 1}, {"kernel32.dll", "SetHandleCount", 1}, {"kernel32.dll", "GetThreadErrorMode", 0}, {"kernel32.dll", "SetThreadErrorMode", 2}, {"kernel32.dll", "DelayLoadFailureHook", 2}, {"kernel32.dll", "ResolveDelayLoadedAPI", 6}, {"kernel32.dll", "__chkstk", 0}, {"kernel32.dll", "GetErrorMode", 0}, {"kernel32.dll", "SetErrorMode", 1},
         {"kernel32.dll", "WerGetFlags", 2}, {"kernel32.dll", "WerSetFlags", 1},
         
         
@@ -313,7 +335,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll", "OpenSemaphoreA", 3,0,0,3}, {"kernel32.dll", "OpenSemaphoreW", 3,0,0,3},
         {"kernel32.dll", "CreateMutexA", 3}, {"kernel32.dll", "CreateMutexW", 3}, {"kernel32.dll", "ReleaseMutex", 1},
         {"kernel32.dll", "CreateMutexExA", 4}, {"kernel32.dll", "CreateMutexExW", 4}, {"kernel32.dll", "OpenMutexA", 3}, {"kernel32.dll", "OpenMutexW", 3},
-        {"kernel32.dll", "CreateEventExA", 4}, {"kernel32.dll", "CreateEventExW", 4}, {"kernel32.dll", "CreateEventA", 4}, {"kernel32.dll", "CreateEventW", 4}, {"kernel32.dll", "SetEvent", 1}, {"kernel32.dll", "ResetEvent", 1},
+        {"kernel32.dll", "CreateEventExA", 4}, {"kernel32.dll", "CreateEventExW", 4}, {"kernel32.dll", "CreateEventA", 4}, {"kernel32.dll", "CreateEventW", 4}, {"kernel32.dll", "SetEvent", 1}, {"kernel32.dll", "ResetEvent", 1}, {"kernel32.dll", "PulseEvent", 1},
         {"kernel32.dll", "OpenEventA", 3}, {"kernel32.dll", "OpenEventW", 3},
         
         {"setupapi.dll","SetupDiClassGuidsFromNameA",4},{"setupapi.dll","SetupDiClassGuidsFromNameExA",6},
@@ -355,7 +377,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         WindowsCall(state,memory,service).return_to(state,*native);return std::nullopt;
     }
     if(service.symbol.starts_with("CreateSemaphore") || service.symbol.starts_with("OpenSemaphore") || service.symbol.starts_with("CreateWaitableTimer") || service.symbol.starts_with("OpenWaitableTimer") || service.symbol=="ReleaseSemaphore")return invoke_sync_object(state,memory,service);
-    if(service.symbol.starts_with("CM_") || service.symbol.starts_with("SetupDi") || service.symbol.starts_with("SetupGetInf") || service.symbol.starts_with("SetupCopyOEMInf") ||
+    if(service.symbol.starts_with("CM_") || service.symbol.starts_with("CMP_") || service.symbol.starts_with("SetupDi") || service.symbol.starts_with("SetupGetInf") || service.symbol.starts_with("SetupCopyOEMInf") ||
        service.symbol.starts_with("SetupUninstallOEMInf") || service.family=="newdev.dll")return invoke_device_configuration(state,memory,service);
     if(service.family=="wldap32.dll")return invoke_ldap(state,memory,service);
     // 沒有 Windows 錯誤回報（Dr. Watson）服務：回報 frrvErrNoDW，呼叫端照常走自己的崩潰處理。
@@ -473,9 +495,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         }
         if(error)last_error_=error;call.return_to(state,result);return std::nullopt;
     }
+    if(module_api=="ResolveDelayLoadedAPI")return invoke_resolve_delay_loaded(state,memory,service);
     if(module_api=="SetDefaultDllDirectories" || module_api=="AddDllDirectory" || module_api=="RemoveDllDirectory")return invoke_module(state,memory,service);
     if(module_api.starts_with("QueryFullProcessImageName") || module_api.starts_with("GetProcessImageFileName") || module_api.starts_with("K32") || module_api.starts_with("EnumProcessModules") || module_api.starts_with("GetModule") || module_api.starts_with("LoadLibrary") || module_api.starts_with("GetDllDirectory") || module_api.starts_with("SetDllDirectory") || module_api=="GetProcAddress" || module_api=="FreeLibrary" || module_api=="DisableThreadLibraryCalls")return invoke_module(state,memory,service);
-    if (service.symbol == "qsort" || service.symbol == "bsearch") return start_sort(state, memory, service.symbol=="bsearch");
+    if (service.symbol == "qsort" || service.symbol == "bsearch" || service.symbol=="qsort_s" || service.symbol=="bsearch_s" ||
+        service.symbol=="_lfind" || service.symbol=="_lfind_s" || service.symbol=="_lsearch") return start_sort(state, memory, service.symbol);
     if(service.symbol=="__chkstk"){
         // x64 堆疊探測：呼叫端在配置區域框架前呼叫，進入時 RSP 為 16n（不是一般呼叫的 16n+8），也沒有 home area，
         // 因此不經 WindowsCall 的框架檢查。RAX 為配置大小，自回傳位址之上逐頁往下確認可寫；保留 RAX 與其他暫存器，
@@ -510,6 +534,62 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         // PE 執行環境沒有 MSIX 套件身分；此錯誤描述目前程序的實際身分狀態。
         arg.return_to(state,arg(0)?15700U:87U);return std::nullopt;
     }
+    if(symbol=="GetCurrentPackagePath2"){
+        // PackagePathType：Install、Mutable、Effective、MachineExternal、UserExternal、EffectiveExternal。
+        arg.return_to(state,static_cast<std::uint32_t>(arg(0))>5 || !arg(1)?87U:15700U);return std::nullopt;
+    }
+    if(symbol=="PackageFamilyNameFromFullName" || symbol=="PackageNameAndPublisherIdFromFamilyName"){
+        // 套件全名 Name_Version_Architecture_ResourceId_PublisherId；家族名 Name_PublisherId。只做字串語法，不需套件已安裝。
+        const bool from_family=symbol=="PackageNameAndPublisherIdFromFamilyName";
+        const auto name_ok=[](std::u16string_view part,std::size_t minimum,std::size_t maximum){
+            if(part.size()<minimum || part.size()>maximum)return false;
+            return std::all_of(part.begin(),part.end(),[](char16_t c){return (c>=u'a' && c<=u'z') || (c>=u'A' && c<=u'Z') || (c>=u'0' && c<=u'9') || c==u'.' || c==u'-';});
+        };
+        const auto publisher_ok=[](std::u16string_view part){
+            if(part.size()!=13)return false;
+            return std::all_of(part.begin(),part.end(),[](char16_t c){const auto l=c>=u'A' && c<=u'Z'?static_cast<char16_t>(c+32):c;return ((l>=u'a' && l<=u'z') && l!=u'i' && l!=u'l' && l!=u'o' && l!=u'u') || (l>=u'0' && l<=u'9');});
+        };
+        const auto version_ok=[](std::u16string_view part){
+            unsigned fields=0;std::size_t at=0;
+            while(at<=part.size()){
+                const auto dot=part.find(u'.',at);const auto field=part.substr(at,dot==part.npos?part.npos:dot-at);
+                if(field.empty() || field.size()>5)return false;std::uint32_t number=0;
+                for(const auto c:field){if(c<u'0' || c>u'9')return false;number=number*10+static_cast<std::uint32_t>(c-u'0');}
+                if(number>65535)return false;++fields;if(dot==part.npos)break;at=dot+1;
+            }
+            return fields==4;
+        };
+        const auto architecture_ok=[](std::u16string_view part){
+            std::u16string lower(part);for(auto& c:lower)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
+            return lower==u"x86" || lower==u"x64" || lower==u"arm" || lower==u"arm64" || lower==u"neutral" || lower==u"x86a64";
+        };
+        const auto put=[&](std::uint64_t length_pointer,std::uint64_t buffer,std::u16string_view text)->bool{
+            const auto capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{length_pointer},32));
+            memory.store(GuestAddress{length_pointer},32,text.size()+1);
+            return buffer && capacity>text.size();
+        };
+        const auto write=[&](std::uint64_t buffer,std::u16string_view text){
+            for(std::size_t i=0;i<text.size();++i)memory.store(GuestAddress{buffer+i*2},16,text[i]);memory.store(GuestAddress{buffer+text.size()*2},16,0);
+        };
+        try{
+            if(!arg(0) || !arg(1) || (from_family && !arg(3))){arg.return_to(state,87);return std::nullopt;}
+            const auto text=read_utf16(memory,GuestAddress{arg(0)},128);
+            std::vector<std::u16string_view> parts;std::u16string_view view(text);
+            for(std::size_t at=0;;){const auto bar=view.find(u'_',at);parts.push_back(view.substr(at,bar==view.npos?view.npos:bar-at));if(bar==view.npos)break;at=bar+1;}
+            if(from_family){
+                if(parts.size()!=2 || !name_ok(parts[0],3,50) || !publisher_ok(parts[1])){arg.return_to(state,87);return std::nullopt;}
+                const bool name_fits=put(arg(1),arg(2),parts[0]),publisher_fits=put(arg(3),arg(4),parts[1]);
+                if(!name_fits || !publisher_fits){arg.return_to(state,122);return std::nullopt;}
+                write(arg(2),parts[0]);write(arg(4),parts[1]);arg.return_to(state,0);return std::nullopt;
+            }
+            if(parts.size()!=5 || !name_ok(parts[0],3,50) || !version_ok(parts[1]) || !architecture_ok(parts[2]) || (!parts[3].empty() && !name_ok(parts[3],1,30)) || !publisher_ok(parts[4])){
+                arg.return_to(state,87);return std::nullopt;
+            }
+            std::u16string family_text(parts[0]);family_text+=u'_';family_text+=parts[4];
+            if(!put(arg(1),arg(2),family_text)){arg.return_to(state,122);return std::nullopt;}
+            write(arg(2),family_text);arg.return_to(state,0);return std::nullopt;
+        }catch(const MemoryFault&){arg.return_to(state,87);return std::nullopt;}
+    }
     if(symbol=="SHAutoComplete"){
         // 提供 HRESULT 入口；檔案／URL 自動完成尚未提供。
         arg.return_to(state,gui_.windows.contains(arg(0))?0x80004001U:0x80070057U);return std::nullopt;
@@ -521,15 +601,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         return invoke_file_io(state,memory,service);
     }else if(symbol.find("NamedPipe")!=symbol.npos || symbol=="OpenFile" || symbol=="_lopen" || symbol=="_lcreat" || symbol=="_lclose" || symbol=="_lread" || symbol=="_hread" || symbol=="_lwrite" || symbol=="_hwrite" || symbol=="_llseek" || symbol=="CancelIo" || symbol=="CancelIoEx" || symbol=="LockFileEx" || symbol=="UnlockFileEx" || symbol=="LockFile" || symbol=="UnlockFile") {
         return invoke_file_io(state,memory,service);
-    }else if(symbol=="RtlCaptureStackBackTrace" || symbol=="CaptureStackBackTrace" || symbol=="RtlGetCallersAddress") {
+    }else if(symbol=="RtlCaptureStackBackTrace" || symbol=="CaptureStackBackTrace" || symbol=="RtlGetCallersAddress" || symbol=="RtlWalkFrameChain") {
         const std::uint8_t width=x86_?32:64;const unsigned bytes=width/8;
         const bool callers=symbol=="RtlGetCallersAddress";
+        // RtlWalkFrameChain(Callers, Count, Flags)：Flags 位元 8～15 為略過的框架數，位元 0（核心模式）不擷取；回傳擷取數。
+        const bool chain=symbol=="RtlWalkFrameChain";
         // GetCallersAddress 取呼叫此 API 的函式之 caller／parent；與 CaptureStackBackTrace 共用實際展開。
-        const auto capacity=callers?2U:std::min(dword(1),65535U),skip=callers?1U:dword(0);std::uint32_t hash=0;
-        const auto output=[&](std::uint64_t index){return callers?arg(static_cast<unsigned>(index)):arg(2)+index*bytes;};
+        const auto capacity=callers?2U:chain?((dword(2)&1U) || !arg(0)?0U:std::min(dword(1),65535U)):std::min(dword(1),65535U);
+        const auto skip=callers?1U:chain?(dword(2)>>8)&0xffU:dword(0);std::uint32_t hash=0;
+        const auto output=[&](std::uint64_t index){return callers?arg(static_cast<unsigned>(index)):(chain?arg(0):arg(2))+index*bytes;};
         if(callers){memory.check(GuestAddress{arg(0)},bytes,Access::Write);memory.check(GuestAddress{arg(1)},bytes,Access::Write);}
-        else if(capacity)memory.check(GuestAddress{arg(2)},std::uint64_t{capacity}*bytes,Access::Write);
-        if(!callers && arg(3))memory.check(GuestAddress{arg(3)},4,Access::Write);
+        else if(capacity)memory.check(GuestAddress{chain?arg(0):arg(2)},std::uint64_t{capacity}*bytes,Access::Write);
+        if(!callers && !chain && arg(3))memory.check(GuestAddress{arg(3)},4,Access::Write);
         auto walk=state;walk.rip=GuestAddress{memory.load(GuestAddress{walk.reg(Gpr::Rsp)},width)};walk.reg(Gpr::Rsp)+=bytes;
         const auto teb=x86_?state.fs_base:state.gs_base;
         const auto low=memory.load(GuestAddress{teb+(x86_?8:16)},width),high=memory.load(GuestAddress{teb+(x86_?4:8)},width);
@@ -552,7 +635,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             }catch(const MemoryFault&) {break;}catch(const HostCallFault&) {break;}
         }
         if(callers)while(result<capacity){memory.store(GuestAddress{output(result)},width,0);++result;}
-        else if(arg(3))memory.store(GuestAddress{arg(3)},32,hash);
+        else if(!chain && arg(3))memory.store(GuestAddress{arg(3)},32,hash);
     }else if(symbol=="EncodePointer" || symbol=="DecodePointer" || symbol=="RtlEncodePointer" || symbol=="RtlDecodePointer" || symbol=="_encode_pointer" || symbol=="_decode_pointer" || symbol=="_encoded_null") {
         if(!runtime_.pointer_cookie) {
             std::array<std::uint8_t,8> bytes{};
@@ -752,32 +835,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         if (!arg(0)) result = 0;
         else if (!runtime_.local_allocations.contains(arg(0)) || !free_heap(memory, arg(0), state)) {last_error_ = 6; result = arg(0);}
         else runtime_.local_allocations.erase(arg(0));
-    } else if(symbol=="GetUserGeoID") {result=UINT32_MAX;if(dword(0)!=16 && dword(0)!=14)last_error_=87;}
-    else if(symbol=="GetGeoInfoA" || symbol=="GetGeoInfoW") {if(!dword(0) || dword(0)==UINT32_MAX || !dword(1) || dword(1)>16 || sint(3)<0 || (arg(3) && !arg(2)))fail(87);else fail(50);}
-    else if(symbol=="GetUserDefaultLocaleName" || symbol=="GetSystemDefaultLocaleName") {if(!arg(0) || sint(1)<=0)fail(87);else if(dword(1)<6)fail(122);else {memory.write(GuestAddress{arg(0)},utf16_bytes(u"en-US"));result=6;}}
-    else if(symbol=="GetSystemDefaultLangID" || symbol=="GetUserDefaultLangID" || symbol=="GetThreadUILanguage" || symbol=="GetUserDefaultUILanguage" || symbol=="GetSystemDefaultUILanguage" || symbol=="GetSystemDefaultLCID" || symbol=="GetUserDefaultLCID" || symbol=="GetThreadLocale")result=0x409;
-    else if(symbol=="GetThreadPreferredUILanguages" || symbol=="GetUserPreferredUILanguages" || symbol=="GetSystemPreferredUILanguages") {
-        const bool thread=symbol=="GetThreadPreferredUILanguages",system=symbol=="GetSystemPreferredUILanguages";
-        const auto flags=dword(0),allowed=thread?0x7cU:system?0x40cU:0xcU;
-        if(!arg(1) || !arg(3) || (flags&~allowed) || (flags&0xc)==0xc ||
-           (thread && (((flags&0x10) && !(flags&0x20)) || ((flags&0x40) && (flags&0x30)))))fail(87);
-        else {
-            const auto capacity=memory.load(GuestAddress{arg(3)},32);
-            memory.check(GuestAddress{arg(1)},4,Access::Write);memory.check(GuestAddress{arg(3)},4,Access::Write);
-            std::vector<std::u16string> languages;
-            // 尚未設定個別 thread 偏好；預設融合 user/system 的 en-US。
-            if(!thread || !(flags&0x40)) {
-                languages.push_back(flags&4?u"0409":u"en-US");
-                if(thread && (flags&0x10))languages.push_back(flags&4?u"0009":u"en");
-            }
-            std::u16string list;for(const auto& language:languages){list+=language;list.push_back(0);}if(list.empty())list.push_back(0);
-            const auto bytes=utf16_bytes(list);const auto required=bytes.size()/2;
-            memory.store(GuestAddress{arg(1)},32,languages.size());memory.store(GuestAddress{arg(3)},32,required);
-            if(!arg(2) && !capacity)result=1;
-            else if(!arg(2) || capacity<required)fail(122);
-            else {memory.write(GuestAddress{arg(2)},bytes);result=1;}
-        }
-    }
+    } else if(symbol=="GetUserDefaultLocaleName" || symbol=="GetSystemDefaultLocaleName") {if(!arg(0) || sint(1)<=0)fail(87);else if(dword(1)<6)fail(122);else {memory.write(GuestAddress{arg(0)},utf16_bytes(u"en-US"));result=6;}}
+    else if(symbol=="GetSystemDefaultLangID" || symbol=="GetUserDefaultLangID" || symbol=="GetUserDefaultUILanguage" || symbol=="GetSystemDefaultUILanguage" || symbol=="GetSystemDefaultLCID" || symbol=="GetUserDefaultLCID")result=0x409;
     else if (symbol == "SetFileApisToOEM" || symbol == "SetFileApisToANSI")runtime_.file_apis_ansi=symbol=="SetFileApisToANSI";
     else if(symbol=="AreFileApisANSI")result=runtime_.file_apis_ansi;
     else if(symbol=="GetLargePageMinimum")result=0; // 虛擬配置僅提供一般頁面，沒有 large-page pool。
@@ -903,20 +962,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         if(native)result=error==87?0xc000000dU:error?0xc0000059U:0U;
         else if(error)fail(error);else result=1;
     } else if (symbol == "GetSystemInfo" || symbol == "GetNativeSystemInfo") {
-        if(x86_) {
-            memory.write(GuestAddress{arg(0)},std::array<std::uint8_t,36>{});
-            memory.store(GuestAddress{arg(0)},16,symbol=="GetNativeSystemInfo"?9:0);
-            memory.store(GuestAddress{arg(0)+4},32,4096);memory.store(GuestAddress{arg(0)+8},32,65536);
-            memory.store(GuestAddress{arg(0)+12},32,user_address_limit()-1);memory.store(GuestAddress{arg(0)+16},32,(UINT64_C(1)<<runtime_.processor_count)-1);
-            memory.store(GuestAddress{arg(0)+20},32,runtime_.processor_count);memory.store(GuestAddress{arg(0)+24},32,586);
-            memory.store(GuestAddress{arg(0)+28},32,65536);memory.store(GuestAddress{arg(0)+32},16,6);
-        } else {
-        memory.write(GuestAddress{arg(0)},std::array<std::uint8_t,48>{});
-        for (const auto [offset,value] : std::array<std::pair<unsigned,std::uint64_t>,8>{{{0,9},{4,4096},{32,runtime_.processor_count},{36,8664},{40,65536},{44,6},{46,0},{2,0}}})
-            memory.store(GuestAddress{arg(0)+offset},offset==0 || offset==2 || offset>=44 ? 16 : 32,value);
-        memory.store(GuestAddress{arg(0)+8},64,65536);memory.store(GuestAddress{arg(0)+16},64,user_address_limit()-1);
-        memory.store(GuestAddress{arg(0)+24},64,runtime_.processor_count==64?UINT64_MAX:(UINT64_C(1)<<runtime_.processor_count)-1);
-        }
+        // 內容與 worker 平行服務共用（windows_system_info_layout.hpp）。
+        const auto info=system_info_bytes(x86_,symbol=="GetNativeSystemInfo",runtime_.processor_count,user_address_limit()-1);
+        memory.write(GuestAddress{arg(0)},std::span<const std::uint8_t>(info.bytes.data(),info.size));
+    } else if (symbol.starts_with("GetSystemWow64Directory2") && dword(2)!=0x14cU) {
+        // 64 位元客體 OS 只有 i386（IMAGE_FILE_MACHINE_I386）的 WOW64 目錄；其他機器類型沒有對應的 WOW64 子系統。
+        fail(87);
     } else if (symbol.starts_with("GetSystemDirectory") || symbol.starts_with("GetSystemWow64Directory") || symbol.starts_with("GetWindowsDirectory") || symbol.starts_with("GetSystemWindowsDirectory")) {
         // 與 GetNativeSystemInfo／IsWow64Process 共用 64 位元客體 OS 設定及既有目錄／緩衝區規則。
         const auto text=utf16_to_utf8(symbol.starts_with("GetSystemWow64Directory") ? windows_wow64_directory : symbol.starts_with("GetSystemDirectory") ? windows_system_directory : windows_directory);
@@ -1056,6 +1107,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             arg.return_to(state,result);return std::nullopt;
         }
         if(!current_process_handle(arg(0)) || (arg(2) && !current_process_handle(arg(2))))return duplicate_remote_handle(state,memory,service);
+#include "windows_directory_duplicate.inc"
         if(const auto source=arg(1);source>=0x100 && source<=0x102 && standard_open_[source-0x100]){
             // 標準串流以 0x100～0x102 代表宿主即時描述元（CRT fd 0～2 共用同一狀態）。同程序複本沿用同一串流值並
             // 增加參照數，寫入、型別與重新導向保持一致；跨程序仍由 duplicate_remote_handle 以描述元傳遞。
@@ -1079,6 +1131,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             std::uint32_t access=event->second.access,access_error=0;
             if(!(dword(6)&2U)){try{initialize_tokens();const auto mutex=event->second.kind==WaitObject::Kind::Mutex;const auto all=mutex?0x1f0001U:0x1f0003U;const security::AccessMapping mapping{0x20001U,mutex?0x20001U:0x20002U,0x120000U,all};const auto descriptor=mutex?(runtime_.mutex_objects.at(event->second.mutex).shared?shared_object_security(runtime_.mutex_objects.at(event->second.mutex).shared->descriptor()):runtime_.mutex_objects.at(event->second.mutex).security_descriptor):(event->second.shared_event?shared_object_security(event->second.shared_event->descriptor()):event->second.security_descriptor);access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(descriptor),access,dword(4),mapping);}catch(const SecurityDescriptorError& failure){access_error=failure.code;}}
             if(event->second.kind==WaitObject::Kind::MemoryResource && (access&~0x100001U))access_error=5;
+            const bool exclusive=event->second.shared_event && event->second.shared_event->exclusive();
+            const bool exclusive_request=service.family=="internal-nt-event" && (dword(7)&0x20U);
+            if(exclusive && !exclusive_request)access_error=5;
+            else if(exclusive_request && (!exclusive || arg(5)))access_error=87;
             const auto source=arg(1);const bool close_source=(dword(6)&1U) && current_process_handle(arg(0),0x40) && !(runtime_.handle_flags[source]&2U);
             const auto close=[&]{if(close_source)(void)close_wait_object(source);};struct Cleanup{const decltype(close)& action;~Cleanup(){action();}} cleanup{close};
             if(!current_process_handle(arg(0),0x40) || (arg(2) && !current_process_handle(arg(2),0x40)))fail(5);
@@ -1087,7 +1143,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             else if(!arg(2)){if(close_source)result=1;else fail(87);}
             else if(!arg(3))fail(87);
             else if(access_error)fail(access_error);
-            else {memory.check(GuestAddress{arg(3)},x86_?4:8,Access::Write);InheritedHandle item;const auto error=export_transfer_handle(arg(1),item);
+            else {memory.check(GuestAddress{arg(3)},x86_?4:8,Access::Write);InheritedHandle item;const auto error=exclusive?0U:export_transfer_handle(arg(1),item);
                 if(error)fail(error);else {const auto handle=runtime_.allocate_wait_handle();auto copy=event->second;copy.access=access;runtime_.wait_objects.emplace(handle,std::move(copy));runtime_.handle_flags[handle]=arg(5)?1:0;memory.store(GuestAddress{arg(3)},x86_?32:64,handle);result=1;}}
             arg.return_to(state,result);return std::nullopt;
         }
@@ -1272,6 +1328,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         }
     } else if(symbol.starts_with("CreateEvent") || symbol.starts_with("OpenEvent")) {
         const bool create=symbol.starts_with("Create"),extended=symbol.starts_with("CreateEventEx");bool valid=true,inherit=!create && arg(1);
+        const bool exclusive=service.family=="internal-nt-event" && (dword(create?4:3)&0x20U);
         const auto name_at=arg(create?(extended?1:3):2);auto name=name_at?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{name_at}):utf8_to_utf16(read_ansi(memory,name_at))):std::u16string{};
         if(name.starts_with(u"Local\\"))name.erase(0,6);
         if(!name.empty() && (std::any_of(runtime_.wait_states.begin(),runtime_.wait_states.end(),[&](const auto& item){return item.second.name==name;}) || std::any_of(runtime_.mutex_objects.begin(),runtime_.mutex_objects.end(),[&](const auto& item){return item.second.name==name;}))){fail(6);valid=false;}
@@ -1282,15 +1339,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             const auto requested=create?(extended?dword(3):0x1f0003U):dword(0);
             auto access=security::creation_access(requested,{0x20001U,0x20002U,0x120000U,0x1f0003U});
             if(create && arg(0)){const unsigned size=x86_?12:24;memory.check(GuestAddress{arg(0)},size,Access::Read);if(memory.load(GuestAddress{arg(0)},32)!=size)throw SecurityDescriptorError{87};inherit=memory.load(GuestAddress{arg(0)+(x86_?8:16)},32)!=0;}
+            if(exclusive && inherit)throw SecurityDescriptorError{87};
             WaitObject object;object.kind=WaitObject::Kind::Event;object.name=name;object.maximum=1;object.manual_reset=create && (extended?(dword(2)&1)!=0:arg(1)!=0);object.count=create && (extended?(dword(2)&2)!=0:arg(2)!=0)?1U:0U;object.access=access;
-            if(!name.empty()) {
+            if(!name.empty() || exclusive) {
+                if(name.empty()){const auto internal_name="exclusive-event-"+std::to_string(host_process_id())+"-"+std::to_string(runtime_.allocate_wait_handle());name.assign(internal_name.begin(),internal_name.end());}
                 const auto factory=[&]{return synchronization_descriptor(memory,arg(0)).bytes;};
-                auto opened=open_shared_event(mapping_session(),std::move(name),create,object.manual_reset,object.count!=0,create?ObjectSecurityFactory{factory}:ObjectSecurityFactory{});
+                auto opened=open_shared_event(mapping_session(),std::move(name),create,object.manual_reset,object.count!=0,create?ObjectSecurityFactory{factory}:ObjectSecurityFactory{},exclusive);
                 if(opened.error){fail(opened.error);valid=false;}
                 else {object.shared_event=std::move(opened.event);object.manual_reset=object.shared_event->manual_reset();if(opened.existed)object.access=synchronization_access(shared_object_security(object.shared_event->descriptor()),requested,0x1f0003U);if(create)last_error_=opened.existed?183:0;}
             }else object.security_descriptor=synchronization_descriptor(memory,arg(0)).bytes;
             if(valid){result=runtime_.allocate_wait_handle();runtime_.wait_objects.emplace(result,std::move(object));if(inherit)runtime_.handle_flags[result]=1;}
         }catch(const SecurityDescriptorError& error){fail(error.code);}
+    } else if (symbol == "PulseEvent") {
+        // 設訊號後立即喚醒此刻已在等待、條件成立的執行緒（自動重設事件只放行一個），再回到未訊號狀態；
+        // 之後才開始等待的執行緒不受影響。
+        const auto found=runtime_.wait_objects.find(arg(0));
+        if(found==runtime_.wait_objects.end() || found->second.kind!=WaitObject::Kind::Event)fail(6);
+        else if(!(found->second.access&2U))fail(5);
+        else {
+            found->second.set_signal(true);(void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
+            const auto again=runtime_.wait_objects.find(arg(0));if(again!=runtime_.wait_objects.end())again->second.set_signal(false);
+            trace_event_operation('P',arg(0),threads_.current,memory.load(GuestAddress{state.reg(Gpr::Rsp)},x86_?32:64));result=1;
+        }
     } else if (symbol == "SetEvent" || symbol == "ResetEvent") {
         const auto found=runtime_.wait_objects.find(arg(0));
         if(found==runtime_.wait_objects.end() || (found->second.kind!=WaitObject::Kind::Event && found->second.kind!=WaitObject::Kind::MemoryResource))fail(6);
@@ -1309,7 +1379,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
                 if(eligible)threads_.yield=threads_.prefer_awakened=true;
             }
         }
-    } else if(symbol=="___lc_locale_name_func" || symbol=="__pctype_func") {
+    } else if(symbol=="___lc_locale_name_func" || symbol=="__pctype_func" || symbol=="___lc_handle_func" || symbol=="___setlc_active_func" || symbol=="___unguarded_readlc_active_add_func") {
         return invoke_locale(state,memory,service);
     } else if(symbol=="iswctype" || symbol=="_isctype" || symbol=="wctype") {
         return invoke_crt_character(state,memory,service);
@@ -1567,12 +1637,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
     else if (symbol == "GetCurrentProcess") result = UINT64_MAX;
     else if (symbol == "GetCurrentThread") result = UINT64_MAX - 1;
     else if(symbol=="GetConsoleMode" || symbol=="SetConsoleMode" || symbol=="SetStdHandle" || symbol.starts_with("ReadConsole") || symbol.starts_with("WriteConsole"))return invoke_console(state,memory,service);
-    else if (symbol == "GetConsoleCP" || symbol == "GetConsoleOutputCP") result=65001;
+    else if (symbol == "GetConsoleCP" || symbol == "GetConsoleOutputCP" || symbol == "SetConsoleCP" || symbol == "SetConsoleOutputCP") return invoke_console_control(state,memory,service);
     else if (symbol == "GetFileType" || symbol == "GetHandleInformation" || symbol=="SetHandleInformation") {
         const auto handle = arg(0);
         const bool standard = handle >= 0x100 && handle < 0x103 && standard_open_[handle - 0x100];
         const bool socket=runtime_.network.sockets.contains(handle);
-        const bool valid=wait_completion_handles_.contains(handle) || bluetooth_handle(handle) || power_requests_.contains(handle) || transaction_handle(handle) || job_handle(handle) || mapping_handle(handle) || process_signaled(handle).has_value() || standard || files_.contains(handle) || socket || runtime_.wait_objects.contains(handle) || runtime_.process_thread_handles.contains(handle) || runtime_.completion_ports.contains(handle) || runtime_.process_snapshots.contains(handle) || runtime_.token_handles.contains(handle);
+        const bool valid=runtime_.object_directories.contains(handle) || wait_completion_handles_.contains(handle) || bluetooth_handle(handle) || power_requests_.contains(handle) || transaction_handle(handle) || job_handle(handle) || mapping_handle(handle) || process_signaled(handle).has_value() || standard || files_.contains(handle) || socket || runtime_.wait_objects.contains(handle) || runtime_.process_thread_handles.contains(handle) || runtime_.completion_ports.contains(handle) || runtime_.process_snapshots.contains(handle) || runtime_.token_handles.contains(handle);
         if (!valid) fail(6);
         else if (symbol == "GetFileType") result = standard?standard_file_type(static_cast<unsigned>(handle-0x100)):bluetooth_handle(handle) || console_handle(handle) || (files_.contains(handle) && (files_.at(handle).serial || files_.at(handle).hid || (files_.at(handle).native && files_.at(handle).native->null_device())))?2:socket || (files_.contains(handle) && files_.at(handle).pipe) ? 3 : files_.contains(handle)?1:0;
         else if(symbol=="SetHandleInformation"){

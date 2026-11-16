@@ -148,7 +148,7 @@ public:
             if(!primitive_attribute(op))finish_pending_primitive();
         }
         if(primitive_open_ && !pending_end_ && primitive_vertex(op))++primitive_vertices_;
-        if(primitive_open_ && op==GlOperation::CallList)primitive_batchable_=false;
+        if(primitive_open_ && (op==GlOperation::CallList || op==GlOperation::CallLists || op==GlOperation::EvalCoord1d || op==GlOperation::EvalCoord2d || op==GlOperation::EvalPoint1 || op==GlOperation::EvalPoint2))primitive_batchable_=false;
         const auto f=[&](unsigned i){return std::bit_cast<GLfloat>(u(i));};const auto d=[&](unsigned i){return std::bit_cast<GLdouble>(a[i]);};
         const auto* fv=reinterpret_cast<const GLfloat*>(data.data());const auto* dv=reinterpret_cast<const GLdouble*>(data.data());
         switch(op){
@@ -218,14 +218,22 @@ public:
                     if(oversized)rejected_proxy_levels_.insert(n(1));else rejected_proxy_levels_.erase(n(1));
                 }
                 break;}
-            if(u(0)!=GL_TEXTURE_2D){remember_error(GL_INVALID_ENUM);break;}
+            // 1D 目標由服務層以高度 1 傳入：proxy 依同一規則清零，實際影像交給系統的 glTexImage1D 並沿用相同的記帳。
+            if(u(0)==GL_PROXY_TEXTURE_1D){
+                GLint maximum=0;glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maximum);
+                const bool oversized=n(3)>=0 && (n(5)==0 || n(5)==1) && static_cast<std::int64_t>(n(3))>static_cast<std::int64_t>(maximum)+2*n(5);
+                glTexImage1D(u(0),n(1),n(2),oversized?0:n(3),n(5),u(6),u(7),nullptr);break;}
+            const bool one_d=u(0)==GL_TEXTURE_1D;
+            if(u(0)!=GL_TEXTURE_2D && !one_d){remember_error(GL_INVALID_ENUM);break;}
+            if(one_d && n(4)!=1){remember_error(GL_INVALID_VALUE);break;}
             GLint maximum=0;glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maximum);const auto pixel_bytes=texture_pixel_bytes(n(2));
             if(!pixel_bytes || n(1)<0 || n(1)>static_cast<GLint>(std::bit_width(static_cast<unsigned>(maximum))-1) || n(5)<0 || n(5)>1 || n(3)<0 || n(4)<0 || n(3)>maximum+2*n(5) || n(4)>maximum+2*n(5)){remember_error(GL_INVALID_VALUE);break;}
-            GLint binding=0;glGetIntegerv(GL_TEXTURE_BINDING_2D,&binding);
+            GLint binding=0;glGetIntegerv(one_d?GL_TEXTURE_BINDING_1D:GL_TEXTURE_BINDING_2D,&binding);
             std::shared_ptr<GpuMemoryReservation> lease;
             if(n(3)>0 && n(4)>0)lease=reserve_gpu_memory(static_cast<std::size_t>(n(3))*static_cast<std::size_t>(n(4))*pixel_bytes);
             auto& levels=texture_memory_[static_cast<GLuint>(binding)];const auto [slot,inserted]=levels.try_emplace(n(1),nullptr);
-            glTexImage2D(u(0),n(1),n(2),n(3),n(4),n(5),u(6),u(7),data.empty()?nullptr:data.data());
+            if(one_d)glTexImage1D(u(0),n(1),n(2),n(3),n(5),u(6),u(7),data.empty()?nullptr:data.data());
+            else glTexImage2D(u(0),n(1),n(2),n(3),n(4),n(5),u(6),u(7),data.empty()?nullptr:data.data());
             if(!preserve_driver_errors()){
                 if(slot->second)glFinish();slot->second=std::move(lease);if(!slot->second)levels.erase(slot);
             }else if(inserted)levels.erase(slot);
@@ -233,9 +241,10 @@ public:
         case GlOperation::TexSubImage2D:
             if(list_definition_){remember_error(GL_INVALID_OPERATION);break;}
             if(data.empty() && n(4)>0 && n(5)>0){remember_error(GL_INVALID_OPERATION);break;}
-            glTexSubImage2D(u(0),n(1),n(2),n(3),n(4),n(5),u(6),u(7),data.empty()?nullptr:data.data());break;
+            if(u(0)==GL_TEXTURE_1D)glTexSubImage1D(u(0),n(1),n(2),n(4),u(6),u(7),data.empty()?nullptr:data.data());
+            else glTexSubImage2D(u(0),n(1),n(2),n(3),n(4),n(5),u(6),u(7),data.empty()?nullptr:data.data());break;
         case GlOperation::TexParameterf:glTexParameterf(u(0),u(1),f(2));break;case GlOperation::TexParameteri:glTexParameteri(u(0),u(1),n(2));break;
-        case GlOperation::CopyTexSubImage2D:glCopyTexSubImage2D(u(0),n(1),n(2),n(3),n(4),n(5),n(6),n(7));break;
+        case GlOperation::CopyTexSubImage2D:if(u(0)==GL_TEXTURE_1D)glCopyTexSubImage1D(u(0),n(1),n(2),n(4),n(5),n(6));else glCopyTexSubImage2D(u(0),n(1),n(2),n(3),n(4),n(5),n(6),n(7));break;
         case GlOperation::GetTexParameteriv:glGetTexParameteriv(u(0),u(1),reinterpret_cast<GLint*>(output.data()));break;
         case GlOperation::GetTexParameterfv:glGetTexParameterfv(u(0),u(1),reinterpret_cast<GLfloat*>(output.data()));break;
         case GlOperation::PolygonOffset:glPolygonOffset(f(0),f(1));break;
@@ -257,6 +266,43 @@ public:
         case GlOperation::ReadPixels:glReadPixels(n(0),n(1),n(2),n(3),u(4),u(5),output.data());break;
         case GlOperation::PolygonMode:glPolygonMode(u(0),u(1));break;
         case GlOperation::Flush:glFlush();break;case GlOperation::Finish:glFinish();break;
+        case GlOperation::RasterPos4dv:glRasterPos4dv(dv);break;case GlOperation::Indexd:glIndexd(d(0));break;
+        case GlOperation::EdgeFlag:glEdgeFlag(u(0)?GL_TRUE:GL_FALSE);break;case GlOperation::ClearIndex:glClearIndex(f(0));break;
+        case GlOperation::IsList:return glIsList(u(0));case GlOperation::ListBase:glListBase(u(0));break;
+        case GlOperation::CallLists:glCallLists(static_cast<GLsizei>(data.size()/4),GL_UNSIGNED_INT,data.data());break;
+        case GlOperation::LightModelfv:glLightModelfv(u(0),fv);break;case GlOperation::ColorMaterial:glColorMaterial(u(0),u(1));break;
+        case GlOperation::GetLightfv:glGetLightfv(u(0),u(1),reinterpret_cast<GLfloat*>(output.data()));break;
+        case GlOperation::GetMaterialfv:glGetMaterialfv(u(0),u(1),reinterpret_cast<GLfloat*>(output.data()));break;
+        case GlOperation::CopyTexImage2D:{
+            // 先經 TexImage2D 共用驗證與 GPU 記憶體記帳，成功配置後才從讀取緩衝複製。
+            preserve_driver_errors();const auto pending=saved_errors_;const auto pending_count=saved_error_count_;saved_error_count_=0;
+            const std::array<std::uint64_t,8> image{a[0],a[1],a[2],a[5],a[6],a[7],GL_RGBA,GL_UNSIGNED_BYTE};execute(GlOperation::TexImage2D,image,{},{});
+            const auto fresh=saved_errors_;const auto fresh_count=saved_error_count_;saved_errors_=pending;saved_error_count_=pending_count;
+            for(std::size_t i=0;i<fresh_count;++i)remember_error(fresh[i]);
+            if(!fresh_count){if(u(0)==GL_TEXTURE_1D)glCopyTexSubImage1D(u(0),n(1),0,n(3),n(4),n(5));else glCopyTexSubImage2D(u(0),n(1),0,0,n(3),n(4),n(5),n(6));}break;}
+        case GlOperation::PrioritizeTextures:{
+            std::vector<GLuint> names;std::vector<GLclampf> priorities;for(std::size_t at=0;at+8<=data.size();at+=8){GLuint name;GLfloat priority;std::memcpy(&name,data.data()+at,4);std::memcpy(&priority,data.data()+at+4,4);names.push_back(name);priorities.push_back(priority);}
+            glPrioritizeTextures(static_cast<GLsizei>(names.size()),names.data(),priorities.data());break;}
+        case GlOperation::TexParameterfv:glTexParameterfv(u(0),u(1),fv);break;
+        // 求值器：服務層已把控制點以 [u][v][分量] 緊密排列成 double，系統實作直接求值與錄製 display list。
+        case GlOperation::Map1d:glMap1d(u(0),d(1),d(2),static_cast<GLint>(gl_map_components(u(0))),n(3),dv);break;
+        case GlOperation::Map2d:{const auto k=static_cast<GLint>(gl_map_components(u(0)));glMap2d(u(0),d(1),d(2),k*n(6),n(3),d(4),d(5),k,n(6),dv);break;}
+        case GlOperation::MapGrid1d:glMapGrid1d(n(0),d(1),d(2));break;
+        case GlOperation::MapGrid2d:glMapGrid2d(n(0),d(1),d(2),n(3),d(4),d(5));break;
+        case GlOperation::EvalCoord1d:glEvalCoord1d(d(0));break;
+        case GlOperation::EvalCoord2d:glEvalCoord2d(d(0),d(1));break;
+        case GlOperation::EvalMesh1:glEvalMesh1(u(0),n(1),n(2));break;
+        case GlOperation::EvalMesh2:glEvalMesh2(u(0),n(1),n(2),n(3),n(4));break;
+        case GlOperation::EvalPoint1:glEvalPoint1(n(0));break;
+        case GlOperation::EvalPoint2:glEvalPoint2(n(0),n(1));break;
+        case GlOperation::GetMapdv:{
+            // 先以 GL_ORDER 求出 GL_COEFF 的數量；結果超過輸出空間時不寫入。
+            const auto target=u(0),query=u(1);const auto k=gl_map_components(target);const bool two=target>=0xdb0;
+            GLint order[2]{1,1};if(k)glGetMapiv(target,GL_ORDER,order);
+            const std::size_t count=!k?0:query==GL_COEFF?static_cast<std::size_t>(std::max(order[0],0))*static_cast<std::size_t>(two?std::max(order[1],0):1)*k:query==GL_ORDER?(two?2U:1U):(two?4U:2U);
+            if(!count || count*8>output.size()){GLdouble scratch[16]{};glGetMapdv(target,query,scratch);return 0;}
+            glGetMapdv(target,query,reinterpret_cast<GLdouble*>(output.data()));return count;
+        }
         default:remember_error(GL_INVALID_OPERATION);break;
         }return 0;
     }

@@ -4,10 +4,6 @@
         if(name.starts_with("DiInstallDriver") || name.starts_with("DiUninstallDriver")){
             const bool install=name.starts_with("DiInstallDriver");
             const auto failed=[&](std::uint32_t error){last_error_=error;return finish(0);};
-            const auto administrator=[&]{
-                initialize_tokens();const auto& token=runtime_.token_objects.at(effective_token_id());
-                return token.integrity>=0x3000U && std::any_of(token.groups.begin(),token.groups.end(),[](const auto& group){return group.sid==security::account_sid(*security::find_account("Administrators")) && (group.attributes&0x14U)==4U;});
-            };
             // (hwndParent, InfPath, Flags, NeedReboot)
             const auto flags=static_cast<std::uint32_t>(arg(2));
             if(flags&~(install?0x1aU:0x1U))return failed(1004);
@@ -103,10 +99,6 @@
         // SetupCopyOEMInf／SetupUninstallOEMInf：驅動套件放入或移出 sandbox DriverStore；需系統管理員權限。
         if(name.starts_with("SetupCopyOEMInf") || name.starts_with("SetupUninstallOEMInf")){
             const auto failed=[&](std::uint32_t error){last_error_=error;return finish(0);};
-            const auto administrator=[&]{
-                initialize_tokens();const auto& token=runtime_.token_objects.at(effective_token_id());
-                return token.integrity>=0x3000U && std::any_of(token.groups.begin(),token.groups.end(),[](const auto& group){return group.sid==security::account_sid(*security::find_account("Administrators")) && (group.attributes&0x14U)==4U;});
-            };
             if(name.starts_with("SetupUninstallOEMInf")){
                 // SetupUninstallOEMInf(InfFileName, Flags, Reserved)：只接受 %windir%\INF 下的 oemN.inf 檔名。
                 if(arg(2) || (arg(1)&~1U))return failed(87);const auto file=read(arg(0));const auto lower=folded(file);

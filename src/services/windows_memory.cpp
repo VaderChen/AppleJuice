@@ -1,6 +1,9 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/registry_store.hpp"
+#include "windows_write_watch.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/security_descriptor.hpp"
+#include "x64arm/unicode.hpp"
 #include <algorithm>
 #include <optional>
 #include <atomic>
@@ -21,7 +24,9 @@ std::uint64_t round_page(std::uint64_t value) {return (value+page-1)&~(page-1);}
 std::optional<Permissions> permissions(std::uint32_t mode) {
     if((mode&~0x1ffU) || ((mode&0x100U) && (mode&0xffU)==1))return std::nullopt;
     mode&=~0x100U;
-    switch (mode) {case 1:return 0;case 2:return 1;case 4:return 3;case 16:return 4;case 32:return 5;case 64:return 7;default:return std::nullopt;}
+    // PAGE_EXECUTE：x64 的分頁沒有「只能執行」，Windows 上這種頁面實際可讀；防護層會把程式碼設成 PAGE_EXECUTE 後再讀回核對。
+    // 實際權限給讀＋執行，查詢仍回報要求的保護值（virtual_page_protections）。
+    switch (mode) {case 1:return 0;case 2:return 1;case 4:return 3;case 16:return 5;case 32:return 5;case 64:return 7;default:return std::nullopt;}
 }
 std::uint32_t protection(Permissions value) {return value==7?64U:value==3?4U:value==5?32U:value==4?16U:value?2U:1U;}
 std::uint32_t residency_error(const std::error_code& error){
@@ -64,18 +69,14 @@ VirtualMemoryInformation WindowsServices::virtual_memory_information(const Guest
             allocation=found->first;initial=found->second.protection;allocation_state=0x2000;type=0x20000;
         }
     } else if (const auto next=regions.lower_bound(address);next!=regions.end()) end=std::min(end,next->first);
-    if(!allocation){
-        const auto stack=[&](std::uint64_t start,std::uint64_t size){if(size && address>=start && address-start<size){allocation=start;initial=4;end=std::min(end,start+size);allocation_state=0x2000;type=0x20000;}};
-        for(const auto& [id,thread]:threads_.items){(void)id;stack(thread.stack_base,thread.stack_size);}
-        for(const auto& [handle,fiber]:threads_.fibers){(void)handle;stack(fiber.stack_base,fiber.stack_size);}
-    }
+    // 堆疊與 VirtualAlloc 共用 reservation；不能從過期的 thread／fiber 描述重新捏造已釋放區域。
     if(section_image){allocation=view->base;initial=view->protection&0xffU;type=0x1000000U;allocation_state=0x2000;end=std::min(end,view->base+view->size);}
     if (mapped) {
         // 查詢從包含 lpAddress 的頁面開始，大小只涵蓋同狀態／權限的連續區間。
         base=address;end=std::min(end,mapped->base.value+mapped->size);mode=protection(mapped->permissions);allocation_state=0x1000;
         if (!allocation) {
             const auto* image=module_image(address,true);allocation=image?image->base:mapped->base.value;
-            initial=mode;type=image?0x1000000U:0x20000U;
+            initial=mode;type=image && !image->private_code?0x1000000U:0x20000U;
             if(image)end=std::min(end,image->base+image->size);
         }
         if(view){
@@ -142,7 +143,42 @@ bool WindowsServices::protection_allocation_range(std::uint64_t begin,std::uint6
     if(const auto* image=module_image(begin,true))return end<=image->base+((image->size+4095)&~UINT64_C(4095));
     return true;
 }
+#ifdef X64ARM_HOST_SERVICES_MEMORY_WATCH
+#include "windows_working_set_watch.inc"
+#endif
+void WindowsServices::register_thread_stack_memory(GuestMemory& memory,std::uint64_t base,std::uint64_t size){
+    if(!size)return;
+    const auto [entry,inserted]=runtime_.virtual_regions.emplace(base,VirtualRegion{size,4U});
+    if(!inserted)throw HostCallFault("執行緒堆疊保留區重疊");
+    try{memory.reserve_virtual_range(GuestAddress{base},size);}
+    catch(...){runtime_.virtual_regions.erase(entry);throw;}
+}
+void WindowsServices::release_thread_stack_memory(GuestMemory& memory,std::uint64_t base,std::uint64_t size){
+    if(!size)return;
+    const auto entry=runtime_.virtual_regions.find(base);
+    if(entry==runtime_.virtual_regions.end() || entry->second.size!=size)throw HostCallFault("執行緒堆疊保留區身分不符");
+    // 沿用公開釋放流程，允許堆疊包含已 decommit 的空洞，並清除保護／working-set 狀態。
+    std::array<std::uint64_t,5> values{base,0,0x8000U,0,0};
+    if(local_memory_operation(memory,3,values,-1,0,0))throw HostCallFault("執行緒堆疊保留區釋放失敗");
+}
 std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::uint32_t operation,std::array<std::uint64_t,5>& values,int descriptor,std::uint64_t frame,std::uint64_t output,const VirtualAddressRequirements* requirements){
+#ifdef X64ARM_HOST_SERVICES_MEMORY_WATCH
+    if(operation==12 || operation==13){
+        if(values[0]>4096 || values[1]!=4096*32)return 87;
+        std::vector<std::uint8_t> wire;std::size_t required{};
+        const auto error=local_working_set_watch(memory,operation==12,static_cast<std::size_t>(values[0]),wire,required);
+        values[2]=required;values[3]=wire.size();if(error || operation==12)return error;
+#if !defined(_WIN32)
+        for(std::size_t done=0;done<wire.size();){
+            const auto count=::pwrite(descriptor,wire.data()+done,wire.size()-done,static_cast<off_t>(done));
+            if(count<0 && errno==EINTR)continue;if(count<=0)return 31;done+=static_cast<std::size_t>(count);
+        }
+        return 0;
+#else
+        return 50;
+#endif
+    }
+#endif
     VirtualAddressRequirements transferred_requirements;
     if(operation==9){
 #if !defined(_WIN32)
@@ -185,7 +221,7 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
             const auto end = (arg(0) + count + 4095) & ~UINT64_C(4095);
             const auto previous=virtual_memory_information(memory,arg(0));const auto old=previous.protection;
             const auto basic=mode&0xffU;const bool copy=basic==8 || basic==128;
-            const Permissions permissions = basic == 1 ? 0 : basic == 2 ? 1 : basic == 4 || basic==8 ? 3 : basic == 16 ? 4 : basic == 32 ? 5 : 7;
+            const Permissions permissions = basic == 1 ? 0 : basic == 2 ? 1 : basic == 4 || basic==8 ? 3 : basic == 16 || basic == 32 ? 5 : 7; // PAGE_EXECUTE 實際可讀，見 permissions()
             const auto actual=static_cast<Permissions>((mode&0x100U)?0:permissions);
             bool shared_image_code=false;
             if(previous.type==0x1000000U && (permissions&permission(Access::Execute)))
@@ -201,8 +237,9 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
                 try {
                     auto protections=runtime_.virtual_page_protections;
                     for(auto cursor=at;cursor<end;cursor+=page){const auto info=virtual_memory_information(memory,cursor);if(copy && (info.allocation!=previous.allocation || (info.type!=0x1000000U && info.type!=0x40000U)))throw std::invalid_argument("私人寫入必須在同一映射內");protections.insert_or_assign(cursor,RuntimeState::PageProtection{mode,info.initial});}
+                    detail::collect_write_watch(runtime_,memory,at,end);
                     if(copy)memory.make_copy_on_write(GuestAddress{at},static_cast<std::size_t>(end-at),actual);else memory.protect(GuestAddress{at}, static_cast<std::size_t>(end - at), actual);
-                    runtime_.virtual_page_protections=std::move(protections);result = 1;
+                    runtime_.virtual_page_protections=std::move(protections);detail::arm_write_watch(runtime_,memory,at,end);result = 1;
                 }
                 catch (const MemoryFault&) { fail(487); } catch(const std::invalid_argument&){fail(5);}
                 if(result)values[4]=old;
@@ -245,11 +282,12 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
                 }catch(const std::bad_alloc&){fail(8);}
             }
         }
-        else if ((type&~0x20547000U) || !(type&0x3000) || !access ||
+        else if ((type&~0x20747000U) || !(type&0x3000) || !access ||
                  (placeholder && (!(type&0x2000) || (type&0x1000) || replace || mode!=1)) ||
                  (replace && (!requested || placeholder)) ||
                  ((type&0x20400000U) && (type&0x20400000U)!=0x20400000U) ||
                  ((type&0x20400000U) && ((size&65535U) || (requested&65535U)))) fail(87);
+        else if((type&0x200000U) && (!(type&0x2000U) || (type&0x20444000U)))fail(87);
         else if(dynamic_code_blocked() && ((*access&permission(Access::Execute)) || ((type&0x1000) && (*access&permission(Access::Write)) && executable_range(requested&~(page-1),round_page(requested+size)-(requested&~(page-1))))))fail(1655);
         else {
             auto begin=requested&~(reserve?granularity-1:page-1);
@@ -287,15 +325,16 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
                     };
                     try {
                         auto protections=runtime_.virtual_page_protections;
+                        detail::collect_write_watch(runtime_,memory,begin,begin+span);
                         if(type&0x1000)for(auto cursor=begin;cursor<begin+span;cursor+=page){
                             if(mode&0x100U)protections.insert_or_assign(cursor,RuntimeState::PageProtection{mode,reserve || replace?mode:found->second.protection});else protections.erase(cursor);}
-                        if (reserve){memory.reserve_virtual_range(GuestAddress{begin},span);reserved_recorded=true;regions.emplace(begin,VirtualRegion{span,mode,placeholder,false});}
+                        if (reserve){memory.reserve_virtual_range(GuestAddress{begin},span);reserved_recorded=true;regions.emplace(begin,VirtualRegion{span,mode,placeholder,false,bool(type&0x200000U),{}});}
                         for (const auto& [base,count] : commits) {memory.map(GuestAddress{base},count,actual);++committed;}
                         // 重新提交保留既有內容，但必須套用本次 flProtect。
                         if(reprotect)memory.protect(GuestAddress{begin},static_cast<std::size_t>(span),actual);
                         if(replace){found->second.placeholder=false;found->second.replaced_placeholder=true;found->second.protection=mode;}
                         runtime_.virtual_page_protections=std::move(protections);
-                        result=begin;
+                        detail::arm_write_watch(runtime_,memory,begin,begin+span);result=begin;
                         if (!requested && !(type&0x100000)) runtime_.next_virtual=(begin+span+granularity-1)&~(granularity-1);
                     } catch (const std::bad_alloc&) {
                         rollback();fail(8);
@@ -342,16 +381,40 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
             else if (begin<=frame && frame<end) fail(87);
             else {
                 memory.discard(GuestAddress{begin},static_cast<std::size_t>(end-begin));
+                detail::reset_write_watch(runtime_,memory,begin,end);
                 runtime_.virtual_page_protections.erase(runtime_.virtual_page_protections.lower_bound(begin),runtime_.virtual_page_protections.lower_bound(end));
                 runtime_.offered_memory_pages.erase(runtime_.offered_memory_pages.lower_bound(begin),runtime_.offered_memory_pages.lower_bound(end));
                 runtime_.reset_memory_pages.erase(runtime_.reset_memory_pages.lower_bound(begin),runtime_.reset_memory_pages.lower_bound(end));
-                if (type==0x8000){memory.release_virtual_range(GuestAddress{begin},end-begin);regions.erase(found);}values[0]=begin;values[1]=end-begin;result=1;
+                if (type==0x8000){
+                    memory.release_virtual_range(GuestAddress{begin},end-begin);regions.erase(found);
+                    // 呼叫者可釋放其他執行緒的堆疊；後續 thread teardown 不得再釋放重用此位址的新配置。
+                    for(auto& [id,thread]:threads_.items){(void)id;if(thread.owns_stack && thread.stack_base==begin && thread.stack_size==end-begin)thread.owns_stack=false;}
+                }values[0]=begin;values[1]=end-begin;result=1;
             }
         }
     }else if(operation==5){
         const auto address=values[0]&~(page-1);if(address>=address_limit)return 87;
         const auto info=virtual_memory_information(memory,address);
         values={info.base,info.allocation,info.size,static_cast<std::uint64_t>(info.initial)|(static_cast<std::uint64_t>(info.state)<<32),static_cast<std::uint64_t>(info.protection)|(static_cast<std::uint64_t>(info.type)<<32)};return 0;
+    }else if(operation==11){
+        // 固定信箱每批最多四頁；不傳送呼叫端指標，跨位元程序也使用相同頁面語義。
+        if(!values[4] || values[4]>4)return 87;
+        for(std::size_t i=0;i<values[4];++i)values[i]=working_set_page_flags(memory,values[i]);
+        return 0;
+    }else if(operation==10){
+        // 跨程序只傳輸客體 UTF-16 路徑，不傳送另一程序的指標或宿主檔名。
+#if !defined(_WIN32)
+        const auto path=mapped_file_name(values[0]);if(path.empty())return 0x10141U;
+        if(path.size()>32766)return 87;
+        const auto bytes=utf16_bytes(path);if(bytes.size()>values[1])return 122;
+        std::size_t done=0;while(done<bytes.size()){
+            const auto written=::pwrite(descriptor,bytes.data()+done,bytes.size()-done,static_cast<off_t>(done));
+            if(written<0 && errno==EINTR)continue;if(written<=0)return 8;done+=static_cast<std::size_t>(written);
+        }
+        values[4]=bytes.size();return 0;
+#else
+        return 50;
+#endif
     }else if(operation==6){
         if(values[0] && (values[0]>=address_limit || values[1]>address_limit-values[0]))return 87;
         if(values[0] && values[1] && values[1]<=UINT64_C(64)*1024*1024)memory.flush_instruction_cache(GuestAddress{values[0]},static_cast<std::size_t>(values[1]));
@@ -382,7 +445,12 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
 #endif
     }else return 87;
     }catch(const MemoryFault&){return operation<=1?299U:487U;}catch(const std::bad_alloc&){return 8;}catch(const std::invalid_argument&){return 87;}
-    if(error)return error;
+    if(error){
+        if(operation==2 || operation==3 || operation==4)
+            trace_virtual_transition(process_id(),operation==2?"allocate":operation==3?"release":"protect",
+                values[0],values[1],values[2],error);
+        return error;
+    }
     if(operation==2){const auto requested=values[0];values[0]=result;values[1]=requested?round_page(requested+values[1])-result:round_page(values[1]);}
     else if(operation==4){const auto end=round_page(values[0]+values[1]);values[0]&=~(page-1);values[1]=end-values[0];}
     if(operation==2 || operation==3 || operation==4)
@@ -392,9 +460,16 @@ std::uint32_t WindowsServices::local_memory_operation(GuestMemory& memory,std::u
 }
 std::span<const WindowsServiceDescriptor> working_set_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+#ifdef X64ARM_HOST_SERVICES_MEMORY_WATCH
+        {"kernel32.dll","K32InitializeProcessForWsWatch",1},{"psapi.dll","InitializeProcessForWsWatch",1},
+        {"kernel32.dll","K32GetWsChanges",3},{"psapi.dll","GetWsChanges",3},
+        {"kernel32.dll","K32GetWsChangesEx",3},{"psapi.dll","GetWsChangesEx",3},
+#endif
         {"kernel32.dll","K32EmptyWorkingSet",1},{"psapi.dll","EmptyWorkingSet",1},
         {"kernel32.dll","VirtualLock",2},{"kernel32.dll","VirtualUnlock",2},
-        {"kernel32.dll","GetProcessWorkingSetSize",3},{"kernel32.dll","SetProcessWorkingSetSize",3}
+        {"kernel32.dll","GetProcessWorkingSetSize",3},{"kernel32.dll","SetProcessWorkingSetSize",3},
+        {"kernel32.dll","GetProcessWorkingSetSizeEx",4},{"kernel32.dll","SetProcessWorkingSetSizeEx",4},
+        {"kernel32.dll","GetSystemFileCacheSize",3},{"kernel32.dll","SetSystemFileCacheSize",3},{"kernel32.dll","GetSystemRegistryQuota",2}
     };return table;
 }
 std::uint32_t WindowsServices::process_memory_copy(GuestMemory& memory,std::uint64_t handle,std::uint64_t address,std::uint64_t buffer,std::uint64_t size,bool writing,std::uint64_t& copied,bool native){
@@ -455,6 +530,39 @@ std::uint32_t WindowsServices::process_memory_copy(GuestMemory& memory,std::uint
 #endif
     }catch(const MemoryFault&){return 299;}catch(const std::bad_alloc&){return 8;}
 }
+std::uint64_t WindowsServices::working_set_page_flags(GuestMemory& memory,std::uint64_t address){
+    const auto mapping=memory.query(GuestAddress{address});
+    if(!mapping || runtime_.offered_memory_pages.contains(address&~UINT64_C(4095)))return 0;
+#ifdef X64ARM_HOST_SERVICES_MEMORY_WATCH
+    if(const auto resident=memory.working_set_resident(GuestAddress{address});resident && !*resident)return 0;
+#endif
+    return 1U|(static_cast<std::uint64_t>(protection(mapping->permissions))<<4)|
+        (shared_mapping_page(address)?0x8002U:0U)|(memory.page_locked(GuestAddress{address})?UINT64_C(1)<<22:0U);
+}
+std::uint32_t WindowsServices::process_working_set_ex(GuestMemory& memory,std::uint64_t handle,std::uint64_t buffer,std::uint64_t bytes){
+    std::uint32_t pid{};std::uint64_t birth{};
+    if(const auto error=process_memory_target(memory,handle,0x400U,pid,birth))return error;
+    const std::uint64_t unit=x86_?4U:8U,stride=unit*2,count=bytes/stride;
+    if(!count)return 24;
+    if(bytes>SIZE_MAX || count>memory.limit()/stride)return 8;
+    const auto bits=static_cast<std::uint8_t>(unit*8);
+    try{
+        memory.check(GuestAddress{buffer},static_cast<std::size_t>(count*stride),Access::Read);
+        memory.check(GuestAddress{buffer},static_cast<std::size_t>(count*stride),Access::Write);
+        std::vector<std::uint64_t> flags(static_cast<std::size_t>(count));
+        for(std::uint64_t first=0;first<count;first+=4){
+            std::array<std::uint64_t,5> values{};values[4]=std::min<std::uint64_t>(4,count-first);
+            for(std::uint64_t i=0;i<values[4];++i)values[i]=memory.load(GuestAddress{buffer+(first+i)*stride},bits);
+            std::uint32_t mode{};
+            const auto error=pid==process_id()?local_memory_operation(memory,11,values,-1):
+                remote_process_request(memory,pid,birth,15,11,values,mode);
+            if(error)return error;
+            for(std::uint64_t i=0;i<std::min<std::uint64_t>(4,count-first);++i)flags[static_cast<std::size_t>(first+i)]=values[i];
+        }
+        for(std::uint64_t i=0;i<count;++i)memory.store(GuestAddress{buffer+i*stride+unit},bits,flags[static_cast<std::size_t>(i)]);
+        return 0;
+    }catch(const MemoryFault&){return 998;}catch(const std::bad_alloc&){return 8;}
+}
 std::optional<std::uint32_t> WindowsServices::invoke_process_memory(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall call(state,memory,service);const auto saved_error=last_error_;const bool native=service.family=="ntdll.dll";
     auto symbol=service.symbol;if(native && symbol.starts_with("Zw"))symbol.remove_prefix(2);else if(native && symbol.starts_with("Nt"))symbol.remove_prefix(2);
@@ -466,6 +574,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_process_memory(GuestState& 
     const bool reading=symbol=="ReadProcessMemory" || symbol=="ReadVirtualMemory" || symbol=="Wow64ReadVirtualMemory64",writing=symbol=="WriteProcessMemory" || symbol=="WriteVirtualMemory" || symbol=="Wow64WriteVirtualMemory64";
     const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
     try{
+        if(symbol=="Toolhelp32ReadProcessMemory"){
+            // (th32ProcessID, lpBaseAddress, lpBuffer, cbRead, lpNumberOfBytesRead)：PID 為 0 或本程序時讀目前程序，否則以 PROCESS_VM_READ 開啟目標。
+            const auto pid=static_cast<std::uint32_t>(call(0));const auto count_pointer=call(4);
+            if(count_pointer)memory.check(GuestAddress{count_pointer},unit,Access::Write);
+            std::uint64_t handle=x86_?UINT32_MAX:UINT64_MAX;bool opened=false;
+            if(pid && pid!=process_id()){handle=nested_service(state,memory,"kernel32.dll","OpenProcess",{0x10,0,pid});if(!handle)return finish(0,last_error_);opened=true;}
+            std::uint64_t copied{};const auto error=process_memory_copy(memory,handle,call(1),call(2),call(3),false,copied,false);
+            if(opened)(void)nested_service(state,memory,"kernel32.dll","CloseHandle",{handle});
+            if(count_pointer)memory.store(GuestAddress{count_pointer},bits,copied);return finish(1,error);
+        }
         if(reading || writing){
             const auto count_bits=static_cast<std::uint8_t>(wow64?64:bits);
             const auto size=call(3),count_pointer=call(4);if(count_pointer)memory.check(GuestAddress{count_pointer},count_bits/8,Access::Write);
@@ -488,8 +606,54 @@ std::optional<std::uint32_t> WindowsServices::invoke_process_memory(GuestState& 
         if(error && !debug_transport)return finish(0,error);
         std::array<std::uint64_t,5> values{};std::uint64_t output=0,length=0,address_pointer=0,size_pointer=0;
         if(unmap){values[0]=call(extended?1:0);values[1]=native?0U:1U;values[2]=symbol=="UnmapViewOfSection"?0U:static_cast<std::uint32_t>(call(extended?2:1));}
+        else if(native && flush){values[0]=call(1);values[1]=call(2);} // NtFlushInstructionCache：位址與長度直接傳值。
         else if(native){
-            if(query){if(static_cast<std::uint32_t>(call(2)))return finish(0,static_cast<std::uint32_t>(call(2))==2?50U:0x10003U);output=call(3);length=call(4);values[0]=call(1);if(call(5))memory.check(GuestAddress{call(5)},unit,Access::Write);}
+            if(query){
+                const auto information=static_cast<std::uint32_t>(call(2));
+                if(information==4){
+                    const auto buffer=call(3),capacity=call(4),returned=call(5);
+                    if(returned)memory.check(GuestAddress{returned},unit,Access::Write);
+                    error=process_working_set_ex(memory,handle,buffer,capacity);
+                    if(!error && returned)memory.store(GuestAddress{returned},bits,capacity);
+                    return finish(0,error);
+                }
+                if(information==2){
+                    const auto buffer=call(3),capacity=call(4),returned=call(5);const auto header=x86_?8U:16U;
+                    if(!buffer)return finish(0,998);if(returned)memory.check(GuestAddress{returned},unit,Access::Write);
+                    std::u16string path;
+                    if(pid==process_id())path=mapped_file_name(call(1));
+                    else {
+#if !defined(_WIN32)
+                        auto pattern=(std::filesystem::temp_directory_path()/"x64arm-mapped-name-XXXXXX").string();std::vector<char> temporary(pattern.begin(),pattern.end());temporary.push_back(0);
+                        const auto fd=::mkstemp(temporary.data());if(fd<0)return finish(0,8);
+                        struct Close{int fd;~Close(){::close(fd);}} cleanup{fd};(void)::unlink(temporary.data());(void)::fcntl(fd,F_SETFD,FD_CLOEXEC);
+                        constexpr std::size_t maximum=65534;if(::ftruncate(fd,maximum))return finish(0,8);
+                        std::array<std::uint64_t,5> request{call(1),maximum,0,0,0};std::uint32_t remote_mode{};
+                        error=remote_process_request(memory,pid,birth,15,10,request,remote_mode,fd);
+                        if(error==0x10141U){last_error_=saved_error;call.return_to(state,0xc0000141U);return std::nullopt;}
+                        if(error)return finish(0,error);
+                        if(request[4]<2 || request[4]>maximum || request[4]%2)return finish(0,87);
+                        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(request[4]));std::size_t done=0;
+                        while(done<bytes.size()){const auto read=::pread(fd,bytes.data()+done,bytes.size()-done,static_cast<off_t>(done));if(read<0 && errno==EINTR)continue;if(read<=0)return finish(0,8);done+=static_cast<std::size_t>(read);}
+                        if(bytes[bytes.size()-2] || bytes.back())return finish(0,87);
+                        for(std::size_t i=0;i+2<bytes.size();i+=2)path.push_back(static_cast<char16_t>(bytes[i]|(static_cast<unsigned>(bytes[i+1])<<8)));
+#else
+                        return finish(0,50);
+#endif
+                    }
+                    if(path.empty()){last_error_=saved_error;call.return_to(state,0xc0000141U);return std::nullopt;}
+                    if(path.size()>32766)return finish(0,87);
+                    const auto bytes=utf16_bytes(path);const auto needed=header+bytes.size();
+                    if(returned)memory.store(GuestAddress{returned},bits,needed);
+                    if(capacity<header)return finish(0,24);
+                    if(capacity<needed){last_error_=saved_error;call.return_to(state,0x80000005U);return std::nullopt;}
+                    memory.check(GuestAddress{buffer},needed,Access::Write);memory.write(GuestAddress{buffer},std::vector<std::uint8_t>(header));
+                    memory.store(GuestAddress{buffer},16,path.size()*2);memory.store(GuestAddress{buffer+2},16,bytes.size());memory.store(GuestAddress{buffer+unit},bits,buffer+header);
+                    memory.write(GuestAddress{buffer+header},bytes);return finish(0,0);
+                }
+                if(information)return finish(0,0x10003U);
+                output=call(3);length=call(4);values[0]=call(1);if(call(5))memory.check(GuestAddress{call(5)},unit,Access::Write);
+            }
             else {
                 address_pointer=call(1);size_pointer=call(allocate && !allocation2?3U:2U);
                 memory.check(GuestAddress{address_pointer},unit,Access::Read);memory.check(GuestAddress{address_pointer},unit,Access::Write);
@@ -558,7 +722,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_process_memory(GuestState& 
             memory.store(GuestAddress{output+unit*2},32,static_cast<std::uint32_t>(values[3]));memory.store(GuestAddress{output+(x86_?12U:24U)},bits,values[2]);
             memory.store(GuestAddress{output+(x86_?16U:32U)},32,values[3]>>32);memory.store(GuestAddress{output+(x86_?20U:36U)},32,static_cast<std::uint32_t>(values[4]));memory.store(GuestAddress{output+(x86_?24U:40U)},32,values[4]>>32);
         }else if(protect)memory.store(GuestAddress{output},32,values[4]);
-        if(native && !query && !unmap){if(x86_ && (values[0]>UINT32_MAX || values[1]>UINT32_MAX))return finish(0,50);memory.store(GuestAddress{address_pointer},bits,values[0]);memory.store(GuestAddress{size_pointer},bits,values[1]);}
+        if(native && !query && !unmap && !flush){if(x86_ && (values[0]>UINT32_MAX || values[1]>UINT32_MAX))return finish(0,50);memory.store(GuestAddress{address_pointer},bits,values[0]);memory.store(GuestAddress{size_pointer},bits,values[1]);}
         return finish(query?structure_size:allocate?values[0]:1U,0);
     }catch(const MemoryFault&){return finish(0,998);}catch(const std::bad_alloc&){return finish(0,8);}
 }
@@ -630,6 +794,7 @@ std::uint32_t WindowsServices::refresh_memory_resource_notifications(bool force)
 }
 std::span<const WindowsServiceDescriptor> memory_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+        {"kernel32.dll","GetWriteWatch",6,0,0,1},{"kernel32.dll","ResetWriteWatch",2},
         {"kernel32.dll","CreateMemoryResourceNotification",1},{"kernel32.dll","QueryMemoryResourceNotification",2},
         {"kernel32.dll","InterlockedExchange",2},{"kernel32.dll","InterlockedIncrement",1},{"kernel32.dll","InterlockedDecrement",1},
         {"kernel32.dll","InterlockedExchangeAdd",2},{"kernel32.dll","InterlockedCompareExchange",3},
@@ -640,7 +805,7 @@ std::span<const WindowsServiceDescriptor> memory_service_descriptors() {
         {"psapi.dll","GetPerformanceInfo",2},{"kernel32.dll","K32GetPerformanceInfo",2},
         {"psapi.dll","GetProcessMemoryInfo",3},{"kernel32.dll","K32GetProcessMemoryInfo",3},
         {"kernel32.dll","FlushInstructionCache",3},{"kernel32.dll","FlushProcessWriteBuffers",0},{"psapi.dll","QueryWorkingSet",3},{"kernel32.dll","K32QueryWorkingSet",3},
-        {"kernel32.dll","ReadProcessMemory",5},{"kernel32.dll","WriteProcessMemory",5},
+        {"kernel32.dll","ReadProcessMemory",5},{"kernel32.dll","Toolhelp32ReadProcessMemory",5,0,0,1},{"kernel32.dll","WriteProcessMemory",5},
         {"kernel32.dll","VirtualAllocEx",5},{"kernel32.dll","VirtualFreeEx",4},{"kernel32.dll","VirtualProtect",4},{"kernel32.dll","VirtualProtectEx",5},
         {"kernel32.dll","UnmapViewOfFileEx",2},{"kernel32.dll","UnmapViewOfFile2",3},
         {"kernel32.dll","VirtualAlloc",4},{"kernel32.dll","VirtualFree",3},{"kernel32.dll","VirtualQuery",3},{"kernel32.dll","VirtualQueryEx",4},
@@ -659,13 +824,35 @@ std::span<const WindowsServiceDescriptor> memory_service_descriptors() {
         {"ntdll.dll","NtWow64ReadVirtualMemory64",5,0xa},{"ntdll.dll","NtWow64WriteVirtualMemory64",5,0xa},
         {"ntdll.dll","ZwReadVirtualMemory",5},{"ntdll.dll","ZwWriteVirtualMemory",5},
         {"ntdll.dll","ZwAllocateVirtualMemory",6},{"ntdll.dll","ZwFreeVirtualMemory",4},
-        {"ntdll.dll","ZwProtectVirtualMemory",5},{"ntdll.dll","ZwQueryVirtualMemory",6},{"ntdll.dll","ZwUnmapViewOfSection",2}
+        {"ntdll.dll","ZwProtectVirtualMemory",5},{"ntdll.dll","ZwQueryVirtualMemory",6},{"ntdll.dll","ZwUnmapViewOfSection",2},
+        {"ntdll.dll","NtFlushInstructionCache",3},{"ntdll.dll","ZwFlushInstructionCache",3}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     poll_job_termination(memory);
-    if(service.symbol=="ReadProcessMemory" || service.symbol=="WriteProcessMemory" || service.symbol=="FlushInstructionCache" || service.symbol.starts_with("UnmapViewOfFile") || service.symbol.starts_with("VirtualAlloc") || service.symbol.starts_with("VirtualFree") || service.symbol.starts_with("VirtualProtect") || service.symbol.starts_with("VirtualQuery") || service.family=="ntdll.dll")return invoke_process_memory(state,memory,service);
+    if(service.symbol=="GetWriteWatch" || service.symbol=="ResetWriteWatch"){
+#include "windows_write_watch_api.inc"
+    }
+    if(service.symbol=="ReadProcessMemory" || service.symbol=="Toolhelp32ReadProcessMemory" || service.symbol=="WriteProcessMemory" || service.symbol=="FlushInstructionCache" || service.symbol.starts_with("UnmapViewOfFile") || service.symbol.starts_with("VirtualAlloc") || service.symbol.starts_with("VirtualFree") || service.symbol.starts_with("VirtualProtect") || service.symbol.starts_with("VirtualQuery") || service.family=="ntdll.dll")return invoke_process_memory(state,memory,service);
     const WindowsCall call(state,memory,service);
+#ifdef X64ARM_HOST_SERVICES_MEMORY_WATCH
+    if(service.symbol.ends_with("InitializeProcessForWsWatch") || service.symbol.ends_with("GetWsChanges") || service.symbol.ends_with("GetWsChangesEx")){
+        const bool initialize=service.symbol.ends_with("InitializeProcessForWsWatch"),extended=service.symbol.ends_with("GetWsChangesEx");
+        std::uint32_t returned=0,error=0;
+        try{
+            std::uint32_t bytes=0;
+            if(!initialize){
+                if(extended){memory.check(GuestAddress{call(2)},4,Access::Write);bytes=static_cast<std::uint32_t>(memory.load(GuestAddress{call(2)},32));}
+                else bytes=static_cast<std::uint32_t>(call(2));
+            }
+            error=process_working_set_watch(memory,call(0),initialize,extended,initialize?0:call(1),bytes,returned);
+            if(initialize && error==0x10048U)error=0;
+            if(extended && (!error || error==122))memory.store(GuestAddress{call(2)},32,returned);
+            if(error==122 && bytes>=(x86_?8U:16U))memory.store(GuestAddress{call(1)},x86_?32:64,0);
+        }catch(const MemoryFault&){error=998;}
+        if(error)last_error_=error;call.return_to(state,error?0U:1U);return std::nullopt;
+    }
+#endif
     if(service.symbol.starts_with("GetNuma")){
         const auto name=service.symbol;const bool extended=name.ends_with("Ex");
         const auto fail=[&](std::uint32_t error){last_error_=error;call.return_to(state,0);return std::optional<std::uint32_t>{};};
@@ -747,19 +934,56 @@ std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,Gu
         catch(const std::system_error& error){last_error_=residency_error(error.code());}catch(const std::bad_alloc&){last_error_=8;}
         call.return_to(state,result);return std::nullopt;
     }
-    if(service.symbol=="GetProcessWorkingSetSize" || service.symbol=="SetProcessWorkingSetSize"){
-        const bool setting=service.symbol=="SetProcessWorkingSetSize";std::uint64_t result=0;
+    if(service.symbol=="GetSystemFileCacheSize" || service.symbol=="SetSystemFileCacheSize"){
+        // 檔案快取上限由宿主管理；查詢回報目前設定（最大值預設為實體記憶體大小），設定需要 SeIncreaseQuotaPrivilege。
+        std::uint64_t result=0;const unsigned unit=x86_?4:8;
+        try{
+            if(!runtime_.file_cache_maximum){const auto snapshot=native_system_performance();runtime_.file_cache_maximum=snapshot.error?UINT64_C(0x40000000):snapshot.pages[3]*snapshot.pages[9];}
+            if(service.symbol=="GetSystemFileCacheSize"){
+                if(!call(0) || !call(1) || !call(2))last_error_=87;
+                else {memory.check(GuestAddress{call(0)},unit,Access::Write);memory.check(GuestAddress{call(1)},unit,Access::Write);memory.check(GuestAddress{call(2)},4,Access::Write);
+                    memory.store(GuestAddress{call(0)},static_cast<std::uint8_t>(unit*8),runtime_.file_cache_minimum);memory.store(GuestAddress{call(1)},static_cast<std::uint8_t>(unit*8),std::min<std::uint64_t>(runtime_.file_cache_maximum,x86_?UINT32_MAX:UINT64_MAX));
+                    memory.store(GuestAddress{call(2)},32,runtime_.file_cache_flags);result=1;}
+            }else {
+                const auto minimum=call(0),maximum=call(1);const auto flags=static_cast<std::uint32_t>(call(2));
+                initialize_tokens();
+                if((flags&~0xfU) || (flags&3U)==3U || (flags&12U)==12U || (minimum!=maximum && minimum>maximum))last_error_=87;
+                else if(!runtime_.token_objects.at(effective_token_id()).has_privilege(5,true))last_error_=1314;
+                else {runtime_.file_cache_minimum=minimum;runtime_.file_cache_maximum=maximum;runtime_.file_cache_flags=flags&5U;result=1;}
+            }
+        }catch(const MemoryFault&){last_error_=998;}
+        call.return_to(state,result);return std::nullopt;
+    }
+    if(service.symbol=="GetSystemRegistryQuota"){
+        // 登錄配額已不強制：允許量回報為 DWORD 上限，使用量為目前登錄資料（路徑、值名稱與資料）的位元組數。
+        std::uint64_t result=0;
+        try{
+            std::uint64_t bytes=0;
+            const auto measure=[&]{for(const auto& [path,values]:runtime_.registry.keys){bytes+=path.size()*2;for(const auto& [name,entry]:values)bytes+=name.size()*2+entry.bytes.size();}};
+            if(registry_file_.empty() || !runtime_.network.external_io)measure();
+            else {RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(!transaction.error)measure();}
+            if(call(0)){memory.check(GuestAddress{call(0)},4,Access::Write);memory.store(GuestAddress{call(0)},32,UINT32_MAX);}
+            if(call(1)){memory.check(GuestAddress{call(1)},4,Access::Write);memory.store(GuestAddress{call(1)},32,std::min<std::uint64_t>(bytes,UINT32_MAX));}
+            result=1;
+        }catch(const MemoryFault&){last_error_=998;}
+        call.return_to(state,result);return std::nullopt;
+    }
+    if(service.symbol.starts_with("GetProcessWorkingSetSize") || service.symbol.starts_with("SetProcessWorkingSetSize")){
+        const bool setting=service.symbol.starts_with("SetProcessWorkingSetSize"),extended=service.symbol.ends_with("Ex");std::uint64_t result=0;
         const auto handle=call(0),minimum=call(1),maximum=call(2),mask=x86_?UINT64_C(0xffffffff):UINT64_MAX;
+        // Ex 版本另帶 QUOTA_LIMITS_HARDWS_* 旗標：同一上下限的啟用與停用不可同時指定。
+        const auto flags=extended && setting?static_cast<std::uint32_t>(call(3)):0U;
         const bool allowed=setting?current_process_handle(handle,0x100):current_process_handle(handle,0x400) || current_process_handle(handle,0x1000);
         if(!allowed)last_error_=current_process_handle(handle)?5:process_object_type(handle)==u"Process"?50:6;
         else try {
             if(!setting){
-                if(!minimum || !maximum)last_error_=87;
+                if(!minimum || !maximum || (extended && !call(3)))last_error_=87;
                 else {const auto limits=memory.working_set_limits();const unsigned unit=x86_?4:8;
-                    memory.check(GuestAddress{minimum},unit,Access::Write);memory.check(GuestAddress{maximum},unit,Access::Write);
+                    memory.check(GuestAddress{minimum},unit,Access::Write);memory.check(GuestAddress{maximum},unit,Access::Write);if(extended)memory.check(GuestAddress{call(3)},4,Access::Write);
                     memory.store(GuestAddress{minimum},static_cast<std::uint8_t>(unit*8),limits.minimum);
-                    memory.store(GuestAddress{maximum},static_cast<std::uint8_t>(unit*8),limits.maximum);result=1;}
-            }else if(minimum==mask && maximum==mask){
+                    memory.store(GuestAddress{maximum},static_cast<std::uint8_t>(unit*8),limits.maximum);if(extended)memory.store(GuestAddress{call(3)},32,runtime_.working_set_flags);result=1;}
+            }else if(extended && ((flags&~0xfU) || (flags&3U)==3U || (flags&12U)==12U))last_error_=87;
+            else if(minimum==mask && maximum==mask){
                 const auto trim=memory.trim_working_set();if(trim.error)last_error_=residency_error(trim.error);else result=1;
             }else if(!minimum || minimum>maximum || minimum==mask || maximum==mask)last_error_=87;
             else {
@@ -767,7 +991,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,Gu
                 if(snapshot.error)last_error_=snapshot.error;
                 else if(snapshot.pages[4]<=512 || maximum/page>snapshot.pages[4]-512)last_error_=87;
                 else if(const auto error=memory.set_working_set_limits(minimum,maximum))last_error_=residency_error(error);
-                else result=1;
+                else {result=1;if(extended){if(flags&1U)runtime_.working_set_flags=(runtime_.working_set_flags&~3U)|1U;if(flags&2U)runtime_.working_set_flags=(runtime_.working_set_flags&~3U)|2U;
+                    if(flags&4U)runtime_.working_set_flags=(runtime_.working_set_flags&~12U)|4U;if(flags&8U)runtime_.working_set_flags=(runtime_.working_set_flags&~12U)|8U;}}
             }
         }catch(const MemoryFault&){last_error_=998;}catch(const std::system_error& error){last_error_=residency_error(error.code());}catch(const std::bad_alloc&){last_error_=8;}
         call.return_to(state,result);return std::nullopt;
@@ -835,7 +1060,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,Gu
                     if(!restore.empty() && restore.back().base.value+restore.back().size==cursor && restore.back().permissions==perms)restore.back().size+=page;
                     else restore.push_back({GuestAddress{cursor},page,perms});
                 }
-                if(!status){memory.protect_ranges(restore);offered.erase(offered.lower_bound(address),offered.lower_bound(end));status=lost?170U:0U;}
+                if(!status){memory.protect_ranges(restore);detail::arm_write_watch(runtime_,memory,address,end);offered.erase(offered.lower_bound(address),offered.lower_bound(end));status=lost?170U:0U;}
             }else{
                 if(offered_overlap(address,end))status=487;
                 for(auto cursor=address;!status && cursor<end;){const auto mapping=memory.query(GuestAddress{cursor});
@@ -858,8 +1083,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,Gu
                         pending.emplace(cursor,OfferedMemoryPage{mapping->permissions,priority,true});}
                     // 此後端採立即丟棄策略；Reclaim 依實際 lost 狀態要求客體重寫資料。
                     if(!status){
+                        detail::collect_write_watch(runtime_,memory,address,end);
                         const auto discarded=memory.discard_contents(GuestAddress{address},static_cast<std::size_t>(size),offer);
-                        cleared=discarded.cleared;advised=discarded.advised;
+                        cleared=discarded.cleared;advised=discarded.advised;detail::arm_write_watch(runtime_,memory,address,end);
                         if(offer)offered.merge(pending);
                         for(auto item=runtime_.reset_memory_pages.lower_bound(address);item!=runtime_.reset_memory_pages.end() && item->first<end;++item)item->second=true;
                     }
@@ -926,16 +1152,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,Gu
             result=1;
         }
     } else if(symbol=="QueryWorkingSetEx" || symbol=="K32QueryWorkingSetEx"){
-        const unsigned unit=x86_?4U:8U;const auto bytes=static_cast<std::uint32_t>(arg(2));const auto bits=static_cast<std::uint8_t>(unit*8);
-        if(!current_process_handle(arg(0),0x400))fail(current_process_handle(arg(0))?5:process_object_type(arg(0))==u"Process"?50:6);
-        else if(bytes%(unit*2) || (bytes && !arg(1)))fail(87);
-        else{
-            memory.check(GuestAddress{arg(1)},bytes,Access::Read);memory.check(GuestAddress{arg(1)},bytes,Access::Write);
-            for(std::uint64_t offset=0;offset<bytes;offset+=unit*2){const auto address=memory.load(GuestAddress{arg(1)+offset},bits);const auto mapping=memory.query(GuestAddress{address});std::uint64_t flags=0;
-                if(mapping && !offered_overlap(address,address+1))flags=1U|(static_cast<std::uint64_t>(protection(mapping->permissions))<<4)|(shared_mapping_page(address)?0x8002U:0U)|(memory.page_locked(GuestAddress{address})?UINT64_C(1)<<22:0U);
-                memory.store(GuestAddress{arg(1)+offset+unit},bits,flags);
-            }result=1;
-        }
+        if(const auto error=process_working_set_ex(memory,arg(0),arg(1),static_cast<std::uint32_t>(arg(2))))fail(error);
+        else result=1;
     } else if(symbol=="FlushProcessWriteBuffers"){
         // 服務入口只在原生客體 worker 全數返回後執行；批次 join 的 acquire
         // 已納入每個 worker 的寫入，再由完整 fence 發布給後續客體執行。
@@ -950,6 +1168,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_memory(GuestState& state,Gu
             for(auto mapping=memory.next_mapping(GuestAddress{0});mapping;mapping=memory.next_mapping(GuestAddress{mapping->base.value+mapping->size})) {
                 for(auto base=mapping->base.value&~(page-1);base<mapping->base.value+mapping->size;base+=page) {
                     if(offered_overlap(base,base+page))continue;
+#ifdef X64ARM_HOST_SERVICES_MEMORY_WATCH
+                    if(const auto resident=memory.working_set_resident(GuestAddress{base});resident && !*resident)continue;
+#endif
                     if(!pages.empty() && pages.back().first==base) pages.back().second|=mapping->permissions;
                     else pages.emplace_back(base,mapping->permissions);
                 }

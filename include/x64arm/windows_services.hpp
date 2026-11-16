@@ -36,6 +36,7 @@
 #include "x64arm/usb.hpp"
 
 namespace x64arm {
+namespace dns_detail {struct Record;}
 namespace wlan {class Backend;}
 // 協調者本地一般服務的 provider 要啟動客體回呼時丟出；呼叫端恢復狀態交回完整路徑。
 struct LocalServiceRefused {};
@@ -54,6 +55,7 @@ struct MinidumpState;
 struct DemangleState;
 struct Msvcp100State;
 struct DeviceConfigurationState;
+struct SetupInfState;
 struct BluetoothState;
 class MachineShutdown;
 struct AccessibleState;
@@ -69,6 +71,7 @@ struct DirectMusicState;
 class NativePowerMonitor;
 struct FileMappingState;
 struct ThreadpoolState;
+namespace service_callback {template<class T> class Task;}
 struct HandleTransferState;
 struct ProcessState;
 struct RemoteThreadState;
@@ -78,6 +81,7 @@ struct TransactionState;
 struct KtmTransaction;
 struct DdeState;
 struct MciState;
+struct LegacyJoystick;
 struct JobState;
 struct PrintingState;
 struct MetafileState;
@@ -97,6 +101,7 @@ using D3D12Replay=std::function<void(NativeGraphics&,const std::function<std::sh
 struct VulkanState;
 struct DirectMLState;
 struct XessState;
+struct FidelityFxState;
 struct PmrState;
 struct WebView2State;
 struct WebBrowserState;
@@ -216,6 +221,9 @@ public:
 #endif
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_PARALLEL
     std::uint64_t resident_context_key(const GuestState&) const noexcept override;
+#ifdef X64ARM_HOST_SERVICES_MEMORY_WATCH
+    std::uint64_t memory_watch_thread_id(const GuestState& state) const noexcept override;
+#endif
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_SERVICE_REQUEST
     void resident_service_request(std::uint64_t,GuestAddress) override;
 #endif
@@ -282,7 +290,10 @@ public:
     static std::span<const WindowsServiceDescriptor> runtime_service_table();
     static constexpr std::size_t output_limit = 16U * 1024U * 1024U;
     static constexpr GuestAddress command_line_address{0x3001000000ULL}; // x64 系統區塊位於 MMU 視窗內（見 GuestMemory::native_mmu_window）。
-    static constexpr std::uint64_t process_heap = 0x200;
+    // 程序堆積的 handle 與 Windows 相同是可讀的 heap 開頭位址（PEB.ProcessHeap、GetProcessHeap）；固定在 KUSER 頁下方、
+    // 2 GiB 以內（x86／x64 共用，客體常式可用 imm32 比較），開頭維持 Windows 10 相容的簽章、Flags 與 ForceFlags 欄位。
+    static constexpr std::uint64_t process_heap = 0x7ffd0000;
+    void write_heap_header(GuestMemory& memory,std::uint64_t address,std::uint32_t flags);
     void initialize(GuestMemory& memory, std::u16string_view command_line, const std::filesystem::path& filesystem_root = {}, const std::filesystem::path& c_drive = {}, bool writable_files = false, const std::filesystem::path& install_root = {}, const std::map<char,std::filesystem::path>& drives = {}, std::string_view certificate_roots_file = {}, bool resident_translation = false);
     bool uses_guard_fast_path() const noexcept {return guard_fast_code_.value!=0;}
     std::u16string map_executable(const std::filesystem::path& path);
@@ -497,6 +508,7 @@ private:
     std::shared_ptr<DdeState> dde_;
     DdeState& dde_state();
     std::optional<std::uint32_t> invoke_dde(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_dde_lists(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_dde(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     void discard_dde(std::uint64_t);
     std::optional<std::uint32_t> invoke_user_session(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -586,6 +598,11 @@ private:
     std::optional<std::uint32_t> invoke_power_notification(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     struct ServiceControlHandle {std::u16string label;std::uint32_t access{},owner{};bool manager{},system{},guest{},status_handle{};std::uint64_t instance{};};
     std::map<std::uint64_t,ServiceControlHandle> service_control_handles_;
+    // LockServiceDatabase：Vista 起僅供相容，鎖定不影響資料庫，QueryServiceLockStatus 回報持有者與時間。
+    struct ServiceDatabaseLock {std::uint64_t handle{},since{};std::u16string owner;};
+    std::optional<ServiceDatabaseLock> service_database_lock_;
+    std::vector<struct ServiceCatalogEntry> service_catalog_entries();
+    std::optional<std::uint32_t> invoke_service_catalog(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     struct GuestServiceDispatch {
         std::u16string label;
         std::uint64_t main{},handler{},context{},thread{},dispatcher{},storage{},control_sequence{};
@@ -624,6 +641,7 @@ private:
     std::uint32_t begin_remote_process_thread_control(std::uint32_t,std::uint64_t,std::uint32_t,std::uint64_t&);
     std::optional<std::uint32_t> process_thread_target(GuestMemory&,std::uint64_t,std::uint32_t,std::uint32_t&,std::uint64_t* = nullptr);
     std::uint32_t process_memory_target(GuestMemory&,std::uint64_t,std::uint32_t,std::uint32_t&,std::uint64_t&);
+    std::uint32_t query_process_debug_state(GuestMemory&,std::uint64_t,bool&);
     std::uint32_t process_basic_information(GuestMemory&,std::uint64_t,std::array<std::uint64_t,5>&,std::uint32_t&,std::uint32_t&);
     void publish_process_information();
     void publish_thread_lifetime(std::uint64_t,std::uint32_t);
@@ -637,11 +655,15 @@ private:
     mutable MemoryStatusCache memory_status_cache_;
     // KUSER_SHARED_DATA（0x7ffe0000）的靜態欄位與 TickCount；TickCount 只在 15.625 ms 刻度改變時改寫。
     void map_shared_user_data(GuestMemory&);
+    std::uint32_t query_system_information(GuestMemory&,std::uint32_t,std::uint64_t,std::uint32_t,std::uint64_t);
     std::uint64_t shared_user_tick_{UINT64_MAX};
     std::uint32_t process_parent_id() const;
     std::uint32_t capture_process_snapshot(GuestMemory&,std::vector<ProcessSnapshot::Process>&);
     std::uint32_t capture_thread_snapshot(GuestMemory&,std::vector<ProcessSnapshot::Thread>&);
     std::vector<ProcessSnapshot::Thread> local_thread_snapshot();
+    struct KernelModuleRecord {std::uint64_t base{},size{};std::uint32_t references{};std::u16string path;};
+    std::vector<KernelModuleRecord> local_kernel_modules() const;
+    std::uint32_t capture_kernel_modules(GuestMemory&,std::vector<KernelModuleRecord>&);
     std::uint32_t local_process_information(std::uint32_t,std::array<std::uint64_t,5>&,std::uint32_t&,int);
     std::uint32_t collect_pss_process_data(GuestMemory&,std::vector<std::uint8_t>&);
     std::uint32_t local_process_api_information(GuestMemory&,std::uint32_t,bool,std::array<std::uint64_t,5>&);
@@ -659,6 +681,13 @@ private:
     bool remote_family_waiting()const;
     std::uint32_t local_memory_operation(GuestMemory&,std::uint32_t,std::array<std::uint64_t,5>&,int,std::uint64_t=0,std::uint64_t=0,const VirtualAddressRequirements* =nullptr);
     std::uint32_t process_memory_copy(GuestMemory&,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t,bool,std::uint64_t&,bool native=false);
+    std::uint64_t working_set_page_flags(GuestMemory&,std::uint64_t);
+    std::uint32_t process_working_set_ex(GuestMemory&,std::uint64_t,std::uint64_t,std::uint64_t);
+#ifdef X64ARM_HOST_SERVICES_MEMORY_WATCH
+    static std::uint32_t working_set_watch_status(std::uint32_t);
+    std::uint32_t local_working_set_watch(GuestMemory&,bool,std::size_t,std::vector<std::uint8_t>&,std::size_t&);
+    std::uint32_t process_working_set_watch(GuestMemory&,std::uint64_t,bool,bool,std::uint64_t,std::uint32_t,std::uint32_t&,bool=false);
+#endif
     std::optional<std::uint32_t> invoke_process_memory(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_nt_process(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_nt_native(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -671,10 +700,22 @@ private:
         bool operator==(const NativeOperation&) const = default;
     };
     std::map<std::uint64_t,NativeOperation> native_operations_;
+    std::optional<std::array<std::uint32_t,10>> concrt_default_policy_;
+    std::array<std::uint64_t,2> gdi_palette_hooks_{}; // gdi32 的 pfnRealizePalette／pfnSelectPalette 資料格（user32 可改寫）。
+    // keyed event：handle → 物件身分（名稱或 handle）；身分＋鍵 → 等待中的等待者與釋放者（各自的私有事件與是否已配對）。
+    struct KeyedEventParty {std::uint64_t event{};bool paired{};};
+    struct KeyedEventQueues {std::vector<KeyedEventParty> waiters,releasers;};
+    std::map<std::uint64_t,std::u16string> keyed_event_handles_;
+    std::map<std::u16string,std::map<std::uint64_t,KeyedEventQueues>> keyed_events_; // Scheduler::SetDefaultSchedulerPolicy 設定的預設政策值。
     std::uint64_t next_native_operation_{1};
     std::uint32_t native_section_access(std::uint64_t,std::uint32_t);
     std::optional<std::uint32_t> invoke_nt_section(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> finish_system_call(GuestState&,GuestMemory&);
+    void enter_process_instrumentation(GuestState&);
+    void restore_user_context(GuestState&,GuestMemory&,const GuestState&);
+    std::uint64_t native_dispatcher_entry(std::string_view) const;
+    bool enter_user_apc(GuestState&,GuestMemory&,GuestCallback,std::uint64_t,bool);
+    std::optional<std::uint32_t> finish_user_apc_entry(GuestState&,GuestMemory&);
     std::optional<std::uint32_t> process_thread_context(GuestMemory&,std::uint64_t,std::uint64_t,bool);
     std::uint32_t thread_context_bytes(std::uint64_t,std::vector<std::uint8_t>&,bool,bool=false);
     std::uint32_t remote_thread_context(GuestMemory&,std::uint32_t,std::vector<std::uint8_t>&,bool);
@@ -747,6 +788,8 @@ private:
     bool dynamic_code_blocked() const;
     bool executable_memory_range(const GuestMemory&,std::uint64_t,std::uint64_t) const;
     bool protection_allocation_range(std::uint64_t,std::uint64_t) const;
+    void register_thread_stack_memory(GuestMemory&,std::uint64_t,std::uint64_t);
+    void release_thread_stack_memory(GuestMemory&,std::uint64_t,std::uint64_t);
     using FileOpenArguments = std::array<std::uint64_t,7>;
     std::optional<std::uint32_t> invoke_file_open(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_file_close(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -789,6 +832,10 @@ private:
     bool socket_select_ready(const ThreadWait&) const;
     std::optional<std::uint32_t> invoke_socket_poll(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_socket_namespace(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // dnsapi 的記錄比較／複製、訊息編解碼、解析器快取、設定查詢與 DnsQueryEx（windows_dns_records.cpp）。
+    std::optional<std::uint32_t> invoke_dns_records(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // 將 RR 依 DNS_RECORD 版面逐筆配置並串接，登錄於 network.addresses 供 DnsRecordListFree 釋放；失敗時全部回收後丟出。
+    std::uint64_t dns_store_records(GuestState&,GuestMemory&,const std::vector<dns_detail::Record>&,unsigned charset,const std::vector<unsigned>* charsets=nullptr);
     std::optional<std::uint32_t> invoke_socket_database(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void poll_socket_lookups(GuestMemory&);
     void cancel_socket_lookups();
@@ -845,7 +892,11 @@ private:
     bool remote_thread_creations_waiting()const;
     std::uint32_t remote_thread_process_identity(std::uint64_t,std::uint32_t,std::uint32_t&,std::uint64_t&);
     std::uint64_t import_created_thread(std::uint32_t,std::uint64_t,std::uint32_t,std::uint32_t,std::uint32_t,bool);
-    std::uint32_t query_association(std::uint32_t,std::uint32_t,std::u16string,const std::u16string&,std::u16string&);
+    // location：找到值的類別機碼（相對 HKEY_CLASSES_ROOT）；AssocQueryKey 與 IQueryAssociations::GetKey 用它開啟機碼。
+    std::uint32_t query_association(std::uint32_t,std::uint32_t,std::u16string,const std::u16string&,std::u16string&,std::u16string* location=nullptr);
+    std::optional<std::uint32_t> invoke_association(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    struct QueryAssociationsObject {std::uint32_t references{1},flags{};std::u16string source;};
+    std::map<std::uint64_t,QueryAssociationsObject> query_associations_;std::uint64_t query_associations_vtable_{};
     std::optional<std::uint32_t> invoke_shell_execute(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_shell_item(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_shell_item(GuestState&,GuestMemory&,std::uint64_t,std::uint32_t);
@@ -853,14 +904,23 @@ private:
     std::uint64_t create_shell_item(GuestMemory&,std::u16string);
     std::uint64_t create_shell_enumerator(GuestMemory&,std::vector<std::u16string>,std::size_t = 0);
     std::uint32_t open_shell_file_stream(GuestMemory&,std::u16string,std::uint32_t,std::uint32_t,bool,std::uint64_t&);
+    // 同一套檔案開啟流程建立 IStream 或檔案 ILockBytes（StgCreateDocfile／StgOpenStorage 的後端）。
+    std::uint32_t open_file_object(GuestMemory&,std::u16string,std::uint32_t,std::uint32_t,bool,bool lock_bytes,std::uint64_t&);
     bool current_process_handle(std::uint64_t,std::uint32_t = 0) const;
     std::u16string_view process_object_type(std::uint64_t) const;
     std::u16string_view object_type(std::uint64_t) const;
-    struct ObjectMetadata {std::uint32_t access{},handles{},pointers{};std::uint64_t identity{};};
+    struct ObjectMetadata {std::uint32_t access{},handles{},pointers{};std::uint64_t identity{};std::string system_key;};
     std::optional<ObjectMetadata> object_metadata(std::uint64_t) const;
     std::optional<ObjectMetadata> mapping_object_metadata(std::uint64_t) const;
     std::optional<ObjectMetadata> job_object_metadata(std::uint64_t) const;
     std::optional<ObjectMetadata> process_object_metadata(std::uint64_t) const;
+    std::optional<ObjectMetadata> kernel_device_metadata(std::uint64_t) const;
+    void append_kernel_device_handles(std::vector<std::uint64_t>&) const;
+    void append_transaction_handles(std::vector<std::uint64_t>&) const;
+    std::string system_object_key(std::uint64_t) const;
+    struct SystemHandleRecord {std::uint64_t handle{},object{};std::uint32_t pid{},access{};std::uint16_t type{},flags{};};
+    std::uint32_t local_system_handles(std::vector<SystemHandleRecord>&);
+    std::uint32_t capture_system_handles(GuestMemory&,std::vector<SystemHandleRecord>&);
     std::optional<bool> process_signaled(std::uint64_t, bool input_idle = false);
     bool processes_waiting();
     const RuntimeImage* module_image(std::uint64_t address, bool containing = false) const;
@@ -873,9 +933,63 @@ private:
     std::optional<std::uint32_t> invoke_crt_error(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint64_t find_module(std::u16string_view name) const;
     GuestAddress resolve_service(std::string_view,std::string_view,bool required) const;
+    // 描述元本身的宿主服務入口（不經匯出改導向的客體快速常式）；沒有對應描述元時回 0。
+    GuestAddress host_service_stub(std::string_view family,std::string_view symbol) const;
+public:
+    // 宿主服務暫借的客體 heap 區塊：配置時清零，離開範圍時全部釋放（含例外與協程結束路徑）。
+    // 各服務共用，不再各自撰寫配置／釋放樣板。allocate／text 失敗時回 0，由呼叫端回報記憶體不足。
+    class GuestScratch {
+    public:
+        GuestScratch(WindowsServices& services,GuestMemory& memory,const GuestState& state):services_(services),memory_(memory),state_(state){}
+        GuestScratch(const GuestScratch&)=delete;GuestScratch& operator=(const GuestScratch&)=delete;
+        ~GuestScratch();
+        std::uint64_t allocate(std::size_t size);
+        std::uint64_t text(std::u16string_view value); // NUL 結尾的 UTF-16 複本
+    private:
+        WindowsServices& services_;GuestMemory& memory_;const GuestState& state_;std::vector<std::uint64_t> blocks_;
+    };
+private:
     std::map<std::string,std::uint64_t> builtin_export_targets(std::string_view) const;
     GuestAddress builtin_constant_address(std::string_view,std::string_view) const;
-    std::map<std::uint64_t,std::uint32_t> builtin_system_calls() const;
+    // NT 系統呼叫表：入口位址→編號（依位址排序的名次）、編號→入口與描述元。ntdll 入口在程序內固定，第一次建立後快取。
+    struct SystemCallTable {
+        std::map<std::uint64_t,std::uint32_t> numbers;
+        std::vector<std::uint64_t> targets;
+        std::vector<const WindowsServiceDescriptor*> descriptors;
+    };
+    const SystemCallTable& system_call_table() const;
+    const std::map<std::uint64_t,std::uint32_t>& builtin_system_calls() const {return system_call_table().numbers;}
+    // 複製的服務物件（例如 PeProgram 的副本）不沿用來源的表，第一次使用時重新建立。
+    struct SystemCallCache {
+        std::atomic<const SystemCallTable*> table{};std::unique_ptr<const SystemCallTable> owner;
+        SystemCallCache()=default;
+        SystemCallCache(const SystemCallCache&) noexcept {}
+        SystemCallCache& operator=(const SystemCallCache&) noexcept {table.store(nullptr);owner.reset();return *this;}
+    };
+    mutable SystemCallCache system_call_cache_;
+    // NtAllocateUuids 的時間版 UUID 時鐘：同一程序內單調遞增，時鐘倒退時遞增序號；節點為本程序的隨機節點。
+    struct UuidClock {std::uint64_t last{};std::uint32_t sequence{};std::array<std::uint8_t,6> node{};bool node_ready{};} uuid_clock_;
+    // RtlRandom／RtlRandomEx 的洗牌表（程序內共用）。
+    struct RtlRandomState {std::array<std::uint32_t,128> table{};std::uint32_t last{};bool ready{};} rtl_random_state_;
+    // kernel32 本機 Atom 表（AddAtom／FindAtom 等）；全域 Atom 表在視窗站命名空間。
+    struct LocalAtomTable {std::map<std::uint16_t,GuiAtom> atoms;std::map<std::u16string,std::uint16_t> names;} local_atoms_;
+    // 32 位元程序的 WOW64 檔案系統重新導向停用狀態（逐執行緒）。
+    std::map<std::uint64_t,bool> wow64_fs_redirection_;
+    // 同步屏障：以客體 SYNCHRONIZATION_BARRIER 位址為鍵；每輪一個手動重設事件。
+    struct SynchronizationBarrier {std::uint32_t total{},remaining{};std::uint64_t generation{},event{};std::vector<std::uint64_t> retired;};
+    std::map<std::uint64_t,SynchronizationBarrier> synchronization_barriers_;
+    // user32 舊式掛鉤（執行緒、掛鉤類型、程序位址 → HHOOK）與逐執行緒的 DPI 主控行為。
+    std::map<std::tuple<std::uint64_t,std::uint32_t,std::uint64_t>,std::uint64_t> legacy_hooks_;
+    // shlwapi 的 HUSKEY：同一相對路徑在 HKCU 與 HKLM 各自開啟的機碼（未開啟者為 0）。
+    struct ShellUsKey {std::uint64_t user{},machine{};};std::map<std::uint64_t,ShellUsKey> shell_us_keys_;
+    // RtlCreateAtomTable 建立的 atom 表格（與本機 atom 相同的表格型別）與釘選的 atom。
+    struct RtlAtomTable {LocalAtomTable atoms;std::set<std::uint16_t> pinned;};std::map<std::uint64_t,RtlAtomTable> rtl_atom_tables_;
+    // SHSetThreadRef 的每執行緒參照（不 AddRef）、SHCreateThreadRef 建立的物件與其 vtable，以及 SHSetInstanceExplorer 的程序參照。
+    std::map<std::uint64_t,std::uint64_t> shell_thread_refs_;std::set<std::uint64_t> shell_thread_ref_objects_;std::uint64_t shell_thread_ref_vtable_{},shell_instance_explorer_{};
+    std::uint64_t shell_inverse_cmap_{}; // SHGetInverseCMAP 的 32768 位元組反查表（常駐客體記憶體）
+    // SHOpenRegStream：讓既有記憶體 IStream 在最後一次 Release 時把內容寫回登錄值（接手 key 的所有權）。
+    bool bind_registry_stream(std::uint64_t stream,std::uint64_t key,std::u16string value);
+    std::map<std::uint64_t,std::uint32_t> dpi_hosting_behavior_;
     std::uint64_t load_module(GuestMemory&, std::u16string name, std::uint32_t flags, std::vector<std::uint64_t>& created, std::u16string_view search_directory = {}, GuestState* = nullptr);
     std::uint64_t module_export(GuestMemory&, std::uint64_t module, std::string_view symbol, std::optional<std::uint16_t> ordinal, std::vector<std::uint64_t>& created, unsigned depth = 0, GuestState* = nullptr);
     FileSnapshot read_module_file(GuestState*,GuestMemory&,const std::u16string&);
@@ -932,6 +1046,11 @@ private:
     UrlCacheState& url_cache_state();
     void release_url_cache() noexcept;
     void cache_http_response(HttpHandle&);
+    // WinINet Cookie（windows_http_cookies.cpp）：請求自動帶入、保存 Set-Cookie，以及 Cookie API 共用的查詢與儲存。
+    void add_http_cookies(HttpInput&);
+    void remember_http_cookies(HttpHandle&);
+    std::vector<HttpCookie> http_cookies(std::string_view url,bool http_only,bool third_party);
+    std::uint32_t store_http_cookie(std::string_view url,std::string_view text,bool http_only,bool third_party);
     std::shared_ptr<NativeHttp> read_http_cache(HttpHandle&);
     std::optional<std::uint32_t> invoke_fiber(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void destroy_fiber(GuestState&,GuestMemory&,std::uint64_t);
@@ -944,6 +1063,7 @@ private:
     std::shared_ptr<VulkanState> vulkan_;
     std::shared_ptr<DirectMLState> directml_;
     std::shared_ptr<XessState> xess_;
+    std::shared_ptr<FidelityFxState> fidelityfx_;
     std::shared_ptr<PmrState> msvcp_pmr_;
     std::shared_ptr<WebView2State> webview2_;
     std::shared_ptr<WebBrowserState> webbrowser_;
@@ -977,8 +1097,11 @@ private:
     bool vulkan_worker_ready() const noexcept;
     std::optional<std::uint32_t> invoke_directml(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_xess(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_fidelityfx(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_gaming_tcui(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_msvcp_pmr(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_msvcp_values(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::uint32_t secure_memory_copy(GuestMemory&,std::uint64_t destination,std::uint64_t capacity,std::uint64_t source,std::uint64_t count,unsigned unit,bool move);
     std::optional<std::uint32_t> invoke_msvcp_special_math(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_task_dialog(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_task_dialog(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
@@ -1051,10 +1174,19 @@ private:
     std::optional<std::uint32_t> resume_storage_copy(GuestState&,GuestMemory&,std::uint64_t,std::uint32_t);
     void discard_storage_copy(GuestState&,GuestMemory&,std::uint64_t);
     std::shared_ptr<MetafileState> metafile_playback_;
-    void finish_metafile_enumeration(std::uint64_t);
+    void finish_metafile_enumeration(GuestState&,GuestMemory&,std::uint64_t);
+    std::optional<std::uint64_t> import_enhanced_metafile(std::vector<std::uint8_t>);
+    // WMF 播放（windows_wmf.cpp）：記錄依 PlayMetaFileRecord 契約呼叫 GDI，物件存在客體 handle table；結束時還原選取物件並刪除建立的物件。
+    bool play_windows_metafile_record(GuestState&,GuestMemory&,std::uint64_t dc,std::uint64_t table,unsigned handles,std::span<const std::uint8_t> record);
+    bool play_windows_metafile(GuestState&,GuestMemory&,std::uint64_t dc,std::span<const std::uint8_t> bytes);
+    std::array<std::uint64_t,4> windows_metafile_selection(GuestState&,GuestMemory&,std::uint64_t dc);
+    void finish_windows_metafile_playback(GuestState&,GuestMemory&,std::uint64_t dc,std::uint64_t table,unsigned handles,const std::array<std::uint64_t,4>& selected);
+    bool write_guest_file(GuestState&,GuestMemory&,std::u16string_view path,std::span<const std::uint8_t> bytes);
+    std::optional<std::vector<std::uint8_t>> read_guest_file(GuestState&,GuestMemory&,std::u16string_view path,std::size_t minimum,std::size_t limit);
     std::shared_ptr<PrintingState> printing_;
     std::optional<std::uint32_t> invoke_printing(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_spooler(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_printer_data(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void printing_changed(unsigned);
     void poll_printer_form_notifications(bool reload);
     bool printer_form_notifications_waiting()const;
@@ -1090,6 +1222,7 @@ private:
     std::optional<std::uint32_t> invoke_accessible(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<DWriteState> dwrite_;
     std::shared_ptr<DeviceConfigurationState> device_configuration_;
+    std::shared_ptr<SetupInfState> setup_inf_;
     void prepare_machine_clock();
     std::shared_ptr<MachineShutdown> machine_shutdown_;
     void prepare_machine_shutdown();
@@ -1116,6 +1249,11 @@ private:
     std::optional<std::uint32_t> duplicate_bluetooth(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_device_configuration(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint32_t system_metric(std::uint32_t index,std::uint32_t dpi=96);
+    std::u16string keyboard_layout_name();
+    std::vector<std::u16string>* current_thread_ui_languages();
+    std::pair<std::uint32_t,DirectorySearch> search_directory(const std::string& path);
+    bool for_each_free_heap_page(GuestMemory&,const std::function<void(std::uint64_t,std::uint64_t)>&);
+    std::uint64_t crt_readlc_active_{},crt_sbh_threshold_{};std::uint32_t crt_sse2_enabled_{1};
     void refresh_device_configuration(bool hid);
     void poll_device_notifications(GuestMemory&);
     void finish_device_notification(GuestState&,GuestMemory&,std::uint64_t);
@@ -1147,6 +1285,7 @@ private:
     std::optional<std::uint32_t> resume_stack_walk(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     void discard_stack_walk(std::uint64_t,GuestMemory&,const GuestState&);
     FileInformation publish_font_file(std::span<const std::uint8_t>);
+    std::uint32_t publish_module_file(std::u16string_view,std::span<const std::uint8_t>);
     std::optional<std::uint32_t> invoke_dwrite(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_dwrite(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     void discard_dwrite(std::uint64_t,GuestMemory&,const GuestState&);
@@ -1157,6 +1296,7 @@ private:
     std::shared_ptr<MciState> mci_;
     MciState& mci_state();
     std::optional<std::uint32_t> invoke_mci(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_mci_string(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_mci_wait(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     void discard_mci_wait(std::uint64_t);
     void notify_mci(std::uint32_t,std::uint64_t,std::uint32_t);
@@ -1179,6 +1319,13 @@ private:
     std::shared_ptr<audio::InputBackend> audio_input_backend_;
     std::map<std::uint64_t,std::shared_ptr<WinmmWaveInput>> wave_inputs_;
     std::deque<GuestCallback> wave_callbacks_;
+    // shcore 縮放變更登錄（RegisterScaleChangeEvent／RegisterScaleChangeNotifications）。
+    struct ScaleChangeWindow {std::uint32_t device{};std::uint64_t window{};std::uint32_t message{};};
+    std::map<std::uint64_t,std::uint64_t> scale_change_events_;std::map<std::uint32_t,ScaleChangeWindow> scale_change_windows_;std::uint64_t next_scale_change_cookie_{};
+    // winmm 可安裝驅動程式執行個體（HDRVR → 模組、DriverProc、DRV_OPEN 回傳的 dwDriverId）。
+    struct InstallableDriver {std::uint64_t module{},procedure{},id{};};
+    std::map<std::uint64_t,InstallableDriver> installable_drivers_;
+    std::uint64_t next_installable_driver_{0x5ad00000};
     std::uint64_t wave_callback_registration_{};
     void poll_wave_output(GuestMemory&);
     bool wave_output_waiting() const;
@@ -1456,7 +1603,7 @@ private:
     std::uint32_t allocate_thread_identifier(std::uint64_t);
     std::uint32_t remote_thread_identifier(std::uint32_t,std::uint64_t,std::uint32_t);
     std::uint32_t thread_access(std::uint64_t handle) const;
-    bool dispatch_user_apc(GuestState&,GuestMemory&,std::uint64_t completion);
+    bool dispatch_user_apc(GuestState&,GuestMemory&,std::uint64_t completion,bool completion_error=false);
     struct CompletionResult {std::uint32_t value{},error{};bool ready{},guest_return{};};
     CompletionResult poll_completion(GuestState&,GuestMemory&,std::uint64_t handle,bool extended,bool expired);
     void advance_waitable_timers();
@@ -1658,6 +1805,8 @@ private:
     std::optional<std::uint32_t> invoke_registered_wait(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_thread(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     void begin_exception(GuestState& state, GuestMemory& memory, std::uint32_t code, std::uint32_t flags, std::span<const std::uint64_t> parameters);
+    bool enter_user_exception(GuestState& state, GuestMemory& memory);
+    std::optional<std::uint32_t> finish_user_exception_entry(GuestState& state, GuestMemory& memory);
     bool callback_protects_exception(const CallbackFrame&,std::uint32_t)const;
     std::optional<std::uint32_t> finish_protected_callback_exception(GuestState&,GuestMemory&);
     std::optional<std::uint32_t> advance_exception(GuestState& state, GuestMemory& memory);
@@ -1714,6 +1863,7 @@ private:
     std::uint32_t local_primary_thread_control(std::uint32_t,ExecutionMode,std::uint32_t,std::uint32_t&,std::vector<std::uint8_t>&,std::uint32_t target_thread=1);
     std::optional<std::uint32_t> invoke_thread_control(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint32_t export_transfer_handle(std::uint64_t,InheritedHandle&);
+    std::uint32_t export_transfer_handle_impl(std::uint64_t,InheritedHandle&);
     bool export_process_handle(std::uint64_t,InheritedHandle&);
     void import_process_handle(const InheritedHandle&);
     void import_transfer_handle(const InheritedHandle&);
@@ -1725,6 +1875,7 @@ private:
     bool shared_mapping_page(std::uint64_t) const;
     struct MappingViewInfo {std::uint64_t base{},size{};std::uint32_t protection{};};
     std::optional<MappingViewInfo> mapping_view_info(std::uint64_t) const;
+    std::u16string mapped_file_name(std::uint64_t) const;
     bool export_mapping_handle(std::uint64_t,InheritedHandle&) const;
     void import_mapping_handle(const InheritedHandle&);
     GuiState gui_;
@@ -1768,8 +1919,22 @@ private:
     void pump_gui_network(std::uint64_t only=0);
     void enqueue_gui_message(GuiMessage);
     void remember_gui_message(const GuiMessage&);
+    // 游標：控制代碼解析（自訂、被 SetSystemCursor 取代或原生系統游標）、依目前游標重設原生游標、回收動畫幀控制代碼。
+    const GuiIcon* resolve_gui_cursor(std::uint64_t handle,GuiIcon& system) const;
+    void present_gui_cursor();
+    void release_cursor_frames(std::uint64_t cursor);
+    // SwapMouseButton：實體左右鍵轉成邏輯按鍵（訊息、MK_* 旗標）；GetMouseMovePointsEx 的移動歷程記錄。
+    void swap_gui_mouse_buttons(GuiMessage&) const;
+    void record_mouse_move_point(std::int64_t x,std::int64_t y,std::uint32_t time,std::uint64_t extra);
+    // InSendMessage／GetCIMSSM 共用：最內層作用中的跨執行緒（或跨程序）傳送與其回呼框架位置。
+    std::pair<std::map<std::uint64_t,GuiSentMessage>::iterator,std::size_t> active_gui_sent_message(std::uint64_t* text_token=nullptr);
+    // {deviceType, originId}；in_send_message 為 GetCIMSSM 語義，目前來源可用時回傳 nullopt。
+    std::optional<std::array<std::uint32_t,2>> input_message_source(bool in_send_message);
     std::optional<std::uint32_t> invoke_imm(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint64_t imm_window_context(std::uint64_t);
+    // 輸入內容目前的目標視窗：使用此內容的焦點視窗、該執行緒最近的 IME 目標，或執行緒內第一個使用此內容的視窗。
+    std::uint64_t imm_context_window(std::uint64_t handle);
+    bool imm_disabled(std::uint64_t thread) const;
     std::optional<std::uint64_t> imm_control_message(GuestMemory&,const GuiMessage&,bool);
     void imm_release_context_storage(GuestMemory&,const GuestState&,std::uint64_t);
     void imm_notify_composition(std::uint64_t,std::uint32_t,bool=false,bool=false);
@@ -1788,6 +1953,14 @@ private:
     void pump_mouse_tracking();
     void pump_gui(GuestMemory& memory, bool wait,std::uint64_t wait_ticks=500000);
     void poll_desktop_notifications();
+    // Shell hook 視窗：依工作列視窗快照差異張貼 SHELLHOOK 訊息；notify 只送給同桌面的登錄視窗。
+    void poll_shell_hooks(bool announce=true);
+    // WinMM 搖桿：槽位與 HID 物件對應（joyGetPos(Ex)／DevCaps／SetCapture 共用）與擷取取樣。
+    void legacy_joystick(std::uint64_t id,LegacyJoystick& out);
+    void poll_joystick_captures();
+    void notify_shell_hook(std::uint32_t code,std::uint64_t lparam,std::uint64_t desktop);
+    bool shell_hook_candidate(std::uint64_t handle) const;
+    std::array<std::int32_t,4> gui_window_screen_rect(const GuiWindow& window);
     std::optional<std::uint32_t> invoke_desktop_notification(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool gui_native_control_message(GuestMemory&,const GuiMessage&);
     void finish_gui_control_notify(GuestMemory&,const GuiMessage&,std::uint64_t result=0);
@@ -1867,6 +2040,11 @@ private:
     std::uint64_t installed_physical_memory(const GuestMemory&) const;
     // 以宿主端暫存框架呼叫已登錄、不需客體回呼的同步服務，沿用其完整驗證與副作用。
     std::uint64_t nested_service(GuestState&,GuestMemory&,std::string_view family,std::string_view symbol,std::initializer_list<std::uint64_t> arguments);
+    std::uint64_t nested_service(GuestState&,GuestMemory&,std::string_view family,std::string_view symbol,std::span<const std::uint64_t> arguments);
+    // 經客體回呼續行的宿主服務：factory 回傳的協程以 co_await service_callback::call 呼叫客體入口，結果以 NestedResult 交回。
+    // 各家族共用這個入口，不再各自撰寫回呼起始樣板；kind 必須是靜態字串。
+    std::optional<std::uint32_t> nested_continuation(GuestState& state,GuestMemory& memory,std::string_view kind,
+        std::function<service_callback::Task<std::optional<std::uint32_t>>(GuestState&,GuestMemory&)> factory);
     void accumulate_dc_bounds(GuiDc&,const GuiDraw&);
     std::optional<std::uint32_t> invoke_gdi(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_gdi_text(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
@@ -1889,7 +2067,47 @@ private:
     std::uint64_t store_gui_icon(GuiIcon,std::uint32_t flags=0);
     std::uint64_t shell_system_icons(std::uint32_t size);
     std::optional<std::uint32_t> invoke_icon_api(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_shell_icons(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_ole_misc(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_ntdll_tables(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_ntdll_trees(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_ntdll_registry(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_xstate_context(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_ntdll_sync(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_keyed_event(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_comctl_arrays(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_comctl_misc(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_ntdll_extras(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_kernel32_legacy(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_ole_user_marshal(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_version_install(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_kernelbase_extras(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_geo(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_installable_driver(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_http_helpers(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_http_cookies(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_glu(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_glu_nurbs(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_glu_tess(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_wgl_fonts(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_wts(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // SetupAPI INF 解析家族（windows_setup_inf.cpp）。
+    std::optional<std::uint32_t> invoke_setup_inf(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // netapi32 工作群組電腦查詢家族（windows_netapi.cpp）。
+    std::optional<std::uint32_t> invoke_netapi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_iphelper_extras(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_user32_window_extras(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // HKEY_CLASSES_ROOT 合併檢視（使用者 Software\Classes、HKCR 本身、機器 Software\Classes，依序）：讀取字串值；回報機碼所在的根（0 使用者、1 HKCR、2 機器，-1 不存在）。
+    std::optional<std::u16string> class_registry_value(const std::u16string& key,const std::u16string& name);
+    int class_registry_root(const std::u16string& key);
+    // CoGetState／CoSetState 的每執行緒狀態物件、CoGetCurrentLogicalThreadId、CoRegisterPSClsid 的程序內對應、CoLoadLibrary(bAutoFree) 載入的模組。
+    std::map<std::uint64_t,std::uint64_t> com_thread_states_;std::map<std::uint64_t,std::array<std::uint8_t,16>> com_logical_threads_;
+    std::map<std::array<std::uint8_t,16>,std::array<std::uint8_t,16>> com_ps_clsids_;std::set<std::uint64_t> com_loaded_libraries_;
+    // 系統影像清單（16 或 32）：原生圖示可用時同 shell_system_icons，否則以檔案／資料夾／磁碟三個佔位項目建立；SHGetFileInfo 與 Shell_GetImageLists 共用。
+    std::uint64_t shell_image_list(std::uint32_t size);
     bool draw_gui_icon(GuestMemory&,std::uint64_t dc,std::uint64_t icon,std::int32_t x,std::int32_t y,std::uint32_t width,std::uint32_t height,std::uint32_t flags,std::uint64_t brush,std::uint32_t step=0);
+    std::uint64_t draw_image_list(GuestMemory&,const GuiImageList&,std::uint32_t index,std::uint64_t dc,std::int32_t x,std::int32_t y,std::uint32_t cx,std::uint32_t cy,
+        std::uint32_t source_x,std::uint32_t source_y,std::uint32_t background,std::uint32_t foreground,std::uint32_t style,std::uint32_t effect=0,std::uint32_t alpha=255);
     std::vector<GuiWindowCreation> plan_gui_control_children(std::uint64_t handle,bool wide);
     void layout_gui_combo(std::uint64_t handle);
     std::uint64_t write_gui_combo_info(GuestMemory&,std::uint64_t handle,std::uint64_t output);
@@ -1927,6 +2145,8 @@ private:
     const RuntimeImage* resource_image(std::uint64_t handle, bool containing = false) const;
     std::vector<GuestCallback> revoke_com_message_filter(GuestMemory& memory, std::uint64_t thread);
     std::optional<std::uint32_t> invoke_profile(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_legacy_device(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_vtable_proxy(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_version(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_locale(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_fonts(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1992,6 +2212,22 @@ private:
     std::optional<std::uint32_t> invoke_object_security(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool close_wait_object(std::uint64_t);
     std::optional<std::uint32_t> invoke_token(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // 依 token handle 與所需存取權取得虛擬 token；不存在回 ERROR_INVALID_HANDLE，權限不足回 ERROR_ACCESS_DENIED。
+    VirtualToken& token_handle_object(std::uint64_t handle,std::uint32_t rights);
+    std::vector<std::uint8_t> machine_account_domain();
+    std::optional<std::uint32_t> invoke_private_security(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_msvcp_runtime(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_d3dkmt_sync(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_d3dkmt_resource(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_gdi_misc(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_windows_metafile(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_mask_blit(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_icm(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_mscms(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_mscms_transform(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    void kmt_wake_waiters(GuestState&,GuestMemory&);
+    std::uint64_t msvcp_ctype_vector(GuestState&,GuestMemory&,std::uint64_t output);
+    void msvcp_cvt_vector(GuestState&,GuestMemory&,std::uint64_t output);
     std::pair<std::vector<std::uint8_t>,std::uint32_t> process_creation_token(std::uint64_t,unsigned = 0);
     std::pair<std::vector<std::uint8_t>,std::uint32_t> pipe_client_token(std::uint32_t);
     void initialize_tokens();
@@ -2078,7 +2314,7 @@ private:
     std::uint64_t type_library_info(GuestMemory&,std::uint64_t,std::uint32_t,bool native=false);
     std::uint64_t reference_type_library(GuestState&,GuestMemory&,std::uint64_t,std::uint32_t);
     std::uint32_t release_type_library(GuestState&,GuestMemory&,std::uint64_t);
-    void register_type_library(std::uint64_t,std::u16string_view path={},std::u16string_view help_directory={});
+    void register_type_library(std::uint64_t,std::u16string_view path={},std::u16string_view help_directory={},unsigned hive=0);
     std::u16string registered_type_library(const std::array<std::uint8_t,16>&,std::uint16_t,std::uint16_t,std::uint32_t);
     std::optional<std::uint32_t> resume_automation(GuestState&,GuestMemory&,std::uint64_t,std::uint32_t);
     void discard_automation(GuestState&,GuestMemory&,std::uint64_t);
@@ -2098,6 +2334,7 @@ private:
     std::optional<std::uint32_t> resume_com_error_retire(GuestState&,GuestMemory&);
     void discard_com_error_set(std::uint64_t);
     std::optional<std::uint32_t> invoke_winrt_error(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_matching_restricted_error(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_restricted_error(GuestState&,GuestMemory&,std::uint64_t,std::uint32_t);
     void discard_restricted_error(GuestState&,GuestMemory&,std::uint64_t);
     std::optional<std::uint32_t> resume_winrt_origin(GuestState&,GuestMemory&,std::uint64_t,std::uint32_t,bool setup);
@@ -2148,12 +2385,30 @@ private:
     std::optional<std::uint32_t> resume_com_operation(GuestState&,GuestMemory&,std::uint64_t,std::uint32_t);
     void discard_com_operation(GuestState&,GuestMemory&,std::uint64_t);
     std::optional<std::uint64_t> com_apartment(std::uint64_t) const;
+    // 是否仍有 MTA：有 MTA 執行緒（可排除正在離開的一個）或有 CoIncrementMTAUsage 的使用計數。
+    bool mta_alive(std::optional<std::uint64_t> except=std::nullopt) const;
+    std::optional<std::uint32_t> invoke_com_call_security(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::vector<GuestCallback> revoke_com_classes(GuestMemory&,std::uint64_t,bool callbacks = true);
     std::optional<std::uint32_t> resume_ole(GuestState&, GuestMemory&, const CallbackFrame&);
     bool shell_dialog_message(GuestState& state, GuestMemory& memory, const GuiMessage& message);
     std::optional<std::uint64_t> shell_browse_control(GuestMemory& memory, const GuiMessage& message, bool wide);
     void shell_browse_refresh(std::uint64_t handle);
     std::uint64_t shell_make_pidl(GuestMemory& memory, std::u16string path);
+    // base 為空：path 的絕對 PIDL（並登錄）；否則為 path 相對於資料夾 base 的子 PIDL（base 為空字串時的子項目即磁碟項目）。
+    std::uint64_t shell_encode_pidl(GuestMemory& memory, std::u16string_view base, std::u16string path, bool absolute);
+    std::uint64_t create_shell_folder(GuestMemory& memory,std::u16string path);
+    // 本 Shell 的 PIDL（磁碟根＋各路徑段）轉回完整路徑；不是本格式或不是絕對 PIDL 時回 nullopt。
+    // base 非空時把 pidl 當成相對於 base 的子項目清單解碼（SHCreateShellItem／SHCreateShellItemArray 的子 PIDL）。
+    std::optional<std::u16string> shell_pidl_path(GuestMemory& memory, std::uint64_t pidl, std::u16string base = {}) const;
+    // 殼層路徑的 SFGAO 屬性（IShellItem／IShellItemArray::GetAttributes 與 SHParseDisplayName 共用）；回傳 HRESULT。
+    std::uint32_t shell_path_attributes(const std::u16string& path,std::uint32_t requested,std::uint32_t& masked);
+    std::uint64_t create_shell_item_array(GuestMemory& memory,std::vector<std::u16string> paths);
+    static std::u16string known_folder_path(const GuestMemory& memory,std::uint64_t address); // KNOWNFOLDERID → 路徑（空字串＝不支援）
+    // DT_PATH_ELLIPSIS 的路徑省略（DrawText、PathCompactPath、PathCompactPathEx、PathSetDlgItemPath 共用）。
+    static std::u16string compact_path_text(std::u16string_view path,std::int32_t available,const std::function<std::int32_t(std::u16string_view)>& measure);
+    // 以 DC 目前字型量測的路徑省略（與 GetTextExtentPoint 相同，不在 DC 表中的 DC 使用預設字型）；回傳結果與是否放得下。
+    std::pair<std::u16string,bool> compact_path_for_dc(std::uint64_t hdc,std::u16string_view path,std::int32_t width);
+    std::optional<std::uint32_t> invoke_shell_idlist(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     void invalidate_window(std::uint64_t handle);
     void update_window_region(std::uint64_t handle,GuiRegion region);
     void finish_gui_erase_callback(const CallbackFrame&,std::uint64_t result);
@@ -2294,6 +2549,35 @@ private:
     std::optional<std::uint32_t> invoke_ldap(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_legacy_file(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_call_named_pipe(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_resolve_delay_loaded(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_ntdll_misc(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_ntdll_pure(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_kernel32_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_advapi32_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_user32_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_gdi32_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_oleaut32_conversion(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_oleaut32_dispatch(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_crt_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_crt_mbcs(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_crt_runtime_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    void initialize_crt_wctype(GuestMemory& memory);
+    // CreateStdDispatch 物件的內部 IUnknown 與 IDispatch vtable（每個程序建立一次）。
+    std::array<std::uint64_t,2> std_dispatch_vtables_{};
+    std::optional<std::uint32_t> invoke_shlwapi_string(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_shlwapi_misc(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_shell_paths(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_path_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_debug_print(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_url(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_rpc_client(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_nt_object(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_nt_continuation(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_nt_family(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_rtl_family(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_ntdll_loader(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::map<std::uint64_t,std::uint64_t> thread_alert_events_; // NtAlertThreadByThreadId：執行緒索引 → 自動重設的警示事件 handle。
+    std::optional<std::uint32_t> invoke_ndr_client_call(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_compatibility(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_crt_character(GuestState&,GuestMemory&,const WindowsServiceDescriptor&,
                                                    const ResidentHostEnvironment* = nullptr);
@@ -2333,6 +2617,7 @@ private:
     bool address_notification_waiting() const;
     void poll_address_notifications(GuestMemory&);
     std::uint32_t tcp_table_call(GuestMemory&,const WindowsCall&,std::string_view);
+    std::uint32_t udp_table_call(GuestMemory&,const WindowsCall&,std::string_view);
     std::optional<std::uint32_t> invoke_network_config(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_tls(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_digest(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -2359,7 +2644,7 @@ private:
     std::optional<std::uint32_t> invoke_crypto(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_time(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_mmio(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
-    std::optional<std::uint32_t> start_sort(GuestState& state, GuestMemory& memory, bool search = false);
+    std::optional<std::uint32_t> start_sort(GuestState& state, GuestMemory& memory, std::string_view symbol);
     std::optional<std::uint32_t> advance_sort(GuestState& state, GuestMemory& memory, std::uint64_t comparison, bool reuse_callback = false);
     struct DirectoryQueryState {
         std::vector<DirectoryEntry> entries;
@@ -2405,12 +2690,38 @@ private:
     std::uint32_t standard_file_type(unsigned) const;
     FileInformation file_handle_information(std::uint64_t);
     std::array<std::shared_ptr<NativeConsole>,3> consoles_{};
+    // CreateConsoleScreenBuffer 的螢幕緩衝區（windows_console_screen.cpp）：額外 handle（0x104 起，間隔 4）對應共享的螢幕內容。
+    // 作用中的螢幕內容一律放在主控台共用緩衝區，其餘保存在狀態物件；操作非作用中的螢幕時，服務入口暫時換入其內容
+    // 並以不顯示的視窗取代原生視窗，處理完再換回。console_screen_count_ 為 0 時入口完全不檢查。
+    struct ConsoleScreen;struct ConsoleScreenState;
+    // 色彩管理共用儲存與 mscms 已開啟設定檔（windows_icm_store.hpp）。
+    struct IcmStore;struct IcmProfiles;std::shared_ptr<IcmProfiles> icm_profiles_;IcmProfiles& icm_profiles();
+    std::shared_ptr<ConsoleScreenState> console_screen_state_;
+    std::size_t console_screen_count_{};
+    ConsoleScreenState& console_screens();
+    bool console_screen_handle(std::uint64_t) const;
+    bool console_screen_swapped() const; // 正在操作換入的非作用中螢幕：不可觸及原生終端設定
+    ConsoleBuffer* console_output_buffer();
+    unsigned console_output_stream() const;
+    bool console_screen_enter(GuestState&,GuestMemory&);
+    void console_screen_leave();
+    std::uint32_t activate_console_screen(std::shared_ptr<ConsoleScreen> target);
+    void close_console_screen(std::uint64_t handle);
     std::array<int,3> parent_stdio_{-1,-1,-1};
     bool console_handle(std::uint64_t) const;
     std::optional<std::uint32_t> invoke_console(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_console_control(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void publish_console_identity(bool attached,bool fresh=false);
     std::uint32_t generate_console_control(GuestMemory&,std::uint32_t,std::uint32_t);
+    struct ConsoleMember {std::uint32_t pid,group;std::uint64_t birth;};
+    std::uint32_t console_members(std::vector<ConsoleMember>&);
+    // 主控台別名與命令歷程使用的執行檔名稱：SetConsoleInputExeName 設定值，否則為主程式檔名。
+    std::u16string console_input_exe() const;
+    std::u16string console_input_exe_name_;
+    std::optional<std::uint32_t> invoke_console_screen(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::uint32_t console_terminal_write(unsigned stream,std::string_view text);
+    std::vector<std::uint64_t> gui_broadcast_targets() const;
+    std::optional<std::uint32_t> invoke_user32_legacy(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint32_t receive_console_control(GuestMemory&,std::uint32_t,std::uint64_t,std::uint64_t,std::uint32_t,std::uint32_t);
     std::uint32_t queue_console_control(GuestMemory&,std::uint32_t);
     bool console_input_ready(std::uint64_t,unsigned=0);
@@ -2420,7 +2731,7 @@ private:
     bool live_input_eof_{};
     bool standard_input_ready(std::uint64_t count, bool text, bool line, int timeout = 0);
     bool await_standard_input(GuestState& state, GuestMemory& memory, std::uint64_t count, bool text = false, bool line = false);
-    FileIoResult write_standard_output(unsigned stream, std::span<const std::uint8_t> bytes,bool retained=false);
+    FileIoResult write_standard_output(unsigned stream, std::span<const std::uint8_t> bytes,bool retained=false,bool unicode=false);
     std::uint32_t last_error_{};
     std::string trace_services_;
     // 診斷：X64ARM_SERVICE_COUNTS=1 時統計每個服務入口的呼叫次數與累計宿主時間（協調者／managed 與 worker 分列），結束時輸出。

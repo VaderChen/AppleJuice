@@ -1740,15 +1740,21 @@ static bool metal_skip_volume_dispatch(const GraphicsStage& stage){
     }
     return enabled && std::any_of(stage.unordered.begin(),stage.unordered.end(),[](const auto& view){return view.resource && view.resource->desc.dimension==4;});
 }
+// D3D11：沒有綁定 compute shader 時 Dispatch／DispatchIndirect 由執行環境丟棄（除錯層只發警告），不是致命錯誤。
+// X64ARM_TRACE_GRAPHICS_ERRORS 時各印一次，方便確認是程式本身未綁定而非綁定遺失。
+inline void metal_note_unbound_dispatch(const char* name){
+    static std::atomic<unsigned> reported{0};
+    if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS") && reported.fetch_add(1,std::memory_order_relaxed)<4)std::fprintf(stderr,"[metal] %s 未綁定 compute shader，依 D3D11 規則略過\n",name);
+}
 void MetalGl::graphics_dispatch_indirect(const GraphicsStage& stage,const std::shared_ptr<GraphicsResource>& arguments,std::uint32_t offset){@autoreleasepool{
     if(metal_skip_volume_dispatch(stage))return;
-    if(!stage.shader)throw std::invalid_argument("DispatchIndirect 缺少 CS");auto& args=metal_resource(arguments);
+    if(!stage.shader){metal_note_unbound_dispatch("DispatchIndirect");return;}auto& args=metal_resource(arguments);
     if(!args.buffer || (offset&3U) || std::uint64_t{offset}+12>args.desc.width)throw std::invalid_argument("間接運算參數越界或未對齊");
     auto& shader=dynamic_cast<MetalShader&>(*stage.shader);metal_resolve_shader(device_,shader);auto e=compute_encoder();[e setComputePipelineState:shader.compute];graphics_bind(nil,e,stage,false);
     if(metal_labels()){e.label=[NSString stringWithFormat:@"cs-indirect %016llx",static_cast<unsigned long long>(shader.content_key)];hang_note(e.label.UTF8String,args.buffer,offset,3);}[e dispatchThreadgroupsWithIndirectBuffer:args.buffer indirectBufferOffset:offset threadsPerThreadgroup:MTLSizeMake(shader.threads[0],shader.threads[1],shader.threads[2])];
     graphics_pending_.push_back(arguments);graphics_trace_dispatch(stage,{0,0,0},arguments,offset);if(metal_dispatch_sync())flush(true,"dispatch_sync");else if(metal_dispatch_commit())flush(false,"dispatch_commit");else ++pending_;batch_commit();
 }}
-void MetalGl::graphics_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){@autoreleasepool{if(metal_skip_volume_dispatch(stage))return;graphics_trace_dispatch_pre(stage);if(!stage.shader)throw std::invalid_argument("Dispatch 缺少 CS");auto& shader=dynamic_cast<MetalShader&>(*stage.shader);metal_resolve_shader(device_,shader);auto e=compute_encoder();
+void MetalGl::graphics_dispatch(const GraphicsStage& stage,std::array<std::uint32_t,3> groups){@autoreleasepool{if(metal_skip_volume_dispatch(stage))return;graphics_trace_dispatch_pre(stage);if(!stage.shader){metal_note_unbound_dispatch("Dispatch");return;}auto& shader=dynamic_cast<MetalShader&>(*stage.shader);metal_resolve_shader(device_,shader);auto e=compute_encoder();
     if(metal_labels()){
         e.label=[NSString stringWithFormat:@"cs %016llx %ux%ux%u",static_cast<unsigned long long>(shader.content_key),groups[0],groups[1],groups[2]];hang_note(e.label.UTF8String);
         auto& note=hang_labels_.back();

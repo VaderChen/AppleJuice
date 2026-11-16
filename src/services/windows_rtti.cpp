@@ -7,7 +7,7 @@ namespace x64arm {
 namespace {
 // MSVC x86 使用絕對指標；x64 的 RTTI／throw metadata 使用 32-bit image RVA。
 // 結構依 Clang MicrosoftCXXABI 的編譯器輸出，不依物件名稱或呼叫位址判斷。
-enum ExceptionKind : unsigned { BadCast,BadTypeid,NonRtti,Exception,BadAlloc,BadFunction,LogicError,LengthError,OutOfRange,RuntimeError,RegexError,InvalidArgument,OverflowError,SystemError,IosFailure,BadException,FutureError,ImproperLock };
+enum ExceptionKind : unsigned { BadCast,BadTypeid,NonRtti,Exception,BadAlloc,BadFunction,LogicError,LengthError,OutOfRange,RuntimeError,RegexError,InvalidArgument,OverflowError,SystemError,IosFailure,BadException,FutureError,ImproperLock,ImproperSchedulerAttach,ImproperSchedulerDetach,InvalidMultipleScheduling,InvalidSchedulerPolicyKey,InvalidSchedulerPolicyThreadSpecification,InvalidSchedulerPolicyValue,MissingWait,SchedulerResourceAllocationError };
 struct ExceptionType {std::string_view name,message;unsigned parent;bool error_code;};
 constexpr unsigned no_parent=UINT32_MAX;
 constexpr std::array<ExceptionType,static_cast<unsigned>(MsvcExceptionKind::Count)> exception_types{{
@@ -29,6 +29,15 @@ constexpr std::array<ExceptionType,static_cast<unsigned>(MsvcExceptionKind::Coun
     {".?AVbad_exception@std@@","bad exception",Exception,false},
     {".?AVfuture_error@std@@","future error",LogicError,true},
     {".?AVimproper_lock@Concurrency@@","Already locked",Exception,false},
+    // 其他 Concurrency 例外：預設建構與 std::exception 相同沒有訊息。
+    {".?AVimproper_scheduler_attach@Concurrency@@","Unknown exception",Exception,false},
+    {".?AVimproper_scheduler_detach@Concurrency@@","Unknown exception",Exception,false},
+    {".?AVinvalid_multiple_scheduling@Concurrency@@","Unknown exception",Exception,false},
+    {".?AVinvalid_scheduler_policy_key@Concurrency@@","Unknown exception",Exception,false},
+    {".?AVinvalid_scheduler_policy_thread_specification@Concurrency@@","Unknown exception",Exception,false},
+    {".?AVinvalid_scheduler_policy_value@Concurrency@@","Unknown exception",Exception,false},
+    {".?AVmissing_wait@Concurrency@@","Unknown exception",Exception,false},
+    {".?AVscheduler_resource_allocation_error@Concurrency@@","Unknown exception",Exception,false},
 }};
 // future_error 與 system_error 相同帶 error_code（值＋分類指標）；what 依 MSVC _Future_error_map。
 constexpr bool category_error(unsigned kind){return kind==SystemError || kind==IosFailure || kind==FutureError;}
@@ -130,6 +139,7 @@ void WindowsServices::initialize_msvc_exception_types(GuestMemory& memory){
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
         auto& data=runtime_.cxx_exceptions;
         if(!data.image.base){
+            data.image.private_code=true;
             // 每個程序共用型別目錄、繼承圖、throw metadata 與唯讀 helper 程式頁。
             // RTTI 與 STL 拋出入口沿用同一個執行緒例外物件及 unwind 生命週期。
             // 每個型別 metadata 佔 0x300；型別增加時程式頁跟著後移，避免與 metadata 重疊。
@@ -228,9 +238,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_rtti(GuestState& state,Gues
     const auto throw_exception=[&](unsigned kind,std::uint64_t custom_message=0,std::uint32_t error_code=0,bool random_error=false){throw_msvc_exception(state,memory,service,static_cast<MsvcExceptionKind>(kind),custom_message,error_code,0,random_error);};
     // VC10～VC12 exception 物件採 vptr、訊息指標、擁有權欄位；
     // x86 成員使用 ECX this 與 callee-pop，x64 使用統一暫存器 ABI。
-    if(symbol.starts_with("??0exception@") || symbol.starts_with("??1exception@") || symbol.starts_with("??4exception@") || symbol.starts_with("??0bad_") || symbol.starts_with("??1bad_") || symbol.starts_with("?what@exception@") || symbol.starts_with("?_type_info_dtor_internal_method@")){
-        const bool ctor=symbol.starts_with("??0"),copy=ctor && (symbol.find("AEBV01")!=std::string_view::npos || symbol.find("ABV01")!=std::string_view::npos);
-        const bool default_ctor=ctor && symbol.ends_with("@XZ"),assignment=symbol.starts_with("??4");
+    if(symbol.starts_with("??0exception@") || symbol.starts_with("??1exception@") || symbol.starts_with("??4exception@") || symbol.starts_with("??0bad_") || symbol.starts_with("??1bad_") || symbol.starts_with("?what@exception@") || symbol.starts_with("?_type_info_dtor_internal_method@") ||
+       symbol.starts_with("??4bad_") || symbol.starts_with("??_Fbad_") || symbol.find("__non_rtti_object@")!=std::string_view::npos){
+        // ??_F 是預設建構閉包：以預設訊息（"bad cast"／"bad typeid"）建構，沒有參數也沒有回傳值。
+        const bool closure=symbol.starts_with("??_F"),ctor=symbol.starts_with("??0") || closure,copy=ctor && (symbol.find("AEBV01")!=std::string_view::npos || symbol.find("ABV01")!=std::string_view::npos);
+        const bool default_ctor=ctor && (closure || symbol.ends_with("@XZ")),assignment=symbol.starts_with("??4");
         const bool borrowed=ctor && (symbol.find("AEBQEBDH@Z")!=std::string_view::npos || symbol.find("ABQBDH@Z")!=std::string_view::npos);
         const WindowsCall method(state,memory,((ctor && !default_ctor) || assignment?1U:0U)+(x86_?0U:1U)+(borrowed?1U:0U));
         const auto object=x86_?static_cast<std::uint32_t>(state.reg(Gpr::Rcx)):method(0);
@@ -241,24 +253,51 @@ std::optional<std::uint32_t> WindowsServices::invoke_rtti(GuestState& state,Gues
             memory.store(GuestAddress{object+unit},bits,0);
         }else{
             ensure_exception_types();const auto& data=runtime_.cxx_exceptions;
-            const auto kind=symbol.find("bad_cast@")!=std::string_view::npos?BadCast:symbol.find("bad_typeid@")!=std::string_view::npos?BadTypeid:Exception;
+            const auto kind=symbol.find("bad_cast@")!=std::string_view::npos?BadCast:symbol.find("bad_typeid@")!=std::string_view::npos?BadTypeid:
+                symbol.find("__non_rtti_object@")!=std::string_view::npos?NonRtti:Exception;
             if(assignment){
                 if(object!=argument){crt_exception_data(state,memory,object+unit,object+unit,true);crt_exception_data(state,memory,argument+unit,object+unit,false);}
             }else if(ctor){
                 memory.check(GuestAddress{object},3*unit,Access::Write);
                 if(copy)crt_exception_data(state,memory,argument+unit,object+unit,false);
-                else{
-                    const bool indirect=symbol.find("AEBQEBD")!=std::string_view::npos || symbol.find("ABQBD")!=std::string_view::npos;
+                else if(closure){
+                    const std::string_view text=kind==BadCast?"bad cast":"bad typeid";const auto copy_text=allocate_heap(memory,text.size()+1);
+                    if(!copy_text)throw std::bad_alloc{};memory.write(GuestAddress{copy_text},std::span(reinterpret_cast<const std::uint8_t*>(text.data()),text.size()));memory.store(GuestAddress{copy_text+text.size()},8,0);
+                    memory.store(GuestAddress{object+unit},bits,copy_text);memory.store(GuestAddress{object+2*unit},bits,1);
+                }else{
+                    // bad_cast(const char* const*) 是 __RTDynamicCast 用的私有建構子：借用指標指向的靜態訊息，不另配置。
+                    const bool pointer_message=symbol.find("PEBQEBD")!=std::string_view::npos || symbol.find("PBQBD")!=std::string_view::npos;
+                    const bool indirect=pointer_message || symbol.find("AEBQEBD")!=std::string_view::npos || symbol.find("ABQBD")!=std::string_view::npos;
                     const auto source=indirect?memory.load(GuestAddress{argument},bits):argument;
                     // Microsoft 的 int overload 借用訊息；int 數值不影響行為，析構不釋放借用資料。
-                    const auto text=borrowed?source:source?crt_duplicate_string(memory,source):0;
-                    memory.store(GuestAddress{object+unit},bits,text);memory.store(GuestAddress{object+2*unit},bits,text && !borrowed?1:0);
+                    const bool shared=borrowed || pointer_message;const auto text=shared?source:source?crt_duplicate_string(memory,source):0;
+                    memory.store(GuestAddress{object+unit},bits,text);memory.store(GuestAddress{object+2*unit},bits,text && !shared?1:0);
                 }
                 memory.store(GuestAddress{object},bits,data.vtable[kind]);
             }else if(symbol.starts_with("?what@")){
                 const auto text=memory.load(GuestAddress{object+unit},bits);method.return_to(state,text?text:data.message[kind]);return std::nullopt;
             }else crt_exception_data(state,memory,object+unit,object+unit,true);
         }
+        method.return_to(state,closure?0:object);return std::nullopt;
+    }
+    if(symbol.find("@Concurrency@@")!=std::string_view::npos && (symbol.starts_with("??0") || symbol.starts_with("?get_error_code@"))){
+        // Concurrency 例外（衍生自 std::exception）：(const char*) 複製訊息、預設建構沒有訊息；scheduler_resource_allocation_error 在
+        // std::exception 資料之後保存 HRESULT，get_error_code 讀回。x86 成員為 thiscall，由被呼叫端清理。
+        static constexpr std::array<std::pair<std::string_view,unsigned>,9> classes{{{"improper_lock@",ImproperLock},{"improper_scheduler_attach@",ImproperSchedulerAttach},
+            {"improper_scheduler_detach@",ImproperSchedulerDetach},{"invalid_multiple_scheduling@",InvalidMultipleScheduling},{"invalid_scheduler_policy_key@",InvalidSchedulerPolicyKey},
+            {"invalid_scheduler_policy_thread_specification@",InvalidSchedulerPolicyThreadSpecification},{"invalid_scheduler_policy_value@",InvalidSchedulerPolicyValue},
+            {"missing_wait@",MissingWait},{"scheduler_resource_allocation_error@",SchedulerResourceAllocationError}}};
+        unsigned kind=UINT32_MAX;for(const auto& [label,value]:classes)if(symbol.find(label)!=std::string_view::npos){kind=value;break;}
+        if(kind==UINT32_MAX)throw HostCallFault("未知 Concurrency 例外類別");
+        const bool getter=symbol.starts_with("?get_error_code@"),message=symbol.find("@PEBD")!=std::string_view::npos || symbol.find("@PBD")!=std::string_view::npos;
+        const bool hresult=kind==SchedulerResourceAllocationError && !getter;
+        const WindowsCall method(state,memory,(message?1U:0U)+(hresult?1U:0U)+(x86_?0U:1U));
+        const auto object=x86_?static_cast<std::uint32_t>(state.reg(Gpr::Rcx)):method(0);
+        if(getter){method.return_to(state,memory.load(GuestAddress{object+3*unit},32));return std::nullopt;}
+        initialize_msvc_exception_types(memory);memory.check(GuestAddress{object},3*unit+(kind==SchedulerResourceAllocationError?8U:0U),Access::Write);
+        const auto source=message?method(x86_?0U:1U):0;const auto text=source?crt_duplicate_string(memory,source):0;
+        memory.store(GuestAddress{object},bits,runtime_.cxx_exceptions.vtable[kind]);memory.store(GuestAddress{object+unit},bits,text);memory.store(GuestAddress{object+2*unit},bits,text?1:0);
+        if(hresult)memory.store(GuestAddress{object+3*unit},32,static_cast<std::uint32_t>(method((message?1U:0U)+(x86_?0U:1U))));
         method.return_to(state,object);return std::nullopt;
     }
     if(symbol=="?_Random_device@std@@YAIXZ"){

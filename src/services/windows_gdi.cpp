@@ -221,7 +221,11 @@ std::span<const WindowsServiceDescriptor> gdi_service_descriptors(){
         {"user32.dll","TabbedTextOutW",8},{"user32.dll","TabbedTextOutA",8},{"user32.dll","GetTabbedTextExtentW",5},{"user32.dll","GetTabbedTextExtentA",5},
         {"user32.dll","FillRect",3},{"user32.dll","FrameRect",3},{"user32.dll","InvertRect",2},{"user32.dll","DrawFocusRect",2},{"user32.dll","DrawEdge",4},{"user32.dll","DrawFrameControl",4},{"gdi32.dll","GdiFlush",0},{"gdi32.dll","BitBlt",9},{"gdi32.dll","StretchBlt",11},{"msimg32.dll","AlphaBlend",11},{"gdi32.dll","GdiAlphaBlend",11},{"msimg32.dll","TransparentBlt",11},{"gdi32.dll","PatBlt",6},{"gdi32.dll","CreateHatchBrush",2},{"gdi32.dll","Ellipse",5},
         {"user32.dll","DrawIcon",4},{"user32.dll","DrawIconEx",9},
-        {"gdi32.dll","SetStretchBltMode",2},{"gdi32.dll","GetStretchBltMode",1},{"gdi32.dll","SetBrushOrgEx",4},{"gdi32.dll","GetBrushOrgEx",2},{"gdi32.dll","CreatePatternBrush",1},
+        {"gdi32.dll","SetStretchBltMode",2},{"gdi32.dll","GetStretchBltMode",1},
+        {"gdi32.dll","SetTextCharacterExtra",2,0,0,2},{"gdi32.dll","SetTextJustification",3,0,0,6},{"gdi32.dll","GetTextCharacterExtra",1},{"gdi32.dll","SetRelAbs",2,0,0,2},{"gdi32.dll","GetRelAbs",2,0,0,2},
+        {"gdi32.dll","SetMapperFlags",2,0,0,2},{"gdi32.dll","GetAspectRatioFilterEx",2},{"gdi32.dll","SetICMMode",2,0,0,2},
+        {"gdi32.dll","SetColorAdjustment",2},{"gdi32.dll","GetColorAdjustment",2},{"gdi32.dll","SetSystemPaletteUse",2,0,0,2},{"gdi32.dll","GetSystemPaletteUse",1},
+        {"gdi32.dll","SetBitmapDimensionEx",4,0,0,6},{"gdi32.dll","GetBitmapDimensionEx",2},{"gdi32.dll","GetRasterizerCaps",2,0,0,2},{"gdi32.dll","SetBrushOrgEx",4},{"gdi32.dll","GetBrushOrgEx",2},{"gdi32.dll","CreatePatternBrush",1},
         {"gdi32.dll","GetBitmapBits",3},{"gdi32.dll","SetBitmapBits",3},{"gdi32.dll","CreateBrushIndirect",1},
         {"gdi32.dll","GetDeviceGammaRamp",2},{"gdi32.dll","SetDeviceGammaRamp",2},
         {"gdi32.dll","SelectPalette",3},{"gdi32.dll","RealizePalette",1},{"gdi32.dll","CreatePalette",1},
@@ -231,7 +235,7 @@ std::span<const WindowsServiceDescriptor> gdi_service_descriptors(){
         {"gdi32.dll","AnimatePalette",4},{"gdi32.dll","GetNearestPaletteIndex",2},{"gdi32.dll","GetNearestColor",2},
         {"gdi32.dll","UnrealizeObject",1},{"gdi32.dll","UpdateColors",1},
         {"gdi32.dll","GetBkMode",1},{"gdi32.dll","GetBkColor",1},{"gdi32.dll","GetTextColor",1},{"gdi32.dll","GetTextAlign",1},
-        {"gdi32.dll","CreateBitmap",5},{"gdi32.dll","CreateDIBSection",6},{"gdi32.dll","TranslateCharsetInfo",3},{"gdi32.dll","GetICMProfileA",3},{"gdi32.dll","GetICMProfileW",3},{"gdi32.dll","CreateDCA",4},{"gdi32.dll","CreateDCW",4},{"gdi32.dll","CreateICA",4},{"gdi32.dll","CreateICW",4},{"gdi32.dll","CreateCompatibleDC",1},{"gdi32.dll","DeleteDC",1},{"gdi32.dll","CreateCompatibleBitmap",3},
+        {"gdi32.dll","CreateBitmap",5},{"gdi32.dll","CreateDIBSection",6},{"gdi32.dll","TranslateCharsetInfo",3},{"gdi32.dll","CreateDCA",4},{"gdi32.dll","CreateDCW",4},{"gdi32.dll","CreateICA",4},{"gdi32.dll","CreateICW",4},{"gdi32.dll","CreateCompatibleDC",1},{"gdi32.dll","DeleteDC",1},{"gdi32.dll","CreateCompatibleBitmap",3},
         {"gdi32.dll","SelectObject",2},{"gdi32.dll","DeleteObject",1},{"gdi32.dll","SetTextAlign",2},{"gdi32.dll","SetTextColor",2},{"gdi32.dll","SetBkColor",2},{"gdi32.dll","SetBkMode",2},
         {"msimg32.dll","GradientFill",6,0,0,52},{"gdi32.dll","GdiGradientFill",6,0,0,52},
         {"gdi32.dll","ExtTextOutA",8},{"gdi32.dll","ExtTextOutW",8},{"gdi32.dll","TextOutA",5},{"gdi32.dll","TextOutW",5},
@@ -311,9 +315,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
                 for(unsigned i=0;i<768;++i)memory.store(GuestAddress{arg(1)+2ULL*i},16,(*ramp)[i]);result=1;
             }else last_error_=50;
         }
-    }else if(symbol=="GetICMProfileA" || symbol=="GetICMProfileW"){
-        if(!known_dc)last_error_=6;else if(!arg(1))last_error_=87;
-        else {memory.check(GuestAddress{arg(1)},4,Access::Write);last_error_=2015;} // 虛擬顯示裝置目前沒有關聯的 ICC 檔。
     }
     else if(symbol=="GdiFlush")result=flush_gdi_batch(memory);
     else if(symbol=="GdiGetBatchLimit" || symbol=="GdiSetBatchLimit"){
@@ -331,14 +332,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
             if(style==1)result=0xb005;
             else if(style==2){forward("CreateHatchBrush",{hatch,color});return std::nullopt;}
             else if(style==3 || style==7){forward("CreatePatternBrush",{hatch});return std::nullopt;}
-            else last_error_=style==5 || style==6 || style==8?50:87;
+            // BS_DIBPATTERN：lbHatch 為 packed DIB 的 HGLOBAL；BS_DIBPATTERNPT：為 packed DIB 指標；lbColor 為 iUsage。
+            else if(style==5){forward("CreateDIBPatternBrush",{hatch,color});return std::nullopt;}
+            else if(style==6){forward("CreateDIBPatternBrushPt",{hatch,color});return std::nullopt;}
+            else last_error_=style==8?50:87;
         }
     }
     else if(symbol=="CreateHatchBrush"){if(d(0)>5)last_error_=87;else{result=gui_.next_object++;gui_.brushes[result]=d(1);gui_.brush_hatches[result]=si(0);}}
     else if(symbol=="CreatePatternBrush"){
         const auto bitmap=gui_.bitmaps.find(arg(0));if(bitmap==gui_.bitmaps.end())last_error_=6;
         else {sync_raster_bitmap(memory,arg(0));GuiBitmap copy{bitmap->second.width,bitmap->second.height,bitmap->second.pixels};copy.bits_per_pixel=bitmap->second.bits_per_pixel;
-            const auto handle=gui_.next_object;gui_.brush_patterns.emplace(handle,std::move(copy));
+            const auto handle=gui_.next_object;gui_.brush_patterns.emplace(handle,std::move(copy));gui_.brush_pattern_sources[handle]=arg(0);
             try{gui_.brushes.emplace(handle,0);}catch(...){gui_.brush_patterns.erase(handle);throw;}
             result=handle;++gui_.next_object;
         }
@@ -385,6 +389,65 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
             }
         }
     }
+    else if(symbol=="SetTextCharacterExtra" || symbol=="GetTextCharacterExtra"){
+        // 每個字元後加上的間距（邏輯單位）：TextOut／ExtTextOut（未給 lpDx 時）與 GetTextExtentPoint 一併計入；失敗回 0x80000000。
+        if(!known_dc){last_error_=6;result=0x80000000U;}
+        else {result=static_cast<std::uint32_t>(dc.char_extra);if(symbol.starts_with("Set"))dc.char_extra=si(1);}
+    }
+    else if(symbol=="SetTextJustification"){
+        // (hdc, nBreakExtra, nBreakCount)：斷字數 0 即取消對齊；分攤方式與字元間距共用 gui_text_spacing。
+        if(!known_dc){last_error_=6;result=0;}
+        else {dc.break_count=std::max(si(2),0);dc.break_extra=dc.break_count?si(1):0;result=1;}
+    }
+    else if(symbol=="SetRelAbs" || symbol=="GetRelAbs"){
+        // ABSOLUTE 1／RELATIVE 2；Win32 的線條座標不受此模式影響，只保存並回報。
+        if(!known_dc)last_error_=6;else if(symbol=="SetRelAbs" && d(1)!=1 && d(1)!=2)last_error_=87;
+        else {result=dc.rel_abs;if(symbol=="SetRelAbs")dc.rel_abs=d(1);}
+    }
+    else if(symbol=="SetMapperFlags" || symbol=="GetAspectRatioFilterEx"){
+        // ASPECT_FILTERING（1）啟用時，字型對應只考慮與裝置長寬比相符的字型；顯示裝置的長寬比為 1:1。
+        if(!known_dc){last_error_=6;result=symbol=="SetMapperFlags"?0xffffffffU:0;}
+        else if(symbol=="SetMapperFlags"){result=dc.mapper_flags;dc.mapper_flags=d(1)&1U;}
+        else if(!arg(1))last_error_=87;
+        else {const std::uint32_t aspect=dc.mapper_flags?1U:0U;memory.store(GuestAddress{arg(1)},32,aspect);memory.store(GuestAddress{arg(1)+4},32,aspect);result=1;}
+    }
+    else if(symbol=="SetICMMode"){
+        // ICM_OFF 1、ICM_ON 2、ICM_QUERY 3、ICM_DONE_OUTSIDEDC 4；QUERY 回目前模式，其餘回傳設定前模式。
+        if(!known_dc)last_error_=6;else if(d(1)<1 || d(1)>4)last_error_=87;
+        else if(d(1)==3)result=dc.icm_mode;else {result=dc.icm_mode;dc.icm_mode=d(1);}
+    }
+    else if(symbol=="SetColorAdjustment" || symbol=="GetColorAdjustment"){
+        // COLORADJUSTMENT（24 位元組）：StretchBlt 的 HALFTONE 模式使用；設定時依文件範圍檢查各欄位。
+        if(!known_dc)last_error_=6;else if(!arg(1))last_error_=87;
+        else if(symbol=="GetColorAdjustment"){for(unsigned i=0;i<12;++i)memory.store(GuestAddress{arg(1)+2*i},16,dc.color_adjustment[i]);result=1;}
+        else {
+            std::array<std::uint16_t,12> value{};for(unsigned i=0;i<12;++i)value[i]=static_cast<std::uint16_t>(memory.load(GuestAddress{arg(1)+2*i},16));
+            const auto in=[](std::int32_t v,std::int32_t low,std::int32_t high){return v>=low && v<=high;};const auto signed_at=[&](unsigned i){return static_cast<std::int32_t>(static_cast<std::int16_t>(value[i]));};
+            const bool valid=value[0]==24 && !(value[1]&~3U) && value[2]<=8 && in(value[3],2500,65000) && in(value[4],2500,65000) && in(value[5],2500,65000) &&
+                value[6]<=4000 && in(value[7],6000,10000) && in(signed_at(8),-100,100) && in(signed_at(9),-100,100) && in(signed_at(10),-100,100) && in(signed_at(11),-100,100);
+            if(!valid)last_error_=87;else {dc.color_adjustment=value;result=1;}
+        }
+    }
+    else if(symbol=="SetSystemPaletteUse" || symbol=="GetSystemPaletteUse"){
+        // SYSPAL_STATIC 1、NOSTATIC 2、NOSTATIC256 3；系統範圍的設定，失敗回 SYSPAL_ERROR（0）。
+        if(!known_dc)last_error_=6;else if(symbol=="SetSystemPaletteUse" && (d(1)<1 || d(1)>3))last_error_=87;
+        else {result=gui_.system_palette_use;if(symbol=="SetSystemPaletteUse")gui_.system_palette_use=d(1);}
+    }
+    else if(symbol=="SetBitmapDimensionEx" || symbol=="GetBitmapDimensionEx"){
+        // 0.1 mm 單位的點陣圖實體尺寸，只供應用程式記錄；Set 可選擇回傳先前尺寸。
+        const auto found=gui_.bitmaps.find(arg(0));const auto output=arg(symbol.starts_with("Set")?3:1);
+        if(found==gui_.bitmaps.end())last_error_=6;
+        else {
+            if(output){memory.store(GuestAddress{output},32,static_cast<std::uint32_t>(found->second.dimension[0]));memory.store(GuestAddress{output+4},32,static_cast<std::uint32_t>(found->second.dimension[1]));}
+            if(symbol.starts_with("Set"))found->second.dimension={si(1),si(2)};
+            result=symbol.starts_with("Set") || output?1:0;if(!result)last_error_=87;
+        }
+    }
+    else if(symbol=="GetRasterizerCaps"){
+        // RASTERIZER_STATUS：nSize 6、wFlags＝TT_AVAILABLE｜TT_ENABLED、nLanguageID 0；只複製呼叫端給的大小。
+        if(!arg(0))last_error_=87;
+        else {const std::array<std::uint8_t,6> status{6,0,3,0,0,0};memory.write(GuestAddress{arg(0)},std::span(status).first(std::min<std::size_t>(d(1),6)));result=1;}
+    }
     else if(symbol=="SetStretchBltMode" || symbol=="GetStretchBltMode"){
         if(!known_dc)last_error_=6;else if(symbol=="SetStretchBltMode" && (d(1)<1 || d(1)>4))last_error_=87;
         else {result=dc.stretch_mode;if(symbol=="SetStretchBltMode")dc.stretch_mode=d(1);}
@@ -408,6 +471,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         else if(!alpha && !transparent && (mode&0x40000000U))last_error_=50; // CAPTUREBLT 需要視窗合成後端。
         else if(!si(3) || !si(4) || (reads_source && (!sw || !sh)))result=1;
         else if(reads_pattern && dc.brush==0xb005)result=1;
+        else if(pat && gui_.emf_recorders.contains(arg(0))){
+            // 中繼檔錄製 DC 沒有點陣表面：PatBlt 只讀 pattern 與目的地，以等價 ROP2（真值表 P*2+D）錄成填色。
+            GuiDraw fill;fill.kind=GuiDraw::Kind::Fill;const auto handle=dc.brush;
+            fill.color=handle==0xb012?dc.dc_brush_color:gui_.brushes.contains(handle)?gui_.brushes.at(handle):handle==0xb000?0xffffff:handle==0xb001?0xc0c0c0:handle==0xb002?0x808080:handle==0xb003?0x404040:0;
+            fill.hatch=gui_.brush_hatches.contains(handle)?gui_.brush_hatches.at(handle):-1;fill.pattern_opaque=dc.mode==2;fill.pattern_background=dc.background;fill.pattern_color=dc.color;fill.brush_origin=dc.brush_origin;
+            if(gui_.brush_patterns.contains(handle)){fill.pattern_brush=handle;fill.pattern_monochrome=gui_.brush_patterns.at(handle).bits_per_pixel==1;}
+            std::uint32_t truth=0;for(unsigned pattern_bit=0;pattern_bit<2;++pattern_bit)for(unsigned target_bit=0;target_bit<2;++target_bit)if((rop>>(pattern_bit*4+target_bit))&1U)truth|=1U<<(pattern_bit*2+target_bit);fill.rop2=truth+1;
+            const auto x0=si(1),y0=si(2),x1=end(si(1),si(3)),y1=end(si(2),si(4));fill.x=std::min(x0,x1);fill.y=std::min(y0,y1);fill.right=std::max(x0,x1);fill.bottom=std::max(y0,y1);
+            fill.clipped=dc.clipped;fill.clip=dc.clip;fill.excluded=dc.excluded;
+            if(raster_draw(memory,arg(0),fill))result=1;else last_error_=50;
+        }
         else {
             const auto src=reads_source?raster_surface(memory,arg(5),false):std::shared_ptr<RasterSurface>{};
             if(reads_source && !src)last_error_=50;
@@ -543,8 +617,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
         const auto selected=[&](const GuiDc& context){return context.bitmap==arg(0) || context.font==arg(0) || context.pen==arg(0) || context.brush==arg(0) || context.palette==arg(0);};
         const bool in_use=std::any_of(gui_.contexts.begin(),gui_.contexts.end(),[&](const auto& entry){return selected(entry.second);}) || std::any_of(gui_.saved_contexts.begin(),gui_.saved_contexts.end(),[&](const auto& entry){return std::any_of(entry.second.begin(),entry.second.end(),selected);});
         if(in_use){last_error_=170;}
-        else {rasters_.erase(arg(0));raster_shared_.erase(arg(0));gui_.pen_widths.erase(arg(0));gui_.extended_pens.erase(arg(0));gui_.brush_hatches.erase(arg(0));gui_.brush_patterns.erase(arg(0));
-            if(bitmap!=gui_.bitmaps.end() && bitmap->second.dib_address){if(bitmap->second.dib_view)(void)unmap_file_view(memory,bitmap->second.dib_view,true);else (void)free_heap(memory,bitmap->second.dib_address,state);}
+        else {rasters_.erase(arg(0));raster_shared_.erase(arg(0));gui_.pen_widths.erase(arg(0));gui_.extended_pens.erase(arg(0));gui_.brush_hatches.erase(arg(0));gui_.brush_dib_patterns.erase(arg(0));gui_.brush_patterns.erase(arg(0));gui_.brush_pattern_sources.erase(arg(0));
+            if(bitmap!=gui_.bitmaps.end() && bitmap->second.dib_address && !bitmap->second.dib_external){if(bitmap->second.dib_view)(void)unmap_file_view(memory,bitmap->second.dib_view,true);else (void)free_heap(memory,bitmap->second.dib_address,state);}
             result=((gui_.font_natives.erase(arg(0)),gui_.fonts.erase(arg(0))) || gui_.bitmaps.erase(arg(0)) || gui_.brushes.erase(arg(0)) || gui_.pens.erase(arg(0)) || gui_.regions.erase(arg(0)) || gui_.palettes.erase(arg(0)))?1:0;
         }
     }
@@ -604,6 +678,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_gdi(GuestState& state,Guest
                 if(cp>0xffff){draw.advances.push_back(0);if(pdy)draw.advances_y.push_back(0);}}
         }
         if(draw.glyph_indices){const auto widths=native_gdi_glyph_advances(draw.font,draw.text);if(draw.advances.empty())draw.advances=widths;}
+        if(!(ext && arg(7)) && (dc.char_extra || dc.break_count) && !draw.glyph_indices && !draw.text.empty()){
+            // SetTextCharacterExtra／SetTextJustification：未給 lpDx 時，以字元自然寬度加上逐字間距作為位移（lpDx 優先，不再加間距）。
+            const auto spacing=gui_text_spacing(dc,draw.text);
+            std::vector<std::int32_t> cumulative;if(native_gui_)if(const auto native=native_gui_->text_advances(draw.font,draw.text))cumulative=*native;
+            if(cumulative.size()!=draw.text.size()){cumulative.assign(draw.text.size(),0);std::int32_t extent=0;
+                for(std::size_t i=0;i<draw.text.size();++i){extent+=native_gui_?native_gui_->text_width(draw.font,std::u16string(1,draw.text[i])).value_or(metrics.average_width):metrics.average_width;cumulative[i]=extent;}}
+            std::int32_t previous=0;for(std::size_t i=0;i<cumulative.size();++i){draw.advances.push_back(checked(static_cast<std::int64_t>(cumulative[i])-previous+spacing[i]));previous=cumulative[i];}
+        }
         const auto fallback_width=static_cast<std::int32_t>(draw.text.size())*metrics.average_width;
         std::int32_t text_width=0,text_height=0;if(draw.advances.empty())text_width=native_gui_?native_gui_->text_width(draw.font,draw.text).value_or(fallback_width):fallback_width;
         else {std::int64_t x=0,y=0;for(std::size_t i=0;i<draw.advances.size();++i){x+=draw.advances[i];if(!draw.advances_y.empty())y+=draw.advances_y[i];checked(x);checked(y);}text_width=checked(x);text_height=checked(y);}

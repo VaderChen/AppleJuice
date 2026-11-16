@@ -3,6 +3,7 @@
 #include "gui_timing.hpp"
 #include "application.hpp"
 #include "modifier_keys.hpp"
+#include "system_cursor.h"
 #import <AppKit/AppKit.h>
 #import <CoreText/CoreText.h>
 #import <CoreVideo/CoreVideo.h>
@@ -1377,6 +1378,17 @@ NSImage* native_gui_icon_image(const GuiIcon& icon){
     return icon.width || icon.height || icon.system || !icon.image.empty() || !icon.rgba.empty()?list_icon(icon):nil;
 }
 namespace {
+// 協調者在 AppKit 事件等待中阻塞時，其他宿主執行緒以這個應用程式定義事件提早叫醒它（postEvent 可從任何執行緒呼叫）。
+// 事件迴圈辨識子型別後直接丟棄，不交給客體或 AppKit 派送。
+constexpr short gui_wake_subtype=0x5841;
+void post_gui_wake_event() noexcept {
+    @autoreleasepool {
+        NSApplication* application=NSApp;if(!application)return;
+        NSEvent* event=[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0 timestamp:0
+                                      windowNumber:0 context:nil subtype:gui_wake_subtype data1:0 data2:0];
+        if(event)[application postEvent:event atStart:NO];
+    }
+}
 NSWindowStyleMask native_window_style(const GuiWindow& model) {
     const auto inset=gui_frame_insets(model);
     if((model.frame_insets && !inset.left && !inset.top && !inset.right && !inset.bottom) || ((model.style&0x80000000U) && (model.style&0xc00000U)!=0xc00000U && !model.dialog))return NSWindowStyleMaskBorderless;
@@ -3015,12 +3027,7 @@ public:
         @autoreleasepool {
             NSCursor* next=nil;
             if(icon){if(!icon->system){NSImage* image=list_icon(*icon);if(!image)return false;next=[[NSCursor alloc] initWithImage:image hotSpot:NSMakePoint(icon->hotspot_x,icon->hotspot_y)];}
-                else {NSString* symbol=nil;switch(icon->system){
-                    case 32512:next=NSCursor.arrowCursor;break;case 32513:next=NSCursor.IBeamCursor;break;case 32515:next=NSCursor.crosshairCursor;break;
-                    case 32642:next=NSCursor.resizeLeftRightCursor;break;case 32643:next=NSCursor.resizeUpDownCursor;break;case 32645:next=NSCursor.operationNotAllowedCursor;break;case 32649:next=NSCursor.pointingHandCursor;break;
-                    case 32514:case 32650:symbol=@"hourglass";break;case 32516:symbol=@"arrow.up";break;case 32640:symbol=@"arrow.up.left.and.arrow.down.right";break;case 32641:symbol=@"arrow.up.right.and.arrow.down.left";break;case 32644:symbol=@"arrow.up.and.down.and.arrow.left.and.right";break;case 32651:symbol=@"questionmark";break;default:return false;}
-                    if(symbol){NSImage* image=[[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] copy];if(!image)return false;image.size=NSMakeSize(24,24);next=[[NSCursor alloc] initWithImage:image hotSpot:NSMakePoint(12,12)];}
-                }
+                else next=x64arm_system_cursor(icon->system); // 與 icons.mm 共用 OCR_*／IDC_* 對應
                 if(!next)return false;
             }
             cursor_=next;for(auto& [handle,window]:windows_){(void)handle;if([window.view isKindOfClass:X64ArmGuestView.class]){((X64ArmGuestView*)window.view).guestCursor=next;[window.view.window invalidateCursorRectsForView:window.view];}}
@@ -3103,6 +3110,8 @@ public:
     std::vector<GuiMessage> poll_for(std::uint64_t nanoseconds) override {
         return poll_for_impl(nanoseconds,true);
     }
+    bool supports_interrupt_wait() const noexcept override {return true;}
+    void interrupt_wait() noexcept override {post_gui_wake_event();}
     std::vector<GuiMessage> take_events(bool record_input) {
         // 預取僅暫存；實際交給客體時才記錄，避免預取逾期重複計數，或快速取用漏記後續加入的事件。
         if(record_input)if(const auto& timing=macos_detail::gui_timing();timing)for(const auto& queued:events_)
@@ -3125,6 +3134,8 @@ public:
                 event=[NSApp nextEventMatchingMask:NSEventMaskAny untilDate:(count==0 && events_.empty() && wait)?[NSDate dateWithTimeIntervalSinceNow:static_cast<double>(nanoseconds)*1e-9]:[NSDate distantPast] inMode:NSDefaultRunLoopMode dequeue:YES];}
             if(!event)break;
             if(!count)batch_deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(4);
+            // interrupt_wait 的喚醒事件只結束本次等待；其餘事件照常以不等待的方式排空。
+            if(event.type==NSEventTypeApplicationDefined && event.subtype==gui_wake_subtype)continue;
             {const NativeGuiPollTrace dispatch_trace("dispatch_event");
                 const auto type=event.type;const bool keyboard=type==NSEventTypeKeyDown || type==NSEventTypeKeyUp || type==NSEventTypeFlagsChanged;
                 const bool mouse=type==NSEventTypeLeftMouseDown || type==NSEventTypeLeftMouseUp || type==NSEventTypeRightMouseDown || type==NSEventTypeRightMouseUp || type==NSEventTypeOtherMouseDown || type==NSEventTypeOtherMouseUp || type==NSEventTypeMouseMoved || type==NSEventTypeLeftMouseDragged || type==NSEventTypeRightMouseDragged || type==NSEventTypeOtherMouseDragged || type==NSEventTypeScrollWheel;
@@ -3304,6 +3315,9 @@ public:
         if(real_)real_->raw_input_policy(keyboard,mouse,sink);else raw_policy_={keyboard,mouse,sink};
     }
     std::vector<GuiMessage> poll_for(std::uint64_t nanoseconds) override {return real("poll_for").poll_for(nanoseconds);}
+    // 喚醒只投遞 NSApp 事件，不讀取（可能尚未建立的）real_；AppKit 未建立時沒有等待可叫醒。
+    bool supports_interrupt_wait() const noexcept override {return true;}
+    void interrupt_wait() noexcept override {post_gui_wake_event();}
     void prefetch_events() override {if(real_)real_->prefetch_events();}
     std::optional<GuiFontMetrics> font_metrics(const GuiFont& font) override {return real("font_metrics").font_metrics(font);}
     std::optional<std::int32_t> text_width(const GuiFont& font,const std::u16string& text) override {return real("text_width").text_width(font,text);}

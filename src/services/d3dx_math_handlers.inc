@@ -11,6 +11,7 @@
         const auto multiply=[](const Matrix& a,const Matrix& b){Matrix m{};for(unsigned i=0;i<4;++i)for(unsigned j=0;j<4;++j)for(unsigned k=0;k<4;++k)m[i*4+j]+=a[i*4+k]*b[k*4+j];return m;};
         const auto rotation=[](const Vector& q){const auto x=q[0],y=q[1],z=q[2],w=q[3];return Matrix{1-2*(y*y+z*z),2*(x*y+z*w),2*(x*z-y*w),0,2*(x*y-z*w),1-2*(x*x+z*z),2*(y*z+x*w),0,2*(x*z+y*w),2*(y*z-x*w),1-2*(x*x+y*y),0,0,0,0,1};};
         auto result=arg(0);
+#include "d3dx_math_extras.inc"
         if(symbol=="D3DXSHDot" || symbol=="D3DXSHEvalConeLight"){
             const auto order=static_cast<unsigned>(arg(0));if(order<2 || order>6){if(symbol=="D3DXSHDot")conversion_result(state,x86_,0,true);arg.return_to(state,symbol=="D3DXSHDot"?0:0x8876086cU);return std::nullopt;}
             std::array<float,36> a{},b{},c{};

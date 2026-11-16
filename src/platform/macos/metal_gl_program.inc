@@ -59,8 +59,10 @@ std::optional<std::uint64_t> MetalGl::programmable_execute(GlOperation op,std::s
             for(unsigned i=0;i<count;++i)for(unsigned c=0;c<columns;++c)for(unsigned r=0;r<components;++r){const auto at=uniform.offset+(target.element+i)*uniform.array_stride+c*uniform.matrix_stride+r*4;auto source=(i*columns+c)*components+r;if(matrix && u(2))source=(i*components+r)*columns+c;std::uint32_t value;std::memcpy(&value,data.data()+source*4,4);if(location.type==0x8b56)value=integer?(value!=0):(std::bit_cast<float>(value)!=0);std::memcpy(stage.uniforms.data()+at,&value,4);}}}return 0;}
     case GlOperation::GenFramebuffers:{if(n(0)<0 || output.size()<static_cast<std::size_t>(u(0))*4){error(0x501);return 0;}for(unsigned i=0;i<u(0);++i){while(!gl_.next_framebuffer || gl_.framebuffers.contains(gl_.next_framebuffer))++gl_.next_framebuffer;const auto id=gl_.next_framebuffer++;gl_.framebuffers[id]=std::make_shared<GlFramebuffer>();std::memcpy(output.data()+i*4,&id,4);}return 0;}
     case GlOperation::ActiveTexture:if(u(0)<0x84c0 || u(0)>=0x84c0+gl_.texture_units.size())error(0x500);else{gl_.texture_units[gl_.active_texture]=state_.binding;gl_.active_texture=u(0)-0x84c0;state_.binding=gl_.texture_units[gl_.active_texture];}return 0;
-    case GlOperation::BindTexture:if(u(0)==0xde1 && u(1)!=UINT32_MAX)gl_.texture_units[gl_.active_texture]=u(1);return std::nullopt;
-    case GlOperation::GenerateMipmap:{if(u(0)!=0xde1){error(0x500);return 0;}auto& t=textures_[state_.binding];if(!t.native){error(0x502);return 0;}begin_commands();auto encoder=[commands_ blitCommandEncoder];MetalEncoderScope encoder_scope{encoder};[encoder generateMipmapsForTexture:t.native];for(unsigned level=1;level<t.native.mipmapLevelCount;++level)t.formats[level]=t.formats.at(0);encoder_scope.end();pending_leases_.push_back(t.lease);return 0;}
+    case GlOperation::BindTexture:{
+        // 只有之後的固定管線綁定會成功時才更新貼圖單元（名稱已綁過 GL_TEXTURE_1D 時為 INVALID_OPERATION）。
+        const auto found=textures_.find(u(1));if(u(0)==0xde1 && u(1)!=UINT32_MAX && (!u(1) || found==textures_.end() || !found->second.target || found->second.target==0xde1))gl_.texture_units[gl_.active_texture]=u(1);return std::nullopt;}
+    case GlOperation::GenerateMipmap:{auto* bound=bound_texture(u(0));if(!bound){error(0x500);return 0;}auto& t=*bound;if(!t.native){error(0x502);return 0;}begin_commands();auto encoder=[commands_ blitCommandEncoder];MetalEncoderScope encoder_scope{encoder};[encoder generateMipmapsForTexture:t.native];for(unsigned level=1;level<t.native.mipmapLevelCount;++level)t.formats[level]=t.formats.at(0);encoder_scope.end();pending_leases_.push_back(t.lease);return 0;}
     case GlOperation::GenTextures:return std::nullopt;
     case GlOperation::BindFramebuffer:{if(u(0)!=0x8d40 && u(0)!=0x8ca8 && u(0)!=0x8ca9){error(0x500);return 0;}if(u(1) && !gl_.framebuffers.contains(u(1)))gl_.framebuffers[u(1)]=std::make_shared<GlFramebuffer>();if(u(0)!=0x8ca8)gl_.draw_framebuffer=u(1);if(u(0)!=0x8ca9)gl_.read_framebuffer=u(1);return 0;}
     case GlOperation::FramebufferTexture2D:{if(u(0)!=0x8d40 && u(0)!=0x8ca8 && u(0)!=0x8ca9){error(0x500);return 0;}const auto id=u(0)==0x8ca8?gl_.read_framebuffer:gl_.draw_framebuffer;if(!id){error(0x502);return 0;}if(u(2)!=0xde1 || (u(1)!=0x8d00 && (u(1)<0x8ce0 || u(1)>=0x8ce8))){error(0x500);return 0;}if(n(4)<0){error(0x501);return 0;}auto& fb=*gl_.framebuffers.at(id);if(!u(3))fb.attachments.erase(u(1));else if(!textures_.contains(u(3)))error(0x502);else fb.attachments[u(1)]={u(3),u(4),textures_.at(u(3))};return 0;}
@@ -83,9 +85,12 @@ std::optional<std::uint64_t> MetalGl::programmable_execute(GlOperation op,std::s
 void MetalGl::gl_texture(std::span<const std::uint64_t> supplied,std::span<const std::uint8_t> data,bool subimage){
     // 完整定義與局部更新共用格式轉換、UNPACK 版面及 GPU 同步。
     std::array<std::uint64_t,8> a{};for(unsigned i=0;i<a.size();++i)a[i]=static_cast<std::uint32_t>(supplied[i]);
-    auto& t=textures_[state_.binding];unsigned xoffset=0,yoffset=0;
+    const unsigned target=static_cast<unsigned>(a[0]);const bool one_d=target==0xde0 || target==0x8063;
+    auto* bound=bound_texture(target==0x8063?0xde0U:target==0x8064?0xde1U:target);if(!bound){error(0x500);return;}
+    auto& t=*bound;unsigned xoffset=0,yoffset=0;
     if(subimage){
-        if(a[0]!=0xde1){error(0x500);return;}
+        if(target!=0xde1 && target!=0xde0){error(0x500);return;}
+        if(one_d && (a[3] || a[5]!=1)){error(0x501);return;}
         if(static_cast<unsigned>(a[1])>14 || static_cast<unsigned>(a[2])>INT32_MAX || static_cast<unsigned>(a[3])>INT32_MAX || static_cast<unsigned>(a[4])>16384 || static_cast<unsigned>(a[5])>16384){error(0x501);return;}
         const auto level=static_cast<unsigned>(a[1]);
         if(!t.native || !t.formats.contains(level)){error(0x502);return;}
@@ -95,8 +100,8 @@ void MetalGl::gl_texture(std::span<const std::uint64_t> supplied,std::span<const
         a[2]=t.formats.at(level);a[3]=a[4];a[4]=a[5];a[5]=0;
     }
     const auto u=[&](unsigned i){return static_cast<unsigned>(a[i]);};
-    const bool proxy=!subimage && u(0)==0x8064;
-    if(u(0)!=0xde1 && !proxy){error(0x500);return;}if(u(1)>14 || u(3)>INT32_MAX || u(4)>INT32_MAX || u(5)>1 || (!proxy && (u(3)>16384 || u(4)>16384 || u(5)))){error(0x501);return;}
+    const bool proxy=!subimage && (u(0)==0x8064 || u(0)==0x8063);
+    if(u(0)!=0xde1 && u(0)!=0xde0 && !proxy){error(0x500);return;}if(!subimage && one_d && u(4)!=1){error(0x501);return;}if(u(1)>14 || u(3)>INT32_MAX || u(4)>INT32_MAX || u(5)>1 || (!proxy && (u(3)>16384 || u(4)>16384 || u(5)))){error(0x501);return;}
     const unsigned source_channels=u(6)==0x1903 || u(6)==0x1902?1U:u(6)==0x8227?2U:u(6)==0x1907?3U:u(6)==0x1908?4U:0U;
     const bool source_packed=u(7)==0x8c3b;
     const unsigned source_unit=u(7)==0x1401?1U:u(7)==0x1406 || source_packed?4U:(u(7)==0x140b || u(7)==0x1403)?2U:0U;if(!source_channels || !source_unit || (source_packed && u(6)!=0x1907)){error(0x500);return;}
@@ -127,7 +132,7 @@ void MetalGl::gl_texture(std::span<const std::uint64_t> supplied,std::span<const
             if(format==MTLPixelFormatDepth32Float)level.depth=32;
             else for(unsigned i=0;i<channels;++i)level.bits[i]=packed?(i==2?10U:11U):component*8;
         }
-        proxy_levels_[u(1)]=level;return;
+        proxy_levels_[u(1)+(one_d?16U:0U)]=level;return;
     }
     if(!subimage && u(1)==0){flush(true);if(!u(3) || !u(4)){t.native=nil;t.lease.reset();t.formats.clear();return;}const bool mipmapped=format!=MTLPixelFormatDepth32Float;
         auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:u(3) height:u(4) mipmapped:mipmapped];desc.storageMode=MTLStorageModeShared;desc.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
@@ -286,11 +291,11 @@ void MetalGl::gl_read_pixels(std::span<const std::uint64_t> args,std::span<std::
 
 void MetalGl::texture_level(GlOperation op,std::span<const std::uint64_t> args,std::span<std::uint8_t> output){
     const auto target=static_cast<unsigned>(args[0]),level=static_cast<unsigned>(args[1]),pname=static_cast<unsigned>(args[2]);
-    if(target!=0xde1 && target!=0x8064){error(0x500);return;}if(level>14){error(0x501);return;}
+    if(target!=0xde1 && target!=0x8064 && target!=0xde0 && target!=0x8063){error(0x500);return;}if(level>14){error(0x501);return;}
     TextureLevelInfo info{};
-    if(target==0x8064){if(const auto found=proxy_levels_.find(level);found!=proxy_levels_.end())info=found->second;}
-    else if(const auto found=textures_.find(state_.binding);found!=textures_.end() && found->second.native && found->second.formats.contains(level)){
-        const auto& t=found->second;info.width=static_cast<unsigned>(std::max<NSUInteger>(1,t.native.width>>level));info.height=static_cast<unsigned>(std::max<NSUInteger>(1,t.native.height>>level));info.format=t.formats.at(level);
+    if(target==0x8064 || target==0x8063){if(const auto found=proxy_levels_.find(level+(target==0x8063?16U:0U));found!=proxy_levels_.end())info=found->second;}
+    else if(const auto* bound=bound_texture(target);bound->native && bound->formats.contains(level)){
+        const auto& t=*bound;info.width=static_cast<unsigned>(std::max<NSUInteger>(1,t.native.width>>level));info.height=static_cast<unsigned>(std::max<NSUInteger>(1,t.native.height>>level));info.format=t.formats.at(level);
         switch(t.native.pixelFormat){
         case MTLPixelFormatR8Unorm:info.bits={8,0,0,0};break;case MTLPixelFormatRG8Unorm:info.bits={8,8,0,0};break;case MTLPixelFormatRGBA8Unorm:info.bits={8,8,8,8};break;
         case MTLPixelFormatR16Unorm:case MTLPixelFormatR16Float:info.bits={16,0,0,0};break;case MTLPixelFormatRG16Unorm:case MTLPixelFormatRG16Float:info.bits={16,16,0,0};break;case MTLPixelFormatRGBA16Unorm:case MTLPixelFormatRGBA16Float:info.bits={16,16,16,16};break;

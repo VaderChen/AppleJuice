@@ -4,6 +4,7 @@
 #include "x64arm/windows_security_attributes.hpp"
 #include "automation_value.hpp"
 #include "windows_locale_data.hpp"
+#include "crt_mbcs.hpp"
 #include "crt_multibyte_state.hpp"
 #include "crt_string_conversion.hpp"
 #include "crt_time_storage.hpp"
@@ -23,6 +24,7 @@
 #include <unicode/udatpg.h>
 #include <unicode/uchar.h>
 #include <unicode/ucol.h>
+#include <unicode/unorm2.h>
 #include <unicode/uscript.h>
 #include <unicode/ustring.h>
 #include <unicode/utrans.h>
@@ -93,6 +95,23 @@ std::optional<Locale> numbered(std::uint32_t id){
     if(!id || id==0x1000 || id==0xc00 || id==0x1400 || id>0xffff)return {};
     const auto name=locale_name(id);if(name.empty() || locale_code(name)!=id)return {};
     auto value=named(name);if(!value)return {};value->id=id;return value;
+}
+// STL C 匯出所在的 DLL：msvcp140 的 _Collvec／_Cvtvec 帶 locale 名稱，VC8～VC10 以 LCID 識別 locale。
+bool msvcp_legacy_vectors(std::string_view family){return family=="msvcp90.dll" || family=="msvcp100.dll";}
+bool msvcp_c_family(std::string_view family){return family=="msvcp140.dll" || family=="msvcp110.dll" || family=="msvcp120.dll" || msvcp_legacy_vectors(family);}
+// _Collvec：msvcp140 為｛碼頁, locale 名稱｝（名稱 NULL 即 C locale），VC8～VC10 為｛LCID, 碼頁｝（LCID 0 即 C locale）；未提供時為 C locale。
+struct MsvcpCollation {bool classic{true};std::uint32_t page{};std::optional<Locale> locale;};
+MsvcpCollation msvcp_collation(const GuestMemory& memory,std::uint64_t vector,std::string_view family,bool x86){
+    MsvcpCollation result;if(!vector)return result;
+    if(msvcp_legacy_vectors(family)){
+        const auto lcid=static_cast<std::uint32_t>(memory.load(GuestAddress{vector},32));result.page=static_cast<std::uint32_t>(memory.load(GuestAddress{vector+4},32));
+        if(lcid){result.classic=false;result.locale=numbered(lcid);}
+        return result;
+    }
+    result.page=static_cast<std::uint32_t>(memory.load(GuestAddress{vector},32));
+    const auto name=memory.load(GuestAddress{vector+(x86?4U:8U)},x86?32:64);
+    if(name){result.classic=false;result.locale=named(read_utf16(memory,GuestAddress{name},255));}
+    return result;
 }
 // 舊式 LGRPID 分類與 LCID 共用宿主 NLS 目錄；不另安裝或載入 Windows 語言包。
 // 自訂／中性 locale 仍由 EnumSystemLocalesEx 提供，不冒用具體地區的 LCID。
@@ -259,14 +278,6 @@ std::u16string counted_string(const GuestMemory& memory,std::uint64_t pointer,st
     for(std::size_t i=0;i<value.size();++i)value[i]=static_cast<char16_t>(memory.load(GuestAddress{pointer+i*2},16));
     return value;
 }
-// 純量入口與 VARIANT 共用精確數值轉換；僅在此對應 Windows 的型別名稱與大小。
-std::pair<std::uint16_t,unsigned> automation_scalar(std::string_view name){
-    static constexpr std::tuple<std::string_view,std::uint16_t,unsigned> types[]{
-        {"I1",16,1},{"I2",2,2},{"I4",3,4},{"I8",20,8},
-        {"UI1",17,1},{"UI2",18,2},{"UI4",19,4},{"UI8",21,8},
-        {"R4",4,4},{"R8",5,8},{"Cy",6,8},{"Date",7,8},{"Bool",11,2},{"Dec",14,16}};
-    for(const auto& [label,type,size]:types)if(name==label)return {type,size};return {};
-}
 std::string icu_locale(const Locale& locale){auto result=utf16_to_utf8(locale.name);std::replace(result.begin(),result.end(),'-','_');return result;}
 #include "windows_locale_info.inc"
 #include "windows_calendar_info.inc"
@@ -341,6 +352,19 @@ std::optional<int> collate_strings(std::u16string left,std::u16string right,cons
     const auto order=collator(locale,flags);if(!order)return {};
     const auto result=ucol_strcoll(order.get(),left.data(),static_cast<std::int32_t>(left.size()),right.data(),static_cast<std::int32_t>(right.size()));
     return result==UCOL_LESS?-1:result==UCOL_GREATER?1:0;
+}
+// FindNLSString：以同一個 collator 比對來源子字串，回傳（位置, 長度）；每個起點最多試到值長度的四倍加八，避免平方成本。
+std::optional<std::pair<std::size_t,std::size_t>> find_collated(std::u16string_view source,std::u16string value,const Locale& locale,std::uint32_t flags,std::uint32_t direction){
+    const auto order=collator(locale,flags);if(!order)return {};value=sort_input(std::move(value),flags);
+    const auto reach=value.size()*4+8;
+    const auto equal=[&](std::size_t at,std::size_t length){const auto text=sort_input(std::u16string(source.substr(at,length)),flags);
+        return ucol_strcoll(order.get(),text.data(),static_cast<std::int32_t>(text.size()),value.data(),static_cast<std::int32_t>(value.size()))==UCOL_EQUAL;};
+    const auto from=[&](std::size_t at)->std::optional<std::size_t>{for(std::size_t length=0;length<=std::min(source.size()-at,reach);++length)if(equal(at,length))return length;return {};};
+    if(direction==0x00100000U){if(const auto length=from(0))return std::pair{std::size_t{0},*length};return {};}
+    if(direction==0x00200000U){for(std::size_t length=0;length<=std::min(source.size(),reach);++length)if(equal(source.size()-length,length))return std::pair{source.size()-length,length};return {};}
+    if(direction==0x00800000U){for(std::size_t at=source.size()+1;at-->0;)if(const auto length=from(at))return std::pair{at,*length};return {};}
+    for(std::size_t at=0;at<=source.size();++at)if(const auto length=from(at))return std::pair{at,*length};
+    return {};
 }
 std::optional<std::vector<std::uint8_t>> collation_key(std::u16string text,const Locale& locale,std::uint32_t flags){
     text=sort_input(std::move(text),flags);const auto order=collator(locale,flags);if(!order)return {};
@@ -597,6 +621,12 @@ const CrtCharacterTable& windows_crt_character_table(const CrtLocaleCategory& lo
     }return cache.emplace(key,std::move(table)).first->second;
 }
 bool windows_locale_name_valid(std::u16string_view name){return named(name).has_value();}
+std::uint16_t windows_nls_character_type(char16_t value,unsigned type){return static_cast<std::uint16_t>(character_type(value,type));}
+std::optional<CrtLocaleCategory> windows_crt_locale_id(std::uint32_t id){
+    if(!id)return CrtLocaleCategory{};
+    const auto locale=numbered(id);if(!locale)return {};
+    auto category=windows_crt_locale(locale->name);if(category)category->lcid=id;return category;
+}
 std::optional<int> windows_nls_compare(std::u16string_view left,std::u16string_view right,std::uint32_t id,std::uint32_t flags){
     const auto locale=numbered(id);if(!locale || flags&~compare_flags)return {};
     return collate_strings(std::u16string(left),std::u16string(right),*locale,flags);
@@ -695,8 +725,16 @@ std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
         {"crt","_setmbcp",1},{"crt","_getmbcp",0},
         {"crt","__p___mb_cur_max",0},{"crt","___mb_cur_max_l_func",1},
         {"normaliz.dll","IdnToAscii",5},{"normaliz.dll","IdnToUnicode",5},
+        {"kernel32.dll","NormalizeString",5,0,0,0x15},{"kernel32.dll","IsNormalizedString",3,0,0,0x5},
         {"ntdll.dll","RtlUTF8ToUnicodeN",5},{"ntdll.dll","RtlUnicodeToUTF8N",5},
         {"msvcp140.dll","_Strcoll",5,0,0,0,true},{"msvcp140.dll","_Strxfrm",5,0,0,0,true},{"msvcp140.dll","_Mbrtowc",5,0,0,0,true},
+        {"msvcp140.dll","_Wcscoll",5,0,0,0,true},{"msvcp140.dll","_Wcsxfrm",5,0,0,0,true},
+        // VC11／VC12 的 _Cvtvec／_Collvec 與 msvcp140 相同（碼頁＋locale 名稱）。
+        {"msvcp110.dll","_Strcoll",5,0,0,0,true},{"msvcp110.dll","_Strxfrm",5,0,0,0,true},{"msvcp110.dll","_Mbrtowc",5,0,0,0,true},{"msvcp110.dll","_Wcscoll",5,0,0,0,true},{"msvcp110.dll","_Wcsxfrm",5,0,0,0,true},
+        {"msvcp120.dll","_Strcoll",5,0,0,0,true},{"msvcp120.dll","_Strxfrm",5,0,0,0,true},{"msvcp120.dll","_Mbrtowc",5,0,0,0,true},{"msvcp120.dll","_Wcscoll",5,0,0,0,true},{"msvcp120.dll","_Wcsxfrm",5,0,0,0,true},
+        // VC9～VC10 的 STL C 匯出（msvcp80 由 msvcp90 家族提供）：_Cvtvec／_Collvec 為｛LCID, 碼頁｝，與 msvcp140 共用轉換與排序流程。
+        {"msvcp90.dll","_Strcoll",5,0,0,0,true},{"msvcp90.dll","_Strxfrm",5,0,0,0,true},{"msvcp90.dll","_Mbrtowc",5,0,0,0,true},{"msvcp90.dll","_Wcscoll",5,0,0,0,true},{"msvcp90.dll","_Wcsxfrm",5,0,0,0,true},
+        {"msvcp100.dll","_Strcoll",5,0,0,0,true},{"msvcp100.dll","_Strxfrm",5,0,0,0,true},{"msvcp100.dll","_Mbrtowc",5,0,0,0,true},{"msvcp100.dll","_Wcscoll",5,0,0,0,true},{"msvcp100.dll","_Wcsxfrm",5,0,0,0,true},
         {"oleaut32.dll","VarI1FromStr",4},{"oleaut32.dll","VarI2FromStr",4},{"oleaut32.dll","VarI4FromStr",4},{"oleaut32.dll","VarI8FromStr",4},
         {"oleaut32.dll","VarUI1FromStr",4},{"oleaut32.dll","VarUI2FromStr",4},{"oleaut32.dll","VarUI4FromStr",4},{"oleaut32.dll","VarUI8FromStr",4},
         {"oleaut32.dll","VarR4FromStr",4},{"oleaut32.dll","VarR8FromStr",4},{"oleaut32.dll","VarCyFromStr",4},
@@ -724,15 +762,21 @@ std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
         {"kernel32.dll","GetCalendarInfoA",6},{"kernel32.dll","GetCalendarInfoW",6},{"kernel32.dll","GetCalendarInfoEx",7},
         {"kernel32.dll","EnumCalendarInfoA",4},{"kernel32.dll","EnumCalendarInfoW",4},
         {"kernel32.dll","EnumCalendarInfoExA",4},{"kernel32.dll","EnumCalendarInfoExW",4},{"kernel32.dll","EnumCalendarInfoExEx",6},
-        {"kernel32.dll","SetCalendarInfoA",4},{"kernel32.dll","SetCalendarInfoW",4}
+        {"kernel32.dll","SetCalendarInfoA",4},{"kernel32.dll","SetCalendarInfoW",4},
+        {"kernel32.dll","EnumDateFormatsA",3},{"kernel32.dll","EnumDateFormatsW",3},{"kernel32.dll","EnumDateFormatsExA",3},{"kernel32.dll","EnumDateFormatsExW",3},
+        {"kernel32.dll","EnumDateFormatsExEx",4},{"kernel32.dll","EnumTimeFormatsA",3},{"kernel32.dll","EnumTimeFormatsW",3},{"kernel32.dll","EnumTimeFormatsEx",4},
+        {"kernel32.dll","EnumSystemCodePagesA",2},{"kernel32.dll","EnumSystemCodePagesW",2},{"kernel32.dll","EnumUILanguagesA",3},{"kernel32.dll","EnumUILanguagesW",3},
+        {"kernel32.dll","FindNLSString",7},{"kernel32.dll","FindNLSStringEx",10},{"kernel32.dll","FindStringOrdinal",6},
+        {"kernel32.dll","GetNLSVersion",3},{"kernel32.dll","GetNLSVersionEx",3},{"kernel32.dll","IsValidNLSVersion",3},{"kernel32.dll","IsNLSDefinedString",5},
+        {"kernel32.dll","InvalidateNLSCache",0},{"kernel32.dll","IdnToNameprepUnicode",5},{"normaliz.dll","IdnToNameprepUnicode",5},
+        {"kernel32.dll","GetThreadLocale",0},{"kernel32.dll","SetThreadLocale",1},{"kernel32.dll","GetThreadUILanguage",0},{"kernel32.dll","SetThreadUILanguage",1},
+        {"kernel32.dll","GetThreadPreferredUILanguages",4},{"kernel32.dll","SetThreadPreferredUILanguages",3},{"kernel32.dll","GetUserPreferredUILanguages",4},
+        {"kernel32.dll","GetSystemPreferredUILanguages",4},{"kernel32.dll","GetProcessPreferredUILanguages",4},{"kernel32.dll","SetProcessPreferredUILanguages",3}
     };return table;
 }
 namespace {
 // _locale_t 的 locinfo 與 mbcinfo 各自保存碼頁。直接使用既有客體 mbcinfo，
 // 讓 explicit locale、目前 locale 快照及執行緒 clone 共用同一份 ABI 狀態。
-std::uint64_t crt_mbc_address(GuestMemory& memory,const CrtLocaleObject& object,bool x86){
-    return memory.load(GuestAddress{object.storage+(x86?4U:8U)},x86?32:64);
-}
 void crt_mbc_assign(GuestMemory& memory,std::uint64_t address,const CrtLocaleCategory& category){
     const auto& characters=windows_crt_character_table(category);
     memory.fill(GuestAddress{address},0,544);
@@ -867,10 +911,35 @@ CrtLocaleObject& WindowsServices::current_crt_locale(GuestState& state,GuestMemo
     }return runtime_.crt_locales.at(address);
 }
 
+// 目前客體執行緒的偏好 UI 語言；尚未建立客體執行緒（例如直接呼叫服務的宿主測試）時為空，查詢沿用程序與使用者設定。
+std::vector<std::u16string>* WindowsServices::current_thread_ui_languages(){
+    const auto found=threads_.items.find(threads_.current);
+    return found==threads_.items.end()?nullptr:&found->second.preferred_ui_languages;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     const auto finish=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto fail=[&](std::uint32_t error){last_error_=error;return finish(0);};
+    // 列舉回呼共用：字串集中寫入一塊客體 heap，依序以「字串位址＋附加引數」呼叫；回呼結束或回 FALSE 後由 LocaleEnumeration 釋放。
+    const auto enumerate=[&](std::uint64_t procedure,std::vector<std::pair<std::vector<std::uint8_t>,std::vector<std::uint64_t>>> items,std::uint32_t nomemory)->std::optional<std::uint32_t>{
+        std::size_t size=0;for(const auto& item:items)size+=item.first.size();if(!size)return finish(1);
+        const auto buffer=allocate_heap(memory,size);if(!buffer)return fail(nomemory);std::vector<GuestCallback> callbacks;auto at=buffer;
+        try{for(auto& [bytes,extra]:items){memory.write(GuestAddress{at},bytes);std::vector<std::uint64_t> args{at};args.insert(args.end(),extra.begin(),extra.end());callbacks.push_back({procedure,std::move(args)});at+=bytes.size();}
+            start_callbacks(state,memory,std::move(callbacks),Continuation::LocaleEnumeration,buffer);}catch(...){(void)free_heap(memory,buffer,state);throw;}
+        return std::nullopt;
+    };
+    // 排序版本：NLSVERSIONINFO(EX) 以 ICU collator 版本為 dwNLSVersion、Unicode 版本為 dwDefinedVersion，
+    // 自訂版本 GUID 由 LCID 與兩個版本決定；CompareStringEx／LCMapStringEx／FindNLSStringEx 只接受目前版本。
+    const auto nls_version=[&](const Locale& locale)->std::optional<std::array<std::uint8_t,32>>{
+        const auto order=collator(locale,0);if(!order)return {};UVersionInfo sort{},unicode{};ucol_getVersion(order.get(),sort);u_getUnicodeVersion(unicode);
+        const std::uint32_t sorting=(std::uint32_t{sort[0]}<<16)|(std::uint32_t{sort[1]}<<8)|sort[2],defined=(std::uint32_t{unicode[0]}<<16)|(std::uint32_t{unicode[1]}<<8)|unicode[2];
+        std::array<std::uint8_t,32> info{};const auto put=[&](std::size_t at,std::uint32_t value){for(unsigned i=0;i<4;++i)info[at+i]=static_cast<std::uint8_t>(value>>(8*i));};
+        put(0,32);put(4,sorting);put(8,defined);put(12,locale.id);put(16,locale.id);put(20,sorting);put(24,defined);put(28,0x34366178U);return info;};
+    const auto version_matches=[&](const Locale& locale,std::uint64_t address){
+        const auto current=nls_version(locale);if(!current)return false;const auto size=memory.load(GuestAddress{address},32);if(size!=12 && size!=32)return false;
+        std::array<std::uint8_t,32> given{};memory.read(GuestAddress{address},std::span(given).first(size));
+        if(!std::equal(given.begin()+4,given.begin()+8,current->begin()+4))return false;
+        return size==12 || std::all_of(given.begin()+16,given.end(),[](std::uint8_t b){return b==0;}) || std::equal(given.begin()+16,given.end(),current->begin()+16);};
     if(name=="IsTextUnicode" || name=="RtlIsTextUnicode"){
         unsigned flags=arg(2)?static_cast<unsigned>(memory.load(GuestAddress{arg(2)},32)):0xffffU;
         const auto length=static_cast<std::int32_t>(arg(1));
@@ -1025,7 +1094,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             const auto address=crt_max_address(memory,*selected,x86_);
             return returned(name=="__p___mb_cur_max"?address:memory.load(GuestAddress{address},32));
         }
-        if(name=="setlocale" || name=="_wsetlocale" || name=="localeconv" || name=="__lconv_init" || name=="___lc_codepage_func" || name=="___lc_collate_cp_func" || name=="___mb_cur_max_func" || name=="__mb_cur_max_func" || name=="___lc_locale_name_func" || name=="__pctype_func"){
+        if(name=="___setlc_active_func" || name=="___unguarded_readlc_active_add_func"){
+            // msvcrt 的地區鎖定計數：setlocale 在宿主端一次完成，觀察到的「進行中」數一律為 0；
+            // 未加鎖讀取地區的計數格由呼叫端自行增減，跨呼叫保留同一位址。
+            if(name=="___setlc_active_func")return returned(0);
+            if(!crt_readlc_active_){crt_readlc_active_=runtime_allocate(memory,{},4,4);memory.store(GuestAddress{crt_readlc_active_},32,0);}
+            return returned(crt_readlc_active_);
+        }
+        if(name=="setlocale" || name=="_wsetlocale" || name=="localeconv" || name=="__lconv_init" || name=="___lc_codepage_func" || name=="___lc_collate_cp_func" || name=="___mb_cur_max_func" || name=="__mb_cur_max_func" || name=="___lc_locale_name_func" || name=="__pctype_func" || name=="___lc_handle_func"){
             auto& current=current_crt_locale(state,memory);const unsigned p=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(p*8);
             const auto pointer=[&](std::uint64_t at){return memory.load(GuestAddress{at},bits);};
             if(name=="___lc_codepage_func" || name=="___lc_collate_cp_func")return returned(current.categories[name=="___lc_codepage_func"?2:1].codepage);
@@ -1035,6 +1111,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             if(name=="__pctype_func")return returned(pointer(references+6*p));
             const auto key=runtime_.crt_thread_locales.contains(threads_.current)?threads_.current:0;auto& query=runtime_.crt_locale_query_buffers[key];
             if(!query){query=allocate_heap(memory,8192);if(!query)return error(12);}
+            if(name=="___lc_handle_func"){
+                // 六個分類的 LCID 陣列（LC_ALL..LC_TIME）：舊版 threadlocinfo 的 lc_handle 欄位；其他版面另寫入查詢緩衝區。
+                if(current.legacy)return returned(info+12);
+                const auto handles=query+8192-512;for(unsigned i=0;i<6;++i)memory.store(GuestAddress{handles+4*i},32,current.categories[i].lcid);return returned(handles);
+            }
             if(name=="___lc_locale_name_func"){
                 const auto names=query+8192-256;for(unsigned i=0;i<6;++i)memory.store(GuestAddress{names+i*p},bits,i && current.categories[i].codepage?pointer(info+72+4*i*p+p):0);return returned(names);
             }
@@ -1251,14 +1332,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         }
         throw HostCallFault("未知 CRT locale 作業");
     }
-    if(service.family=="msvcp140.dll" && name=="_Mbrtowc"){
+    if(msvcp_c_family(service.family) && name=="_Mbrtowc"){
         // STL 的 _Mbrtowc(pwc, s, n, mbstate_t*, const _Cvtvec*)：依 _Cvtvec 的 code page 轉一個字元，回傳位元組數，
         // 空字元回 0、不完整回 -2（前綴存入 mbstate_t）、無效回 -1 並設 EILSEQ；C locale 直接把位元組零延伸。
         const auto returned=[&](std::int32_t value){arg.return_to(state,static_cast<std::uint32_t>(value));return std::optional<std::uint32_t>{};};
         const auto output=arg(0),state_pointer=arg(3),vector=arg(4);auto source=arg(1);auto capacity=arg(2);
         crt_multibyte::State conversion{};if(state_pointer){memory.read(GuestAddress{state_pointer},conversion);memory.check(GuestAddress{state_pointer},8,Access::Write);}
         std::uint32_t page=0;bool classic=true;
-        if(vector){page=static_cast<std::uint32_t>(memory.load(GuestAddress{vector},32));classic=memory.load(GuestAddress{vector+8},32)!=0;}
+        if(vector){
+            // msvcp140：｛碼頁, 最大位元組數, 是否 C locale, …｝；VC8～VC10：｛LCID, 碼頁｝，LCID 0 即 C locale。
+            if(msvcp_legacy_vectors(service.family)){page=static_cast<std::uint32_t>(memory.load(GuestAddress{vector+4},32));classic=memory.load(GuestAddress{vector},32)==0;}
+            else {page=static_cast<std::uint32_t>(memory.load(GuestAddress{vector},32));classic=memory.load(GuestAddress{vector+8},32)!=0;}
+        }
         else {const auto& category=current_crt_locale(state,memory).categories[2];page=category.codepage;classic=!page;}
         if(!source){if(state_pointer)memory.fill(GuestAddress{state_pointer},0,8);return returned(0);}
         if(!capacity)return returned(-2);
@@ -1273,7 +1358,48 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         if(result.status!=CrtDecodedCharacter::Status::Complete || result.character>65535){memory.store(GuestAddress{runtime_.errno_cell},32,42);return returned(-1);}
         if(output)memory.store(GuestAddress{output},16,result.character);return returned(result.character?static_cast<std::int32_t>(result.consumed):0);
     }
-    if(service.family=="msvcp140.dll"){
+    if(msvcp_c_family(service.family) && (name=="_Wcscoll" || name=="_Wcsxfrm")){
+        // collate<wchar_t> 的 do_compare／do_transform：_Wcscoll(s1,e1,s2,e2,const _Collvec*)、_Wcsxfrm(d,de,s,se,const _Collvec*)，
+        // 長度以 wchar_t 計。_LocaleName 為空（C locale）時逐碼元比較、短者為小，轉換即原樣複製；否則與 CompareStringEx
+        // （SORT_STRINGSORT）／LCMapStringEx（LCMAP_SORTKEY）共用排序規則，排序鍵每個 byte 放大為一個 wchar_t。
+        // 失敗時 _Wcscoll 設 errno EINVAL 並回 _NLSCMPERROR；_Wcsxfrm 回 INT_MAX，與 MSVC 相同。
+        const bool mapping=name=="_Wcsxfrm";
+        const auto returned=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
+        const auto invalid=[&](unsigned error){if(!mapping)memory.store(GuestAddress{runtime_.errno_cell},32,error);return returned(INT32_MAX);};
+        try{
+            if(arg(1)<arg(0) || arg(3)<arg(2) || ((arg(1)-arg(0))&1U) || ((arg(3)-arg(2))&1U))return invalid(22);
+            const auto first_size=(arg(1)-arg(0))/2,second_size=(arg(3)-arg(2))/2;
+            if(first_size>1048576 || second_size>1048576)return invalid(22);
+            const auto collation=msvcp_collation(memory,arg(4),service.family,x86_);
+            const auto right=counted_string(memory,arg(2),static_cast<std::int32_t>(second_size),false);
+            if(collation.classic){
+                if(mapping){
+                    if(second_size<=first_size)for(std::size_t i=0;i<right.size();++i)memory.store(GuestAddress{arg(0)+i*2},16,right[i]);
+                    return returned(second_size);
+                }
+                const auto left=counted_string(memory,arg(0),static_cast<std::int32_t>(first_size),false);
+                const auto shared=std::min(left.size(),right.size());
+                for(std::size_t i=0;i<shared;++i)if(left[i]!=right[i])return returned(left[i]<right[i]?UINT32_MAX:1);
+                return returned(left.size()==right.size()?0:left.size()<right.size()?UINT32_MAX:1);
+            }
+            const auto& locale=collation.locale;
+            if(!locale)return invalid(22);
+            // UCRT 的 NLS 包裝先截到第一個 NUL（CompareString／LCMapString 會比到 NUL 之後）；任一側為空時只比長度。
+            const auto until_null=[](std::u16string text){if(const auto end=text.find(u'\0');end!=text.npos)text.resize(end);return text;};
+            const auto source=until_null(right);
+            if(!mapping){
+                const auto left=until_null(counted_string(memory,arg(0),static_cast<std::int32_t>(first_size),false));
+                if(left.empty() || source.empty())return returned(left.size()==source.size()?0:left.size()<source.size()?UINT32_MAX:1);
+                const auto order=collate_strings(left,source,*locale,0x1000U);if(!order)return invalid(22);
+                return returned(static_cast<std::uint32_t>(*order));
+            }
+            const auto bytes=collation_key(source,*locale,0);if(!bytes)return returned(INT32_MAX);
+            if(bytes->size()<=first_size)for(std::size_t i=0;i<bytes->size();++i)memory.store(GuestAddress{arg(0)+i*2},16,(*bytes)[i]);
+            return returned(bytes->size());
+        }catch(const MemoryFault&){return invalid(22);}catch(const std::bad_alloc&){return invalid(12);}
+        catch(const std::runtime_error&){return invalid(22);}
+    }
+    if(msvcp_c_family(service.family) && (name=="_Strcoll" || name=="_Strxfrm")){
         const bool mapping=name=="_Strxfrm";
         const auto returned=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
         const auto invalid=[&](unsigned error){if(!mapping)memory.store(GuestAddress{runtime_.errno_cell},32,error);return returned(mapping?(x86_?UINT32_MAX:UINT64_MAX):INT32_MAX);};
@@ -1282,9 +1408,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             const auto first_size=arg(1)-arg(0),second_size=arg(3)-arg(2);
             if(first_size>1048576 || second_size>1048576)return invalid(22);
             // 未指定 _Collvec 時，沿用目前 CRT 的 C locale（code page 0、空名稱）。
-            const auto page=arg(4)?static_cast<unsigned>(memory.load(GuestAddress{arg(4)},32)):0U;
-            const auto locale_pointer=arg(4)?memory.load(GuestAddress{arg(4)+(x86_?4U:8U)},x86_?32:64):0;
-            if(!locale_pointer && (!mapping || !page)){
+            const auto collation=msvcp_collation(memory,arg(4),service.family,x86_);const auto page=collation.page;
+            if(collation.classic && (!mapping || !page)){
                 std::vector<std::uint8_t> right(static_cast<std::size_t>(second_size));
                 if(second_size)memory.read(GuestAddress{arg(2)},right);
                 if(mapping){if(second_size<=first_size && second_size)memory.write(GuestAddress{arg(0)},right);return returned(second_size);}
@@ -1293,7 +1418,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
                 const auto cmp=std::lexicographical_compare_three_way(left.begin(),left.end(),right.begin(),right.end());
                 return returned(cmp<0?UINT32_MAX:cmp>0?1:0);
             }
-            const auto locale=locale_pointer?named(read_utf16(memory,GuestAddress{locale_pointer},255)):numbered(0x400);
+            const auto locale=collation.classic?numbered(0x400):collation.locale;
             if(!locale)return invalid(22);
             if(mapping && !second_size)return invalid(22);
             const auto encoding=page==0 || page==65001?std::string{"UTF-8"}:page==20127?std::string{"US-ASCII"}:"windows-"+std::to_string(page);
@@ -1344,6 +1469,42 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             if(arg(2))memory.store(GuestAddress{arg(2)},32,written);
             return finish(written<total?0xc0000023U:replaced?0x107U:0);
         }catch(const MemoryFault&){return finish(0xc0000005U);}catch(const std::bad_alloc&){return finish(0xc0000017U);}
+    }
+    if(name=="NormalizeString" || name=="IsNormalizedString"){
+        // NORM_FORM：NormalizationC＝1、D＝2、KC＝5、KD＝6，以 ICU 的 Unicode 正規化實作。長度 -1 表示 NUL 結尾（輸出一併計入 NUL）。
+        // 緩衝區不足回負的估計長度並設 ERROR_INSUFFICIENT_BUFFER；無效的 UTF-16（孤立代理字元）為 ERROR_NO_UNICODE_TRANSLATION。
+        const auto form=static_cast<std::uint32_t>(arg(0));const auto count=static_cast<std::int32_t>(arg(2));
+        UErrorCode status=U_ZERO_ERROR;const UNormalizer2* normalizer=nullptr;
+        switch(form){case 1:normalizer=unorm2_getNFCInstance(&status);break;case 2:normalizer=unorm2_getNFDInstance(&status);break;
+            case 5:normalizer=unorm2_getNFKCInstance(&status);break;case 6:normalizer=unorm2_getNFKDInstance(&status);break;default:break;}
+        if(!normalizer || U_FAILURE(status))return fail(87);
+        if(!arg(1) || count<-1 || (name=="NormalizeString" && static_cast<std::int32_t>(arg(4))<0))return fail(87);
+        try{
+            auto source=counted_string(memory,arg(1),count,true);
+            const bool terminal=!source.empty() && source.back()==0 && count==-1;if(terminal)source.pop_back();
+            for(std::size_t i=0;i<source.size();++i){const auto c=source[i];
+                if(c>=0xd800 && c<=0xdbff){if(i+1<source.size() && source[i+1]>=0xdc00 && source[i+1]<=0xdfff){++i;continue;}}
+                else if(c<0xdc00 || c>0xdfff)continue;
+                last_error_=1113;return finish(name=="NormalizeString"?static_cast<std::uint32_t>(-static_cast<std::int32_t>(i)-1):0U);
+            }
+            const auto* text=reinterpret_cast<const UChar*>(source.data());
+            if(name=="IsNormalizedString"){
+                const auto normalized=unorm2_isNormalized(normalizer,text,static_cast<std::int32_t>(source.size()),&status);
+                if(U_FAILURE(status))return fail(1113);last_error_=0;return finish(normalized?1U:0U);
+            }
+            std::u16string result(source.size()*4+16,u'\0');
+            auto length=unorm2_normalize(normalizer,text,static_cast<std::int32_t>(source.size()),reinterpret_cast<UChar*>(result.data()),static_cast<std::int32_t>(result.size()),&status);
+            if(status==U_BUFFER_OVERFLOW_ERROR){status=U_ZERO_ERROR;result.resize(static_cast<std::size_t>(length));
+                length=unorm2_normalize(normalizer,text,static_cast<std::int32_t>(source.size()),reinterpret_cast<UChar*>(result.data()),length,&status);}
+            if(U_FAILURE(status))return fail(1113);
+            result.resize(static_cast<std::size_t>(length));if(terminal)result.push_back(0);
+            const auto capacity=static_cast<std::int32_t>(arg(4));const auto needed=static_cast<std::int32_t>(result.size());
+            if(!capacity){last_error_=0;return finish(static_cast<std::uint32_t>(needed));}
+            if(capacity<needed){last_error_=122;return finish(static_cast<std::uint32_t>(-needed));}
+            memory.check(GuestAddress{arg(3)},result.size()*2,Access::Write);
+            for(std::size_t i=0;i<result.size();++i)memory.store(GuestAddress{arg(3)+i*2},16,result[i]);
+            last_error_=0;return finish(static_cast<std::uint32_t>(needed));
+        }catch(const MemoryFault&){return fail(998);}catch(const std::bad_alloc&){return fail(14);}
     }
     if(name=="IdnToAscii" || name=="IdnToUnicode"){
         const auto flags=static_cast<std::uint32_t>(arg(0));
@@ -1421,7 +1582,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
     }
     if(name.starts_with("Var") && (name.ends_with("FromStr") || name.starts_with("VarBstrFrom"))){
         using namespace automation;const bool to_string=name.starts_with("VarBstrFrom");
-        const auto [type,bytes]=automation_scalar(to_string?name.substr(11):name.substr(3,name.size()-10));
+        const auto [type,bytes]=scalar_type(to_string?name.substr(11):name.substr(3,name.size()-10));
         const auto flags=static_cast<std::uint32_t>(arg(2)),lcid=static_cast<std::uint32_t>(arg(1));
         const auto allowed=0x80000000U|(type==7?0x1cfU:type==11?0x10U:to_string?0U:3U);
         const auto calendars=flags&0x188U;
@@ -1508,25 +1669,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             const auto encoding=ansi_encoding(*locale,(flags&0x40000000U)!=0);
             if(enumeration){
                 if(!arg(0))return fail(87);memory.check(GuestAddress{arg(0)},1,Access::Execute);
-                std::vector<std::pair<std::vector<std::uint8_t>,std::uint32_t>> items;std::size_t bytes=0;
+                std::vector<std::pair<std::vector<std::uint8_t>,std::vector<std::uint64_t>>> items;
                 for(const auto id:calendar==UINT32_MAX?available:std::vector<std::uint32_t>{calendar}){
                     const auto info=information(*calendar_kind(id));if(!info)return fail(1004);
-                    auto text=wide?utf16_bytes(info->text):ansi_output(info->text+u'\0',encoding);
-                    bytes+=text.size();items.emplace_back(std::move(text),id);
+                    std::vector<std::uint64_t> extra;if(name!="EnumCalendarInfoA" && name!="EnumCalendarInfoW")extra.push_back(id);
+                    if(named_locale){extra.push_back(0);extra.push_back(arg(5));}
+                    items.emplace_back(wide?utf16_bytes(info->text):ansi_output(info->text+u'\0',encoding),std::move(extra));
                 }
-                if(items.empty())return finish(1);
-                const auto buffer=allocate_heap(memory,bytes);if(!buffer)return fail(14);auto at=buffer;
-                std::vector<GuestCallback> callbacks;
-                try{
-                    for(const auto& [text,id]:items){
-                        memory.write(GuestAddress{at},text);std::vector<std::uint64_t> args{at};
-                        if(name!="EnumCalendarInfoA" && name!="EnumCalendarInfoW")args.push_back(id);
-                        if(named_locale){args.push_back(0);args.push_back(arg(5));}
-                        callbacks.push_back({arg(0),std::move(args)});at+=text.size();
-                    }
-                    start_callbacks(state,memory,std::move(callbacks),Continuation::LocaleEnumeration,buffer);
-                }catch(...){(void)free_heap(memory,buffer,state);throw;}
-                return std::nullopt;
+                return enumerate(arg(0),std::move(items),14);
             }
             const auto output=arg(type_arg+1),number=arg(type_arg+3);const auto capacity=static_cast<std::int32_t>(arg(type_arg+2));
             if(capacity<0)return fail(87);
@@ -1656,7 +1806,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
     if(name=="CompareStringW" || name=="CompareStringA" || name=="CompareStringEx" || name=="LCMapStringA" || name=="LCMapStringW" || name=="LCMapStringEx"){
         const bool extended=name.ends_with("Ex"),mapping=name.starts_with("LCMap");
         const auto locale=extended?named(requested()):numbered(static_cast<std::uint32_t>(arg(0)));
-        if(!locale)return fail(87);if(extended && (arg(7) || arg(8)))return fail(87);if(extended && arg(6))return fail(50);
+        if(!locale)return fail(87);if(extended && (arg(7) || arg(8)))return fail(87);if(extended && arg(6) && !version_matches(*locale,arg(6)))return fail(87);
         const bool ansi=name.ends_with('A');const auto raw_flags=static_cast<std::uint32_t>(arg(1));const auto flags=ansi?raw_flags&~0x40000000U:raw_flags;
         const auto input=[&](std::uint64_t address,std::int32_t length,bool terminal){return ansi?ansi_input(memory,address,length,terminal,ansi_encoding(*locale,(raw_flags&0x40000000U)!=0)):counted_string(memory,address,length,terminal);};
         if(!arg(2))return fail(87);
@@ -1760,21 +1910,179 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         if(!capacity)return finish(required);if(static_cast<std::uint32_t>(capacity)<required)return fail(122);
         memory.write(GuestAddress{output},utf16_bytes(locale->name));return finish(required);
     }
+    if(name=="GetNLSVersion" || name=="GetNLSVersionEx" || name=="IsValidNLSVersion"){
+        const bool extended=name!="GetNLSVersion";if(arg(0)!=1)return fail(1004);
+        const auto locale=extended?named(requested_locale_name(memory,arg(1))):numbered(static_cast<std::uint32_t>(arg(1)));if(!locale || !arg(2))return fail(87);
+        if(name=="IsValidNLSVersion"){last_error_=0;return finish(version_matches(*locale,arg(2))?1U:0U);}
+        const auto size=memory.load(GuestAddress{arg(2)},32);if(size!=32 && (extended || size!=12))return fail(122);
+        const auto info=nls_version(*locale);if(!info)return fail(14);memory.write(GuestAddress{arg(2)+4},std::span(*info).subspan(4,size-4));return finish(1);
+    }
+    if(name=="IsNLSDefinedString"){
+        // 每個碼位都必須是已指派的 Unicode 字元；孤立代理字元與未指派碼位都不算已定義。
+        if(arg(0)!=1 || arg(1))return fail(1004);const auto count=static_cast<std::int32_t>(arg(4));if(!arg(3) || !count || count<-1)return fail(87);
+        const auto text=counted_string(memory,arg(3),count,false);
+        for(std::size_t at=0;at<text.size();){UChar32 code=text[at++];
+            if(code>=0xd800 && code<=0xdbff){if(at>=text.size() || text[at]<0xdc00 || text[at]>0xdfff)return finish(0);code=0x10000+((code-0xd800)<<10)+(text[at++]-0xdc00);}
+            else if(code>=0xdc00 && code<=0xdfff)return finish(0);
+            if(!u_isdefined(code))return finish(0);}
+        return finish(1);
+    }
+    if(name=="InvalidateNLSCache")return finish(1); // 地區資料每次查詢都直接取自 ICU／宿主，沒有需要失效的快取。
+    if(name=="FindNLSString" || name=="FindNLSStringEx" || name=="FindStringOrdinal"){
+        // 回傳來源中的位置；找不到回 -1 並設 ERROR_SUCCESS。
+        const auto missing=[&](std::uint32_t error){last_error_=error;return finish(UINT32_MAX);};
+        const bool ordinal=name=="FindStringOrdinal";const unsigned base=ordinal?1U:2U;
+        const auto raw=static_cast<std::uint32_t>(arg(ordinal?0:1));const auto direction=raw&0x00f00000U,options=raw&~0x00f00000U;
+        if((direction&(direction-1)) || (ordinal?(raw!=direction || !direction):(options&~compare_flags)!=0))return missing(1004);
+        const auto source_count=static_cast<std::int32_t>(arg(base+1)),value_count=static_cast<std::int32_t>(arg(base+3));
+        if(!arg(base) || !arg(base+2) || source_count<-1 || value_count<-1 || (!ordinal && (!source_count || !value_count)) || (ordinal && arg(5)>1))return missing(87);
+        auto source=counted_string(memory,arg(base),source_count,false),value=counted_string(memory,arg(base+2),value_count,false);
+        if(ordinal){
+            if(arg(5)){for(auto& c:source)c=static_cast<char16_t>(u_toupper(c));for(auto& c:value)c=static_cast<char16_t>(u_toupper(c));}
+            std::size_t at=std::u16string::npos;
+            if(direction==0x00100000U){if(source.starts_with(value))at=0;}else if(direction==0x00200000U){if(source.ends_with(value))at=source.size()-value.size();}
+            else at=direction==0x00800000U?source.rfind(value):source.find(value);
+            last_error_=0;return finish(at==std::u16string::npos?UINT32_MAX:static_cast<std::uint32_t>(at));
+        }
+        const bool extended=name=="FindNLSStringEx";const auto locale=extended?named(requested()):numbered(static_cast<std::uint32_t>(arg(0)));
+        if(!locale || (extended && (arg(8) || arg(9) || (arg(7) && !version_matches(*locale,arg(7))))))return missing(87);
+        const auto found=find_collated(source,std::move(value),*locale,options,direction);if(!found)return missing(0);
+        if(arg(6))memory.store(GuestAddress{arg(6)},32,static_cast<std::uint32_t>(found->second));
+        last_error_=0;return finish(static_cast<std::uint32_t>(found->first));
+    }
+    if(name.starts_with("EnumDateFormats") || name.starts_with("EnumTimeFormats")){
+        // 回呼引數：A／W 只有格式字串；DateFormatsEx 另帶曆法識別碼；DateFormatsExEx／TimeFormatsEx 另帶 lParam。
+        const bool date=name.starts_with("EnumDate"),named_locale=name=="EnumDateFormatsExEx" || name=="EnumTimeFormatsEx",ansi=name.ends_with('A');
+        if(!arg(0))return fail(87);
+        const auto locale=named_locale?named(requested_locale_name(memory,arg(1))):numbered(static_cast<std::uint32_t>(arg(1)));if(!locale)return fail(87);
+        const auto raw=static_cast<std::uint32_t>(arg(2));const auto flags=ansi?raw&~0x40000000U:raw;
+        std::uint32_t type=0;const bool alternate=date && (flags&4U);
+        if(date){const auto kind=flags&~4U;type=kind==1?0x1fU:kind==2?0x20U:kind==8?0x1006U:kind==0x80?0x78U:0U;}
+        else type=flags==0?0x1003U:flags==2?0x79U:0U;
+        if(!type)return fail(1004);
+        memory.check(GuestAddress{arg(0)},1,Access::Execute);
+        // 預設曆法沿用 GetLocaleInfo 的格式；DATE_USE_ALT_CALENDAR 改用地區設定的第一個選用曆法。
+        std::uint32_t calendar=1;if(const auto info=locale_information(*locale,0x1009,false);info && info->number)calendar=*info->number;
+        std::optional<LocaleInfo> format;
+        if(alternate)for(const auto id:locale_calendars(*locale)){
+            const auto* kind=calendar_kind(id);if(id==calendar || !kind)continue;
+            format=calendar_information(*locale,*kind,type==0x1f?5U:type==0x20?6U:type==0x1006?0x2fU:0x38U,false);if(format){calendar=id;break;}
+        }
+        if(!format)format=locale_information(*locale,type,false);if(!format)return fail(1004);
+        std::vector<std::uint64_t> extra;if(name.starts_with("EnumDateFormatsEx"))extra.push_back(calendar);if(named_locale)extra.push_back(arg(3));
+        std::vector<std::pair<std::vector<std::uint8_t>,std::vector<std::uint64_t>>> items;
+        items.emplace_back(ansi?ansi_output(format->text+u'\0',ansi_encoding(*locale,(raw&0x40000000U)!=0)):utf16_bytes(format->text),std::move(extra));
+        return enumerate(arg(0),std::move(items),8);
+    }
+    if(name=="EnumSystemCodePagesA" || name=="EnumSystemCodePagesW"){
+        // 與 IsValidCodePage 使用同一份碼頁支援判斷；CP_INSTALLED 與 CP_SUPPORTED 的集合相同。
+        const auto flags=static_cast<std::uint32_t>(arg(1));if(flags!=1 && flags!=2)return fail(1004);if(!arg(0))return fail(87);
+        memory.check(GuestAddress{arg(0)},1,Access::Execute);
+        constexpr std::uint16_t candidates[]{37,437,500,708,720,737,775,850,852,855,857,858,860,861,862,863,864,865,866,869,870,874,875,932,936,949,950,1026,1047,
+            1140,1141,1142,1143,1144,1145,1146,1147,1148,1149,1250,1251,1252,1253,1254,1255,1256,1257,1258,1361,10000,10001,10002,10003,10004,10005,10006,10007,
+            10008,10010,10017,10021,10029,10079,10081,10082,20000,20001,20002,20003,20004,20005,20105,20106,20107,20108,20127,20261,20269,20273,20277,20278,20280,
+            20284,20285,20290,20297,20420,20423,20424,20833,20838,20866,20871,20880,20905,20924,20932,20936,20949,21025,21866,28591,28592,28593,28594,28595,28596,
+            28597,28598,28599,28603,28605,38598,50220,50221,50222,50225,50227,51932,51936,51949,52936,54936,57002,57003,57004,57005,57006,57007,57008,57009,57010,
+            57011,65000,65001};
+        std::vector<std::pair<std::vector<std::uint8_t>,std::vector<std::uint64_t>>> items;
+        for(const auto page:candidates)if(windows_crt_codepage(page)){const auto text=std::to_string(page);
+            items.emplace_back(name.ends_with('W')?utf16_bytes(utf8_to_utf16(text)):std::vector<std::uint8_t>(text.c_str(),text.c_str()+text.size()+1),std::vector<std::uint64_t>{});}
+        return enumerate(arg(0),std::move(items),8);
+    }
+    // MUI 偏好 UI 語言：以 locale 名稱保存；MUI_LANGUAGE_ID（4）輸出四位十六進位 LANGID，否則輸出名稱。
+    const auto mui_text=[&](const std::u16string& language,bool id)->std::u16string{
+        if(!id)return language;const auto locale=named(language);char hex[5]{};std::snprintf(hex,sizeof hex,"%04X",locale?locale->id&0xffffU:0U);return utf8_to_utf16(hex);};
+    const auto mui_parse=[&](std::u16string_view text,bool id)->std::optional<std::u16string>{
+        std::optional<Locale> locale;
+        if(id){if(text.size()!=4)return {};std::uint32_t value=0;for(const auto c:text){const int digit=c>=u'0'&&c<=u'9'?c-u'0':c>=u'a'&&c<=u'f'?c-u'a'+10:c>=u'A'&&c<=u'F'?c-u'A'+10:-1;if(digit<0)return {};value=value*16+static_cast<std::uint32_t>(digit);}locale=numbered(value);}
+        else locale=named(text);
+        if(!locale || locale->name.empty())return {};return locale->name;};
+    const auto mui_write=[&](const std::vector<std::u16string>& languages,bool id,std::uint64_t count,std::uint64_t buffer,std::uint64_t size)->std::optional<std::uint32_t>{
+        const auto capacity=memory.load(GuestAddress{size},32);memory.check(GuestAddress{count},4,Access::Write);memory.check(GuestAddress{size},4,Access::Write);
+        std::u16string list;for(const auto& language:languages){list+=mui_text(language,id);list.push_back(0);}if(list.empty())list.push_back(0);
+        const auto bytes=utf16_bytes(list);const auto required=static_cast<std::uint32_t>(bytes.size()/2);
+        memory.store(GuestAddress{count},32,languages.size());memory.store(GuestAddress{size},32,required);
+        if(!buffer && !capacity)return finish(1);if(!buffer || capacity<required)return fail(122);
+        memory.write(GuestAddress{buffer},bytes);return finish(1);};
+    // 使用者與系統 UI 語言目前固定為 en-US。
+    const std::vector<std::u16string> user_languages{u"en-US"};
+    if(name=="GetThreadPreferredUILanguages" || name=="GetUserPreferredUILanguages" || name=="GetSystemPreferredUILanguages" || name=="GetProcessPreferredUILanguages"){
+        const bool thread=name=="GetThreadPreferredUILanguages",system=name=="GetSystemPreferredUILanguages",process=name=="GetProcessPreferredUILanguages";
+        const auto flags=static_cast<std::uint32_t>(arg(0)),allowed=thread?0x7cU:system?0x40cU:0xcU;
+        if(!arg(1) || !arg(3) || (flags&~allowed) || (flags&0xc)==0xc ||
+           (thread && (((flags&0x10) && !(flags&0x20)) || ((flags&0x40) && (flags&0x30)))))return fail(87);
+        std::vector<std::u16string> languages;const auto add=[&](const std::u16string& language){if(std::find(languages.begin(),languages.end(),language)==languages.end())languages.push_back(language);};
+        if(process)for(const auto& language:runtime_.preferred_ui_languages)add(language);
+        else if(thread){
+            // 執行緒清單在前，其次程序與使用者清單；MUI_THREAD_LANGUAGES 只取執行緒清單。
+            if(const auto* current=current_thread_ui_languages())for(const auto& language:*current)add(language);
+            if(!(flags&0x40)){for(const auto& language:runtime_.preferred_ui_languages)add(language);for(const auto& language:user_languages)add(language);}
+            if(flags&0x10){const auto copy=languages;for(const auto& language:copy){const auto dash=language.find(u'-');if(dash!=language.npos)if(const auto parent=named(language.substr(0,dash));parent && !parent->name.empty())add(parent->name);}}
+        }
+        else for(const auto& language:user_languages)add(language);
+        return mui_write(languages,(flags&4)!=0,arg(1),arg(2),arg(3));
+    }
+    if(name=="SetThreadPreferredUILanguages" || name=="SetProcessPreferredUILanguages"){
+        // 緩衝區為 NULL 或空多字串時清除；最多保存五個語言，任一無效即失敗且不變更。
+        const bool thread=name=="SetThreadPreferredUILanguages";const auto flags=static_cast<std::uint32_t>(arg(0));
+        if((flags&~(thread?0x30dU:0xcU)) || (flags&0xc)==0xc || (arg(1) && !(flags&0xc)))return fail(87);
+        std::vector<std::u16string> languages;
+        if(arg(1))for(std::uint64_t at=arg(1);;){const auto text=read_utf16(memory,GuestAddress{at},85);if(text.empty())break;
+            const auto language=mui_parse(text,(flags&4)!=0);if(!language)return fail(87);
+            if(languages.size()<5 && std::find(languages.begin(),languages.end(),*language)==languages.end())languages.push_back(*language);at+=(text.size()+1)*2;}
+        if(arg(2))memory.store(GuestAddress{arg(2)},32,languages.size());
+        auto* target=thread?current_thread_ui_languages():&runtime_.preferred_ui_languages;if(!target)return fail(87);
+        *target=std::move(languages);return finish(1);
+    }
+    if(name=="GetThreadUILanguage" || name=="SetThreadUILanguage"){
+        // SetThreadUILanguage 等同只設定一個執行緒偏好 UI 語言；0 表示沿用目前語言。
+        auto* thread=current_thread_ui_languages();
+        const auto current=[&]()->std::uint32_t{if(thread && !thread->empty())if(const auto locale=named(thread->front()))return locale->id&0xffffU;return 0x409U;};
+        if(name=="GetThreadUILanguage" || !static_cast<std::uint16_t>(arg(0)))return finish(current());
+        const auto locale=numbered(static_cast<std::uint16_t>(arg(0)));if(!locale || locale->name.empty() || !thread)return fail(87);
+        *thread={locale->name};return finish(locale->id&0xffffU);
+    }
+    if(name=="GetThreadLocale" || name=="SetThreadLocale"){
+        // 尚未建立客體執行緒時沒有執行緒地區設定：查詢回預設 en-US，設定失敗。
+        const auto thread=threads_.items.find(threads_.current);
+        if(name=="GetThreadLocale")return finish(thread!=threads_.items.end() && thread->second.locale?thread->second.locale:0x409U);
+        auto id=static_cast<std::uint32_t>(arg(0));if(id==0x400 || id==0x800)id=0x409;
+        const auto locale=numbered(id);if(!locale || locale->name.empty() || locale->neutral || thread==threads_.items.end())return fail(87);thread->second.locale=id;return finish(1);
+    }
+    if(name=="EnumUILanguagesA" || name=="EnumUILanguagesW"){
+        // 已安裝的 UI 語言與 GetSystemPreferredUILanguages 相同。
+        const auto flags=static_cast<std::uint32_t>(arg(1));if(!arg(0))return fail(87);if((flags&~0xacU) || (flags&0xc)==0xc)return fail(1004);
+        memory.check(GuestAddress{arg(0)},1,Access::Execute);
+        std::vector<std::pair<std::vector<std::uint8_t>,std::vector<std::uint64_t>>> items;
+        for(const auto& language:user_languages){const auto text=mui_text(language,!(flags&8));
+            items.emplace_back(name.ends_with('W')?utf16_bytes(text):ansi_output(text+u'\0',"UTF-8"),std::vector<std::uint64_t>{arg(2)});}
+        return enumerate(arg(0),std::move(items),8);
+    }
+    if(name=="IdnToNameprepUnicode"){
+        const auto flags=static_cast<std::uint32_t>(arg(0));const auto count=static_cast<std::int32_t>(arg(2)),capacity=static_cast<std::int32_t>(arg(4));
+        if(flags&~3U)return fail(1004);
+        if(!arg(1) || !count || count<-1 || capacity<0 || (capacity && !arg(3)) || arg(1)==arg(3))return fail(87);
+        try{
+            auto source=counted_string(memory,arg(1),count,true);const bool terminal=!source.empty() && source.back()==0;if(terminal)source.pop_back();
+            if(source.empty() || source.find(char16_t{})!=source.npos)return fail(123);
+            auto result=idn_detail::nameprep(source,flags);if(!result)return fail(123);if(terminal)result->push_back(0);
+            if(!capacity)return finish(static_cast<std::uint32_t>(result->size()));if(static_cast<std::size_t>(capacity)<result->size())return fail(122);
+            memory.check(GuestAddress{arg(3)},result->size()*2,Access::Write);for(std::size_t i=0;i<result->size();++i)memory.store(GuestAddress{arg(3)+i*2},16,(*result)[i]);
+            return finish(static_cast<std::uint32_t>(result->size()));
+        }catch(const MemoryFault&){return fail(998);}catch(const std::bad_alloc&){return fail(14);}
+    }
     if(name.starts_with("EnumSystemLocales")){
         const bool extended=name.ends_with("Ex"),wide=extended || name.ends_with('W');const auto flags=static_cast<std::uint32_t>(arg(1));
         if(!arg(0) || (extended && arg(3)))return fail(87);
         if((extended && (flags&~0x7fU)) || (!extended && flags!=1 && flags!=2))return fail(1004);
         memory.check(GuestAddress{arg(0)},1,Access::Execute);
-        std::vector<std::pair<std::vector<std::uint8_t>,unsigned>> items;std::set<std::uint32_t> ids;
+        std::vector<std::pair<std::vector<std::uint8_t>,std::vector<std::uint64_t>>> items;std::set<std::uint32_t> ids;
         for(const auto& [key,locale]:locales()){
             (void)key;if(locale.name.empty())continue;const unsigned kind=(locale.id==0x1000?4U:1U)|(locale.neutral?0x10U:0x20U);
-            if(extended){if(flags && !(flags&kind))continue;items.emplace_back(utf16_bytes(locale.name),kind);}
-            else {if(locale.neutral || locale.id==0x1000 || !ids.insert(locale.id).second)continue;char hex[9]{};std::snprintf(hex,sizeof hex,"%08x",locale.id);items.emplace_back(wide?utf16_bytes(utf8_to_utf16(hex)):std::vector<std::uint8_t>(hex,hex+9),0);}
+            if(extended){if(flags && !(flags&kind))continue;items.emplace_back(utf16_bytes(locale.name),std::vector<std::uint64_t>{kind,arg(2)});}
+            else {if(locale.neutral || locale.id==0x1000 || !ids.insert(locale.id).second)continue;char hex[9]{};std::snprintf(hex,sizeof hex,"%08x",locale.id);items.emplace_back(wide?utf16_bytes(utf8_to_utf16(hex)):std::vector<std::uint8_t>(hex,hex+9),std::vector<std::uint64_t>{});}
         }
-        std::size_t size=0;for(const auto& item:items)size+=item.first.size();if(!size)return finish(1);
-        const auto buffer=allocate_heap(memory,size);if(!buffer)return fail(8);std::vector<GuestCallback> callbacks;auto at=buffer;
-        try{for(const auto& [bytes,kind]:items){memory.write(GuestAddress{at},bytes);callbacks.push_back({arg(0),extended?std::vector<std::uint64_t>{at,kind,arg(2)}:std::vector<std::uint64_t>{at}});at+=bytes.size();}start_callbacks(state,memory,std::move(callbacks),Continuation::LocaleEnumeration,buffer);}catch(...){(void)free_heap(memory,buffer,state);throw;}
-        return std::nullopt;
+        return enumerate(arg(0),std::move(items),8);
     }
     return fail(50);
 }

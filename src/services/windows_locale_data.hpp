@@ -19,6 +19,10 @@ std::optional<std::array<std::uint32_t,3>> windows_locale_digit_substitution(std
 // CRT locale 物件與 Win32 NLS 共用名稱、LCID、碼頁及 lead／trail 分類。
 std::optional<CrtLocaleCategory> windows_crt_locale(std::u16string_view name);
 std::optional<CrtLocaleCategory> windows_crt_codepage(std::uint32_t codepage);
+// 依 LCID 建立 CRT locale 類別（VC8～VC10 的 STL 以 LCID 識別 locale）；0 即 C locale。
+std::optional<CrtLocaleCategory> windows_crt_locale_id(std::uint32_t lcid);
+// GetStringTypeW 的單一字元分類（CT_CTYPE1／2／3），STL 的 _Getwctype 共用。
+std::uint16_t windows_nls_character_type(char16_t value,unsigned type);
 struct CrtNumericData {std::u16string decimal{u"."},thousands;std::string grouping;};
 CrtNumericData windows_crt_numeric(const CrtLocaleCategory&);
 struct CrtTimeData {

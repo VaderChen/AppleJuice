@@ -3,11 +3,13 @@
 
 namespace x64arm::msvcp_detail {
 // VC10 與 VC14 共用操作語義；ABI 差異只在此描述。VC14 streambuf 不含 VC10 的鎖指標。
+// x86 的 ios_base 因含 8 位元組 streamsize，虛擬表指標後補齊到 8：VC10／VC14 的 _Mystate 皆在 12、_Fmtfl 在 20
+// （VC14 實際程式內嵌碼讀 _Fmtfl 於 0x14、_Wide 於 0x20）；VC9 的 streamsize 為 int，沒有這段補齊。
 struct StreamAbi {
     bool modern{},legacy{};
     unsigned element{2},p{},state{},flags{},precision{},width{},locale{},ios_size{},buffer_size{};
     explicit StreamAbi(bool x86,bool vc14=false,unsigned characters=2,bool vc9=false):modern(vc14),legacy(vc9),element(characters),p(x86?4U:8U),
-        state(x86?(vc14 || vc9?8U:12U):16U),flags(x86?(vc14 || vc9?16U:20U):24U),precision(x86?(vc9?20U:24U):32U),width(x86?(vc9?24U:32U):40U),
+        state(x86?(vc9?8U:12U):16U),flags(x86?(vc9?16U:20U):24U),precision(x86?(vc9?20U:24U):32U),width(x86?(vc9?24U:32U):40U),
         locale(x86?(vc9?36U:48U):64U),ios_size(x86?(vc9?40U:56U):72U),buffer_size((vc14?12U:13U)*p+8U){}
     unsigned count_offset()const{return legacy?p:8U;}
     std::uint8_t stream_bits()const{return static_cast<std::uint8_t>(legacy?p*8:64U);}
@@ -34,18 +36,19 @@ struct StreamAbi {
 };
 // STL 的 C 匯出名稱不含類別字樣，由此併入 VC10／VC14 共用流程。
 inline bool c_export(std::string_view name){
-    return name=="_Cosh" || name=="_LCosh" || name=="_FCosh" || name=="_Sinh" || name=="_LSinh" || name=="_FSinh" || name=="_Exp" || name=="_LExp" || name=="_FExp" ||
-        name=="_Dtest" || name=="_LDtest" || name=="_FDtest" || name=="_Getctype" || name=="_Getcvt" || name=="_Lock_shared_ptr_spin_lock" || name=="_Unlock_shared_ptr_spin_lock";
+    return name=="_Getctype" || name=="_Getcvt" || name=="_Lock_shared_ptr_spin_lock" || name=="_Unlock_shared_ptr_spin_lock";
 }
 inline bool modern(const WindowsServiceDescriptor& service){return service.family=="msvcp140.dll" || service.family=="internal-msvcp140";}
 inline unsigned element(const WindowsServiceDescriptor& service){
+    // VC9／VC10 基底 streambuf 的內部虛擬表依字元型別分開：DStream…（char）、WStream…（寬字元）。
+    if((service.family=="internal-msvcp90" || service.family=="internal-msvcp100") && (service.symbol.starts_with("DStream") || service.symbol.starts_with("WStream")))return service.symbol[0]=='D'?1U:2U;
     if(service.family=="internal-msvcp90")return 1U;
     if(service.family=="internal-msvcp140")return service.symbol.starts_with('D')?1U:2U;
     return service.symbol.find("basic_streambuf@D")!=service.symbol.npos || service.symbol.find("basic_ios@D")!=service.symbol.npos ||
         service.symbol.find("basic_istream@D")!=service.symbol.npos || service.symbol.find("basic_ostream@D")!=service.symbol.npos ||
         service.symbol.find("basic_iostream@D")!=service.symbol.npos || service.symbol.find("ctype@D")!=service.symbol.npos ||
-        service.symbol.find("time_put@D")!=service.symbol.npos || service.symbol.find("codecvt@DD")!=service.symbol.npos ||
-        service.symbol.find("num_put@D")!=service.symbol.npos || service.symbol.find("numpunct@D")!=service.symbol.npos ||
+        service.symbol.find("time_put@D")!=service.symbol.npos || service.symbol.find("time_get@D")!=service.symbol.npos || service.symbol.find("codecvt@DD")!=service.symbol.npos ||
+        service.symbol.find("num_put@D")!=service.symbol.npos || service.symbol.find("num_get@D")!=service.symbol.npos || service.symbol.find("numpunct@D")!=service.symbol.npos ||
         service.symbol.find("numpunct_byname@D")!=service.symbol.npos || service.symbol.find("basic_ifstream@D")!=service.symbol.npos ||
         service.symbol.find("basic_filebuf@D")!=service.symbol.npos?1U:2U;
 }

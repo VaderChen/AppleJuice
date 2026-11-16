@@ -21,6 +21,8 @@ std::span<const WindowsServiceDescriptor> resource_service_descriptors(){
         {"kernel32.dll","EnumResourceTypesA",3},{"kernel32.dll","EnumResourceTypesW",3},
         {"kernel32.dll","EnumResourceNamesA",4},{"kernel32.dll","EnumResourceNamesW",4},
         {"kernel32.dll","EnumResourceLanguagesA",5},{"kernel32.dll","EnumResourceLanguagesW",5},
+        {"kernel32.dll","EnumResourceTypesExA",5},{"kernel32.dll","EnumResourceTypesExW",5},{"kernel32.dll","EnumResourceNamesExA",6},{"kernel32.dll","EnumResourceNamesExW",6},
+        {"kernel32.dll","EnumResourceLanguagesExA",7},{"kernel32.dll","EnumResourceLanguagesExW",7},
         {"user32.dll","LoadStringA",4},{"user32.dll","LoadStringW",4},
         {"user32.dll","LoadBitmapA",2},{"user32.dll","LoadBitmapW",2},
         {"user32.dll","SetThreadDpiAwarenessContext",1},{"user32.dll","GetThreadDpiAwarenessContext",0},
@@ -31,12 +33,14 @@ std::span<const WindowsServiceDescriptor> resource_service_descriptors(){
         {"user32.dll","EnableNonClientDpiScaling",1},{"user32.dll","GetSystemMetricsForDpi",2},
         {"user32.dll","GetDpiForWindow",1},{"user32.dll","GetDpiForSystem",0},
         {"shcore.dll","SetProcessDpiAwareness",1},{"shcore.dll","GetProcessDpiAwareness",2},{"shcore.dll","GetDpiForMonitor",4},
+        {"shcore.dll","GetScaleFactorForMonitor",2},{"shcore.dll","GetScaleFactorForDevice",1,0,0,0x1},{"shcore.dll","RegisterScaleChangeEvent",2},{"shcore.dll","UnregisterScaleChangeEvent",1},
+        {"shcore.dll","RegisterScaleChangeNotifications",4,0,0,0x5},{"shcore.dll","RevokeScaleChangeNotifications",2,0,0,0x3},
         {"user32.dll","SetProcessDPIAware",0},{"user32.dll","IsProcessDPIAware",0},{"user32.dll","GetDialogBaseUnits",0},
         {"user32.dll","CallWindowProcA",5},{"user32.dll","CallWindowProcW",5},{"user32.dll","GetKeyState",1},
         {"user32.dll","MapVirtualKeyA",2},{"user32.dll","MapVirtualKeyW",2},{"user32.dll","MapVirtualKeyExA",3},{"user32.dll","MapVirtualKeyExW",3},
         {"user32.dll","GetClassInfoA",3},{"user32.dll","GetClassInfoW",3},{"user32.dll","GetClassInfoExA",3},{"user32.dll","GetClassInfoExW",3},
         {"user32.dll","GetWindowPlacement",2},{"user32.dll","SetWindowPlacement",2},
-        {"user32.dll","WindowFromPoint",1,1},{"user32.dll","ChildWindowFromPoint",2,2},{"user32.dll","ChildWindowFromPointEx",3,2},{"user32.dll","RealChildWindowFromPoint",2,2},
+        {"user32.dll","WindowFromPoint",1,1},{"user32.dll","WindowFromPhysicalPoint",1,1},{"user32.dll","ChildWindowFromPoint",2,2},{"user32.dll","ChildWindowFromPointEx",3,2},{"user32.dll","RealChildWindowFromPoint",2,2},
         {"user32.dll","LoadMenuA",2},{"user32.dll","LoadMenuW",2},
         {"user32.dll","LoadMenuIndirectA",1},{"user32.dll","LoadMenuIndirectW",1},
         {"user32.dll","LoadAcceleratorsA",2},{"user32.dll","LoadAcceleratorsW",2},
@@ -247,6 +251,13 @@ std::uint64_t WindowsServices::load_gui_menu(GuestMemory& memory,std::uint64_t b
         };return parse(0);
     }catch(...){for(const auto handle:created)gui_.menus.erase(handle);throw;}
 }
+// 判斷視窗所在螢幕的矩形：最小化視窗依還原位置，其他依外框的螢幕座標（MonitorFromWindow 與 Shell hook 共用）。
+std::array<std::int32_t,4> WindowsServices::gui_window_screen_rect(const GuiWindow& window){
+    if(window.show_command==2 && window.normal_rect){const auto& n=*window.normal_rect;return {n[0],n[1],n[0]+n[2],n[1]+n[3]};}
+    const auto origin=gui_client_origin(gui_,window.parent);const auto outer=gui_outer_size(window);
+    const auto x=static_cast<std::int32_t>(window.x+origin[0]),y=static_cast<std::int32_t>(window.y+origin[1]);
+    return {x,y,x+static_cast<std::int32_t>(outer[0]),y+static_cast<std::int32_t>(outer[1])};
+}
 std::uint64_t WindowsServices::effective_dpi_context() const {
     const auto thread=threads_.items.find(threads_.current);
     return thread!=threads_.items.end() && thread->second.dpi_context?thread->second.dpi_context:gui_.dpi_context;
@@ -273,8 +284,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
         const bool types=symbol.starts_with("EnumResourceTypes"),names=symbol.starts_with("EnumResourceNames");
         const unsigned function=types?1:names?2:3;
         const auto* image=resource_image(arg(0)?arg(0):runtime_.image.base);
+        // Ex 版本：RESOURCE_ENUM_LN（1）列舉模組本身，RESOURCE_ENUM_MUI（2／4）列舉 MUI 檔；沒有 MUI 檔時只剩 LN 的內容，
+        // 0 等同 LN|MUI。LangId 只用來挑選 MUI 檔。
+        const bool extended=symbol.find("Ex")!=symbol.npos;const auto enum_flags=extended?d(function+2):0U;
         if(!image)fail(126);
-        else if(!arg(function) || (!types && !arg(1)) || (!types && !names && !arg(2)))fail(87);
+        else if(!arg(function) || (!types && !arg(1)) || (!types && !names && !arg(2)) || (enum_flags&~0xfU))fail(87);
+        else if(enum_flags && !(enum_flags&1U))fail(types?1812U:names?1813U:1815U);
         else try{
             const ResourceDirectory tree(memory,*image);
             const auto type=types?ResourceKey{std::uint16_t{0}}:resource_key(memory,arg(1),wide);
@@ -325,6 +340,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
         }
     }else if(symbol.starts_with("MapVirtualKey")){
         if(symbol.starts_with("MapVirtualKeyEx") && !windows_input_layout_supported(arg(2)))fail(87);else result=windows_map_virtual_key(d(0),d(1));
+    }else if(symbol=="GetScaleFactorForMonitor" || symbol=="GetScaleFactorForDevice"){
+        // 虛擬桌面固定 96 DPI，每台螢幕都是 SCALE_100_PERCENT；未知裝置類型為 DEVICE_SCALE_FACTOR_INVALID。
+        if(symbol=="GetScaleFactorForDevice")result=d(0)<=1?100U:0U;
+        else if(!arg(0) || arg(0)>gui_monitors().size() || !arg(1))result=0x80070057U;
+        else {memory.store(GuestAddress{arg(1)},32,100);result=0;}
+    }else if(symbol=="RegisterScaleChangeEvent" || symbol=="UnregisterScaleChangeEvent" || symbol=="RegisterScaleChangeNotifications" || symbol=="RevokeScaleChangeNotifications"){
+        // 登錄縮放變更的事件或視窗訊息；虛擬桌面的縮放固定為 100%，登錄有效但不會觸發。
+        result=0x80070057U;
+        if(symbol=="RegisterScaleChangeEvent"){
+            const auto event=runtime_.wait_objects.find(arg(0));
+            if(event!=runtime_.wait_objects.end() && event->second.kind==WaitObject::Kind::Event && arg(1)){
+                const auto cookie=++next_scale_change_cookie_;scale_change_events_[cookie]=arg(0);memory.store(GuestAddress{arg(1)},x86_?32:64,cookie);result=0;}
+        }else if(symbol=="UnregisterScaleChangeEvent"){if(scale_change_events_.erase(arg(0)))result=0;}
+        else if(symbol=="RegisterScaleChangeNotifications"){
+            if(d(0)<=1 && gui_.windows.contains(arg(1)) && arg(3)){
+                const auto cookie=static_cast<std::uint32_t>(++next_scale_change_cookie_);scale_change_windows_[cookie]={d(0),arg(1),d(2)};memory.store(GuestAddress{arg(3)},32,cookie);result=0;}
+        }else if(const auto found=scale_change_windows_.find(d(1));found!=scale_change_windows_.end() && found->second.device==d(0)){scale_change_windows_.erase(found);result=0;}
     }else if(symbol=="GetDpiForMonitor"){
         // 與 monitor／GDI／DPI context 共用同一個 96 DPI 虛擬桌面。
         result=0x80070057U;
@@ -396,8 +428,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
                     start_callbacks(state,memory,{{resolve("user32.dll","ShowWindow").value,{arg(0),show}}},Continuation::Return,1);return std::nullopt;}
             }
         }
-    }else if(symbol=="WindowFromPoint" || symbol=="ChildWindowFromPoint" || symbol=="ChildWindowFromPointEx" || symbol=="RealChildWindowFromPoint"){
-        const bool child=symbol!="WindowFromPoint";const auto flags=symbol=="ChildWindowFromPointEx"?d(2):0;
+    }else if(symbol=="WindowFromPoint" || symbol=="WindowFromPhysicalPoint" || symbol=="ChildWindowFromPoint" || symbol=="ChildWindowFromPointEx" || symbol=="RealChildWindowFromPoint"){
+        // 共用視窗模型為 96 DPI，實體與邏輯座標相同：WindowFromPhysicalPoint 與 WindowFromPoint 一致。
+        const bool child=symbol!="WindowFromPoint" && symbol!="WindowFromPhysicalPoint";const auto flags=symbol=="ChildWindowFromPointEx"?d(2):0;
         const auto point=arg(child?1:0);const auto x=static_cast<std::int32_t>(point),y=static_cast<std::int32_t>(point>>32);
         if(child && !gui_.windows.contains(arg(0)))fail(1400);
         else if(flags>7)fail(87);
@@ -549,8 +582,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
                 if(flags&1U)gui_.display_registry_mode=selected;
                 if(!(flags&0x10000000U)){
                     const auto previous=gui_.display_mode.value_or(original);gui_.display_mode=selected;gui_area_cached_={};
-                    if(previous!=selected)for(const auto& [window,item]:gui_.windows)if(!item.parent && !item.destroying)
-                        enqueue_gui_message({window,selected[2],selected[0]|(std::uint64_t{selected[1]}<<16),0x7e});
+                    if(previous!=selected){++gui_.display_uniqueness;for(const auto& [window,item]:gui_.windows)if(!item.parent && !item.destroying)
+                        enqueue_gui_message({window,selected[2],selected[0]|(std::uint64_t{selected[1]}<<16),0x7e});}
                 }
             }
         }
@@ -635,13 +668,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
             // 最小化視窗依還原位置判斷；其他程序的視窗查共用視窗表，找不到時依旗標回主螢幕或 NULL。
             std::optional<std::array<std::int32_t,4>> rect;
             if(arg(0)==gui_.desktop)rect=gui_screen_area();
-            else if(const auto found=gui_.windows.find(arg(0));found!=gui_.windows.end()){
-                const auto& window=found->second;
-                if(window.show_command==2 && window.normal_rect){const auto& n=*window.normal_rect;rect=std::array<std::int32_t,4>{n[0],n[1],n[0]+n[2],n[1]+n[3]};}
-                else {const auto origin=gui_client_origin(gui_,window.parent);const auto outer=gui_outer_size(window);
-                    const auto x=static_cast<std::int32_t>(window.x+origin[0]),y=static_cast<std::int32_t>(window.y+origin[1]);
-                    rect=std::array<std::int32_t,4>{x,y,x+static_cast<std::int32_t>(outer[0]),y+static_cast<std::int32_t>(outer[1])};}
-            }else if(const auto shared=shared_gui_window(arg(0))){
+            else if(const auto found=gui_.windows.find(arg(0));found!=gui_.windows.end())rect=gui_window_screen_rect(found->second);
+            else if(const auto shared=shared_gui_window(arg(0))){
                 rect=std::array<std::int32_t,4>{shared->x,shared->y,shared->x+static_cast<std::int32_t>(shared->outer_width),shared->y+static_cast<std::int32_t>(shared->outer_height)};
             }
             result=rect?gui_monitor_from_rect(*rect,flags):flags?1:0;
@@ -666,6 +694,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
                 font(arg(2)+24);memory.store(GuestAddress{arg(2)+24+lf},32,16);memory.store(GuestAddress{arg(2)+28+lf},32,20);font(arg(2)+32+lf);
                 memory.store(GuestAddress{arg(2)+32+lf*2},32,16);memory.store(GuestAddress{arg(2)+36+lf*2},32,20);
                 font(arg(2)+40+lf*2);font(arg(2)+40+lf*3);font(arg(2)+40+lf*4);result=1;}
+        }else if(d(0)==0x21 || d(0)==0x57){
+            // SPI_SETMOUSEBUTTONSWAP 與 SwapMouseButton 共用左右鍵對調狀態；SPI_SETCURSORS 還原被 SetSystemCursor 取代的系統游標。
+            if(d(0)==0x21)gui_.mouse_buttons_swapped=d(1)!=0;else {gui_.system_cursors.clear();present_gui_cursor();}
+            result=1;
         }else if(d(0)==0x4a || d(0)==0x200a || d(0)==0x200c || d(0)==0x2012 || d(0)==0x1048){
             if(!arg(2))fail(87);else {
                 const auto value=d(0)==0x4a?static_cast<std::uint32_t>(gui_.font_smoothing):d(0)==0x200a?gui_.font_smoothing_type:d(0)==0x200c?gui_.font_smoothing_contrast:d(0)==0x2012?gui_.font_smoothing_orientation:static_cast<std::uint32_t>(gui_.font_smoothing && gui_.font_smoothing_type==2);

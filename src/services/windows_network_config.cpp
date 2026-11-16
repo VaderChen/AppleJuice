@@ -7,6 +7,7 @@
 #include "ipv4_prefix.h"
 #include "http_proxy_configuration.hpp"
 #include "x64arm/dhcp_lease.hpp"
+#include "../platform/network_statistics.hpp"
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -22,12 +23,15 @@
 #include <netpacket/packet.h>
 #endif
 #include <algorithm>
+#include <bit>
+#include <set>
 #include <cstring>
 #include <cerrno>
 #include <ctime>
 #include <cstdio>
 #include <cctype>
 #include <chrono>
+#include <thread>
 
 namespace x64arm {
 namespace {
@@ -294,6 +298,7 @@ NetworkRoute query_route(const NetworkConfiguration& config,std::uint64_t luid,s
 #endif
     return result;
 }
+#include "windows_ip_neighbors.inc"
 }
 bool snapshot_network_configuration(NetworkConfiguration& result){return capture(result);}
 bool WindowsServices::address_notification_waiting() const {
@@ -314,7 +319,7 @@ void WindowsServices::poll_address_notifications(GuestMemory& memory){
 // invoke_network_config 的描述項：登錄與處理函式放在同一個檔案（群組＝路由單位）。
 std::span<const WindowsServiceDescriptor> network_config_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
-        {"iphlpapi.dll","GetAdaptersAddresses",5},{"iphlpapi.dll","GetExtendedTcpTable",6,0,0,60},{"iphlpapi.dll","GetTcpTable",3,0,0,4},{"iphlpapi.dll","GetAdaptersInfo",2},
+        {"iphlpapi.dll","GetAdaptersAddresses",5},{"iphlpapi.dll","GetExtendedTcpTable",6,0,0,60},{"iphlpapi.dll","GetTcpTable",3,0,0,4},{"iphlpapi.dll","GetExtendedUdpTable",6,0,0,60},{"iphlpapi.dll","GetUdpTable",3,0,0,4},{"iphlpapi.dll","GetUdp6Table",3,0,0,4},{"iphlpapi.dll","GetAdaptersInfo",2},
         {"iphlpapi.dll","GetNetworkParams",2},{"iphlpapi.dll","GetIpAddrTable",3},{"iphlpapi.dll","GetIpForwardTable",3},{"iphlpapi.dll","IpReleaseAddress",1},
         {"iphlpapi.dll","IpRenewAddress",1},{"iphlpapi.dll","GetIfEntry",1},{"iphlpapi.dll","GetIfTable",3},{"iphlpapi.dll","GetIfTable2",1},
         {"iphlpapi.dll","GetIfTable2Ex",2},{"iphlpapi.dll","GetIfEntry2",1},{"iphlpapi.dll","FreeMibTable",1},{"iphlpapi.dll","GetInterfaceInfo",2},
@@ -326,10 +331,45 @@ std::span<const WindowsServiceDescriptor> network_config_service_descriptors(){
         {"winhttp.dll","WinHttpSetDefaultProxyConfiguration",1},{"iphlpapi.dll","GetBestRoute2",7},{"dhcpcsvc.dll","DhcpCApiInitialize",1},{"dhcpcsvc.dll","DhcpCApiCleanup",0},
         {"dhcpcsvc.dll","DhcpRequestParams",9,(1U<<4)|(1U<<5)},{"iphlpapi.dll","GetBestInterface",2},{"iphlpapi.dll","GetBestInterfaceEx",2},{"iphlpapi.dll","NotifyAddrChange",2},
         {"iphlpapi.dll","CancelIPChangeNotify",1},
+        {"iphlpapi.dll","SendARP",4,0,0,3},{"iphlpapi.dll","GetIpNetTable",3,0,0,4},
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);std::uint64_t result=0;
+    if(service.symbol=="SendARP"){
+        // Vista+：空指標產生存取違規；失敗不覆寫 MAC，長度歸零。
+        const auto capacity=memory.load(GuestAddress{arg(3)},32);memory.check(GuestAddress{arg(3)},4,Access::Write);
+        memory.check(GuestAddress{arg(2)},std::min<std::uint64_t>(std::max<std::uint64_t>(1,capacity),8),Access::Write);
+        std::vector<std::uint8_t> physical;
+        if(capacity<6)result=111;
+        else {auto& config=*runtime_.network.configuration;
+            if(!runtime_.network.external_io)throw HostCallFault("compare 不允許原生 ARP 查詢");
+            result=refresh_configuration(config,true,false)?resolve_ipv4_neighbor(config,static_cast<std::uint32_t>(arg(0)),static_cast<std::uint32_t>(arg(1)),physical):31;
+            if(!result && capacity<physical.size())result=111;
+        }
+        if(!result)memory.write(GuestAddress{arg(2)},physical);
+        memory.store(GuestAddress{arg(3)},32,result?0:physical.size());arg.return_to(state,result);return std::nullopt;
+    }
+    if(service.symbol=="GetIpNetTable"){
+        try{
+            if(!arg(1))result=87;
+            else {
+                const auto capacity=memory.load(GuestAddress{arg(1)},32);memory.check(GuestAddress{arg(1)},4,Access::Write);
+                if(!runtime_.network.external_io)throw HostCallFault("compare 不允許原生 ARP 查詢");
+                std::vector<Ipv4Neighbor> entries;result=ipv4_neighbors(entries);
+                if(!result){
+                    if(arg(2))std::stable_sort(entries.begin(),entries.end(),[](const auto& a,const auto& b){return ntohl(a.address)<ntohl(b.address);});
+                    const auto required=4+entries.size()*24;memory.store(GuestAddress{arg(1)},32,required);
+                    if(entries.empty())result=232;
+                    else if(!arg(0) || capacity<required)result=122;
+                    else {memory.write(GuestAddress{arg(0)},std::vector<std::uint8_t>(required));memory.store(GuestAddress{arg(0)},32,entries.size());
+                        for(std::size_t i=0;i<entries.size();++i){const auto at=arg(0)+4+i*24;const auto& item=entries[i];memory.store(GuestAddress{at},32,item.index);memory.store(GuestAddress{at+4},32,item.physical.size());memory.write(GuestAddress{at+8},item.physical);memory.store(GuestAddress{at+16},32,item.address);memory.store(GuestAddress{at+20},32,item.type);}
+                    }
+                }
+            }
+        }catch(const MemoryFault&){result=87;}catch(const std::bad_alloc&){result=8;}
+        arg.return_to(state,result);return std::nullopt;
+    }
     if(service.symbol=="ConvertLengthToIpv4Mask" || service.symbol=="ConvertIpv4MaskToLength"){
         try {
             if(!arg(1))result=87;
@@ -345,6 +385,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& 
         arg.return_to(state,result);return std::nullopt;
     }
     if(service.symbol=="GetExtendedTcpTable" || service.symbol=="GetTcpTable"){arg.return_to(state,tcp_table_call(memory,arg,service.symbol));return std::nullopt;}
+    if(service.symbol=="GetExtendedUdpTable" || service.symbol=="GetUdpTable" || service.symbol=="GetUdp6Table"){arg.return_to(state,udp_table_call(memory,arg,service.symbol));return std::nullopt;}
     if(service.family=="dhcpcsvc.dll"){
         struct Error {std::uint32_t code;};const auto require=[](bool ok,std::uint32_t code=87){if(!ok)throw Error{code};};
         try {
@@ -857,4 +898,5 @@ std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& 
     }
     arg.return_to(state,result);return std::nullopt;
 }
+#include "iphelper_extras.inc"
 }

@@ -11,7 +11,9 @@
 #include "windows_display_identity.hpp"
 #include "setup_driver_store.hpp"
 #include "bluetooth_windows.hpp"
+#include "windows_sddl.hpp"
 #include <algorithm>
+#include <cstring>
 #include <set>
 
 namespace x64arm {
@@ -124,6 +126,8 @@ std::uint32_t sync_hardware_key(RegistryState& registry,const std::filesystem::p
 }
 struct DeviceConfigurationState {
     std::map<std::uint32_t,DeviceNode> nodes;
+    // CM_Connect_Machine 取得的本機 HMACHINE（客體堆積上的唯一位址），由 CM_Disconnect_Machine 釋放。
+    std::set<std::uint64_t> machines;
     std::map<input::Guid,std::uint32_t> hid_nodes;
     std::map<std::u16string,std::uint32_t> bluetooth_nodes;
     // 監視器：顯示器序號（0 起算）→ devnode，拔除後保留為不存在；monitors 為最近一次同步的顯示器狀態。
@@ -339,8 +343,19 @@ std::optional<usb::Target> WindowsServices::usb_target(const std::u16string& pat
     return found->second;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');
+    const WindowsCall arg(state,memory,service);
+    // CM_*_Ex 只比基本版多最後一個 hMachine：NULL 或 CM_Connect_Machine 取得的本機 handle 有效，之後與基本版共用同一實作。
+    std::string base_name{service.symbol};bool machine_variant=false;
+    if(base_name.starts_with("CM_"))if(const auto at=base_name.rfind("_Ex");at!=std::string::npos && (at+3==base_name.size() || (at+4==base_name.size() && (base_name[at+3]=='A' || base_name[at+3]=='W')))){base_name.erase(at,3);machine_variant=true;}
+    const std::string_view name=base_name;const bool wide=name.ends_with('W');
     const auto finish=[&](std::uint64_t result)->std::optional<std::uint32_t>{arg.return_to(state,result);return std::nullopt;};
+    const auto machine_valid=[&](std::uint64_t handle){return !handle || (device_configuration_ && device_configuration_->machines.contains(handle));};
+    if(machine_variant && !machine_valid(arg(service.arguments-1)))return finish(49);
+    // 已提升的系統管理員權杖：裝置啟用／停用與類別屬性寫入共用。
+    const auto administrator=[&]{
+        initialize_tokens();const auto& token=runtime_.token_objects.at(effective_token_id());
+        return token.integrity>=0x3000U && std::any_of(token.groups.begin(),token.groups.end(),[](const auto& group){return group.sid==security::account_sid(*security::find_account("Administrators")) && (group.attributes&0x14U)==4U;});
+    };
     const auto read=[&](std::uint64_t pointer){return pointer?(wide?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16(read_ansi(memory,pointer,32768))):std::u16string{};};
     if(!runtime_.network.external_io)throw HostCallFault("原生顯示裝置盤點不支援 deterministic compare");
     if(name=="CM_Register_Notification" || name=="CM_Unregister_Notification")return invoke_device_notification(state,memory,service);
@@ -439,8 +454,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
             return false;
         };
         if(device_configuration_->monitor_nodes.empty() && sees_monitor_nodes())sync_monitor_nodes(*device_configuration_,gui_monitors());
+        if(name=="CM_Connect_MachineA" || name=="CM_Connect_MachineW"){
+            // 自 Windows 8 起不能連線遠端電腦；本機（NULL、空字串、"."、LOCALHOST 或電腦名稱，可帶 \\ 前綴）取得 handle。
+            if(!arg(1))return finish(3);memory.check(GuestAddress{arg(1)},x86_?4:8,Access::Write);auto server=folded(read(arg(0)));if(server.starts_with(u"\\\\"))server.erase(0,2);
+            if(!server.empty() && server!=u"." && server!=u"localhost" && server!=u"x64arm")return finish(49);
+            if(device_configuration_->machines.size()>=256)return finish(2);const auto handle=allocate_heap(memory,16);if(!handle)return finish(2);
+            device_configuration_->machines.insert(handle);memory.store(GuestAddress{arg(1)},x86_?32:64,handle);return finish(0);
+        }
+        if(name=="CM_Disconnect_Machine"){
+            if(!arg(0))return finish(0);if(!device_configuration_->machines.erase(arg(0)))return finish(49);(void)free_heap(memory,arg(0),state);return finish(0);
+        }
+        if(name=="CM_Get_Version")return finish(0x0400); // Windows 2000 起的 Configuration Manager 版本。
+        if(name=="CMP_WaitNoPendingInstallEvents")return finish(0); // 裝置安裝在 SetupAPI 呼叫內同步完成，沒有排隊中的安裝事件：WAIT_OBJECT_0。
+        if(name.starts_with("CM_Enumerate_Enumerators")){
+            // (ulEnumIndex, Buffer, pulLength, ulFlags)：Enum 鍵下的列舉子名稱（依名稱排序，不分大小寫去重）。
+            if(!arg(1) || !arg(2))return finish(3);if(arg(3))return finish(4);
+            std::map<std::u16string,std::u16string> enumerators;for(const auto& [handle,node]:nodes){(void)handle;if(!node.pending_set && !node.enumerator.empty())enumerators.try_emplace(folded(node.enumerator),node.enumerator);}
+            const auto index=static_cast<std::uint32_t>(arg(0));if(index>=enumerators.size())return finish(37);
+            const auto& text=std::next(enumerators.begin(),static_cast<std::ptrdiff_t>(index))->second;const auto ansi=utf16_to_utf8(text);const auto required=(wide?text.size():ansi.size())+1;
+            const auto capacity=memory.load(GuestAddress{arg(2)},32);memory.check(GuestAddress{arg(2)},4,Access::Write);memory.store(GuestAddress{arg(2)},32,required);if(capacity<required)return finish(26);
+            auto bytes=wide?utf16_bytes(text):std::vector<std::uint8_t>(ansi.begin(),ansi.end());if(!wide)bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);return finish(0);
+        }
+        if(name.starts_with("CM_Get_Device_Interface_Alias")){
+            // (pszDeviceInterface, AliasInterfaceGuid, pszAliasDeviceInterface, pulLength, ulFlags)：裝置模型中同一裝置的所有介面類別共用同一個符號連結。
+            if(!arg(0) || !arg(1) || !arg(3))return finish(3);if(arg(4))return finish(4);
+            const auto path=folded(read(arg(0)));std::array<std::uint8_t,16> guid{};memory.read(GuestAddress{arg(1)},guid);
+            const auto found=std::find_if(nodes.begin(),nodes.end(),[&](const auto& item){return !item.second.pending_set && !item.second.interface_path.empty() && folded(item.second.interface_path)==path;});
+            if(found==nodes.end() || !supports_interface(found->second,guid))return finish(55);
+            const auto& text=found->second.interface_path;const auto ansi=utf16_to_utf8(text);const auto required=(wide?text.size():ansi.size())+1;
+            const auto capacity=memory.load(GuestAddress{arg(3)},32);memory.check(GuestAddress{arg(3)},4,Access::Write);memory.store(GuestAddress{arg(3)},32,required);
+            if(!arg(2) || capacity<required)return finish(26);auto bytes=wide?utf16_bytes(text):std::vector<std::uint8_t>(ansi.begin(),ansi.end());if(!wide)bytes.push_back(0);memory.write(GuestAddress{arg(2)},bytes);return finish(0);
+        }
 #include "windows_device_interface_property_calls.inc"
-        if(name.starts_with("SetupDiClass") || name.starts_with("SetupDiGetClassDescription") || name.starts_with("SetupDiBuildClassInfoList") || name.starts_with("SetupDiOpenClassRegKey")){
+        if(name.starts_with("SetupDiClass") || name.starts_with("SetupDiGetClassDescription") || name.starts_with("SetupDiBuildClassInfoList") || name.starts_with("SetupDiOpenClassRegKey") ||
+           name=="CM_Enumerate_Classes" || name.starts_with("CM_Get_Class_") || name.starts_with("CM_Open_Class_Key") || name.starts_with("CM_Set_Class_Registry_Property")){
 #include "windows_setup_classes.inc"
         }
 
@@ -494,9 +541,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
         if(name=="CM_Enable_DevNode" || name=="CM_Disable_DevNode"){
             const bool enable=name=="CM_Enable_DevNode";const auto flags=static_cast<std::uint32_t>(arg(1));
             if(enable?flags!=0:(flags&~15U)!=0)return finish(4);
-            initialize_tokens();const auto& token=runtime_.token_objects.at(effective_token_id());
-            const bool admin=token.integrity>=0x3000U && std::any_of(token.groups.begin(),token.groups.end(),[](const auto& group){return group.sid==security::account_sid(*security::find_account("Administrators")) && (group.attributes&0x14U)==4U;});
-            if(!admin)return finish(51);if(!node.present)return finish(13);
+            if(!administrator())return finish(51);if(!node.present)return finish(13);
             // 原生橋接裝置沒有宣告 DN_DISABLEABLE；不可僅修改 devnode 狀態冒充停用硬體。
             if(!enable)return finish(40);
             return finish((node.status&8U) && !node.problem?0U:48U);
@@ -527,6 +572,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
             const bool fits=arg(3) && capacity>=property->bytes.size();if(fits)memory.check(GuestAddress{arg(3)},property->bytes.size(),Access::Write);
             memory.store(GuestAddress{arg(2)},32,property->type);memory.store(GuestAddress{arg(4)},32,property->bytes.size());
             if(!fits)return finish(26);memory.write(GuestAddress{arg(3)},property->bytes);return finish(0);
+        }
+        if(name=="CM_Get_DevNode_Property_Keys"){
+            // (dnDevInst, PropertyKeyArray, PropertyKeyCount, ulFlags)：列出 device_property 實際有值的鍵。
+            if(arg(3))return finish(4);if(!arg(2))return finish(3);const auto capacity=memory.load(GuestAddress{arg(2)},32);if(!arg(1) && capacity)return finish(3);
+            const auto keys=device_property_keys(node,nodes);memory.check(GuestAddress{arg(2)},4,Access::Write);memory.store(GuestAddress{arg(2)},32,keys.size());
+            if(!arg(1) || capacity<keys.size())return finish(26);
+            std::vector<std::uint8_t> bytes;for(const auto& key:keys){bytes.insert(bytes.end(),key.format.begin(),key.format.end());for(unsigned shift=0;shift<32;shift+=8)bytes.push_back(static_cast<std::uint8_t>(key.id>>shift));}
+            memory.write(GuestAddress{arg(1)},bytes);return finish(0);
+        }
+        if(name=="CM_Reenumerate_DevNode"){
+            // (dnDevInst, ulFlags)：本次呼叫已重新盤點宿主裝置並同步裝置樹（上方 refresh_device_configuration）。
+            if(arg(1)&~7U)return finish(4);return finish(0);
         }
         if(name=="CM_Open_DevNode_Key"){
             if(!arg(4))return finish(3);if(arg(3)>1)return finish(31);if(arg(5)&~0x301U || (arg(5)&0x300U)==0x300U)return finish(4);

@@ -315,6 +315,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_mdi(GuestState& state,Guest
         const auto client=gui_.windows.find(arg(7));if(client==gui_.windows.end() || !client->second.mdi){fail(1400);return std::nullopt;}
         api(wide?"CreateWindowExW":"CreateWindowExA",{0x40,arg(0),arg(1),arg(2),arg(3),arg(4),arg(5),arg(6),arg(7),0,arg(8),arg(9)});return std::nullopt;
     }
+    if(service.symbol=="ScrollChildren" || service.symbol=="CalcChildScroll") {
+        // MDI client 的預設捲動：ScrollChildren 與 client 的 WM_HSCROLL／WM_VSCROLL 共用同一處理（移動子視窗並更新捲軸）；
+        // CalcChildScroll 依可見子視窗的範圍重算捲軸（SB_HORZ／SB_VERT／SB_BOTH）。非 MDI client 沒有受管理的子視窗版面，不做任何事。
+        const auto client=gui_.windows.find(arg(0));if(client==gui_.windows.end()){fail(1400);return std::nullopt;}
+        if(service.symbol=="CalcChildScroll"){
+            const auto bar=static_cast<std::uint32_t>(arg(1));
+            if(bar!=0 && bar!=1 && bar!=3){fail(87);return std::nullopt;}
+            if(client->second.mdi)refresh_mdi(arg(0),&memory);
+            arg.return_to(state,0);return std::nullopt;
+        }
+        const auto message=static_cast<std::uint32_t>(arg(1));
+        if(client->second.mdi && (message==0x114 || message==0x115) &&
+           dispatch_mdi_client(state,memory,{arg(0),arg(2),arg(3),message},client->second.unicode))return std::nullopt;
+        arg.return_to(state,0);return std::nullopt;
+    }
     if(service.symbol=="TranslateMDISysAccel") {
         const auto client=gui_.windows.find(arg(0));if(client==gui_.windows.end() || !client->second.mdi){fail(1400);return std::nullopt;}
         if(!arg(1)){fail(87);return std::nullopt;}

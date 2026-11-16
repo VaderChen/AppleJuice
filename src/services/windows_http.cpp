@@ -11,7 +11,7 @@
 #include <system_error>
 
 namespace x64arm {
-HttpState::HttpState(const HttpState& other):next(other.next),last_responses(other.last_responses),nearest_server(other.nearest_server){if(!other.handles.empty() || !other.connection_probes.empty() || other.cache_active)throw std::logic_error("無法複製使用中的 WinHTTP session");}
+HttpState::HttpState(const HttpState& other):session_cookies(other.session_cookies),next(other.next),last_responses(other.last_responses),nearest_server(other.nearest_server){if(!other.handles.empty() || !other.connection_probes.empty() || other.cache_active)throw std::logic_error("無法複製使用中的 WinHTTP session");}
 HttpState& HttpState::operator=(const HttpState& other){if(this!=&other)*this=HttpState(other);return *this;}
 namespace {
 struct HttpError {std::uint32_t code;};
@@ -40,6 +40,14 @@ std::span<const WindowsServiceDescriptor> http_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"wininet.dll","InternetCheckConnectionA",3},{"wininet.dll","InternetCheckConnectionW",3},
         {"wininet.dll","InternetGetConnectedState",2},{"wininet.dll","InternetGetConnectedStateEx",4},{"wininet.dll","InternetGetConnectedStateExA",4},{"wininet.dll","InternetGetConnectedStateExW",4},
+        {"wininet.dll","CreateUrlCacheGroup",2},{"wininet.dll","DeleteUrlCacheGroup",3,1},{"wininet.dll","SetUrlCacheEntryGroup",6,4},{"wininet.dll","SetUrlCacheEntryGroupA",6,4},{"wininet.dll","SetUrlCacheEntryGroupW",6,4},
+        {"wininet.dll","GetUrlCacheGroupAttributeA",6,1},{"wininet.dll","GetUrlCacheGroupAttributeW",6,1},{"wininet.dll","SetUrlCacheGroupAttributeA",5,1},{"wininet.dll","SetUrlCacheGroupAttributeW",5,1},
+        {"wininet.dll","FindFirstUrlCacheGroup",6},{"wininet.dll","FindNextUrlCacheGroup",3},{"wininet.dll","FindFirstUrlCacheEntryExA",9,8},{"wininet.dll","FindFirstUrlCacheEntryExW",9,8},
+        {"wininet.dll","FindNextUrlCacheEntryExA",6},{"wininet.dll","FindNextUrlCacheEntryExW",6},{"wininet.dll","IsUrlCacheEntryExpiredA",3},{"wininet.dll","IsUrlCacheEntryExpiredW",3},
+        {"wininet.dll","GetUrlCacheConfigInfoA",3},{"wininet.dll","GetUrlCacheConfigInfoW",3},{"wininet.dll","SetUrlCacheConfigInfoA",2},{"wininet.dll","SetUrlCacheConfigInfoW",2},
+        {"wininet.dll","FreeUrlCacheSpaceA",3},{"wininet.dll","FreeUrlCacheSpaceW",3},{"wininet.dll","CreateUrlCacheContainerA",8},{"wininet.dll","CreateUrlCacheContainerW",8},
+        {"wininet.dll","DeleteUrlCacheContainerA",2},{"wininet.dll","DeleteUrlCacheContainerW",2},{"wininet.dll","FindFirstUrlCacheContainerA",4},{"wininet.dll","FindFirstUrlCacheContainerW",4},
+        {"wininet.dll","FindNextUrlCacheContainerA",3},{"wininet.dll","FindNextUrlCacheContainerW",3},{"wininet.dll","IncrementUrlCacheHeaderData",2},
         {"wininet.dll","CreateUrlCacheEntryA",5},{"wininet.dll","CreateUrlCacheEntryW",5},{"wininet.dll","CommitUrlCacheEntryA",9,12},{"wininet.dll","CommitUrlCacheEntryW",9,12},{"wininet.dll","GetUrlCacheEntryInfoA",3},{"wininet.dll","GetUrlCacheEntryInfoW",3},{"wininet.dll","GetUrlCacheEntryInfoExA",7},{"wininet.dll","GetUrlCacheEntryInfoExW",7},{"wininet.dll","RetrieveUrlCacheEntryFileA",4},{"wininet.dll","RetrieveUrlCacheEntryFileW",4},{"wininet.dll","UnlockUrlCacheEntryFileA",2},{"wininet.dll","UnlockUrlCacheEntryFileW",2},{"wininet.dll","DeleteUrlCacheEntryA",1},{"wininet.dll","DeleteUrlCacheEntryW",1},{"wininet.dll","SetUrlCacheEntryInfoA",3},{"wininet.dll","SetUrlCacheEntryInfoW",3},{"wininet.dll","RetrieveUrlCacheEntryStreamA",5},{"wininet.dll","RetrieveUrlCacheEntryStreamW",5},{"wininet.dll","FindFirstUrlCacheEntryA",3},{"wininet.dll","FindFirstUrlCacheEntryW",3},{"wininet.dll","FindNextUrlCacheEntryA",3},{"wininet.dll","FindNextUrlCacheEntryW",3},{"wininet.dll","UnlockUrlCacheEntryFile",2},{"wininet.dll","ReadUrlCacheEntryStream",5},{"wininet.dll","ReadUrlCacheEntryStreamEx",4,2},{"wininet.dll","UnlockUrlCacheEntryStream",2},{"wininet.dll","FindCloseUrlCache",1},
         {"wininet.dll","InternetOpenA",5},{"wininet.dll","InternetOpenW",5},{"wininet.dll","InternetOpenUrlA",6},{"wininet.dll","InternetOpenUrlW",6},
         {"wininet.dll","InternetConnectA",8},{"wininet.dll","InternetConnectW",8},{"wininet.dll","HttpOpenRequestA",8},{"wininet.dll","HttpOpenRequestW",8},
@@ -141,7 +149,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
         request.io_accounted={};
         if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許 WinHTTP 外部 I/O");
         if(request.inet){request.pending=read_http_cache(request);if(request.pending){request.cache_hit=true;return;}if(request.cache_flags&0x01000000U)throw HttpError{2};}
-        request.cache_hit=false;notify(request,30,0);request.pending=start_native_http(request.input);if(!request.pending)throw HttpError{50};
+        request.cache_hit=false;notify(request,30,0);auto input=request.input;if(request.inet && !(request.cache_flags&0x00080000U))add_http_cookies(input);request.pending=start_native_http(std::move(input));if(!request.pending)throw HttpError{50};
     };
     const auto remember_server=[&](HttpHandle& request){
         if(request.inet){
@@ -214,7 +222,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
             if(short_buffer)throw HttpError{122};
             for(unsigned i=0;i<parts.size();++i){const auto cell=arg(3)+offsets[i],capacity=memory.load(GuestAddress{cell+unit},32),pointer=memory.load(GuestAddress{cell},pointer_bits);if(!capacity)continue;const auto [begin,length]=parts[i];
                 if(pointer){if(ansi){const auto part=latin(url.substr(begin,length));std::vector<std::uint8_t> bytes(part.begin(),part.end());bytes.push_back(0);memory.write(GuestAddress{pointer},bytes);}else memory.write(GuestAddress{pointer},utf16_bytes(url.substr(begin,length)));}else memory.store(GuestAddress{cell},pointer_bits,length?arg(0)+begin*(ansi?1:2):0);memory.store(GuestAddress{cell+unit},32,length);}
-            memory.store(GuestAddress{arg(3)+(x86_?12:20)},32,scheme=="https"?2:1);memory.store(GuestAddress{arg(3)+(x86_?24:36)},16,port);result=1;
+            // nScheme 依呼叫的 API：WinINet 的 INTERNET_SCHEME_HTTP／HTTPS 為 3／4，WinHTTP 為 1／2。
+            memory.store(GuestAddress{arg(3)+(x86_?12:20)},32,inet?(scheme=="https"?4U:3U):(scheme=="https"?2U:1U));memory.store(GuestAddress{arg(3)+(x86_?24:36)},16,port);result=1;
         }else if(symbol=="WinHttpOpen"){
             if(d(4)&~(inet?0U:0x10000000U))throw HttpError{50};if(d(1)==4)throw HttpError{50};if(d(1)!=0 && d(1)!=1 && d(1)!=3)throw HttpError{87};
             HttpHandle session;session.inet=inet;session.asynchronous=(d(4)&0x10000000U)!=0;session.agent=latin(text(arg(0)));if(session.agent.find_first_of("\r\n")!=std::string::npos)throw HttpError{87};
@@ -261,7 +270,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 }result=1;
             }else if(symbol=="InternetOpenUrl"){
                 require(HttpHandle::Kind::Session);if(!arg(1))throw HttpError{87};
-                if(d(4)&~0x85e00300U)throw HttpError{50};
+                if(d(4)&~0x85e80300U)throw HttpError{50};
                 auto pending=object.opening.find(threads_.current);std::uint64_t id=0;
                 if(pending==object.opening.end()){
                     HttpHandle request;request.kind=HttpHandle::Kind::Request;request.inet=inet;request.cache_flags=d(symbol=="InternetOpenUrl"?4:6);request.parent=arg(0);request.input=object.input;request.input.url=ansi?read_ansi(memory,arg(1)):utf16_to_utf8(text(arg(1)));request.input.method="GET";request.context=arg(5);request.input.follow_redirects=!(d(4)&0x200000U);
@@ -275,7 +284,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 auto item=handles.find(id);if(item==handles.end()){object.opening.erase(threads_.current);throw HttpError{6};}auto& request=item->second;
                 if(!request.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={id};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
                 request.response=request.pending->take();account_http_io(request);request.pending.reset();object.opening.erase(threads_.current);if(request.inet && request.response.error)runtime_.http.last_responses[threads_.current]={request.response.error,request.response.status_line};if(request.response.error){const auto error=request.response.error;handles.erase(id);throw HttpError{error};}
-                request.received=request.sent=true;cache_http_response(request);remember_server(request);result=id;
+                request.received=request.sent=true;remember_http_cookies(request);cache_http_response(request);remember_server(request);result=id;
             }else if(symbol=="WinHttpSetOption" || symbol=="WinHttpQueryOption"){
                 #include "winhttp_options.inc"
             }else if(symbol=="InternetSetOption" || symbol=="InternetQueryOption"){
@@ -321,7 +330,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 if((inet?(d(5)!=3 || d(6)!=0):d(3)!=0) || !arg(1) || d(2)>65535)throw HttpError{87};HttpHandle connection;connection.kind=HttpHandle::Kind::Connection;connection.parent=arg(0);connection.inet=inet;connection.context=object.context;connection.input=object.input;connection.agent=object.agent;connection.host=utf16_to_utf8(text(arg(1)));connection.port=static_cast<std::uint16_t>(d(2));if(inet){connection.context=arg(7);connection.input.username=utf16_to_utf8(text(arg(3)));connection.input.password=utf16_to_utf8(text(arg(4)));}
                 if(connection.host.empty() || connection.host.find_first_of("/@?# \r\n")!=std::string::npos)throw HttpError{12005};result=insert(std::move(connection));
             }else if(symbol=="WinHttpOpenRequest"){
-                require(HttpHandle::Kind::Connection);if(d(6)&~(inet?0x85e00300U:0x00800100U))throw HttpError{50};HttpHandle request;request.kind=HttpHandle::Kind::Request;request.inet=inet;request.cache_flags=d(symbol=="InternetOpenUrl"?4:6);request.parent=arg(0);request.context=object.context;request.agent=object.agent;request.input=object.input;request.secure=(d(6)&0x00800000U)!=0;if(inet){request.context=arg(7);request.input.follow_redirects=!(d(6)&0x200000U);}
+                require(HttpHandle::Kind::Connection);if(d(6)&~(inet?0x85e80300U:0x00800100U))throw HttpError{50};HttpHandle request;request.kind=HttpHandle::Kind::Request;request.inet=inet;request.cache_flags=d(symbol=="InternetOpenUrl"?4:6);request.parent=arg(0);request.context=object.context;request.agent=object.agent;request.input=object.input;request.secure=(d(6)&0x00800000U)!=0;if(inet){request.context=arg(7);request.input.follow_redirects=!(d(6)&0x200000U);}
                 request.input.method=arg(1)?latin(text(arg(1))):"GET";if(!token(request.input.method))throw HttpError{87};
                 if(arg(3) && text(arg(3))!=u"HTTP/1.1")throw HttpError{50};request.path=arg(2)?utf16_to_utf8(text(arg(2))):"/";if(request.path.empty())request.path="/";if(request.path[0]!='/')request.path="/"+request.path;
                 const auto port=object.port?object.port:request.secure?443:80;auto host=object.host;if(host.find(':')!=std::string::npos && host.front()!='[')host="["+host+"]";
@@ -340,7 +349,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                         object.input.headers=std::move(headers);object.input.body=std::move(body);object.total=d(4);object.cursor=0;object.response={};object.sent=true;object.received=false;start(object);
                     }
                     if(!object.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={arg(0)};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
-                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;cache_http_response(object);remember_server(object);result=1;
+                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
                 }
                 else if(symbol=="HttpSendRequestEx"){
                     // INTERNET_BUFFERS 提供首段標頭、資料與 dwBufferTotal；其餘資料由 InternetWriteFile 補齊，HttpEndRequest 才送出。dwBufferTotal 為 0 時以實際寫入量為準。
@@ -364,7 +373,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                     if(arg(1))throw HttpError{87};
                     if(!object.pending){if(!object.sent || object.received || (object.total && object.input.body.size()!=object.total))throw HttpError{12019};object.total=static_cast<std::uint32_t>(object.input.body.size());start(object);}
                     if(!object.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={arg(0)};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
-                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;cache_http_response(object);remember_server(object);result=1;
+                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
                 }
                 else if(symbol=="WinHttpSendRequest"){
                     if(object.pending || (object.sent && object.total!=d(5)))throw HttpError{12019};if(d(5)>16*1024*1024 || d(4)>d(5) || (d(4) && !arg(3)))throw HttpError{87};
@@ -377,7 +386,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 }else if(symbol=="WinHttpReceiveResponse"){
                     if(arg(1))throw HttpError{87};if(!object.sent || object.received || object.input.body.size()!=object.total)throw HttpError{12019};
                     if(!object.pending)throw HttpError{12019};if(!object.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={arg(0)};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
-                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;cache_http_response(object);remember_server(object);result=1;
+                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
                 }else if(symbol=="WinHttpReadData" || symbol=="WinHttpQueryDataAvailable"){
                     if(!object.received)throw HttpError{12019};const bool read=symbol=="WinHttpReadData";const auto count=read?std::min<std::size_t>(d(2),object.response.body.size()-std::min(object.cursor,object.response.body.size())):object.response.body.size()-std::min(object.cursor,object.response.body.size());const auto output=arg(read?3:1);if(!output && (read || !inet))throw HttpError{87};if(output)memory.check(GuestAddress{output},4,Access::Write);
                     if(read && count){memory.check(GuestAddress{arg(1)},count,Access::Write);memory.write(GuestAddress{arg(1)},std::span(object.response.body).subspan(object.cursor,count));object.cursor+=count;}if(output)memory.store(GuestAddress{output},32,count);result=1;

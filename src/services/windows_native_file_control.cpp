@@ -194,6 +194,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_fs_control(GuestState& stat
             else if(!output || !output_size)error=87;
             else {bytes.resize(std::min<std::uint32_t>(output_size,UINT16_MAX));error=file.hid->physical_descriptor(bytes);if(!error)process_io::record(process_io::Kind::Other,bytes.size());}
         }else if(file.serial || file.usb || (file.native && file.native->null_device()))error=1;
+        else if(file.native && file.native->volume_device()){
+            // 卷以授權映射的檔案樹承接；識別與容量共用卷後台，沒有 NTFS 或原始磁區映像。
+            const auto put=[&](unsigned at,unsigned width,std::uint64_t value){for(unsigned i=0;i<width;++i)bytes.at(at+i)=static_cast<std::uint8_t>(value>>(8*i));};
+            if(code==0x7405cU){ // IOCTL_DISK_GET_LENGTH_INFO
+                if(output_size<8)error=122;
+                else {const auto space=file.native->volume_space();error=space.error;if(!error){bytes.resize(8);put(0,8,space.total);}}
+            }else if(code==0x70024U || code==0x90028U){ // IS_WRITABLE / IS_VOLUME_MOUNTED
+                const auto space=file.native->volume_space();error=space.error;
+                if(!error && code==0x70024U && !filesystem_.writable())error=19;
+            }else if(code==0x2d1400U){ // IOCTL_STORAGE_QUERY_PROPERTY
+                if(input_size<8)error=87;
+                else {
+                    const auto property=memory.load(GuestAddress{input},32),query=memory.load(GuestAddress{input+4},32);
+                    if(property!=0)error=50;
+                    else if(query>1)error=87;
+                    else if(query==0){
+                        if(output_size<8)error=122;
+                        else {
+                            const auto properties=filesystem_.volume_properties(file.native->volume_id());error=properties.error;
+                            if(!error){
+                                bytes.resize(40);put(0,4,40);put(28,4,14); // BusTypeVirtual；無移除媒體／原始裝置屬性。
+                                const auto add=[&](unsigned at,const std::string& text){put(at,4,bytes.size());bytes.insert(bytes.end(),text.begin(),text.end());bytes.push_back(0);};
+                                add(12,"X64ARM");add(16,"Mapped volume");add(20,"1");
+                                std::string serial;constexpr char hex[]="0123456789abcdef";
+                                for(unsigned i=0;i<16;++i){const auto value=properties.object_id[i];serial.push_back(hex[value>>4]);serial.push_back(hex[value&15]);}
+                                add(24,serial);put(4,4,bytes.size());
+                                // STORAGE_DESCRIPTOR_HEADER 支援先探測 Size，再配置完整描述元。
+                                if(output_size<bytes.size())bytes.resize(output_size);
+                            }
+                        }
+                    }
+                }
+            }else error=1;
+        }
         else if(code==0x900a8U){ // FSCTL_GET_REPARSE_POINT
             const auto identity=file.native?file.native:file.identity;
             const auto current=identity?filesystem_.final_path(*identity,file.path.empty()?file.key:file.path):FileInformation{{},{},6};

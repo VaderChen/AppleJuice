@@ -54,8 +54,14 @@ inline const std::vector<Binding>& bindings(){
             for(const auto& e:std::vector<std::pair<std::string,unsigned>>{
                 {"FileDelete",1},{"FileOverflow",1},{"FilePbackfail",1},{"FileUnderflow",0},{"FileUflow",0},
                 {"StreamShowmany",0},{"FileXsgetn",2},{"FileXsgetnSafe",3},{"FileXsputn",2},{"FileSeekoff",4},
-                {"FileSeekpos",x86?8U:3U},{"FileSetbuf",2},{"FileSync",0},{"FileImbue",1},{"FileIosDelete",1}})
+                {"FileSeekpos",x86?8U:3U},{"FileSetbuf",2},{"FileSync",0},{"FileImbue",1},{"FileIosDelete",1},
+})
                 v.push_back({"internal-msvcp90",e.first+(x86?"32":"64"),e.second+(!x86?1U:0U),x86});
+            // 基底 basic_streambuf 的 VC9 虛擬表入口，char（D）與寬字元（W）各一份。
+            for(const char* prefix:{"D","W"})for(const auto& e:std::vector<std::pair<std::string,unsigned>>{
+                {"StreamDelete",1},{"StreamOverflow",1},{"StreamPbackfail",1},{"StreamShowmany",0},{"StreamUnderflow",0},{"StreamUflow",0},{"StreamXsgetn",2},{"StreamXsgetnSafe",3},
+                {"StreamXsputn",2},{"StreamSeekoff",4},{"StreamSeekpos",x86?8U:3U},{"StreamSetbuf",2},{"StreamSync",0},{"StreamImbue",1}})
+                v.push_back({"internal-msvcp90",prefix+e.first+(x86?"32":"64"),e.second+(!x86?1U:0U),x86});
         }
         return v;
     }();return entries;
@@ -65,7 +71,7 @@ inline std::vector<WindowsServiceDescriptor> descriptors(){
     for(const auto& b:bindings())result.push_back({b.family,b.name,b.arguments});return result;
 }
 inline bool family(std::string_view name){return name.find("basic_ifstream@")!=name.npos || name.find("basic_filebuf@")!=name.npos ||
-    name.find("basic_istream@")!=name.npos || name.find("basic_streambuf@")!=name.npos || name.find("basic_ios@")!=name.npos || name.find("ios_base@")!=name.npos;}
+    name.find("basic_istream@")!=name.npos || name.find("basic_ostream@")!=name.npos || name.find("basic_iostream@")!=name.npos || name.find("basic_streambuf@")!=name.npos || name.find("basic_ios@")!=name.npos || name.find("ios_base@")!=name.npos;}
 inline std::string_view native_name(std::string_view name){
     if(name.starts_with("?gcount@"))return "guest_stream_count";
     if(name.starts_with("?is_open@"))return name.find("basic_ifstream@")!=name.npos?"guest_ifstream_open":"guest_filebuf_open";

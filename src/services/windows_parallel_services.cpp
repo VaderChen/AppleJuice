@@ -19,6 +19,8 @@
 #include "parallel_mapping_lock.hpp"
 #include "x64arm/gpu_memory.hpp"
 #include "windows_display_identity.hpp"
+#include "windows_system_info_layout.hpp"
+#include "x64arm/cpu_features.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -122,6 +124,16 @@ ResidentClockRecipe WindowsServices::resident_clock_recipe(GuestAddress address)
     // QueryPerformanceCounter（Win64）：與 worker 服務同一條 100 ns 硬體時間軸；X64ARM_AOT_QPC_LOWERING=0 保留原服務。
     static const bool qpc=[] {const auto* value=std::getenv("X64ARM_AOT_QPC_LOWERING");return !value || std::string_view(value)!="0";}();
     if(qpc && !x86_ && symbol=="QueryPerformanceCounter")return ResidentClockRecipe::PerformanceCounter;
+    // 程序固定資訊（核心 resident_query_arm64.inc）：與 Windows 相同直接讀客體 TEB／PEB／共享資料頁，值與協調者及 worker 服務相同；
+    // 非 NULL 模組名稱、頁面不合資格時在入口交回本服務。X64ARM_AOT_PROCESS_QUERY_LOWERING=0 保留原服務。
+    static const bool query=[] {const auto* value=std::getenv("X64ARM_AOT_PROCESS_QUERY_LOWERING");return !value || std::string_view(value)!="0";}();
+    if(query){
+        if(symbol=="GetCurrentProcessId")return ResidentClockRecipe::ProcessId;
+        if(symbol=="GetProcessHeap")return ResidentClockRecipe::ProcessHeap;
+        if(symbol=="GetModuleHandleW" || symbol=="GetModuleHandleA")return ResidentClockRecipe::ModuleImage;
+        if(symbol=="IsProcessorFeaturePresent")return ResidentClockRecipe::ProcessorFeature;
+        if(symbol=="QueryPerformanceFrequency")return ResidentClockRecipe::PerformanceFrequency;
+    }
     return ResidentClockRecipe::None;
 }
 #endif
@@ -356,6 +368,16 @@ bool thread_priority_worker_service(std::string_view symbol) noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_THREAD_PRIORITY");return !value || std::string_view(value)!="0";}();
     return enabled && (symbol=="SetThreadPriority" || symbol=="GetThreadPriority");
 }
+// 程序固定資訊與系統時間的純讀取：GetCurrentProcessId、GetProcessHeap、GetModuleHandleA／W(NULL)、IsProcessorFeaturePresent、
+// GetSystemInfo／GetNativeSystemInfo、GetSystemTimeAsFileTime（含 Precise）。只讀初始化後不變的程序狀態或主機時鐘，
+// 原本每次往返協調者並全停其他 worker（2 vCPU 兩執行緒每次 1.2～3.5 µs）。非 NULL 模組名稱、沒有機器時鐘、
+// 輸出不可寫或與返回槽重疊時交回協調者。X64ARM_PARALLEL_PROCESS_QUERIES=0 關閉。
+bool process_query_worker_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_PROCESS_QUERIES");return !value || std::string_view(value)!="0";}();
+    return enabled && (symbol=="GetCurrentProcessId" || symbol=="GetProcessHeap" || symbol=="GetModuleHandleW" || symbol=="GetModuleHandleA" ||
+        symbol=="IsProcessorFeaturePresent" || symbol=="GetSystemInfo" || symbol=="GetNativeSystemInfo" ||
+        symbol=="GetSystemTimeAsFileTime" || symbol=="GetSystemTimePreciseAsFileTime");
+}
 bool parallel_tick_clock_enabled() noexcept {
     static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_TICK_CLOCK");return !value || std::string_view(value)!="0";}();
     return enabled;
@@ -364,6 +386,7 @@ bool parallel_tick_clock_enabled() noexcept {
 // 仍交回協調者。Win64 沿用暫存器 ABI，不因擴充 Win32 改變原有資格。
 std::optional<unsigned> context_service_arguments(std::string_view symbol) noexcept {
     if(symbol=="HeapAlloc" || symbol=="HeapFree" || symbol=="HeapSize")return 3;
+    if(process_query_worker_service(symbol))return symbol=="GetCurrentProcessId" || symbol=="GetProcessHeap"?0U:1U;
     if(symbol=="GetLastError" || symbol=="GetCurrentThreadId" || symbol=="SwitchToThread" || tick_clock_service(symbol) || crt_clock_service(symbol) || msvcp_clock_service(symbol))return 0;
     if(symbol=="TlsSetValue" || symbol=="FlsSetValue" || symbol=="WaitForSingleObject")return 2;
     if(symbol=="WaitForSingleObjectEx")return 3;
@@ -556,7 +579,7 @@ bool WindowsServices::parallel_service_static(GuestAddress address) const noexce
     if(parallel_srw_enabled() && (srw_service(symbol) || msvcp_mutex_service(symbol)))return true;
     if(thrd_tail_service(symbol) || parallel_event_service(symbol) || parallel_wait_service(symbol) || parallel_null_wait_service(symbol) || parallel_semaphore_service(symbol) ||
        parallel_wait_multiple_service(symbol))return true;
-    if(thread_priority_worker_service(symbol) || crt_string_copy_worker_service(symbol))return true;
+    if(thread_priority_worker_service(symbol) || crt_string_copy_worker_service(symbol) || process_query_worker_service(symbol))return true;
     return symbol=="TlsGetValue" || symbol=="TlsGetValue2" || symbol=="TlsSetValue" ||
         symbol=="FlsGetValue" || symbol=="FlsGetValue2" || symbol=="FlsSetValue" ||
         symbol=="InitOnceBeginInitialize" || symbol=="InitOnceExecuteOnce" ||
@@ -695,7 +718,9 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(!d3d11_local_eligible(state,memory,descriptor) || !graphics_worker_outputs_private(state,memory,descriptor))return false;
         count_scope.accepted=true;
         struct Local {~Local(){graphics_local()=false;}} local;graphics_local()=true;
-        const auto stream_context=state.reg(Gpr::Rcx);const auto stream_teb=state.gs_base;
+        // 串流擁有者：x64 的 this 在 RCX、執行緒以 GS（64 位元 TEB）辨識；PE32 的 this 在 [esp+4]、執行緒以 FS（32 位元 TEB）辨識。
+        const auto stream_context=!d3d11_stream_?0:x86_?WindowsCall(state,memory,descriptor)(0):state.reg(Gpr::Rcx);
+        const auto stream_teb=x86_?state.fs_base:state.gs_base;
         // Draw*／Dispatch* 的前置路徑可提早放開映射鎖；其他方法不必多寫一次執行緒區域變數。
         const bool may_release_mapping=descriptor.symbol.front()=='D';
         struct MappingGuardScope {bool set;~MappingGuardScope(){if(set)detail::d3d11_worker_mapping_guard()=nullptr;}} mapping_guard_scope{may_release_mapping};
@@ -708,7 +733,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             graphics_lock.unlock();mapping_guard.lock();lock_graphics(graphics_lock);
             if(invoke_d3d11(state,memory,descriptor))throw std::logic_error("worker 上的 D3D11 服務意外終止客體");
         }
-        if(d3d11_stream_ && !x86_ && mapping_guard.owns_lock())d3d11_stream_claim(memory,stream_context,stream_teb);
+        if(d3d11_stream_ && stream_context && mapping_guard.owns_lock())d3d11_stream_claim(memory,stream_context,stream_teb);
         state.rep_compare={};
         return true;
     }
@@ -1508,6 +1533,25 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         result=0;
         detail::peek_idle_record(state,memory.native_borrow_generation(),static_cast<const std::uint8_t*>(static_cast<const void*>(stack)),flags,gui_peek_idle_until_);
     }else if(symbol=="GetCurrentThreadId")result=thread_identifier(tid);
+    else if(process_query_worker_service(symbol)){
+        // 與協調者服務相同的值與寫入內容（GetSystemInfo 共用 windows_system_info_layout.hpp），都不改 LastError。
+        if(symbol=="GetCurrentProcessId")result=process_id();
+        else if(symbol=="GetProcessHeap")result=process_heap;
+        else if(symbol=="GetModuleHandleW" || symbol=="GetModuleHandleA"){
+            if(first || !runtime_.image.base)return false; // 依名稱查模組需要載入器狀態，交回協調者。
+            result=runtime_.image.base;
+        }else if(symbol=="IsProcessorFeaturePresent")result=virtual_processor_feature(static_cast<std::uint32_t>(first),x86_)?1:0;
+        else if(symbol=="GetSystemInfo" || symbol=="GetNativeSystemInfo"){
+            const auto info=system_info_bytes(x86_,symbol=="GetNativeSystemInfo",runtime_.processor_count,user_address_limit()-1);
+            auto* output=pointer(first,info.size,2);if(!output)return false;
+            std::memcpy(output,info.bytes.data(),info.size);
+        }else{
+            // 主機時鐘：與 worker 上的 QueryPerformanceCounter 同一單調時間軸；機器時鐘有自己的鎖，可由多條 worker 同時讀取。
+            if(!runtime_.machine_clock)return false;
+            auto* output=pointer(first,8,2);if(!output)return false;
+            put(output,runtime_.machine_clock->snapshot_at(detail::monotonic_ticks()).filetime,8);
+        }
+    }
 else if(symbol=="QueryPerformanceCounter" || symbol=="QueryPerformanceFrequency"){
         auto* output=pointer(first,8,2);if(!output)return false;
         // host-clock 直接讀硬體計數器，與 machine clock 同一時間軸；不在 worker 更新共享時間頁。

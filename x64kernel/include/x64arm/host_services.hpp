@@ -1,4 +1,5 @@
 #pragma once
+#define X64ARM_HOST_SERVICES_MEMORY_WATCH 1
 #include "x64arm/memory.hpp"
 #include "x64arm/execution_policy.hpp"
 #include "x64arm/result.hpp"
@@ -55,9 +56,13 @@ inline constexpr std::uint32_t cpu_software_interrupt_trap = 0x10000100U;
 enum class SystemCallEntry { Syscall, Sysenter, Interrupt };
 // CompletedResolve：服務已在 worker 完成，但釋放了有等待者的物件（號誌、手動重設事件）；worker 不等待，協調者盡快解析等待。
 enum class ResidentServiceProgress {Completed,Retry,Coordinator,CompletedWithoutSignal,CompletedResolve};
-// 含睡眠的宿主連續時鐘，毫秒自宿主開機起算；DWORD 自然回繞。
+// 唯讀常駐配方。時鐘：含睡眠的宿主連續時鐘，毫秒自宿主開機起算；DWORD 自然回繞。
 // 核心依客體模式選擇 EAX、EDX:EAX 或 RAX，沒有參數、LastError 或共享時間頁副作用。
-enum class ResidentClockRecipe : unsigned {None=0,Milliseconds32=1,Milliseconds64=2,PerformanceCounter=3};
+// 4 由服務端標記 D3D11 命令串流的純量方法。5～9 為程序固定資訊：直接讀客體 TEB／PEB／KUSER_SHARED_DATA
+//（GetCurrentProcessId、GetProcessHeap、GetModuleHandleA／W(NULL)、IsProcessorFeaturePresent），
+// QueryPerformanceFrequency 寫入 10 MHz；都沒有 LastError 副作用，資格不符時交回原服務。
+enum class ResidentClockRecipe : unsigned {None=0,Milliseconds32=1,Milliseconds64=2,PerformanceCounter=3,
+    ProcessId=5,ProcessHeap=6,ModuleImage=7,ProcessorFeature=8,PerformanceFrequency=9};
 class HostCallFault : public std::runtime_error { using std::runtime_error::runtime_error; };
 struct CpuFault : std::runtime_error {
     std::uint32_t code;
@@ -187,6 +192,8 @@ public:
     virtual std::uint64_t resident_context_key(const GuestState& state) const noexcept {
         return reinterpret_cast<std::uintptr_t>(&state);
     }
+    // 客體可觀察的執行緒識別；不得把預設排程用宿主指標發布至工作集紀錄。
+    virtual std::uint64_t memory_watch_thread_id(const GuestState&) const noexcept {return 0;}
     // 全體 worker 停止後傳遞實際未完成的服務；不能只依入口的靜態平行資格
     // 重派同一個請求。key 為 resident_context_key，入口隨請求保存以排除舊狀態。
     // provider 僅登記排程待辦，不在這個通知內執行服務或切換 context。

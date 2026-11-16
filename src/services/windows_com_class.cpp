@@ -27,6 +27,10 @@ std::optional<std::uint64_t> WindowsServices::com_apartment(std::uint64_t thread
     if(found==gui_.com_initializations.end() || found->second<16)return std::nullopt;
     return (found->second&2U)?thread:0;
 }
+bool WindowsServices::mta_alive(std::optional<std::uint64_t> except) const {
+    if(!runtime_.com_mta_usage_cookies.empty())return true;
+    return std::any_of(gui_.com_initializations.begin(),gui_.com_initializations.end(),[&](const auto& row){return (!except || row.first!=*except) && row.second>=16 && !(row.second&2U);});
+}
 
 std::vector<GuestCallback> WindowsServices::revoke_com_classes(GuestMemory& memory,std::uint64_t thread,bool callbacks){
     std::vector<GuestCallback> result;
@@ -34,8 +38,7 @@ std::vector<GuestCallback> WindowsServices::revoke_com_classes(GuestMemory& memo
     if(initialized==gui_.com_initializations.end())return result;
     // CoUninitialize 已減少初始化次數，但尚未清除 apartment mode。
     const auto apartment=(initialized->second&2U)?thread:0;
-    if(!apartment && std::any_of(gui_.com_initializations.begin(),gui_.com_initializations.end(),
-        [&](const auto& entry){return entry.first!=thread && entry.second>=16 && !(entry.second&2U);}))return result;
+    if(!apartment && mta_alive(thread))return result;
     for(auto it=runtime_.com_classes.begin();it!=runtime_.com_classes.end();){
         auto& record=it->second;
         if(record.apartment!=apartment){++it;continue;}

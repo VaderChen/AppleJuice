@@ -9,6 +9,7 @@
 #include "gui_timing_layout.h"
 #include "crt_library.hpp"
 #include "builtin_export_aliases.hpp"
+#include "builtin_export_catalog.hpp"
 #include "builtin_provider_families.hpp"
 #include "msvcp90_string_exports.hpp"
 #include "msvcp90_stream_exports.hpp"
@@ -288,6 +289,16 @@ void WindowsServices::map_shared_user_data(GuestMemory& memory) {
     put(xstate+0x340,4,virtual_xsave_bytes);                    // AllNonLargeFeatureSize
     memory.map(GuestAddress{0x7ffe0000},page.size(),permission(Access::Read),page);
     shared_user_tick_=UINT64_MAX;
+    // 程序堆積的開頭頁：與 Windows 相同，handle 指向可讀寫的 heap 結構（程序堆積為可成長、非私有）。
+    memory.map(GuestAddress{process_heap},GuestMemory::guest_page_size,permission(Access::Read)|permission(Access::Write),std::vector<std::uint8_t>(GuestMemory::guest_page_size));
+    write_heap_header(memory,process_heap,2);
+}
+// Windows 10 的 HEAP 開頭欄位：SegmentSignature 0xffeeffee、SegmentFlags（可成長時為 HEAP_GROWABLE）、
+// Flags 與 ForceFlags（沒有偵錯旗標時為 0）。x64 位移 0x10／0x14／0x70／0x74，x86 為 0x08／0x0c／0x40／0x44。
+void WindowsServices::write_heap_header(GuestMemory& memory,std::uint64_t address,std::uint32_t flags){
+    const std::uint64_t signature=x86_?0x08:0x10,segment=x86_?0x0c:0x14,heap_flags=x86_?0x40:0x70,force=x86_?0x44:0x74;
+    memory.store(GuestAddress{address+signature},32,0xffeeffeeU);memory.store(GuestAddress{address+segment},32,flags&2U);
+    memory.store(GuestAddress{address+heap_flags},32,flags);memory.store(GuestAddress{address+force},32,0);
 }
 void WindowsServices::set_standard_input(std::span<const std::uint8_t> bytes) {
     if (bytes.size() > output_limit) throw std::invalid_argument("stdin 快照超過 16 MiB 上限");
@@ -689,7 +700,9 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
             else patch_services(detail::guest_thread_routines,8);
             const std::span<const std::uint8_t> pages(bytes);
             memory.map(guest_thread_routines_,GuestMemory::guest_page_size,read_execute,pages.first(GuestMemory::guest_page_size));
-            if(!x86_ && detail::d3d12_descriptor_lowering_enabled())
+            // Win64 第二頁（IASetVertexBuffers 多檢視錄製與描述元常式）一律映射；描述元常式是否接入 vtable 仍由
+            // d3d12_descriptor_lowering_enabled() 在 windows_d3d12.cpp 決定。
+            if(!x86_)
                 memory.map(GuestAddress{callback_return_.value+guest_descriptor_page_offset},GuestMemory::guest_page_size,
                            read_execute,pages.subspan(GuestMemory::guest_page_size));
         }
@@ -715,6 +728,9 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
         }
         // PE32 沒有客體常式頁；process heap 的小型配置仍可由服務端使用同一套 chunk 級距配置區。
         if(x86_)(void)guest_heap_setup(memory);
+        // PE32 的 D3D11 命令串流：環與共用區接在固定 gateway 之後（0x7f300000 起 12 MiB，KUSER_SHARED_DATA 之前），
+        // 合成框架與參數副本都在 32 位元位址內；位址已被占用就不建立（維持 worker 同步執行）。
+        if(x86_)d3d11_stream_setup(memory,callback_return_.value+windows_address_layout::gateway_capacity);
         if(!x86_ && guest_scalar_math_enabled()){
             // 沿用客體 CRT 常式與 resolver；一般數值不經 HostServices 或物化完整 GuestState。
             // 只在初始化填入各自原服務的慢路徑，之後程式頁保持唯讀且可執行。
@@ -862,6 +878,27 @@ GuestAddress WindowsServices::resolve(std::string_view dll, std::string_view sym
     return resolve_service(dll,symbol,true);
 }
 // 匯出列舉的未命中屬正常查詢；共用解析規則，但不配置例外或展開堆疊。
+WindowsServices::GuestScratch::~GuestScratch(){for(const auto address:blocks_)(void)services_.free_heap(memory_,address,state_);}
+std::uint64_t WindowsServices::GuestScratch::allocate(std::size_t size){
+    size=std::max<std::size_t>(size,16);const auto address=services_.allocate_heap(memory_,size);if(!address)return 0;
+    try{memory_.write(GuestAddress{address},std::vector<std::uint8_t>(size));blocks_.push_back(address);}
+    catch(...){(void)services_.free_heap(memory_,address,state_);throw;}
+    return address;
+}
+std::uint64_t WindowsServices::GuestScratch::text(std::u16string_view value){
+    const auto bytes=utf16_bytes(value);const auto address=allocate(bytes.size());if(address)memory_.write(GuestAddress{address},bytes);return address;
+}
+GuestAddress WindowsServices::host_service_stub(std::string_view family,std::string_view symbol) const {
+    // 與客體常式慢路徑槽相同的版面：核心服務之後依 runtime_service_descriptors() 的順序各占 16 bytes，首筆優先。
+    static const auto index=[] {
+        std::map<std::pair<std::string_view,std::string_view>,std::size_t> out;const auto table=runtime_service_descriptors();
+        for(std::size_t i=0;i<table.size();++i)out.try_emplace(std::pair{table[i].family,table[i].symbol},i);
+        return out;
+    }();
+    if(!stub_base_.value)return GuestAddress{};
+    const auto found=index.find(std::pair{family,symbol});if(found==index.end())return GuestAddress{};
+    return GuestAddress{stub_base_.value+(services.size()+found->second)*16};
+}
 GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_view symbol,bool required) const {
     std::string lower(dll);
     for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -954,6 +991,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     const auto family = crt_library(lower) ? "crt" : lower;
     if(const auto data=builtin_constant_address(lower,symbol);data.value)return data;
     if(lower=="msvcp100.dll" || lower=="msvcp140.dll")if(const auto data=msvcp100_data(symbol,lower=="msvcp140.dll");data.value)return data;
+    if(lower=="gdi32.dll" && (symbol=="pfnRealizePalette" || symbol=="pfnSelectPalette") && gdi_palette_hooks_[0])return GuestAddress{gdi_palette_hooks_[symbol=="pfnSelectPalette"?1:0]};
     if(lower=="msvcrt.dll"){
         if(symbol=="__pioinfo")return GuestAddress{runtime_.lowio_table};
         if(symbol=="__badioinfo")return GuestAddress{runtime_.bad_ioinfo};
@@ -987,7 +1025,12 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             std::pair{"_commode", 32U}, std::pair{"_acmdln", 48U}, std::pair{"_wcmdln", 104U},
             // 軟體 x87 除法不具有早期 Pentium FDIV 缺陷；保留 CRT 可寫資料 ABI。
             std::pair{"_adjust_fdiv", 72U}, std::pair{"_timezone",80U},
-            std::pair{"_daylight",84U}, std::pair{"_tzname",88U}, std::pair{"__mb_cur_max",128U}, std::pair{"_pctype",136U}
+            std::pair{"_daylight",84U}, std::pair{"_tzname",88U}, std::pair{"__mb_cur_max",128U}, std::pair{"_pctype",136U},
+            // U+0000～U+00FF 的寬字元分類表（initialize_crt_wctype），與 __pwctype_func 指向同一份資料。
+            std::pair{"_wctype",0x400U},
+            // 舊版 CRT 資料（initialize_crt_wctype 建立）：_pwctype 指向 _wctype 表；_dstbias 與 __dstbias 同格。
+            std::pair{"_pwctype",0x320U},std::pair{"_amblksiz",0x328U},std::pair{"_winver",0x330U},std::pair{"_winmajor",0x334U},
+            std::pair{"_winminor",0x338U},std::pair{"_osver",0x33cU},std::pair{"_dstbias",160U}
         };
         for (const auto& [name, offset] : data) if (symbol == name) return GuestAddress{runtime_base_.value + offset};
     }
@@ -1060,8 +1103,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     throw std::invalid_argument("未支援的 PE import：" + std::string(dll) + "!" + std::string(symbol));
 }
 // 名稱索引只保存不可變契約，不保存任何程序地址、架構或原生 provider 狀態。
-std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std::string_view family) const {
-    startup_profile::Scope measurement("builtin_exports",family,true);
+const std::map<std::string_view,std::set<std::string>>& detail::builtin_export_catalog(){
     static const auto names=[] {
         std::map<std::string_view,std::set<std::string>> index;
         std::set<std::string_view> all;
@@ -1077,6 +1119,8 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
         for(const auto& symbol:index["dbghelp.dll"])
             if(detail::builtin_provider_export_family("imagehlp.dll",symbol)=="dbghelp.dll")index["imagehlp.dll"].emplace(symbol);
         for(const auto& [ordinal,name]:detail::ole_ordinal_exports){(void)name;index["oleaut32.dll"].emplace("#"+std::to_string(ordinal));}
+        for(const auto* module:{"msvcr100.dll","msvcr110.dll","msvcr120.dll","msvcp100.dll","msvcp110.dll","msvcp120.dll"})
+            for(const auto& symbol:index["concrt140.dll"])if(detail::builtin_provider_export_family(module,symbol)=="concrt140.dll")index[module].emplace(symbol);
         for(const auto* module:{"xaudio2_9.dll","xaudio2_9redist.dll"}){index[module].emplace("XAudio2Create");index[module].emplace("#1");index[module].emplace("CreateFX");index[module].emplace("#4");}
         for(const auto& service:math_service_descriptors())if(service.family=="d3dx9_43.dll")index["d3dx10_43.dll"].emplace(service.symbol);
         // CRT 別名仍經 resolve_service 選擇版本及 x86 ABI；只加入既有可列舉名稱。
@@ -1088,17 +1132,23 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
         for(const auto& [alias,target]:detail::crt_export_aliases)
             if(all.contains(target))index["crt"].emplace(alias);
         for(const auto symbol:all)if(symbol.starts_with("_o_"))index["api-ms-win-crt-private-l1-1-0.dll"].emplace(symbol);
+        // Windows ucrtbase 實際匯出的 _o_ 名稱；目標函式未實作者在下方解析失敗而不發布。
+        for(const auto name:detail::ucrt_optional_exports){const auto symbol="_o_"+std::string(name);index["ucrtbase.dll"].emplace(symbol);index["api-ms-win-crt-private-l1-1-0.dll"].emplace(symbol);}
         index["wsock32.dll"].insert(index["ws2_32.dll"].begin(),index["ws2_32.dll"].end());
         return index;
     }();
+    return names;
+}
+std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std::string_view family) const {
+    startup_profile::Scope measurement("builtin_exports",family,true);
+    const auto& names=detail::builtin_export_catalog();
     std::map<std::string,std::uint64_t> result;
     const auto guest_entry=[&](GuestAddress target){
         // 與 resolve_service 共用架構對應的執行緒函式目錄，包含直接返回與同步原語。
         if(guest_thread_routines_.value){
             const auto contains=[&](const auto& routines){
                 return std::any_of(routines.begin(),routines.end(),[&](const auto& entry){
-                    return (entry.entry<GuestMemory::guest_page_size || detail::d3d12_descriptor_lowering_enabled()) &&
-                           target.value==guest_thread_routines_.value+guest_thread_offset(entry.entry);
+                    return target.value==guest_thread_routines_.value+guest_thread_offset(entry.entry);
                 });
             };
             if(x86_?contains(detail::guest_thread_x86_routines):contains(detail::guest_thread_routines))return true;
@@ -1122,6 +1172,7 @@ std::map<std::string,std::uint64_t> WindowsServices::builtin_export_targets(std:
     const auto add_family=[&](std::string_view name){
         const auto found=names.find(name);if(found==names.end())return;
         for(const auto& symbol:found->second){
+            if(x86_ && (symbol=="KiUserExceptionDispatcher" || symbol=="KiUserApcDispatcher"))continue; // 本入口目前實作 x64 的核心堆疊 ABI。
             const auto target=resolve_service(family,symbol,false);
             // 客體函式仍是同一個 CRT 匯出；只有精確入口可發布，不把資料槽當成函式。
             if(target.value && (handles(target) || guest_entry(target)))result.try_emplace(symbol,target.value);
@@ -1212,7 +1263,7 @@ GuestAddress WindowsServices::guest_thread_routine(std::string_view symbol) cons
     if(!guest_thread_routines_.value || !runtime_.image.base || !trace_services_.empty() || startup_profile::enabled())return GuestAddress{0};
     if(x86_){for(const auto& routine:detail::guest_thread_x86_routines)if(routine.symbol==symbol)return GuestAddress{guest_thread_routines_.value+routine.entry};}
     else for(const auto& routine:detail::guest_thread_routines)
-        if(routine.symbol==symbol && (routine.entry<GuestMemory::guest_page_size || detail::d3d12_descriptor_lowering_enabled()))
+        if(routine.symbol==symbol)
             return GuestAddress{guest_thread_routines_.value+guest_thread_offset(routine.entry)};
     return GuestAddress{0};
 }
@@ -2610,6 +2661,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
     if(registry_io_busy_ && environment){environment->restore();environment=nullptr;}
 #endif
     if(defer_registry_io_call(state,memory))return std::nullopt;
+    // 額外的主控台螢幕緩衝區：只在程式建立過螢幕緩衝區時檢查服務名稱與 handle（見 console_screen_enter）。
+    struct ScreenScope {WindowsServices& self;bool active;~ScreenScope(){if(active)self.console_screen_leave();}}
+        screen_scope{*this,console_screen_count_ && console_screen_enter(state,memory)};
     entry_runtime_profile::Scope duration(entry_runtime_profile::Kind::Service,state.rip.value,
         entry_runtime_profile::enabled()?name(state.rip):std::string_view{});
     static const bool trace_slow_calls=std::getenv("X64ARM_TRACE_SLOW_CALLS")!=nullptr;
@@ -2875,6 +2929,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_boundary(GuestState& state,
             if(service_name=="GetProcAddress") {
                 if(args(1)>0xffff)trace_text("symbol",args(1),false);
                 else std::fprintf(stderr,"[api] ordinal=%llu\n",static_cast<unsigned long long>(args(1)));
+            }else if(std::getenv("X64ARM_TRACE_SERVICE_STRINGS") && (service_name=="wcscmp" || service_name=="_wcsicmp" || service_name=="wcsncmp" || service_name=="_wcsnicmp" ||
+                     service_name=="strcmp" || service_name=="_stricmp" || service_name=="strncmp" || service_name=="_strnicmp" || service_name=="wcsstr" || service_name=="strstr")){
+                // 比較類 CRT 函式的兩個字串（診斷用，只讀取）。
+                const bool wide=service_name.find("wcs")!=service_name.npos;
+                trace_text("left",args(0),wide);trace_text("right",args(1),wide);
+            }else if(service_name=="strlen" && std::getenv("X64ARM_TRACE_SERVICE_STRINGS")){
+                std::string value;
+                for(unsigned n=0;n<256 && args(0);++n){const auto byte=memory.load(GuestAddress{args(0)+n},8);if(!byte)break;if(byte<32 || byte>126){value.clear();break;}value.push_back(static_cast<char>(byte));}
+                if(!value.empty())std::fprintf(stderr,"[api] string=%s\n",value.c_str());
             }else if(service_name.starts_with("LoadLibrary"))trace_text("library",args(0),service_name.ends_with('W'));
             else if(service_name=="fopen" || service_name=="_wfopen" || service_name=="_fsopen" || service_name=="_wfsopen" ||
                     service_name=="freopen" || service_name=="_wfreopen" || service_name=="_open" || service_name=="_wopen" ||
@@ -3041,13 +3104,29 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
         returned = command_line_address_.value;
     } else if (symbol == "GetProcessHeap") returned = process_heap;
     else if(symbol=="HeapSetInformation" || symbol=="HeapQueryInformation") {
-        if(arg(0)!=process_heap && !runtime_.private_heaps.contains(arg(0)))fail(6);
-        else if(dword(1)!=0)fail(50);
-        else if(arg(3)<4 || !arg(2)){if(symbol=="HeapQueryInformation" && arg(4))memory.store(GuestAddress{arg(4)},x86_?32:64,4);fail(122);}
-        else if(symbol=="HeapQueryInformation"){
-            memory.store(GuestAddress{arg(2)},32,0);if(arg(4))memory.store(GuestAddress{arg(4)},x86_?32:64,4);returned=1;
-        } else if(memory.load(GuestAddress{arg(2)},32)!=0)fail(50); // 尚未實作 LFH；明確拒絕此可選策略。
-        else returned=1;
+        // 類別 0 HeapCompatibilityInformation：每個 heap 記錄標準（0）或 LFH（2）前端；LFH 是配置器內部策略，
+        // 設定後查詢即回報 2，只能由標準切到 LFH（不能切回），HEAP_NO_SERIALIZE 的 heap 不可啟用。
+        // 類別 1 HeapEnableTerminationOnCorruption（忽略 heap 參數）與類別 3 HeapOptimizeResources（版本 1）只能設定。
+        const bool query=symbol=="HeapQueryInformation";const auto information=dword(1);
+        const bool known=arg(0)==process_heap || runtime_.private_heaps.contains(arg(0));
+        if(!query && information==1)returned=1;
+        else if(!query && information==3){
+            if(!arg(2) || arg(3)<8)fail(122);
+            else if(memory.load(GuestAddress{arg(2)},32)!=1)fail(87);
+            else returned=1;
+        }
+        else if(information!=0)fail(87);
+        else if(!known)fail(6);
+        else if(arg(3)<4 || !arg(2)){if(query && arg(4))memory.store(GuestAddress{arg(4)},x86_?32:64,4);fail(122);}
+        else if(query){
+            const auto found=runtime_.heap_compatibility.find(arg(0));
+            memory.store(GuestAddress{arg(2)},32,found==runtime_.heap_compatibility.end()?0U:found->second);if(arg(4))memory.store(GuestAddress{arg(4)},x86_?32:64,4);returned=1;
+        } else {
+            const auto mode=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)},32));
+            if(mode!=0 && mode!=2)fail(87);
+            else if(mode==2 && runtime_.unserialized_heaps.contains(arg(0)))fail(87);
+            else {if(mode==2)runtime_.heap_compatibility[arg(0)]=2;returned=1;}
+        }
     }
     else if(symbol=="GetProcessHeaps") {
         const auto count=runtime_.private_heaps.size()+1,capacity=static_cast<std::size_t>(dword(0)),copied=std::min(count,capacity);const unsigned unit=x86_?4:8;const std::uint8_t bits=x86_?32:64;
@@ -3098,7 +3177,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
     else if(symbol=="HeapCreate") {
         if(dword(0)&~1U)fail(50);
         else if(arg(1)>memory.limit() || arg(2)>UINT64_MAX-4095 || (arg(2) && arg(1)>arg(2)))fail(8);
-        else {returned=runtime_.allocate_wait_handle();runtime_.private_heaps.emplace(returned,std::pair{arg(2)?(arg(2)+4095)&~UINT64_C(4095):0,UINT64_C(0)});if(dword(0)&1)runtime_.unserialized_heaps.insert(returned);
+        else if(const auto header=allocate_heap(memory,0x100);!header)fail(8);
+        else {
+            // handle 是 heap 開頭的位址（與 Windows 相同可讀）：私有 heap 帶 HEAP_CLASS_1，無上限者可成長。
+            memory.write(GuestAddress{header},std::vector<std::uint8_t>(0x100));write_heap_header(memory,header,(dword(0)&1U)|0x1000U|(arg(2)?0U:2U));
+            returned=header;runtime_.private_heaps.emplace(returned,std::pair{arg(2)?(arg(2)+4095)&~UINT64_C(4095):0,UINT64_C(0)});if(dword(0)&1)runtime_.unserialized_heaps.insert(returned);
             // 可成長私有 heap（如靜態 CRT 的 _crtheap）可改用級距配置區；有上限者維持一般 heap 的容量契約。
             if(guest_heap_chunked_ && !arg(2) && guest_heap_private_requested()){
                 guest_private_heaps_.emplace(returned,GuestPrivateHeap{});++guest_heap_topology_generation_;}}
@@ -3108,7 +3191,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
         else {std::vector<std::uint64_t> pointers;for(const auto& [pointer,owner]:runtime_.heap_owners)if(owner==arg(0))pointers.push_back(pointer);
             for(const auto pointer:pointers)(void)free_heap(memory,pointer,state);
             // 釋放時可能進入快速清單；移除 heap 前把它的區塊全部歸還，頁面與用量帳目隨之結清。
-            flush_heap_quick(memory,arg(0));heap_quick_bins_.erase(arg(0));guest_heap_destroy(memory,arg(0));runtime_.private_heaps.erase(heap);runtime_.heap_locks.erase(arg(0));runtime_.unserialized_heaps.erase(arg(0));returned=1;}
+            flush_heap_quick(memory,arg(0));heap_quick_bins_.erase(arg(0));guest_heap_destroy(memory,arg(0));runtime_.private_heaps.erase(heap);runtime_.heap_locks.erase(arg(0));runtime_.unserialized_heaps.erase(arg(0));
+            runtime_.heap_compatibility.erase(arg(0));(void)free_heap(memory,arg(0),state);returned=1;}
     } else if(symbol=="HeapAlloc" || symbol=="HeapReAlloc" || symbol=="HeapFree" || symbol=="HeapSize" || symbol=="HeapValidate") {
         const auto heap=arg(0),pointer=arg(2);const bool valid=heap==process_heap || runtime_.private_heaps.contains(heap);
         struct HeapPathScope {
@@ -3185,7 +3269,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_service(GuestState& state, 
         }
         return invoke_file_open(state,memory,{"kernel32.dll",symbol,symbol=="CreateFile2"?5U:7U});
     } else if (symbol == "CloseHandle") {
-        return invoke_file_close(state,memory,{"kernel32.dll",symbol,1});
+        if(console_screen_count_ && console_screen_handle(arg(0))){close_console_screen(arg(0));returned=1;}
+        else return invoke_file_close(state,memory,{"kernel32.dll",symbol,1});
     } else if (symbol == "GetFileSizeEx") {
         if(const auto native=invoke_native_file_information(state,memory,{"kernel32.dll",symbol,2})){frame.return_to(state,*native);return std::nullopt;}
         const auto file=file_handle_information(arg(0));

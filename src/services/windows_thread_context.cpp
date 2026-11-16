@@ -84,14 +84,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread_control(GuestState& 
         }
         if(id) {
             auto& thread=threads_.items.at(id);
+            // 自己的客體執行緒已在服務邊界停止。重建呼叫返回狀態，避免把
+            // syscall 的暫借堆疊／內部返回入口當成使用者的 CONTEXT。
+            const auto self_return=[&](bool& syscall){
+                auto result=state;call.return_to(result,native?0:1);syscall=false;
+                if(native && !thread.system_calls.empty()){
+                    const auto& frame=thread.system_calls.back();
+                    syscall=result.rip.value==callback_return_.value+0xe0 && result.reg(Gpr::Rsp)==frame.expected_stack;
+                    if(syscall){result.rip=GuestAddress{frame.resume};result.reg(Gpr::Rsp)=frame.resume_stack;
+                        result.reg(Gpr::Rcx)=frame.resume_rcx;result.reg(Gpr::Rdx)=frame.resume_rdx;
+                        result.reg(Gpr::R11)=frame.resume_r11;result.rflags=frame.flags;}
+                }
+                return result;
+            };
             if(thread.status==ThreadStatus::Exited){if(native && !suspend && !context_call)return finish(0);
                 if(context_call){threads_.items.at(threads_.current).last_native_status=0xc000004bU;last_error_=saved_error;call.return_to(state,0xc000004bU);return std::nullopt;}
                 return fail(87);}
             if(getter) {
                 if(id!=threads_.current && !thread.suspended)return fail(87);
-                context=thread_context::capture(id==threads_.current?state:thread.context,mode,flags);
+                bool syscall=false;
+                context=thread_context::capture(id==threads_.current?self_return(syscall):thread.context,mode,flags);
             } else if(setter) {
-                if(!thread.suspended || id==threads_.current)return fail(87);
+                if(id==threads_.current){
+                    bool syscall=false;const auto returned=self_return(syscall);
+                    // 完整驗證後才提交，失敗時不能改變暫存器或消耗 syscall 框架。
+                    GuestState restored;
+                    try{restored=thread_context::restore(returned,mode,context);}catch(const HostCallFault&){return fail(50);}
+                    restored.reg(Gpr::Rax)=native?0:1;
+                    const bool instrumented=syscall && thread.system_calls.back().instrumented;
+                    if(syscall){auto bridge=state;call.return_to(bridge,0);(void)finish_system_call(bridge,memory);}
+                    if(native){thread.last_native_status=0;last_error_=saved_error;}
+                    state=restored;if(instrumented)enter_process_instrumentation(state);
+                    notify_concurrency_changed();return std::nullopt;
+                }
+                if(!thread.suspended)return fail(87);
                 if((flags&1U) && thread.status==ThreadStatus::Waiting)return fail(170);
                 try{thread.context=thread_context::restore(thread.context,mode,context);}catch(const HostCallFault&){return fail(50);}value=1;
             } else if(suspend) {

@@ -84,8 +84,9 @@ if(service.family=="ntdll.dll") {
                 entry=arg(rtl?6:4);parameter=arg(rtl?7:5);
                 const auto flags=rtl?(static_cast<std::uint8_t>(arg(2))?1U:0U):static_cast<std::uint32_t>(arg(6));
                 if(flags&~0x77U)return finish(0xc000000dU);
-                if(flags&0x70U)return finish(0xc00000bbU);
+                if(flags&0x30U)return finish(0xc00000bbU);
                 suspended=(flags&1U)!=0;bootstrap.skip_thread_attach=(flags&2U)!=0;bootstrap.hidden_from_debugger=(flags&4U)!=0;
+                bootstrap.bypass_process_freeze=(flags&0x40U)!=0;
                 if(arg(rtl?3:7))return finish(0xc00000bbU);
                 const auto commit=arg(rtl?5:8),reserve=arg(rtl?4:9);
                 if(commit>UINT32_MAX || reserve>UINT32_MAX)return finish(0xc0000017U);

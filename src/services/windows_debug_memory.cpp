@@ -116,7 +116,7 @@ void WindowsServices::poll_debug_memory(GuestMemory& memory,unsigned millisecond
                     const auto mode=static_cast<std::uint32_t>(load(request.payload,request_header,4));
                     const auto at=address&~UINT64_C(4095);const auto mapping=memory.query(GuestAddress{address});
                     const auto limit=user_address_limit();
-                    const auto access=mode==1?0:mode==2?1:mode==4?3:mode==16?4:mode==32?5:mode==64?7:-1;
+                    const auto access=mode==1?0:mode==2?1:mode==4?3:mode==16 || mode==32?5:mode==64?7:-1; // PAGE_EXECUTE 實際可讀（與 VirtualProtect 相同）
                     if(!size || !mapping || address>=limit || size>limit-address || size>memory.limit() || address+size>UINT64_MAX-4095)reply.error=487;
                     else if(access<0)reply.error=87;
                     else {

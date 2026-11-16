@@ -97,7 +97,7 @@ std::span<const WindowsServiceDescriptor> dbghelp_symbol_service_descriptors(){
 void WindowsServices::refresh_symbol_modules(SymbolSession& session,const GuestMemory& memory){
     std::map<std::uint64_t,const RuntimeImage*> images;if(runtime_.image.base)images.emplace(runtime_.image.base,&runtime_.image);
     for(const auto& [base,module]:runtime_.loaded_modules)images.emplace(base,&module.image);
-    for(const auto& [base,image]:runtime_.builtin_images)images.emplace(base,&image);
+    for(const auto& [base,image]:runtime_.builtin_images)if(!image.private_code)images.emplace(base,&image);
     for(auto at=session.images.begin();at!=session.images.end();)if(at->second.invaded && !images.contains(at->first)){session.modules.erase(at->first);at=session.images.erase(at);}else ++at;
     for(const auto& [base,image]:images){if(session.images.contains(base))continue;
         const auto end=base+image->size;
@@ -119,7 +119,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp_symbols(GuestState&
         if(!arg(1)){last_error_=87;arg.return_to(state,0);return std::nullopt;}
         std::vector<const RuntimeImage*> images;if(runtime_.image.base)images.push_back(&runtime_.image);
         for(const auto& [base,module]:runtime_.loaded_modules)images.push_back(&module.image);
-        for(const auto& [base,image]:runtime_.builtin_images)images.push_back(&image);
+        for(const auto& [base,image]:runtime_.builtin_images)if(!image.private_code)images.push_back(&image);
         std::vector<GuestCallback> calls;
         for(const auto* image:images){
             auto cached=runtime_.loaded_module_names.find(image->path);

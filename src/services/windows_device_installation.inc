@@ -18,10 +18,6 @@ if(name.starts_with("SetupDiCreateDeviceInfo") || name.starts_with("SetupDiSetDe
     const auto publish=[&](std::uint64_t pointer,std::uint32_t handle){
         memory.write(GuestAddress{pointer+4},all.at(handle).guid);memory.store(GuestAddress{pointer+20},32,handle);memory.store(GuestAddress{pointer+24},x86_?32:64,set_handle);
     };
-    const auto administrator=[&]{
-        initialize_tokens();const auto& token=runtime_.token_objects.at(effective_token_id());
-        return token.integrity>=0x3000U && std::any_of(token.groups.begin(),token.groups.end(),[](const auto& group){return group.sid==security::account_sid(*security::find_account("Administrators")) && (group.attributes&0x14U)==4U;});
-    };
     const auto store_node=[&](const DeviceNode& node){return write_enum_key(runtime_.registry,registry_file_,node,output_limit);};
     const auto erase_node=[&](const DeviceNode& node){return erase_registry_tree(runtime_.registry,registry_file_,std::u16string(1,2)+u"\\SYSTEM\\CurrentControlSet\\Enum\\"+node.id);};
     const auto text_of=[&](const DeviceNode& node,std::uint32_t property){return property_text(node,property);};

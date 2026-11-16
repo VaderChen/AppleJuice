@@ -92,6 +92,8 @@ struct GuiMessage {
     std::uint64_t input_order{}; // 命中／啟用回呼完成後，仍保留輸入到達的先後。
     bool mouse_no_coalesce{}; // MOUSEEVENTF_MOVE_NOCOALESCE：此筆移動不可被後續座標取代。
     std::optional<std::uint32_t> mouse_time{}; // 原生事件發生時間；雙擊不能以批次取出時間判斷。
+    // INPUT_MESSAGE_SOURCE（裝置 IMDT_*、來源 IMO_*）；0 時由佇列類別推得，原生鍵盤／滑鼠為硬體。
+    std::uint8_t source_device{},source_origin{};
     bool operator==(const GuiMessage&) const = default;
 };
 inline std::uint32_t gui_queue_category(const GuiMessage& message){
@@ -217,7 +219,23 @@ struct GuiImageList {
     std::uint32_t background{0xffffffffU};
     // ImageList_GetImageInfo 回傳的內部影像／遮罩條帶點陣圖；每次查詢依目前影像重建。
     std::uint64_t image_bitmap{},mask_bitmap{};
+    // ImageList_SetOverlayImage：覆蓋遮罩 1～15 對應的影像索引（-1 未設定）。
+    std::array<std::int32_t,15> overlays{-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
     bool operator==(const GuiImageList&) const = default;
+};
+// comctl32 MRU 清單（CreateMRUListW）：值名 a～z 對應 26 個資料格，order 是由新到舊的格位字母（即登錄值 MRUList）。
+struct GuiMruList {
+    std::uint64_t key{},compare{};std::uint32_t max{},flags{};
+    std::array<std::vector<std::uint8_t>,26> slots{};std::u16string order{};bool dirty{};
+    bool operator==(const GuiMruList&) const = default;
+};
+// ImageList 拖曳（ImageList_BeginDrag～EndDrag）：拖曳影像清單、熱點、目前位置；顯示時保存被覆蓋的畫面以便隱藏或移動時還原。
+struct GuiImageDrag {
+    std::uint64_t list{},lock{},saved_dc{},saved_bitmap{},saved_previous{};
+    std::int32_t hotspot_x{},hotspot_y{},x{},y{},saved_x{},saved_y{};std::uint32_t saved_width{},saved_height{};
+    std::int32_t client_x{},client_y{}; // 鎖定視窗工作區原點相對於視窗左上角的位移（DragEnter 時取得）。
+    bool entered{},shown{},saved{};
+    bool operator==(const GuiImageDrag&) const = default;
 };
 struct GuiToolbarButton {
     std::int32_t image{-2},command{};
@@ -247,6 +265,9 @@ struct GuiAtom {
     std::uint32_t references{};
     bool operator==(const GuiAtom&) const = default;
 };
+// 字串 atom 在指定表格中查找或加入（加入時增加參考計數；名稱不分大小寫）。找不到且不加入回 0；表格滿或計數溢位時 error＝8。
+// 本機／全域 atom（kernel32、user32）與 ntdll 的 Rtl*AtomTable 共用。
+std::uint16_t gui_atom_table_add(std::map<std::uint16_t,GuiAtom>& atoms,std::map<std::u16string,std::uint16_t>& names,std::u16string text,bool add,std::uint32_t& error);
 struct GuiProperty {
     std::uint64_t value{};
     bool owns_atom{};
@@ -312,6 +333,11 @@ struct GuiShellItem {
     std::u16string path;
     std::uint32_t references{1};
     bool operator==(const GuiShellItem&) const = default;
+};
+struct GuiShellItemArray {
+    std::vector<std::u16string> paths;
+    std::uint32_t references{1};
+    bool operator==(const GuiShellItemArray&) const = default;
 };
 struct GuiShellItemEnumerator {
     std::vector<std::u16string> paths;
@@ -488,6 +514,9 @@ struct GuiWindow {
     std::uint32_t check{}, text_limit{32767};
     std::uint64_t dpi_context{UINT64_MAX};
     bool nonclient_dpi_scaling{};
+    std::uint32_t context_help_id{}; // SetWindowContextHelpId
+    // SetGestureConfig：手勢 ID →（想要, 封鎖）；未設定的 ID 沿用預設。
+    std::map<std::uint32_t,std::pair<std::uint32_t,std::uint32_t>> gesture_config{};
     std::uint16_t password_character{u'*'};
     std::uint32_t dialog_base_x{8},dialog_base_y{16};bool owned_font{};GuiFont control_font{};
     std::uint64_t spin_buddy{};
@@ -502,6 +531,7 @@ struct GuiWindow {
     bool modal_owner_was_enabled{true};
     bool button_pressed{},button_armed{};
     std::uint64_t dialog_result{}, default_id{}, icon{},resource_icon{},window_icon{},window_small_icon{};
+    std::uint64_t modal_deadline{}; // MessageBoxTimeout：到期（clock ticks）時以 MB_TIMEDOUT（32000）結束模態迴圈；0 為不限時。
     GuiIcon application_icon{};
     std::vector<std::uint8_t> extra{};
     std::vector<GuiItem> items{};
@@ -539,6 +569,8 @@ struct GuiWindow {
     GuiItem combo_edit_item{};
     GuiMessage modal_message{};
     std::uint64_t modal_message_buffer{};
+    // InitializeFlatSB 後的 WSB_PROP_* 屬性（位元 0～11 依序）；comctl32 v6 的 flat scroll bar 以標準捲軸呈現。
+    std::optional<std::array<std::int64_t,12>> flat_scroll;
     bool operator==(const GuiWindow&) const = default;
 };
 struct GuiWindowCreation {
@@ -577,7 +609,8 @@ struct GuiBitmap {
     std::uint32_t width{},height{};std::vector<std::uint32_t> pixels{};std::uint64_t resource_id{};
     // DIB bits 屬於客體配置；pixels 保存最近同步的 COLORREF/alpha，不暴露宿主指標。
     std::uint64_t dib_address{};std::uint32_t stride{};std::uint16_t bits_per_pixel{32};std::int32_t signed_height{};bool dib_upload_pending{},raw_alpha{};
-    std::uint64_t dib_view{},dib_section{};std::uint32_t dib_offset{};
+    std::array<std::int32_t,2> dimension{}; // SetBitmapDimensionEx 的 0.1 mm 尺寸
+    std::uint64_t dib_view{},dib_section{};std::uint32_t dib_offset{};bool dib_external{}; // dib_external：位元由呼叫端擁有（D3DKMTCreateDCFromMemory），刪除時不釋放
     std::uint32_t dib_compression{};std::array<std::uint32_t,4> dib_masks{0xff0000,0xff00,0xff,0xff000000};
     std::vector<std::uint32_t> dib_palette{}; // COLORREF；RGBQUAD 與邏輯調色盤在 API 邊界轉換。
     bool operator==(const GuiBitmap&) const = default;
@@ -621,8 +654,25 @@ struct GuiDc {
     bool bounds_enabled{};std::array<std::int32_t,4> bounds{};
     // SetLayout／GetLayout 的版面旗標；目前只接受由左至右版面。
     std::uint32_t layout{};
+    // SetTextCharacterExtra（邏輯單位，加在每個字元之後）、SetRelAbs、SetMapperFlags、SetICMMode、SetColorAdjustment 的 DC 狀態。
+    std::int32_t char_extra{};std::uint32_t rel_abs{1},mapper_flags{},icm_mode{1};
+    std::u16string icm_profile; // SetICMProfile 選入的輸出設定檔完整路徑；空字串沿用預設顯示設定檔。
+    // SetTextJustification：斷字字元（空白）分攤的額外寬度與斷字數；SetColorSpace 選入的色彩空間（0 為預設 sRGB）。
+    std::int32_t break_extra{},break_count{};std::uint64_t color_space{};
+    std::array<std::int32_t,4> virtual_resolution{}; // SetVirtualResolution：像素寬高與毫米寬高；全 0 表示使用實體裝置值。
+    std::array<std::uint16_t,12> color_adjustment{24,0,0,10000,10000,10000,0,10000,0,0,0,0};
     bool operator==(const GuiDc&) const = default;
 };
+// TextOut／ExtTextOut（未給 lpDx）與 GetTextExtentPoint 共用的逐字額外位移：每個字元加 SetTextCharacterExtra 的間距，
+// 空白（TrueType 的斷字字元）再分攤 SetTextJustification 的寬度，除不盡的餘數依序給前面的斷字字元。
+inline std::vector<std::int32_t> gui_text_spacing(const GuiDc& dc,std::u16string_view text){
+    std::vector<std::int32_t> extra(text.size(),dc.char_extra);
+    if(dc.break_count>0){
+        const auto base=dc.break_extra/dc.break_count,remainder=dc.break_extra%dc.break_count;std::int32_t seen=0;
+        for(std::size_t i=0;i<text.size();++i)if(text[i]==u' '){extra[i]+=base+(seen<remainder?(remainder>0?1:0):(seen< -remainder?-1:0));++seen;}
+    }
+    return extra;
+}
 struct GuiMouseTracking {
     std::uint64_t window{},deadline{};std::uint32_t flags{},hover_time{};std::array<std::int32_t,2> anchor{};
     bool operator==(const GuiMouseTracking&)const=default;
@@ -636,7 +686,9 @@ struct GuiMdiMove {
     bool sizing{},cancel{};
     bool operator==(const GuiMdiMove&) const = default;
 };
-struct GuiTimer {std::uint64_t deadline{},interval{},procedure{},thread{},coalescing_tolerance{};bool operator==(const GuiTimer&) const = default;};
+// message：SetTimer 為 WM_TIMER（0x113），SetSystemTimer 為 WM_SYSTIMER（0x118）；系統計時器在表中的 ID 帶 gui_system_timer_bit，與同 ID 的一般計時器分開。
+inline constexpr std::uint64_t gui_system_timer_bit=UINT64_C(1)<<63;
+struct GuiTimer {std::uint64_t deadline{},interval{},procedure{},thread{},coalescing_tolerance{};std::uint32_t message{0x113};bool operator==(const GuiTimer&) const = default;};
 struct GuiThemeData {std::u16string class_name;std::uint64_t window{};std::uint32_t dpi{96},flags{};bool operator==(const GuiThemeData&)const=default;};
 struct GuiThemeMetrics {
     std::array<std::int32_t,2> minimum{},intrinsic{};
@@ -669,6 +721,7 @@ struct GuiSentMessage {
     std::optional<GuestCallback> rpc{};
     std::uint64_t rpc_error_pointer{},proxy_operation{};
     std::uint64_t remote_birth{},remote_sequence{};std::uint32_t remote_process{};bool remote_server{},remote_replied{};
+    std::uint8_t source_device{},source_origin{}; // 寄送端送出時的目前輸入來源（GetCIMSSM）。
     bool operator==(const GuiSentMessage&) const = default;
 };
 struct GuiSendCallback {
@@ -808,6 +861,8 @@ struct GuiImmContext {
     std::uint32_t conversion{},sentence{};GuiImeData data{};
     std::array<std::uint8_t,28> composition{};
     std::array<std::uint8_t,92> font{};
+    // ImmSetStatusWindowPos 設定的狀態視窗位置（INIT_STATUSWNDPOS）。
+    std::optional<std::array<std::int32_t,2>> status_position;
     std::map<std::uint32_t,std::array<std::uint8_t,32>> candidates;
     std::uint64_t storage{};std::uint32_t locks{};
     std::array<std::uint64_t,5> buffers{};
@@ -825,6 +880,8 @@ struct GuiMetafile {
     std::u16string description;
     std::uint32_t records{};
     bool imported{};
+    // WMF 錄製 DC（CreateMetaFile）：bytes 為 WMF 記錄；file 非空時為磁碟 metafile 的路徑，CloseMetaFile 時寫出。
+    bool wmf{};std::u16string file;
     bool operator==(const GuiMetafile&) const = default;
 };
 struct GuiClipboardFormat {
@@ -991,6 +1048,10 @@ struct GuiSubclassChain {
 };
 // 執行中的子類別程序（每執行緒巢狀）；DefSubclassProc 依此找下一層。
 struct GuiSubclassFrame {std::uint64_t thread{},window{},procedure{},id{};std::size_t index{};bool operator==(const GuiSubclassFrame&) const = default;};
+// RegisterShellHookWindow 上次比對時的工作列視窗：標題、所在螢幕與桌面（銷毀後仍需桌面判斷收件者）。
+// joySetCapture 的擷取狀態：視窗、期限、是否只在變化時送、上次回報的位置與按鍵。
+struct GuiJoystickCapture {std::uint64_t window{},interval{},deadline{};std::uint32_t x{},y{},z{},buttons{};bool changed{};bool operator==(const GuiJoystickCapture&) const=default;};
+struct GuiShellHookWindow {std::u16string title;std::uint64_t monitor{},desktop{};bool operator==(const GuiShellHookWindow&) const=default;};
 struct GuiState : GuiStationNamespace {
     std::uint32_t process_default_layout{};
     std::map<std::uint64_t,GuiSubclassChain> subclasses;
@@ -1010,6 +1071,11 @@ struct GuiState : GuiStationNamespace {
     desktop::Icons status_icons;
     desktop::Attention attention;
     std::set<std::uint64_t> native_attention_windows;
+    std::set<std::uint64_t> shell_hook_windows;
+    std::map<std::uint64_t,GuiShellHookWindow> shell_hook_tracked;
+    std::uint64_t shell_hook_active{};
+    std::array<std::optional<GuiJoystickCapture>,2> joystick_captures{};
+    std::array<std::uint32_t,16> joystick_thresholds{};
     std::optional<std::uint32_t> desktop_notification_state;
     std::map<std::uint64_t,GuiUserObject> user_objects;
     std::map<std::uint64_t,GuiUserHandle> user_handles;
@@ -1020,6 +1086,7 @@ struct GuiState : GuiStationNamespace {
 
     std::map<std::uint64_t,GuiScriptAnalysis> script_analyses;
     std::map<std::uint64_t,GuiFont> script_caches;
+    std::uint64_t script_properties{}; // ScriptGetProperties 的程序共用表（客體 heap）
     std::map<std::uint64_t,GuiMetafile> emf_recorders,metafiles;
 
     std::array<std::uint64_t,2> resource_peaks{};
@@ -1065,6 +1132,8 @@ struct GuiState : GuiStationNamespace {
     std::map<std::uint64_t,GuiImmContext> input_contexts;
     std::map<std::uint64_t,GuiImmBuffer> input_buffers;
     std::map<std::uint64_t,std::uint64_t> input_defaults,input_associations;
+    // ImmDisableIME：停用 IME 的執行緒，或整個程序（-1）。
+    std::set<std::uint64_t> input_disabled_threads;bool input_disabled_process{};
     std::map<std::uint64_t,std::uint64_t> input_windows,input_window_targets;
     std::map<std::pair<std::uint64_t,std::uint64_t>,std::uint32_t> input_borrows;
     std::map<std::uint64_t,GuiWinEventHook> event_hooks;
@@ -1078,6 +1147,12 @@ struct GuiState : GuiStationNamespace {
     std::uint64_t process_keyboard_layout{};
     std::map<std::uint64_t,GuiShellItem> shell_items;
     std::map<std::uint64_t,GuiShellItemEnumerator> shell_item_enumerators;
+    std::map<std::uint64_t,GuiShellItemArray> shell_item_arrays;std::uint64_t shell_item_array_vtable{};
+    // IShellFolder（路徑空字串＝桌面）：物件為 [IShellFolder vtable][IPersistFolder2 vtable]，兩個介面共用參照數；IEnumIDList 列舉子項目名稱。
+    struct ShellFolder {std::u16string path;std::uint32_t references{1};bool operator==(const ShellFolder&) const = default;};
+    struct ShellIdListEnum {std::u16string folder;std::vector<std::u16string> names;std::size_t cursor{};std::uint32_t references{1};bool operator==(const ShellIdListEnum&) const = default;};
+    std::map<std::uint64_t,ShellFolder> shell_folders;std::map<std::uint64_t,ShellIdListEnum> shell_idlist_enums;
+    std::uint64_t shell_folder_vtable{},shell_persist_vtable{},shell_idlist_enum_vtable{};
     std::map<std::uint64_t,GuiShellItemOperation> shell_item_operations;
     std::uint64_t shell_item_vtable{},shell_item_enum_vtable{};
     std::uint64_t shell_property_vtable{},task_allocator{};
@@ -1114,12 +1189,18 @@ struct GuiState : GuiStationNamespace {
     struct Palette {std::vector<std::uint32_t> entries;std::uint64_t generation{1};bool operator==(const Palette&)const=default;};
     std::map<std::uint64_t,Palette> palettes;
     std::map<std::uint64_t,GuiBitmap> brush_patterns;
+    std::map<std::uint64_t,std::uint64_t> brush_pattern_sources; // CreatePatternBrush 的來源 HBITMAP（GetObject 的 lbHatch）
+    std::map<std::uint64_t,std::array<std::uint64_t,2>> brush_dib_patterns; // CreateDIBPatternBrush(Pt) 的｛iUsage, 來源｝（GetObject 回 BS_DIBPATTERN）
+    std::map<std::uint64_t,std::vector<std::uint8_t>> color_spaces;           // CreateColorSpace 的 LOGCOLORSPACEW（檔名以 UTF-16 保存）
+    std::uint64_t default_color_space{};
     std::map<std::uint64_t, std::uint32_t> pens;
     struct ExtendedPen {std::uint32_t style{},width{},brush_style{};bool operator==(const ExtendedPen&)const=default;};
     std::map<std::uint64_t,ExtendedPen> extended_pens;
     std::map<std::uint64_t,std::int32_t> pen_widths,brush_hatches;
     std::vector<GuiMessage> queue;
     std::set<std::uint64_t> message_threads;
+    // Shell 登記的 Program Manager／工作管理員視窗，以及舊式 IME（WINNLSEnableIME）的啟用狀態。
+    std::uint64_t progman_window{},taskman_window{};bool legacy_ime_enabled{true};
     std::uint64_t next_window{0x10000}, next_object{0xc000}, next_atom{0xc000}, next_input_order{1};
     std::uint64_t dispatched{}, paints{}, destroyed{};
     std::map<std::uint64_t,GuiSocketWatch> socket_watches{};
@@ -1145,6 +1226,10 @@ struct GuiState : GuiStationNamespace {
     std::map<std::uint64_t,GuiMouseClick> mouse_clicks;
     std::uint64_t caret_generation{},cursor{0xd000+32512};
     std::uint64_t cursor_animation_start{};std::uint32_t cursor_animation_step{};
+    std::map<std::uint32_t,GuiIcon> system_cursors{}; // SetSystemCursor 取代的系統游標（OCR_*）；SPI_SETCURSORS 還原。
+    std::map<std::pair<std::uint64_t,std::uint32_t>,std::uint64_t> cursor_frames{}; // GetCursorFrameInfo 的幀控制代碼（共用；原游標銷毀時回收）。
+    bool mouse_buttons_swapped{}; // SwapMouseButton／SPI_SETMOUSEBUTTONSWAP：實體左右鍵對調成邏輯按鍵。
+    std::vector<std::array<std::int64_t,4>> mouse_move_points{}; // GetMouseMovePointsEx：最近 64 筆 {x, y, time, extra}，新的在後。
     std::int32_t cursor_count{};
     std::uint64_t focus{}, active{}, capture{}, next_item{0x200000}, desktop{0x100};
     KeyVersionedMap<std::uint64_t,std::uint64_t> dc_objects{};
@@ -1156,6 +1241,10 @@ struct GuiState : GuiStationNamespace {
     GuiIcon default_application_icon{};bool application_icon_loaded{};
     std::map<std::uint64_t,GuiImageList> image_lists{};
     std::uint64_t shell_large_image_list{},shell_small_image_list{};
+    // Shell_GetCachedImageIndex：「小寫路徑|索引」→ 系統影像清單索引；SHCreateFileExtractIconW 的 IExtractIconW 物件。
+    std::map<std::u16string,std::uint32_t> shell_cached_icons;
+    struct ShellExtractIcon {std::u16string path;std::uint32_t attributes{},references{1};bool operator==(const ShellExtractIcon&) const = default;};
+    std::map<std::uint64_t,ShellExtractIcon> shell_extract_icons;std::uint64_t shell_extract_icon_vtable{};
     std::map<std::uint64_t,std::vector<std::array<std::uint16_t,3>>> accelerators{};
     std::map<std::pair<std::uint64_t,std::uint64_t>,GuiTimer> timers{};
     std::uint64_t timer_deadline(std::uint64_t earliest,std::uint64_t tolerance,std::pair<std::uint64_t,std::uint64_t> ignored)const {
@@ -1185,6 +1274,19 @@ struct GuiState : GuiStationNamespace {
     std::map<std::uint64_t,std::vector<std::uint8_t>> fonts{};
     std::map<std::uint64_t,std::vector<NativeFontFace>> memory_fonts;
     std::map<std::pair<std::string,std::uint32_t>,std::vector<std::uint64_t>> file_fonts;
+    // GetFontRealizationInfo 的實現 ID（索引＋1）→ face；GetFontFileData 使用的 sfnt 於首次查詢時建立。
+    struct RealizedFont {NativeFontFace face;std::vector<std::uint8_t> file;bool loaded{};bool operator==(const RealizedFont&)const=default;};
+    std::vector<RealizedFont> realized_fonts;std::uint32_t font_cache_number{};
+    std::uint32_t display_uniqueness{1}; // GdiEntry13（DdQueryDisplaySettingsUniqueness）：顯示模式每變更一次加一。
+    std::uint16_t comctl_mui_language{}; // InitMUILanguage／GetMUILanguage（LANG_NEUTRAL 起始）。
+    std::uint32_t orientation_preference{}; // SetDisplayAutoRotationPreferences（ORIENTATION_PREFERENCE_NONE 起始）。
+    std::map<std::uint64_t,GuiMruList> mru_lists{};
+    GuiImageDrag image_drag{};
+    // HIMAGELIST_QueryInterface 的 IImageList 包裝：每個清單一個 COM 物件（客體記憶體只存 vtable 指標）；references 含建立者的參照，
+    // ImageList_Destroy 只釋放建立者那一份，最後一個 Release 才銷毀清單。
+    struct ImageListCom {std::uint64_t object{};std::uint32_t references{};bool operator==(const ImageListCom&) const = default;};
+    std::map<std::uint64_t,ImageListCom> image_list_com{};std::uint64_t image_list_vtable{};
+    bool eudc_enabled{true};
     std::map<std::uint64_t,std::shared_ptr<const void>> font_natives;
     std::map<std::uint64_t,std::uint32_t> com_initializations{};
     // CoLockObjectExternal 的外部強鎖計數；第一次鎖定 AddRef，最後解鎖 Release。
@@ -1194,6 +1296,24 @@ struct GuiState : GuiStationNamespace {
     std::map<std::uint64_t,BufferedPaint> buffered_paints{};std::uint32_t buffered_paint_inits{};
     // D3DKMT 配接器 handle（同一個虛擬顯示配接器可被開啟多次）。
     std::set<std::uint32_t> kmt_adapters{};std::uint32_t next_kmt_adapter{0x40000040U};
+    // D3DKMT 裝置：所屬介面卡與佇列上限；VidPn 來源 0 的擁有者裝置與擁有類型（D3DKMT_VIDPNSOURCEOWNER_TYPE）。
+    struct KmtDevice {std::uint32_t adapter{},present_limit{},flip_limit{};bool operator==(const KmtDevice&)const=default;};
+    std::uint32_t system_palette_use{1}; // SYSPAL_STATIC
+    std::map<std::uint32_t,KmtDevice> kmt_devices{};std::uint32_t next_kmt_device{0x40000c00U},kmt_vidpn_owner{},kmt_vidpn_owner_type{};
+    // D3DKMT 同步物件與 keyed mutex（windows_d3dkmt_sync.cpp）：本機 handle 與共用 handle 都指向物件編號；CPU 等待者在條件成立時設定事件。
+    struct KmtSync {std::uint32_t type{},device{};std::uint64_t value{},maximum{},cpu_address{},event{};bool operator==(const KmtSync&)const=default;};
+    struct KmtMutex {std::uint64_t key{},fence{};bool owned{};std::uint32_t owner{};std::vector<std::uint8_t> private_data;bool operator==(const KmtMutex&)const=default;};
+    struct KmtWaiter {std::vector<std::pair<std::uint64_t,std::uint64_t>> targets;bool any{};std::uint64_t mutex{},key{},event{};bool operator==(const KmtWaiter&)const=default;};
+    std::map<std::uint64_t,KmtSync> kmt_sync_objects{};std::map<std::uint32_t,std::uint64_t> kmt_sync_handles{},kmt_sync_shared{};
+    std::map<std::uint64_t,KmtMutex> kmt_mutexes{};std::map<std::uint32_t,std::uint64_t> kmt_mutex_handles{},kmt_mutex_shared{};
+    std::vector<KmtWaiter> kmt_waiters{};std::uint64_t next_kmt_object{1};std::uint32_t next_kmt_sync{0x40100000U};
+    // D3DKMT 配置與資源（windows_d3dkmt_resource.cpp）：配置屬於裝置並可歸入資源；資源保存執行階段、資源與各配置的驅動私有資料。
+    // 本機資源 handle → {裝置, 資源物件}；hGlobalShare → 資源物件。全部本機 handle 關閉時資源與其全域共用 handle 一併釋放。
+    // 資源的各配置以 allocation_ids 識別；建立者銷毀配置時一併移出資源，開啟者的配置 handle 只是本機參考。
+    struct KmtResource {std::vector<std::uint8_t> runtime_data,driver_data;std::vector<std::vector<std::uint8_t>> allocations;std::vector<std::uint64_t> allocation_ids;bool operator==(const KmtResource&)const=default;};
+    struct KmtAllocation {std::uint32_t device{};std::uint64_t resource{};std::vector<std::uint8_t> driver_data;std::uint64_t entry{};bool owner{};bool operator==(const KmtAllocation&)const=default;};
+    std::map<std::uint64_t,KmtResource> kmt_resources{};std::map<std::uint32_t,std::pair<std::uint32_t,std::uint64_t>> kmt_resource_handles{};
+    std::map<std::uint32_t,std::uint64_t> kmt_resource_shared{};std::map<std::uint32_t,KmtAllocation> kmt_allocations{};
     std::uint64_t com_main_sta{}; // 依首次 STA 初始化順序識別，非依 thread ID 排序。
     std::map<std::uint64_t,std::uint64_t> com_message_filters{};
     std::map<std::uint64_t,GuiCommonDialog> common_dialogs{};
@@ -1305,6 +1425,10 @@ public:
     virtual bool ime_convert(std::uint64_t) {return false;}
     virtual void raw_input_policy(bool,bool,bool) {}
     virtual std::vector<GuiMessage> poll_for(std::uint64_t nanoseconds) {return poll(nanoseconds!=0);}
+    // 其他宿主執行緒可呼叫 interrupt_wait() 讓正在 poll_for 阻塞的 GUI 執行緒提早返回（只投遞不交給客體的喚醒事件）；
+    // 不支援的後端回傳 false，呼叫端維持原本的短輪詢。
+    virtual bool supports_interrupt_wait() const noexcept {return false;}
+    virtual void interrupt_wait() noexcept {}
     // 不持服務狀態鎖時先向宿主抽取事件；之後第一次 poll_for(0) 直接回傳已抽到的事件，不再進宿主事件迴圈。
     virtual void prefetch_events() {}
     virtual std::optional<GuiFontMetrics> font_metrics(const GuiFont&) {return std::nullopt;}
@@ -1366,6 +1490,8 @@ public:
     virtual std::optional<std::vector<std::array<std::uint32_t,2>>> text_line_ranges(std::uint64_t) {return std::nullopt;}
 };
 GuiFont gui_font(const GuiState&,std::uint64_t font_handle);
+// 字型字元集對應的 ANSI 碼頁（windows_fonts.cpp）；SYMBOL_CHARSET 回 0，代表位元組直接對應字碼。
+std::uint32_t gdi_charset_code_page(std::uint8_t charset);
 GuiFontMetrics fallback_font_metrics(const GuiFont&);
 std::shared_ptr<NativeGui> make_native_gui(const std::filesystem::path& snapshot);
 }

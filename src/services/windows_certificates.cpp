@@ -244,7 +244,16 @@ std::vector<std::uint8_t> embedded_message(std::span<const std::uint8_t> bytes){
     const auto begin=static_cast<std::size_t>(number(optional+directories+32,4)),size=static_cast<std::size_t>(number(optional+directories+36,4));
     if(!size || (begin&7) || begin>bytes.size() || size>bytes.size()-begin)throw CertificateError{0x80092009};
     for(auto at=begin;at<begin+size;){const auto length=static_cast<std::size_t>(number(at,4));if(length<8 || length>begin+size-at)throw CertificateError{0x80092009};
-        if(number(at+4,2)==0x200 && number(at+6,2)==2)return {bytes.begin()+static_cast<std::ptrdiff_t>(at+8),bytes.begin()+static_cast<std::ptrdiff_t>(at+length)};
+        if(number(at+4,2)==0x200 && number(at+6,2)==2){
+            // WIN_CERTIFICATE 的 dwLength 可以包含八位元組對齊；CryptMsg 的 DER 本體不能含這些填補。
+            const auto* payload=bytes.data()+at+8;const auto* cursor=payload;long content_size{};int tag{},klass{};
+            const auto flags=ASN1_get_object(&cursor,&content_size,&tag,&klass,static_cast<long>(length-8));
+            if((flags&0x81) || tag!=V_ASN1_SEQUENCE || klass!=V_ASN1_UNIVERSAL || content_size<0 ||
+               cursor<payload || cursor>payload+length-8 || static_cast<std::size_t>(content_size)>static_cast<std::size_t>(payload+length-8-cursor))throw CertificateError{0x80092009};
+            const auto* end=cursor+content_size;const auto padding=static_cast<std::size_t>(payload+length-8-end);
+            if(padding>7 || !std::all_of(end,payload+length-8,[](auto value){return value==0;}))throw CertificateError{0x80092009};
+            return {payload,end};
+        }
         at+=(length+7)&~std::size_t{7};
     }
     throw CertificateError{0x80092009};

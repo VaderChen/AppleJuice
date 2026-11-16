@@ -2,7 +2,9 @@
 #include "x64arm/windows_fonts.hpp"
 #include "x64arm/native_font_data.hpp"
 #include "x64arm/unicode.hpp"
+#include "windows_locale_data.hpp"
 #include <algorithm>
+#include <map>
 #include <set>
 #include <tuple>
 #include <cmath>
@@ -14,6 +16,14 @@
 #include <unicode/utf16.h>
 
 namespace x64arm {
+std::uint32_t gdi_charset_code_page(std::uint8_t charset){
+    // 字元集→ANSI 碼頁（Windows 字元集對照）；DEFAULT／OEM 沿用本引擎的 ACP／OEMCP（UTF-8）。
+    switch(charset){
+    case 0:return 1252;case 2:return 0;case 77:return 10000;case 128:return 932;case 129:return 949;case 130:return 1361;case 134:return 936;case 136:return 950;
+    case 161:return 1253;case 162:return 1254;case 163:return 1258;case 177:return 1255;case 178:return 1256;case 186:return 1257;case 204:return 1251;case 222:return 874;case 238:return 1250;
+    default:return 65001;
+    }
+}
 bool windows_ui_font_alias(std::u16string_view family){
     constexpr std::u16string_view aliases[]{u"",u"System",u"Segoe UI",u"MS Shell Dlg",u"MS Shell Dlg 2",u"MS Sans Serif",u"Microsoft Sans Serif",u"Tahoma"};
     const auto lower=[](char16_t value){return value>=u'A' && value<=u'Z'?static_cast<char16_t>(value+32):value;};
@@ -65,10 +75,15 @@ std::span<const WindowsServiceDescriptor> font_service_descriptors(){
         {"gdi32.dll","AddFontResourceExA",3,0,0,0x2},{"gdi32.dll","AddFontResourceExW",3,0,0,0x2},{"gdi32.dll","RemoveFontResourceExA",3,0,0,0x2},{"gdi32.dll","RemoveFontResourceExW",3,0,0,0x2},{"gdi32.dll","GetGlyphOutlineA",7,0,0,0x16},{"gdi32.dll","GetGlyphOutlineW",7,0,0,0x16},
         {"gdi32.dll","GetTextExtentPointI",4,0,0,0x4},{"gdi32.dll","GetTextExtentExPointI",7,0,0,0xc},
         {"gdi32.dll","GetCharABCWidthsA",4,0,0,0x6},{"gdi32.dll","GetCharABCWidthsW",4,0,0,0x6},{"gdi32.dll","GetCharABCWidthsI",5,0,0,0x6},
-        {"gdi32.dll","GetCharWidthA",4,0,0,0x6},{"gdi32.dll","GetCharWidthW",4,0,0,0x6},{"gdi32.dll","GetCharWidthI",5,0,0,0x6},{"gdi32.dll","AddFontMemResourceEx",4,0,0,0x2},{"gdi32.dll","RemoveFontMemResourceEx",1},{"gdi32.dll","EnumFontFamiliesExA",5,0,0,0x10},{"gdi32.dll","EnumFontFamiliesExW",5,0,0,0x10},{"gdi32.dll","GetFontData",5,0,0,0x16},{"gdi32.dll","GetGlyphIndicesW",5,0,0,0x14},{"gdi32.dll","GetFontUnicodeRanges",2},{"gdi32.dll","GetTextFaceA",3,0,0,0x2},{"gdi32.dll","GetTextFaceW",3,0,0,0x2},{"gdi32.dll","EnumFontFamiliesA",4},{"gdi32.dll","EnumFontFamiliesW",4}};return table;
+        {"gdi32.dll","GetCharWidthA",4,0,0,0x6},{"gdi32.dll","GetCharWidthW",4,0,0,0x6},{"gdi32.dll","GetCharWidthI",5,0,0,0x6},{"gdi32.dll","AddFontMemResourceEx",4,0,0,0x2},{"gdi32.dll","RemoveFontMemResourceEx",1},{"gdi32.dll","EnumFontFamiliesExA",5,0,0,0x10},{"gdi32.dll","EnumFontFamiliesExW",5,0,0,0x10},{"gdi32.dll","GetFontData",5,0,0,0x16},{"gdi32.dll","GetGlyphIndicesW",5,0,0,0x14},{"gdi32.dll","GetFontUnicodeRanges",2},{"gdi32.dll","GetTextFaceA",3,0,0,0x2},{"gdi32.dll","GetTextFaceW",3,0,0,0x2},{"gdi32.dll","EnumFontFamiliesA",4},{"gdi32.dll","EnumFontFamiliesW",4},
+        {"gdi32.dll","GetKerningPairsA",3},{"gdi32.dll","GetKerningPairsW",3},{"gdi32.dll","GetCharWidthInfo",2},{"gdi32.dll","FontIsLinked",1},
+        {"gdi32.dll","CreateFontIndirectExA",1},{"gdi32.dll","CreateFontIndirectExW",1},
+        {"gdi32.dll","GetFontRealizationInfo",2},{"gdi32.dll","GdiRealizationInfo",2},{"gdi32.dll","GetFontFileInfo",5},{"gdi32.dll","GetFontFileData",5,0x4},
+        {"gdi32.dll","GetFontResourceInfoW",4}};return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto finish=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
+#include "gdi_font_realization.inc"
     if(service.symbol.starts_with("AddFontResource") || service.symbol.starts_with("RemoveFontResource")){
         const bool extended=service.symbol.find("ResourceEx")!=std::string_view::npos;
         const auto flags=extended?static_cast<std::uint32_t>(arg(1)):0U;
@@ -88,6 +103,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
         const auto size=static_cast<std::uint32_t>(arg(1));if(!arg(0) || !size || size>output_limit || arg(2) || !arg(3) || gui_.memory_fonts.size()>=256)return finish(0);
         memory.check(GuestAddress{arg(3)},4,Access::Write);std::vector<std::uint8_t> bytes(size);memory.read(GuestAddress{arg(0)},bytes);auto faces=native_load_font_faces(bytes);if(faces.empty())return finish(0);
         const auto handle=gui_.next_object++;memory.store(GuestAddress{arg(3)},32,faces.size());gui_.memory_fonts.emplace(handle,std::move(faces));return finish(static_cast<std::uint32_t>(handle));
+    }
+    if(service.symbol.starts_with("CreateFontIndirectEx")){
+        // ENUMLOGFONTEXDV 以 LOGFONT 開頭（W 348／A 188 位元組後接 DESIGNVECTOR）：設計向量須帶 STAMP_DESIGNVECTOR 且軸數不超過 16；
+        // 沒有 multiple master 字型時軸值不影響實現，與 OpenType 字型的 Windows 行為相同。
+        if(!arg(0)){last_error_=87;return finish(0);}
+        const auto vector=arg(0)+(service.symbol.ends_with('W')?348U:188U);const auto stamp=static_cast<std::uint32_t>(memory.load(GuestAddress{vector},32)),axes=static_cast<std::uint32_t>(memory.load(GuestAddress{vector+4},32));
+        if(stamp!=0x08007664U || axes>16){last_error_=87;return finish(0);}
+        return finish(static_cast<std::uint32_t>(nested_service(state,memory,"gdi32.dll",service.symbol.ends_with('W')?"CreateFontIndirectW":"CreateFontIndirectA",{arg(0)})));
     }
     const bool extended=service.symbol.starts_with("EnumFontFamiliesEx"),wide=service.symbol.ends_with('W');
     const bool query=!service.symbol.starts_with("EnumFont");
@@ -182,6 +205,57 @@ std::optional<std::uint32_t> WindowsServices::invoke_fonts(GuestState& state,Gue
                 std::vector<std::uint8_t> bytes(count*(abc?12:4));for(unsigned i=0;i<count;++i){if(!abc)number(bytes,i*4,static_cast<unsigned>(advances[i]));else{const auto a=static_cast<std::int32_t>(std::floor(metrics[i][0]*sx)),right=static_cast<std::int32_t>(std::ceil((metrics[i][1]-metrics[i][2])*sx));const auto b=std::max(0,right-a);number(bytes,i*12,static_cast<unsigned>(a));number(bytes,i*12+4,static_cast<unsigned>(b));number(bytes,i*12+8,static_cast<unsigned>(advances[i]-a-b));}}
                 memory.write(GuestAddress{output},bytes);return finish(1);
             }catch(const std::bad_alloc&){return fail(8);}catch(const std::length_error&){return fail(8);}catch(const std::domain_error&){return fail(50);}catch(const std::invalid_argument&){return fail(87);}
+        }
+        if(name.starts_with("GetKerningPairs") || name=="GetCharWidthInfo"){
+            const double em=model.height<0?-static_cast<double>(model.height):model.height?static_cast<double>(model.height)*face->em/std::max(1,face->ascent+face->descent):13;
+            const double sy=em/face->em,sx=model.width?std::abs(static_cast<double>(model.width))/std::max(1,face->average_width):sy;
+            const auto u16=[](const std::vector<std::uint8_t>& table,std::size_t at)->std::optional<std::uint32_t>{if(at+2>table.size())return std::nullopt;return static_cast<std::uint32_t>(table[at])<<8|table[at+1];};
+            if(name=="GetCharWidthInfo"){
+                // CHARWIDTHINFO {lMaxNegA, lMaxNegC, lMinWidthD}：全部字形中最負的 A、C 寬度與最小非零前進寬度（與 GetCharABCWidths 同一換算）。
+                if(!arg(1))return fail(87);const auto maxp=native_font_table(*face,0x6d617870);const auto total=u16(maxp,4).value_or(0);if(!total)return fail(50);
+                std::vector<std::uint16_t> glyphs(total);std::iota(glyphs.begin(),glyphs.end(),std::uint16_t{0});const auto metrics=native_font_glyph_metrics(*face,glyphs);
+                std::int64_t negative_a=0,negative_c=0,minimum=INT32_MAX;
+                for(const auto& m:metrics){const auto advance=static_cast<std::int64_t>(std::round(m[1]*sx)),a=static_cast<std::int64_t>(std::floor(m[0]*sx)),right=static_cast<std::int64_t>(std::ceil((m[1]-m[2])*sx));
+                    const auto b=std::max<std::int64_t>(0,right-a),c=advance-a-b;negative_a=std::min(negative_a,a);negative_c=std::min(negative_c,c);if(advance>0)minimum=std::min(minimum,advance);}
+                if(minimum==INT32_MAX)minimum=0;memory.check(GuestAddress{arg(1)},12,Access::Write);
+                memory.store(GuestAddress{arg(1)},32,static_cast<std::uint32_t>(static_cast<std::int32_t>(negative_a)));memory.store(GuestAddress{arg(1)+4},32,static_cast<std::uint32_t>(static_cast<std::int32_t>(negative_c)));memory.store(GuestAddress{arg(1)+8},32,static_cast<std::uint32_t>(minimum));
+                return finish(1);
+            }
+            // 'kern' 表：Microsoft 版本 0 與 Apple 版本 1.0 的水平 format 0 子表（略過最小值、跨串流與變體子表；override 位元取代累加）。
+            const auto kern=native_font_table(*face,0x6b65726e);std::map<std::pair<std::uint16_t,std::uint16_t>,std::int32_t> pairs;
+            const auto read_pairs=[&](std::size_t at,bool replace){const auto count=u16(kern,at).value_or(0);for(std::uint32_t i=0;i<count;++i){const auto p=at+8+i*6;const auto left=u16(kern,p),right=u16(kern,p+2),value=u16(kern,p+4);if(!left || !right || !value)break;
+                auto& slot=pairs[{static_cast<std::uint16_t>(*left),static_cast<std::uint16_t>(*right)}];slot=(replace?0:slot)+static_cast<std::int16_t>(*value);}};
+            if(const auto version=u16(kern,0);version && *version==0){
+                std::size_t at=4;for(std::uint32_t table=0,tables=u16(kern,2).value_or(0);table<tables;++table){const auto length=u16(kern,at+2),coverage=u16(kern,at+4);if(!length || !coverage || *length<6)break;
+                    if((*coverage>>8)==0 && (*coverage&1U) && !(*coverage&6U))read_pairs(at+6,(*coverage&8U)!=0);at+=*length;}
+            }else if(version && *version==1 && u16(kern,2).value_or(1)==0){
+                const auto tables=(u16(kern,4).value_or(0)<<16)|u16(kern,6).value_or(0);std::size_t at=8;
+                for(std::uint32_t table=0;table<tables && table<256;++table){const auto length=(u16(kern,at).value_or(0)<<16)|u16(kern,at+2).value_or(0),coverage=u16(kern,at+4).value_or(0);if(length<8)break;
+                    if((coverage&0xffU)==0 && !(coverage&0xe000U))read_pairs(at+8,false);at+=length;}
+            }
+            // 字形→字元碼：W 版為 UTF-16（BMP），A 版為字型字元集碼頁（單位元組或雙位元組 DBCS），取最小的字碼。
+            std::vector<std::uint32_t> characters;characters.reserve(0xffe0);for(std::uint32_t c=0x20;c<0x10000;++c)if(c<0xd800 || c>0xdfff)characters.push_back(c);
+            const auto glyphs=native_font_glyph_indices(*face,characters);const auto page=gdi_charset_code_page(model.charset);std::map<std::uint16_t,std::uint16_t> codes;
+            for(std::size_t i=0;i<characters.size();++i){if(!glyphs[i] || codes.contains(glyphs[i]))continue;std::uint32_t code=characters[i];
+                if(!wide){const std::u16string text(1,static_cast<char16_t>(code));
+                    if(!page){if(code>0xff && !(code>=0xf000 && code<=0xf0ff))continue;code&=0xffU;}
+                    else {const auto encoded=windows_nls_encode(text,page,true,"?",true);if(!encoded || encoded->used_default || encoded->bytes.empty() || encoded->bytes.size()>2)continue;code=encoded->bytes.size()==1?encoded->bytes[0]:(static_cast<std::uint32_t>(encoded->bytes[0])<<8|encoded->bytes[1]);}}
+                codes.emplace(glyphs[i],static_cast<std::uint16_t>(code));}
+            std::vector<std::tuple<std::uint16_t,std::uint16_t,std::int32_t>> out;
+            for(const auto& [key,value]:pairs){const auto first=codes.find(key.first),second=codes.find(key.second);if(first==codes.end() || second==codes.end())continue;
+                const auto amount=static_cast<std::int32_t>(std::lround(value*sx));if(amount)out.emplace_back(first->second,second->second,amount);}
+            std::sort(out.begin(),out.end());
+            if(!arg(2))return finish(static_cast<std::uint32_t>(out.size()));
+            const auto count=std::min<std::size_t>(static_cast<std::uint32_t>(arg(1)),out.size());memory.check(GuestAddress{arg(2)},count*8,Access::Write);
+            for(std::size_t i=0;i<count;++i){const auto& [first,second,amount]=out[i];memory.store(GuestAddress{arg(2)+i*8},16,first);memory.store(GuestAddress{arg(2)+i*8+2},16,second);memory.store(GuestAddress{arg(2)+i*8+4},32,static_cast<std::uint32_t>(amount));}
+            return finish(static_cast<std::uint32_t>(count));
+        }
+        if(name=="FontIsLinked"){
+            // 字型連結：HKLM\...\FontLink\SystemLink 有該字面名稱的 REG_MULTI_SZ 時為已連結。
+            GuestScratch scratch(*this,memory,state);const auto key=scratch.text(u"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink");
+            const auto value=scratch.text(model.face.empty()?face->family:model.face),size=scratch.allocate(4);if(!key || !value || !size)return fail(8);
+            const auto root=x86_?std::uint64_t{0x80000002U}:UINT64_C(0xffffffff80000002);
+            return finish(static_cast<std::uint32_t>(nested_service(state,memory,"advapi32.dll","RegGetValueW",{root,key,value,0x20,0,0,size}))==0?1U:0U);
         }
         if(name=="GetFontData"){
             const auto tag=static_cast<std::uint32_t>(arg(1)),offset=static_cast<std::uint32_t>(arg(2)),capacity=static_cast<std::uint32_t>(arg(4));

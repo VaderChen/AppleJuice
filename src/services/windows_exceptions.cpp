@@ -1,27 +1,140 @@
 #include "x64arm/windows_services.hpp"
+#include "windows_write_watch.hpp"
 #include "x64arm/interpreter.hpp"
 #include "x64arm/windows_unwind.hpp"
 #include "windows_memory_diagnostics.hpp"
+#include "windows_exception_diagnostics.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <charconv>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
+#include <set>
 #include <sstream>
+#include <tuple>
 
 namespace x64arm::detail {const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,GuestAddress address) noexcept;}
 namespace x64arm {
 namespace {
-void trace_fault_memory(const GuestState& state,const GuestMemory& memory,std::uint64_t pid,std::uint64_t thread) noexcept {
+void trace_cpu_fault_instruction(const GuestState& state,const GuestMemory& memory,std::uint32_t code,std::uint64_t pid,std::uint64_t thread) noexcept {
+    // 只保存故障當下的指令，供通用指令盤點；不讀取堆疊、票證或其他資料。
+    // 上限是每個程序的不同「例外碼／位址／指令」數，重複故障不持續輸出。
+    static const unsigned limit=[] {
+        const auto* setting=std::getenv("X64ARM_TRACE_CPU_FAULTS");if(!setting || !*setting)return 0U;
+        const std::string_view text{setting};unsigned value{};const auto parsed=std::from_chars(text.data(),text.data()+text.size(),value);
+        return parsed.ec==std::errc{} && parsed.ptr==text.data()+text.size() && value<=4096?value:0U;
+    }();
+    if(!limit)return;
+    try {
+        using Key=std::tuple<std::uint32_t,std::uint64_t,std::array<std::uint8_t,15>,unsigned>;
+        static std::mutex lock;static std::set<Key> recorded;
+        const std::lock_guard guard(lock);if(recorded.size()>=limit)return;
+        std::array<std::uint8_t,15> bytes{};unsigned size{};
+        for(;size<bytes.size() && state.rip.value<=UINT64_MAX-size;++size)
+            try{bytes[size]=static_cast<std::uint8_t>(memory.load(GuestAddress{state.rip.value+size},8));}catch(const MemoryFault&){break;}
+        if(!recorded.emplace(code,state.rip.value,bytes,size).second)return;
+        std::array<char,31> hex{};constexpr char digits[]="0123456789abcdef";
+        for(unsigned i=0;i<size;++i){hex[2*i]=digits[bytes[i]>>4];hex[2*i+1]=digits[bytes[i]&15];}
+        std::fprintf(stderr,"[cpu_fault_instruction] pid=%llu thread=%llu code=%08x rip=%llx bytes=%s\n",
+            static_cast<unsigned long long>(pid),static_cast<unsigned long long>(thread),code,
+            static_cast<unsigned long long>(state.rip.value),hex.data());
+    }catch(...){/* 診斷不得變更客體例外結果。 */}
+}
+}
+namespace detail {
+void trace_handler_resume_instruction(const GuestState& state,const GuestMemory& memory,std::uint32_t code,std::uint64_t origin,std::uint64_t pid,std::uint64_t thread) noexcept {
+    // handler 可能將 CONTEXT 指向另一段程式碼；唯讀記錄其返回時的指令，
+    // 不將稍後的記憶體快照誤認為當時將執行的內容。continue handler 尚可修改它。
+    struct Settings {
+        unsigned limit{},count{};
+        std::array<std::pair<std::uint64_t,std::uint64_t>,8> ranges{};
+    };
+    static const Settings settings=[] {
+        Settings result;
+        const auto* value=std::getenv("X64ARM_TRACE_HANDLER_RESUME");if(!value || !*value)return result;
+        const std::string_view text{value};unsigned limit{};
+        const auto number=std::from_chars(text.data(),text.data()+text.size(),limit);
+        if(number.ec!=std::errc{} || number.ptr!=text.data()+text.size() || !limit || limit>4096)return result;
+        const auto* filter=std::getenv("X64ARM_TRACE_HANDLER_RESUME_RANGES");
+        if(filter && *filter){
+            std::string_view ranges{filter};if(ranges.size()>512)return result;
+            while(!ranges.empty()){
+                if(result.count==result.ranges.size())return Settings{};
+                const auto comma=ranges.find(',');const auto item=ranges.substr(0,comma);const auto dash=item.find('-');
+                if(dash==item.npos)return Settings{};
+                const auto hex=[](std::string_view text,std::uint64_t& output){
+                    if(text.starts_with("0x") || text.starts_with("0X"))text.remove_prefix(2);
+                    const auto parsed=std::from_chars(text.data(),text.data()+text.size(),output,16);
+                    return !text.empty() && parsed.ec==std::errc{} && parsed.ptr==text.data()+text.size();
+                };
+                std::uint64_t begin{},end{};
+                if(!hex(item.substr(0,dash),begin) || !hex(item.substr(dash+1),end) || begin>=end)return Settings{};
+                result.ranges[result.count++]={begin,end};
+                if(comma==ranges.npos)break;
+                ranges.remove_prefix(comma+1);if(ranges.empty())return Settings{};
+            }
+        }
+        result.limit=limit;return result;
+    }();
+    if(!settings.limit)return;
+    if(settings.count && std::none_of(settings.ranges.begin(),settings.ranges.begin()+settings.count,
+        [&](const auto& range){return origin>=range.first && origin<range.second;}))return;
+    try {
+        using Key=std::tuple<std::uint32_t,std::uint64_t,std::uint64_t,std::array<std::uint8_t,32>,unsigned,
+                             std::array<std::uint8_t,64>,unsigned>;
+        static std::mutex lock;static std::set<Key> recorded;
+        const std::lock_guard guard(lock);if(recorded.size()>=settings.limit)return;
+        std::array<std::uint8_t,32> bytes{};unsigned size{};
+        for(;size<bytes.size() && state.rip.value<=UINT64_MAX-size;++size)try{
+            const GuestAddress address{state.rip.value+size};memory.check(address,1,Access::Execute);
+            bytes[size]=static_cast<std::uint8_t>(memory.load(address,8));
+        }catch(const MemoryFault&){break;}
+        // handler 可以把 RIP 移到小型 trampoline；同時保存原故障位置的
+        // 有界可執行前綴，避免將稍後重新加密的內容誤認為續行當下的指令。
+        std::array<std::uint8_t,64> original{};unsigned original_size{};
+        for(;original_size<original.size() && origin<=UINT64_MAX-original_size;++original_size)try{
+            const GuestAddress address{origin+original_size};memory.check(address,1,Access::Execute);
+            original[original_size]=static_cast<std::uint8_t>(memory.load(address,8));
+        }catch(const MemoryFault&){break;}
+        if(!size || !recorded.emplace(code,origin,state.rip.value,bytes,size,original,original_size).second)return;
+        std::array<char,65> hex{};constexpr char digits[]="0123456789abcdef";
+        for(unsigned i=0;i<size;++i){hex[2*i]=digits[bytes[i]>>4];hex[2*i+1]=digits[bytes[i]&15];}
+        std::array<char,129> original_hex{};
+        for(unsigned i=0;i<original_size;++i){original_hex[2*i]=digits[original[i]>>4];original_hex[2*i+1]=digits[original[i]&15];}
+        // 暫存器來自即將恢復的 CONTEXT；同一快照仍只記第一次，並非完整呼叫序列。
+        std::fprintf(stderr,"[handler_resume_instruction] pid=%llu thread=%llu code=%08x origin=%llx rip=%llx bytes=%s origin_bytes=%s rax=%llx rcx=%llx rdx=%llx r8=%llx r9=%llx rsp=%llx flags=%llx\n",
+            static_cast<unsigned long long>(pid),static_cast<unsigned long long>(thread),code,
+            static_cast<unsigned long long>(origin),static_cast<unsigned long long>(state.rip.value),hex.data(),original_hex.data(),
+            static_cast<unsigned long long>(state.reg(Gpr::Rax)),static_cast<unsigned long long>(state.reg(Gpr::Rcx)),
+            static_cast<unsigned long long>(state.reg(Gpr::Rdx)),static_cast<unsigned long long>(state.reg(Gpr::R8)),
+            static_cast<unsigned long long>(state.reg(Gpr::R9)),static_cast<unsigned long long>(state.reg(Gpr::Rsp)),
+            static_cast<unsigned long long>(state.rflags));
+    }catch(...){/* 診斷不得改變 CONTEXT、記憶體或例外結果。 */}
+}
+}
+namespace {
+void trace_fault_memory(const GuestState& state,const GuestMemory& memory,std::uint64_t pid,std::uint64_t thread,bool terminal=false) noexcept {
     if(!std::getenv("X64ARM_TRACE_FAULT_MEMORY"))return;
     static std::atomic<unsigned> samples{};
-    const auto sample=samples.fetch_add(1,std::memory_order_relaxed);if(sample>=16)return;
+    const auto sample=samples.fetch_add(1,std::memory_order_relaxed);if(sample>=16 && !terminal)return;
     try{
         constexpr std::array registers{Gpr::Rax,Gpr::Rcx,Gpr::Rdx,Gpr::Rbx,Gpr::Rsp,Gpr::Rbp,Gpr::Rsi,Gpr::Rdi,
             Gpr::R8,Gpr::R9,Gpr::R10,Gpr::R11,Gpr::R12,Gpr::R13,Gpr::R14,Gpr::R15};
         constexpr std::array names{"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15"};
         std::ostringstream out;out<<"[fault_context] pid="<<pid<<" thread="<<thread<<" sample="<<sample
-            <<" rip=0x"<<std::hex<<state.rip.value<<" rflags=0x"<<state.rflags<<'\n';
+            <<" terminal="<<terminal<<" rip=0x"<<std::hex<<state.rip.value<<" rflags=0x"<<state.rflags<<'\n';
+        out<<"[fault_instruction] begin=0x"<<state.rip.value;
+        for(unsigned i=0;i<32 && state.rip.value<=UINT64_MAX-i;++i)try{out<<' '<<memory.load(GuestAddress{state.rip.value+i},8);}catch(const MemoryFault&){out<<" unreadable";break;}
+        out<<'\n';
+        if(terminal)try{
+            const auto pc=memory.load(GuestAddress{state.reg(Gpr::Rsp)},memory.execution_mode()==ExecutionMode::X86?32:64);
+            if(pc>=32){out<<"[fault_return_site] begin=0x"<<pc-32;
+                for(unsigned i=0;i<64;++i)try{out<<' '<<memory.load(GuestAddress{pc-32+i},8);}catch(const MemoryFault&){out<<" unreadable";break;}
+                out<<'\n';}
+        }catch(const MemoryFault&){}
         const bool regions=sample<4 && std::getenv("X64ARM_TRACE_FAULT_REGIONS");
         const bool pointers=sample<4 && std::getenv("X64ARM_TRACE_FAULT_POINTERS");
         const bool pages=sample<2 && std::getenv("X64ARM_TRACE_FAULT_PAGES");
@@ -144,6 +257,8 @@ GuestState read_jump_buffer(const GuestMemory& memory, std::uint64_t address, co
     return restored;
 }
 }
+// RtlRestoreContext 的 STATUS_LONGJUMP 路徑共用同一個 jmp_buf 讀取。
+GuestState restore_jump_buffer(const GuestMemory& memory,std::uint64_t address,const GuestState& state,std::uint32_t value){return read_jump_buffer(memory,address,state,value);}
 bool WindowsServices::dispatch_cpu_trap(GuestState& state,GuestMemory& memory,std::uint32_t code,unsigned length){
     // CPU 保存 trap 後的 RIP；Windows breakpoint 的 EXCEPTION_RECORD／CONTEXT 指向 CC 本身。
     if(code==0x80000003U && length)state.rip.value=(state.rip.value-1)&(x86_?UINT32_MAX:UINT64_MAX);
@@ -151,10 +266,15 @@ bool WindowsServices::dispatch_cpu_trap(GuestState& state,GuestMemory& memory,st
 }
 bool WindowsServices::dispatch_cpu_exception(GuestState& state, GuestMemory& memory, std::uint32_t code) {
     d3d11_stream_quiesced();
+    trace_cpu_fault_instruction(state,memory,code,process_id(),threads_.current);
+    trace_fault_memory(state,memory,process_id(),threads_.current);
     // 核心驅動映像內的特權 I/O 指令由虛擬平台模擬後續跑；未模擬者仍依 #GP 交給例外處理。
     if(code==0xc0000096U && emulate_kernel_instruction(state,memory))return true;
     prune_x86_exception_callbacks(state,memory);
     if(emit_debug_event(state,memory,debugger::Exception{code,0,0,state.rip.value,{},true})==debugger::handled)return true;
+    if(!x86_ && runtime_.modules.contains("ntdll.dll")){
+        begin_exception(state,memory,code,0,{});enter_user_exception(state,memory);return true;
+    }
     const bool module_functions=std::any_of(runtime_.loaded_modules.begin(),runtime_.loaded_modules.end(),[](const auto& entry){return !entry.second.image.functions.empty();}) ||
         std::any_of(runtime_.dynamic_function_tables.begin(),runtime_.dynamic_function_tables.end(),[](const auto& entry){return entry.count!=0 || entry.callback;});
     const bool etw_callback=std::any_of(runtime_.callbacks.begin(),runtime_.callbacks.end(),[](const auto& frame){return frame.continuation==Continuation::EtwProcess;});
@@ -197,18 +317,61 @@ bool WindowsServices::dispatch_fault(GuestState& state, GuestMemory& memory, con
     if(release_stack_guard(state,memory,fault.address.value)){
         constexpr std::uint32_t overflow=0xc00000fdU;
         if(emit_debug_event(state,memory,debugger::Exception{overflow,0,0,state.rip.value,{},true})==debugger::handled)return true;
-        begin_exception(state,memory,overflow,0,{});return true;
+        begin_exception(state,memory,overflow,0,{});enter_user_exception(state,memory);return true;
     }
     const std::array<std::uint64_t, 2> parameters{fault.access == Access::Write ? 1U : fault.access == Access::Execute ? 8U : 0U, fault.address.value};
     auto code=0xc0000005U;const auto page=fault.address.value&~UINT64_C(4095);
     if(auto protection=runtime_.virtual_page_protections.find(page);protection!=runtime_.virtual_page_protections.end() && (protection->second.mode&0x100U)){
         const auto mode=protection->second.mode&~0x100U;
-        const Permissions access=mode==2?1:mode==4 || mode==8?3:mode==16?4:mode==32?5:7;
+        const Permissions access=mode==2?1:mode==4 || mode==8?3:mode==16 || mode==32?5:7; // PAGE_EXECUTE 實際可讀（與 VirtualProtect 相同）
         if(mode==8 || mode==128)memory.make_copy_on_write(GuestAddress{page},4096,access);else memory.protect(GuestAddress{page},4096,access);
+        detail::arm_write_watch(runtime_,memory,page,page+4096);
         protection->second.mode=mode;code=0x80000001U;
     }
     if(emit_debug_event(state,memory,debugger::Exception{code,0,0,state.rip.value,{parameters.begin(),parameters.end()},true})==debugger::handled)return true;
-    begin_exception(state, memory, code, 0, parameters); return true;
+    begin_exception(state, memory, code, 0, parameters);enter_user_exception(state,memory);return true;
+}
+bool WindowsServices::enter_user_exception(GuestState& state,GuestMemory& memory){
+    if(x86_ || exceptions_.stack.empty())return false;
+    const auto module=runtime_.modules.find("ntdll.dll");if(module==runtime_.modules.end())return false;
+    const auto* image=module_image(module->second);if(!image)return false;
+    const auto name=image->export_names.find("KiUserExceptionDispatcher");if(name==image->export_names.end())return false;
+    const auto entry=image->base+image->export_ordinals.at(name->second);
+    auto& dispatch=exceptions_.stack.back();const auto& origin=dispatch.original;
+    // CONTEXT(0x4d0)、EXCEPTION_RECORD(0x98)、對齊欄位及 MACHINE_FRAME(0x28)。
+    constexpr std::uint64_t frame_size=0x598;
+    if(origin.reg(Gpr::Rsp)<frame_size)return false;
+    const auto stack=(origin.reg(Gpr::Rsp)-frame_size)&~UINT64_C(15);
+    // 堆疊耗盡時仍保留既有 emergency arena 的派送，不再遞迴觸發相同 guard fault。
+    try{memory.check(GuestAddress{stack},frame_size,Access::Write);}catch(const MemoryFault&){return false;}
+    memory.write(GuestAddress{stack},std::array<std::uint8_t,frame_size>{});
+    write_context(memory,stack,origin);
+    std::array<std::uint8_t,0x98> record{};memory.read(GuestAddress{dispatch.record},record);memory.write(GuestAddress{stack+0x4d0},record);
+    memory.store(GuestAddress{stack+0x570},64,origin.rip.value);memory.store(GuestAddress{stack+0x578},64,0x33);
+    memory.store(GuestAddress{stack+0x580},64,memory.load(GuestAddress{stack+0x44},32));
+    memory.store(GuestAddress{stack+0x588},64,origin.reg(Gpr::Rsp));memory.store(GuestAddress{stack+0x590},64,0x2b);
+    dispatch.native_stack=stack;dispatch.native_entry=entry;
+    state=origin;state.reg(Gpr::Rsp)=stack;state.reg(Gpr::Rcx)=stack;state.reg(Gpr::Rdx)=stack+0x4d0;state.rip=GuestAddress{entry};
+    enter_process_instrumentation(state);
+    return true;
+}
+std::optional<std::uint32_t> WindowsServices::finish_user_exception_entry(GuestState& state,GuestMemory& memory){
+    if(x86_)throw HostCallFault("KiUserExceptionDispatcher 需要 x64 核心堆疊 ABI");
+    const auto stack=state.reg(Gpr::Rsp);memory.check(GuestAddress{stack},0x598,Access::Read);
+    const auto count=memory.load(GuestAddress{stack+0x4d0+24},32);if(count>15)throw HostCallFault("使用者例外紀錄參數超過上限");
+    // 入口也可由客體以標準框架直接轉入；共用同一套 VEH／SEH 狀態，不假造成功。
+    if(exceptions_.stack.empty() || exceptions_.stack.back().native_stack!=stack){
+        auto origin=read_context(memory,stack,state);std::vector<std::uint64_t> parameters;
+        for(unsigned i=0;i<count;++i)parameters.push_back(memory.load(GuestAddress{stack+0x4d0+32+i*8},64));
+        begin_exception(origin,memory,static_cast<std::uint32_t>(memory.load(GuestAddress{stack+0x4d0},32)),static_cast<std::uint32_t>(memory.load(GuestAddress{stack+0x4d0+4},32)),parameters);
+    }
+    auto& dispatch=exceptions_.stack.back();
+    std::array<std::uint8_t,0x4d0> context{};memory.read(GuestAddress{stack},context);memory.write(GuestAddress{dispatch.context},context);
+    std::array<std::uint8_t,0x98> record{};memory.read(GuestAddress{stack+0x4d0},record);memory.write(GuestAddress{dispatch.record},record);
+    dispatch.code=static_cast<std::uint32_t>(memory.load(GuestAddress{dispatch.record},32));dispatch.flags=static_cast<std::uint32_t>(memory.load(GuestAddress{dispatch.record+4},32));
+    dispatch.original=read_context(memory,dispatch.context,dispatch.original);dispatch.walk=dispatch.original;
+    dispatch.native_stack=0;dispatch.native_entry=0;state=dispatch.original;state.rip=exception_entry_;
+    return advance_exception(state,memory);
 }
 void WindowsServices::begin_exception(GuestState& state, GuestMemory& memory, std::uint32_t code, std::uint32_t flags_value, std::span<const std::uint64_t> parameters) {
     if(std::getenv("X64ARM_TRACE_FAULTS"))std::cerr<<"[exception] thread="<<threads_.current<<" code=0x"<<std::hex<<code<<" rip=0x"<<state.rip.value<<" rsp=0x"<<state.reg(Gpr::Rsp)<<std::dec<<'\n';
@@ -254,6 +417,12 @@ void WindowsServices::begin_exception(GuestState& state, GuestMemory& memory, st
     exceptions_.stack.push_back(std::move(dispatch));sync_msvc_uncaught(memory); state.rip = exception_entry_;
 }
 std::optional<bool> WindowsServices::append_exception_frame(GuestState& state,GuestMemory& memory, ExceptionDispatch& dispatch) {
+    // 準備回呼內的巢狀例外可跨越核心建立的框架，從原 CONTEXT 繼續搜尋。
+    if(!x86_)for(std::size_t i=exceptions_.stack.size();i>0;--i){const auto& outer=exceptions_.stack[i-1];
+        if(&outer!=&dispatch && outer.native_stack && dispatch.walk.rip.value>=outer.native_entry && dispatch.walk.rip.value<outer.native_entry+32 && dispatch.walk.reg(Gpr::Rsp)==outer.native_stack){
+            dispatch.walk=read_context(memory,outer.native_stack,outer.original);dispatch.walk_exception_depth=i-1;dispatch.walk_callback_depth=outer.callback_depth;break;
+        }
+    }
     while(handles(dispatch.walk.rip)) {
         if(dispatch.walk.rip.value==callback_return_.value+0xe0){
             const auto& calls=threads_.items.at(threads_.current).system_calls;const auto found=std::find_if(calls.rbegin(),calls.rend(),[&](const auto& frame){return dispatch.walk.reg(Gpr::Rsp)==frame.stack+8;});
@@ -338,6 +507,10 @@ std::optional<bool> WindowsServices::append_exception_frame(GuestState& state,Gu
     const auto unwind=virtual_unwind(memory,image?*image:leaf_image,pc,dispatch.walk,3);
     dispatch.function_query_ready=false;
     if(unwind.caller.reg(Gpr::Rsp)<=dispatch.walk.reg(Gpr::Rsp))throw HostCallFault("例外 unwind 未向上推進堆疊");
+    // 診斷：逐框架列出查到的函式表項目、處理常式與展開後的呼叫者。
+    if(std::getenv("X64ARM_TRACE_FAULTS"))std::cerr<<"[exception_frame] index="<<dispatch.frames.size()<<" pc=0x"<<std::hex<<pc<<" rsp=0x"<<dispatch.walk.reg(Gpr::Rsp)
+        <<" entry=0x"<<unwind.function_entry<<" handler=0x"<<unwind.handler<<" flags="<<unwind.handler_flags<<" establisher=0x"<<unwind.establisher
+        <<" caller=0x"<<unwind.caller.rip.value<<" caller_rsp=0x"<<unwind.caller.reg(Gpr::Rsp)<<std::dec<<'\n';
     dispatch.frames.push_back({dispatch.walk,pc,unwind,dispatch.walk_callback_depth,dispatch.walk_exception_depth,dispatch.walk_scope_index});
     dispatch.walk_scope_index=0;return true;
 }
@@ -376,6 +549,10 @@ std::optional<std::uint32_t> WindowsServices::advance_exception(GuestState& stat
     auto& dispatch = exceptions_.stack.back();
     const auto call = [&](std::uint64_t handler, std::vector<std::uint64_t> arguments) {
         state = dispatch.consolidate_record?dispatch.consolidate_origin:dispatch.original;
+        if(state.reg(Gpr::Rsp)<256){
+            trace_fault_memory(state,memory,process_id(),threads_.current,true);
+            if(std::getenv("X64ARM_TRACE_FAULT_MEMORY"))std::cerr<<"[exception_stack_failure] code=0x"<<std::hex<<dispatch.code<<" handler=0x"<<handler<<" context=0x"<<dispatch.context<<" record=0x"<<dispatch.record<<std::dec<<" stage="<<static_cast<unsigned>(dispatch.stage)<<'\n';
+        }
         start_callbacks(state, memory, {{handler, std::move(arguments)}}, Continuation::Exception);
     };
     if (dispatch.stage == ExceptionStage::Vectored) {
@@ -468,6 +645,7 @@ std::optional<std::uint32_t> WindowsServices::advance_exception(GuestState& stat
         }
         exceptions_.stack.pop_back();sync_msvc_uncaught(memory);
         if(disposition==debugger::handled)return std::nullopt;
+        trace_fault_memory(state,memory,process_id(),threads_.current,true);
         (void)emit_debug_event(state,memory,debugger::ExitProcess{code==0xe06d7363U?3U:code});return code==0xe06d7363U?3U:code;
     }
     throw HostCallFault("例外派送狀態不合法");
@@ -481,6 +659,7 @@ std::optional<std::uint32_t> WindowsServices::resume_exception(GuestState& state
     if (resume) {
         if (dispatch.flags & 1) throw HostCallFault("handler 嘗試繼續不可繼續的例外");
         state = read_context(memory, dispatch.context, dispatch.original);
+        detail::trace_handler_resume_instruction(state,memory,dispatch.code,dispatch.original.rip.value,process_id(),threads_.current);
         std::vector<GuestCallback> callbacks;
         for (const auto& handler : exceptions_.continue_vectors) callbacks.push_back({handler.second,{dispatch.pointers}});
         if (!callbacks.empty()) start_callbacks(state,memory,std::move(callbacks),Continuation::ContinueException);
@@ -581,7 +760,7 @@ std::optional<std::uint32_t> WindowsServices::seh_finally_result(GuestState& sta
 // invoke_exception 的描述項：登錄與處理函式放在同一個檔案（群組＝路由單位）。
 std::span<const WindowsServiceDescriptor> exception_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
-        {"crt","__crtUnhandledException",1},{"crt","__crtCapturePreviousContext",1},{"kernel32.dll", "DebugBreak", 0},{"kernel32.dll", "UnhandledExceptionFilter", 1},
+        {"crt","__crtUnhandledException",1},{"crt","__crtCapturePreviousContext",1},{"crt","__crtCaptureCurrentContext",1},{"kernel32.dll", "DebugBreak", 0},{"kernel32.dll", "UnhandledExceptionFilter", 1},
         {"kernel32.dll", "RtlUnwind", 4},{"ntdll.dll", "RtlUnwind", 4},{"kernel32.dll", "RaiseFailFastException", 3},{"kernel32.dll", "RtlAddFunctionTable", 3,1U<<2},
         {"ntdll.dll", "RtlAddFunctionTable", 3,1U<<2},{"kernel32.dll", "RtlDeleteFunctionTable", 1},{"ntdll.dll", "RtlDeleteFunctionTable", 1},{"kernel32.dll", "RtlInstallFunctionTableCallback", 6},
         {"ntdll.dll", "RtlInstallFunctionTableCallback", 6},{"ntdll.dll", "RtlAddGrowableFunctionTable", 6},{"ntdll.dll", "RtlGrowFunctionTable", 2},{"ntdll.dll", "RtlDeleteGrowableFunctionTable", 1},
@@ -697,7 +876,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
         if(emit_debug_event(caller,memory,debugger::Exception{code,flags_value,0,caller.rip.value,parameters,true})!=debugger::handled)
             begin_exception(caller, memory, code, flags_value, parameters);
         state = caller; return std::nullopt;
-    } else if (symbol == "RtlCaptureContext" || symbol=="__crtCapturePreviousContext") {
+    } else if (symbol == "RtlCaptureContext" || symbol=="__crtCapturePreviousContext" || symbol=="__crtCaptureCurrentContext") {
         auto caller = state; arg.return_to(caller,state.reg(Gpr::Rax));
         // 共用入口已彈出 CRT wrapper；再依實際 unwind metadata 取得上一層框架。
         if(symbol=="__crtCapturePreviousContext" && !x86_) {
@@ -709,7 +888,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
         }
         write_context(memory,arg(0),caller);
     } else if (symbol == "RtlPcToFileHeader") {
-        if(const auto* image=module_image(arg(0),true))result=image->base;
+        if(const auto* image=module_image(arg(0),true);image && !image->private_code)result=image->base;
         memory.store(GuestAddress{arg(1)},x86_?32:64,result);
     } else if (symbol == "RtlLookupFunctionEntry") {
         if(arg(2))memory.check(GuestAddress{arg(2)},216,Access::Write);

@@ -713,13 +713,13 @@ _guest__unlock_locales_end:
 // 長字串、尾綴、特殊值、非就近捨入及超界一律使用原 strtod 完整契約。
 decimal_to_double_routine strtod, 1
 
-// kernel32 HeapAlloc／HeapFree：程序堆積（0x200）與 malloc／free 共用配置區鎖及級距串列（UCRT 同樣以程序堆積配置）。
+// kernel32 HeapAlloc／HeapFree：程序堆積（handle 0x7ffd0000，與 WindowsServices::process_heap 相同）與 malloc／free 共用配置區鎖及級距串列（UCRT 同樣以程序堆積配置）。
 // 配置旗標只收 0／HEAP_ZERO_MEMORY、釋放只收 0；狀態頁 +32 非零表示程序堆積正被 HeapLock 持有。
 // 私有 heap、其他旗標、NULL、超過上限、空串列、非配置區或非程序堆積 chunk 一律以原參數尾跳原服務。
 .p2align 6
 .globl _guest_HeapAlloc
 _guest_HeapAlloc:
-    cmp rcx, 0x200
+    cmp rcx, 0x7ffd0000
     jne LHeapAlloc_slow
     test edx, -9
     jne LHeapAlloc_slow
@@ -775,7 +775,7 @@ _guest_HeapAlloc_end:
 .p2align 6
 .globl _guest_HeapFree
 _guest_HeapFree:
-    cmp rcx, 0x200
+    cmp rcx, 0x7ffd0000
     jne LHeapFree_slow
     test edx, edx
     jne LHeapFree_slow

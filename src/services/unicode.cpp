@@ -160,6 +160,16 @@ std::string utf16_to_utf8(std::u16string_view text) {
     }
     return result;
 }
+void replace_lone_surrogates(std::u16string& text) {
+    for(std::size_t i=0;i<text.size();++i){
+        const auto c=text[i];
+        if(c>=0xd800 && c<=0xdbff){if(i+1<text.size() && text[i+1]>=0xdc00 && text[i+1]<=0xdfff)++i;else text[i]=u'\ufffd';}
+        else if(c>=0xdc00 && c<=0xdfff)text[i]=u'\ufffd';
+    }
+}
+std::string utf16_to_utf8_lossy(std::u16string_view text) {
+    std::u16string copy(text);replace_lone_surrogates(copy);return utf16_to_utf8(copy);
+}
 std::u16string read_utf16_counted(const GuestMemory& memory,GuestAddress address,std::size_t count) {
     std::u16string result;
     if(!count)return result;

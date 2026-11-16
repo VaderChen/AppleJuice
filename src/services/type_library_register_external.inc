@@ -37,7 +37,7 @@ return service_callback::invoke<std::optional<std::uint32_t>>(
                 for(unsigned n=0;n<2;++n){auto release=std::move(releases.back());releases.pop_back();(void)co_await service_callback::call(release.target,std::move(release.arguments));}
             }
             runtime_.type_libraries.views.emplace(scratch,TypeLibraryView{model,utf16_to_utf8(path),scratch,-1,1});
-            register_type_library(scratch,path,help);
+            register_type_library(scratch,path,help,service.symbol=="RegisterTypeLibForUser"?1U:0U);
         }catch(const typelib::Error& error){result=error.code;}catch(const MemoryFault&){result=0x80070057U;}catch(const std::bad_alloc&){result=nomemory;}
         while(!releases.empty()){auto release=std::move(releases.back());releases.pop_back();(void)co_await service_callback::call(release.target,std::move(release.arguments));}
         call.return_to(s,result);co_return std::nullopt;

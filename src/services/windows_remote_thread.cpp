@@ -43,7 +43,7 @@ std::uint32_t WindowsServices::begin_remote_thread_creation(GuestMemory& memory,
         std::vector<std::uint8_t> request(rpc::header_size+bootstrap.security_descriptor.size()+context.size());
         rpc::put(request,0,rpc::signature,8);rpc::put(request,8,1);rpc::put(request,16,x86_?32:64);
         const auto flags=(outputs.suspended?1U:0U)|(bootstrap.skip_thread_attach?2U:0U)|(bootstrap.hidden_from_debugger?4U:0U)|
-            (bootstrap.context?8U:0U)|(outputs.default_stack?16U:0U);
+            (bootstrap.context?8U:0U)|(outputs.default_stack?16U:0U)|(bootstrap.bypass_process_freeze?32U:0U);
         rpc::put(request,20,flags);rpc::put(request,24,bootstrap.access);rpc::put(request,28,bootstrap.security_descriptor.size());
         rpc::put(request,32,entry,8);rpc::put(request,40,parameter,8);rpc::put(request,48,stack,8);
         rpc::put(request,56,bootstrap.stack_low,8);rpc::put(request,64,bootstrap.stack_high,8);rpc::put(request,72,bootstrap.stack_allocation,8);
@@ -148,11 +148,12 @@ std::uint32_t WindowsServices::receive_remote_thread_creation(GuestMemory& memor
         if(operations.size()>=1024)return 8;
         if(channel->phase().load(std::memory_order_acquire))return 995;
         const auto bytes=channel->read();const auto flags=rpc::get(bytes,20),security_size=rpc::get(bytes,28),context_size=rpc::get(bytes,80);
-        if(rpc::get(bytes,0,8)!=rpc::signature || rpc::get(bytes,8)!=1 || rpc::get(bytes,16)!=mode || (flags&~31U) || rpc::get(bytes,84) ||
+        if(rpc::get(bytes,0,8)!=rpc::signature || rpc::get(bytes,8)!=1 || rpc::get(bytes,16)!=mode || (flags&~63U) || rpc::get(bytes,84) ||
            security_size>bytes.size()-rpc::header_size || context_size!=bytes.size()-rpc::header_size-security_size ||
            ((flags&8U)?context_size!=thread_context::size(x86_?ExecutionMode::X86:ExecutionMode::X64):context_size!=0))return 13;
         GuestThreadBootstrap bootstrap;bootstrap.access=0x1fffffU;
         bootstrap.skip_thread_attach=(flags&2U)!=0;bootstrap.hidden_from_debugger=(flags&4U)!=0;
+        bootstrap.bypass_process_freeze=(flags&32U)!=0;
         bootstrap.security_descriptor.assign(bytes.begin()+rpc::header_size,bytes.begin()+rpc::header_size+static_cast<std::ptrdiff_t>(security_size));
         (void)security::parse_relative_descriptor(bootstrap.security_descriptor);
         GuestState initial;

@@ -52,13 +52,27 @@ std::int32_t coordinate(std::int64_t value){if(value<INT32_MIN || value>INT32_MA
 std::span<const WindowsServiceDescriptor> dib_transfer_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"gdi32.dll","GetDIBits",7},{"gdi32.dll","SetDIBits",7},
-        {"gdi32.dll","StretchDIBits",13},{"gdi32.dll","SetDIBitsToDevice",12}
+        {"gdi32.dll","StretchDIBits",13},{"gdi32.dll","SetDIBitsToDevice",12},
+        {"gdi32.dll","CreateDIBPatternBrushPt",2,0,0,2},{"gdi32.dll","CreateDIBPatternBrush",2,0,0,2}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_dib_transfer(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
     const auto d=[&](unsigned n){return static_cast<std::uint32_t>(arg(n));};const auto si=[&](unsigned n){return std::bit_cast<std::int32_t>(d(n));};std::uint64_t result=0;
     try {
+        if(symbol=="CreateDIBPatternBrushPt" || symbol=="CreateDIBPatternBrush"){
+            // packed DIB（BITMAPINFO、色表、像素）轉成與 CreatePatternBrush 相同的圖樣；HGLOBAL 版本經 GlobalLock 取得同一份資料。
+            const bool global=symbol=="CreateDIBPatternBrush";auto address=arg(0);
+            if(global){address=nested_service(state,memory,"kernel32.dll","GlobalLock",{arg(0)});if(!address)throw DibError{87};}
+            struct Unlock{WindowsServices& self;GuestState& s;GuestMemory& m;std::uint64_t handle;~Unlock(){if(handle)(void)self.nested_service(s,m,"kernel32.dll","GlobalUnlock",{handle});}} unlock{*this,state,memory,global?arg(0):0};
+            const auto format=dib_format(memory,address,d(1),true);
+            auto pattern=dib_band(memory,address+format.table_offset+format.table_count*format.table_entry,format,format.height);
+            pattern.bits_per_pixel=static_cast<std::uint16_t>(format.bpp);
+            const auto handle=gui_.next_object;gui_.brush_patterns.emplace(handle,std::move(pattern));
+            try{gui_.brushes.emplace(handle,0);gui_.brush_dib_patterns[handle]={d(1),arg(0)};}catch(...){gui_.brush_patterns.erase(handle);gui_.brushes.erase(handle);throw;}
+            ++gui_.next_object;result=handle;
+            arg.return_to(state,result);return std::nullopt;
+        }
         const bool get=symbol=="GetDIBits",set=symbol=="SetDIBits";
         if(get || set){
             const auto found=gui_.bitmaps.find(arg(1));if(found==gui_.bitmaps.end())throw DibError{6};auto& bitmap=found->second;

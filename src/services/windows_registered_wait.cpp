@@ -4,11 +4,13 @@
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> registered_wait_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
-        {"kernel32.dll","QueueUserWorkItem",3,0,0,0x4},{"kernel32.dll","RegisterWaitForSingleObject",6,0,0,0x30},{"kernel32.dll","UnregisterWait",1},{"kernel32.dll","UnregisterWaitEx",2},
+        {"kernel32.dll","QueueUserWorkItem",3,0,0,0x4},{"kernel32.dll","RegisterWaitForSingleObject",6,0,0,0x30},{"kernel32.dll","RegisterWaitForSingleObjectEx",5,0,0,0x18},{"kernel32.dll","UnregisterWait",1},{"kernel32.dll","UnregisterWaitEx",2},
         {"kernel32.dll","CreateTimerQueue",0},{"kernel32.dll","CreateTimerQueueTimer",7,0,0,0x70},
         {"kernel32.dll","ChangeTimerQueueTimer",4,0,0,0xc},{"kernel32.dll","DeleteTimerQueueTimer",3},
         {"kernel32.dll","DeleteTimerQueueEx",2},{"kernel32.dll","DeleteTimerQueue",1},
-        {"internal-threadpool","WaitDispatch",1}
+        {"internal-threadpool","WaitDispatch",1},{"internal-threadpool","ThreadpoolCleanupGroupWait",1},
+        {"kernel32.dll","CreateThreadpoolCleanupGroup",0},{"kernel32.dll","CloseThreadpoolCleanupGroup",1},{"kernel32.dll","CloseThreadpoolCleanupGroupMembers",3},
+        {"kernel32.dll","SetThreadpoolTimerEx",4,0,0,0xc},{"kernel32.dll","SetThreadpoolStackInformation",2},{"kernel32.dll","QueryThreadpoolStackInformation",2}
         ,{"kernel32.dll","CreateThreadpool",1},{"kernel32.dll","CloseThreadpool",1},
         {"kernel32.dll","SetThreadpoolThreadMaximum",2,0,0,0x2},{"kernel32.dll","SetThreadpoolThreadMinimum",2,0,0,0x2}
         ,{"kernel32.dll","CreateThreadpoolWork",3},{"kernel32.dll","SubmitThreadpoolWork",1},
@@ -109,22 +111,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_registered_wait(GuestState&
         if(const auto error=queue_pool_callback(state,memory,{arg(0),{arg(1)}}))return finish(0,error);
         return finish(1);
     }
-    if(name=="RegisterWaitForSingleObject"){
-        if(!arg(0)||!arg(2))return finish(0,87);
-        if(arg(5)&~UINT64_C(0x9c))return finish(0,50); // 不宣告 impersonation／APC I/O worker 能力。
-        const auto object=runtime_.wait_objects.find(arg(1));
-        if(object==runtime_.wait_objects.end() && !thread_id(arg(1)) && !process_signaled(arg(1)).has_value())return finish(0,6);
+    if(name=="RegisterWaitForSingleObject" || name=="RegisterWaitForSingleObjectEx"){
+        // Ex 版本沒有輸出參數、直接回傳等待 handle（失敗為 NULL），其餘參數依序前移。
+        const bool ex=name.ends_with("Ex");const auto a=[&](unsigned index){return arg(ex?index-1:index);};
+        if((!ex && !arg(0))||!a(2))return finish(0,87);
+        if(a(5)&~UINT64_C(0x9c))return finish(0,50); // 不宣告 impersonation／APC I/O worker 能力。
+        const auto object=runtime_.wait_objects.find(a(1));
+        if(object==runtime_.wait_objects.end() && !thread_id(a(1)) && !process_signaled(a(1)).has_value())return finish(0,6);
         if(object!=runtime_.wait_objects.end() && (object->second.kind==WaitObject::Kind::Mutex || !(object->second.access&0x100000)))return finish(0,87);
-        if(thread_id(arg(1)) && !(thread_access(arg(1))&0x100000))return finish(0,5);
-        memory.check(GuestAddress{arg(0)},x86_?4:8,Access::Write);memory.check(GuestAddress{arg(2)},1,Access::Execute);
+        if(thread_id(a(1)) && !(thread_access(a(1))&0x100000))return finish(0,5);
+        if(!ex)memory.check(GuestAddress{arg(0)},x86_?4:8,Access::Write);memory.check(GuestAddress{a(2)},1,Access::Execute);
         if(registered_waits_.size()>=64)return finish(0,8);
         const auto worker=acquire_wait_worker(state,memory,65536);if(!worker)return finish(0,last_error_);
-        const auto handle=next_registered_wait_++;RegisteredWait wait;wait.target=arg(1);wait.callback=arg(2);wait.parameter=arg(3);wait.worker=worker;
-        const auto milliseconds=static_cast<std::uint32_t>(arg(4));wait.flags=static_cast<std::uint32_t>(arg(5));
+        const auto handle=next_registered_wait_++;RegisteredWait wait;wait.target=a(1);wait.callback=a(2);wait.parameter=a(3);wait.worker=worker;
+        const auto milliseconds=static_cast<std::uint32_t>(a(4));wait.flags=static_cast<std::uint32_t>(a(5));
         wait.interval_ticks=milliseconds==UINT32_MAX?UINT64_MAX:std::uint64_t{milliseconds}*10000;
         wait.deadline=runtime_.clock_ticks+std::min(wait.interval_ticks,UINT64_MAX-runtime_.clock_ticks);
         registered_waits_.emplace(handle,wait);wait_workers_[worker]=handle;
         auto& thread=threads_.items.at(worker);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::RegisteredWait;thread.wait.deadline=wait.deadline;
+        if(ex)return finish(handle);
         memory.store(GuestAddress{arg(0)},x86_?32:64,handle);return finish(1);
     }
     auto& calling=threads_.items.at(threads_.current);

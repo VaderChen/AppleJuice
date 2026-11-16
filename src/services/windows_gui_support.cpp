@@ -24,6 +24,13 @@
 
 namespace x64arm {
 #include "windows_gui_timing.inc"
+// 目前執行緒的鍵盤配置名稱（KLID，8 位十六進位）；user32 GetKeyboardLayoutName 與主控台 GetConsoleKeyboardLayoutName 共用。
+std::u16string WindowsServices::keyboard_layout_name(){
+    std::uint32_t layout=0x409;if(native_gui_)for(const auto& method:native_input_methods())if(method.current){layout=method.layout;break;}
+    if(const auto selected=selected_keyboard_layout(threads_.current))layout=static_cast<std::uint32_t>(((selected>>16)&0xffffU)==(selected&0xffffU)?selected&0xffffU:selected);
+    std::u16string name(8,u'0');for(unsigned i=0;i<8;++i)name[7-i]=u"0123456789ABCDEF"[(layout>>(i*4))&15];
+    return name;
+}
 std::uint32_t WindowsServices::system_metric(std::uint32_t index,std::uint32_t dpi) {
     switch(index){
     case 0:case 1:{const auto area=gui_screen_area();return static_cast<std::uint32_t>(index==0?area[2]-area[0]:area[3]-area[1]);}
@@ -36,6 +43,7 @@ std::uint32_t WindowsServices::system_metric(std::uint32_t index,std::uint32_t d
         }
         return static_cast<std::uint32_t>(index==76?bounds[0]:index==77?bounds[1]:index==78?bounds[2]-bounds[0]:bounds[3]-bounds[1]);
     }
+    case 23:return gui_.mouse_buttons_swapped?1U:0U; // SM_SWAPBUTTON
     case 80:return static_cast<std::uint32_t>(gui_monitors().size());
     case 81:return 1;
     case 16:case 17:{const auto area=gui_work_area();return static_cast<std::uint32_t>(index==16?area[2]-area[0]:area[3]-area[1]);}
@@ -52,7 +60,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"user32.dll","DefFrameProcA",5},{"user32.dll","DefFrameProcW",5},
         {"user32.dll","DefMDIChildProcA",4},{"user32.dll","DefMDIChildProcW",4},
         {"user32.dll","CreateMDIWindowA",10},{"user32.dll","CreateMDIWindowW",10},
-        {"user32.dll","TranslateMDISysAccel",2},
+        {"user32.dll","TranslateMDISysAccel",2},{"user32.dll","ScrollChildren",4},{"user32.dll","CalcChildScroll",2},
         {"user32.dll","IsWindowUnicode",1},{"user32.dll","GetNextDlgTabItem",3},{"user32.dll","GetNextDlgGroupItem",3},
         {"dwmapi.dll","DwmIsCompositionEnabled",1},{"dwmapi.dll","DwmEnableComposition",1},
         {"dwmapi.dll","DwmExtendFrameIntoClientArea",2},{"dwmapi.dll","DwmEnableBlurBehindWindow",2},
@@ -65,7 +73,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         
         
         
-        {"kernel32.dll","InterlockedFlushSList",1},{"kernel32.dll","InterlockedPushEntrySList",2},{"kernel32.dll","InterlockedPopEntrySList",1},{"kernel32.dll","QueryDepthSList",1},{"kernel32.dll","InitializeSListHead",1}, {"kernel32.dll","FindResourceA",3},{"kernel32.dll","FindResourceExA",4},{"kernel32.dll","FindResourceExW",4},{"kernel32.dll","FindResourceW",3},
+        {"kernel32.dll","InterlockedFlushSList",1},{"kernel32.dll","InterlockedPushEntrySList",2},{"kernel32.dll","InterlockedPushListSListEx",4},{"ntdll.dll","RtlInterlockedPushListSListEx",4},{"kernel32.dll","InterlockedPopEntrySList",1},{"kernel32.dll","QueryDepthSList",1},{"kernel32.dll","InitializeSListHead",1}, {"kernel32.dll","FindResourceA",3},{"kernel32.dll","FindResourceExA",4},{"kernel32.dll","FindResourceExW",4},{"kernel32.dll","FindResourceW",3},
         {"kernel32.dll","LoadResource",2},{"kernel32.dll","LockResource",1},{"kernel32.dll","SizeofResource",2},
         {"kernel32.dll","MulDiv",3},
         {"ole32.dll","CoInitialize",1},{"ole32.dll","CoInitializeEx",2},{"ole32.dll","CoUninitialize",0},{"ole32.dll","CoCreateInstance",5,0,0,4},{"ole32.dll","CoGetClassObject",5,0,0,2},
@@ -75,6 +83,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"user32.dll","DialogBoxIndirectParamA",5},{"user32.dll","DialogBoxIndirectParamW",5},{"user32.dll","CreateDialogIndirectParamA",5},{"user32.dll","CreateDialogIndirectParamW",5},
         {"user32.dll","MessageBoxA",4},{"user32.dll","MessageBoxW",4},
         {"user32.dll","MessageBoxIndirectA",1},{"user32.dll","MessageBoxIndirectW",1},{"user32.dll","MessageBeep",1},
+        {"user32.dll","MessageBoxTimeoutA",6,0,0,0x38},{"user32.dll","MessageBoxTimeoutW",6,0,0,0x38},
         {"comctl32.dll","MakeDragList",1},{"comctl32.dll","LBItemFromPt",3},{"comctl32.dll","DrawInsert",3},
         {"ole32.dll","OleDuplicateData",3},
         {"shell32.dll","DragAcceptFiles",2},{"user32.dll","ClipCursor",1},{"user32.dll","GetClipCursor",1},{"user32.dll","AttachThreadInput",3},{"user32.dll","GetScrollPos",2},{"shell32.dll","DragQueryFileA",4},{"shell32.dll","DragQueryFileW",4},{"shell32.dll","DragQueryPoint",2},{"shell32.dll","DragFinish",1},
@@ -101,7 +110,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"user32.dll","GetClassLongPtrA",2},{"user32.dll","GetClassLongPtrW",2},{"user32.dll","SetClassLongPtrA",3},{"user32.dll","SetClassLongPtrW",3},
         {"user32.dll","GetClassWord",2},{"user32.dll","SetClassWord",3},
         {"user32.dll","GetClassNameA",3},{"user32.dll","GetClassNameW",3},{"user32.dll","RealGetWindowClassA",3},{"user32.dll","RealGetWindowClassW",3},{"user32.dll","RealGetWindowClass",3},
-        {"user32.dll","SetTimer",4},{"user32.dll","SetCoalescableTimer",5},{"user32.dll","KillTimer",2},{"user32.dll","GetQueueStatus",1},{"user32.dll","MsgWaitForMultipleObjects",5},{"user32.dll","MsgWaitForMultipleObjectsEx",5},
+        {"user32.dll","SetTimer",4},{"user32.dll","SetCoalescableTimer",5},{"user32.dll","KillTimer",2},{"user32.dll","SetSystemTimer",4},{"user32.dll","KillSystemTimer",2},{"user32.dll","GetQueueStatus",1},{"user32.dll","MsgWaitForMultipleObjects",5},{"user32.dll","MsgWaitForMultipleObjectsEx",5},
         {"user32.dll","GetKeyboardLayout",1},{"user32.dll","GetKeyboardLayoutNameA",1},{"user32.dll","GetKeyboardLayoutNameW",1},{"user32.dll","GetKeyboardLayoutList",2},{"user32.dll","TrackMouseEvent",1},{"comctl32.dll","_TrackMouseEvent",1},{"user32.dll","GetAsyncKeyState",1},{"user32.dll","GetLastInputInfo",1},{"user32.dll","GetKeyboardState",1},{"user32.dll","SetKeyboardState",1},
         {"user32.dll","CreateCaret",4},{"user32.dll","DestroyCaret",0},{"user32.dll","ShowCaret",1},{"user32.dll","HideCaret",1},{"user32.dll","SetCaretPos",2},{"user32.dll","GetCaretPos",1},
         {"user32.dll","SetScrollInfo",4},{"user32.dll","GetScrollInfo",3},{"user32.dll","GetScrollBarInfo",3},{"user32.dll","SetCursor",1},{"user32.dll","ShowCursor",1},
@@ -175,12 +184,35 @@ std::uint64_t WindowsServices::gui_resource(const GuestMemory& memory,std::uint6
     return 0;
 }
 #include "gui_window_position.inc"
+// 游標控制代碼對應的圖示：自訂游標、SetSystemCursor 取代的系統游標，或交給原生後台的系統游標識別（寫入 system）。
+const GuiIcon* WindowsServices::resolve_gui_cursor(std::uint64_t handle,GuiIcon& system) const {
+    if(const auto found=gui_.icons.find(handle);found!=gui_.icons.end())return found->second.is_icon?nullptr:&found->second;
+    if(handle<0xd000 || !gui_system_cursor_id(handle-0xd000))return nullptr;
+    const auto id=static_cast<std::uint32_t>(handle-0xd000);
+    if(const auto replaced=gui_.system_cursors.find(id);replaced!=gui_.system_cursors.end())return &replaced->second;
+    system=GuiIcon{};system.is_icon=false;system.system=id;return &system;
+}
+void WindowsServices::release_cursor_frames(std::uint64_t cursor){
+    // 共用游標不會被 DestroyCursor 銷毀，其幀控制代碼保留。
+    if(const auto found=gui_.icons.find(cursor);found==gui_.icons.end() || found->second.shared)return;
+    for(auto it=gui_.cursor_frames.begin();it!=gui_.cursor_frames.end();)if(it->first.first==cursor){gui_.icons.erase(it->second);it=gui_.cursor_frames.erase(it);}else ++it;
+}
+// 依目前游標（含動畫幀）重新設定原生游標：系統游標被取代或還原、拖放結束還原游標時共用。
+void WindowsServices::present_gui_cursor(){
+    if(!native_gui_ || !interactive_station())return;
+    GuiIcon system;const GuiIcon* icon=gui_.cursor?resolve_gui_cursor(gui_.cursor,system):nullptr;
+    if(icon && !icon->animation_sequence.empty()){
+        const auto step=icon_animation_step(*icon,runtime_.clock_ticks>=gui_.cursor_animation_start?runtime_.clock_ticks-gui_.cursor_animation_start:0);
+        icon=&icon->animation_frames.at(icon->animation_sequence[step]);gui_.cursor_animation_step=step;
+    }
+    (void)native_gui_->set_cursor(icon,gui_.cursor_count>=0 && icon);
+}
 std::uint64_t WindowsServices::load_gui_icon(GuestMemory& memory,std::uint64_t instance,std::uint64_t name,bool wide,std::uint32_t width,std::uint32_t height,bool intrinsic,bool first,bool cursor,std::uint32_t flags,bool prefer_larger){
     const auto fail=[&](std::uint32_t error){last_error_=error;return UINT64_C(0);};
     if(width>4096 || height>4096)return fail(87);
     try {
         if(cursor && !instance && name<=65535){
-            switch(name){case 32512:case 32513:case 32514:case 32515:case 32516:case 32640:case 32641:case 32642:case 32643:case 32644:case 32645:case 32649:case 32650:case 32651:return 0xd000+name;default:return fail(1814);}
+            return gui_system_cursor_id(name)?0xd000+name:fail(1814);
         }
         if(!cursor && !instance && name>=32512 && name<=32518){
 #ifndef __APPLE__
@@ -214,10 +246,40 @@ std::uint64_t WindowsServices::load_gui_icon(GuestMemory& memory,std::uint64_t i
         return store_gui_icon(std::move(icon),flags);
     }catch(const std::invalid_argument&){return fail(193);}catch(const std::bad_alloc&){return fail(8);}
 }
+std::pair<std::map<std::uint64_t,GuiSentMessage>::iterator,std::size_t> WindowsServices::active_gui_sent_message(std::uint64_t* text_token){
+    // 由內而外找本執行緒正在處理、且來自其他執行緒／程序（或已回覆）的傳送；同執行緒 SendMessage 不算。
+    for(auto index=runtime_.callbacks.size();index-->0;){
+        const auto& frame=runtime_.callbacks[index];
+        auto token=frame.continuation==Continuation::GuiSentMessage?frame.value:0;
+        if(frame.continuation==Continuation::GuiTextThunk){const auto text=gui_text_thunks_.find(frame.value);if(text!=gui_text_thunks_.end() && text->second.completion==Continuation::GuiSentMessage)token=text->second.value;}
+        if(!token)continue;const auto sent=gui_.sent_messages.find(token);
+        if(sent!=gui_.sent_messages.end() && sent->second.active && !sent->second.rpc && sent->second.receiver==threads_.current &&
+           ((sent->second.sender && sent->second.sender!=threads_.current) || sent->second.remote_server || sent->second.done)){
+            if(text_token && frame.continuation==Continuation::GuiTextThunk)*text_token=frame.value;
+            return {sent,index};
+        }
+    }
+    return {gui_.sent_messages.end(),runtime_.callbacks.size()};
+}
+std::optional<std::array<std::uint32_t,2>> WindowsServices::input_message_source(bool in_send_message){
+    const auto& thread=threads_.items.at(threads_.current);
+    const std::array<std::uint32_t,2> own{thread.message_source_device,thread.message_source_origin};
+    const auto [sent,cross]=active_gui_sent_message();
+    std::size_t local=runtime_.callbacks.size();
+    for(auto index=runtime_.callbacks.size();index-->0;)if(runtime_.callbacks[index].gui_sent_message){local=index;break;}
+    const bool sending=sent!=gui_.sent_messages.end() || local<runtime_.callbacks.size();
+    // SendMessage 送入的訊息（含系統產生者）在返回前一律不可用。
+    if(!in_send_message)return sending?std::array<std::uint32_t,2>{}:own;
+    if(!sending)return own[0]?std::nullopt:std::optional{std::array<std::uint32_t,2>{}};
+    // 最內層的傳送決定來源：跨執行緒取寄送端送出時的快照；同執行緒沿用送出前本執行緒的來源。
+    if(sent!=gui_.sent_messages.end() && (local==runtime_.callbacks.size() || cross>local))return std::array<std::uint32_t,2>{sent->second.source_device,sent->second.source_origin};
+    return own;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.symbol=="WinHelpA" || service.symbol=="WinHelpW")return invoke_winhelp(state,memory,service);
     if(service.symbol.starts_with("DefFrameProc") || service.symbol.starts_with("DefMDIChildProc") ||
-       service.symbol.starts_with("CreateMDIWindow") || service.symbol=="TranslateMDISysAccel")return invoke_mdi(state,memory,service);
+       service.symbol.starts_with("CreateMDIWindow") || service.symbol=="TranslateMDISysAccel" ||
+       service.symbol=="ScrollChildren" || service.symbol=="CalcChildScroll")return invoke_mdi(state,memory,service);
     const auto input_connected=[&](std::uint64_t target){return gui_input_connected(threads_.current,target);};
     if(service.symbol=="CreateCaret" || service.symbol=="DestroyCaret" || service.symbol=="ShowCaret" || service.symbol=="HideCaret" || service.symbol=="GetCaretPos" || service.symbol=="SetCaretPos")return invoke_gui_caret(state,memory,service);
 
@@ -244,14 +306,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         return false;
     };
     if(symbol=="InSendMessage" || symbol=="InSendMessageEx" || symbol=="ReplyMessage"){
-        auto active=gui_.sent_messages.end();std::uint64_t text_token=0;
-        for(auto frame=runtime_.callbacks.rbegin();frame!=runtime_.callbacks.rend();++frame){
-            auto token=frame->continuation==Continuation::GuiSentMessage?frame->value:0;
-            if(frame->continuation==Continuation::GuiTextThunk){const auto text=gui_text_thunks_.find(frame->value);if(text!=gui_text_thunks_.end() && text->second.completion==Continuation::GuiSentMessage)token=text->second.value;}
-            if(!token)continue;const auto sent=gui_.sent_messages.find(token);
-            if(sent!=gui_.sent_messages.end() && sent->second.active && !sent->second.rpc && sent->second.receiver==threads_.current &&
-               ((sent->second.sender && sent->second.sender!=threads_.current) || sent->second.remote_server || sent->second.done)){active=sent;if(frame->continuation==Continuation::GuiTextThunk)text_token=frame->value;break;}
-        }
+        std::uint64_t text_token=0;const auto active=active_gui_sent_message(&text_token).first;
         const auto flags=active==gui_.sent_messages.end()?0U:(active->second.kind==GuiSentMessage::Kind::Synchronous?1U:active->second.kind==GuiSentMessage::Kind::Notify?2U:4U)|(active->second.done?8U:0U);
         if(symbol=="ReplyMessage"){
             if(active!=gui_.sent_messages.end() && active->second.kind==GuiSentMessage::Kind::Synchronous){if(!active->second.done){
@@ -336,12 +391,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     else if(symbol.starts_with("GetClassLong") || symbol.starts_with("SetClassLong") || symbol=="GetClassWord" || symbol=="SetClassWord" || symbol.starts_with("GetClassInfo") || symbol.starts_with("UnregisterClass")){
 #include "windows_class_properties.inc"
     }
-    else if(symbol=="InitializeSListHead" || symbol=="InterlockedFlushSList" || symbol=="InterlockedPushEntrySList" || symbol=="InterlockedPopEntrySList" || symbol=="QueryDepthSList") {
+    else if(symbol=="InitializeSListHead" || symbol=="InterlockedFlushSList" || symbol=="InterlockedPushEntrySList" || symbol=="InterlockedPopEntrySList" || symbol=="QueryDepthSList" || symbol.ends_with("InterlockedPushListSListEx")) {
         const auto header=arg(0);
         if(symbol=="InitializeSListHead") {slist::check(memory,header,x86_,Access::Write);memory.write(GuestAddress{header},std::vector<std::uint8_t>(slist::size(x86_)));}
         else if(symbol=="QueryDepthSList")result=slist::depth(memory,header,x86_);
         else if(symbol=="InterlockedFlushSList")result=slist::flush(memory,header,x86_);
         else if(symbol=="InterlockedPushEntrySList")result=slist::push(memory,header,x86_,arg(1));
+        else if(symbol.ends_with("InterlockedPushListSListEx"))result=slist::push_list(memory,header,x86_,arg(1),arg(2),static_cast<std::uint32_t>(arg(3)));
         else result=slist::pop(memory,header,x86_);
     }
     else if(symbol=="MulDiv"){
@@ -435,7 +491,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     }else if(symbol=="GetTouchInputInfo" || symbol=="CloseTouchInputHandle"){
         // 沒有實體觸控來源便不產生 WM_TOUCH 或 HTOUCHINPUT；任意值不是有效封包。
         fail(6);
-    }else if(symbol=="SetTimer" || symbol=="SetCoalescableTimer"){
+    }else if(symbol=="SetTimer" || symbol=="SetCoalescableTimer" || symbol=="SetSystemTimer"){
+        // SetSystemTimer：與 SetTimer 相同的期限與 ID 規則，但送 WM_SYSTIMER，且與同 ID 的一般計時器互不影響。
+        const auto system=symbol=="SetSystemTimer"?gui_system_timer_bit:UINT64_C(0);
         const auto elapsed=std::clamp(d(2),10U,0x7fffffffU);
         const auto tolerance=symbol=="SetCoalescableTimer"?d(4):0U;
         if(tolerance!=UINT32_MAX && tolerance>0x7ffffff5U)fail(87);
@@ -445,18 +503,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         else if(arg(0) && !gui_.windows.contains(arg(0)))fail(1400);
         else if(arg(0) && gui_.windows.at(arg(0)).thread!=threads_.current)fail(5);
         else {
-            auto id=arg(1);const auto existing=gui_.timers.find({arg(0),id});
+            auto id=arg(1)&~gui_system_timer_bit;const auto existing=gui_.timers.find({arg(0),id|system});
             // 有 HWND 的 ID 屬於該視窗，包含 ID 0；只有無 HWND 的新 timer 才配置 ID。
             if(!arg(0) && (!id || existing==gui_.timers.end() || existing->second.thread!=threads_.current))id=gui_.next_object++;
             const auto interval=static_cast<std::uint64_t>(elapsed)*10000;
             const auto slack=tolerance==UINT32_MAX?0:static_cast<std::uint64_t>(tolerance)*10000;
             const auto owner=arg(0)?gui_.windows.at(arg(0)).thread:threads_.current;
-            const auto deadline=gui_.timer_deadline(runtime_.clock_ticks+interval,slack,{arg(0),id});
-            gui_.timers[{arg(0),id}]={deadline,interval,arg(3),owner,slack};
+            const auto deadline=gui_.timer_deadline(runtime_.clock_ticks+interval,slack,{arg(0),id|system});
+            gui_.timers[{arg(0),id|system}]={deadline,interval,arg(3),owner,slack,system?0x118U:0x113U};
             result=id?id:1;gui_.message_threads.insert(owner);
         }
-    }else if(symbol=="KillTimer"){
-        const auto timer=gui_.timers.find({arg(0),arg(1)});
+    }else if(symbol=="KillTimer" || symbol=="KillSystemTimer"){
+        const auto timer=gui_.timers.find({arg(0),(arg(1)&~gui_system_timer_bit)|(symbol=="KillSystemTimer"?gui_system_timer_bit:UINT64_C(0))});
         if(timer!=gui_.timers.end() && (arg(0) || timer->second.thread==threads_.current)){gui_.timers.erase(timer);result=1;}
     }
     else if(symbol=="GetWindowThreadProcessId"){
@@ -504,9 +562,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     }
     else if(symbol=="GetKeyboardLayoutNameA" || symbol=="GetKeyboardLayoutNameW"){
         if(!arg(0))fail(87);
-        else {std::uint32_t layout=0x409;if(native_gui_)for(const auto& method:native_input_methods())if(method.current){layout=method.layout;break;}
-            if(const auto selected=selected_keyboard_layout(threads_.current))layout=static_cast<std::uint32_t>(((selected>>16)&0xffffU)==(selected&0xffffU)?selected&0xffffU:selected);
-            std::u16string name(8,u'0');for(unsigned i=0;i<8;++i)name[7-i]=u"0123456789ABCDEF"[(layout>>(i*4))&15];
+        else {const auto name=keyboard_layout_name();
             if(wide)memory.write(GuestAddress{arg(0)},utf16_bytes(name));else {const auto bytes=utf16_to_utf8(name);std::vector<std::uint8_t> value(bytes.begin(),bytes.end());value.push_back(0);memory.write(GuestAddress{arg(0)},value);}result=1;}
     }else if(symbol=="GetKeyboardLayoutList"){
         if(s32(arg(0))<0 || (d(0) && !arg(1)))fail(87);
@@ -517,11 +573,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     else if(symbol=="SetKeyboardState"){memory.read(GuestAddress{arg(0)},gui_.keyboard);for(unsigned i=0;i<256;++i)gui_.input_keyboard[i]=static_cast<std::uint8_t>((gui_.input_keyboard[i]&0x80U)|(gui_.keyboard[i]&1U));result=1;}
     else if(symbol=="GetCursor")result=gui_.cursor;
     else if(symbol=="ShowCursor" || symbol=="SetCursor"){
-        const bool set=symbol=="SetCursor";const auto handle=set?arg(0):gui_.cursor;GuiIcon icon;const GuiIcon* selected=nullptr;bool valid=true;
-        if(handle){const auto found=gui_.icons.find(handle);if(found!=gui_.icons.end() && !found->second.is_icon)selected=&found->second;
-            else if(handle>=0xd000 && handle<0x1d000){icon.is_icon=false;icon.system=static_cast<std::uint32_t>(handle-0xd000);switch(icon.system){case 32512:case 32513:case 32514:case 32515:case 32516:case 32640:case 32641:case 32642:case 32643:case 32644:case 32645:case 32649:case 32650:case 32651:selected=&icon;break;default:valid=false;break;}}
-            else valid=false;
-        }
+        const bool set=symbol=="SetCursor";const auto handle=set?arg(0):gui_.cursor;GuiIcon icon;
+        const GuiIcon* selected=handle?resolve_gui_cursor(handle,icon):nullptr;const bool valid=!handle || selected;
         const bool changed=set && handle!=gui_.cursor;const auto start=changed?runtime_.clock_ticks:gui_.cursor_animation_start;
         const auto step=selected?icon_animation_step(*selected,runtime_.clock_ticks>=start?runtime_.clock_ticks-start:0):0;
         if(selected && !selected->animation_sequence.empty())selected=&selected->animation_frames.at(selected->animation_sequence[step]);
@@ -605,14 +658,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     }
     else if(symbol=="EndDialog"){const auto f=gui_.windows.find(arg(0));if(f!=gui_.windows.end() && f->second.modal){f->second.ended=true;f->second.dialog_result=arg(1);result=1;}else fail(1400);}
     else if(symbol.starts_with("MessageBox")){
-        auto owner=arg(0),body=arg(1),caption=arg(2);auto style=d(3);
-        if(symbol.starts_with("MessageBoxIndirect")){
+        // MessageBoxIndirect 只有一個參數：不可先讀第 2～4 個參數（x86 執行緒堆疊頂端附近會越界）。
+        const bool indirect=symbol.starts_with("MessageBoxIndirect");
+        std::uint64_t owner=indirect?0:arg(0),body=indirect?0:arg(1),caption=indirect?0:arg(2);std::uint32_t style=indirect?0:d(3);
+        if(indirect){
             const auto p=arg(0);if(!p || memory.load(GuestAddress{p},32)!=(x86_?40:80)){fail(87);arg.return_to(state,0);return std::nullopt;}
             memory.check(GuestAddress{p},x86_?40:80,Access::Read);const auto bits=static_cast<std::uint8_t>(x86_?32:64);owner=memory.load(GuestAddress{p+(x86_?4:8)},bits);body=memory.load(GuestAddress{p+(x86_?12:24)},bits);caption=memory.load(GuestAddress{p+(x86_?16:32)},bits);style=static_cast<std::uint32_t>(memory.load(GuestAddress{p+(x86_?20:40)},32));
             // Help callback 與自訂 icon 尚未接入；回報失敗，不誤讀未啟用欄位。
             if(style&(0x4000U|0x80U)){fail(50);arg.return_to(state,0);return std::nullopt;}
         }
         GuiWindow w;w.dpi_context=effective_dpi_context();w.thread=threads_.current;w.title=read(caption);w.class_name=u"#32770";w.dialog=true;w.modal=true;w.builtin=true;w.owner=owner;w.width=500;w.height=190;w.style=0x10000000;w.visible=true;w.extra.resize(40);
+        // MessageBoxTimeout(hWnd, lpText, lpCaption, uType, wLanguageId, dwMilliseconds)：到期以 MB_TIMEDOUT（32000）結束；INFINITE 不限時。
+        if(symbol.starts_with("MessageBoxTimeout") && d(5)!=UINT32_MAX)w.modal_deadline=runtime_.clock_ticks+std::uint64_t{d(5)}*10000+(d(5)?0U:1U);
         w.procedure=resolve("user32.dll",wide?"DefDlgProcW":"DefDlgProcA").value;const auto h=allocate_gui_window();
         std::vector<GuiWindowCreation> plans{{h,std::move(w),wide}};
         const auto add=[&](GuiWindow child){child.thread=threads_.current;child.parent=h;child.style|=0x50000000;child.visible=true;child.builtin=true;child.control_class=child.class_name;child.procedure=stock_gui_proc(child.class_name,wide);plans.push_back({allocate_gui_window(),std::move(child),wide});};
@@ -935,6 +992,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         }
     }
     else if(symbol=="DestroyIcon" || symbol=="DestroyCursor"){
+        release_cursor_frames(arg(0));
         const auto icon=gui_.icons.find(arg(0));if(icon==gui_.icons.end())fail(1402);else if((symbol=="DestroyIcon")!=icon->second.is_icon)fail(87);else if(icon->second.shared)result=1;else{if(gui_.cursor==arg(0)){gui_.cursor=0;if(native_gui_ && interactive_station())(void)native_gui_->set_cursor(nullptr,false);}gui_.icons.erase(icon);result=1;}
     }
     else if(symbol=="BringWindowToTop"){
@@ -1026,7 +1084,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             const auto extended=gui_.extended_pens.find(arg(0));const bool ext=extended!=gui_.extended_pens.end();const unsigned size=ext?(x86_?24:28):16;
             if(!arg(2))result=size;else if(d(1)>=size){std::vector<std::uint8_t> bytes(size);const auto put=[&](unsigned at,unsigned value){for(unsigned i=0;i<4;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
                 put(0,ext?extended->second.style:gui_.pen_widths.at(arg(0))?0:5);put(4,ext?extended->second.width:static_cast<unsigned>(gui_.pen_widths.at(arg(0))));if(ext)put(8,extended->second.brush_style);put(12,gui_.pens.at(arg(0)));memory.write(GuestAddress{arg(2)},bytes);result=size;}
-        }else fail(gui_.brushes.contains(arg(0))?50:6);
+        }else if(gui_.brushes.contains(arg(0)) || (arg(0)>=0xb000 && arg(0)<=0xb005) || arg(0)==0xb012){
+            // LOGBRUSH：lbStyle（BS_SOLID 0／BS_NULL 1／BS_HATCHED 2／BS_PATTERN 3）、lbColor、lbHatch（ULONG_PTR：陰影樣式或圖樣點陣圖）。
+            const unsigned size=x86_?12U:16U;const auto handle=arg(0);std::uint32_t style=0,color=0;std::uint64_t hatch=0;
+            if(const auto found=gui_.brushes.find(handle);found!=gui_.brushes.end()){
+                color=found->second;
+                if(const auto hatched=gui_.brush_hatches.find(handle);hatched!=gui_.brush_hatches.end()){style=2;hatch=static_cast<std::uint32_t>(hatched->second);}
+                else if(const auto dib=gui_.brush_dib_patterns.find(handle);dib!=gui_.brush_dib_patterns.end()){style=5;color=static_cast<std::uint32_t>(dib->second[0]);hatch=dib->second[1];}
+                else if(gui_.brush_patterns.contains(handle)){style=3;color=0;if(const auto source=gui_.brush_pattern_sources.find(handle);source!=gui_.brush_pattern_sources.end())hatch=source->second;}
+            }else if(handle==0xb005)style=1;
+            else if(handle==0xb012)color=0xffffff;   // DC_BRUSH 的預設色
+            else {constexpr std::array<std::uint32_t,5> stock{0xffffff,0xc0c0c0,0x808080,0x404040,0};color=stock[handle-0xb000];}
+            if(!arg(2))result=size;
+            else if(d(1)>=size){memory.store(GuestAddress{arg(2)},32,style);memory.store(GuestAddress{arg(2)+4},32,color);memory.store(GuestAddress{arg(2)+8},x86_?32:64,hatch);result=size;}
+        }else fail(6);
     } else if(symbol.starts_with("GetTextExtent")){
         const bool ex=symbol.starts_with("GetTextExtentEx");const auto count=d(2);if(count>1048576)throw HostCallFault("GDI 文字長度超過上限");memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(count)*(wide?2:1),Access::Read);
         const auto p=arg(ex?6:3);memory.check(GuestAddress{p},8,Access::Write);
@@ -1037,9 +1108,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             for(std::size_t at=0;at<bytes.size();){const auto first=static_cast<unsigned char>(bytes[at]);std::size_t n=first<0x80?1:first>=0xc2 && first<=0xdf?2:first>=0xe0 && first<=0xef?3:first>=0xf0 && first<=0xf4?4:1;
                 if(n>bytes.size()-at || std::any_of(bytes.begin()+static_cast<std::ptrdiff_t>(at+1),bytes.begin()+static_cast<std::ptrdiff_t>(at+std::min(n,bytes.size()-at)),[](unsigned char c){return (c&0xc0)!=0x80;}))n=1;
                 text+=utf8_to_utf16_lossy(std::string_view(bytes).substr(at,n));for(std::size_t j=0;j<n;++j)ends.push_back(text.size());at+=n;}}
-        const auto width=text_width(font,text);memory.store(GuestAddress{p},32,static_cast<std::uint32_t>(width));memory.store(GuestAddress{p+4},32,static_cast<std::uint32_t>(metrics.height));
+        // SetTextCharacterExtra 與 SetTextJustification 的逐字間距加在各字元之後，寬度與各字元累計位置一併計入。
+        const auto spacing=[&]{const auto context=gui_.contexts.find(arg(0));return context==gui_.contexts.end()?std::vector<std::int32_t>(text.size()):gui_text_spacing(context->second,text);}();
+        std::int32_t total_spacing=0;for(const auto value:spacing)total_spacing+=value;
+        const auto width=text_width(font,text)+total_spacing;memory.store(GuestAddress{p},32,static_cast<std::uint32_t>(width));memory.store(GuestAddress{p+4},32,static_cast<std::uint32_t>(metrics.height));
         if(ex){std::vector<std::int32_t> advances;if(native_gui_)if(const auto native=native_gui_->text_advances(font,text))advances=*native;
             if(advances.size()!=text.size()){advances.resize(text.size());std::int32_t extent=0;for(std::size_t i=0;i<text.size();++i){extent+=text_width(font,std::u16string(1,text[i]));advances[i]=extent;}}
+            std::int32_t accumulated=0;for(std::size_t i=0;i<advances.size();++i){accumulated+=i<spacing.size()?spacing[i]:0;advances[i]+=accumulated;}
             std::uint32_t fit=0;for(std::size_t i=0;i<count;++i){const auto end=wide?i+1:ends[i];const auto extent=end?advances[end-1]:0;if(arg(5))memory.store(GuestAddress{arg(5)+i*4},32,static_cast<std::uint32_t>(extent));if(extent<=s32(arg(3)) && (wide || i+1==count || ends[i+1]!=end))fit=static_cast<std::uint32_t>(i+1);}
             if(arg(4))memory.store(GuestAddress{arg(4)},32,fit);}result=1;
     } else if(symbol.starts_with("GetTextMetrics")){
@@ -1052,13 +1127,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         const auto screen=gui_screen_area();
         const auto millimeters=[](std::int64_t pixels){return static_cast<std::uint32_t>((pixels*254+480)/960);};
         const std::uint32_t minus_one=UINT32_MAX;
+        // SetVirtualResolution 設定的虛擬值只影響 HORZRES／VERTRES／HORZSIZE／VERTSIZE；桌面解析度仍為實體值。
+        const auto context=gui_.contexts.find(arg(0));const auto virtual_values=context==gui_.contexts.end()?std::array<std::int32_t,4>{}:context->second.virtual_resolution;
+        const bool virtual_set=virtual_values[0]>0;
         switch(d(1)){
         case 0:result=0x4000;break;                       // DRIVERVERSION
         case 2:result=1;break;                            // TECHNOLOGY：DT_RASDISPLAY
-        case 4:result=millimeters(screen[2]);break;       // HORZSIZE
-        case 6:result=millimeters(screen[3]);break;       // VERTSIZE
-        case 8:case 118:result=static_cast<std::uint32_t>(screen[2]);break; // HORZRES、DESKTOPHORZRES
-        case 10:case 117:result=static_cast<std::uint32_t>(screen[3]);break; // VERTRES、DESKTOPVERTRES
+        case 4:result=virtual_set?static_cast<std::uint32_t>(virtual_values[2]):millimeters(screen[2]);break; // HORZSIZE
+        case 6:result=virtual_set?static_cast<std::uint32_t>(virtual_values[3]):millimeters(screen[3]);break; // VERTSIZE
+        case 8:result=virtual_set?static_cast<std::uint32_t>(virtual_values[0]):static_cast<std::uint32_t>(screen[2]);break; // HORZRES
+        case 118:result=static_cast<std::uint32_t>(screen[2]);break; // DESKTOPHORZRES
+        case 10:result=virtual_set?static_cast<std::uint32_t>(virtual_values[1]):static_cast<std::uint32_t>(screen[3]);break; // VERTRES
+        case 117:result=static_cast<std::uint32_t>(screen[3]);break; // DESKTOPVERTRES
         case 12:result=gui_.display_mode?(*gui_.display_mode)[2]:32;break; // BITSPIXEL
         case 14:result=1;break;                           // PLANES
         case 16:case 18:case 24:result=minus_one;break;   // NUMBRUSHES、NUMPENS、NUMCOLORS：超過 8 位元色時為 -1

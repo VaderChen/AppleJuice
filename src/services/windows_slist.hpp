@@ -38,6 +38,14 @@ inline std::uint64_t push(GuestMemory& memory, std::uint64_t header, bool x86, s
     memory.store(GuestAddress{entry}, x86 ? 32 : 64, previous);
     update(memory, header, x86, entry, static_cast<std::uint16_t>(count + 1)); return previous;
 }
+// InterlockedPushListSListEx：把已串好的 first…last 一次推入，last 接上原本的第一項。
+inline std::uint64_t push_list(GuestMemory& memory, std::uint64_t header, bool x86, std::uint64_t entry, std::uint64_t last, std::uint32_t count) {
+    check(memory, header, x86, Access::Write);
+    if (!entry || !last || entry % (x86 ? 4 : 16) || last % (x86 ? 4 : 16)) throw HostCallFault("SLIST_ENTRY 對齊錯誤");
+    const auto previous = first(memory, header, x86); const auto depth_now = depth(memory, header, x86);
+    memory.store(GuestAddress{last}, x86 ? 32 : 64, previous);
+    update(memory, header, x86, entry, static_cast<std::uint16_t>(depth_now + count)); return previous;
+}
 inline std::uint64_t pop(GuestMemory& memory, std::uint64_t header, bool x86) {
     const auto previous = first(memory, header, x86); const auto count = depth(memory, header, x86);
     const auto next = previous ? memory.load(GuestAddress{previous}, x86 ? 32 : 64) : 0;
