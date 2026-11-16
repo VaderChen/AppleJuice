@@ -28,7 +28,23 @@ enum class GlOperation {
     RasterPos4dv,Indexd,EdgeFlag,ClearIndex,IsList,ListBase,CallLists,LightModelfv,GetLightfv,GetMaterialfv,ColorMaterial,
     CopyTexImage2D,PrioritizeTextures,TexParameterfv,
     // 求值器：服務層把 f／d 變體一律換成雙精度；Map1d／Map2d 的控制點以 [u][v][分量] 緊密排列放在 data，GetMapdv 回傳寫入的 double 數。
-    Map1d,Map2d,MapGrid1d,MapGrid2d,EvalCoord1d,EvalCoord2d,EvalMesh1,EvalMesh2,EvalPoint1,EvalPoint2,GetMapdv
+    Map1d,Map2d,MapGrid1d,MapGrid2d,EvalCoord1d,EvalCoord2d,EvalMesh1,EvalMesh2,EvalPoint1,EvalPoint2,GetMapdv,
+    // glTexGen／glGetTexGen：args 為 {coord,pname}，data／output 為 1（GL_TEXTURE_GEN_MODE）或 4（平面）個 double；GetTexGendv 回傳寫入的 double 數。
+    TexGendv,GetTexGendv,
+    // 選取／回饋模式：SelectBuffer {size}、FeedbackBuffer {size,type}、名稱堆疊操作與 PassThrough {float 位元}。
+    // RenderMode 離開 SELECT／FEEDBACK 時在 output 寫入「字數＋內容」（命中紀錄為 uint32，回饋值為 float），回傳值為命中數／值數或溢位時的 -1。
+    SelectBuffer,InitNames,LoadName,PushName,PopName,FeedbackBuffer,PassThrough,
+    // 使用者剪裁面：args {plane}，ClipPlane 的 data 與 GetClipPlane 的 output 皆為 4 個 double。
+    ClipPlane,GetClipPlane,
+    // glGetTexImage：args {target,level,format,type}，output 依 GL_PACK_* 版面；回傳寫入的位元組數。
+    GetTexImage,
+    // 點畫：LineStipple {factor,pattern}；PolygonStipple 的 data 為依 GL_UNPACK_* 排列的 32×32 位元；GetPolygonStipple 的 output 依 GL_PACK_*。
+    LineStipple,PolygonStipple,GetPolygonStipple,
+    // 像素傳輸：PixelTransfer {pname,double 位元}；PixelMap {map,mapsize,type}，data 為 mapsize 個 type（FLOAT／UNSIGNED_INT／UNSIGNED_SHORT）值；
+    // GetPixelMap {map,type}，output 為該表全部項目；DrawPixels {width,height,format,type}，data 依 GL_UNPACK_*；CopyPixels {x,y,width,height,type}。
+    PixelTransfer,PixelMap,GetPixelMap,DrawPixels,CopyPixels,
+    // 累積緩衝與邏輯運算：Accum {op,value 浮點位元}；ClearAccum {r,g,b,a 浮點位元}；LogicOp {opcode}。
+    Accum,ClearAccum,LogicOp
 };
 // GL_MAP1_*（0x0D90～0x0D98）與 GL_MAP2_*（0x0DB0～0x0DB8）每個控制點的分量數；其他值為 0。服務層、各後端與 GLU NURBS 共用。
 constexpr unsigned gl_map_components(std::uint32_t target){
@@ -47,6 +63,8 @@ public:
     virtual ~NativeOpenGlContext()=default;
     virtual OpenGlShareResult share_objects(NativeOpenGlContext& source){return &source==this?OpenGlShareResult::Shared:OpenGlShareResult::Unsupported;}
     virtual bool programmable()const noexcept{return false;}
+    // wglCopyContext：把 source 中依 glPushAttrib 位元選定的狀態群組套到這個 context；不支援時回傳 false。
+    virtual bool copy_state(NativeOpenGlContext&,std::uint32_t){return false;}
     virtual std::shared_ptr<OpenGlBuffer> buffer_object(std::uint32_t){return {};}
     virtual std::shared_ptr<OpenGlBuffer> bound_buffer(std::uint32_t){return {};}
     virtual void bind()=0;
@@ -72,8 +90,10 @@ std::shared_ptr<NativeOpenGlContext> make_metal_command_thread(std::shared_ptr<N
 std::optional<std::pair<std::string,std::string>> metal_opengl_identity();
 std::shared_ptr<NativeOpenGlContext> make_native_opengl(void* view,std::uint32_t width,std::uint32_t height);
 struct OpenGlArray { std::uint64_t pointer{};std::int32_t size{4},stride{};std::uint32_t type{0x1406};bool enabled{};std::shared_ptr<OpenGlBuffer> buffer;bool operator==(const OpenGlArray&)const=default; };
+inline OpenGlArray opengl_array(std::int32_t size,std::uint32_t type){OpenGlArray array;array.size=size;array.type=type;return array;}
+// 用戶端陣列：0 頂點、1 法線（固定 3 分量）、2 顏色、3 貼圖座標，以上四個交給後端上傳；4 邊旗標（GLboolean）、5 色彩索引（預設 GL_FLOAT）只由服務層逐元素送出。
 struct OpenGlClientState {
-    std::array<OpenGlArray,4> arrays{};
+    std::array<OpenGlArray,6> arrays{OpenGlArray{},opengl_array(3,0x1406),OpenGlArray{},OpenGlArray{},opengl_array(1,0x1401),opengl_array(1,0x1406)};
     std::map<std::uint32_t,std::int32_t> pixel_store{{0xcf5,4},{0xd05,4}};
     bool operator==(const OpenGlClientState&)const=default;
 };
@@ -84,8 +104,10 @@ struct OpenGlContext {
     std::vector<std::pair<std::uint32_t,OpenGlClientState>> client_stack;
     std::uint32_t program{};
     std::uint32_t vertex_array{};
-    std::map<std::uint32_t,std::array<OpenGlArray,4>> vertex_array_clients;
+    std::map<std::uint32_t,std::array<OpenGlArray,6>> vertex_array_clients;
     std::uint32_t error{};std::int32_t interval{1};bool beginning{};
+    // glSelectBuffer／glFeedbackBuffer 的客體緩衝與大小（以 32 位元字計）；render_mode 為服務層記錄的 GL_RENDER_MODE，用來在離開時寫回客體。
+    std::uint64_t select_buffer{},feedback_buffer{};std::uint32_t select_size{},feedback_size{},feedback_type{},render_mode{0x1c00};bool select_set{},feedback_set{};
     std::map<std::uint32_t,std::uint64_t> strings;
     // 每個 context 保留 staging 容量；內容每次從客體重新讀入。
     std::vector<std::uint8_t> input_scratch,output_scratch,array_scratch,packed_scratch;

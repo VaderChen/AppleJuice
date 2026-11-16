@@ -28,6 +28,8 @@ struct EventRenderContext {
 struct LegacyEventReader {
     std::u16string channel;
     std::int64_t position{};bool positioned{};
+    // OpenBackupEventLog：開啟時讀入的備份檔紀錄；NotifyChangeEventLog 登記的事件物件 handle（0 表示未登記）。
+    bool from_backup{};std::vector<EventRecord> backup;std::uint64_t notify{};
     bool operator==(const LegacyEventReader&) const=default;
 };
 struct EventLogState {

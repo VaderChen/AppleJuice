@@ -113,6 +113,7 @@ std::span<const WindowsServiceDescriptor> dinput_service_descriptors(){
             result.push_back({family,"XInputGetBatteryInformation",3,0,0,3});
             result.push_back({family,"XInputGetKeystroke",3,0,0,3});
             result.push_back({family,"#100",2,0,0,1}); // XInputGetStateEx：含 Guide 鍵。
+            result.push_back({family,"DllMain",3,0,0,2}); // 內建 XInput 不需程序／執行緒初始化，各通知都回 TRUE。
         }
         result.push_back({"xinput1_3.dll","XInputGetDSoundAudioDeviceGuids",3,0,0,1});
         // XInput 9.1.0（Vista 起內建）只匯出四個入口，語義與 1_3 相同。

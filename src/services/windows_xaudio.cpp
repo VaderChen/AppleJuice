@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/audio_graph.hpp"
+#include "x64arm/audio_channels.hpp"
 #include "x64arm/audio_adpcm.hpp"
 #include "x64arm/unicode.hpp"
 #include "xaudio_interfaces.hpp"
@@ -89,7 +90,7 @@ struct Engine {
     std::vector<audio_endpoint::Endpoint> devices;
     std::set<std::uint64_t> callbacks;
     std::vector<float> quantum;
-    std::size_t produced{};unsigned rate{48000},fraction{},version{7};
+    std::size_t produced{};unsigned rate{48000},channels{2},fraction{},version{7};
     unsigned lead_quanta{3};
     std::uint64_t observed_starved_runs{};
     bool initialized{},active{true},busy{},audible_reported{};
@@ -121,7 +122,9 @@ struct XAudioState {
 };
 std::span<const WindowsServiceDescriptor> xaudio_service_descriptors(){
     static const auto table=[] {
-        std::vector<WindowsServiceDescriptor> result{{"xaudio2_7.dll","DllGetClassObject",3},{"xaudio2_7.dll","DllCanUnloadNow",0},{"xaudio2_8.dll","XAudio2Create",3,0,0,6},{"xaudio2_9.dll","XAudio2Create",3,0,0,6}};
+        std::vector<WindowsServiceDescriptor> result{{"xaudio2_7.dll","DllGetClassObject",3},{"xaudio2_7.dll","DllCanUnloadNow",0},{"xaudio2_8.dll","XAudio2Create",3,0,0,6},{"xaudio2_9.dll","XAudio2Create",3,0,0,6},
+            // XAudio2CreateWithVersionInfo：多一個 ntddiVersion（標頭版本），引擎行為與 XAudio2Create 相同。
+            {"xaudio2_8.dll","XAudio2CreateWithVersionInfo",4,0,0,0xe},{"xaudio2_9.dll","XAudio2CreateWithVersionInfo",4,0,0,0xe}};
         for(auto methods:{std::span<const Method>(identity),std::span<const Method>(enumeration),std::span<const Method>(engine_methods),std::span<const Method>(voice_methods),std::span<const Method>(source_methods),std::span<const Method>(factory_methods)})for(const auto& m:methods)result.push_back({"internal-xaudio",m.name,m.args,0,0,m.narrow});
         result.push_back({"internal-xaudio","CreateMasteringVoice28",8,0,0,156});result.push_back({"internal-xaudio","GetState28",3,0,0,4});result.push_back({"internal-xaudio","GetChannelMask",2});
         for(auto name:{"Work","Render","Complete"})result.push_back({"internal-xaudio",name,2,0,0,2});
@@ -174,7 +177,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
     const auto method=[&](std::uint64_t p,unsigned slot){require(p!=0);return get(get(p,0,bits),slot*unit,bits);};
     const auto publish=[&](std::uint64_t p,const Object& o){if(o.kind!=Object::Voice)return;const auto info=o.engine->graph->state(o.voice);
         put(p+XA_VERSION,o.engine->version);put(p+XA_FLAGS,info.creation_flags);put(p+XA_ACTIVE,info.flags);put(p+XA_CHANNELS,info.format.channels);put(p+XA_RATE,info.format.rate);
-        put(p+XA_VOLUME,std::bit_cast<std::uint32_t>(info.volume));put(p+XA_RATIO,std::bit_cast<std::uint32_t>(info.ratio));put(p+XA_FILTER,info.filter.type);put(p+XA_FILTER+4,std::bit_cast<std::uint32_t>(info.filter.frequency));put(p+XA_FILTER+8,std::bit_cast<std::uint32_t>(info.filter.one_over_q));put(p+XA_MASK,info.format.channels==1?4:3);
+        put(p+XA_VOLUME,std::bit_cast<std::uint32_t>(info.volume));put(p+XA_RATIO,std::bit_cast<std::uint32_t>(info.ratio));put(p+XA_FILTER,info.filter.type);put(p+XA_FILTER+4,std::bit_cast<std::uint32_t>(info.filter.frequency));put(p+XA_FILTER+8,std::bit_cast<std::uint32_t>(info.filter.one_over_q));put(p+XA_MASK,info.format.channel_mask?info.format.channel_mask:audio::channel_mask(info.format.channels));
         memory.write(GuestAddress{p+XA_VOLUMES},{reinterpret_cast<const std::uint8_t*>(info.channel_volumes.data()),info.channel_volumes.size()*4});
         put(p+XA_CONTEXT,info.context,64);put(p+XA_QUEUED,info.queued);put(p+XA_SAMPLES,info.samples,64);
     };
@@ -244,7 +247,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
             const bool com=name=="CoGetClassObject";const auto out=arg(com?4:2);check(out,unit);put(out,0,bits);
             if(!xaudio::is_class(memory,arg(0)) || (com && !(d(1)&1)))result=0x80040111U;
             else if(iid(arg(com?3:1))!=xaudio::factory && iid(arg(com?3:1))!=xaudio::unknown)result=no_interface;else put(out,create({Object::Factory,{}}),bits);
-        }else if(name=="CoCreateInstance" || name=="XAudio2Create"){
+        }else if(name=="CoCreateInstance" || name=="XAudio2Create" || name=="XAudio2CreateWithVersionInfo"){
             const bool com=name=="CoCreateInstance";const auto out=arg(com?4:0);check(out,unit);put(out,0,bits);
             if(com && arg(1))result=0x80040110U;else if(com && !(d(2)&1))result=0x80040154U;
             else if(com && !com_apartment(threads_.current))result=0x800401f0U;
@@ -355,7 +358,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                 const auto call=[&](std::uint64_t target,unsigned slot,std::vector<std::uint64_t> values){callbacks.push_back({method(target,slot),std::move(values)});};
                 if(!e->active || !e->output){e->busy=false;arg.return_to(state,0);return std::nullopt;}
                 if(name=="Work"){
-                    e->fraction+=e->rate;const auto frames=e->fraction/100;e->fraction%=100;e->quantum.assign(frames*2,0);e->produced=0;e->pass_voices.clear();
+                    e->fraction+=e->rate;const auto frames=e->fraction/100;e->fraction%=100;e->quantum.assign(frames*e->channels,0);e->produced=0;e->pass_voices.clear();
                     for(const auto cb:e->callbacks)call(cb,0,{cb});
                     for(const auto& [p,voice]:bridge.objects)if(voice.engine==e && voice.kind==Object::Voice && voice.callback){const auto info=e->graph->state(voice.voice);if(info.kind==Graph::Kind::Source && info.playing){
                         auto bytes=e->graph->required_bytes(voice.voice,frames,e->rate);
@@ -364,7 +367,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                     }}
                     callbacks.push_back({resolve("internal-xaudio","Render").value,{arg(0),e->ticket}});
                 }else if(name=="Render"){
-                    const auto began=thread_cpu();e->produced+=e->graph->render_until_event(std::span(e->quantum).subspan(e->produced*2),e->rate);e->cpu_ns+=thread_cpu()-began;
+                    const auto began=thread_cpu();e->produced+=e->graph->render_until_event(std::span(e->quantum).subspan(e->produced*e->channels),e->rate,e->channels);e->cpu_ns+=thread_cpu()-began;
                     for(const auto& event:e->graph->take_events()){
                         if(event.kind==Graph::EventKind::CriticalError){e->active=false;e->busy=false;{std::lock_guard lock(e->pcm->mutex);e->pcm->playing=false;}for(const auto cb:e->callbacks)call(cb,2,{cb,0x88960001U});continue;}
                         for(const auto& [p,voice]:bridge.objects)if(voice.engine==e && voice.kind==Object::Voice && voice.voice==event.voice && voice.callback){
@@ -372,7 +375,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                             if(slot==2)call(voice.callback,slot,{voice.callback});else call(voice.callback,slot,{voice.callback,event.context});break;
                         }
                     }
-                    if(e->active && e->produced*2<e->quantum.size())callbacks.push_back({resolve("internal-xaudio","Render").value,{arg(0),e->ticket}});
+                    if(e->active && e->produced*e->channels<e->quantum.size())callbacks.push_back({resolve("internal-xaudio","Render").value,{arg(0),e->ticket}});
                     else if(e->active){
                         for(const auto& [p,id]:e->pass_voices){const auto found=bridge.objects.find(p);if(found!=bridge.objects.end() && found->second.kind==Object::Voice && found->second.engine==e && found->second.voice==id)call(found->second.callback,1,{found->second.callback});}
                         for(const auto cb:e->callbacks)call(cb,1,{cb});callbacks.push_back({resolve("internal-xaudio","Complete").value,{arg(0),e->ticket}});
@@ -381,7 +384,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                     std::uint64_t starved=0,runs=0,queued=0;bool report=false;
                     {std::lock_guard lock(e->pcm->mutex);const auto* bytes=reinterpret_cast<const std::uint8_t*>(e->quantum.data());e->pcm->pcm.insert(e->pcm->pcm.end(),bytes,bytes+e->quantum.size()*4);e->rendered+=e->produced;e->busy=false;
                      if(trace_audio()){++e->stats_quanta;const auto t=now();if(!e->stats_wall){e->stats_wall=t;e->stats_starved=e->pcm->starved_frames;e->stats_runs=e->pcm->starved_runs;}
-                        else if(t-e->stats_wall>=2000000000ULL){report=true;starved=e->pcm->starved_frames-e->stats_starved;runs=e->pcm->starved_runs-e->stats_runs;queued=e->pcm->pcm.size()/8;
+                        else if(t-e->stats_wall>=2000000000ULL){report=true;starved=e->pcm->starved_frames-e->stats_starved;runs=e->pcm->starved_runs-e->stats_runs;queued=e->pcm->pcm.size()/e->pcm->frame_bytes();
                             e->stats_wall=t;e->stats_starved=e->pcm->starved_frames;e->stats_runs=e->pcm->starved_runs;}}}
                     if(report){std::fprintf(stderr,"xaudio_stats pid=%d starved_frames=%llu starved_runs=%llu queued_frames=%llu quanta=%llu unix_ms=%lld\n",static_cast<int>(::getpid()),
                         static_cast<unsigned long long>(starved),static_cast<unsigned long long>(runs),static_cast<unsigned long long>(queued),static_cast<unsigned long long>(e->stats_quanta),
@@ -397,7 +400,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                 else if(name=="GetDeviceDetails"){
                     require(d(1)<e->devices.size());check(arg(2),1068);std::vector<std::uint8_t> bytes(1068);memory.write(GuestAddress{arg(2)},bytes);const auto& device=e->devices[d(1)];
                     memory.write(GuestAddress{arg(2)},utf16_bytes(device.id.substr(0,255)));memory.write(GuestAddress{arg(2)+512},utf16_bytes(device.device.name.substr(0,255)));put(arg(2)+1024,device.device.default_output?15:0);
-                    const auto p=arg(2)+1028;put(p,0xfffe,16);put(p+2,2,16);put(p+4,48000);put(p+8,384000);put(p+12,8,16);put(p+14,32,16);put(p+16,22,16);put(p+18,32,16);put(p+20,3);memory.write(GuestAddress{p+24},std::array<std::uint8_t,16>{3,0,0,0,0,0,0x10,0,0x80,0,0,0xaa,0,0x38,0x9b,0x71});
+                    const auto channels=audio::environment_enabled()?8U:2U;const auto p=arg(2)+1028;put(p,0xfffe,16);put(p+2,channels,16);put(p+4,48000);put(p+8,48000*channels*4);put(p+12,channels*4,16);put(p+14,32,16);put(p+16,22,16);put(p+18,32,16);put(p+20,audio::channel_mask(channels));memory.write(GuestAddress{p+24},std::array<std::uint8_t,16>{3,0,0,0,0,0,0x10,0,0x80,0,0,0xaa,0,0x38,0x9b,0x71});
                 }else if(name=="Initialize"){require(!e->initialized && !(d(1)&~1U) && d(2));e->initialized=true;}
                 else {require(e->initialized);
                     if(name=="RegisterForCallbacks"){for(unsigned i=0;i<3;++i)(void)method(arg(1),i);e->callbacks.insert(arg(1));}
@@ -408,7 +411,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                     else if(name=="GetPerformanceData"){
                         check(arg(1),64);memory.write(GuestAddress{arg(1)},std::array<std::uint8_t,64>{});const auto time=now();put(arg(1),e->cpu_ns-e->last_cpu,64);put(arg(1)+8,time-e->last_wall,64);e->last_wall=time;e->last_cpu=e->cpu_ns;
                         unsigned active=0,total=0,submix=0;for(const auto& [p,v]:bridge.objects)if(v.kind==Object::Voice && v.engine==e){const auto vs=e->graph->state(v.voice);if(vs.kind==Graph::Kind::Source){++total;if(vs.playing)++active;}else if(vs.kind==Graph::Kind::Submix)++submix;}
-                        std::lock_guard lock(e->pcm->mutex);put(arg(1)+24,e->pcm->pcm.size());put(arg(1)+28,e->pcm->pcm.size()/8);put(arg(1)+32,e->pcm->starved_runs);put(arg(1)+36,active);put(arg(1)+40,total);put(arg(1)+44,submix);
+                        std::lock_guard lock(e->pcm->mutex);put(arg(1)+24,e->pcm->pcm.size());put(arg(1)+28,e->pcm->pcm.size()/e->pcm->frame_bytes());put(arg(1)+32,e->pcm->starved_runs);put(arg(1)+36,active);put(arg(1)+40,total);put(arg(1)+44,submix);
                     }else if(name=="CreateSourceVoice" || name=="CreateSubmixVoice" || name.starts_with("CreateMasteringVoice")){
                         check(arg(1),unit);put(arg(1),0,bits);Graph::Format format;Graph::Kind kind;unsigned flags=0,stage=0;float ratio=2;std::uint64_t callback=0,send=0,effects=0;std::string device;std::optional<audio::AdpcmFormat> adpcm;
                         if(name=="CreateSourceVoice"){
@@ -420,7 +423,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                             }else {const auto parsed=read_pcm_wave_format(memory,arg(2),true,true,1000,max_rate,{64,32,true,true});require(bool(parsed));format={parsed->channels,parsed->rate,parsed->bits,parsed->floating,parsed->channel_mask};}
                             kind=Graph::Kind::Source;flags=d(3);ratio=fp(4);callback=arg(5);send=arg(6);effects=arg(7);if(callback)for(unsigned i=0;i<7;++i)(void)method(callback,i);
                         }else if(name=="CreateSubmixVoice"){format={d(2),d(3),32,true};kind=Graph::Kind::Submix;flags=d(4);stage=d(5);send=arg(6);effects=arg(7);}
-                        else {require(!e->master && !d(4));format={d(2)?d(2):2U,d(3)?d(3):48000U,32,true};kind=Graph::Kind::Master;effects=arg(6);
+                        else {require(!e->master && !d(4));format={d(2)?d(2):(audio::environment_enabled()?8U:2U),d(3)?d(3):48000U,32,true};kind=Graph::Kind::Master;effects=arg(6);
                             if(e->version==7){require(d(5)<e->devices.size());device=e->devices[d(5)].device.uid;}
                             else {if(arg(5)){const auto id=read_utf16(memory,GuestAddress{arg(5)});const auto i=std::find_if(e->devices.begin(),e->devices.end(),[&](const auto& v){return v.id==id;});require(i!=e->devices.end());device=i->device.uid;}require(d(7)<=11);}
                         }
@@ -434,7 +437,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                             p=create({Object::Voice,e,id,callback});
                             bridge.objects.at(p).adpcm=std::move(adpcm);
                             if(!chain.empty())set_chain(p,chain,effect_rate,format.channels);
-                            if(kind==Graph::Kind::Master){(void)mapping_session();e->pcm->progress_notify=[wake=mapping_wake()]()noexcept{if(wake)wake->notify();};e->pcm->rate=e->pcm->frequency=e->rate=format.rate;e->pcm->channels=2;e->pcm->bits=32;e->pcm->floating=e->pcm->streaming=true;e->pcm->playing=e->active;e->pcm->pcm.reserve(e->rate*8/10);e->output=audio::open_output(e->pcm,device);require(bool(e->output));e->master=p;}
+                            if(kind==Graph::Kind::Master){(void)mapping_session();e->pcm->progress_notify=[wake=mapping_wake()]()noexcept{if(wake)wake->notify();};e->pcm->rate=e->pcm->frequency=e->rate=format.rate;e->pcm->channels=e->channels=format.channels;e->pcm->channel_mask=format.channel_mask;e->pcm->bits=32;e->pcm->floating=e->pcm->streaming=true;e->pcm->playing=e->active;e->pcm->pcm.reserve(e->rate*e->pcm->frame_bytes()/10);e->output=audio::open_output(e->pcm,device);require(bool(e->output));e->master=p;}
                             put(arg(1),p,bits);
                         }catch(...){if(p){drop_chain(object(p));bridge.objects.erase(p);(void)free_heap(memory,p,state);}e->graph->destroy(id);throw;}
                     }else throw HostCallFault("尚未實作 XAudio2 引擎方法："+std::string(name));
@@ -445,7 +448,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                 const auto filter=[&](std::uint64_t p){return Graph::Filter{static_cast<unsigned>(get(p)),std::bit_cast<float>(static_cast<std::uint32_t>(get(p,4))),std::bit_cast<float>(static_cast<std::uint32_t>(get(p,8)))};};
                 const auto store_filter=[&](std::uint64_t p,Graph::Filter f){check(p,12);put(p,f.type);put(p+4,std::bit_cast<std::uint32_t>(f.frequency));put(p+8,std::bit_cast<std::uint32_t>(f.one_over_q));};
                 if(name=="GetVoiceDetails"){check(arg(1),e->version==7?12:16);put(arg(1),info.creation_flags);if(e->version>=8)put(arg(1)+4,info.flags);put(arg(1)+(e->version==7?4:8),info.format.channels);put(arg(1)+(e->version==7?8:12),info.format.rate);}
-                else if(name=="GetChannelMask")put(arg(1),info.format.channels==1?4:3);
+                else if(name=="GetChannelMask")put(arg(1),info.format.channel_mask?info.format.channel_mask:audio::channel_mask(info.format.channels));
                 else if(name=="SetOutputVoices")e->graph->set_sends(o.voice,sends(e,arg(1)));
                 else if(name=="SetEffectChain"){const auto rate=e->master?e->rate:info.format.rate;set_chain(arg(0),read_chain(arg(1),info.format.channels,rate,arg(0)),rate,info.format.channels);}
                 else if(name=="EnableEffect" || name=="DisableEffect"){require(d(1)<o.chain.size() && d(2)!=UINT32_MAX);c.operation=name=="EnableEffect"?Graph::Operation::EnableEffect:Graph::Operation::DisableEffect;c.effect=d(1);e->graph->change(std::move(c),d(2));}

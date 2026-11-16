@@ -227,6 +227,8 @@ function render() {
   $('library-summary').textContent = t`${state.programs.length - temporaryCount} 個程式${temporaryCount ? t` · ${temporaryCount} 個臨時程式` : ''}${state.running ? t` · ${state.running} 個執行中` : t(' · 選取程式，開始執行。')}`;
   renderTemporarySessions();
   for (const id of ['add', 'empty-add', 'temporary']) $(id).disabled = busy;
+  $('spatial-headphones-quick').checked = state.globalSettings?.spatialHeadphones === true;
+  $('spatial-headphones-quick').disabled = busy;
   const p = selected(); $('empty').hidden = !!p; $('detail').hidden = !p;
   if (!p) { currentID = ''; return; }
   if (currentID !== p.id) { currentID = p.id; loadSettings(p); tab = 'workspace'; }
@@ -379,6 +381,13 @@ async function startProgram(id) {
 }
 async function stopProgram(id) { applyState(await api('stop', { id })); }
 $('save').onclick = () => perform(async () => { const id = state.selected; const next = await api('save', { id, settings: readSettings() }); drafts.delete(id); applyState(next); toast(selected()?.temporary ? t('本次設定已套用') : t('此程式的設定已儲存')); });
+// 主畫面與設定頁共用全域音訊偏好；下次啟動生效，不保存個別程式的其他草稿。
+$('spatial-headphones-quick').onchange = () => {
+  const enabled = $('spatial-headphones-quick').checked;
+  return perform(async () => applyState(await api('saveGlobalSettings', {
+    globalSettings: { ...state.globalSettings, spatialHeadphones: enabled }
+  })));
+};
 // 執行頁的顯示開關：切換即寫入此程式的設定，只更新這兩項，不連帶儲存「程式設定」頁尚未儲存的草稿；於下次啟動生效。
 for (const id of ['present-upscale', 'present-interpolation']) $(id).onchange = () => perform(async () => {
   const p = selected(); if (!p) return;
@@ -592,6 +601,7 @@ $('app-settings').onclick = () => {
   closeProgramMenu(); $('global-drive-rows').replaceChildren();
   const defaults = state.globalSettings || { cDrive: '', drives: {} };
   $('certificate-roots-file').checked = defaults.certificateRootsFile === true;
+  $('spatial-headphones').checked = defaults.spatialHeadphones === true;
   $('certificate-roots-path').value = defaults.certificateRootsPath || 'ProgramData/MacWin/Certificates/ROOT.pem';
   $('windows-font').replaceChildren(new Option(t('自動（macOS 系統向量字型）'), 'auto'), ...windowsFonts.map(font => new Option(font, font)));
   $('windows-font').value = defaults.windowsFont || 'auto';
@@ -622,7 +632,7 @@ $('global-settings-save').onclick = async () => {
   if (!$('global-cpu-form').checkValidity()) { showGlobalTab('cpu'); $('global-cpu-form').reportValidity(); return; }
   if (!$('global-gpu-form').checkValidity()) { showGlobalTab('gpu'); $('global-gpu-form').reportValidity(); return; }
   if (!$('global-settings-form').checkValidity()) { showGlobalTab('advanced'); $('global-settings-form').reportValidity(); return; }
-  const defaults = { windowsFont: $('windows-font').value, nativeV8Bridge: state.globalSettings.nativeV8Bridge === true, nativeLibraryBridge: state.globalSettings.nativeLibraryBridge === true, compilerWorkers: state.globalSettings.compilerWorkers ?? 2, cpuCoresX64: globalCPUSelections.x64, cpuCoresX86: globalCPUSelections.x86, openGLBackend: 'auto', cDrive: $('global-c-drive').value, drives: {}, language: $('ui-language').value, theme: $('ui-theme').value };
+  const defaults = { spatialHeadphones: $('spatial-headphones').checked, windowsFont: $('windows-font').value, nativeV8Bridge: state.globalSettings.nativeV8Bridge === true, nativeLibraryBridge: state.globalSettings.nativeLibraryBridge === true, compilerWorkers: state.globalSettings.compilerWorkers ?? 2, cpuCoresX64: globalCPUSelections.x64, cpuCoresX86: globalCPUSelections.x86, openGLBackend: 'auto', cDrive: $('global-c-drive').value, drives: {}, language: $('ui-language').value, theme: $('ui-theme').value };
   defaults.certificateRootsFile = $('certificate-roots-file').checked;
   defaults.certificateRootsPath = $('certificate-roots-path').value;
   for (const row of document.querySelectorAll('.global-drive-row')) {

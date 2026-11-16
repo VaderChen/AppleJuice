@@ -38,7 +38,7 @@ void metal_geometry_metadata(MetalShader& shader,std::span<const std::uint8_t> b
        (shader.geometry_input!=1 && shader.geometry_input!=2 && shader.geometry_input!=3 && shader.geometry_input!=6 && shader.geometry_input!=7) ||
        (shader.geometry_output!=1 && shader.geometry_output!=3 && shader.geometry_output!=5))
         throw std::invalid_argument("幾何階段圖元／頂點配額不支援");
-    for(const auto& v:shader.output_varyings)if(!v.components || v.components>4 || (v.system!=0 && v.system!=NAME_POSITION && v.system!=NAME_RENDER_TARGET_ARRAY_INDEX && v.system!=NAME_VIEWPORT_ARRAY_INDEX && v.system!=NAME_CLIP_DISTANCE))
+    for(const auto& v:shader.output_varyings)if(!v.components || v.components>4 || (v.system!=0 && v.system!=NAME_POSITION && v.system!=NAME_RENDER_TARGET_ARRAY_INDEX && v.system!=NAME_VIEWPORT_ARRAY_INDEX && v.system!=NAME_CLIP_DISTANCE && v.system!=NAME_CULL_DISTANCE))
         throw std::invalid_argument("幾何輸出 semantic 尚未映射："+v.semantic);
 }
 struct MetalFunctionText {std::size_t begin{},end{};std::vector<std::string> parameters,names;};
@@ -83,6 +83,29 @@ std::string metal_unpack_varying(const MetalVarying& v,const std::string& field)
 std::string metal_assign_varying(const MetalVarying& v,const std::string& destination,const std::string& packed){
     if(v.clip_count){std::string code;for(unsigned i=0;i<v.components;++i)code+=destination+(v.clip_count>1?"["+std::to_string(v.clip_offset+i)+"]":"")+"=("+packed+")."+std::string(1,"xyzw"[i])+";\n";return code;}
     return destination+"="+metal_unpack_varying(v,packed)+";\n";
+}
+// CullDistance 與 ClipDistance 不同：同一平面的所有頂點皆為負值才丟棄整個圖元。
+// 部分頂點為負時保留完整圖元，不能映射成逐像素裁切。
+std::string metal_primitive_cull(const MetalShader& shader,unsigned width,const std::string& vertex){
+    std::string result;
+    for(const auto& v:shader.output_varyings)if(v.system==NAME_CULL_DISTANCE)for(unsigned c=0;c<v.components;++c){
+        if(!result.empty())result+=" || ";result+='(';
+        for(unsigned k=0;k<width;++k){if(k)result+=" && ";result+=vertex+"[i-"+std::to_string(k)+"]."+v.name+(v.components>1?"."+std::string(1,"xyzw"[c]):"")+" < 0.0f";}
+        result+=')';
+    }
+    return result;
+}
+bool metal_vertex_cull_needed(MetalShader& shader){
+    if(shader.primitive_cull>=0)return shader.primitive_cull!=0;
+    for(const auto& v:shader.output_varyings)if(v.system==NAME_CULL_DISTANCE){
+        // 能證明所有寫入都是零時，平面永不剔除，不需要額外的圖元階段。
+        // 其餘值與控制流程一律交由 GPU 判定；分析只在首次建立繪製路徑時執行。
+        const std::regex use("output\\."+v.name+"\\b");
+        const std::regex zero("output\\."+v.name+R"(\s*=\s*(?:0(?:\.0*)?f?|float[234]\(0(?:\.0*)?f?\))\s*;)");
+        const auto remainder=std::regex_replace(shader.source,zero,"");
+        if(std::regex_search(remainder,use)){shader.primitive_cull=1;return true;}
+    }
+    shader.primitive_cull=0;return false;
 }
 std::vector<unsigned> metal_free_buffers(const MetalShader& shader,const std::array<int,32>* slots,unsigned count){
     std::set<unsigned> occupied;
@@ -215,6 +238,13 @@ MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDesc
         for(unsigned i=0;i<gs.output_varyings.size();++i)code<<"x64Results[at+"<<i<<"]="<<(gs.output_varyings[i].system==NAME_POSITION?"float4(2,2,2,1)":"float4(0)")<<";\n";
         code<<"}}\n";const bool position=std::any_of(gs.output_varyings.begin(),gs.output_varyings.end(),[](const auto& v){return v.system==NAME_POSITION;});if(position){code<<"vertex Mtl_GeometryOut x64GeometryDraw(device const float4* data [[buffer(0)]],uint x64Index [[vertex_id]]){Mtl_GeometryOut output{};uint at=x64Index*"<<gs.output_varyings.size()<<";\n";
         for(unsigned i=0;i<gs.output_varyings.size();++i)code<<metal_assign_varying(gs.output_varyings[i],"output."+gs.output_varyings[i].name,"data[at+"+std::to_string(i)+"]");
+        // 串流輸出在圖元剔除之前：保留展開的全部資料，只在光柵化入口依同一圖元的所有頂點判定。
+        std::string cull;
+        for(unsigned n=0;n<gs.output_varyings.size();++n){const auto& v=gs.output_varyings[n];if(v.system!=NAME_CULL_DISTANCE)continue;
+            for(unsigned c=0;c<v.components;++c){if(!cull.empty())cull+=" || ";cull+='(';
+                for(unsigned k=0;k<output_width;++k){if(k)cull+=" && ";cull+="data[((x64Index-x64Index%"+std::to_string(output_width)+"u)+"+std::to_string(k)+"u)*"+std::to_string(gs.output_varyings.size())+"u+"+std::to_string(n)+"u]."+std::string(1,"xyzw"[c])+" < 0.0f";}
+                cull+=')';}}
+        if(!cull.empty())code<<"if("<<cull<<")output.mtl_Position=float4(2,2,2,1);\n";
         code<<"return output;}\n";}auto program=gs.geometry_output==1?code.str():metal_nonpoint_source(code.str());
         {MetalStallScope timing("geometry_compute_library",gs.serial,2);
         library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:program.c_str()] options:options error:&error];}
@@ -401,6 +431,7 @@ std::shared_ptr<const MetalGeometryMesh> MetalGl::graphics_geometry_mesh(const G
         if(split){code<<"X64MeshVertex x64Vertex;";for(const auto& f:fields)code<<"x64Vertex."<<f<<"=emitted.vertices[i]."<<f<<";";code<<"x64Mesh.set_vertex(x64Lane*"<<limit_vertices<<"u+i,x64Vertex);}\n";}
         else code<<"x64Mesh.set_vertex(x64Lane*"<<limit_vertices<<"u+i,emitted.vertices[i]);}\n";
         code<<"for(uint i=0;i<x64Count && x64Written<"<<primitives<<"u;++i){if(i==0 || emitted.strips[i]!=emitted.strips[i-1])x64StripStart=i;if(i-x64StripStart+1<"<<width<<"u)continue;\n";
+        if(const auto cull=metal_primitive_cull(*gs,width,"emitted.vertices");!cull.empty())code<<"if("<<cull<<")continue;\n";
         code<<"const uint x64Slot=x64Lane*"<<primitives<<"u+x64Written;for(uint k=0;k<"<<width<<"u;++k){uint j=i;";
         if(width==2)code<<"j=i-1+k;";
         if(width==3)code<<"j=i-2+k;if(((i-x64StripStart)&1u) && k<2)j=i-1-k;";

@@ -2,6 +2,7 @@ const auto xinput_result=[&]() -> std::uint32_t {
     // DirectInput／RawInput 沿用相同 backend 與事件輪詢；XInput 僅使用明確的 gamepad profile。
     // 入口家族：GetState／SetState／GetCapabilities／Enable／GetBatteryInformation／GetKeystroke／
     // GetAudioDeviceIds（1_4）／GetDSoundAudioDeviceGuids（1_3）／#100 GetStateEx／#108 GetCapabilitiesEx（1_4）。
+    if(name=="DllMain")return 1U;
     const bool capabilities_ex=name=="#108";
     const auto index=static_cast<std::uint32_t>(arg(capabilities_ex?1:0));
     const unsigned output_index=name=="XInputGetCapabilities"?2:name=="XInputGetBatteryInformation" || name=="XInputGetKeystroke"?2:capabilities_ex?3:1;

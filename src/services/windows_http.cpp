@@ -38,6 +38,7 @@ void add_headers(HttpHeaders& headers,std::u16string_view text,std::uint32_t fla
 }
 std::span<const WindowsServiceDescriptor> http_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"wininet.dll","InternetAttemptConnect",1},
         {"wininet.dll","InternetCheckConnectionA",3},{"wininet.dll","InternetCheckConnectionW",3},
         {"wininet.dll","InternetGetConnectedState",2},{"wininet.dll","InternetGetConnectedStateEx",4},{"wininet.dll","InternetGetConnectedStateExA",4},{"wininet.dll","InternetGetConnectedStateExW",4},
         {"wininet.dll","CreateUrlCacheGroup",2},{"wininet.dll","DeleteUrlCacheGroup",3,1},{"wininet.dll","SetUrlCacheEntryGroup",6,4},{"wininet.dll","SetUrlCacheEntryGroupA",6,4},{"wininet.dll","SetUrlCacheEntryGroupW",6,4},
@@ -172,13 +173,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
             if(ansi){std::vector<std::uint8_t> bytes(message.begin(),message.end());bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);}
             else memory.write(GuestAddress{arg(1)},utf16_bytes(wide_latin(message)));
             memory.store(GuestAddress{arg(2)},32,chars);result=1;
-        }else if(symbol.starts_with("InternetGetConnectedState")){
+        }else if(symbol=="InternetAttemptConnect" || symbol.starts_with("InternetGetConnectedState")){
             // 依宿主網路設定：有已啟用、非回送且有預設閘道的介面即為 LAN 連線（一般 PC 回報 LAN｜RAS_INSTALLED）；否則 OFFLINE。
-            const bool extended=symbol.starts_with("InternetGetConnectedStateEx");
-            if(!arg(0) || d(extended?3:1))throw HttpError{87};
+            const bool attempt=symbol=="InternetAttemptConnect",extended=symbol.starts_with("InternetGetConnectedStateEx");
+            // InternetAttemptConnect 直接回傳 DWORD 錯誤碼；不套用 BOOL／LastError 契約。
+            if(attempt && d(0)){arg.return_to(state,87);return std::nullopt;}
+            if(!attempt && (!arg(0) || d(extended?3:1)))throw HttpError{87};
             NetworkConfiguration config;bool online=false;
             if(runtime_.network.external_io && snapshot_network_configuration(config))
                 online=std::any_of(config.interfaces.begin(),config.interfaces.end(),[](const auto& item){return item.status==1 && item.type!=24 && !item.gateways.empty();});
+            if(attempt){arg.return_to(state,online?0U:2250U);return std::nullopt;}
             memory.check(GuestAddress{arg(0)},4,Access::Write);memory.store(GuestAddress{arg(0)},32,online?0x12U:0x20U);
             if(extended && arg(1) && d(2)){
                 const std::u16string name=online?u"LAN Connection":u"";const auto count=std::min<std::size_t>(name.size(),d(2)-1);

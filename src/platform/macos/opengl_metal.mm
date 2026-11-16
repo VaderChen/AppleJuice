@@ -66,7 +66,7 @@ Matrix identity(){Matrix m{};m[0]=m[5]=m[10]=m[15]=1;return m;}
 // STENCIL_TEST、RESCALE_NORMAL、POLYGON_OFFSET_*、光照相關，以及 GL_AUTO_NORMAL 與 GL_MAP1_*／GL_MAP2_* 求值器開關（由 GLU NURBS 與求值器讀取）。
 bool toggle_cap(unsigned cap){
     return cap==0xb71 || cap==0xb90 || cap==0xbc0 || cap==0xbe2 || cap==0xc11 || cap==0xde1 || cap==0xde0 || cap==0xb44 || cap==0xb60 || cap==0x8037 || cap==0x2a01 || cap==0x2a02 ||
-        lighting_cap(cap) || cap==0xd80 || (cap>=0xd90 && cap<=0xd98) || (cap>=0xdb0 && cap<=0xdb8);
+        lighting_cap(cap) || (cap>=0xc60 && cap<=0xc63) || cap==0xb24 || cap==0xb42 || cap==0xbf1 || cap==0xbf2 || cap==0xd80 || (cap>=0xd90 && cap<=0xd98) || (cap>=0xdb0 && cap<=0xdb8);
 }
 Matrix multiply(const Matrix& a,const Matrix& b){Matrix m{};for(unsigned c=0;c<4;++c)for(unsigned r=0;r<4;++r)for(unsigned k=0;k<4;++k)m[c*4+r]+=a[k*4+r]*b[c*4+k];return m;}
 struct Vertex {Vec position{},color{},texcoord{},normal{},ambient{},diffuse{},specular{},emission{},shininess{};};
@@ -80,11 +80,17 @@ struct Texture {bool created{};id<MTLTexture> native;std::shared_ptr<GpuMemoryRe
     unsigned target{};};
 struct TextureEnvironment {unsigned mode{};Vec color{};};
 struct GlStencil {unsigned function{0x207},reference{},read_mask{UINT32_MAX},write_mask{UINT32_MAX},fail{0x1e00},depth_fail{0x1e00},pass{0x1e00},clear{};};
+// glPixelTransfer（GL_PIXEL_MODE_BIT）：色彩與深度的縮放／偏移、索引位移與 MAP_COLOR／MAP_STENCIL。
+struct PixelTransferState {std::array<float,4> scale{1,1,1,1},bias{};float depth_scale{1},depth_bias{};int index_shift{},index_offset{};bool map_color{},map_stencil{};};
+// glTexGen 的單一座標：模式、物件平面與已換到眼座標的平面。
+struct TexGen {unsigned mode{0x2400};std::array<double,4> object{},eye{};};
 struct State {
     Vec color{1,1,1,1},texcoord{0,0,0,1},normal{0,0,1,0},clear{};
     std::array<Light,8> lights=default_lights();std::array<Material,2> materials;
     Fog fog;unsigned fog_hint{0x1100},perspective_hint{0x1100};
-    GlStencil stencil;
+    GlStencil stencil;PixelTransferState transfer;
+    // glClearAccum（GL_ACCUM_BUFFER_BIT）與 glLogicOp（GL_COLOR_BUFFER_BIT）。
+    Vec accum_clear{};unsigned logic_op{0x1503};
     std::array<double,2> depth_range{0,1};double depth_clear{1};bool depth_write{true};
     std::array<float,2> polygon_offset{};
     // glColorMask 位元依 R、G、B、A；線寬依 ALIASED_LINE_WIDTH_RANGE=[1,1] 柵格化，但保留查詢值。
@@ -106,6 +112,12 @@ struct State {
     unsigned color_material_face{0x408},color_material_mode{0x1602};
     // glMapGrid1／2：{分段數,起點,終點}、{u 分段,u1,u2,v 分段,v1,v2}。
     std::array<double,3> grid1{1,0,1};std::array<double,6> grid2{1,0,1,1,0,1};
+    // glTexGen：S、T 的預設平面為 (1,0,0,0)、(0,1,0,0)；texgen_mask 快取 GL_TEXTURE_GEN_S～Q（0x0C60～0x0C63）的啟用位元，vertex() 只檢查這個值。
+    std::array<TexGen,4> texgen{{{0x2400,{1,0,0,0},{1,0,0,0}},{0x2400,{0,1,0,0},{0,1,0,0}},{},{}}};unsigned texgen_mask{};
+    // glClipPlane：GL_CLIP_PLANE0～7 的眼座標平面（GL_TRANSFORM_BIT）。
+    std::array<std::array<double,4>,8> clip_planes{};
+    // glLineStipple（GL_LINE_BIT）與 glPolygonStipple（GL_POLYGON_STIPPLE_BIT）：預設全部繪製。
+    unsigned line_stipple_factor{1},line_stipple_pattern{0xffff};std::array<std::uint32_t,32> polygon_stipple=[]{std::array<std::uint32_t,32> rows{};rows.fill(UINT32_MAX);return rows;}();
 };
 struct Command {GlOperation op;std::vector<std::uint64_t> args;std::vector<std::uint8_t> data;};
 struct Array {int size{};unsigned type{};std::vector<std::uint8_t> bytes;bool enabled{};};
@@ -347,6 +359,62 @@ class MetalGl final:public NativeOpenGlContext {
     std::array<double,4> eval_value(unsigned,double,double,std::array<double,4>*,std::array<double,4>*);
     void eval_vertex(double,double,bool);
     std::uint64_t evaluator(GlOperation,std::span<const std::uint64_t>,std::span<const std::uint8_t>,std::span<std::uint8_t>);
+    // 選取與回饋模式（metal_select.inc）：命中紀錄與回饋值只在 RenderMode 離開時交給服務層。
+    static constexpr std::size_t max_name_stack_depth=128;
+    struct SelectState {std::uint32_t size{};bool buffer{},hit{},overflow{};std::vector<std::uint32_t> names,records;std::uint32_t hits{};double min_z{},max_z{};};
+    struct FeedbackState {std::uint32_t size{},type{0x0600};bool buffer{},overflow{};std::vector<float> values;};
+public:
+    struct FeedbackVertex {std::array<double,4> clip{},eye{};Vec color{0,0,0,1},texcoord{0,0,0,1};};
+private:
+    SelectState select_;FeedbackState feedback_;
+    std::array<double,4> window_coordinates(const std::array<double,4>&)const;
+    void select_hit(double);void write_hit_record();void feedback_values(std::initializer_list<double>);void feedback_vertex(const FeedbackVertex&);
+    void raster_feedback(unsigned token);void feedback_primitive();
+    std::uint64_t select_feedback(GlOperation,std::span<const std::uint64_t>,std::span<std::uint8_t>);
+    // 使用者剪裁面（metal_clip.inc）：GL_MAX_CLIP_PLANES 為 8，與可程式路徑的 gl_ClipDistance 數量相同。
+    static constexpr unsigned max_clip_planes=8;
+    std::uint64_t clip_plane(GlOperation,std::span<const std::uint64_t>,std::span<const std::uint8_t>,std::span<std::uint8_t>);
+    std::array<Vec,9> clip_uniform(bool clearing)const;
+    // 像素傳輸、glDrawPixels／glCopyPixels 與 glReadPixels 的一般格式（metal_pixel_transfer.inc）。
+    struct PixelStore {bool swap{},lsb{};std::size_t row{},skip_rows{},skip_pixels{},align{4};};
+    struct PixelGeometry {bool bitmap{};std::size_t element{},group{},stride{};};
+    // kind：1 色彩（每像素 RGBA）、2 深度、3 模板。
+    struct PixelImage {unsigned width{},height{},kind{};std::vector<float> values;};
+    struct PixelDraw {unsigned kind{};id<MTLTexture> image{nil};std::array<float,8> params{};};
+    std::array<std::vector<float>,10> pixel_maps_=[]{std::array<std::vector<float>,10> maps;for(auto& map:maps)map.assign(1,0.F);return maps;}();
+    PixelDraw pixel_draw_;
+    PixelStore pixel_store(bool pack,unsigned width,bool canonical)const;
+    static PixelGeometry pixel_geometry(const PixelStore&,unsigned format,unsigned type);
+    bool color_transfer_active()const;void color_transfer(std::array<float,4>&)const;
+    std::int64_t index_transfer(std::int64_t)const;std::array<float,4> index_to_rgba(std::int64_t)const;std::int64_t stencil_transfer(std::int64_t)const;float depth_transfer(float)const;
+    std::uint64_t pixel_transfer(GlOperation,std::span<const std::uint64_t>,std::span<const std::uint8_t>,std::span<std::uint8_t>);
+    std::optional<std::vector<float>> pixel_transfer_query(unsigned pname)const;
+    std::optional<PixelImage> unpack_image(unsigned width,unsigned height,unsigned format,unsigned type,std::span<const std::uint8_t>,bool canonical);
+    std::pair<std::vector<std::uint64_t>,std::vector<std::uint8_t>> pixels_record(std::span<const std::uint64_t>,std::span<const std::uint8_t>);
+    template<class Emit> void window_space(Emit&& emit);
+    void draw_pixel_image(const PixelImage&);
+    void draw_pixels(std::span<const std::uint64_t>,std::span<const std::uint8_t>);void copy_pixels(std::span<const std::uint64_t>);
+    std::vector<float> read_color(std::int32_t x,std::int32_t y,unsigned width,unsigned height);
+    std::vector<float> read_depth_stencil(std::int32_t x,std::int32_t y,unsigned width,unsigned height,bool stencil);
+    std::uint64_t pack_pixels(std::span<const float>,unsigned channels,unsigned width,unsigned height,unsigned format,unsigned type,bool luminance_sum,std::span<std::uint8_t>);
+    void read_pixels(std::span<const std::uint64_t>,std::span<std::uint8_t>);
+    void pixel_depth_stencil_state(MTLDepthStencilDescriptor*)const;
+    // 累積緩衝與邏輯運算（metal_accumulation.inc）。
+    id<MTLTexture> accum_{nil};std::shared_ptr<GpuMemoryReservation> accum_lease_;id<MTLComputePipelineState> accum_pipeline_{nil};
+    std::uint64_t accumulation(GlOperation,std::span<const std::uint64_t>);
+    std::optional<std::vector<float>> accumulation_query(unsigned pname)const;
+    bool logic_active(bool clearing,bool fixed)const;
+    void ensure_accum();void accum_compute(unsigned op,float value,Vec clear);void accum_dispatch(unsigned op,float value,Vec clear,MTLScissorRect region);void accum_return(float value);
+    // 點畫（metal_stipple.inc）。
+    std::uint64_t stipple(GlOperation,std::span<const std::uint64_t>,std::span<const std::uint8_t>,std::span<std::uint8_t>);
+    void line_stipple_counters(std::vector<Vertex>&,bool independent);
+    std::array<std::uint32_t,36> stipple_uniform(MTLPrimitiveType,bool clearing)const;
+    // glGetTexImage（metal_get_tex_image.inc）。
+    std::uint64_t get_tex_image(std::span<const std::uint64_t>,std::span<std::uint8_t>);
+    // glTexGen（metal_texgen.inc）。
+    std::uint64_t texgen(GlOperation,std::span<const std::uint64_t>,std::span<const std::uint8_t>,std::span<std::uint8_t>);
+    void apply_texgen(const Vec&,Vec&);
+    unsigned texgen_mask()const;
     std::shared_ptr<GlBuffer> gl_buffer(unsigned);
     std::shared_ptr<GraphicsResource> gl_buffer_resource(const std::shared_ptr<GlBuffer>&);
     void gl_buffer_update(const std::shared_ptr<GlBuffer>&,std::span<const std::uint8_t>,std::uint32_t);
@@ -372,6 +440,43 @@ class MetalGl final:public NativeOpenGlContext {
         std::map<unsigned,std::array<unsigned,6>> texture_parameters;
     };
     std::vector<AttributeSnapshot> attributes_;
+    // glPushAttrib／glPopAttrib 與 wglCopyContext 共用：依屬性位元擷取目前狀態，或把快照中的位元群組套回目前狀態。
+    AttributeSnapshot capture_attributes(unsigned mask){
+        AttributeSnapshot snapshot;snapshot.mask=mask;snapshot.state=state_;
+        snapshot.programmable={gl_.src_alpha,gl_.dst_alpha,gl_.equation_rgb,gl_.equation_alpha,gl_.polygon_mode};snapshot.current_attributes=gl_.attribute_values;
+        if(mask&0x40000){
+            snapshot.active=gl_.active_texture;snapshot.units=gl_.texture_units;snapshot.units[snapshot.active]=state_.binding;
+            for(const auto id:snapshot.units)if(const auto t=textures_.find(id);t!=textures_.end())snapshot.texture_parameters[id]={t->second.min,t->second.mag,t->second.s,t->second.t,t->second.anisotropy,t->second.max_level};
+        }
+        return snapshot;
+    }
+    void restore_attributes(const AttributeSnapshot& snapshot){
+        const auto mask=snapshot.mask;const auto& s=snapshot.state;
+
+        if(mask==0xfffffU)state_=s;
+        if(mask&0x10000){state_.grid1=s.grid1;state_.grid2=s.grid2;for(unsigned cap=0xd80;cap<=0xdb8;++cap)if(cap==0xd80 || gl_map_components(cap)){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}}
+        if(mask&1)gl_.attribute_values=snapshot.current_attributes;
+        if(mask&2)state_.point_size=s.point_size;
+        if(mask&0x4000)state_.index_mask=s.index_mask;
+        if(mask&0x4000)state_.clear_index=s.clear_index;if(mask&0x20000)state_.list_base=s.list_base;
+        if(mask&1){state_.current_index=s.current_index;state_.edge_flag=s.edge_flag;state_.raster_valid=s.raster_valid;state_.raster_position=s.raster_position;state_.raster_color=s.raster_color;state_.raster_texcoord=s.raster_texcoord;state_.raster_index=s.raster_index;state_.raster_distance=s.raster_distance;}
+        if(mask&0x40){state_.light_model_ambient=s.light_model_ambient;state_.light_model_local=s.light_model_local;state_.light_model_two_side=s.light_model_two_side;state_.light_model_color_control=s.light_model_color_control;state_.color_material_face=s.color_material_face;state_.color_material_mode=s.color_material_mode;}
+        if(mask&0x4000){gl_.src_alpha=snapshot.programmable[0];gl_.dst_alpha=snapshot.programmable[1];gl_.equation_rgb=snapshot.programmable[2];gl_.equation_alpha=snapshot.programmable[3];}
+        if(mask&0x20){state_.read_buffer=s.read_buffer;state_.transfer=s.transfer;}
+        if(mask&0x200)state_.accum_clear=s.accum_clear;
+        if(mask&0x4000){state_.logic_op=s.logic_op;for(const unsigned cap:{0xbf1U,0xbf2U}){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}}
+        if(mask&8){state_.polygon_offset=s.polygon_offset;for(const unsigned cap:{0x8037U,0x2a01U,0x2a02U}){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}gl_.polygon_mode=snapshot.programmable[4];state_.cull_face=s.cull_face;state_.front_face=s.front_face;state_.enabled.erase(0xb44);if(s.enabled.contains(0xb44))state_.enabled.insert(0xb44);}
+
+        if(mask&0x40000){
+            gl_.active_texture=snapshot.active;gl_.texture_units=snapshot.units;state_.binding=s.binding;state_.binding_1d=s.binding_1d;state_.environments=s.environments;
+            for(const unsigned cap:{0xde0U,0xde1U,0xc60U,0xc61U,0xc62U,0xc63U}){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}state_.texgen=s.texgen;
+            // 還原參數與綁定，不回退 Push 之後更新的貼圖影像與資源。
+            for(const auto& [id,p]:snapshot.texture_parameters){auto& t=textures_[id];t.min=p[0];t.mag=p[1];t.s=p[2];t.t=p[3];t.anisotropy=p[4];t.max_level=p[5];}
+        }
+        if(mask&1){state_.color=s.color;state_.texcoord=s.texcoord;state_.normal=s.normal;}if(mask&0x40){state_.lights=s.lights;state_.materials=s.materials;for(unsigned cap:{0xb50U,0xb57U,0x4000U,0x4001U,0x4002U,0x4003U,0x4004U,0x4005U,0x4006U,0x4007U}){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}}if(mask&0x8000){state_.fog_hint=s.fog_hint;state_.perspective_hint=s.perspective_hint;}if(mask&0x80){state_.fog=s.fog;state_.enabled.erase(0xb60);if(s.enabled.contains(0xb60))state_.enabled.insert(0xb60);}if(mask&0x100){state_.depth_clear=s.depth_clear;state_.depth_func=s.depth_func;state_.depth_write=s.depth_write;state_.enabled.erase(0xb71);if(s.enabled.contains(0xb71))state_.enabled.insert(0xb71);}if(mask&0x400){state_.stencil=s.stencil;state_.enabled.erase(0xb90);if(s.enabled.contains(0xb90))state_.enabled.insert(0xb90);}if(mask&0x800){state_.viewport=s.viewport;state_.depth_range=s.depth_range;}if(mask&0x1000){state_.matrix_mode=s.matrix_mode;state_.enabled.erase(0xba1);if(s.enabled.contains(0xba1))state_.enabled.insert(0xba1);
+            state_.clip_planes=s.clip_planes;for(unsigned cap=0x3000;cap<0x3000+max_clip_planes;++cap){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}}if(mask&0x2000)state_.enabled=s.enabled;if(mask&0x4000){state_.alpha_func=s.alpha_func;state_.alpha_ref=s.alpha_ref;state_.enabled.erase(0xbc0);if(s.enabled.contains(0xbc0))state_.enabled.insert(0xbc0);state_.clear=s.clear;state_.draw_buffer=s.draw_buffer;state_.blend_src=s.blend_src;state_.blend_dst=s.blend_dst;state_.enabled.erase(0xbe2);if(s.enabled.contains(0xbe2))state_.enabled.insert(0xbe2);}if(mask&0x4000)state_.color_mask=s.color_mask;if(mask&4){state_.line_width=s.line_width;state_.line_stipple_factor=s.line_stipple_factor;state_.line_stipple_pattern=s.line_stipple_pattern;state_.enabled.erase(0xb24);if(s.enabled.contains(0xb24))state_.enabled.insert(0xb24);}
+        if(mask&0x10)state_.polygon_stipple=s.polygon_stipple;if(mask&8){state_.enabled.erase(0xb42);if(s.enabled.contains(0xb42))state_.enabled.insert(0xb42);}if(mask&0x20)state_.pixel_zoom=s.pixel_zoom;if(mask&0x80000){state_.scissor=s.scissor;state_.enabled.erase(0xc11);if(s.enabled.contains(0xc11))state_.enabled.insert(0xc11);}state_.texgen_mask=texgen_mask();
+    }
     GlSharedNames<std::vector<Command>> lists_;
     GlSharedCounter next_list_{1},next_texture_{1};
     unsigned compiling_{},compile_mode_{},recursion_{},error_{},primitive_{};
@@ -688,11 +793,12 @@ class MetalGl final:public NativeOpenGlContext {
     static bool factor(unsigned x){return x<=1 || (x>=0x300 && x<=0x308);}
     static MTLBlendFactor blend(unsigned x){switch(x){case 0:return MTLBlendFactorZero;case 1:return MTLBlendFactorOne;case 0x300:return MTLBlendFactorSourceColor;case 0x301:return MTLBlendFactorOneMinusSourceColor;case 0x302:return MTLBlendFactorSourceAlpha;case 0x303:return MTLBlendFactorOneMinusSourceAlpha;case 0x304:return MTLBlendFactorDestinationAlpha;case 0x305:return MTLBlendFactorOneMinusDestinationAlpha;case 0x306:return MTLBlendFactorDestinationColor;case 0x307:return MTLBlendFactorOneMinusDestinationColor;default:return MTLBlendFactorSourceAlphaSaturated;}}
     id<MTLRenderPipelineState> pipeline(bool clear,bool color_write=true,bool fixed=false,MTLPixelFormat color_format=MTLPixelFormatBGRA8Unorm,MTLPixelFormat depth_format=MTLPixelFormatDepth32Float_Stencil8,unsigned samples=1){
-        const bool blending=!clear && state_.enabled.contains(0xbe2);const std::uint64_t flags=(blending?1ULL:0ULL)|(std::uint64_t{state_.blend_src}<<1)|(std::uint64_t{state_.blend_dst}<<16)|(color_write?1ULL<<40:0)|(fixed?1ULL<<41:0)|(std::uint64_t{state_.color_mask&15U}<<42);
+        // 邏輯運算與 GL_RETURN 取代混色。
+        const bool logic=logic_active(clear,fixed);const bool blending=!clear && !logic && pixel_draw_.kind!=4 && state_.enabled.contains(0xbe2);const std::uint64_t flags=(logic?1ULL<<49:0)|(blending?1ULL:0ULL)|(std::uint64_t{state_.blend_src}<<1)|(std::uint64_t{state_.blend_dst}<<16)|(color_write?1ULL<<40:0)|(fixed?1ULL<<41:0)|(std::uint64_t{state_.color_mask&15U}<<42)|(std::uint64_t{pixel_draw_.kind}<<46);
         MetalPipelineKey fields;fields<<'f'<<flags<<color_format<<depth_format<<samples<<gl_.src_alpha<<gl_.dst_alpha<<gl_.equation_rgb<<gl_.equation_alpha;const auto& key=fields.str();
         if(const auto found=gl_pipelines_.get(key))return *found;
-        auto desc=[MTLRenderPipelineDescriptor new];desc.vertexFunction=[library_ newFunctionWithName:fixed?@"fixed_vertex_main":@"vertex_main"];desc.fragmentFunction=[library_ newFunctionWithName:@"fragment_main"];desc.colorAttachments[0].pixelFormat=color_format;desc.depthAttachmentPixelFormat=depth_format;desc.stencilAttachmentPixelFormat=depth_format==MTLPixelFormatDepth32Float_Stencil8?depth_format:MTLPixelFormatInvalid;desc.sampleCount=samples;
-        auto attachment=desc.colorAttachments[0];attachment.blendingEnabled=blending;attachment.sourceRGBBlendFactor=blend(state_.blend_src);attachment.sourceAlphaBlendFactor=blend(gl_.src_alpha);attachment.destinationRGBBlendFactor=blend(state_.blend_dst);attachment.destinationAlphaBlendFactor=blend(gl_.dst_alpha);const auto equation=[](unsigned v){switch(v){case 0x800a:return MTLBlendOperationSubtract;case 0x800b:return MTLBlendOperationReverseSubtract;case 0x8007:return MTLBlendOperationMin;case 0x8008:return MTLBlendOperationMax;default:return MTLBlendOperationAdd;}};attachment.rgbBlendOperation=equation(gl_.equation_rgb);attachment.alphaBlendOperation=equation(gl_.equation_alpha);attachment.writeMask=color_write?((state_.color_mask&1U?MTLColorWriteMaskRed:MTLColorWriteMaskNone)|(state_.color_mask&2U?MTLColorWriteMaskGreen:MTLColorWriteMaskNone)|(state_.color_mask&4U?MTLColorWriteMaskBlue:MTLColorWriteMaskNone)|(state_.color_mask&8U?MTLColorWriteMaskAlpha:MTLColorWriteMaskNone)):MTLColorWriteMaskNone;
+        auto desc=[MTLRenderPipelineDescriptor new];desc.vertexFunction=[library_ newFunctionWithName:fixed?@"fixed_vertex_main":@"vertex_main"];desc.fragmentFunction=[library_ newFunctionWithName:pixel_draw_.kind==1?(logic?@"fragment_pixels_logic":@"fragment_pixels"):pixel_draw_.kind==2?(logic?@"fragment_pixels_depth_logic":@"fragment_pixels_depth"):pixel_draw_.kind==3?@"fragment_pixels_stencil":pixel_draw_.kind==4?@"fragment_accum_return":logic?@"fragment_main_logic":@"fragment_main"];desc.colorAttachments[0].pixelFormat=color_format;desc.depthAttachmentPixelFormat=depth_format;desc.stencilAttachmentPixelFormat=depth_format==MTLPixelFormatDepth32Float_Stencil8?depth_format:MTLPixelFormatInvalid;desc.sampleCount=samples;
+        auto attachment=desc.colorAttachments[0];attachment.blendingEnabled=blending;attachment.sourceRGBBlendFactor=blend(state_.blend_src);attachment.sourceAlphaBlendFactor=blend(gl_.src_alpha);attachment.destinationRGBBlendFactor=blend(state_.blend_dst);attachment.destinationAlphaBlendFactor=blend(gl_.dst_alpha);const auto equation=[](unsigned v){switch(v){case 0x800a:return MTLBlendOperationSubtract;case 0x800b:return MTLBlendOperationReverseSubtract;case 0x8007:return MTLBlendOperationMin;case 0x8008:return MTLBlendOperationMax;default:return MTLBlendOperationAdd;}};attachment.rgbBlendOperation=equation(gl_.equation_rgb);attachment.alphaBlendOperation=equation(gl_.equation_alpha);attachment.writeMask=color_write && pixel_draw_.kind!=3?((state_.color_mask&1U?MTLColorWriteMaskRed:MTLColorWriteMaskNone)|(state_.color_mask&2U?MTLColorWriteMaskGreen:MTLColorWriteMaskNone)|(state_.color_mask&4U?MTLColorWriteMaskBlue:MTLColorWriteMaskNone)|(state_.color_mask&8U?MTLColorWriteMaskAlpha:MTLColorWriteMaskNone)):MTLColorWriteMaskNone;
         NSError* e=nil;auto p=[device_ newRenderPipelineStateWithDescriptor:desc error:&e];if(!p)throw std::runtime_error(std::string("Metal GL pipeline: ")+e.localizedDescription.UTF8String);gl_pipelines_.put(key,p);return p;
     }
     MTLScissorRect scissor(bool enabled,unsigned width=0,unsigned height=0){
@@ -714,7 +820,7 @@ class MetalGl final:public NativeOpenGlContext {
         auto lease=reserve_gpu_memory(vertex_bytes+(fixed?fixed->indices.size_bytes():0));auto buffer=[device_ newBufferWithBytes:vertex_data length:vertex_bytes options:MTLResourceStorageModeShared];if(!buffer)throw std::bad_alloc{};
         id<MTLBuffer> indices=nil;if(fixed && !fixed->indices.empty()){indices=[device_ newBufferWithBytes:fixed->indices.data() length:fixed->indices.size_bytes() options:MTLResourceStorageModeShared];if(!indices)throw std::bad_alloc{};}
         auto depth=[MTLDepthStencilDescriptor new];depth.depthCompareFunction=clearing?MTLCompareFunctionAlways:state_.enabled.contains(0xb71)?static_cast<MTLCompareFunction>(state_.depth_func-0x200):MTLCompareFunctionAlways;depth.depthWriteEnabled=clearing?((clear_mask&0x100) && state_.depth_write):(state_.enabled.contains(0xb71) && state_.depth_write);
-        gl_stencil(depth,clearing,clear_mask);auto ds=cached_depth_state(depth);if(!ds)throw std::bad_alloc{};
+        gl_stencil(depth,clearing,clear_mask);if(pixel_draw_.kind==3 || pixel_draw_.kind==4)pixel_depth_stencil_state(depth);auto ds=cached_depth_state(depth);if(!ds)throw std::bad_alloc{};
         begin_commands(true,"lease");pending_leases_.push_back(std::move(lease));
         auto pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=render_color;pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionStore;pass.depthAttachment.texture=render_depth;pass.depthAttachment.loadAction=MTLLoadActionLoad;pass.depthAttachment.storeAction=MTLStoreActionStore;pass.stencilAttachment.texture=render_depth.pixelFormat==MTLPixelFormatDepth32Float_Stencil8?render_depth:nil;pass.stencilAttachment.loadAction=MTLLoadActionLoad;pass.stencilAttachment.storeAction=MTLStoreActionStore;
         if(fixed_targets_set_){pass.colorAttachments[0].level=fixed_color_.level;pass.colorAttachments[0].slice=fixed_color_.slice;graphics_pending_.push_back(fixed_color_.resource);if(fixed_depth_.resource){pass.depthAttachment.level=pass.stencilAttachment.level=fixed_depth_.level;pass.depthAttachment.slice=pass.stencilAttachment.slice=fixed_depth_.slice;graphics_pending_.push_back(fixed_depth_.resource);}}
@@ -736,9 +842,14 @@ class MetalGl final:public NativeOpenGlContext {
         lights[8].ambient=state_.light_model_ambient;lights[8].spot={state_.light_model_local?1.F:0.F,state_.light_model_two_side?1.F:0.F,state_.light_model_color_control==0x81fa?1.F:0.F,0};
         [enc setVertexBytes:lights.data() length:sizeof(lights) atIndex:4];[enc setVertexBytes:lighting_flags.data() length:sizeof(lighting_flags) atIndex:5];
         const float point_size=std::clamp(std::round(state_.point_size),1.F,64.F);[enc setVertexBytes:&point_size length:sizeof(point_size) atIndex:6];
+        // glClear 也以全畫面三角形經過此路徑，依規格不受使用者剪裁面影響。
+        const auto clip_planes=clip_uniform(clearing);[enc setVertexBytes:clip_planes.data() length:sizeof(clip_planes) atIndex:7];
         }
         const auto& fog=state_.fog;const std::array<Vec,2> fog_uniform{{fog.color,{fog.density,fog.start,fog.end,!clearing && state_.enabled.contains(0xb60)?static_cast<float>(fog.mode):0}}};
         [enc setFragmentBytes:fog_uniform.data() length:sizeof(fog_uniform) atIndex:1];
+        const auto stipple_state=stipple_uniform(primitive,clearing);[enc setFragmentBytes:stipple_state.data() length:sizeof(stipple_state) atIndex:3];
+        if(pixel_draw_.kind){[enc setFragmentTexture:pixel_draw_.image atIndex:1];[enc setFragmentBytes:pixel_draw_.params.data() length:sizeof(pixel_draw_.params) atIndex:4];}
+        if(logic_active(clearing,fixed!=nullptr)){const std::uint32_t code=state_.logic_op-0x1500;[enc setFragmentBytes:&code length:sizeof(code) atIndex:5];}
         const bool texture_1d=!state_.enabled.contains(0xde1) && state_.enabled.contains(0xde0);
         unsigned enabled=0;auto& t=*bound_texture(texture_1d?0xde0U:0xde1U);auto default_sampler=[MTLSamplerDescriptor new];[enc setFragmentTexture:textures_.at(UINT32_MAX).native atIndex:0];[enc setFragmentSamplerState:cached_sampler_state(default_sampler) atIndex:0];
         if(!clearing && (state_.enabled.contains(0xde1) || texture_1d)){
@@ -760,6 +871,8 @@ class MetalGl final:public NativeOpenGlContext {
         else [enc drawPrimitives:primitive vertexStart:0 vertexCount:fixed?fixed->vertices.size():vertices.size()];enc_scope.end();++draws_;if(++pending_>=128)flush(false);
     }
     void end_primitive(){
+        // 選取／回饋模式不繪製，改在 CPU 端裁切並產生命中或回饋記號。
+        if(state_.render_mode!=0x1c00){feedback_primitive();return;}
         std::vector<Vertex> expanded;MTLPrimitiveType type=MTLPrimitiveTypeTriangle;
         const auto add=[&](std::size_t i){expanded.push_back(vertices_[i]);};
         switch(primitive_){
@@ -773,11 +886,12 @@ class MetalGl final:public NativeOpenGlContext {
         case 8:for(std::size_t i=0;i+3<vertices_.size();i+=2){add(i);add(i+1);add(i+3);add(i);add(i+3);add(i+2);}break;
         default:error(0x500);break;
         }
+        if(type==MTLPrimitiveTypeLine && state_.enabled.contains(0xb24))line_stipple_counters(expanded,primitive_==1);
         draw(expanded,type);vertices_.clear();
     }
     static unsigned unit(unsigned type){switch(type){case 0x1400:case 0x1401:return 1;case 0x1402:case 0x1403:return 2;case 0x1404:case 0x1405:case 0x1406:return 4;case 0x140a:return 8;default:throw std::invalid_argument("GL scalar type");}}
     static double number(std::span<const std::uint8_t> b,std::size_t at,unsigned type){const auto size=unit(type);if(at>b.size() || size>b.size()-at)throw std::invalid_argument("GL scalar bounds");std::uint64_t n=0;std::memcpy(&n,b.data()+at,size);switch(type){case 0x1400:return static_cast<std::int8_t>(n);case 0x1401:return static_cast<std::uint8_t>(n);case 0x1402:return static_cast<std::int16_t>(n);case 0x1403:return static_cast<std::uint16_t>(n);case 0x1404:return static_cast<std::int32_t>(n);case 0x1405:return static_cast<std::uint32_t>(n);case 0x1406:return std::bit_cast<float>(static_cast<std::uint32_t>(n));default:return std::bit_cast<double>(n);}}
-    void vertex(Vec position){if(!begun_){error(0x502);return;}if(vertices_.size()>=1048576)throw std::bad_alloc{};Vec tex{};for(unsigned r=0;r<4;++r)for(unsigned k=0;k<4;++k)tex[r]+=matrices_[2].back()[k*4+r]*state_.texcoord[k];const auto& material=state_.materials[0];vertices_.push_back({position,state_.color,tex,state_.normal,material.ambient,material.diffuse,material.specular,material.emission,material.shininess});}
+    void vertex(Vec position){if(!begun_){error(0x502);return;}if(vertices_.size()>=1048576)throw std::bad_alloc{};Vec source=state_.texcoord;if(state_.texgen_mask)apply_texgen(position,source);Vec tex{};for(unsigned r=0;r<4;++r)for(unsigned k=0;k<4;++k)tex[r]+=matrices_[2].back()[k*4+r]*source[k];const auto& material=state_.materials[0];vertices_.push_back({position,state_.color,tex,state_.normal,material.ambient,material.diffuse,material.specular,material.emission,material.shininess});}
     // glColorMaterial 指定的面與參數追蹤目前色彩；被追蹤的參數不受 glMaterial 改寫。
     bool color_tracked(unsigned face,unsigned parameter)const{
         if(!state_.enabled.contains(0xb57) || (state_.color_material_face!=0x408 && state_.color_material_face!=0x404+face))return false;
@@ -790,11 +904,15 @@ class MetalGl final:public NativeOpenGlContext {
     // GL 1.1 §2.12：物件座標經模型視圖、投影變換後做剪裁測試，再以視埠與深度範圍換算；顏色與紋理座標取目前值。
     void raster_position(Vec object){
         const auto eye=transform(matrices_[0].back(),object);const auto clip=transform(matrices_[1].back(),eye);const auto w=clip[3];
-        state_.raster_valid=w>0 && std::abs(clip[0])<=w && std::abs(clip[1])<=w && std::abs(clip[2])<=w;if(!state_.raster_valid)return;
+        state_.raster_valid=w>0 && std::abs(clip[0])<=w && std::abs(clip[1])<=w && std::abs(clip[2])<=w;
+        // 光柵位置也依已啟用的使用者剪裁面（眼座標）判斷是否有效。
+        for(unsigned i=0;i<8 && state_.raster_valid;++i)if(state_.enabled.contains(0x3000+i)){const auto& p=state_.clip_planes[i];if(p[0]*eye[0]+p[1]*eye[1]+p[2]*eye[2]+p[3]*eye[3]<0)state_.raster_valid=false;}
+        if(!state_.raster_valid)return;
         const auto& v=state_.viewport;const auto& range=state_.depth_range;
         state_.raster_position={static_cast<float>((clip[0]/w+1)*v[2]/2+v[0]),static_cast<float>((clip[1]/w+1)*v[3]/2+v[1]),static_cast<float>((range[1]-range[0])/2*(clip[2]/w)+(range[0]+range[1])/2),w};
         const double scale=eye[3]!=0?1.0/eye[3]:1.0;state_.raster_distance=std::sqrt(eye[0]*eye[0]*scale*scale+eye[1]*eye[1]*scale*scale+eye[2]*eye[2]*scale*scale);
-        state_.raster_color=state_.color;state_.raster_index=state_.current_index;state_.raster_texcoord=transform(matrices_[2].back(),state_.texcoord);
+        state_.raster_color=state_.color;state_.raster_index=state_.current_index;{Vec source=state_.texcoord;if(state_.texgen_mask)apply_texgen(object,source);state_.raster_texcoord=transform(matrices_[2].back(),source);}
+        if(state_.render_mode==0x1c02)raster_feedback(0);
     }
     // GL 1.1 §3.6.4 glBitmap：位元 1 的位置產生片段（光柵色彩與紋理座標，照常經過 alpha／模板／深度測試與混色），左下角為光柵位置減 xorig／yorig 取整；
     // 光柵位置無效時不繪製也不前進，之後依 xmove／ymove 前進。資料依目前解包設定讀取；顯示清單內的記錄已在編譯時解包（a[7] 為 canonical 標記）。
@@ -826,24 +944,17 @@ class MetalGl final:public NativeOpenGlContext {
         const auto width=static_cast<std::int32_t>(static_cast<unsigned>(a[0])),height=static_cast<std::int32_t>(static_cast<unsigned>(a[1]));
         const auto f=[&](unsigned i){return std::bit_cast<float>(static_cast<unsigned>(a[i]));};
         if(width<0 || height<0){error(0x501);return;}if(begun_){error(0x502);return;}if(!state_.raster_valid)return;
-        const auto& v=state_.viewport;
-        if(width && height && !data.empty() && v[2]>0 && v[3]>0){
+        if(state_.render_mode!=0x1c00)raster_feedback(0x0704);
+        else if(width && height && !data.empty()){
             const auto bits=bitmap_bits(a,data,static_cast<unsigned>(width),static_cast<unsigned>(height));
-            const double x0=std::floor(state_.raster_position[0]-f(2)),y0=std::floor(state_.raster_position[1]-f(3));const auto& range=state_.depth_range;
-            const auto z=static_cast<float>(range[1]!=range[0]?(state_.raster_position[2]-(range[0]+range[1])/2)*2/(range[1]-range[0]):0);
-            // 以單位矩陣把視窗座標直接換成剪裁座標；暫停光照與剔除，片段帶光柵色彩與（已經過紋理矩陣的）光柵紋理座標。
-            struct Saved {MetalGl& gl;std::array<Matrix,3> matrices;std::set<unsigned> enabled;Vec color,texcoord;
-                ~Saved(){for(std::size_t i=0;i<3;++i)gl.matrices_[i].back()=matrices[i];gl.state_.enabled=std::move(enabled);gl.state_.color=color;gl.state_.texcoord=texcoord;gl.begun_=false;gl.vertices_.clear();}
-            } saved{*this,{matrices_[0].back(),matrices_[1].back(),matrices_[2].back()},state_.enabled,state_.color,state_.texcoord};
-            for(auto& stack:matrices_)stack.back()=identity();for(const unsigned cap:{0xb50U,0xb44U,0x8037U})state_.enabled.erase(cap);
-            state_.color=state_.raster_color;state_.texcoord=state_.raster_texcoord;
-            const auto clip=[&](double wx,double wy){return Vec{static_cast<float>((wx-v[0])*2/v[2]-1),static_cast<float>((wy-v[1])*2/v[3]-1),z,1};};
-            begun_=true;primitive_=4;vertices_.clear();
-            for(std::size_t y=0;y<static_cast<std::size_t>(height);++y)for(std::size_t x=0;x<static_cast<std::size_t>(width);++x){
-                if(!bits[y*static_cast<std::size_t>(width)+x])continue;const double px=x0+static_cast<double>(x),py=y0+static_cast<double>(y);
-                const auto a0=clip(px,py),a1=clip(px+1,py),a2=clip(px+1,py+1),a3=clip(px,py+1);vertex(a0);vertex(a1);vertex(a2);vertex(a0);vertex(a2);vertex(a3);
-            }
-            begun_=false;if(!vertices_.empty())end_primitive();
+            const double x0=std::floor(state_.raster_position[0]-f(2)),y0=std::floor(state_.raster_position[1]-f(3));
+            // 位元圖片段只受光柵位置是否有效影響，不經視埠與使用者剪裁面裁切（metal_pixel_transfer.inc 的 window_space）。
+            window_space([&](const auto& clip){
+                for(std::size_t y=0;y<static_cast<std::size_t>(height);++y)for(std::size_t x=0;x<static_cast<std::size_t>(width);++x){
+                    if(!bits[y*static_cast<std::size_t>(width)+x])continue;const double px=x0+static_cast<double>(x),py=y0+static_cast<double>(y);
+                    const auto a0=clip(px,py),a1=clip(px+1,py),a2=clip(px+1,py+1),a3=clip(px,py+1);vertex(a0);vertex(a1);vertex(a2);vertex(a0);vertex(a2);vertex(a3);
+                }
+            });
         }
         state_.raster_position[0]+=f(4);state_.raster_position[1]+=f(5);
     }
@@ -873,6 +984,8 @@ class MetalGl final:public NativeOpenGlContext {
         else if(pname==0xc21)values={static_cast<double>(state_.index_mask)};
         else if(pname==0x8642)values={state_.enabled.contains(pname)?1.:0.};
         else if(pname==0x8038 || pname==0x2a00)values={state_.polygon_offset[pname==0x8038?0:1]};
+        else if(const auto transfer=pixel_transfer_query(pname))values.assign(transfer->begin(),transfer->end());
+        else if(const auto accumulated=accumulation_query(pname))values.assign(accumulated->begin(),accumulated->end());
         else if(pname==0xd16)values={state_.pixel_zoom[0]};else if(pname==0xd17)values={state_.pixel_zoom[1]};else if(pname==0xc40)values={static_cast<double>(state_.render_mode)};
         else if(pname==0xb72)values={state_.depth_write?1.:0.};else if(pname==0xb73)values={state_.depth_clear};else if(pname==0xb74)values={static_cast<double>(state_.depth_func)};
         else if(pname>=0xb91 && pname<=0xb98){const auto& st=state_.stencil;const std::array values_by_name{st.clear,st.function,st.read_mask,st.fail,st.depth_fail,st.pass,st.reference,st.write_mask};values={static_cast<double>(std::bit_cast<std::int32_t>(values_by_name[pname-0xb91]))};}
@@ -882,7 +995,9 @@ class MetalGl final:public NativeOpenGlContext {
         else if(pname==0xd36)values={32};else if(pname==0xd38 || pname==0xd39)values={2};else if(pname==0xd3a)values={16384,16384};
         else if(pixel_.contains(pname))values={static_cast<double>(pixel_[pname])};
         else if(toggle_cap(pname))values={state_.enabled.contains(pname)?1.:0.};
-        else if(pname==0xd30)values={static_cast<double>(gl_max_eval_order)};
+        else if(pname==0xd30)values={static_cast<double>(gl_max_eval_order)};else if(pname==0xb25)values={static_cast<double>(state_.line_stipple_pattern)};else if(pname==0xb26)values={static_cast<double>(state_.line_stipple_factor)};else if(pname==0xd32)values={static_cast<double>(max_clip_planes)};
+        else if(pname==0xd37)values={static_cast<double>(max_name_stack_depth)};else if(pname==0xd70)values={static_cast<double>(select_.names.size())};
+        else if(pname==0xdf1)values={static_cast<double>(feedback_.size)};else if(pname==0xdf2)values={static_cast<double>(feedback_.type)};else if(pname==0xdf4)values={static_cast<double>(select_.size)};
         else if(pname==0xdd0)values={state_.grid1[1],state_.grid1[2]};else if(pname==0xdd1)values={state_.grid1[0]};
         else if(pname==0xdd2)values={state_.grid2[1],state_.grid2[2],state_.grid2[4],state_.grid2[5]};else if(pname==0xdd3)values={state_.grid2[0],state_.grid2[3]};
         else if(pname==0xb02){values={state_.normal[0],state_.normal[1],state_.normal[2]};}
@@ -898,7 +1013,7 @@ class MetalGl final:public NativeOpenGlContext {
         else if(pname==0xb65)values={static_cast<double>(state_.fog.mode)};else if(pname==0xc54)values={static_cast<double>(state_.fog_hint)};else if(pname==0xc50)values={static_cast<double>(state_.perspective_hint)};
         else {error(0x500);return;}
         const unsigned size=op==GlOperation::GetDoublev?8:op==GlOperation::GetBooleanv?1:4;if(values.size()*size>out.size())throw std::invalid_argument("GL query bounds");
-        for(std::size_t i=0;i<values.size();++i){const auto n=values[i];std::uint64_t value=0;if(op==GlOperation::GetDoublev)value=std::bit_cast<std::uint64_t>(n);else if(op==GlOperation::GetFloatv)value=std::bit_cast<std::uint32_t>(static_cast<float>(n));else if(op==GlOperation::GetBooleanv)value=n!=0;else if(pname==0xc21)value=state_.index_mask;else {const auto scaled=(pname==0xb00 || pname==0xc22 || pname==0xb66 || pname==0xb53 || pname==0xb02 || pname==0xbc2 || pname==0xb04)?n*2147483647.:n;const auto safe=std::isfinite(scaled)?std::clamp(std::round(scaled),-2147483648.,2147483647.):0.;value=static_cast<std::uint32_t>(static_cast<std::int32_t>(safe));}std::memcpy(out.data()+i*size,&value,size);}
+        for(std::size_t i=0;i<values.size();++i){const auto n=values[i];std::uint64_t value=0;if(op==GlOperation::GetDoublev)value=std::bit_cast<std::uint64_t>(n);else if(op==GlOperation::GetFloatv)value=std::bit_cast<std::uint32_t>(static_cast<float>(n));else if(op==GlOperation::GetBooleanv)value=n!=0;else if(pname==0xc21)value=state_.index_mask;else {const auto scaled=(pname==0xb00 || pname==0xc22 || pname==0xb80 || pname==0xb66 || pname==0xb53 || pname==0xb02 || pname==0xbc2 || pname==0xb04)?n*2147483647.:n;const auto safe=std::isfinite(scaled)?std::clamp(std::round(scaled),-2147483648.,2147483647.):0.;value=static_cast<std::uint32_t>(static_cast<std::int32_t>(safe));}std::memcpy(out.data()+i*size,&value,size);}
     }
 public:
     MetalGl(void* view,unsigned w,unsigned h){@autoreleasepool{
@@ -913,7 +1028,7 @@ public:
     void drawable(void* raw,unsigned w,unsigned h)override{@autoreleasepool{
         if(!w || !h || w>16384 || h>16384 || std::uint64_t{w}*h>64*1024*1024)throw std::bad_alloc{};
         if(w!=width_ || h!=height_){flush(true);finish_immediate_present();auto lease=reserve_gpu_memory(static_cast<std::size_t>(w)*h*16);auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];d.storageMode=MTLStorageModeShared;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;auto color=[device_ newTextureWithDescriptor:d];auto front=[device_ newTextureWithDescriptor:d];d.pixelFormat=MTLPixelFormatDepth32Float_Stencil8;d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget;auto depth=[device_ newTextureWithDescriptor:d];if(!color || !front || !depth)throw std::bad_alloc{};
-            if(!width_){state_.viewport={0,0,static_cast<int>(w),static_cast<int>(h)};state_.scissor=state_.viewport;}width_=w;height_=h;surface_=std::move(lease);color_=color;front_=front;depth_=depth;present_scaler_reset(w,h);
+            if(!width_){state_.viewport={0,0,static_cast<int>(w),static_cast<int>(h)};state_.scissor=state_.viewport;}width_=w;height_=h;surface_=std::move(lease);color_=color;front_=front;depth_=depth;accum_=nil;accum_lease_.reset();present_scaler_reset(w,h);
             begin_commands();auto pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=color_;pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;pass.depthAttachment.texture=depth_;pass.depthAttachment.loadAction=MTLLoadActionClear;pass.depthAttachment.clearDepth=1;pass.depthAttachment.storeAction=MTLStoreActionStore;pass.stencilAttachment.texture=depth_;pass.stencilAttachment.loadAction=MTLLoadActionClear;pass.stencilAttachment.clearStencil=0;pass.stencilAttachment.storeAction=MTLStoreActionStore;auto enc=[commands_ renderCommandEncoderWithDescriptor:pass];MetalEncoderScope enc_scope{enc};enc_scope.end();
         }
         auto view=(__bridge NSView*)raw;if(view!=view_){finish_immediate_present();immediate_unavailable_=false;detach();if(view){view_=view;auto& use=metal_view_users[raw];if(!use.count){use.original=view.layer;use.wanted=view.wantsLayer;}++use.count;view.wantsLayer=YES;layer_=[CAMetalLayer layer];layer_.device=device_;layer_.pixelFormat=MTLPixelFormatBGRA8Unorm;layer_.framebufferOnly=NO;drawable_limit_=layer_.maximumDrawableCount>1?layer_.maximumDrawableCount-1:1;view.layer=layer_;if([view respondsToSelector:NSSelectorFromString(@"setOpenGLManaged:")])[view setValue:@YES forKey:@"openGLManaged"];}}
@@ -1008,6 +1123,11 @@ public:
     void array(unsigned index,int size,unsigned type,std::span<const std::uint8_t> bytes,bool enabled)override{if(index>=4 || size<1 || size>4)throw std::invalid_argument("GL array");auto& a=arrays_[index];a.size=size;a.type=type;a.enabled=enabled;a.bytes.assign(bytes.begin(),bytes.end());}
     std::string capture(const std::filesystem::path& path)override{@autoreleasepool{flush(true);std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width_)*height_*4);[color_ getBytes:pixels.data() bytesPerRow:width_*4 fromRegion:MTLRegionMake2D(0,0,width_,height_) mipmapLevel:0];auto bitmap=[[NSBitmapImageRep alloc] initWithBitmapDataPlanes:nullptr pixelsWide:width_ pixelsHigh:height_ bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace bitmapFormat:NSBitmapFormatAlphaNonpremultiplied bytesPerRow:width_*4 bitsPerPixel:32];if(!bitmap)throw std::bad_alloc{};for(std::size_t i=0;i<pixels.size();i+=4){std::swap(pixels[i],pixels[i+2]);}std::memcpy(bitmap.bitmapData,pixels.data(),pixels.size());if(!path.parent_path().empty())std::filesystem::create_directories(path.parent_path());if(![[bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:[NSString stringWithUTF8String:path.c_str()] atomically:YES])throw std::runtime_error("Metal PNG capture failed");return "opengl_capture="+path.string()+" backend=metal\n";}}
     bool programmable()const noexcept override{return true;}
+    bool copy_state(NativeOpenGlContext& other,std::uint32_t mask)override{
+        // wglCopyContext：以來源的 glPushAttrib 快照套用到這個 context，與 glPopAttrib 共用還原規則。
+        auto* source=dynamic_cast<MetalGl*>(&other);if(!source)return false;if(source==this)return true;
+        restore_attributes(source->capture_attributes(mask));return true;
+    }
     OpenGlShareResult share_objects(NativeOpenGlContext& other)override{
         auto* source=dynamic_cast<MetalGl*>(&other);if(!source || source->device_!=device_)return OpenGlShareResult::Unsupported;
         if(textures_.same_group(source->textures_))return OpenGlShareResult::Shared;
@@ -1136,6 +1256,13 @@ public:
 #include "metal_shader_cache.inc"
 #include "metal_programmable.inc"
 #include "metal_evaluators.inc"
+#include "metal_texgen.inc"
+#include "metal_clip.inc"
+#include "metal_pixel_transfer.inc"
+#include "metal_accumulation.inc"
+#include "metal_get_tex_image.inc"
+#include "metal_stipple.inc"
+#include "metal_select.inc"
 #include "metal_timestamp.inc"
 #include "metal_graphics_capture.inc"
 std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,std::span<const std::uint8_t> data,std::span<std::uint8_t> output){@autoreleasepool{
@@ -1149,10 +1276,11 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     const auto u=[&](unsigned i){return static_cast<unsigned>(a[i]);};const auto n=[&](unsigned i){return static_cast<std::int32_t>(u(i));};const auto f=[&](unsigned i){return std::bit_cast<float>(u(i));};const auto d=[&](unsigned i){return std::bit_cast<double>(a[i]);};
     const auto vector=[&](unsigned count,bool wide=false){Vec value{0,0,0,1};for(unsigned i=0;i<count;++i)value[i]=static_cast<float>(number(data,i*(wide?8:4),wide?0x140a:0x1406));return value;};
     if(op==GlOperation::GetError){if(begun_){error(0x502);return 0;}const auto e=error_;error_=0;return e;}
-    if(compiling_ && !replaying_ && op!=GlOperation::GetMapdv && op!=GlOperation::IsTexture && op!=GlOperation::GetTexLevelParameteriv && op!=GlOperation::GetTexLevelParameterfv && !(op==GlOperation::TexImage2D && (u(0)==0x8064 || u(0)==0x8063)) && op!=GlOperation::EndList && op!=GlOperation::NewList && op!=GlOperation::GenLists && op!=GlOperation::DeleteLists && op!=GlOperation::GenTextures && op!=GlOperation::DeleteTextures && op!=GlOperation::GetIntegerv && op!=GlOperation::GetFloatv && op!=GlOperation::GetDoublev && op!=GlOperation::GetBooleanv && op!=GlOperation::IsEnabled && op!=GlOperation::GetTexEnviv && op!=GlOperation::GetTexEnvfv && op!=GlOperation::GetTexParameteriv && op!=GlOperation::GetTexParameterfv && op!=GlOperation::ReadPixels && op!=GlOperation::PixelStorei && op!=GlOperation::PushClientAttrib && op!=GlOperation::PopClientAttrib && op!=GlOperation::IsList && op!=GlOperation::GetLightfv && op!=GlOperation::GetMaterialfv){
+    if(compiling_ && !replaying_ && op!=GlOperation::GetMapdv && op!=GlOperation::GetTexGendv && op!=GlOperation::GetClipPlane && op!=GlOperation::GetTexImage && op!=GlOperation::GetPolygonStipple && op!=GlOperation::GetPixelMap && op!=GlOperation::RenderMode && op!=GlOperation::SelectBuffer && op!=GlOperation::FeedbackBuffer && op!=GlOperation::IsTexture && op!=GlOperation::GetTexLevelParameteriv && op!=GlOperation::GetTexLevelParameterfv && !(op==GlOperation::TexImage2D && (u(0)==0x8064 || u(0)==0x8063)) && op!=GlOperation::EndList && op!=GlOperation::NewList && op!=GlOperation::GenLists && op!=GlOperation::DeleteLists && op!=GlOperation::GenTextures && op!=GlOperation::DeleteTextures && op!=GlOperation::GetIntegerv && op!=GlOperation::GetFloatv && op!=GlOperation::GetDoublev && op!=GlOperation::GetBooleanv && op!=GlOperation::IsEnabled && op!=GlOperation::GetTexEnviv && op!=GlOperation::GetTexEnvfv && op!=GlOperation::GetTexParameteriv && op!=GlOperation::GetTexParameterfv && op!=GlOperation::ReadPixels && op!=GlOperation::PixelStorei && op!=GlOperation::PushClientAttrib && op!=GlOperation::PopClientAttrib && op!=GlOperation::IsList && op!=GlOperation::GetLightfv && op!=GlOperation::GetMaterialfv){
         if(op==GlOperation::TexImage2D || op==GlOperation::TexSubImage2D || op==GlOperation::CopyTexImage2D || op==GlOperation::DrawArrays || op==GlOperation::DrawElements){error(0x502);return 0;}
         const auto bytes=sizeof(Command)+a.size_bytes()+data.size();if(list_bytes_+bytes>32*1024*1024)throw std::bad_alloc{};
-        if(op==GlOperation::Bitmap){auto [args,bits]=bitmap_record(a,data);lists_[compiling_].push_back({op,std::move(args),std::move(bits)});}else lists_[compiling_].push_back({op,{a.begin(),a.end()},{data.begin(),data.end()}});
+        if(op==GlOperation::Bitmap){auto [args,bits]=bitmap_record(a,data);lists_[compiling_].push_back({op,std::move(args),std::move(bits)});}
+        else if(op==GlOperation::DrawPixels){auto [args,pixels]=pixels_record(a,data);lists_[compiling_].push_back({op,std::move(args),std::move(pixels)});}else lists_[compiling_].push_back({op,{a.begin(),a.end()},{data.begin(),data.end()}});
         list_bytes_+=bytes;if(compile_mode_==0x1300)return 0;
     }
     const bool attribute=op==GlOperation::Materialf || op==GlOperation::Materialfv || op==GlOperation::Color3f || op==GlOperation::Color4f || op==GlOperation::Color4fv || op==GlOperation::Color4dv || op==GlOperation::TexCoord2f || op==GlOperation::TexCoord2fv || op==GlOperation::TexCoord4fv || op==GlOperation::TexCoord4dv || op==GlOperation::Normal3f || op==GlOperation::Normal3fv || op==GlOperation::Normal3dv;
@@ -1161,6 +1289,14 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     try {switch(op){
     case GlOperation::Map1d:case GlOperation::Map2d:case GlOperation::MapGrid1d:case GlOperation::MapGrid2d:case GlOperation::EvalCoord1d:case GlOperation::EvalCoord2d:
     case GlOperation::EvalMesh1:case GlOperation::EvalMesh2:case GlOperation::EvalPoint1:case GlOperation::EvalPoint2:case GlOperation::GetMapdv:return evaluator(op,a,data,output);
+    case GlOperation::TexGendv:case GlOperation::GetTexGendv:return texgen(op,a,data,output);
+    case GlOperation::ClipPlane:case GlOperation::GetClipPlane:return clip_plane(op,a,data,output);
+    case GlOperation::GetTexImage:return get_tex_image(a,output);
+    case GlOperation::LineStipple:case GlOperation::PolygonStipple:case GlOperation::GetPolygonStipple:return stipple(op,a,data,output);
+    case GlOperation::PixelTransfer:case GlOperation::PixelMap:case GlOperation::GetPixelMap:return pixel_transfer(op,a,data,output);
+    case GlOperation::DrawPixels:draw_pixels(a,data);break;
+    case GlOperation::Accum:case GlOperation::ClearAccum:case GlOperation::LogicOp:return accumulation(op,a);
+    case GlOperation::CopyPixels:copy_pixels(a);break;
     case GlOperation::Begin:if(u(0)>9)error(0x500);else {begun_=true;primitive_=u(0);vertices_.clear();}break;
     case GlOperation::End:if(!begun_)error(0x502);else {begun_=false;end_primitive();}break;
     case GlOperation::Vertex2f:vertex({f(0),f(1),0,1});break;case GlOperation::Vertex2i:vertex({static_cast<float>(n(0)),static_cast<float>(n(1)),0,1});break;
@@ -1171,10 +1307,12 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     case GlOperation::ClearColor:for(unsigned i=0;i<4;++i)state_.clear[i]=std::clamp(f(i),0.0F,1.0F);break;
     case GlOperation::DepthRange:state_.depth_range={std::clamp(d(0),0.,1.),std::clamp(d(1),0.,1.)};break;
     case GlOperation::ClearDepth:state_.depth_clear=std::clamp(d(0),0.,1.);break;
-    case GlOperation::Clear:{if(u(0)&~0x4500U){error(0x501);break;}if(!u(0))break;const auto z=static_cast<float>(state_.depth_clear*2-1);const std::array<Vertex,3> v{{{{-1,-1,z,1},state_.clear,{0,0,0,1}},{{3,-1,z,1},state_.clear,{0,0,0,1}},{{-1,3,z,1},state_.clear,{0,0,0,1}}}};draw(v,MTLPrimitiveTypeTriangle,true,u(0));break;}
+    case GlOperation::Clear:{if(u(0)&~0x4700U){error(0x501);break;}if(!u(0) || state_.render_mode!=0x1c00)break;
+        // GL_ACCUM_BUFFER_BIT 只受剪裁測試影響，以累積緩衝運算清除；其餘位元走一般清除。
+        if(u(0)&0x200)accum_compute(0,0,state_.accum_clear);if(!(u(0)&0x4500U))break;const auto z=static_cast<float>(state_.depth_clear*2-1);const std::array<Vertex,3> v{{{{-1,-1,z,1},state_.clear,{0,0,0,1}},{{3,-1,z,1},state_.clear,{0,0,0,1}},{{-1,3,z,1},state_.clear,{0,0,0,1}}}};draw(v,MTLPrimitiveTypeTriangle,true,u(0)&0x4500U);break;}
     case GlOperation::CullFace:if(u(0)!=0x404 && u(0)!=0x405 && u(0)!=0x408)error(0x500);else state_.cull_face=u(0);break;
     case GlOperation::FrontFace:if(u(0)!=0x900 && u(0)!=0x901)error(0x500);else state_.front_face=u(0);break;
-    case GlOperation::Enable:case GlOperation::Disable:{const auto cap=u(0);if(!toggle_cap(cap)){error(0x500);break;}if(op==GlOperation::Enable){state_.enabled.insert(cap);if(cap==0xb57)track_color();}else state_.enabled.erase(cap);break;}
+    case GlOperation::Enable:case GlOperation::Disable:{const auto cap=u(0);if(!toggle_cap(cap)){error(0x500);break;}if(op==GlOperation::Enable){state_.enabled.insert(cap);if(cap==0xb57)track_color();}else state_.enabled.erase(cap);if(cap>=0xc60 && cap<=0xc63)state_.texgen_mask=texgen_mask();break;}
     case GlOperation::IsEnabled:if(!toggle_cap(u(0))){error(0x500);return 0;}return state_.enabled.contains(u(0));
     case GlOperation::BlendFunc:if(!factor(u(0)) || !factor(u(1)) || u(1)==0x308)error(0x500);else {state_.blend_src=u(0);state_.blend_dst=u(1);}break;
     case GlOperation::StencilFunc:if(u(0)<0x200 || u(0)>0x207)error(0x500);else {state_.stencil.function=u(0);state_.stencil.reference=static_cast<unsigned>(std::clamp(n(1),0,255));state_.stencil.read_mask=u(2);}break;
@@ -1189,9 +1327,8 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     case GlOperation::PointSize:if(!(f(0)>0))error(0x501);else state_.point_size=f(0);break;
     case GlOperation::IndexMask:state_.index_mask=u(0);break;
     case GlOperation::PixelZoom:state_.pixel_zoom={f(0),f(1)};break;
-    case GlOperation::RenderMode:{
-        // 只有 GL_RENDER 可用：沒有 glSelectBuffer／glFeedbackBuffer，進入 SELECT／FEEDBACK 依規格回報 INVALID_OPERATION。
-        if(u(0)<0x1c00 || u(0)>0x1c02){error(0x500);return 0;}if(u(0)!=0x1c00){error(0x502);return 0;}state_.render_mode=u(0);return 0;}
+    case GlOperation::RenderMode:case GlOperation::SelectBuffer:case GlOperation::FeedbackBuffer:case GlOperation::InitNames:case GlOperation::LoadName:
+    case GlOperation::PushName:case GlOperation::PopName:case GlOperation::PassThrough:return select_feedback(op,a,output);
     case GlOperation::ShadeModel:if(u(0)!=0x1d01)error(u(0)==0x1d00?0x502:0x500);break;
     case GlOperation::Hint:if(u(1)<0x1100 || u(1)>0x1102)error(0x500);else if(u(0)==0xc54)state_.fog_hint=u(1);else if(u(0)==0xc50)state_.perspective_hint=u(1);else error(0x500);break;
     case GlOperation::Lightfv:{
@@ -1270,6 +1407,8 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
         auto saved=pixel_;struct Restore {decltype(pixel_)& target;decltype(pixel_) saved;~Restore(){target=std::move(saved);}} restore{pixel_,std::move(saved)};
         pixel_.clear();pixel_[0xd05]=pixel_[0xcf5]=1;
         const std::array<std::uint64_t,6> read{a[4],a[5],a[6],a[7],0x1908,0x1401};
+        // 像素傳輸只在寫入紋理時套用一次，內部讀回暫停。
+        struct Transfer {PixelTransferState& target;PixelTransferState saved;~Transfer(){target=saved;}} transfer{state_.transfer,std::exchange(state_.transfer,PixelTransferState{})};
         const auto old_error=error_;error_=0;execute(GlOperation::ReadPixels,read,{},pixels);const auto read_error=error_;error_=old_error?old_error:read_error;if(read_error)break;
         const std::array<std::uint64_t,8> write{a[0],a[1],a[2],a[3],a[6],a[7],0x1908,0x1401};gl_texture(write,pixels,true);break;
     }
@@ -1279,35 +1418,8 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     case GlOperation::PixelStorei:if((u(0)<0xcf0 || u(0)>0xcf5) && (u(0)<0xd00 || u(0)>0xd05))error(0x500);else if(n(1)<0 || ((u(0)&15)==5 && u(1)!=1 && u(1)!=2 && u(1)!=4 && u(1)!=8))error(0x501);else pixel_[u(0)]=(u(0)&15)<=1?(u(1)?1:0):n(1);break;
     case GlOperation::PushClientAttrib:if(pixel_stack_.size()>=16)error(0x503);else pixel_stack_.push_back((u(0)&1)?pixel_:std::map<unsigned,int>{});break;
     case GlOperation::PopClientAttrib:if(pixel_stack_.empty())error(0x504);else {if(!pixel_stack_.back().empty())pixel_=pixel_stack_.back();pixel_stack_.pop_back();}break;
-    case GlOperation::PushAttrib:if(u(0)!=0xfffffU && (u(0)&~0xffdefU))error(0x501);else if(attributes_.size()>=16)error(0x503);else {
-        AttributeSnapshot snapshot;snapshot.mask=u(0);snapshot.state=state_;
-        snapshot.programmable={gl_.src_alpha,gl_.dst_alpha,gl_.equation_rgb,gl_.equation_alpha,gl_.polygon_mode};snapshot.current_attributes=gl_.attribute_values;
-        if(u(0)&0x40000){
-            snapshot.active=gl_.active_texture;snapshot.units=gl_.texture_units;snapshot.units[snapshot.active]=state_.binding;
-            for(const auto id:snapshot.units)if(const auto t=textures_.find(id);t!=textures_.end())snapshot.texture_parameters[id]={t->second.min,t->second.mag,t->second.s,t->second.t,t->second.anisotropy,t->second.max_level};
-        }
-        attributes_.push_back(std::move(snapshot));
-    }break;
-    case GlOperation::PopAttrib:if(attributes_.empty())error(0x504);else {const auto snapshot=std::move(attributes_.back());attributes_.pop_back();const auto mask=snapshot.mask;const auto& s=snapshot.state;
-        if(mask==0xfffffU)state_=s;
-        if(mask&0x10000){state_.grid1=s.grid1;state_.grid2=s.grid2;for(unsigned cap=0xd80;cap<=0xdb8;++cap)if(cap==0xd80 || gl_map_components(cap)){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}}
-        if(mask&1)gl_.attribute_values=snapshot.current_attributes;
-        if(mask&2)state_.point_size=s.point_size;
-        if(mask&0x4000)state_.index_mask=s.index_mask;
-        if(mask&0x4000)state_.clear_index=s.clear_index;if(mask&0x20000)state_.list_base=s.list_base;
-        if(mask&1){state_.current_index=s.current_index;state_.edge_flag=s.edge_flag;state_.raster_valid=s.raster_valid;state_.raster_position=s.raster_position;state_.raster_color=s.raster_color;state_.raster_texcoord=s.raster_texcoord;state_.raster_index=s.raster_index;state_.raster_distance=s.raster_distance;}
-        if(mask&0x40){state_.light_model_ambient=s.light_model_ambient;state_.light_model_local=s.light_model_local;state_.light_model_two_side=s.light_model_two_side;state_.light_model_color_control=s.light_model_color_control;state_.color_material_face=s.color_material_face;state_.color_material_mode=s.color_material_mode;}
-        if(mask&0x4000){gl_.src_alpha=snapshot.programmable[0];gl_.dst_alpha=snapshot.programmable[1];gl_.equation_rgb=snapshot.programmable[2];gl_.equation_alpha=snapshot.programmable[3];}
-        if(mask&0x20)state_.read_buffer=s.read_buffer;
-        if(mask&8){state_.polygon_offset=s.polygon_offset;for(const unsigned cap:{0x8037U,0x2a01U,0x2a02U}){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}gl_.polygon_mode=snapshot.programmable[4];state_.cull_face=s.cull_face;state_.front_face=s.front_face;state_.enabled.erase(0xb44);if(s.enabled.contains(0xb44))state_.enabled.insert(0xb44);}
-
-        if(mask&0x40000){
-            gl_.active_texture=snapshot.active;gl_.texture_units=snapshot.units;state_.binding=s.binding;state_.binding_1d=s.binding_1d;state_.environments=s.environments;
-            for(const unsigned cap:{0xde0U,0xde1U}){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}
-            // 還原參數與綁定，不回退 Push 之後更新的貼圖影像與資源。
-            for(const auto& [id,p]:snapshot.texture_parameters){auto& t=textures_[id];t.min=p[0];t.mag=p[1];t.s=p[2];t.t=p[3];t.anisotropy=p[4];t.max_level=p[5];}
-        }
-        if(mask&1){state_.color=s.color;state_.texcoord=s.texcoord;state_.normal=s.normal;}if(mask&0x40){state_.lights=s.lights;state_.materials=s.materials;for(unsigned cap:{0xb50U,0xb57U,0x4000U,0x4001U,0x4002U,0x4003U,0x4004U,0x4005U,0x4006U,0x4007U}){state_.enabled.erase(cap);if(s.enabled.contains(cap))state_.enabled.insert(cap);}}if(mask&0x8000){state_.fog_hint=s.fog_hint;state_.perspective_hint=s.perspective_hint;}if(mask&0x80){state_.fog=s.fog;state_.enabled.erase(0xb60);if(s.enabled.contains(0xb60))state_.enabled.insert(0xb60);}if(mask&0x100){state_.depth_clear=s.depth_clear;state_.depth_func=s.depth_func;state_.depth_write=s.depth_write;state_.enabled.erase(0xb71);if(s.enabled.contains(0xb71))state_.enabled.insert(0xb71);}if(mask&0x400){state_.stencil=s.stencil;state_.enabled.erase(0xb90);if(s.enabled.contains(0xb90))state_.enabled.insert(0xb90);}if(mask&0x800){state_.viewport=s.viewport;state_.depth_range=s.depth_range;}if(mask&0x1000){state_.matrix_mode=s.matrix_mode;state_.enabled.erase(0xba1);if(s.enabled.contains(0xba1))state_.enabled.insert(0xba1);}if(mask&0x2000)state_.enabled=s.enabled;if(mask&0x4000){state_.alpha_func=s.alpha_func;state_.alpha_ref=s.alpha_ref;state_.enabled.erase(0xbc0);if(s.enabled.contains(0xbc0))state_.enabled.insert(0xbc0);state_.clear=s.clear;state_.draw_buffer=s.draw_buffer;state_.blend_src=s.blend_src;state_.blend_dst=s.blend_dst;state_.enabled.erase(0xbe2);if(s.enabled.contains(0xbe2))state_.enabled.insert(0xbe2);}if(mask&0x4000)state_.color_mask=s.color_mask;if(mask&4)state_.line_width=s.line_width;if(mask&0x20)state_.pixel_zoom=s.pixel_zoom;if(mask&0x80000){state_.scissor=s.scissor;state_.enabled.erase(0xc11);if(s.enabled.contains(0xc11))state_.enabled.insert(0xc11);}}break;
+    case GlOperation::PushAttrib:if(u(0)!=0xfffffU && (u(0)&~0xfffffU))error(0x501);else if(attributes_.size()>=16)error(0x503);else attributes_.push_back(capture_attributes(u(0)));break;
+    case GlOperation::PopAttrib:if(attributes_.empty())error(0x504);else {const auto snapshot=std::move(attributes_.back());attributes_.pop_back();restore_attributes(snapshot);}break;
     case GlOperation::NewList:if(compiling_ || !u(0) || (u(1)!=0x1300 && u(1)!=0x1301))error(0x502);else {if(!lists_.contains(u(0)) && lists_.size()>=65536)throw std::bad_alloc{};for(const auto& c:lists_[u(0)])list_bytes_-=sizeof(Command)+c.args.size()*8+c.data.size();lists_[u(0)].clear();compiling_=u(0);compile_mode_=u(1);}break;
     case GlOperation::EndList:if(!compiling_)error(0x502);else compiling_=0;break;
     case GlOperation::GenLists:if(n(0)<0)error(0x501);else if(u(0)){
@@ -1318,8 +1430,7 @@ std::uint64_t MetalGl::execute(GlOperation op,std::span<const std::uint64_t> a,s
     case GlOperation::CallList:if(recursion_>=64)error(0x503);else if(const auto it=lists_.find(u(0));it!=lists_.end()){const bool saved=replaying_;replaying_=true;++recursion_;try{for(const auto& c:it->second)execute(c.op,c.args,c.data,{});}catch(...){--recursion_;replaying_=saved;throw;}--recursion_;replaying_=saved;}break;
     case GlOperation::DrawArrays:case GlOperation::DrawElements:{if(!arrays_[0].enabled)break;const unsigned count=u(op==GlOperation::DrawArrays?2:1);if(count>1048576 || u(0)>9){error(0x501);break;}primitive_=u(0);vertices_.clear();begun_=true;try{for(unsigned i=0;i<count;++i)array_vertex(op==GlOperation::DrawArrays?u(1)+i:static_cast<unsigned>(number(data,static_cast<std::size_t>(i)*unit(u(2)),u(2))));}catch(...){begun_=false;vertices_.clear();throw;}begun_=false;end_primitive();break;}
     case GlOperation::GetIntegerv:case GlOperation::GetFloatv:case GlOperation::GetDoublev:case GlOperation::GetBooleanv:query(op,u(0),output);break;
-    case GlOperation::ReadPixels:{if((u(4)!=0x1908 && u(4)!=0x1907) || u(5)!=0x1401){error(0x500);break;}if(n(2)<0 || n(3)<0){error(0x501);break;}flush(true);const unsigned components=u(4)==0x1908?4:3;const auto [stride,offset]=pixel_layout(u(2),components,true);if(u(2) && u(3) && offset+(u(3)-1)*stride+std::size_t{u(2)}*components>output.size())throw std::invalid_argument("read pixels bounds");
-        std::vector<std::uint8_t> row(static_cast<std::size_t>(width_)*4);for(unsigned y=0;y<u(3);++y){const auto src_y=static_cast<std::int64_t>(n(1))+y;if(src_y<0 || src_y>=height_)continue;[(state_.read_buffer==0x404?front_:color_) getBytes:row.data() bytesPerRow:width_*4 fromRegion:MTLRegionMake2D(0,static_cast<NSUInteger>(height_-1-src_y),width_,1) mipmapLevel:0];for(unsigned x=0;x<u(2);++x){const auto src_x=static_cast<std::int64_t>(n(0))+x;if(src_x<0 || src_x>=width_)continue;const auto at=offset+y*stride+x*components,src=static_cast<std::size_t>(src_x)*4;output[at]=row[src+2];output[at+1]=row[src+1];output[at+2]=row[src];if(components==4)output[at+3]=row[src+3];}}break;}
+    case GlOperation::ReadPixels:read_pixels(a,output);break;
     case GlOperation::DrawBuffer:case GlOperation::ReadBuffer:if(u(0)!=0x404 && u(0)!=0x405)error(0x500);else (op==GlOperation::DrawBuffer?state_.draw_buffer:state_.read_buffer)=u(0);break;
     case GlOperation::Flush:flush(false);break;case GlOperation::Finish:flush(true);break;
     case GlOperation::RasterPos4dv:raster_position(vector(4,true));break;

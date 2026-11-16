@@ -135,6 +135,9 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"ntdll.dll","RtlDisownModuleHeapAllocation",2},
         {"kernel32.dll","BaseGetNamedObjectDirectory",1},
+        // 分散／集中 I/O（windows_file_segments.inc）
+        {"kernel32.dll","ReadFileScatter",5,0,0,0x4},{"kernel32.dll","WriteFileGather",5,0,0,0x4},
+        {"ntdll.dll","NtReadFileScatter",9,0,0,0x40},{"ntdll.dll","ZwReadFileScatter",9,0,0,0x40},{"ntdll.dll","NtWriteFileGather",9,0,0,0x40},{"ntdll.dll","ZwWriteFileGather",9,0,0,0x40},
         {"ntdll.dll","NtOpenDirectoryObject",3,0,0,2},{"ntdll.dll","ZwOpenDirectoryObject",3,0,0,2},
 #include "concrt_sync_descriptors.inc"
 #include "concrt_lock_descriptors.inc"
@@ -555,6 +558,7 @@ bool rtl_family_service(std::string_view symbol);
 bool ntdll_loader_service(std::string_view symbol);
 std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.symbol=="KiUserExceptionDispatcher")return finish_user_exception_entry(state,memory);
+    if(service.symbol.ends_with("ReadFileScatter") || service.symbol.ends_with("WriteFileGather"))return invoke_file_segments(state,memory,service);
     if(service.symbol=="KiUserApcDispatcher")return finish_user_apc_entry(state,memory);
     if(service.family=="internal-apc-dispatch"){
         if(runtime_.callbacks.empty() || !native_apc_continuation(runtime_.callbacks.back().continuation))
@@ -1247,4 +1251,5 @@ namespace x64arm {
 #include "windows_nt_families.inc"
 #include "windows_ntdll_rtl.inc"
 #include "windows_ntdll_loader.inc"
+#include "windows_file_segments.inc"
 }

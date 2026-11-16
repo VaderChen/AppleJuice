@@ -9,6 +9,7 @@
 #include "audio_endpoints.hpp"
 #include "wave_device_message.hpp"
 #include "pcm_wave_format.hpp"
+#include "x64arm/audio_channels.hpp"
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -107,7 +108,7 @@ struct Stream {
     std::shared_ptr<Session> session;
     std::uint32_t flags{},capacity{},requested{},category{},options{};
     std::uint64_t data{},event{},clock_frames{},observed_frames{},event_origin_frames{},event_periods{};
-    std::array<float,2> volumes{1,1};
+    std::array<float,18> volumes=[] {std::array<float,18> result;result.fill(1);return result;}();
     // 診斷（X64ARM_TRACE_AUDIO=start／1／stats）：客體補資料與事件節奏，定位斷續來源。
     struct Stats {std::uint64_t releases{},frames{},events{},catchups{},requested{};double max_release_gap{},max_event_gap{};
         std::chrono::steady_clock::time_point last_release{},last_event{},last_report{};std::uint64_t starved{},runs{},thread{};int priority{},base_priority{};bool multimedia{};
@@ -246,9 +247,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
     const auto mix=[] {
         std::vector<std::uint8_t> bytes(40);const auto store=[&](unsigned at,std::uint32_t value,unsigned count){for(unsigned i=0;i<count;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(8*i));};
         const auto rate=wasapi_mix_rate();
-        store(0,0xfffe,2);store(2,2,2);store(4,rate,4);store(8,rate*8U,4);store(12,8,2);store(14,32,2);store(16,22,2);store(18,32,2);store(20,3,4);std::copy(float_format.begin(),float_format.end(),bytes.begin()+24);return bytes;
+        const auto channels=audio::environment_enabled()?8U:2U;
+        store(0,0xfffe,2);store(2,channels,2);store(4,rate,4);store(8,rate*channels*4,4);store(12,channels*4,2);store(14,32,2);store(16,22,2);store(18,32,2);store(20,audio::channel_mask(channels),4);std::copy(float_format.begin(),float_format.end(),bytes.begin()+24);return bytes;
     };
-    const auto format=[&](std::uint64_t p){if(!p)throw PointerError{};return read_pcm_wave_format(memory,p,true,true,8000,192000);};
+    const auto format=[&](std::uint64_t p){
+        if(!p)throw PointerError{};
+        auto value=read_pcm_wave_format(memory,p,true,true,8000,192000,{18,32,true,true});
+        if(value && !audio::valid_channel_layout(value->channels,value->channel_mask))value.reset();
+        return value;
+    };
     const auto create=[&](const std::shared_ptr<Object>& object,Kind k){
         if(object->pointers.contains(k))return object->pointers.at(k);
         if(bridge.objects.size()>=1024)throw std::bad_alloc{};
@@ -445,7 +452,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                     else if(index==6){put(arg(2),31,16);put(arg(2)+8,text(info.guid_text),bits);}
                     else if(index==7){put(arg(2),31,16);put(arg(2)+8,text(adapter),bits);}
                     else if(index==5){put(arg(2),19,16);put(arg(2)+8,form_factor(info.device.transport));}
-                    else if(index==1){put(arg(2),19,16);put(arg(2)+8,info.device.output_channels==1?4U:3U);}
+                    else if(index==1){put(arg(2),19,16);put(arg(2)+8,audio::environment_enabled()?audio::channel_mask(8):(info.device.output_channels==1?4U:3U));}
                     else if(index==2){const auto bytes=mix();const auto data=allocation(bytes);put(arg(2),65,16);put(arg(2)+8,bytes.size());put(arg(2)+8+unit,data,bits);}
                 }else if(name=="P_SetValue" || name=="P_Commit")result=0x80070005U;else result=invalid;
             }else if(object->stream && std::any_of(methods(kind).begin(),methods(kind).end(),[&](const auto& method){return method.name==name;})){
@@ -497,7 +504,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                         (void)mapping_session();
                         pcm.progress_notify=[wake=mapping_wake()]() noexcept {if(wake)wake->notify();};
                         const auto data=allocate_heap(memory,frames*f->align);if(!data)throw std::bad_alloc{};
-                        try{pcm.channels=f->channels;pcm.bits=f->bits;pcm.floating=f->floating;pcm.rate=pcm.frequency=f->rate;pcm.streaming=true;s.output=audio::open_output(s.pcm,s.device);}catch(const std::runtime_error&){(void)free_heap(memory,data,state);result=0x8889000fU;}
+                        try{pcm.channels=f->channels;pcm.channel_mask=f->channel_mask;pcm.bits=f->bits;pcm.floating=f->floating;pcm.rate=pcm.frequency=f->rate;pcm.streaming=true;s.output=audio::open_output(s.pcm,s.device);}catch(const std::runtime_error&){(void)free_heap(memory,data,state);result=0x8889000fU;}
                         if(!result){s.data=data;s.capacity=static_cast<std::uint32_t>(frames);s.format=*f;s.flags=d(2);s.initialized=true;s.observed_frames=pcm.rendered_frames;s.session=std::move(session);s.session->streams.push_back(object->stream);
                             trace_audio_event("initialize",&s,f->rate);update_session(s.session);
                             if(audio_stats_enabled())std::fprintf(stderr,"wasapi_init pid=%d stream=%p rate=%u channels=%u bits=%u flags=0x%x requested_hns=%llu period_hns=%llu capacity=%u\n",
@@ -589,7 +596,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wasapi(GuestState& state,Gu
                     else if(name=="V_GetAllVolumes"){check(arg(2),d(1)*4);for(unsigned i=0;i<d(1);++i)put(arg(2)+i*4,std::bit_cast<std::uint32_t>(s.volumes[i]));}
                     else {auto levels=s.volumes;for(unsigned i=0;i<d(1);++i){levels[i]=std::bit_cast<float>(static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)+i*4},32)));if(!std::isfinite(levels[i]) || levels[i]<0 || levels[i]>1)result=invalid;}if(!result)s.volumes=levels;}
                 }else result=invalid;
-                pcm.left=s.volumes[0];pcm.right=s.volumes[s.format.channels==1?0:1];
+                pcm.left=pcm.right=1;pcm.channel_gains=s.volumes;
             }else result=invalid;
         }
     }catch(const PointerError&){result=pointer_error;}catch(const MemoryFault&){result=pointer_error;}catch(const std::bad_alloc&){result=0x8007000eU;}

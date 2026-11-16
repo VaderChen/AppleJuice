@@ -1,4 +1,5 @@
 #include "x64arm/audio_graph.hpp"
+#include "x64arm/audio_channels.hpp"
 #include "x64arm/audio_pcm.hpp"
 #include <algorithm>
 #include <bit>
@@ -147,7 +148,7 @@ VoiceGraph::Voice VoiceGraph::create(Kind kind,Format format,unsigned flags,unsi
     require((format.floating?format.bits==32:format.bits==8 || format.bits==16 || format.bits==24 || format.bits==32) && (!format.channel_mask || static_cast<unsigned>(std::popcount(format.channel_mask))==format.channels));
     require(std::isfinite(maximum_ratio) && maximum_ratio>=(1.F/1024) && maximum_ratio<=1024);
     require(!(flags&~14U) && (kind==Kind::Source || !(flags&6U)));const auto creation_flags=flags;if(flags&4U)flags|=2U;
-    std::lock_guard lock(impl_->mutex);if(kind==Kind::Master)require(!impl_->master && format.channels<=2);else require(impl_->master!=0);
+    std::lock_guard lock(impl_->mutex);if(kind==Kind::Master)require(!impl_->master && valid_channel_layout(format.channels,format.channel_mask));else require(impl_->master!=0);
     auto n=std::make_unique<Impl::Node>();n->state.kind=kind;n->state.format=format;n->state.flags=flags;n->state.creation_flags=creation_flags;n->state.stage=stage;n->state.channel_volumes.assign(format.channels,1);n->maximum_ratio=maximum_ratio;n->state.ratio=std::min(1.F,maximum_ratio);
     const auto id=impl_->next++;impl_->nodes.emplace(id,std::move(n));if(kind==Kind::Master)impl_->master=id;impl_->rebuild();return id;
 }
@@ -236,15 +237,16 @@ std::vector<VoiceGraph::Event> VoiceGraph::take_events(){
     std::lock_guard lock(impl_->mutex);std::vector<Event> events(impl_->events.begin(),impl_->events.begin()+impl_->event_count);impl_->event_count=0;
     for(auto& [id,n]:impl_->nodes)for(auto& b:n->packets)if(b && b->done)b.reset();return events;
 }
-std::size_t VoiceGraph::render_frames(std::span<float> output,unsigned rate,bool pause) {
+std::size_t VoiceGraph::render_frames(std::span<float> output,unsigned rate,bool pause,unsigned output_channels) {
     std::fill(output.begin(),output.end(),0);if(!rate)return 0;std::lock_guard lock(impl_->mutex);
-    if(!impl_->started || impl_->faulted || !impl_->master)return output.size()/2;
+    require(output_channels && (output_channels==2 || (impl_->master && output_channels==impl_->nodes.at(impl_->master)->state.format.channels)) && output.size()%output_channels==0);
+    if(!impl_->started || impl_->faulted || !impl_->master)return output.size()/output_channels;
     auto& master=*impl_->nodes.at(impl_->master);
-    for(std::size_t frame=0;frame+1<output.size() && !impl_->faulted;frame+=2){
+    for(std::size_t frame=0;frame+output_channels<=output.size() && !impl_->faulted;frame+=output_channels){
         for(auto& [id,n]:impl_->order)if(n->state.kind==Kind::Source && n->state.playing){
             if(n->advance_pending>0)n->advance_pending=impl_->advance(id,*n,n->advance_pending,pause);
-            if(pause && impl_->event_count)return frame/2;
-            if(n->count){auto& b=*n->packets[n->queue[n->head]];if(!b.started){b.started=true;impl_->event(EventKind::BufferStart,id,b.packet.context);if(pause)return frame/2;}}
+            if(pause && impl_->event_count)return frame/output_channels;
+            if(n->count){auto& b=*n->packets[n->queue[n->head]];if(!b.started){b.started=true;impl_->event(EventKind::BufferStart,id,b.packet.context);if(pause)return frame/output_channels;}}
         }
         for(auto& [id,n]:impl_->order)n->frame.fill(0);
         for(auto& [id,n]:impl_->order){const auto channels=n->state.format.channels;
@@ -270,11 +272,15 @@ std::size_t VoiceGraph::render_frames(std::span<float> output,unsigned rate,bool
                 for(unsigned d=0;d<destination.state.format.channels;++d){float sum=0;for(unsigned c=0;c<channels;++c)sum+=n->frame[c]*e.matrix[d*channels+c];if(e.use_filter)sum=e.filter.process(sum,d);destination.frame[d]+=sum;}
             }
         }
-        output[frame]=master.frame[0];output[frame+1]=master.frame[master.state.format.channels==1?0:1];
-        if(pause && impl_->event_count)return frame/2+1;
+        if(output_channels==master.state.format.channels){for(unsigned c=0;c<output_channels;++c)output[frame+c]=master.frame[c];}
+        else if(master.state.format.channels<=2){output[frame]=master.frame[0];output[frame+1]=master.frame[master.state.format.channels==1?0:1];}
+        else {const auto mask=master.state.format.channel_mask?master.state.format.channel_mask:channel_mask(master.state.format.channels);
+            for(unsigned c=0;c<master.state.format.channels;++c){const auto p=speaker_position(speaker_at(mask,c));const auto gain=p.lfe?.5F:.70710678F;
+                output[frame]+=master.frame[c]*gain*std::sqrt(1-std::max(p.x,0.F));output[frame+1]+=master.frame[c]*gain*std::sqrt(1+std::min(p.x,0.F));}}
+        if(pause && impl_->event_count)return frame/output_channels+1;
     }
-    return output.size()/2;
+    return output.size()/output_channels;
 }
 void VoiceGraph::render(std::span<float> output,unsigned rate) noexcept {(void)render_frames(output,rate,false);}
-std::size_t VoiceGraph::render_until_event(std::span<float> output,unsigned rate){return render_frames(output,rate,true);}
+std::size_t VoiceGraph::render_until_event(std::span<float> output,unsigned rate,unsigned channels){return render_frames(output,rate,true,channels);}
 }

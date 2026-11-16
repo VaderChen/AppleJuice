@@ -116,6 +116,10 @@ constexpr Command commands[]{
     {"glPointSize",GlOperation::PointSize,1,1,0},
     {"glIndexMask",GlOperation::IndexMask,1,0,0},
     {"glPixelZoom",GlOperation::PixelZoom,2,3,0},
+    {"glCopyPixels",GlOperation::CopyPixels,5,0,0},
+    {"glAccum",GlOperation::Accum,2,2,0},
+    {"glClearAccum",GlOperation::ClearAccum,4,15,0},
+    {"glLogicOp",GlOperation::LogicOp,1,0,0},
     {"glRenderMode",GlOperation::RenderMode,1,0,0},
     {"glShadeModel",GlOperation::ShadeModel,1,0,0},
     {"glHint",GlOperation::Hint,2,0,0},
@@ -291,6 +295,10 @@ unsigned query_size(std::uint32_t p){
     if(p==0xd80 || gl_map_components(p))return 1;
     if(p==0xdd0 || p==0xdd3)return 2; // MAP1_GRID_DOMAIN、MAP2_GRID_SEGMENTS
     if(p==0xdd1)return 1;if(p==0xdd2)return 4; // MAP1_GRID_SEGMENTS、MAP2_GRID_DOMAIN
+    if(p>=0xc60 && p<=0xc63)return 1; // GL_TEXTURE_GEN_S～Q
+    if(p==0xb26)return 1; // GL_LINE_STIPPLE_REPEAT
+    if((p>=0xd10 && p<=0xd1f) || (p>=0xcb0 && p<=0xcb9))return 1; // GL_MAP_COLOR～GL_DEPTH_BIAS 與 GL_PIXEL_MAP_*_SIZE
+    if(p==0xd70 || p==0xdf1 || p==0xdf2 || p==0xdf4)return 1; // NAME_STACK_DEPTH、FEEDBACK_BUFFER_SIZE／TYPE、SELECTION_BUFFER_SIZE
     switch(p){case 0xba6:case 0xba7:case 0xba8:return 16;
     case 0xb00:case 0xb03:case 0xb04:case 0xb06:case 0xb07:case 0xba2:case 0xc10:case 0xc22:case 0xc23:case 0xb53:case 0xb66:case 0xb80:return 4;
     case 0xb02:return 3;
@@ -305,7 +313,7 @@ unsigned query_size(std::uint32_t p){
     case 0xba0:case 0xba1:case 0xba3:case 0xba4:case 0xba5:case 0xbc0:case 0xbc1:case 0xbc2:case 0xbd0:case 0xbe0:case 0xbe1:case 0xbe2:case 0xbf0:case 0xbf1:case 0xbf2:
     case 0xc00:case 0xc01:case 0xc02:case 0xc11:case 0xc20:case 0xc21:case 0xc30:case 0xc31:case 0xc32:case 0xc33:case 0xc40:case 0xc50:case 0xc51:case 0xc52:case 0xc53:case 0xc54:
     case 0xcf0:case 0xcf1:case 0xcf2:case 0xcf3:case 0xcf4:case 0xcf5:case 0xd00:case 0xd01:case 0xd02:case 0xd03:case 0xd04:case 0xd05:
-    case 0xd30:case 0xd31:case 0xd32:case 0xd33:case 0xd34:case 0xd35:case 0xd36:case 0xd37:case 0xd38:case 0xd39:case 0xd3b:case 0xd50:case 0xd51:case 0xd52:case 0xd53:case 0xd54:case 0xd55:case 0xd56:case 0xd57:case 0xd58:case 0xd59:
+    case 0xd30:case 0xd31:case 0xd32:case 0xd33:case 0xd34:case 0xd35:case 0xd36:case 0xd37:case 0xd38:case 0xd39:case 0xd3b:case 0xd50:case 0xd51:case 0xd52:case 0xd53:case 0xd54:case 0xd55:case 0xd56:case 0xd57:case 0xd58:case 0xd59:case 0xd5a:case 0xd5b:
     case 0x85b5:case 0x8f36:case 0x8f37:case 0x8a28:case 0x8642:
     case 0x84ff:case 0x8b4d:case 0x8872:case 0x8b4c:case 0x8869:case 0x8cdf:case 0x8824:case 0x8b8d:case 0x8894:case 0x8895:case 0x84e0:case 0x821b:case 0x821c:case 0x821d:
     case 0xde0:case 0xde1:case 0x8068:case 0x8069:case 0x8074:case 0x8075:case 0x8076:case 0x8078:case 0x8086:case 0x8087:case 0x8088:case 0x808a:case 0x808b:case 0x808c:case 0x808d:case 0x808e:case 0x808f:case 0x8090:case 0x8091:case 0x8092:case 0x8093:return 1;
@@ -336,6 +344,8 @@ std::span<const WindowsServiceDescriptor> opengl_service_descriptors(){
         const WindowsServiceDescriptor extra[]{
             {"opengl32.dll","wglCreateContext",1},{"opengl32.dll","wglDeleteContext",1},{"opengl32.dll","wglShareLists",2},{"opengl32.dll","wglMakeCurrent",2},
             {"opengl32.dll","wglGetCurrentContext",0},{"opengl32.dll","wglGetCurrentDC",0},{"opengl32.dll","wglGetProcAddress",1},
+            {"opengl32.dll","wglCreateLayerContext",2},{"opengl32.dll","wglDescribeLayerPlane",5},{"opengl32.dll","wglSetLayerPaletteEntries",5},{"opengl32.dll","wglGetLayerPaletteEntries",5},
+            {"opengl32.dll","wglRealizeLayerPalette",3},{"opengl32.dll","wglCopyContext",3},{"opengl32.dll","wglGetDefaultProcAddress",1},
             {"opengl32.dll","wglUseFontBitmapsA",4,0,0,0xe},{"opengl32.dll","wglUseFontBitmapsW",4,0,0,0xe},{"opengl32.dll","wglUseFontOutlinesA",8,0,0,0x7e},{"opengl32.dll","wglUseFontOutlinesW",8,0,0,0x7e},
             {"opengl32.dll","wglSwapIntervalEXT",1},{"opengl32.dll","wglGetSwapIntervalEXT",0},{"opengl32.dll","wglSwapLayerBuffers",2},
             {"opengl32.dll","wglGetExtensionsStringARB",1},{"opengl32.dll","wglChoosePixelFormatARB",6},
@@ -348,6 +358,18 @@ std::span<const WindowsServiceDescriptor> opengl_service_descriptors(){
             {"opengl32.dll","glEvalMesh1",3},{"opengl32.dll","glEvalMesh2",5},{"opengl32.dll","glEvalPoint1",1},{"opengl32.dll","glEvalPoint2",2},
             {"opengl32.dll","glGetMapdv",3},{"opengl32.dll","glGetMapfv",3},{"opengl32.dll","glGetMapiv",3},
             // 1D 貼圖：以高度 1 交給 TexImage2D／TexSubImage2D／CopyTexImage2D／CopyTexSubImage2D 後端操作。
+            // 貼圖座標產生：x86 的 glTexGend 第三個參數為 8 位元組。
+            {"opengl32.dll","glTexGend",3,0x4},{"opengl32.dll","glTexGenf",3},{"opengl32.dll","glTexGeni",3},{"opengl32.dll","glTexGendv",3},{"opengl32.dll","glTexGenfv",3},{"opengl32.dll","glTexGeniv",3},
+            {"opengl32.dll","glGetTexGendv",3},{"opengl32.dll","glGetTexGenfv",3},{"opengl32.dll","glGetTexGeniv",3},
+            // 選取與回饋模式。
+            {"opengl32.dll","glSelectBuffer",2},{"opengl32.dll","glFeedbackBuffer",3},{"opengl32.dll","glInitNames",0},{"opengl32.dll","glLoadName",1},
+            {"opengl32.dll","glPushName",1},{"opengl32.dll","glPopName",0},{"opengl32.dll","glPassThrough",1},
+            // 交錯陣列、邊旗標與色彩索引陣列。
+            {"opengl32.dll","glInterleavedArrays",3},{"opengl32.dll","glEdgeFlagPointer",2},{"opengl32.dll","glIndexPointer",3},
+            {"opengl32.dll","glClipPlane",2},{"opengl32.dll","glGetClipPlane",2},{"opengl32.dll","glGetTexImage",5},
+            {"opengl32.dll","glLineStipple",2,0,0,0x3},{"opengl32.dll","glPolygonStipple",1},{"opengl32.dll","glGetPolygonStipple",1},
+            {"opengl32.dll","glPixelTransferf",2},{"opengl32.dll","glPixelTransferi",2},{"opengl32.dll","glPixelMapfv",3},{"opengl32.dll","glPixelMapuiv",3},{"opengl32.dll","glPixelMapusv",3},
+            {"opengl32.dll","glGetPixelMapfv",2},{"opengl32.dll","glGetPixelMapuiv",2},{"opengl32.dll","glGetPixelMapusv",2},{"opengl32.dll","glDrawPixels",5},{"opengl32.dll","glDebugEntry",2},
             {"opengl32.dll","glTexImage1D",8},{"opengl32.dll","glTexSubImage1D",7},{"opengl32.dll","glCopyTexImage1D",7},{"opengl32.dll","glCopyTexSubImage1D",6},
             {"opengl32.dll","glGetStringi",2},{"opengl32.dll","glGetPointerv",2},{"opengl32.dll","glGetString",1},{"opengl32.dll","glVertexPointer",4},{"opengl32.dll","glColorPointer",4},{"opengl32.dll","glNormalPointer",3},{"opengl32.dll","glTexCoordPointer",4},
             {"opengl32.dll","glEnableClientState",1},{"opengl32.dll","glDisableClientState",1},{"opengl32.dll","glArrayElement",1},
@@ -389,7 +411,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
         // 未提供的 extension 必須回 NULL；不能讓客體誤以為完整 host GL ABI 可直接呼叫。
         return finish(0);
     }
-    if(symbol=="wglCreateContext" || symbol=="wglCreateContextAttribsARB"){
+#include "windows_wgl_layers.inc"
+    if(symbol=="wglCreateContext" || symbol=="wglCreateContextAttribsARB" || symbol=="wglCreateLayerContext"){
+        // wglCreateLayerContext(hdc, iLayerPlane)：只有主平面 0 存在，其他平面為 ERROR_INVALID_PARAMETER。
+        if(symbol=="wglCreateLayerContext" && n(1)!=0){last_error_=dc_window(arg(0))?87:6;return finish(0);}
         if(!runtime_.network.external_io)throw HostCallFault("GPU context 不支援 deterministic compare");
         const auto h=dc_window(arg(0));if(!h || !opengl_.pixel_formats.contains(arg(0))){last_error_=2000;return finish(0);}
         int requested_major=1,requested_minor=0;
@@ -497,19 +522,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
         if(!c.strings.contains(d(0))){const auto value=d(0)==0x1f03?std::string{}:c.native->string(d(0));std::vector<std::uint8_t> bytes(value.begin(),value.end());bytes.push_back(0);c.strings[d(0)]=runtime_allocate(memory,bytes);}
         return finish(c.strings.at(d(0)));
     }
-    const auto array_index=[](std::uint32_t name)->int{switch(name){case 0x8074:return 0;case 0x8075:return 1;case 0x8076:return 2;case 0x8078:return 3;default:return -1;}};
+    const auto array_index=[](std::uint32_t name)->int{switch(name){case 0x8074:return 0;case 0x8075:return 1;case 0x8076:return 2;case 0x8078:return 3;case 0x8079:return 4;case 0x8077:return 5;default:return -1;}};
+    if(symbol=="glGetPointerv" && (d(0)==0x0df0 || d(0)==0x0df3)){
+        // GL_FEEDBACK_BUFFER_POINTER／GL_SELECTION_BUFFER_POINTER 回報 glFeedbackBuffer／glSelectBuffer 收到的客體位址。
+        memory.store(GuestAddress{arg(1)},memory.execution_mode()==ExecutionMode::X86?32:64,d(0)==0x0df0?c.feedback_buffer:c.select_buffer);return finish(0);
+    }
     if(symbol=="glGetPointerv"){
-        const auto i=d(0)==0x808e?0:d(0)==0x808f?1:d(0)==0x8090?2:d(0)==0x8092?3:-1;
+        const auto i=d(0)==0x808e?0:d(0)==0x808f?1:d(0)==0x8090?2:d(0)==0x8092?3:d(0)==0x8093?4:d(0)==0x8091?5:-1;
         if(i<0)error(c,invalid_enum);else memory.store(GuestAddress{arg(1)},memory.execution_mode()==ExecutionMode::X86?32:64,c.client.arrays[static_cast<std::size_t>(i)].pointer);return finish(0);
     }
     if(symbol=="glIsEnabled"){const auto i=array_index(d(0));if(i>=0)return finish(c.client.arrays[static_cast<std::size_t>(i)].enabled?1:0);}
     if(symbol=="glGetIntegerv" || symbol=="glGetFloatv" || symbol=="glGetDoublev" || symbol=="glGetBooleanv"){
         std::optional<std::uint32_t> answer;const auto pname=d(0);const auto enabled=array_index(pname);
         if(enabled>=0)answer=c.client.arrays[static_cast<std::size_t>(enabled)].enabled?1U:0U;
-        constexpr std::array<std::uint32_t,4> buffer_queries{0x8896,0x8897,0x8898,0x889a};
-        for(unsigned i=0;i<4;++i)if(pname==buffer_queries[i])answer=c.client.arrays[i].buffer?c.client.arrays[i].buffer->name:0;
-        constexpr std::array<std::array<std::uint32_t,3>,4> fields{{{0x807a,0x807b,0x807c},{0,0x807e,0x807f},{0x8081,0x8082,0x8083},{0x8088,0x8089,0x808a}}};
-        for(unsigned i=0;i<4;++i)for(unsigned j=0;j<3;++j)if(fields[i][j] && fields[i][j]==pname){const auto& a=c.client.arrays[i];answer=j==0?static_cast<std::uint32_t>(a.size):j==1?a.type:static_cast<std::uint32_t>(a.stride);}
+        constexpr std::array<std::uint32_t,6> buffer_queries{0x8896,0x8897,0x8898,0x889a,0x889b,0x8899};
+        for(unsigned i=0;i<6;++i)if(pname==buffer_queries[i])answer=c.client.arrays[i].buffer?c.client.arrays[i].buffer->name:0;
+        // 每個陣列的 SIZE／TYPE／STRIDE 查詢；邊旗標只有 STRIDE，色彩索引沒有 SIZE。
+        constexpr std::array<std::array<std::uint32_t,3>,6> fields{{{0x807a,0x807b,0x807c},{0,0x807e,0x807f},{0x8081,0x8082,0x8083},{0x8088,0x8089,0x808a},{0,0,0x808c},{0,0x8085,0x8086}}};
+        for(unsigned i=0;i<6;++i)for(unsigned j=0;j<3;++j)if(fields[i][j] && fields[i][j]==pname){const auto& a=c.client.arrays[i];answer=j==0?static_cast<std::uint32_t>(a.size):j==1?a.type:static_cast<std::uint32_t>(a.stride);}
         if(answer){const auto value=*answer;if(symbol=="glGetBooleanv")memory.store(GuestAddress{arg(1)},8,value?1:0);
             else if(symbol=="glGetFloatv")memory.store(GuestAddress{arg(1)},32,std::bit_cast<std::uint32_t>(static_cast<float>(value)));
             else if(symbol=="glGetDoublev")memory.store(GuestAddress{arg(1)},64,std::bit_cast<std::uint64_t>(static_cast<double>(value)));
@@ -527,6 +557,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
         if(c.vertex_array && !buffer && pointer){error(c,invalid_operation);return finish(0);}
         auto& a=c.client.arrays[i];a.pointer=pointer;a.size=size;a.stride=stride;a.type=type;a.buffer=std::move(buffer);return finish(0);
     }
+#include "windows_opengl_arrays.inc"
     const auto array_read=[&](const OpenGlArray& array,std::uint64_t offset,std::span<std::uint8_t> bytes){
         if(array.pointer>UINT64_MAX-offset){error(c,invalid_operation);return false;}offset+=array.pointer;
         if(array.buffer){if(offset>array.buffer->bytes.size() || bytes.size()>array.buffer->bytes.size()-offset){error(c,invalid_operation);return false;}
@@ -535,13 +566,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
     };
     const auto array_element=[&](std::uint32_t index){
         // ArrayElement 在 display list 編譯時擷取當時的 guest 陣列內容。
-        for(const unsigned i:{2U,1U,3U,0U}){
+        for(const unsigned i:{2U,1U,3U,4U,5U,0U}){
             const auto& a=c.client.arrays[i];if(!a.enabled)continue;const auto unit=type_size(a.type),extent=unit*static_cast<std::uint32_t>(a.size);const auto stride=a.stride?static_cast<std::uint32_t>(a.stride):extent;
             const auto offset=static_cast<std::uint64_t>(index)*stride;
             std::array<std::uint8_t,32> bytes{};if(!array_read(a,offset,std::span(bytes).first(extent)))return;std::array<double,4> values{0,0,0,1};
             // 法向量陣列只接受有號型別，因此法向量與色彩都依同一套整數正規化。
             for(unsigned j=0;j<static_cast<unsigned>(a.size);++j){std::uint64_t raw=0;for(unsigned k=0;k<unit;++k)raw|=std::uint64_t(bytes[j*unit+k])<<(8*k);
                 values[j]=gl_component(a.type,raw);if(i==1||i==2)values[j]=gl_normalized(a.type,values[j]);}
+            // 邊旗標陣列送 EdgeFlag，色彩索引陣列送 Indexd（不正規化）。
+            if(i==4){c.native->execute(GlOperation::EdgeFlag,std::array<std::uint64_t,1>{values[0]!=0?1U:0U});continue;}
+            if(i==5){c.native->execute(GlOperation::Indexd,std::array<std::uint64_t,1>{std::bit_cast<std::uint64_t>(values[0])});continue;}
             const auto op=i==0?GlOperation::Vertex4dv:i==1?GlOperation::Normal3dv:i==2?GlOperation::Color4dv:GlOperation::TexCoord4dv;
             c.native->execute(op,{},std::span(reinterpret_cast<const std::uint8_t*>(values.data()),sizeof(values)));
         }
@@ -554,6 +588,42 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
     const auto send_vector=[&](GlOperation operation,const std::array<double,4>& vector){c.native->execute(operation,{},std::span(reinterpret_cast<const std::uint8_t*>(vector.data()),sizeof(vector)));};
 #include "windows_opengl_evaluators.inc"
 #include "windows_opengl_texture1d.inc"
+#include "windows_opengl_texgen.inc"
+#include "windows_opengl_select.inc"
+#include "windows_opengl_pixels.inc"
+    if(symbol=="glGetTexImage"){
+        // (target, level, format, type, pixels)：只接受 GL_TEXTURE_1D／2D；先查該層級寬高決定輸出大小，GL_PACK_* 的留白保留客體原有內容。
+        if(d(0)!=0xde0 && d(0)!=0xde1){error(c,invalid_enum);return finish(0);}if(n(1)<0){error(c,invalid_value);return finish(0);}
+        const auto level_size=[&](std::uint32_t pname){std::array<std::uint8_t,4> value{};const std::array<std::uint64_t,4> query{d(0),d(1),pname,0};c.native->execute(GlOperation::GetTexLevelParameteriv,query,{},value);std::int32_t result;std::memcpy(&result,value.data(),4);return result;};
+        const auto width=level_size(0x1000),height=level_size(0x1001);if(width<=0 || height<=0)return finish(0);
+        const auto bytes=pixel_bytes(c.client,width,height,d(2),d(3),true);if(!bytes){error(c,invalid_enum);return finish(0);}
+        auto& out=c.output_scratch;out.resize(*bytes);if(arg(4) && *bytes)memory.read(GuestAddress{arg(4)},out);
+        const std::array<std::uint64_t,4> values{d(0),d(1),d(2),d(3)};std::uint64_t written=0;
+        try{written=c.native->execute(GlOperation::GetTexImage,values,{},out);}catch(const std::bad_alloc&){error(c,out_of_memory);return finish(0);}
+        if(written && arg(4))memory.write(GuestAddress{arg(4)},std::span<const std::uint8_t>(out).first(static_cast<std::size_t>(std::min<std::uint64_t>(written,out.size()))));
+        return finish(0);
+    }
+    if(symbol=="glLineStipple" || symbol=="glPolygonStipple" || symbol=="glGetPolygonStipple"){
+        // glLineStipple(factor, pattern)；glPolygonStipple／glGetPolygonStipple(mask)：32×32 位元圖，依 GL_UNPACK_*／GL_PACK_* 版面讀寫。
+        try{
+            if(symbol=="glLineStipple"){const std::array<std::uint64_t,2> values{d(0),d(1)&0xffffU};c.native->execute(GlOperation::LineStipple,values,{},{});return finish(0);}
+            const bool get=symbol=="glGetPolygonStipple";const auto bytes=pixel_bytes(c.client,32,32,0x1900,0x1a00,get);if(!bytes){error(c,invalid_value);return finish(0);}
+            if(!get){auto& input=c.input_scratch;read_reusable(memory,arg(0),*bytes,input);c.native->execute(GlOperation::PolygonStipple,{},input,{});return finish(0);}
+            auto& out=c.output_scratch;out.resize(*bytes);memory.read(GuestAddress{arg(0)},out);
+            if(c.native->execute(GlOperation::GetPolygonStipple,{},{},out))memory.write(GuestAddress{arg(0)},out);
+        }catch(const std::bad_alloc&){error(c,out_of_memory);}
+        return finish(0);
+    }
+    if(symbol=="glClipPlane" || symbol=="glGetClipPlane"){
+        // (plane, equation)：方程式為 4 個 double；平面編號與眼座標轉換由後端處理。
+        if(d(0)<0x3000 || d(0)>=0x3008){error(c,invalid_enum);return finish(0);}
+        const std::array<std::uint64_t,1> values{d(0)};
+        try{
+            if(symbol=="glClipPlane"){auto& input=c.input_scratch;read_reusable(memory,arg(1),32,input);c.native->execute(GlOperation::ClipPlane,values,input,{});}
+            else {std::array<std::uint8_t,32> equation{};if(c.native->execute(GlOperation::GetClipPlane,values,{},equation)==4)memory.write(GuestAddress{arg(1)},equation);}
+        }catch(const std::bad_alloc&){error(c,out_of_memory);}
+        return finish(0);
+    }
     if(variant){
         const auto unit=type_size(variant->type);const bool floating=variant->type==0x1406 || variant->type==0x140a;std::array<double,4> raw{};
         for(unsigned i=0;i<variant->count;++i){
@@ -722,6 +792,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
         auto& indices=c.index_scratch;
         if(indexed){const auto type=d(2);if(type!=0x1401&&type!=0x1403&&type!=0x1405){error(c,invalid_enum);return finish(0);}const auto unit=type_size(type);const auto length=static_cast<std::uint64_t>(count)*unit;if(length>transfer_limit){error(c,out_of_memory);return finish(0);}input.resize(static_cast<std::size_t>(length));OpenGlArray elements;elements.pointer=arg(3);elements.buffer=c.native->bound_buffer(0x8893);if(!array_read(elements,0,input))return finish(0);const auto& bytes=input;indices.resize(static_cast<std::size_t>(count));
             for(std::size_t i=0;i<indices.size();++i){std::uint32_t value=0;for(unsigned j=0;j<unit;++j)value|=std::uint32_t(bytes[i*unit+j])<<(j*8);indices[i]=value;first=std::min(first,value);last=std::max(last,value);}}
+        if(c.client.arrays[4].enabled || c.client.arrays[5].enabled){
+            // 後端只上傳頂點、法線、顏色、貼圖座標四個陣列；邊旗標或色彩索引陣列啟用時改為逐元素送出，保留這兩種屬性。
+            c.native->execute(GlOperation::Begin,std::array<std::uint64_t,1>{d(0)});
+            if(indexed){for(const auto index:indices)array_element(index);}else{for(std::uint64_t i=first;i<=last;++i)array_element(static_cast<std::uint32_t>(i));}
+            c.native->execute(GlOperation::End);++c.draws;return finish(0);
+        }
         const auto extent=static_cast<std::uint64_t>(last)-first+1;if(extent>transfer_limit/32){error(c,out_of_memory);return finish(0);}
         for(unsigned i=0;i<4;++i){const auto& a=c.client.arrays[i];if(!a.enabled){if(!upload(i,a.size,a.type,{},false))return finish(0);continue;}
             const auto element=type_size(a.type)*static_cast<std::uint32_t>(a.size),stride=a.stride?static_cast<std::uint32_t>(a.stride):element;
@@ -738,21 +814,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_opengl(GuestState& state,Gu
         std::fprintf(stderr,"[gl-texture] %.*s",static_cast<int>(symbol.size()),symbol.data());
         for(auto value:values)std::fprintf(stderr," %llx",static_cast<unsigned long long>(value));std::fprintf(stderr,"\n");
     }
-    std::array<bool,4> deleted_client_buffers{};
+    std::array<bool,6> deleted_client_buffers{};
     if(symbol=="glDeleteBuffers")for(std::size_t i=0;i<input.size();i+=4){std::uint32_t name;std::memcpy(&name,input.data()+i,4);const auto buffer=c.native->buffer_object(name);
-        if(buffer)for(unsigned j=0;j<4;++j)if(c.client.arrays[j].buffer==buffer)deleted_client_buffers[j]=true;}
+        if(buffer)for(unsigned j=0;j<6;++j)if(c.client.arrays[j].buffer==buffer)deleted_client_buffers[j]=true;}
     std::uint64_t result=0;try{result=c.native->execute(found->operation,values,input,output);}catch(const std::bad_alloc&){
         if(std::getenv("X64ARM_GL_TRACE"))std::fprintf(stderr,"[gl-allocation-failed] operation=%u\n",static_cast<unsigned>(found->operation));
         error(c,out_of_memory);return finish(0);}
 
     if(symbol=="glUseProgram" && result)c.program=d(0);
-    if(symbol=="glDeleteBuffers" && result)for(unsigned i=0;i<4;++i)if(deleted_client_buffers[i])c.client.arrays[i].buffer.reset();
+    if(symbol=="glDeleteBuffers" && result)for(unsigned i=0;i<6;++i)if(deleted_client_buffers[i])c.client.arrays[i].buffer.reset();
     if(symbol=="glBindVertexArray" && result){
         c.vertex_array_clients[c.vertex_array]=c.client.arrays;c.vertex_array=d(0);
-        auto [it,added]=c.vertex_array_clients.try_emplace(c.vertex_array);if(added)it->second[1].size=3;c.client.arrays=it->second;
+        auto [it,added]=c.vertex_array_clients.try_emplace(c.vertex_array);if(added)it->second=OpenGlClientState{}.arrays;c.client.arrays=it->second;
     }
     if(symbol=="glDeleteVertexArrays" && result){for(std::size_t i=0;i<input.size();i+=4){std::uint32_t name;std::memcpy(&name,input.data()+i,4);if(!name)continue;
-        if(c.vertex_array==name){c.vertex_array=0;auto [it,added]=c.vertex_array_clients.try_emplace(0);if(added)it->second[1].size=3;c.client.arrays=it->second;}c.vertex_array_clients.erase(name);}}
+        if(c.vertex_array==name){c.vertex_array=0;auto [it,added]=c.vertex_array_clients.try_emplace(0);if(added)it->second=OpenGlClientState{}.arrays;c.client.arrays=it->second;}c.vertex_array_clients.erase(name);}}
     if(!result && (symbol=="glGetBufferParameteriv" || symbol=="glGetBufferSubData" || symbol=="glGetVertexAttribiv" || symbol=="glGetVertexAttribfv" || symbol=="glGetVertexAttribPointerv"))output.clear();
     if((symbol=="glGetShaderInfoLog" || symbol=="glGetProgramInfoLog") && arg(2))memory.store(GuestAddress{arg(2)},32,result);
     if(!output.empty())memory.write(GuestAddress{output_address},output);

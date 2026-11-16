@@ -1129,13 +1129,15 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
             }
         }
     }
+    const bool vertex_cull= !original.stages[2].shader && !original.stages[3].shader && !original.stages[4].shader && original.stages[0].shader &&
+        metal_vertex_cull_needed(dynamic_cast<MetalShader&>(*original.stages[0].shader));
     if(original.indirect){
         const auto size=original.indexed?20U:16U;auto& arguments=metal_resource(original.indirect);
         if(!arguments.buffer || (original.indirect_offset&3U) || std::uint64_t{original.indirect_offset}+size>arguments.desc.width)throw std::invalid_argument("間接繪製參數越界或未對齊");
         // 細分、幾何／SO 需要 CPU 端數量：等 GPU 寫完後讀回參數，轉成一般繪製。SO 統計只在 GS 路徑累計；
         // 每個 context 都持有統計物件，不能以其存在判斷（否則每次間接繪製都同步等待 GPU）。
         // 走 GS mesh 路徑的繪製由 object 階段直接讀參數緩衝，不讀回（管線統計與其他間接繪製相同，不在 CPU 端累計）。
-        if((original.stages[2].shader || original.stages[3].shader || original.stages[4].shader ||
+        if((vertex_cull || original.stages[2].shader || original.stages[3].shader || original.stages[4].shader ||
            std::any_of(original.stream_targets.begin(),original.stream_targets.end(),[](const auto& target){return bool(target);})) && !graphics_geometry_mesh(original)){
             GraphicsView view;view.resource=original.indirect;view.first=original.indirect_offset;view.count=size;
             const auto bytes=graphics_read(view);std::array<std::uint32_t,5> values{};std::memcpy(values.data(),bytes.data(),size);
@@ -1155,6 +1157,11 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         }
     }
     std::unique_ptr<GraphicsDraw> raster;
+    if(vertex_cull){
+        // 沿用 SO 的 VS 直通圖元流程：擷取頂點結果、依原 topology 組圖元，再在光柵化前剔除。
+        // 常數零平面在建立路徑時已證明不會剔除，仍走原本的單一頂點階段。
+        raster=std::make_unique<GraphicsDraw>(original);raster->stages[2].shader=original.stages[0].shader;
+    }
     if(metal_stream_output_gpu_enabled() && original.stages[2].shader && !original.stages[2].shader->stream_output.empty() &&
        original.stages[2].shader->stage==0 && original.stages[2].shader->rasterized_stream!=UINT32_MAX &&
        !original.stages[3].shader && !original.stages[4].shader &&

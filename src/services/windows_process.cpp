@@ -2202,6 +2202,8 @@ bool WindowsServices::processes_waiting() {
 }
 std::span<const WindowsServiceDescriptor> process_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
+        {"psapi.dll","EnumDeviceDrivers",3,0,0,0x2},{"psapi.dll","GetDeviceDriverBaseNameA",3,0,0,0x4},{"psapi.dll","GetDeviceDriverBaseNameW",3,0,0,0x4},
+        {"psapi.dll","GetDeviceDriverFileNameA",3,0,0,0x4},{"psapi.dll","GetDeviceDriverFileNameW",3,0,0,0x4},
         {"kernel32.dll","PssCaptureSnapshot",4,0,0,0x6},{"kernel32.dll","PssQuerySnapshot",4,0,0,0xa},
         {"kernel32.dll","PssFreeSnapshot",2},{"kernel32.dll","PssDuplicateSnapshot",5,0,0,0x10},
         {"crt","_spawnv",3},{"crt","_spawnve",4},{"crt","_spawnvp",3},{"crt","_spawnvpe",4},
@@ -3171,6 +3173,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
 #include "windows_native_user_process.inc"
 #include "windows_native_process_only.inc"
 #include "windows_process_logon.inc"
+#include "windows_device_drivers.inc"
     if(service.symbol.starts_with("Pss")){
 #include "windows_pss_snapshot.inc"
     }

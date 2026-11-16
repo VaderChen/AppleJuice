@@ -34,7 +34,7 @@
     </div>
    </div>
    <div class="run-footer"><div id="run-message" class="run-message" role="status">啟動參數、工作資料夾與 C 槽映射可在「程式設定」調整。</div>
-    <div class="run-switches" role="group" aria-label="顯示"><label class="switch"><input type="checkbox" role="switch" id="present-upscale"><span class="switch-track" aria-hidden="true"></span><span>2 倍放大顯示</span></label><label class="switch"><input type="checkbox" role="switch" id="present-interpolation"><span class="switch-track" aria-hidden="true"></span><span>畫面內插</span></label></div>
+    <div class="run-switches" role="group" aria-label="播放選項"><label class="switch"><input type="checkbox" role="switch" id="spatial-headphones-quick"><span class="switch-track" aria-hidden="true"></span><span>空間混音(耳機)</span></label><label class="switch"><input type="checkbox" role="switch" id="present-upscale"><span class="switch-track" aria-hidden="true"></span><span>2 倍放大顯示</span></label><label class="switch"><input type="checkbox" role="switch" id="present-interpolation"><span class="switch-track" aria-hidden="true"></span><span>畫面內插</span></label></div>
    </div>
   </div>
   <div id="settings" class="settings-panel" role="tabpanel" aria-labelledby="tab-settings" hidden><div class="section-heading"><div><h3>啟動設定</h3><p id="settings-note">每個 EXE 使用自己的設定檔，下次啟動時套用。</p></div><div class="settings-actions"><button id="analyze" class="button secondary" hidden>程式加速分析</button><button id="save" class="button secondary">儲存設定</button></div></div><form id="settings-form">
@@ -74,6 +74,7 @@
   <button id="global-tab-windows" type="button" role="tab" aria-controls="global-windows" aria-selected="false" data-global-tab="windows" tabindex="-1">Windows 介面</button>
   <button id="global-tab-cpu" type="button" role="tab" aria-controls="global-cpu" aria-selected="false" data-global-tab="cpu" tabindex="-1">CPU</button>
   <button id="global-tab-gpu" type="button" role="tab" aria-controls="global-gpu" aria-selected="false" data-global-tab="gpu" tabindex="-1">GPU</button>
+  <button id="global-tab-audio" type="button" role="tab" aria-controls="global-audio" aria-selected="false" data-global-tab="audio" tabindex="-1">音訊</button>
   <button id="global-tab-cache" type="button" role="tab" aria-controls="global-cache" aria-selected="false" data-global-tab="cache" tabindex="-1">快取</button>
   <button id="global-tab-about" type="button" role="tab" aria-controls="global-about" aria-selected="false" data-global-tab="about" tabindex="-1">關於</button>
  </nav><div class="app-settings-pages">
@@ -90,6 +91,11 @@
    </form><dl class="settings-summary"><div><dt>執行模式</dt><dd id="execution-mode">Resident AOT 常駐轉譯</dd></div><div><dt>指令數上限</dt><dd>依個別程式設定，預設不限</dd></div></dl></section>
   <section id="global-gpu" role="tabpanel" aria-labelledby="global-tab-gpu" hidden><h4>程式 GPU 記憶體</h4><form id="global-gpu-form"><fieldset id="gpu-memory" class="settings-capsule-options" aria-label="GPU 記憶體" aria-describedby="gpu-memory-system" disabled><div class="settings-capsule-row"><div class="settings-capsules"><label><input id="gpu-memory-4096" type="radio" name="gpu-memory" value="4096"><span>4G</span></label><label><input id="gpu-memory-6144" type="radio" name="gpu-memory" value="6144"><span>6G</span></label><label><input id="gpu-memory-8192" type="radio" name="gpu-memory" value="8192"><span>8G</span></label><label><input id="gpu-memory-16384" type="radio" name="gpu-memory" value="16384"><span>16G</span></label></div><output id="gpu-memory-value" aria-live="polite">—</output></div></fieldset>
    <p id="gpu-memory-system" class="field-help"></p></form></section>
+  <section id="global-audio" role="tabpanel" aria-labelledby="global-tab-audio" hidden><h4>耳機音效</h4><div class="appearance-settings">
+   <label class="switch"><input id="spatial-headphones" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span><span>空間混音(耳機)</span></label>
+   <p class="field-help">將多聲道聲音模擬為耳機的立體空間音效。請配戴耳機使用。</p>
+   <p class="field-help">預設關閉，儲存後於下次啟動程式生效。目前不啟用頭部追蹤。</p>
+  </div></section>
   <section id="global-advanced" role="tabpanel" aria-labelledby="global-tab-advanced" hidden><h4>預設磁碟映射</h4><p>C: 為必要設定。可新增 D: 至 Z:，供各程式在下次啟動時使用；讀寫權限沿用各 EXE 的設定。</p>
    <form id="global-settings-form"><div id="global-drive-rows" class="global-drive-rows"></div><button id="global-add-drive" type="button" class="button secondary">＋ 新增磁碟映射</button></form>
    <p class="global-hint">每個 EXE 的 C: 與工作目錄仍可獨立設定。更改映射不會搬移或刪除目錄中的檔案。</p>

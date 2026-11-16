@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <set>
 
@@ -22,6 +23,14 @@ std::span<const WindowsServiceDescriptor> shell_service_descriptors() {
         {"shell32.dll","SHChangeNotify",4},{"shell32.dll","SHGetPropertyStoreForWindow",3},
         {"shell32.dll","SHAddToRecentDocs",2},
         {"ole32.dll","PropVariantClear",1},{"ole32.dll","PropVariantCopy",2},{"propsys.dll","InitPropVariantFromCLSID",2},{"propsys.dll","PSCreateMemoryPropertyStore",2},{"propsys.dll","VariantCompare",2},{"propsys.dll","PropVariantToStringAlloc",2},{"propsys.dll","PropVariantToString",3},
+        {"propsys.dll","PropVariantChangeType",4,0,0,0xc},{"propsys.dll","PropVariantCompareEx",4,0,0,0xc},{"propsys.dll","PropVariantGetStringElem",3,0,0,0x2},
+        {"propsys.dll","PropVariantToInt16",2},{"propsys.dll","PropVariantToUInt16",2},{"propsys.dll","PropVariantToInt32",2},{"propsys.dll","PropVariantToUInt32",2},
+        {"propsys.dll","PropVariantToInt64",2},{"propsys.dll","PropVariantToUInt64",2},{"propsys.dll","PropVariantToDouble",2},{"propsys.dll","PropVariantToBoolean",2},
+        {"propsys.dll","PropVariantToUInt32WithDefault",2,0,0,0x2},{"propsys.dll","PropVariantToFileTime",3,0,0,0x2},{"propsys.dll","PropVariantToGUID",2},{"propsys.dll","PropVariantToBSTR",2},
+        {"propsys.dll","PropVariantToBuffer",3,0,0,0x4},{"propsys.dll","PropVariantToUInt32Vector",4,0,0,0x4},{"propsys.dll","PropVariantToStringWithDefault",2},{"propsys.dll","PropVariantToVariant",2},
+        {"propsys.dll","VariantToPropVariant",2},{"propsys.dll","VariantToGUID",2},{"propsys.dll","VariantToString",3,0,0,0x4},{"propsys.dll","VariantToStringWithDefault",2},
+        {"propsys.dll","InitPropVariantFromBuffer",3,0,0,0x2},{"propsys.dll","InitPropVariantFromGUIDAsString",2},{"propsys.dll","InitPropVariantFromStringVector",3,0,0,0x2},
+        {"propsys.dll","InitVariantFromBuffer",3,0,0,0x2},{"propsys.dll","InitVariantFromFileTime",2},{"propsys.dll","InitVariantFromGUIDAsString",2},
         {"internal-shell","IPropertyStore.QueryInterface",3},{"internal-shell","IPropertyStore.AddRef",1},{"internal-shell","IPropertyStore.Release",1},
         {"internal-shell","IPropertyStore.GetCount",2},{"internal-shell","IPropertyStore.GetAt",3},{"internal-shell","IPropertyStore.GetValue",3},{"internal-shell","IPropertyStore.SetValue",3},{"internal-shell","IPropertyStore.Commit",1},
         {"shell32.dll","SHGetKnownFolderPath",4},{"shell32.dll","SHGetKnownFolderIDList",4},
@@ -351,18 +360,41 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
         }catch(const MemoryFault&){result=0x80070057U;}catch(const std::bad_alloc&){result=0x8007000eU;}
         arg.return_to(state,result);return std::nullopt;
     }
-    if(symbol.starts_with("PropVariantToString") || symbol=="InitPropVariantFromCLSID" || symbol=="SHGetPropertyStoreForWindow" || symbol=="PSCreateMemoryPropertyStore" || symbol=="VariantCompare" || symbol.starts_with("IPropertyStore.") || symbol=="PropVariantClear" || symbol=="PropVariantCopy"){
+    if(symbol.starts_with("PropVariant") || symbol.starts_with("InitPropVariantFrom") || symbol.starts_with("InitVariantFrom") || symbol.starts_with("VariantTo") || symbol=="SHGetPropertyStoreForWindow" || symbol=="PSCreateMemoryPropertyStore" || symbol=="VariantCompare" || symbol.starts_with("IPropertyStore.") || symbol=="PropVariantClear" || symbol=="PropVariantCopy"){
         const auto bits=static_cast<std::uint8_t>(x86_?32:64);const unsigned unit=x86_?4:8,size=x86_?16:24;
         constexpr std::uint32_t pointer_error=0x80004003U,no_interface=0x80004002U;
         constexpr std::array<std::uint8_t,16> iid{0xeb,0x8e,0x6d,0x88,0xf2,0x8c,0x46,0x44,0x8d,0x02,0xcd,0xba,0x1d,0xbd,0xcf,0x99},unknown{0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
         const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
         const auto scalar_size=[](unsigned type)->unsigned{switch(type){case 0:case 1:return 0;case 16:case 17:return 1;case 2:case 11:case 18:return 2;case 3:case 4:case 10:case 19:case 22:case 23:return 4;case 5:case 6:case 7:case 20:case 21:case 64:return 8;case 14:return 16;default:return 99;}};
-        const auto indirect=[](unsigned type){return type==8 || type==30 || type==31 || type==65 || type==72 || type==0x1011;};
+        // VT_VECTOR|x：元素為字串（LPWSTR／LPSTR／BSTR，陣列存指標）、CLSID 或純量；儲存時字串元素以「4 位元組長度＋內容」串接，其餘為元素原始位元組。
+        const auto vector_stride=[&](unsigned type)->unsigned{
+            if(!(type&0x1000U) || (type&~0x1fffU))return 0;const auto element=type&0xfffU;
+            if(element==8 || element==30 || element==31)return unit;if(element==72)return 16;if(element<2 || element==14)return 0;
+            const auto n=scalar_size(element);return n==99?0:n;};
+        const auto indirect=[&](unsigned type){return type==8 || type==30 || type==31 || type==65 || type==72 || vector_stride(type)!=0;};
+        const auto make_bstr=[&](std::span<const std::uint8_t> bytes){
+            const auto base=allocate_heap(memory,bytes.size()+10);if(!base)throw std::bad_alloc{};
+            memory.store(GuestAddress{base},32,0x52545342U);memory.store(GuestAddress{base+4},32,bytes.size());if(!bytes.empty())memory.write(GuestAddress{base+8},bytes);
+            memory.store(GuestAddress{base+8+bytes.size()},16,0);return base+8;};
         const auto read_payload=[&](std::uint16_t type,std::uint64_t payload){
             GuiStoredVariant v;v.type=type;
             const auto n=scalar_size(v.type);
             if(n!=99){if(n)memory.read(GuestAddress{payload-(v.type==14?8U:0U)},std::span{v.scalar}.first(n));return v;}
             if(!indirect(v.type))throw std::invalid_argument("尚未支援的 PROPVARIANT 型別");
+            if(const auto stride=vector_stride(v.type);stride && v.type!=0x1011){
+                const auto count=memory.load(GuestAddress{payload},32),elements=memory.load(GuestAddress{payload+unit},bits);const auto element=v.type&0xfffU;
+                if(count>1048576 || (count && !elements))throw std::invalid_argument("PROPVARIANT 向量大小不合法");
+                if(element!=8 && element!=30 && element!=31){v.payload.resize(count*stride);if(count)memory.read(GuestAddress{elements},v.payload);return v;}
+                for(std::uint64_t i=0;i<count;++i){
+                    const auto item=memory.load(GuestAddress{elements+i*unit},bits);std::vector<std::uint8_t> bytes;
+                    if(element==31)bytes=utf16_bytes(item?read_utf16(memory,GuestAddress{item}):std::u16string{});
+                    else if(element==8){if(item){bytes.resize(memory.load(GuestAddress{item-4},32));if(!bytes.empty())memory.read(GuestAddress{item},bytes);}}
+                    else{const auto text=item?read_ansi(memory,item):std::string{};bytes.assign(text.begin(),text.end());bytes.push_back(0);}
+                    if(v.payload.size()+bytes.size()>16*1024*1024)throw std::invalid_argument("PROPVARIANT 資料大小不合法");
+                    for(unsigned k=0;k<4;++k)v.payload.push_back(static_cast<std::uint8_t>(bytes.size()>>(8*k)));v.payload.insert(v.payload.end(),bytes.begin(),bytes.end());
+                }
+                return v;
+            }
             const bool counted=v.type==65 || v.type==0x1011;const auto pointer=memory.load(GuestAddress{payload+(counted?unit:0)},bits);
             std::size_t length=0;
             if(counted)length=memory.load(GuestAddress{payload},32);
@@ -392,9 +424,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
         };
         const auto clear_variant=[&](std::uint64_t at)->std::uint32_t{
             memory.check(GuestAddress{at},size,Access::Write);const auto type=static_cast<unsigned>(memory.load(GuestAddress{at},16));
+            // VT_ARRAY 由 SafeArrayDestroy 釋放（含 BSTR／介面元素）；字串向量先釋放各元素再釋放指標陣列。
+            if((type&0x2000U) && !(type&0x5000U)){
+                if(const auto array=memory.load(GuestAddress{at+8},bits)){const auto status=static_cast<std::uint32_t>(nested_service(state,memory,"oleaut32.dll","SafeArrayDestroy",{array}));if(status)return status;}
+                memory.write(GuestAddress{at},std::vector<std::uint8_t>(size));return 0;
+            }
+            if(const auto element=type&0xfffU;vector_stride(type) && (element==8 || element==30 || element==31)){
+                const auto count=memory.load(GuestAddress{at+8},32),elements=memory.load(GuestAddress{at+8+unit},bits);
+                if(count>1048576 || (count && !elements))return invalid_argument;
+                for(std::uint64_t i=0;i<count;++i)if(const auto item=memory.load(GuestAddress{elements+i*unit},bits)){
+                    const auto base=element==8?item-8:item;if(!allocations_.contains(base) || (element==8 && memory.load(GuestAddress{base},32)!=0x52545342U))return invalid_argument;
+                    if(!free_heap(memory,base,state))return invalid_argument;}
+                if(elements && (!allocations_.contains(elements) || !free_heap(memory,elements,state)))return invalid_argument;
+                memory.write(GuestAddress{at},std::vector<std::uint8_t>(size));return 0;
+            }
             if(scalar_size(type)==99){
                 if(!indirect(type))return not_implemented;
-                const auto pointer=memory.load(GuestAddress{at+8+((type==65 || type==0x1011)?unit:0)},bits);
+                const auto pointer=memory.load(GuestAddress{at+8+((type==65 || vector_stride(type))?unit:0)},bits);
                 if(pointer){const auto base=type==8?pointer-8:pointer;
                     if(!allocations_.contains(base) || (type==8 && memory.load(GuestAddress{base},32)!=0x52545342U))return invalid_argument;
                     if(!free_heap(memory,base,state))return invalid_argument;
@@ -404,19 +450,36 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
         };
         const auto write_variant=[&](std::uint64_t at,const GuiStoredVariant& v){
             memory.check(GuestAddress{at},size,Access::Write);std::vector<std::uint8_t> data(size);std::uint64_t pointer=0;
-            const auto n=scalar_size(v.type);
+            const auto n=scalar_size(v.type);const auto element=v.type&0xfffU;
+            if(vector_stride(v.type) && (element==8 || element==30 || element==31)){
+                // 字串向量：先配置全部元素，失敗時一併釋放。
+                std::vector<std::uint64_t> items;std::uint64_t elements=0;
+                try{
+                    for(std::size_t at_byte=0;at_byte+4<=v.payload.size();){
+                        std::size_t length=0;for(unsigned k=0;k<4;++k)length|=std::size_t{v.payload[at_byte+k]}<<(8*k);at_byte+=4;
+                        if(at_byte+length>v.payload.size())throw std::invalid_argument("PROPVARIANT 向量資料不合法");
+                        const auto bytes=std::span(v.payload).subspan(at_byte,length);at_byte+=length;
+                        if(element==8)items.push_back(make_bstr(bytes));
+                        else{const auto item=allocate_heap(memory,std::max<std::size_t>(length,1));if(!item)throw std::bad_alloc{};items.push_back(item);if(length)memory.write(GuestAddress{item},bytes);else memory.store(GuestAddress{item},8,0);}
+                    }
+                    if(!items.empty()){elements=allocate_heap(memory,items.size()*unit);if(!elements)throw std::bad_alloc{};for(std::size_t i=0;i<items.size();++i)memory.store(GuestAddress{elements+i*unit},bits,items[i]);}
+                }catch(...){for(const auto item:items)(void)free_heap(memory,element==8?item-8:item,state);throw;}
+                data[0]=v.type&255;data[1]=v.type>>8;
+                for(unsigned i=0;i<4;++i)data[8+i]=static_cast<std::uint8_t>(items.size()>>(8*i));for(unsigned i=0;i<unit;++i)data[8+unit+i]=static_cast<std::uint8_t>(elements>>(8*i));
+                memory.write(GuestAddress{at},data);return;
+            }
             if(n!=99){if(n)std::copy_n(v.scalar.begin(),n,data.begin()+(v.type==14?0:8));}
-            else if(!v.payload.empty() || v.type==8){
-                const auto bytes=v.payload.size()+(v.type==8?10:0);const auto base=allocate_heap(memory,bytes);if(!base)throw std::bad_alloc{};pointer=base+(v.type==8?8:0);
-                if(v.type==8){memory.store(GuestAddress{base},32,0x52545342U);memory.store(GuestAddress{base+4},32,v.payload.size());memory.store(GuestAddress{pointer+v.payload.size()},16,0);}
-                if(!v.payload.empty())memory.write(GuestAddress{pointer},v.payload);
+            else if(v.type==8)pointer=make_bstr(v.payload);
+            else if(!v.payload.empty()){
+                const auto base=allocate_heap(memory,v.payload.size());if(!base)throw std::bad_alloc{};pointer=base;memory.write(GuestAddress{pointer},v.payload);
             }
             data[0]=v.type&255;data[1]=v.type>>8;
-            if(n==99){const bool counted=v.type==65 || v.type==0x1011;const auto offset=8+(counted?unit:0);for(unsigned i=0;i<unit;++i)data[offset+i]=static_cast<std::uint8_t>(pointer>>(8*i));if(counted)for(unsigned i=0;i<4;++i)data[8+i]=static_cast<std::uint8_t>(v.payload.size()>>(8*i));}
+            if(n==99){const auto stride=vector_stride(v.type);const bool counted=v.type==65 || stride;const auto offset=8+(counted?unit:0);for(unsigned i=0;i<unit;++i)data[offset+i]=static_cast<std::uint8_t>(pointer>>(8*i));if(counted)for(unsigned i=0;i<4;++i)data[8+i]=static_cast<std::uint8_t>((stride?v.payload.size()/stride:v.payload.size())>>(8*i));}
             memory.write(GuestAddress{at},data);
         };
         try{
-            if(symbol=="PropVariantToStringAlloc" || symbol=="PropVariantToString"){
+#include "windows_propvariant.inc"
+            if(symbol=="PropVariantToStringAlloc" || symbol=="PropVariantToString" || symbol=="VariantToString"){
                 const bool allocated=symbol=="PropVariantToStringAlloc";
                 if(!arg(1))return finish(pointer_error);
                 if(allocated)memory.store(GuestAddress{arg(1)},bits,0);
@@ -460,32 +523,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
                 }
                 if(symbol=="PropVariantClear")return finish(clear_variant(arg(0)));
                 if(arg(0)==arg(1))return finish(0);const auto value=read_variant(arg(1));const auto error=clear_variant(arg(0));if(error)return finish(error);write_variant(arg(0),value);return finish(0);
-            }
-            if(symbol=="VariantCompare"){
-                // PropVariantCompareEx 的預設規則：空值最小；數值依數值比較；字串不分大小寫；不同類別依 VARTYPE 排序。
-                const auto left=read_variant(arg(0)),right=read_variant(arg(1));
-                const auto empty=[](const GuiStoredVariant& v){return v.type==0 || v.type==1;};
-                const auto numeric=[&](const GuiStoredVariant& v)->std::optional<double>{
-                    const auto raw=[&](unsigned n){std::uint64_t value=0;for(unsigned i=0;i<n;++i)value|=std::uint64_t{v.scalar[i]}<<(i*8);return value;};
-                    switch(v.type){
-                    case 16:return static_cast<double>(static_cast<std::int8_t>(raw(1)));case 17:return static_cast<double>(raw(1));
-                    case 2:return static_cast<double>(static_cast<std::int16_t>(raw(2)));case 18:return static_cast<double>(raw(2));
-                    case 11:return raw(2)?-1.0:0.0;
-                    case 3:case 22:return static_cast<double>(static_cast<std::int32_t>(raw(4)));case 19:case 23:return static_cast<double>(raw(4));
-                    case 20:return static_cast<double>(static_cast<std::int64_t>(raw(8)));case 21:return static_cast<double>(raw(8));
-                    case 4:return static_cast<double>(std::bit_cast<float>(static_cast<std::uint32_t>(raw(4))));
-                    case 5:case 7:return std::bit_cast<double>(raw(8));
-                    default:return std::nullopt;
-                    }
-                };
-                const auto text=[&](const GuiStoredVariant& v)->std::optional<std::u16string>{if(v.type!=8 && v.type!=30 && v.type!=31)return std::nullopt;auto value=string_value(v);for(auto& c:value)c=unicode_case_unit(c,false);return value;};
-                std::int32_t order=0;
-                if(empty(left) || empty(right))order=empty(left)==empty(right)?0:empty(left)?-1:1;
-                else if(const auto a=numeric(left),b=numeric(right);a && b)order=*a<*b?-1:*a>*b?1:0;
-                else if(const auto x=text(left),y=text(right);x && y)order=*x<*y?-1:*x>*y?1:0;
-                else if(left.type!=right.type)order=left.type<right.type?-1:1;
-                else order=left.payload<right.payload?-1:left.payload>right.payload?1:0;
-                return finish(static_cast<std::uint32_t>(order));
             }
             if(symbol=="PSCreateMemoryPropertyStore"){
                 if(!arg(1))return finish(pointer_error);memory.store(GuestAddress{arg(1)},bits,0);if(!arg(0))return finish(pointer_error);
@@ -531,9 +568,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
             if(symbol=="IPropertyStore.GetValue"){const auto value=properties.find(key);write_variant(arg(2),value==properties.end()?GuiStoredVariant{}:value->second);return finish(0);}
             const auto value=read_variant(arg(2));if(!value.type)properties.erase(key);else {if(properties.size()>=4096 && !properties.contains(key))return finish(0x8007000eU);properties[key]=value;}return finish(0);
         }catch(const std::bad_alloc&){return finish(0x8007000eU);}
-        catch(const std::invalid_argument&){return finish(symbol.starts_with("PropVariantToString")?automation::mismatch:not_implemented);}
-        catch(const std::range_error&){if(symbol.starts_with("PropVariantToString"))return finish(automation::overflow);throw;}
-        catch(const MemoryFault&){if(symbol.starts_with("PropVariantToString"))return finish(pointer_error);throw;}
+        catch(const std::invalid_argument&){return finish((symbol.starts_with("PropVariantToString") || symbol=="VariantToString")?automation::mismatch:not_implemented);}
+        catch(const std::range_error&){if((symbol.starts_with("PropVariantToString") || symbol=="VariantToString"))return finish(automation::overflow);throw;}
+        catch(const MemoryFault&){if((symbol.starts_with("PropVariantToString") || symbol=="VariantToString"))return finish(pointer_error);throw;}
     }
     if(symbol.starts_with("SHFileOperation")){
         const auto p=arg(0);const unsigned pointer_bits=x86_?32U:64U;

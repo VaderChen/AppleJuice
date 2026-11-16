@@ -45,6 +45,8 @@ struct Wave {
     std::unique_ptr<audio::Input> input;
     std::vector<std::uint8_t> record_tail;
     std::vector<std::uint64_t> waiters;
+    // mciSetDriverData／mciSetYieldProc：驅動程式資料與 MCI_WAIT 期間呼叫的 yield 程序。
+    std::uint64_t driver_data{},yield_proc{};std::uint32_t yield_data{};
     std::uint64_t frames()const{return pcm.size()/format.align;}
     std::uint32_t status_mode()const{return mode==Mode::Stopped?525U:mode==Mode::Playing?526U:mode==Mode::Recording?527U:529U;}
     void load(std::span<const std::uint8_t> bytes){
@@ -103,8 +105,10 @@ struct Wave {
 namespace x64arm {
 struct MciState {
     std::map<std::uint32_t,std::shared_ptr<mci::Wave>> devices;
-    struct Wait {std::uint32_t device{},error{};std::uint64_t owner{};};
+    struct Wait {std::uint32_t device{},error{};std::uint64_t owner{};bool yielding{};};
     std::map<std::uint64_t,Wait> waits;
     std::uint32_t next_device{1};
+    // mciLoadCommandResource 載入的命令表（已驗證格式）；0 保留給核心命令表。
+    std::map<std::uint32_t,std::vector<std::uint8_t>> command_tables;std::uint32_t next_table{1};
 };
 }

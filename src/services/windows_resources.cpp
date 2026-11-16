@@ -596,7 +596,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
         if(!arg(2) || (symbol.starts_with("EnumDisplaySettingsEx") && (d(3)&~3U)))fail(87);
         else if(!index || index>monitors.size())fail(1168);
         else {
-            // 輸入的 dmSize 不檢查下限（Steel Nomad 以 dmSize=0 查詢，在 Windows 上可用；Wine 亦固定寫回）：不足時寫回到 dmICMMethod
+            // 輸入的 dmSize 不檢查下限（Steel Nomad 以 dmSize=0 查詢，在 Windows 上可用）：不足時寫回到 dmICMMethod
             // 之前的固定部分（W 188、A 124 位元組）並設定 dmSize；呼叫端提供的較大結構照舊寫到其 dmSize（最多完整 DEVMODE）。
             const auto requested=static_cast<unsigned>(memory.load(GuestAddress{arg(2)+name_bytes+4},16));
             const auto supplied=requested>=total-8?std::min<unsigned>(total,requested):(wide?188U:124U);

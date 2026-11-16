@@ -1,4 +1,6 @@
 #include "x64arm/audio.hpp"
+#include "x64arm/audio_environment.hpp"
+#include "x64arm/audio_channels.hpp"
 #include "audio_capture.hpp"
 #include "audio_device.hpp"
 #include <AudioUnit/AudioUnit.h>
@@ -15,6 +17,9 @@ namespace {
 class CoreAudioOutput final : public Output {
     AudioUnit unit_{};
     std::shared_ptr<Buffer> buffer_;
+    static constexpr unsigned maximum_spatial_frames=4096;
+    std::unique_ptr<EnvironmentRenderer> environment_;
+    std::vector<float> spatial_pcm_;
     // WASAPI 串流以串流本身的取樣率開啟輸出單元，取樣率轉換由 Core Audio 的轉換器完成；
     // 其他來源（DirectSound、WinMM）維持 48 kHz 混音並沿用既有的頻率／Doppler 處理。
     unsigned rate_=48000;
@@ -42,7 +47,26 @@ class CoreAudioOutput final : public Output {
     static OSStatus render(void* context,AudioUnitRenderActionFlags*,const AudioTimeStamp*,UInt32,UInt32 frames,AudioBufferList* data) {
         auto& self=*static_cast<CoreAudioOutput*>(context);
         if(data->mNumberBuffers!=1 || !data->mBuffers[0].mData || data->mBuffers[0].mDataByteSize<frames*2*sizeof(float))return kAudio_ParamError;
-        self.buffer_->render({static_cast<float*>(data->mBuffers[0].mData),static_cast<std::size_t>(frames)*2},self.rate_);
+        auto* output=static_cast<float*>(data->mBuffers[0].mData);
+        if(self.environment_){
+            for(unsigned offset=0;offset<frames;){const auto count=std::min(maximum_spatial_frames,frames-offset);
+                const std::span<float> input{self.spatial_pcm_.data(),static_cast<std::size_t>(count)*self.buffer_->channels};
+                self.buffer_->render_channels(input,self.rate_,self.buffer_->channels);
+                bool active=true;
+                if(self.buffer_->native_spatial){
+                    std::array<float,3> position;
+                    {std::lock_guard lock(self.buffer_->mutex);position=self.buffer_->spatial_position;active=self.buffer_->spatial_active;}
+                    self.environment_->position(position[0],position[1],position[2]);
+                }
+                const std::span<float> stereo{output+offset*2,static_cast<std::size_t>(count)*2};
+                if(!self.environment_->render(input,stereo))return kAudio_ParamError;
+                if(self.buffer_->native_spatial){
+                    if(!active)for(unsigned i=0;i<count;++i)stereo[i*2]=stereo[i*2+1]=input[i];
+                    self.buffer_->process_spatial_output(stereo);
+                }
+                offset+=count;
+            }
+        }else self.buffer_->render({output,static_cast<std::size_t>(frames)*2},self.rate_);
         self.observe({static_cast<const float*>(data->mBuffers[0].mData),static_cast<std::size_t>(frames)*2});
         if(self.capture_)self.capture_->push({static_cast<const float*>(data->mBuffers[0].mData),static_cast<std::size_t>(frames)*2});
         return noErr;
@@ -53,6 +77,12 @@ public:
     explicit CoreAudioOutput(std::shared_ptr<Buffer> buffer,AudioDeviceID device=kAudioObjectUnknown):buffer_(std::move(buffer)) {
         // 呼叫端（例如 WASAPI 的 Initialize）已持有 buffer mutex；本單元的轉譯回呼在建構完成前尚未啟動，直接讀取即可，不可再上鎖。
         if(buffer_->streaming && buffer_->rate>=8000 && buffer_->rate<=192000)rate_=buffer_->rate;
+        if((buffer_->channels>2 || buffer_->spatial_object) && environment_enabled()){
+            if(buffer_->source)throw std::runtime_error("多聲道 RenderSource 必須保留 PCM 聲道後再接空間混音");
+            environment_=make_environment_renderer(buffer_->channels,buffer_->channel_mask,rate_,maximum_spatial_frames);
+            spatial_pcm_.resize(static_cast<std::size_t>(maximum_spatial_frames)*buffer_->channels);
+            buffer_->native_spatial=buffer_->spatial_object;
+        }
         capture_=OutputCapture::open("coreaudio",rate_,this);
         AudioComponentDescription desc{};desc.componentType=kAudioUnitType_Output;desc.componentSubType=device==kAudioObjectUnknown?kAudioUnitSubType_DefaultOutput:kAudioUnitSubType_HALOutput;desc.componentManufacturer=kAudioUnitManufacturer_Apple;
         const auto component=AudioComponentFindNext(nullptr,&desc);

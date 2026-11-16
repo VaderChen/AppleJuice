@@ -86,6 +86,37 @@ EventValue selected_value(xmlDoc* doc,const std::string& path,const DecodedEvent
     auto all=evaluate(doc,"Event/EventData/*");for(int i=0;all->nodesetval && i<all->nodesetval->nodeNr;++i)if(all->nodesetval->nodeTab[i]==node)return decoded.user.at(static_cast<unsigned>(i));
     XmlText value(xmlNodeGetContent(node));return string_value(utf8_to_utf16(value?reinterpret_cast<const char*>(value.get()):""));
 }
+// 備份檔（.evt）：ELF_LOGFILE_HEADER（48 位元組）＋依序排列的 EVENTLOGRECORD＋ELF_EOF_RECORD（40 位元組）。只寫出未環繞的檔案；
+// 讀取時驗證表頭、每筆紀錄的長度與簽章及結尾記號，環繞（ELF_LOGFILE_HEADER_WRAP）的檔案視為損毀。
+std::uint32_t record_number(const EventRecord& record){return integer(std::span(record.bytes).subspan(8));}
+std::vector<std::uint8_t> backup_bytes(const std::vector<EventRecord>& records){
+    std::vector<std::uint8_t> bytes(48);put(bytes,0,0x30);put(bytes,4,0x654c664c);put(bytes,8,1);put(bytes,12,1);put(bytes,16,0x30);put(bytes,44,0x30);
+    for(const auto& record:records)bytes.insert(bytes.end(),record.bytes.begin(),record.bytes.end());
+    const auto end=static_cast<std::uint32_t>(bytes.size());const auto oldest=records.empty()?0U:record_number(records.front()),current=records.empty()?1U:record_number(records.back())+1;
+    put(bytes,20,end);put(bytes,24,current);put(bytes,28,oldest);put(bytes,32,static_cast<std::uint32_t>(std::max<std::size_t>(0x80000,(bytes.size()+40+0xffff)&~std::size_t{0xffff})));
+    bytes.resize(bytes.size()+40);const std::array<std::uint32_t,10> eof{0x28,0x11111111,0x22222222,0x33333333,0x44444444,0x30,end,current,oldest,0x28};
+    for(unsigned i=0;i<eof.size();++i)put(bytes,end+i*4,eof[i]);
+    return bytes;
+}
+std::vector<EventRecord> parse_backup(std::span<const std::uint8_t> bytes,const std::u16string& channel){
+    if(bytes.size()<88 || integer(bytes)!=0x30 || integer(bytes.subspan(4))!=0x654c664c || integer(bytes.subspan(44))!=0x30 || (integer(bytes.subspan(36))&2))throw EventError{1500};
+    const auto start=integer(bytes.subspan(16)),end=integer(bytes.subspan(20));
+    if(start<0x30 || end<start || end>bytes.size()-40 || integer(bytes.subspan(end))!=0x28 || integer(bytes.subspan(end+4))!=0x11111111)throw EventError{1500};
+    std::vector<EventRecord> records;std::size_t offset=start;
+    while(offset<end){
+        if(end-offset<60)throw EventError{1500};const auto size=integer(bytes.subspan(offset));
+        if(size<60 || size>0x3ffff || (size&3) || size>end-offset || integer(bytes.subspan(offset+4))!=0x654c664c || integer(bytes.subspan(offset+size-4))!=size)throw EventError{1500};
+        records.push_back({{bytes.begin()+static_cast<std::ptrdiff_t>(offset),bytes.begin()+static_cast<std::ptrdiff_t>(offset+size)},channel,0});offset+=size;
+    }
+    return records;
+}
+// ClearEventLog：在共用鎖之外取得排他鎖後截成 0；紀錄編號因此從 1 重新開始。
+void clear_records(const std::filesystem::path& path){
+    File file{::open(path.c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW)};if(file.fd<0){if(errno==ENOENT)return;throw EventError{io_error()};}
+    while(::flock(file.fd,LOCK_EX)<0)if(errno!=EINTR)throw EventError{io_error()};
+    struct stat status{};if(::fstat(file.fd,&status) || !S_ISREG(status.st_mode) || status.st_uid!=::geteuid())throw EventError{5};
+    if(::ftruncate(file.fd,0) || ::fsync(file.fd))throw EventError{io_error()};
+}
 void append(const std::filesystem::path& path,std::vector<std::uint8_t>& record){
     File file{::open(path.c_str(),O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600)};if(file.fd<0)throw EventError{io_error()};
     while(::flock(file.fd,LOCK_EX)<0)if(errno!=EINTR)throw EventError{io_error()};
@@ -122,12 +153,23 @@ std::span<const WindowsServiceDescriptor> eventlog_service_descriptors(){
         {"advapi32.dll","ReadEventLogA",7},{"advapi32.dll","ReadEventLogW",7},{"advapi32.dll","CloseEventLog",1},
         {"advapi32.dll","GetNumberOfEventLogRecords",2},{"advapi32.dll","GetOldestEventLogRecord",2},
         {"advapi32.dll","RegisterEventSourceA",2},{"advapi32.dll","RegisterEventSourceW",2},
-        {"advapi32.dll","ReportEventA",9},{"advapi32.dll","ReportEventW",9},{"advapi32.dll","DeregisterEventSource",1}
+        {"advapi32.dll","ReportEventA",9},{"advapi32.dll","ReportEventW",9},{"advapi32.dll","DeregisterEventSource",1},
+        {"advapi32.dll","BackupEventLogA",2},{"advapi32.dll","BackupEventLogW",2},{"advapi32.dll","ClearEventLogA",2},{"advapi32.dll","ClearEventLogW",2},
+        {"advapi32.dll","OpenBackupEventLogA",2},{"advapi32.dll","OpenBackupEventLogW",2},{"advapi32.dll","GetEventLogInformation",5},{"advapi32.dll","NotifyChangeEventLog",2}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_eventlog(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');std::uint64_t result=0;
     const auto text=[&](std::uint64_t address,std::size_t maximum){if(!address)throw EventError{87};return wide?read_utf16(memory,GuestAddress{address},maximum):utf8_to_utf16(read_ansi(memory,address,maximum));};
+    const auto log_directory=[&]{return registry_file_.empty()?std::filesystem::path(mapping_session()):registry_file_.parent_path();};
+    // 讀取器的紀錄：備份檔讀取器使用開啟時的快照，其餘讀取沙箱中的事件記錄檔。
+    const auto reader_records=[&](const LegacyEventReader& reader){return reader.from_backup?reader.backup:read_records(log_directory()/record_filename(reader.channel),reader.channel);};
+    // 以客體路徑寫出備份檔；檔案已存在時回報 ERROR_ALREADY_EXISTS。
+    const auto write_backup=[&](const std::u16string& name,const std::vector<EventRecord>& records){
+        if(name.empty())throw EventError{87};const auto bytes=backup_bytes(records);
+        auto opened=filesystem_.open_host(utf16_to_utf8(name),0x40000000U,1,0x80,0);if(opened.error)throw EventError{opened.error==80?183U:opened.error};
+        const auto written=opened.file->write(bytes,0);if(written.error)throw EventError{written.error};if(written.bytes!=bytes.size())throw EventError{112};
+        if(const auto flushed=opened.file->flush())throw EventError{flushed};};
     try {
         if(service.family=="wevtapi.dll"){
             auto& logs=runtime_.eventlog;const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
@@ -195,13 +237,45 @@ std::optional<std::uint32_t> WindowsServices::invoke_eventlog(GuestState& state,
             if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許事件記錄檔 I/O");
             const auto directory=registry_file_.empty()?std::filesystem::path(mapping_session()):registry_file_.parent_path();
             (void)read_records(directory/record_filename(channel),channel);
-            const auto handle=runtime_.eventlog.next++;runtime_.eventlog.readers.emplace(handle,LegacyEventReader{channel,0,false});result=handle;
+            const auto handle=runtime_.eventlog.next++;LegacyEventReader reader;reader.channel=channel;runtime_.eventlog.readers.emplace(handle,std::move(reader));result=handle;
+        }else if(symbol.starts_with("OpenBackupEventLog")) {
+            const auto server=arg(0)?lower(text(arg(0),256)):std::u16string{};
+            if(!server.empty() && server!=u"." && server!=u"x64arm" && server!=u"\\x64arm")throw EventError{53};
+            const auto name=text(arg(1),32767);if(name.empty())throw EventError{87};if(runtime_.eventlog.readers.size()>=4096)throw EventError{8};
+            if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許事件記錄檔 I/O");
+            auto opened=filesystem_.open_reader(utf16_to_utf8(name));if(opened.error)throw EventError{opened.error};
+            if(opened.metadata.size>32*1024*1024)throw EventError{1500};std::vector<std::uint8_t> bytes(static_cast<std::size_t>(opened.metadata.size));
+            const auto read=opened.file->read(bytes,0);if(read.error)throw EventError{read.error};bytes.resize(static_cast<std::size_t>(read.bytes));
+            LegacyEventReader reader;reader.channel=u"application";reader.from_backup=true;reader.backup=parse_backup(bytes,u"Application");
+            const auto handle=runtime_.eventlog.next++;runtime_.eventlog.readers.emplace(handle,std::move(reader));result=handle;
+        }else if(symbol.starts_with("BackupEventLog") || symbol.starts_with("ClearEventLog")) {
+            const auto found=runtime_.eventlog.readers.find(arg(0));if(found==runtime_.eventlog.readers.end())throw EventError{6};
+            if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許事件記錄檔 I/O");
+            const bool clear=symbol.starts_with("ClearEventLog");if(clear && found->second.from_backup)throw EventError{6};
+            if(!clear && !arg(1))throw EventError{87};
+            // ClearEventLog 有備份檔名時先備份，備份失敗就不清除。
+            if(arg(1))write_backup(text(arg(1),32767),reader_records(found->second));
+            if(clear){clear_records(log_directory()/record_filename(found->second.channel));for(auto& [handle,reader]:runtime_.eventlog.readers){(void)handle;if(!reader.from_backup && reader.channel==found->second.channel){reader.position=0;reader.positioned=false;}}}
+            result=1;
+        }else if(symbol=="GetEventLogInformation") {
+            // 只有 EVENTLOG_FULL_INFO（0）：EVENTLOG_FULL_INFORMATION {DWORD dwFull}，紀錄檔達 32 MiB 上限時為 1。
+            const auto found=runtime_.eventlog.readers.find(arg(0));if(found==runtime_.eventlog.readers.end())throw EventError{6};
+            if(static_cast<std::uint32_t>(arg(1))!=0)throw EventError{124};if(!arg(4))throw EventError{1784};
+            memory.store(GuestAddress{arg(4)},32,4);if(static_cast<std::uint32_t>(arg(3))<4)throw EventError{122};if(!arg(2))throw EventError{1784};
+            std::uint32_t full=0;
+            if(!found->second.from_backup){struct stat status{};const auto path=log_directory()/record_filename(found->second.channel);if(::stat(path.c_str(),&status)==0 && status.st_size+0x40000>=32*1024*1024)full=1;}
+            memory.store(GuestAddress{arg(2)},32,full);result=1;
+        }else if(symbol=="NotifyChangeEventLog") {
+            // 之後寫入同一記錄檔時觸發登記的事件物件；備份檔讀取器不接受通知。
+            const auto found=runtime_.eventlog.readers.find(arg(0));if(found==runtime_.eventlog.readers.end() || found->second.from_backup)throw EventError{6};
+            const auto event=runtime_.wait_objects.find(arg(1));if(event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event)throw EventError{6};
+            found->second.notify=arg(1);result=1;
         }else if(symbol=="CloseEventLog") {
             if(!runtime_.eventlog.readers.erase(arg(0)))throw EventError{6};result=1;
         }else if(symbol.starts_with("ReadEventLog") || symbol=="GetNumberOfEventLogRecords" || symbol=="GetOldestEventLogRecord") {
             const auto found=runtime_.eventlog.readers.find(arg(0));if(found==runtime_.eventlog.readers.end())throw EventError{6};auto& reader=found->second;
             if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許事件記錄檔 I/O");
-            const auto directory=registry_file_.empty()?std::filesystem::path(mapping_session()):registry_file_.parent_path();const auto records=read_records(directory/record_filename(reader.channel),reader.channel);
+            const auto records=reader_records(reader);
             if(symbol=="GetNumberOfEventLogRecords" || symbol=="GetOldestEventLogRecord") {
                 if(!arg(1))throw EventError{87};memory.store(GuestAddress{arg(1)},32,symbol=="GetNumberOfEventLogRecords"?records.size():records.empty()?0U:integer(std::span(records.front().bytes).subspan(8)));result=1;
             }else {
@@ -256,6 +330,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_eventlog(GuestState& state,
             if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許事件記錄檔 I/O");
             const auto directory=registry_file_.empty()?std::filesystem::path(mapping_session()):registry_file_.parent_path();
             append(directory/record_filename(found->second.log),record);result=1;
+            // NotifyChangeEventLog：同一記錄檔的讀取器登記了事件物件時觸發。
+            bool signaled=false;
+            for(const auto& [handle,reader]:runtime_.eventlog.readers){(void)handle;if(reader.from_backup || !reader.notify || reader.channel!=found->second.log)continue;
+                const auto event=runtime_.wait_objects.find(reader.notify);if(event!=runtime_.wait_objects.end() && event->second.kind==WaitObject::Kind::Event){event->second.set_signal(true);signaled=true;}}
+            if(signaled)(void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
         }
     }catch(const EventError& error){last_error_=error.code;}catch(const MemoryFault&){last_error_=998;}catch(const std::bad_alloc&){last_error_=8;}
     arg.return_to(state,result);return std::nullopt;

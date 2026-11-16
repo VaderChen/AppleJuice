@@ -22,7 +22,8 @@ void resolution(std::ostream& out, const WindowsServices& services, std::string 
     out << ",\"builtin_module\":" << (services.builtin_module(dll)?"true":"false");
     try {
         const auto address=services.resolve(dll,symbol);
-        out << ",\"registered\":true,\"resolved_name\":" << json_string(services.name(address));
+        const auto name=services.name(address);
+        out << ",\"registered\":true,\"resolved_name\":" << json_string(name.empty()?symbol:name);
     } catch(const std::invalid_argument&) { out << ",\"registered\":false"; }
 }
 }
@@ -34,7 +35,12 @@ void audit_pe(const std::filesystem::path& path, std::ostream& output) {
     std::string loader_error;
     try { (void)parse_pe_image(bytes,{},parsed.dll,GuestMemory::maximum_capacity); }
     catch(const std::invalid_argument& error) { loader_error=error.what(); }
-    const WindowsServices services;
+    // 資料匯出（locale::id、vtable 等）由共用 runtime 初始化建立，不能只查未初始化的服務 stub。
+    // 無檔案映射、無客體執行；與目標 PE 使用相同的指標寬度。
+    GuestMemory memory;
+    memory.set_execution_mode(parsed.metadata.architecture==PeArchitecture::X86?ExecutionMode::X86:ExecutionMode::X64);
+    WindowsServices services;
+    services.initialize(memory,u"");
     // 先完成解析才輸出，避免格式錯誤留下半份 JSON。
     output << "{\"schema\":1,\"architecture\":" << json_string(parsed.metadata.architecture==PeArchitecture::X86?"x86":"x64")
            << ",\"dll\":" << (parsed.dll?"true":"false") << ",\"loader_error\":" << json_string(loader_error) << ",\"image_size\":" << parsed.metadata.image_size << ",\"imports\":[";

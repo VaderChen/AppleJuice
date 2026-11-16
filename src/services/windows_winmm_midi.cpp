@@ -1,7 +1,10 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/midi.hpp"
 #include "x64arm/unicode.hpp"
+#include "wave_device_message.hpp"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace x64arm {
 struct WinmmMidiOutput {
@@ -26,6 +29,16 @@ void midi_volume(WinmmMidiOutput& output,std::uint32_t value){
     output.playback->left_gain=static_cast<float>(value&65535U)/65535;
     output.playback->right_gain=static_cast<float>(value>>16)/65535;
 }
+}
+bool WindowsServices::midi_output_open(std::uint64_t output)const{return midi_outputs_.contains(output);}
+bool WindowsServices::midi_thru(std::uint64_t handle,std::span<const std::uint8_t> message){
+    const auto found=midi_outputs_.find(handle);if(found==midi_outputs_.end() || message.empty())return found!=midi_outputs_.end();auto& output=*found->second;
+    static const bool trace=std::getenv("X64ARM_TRACE_MIDI_THRU")!=nullptr;
+    if(trace){std::fprintf(stderr,"[midi-thru] bytes=");for(std::size_t i=0;i<message.size();++i)std::fprintf(stderr,i?" %02x":"%02x",message[i]);std::fprintf(stderr,"\n");}
+    if(message[0]==0xf0)return output.output->system_exclusive(message),true;
+    (void)output.output->short_message(message[0],message.size()>1?message[1]:0,message.size()>2?message[2]:0);
+    if(message[0]>=0x80 && message[0]<0xf0)output.running_status=message[0];else if(message[0]<0xf8)output.running_status=0;
+    return true;
 }
 bool WindowsServices::midi_output_waiting()const{
     for(const auto& [handle,output]:midi_outputs_){(void)handle;std::lock_guard lock(output->playback->mutex);
@@ -68,6 +81,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_midi(GuestState& stat
     };
     try {
         if(symbol=="midiOutGetNumDevs")result=midi::output_available()?1:0;
+        else if(symbol=="midiOutMessage"){
+            // 驅動程式訊息與 waveOutMessage 共用處理；內建合成器只有裝置 0。
+            const std::vector<std::u16string> ids=midi::output_available()?std::vector<std::u16string>{u"{x64arm-midi-synthesizer}"}:std::vector<std::u16string>{};
+            result=wave::device_message(memory,arg(0),d(1),arg(2),arg(3),ids,midi_outputs_.contains(arg(0)),x86_);
+        }else if(symbol=="midiOutCachePatches" || symbol=="midiOutCacheDrumPatches"){
+            // (hmo, uBank／uPatch, lpwPatchArray／lpwKeyArray, fuCache)：內建合成器的音色全部常駐，裝置能力不含 MIDICAPS_CACHE，
+            // 參數有效時回報 MMSYSERR_NOTSUPPORTED。
+            if(!midi_outputs_.contains(arg(0)))result=5;
+            else if(!d(3) || d(3)>4)result=10;
+            else if(d(1)>127 || !arg(2))result=11;
+            else {memory.check(GuestAddress{arg(2)},256,Access::Read);result=8;}
+        }
         else if(symbol.starts_with("midiOutGetDevCaps")){
             if(arg(0)!=0 && arg(0)!=UINT32_MAX && arg(0)!=UINT64_MAX && !midi_outputs_.contains(arg(0)))result=2;
             else if(!midi::output_available())result=2;

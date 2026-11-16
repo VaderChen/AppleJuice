@@ -319,6 +319,20 @@ EXPORT Wide *guest_wcsrchr(const Wide *text, Wide character) {
         if (!*text++) return found;
     }
 }
+EXPORT Wide *guest_wcsstr(const Wide *text, const Wide *pattern) {
+    /* CRT 搜尋沒有 Win32 路徑的 32767 字元限制；空 pattern 不讀取 text。
+     * 每次只讀取必要的 code unit，不跨過 NUL 預讀下一頁。 */
+    if (!*pattern) return (Wide *)text;
+    for (; *text; ++text) {
+        const Wide *left = text, *right = pattern;
+        while (*left == *right) {
+            ++left; ++right;
+            if (!*right) return (Wide *)text;
+        }
+        if (!*left) return (Wide *)0;
+    }
+    return (Wide *)0;
+}
 
 /* 字元、errno 與整數轉換共用每個執行緒的客體狀態，不快取宿主的 current。 */
 INLINE const GuestCrtThreadState *thread_state(void) {

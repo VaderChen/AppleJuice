@@ -11,6 +11,8 @@
 #include "socket_multicast_options.hpp"
 #include "socket_ingress.hpp"
 #include "monotonic_clock.hpp"
+#include "service_callback_task.hpp"
+#include <tuple>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -333,7 +335,9 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         
         
         
-        {"ws2_32.dll","WSAPoll",3},{"ws2_32.dll","WSASendDisconnect",2},
+        {"ws2_32.dll","WSAPoll",3},{"ws2_32.dll","WSASendDisconnect",2},{"ws2_32.dll","WSARecvDisconnect",2},{"ws2_32.dll","WSAJoinLeaf",8},
+        {"mswsock.dll","WSARecvEx",4},{"mswsock.dll","EnumProtocolsA",3},{"mswsock.dll","EnumProtocolsW",3},
+        {"ws2_32.dll","WSAConnectByNameA",9},{"ws2_32.dll","WSAConnectByNameW",9},{"ws2_32.dll","GetHostNameW",2},
         {"ws2_32.dll","getprotobyname",1},{"ws2_32.dll","getprotobynumber",1},
         {"ws2_32.dll","WSAAsyncGetHostByName",5},{"ws2_32.dll","WSAAsyncGetHostByAddr",7},
         {"ws2_32.dll","WSAAsyncGetProtoByName",5},{"ws2_32.dll","WSAAsyncGetProtoByNumber",5},
@@ -372,9 +376,11 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
 #include "windows_socket_accept.inc"
 std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
 #include "windows_dns.inc"
+#include "windows_socket_connect_name.inc"
+#include "windows_socket_legacy.inc"
     if(service.symbol=="accept" || service.symbol=="WSAAccept")return invoke_socket_accept(state,memory,service);
     if(service.symbol.starts_with("WSALookupService") || service.symbol.starts_with("WSASetService") || service.symbol.starts_with("WSAEnumNameSpaceProviders"))return invoke_socket_namespace(state,memory,service);
-    if(service.symbol=="WSAPoll" || service.symbol=="WSASendDisconnect")return invoke_socket_poll(state,memory,service);
+    if(service.symbol=="WSAPoll" || service.symbol=="WSASendDisconnect" || service.symbol=="WSARecvDisconnect" || service.symbol=="WSAJoinLeaf")return invoke_socket_poll(state,memory,service);
     if(service.symbol.starts_with("WSAAsyncGet") || service.symbol=="WSACancelAsyncRequest" || service.symbol=="gethostbyname" || service.symbol=="gethostbyaddr" || service.symbol=="getservbyname" || service.symbol=="getservbyport" || service.symbol=="getprotobyname" || service.symbol=="getprotobynumber")return invoke_socket_database(state,memory,service);
     if(service.symbol=="AcceptEx" || service.symbol=="GetAcceptExSockaddrs" || service.symbol=="WSAGetOverlappedResult")return invoke_network_extension(state,memory,service);
     if(service.symbol=="ConnectEx" || service.symbol=="DisconnectEx" || service.symbol=="TransmitFile")return invoke_socket_io(state,memory,service);
@@ -662,6 +668,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
             else if (type!=SOCK_STREAM && type!=SOCK_DGRAM) fail(10044);
             else if (network.sockets.size()>=1024) fail(10024);
             else {const auto fd=::socket(family,type,protocol);if (fd<0) fail(socket_error(errno));else{make_socket(fd,family,type,protocol);if(result!=UINT64_MAX && extended){network.sockets.at(result)->overlapped=(u32(5)&1)!=0;runtime_.handle_flags[result]=(u32(5)&0x80)?0:1;}}}
+        } else if (symbol=="GetHostNameW") {
+            // 與 gethostname 相同的主機名稱，以 UTF-16 寫出；namelen 以字元計，含結尾 NUL。
+            std::array<char,256> name{};
+            if (sint(1)<=0 || u32(1)>32768) fail(10014);
+            else if (::gethostname(name.data(),name.size()-1)<0) fail(socket_error(errno));
+            else {const auto bytes=utf16_bytes(utf8_to_utf16_lossy(name.data()));if (bytes.size()/2>u32(1)) fail(10014);else memory.write(GuestAddress{arg(0)},bytes);}
         } else if (symbol=="gethostname") {
             if (sint(1)<=0 || u32(1)>32768) fail(10014);
             else {

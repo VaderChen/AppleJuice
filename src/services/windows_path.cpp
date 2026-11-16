@@ -10,8 +10,6 @@
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> path_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
-        {"kernel32.dll","wine_get_unix_file_name",1,0,0,0,true},
-        {"kernel32.dll","wine_get_dos_file_name",1,0,0,0,true},
         {"shlwapi.dll","PathCombineA",3},{"shlwapi.dll","PathCombineW",3},
         {"shlwapi.dll","PathAppendA",2},{"shlwapi.dll","PathAppendW",2},
         {"shlwapi.dll","PathRemoveFileSpecA",1},{"shlwapi.dll","PathRemoveFileSpecW",1},
@@ -363,30 +361,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_association(GuestState& sta
     throw HostCallFault("未知的檔案關聯服務");
 }
 std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
-    if(service.symbol=="wine_get_unix_file_name" || service.symbol=="wine_get_dos_file_name"){
-        const WindowsCall call(state,memory,service);std::uint64_t result=0;
-        try{
-            if(!call(0))last_error_=87;
-            else{
-                std::vector<std::uint8_t> bytes;std::uint32_t error=0;
-                if(service.symbol=="wine_get_unix_file_name"){
-                    const auto input=read_utf16(memory,GuestAddress{call(0)},32767);
-                    const auto path=full_windows_dos_path(input,runtime_.current_directory);
-                    const auto converted=filesystem_.unix_file_name(utf16_to_utf8(path));error=converted.second;
-                    if(!error){const auto text=converted.first.string();bytes.assign(text.begin(),text.end());bytes.push_back(0);}
-                }else{
-                    const auto input=read_ansi(memory,call(0),32767);std::u16string path;
-                    if(input.empty())error=123;
-                    else if(input.front()!='/')path=full_windows_dos_path(utf8_to_utf16(input),runtime_.current_directory);
-                    else{const auto converted=filesystem_.dos_file_name(input);error=converted.second;if(!error)path=utf8_to_utf16(converted.first);}
-                    if(!error)bytes=utf16_bytes(path);
-                }
-                if(error)last_error_=error;
-                else{result=allocate_heap(memory,bytes.size());if(result)memory.write(GuestAddress{result},bytes);else last_error_=8;}
-            }
-        }catch(const std::invalid_argument&){last_error_=123;}
-        call.return_to(state,result);return std::nullopt;
-    }
     if(service.symbol.starts_with("Assoc") || service.family=="internal-query-associations")return invoke_association(state,memory,service);
     if(service.symbol.starts_with("PathStripToRoot")){
         const WindowsCall call(state,memory,service);const bool wide=service.symbol.ends_with('W');std::uint64_t result=0;

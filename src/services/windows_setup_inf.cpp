@@ -2,8 +2,12 @@
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/unicode.hpp"
 #include "setup_driver_store.hpp"
+#include "windows_sddl.hpp"
+#include "x64arm/security_access.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 
@@ -18,6 +22,17 @@ struct SetupInfState {
     struct File {std::u16string path;std::uint32_t style{};std::map<std::u16string,Section> sections;std::vector<std::u16string> order;};
     struct Handle {std::vector<File> files;std::map<std::u16string,std::uint32_t> section_ids;std::vector<std::u16string> section_names;};
     std::map<std::uint64_t,Handle> handles;
+    // 字串表（windows_setup_string_table.inc）：handle 為程序堆積位址；Entry 保存字串、客體堆積複本與附加資料。
+    struct StringTable {struct Entry {std::u16string text;std::uint64_t guest{};std::vector<std::uint8_t> extra;};std::uint32_t max_extra{};std::vector<Entry> entries;};
+    std::map<std::uint64_t,StringTable> string_tables;
+    std::uint32_t global_flags{};
+    // 磁碟空間清單、安裝記錄檔與檔案記錄（windows_setup_disk_log.inc）；handle 為程序堆積位址。
+    struct DiskSpace {struct File {std::u16string path;std::int64_t size{};std::uint32_t operation{};};std::uint32_t flags{};std::map<std::u16string,File> files;};
+    std::map<std::uint64_t,DiskSpace> disk_spaces;
+    struct FileLog {struct Entry {std::u16string target;std::vector<std::u16string> fields;};struct Section {std::u16string name;std::vector<Entry> entries;};
+        std::u16string path;std::uint32_t flags{};std::vector<Section> sections;};
+    std::map<std::uint64_t,FileLog> file_logs;
+    bool log_open{};
 };
 namespace {
 using driver_store::fold;
@@ -101,7 +116,32 @@ std::span<const WindowsServiceDescriptor> setup_inf_service_descriptors(){
         {"setupapi.dll","SetupGetTargetPathA",6,0,0,0x10},{"setupapi.dll","SetupGetTargetPathW",6,0,0,0x10},
         {"setupapi.dll","SetupDiGetINFClassA",5,0,0,8},{"setupapi.dll","SetupDiGetINFClassW",5,0,0,8},
         {"setupapi.dll","SetupDiGetActualSectionToInstallA",6,0,0,8},{"setupapi.dll","SetupDiGetActualSectionToInstallW",6,0,0,8},
-        {"setupapi.dll","SetupDiGetActualSectionToInstallExA",8,0,0,0x10},{"setupapi.dll","SetupDiGetActualSectionToInstallExW",8,0,0,0x10}};
+        {"setupapi.dll","SetupDiGetActualSectionToInstallExA",8,0,0,0x10},{"setupapi.dll","SetupDiGetActualSectionToInstallExW",8,0,0,0x10},
+        // 字串表與公用輔助函式（windows_setup_string_table.inc）
+        {"setupapi.dll","StringTableInitialize",0},{"setupapi.dll","StringTableInitializeEx",2,0,0,0x3},{"setupapi.dll","StringTableDestroy",1},
+        {"setupapi.dll","StringTableAddString",3,0,0,0x4},{"setupapi.dll","StringTableAddStringEx",5,0,0,0x14},{"setupapi.dll","StringTableLookUpString",3,0,0,0x4},
+        {"setupapi.dll","StringTableLookUpStringEx",5,0,0,0x14},{"setupapi.dll","StringTableStringFromId",2,0,0,0x2},{"setupapi.dll","StringTableStringFromIdEx",4,0,0,0x2},
+        {"setupapi.dll","StringTableGetExtraData",4,0,0,0xa},{"setupapi.dll","StringTableSetExtraData",4,0,0,0xa},{"setupapi.dll","StringTableDuplicate",1},{"setupapi.dll","StringTableTrim",1},
+        {"setupapi.dll","pSetupStringTableInitialize",0},{"setupapi.dll","pSetupStringTableInitializeEx",2,0,0,0x3},{"setupapi.dll","pSetupStringTableDestroy",1},
+        {"setupapi.dll","pSetupStringTableAddString",3,0,0,0x4},{"setupapi.dll","pSetupStringTableAddStringEx",5,0,0,0x14},{"setupapi.dll","pSetupStringTableLookUpString",3,0,0,0x4},
+        {"setupapi.dll","pSetupStringTableLookUpStringEx",5,0,0,0x14},{"setupapi.dll","pSetupStringTableGetExtraData",4,0,0,0xa},{"setupapi.dll","pSetupStringTableSetExtraData",4,0,0,0xa},
+        {"setupapi.dll","pSetupStringTableDuplicate",1},
+        {"setupapi.dll","MyMalloc",1,0,0,0x1},{"setupapi.dll","MyFree",1},{"setupapi.dll","MyRealloc",2,0,0,0x2},{"setupapi.dll","pSetupMalloc",1,0,0,0x1},{"setupapi.dll","pSetupFree",1},
+        {"setupapi.dll","pSetupRealloc",2,0,0,0x2},{"setupapi.dll","DuplicateString",1},{"setupapi.dll","MultiByteToUnicode",2,0,0,0x2},{"setupapi.dll","UnicodeToMultiByte",2,0,0,0x2},
+        {"setupapi.dll","CaptureStringArg",2},{"setupapi.dll","CaptureAndConvertAnsiArg",2},{"setupapi.dll","IsUserAdmin",0},{"setupapi.dll","pSetupIsUserAdmin",0},
+        {"setupapi.dll","FileExists",2},{"setupapi.dll","pSetupGetGlobalFlags",0},{"setupapi.dll","pSetupSetGlobalFlags",1,0,0,0x1},
+        // 磁碟空間清單、安裝記錄檔、檔案記錄與非互動模式（windows_setup_disk_log.inc）
+        {"setupapi.dll","SetupCreateDiskSpaceListA",3,0,0,0x6},{"setupapi.dll","SetupCreateDiskSpaceListW",3,0,0,0x6},{"setupapi.dll","SetupDuplicateDiskSpaceListA",4,0,0,0xc},
+        {"setupapi.dll","SetupDuplicateDiskSpaceListW",4,0,0,0xc},{"setupapi.dll","SetupDestroyDiskSpaceList",1},
+        {"setupapi.dll","SetupAddToDiskSpaceListA",6,0x4,0,0x28},{"setupapi.dll","SetupAddToDiskSpaceListW",6,0x4,0,0x28},
+        {"setupapi.dll","SetupRemoveFromDiskSpaceListA",5,0,0,0x14},{"setupapi.dll","SetupRemoveFromDiskSpaceListW",5,0,0,0x14},
+        {"setupapi.dll","SetupQuerySpaceRequiredOnDriveA",5,0,0,0x10},{"setupapi.dll","SetupQuerySpaceRequiredOnDriveW",5,0,0,0x10},
+        {"setupapi.dll","SetupQueryDrivesInDiskSpaceListA",4,0,0,0x4},{"setupapi.dll","SetupQueryDrivesInDiskSpaceListW",4,0,0,0x4},
+        {"setupapi.dll","SetupOpenLog",1,0,0,0x1},{"setupapi.dll","SetupCloseLog",0},{"setupapi.dll","SetupLogErrorA",2,0,0,0x2},{"setupapi.dll","SetupLogErrorW",2,0,0,0x2},
+        {"setupapi.dll","SetupInitializeFileLogA",2,0,0,0x2},{"setupapi.dll","SetupInitializeFileLogW",2,0,0,0x2},{"setupapi.dll","SetupTerminateFileLog",1},
+        {"setupapi.dll","SetupLogFileA",9,0,0,0x110},{"setupapi.dll","SetupLogFileW",9,0,0,0x110},{"setupapi.dll","SetupQueryFileLogA",7,0,0,0x28},{"setupapi.dll","SetupQueryFileLogW",7,0,0,0x28},
+        {"setupapi.dll","SetupRemoveFileLogEntryA",3},{"setupapi.dll","SetupRemoveFileLogEntryW",3},
+        {"setupapi.dll","SetupGetNonInteractiveMode",0},{"setupapi.dll","SetupSetNonInteractiveMode",1,0,0,0x1}};
     return table;
 }
 
@@ -421,6 +461,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_setup_inf(GuestState& state
             if(extension_at){memory.check(GuestAddress{extension_at},unit,Access::Write);const auto offset=wide?base.size()*2:utf16_to_utf8(base).size();memory.store(GuestAddress{extension_at},width,chosen.size()==base.size()?0:buffer+offset);}
             return succeed();
         }
+#include "windows_setup_string_table.inc"
+#include "windows_setup_disk_log.inc"
         throw HostCallFault("尚未實作 SetupAPI INF 服務："+std::string(name));
     }catch(const Failure& error){
         const bool handle_result=name.starts_with("SetupOpenInfFile") || name=="SetupOpenMasterInf";

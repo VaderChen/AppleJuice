@@ -321,6 +321,7 @@ inline void metal_gpu_profile_add(const std::string& key,double seconds,std::uin
 struct MetalShader final:GraphicsShader {
     std::vector<std::uint8_t> bytecode;
     std::shared_ptr<MetalPendingLibrary> pending;
+    std::exception_ptr compile_failure;
     std::array<unsigned,4> tessellation{}; // 分割、繞序、最大係數、每群 patch 數。
     id<MTLFunction> function,dual_source_function,non_point_function;id<MTLComputePipelineState> compute;
     std::map<unsigned,id<MTLFunction>> alpha_functions;
@@ -335,13 +336,16 @@ struct MetalShader final:GraphicsShader {
     bool writes_depth{};
     bool non_point_checked{};
     signed char uav_write_only{-1}; // 首次需要時由 bytecode 判定（見 metal_dxbc_uav_write_only）。
+    signed char primitive_cull{-1}; // 首次使用時證明 CullDistance 是否恆為零；其餘值由 GPU 依整個圖元判斷。
     std::vector<MetalVarying> input_varyings,output_varyings;
     unsigned geometry_input{},geometry_output{},geometry_max{},geometry_instances{1};
     unsigned buffer_views_slot{UINT32_MAX};
 };
 // 取得非同步編譯的結果：建立 function（運算著色器再建立 compute pipeline）。失敗時沿用同步路徑的錯誤訊息。
 void metal_resolve_shader(id<MTLDevice> device,MetalShader& shader){
+    if(shader.compile_failure)std::rethrow_exception(shader.compile_failure);
     if(!shader.pending)return;
+    try{
     const auto pending=shader.pending;
     {MetalStallScope timing("shader_library_wait",shader.serial,shader.stage);
         std::unique_lock lock(pending->mutex);pending->ready.wait(lock,[&]{return pending->done;});}
@@ -353,6 +357,7 @@ void metal_resolve_shader(id<MTLDevice> device,MetalShader& shader){
         NSError* error=nil;shader.compute=[device newComputePipelineStateWithFunction:shader.function error:&error];
         if(!shader.compute)throw std::invalid_argument("Metal compute pipeline 建立失敗："+std::string(error.localizedDescription.UTF8String));}
     shader.pending.reset();
+    }catch(...){shader.compile_failure=std::current_exception();shader.pending.reset();throw;}
 }
 struct MetalTessellationPipeline {
     std::array<std::shared_ptr<MetalShader>,3> stages;

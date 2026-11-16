@@ -382,6 +382,36 @@
       await api('smokeResult', { result: { passed: true, checks, captures, state } });
       return;
     }
+    if (smokeConfig.scenario === 'settings' && smokeConfig.settingsTest === 'spatial-audio') {
+      await click('app-settings'); await click('global-tab-audio');
+      check('空間混音(耳機)預設關閉', state.globalSettings.spatialHeadphones === false && !$('spatial-headphones').checked);
+      for (const enabled of [true, false]) {
+        $('spatial-headphones').checked = enabled;
+        await click('global-settings-save'); await until(() => !$('global-settings-save').disabled, '儲存空間混音');
+        check(`空間混音開關已儲存 ${enabled}`, state.globalSettings.spatialHeadphones === enabled);
+        await click('app-settings-close'); await click('app-settings'); await click('global-tab-audio');
+        check(`重開設定保留空間混音 ${enabled}`, $('spatial-headphones').checked === enabled);
+      }
+      check('設定頁使用 Switch', $('spatial-headphones').getAttribute('role') === 'switch' && $('spatial-headphones').nextElementSibling.classList.contains('switch-track'));
+      await capture('spatial-audio.png');
+      await click('app-settings-close');
+      await api('smokePick', {paths:smokeConfig.programs}); await click('add');
+      const quick = $('spatial-headphones-quick'), displayDraft = $('present-upscale').checked;
+      check('主畫面音訊 Switch 位於兩個畫面開關左側', quick.getAttribute('role') === 'switch' && quick.closest('.switch').nextElementSibling.contains($('present-upscale')) &&
+        quick.getBoundingClientRect().left < $('present-upscale').getBoundingClientRect().left);
+      for (const enabled of [true, false]) {
+        quick.click(); await until(() => !busy && state.globalSettings.spatialHeadphones === enabled, '主畫面空間混音連動');
+        check(`主畫面 Switch 已保存 ${enabled}`, quick.checked === enabled && $('present-upscale').checked === displayDraft);
+        await click('app-settings'); await click('global-tab-audio');
+        check(`設定頁與主畫面連動 ${enabled}`, $('spatial-headphones').checked === enabled);
+        await click('app-settings-close');
+      }
+      const switches = [...document.querySelectorAll('.run-switches .switch')].map(node => node.getBoundingClientRect());
+      check('三個開關保持同列且不溢出', switches.every(box => Math.abs(box.top-switches[0].top)<1) && switches.at(-1).right <= innerWidth);
+      await capture('spatial-audio-quick.png');
+      await api('smokeResult', { result: { passed: true, checks, captures, state } });
+      return;
+    }
     if (smokeConfig.scenario === 'settings' && smokeConfig.settingsTest === 'certificate-roots') {
       await click('app-settings'); await click('global-tab-advanced');
       await checkCertificateRootPreferences();
@@ -391,7 +421,7 @@
     check('自動語言依系統偏好解析', resolveLanguage('auto', ['fr-FR', 'ja-JP']) === 'ja' && resolveLanguage('auto', ['zh-TW']) === 'zh-Hant' && resolveLanguage('auto', ['ko-KR']) === 'ko' && resolveLanguage('auto', ['de-DE']) === 'en');
     await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, language: 'zh-Hant', theme: 'forest'}})));
     await click('app-settings');
-    check('設定分頁包含 Windows 介面、CPU、GPU 與快取', [...document.querySelectorAll('[data-global-tab]')].map(button => button.dataset.globalTab).join(',') === 'general,advanced,windows,cpu,gpu,cache,about');
+    check('設定分頁包含 Windows 介面、CPU、GPU、音訊與快取', [...document.querySelectorAll('[data-global-tab]')].map(button => button.dataset.globalTab).join(',') === 'general,advanced,windows,cpu,gpu,audio,cache,about');
     await checkSettingsDialogGeometry();
     await click('global-tab-cache'); await until(() => / GB$/.test($('cache-total').textContent), '快取用量');
     check('快取分頁顯示 GB 總用量且每個項目有刪除按鈕', !$('global-cache').hidden && $('global-general').hidden && /^\d+\.\d{2} GB$/.test($('cache-total').textContent) &&
@@ -400,7 +430,9 @@
     check('實驗性功能頁面與控制項已移除', !document.querySelector('#global-tab-experimental, #global-experimental, #native-library-bridge, #native-v8-bridge, #add-native-v8-tests'));
     await click('global-tab-gpu');
     $('global-tab-gpu').dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', bubbles: true}));
-    check('鍵盤可由 GPU 直接切換快取', !$('global-cache').hidden && document.activeElement === $('global-tab-cache'));
+    check('鍵盤可由 GPU 切換音訊', !$('global-audio').hidden && document.activeElement === $('global-tab-audio'));
+    $('global-tab-audio').dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', bubbles: true}));
+    check('鍵盤可由音訊切換快取', !$('global-cache').hidden && document.activeElement === $('global-tab-cache'));
     const originalLibraryBridge = state.globalSettings.nativeLibraryBridge, originalV8 = state.globalSettings.nativeV8Bridge;
     for (const value of [true, false]) {
       await perform(async () => applyState(await api('saveGlobalSettings', {globalSettings: {...state.globalSettings, nativeLibraryBridge: value}})));

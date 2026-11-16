@@ -38,7 +38,11 @@ std::span<const WindowsServiceDescriptor> mci_service_descriptors(){
         {"winmm.dll","mciSendCommandW",4,0,0,3},{"winmm.dll","mciSendCommandA",4,0,0,3},
         {"winmm.dll","mciGetDeviceIDW",1},{"winmm.dll","mciGetDeviceIDA",1},
         {"winmm.dll","mciGetErrorStringW",3,0,0,5},{"winmm.dll","mciGetErrorStringA",3,0,0,5},
-        {"winmm.dll","mciSendStringW",4,0,0,4},{"winmm.dll","mciSendStringA",4,0,0,4},{"winmm.dll","mciExecute",1}
+        {"winmm.dll","mciSendStringW",4,0,0,4},{"winmm.dll","mciSendStringA",4,0,0,4},{"winmm.dll","mciExecute",1},
+        {"winmm.dll","mciGetDriverData",1,0,0,1},{"winmm.dll","mciSetDriverData",2,0,0,1},{"winmm.dll","mciGetCreatorTask",1,0,0,1},
+        {"winmm.dll","mciDriverNotify",3,0,0,6},{"winmm.dll","mciDriverYield",1,0,0,1},{"winmm.dll","mciSetYieldProc",3,0,0,5},{"winmm.dll","mciGetYieldProc",2,0,0,1},
+        {"winmm.dll","mciGetDeviceIDFromElementIDA",2,0,0,1},{"winmm.dll","mciGetDeviceIDFromElementIDW",2,0,0,1},
+        {"winmm.dll","mciLoadCommandResource",3,0,0,4},{"winmm.dll","mciFreeCommandResource",1,0,0,1}
     };return entries;
 }
 MciState& WindowsServices::mci_state(){if(!mci_)mci_=std::make_shared<MciState>();return *mci_;}
@@ -75,8 +79,17 @@ void WindowsServices::discard_mci_wait(std::uint64_t handle){
 }
 std::optional<std::uint32_t> WindowsServices::resume_mci_wait(GuestState& state,GuestMemory& memory,std::uint64_t handle,std::uint64_t result){
     poll_mci();auto& bridge=mci_state();const auto found=bridge.waits.find(handle);if(found==bridge.waits.end())throw HostCallFault("MCI_WAIT 缺少等待狀態");
-    if(result==0xc0U){start_callbacks(state,memory,{{resolve("kernel32.dll","WaitForSingleObjectEx").value,{handle,UINT32_MAX,1}}},Continuation::MciWait,handle);return {};}
-    const auto code=found->second.error;discard_mci_wait(handle);complete_call(state,memory,result==0?code:mci::hardware);return {};
+    // 裝置設有 yield 程序時以 100 ms 為間隔等待，逾時呼叫 yield 程序；傳回非零即結束等待（命令仍成功，播放／錄音繼續）。
+    auto& wait=found->second;const auto device=bridge.devices.find(wait.device);const auto yield=device!=bridge.devices.end()?device->second->yield_proc:0;
+    const auto again=[&]{start_callbacks(state,memory,{{resolve("kernel32.dll","WaitForSingleObjectEx").value,{handle,yield?100U:UINT32_MAX,1}}},Continuation::MciWait,handle);};
+    if(wait.yielding){
+        wait.yielding=false;
+        if(static_cast<std::uint32_t>(result)){discard_mci_wait(handle);complete_call(state,memory,0);return {};}
+        again();return {};
+    }
+    if(result==0x102U && yield){wait.yielding=true;start_callbacks(state,memory,{{yield,{wait.device,device->second->yield_data}}},Continuation::MciWait,handle);return {};}
+    if(result==0xc0U || result==0x102U){again();return {};}
+    const auto code=wait.error;discard_mci_wait(handle);complete_call(state,memory,result==0?code:mci::hardware);return {};
 }
 
 std::optional<std::uint32_t> WindowsServices::invoke_mci(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -93,6 +106,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mci(GuestState& state,Guest
     };
     try{
         auto& bridge=mci_state();poll_mci();
+#include "windows_mci_driver.inc"
         if(name.starts_with("mciGetDeviceID")){
             return finish(find_device(bridge,string(arg(0))));
         }
@@ -250,7 +264,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_mci(GuestState& state,Guest
             if(first==last){complete_mci_transport(id,1);return finish(0);}
             if(flags&mci::wait){const auto handle=runtime_.allocate_wait_handle();
                 try{WaitObject event;event.kind=WaitObject::Kind::Event;event.manual_reset=true;event.access=0x100000U;runtime_.wait_objects.emplace(handle,std::move(event));bridge.waits.emplace(handle,MciState::Wait{id,0,threads_.current});device.waiters.push_back(handle);
-                    start_callbacks(state,memory,{{resolve("kernel32.dll","WaitForSingleObjectEx").value,{handle,UINT32_MAX,1}}},Continuation::MciWait,handle);
+                    start_callbacks(state,memory,{{resolve("kernel32.dll","WaitForSingleObjectEx").value,{handle,device.yield_proc?100U:UINT32_MAX,1}}},Continuation::MciWait,handle);
                 }catch(...){discard_mci_wait(handle);runtime_.wait_objects.erase(handle);throw;}return {};}
             return finish(0);
         }

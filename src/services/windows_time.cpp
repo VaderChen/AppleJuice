@@ -39,6 +39,12 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
         {"msacm32.dll","acmStreamPrepareHeader",3},{"msacm32.dll","acmStreamUnprepareHeader",3},{"msacm32.dll","acmStreamConvert",3},
         {"msacm32.dll","acmStreamReset",2},{"msacm32.dll","acmStreamMessage",4},{"msacm32.dll","acmFormatSuggest",5},
         {"msacm32.dll","acmGetVersion",0},{"msacm32.dll","acmMetrics",3},
+        {"msacm32.dll","acmDriverEnum",3},{"msacm32.dll","acmDriverDetailsA",3},{"msacm32.dll","acmDriverDetailsW",3},{"msacm32.dll","acmDriverOpen",3},
+        {"msacm32.dll","acmDriverClose",2},{"msacm32.dll","acmDriverID",3},{"msacm32.dll","acmDriverMessage",4},{"msacm32.dll","acmDriverPriority",3},
+        {"msacm32.dll","acmFormatTagDetailsA",3},{"msacm32.dll","acmFormatTagDetailsW",3},{"msacm32.dll","acmFormatDetailsA",3},{"msacm32.dll","acmFormatDetailsW",3},
+        {"msacm32.dll","acmFormatTagEnumA",5},{"msacm32.dll","acmFormatTagEnumW",5},{"msacm32.dll","acmFormatEnumA",5},{"msacm32.dll","acmFormatEnumW",5},
+        {"msacm32.dll","acmFilterTagDetailsA",3},{"msacm32.dll","acmFilterTagDetailsW",3},{"msacm32.dll","acmFilterDetailsA",3},{"msacm32.dll","acmFilterDetailsW",3},
+        {"msacm32.dll","acmFilterTagEnumA",5},{"msacm32.dll","acmFilterTagEnumW",5},{"msacm32.dll","acmFilterEnumA",5},{"msacm32.dll","acmFilterEnumW",5},
         {"crt","_gmtime64",1},{"crt","_localtime64",1},{"crt","_gmtime64_s",2},{"crt","_localtime64_s",2},
         {"crt","_mkgmtime64",1},{"crt","_mktime64",1},{"crt","_time64",1},{"crt","_difftime64",2,3},
         {"crt","time",1},{"crt","_time32",1},{"crt","gmtime",1},{"crt","localtime",1},
@@ -91,6 +97,8 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
         ,{"winmm.dll","midiInOpen",5},{"winmm.dll","midiInClose",1},{"winmm.dll","midiInGetID",2}
         ,{"winmm.dll","midiInPrepareHeader",3},{"winmm.dll","midiInUnprepareHeader",3},{"winmm.dll","midiInAddBuffer",3}
         ,{"winmm.dll","midiInStart",1},{"winmm.dll","midiInStop",1},{"winmm.dll","midiInReset",1}
+        ,{"winmm.dll","midiInMessage",4,0,0,0x2},{"winmm.dll","midiOutMessage",4,0,0,0x2},{"winmm.dll","midiConnect",3},{"winmm.dll","midiDisconnect",3}
+        ,{"winmm.dll","midiOutCachePatches",4,0,0,0xa},{"winmm.dll","midiOutCacheDrumPatches",4,0,0,0xa}
         ,{"winmm.dll","timeGetTime",0},{"winmm.dll","timeGetDevCaps",2},{"winmm.dll","timeGetSystemTime",2,0,0,2},{"winmm.dll","mmsystemGetVersion",0}
         ,{"winmm.dll","timeSetEvent",5},{"winmm.dll","timeKillEvent",1}
         ,{"winmm.dll","timeBeginPeriod",1},{"winmm.dll","timeEndPeriod",1}
@@ -255,7 +263,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
     if(service.symbol.starts_with("waveOut"))return invoke_wave_output(state,memory,service);
     if(service.symbol.starts_with("PlaySound") || service.symbol.starts_with("sndPlaySound"))return invoke_play_sound(state,memory,service);
     if(service.symbol.starts_with("waveIn"))return invoke_wave_input(state,memory,service);
-    if(service.symbol.starts_with("midiIn"))return invoke_midi_input(state,memory,service);
+    if(service.symbol.starts_with("midiIn") || service.symbol=="midiConnect" || service.symbol=="midiDisconnect")return invoke_midi_input(state,memory,service);
     if(service.symbol.starts_with("midiOut") || service.symbol.starts_with("midiStream"))return invoke_winmm_midi(state,memory,service);
     const WindowsCall arg(state,memory,service); const auto symbol=service.symbol;
     if(symbol=="_Getdays" || symbol=="_W_Getdays" || symbol=="_Getmonths" || symbol=="_W_Getmonths" || symbol=="_Gettnames" || symbol=="_W_Gettnames"){

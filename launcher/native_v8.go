@@ -88,6 +88,11 @@ func (a *App) engineEnvironmentLocked() ([]string, error) {
 		}
 	}
 	environment := engineEnvironment(a.library.CompilerWorkers, a.library.OpenGLBackend, a.library.NativeLibraryBridge, host)
+	spatial := "0"
+	if a.library.SpatialHeadphones {
+		spatial = "1"
+	}
+	environment = append(environment, "X64ARM_AUDIO_ENVIRONMENT="+spatial)
 	// 正常執行固定使用主螢幕桌面 1；只有測試才使用背景桌面。
 	space := a.windowSpaceUUID
 	if !a.windowSpaceTesting && space != "" {

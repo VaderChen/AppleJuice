@@ -1,5 +1,6 @@
 #include "x64arm/audio.hpp"
 #include "x64arm/audio_pcm.hpp"
+#include "x64arm/audio_channels.hpp"
 #include <algorithm>
 #include <cmath>
 #include <bit>
@@ -28,8 +29,14 @@ void Buffer::capture(std::span<const float> in,unsigned input_rate){
     }
 }
 void Buffer::render(std::span<float> out,unsigned output_rate) {
+    render_channels(out,output_rate,2);
+}
+void Buffer::render_channels(std::span<float> out,unsigned output_rate,unsigned output_channels) {
     std::fill(out.begin(),out.end(),0.0F);
+    if(!output_channels || (output_channels!=2 && output_channels!=channels))return;
+    const auto requested=out.size()/output_channels;
     if(source){
+        if(output_channels!=2)return; // RenderSource 的既有契約為立體聲。
         source->render(out,output_rate);
         {std::lock_guard lock(mutex);rendered_frames+=out.size()/2;
             for(std::size_t i=0;i+1<out.size();i+=2){
@@ -48,14 +55,14 @@ void Buffer::render(std::span<float> out,unsigned output_rate) {
         ~ProgressNotification(){if(active && notify)notify();}
     } progress{progress_notify};
     std::lock_guard lock(mutex);
-    progress.active=streaming && playing && out.size()/2!=0;
-    rendered_frames+=out.size()/2;
+    progress.active=streaming && playing && requested!=0;
+    rendered_frames+=requested;
     // 串流 underrun 計數：本次 callback 有多少 frame 因 queue 耗盡而以靜音補上。
     const auto starve=[&](std::size_t missing){
         if(!streaming || !playing)return;
         if(missing){starved_frames+=missing;if(!starving)++starved_runs;starving=true;}else starving=false;
     };
-    if((!playing && effects.empty()) || !output_rate || pcm.empty()){starve(out.size()/2);return;}
+    if((!playing && (effects.empty() || native_spatial)) || !output_rate || pcm.empty() || !frame_bytes() || channels>channel_gains.size()){starve(requested);return;}
     const auto frames=pcm.size()/frame_bytes();
     const auto advance=[&](double previous){
         for(const auto& n:notifications){
@@ -74,12 +81,12 @@ void Buffer::render(std::span<float> out,unsigned output_rate) {
             else {cursor=0;stop(false);}
         }
     };
-    const auto left_gain=left*spatial_left,right_gain=right*spatial_right;
-    if(effects.empty() && playing && frames && (channels==1 || channels==2) &&
+    const auto left_gain=left*spatial_left*channel_gains[0],right_gain=right*spatial_right*channel_gains[channels==1?0:1];
+    if(output_channels==2 && effects.empty() && playing && frames && (channels==1 || channels==2) &&
        ((!floating && (bits==8 || bits==16)) || (floating && bits==32)) &&
        std::isfinite(cursor) && cursor>=0 && cursor<static_cast<double>(frames) &&
        std::isfinite(left_gain) && std::isfinite(right_gain) && static_cast<double>(frequency)*doppler/output_rate==1){
-        std::size_t done=0;const auto requested=out.size()/2;
+        std::size_t done=0;
         while(done<requested && playing && cursor<static_cast<double>(frames)){
             const auto frame=static_cast<std::size_t>(cursor);auto count=std::min(requested-done,frames-frame);
             // 迴圈區段的結尾也是區塊邊界，讓 advance 在同一個 frame 倒回。
@@ -97,27 +104,42 @@ void Buffer::render(std::span<float> out,unsigned output_rate) {
         return;
     }
     const auto sample=[&](std::size_t frame,unsigned channel) {
-        const auto at=frame*frame_bytes()+channel*(bits/8);
-        if(floating){std::uint32_t word=0;for(unsigned b=0;b<4;++b)word|=static_cast<std::uint32_t>(pcm[at+b])<<(b*8);const auto value=std::bit_cast<float>(word);return std::isfinite(value)?std::clamp(value,-1.0F,1.0F):0.0F;}
-        if(bits==8)return (static_cast<float>(pcm[at])-128.0F)/128.0F;
-        const auto raw=static_cast<std::uint16_t>(pcm[at]|(static_cast<unsigned>(pcm[at+1])<<8));
-        return static_cast<float>(static_cast<std::int16_t>(raw))/32768.0F;
+        return pcm_sample(pcm.data()+frame*frame_bytes()+channel*(bits/8),bits,floating);
     };
     std::size_t missing=0;
-    for(std::size_t i=0;i+1<out.size();i+=2){
+    for(std::size_t i=0;i+output_channels<=out.size();i+=output_channels){
         // 串流的 queue 耗盡時輸出靜音，保留播放狀態與讀取游標，讓 API 補入下一包。
         if(streaming && cursor>=static_cast<double>(frames)){++missing;continue;}
-        if(!playing){for(auto& effect:effects)effect->process(out[i],out[i+1],spatial_distance);out[i]*=left*spatial_left;out[i+1]*=right*spatial_right;rendered_peak=std::max({rendered_peak,std::abs(out[i]),std::abs(out[i+1])});continue;}
+        if(!playing){if(output_channels==2){for(auto& effect:effects)effect->process(out[i],out[i+1],spatial_distance);out[i]*=left_gain;out[i+1]*=right_gain;rendered_peak=std::max({rendered_peak,std::abs(out[i]),std::abs(out[i+1])});}continue;}
         const auto frame=static_cast<std::size_t>(cursor);
-        out[i]=sample(frame,0);out[i+1]=sample(frame,channels==1?0:1);
-        for(auto& effect:effects)effect->process(out[i],out[i+1],spatial_distance);
-        out[i]*=left*spatial_left;out[i+1]*=right*spatial_right;
-        rendered_peak=std::max({rendered_peak,std::abs(out[i]),std::abs(out[i+1])});
-        rendered_left_peak=std::max(rendered_left_peak,std::abs(out[i]));rendered_right_peak=std::max(rendered_right_peak,std::abs(out[i+1]));
+        if(output_channels==2 && channels<=2){
+            out[i]=sample(frame,0);out[i+1]=sample(frame,channels==1?0:1);
+            for(auto& effect:effects)effect->process(out[i],out[i+1],spatial_distance);
+            out[i]*=left_gain;out[i+1]*=right_gain;
+        }else if(output_channels==channels){
+            for(unsigned c=0;c<channels;++c)out[i+c]=sample(frame,c)*(native_spatial?spatial_attenuation:channel_gains[c]*(c==0?left:c==1?right:(left+right)*.5F));
+        }else{
+            // 關閉 HRTF 時仍保留中央、環繞與 LFE；不能只取前兩聲道。
+            const auto mask=channel_mask?channel_mask:audio::channel_mask(channels);
+            for(unsigned c=0;c<channels;++c){const auto p=speaker_position(speaker_at(mask,c));const auto value=sample(frame,c)*channel_gains[c];
+                const auto gain=p.lfe?.5F:.70710678F;out[i]+=value*gain*std::sqrt(1-std::max(p.x,0.F));out[i+1]+=value*gain*std::sqrt(1+std::min(p.x,0.F));}
+            out[i]*=left*spatial_left;out[i+1]*=right*spatial_right;
+        }
+        for(unsigned c=0;c<output_channels;++c)rendered_peak=std::max(rendered_peak,std::abs(out[i+c]));
+        rendered_left_peak=std::max(rendered_left_peak,std::abs(out[i]));rendered_right_peak=std::max(rendered_right_peak,std::abs(out[i+(output_channels==1?0:1)]));
         const double previous=cursor;
         cursor+=static_cast<double>(frequency)*doppler/output_rate;
         advance(previous);
     }
     starve(missing);
+}
+void Buffer::process_spatial_output(std::span<float> out){
+    std::lock_guard lock(mutex);
+    for(std::size_t i=0;i+1<out.size();i+=2){
+        for(auto& effect:effects)effect->process(out[i],out[i+1],spatial_distance);
+        out[i]*=left*channel_gains[0];out[i+1]*=right*channel_gains[0];
+        rendered_left_peak=std::max(rendered_left_peak,std::abs(out[i]));rendered_right_peak=std::max(rendered_right_peak,std::abs(out[i+1]));
+        rendered_peak=std::max({rendered_peak,std::abs(out[i]),std::abs(out[i+1])});
+    }
 }
 }

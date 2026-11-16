@@ -235,6 +235,14 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     // winmm：Drv* 為可安裝驅動程式函式的舊名；無尾碼的 PlaySound 即 ANSI 版本。
     {"winmm.dll","DrvOpen","winmm.dll","OpenDriver"},{"winmm.dll","DrvOpenA","winmm.dll","OpenDriverA"},{"winmm.dll","DrvClose","winmm.dll","CloseDriver"},
     {"winmm.dll","DrvSendMessage","winmm.dll","SendDriverMessage"},{"winmm.dll","DrvDefDriverProc","winmm.dll","DefDriverProc"},
+    // msacm32 的 DriverProc：作為可安裝驅動程式時只處理標準 DRV_* 訊息，與 DefDriverProc 相同。
+    {"msacm32.dll","DriverProc","winmm.dll","DefDriverProc"},
+    // kernel32 的 K32 裝置驅動程式入口與 psapi 同一實作。
+    {"kernel32.dll","K32EnumDeviceDrivers","psapi.dll","EnumDeviceDrivers"},{"kernel32.dll","K32GetDeviceDriverBaseNameA","psapi.dll","GetDeviceDriverBaseNameA"},
+    {"kernel32.dll","K32GetDeviceDriverBaseNameW","psapi.dll","GetDeviceDriverBaseNameW"},{"kernel32.dll","K32GetDeviceDriverFileNameA","psapi.dll","GetDeviceDriverFileNameA"},
+    {"kernel32.dll","K32GetDeviceDriverFileNameW","psapi.dll","GetDeviceDriverFileNameW"},
+    // WSCEnumProtocols32：64 位元程序列舉 32 位元目錄；兩種目錄的內建提供者相同。
+    {"ws2_32.dll","WSCEnumProtocols32","ws2_32.dll","WSCEnumProtocols"},
     {"winmm.dll","DrvGetModuleHandle","winmm.dll","GetDriverModuleHandle"},{"winmm.dll","PlaySound","winmm.dll","PlaySoundA"},
     // kernelbase 第六批（由 kernel32 承接）：psapi 的分頁檔列舉。
     {"kernel32.dll","EnumPageFilesA","psapi.dll","EnumPageFilesA"},{"kernel32.dll","EnumPageFilesW","psapi.dll","EnumPageFilesW"},
@@ -581,10 +589,16 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     // #2 CreateAudioReverb、#3 CreateAudioVolumeMeter 內建尚未實作，不登錄入口。
     {"xaudio2_9.dll","#1","xaudio2_9.dll","XAudio2Create"},
     {"xaudio2_9.dll","#4","xaudio2_9.dll","CreateFX"},
+    // XAudio2CreateWithVersionInfo 是 #7；不指定時會占用尚未實作的 #2。
+    {"xaudio2_9.dll","#7","xaudio2_9.dll","XAudio2CreateWithVersionInfo"},
     {"xaudio2_9.dll","#5","x3daudio1_7.dll","X3DAudioCalculate"},
     {"xaudio2_9.dll","#6","x3daudio1_7.dll","X3DAudioInitialize"},
     {"xaudio2_9.dll","X3DAudioCalculate","x3daudio1_7.dll","X3DAudioCalculate"},
     {"xaudio2_9.dll","X3DAudioInitialize","x3daudio1_7.dll","X3DAudioInitialize"},
+    // 只以序數匯出的 XInputGetStateEx（#100）與 XInputGetCapabilitiesEx（#108）另提供名稱。
+    {"xinput1_3.dll","XInputGetStateEx","xinput1_3.dll","#100"},{"xinput1_4.dll","XInputGetStateEx","xinput1_4.dll","#100"},
+    {"xinput1_4.dll","XInputGetCapabilitiesEx","xinput1_4.dll","#108"},
+    {"xaudio2_8.dll","X3DAudioCalculate","x3daudio1_7.dll","X3DAudioCalculate"},{"xaudio2_8.dll","X3DAudioInitialize","x3daudio1_7.dll","X3DAudioInitialize"},
     {"xinput1_3.dll","#2","xinput1_3.dll","XInputGetState"},
     {"xinput1_3.dll","#3","xinput1_3.dll","XInputSetState"},
     {"xinput1_3.dll","#4","xinput1_3.dll","XInputGetCapabilities"},
@@ -753,6 +767,14 @@ inline constexpr ServiceExportAlias service_export_aliases[]{
     {"ntdll.dll","RtlInterlockedFlushSList","kernel32.dll","InterlockedFlushSList"},
     {"ntdll.dll","RtlInterlockedPopEntrySList","kernel32.dll","InterlockedPopEntrySList"},
     {"ntdll.dll","RtlInterlockedPushEntrySList","kernel32.dll","InterlockedPushEntrySList"},
+    // kernelbase 的分散／集中 I/O 沿用 kernel32 實作。
+    {"kernelbase.dll","ReadFileScatter","kernel32.dll","ReadFileScatter"},{"kernelbase.dll","WriteFileGather","kernel32.dll","WriteFileGather"},
+    // advapi32 的訊息摘要與 ntoskrnl 的自訂字碼頁表沿用 ntdll 實作。
+    {"advapi32.dll","MD4Init","ntdll.dll","MD4Init"},{"advapi32.dll","MD4Update","ntdll.dll","MD4Update"},{"advapi32.dll","MD4Final","ntdll.dll","MD4Final"},
+    {"advapi32.dll","MD5Init","ntdll.dll","MD5Init"},{"advapi32.dll","MD5Update","ntdll.dll","MD5Update"},{"advapi32.dll","MD5Final","ntdll.dll","MD5Final"},
+    {"advapi32.dll","A_SHAInit","ntdll.dll","A_SHAInit"},{"advapi32.dll","A_SHAUpdate","ntdll.dll","A_SHAUpdate"},{"advapi32.dll","A_SHAFinal","ntdll.dll","A_SHAFinal"},
+    {"ntoskrnl.exe","RtlInitCodePageTable","ntdll.dll","RtlInitCodePageTable"},{"ntoskrnl.exe","RtlCustomCPToUnicodeN","ntdll.dll","RtlCustomCPToUnicodeN"},
+    {"ntoskrnl.exe","RtlUnicodeToCustomCPN","ntdll.dll","RtlUnicodeToCustomCPN"},{"ntoskrnl.exe","RtlUpcaseUnicodeToCustomCPN","ntdll.dll","RtlUpcaseUnicodeToCustomCPN"},
     {"ntdll.dll","RtlQueryDepthSList","kernel32.dll","QueryDepthSList"},
     {"ntdll.dll","RtlGetLastWin32Error","kernel32.dll","GetLastError"},
     {"ntdll.dll","RtlSetLastWin32Error","kernel32.dll","SetLastError"},

@@ -1981,7 +1981,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     }
     else if(frame.continuation==Continuation::ConsoleControl && static_cast<std::uint32_t>(callback_value)){frame.value=1;frame.index=frame.callbacks.size();}
     else if(frame.continuation==Continuation::ReturnUntilFailure && (static_cast<std::uint32_t>(callback_value)&0x80000000U))frame.index=frame.callbacks.size();
-    else if((frame.continuation==Continuation::ReturnUntilFalse || frame.continuation==Continuation::MonitorEnumeration || frame.continuation==Continuation::DirectInputEnumeration || frame.continuation==Continuation::WindowEnumeration || frame.continuation==Continuation::MetafileEnumeration || frame.continuation==Continuation::LocaleEnumeration || frame.continuation==Continuation::ResourceEnumeration) && !static_cast<std::uint32_t>(callback_value))frame.index=frame.callbacks.size();
+    else if((frame.continuation==Continuation::ReturnUntilFalse || frame.continuation==Continuation::MonitorEnumeration || frame.continuation==Continuation::DirectInputEnumeration || frame.continuation==Continuation::WindowEnumeration || frame.continuation==Continuation::MetafileEnumeration || frame.continuation==Continuation::LocaleEnumeration || frame.continuation==Continuation::ResourceEnumeration || frame.continuation==Continuation::AcmEnumeration) && !static_cast<std::uint32_t>(callback_value))frame.index=frame.callbacks.size();
     else if (frame.index < frame.callbacks.size()) ++frame.index;
     if(frame.continuation==Continuation::WindowEnumeration)while(frame.index<frame.callbacks.size() && !gui_.windows.contains(frame.callbacks[frame.index].arguments[0]))++frame.index;
     if (frame.index < frame.callbacks.size()) { enter_callback(state, memory); return std::nullopt; }
@@ -2141,6 +2141,8 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
         if(error)last_error_=error;complete_call(state,memory,error?0:1);return std::nullopt;
     }
     if(finished.continuation==Continuation::LocaleEnumeration){(void)free_heap(memory,finished.value,state);complete_call(state,memory,1);return std::nullopt;}
+    // ACM 列舉（acmDriverEnum／acmFormat*Enum）：釋放每項回呼的詳細資料暫存，回傳 MMSYSERR_NOERROR。
+    if(finished.continuation==Continuation::AcmEnumeration){if(finished.value)(void)free_heap(memory,finished.value,state);complete_call(state,memory,0);return std::nullopt;}
     if(finished.continuation==Continuation::MetafileEnumeration){finish_metafile_enumeration(state,memory,finished.value);(void)free_heap(memory,finished.value,state);complete_call(state,memory,static_cast<std::uint32_t>(callback_value)!=0);return std::nullopt;}
     if(finished.continuation==Continuation::SafeArrayOperation){const auto locks=memory.load(GuestAddress{finished.value+8},32);if(locks)memory.store(GuestAddress{finished.value+8},32,locks-1);complete_call(state,memory,0);return std::nullopt;}
     if(finished.continuation==Continuation::AccessibleOperation)return resume_accessible(state,memory,finished.value,callback_value);

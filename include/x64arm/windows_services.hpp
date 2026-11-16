@@ -872,6 +872,8 @@ private:
     // 共用即時／待命 I/O 的結果發布、事件、APC 及完成埠通知。
     static std::uint32_t file_io_status(std::uint32_t);
     void complete_file_io(GuestMemory&,PendingFileIo&,std::uint32_t);
+    // ReadFileScatter／WriteFileGather 與 Nt 版本（windows_file_segments.inc）。
+    std::optional<std::uint32_t> invoke_file_segments(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_file_copy_chunk(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_fs_control(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_set_volume(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1032,6 +1034,8 @@ private:
         bool ready{};
     };
     std::map<std::uint64_t,ProxyResolver> proxy_resolvers_;
+    // LSA 原則 handle（值為授予的存取權）與 LsaRegisterPolicyChangeNotification 的 {資訊類別, 事件 handle}（windows_lsa.inc）。
+    std::map<std::uint64_t,std::uint32_t> lsa_policies_;std::uint64_t next_lsa_policy_{0x6a000000};std::set<std::pair<std::uint32_t,std::uint64_t>> lsa_notifications_;
     std::map<std::uint64_t,HttpCallbackOperation> http_callbacks_;
     std::map<std::uint64_t,std::uint64_t> proxy_result_allocations_;
     std::uint64_t queue_http_callback(const GuestState&,GuestMemory&,std::uint64_t,std::uint32_t,std::span<const std::uint8_t>,std::uint64_t,bool=true);
@@ -1339,6 +1343,9 @@ private:
     bool midi_output_waiting() const;
     std::map<std::uint64_t,std::shared_ptr<WinmmMidiInput>> midi_inputs_;
     void poll_midi_input(GuestMemory&);
+    // MIDI thru（midiConnect）：把輸入裝置收到的完整訊息轉送到已開啟的輸出；輸出已關閉時回傳 false。
+    bool midi_thru(std::uint64_t output,std::span<const std::uint8_t> message);
+    bool midi_output_open(std::uint64_t output) const;
     bool midi_input_waiting() const;
     std::optional<std::uint32_t> invoke_midi_input(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_winmm_midi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);

@@ -1,12 +1,13 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "guest_counted_string.hpp"
+#include "message_digest.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
 
 // ntdll 的純運算 Rtl 家族：記憶體、計數字串（STRING／UNICODE_STRING）、整數轉換、GUID、位元圖、LUID、TIME_FIELDS、
-// 亂數、CRC32 與 PE 映像輔助。全部在宿主端直接讀寫客體記憶體，不經客體回呼；ANSI／OEM 與引擎其他轉碼相同使用 UTF-8。
+// 亂數、CRC32、MD4／MD5／SHA-1 訊息摘要、自訂字碼頁表（CPTABLEINFO）與 PE 映像輔助。全部在宿主端直接讀寫客體記憶體，不經客體回呼；ANSI／OEM 與引擎其他轉碼相同使用 UTF-8。
 namespace x64arm {
 namespace {
 constexpr std::uint32_t status_invalid_parameter=0xc000000dU,status_buffer_too_small=0xc0000023U,status_buffer_overflow=0x80000005U,
@@ -82,6 +83,11 @@ std::span<const WindowsServiceDescriptor> ntdll_pure_service_descriptors(){
         {"ntdll.dll","RtlTimeToSecondsSince1980",2},{"ntdll.dll","RtlSecondsSince1980ToTime",2,0,0,0x1},
         // 亂數與 CRC
         {"ntdll.dll","RtlUniform",1},{"ntdll.dll","RtlRandom",1},{"ntdll.dll","RtlRandomEx",1},{"ntdll.dll","RtlComputeCrc32",3,0,0,0x5},
+        // 訊息摘要（advapi32 同名匯出共用此實作）
+        {"ntdll.dll","MD4Init",1},{"ntdll.dll","MD4Update",3,0,0,0x4},{"ntdll.dll","MD4Final",1},{"ntdll.dll","MD5Init",1},{"ntdll.dll","MD5Update",3,0,0,0x4},{"ntdll.dll","MD5Final",1},
+        {"ntdll.dll","A_SHAInit",1},{"ntdll.dll","A_SHAUpdate",3,0,0,0x4},{"ntdll.dll","A_SHAFinal",2},
+        // 自訂字碼頁表
+        {"ntdll.dll","RtlInitCodePageTable",2},{"ntdll.dll","RtlCustomCPToUnicodeN",6,0,0,0x24},{"ntdll.dll","RtlUnicodeToCustomCPN",6,0,0,0x24},{"ntdll.dll","RtlUpcaseUnicodeToCustomCPN",6,0,0,0x24},
         // PE 映像
         {"ntdll.dll","RtlImageNtHeader",1},{"ntdll.dll","RtlImageDirectoryEntryToData",4,0,0,0x6},{"ntdll.dll","RtlImageRvaToSection",3,0,0,0x4},
         {"ntdll.dll","RtlImageRvaToVa",4,0,0,0x4},{"ntdll.dll","RtlAddressInSectionTable",3,0,0,0x4},
@@ -458,6 +464,101 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_pure(GuestState& stat
             auto seed=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},32));
             const auto index=shuffle.last%shuffle.table.size();const auto result=shuffle.table[index];
             shuffle.table[index]=uniform_next(seed);shuffle.last=result;memory.store(GuestAddress{arg(0)},32,seed);return done(result);
+        }
+        if(name.starts_with("MD4") || name.starts_with("MD5") || name.starts_with("A_SHA")){
+            // 客體結構：MD4_CTX {ULONG buf[4]; ULONG i[2]; UCHAR in[64]; UCHAR digest[16]}、MD5_CTX {ULONG i[2]; ULONG buf[4]; UCHAR in[64]; UCHAR digest[16]}，
+            // i 為以位元計的長度（低、高）；SHA_CTX {ULONG Unknown[6]; ULONG State[5]; ULONG Count[2]; UCHAR Buffer[64]}，Count 為位元組數（低、高）。
+            // 狀態全部存在客體結構，複製結構後可各自繼續；MD4Final／MD5Final 把摘要寫入 digest，A_SHAFinal 寫入第二個參數並重新初始化。
+            const bool sha=name.starts_with("A_SHA"),md4=name.starts_with("MD4");const auto context=arg(0);
+            const std::uint64_t state_at=sha?24:md4?0:8,count_at=sha?44:md4?16:0,buffer_at=sha?52:24;const unsigned words=sha?5:4;
+            std::array<std::uint32_t,5> chain{};for(unsigned i=0;i<words;++i)chain[i]=static_cast<std::uint32_t>(memory.load(GuestAddress{context+state_at+i*4},32));
+            auto count=memory.load(GuestAddress{context+count_at},32)|(memory.load(GuestAddress{context+count_at+4},32)<<32);
+            std::array<std::uint8_t,64> buffer{};memory.read(GuestAddress{context+buffer_at},buffer);
+            const auto bytes=[&]{return sha?count:count/8;};
+            const auto compress=[&](const std::uint8_t* block){
+                if(sha){std::array<std::uint32_t,5> s=chain;digest::sha1_block(s,block);chain=s;}
+                else{std::array<std::uint32_t,4> s{chain[0],chain[1],chain[2],chain[3]};if(md4)digest::md4_block(s,block);else digest::md5_block(s,block);std::copy(s.begin(),s.end(),chain.begin());}};
+            const auto absorb=[&](std::span<const std::uint8_t> data){
+                for(const auto value:data){const auto index=static_cast<std::size_t>(bytes()%64);buffer[index]=value;count+=sha?1:8;if(index==63)compress(buffer.data());}};
+            const auto store_state=[&]{
+                for(unsigned i=0;i<words;++i)memory.store(GuestAddress{context+state_at+i*4},32,chain[i]);
+                memory.store(GuestAddress{context+count_at},32,count&0xffffffffU);memory.store(GuestAddress{context+count_at+4},32,count>>32);memory.write(GuestAddress{context+buffer_at},buffer);};
+            if(name.ends_with("Init")){
+                if(sha)std::copy(digest::sha1_initial.begin(),digest::sha1_initial.end(),chain.begin());else std::copy(digest::md_initial.begin(),digest::md_initial.end(),chain.begin());
+                count=0;buffer.fill(0);store_state();return done(0);
+            }
+            if(name.ends_with("Update")){
+                // 長輸入分段讀取，避免一次配置整段客體資料。
+                auto source=arg(1);auto remaining=static_cast<std::uint64_t>(u32(2));std::vector<std::uint8_t> chunk;
+                while(remaining){const auto size=static_cast<std::size_t>(std::min<std::uint64_t>(remaining,65536));chunk.resize(size);memory.read(GuestAddress{source},chunk);absorb(chunk);source+=size;remaining-=size;}
+                store_state();return done(0);
+            }
+            // Final：補 0x80、填 0 到 56 位元組，再附上位元長度（MD4／MD5 為小端序，SHA-1 為大端序）。
+            const auto length_bits=sha?count*8:count;
+            std::array<std::uint8_t,72> tail{};tail[0]=0x80;const auto used=static_cast<std::size_t>(bytes()%64);const auto pad=(used<56?56:120)-used;
+            for(unsigned i=0;i<8;++i)tail[pad+i]=static_cast<std::uint8_t>(sha?length_bits>>(56-8*i):length_bits>>(8*i));
+            absorb(std::span<const std::uint8_t>(tail).first(pad+8));
+            std::array<std::uint8_t,20> result{};
+            for(unsigned i=0;i<words;++i)for(unsigned k=0;k<4;++k)result[i*4+k]=static_cast<std::uint8_t>(sha?chain[i]>>(24-8*k):chain[i]>>(8*k));
+            if(sha){memory.write(GuestAddress{arg(1)},std::span<const std::uint8_t>(result).first(20));
+                std::copy(digest::sha1_initial.begin(),digest::sha1_initial.end(),chain.begin());count=0;buffer.fill(0);}
+            else memory.write(GuestAddress{context+88},std::span<const std::uint8_t>(result).first(16));
+            store_state();return done(0);
+        }
+        if(name=="RtlInitCodePageTable" || name=="RtlCustomCPToUnicodeN" || name=="RtlUnicodeToCustomCPN" || name=="RtlUpcaseUnicodeToCustomCPN"){
+            // CPTABLEINFO {USHORT CodePage, MaximumCharacterSize, DefaultChar, UniDefaultChar, TransDefaultChar, TransUniDefaultChar, DBCSCodePage; UCHAR LeadByte[12];
+            //              PUSHORT MultiByteTable; PVOID WideCharTable; PUSHORT DBCSRanges; PUSHORT DBCSOffsets}；指標從 28（x86）或 32（x64）位元組開始。
+            const std::uint64_t pointers=x86_?28:32;const auto info=arg(0);
+            const auto word=[&](std::uint64_t address){return static_cast<std::uint16_t>(memory.load(GuestAddress{address},16));};
+            const auto pointer=[&](unsigned index){return memory.load(GuestAddress{info+pointers+index*unit},bits);};
+            if(name=="RtlInitCodePageTable"){
+                // NLS 碼頁檔：表頭（字數、碼頁、最大字元長度、四個預設字元、12 個前導位元組），接著 [到 WideCharTable 的字數] MultiByteTable[256]、
+                // [字形表旗標（非 0 時接 256 項）]、[DBCS 範圍數] 與各前導位元組的位移表；UTF-8（65001）沒有表格。
+                const auto base=arg(0),out=arg(1);
+                for(std::uint64_t offset=0;offset<pointers+4*unit;offset+=2)memory.store(GuestAddress{out+offset},16,0);
+                if(word(base+2)==65001){
+                    const std::array<std::uint16_t,6> fields{65001,4,'?',0xfffd,'?','?'};for(unsigned i=0;i<fields.size();++i)memory.store(GuestAddress{out+i*2},16,fields[i]);return done(0);
+                }
+                for(unsigned i=1;i<=6;++i)memory.store(GuestAddress{out+(i-1)*2},16,word(base+i*2));
+                std::array<std::uint8_t,12> lead{};memory.read(GuestAddress{base+14},lead);memory.write(GuestAddress{out+14},lead);
+                auto at=base+std::uint64_t{word(base)}*2;const auto wide=at+(std::uint64_t{word(at)}+1)*2;const auto multi=at+2;at=multi+512;
+                // 字形表旗標之後（有字形表時再跳過 256 項）為 DBCS 範圍數。
+                const auto glyph=at;at=glyph+2;if(word(glyph))at+=512;const auto ranges=at;const bool dbcs=word(ranges)!=0;
+                memory.store(GuestAddress{out+12},16,dbcs?1:0);
+                memory.store(GuestAddress{out+pointers},bits,multi);memory.store(GuestAddress{out+pointers+unit},bits,wide);
+                memory.store(GuestAddress{out+pointers+2*unit},bits,ranges);memory.store(GuestAddress{out+pointers+3*unit},bits,dbcs?ranges+2:0);
+                return done(0);
+            }
+            // 轉換：(info, 目的, 目的位元組上限, 寫入位元組數（可為 NULL）, 來源, 來源位元組數)；輸出不足時截斷，與 RtlMultiByteToUnicodeN 相同回傳 STATUS_SUCCESS。
+            const auto destination=arg(1),capacity=static_cast<std::uint64_t>(u32(2)),count_pointer=arg(3),source=arg(4),length=static_cast<std::uint64_t>(u32(5));
+            if(length>output_limit)return done(status_no_memory);
+            const bool utf8=word(info)==65001,dbcs=word(info+12)!=0;const auto multi=pointer(0),wide=pointer(1),offsets=pointer(3);
+            std::vector<std::uint8_t> out;
+            if(name=="RtlCustomCPToUnicodeN"){
+                std::vector<std::uint8_t> input(static_cast<std::size_t>(length));memory.read(GuestAddress{source},input);
+                if(utf8){auto text=utf8_to_utf16_lossy(std::string_view(reinterpret_cast<const char*>(input.data()),input.size()));out=utf16_payload(text);
+                    out.resize(std::min<std::size_t>(out.size(),static_cast<std::size_t>(capacity&~std::uint64_t{1})));
+                    if(out.size()>=2 && out.size()<text.size()*2){const auto last=static_cast<unsigned>(out[out.size()-2])|(static_cast<unsigned>(out[out.size()-1])<<8);if(last>=0xd800 && last<=0xdbff)out.resize(out.size()-2);}}
+                else for(std::size_t i=0;i<input.size() && out.size()+2<=capacity;++i){
+                    std::uint16_t value=word(multi+std::uint64_t{input[i]}*2);
+                    if(dbcs){const auto lead=word(offsets+std::uint64_t{input[i]}*2);if(lead && i+1<input.size())value=word(offsets+(std::uint64_t{lead}+input[++i])*2);}
+                    out.push_back(static_cast<std::uint8_t>(value));out.push_back(static_cast<std::uint8_t>(value>>8));
+                }
+            }else{
+                auto text=read_utf16_counted(memory,GuestAddress{source},static_cast<std::size_t>(length/2));
+                if(name.starts_with("RtlUpcase"))for(auto& c:text)c=upper(c);
+                if(utf8){const auto narrow=utf16_to_utf8_lossy(text);out.assign(narrow.begin(),narrow.end());
+                    if(out.size()>capacity){std::size_t keep=static_cast<std::size_t>(capacity);while(keep && (out[keep]&0xc0U)==0x80U)--keep;out.resize(keep);}}
+                else for(const auto c:text){
+                    if(!dbcs){if(out.size()+1>capacity)break;out.push_back(static_cast<std::uint8_t>(memory.load(GuestAddress{wide+c},8)));continue;}
+                    const auto value=word(wide+std::uint64_t{c}*2);
+                    if(value&0xff00U){if(out.size()+2>capacity)break;out.push_back(static_cast<std::uint8_t>(value>>8));out.push_back(static_cast<std::uint8_t>(value));}
+                    else{if(out.size()+1>capacity)break;out.push_back(static_cast<std::uint8_t>(value));}
+                }
+            }
+            if(!out.empty())memory.write(GuestAddress{destination},out);
+            if(count_pointer)memory.store(GuestAddress{count_pointer},32,out.size());
+            return done(0);
         }
         if(name=="RtlComputeCrc32"){
             // (ULONG InitialCrc, PUCHAR Buffer, INT Length)：IEEE 802.3 CRC-32（反射多項式 0xEDB88320），可串接計算。

@@ -242,7 +242,8 @@ std::string WindowsServices::d3d9_diagnostics()const{
     return out.str();
 }
 std::span<const WindowsServiceDescriptor> d3d9_service_descriptors(){
-    static const auto table=[](){std::vector<WindowsServiceDescriptor> value{{"d3d9.dll","Direct3DCreate9",1},{"d3d9.dll","Direct3DCreate9Ex",2}};
+    // Direct3DCreate9On12：覆寫清單指定的 D3D12 裝置只影響 Windows 的 9On12 轉譯層；Metal 後端直接建立同一種 IDirect3D9。DebugSetMute 是零售版執行階段的空操作。
+    static const auto table=[](){std::vector<WindowsServiceDescriptor> value{{"d3d9.dll","Direct3DCreate9",1},{"d3d9.dll","Direct3DCreate9Ex",2},{"d3d9.dll","Direct3DCreate9On12",3,0,0,5},{"d3d9.dll","DebugSetMute",0}};
         for(const auto entry:{WindowsServiceDescriptor{"d3d9.dll","D3DPERF_BeginEvent",2},{"d3d9.dll","D3DPERF_EndEvent",0},{"d3d9.dll","D3DPERF_GetStatus",0},{"d3d9.dll","D3DPERF_SetMarker",2},{"d3d9.dll","D3DPERF_SetRegion",2},{"d3d9.dll","D3DPERF_SetOptions",1},{"d3d9.dll","D3DPERF_QueryRepeatFrame",0}})value.push_back(entry);
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"}){value.push_back({family,"D3DXCreatePRTEngine",5});value.push_back({family,"D3DXConcatenateMeshes",8});value.push_back({family,"D3DXCreateRenderToEnvMap",7});value.push_back({family,"D3DXCreateRenderToSurface",7});value.push_back({family,"D3DXFileCreate",1});value.push_back({family,"D3DXCreateSkinInfo",4});value.push_back({family,"D3DXCreateSkinInfoFVF",4});value.push_back({family,"D3DXCreateTextureGutterHelper",5});}
         for(auto family:{"d3dx9_42.dll","d3dx9_43.dll"})for(auto entry:{WindowsServiceDescriptor{family,"D3DXCreateMesh",6},{family,"D3DXCreateMeshFVF",6},{family,"D3DXGetDeclLength",1},{family,"D3DXGetFVFVertexSize",1},{family,"D3DXComputeNormals",2},{family,"D3DXWeldVertices",7},{family,"D3DXComputeTangentFrameEx",16},{family,"D3DXTessellateNPatches",6}})value.push_back(entry);
@@ -636,8 +637,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d9(GuestState& state,Gues
 const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_windows_path(utf8_to_utf16(path),runtime_.current_directory));};
 #include "d3dx9_mesh_handlers.inc"
         if(mesh_handled){}
-        else if(symbol=="Direct3DCreate9" || symbol=="Direct3DCreate9Ex"){
-            const bool ex=symbol=="Direct3DCreate9Ex";if(ex)output(1);require(u(0)==32,unavailable);{auto native=make_metal_opengl(nullptr,1,1);require(bool(native),unavailable);auto factory=create(Kind::Factory,0,false,ex);factory->native=std::move(native);if(ex)store_pointer(arg(1),factory->root);else result=factory->root;}
+        else if(symbol=="DebugSetMute"){}
+        else if(symbol=="Direct3DCreate9" || symbol=="Direct3DCreate9Ex" || symbol=="Direct3DCreate9On12"){
+            const bool ex=symbol=="Direct3DCreate9Ex";
+            // D3D9ON12_ARGS：{BOOL Enable9On12; IUnknown* pD3D12Device; IUnknown* ppD3D12Queues[2]; UINT NumQueues; UINT NodeMask}。
+            if(symbol=="Direct3DCreate9On12" && u(2))memory.check(GuestAddress{arg(1)},static_cast<std::size_t>(u(2))*(x86_?24U:40U),Access::Read);if(ex)output(1);require(u(0)==32,unavailable);{auto native=make_metal_opengl(nullptr,1,1);require(bool(native),unavailable);auto factory=create(Kind::Factory,0,false,ex);factory->native=std::move(native);if(ex)store_pointer(arg(1),factory->root);else result=factory->root;}
         }else {
             const auto dot=symbol.find('.');require(dot!=std::string_view::npos);const auto prefix=symbol.substr(0,dot);symbol.remove_prefix(dot+1);
             const auto kind=prefix.starts_with("Factory")?Kind::Factory:prefix.starts_with("Device")?Kind::Device:prefix.starts_with("SwapChain")?Kind::SwapChain:prefix=="Query"?Kind::Query:prefix=="StateBlock"?Kind::StateBlock:prefix=="VertexShader"?Kind::VertexShader:prefix=="PixelShader"?Kind::PixelShader:prefix=="VertexDeclaration"?Kind::VertexDeclaration:prefix=="Texture"?Kind::Texture:prefix=="CubeTexture"?Kind::CubeTexture:prefix=="VolumeTexture"?Kind::VolumeTexture:prefix=="Volume"?Kind::Volume:prefix=="VertexBuffer"?Kind::VertexBuffer:prefix=="IndexBuffer"?Kind::IndexBuffer:Kind::Surface;auto value=get(arg(0),kind);const bool recording=kind==Kind::Device && value->recording && recordable(symbol);auto& object=recording?*value->recording:*value;
@@ -1022,9 +1026,9 @@ const auto d3dx_path=[&](std::string_view path){return utf16_to_utf8(normalized_
                 if(recording)record_state(object,symbol,u(1),u(2),u(3));
             }
         }
-    }catch(const Failure& error){result=(service.symbol=="Direct3DCreate9" || service.symbol=="FactoryEx.GetAdapterModeCountEx")?0:error.value;if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d9] %s HRESULT=%08x arg1=%llx arg2=%llx arg3=%llx (%s:%u)\n",std::string(service.symbol).c_str(),error.value,static_cast<unsigned long long>(arg(1)),static_cast<unsigned long long>(arg(2)),static_cast<unsigned long long>(arg(3)),error.where.file_name(),error.where.line());}
+    }catch(const Failure& error){result=(service.symbol=="Direct3DCreate9" || service.symbol=="Direct3DCreate9On12" || service.symbol=="FactoryEx.GetAdapterModeCountEx")?0:error.value;if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d9] %s HRESULT=%08x arg1=%llx arg2=%llx arg3=%llx (%s:%u)\n",std::string(service.symbol).c_str(),error.value,static_cast<unsigned long long>(arg(1)),static_cast<unsigned long long>(arg(2)),static_cast<unsigned long long>(arg(3)),error.where.file_name(),error.where.line());}
     catch(const texture_image::Error& error){result=error.hresult;if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d9] %s: %s\n",std::string(service.symbol).c_str(),error.what());}
-    catch(const std::bad_alloc&){result=service.symbol=="Direct3DCreate9"?0:out_of_memory;}
+    catch(const std::bad_alloc&){result=service.symbol=="Direct3DCreate9" || service.symbol=="Direct3DCreate9On12"?0:out_of_memory;}
     catch(const std::invalid_argument& error){result=invalid;if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS"))std::fprintf(stderr,"[d3d9] %s: %s\n",std::string(service.symbol).c_str(),error.what());}
     for(auto it=bridge.prt_engine_operations.begin();it!=bridge.prt_engine_operations.end();)if(it->second.thread==threads_.current && it->second.stack==state.reg(Gpr::Rsp) && it->second.service.symbol==service.symbol)it=bridge.prt_engine_operations.erase(it);else ++it;
     for(auto it=bridge.prt_comp_operations.begin();it!=bridge.prt_comp_operations.end();)if(it->second.thread==threads_.current && it->second.stack==state.reg(Gpr::Rsp) && it->second.service.symbol==service.symbol)it=bridge.prt_comp_operations.erase(it);else ++it;

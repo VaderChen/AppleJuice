@@ -13,6 +13,8 @@ inline std::array<std::uint8_t,40> wgl_pixel_format(){
     p[10]=p[12]=p[14]=p[16]=8;p[11]=16;p[13]=8;p[17]=24;
     const auto* backend=std::getenv("X64ARM_GL_BACKEND");
     p[23]=backend && std::string_view(backend)=="metal"?32:24;p[24]=8;
+    // 累積緩衝：Metal 後端提供每分量 16 位元的 RGBA；宿主 OpenGL 後端畫在離屏 FBO，沒有累積緩衝。
+    if(!backend || std::string_view(backend)!="legacy"){p[18]=64;p[19]=p[20]=p[21]=p[22]=16;}
     return p;
 }
 struct WglFormatAttribute {int value{};bool minimum{},ignored{},main_plane_only{};};
@@ -36,7 +38,8 @@ inline std::optional<WglFormatAttribute> wgl_format_attribute(unsigned attribute
     case 0x2017:return WglFormatAttribute{p[12],true};case 0x2018:return WglFormatAttribute{p[13],false,true};
     case 0x2019:return WglFormatAttribute{p[14],true};case 0x201a:return WglFormatAttribute{p[15],false,true};
     case 0x201b:return WglFormatAttribute{p[16],true};case 0x201c:return WglFormatAttribute{p[17],false,true};
-    case 0x201d:case 0x201e:case 0x201f:case 0x2020:case 0x2021:case 0x2024:return WglFormatAttribute{0,true};
+    case 0x201d:case 0x201e:case 0x201f:case 0x2020:case 0x2021:return WglFormatAttribute{p[18+attribute-0x201d],true};
+    case 0x2024:return WglFormatAttribute{0,true};
     case 0x2022:return WglFormatAttribute{p[23],true};case 0x2023:return WglFormatAttribute{p[24],true};
     default:return {};
     }

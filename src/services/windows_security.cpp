@@ -94,6 +94,11 @@ std::span<const WindowsServiceDescriptor> security_service_descriptors() {
         {"advapi32.dll","AdjustTokenGroups",6},{"advapi32.dll","PrivilegeCheck",3},
         {"advapi32.dll", "LsaOpenPolicy", 4}, {"advapi32.dll", "LsaClose", 1},
         {"advapi32.dll", "LsaAddAccountRights", 4}, {"advapi32.dll", "LsaNtStatusToWinError", 1},
+        {"advapi32.dll","LsaFreeMemory",1},{"advapi32.dll","LsaLookupNames",5,0,0,0x2},{"advapi32.dll","LsaLookupNames2",6,0,0,0x6},{"advapi32.dll","LsaLookupSids",5,0,0,0x2},
+        {"advapi32.dll","LsaLookupPrivilegeName",3},{"advapi32.dll","LsaLookupPrivilegeDisplayName",4},{"advapi32.dll","LsaQueryInformationPolicy",3,0,0,0x2},{"advapi32.dll","LsaGetUserName",2},
+        {"advapi32.dll","LsaEnumerateTrustedDomains",5,0,0,0x8},{"advapi32.dll","LsaEnumerateTrustedDomainsEx",5,0,0,0x8},
+        {"advapi32.dll","LsaRegisterPolicyChangeNotification",2,0,0,0x1},{"advapi32.dll","LsaUnregisterPolicyChangeNotification",2,0,0,0x1},
+        {"advapi32.dll","LsaRemoveAccountRights",5,0,0,0x14},{"advapi32.dll","LsaEnumerateAccountRights",4},{"advapi32.dll","LsaEnumerateAccountsWithUserRight",4},{"advapi32.dll","LsaEnumerateAccounts",5,0,0,0x8},
         {"advapi32.dll", "LookupAccountNameA", 7}, {"advapi32.dll", "LookupAccountNameW", 7},
         {"advapi32.dll", "LookupAccountSidA", 7}, {"advapi32.dll", "LookupAccountSidW", 7},
         {"advapi32.dll", "GetFileSecurityA", 5}, {"advapi32.dll", "GetFileSecurityW", 5},
@@ -170,8 +175,12 @@ std::uint32_t token_access(std::uint32_t requested) {
 std::uint32_t lsa_winerror(std::uint32_t status) {
     switch (status) {
     case 0: return 0;
+    case 0x107: return 1301; // STATUS_SOME_NOT_MAPPED
     case 0x8000001a: return 259; // STATUS_NO_MORE_ENTRIES
+    case 0xc0000001: return 31;
     case 0xc0000002: return 120;
+    case 0xc0000003: return 87; // STATUS_INVALID_INFO_CLASS
+    case 0xc0000005: return 998;
     case 0xc0000008: return 6;
     case 0xc000000d: return 87;
     case 0xc0000017: return 8;
@@ -711,30 +720,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
     }else if (symbol == "IsUserAnAdmin") {
         initialize_tokens();const auto& token=runtime_.token_objects.at(effective_token_id());const auto administrators=sddl_sid("BA");
         result=token_sid_matches(token,administrators,false) && (!token.restriction_check || token_sid_matches(token,administrators,false,true));
-    } else if (symbol == "LsaOpenPolicy") {
-        // LSA 使用 NTSTATUS，不寫 LastError。虛擬低權限 token 不能開啟系統 policy。
-        result = 0xc0000022;
-        if (!arg(1) || !arg(3)) result = 0xc000000d;
-        else {
-            memory.check(GuestAddress{arg(1)}, 48, Access::Read); // x64 LSA_OBJECT_ATTRIBUTES
-            memory.check(GuestAddress{arg(3)}, 8, Access::Write);
-            if (arg(0)) {
-                memory.check(GuestAddress{arg(0)}, 16, Access::Read); // LSA_UNICODE_STRING
-                const auto length = memory.load(GuestAddress{arg(0)}, 16);
-                const auto capacity = memory.load(GuestAddress{arg(0) + 2}, 16);
-                const auto buffer = memory.load(GuestAddress{arg(0) + 8}, 64);
-                if ((length & 1) || length > capacity || (length && !buffer)) result = 0xc000000d;
-                else if (length) {
-                    memory.check(GuestAddress{buffer}, static_cast<std::size_t>(length), Access::Read);
-                    result = 0xc00000bb; // 沒有遠端 LSA 後端。
-                }
-            }
-        }
-    } else if (symbol == "LsaClose" || symbol == "LsaAddAccountRights") {
-        // 目前沒有可取得的 policy handle；token、file、任意整數均不是 LSA handle。
-        result = 0xc0000008;
-    } else if (symbol == "LsaNtStatusToWinError") {
-        result = lsa_winerror(u32(0));
+    } else if (symbol.starts_with("Lsa")) {
+#include "windows_lsa.inc"
     } else if (symbol == "LookupAccountNameA" || symbol == "LookupAccountNameW" ||
                symbol == "LookupAccountSidA" || symbol == "LookupAccountSidW") {
         const bool wide = symbol.back() == 'W', by_sid = symbol.starts_with("LookupAccountSid");

@@ -203,6 +203,11 @@ public:
         if(auto* proxy=dynamic_cast<MetalCommandThread*>(target)){proxy->graphics_sync();target=&proxy->inner();}
         return inner_->share_objects(*target);
     }
+    bool copy_state(NativeOpenGlContext& source,std::uint32_t mask) override {
+        graphics_sync();NativeOpenGlContext* from=&source;
+        if(auto* proxy=dynamic_cast<MetalCommandThread*>(from)){proxy->graphics_sync();from=&proxy->inner();}
+        return inner_->copy_state(*from,mask);
+    }
     bool programmable()const noexcept override {return inner_->programmable();}
     std::shared_ptr<OpenGlBuffer> buffer_object(std::uint32_t name) override {graphics_sync();return inner_->buffer_object(name);}
     std::shared_ptr<OpenGlBuffer> bound_buffer(std::uint32_t target) override {graphics_sync();return inner_->bound_buffer(target);}

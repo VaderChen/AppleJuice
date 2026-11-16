@@ -31,6 +31,8 @@ class MacOpenGl final:public NativeOpenGlContext {
     std::set<GLint> rejected_proxy_levels_;
     std::array<GLenum,8> saved_errors_{};std::size_t saved_error_count_{};
     bool list_definition_{},compiling_list_{},primitive_open_{},pending_end_{},primitive_batchable_{};
+    // glSelectBuffer／glFeedbackBuffer 交給系統實作的宿主緩衝；RenderMode 離開時複製到 output，再由服務層寫回客體。
+    std::vector<GLuint> select_buffer_;std::vector<GLfloat> feedback_buffer_;
     const bool list_batch_enabled_=std::getenv("X64ARM_GL_DISABLE_LIST_BATCHING")==nullptr;
     GLenum primitive_mode_{};
     std::uint64_t primitive_vertices_{},list_groups_{},merged_boundaries_{};
@@ -79,6 +81,12 @@ public:
         }
     }
     ~MacOpenGl()override{@autoreleasepool{bind();finish_pending_primitive();glFinish();for(const auto& a:arrays_)if(a.buffer)glDeleteBuffers(1,&a.buffer);release_surface();release_view(view_);[context_ clearDrawable];[NSOpenGLContext clearCurrentContext];}}
+    bool copy_state(NativeOpenGlContext& other,std::uint32_t mask)override{
+        // wglCopyContext：系統的 CGLCopyContext 依同一組屬性位元複製；來源尚未送出的合併圖元先完成。
+        auto* source=dynamic_cast<MacOpenGl*>(&other);if(!source)return false;if(source==this)return true;
+        source->bind();source->finish_pending_primitive();bind();
+        return CGLCopyContext(source->context_.CGLContextObj,context_.CGLContextObj,mask)==kCGLNoError;
+    }
     void bind()override{if(CGLGetCurrentContext()!=context_.CGLContextObj && CGLSetCurrentContext(context_.CGLContextObj)!=kCGLNoError)throw std::runtime_error("無法切換 OpenGL context");}
     void drawable(void* opaque,std::uint32_t width,std::uint32_t height)override{
         if(!width || !height || width>16384 || height>16384)throw std::runtime_error("OpenGL drawable 尺寸超出支援範圍");
@@ -173,7 +181,53 @@ public:
         case GlOperation::DepthFunc:glDepthFunc(u(0));break;case GlOperation::DepthRange:glDepthRange(d(0),d(1));break;case GlOperation::DepthMask:glDepthMask(static_cast<GLboolean>(u(0)));break;
         case GlOperation::ColorMask:glColorMask(static_cast<GLboolean>(u(0)!=0),static_cast<GLboolean>(u(1)!=0),static_cast<GLboolean>(u(2)!=0),static_cast<GLboolean>(u(3)!=0));break;
         case GlOperation::LineWidth:glLineWidth(f(0));break;case GlOperation::PointSize:glPointSize(f(0));break;case GlOperation::IndexMask:glIndexMask(u(0));break;case GlOperation::PixelZoom:glPixelZoom(f(0),f(1));break;
-        case GlOperation::RenderMode:return static_cast<std::uint32_t>(glRenderMode(u(0)));
+        case GlOperation::RenderMode:{
+            GLint previous=GL_RENDER;glGetIntegerv(GL_RENDER_MODE,&previous);const GLint result=glRenderMode(u(0));
+            std::vector<std::uint32_t> words;
+            if(previous==GL_SELECT){
+                // 命中數轉成字數：每筆紀錄為 3＋名稱數；溢位時整個緩衝都是有效內容。
+                std::size_t count=select_buffer_.size();if(result>=0){count=0;for(GLint hit=0;hit<result && count<select_buffer_.size();++hit)count+=3+select_buffer_[count];count=std::min(count,select_buffer_.size());}
+                words.assign(select_buffer_.begin(),select_buffer_.begin()+static_cast<std::ptrdiff_t>(count));
+            }else if(previous==GL_FEEDBACK){
+                const std::size_t count=result<0?feedback_buffer_.size():std::min<std::size_t>(static_cast<std::size_t>(result),feedback_buffer_.size());
+                for(std::size_t i=0;i<count;++i)words.push_back(std::bit_cast<std::uint32_t>(feedback_buffer_[i]));
+            }
+            if(output.size()>=4){const auto count=std::min<std::size_t>(words.size(),output.size()/4-1);const auto header=static_cast<std::uint32_t>(count);std::memcpy(output.data(),&header,4);if(count)std::memcpy(output.data()+4,words.data(),count*4);}
+            return static_cast<std::uint32_t>(result);}
+        case GlOperation::SelectBuffer:case GlOperation::FeedbackBuffer:{
+            // 系統實作在選取／回饋模式中拒絕更換緩衝；先確認模式，避免釋放系統仍持有的緩衝。
+            GLint mode=GL_RENDER;glGetIntegerv(GL_RENDER_MODE,&mode);
+            if(mode==(op==GlOperation::SelectBuffer?GL_SELECT:GL_FEEDBACK)){remember_error(GL_INVALID_OPERATION);break;}
+            if(op==GlOperation::SelectBuffer){select_buffer_.assign(u(0),0);glSelectBuffer(n(0),select_buffer_.data());}
+            else {feedback_buffer_.assign(u(0),0);glFeedbackBuffer(n(0),u(1),feedback_buffer_.data());}
+            break;}
+        // 規格把 factor 夾在 1～256；系統實作保存原值，先夾限再交給它。
+        case GlOperation::LineStipple:glLineStipple(std::clamp(n(0),1,256),static_cast<GLushort>(u(1)));break;
+        case GlOperation::PixelTransfer:glPixelTransferf(u(0),static_cast<GLfloat>(std::bit_cast<double>(a[1])));break;
+        case GlOperation::PixelMap:{
+            // 依元素型別交給系統的對應版本，避免改變整數表的換算。
+            const auto size=n(1);if(size<1 || data.size()<static_cast<std::size_t>(size)*(u(2)==0x1403?2U:4U)){remember_error(GL_INVALID_VALUE);break;}
+            if(u(2)==0x1403){std::vector<GLushort> values(static_cast<std::size_t>(size));std::memcpy(values.data(),data.data(),values.size()*2);glPixelMapusv(u(0),size,values.data());}
+            else if(u(2)==0x1405){std::vector<GLuint> values(static_cast<std::size_t>(size));std::memcpy(values.data(),data.data(),values.size()*4);glPixelMapuiv(u(0),size,values.data());}
+            else{std::vector<GLfloat> values(static_cast<std::size_t>(size));std::memcpy(values.data(),data.data(),values.size()*4);glPixelMapfv(u(0),size,values.data());}
+            break;}
+        case GlOperation::GetPixelMap:{
+            if(output.empty())return 0;const std::size_t width=u(1)==0x1403?2U:4U;std::vector<std::uint8_t> values(output.size()+width);
+            if(u(1)==0x1403)glGetPixelMapusv(u(0),reinterpret_cast<GLushort*>(values.data()));else if(u(1)==0x1405)glGetPixelMapuiv(u(0),reinterpret_cast<GLuint*>(values.data()));
+            else glGetPixelMapfv(u(0),reinterpret_cast<GLfloat*>(values.data()));
+            std::memcpy(output.data(),values.data(),output.size());return output.size();}
+        case GlOperation::DrawPixels:glDrawPixels(n(0),n(1),u(2),u(3),data.empty()?nullptr:data.data());break;
+        case GlOperation::CopyPixels:glCopyPixels(n(0),n(1),n(2),n(3),u(4));break;
+        // 宿主表面為離屏 FBO，沒有累積緩衝：glAccum 由系統回報 GL_INVALID_OPERATION，清除值與邏輯運算照常保存與套用。
+        case GlOperation::Accum:glAccum(u(0),f(1));break;case GlOperation::ClearAccum:glClearAccum(f(0),f(1),f(2),f(3));break;case GlOperation::LogicOp:glLogicOp(u(0));break;
+        case GlOperation::PolygonStipple:if(data.size()<128)remember_error(GL_INVALID_VALUE);else glPolygonStipple(data.data());break;
+        case GlOperation::GetPolygonStipple:if(output.empty())return 0;glGetPolygonStipple(output.data());return output.size();
+        case GlOperation::GetTexImage:if(output.empty())return 0;glGetTexImage(u(0),n(1),u(2),u(3),output.data());return output.size();
+        case GlOperation::ClipPlane:if(data.size()<32)remember_error(GL_INVALID_VALUE);else glClipPlane(u(0),dv);break;
+        case GlOperation::GetClipPlane:if(output.size()<32){GLdouble scratch[4]{};glGetClipPlane(u(0),scratch);return 0;}glGetClipPlane(u(0),reinterpret_cast<GLdouble*>(output.data()));return 4;
+        case GlOperation::InitNames:glInitNames();break;case GlOperation::LoadName:glLoadName(u(0));break;
+        case GlOperation::PushName:glPushName(u(0));break;case GlOperation::PopName:glPopName();break;
+        case GlOperation::PassThrough:glPassThrough(f(0));break;
         case GlOperation::ShadeModel:glShadeModel(u(0));break;case GlOperation::Hint:glHint(u(0),u(1));break;
         case GlOperation::Viewport:glViewport(n(0),n(1),n(2),n(3));break;case GlOperation::Scissor:glScissor(n(0),n(1),n(2),n(3));break;
         case GlOperation::MatrixMode:glMatrixMode(u(0));break;case GlOperation::LoadIdentity:glLoadIdentity();break;
@@ -295,6 +349,16 @@ public:
         case GlOperation::EvalMesh2:glEvalMesh2(u(0),n(1),n(2),n(3),n(4));break;
         case GlOperation::EvalPoint1:glEvalPoint1(n(0));break;
         case GlOperation::EvalPoint2:glEvalPoint2(n(0),n(1));break;
+        // glTexGen：服務層已把各型別換成 double，系統實作負責眼座標平面轉換與產生。
+        case GlOperation::TexGendv:{
+            if(data.size()<8){remember_error(GL_INVALID_ENUM);break;}
+            glTexGendv(u(0),u(1),dv);
+            // 系統實作切換產生模式（例如 SPHERE_MAP→NORMAL_MAP）後，要等該座標的 GL_TEXTURE_GEN_* 重新啟用才更新產生程式，之前繪製結果全黑且沒有錯誤碼。
+            // 已啟用時立即關閉再開啟一次，淨狀態不變；定義 display list 時不做，避免把切換錄進清單。
+            if(u(1)==GL_TEXTURE_GEN_MODE && !list_definition_ && u(0)>=GL_S && u(0)<=GL_Q){const GLenum cap=GL_TEXTURE_GEN_S+(u(0)-GL_S);if(glIsEnabled(cap)){glDisable(cap);glEnable(cap);}}
+            break;}
+        case GlOperation::GetTexGendv:{const std::size_t count=u(1)==GL_TEXTURE_GEN_MODE?1U:4U;if(count*8>output.size()){GLdouble scratch[4]{};glGetTexGendv(u(0),u(1),scratch);return 0;}
+            glGetTexGendv(u(0),u(1),reinterpret_cast<GLdouble*>(output.data()));return count;}
         case GlOperation::GetMapdv:{
             // 先以 GL_ORDER 求出 GL_COEFF 的數量；結果超過輸出空間時不寫入。
             const auto target=u(0),query=u(1);const auto k=gl_map_components(target);const bool two=target>=0xdb0;

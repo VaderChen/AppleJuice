@@ -77,6 +77,8 @@ void update(Object& o){
     pcm.left=gain(o.volume)*gain(-std::max(o.pan,0))*gain(o.primary?0:d.volume)*gain(-std::max(o.primary?0:d.pan,0));
     pcm.right=gain(o.volume)*gain(std::min(o.pan,0))*gain(o.primary?0:d.volume)*gain(std::min(o.primary?0:d.pan,0));
     pcm.spatial_left=pcm.spatial_right=pcm.doppler=1;pcm.spatial_distance=0;
+    pcm.spatial_object=(o.flags&0x10) && !o.primary;
+    pcm.spatial_active=false;pcm.spatial_attenuation=1;
     if(!(o.flags&0x10) || o.primary || o.source.mode==2)return;
     const auto& s=o.source;const auto& l=d.listener;
     const auto v=s.mode==1?s.position:sub(s.position,l.position);const auto distance=length(v);const auto direction=normalized(v);
@@ -90,6 +92,9 @@ void update(Object& o){
         attenuation*=std::pow(10.0F,static_cast<float>(s.cone_volume)*fraction/2000.0F);
     }
     const auto right=s.mode==1?Vector{1,0,0}:normalized(cross(l.top,l.front));const auto pan=std::clamp(dot(direction,right),-1.0F,1.0F);
+    const auto front=s.mode==1?Vector{0,0,1}:normalized(l.front);const auto top=normalized(cross(front,right));
+    pcm.spatial_active=true;pcm.spatial_attenuation=attenuation;
+    pcm.spatial_position={dot(direction,right),dot(direction,top),-dot(direction,front)};
     const auto gains=stereo(pan,attenuation);pcm.spatial_left=gains.first;pcm.spatial_right=gains.second;
     const auto listener_speed=s.mode==1?0.0F:dot(l.velocity,direction)*l.distance*l.doppler;
     const auto source_speed=dot(s.velocity,direction)*l.distance*l.doppler;
@@ -445,7 +450,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dsound(GuestState& state,Gu
                 else if(arg(3)&2)result=control_unavailable;
                 else if(std::any_of(o.effects.begin(),o.effects.end(),[](const auto& effect){return effect.hardware;}))result=control_unavailable;
                 else {
-                    {std::lock_guard lock(pcm.mutex);(void)allocate_effects(o);}
+                    {std::lock_guard lock(pcm.mutex);(void)allocate_effects(o);update(o);}
                     if(!o.output){try{o.output=audio::open_output(o.pcm,o.context->host);}catch(const std::runtime_error&){result=no_driver;}}
                     if(!result){std::lock_guard lock(pcm.mutex);if(!pcm.playing)for(auto& effect:pcm.effects)effect->reset();pcm.looping=(arg(3)&1)!=0;pcm.playing=true;}
                 }

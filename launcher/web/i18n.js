@@ -1,5 +1,11 @@
 // 介面翻譯集中管理；不翻譯程式名稱、路徑或客體輸出。
 const translations = {
+"播放選項": ["Playback options", "再生オプション", "재생 옵션"],
+"音訊": ["Audio", "オーディオ", "오디오"],
+"耳機音效": ["Headphone audio", "ヘッドフォンの音響", "헤드폰 음향"],
+"空間混音(耳機)": ["Spatial headphone mixing", "ヘッドフォン空間ミックス", "헤드폰 공간 믹싱"],
+"將多聲道聲音模擬為耳機的立體空間音效。請配戴耳機使用。": ["Render multichannel audio as spatial sound for headphones. Use with headphones.", "マルチチャンネル音声をヘッドフォンの立体音響として再生します。ヘッドフォンでご使用ください。", "다채널 오디오를 헤드폰용 공간 음향으로 재생합니다. 헤드폰을 착용해 주세요."],
+"預設關閉，儲存後於下次啟動程式生效。目前不啟用頭部追蹤。": ["Off by default. Applies the next time an app starts after saving. Head tracking is disabled.", "初期設定はオフです。保存後、アプリの次回起動時に適用されます。ヘッドトラッキングは無効です。", "기본값은 꺼짐입니다. 저장 후 앱을 다시 실행하면 적용됩니다. 머리 추적은 사용하지 않습니다."],
 "快取": ["Caches", "キャッシュ", "캐시"],
 "快取用量": ["Cache usage", "キャッシュ使用量", "캐시 사용량"],
 "快取可以重新建立。刪除後，程式下次啟動需要重新編譯著色器，初期畫面可能較不流暢。": ["Caches can be rebuilt. After clearing, an app recompiles its shaders on the next launch and may stutter at first.", "キャッシュは再作成できます。消去後は次回起動時にシェーダーを再コンパイルするため、最初は動作がぎこちなくなることがあります。", "캐시는 다시 만들 수 있습니다. 지운 뒤에는 다음 실행 때 셰이더를 다시 컴파일하므로 처음에는 끊길 수 있습니다."],

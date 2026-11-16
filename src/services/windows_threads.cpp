@@ -553,6 +553,9 @@ std::span<const WindowsServiceDescriptor> thread_service_descriptors() {
                                                       {"avrt.dll", "AvSetMmThreadCharacteristicsW", 2},
                                                       {"avrt.dll", "AvSetMmThreadPriority", 2},
                                                       {"avrt.dll", "AvRevertMmThreadCharacteristics", 1},
+                                                      {"avrt.dll", "AvSetMmMaxThreadCharacteristicsA", 3},
+                                                      {"avrt.dll", "AvSetMmMaxThreadCharacteristicsW", 3},
+                                                      {"avrt.dll", "AvQuerySystemResponsiveness", 2},
                                                       {"kernel32.dll", "CreateIoCompletionPort", 4},
                                                       {"kernel32.dll", "PostQueuedCompletionStatus", 4},
                                                       {"kernel32.dll", "GetQueuedCompletionStatus", 5},
@@ -4725,48 +4728,77 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 else {const auto value=static_cast<std::int32_t>(arg(1));if(value < -2 || value > 2)return done(0,87);task.relative=value;}
                 threads_.yield=true;return done(1);
             }
-            if(!arg(0) || !arg(1))return done(0,87);
-            memory.check(GuestAddress{arg(1)},4,Access::Write);
-            auto name=service.symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(0)},256):utf8_to_utf16_lossy(read_ansi(memory,arg(0),256));
-            for(auto& c:name)c=unicode_case_unit(c,false);
-            if(name.empty() || name.find(u'\\')!=name.npos || name.find(u'/')!=name.npos)return done(0,1550);
-            if(task.handle)return done(0,1552);
-            const auto requested=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)},32));
-            const auto known=threads_.multimedia_task_indices.find(name);
-            if(requested && (known==threads_.multimedia_task_indices.end() || known->second!=requested))return done(0,1551);
-            std::u16string category=name==u"pro audio"?u"high":name==u"distribution"?u"low":u"medium";
-            bool supported=false;
-            for(auto standard:{u"audio",u"capture",u"distribution",u"games",u"playback",u"pro audio",u"window manager"})if(name==standard)supported=true;
-            RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
-            if(transaction.error)return done(0,transaction.error);
+            // 工作設定：HKLM\...\Multimedia\SystemProfile\Tasks\<名稱> 的 Priority（1～8）與 Scheduling Category；SystemResponsiveness 為 100 時停用 MMCSS。
+            struct Profile {std::u16string name;std::uint32_t error{};int priority{2},minimum{},maximum{};};
+            const auto read_name=[&](std::uint64_t address){auto text=service.symbol.ends_with('W')?read_utf16(memory,GuestAddress{address},256):utf8_to_utf16_lossy(read_ansi(memory,address,256));for(auto& c:text)c=unicode_case_unit(c,false);return text;};
             const auto system=std::u16string(1,2)+u"\\software\\microsoft\\windows nt\\currentversion\\multimedia\\systemprofile";
             const auto number=[](const RegistryValue& value)->std::optional<std::uint32_t>{
                 if(value.type!=4 || value.bytes.size()!=4)return {};
                 std::uint32_t out=0;for(unsigned i=0;i<4;++i)out|=static_cast<std::uint32_t>(value.bytes[i])<<(i*8);return out;
             };
-            if(const auto settings=runtime_.registry.keys.find(system);settings!=runtime_.registry.keys.end()){
-                if(const auto value=settings->second.find(u"systemresponsiveness");value!=settings->second.end() && number(value->second)==100U)return done(0,1058);
-            }
-            int priority=2;
-            if(const auto settings=runtime_.registry.keys.find(system+u"\\tasks\\"+name);settings!=runtime_.registry.keys.end()){
-                supported=true;
-                if(const auto value=settings->second.find(u"priority");value!=settings->second.end()){
-                    const auto amount=number(value->second);if(!amount || *amount<1 || *amount>8)return done(0,87);priority=static_cast<int>(*amount);
+            const auto responsiveness=[&]()->std::optional<std::uint32_t>{
+                if(const auto settings=runtime_.registry.keys.find(system);settings!=runtime_.registry.keys.end())
+                    if(const auto value=settings->second.find(u"systemresponsiveness");value!=settings->second.end())return number(value->second);
+                return std::nullopt;};
+            const auto profile=[&](std::u16string name)->Profile{
+                Profile result;result.name=name;
+                if(name.empty() || name.find(u'\\')!=name.npos || name.find(u'/')!=name.npos){result.error=1550;return result;}
+                std::u16string category=name==u"pro audio"?u"high":name==u"distribution"?u"low":u"medium";
+                bool supported=false;
+                for(auto standard:{u"audio",u"capture",u"distribution",u"games",u"playback",u"pro audio",u"window manager"})if(name==standard)supported=true;
+                if(responsiveness()==100U){result.error=1058;return result;}
+                int priority=2;
+                if(const auto settings=runtime_.registry.keys.find(system+u"\\tasks\\"+name);settings!=runtime_.registry.keys.end()){
+                    supported=true;
+                    if(const auto value=settings->second.find(u"priority");value!=settings->second.end()){
+                        const auto amount=number(value->second);if(!amount || *amount<1 || *amount>8){result.error=87;return result;}priority=static_cast<int>(*amount);
+                    }
+                    if(const auto value=settings->second.find(u"scheduling category");value!=settings->second.end()){
+                        const auto& data=value->second;if(data.type!=1 || data.bytes.size()%2){result.error=87;return result;}category.clear();
+                        for(std::size_t i=0;i<data.bytes.size();i+=2){const auto c=static_cast<char16_t>(data.bytes[i]|(static_cast<unsigned>(data.bytes[i+1])<<8));if(!c)break;category+=unicode_case_unit(c,false);}
+                    }
                 }
-                if(const auto value=settings->second.find(u"scheduling category");value!=settings->second.end()){
-                    const auto& data=value->second;if(data.type!=1 || data.bytes.size()%2)return done(0,87);category.clear();
-                    for(std::size_t i=0;i<data.bytes.size();i+=2){const auto c=static_cast<char16_t>(data.bytes[i]|(static_cast<unsigned>(data.bytes[i+1])<<8));if(!c)break;category+=unicode_case_unit(c,false);}
-                }
+                if(!supported){result.error=1550;return result;}
+                result.minimum=category==u"high"?23:category==u"medium"?16:category==u"low"?8:0;
+                if(!result.minimum){result.error=87;return result;}
+                result.maximum=category==u"high"?26:category==u"medium"?22:15;
+                if(category==u"high")priority=2;
+                result.priority=std::clamp(result.minimum+priority-1,result.minimum,result.maximum);return result;};
+            RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
+            if(transaction.error)return done(0,transaction.error);
+            if(service.symbol=="AvQuerySystemResponsiveness"){
+                // (AvrtHandle, PULONG)：值以 10 為單位向上取整，0 視為 10，未設定時為 20。
+                if(!arg(0) || task.handle!=arg(0))return done(0,6);if(!arg(1))return done(0,87);
+                auto value=responsiveness().value_or(20U);value=value?std::min(100U,(value+9)/10*10):10U;
+                memory.store(GuestAddress{arg(1)},32,value);return done(1);
             }
-            if(!supported)return done(0,1550);
-            const int minimum=category==u"high"?23:category==u"medium"?16:category==u"low"?8:0;
-            if(!minimum)return done(0,87);
-            const int maximum=category==u"high"?26:category==u"medium"?22:15;
-            if(category==u"high")priority=2;
+            const bool pair=service.symbol.starts_with("AvSetMmMaxThreadCharacteristics");const unsigned index_argument=pair?2:1;
+            if(!arg(0) || !arg(index_argument) || (pair && !arg(1)))return done(0,87);
+            memory.check(GuestAddress{arg(index_argument)},4,Access::Write);
+            // 單一工作沿用原本的檢查順序：名稱格式、已關聯、工作索引，再讀工作設定。
+            // AvSetMmMaxThreadCharacteristics：兩個工作取優先順序較高者（相同時取第一個）。
+            const auto requested=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(index_argument)},32));
+            const auto index_matches=[&](const std::u16string& name){const auto known=threads_.multimedia_task_indices.find(name);return !requested || (known!=threads_.multimedia_task_indices.end() && known->second==requested);};
+            Profile chosen;
+            if(!pair){
+                const auto name=read_name(arg(0));
+                if(name.empty() || name.find(u'\\')!=name.npos || name.find(u'/')!=name.npos)return done(0,1550);
+                if(task.handle)return done(0,1552);
+                if(!index_matches(name))return done(0,1551);
+                chosen=profile(name);
+            }else{
+                if(task.handle)return done(0,1552);
+                chosen=profile(read_name(arg(0)));const auto second=profile(read_name(arg(1)));
+                if(chosen.error && second.error)return done(0,chosen.error);
+                if(chosen.error || (!second.error && second.priority>chosen.priority))chosen=second;
+                if(!index_matches(chosen.name))return done(0,1551);
+            }
+            if(chosen.error)return done(0,chosen.error);
+            const auto known=threads_.multimedia_task_indices.find(chosen.name);
             auto index=known==threads_.multimedia_task_indices.end()?0:known->second;
-            if(!index){if(threads_.multimedia_task_indices.size()>=4096)return done(0,8);index=static_cast<std::uint32_t>(threads_.multimedia_task_indices.size()+1);threads_.multimedia_task_indices.emplace(name,index);}
-            task={runtime_.allocate_wait_handle(),std::clamp(minimum+priority-1,minimum,maximum),minimum,maximum,0};
-            memory.store(GuestAddress{arg(1)},32,index);threads_.yield=true;return done(task.handle);
+            if(!index){if(threads_.multimedia_task_indices.size()>=4096)return done(0,8);index=static_cast<std::uint32_t>(threads_.multimedia_task_indices.size()+1);threads_.multimedia_task_indices.emplace(chosen.name,index);}
+            task={runtime_.allocate_wait_handle(),chosen.priority,chosen.minimum,chosen.maximum,0};
+            memory.store(GuestAddress{arg(index_argument)},32,index);threads_.yield=true;return done(task.handle);
         }catch(const MemoryFault&){return done(0,998);}catch(const std::bad_alloc&){return done(0,8);}catch(const std::invalid_argument&){return done(0,87);}
     }
     if (service.symbol == "SetThreadDescription" || service.symbol == "GetThreadDescription") {

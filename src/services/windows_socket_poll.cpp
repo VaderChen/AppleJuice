@@ -20,6 +20,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_socket_poll(GuestState& sta
     const auto failed=[&](std::uint32_t error){last_error_=error;if(service.symbol=="WSAPoll"){auto& wait=threads_.items.at(threads_.current).wait;if(wait.kind==ThreadWaitKind::SocketSelect)wait={};}return finish(UINT32_MAX);};
     if(!network.startups)return failed(10093);
     try{
+        if(service.symbol=="WSARecvDisconnect"){
+            // TCP 沒有中斷資料：lpInboundDisconnectData 須為 NULL；成功時停止接收。
+            const auto found=network.sockets.find(arg(0));if(found==network.sockets.end())return failed(10038);
+            if(arg(1)){memory.check(GuestAddress{arg(1)},x86_?8:16,Access::Read);return failed(10042);}
+            if(::shutdown(found->second->descriptor,SHUT_RD)<0)return failed(socket_detail::socket_error(errno));return finish(0);
+        }
+        if(service.symbol=="WSAJoinLeaf"){
+            // 內建 TCP／UDP 提供者沒有 XP1_SUPPORT_MULTIPOINT，socket 也不能以 WSA_FLAG_MULTIPOINT_* 建立。
+            const auto found=network.sockets.find(arg(0));last_error_=found==network.sockets.end()?10038:10022;return finish(x86_?UINT32_MAX:UINT64_MAX);
+        }
         if(service.symbol=="WSASendDisconnect"){
             const auto found=network.sockets.find(arg(0));if(found==network.sockets.end())return failed(10038);
             if(arg(1)){memory.check(GuestAddress{arg(1)},x86_?8:16,Access::Read);return failed(10042);}

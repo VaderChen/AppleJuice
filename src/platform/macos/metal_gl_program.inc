@@ -143,6 +143,9 @@ void MetalGl::gl_texture(std::span<const std::uint64_t> supplied,std::span<const
     if(!u(3) || !u(4))return;
     if(data.empty()){if(subimage)error(0x502);return;}const auto [stride,start]=pixel_layout(u(3),source_bytes,false);if(start+(u(4)-1)*stride+static_cast<std::size_t>(u(3))*source_bytes>data.size()){error(0x501);return;}
     std::vector<std::uint8_t> pixels(static_cast<std::size_t>(u(3))*u(4)*bytes_per_pixel);
+    // 客體影像依規格先做像素傳輸（色彩縮放／偏移與 MAP_COLOR；深度來源為深度縮放／偏移），再換成內部格式。
+    const bool depth_source=u(6)==0x1902;const auto& transfer=state_.transfer;
+    const bool transfer_color=!depth_source && color_transfer_active(),transfer_depth=depth_source && (transfer.depth_scale!=1 || transfer.depth_bias!=0);
     for(unsigned y=0;y<u(4);++y)for(unsigned x=0;x<u(3);++x){std::array<float,4> values{0,0,0,1};
         for(unsigned c=0;c<std::min(channels,source_channels);++c){const auto at=start+y*stride+x*source_bytes;
             if(source_packed){std::uint32_t word;std::memcpy(&word,data.data()+at,4);if(pixel_[0xcf0])word=__builtin_bswap32(word);values[c]=unpack_rg11b10(word,c);}
@@ -150,6 +153,7 @@ void MetalGl::gl_texture(std::span<const std::uint64_t> supplied,std::span<const
             else if(source_unit==4)std::memcpy(&values[c],data.data()+at+c*4,4);
             else if(u(7)==0x1403){std::uint16_t word;std::memcpy(&word,data.data()+at+c*2,2);if(pixel_[0xcf0])word=__builtin_bswap16(word);values[c]=word/65535.F;}
             else{__fp16 half;std::memcpy(&half,data.data()+at+c*2,2);values[c]=half;}}
+        if(transfer_color)color_transfer(values);else if(transfer_depth)values[0]=depth_transfer(values[0]);
         if(u(2)==3 || u(2)==0x1907 || u(2)==0x8051 || u(2)==0x8054 || u(2)==0x881b || u(2)==0x8815)values[3]=1;
         const auto at=(static_cast<std::size_t>(y)*u(3)+x)*bytes_per_pixel;
         if(packed){const auto word=pack_rg11b10(values[0],values[1],values[2]);std::memcpy(pixels.data()+at,&word,4);}

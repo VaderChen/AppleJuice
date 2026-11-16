@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/midi.hpp"
 #include "x64arm/unicode.hpp"
+#include "wave_device_message.hpp"
 #include <algorithm>
 
 namespace x64arm {
@@ -10,6 +11,9 @@ struct WinmmMidiInput {
     std::uint8_t running{},status{},count{},needed{};std::uint32_t message{},stamp{};
     struct Header {std::uint64_t data{};std::uint32_t capacity{},size{},used{},stamp{};bool queued{};};
     std::map<std::uint64_t,Header> headers;std::deque<std::uint64_t> queue;
+    // midiConnect 的輸出：完整短訊息、即時訊息與 SysEx 依收到的順序轉送。
+    std::uint64_t thru{};std::vector<std::vector<std::uint8_t>> forward;std::vector<std::uint8_t> forward_sysex;
+    void relay(std::uint32_t word,unsigned length){if(thru){std::vector<std::uint8_t> bytes(length);for(unsigned i=0;i<length;++i)bytes[i]=static_cast<std::uint8_t>(word>>(8*i));forward.push_back(std::move(bytes));}}
     void notify(std::deque<GuestCallback>& callbacks,std::uint64_t handle,unsigned msg,std::uint64_t param=0,std::uint32_t time=0)const{
         if(kind==0x30000)callbacks.push_back({target,{handle,msg,instance,param,time}});
         else if(kind==0x10000 || kind==0x20000)callbacks.push_back({target,{callback,msg,handle,param}});
@@ -25,7 +29,8 @@ struct WinmmMidiInput {
         if(packet.overflow){if(sysex)complete(memory,unit,callbacks,handle,true);notify(callbacks,handle,0x3c5,0,packet.milliseconds);running=status=count=needed=0;sysex=false;return;}
         for(const auto byte:packet.bytes){
             // 即時訊息不打斷 SysEx、running status 或尚未收完的短訊息。
-            if(byte>=0xf8){notify(callbacks,handle,byte==0xf9 || byte==0xfd?0x3c5:0x3c3,byte,packet.milliseconds);continue;}
+            if(byte>=0xf8){notify(callbacks,handle,byte==0xf9 || byte==0xfd?0x3c5:0x3c3,byte,packet.milliseconds);if(byte!=0xf9 && byte!=0xfd)relay(byte,1);continue;}
+            if(thru && (sysex || byte==0xf0)){if(byte>=0x80 && byte!=0xf0 && byte!=0xf7)forward_sysex.clear();else{forward_sysex.push_back(byte);if(byte==0xf7){forward.push_back(std::move(forward_sysex));forward_sysex.clear();}}}
             if(sysex){
                 if(byte>=0x80 && byte!=0xf7){complete(memory,unit,callbacks,handle,true);sysex=false;}
                 else {
@@ -38,25 +43,41 @@ struct WinmmMidiInput {
                 status=count=needed=0;running=byte<0xf0?byte:0;
                 if(byte==0xf0){sysex=true;if(!queue.empty()){auto& h=headers.at(queue.front());h.stamp=packet.milliseconds;memory.store(GuestAddress{h.data+h.used++},8,byte);if(h.used==h.size)complete(memory,unit,callbacks,handle);}continue;}
                 if(byte==0xf4 || byte==0xf5 || byte==0xf7){notify(callbacks,handle,0x3c5,byte,packet.milliseconds);continue;}
-                if(byte==0xf6){notify(callbacks,handle,0x3c3,byte,packet.milliseconds);continue;}
+                if(byte==0xf6){notify(callbacks,handle,0x3c3,byte,packet.milliseconds);relay(byte,1);continue;}
                 status=byte;needed=byte<0xf0?((byte&0xe0)==0xc0?1:2):(byte==0xf2?2:1);message=byte;stamp=packet.milliseconds;continue;
             }
             if(!status){if(!running){notify(callbacks,handle,0x3c5,byte,packet.milliseconds);continue;}status=running;needed=(status&0xe0)==0xc0?1:2;message=status;count=0;stamp=packet.milliseconds;}
             message|=static_cast<std::uint32_t>(byte)<<(8*(++count));
-            if(count==needed){notify(callbacks,handle,io_status && callbacks.size()>128?0x3cc:0x3c3,message,stamp);status=count=needed=0;}
+            if(count==needed){notify(callbacks,handle,io_status && callbacks.size()>128?0x3cc:0x3c3,message,stamp);relay(message,needed+1U);status=count=needed=0;}
         }
     }
 };
 bool WindowsServices::midi_input_waiting()const{for(const auto& [handle,input]:midi_inputs_){(void)handle;if(input->started)return true;}return false;}
 void WindowsServices::poll_midi_input(GuestMemory& memory){
     if(wave_callbacks_.size()>512)return;
-    for(auto& [handle,input]:midi_inputs_){if(wave_callbacks_.size()>512)break;if(input->started)for(const auto& packet:input->input->drain())input->consume(memory,x86_?4:8,wave_callbacks_,handle,packet);}
+    for(auto& [handle,input]:midi_inputs_){
+        if(wave_callbacks_.size()>512)break;if(input->started)for(const auto& packet:input->input->drain())input->consume(memory,x86_?4:8,wave_callbacks_,handle,packet);
+        for(const auto& message:input->forward)if(input->thru && !midi_thru(input->thru,message)){input->thru=0;input->forward_sysex.clear();}
+        input->forward.clear();
+    }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_midi_input(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const auto d=[&](unsigned n){return static_cast<std::uint32_t>(arg(n));};
     const std::uint8_t bits=x86_?32:64;const unsigned unit=bits/8,header_size=x86_?64:112,flags_offset=x86_?16:24;std::uint64_t result=0;
     try {
-        if(name=="midiInGetNumDevs")result=midi::input_devices().size();
+        if(name=="midiConnect" || name=="midiDisconnect"){
+            // (hmi, hmo, pReserved)：一個輸入只能連到一個輸出；已連線回報 MIDIERR_NOTREADY，未連線的中斷回報 MMSYSERR_INVALPARAM。
+            const auto found=midi_inputs_.find(arg(0));
+            if(arg(2))result=11;
+            else if(found==midi_inputs_.end() || !midi_output_open(arg(1)))result=5;
+            else if(name=="midiConnect"){if(found->second->thru)result=67;else found->second->thru=arg(1);}
+            else if(found->second->thru!=arg(1))result=11;
+            else {found->second->thru=0;found->second->forward.clear();found->second->forward_sysex.clear();}
+        }else if(name=="midiInMessage"){
+            // 驅動程式訊息：與 waveInMessage 共用 DRV_QUERY*／DRVM_MAPPER 處理；已開啟的 HMIDIIN 不接受系統查詢。
+            std::vector<std::u16string> ids;for(const auto& device:midi::input_devices())ids.push_back(u"{x64arm-midi-input}."+utf8_to_utf16_lossy(device.name));
+            result=wave::device_message(memory,arg(0),d(1),arg(2),arg(3),ids,midi_inputs_.contains(arg(0)),x86_);
+        }else if(name=="midiInGetNumDevs")result=midi::input_devices().size();
         else if(name.starts_with("midiInGetDevCaps")){
             const auto devices=midi::input_devices();auto index=arg(0);const auto opened=midi_inputs_.find(index);
             if(opened!=midi_inputs_.end()){index=devices.size();for(std::size_t i=0;i<devices.size();++i)if(devices[i].endpoint==opened->second->endpoint){index=i;break;}}

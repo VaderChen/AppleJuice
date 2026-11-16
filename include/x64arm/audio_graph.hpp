@@ -57,10 +57,10 @@ public:
     bool running() const;
     std::vector<Event> take_events();
     // 在客體回呼邊界停止。可回傳 0（BufferStart 先於讀樣本）；呼叫端派送事件後續跑。
-    std::size_t render_until_event(std::span<float>,unsigned);
+    std::size_t render_until_event(std::span<float>,unsigned,unsigned output_channels=2);
     void render(std::span<float>,unsigned) noexcept override;
 private:
     struct Impl;std::unique_ptr<Impl> impl_;
-    std::size_t render_frames(std::span<float>,unsigned,bool);
+    std::size_t render_frames(std::span<float>,unsigned,bool,unsigned output_channels=2);
 };
 }

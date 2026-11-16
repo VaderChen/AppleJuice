@@ -760,11 +760,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             if(left!=right){result=left<right?UINT32_MAX:1;break;}if(!left)break;
         }
     }else if(symbol=="wcsstr"){
-        const auto pattern=read_utf16(memory,GuestAddress{arg(1)});if(pattern.empty())result=arg(0);
-        else {const auto haystack=read_utf16(memory,GuestAddress{arg(0)});const auto at=haystack.find(pattern);if(at!=haystack.npos)result=arg(0)+at*2;}
+        // CRT 寬字串不是 Win32 路徑：逐單位比對，保留提早命中及未映射頁面的故障契約。
+        const auto next=[](std::uint64_t pointer){if(pointer>UINT64_MAX-2)throw MemoryFault(GuestAddress{pointer},Access::Read,2,"CRT 寬字串地址溢位");return pointer+2;};
+        if(!memory.load(GuestAddress{arg(1)},16))result=arg(0);
+        else for(auto start=arg(0);memory.load(GuestAddress{start},16);start=next(start)){
+            auto left=start,right=arg(1);
+            while(memory.load(GuestAddress{left},16)==memory.load(GuestAddress{right},16)){
+                left=next(left);right=next(right);if(!memory.load(GuestAddress{right},16)){result=start;break;}
+            }
+            if(result || !memory.load(GuestAddress{left},16))break;
+        }
     }else if(symbol=="wcschr" || symbol=="wcsrchr"){
-        const auto text=read_utf16(memory,GuestAddress{arg(0)});const auto character=static_cast<char16_t>(arg(1));
-        const auto at=!character?text.size():symbol=="wcschr"?text.find(character):text.rfind(character);if(at!=text.npos)result=arg(0)+at*2;
+        const auto character=static_cast<char16_t>(arg(1));
+        for(auto at=arg(0);;at+=2){const auto value=memory.load(GuestAddress{at},16);
+            if(value==character){result=at;if(symbol=="wcschr")break;}if(!value)break;
+            if(at>UINT64_MAX-2)throw MemoryFault(GuestAddress{at},Access::Read,2,"CRT 寬字串地址溢位");
+        }
     }else if(symbol.starts_with("GetUserName")){
         const bool wide=symbol.ends_with('W'),extended=symbol.starts_with("GetUserNameEx");const auto buffer=arg(extended?1:0),size=arg(extended?2:1);
         if(!size || (extended && !arg(0)))fail(87);

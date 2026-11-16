@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -23,6 +24,9 @@ struct Buffer {
     std::mutex mutex;
     std::vector<std::uint8_t> pcm;
     unsigned channels{2}, bits{16}, rate{44100}, frequency{44100};
+    unsigned channel_mask{};
+    // 空間混音前保留每個輸入聲道的獨立音量；未指定者為 1。
+    std::array<float,18> channel_gains=[] {std::array<float,18> result;result.fill(1);return result;}();
     double cursor{};
     float left{1}, right{1};
     bool playing{}, looping{}, streaming{}, floating{};
@@ -35,6 +39,10 @@ struct Buffer {
     std::vector<std::uint64_t> pending_notifications;
     float spatial_left{1}, spatial_right{1}, doppler{1};
     float spatial_distance{};
+    // DirectSound3D 的單聲道物件；座標已依遊戲聽者轉為右手相對方向。
+    bool spatial_object{},spatial_active{},native_spatial{};
+    std::array<float,3> spatial_position{0,0,-1};
+    float spatial_attenuation{1};
     std::vector<std::shared_ptr<Effect>> effects;
     bool capture_failed{};
     std::uint64_t captured_frames{};
@@ -50,6 +58,9 @@ struct Buffer {
     void stop(bool reset_effects=true); // 呼叫端持有 mutex；callback 只記錄事件。
     unsigned frame_bytes() const { return channels*(bits/8); }
     void render(std::span<float> stereo, unsigned output_rate);
+    // 輸出聲道數等於輸入聲道數時，保留 PCM 的聲道順序；立體聲入口仍共用相同游標與通知。
+    void render_channels(std::span<float>,unsigned output_rate,unsigned output_channels);
+    void process_spatial_output(std::span<float> stereo);
     void capture(std::span<const float> stereo,unsigned input_rate);
 };
 class Output {

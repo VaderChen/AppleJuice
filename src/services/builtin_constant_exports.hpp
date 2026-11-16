@@ -20,6 +20,8 @@ inline std::span<const msvcp_numeric::Constant> builtin_constant_exports(std::st
                 if(modern && (item.name.ends_with("Eps") || item.name=="_LZero"))continue;
                 out.push_back(item);
             }
+            // streamoff 的錯誤位置是 -1；VC14 仍為二進位相容保留真正的唯讀資料匯出。
+            if(modern)out.push_back({"?_BADOFF@std@@3_JB",UINT64_MAX,8});
             return out;
         };
         static const auto vc11=subset(false),vc14=subset(true);

@@ -1,5 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/audio_adpcm.hpp"
+#include "x64arm/unicode.hpp"
+#include <array>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -27,7 +29,7 @@ AudioStreamBasicDescription description(const Format& f){AudioStreamBasicDescrip
     else{const auto bits=f.adpcm?16U:f.bits;d.mFormatID=kAudioFormatLinearPCM;d.mFormatFlags=kAudioFormatFlagIsPacked|(f.tag==3?kAudioFormatFlagIsFloat:bits>8?kAudioFormatFlagIsSignedInteger:0);d.mBitsPerChannel=bits;d.mFramesPerPacket=1;d.mBytesPerFrame=d.mBytesPerPacket=f.adpcm?f.channels*2:f.align;}return d;}
 #endif
 struct Stream {
-    Format source,destination;std::map<std::uint64_t,std::pair<unsigned,unsigned>> headers;
+    Format source,destination;std::map<std::uint64_t,std::pair<unsigned,unsigned>> headers;std::uint64_t driver{};
     std::span<const std::uint8_t> input;std::vector<std::uint8_t> decoded;std::size_t cursor{},decoded_offset{};bool ending{},block_align{},direct_pcm{};
 #ifdef __APPLE__
     AudioConverterRef converter{};std::vector<std::uint8_t> retained;AudioStreamPacketDescription packet{};
@@ -121,21 +123,25 @@ struct Stream {
     }
 };
 }
-struct AcmState {std::map<std::uint64_t,std::shared_ptr<Stream>> streams;std::map<std::string_view,std::uint64_t> trace_calls;};
+// streams：HACMSTREAM；drivers：acmDriverOpen 發出的 HACMDRIVER→內建驅動程式索引；order／enabled：acmDriverPriority 調整的列舉順序與啟用狀態。
+struct AcmState {std::map<std::uint64_t,std::shared_ptr<Stream>> streams;std::map<std::string_view,std::uint64_t> trace_calls;
+    std::map<std::uint64_t,unsigned> drivers;std::vector<unsigned> order{0,1,2};std::array<bool,3> enabled{true,true,true};std::uint64_t next_driver=0x6c100000;};
 std::optional<std::uint32_t> WindowsServices::invoke_acm(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const auto d=[&](unsigned n){return static_cast<unsigned>(arg(n));};const std::uint8_t pointer_bits=x86_?32:64;std::uint32_t result=0;
     std::shared_ptr<Stream> traced;unsigned consumed_bytes=0,written_bytes=0;
     try{
         if(name=="acmGetVersion"){arg.return_to(state,0x04000000);return {};}
-        if(name=="acmMetrics"){if(!arg(2))throw AcmError{11};unsigned value=0;if(arg(0))throw AcmError{5};switch(d(1)){case 1:case 2:case 3:value=1;break;case 4:case 5:value=0;break;case 50:value=18+UINT16_MAX;break;default:throw AcmError{10};}memory.store(GuestAddress{arg(2)},32,value);}
-        else if(name=="acmFormatSuggest"){
-            if(arg(0))throw AcmError{5};const auto source=read_format(memory,arg(1));if(!arg(2) || d(3)<16)throw AcmError{11};if(d(4)&~0xf0000U)throw AcmError{10};const auto get=[&](unsigned at,std::uint8_t bits){return static_cast<unsigned>(memory.load(GuestAddress{arg(2)+at},bits));};
+#include "windows_acm_catalog.inc"
+        // had 可為 NULL 或 acmDriverOpen 的驅動程式；指定時來源格式須屬於該驅動程式。
+        const auto driver_accepts=[&](std::uint64_t had,unsigned tag){if(!had)return;if(!acm_ || !acm_->drivers.contains(had))throw AcmError{5};const auto index=acm_->drivers.at(had);if(index==0?tag!=1 && tag!=3:index==1?tag!=2:tag!=0x55)throw AcmError{512};};
+        if(name=="acmFormatSuggest"){
+            const auto source=read_format(memory,arg(1));driver_accepts(arg(0),source.tag);if(!arg(2) || d(3)<16)throw AcmError{11};if(d(4)&~0xf0000U)throw AcmError{10};const auto get=[&](unsigned at,std::uint8_t bits){return static_cast<unsigned>(memory.load(GuestAddress{arg(2)+at},bits));};
             const auto tag=d(4)&0x10000?get(0,16):1U,channels=d(4)&0x20000?get(2,16):source.channels,rate=d(4)&0x40000?get(4,32):source.rate,bits=d(4)&0x80000?get(14,16):16U;
             if(tag!=1 || !channels || channels>2 || rate<1000 || rate>384000 || (bits!=8 && bits!=16 && bits!=24 && bits!=32))throw AcmError{512};const auto align=channels*bits/8;memory.check(GuestAddress{arg(2)},std::min(d(3),18U),Access::Write);
             memory.store(GuestAddress{arg(2)},16,tag);memory.store(GuestAddress{arg(2)+2},16,channels);memory.store(GuestAddress{arg(2)+4},32,rate);memory.store(GuestAddress{arg(2)+8},32,rate*align);memory.store(GuestAddress{arg(2)+12},16,align);memory.store(GuestAddress{arg(2)+14},16,bits);if(d(3)>=18)memory.store(GuestAddress{arg(2)+16},16,0);
         }else if(name=="acmStreamOpen"){
-            if(d(7)&~7U)throw AcmError{10};if(arg(1))throw AcmError{5};if(arg(4) || (d(7)&2))throw AcmError{512};if(arg(5) || arg(6) || (!(d(7)&1) && !arg(0)))throw AcmError{11};if(arg(0))memory.store(GuestAddress{arg(0)},pointer_bits,0);
-            auto stream=std::make_shared<Stream>(read_format(memory,arg(2)),read_format(memory,arg(3)));traced=stream;if(!(d(7)&1)){if(!acm_)acm_=std::make_shared<AcmState>();if(acm_->streams.size()>=256)throw AcmError{4};const auto handle=runtime_.allocate_wait_handle();acm_->streams.emplace(handle,std::move(stream));memory.store(GuestAddress{arg(0)},pointer_bits,handle);}
+            if(d(7)&~7U)throw AcmError{10};if(arg(1) && (!acm_ || !acm_->drivers.contains(arg(1))))throw AcmError{5};if(arg(4) || (d(7)&2))throw AcmError{512};if(arg(5) || arg(6) || (!(d(7)&1) && !arg(0)))throw AcmError{11};if(arg(0))memory.store(GuestAddress{arg(0)},pointer_bits,0);
+            auto stream=std::make_shared<Stream>(read_format(memory,arg(2)),read_format(memory,arg(3)));traced=stream;driver_accepts(arg(1),stream->source.tag);stream->driver=arg(1);if(!(d(7)&1)){if(!acm_)acm_=std::make_shared<AcmState>();if(acm_->streams.size()>=256)throw AcmError{4};const auto handle=runtime_.allocate_wait_handle();acm_->streams.emplace(handle,std::move(stream));memory.store(GuestAddress{arg(0)},pointer_bits,handle);}
         }else{
             if(name=="acmStreamSize" && arg(2))memory.store(GuestAddress{arg(2)},32,0);if(!acm_ || !acm_->streams.contains(arg(0)))throw AcmError{5};auto stream=acm_->streams.at(arg(0));traced=stream;
             if(name=="acmStreamSize"){

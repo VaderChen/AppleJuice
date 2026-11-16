@@ -60,6 +60,7 @@ type Settings struct {
 	PresentInterpolation bool `json:"presentInterpolation,omitempty"`
 }
 type GlobalSettings struct {
+	SpatialHeadphones    bool              `json:"spatialHeadphones"`
 	CertificateRootsFile bool              `json:"certificateRootsFile"`
 	CertificateRootsPath string            `json:"certificateRootsPath"`
 	WindowsFont          string            `json:"windowsFont"`
@@ -76,6 +77,7 @@ type GlobalSettings struct {
 	Drives               map[string]string `json:"drives"`
 }
 type Library struct {
+	SpatialHeadphones    bool              `json:"spatialHeadphones"`
 	CertificateRootsFile bool              `json:"certificateRootsFile"`
 	CertificateRootsPath string            `json:"certificateRootsPath"`
 	WindowsFont          string            `json:"windowsFont"`
@@ -319,6 +321,7 @@ func NewApp(engine, dataDir, cDrive string) (*App, error) {
 	a.library.WindowsFont = normalizeWindowsFont(defaults.WindowsFont)
 	a.library.NativeLibraryBridge = defaults.NativeLibraryBridge
 	a.library.NativeV8Bridge = defaults.NativeV8Bridge
+	a.library.SpatialHeadphones = defaults.SpatialHeadphones
 	a.library.CertificateRootsFile = defaults.CertificateRootsFile
 	a.library.CertificateRootsPath, err = certificateRootsRelativePath(defaults.CertificateRootsPath)
 	if err != nil {
@@ -429,6 +432,7 @@ func (a *App) snapshotLocked() Snapshot {
 	s.GlobalSettings.CPUCoresX64, s.GlobalSettings.CPUCoresX86 = a.library.CPUCoresX64, a.library.CPUCoresX86
 	s.GlobalSettings.NativeLibraryBridge = a.library.NativeLibraryBridge
 	s.GlobalSettings.NativeV8Bridge = a.library.NativeV8Bridge
+	s.GlobalSettings.SpatialHeadphones = a.library.SpatialHeadphones
 	s.NativeV8Ready = a.nativeV8Host() != ""
 	s.NativeV8TestsReady = len(a.nativeV8Tests()) == 2
 	s.GlobalSettings.CompilerWorkers = a.library.CompilerWorkers
@@ -794,7 +798,7 @@ func validateGlobalSettings(settings GlobalSettings) (GlobalSettings, error) {
 	if err != nil {
 		return GlobalSettings{}, fmt.Errorf("C: 為必要設定：%w", err)
 	}
-	out := GlobalSettings{NativeV8Bridge: settings.NativeV8Bridge, NativeLibraryBridge: settings.NativeLibraryBridge, CompilerWorkers: settings.CompilerWorkers, CPUCoresX64: x64, CPUCoresX86: x86, OpenGLBackend: backend, CDrive: c, Drives: map[string]string{}, Language: language, Theme: theme}
+	out := GlobalSettings{SpatialHeadphones: settings.SpatialHeadphones, NativeV8Bridge: settings.NativeV8Bridge, NativeLibraryBridge: settings.NativeLibraryBridge, CompilerWorkers: settings.CompilerWorkers, CPUCoresX64: x64, CPUCoresX86: x86, OpenGLBackend: backend, CDrive: c, Drives: map[string]string{}, Language: language, Theme: theme}
 	out.WindowsFont = font
 	out.CPUDefaultsVersion = cpuDefaultsVersion
 	out.CertificateRootsFile, out.CertificateRootsPath = settings.CertificateRootsFile, certificatePath
@@ -829,6 +833,7 @@ func (a *App) SaveGlobalSettings(settings GlobalSettings) error {
 	}
 	a.library.NativeLibraryBridge = settings.NativeLibraryBridge
 	a.library.NativeV8Bridge = settings.NativeV8Bridge
+	a.library.SpatialHeadphones = settings.SpatialHeadphones
 	a.library.CertificateRootsFile, a.library.CertificateRootsPath = settings.CertificateRootsFile, settings.CertificateRootsPath
 	a.library.OpenGLBackend = settings.OpenGLBackend
 	a.library.CompilerWorkers = settings.CompilerWorkers

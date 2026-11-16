@@ -34,7 +34,7 @@ struct ModuleError : std::runtime_error {
     std::uint32_t code;
     ModuleError(std::uint32_t value,std::string message):std::runtime_error(std::move(message)),code(value){}
 };
-void module_event(std::vector<std::string>& events,std::string event){
+void module_event(DiagnosticEvents& events,std::string event){
     static const bool trace=[] {const auto* value=std::getenv("X64ARM_TRACE_MODULES");return value && std::string_view(value)=="1";}();
     // 致命錯誤視窗可能讓客體無法正常退出；診斷模式即時保留失敗原因。
     if(trace)std::fprintf(stderr,"module_event pid=%u %s\n",static_cast<unsigned>(getpid()),event.c_str());
@@ -960,7 +960,7 @@ std::pair<std::uint64_t,std::uint32_t> WindowsServices::load_kernel_image(GuestM
     catch(const std::bad_alloc&){for(auto it=created.rbegin();it!=created.rend();++it)unmap_module(memory,*it);return {0,8};}
 }
 std::string WindowsServices::module_diagnostics() const {
-    std::string output;for(const auto& event:runtime_.module_events)output+=event+'\n';return output;
+    return runtime_.module_events.render();
 }
 
 std::array<std::uint8_t,32> WindowsServices::image_identity(const std::filesystem::path& source,std::span<const std::uint8_t> bytes){
