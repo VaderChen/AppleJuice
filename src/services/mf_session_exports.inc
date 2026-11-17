@@ -16,7 +16,8 @@ if(name=="MFCreateMediaSession"){
     out(arg(0));const auto p=make(mf::Activate);object(p,mf::Activate)->identifier=5;put(arg(0),p,bits);
 }else if(name=="MFPutWorkItem" || name=="MFPutWorkItem2" || name=="MFPutWorkItemEx" || name=="MFPutWorkItemEx2"){
     // 工作佇列共用 MF 工作執行緒，由 poll_media_foundation 派送；Invoke 不在呼叫端執行緒重入。
-    const auto queue=d(0);require(queue<=8 || (queue&0xffff0000U)!=0,0xc00d36ffU);require(queue!=UINT32_MAX,0xc00d36ffU);
+    // 標準佇列（MFASYNC_CALLBACK_QUEUE_*）或仍有參照的使用者佇列；其他識別碼回報 MF_E_INVALID_WORKQUEUE。
+    const auto queue=d(0);require(queue<=8 || bridge.queues.contains(queue),0xc00d36ffU);
     const unsigned shift=name.ends_with('2')?1U:0U;std::uint64_t result_pointer=0;
     if(name.starts_with("MFPutWorkItemEx")){
         auto completion=object(arg(1+shift),mf::Async);require(completion->callback!=0);hold(arg(1+shift));result_pointer=arg(1+shift);
@@ -24,7 +25,7 @@ if(name=="MFCreateMediaSession"){
         require(arg(1+shift)!=0,pointer_error);(void)foreign_method(arg(1+shift),4);
         result_pointer=make(mf::Async);auto completion=object(result_pointer,mf::Async);hold(arg(1+shift));hold(arg(2+shift));completion->callback=arg(1+shift);completion->state=arg(2+shift);
     }
-    const auto callback=object(result_pointer,mf::Async)->callback;bridge.work_items.push_back({result_pointer,foreign_method(callback,4),callback});
+    const auto callback=object(result_pointer,mf::Async)->callback;bridge.work_items.push_back({result_pointer,foreign_method(callback,4),callback,queue});
 }else if(name=="SessionPump"){
     session_pump(object(arg(0),mf::Session),arg(0));
 }else if(name=="SessionPumpDone"){

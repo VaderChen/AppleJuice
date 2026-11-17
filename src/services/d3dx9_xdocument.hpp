@@ -69,4 +69,44 @@ public:
         return std::move(document_);
     }
 };
+// ID3DXFileData 節點（含子節點）依模板還原成 token 串流：數值、字串與分隔符號的順序與文字 X-file 相同，
+// 讓 D3DXLoadMeshFromXof／D3DXLoadSkinMeshFromXof 沿用 D3DXLoadMeshFromX 的 Mesh parser。參照節點展開成目標資料。
+inline void node_tokens(const Document& document,unsigned index,std::vector<Token>& out,unsigned depth=0){
+    const auto check=[](bool ok){if(!ok)throw std::invalid_argument("X-file 資料節點格式不符");};
+    check(depth<128 && index<document.nodes.size() && out.size()<64U*1024U*1024U);
+    const auto* node=&document.nodes[index];if(node->target!=UINT32_MAX){check(node->target<document.nodes.size());node=&document.nodes[node->target];}
+    const auto found=document.templates.find(node->type);check(found!=document.templates.end());
+    out.push_back({node->type});if(!node->name.empty())out.push_back({node->name});out.push_back({"{"});
+    const auto& bytes=node->bytes;std::size_t at=0;
+    const auto take=[&](std::size_t size){check(at<=bytes.size() && size<=bytes.size()-at);const auto start=at;at+=size;return start;};
+    const auto numeric=[](double value){Token token;token.number=value;token.numeric=true;return token;};
+    const std::map<std::string,std::pair<unsigned,bool>> integral{{"WORD",{2,false}},{"DWORD",{4,false}},{"CHAR",{1,true}},{"UCHAR",{1,false}},{"BYTE",{1,false}},{"SWORD",{2,true}},{"SDWORD",{4,true}}};
+    std::function<void(const Template&,unsigned)> members=[&](const Template& value,unsigned level){
+        check(level<128);std::map<std::string,std::uint64_t> integers;
+        for(const auto& member:value.members){
+            std::uint64_t count=1;
+            for(const auto& dimension:member.dimensions){
+                std::uint64_t size=0;if(dimension.numeric)size=static_cast<std::uint64_t>(dimension.number);else{check(integers.contains(dimension.text));size=integers.at(dimension.text);}
+                check(size<=16777216);count*=size;check(count<=16777216);
+            }
+            for(std::uint64_t i=0;i<count;++i){
+                const auto& type=member.type;
+                if(type=="STRING" || type=="LPSTR"){
+                    check(at<bytes.size());const auto begin=bytes.begin()+static_cast<std::ptrdiff_t>(at);const auto end=std::find(begin,bytes.end(),std::uint8_t{0});check(end!=bytes.end());
+                    out.push_back({std::string(begin,end)});at=static_cast<std::size_t>(end-bytes.begin())+1;
+                }else if(type=="FLOAT" || type=="float"){float number{};std::memcpy(&number,bytes.data()+take(4),4);out.push_back(numeric(number));}
+                else if(type=="DOUBLE" || type=="double"){double number{};std::memcpy(&number,bytes.data()+take(8),8);out.push_back(numeric(number));}
+                else if(const auto it=integral.find(type);it!=integral.end()){
+                    const auto [size,signed_value]=it->second;const auto start=take(size);std::uint64_t number=0;
+                    for(unsigned b=0;b<size;++b)number|=std::uint64_t{bytes[start+b]}<<(b*8);integers[member.name]=number;
+                    double shown=static_cast<double>(number);if(signed_value && (number>>(size*8-1)))shown-=std::ldexp(1.,static_cast<int>(size*8));out.push_back(numeric(shown));
+                }else{check(document.templates.contains(type));members(document.templates.at(type),level+1);}
+                out.push_back({";"});
+            }
+        }
+    };
+    members(found->second,0);check(at==bytes.size());
+    for(const auto child:node->children)node_tokens(document,child,out,depth+1);
+    out.push_back({"}"});
+}
 }

@@ -6,6 +6,8 @@ namespace x64arm::detail {
 // D3DX9 的版本 DLL 共用已實作的匯出 ABI；不載入系統目錄的可再散布二進位。
 // 只辨識正式的兩位數 SDK 版本，其他名稱仍交既有載入規則。
 constexpr std::string_view builtin_provider_family(std::string_view name){
+    // UWP 版 XInput 與桌面 1.4 共用完整控制器提供者、ABI、裝置狀態與錯誤契約。
+    if(name=="xinputuap.dll")return "xinput1_4.dll";
     if(name.size()==12 && name.starts_with("d3dx9_") && name.ends_with(".dll") &&
        name[6]>='0' && name[6]<='9' && name[7]>='0' && name[7]<='9'){
         const auto version=(name[6]-'0')*10+(name[7]-'0');
@@ -23,7 +25,8 @@ constexpr std::string_view builtin_provider_family(std::string_view name){
 constexpr std::string_view builtin_provider_export_family(std::string_view family,std::string_view symbol){
     // VC10～VC12 把 ConcRT 匯出放在 msvcr100／110／120，並行容器基底放在 msvcp100／110／120；同名匯出的物件版面與 concrt140 相同。
     if((family=="msvcr100.dll" || family=="msvcr110.dll" || family=="msvcr120.dll" || family=="msvcp100.dll" || family=="msvcp110.dll" || family=="msvcp120.dll") &&
-       symbol.find("@Concurrency@@")!=symbol.npos)return "concrt140.dll";
+       symbol.find("@Concurrency@@")!=symbol.npos && symbol.find("@platform@details@Concurrency@@")==symbol.npos)return "concrt140.dll";
+    // Concurrency::details::platform（執行緒識別碼等）在 VC14 移到 msvcp140，不屬 concrt140；由各自的別名對應。
     if(family=="imagehlp.dll"){
         constexpr std::array shared{"EnumerateLoadedModules","EnumerateLoadedModules64",
             "FindDebugInfoFile","FindDebugInfoFileEx","FindExecutableImage","FindExecutableImageEx",
@@ -39,4 +42,5 @@ static_assert(builtin_provider_family("d3dx9_29.dll")=="d3dx9_43.dll");
 static_assert(builtin_provider_family("d3dx9_23.dll")=="d3dx9_23.dll");
 static_assert(builtin_provider_family("msvcp80.dll")=="msvcp90.dll" && builtin_provider_family("msvcp100.dll")=="msvcp100.dll");
 static_assert(builtin_provider_export_family("imagehlp.dll","ImageAddCertificate")=="imagehlp.dll");
+static_assert(builtin_provider_export_family("msvcr120.dll","?GetCurrentThreadId@platform@details@Concurrency@@YAJXZ")=="msvcr120.dll");
 }

@@ -31,7 +31,7 @@ class AutomationGamepadBackend final : public input::Backend {
         if(::stat(path_.c_str(),&info)!=0){present_=false;return;}
         if(present_ && info.st_mtimespec.tv_sec==modified_.tv_sec && info.st_mtimespec.tv_nsec==modified_.tv_nsec)return;
         modified_=info.st_mtimespec;present_=true;
-        input::Gamepad pad{};pad.device=guid();pad.supported_buttons=0xf7ffU;pad.supported_triggers={true,true};pad.supported_sticks={true,true,true,true};
+        input::Gamepad pad{};pad.device=guid();pad.supported_buttons=0xf7ffU;pad.supported_triggers={true,true};pad.supported_sticks={true,true,true,true};pad.wireless=false;
         std::ifstream stream(path_);std::string token;
         while(stream>>token){
             const auto equal=token.find('=');if(equal==std::string::npos)continue;
@@ -55,6 +55,7 @@ public:
         std::lock_guard lock(mutex_);refresh();if(present_)pads.push_back(pad_);return pads;
     }
     std::uint32_t rumble(const input::Guid& device,std::uint16_t left,std::uint16_t right)override{return device==guid()?0:inner_->rumble(device,left,right);}
+    std::uint32_t vibrate(const input::Guid& device,const std::array<std::uint16_t,4>& motors)override{return device==guid()?0:inner_->vibrate(device,motors);}
     std::vector<input::PointerDevice> pointer_devices()override{return inner_->pointer_devices();}
     std::vector<input::PointerSample> pointer_samples()override{return inner_->pointer_samples();}
     std::uint32_t set_report(const input::Guid& device,unsigned id,std::span<const std::uint8_t> bytes)override{return inner_->set_report(device,id,bytes);}

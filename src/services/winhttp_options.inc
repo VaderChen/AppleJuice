@@ -2,13 +2,13 @@
 const bool setting=symbol=="WinHttpSetOption";const auto option=d(1);
 const bool timeout=option==2 || option==3 || option==5 || option==6;
 const unsigned timeout_index=option==2?0:option==3?1:option==5?2:3;
-const bool string=option==41 || option==0x1000 || option==0x1001;
+const bool string=option==41 || (option>=0x1000 && option<=0x1003);
 const bool pointer=option==1 || option==21 || option==45;
 const bool readonly=option==1 || option==9 || option==21;
 if(!timeout && !string && !pointer && option!=9 && option!=38 && option!=63 && option!=84 && option!=88 && option!=89 && option!=118)throw HttpError{12009};
 if(object.inet)throw HttpError{12018};
 if(!readonly && option!=45 && object.kind!=HttpHandle::Kind::Session && object.kind!=HttpHandle::Kind::Request)throw HttpError{12018};
-if(option==63 || option==0x1000 || option==0x1001)require(HttpHandle::Kind::Request);
+if(option==63 || (option>=0x1000 && option<=0x1003))require(HttpHandle::Kind::Request);
 if(setting){
     if(readonly)throw HttpError{12011};
     if(object.pending && option!=45)throw HttpError{12019};
@@ -24,7 +24,7 @@ if(setting){
                 std::erase_if(headers,[](const auto& h){return lower(h.first)=="user-agent";});
                 if(!agent.empty())headers.emplace_back("User-Agent",agent);object.input.headers=std::move(headers);}
             object.agent=std::move(agent);
-        }else (option==0x1000?object.input.username:object.input.password)=utf16_to_utf8(value);
+        }else (option==0x1000?object.input.username:option==0x1001?object.input.password:option==0x1002?object.input.proxy_username:object.input.proxy_password)=utf16_to_utf8(value);
     }else if(option==38){
         if(d(3)!=unit*3)throw HttpError{122};memory.check(GuestAddress{arg(2)},unit*3,Access::Read);
         const auto access=memory.load(GuestAddress{arg(2)},32);
@@ -60,7 +60,7 @@ if(setting){
 }else{
     if(!arg(3))throw HttpError{87};const auto capacity=memory.load(GuestAddress{arg(3)},32);memory.check(GuestAddress{arg(3)},4,Access::Write);
     std::vector<std::uint8_t> bytes;
-    if(string){const auto& value=option==41?object.agent:option==0x1000?object.input.username:object.input.password;
+    if(string){const auto& value=option==41?object.agent:option==0x1000?object.input.username:option==0x1001?object.input.password:option==0x1002?object.input.proxy_username:object.input.proxy_password;
         bytes=utf16_bytes(option==41?wide_latin(value):utf8_to_utf16(value));}
     else if(option==38)bytes.resize(unit*3);
     else{

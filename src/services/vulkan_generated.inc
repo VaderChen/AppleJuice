@@ -15,7 +15,9 @@
     X(vkCmdBeginRenderPass2) \
     X(vkCmdBeginRendering) \
     X(vkCmdBindDescriptorSets) \
+    X(vkCmdBindDescriptorSets2) \
     X(vkCmdBindIndexBuffer) \
+    X(vkCmdBindIndexBuffer2) \
     X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) \
     X(vkCmdBindVertexBuffers2) \
@@ -53,7 +55,11 @@
     X(vkCmdPipelineBarrier) \
     X(vkCmdPipelineBarrier2) \
     X(vkCmdPushConstants) \
+    X(vkCmdPushConstants2) \
     X(vkCmdPushDescriptorSet) \
+    X(vkCmdPushDescriptorSet2) \
+    X(vkCmdPushDescriptorSetWithTemplate) \
+    X(vkCmdPushDescriptorSetWithTemplate2) \
     X(vkCmdResetEvent) \
     X(vkCmdResetEvent2) \
     X(vkCmdResetQueryPool) \
@@ -72,12 +78,15 @@
     X(vkCmdSetEvent) \
     X(vkCmdSetEvent2) \
     X(vkCmdSetFrontFace) \
+    X(vkCmdSetLineStipple) \
     X(vkCmdSetLineWidth) \
     X(vkCmdSetLogicOpEXT) \
     X(vkCmdSetPatchControlPointsEXT) \
     X(vkCmdSetPrimitiveRestartEnable) \
     X(vkCmdSetPrimitiveTopology) \
     X(vkCmdSetRasterizerDiscardEnable) \
+    X(vkCmdSetRenderingAttachmentLocations) \
+    X(vkCmdSetRenderingInputAttachmentIndices) \
     X(vkCmdSetScissor) \
     X(vkCmdSetScissorWithCount) \
     X(vkCmdSetStencilCompareMask) \
@@ -92,6 +101,9 @@
     X(vkCmdWaitEvents2) \
     X(vkCmdWriteTimestamp) \
     X(vkCmdWriteTimestamp2) \
+    X(vkCopyImageToImage) \
+    X(vkCopyImageToMemory) \
+    X(vkCopyMemoryToImage) \
     X(vkCreateBuffer) \
     X(vkCreateBufferView) \
     X(vkCreateCommandPool) \
@@ -167,6 +179,7 @@
     X(vkGetDeviceGroupSurfacePresentModesKHR) \
     X(vkGetDeviceImageMemoryRequirements) \
     X(vkGetDeviceImageSparseMemoryRequirements) \
+    X(vkGetDeviceImageSubresourceLayout) \
     X(vkGetDeviceMemoryCommitment) \
     X(vkGetDeviceMemoryOpaqueCaptureAddress) \
     X(vkGetDeviceProcAddr) \
@@ -179,6 +192,7 @@
     X(vkGetImageSparseMemoryRequirements) \
     X(vkGetImageSparseMemoryRequirements2) \
     X(vkGetImageSubresourceLayout) \
+    X(vkGetImageSubresourceLayout2) \
     X(vkGetInstanceProcAddr) \
     X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) \
     X(vkGetPhysicalDeviceExternalBufferProperties) \
@@ -210,10 +224,12 @@
     X(vkGetPrivateData) \
     X(vkGetQueryPoolResults) \
     X(vkGetRenderAreaGranularity) \
+    X(vkGetRenderingAreaGranularity) \
     X(vkGetSemaphoreCounterValue) \
     X(vkGetSwapchainImagesKHR) \
     X(vkInvalidateMappedMemoryRanges) \
     X(vkMapMemory) \
+    X(vkMapMemory2) \
     X(vkMergePipelineCaches) \
     X(vkQueueBindSparse) \
     X(vkQueuePresentKHR) \
@@ -229,11 +245,116 @@
     X(vkSetEvent) \
     X(vkSetPrivateData) \
     X(vkSignalSemaphore) \
+    X(vkTransitionImageLayout) \
     X(vkTrimCommandPool) \
     X(vkUnmapMemory) \
+    X(vkUnmapMemory2) \
+    X(vkUpdateDescriptorSetWithTemplate) \
     X(vkUpdateDescriptorSets) \
     X(vkWaitForFences) \
     X(vkWaitSemaphores)
+
+#define X64ARM_VULKAN_ALIASES(X) \
+    X(vkBindBufferMemory2,"vkBindBufferMemory2KHR") \
+    X(vkBindImageMemory2,"vkBindImageMemory2KHR") \
+    X(vkCmdBeginRenderPass2,"vkCmdBeginRenderPass2KHR") \
+    X(vkCmdBeginRendering,"vkCmdBeginRenderingKHR") \
+    X(vkCmdBindDescriptorSets2,"vkCmdBindDescriptorSets2KHR") \
+    X(vkCmdBindIndexBuffer2,"vkCmdBindIndexBuffer2KHR") \
+    X(vkCmdBindVertexBuffers2,"vkCmdBindVertexBuffers2EXT") \
+    X(vkCmdBlitImage2,"vkCmdBlitImage2KHR") \
+    X(vkCmdCopyBuffer2,"vkCmdCopyBuffer2KHR") \
+    X(vkCmdCopyBufferToImage2,"vkCmdCopyBufferToImage2KHR") \
+    X(vkCmdCopyImage2,"vkCmdCopyImage2KHR") \
+    X(vkCmdCopyImageToBuffer2,"vkCmdCopyImageToBuffer2KHR") \
+    X(vkCmdDispatchBase,"vkCmdDispatchBaseKHR") \
+    X(vkCmdDrawIndexedIndirectCount,"vkCmdDrawIndexedIndirectCountAMD") \
+    X(vkCmdDrawIndexedIndirectCount,"vkCmdDrawIndexedIndirectCountKHR") \
+    X(vkCmdDrawIndirectCount,"vkCmdDrawIndirectCountAMD") \
+    X(vkCmdDrawIndirectCount,"vkCmdDrawIndirectCountKHR") \
+    X(vkCmdEndRenderPass2,"vkCmdEndRenderPass2KHR") \
+    X(vkCmdEndRendering,"vkCmdEndRenderingKHR") \
+    X(vkCmdNextSubpass2,"vkCmdNextSubpass2KHR") \
+    X(vkCmdPipelineBarrier2,"vkCmdPipelineBarrier2KHR") \
+    X(vkCmdPushConstants2,"vkCmdPushConstants2KHR") \
+    X(vkCmdPushDescriptorSet,"vkCmdPushDescriptorSetKHR") \
+    X(vkCmdPushDescriptorSet2,"vkCmdPushDescriptorSet2KHR") \
+    X(vkCmdPushDescriptorSetWithTemplate,"vkCmdPushDescriptorSetWithTemplateKHR") \
+    X(vkCmdPushDescriptorSetWithTemplate2,"vkCmdPushDescriptorSetWithTemplate2KHR") \
+    X(vkCmdResetEvent2,"vkCmdResetEvent2KHR") \
+    X(vkCmdResolveImage2,"vkCmdResolveImage2KHR") \
+    X(vkCmdSetCullMode,"vkCmdSetCullModeEXT") \
+    X(vkCmdSetDepthBiasEnable,"vkCmdSetDepthBiasEnableEXT") \
+    X(vkCmdSetDepthBoundsTestEnable,"vkCmdSetDepthBoundsTestEnableEXT") \
+    X(vkCmdSetDepthCompareOp,"vkCmdSetDepthCompareOpEXT") \
+    X(vkCmdSetDepthTestEnable,"vkCmdSetDepthTestEnableEXT") \
+    X(vkCmdSetDepthWriteEnable,"vkCmdSetDepthWriteEnableEXT") \
+    X(vkCmdSetDeviceMask,"vkCmdSetDeviceMaskKHR") \
+    X(vkCmdSetEvent2,"vkCmdSetEvent2KHR") \
+    X(vkCmdSetFrontFace,"vkCmdSetFrontFaceEXT") \
+    X(vkCmdSetLineStipple,"vkCmdSetLineStippleEXT") \
+    X(vkCmdSetLineStipple,"vkCmdSetLineStippleKHR") \
+    X(vkCmdSetPrimitiveRestartEnable,"vkCmdSetPrimitiveRestartEnableEXT") \
+    X(vkCmdSetPrimitiveTopology,"vkCmdSetPrimitiveTopologyEXT") \
+    X(vkCmdSetRasterizerDiscardEnable,"vkCmdSetRasterizerDiscardEnableEXT") \
+    X(vkCmdSetRenderingAttachmentLocations,"vkCmdSetRenderingAttachmentLocationsKHR") \
+    X(vkCmdSetRenderingInputAttachmentIndices,"vkCmdSetRenderingInputAttachmentIndicesKHR") \
+    X(vkCmdSetScissorWithCount,"vkCmdSetScissorWithCountEXT") \
+    X(vkCmdSetStencilOp,"vkCmdSetStencilOpEXT") \
+    X(vkCmdSetStencilTestEnable,"vkCmdSetStencilTestEnableEXT") \
+    X(vkCmdSetViewportWithCount,"vkCmdSetViewportWithCountEXT") \
+    X(vkCmdWaitEvents2,"vkCmdWaitEvents2KHR") \
+    X(vkCmdWriteTimestamp2,"vkCmdWriteTimestamp2KHR") \
+    X(vkCopyImageToImage,"vkCopyImageToImageEXT") \
+    X(vkCopyImageToMemory,"vkCopyImageToMemoryEXT") \
+    X(vkCopyMemoryToImage,"vkCopyMemoryToImageEXT") \
+    X(vkCreateDescriptorUpdateTemplate,"vkCreateDescriptorUpdateTemplateKHR") \
+    X(vkCreatePrivateDataSlot,"vkCreatePrivateDataSlotEXT") \
+    X(vkCreateRenderPass2,"vkCreateRenderPass2KHR") \
+    X(vkCreateSamplerYcbcrConversion,"vkCreateSamplerYcbcrConversionKHR") \
+    X(vkDestroyDescriptorUpdateTemplate,"vkDestroyDescriptorUpdateTemplateKHR") \
+    X(vkDestroyPrivateDataSlot,"vkDestroyPrivateDataSlotEXT") \
+    X(vkDestroySamplerYcbcrConversion,"vkDestroySamplerYcbcrConversionKHR") \
+    X(vkEnumeratePhysicalDeviceGroups,"vkEnumeratePhysicalDeviceGroupsKHR") \
+    X(vkGetBufferDeviceAddress,"vkGetBufferDeviceAddressEXT") \
+    X(vkGetBufferDeviceAddress,"vkGetBufferDeviceAddressKHR") \
+    X(vkGetBufferMemoryRequirements2,"vkGetBufferMemoryRequirements2KHR") \
+    X(vkGetBufferOpaqueCaptureAddress,"vkGetBufferOpaqueCaptureAddressKHR") \
+    X(vkGetDescriptorSetLayoutSupport,"vkGetDescriptorSetLayoutSupportKHR") \
+    X(vkGetDeviceBufferMemoryRequirements,"vkGetDeviceBufferMemoryRequirementsKHR") \
+    X(vkGetDeviceGroupPeerMemoryFeatures,"vkGetDeviceGroupPeerMemoryFeaturesKHR") \
+    X(vkGetDeviceImageMemoryRequirements,"vkGetDeviceImageMemoryRequirementsKHR") \
+    X(vkGetDeviceImageSparseMemoryRequirements,"vkGetDeviceImageSparseMemoryRequirementsKHR") \
+    X(vkGetDeviceImageSubresourceLayout,"vkGetDeviceImageSubresourceLayoutKHR") \
+    X(vkGetDeviceMemoryOpaqueCaptureAddress,"vkGetDeviceMemoryOpaqueCaptureAddressKHR") \
+    X(vkGetImageMemoryRequirements2,"vkGetImageMemoryRequirements2KHR") \
+    X(vkGetImageSparseMemoryRequirements2,"vkGetImageSparseMemoryRequirements2KHR") \
+    X(vkGetImageSubresourceLayout2,"vkGetImageSubresourceLayout2EXT") \
+    X(vkGetImageSubresourceLayout2,"vkGetImageSubresourceLayout2KHR") \
+    X(vkGetPhysicalDeviceExternalBufferProperties,"vkGetPhysicalDeviceExternalBufferPropertiesKHR") \
+    X(vkGetPhysicalDeviceExternalFenceProperties,"vkGetPhysicalDeviceExternalFencePropertiesKHR") \
+    X(vkGetPhysicalDeviceExternalSemaphoreProperties,"vkGetPhysicalDeviceExternalSemaphorePropertiesKHR") \
+    X(vkGetPhysicalDeviceFeatures2,"vkGetPhysicalDeviceFeatures2KHR") \
+    X(vkGetPhysicalDeviceFormatProperties2,"vkGetPhysicalDeviceFormatProperties2KHR") \
+    X(vkGetPhysicalDeviceImageFormatProperties2,"vkGetPhysicalDeviceImageFormatProperties2KHR") \
+    X(vkGetPhysicalDeviceMemoryProperties2,"vkGetPhysicalDeviceMemoryProperties2KHR") \
+    X(vkGetPhysicalDeviceProperties2,"vkGetPhysicalDeviceProperties2KHR") \
+    X(vkGetPhysicalDeviceQueueFamilyProperties2,"vkGetPhysicalDeviceQueueFamilyProperties2KHR") \
+    X(vkGetPhysicalDeviceSparseImageFormatProperties2,"vkGetPhysicalDeviceSparseImageFormatProperties2KHR") \
+    X(vkGetPhysicalDeviceToolProperties,"vkGetPhysicalDeviceToolPropertiesEXT") \
+    X(vkGetPrivateData,"vkGetPrivateDataEXT") \
+    X(vkGetRenderingAreaGranularity,"vkGetRenderingAreaGranularityKHR") \
+    X(vkGetSemaphoreCounterValue,"vkGetSemaphoreCounterValueKHR") \
+    X(vkMapMemory2,"vkMapMemory2KHR") \
+    X(vkQueueSubmit2,"vkQueueSubmit2KHR") \
+    X(vkResetQueryPool,"vkResetQueryPoolEXT") \
+    X(vkSetPrivateData,"vkSetPrivateDataEXT") \
+    X(vkSignalSemaphore,"vkSignalSemaphoreKHR") \
+    X(vkTransitionImageLayout,"vkTransitionImageLayoutEXT") \
+    X(vkTrimCommandPool,"vkTrimCommandPoolKHR") \
+    X(vkUnmapMemory2,"vkUnmapMemory2KHR") \
+    X(vkUpdateDescriptorSetWithTemplate,"vkUpdateDescriptorSetWithTemplateKHR") \
+    X(vkWaitSemaphores,"vkWaitSemaphoresKHR")
 
 #ifdef X64ARM_VULKAN_STRUCTS
 template<class T> constexpr bool vulkan_dispatchable=false;
@@ -39863,7 +39984,9 @@ constexpr WindowsServiceDescriptor vulkan_descriptors[]={
     {"vulkan-1.dll","vkCmdBeginRendering",2,0x0u,0,0x0u},
     {"vulkan-1.dll","vkCmdBeginRenderingKHR",2,0x0u,0,0x0u},
     {"vulkan-1.dll","vkCmdBindDescriptorSets",8,0x4u,0,0x5au},
+    {"vulkan-1.dll","vkCmdBindDescriptorSets2",2,0x0u,0,0x0u},
     {"vulkan-1.dll","vkCmdBindIndexBuffer",4,0x6u,0,0x8u},
+    {"vulkan-1.dll","vkCmdBindIndexBuffer2",5,0xeu,0,0x10u},
     {"vulkan-1.dll","vkCmdBindPipeline",3,0x4u,0,0x2u},
     {"vulkan-1.dll","vkCmdBindVertexBuffers",5,0x0u,0,0x6u},
     {"vulkan-1.dll","vkCmdBindVertexBuffers2",7,0x0u,0,0x6u},
@@ -39912,7 +40035,13 @@ constexpr WindowsServiceDescriptor vulkan_descriptors[]={
     {"vulkan-1.dll","vkCmdPipelineBarrier2",2,0x0u,0,0x0u},
     {"vulkan-1.dll","vkCmdPipelineBarrier2KHR",2,0x0u,0,0x0u},
     {"vulkan-1.dll","vkCmdPushConstants",6,0x2u,0,0x1cu},
+    {"vulkan-1.dll","vkCmdPushConstants2",2,0x0u,0,0x0u},
+    {"vulkan-1.dll","vkCmdPushDescriptorSet",6,0x4u,0,0x1au},
     {"vulkan-1.dll","vkCmdPushDescriptorSetKHR",6,0x4u,0,0x1au},
+    {"vulkan-1.dll","vkCmdPushDescriptorSet2",2,0x0u,0,0x0u},
+    {"vulkan-1.dll","vkCmdPushDescriptorSetWithTemplate",5,0x6u,0,0x8u},
+    {"vulkan-1.dll","vkCmdPushDescriptorSetWithTemplateKHR",5,0x6u,0,0x8u},
+    {"vulkan-1.dll","vkCmdPushDescriptorSetWithTemplate2",2,0x0u,0,0x0u},
     {"vulkan-1.dll","vkCmdResetEvent",3,0x2u,0,0x4u},
     {"vulkan-1.dll","vkCmdResetEvent2",3,0x6u,0,0x0u},
     {"vulkan-1.dll","vkCmdResetEvent2KHR",3,0x6u,0,0x0u},
@@ -39942,6 +40071,7 @@ constexpr WindowsServiceDescriptor vulkan_descriptors[]={
     {"vulkan-1.dll","vkCmdSetEvent2KHR",3,0x2u,0,0x0u},
     {"vulkan-1.dll","vkCmdSetFrontFace",2,0x0u,0,0x2u},
     {"vulkan-1.dll","vkCmdSetFrontFaceEXT",2,0x0u,0,0x2u},
+    {"vulkan-1.dll","vkCmdSetLineStipple",3,0x0u,0,0x6u},
     {"vulkan-1.dll","vkCmdSetLineWidth",2,0x0u,0,0x2u},
     {"vulkan-1.dll","vkCmdSetLogicOpEXT",2,0x0u,0,0x2u},
     {"vulkan-1.dll","vkCmdSetPatchControlPointsEXT",2,0x0u,0,0x2u},
@@ -39951,6 +40081,8 @@ constexpr WindowsServiceDescriptor vulkan_descriptors[]={
     {"vulkan-1.dll","vkCmdSetPrimitiveTopologyEXT",2,0x0u,0,0x2u},
     {"vulkan-1.dll","vkCmdSetRasterizerDiscardEnable",2,0x0u,0,0x2u},
     {"vulkan-1.dll","vkCmdSetRasterizerDiscardEnableEXT",2,0x0u,0,0x2u},
+    {"vulkan-1.dll","vkCmdSetRenderingAttachmentLocations",2,0x0u,0,0x0u},
+    {"vulkan-1.dll","vkCmdSetRenderingInputAttachmentIndices",2,0x0u,0,0x0u},
     {"vulkan-1.dll","vkCmdSetScissor",4,0x0u,0,0x6u},
     {"vulkan-1.dll","vkCmdSetScissorWithCount",3,0x0u,0,0x2u},
     {"vulkan-1.dll","vkCmdSetScissorWithCountEXT",3,0x0u,0,0x2u},
@@ -39971,6 +40103,9 @@ constexpr WindowsServiceDescriptor vulkan_descriptors[]={
     {"vulkan-1.dll","vkCmdWriteTimestamp",4,0x4u,0,0xau},
     {"vulkan-1.dll","vkCmdWriteTimestamp2",4,0x6u,0,0x8u},
     {"vulkan-1.dll","vkCmdWriteTimestamp2KHR",4,0x6u,0,0x8u},
+    {"vulkan-1.dll","vkCopyImageToImage",2,0x0u,0,0x0u},
+    {"vulkan-1.dll","vkCopyImageToMemory",2,0x0u,0,0x0u},
+    {"vulkan-1.dll","vkCopyMemoryToImage",2,0x0u,0,0x0u},
     {"vulkan-1.dll","vkCreateBuffer",4,0x0u,0,0x0u},
     {"vulkan-1.dll","vkCreateBufferView",4,0x0u,0,0x0u},
     {"vulkan-1.dll","vkCreateCommandPool",4,0x0u,0,0x0u},
@@ -40063,6 +40198,7 @@ constexpr WindowsServiceDescriptor vulkan_descriptors[]={
     {"vulkan-1.dll","vkGetDeviceImageMemoryRequirementsKHR",3,0x0u,0,0x0u},
     {"vulkan-1.dll","vkGetDeviceImageSparseMemoryRequirements",4,0x0u,0,0x0u},
     {"vulkan-1.dll","vkGetDeviceImageSparseMemoryRequirementsKHR",4,0x0u,0,0x0u},
+    {"vulkan-1.dll","vkGetDeviceImageSubresourceLayout",3,0x0u,0,0x0u},
     {"vulkan-1.dll","vkGetDeviceMemoryCommitment",3,0x2u,0,0x0u},
     {"vulkan-1.dll","vkGetDeviceMemoryOpaqueCaptureAddress",2,0x0u,0,0x0u},
     {"vulkan-1.dll","vkGetDeviceMemoryOpaqueCaptureAddressKHR",2,0x0u,0,0x0u},
@@ -40078,6 +40214,7 @@ constexpr WindowsServiceDescriptor vulkan_descriptors[]={
     {"vulkan-1.dll","vkGetImageSparseMemoryRequirements2",4,0x0u,0,0x0u},
     {"vulkan-1.dll","vkGetImageSparseMemoryRequirements2KHR",4,0x0u,0,0x0u},
     {"vulkan-1.dll","vkGetImageSubresourceLayout",4,0x2u,0,0x0u},
+    {"vulkan-1.dll","vkGetImageSubresourceLayout2",4,0x2u,0,0x0u},
     {"vulkan-1.dll","vkGetInstanceProcAddr",2,0x0u,0,0x0u},
     {"vulkan-1.dll","vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR",3,0x0u,0,0x0u},
     {"vulkan-1.dll","vkGetPhysicalDeviceExternalBufferProperties",3,0x0u,0,0x0u},
@@ -40122,11 +40259,13 @@ constexpr WindowsServiceDescriptor vulkan_descriptors[]={
     {"vulkan-1.dll","vkGetPrivateDataEXT",5,0xcu,0,0x2u},
     {"vulkan-1.dll","vkGetQueryPoolResults",8,0x42u,0,0x8cu},
     {"vulkan-1.dll","vkGetRenderAreaGranularity",3,0x2u,0,0x0u},
+    {"vulkan-1.dll","vkGetRenderingAreaGranularity",3,0x0u,0,0x0u},
     {"vulkan-1.dll","vkGetSemaphoreCounterValue",3,0x2u,0,0x0u},
     {"vulkan-1.dll","vkGetSemaphoreCounterValueKHR",3,0x2u,0,0x0u},
     {"vulkan-1.dll","vkGetSwapchainImagesKHR",4,0x2u,0,0x0u},
     {"vulkan-1.dll","vkInvalidateMappedMemoryRanges",3,0x0u,0,0x2u},
     {"vulkan-1.dll","vkMapMemory",6,0xeu,0,0x10u},
+    {"vulkan-1.dll","vkMapMemory2",3,0x0u,0,0x0u},
     {"vulkan-1.dll","vkMergePipelineCaches",4,0x2u,0,0x4u},
     {"vulkan-1.dll","vkQueueBindSparse",4,0x8u,0,0x2u},
     {"vulkan-1.dll","vkQueuePresentKHR",2,0x0u,0,0x0u},
@@ -40146,9 +40285,13 @@ constexpr WindowsServiceDescriptor vulkan_descriptors[]={
     {"vulkan-1.dll","vkSetPrivateDataEXT",5,0x1cu,0,0x2u},
     {"vulkan-1.dll","vkSignalSemaphore",2,0x0u,0,0x0u},
     {"vulkan-1.dll","vkSignalSemaphoreKHR",2,0x0u,0,0x0u},
+    {"vulkan-1.dll","vkTransitionImageLayout",3,0x0u,0,0x2u},
     {"vulkan-1.dll","vkTrimCommandPool",3,0x2u,0,0x4u},
     {"vulkan-1.dll","vkTrimCommandPoolKHR",3,0x2u,0,0x4u},
     {"vulkan-1.dll","vkUnmapMemory",2,0x2u,0,0x0u},
+    {"vulkan-1.dll","vkUnmapMemory2",2,0x0u,0,0x0u},
+    {"vulkan-1.dll","vkUpdateDescriptorSetWithTemplate",4,0x6u,0,0x0u},
+    {"vulkan-1.dll","vkUpdateDescriptorSetWithTemplateKHR",4,0x6u,0,0x0u},
     {"vulkan-1.dll","vkUpdateDescriptorSets",5,0x0u,0,0xau},
     {"vulkan-1.dll","vkWaitForFences",5,0x10u,0,0xau},
     {"vulkan-1.dll","vkWaitSemaphores",3,0x4u,0,0x0u},
@@ -40176,296 +40319,318 @@ constexpr VulkanCommandName vulkan_command_names[]={
     {"vkCmdBeginRendering",13},
     {"vkCmdBeginRenderingKHR",13},
     {"vkCmdBindDescriptorSets",14},
-    {"vkCmdBindIndexBuffer",15},
-    {"vkCmdBindPipeline",16},
-    {"vkCmdBindVertexBuffers",17},
-    {"vkCmdBindVertexBuffers2",18},
-    {"vkCmdBindVertexBuffers2EXT",18},
-    {"vkCmdBlitImage",19},
-    {"vkCmdBlitImage2",20},
-    {"vkCmdBlitImage2KHR",20},
-    {"vkCmdClearAttachments",21},
-    {"vkCmdClearColorImage",22},
-    {"vkCmdClearDepthStencilImage",23},
-    {"vkCmdCopyBuffer",24},
-    {"vkCmdCopyBuffer2",25},
-    {"vkCmdCopyBuffer2KHR",25},
-    {"vkCmdCopyBufferToImage",26},
-    {"vkCmdCopyBufferToImage2",27},
-    {"vkCmdCopyBufferToImage2KHR",27},
-    {"vkCmdCopyImage",28},
-    {"vkCmdCopyImage2",29},
-    {"vkCmdCopyImage2KHR",29},
-    {"vkCmdCopyImageToBuffer",30},
-    {"vkCmdCopyImageToBuffer2",31},
-    {"vkCmdCopyImageToBuffer2KHR",31},
-    {"vkCmdCopyQueryPoolResults",32},
-    {"vkCmdDispatch",33},
-    {"vkCmdDispatchBase",34},
-    {"vkCmdDispatchBaseKHR",34},
-    {"vkCmdDispatchIndirect",35},
-    {"vkCmdDraw",36},
-    {"vkCmdDrawIndexed",37},
-    {"vkCmdDrawIndexedIndirect",38},
-    {"vkCmdDrawIndexedIndirectCount",39},
-    {"vkCmdDrawIndirect",40},
-    {"vkCmdDrawIndirectCount",41},
-    {"vkCmdEndQuery",42},
-    {"vkCmdEndRenderPass",43},
-    {"vkCmdEndRenderPass2",44},
-    {"vkCmdEndRenderPass2KHR",44},
-    {"vkCmdEndRendering",45},
-    {"vkCmdEndRenderingKHR",45},
-    {"vkCmdExecuteCommands",46},
-    {"vkCmdFillBuffer",47},
-    {"vkCmdNextSubpass",48},
-    {"vkCmdNextSubpass2",49},
-    {"vkCmdNextSubpass2KHR",49},
-    {"vkCmdPipelineBarrier",50},
-    {"vkCmdPipelineBarrier2",51},
-    {"vkCmdPipelineBarrier2KHR",51},
-    {"vkCmdPushConstants",52},
-    {"vkCmdPushDescriptorSetKHR",53},
-    {"vkCmdResetEvent",54},
-    {"vkCmdResetEvent2",55},
-    {"vkCmdResetEvent2KHR",55},
-    {"vkCmdResetQueryPool",56},
-    {"vkCmdResolveImage",57},
-    {"vkCmdResolveImage2",58},
-    {"vkCmdResolveImage2KHR",58},
-    {"vkCmdSetBlendConstants",59},
-    {"vkCmdSetCullMode",60},
-    {"vkCmdSetCullModeEXT",60},
-    {"vkCmdSetDepthBias",61},
-    {"vkCmdSetDepthBiasEnable",62},
-    {"vkCmdSetDepthBiasEnableEXT",62},
-    {"vkCmdSetDepthBounds",63},
-    {"vkCmdSetDepthBoundsTestEnable",64},
-    {"vkCmdSetDepthBoundsTestEnableEXT",64},
-    {"vkCmdSetDepthCompareOp",65},
-    {"vkCmdSetDepthCompareOpEXT",65},
-    {"vkCmdSetDepthTestEnable",66},
-    {"vkCmdSetDepthTestEnableEXT",66},
-    {"vkCmdSetDepthWriteEnable",67},
-    {"vkCmdSetDepthWriteEnableEXT",67},
-    {"vkCmdSetDeviceMask",68},
-    {"vkCmdSetDeviceMaskKHR",68},
-    {"vkCmdSetEvent",69},
-    {"vkCmdSetEvent2",70},
-    {"vkCmdSetEvent2KHR",70},
-    {"vkCmdSetFrontFace",71},
-    {"vkCmdSetFrontFaceEXT",71},
-    {"vkCmdSetLineWidth",72},
-    {"vkCmdSetLogicOpEXT",73},
-    {"vkCmdSetPatchControlPointsEXT",74},
-    {"vkCmdSetPrimitiveRestartEnable",75},
-    {"vkCmdSetPrimitiveRestartEnableEXT",75},
-    {"vkCmdSetPrimitiveTopology",76},
-    {"vkCmdSetPrimitiveTopologyEXT",76},
-    {"vkCmdSetRasterizerDiscardEnable",77},
-    {"vkCmdSetRasterizerDiscardEnableEXT",77},
-    {"vkCmdSetScissor",78},
-    {"vkCmdSetScissorWithCount",79},
-    {"vkCmdSetScissorWithCountEXT",79},
-    {"vkCmdSetStencilCompareMask",80},
-    {"vkCmdSetStencilOp",81},
-    {"vkCmdSetStencilOpEXT",81},
-    {"vkCmdSetStencilReference",82},
-    {"vkCmdSetStencilTestEnable",83},
-    {"vkCmdSetStencilTestEnableEXT",83},
-    {"vkCmdSetStencilWriteMask",84},
-    {"vkCmdSetViewport",85},
-    {"vkCmdSetViewportWithCount",86},
-    {"vkCmdSetViewportWithCountEXT",86},
-    {"vkCmdUpdateBuffer",87},
-    {"vkCmdWaitEvents",88},
-    {"vkCmdWaitEvents2",89},
-    {"vkCmdWaitEvents2KHR",89},
-    {"vkCmdWriteTimestamp",90},
-    {"vkCmdWriteTimestamp2",91},
-    {"vkCmdWriteTimestamp2KHR",91},
-    {"vkCreateBuffer",92},
-    {"vkCreateBufferView",93},
-    {"vkCreateCommandPool",94},
-    {"vkCreateComputePipelines",95},
-    {"vkCreateDescriptorPool",96},
-    {"vkCreateDescriptorSetLayout",97},
-    {"vkCreateDescriptorUpdateTemplate",98},
-    {"vkCreateDescriptorUpdateTemplateKHR",98},
-    {"vkCreateDevice",99},
-    {"vkCreateEvent",100},
-    {"vkCreateFence",101},
-    {"vkCreateFramebuffer",102},
-    {"vkCreateGraphicsPipelines",103},
-    {"vkCreateImage",104},
-    {"vkCreateImageView",105},
-    {"vkCreateInstance",106},
-    {"vkCreatePipelineCache",107},
-    {"vkCreatePipelineLayout",108},
-    {"vkCreatePrivateDataSlot",109},
-    {"vkCreatePrivateDataSlotEXT",109},
-    {"vkCreateQueryPool",110},
-    {"vkCreateRenderPass",111},
-    {"vkCreateRenderPass2",112},
-    {"vkCreateRenderPass2KHR",112},
-    {"vkCreateSampler",113},
-    {"vkCreateSamplerYcbcrConversion",114},
-    {"vkCreateSamplerYcbcrConversionKHR",114},
-    {"vkCreateSemaphore",115},
-    {"vkCreateShaderModule",116},
-    {"vkCreateSwapchainKHR",117},
-    {"vkCreateWin32SurfaceKHR",118},
-    {"vkDestroyBuffer",119},
-    {"vkDestroyBufferView",120},
-    {"vkDestroyCommandPool",121},
-    {"vkDestroyDescriptorPool",122},
-    {"vkDestroyDescriptorSetLayout",123},
-    {"vkDestroyDescriptorUpdateTemplate",124},
-    {"vkDestroyDescriptorUpdateTemplateKHR",124},
-    {"vkDestroyDevice",125},
-    {"vkDestroyEvent",126},
-    {"vkDestroyFence",127},
-    {"vkDestroyFramebuffer",128},
-    {"vkDestroyImage",129},
-    {"vkDestroyImageView",130},
-    {"vkDestroyInstance",131},
-    {"vkDestroyPipeline",132},
-    {"vkDestroyPipelineCache",133},
-    {"vkDestroyPipelineLayout",134},
-    {"vkDestroyPrivateDataSlot",135},
-    {"vkDestroyPrivateDataSlotEXT",135},
-    {"vkDestroyQueryPool",136},
-    {"vkDestroyRenderPass",137},
-    {"vkDestroySampler",138},
-    {"vkDestroySamplerYcbcrConversion",139},
-    {"vkDestroySamplerYcbcrConversionKHR",139},
-    {"vkDestroySemaphore",140},
-    {"vkDestroyShaderModule",141},
-    {"vkDestroySurfaceKHR",142},
-    {"vkDestroySwapchainKHR",143},
-    {"vkDeviceWaitIdle",144},
-    {"vkEndCommandBuffer",145},
-    {"vkEnumerateDeviceExtensionProperties",146},
-    {"vkEnumerateDeviceLayerProperties",147},
-    {"vkEnumerateInstanceExtensionProperties",148},
-    {"vkEnumerateInstanceLayerProperties",149},
-    {"vkEnumerateInstanceVersion",150},
-    {"vkEnumeratePhysicalDeviceGroups",151},
-    {"vkEnumeratePhysicalDeviceGroupsKHR",151},
-    {"vkEnumeratePhysicalDevices",152},
-    {"vkFlushMappedMemoryRanges",153},
-    {"vkFreeCommandBuffers",154},
-    {"vkFreeDescriptorSets",155},
-    {"vkFreeMemory",156},
-    {"vkGetBufferDeviceAddress",157},
-    {"vkGetBufferDeviceAddressKHR",157},
-    {"vkGetBufferMemoryRequirements",158},
-    {"vkGetBufferMemoryRequirements2",159},
-    {"vkGetBufferMemoryRequirements2KHR",159},
-    {"vkGetBufferOpaqueCaptureAddress",160},
-    {"vkGetBufferOpaqueCaptureAddressKHR",160},
-    {"vkGetDescriptorSetLayoutSupport",161},
-    {"vkGetDescriptorSetLayoutSupportKHR",161},
-    {"vkGetDeviceBufferMemoryRequirements",162},
-    {"vkGetDeviceBufferMemoryRequirementsKHR",162},
-    {"vkGetDeviceGroupPeerMemoryFeatures",163},
-    {"vkGetDeviceGroupPeerMemoryFeaturesKHR",163},
-    {"vkGetDeviceGroupPresentCapabilitiesKHR",164},
-    {"vkGetDeviceGroupSurfacePresentModesKHR",165},
-    {"vkGetDeviceImageMemoryRequirements",166},
-    {"vkGetDeviceImageMemoryRequirementsKHR",166},
-    {"vkGetDeviceImageSparseMemoryRequirements",167},
-    {"vkGetDeviceImageSparseMemoryRequirementsKHR",167},
-    {"vkGetDeviceMemoryCommitment",168},
-    {"vkGetDeviceMemoryOpaqueCaptureAddress",169},
-    {"vkGetDeviceMemoryOpaqueCaptureAddressKHR",169},
-    {"vkGetDeviceProcAddr",170},
-    {"vkGetDeviceQueue",171},
-    {"vkGetDeviceQueue2",172},
-    {"vkGetEventStatus",173},
-    {"vkGetFenceStatus",174},
-    {"vkGetImageMemoryRequirements",175},
-    {"vkGetImageMemoryRequirements2",176},
-    {"vkGetImageMemoryRequirements2KHR",176},
-    {"vkGetImageSparseMemoryRequirements",177},
-    {"vkGetImageSparseMemoryRequirements2",178},
-    {"vkGetImageSparseMemoryRequirements2KHR",178},
-    {"vkGetImageSubresourceLayout",179},
-    {"vkGetInstanceProcAddr",180},
-    {"vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR",181},
-    {"vkGetPhysicalDeviceExternalBufferProperties",182},
-    {"vkGetPhysicalDeviceExternalBufferPropertiesKHR",182},
-    {"vkGetPhysicalDeviceExternalFenceProperties",183},
-    {"vkGetPhysicalDeviceExternalFencePropertiesKHR",183},
-    {"vkGetPhysicalDeviceExternalSemaphoreProperties",184},
-    {"vkGetPhysicalDeviceExternalSemaphorePropertiesKHR",184},
-    {"vkGetPhysicalDeviceFeatures",185},
-    {"vkGetPhysicalDeviceFeatures2",186},
-    {"vkGetPhysicalDeviceFeatures2KHR",186},
-    {"vkGetPhysicalDeviceFormatProperties",187},
-    {"vkGetPhysicalDeviceFormatProperties2",188},
-    {"vkGetPhysicalDeviceFormatProperties2KHR",188},
-    {"vkGetPhysicalDeviceImageFormatProperties",189},
-    {"vkGetPhysicalDeviceImageFormatProperties2",190},
-    {"vkGetPhysicalDeviceImageFormatProperties2KHR",190},
-    {"vkGetPhysicalDeviceMemoryProperties",191},
-    {"vkGetPhysicalDeviceMemoryProperties2",192},
-    {"vkGetPhysicalDeviceMemoryProperties2KHR",192},
-    {"vkGetPhysicalDevicePresentRectanglesKHR",193},
-    {"vkGetPhysicalDeviceProperties",194},
-    {"vkGetPhysicalDeviceProperties2",195},
-    {"vkGetPhysicalDeviceProperties2KHR",195},
-    {"vkGetPhysicalDeviceQueueFamilyProperties",196},
-    {"vkGetPhysicalDeviceQueueFamilyProperties2",197},
-    {"vkGetPhysicalDeviceQueueFamilyProperties2KHR",197},
-    {"vkGetPhysicalDeviceSparseImageFormatProperties",198},
-    {"vkGetPhysicalDeviceSparseImageFormatProperties2",199},
-    {"vkGetPhysicalDeviceSparseImageFormatProperties2KHR",199},
-    {"vkGetPhysicalDeviceSurfaceCapabilities2KHR",200},
-    {"vkGetPhysicalDeviceSurfaceCapabilitiesKHR",201},
-    {"vkGetPhysicalDeviceSurfaceFormats2KHR",202},
-    {"vkGetPhysicalDeviceSurfaceFormatsKHR",203},
-    {"vkGetPhysicalDeviceSurfacePresentModesKHR",204},
-    {"vkGetPhysicalDeviceSurfaceSupportKHR",205},
-    {"vkGetPhysicalDeviceToolProperties",206},
-    {"vkGetPhysicalDeviceToolPropertiesEXT",206},
-    {"vkGetPhysicalDeviceWin32PresentationSupportKHR",207},
-    {"vkGetPipelineCacheData",208},
-    {"vkGetPrivateData",209},
-    {"vkGetPrivateDataEXT",209},
-    {"vkGetQueryPoolResults",210},
-    {"vkGetRenderAreaGranularity",211},
-    {"vkGetSemaphoreCounterValue",212},
-    {"vkGetSemaphoreCounterValueKHR",212},
-    {"vkGetSwapchainImagesKHR",213},
-    {"vkInvalidateMappedMemoryRanges",214},
-    {"vkMapMemory",215},
-    {"vkMergePipelineCaches",216},
-    {"vkQueueBindSparse",217},
-    {"vkQueuePresentKHR",218},
-    {"vkQueueSubmit",219},
-    {"vkQueueSubmit2",220},
-    {"vkQueueSubmit2KHR",220},
-    {"vkQueueWaitIdle",221},
-    {"vkResetCommandBuffer",222},
-    {"vkResetCommandPool",223},
-    {"vkResetDescriptorPool",224},
-    {"vkResetEvent",225},
-    {"vkResetFences",226},
-    {"vkResetQueryPool",227},
-    {"vkResetQueryPoolEXT",227},
-    {"vkSetEvent",228},
-    {"vkSetPrivateData",229},
-    {"vkSetPrivateDataEXT",229},
-    {"vkSignalSemaphore",230},
-    {"vkSignalSemaphoreKHR",230},
-    {"vkTrimCommandPool",231},
-    {"vkTrimCommandPoolKHR",231},
-    {"vkUnmapMemory",232},
-    {"vkUpdateDescriptorSets",233},
-    {"vkWaitForFences",234},
-    {"vkWaitSemaphores",235},
-    {"vkWaitSemaphoresKHR",235},
+    {"vkCmdBindDescriptorSets2",15},
+    {"vkCmdBindIndexBuffer",16},
+    {"vkCmdBindIndexBuffer2",17},
+    {"vkCmdBindPipeline",18},
+    {"vkCmdBindVertexBuffers",19},
+    {"vkCmdBindVertexBuffers2",20},
+    {"vkCmdBindVertexBuffers2EXT",20},
+    {"vkCmdBlitImage",21},
+    {"vkCmdBlitImage2",22},
+    {"vkCmdBlitImage2KHR",22},
+    {"vkCmdClearAttachments",23},
+    {"vkCmdClearColorImage",24},
+    {"vkCmdClearDepthStencilImage",25},
+    {"vkCmdCopyBuffer",26},
+    {"vkCmdCopyBuffer2",27},
+    {"vkCmdCopyBuffer2KHR",27},
+    {"vkCmdCopyBufferToImage",28},
+    {"vkCmdCopyBufferToImage2",29},
+    {"vkCmdCopyBufferToImage2KHR",29},
+    {"vkCmdCopyImage",30},
+    {"vkCmdCopyImage2",31},
+    {"vkCmdCopyImage2KHR",31},
+    {"vkCmdCopyImageToBuffer",32},
+    {"vkCmdCopyImageToBuffer2",33},
+    {"vkCmdCopyImageToBuffer2KHR",33},
+    {"vkCmdCopyQueryPoolResults",34},
+    {"vkCmdDispatch",35},
+    {"vkCmdDispatchBase",36},
+    {"vkCmdDispatchBaseKHR",36},
+    {"vkCmdDispatchIndirect",37},
+    {"vkCmdDraw",38},
+    {"vkCmdDrawIndexed",39},
+    {"vkCmdDrawIndexedIndirect",40},
+    {"vkCmdDrawIndexedIndirectCount",41},
+    {"vkCmdDrawIndirect",42},
+    {"vkCmdDrawIndirectCount",43},
+    {"vkCmdEndQuery",44},
+    {"vkCmdEndRenderPass",45},
+    {"vkCmdEndRenderPass2",46},
+    {"vkCmdEndRenderPass2KHR",46},
+    {"vkCmdEndRendering",47},
+    {"vkCmdEndRenderingKHR",47},
+    {"vkCmdExecuteCommands",48},
+    {"vkCmdFillBuffer",49},
+    {"vkCmdNextSubpass",50},
+    {"vkCmdNextSubpass2",51},
+    {"vkCmdNextSubpass2KHR",51},
+    {"vkCmdPipelineBarrier",52},
+    {"vkCmdPipelineBarrier2",53},
+    {"vkCmdPipelineBarrier2KHR",53},
+    {"vkCmdPushConstants",54},
+    {"vkCmdPushConstants2",55},
+    {"vkCmdPushDescriptorSet",56},
+    {"vkCmdPushDescriptorSetKHR",56},
+    {"vkCmdPushDescriptorSet2",57},
+    {"vkCmdPushDescriptorSetWithTemplate",58},
+    {"vkCmdPushDescriptorSetWithTemplateKHR",58},
+    {"vkCmdPushDescriptorSetWithTemplate2",59},
+    {"vkCmdResetEvent",60},
+    {"vkCmdResetEvent2",61},
+    {"vkCmdResetEvent2KHR",61},
+    {"vkCmdResetQueryPool",62},
+    {"vkCmdResolveImage",63},
+    {"vkCmdResolveImage2",64},
+    {"vkCmdResolveImage2KHR",64},
+    {"vkCmdSetBlendConstants",65},
+    {"vkCmdSetCullMode",66},
+    {"vkCmdSetCullModeEXT",66},
+    {"vkCmdSetDepthBias",67},
+    {"vkCmdSetDepthBiasEnable",68},
+    {"vkCmdSetDepthBiasEnableEXT",68},
+    {"vkCmdSetDepthBounds",69},
+    {"vkCmdSetDepthBoundsTestEnable",70},
+    {"vkCmdSetDepthBoundsTestEnableEXT",70},
+    {"vkCmdSetDepthCompareOp",71},
+    {"vkCmdSetDepthCompareOpEXT",71},
+    {"vkCmdSetDepthTestEnable",72},
+    {"vkCmdSetDepthTestEnableEXT",72},
+    {"vkCmdSetDepthWriteEnable",73},
+    {"vkCmdSetDepthWriteEnableEXT",73},
+    {"vkCmdSetDeviceMask",74},
+    {"vkCmdSetDeviceMaskKHR",74},
+    {"vkCmdSetEvent",75},
+    {"vkCmdSetEvent2",76},
+    {"vkCmdSetEvent2KHR",76},
+    {"vkCmdSetFrontFace",77},
+    {"vkCmdSetFrontFaceEXT",77},
+    {"vkCmdSetLineStipple",78},
+    {"vkCmdSetLineWidth",79},
+    {"vkCmdSetLogicOpEXT",80},
+    {"vkCmdSetPatchControlPointsEXT",81},
+    {"vkCmdSetPrimitiveRestartEnable",82},
+    {"vkCmdSetPrimitiveRestartEnableEXT",82},
+    {"vkCmdSetPrimitiveTopology",83},
+    {"vkCmdSetPrimitiveTopologyEXT",83},
+    {"vkCmdSetRasterizerDiscardEnable",84},
+    {"vkCmdSetRasterizerDiscardEnableEXT",84},
+    {"vkCmdSetRenderingAttachmentLocations",85},
+    {"vkCmdSetRenderingInputAttachmentIndices",86},
+    {"vkCmdSetScissor",87},
+    {"vkCmdSetScissorWithCount",88},
+    {"vkCmdSetScissorWithCountEXT",88},
+    {"vkCmdSetStencilCompareMask",89},
+    {"vkCmdSetStencilOp",90},
+    {"vkCmdSetStencilOpEXT",90},
+    {"vkCmdSetStencilReference",91},
+    {"vkCmdSetStencilTestEnable",92},
+    {"vkCmdSetStencilTestEnableEXT",92},
+    {"vkCmdSetStencilWriteMask",93},
+    {"vkCmdSetViewport",94},
+    {"vkCmdSetViewportWithCount",95},
+    {"vkCmdSetViewportWithCountEXT",95},
+    {"vkCmdUpdateBuffer",96},
+    {"vkCmdWaitEvents",97},
+    {"vkCmdWaitEvents2",98},
+    {"vkCmdWaitEvents2KHR",98},
+    {"vkCmdWriteTimestamp",99},
+    {"vkCmdWriteTimestamp2",100},
+    {"vkCmdWriteTimestamp2KHR",100},
+    {"vkCopyImageToImage",101},
+    {"vkCopyImageToMemory",102},
+    {"vkCopyMemoryToImage",103},
+    {"vkCreateBuffer",104},
+    {"vkCreateBufferView",105},
+    {"vkCreateCommandPool",106},
+    {"vkCreateComputePipelines",107},
+    {"vkCreateDescriptorPool",108},
+    {"vkCreateDescriptorSetLayout",109},
+    {"vkCreateDescriptorUpdateTemplate",110},
+    {"vkCreateDescriptorUpdateTemplateKHR",110},
+    {"vkCreateDevice",111},
+    {"vkCreateEvent",112},
+    {"vkCreateFence",113},
+    {"vkCreateFramebuffer",114},
+    {"vkCreateGraphicsPipelines",115},
+    {"vkCreateImage",116},
+    {"vkCreateImageView",117},
+    {"vkCreateInstance",118},
+    {"vkCreatePipelineCache",119},
+    {"vkCreatePipelineLayout",120},
+    {"vkCreatePrivateDataSlot",121},
+    {"vkCreatePrivateDataSlotEXT",121},
+    {"vkCreateQueryPool",122},
+    {"vkCreateRenderPass",123},
+    {"vkCreateRenderPass2",124},
+    {"vkCreateRenderPass2KHR",124},
+    {"vkCreateSampler",125},
+    {"vkCreateSamplerYcbcrConversion",126},
+    {"vkCreateSamplerYcbcrConversionKHR",126},
+    {"vkCreateSemaphore",127},
+    {"vkCreateShaderModule",128},
+    {"vkCreateSwapchainKHR",129},
+    {"vkCreateWin32SurfaceKHR",130},
+    {"vkDestroyBuffer",131},
+    {"vkDestroyBufferView",132},
+    {"vkDestroyCommandPool",133},
+    {"vkDestroyDescriptorPool",134},
+    {"vkDestroyDescriptorSetLayout",135},
+    {"vkDestroyDescriptorUpdateTemplate",136},
+    {"vkDestroyDescriptorUpdateTemplateKHR",136},
+    {"vkDestroyDevice",137},
+    {"vkDestroyEvent",138},
+    {"vkDestroyFence",139},
+    {"vkDestroyFramebuffer",140},
+    {"vkDestroyImage",141},
+    {"vkDestroyImageView",142},
+    {"vkDestroyInstance",143},
+    {"vkDestroyPipeline",144},
+    {"vkDestroyPipelineCache",145},
+    {"vkDestroyPipelineLayout",146},
+    {"vkDestroyPrivateDataSlot",147},
+    {"vkDestroyPrivateDataSlotEXT",147},
+    {"vkDestroyQueryPool",148},
+    {"vkDestroyRenderPass",149},
+    {"vkDestroySampler",150},
+    {"vkDestroySamplerYcbcrConversion",151},
+    {"vkDestroySamplerYcbcrConversionKHR",151},
+    {"vkDestroySemaphore",152},
+    {"vkDestroyShaderModule",153},
+    {"vkDestroySurfaceKHR",154},
+    {"vkDestroySwapchainKHR",155},
+    {"vkDeviceWaitIdle",156},
+    {"vkEndCommandBuffer",157},
+    {"vkEnumerateDeviceExtensionProperties",158},
+    {"vkEnumerateDeviceLayerProperties",159},
+    {"vkEnumerateInstanceExtensionProperties",160},
+    {"vkEnumerateInstanceLayerProperties",161},
+    {"vkEnumerateInstanceVersion",162},
+    {"vkEnumeratePhysicalDeviceGroups",163},
+    {"vkEnumeratePhysicalDeviceGroupsKHR",163},
+    {"vkEnumeratePhysicalDevices",164},
+    {"vkFlushMappedMemoryRanges",165},
+    {"vkFreeCommandBuffers",166},
+    {"vkFreeDescriptorSets",167},
+    {"vkFreeMemory",168},
+    {"vkGetBufferDeviceAddress",169},
+    {"vkGetBufferDeviceAddressKHR",169},
+    {"vkGetBufferMemoryRequirements",170},
+    {"vkGetBufferMemoryRequirements2",171},
+    {"vkGetBufferMemoryRequirements2KHR",171},
+    {"vkGetBufferOpaqueCaptureAddress",172},
+    {"vkGetBufferOpaqueCaptureAddressKHR",172},
+    {"vkGetDescriptorSetLayoutSupport",173},
+    {"vkGetDescriptorSetLayoutSupportKHR",173},
+    {"vkGetDeviceBufferMemoryRequirements",174},
+    {"vkGetDeviceBufferMemoryRequirementsKHR",174},
+    {"vkGetDeviceGroupPeerMemoryFeatures",175},
+    {"vkGetDeviceGroupPeerMemoryFeaturesKHR",175},
+    {"vkGetDeviceGroupPresentCapabilitiesKHR",176},
+    {"vkGetDeviceGroupSurfacePresentModesKHR",177},
+    {"vkGetDeviceImageMemoryRequirements",178},
+    {"vkGetDeviceImageMemoryRequirementsKHR",178},
+    {"vkGetDeviceImageSparseMemoryRequirements",179},
+    {"vkGetDeviceImageSparseMemoryRequirementsKHR",179},
+    {"vkGetDeviceImageSubresourceLayout",180},
+    {"vkGetDeviceMemoryCommitment",181},
+    {"vkGetDeviceMemoryOpaqueCaptureAddress",182},
+    {"vkGetDeviceMemoryOpaqueCaptureAddressKHR",182},
+    {"vkGetDeviceProcAddr",183},
+    {"vkGetDeviceQueue",184},
+    {"vkGetDeviceQueue2",185},
+    {"vkGetEventStatus",186},
+    {"vkGetFenceStatus",187},
+    {"vkGetImageMemoryRequirements",188},
+    {"vkGetImageMemoryRequirements2",189},
+    {"vkGetImageMemoryRequirements2KHR",189},
+    {"vkGetImageSparseMemoryRequirements",190},
+    {"vkGetImageSparseMemoryRequirements2",191},
+    {"vkGetImageSparseMemoryRequirements2KHR",191},
+    {"vkGetImageSubresourceLayout",192},
+    {"vkGetImageSubresourceLayout2",193},
+    {"vkGetInstanceProcAddr",194},
+    {"vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR",195},
+    {"vkGetPhysicalDeviceExternalBufferProperties",196},
+    {"vkGetPhysicalDeviceExternalBufferPropertiesKHR",196},
+    {"vkGetPhysicalDeviceExternalFenceProperties",197},
+    {"vkGetPhysicalDeviceExternalFencePropertiesKHR",197},
+    {"vkGetPhysicalDeviceExternalSemaphoreProperties",198},
+    {"vkGetPhysicalDeviceExternalSemaphorePropertiesKHR",198},
+    {"vkGetPhysicalDeviceFeatures",199},
+    {"vkGetPhysicalDeviceFeatures2",200},
+    {"vkGetPhysicalDeviceFeatures2KHR",200},
+    {"vkGetPhysicalDeviceFormatProperties",201},
+    {"vkGetPhysicalDeviceFormatProperties2",202},
+    {"vkGetPhysicalDeviceFormatProperties2KHR",202},
+    {"vkGetPhysicalDeviceImageFormatProperties",203},
+    {"vkGetPhysicalDeviceImageFormatProperties2",204},
+    {"vkGetPhysicalDeviceImageFormatProperties2KHR",204},
+    {"vkGetPhysicalDeviceMemoryProperties",205},
+    {"vkGetPhysicalDeviceMemoryProperties2",206},
+    {"vkGetPhysicalDeviceMemoryProperties2KHR",206},
+    {"vkGetPhysicalDevicePresentRectanglesKHR",207},
+    {"vkGetPhysicalDeviceProperties",208},
+    {"vkGetPhysicalDeviceProperties2",209},
+    {"vkGetPhysicalDeviceProperties2KHR",209},
+    {"vkGetPhysicalDeviceQueueFamilyProperties",210},
+    {"vkGetPhysicalDeviceQueueFamilyProperties2",211},
+    {"vkGetPhysicalDeviceQueueFamilyProperties2KHR",211},
+    {"vkGetPhysicalDeviceSparseImageFormatProperties",212},
+    {"vkGetPhysicalDeviceSparseImageFormatProperties2",213},
+    {"vkGetPhysicalDeviceSparseImageFormatProperties2KHR",213},
+    {"vkGetPhysicalDeviceSurfaceCapabilities2KHR",214},
+    {"vkGetPhysicalDeviceSurfaceCapabilitiesKHR",215},
+    {"vkGetPhysicalDeviceSurfaceFormats2KHR",216},
+    {"vkGetPhysicalDeviceSurfaceFormatsKHR",217},
+    {"vkGetPhysicalDeviceSurfacePresentModesKHR",218},
+    {"vkGetPhysicalDeviceSurfaceSupportKHR",219},
+    {"vkGetPhysicalDeviceToolProperties",220},
+    {"vkGetPhysicalDeviceToolPropertiesEXT",220},
+    {"vkGetPhysicalDeviceWin32PresentationSupportKHR",221},
+    {"vkGetPipelineCacheData",222},
+    {"vkGetPrivateData",223},
+    {"vkGetPrivateDataEXT",223},
+    {"vkGetQueryPoolResults",224},
+    {"vkGetRenderAreaGranularity",225},
+    {"vkGetRenderingAreaGranularity",226},
+    {"vkGetSemaphoreCounterValue",227},
+    {"vkGetSemaphoreCounterValueKHR",227},
+    {"vkGetSwapchainImagesKHR",228},
+    {"vkInvalidateMappedMemoryRanges",229},
+    {"vkMapMemory",230},
+    {"vkMapMemory2",231},
+    {"vkMergePipelineCaches",232},
+    {"vkQueueBindSparse",233},
+    {"vkQueuePresentKHR",234},
+    {"vkQueueSubmit",235},
+    {"vkQueueSubmit2",236},
+    {"vkQueueSubmit2KHR",236},
+    {"vkQueueWaitIdle",237},
+    {"vkResetCommandBuffer",238},
+    {"vkResetCommandPool",239},
+    {"vkResetDescriptorPool",240},
+    {"vkResetEvent",241},
+    {"vkResetFences",242},
+    {"vkResetQueryPool",243},
+    {"vkResetQueryPoolEXT",243},
+    {"vkSetEvent",244},
+    {"vkSetPrivateData",245},
+    {"vkSetPrivateDataEXT",245},
+    {"vkSignalSemaphore",246},
+    {"vkSignalSemaphoreKHR",246},
+    {"vkTransitionImageLayout",247},
+    {"vkTrimCommandPool",248},
+    {"vkTrimCommandPoolKHR",248},
+    {"vkUnmapMemory",249},
+    {"vkUnmapMemory2",250},
+    {"vkUpdateDescriptorSetWithTemplate",251},
+    {"vkUpdateDescriptorSetWithTemplateKHR",251},
+    {"vkUpdateDescriptorSets",252},
+    {"vkWaitForFences",253},
+    {"vkWaitSemaphores",254},
+    {"vkWaitSemaphoresKHR",254},
 };
 #endif
 #ifdef X64ARM_VULKAN_HANDLERS
@@ -40558,20 +40723,33 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a7=static_cast<const uint32_t*>(c.in_array(7,static_cast<std::size_t>(a6),4,A_BYTES));
         c.fn().vkCmdBindDescriptorSets(a0,a1,a2,a3,a4,a5,a6,a7);c.finish();return c.done(0);
     }
-    case 15: { // vkCmdBindIndexBuffer
+    case 15: { // vkCmdBindDescriptorSets2
+        const auto a0=c.handle<VkCommandBuffer>(0);
+        auto* a1=static_cast<const VkBindDescriptorSetsInfo*>(c.in_struct(1,53,1));
+        c.fn().vkCmdBindDescriptorSets2(a0,a1);c.finish();return c.done(0);
+    }
+    case 16: { // vkCmdBindIndexBuffer
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkBuffer>(1);
         const auto a2=static_cast<VkDeviceSize>(c.u64(2));
         const auto a3=static_cast<VkIndexType>(c.u32(3));
         c.fn().vkCmdBindIndexBuffer(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 16: { // vkCmdBindPipeline
+    case 17: { // vkCmdBindIndexBuffer2
+        const auto a0=c.handle<VkCommandBuffer>(0);
+        const auto a1=c.handle<VkBuffer>(1);
+        const auto a2=static_cast<VkDeviceSize>(c.u64(2));
+        const auto a3=static_cast<VkDeviceSize>(c.u64(3));
+        const auto a4=static_cast<VkIndexType>(c.u32(4));
+        c.fn().vkCmdBindIndexBuffer2(a0,a1,a2,a3,a4);c.finish();return c.done(0);
+    }
+    case 18: { // vkCmdBindPipeline
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkPipelineBindPoint>(c.u32(1));
         const auto a2=c.handle<VkPipeline>(2);
         c.fn().vkCmdBindPipeline(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 17: { // vkCmdBindVertexBuffers
+    case 19: { // vkCmdBindVertexBuffers
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
@@ -40579,7 +40757,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a4=static_cast<const VkDeviceSize*>(c.in_array(4,static_cast<std::size_t>(a2),8,A_BYTES));
         c.fn().vkCmdBindVertexBuffers(a0,a1,a2,a3,a4);c.finish();return c.done(0);
     }
-    case 18: { // vkCmdBindVertexBuffers2
+    case 20: { // vkCmdBindVertexBuffers2
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
@@ -40589,7 +40767,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a6=static_cast<const VkDeviceSize*>(c.in_array(6,static_cast<std::size_t>(a2),8,A_BYTES));
         c.fn().vkCmdBindVertexBuffers2(a0,a1,a2,a3,a4,a5,a6);c.finish();return c.done(0);
     }
-    case 19: { // vkCmdBlitImage
+    case 21: { // vkCmdBlitImage
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkImage>(1);
         const auto a2=static_cast<VkImageLayout>(c.u32(2));
@@ -40600,12 +40778,12 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a7=static_cast<VkFilter>(c.u32(7));
         c.fn().vkCmdBlitImage(a0,a1,a2,a3,a4,a5,a6,a7);c.finish();return c.done(0);
     }
-    case 20: { // vkCmdBlitImage2
+    case 22: { // vkCmdBlitImage2
         const auto a0=c.handle<VkCommandBuffer>(0);
         auto* a1=static_cast<const VkBlitImageInfo2*>(c.in_struct(1,73,1));
         c.fn().vkCmdBlitImage2(a0,a1);c.finish();return c.done(0);
     }
-    case 21: { // vkCmdClearAttachments
+    case 23: { // vkCmdClearAttachments
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkClearAttachment*>(c.in_struct(2,93,a1));
@@ -40613,7 +40791,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a4=static_cast<const VkClearRect*>(c.in_struct(4,96,a3));
         c.fn().vkCmdClearAttachments(a0,a1,a2,a3,a4);c.finish();return c.done(0);
     }
-    case 22: { // vkCmdClearColorImage
+    case 24: { // vkCmdClearColorImage
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkImage>(1);
         const auto a2=static_cast<VkImageLayout>(c.u32(2));
@@ -40622,7 +40800,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a5=static_cast<const VkImageSubresourceRange*>(c.in_struct(5,408,a4));
         c.fn().vkCmdClearColorImage(a0,a1,a2,a3,a4,a5);c.finish();return c.done(0);
     }
-    case 23: { // vkCmdClearDepthStencilImage
+    case 25: { // vkCmdClearDepthStencilImage
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkImage>(1);
         const auto a2=static_cast<VkImageLayout>(c.u32(2));
@@ -40631,7 +40809,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a5=static_cast<const VkImageSubresourceRange*>(c.in_struct(5,408,a4));
         c.fn().vkCmdClearDepthStencilImage(a0,a1,a2,a3,a4,a5);c.finish();return c.done(0);
     }
-    case 24: { // vkCmdCopyBuffer
+    case 26: { // vkCmdCopyBuffer
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkBuffer>(1);
         const auto a2=c.handle<VkBuffer>(2);
@@ -40639,12 +40817,12 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a4=static_cast<const VkBufferCopy*>(c.in_struct(4,75,a3));
         c.fn().vkCmdCopyBuffer(a0,a1,a2,a3,a4);c.finish();return c.done(0);
     }
-    case 25: { // vkCmdCopyBuffer2
+    case 27: { // vkCmdCopyBuffer2
         const auto a0=c.handle<VkCommandBuffer>(0);
         auto* a1=static_cast<const VkCopyBufferInfo2*>(c.in_struct(1,139,1));
         c.fn().vkCmdCopyBuffer2(a0,a1);c.finish();return c.done(0);
     }
-    case 26: { // vkCmdCopyBufferToImage
+    case 28: { // vkCmdCopyBufferToImage
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkBuffer>(1);
         const auto a2=c.handle<VkImage>(2);
@@ -40653,12 +40831,12 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a5=static_cast<const VkBufferImageCopy*>(c.in_struct(5,80,a4));
         c.fn().vkCmdCopyBufferToImage(a0,a1,a2,a3,a4,a5);c.finish();return c.done(0);
     }
-    case 27: { // vkCmdCopyBufferToImage2
+    case 29: { // vkCmdCopyBufferToImage2
         const auto a0=c.handle<VkCommandBuffer>(0);
         auto* a1=static_cast<const VkCopyBufferToImageInfo2*>(c.in_struct(1,140,1));
         c.fn().vkCmdCopyBufferToImage2(a0,a1);c.finish();return c.done(0);
     }
-    case 28: { // vkCmdCopyImage
+    case 30: { // vkCmdCopyImage
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkImage>(1);
         const auto a2=static_cast<VkImageLayout>(c.u32(2));
@@ -40668,12 +40846,12 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a6=static_cast<const VkImageCopy*>(c.in_struct(6,385,a5));
         c.fn().vkCmdCopyImage(a0,a1,a2,a3,a4,a5,a6);c.finish();return c.done(0);
     }
-    case 29: { // vkCmdCopyImage2
+    case 31: { // vkCmdCopyImage2
         const auto a0=c.handle<VkCommandBuffer>(0);
         auto* a1=static_cast<const VkCopyImageInfo2*>(c.in_struct(1,145,1));
         c.fn().vkCmdCopyImage2(a0,a1);c.finish();return c.done(0);
     }
-    case 30: { // vkCmdCopyImageToBuffer
+    case 32: { // vkCmdCopyImageToBuffer
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkImage>(1);
         const auto a2=static_cast<VkImageLayout>(c.u32(2));
@@ -40682,12 +40860,12 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a5=static_cast<const VkBufferImageCopy*>(c.in_struct(5,80,a4));
         c.fn().vkCmdCopyImageToBuffer(a0,a1,a2,a3,a4,a5);c.finish();return c.done(0);
     }
-    case 31: { // vkCmdCopyImageToBuffer2
+    case 33: { // vkCmdCopyImageToBuffer2
         const auto a0=c.handle<VkCommandBuffer>(0);
         auto* a1=static_cast<const VkCopyImageToBufferInfo2*>(c.in_struct(1,146,1));
         c.fn().vkCmdCopyImageToBuffer2(a0,a1);c.finish();return c.done(0);
     }
-    case 32: { // vkCmdCopyQueryPoolResults
+    case 34: { // vkCmdCopyQueryPoolResults
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkQueryPool>(1);
         const auto a2=static_cast<uint32_t>(c.u32(2));
@@ -40698,14 +40876,14 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a7=static_cast<VkQueryResultFlags>(c.u32(7));
         c.fn().vkCmdCopyQueryPoolResults(a0,a1,a2,a3,a4,a5,a6,a7);c.finish();return c.done(0);
     }
-    case 33: { // vkCmdDispatch
+    case 35: { // vkCmdDispatch
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
         const auto a3=static_cast<uint32_t>(c.u32(3));
         c.fn().vkCmdDispatch(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 34: { // vkCmdDispatchBase
+    case 36: { // vkCmdDispatchBase
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
@@ -40715,13 +40893,13 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a6=static_cast<uint32_t>(c.u32(6));
         c.fn().vkCmdDispatchBase(a0,a1,a2,a3,a4,a5,a6);c.finish();return c.done(0);
     }
-    case 35: { // vkCmdDispatchIndirect
+    case 37: { // vkCmdDispatchIndirect
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkBuffer>(1);
         const auto a2=static_cast<VkDeviceSize>(c.u64(2));
         c.fn().vkCmdDispatchIndirect(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 36: { // vkCmdDraw
+    case 38: { // vkCmdDraw
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
@@ -40729,7 +40907,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a4=static_cast<uint32_t>(c.u32(4));
         c.fn().vkCmdDraw(a0,a1,a2,a3,a4);c.finish();return c.done(0);
     }
-    case 37: { // vkCmdDrawIndexed
+    case 39: { // vkCmdDrawIndexed
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
@@ -40738,7 +40916,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a5=static_cast<uint32_t>(c.u32(5));
         c.fn().vkCmdDrawIndexed(a0,a1,a2,a3,a4,a5);c.finish();return c.done(0);
     }
-    case 38: { // vkCmdDrawIndexedIndirect
+    case 40: { // vkCmdDrawIndexedIndirect
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkBuffer>(1);
         const auto a2=static_cast<VkDeviceSize>(c.u64(2));
@@ -40746,7 +40924,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a4=static_cast<uint32_t>(c.u32(4));
         c.fn().vkCmdDrawIndexedIndirect(a0,a1,a2,a3,a4);c.finish();return c.done(0);
     }
-    case 39: { // vkCmdDrawIndexedIndirectCount
+    case 41: { // vkCmdDrawIndexedIndirectCount
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkBuffer>(1);
         const auto a2=static_cast<VkDeviceSize>(c.u64(2));
@@ -40756,7 +40934,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a6=static_cast<uint32_t>(c.u32(6));
         c.fn().vkCmdDrawIndexedIndirectCount(a0,a1,a2,a3,a4,a5,a6);c.finish();return c.done(0);
     }
-    case 40: { // vkCmdDrawIndirect
+    case 42: { // vkCmdDrawIndirect
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkBuffer>(1);
         const auto a2=static_cast<VkDeviceSize>(c.u64(2));
@@ -40764,7 +40942,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a4=static_cast<uint32_t>(c.u32(4));
         c.fn().vkCmdDrawIndirect(a0,a1,a2,a3,a4);c.finish();return c.done(0);
     }
-    case 41: { // vkCmdDrawIndirectCount
+    case 43: { // vkCmdDrawIndirectCount
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkBuffer>(1);
         const auto a2=static_cast<VkDeviceSize>(c.u64(2));
@@ -40774,32 +40952,32 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a6=static_cast<uint32_t>(c.u32(6));
         c.fn().vkCmdDrawIndirectCount(a0,a1,a2,a3,a4,a5,a6);c.finish();return c.done(0);
     }
-    case 42: { // vkCmdEndQuery
+    case 44: { // vkCmdEndQuery
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkQueryPool>(1);
         const auto a2=static_cast<uint32_t>(c.u32(2));
         c.fn().vkCmdEndQuery(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 43: { // vkCmdEndRenderPass
+    case 45: { // vkCmdEndRenderPass
         const auto a0=c.handle<VkCommandBuffer>(0);
         c.fn().vkCmdEndRenderPass(a0);c.finish();return c.done(0);
     }
-    case 44: { // vkCmdEndRenderPass2
+    case 46: { // vkCmdEndRenderPass2
         const auto a0=c.handle<VkCommandBuffer>(0);
         auto* a1=static_cast<const VkSubpassEndInfo*>(c.in_struct(1,1154,1));
         c.fn().vkCmdEndRenderPass2(a0,a1);c.finish();return c.done(0);
     }
-    case 45: { // vkCmdEndRendering
+    case 47: { // vkCmdEndRendering
         const auto a0=c.handle<VkCommandBuffer>(0);
         c.fn().vkCmdEndRendering(a0);c.finish();return c.done(0);
     }
-    case 46: { // vkCmdExecuteCommands
+    case 48: { // vkCmdExecuteCommands
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkCommandBuffer*>(c.in_array(2,static_cast<std::size_t>(a1),8,A_DISPATCH));
         c.fn().vkCmdExecuteCommands(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 47: { // vkCmdFillBuffer
+    case 49: { // vkCmdFillBuffer
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkBuffer>(1);
         const auto a2=static_cast<VkDeviceSize>(c.u64(2));
@@ -40807,18 +40985,18 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a4=static_cast<uint32_t>(c.u32(4));
         c.fn().vkCmdFillBuffer(a0,a1,a2,a3,a4);c.finish();return c.done(0);
     }
-    case 48: { // vkCmdNextSubpass
+    case 50: { // vkCmdNextSubpass
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkSubpassContents>(c.u32(1));
         c.fn().vkCmdNextSubpass(a0,a1);c.finish();return c.done(0);
     }
-    case 49: { // vkCmdNextSubpass2
+    case 51: { // vkCmdNextSubpass2
         const auto a0=c.handle<VkCommandBuffer>(0);
         auto* a1=static_cast<const VkSubpassBeginInfo*>(c.in_struct(1,1148,1));
         auto* a2=static_cast<const VkSubpassEndInfo*>(c.in_struct(2,1154,1));
         c.fn().vkCmdNextSubpass2(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 50: { // vkCmdPipelineBarrier
+    case 52: { // vkCmdPipelineBarrier
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkPipelineStageFlags>(c.u32(1));
         const auto a2=static_cast<VkPipelineStageFlags>(c.u32(2));
@@ -40831,12 +41009,12 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a9=static_cast<const VkImageMemoryBarrier*>(c.in_struct(9,396,a8));
         c.fn().vkCmdPipelineBarrier(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9);c.finish();return c.done(0);
     }
-    case 51: { // vkCmdPipelineBarrier2
+    case 53: { // vkCmdPipelineBarrier2
         const auto a0=c.handle<VkCommandBuffer>(0);
         auto* a1=static_cast<const VkDependencyInfo*>(c.in_struct(1,205,1));
         c.fn().vkCmdPipelineBarrier2(a0,a1);c.finish();return c.done(0);
     }
-    case 52: { // vkCmdPushConstants
+    case 54: { // vkCmdPushConstants
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkPipelineLayout>(1);
         const auto a2=static_cast<VkShaderStageFlags>(c.u32(2));
@@ -40845,7 +41023,12 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a5=static_cast<const void*>(c.in_array(5,static_cast<std::size_t>(a4),1,A_BYTES));
         c.fn().vkCmdPushConstants(a0,a1,a2,a3,a4,a5);c.finish();return c.done(0);
     }
-    case 53: { // vkCmdPushDescriptorSet
+    case 55: { // vkCmdPushConstants2
+        const auto a0=c.handle<VkCommandBuffer>(0);
+        auto* a1=static_cast<const VkPushConstantsInfo*>(c.in_struct(1,1026,1));
+        c.fn().vkCmdPushConstants2(a0,a1);c.finish();return c.done(0);
+    }
+    case 56: { // vkCmdPushDescriptorSet
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkPipelineBindPoint>(c.u32(1));
         const auto a2=c.handle<VkPipelineLayout>(2);
@@ -40854,26 +41037,37 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a5=static_cast<const VkWriteDescriptorSet*>(c.in_struct(5,1331,a4));
         c.fn().vkCmdPushDescriptorSet(a0,a1,a2,a3,a4,a5);c.finish();return c.done(0);
     }
-    case 54: { // vkCmdResetEvent
+    case 57: { // vkCmdPushDescriptorSet2
+        const auto a0=c.handle<VkCommandBuffer>(0);
+        auto* a1=static_cast<const VkPushDescriptorSetInfo*>(c.in_struct(1,1028,1));
+        c.fn().vkCmdPushDescriptorSet2(a0,a1);c.finish();return c.done(0);
+    }
+    case 58: { // vkCmdPushDescriptorSetWithTemplate
+        return custom_vkCmdPushDescriptorSetWithTemplate(c);
+    }
+    case 59: { // vkCmdPushDescriptorSetWithTemplate2
+        return custom_vkCmdPushDescriptorSetWithTemplate2(c);
+    }
+    case 60: { // vkCmdResetEvent
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkEvent>(1);
         const auto a2=static_cast<VkPipelineStageFlags>(c.u32(2));
         c.fn().vkCmdResetEvent(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 55: { // vkCmdResetEvent2
+    case 61: { // vkCmdResetEvent2
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkEvent>(1);
         const auto a2=static_cast<VkPipelineStageFlags2>(c.u64(2));
         c.fn().vkCmdResetEvent2(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 56: { // vkCmdResetQueryPool
+    case 62: { // vkCmdResetQueryPool
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkQueryPool>(1);
         const auto a2=static_cast<uint32_t>(c.u32(2));
         const auto a3=static_cast<uint32_t>(c.u32(3));
         c.fn().vkCmdResetQueryPool(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 57: { // vkCmdResolveImage
+    case 63: { // vkCmdResolveImage
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkImage>(1);
         const auto a2=static_cast<VkImageLayout>(c.u32(2));
@@ -40883,131 +41077,147 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a6=static_cast<const VkImageResolve*>(c.in_struct(6,400,a5));
         c.fn().vkCmdResolveImage(a0,a1,a2,a3,a4,a5,a6);c.finish();return c.done(0);
     }
-    case 58: { // vkCmdResolveImage2
+    case 64: { // vkCmdResolveImage2
         const auto a0=c.handle<VkCommandBuffer>(0);
         auto* a1=static_cast<const VkResolveImageInfo2*>(c.in_struct(1,1089,1));
         c.fn().vkCmdResolveImage2(a0,a1);c.finish();return c.done(0);
     }
-    case 59: { // vkCmdSetBlendConstants
+    case 65: { // vkCmdSetBlendConstants
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto* a1=static_cast<const float*>(c.in_bytes(1,4*4));
         c.fn().vkCmdSetBlendConstants(a0,a1);c.finish();return c.done(0);
     }
-    case 60: { // vkCmdSetCullMode
+    case 66: { // vkCmdSetCullMode
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkCullModeFlags>(c.u32(1));
         c.fn().vkCmdSetCullMode(a0,a1);c.finish();return c.done(0);
     }
-    case 61: { // vkCmdSetDepthBias
+    case 67: { // vkCmdSetDepthBias
         const auto a0=c.handle<VkCommandBuffer>(0);
         const float a1=c.f32(1);
         const float a2=c.f32(2);
         const float a3=c.f32(3);
         c.fn().vkCmdSetDepthBias(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 62: { // vkCmdSetDepthBiasEnable
+    case 68: { // vkCmdSetDepthBiasEnable
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkBool32>(c.u32(1));
         c.fn().vkCmdSetDepthBiasEnable(a0,a1);c.finish();return c.done(0);
     }
-    case 63: { // vkCmdSetDepthBounds
+    case 69: { // vkCmdSetDepthBounds
         const auto a0=c.handle<VkCommandBuffer>(0);
         const float a1=c.f32(1);
         const float a2=c.f32(2);
         c.fn().vkCmdSetDepthBounds(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 64: { // vkCmdSetDepthBoundsTestEnable
+    case 70: { // vkCmdSetDepthBoundsTestEnable
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkBool32>(c.u32(1));
         c.fn().vkCmdSetDepthBoundsTestEnable(a0,a1);c.finish();return c.done(0);
     }
-    case 65: { // vkCmdSetDepthCompareOp
+    case 71: { // vkCmdSetDepthCompareOp
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkCompareOp>(c.u32(1));
         c.fn().vkCmdSetDepthCompareOp(a0,a1);c.finish();return c.done(0);
     }
-    case 66: { // vkCmdSetDepthTestEnable
+    case 72: { // vkCmdSetDepthTestEnable
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkBool32>(c.u32(1));
         c.fn().vkCmdSetDepthTestEnable(a0,a1);c.finish();return c.done(0);
     }
-    case 67: { // vkCmdSetDepthWriteEnable
+    case 73: { // vkCmdSetDepthWriteEnable
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkBool32>(c.u32(1));
         c.fn().vkCmdSetDepthWriteEnable(a0,a1);c.finish();return c.done(0);
     }
-    case 68: { // vkCmdSetDeviceMask
+    case 74: { // vkCmdSetDeviceMask
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         c.fn().vkCmdSetDeviceMask(a0,a1);c.finish();return c.done(0);
     }
-    case 69: { // vkCmdSetEvent
+    case 75: { // vkCmdSetEvent
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkEvent>(1);
         const auto a2=static_cast<VkPipelineStageFlags>(c.u32(2));
         c.fn().vkCmdSetEvent(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 70: { // vkCmdSetEvent2
+    case 76: { // vkCmdSetEvent2
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkEvent>(1);
         auto* a2=static_cast<const VkDependencyInfo*>(c.in_struct(2,205,1));
         c.fn().vkCmdSetEvent2(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 71: { // vkCmdSetFrontFace
+    case 77: { // vkCmdSetFrontFace
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkFrontFace>(c.u32(1));
         c.fn().vkCmdSetFrontFace(a0,a1);c.finish();return c.done(0);
     }
-    case 72: { // vkCmdSetLineWidth
+    case 78: { // vkCmdSetLineStipple
+        const auto a0=c.handle<VkCommandBuffer>(0);
+        const auto a1=static_cast<uint32_t>(c.u32(1));
+        const auto a2=static_cast<uint16_t>(c.u32(2));
+        c.fn().vkCmdSetLineStipple(a0,a1,a2);c.finish();return c.done(0);
+    }
+    case 79: { // vkCmdSetLineWidth
         const auto a0=c.handle<VkCommandBuffer>(0);
         const float a1=c.f32(1);
         c.fn().vkCmdSetLineWidth(a0,a1);c.finish();return c.done(0);
     }
-    case 73: { // vkCmdSetLogicOpEXT
+    case 80: { // vkCmdSetLogicOpEXT
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkLogicOp>(c.u32(1));
         c.fn().vkCmdSetLogicOpEXT(a0,a1);c.finish();return c.done(0);
     }
-    case 74: { // vkCmdSetPatchControlPointsEXT
+    case 81: { // vkCmdSetPatchControlPointsEXT
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         c.fn().vkCmdSetPatchControlPointsEXT(a0,a1);c.finish();return c.done(0);
     }
-    case 75: { // vkCmdSetPrimitiveRestartEnable
+    case 82: { // vkCmdSetPrimitiveRestartEnable
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkBool32>(c.u32(1));
         c.fn().vkCmdSetPrimitiveRestartEnable(a0,a1);c.finish();return c.done(0);
     }
-    case 76: { // vkCmdSetPrimitiveTopology
+    case 83: { // vkCmdSetPrimitiveTopology
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkPrimitiveTopology>(c.u32(1));
         c.fn().vkCmdSetPrimitiveTopology(a0,a1);c.finish();return c.done(0);
     }
-    case 77: { // vkCmdSetRasterizerDiscardEnable
+    case 84: { // vkCmdSetRasterizerDiscardEnable
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkBool32>(c.u32(1));
         c.fn().vkCmdSetRasterizerDiscardEnable(a0,a1);c.finish();return c.done(0);
     }
-    case 78: { // vkCmdSetScissor
+    case 85: { // vkCmdSetRenderingAttachmentLocations
+        const auto a0=c.handle<VkCommandBuffer>(0);
+        auto* a1=static_cast<const VkRenderingAttachmentLocationInfo*>(c.in_struct(1,1083,1));
+        c.fn().vkCmdSetRenderingAttachmentLocations(a0,a1);c.finish();return c.done(0);
+    }
+    case 86: { // vkCmdSetRenderingInputAttachmentIndices
+        const auto a0=c.handle<VkCommandBuffer>(0);
+        auto* a1=static_cast<const VkRenderingInputAttachmentIndexInfo*>(c.in_struct(1,1088,1));
+        c.fn().vkCmdSetRenderingInputAttachmentIndices(a0,a1);c.finish();return c.done(0);
+    }
+    case 87: { // vkCmdSetScissor
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
         auto* a3=static_cast<const VkRect2D*>(c.in_struct(3,1055,a2));
         c.fn().vkCmdSetScissor(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 79: { // vkCmdSetScissorWithCount
+    case 88: { // vkCmdSetScissorWithCount
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkRect2D*>(c.in_struct(2,1055,a1));
         c.fn().vkCmdSetScissorWithCount(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 80: { // vkCmdSetStencilCompareMask
+    case 89: { // vkCmdSetStencilCompareMask
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkStencilFaceFlags>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
         c.fn().vkCmdSetStencilCompareMask(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 81: { // vkCmdSetStencilOp
+    case 90: { // vkCmdSetStencilOp
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkStencilFaceFlags>(c.u32(1));
         const auto a2=static_cast<VkStencilOp>(c.u32(2));
@@ -41016,37 +41226,37 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a5=static_cast<VkCompareOp>(c.u32(5));
         c.fn().vkCmdSetStencilOp(a0,a1,a2,a3,a4,a5);c.finish();return c.done(0);
     }
-    case 82: { // vkCmdSetStencilReference
+    case 91: { // vkCmdSetStencilReference
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkStencilFaceFlags>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
         c.fn().vkCmdSetStencilReference(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 83: { // vkCmdSetStencilTestEnable
+    case 92: { // vkCmdSetStencilTestEnable
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkBool32>(c.u32(1));
         c.fn().vkCmdSetStencilTestEnable(a0,a1);c.finish();return c.done(0);
     }
-    case 84: { // vkCmdSetStencilWriteMask
+    case 93: { // vkCmdSetStencilWriteMask
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkStencilFaceFlags>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
         c.fn().vkCmdSetStencilWriteMask(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 85: { // vkCmdSetViewport
+    case 94: { // vkCmdSetViewport
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
         auto* a3=static_cast<const VkViewport*>(c.in_struct(3,1328,a2));
         c.fn().vkCmdSetViewport(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 86: { // vkCmdSetViewportWithCount
+    case 95: { // vkCmdSetViewportWithCount
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkViewport*>(c.in_struct(2,1328,a1));
         c.fn().vkCmdSetViewportWithCount(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 87: { // vkCmdUpdateBuffer
+    case 96: { // vkCmdUpdateBuffer
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=c.handle<VkBuffer>(1);
         const auto a2=static_cast<VkDeviceSize>(c.u64(2));
@@ -41054,7 +41264,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a4=static_cast<const void*>(c.in_array(4,static_cast<std::size_t>(a3),1,A_BYTES));
         c.fn().vkCmdUpdateBuffer(a0,a1,a2,a3,a4);c.finish();return c.done(0);
     }
-    case 88: { // vkCmdWaitEvents
+    case 97: { // vkCmdWaitEvents
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkEvent*>(c.in_array(2,static_cast<std::size_t>(a1),8,A_BYTES));
@@ -41068,46 +41278,57 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a10=static_cast<const VkImageMemoryBarrier*>(c.in_struct(10,396,a9));
         c.fn().vkCmdWaitEvents(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10);c.finish();return c.done(0);
     }
-    case 89: { // vkCmdWaitEvents2
+    case 98: { // vkCmdWaitEvents2
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkEvent*>(c.in_array(2,static_cast<std::size_t>(a1),8,A_BYTES));
         auto* a3=static_cast<const VkDependencyInfo*>(c.in_struct(3,205,a1));
         c.fn().vkCmdWaitEvents2(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 90: { // vkCmdWriteTimestamp
+    case 99: { // vkCmdWriteTimestamp
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkPipelineStageFlagBits>(c.u32(1));
         const auto a2=c.handle<VkQueryPool>(2);
         const auto a3=static_cast<uint32_t>(c.u32(3));
         c.fn().vkCmdWriteTimestamp(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 91: { // vkCmdWriteTimestamp2
+    case 100: { // vkCmdWriteTimestamp2
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkPipelineStageFlags2>(c.u64(1));
         const auto a2=c.handle<VkQueryPool>(2);
         const auto a3=static_cast<uint32_t>(c.u32(3));
         c.fn().vkCmdWriteTimestamp2(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 92: { // vkCreateBuffer
+    case 101: { // vkCopyImageToImage
+        const auto a0=c.handle<VkDevice>(0);
+        auto* a1=static_cast<const VkCopyImageToImageInfo*>(c.in_struct(1,147,1));
+        const auto r=c.fn().vkCopyImageToImage(a0,a1);c.finish();return c.done(static_cast<std::uint32_t>(r));
+    }
+    case 102: { // vkCopyImageToMemory
+        return custom_vkCopyImageToMemory(c);
+    }
+    case 103: { // vkCopyMemoryToImage
+        return custom_vkCopyMemoryToImage(c);
+    }
+    case 104: { // vkCreateBuffer
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkBufferCreateInfo*>(c.in_struct(1,77,1));
         auto* a3=static_cast<VkBuffer*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateBuffer(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 93: { // vkCreateBufferView
+    case 105: { // vkCreateBufferView
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkBufferViewCreateInfo*>(c.in_struct(1,87,1));
         auto* a3=static_cast<VkBufferView*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateBufferView(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 94: { // vkCreateCommandPool
+    case 106: { // vkCreateCommandPool
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkCommandPoolCreateInfo*>(c.in_struct(1,124,1));
         auto* a3=static_cast<VkCommandPool*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateCommandPool(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 95: { // vkCreateComputePipelines
+    case 107: { // vkCreateComputePipelines
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkPipelineCache>(1);
         const auto a2=static_cast<uint32_t>(c.u32(2));
@@ -41115,46 +41336,43 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a5=static_cast<VkPipeline*>(c.out_array(5,static_cast<std::size_t>(a2),8,A_BYTES));
         const auto r=c.fn().vkCreateComputePipelines(a0,a1,a2,a3,nullptr,a5);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 96: { // vkCreateDescriptorPool
+    case 108: { // vkCreateDescriptorPool
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkDescriptorPoolCreateInfo*>(c.in_struct(1,225,1));
         auto* a3=static_cast<VkDescriptorPool*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateDescriptorPool(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 97: { // vkCreateDescriptorSetLayout
+    case 109: { // vkCreateDescriptorSetLayout
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkDescriptorSetLayoutCreateInfo*>(c.in_struct(1,233,1));
         auto* a3=static_cast<VkDescriptorSetLayout*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateDescriptorSetLayout(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 98: { // vkCreateDescriptorUpdateTemplate
-        const auto a0=c.handle<VkDevice>(0);
-        auto* a1=static_cast<const VkDescriptorUpdateTemplateCreateInfo*>(c.in_struct(1,238,1));
-        auto* a3=static_cast<VkDescriptorUpdateTemplate*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
-        const auto r=c.fn().vkCreateDescriptorUpdateTemplate(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
+    case 110: { // vkCreateDescriptorUpdateTemplate
+        return custom_vkCreateDescriptorUpdateTemplate(c);
     }
-    case 99: { // vkCreateDevice
+    case 111: { // vkCreateDevice
         return custom_vkCreateDevice(c);
     }
-    case 100: { // vkCreateEvent
+    case 112: { // vkCreateEvent
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkEventCreateInfo*>(c.in_struct(1,314,1));
         auto* a3=static_cast<VkEvent*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateEvent(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 101: { // vkCreateFence
+    case 113: { // vkCreateFence
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkFenceCreateInfo*>(c.in_struct(1,337,1));
         auto* a3=static_cast<VkFence*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateFence(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 102: { // vkCreateFramebuffer
+    case 114: { // vkCreateFramebuffer
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkFramebufferCreateInfo*>(c.in_struct(1,349,1));
         auto* a3=static_cast<VkFramebuffer*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateFramebuffer(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 103: { // vkCreateGraphicsPipelines
+    case 115: { // vkCreateGraphicsPipelines
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkPipelineCache>(1);
         const auto a2=static_cast<uint32_t>(c.u32(2));
@@ -41162,298 +41380,291 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a5=static_cast<VkPipeline*>(c.out_array(5,static_cast<std::size_t>(a2),8,A_BYTES));
         const auto r=c.fn().vkCreateGraphicsPipelines(a0,a1,a2,a3,nullptr,a5);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 104: { // vkCreateImage
-        const auto a0=c.handle<VkDevice>(0);
-        auto* a1=static_cast<const VkImageCreateInfo*>(c.in_struct(1,388,1));
-        auto* a3=static_cast<VkImage*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
-        const auto r=c.fn().vkCreateImage(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
+    case 116: { // vkCreateImage
+        return custom_vkCreateImage(c);
     }
-    case 105: { // vkCreateImageView
+    case 117: { // vkCreateImageView
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkImageViewCreateInfo*>(c.in_struct(1,415,1));
         auto* a3=static_cast<VkImageView*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateImageView(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 106: { // vkCreateInstance
+    case 118: { // vkCreateInstance
         return custom_vkCreateInstance(c);
     }
-    case 107: { // vkCreatePipelineCache
+    case 119: { // vkCreatePipelineCache
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkPipelineCacheCreateInfo*>(c.in_struct(1,951,1));
         auto* a3=static_cast<VkPipelineCache*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreatePipelineCache(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 108: { // vkCreatePipelineLayout
+    case 120: { // vkCreatePipelineLayout
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkPipelineLayoutCreateInfo*>(c.in_struct(1,980,1));
         auto* a3=static_cast<VkPipelineLayout*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreatePipelineLayout(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 109: { // vkCreatePrivateDataSlot
+    case 121: { // vkCreatePrivateDataSlot
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkPrivateDataSlotCreateInfo*>(c.in_struct(1,1022,1));
         auto* a3=static_cast<VkPrivateDataSlot*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreatePrivateDataSlot(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 110: { // vkCreateQueryPool
+    case 122: { // vkCreateQueryPool
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkQueryPoolCreateInfo*>(c.in_struct(1,1031,1));
         auto* a3=static_cast<VkQueryPool*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateQueryPool(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 111: { // vkCreateRenderPass
+    case 123: { // vkCreateRenderPass
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkRenderPassCreateInfo*>(c.in_struct(1,1062,1));
         auto* a3=static_cast<VkRenderPass*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateRenderPass(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 112: { // vkCreateRenderPass2
+    case 124: { // vkCreateRenderPass2
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkRenderPassCreateInfo2*>(c.in_struct(1,1063,1));
         auto* a3=static_cast<VkRenderPass*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateRenderPass2(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 113: { // vkCreateSampler
+    case 125: { // vkCreateSampler
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkSamplerCreateInfo*>(c.in_struct(1,1099,1));
         auto* a3=static_cast<VkSampler*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateSampler(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 114: { // vkCreateSamplerYcbcrConversion
+    case 126: { // vkCreateSamplerYcbcrConversion
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkSamplerYcbcrConversionCreateInfo*>(c.in_struct(1,1104,1));
         auto* a3=static_cast<VkSamplerYcbcrConversion*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateSamplerYcbcrConversion(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 115: { // vkCreateSemaphore
+    case 127: { // vkCreateSemaphore
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkSemaphoreCreateInfo*>(c.in_struct(1,1108,1));
         auto* a3=static_cast<VkSemaphore*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateSemaphore(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 116: { // vkCreateShaderModule
+    case 128: { // vkCreateShaderModule
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkShaderModuleCreateInfo*>(c.in_struct(1,1123,1));
         auto* a3=static_cast<VkShaderModule*>(c.out_array(3,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkCreateShaderModule(a0,a1,nullptr,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 117: { // vkCreateSwapchainKHR
+    case 129: { // vkCreateSwapchainKHR
         return custom_vkCreateSwapchainKHR(c);
     }
-    case 118: { // vkCreateWin32SurfaceKHR
+    case 130: { // vkCreateWin32SurfaceKHR
         return custom_vkCreateWin32SurfaceKHR(c);
     }
-    case 119: { // vkDestroyBuffer
+    case 131: { // vkDestroyBuffer
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkBuffer>(1);
         c.fn().vkDestroyBuffer(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 120: { // vkDestroyBufferView
+    case 132: { // vkDestroyBufferView
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkBufferView>(1);
         c.fn().vkDestroyBufferView(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 121: { // vkDestroyCommandPool
+    case 133: { // vkDestroyCommandPool
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkCommandPool>(1);
         c.fn().vkDestroyCommandPool(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 122: { // vkDestroyDescriptorPool
+    case 134: { // vkDestroyDescriptorPool
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkDescriptorPool>(1);
         c.fn().vkDestroyDescriptorPool(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 123: { // vkDestroyDescriptorSetLayout
+    case 135: { // vkDestroyDescriptorSetLayout
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkDescriptorSetLayout>(1);
         c.fn().vkDestroyDescriptorSetLayout(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 124: { // vkDestroyDescriptorUpdateTemplate
-        const auto a0=c.handle<VkDevice>(0);
-        const auto a1=c.handle<VkDescriptorUpdateTemplate>(1);
-        c.fn().vkDestroyDescriptorUpdateTemplate(a0,a1,nullptr);c.finish();return c.done(0);
+    case 136: { // vkDestroyDescriptorUpdateTemplate
+        return custom_vkDestroyDescriptorUpdateTemplate(c);
     }
-    case 125: { // vkDestroyDevice
+    case 137: { // vkDestroyDevice
         return custom_vkDestroyDevice(c);
     }
-    case 126: { // vkDestroyEvent
+    case 138: { // vkDestroyEvent
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkEvent>(1);
         c.fn().vkDestroyEvent(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 127: { // vkDestroyFence
+    case 139: { // vkDestroyFence
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkFence>(1);
         c.fn().vkDestroyFence(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 128: { // vkDestroyFramebuffer
+    case 140: { // vkDestroyFramebuffer
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkFramebuffer>(1);
         c.fn().vkDestroyFramebuffer(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 129: { // vkDestroyImage
-        const auto a0=c.handle<VkDevice>(0);
-        const auto a1=c.handle<VkImage>(1);
-        c.fn().vkDestroyImage(a0,a1,nullptr);c.finish();return c.done(0);
+    case 141: { // vkDestroyImage
+        return custom_vkDestroyImage(c);
     }
-    case 130: { // vkDestroyImageView
+    case 142: { // vkDestroyImageView
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkImageView>(1);
         c.fn().vkDestroyImageView(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 131: { // vkDestroyInstance
+    case 143: { // vkDestroyInstance
         return custom_vkDestroyInstance(c);
     }
-    case 132: { // vkDestroyPipeline
+    case 144: { // vkDestroyPipeline
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkPipeline>(1);
         c.fn().vkDestroyPipeline(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 133: { // vkDestroyPipelineCache
+    case 145: { // vkDestroyPipelineCache
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkPipelineCache>(1);
         c.fn().vkDestroyPipelineCache(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 134: { // vkDestroyPipelineLayout
+    case 146: { // vkDestroyPipelineLayout
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkPipelineLayout>(1);
         c.fn().vkDestroyPipelineLayout(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 135: { // vkDestroyPrivateDataSlot
+    case 147: { // vkDestroyPrivateDataSlot
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkPrivateDataSlot>(1);
         c.fn().vkDestroyPrivateDataSlot(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 136: { // vkDestroyQueryPool
+    case 148: { // vkDestroyQueryPool
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkQueryPool>(1);
         c.fn().vkDestroyQueryPool(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 137: { // vkDestroyRenderPass
+    case 149: { // vkDestroyRenderPass
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkRenderPass>(1);
         c.fn().vkDestroyRenderPass(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 138: { // vkDestroySampler
+    case 150: { // vkDestroySampler
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkSampler>(1);
         c.fn().vkDestroySampler(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 139: { // vkDestroySamplerYcbcrConversion
+    case 151: { // vkDestroySamplerYcbcrConversion
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkSamplerYcbcrConversion>(1);
         c.fn().vkDestroySamplerYcbcrConversion(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 140: { // vkDestroySemaphore
+    case 152: { // vkDestroySemaphore
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkSemaphore>(1);
         c.fn().vkDestroySemaphore(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 141: { // vkDestroyShaderModule
+    case 153: { // vkDestroyShaderModule
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkShaderModule>(1);
         c.fn().vkDestroyShaderModule(a0,a1,nullptr);c.finish();return c.done(0);
     }
-    case 142: { // vkDestroySurfaceKHR
+    case 154: { // vkDestroySurfaceKHR
         return custom_vkDestroySurfaceKHR(c);
     }
-    case 143: { // vkDestroySwapchainKHR
+    case 155: { // vkDestroySwapchainKHR
         return custom_vkDestroySwapchainKHR(c);
     }
-    case 144: { // vkDeviceWaitIdle
+    case 156: { // vkDeviceWaitIdle
         const auto a0=c.handle<VkDevice>(0);
         const auto r=c.fn().vkDeviceWaitIdle(a0);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 145: { // vkEndCommandBuffer
+    case 157: { // vkEndCommandBuffer
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto r=c.fn().vkEndCommandBuffer(a0);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 146: { // vkEnumerateDeviceExtensionProperties
+    case 158: { // vkEnumerateDeviceExtensionProperties
         return custom_vkEnumerateDeviceExtensionProperties(c);
     }
-    case 147: { // vkEnumerateDeviceLayerProperties
+    case 159: { // vkEnumerateDeviceLayerProperties
         return custom_vkEnumerateDeviceLayerProperties(c);
     }
-    case 148: { // vkEnumerateInstanceExtensionProperties
+    case 160: { // vkEnumerateInstanceExtensionProperties
         return custom_vkEnumerateInstanceExtensionProperties(c);
     }
-    case 149: { // vkEnumerateInstanceLayerProperties
+    case 161: { // vkEnumerateInstanceLayerProperties
         return custom_vkEnumerateInstanceLayerProperties(c);
     }
-    case 150: { // vkEnumerateInstanceVersion
+    case 162: { // vkEnumerateInstanceVersion
         auto* a0=static_cast<uint32_t*>(c.out_array(0,static_cast<std::size_t>(1),4,A_BYTES));
         const auto r=c.fn().vkEnumerateInstanceVersion(a0);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 151: { // vkEnumeratePhysicalDeviceGroups
+    case 163: { // vkEnumeratePhysicalDeviceGroups
         const auto a0=c.handle<VkInstance>(0);
         auto* a1=static_cast<uint32_t*>(c.out_array(1,1,4,A_BYTES));
         auto* a2=static_cast<VkPhysicalDeviceGroupProperties*>(c.out_struct(2,663,c.deref(1,4,A_BYTES)));
         const auto r=c.fn().vkEnumeratePhysicalDeviceGroups(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 152: { // vkEnumeratePhysicalDevices
+    case 164: { // vkEnumeratePhysicalDevices
         const auto a0=c.handle<VkInstance>(0);
         auto* a1=static_cast<uint32_t*>(c.out_array(1,1,4,A_BYTES));
         auto* a2=static_cast<VkPhysicalDevice*>(c.out_array(2,static_cast<std::size_t>(c.deref(1,4,A_BYTES)),8,A_DISPATCH));
         const auto r=c.fn().vkEnumeratePhysicalDevices(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 153: { // vkFlushMappedMemoryRanges
+    case 165: { // vkFlushMappedMemoryRanges
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkMappedMemoryRange*>(c.in_struct(2,453,a1));
         const auto r=c.fn().vkFlushMappedMemoryRanges(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 154: { // vkFreeCommandBuffers
+    case 166: { // vkFreeCommandBuffers
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkCommandPool>(1);
         const auto a2=static_cast<uint32_t>(c.u32(2));
         auto* a3=static_cast<const VkCommandBuffer*>(c.in_array(3,static_cast<std::size_t>(a2),8,A_DISPATCH));
         c.fn().vkFreeCommandBuffers(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 155: { // vkFreeDescriptorSets
+    case 167: { // vkFreeDescriptorSets
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkDescriptorPool>(1);
         const auto a2=static_cast<uint32_t>(c.u32(2));
         auto* a3=static_cast<const VkDescriptorSet*>(c.in_array(3,static_cast<std::size_t>(a2),8,A_BYTES));
         const auto r=c.fn().vkFreeDescriptorSets(a0,a1,a2,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 156: { // vkFreeMemory
+    case 168: { // vkFreeMemory
         return custom_vkFreeMemory(c);
     }
-    case 157: { // vkGetBufferDeviceAddress
+    case 169: { // vkGetBufferDeviceAddress
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkBufferDeviceAddressInfo*>(c.in_struct(1,79,1));
         const auto r=c.fn().vkGetBufferDeviceAddress(a0,a1);c.finish();return c.done(static_cast<std::uint64_t>(r),true);
     }
-    case 158: { // vkGetBufferMemoryRequirements
+    case 170: { // vkGetBufferMemoryRequirements
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkBuffer>(1);
         auto* a2=static_cast<VkMemoryRequirements*>(c.out_struct(2,474,1));
         c.fn().vkGetBufferMemoryRequirements(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 159: { // vkGetBufferMemoryRequirements2
+    case 171: { // vkGetBufferMemoryRequirements2
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkBufferMemoryRequirementsInfo2*>(c.in_struct(1,84,1));
         auto* a2=static_cast<VkMemoryRequirements2*>(c.out_struct(2,475,1));
         c.fn().vkGetBufferMemoryRequirements2(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 160: { // vkGetBufferOpaqueCaptureAddress
+    case 172: { // vkGetBufferOpaqueCaptureAddress
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkBufferDeviceAddressInfo*>(c.in_struct(1,79,1));
         const auto r=c.fn().vkGetBufferOpaqueCaptureAddress(a0,a1);c.finish();return c.done(static_cast<std::uint64_t>(r),true);
     }
-    case 161: { // vkGetDescriptorSetLayoutSupport
+    case 173: { // vkGetDescriptorSetLayoutSupport
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkDescriptorSetLayoutCreateInfo*>(c.in_struct(1,233,1));
         auto* a2=static_cast<VkDescriptorSetLayoutSupport*>(c.out_struct(2,235,1));
         c.fn().vkGetDescriptorSetLayoutSupport(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 162: { // vkGetDeviceBufferMemoryRequirements
+    case 174: { // vkGetDeviceBufferMemoryRequirements
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkDeviceBufferMemoryRequirements*>(c.in_struct(1,242,1));
         auto* a2=static_cast<VkMemoryRequirements2*>(c.out_struct(2,475,1));
         c.fn().vkGetDeviceBufferMemoryRequirements(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 163: { // vkGetDeviceGroupPeerMemoryFeatures
+    case 175: { // vkGetDeviceGroupPeerMemoryFeatures
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
@@ -41461,147 +41672,160 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a4=static_cast<VkPeerMemoryFeatureFlags*>(c.out_array(4,static_cast<std::size_t>(1),4,A_BYTES));
         c.fn().vkGetDeviceGroupPeerMemoryFeatures(a0,a1,a2,a3,a4);c.finish();return c.done(0);
     }
-    case 164: { // vkGetDeviceGroupPresentCapabilitiesKHR
+    case 176: { // vkGetDeviceGroupPresentCapabilitiesKHR
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<VkDeviceGroupPresentCapabilitiesKHR*>(c.out_struct(1,258,1));
         const auto r=c.fn().vkGetDeviceGroupPresentCapabilitiesKHR(a0,a1);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 165: { // vkGetDeviceGroupSurfacePresentModesKHR
+    case 177: { // vkGetDeviceGroupSurfacePresentModesKHR
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkSurfaceKHR>(1);
         auto* a2=static_cast<VkDeviceGroupPresentModeFlagsKHR*>(c.out_array(2,static_cast<std::size_t>(1),4,A_BYTES));
         const auto r=c.fn().vkGetDeviceGroupSurfacePresentModesKHR(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 166: { // vkGetDeviceImageMemoryRequirements
+    case 178: { // vkGetDeviceImageMemoryRequirements
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkDeviceImageMemoryRequirements*>(c.in_struct(1,263,1));
         auto* a2=static_cast<VkMemoryRequirements2*>(c.out_struct(2,475,1));
         c.fn().vkGetDeviceImageMemoryRequirements(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 167: { // vkGetDeviceImageSparseMemoryRequirements
+    case 179: { // vkGetDeviceImageSparseMemoryRequirements
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkDeviceImageMemoryRequirements*>(c.in_struct(1,263,1));
         auto* a2=static_cast<uint32_t*>(c.out_array(2,1,4,A_BYTES));
         auto* a3=static_cast<VkSparseImageMemoryRequirements2*>(c.out_struct(3,1137,c.deref(2,4,A_BYTES)));
         c.fn().vkGetDeviceImageSparseMemoryRequirements(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 168: { // vkGetDeviceMemoryCommitment
+    case 180: { // vkGetDeviceImageSubresourceLayout
+        const auto a0=c.handle<VkDevice>(0);
+        auto* a1=static_cast<const VkDeviceImageSubresourceInfo*>(c.in_struct(1,264,1));
+        auto* a2=static_cast<VkSubresourceLayout2*>(c.out_struct(2,1160,1));
+        c.fn().vkGetDeviceImageSubresourceLayout(a0,a1,a2);c.finish();return c.done(0);
+    }
+    case 181: { // vkGetDeviceMemoryCommitment
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkDeviceMemory>(1);
         auto* a2=static_cast<VkDeviceSize*>(c.out_array(2,static_cast<std::size_t>(1),8,A_BYTES));
         c.fn().vkGetDeviceMemoryCommitment(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 169: { // vkGetDeviceMemoryOpaqueCaptureAddress
+    case 182: { // vkGetDeviceMemoryOpaqueCaptureAddress
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkDeviceMemoryOpaqueCaptureAddressInfo*>(c.in_struct(1,267,1));
         const auto r=c.fn().vkGetDeviceMemoryOpaqueCaptureAddress(a0,a1);c.finish();return c.done(static_cast<std::uint64_t>(r),true);
     }
-    case 170: { // vkGetDeviceProcAddr
+    case 183: { // vkGetDeviceProcAddr
         return custom_vkGetDeviceProcAddr(c);
     }
-    case 171: { // vkGetDeviceQueue
+    case 184: { // vkGetDeviceQueue
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         const auto a2=static_cast<uint32_t>(c.u32(2));
         auto* a3=static_cast<VkQueue*>(c.out_array(3,static_cast<std::size_t>(1),8,A_DISPATCH));
         c.fn().vkGetDeviceQueue(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 172: { // vkGetDeviceQueue2
+    case 185: { // vkGetDeviceQueue2
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkDeviceQueueInfo2*>(c.in_struct(1,276,1));
         auto* a2=static_cast<VkQueue*>(c.out_array(2,static_cast<std::size_t>(1),8,A_DISPATCH));
         c.fn().vkGetDeviceQueue2(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 173: { // vkGetEventStatus
+    case 186: { // vkGetEventStatus
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkEvent>(1);
         const auto r=c.fn().vkGetEventStatus(a0,a1);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 174: { // vkGetFenceStatus
+    case 187: { // vkGetFenceStatus
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkFence>(1);
         const auto r=c.fn().vkGetFenceStatus(a0,a1);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 175: { // vkGetImageMemoryRequirements
+    case 188: { // vkGetImageMemoryRequirements
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkImage>(1);
         auto* a2=static_cast<VkMemoryRequirements*>(c.out_struct(2,474,1));
         c.fn().vkGetImageMemoryRequirements(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 176: { // vkGetImageMemoryRequirements2
+    case 189: { // vkGetImageMemoryRequirements2
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkImageMemoryRequirementsInfo2*>(c.in_struct(1,398,1));
         auto* a2=static_cast<VkMemoryRequirements2*>(c.out_struct(2,475,1));
         c.fn().vkGetImageMemoryRequirements2(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 177: { // vkGetImageSparseMemoryRequirements
+    case 190: { // vkGetImageSparseMemoryRequirements
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkImage>(1);
         auto* a2=static_cast<uint32_t*>(c.out_array(2,1,4,A_BYTES));
         auto* a3=static_cast<VkSparseImageMemoryRequirements*>(c.out_struct(3,1136,c.deref(2,4,A_BYTES)));
         c.fn().vkGetImageSparseMemoryRequirements(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 178: { // vkGetImageSparseMemoryRequirements2
+    case 191: { // vkGetImageSparseMemoryRequirements2
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkImageSparseMemoryRequirementsInfo2*>(c.in_struct(1,402,1));
         auto* a2=static_cast<uint32_t*>(c.out_array(2,1,4,A_BYTES));
         auto* a3=static_cast<VkSparseImageMemoryRequirements2*>(c.out_struct(3,1137,c.deref(2,4,A_BYTES)));
         c.fn().vkGetImageSparseMemoryRequirements2(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 179: { // vkGetImageSubresourceLayout
+    case 192: { // vkGetImageSubresourceLayout
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkImage>(1);
         auto* a2=static_cast<const VkImageSubresource*>(c.in_struct(2,405,1));
         auto* a3=static_cast<VkSubresourceLayout*>(c.out_struct(3,1159,1));
         c.fn().vkGetImageSubresourceLayout(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 180: { // vkGetInstanceProcAddr
+    case 193: { // vkGetImageSubresourceLayout2
+        const auto a0=c.handle<VkDevice>(0);
+        const auto a1=c.handle<VkImage>(1);
+        auto* a2=static_cast<const VkImageSubresource2*>(c.in_struct(2,406,1));
+        auto* a3=static_cast<VkSubresourceLayout2*>(c.out_struct(3,1160,1));
+        c.fn().vkGetImageSubresourceLayout2(a0,a1,a2,a3);c.finish();return c.done(0);
+    }
+    case 194: { // vkGetInstanceProcAddr
         return custom_vkGetInstanceProcAddr(c);
     }
-    case 181: { // vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
+    case 195: { // vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
         return custom_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(c);
     }
-    case 182: { // vkGetPhysicalDeviceExternalBufferProperties
+    case 196: { // vkGetPhysicalDeviceExternalBufferProperties
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<const VkPhysicalDeviceExternalBufferInfo*>(c.in_struct(1,625,1));
         auto* a2=static_cast<VkExternalBufferProperties*>(c.out_struct(2,322,1));
         c.fn().vkGetPhysicalDeviceExternalBufferProperties(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 183: { // vkGetPhysicalDeviceExternalFenceProperties
+    case 197: { // vkGetPhysicalDeviceExternalFenceProperties
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<const VkPhysicalDeviceExternalFenceInfo*>(c.in_struct(1,627,1));
         auto* a2=static_cast<VkExternalFenceProperties*>(c.out_struct(2,326,1));
         c.fn().vkGetPhysicalDeviceExternalFenceProperties(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 184: { // vkGetPhysicalDeviceExternalSemaphoreProperties
+    case 198: { // vkGetPhysicalDeviceExternalSemaphoreProperties
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<const VkPhysicalDeviceExternalSemaphoreInfo*>(c.in_struct(1,631,1));
         auto* a2=static_cast<VkExternalSemaphoreProperties*>(c.out_struct(2,335,1));
         c.fn().vkGetPhysicalDeviceExternalSemaphoreProperties(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 185: { // vkGetPhysicalDeviceFeatures
+    case 199: { // vkGetPhysicalDeviceFeatures
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<VkPhysicalDeviceFeatures*>(c.out_struct(1,636,1));
         c.fn().vkGetPhysicalDeviceFeatures(a0,a1);c.finish();return c.done(0);
     }
-    case 186: { // vkGetPhysicalDeviceFeatures2
+    case 200: { // vkGetPhysicalDeviceFeatures2
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<VkPhysicalDeviceFeatures2*>(c.out_struct(1,637,1));
         c.fn().vkGetPhysicalDeviceFeatures2(a0,a1);c.finish();return c.done(0);
     }
-    case 187: { // vkGetPhysicalDeviceFormatProperties
+    case 201: { // vkGetPhysicalDeviceFormatProperties
         const auto a0=c.handle<VkPhysicalDevice>(0);
         const auto a1=static_cast<VkFormat>(c.u32(1));
         auto* a2=static_cast<VkFormatProperties*>(c.out_struct(2,340,1));
         c.fn().vkGetPhysicalDeviceFormatProperties(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 188: { // vkGetPhysicalDeviceFormatProperties2
+    case 202: { // vkGetPhysicalDeviceFormatProperties2
         const auto a0=c.handle<VkPhysicalDevice>(0);
         const auto a1=static_cast<VkFormat>(c.u32(1));
         auto* a2=static_cast<VkFormatProperties2*>(c.out_struct(2,341,1));
         c.fn().vkGetPhysicalDeviceFormatProperties2(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 189: { // vkGetPhysicalDeviceImageFormatProperties
+    case 203: { // vkGetPhysicalDeviceImageFormatProperties
         const auto a0=c.handle<VkPhysicalDevice>(0);
         const auto a1=static_cast<VkFormat>(c.u32(1));
         const auto a2=static_cast<VkImageType>(c.u32(2));
@@ -41611,48 +41835,48 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a6=static_cast<VkImageFormatProperties*>(c.out_struct(6,394,1));
         const auto r=c.fn().vkGetPhysicalDeviceImageFormatProperties(a0,a1,a2,a3,a4,a5,a6);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 190: { // vkGetPhysicalDeviceImageFormatProperties2
+    case 204: { // vkGetPhysicalDeviceImageFormatProperties2
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<const VkPhysicalDeviceImageFormatInfo2*>(c.in_struct(1,675,1));
         auto* a2=static_cast<VkImageFormatProperties2*>(c.out_struct(2,395,1));
         const auto r=c.fn().vkGetPhysicalDeviceImageFormatProperties2(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 191: { // vkGetPhysicalDeviceMemoryProperties
+    case 205: { // vkGetPhysicalDeviceMemoryProperties
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<VkPhysicalDeviceMemoryProperties*>(c.out_struct(1,724,1));
         c.fn().vkGetPhysicalDeviceMemoryProperties(a0,a1);c.finish();return c.done(0);
     }
-    case 192: { // vkGetPhysicalDeviceMemoryProperties2
+    case 206: { // vkGetPhysicalDeviceMemoryProperties2
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<VkPhysicalDeviceMemoryProperties2*>(c.out_struct(1,725,1));
         c.fn().vkGetPhysicalDeviceMemoryProperties2(a0,a1);c.finish();return c.done(0);
     }
-    case 193: { // vkGetPhysicalDevicePresentRectanglesKHR
+    case 207: { // vkGetPhysicalDevicePresentRectanglesKHR
         return custom_vkGetPhysicalDevicePresentRectanglesKHR(c);
     }
-    case 194: { // vkGetPhysicalDeviceProperties
+    case 208: { // vkGetPhysicalDeviceProperties
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<VkPhysicalDeviceProperties*>(c.out_struct(1,782,1));
         c.fn().vkGetPhysicalDeviceProperties(a0,a1);c.finish();return c.done(0);
     }
-    case 195: { // vkGetPhysicalDeviceProperties2
+    case 209: { // vkGetPhysicalDeviceProperties2
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<VkPhysicalDeviceProperties2*>(c.out_struct(1,783,1));
         c.fn().vkGetPhysicalDeviceProperties2(a0,a1);c.finish();return c.done(0);
     }
-    case 196: { // vkGetPhysicalDeviceQueueFamilyProperties
+    case 210: { // vkGetPhysicalDeviceQueueFamilyProperties
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<uint32_t*>(c.out_array(1,1,4,A_BYTES));
         auto* a2=static_cast<VkQueueFamilyProperties*>(c.out_struct(2,1045,c.deref(1,4,A_BYTES)));
         c.fn().vkGetPhysicalDeviceQueueFamilyProperties(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 197: { // vkGetPhysicalDeviceQueueFamilyProperties2
+    case 211: { // vkGetPhysicalDeviceQueueFamilyProperties2
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<uint32_t*>(c.out_array(1,1,4,A_BYTES));
         auto* a2=static_cast<VkQueueFamilyProperties2*>(c.out_struct(2,1046,c.deref(1,4,A_BYTES)));
         c.fn().vkGetPhysicalDeviceQueueFamilyProperties2(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 198: { // vkGetPhysicalDeviceSparseImageFormatProperties
+    case 212: { // vkGetPhysicalDeviceSparseImageFormatProperties
         const auto a0=c.handle<VkPhysicalDevice>(0);
         const auto a1=static_cast<VkFormat>(c.u32(1));
         const auto a2=static_cast<VkImageType>(c.u32(2));
@@ -41663,70 +41887,70 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a7=static_cast<VkSparseImageFormatProperties*>(c.out_struct(7,1132,c.deref(6,4,A_BYTES)));
         c.fn().vkGetPhysicalDeviceSparseImageFormatProperties(a0,a1,a2,a3,a4,a5,a6,a7);c.finish();return c.done(0);
     }
-    case 199: { // vkGetPhysicalDeviceSparseImageFormatProperties2
+    case 213: { // vkGetPhysicalDeviceSparseImageFormatProperties2
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<const VkPhysicalDeviceSparseImageFormatInfo2*>(c.in_struct(1,883,1));
         auto* a2=static_cast<uint32_t*>(c.out_array(2,1,4,A_BYTES));
         auto* a3=static_cast<VkSparseImageFormatProperties2*>(c.out_struct(3,1133,c.deref(2,4,A_BYTES)));
         c.fn().vkGetPhysicalDeviceSparseImageFormatProperties2(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 200: { // vkGetPhysicalDeviceSurfaceCapabilities2KHR
+    case 214: { // vkGetPhysicalDeviceSurfaceCapabilities2KHR
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<const VkPhysicalDeviceSurfaceInfo2KHR*>(c.in_struct(1,891,1));
         auto* a2=static_cast<VkSurfaceCapabilities2KHR*>(c.out_struct(2,1163,1));
         const auto r=c.fn().vkGetPhysicalDeviceSurfaceCapabilities2KHR(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 201: { // vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+    case 215: { // vkGetPhysicalDeviceSurfaceCapabilitiesKHR
         const auto a0=c.handle<VkPhysicalDevice>(0);
         const auto a1=c.handle<VkSurfaceKHR>(1);
         auto* a2=static_cast<VkSurfaceCapabilitiesKHR*>(c.out_struct(2,1164,1));
         const auto r=c.fn().vkGetPhysicalDeviceSurfaceCapabilitiesKHR(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 202: { // vkGetPhysicalDeviceSurfaceFormats2KHR
+    case 216: { // vkGetPhysicalDeviceSurfaceFormats2KHR
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<const VkPhysicalDeviceSurfaceInfo2KHR*>(c.in_struct(1,891,1));
         auto* a2=static_cast<uint32_t*>(c.out_array(2,1,4,A_BYTES));
         auto* a3=static_cast<VkSurfaceFormat2KHR*>(c.out_struct(3,1168,c.deref(2,4,A_BYTES)));
         const auto r=c.fn().vkGetPhysicalDeviceSurfaceFormats2KHR(a0,a1,a2,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 203: { // vkGetPhysicalDeviceSurfaceFormatsKHR
+    case 217: { // vkGetPhysicalDeviceSurfaceFormatsKHR
         const auto a0=c.handle<VkPhysicalDevice>(0);
         const auto a1=c.handle<VkSurfaceKHR>(1);
         auto* a2=static_cast<uint32_t*>(c.out_array(2,1,4,A_BYTES));
         auto* a3=static_cast<VkSurfaceFormatKHR*>(c.out_struct(3,1169,c.deref(2,4,A_BYTES)));
         const auto r=c.fn().vkGetPhysicalDeviceSurfaceFormatsKHR(a0,a1,a2,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 204: { // vkGetPhysicalDeviceSurfacePresentModesKHR
+    case 218: { // vkGetPhysicalDeviceSurfacePresentModesKHR
         const auto a0=c.handle<VkPhysicalDevice>(0);
         const auto a1=c.handle<VkSurfaceKHR>(1);
         auto* a2=static_cast<uint32_t*>(c.out_array(2,1,4,A_BYTES));
         auto* a3=static_cast<VkPresentModeKHR*>(c.out_array(3,static_cast<std::size_t>(c.deref(2,4,A_BYTES)),4,A_BYTES));
         const auto r=c.fn().vkGetPhysicalDeviceSurfacePresentModesKHR(a0,a1,a2,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 205: { // vkGetPhysicalDeviceSurfaceSupportKHR
+    case 219: { // vkGetPhysicalDeviceSurfaceSupportKHR
         const auto a0=c.handle<VkPhysicalDevice>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         const auto a2=c.handle<VkSurfaceKHR>(2);
         auto* a3=static_cast<VkBool32*>(c.out_array(3,static_cast<std::size_t>(1),4,A_BYTES));
         const auto r=c.fn().vkGetPhysicalDeviceSurfaceSupportKHR(a0,a1,a2,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 206: { // vkGetPhysicalDeviceToolProperties
+    case 220: { // vkGetPhysicalDeviceToolProperties
         const auto a0=c.handle<VkPhysicalDevice>(0);
         auto* a1=static_cast<uint32_t*>(c.out_array(1,1,4,A_BYTES));
         auto* a2=static_cast<VkPhysicalDeviceToolProperties*>(c.out_struct(2,908,c.deref(1,4,A_BYTES)));
         const auto r=c.fn().vkGetPhysicalDeviceToolProperties(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 207: { // vkGetPhysicalDeviceWin32PresentationSupportKHR
+    case 221: { // vkGetPhysicalDeviceWin32PresentationSupportKHR
         return custom_vkGetPhysicalDeviceWin32PresentationSupportKHR(c);
     }
-    case 208: { // vkGetPipelineCacheData
+    case 222: { // vkGetPipelineCacheData
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkPipelineCache>(1);
         auto* a2=static_cast<size_t*>(c.out_array(2,1,8,A_SIZE));
         auto* a3=static_cast<void*>(c.out_array(3,static_cast<std::size_t>(c.deref(2,8,A_SIZE)),1,A_BYTES));
         const auto r=c.fn().vkGetPipelineCacheData(a0,a1,a2,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 209: { // vkGetPrivateData
+    case 223: { // vkGetPrivateData
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=static_cast<VkObjectType>(c.u32(1));
         const auto a2=static_cast<uint64_t>(c.u64(2));
@@ -41734,7 +41958,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a4=static_cast<uint64_t*>(c.out_array(4,static_cast<std::size_t>(1),8,A_BYTES));
         c.fn().vkGetPrivateData(a0,a1,a2,a3,a4);c.finish();return c.done(0);
     }
-    case 210: { // vkGetQueryPoolResults
+    case 224: { // vkGetQueryPoolResults
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkQueryPool>(1);
         const auto a2=static_cast<uint32_t>(c.u32(2));
@@ -41745,110 +41969,119 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a7=static_cast<VkQueryResultFlags>(c.u32(7));
         const auto r=c.fn().vkGetQueryPoolResults(a0,a1,a2,a3,a4,a5,a6,a7);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 211: { // vkGetRenderAreaGranularity
+    case 225: { // vkGetRenderAreaGranularity
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkRenderPass>(1);
         auto* a2=static_cast<VkExtent2D*>(c.out_struct(2,320,1));
         c.fn().vkGetRenderAreaGranularity(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 212: { // vkGetSemaphoreCounterValue
+    case 226: { // vkGetRenderingAreaGranularity
+        const auto a0=c.handle<VkDevice>(0);
+        auto* a1=static_cast<const VkRenderingAreaInfo*>(c.in_struct(1,1080,1));
+        auto* a2=static_cast<VkExtent2D*>(c.out_struct(2,320,1));
+        c.fn().vkGetRenderingAreaGranularity(a0,a1,a2);c.finish();return c.done(0);
+    }
+    case 227: { // vkGetSemaphoreCounterValue
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkSemaphore>(1);
         auto* a2=static_cast<uint64_t*>(c.out_array(2,static_cast<std::size_t>(1),8,A_BYTES));
         const auto r=c.fn().vkGetSemaphoreCounterValue(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 213: { // vkGetSwapchainImagesKHR
+    case 228: { // vkGetSwapchainImagesKHR
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkSwapchainKHR>(1);
         auto* a2=static_cast<uint32_t*>(c.out_array(2,1,4,A_BYTES));
         auto* a3=static_cast<VkImage*>(c.out_array(3,static_cast<std::size_t>(c.deref(2,4,A_BYTES)),8,A_BYTES));
         const auto r=c.fn().vkGetSwapchainImagesKHR(a0,a1,a2,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 214: { // vkInvalidateMappedMemoryRanges
+    case 229: { // vkInvalidateMappedMemoryRanges
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkMappedMemoryRange*>(c.in_struct(2,453,a1));
         const auto r=c.fn().vkInvalidateMappedMemoryRanges(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 215: { // vkMapMemory
+    case 230: { // vkMapMemory
         return custom_vkMapMemory(c);
     }
-    case 216: { // vkMergePipelineCaches
+    case 231: { // vkMapMemory2
+        return custom_vkMapMemory2(c);
+    }
+    case 232: { // vkMergePipelineCaches
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkPipelineCache>(1);
         const auto a2=static_cast<uint32_t>(c.u32(2));
         auto* a3=static_cast<const VkPipelineCache*>(c.in_array(3,static_cast<std::size_t>(a2),8,A_BYTES));
         const auto r=c.fn().vkMergePipelineCaches(a0,a1,a2,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 217: { // vkQueueBindSparse
+    case 233: { // vkQueueBindSparse
         const auto a0=c.handle<VkQueue>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkBindSparseInfo*>(c.in_struct(2,65,a1));
         const auto a3=c.handle<VkFence>(3);
         const auto r=c.fn().vkQueueBindSparse(a0,a1,a2,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 218: { // vkQueuePresentKHR
+    case 234: { // vkQueuePresentKHR
         return custom_vkQueuePresentKHR(c);
     }
-    case 219: { // vkQueueSubmit
+    case 235: { // vkQueueSubmit
         const auto a0=c.handle<VkQueue>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkSubmitInfo*>(c.in_struct(2,1146,a1));
         const auto a3=c.handle<VkFence>(3);
         const auto r=c.fn().vkQueueSubmit(a0,a1,a2,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 220: { // vkQueueSubmit2
+    case 236: { // vkQueueSubmit2
         const auto a0=c.handle<VkQueue>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkSubmitInfo2*>(c.in_struct(2,1147,a1));
         const auto a3=c.handle<VkFence>(3);
         const auto r=c.fn().vkQueueSubmit2(a0,a1,a2,a3);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 221: { // vkQueueWaitIdle
+    case 237: { // vkQueueWaitIdle
         const auto a0=c.handle<VkQueue>(0);
         const auto r=c.fn().vkQueueWaitIdle(a0);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 222: { // vkResetCommandBuffer
+    case 238: { // vkResetCommandBuffer
         const auto a0=c.handle<VkCommandBuffer>(0);
         const auto a1=static_cast<VkCommandBufferResetFlags>(c.u32(1));
         const auto r=c.fn().vkResetCommandBuffer(a0,a1);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 223: { // vkResetCommandPool
+    case 239: { // vkResetCommandPool
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkCommandPool>(1);
         const auto a2=static_cast<VkCommandPoolResetFlags>(c.u32(2));
         const auto r=c.fn().vkResetCommandPool(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 224: { // vkResetDescriptorPool
+    case 240: { // vkResetDescriptorPool
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkDescriptorPool>(1);
         const auto a2=static_cast<VkDescriptorPoolResetFlags>(c.u32(2));
         const auto r=c.fn().vkResetDescriptorPool(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 225: { // vkResetEvent
+    case 241: { // vkResetEvent
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkEvent>(1);
         const auto r=c.fn().vkResetEvent(a0,a1);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 226: { // vkResetFences
+    case 242: { // vkResetFences
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkFence*>(c.in_array(2,static_cast<std::size_t>(a1),8,A_BYTES));
         const auto r=c.fn().vkResetFences(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 227: { // vkResetQueryPool
+    case 243: { // vkResetQueryPool
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkQueryPool>(1);
         const auto a2=static_cast<uint32_t>(c.u32(2));
         const auto a3=static_cast<uint32_t>(c.u32(3));
         c.fn().vkResetQueryPool(a0,a1,a2,a3);c.finish();return c.done(0);
     }
-    case 228: { // vkSetEvent
+    case 244: { // vkSetEvent
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkEvent>(1);
         const auto r=c.fn().vkSetEvent(a0,a1);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 229: { // vkSetPrivateData
+    case 245: { // vkSetPrivateData
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=static_cast<VkObjectType>(c.u32(1));
         const auto a2=static_cast<uint64_t>(c.u64(2));
@@ -41856,21 +42089,33 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a4=static_cast<uint64_t>(c.u64(4));
         const auto r=c.fn().vkSetPrivateData(a0,a1,a2,a3,a4);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 230: { // vkSignalSemaphore
+    case 246: { // vkSignalSemaphore
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkSemaphoreSignalInfo*>(c.in_struct(1,1110,1));
         const auto r=c.fn().vkSignalSemaphore(a0,a1);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 231: { // vkTrimCommandPool
+    case 247: { // vkTransitionImageLayout
+        const auto a0=c.handle<VkDevice>(0);
+        const auto a1=static_cast<uint32_t>(c.u32(1));
+        auto* a2=static_cast<const VkHostImageLayoutTransitionInfo*>(c.in_struct(2,378,a1));
+        const auto r=c.fn().vkTransitionImageLayout(a0,a1,a2);c.finish();return c.done(static_cast<std::uint32_t>(r));
+    }
+    case 248: { // vkTrimCommandPool
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=c.handle<VkCommandPool>(1);
         const auto a2=static_cast<VkCommandPoolTrimFlags>(c.u32(2));
         c.fn().vkTrimCommandPool(a0,a1,a2);c.finish();return c.done(0);
     }
-    case 232: { // vkUnmapMemory
+    case 249: { // vkUnmapMemory
         return custom_vkUnmapMemory(c);
     }
-    case 233: { // vkUpdateDescriptorSets
+    case 250: { // vkUnmapMemory2
+        return custom_vkUnmapMemory2(c);
+    }
+    case 251: { // vkUpdateDescriptorSetWithTemplate
+        return custom_vkUpdateDescriptorSetWithTemplate(c);
+    }
+    case 252: { // vkUpdateDescriptorSets
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkWriteDescriptorSet*>(c.in_struct(2,1331,a1));
@@ -41878,7 +42123,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         auto* a4=static_cast<const VkCopyDescriptorSet*>(c.in_struct(4,142,a3));
         c.fn().vkUpdateDescriptorSets(a0,a1,a2,a3,a4);c.finish();return c.done(0);
     }
-    case 234: { // vkWaitForFences
+    case 253: { // vkWaitForFences
         const auto a0=c.handle<VkDevice>(0);
         const auto a1=static_cast<uint32_t>(c.u32(1));
         auto* a2=static_cast<const VkFence*>(c.in_array(2,static_cast<std::size_t>(a1),8,A_BYTES));
@@ -41886,7 +42131,7 @@ std::optional<std::uint32_t> vulkan_dispatch(VulkanCall& c,unsigned index){
         const auto a4=static_cast<uint64_t>(c.u64(4));
         const auto r=c.fn().vkWaitForFences(a0,a1,a2,a3,a4);c.finish();return c.done(static_cast<std::uint32_t>(r));
     }
-    case 235: { // vkWaitSemaphores
+    case 254: { // vkWaitSemaphores
         const auto a0=c.handle<VkDevice>(0);
         auto* a1=static_cast<const VkSemaphoreWaitInfo*>(c.in_struct(1,1113,1));
         const auto a2=static_cast<uint64_t>(c.u64(2));

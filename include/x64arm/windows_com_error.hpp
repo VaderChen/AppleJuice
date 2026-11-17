@@ -1,9 +1,10 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include <vector>
 
 namespace x64arm {
-enum class ComErrorViewKind { Info, Create, Support, Restricted };
+enum class ComErrorViewKind { Info, Create, Support, Restricted, Language };
 struct ComErrorView {
     std::uint64_t object{};
     ComErrorViewKind kind{};
@@ -31,7 +32,9 @@ struct ComErrorBridge {
     std::map<std::uint64_t,ComErrorOperation> operations;
     std::map<std::uint64_t,RestrictedErrorOperation> restricted_operations;
     std::map<std::uint64_t,WinrtOriginOperation> origins;
-    std::uint64_t info_table{}, create_table{}, support_table{}, restricted_table{}, next_operation{1};
+    std::map<std::uint64_t,std::uint64_t> language_exceptions;
+    std::vector<std::uint64_t> language_releases;
+    std::uint64_t info_table{}, create_table{}, support_table{}, restricted_table{}, language_table{}, next_operation{1};
     bool operator==(const ComErrorBridge&) const = default;
 };
 }

@@ -315,7 +315,9 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         ,{"ntdll.dll","LdrFindEntryForAddress",2},{"ntdll.dll","LdrGetDllFullName",2},{"ntdll.dll","LdrGetDllDirectory",1},{"ntdll.dll","LdrSetDllDirectory",1}
         ,{"ntdll.dll","LdrAddDllDirectory",2},{"ntdll.dll","LdrRemoveDllDirectory",1},{"ntdll.dll","LdrSetDefaultDllDirectories",1,0,0,0x1}
         ,{"ntdll.dll","LdrFindResource_U",4,0,0,0x4},{"ntdll.dll","LdrAccessResource",4},{"ntdll.dll","LdrProcessRelocationBlock",4,0,0,0x2}
-        ,{"ntdll.dll","LdrEnumerateLoadedModules",3},{"ntdll.dll","LdrQueryImageFileExecutionOptions",6,0,0,0x14}
+        ,{"ntdll.dll","LdrEnumerateLoadedModules",3},{"ntdll.dll","LdrGetDllPath",4},{"ntdll.dll","RtlGetSearchPath",1},{"ntdll.dll","RtlGetExePath",2},{"ntdll.dll","RtlReleasePath",1},
+        {"ntdll.dll","LdrQueryProcessModuleInformation",3},{"ntdll.dll","RtlQueryProcessPlaceholderCompatibilityMode",0},{"ntdll.dll","RtlSetProcessPlaceholderCompatibilityMode",1},
+        {"ntdll.dll","RtlQueryThreadPlaceholderCompatibilityMode",0},{"ntdll.dll","RtlSetThreadPlaceholderCompatibilityMode",1},{"ntdll.dll","LdrQueryImageFileExecutionOptions",6,0,0,0x14}
         ,{"ntdll.dll","DbgBreakPoint",0},{"ntdll.dll","DbgUserBreakPoint",0}
         ,{"ntdll.dll","RtlLcidToLocaleName",4,0,0,0x5},{"ntdll.dll","RtlLocaleNameToLcid",3,0,0,0x4},{"ntdll.dll","RtlIsValidLocaleName",2,0,0,0x2}
         ,{"ntdll.dll","RtlGetUserPreferredUILanguages",5,0,0,0x3},{"ntdll.dll","RtlGetSystemPreferredUILanguages",5,0,0,0x3},{"ntdll.dll","RtlGetThreadPreferredUILanguages",4,0,0,0x1}

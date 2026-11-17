@@ -17,7 +17,10 @@ struct HttpResult {
     bool operator==(const HttpResult&) const = default;
 };
 struct HttpInput {
-    std::string url,method,proxy,bypass,username,password;
+    std::string url,method,proxy,bypass,username,password,proxy_username,proxy_password;
+    // WinHTTP 的伺服器與代理認證各自選擇方案；0 沿用 WinINet／SetOption 的自動協商。
+    std::uint32_t auth_scheme{},proxy_auth_scheme{};
+    bool credentials_set{},proxy_credentials_set{};
     bool follow_redirects{true};
     std::uint32_t redirect_policy{1},max_redirects{10},disabled_features{},decompression{},secure_protocols{};
     HttpHeaders headers;

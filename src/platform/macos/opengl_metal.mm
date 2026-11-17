@@ -12,6 +12,10 @@
 #include "x64arm/windows_opengl.hpp"
 #include "x64arm/gpu_memory.hpp"
 #include "x64arm/bounded_cache.hpp"
+#include "x64arm/resource_cache.hpp"
+#include <CommonCrypto/CommonDigest.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <IOKit/IOKitLib.h>
 #include "x64arm/graphics_index_range.hpp"
 #include "x64arm/shared_wake.hpp"
@@ -49,12 +53,21 @@
 #include <fstream>
 #include <filesystem>
 #include <unistd.h>
+#include <pthread.h>
+#include <pthread/qos.h>
 #include <sstream>
 #include <hlslcc.h>
 #include <stdexcept>
 
 namespace x64arm { namespace {
 using namespace metal_gl;
+// 呈現與繪圖提交同為互動工作；std::thread 預設的一般 QoS 在宿主有其他工作時容易錯過螢幕更新。
+// 只在執行緒建立時設定，不在逐幀路徑反覆切換。0 保留同成品的診斷對照。
+void metal_present_thread_start(const char* name){
+    (void)pthread_setname_np(name);
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_METAL_PRESENT_QOS");return !value || std::string_view(value)!="0";}();
+    if(enabled)(void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
+}
 // 診斷可縮小或停用快取，不能放大正式上限。計帳涵蓋索引與鍵，Metal 私有配置由筆數限制。
 std::size_t metal_cache_entries(const char* name,std::size_t limit){
     const auto* text=std::getenv(name);if(!text || !*text)return limit;
@@ -162,6 +175,7 @@ public:
             static_cast<unsigned long long>(elapsed/1000),static_cast<long long>(now),name_);
     }
 };
+#include "metal_library_cache.inc"
 #include "metal_programmable_types.inc"
 static std::uint32_t metal_batch_limit();
 id<MTLTexture> metal_shader_texture(const GraphicsView&);

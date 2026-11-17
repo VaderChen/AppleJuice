@@ -46,8 +46,16 @@ Counters& counters() noexcept {static Counters value;return value;}
 std::uint64_t fnv(std::span<const std::uint8_t> bytes) noexcept {
     std::uint64_t hash=1469598103934665603ULL;for(const auto value:bytes){hash^=value;hash*=1099511628211ULL;}return hash;
 }
-std::array<std::uint8_t,16> executable_identity() noexcept {
+std::array<std::uint8_t,16> translation_identity() noexcept {
     std::array<std::uint8_t,16> result{};
+#if defined(X64ARM_SHADER_CACHE_REVISION)
+    // 相同格式、轉譯來源及相依套件可跨執行檔沿用；完整來源雜湊由建置系統維護。
+    constexpr std::string_view revision=X64ARM_SHADER_CACHE_REVISION;
+    std::array<unsigned char,CC_SHA256_DIGEST_LENGTH> digest{};
+    CC_SHA256(revision.data(),static_cast<CC_LONG>(revision.size()),digest.data());
+    std::copy_n(digest.begin(),result.size(),result.begin());return result;
+#else
+    // 未經正式建置系統的工具仍採保守的執行檔身分，不能誤沿用不明轉譯器的資料。
     const auto* image=reinterpret_cast<const mach_header_64*>(_dyld_get_image_header(0));
     if(!image || image->magic!=MH_MAGIC_64)return result;
     const auto* at=reinterpret_cast<const std::uint8_t*>(image+1);
@@ -60,6 +68,7 @@ std::array<std::uint8_t,16> executable_identity() noexcept {
         at+=command.cmdsize;
     }
     return result;
+#endif
 }
 void trace() noexcept {
     static const bool enabled=std::getenv("X64ARM_SHADER_MEMORY_CACHE_TRACE")!=nullptr;
@@ -79,7 +88,7 @@ class Segment {
     Record record(std::uint64_t offset) const noexcept {Record value;std::memcpy(&value,base_+offset,sizeof value);return value;}
 public:
     bool open(){
-        const auto identity=executable_identity();
+        const auto identity=translation_identity();
         if(std::all_of(identity.begin(),identity.end(),[](auto value){return value==0;}))return false; // 無法辨識引擎身分時不共用。
         const auto* text=std::getenv("X64ARM_SHADER_MEMORY_CACHE_MB");
         const auto megabytes=std::clamp<std::uint64_t>(text?std::strtoull(text,nullptr,10):256,16,2048);

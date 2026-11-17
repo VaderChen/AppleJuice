@@ -110,6 +110,7 @@ bool metal_vertex_cull_needed(MetalShader& shader){
 std::vector<unsigned> metal_free_buffers(const MetalShader& shader,const std::array<int,32>* slots,unsigned count){
     std::set<unsigned> occupied;
     if(shader.buffer_views_slot!=UINT32_MAX)occupied.insert(shader.buffer_views_slot);
+    if(shader.buffer_sizes_slot!=UINT32_MAX)occupied.insert(shader.buffer_sizes_slot);
     for(const auto& b:shader.bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9)){occupied.insert(b.native_slot);if(b.counter_slot!=UINT32_MAX)occupied.insert(b.counter_slot);}
     if(slots)for(int slot:*slots)if(slot>=0)occupied.insert(static_cast<unsigned>(slot));
     std::vector<unsigned> result;for(unsigned i=0;i<31 && result.size()<count;++i)if(!occupied.contains(i))result.push_back(i);
@@ -358,7 +359,7 @@ std::shared_ptr<const MetalGeometryMesh> MetalGl::graphics_geometry_mesh(const G
             const auto used=[](const MetalShader& shader){std::array<unsigned,3> value{};
                 for(const auto& b:shader.bindings){if(b.type==2)value[2]=std::max(value[2],b.native_slot+1);else if(b.type==1 || b.type==5)value[1]=std::max(value[1],b.native_slot+1);
                     else{value[0]=std::max(value[0],b.native_slot+1);if(b.counter_slot!=UINT32_MAX)value[0]=std::max(value[0],b.counter_slot+1);}}
-                if(shader.buffer_views_slot!=UINT32_MAX)value[0]=std::max(value[0],shader.buffer_views_slot+1);return value;};
+                if(shader.buffer_views_slot!=UINT32_MAX)value[0]=std::max(value[0],shader.buffer_views_slot+1);if(shader.buffer_sizes_slot!=UINT32_MAX)value[0]=std::max(value[0],shader.buffer_sizes_slot+1);return value;};
             offsets=used(*gs);const auto vertex_used=used(*vs);
             if(offsets[0]+vertex_used[0]>31 || offsets[1]+vertex_used[1]>128 || offsets[2]+vertex_used[2]>16)return nullptr;
             std::vector<std::string> types;{const std::regex declared(R"(\bstruct\s+(\w+))");for(std::sregex_iterator it(source.begin(),source.end(),declared),end;it!=end;++it)types.push_back((*it)[1]);}

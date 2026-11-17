@@ -1,4 +1,9 @@
 #include "x64arm/windows_services.hpp"
+#if defined(__APPLE__)
+#include <sys/fsgetpath.h>
+#include <sys/mount.h>
+#include <sys/param.h>
+#endif
 #include "service_callback_task.hpp"
 #include "crt_os_error.hpp"
 #include "windows_file_stat.hpp"
@@ -352,7 +357,7 @@ std::span<const WindowsServiceDescriptor> file_service_descriptors() {
         {"kernel32.dll","GetFileAttributesA",1},{"kernel32.dll","GetFileAttributesW",1},
         {"kernel32.dll","SetFileAttributesA",2},{"kernel32.dll","SetFileAttributesW",2},
         {"kernel32.dll","GetFileAttributesExA",3},{"kernel32.dll","GetFileAttributesExW",3},
-        {"kernel32.dll","GetFileInformationByHandle",2},{"kernel32.dll","GetFileInformationByHandleEx",4},
+        {"kernel32.dll","GetFileInformationByHandle",2},{"kernel32.dll","GetFileInformationByHandleEx",4},{"kernel32.dll","OpenFileById",6},
         {"kernel32.dll","GetFileInformationByName",4,0,0,0xa},
         {"kernel32.dll","GetVolumeInformationByHandleW",8},
         {"crt","_stat32",2},{"crt","_stat32i64",2},{"crt","_stat64i32",2},{"crt","_stat64",2},
@@ -367,6 +372,7 @@ std::pair<std::uint32_t,DirectorySearch> WindowsServices::search_directory(const
 std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     if(service.symbol=="BackupRead" || service.symbol=="BackupWrite" || service.symbol=="BackupSeek")return invoke_file_backup(state,memory,service);
     if(service.symbol=="GetOverlappedResult" || service.symbol=="GetOverlappedResultEx")return invoke_overlapped_result(state,memory,service);
+#include "windows_file_by_id.inc"
     const WindowsCall arg(state,memory,service);auto symbol=service.symbol;
     // 舊版 CRT 名稱（_findfirst／_findfirsti64、_stat／_stati64、_fstat…）依 time_t 寬度對應明確版本：
     // Win32 的 time_t 為 32 位元、Win64 為 64 位元；i64 版本另帶 64 位元檔案大小。

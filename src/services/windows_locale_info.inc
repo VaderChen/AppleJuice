@@ -106,6 +106,28 @@ std::optional<LocaleInfo> locale_information(const Locale& locale,std::uint32_t 
     case 0x17:return text(number_symbol(currency.get(),UNUM_MONETARY_GROUPING_SEPARATOR_SYMBOL));
     case 0x18:return text(grouping(currency.get()));
     case 0x19:case 0x1a:return locale_info_number(static_cast<std::uint32_t>(unum_getAttribute(currency.get(),UNUM_MAX_FRACTION_DIGITS)));
+    case 0x1b:case 0x1c:case 0x1010:{
+        // LOCALE_ICURRENCY／LOCALE_INEGCURR／LOCALE_INEGNUMBER：取與 GetCurrencyFormat／GetNumberFormat 預設輸出相同樣式（貨幣為會計樣式）的字首字尾，
+        // 正規化成 Windows 的 $、n、-、括號與空白形狀後查表；表外形狀依符號位置回退成負號在前的格式。
+        const bool money=type!=0x1010,negative=type!=0x1b;
+        error=U_ZERO_ERROR;NumberFormat format(unum_open(money?UNUM_CURRENCY_ACCOUNTING:UNUM_DECIMAL,nullptr,0,id.c_str(),nullptr,&error),unum_close);
+        if(U_FAILURE(error) || !format)throw std::runtime_error("ICU 數值語系建立失敗");
+        const auto symbol=money?number_symbol(format.get(),UNUM_CURRENCY_SYMBOL):std::u16string{},sign=number_symbol(format.get(),UNUM_MINUS_SIGN_SYMBOL);
+        const auto canonical=[&](UNumberFormatTextAttribute attr){
+            const auto value=locale_info_text([&](UChar* buffer,int count,UErrorCode* status){return unum_getTextAttribute(format.get(),attr,buffer,count,status);});
+            std::u16string out;for(std::size_t i=0;i<value.size();){
+                if(!symbol.empty() && value.compare(i,symbol.size(),symbol)==0){out+=u'$';i+=symbol.size();}
+                else if(!sign.empty() && value.compare(i,sign.size(),sign)==0){out+=u'-';i+=sign.size();}
+                else if(value[i]==u'(' || value[i]==u')')out+=value[i++];
+                else{if(u_isUWhiteSpace(value[i]) && (out.empty() || out.back()!=u' '))out+=u' ';++i;}
+            }return out;};
+        const auto shape=canonical(negative?UNUM_NEGATIVE_PREFIX:UNUM_POSITIVE_PREFIX)+u"n"+canonical(negative?UNUM_NEGATIVE_SUFFIX:UNUM_POSITIVE_SUFFIX);
+        static constexpr std::array<std::u16string_view,5> numbers{u"(n)",u"-n",u"- n",u"n-",u"n -"};
+        static constexpr std::array<std::u16string_view,4> positives{u"$n",u"n$",u"$ n",u"n $"};
+        static constexpr std::array<std::u16string_view,16> negatives{u"($n)",u"-$n",u"$-n",u"$n-",u"(n$)",u"-n$",u"n-$",u"n$-",u"-n $",u"-$ n",u"n $-",u"$ n-",u"$ -n",u"n- $",u"($ n)",u"(n $)"};
+        const std::span<const std::u16string_view> patterns=!money?std::span<const std::u16string_view>(numbers):negative?std::span<const std::u16string_view>(negatives):std::span<const std::u16string_view>(positives);
+        for(std::size_t i=0;i<patterns.size();++i)if(patterns[i]==shape)return locale_info_number(static_cast<std::uint32_t>(i));
+        return locale_info_number(!money?1U:!negative?(shape.find(u'$')<shape.find(u'n')?0U:1U):(shape.find(u'$')<shape.find(u'n')?1U:5U));}
     case 0x50:return text(u""); // 正數不帶正號，符合 Windows 的預設數值格式。
     case 0x51:return text(number_symbol(decimal.get(),UNUM_MINUS_SIGN_SYMBOL));
     case 0x69:return text(number_symbol(decimal.get(),UNUM_NAN_SYMBOL));

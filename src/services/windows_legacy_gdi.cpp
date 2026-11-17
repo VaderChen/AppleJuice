@@ -389,6 +389,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_gdi(GuestState& stat
                 const auto text=[&](std::uint64_t at,std::u16string_view value,std::size_t limit){for(std::size_t i=0;i<limit;++i)memory.store(GuestAddress{at+i*2},16,i<value.size()?value[i]:0);};
                 const auto identity=metal_opengl_identity();const auto renderer=identity?utf8_to_utf16(identity->first):std::u16string(display_identity::adapter_name);
                 switch(type){
+                case 48: // KMTQAITYPE_QUERYREGISTRY：共用 SetupAPI 的裝置、登錄與 DriverStore 後端。
+                    return invoke_device_configuration(state,memory,service);
                 case 3: // KMTQAITYPE_GETSEGMENTSIZE：UMA 沒有獨立顯存，共享系統記憶體＝GPU 記憶體額度。
                     if(!need(24))return finish(invalid);memory.store(GuestAddress{data},64,0);memory.store(GuestAddress{data+8},64,0);memory.store(GuestAddress{data+16},64,memory_limit.limit);return finish(ok);
                 case 8: // KMTQAITYPE_ADAPTERREGISTRYINFO：AdapterString／BiosString／DacType／ChipType 各 WCHAR[260]。

@@ -636,7 +636,10 @@
             graphics_handled=true;auto context=typed(arg(0),Kind::Context),view=typed(arg(1),Kind::Unordered);require(view->device==context->device);const auto raw=bytes32(arg(2),4);std::array<std::uint32_t,4> values{};std::copy(raw.begin(),raw.end(),values.begin());
             const auto target=view->graphics_view;const bool floating=symbol.ends_with("Float");// 文件：Float 版只用於 FLOAT／UNORM／SNORM UAV，其他 UAV 的呼叫「不送達驅動」即略過；Uint 版適用任何 UAV。
             submit(context,{[target,values,floating](auto& native){if(!native.graphics_clear_unordered(target,values,floating) && !floating)throw std::invalid_argument("UAV 清除值與格式不相容");}});
-        }else if(symbol=="ClearState"){graphics_handled=true;auto context=typed(arg(0),Kind::Context);clear_bindings(context);context->linkage_constants={};context->linkage_keys={};}
+        }else if(symbol=="ClearState" || symbol=="D3DX10UnsetAllDeviceObjects"){
+            // D3DX10UnsetAllDeviceObjects(ID3D10Device*)：解除裝置上所有繫結，與 D3D10 裝置的 ClearState 相同（作用於其內部 context）。
+            graphics_handled=true;auto context=symbol=="ClearState"?typed(arg(0),Kind::Context):typed(typed(arg(0),Kind::Device)->context10,Kind::Context);
+            clear_bindings(context);context->linkage_constants={};context->linkage_keys={};}
         // 明確的 Flush 一律實際提交（序號 0）：後端在提交時回收已完成批次、釋出延後銷毀資源的 GPU 額度。回收在命令執行緒上進行，Flush 返回時不一定已完成；
         // Flush 文件的 ClearState＋Flush 後立即配置若額度不足，由代理的 graphics_resource 同步、提交後重試。仍記錄序號，讓之後的 GetData 知道 End 已被涵蓋。
         // 延遲內容的 Flush 沒有作用（命令要到 ExecuteCommandList 才送出），不是錯誤；3DMark Fire Strike 在 deinit 時會呼叫。
@@ -940,7 +943,10 @@
             graphics_handled=true;auto device=typed(arg(0),Kind::DxgiDevice);if(symbol=="SetGPUThreadPriority"){require(static_cast<std::int32_t>(u32(1))>=-7 && static_cast<std::int32_t>(u32(1))<=7);device->priority=u32(1);}else if(symbol=="GetGPUThreadPriority")memory.store(GuestAddress{arg(1)},32,device->priority);else if(symbol=="SetMaximumFrameLatency"){require(u32(1)<=16);device->slice=u32(1)?u32(1):3;}else memory.store(GuestAddress{arg(1)},32,device->slice?device->slice:3);
         }
 
-        else if(symbol.starts_with("D3DX11CompileFrom") || symbol=="D3DCompile" || symbol=="D3DCompile2" || symbol=="D3DDisassemble" || symbol=="D3DCreateBlob" || symbol=="BlobPointer" || symbol=="BlobSize" || symbol=="D3DGetInputSignatureBlob" || symbol=="D3DGetOutputSignatureBlob" || symbol=="D3DGetInputAndOutputSignatureBlob"){
+        else if(symbol.starts_with("D3DX11CompileFrom") || symbol=="D3DCompile" || symbol=="D3DCompile2" || symbol=="D3DDisassemble" || symbol=="D3DCreateBlob" || symbol=="BlobPointer" || symbol=="BlobSize" || symbol=="D3DGetInputSignatureBlob" || symbol=="D3DGetOutputSignatureBlob" || symbol=="D3DGetInputAndOutputSignatureBlob" ||
+                symbol=="D3D10CompileShader" || symbol=="D3D10CompileEffectFromMemory" || symbol=="D3D10GetShaderDebugInfo" || (symbol.starts_with("D3D10Get") && symbol.ends_with("ShaderProfile")) ||
+                symbol=="D3DPreprocess" || symbol=="D3DGetBlobPart" || symbol=="D3DStripShader" || symbol=="D3DGetDebugInfo" || symbol=="D3DReadFileToBlob" || symbol=="D3DWriteBlobToFile" ||
+                symbol=="D3DCompileFromFile" || symbol=="D3DAssemble" || symbol=="D3DX10PreprocessShaderFromMemory"){
             graphics_handled=true;
             const auto blob=[&](std::span<const std::uint8_t> data){auto id=create(Kind::Blob);try{const auto ptr=allocate_heap(memory,std::max<std::size_t>(1,data.size()));if(!ptr)throw std::bad_alloc{};id->allocations.push_back(ptr);id->mapped=ptr;id->sequence=data.size();memory.write(GuestAddress{ptr},data);}catch(...){release(id->root);throw;}return id->root;};
             if(symbol=="BlobPointer")result=typed(arg(0),Kind::Blob)->mapped;
@@ -956,6 +962,66 @@
                 text.push_back(0);write_pointer(arg(4),blob({reinterpret_cast<const std::uint8_t*>(text.data()),text.size()}));
             }
             else if(symbol=="D3DCreateBlob"){require(arg(0)<=64*1024*1024);output(1);std::vector<std::uint8_t> data(static_cast<std::size_t>(arg(0)));write_pointer(arg(1),blob(data));}
+            else if(symbol.ends_with("ShaderProfile")){
+                // D3D10Get{Vertex,Pixel,Geometry}ShaderProfile(pDevice)：10.1 等級的裝置為 4_1，其他（含 NULL）為 4_0；字串常駐於程序。
+                std::string level="4_0";if(arg(0) && typed(arg(0),Kind::Device)->feature_level==0xa100)level="4_1";
+                const auto text=std::string(symbol=="D3D10GetVertexShaderProfile"?"vs_":symbol=="D3D10GetPixelShaderProfile"?"ps_":"gs_")+level;
+                auto& cached=bridge.profile_strings[text];
+                if(!cached){std::vector<std::uint8_t> bytes(text.begin(),text.end());bytes.push_back(0);cached=runtime_allocate(memory,bytes);}
+                result=cached;
+            }
+            else if(symbol=="D3D10GetShaderDebugInfo" || symbol=="D3DGetDebugInfo"){
+                // (Bytecode, Length, ppDebugInfo)：DXBC 容器中的 SDBG 區塊；沒有偵錯資訊時回 E_FAIL。
+                output(2);write_pointer(arg(2),0);require(arg(0) && arg(1)>=32 && arg(1)<=16U*1024U*1024U);
+                const auto debug=graphics_dxbc_section(read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1))),0x47424453U);
+                if(!debug)result=0x80004005U;else write_pointer(arg(2),blob(*debug));
+            }
+            else if(symbol=="D3DGetBlobPart"){
+                // (Data, Size, D3D_BLOB_PART, Flags, ppPart)：簽章部分回傳只含簽章的 DXBC 容器；其他部分回傳對應區塊的原始資料；不存在回 E_FAIL。
+                output(4);write_pointer(arg(4),0);require(arg(0) && arg(1)>=32 && arg(1)<=16U*1024U*1024U && !u32(3));
+                const auto bytes=read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1)));const auto part=u32(2);
+                constexpr std::array<std::uint32_t,5> signature_masks{1,2,3,4,7};
+                // DEBUG_INFO 5 SDBG、LEGACY_SHADER 6 Aon9、XNA_PREPASS 7 XNAP、XNA 8 XNAS、PDB 9 SPDB、PRIVATE_DATA 10 PRIV、ROOT_SIGNATURE 11 RTS0、DEBUG_NAME 12 ILDN。
+                constexpr std::array<std::uint32_t,8> tags{0x47424453U,0x396e6f41U,0x50414e58U,0x53414e58U,0x42445053U,0x56495250U,0x30535452U,0x4e444c49U};
+                if(part<signature_masks.size()){try{write_pointer(arg(4),blob(graphics_signature_blob(bytes,signature_masks[part])));}catch(const std::invalid_argument&){result=0x80004005U;}}
+                else if(part>=5 && part<5+tags.size()){const auto data=graphics_dxbc_section(bytes,tags[part-5]);if(!data)result=0x80004005U;else write_pointer(arg(4),blob(*data));}
+                else result=0x80070057U;
+            }
+            else if(symbol=="D3DStripShader"){
+                // (Bytecode, Length, StripFlags, ppStripped)：REFLECTION_DATA 1 移除 RDEF／STAT、DEBUG_INFO 2 移除 SDBG／SPDB／ILDB／ILDN、TEST_BLOBS 4、
+                // PRIVATE_DATA 8 移除 PRIV、ROOT_SIGNATURE 16 移除 RTS0；其餘區塊保留並重算校驗和。
+                output(3);write_pointer(arg(3),0);require(arg(0) && arg(1)>=32 && arg(1)<=16U*1024U*1024U);const auto flags=u32(2);
+                const auto stripped=graphics_dxbc_filter(read_bytes(memory,arg(0),static_cast<std::size_t>(arg(1))),[&](std::uint32_t tag){
+                    if((flags&1U) && (tag==0x46454452U || tag==0x54415453U))return false;
+                    if((flags&2U) && (tag==0x47424453U || tag==0x42445053U || tag==0x42444c49U || tag==0x4e444c49U))return false;
+                    if((flags&8U) && tag==0x56495250U)return false;
+                    if((flags&16U) && tag==0x30535452U)return false;
+                    return true;});
+                write_pointer(arg(3),blob(stripped));
+            }
+            else if(symbol=="D3DReadFileToBlob"){
+                // (FileName（寬字元）, ppContents)
+                output(1);write_pointer(arg(1),0);require(arg(0));
+                const auto opened=filesystem_.open_reader(utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})));
+                if(opened.error)result=0x80070000U|opened.error;
+                else{const auto info=opened.file->information();if(info.error)result=0x80070000U|info.error;
+                    else{require(info.metadata.size<=256U*1024U*1024U);std::vector<std::uint8_t> data(static_cast<std::size_t>(info.metadata.size));const auto io=opened.file->read(data,0);
+                        if(io.error || io.bytes!=data.size())result=0x80070000U|(io.error?io.error:38U);else write_pointer(arg(1),blob(data));}}
+            }
+            else if(symbol=="D3DWriteBlobToFile"){
+                // (Blob, FileName（寬字元）, bOverwrite)：經 CreateFileW（CREATE_ALWAYS 或 CREATE_NEW）與 WriteFile 寫出 blob 內容。
+                auto source=typed(arg(0),Kind::Blob);require(arg(1));
+                const auto invalid_handle=x86_?UINT64_C(0xffffffff):UINT64_MAX;
+                const auto file=nested_service(state,memory,"kernel32.dll","CreateFileW",{arg(1),0x40000000U,0,0,u32(2)?2U:1U,0x80,0});
+                if(file==invalid_handle || !file)result=0x80070000U|(last_error_?last_error_:5U);
+                else{
+                    const auto written=allocate_heap(memory,4);if(!written)throw std::bad_alloc{};
+                    const auto ok=nested_service(state,memory,"kernel32.dll","WriteFile",{file,source->mapped,source->sequence,written,0})&UINT32_MAX;
+                    const auto count=memory.load(GuestAddress{written},32);(void)free_heap(memory,written,state);const auto error=last_error_;
+                    (void)nested_service(state,memory,"kernel32.dll","CloseHandle",{file});
+                    if(!ok || count!=source->sequence)result=0x80070000U|(error?error:29U);
+                }
+            }
             else {
                 // 遊戲已載入自帶的 HLSL 編譯器（app-local d3dcompiler，見 load_module）：D3DX11CompileFromMemory 直接尾呼叫它的 D3DCompile。
                 // 兩者參數相同，只差 pPump／pHResult（同步編譯時皆為 NULL）：ppShader、ppErrorMsgs 移到 D3DCompile 的第 10、11 個參數位置，
@@ -985,18 +1051,24 @@
                         (void)bits;state.rip=GuestAddress{compile};state.rep_compare={};return std::nullopt;
                     }
                 }
-                const bool d3dx=symbol.starts_with("D3DX11CompileFrom"),file=symbol.starts_with("D3DX11CompileFromFile"),resource=symbol.starts_with("D3DX11CompileFromResource");
-                const unsigned macros_arg=file?1:3,include_arg=file?2:4,entry_arg=file?3:5,profile_arg=file?4:6,flags_arg=file?5:7;
-                const unsigned code=d3dx?(file?8:10):(symbol=="D3DCompile2"?12:9),errors=code+1;
+                const bool d3dx=symbol.starts_with("D3DX11CompileFrom"),file=symbol.starts_with("D3DX11CompileFromFile") || symbol=="D3DCompileFromFile",resource=symbol.starts_with("D3DX11CompileFromResource");
+                // D3DCompileFromFile 與 D3DX11CompileFromFile 同形但沒有 pPump／pHResult；D3DPreprocess（輸出前處理後文字）與 D3DAssemble（組譯 SM1～3）沒有進入點與設定檔。
+                const bool compile_file=symbol=="D3DCompileFromFile",d3dx10_preprocess=symbol=="D3DX10PreprocessShaderFromMemory",preprocess=symbol=="D3DPreprocess" || d3dx10_preprocess,assemble=symbol=="D3DAssemble";
+                // D3D10CompileShader 與 D3DCompile 相同但沒有 Flags2；D3D10CompileEffectFromMemory 以 fx_4_0 編譯，HLSL／FX 旗標在第 6、7 個參數。
+                const bool d3d10_shader=symbol=="D3D10CompileShader",d3d10_effect=symbol=="D3D10CompileEffectFromMemory";
+                const unsigned macros_arg=file?1:3,include_arg=file?2:4,entry_arg=file?3:5,profile_arg=file?4:6,flags_arg=file?5:(d3d10_effect || assemble?5:7);
+                const unsigned code=d3dx?(file?8:10):compile_file?7:d3dx10_preprocess?6:preprocess?5:assemble?6:d3d10_shader?8:d3d10_effect?7:(symbol=="D3DCompile2"?12:9),errors=code+1;
                 output(code);write_pointer(arg(code),0);if(arg(errors)){output(errors);write_pointer(arg(errors),0);}
                 // 同步編譯共用 HLSL 後端；自訂 include 經原執行緒的真正客體 callback。
                 if(d3dx)require(!arg(file?7:9) && !arg(code+2));
-                else require(!(u32(8)&~3U) && (!u32(8) || read_ansi(memory,arg(profile_arg)).starts_with("fx_")));
+                else if(compile_file)require(!(u32(6)&~3U) && (!u32(6) || read_ansi(memory,arg(profile_arg)).starts_with("fx_")));
+                else if(d3dx10_preprocess)require(!arg(5) && !arg(8)); // 同步版本：pPump、pHResult 為 NULL（與 D3DX11 編譯入口相同）
+                else if(!d3d10_shader && !d3d10_effect && !preprocess && !assemble)require(!(u32(8)&~3U) && (!u32(8) || read_ansi(memory,arg(profile_arg)).starts_with("fx_")));
                 if(symbol=="D3DCompile2")require(!u32(9) && !arg(10) && !arg(11));
                 std::string source_name="shader";
                 std::vector<std::uint8_t> source;
                 if(file){
-                    source_name=symbol.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
+                    source_name=symbol.ends_with('W') || compile_file?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)})):read_ansi(memory,arg(0));
                     const auto opened=filesystem_.open_reader(source_name);
                     if(opened.error)throw texture_image::Error(0x80070000U|opened.error,"無法讀取 shader 檔案");
                     const auto info=opened.file->information();
@@ -1042,7 +1114,7 @@
                 };
 
                 // D3DX 的檔案入口提供預設 include；D3DCompile 記憶體入口須明確傳入 STANDARD_FILE_INCLUDE。
-                if(!operation && (file || arg(include_arg)==1))include_loader=[&](std::string_view filename,bool local,std::string_view parent)->std::optional<HlslIncludeSource>{
+                if(!operation && ((file && !compile_file) || arg(include_arg)==1))include_loader=[&](std::string_view filename,bool local,std::string_view parent)->std::optional<HlslIncludeSource>{
                     const auto directory=[](std::string_view path){const auto at=path.find_last_of("/\\");return at==path.npos?std::string{}:std::string(path.substr(0,at+1));};
                     const bool absolute=filename.starts_with('/') || filename.starts_with('\\') || (filename.size()>1 && filename[1]==':');
                     std::vector<std::string> paths;if(absolute)paths.emplace_back(filename);else{
@@ -1058,7 +1130,11 @@
                     }
                     return std::nullopt;
                 };
-                auto compilation=operation && operation->result?*operation->result:graphics_compile_hlsl_includes(source,source_name,arg(entry_arg)?read_ansi(memory,arg(entry_arg)):"main",read_ansi(memory,arg(profile_arg)),macros,u32(flags_arg),include_loader,d3dx?u32(file?6:8):u32(8));
+                auto compilation=operation && operation->result?*operation->result:
+                    preprocess?graphics_preprocess_shader(source,source_name,macros,include_loader):
+                    assemble?graphics_assemble_shader(source,source_name,macros,u32(flags_arg),include_loader):
+                    graphics_compile_hlsl_includes(source,source_name,!d3d10_effect && arg(entry_arg)?read_ansi(memory,arg(entry_arg)):"main",d3d10_effect?std::string("fx_4_0"):read_ansi(memory,arg(profile_arg)),macros,u32(flags_arg),include_loader,d3dx?u32(file?6:8):compile_file?u32(6):d3d10_shader?0U:d3d10_effect?u32(6):u32(8));
+                if(preprocess && !compilation.bytecode.empty() && compilation.bytecode.back()!=0 && (!operation || !operation->pending))compilation.bytecode.push_back(0); // 前處理文字以 NUL 結尾
                 if(operation){
                     if(operation->pending){
                         const auto& entry=*operation->pending;

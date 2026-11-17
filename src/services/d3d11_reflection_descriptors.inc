@@ -1,4 +1,4 @@
-{"d3dcompiler_43.dll","D3DReflect",4},{"d3dcompiler_47.dll","D3DReflect",4},
+{"d3dcompiler_43.dll","D3DReflect",4},{"d3dcompiler_47.dll","D3DReflect",4},{"d3d10.dll","D3D10ReflectShader",3},
 {"internal-d3d11","ReflectDesc",2},
 {"internal-d3d11","ReflectBufferByIndex",2},
 {"internal-d3d11","ReflectBufferByName",2},

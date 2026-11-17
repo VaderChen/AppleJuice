@@ -21,6 +21,7 @@
 #include "windows_display_identity.hpp"
 #include "windows_system_info_layout.hpp"
 #include "x64arm/cpu_features.hpp"
+#include "x64arm/processor_information.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -226,8 +227,8 @@ bool WindowsServices::resident_timestamp_counter(const GuestState&,const GuestMe
     // 只讀硬體時間，不呼叫 retired，也不寫全體執行緒共用的 KUSER 時間頁。
     const auto ticks=detail::monotonic_ticks();
     const auto& identity=memory.processor_identity();
-    const std::uint64_t mhz=identity.base_mhz?identity.base_mhz:identity.maximum_mhz;
-    result=mhz?static_cast<std::uint64_t>(static_cast<unsigned __int128>(ticks)*mhz/10U):ticks;
+    const auto mhz=processor_timestamp_mhz(identity.base_mhz,identity.maximum_mhz);
+    result=static_cast<std::uint64_t>(static_cast<unsigned __int128>(ticks)*mhz/10U);
     return true;
 }
 #endif

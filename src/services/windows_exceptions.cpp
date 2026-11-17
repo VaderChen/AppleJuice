@@ -766,7 +766,7 @@ std::span<const WindowsServiceDescriptor> exception_service_descriptors(){
         {"ntdll.dll", "RtlInstallFunctionTableCallback", 6},{"ntdll.dll", "RtlAddGrowableFunctionTable", 6},{"ntdll.dll", "RtlGrowFunctionTable", 2},{"ntdll.dll", "RtlDeleteGrowableFunctionTable", 1},
         {"kernel32.dll", "RaiseException", 4},{"kernel32.dll", "AddVectoredExceptionHandler", 2},{"kernel32.dll", "RemoveVectoredExceptionHandler", 1},{"kernel32.dll", "AddVectoredContinueHandler", 2},
         {"kernel32.dll", "RemoveVectoredContinueHandler", 1},{"kernel32.dll", "RtlPcToFileHeader", 2},{"ntdll.dll", "RtlPcToFileHeader", 2},{"kernel32.dll", "RtlCaptureContext", 1},
-        {"kernel32.dll", "RtlLookupFunctionEntry", 3},{"kernel32.dll", "RtlVirtualUnwind", 8},{"kernel32.dll", "RtlUnwindEx", 6},{"crt", "_local_unwind", 2},
+        {"kernel32.dll", "RtlLookupFunctionEntry", 3},{"ntdll.dll", "RtlLookupFunctionTable", 3},{"ntdll.dll", "RtlIsEcCode", 1},{"kernel32.dll", "RtlIsEcCode", 1},{"kernel32.dll", "RtlVirtualUnwind", 8},{"kernel32.dll", "RtlUnwindEx", 6},{"crt", "_local_unwind", 2},
         {"crt", "__C_specific_handler", 4},{"kernel32.dll", "__C_specific_handler", 4},{"ntdll.dll", "__C_specific_handler", 4},{"crt", "setjmp", 1},
         {"crt", "_setjmp", 2},{"crt", "__intrinsic_setjmp", 1},{"crt", "_setjmpex", 2},{"crt", "__intrinsic_setjmpex", 2},
         {"crt", "longjmp", 2},{"crt", "_setjmp3", 2},{"crt", "_longjmpex", 2},
@@ -902,6 +902,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_exception(GuestState& state
                 result = image->function_table + static_cast<std::uint64_t>(function - image->functions.data()) * 12;
             }
         }
+    } else if (symbol == "RtlLookupFunctionTable") {
+        // (ControlPc, ImageBase*, SizeOfTable*)：與 RtlLookupFunctionEntry 同一份映像例外目錄（.pdata），或以 RtlAddFunctionTable／
+        // RtlAddGrowableFunctionTable 登錄的動態表；回呼式動態表沒有固定表格，與找不到時同樣回 NULL。SizeOfTable 為位元組數。
+        std::uint64_t base=0,table=0,size=0;
+        if(const auto* image=module_image(arg(0),true);image && image->function_table){base=image->base;table=image->function_table;size=image->functions.size()*12U;}
+        else if(!x86_)for(const auto& dynamic:runtime_.dynamic_function_tables)
+            if(!dynamic.callback && arg(0)>=dynamic.image.base && arg(0)<dynamic.range_end){base=dynamic.image.base;table=dynamic.image.function_table;size=std::uint64_t{dynamic.count}*12U;break;}
+        if(table){memory.store(GuestAddress{arg(1)},64,base);memory.store(GuestAddress{arg(2)},32,size);result=table;}
+    } else if (symbol == "RtlIsEcCode") {
+        // 是否為 ARM64EC 程式碼。客體是 x64／x86 程序，載入器拒絕帶 CHPE 中繼資料（Load Config 偏移 200）的映像，動態產碼也只有 x64，
+        // 因此程序內不存在 EC 程式碼，任何位址都回 FALSE（與 x64 Windows 相同，不讀取位址內容）。
+        result=0;
     } else if (symbol == "RtlVirtualUnwind") {
         RuntimeImage leaf;leaf.base=arg(1);leaf.size=UINT64_MAX-leaf.base;
         const auto* image=arg(3)?unwind_image(memory,arg(2),arg(3)):&leaf;

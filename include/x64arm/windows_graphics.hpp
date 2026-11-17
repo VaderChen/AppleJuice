@@ -35,14 +35,16 @@ struct GraphicsPipelineStatistics {std::uint64_t ia_vertices{},ia_primitives{},v
 // type：0 CBV、1 SRV 貼圖／typed buffer、2 取樣器、3 SRV 緩衝、4 UAV 緩衝、5 UAV 貼圖；
 // 6～9 為 D3D12 描述元表（bindless 大陣列）：6 SRV 貼圖、7 UAV 貼圖、8 SRV 緩衝、9 UAV 緩衝，以 (space, slot) 對應根簽章範圍。
 // count：描述元表宣告的描述元數（~0U 為無界；0 表示非描述元表）。
-// source：D3D12 離散 UAV 緩衝暫存器超出 u7 時改用未占用的 slot，這裡保存原始暫存器（UINT32_MAX 表示未重新對應）。
+// source：D3D12 離散資源的非零 space／高編號暫存器改用未占用 slot，這裡保存原始暫存器（UINT32_MAX 表示未重新對應）。
 // dimension：著色器宣告的貼圖維度（數值同 D3D_SRV_DIMENSION，0 表示未知）。
 struct GraphicsBinding {std::uint32_t type{},slot{},native_slot{},counter_slot{UINT32_MAX},space{},count{},source{UINT32_MAX},dimension{};};
 struct GraphicsInput {std::string semantic;std::uint32_t index{},attribute{},component{};}; // component：0 浮點、1 無號、2 有號。
 struct GraphicsLegacyShader {std::string source,entry;std::vector<GraphicsBinding> bindings;std::vector<GraphicsInput> inputs;};
 GraphicsLegacyShader graphics_legacy_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes);
 // SM5.1 DXBC 與 DXIL：經 vkd3d-shader（SPIR-V）與 SPIRV-Cross 轉為 MSL；入口為 xlatMtlMain。
-struct GraphicsModernShader {std::string source,entry;std::vector<GraphicsBinding> bindings;std::vector<GraphicsInput> inputs;std::array<std::uint32_t,3> threads{1,1,1};};
+// 原始 D3D 簽章的位置與分量遮罩；階段連結不能把轉譯器的 locnN 當成語意名稱。
+struct GraphicsShaderSemantic {std::string semantic;std::uint32_t index{},location{},mask{};};
+struct GraphicsModernShader {std::string source,entry;std::vector<GraphicsBinding> bindings;std::vector<GraphicsInput> inputs;std::vector<GraphicsShaderSemantic> signature_inputs,signature_outputs;std::array<std::uint32_t,3> threads{1,1,1};std::uint32_t buffer_sizes_slot{UINT32_MAX};};
 bool graphics_modern_shader_required(std::span<const std::uint8_t> bytes);
 GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes);
 struct GraphicsShader:GraphicsObject {

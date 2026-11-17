@@ -57,6 +57,10 @@ struct VulkanState {
     struct Mapped {std::uint64_t device{},guest{};std::size_t size{};};
     std::unordered_map<std::uint64_t,Mapped> mapped;
     std::unordered_map<std::uint64_t,VkDeviceSize> allocations;
+    // vkCreateImage 記錄的格式（主機影像複製換算客體緩衝區大小）與更新範本的 pData 長度（windows_vulkan_14.inc）。
+    struct ImageInfo {VkFormat format{};VkImageType type{};std::uint32_t layers{1};};
+    std::unordered_map<std::uint64_t,ImageInfo> images;
+    std::unordered_map<std::uint64_t,std::size_t> templates;
     struct Dispatch {std::uintptr_t host{};std::uint32_t parent{};};
     std::unordered_map<std::uint32_t,Dispatch> dispatch32;
     std::unordered_map<std::uintptr_t,std::uint32_t> reverse32;
@@ -298,6 +302,10 @@ void load_instance(VulkanState& vulkan,VkInstance instance) {
     // 裝置層級函式也經 loader 取得 trampoline，依 handle 轉送；同一張表適用所有 instance／device。
 #define X64ARM_VULKAN_LOAD(name) if(auto loaded=reinterpret_cast<PFN_##name>(vulkan.loader(instance,#name)))vulkan.fn.name=loaded;
     X64ARM_VULKAN_FUNCTIONS(X64ARM_VULKAN_LOAD)
+    // 宿主驅動沒有提供核心名稱（例如 Vulkan 1.4 提升的命令）時，改以 KHR／EXT 別名取得同一個函式。
+#define X64ARM_VULKAN_ALIAS(name,alias) if(!vulkan.fn.name)if(auto loaded=reinterpret_cast<PFN_##name>(vulkan.loader(instance,alias)))vulkan.fn.name=loaded;
+    X64ARM_VULKAN_ALIASES(X64ARM_VULKAN_ALIAS)
+#undef X64ARM_VULKAN_ALIAS
 #undef X64ARM_VULKAN_LOAD
     vulkan.instance_loaded=true;
 }
@@ -596,20 +604,12 @@ std::optional<std::uint32_t> custom_vkFreeMemory(VulkanCall& c) {
     vulkan.fn.vkFreeMemory(c.handle<VkDevice>(0),c.handle<VkDeviceMemory>(1),nullptr);
     return c.done(0);
 }
+#include "windows_vulkan_14.inc"
 std::optional<std::uint32_t> custom_vkMapMemory(VulkanCall& c) {
-    // 整個配置只對映一次並放到客體位址空間；同一記憶體再次 Map 沿用同一段客體位址。
-    auto& vulkan=c.vulkan();const auto device=reinterpret_cast<std::uintptr_t>(c.handle<VkDevice>(0));const auto memory=c.arg(1),offset=c.u64(2),out=c.arg(5);
-    if(!out)return failure(c,VK_ERROR_MEMORY_MAP_FAILED);
-    if(const auto found=vulkan.mapped.find(memory);found!=vulkan.mapped.end()){c.store_pointer(out,found->second.guest+offset);return c.done(VK_SUCCESS);}
-    const auto allocation=vulkan.allocations.find(memory);if(allocation==vulkan.allocations.end())return failure(c,VK_ERROR_MEMORY_MAP_FAILED);
-    void* host=nullptr;const auto result=vulkan.fn.vkMapMemory(c.handle<VkDevice>(0),c.handle<VkDeviceMemory>(1),0,VK_WHOLE_SIZE,0,&host);
-    if(result!=VK_SUCCESS)return failure(c,result);
-    const auto size=static_cast<std::size_t>((allocation->second+host_page-1)&~static_cast<VkDeviceSize>(host_page-1));
-    // MoltenVK 的對映位址為 16 KiB 頁面對齊，配置以整頁保留；未對齊時無法直接對映。
-    const auto guest=reinterpret_cast<std::uintptr_t>(host)%host_page==0?c.host().map(host,size):0;
-    if(!guest){vulkan.fn.vkUnmapMemory(c.handle<VkDevice>(0),c.handle<VkDeviceMemory>(1));return failure(c,VK_ERROR_MEMORY_MAP_FAILED);}
-    vulkan.mapped[memory]={device,guest,size};c.store_pointer(out,guest+offset);
-    return c.done(VK_SUCCESS);
+    // 整個配置只對映一次並放到客體位址空間；同一記憶體再次 Map 沿用同一段客體位址（MoltenVK 的對映位址為 16 KiB 頁面對齊，未對齊時無法直接對映）。
+    const auto offset=c.u64(2),out=c.arg(5);if(!out)return failure(c,VK_ERROR_MEMORY_MAP_FAILED);
+    VkResult result{};const auto guest=vulkan_map_whole(c,c.handle<VkDevice>(0),c.arg(1),result);if(!guest)return failure(c,result);
+    c.store_pointer(out,guest+offset);return c.done(VK_SUCCESS);
 }
 // 客體對映保留到 vkFreeMemory／vkDestroyDevice：規格禁止 Unmap 後存取該指標，MoltenVK 的對映位址固定；
 // 每次 Map／Unmap 重建原生 MMU 別名的成本會落在工作負載的計時區段內（例如每次迭代反覆對映的程式）。

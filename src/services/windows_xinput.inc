@@ -60,7 +60,10 @@ const auto xinput_result=[&]() -> std::uint32_t {
     if(name=="XInputSetState"){
         memory.check(GuestAddress{output},4,Access::Read);
         if(!bridge.xinput_enabled)return 0U;
-        return bridge.backend->rumble(*slot.device,static_cast<std::uint16_t>(memory.load(GuestAddress{output},16)),static_cast<std::uint16_t>(memory.load(GuestAddress{output+2},16)));
+        const auto left=static_cast<std::uint16_t>(memory.load(GuestAddress{output},16)),right=static_cast<std::uint16_t>(memory.load(GuestAddress{output+2},16));
+        const auto error=bridge.backend->rumble(*slot.device,left,right);
+        if(!error){auto& vibration=bridge.gamepad_vibrations[*slot.device];vibration[0]=left/65535.0;vibration[1]=right/65535.0;}
+        return error;
     }
     if(name=="XInputGetState" || name=="#100"){
         memory.check(GuestAddress{output},16,Access::Write);

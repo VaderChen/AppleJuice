@@ -41,8 +41,12 @@ inline void refresh_processor_registry(RegistryState& registry,unsigned count,co
         };
         const auto string=[&](const char16_t* name,std::string_view text){put(name,{1,utf16_bytes(utf8_to_utf16(text)),{}});};
         string(u"ProcessorNameString",cpu.name);string(u"Identifier",identifier);string(u"VendorIdentifier",vendor_text);
-        // ~MHz 是標稱頻率；沒有主機標稱值時不把最高 DVFS 頻率冒充成 base clock。
-        if(cpu.nominal_mhz){std::vector<std::uint8_t> value(4);for(unsigned i=0;i<4;++i)value[i]=static_cast<std::uint8_t>(cpu.nominal_mhz>>(i*8));put(u"~MHz",{4,std::move(value),{}});}
+        // 此硬體鍵描述相容處理器：~MHz 必須與實際 TSC 換算使用同一固定頻率。
+        // 不回填宿主未知的 nominal_mhz，也不將此值當成宿主即時頻率。
+        const auto mhz=processor_timestamp_mhz(cpu.nominal_mhz,cpu.maximum_mhz);
+        std::vector<std::uint8_t> value(4);
+        for(unsigned i=0;i<4;++i)value[i]=static_cast<std::uint8_t>(mhz>>(i*8));
+        put(u"~MHz",{4,std::move(value),{}});
     }
 }
 }

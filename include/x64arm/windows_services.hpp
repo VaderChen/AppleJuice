@@ -540,6 +540,8 @@ private:
     // urlmon 安全區域管理員與 DXVA2 裝置管理員／視訊服務。
     struct UrlSecurityManager {std::uint32_t references{1};std::uint64_t site{};bool operator==(const UrlSecurityManager&)const=default;};
     std::map<std::uint64_t,UrlSecurityManager> url_security_managers_;std::uint64_t url_security_table_{};
+    // urlmon 工作階段選項：UrlMkSetSessionOption 設定的 User-Agent 與 URL 編碼政策（未設定時依登錄與預設值）。
+    std::optional<std::string> urlmon_user_agent_;std::optional<std::uint32_t> urlmon_url_encoding_;
     std::uint32_t url_zone(std::u16string_view url);
     std::optional<std::uint32_t> invoke_url_security(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     struct Dxva2Manager {std::uint64_t device{},locked{};std::uint32_t references{1},token{},generation{};std::map<std::uint64_t,std::uint32_t> handles;bool operator==(const Dxva2Manager&)const=default;};
@@ -598,6 +600,11 @@ private:
     std::optional<std::uint32_t> invoke_power_notification(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     struct ServiceControlHandle {std::u16string label;std::uint32_t access{},owner{};bool manager{},system{},guest{},status_handle{};std::uint64_t instance{};};
     std::map<std::uint64_t,ServiceControlHandle> service_control_handles_;
+    // NotifyServiceStatusChange：每個 handle 一筆待送通知；names 是 SCM handle 登錄時的客體服務名稱快照（CREATED／DELETED 用）。
+    struct ServiceNotification {std::uint64_t handle{},buffer{},callback{},thread{};std::uint32_t mask{};std::vector<std::u16string> names;};
+    std::vector<ServiceNotification> service_notifications_;std::uint64_t service_notification_poll_{};
+    void poll_service_notifications(GuestMemory&);
+    bool deliver_service_notification(GuestMemory&,ServiceNotification&);
     // LockServiceDatabase：Vista 起僅供相容，鎖定不影響資料庫，QueryServiceLockStatus 回報持有者與時間。
     struct ServiceDatabaseLock {std::uint64_t handle{},since{};std::u16string owner;};
     std::optional<ServiceDatabaseLock> service_database_lock_;
@@ -993,6 +1000,12 @@ private:
     bool bind_registry_stream(std::uint64_t stream,std::uint64_t key,std::u16string value);
     std::map<std::uint64_t,std::uint32_t> dpi_hosting_behavior_;
     std::uint64_t load_module(GuestMemory&, std::u16string name, std::uint32_t flags, std::vector<std::uint64_t>& created, std::u16string_view search_directory = {}, GuestState* = nullptr);
+    // 裸名稱 DLL 依旗標搜尋的目錄（各項以 \ 結尾；空字串代表目前目錄），載入器與 LdrGetDllPath／RtlGetSearchPath 共用。
+    std::vector<std::u16string> dll_search_directories(std::uint32_t flags, std::u16string_view search_directory) const;
+    // SearchPath 未指定路徑時的預設目錄：固定五項，有 PATH 時第六項為尚未拆開的 PATH；current_index 取得目前目錄的位置；回傳登錄讀取錯誤碼。
+    std::uint32_t default_search_paths(GuestMemory&, std::vector<std::u16string>& paths, std::size_t* current_index = nullptr);
+    // SearchTreeForFile 的目錄走訪（FindExecutableImage／FindDebugInfoFile 共用）。
+    std::optional<std::u16string> search_tree_for_file(std::u16string root, std::u16string_view file);
     std::uint64_t module_export(GuestMemory&, std::uint64_t module, std::string_view symbol, std::optional<std::uint16_t> ordinal, std::vector<std::uint64_t>& created, unsigned depth = 0, GuestState* = nullptr);
     FileSnapshot read_module_file(GuestState*,GuestMemory&,const std::u16string&);
     std::uint32_t call_guest_native_file(GuestState&,GuestMemory&,std::uint64_t,std::vector<std::uint64_t>);
@@ -1164,6 +1177,7 @@ private:
     std::optional<std::uint32_t> resume_msi(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     void discard_msi(GuestState&,GuestMemory&,std::uint64_t);
     std::optional<std::uint32_t> begin_msi_registry(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_msi_query(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> resume_msi_registry(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     std::optional<std::uint32_t> invoke_storage(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_storage_stream(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1372,6 +1386,8 @@ private:
     void discard_media_foundation_query(std::uint64_t,GuestMemory&,GuestState&);
     bool media_graphics_device(std::uint64_t) const;
     std::optional<MediaSurface> media_graphics_surface(std::uint64_t,std::uint32_t) const;
+    // D3D9 表面（IDirect3DSurface9）的 MediaSurface 讀寫：MFCreateDXSurfaceBuffer 用，與 LockRect 共用像素與原生資源。
+    std::optional<MediaSurface> media_d3d9_surface(std::uint64_t) const;
     std::optional<std::uint32_t> invoke_wasapi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_wic(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void poll_wasapi();
@@ -1415,6 +1431,11 @@ private:
     void prepare_input_backend();
     void dinput_cursor_warped();
     std::shared_ptr<input::Backend> input_backend()const;
+    std::optional<std::uint32_t> activate_winrt_gamepad(GuestState&,GuestMemory&,std::u16string_view,bool,std::uint64_t,std::uint64_t);
+    std::optional<std::uint32_t> invoke_winrt_gamepad(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::uint64_t winrt_gamepad_view(GuestState&,GuestMemory&,const std::shared_ptr<struct WinrtGamepadObject>&,unsigned);
+    std::uint32_t release_winrt_gamepad(GuestState&,GuestMemory&,const std::shared_ptr<struct WinrtGamepadObject>&);
+    void poll_winrt_gamepads(const GuestState&,GuestMemory&,bool=false);
     std::shared_ptr<struct RawInputState> raw_input_;
     std::shared_ptr<struct PointerInputState> pointer_input_;
     void poll_pointer_input();
@@ -1647,12 +1668,21 @@ private:
     std::u16string registry_object_path(const GuestMemory&,std::uint64_t,bool);
     std::uint32_t commit_registry_transaction(RegistryTransaction&);
     std::map<std::u16string,std::shared_ptr<HostFile>> registry_hive_files_;
+    // RegLoadAppKey 的應用程式 hive：鍵為內部根路徑，image 是最近寫入檔案的 hive 內容（交易重新載入後據此重新安裝）。
+    struct AppHive {std::u16string source,name;std::shared_ptr<HostFile> file;std::vector<std::uint8_t> image;std::uint64_t device{},id{};std::uint32_t minor{3};bool exclusive{};};
+    std::map<std::u16string,AppHive> app_hives_;
+    std::uint32_t load_app_hive(const std::u16string&,bool,std::u16string&);
+    void restore_app_hives(RegistryState&);
+    std::uint32_t persist_app_hives();
+    void release_app_hives();
     std::map<std::u16string,std::shared_ptr<HostFile>> registry_replacement_files_;
     std::optional<std::uint32_t> invoke_registry_security(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     const std::vector<std::uint8_t>& registry_security_descriptor(const std::u16string&);
     std::vector<std::uint8_t> registry_creation_descriptor(const std::vector<std::uint8_t>&,security::SecurityDescriptor);
     std::uint32_t registry_security_access(const std::u16string&,std::uint32_t);
     std::u16string registry_current_user_path(bool cached=false);
+    // 機碼改名（RegRenameKey／NtRenameKey 共用）：整棵子樹與其名稱、安全性、類別、揮發性、開啟中的 handle 一併移動；回傳 NTSTATUS。
+    std::uint32_t rename_registry_key(const RegistryHandle&,std::u16string_view,std::vector<std::pair<std::u16string,std::uint32_t>>&);
     std::pair<std::u16string,std::uint32_t> registry_security_handle(std::uint64_t,std::uint32_t);
     std::optional<std::uint32_t> invoke_nt_registry(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint32_t query_registry_multiple_values(GuestMemory&,const WindowsCall&,const RegistryHandle&,bool,bool);
@@ -1665,6 +1695,8 @@ private:
         std::shared_ptr<HostFile> file;std::string key,owner;
         std::uint32_t minimum{2},maximum{64},flush_timer{},mode{},enable_flags{},file_errors{};
         std::uint64_t deadline{UINT64_MAX};bool private_logger{};
+        // TraceSetInformation：TraceSetDisallowList 的提供者不能再啟用到此工作階段；TraceProviderBinaryTracking 旗標。
+        std::vector<etw::Guid> disallowed;bool binary_tracking{};
         bool operator==(const EtwSessionInfo&)const=default;
     };
     struct EtwConsumerInfo {
@@ -1683,6 +1715,8 @@ private:
         bool operator==(const EtwCallbackOperation&)const=default;
     };
     std::map<std::uint64_t,EtwSessionInfo> etw_sessions_;
+    // TraceSetInformation(TraceSampledProfileIntervalInfo)：各取樣來源的間隔（100 ns），預設 10000（1 ms）。
+    std::map<std::uint32_t,std::uint32_t> etw_profile_intervals_;
     std::map<std::uint64_t,EtwConsumerInfo> etw_consumers_;
     std::map<etw::Guid,std::uint64_t> etw_class_callbacks_;
     std::map<std::uint64_t,EtwProcessOperation> etw_processes_;
@@ -1811,6 +1845,14 @@ private:
     std::optional<std::uint32_t> resume_registered_wait(GuestState&,GuestMemory&);
     std::optional<std::uint32_t> invoke_registered_wait(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_thread(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
+    // MMCSS 工作設定與工作索引（avrt 與 Media Foundation 的 MMCSS 工作佇列共用）；呼叫端須持有登錄交易。
+    struct MultimediaProfile {std::u16string name;std::uint32_t error{};int priority{2},minimum{},maximum{};};
+    std::optional<std::uint32_t> multimedia_responsiveness() const;
+    MultimediaProfile multimedia_profile(std::u16string name) const;
+    // 已知名稱沿用既有索引，否則配置下一個；requested 非零時必須與既有索引相符。回傳 Win32 錯誤碼（0 成功）。
+    std::uint32_t multimedia_task_index(const std::u16string& name,std::uint32_t requested,std::uint32_t& index);
+    // 依類別名稱（不分大小寫）建立 MMCSS 工作設定與索引，不關聯任何執行緒；Media Foundation 的 MMCSS 工作佇列在工作執行緒上套用。
+    std::uint32_t multimedia_task(std::u16string_view name,std::uint32_t requested,MultimediaThreadTask& task,std::uint32_t& index);
     void begin_exception(GuestState& state, GuestMemory& memory, std::uint32_t code, std::uint32_t flags, std::span<const std::uint64_t> parameters);
     bool enter_user_exception(GuestState& state, GuestMemory& memory);
     std::optional<std::uint32_t> finish_user_exception_entry(GuestState& state, GuestMemory& memory);
@@ -2221,6 +2263,23 @@ private:
     std::optional<std::uint32_t> invoke_token(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     // 依 token handle 與所需存取權取得虛擬 token；不存在回 ERROR_INVALID_HANDLE，權限不足回 ERROR_ACCESS_DENIED。
     VirtualToken& token_handle_object(std::uint64_t handle,std::uint32_t rights);
+    // Safer 層級 handle（SaferCreateLevel／SaferIdentifyLevel），只在本程序有效；名稱與說明可由 SaferSetLevelInformation 改寫。
+    struct SaferLevel {std::uint32_t scope{},level{};std::u16string name,description;};
+    std::map<std::uint64_t,SaferLevel> safer_levels_;std::uint64_t next_safer_level_{0x5afe0010};
+    // crypt32 的 CRYPT_OID_INFO 表與存放區顯示名稱：第一次使用時配置在執行階段區，程序存續期間有效。
+    std::uint64_t crypt_oid_table_{},crypt_default_provider_{};std::array<std::uint64_t,18> crypt_localized_names_{};std::vector<CryptOidInfoEntry> crypt_oid_entries_;
+    // crypt32 OID 函式登錄（HKLM\SOFTWARE\Microsoft\Cryptography\OID\EncodingType N\<函式>\<OID>）。
+    std::u16string crypt_oid_registry_path(std::uint32_t encoding,std::string_view function,std::string_view oid,std::vector<std::pair<std::u16string,std::u16string>>* levels=nullptr);
+    std::optional<RegistryValue> crypt_oid_registry_value(std::uint32_t encoding,std::string_view function,std::string_view oid,std::u16string_view name);
+    std::uint32_t crypt_oid_registry_update(std::uint32_t encoding,std::string_view function,std::string_view oid,const std::vector<std::pair<std::u16string,std::optional<RegistryValue>>>& values,bool remove_key=false);
+    std::vector<std::pair<std::u16string,std::map<std::u16string,RegistryValue>>> crypt_oid_registry_children(std::uint32_t encoding,std::string_view function);
+    // 憑證系統存放區（HKCU／HKLM\Software\Microsoft\SystemCertificates\<名稱>），內容為序列化元素的 Blob 值。
+    std::uint32_t open_system_certificate_store(CertificateStore&,std::uint32_t location,const std::u16string& name,std::uint32_t flags);
+    std::uint32_t persist_system_certificate_stores();
+    std::optional<std::u16string> user_locale_override(std::uint32_t type);
+    std::uint32_t set_user_locale_overrides(const std::vector<std::pair<std::u16string,std::u16string>>& values,GuestMemory& memory);
+    std::optional<bool> certificate_crl_revoked(std::uint64_t store,const std::vector<std::uint8_t>& issuer_der,const std::vector<std::uint8_t>& subject_der);
+    std::u16string system_certificate_store_root(std::uint32_t location);
     std::vector<std::uint8_t> machine_account_domain();
     std::optional<std::uint32_t> invoke_private_security(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_msvcp_runtime(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -2560,10 +2619,12 @@ private:
     std::optional<std::uint32_t> invoke_ntdll_misc(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_ntdll_pure(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_kernel32_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_memory_modern(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_advapi32_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_user32_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_gdi32_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_oleaut32_conversion(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_oleaut32_format(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_oleaut32_dispatch(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_crt_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_crt_mbcs(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
@@ -2602,6 +2663,10 @@ private:
     std::uint32_t data_protection_audit(std::u16string_view,std::span<const std::uint8_t>,std::uint32_t,bool,std::uint32_t status=0);
     std::uint32_t legacy_crypto_call(GuestMemory&,const WindowsCall&,std::string_view);
     std::uint64_t acquire_crypto_provider(std::string,std::string,std::uint32_t,std::uint32_t);
+    // CSP 預設提供者：使用者預設存於 HKCU\Software\Microsoft\Cryptography\Provider Type NNN，電腦預設存於
+    // HKLM\SOFTWARE\Microsoft\Cryptography\Defaults\Provider Types\Type NNN 的 Name 值；讀取不到時回傳空值。
+    std::optional<std::string> crypto_default_provider(std::uint32_t type,bool user);
+    std::uint32_t set_crypto_default_provider(std::uint32_t type,bool user,const std::optional<std::string>& name);
     bool retain_crypto_provider(std::uint64_t);
     bool release_crypto_provider(std::uint64_t);
     bool store_crypto_user_key(std::uint64_t,std::uint32_t,const LegacyCryptKey&);
@@ -2611,6 +2676,9 @@ private:
     std::uint32_t crypto_key_call(GuestMemory& memory, const WindowsCall& arg, std::string_view symbol);
     std::uint32_t storage_crypto_call(GuestMemory&,const WindowsCall&,std::string_view);
     std::uint64_t trust_call(GuestState&,GuestMemory&,const WindowsCall&,std::string_view);
+    // WinVerifyTrust 與 SIP 共用的主體檔案內容（handle 或檔名）；SIP（CryptSIP*）的實作在 windows_sip.inc。
+    std::vector<std::uint8_t> trust_file_contents(GuestMemory&,std::uint64_t handle,std::uint64_t path);
+    std::optional<std::uint32_t> invoke_sip(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint32_t image_certificate_call(GuestMemory&,const WindowsCall&,std::string_view);
     void rebuild_crt_environment(GuestMemory& memory, const GuestState& state);
     std::optional<std::uint32_t> invoke_environment(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);

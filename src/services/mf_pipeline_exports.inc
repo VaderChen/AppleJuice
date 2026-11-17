@@ -1,20 +1,4 @@
-if(name=="MFTEnumEx" || name=="MFTEnum"){
-    const bool legacy=name=="MFTEnum";const auto output_arg=legacy?5U:4U,count_arg=legacy?6U:5U;
-    out(arg(output_arg));put(arg(count_arg),0);const auto category=guid(arg(0));auto flags=d(1);
-    // 舊列舉僅包含同步軟體 MFT；共用實際可用的目錄與型別篩選，不能把非同步硬體解碼器列入。
-    if(legacy){require(flags==0);flags=1;}else {require(!(flags&~0x1ffU));if(!flags)flags=0x51;if(!(flags&7))flags|=1;}
-    const auto matches=[&](std::uint64_t filter,const Guid& subtype){return !filter || (guid(filter)==mf::MFMediaType_Video && guid(filter+16)==subtype);};
-    const bool encode=category==mf::MFT_CATEGORY_VIDEO_ENCODER;
-    const auto input_subtype=encode?mf::nv12:mf::h264,output_subtype=encode?mf::h264:mf::nv12;
-    if((encode || category==mf::MFT_CATEGORY_VIDEO_DECODER) && (flags&4) && matches(arg(2),input_subtype) && matches(arg(3),output_subtype) &&
-        (encode?video::hardware_encode_supported(video::Codec::H264):video::hardware_decode_supported(video::Codec::H264))){
-        const auto p=make(mf::Activate);auto activation=object(p,mf::Activate);activation->identifier=encode?3:1;
-        set(*activation,mf::MFT_TRANSFORM_CLSID_Attribute,valueguid(encode?mf::native_h264_encoder:mf::native_h264));set(*activation,mf::MFT_FRIENDLY_NAME_Attribute,valuestring(encode?u"MacWin VideoToolbox H.264 硬體編碼器":u"MacWin VideoToolbox H.264 硬體解碼器"));
-        set(*activation,mf::MF_TRANSFORM_ASYNC,value32(1));set(*activation,mf::MFT_ENUM_HARDWARE_URL_Attribute,valuestring(encode?u"macwin://videotoolbox/h264/encoder":u"macwin://videotoolbox/h264"));set(*activation,mf::MFT_ENUM_HARDWARE_VENDOR_ID_Attribute,valuestring(u"VEN_106B"));
-        for(const auto& [key,subtype]:std::array<std::pair<Guid,Guid>,2>{{{mf::MFT_INPUT_TYPES_Attributes,input_subtype},{mf::MFT_OUTPUT_TYPES_Attributes,output_subtype}}}){Value value;value.type=0x1011;value.blob.insert(value.blob.end(),mf::MFMediaType_Video.begin(),mf::MFMediaType_Video.end());value.blob.insert(value.blob.end(),subtype.begin(),subtype.end());set(*activation,key,std::move(value));}
-        const auto array=allocate(unit);put(array,p,bits);put(arg(output_arg),array,bits);put(arg(count_arg),1);
-    }
-}else if(name=="MFEnumDeviceSources"){
+if(name=="MFEnumDeviceSources"){
     out(arg(1));put(arg(2),0);auto attributes=entry(arg(0)).object;const auto type=get(*attributes,mf::MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,72).id;
     require(type==mf::MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID || type==mf::MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
     if(type==mf::MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID){

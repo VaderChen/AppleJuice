@@ -171,8 +171,7 @@ std::uint64_t WindowsServices::timestamp_counter(const GuestState& state,GuestMe
     retired(memory,0);
     // 宿主時鐘模式的 TSC 依客體處理器身分的標稱頻率計數（宿主未公告標稱值時用最高頻率），與 CPUID 0x16 同源；
     // 兩者皆未知才沿用 100 ns 刻度。由同一宿主單調時鐘換算，跨執行緒與程序保持單調。
-    const auto& identity=memory.processor_identity();const std::uint64_t mhz=identity.base_mhz?identity.base_mhz:identity.maximum_mhz;
-    if(!mhz)return runtime_.clock_ticks;
+    const auto& identity=memory.processor_identity();const auto mhz=processor_timestamp_mhz(identity.base_mhz,identity.maximum_mhz);
     return static_cast<std::uint64_t>(static_cast<unsigned __int128>(runtime_.clock_ticks)*mhz/10U);
 }
 void WindowsServices::set_host_clock(GuestMemory& memory, bool enabled) {
@@ -912,7 +911,8 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
         for(const auto& alias:detail::service_export_aliases)index.emplace(std::pair{alias.family,alias.symbol},&alias);
         return index;
     }();
-    const auto alias_family=lower=="wsock32.dll" && symbol!="#1141" && symbol!="#1142"?std::string_view{"ws2_32.dll"}:std::string_view{lower};
+    // wsock32 其餘名稱與 ws2_32 共用；只有 wsock32 自己登錄的別名（#1141／#1142、mswsock 轉送、舊版 inet_network）另行解析。
+    const auto alias_family=lower=="wsock32.dll" && !aliases.contains({std::string_view{"wsock32.dll"},symbol})?std::string_view{"ws2_32.dll"}:std::string_view{lower};
     if(const auto found=aliases.find({alias_family,symbol});found!=aliases.end()){
         const auto& alias=*found->second;lower=alias.target_family;symbol=alias.target_symbol;
     }

@@ -63,6 +63,7 @@ std::span<const WindowsServiceDescriptor> http_service_descriptors(){
         {"winhttp.dll","WinHttpOpen",5},{"winhttp.dll","WinHttpConnect",4},{"winhttp.dll","WinHttpOpenRequest",7},
         {"winhttp.dll","WinHttpSetTimeouts",5},{"winhttp.dll","WinHttpAddRequestHeaders",4},{"winhttp.dll","WinHttpSendRequest",7},
         {"winhttp.dll","WinHttpSetOption",4},{"winhttp.dll","WinHttpQueryOption",4},
+        {"winhttp.dll","WinHttpSetCredentials",6},{"winhttp.dll","WinHttpQueryAuthSchemes",4},
         {"winhttp.dll","WinHttpWriteData",4},{"winhttp.dll","WinHttpReceiveResponse",2},{"winhttp.dll","WinHttpReadData",4},
         {"winhttp.dll","WinHttpQueryDataAvailable",2},{"winhttp.dll","WinHttpQueryHeaders",6},{"winhttp.dll","WinHttpCloseHandle",1},
         {"winhttp.dll","WinHttpCrackUrl",4},{"winhttp.dll","WinHttpGetProxyForUrl",4},{"winhttp.dll","WinHttpDetectAutoProxyConfigUrl",2},
@@ -344,7 +345,33 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 if(arg(5)){std::string accepts;for(unsigned n=0;;++n){if(n>=128)throw HttpError{87};const auto at=memory.load(GuestAddress{arg(5)+n*unit},pointer_bits);if(!at)break;if(!accepts.empty())accepts+=", ";accepts+=latin(text(at));}if(accepts.find_first_of("\r\n")!=std::string::npos)throw HttpError{87};if(!accepts.empty())request.input.headers.emplace_back("Accept",accepts);}result=insert(std::move(request));
             }else{
                 require(HttpHandle::Kind::Request);
-                if(symbol=="WinHttpAddRequestHeaders"){if(inet && !arg(1))throw HttpError{87};if(object.pending)throw HttpError{12019};add_headers(object.input.headers,text(arg(1),d(2)),d(3));result=1;}
+                if(symbol=="WinHttpSetCredentials"){
+                    if(object.inet)throw HttpError{12018};if(object.pending)throw HttpError{12019};
+                    const auto target=d(1),scheme=d(2);if(target>1 || arg(5) || !scheme || (scheme&(scheme-1)) || (scheme&~31U))throw HttpError{87};
+                    // Passport 仰賴已退役的宿主認證提供者；不能把它當成 Basic 或假裝完成認證。
+                    if(scheme==4)throw HttpError{50};
+                    if((scheme==1 || scheme==8) && (!arg(3) || !arg(4)))throw HttpError{87};
+                    auto username=utf16_to_utf8(text(arg(3))),password=utf16_to_utf8(text(arg(4)));
+                    if(target){object.input.proxy_username=std::move(username);object.input.proxy_password=std::move(password);object.input.proxy_auth_scheme=scheme;object.input.proxy_credentials_set=true;}
+                    else{object.input.username=std::move(username);object.input.password=std::move(password);object.input.auth_scheme=scheme;object.input.credentials_set=true;}result=1;
+                }else if(symbol=="WinHttpQueryAuthSchemes"){
+                    if(object.inet)throw HttpError{12018};if(!object.received || object.pending)throw HttpError{12019};
+                    for(unsigned i=1;i<4;++i){if(!arg(i))throw HttpError{87};memory.check(GuestAddress{arg(i)},4,Access::Write);}
+                    const bool proxy=object.response.status==407;if(!proxy && object.response.status!=401)throw HttpError{12150};
+                    const std::string_view header=proxy?"proxy-authenticate":"www-authenticate";std::uint32_t supported=0,first=0;
+                    for(const auto& [key,value]:object.response.headers)if(lower(key)==header){
+                        // 同一 header 可有多個 challenge；引號內的逗號屬於參數，不能切斷 realm／qop。
+                        bool quoted=false,escape=false,begin=true;
+                        for(std::size_t at=0;at<value.size();++at){const auto c=value[at];
+                            if(escape){escape=false;continue;}if(quoted && c=='\\'){escape=true;continue;}if(c=='\"'){quoted=!quoted;continue;}
+                            if(quoted)continue;if(c==','){begin=true;continue;}if(!begin || c==' ' || c=='\t')continue;begin=false;
+                            auto end=at;while(end<value.size() && value[end]!=' ' && value[end]!='\t' && value[end]!=',')++end;
+                            const auto name=lower(value.substr(at,end-at));const auto scheme=name=="basic"?1U:name=="ntlm"?2U:name=="passport"?4U:name=="digest"?8U:name=="negotiate"?16U:0U;
+                            if(scheme){if(!first)first=scheme;supported|=scheme;}
+                        }
+                    }
+                    if(!supported)throw HttpError{12150};memory.store(GuestAddress{arg(1)},32,supported);memory.store(GuestAddress{arg(2)},32,first);memory.store(GuestAddress{arg(3)},32,proxy?1:0);result=1;
+                }else if(symbol=="WinHttpAddRequestHeaders"){if(inet && !arg(1))throw HttpError{87};if(object.pending)throw HttpError{12019};add_headers(object.input.headers,text(arg(1),d(2)),d(3));result=1;}
                 else if(symbol=="HttpSendRequest"){
                     if(!object.pending){
                         if(d(4)>16*1024*1024 || (d(4) && !arg(3)) || (!ansi && arg(1) && d(2)==UINT32_MAX))throw HttpError{87};
@@ -380,7 +407,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                     object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
                 }
                 else if(symbol=="WinHttpSendRequest"){
-                    if(object.pending || (object.sent && object.total!=d(5)))throw HttpError{12019};if(d(5)>16*1024*1024 || d(4)>d(5) || (d(4) && !arg(3)))throw HttpError{87};
+                    if(object.pending || (object.sent && !object.received && object.total!=d(5)))throw HttpError{12019};if(d(5)>16*1024*1024 || d(4)>d(5) || (d(4) && !arg(3)))throw HttpError{87};
                     auto headers=object.input.headers;if(arg(1))add_headers(headers,text(arg(1),d(2)),0xa0000000);
                     for(const auto& [name,value]:headers){const auto key=lower(name);if(key=="transfer-encoding")throw HttpError{50};if(key=="content-length"){std::uint64_t amount=0;const auto parsed=std::from_chars(value.data(),value.data()+value.size(),amount);if(parsed.ec!=std::errc{} || parsed.ptr!=value.data()+value.size() || amount!=d(5))throw HttpError{87};}}
                     std::vector<std::uint8_t> body(d(4));if(d(4))memory.read(GuestAddress{arg(3)},body);object.input.headers=std::move(headers);object.input.body=std::move(body);object.total=d(5);object.context=arg(6);object.response={};object.cursor=0;object.sent=true;object.received=false;if(object.input.body.size()==object.total)start(object);result=1;

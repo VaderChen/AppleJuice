@@ -3,8 +3,62 @@
 #include "legacy_crypto_catalog.hpp"
 #include "x64arm/private_key_store.hpp"
 #include "x64arm/file_security.hpp"
+#include "x64arm/registry_store.hpp"
+#include <cstdio>
 #include <cstring>
 namespace x64arm {
+namespace {
+// 預設提供者機碼的邏輯路徑（未套用 WOW64 檢視）與各層的顯示名稱。
+std::vector<std::pair<std::u16string,std::u16string>> default_provider_components(std::uint32_t type,bool user){
+    char digits[8];std::snprintf(digits,sizeof digits,"%03u",type%1000U);const auto number=utf8_to_utf16(digits);
+    if(user)return {{u"software",u"Software"},{u"microsoft",u"Microsoft"},{u"cryptography",u"Cryptography"},{u"provider type "+number,u"Provider Type "+number}};
+    return {{u"software",u"SOFTWARE"},{u"microsoft",u"Microsoft"},{u"cryptography",u"Cryptography"},{u"defaults",u"Defaults"},{u"provider types",u"Provider Types"},{u"type "+number,u"Type "+number}};
+}
+}
+std::optional<std::string> WindowsServices::crypto_default_provider(std::uint32_t type,bool user){
+    if(!registry_file_.empty() && !runtime_.network.external_io)return std::nullopt;
+    RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return std::nullopt;
+    initialize_registry_views(runtime_.registry);
+    auto path=user?registry_current_user_path():std::u16string(1,2);for(const auto& [folded,display]:default_provider_components(type,user)){(void)display;path+=u"\\";path+=folded;}
+    const auto key=runtime_.registry.keys.find(registry_view_path(path,registry_view(0,x86_)));if(key==runtime_.registry.keys.end())return std::nullopt;
+    const auto value=key->second.find(u"name");if(value==key->second.end() || value->second.type!=1 || value->second.bytes.size()%2)return std::nullopt;
+    std::u16string text;for(std::size_t i=0;i+1<value->second.bytes.size();i+=2){const auto c=static_cast<char16_t>(value->second.bytes[i]|(value->second.bytes[i+1]<<8));if(!c)break;text+=c;}
+    if(text.empty())return std::nullopt;return utf16_to_utf8(text);
+}
+// 寫入或刪除（name 為空）預設提供者：沿用登錄的安全性檢查（建立子機碼需父機碼的 KEY_CREATE_SUB_KEY，寫值需 KEY_SET_VALUE，刪除需 DELETE），
+// 新機碼繼承父機碼的安全性描述元；在同一個登錄交易內提交，其他程序立即看到。
+std::uint32_t WindowsServices::set_crypto_default_provider(std::uint32_t type,bool user,const std::optional<std::string>& name){
+    if(!registry_file_.empty() && !runtime_.network.external_io)return 50;
+    RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,false);if(transaction.error)return transaction.error;
+    initialize_registry_views(runtime_.registry);
+    auto& registry=runtime_.registry;const auto before=registry;const auto view=registry_view(0,x86_);
+    try{
+        auto logical=user?registry_current_user_path():std::u16string(1,2);std::vector<std::pair<std::u16string,std::u16string>> levels;
+        for(const auto& [folded,display]:default_provider_components(type,user)){logical+=u"\\";logical+=folded;levels.emplace_back(registry_view_path(logical,view),display);}
+        const auto& key=levels.back().first;const auto now=runtime_.system_filetime();
+        if(!name){
+            const auto found=registry.keys.find(key);if(found==registry.keys.end())return 0x80090017U;
+            (void)registry_security_access(key,0x10000U);
+            for(const auto& [entry,value]:found->second){(void)entry;registry.bytes-=value.bytes.size();--registry.values;}
+            registry.keys.erase(found);registry.display_names.erase(key);registry.modified_times.erase(key);registry.security_descriptors.erase(key);registry.classes.erase(key);
+            registry.modified_times[key.substr(0,key.find_last_of(u'\\'))]=now;
+        }else{
+            for(const auto& [path,display]:levels){
+                if(registry.keys.contains(path))continue;
+                const auto parent=path.substr(0,path.find_last_of(u'\\'));registry.keys.try_emplace(parent);(void)registry_security_access(parent,4U);
+                auto descriptor=registry_creation_descriptor(registry_security_descriptor(parent),{});
+                registry.keys.try_emplace(path);registry.display_names[path]=display;registry.modified_times[path]=now;registry.security_descriptors[path]=std::move(descriptor);
+            }
+            (void)registry_security_access(key,2U);
+            auto& values=registry.keys[key];auto bytes=utf16_bytes(utf8_to_utf16(*name));
+            if(const auto old=values.find(u"name");old!=values.end()){registry.bytes-=old->second.bytes.size();--registry.values;}
+            registry.bytes+=bytes.size();++registry.values;values[u"name"]=RegistryValue{1,std::move(bytes),u"Name"};registry.modified_times[key]=now;
+        }
+        if(const auto error=commit_registry_transaction(transaction)){registry=before;return error;}
+        return 0;
+    }catch(const SecurityDescriptorError& error){registry=before;return error.code;}
+    catch(...){registry=before;throw;}
+}
 std::uint32_t WindowsServices::legacy_crypto_provider(GuestMemory& memory,const WindowsCall& arg,std::string_view symbol){
     using Bytes=std::vector<std::uint8_t>;using namespace legacy_crypto;
     const auto fail=[&](std::uint32_t error){last_error_=error;return 0U;};
@@ -24,6 +78,28 @@ std::uint32_t WindowsServices::legacy_crypto_provider(GuestMemory& memory,const 
         memory.check(GuestAddress{arg(0)},x86_?4:8,Access::Write);
         const auto handle=acquire_crypto_provider(arg(1)?string(1):std::string{},arg(2)?string(2):std::string{},u32(3),u32(4));
         if(!handle)return 0;memory.store(GuestAddress{arg(0)},x86_?32:64,handle==UINT64_MAX?0:handle);return 1;
+    }
+    if(symbol.starts_with("CryptGetDefaultProvider")){
+        // (dwProvType, pdwReserved, dwFlags, pszProvName, pcbProvName)：CRYPT_MACHINE_DEFAULT 取電腦預設；CRYPT_USER_DEFAULT（或 0）先取使用者預設，
+        // 沒有設定時與 CryptAcquireContext 相同地退回電腦預設，再退回內建目錄的第一個提供者。
+        if(arg(1))return fail(87);const auto flags=u32(2);if((flags&~3U) || flags==3U)return fail(0x80090009);
+        const auto type=u32(0);if(!legacy_crypto::provider(type))return fail(0x80090017);
+        std::optional<std::string> name;if(flags!=1U)name=crypto_default_provider(type,true);if(!name)name=crypto_default_provider(type,false);
+        if(!name || !legacy_crypto::provider(type,*name))name=legacy_crypto::provider(type)->name;
+        return write(symbol.back()=='W'?utf16_bytes(utf8_to_utf16(*name)):text(*name),arg(3),arg(4));
+    }
+    if(symbol.starts_with("CryptSetProvider")){
+        // CryptSetProvider(pszProvName, dwProvType) 即 CryptSetProviderEx(..., NULL, CRYPT_USER_DEFAULT)。
+        // CryptSetProviderEx(pszProvName, dwProvType, pdwReserved, dwFlags)：CRYPT_MACHINE_DEFAULT／CRYPT_USER_DEFAULT 擇一，CRYPT_DELETE_DEFAULT 刪除設定。
+        const bool extended=symbol.starts_with("CryptSetProviderEx");const auto type=u32(1);const auto flags=extended?u32(3):2U;
+        if(extended && arg(2))return fail(87);if((flags&~7U) || !(flags&3U) || (flags&3U)==3U)return fail(0x80090009);
+        if(!legacy_crypto::provider(type))return fail(0x80090014);
+        std::optional<std::string> name;
+        if(!(flags&4U)){
+            if(!arg(0))return fail(87);name=symbol.back()=='W'?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)},1024)):read_ansi(memory,arg(0),4096);
+            if(!legacy_crypto::provider(type,*name)){const bool known=std::any_of(std::begin(providers),std::end(providers),[&](const auto& p){return *name==p.name;});return fail(known?0x8009001bU:0x80090013U);}
+        }
+        const auto status=set_crypto_default_provider(type,(flags&2U)!=0,name);return status?fail(status):1U;
     }
     if(symbol.starts_with("CryptEnumProvider")){
         if(arg(1) || !arg(3) || !arg(5))return fail(87);if(u32(2))return fail(0x80090009);

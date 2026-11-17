@@ -81,6 +81,8 @@ std::span<const WindowsServiceDescriptor> security_service_descriptors() {
         {"kernel32.dll","SetThreadToken",2},
         {"advapi32.dll","SetThreadToken",2},{"advapi32.dll","RevertToSelf",0},{"advapi32.dll","ImpersonateSelf",1},
         {"advapi32.dll","ImpersonateNamedPipeClient",1},{"advapi32.dll","ImpersonateLoggedOnUser",1},{"advapi32.dll","CreateRestrictedToken",9},
+        {"advapi32.dll","SaferCreateLevel",5},{"advapi32.dll","SaferCloseLevel",1},{"advapi32.dll","SaferIdentifyLevel",4},{"advapi32.dll","SaferGetPolicyInformation",6},
+        {"advapi32.dll","SaferGetLevelInformation",5},{"advapi32.dll","SaferSetLevelInformation",4},{"advapi32.dll","SaferiIsExecutableFileType",2},{"advapi32.dll","SaferComputeTokenFromLevel",5},
         {"advapi32.dll","SetTokenInformation",4},{"advapi32.dll","IsTokenRestricted",1},
         {"advapi32.dll","CheckTokenMembership",3},{"advapi32.dll","AccessCheck",8},{"advapi32.dll","AccessCheckByType",11},
         {"advapi32.dll","MapGenericMask",2},{"advapi32.dll","AreAllAccessesGranted",2},{"advapi32.dll","AreAnyAccessesGranted",2},
@@ -95,12 +97,14 @@ std::span<const WindowsServiceDescriptor> security_service_descriptors() {
         {"advapi32.dll", "LsaOpenPolicy", 4}, {"advapi32.dll", "LsaClose", 1},
         {"advapi32.dll", "LsaAddAccountRights", 4}, {"advapi32.dll", "LsaNtStatusToWinError", 1},
         {"advapi32.dll","LsaFreeMemory",1},{"advapi32.dll","LsaLookupNames",5,0,0,0x2},{"advapi32.dll","LsaLookupNames2",6,0,0,0x6},{"advapi32.dll","LsaLookupSids",5,0,0,0x2},
-        {"advapi32.dll","LsaLookupPrivilegeName",3},{"advapi32.dll","LsaLookupPrivilegeDisplayName",4},{"advapi32.dll","LsaQueryInformationPolicy",3,0,0,0x2},{"advapi32.dll","LsaGetUserName",2},
+        {"advapi32.dll","LsaLookupPrivilegeName",3},{"advapi32.dll","LsaLookupPrivilegeDisplayName",4},{"advapi32.dll","LsaQueryInformationPolicy",3,0,0,0x2},{"advapi32.dll","LsaSetInformationPolicy",3,0,0,0x2},
+        {"advapi32.dll","AuditQuerySystemPolicy",3,0,0,0x2},{"advapi32.dll","AuditSetSystemPolicy",2,0,0,0x2},{"advapi32.dll","AuditFree",1},{"advapi32.dll","LsaGetUserName",2},
         {"advapi32.dll","LsaEnumerateTrustedDomains",5,0,0,0x8},{"advapi32.dll","LsaEnumerateTrustedDomainsEx",5,0,0,0x8},
         {"advapi32.dll","LsaRegisterPolicyChangeNotification",2,0,0,0x1},{"advapi32.dll","LsaUnregisterPolicyChangeNotification",2,0,0,0x1},
         {"advapi32.dll","LsaRemoveAccountRights",5,0,0,0x14},{"advapi32.dll","LsaEnumerateAccountRights",4},{"advapi32.dll","LsaEnumerateAccountsWithUserRight",4},{"advapi32.dll","LsaEnumerateAccounts",5,0,0,0x8},
         {"advapi32.dll", "LookupAccountNameA", 7}, {"advapi32.dll", "LookupAccountNameW", 7},
         {"advapi32.dll", "LookupAccountSidA", 7}, {"advapi32.dll", "LookupAccountSidW", 7},
+        {"advapi32.dll", "LookupAccountSidLocalA", 6}, {"advapi32.dll", "LookupAccountSidLocalW", 6},
         {"advapi32.dll", "GetFileSecurityA", 5}, {"advapi32.dll", "GetFileSecurityW", 5},
         {"advapi32.dll", "SetFileSecurityA", 3}, {"advapi32.dll", "SetFileSecurityW", 3}
     };
@@ -353,7 +357,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
        service.symbol.starts_with("SetFileSecurity") ||
        ((service.symbol=="GetSecurityInfo" || service.symbol=="SetSecurityInfo") && WindowsCall(state,memory,service)(1)==1))
         return invoke_security_descriptor(state,memory,service);
-    for(const auto name:{"GetSecurityInfo","SetSecurityInfo","SetKernelObjectSecurity","GetKernelObjectSecurity","OpenProcessToken","OpenThreadToken","DuplicateToken","DuplicateTokenEx","SetThreadToken","RevertToSelf","ImpersonateSelf","ImpersonateAnonymousToken","ImpersonateLoggedOnUser","ImpersonateNamedPipeClient","CreateRestrictedToken","SetTokenInformation","GetTokenInformation","AdjustTokenPrivileges","AdjustTokenGroups","PrivilegeCheck","IsTokenRestricted","CheckTokenMembership","AccessCheck","AccessCheckByType","MapGenericMask","AreAllAccessesGranted","AreAnyAccessesGranted"})
+    for(const auto name:{"GetSecurityInfo","SetSecurityInfo","SaferCreateLevel","SaferCloseLevel","SaferIdentifyLevel","SaferGetPolicyInformation","SaferGetLevelInformation","SaferSetLevelInformation","SaferiIsExecutableFileType","SaferComputeTokenFromLevel","SetKernelObjectSecurity","GetKernelObjectSecurity","OpenProcessToken","OpenThreadToken","DuplicateToken","DuplicateTokenEx","SetThreadToken","RevertToSelf","ImpersonateSelf","ImpersonateAnonymousToken","ImpersonateLoggedOnUser","ImpersonateNamedPipeClient","CreateRestrictedToken","SetTokenInformation","GetTokenInformation","AdjustTokenPrivileges","AdjustTokenGroups","PrivilegeCheck","IsTokenRestricted","CheckTokenMembership","AccessCheck","AccessCheckByType","MapGenericMask","AreAllAccessesGranted","AreAnyAccessesGranted"})
         if(service.symbol==name)return invoke_token(state,memory,service);
     const WindowsCall arg(state, memory, service);
     const auto u32 = [&](unsigned index) { return static_cast<std::uint32_t>(arg(index)); };
@@ -720,8 +724,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
     }else if (symbol == "IsUserAnAdmin") {
         initialize_tokens();const auto& token=runtime_.token_objects.at(effective_token_id());const auto administrators=sddl_sid("BA");
         result=token_sid_matches(token,administrators,false) && (!token.restriction_check || token_sid_matches(token,administrators,false,true));
-    } else if (symbol.starts_with("Lsa")) {
+    } else if (symbol.starts_with("Lsa") || symbol.starts_with("Audit")) {
 #include "windows_lsa.inc"
+    } else if (symbol == "LookupAccountSidLocalA" || symbol == "LookupAccountSidLocalW") {
+        // 等同 LookupAccountSid(NULL, ...)：沿用同一查詢與錯誤碼。
+        result = nested_service(state, memory, "advapi32.dll", symbol.back() == 'W' ? "LookupAccountSidW" : "LookupAccountSidA",
+                                {0, arg(0), arg(1), arg(2), arg(3), arg(4), arg(5)}) & UINT32_MAX;
     } else if (symbol == "LookupAccountNameA" || symbol == "LookupAccountNameW" ||
                symbol == "LookupAccountSidA" || symbol == "LookupAccountSidW") {
         const bool wide = symbol.back() == 'W', by_sid = symbol.starts_with("LookupAccountSid");
@@ -1292,7 +1300,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_token(GuestState& state,Gue
                 }
             }
         }else
-        if(symbol=="AreAllAccessesGranted")result=(u32(0)&u32(1))==u32(1);
+        if(symbol.starts_with("Safer"))
+#include "windows_safer.inc"
+        else if(symbol=="AreAllAccessesGranted")result=(u32(0)&u32(1))==u32(1);
         else if(symbol=="AreAnyAccessesGranted")result=bool(u32(0)&u32(1));
         else if(symbol=="MapGenericMask"){
             const auto mapping=mapping_at(arg(1));const auto mask=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},32));memory.store(GuestAddress{arg(0)},32,mapped_access(mask,mapping));

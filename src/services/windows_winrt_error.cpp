@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_error_support.hpp"
+#include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
 #include <algorithm>
 
@@ -12,11 +13,14 @@ using winrt_error_detail::method;
 std::span<const WindowsServiceDescriptor> winrt_error_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"combase.dll","RoOriginateError",2},{"combase.dll","RoOriginateErrorW",3},
+        {"combase.dll","RoOriginateLanguageException",3},
         {"combase.dll","RoGetErrorReportingFlags",1},{"combase.dll","RoSetErrorReportingFlags",1},
         {"combase.dll","GetRestrictedErrorInfo",1},{"combase.dll","SetRestrictedErrorInfo",1},
         {"combase.dll","RoGetMatchingRestrictedErrorInfo",2},{"combase.dll","IsErrorPropagationEnabled",0},{"combase.dll","RoReportFailedDelegate",2},
         {"internal-restricted-error","QueryInterface",3},{"internal-restricted-error","AddRef",1},{"internal-restricted-error","Release",1},
         {"internal-restricted-error","GetErrorDetails",5},{"internal-restricted-error","GetReference",2},
+        {"internal-language-error","QueryInterface",3},{"internal-language-error","AddRef",1},{"internal-language-error","Release",1},
+        {"internal-language-error","GetLanguageException",2},
         {"internal-winrt-error","Raise",1}
     };return table;
 }
@@ -76,8 +80,60 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_error(GuestState& sta
     const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto pointer=[&](std::uint64_t at,std::size_t size){if(!at)throw HostCallFault("WinRT 錯誤輸出指標為空");memory.check(GuestAddress{at},size,Access::Write);};
     const auto next_id=[&](){auto id=bridge.next_operation;while(!id || bridge.restricted_operations.contains(id) || bridge.origins.contains(id))++id;bridge.next_operation=id+1;return id;};
+    if(name=="RoOriginateLanguageException"){
+        return service_callback::invoke<std::optional<std::uint32_t>>(
+            this,threads_.current,state,memory,name,
+            [this](GuestState& s,GuestMemory& m,std::uint64_t target,std::vector<std::uint64_t> args,std::uint64_t id){start_callbacks(s,m,{{target,std::move(args)}},Continuation::NestedResult,id);},
+            [this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(s,m,service);const auto done=[&](bool value){call.return_to(s,value?1:0);return std::optional<std::uint32_t>{};};
+                const auto hr=static_cast<std::uint32_t>(call(0));if(!(hr&0x80000000U))co_return done(false);
+                auto& errors=runtime_.com_error_bridge;std::u16string message,generic;com_error::Reporting reporting;
+                struct Owned {
+                    WindowsServices& self;GuestState& state;GuestMemory& memory;std::uint64_t object{},origin{};
+                    ~Owned(){if(object)(void)self.release_com_error(state,memory,object);if(origin)self.discard_winrt_origin(state,memory,origin);}
+                } owned{*this,s,m};
+                try{
+                    generic=windows_error_message(hr);if(generic.empty())generic=windows_error_message(0x80004005U);
+                    message=com_error::reported_message(hr,call(1)?std::optional<std::u16string_view>{winrt_content(m,winrt_string(m,call(1)),com_error::maximum_message_units)}:std::nullopt,generic);
+                    if(message.empty())co_return done(false);
+                    reporting=com_error::reporting(runtime_.com_errors.flags(),false,com_apartment(threads_.current).has_value() || mta_alive());
+                    if(!reporting.channel && !reporting.exception)co_return done(true);
+                    if(reporting.channel){com_error::Object value;value.hresult=hr;value.description=generic;value.description_present=true;value.restricted_description=message;value.restricted=true;
+                        owned.object=create_com_error(s,m,std::move(value));
+                        if(call(2)){errors.language_exceptions.emplace(owned.object,0);(void)method(m,call(2),1);(void)method(m,call(2),2);}
+                    }
+                    if(reporting.exception){
+                        if(errors.origins.size()>=4096)co_return done(false);auto id=errors.next_operation;
+                        while(!id || errors.origins.contains(id) || errors.restricted_operations.contains(id))++id;
+                        WinrtOriginOperation op;op.hresult=hr;op.length=static_cast<std::uint32_t>(message.size());op.exception=true;
+                        op.payload=allocate_heap(m,(message.size()+1)*2);if(!op.payload)co_return done(false);
+                        try{m.write(GuestAddress{op.payload},utf16_bytes(message));errors.origins.emplace(id,op);}
+                        catch(...){(void)free_heap(m,op.payload,s);throw;}errors.next_operation=id+1;owned.origin=id;
+                    }
+                    if(owned.object && call(2)){
+                        (void)co_await service_callback::call(method(m,call(2),1),{call(2)});
+                        errors.language_exceptions.at(owned.object)=call(2); // AddRef 完成後才移交給錯誤物件。
+                    }
+                    if(owned.object){
+                        const auto status=static_cast<std::uint32_t>(co_await service_callback::call(resolve("combase.dll","SetErrorInfo").value,{0,owned.object}));
+                        const auto object=std::exchange(owned.object,0);
+                        (void)co_await service_callback::call(method(m,object,2),{object});
+                        if(status&0x80000000U)co_return done(false);
+                    }
+                    if(owned.origin)(void)co_await service_callback::call(resolve("internal-winrt-error","Raise").value,{owned.origin});
+                    co_return done(true);
+                }catch(const MemoryFault&){co_return done(false);}catch(const HostCallFault&){co_return done(false);}catch(const std::bad_alloc&){co_return done(false);}
+            });
+    }
     if(name=="RoGetMatchingRestrictedErrorInfo")return invoke_matching_restricted_error(state,memory,service);
     try{
+        if(service.family=="internal-language-error"){
+            if(name=="QueryInterface" || name=="AddRef" || name=="Release")return invoke_com_error(state,memory,service);
+            const auto view=bridge.views.find(arg(0));if(view==bridge.views.end() || view->second.kind!=ComErrorViewKind::Language)return done(invalid);
+            pointer(arg(1),unit);const auto found=bridge.language_exceptions.find(view->second.object);const auto language=found==bridge.language_exceptions.end()?0:found->second;
+            const auto target=language?method(memory,language,1):0;memory.store(GuestAddress{arg(1)},bits,language);
+            if(language){start_callbacks(state,memory,{{target,{language}}},Continuation::Return,0);return std::nullopt;}return done(0);
+        }
         if(name=="IsErrorPropagationEnabled"){
             // 錯誤經 SetErrorInfo 通道跨 ABI 傳遞；與 RoOriginateError 共用同一組回報旗標判定。
             return done(com_error::reporting(runtime_.com_errors.flags(),false,true).channel?1:0);

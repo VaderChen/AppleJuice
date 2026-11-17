@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include "crypto_kdf.hpp"
 namespace x64arm {
 namespace {
 struct HashInfo {std::string_view name;unsigned digest,block;};
@@ -27,7 +28,9 @@ std::span<const WindowsServiceDescriptor> crypto_service_descriptors() {
         {"crypt32.dll","CryptStringToBinaryA",7},{"crypt32.dll","CryptStringToBinaryW",7},
         {"advapi32.dll","CryptAcquireContextA",5},{"advapi32.dll","CryptAcquireContextW",5},
         {"advapi32.dll","CryptReleaseContext",2},{"advapi32.dll","CryptGenRandom",3},{"advapi32.dll","SystemFunction036",2},
-        {"advapi32.dll","CryptCreateHash",5},{"advapi32.dll","CryptHashData",4},
+        {"advapi32.dll","CryptCreateHash",5},{"advapi32.dll","CryptHashData",4},{"advapi32.dll","CryptDeriveKey",5},{"advapi32.dll","CryptHashSessionKey",3},
+        {"advapi32.dll","CryptGetDefaultProviderA",5},{"advapi32.dll","CryptGetDefaultProviderW",5},{"advapi32.dll","CryptSetProviderA",2},{"advapi32.dll","CryptSetProviderW",2},
+        {"advapi32.dll","CryptSetProviderExA",4},{"advapi32.dll","CryptSetProviderExW",4},
         {"advapi32.dll","CryptGetHashParam",5},{"advapi32.dll","CryptSetHashParam",4},
         {"advapi32.dll","CryptDuplicateHash",4},{"advapi32.dll","CryptDestroyHash",1},
         {"advapi32.dll","CryptImportKey",6},{"advapi32.dll","CryptExportKey",6},
@@ -54,6 +57,8 @@ std::span<const WindowsServiceDescriptor> crypto_service_descriptors() {
         {"bcrypt.dll","BCryptSecretAgreement",4},{"bcrypt.dll","BCryptDeriveKey",7},
         {"bcrypt.dll","BCryptDestroySecret",1},{"bcrypt.dll","BCryptEncrypt",10},
         {"bcrypt.dll","BCryptDecrypt",10},{"bcrypt.dll","BCryptVerifySignature",7},{"bcrypt.dll","BCryptSignHash",8},
+        {"bcrypt.dll","BCryptHash",7},{"bcrypt.dll","BCryptDuplicateKey",5},{"bcrypt.dll","BCryptEnumAlgorithms",4},{"bcrypt.dll","BCryptFreeBuffer",1},
+        {"bcrypt.dll","BCryptGetFipsAlgorithmMode",1},{"bcrypt.dll","BCryptDeriveKeyCapi",5},{"bcrypt.dll","BCryptKeyDerivation",6},
         {"ncrypt.dll","NCryptOpenStorageProvider",3},{"ncrypt.dll","NCryptFreeObject",1},
         {"ncrypt.dll","NCryptCreatePersistedKey",6},{"ncrypt.dll","NCryptFinalizeKey",2},
         {"ncrypt.dll","NCryptOpenKey",5},{"ncrypt.dll","NCryptDeleteKey",2},
@@ -70,7 +75,19 @@ std::span<const WindowsServiceDescriptor> crypto_service_descriptors() {
         {"wintrust.dll","CryptCATAdminAcquireContext",3,0,0,4},{"wintrust.dll","CryptCATAdminAcquireContext2",5,0,0,16},
         {"wintrust.dll","CryptCATAdminCalcHashFromFileHandle",4,0,0,8},{"wintrust.dll","CryptCATAdminCalcHashFromFileHandle2",5,0,0,16},
         {"wintrust.dll","CryptCATAdminEnumCatalogFromHash",5,0,0,12},{"wintrust.dll","CryptCATCatalogInfoFromContext",3,0,0,4},
-        {"wintrust.dll","CryptCATAdminReleaseCatalogContext",3,0,0,4},{"wintrust.dll","CryptCATAdminReleaseContext",2,0,0,2}
+        {"wintrust.dll","CryptCATAdminReleaseCatalogContext",3,0,0,4},{"wintrust.dll","CryptCATAdminReleaseContext",2,0,0,2},
+        {"wintrust.dll","WVTAsn1SpcLinkEncode",5,0,0,0x1},{"wintrust.dll","WVTAsn1SpcLinkDecode",7,0,0,0x19},{"wintrust.dll","WVTAsn1SpcPeImageDataEncode",5,0,0,0x1},{"wintrust.dll","WVTAsn1SpcPeImageDataDecode",7,0,0,0x19},{"wintrust.dll","WVTAsn1SpcIndirectDataContentEncode",5,0,0,0x1},{"wintrust.dll","WVTAsn1SpcIndirectDataContentDecode",7,0,0,0x19},{"wintrust.dll","WVTAsn1SpcSpOpusInfoEncode",5,0,0,0x1},{"wintrust.dll","WVTAsn1SpcSpOpusInfoDecode",7,0,0,0x19},{"wintrust.dll","WVTAsn1SpcFinancialCriteriaInfoEncode",5,0,0,0x1},{"wintrust.dll","WVTAsn1SpcFinancialCriteriaInfoDecode",7,0,0,0x19},
+        {"wintrust.dll","WTHelperGetFileHandle",1},{"wintrust.dll","WTHelperGetFileName",1},{"wintrust.dll","WintrustGetRegPolicyFlags",1},{"wintrust.dll","WintrustSetRegPolicyFlags",1,0,0,0x1},{"wintrust.dll","TrustIsCertificateSelfSigned",3,0,0,0x6},
+        {"wintrust.dll","CryptCATOpen",5,0,0,0x1a},{"wintrust.dll","CryptCATClose",1},{"wintrust.dll","CryptCATEnumerateMember",2},{"wintrust.dll","CryptCATGetMemberInfo",2},
+        {"wintrust.dll","CryptCATEnumerateAttr",3},{"wintrust.dll","CryptCATGetAttrInfo",3},{"wintrust.dll","CryptCATEnumerateCatAttr",2},{"wintrust.dll","CryptCATGetCatAttrInfo",2},
+        {"wintrust.dll","CryptCATPutMemberInfo",7,0,0,0x30},{"wintrust.dll","CryptCATPutAttrInfo",6,0,0,0x18},{"wintrust.dll","CryptCATPutCatAttrInfo",5,0,0,0xc},{"wintrust.dll","CryptCATPersistStore",1},
+        {"wintrust.dll","WVTAsn1CatNameValueEncode",5,0,0,0x1},{"wintrust.dll","WVTAsn1CatNameValueDecode",7,0,0,0x19},{"wintrust.dll","WVTAsn1CatMemberInfoEncode",5,0,0,0x1},{"wintrust.dll","WVTAsn1CatMemberInfoDecode",7,0,0,0x19},
+        {"wintrust.dll","CryptCATAdminAddCatalog",4,0,0,8},{"wintrust.dll","CryptCATAdminRemoveCatalog",3,0,0,4},{"wintrust.dll","CryptCATAdminResolveCatalogPath",4,0,0,8},{"wintrust.dll","IsCatalogFile",2},
+        {"crypt32.dll","CryptSIPRetrieveSubjectGuid",3},{"crypt32.dll","CryptSIPRetrieveSubjectGuidForCatalogFile",3},{"crypt32.dll","CryptSIPLoad",3},
+        {"crypt32.dll","CryptSIPAddProvider",1},{"crypt32.dll","CryptSIPRemoveProvider",1},{"crypt32.dll","CryptSIPGetSignedDataMsg",5},
+        {"crypt32.dll","CryptSIPPutSignedDataMsg",5},{"crypt32.dll","CryptSIPRemoveSignedDataMsg",2},{"crypt32.dll","CryptSIPCreateIndirectData",3},
+        {"crypt32.dll","CryptSIPVerifyIndirectData",2},{"wintrust.dll","CryptSIPGetSignedDataMsg",5},{"wintrust.dll","CryptSIPPutSignedDataMsg",5},
+        {"wintrust.dll","CryptSIPRemoveSignedDataMsg",2},{"wintrust.dll","CryptSIPCreateIndirectData",3},{"wintrust.dll","CryptSIPVerifyIndirectData",2}
     };return table;
 }
 bool WindowsServices::fill_random(GuestMemory& memory,std::uint64_t address,std::uint64_t size) {
@@ -100,6 +117,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crypto(GuestState& state,Gu
         if (count>output_limit) throw HostCallFault("單次密碼服務資料超過 16 MiB 上限");
         std::vector<std::uint8_t> bytes(count);memory.read(GuestAddress{pointer},bytes);return bytes;
     };
+    if(symbol.starts_with("CryptSIP"))return invoke_sip(state,memory,service);
     if(service.family=="wintrust.dll"){
         const auto result=trust_call(state,memory,arg,symbol);
         // 獨立的唯讀診斷不關閉常駐服務，也不改變驗證結果或信任來源。
@@ -197,7 +215,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_crypto(GuestState& state,Gu
         catch(const std::runtime_error&){last_error_=0x80090020U;}
     }
     else if(symbol.starts_with("NCrypt"))status=storage_crypto_call(memory,arg,symbol);
-    else if (symbol=="CryptAcquireContextA" || symbol=="CryptAcquireContextW" || symbol.starts_with("CryptEnumProvider") || symbol=="CryptGetProvParam" || symbol=="CryptSetProvParam")status=legacy_crypto_provider(memory,arg,symbol);
+    else if (symbol=="CryptAcquireContextA" || symbol=="CryptAcquireContextW" || symbol.starts_with("CryptEnumProvider") || symbol=="CryptGetProvParam" || symbol=="CryptSetProvParam" ||
+        symbol.starts_with("CryptGetDefaultProvider") || symbol.starts_with("CryptSetProvider"))status=legacy_crypto_provider(memory,arg,symbol);
     else if(symbol=="CryptEncrypt" || symbol=="CryptDecrypt" || symbol=="CryptGenKey" || symbol=="CryptSetKeyParam")status=legacy_crypto_cipher(memory,arg,symbol);
     else if (symbol=="CryptReleaseContext") {
         if(u32(1))last_error_=87;else if(!release_crypto_provider(arg(0)))last_error_=6;else status=1;
@@ -218,7 +237,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crypto(GuestState& state,Gu
         const auto name=wide(1);const auto flags_value=u32(3);
         if (!arg(0) || flags_value&~0x28U) status=invalid_parameter;
         else if (flags_value && !hash_info(name)) status=invalid_parameter;
-        else if ((arg(2) && wide(2)!="Microsoft Primitive Provider") || (!hash_info(name) && name!="RNG" && name!="AES" && !cng::supported(name) && name!="DH")) status=0xc0000225U;
+        else if ((arg(2) && wide(2)!="Microsoft Primitive Provider") || (!hash_info(name) && name!="RNG" && name!="AES" && !cng::supported(name) && name!="DH" && !crypto_kdf::supported(name))) status=0xc0000225U;
         else if (runtime_.crypto_algorithms.size()>=1024) status=0xc0000017U;
         else {
             memory.check(GuestAddress{arg(0)},x86_?4:8,Access::Write);
@@ -283,16 +302,71 @@ std::optional<std::uint32_t> WindowsServices::invoke_crypto(GuestState& state,Gu
         else {
             memory.check(GuestAddress{arg(6)},length,Access::Write);
             const auto password=buffer(arg(1),u32(2)),salt=buffer(arg(3),u32(4));
-            const CryptoHash keyed(algorithm->second.name,true,password);
-            std::vector<std::uint8_t> derived;derived.reserve(length);
-            for (std::uint32_t block=1;derived.size()<length;++block) {
-                auto first=keyed;first.update(salt);
-                const std::array<std::uint8_t,4> index{static_cast<std::uint8_t>(block>>24),static_cast<std::uint8_t>(block>>16),static_cast<std::uint8_t>(block>>8),static_cast<std::uint8_t>(block)};
-                first.update(index);auto u=first.digest();auto t=u;
-                for (std::uint64_t round=1;round<iterations;++round) {auto next=keyed;next.update(u);u=next.digest();for (std::size_t i=0;i<t.size();++i) t[i]^=u[i];}
-                derived.insert(derived.end(),t.begin(),t.begin()+static_cast<std::ptrdiff_t>(std::min<std::size_t>(t.size(),length-derived.size())));
+            memory.write(GuestAddress{arg(6)},crypto_kdf::pbkdf2(algorithm->second.name,password,salt,iterations,length));
+        }
+    } else if (symbol=="BCryptHash") {
+        // (hAlgorithm, pbSecret, cbSecret, pbInput, cbInput, pbOutput, cbOutput)：一次完成雜湊或 HMAC（HMAC 演算法以 pbSecret 為金鑰）。
+        const auto algorithm=runtime_.crypto_algorithms.find(arg(0));
+        if (algorithm==runtime_.crypto_algorithms.end()) status=invalid_handle;
+        else if (!hash_info(algorithm->second.name)) status=not_supported;
+        else if (!arg(5) || u32(6)!=hash_info(algorithm->second.name)->digest || (!algorithm->second.hmac && u32(2)) || (u32(2) && !arg(1)) || (u32(4) && !arg(3))) status=invalid_parameter;
+        else {
+            memory.check(GuestAddress{arg(5)},u32(6),Access::Write);
+            CryptoHash hash(algorithm->second.name,algorithm->second.hmac,buffer(arg(1),u32(2)));hash.update(buffer(arg(3),u32(4)));memory.write(GuestAddress{arg(5)},hash.digest());
+        }
+    } else if (symbol=="BCryptEnumAlgorithms") {
+        // (dwAlgOperations, pAlgCount, ppAlgList, dwFlags)：BCRYPT_ALGORITHM_IDENTIFIER 陣列與名稱放在同一塊程序堆積，以 BCryptFreeBuffer 釋放。
+        struct Entry {const char16_t* name;std::uint32_t kind;};
+        static constexpr Entry entries[]{{u"AES",1},{u"MD5",2},{u"SHA1",2},{u"SHA256",2},{u"SHA384",2},{u"SHA512",2},{u"RSA",3},{u"DH",4},{u"ECDH_P256",4},{u"ECDH_P384",4},{u"ECDH_P521",4},
+            {u"RSA_SIGN",5},{u"ECDSA_P256",5},{u"ECDSA_P384",5},{u"ECDSA_P521",5},{u"RNG",6},{u"PBKDF2",7},{u"SP800_108_CTR_HMAC",7},{u"SP800_56A_CONCAT",7},{u"CAPI_KDF",7}};
+        const auto operations=u32(0);
+        if (operations&~0x7fU || u32(3) || !arg(1) || !arg(2)) status=invalid_parameter;
+        else {
+            std::vector<const Entry*> selected;for (const auto& entry:entries) if (!operations || (operations&(1U<<(entry.kind-1)))) selected.push_back(&entry);
+            const unsigned unit=x86_?4U:8U,entry_size=x86_?12U:16U;std::size_t size=selected.size()*entry_size;for (const auto* entry:selected) size+=(std::char_traits<char16_t>::length(entry->name)+1)*2;
+            memory.check(GuestAddress{arg(1)},4,Access::Write);memory.check(GuestAddress{arg(2)},unit,Access::Write);
+            const auto block=allocate_heap(memory,size);
+            if (!block) status=0xc0000017U;
+            else {
+                auto text=block+selected.size()*entry_size;
+                for (std::size_t i=0;i<selected.size();++i) {
+                    const auto at=block+i*entry_size;const auto bytes=utf16_bytes(selected[i]->name);memory.write(GuestAddress{text},bytes);
+                    memory.store(GuestAddress{at},x86_?32:64,text);memory.store(GuestAddress{at+unit},32,selected[i]->kind);memory.store(GuestAddress{at+unit+4},32,0);text+=bytes.size();
+                }
+                memory.store(GuestAddress{arg(1)},32,selected.size());memory.store(GuestAddress{arg(2)},x86_?32:64,block);
             }
-            memory.write(GuestAddress{arg(6)},derived);
+        }
+    } else if (symbol=="BCryptFreeBuffer") {
+        if (arg(0)) (void)free_heap(memory,arg(0),state);
+    } else if (symbol=="BCryptGetFipsAlgorithmMode") {
+        // HKLM\SYSTEM\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy 的 Enabled（Vista 起），或 Lsa 的 FIPSAlgorithmPolicy 值；預設停用。
+        if (!arg(0)) status=invalid_parameter;
+        else {
+            bool enabled=false;
+            if (registry_file_.empty() || runtime_.network.external_io) {
+                RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
+                const auto dword=[&](const std::u16string& path,std::u16string_view name)->std::optional<std::uint32_t>{
+                    const auto key=runtime_.registry.keys.find(path);if (key==runtime_.registry.keys.end()) return std::nullopt;
+                    const auto value=key->second.find(std::u16string(name));if (value==key->second.end() || value->second.type!=4 || value->second.bytes.size()<4) return std::nullopt;
+                    const auto& b=value->second.bytes;return std::uint32_t{b[0]}|(std::uint32_t{b[1]}<<8)|(std::uint32_t{b[2]}<<16)|(std::uint32_t{b[3]}<<24);};
+                if (!transaction.error) {
+                    const std::u16string lsa=std::u16string(1,2)+u"\\system\\currentcontrolset\\control\\lsa";
+                    if (const auto value=dword(lsa+u"\\fipsalgorithmpolicy",u"enabled")) enabled=*value!=0;
+                    else if (const auto legacy=dword(lsa,u"fipsalgorithmpolicy")) enabled=*legacy!=0;
+                }
+            }
+            memory.store(GuestAddress{arg(0)},8,enabled?1:0);
+        }
+    } else if (symbol=="BCryptDeriveKeyCapi") {
+        // (hHash, hTargetAlg, pbDerivedKey, cbDerivedKey, dwFlags)：與 CryptDeriveKey 相同，完成雜湊後取雜湊值，需要更長時以 0x36／0x5C 延伸；雜湊隨之結束。
+        const auto found=runtime_.crypto_hashes.find(arg(0));
+        if (found==runtime_.crypto_hashes.end()) status=invalid_handle;
+        else if (arg(1) && !runtime_.crypto_algorithms.contains(arg(1))) status=invalid_handle;
+        else if (u32(4) || !arg(2) || !u32(3) || found->second.finished || !hash_info(found->second.algorithm.name) || u32(3)>hash_info(found->second.algorithm.name)->digest*2U) status=invalid_parameter;
+        else {
+            memory.check(GuestAddress{arg(2)},u32(3),Access::Write);auto& object=found->second;
+            memory.write(GuestAddress{arg(2)},crypto_kdf::capi_expand(object.algorithm.name,object.hash.digest(),u32(3)));
+            if (object.algorithm.reusable) object.hash=CryptoHash(object.algorithm.name,object.algorithm.hmac,object.key);else object.finished=true;
         }
     } else if (symbol=="BCryptDestroyHash") {
         if (!runtime_.crypto_hashes.erase(arg(0))) status=invalid_handle;

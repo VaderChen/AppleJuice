@@ -17,6 +17,8 @@ std::span<const WindowsServiceDescriptor> theme_service_descriptors() {
         {"uxtheme.dll","GetThemeBackgroundContentRect",6},{"uxtheme.dll","GetThemePartSize",7},
         {"uxtheme.dll","IsThemePartDefined",3},{"uxtheme.dll","IsThemeBackgroundPartiallyTransparent",3},
         {"uxtheme.dll","GetThemeColor",5},{"uxtheme.dll","GetThemeSysColor",2},
+        {"uxtheme.dll","GetThemeMargins",7},{"uxtheme.dll","GetThemeBackgroundExtent",6},{"uxtheme.dll","GetThemeBackgroundRegion",6},{"uxtheme.dll","GetThemeTextMetrics",5},
+        {"uxtheme.dll","GetThemeSysSize",2},{"uxtheme.dll","GetThemeSysColorBrush",2},{"uxtheme.dll","GetThemeSysBool",2},{"uxtheme.dll","GetThemeSysFont",3},{"uxtheme.dll","GetThemeSysInt",3},
         // 僅註冊目前虛擬 Windows 10 19045 ABI 的已知 ordinal；135 是 PreferredAppMode。
         {"uxtheme.dll","OpenNcThemeData",2},{"uxtheme.dll","RefreshImmersiveColorPolicyState",0},
         {"uxtheme.dll","GetIsImmersiveColorUsingHighContrast",1},{"uxtheme.dll","ShouldAppsUseDarkMode",0},
@@ -137,6 +139,71 @@ std::optional<std::uint32_t> WindowsServices::invoke_theme(GuestState& state,Gue
             const auto property=static_cast<std::uint32_t>(arg(3));
             if(!info || (property!=3803 && property!=3802 && property!=3821))result=e_prop;
             else {memory.store(GuestAddress{arg(4)},32,(property==3803?info->text_color:info->background_color)&0xffffffU);}
+        }
+    }else if(name=="GetThemeSysSize"){
+        // 只支援 MSDN 列出的系統尺寸；有主題 handle 時依主題的 DPI 換算。
+        constexpr std::array<std::uint32_t,11> supported{5,2,3,21,30,31,52,53,54,55,92};const auto id=static_cast<std::uint32_t>(arg(1));
+        const auto theme=gui_.themes.find(arg(0));const auto dpi=theme!=gui_.themes.end()?theme->second.dpi:96U;
+        result=std::find(supported.begin(),supported.end(),id)!=supported.end()?system_metric(id,dpi):0U;
+    }else if(name=="GetThemeSysColorBrush"){
+        // 主題系統色刷與 GetSysColorBrush 同源。
+        result=nested_service(state,memory,"user32.dll","GetSysColorBrush",{static_cast<std::uint32_t>(arg(1))});
+    }else if(name=="GetThemeSysBool"){
+        // TMT_FLATMENUS（1001）取 SPI_GETFLATMENU；其他識別碼為 STG_E_INVALIDPARAMETER。
+        last_error_=0;
+        if(static_cast<std::uint32_t>(arg(1))==1001){GuestScratch scratch(*this,memory,state);const auto value=scratch.allocate(4);if(!value)last_error_=8;
+            else{memory.store(GuestAddress{value},32,0);if(nested_service(state,memory,"user32.dll","SystemParametersInfoW",{0x1022,0,value,0})&UINT32_MAX)result=memory.load(GuestAddress{value},32)!=0;last_error_=0;}}
+        else last_error_=0x80030057U;
+    }else if(name=="GetThemeSysFont"){
+        // TMT_CAPTIONFONT～TMT_ICONTITLEFONT（801～806）：NONCLIENTMETRICSW 的各字型與 SPI_GETICONTITLELOGFONT。
+        const auto id=static_cast<std::uint32_t>(arg(1));
+        if(!arg(2))result=e_pointer;else if(id<801 || id>806)result=0x80070057U;
+        else{GuestScratch scratch(*this,memory,state);const auto buffer=scratch.allocate(504);if(!buffer)result=0x8007000eU;
+            else if(id==806){if(!(nested_service(state,memory,"user32.dll","SystemParametersInfoW",{0x1f,92,buffer,0})&UINT32_MAX))result=0x80004005U;}
+            else{memory.write(GuestAddress{buffer},std::vector<std::uint8_t>(504));memory.store(GuestAddress{buffer},32,504);if(!(nested_service(state,memory,"user32.dll","SystemParametersInfoW",{0x29,504,buffer,0})&UINT32_MAX))result=0x80004005U;}
+            if(!result){constexpr std::array<unsigned,5> offsets{24,124,224,316,408};const auto at=id==806?buffer:buffer+offsets[id-801];
+                std::vector<std::uint8_t> font(92);memory.read(GuestAddress{at},font);memory.check(GuestAddress{arg(2)},92,Access::Write);memory.write(GuestAddress{arg(2)},font);}}
+        last_error_=0;
+    }else if(name=="GetThemeSysInt"){
+        // TMT_MINCOLORDEPTH（1301）：Windows 主題的系統度量為 15 位元；其他識別碼為 E_PROP_ID_UNSUPPORTED。
+        if(!gui_.themes.contains(arg(0)))result=e_handle;else if(!arg(2))result=e_pointer;
+        else if(static_cast<std::uint32_t>(arg(1))!=1301)result=e_prop;else memory.store(GuestAddress{arg(2)},32,15);
+    }else if(name=="GetThemeMargins" || name=="GetThemeBackgroundExtent" || name=="GetThemeBackgroundRegion" || name=="GetThemeTextMetrics"){
+        // 由原生控制項的內容區計算邊界：content 是在指定尺寸下內容區的左、上、右、下座標。
+        const auto theme=gui_.themes.find(arg(0));
+        if(theme==gui_.themes.end())result=e_handle;
+        else if(!valid_dc(arg(1)))result=e_handle;
+        else{
+            const auto& data=theme->second;const auto part=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(2))),status=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(3)));
+            const auto read_rect=[&](std::uint64_t at){std::array<std::int32_t,4> rect{};memory.check(GuestAddress{at},16,Access::Read);for(unsigned i=0;i<4;++i)rect[i]=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{at+i*4},32)));return rect;};
+            const auto margins=[&](std::array<std::int32_t,2> size)->std::optional<std::array<std::int32_t,4>>{
+                const auto info=native_gui_?native_gui_->theme_metrics(data.class_name,part,status,data.dpi,size):std::nullopt;if(!info)return std::nullopt;
+                if(!size[0] && !size[1])size=info->intrinsic;const auto measured=native_gui_->theme_metrics(data.class_name,part,status,data.dpi,size);if(!measured)return std::nullopt;
+                return std::array<std::int32_t,4>{std::max(0,measured->content[0]),std::max(0,size[0]-measured->content[2]),std::max(0,measured->content[1]),std::max(0,size[1]-measured->content[3])};
+            };
+            if(name=="GetThemeMargins"){
+                // (hTheme, hdc, iPartId, iStateId, iPropId, prc, pMargins)：TMT_SIZINGMARGINS（3601）與 TMT_CONTENTMARGINS（3602）；MARGINS 為左、右、上、下。
+                const auto property=static_cast<std::uint32_t>(arg(4));
+                if(!arg(6))result=e_pointer;else if(property!=3601 && property!=3602)result=e_prop;
+                else{std::array<std::int32_t,2> size{};if(arg(5)){const auto rect=read_rect(arg(5));size={rect[2]-rect[0],rect[3]-rect[1]};if(size[0]<0 || size[1]<0)result=0x80070057U;}
+                    if(!result){const auto value=margins(size);if(!value)result=e_prop;else{memory.check(GuestAddress{arg(6)},16,Access::Write);for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(6)+i*4},32,static_cast<std::uint32_t>((*value)[i]));}}}
+            }else if(name=="GetThemeBackgroundExtent"){
+                // (hTheme, hdc, iPartId, iStateId, pContentRect, pExtentRect)：內容區向外加上邊界。
+                if(!arg(4) || !arg(5))result=e_pointer;
+                else{const auto content=read_rect(arg(4));const auto value=margins({std::max(0,content[2]-content[0]),std::max(0,content[3]-content[1])});
+                    if(!value)result=e_prop;else{const std::array<std::int32_t,4> extent{content[0]-(*value)[0],content[1]-(*value)[2],content[2]+(*value)[1],content[3]+(*value)[3]};
+                        memory.check(GuestAddress{arg(5)},16,Access::Write);for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(5)+i*4},32,static_cast<std::uint32_t>(extent[i]));}}
+            }else if(name=="GetThemeBackgroundRegion"){
+                // (hTheme, hdc, iPartId, iStateId, pRect, pRegion)：原生控制項背景為不透明矩形。
+                if(!arg(4) || !arg(5))result=e_pointer;
+                else{const auto rect=read_rect(arg(4));memory.check(GuestAddress{arg(5)},x86_?4:8,Access::Write);
+                    const auto region=nested_service(state,memory,"gdi32.dll","CreateRectRgn",{static_cast<std::uint32_t>(rect[0]),static_cast<std::uint32_t>(rect[1]),static_cast<std::uint32_t>(rect[2]),static_cast<std::uint32_t>(rect[3])});
+                    if(!region)result=0x8007000eU;else memory.store(GuestAddress{arg(5)},x86_?32:64,region);}
+            }else{
+                // (hTheme, hdc, iPartId, iStateId, ptm)：主題未定義 TMT_FONT，取 DC 目前字型的 TEXTMETRICW。
+                if(!arg(4))result=e_pointer;else if(!arg(1))result=e_handle;
+                else if(!(nested_service(state,memory,"gdi32.dll","GetTextMetricsW",{arg(1),arg(4)})&UINT32_MAX))result=0x80004005U;
+            }
         }
     }else if(name=="CloseThemeData") {
         if(!gui_.themes.erase(arg(0)))result=e_handle;

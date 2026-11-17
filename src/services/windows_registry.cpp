@@ -8,6 +8,7 @@
 #include <cstring>
 #include <exception>
 #include <thread>
+#include <random>
 #include "x64arm/shared_wake.hpp"
 #include "x64arm/interpreter.hpp"
 #include "x64arm/registry_store.hpp"
@@ -17,6 +18,7 @@
 #include "x64arm/windows_security_attributes.hpp"
 #include "registry_hive.hpp"
 #include "registry_native_status.hpp"
+#include "registry_text_view.hpp"
 #include "apphelp_cache_store.hpp"
 #include "apphelp_environment.hpp"
 #include "apphelp_sdb.hpp"
@@ -69,6 +71,7 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
         {"advapi32.dll","RegDeleteKeyA",2},{"advapi32.dll","RegDeleteKeyW",2},
         {"advapi32.dll","RegDeleteKeyExA",4,0,0,0xc},{"advapi32.dll","RegDeleteKeyExW",4,0,0,0xc},
         {"advapi32.dll","RegDeleteTreeA",2},{"advapi32.dll","RegDeleteTreeW",2},
+        {"advapi32.dll","RegRenameKey",3},{"advapi32.dll","RegLoadAppKeyA",5,0,0,0x1c},{"advapi32.dll","RegLoadAppKeyW",5,0,0,0x1c},{"advapi32.dll","RegOpenUserClassesRoot",4,0,0,0x6},{"advapi32.dll","RegOverridePredefKey",2},
         {"shlwapi.dll","SHGetValueA",6},{"shlwapi.dll","SHGetValueW",6},{"shlwapi.dll","SHRegGetUSValueA",8},{"shlwapi.dll","SHRegGetUSValueW",8},
         {"shlwapi.dll","SHDeleteKeyA",2},{"shlwapi.dll","SHDeleteKeyW",2},
         {"advapi32.dll","RegNotifyChangeKeyValue",5,0,0,0x16},{"advapi32.dll","RegCloseKey",1},
@@ -88,11 +91,12 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
         {"ntdll.dll","NtNotifyChangeKey",10,0,0,0x360},
         {"ntdll.dll","NtLoadKey",2},{"ntdll.dll","NtLoadKey2",3,0,0,4},{"ntdll.dll","NtUnloadKey",1},
         {"ntdll.dll","NtSaveKey",2},{"ntdll.dll","NtRestoreKey",3,0,0,4},{"ntdll.dll","NtReplaceKey",3},
-        {"ntdll.dll","NtDeleteValueKey",2},{"ntdll.dll","NtDeleteKey",1},{"ntdll.dll","NtFlushKey",1},{"ntdll.dll","NtClose",1},
+        {"ntdll.dll","NtDeleteValueKey",2},{"ntdll.dll","NtDeleteKey",1},{"ntdll.dll","NtRenameKey",2},{"ntdll.dll","NtFlushKey",1},{"ntdll.dll","NtClose",1},
         {"ntdll.dll","NtApphelpCacheControl",2,0,0,1},{"ntdll.dll","ZwApphelpCacheControl",2,0,0,1}
     };return table;
 }
 #include "windows_registry_hive.inc"
+#include "windows_registry_app_hive.inc"
 #include "windows_registry_values.inc"
 void WindowsServices::poll_registry_notifications(bool reload,std::u16string_view mutation,std::uint32_t filter,GuestMemory* memory) {
     poll_printer_form_notifications(reload);
@@ -101,7 +105,7 @@ void WindowsServices::poll_registry_notifications(bool reload,std::u16string_vie
     bool compare_snapshots=!registry_io_busy_ && (!reload || registry_file_.empty());
     if(!registry_io_busy_ && reload && !registry_file_.empty()) {
         const auto now=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-        if(now>=registry_poll_time_+100){RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return;registry_poll_time_=now;compare_snapshots=true;}
+        if(now>=registry_poll_time_+100){RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return;restore_app_hives(registry);registry_poll_time_=now;compare_snapshots=true;}
     }
     // 交易重載／變更與 API 內明確通知仍完整比對。只有背景輪詢、同一份狀態且世代未變時，
     // 才沿用上次確認的鍵存在性；關閉 handle、路徑替換、執行緒退出及待發布 IOSB 每次都檢查。
@@ -189,6 +193,46 @@ std::u16string WindowsServices::registry_current_user_path(bool cached){
     if(cache)runtime_.registry_predefined_cache[0x80000001U]=path;
     return path;
 }
+// 機碼改名：同一父機碼下換成新名稱（不可含反斜線、不超過 255 字元）；hive 根、HKLM／HKU 下一層（各自是 hive）、WOW64 重導向根與含掛載 hive 的子樹不可改名，
+// 目的名稱已存在時為 STATUS_CANNOT_DELETE。子樹的鍵、顯示名稱、安全性描述元、時間、類別與揮發標記一併移到新路徑，
+// 本程序指向子樹的 handle（含 RegOverridePredefKey 的對應）改指新路徑；其他程序已開啟的 handle 之後回報機碼已刪除。
+std::uint32_t WindowsServices::rename_registry_key(const RegistryHandle& key,std::u16string_view requested,std::vector<std::pair<std::u16string,std::uint32_t>>& mutations){
+    auto& registry=runtime_.registry;const auto& old_path=key.path;
+    if((key.access&0x20006U)!=0x20006U)return 0xc0000022U;
+    if(requested.empty() || requested.size()>255 || requested.find(u'\\')!=requested.npos || requested.find(u'\0')!=requested.npos)return 0xc000000dU;
+    const auto slash=old_path.find_last_of(u'\\');if(old_path.size()==1 || slash==old_path.npos)return 0xc0000022U;
+    const auto parent=old_path.substr(0,slash);if(parent.size()==1 && (parent[0]==2 || parent[0]==3))return 0xc0000022U;
+    // 32 位元檢視的重導向根（WOW6432Node）承載整個 WOW64 檢視，不可改名。
+    if(old_path.substr(slash+1)==u"wow6432node")return 0xc0000022U;
+    const auto prefix=old_path+u"\\";
+    for(const auto& [mount,info]:registry.hives){(void)info;if(mount==old_path || mount.starts_with(prefix))return 0xc0000022U;}
+    std::u16string leaf(requested);for(auto& c:leaf)c=unicode_case_unit(c,false);
+    const auto new_path=parent+u"\\"+leaf;const auto old_leaf=old_path.substr(slash+1);
+    if(new_path!=old_path && registry.keys.contains(new_path))return 0xc0000121U;
+    if(new_path!=old_path){
+        const auto moved=[&](const std::u16string& path)->std::optional<std::u16string>{if(path==old_path)return new_path;if(path.starts_with(prefix))return new_path+path.substr(old_path.size());return std::nullopt;};
+        const auto move_map=[&](auto& map){
+            std::vector<std::u16string> names;for(auto it=map.lower_bound(old_path);it!=map.end() && (it->first==old_path || it->first.starts_with(prefix));++it)names.push_back(it->first);
+            for(const auto& name:names){auto node=map.extract(name);node.key()=*moved(name);map.insert(std::move(node));}
+        };
+        move_map(registry.keys);move_map(registry.display_names);move_map(registry.modified_times);move_map(registry.security_descriptors);move_map(registry.classes);
+        for(auto* set:{&registry.volatile_keys,&registry.generated_keys}){
+            std::vector<std::u16string> names;for(auto it=set->lower_bound(old_path);it!=set->end() && (*it==old_path || it->starts_with(prefix));++it)names.push_back(*it);
+            for(const auto& name:names){set->erase(name);set->insert(*moved(name));}
+        }
+        // handle 的實體路徑改指新位置；邏輯路徑（WOW64 檢視前）的同一層名稱一併替換。
+        const auto retarget=[&](RegistryHandle& handle){
+            const auto target=moved(handle.path);if(!target)return;const auto rest=handle.path.substr(old_path.size());handle.path=*target;
+            auto& logical=handle.logical_path;const auto tail=old_leaf+rest;
+            if(logical.size()>tail.size() && logical.ends_with(tail) && logical[logical.size()-tail.size()-1]==u'\\')logical=logical.substr(0,logical.size()-tail.size())+leaf+rest;
+        };
+        for(auto& [id,handle]:registry.handles){(void)id;retarget(handle);}
+        for(auto& [root,handle]:runtime_.registry_predefined_overrides){(void)root;retarget(handle);}
+    }
+    registry.display_names[new_path]=std::u16string(requested);
+    const auto now=runtime_.system_filetime();registry.modified_times[new_path]=now;registry.modified_times[parent]=now;
+    mutations.emplace_back(parent,1U);mutations.emplace_back(new_path,1U);return 0;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     // SHGetValue（hkey, subkey, value, type*, data, size*）：開啟子機碼後交給 SHQueryValueEx，與 Windows 相同地把 REG_EXPAND_SZ 展開成 REG_SZ。
     if(service.symbol=="SHGetValueA" || service.symbol=="SHGetValueW"){
@@ -261,6 +305,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         symbol.starts_with("RegEnum") || symbol=="RegCloseKey" || symbol=="RegNotifyChangeKeyValue";
     auto transaction=std::make_unique<RegistryTransaction>(registry,registry_file_,&registry_store_cache_,readonly);
     if(transaction->error){zero_failure(transaction->error);arg.return_to(state,transaction->error);return std::nullopt;}
+    restore_app_hives(registry);
     refresh_processor_registry(registry,memory.processor_count(),guest_processor_information(memory));
     refresh_vc_runtime_registry(registry);
     initialize_registry_views(registry);
@@ -273,7 +318,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         ~KeyValueRollback(){if(enabled && changed && !accepted)target=std::move(before);}
     } rollback{registry,before_transaction,changed,key_value};
     const auto done=[&](std::uint32_t result)->std::optional<std::uint32_t>{
-        if(!result && changed){result=commit_registry_transaction(*transaction);if(result && !registry_file_.empty())registry=before_transaction;}
+        if(!result && changed){result=commit_registry_transaction(*transaction);if(result && !registry_file_.empty())registry=before_transaction;if(!result && !app_hives_.empty())result=persist_app_hives();}
         if(!result){for(const auto& [path,filter]:mutations)poll_registry_notifications(false,path,filter,&memory);poll_registry_notifications(false,{},0,&memory);}
         rollback.accepted=!result;zero_failure(result);arg.return_to(state,result);return std::nullopt;
     };
@@ -297,11 +342,46 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
         const auto path=registry_current_user_path();const auto granted=registry_security_access(path,access);
         registry.handles.emplace(token,RegistryHandle{path,granted,registry_view(access,x86_),path});memory.store(GuestAddress{arg(1)},x86_?32:64,token);return done(0);
     }
+    if(symbol.starts_with("RegLoadAppKey")){
+        // (lpFile, phkResult, samDesired, dwOptions, Reserved)：不需備份／還原權限；檔案不存在時建立空 hive。dwOptions 只接受 REG_PROCESS_APPKEY。
+        const auto access=static_cast<std::uint32_t>(arg(2)),options=static_cast<std::uint32_t>(arg(3));
+        if(!arg(0) || !arg(1) || static_cast<std::uint32_t>(arg(4)) || (options&~1U) || (access&0x300U)==0x300U)return done(87);
+        if(access&~0xf30f033fU)return done(50);
+        const auto source=symbol.ends_with("W")?read_utf16(memory,GuestAddress{arg(0)},32768):utf8_to_utf16(read_ansi(memory,arg(0),32768));if(source.empty())return done(87);
+        if(registry.handles.size()>=4096)return done(8);memory.check(GuestAddress{arg(1)},x86_?4:8,Access::Write);memory.store(GuestAddress{arg(1)},x86_?32:64,0);
+        std::u16string root;std::uint32_t status=0;
+        try{status=load_app_hive(source,(options&1U)!=0,root);}catch(const registry_hive::Error& error){status=error.code;}
+        if(status)return done(status);
+        std::uint32_t granted=0;try{granted=registry_security_access(root,access);}catch(...){release_app_hives();throw;}
+        const auto handle=registry.next_handle++;registry.handles.emplace(handle,RegistryHandle{root,granted,RegistryView::Native64,root});memory.store(GuestAddress{arg(1)},x86_?32:64,handle);return done(0);
+    }
+    if(symbol=="RegOpenUserClassesRoot"){
+        // (hToken, dwOptions, samDesired, phkResult)：權杖使用者的 HKCU\Software\Classes（HKCR 合併檢視的使用者部分）；權杖需 TOKEN_QUERY。
+        const auto access=static_cast<std::uint32_t>(arg(2));
+        if(!arg(3) || static_cast<std::uint32_t>(arg(1)) || (access&0x300U)==0x300U)return done(87);
+        if(access&~0xf30f033fU)return done(50);
+        const auto token_access=runtime_.token_handles.find(arg(0));if(token_access==runtime_.token_handles.end())return done(6);if(!(token_access->second&8U))return done(5);
+        if(registry.handles.size()>=4096)return done(8);memory.check(GuestAddress{arg(3)},x86_?4:8,Access::Write);
+        const auto path=registry_user_root(registry,token_user_sid_string(runtime_.token_handle_objects.at(arg(0))),token_user_sid_string(1))+u"\\software\\classes";
+        if(!registry.keys.contains(path))return done(2);
+        const auto granted=registry_security_access(path,access);const auto handle=registry.next_handle++;
+        registry.handles.emplace(handle,RegistryHandle{path,granted,registry_view(access,x86_),path});memory.store(GuestAddress{arg(3)},x86_?32:64,handle);return done(0);
+    }
     const auto root=static_cast<std::uint32_t>(arg(0));
     const bool root_encoding=arg(0)==root || arg(0)==(UINT64_C(0xffffffff00000000)|root);
     const bool predefined=root_encoding && root>=0x80000000U && root<=0x80000006U && root!=0x80000004U;
+    if(symbol=="RegOverridePredefKey"){
+        // (hKey, hNewHKey)：本程序之後對該預先定義機碼的存取改用 hNewHKey 所指的機碼（複製路徑與存取權，呼叫端可關閉原 handle）；NULL 恢復預設。
+        if(!predefined)return done(6);
+        if(!arg(1)){runtime_.registry_predefined_overrides.erase(root);return done(0);}
+        const auto target_root=static_cast<std::uint32_t>(arg(1));
+        if((arg(1)==target_root || arg(1)==(UINT64_C(0xffffffff00000000)|target_root)) && target_root>=0x80000000U && target_root<=0x80000006U)return done(87);
+        const auto target=registry.handles.find(arg(1));if(target==registry.handles.end())return done(6);if(!registry.keys.contains(target->second.path))return done(1018);
+        runtime_.registry_predefined_overrides.insert_or_assign(root,target->second);return done(0);
+    }
     RegistryHandle handle;
-    if(predefined) {
+    if(const auto overridden=predefined?runtime_.registry_predefined_overrides.find(root):runtime_.registry_predefined_overrides.end();overridden!=runtime_.registry_predefined_overrides.end())handle=overridden->second;
+    else if(predefined) {
         const bool cache=!runtime_.registry_cache_disabled && !(root==0x80000001U && runtime_.registry_user_cache_disabled);
         const auto found=runtime_.registry_predefined_cache.find(root);
         handle.path=cache && found!=runtime_.registry_predefined_cache.end()?found->second:root==0x80000001U?registry_current_user_path(true):std::u16string(1,static_cast<char16_t>(root&255));
@@ -310,7 +390,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
     else {
         const auto found=registry.handles.find(arg(0));if(found==registry.handles.end())return done(6);handle=found->second;
     }
-    if(symbol=="RegCloseKey") {if(!predefined){registry.handles.erase(arg(0));runtime_.handle_flags.erase(arg(0));poll_registry_notifications(false,{},0,&memory);}return done(0);}
+    if(symbol=="RegCloseKey") {if(!predefined){registry.handles.erase(arg(0));runtime_.handle_flags.erase(arg(0));if(!app_hives_.empty())release_app_hives();poll_registry_notifications(false,{},0,&memory);}return done(0);}
     if(!registry.keys.contains(handle.path))return done(1018);
     // Windows 7 起使用共享鍵及 WOW64 重導向，不再對任何鍵進行 reflection。
     // 仍驗證 handle／存活鍵及輸出記憶體；啟用或停用不改變共享鍵語義。
@@ -409,6 +489,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,
             if(registry.keys.contains(handle.path))handle.access=registry_security_access(handle.path,delete_key_value?2U:1U);
         }
         if(!registry.keys.contains(handle.path))return done(2);
+    }
+    if(symbol=="RegRenameKey"){
+        // (hKey, lpSubKeyName, lpNewKeyName)：只有 Unicode 版本；子機碼以 KEY_WRITE 開啟後改名，與 NtRenameKey 共用實作。
+        if(!arg(2))return done(87);
+        const auto wide_text=[&](std::uint64_t pointer){return pointer?read_utf16(memory,GuestAddress{pointer},32768):std::u16string{};};
+        auto subkey=wide_text(arg(1));for(auto& c:subkey)c=unicode_case_unit(c,false);const auto new_name=wide_text(arg(2));
+        RegistryHandle target=handle;
+        if(!subkey.empty()){
+            const auto logical=canonical(registry_logical_path(handle)+u"\\"+subkey);target.path=registry_view_path(logical,handle.view);target.logical_path=logical;
+            if(!registry.keys.contains(target.path))return done(2);target.access=registry_security_access(target.path,0x20006U);
+        }else if(predefined)target.access=registry_security_access(target.path,0x20006U);
+        const auto status=rename_registry_key(target,new_name,mutations);
+        if(status)return done(status==0xc000000dU?87U:status==0xc0000034U?2U:status==0xc000017cU?1018U:5U);
+        changed=true;return done(0);
     }
     const auto key_name=legacy_query?std::u16string{}:name(arg(shell_query || get_value || delete_key_value?2:1));
     if(symbol.starts_with("RegDeleteTree") || symbol.starts_with("SHDeleteKey")){

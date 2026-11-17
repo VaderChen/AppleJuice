@@ -44,6 +44,7 @@ struct Gamepad {
     std::array<float,4> sticks{};
     std::array<bool,2> supported_triggers{},rumble{};
     std::array<bool,4> supported_sticks{};
+    std::optional<bool> wireless;
 };
 // IOHID 原始 wire report：具 ID 的報告保留第一個 ID byte；ID 0 不含 Windows 的補零 byte。
 struct Report {Guid device{};std::uint32_t id{};std::vector<std::uint8_t> bytes{};};
@@ -99,6 +100,11 @@ public:
     virtual std::vector<Report> reports(){return {};}
     virtual std::vector<Gamepad> gamepads(){return {};}
     virtual std::uint32_t rumble(const Guid&,std::uint16_t,std::uint16_t){return 50;}
+    // 四個獨立震動馬達；既有雙馬達後端保留相同 rumble 契約，不能靜默丟棄扳機震動。
+    virtual std::uint32_t vibrate(const Guid& device,const std::array<std::uint16_t,4>& motors){
+        if(motors[2] || motors[3])return 50;
+        return rumble(device,motors[0],motors[1]);
+    }
     virtual std::vector<PointerDevice> pointer_devices(){return {};}
     virtual std::vector<PointerSample> pointer_samples(){return {};}
     virtual std::uint32_t set_report(const Guid&,unsigned,std::span<const std::uint8_t>){return 50;}

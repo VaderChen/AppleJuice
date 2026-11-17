@@ -233,7 +233,26 @@ struct MetalResource final:GraphicsResource {
     std::shared_ptr<MetalBufferPool> recycle;
     // 被 D3D12 描述元表引用時加入的 residency set；資源釋放時一併移除。
     id residency;
+    // D3D12 描述元不擁有資源。view 可在 shader view 快取淘汰後繼續供描述元使用，
+    // 但最後一個資源引用釋放時，也必須放掉描述元保留的宿主 texture／buffer view。
+    // 描述元副本共用同一個 token；資源只保留弱引用，避免形成循環。
+    struct DescriptorTexture {id<MTLTexture> texture;explicit DescriptorTexture(id<MTLTexture> value):texture(value){}};
+    std::map<const void*,std::weak_ptr<DescriptorTexture>> descriptor_textures;
+    std::size_t descriptor_prune_at{64};
+    std::shared_ptr<void> retain_descriptor_texture(id<MTLTexture> value){
+        const auto key=(__bridge const void*)value;
+        auto& weak=descriptor_textures[key];
+        if(auto live=weak.lock())return live;
+        auto live=std::make_shared<DescriptorTexture>(value);weak=live;
+        // 按倍增門檻回收失效索引，避免反覆更新描述元時累積弱引用，也不逐次掃描大表。
+        if(descriptor_textures.size()>=descriptor_prune_at){
+            std::erase_if(descriptor_textures,[](const auto& entry){return entry.second.expired();});
+            descriptor_prune_at=std::max<std::size_t>(64,descriptor_textures.size()*2);
+        }
+        return live;
+    }
     ~MetalResource() override {
+        for(auto& [key,weak]:descriptor_textures){(void)key;if(auto live=weak.lock())live->texture=nil;}
         if(residency){if(@available(macOS 15.0,*))[(id<MTLResidencySet>)residency removeAllocation:(id<MTLAllocation>)(texture?(id)texture:(id)buffer)];}
         if(recycle && buffer && !texture)recycle->put(buffer);
     }
@@ -338,9 +357,29 @@ struct MetalShader final:GraphicsShader {
     signed char uav_write_only{-1}; // 首次需要時由 bytecode 判定（見 metal_dxbc_uav_write_only）。
     signed char primitive_cull{-1}; // 首次使用時證明 CullDistance 是否恆為零；其餘值由 GPU 依整個圖元判斷。
     std::vector<MetalVarying> input_varyings,output_varyings;
+    std::vector<GraphicsShaderSemantic> signature_inputs,signature_outputs;
     unsigned geometry_input{},geometry_output{},geometry_max{},geometry_instances{1};
     unsigned buffer_views_slot{UINT32_MAX};
+    unsigned buffer_sizes_slot{UINT32_MAX}; // SPIRV-Cross OpArrayLength；索引為著色器的原生 buffer 槽位。
 };
+// 現代與傳統著色器共用編譯完成狀態；首次使用由 metal_resolve_shader 等待並承接錯誤。
+bool metal_queue_shader_library(id<MTLDevice> device,MetalShader& shader,const std::string& source,NSString* entry,MTLCompileOptions* options){
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_METAL_ASYNC_SHADER");return !value || std::string_view(value)!="0";}();
+    if(!enabled)return false;
+    auto pending=std::make_shared<MetalPendingLibrary>();pending->entry=entry;shader.pending=pending;
+    const auto compilation=metal_library_compilation(source,options);
+    const auto& text=compilation.source.empty()?source:compilation.source;
+    if(!compilation.source.empty())options=compilation.options;
+    const auto request=metal_library_request(text,options);
+    if(auto library=metal_library_cached(device,request)){pending->library=library;pending->done=true;return true;}
+    metal_library_capture(request,text);
+    [device newLibraryWithSource:[NSString stringWithUTF8String:text.c_str()] options:options completionHandler:^(id<MTLLibrary> library,NSError* failure){
+        std::lock_guard lock(pending->mutex);pending->library=library;
+        if(!library)pending->error=failure?std::string(failure.localizedDescription.UTF8String):std::string("未知錯誤");
+        pending->done=true;pending->ready.notify_all();
+    }];
+    return true;
+}
 // 取得非同步編譯的結果：建立 function（運算著色器再建立 compute pipeline）。失敗時沿用同步路徑的錯誤訊息。
 void metal_resolve_shader(id<MTLDevice> device,MetalShader& shader){
     if(shader.compile_failure)std::rethrow_exception(shader.compile_failure);

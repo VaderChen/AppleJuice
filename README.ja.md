@@ -113,13 +113,28 @@ x86_64（64 ビット）に加えて、x86 PE32 の EXE と対応する DLL を�
 - **オーディオ**：DirectSound（3D 定位と録音を含む）、XAudio2、WASAPI、X3DAudio を Core Audio で出力し、ステレオの左右チャンネルとパンを保持します。
 - **入力**：DirectInput（フォースフィードバックを含む）、XInput、Raw Input は macOS の物理入力デバイスのデータを使用します。
 - **動画**：Media Foundation と D3D11 DXVA の H.264 エンコード／デコードは VideoToolbox のハードウェアアクセラレーションを使用します。Windows Media（ASF）の VC-1／WMV と WMA は内蔵のデコーダー専用 FFmpeg でデコードします。HEVC と AV1 は未完成です。
-- **アップスケーリング**：ゲームの XeSS は MetalFX のテンポラルアップスケーラーで実行します。ゲームが XeSS を有効にすると、Launcher のフレーム補間と 2 倍拡大は自動的に停止し、ゲームのアップスケーラーの出力を表示します。
 
 AppleJuice は開発中です。Windows 全体、すべてのアプリケーション、すべての API 引数の組み合わせには対応していません。読み込みやウィンドウの表示が成功しても、アプリケーション全体の互換性を保証するものではありません。ドライブマッピングは完全な OS サンドボックスではなく、有効なサービスはマッピング先のファイルやネットワークにアクセスする場合があります。信頼できるプログラムだけを実行し、必要に応じてアクセス権を設定してください。
 
 リポジトリには `src/`、`include/`、`launcher/`、`cmake/`、必要なビルドスクリプト、`third_party/`、`x64kernel/` と使用ドキュメントを含みます。
 
-## 動作確認の記録 / 2026-11-13 / 全 22 本のゲーム
+## ネイティブ MetalFX とマルチチャンネル HRTF ヘッドフォン再生
+
+これらは AppleJuice が画面表示と音声出力の処理でネイティブに提供する機能です。ゲーム自体が MetalFX や HRTF に対応していなくても、ゲームの変更や MOD の導入なしで手動で有効にできます。
+
+### MetalFX アップスケーリングとフレーム補間
+
+- **2 倍拡大表示**：メイン画面のスイッチから、macOS ネイティブの MetalFX 空間アップスケーラーで出力を 2 倍に拡大します。ゲーム側の対応は不要です。
+- **フレーム補間**：本プロジェクトが別途 macOS ネイティブの VideoToolbox を使い、完成した前後の画像から中間画像を生成します。ゲームから深度やモーションベクトルを受け取る必要はありません。macOS 26 以降と対応デバイスが必要で、入力は最大 1920×1080 です。ゲーム自体の更新頻度は増えません。
+- **ゲーム内 XeSS**：ゲームが XeSS を提供する場合は MetalFX テンポラルアップスケーリングへ変換できます。この経路では Launcher のフレーム補間と 2 倍拡大を自動的に停止し、ゲームのアップスケーラーの出力を表示します。
+
+### マルチチャンネル HRTF ヘッドフォン再生
+
+「ヘッドフォン空間ミックス」を有効にすると、5.1、7.1 などの各チャンネルを仮想スピーカーの位置に配置し、HRTF により通常のヘッドフォン向けのバイノーラル・ステレオへ変換します。低音チャンネルも保持します。ゲームや動画アプリに HRTF 対応は不要ですが、空間効果は実際の入力チャンネル情報によって変わります。
+
+メイン画面と「設定 → オーディオ」に連動するスイッチがあります。初期設定はオフで、変更はアプリの次回起動時に適用します。現在はヘッドトラッキングを使用しません。
+
+## 動作確認の記録 / 2026-11-17 / 全 23 本のゲーム
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作不可・対応中" title="動作不可・対応中"> 動作不可・対応中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="起動可" title="起動可"> 起動可　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="低効率" title="低効率"> 低効率　<img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="良好（MetalFX）" title="良好（MetalFX）"> 良好（MetalFX）　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好" title="良好"> 良好
 
@@ -151,9 +166,12 @@ AppleJuice は開発中です。Windows 全体、すべてのアプリケーシ�
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="低効率" title="低効率"> |
 | デイヴ・ザ・ダイバー | x64 | D3D11（Unity） | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="起動可" title="起動可"> |
 | 特警シグナルフォース | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="起動可" title="起動可"> |
+| DEATH STRANDING DIRECTOR'S CUT | x64 | D3D12 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="起動可" title="起動可"> |
 | バイオハザード ヴィレッジ | x64 | D3D12（RE Engine） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="動作不可・対応中" title="動作不可・対応中"> |
 
 「良好（MetalFX）」は、Launcher のフレーム補間または 2 倍拡大（MetalFX）を有効にすると「良好」の基準を満たすことを示します。無効の場合は「低効率」です。
+
+DEATH STRANDING DIRECTOR'S CUT は現在「起動可」です。第 3 章のセーブ読込とキャラクター移動は確認済みですが、白いちらつきが発生する場合があり、安定した 50 FPS には達していません。問題を解決し、実際のプレイと他の場面の検証を終えた後に評価を更新します。「良好」は安定して 50 FPS を超えるか、アプリ自身のフレームレート上限に達することを基準とします。
 
 記録は当時のバージョンと設定によるもので、ゲーム全体の流れ、他のバージョン、すべての設定での動作を示すものではありません。
 

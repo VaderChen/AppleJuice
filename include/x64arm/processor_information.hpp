@@ -11,6 +11,11 @@ struct ProcessorInformation {
     std::string socket{"Virtual Socket 0"};
     std::uint32_t maximum_mhz{}, nominal_mhz{};
 };
+// 相容處理器 TSC 的固定計數頻率，與宿主即時／base clock 分開。
+// 沿用既有 TSC 政策：已知標稱值 → 已知上限 → 100 ns（10 MHz）。
+constexpr std::uint32_t processor_timestamp_mhz(std::uint32_t nominal,std::uint32_t maximum) noexcept {
+    return nominal?nominal:(maximum?maximum:10U);
+}
 const ProcessorInformation& native_processor_information();
 class GuestMemory;
 ProcessorInformation guest_processor_information(const GuestMemory&);

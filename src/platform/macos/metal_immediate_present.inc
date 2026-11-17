@@ -23,6 +23,7 @@ class MetalImmediatePresenter {
     unsigned width_{},height_{};
 
     void run() noexcept {
+        metal_present_thread_start("x64arm.present.immediate");
         try {
             for(;;){
                 {

@@ -9,11 +9,14 @@
 #include "x64arm/windows_guid.hpp"
 #include "x64arm/security_descriptor.hpp"
 #include "windows_display_identity.hpp"
+#include "x64arm/windows_default_environment.hpp"
+#include "registry_text_view.hpp"
 #include "setup_driver_store.hpp"
 #include "bluetooth_windows.hpp"
 #include "windows_sddl.hpp"
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <set>
 
 namespace x64arm {
@@ -358,6 +361,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
     };
     const auto read=[&](std::uint64_t pointer){return pointer?(wide?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16(read_ansi(memory,pointer,32768))):std::u16string{};};
     if(!runtime_.network.external_io)throw HostCallFault("原生顯示裝置盤點不支援 deterministic compare");
+    if(name=="D3DKMTQueryAdapterInfo"){
+#include "windows_d3dkmt_registry.inc"
+    }
     if(name=="CM_Register_Notification" || name=="CM_Unregister_Notification")return invoke_device_notification(state,memory,service);
     if(name=="CM_MapCrToWin32Err"){
         // CONFIGRET → Win32 錯誤（與 Windows 的對照表相同）；未列出的代碼回傳呼叫端指定的預設值。

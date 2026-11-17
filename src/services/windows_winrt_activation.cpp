@@ -56,6 +56,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_activation(GuestState
         // RoRegisterActivationFactories 登錄的程序內工廠優先，不需載入 DLL。
         const auto registered=winrt_class_factories_.find(fold(class_name));
         if(registered==winrt_class_factories_.end()){
+            // 系統 WinRT 輸入類別共用既有 DirectInput／XInput 後端；程序自己登錄的工廠仍優先。
+            if(const auto result=activate_winrt_gamepad(state,memory,class_name,activate,activate?0:arg(1),output))return done(*result);
             // 與 Reg* 共用持久檔鎖及 WOW64 視圖；不在 guest 回呼期間持有鎖。
             if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
             RegistryTransaction transaction(runtime_.registry,registry_file_);if(transaction.error)return done(hresult(transaction.error));

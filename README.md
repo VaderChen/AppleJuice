@@ -64,6 +64,8 @@ AppleJuice 執行 Windows x86_64 版本，Rosetta 執行 macOS x86_64 版本，�
 ./run.command
 ```
 
+首次執行會自動建置與封裝；之後核對並沿用已驗證的套件，正常啟動不等待同一提交內的開發改動重新編譯。Git 提交更新時會重新建置；要套用尚未提交的修改，執行 `./run.command --rebuild` 或下方的自行編譯流程。
+
 完成後開啟 `build/launcher/Win64 Launcher.app`。按「加入 EXE」，選取自行準備的 Windows 程式，設定工作資料夾、命令列、磁碟映射與寫入權限，再按播放圖示。文字程式使用內嵌終端，視窗程式開啟獨立視窗。
 
 ## 自行編譯
@@ -115,13 +117,28 @@ x64 OpenCL 與 Vulkan 分別使用 macOS OpenCL.framework 與 Vulkan loader／Mo
 - **音訊**：DirectSound（含 3D 定位與錄音）、XAudio2、WASAPI 與 X3DAudio 經 Core Audio 輸出，保留立體聲左右聲道與聲像。
 - **輸入**：DirectInput（含力回饋）、XInput 與 Raw Input 取用 macOS 實體輸入裝置的資料。
 - **影片**：Media Foundation 與 D3D11 DXVA 的 H.264 編解碼使用 VideoToolbox 硬體加速；Windows Media（ASF）的 VC-1／WMV 與 WMA 由內建、只含解碼器的 FFmpeg 解碼。HEVC 與 AV1 尚未完成。
-- **畫面升頻**：遊戲的 XeSS 以 MetalFX 時間性升頻執行；遊戲啟用 XeSS 時，Launcher 的畫面內插與 2 倍放大會自動停用，改由遊戲的升頻輸出。
 
 AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數組合並未全面支援。成功載入或顯示視窗不代表完整應用程式均可使用。磁碟映射不是完整 OS 沙箱；啟用的服務可能存取映射檔案或使用網路。請只執行信任的程式，並依需要設定存取權限。
 
 儲存庫包含 `src/`、`include/`、`launcher/`、`cmake/`、必要建置腳本、`third_party/`、`x64kernel/` 與使用文件。
 
-## 實測紀錄 / 2026-11-13 / 共 22 款遊戲
+## 原生 MetalFX 與多聲道 HRTF 耳機模擬
+
+這兩項功能皆由 AppleJuice 在畫面呈現與音訊輸出層原生提供，遊戲沒有內建 MetalFX 或 HRTF 支援，也可以手動開啟，不需要修改遊戲或安裝遊戲模組。
+
+### MetalFX 升頻與畫面內插
+
+- **2 倍放大顯示**：在主畫面開啟同名開關，以 macOS 原生 MetalFX 空間升頻將遊戲輸出放大 2 倍，無須遊戲整合升頻功能。
+- **畫面內插**：由本專案另外透過 macOS 原生 VideoToolbox，在前後兩張已完成畫面之間產生中間畫面，提高顯示流暢度，無須遊戲提供深度或動態向量。需要 macOS 26 以上及支援的裝置，輸入畫面最高為 1920×1080；內插不會提高遊戲本身的更新頻率。
+- **遊戲內 XeSS**：程式本身提供 XeSS 時，亦可對應至 MetalFX 時間性升頻。這條路徑啟用後，Launcher 的畫面內插與 2 倍放大會自動停用，改由遊戲的升頻輸出。
+
+### 多聲道 HRTF 耳機模擬
+
+開啟「空間混音(耳機)」，即可將程式輸出的 5.1、7.1 等多聲道音訊，依各聲道方位經 HRTF 轉為立體聲雙耳輸出，讓一般耳機呈現方向感，並保留低頻聲道。遊戲或影音程式無須內建 HRTF；空間效果依來源實際提供的聲道資訊而定。
+
+主畫面與「設定 → 音訊」皆提供同步的 Switch 開關。此功能預設關閉，設定於下次啟動程式時生效，目前不啟用頭部追蹤。
+
+## 實測紀錄 / 2026-11-17 / 共 23 款遊戲
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="無法運作、處理中" title="無法運作、處理中"> 無法運作、處理中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="可開啟" title="可開啟"> 可開啟　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="效率不高" title="效率不高"> 效率不高　<img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="運作良好 (MetalFX)" title="運作良好 (MetalFX)"> 運作良好 (MetalFX)　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="運作良好" title="運作良好"> 運作良好
 
@@ -147,6 +164,7 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | Steam | x64 | Chromium（CEF） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 電馭叛客 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
+| 死亡擱淺 DIRECTOR'S CUT | x64 | D3D12 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="可開啟" title="可開啟"> |
 | 三國志X with 威力加強版 | x86 | 未知 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 雙人成行 | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="效率不高" title="效率不高"> |
@@ -156,6 +174,8 @@ AppleJuice 持續開發中，完整 Windows、所有程式及所有 API 參數�
 | 惡靈古堡 村莊 | x64 | D3D12（RE Engine） | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="無法運作、處理中" title="無法運作、處理中"> |
 
 「運作良好 (MetalFX)」表示開啟 Launcher 的畫面內插或 2 倍放大（MetalFX）後達到運作良好標準；未開啟時仍屬效率不高。
+
+《死亡擱淺 DIRECTOR'S CUT》目前評為「可開啟」。已驗證第 3 章的存檔載入與角色行走，仍可能出現泛白閃爍，尚未達到穩定 50 FPS；待問題解決並完成實際遊玩與其他場景驗收後，再更新支援程度。「運作良好」須穩定超過 50 FPS，或達到程式本身的幀率上限。
 
 實測紀錄依當時版本與設定，不代表完整遊戲流程、其他版本或所有設定均可使用。
 

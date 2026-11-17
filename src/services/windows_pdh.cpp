@@ -5,6 +5,11 @@
 #include "x64arm/windows_power.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include "x64arm/x87_fp.hpp"
+extern "C" {
+#include "softfloat.h"
+}
 
 namespace x64arm {
 // PDH 即時計數器：Processor／Processor Information／Memory 物件以虛擬 vCPU 為實例，
@@ -45,7 +50,7 @@ struct Snapshot {
     SystemPerformance memory;
 };
 struct Path {Object object{};const CounterName* counter{};std::u16string instance;bool wildcard{},has_instance{};};
-struct CounterState {std::uint64_t query{},user{};Path path;std::shared_ptr<const Snapshot> previous,current;};
+struct CounterState {std::uint64_t query{},user{};Path path;std::shared_ptr<const Snapshot> previous,current;std::int32_t scale{};};
 struct Query {std::uint64_t user{};std::vector<std::uint64_t> counters;std::uint64_t registration{};};
 std::u16string fold(std::u16string_view text){std::u16string result(text);for(auto& c:result)c=unicode_case_unit(c,false);return result;}
 std::uint32_t parse(std::u16string_view text,Path& out){
@@ -144,8 +149,66 @@ std::optional<double> value(const CounterState& counter,std::size_t index,unsign
     default:{const auto p=performance();if(p<0)return std::nullopt;return total>0?busy/total*p:0.0;}
     }
 }
+// 不分大小寫的萬用字元比對（* 為任意長度）。
+bool glob(std::u16string_view pattern,std::u16string_view text){
+    const auto p=fold(pattern),t=fold(text);std::size_t pi=0,ti=0,star=std::u16string::npos,mark=0;
+    while(ti<t.size()){
+        if(pi<p.size() && p[pi]==t[ti]){++pi;++ti;}
+        else if(pi<p.size() && p[pi]==u'*'){star=pi++;mark=ti;}
+        else if(star!=std::u16string::npos){pi=star+1;ti=++mark;}
+        else return false;
+    }
+    while(pi<p.size() && p[pi]==u'*')++pi;return pi==p.size();
 }
-struct PdhState {std::map<std::uint64_t,pdh::Query> queries;std::map<std::uint64_t,pdh::CounterState> counters;};
+// PdhExpandWildCardPath：物件、實例與計數器欄位的萬用字元展開成完整路徑；PDH_NOEXPANDCOUNTERS（1）／PDH_NOEXPANDINSTANCES（2）保留 *。
+std::uint32_t expand(std::u16string_view text,std::uint32_t flags,unsigned count,std::vector<std::u16string>& out){
+    std::u16string prefix;
+    if(text.starts_with(u"\\\\")){
+        const auto end=text.find(u'\\',2);if(end==text.npos)return bad_name;const auto machine=fold(text.substr(2,end-2));
+        if(machine!=u"." && machine!=u"localhost" && machine!=u"x64arm")return no_machine;prefix=std::u16string(text.substr(0,end));text.remove_prefix(end);
+    }
+    if(!text.starts_with(u"\\"))return bad_name;text.remove_prefix(1);
+    const auto separator=text.rfind(u'\\');if(separator==text.npos || separator+1==text.size())return bad_name;
+    auto object=text.substr(0,separator);const auto counter=text.substr(separator+1);std::optional<std::u16string_view> instance;
+    if(const auto open=object.find(u'(');open!=object.npos){if(!object.ends_with(u')'))return bad_name;instance=object.substr(open+1,object.size()-open-2);object=object.substr(0,open);if(instance->empty())return bad_name;}
+    bool object_found=false,instance_found=false;
+    for(std::size_t o=0;o<std::size(object_names);++o){
+        if(!glob(object,object_names[o]))continue;object_found=true;const auto kind=static_cast<Object>(o);const bool instanced=kind!=Object::Memory;
+        if(instanced!=instance.has_value())continue;
+        std::vector<std::u16string> names;
+        if(!instanced)names.emplace_back();
+        else if((flags&2U) && *instance==u"*")names.emplace_back(u"*");
+        else for(const auto& name:instances(kind,count))if(glob(*instance,name))names.push_back(name);
+        if(names.empty())continue;instance_found=true;
+        std::vector<std::u16string_view> counters;
+        if((flags&1U) && counter==u"*")counters.emplace_back(u"*");else for(const auto& item:display_names)if(item.object==kind && glob(counter,item.name))counters.push_back(item.name);
+        for(const auto& name:names)for(const auto item:counters)out.push_back(prefix+u"\\"+std::u16string(object_names[o])+(instanced?u"("+name+u")":std::u16string{})+u"\\"+std::u16string(item));
+    }
+    if(!out.empty())return 0;
+    return !object_found?no_object:instance.has_value() && !instance_found?no_instance:no_counter;
+}
+// PDH_COUNTER_INFO 的 szExplainText（本專案撰寫的英文說明）。
+std::u16string_view explain(Counter counter){
+    switch(counter){
+    case Counter::ProcessorTime:return u"Percentage of elapsed time the processor spent executing non-idle threads.";
+    case Counter::IdleTime:return u"Percentage of elapsed time the processor was idle.";
+    case Counter::UserTime:return u"Percentage of elapsed time the processor spent in user mode.";
+    case Counter::PrivilegedTime:return u"Percentage of elapsed time the processor spent in privileged mode, excluding idle time.";
+    case Counter::Frequency:return u"Current processor frequency in megahertz.";
+    case Counter::Performance:return u"Processor performance relative to the nominal frequency, in percent.";
+    case Counter::Utility:return u"Processor utilization scaled by performance relative to the nominal frequency, in percent.";
+    case Counter::MaximumFrequency:return u"Current processor frequency as a percentage of the maximum frequency.";
+    case Counter::AvailableBytes:return u"Physical memory immediately available to processes, in bytes.";
+    case Counter::AvailableKBytes:return u"Physical memory immediately available to processes, in kilobytes.";
+    case Counter::AvailableMBytes:return u"Physical memory immediately available to processes, in megabytes.";
+    case Counter::CommittedBytes:return u"Committed virtual memory, in bytes.";
+    case Counter::CommitLimit:return u"Virtual memory that can be committed without extending the paging file, in bytes.";
+    case Counter::CommittedInUse:return u"Committed bytes as a percentage of the commit limit.";
+    }
+    return {};
+}
+}
+struct PdhState {std::map<std::uint64_t,pdh::Query> queries;std::map<std::uint64_t,pdh::CounterState> counters;std::uint32_t data_source{1};};
 std::uint32_t WindowsServices::collect_pdh_query(std::uint64_t handle,std::uint64_t* timestamp){
     const auto query=pdh_->queries.find(handle);if(query==pdh_->queries.end())return pdh::invalid_handle;
     if(query->second.counters.empty())return pdh::no_data;
@@ -203,7 +266,12 @@ std::span<const WindowsServiceDescriptor> pdh_service_descriptors(){
         {"pdh.dll","PdhEnumObjectsA",6},{"pdh.dll","PdhEnumObjectsW",6},{"pdh.dll","PdhEnumObjectItemsA",9},{"pdh.dll","PdhEnumObjectItemsW",9},
         {"pdh.dll","PdhConnectMachineA",1},{"pdh.dll","PdhConnectMachineW",1},{"pdh.dll","PdhEnumMachinesA",3},{"pdh.dll","PdhEnumMachinesW",3},
         {"pdh.dll","PdhLookupPerfNameByIndexA",4},{"pdh.dll","PdhLookupPerfNameByIndexW",4},{"pdh.dll","PdhLookupPerfIndexByNameA",3},{"pdh.dll","PdhLookupPerfIndexByNameW",3},
-        {"pdh.dll","PdhGetRawCounterValue",3}
+        {"pdh.dll","PdhGetRawCounterValue",3},
+        {"pdh.dll","PdhMakeCounterPathA",4},{"pdh.dll","PdhMakeCounterPathW",4},{"pdh.dll","PdhExpandWildCardPathA",5},{"pdh.dll","PdhExpandWildCardPathW",5},
+        {"pdh.dll","PdhExpandCounterPathA",3},{"pdh.dll","PdhExpandCounterPathW",3},{"pdh.dll","PdhValidatePathExA",2},{"pdh.dll","PdhValidatePathExW",2},
+        {"pdh.dll","PdhGetCounterInfoA",4,0,0,0x2},{"pdh.dll","PdhGetCounterInfoW",4,0,0,0x2},{"pdh.dll","PdhSetCounterScaleFactor",2},{"pdh.dll","PdhGetCounterTimeBase",2},
+        {"pdh.dll","PdhGetRawCounterArrayA",4},{"pdh.dll","PdhGetRawCounterArrayW",4},{"pdh.dll","PdhCalculateCounterFromRawValue",5},
+        {"pdh.dll","PdhGetDllVersion",1},{"pdh.dll","PdhSetDefaultRealTimeDataSource",1},{"pdh.dll","PdhVbAddCounter",3},{"pdh.dll","PdhVbGetDoubleCounterValue",2}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_pdh(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -222,6 +290,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_pdh(GuestState& state,Guest
             const auto handle=runtime_.allocate_wait_handle();pdh_state.queries.emplace(handle,pdh::Query{arg(1),{}});
             memory.store(GuestAddress{arg(2)},bits,handle);return finish(0);
         }
+        if(symbol.starts_with("PdhValidatePathEx")){
+            // (hDataSource, path)：只有即時資料（NULL）；記錄檔資料來源控制代碼不存在。
+            if(arg(0))return finish(pdh::invalid_handle);if(!arg(1))return finish(pdh::invalid_argument);pdh::Path path;return finish(pdh::parse(text(1),path));
+        }
+        if(symbol=="PdhGetDllVersion"){if(!arg(0))return finish(pdh::invalid_argument);memory.store(GuestAddress{arg(0)},32,0x503);return finish(0);}
+        if(symbol=="PdhSetDefaultRealTimeDataSource"){
+            // DATA_SOURCE_REGISTRY（1）或 DATA_SOURCE_WBEM（4）；兩者都由同一取樣來源提供數值。
+            const auto source=static_cast<std::uint32_t>(arg(0));if(source!=1 && source!=4)return finish(pdh::invalid_argument);pdh_state.data_source=source;return finish(0);
+        }
+        if(symbol=="PdhVbAddCounter"){
+            // (query, ANSI 路徑, counter*)：PdhAddCounterA 且 dwUserData 為 0。
+            const auto query=pdh_state.queries.find(arg(0));if(query==pdh_state.queries.end())return finish(pdh::invalid_handle);
+            if(!arg(1) || !arg(2))return finish(pdh::invalid_argument);memory.check(GuestAddress{arg(2)},unit,Access::Write);
+            pdh::Path path;if(const auto error=pdh::parse(text(1),path))return finish(error);if(pdh_state.counters.size()>=65536)return finish(pdh::memory_failure);
+            const auto handle=runtime_.allocate_wait_handle();pdh_state.counters.emplace(handle,pdh::CounterState{arg(0),0,std::move(path),{},{},0});
+            query->second.counters.push_back(handle);memory.store(GuestAddress{arg(2)},bits,handle);return finish(0);
+        }
         if(symbol.starts_with("PdhValidatePath")){
             if(!arg(0))return finish(pdh::invalid_argument);pdh::Path path;return finish(pdh::parse(text(0),path));
         }
@@ -230,7 +315,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_pdh(GuestState& state,Guest
             if(!arg(1) || !arg(3))return finish(pdh::invalid_argument);memory.check(GuestAddress{arg(3)},unit,Access::Write);
             pdh::Path path;if(const auto error=pdh::parse(text(1),path))return finish(error);
             if(pdh_state.counters.size()>=65536)return finish(pdh::memory_failure);
-            const auto handle=runtime_.allocate_wait_handle();pdh_state.counters.emplace(handle,pdh::CounterState{arg(0),arg(2),std::move(path),{},{}});
+            const auto handle=runtime_.allocate_wait_handle();pdh_state.counters.emplace(handle,pdh::CounterState{arg(0),arg(2),std::move(path),{},{},0});
             query->second.counters.push_back(handle);memory.store(GuestAddress{arg(3)},bits,handle);return finish(0);
         }
         if(symbol=="PdhRemoveCounter"){
@@ -303,38 +388,156 @@ std::optional<std::uint32_t> WindowsServices::invoke_pdh(GuestState& state,Guest
             const auto found=std::find_if(std::begin(pdh::standard_indexes),std::end(pdh::standard_indexes),[&](const auto& item){return pdh::fold(item.second)==name;});
             if(found==std::end(pdh::standard_indexes))return finish(pdh::invalid_argument);memory.store(GuestAddress{arg(2)},32,found->first);return finish(0);
         }
+        if(symbol.starts_with("PdhMakeCounterPath")){
+            // PDH_COUNTER_PATH_ELEMENTS：Machine、Object、Instance、ParentInstance、InstanceIndex、Counter；組成 \\Machine\Object(Parent/Instance#Index)\Counter。
+            // dwFlags 的 WMI 路徑轉換（PDH_PATH_WBEM_RESULT／INPUT）尚未支援。
+            if(!arg(0) || !arg(2))return finish(pdh::invalid_argument);if(static_cast<std::uint32_t>(arg(3)))return finish(pdh::invalid_argument);
+            const auto field=[&](unsigned slot){const auto pointer=memory.load(GuestAddress{arg(0)+slot*unit},bits);return pointer?text_at(pointer):std::u16string{};};
+            const auto machine=field(0),object=field(1),instance=field(2),parent=field(3),counter_name=field(5);const auto index=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+4*unit},32));
+            if(object.empty() || counter_name.empty())return finish(pdh::invalid_argument);
+            std::u16string path;if(!machine.empty())path=(machine.starts_with(u"\\\\")?u"":u"\\\\")+machine;path+=u"\\"+object;
+            if(!instance.empty()){path+=u"(";if(!parent.empty())path+=parent+u"/";path+=instance;if(index && index!=UINT32_MAX)path+=u"#"+utf8_to_utf16(std::to_string(index));path+=u")";}
+            path+=u"\\"+counter_name;
+            const auto encoded=utf16_to_utf8(path);const auto length=(wide?path.size():encoded.size())+1;const auto capacity=memory.load(GuestAddress{arg(2)},32);
+            memory.store(GuestAddress{arg(2)},32,length);if(!arg(1) || capacity<length)return finish(pdh::more_data);
+            if(wide)memory.write(GuestAddress{arg(1)},utf16_bytes(path));else{memory.write(GuestAddress{arg(1)},std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()),encoded.size()));memory.store(GuestAddress{arg(1)+encoded.size()},8,0);}
+            return finish(0);
+        }
+        if(symbol.starts_with("PdhExpandWildCardPath") || symbol.starts_with("PdhExpandCounterPath")){
+            // ExpandCounterPath(path, list, length)＝ExpandWildCardPath(NULL, path, list, length, 0)；只支援即時資料來源。
+            const bool extended=symbol.starts_with("PdhExpandWildCardPath");const unsigned shift=extended?1U:0U;
+            if(extended && arg(0))return finish(pdh::not_implemented);if(!arg(shift) || !arg(2+shift))return finish(pdh::invalid_argument);
+            std::vector<std::u16string> paths;if(const auto status=pdh::expand(text_at(arg(shift)),extended?static_cast<std::uint32_t>(arg(4)):0U,count,paths))return finish(status);
+            return finish(store_list(arg(1+shift),arg(2+shift),multi(paths))?0:pdh::more_data);
+        }
         const auto counter=pdh_state.counters.find(arg(0));if(counter==pdh_state.counters.end())return finish(pdh::invalid_handle);
+        const auto names=pdh::instances(counter->second.path.object,count);
+        // 原始值：計時型以 100 ns CPU 時間（FirstValue＝該狀態時間、SecondValue＝總時間），其他以計算後的值為 FirstValue。
+        const auto raw_of=[&](std::size_t index,std::int64_t& first,std::int64_t& second)->std::uint32_t{
+            const auto& counter_name=*counter->second.path.counter;const auto& current=*counter->second.current;first=second=0;
+            if(counter_name.rate){const auto cpu=std::min<std::size_t>(index,count);const auto& times=cpu<count?current.cpus.at(cpu):current.total;
+                second=static_cast<std::int64_t>(times.kernel+times.user);
+                switch(counter_name.counter){case pdh::Counter::ProcessorTime:case pdh::Counter::IdleTime:first=static_cast<std::int64_t>(times.idle);break;
+                    case pdh::Counter::UserTime:first=static_cast<std::int64_t>(times.user);break;case pdh::Counter::PrivilegedTime:first=static_cast<std::int64_t>(times.kernel>times.idle?times.kernel-times.idle:0);break;
+                    default:{std::uint32_t status=0;const auto number=pdh::value(counter->second,index,count,status);first=number?static_cast<std::int64_t>(*number):0;second=100;break;}}
+                return 0;
+            }
+            std::uint32_t status=0;const auto number=pdh::value(counter->second,index,count,status);if(!number)return status;first=static_cast<std::int64_t>(*number);return 0;
+        };
+        const auto write_raw=[&](std::uint64_t at,std::uint32_t status,std::int64_t first,std::int64_t second){
+            memory.fill(GuestAddress{at},0,40);memory.store(GuestAddress{at},32,status);if(status)return;const auto now=counter->second.current->timestamp;
+            memory.store(GuestAddress{at+4},32,static_cast<std::uint32_t>(now));memory.store(GuestAddress{at+8},32,static_cast<std::uint32_t>(now>>32));
+            memory.store(GuestAddress{at+16},64,static_cast<std::uint64_t>(first));memory.store(GuestAddress{at+24},64,static_cast<std::uint64_t>(second));memory.store(GuestAddress{at+32},32,1);};
+        std::vector<std::size_t> matching;
+        for(std::size_t i=0;i<names.size();++i)if(counter->second.path.object==pdh::Object::Memory || counter->second.path.wildcard || pdh::fold(names[i])==pdh::fold(counter->second.path.instance))matching.push_back(i);
+        // PDH_FMT_COUNTERVALUE（CStatus＋8 bytes union）：百分比計數器預設上限 100、縮放因數（PDH_FMT_NOSCALE 不套用）、PDH_FMT_1000。
+        const auto format_value=[&](double result,std::uint32_t format,std::array<std::uint8_t,16>& bytes){
+            bytes.fill(0);const auto kind_bits=format&0x700U;const auto& counter_name=*counter->second.path.counter;
+            if(counter_name.percent && !(format&0x8000U))result=std::clamp(result,0.0,100.0);
+            if(!(format&0x1000U) && counter->second.scale)result*=std::pow(10.0,counter->second.scale);
+            if(format&0x2000U)result*=1000;
+            std::uint64_t raw=0;
+            if(kind_bits==0x200U)raw=std::bit_cast<std::uint64_t>(result);
+            else if(kind_bits==0x400U)raw=static_cast<std::uint64_t>(static_cast<std::int64_t>(std::llround(std::clamp(result,-9.2e18,9.2e18))));
+            else raw=static_cast<std::uint32_t>(static_cast<std::int32_t>(std::lround(std::clamp(result,-2147483648.0,2147483647.0))));
+            for(unsigned b=0;b<8;++b)bytes[8+b]=static_cast<std::uint8_t>(raw>>(b*8));
+        };
+        if(symbol=="PdhSetCounterScaleFactor"){const auto factor=static_cast<std::int32_t>(arg(1));if(factor<-7 || factor>7)return finish(pdh::invalid_argument);counter->second.scale=factor;return finish(0);}
+        if(symbol=="PdhGetCounterTimeBase"){if(!arg(1))return finish(pdh::invalid_argument);memory.store(GuestAddress{arg(1)},64,10000000);return finish(0);}
+        if(symbol.starts_with("PdhGetCounterInfo")){
+            // PDH_COUNTER_INFO：固定欄位、路徑元素與說明文字指標，字串依序放在 DataBuffer 之後；長度不足回 PDH_MORE_DATA 與所需位元組數。
+            if(!arg(2))return finish(pdh::invalid_argument);
+            const auto& counter_name=*counter->second.path.counter;const auto object_index=static_cast<std::size_t>(counter->second.path.object);
+            std::u16string counter_display;for(const auto& item:pdh::display_names)if(item.object==counter->second.path.object && item.counter==counter_name.counter)counter_display=item.name;
+            const std::u16string machine=u"\\\\X64ARM",object(pdh::object_names[object_index]);const auto& instance=counter->second.path.instance;
+            const auto full=machine+u"\\"+object+(counter->second.path.has_instance?u"("+instance+u")":std::u16string{})+u"\\"+counter_display;
+            std::vector<std::u16string> strings{full,machine,object,counter_display};if(counter->second.path.has_instance)strings.push_back(instance);const bool explain=(arg(1)&0xffU)!=0;if(explain)strings.emplace_back(pdh::explain(counter_name.counter));
+            // 聯合大小取最大成員：x86 為 PDH_DATA_ITEM_PATH_ELEMENTS（含 GUID，28 bytes），x64 為 PDH_COUNTER_PATH_ELEMENTS（48 bytes）。
+            const unsigned union_size=x86_?28U:48U,explain_at=24+3*unit+union_size,header=explain_at+unit;std::size_t required=header;
+            const auto encode_text=[&](const std::u16string& value){if(wide)return utf16_bytes(value);auto encoded=utf16_to_utf8(value);std::vector<std::uint8_t> out(encoded.begin(),encoded.end());out.push_back(0);return out;};
+            std::vector<std::vector<std::uint8_t>> encoded;for(const auto& value:strings){encoded.push_back(encode_text(value));required+=encoded.back().size();}
+            required=(required+7)&~std::size_t{7};const auto capacity=memory.load(GuestAddress{arg(2)},32);memory.store(GuestAddress{arg(2)},32,required);
+            if(!arg(3) || capacity<required)return finish(pdh::more_data);
+            memory.check(GuestAddress{arg(3)},required,Access::Write);memory.fill(GuestAddress{arg(3)},0,required);
+            std::vector<std::uint64_t> pointers;auto at=arg(3)+header;for(const auto& bytes:encoded){pointers.push_back(at);memory.write(GuestAddress{at},bytes);at+=bytes.size();}
+            const auto base=arg(3);const auto query_user=pdh_state.queries.contains(counter->second.query)?pdh_state.queries.at(counter->second.query).user:0;
+            memory.store(GuestAddress{base},32,required);memory.store(GuestAddress{base+4},32,counter_name.type);memory.store(GuestAddress{base+8},32,0x503);memory.store(GuestAddress{base+12},32,0);
+            memory.store(GuestAddress{base+16},32,static_cast<std::uint32_t>(counter->second.scale));memory.store(GuestAddress{base+20},32,0);
+            memory.store(GuestAddress{base+24},bits,counter->second.user);memory.store(GuestAddress{base+24+unit},bits,query_user);
+            const auto path_at=base+24+2*unit;memory.store(GuestAddress{path_at},bits,pointers[0]);
+            // CounterPath：Machine、Object、Instance、ParentInstance（無）、InstanceIndex（0）、Counter。
+            const auto elements=path_at+unit;memory.store(GuestAddress{elements},bits,pointers[1]);memory.store(GuestAddress{elements+unit},bits,pointers[2]);
+            if(counter->second.path.has_instance)memory.store(GuestAddress{elements+2*unit},bits,pointers[4]);
+            memory.store(GuestAddress{elements+5*unit},bits,pointers[3]);
+            if(explain)memory.store(GuestAddress{base+explain_at},bits,pointers.back());
+            return finish(0);
+        }
+        if(symbol.starts_with("PdhGetRawCounterArray")){
+            // PDH_RAW_COUNTER_ITEM（名稱指標＋8 位元組對齊的 PDH_RAW_COUNTER，共 48 bytes）陣列後接實例名稱。
+            if(!arg(1) || !arg(2))return finish(pdh::invalid_argument);if(!counter->second.current)return finish(pdh::invalid_data);
+            std::vector<std::vector<std::uint8_t>> encoded;std::size_t required=matching.size()*48;
+            for(const auto index:matching){auto bytes=wide?utf16_bytes(names[index]):[&]{auto value=utf16_to_utf8(names[index]);std::vector<std::uint8_t> out(value.begin(),value.end());out.push_back(0);return out;}();required+=bytes.size();encoded.push_back(std::move(bytes));}
+            required=(required+7)&~std::size_t{7};const auto capacity=memory.load(GuestAddress{arg(1)},32);memory.store(GuestAddress{arg(2)},32,matching.size());
+            if(!arg(3) || capacity<required){memory.store(GuestAddress{arg(1)},32,required);return finish(pdh::more_data);}
+            memory.check(GuestAddress{arg(3)},required,Access::Write);auto strings=arg(3)+matching.size()*48;
+            for(std::size_t i=0;i<matching.size();++i){
+                const auto at=arg(3)+i*48;memory.store(GuestAddress{at},bits,strings);if(x86_)memory.store(GuestAddress{at+4},32,0);
+                std::int64_t first=0,second=0;const auto status=raw_of(matching[i],first,second);write_raw(at+8,status,first,second);
+                memory.write(GuestAddress{strings},encoded[i]);strings+=encoded[i].size();
+            }
+            memory.store(GuestAddress{arg(1)},32,required);return finish(0);
+        }
+        if(symbol=="PdhCalculateCounterFromRawValue"){
+            // (counter, format, 較新的原始值, 較舊的原始值, 輸出)：計時型以兩筆原始值的差計算，其餘取較新值的 FirstValue。
+            const auto format=static_cast<std::uint32_t>(arg(1));const auto kind_bits=format&0x700U;
+            if(!arg(2) || !arg(4) || (kind_bits!=0x100U && kind_bits!=0x200U && kind_bits!=0x400U))return finish(pdh::invalid_argument);
+            memory.check(GuestAddress{arg(4)},16,Access::Write);
+            const auto read_raw=[&](std::uint64_t at,std::int64_t& first,std::int64_t& second){first=static_cast<std::int64_t>(memory.load(GuestAddress{at+16},64));second=static_cast<std::int64_t>(memory.load(GuestAddress{at+24},64));return static_cast<std::uint32_t>(memory.load(GuestAddress{at},32));};
+            std::int64_t first=0,second=0,old_first=0,old_second=0;const auto status=read_raw(arg(2),first,second);
+            std::array<std::uint8_t,16> bytes{};
+            const auto fail=[&](std::uint32_t code){bytes.fill(0);for(unsigned b=0;b<4;++b)bytes[b]=static_cast<std::uint8_t>(code>>(b*8));memory.write(GuestAddress{arg(4)},bytes);return finish(pdh::invalid_data);};
+            if(status>1)return fail(status);
+            const auto& counter_name=*counter->second.path.counter;double result=static_cast<double>(first);
+            const bool timer=counter_name.counter==pdh::Counter::ProcessorTime || counter_name.counter==pdh::Counter::IdleTime || counter_name.counter==pdh::Counter::UserTime || counter_name.counter==pdh::Counter::PrivilegedTime;
+            if(timer){
+                if(!arg(3))return fail(pdh::invalid_cstatus);if(const auto old_status=read_raw(arg(3),old_first,old_second);old_status>1)return fail(old_status);
+                const auto total=static_cast<double>(second-old_second),part=static_cast<double>(first-old_first);
+                const auto share=total>0?100.0*part/total:0.0;result=counter_name.counter==pdh::Counter::ProcessorTime?100.0-share:share;
+            }
+            format_value(result,format,bytes);memory.write(GuestAddress{arg(4)},bytes);return finish(0);
+        }
+        if(symbol=="PdhVbGetDoubleCounterValue"){
+            // 以 PDH_FMT_DOUBLE 取第一個符合的實例；CStatus 寫入 pdwCounterStatus，回傳值為 double（x86 ST0、x64 XMM0）。
+            double result=0;std::uint32_t status=pdh::no_instance;
+            if(counter->second.current && !matching.empty()){if(const auto number=pdh::value(counter->second,matching.front(),count,status)){std::array<std::uint8_t,16> bytes{};format_value(*number,0x200U,bytes);std::memcpy(&result,bytes.data()+8,8);status=0;}}
+            else if(!counter->second.current)status=pdh::invalid_cstatus;
+            if(arg(1))memory.store(GuestAddress{arg(1)},32,status);
+            const auto raw=std::bit_cast<std::uint64_t>(result);
+            if(x86_){const auto top=((state.x87_status>>11)+7U)&7U;const auto out=f64_to_extF80({raw});state.x87[top]={out.signif,out.signExp};state.x87_status=static_cast<std::uint16_t>((state.x87_status&~0x3800U)|(top<<11));state.x87_tag=static_cast<std::uint16_t>((state.x87_tag&~(3U<<(top*2)))|(x87_tag(state.x87[top])<<(top*2)));}
+            else for(unsigned i=0;i<8;++i)state.xmm[0][i]=static_cast<std::uint8_t>(raw>>(i*8));
+            return finish(status);
+        }
         if(symbol=="PdhGetRawCounterValue"){
             // PDH_RAW_COUNTER：CStatus、TimeStamp(FILETIME)、FirstValue、SecondValue、MultiCount。計時型計數器以 100 ns CPU 時間為值與時基。
             if(!arg(2))return finish(pdh::invalid_argument);memory.check(GuestAddress{arg(2)},40,Access::Write);memory.fill(GuestAddress{arg(2)},0,40);
             const auto& counter_name=*counter->second.path.counter;if(arg(1))memory.store(GuestAddress{arg(1)},32,counter_name.type);
             if(!counter->second.current){memory.store(GuestAddress{arg(2)},32,pdh::invalid_cstatus);return finish(pdh::invalid_data);}
-            const auto names=pdh::instances(counter->second.path.object,count);std::size_t index=0;
+            std::size_t index=0;
             if(counter->second.path.object!=pdh::Object::Memory){index=names.size();for(std::size_t i=0;i<names.size();++i)if(pdh::fold(names[i])==pdh::fold(counter->second.path.instance)){index=i;break;}}
             if(index==names.size()){memory.store(GuestAddress{arg(2)},32,pdh::no_instance);return finish(pdh::invalid_data);}
-            const auto& current=*counter->second.current;std::int64_t first=0,second=0;
-            if(counter_name.rate){const auto cpu=std::min<std::size_t>(index,count);const auto& times=cpu<count?current.cpus.at(cpu):current.total;
-                second=static_cast<std::int64_t>(times.kernel+times.user);
-                switch(counter_name.counter){case pdh::Counter::ProcessorTime:case pdh::Counter::IdleTime:first=static_cast<std::int64_t>(times.idle);break;
-                    case pdh::Counter::UserTime:first=static_cast<std::int64_t>(times.user);break;case pdh::Counter::PrivilegedTime:first=static_cast<std::int64_t>(times.kernel>times.idle?times.kernel-times.idle:0);break;
-                    default:{std::uint32_t status=0;const auto value=pdh::value(counter->second,index,count,status);first=value?static_cast<std::int64_t>(*value):0;second=100;break;}}
-            }else {std::uint32_t status=0;const auto value=pdh::value(counter->second,index,count,status);if(!value){memory.store(GuestAddress{arg(2)},32,status);return finish(pdh::invalid_data);}first=static_cast<std::int64_t>(*value);}
-            const auto now=current.timestamp;memory.store(GuestAddress{arg(2)+4},32,static_cast<std::uint32_t>(now));memory.store(GuestAddress{arg(2)+8},32,static_cast<std::uint32_t>(now>>32));
-            memory.store(GuestAddress{arg(2)+16},64,static_cast<std::uint64_t>(first));memory.store(GuestAddress{arg(2)+24},64,static_cast<std::uint64_t>(second));memory.store(GuestAddress{arg(2)+32},32,1);return finish(0);
+            std::int64_t first=0,second=0;const auto status=raw_of(index,first,second);write_raw(arg(2),status,first,second);return finish(status?pdh::invalid_data:0);
         }
         const auto format=static_cast<std::uint32_t>(arg(1));const auto kind=format&0x700U;
         if(kind!=0x100U && kind!=0x200U && kind!=0x400U)return finish(pdh::invalid_argument);
         const auto& name=*counter->second.path.counter;
-        const auto names=pdh::instances(counter->second.path.object,count);
-        std::vector<std::size_t> selected;
-        for(std::size_t i=0;i<names.size();++i)
-            if(counter->second.path.object==pdh::Object::Memory || counter->second.path.wildcard || pdh::fold(names[i])==pdh::fold(counter->second.path.instance))selected.push_back(i);
+        std::vector<std::size_t> selected=matching;
         // 依格式寫入 PDH_FMT_COUNTERVALUE：CStatus、對齊空間與 8 bytes union。
         const auto encode=[&](std::size_t index,std::array<std::uint8_t,16>& bytes){
             bytes.fill(0);std::uint32_t status=pdh::invalid_cstatus;std::optional<double> number;
             if(counter->second.current)number=pdh::value(counter->second,index,count,status);
             if(!number){for(unsigned b=0;b<4;++b)bytes[b]=static_cast<std::uint8_t>(status>>(b*8));return false;}
             auto result=*number;if(name.percent && !(format&0x8000U))result=std::clamp(result,0.0,100.0);
+            if(!(format&0x1000U) && counter->second.scale)result*=std::pow(10.0,counter->second.scale);
             if(format&0x2000U)result*=1000;
             std::uint64_t raw=0;
             if(kind==0x200U)raw=std::bit_cast<std::uint64_t>(result);

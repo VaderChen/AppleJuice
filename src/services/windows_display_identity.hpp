@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <string>
 #include <string_view>
+#include "x64arm/registry.hpp"
+#include "x64arm/unicode.hpp"
 
 namespace x64arm::display_identity {
 // 顯示配接器列在 PCI 列舉器下：程式常以 SetupDiGetClassDevs(…, L"PCI", …) 找顯示卡，再以 DXGI 描述比對硬體 ID。
@@ -24,11 +26,28 @@ inline constexpr std::uint64_t version_number=UINT64_C(1)<<32;
 // DXGI、DXCore 與 D3D12 使用相同的虛擬配接器 LUID。
 inline constexpr std::uint64_t adapter_luid=0x78363461;
 inline constexpr std::uint32_t vendor_id=0x106b;
+inline constexpr std::u16string_view vendor_name=u"Apple";
 // DXGI_ADAPTER_DESC 的 DeviceId、SubSysId、Revision 均為 0（配接器描述零初始化）。
 // 程式常以描述組成 PnP 硬體 ID，再經 SetupAPI 找到裝置節點與驅動鍵，因此第一個硬體 ID 與執行個體前綴依相同數值組成。
 inline constexpr std::u16string_view adapter_hardware_id=u"PCI\\VEN_106B&DEV_0000&SUBSYS_00000000&REV_00";
 inline constexpr std::u16string_view adapter_name=u"Apple Metal / VideoToolbox 共用圖形裝置";
 inline constexpr std::string_view adapter_name_utf8="Apple Metal / VideoToolbox 共用圖形裝置";
+
+// SetupAPI 與 KMT 的驅動登錄視圖共用資料，不各自產生不同的驅動版本或硬體身分。
+inline std::vector<std::pair<std::u16string,RegistryValue>> driver_registry_values(std::u16string_view description,std::uint64_t shared_memory){
+    std::vector<std::pair<std::u16string,RegistryValue>> result;
+    const auto add=[&](std::u16string name,std::vector<std::uint8_t> bytes,std::uint32_t type){RegistryValue value;value.type=type;value.display_name=name;value.bytes=std::move(bytes);result.emplace_back(std::move(name),std::move(value));};
+    const auto text=[&](const char16_t* name,std::u16string_view value){add(name,utf16_bytes(value),1);};
+    text(u"DriverVersion",version);text(u"DriverDate",date);text(u"ProviderName",provider);text(u"DriverDesc",description);
+    auto id=std::u16string(adapter_hardware_id);for(auto& c:id)c=unicode_case_unit(c,false);text(u"MatchingDeviceId",id);
+    std::vector<std::uint8_t> date_bytes(8),memory_bytes(8);
+    for(unsigned i=0;i<8;++i){date_bytes[i]=static_cast<std::uint8_t>(date_filetime>>(8*i));memory_bytes[i]=static_cast<std::uint8_t>(shared_memory>>(8*i));}
+    add(u"DriverDateData",std::move(date_bytes),3);add(u"HardwareInformation.qwMemorySize",std::move(memory_bytes),11);
+    const auto binary_text=[&](const char16_t* name,std::u16string_view value){auto bytes=utf16_bytes(value);bytes.resize(bytes.size()+2);add(name,std::move(bytes),3);};
+    binary_text(u"HardwareInformation.AdapterString",adapter_name);binary_text(u"HardwareInformation.ChipType",description);
+    binary_text(u"HardwareInformation.DacType",u"Integrated RAMDAC");binary_text(u"HardwareInformation.BiosString",u"");
+    return result;
+}
 
 inline bool parallel_graphics_descriptions() noexcept {
     static const bool enabled=[] {

@@ -3,6 +3,7 @@
 #include "x64arm/d3d12_abi.hpp"
 #include "x64arm/unicode.hpp"
 #include "windows_display_identity.hpp"
+#include "builtin_module_data.hpp"
 #include "x64arm/shared_wake.hpp"
 #include "d3d12_root_binding_layout.h"
 #include "d3d12_descriptor_layout.h"
@@ -639,6 +640,12 @@ void d3d12_transfer_descriptors(D3D12State& bridge,D3D12Submitter* submitter,Gue
         auto word=source_valid?d3d12_load_word(*source_heap,source_index):descriptor_empty;
         if(d3d12_try_write_word(*dest_heap,dest_index,word,skip_same,skip_same?stats:nullptr))return false;
         auto incoming=word?d3d12_decode_word(word):d3d12_read_descriptor(bridge,*source_heap,source_index,true);
+        if(static const char* const format_text=std::getenv("X64ARM_TRACE_D3D12_COPY_FORMAT");format_text && incoming.data &&
+           incoming.data->view.format==std::strtoull(format_text,nullptr,10))
+            std::fprintf(stderr,"d3d12_copy source=%llx destination=%llx source_index=%llu destination_index=%llu type=%u resource=%llx view_format=%u\n",
+                static_cast<unsigned long long>(source_heap->cpu+source_index*descriptor_size),static_cast<unsigned long long>(dest_heap->cpu+dest_index*descriptor_size),
+                static_cast<unsigned long long>(source_index),static_cast<unsigned long long>(dest_index),static_cast<unsigned>(incoming.type),
+                static_cast<unsigned long long>(incoming.resource),incoming.data->view.format);
         if(!word && !dest_heap->descriptor_words.empty()){
             if(incoming.type==Descriptor::Type::Empty)word=descriptor_empty;
             else if(incoming.type==Descriptor::Type::Constant)word=d3d12_constant_word(incoming.address,incoming.size);
@@ -1187,17 +1194,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
     const auto note=[&](std::string text){if(d3d12_worker_context()){const std::lock_guard lock(bridge.notes_mutex);bridge.worker_notes.push_back(std::move(text));}else runtime_.module_events.push_back(std::move(text));};
     if(!d3d12_worker_context()){const std::lock_guard lock(bridge.notes_mutex);runtime_.module_events.merge(bridge.worker_notes);bridge.worker_notes.clear();}
     const auto report=[&](std::string_view name){if([&]{const std::lock_guard lock(bridge.notes_mutex);return bridge.reported.insert(std::string(name)).second;}()){note("d3d12_note=尚未支援 "+std::string(name));trace("[d3d12] 尚未支援 %.*s\n",static_cast<int>(name.size()),name.data());}};
-    const auto create=[&](Kind kind,std::uint64_t device)->std::uint64_t{
+    const auto interface_table=[&](Kind kind)->std::uint64_t{
         auto& table=bridge.tables[kind];
         if(!table){
+            std::vector<std::uint64_t> entries;
             if(kind==Kind::SwapChain){
-                table=runtime_allocate(memory,{},std::size(swap_methods)*8);std::size_t i=0;
-                for(const auto& [name,count]:swap_methods){(void)count;store(table+8*i++,64,resolve("internal-d3d12","Swap."+std::string(name)).value);}
+                entries.reserve(std::size(swap_methods));
+                for(const auto& [name,count]:swap_methods){(void)count;entries.push_back(resolve("internal-d3d12","Swap."+std::string(name)).value);}
             }else if(kind==Kind::Blob){
-                table=runtime_allocate(memory,{},5*8);std::size_t i=0;
-                for(const auto* name:{"Blob.QueryInterface","Blob.AddRef","Blob.Release","Blob.GetBufferPointer","Blob.GetBufferSize"})store(table+8*i++,64,resolve("internal-d3d12",name).value);
+                for(const auto* name:{"Blob.QueryInterface","Blob.AddRef","Blob.Release","Blob.GetBufferPointer","Blob.GetBufferSize"})entries.push_back(resolve("internal-d3d12",name).value);
             }else{
-                const auto* item=info_of(kind);const auto* abi=d3d12abi::find_interface(item->top);table=runtime_allocate(memory,{},abi->methods.size()*8);
+                const auto* item=info_of(kind);const auto* abi=d3d12abi::find_interface(item->top);entries.reserve(abi->methods.size());
                 // ID3D12Resource::GetGPUVirtualAddress 改由客體常式直接讀 [this+8]（建立時寫入的緩衝 GPU 位址），不經服務：
                 // 電馭判客每幀上萬次，原本每次離開原生碼往返 worker 服務。X64ARM_GUEST_D3D12_GPUVA=0 關閉（含下方堆積起點）。
                 static const bool guest_gpuva=[] {const auto* value=std::getenv("X64ARM_GUEST_D3D12_GPUVA");return !value || std::string_view(value)!="0";}();
@@ -1228,10 +1235,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                 };
                 for(std::size_t i=0;i<abi->methods.size();++i){
                     const auto guest=routine(abi->methods[i].name);
-                    store(table+i*8,64,guest?guest:resolve("internal-d3d12",std::string(item->prefix)+std::string(abi->methods[i].name)).value);
+                    entries.push_back(guest?guest:resolve("internal-d3d12",std::string(item->prefix)+std::string(abi->methods[i].name)).value);
                 }
             }
+            const auto provider=kind==Kind::SwapChain?u"dxgi.dll":u"d3d12.dll";std::vector<std::uint64_t> created;
+            const auto module=load_module(memory,provider,0,created,{},&state);
+            std::vector<std::uint8_t> data(entries.size()*8);
+            for(std::size_t i=0;i<entries.size();++i)for(unsigned n=0;n<8;++n)data[i*8+n]=static_cast<std::uint8_t>(entries[i]>>(n*8));
+            table=detail::initialize_builtin_module_data(memory,runtime_.builtin_images.at(module),data);
         }
+        return table;
+    };
+    const auto create=[&](Kind kind,std::uint64_t device)->std::uint64_t{
+        const auto table=interface_table(kind);
         // [0] vtable、[8] 依種類保存客體常式讀取的值（Blob 資料、資源 GPU 位址、堆積 CPU 起點），堆積另有 [16] GPU 起點。
         const auto pointer=allocate_heap(memory,kind==Kind::DescriptorHeap?24:16);if(!pointer)throw std::bad_alloc();
         store(pointer,64,table);store(pointer+8,64,0);if(kind==Kind::DescriptorHeap)store(pointer+16,64,0);
@@ -1269,6 +1285,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
         try{native=make_metal_opengl(nullptr,1,1);}catch(const std::exception&){native.reset();}
         if(!native)return finish(unsupported);
         if(!arg(3))return finish(false_ok);
+        // 模組內唯讀表只在裝置建立的協調者階段初始化；後續並行資源建立共用已發布的表。
+        for(const auto& item:kinds())(void)interface_table(item.kind);
+        (void)interface_table(Kind::SwapChain);(void)interface_table(Kind::Blob);
         // 每幀十餘次 ExecuteCommandLists：在途上限 3 讓 CPU 每三次提交就等 GPU（電馭判客 Benchmark 上限 8 時快約 8%）。
         native->graphics_submission_depth(8);
         d3d12_start_submitter(memory);
@@ -1890,7 +1909,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             }
             vkd3d_shader_free_root_signature(&parsed);if(desc==&converted)vkd3d_shader_free_root_signature(&converted);
             if(!arg(5))return finish(false_ok);
-            const auto object=create(Kind::RootSignature,self);bridge.roots[object]=std::move(root);return finish(give(object,arg(4),arg(5)));
+            const auto object=create(Kind::RootSignature,self);
+            if(static const char* const space_text=std::getenv("X64ARM_TRACE_D3D12_BIND_SPACE");space_text){
+                const auto space=std::strtoull(space_text,nullptr,0);
+                for(std::uint32_t i=0;i<root.parameters.size();++i){const auto& p=root.parameters[i];
+                    for(const auto& r:p.ranges)if(r.space==space)
+                        std::fprintf(stderr,"d3d12_root object=%llx parameter=%u visibility=%u range_type=%u range_count=%u range_base=%u range_space=%u range_offset=%u\n",
+                            static_cast<unsigned long long>(object),i,p.visibility,r.type,r.count,r.base,r.space,r.offset);
+                }
+            }
+            bridge.roots[object]=std::move(root);return finish(give(object,arg(4),arg(5)));
         }
         // D3D12_GRAPHICS_PIPELINE_STATE_DESC（x64，656 bytes）轉為共用後端的 D3D11 狀態格式。desc 是宿主端複本，
         // 著色器與輸入配置的指標仍指向客體記憶體；CreateGraphicsPipelineState 與 CreatePipelineState（子物件串流）共用。
@@ -2213,15 +2241,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
             const auto d=bytes(arg(1),56);const auto word=[&](unsigned at){std::uint32_t value;std::memcpy(&value,d.data()+at,4);return value;};
             std::uint64_t width;std::memcpy(&width,d.data()+16,8);const auto dimension=word(0),height=dimension==1?1U:word(24),depth_or_layers=dimension==1?1U:(word(28)&0xffffU),format=word(32);
             auto levels=dimension==1?1U:(word(28)>>16);if(!levels){levels=1;for(auto size=std::max<std::uint64_t>({width,height,dimension==4?depth_or_layers:1U});size>1;size>>=1)++levels;}
-            std::uint64_t offset=arg(4),total=0;
+            std::uint64_t offset=0,total=0;
             for(std::uint32_t i=0;i<u32(3);++i){
                 const auto sub=u32(2)+i;const auto level=sub%levels;
-                const std::uint64_t w=std::max<std::uint64_t>(1,width>>level);const std::uint32_t h=std::max(1U,height>>level),z=dimension==4?std::max(1U,depth_or_layers>>level):1U;
+                const auto block=graphics_format_bc_family(format)?4U:1U;
+                // 足跡描述實體區塊範圍，取樣仍使用資源本身的邏輯 mip 尺寸。
+                const std::uint64_t w=(std::max<std::uint64_t>(1,width>>level)+block-1)&~std::uint64_t{block-1};
+                const std::uint32_t h=(std::max(1U,height>>level)+block-1)&~(block-1),z=dimension==4?std::max(1U,depth_or_layers>>level):1U;
                 const auto pitch=dimension==1?std::array<std::uint32_t,2>{static_cast<std::uint32_t>(w),1U}:graphics_format_pitch(format,static_cast<std::uint32_t>(w),h);
                 const auto row=(std::uint64_t{pitch[0]}+255U)&~UINT64_C(255);offset=(offset+511U)&~UINT64_C(511);
-                if(arg(5)){const auto at=arg(5)+i*32;store(at,64,offset);store(at+8,32,format);store(at+12,32,w);store(at+16,32,h);store(at+20,32,z);store(at+24,32,row);}
+                if(arg(5)){const auto at=arg(5)+i*32;store(at,64,arg(4)+offset);store(at+8,32,format);store(at+12,32,w);store(at+16,32,h);store(at+20,32,z);store(at+24,32,row);}
                 if(arg(6))store(arg(6)+i*4,32,pitch[1]);if(arg(7))store(arg(7)+i*8,64,pitch[0]);
-                const auto size=row*(std::uint64_t{pitch[1]}*z-1)+pitch[0];total=offset+size-arg(4);offset+=row*pitch[1]*z;
+                const auto size=row*(std::uint64_t{pitch[1]}*z-1)+pitch[0];total=offset+size;offset=total;
             }
             if(arg(8))store(arg(8),64,total);return finish(0);
         }
@@ -2261,6 +2292,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         if(view_dimension==8 && v.slices==UINT32_MAX){const auto depth=std::max(1U,resource.depth>>std::min(v.level,31U));v.slices=v.slice<depth?depth-v.slice:0;}}
                 }
             }else if(resource.dimension==1){v.first=0;v.count=static_cast<std::uint32_t>(resource.width);v.levels=1;v.format=42;}
+            if(static const char* const width_text=std::getenv("X64ARM_TRACE_D3D12_VIEW_WIDTH");width_text && resource.width==std::strtoull(width_text,nullptr,10))
+                std::fprintf(stderr,"d3d12_view kind=%s handle=%llx resource=%llx gpu_ptr=%p requested_format=%u view_format=%u resource_format=%u dimension=%u width=%llu height=%u view_dimension=%u flags=%u\n",
+                    uav?"uav":"srv",static_cast<unsigned long long>(handle),static_cast<unsigned long long>(arg(1)),static_cast<void*>(resource.gpu.get()),
+                    desc?static_cast<unsigned>(load(desc,32)):0U,v.format,resource.format,resource.dimension,static_cast<unsigned long long>(resource.width),resource.height,v.dimension,v.flags);
             // 鏡像值快取隨描述元複製共用；X64ARM_D3D12_MIRROR_CACHE=0 時不填入。
             static const bool mirror_cache=[] {const auto* text=std::getenv("X64ARM_D3D12_MIRROR_CACHE");return !text || std::string_view(text)!="0";}();
             auto data=std::make_shared<D3D12State::DescriptorData>();data->view=std::move(v);if(mirror_cache)data->mirror.emplace();
@@ -2777,11 +2812,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         // source 為原始暫存器（見 d3d12_shader.cpp）。這些項目在全部參數處理完才放入（late），不會被同號的 space 0 暫存器覆寫。
                         // 類別：0＝b、1＝t、2＝s、3＝u。
                         const auto class_of=[](std::uint32_t type)->std::uint32_t{return type==0?0U:type==1 || type==3?1U:type==2?2U:3U;};
-                        const auto spaced_key=[](std::uint32_t cls,std::uint32_t space,std::uint32_t reg){return (std::uint64_t{cls}<<62)|(std::uint64_t{space&0x3fffffffU}<<32)|reg;};
-                        std::unordered_map<std::uint64_t,std::uint32_t> spaced;
+                        const auto spaced_key=[](std::uint32_t cls,std::uint32_t space,std::uint32_t reg){return std::array{cls,space,reg};};
+                        std::map<std::array<std::uint32_t,3>,std::uint32_t> spaced; // 保留完整 32-bit space，不把類別塞入其高位元。
                         if(stage.shader)for(const auto& binding:stage.shader->bindings){
                             if(binding.type<=5 && binding.source!=UINT32_MAX)spaced.emplace(spaced_key(class_of(binding.type),binding.space,binding.source),binding.slot);
-                            if(used.all || binding.space)continue;
+                            if(used.all || binding.space || binding.source!=UINT32_MAX)continue;
                             const auto mark=[&](std::array<std::uint64_t,2>& mask,std::uint32_t reg){if(reg<128)mask[reg>>6]|=std::uint64_t{1}<<(reg&63U);else used.all=true;};
                             switch(binding.type){
                                 case 0:mark(used.b,binding.slot);break;
@@ -2849,16 +2884,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                 for(const auto& range:parameter.ranges){
                                     const std::uint32_t cls=range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER?2U:range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV?0U:
                                         range.type==VKD3D_SHADER_DESCRIPTOR_TYPE_UAV?3U:1U;
-                                    // 非零 space 的範圍：只解析著色器實際使用、落在範圍內的 (space, register)。
+                                    // 重新配置的範圍：依原始 (space, register) 取描述元，space 0 的高編號也走同一流程。
                                     std::vector<std::uint32_t> spaced_items;
-                                    if(range.space){
+                                    if(!spaced.empty()){
                                         for(const auto& [key,slot]:spaced){(void)slot;
-                                            const auto reg=static_cast<std::uint32_t>(key);
-                                            if((key>>62)!=cls || ((key>>32)&0x3fffffffU)!=range.space || reg<range.base || (range.count!=~0U && reg-range.base>=range.count))continue;
+                                            const auto reg=key[2];
+                                            if(key[0]!=cls || key[1]!=range.space || reg<range.base || (range.count!=~0U && reg-range.base>=range.count))continue;
                                             spaced_items.push_back(reg-range.base);
                                         }
-                                        if(spaced_items.empty())continue;
                                     }
+                                    if(range.space && spaced_items.empty())continue;
                                     // 共用後端最多 128 個 SRV 槽；更大的陣列只能經描述元表存取。
                                     const auto count=range.count==~0U?1U:std::min<std::uint32_t>(range.count,128);
                                     const auto& mask=cls==2?used.s:cls==0?used.b:cls==3?used.u:used.t;
@@ -2870,7 +2905,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                         const auto from=low-w*64U,to=high-w*64U;
                                         wanted[w]=mask[w]&(to>=64?~std::uint64_t{0}:(std::uint64_t{1}<<to)-1U)&~((std::uint64_t{1}<<from)-1U);
                                     }
-                                    if(!range.space && !used.all && !wanted[0] && !wanted[1])continue;
+                                    if(!range.space && !used.all && !wanted[0] && !wanted[1] && spaced_items.empty())continue;
                                     // 範圍內的描述元屬於同一個堆積：只查一次堆積，逐項以索引取用（超出堆積的項目視為空）。
                                     const auto [range_heap,range_first]=heap_at(base+std::uint64_t{range.offset}*descriptor_size,true);if(!range_heap)continue;
                                     std::uint64_t visited=0;
@@ -2885,6 +2920,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                         if(!entry->resource)return true;auto view=entry->view();auto* const found_resource=resource_of(entry->resource);if(!found_resource)throw std::out_of_range("描述元表資源不存在");
                                         auto& resource=*found_resource;view.resource=resource.dimension==1?gpu_resource_of(resource,entry->resource,view.first,view.count?view.count:UINT64_MAX,"table"):resource.gpu;
                                         if(cls==3)attach_counter(view,*entry);
+                                        if(static const char* const space_text=std::getenv("X64ARM_TRACE_D3D12_BIND_SPACE");space_text && range.space==std::strtoull(space_text,nullptr,0))
+                                            std::fprintf(stderr,"d3d12_bind shader_ptr=%p parameter=%u class=%u space=%u reg=%u slot=%u table=%llx range_offset=%u range_base=%u range_count=%u heap_cpu=%llx heap_gpu=%llx descriptor_index=%llu descriptor_type=%u resource=%llx gpu_ptr=%p view_format=%u resource_format=%u width=%llu height=%u\n",
+                                                static_cast<void*>(stage.shader.get()),index,cls,range.space,range.base+i,place.slot,static_cast<unsigned long long>(base),range.offset,range.base,range.count,
+                                                static_cast<unsigned long long>(range_heap->cpu),static_cast<unsigned long long>(range_heap->gpu),static_cast<unsigned long long>(range_first+i),
+                                                static_cast<unsigned>(entry->type),static_cast<unsigned long long>(entry->resource),static_cast<void*>(resource.gpu.get()),view.format,resource.format,
+                                                static_cast<unsigned long long>(resource.width),resource.height);
                                         put_view(place,cls==3,view);if(cls==3)written.insert(entry->resource);
                                         return true;
                                     };
@@ -2895,6 +2936,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                         for(auto bits=wanted[w];bits && more;bits&=bits-1)more=visit(static_cast<std::uint32_t>(w*64U+static_cast<unsigned>(std::countr_zero(bits))-range.base));
                                         if(!more)break;
                                     }
+                                    if(!range.space)for(const auto i:spaced_items)if(!used.all || i>=count)visit(i);
                                     if(D3D12Submitter::tracing() && d3d12_submitter_)d3d12_submitter_->stats.table_entries.fetch_add(visited,std::memory_order_relaxed);
                                 }
                             }
@@ -3179,6 +3221,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                         }
                         else if(c.op=="Dispatch"sv || c.op=="DispatchIndirectGpu"sv){
                             const auto p=bridge.pipelines.find(pipeline);if(p==bridge.pipelines.end() || !p->second.compute)throw std::invalid_argument("Dispatch 缺少運算管線");
+                            if(std::getenv("X64ARM_TRACE_D3D12_BIND_SPACE"))
+                                std::fprintf(stderr,"d3d12_dispatch pipeline=%llx shader_ptr=%p root=%llx pso_root=%llx table0=%llx table1=%llx groups=%llu,%llu,%llu\n",
+                                    static_cast<unsigned long long>(pipeline),static_cast<void*>(p->second.shader.get()),static_cast<unsigned long long>(compute_roots.root),
+                                    static_cast<unsigned long long>(p->second.root),static_cast<unsigned long long>(compute_roots.tables[0]),static_cast<unsigned long long>(compute_roots.tables[1]),
+                                    static_cast<unsigned long long>(v[0]),static_cast<unsigned long long>(v[1]),static_cast<unsigned long long>(v.size()>2?v[2]:0));
                             GraphicsStage stage;stage.shader=p->second.shader;bind(stage,compute_roots,signature_of(compute_roots),0);
                             if(c.op=="DispatchIndirectGpu"sv)native.graphics_dispatch_indirect(stage,gpu_resource(v[0]),static_cast<std::uint32_t>(v[1]));
                             else native.graphics_dispatch(stage,{static_cast<std::uint32_t>(v[0]),static_cast<std::uint32_t>(v[1]),static_cast<std::uint32_t>(v[2])});
@@ -3255,10 +3302,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             const auto footprint=[&](std::size_t at){std::uint64_t offset;std::memcpy(&offset,c.data.data()+at+16,8);std::array<std::uint32_t,5> f;std::memcpy(f.data(),c.data.data()+at+24,20);return std::pair{offset,f};};
                             auto& d=bridge.resources.at(dst);auto& s=bridge.resources.at(src);
                             const auto x=static_cast<std::uint32_t>(v[1]),y=static_cast<std::uint32_t>(v[2]),z=static_cast<std::uint32_t>(v[3]);
-                            const auto source_box=[&](std::array<std::uint32_t,3> extent){
+                            const auto source_box=[&](std::array<std::uint32_t,3> extent,std::uint32_t format){
                                 std::array<std::uint32_t,6> box{0,0,0,extent[0],extent[1],extent[2]};
                                 if(c.data.size()>=120)std::memcpy(box.data(),c.data.data()+96,24);
-                                for(unsigned axis=0;axis<3;++axis)if(box[axis]>box[axis+3] || box[axis+3]>extent[axis])throw std::invalid_argument("CopyTextureRegion 來源範圍越界");
+                                const bool compressed=graphics_format_bc_family(format)!=0;
+                                for(unsigned axis=0;axis<3;++axis){
+                                    const auto limit=compressed && axis<2?(std::uint64_t{extent[axis]}+3U)&~UINT64_C(3):extent[axis];
+                                    if(box[axis]>box[axis+3] || box[axis+3]>limit)throw std::invalid_argument("CopyTextureRegion 來源範圍越界");
+                                }
+                                if(box[0]==box[3] || box[1]==box[4] || box[2]==box[5])return box;
+                                if(compressed)for(unsigned axis=0;axis<2;++axis)
+                                    if(box[axis]%4 || (box[axis+3]%4 && box[axis+3]!=extent[axis]))throw std::invalid_argument("CopyTextureRegion 來源未對齊壓縮區塊或 mip 邊緣");
                                 return box;
                             };
                             const auto extent=[](const D3D12State::Resource& r,std::uint32_t sub){
@@ -3281,12 +3335,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                             };
                             if(dst_type==0 && src_type==1){
                                 const auto [offset,f]=footprint(48);const auto level=dst_sub%d.levels,layer=dst_sub/d.levels;
-                                const auto box=source_box({f[1],f[2],f[3]});const std::array<std::uint32_t,3> size{box[3]-box[0],box[4]-box[1],box[5]-box[2]};
+                                const auto box=source_box({f[1],f[2],f[3]},f[0]);const std::array<std::uint32_t,3> size{box[3]-box[0],box[4]-box[1],box[5]-box[2]};
                                 if(!size[0] || !size[1] || !size[2])continue;
                                 const auto bounds=extent(d,dst_sub);const std::array<std::uint32_t,3> origin{x,y,z};
-                                for(unsigned axis=0;axis<3;++axis)if(origin[axis]>bounds[axis] || size[axis]>bounds[axis]-origin[axis])throw std::invalid_argument("CopyTextureRegion 紋理目的範圍越界");
+                                const bool compressed=graphics_format_bc_family(d.format) && graphics_format_bc_family(d.format)==graphics_format_bc_family(f[0]);
+                                for(unsigned axis=0;axis<3;++axis){
+                                    const auto limit=compressed && axis<2?(std::uint64_t{bounds[axis]}+3U)&~UINT64_C(3):bounds[axis];
+                                    const auto end=std::uint64_t{origin[axis]}+size[axis];
+                                    if(origin[axis]>=bounds[axis] || end>limit || (compressed && axis<2 && (origin[axis]%4 || (end%4 && end!=bounds[axis])))){
+                                    char detail[384];std::snprintf(detail,sizeof detail,
+                                        "CopyTextureRegion 紋理目的範圍越界：dst_format=%u sub=%u bounds=%u,%u,%u origin=%u,%u,%u size=%u,%u,%u src_format=%u footprint=%u,%u,%u pitch=%u box=%u",
+                                        d.format,dst_sub,bounds[0],bounds[1],bounds[2],x,y,z,size[0],size[1],size[2],f[0],f[1],f[2],f[3],f[4],c.data.size()>=120?1U:0U);
+                                    throw std::invalid_argument(detail);
+                                    }
+                                }
                                 const auto pitch=graphics_format_pitch(f[0],size[0],size[1]);const auto region=buffer_region(s,offset,f,{box[0],box[1],box[2]},size);
-                                const std::array<std::uint32_t,6> destination{x,y,z,x+size[0],y+size[1],z+size[2]};
+                                // BC 的尾端區塊完整搬移；宿主 API 的區域則須使用邏輯 mip 邊緣。
+                                const std::array<std::uint32_t,6> destination{x,y,z,
+                                    static_cast<std::uint32_t>(std::min(std::uint64_t{x}+size[0],std::uint64_t{bounds[0]})),
+                                    static_cast<std::uint32_t>(std::min(std::uint64_t{y}+size[1],std::uint64_t{bounds[1]})),z+size[2]};
                                 // 範圍複製仍走同一個零複製入口；來源位移與 image pitch 依完整足跡計算。
                                 if(s.host_shared && s.gpu && d.gpu && region[1]<=UINT32_MAX){
                                     GraphicsView view{d.gpu};view.level=level;view.slice=layer;
@@ -3306,7 +3373,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                 native.graphics_write_region(view,data,pitch[0],pitch[0]*pitch[1],destination);
                             }else if(dst_type==1 && src_type==0){
                                 const auto [offset,f]=footprint(0);const auto level=src_sub%s.levels,layer=src_sub/s.levels;
-                                const auto bounds=extent(s,src_sub);const auto box=source_box(bounds);const std::array<std::uint32_t,3> size{box[3]-box[0],box[4]-box[1],box[5]-box[2]};
+                                const auto bounds=extent(s,src_sub);const auto box=source_box(bounds,s.format);const std::array<std::uint32_t,3> size{box[3]-box[0],box[4]-box[1],box[5]-box[2]};
                                 if(!size[0] || !size[1] || !size[2])continue;
                                 const auto region=buffer_region(d,offset,f,{x,y,z},size);const auto copy_pitch=graphics_format_pitch(s.format,size[0],size[1]);
                                 // 診斷（X64ARM_TRACE_D3D12_READBACK=1）：小紋理讀回到 CPU 可見緩衝時，列出目的位置目前的內容（上一次讀回的結果）。
@@ -3319,7 +3386,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                 // 零複製目的（整個子資源、無來源範圍）：GPU blit 寫入，提交完成後客體直接可見（Map 時等寫入完成）。
                                 if(d.gpu && s.gpu && region[1]<=UINT32_MAX){
                                     GraphicsView view{s.gpu};view.level=level;view.slice=layer;
-                                    if(native.graphics_copy_buffer_texture(view,GraphicsView{d.gpu},region[0],f[4],static_cast<std::uint32_t>(region[1]),box,false)){written.insert(dst);continue;}
+                                    auto logical_box=box;logical_box[3]=std::min(box[3],bounds[0]);logical_box[4]=std::min(box[4],bounds[1]);
+                                    if(native.graphics_copy_buffer_texture(view,GraphicsView{d.gpu},region[0],f[4],static_cast<std::uint32_t>(region[1]),logical_box,false)){written.insert(dst);continue;}
                                 }
                                 count_sync("texture_to_readback");GraphicsView view{s.gpu};view.level=level;view.slice=layer;const auto data=native.graphics_read(view);
                                 const auto pitch=graphics_format_pitch(s.format,bounds[0],bounds[1]);const auto block=graphics_format_bc_family(s.format)?4U:1U,element=graphics_format_pitch(s.format,1,1)[0];
@@ -3333,11 +3401,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d12(GuestState& state,Gue
                                 }
                             }else if(dst_type==0 && src_type==0){
                                 GraphicsView to{d.gpu};to.level=dst_sub%d.levels;to.slice=dst_sub/d.levels;GraphicsView from{s.gpu};from.level=src_sub%s.levels;from.slice=src_sub/s.levels;
-                                const auto box=source_box(extent(s,src_sub));
+                                const auto box=source_box(extent(s,src_sub),s.format);
+                                if(box[0]==box[3] || box[1]==box[4] || box[2]==box[5])continue;
                                 native.graphics_copy(to,from,{x,y,z},box);
                             }else if(dst_type==1 && src_type==1){
                                 const auto [source_offset,sf]=footprint(48);const auto [destination_offset,df]=footprint(0);
-                                const auto box=source_box({sf[1],sf[2],sf[3]});const std::array<std::uint32_t,3> size{box[3]-box[0],box[4]-box[1],box[5]-box[2]};
+                                const auto box=source_box({sf[1],sf[2],sf[3]},sf[0]);const std::array<std::uint32_t,3> size{box[3]-box[0],box[4]-box[1],box[5]-box[2]};
                                 if(!size[0] || !size[1] || !size[2])continue;
                                 const auto from=buffer_region(s,source_offset,sf,{box[0],box[1],box[2]},size),to=buffer_region(d,destination_offset,df,{x,y,z},size);
                                 const auto pitch=graphics_format_pitch(sf[0],size[0],size[1]);

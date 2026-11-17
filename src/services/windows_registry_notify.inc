@@ -15,7 +15,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry_notify(GuestState&
     try{
         if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
         auto& registry=runtime_.registry;auto transaction=std::make_unique<RegistryTransaction>(registry,registry_file_,&registry_store_cache_,true);
-        if(transaction->error)return error(transaction->error);initialize_registry_views(registry);
+        if(transaction->error)return error(transaction->error);restore_app_hives(registry);initialize_registry_views(registry);
         poll_registry_notifications(false,{},0,&memory);
         const auto key=registry.handles.find(arg(0));
         if(native && key==registry.handles.end())return error(6);

@@ -113,13 +113,28 @@ x86_64(64비트) 외에도 x86 PE32 EXE와 해당 DLL을 로드할 수 있습니
 - **오디오**: DirectSound(3D 위치 지정 및 녹음 포함), XAudio2, WASAPI, X3DAudio를 Core Audio로 출력하며 스테레오 좌우 채널과 패닝을 유지합니다.
 - **입력**: DirectInput(포스 피드백 포함), XInput, Raw Input은 macOS 실제 입력 장치의 데이터를 사용합니다.
 - **동영상**: Media Foundation과 D3D11 DXVA의 H.264 인코딩/디코딩은 VideoToolbox 하드웨어 가속을 사용합니다. Windows Media(ASF)의 VC-1/WMV와 WMA는 내장된 디코더 전용 FFmpeg로 디코딩합니다. HEVC와 AV1은 아직 완료되지 않았습니다.
-- **업스케일링**: 게임의 XeSS는 MetalFX 시간적 업스케일러로 실행합니다. 게임이 XeSS를 켜면 Launcher의 프레임 보간과 2배 확대는 자동으로 꺼지고 게임 업스케일러의 출력을 표시합니다.
 
 AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 API 매개변수 조합을 완전히 지원하지 않습니다. 프로그램 로딩이나 창 표시가 성공해도 전체 프로그램의 호환성이 보장되지는 않습니다. 드라이브 매핑은 완전한 OS 샌드박스가 아니며 활성화된 서비스는 매핑된 파일이나 네트워크에 접근할 수 있습니다. 신뢰할 수 있는 프로그램만 실행하고 필요한 접근 권한을 설정하세요.
 
 저장소에는 `src/`, `include/`, `launcher/`, `cmake/`, 필수 빌드 스크립트, `third_party/`, `x64kernel/` 및 사용 문서가 포함되어 있습니다.
 
-## 실측 기록 / 2026-11-13 / 게임 총 22개
+## 네이티브 MetalFX 및 다채널 HRTF 헤드폰 시뮬레이션
+
+AppleJuice가 화면 표시 및 오디오 출력 단계에서 기본 제공하는 기능입니다. 게임 자체가 MetalFX나 HRTF를 지원하지 않아도 게임 수정이나 모드 설치 없이 직접 켤 수 있습니다.
+
+### MetalFX 업스케일링 및 프레임 보간
+
+- **2배 확대 표시**: 메인 화면 스위치로 macOS 네이티브 MetalFX 공간 업스케일러를 사용해 게임 출력을 2배로 확대합니다. 게임 자체의 업스케일링 지원은 필요하지 않습니다.
+- **프레임 보간**: 본 프로젝트가 별도로 macOS 네이티브 VideoToolbox를 이용해 완성된 두 프레임 사이에 중간 화면을 생성합니다. 게임의 깊이 정보나 모션 벡터가 필요하지 않습니다. macOS 26 이상과 지원 장치가 필요하며 입력은 최대 1920×1080입니다. 게임 자체의 업데이트 빈도는 높아지지 않습니다.
+- **게임 내 XeSS**: 게임이 XeSS를 제공하면 MetalFX 시간적 업스케일링으로 연결할 수 있습니다. 이 경로가 켜지면 Launcher의 프레임 보간과 2배 확대를 자동으로 끄고 게임 업스케일러 출력을 표시합니다.
+
+### 다채널 HRTF 헤드폰 시뮬레이션
+
+"헤드폰 공간 믹싱"을 켜면 5.1, 7.1 등 각 채널을 가상 스피커 위치에 배치하고 HRTF로 일반 헤드폰용 바이노럴 스테레오를 생성하며 저음 채널도 유지합니다. 게임이나 영상 프로그램에 HRTF 기능이 없어도 사용할 수 있으며, 공간감은 실제 입력 채널 정보에 따라 달라집니다.
+
+메인 화면과 설정 → 오디오에 연동된 스위치가 있습니다. 기본값은 꺼짐이며 변경 사항은 프로그램을 다음에 시작할 때 적용됩니다. 현재 머리 추적은 사용하지 않습니다.
+
+## 실측 기록 / 2026-11-17 / 게임 총 23개
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="미작동·작업 중" title="미작동·작업 중"> 미작동·작업 중 · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="실행 가능" title="실행 가능"> 실행 가능 · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="저효율" title="저효율"> 저효율 · <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="원활 (MetalFX)" title="원활 (MetalFX)"> 원활 (MetalFX) · <img src="docs/images/support-levels/good.png" width="16" height="16" alt="원활" title="원활"> 원활
 
@@ -151,9 +166,12 @@ AppleJuice는 개발 중이며 전체 Windows, 모든 프로그램 및 모든 AP
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="실행 가능" title="실행 가능"> |
 | 데이브 더 다이버 | x64 | D3D11(Unity) | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="실행 가능" title="실행 가능"> |
+| DEATH STRANDING DIRECTOR'S CUT | x64 | D3D12 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="실행 가능" title="실행 가능"> |
 | 바이오하자드 빌리지 | x64 | D3D12 (RE Engine) | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="미작동·작업 중" title="미작동·작업 중"> |
 
 "원활 (MetalFX)"는 Launcher의 프레임 보간 또는 2배 확대(MetalFX)를 켜면 원활 기준을 충족한다는 뜻이며, 끄면 저효율에 해당합니다.
+
+DEATH STRANDING DIRECTOR'S CUT은 현재 "실행 가능"으로 평가합니다. 3장 저장 파일 불러오기와 캐릭터 이동은 확인했지만 흰색 깜박임이 발생할 수 있으며 안정적인 50 FPS에는 도달하지 못했습니다. 문제를 해결하고 실제 플레이와 다른 장면의 검증을 마친 뒤 지원 수준을 갱신합니다. "원활"은 50 FPS를 안정적으로 초과하거나 프로그램 자체의 프레임률 상한에 도달한 경우를 뜻합니다.
 
 실측 기록은 당시 버전과 설정 기준이며, 전체 게임 진행, 다른 버전 또는 모든 설정에서의 동작을 의미하지 않습니다.
 

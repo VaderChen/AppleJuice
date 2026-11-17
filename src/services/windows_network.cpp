@@ -342,7 +342,7 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         {"ws2_32.dll","WSAAsyncGetHostByName",5},{"ws2_32.dll","WSAAsyncGetHostByAddr",7},
         {"ws2_32.dll","WSAAsyncGetProtoByName",5},{"ws2_32.dll","WSAAsyncGetProtoByNumber",5},
         {"ws2_32.dll","WSAAsyncGetServByName",6},{"ws2_32.dll","WSAAsyncGetServByPort",6},{"ws2_32.dll","WSACancelAsyncRequest",1},
-        {"ws2_32.dll","inet_addr",1},{"ws2_32.dll","inet_ntoa",1},{"ws2_32.dll","WSAAsyncSelect",4},{"ws2_32.dll","WSAEventSelect",3},{"ws2_32.dll","WSAEnumNetworkEvents",3},{"ws2_32.dll","WSACreateEvent",0},{"ws2_32.dll","WSAStartup",2},{"ws2_32.dll","WSACleanup",0},{"ws2_32.dll","WSAGetLastError",0},{"ws2_32.dll","WSASetLastError",1},
+        {"ws2_32.dll","inet_addr",1},{"internal-wsock32","inet_network",1},{"ws2_32.dll","inet_ntoa",1},{"ws2_32.dll","WSAAsyncSelect",4},{"ws2_32.dll","WSAEventSelect",3},{"ws2_32.dll","WSAEnumNetworkEvents",3},{"ws2_32.dll","WSACreateEvent",0},{"ws2_32.dll","WSAStartup",2},{"ws2_32.dll","WSACleanup",0},{"ws2_32.dll","WSAGetLastError",0},{"ws2_32.dll","WSASetLastError",1},
         {"mswsock.dll","AcceptEx",8},{"mswsock.dll","GetAcceptExSockaddrs",8},{"mswsock.dll","ConnectEx",7},{"mswsock.dll","DisconnectEx",4},{"mswsock.dll","TransmitFile",7},
         {"ws2_32.dll","AcceptEx",8},{"ws2_32.dll","GetAcceptExSockaddrs",8},{"ws2_32.dll","WSAGetOverlappedResult",5},
         {"ws2_32.dll","WSAEnumProtocolsA",3},{"ws2_32.dll","WSAEnumProtocolsW",3},
@@ -600,6 +600,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
         else if (symbol=="WSASetLastError") last_error_=u32(0);
         else if (symbol=="htons" || symbol=="ntohs") result=htons(static_cast<std::uint16_t>(arg(0)));
         else if (symbol=="htonl" || symbol=="ntohl") result=htonl(u32(0));
+        else if(symbol=="inet_network"){
+            // BSD 語義：各段可為十／八／十六進位，依段數左移組合，結果為主機位元組順序；格式錯誤回 INADDR_NONE。
+            if(!arg(0)){last_error_=10014;result=UINT32_MAX;}
+            else {const auto text=read_ansi(memory,arg(0),256);result=static_cast<std::uint32_t>(::inet_network(text.c_str()));}
+        }
         else if(symbol=="inet_addr"){
             if(!arg(0)){last_error_=10014;result=UINT32_MAX;}
             else {const auto text=read_ansi(memory,arg(0));result=text==" "?0U: ::inet_addr(text.c_str());}

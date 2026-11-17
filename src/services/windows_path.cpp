@@ -360,6 +360,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_association(GuestState& sta
     }catch(const std::invalid_argument&){return done(invalid);}
     throw HostCallFault("未知的檔案關聯服務");
 }
+// 未指定搜尋路徑時的預設順序（SearchPath 與 RtlGetExePath 共用）：應用程式目錄、目前目錄（非安全模式時在前）、System32、System、
+// Windows、目前目錄（安全模式時在後），共五項；有 PATH 環境變數時第六項是尚未拆開的 PATH。安全模式依 SetSearchPathMode，未設定時讀登錄 SafeProcessSearchMode。
+std::uint32_t WindowsServices::default_search_paths(GuestMemory& memory,std::vector<std::u16string>& paths,std::size_t* current_index) {
+    bool safe=(runtime_.search_path_mode&1)!=0;
+    if(!runtime_.search_path_mode){
+        if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
+        RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
+        if(transaction.error)return transaction.error;
+        const auto key=runtime_.registry.keys.find(std::u16string(1,char16_t{2})+u"\\system\\currentcontrolset\\control\\session manager");
+        if(key!=runtime_.registry.keys.end()){const auto value=key->second.find(u"safeprocesssearchmode");if(value!=key->second.end() && value->second.type==4 && value->second.bytes.size()==4)safe=value->second.bytes[0]==1 && !value->second.bytes[1] && !value->second.bytes[2] && !value->second.bytes[3];}
+    }
+    auto executable=runtime_.image.path;
+    if(executable.empty()){const auto argv=memory.load(GuestAddress{runtime_.wargv_cell},x86_?32:64);executable=read_utf16(memory,GuestAddress{memory.load(GuestAddress{argv},x86_?32:64)});}
+    executable=normalized_windows_path(executable);paths.push_back(executable.substr(0,executable.find_last_of(u'\\')+1));
+    if(!safe){if(current_index)*current_index=paths.size();paths.push_back(runtime_.current_directory);}
+    paths.insert(paths.end(),{u"C:\\Windows\\System32",u"C:\\Windows\\System",u"C:\\Windows"});
+    if(safe){if(current_index)*current_index=paths.size();paths.push_back(runtime_.current_directory);}
+    if(const auto env=runtime_.environment.find(u"PATH");env!=runtime_.environment.end())paths.push_back(env->second.second);
+    return 0;
+}
+
 std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     if(service.symbol.starts_with("Assoc") || service.family=="internal-query-associations")return invoke_association(state,memory,service);
     if(service.symbol.starts_with("PathStripToRoot")){
@@ -468,21 +489,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_path(GuestState& state,Gues
             if(name.find_first_of(u"\\:")!=name.npos)paths.emplace_back();
             else if(arg(0))append(read(0));
             else{
-                bool safe=(runtime_.search_path_mode&1)!=0;
-                if(!runtime_.search_path_mode){
-                    if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
-                    RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
-                    if(transaction.error){last_error_=transaction.error;arg.return_to(state,0);return std::nullopt;}
-                    const auto key=runtime_.registry.keys.find(std::u16string(1,char16_t{2})+u"\\system\\currentcontrolset\\control\\session manager");
-                    if(key!=runtime_.registry.keys.end()){const auto value=key->second.find(u"safeprocesssearchmode");if(value!=key->second.end() && value->second.type==4 && value->second.bytes.size()==4)safe=value->second.bytes[0]==1 && !value->second.bytes[1] && !value->second.bytes[2] && !value->second.bytes[3];}
-                }
-                auto executable=runtime_.image.path;
-                if(executable.empty()){const auto argv=memory.load(GuestAddress{runtime_.wargv_cell},x86_?32:64);executable=read_utf16(memory,GuestAddress{memory.load(GuestAddress{argv},x86_?32:64)});}
-                executable=normalized_windows_path(executable);paths.push_back(executable.substr(0,executable.find_last_of(u'\\')+1));
-                if(!safe)paths.push_back(runtime_.current_directory);
-                paths.insert(paths.end(),{u"C:\\Windows\\System32",u"C:\\Windows\\System",u"C:\\Windows"});
-                if(safe)paths.push_back(runtime_.current_directory);
-                if(const auto env=runtime_.environment.find(u"PATH");env!=runtime_.environment.end())append(env->second.second);
+                std::vector<std::u16string> defaults;
+                if(const auto error=default_search_paths(memory,defaults)){last_error_=error;arg.return_to(state,0);return std::nullopt;}
+                paths.insert(paths.end(),defaults.begin(),defaults.begin()+5);if(defaults.size()>5)append(defaults[5]);
             }
             std::u16string found;std::uint32_t lookup_error=2;
             for(auto path:paths){

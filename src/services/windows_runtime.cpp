@@ -1981,7 +1981,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     }
     else if(frame.continuation==Continuation::ConsoleControl && static_cast<std::uint32_t>(callback_value)){frame.value=1;frame.index=frame.callbacks.size();}
     else if(frame.continuation==Continuation::ReturnUntilFailure && (static_cast<std::uint32_t>(callback_value)&0x80000000U))frame.index=frame.callbacks.size();
-    else if((frame.continuation==Continuation::ReturnUntilFalse || frame.continuation==Continuation::MonitorEnumeration || frame.continuation==Continuation::DirectInputEnumeration || frame.continuation==Continuation::WindowEnumeration || frame.continuation==Continuation::MetafileEnumeration || frame.continuation==Continuation::LocaleEnumeration || frame.continuation==Continuation::ResourceEnumeration || frame.continuation==Continuation::AcmEnumeration) && !static_cast<std::uint32_t>(callback_value))frame.index=frame.callbacks.size();
+    else if((frame.continuation==Continuation::ReturnUntilFalse || frame.continuation==Continuation::MonitorEnumeration || frame.continuation==Continuation::DirectInputEnumeration || frame.continuation==Continuation::WindowEnumeration || frame.continuation==Continuation::MetafileEnumeration || frame.continuation==Continuation::LocaleEnumeration || frame.continuation==Continuation::ResourceEnumeration || frame.continuation==Continuation::AcmEnumeration || frame.continuation==Continuation::SymbolEnumeration) && !static_cast<std::uint32_t>(callback_value))frame.index=frame.callbacks.size();
     else if (frame.index < frame.callbacks.size()) ++frame.index;
     if(frame.continuation==Continuation::WindowEnumeration)while(frame.index<frame.callbacks.size() && !gui_.windows.contains(frame.callbacks[frame.index].arguments[0]))++frame.index;
     if (frame.index < frame.callbacks.size()) { enter_callback(state, memory); return std::nullopt; }
@@ -2156,6 +2156,8 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     // EnumDisplayMonitors：回呼回 FALSE 即停止，回傳最後一次回呼結果並釋放各螢幕矩形。
     if(finished.continuation==Continuation::MonitorEnumeration){(void)free_heap(memory,finished.value,state);complete_call(state,memory,static_cast<std::uint32_t>(callback_value)!=0);return std::nullopt;}
     if(finished.continuation==Continuation::ReturnZeroFreeHeap){(void)free_heap(memory,finished.value,state);complete_call(state,memory,0);return std::nullopt;}
+    // DbgHelp 的符號／模組列舉：回呼回 FALSE 只停止列舉，函式仍回傳 TRUE；釋放傳給回呼的名稱與 SYMBOL_INFO 區塊。
+    if(finished.continuation==Continuation::SymbolEnumeration){(void)free_heap(memory,finished.value,state);complete_call(state,memory,1);return std::nullopt;}
     if(finished.continuation==Continuation::GuiWinEvent){if(finished.value)return advance_gui_modal(state,memory,finished.value);return std::nullopt;}
     if(finished.continuation==Continuation::GuiMouseInput)return resume_gui_mouse(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::GuiMoveSize)return resume_gui_move_size(state,memory,finished.value,callback_value);

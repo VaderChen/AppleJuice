@@ -1,5 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "service_callback_task.hpp"
+#include <numeric>
 #include "mf_interfaces.hpp"
 #include "mf_image_layout.h"
 #include "guest_mf_image.hpp"
@@ -65,6 +67,45 @@ struct Value {
     std::uint32_t type{};std::uint64_t scalar{};Guid id{};std::u16string text;std::vector<std::uint8_t> blob;
     bool operator==(const Value&)const=default;
 };
+// 屬性存放區的序列化（MFGetAttributesAsBlob／MFInitAttributesFromBlob、MFSerializeAttributesToStream 與 MF_MT_WRAPPED_TYPE 共用）：
+// UINT32 筆數，之後每筆 {GUID 鍵, UINT32 型別, 內容}；UINT32 為 4 位元組、UINT64／double 為 8 位元組、GUID 為 16 位元組、
+// 字串為 UINT32 字元數＋UTF-16、BLOB 為 UINT32 長度＋位元組；IUnknown 只在 by_reference 時寫入 8 位元組指標，否則略過。
+std::vector<std::uint8_t> encode_attributes(const std::map<Guid,Value>& attributes,bool by_reference){
+    std::vector<std::uint8_t> out(4);std::uint32_t count=0;
+    const auto put=[&](std::uint64_t value,unsigned size){for(unsigned i=0;i<size;++i)out.push_back(static_cast<std::uint8_t>(value>>(8*i)));};
+    for(const auto& [key,value]:attributes){
+        if(value.type==13 && !by_reference)continue;
+        out.insert(out.end(),key.begin(),key.end());put(value.type,4);++count;
+        switch(value.type){
+        case 19:put(value.scalar,4);break;case 21:case 5:case 13:put(value.scalar,8);break;
+        case 72:out.insert(out.end(),value.id.begin(),value.id.end());break;
+        case 31:put(value.text.size(),4);for(const auto c:value.text)put(c,2);break;
+        case 0x1011:put(value.blob.size(),4);out.insert(out.end(),value.blob.begin(),value.blob.end());break;
+        default:throw Failure{type_error};
+        }
+    }
+    for(unsigned i=0;i<4;++i)out[i]=static_cast<std::uint8_t>(count>>(8*i));return out;
+}
+std::optional<std::vector<std::pair<Guid,Value>>> decode_attributes(std::span<const std::uint8_t> bytes){
+    std::size_t at=0;
+    const auto take=[&](unsigned size)->std::optional<std::uint64_t>{if(bytes.size()-at<size)return std::nullopt;std::uint64_t value=0;for(unsigned i=0;i<size;++i)value|=std::uint64_t{bytes[at+i]}<<(8*i);at+=size;return value;};
+    const auto count=take(4);if(!count || *count>65536)return std::nullopt;
+    std::vector<std::pair<Guid,Value>> items;
+    for(std::uint64_t n=0;n<*count;++n){
+        if(bytes.size()-at<20)return std::nullopt;Guid key{};std::copy_n(bytes.begin()+static_cast<std::ptrdiff_t>(at),16,key.begin());at+=16;
+        Value value;value.type=static_cast<std::uint32_t>(*take(4));
+        switch(value.type){
+        case 19:{const auto v=take(4);if(!v)return std::nullopt;value.scalar=*v;break;}
+        case 21:case 5:case 13:{const auto v=take(8);if(!v)return std::nullopt;value.scalar=*v;break;}
+        case 72:if(bytes.size()-at<16)return std::nullopt;std::copy_n(bytes.begin()+static_cast<std::ptrdiff_t>(at),16,value.id.begin());at+=16;break;
+        case 31:{const auto length=take(4);if(!length || *length>bytes.size())return std::nullopt;for(std::uint64_t i=0;i<*length;++i){const auto c=take(2);if(!c)return std::nullopt;value.text.push_back(static_cast<char16_t>(*c));}break;}
+        case 0x1011:{const auto length=take(4);if(!length || bytes.size()-at<*length)return std::nullopt;value.blob.assign(bytes.begin()+static_cast<std::ptrdiff_t>(at),bytes.begin()+static_cast<std::ptrdiff_t>(at+*length));at+=*length;break;}
+        default:return std::nullopt;
+        }
+        items.emplace_back(key,std::move(value));
+    }
+    return items;
+}
 struct ByteStreamState {
     std::shared_ptr<HostFile> file;
     std::uint64_t position{};std::uint32_t capabilities{};bool closed{};
@@ -108,6 +149,9 @@ public:
     std::uint32_t operator++(){if(memory_)return static_cast<std::uint32_t>(memory_->atomic_rmw(GuestAddress{address_},Bits,GuestMemory::AtomicRmw::Add,1)+1);return static_cast<std::uint32_t>(++local_);}
     std::uint32_t operator--(){if(memory_)return static_cast<std::uint32_t>(memory_->atomic_rmw(GuestAddress{address_},Bits,GuestMemory::AtomicRmw::Add,UINT32_MAX)-1);return static_cast<std::uint32_t>(--local_);}
 };
+// MFCreateVideoSampleAllocatorEx 的樣本池：owned 是配置器建立且仍歸它管理的樣本，free 是參照歸零後回收的閒置樣本。
+struct SamplePool {std::vector<std::uint64_t> free;std::set<std::uint64_t> owned;std::uint64_t manager{},notify{},type{};
+    std::uint32_t maximum{},width{},height{},code{},format{},bind{},usage{},misc{};bool initialized{},bottom_up{};};
 struct Object {
     mf::Kind kind{};BufferCell<32> refs{1};std::map<mf::Kind,std::uint64_t> pointers;std::map<Guid,Value> attributes;
     std::uint64_t allocation{},parent{},state{},callback{},result_object{},queue_owner{};BufferCell<64> data{};
@@ -139,6 +183,12 @@ struct Object {
     struct NodeLink {std::uint64_t node{};std::uint32_t index{};};
     std::uint64_t topo_id{};std::uint32_t node_type{};std::vector<NodeLink> outputs,inputs;std::map<std::uint32_t,std::uint64_t> output_prefs,input_prefs;
     std::shared_ptr<SessionState> session;bool event_dispatching{};
+    // MFCreateSystemTimeSource：state 為 MFCLOCK_STATE（0 無效、1 執行、2 停止、3 暫停），clock／system 是最近一次轉換時的時鐘與系統時間。
+    struct Timing {std::uint32_t state{};std::int64_t clock{},system{};float rate{1};} timing;
+    // IMFTrackedSample（tracked 為 MFCreateTrackedSample 建立）與樣本池歸屬。
+    bool tracked{};std::uint64_t tracker{},tracker_state{},pool_owner{};std::shared_ptr<SamplePool> pool;
+    // MFCreateD3D12SynchronizationObject：就緒與釋放各一個 ID3D12Fence，數值單調遞增。
+    struct D3D12Sync {std::uint64_t device{},ready{},release{},ready_value{},release_value{};};std::shared_ptr<D3D12Sync> d3d12;
 };
 struct Entry {std::shared_ptr<Object> object;mf::Kind kind;};
 }
@@ -150,8 +200,30 @@ struct MediaFoundationState {
     std::map<std::uint64_t,Query> queries;
     std::uint64_t next_topology_id{1};
     // MFPutWorkItem 系列：由 poll_media_foundation 派送到客體工作執行緒。
-    struct WorkItem {std::uint64_t result{},invoke{},callback{};};
+    struct WorkItem {std::uint64_t result{},invoke{},callback{};std::uint32_t queue{};};
     std::deque<WorkItem> work_items;
+    // MFAllocateWorkQueue 系列的使用者佇列：type 0 標準、1 視窗、2 多執行緒；非多執行緒佇列一次只派送一個工作（busy）。
+    // mmcss 非空時為 MMCSS 工作佇列：task 是工作索引，mmcss_task 在派送工作時套用到工作執行緒（MmcssEnter／MmcssLeave）。
+    struct WorkQueue {std::uint32_t type{},target{},locks{1},task{};bool busy{};std::u16string mmcss;MultimediaThreadTask mmcss_task{};};
+    std::map<std::uint32_t,WorkQueue> queues;std::map<std::u16string,std::uint32_t> shared_queues;
+    std::uint32_t next_queue{0x10001},platform_locks{};
+    // MFRegisterPlatformWithMMCSS：標準佇列（識別碼 0～8）共用的 MMCSS 設定；mmcss_threads 記錄目前套用中的工作執行緒與工作 handle。
+    WorkQueue platform;std::map<std::uint64_t,std::uint64_t> mmcss_threads;
+    // MFTRegisterLocal／MFTRegisterLocalByCLSID 的本機登錄（factory 非零時持有類別工廠的參照）；登錄表中的 MFT 也以同一結構讀出。
+    struct LocalTransform {mf::Guid clsid{},category{};std::u16string name;std::uint32_t flags{};std::vector<std::uint8_t> inputs,outputs,attributes;std::uint64_t factory{};};
+    std::vector<LocalTransform> local_transforms;
+    // MFRegisterLocalSchemeHandler／MFRegisterLocalByteStreamHandler：scheme（含冒號）、副檔名（不含點）與 MIME 皆為小寫；後登錄者優先。
+    struct LocalHandler {std::u16string scheme,extension,mime;std::uint64_t activate{};};
+    std::vector<LocalHandler> local_handlers;
+    // MFJoinWorkQueue：檔案以完成鍵＝cookie 繫結到 MF 的內部完成埠；封包的 OVERLAPPED 位於 MFASYNCRESULT 的介面指標之後，完成時放入加入的工作佇列。
+    struct Join {std::uint32_t queue{};std::uint64_t file{};};
+    std::uint64_t io_port{},next_join{1};std::map<std::uint64_t,Join> joins;std::set<std::uint64_t> bound_files;
+    // MFGetPluginControl：程序內唯一物件；偏好以 {類型, 小寫選擇字串} 為鍵（值為原字串與 CLSID），停用清單為 {類型, CLSID}。
+    std::uint64_t plugin_control{};
+    struct Plugins {std::map<std::pair<std::uint32_t,std::u16string>,std::pair<std::u16string,mf::Guid>> preferred;std::vector<std::pair<std::uint32_t,mf::Guid>> disabled;std::uint32_t policy{};} plugins;
+    // 排程、等待與週期工作：handle 是計時器佇列計時器或 RegisterWaitForSingleObject 的等待物件。
+    struct Timed {std::uint64_t handle{},result{},callback{},context{};bool waiting{},periodic{};};
+    std::map<std::uint64_t,Timed> timed;std::uint64_t next_key{1};
 };
 bool WindowsServices::media_foundation_ready(std::uint64_t pointer,std::uint64_t thread) const {
     (void)thread;
@@ -162,7 +234,8 @@ bool WindowsServices::media_foundation_ready(std::uint64_t pointer,std::uint64_t
     return item.kind==mf::Manager?!item.lock_handle:item.closed || !item.events.empty();
 }
 bool WindowsServices::media_foundation_waiting() const {
-    if(!media_foundation_)return false;if(!media_foundation_->work_items.empty())return true;for(const auto& [id,thread]:threads_.items){(void)id;if(thread.status==ThreadStatus::Waiting && thread.wait.kind==ThreadWaitKind::MediaFoundation && !thread.wait.handles.empty()){const auto found=media_foundation_->objects.find(thread.wait.handles.front());if(found!=media_foundation_->objects.end() && (found->second.object->kind==mf::Reader || found->second.object->kind==mf::Session))return true;}}for(const auto& [pointer,entry]:media_foundation_->objects){(void)pointer;if(entry.kind==entry.object->kind && entry.object->job_held)return true;}return false;
+    if(!media_foundation_)return false;if(!media_foundation_->work_items.empty())return true;
+    if(media_foundation_->io_port)if(const auto port=runtime_.completion_ports.find(media_foundation_->io_port);port!=runtime_.completion_ports.end() && !port->second.packets.empty())return true;for(const auto& [id,thread]:threads_.items){(void)id;if(thread.status==ThreadStatus::Waiting && thread.wait.kind==ThreadWaitKind::MediaFoundation && !thread.wait.handles.empty()){const auto found=media_foundation_->objects.find(thread.wait.handles.front());if(found!=media_foundation_->objects.end() && (found->second.object->kind==mf::Reader || found->second.object->kind==mf::Session))return true;}}for(const auto& [pointer,entry]:media_foundation_->objects){(void)pointer;if(entry.kind==entry.object->kind && entry.object->job_held)return true;}return false;
 }
 void WindowsServices::poll_media_foundation(GuestMemory& memory){
     if(!media_foundation_ || threads_.items.empty() || registered_waits_.size()>=64)return;
@@ -174,10 +247,36 @@ void WindowsServices::poll_media_foundation(GuestMemory& memory){
         auto& thread=threads_.items.at(worker);thread.status=ThreadStatus::Runnable;thread.wait={};return true;
     };
     auto& work_items=media_foundation_->work_items;
-    while(!work_items.empty()){
-        const auto item=work_items.front();
-        if(!dispatch({{item.invoke,{item.callback,item.result}},{resolve("internal-mf","Release").value,{item.result}}}))return;
-        work_items.pop_front();
+    // MFJoinWorkQueue 的 I/O 完成：依 OVERLAPPED 找回 MFASYNCRESULT（本引擎的非同步結果物件），寫回 hrStatusResult／dwBytesTransferred 後交給加入的佇列。
+    // 已解除加入的 cookie 或不是本引擎非同步結果的 OVERLAPPED 不處理。
+    if(media_foundation_->io_port)if(const auto port=runtime_.completion_ports.find(media_foundation_->io_port);port!=runtime_.completion_ports.end()){
+        const unsigned unit=x86_?4U:8U;const std::uint8_t width=x86_?32:64;
+        while(!port->second.packets.empty()){
+            const auto packet=port->second.packets.front();port->second.packets.pop_front();
+            const auto join=media_foundation_->joins.find(packet.key);if(join==media_foundation_->joins.end() || packet.overlapped<unit)continue;
+            const auto result=packet.overlapped-unit;const auto found=media_foundation_->objects.find(result);
+            if(found==media_foundation_->objects.end() || found->second.object->kind!=mf::Async || !found->second.object->callback)continue;
+            auto& item=*found->second.object;const auto error=completion_packet_error(packet.status);item.status=error?0x80070000U|(error&0xffffU):0U;
+            memory.store(GuestAddress{result+(x86_?28U:48U)},32,item.status);memory.store(GuestAddress{result+(x86_?32U:52U)},32,static_cast<std::uint32_t>(packet.bytes));
+            ++item.refs;const auto table=memory.load(GuestAddress{item.callback},width);
+            work_items.push_back({result,memory.load(GuestAddress{table+4*unit},width),item.callback,join->second.queue});
+        }
+    }
+    // 非多執行緒的使用者佇列依提交順序一次派送一個，工作結束時由 internal-mf!QueueDone 解除；其他佇列可並行。
+    for(auto it=work_items.begin();it!=work_items.end();){
+        const auto item=*it;const auto queue=media_foundation_->queues.find(item.queue);
+        const bool serial=queue!=media_foundation_->queues.end() && queue->second.type!=2;
+        if(serial && queue->second.busy){++it;continue;}
+        std::vector<GuestCallback> batch{{item.invoke,{item.callback,item.result}},{resolve("internal-mf","Release").value,{item.result}}};
+        // MMCSS 工作佇列：工作執行緒在 Invoke 前套用該佇列的 MMCSS 工作設定，結束後還原（工作執行緒由多個佇列共用）。
+        const auto& owner=item.queue<=8?media_foundation_->platform:queue!=media_foundation_->queues.end()?queue->second:media_foundation_->platform;
+        if((item.queue<=8 || queue!=media_foundation_->queues.end()) && owner.mmcss_task.handle){
+            batch.insert(batch.begin(),{resolve("internal-mf","MmcssEnter").value,{item.queue}});batch.push_back({resolve("internal-mf","MmcssLeave").value,{item.queue}});
+        }
+        if(serial)batch.push_back({resolve("internal-mf","QueueDone").value,{item.queue}});
+        if(!dispatch(std::move(batch)))return;
+        if(serial)queue->second.busy=true;
+        it=work_items.erase(it);
     }
     std::vector<std::uint64_t> ready,session_pumps,session_events;
     for(const auto& [pointer,entry]:media_foundation_->objects){
@@ -256,14 +355,43 @@ std::span<const WindowsServiceDescriptor> media_foundation_service_descriptors()
             {"mfplat.dll","MFInitMediaTypeFromWaveFormatEx",3,0,0,4},{"mfplat.dll","MFCreateWaveFormatExFromMFMediaType",4,0,0,8},
             {"mfplat.dll","MFCreateDXGIDeviceManager",2},{"mfplat.dll","MFLockDXGIDeviceManager",2},{"mfplat.dll","MFUnlockDXGIDeviceManager",0},
             {"mfplat.dll","MFCreateDXGISurfaceBuffer",5,0,0,12},
-            {"mf.dll","MFGetService",4},{"mfplat.dll","MFTEnum",7,0,1,2},{"mfplat.dll","MFTEnumEx",6,0,1,2},{"mf.dll","MFEnumDeviceSources",3},{"mf.dll","MFCreateDeviceSource",2},
+            {"mf.dll","MFGetService",4},{"mfplat.dll","MFTEnum",7,0,1,2},{"mfplat.dll","MFTEnumEx",6,0,1,2},{"mfplat.dll","MFTEnum2",7,0,1,2},
+            {"mfplat.dll","MFTRegister",9,0,3,0x58},{"mfplat.dll","MFTUnregister",1,0,1},{"mfplat.dll","MFTGetInfo",7,0,1},{"mfplat.dll","MFTRegisterLocal",8,0,0,0x58},
+            {"mfplat.dll","MFTRegisterLocalByCLSID",8,0,0,0x58},{"mfplat.dll","MFTUnregisterLocal",1},{"mfplat.dll","MFTUnregisterLocalByCLSID",1,0,1},{"mf.dll","MFEnumDeviceSources",3},{"mf.dll","MFCreateDeviceSource",2},
             {"mfplat.dll","MFCreateSourceResolver",1},{"mfreadwrite.dll","MFCreateSourceReaderFromURL",3},{"mfreadwrite.dll","MFCreateSourceReaderFromByteStream",3},{"mfreadwrite.dll","MFCreateSourceReaderFromMediaSource",3},{"mfreadwrite.dll","MFCreateSinkWriterFromURL",4},{"mfplat.dll","MFCreateFile",5,0,0,7},{"mfplat.dll","MFCreateMFByteStreamOnStream",2},{"mfplat.dll","MFCreateMFByteStreamOnStreamEx",2},{"mfplat.dll","MFCreateStreamOnMFByteStream",2},{"mfplat.dll","MFCreateStreamOnMFByteStreamEx",3},{"internal-mf","PipelinePoll",1},
             {"mf.dll","MFCreateMediaSession",2},{"mf.dll","MFCreateTopology",1},{"mf.dll","MFCreateTopologyNode",2,0,0,1},{"mf.dll","MFCreateSampleGrabberSinkActivate",3},{"mf.dll","MFCreateAudioRendererActivate",1},
             {"mfplat.dll","MFCreateCollection",1},{"mfplat.dll","MFPutWorkItem",3,0,0,1},{"mfplat.dll","MFPutWorkItem2",4,0,0,3},{"mfplat.dll","MFPutWorkItemEx",2,0,0,1},{"mfplat.dll","MFPutWorkItemEx2",3,0,0,3},
             {"internal-mf","SessionPump",1},{"internal-mf","SessionPumpDone",1},{"internal-mf","SessionDeliver",1},
+            {"mfplat.dll","MFAllocateWorkQueue",1},{"mfplat.dll","MFAllocateWorkQueueEx",2,0,0,1},{"mfplat.dll","MFAllocateSerialWorkQueue",2,0,0,1},
+            {"mfplat.dll","MFLockWorkQueue",1,0,0,1},{"mfplat.dll","MFUnlockWorkQueue",1,0,0,1},{"mfplat.dll","MFLockSharedWorkQueue",4,0,0,2},
+            {"mfplat.dll","MFLockPlatform",0},{"mfplat.dll","MFUnlockPlatform",0},{"mfplat.dll","MFGetTimerPeriodicity",1},
+            {"mfplat.dll","MFScheduleWorkItem",4,0x4},{"mfplat.dll","MFScheduleWorkItemEx",3,0x2},{"mfplat.dll","MFCancelWorkItem",1,0x1},
+            {"mfplat.dll","MFPutWaitingWorkItem",4,0,0,2},{"mfplat.dll","MFAddPeriodicCallback",3},{"mfplat.dll","MFRemovePeriodicCallback",1,0,0,1},
+            {"mfplat.dll","MFGetAttributesAsBlobSize",2},{"mfplat.dll","MFGetAttributesAsBlob",3,0,0,4},{"mfplat.dll","MFInitAttributesFromBlob",3,0,0,4},
+            {"mfplat.dll","MFSerializeAttributesToStream",3,0,0,2},{"mfplat.dll","MFDeserializeAttributesFromStream",3,0,0,2},
+            {"mfplat.dll","MFWrapMediaType",4},{"mfplat.dll","MFUnwrapMediaType",2},{"mfplat.dll","MFCompareFullToPartialMediaType",2},
+            {"mfplat.dll","MFAverageTimePerFrameToFrameRate",3,0x1},{"mfplat.dll","MFllMulDiv",4,0xf},{"mfplat.dll","MFHeapAlloc",5,0,0,0x1a},{"mfplat.dll","MFHeapFree",1},
+            {"mfplat.dll","MFCreatePathFromURL",2},
+            {"mfplat.dll","MFCreateVideoMediaTypeFromSubtype",2},{"mfplat.dll","MFCreateVideoMediaType",2},{"mfplat.dll","MFCreateAudioMediaType",2},
+            {"mfplat.dll","MFCreateVideoMediaTypeFromVideoInfoHeader",8,0x20,0,0x1e},{"mfplat.dll","MFInitMediaTypeFromVideoInfoHeader",4,0,0,4},
+            {"mfplat.dll","MFInitMediaTypeFromVideoInfoHeader2",4,0,0,4},{"mfplat.dll","MFInitMediaTypeFromMPEG1VideoInfo",4,0,0,4},{"mfplat.dll","MFInitMediaTypeFromMPEG2VideoInfo",4,0,0,4},
+            {"mfplat.dll","MFInitMediaTypeFromMFVideoFormat",3,0,0,4},{"mfplat.dll","MFInitMediaTypeFromAMMediaType",2},{"mfplat.dll","MFInitAMMediaTypeFromMFMediaType",3,0,2},
+            {"mfplat.dll","MFCreateAMMediaTypeFromMFMediaType",3,0,2},{"mfplat.dll","MFCreateMFVideoFormatFromMFMediaType",3},{"mfplat.dll","MFCreateMediaTypeFromRepresentation",3,0,1},
+            {"mfplat.dll","MFInitVideoFormat_RGB",4,0,0,0xe},{"mfplat.dll","MFConvertColorInfoToDXVA",2},{"mfplat.dll","MFMapDX9FormatToDXGIFormat",1,0,0,1},
+            {"mfplat.dll","MFMapDXGIFormatToDX9Format",1,0,0,1},
+            {"mfplat.dll","MFBeginCreateFile",7,0,0,7},{"mfplat.dll","MFEndCreateFile",2},{"mfplat.dll","MFCancelCreateFile",1},{"mfplat.dll","MFCreateTempFile",4,0,0,7},
+            {"mfplat.dll","MFCreate2DMediaBuffer",5,0,0,0xf},{"mfplat.dll","MFCreateMediaBufferFromMediaType",5,0x2,0,0xc},{"mfplat.dll","MFCreateLegacyMediaBufferOnMFMediaBuffer",4,0,0,4},
+            {"mfplat.dll","CreatePropertyStore",1},{"mfplat.dll","MFCreateTransformActivate",1},{"mfplat.dll","MFCreateMFByteStreamWrapper",2},
+            {"mfplat.dll","MFGetPluginControl",1},{"mfplat.dll","MFCreateSystemTimeSource",1},{"mfplat.dll","MFCreateTrackedSample",1},{"mfplat.dll","MFCreateD3D12SynchronizationObject",3},{"mfplat.dll","MFCreateDXSurfaceBuffer",4,0,0,4},{"mfplat.dll","MFJoinWorkQueue",3,0,0,1},{"mfplat.dll","MFUnjoinWorkQueue",2,0,0,1},{"mfplat.dll","MFRegisterLocalSchemeHandler",2},{"mfplat.dll","MFRegisterLocalByteStreamHandler",3},
+            {"internal-mf","ResolverDeliver",4,0,0,0xc},{"mfplat.dll","MFCreateVideoSampleAllocatorEx",2},
+            {"internal-mf","TimedFire",2,0,0,2},{"internal-mf","PeriodicFire",2,0,0,2},{"internal-mf","QueueDone",1,0,0,1},{"internal-mf","MmcssEnter",1,0,0,1},{"internal-mf","MmcssLeave",1,0,0,1},
+            {"mfplat.dll","MFBeginRegisterWorkQueueWithMMCSS",5,0,0,5},{"mfplat.dll","MFBeginRegisterWorkQueueWithMMCSSEx",6,0,0,0xd},
+            {"mfplat.dll","MFEndRegisterWorkQueueWithMMCSS",2},{"mfplat.dll","MFBeginUnregisterWorkQueueWithMMCSS",3,0,0,1},{"mfplat.dll","MFEndUnregisterWorkQueueWithMMCSS",1},
+            {"mfplat.dll","MFGetWorkQueueMMCSSClass",3,0,0,1},{"mfplat.dll","MFGetWorkQueueMMCSSTaskId",2,0,0,1},{"mfplat.dll","MFGetWorkQueueMMCSSPriority",2,0,0,1},
+            {"mfplat.dll","MFRegisterPlatformWithMMCSS",3,0,0,4},{"mfplat.dll","MFUnregisterPlatformFromMMCSS",0},
             {"internal-mf","BufferDestroy",1},{"internal-mf","B_LockHost",4},{"internal-mf","B_UnlockHost",1}};
         std::set<std::string_view> names;const auto append=[&](const auto& methods){for(const auto& m:methods)if(names.insert(m.name).second)result.push_back({"internal-mf",m.name,m.args,m.wide,m.aggregate,m.narrow});};
-        append(mf::common);for(unsigned k=0;k<=mf::ComStream;++k)append(mf::methods(static_cast<mf::Kind>(k)));
+        append(mf::common);for(unsigned k=0;k<=mf::D3D12SyncObject;++k)append(mf::methods(static_cast<mf::Kind>(k)));
         return result;
     }();return table;
 }
@@ -296,6 +424,72 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
         a.return_to(state,status);return std::nullopt;
     }
     if(!media_foundation_)media_foundation_=std::make_shared<MediaFoundationState>();auto& bridge=*media_foundation_;
+    if(service.symbol=="V_ActivateObject"){
+        // 登錄或本機登錄的 MFT（identifier 6：CoCreateInstance；7：本機類別工廠）：建立後保留，之後以該物件的 QueryInterface 取得要求的介面。
+        const WindowsCall probe(state,memory,service);
+        if(const auto found=bridge.objects.find(probe(0));found!=bridge.objects.end() && found->second.object->kind==mf::Activate && (found->second.object->identifier==6 || found->second.object->identifier==7)){
+            auto item=found->second.object;
+            return nested_continuation(state,memory,service.symbol,[this,service,item](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(s,m,service);const std::uint8_t width=x86_?32:64;const unsigned size_of_pointer=width/8U;
+                const auto finish=[&](std::uint32_t hr){call.return_to(s,hr);return std::optional<std::uint32_t>{};};
+                const auto method=[&](std::uint64_t object,unsigned slot){const auto table=m.load(GuestAddress{object},width);return m.load(GuestAddress{table+slot*size_of_pointer},width);};
+                if(!call(1) || !call(2))co_return finish(0x80004003U);
+                m.store(GuestAddress{call(2)},width,0);
+                if(!item->result_object){
+                    const auto clsid=item->attributes.find(mf::MFT_TRANSFORM_CLSID_Attribute);if(clsid==item->attributes.end() || clsid->second.type!=72)co_return finish(0xc00d36e6U);
+                    const auto block=allocate_heap(m,48);if(!block)co_return finish(0x8007000eU);
+                    m.write(GuestAddress{block},clsid->second.id);m.write(GuestAddress{block+16},mf::unknown);m.store(GuestAddress{block+32},width,0);
+                    const auto hr=static_cast<std::uint32_t>(item->identifier==6?
+                        co_await service_callback::call_value(resolve("ole32.dll","CoCreateInstance").value,{block,0,1,block+16,block+32}):
+                        co_await service_callback::call_value(method(item->callback,3),{item->callback,0,block+16,block+32}));
+                    const auto created=hr?0:m.load(GuestAddress{block+32},width);(void)free_heap(m,block,s);
+                    if(hr)co_return finish(hr);if(!created)co_return finish(0x80004003U);
+                    if(item->result_object)(void)co_await service_callback::call_value(method(created,2),{created});else item->result_object=created;
+                }
+                const auto target=item->result_object;
+                co_return finish(static_cast<std::uint32_t>(co_await service_callback::call_value(method(target,0),{target,call(1),call(2)})));
+            });
+        }
+    }
+    if(service.symbol=="MFSerializeAttributesToStream" || service.symbol=="MFDeserializeAttributesFromStream"){
+        // (pAttr, dwOptions, pStm)：串流內容為 UINT32 長度＋encode_attributes 的格式，經 ISequentialStream::Write／Read 讀寫。
+        // MF_ATTRIBUTE_SERIALIZE_UNKNOWN_BYREF（1）時 IUnknown 以指標寫入並由串流持有一個參照，讀回時接收該參照；否則略過 IUnknown。
+        return nested_continuation(state,memory,service.symbol,[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);const bool serialize=service.symbol=="MFSerializeAttributesToStream";const std::uint8_t width=x86_?32:64;const unsigned size_of_pointer=width/8U;
+            const auto finish=[&](std::uint32_t hr){call.return_to(s,hr);return std::optional<std::uint32_t>{};};
+            std::vector<std::uint64_t> blocks;
+            struct Release {WindowsServices& self;GuestMemory& memory;GuestState& state;std::vector<std::uint64_t>& blocks;~Release(){for(const auto block:blocks)(void)self.free_heap(memory,block,state);}} cleanup{*this,m,s,blocks};
+            const auto scratch=[&](std::size_t length)->std::uint64_t{const auto block=allocate_heap(m,std::max<std::size_t>(length,8));if(!block)throw std::bad_alloc{};blocks.push_back(block);return block;};
+            const auto method=[&](std::uint64_t object,unsigned slot){const auto table=m.load(GuestAddress{object},width);return m.load(GuestAddress{table+slot*size_of_pointer},width);};
+            const auto attributes=call(0),stream=call(2);const bool by_reference=(static_cast<std::uint32_t>(call(1))&1U)!=0;
+            const auto store=[&]()->Object*{const auto found=media_foundation_->objects.find(attributes);return found==media_foundation_->objects.end() || !mf::attributes(found->second.object->kind)?nullptr:found->second.object.get();};
+            if(!attributes || !stream)co_return finish(pointer_error);if(!store())co_return finish(no_interface);
+            if(serialize){
+                std::vector<std::uint8_t> body;try{body=encode_attributes(store()->attributes,by_reference);}catch(const Failure& failure){co_return finish(failure.code);}
+                std::vector<std::uint64_t> shared;if(by_reference)for(const auto& [key,value]:store()->attributes)if(value.type==13 && value.scalar)shared.push_back(value.scalar);
+                std::vector<std::uint8_t> bytes(4);for(unsigned i=0;i<4;++i)bytes[i]=static_cast<std::uint8_t>(body.size()>>(8*i));bytes.insert(bytes.end(),body.begin(),body.end());
+                const auto buffer=scratch(bytes.size()+4);m.write(GuestAddress{buffer},bytes);const auto written=buffer+bytes.size();m.store(GuestAddress{written},32,0);
+                const auto hr=static_cast<std::uint32_t>(co_await service_callback::call_value(method(stream,4),{stream,buffer,bytes.size(),written}));
+                if(hr)co_return finish(hr);if(m.load(GuestAddress{written},32)!=bytes.size())co_return finish(0x80030070U);
+                for(const auto object:shared)(void)co_await service_callback::call_value(method(object,1),{object});
+                co_return finish(0);
+            }
+            const auto header=scratch(8);
+            auto hr=static_cast<std::uint32_t>(co_await service_callback::call_value(method(stream,3),{stream,header,4,header+4}));
+            if(hr)co_return finish(hr);if(m.load(GuestAddress{header+4},32)!=4)co_return finish(0x80004005U);
+            const auto length=static_cast<std::uint32_t>(m.load(GuestAddress{header},32));if(length>16U*1024U*1024U)co_return finish(invalid);
+            const auto body=scratch(static_cast<std::size_t>(length)+4);
+            hr=static_cast<std::uint32_t>(co_await service_callback::call_value(method(stream,3),{stream,body,length,body+length}));
+            if(hr)co_return finish(hr);if(m.load(GuestAddress{body+length},32)!=length)co_return finish(0x80004005U);
+            std::vector<std::uint8_t> bytes(length);if(length)m.read(GuestAddress{body},bytes);const auto items=decode_attributes(bytes);if(!items)co_return finish(invalid);
+            for(const auto& [key,value]:*items)if(value.type==13 && !by_reference)co_return finish(invalid);
+            if(!store())co_return finish(no_interface);
+            std::vector<std::uint64_t> previous;for(const auto& [key,value]:store()->attributes)if(value.type==13 && value.scalar)previous.push_back(value.scalar);
+            store()->attributes.clear();for(const auto& [key,value]:*items)store()->attributes.insert_or_assign(key,value);
+            for(const auto object:previous)(void)co_await service_callback::call_value(method(object,2),{object});
+            co_return finish(0);
+        });
+    }
     const WindowsCall arg(state,memory,service);const auto name=service.symbol=="B_LockHost"?std::string_view{"B_Lock"}:service.symbol=="B_UnlockHost"?std::string_view{"B_Unlock"}:service.symbol;const auto bits=static_cast<std::uint8_t>(x86_?32:64);const auto unit=bits/8U;
     const auto d=[&](unsigned n){return static_cast<std::uint32_t>(arg(n));};
     const auto require=[](bool test,std::uint32_t code=invalid){if(!test)throw Failure{code};};
@@ -329,10 +523,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
         }
         for(const auto& [index,type]:item->output_prefs){(void)index;release(type);}for(const auto& [index,type]:item->input_prefs){(void)index;release(type);}
         if(item->allocation)(void)free_heap(memory,item->allocation,state);
-    };
-    release=[&](std::uint64_t p){
-        if(!p)return;const auto found=bridge.objects.find(p);if(found==bridge.objects.end()){callbacks.push_back({foreign_method(p,2),{p}});return;}
-        if(!--found->second.object->refs)destroy(p);
+        release(item->tracker);release(item->tracker_state);
+        if(item->d3d12){const auto sync=item->d3d12;item->d3d12.reset();release(sync->ready);release(sync->release);release(sync->device);}
+        if(item->pool){
+            // 配置器銷毀：閒置樣本一併銷毀，仍在使用的樣本脫離（之後照一般樣本釋放）。
+            auto pool=item->pool;item->pool.reset();
+            for(const auto sample:pool->owned)if(const auto found=bridge.objects.find(sample);found!=bridge.objects.end())found->second.object->pool_owner=0;
+            for(const auto sample:pool->free)if(const auto found=bridge.objects.find(sample);found!=bridge.objects.end()){found->second.object->refs=1;release(sample);}
+            release(pool->manager);release(pool->notify);release(pool->type);
+        }
     };
     const auto create=[&](const std::shared_ptr<Object>& item,mf::Kind kind){
         if(item->pointers.contains(kind))return item->pointers.at(kind);
@@ -353,7 +552,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
             }
             bridge.tables.emplace(kind,table);
         }
-        const auto p=allocate(kind==mf::Buffer?MF_BUFFER_BYTES:unit);put(p,bridge.tables.at(kind),bits);
+        // 非同步結果配置 MFASYNCRESULT 的大小（介面指標＋OVERLAPPED＋pCallback＋hrStatusResult＋dwBytesTransferred＋hEvent），供 MFJoinWorkQueue 的 I/O 使用。
+        const std::size_t object_bytes=kind==mf::Buffer?MF_BUFFER_BYTES:kind==mf::Async?(x86_?40U:64U):unit;
+        const auto p=allocate(object_bytes);if(kind==mf::Async)memory.fill(GuestAddress{p},0,object_bytes);put(p,bridge.tables.at(kind),bits);
         if(kind==mf::Buffer){
             memory.fill(GuestAddress{p+8},0,MF_BUFFER_BYTES-8);
             item->refs.bind(memory,p+MF_BUFFER_REFS);item->locks.bind(memory,p+MF_BUFFER_LOCKS);item->data.bind(memory,p+MF_BUFFER_DATA);
@@ -366,11 +567,39 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
         item->pointers.emplace(kind,p);bridge.objects.emplace(p,Entry{item,kind});return p;
     };
     const auto make=[&](mf::Kind kind){auto item=std::make_shared<Object>();item->kind=kind;return create(item,kind);};
+    release=[&](std::uint64_t p){
+        if(!p)return;const auto found=bridge.objects.find(p);if(found==bridge.objects.end()){callbacks.push_back({foreign_method(p,2),{p}});return;}
+        auto& item=*found->second.object;if(--item.refs)return;
+        // 樣本配置器的樣本：參照歸零時回到配置器的閒置清單（不銷毀），並通知 IMFVideoSampleAllocatorNotify::NotifyRelease。
+        if(item.kind==mf::Sample && item.pool_owner){
+            if(const auto owner=bridge.objects.find(item.pool_owner);owner!=bridge.objects.end() && owner->second.object->pool && owner->second.object->pool->owned.contains(p)){
+                auto& pool=*owner->second.object->pool;pool.free.push_back(p);if(pool.notify)callbacks.push_back({foreign_method(pool.notify,3),{pool.notify}});return;}
+            item.pool_owner=0;
+        }
+        // IMFTrackedSample：參照歸零時不銷毀，改由非同步結果持有並經標準工作佇列呼叫 SetAllocator 給的回呼（一次性）。
+        if(item.kind==mf::Sample && item.tracker){
+            const auto callback=item.tracker,context=item.tracker_state;item.tracker=item.tracker_state=0;item.refs=1;
+            const auto r=make(mf::Async);auto completion=object(r,mf::Async);completion->result_object=item.pointers.at(mf::Sample);completion->callback=callback;completion->state=context;
+            bridge.work_items.push_back({r,foreign_method(callback,4),callback,1});return;
+        }
+        destroy(p);
+    };
     const auto query=[&](std::uint64_t p,const Guid& iid,std::uint64_t output){
         out(output);const auto& source=entry(p);auto item=source.object;std::uint64_t pointer=0;
         if(iid==mf::unknown || iid==mf::iid(item->kind) || (iid==mf::iid_Attributes && mf::attributes(item->kind)))pointer=item->pointers.at(item->kind);
         // IMFAudioMediaType：只有主類型為音訊的媒體類型提供，與 IMFMediaType 是同一個物件（GetAudioFormat 接在 IMFMediaType 的方法之後）。
         else if(iid==mf::iid_AudioMediaType && item->kind==mf::MediaType && item->attributes.contains(mf::MF_MT_MAJOR_TYPE) && item->attributes.at(mf::MF_MT_MAJOR_TYPE).id==mf::MFMediaType_Audio)pointer=item->pointers.at(mf::MediaType);
+        // IMFVideoMediaType：主要型別為視訊時同一個物件（GetVideoFormat 與 GetAudioFormat 佔同一個方法位置，之後是 GetVideoRepresentation）。
+        // DMO IMediaBuffer 包裝：建立時給了樣本則可查出 IMFSample。
+        else if(item->kind==mf::LegacyBuffer && iid==mf::iid(mf::Sample) && item->state)pointer=item->state;
+        else if(item->kind==mf::PluginControl && iid==mf::iid_PluginControl)pointer=item->pointers.at(mf::PluginControl);
+        else if(item->kind==mf::Sample && item->tracked && iid==mf::iid_TrackedSample)pointer=create(item,mf::TrackedSample);
+        else if(item->kind==mf::SampleAllocator && iid==mf::iid_SampleAllocator)pointer=item->pointers.at(mf::SampleAllocator);
+        else if(item->kind==mf::SampleAllocator && iid==mf::iid_AllocatorCallback)pointer=create(item,mf::AllocatorCallback);
+        else if(item->kind==mf::TimeSource && iid==mf::iid_Clock)pointer=item->pointers.at(mf::TimeSource);
+        else if(item->kind==mf::D3D12Sync && iid==mf::iid_D3D12SyncObject)pointer=create(item,mf::D3D12SyncObject);
+        else if(item->kind==mf::TimeSource && iid==mf::iid_StateSink)pointer=create(item,mf::StateSink);
+        else if(iid==mf::iid_VideoMediaType && item->kind==mf::MediaType && item->attributes.contains(mf::MF_MT_MAJOR_TYPE) && item->attributes.at(mf::MF_MT_MAJOR_TYPE).id==mf::MFMediaType_Video)pointer=item->pointers.at(mf::MediaType);
         else if(iid==mf::iid_Generator && (item->kind==mf::Transform || item->kind==mf::Source || item->kind==mf::MediaStream))pointer=create(item,mf::Generator);
         else if(iid==mf::iid_Shutdown && item->kind==mf::Transform)pointer=create(item,mf::Shutdown);
         else if(item->kind==mf::Stream && iid==mf::iid_TypeHandler)pointer=create(item,mf::TypeHandler);
@@ -380,7 +609,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
         else if(item->kind==mf::Session && iid==mf::iid_RateControl)pointer=create(item,mf::RateControl);
         else if(item->kind==mf::Session && iid==mf::iid_RateSupport)pointer=create(item,mf::RateSupport);
         else if(item->kind==mf::Session && iid==mf::iid_GetService)pointer=create(item,mf::GetService);
-        else if(item->surface && (iid==mf::iid_Surface || iid==mf::iid_TwoD || iid==mf::iid_TwoD2))pointer=create(item,iid==mf::iid_Surface?mf::Surface:iid==mf::iid_TwoD?mf::TwoD:mf::TwoD2);
+        // D3D9 表面緩衝提供 IMFGetService（MR_BUFFER_SERVICE），不提供 IMFDXGIBuffer。
+        else if(item->kind==mf::Buffer && item->extended==mf::iid_D3D9Surface && iid==mf::iid_GetService)pointer=create(item,mf::GetService);
+        else if(item->surface && ((iid==mf::iid_Surface && item->extended!=mf::iid_D3D9Surface) || iid==mf::iid_TwoD || iid==mf::iid_TwoD2))pointer=create(item,iid==mf::iid_Surface?mf::Surface:iid==mf::iid_TwoD?mf::TwoD:mf::TwoD2);
         else throw Failure{no_interface};hold(pointer);put(output,pointer,bits);
     };
     const auto read_value=[&](std::uint64_t p){
@@ -435,17 +666,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
     #include "mf_session_source_helpers.inc"
     #include "mf_file_source_helpers.inc"
     #include "mf_session_helpers.inc"
+    #include "mf_format_helpers.inc"
     std::uint64_t result=0;
     try {
         #include "mf_file_source_exports.inc"
         else
         #include "mf_session_exports.inc"
         else
+        #include "mf_file_exports.inc"
+        else
         #include "mf_bytestream_exports.inc"
         else
         #include "mf_sink_exports.inc"
         else
         #include "mf_pipeline_exports.inc"
+        else
+        #include "mf_work_queue_exports.inc"
+        else
+        #include "mf_attribute_exports.inc"
+        else
+        #include "mf_format_exports.inc"
+        else
+        #include "mf_transform_exports.inc"
+        else
+        #include "mf_runtime_exports.inc"
         else
         if(name=="MFGetService"){
             out(arg(3));require(arg(0)!=0,pointer_error);const auto service_id=guid(arg(1)),iid=guid(arg(2));
@@ -472,7 +716,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
         }else if(name=="MFCreateMediaBufferWrapper"){
             out(arg(3));auto parent=object(arg(0),mf::Buffer);require(d(1)<=parent->length && d(2)<=parent->length-d(1));map_buffer(*parent,true,false);const auto p=make(mf::Buffer);auto item=object(p,mf::Buffer);hold(arg(0));item->parent=arg(0);item->identifier=d(1);item->data=parent->data+d(1);item->length=item->maximum=d(2);put(p+MF_BUFFER_PLAIN,memory.load(GuestAddress{arg(0)+MF_BUFFER_PLAIN},32));put(arg(3),p,bits);
         }else if(name=="MFCreateAsyncResult"){
-            out(arg(3));const auto p=make(mf::Async);auto item=object(p,mf::Async);hold(arg(0));hold(arg(1));hold(arg(2));item->result_object=arg(0);item->callback=arg(1);item->state=arg(2);put(arg(3),p,bits);
+            out(arg(3));const auto p=make(mf::Async);auto item=object(p,mf::Async);hold(arg(0));hold(arg(1));hold(arg(2));item->result_object=arg(0);item->callback=arg(1);item->state=arg(2);
+            put(p+(x86_?24U:40U),arg(1),bits);put(arg(3),p,bits);
         }else if(name=="MFInvokeCallback"){
             auto item=object(arg(0),mf::Async);require(item->callback!=0);callbacks.push_back({foreign_method(item->callback,4),{item->callback,arg(0)}});
         }else if(name=="MFCreateMediaEvent"){out(arg(4));put(arg(4),event(d(0),guid(arg(1)),d(2),arg(3)?read_value(arg(3)):Value{}),bits);}
@@ -481,22 +726,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
             std::vector<std::uint64_t> children;for(unsigned n=0;n<count;++n){const auto child=memory.load(GuestAddress{list+n*unit},bits);(void)object(child,stream?mf::MediaType:mf::Stream);children.push_back(child);}
             const auto p=make(stream?mf::Stream:mf::Presentation);auto item=entry(p).object;item->identifier=stream?d(0):0;item->children=children;item->selected.resize(count,false);for(const auto child:children)hold(child);if(stream){item->current_type=children.front();hold(item->current_type);}put(output,p,bits);
         }else if(name=="MFInitMediaTypeFromWaveFormatEx"){
-            auto item=object(arg(0),mf::MediaType);require(d(2)>=16);const auto bytes=data(arg(1),d(2));const auto load=[&](unsigned at,unsigned width){require(at+width<=bytes.size());std::uint32_t v=0;for(unsigned n=0;n<width;++n)v|=static_cast<std::uint32_t>(bytes[at+n])<<(8*n);return v;};
-            const auto tag=load(0,2),channels=load(2,2),rate=load(4,4),avg=load(8,4),align=load(12,2),depth=load(14,2);Guid subtype=mf::guid(tag,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71});std::uint32_t mask=0;
-            require(channels && rate && align);if(tag==0xfffe){require(bytes.size()>=40 && load(16,2)>=22);std::copy_n(bytes.begin()+24,16,subtype.begin());mask=load(20,4);}else if(bytes.size()>=18)require(18+load(16,2)<=bytes.size());
-            const bool pcm=subtype==mf::pcm || subtype==mf::ieee;if(pcm)require(depth && align==(channels*depth+7)/8 && avg==static_cast<std::uint64_t>(rate)*align);
-            Value v;v.type=72;v.id=mf::MFMediaType_Audio;set(*item,mf::MF_MT_MAJOR_TYPE,v);v.id=subtype;set(*item,mf::MF_MT_SUBTYPE,v);v={};v.type=19;
-            for(const auto& pair:std::array<std::pair<Guid,std::uint32_t>,9>{{{mf::MF_MT_AUDIO_NUM_CHANNELS,channels},{mf::MF_MT_AUDIO_SAMPLES_PER_SECOND,rate},{mf::MF_MT_AUDIO_AVG_BYTES_PER_SECOND,avg},{mf::MF_MT_AUDIO_BLOCK_ALIGNMENT,align},{mf::MF_MT_AUDIO_BITS_PER_SAMPLE,depth},{mf::MF_MT_AUDIO_CHANNEL_MASK,mask},{mf::MF_MT_COMPRESSED,pcm?0U:1U},{mf::MF_MT_FIXED_SIZE_SAMPLES,pcm?1U:0U},{mf::MF_MT_SAMPLE_SIZE,align}}}){v.scalar=pair.second;set(*item,pair.first,v);}
+            auto item=object(arg(0),mf::MediaType);require(d(2)>=16);init_wave(*item,data(arg(1),d(2)));
         }else if(name=="MFCreateWaveFormatExFromMFMediaType"){
-            out(arg(1));put(arg(2),0);auto item=object(arg(0),mf::MediaType);require(d(3)<=1);require(get(*item,mf::MF_MT_MAJOR_TYPE,72).id==mf::MFMediaType_Audio,0xc00d36b4U);const auto subtype=get(*item,mf::MF_MT_SUBTYPE,72).id;
-            require(subtype==mf::pcm || subtype==mf::ieee,0xc00d36b4U);const auto channels=get(*item,mf::MF_MT_AUDIO_NUM_CHANNELS,19).scalar,rate=get(*item,mf::MF_MT_AUDIO_SAMPLES_PER_SECOND,19).scalar,align=get(*item,mf::MF_MT_AUDIO_BLOCK_ALIGNMENT,19).scalar,depth=get(*item,mf::MF_MT_AUDIO_BITS_PER_SAMPLE,19).scalar,avg=get(*item,mf::MF_MT_AUDIO_AVG_BYTES_PER_SECOND,19).scalar;
-            require(channels && channels<=UINT16_MAX && depth && depth<=UINT16_MAX && align<=UINT16_MAX && avg==rate*align);const bool extended=!d(3);const auto size=extended?40U:18U;const auto p=allocate(size);memory.write(GuestAddress{p},std::vector<std::uint8_t>(size));put(p,extended?0xfffe:subtype==mf::pcm?1:3,16);put(p+2,channels,16);put(p+4,rate);put(p+8,avg);put(p+12,align,16);put(p+14,depth,16);put(p+16,extended?22:0,16);if(extended){put(p+18,depth,16);const auto mask=item->attributes.find(mf::MF_MT_AUDIO_CHANNEL_MASK);put(p+20,mask==item->attributes.end()?0:mask->second.scalar);memory.write(GuestAddress{p+24},subtype);}put(arg(1),p,bits);put(arg(2),size);
+            out(arg(1));put(arg(2),0);auto item=object(arg(0),mf::MediaType);require(d(3)<=1);const auto bytes=pcm_wave_bytes(*item,!d(3));
+            const auto p=allocate(bytes.size());memory.write(GuestAddress{p},bytes);put(arg(1),p,bits);put(arg(2),bytes.size());
         }else if(name=="MFCreateDXGIDeviceManager" || name=="MFLockDXGIDeviceManager"){
             check(arg(0),4);out(arg(1));const bool shared=name=="MFLockDXGIDeviceManager";require(!shared || bridge.manager_locks<UINT32_MAX,0x8007000eU);
             auto p=shared?bridge.shared_manager:0;if(!p){require(bridge.next_reset_token!=0,0x8007000eU);p=make(mf::Manager);object(p,mf::Manager)->reset_token=bridge.next_reset_token++;if(shared)bridge.shared_manager=p;}
             if(shared){++bridge.manager_locks;hold(p);}put(arg(0),object(p,mf::Manager)->reset_token);put(arg(1),p,bits);
         }else if(name=="MFUnlockDXGIDeviceManager"){
             require(bridge.manager_locks!=0,0xc00d36b2U);if(!--bridge.manager_locks){const auto p=bridge.shared_manager;bridge.shared_manager=0;release(p);}
+        }else if(name=="MFCreateDXSurfaceBuffer"){
+            // (riid, punkSurface, fBottomUpWhenLinear, ppBuffer)：riid 必須是 IID_IDirect3DSurface9；以 media_d3d9_surface 的讀寫提供 IMF2DBuffer／IMF2DBuffer2。
+            out(arg(3));require(guid(arg(0))==mf::iid_D3D9Surface,no_interface);auto surface=media_d3d9_surface(arg(1));require(surface.has_value(),invalid);
+            const auto p=make(mf::Buffer);auto item=object(p,mf::Buffer);item->surface=std::move(surface);item->bottom_up=d(2)!=0;item->parent=arg(1);item->extended=mf::iid_D3D9Surface;
+            item->maximum=item->length=item->surface->size;hold(arg(1));put(arg(3),p,bits);
         }else if(name=="MFCreateDXGISurfaceBuffer"){
             out(arg(4));require(guid(arg(0))==d3d11_guid::IID_ID3D11Texture2D,no_interface);auto surface=media_graphics_surface(arg(1),d(2));require(surface.has_value(),invalid);const auto p=make(mf::Buffer);auto item=object(p,mf::Buffer);item->surface=std::move(surface);item->bottom_up=d(3)!=0;item->parent=arg(1);item->identifier=d(2);item->maximum=item->length=item->surface->size;hold(arg(1));put(arg(4),p,bits);
         }else {
@@ -571,6 +815,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
                 if(name=="T_GetMajorType"){check(arg(1),16);memory.write(GuestAddress{arg(1)},get(*item,mf::MF_MT_MAJOR_TYPE,72).id);}
                 else if(name=="T_IsCompressedFormat"){const auto found=item->attributes.find(mf::MF_MT_COMPRESSED);put(arg(1),found!=item->attributes.end() && found->second.scalar!=0);}
                 else if(name=="T_IsEqual"){auto theirs=object(arg(1),mf::MediaType);const auto equal=[&](const Guid& key){const auto a=item->attributes.find(key),b=theirs->attributes.find(key);return a!=item->attributes.end() && b!=theirs->attributes.end() && a->second==b->second;};std::uint32_t flags=0;if(equal(mf::MF_MT_MAJOR_TYPE))flags|=1;if(equal(mf::MF_MT_SUBTYPE))flags|=2;auto a=item->attributes,b=theirs->attributes;a.erase(mf::MF_MT_MAJOR_TYPE);a.erase(mf::MF_MT_SUBTYPE);b.erase(mf::MF_MT_MAJOR_TYPE);b.erase(mf::MF_MT_SUBTYPE);if(a==b)flags|=4;if(item->attributes==theirs->attributes)flags|=8;put(arg(2),flags);result=flags==15?0:1;}
+                else if(name=="T_GetRepresentation" || name=="T_GetVideoRepresentation"){
+                    // AM_MEDIA_TYPE_REPRESENTATION 與 FORMAT_* 都回傳 AM_MEDIA_TYPE（格式區塊依要求的型別，見 mf_format_helpers.inc）；
+                    // IMFVideoMediaType::GetVideoRepresentation 的 lStride 非零時取代預設步幅（負值為由下而上）。
+                    out(arg(2));const auto requested=guid(arg(1));
+                    require(requested==fmt_am_representation || requested==fmt_wave || requested==fmt_video_info || requested==fmt_video_info2 || requested==fmt_mpeg1 ||
+                        requested==fmt_mpeg2 || requested==fmt_mf_video,unsupported_representation);
+                    Object view;view.kind=mf::MediaType;view.attributes=item->attributes;
+                    if(name=="T_GetVideoRepresentation"){require_video(view);if(const auto stride=static_cast<std::int32_t>(d(3)))view.attributes.insert_or_assign(mf::MF_MT_DEFAULT_STRIDE,value32(static_cast<std::uint32_t>(stride)));}
+                    const auto p=allocate(am_size);gui_.task_allocations.insert(p);
+                    try{write_am(p,view,requested);}catch(...){gui_.task_allocations.erase(p);(void)free_heap(memory,p,state);throw;}
+                    put(arg(2),p,bits);
+                }else if(name=="T_FreeRepresentation")free_am(arg(2));
+                else if(name=="T_GetAudioFormat" && item->attributes.contains(mf::MF_MT_MAJOR_TYPE) && item->attributes.at(mf::MF_MT_MAJOR_TYPE).id==mf::MFMediaType_Video){
+                    // IMFVideoMediaType::GetVideoFormat：回傳由媒體類型持有的 MFVIDEOFORMAT 指標，隨媒體類型釋放；每次呼叫依目前屬性重新產生，失敗時回 NULL。
+                    result=0;
+                    try{const auto bytes=mf_video_bytes(*item);if(item->allocation){(void)free_heap(memory,item->allocation,state);item->allocation=0;}
+                        item->allocation=allocate(bytes.size());memory.write(GuestAddress{item->allocation},bytes);result=item->allocation;}catch(const Failure&){}
+                }
                 else if(name=="T_GetAudioFormat"){
                     // IMFAudioMediaType::GetAudioFormat：回傳由媒體類型持有的 WAVEFORMATEX 指標（不是 HRESULT）；不是音訊類型或缺少必要屬性時回 NULL。
                     // 格式標籤取自子類型 GUID 的前 32 位元（{XXXXXXXX-0000-0010-8000-00AA00389B71} 家族），編碼器私有資料（MF_MT_USER_DATA）接在後面當 cbSize 部分。
@@ -643,6 +905,157 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
                 else if(name=="X_GetResource"){out(arg(2));start_callbacks(state,memory,{{foreign_method(item->parent,0),{item->parent,arg(1),arg(2)}}},Continuation::ReturnCallback);return std::nullopt;}
                 else if(name=="X_SetUnknown"){const auto key=guid(arg(1));if(!arg(2)){const auto found=item->attributes.find(key);if(found!=item->attributes.end()){release(found->second.scalar);item->attributes.erase(found);}}else {require(!item->attributes.contains(key),0x80071392U);Value value;value.type=13;value.scalar=arg(2);set(*item,key,value);}}
                 else if(name=="X_GetUnknown"){out(arg(3));const auto found=item->attributes.find(guid(arg(1)));require(found!=item->attributes.end(),0xc00d36d5U);const auto p=found->second.scalar;if(bridge.objects.contains(p))query(p,guid(arg(2)),arg(3));else {start_callbacks(state,memory,{{foreign_method(p,0),{p,arg(2),arg(3)}}},Continuation::ReturnCallback);return std::nullopt;}}
+            }else if(name.starts_with("HB_")){
+                // 交給客體 handler 的 IMFAsyncCallback：同步解析時保存結果並設定事件；非同步解析時在回呼中呼叫 EndCreateObject，再把結果送回解析器的完成佇列。
+                require(item->kind==mf::HostCallback,no_interface);
+                if(name=="HB_GetParameters")throw Failure{0x80004001U};
+                if(!(item->identifier&1U)){
+                    hold(arg(1));release(item->callback);item->callback=arg(1);(void)nested_service(state,memory,"kernel32.dll","SetEvent",{item->generation});
+                }else {
+                    if(service_callback::completed(this,threads_.current,service.symbol,state))return nested_continuation(state,memory,service.symbol,[](GuestState&,GuestMemory&)->service_callback::Task<std::optional<std::uint32_t>>{throw HostCallFault("服務續行重播不應重新建立");});
+                    const auto handler=item->result_object,completion=item->state,host=item->pointers.at(mf::HostCallback);require(handler && completion,0x8000ffffU);hold(host);
+                    return nested_continuation(state,memory,service.symbol,[this,service,handler,completion,host](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                        const WindowsCall call(s,m,service);const std::uint8_t width=x86_?32:64;const unsigned size_of_pointer=width/8U;
+                        const auto method=[&](std::uint64_t object,unsigned slot){const auto table=m.load(GuestAddress{object},width);return m.load(GuestAddress{table+slot*size_of_pointer},width);};
+                        const auto block=allocate_heap(m,16);std::uint32_t hr=0x8007000eU;std::uint64_t created=0;std::uint32_t type=2;
+                        if(block){m.store(GuestAddress{block},32,2);m.store(GuestAddress{block+8},width,0);
+                            hr=static_cast<std::uint32_t>(co_await service_callback::call_value(method(handler,4),{handler,call(1),block,block+8}));
+                            if(!hr){type=static_cast<std::uint32_t>(m.load(GuestAddress{block},32));created=m.load(GuestAddress{block+8},width);}(void)free_heap(m,block,s);}
+                        (void)co_await service_callback::call_value(resolve("internal-mf","ResolverDeliver").value,{completion,hr?0:created,hr?2:type,hr});
+                        (void)co_await service_callback::call_value(resolve("internal-mf","Release").value,{host});
+                        call.return_to(s,0);co_return std::nullopt;
+                    });
+                }
+            }else if(name.starts_with("DS_") || name.starts_with("DO_")){
+                // D3D12 同步物件：就緒＝生產端佇列 Signal(就緒 fence, ++n)，消費端 Wait(就緒 fence, n)；釋放＝消費端 Signal(釋放 fence, ++m)；
+                // 事件以 fence 的 SetEventOnCompletion 通知。Reset 不改 fence（數值持續遞增）。客體 D3D12 介面以續行呼叫；續行前會改計數，重播時直接取回結果。
+                require(item->kind==mf::D3D12Sync,no_interface);
+                if(service_callback::completed(this,threads_.current,service.symbol,state))return nested_continuation(state,memory,service.symbol,[](GuestState&,GuestMemory&)->service_callback::Task<std::optional<std::uint32_t>>{throw HostCallFault("服務續行重播不應重新建立");});
+                const auto sync=item->d3d12;require(sync && sync->ready && sync->release,not_initialized);
+                if(name!="DO_Reset"){
+                require(arg(1)!=0,name.find("Event")!=std::string_view::npos?invalid:pointer_error);
+                std::uint64_t target=0,value=0;unsigned slot=0;std::uint64_t fence=0;
+                if(name=="DS_EnqueueResourceReady"){target=arg(1);slot=14;fence=sync->ready;value=++sync->ready_value;}
+                else if(name=="DS_EnqueueResourceReadyWait"){target=arg(1);slot=15;fence=sync->ready;value=sync->ready_value;}
+                else if(name=="DS_EnqueueResourceRelease"){target=arg(1);slot=14;fence=sync->release;value=++sync->release_value;}
+                else if(name=="DS_SignalEventOnResourceReady"){target=sync->ready;slot=9;value=sync->ready_value;}
+                else {target=sync->release;slot=9;value=sync->release_value;}
+                std::vector<std::uint64_t> args{target};if(fence)args.push_back(fence);
+                if(x86_){args.push_back(value&UINT32_MAX);args.push_back(value>>32);}else args.push_back(value);
+                if(!fence)args.push_back(arg(1));
+                return nested_continuation(state,memory,service.symbol,[this,service,target,slot,args](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                    const WindowsCall call(s,m,service);const std::uint8_t width=x86_?32:64;const unsigned size_of_pointer=width/8U;
+                    const auto table=m.load(GuestAddress{target},width);const auto entry_point=m.load(GuestAddress{table+slot*size_of_pointer},width);
+                    call.return_to(s,static_cast<std::uint32_t>(co_await service_callback::call_value(entry_point,args)));co_return std::nullopt;
+                });
+                }
+            }else if(name.starts_with("TK_")){
+                // IMFTrackedSample::SetAllocator：已有擁有者時回報 MF_E_NOTACCEPTING。
+                require(item->kind==mf::Sample && item->tracked,no_interface);require(arg(1)!=0,pointer_error);require(!item->tracker,0xc00d36b5U);
+                (void)foreign_method(arg(1),4);hold(arg(1));hold(arg(2));item->tracker=arg(1);item->tracker_state=arg(2);
+            }else if(name.starts_with("SA_") || name.starts_with("SC_")){
+                // IMFVideoSampleAllocatorEx：每個樣本一個緩衝；有 DXGI 裝置管理員時為 D3D11 材質（DXGI surface 緩衝），否則為記憶體 2D 緩衝。
+                require(item->kind==mf::SampleAllocator,no_interface);if(!item->pool)item->pool=std::make_shared<SamplePool>();auto& pool=*item->pool;
+                const auto allocator=item->pointers.at(mf::SampleAllocator);
+                const auto uninitialize=[&]{
+                    for(const auto sample:pool.owned)if(const auto found=bridge.objects.find(sample);found!=bridge.objects.end())found->second.object->pool_owner=0;
+                    auto idle=std::move(pool.free);pool.free.clear();pool.owned.clear();
+                    for(const auto sample:idle)if(const auto found=bridge.objects.find(sample);found!=bridge.objects.end()){found->second.object->refs=1;release(sample);}
+                    release(pool.type);pool.type=0;pool.initialized=false;};
+                const auto new_sample=[&]{
+                    std::uint64_t buffer=0;
+                    if(pool.manager){
+                        const auto device=object(pool.manager,mf::Manager)->parent;require(device!=0,0xc00d6d76U);
+                        GuestScratch scratch(*this,memory,state);const auto desc=scratch.allocate(44),slot=scratch.allocate(8);require(desc && slot,0x8007000eU);
+                        const std::array<std::uint32_t,11> words{pool.width,pool.height,1,1,pool.format,1,0,pool.usage,pool.bind,0,pool.misc};
+                        for(unsigned i=0;i<11;++i)memory.store(GuestAddress{desc+4*i},32,words[i]);
+                        const auto status=static_cast<std::uint32_t>(nested_service(state,memory,"internal-d3d11","CreateTexture2D",{device,desc,0,slot}));require(!status,status);
+                        const auto texture=memory.load(GuestAddress{slot},bits);auto surface=media_graphics_surface(texture,0);
+                        if(!surface){release(texture);throw Failure{0xc00d6d76U};}
+                        buffer=make(mf::Buffer);auto target=object(buffer,mf::Buffer);target->surface=std::move(surface);target->parent=texture;target->maximum=target->length=target->surface->size;
+                    }else buffer=buffer_2d(pool.width,pool.height,pool.code,pool.bottom_up);
+                    std::uint64_t sample=0;try{sample=make(mf::Sample);}catch(...){release(buffer);throw;}
+                    auto created=object(sample,mf::Sample);created->children.push_back(buffer);created->pool_owner=allocator;pool.owned.insert(sample);return sample;};
+                if(name=="SA_SetDirectXManager"){
+                    if(arg(1)){require(bridge.objects.contains(arg(1)) && entry(arg(1)).object->kind==mf::Manager,0xc00d6d76U);}
+                    if(arg(1)!=pool.manager){uninitialize();hold(arg(1));release(pool.manager);pool.manager=arg(1);}
+                }else if(name=="SA_UninitializeSampleAllocator")uninitialize();
+                else if(name=="SA_InitializeSampleAllocator" || name=="SA_InitializeSampleAllocatorEx"){
+                    // InitializeSampleAllocator(cRequestedFrames, pMediaType)＝Ex(cRequestedFrames, cRequestedFrames, NULL, pMediaType)。
+                    const bool extended=name.ends_with("Ex");const auto initial=d(1),maximum=extended?d(2):d(1);const auto attributes=extended?arg(3):0,type_pointer=arg(extended?4:2);
+                    require(maximum && initial<=maximum && maximum<=4096);auto type=object(type_pointer,mf::MediaType);require_video(*type);
+                    const auto frame=attribute_scalar(*type,mf::MF_MT_FRAME_SIZE);const auto code=media_code(subtype_of(*type));require(frame>>32 && (frame&UINT32_MAX) && code,invalid_media_type);
+                    std::uint32_t format=0;for(const auto& [dx9,dxgi_format]:dxgi)if(dx9==code){format=dxgi_format;break;}
+                    std::uint32_t bind=8,usage=0,misc=0;
+                    if(attributes){auto store=entry(attributes).object;require(mf::attributes(store->kind),no_interface);
+                        const Guid bind_key=mf::guid(0xeacf97ad,0x065c,0x4408,{0xbe,0xe3,0xfd,0xcb,0xfd,0x12,0x8b,0xe2}),usage_key=mf::guid(0xe85fe442,0x2ca3,0x486e,{0xa9,0xc7,0x10,0x9d,0xda,0x60,0x98,0x80}),
+                            shared_key=mf::guid(0x7b8f32c3,0x6d96,0x4b89,{0x92,0x03,0xdd,0x38,0xb6,0x14,0x14,0xf3});
+                        bind=static_cast<std::uint32_t>(attribute_scalar(*store,bind_key,bind));usage=static_cast<std::uint32_t>(attribute_scalar(*store,usage_key,usage));if(attribute_scalar(*store,shared_key))misc|=2;}
+                    if(pool.manager)require(format!=0,0xc00d6d76U);
+                    uninitialize();pool.width=static_cast<std::uint32_t>(frame>>32);pool.height=static_cast<std::uint32_t>(frame);pool.code=code;pool.format=format;pool.bind=bind;pool.usage=usage;pool.misc=misc;
+                    pool.bottom_up=static_cast<std::int32_t>(attribute_scalar(*type,mf::MF_MT_DEFAULT_STRIDE,1))<0;pool.maximum=maximum;hold(type_pointer);pool.type=type_pointer;pool.initialized=true;
+                    try{for(std::uint32_t i=0;i<initial;++i){const auto sample=new_sample();object(sample,mf::Sample)->refs=0;pool.free.push_back(sample);}}catch(...){uninitialize();throw;}
+                }else if(name=="SA_AllocateSample"){
+                    out(arg(1));require(pool.initialized,not_initialized);std::uint64_t sample=0;
+                    if(!pool.free.empty()){sample=pool.free.back();pool.free.pop_back();object(sample,mf::Sample)->refs=1;}
+                    else {require(pool.owned.size()<pool.maximum,0xc00d4a3eU);sample=new_sample();}
+                    put(arg(1),sample,bits);
+                }else if(name=="SC_SetCallback"){if(arg(1))(void)foreign_method(arg(1),3);hold(arg(1));release(pool.notify);pool.notify=arg(1);}
+                else if(name=="SC_GetFreeSampleCount"){require(arg(1)!=0,pointer_error);put(arg(1),static_cast<std::uint32_t>(pool.free.size()));}
+            }else if(name.starts_with("PC_")){
+                // IMFPluginControl：找不到偏好或未停用時回報 HRESULT_FROM_WIN32(ERROR_NOT_FOUND)，索引超出範圍為 MF_E_OUT_OF_RANGE。
+                require(item->kind==mf::PluginControl,no_interface);auto& plugins=bridge.plugins;const auto type=d(1);
+                const auto folded=[&](std::uint64_t p){require(p!=0,pointer_error);auto text=read_utf16(memory,GuestAddress{p},1024);for(auto& c:text)c=unicode_case_unit(c,false);return text;};
+                if(name=="PC_GetPreferredClsid"){
+                    require(arg(3)!=0,pointer_error);const auto found=plugins.preferred.find({type,folded(arg(2))});require(found!=plugins.preferred.end(),0x80070490U);memory.write(GuestAddress{arg(3)},found->second.second);
+                }else if(name=="PC_GetPreferredClsidByIndex"){
+                    require(arg(3)!=0 && arg(4)!=0,pointer_error);std::uint32_t index=0;bool located=false;
+                    for(const auto& [key,value]:plugins.preferred)if(key.first==type && index++==d(2)){
+                        const auto bytes=utf16_bytes(value.first);const auto p=allocate(bytes.size());memory.write(GuestAddress{p},bytes);gui_.task_allocations.insert(p);
+                        put(arg(3),p,bits);memory.write(GuestAddress{arg(4)},value.second);located=true;break;}
+                    require(located,0xc00d3702U);
+                }else if(name=="PC_SetPreferredClsid"){
+                    const auto key=std::pair{type,folded(arg(2))};
+                    if(arg(3)){require(plugins.preferred.size()<65536 || plugins.preferred.contains(key),0x8007000eU);plugins.preferred.insert_or_assign(key,std::pair{read_utf16(memory,GuestAddress{arg(2)},1024),guid(arg(3))});}
+                    else plugins.preferred.erase(key);
+                }else if(name=="PC_IsDisabled"){
+                    require(std::find(plugins.disabled.begin(),plugins.disabled.end(),std::pair{type,guid(arg(2))})!=plugins.disabled.end(),0x80070490U);
+                }else if(name=="PC_GetDisabledByIndex"){
+                    require(arg(3)!=0,pointer_error);std::uint32_t index=0;bool located=false;
+                    for(const auto& [kind,id]:plugins.disabled)if(kind==type && index++==d(2)){memory.write(GuestAddress{arg(3)},id);located=true;break;}
+                    require(located,0xc00d3702U);
+                }else if(name=="PC_SetDisabled"){
+                    const auto key=std::pair{type,guid(arg(2))};const auto found=std::find(plugins.disabled.begin(),plugins.disabled.end(),key);
+                    if(d(3)){if(found==plugins.disabled.end()){require(plugins.disabled.size()<65536,0x8007000eU);plugins.disabled.push_back(key);}}
+                    else if(found!=plugins.disabled.end())plugins.disabled.erase(found);
+                }else if(name=="PC_SetPolicy"){require(d(1)<=3);plugins.policy=d(1);}
+            }else if(name.starts_with("TS_") || name.starts_with("SS_")){
+                // 系統時間來源：時鐘時間＝基準時鐘＋（系統時間−基準系統時間）×速率；暫停時凍結，停止與無效為 0。
+                require(item->kind==mf::TimeSource,no_interface);auto& timing=item->timing;const auto now=static_cast<std::int64_t>(runtime_.clock_ticks);
+                const auto clock_at=[&](std::int64_t system)->std::int64_t{
+                    if(timing.state!=1)return timing.state==3?timing.clock:0;return timing.clock+static_cast<std::int64_t>(static_cast<double>(system-timing.system)*timing.rate);};
+                const auto system=static_cast<std::int64_t>(arg(1));
+                if(name=="TS_GetClockCharacteristics"){require(arg(1)!=0,pointer_error);put(arg(1),0xaU);}
+                else if(name=="TS_GetCorrelatedTime"){require(!d(1));require(arg(2)!=0 && arg(3)!=0,pointer_error);put(arg(2),static_cast<std::uint64_t>(clock_at(now)),64);put(arg(3),static_cast<std::uint64_t>(now),64);}
+                else if(name=="TS_GetContinuityKey"){require(arg(1)!=0,pointer_error);put(arg(1),0);}
+                else if(name=="TS_GetState"){require(arg(2)!=0,pointer_error);put(arg(2),timing.state);}
+                else if(name=="TS_GetProperties"){
+                    // MFCLOCK_PROPERTIES：相關速率 0、時鐘 GUID_NULL、MFCLOCK_RELATIVE_FLAG_JITTER_NEVER_AHEAD、10 MHz、容差未知（50000）、抖動 1。
+                    check(arg(1),48);std::vector<std::uint8_t> bytes(48);fmt_put(bytes,24,1,4);fmt_put(bytes,32,10000000,8);fmt_put(bytes,40,50000,4);fmt_put(bytes,44,1,4);memory.write(GuestAddress{arg(1)},bytes);
+                }else if(name=="TS_GetUnderlyingClock"){out(arg(1));const auto p=item->pointers.at(mf::TimeSource);hold(p);put(arg(1),p,bits);}
+                else if(name=="SS_OnClockStart"){
+                    const auto offset=static_cast<std::int64_t>(arg(2));timing.clock=offset==INT64_MAX?clock_at(system):offset;timing.system=system;timing.state=1;
+                }else if(name=="SS_OnClockStop"){timing.clock=0;timing.system=system;timing.state=2;}
+                else if(name=="SS_OnClockPause"){timing.clock=clock_at(system);timing.system=system;timing.state=3;}
+                else if(name=="SS_OnClockRestart"){require(timing.state==3,0xc00d36b2U);timing.system=system;timing.state=1;}
+                else if(name=="SS_OnClockSetRate"){const auto rate=float_argument(2);require(rate>=0.0f,0xc00d36d0U);timing.clock=clock_at(system);timing.system=system;timing.rate=rate;}
+            }else if(name.starts_with("K_")){
+                // IMediaBuffer：長度與指標自 cbOffset 起算；GetBufferAndLength 以線性配置對應 MF 緩衝（surface 緩衝先讀回）。
+                require(item->kind==mf::LegacyBuffer,no_interface);auto buffer=object(item->parent,mf::Buffer);const auto offset=item->identifier;
+                if(name=="K_SetLength"){require(d(1)<=buffer->maximum-offset);buffer->length=offset+d(1);}
+                else if(name=="K_GetMaxLength"){require(arg(1)!=0,pointer_error);put(arg(1),buffer->maximum-offset);}
+                else {require(arg(1) || arg(2),pointer_error);map_buffer(*buffer,true,false);if(arg(1))put(arg(1),buffer->data+offset,bits);
+                    if(arg(2))put(arg(2),buffer->length>offset?buffer->length-offset:0U);}
             }else if(name.starts_with("Y_")){
                 require(item->surface.has_value(),no_interface);
                 if(name=="Y_Lock2D" || name=="Y_Lock2DSize"){
@@ -676,6 +1089,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_media_foundation(GuestState
     if(trace_failures && (result&0x80000000U) && name!="MFGetSystemTime" && name!="T_GetAudioFormat")
         std::fprintf(stderr,"[media-foundation] %.*s 失敗 hr=0x%08x\n",static_cast<int>(name.size()),name.data(),static_cast<unsigned>(result));
     if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,result);return std::nullopt;}
-    arg.return_to(state,result,name=="MFGetSystemTime" || name=="T_GetAudioFormat");return std::nullopt;
+    arg.return_to(state,result,name=="MFGetSystemTime" || name=="T_GetAudioFormat" || name=="MFllMulDiv");return std::nullopt;
 }
 }

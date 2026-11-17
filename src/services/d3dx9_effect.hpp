@@ -11,7 +11,7 @@ namespace x64arm::fx9 {
 // FX2 的結構與非結構區分開解碼；所有 offset 都以容器區段為界，不解參照客體位址。
 struct Type {unsigned scalar{},klass{},rows{},columns{},elements{};std::string name,semantic;std::vector<Type> members;unsigned count()const{return std::max(1U,elements);}unsigned bytes()const{std::uint64_t size=0;if(klass==5)for(const auto& member:members)size+=member.bytes();else size=klass==4?4U:rows*columns*4U;size*=count();if(size>16*1024*1024)throw std::invalid_argument("FX2 型別大小超限");return static_cast<unsigned>(size);}};
 struct Assignment {unsigned state{},index{},type_offset{},value_offset{},kind{UINT32_MAX};std::vector<std::uint8_t> code;std::string parameter;};
-struct Parameter {Type type;unsigned flags{};std::vector<std::uint8_t> values;std::vector<unsigned> objects;std::vector<std::vector<Assignment>> samplers;std::vector<Parameter> annotations;};
+struct Parameter {Type type;unsigned flags{},offset{};std::vector<std::uint8_t> values;std::vector<unsigned> objects;std::vector<std::vector<Assignment>> samplers;std::vector<Parameter> annotations;};
 struct Pass {std::string name;std::vector<Parameter> annotations;std::vector<Assignment> assignments;};
 struct Technique {std::string name;std::vector<Parameter> annotations;std::vector<Pass> passes;};
 struct Program {
@@ -33,7 +33,7 @@ struct Program {
         else if(value.klass!=4)throw std::invalid_argument("FX2 型別類別無效");(void)value.bytes();return value;
     }
     Parameter parameter(unsigned type_offset,unsigned value_offset,unsigned flags=0)const{
-        std::size_t at=type_offset;Parameter value;value.type=type(at);value.flags=flags;
+        std::size_t at=type_offset;Parameter value;value.type=type(at);value.flags=flags;value.offset=value_offset;
         if(value.type.klass!=4){value.values=value_offset?slice(data,value_offset,value.type.bytes()):std::vector<std::uint8_t>(value.type.bytes());return value;}
         at=value_offset;const bool sampler=value.type.scalar>=10 && value.type.scalar<=14;
         for(unsigned i=0;i<value.type.count();++i){if(sampler){std::vector<Assignment> states;const auto count=value_offset?bounded(take(at)):0;for(unsigned j=0;j<count;++j){Assignment assignment;assignment.state=take(at);assignment.index=take(at);assignment.type_offset=take(at);assignment.value_offset=take(at);states.push_back(assignment);}value.samplers.push_back(std::move(states));}else value.objects.push_back(value_offset?take(at):0);}

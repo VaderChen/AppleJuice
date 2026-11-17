@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "cng_asymmetric.hpp"
+#include "crypto_kdf.hpp"
 #include <openssl/bn.h>
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
@@ -139,6 +140,13 @@ std::uint32_t WindowsServices::crypto_key_call(GuestMemory& memory,const Windows
             } else return unsupported;
             value.finalized=true;return create(std::move(value),3);
         }
+        // 金鑰衍生演算法：秘密值為任意長度的金鑰材料，供 BCryptKeyDerivation 使用。
+        if (crypto_kdf::supported(kind)) {
+            if (symbol!="BCryptGenerateSymmetricKey") return unsupported;
+            if (u32(6) || (arg(2)?u32(3)<256:u32(3)!=0)) return invalid;
+            if (arg(2)) memory.check(GuestAddress{arg(2)},256,Access::Write);
+            value.secret=read(4,5);value.bits=static_cast<std::uint32_t>(value.secret.size()*8);value.finalized=true;return create(std::move(value),1);
+        }
         if (kind!="AES") return unsupported;
         const bool imported=symbol=="BCryptImportKey";
         const auto target=imported?3U:1U,object=imported?4U:2U,length=object+1;
@@ -152,6 +160,51 @@ std::uint32_t WindowsServices::crypto_key_call(GuestMemory& memory,const Windows
         } else value.secret=read(4,5);
         if (value.secret.size()!=16 && value.secret.size()!=24 && value.secret.size()!=32) return invalid;
         value.bits=static_cast<std::uint32_t>(value.secret.size()*8);value.finalized=true;return create(std::move(value),target);
+    }
+    if (symbol=="BCryptDuplicateKey") {
+        // (hKey, phNewKey, pbKeyObject, cbKeyObject, dwFlags)：只複製對稱金鑰（含鏈結模式與金鑰衍生材料）。
+        if (key==runtime_.crypto_keys.end()) return bad_handle;
+        if (u32(4) || (arg(2)?u32(3)<256:u32(3)!=0)) return invalid;
+        if (!key->second.der.empty() || cng::supported(key->second.algorithm.name) || key->second.algorithm.name=="DH") return unsupported;
+        if (arg(2)) memory.check(GuestAddress{arg(2)},256,Access::Write);
+        auto copy=key->second;return create(std::move(copy),1);
+    }
+    if (symbol=="BCryptKeyDerivation") {
+        // (hKey, pParameterList, pbDerivedKey, cbDerivedKey, pcbResult, dwFlags)：PBKDF2、SP800_108_CTR_HMAC、SP800_56A_CONCAT、CAPI_KDF。
+        // BCryptBufferDesc {ulVersion, cBuffers, pBuffers}、BCryptBuffer {cbBuffer, BufferType, pvBuffer}；KDF_HASH_ALGORITHM 預設 SHA1。
+        if (key==runtime_.crypto_keys.end()) return bad_handle;const auto& kind=key->second.algorithm.name;
+        if (!crypto_kdf::supported(kind)) return invalid;
+        if (u32(5) || !arg(2) || !u32(3) || !arg(4)) return invalid;
+        const unsigned unit=x86_?4U:8U;std::map<std::uint32_t,Bytes> parameters;
+        if (arg(1)) {
+            const auto version=memory.load(GuestAddress{arg(1)},32),count=memory.load(GuestAddress{arg(1)+4},32),list=memory.load(GuestAddress{arg(1)+8},x86_?32:64);
+            if (version || count>64 || (count && !list)) return invalid;
+            for (std::uint64_t i=0;i<count;++i) {
+                const auto entry=list+i*(x86_?12U:16U);const auto size=static_cast<std::uint32_t>(memory.load(GuestAddress{entry},32)),type=static_cast<std::uint32_t>(memory.load(GuestAddress{entry+4},32));
+                const auto data=memory.load(GuestAddress{entry+unit+(x86_?4U:0U)},x86_?32:64);
+                if (size>output_limit || (size && !data)) return invalid;Bytes bytes(size);if (size) memory.read(GuestAddress{data},bytes);parameters[type]=std::move(bytes);
+            }
+        }
+        const auto parameter=[&](std::uint32_t type)->const Bytes*{const auto found=parameters.find(type);return found==parameters.end()?nullptr:&found->second;};
+        std::string hash="SHA1";
+        if (const auto* name=parameter(0)) {std::u16string text;for (std::size_t i=0;i+1<name->size();i+=2) {const auto c=static_cast<char16_t>((*name)[i]|((*name)[i+1]<<8));if (!c) break;text.push_back(c);}hash=utf16_to_utf8(text);}
+        if (!crypto_kdf::hash_supported(hash)) return unsupported;
+        const auto empty=Bytes{};const auto value_of=[&](std::uint32_t type)->const Bytes&{const auto* found=parameter(type);return found?*found:empty;};
+        const auto length=static_cast<std::size_t>(u32(3));const auto& secret=key->second.secret;Bytes derived;
+        if (kind=="PBKDF2") {
+            const auto* count=parameter(0x10);if (!count || count->size()!=8) return invalid;std::uint64_t iterations=0;for (unsigned i=0;i<8;++i) iterations|=std::uint64_t{(*count)[i]}<<(8*i);
+            if (!iterations) return invalid;derived=crypto_kdf::pbkdf2(hash,secret,value_of(0xf),iterations,length);
+        } else if (kind=="SP800_108_CTR_HMAC") derived=crypto_kdf::sp800_108_counter_hmac(hash,secret,value_of(0xd),value_of(0xe),length);
+        else if (kind=="SP800_56A_CONCAT") {
+            if (!parameter(8) || !parameter(9) || !parameter(0xa)) return invalid;Bytes other;
+            for (const auto type:{8U,9U,0xaU,0xbU,0xcU}) append(other,value_of(type));
+            derived=crypto_kdf::sp800_56a_concat(hash,secret,other,length);
+        } else {
+            CryptoHash digest(hash,false,{});digest.update(secret);const auto value=digest.digest();if (length>value.size()*2) return invalid;
+            derived=crypto_kdf::capi_expand(hash,value,length);
+        }
+        memory.check(GuestAddress{arg(2)},length,Access::Write);memory.check(GuestAddress{arg(4)},4,Access::Write);
+        memory.write(GuestAddress{arg(2)},derived);memory.store(GuestAddress{arg(4)},32,derived.size());return 0;
     }
     if (symbol=="BCryptDeriveKey") {
         const auto found=runtime_.crypto_secrets.find(arg(0));if (found==runtime_.crypto_secrets.end()) return bad_handle;

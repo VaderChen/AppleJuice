@@ -135,6 +135,23 @@ if(APPLE)
   file(SHA256 "${CMAKE_SOURCE_DIR}/cmake/Glsl.cmake" glsl_resource_dependencies)
   string(SHA256 glsl_resource_revision "${glsl_resource_source}${glsl_resource_codec}${glsl_resource_schema}${glsl_resource_dependencies}")
   target_compile_definitions(x64arm_glsl PRIVATE "X64ARM_GLSL_RESOURCE_REVISION=\"${glsl_resource_revision}\"")
+  # 跨引擎更新保留相同轉譯器的結果；只以轉譯、格式及固定相依套件識別，避免每次連結 UUID 都重做。
+  file(GLOB shader_cache_patches CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/cmake/*.cmake")
+  set(shader_cache_sources src/services/d3d12_shader.cpp src/services/shader_memory_cache.cpp
+      src/services/shader_memory_cache.hpp include/x64arm/windows_graphics.hpp
+      src/platform/macos/metal_programmable.inc src/platform/macos/metal_programmable_types.inc
+      src/platform/macos/metal_shader_cache.inc ${shader_cache_patches})
+  set(shader_cache_identity "${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_BUILD_TYPE};${CMAKE_CXX_FLAGS};${CMAKE_CXX_FLAGS_RELEASE}")
+  foreach(shader_cache_source IN LISTS shader_cache_sources)
+    if(NOT IS_ABSOLUTE "${shader_cache_source}")
+      set(shader_cache_source "${CMAKE_SOURCE_DIR}/${shader_cache_source}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${shader_cache_source}")
+    file(SHA256 "${shader_cache_source}" shader_cache_digest)
+    string(APPEND shader_cache_identity "${shader_cache_digest}")
+  endforeach()
+  string(SHA256 shader_cache_revision "${shader_cache_identity}")
+  target_compile_definitions(x64arm_glsl PRIVATE "X64ARM_SHADER_CACHE_REVISION=\"${shader_cache_revision}\"")
 endif()
 target_sources(x64arm_windows PRIVATE src/services/thread_context.cpp src/services/windows_thread_context.cpp)
 target_sources(x64arm_windows PRIVATE src/services/windows_remote_thread.cpp)

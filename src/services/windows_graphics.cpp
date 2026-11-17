@@ -198,6 +198,24 @@ std::vector<std::uint8_t> graphics_signature_blob(std::span<const std::uint8_t> 
         vkd3d_shader_free_shader_code(&output);vkd3d_shader_free_dxbc(&desc);return result;
     }catch(...){vkd3d_shader_free_shader_code(&output);vkd3d_shader_free_dxbc(&desc);throw;}
 }
+std::optional<std::vector<std::uint8_t>> graphics_dxbc_section(std::span<const std::uint8_t> bytes,std::uint32_t tag){
+    const vkd3d_shader_code input{bytes.data(),bytes.size()};vkd3d_shader_dxbc_desc desc{};
+    if(vkd3d_shader_parse_dxbc(&input,0,&desc,nullptr)<0)throw std::invalid_argument("DXBC 容器不合法");
+    std::optional<std::vector<std::uint8_t>> result;
+    for(std::size_t i=0;i<desc.section_count;++i)if(desc.sections[i].tag==tag){const auto* data=static_cast<const std::uint8_t*>(desc.sections[i].data.code);result.emplace(data,data+desc.sections[i].data.size);break;}
+    vkd3d_shader_free_dxbc(&desc);return result;
+}
+std::vector<std::uint8_t> graphics_dxbc_filter(std::span<const std::uint8_t> bytes,const std::function<bool(std::uint32_t)>& keep){
+    const vkd3d_shader_code input{bytes.data(),bytes.size()};vkd3d_shader_dxbc_desc desc{};
+    if(vkd3d_shader_parse_dxbc(&input,0,&desc,nullptr)<0)throw std::invalid_argument("DXBC 容器不合法");
+    vkd3d_shader_code output{};
+    try{
+        std::vector<vkd3d_shader_dxbc_section_desc> sections;for(std::size_t i=0;i<desc.section_count;++i)if(keep(desc.sections[i].tag))sections.push_back(desc.sections[i]);
+        if(vkd3d_shader_serialize_dxbc(sections.size(),sections.data(),&output,nullptr)<0)throw std::invalid_argument("DXBC 無法重新序列化");
+        const auto* data=static_cast<const std::uint8_t*>(output.code);std::vector<std::uint8_t> result(data,data+output.size);
+        vkd3d_shader_free_shader_code(&output);vkd3d_shader_free_dxbc(&desc);return result;
+    }catch(...){vkd3d_shader_free_shader_code(&output);vkd3d_shader_free_dxbc(&desc);throw;}
+}
 std::uint32_t graphics_format_bytes(std::uint32_t f){
     switch(f){
     case 1:case 2:case 3:case 4:return 16;

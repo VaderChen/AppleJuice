@@ -1,11 +1,14 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
 #include "automation_value.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
 #include <deque>
 #include <string>
+#include <vector>
 
 // oleaut32 純量轉換與 CY／DECIMAL 運算家族。
 // Var<T>From<S> 全部交給 VariantChangeType 共用的 number_convert（精確有理數、ties-to-even、溢位與 VARIANT_TRUE 規則），
@@ -43,6 +46,9 @@ std::span<const WindowsServiceDescriptor> oleaut32_conversion_service_descriptor
         add("VarDecCmpR8",2,2);add("VarR4CmpR8",2,2);add("VarR8Pow",3,3);add("VarR8Round",3,1);
         for(const auto name:{"VarAbs","VarFix","VarInt"})add(name,2);
         for(const auto name:{"VarRound","VarEqv","VarImp","VarCat","VarPow"})add(name,3);
+        // VB 格式化與 NUMPARSE（windows_oleaut32_format.inc）。
+        for(const auto name:{"VarFormatNumber","VarFormatPercent","VarFormatCurrency"})add(name,7);
+        add("VarFormatDateTime",4);add("VarParseNumFromStr",5);add("VarNumFromParseNum",4);
         return out;
     }();
     return table;
@@ -62,6 +68,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_oleaut32_conversion(GuestSt
         if(type==14){put(v,0,2,0);m.write(GuestAddress{pointer},std::span{v}.first(16));}
         else m.write(GuestAddress{pointer},std::span{v}.subspan(8,bytes));
     };
+    if(name.starts_with("VarFormat") || name=="VarParseNumFromStr" || name=="VarNumFromParseNum")return invoke_oleaut32_format(state,memory,service);
     const auto [target_name,source_name]=conversion_parts(name);
     const bool conversion=!target_name.empty() && (scalar_type(target_name).first || target_name=="Bstr") && (scalar_type(source_name).first || source_name=="Disp");
     if(conversion && source_name=="Disp"){
@@ -223,4 +230,5 @@ std::optional<std::uint32_t> WindowsServices::invoke_oleaut32_conversion(GuestSt
         if(!status)store_scalar(memory,output,out,own,own_bytes);return done(status);
     }catch(const std::invalid_argument&){return done(invalid);}catch(const MemoryFault&){return done(invalid);}catch(const std::bad_alloc&){return done(nomemory);}
 }
+#include "windows_oleaut32_format.inc"
 }

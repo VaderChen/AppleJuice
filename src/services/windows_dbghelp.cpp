@@ -1,5 +1,7 @@
+#include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "x64arm/windows_paths.hpp"
 #include <algorithm>
 #include <utility>
 
@@ -41,7 +43,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_stack_walk(GuestState& stat
     };
     try{
         if(!token){
-            const auto machine=static_cast<std::uint32_t>(arg(0));const bool amd64=machine==0x8664,wide=service.symbol=="StackWalk64";
+            const auto machine=static_cast<std::uint32_t>(arg(0));const bool amd64=machine==0x8664,extended=service.symbol=="StackWalkEx",wide=service.symbol=="StackWalk64" || extended;
+            // StackWalkEx：StackFrameSize 必須是 sizeof(STACKFRAME_EX)；SYM_STKWALK_FORCE_FRAMEPTR 只在 x86（本來就以 EBP 串列走訪）接受。
+            if(extended){const auto flags=static_cast<std::uint32_t>(arg(9));
+                if(!arg(3) || flags>1 || (flags && amd64)){last_error_=87;return finish(false);}
+                memory.check(GuestAddress{arg(3)},272,Access::Write);if(memory.load(GuestAddress{arg(3)+264},32)!=272){last_error_=87;return finish(false);}}
             if((machine!=0x14c && !amd64) || (amd64 && (x86_ || !wide || !arg(4))) || !arg(3) || (!arg(5) && !current_process_handle(arg(1))) || bridge.operations.size()>=128)return finish(false);
             memory.check(GuestAddress{arg(3)},frame_size(wide),Access::Read);memory.check(GuestAddress{arg(3)},frame_size(wide),Access::Write);
             const unsigned stride=wide?16U:12U,mode=wide?12U:8U,bits=wide?64U:32U;
@@ -138,13 +144,19 @@ std::span<const WindowsServiceDescriptor> dbghelp_service_descriptors() {
         {"dbghelp.dll","ImageNtHeader",1},{"dbghelp.dll","ImageDirectoryEntryToData",4},{"dbghelp.dll","ImageDirectoryEntryToDataEx",5},
         {"dbghelp.dll","ImageRvaToSection",3},{"dbghelp.dll","ImageRvaToVa",4},
         {"imagehlp.dll","MapAndLoad",5},{"imagehlp.dll","UnMapAndLoad",1},
+        {"imagehlp.dll","CheckSumMappedFile",4},{"imagehlp.dll","MapFileAndCheckSumA",3},{"imagehlp.dll","MapFileAndCheckSumW",3},
+        {"imagehlp.dll","GetImageUnusedHeaderBytes",2},{"imagehlp.dll","ImageLoad",2},{"imagehlp.dll","ImageUnload",1},{"imagehlp.dll","TouchFileTimes",2},
+        {"dbghelp.dll","FindExecutableImage",3},{"dbghelp.dll","FindExecutableImageEx",5},{"dbghelp.dll","FindExecutableImageExW",5},
+        {"dbghelp.dll","FindDebugInfoFile",3},{"dbghelp.dll","FindDebugInfoFileEx",5},
         {"dbghelp.dll","SymInitialize",3},{"dbghelp.dll","SymInitializeW",3},
         {"dbghelp.dll","SymCleanup",1},{"dbghelp.dll","SymRefreshModuleList",1},
         {"dbghelp.dll","SymSetSearchPath",2},{"dbghelp.dll","SymSetSearchPathW",2},
         {"dbghelp.dll","SymGetSearchPath",3},{"dbghelp.dll","SymGetSearchPathW",3},
         {"dbghelp.dll","SymGetModuleBase64",2,2},{"dbghelp.dll","SymFunctionTableAccess64",2,2},
         {"dbghelp.dll","SymFromAddr",4,2},{"dbghelp.dll","SymFromAddrW",4,2},
-        {"dbghelp.dll","SymGetLineFromAddr64",4,2},{"dbghelp.dll","SymGetLineFromAddrW64",4,2}
+        {"dbghelp.dll","SymGetLineFromAddr64",4,2},{"dbghelp.dll","SymGetLineFromAddrW64",4,2},
+        // StackWalkEx：STACKFRAME_EX（STACKFRAME64 之後加 StackFrameSize、InlineFrameContext），第 10 個參數為旗標。
+        {"dbghelp.dll","StackWalkEx",10,0,0,0x201}
     };
     return table;
 }
@@ -152,7 +164,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp(GuestState& state,G
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     if(name=="MiniDumpWriteDump" || name=="MiniDumpReadDumpStream")return invoke_minidump(state,memory,service);
     if(name=="UnDecorateSymbolName" || name=="UnDecorateSymbolNameW")return invoke_demangle(state,memory,service);
-    if(name=="StackWalk64" || name=="StackWalk")return invoke_stack_walk(state,memory,service);
+    if(name=="StackWalk64" || name=="StackWalk" || name=="StackWalkEx")return invoke_stack_walk(state,memory,service);
+    // 不需要 SymInitialize 工作階段的符號輔助函式直接交給符號服務。
+    if(name.starts_with("SymUnDName") || name.starts_with("SymMatchString") || name=="SymGetExtendedOption" || name=="SymSetExtendedOption" || name=="SymSetParentWindow" ||
+       name=="GetTimestampForLoadedLibrary" || name=="MakeSureDirectoryPathExists" || name.starts_with("SearchTreeForFile"))return invoke_dbghelp_symbols(state,memory,service);
     const bool wide=name.ends_with('W') || name.ends_with("W64");
     std::uint64_t result=0;
     const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
@@ -219,6 +234,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp(GuestState& state,G
         memory.store(GuestAddress{image+size_at},32,size);
         arg.return_to(state,1);return std::nullopt;
     }
+#include "windows_imagehlp_tools.inc"
     if(name.starts_with("Image") && !name.starts_with("Imagehlp")){
         // PE 標頭工具（ImagehlpApiVersion* 是版本查詢，不屬此類）：呼叫端傳入已映射的映像或檔案 view；非 PE 回 NULL 與 ERROR_BAD_EXE_FORMAT。
         const auto nt_header=[&](std::uint64_t base)->std::uint64_t{

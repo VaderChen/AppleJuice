@@ -807,14 +807,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
         if (found==runtime_.environment_blocks.end() || found->second!=wide) last_error_=87;
         else {free_heap(memory,arg(0),state);runtime_.environment_blocks.erase(found);result=1;}
     } else if (symbol.starts_with("ExpandEnvironmentStrings")) {
-        const auto source=text(0);std::u16string expanded;
-        for (std::size_t at=0;at<source.size();) {
-            if (source[at]!=u'%') {expanded.push_back(source[at++]);continue;}
-            const auto end=source.find(u'%',at+1);if (end==std::u16string::npos) {expanded.append(source.substr(at));break;}
-            const auto found=runtime_.environment.find(environment_key(source.substr(at+1,end-at-1)));
-            expanded.append(found==runtime_.environment.end()?source.substr(at,end-at+1):found->second.second);at=end+1;
-            if (expanded.size()>32767) throw HostCallFault("展開的環境變數字串超過上限");
-        }
+        std::u16string expanded;
+        try{expanded=expand_guest_environment(text(0),runtime_.environment);}
+        catch(const std::length_error& error){throw HostCallFault(error.what());}
         const auto bytes=encode(expanded);result=bytes.size()/(wide?2U:1U);
         if (static_cast<std::uint32_t>(arg(2))>=result) memory.write(GuestAddress{arg(1)},bytes);
     }

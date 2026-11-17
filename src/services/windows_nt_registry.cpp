@@ -24,19 +24,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_registry(GuestState& sta
     const auto finish=[&](std::uint32_t status){arg.return_to(state,status);return std::optional<std::uint32_t>{};};
     if(symbol=="NtClose"){
         if(const auto flags=runtime_.handle_flags.find(arg(0));flags!=runtime_.handle_flags.end() && (flags->second&2U))return finish(0xc0000235U);
-        if(registry.handles.erase(arg(0))){runtime_.handle_flags.erase(arg(0));poll_registry_notifications(false,{},0,&memory);return finish(0);}
+        if(registry.handles.erase(arg(0))){runtime_.handle_flags.erase(arg(0));if(!app_hives_.empty())release_app_hives();poll_registry_notifications(false,{},0,&memory);return finish(0);}
         start_callbacks(state,memory,{{resolve("internal-nt-file","CloseHandle").value,{arg(0)}}},Continuation::NtCloseResult);return std::nullopt;
     }
     if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
     const bool readonly=symbol.starts_with("NtOpen") || symbol.starts_with("NtQuery") || symbol.starts_with("NtEnumerate") || symbol=="NtFlushKey";
     RegistryTransaction transaction(registry,registry_file_,&registry_store_cache_,readonly);if(transaction.error)return finish(native_io_error(transaction.error));
+    restore_app_hives(registry);
     refresh_processor_registry(registry,memory.processor_count(),guest_processor_information(memory));
     refresh_vc_runtime_registry(registry);
     initialize_registry_views(registry);
     poll_registry_notifications(false,{},0,&memory);bool changed=false;std::vector<std::pair<std::u16string,std::uint32_t>> mutations;
     const auto original=registry_file_.empty() || readonly?RegistryState{}:registry;
     const auto done=[&](std::uint32_t status){
-        if(!status && changed){status=native_io_error(commit_registry_transaction(transaction));if(status && !registry_file_.empty())registry=original;}
+        if(!status && changed){status=native_io_error(commit_registry_transaction(transaction));if(status && !registry_file_.empty())registry=original;if(!status && !app_hives_.empty())status=native_io_error(persist_app_hives());}
         if(!status){for(const auto& [path,filter]:mutations)poll_registry_notifications(false,path,filter,&memory);poll_registry_notifications(false,{},0,&memory);}
         return finish(status);
     };
@@ -56,7 +57,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_registry(GuestState& sta
         registry.keys.try_emplace(user_hive);registry.display_names[user_hive]=user_sid;
         const auto canonical=[&](const std::u16string& path){return path==user_hive || path.starts_with(user_hive+u"\\")?std::u16string(1,1)+path.substr(user_hive.size()):path;};
         const auto display_path=[&](const std::u16string& path){
-            std::u16string result=path[0]==1?u"\\REGISTRY\\USER\\"+user_sid:path[0]==2?u"\\REGISTRY\\MACHINE":path[0]==3?u"\\REGISTRY\\USER":u"";
+            std::u16string result=path[0]==1?u"\\REGISTRY\\USER\\"+user_sid:path[0]==2?u"\\REGISTRY\\MACHINE":path[0]==3?u"\\REGISTRY\\USER":path[0]==0x0a?u"\\REGISTRY\\A":u"";
             if(result.empty())throw NativeRegistryError{unsupported};
             for(std::size_t start=2;start<path.size();){const auto end=path.find(u'\\',start),stop=end==path.npos?path.size():end;
                 const auto key=path.substr(0,stop);const auto named=registry.display_names.find(key);result+=u'\\';result+=named==registry.display_names.end()?path.substr(start,stop-start):named->second;
@@ -133,6 +134,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_registry(GuestState& sta
             }
             return done(0);
         }
+        if(symbol=="NtRenameKey"){const auto status=rename_registry_key(handle,string(arg(1)),mutations);if(!status)changed=true;return done(status);}
         if(symbol=="NtFlushKey"){if(!(handle.access&1U))return done(denied);if(const auto error=flush_registry_hives())return done(native_io_error(error));return done(native_io_error(transaction.flush()));}
         if(symbol=="NtDeleteKey"){
             if(registry.hives.contains(handle.path))return done(denied);

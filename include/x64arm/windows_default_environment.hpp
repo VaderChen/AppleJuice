@@ -3,9 +3,25 @@
 #include <string>
 #include <array>
 #include <optional>
+#include <stdexcept>
 #include "x64arm/unicode.hpp"
 namespace x64arm {
 using GuestEnvironment=std::map<std::u16string,std::pair<std::u16string,std::u16string>>;
+// 環境名稱與 Win32 共用 ASCII 大小寫契約；未知名稱保留原文，不遞迴展開。
+inline std::u16string expand_guest_environment(std::u16string_view source,const GuestEnvironment& environment){
+    std::u16string result;
+    for(std::size_t at=0;at<source.size();){
+        if(source[at]!=u'%')result.push_back(source[at++]);
+        else {
+            const auto end=source.find(u'%',at+1);if(end==source.npos){result.append(source.substr(at));break;}
+            auto key=std::u16string(source.substr(at+1,end-at-1));for(auto& c:key)if(c>=u'a' && c<=u'z')c=static_cast<char16_t>(c-32);
+            const auto value=environment.find(key);result.append(value==environment.end()?source.substr(at,end-at+1):std::u16string_view(value->second.second));at=end+1;
+        }
+        if(result.size()>32767)throw std::length_error("展開的環境變數字串超過上限");
+    }
+    if(result.size()>32767)throw std::length_error("展開的環境變數字串超過上限");
+    return result;
+}
 inline GuestEnvironment guest_default_environment(bool user){
     GuestEnvironment values;
     const auto add=[&](const char16_t* name,const char16_t* value){std::u16string key=name;for(auto& c:key)if(c>=u'a' && c<=u'z')c=static_cast<char16_t>(c-32);values[key]={name,value};};

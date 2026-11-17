@@ -32,6 +32,8 @@ ParsedUrl parse(std::u16string_view url){
 std::span<const WindowsServiceDescriptor> url_security_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"urlmon.dll","CoInternetCreateSecurityManager",3},
+        {"urlmon.dll","CoInternetParseUrl",7},{"urlmon.dll","CoInternetCombineUrl",7},{"urlmon.dll","CoInternetCompareUrl",3},{"urlmon.dll","IsValidURL",3},
+        {"urlmon.dll","FindMimeFromData",8},{"urlmon.dll","ObtainUserAgentString",3},{"urlmon.dll","UrlMkGetSessionOption",5},{"urlmon.dll","UrlMkSetSessionOption",4},
         {"internal-url-security","QueryInterface",3},{"internal-url-security","AddRef",1},{"internal-url-security","Release",1},
         {"internal-url-security","SetSecuritySite",2},{"internal-url-security","GetSecuritySite",2},{"internal-url-security","MapUrlToZone",4},
         {"internal-url-security","GetSecurityId",5},{"internal-url-security","ProcessUrlAction",9},{"internal-url-security","QueryCustomPolicy",8},
@@ -77,6 +79,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_url_security(GuestState& st
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto finish=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     try{
+#include "windows_urlmon_tools.inc"
         if(name=="CoInternetCreateSecurityManager"){
             if(!arg(1))return finish(pointer_error);memory.check(GuestAddress{arg(1)},unit,Access::Write);memory.store(GuestAddress{arg(1)},bits,0);
             if(arg(2))return finish(invalid);

@@ -18,16 +18,7 @@
                     RegistryValue value;value.type=1;value.display_name=u"PortName";value.bytes=utf16_bytes(node.port_name);add(u"PortName",value);
                 }
                 if(driver && node.guid==display_identity::class_guid){
-                    const auto text_value=[&](std::u16string key,std::u16string_view value){RegistryValue data;data.type=1;data.display_name=key;data.bytes=utf16_bytes(value);add(std::move(key),data);};
-                    text_value(u"DriverVersion",display_identity::version);text_value(u"DriverDate",display_identity::date);text_value(u"ProviderName",display_identity::provider);
-                    // 與 Windows 顯示驅動鍵相同的欄位：DriverDateData（FILETIME）、DriverDesc、MatchingDeviceId 與 HardwareInformation.*。
-                    const auto binary_value=[&](std::u16string key,std::vector<std::uint8_t> bytes,std::uint32_t type){RegistryValue data;data.type=type;data.display_name=key;data.bytes=std::move(bytes);add(std::move(key),data);};
-                    std::vector<std::uint8_t> date(8);for(unsigned i=0;i<8;++i)date[i]=static_cast<std::uint8_t>(display_identity::date_filetime>>(i*8));binary_value(u"DriverDateData",date,3);
-                    const auto description=property_text(node,1);text_value(u"DriverDesc",description);text_value(u"MatchingDeviceId",folded(std::u16string(display_identity::adapter_hardware_id)));
-                    auto wide=[&](std::u16string_view text){auto bytes=utf16_bytes(text);bytes.push_back(0);bytes.push_back(0);return bytes;};
-                    binary_value(u"HardwareInformation.AdapterString",wide(display_identity::adapter_name),3);binary_value(u"HardwareInformation.ChipType",wide(description),3);
-                    binary_value(u"HardwareInformation.DacType",wide(u"Integrated RAMDAC"),3);binary_value(u"HardwareInformation.BiosString",wide(u""),3);
-                    std::vector<std::uint8_t> size(8);const auto shared=gpu_memory_stats().limit;for(unsigned i=0;i<8;++i)size[i]=static_cast<std::uint8_t>(shared>>(i*8));binary_value(u"HardwareInformation.qwMemorySize",size,11);
+                    for(const auto& [key,value]:display_identity::driver_registry_values(property_text(node,1),gpu_memory_stats().limit))add(key,value);
                 }
                 if(additions.empty() && existing!=registry.keys.end()){transaction.unchanged();return 0;}
                 if(registry.bytes+added>output_limit || registry.values+additions.size()>4096 || registry.keys.size()+12>4096)return 8;

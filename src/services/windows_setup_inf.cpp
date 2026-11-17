@@ -10,6 +10,10 @@
 #include <set>
 #include <memory>
 #include <optional>
+#include <tuple>
+#include "service_callback_task.hpp"
+#include "lz_compression.hpp"
+#include "cabinet_archive.hpp"
 
 // SetupAPI 的 INF 解析家族：以宿主原生解析器保存 HINF（可附加多個 INF），INFCONTEXT 為 {Inf, CurrentInf, Section, Line}。
 // 欄位讀取時才做 %strkey%（[Strings] 與 [Strings.0009]／[Strings.0409] 覆寫）與 %dirid% 代換；引號內的文字不代換。
@@ -20,7 +24,9 @@ struct SetupInfState {
     struct Line {Field key;bool keyed{};std::vector<Field> fields;};
     struct Section {std::u16string name;std::vector<Line> lines;};
     struct File {std::u16string path;std::uint32_t style{};std::map<std::u16string,Section> sections;std::vector<std::u16string> order;};
-    struct Handle {std::vector<File> files;std::map<std::u16string,std::uint32_t> section_ids;std::vector<std::u16string> section_names;};
+    // dirids：SetupSetDirectoryId 設定的使用者 DIRID（0x8000 以上）；field_cache：pSetupGetField 回傳的欄位複本（附加檔案、區段、行、欄位 → 程序堆積位址），關閉 INF 時釋放。
+    struct Handle {std::vector<File> files;std::map<std::u16string,std::uint32_t> section_ids;std::vector<std::u16string> section_names;std::map<std::uint32_t,std::u16string> dirids;
+        std::map<std::tuple<std::size_t,std::uint32_t,std::uint32_t,std::uint32_t>,std::uint64_t> field_cache;};
     std::map<std::uint64_t,Handle> handles;
     // 字串表（windows_setup_string_table.inc）：handle 為程序堆積位址；Entry 保存字串、客體堆積複本與附加資料。
     struct StringTable {struct Entry {std::u16string text;std::uint64_t guest{};std::vector<std::uint8_t> extra;};std::uint32_t max_extra{};std::vector<Entry> entries;};
@@ -33,6 +39,17 @@ struct SetupInfState {
         std::u16string path;std::uint32_t flags{};std::vector<Section> sections;};
     std::map<std::uint64_t,FileLog> file_logs;
     bool log_open{};
+    // 檔案佇列與預設佇列回呼（windows_setup_file_queue.inc）；handle 與回呼內容都是程序堆積位址。
+    // 複製項目保留未組合的來源根目錄、子路徑與檔名（提交時才依 SP_COPY_SOURCE*_ABSOLUTE 與換片結果組合）；刪除只用 target。
+    struct QueuedCopy {std::u16string root,path,file,description,tagfile,target_directory,target_file,security;std::uint32_t style{};};
+    struct QueuedPath {std::u16string source,target;};
+    struct FileQueue {std::vector<QueuedCopy> copies;std::vector<QueuedPath> renames,deletes;std::uint32_t flags{},private_flags{};
+        std::vector<std::uint8_t> platform;std::u16string catalog;};
+    std::map<std::uint64_t,FileQueue> file_queues;
+    struct QueueCallback {std::uint64_t owner{},progress{};std::uint32_t message{};bool quiet{};};
+    std::map<std::uint64_t,QueueCallback> queue_callbacks;
+    // SRCLIST_TEMPORARY 設定的本程序安裝來源清單（windows_setup_install.inc）。
+    std::optional<std::vector<std::u16string>> temporary_sources;
 };
 namespace {
 using driver_store::fold;
@@ -141,7 +158,45 @@ std::span<const WindowsServiceDescriptor> setup_inf_service_descriptors(){
         {"setupapi.dll","SetupInitializeFileLogA",2,0,0,0x2},{"setupapi.dll","SetupInitializeFileLogW",2,0,0,0x2},{"setupapi.dll","SetupTerminateFileLog",1},
         {"setupapi.dll","SetupLogFileA",9,0,0,0x110},{"setupapi.dll","SetupLogFileW",9,0,0,0x110},{"setupapi.dll","SetupQueryFileLogA",7,0,0,0x28},{"setupapi.dll","SetupQueryFileLogW",7,0,0,0x28},
         {"setupapi.dll","SetupRemoveFileLogEntryA",3},{"setupapi.dll","SetupRemoveFileLogEntryW",3},
-        {"setupapi.dll","SetupGetNonInteractiveMode",0},{"setupapi.dll","SetupSetNonInteractiveMode",1,0,0,0x1}};
+        {"setupapi.dll","SetupGetNonInteractiveMode",0},{"setupapi.dll","SetupSetNonInteractiveMode",1,0,0,0x1},
+        // 檔案佇列、預設佇列回呼與提示對話框（windows_setup_file_queue.inc）
+        {"setupapi.dll","SetupOpenFileQueue",0},{"setupapi.dll","SetupCloseFileQueue",1},{"setupapi.dll","SetupQueueCopyA",9,0,0,0x100},{"setupapi.dll","SetupQueueCopyW",9,0,0,0x100},
+        {"setupapi.dll","SetupQueueCopyIndirectA",1},{"setupapi.dll","SetupQueueCopyIndirectW",1},{"setupapi.dll","SetupQueueDefaultCopyA",6,0,0,0x20},{"setupapi.dll","SetupQueueDefaultCopyW",6,0,0,0x20},
+        {"setupapi.dll","SetupQueueCopySectionA",6,0,0,0x20},{"setupapi.dll","SetupQueueCopySectionW",6,0,0,0x20},{"setupapi.dll","SetupQueueDeleteA",3},{"setupapi.dll","SetupQueueDeleteW",3},
+        {"setupapi.dll","SetupQueueDeleteSectionA",4},{"setupapi.dll","SetupQueueDeleteSectionW",4},{"setupapi.dll","SetupQueueRenameA",5},{"setupapi.dll","SetupQueueRenameW",5},
+        {"setupapi.dll","SetupQueueRenameSectionA",4},{"setupapi.dll","SetupQueueRenameSectionW",4},{"setupapi.dll","SetupGetFileQueueCount",3,0,0,0x2},{"setupapi.dll","SetupGetFileQueueFlags",2},
+        {"setupapi.dll","SetupSetFileQueueFlags",3,0,0,0x6},{"setupapi.dll","pSetupGetQueueFlags",1},{"setupapi.dll","pSetupSetQueueFlags",2,0,0,0x2},
+        {"setupapi.dll","SetupSetFileQueueAlternatePlatformA",3},{"setupapi.dll","SetupSetFileQueueAlternatePlatformW",3},
+        {"setupapi.dll","SetupScanFileQueueA",6,0,0,0x2},{"setupapi.dll","SetupScanFileQueueW",6,0,0,0x2},
+        {"setupapi.dll","SetupCommitFileQueue",4},{"setupapi.dll","SetupCommitFileQueueA",4},{"setupapi.dll","SetupCommitFileQueueW",4},
+        {"setupapi.dll","SetupInitDefaultQueueCallback",1},{"setupapi.dll","SetupInitDefaultQueueCallbackEx",5,0,0,0xc},{"setupapi.dll","SetupTermDefaultQueueCallback",1},
+        {"setupapi.dll","SetupDefaultQueueCallbackA",4,0,0,0x2},{"setupapi.dll","SetupDefaultQueueCallbackW",4,0,0,0x2},
+        {"setupapi.dll","SetupPromptForDiskA",10,0,0,0x140},{"setupapi.dll","SetupPromptForDiskW",10,0,0,0x140},
+        {"setupapi.dll","SetupCopyErrorA",11,0,0,0x2c0},{"setupapi.dll","SetupCopyErrorW",11,0,0,0x2c0},
+        {"setupapi.dll","SetupDeleteErrorA",5,0,0,0x18},{"setupapi.dll","SetupDeleteErrorW",5,0,0,0x18},
+        {"setupapi.dll","SetupRenameErrorA",6,0,0,0x30},{"setupapi.dll","SetupRenameErrorW",6,0,0,0x30},
+        // INF 安裝與解壓（windows_setup_install.inc）
+        {"setupapi.dll","SetupSetDirectoryIdA",3,0,0,0x2},{"setupapi.dll","SetupSetDirectoryIdW",3,0,0,0x2},
+        {"setupapi.dll","SetupGetFileCompressionInfoA",5},{"setupapi.dll","SetupGetFileCompressionInfoW",5},
+        {"setupapi.dll","SetupGetFileCompressionInfoExA",7,0,0,0x4},{"setupapi.dll","SetupGetFileCompressionInfoExW",7,0,0,0x4},
+        {"setupapi.dll","SetupDecompressOrCopyFileA",3},{"setupapi.dll","SetupDecompressOrCopyFileW",3},
+        {"setupapi.dll","SetupIterateCabinetA",4,0,0,0x2},{"setupapi.dll","SetupIterateCabinetW",4,0,0,0x2},
+        {"setupapi.dll","SetupInstallFileA",8,0,0,0x20},{"setupapi.dll","SetupInstallFileW",8,0,0,0x20},
+        {"setupapi.dll","SetupInstallFileExA",9,0,0,0x20},{"setupapi.dll","SetupInstallFileExW",9,0,0,0x20},
+        {"setupapi.dll","SetupInstallFilesFromInfSectionA",6,0,0,0x20},{"setupapi.dll","SetupInstallFilesFromInfSectionW",6,0,0,0x20},
+        {"setupapi.dll","SetupPromptReboot",3,0,0,0x4},
+        {"setupapi.dll","SetupAddToSourceListA",2,0,0,0x1},{"setupapi.dll","SetupAddToSourceListW",2,0,0,0x1},
+        {"setupapi.dll","SetupSetSourceListA",3,0,0,0x5},{"setupapi.dll","SetupSetSourceListW",3,0,0,0x5},
+        {"setupapi.dll","SetupAddInstallSectionToDiskSpaceListA",6,0,0,0x20},{"setupapi.dll","SetupAddInstallSectionToDiskSpaceListW",6,0,0,0x20},
+        // INF 安裝區段、服務安裝與 rundll32 入口（windows_setup_sections.inc）
+        {"setupapi.dll","SetupInstallFromInfSectionA",11,0,0,0x48},{"setupapi.dll","SetupInstallFromInfSectionW",11,0,0,0x48},
+        {"setupapi.dll","SetupInstallServicesFromInfSectionA",3,0,0,0x4},{"setupapi.dll","SetupInstallServicesFromInfSectionW",3,0,0,0x4},
+        {"setupapi.dll","InstallHinfSection",4,0,0,0x8},{"setupapi.dll","InstallHinfSectionA",4,0,0,0x8},{"setupapi.dll","InstallHinfSectionW",4,0,0,0x8},
+        // 公用輔助函式（windows_setup_helpers.inc）
+        {"setupapi.dll","AssertFail",3,0,0,0x2},{"setupapi.dll","DelayedMove",2},{"setupapi.dll","DoesUserHavePrivilege",1},{"setupapi.dll","EnablePrivilege",2,0,0,0x2},
+        {"setupapi.dll","OpenAndMapFileForRead",5},{"setupapi.dll","UnmapAndCloseFile",3},{"setupapi.dll","QueryRegistryValue",5},{"setupapi.dll","RegistryDelnode",2},
+        {"setupapi.dll","RetreiveFileSecurity",2},{"setupapi.dll","StampFileSecurity",2},{"setupapi.dll","TakeOwnershipOfFile",1},{"setupapi.dll","pSetupGetField",2,0,0,0x2},
+        {"setupapi.dll","InstallCatalog",3},{"setupapi.dll","pSetupInstallCatalog",3}};
     return table;
 }
 
@@ -192,18 +247,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_setup_inf(GuestState& state
         default:return std::nullopt;
         }
     };
+    // 使用者 DIRID（SetupSetDirectoryId）優先於標準 DIRID。
+    const auto handle_dirid=[&](const State::Handle& handle,std::int64_t id,const State::File& file)->std::optional<std::u16string>{
+        if(id>=0x8000 && id<=0xffff)if(const auto found=handle.dirids.find(static_cast<std::uint32_t>(id));found!=handle.dirids.end())return found->second;
+        return dirid(id,file);
+    };
     const auto substitute=[&](const State::Handle& handle,const State::File& file,const std::u16string& text){
         std::u16string result;
         for(std::size_t i=0;i<text.size();){
             if(text[i]!=u'%'){result+=text[i++];continue;}
             const auto close=text.find(u'%',i+1);if(close==text.npos){result+=text.substr(i);break;}
             if(close==i+1){result+=u'%';i=close+1;continue;}
-            const auto token=text.substr(i+1,close-i-1);
+            const auto token=text.substr(i+1,close-i-1);bool skip_separator=false;
             if(const auto value=string_value(handle,fold(token)))result+=*value;
-            else if(const auto number=driver_store::number(token); number && !token.empty()){if(const auto path=dirid(static_cast<std::int64_t>(*number),file))result+=*path;else result+=text.substr(i,close-i+1);}
+            else if(const auto number=driver_store::number(token); number && !token.empty()){
+                // 展開成根目錄（例如 DIRID 24＝C:\\）且後面接分隔字元時只保留一個分隔字元。
+                if(const auto path=handle_dirid(handle,static_cast<std::int64_t>(*number),file)){result+=*path;if(!path->empty() && path->back()==u'\\' && close+1<text.size() && (text[close+1]==u'\\' || text[close+1]==u'/'))skip_separator=true;}
+                else result+=text.substr(i,close-i+1);
+            }
             else if(token==u"-1")result+=u"";
             else result+=text.substr(i,close-i+1);
-            i=close+1;
+            i=close+1+(skip_separator?1:0);
         }
         return result;
     };
@@ -247,6 +311,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_setup_inf(GuestState& state
         for(const auto& candidate:{base+suffix,base+u".nt"}){if(section_exists(handle,section_id(handle,candidate)))return candidate;}
         return base;
     };
+    // [SourceDisksNames]／[SourceDisksFiles] 以 .amd64 等平台字尾裝飾；[DestinationDirs] 不裝飾。
+    const auto first_line=[&](State::Handle& handle,std::uint64_t inf,const std::u16string& section,const std::u16string& key,bool platform)->std::optional<Context>{
+        auto chosen=section;if(platform && section_exists(handle,section_id(handle,section+u".amd64")))chosen=section+u".amd64";
+        return search(handle,inf,section_id(handle,chosen),0,0,fold(key));
+    };
+    const auto line_field=[&](const Context& context,std::size_t at)->std::u16string{auto [h,file,line]=context_line(context);if(at>=line.fields.size())return {};return field_text(h,file,line.fields[at]);};
+    // SetupGetTargetPath 與檔案佇列共用：[DestinationDirs] 的 dirid[,子目錄]，沒有項目時用 DefaultDestDir，再退回 DIRID 11；dirid 無效為 ERROR_INVALID_DATA。
+    const auto destination_of=[&](State::Handle& handle,std::uint64_t inf,const std::u16string& section)->std::u16string{
+        std::optional<Context> found;if(!section.empty())found=first_line(handle,inf,u"DestinationDirs",section,false);if(!found)found=first_line(handle,inf,u"DestinationDirs",u"DefaultDestDir",false);
+        std::u16string path=u"C:\\Windows\\System32";
+        if(found){
+            const auto number=driver_store::number(line_field(*found,0));auto [h,owner,line]=context_line(*found);(void)h;(void)line;
+            if(!number)throw Failure{13};const auto base=handle_dirid(handle,static_cast<std::int64_t>(static_cast<std::int32_t>(*number)),owner);if(!base)throw Failure{13};path=*base;
+            // 子目錄接在 dirid 之後；dirid 為根目錄（例如 24＝C:\\）時不重複分隔字元。
+            if(auto sub=line_field(*found,1);!sub.empty()){while(!sub.empty() && (sub.front()==u'\\' || sub.front()==u'/'))sub.erase(0,1);path=path.empty()?sub:path.back()==u'\\'?path+sub:path+u"\\"+sub;}
+        }
+        return path;
+    };
+    // 提示與錯誤對話框回傳 DPROMPT_*：一般失敗為 DPROMPT_CANCEL，記憶體不足為 DPROMPT_OUTOFMEMORY。
+    const bool failure_dialog=name.starts_with("SetupPromptForDisk") || name.starts_with("SetupCopyError") || name.starts_with("SetupDeleteError") || name.starts_with("SetupRenameError");
     try{
         if(name=="SetupOpenInfFileA" || name=="SetupOpenInfFileW" || name=="SetupOpenMasterInf"){
             // (FileName, InfClass, InfStyle, ErrorLine)：INF_STYLE_OLDNT＝1、INF_STYLE_WIN4＝2，快取旗標不影響結果。
@@ -279,7 +363,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_setup_inf(GuestState& state
             for(auto& file:files)handle.files.push_back(std::move(file));
             return succeed();
         }
-        if(name=="SetupCloseInfFile"){if(const auto found=handles.find(arg(0));found!=handles.end()){handles.erase(found);(void)free_heap(memory,arg(0),state);}return finish(0);}
+        if(name=="SetupCloseInfFile"){if(const auto found=handles.find(arg(0));found!=handles.end()){for(const auto& [field,copy]:found->second.field_cache){(void)field;(void)free_heap(memory,copy,state);}handles.erase(found);(void)free_heap(memory,arg(0),state);}return finish(0);}
         if(name.starts_with("SetupEnumInfSections")){
             // (InfHandle, Index, Buffer, Size, SizeNeeded)：依首次出現的順序列出全部附加 INF 的區段名稱。
             auto& handle=find_handle(arg(0));std::vector<std::u16string> seen,names;
@@ -398,16 +482,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_setup_inf(GuestState& state
         }
         if(name.starts_with("SetupGetSourceInfo") || name.starts_with("SetupGetSourceFileLocation") || name.starts_with("SetupGetTargetPath")){
             auto& handle=find_handle(arg(0));
-            // [SourceDisksNames]／[SourceDisksFiles] 以 .amd64 等平台字尾裝飾；[DestinationDirs] 不裝飾。
-            const auto first_line=[&](const std::u16string& section,const std::u16string& key,bool platform)->std::optional<Context>{
-                auto chosen=section;if(platform && section_exists(handle,section_id(handle,section+u".amd64")))chosen=section+u".amd64";
-                return search(handle,arg(0),section_id(handle,chosen),0,0,fold(key));
-            };
-            const auto line_field=[&](const Context& context,std::size_t at)->std::u16string{auto [h,file,line]=context_line(context);if(at>=line.fields.size())return {};return field_text(h,file,line.fields[at]);};
             if(name.starts_with("SetupGetSourceInfo")){
                 // (InfHandle, SourceId, InfoDesired, ReturnBuffer, ReturnBufferSize, RequiredSize)：[SourceDisksNames] 的描述、標記檔、路徑與旗標。
                 const auto info=static_cast<std::uint32_t>(arg(2));if(info<1 || info>5)return fail(87);
-                const auto found=first_line(u"SourceDisksNames",utf8_to_utf16(std::to_string(static_cast<std::uint32_t>(arg(1)))),true);if(!found)return fail(line_not_found);
+                const auto found=first_line(handle,arg(0),u"SourceDisksNames",utf8_to_utf16(std::to_string(static_cast<std::uint32_t>(arg(1)))),true);if(!found)return fail(line_not_found);
                 constexpr std::array<std::size_t,5> columns{3,1,0,4,5};
                 return output(arg(3),arg(4),arg(5),encoded(line_field(*found,columns[info-1])));
             }
@@ -416,7 +494,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_setup_inf(GuestState& state
                 std::u16string file;
                 if(arg(1)){auto [h,owner,line]=context_line(read_context(arg(1)));file=line.fields.size()>1 && !line.fields[1].empty()?field_text(h,owner,line.fields[1]):line.fields.empty()?std::u16string{}:field_text(h,owner,line.fields.front());}
                 else if(arg(2))file=read_text(arg(2));else return fail(87);
-                if(!arg(3))return fail(87);const auto found=first_line(u"SourceDisksFiles",file,true);if(!found)return fail(line_not_found);
+                if(!arg(3))return fail(87);const auto found=first_line(handle,arg(0),u"SourceDisksFiles",file,true);if(!found)return fail(line_not_found);
                 const auto id=driver_store::number(line_field(*found,0));if(!id)return fail(13);memory.check(GuestAddress{arg(3)},4,Access::Write);memory.store(GuestAddress{arg(3)},32,*id);
                 return output(arg(4),arg(5),arg(6),encoded(line_field(*found,1)));
             }
@@ -424,14 +502,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_setup_inf(GuestState& state
             std::u16string section;
             if(arg(1)){const auto context=read_context(arg(1));auto& owner=find_handle(context.inf);if(context.section>=owner.section_names.size())return fail(87);section=owner.section_names[context.section];}
             else if(arg(2))section=read_text(arg(2));
-            std::optional<Context> found;if(!section.empty())found=first_line(u"DestinationDirs",section,false);if(!found)found=first_line(u"DestinationDirs",u"DefaultDestDir",false);
-            std::u16string path=u"C:\\Windows\\System32";
-            if(found){
-                const auto number=driver_store::number(line_field(*found,0));auto [h,owner,line]=context_line(*found);(void)h;(void)line;
-                if(number){const auto base=dirid(static_cast<std::int64_t>(static_cast<std::int32_t>(*number)),owner);if(!base)return fail(13);path=*base;}else return fail(13);
-                if(const auto sub=line_field(*found,1);!sub.empty())path=path.empty()?sub:path+u"\\"+sub;
-            }
-            return output(arg(3),arg(4),arg(5),encoded(path));
+            return output(arg(3),arg(4),arg(5),encoded(destination_of(handle,arg(0),section)));
         }
         if(name.starts_with("SetupDiGetINFClass")){
             // (InfName, ClassGuid, ClassName, ClassNameSize, RequiredSize)：讀 [Version] 的 Class 與 ClassGUID（沒有 GUID 時為 GUID_NULL）。
@@ -463,13 +534,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_setup_inf(GuestState& state
         }
 #include "windows_setup_string_table.inc"
 #include "windows_setup_disk_log.inc"
+#include "windows_setup_file_queue.inc"
+#include "windows_setup_install.inc"
+#include "windows_setup_sections.inc"
+#include "windows_setup_helpers.inc"
         throw HostCallFault("尚未實作 SetupAPI INF 服務："+std::string(name));
     }catch(const Failure& error){
-        const bool handle_result=name.starts_with("SetupOpenInfFile") || name=="SetupOpenMasterInf";
+        const bool handle_result=name.starts_with("SetupOpenInfFile") || name=="SetupOpenMasterInf" || name=="SetupOpenFileQueue";
         const bool count_result=name.starts_with("SetupGetLineCount");
-        return fail(error.code,handle_result?invalid_handle:count_result?std::uint64_t{UINT32_MAX}:0);
+        return fail(error.code,handle_result?invalid_handle:count_result?std::uint64_t{UINT32_MAX}:failure_dialog?1:0);
     }catch(const MemoryFault&){
-        const bool handle_result=name.starts_with("SetupOpenInfFile") || name=="SetupOpenMasterInf";return fail(998,handle_result?invalid_handle:0);
-    }catch(const std::bad_alloc&){return fail(8,name.starts_with("SetupOpenInfFile") || name=="SetupOpenMasterInf"?invalid_handle:0);}
+        const bool handle_result=name.starts_with("SetupOpenInfFile") || name=="SetupOpenMasterInf" || name=="SetupOpenFileQueue";return fail(998,handle_result?invalid_handle:failure_dialog?1:0);
+    }catch(const std::bad_alloc&){return fail(8,name.starts_with("SetupOpenInfFile") || name=="SetupOpenMasterInf" || name=="SetupOpenFileQueue"?invalid_handle:failure_dialog?4:0);}
 }
 }

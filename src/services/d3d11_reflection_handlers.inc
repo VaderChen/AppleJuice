@@ -1,6 +1,9 @@
-        if(symbol=="D3DReflect"){
-            graphics_handled=true;output(3);write_pointer(arg(3),0);
-            const auto iid=read_guid(memory,arg(2));
+        if(symbol=="D3DReflect" || symbol=="D3D10ReflectShader"){
+            // D3D10ReflectShader(Bytecode, Length, ID3D10ShaderReflection**)：同一個反射物件；sequence 10 依 D3D10 的較短描述結構輸出。
+            // ID3D10ShaderReflection 與子介面的方法順序是 ID3D11 版本的前綴。
+            const bool d3d10=symbol=="D3D10ReflectShader";const unsigned out=d3d10?2:3;
+            graphics_handled=true;output(out);write_pointer(arg(out),0);
+            const auto iid=d3d10?IID_ID3D11ShaderReflection:read_guid(memory,arg(2));
             if(iid!=IID_ID3D11ShaderReflection && iid!=IID_ID3D11ShaderReflection47 && iid!=IID_ID3D11ShaderReflection43 && iid!=IID_ID3D12ShaderReflection){
                 if(std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS")){std::fprintf(stderr,"[d3d11] D3DReflect 不支援的 IID");for(const auto byte:iid)std::fprintf(stderr," %02x",static_cast<unsigned>(byte));std::fprintf(stderr,"\n");}
                 complete_call(state,memory,no_interface);return std::nullopt;}
@@ -9,7 +12,7 @@
             require(reflection->version!=0);
             auto id=create(Kind::Reflection);id->reflection=std::move(reflection);id->reflection_owner=id->root;
             // sequence：43／47 為 d3dcompiler 版本的結構差異；1012 為 ID3D12ShaderReflection（簽章同 47，綁定描述多 Space、uID）。
-            id->sequence=iid==IID_ID3D11ShaderReflection43?43U:iid==IID_ID3D12ShaderReflection?1012U:47U;write_pointer(arg(3),id->root);
+            id->sequence=d3d10?10U:iid==IID_ID3D11ShaderReflection43?43U:iid==IID_ID3D12ShaderReflection?1012U:47U;write_pointer(arg(out),id->root);
         }else if(symbol.starts_with("Reflect")){
             graphics_handled=true;auto id=object(arg(0)).identity;require(bool(id->reflection));
             auto root=typed(id->reflection_owner,Kind::Reflection);const auto& r=*id->reflection;
@@ -37,6 +40,7 @@
                 for(const unsigned index:std::array<unsigned,22>{0,1,10,2,3,14,15,16,17,18,4,5,6,7,8,9,11,12,13,24,25,23})fields.push_back(stat(index));
                 fields.push_back(static_cast<unsigned>(r.signatures[2].size()));
                 for(unsigned index=27;index<35;++index)fields.push_back(stat(index));
+                if(root->sequence==10)fields.resize(26); // D3D10_SHADER_DESC 止於 GSMaxOutputVertexCount。
                 const auto size=(fields_at+fields.size()*4+pointer_size-1)&~std::size_t(pointer_size-1);
                 memory.fill(GuestAddress{arg(1)},0,size);memory.store(GuestAddress{arg(1)},32,r.version);write_pointer(arg(1)+ptr_at,string(r.creator));words(arg(1)+fields_at,fields);
             }else if(symbol=="ReflectBufferByIndex" || symbol=="ReflectBufferByName"){
@@ -59,18 +63,19 @@
                 if(root->sequence==1012){const std::array d3d12{b.space,b.id};words(arg(2)+pointer_size+28,d3d12);}
             }else if(symbol=="ReflectInput" || symbol=="ReflectOutput" || symbol=="ReflectPatch"){
                 const auto kind=symbol=="ReflectInput"?0U:symbol=="ReflectOutput"?1U:2U;require(u32(1)<r.signatures[kind].size() && arg(2));const auto& s=r.signatures[kind][u32(1)];
-                const auto size=pointer_size+(root->sequence>=47?28U:24U);memory.fill(GuestAddress{arg(2)},0,size);write_pointer(arg(2),string(s.name));
-                const std::array values{s.index,s.reg,s.system,s.component,s.mask|(s.used<<8),s.stream};words(arg(2)+pointer_size,values);
+                const auto size=pointer_size+(root->sequence==10?20U:root->sequence>=47?28U:24U);memory.fill(GuestAddress{arg(2)},0,size);write_pointer(arg(2),string(s.name));
+                const std::array values{s.index,s.reg,s.system,s.component,s.mask|(s.used<<8),s.stream};words(arg(2)+pointer_size,std::span(values).first(root->sequence==10?5:6)); // D3D10 沒有 Stream
                 if(root->sequence>=47)memory.store(GuestAddress{arg(2)+pointer_size+24},32,s.precision);
             }else if(symbol=="ReflectBufferDesc"){
                 const auto b=buffer();require(b && arg(1));write_pointer(arg(1),string(b->name));const std::array values{b->type,static_cast<unsigned>(b->variables.size()),b->size,b->flags};words(arg(1)+pointer_size,values);
             }else if(symbol=="ReflectVariableDesc"){
                 const auto v=variable();require(v && arg(1));const unsigned value_at=x86_?16U:24U,tail=value_at+pointer_size;
-                memory.fill(GuestAddress{arg(1)},0,tail+16);write_pointer(arg(1),string(v->name));const std::array values{v->offset,v->size,v->flags};words(arg(1)+pointer_size,values);
+                const bool short_desc=root->sequence==10; // D3D10_SHADER_VARIABLE_DESC 沒有紋理／取樣器範圍欄位
+                memory.fill(GuestAddress{arg(1)},0,short_desc?tail:tail+16);write_pointer(arg(1),string(v->name));const std::array values{v->offset,v->size,v->flags};words(arg(1)+pointer_size,values);
                 if(!v->initial.empty()){
                     const auto address=allocate_heap(memory,v->initial.size());if(!address)throw std::bad_alloc{};root->allocations.push_back(address);memory.write(GuestAddress{address},v->initial);write_pointer(arg(1)+value_at,address);
                 }
-                const std::array bindings{v->texture,v->textures,v->sampler,v->samplers};words(arg(1)+tail,bindings);
+                if(!short_desc){const std::array bindings{v->texture,v->textures,v->sampler,v->samplers};words(arg(1)+tail,bindings);}
             }else if(symbol=="ReflectVariableType"){
                 const auto v=variable();result=sub(Kind::ReflectionType,id->reflection_buffer,id->reflection_variable,v?v->type.get():nullptr,0);
             }else if(symbol=="ReflectVariableBuffer")result=sub(Kind::ReflectionBuffer,id->reflection_buffer,UINT32_MAX,nullptr,0);
@@ -79,8 +84,9 @@
                 if(v && buffer()->type==2 && u32(1)<std::max(1U,v->type->elements))result=v->offset+u32(1);
             }else if(symbol=="ReflectTypeDesc"){
                 const auto t=id->reflection_type;require(t && arg(1));const unsigned name_at=x86_?28U:32U;
-                memory.fill(GuestAddress{arg(1)},0,name_at+pointer_size);const std::array values{t->classification,t->base,t->rows,t->columns,t->elements,static_cast<unsigned>(t->members.size()),id->reflection_offset};words(arg(1),values);
-                if(!t->name.empty())write_pointer(arg(1)+name_at,string(t->name));
+                const bool short_desc=root->sequence==10; // D3D10_SHADER_TYPE_DESC 沒有 Name
+                memory.fill(GuestAddress{arg(1)},0,short_desc?28U:name_at+pointer_size);const std::array values{t->classification,t->base,t->rows,t->columns,t->elements,static_cast<unsigned>(t->members.size()),id->reflection_offset};words(arg(1),values);
+                if(!short_desc && !t->name.empty())write_pointer(arg(1)+name_at,string(t->name));
             }else if(symbol=="ReflectMemberByIndex" || symbol=="ReflectMemberByName" || symbol=="ReflectMemberName"){
                 const auto t=id->reflection_type;unsigned index=u32(1);
                 if(symbol=="ReflectMemberByName"){const auto name=arg(1)?read_ansi(memory,arg(1)):std::string{};index=UINT32_MAX;if(t)for(unsigned i=0;i<t->members.size();++i)if(t->members[i].name==name){index=i;break;}}

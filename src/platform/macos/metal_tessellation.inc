@@ -97,6 +97,7 @@ MetalTessellationDraw MetalGl::graphics_tessellation(const GraphicsDraw& d,const
         p->factor_slot=slot("tessFactors");p->info_slot=slot("patchInfo");
         std::set<unsigned> kernel_slots{p->factor_slot,p->info_slot};if(p->control_slot!=UINT32_MAX)kernel_slots.insert(p->control_slot);if(p->patch_slot!=UINT32_MAX)kernel_slots.insert(p->patch_slot);
         for(unsigned i=0;i<2;++i)for(const auto& b:p->stages[i]->bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9))kernel_slots.insert(b.native_slot);
+        for(unsigned i=0;i<2;++i)if(p->stages[i]->buffer_sizes_slot!=UINT32_MAX)kernel_slots.insert(p->stages[i]->buffer_sizes_slot);
         // VS／HS 共用 kernel，但 typed buffer 的 view 範圍各自獨立。
         for(unsigned i=0;i<2;++i)if(p->stages[i]->source.find("x64arm_buffer_views[")!=std::string::npos){
             unsigned at=30;while(kernel_slots.contains(at)){if(!at)throw std::invalid_argument("細分 buffer view 配額不足");--at;}
@@ -117,6 +118,7 @@ MetalTessellationDraw MetalGl::graphics_tessellation(const GraphicsDraw& d,const
         std::set<unsigned> domain_slots;
         for(const auto& b:p->stages[2]->bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9))domain_slots.insert(b.native_slot);
         if(p->stages[2]->buffer_views_slot!=UINT32_MAX)domain_slots.insert(p->stages[2]->buffer_views_slot);
+        if(p->stages[2]->buffer_sizes_slot!=UINT32_MAX)domain_slots.insert(p->stages[2]->buffer_sizes_slot);
         p->domain_control_slot=reserve_slot(domain_slots);p->domain_patch_slot=reserve_slot(domain_slots);
         auto& domain_source=p->stages[2]->source;
         if(domain_source.find("tessFactor.")!=domain_source.npos){
@@ -147,6 +149,7 @@ MetalTessellationDraw MetalGl::graphics_tessellation(const GraphicsDraw& d,const
         if(p->raw_factor_slot!=UINT32_MAX)occupied.insert(p->raw_factor_slot);
         for(unsigned i=0;i<2;++i)for(const auto& binding:p->stages[i]->bindings)if(binding.type==0 || binding.type==3 || binding.type==4)occupied.insert(binding.native_slot);
         for(unsigned i=0;i<2;++i)if(p->stages[i]->buffer_views_slot!=UINT32_MAX)occupied.insert(p->stages[i]->buffer_views_slot);
+        for(unsigned i=0;i<2;++i)if(p->stages[i]->buffer_sizes_slot!=UINT32_MAX)occupied.insert(p->stages[i]->buffer_sizes_slot);
         unsigned next=30;
         for(const auto& input:p->stages[0]->inputs){auto element=std::find_if(d.layout.begin(),d.layout.end(),[&](const auto& e){return e.semantic==input.semantic && e.index==input.index;});
             if(element==d.layout.end() || element->slot>=32 || !d.vertices[element->slot].resource)throw std::invalid_argument("細分頂點 layout 缺少 semantic");
@@ -266,6 +269,7 @@ MetalTessellationDraw MetalGl::graphics_tessellation(const GraphicsDraw& d,const
     if(p->raw_factor_slot!=UINT32_MAX){occupied.insert(p->raw_factor_slot);[encoder setBuffer:result.raw_factors offset:0 atIndex:p->raw_factor_slot];}
     for(unsigned i=0;i<2;++i){auto stage=d.stages[i?3:0];stage.shader=p->stages[i];graphics_bind(nil,encoder,stage,false);for(const auto& b:stage.shader->bindings)if(b.type==0 || b.type==3 || b.type==4 || (b.type>=6 && b.type<=9))occupied.insert(b.native_slot);}
     for(unsigned i=0;i<2;++i)if(p->stages[i]->buffer_views_slot!=UINT32_MAX)occupied.insert(p->stages[i]->buffer_views_slot);
+        for(unsigned i=0;i<2;++i)if(p->stages[i]->buffer_sizes_slot!=UINT32_MAX)occupied.insert(p->stages[i]->buffer_sizes_slot);
     unsigned next=30;for(const auto& [buffer,offset]:gathered){while(occupied.contains(next))--next;[encoder setBuffer:buffer offset:offset atIndex:next];occupied.insert(next);--next;}
     if(p->direct && d.indexed){[encoder setBuffer:metal_resource(d.indices).buffer offset:std::uint64_t{d.index_offset}+std::uint64_t{d.start}*(d.index_format==57?2U:4U) atIndex:p->index_slot];graphics_pending_.push_back(d.indices);}
     if(p->control_slot!=UINT32_MAX)[encoder setBuffer:result.controls offset:0 atIndex:p->control_slot];if(p->patch_slot!=UINT32_MAX)[encoder setBuffer:result.patches offset:0 atIndex:p->patch_slot];[encoder setBuffer:result.factors offset:0 atIndex:p->factor_slot];

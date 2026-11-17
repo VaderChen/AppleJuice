@@ -566,6 +566,8 @@ std::span<const WindowsServiceDescriptor> thread_service_descriptors() {
                                                       {"kernel32.dll", "Module32FirstW", 2},
                                                       {"kernel32.dll", "Module32NextW", 2},
                                                       {"kernel32.dll", "CreateToolhelp32Snapshot", 2},
+                                                      {"kernel32.dll", "Heap32ListFirst", 2},
+                                                      {"kernel32.dll", "Heap32ListNext", 2},
                                                       {"kernel32.dll", "Process32FirstW", 2},
                                                       {"kernel32.dll", "Process32NextW", 2},
                                                       {"kernel32.dll", "Process32First", 2},
@@ -2880,6 +2882,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
     {
         WakePollScope poll_measurement("poll_media_foundation");
         poll_media_foundation(memory);
+        if(!service_notifications_.empty())poll_service_notifications(memory);
     }
     {
         WakePollScope poll_measurement("poll_wave_input");
@@ -2917,6 +2920,7 @@ void WindowsServices::wake_threads(GuestMemory &memory) {
     {
         WakePollScope poll_measurement("poll_dinput");
         poll_dinput(true);
+        if(const auto current=threads_.items.find(threads_.current);current!=threads_.items.end())poll_winrt_gamepads(current->second.context,memory);
     }
     {
         WakePollScope poll_measurement("poll_address_notifications");
@@ -4711,6 +4715,60 @@ void WindowsServices::publish_once_cache(GuestMemory& memory,std::uint64_t addre
     memory.atomic_rmw(GuestAddress{slot},64,GuestMemory::AtomicRmw::Exchange,address);
 }
 
+// MMCSS 工作設定：HKLM\...\Multimedia\SystemProfile\Tasks\<名稱> 的 Priority（1～8）與 Scheduling Category；SystemResponsiveness 為 100 時停用 MMCSS。
+// 名稱比對不分大小寫（呼叫端先轉小寫）；avrt 與 Media Foundation 的 MMCSS 工作佇列共用，呼叫端須持有登錄交易。
+namespace {
+const std::u16string& multimedia_system_key(){static const auto key=std::u16string(1,2)+u"\\software\\microsoft\\windows nt\\currentversion\\multimedia\\systemprofile";return key;}
+std::optional<std::uint32_t> multimedia_number(const RegistryValue& value){
+    if(value.type!=4 || value.bytes.size()!=4)return {};
+    std::uint32_t out=0;for(unsigned i=0;i<4;++i)out|=static_cast<std::uint32_t>(value.bytes[i])<<(i*8);return out;
+}
+}
+std::optional<std::uint32_t> WindowsServices::multimedia_responsiveness() const {
+    if(const auto settings=runtime_.registry.keys.find(multimedia_system_key());settings!=runtime_.registry.keys.end())
+        if(const auto value=settings->second.find(u"systemresponsiveness");value!=settings->second.end())return multimedia_number(value->second);
+    return std::nullopt;
+}
+WindowsServices::MultimediaProfile WindowsServices::multimedia_profile(std::u16string name) const {
+    MultimediaProfile result;result.name=name;
+    if(name.empty() || name.find(u'\\')!=name.npos || name.find(u'/')!=name.npos){result.error=1550;return result;}
+    std::u16string category=name==u"pro audio"?u"high":name==u"distribution"?u"low":u"medium";
+    bool supported=false;
+    for(auto standard:{u"audio",u"capture",u"distribution",u"games",u"playback",u"pro audio",u"window manager"})if(name==standard)supported=true;
+    if(multimedia_responsiveness()==100U){result.error=1058;return result;}
+    int priority=2;
+    if(const auto settings=runtime_.registry.keys.find(multimedia_system_key()+u"\\tasks\\"+name);settings!=runtime_.registry.keys.end()){
+        supported=true;
+        if(const auto value=settings->second.find(u"priority");value!=settings->second.end()){
+            const auto amount=multimedia_number(value->second);if(!amount || *amount<1 || *amount>8){result.error=87;return result;}priority=static_cast<int>(*amount);
+        }
+        if(const auto value=settings->second.find(u"scheduling category");value!=settings->second.end()){
+            const auto& data=value->second;if(data.type!=1 || data.bytes.size()%2){result.error=87;return result;}category.clear();
+            for(std::size_t i=0;i<data.bytes.size();i+=2){const auto c=static_cast<char16_t>(data.bytes[i]|(static_cast<unsigned>(data.bytes[i+1])<<8));if(!c)break;category+=unicode_case_unit(c,false);}
+        }
+    }
+    if(!supported){result.error=1550;return result;}
+    result.minimum=category==u"high"?23:category==u"medium"?16:category==u"low"?8:0;
+    if(!result.minimum){result.error=87;return result;}
+    result.maximum=category==u"high"?26:category==u"medium"?22:15;
+    if(category==u"high")priority=2;
+    result.priority=std::clamp(result.minimum+priority-1,result.minimum,result.maximum);return result;
+}
+std::uint32_t WindowsServices::multimedia_task_index(const std::u16string& name,std::uint32_t requested,std::uint32_t& index){
+    const auto known=threads_.multimedia_task_indices.find(name);
+    if(known!=threads_.multimedia_task_indices.end()){if(requested && requested!=known->second)return 1551;index=known->second;return 0;}
+    if(requested)return 1551;
+    if(threads_.multimedia_task_indices.size()>=4096)return 8;
+    index=static_cast<std::uint32_t>(threads_.multimedia_task_indices.size()+1);threads_.multimedia_task_indices.emplace(name,index);return 0;
+}
+std::uint32_t WindowsServices::multimedia_task(std::u16string_view name,std::uint32_t requested,MultimediaThreadTask& task,std::uint32_t& index){
+    std::u16string folded(name);for(auto& c:folded)c=unicode_case_unit(c,false);
+    RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return transaction.error;
+    const auto profile=multimedia_profile(folded);if(profile.error)return profile.error;
+    if(const auto error=multimedia_task_index(profile.name,requested,index))return error;
+    task={runtime_.allocate_wait_handle(),profile.priority,profile.minimum,profile.maximum,0};return 0;
+}
+
 std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, GuestMemory &memory,
                                                             const WindowsServiceDescriptor &service) {
     if(service.symbol=="Beep")return invoke_wave_output(state,memory,service);
@@ -4728,48 +4786,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 else {const auto value=static_cast<std::int32_t>(arg(1));if(value < -2 || value > 2)return done(0,87);task.relative=value;}
                 threads_.yield=true;return done(1);
             }
-            // 工作設定：HKLM\...\Multimedia\SystemProfile\Tasks\<名稱> 的 Priority（1～8）與 Scheduling Category；SystemResponsiveness 為 100 時停用 MMCSS。
-            struct Profile {std::u16string name;std::uint32_t error{};int priority{2},minimum{},maximum{};};
+            using Profile=MultimediaProfile;
             const auto read_name=[&](std::uint64_t address){auto text=service.symbol.ends_with('W')?read_utf16(memory,GuestAddress{address},256):utf8_to_utf16_lossy(read_ansi(memory,address,256));for(auto& c:text)c=unicode_case_unit(c,false);return text;};
-            const auto system=std::u16string(1,2)+u"\\software\\microsoft\\windows nt\\currentversion\\multimedia\\systemprofile";
-            const auto number=[](const RegistryValue& value)->std::optional<std::uint32_t>{
-                if(value.type!=4 || value.bytes.size()!=4)return {};
-                std::uint32_t out=0;for(unsigned i=0;i<4;++i)out|=static_cast<std::uint32_t>(value.bytes[i])<<(i*8);return out;
-            };
-            const auto responsiveness=[&]()->std::optional<std::uint32_t>{
-                if(const auto settings=runtime_.registry.keys.find(system);settings!=runtime_.registry.keys.end())
-                    if(const auto value=settings->second.find(u"systemresponsiveness");value!=settings->second.end())return number(value->second);
-                return std::nullopt;};
-            const auto profile=[&](std::u16string name)->Profile{
-                Profile result;result.name=name;
-                if(name.empty() || name.find(u'\\')!=name.npos || name.find(u'/')!=name.npos){result.error=1550;return result;}
-                std::u16string category=name==u"pro audio"?u"high":name==u"distribution"?u"low":u"medium";
-                bool supported=false;
-                for(auto standard:{u"audio",u"capture",u"distribution",u"games",u"playback",u"pro audio",u"window manager"})if(name==standard)supported=true;
-                if(responsiveness()==100U){result.error=1058;return result;}
-                int priority=2;
-                if(const auto settings=runtime_.registry.keys.find(system+u"\\tasks\\"+name);settings!=runtime_.registry.keys.end()){
-                    supported=true;
-                    if(const auto value=settings->second.find(u"priority");value!=settings->second.end()){
-                        const auto amount=number(value->second);if(!amount || *amount<1 || *amount>8){result.error=87;return result;}priority=static_cast<int>(*amount);
-                    }
-                    if(const auto value=settings->second.find(u"scheduling category");value!=settings->second.end()){
-                        const auto& data=value->second;if(data.type!=1 || data.bytes.size()%2){result.error=87;return result;}category.clear();
-                        for(std::size_t i=0;i<data.bytes.size();i+=2){const auto c=static_cast<char16_t>(data.bytes[i]|(static_cast<unsigned>(data.bytes[i+1])<<8));if(!c)break;category+=unicode_case_unit(c,false);}
-                    }
-                }
-                if(!supported){result.error=1550;return result;}
-                result.minimum=category==u"high"?23:category==u"medium"?16:category==u"low"?8:0;
-                if(!result.minimum){result.error=87;return result;}
-                result.maximum=category==u"high"?26:category==u"medium"?22:15;
-                if(category==u"high")priority=2;
-                result.priority=std::clamp(result.minimum+priority-1,result.minimum,result.maximum);return result;};
+            const auto profile=[&](std::u16string name){return multimedia_profile(std::move(name));};
             RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
             if(transaction.error)return done(0,transaction.error);
             if(service.symbol=="AvQuerySystemResponsiveness"){
                 // (AvrtHandle, PULONG)：值以 10 為單位向上取整，0 視為 10，未設定時為 20。
                 if(!arg(0) || task.handle!=arg(0))return done(0,6);if(!arg(1))return done(0,87);
-                auto value=responsiveness().value_or(20U);value=value?std::min(100U,(value+9)/10*10):10U;
+                auto value=multimedia_responsiveness().value_or(20U);value=value?std::min(100U,(value+9)/10*10):10U;
                 memory.store(GuestAddress{arg(1)},32,value);return done(1);
             }
             const bool pair=service.symbol.starts_with("AvSetMmMaxThreadCharacteristics");const unsigned index_argument=pair?2:1;
@@ -4794,9 +4819,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
                 if(!index_matches(chosen.name))return done(0,1551);
             }
             if(chosen.error)return done(0,chosen.error);
-            const auto known=threads_.multimedia_task_indices.find(chosen.name);
-            auto index=known==threads_.multimedia_task_indices.end()?0:known->second;
-            if(!index){if(threads_.multimedia_task_indices.size()>=4096)return done(0,8);index=static_cast<std::uint32_t>(threads_.multimedia_task_indices.size()+1);threads_.multimedia_task_indices.emplace(chosen.name,index);}
+            std::uint32_t index=0;if(const auto error=multimedia_task_index(chosen.name,0,index))return done(0,error);
             task={runtime_.allocate_wait_handle(),chosen.priority,chosen.minimum,chosen.maximum,0};
             memory.store(GuestAddress{arg(index_argument)},32,index);threads_.yield=true;return done(task.handle);
         }catch(const MemoryFault&){return done(0,998);}catch(const std::bad_alloc&){return done(0,8);}catch(const std::invalid_argument&){return done(0,87);}
@@ -5434,10 +5457,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             return std::nullopt;
         }
     } else if (symbol == "CreateToolhelp32Snapshot") {
-        if (u32(0) & ~0x8000001eU) {
+        if (u32(0) & ~0x8000001fU) {
             last_error_ = 50;
             result = UINT64_MAX;
-        } else if ((u32(0) & 0x18U) && u32(1) && u32(1) != process_id()) {
+        } else if ((u32(0) & 0x19U) && u32(1) && u32(1) != process_id()) {
             last_error_ = 50;
             result = UINT64_MAX;
         } else if ((u32(0) & 0x18U) && await_loader(state, memory))
@@ -5448,6 +5471,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
         } else {
             ProcessSnapshot snapshot;
             snapshot.flags = u32(0);
+            if (snapshot.flags & 1U) {
+                snapshot.heaps.push_back(process_heap);
+                for (const auto &[heap, limits] : runtime_.private_heaps) {
+                    (void)limits;
+                    snapshot.heaps.push_back(heap);
+                }
+            }
             if (snapshot.flags & 4U) {
                 const auto error = capture_thread_snapshot(memory, snapshot.threads);
                 if (error) {
@@ -5497,6 +5527,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             }
             result = runtime_.allocate_wait_handle();
             runtime_.process_snapshots.emplace(result, std::move(snapshot));
+        }
+    } else if (symbol.starts_with("Heap32List")) {
+        // HEAPLIST32：dwSize、th32ProcessID、th32HeapID、dwFlags（預設堆積為 HF32_DEFAULT）。
+        const auto found = runtime_.process_snapshots.find(arg(0));
+        const unsigned size = x86_ ? 16U : 32U, unit = x86_ ? 4U : 8U;
+        if (found == runtime_.process_snapshots.end())
+            fail(6);
+        else if (!arg(1))
+            fail(87);
+        else if (memory.load(GuestAddress{arg(1)}, x86_ ? 32 : 64) < size)
+            fail(24);
+        else {
+            auto &snapshot = found->second;
+            if (symbol == "Heap32ListFirst")
+                snapshot.heap_cursor = 0;
+            if (snapshot.heap_cursor >= snapshot.heaps.size())
+                fail(18);
+            else {
+                const auto heap = snapshot.heaps[snapshot.heap_cursor];
+                memory.store(GuestAddress{arg(1) + unit}, 32, process_id());
+                memory.store(GuestAddress{arg(1) + 2 * unit}, x86_ ? 32 : 64, heap);
+                memory.store(GuestAddress{arg(1) + 3 * unit}, 32, heap == process_heap ? 1U : 0U);
+                ++snapshot.heap_cursor;
+                result = 1;
+            }
         }
     } else if (symbol.starts_with("Module32")) {
         const auto found = runtime_.process_snapshots.find(arg(0));

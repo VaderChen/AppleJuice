@@ -22,7 +22,7 @@ std::span<const WindowsServiceDescriptor> service_control_descriptors() {
         {"advapi32.dll","StartServiceCtrlDispatcherA",1},{"advapi32.dll","StartServiceCtrlDispatcherW",1},
         {"advapi32.dll","RegisterServiceCtrlHandlerA",2},{"advapi32.dll","RegisterServiceCtrlHandlerW",2},
         {"advapi32.dll","RegisterServiceCtrlHandlerExA",3},{"advapi32.dll","RegisterServiceCtrlHandlerExW",3},
-        {"advapi32.dll","SetServiceStatus",2},{"advapi32.dll","QueryServiceObjectSecurity",5},{"advapi32.dll","SetServiceObjectSecurity",3},
+        {"advapi32.dll","SetServiceStatus",2},{"advapi32.dll","NotifyServiceStatusChangeW",3,0,0,2},{"advapi32.dll","QueryServiceObjectSecurity",5},{"advapi32.dll","SetServiceObjectSecurity",3},
         {"advapi32.dll","EnumServicesStatusA",8},{"advapi32.dll","EnumServicesStatusW",8},
         {"advapi32.dll","EnumServicesStatusExA",10},{"advapi32.dll","EnumServicesStatusExW",10},
         // 目錄查詢：顯示名稱／鍵名互查、相依服務（遞移，依停止順序）、相容用的資料庫鎖定。
@@ -171,7 +171,73 @@ std::optional<std::uint32_t> WindowsServices::invoke_service_catalog(GuestState&
     }catch(const std::bad_alloc&){fail(8);}
     arg.return_to(state,result);return std::nullopt;
 }
+// NotifyServiceStatusChange 的狀態檢查：服務 handle 依目前狀態（1～7 對應遮罩 1<<(狀態−1)）與刪除標記（DELETE_PENDING 0x200）；
+// SCM handle 比對登錄時的客體服務名稱快照（CREATED 0x80／DELETED 0x100，名稱清單為 MULTI_SZ，刪除者前綴「/」）。
+// 符合時寫入 SERVICE_NOTIFY_2W（dwNotificationStatus、SERVICE_STATUS_PROCESS、dwNotificationTriggered、pszServiceNames），再以 APC 交給登錄的執行緒；一次性。
+bool WindowsServices::deliver_service_notification(GuestMemory& memory,ServiceNotification& notification){
+    const auto handle=service_control_handles_.find(notification.handle);if(handle==service_control_handles_.end())return true;
+    const unsigned unit=x86_?4:8;const std::uint64_t status_at=notification.buffer+(x86_?12U:24U),words_at=status_at+4,triggered_at=words_at+36,names_at=x86_?56U:72U;
+    std::array<std::uint32_t,9> words{};std::uint32_t triggered=0,error=0;std::vector<std::u16string> created,deleted;
+    RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return false;
+    if(handle->second.manager){
+        std::vector<std::u16string> current;
+        for(const auto& [key,values]:runtime_.registry.keys)if(key.starts_with(guest_service::root+u"\\") && key.find(u'\\',guest_service::root.size()+1)==key.npos && guest_service::installed(values))
+            current.push_back(guest_service::text(values,u"name",key.substr(guest_service::root.size()+1)));
+        const auto folded=[](std::u16string text){for(auto& c:text)c=unicode_case_unit(c,false);return text;};
+        const auto contains=[&](const std::vector<std::u16string>& list,const std::u16string& name){return std::any_of(list.begin(),list.end(),[&](const auto& item){return folded(item)==folded(name);});};
+        if(notification.mask&0x80U)for(const auto& name:current)if(!contains(notification.names,name))created.push_back(name);
+        if(notification.mask&0x100U)for(const auto& name:notification.names)if(!contains(current,name))deleted.push_back(name);
+        if(created.empty() && deleted.empty())return false;triggered=(created.empty()?0U:0x80U)|(deleted.empty()?0U:0x100U);
+    }else if(handle->second.guest){
+        const auto found=runtime_.registry.keys.find(guest_service::path(handle->second.label));
+        if(found==runtime_.registry.keys.end() || guest_service::number(found->second,u"deleteflag")){if(!(notification.mask&0x200U))return false;triggered=0x200U;error=0;
+            if(found!=runtime_.registry.keys.end())words=guest_service::status(found->second);}
+        else {words=guest_service::status(found->second);const auto bit=words[1]>=1 && words[1]<=7?1U<<(words[1]-1):0U;if(!(notification.mask&bit))return false;triggered=bit;}
+    }else {
+        const auto status=native_service_status(handle->second.label,handle->second.system);if(!status)return false;
+        words=service_status_words(*status);const auto bit=words[1]>=1 && words[1]<=7?1U<<(words[1]-1):0U;if(!(notification.mask&bit))return false;triggered=bit;
+    }
+    memory.store(GuestAddress{status_at},32,error);for(unsigned i=0;i<9;++i)memory.store(GuestAddress{words_at+4*i},32,words[i]);memory.store(GuestAddress{triggered_at},32,triggered);
+    std::uint64_t names=0;
+    if(!created.empty() || !deleted.empty()){
+        std::vector<std::uint8_t> bytes;const auto add=[&](const std::u16string& text){const auto encoded=utf16_bytes(text);bytes.insert(bytes.end(),encoded.begin(),encoded.end());};
+        for(const auto& name:created)add(name);for(const auto& name:deleted)add(u"/"+name);bytes.push_back(0);bytes.push_back(0);
+        names=allocate_heap(memory,bytes.size());if(names)memory.write(GuestAddress{names},bytes);
+    }
+    memory.store(GuestAddress{notification.buffer+names_at},static_cast<std::uint8_t>(unit*8),names);
+    if(const auto thread=threads_.items.find(notification.thread);thread!=threads_.items.end() && thread->second.status!=ThreadStatus::Exited && !thread->second.terminating && thread->second.apcs.size()<1024)
+        thread->second.apcs.push_back({notification.callback,{notification.buffer}});
+    return true;
+}
+void WindowsServices::poll_service_notifications(GuestMemory& memory){
+    if(runtime_.clock_ticks<service_notification_poll_)return;service_notification_poll_=runtime_.clock_ticks+200000;
+    // 狀態讀取失敗（登錄內容損毀等）時丟棄該筆通知，不中斷排程輪詢。
+    for(auto it=service_notifications_.begin();it!=service_notifications_.end();){
+        bool done=true;try{done=deliver_service_notification(memory,*it);}catch(const SecurityDescriptorError&){}catch(const MemoryFault&){}
+        if(done)it=service_notifications_.erase(it);else ++it;}
+}
 std::optional<std::uint32_t> WindowsServices::invoke_service_control(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    if(service.symbol=="NotifyServiceStatusChangeW"){
+        // (hService, dwNotifyMask, pNotifyBuffer)：回傳 Win32 錯誤碼。SERVICE_NOTIFY 的 dwVersion 須為 SERVICE_NOTIFY_STATUS_CHANGE（2）。
+        const WindowsCall call(state,memory,service);const auto finish=[&](std::uint32_t error){call.return_to(state,error);return std::optional<std::uint32_t>{};};
+        const auto handle=service_control_handles_.find(call(0));if(handle==service_control_handles_.end() || handle->second.owner!=process_id())return finish(6);
+        const auto mask=static_cast<std::uint32_t>(call(1));const auto buffer=call(2);const bool manager=handle->second.manager;
+        if(!buffer || !mask || (manager?(mask&~0x180U):(mask&~0x27fU)))return finish(87);
+        if(!manager && !(handle->second.access&4))return finish(5);if(manager && !(handle->second.access&1))return finish(5);
+        try{
+            memory.check(GuestAddress{buffer},x86_?60:80,Access::Write);if(memory.load(GuestAddress{buffer},32)!=2)return finish(87);
+            const auto callback=memory.load(GuestAddress{buffer+(x86_?4U:8U)},x86_?32:64);if(!callback)return finish(87);
+            ServiceNotification notification;notification.handle=call(0);notification.buffer=buffer;notification.callback=callback;notification.thread=threads_.current;notification.mask=mask;
+            {RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return finish(transaction.error);
+                if(manager){for(const auto& [key,values]:runtime_.registry.keys)if(key.starts_with(guest_service::root+u"\\") && key.find(u'\\',guest_service::root.size()+1)==key.npos && guest_service::installed(values))
+                    notification.names.push_back(guest_service::text(values,u"name",key.substr(guest_service::root.size()+1)));}
+                else if(handle->second.guest){const auto found=runtime_.registry.keys.find(guest_service::path(handle->second.label));
+                    if(found==runtime_.registry.keys.end() || guest_service::number(found->second,u"deleteflag"))return finish(1072);}}
+            std::erase_if(service_notifications_,[&](const auto& item){return item.handle==call(0);});
+            if(!deliver_service_notification(memory,notification)){if(service_notifications_.size()>=1024)return finish(8);service_notifications_.push_back(std::move(notification));}
+        }catch(const MemoryFault&){return finish(998);}catch(const SecurityDescriptorError& error){return finish(error.code);}
+        return finish(0);
+    }
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');std::uint64_t result=0;
     if(name.starts_with("GetServiceDisplayName") || name.starts_with("GetServiceKeyName") || name.starts_with("EnumDependentServices") ||
        name=="LockServiceDatabase" || name=="UnlockServiceDatabase" || name.starts_with("QueryServiceLockStatus"))return invoke_service_catalog(state,memory,service);

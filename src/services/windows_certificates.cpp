@@ -1,10 +1,15 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "x64arm/registry_store.hpp"
+#include "x64arm/security_descriptor.hpp"
+#include "x64arm/crypto.hpp"
+#include "service_callback_task.hpp"
 #include "certificate_packet.hpp"
 #include "certificate_store.hpp"
 #include "sandbox_certificate_roots.hpp"
 #include "certificate_pfx.hpp"
 #include "certificate_keys.hpp"
+#include "cng_asymmetric.hpp"
 #include "ncrypt_key_store.hpp"
 #include "x64arm/private_key_store.hpp"
 #include <algorithm>
@@ -18,6 +23,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include "idn_conversion.hpp"
+#include "legacy_crypto_catalog.hpp"
 namespace x64arm {
 namespace {
 using namespace certificate_detail;
@@ -299,6 +305,7 @@ std::vector<std::vector<std::uint8_t>> message_crls(PKCS7* message){
     const auto count=sk_X509_CRL_num(message->d.sign->crl);if(count<0 || count>4096)throw CertificateError{8};result.reserve(static_cast<std::size_t>(count));
     for(int i=0;i<count;++i)result.push_back(encoded(sk_X509_CRL_value(message->d.sign->crl,i),i2d_X509_CRL));return result;
 }
+#include "crypt_message_sign.inc"
 std::uint32_t trust_error(int error){
     switch(error){
     case X509_V_OK:return 0;
@@ -345,10 +352,46 @@ bool certificate_host_matches(X509* cert,std::u16string_view name){
     if(!converted)return false;const auto ascii=utf16_to_utf8(*converted);
     return X509_check_host(cert,ascii.data(),ascii.size(),X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS,nullptr)==1;
 }
+// 系統憑證存放區與存放區位置的顯示名稱：CryptFindLocalizedName 與系統存放區的 CERT_STORE_LOCALIZED_NAME_PROP_ID 共用。
+constexpr std::pair<const char16_t*,const char16_t*> certificate_localized_names[]{
+    {u"Root",u"Trusted Root Certification Authorities"},{u"My",u"Personal"},{u"CA",u"Intermediate Certification Authorities"},{u"Trust",u"Enterprise Trust"},
+    {u"Disallowed",u"Untrusted Certificates"},{u"AddressBook",u"Other People"},{u"TrustedPeople",u"Trusted People"},{u"TrustedPublisher",u"Trusted Publishers"},
+    {u"AuthRoot",u"Third-Party Root Certification Authorities"},{u"SmartCardRoot",u"Smart Card Trusted Roots"},{u"Request",u"Certificate Enrollment Requests"},
+    {u"UserDS",u"Active Directory User Object"},{u".Default",u"Default"},{u"LocalMachine",u"Local Computer"},{u"CurrentUser",u"Current User"},
+    {u"CurrentService",u"Current Service"},{u"Services",u"Services"},{u"Users",u"Users"}};
+std::optional<std::size_t> certificate_localized_name_index(std::u16string_view name){
+    const auto lower=[](std::u16string text){for(auto& c:text)c=unicode_case_unit(c,false);return text;};const auto wanted=lower(std::u16string(name));
+    for(std::size_t i=0;i<std::size(certificate_localized_names);++i)if(lower(certificate_localized_names[i].first)==wanted)return i;
+    return std::nullopt;
+}
+// 系統存放區開啟時帶 CERT_STORE_LOCALIZED_NAME_PROP_ID（以 NUL 結尾的 UTF-16）。
+void set_store_localized_name(CertificateStore& store,std::u16string_view name){
+    if(const auto index=certificate_localized_name_index(name))store.properties[0x1000U]=utf16_bytes(certificate_localized_names[*index].second);
+}
+#include "certificate_crl_match.inc"
 }
 void certificate_detail::refresh_store(CertificateState& state,std::uint64_t handle,bool automatic,ReadOnlyFiles& files){if(automatic)auto_resync_store(state,handle,files);else resync_store(state,handle,files);}
 std::span<const WindowsServiceDescriptor> certificate_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"crypt32.dll","CryptFindOIDInfo",3},{"crypt32.dll","CryptEnumOIDInfo",4},{"crypt32.dll","CertOIDToAlgId",1},{"crypt32.dll","CertAlgIdToOID",1},
+        {"crypt32.dll","CryptFindLocalizedName",1},{"crypt32.dll","CertCompareIntegerBlob",2},{"crypt32.dll","CertCompareCertificate",3},{"crypt32.dll","CertComparePublicKeyInfo",3},
+        {"crypt32.dll","CertGetPublicKeyLength",2},{"crypt32.dll","CertVerifyValidityNesting",2},{"crypt32.dll","CertFindRDNAttr",2},{"crypt32.dll","CertFindAttribute",3},
+        {"crypt32.dll","CertRDNValueToStrA",4},{"crypt32.dll","CertRDNValueToStrW",4},{"crypt32.dll","CertIsRDNAttrsInCertificateName",4},{"crypt32.dll","CertGetSubjectCertificateFromStore",3},
+        {"crypt32.dll","CryptExportPublicKeyInfo",5},{"crypt32.dll","CryptExportPublicKeyInfoEx",8},{"crypt32.dll","CryptImportPublicKeyInfo",4},
+        {"crypt32.dll","CryptImportPublicKeyInfoEx",7},{"crypt32.dll","CryptImportPublicKeyInfoEx2",5},
+        {"crypt32.dll","CertSerializeCertificateStoreElement",4},{"crypt32.dll","CertSerializeCRLStoreElement",4},{"crypt32.dll","CertAddSerializedElementToStore",8},
+        {"crypt32.dll","CertAddEncodedCertificateToSystemStoreA",3},{"crypt32.dll","CertAddEncodedCertificateToSystemStoreW",3},{"crypt32.dll","CertEnumSystemStore",4},
+        {"crypt32.dll","CertEnumPhysicalStore",4},{"crypt32.dll","CertRegisterSystemStore",4},{"crypt32.dll","CertUnregisterSystemStore",2},
+        {"crypt32.dll","CryptMsgOpenToEncode",6},{"crypt32.dll","CryptMsgControl",4},{"crypt32.dll","CryptSignMessage",7},{"crypt32.dll","CryptVerifyMessageSignature",7},
+        {"crypt32.dll","CryptVerifyDetachedMessageSignature",8},{"crypt32.dll","CryptGetMessageSignerCount",3},{"crypt32.dll","CryptGetMessageCertificates",5},
+        {"crypt32.dll","CryptMsgGetAndVerifySigner",6},
+        {"crypt32.dll","CryptRegisterOIDFunction",5},{"crypt32.dll","CryptUnregisterOIDFunction",3},{"crypt32.dll","CryptGetOIDFunctionValue",7},{"crypt32.dll","CryptSetOIDFunctionValue",7},
+        {"crypt32.dll","CryptRegisterDefaultOIDFunction",4},{"crypt32.dll","CryptUnregisterDefaultOIDFunction",3},{"crypt32.dll","CryptGetDefaultOIDDllList",4},
+        {"crypt32.dll","CertAddCertificateLinkToStore",4},{"crypt32.dll","CryptSignCertificate",9},{"crypt32.dll","CryptSignAndEncodeCertificate",9},{"crypt32.dll","CryptHashToBeSigned",6},
+        {"crypt32.dll","CertFindCRLInStore",6},{"crypt32.dll","CertGetCRLFromStore",4},{"crypt32.dll","CertFindCertificateInCRL",5},{"crypt32.dll","CertIsValidCRLForCertificate",4},
+        {"crypt32.dll","CertVerifySubjectCertificateContext",3},{"crypt32.dll","CertGetStoreProperty",4},{"crypt32.dll","CertSetStoreProperty",4},
+        {"crypt32.dll","I_CryptFreeTls",2},{"crypt32.dll","I_CryptDetachTls",1},{"crypt32.dll","I_CryptReadTrustedPublisherDWORDValueFromRegistry",2},{"crypt32.dll","I_CryptGetDefaultCryptProv",1},
+        {"crypt32.dll","CryptGetDefaultOIDFunctionAddress",6},{"crypt32.dll","CryptRegisterOIDInfo",2},{"crypt32.dll","CryptUnregisterOIDInfo",1},{"crypt32.dll","CryptHashMessage",9},{"crypt32.dll","CryptVerifyMessageHash",7},{"crypt32.dll","CryptVerifyDetachedMessageHash",8},{"crypt32.dll","CryptMemAlloc",1},{"crypt32.dll","CryptMemRealloc",2},{"crypt32.dll","CryptMemFree",1},
         {"crypt32.dll","PFXIsPFXBlob",1},{"crypt32.dll","PFXVerifyPassword",3},{"crypt32.dll","PFXImportCertStore",3},
         {"crypt32.dll","CryptInstallOIDFunctionAddress",6},{"crypt32.dll","CryptInitOIDFunctionSet",2},
         {"crypt32.dll","CryptGetOIDFunctionAddress",6},{"crypt32.dll","CryptFreeOIDFunctionAddress",2},
@@ -463,12 +506,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
         std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> output(d2i_PUBKEY(nullptr,&cursor,static_cast<long>(der.size())),EVP_PKEY_free);if(!output || cursor!=der.data()+der.size())throw CertificateError{0x8009310b};return output;
     };
     try {
+        #include "crypt_oid_info.inc"
+        #include "certificate_compare.inc"
+        #include "certificate_public_key_info.inc"
+        #include "certificate_store_elements.inc"
+        #include "crypt_message_encode.inc"
+        #include "crypt_oid_registry.inc"
+        #include "certificate_crl_find.inc"
+        #include "certificate_sign.inc"
+        #include "certificate_link.inc"
         #include "certificate_pfx_import.inc"
         if(symbol=="CryptInstallOIDFunctionAddress" || symbol=="CryptInitOIDFunctionSet"){
             const bool install=symbol=="CryptInstallOIDFunctionAddress";
             const auto pointer=arg(install?2:0);const auto count=install?u32(3):0U,flags=u32(install?5:1);
             if(!pointer || (flags&~(install?1U:0U)) || count>65536 || (count && !arg(4)))throw CertificateError{87};
-            auto name=read_ansi(memory,pointer,1024);if(name.empty())throw CertificateError{87};
+            auto name=read_ansi(memory,pointer,1024);if(name.empty())throw CertificateError{87};const auto original=name;
             for(auto& c:name)if(c>='A' && c<='Z')c=static_cast<char>(c-'A'+'a');
             auto found=std::find_if(certs.oid_sets.begin(),certs.oid_sets.end(),[&](const auto& item){return item.second.name==name;});
             std::vector<CryptOidFunction> incoming;incoming.reserve(count);
@@ -481,7 +533,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
             }
             if(found==certs.oid_sets.end()){
                 if(certs.oid_sets.size()>=1024)throw CertificateError{8};
-                found=certs.oid_sets.emplace(runtime_.allocate_wait_handle(),CryptOidFunctionSet{std::move(name),{}}).first;
+                found=certs.oid_sets.emplace(runtime_.allocate_wait_handle(),CryptOidFunctionSet{std::move(name),{},original}).first;
             }
             auto& functions=found->second.functions;if(count>65536-functions.size())throw CertificateError{8};
             // 先驗證完整輸入，再一次插入；BEFORE 仍保留同一批陣列的順序。
@@ -496,13 +548,29 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
             auto key=arg(2)<=65535?"#"+std::to_string(arg(2)):"s:"+read_ansi(memory,arg(2),1024);
             for(auto& c:key)if(c>='A' && c<='Z')c=static_cast<char>(c-'A'+'a');
             const auto found=std::find_if(set->second.functions.begin(),set->second.functions.end(),[&](const auto& item){return item.encoding==(u32(1)&65535U) && item.oid==key;});
-            if(found==set->second.functions.end())throw CertificateError{2};
+            if(found==set->second.functions.end()){
+                // 沒有安裝的函式時（且未指定 CRYPT_GET_INSTALLED_OID_FUNC_FLAG）改用登錄的 Dll／FuncName：載入 DLL 並取得函式位址，handle 釋放時卸載。
+                if(u32(3)&1U)throw CertificateError{2};
+                const auto oid=arg(2)<=65535?"#"+std::to_string(arg(2)):read_ansi(memory,arg(2),1024);const auto& function=set->second.original.empty()?set->second.name:set->second.original;
+                const auto dll=crypt_oid_registry_value(u32(1)&65535U,function,oid,u"Dll");if(!dll || (dll->type!=1 && dll->type!=2) || dll->bytes.size()<4)throw CertificateError{2};
+                const auto override=crypt_oid_registry_value(u32(1)&65535U,function,oid,u"FuncName");
+                std::string procedure=function;if(override && (override->type==1 || override->type==2)){std::u16string text;for(std::size_t i=0;i+1<override->bytes.size();i+=2){const auto c=static_cast<char16_t>(override->bytes[i]|(override->bytes[i+1]<<8));if(!c)break;text+=c;}if(!text.empty())procedure=utf16_to_utf8(text);}
+                GuestScratch scratch(*this,memory,state);const auto path=scratch.allocate(dll->bytes.size()+2),name=scratch.allocate(procedure.size()+1);if(!path || !name)throw CertificateError{8};
+                memory.write(GuestAddress{path},dll->bytes);memory.store(GuestAddress{path+dll->bytes.size()},16,0);std::vector<std::uint8_t> ansi(procedure.begin(),procedure.end());ansi.push_back(0);memory.write(GuestAddress{name},ansi);
+                auto module=nested_service(state,memory,"kernel32.dll","LoadLibraryW",{path});if(x86_)module&=UINT32_MAX;if(!module)throw CertificateError{2};
+                auto address=nested_service(state,memory,"kernel32.dll","GetProcAddress",{module,name});if(x86_)address&=UINT32_MAX;
+                if(!address){(void)nested_service(state,memory,"kernel32.dll","FreeLibrary",{module});throw CertificateError{127};}
+                if(certs.oid_addresses.size()>=65536)throw CertificateError{8};CryptOidFunction loaded{key,address,module,u32(1)&65535U,true,UINT32_MAX};
+                const auto handle=runtime_.allocate_wait_handle();certs.oid_addresses.emplace(handle,loaded);memory.store(GuestAddress{arg(4)},bits,address);memory.store(GuestAddress{arg(5)},bits,handle);result=1;
+                arg.return_to(state,result);return std::nullopt;
+            }
             if(certs.oid_addresses.size()>=65536)throw CertificateError{8};
             const auto handle=runtime_.allocate_wait_handle();certs.oid_addresses.emplace(handle,*found);
             memory.store(GuestAddress{arg(4)},bits,found->address);memory.store(GuestAddress{arg(5)},bits,handle);result=1;
         }else if(symbol=="CryptFreeOIDFunctionAddress"){
             if(u32(1))throw CertificateError{87};
-            if(arg(0) && !certs.oid_addresses.erase(arg(0)))throw CertificateError{6};result=1;
+            if(arg(0)){const auto entry=certs.oid_addresses.find(arg(0));if(entry==certs.oid_addresses.end())throw CertificateError{6};const bool loaded=entry->second.loaded;const auto module=entry->second.module;
+                certs.oid_addresses.erase(entry);if(loaded && module)(void)nested_service(state,memory,"kernel32.dll","FreeLibrary",{module});}result=1;
         }else if(symbol=="CryptMsgOpenToDecode"){
             if((u32(0)&0xffff0000U)!=0x10000U || u32(1) || arg(3) || arg(4) || arg(5))throw CertificateError{50};
             if(u32(2)>2)throw CertificateError{50};if(certs.messages.size()>=128)throw CertificateError{8};
@@ -669,7 +737,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
                     else if(type==11){auto serial=asn1_content(encoded(X509_get0_serialNumber(cert.get()),i2d_ASN1_INTEGER));std::reverse(serial.begin(),serial.end());matches=encoded(X509_get_issuer_name(cert.get()),i2d_X509_NAME)==wanted && serial==wanted_serial;}
                     else if(type==12){matches=X509_check_issued(cert.get(),subject.get())==X509_V_OK;
                         if(matches && issuer_search){if((checks&1U) && X509_verify(subject.get(),X509_get0_pubkey(cert.get()))==1)checks&=~1U;
-                            if((checks&2U) && now>=certificate_time(X509_get0_notBefore(subject.get())) && now<=certificate_time(X509_get0_notAfter(subject.get())))checks&=~2U;if(checks&4U)checks|=0x10000U;}}
+                            if((checks&2U) && now>=certificate_time(X509_get0_notBefore(subject.get())) && now<=certificate_time(X509_get0_notAfter(subject.get())))checks&=~2U;
+                            // 撤銷：在同一存放區找此發行者簽發的 CRL；找不到時加上 CERT_STORE_NO_CRL_FLAG，未列出時清除旗標。
+                            if(checks&4U){const auto revoked=certificate_crl_revoked(arg(0),*item.der,wanted);if(!revoked)checks|=0x10000U;else if(!*revoked)checks&=~4U;}}}
                 }
                 if(matches){result=create_certificate(memory,*item.der,arg(0),item.identity);break;}
             }
@@ -843,10 +913,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
             }
             else if(system){
                 const auto flags=simple?0x10000U:u32(3);const auto location=flags&0xff0000U;const auto pointer=simple?arg(1):arg(4);
-                if((simple?arg(0):arg(2)) || (flags&~0x3c000U) || (location!=0x10000U && location!=0x20000U))throw CertificateError{50};if(!pointer)throw CertificateError{87};
-                auto name=(simple?symbol.ends_with('W'):arg(0)!=9)?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer));for(auto& c:name)c=unicode_case_unit(c,true);
-                if(name!=u"ROOT")throw CertificateError{50};
-                CertificateStore store;store.readonly=true;store.root_provider=true;const auto roots=certificate_roots(filesystem_);
+                if((simple?arg(0):arg(2)) || (flags&~0x3f204U) || (location!=0x10000U && location!=0x20000U))throw CertificateError{50};if(!pointer)throw CertificateError{87};
+                const auto display=(simple?symbol.ends_with('W'):arg(0)!=9)?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer));auto name=display;for(auto& c:name)c=unicode_case_unit(c,true);
+                if(name!=u"ROOT"){
+                    // ROOT 以外的系統存放區：沙箱登錄中的持久存放區。
+                    CertificateStore store;store.readonly=(flags&0x8000U)!=0;store.enum_archived=(flags&0x200U)!=0;
+                    if(const auto error=open_system_certificate_store(store,location,display,flags))throw CertificateError{error};
+                    store.system_location=location;set_store_localized_name(store,display);
+                    result=runtime_.allocate_wait_handle();certs.stores.emplace(result,std::move(store));arg.return_to(state,result);return std::nullopt;
+                }
+                CertificateStore store;store.readonly=true;store.root_provider=true;store.system_location=location;set_store_localized_name(store,u"Root");const auto roots=certificate_roots(filesystem_);
                 for(const auto& root:roots){const auto identity=store.next_identity++,property=certs.next_property_identity++;store.items.emplace(identity,encoded(root.get(),i2d_X509));store.property_identities.emplace(identity,property);certs.properties.emplace(property,CertificateProperties{});}
                 result=runtime_.allocate_wait_handle();certs.stores.emplace(result,std::move(store));
             }else if(arg(2) || (u32(3)&~0xb205U))fail(50);
@@ -935,6 +1011,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
             if(!added)throw CertificateError{last};
         }else throw HostCallFault("尚未實作憑證服務："+std::string(symbol));
     }catch(const CertificateError& error){fail(error.code);}catch(const MemoryFault&){fail(87);}catch(const std::bad_alloc&){fail(8);}
+    // 系統存放區的內容變更寫回沙箱登錄。
+    if(result && (symbol.starts_with("CertAdd") || symbol.starts_with("CertDelete") || symbol.starts_with("CertSet") || symbol=="CertRemoveEnhancedKeyUsageIdentifier"))
+        try{if(const auto error=persist_system_certificate_stores()){last_error_=error;result=0;}}catch(const CertificateError& error){last_error_=error.code;result=0;}
     arg.return_to(state,result);return std::nullopt;
 }
+#include "certificate_system_store.inc"
+#include "crypt_oid_registry_members.inc"
+#include "certificate_crl_members.inc"
 }

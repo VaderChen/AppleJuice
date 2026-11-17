@@ -27,6 +27,8 @@ std::uint32_t decode(const Bytes& bytes,Keys& keys){
 std::uint64_t WindowsServices::acquire_crypto_provider(std::string container,std::string name,std::uint32_t type,std::uint32_t flags){
     using namespace legacy_crypto;const auto fail=[&](std::uint32_t error){last_error_=error;return UINT64_C(0);};
     if(!legacy_crypto::provider(type))return fail(0x80090014);
+    // 未指定提供者時依序使用使用者預設、電腦預設（CryptSetProvider／CryptSetProviderEx 設定），都沒有或不在目錄內時使用目錄的第一個。
+    if(name.empty()){for(const bool user:{true,false})if(auto chosen=crypto_default_provider(type,user);chosen && legacy_crypto::provider(type,*chosen)){name=std::move(*chosen);break;}}
     const auto* catalog=legacy_crypto::provider(type,name);
     if(!catalog){const bool known=std::any_of(std::begin(providers),std::end(providers),[&](const auto& p){return name==p.name;});return fail(known?0x8009001bU:0x80090013U);}
     if(flags&~0xf0000078U || ((flags&24U)==24U))return fail(0x80090009);

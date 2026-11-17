@@ -159,6 +159,9 @@
         }else if(symbol=="D3DXCheckVersion"){
             // 所有 d3dx9_24～43 共用同一實作：接受 D3D_SDK_VERSION 31／32 與該範圍內的 D3DX_SDK_VERSION。
             const auto d3d=static_cast<std::uint32_t>(arg(0)),d3dx=static_cast<std::uint32_t>(arg(1));bool_result((d3d==31 || d3d==32) && d3dx>=24 && d3dx<=43);
+        }else if(symbol=="D3DXCpuOptimizations"){
+            // 回傳 D3DX_CPU_OPTIMIZATION：停用時 D3DX_NOT_OPTIMIZED 0；啟用時為虛擬 CPU 支援的 D3DX_SSE2_OPTIMIZED 2。d3dx10_43 經共用數學匯出使用同一入口。
+            result=static_cast<std::uint32_t>(arg(0))?2U:0U;
         }else if(symbol=="D3DXDebugMute"){
             // 偵錯輸出靜音旗標（每個程序一份，位於 CRT 資料區）；回傳先前的狀態。
             const GuestAddress cell{runtime_base_.value+200};result=memory.load(cell,32);memory.store(cell,32,static_cast<std::uint32_t>(arg(0))?1U:0U);

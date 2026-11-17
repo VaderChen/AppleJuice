@@ -13,7 +13,9 @@ constexpr std::string_view ntdll_loader_symbols[]{
     "RtlGetThreadPreferredUILanguages","RtlIdnToAscii","RtlIdnToUnicode","RtlNormalizeString","RtlIsNormalizedString",
     "RtlGetProcessPreferredUILanguages","RtlSetProcessPreferredUILanguages","RtlSetThreadPreferredUILanguages","RtlIdnToNameprepUnicode",
     "RtlConvertSidToUnicodeString","RtlEncodeSystemPointer","RtlDecodeSystemPointer","RtlGetFullPathName_UEx","RtlGetLongestNtPathLength",
-    "RtlDosPathNameToRelativeNtPathName_U","RtlDosPathNameToRelativeNtPathName_U_WithStatus","RtlReleaseRelativeName"};
+    "RtlDosPathNameToRelativeNtPathName_U","RtlDosPathNameToRelativeNtPathName_U_WithStatus","RtlReleaseRelativeName",
+    "LdrGetDllPath","RtlGetSearchPath","RtlGetExePath","RtlReleasePath","LdrQueryProcessModuleInformation",
+    "RtlQueryProcessPlaceholderCompatibilityMode","RtlSetProcessPlaceholderCompatibilityMode","RtlQueryThreadPlaceholderCompatibilityMode","RtlSetThreadPlaceholderCompatibilityMode"};
 }
 bool ntdll_loader_service(std::string_view symbol){return std::find(std::begin(ntdll_loader_symbols),std::end(ntdll_loader_symbols),symbol)!=std::end(ntdll_loader_symbols);}
 std::optional<std::uint32_t> WindowsServices::invoke_ntdll_loader(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -283,6 +285,87 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_loader(GuestState& st
             if(call(0)){const auto handle=memory.load(GuestAddress{call(0)+2*unit},bits);if(handle)(void)kernel("CloseHandle",{handle});
                 memory.write(GuestAddress{call(0)},std::vector<std::uint8_t>(x86_?16U:32U));}
             return finish(0);
+        }
+        // 搜尋路徑：LdrGetDllPath／RtlGetSearchPath 與載入器共用 dll_search_directories，RtlGetExePath 與 SearchPath 共用 default_search_paths，
+        // 三者看到的目錄順序與實際搜尋一致。字串以程序 heap 配置（RtlReleasePath 釋放），各項去掉結尾的 \（根目錄除外），目前目錄寫成 "."。
+        if(name=="LdrGetDllPath" || name=="RtlGetSearchPath" || name=="RtlGetExePath"){
+            const unsigned output=name=="LdrGetDllPath"?2U:name=="RtlGetExePath"?1U:0U;
+            if(!call(output))return finish(invalid_parameter);
+            memory.store(GuestAddress{call(output)},bits,0);if(name=="LdrGetDllPath" && call(3))memory.store(GuestAddress{call(3)},bits,0);
+            std::vector<std::u16string> entries;std::u16string environment_path;
+            if(name=="RtlGetExePath"){
+                // (ExecutableName, Path*)：預設順序中的目前目錄依 NeedCurrentDirectoryForExePath 決定是否保留；PATH 原樣接在最後。
+                if(!call(0))return finish(invalid_parameter);
+                std::size_t current=0;if(const auto error=default_search_paths(memory,entries,&current))return finish(nt_status(error));
+                if(entries.size()>5){environment_path=std::move(entries.back());entries.pop_back();}
+                if(executable_needs_current_directory(read_utf16(memory,GuestAddress{call(0)},32768)))entries[current].clear();
+                else entries.erase(entries.begin()+static_cast<std::ptrdiff_t>(current));
+            }else{
+                // LdrGetDllPath(DllName, Flags, DllPath*, SearchPaths*)：Flags 為 LoadLibraryEx 的搜尋旗標；ALTERED_SEARCH_PATH 或 DLL_LOAD_DIR
+                // 以 DllName 所在目錄搜尋相依 DLL；未指定搜尋旗標時套用 SetDefaultDllDirectories。RtlGetSearchPath 是傳統的標準順序。
+                auto flags=name=="LdrGetDllPath"?word(1):0U;std::u16string directory;
+                if(name=="LdrGetDllPath"){
+                    if((flags&8U) && (flags&0x1f00U))return finish(invalid_parameter);
+                    if((flags&0x108U) && call(0)){
+                        auto module=read_utf16(memory,GuestAddress{call(0)},32768);std::replace(module.begin(),module.end(),u'/',u'\\');
+                        if(const auto slash=module.find_last_of(u'\\');slash!=module.npos)directory=module.substr(0,slash+1);
+                    }
+                    if(!(flags&0x1f08U))flags|=runtime_.default_dll_directories;if(flags&0x1000U)flags=(flags&~0x1000U)|0xe00U;
+                }
+                entries=dll_search_directories(flags,directory);
+            }
+            std::u16string text;
+            for(auto entry:entries){
+                if(entry.empty())entry=u".";
+                else if(entry.size()>1 && (entry.back()==u'\\' || entry.back()==u'/') && !(entry.size()==3 && entry[1]==u':'))entry.pop_back();
+                if(!text.empty())text.push_back(u';');text+=entry;
+            }
+            if(!environment_path.empty()){if(!text.empty())text.push_back(u';');text+=environment_path;}
+            const auto bytes=utf16_bytes(text);const auto buffer=allocate_heap(memory,bytes.size());if(!buffer)return finish(no_memory);
+            memory.write(GuestAddress{buffer},bytes);memory.store(GuestAddress{call(output)},bits,buffer);return finish(0);
+        }
+        if(name=="RtlReleasePath"){if(call(0))(void)free_heap(memory,call(0),state);return finish(0);}
+        if(name=="LdrQueryProcessModuleInformation"){
+            // (RTL_PROCESS_MODULES*, Size, ReturnedSize*)：NumberOfModules 後接 RTL_PROCESS_MODULE_INFORMATION（x64 296、x86 284 位元組），
+            // 依 PEB 載入順序列出映像基址、大小、LDR 旗標、載入計數、載入／初始化順序與 256 位元組 ANSI 完整路徑（OffsetToFileName 指向檔名）。
+            publish_loader_data(memory);
+            std::vector<std::uint64_t> entries;
+            for(const auto base:runtime_.loader_published)if(const auto found=runtime_.loader_entries.find(base);found!=runtime_.loader_entries.end())entries.push_back(found->second);
+            std::map<std::uint64_t,std::uint16_t> initialized;
+            {const auto head=runtime_.loader_data+(x86_?0x1cU:0x30U);std::uint16_t index=0;
+             for(auto node=memory.load(GuestAddress{head},bits);node!=head && index<4096;node=memory.load(GuestAddress{node},bits))initialized.emplace(node-4*unit,index++);}
+            const unsigned record=x86_?284U:296U;const auto required=static_cast<std::uint32_t>(unit+entries.size()*record);
+            if(call(2))memory.store(GuestAddress{call(2)},32,required);
+            if(word(1)<required){if(call(0) && word(1)>=4)memory.store(GuestAddress{call(0)},32,entries.size());return finish(0xc0000004U);} // STATUS_INFO_LENGTH_MISMATCH
+            if(!call(0))return finish(invalid_parameter);
+            std::vector<std::uint8_t> bytes(required);
+            const auto put=[&](std::size_t at,unsigned size,std::uint64_t value){for(unsigned i=0;i<size;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
+            put(0,4,entries.size());
+            for(std::size_t i=0;i<entries.size();++i){
+                const auto entry=entries[i];const auto at=unit+i*record;
+                const auto base=memory.load(GuestAddress{entry+6*unit},bits),size=memory.load(GuestAddress{entry+8*unit},32);
+                const auto flags=memory.load(GuestAddress{entry+(x86_?0x34U:0x68U)},32),count=memory.load(GuestAddress{entry+(x86_?0x38U:0x6cU)},16);
+                auto path=utf16_to_utf8(native_string(memory,entry+(x86_?0x24U:0x48U),x86_));if(path.size()>255)path.resize(255);
+                const auto file=path.find_last_of("\\/");const auto file_at=file==path.npos?0U:static_cast<unsigned>(file+1);
+                // Section、MappedBase、ImageBase、ImageSize、Flags、LoadOrderIndex、InitOrderIndex、LoadCount、OffsetToFileName、FullPathName。
+                put(at+unit,unit,base);put(at+2*unit,unit,base);put(at+3*unit,4,size);put(at+3*unit+4,4,flags);
+                const auto found=initialized.find(entry);
+                put(at+3*unit+8,2,i);put(at+3*unit+10,2,found==initialized.end()?0:found->second);put(at+3*unit+12,2,count);put(at+3*unit+14,2,file_at);
+                std::copy(path.begin(),path.end(),bytes.begin()+static_cast<std::ptrdiff_t>(at+3*unit+16));
+            }
+            memory.write(GuestAddress{call(0)},bytes);return finish(0);
+        }
+        // Placeholder 相容模式（回傳 CHAR）：Set 回傳先前的模式；PHCM_ERROR_INVALID_PARAMETER＝-1、PHCM_ERROR_NO_TEB＝-2。程序可設 DISGUISE（1）
+        // 或 EXPOSE（2），預設 EXPOSE；執行緒另可設 APPLICATION_DEFAULT（0，沿用程序）。沙箱檔案系統沒有雲端 placeholder，模式不改變檔案查詢結果。
+        if(name.ends_with("PlaceholderCompatibilityMode")){
+            const bool set=name.starts_with("RtlSet"),thread=name.find("Thread")!=name.npos;
+            const auto mode=static_cast<std::int8_t>(call(0)&0xffU);
+            const auto result=[&](std::int8_t value){return finish(static_cast<std::uint8_t>(value));};
+            std::int8_t* target=&runtime_.placeholder_mode;
+            if(thread){const auto found=threads_.items.find(threads_.current);if(found==threads_.items.end())return result(-2);target=&found->second.placeholder_mode;}
+            if(!set)return result(*target);
+            if(mode<(thread?0:1) || mode>2)return result(-1);
+            const auto previous=*target;*target=mode;return result(previous);
         }
     }catch(const NativeError& error){return finish(error.status);}
     catch(const MemoryFault&){return finish(access_violation);}

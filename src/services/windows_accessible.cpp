@@ -1,9 +1,19 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/unicode.hpp"
+#include "builtin_version.hpp"
 #include <algorithm>
 namespace x64arm {
 namespace {
+// MSAA 角色（ROLE_SYSTEM_*，1～0x40）與狀態位元（STATE_SYSTEM_*）的英文顯示名稱；0 號狀態為 normal。
+constexpr std::u16string_view role_names[]{u"",u"title bar",u"menu bar",u"scroll bar",u"grip",u"sound",u"cursor",u"caret",u"alert",u"window",u"client",u"popup menu",u"menu item",
+    u"tool tip",u"application",u"document",u"pane",u"chart",u"dialog",u"border",u"grouping",u"separator",u"tool bar",u"status bar",u"table",u"column header",u"row header",
+    u"column",u"row",u"cell",u"link",u"help balloon",u"character",u"list",u"list item",u"outline",u"outline item",u"page tab",u"property page",u"indicator",u"graphic",
+    u"text",u"editable text",u"push button",u"check box",u"radio button",u"combo box",u"drop down",u"progress bar",u"dial",u"hot key field",u"slider",u"spin box",
+    u"diagram",u"animation",u"equation",u"drop down button",u"menu button",u"grid drop down button",u"white space",u"page tab list",u"clock",u"split button",u"IP address",u"outline button"};
+constexpr std::u16string_view state_names[]{u"unavailable",u"selected",u"focused",u"pressed",u"checked",u"mixed",u"read only",u"hot tracked",u"default",u"expanded",u"collapsed",
+    u"busy",u"floating",u"marqueed",u"animated",u"invisible",u"offscreen",u"sizeable",u"moveable",u"self voicing",u"focusable",u"selectable",u"linked",u"traversed",
+    u"multiple selectable",u"extended selectable",u"alert low",u"alert medium",u"alert high",u"protected",u"has popup"};
 using Guid=std::array<std::uint8_t,16>;
 constexpr Guid accessible_iid{0xe0,0x36,0x87,0x61,0x3d,0x3c,0xcf,0x11,0x81,0x0c,0,0xaa,0,0x38,0x9b,0x71};
 constexpr Guid dispatch_iid{0,4,2,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46},unknown_iid{0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
@@ -40,6 +50,8 @@ struct AccessibleState {
 };
 std::span<const WindowsServiceDescriptor> accessible_service_descriptors(){
     static const auto descriptors=[] {std::vector<WindowsServiceDescriptor> list{{"oleacc.dll","CreateStdAccessibleObject",4},{"oleacc.dll","AccessibleObjectFromWindow",4},{"oleacc.dll","AccessibleChildren",5},{"oleacc.dll","WindowFromAccessibleObject",2},{"oleacc.dll","LresultFromObject",3},{"oleacc.dll","ObjectFromLresult",4},
+        {"oleacc.dll","GetRoleTextA",3},{"oleacc.dll","GetRoleTextW",3},{"oleacc.dll","GetStateTextA",3},{"oleacc.dll","GetStateTextW",3},
+        {"oleacc.dll","GetOleaccVersionInfo",2},{"oleacc.dll","GetProcessHandleFromHwnd",1},
         {"uiautomationcore.dll","UiaGetReservedMixedAttributeValue",1},{"uiautomationcore.dll","UiaGetReservedNotSupportedValue",1},
         {"uiautomationcore.dll","UiaHostProviderFromHwnd",2},{"uiautomationcore.dll","UiaReturnRawElementProvider",4},
         {"uiautomationcore.dll","UiaRaiseAutomationEvent",2},{"uiautomationcore.dll","UiaRaiseAutomationPropertyChangedEvent",4,0,12},
@@ -137,6 +149,33 @@ std::optional<std::uint32_t> WindowsServices::invoke_accessible(GuestState& stat
         const auto method=[&](std::uint64_t object,unsigned index){const auto table=memory.load(GuestAddress{object},bits),target=memory.load(GuestAddress{table+index*unit},bits);if(!handles(GuestAddress{target}))memory.check(GuestAddress{target},1,Access::Execute);return target;};
         const auto scratch_for=[&](unsigned operation){const auto at=allocate_heap(memory,112);if(!at)throw std::bad_alloc{};memory.write(GuestAddress{at},std::vector<std::uint8_t>(112));memory.store(GuestAddress{at},64,operation);return at;};
 #include "windows_uia_provider.inc"
+        if(name.starts_with("GetRoleText") || name.starts_with("GetStateText")){
+            // (id, buffer, capacity)：回傳字元數（不含 NUL）；buffer 為 NULL 時回傳所需長度，容量不足時截斷並保留 NUL；未知角色或非單一狀態位元回 0。
+            const bool role=name.starts_with("GetRole"),wide=name.ends_with('W');const auto id=static_cast<std::uint32_t>(arg(0));std::u16string_view text;
+            if(role){if(id>0 && id<std::size(role_names))text=role_names[id];}
+            else if(!id)text=u"normal";
+            else if(!(id&(id-1))){const auto bit=static_cast<unsigned>(std::countr_zero(id));if(bit<std::size(state_names))text=state_names[bit];}
+            if(text.empty()){if(arg(1) && static_cast<std::uint32_t>(arg(2)))memory.store(GuestAddress{arg(1)},wide?16:8,0);return finish(0);}
+            if(!arg(1))return finish(text.size());const auto capacity=static_cast<std::uint32_t>(arg(2));if(!capacity)return finish(0);
+            const auto count=std::min<std::size_t>(text.size(),capacity-1);
+            if(wide){memory.write(GuestAddress{arg(1)},utf16_bytes(text.substr(0,count)));}
+            else{std::vector<std::uint8_t> bytes;for(std::size_t i=0;i<count;++i)bytes.push_back(static_cast<std::uint8_t>(text[i]));bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);}
+            return finish(count);
+        }
+        if(name=="GetOleaccVersionInfo"){
+            // 版本與內建 oleacc.dll 的版本資源一致：pVer＝主.次、pBuild＝組建.修訂（高字組／低字組）。
+            if(!arg(0) || !arg(1))return finish(0);const auto version=builtin_file_version("oleacc.dll");
+            memory.store(GuestAddress{arg(0)},32,(version[0]<<16)|(version[1]&0xffffU));memory.store(GuestAddress{arg(1)},32,(version[2]<<16)|(version[3]&0xffffU));return finish(0);
+        }
+        if(name=="GetProcessHandleFromHwnd"){
+            // 視窗所屬程序，存取權為 PROCESS_DUP_HANDLE｜VM_OPERATION｜VM_READ｜VM_WRITE｜SYNCHRONIZE；無效視窗回 NULL。
+            const auto saved=last_error_;const auto slot=allocate_heap(memory,8);if(!slot)return finish(0);
+            struct Free {WindowsServices& self;GuestMemory& memory;const GuestState& state;std::uint64_t at;~Free(){(void)self.free_heap(memory,at,state);}} release{*this,memory,state,slot};
+            memory.store(GuestAddress{slot},32,0);
+            if(!nested_service(state,memory,"user32.dll","GetWindowThreadProcessId",{arg(0),slot})){last_error_=1400;return finish(0);}
+            const auto pid=memory.load(GuestAddress{slot},32);const auto handle=nested_service(state,memory,"kernel32.dll","OpenProcess",{0x100078U,0,pid})&(x86_?UINT32_MAX:UINT64_MAX);
+            if(handle)last_error_=saved;return finish(handle);
+        }
         if(name=="LresultFromObject"){
             if(!arg(0) || !arg(2))return finish(invalid);if(bridge.transfers.size()>=4096 || bridge.next_transfer>0x7fffffffU)return finish(0x8007000eU);
             const auto iid=guid(arg(0));const auto target=method(arg(2),0),scratch=scratch_for(1);memory.write(GuestAddress{scratch+24},iid);memory.store(GuestAddress{scratch+56},64,arg(1));

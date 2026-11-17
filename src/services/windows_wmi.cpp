@@ -1,10 +1,14 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "x64arm/gpu_memory.hpp"
 #include "virtual_firmware.hpp"
+#include "service_callback_task.hpp"
+#include "windows_display_identity.hpp"
 #include <algorithm>
 #include <sstream>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 
 namespace x64arm {
 namespace {
@@ -12,6 +16,11 @@ constexpr unsigned locator=0,services=1,enumerator=2,object=3;
 constexpr std::array<std::string_view,4> interfaces{
     "dc12a687-737f-11cf-884d-00aa004b2e24","9556dc99-828c-11cf-a37e-00aa003240c7",
     "027947e1-d731-11ce-a357-000000000001","dc12a681-737f-11cf-884d-00aa004b2e24"};
+// WbemCli／WbemProv 的 Locator coclass 都提供 IWbemLocator；本機連線沿用相同的
+// 虛擬使用者、命名空間與認證限制，不因類別名稱另建後端或提升權限。
+constexpr std::array<std::string_view,4> locator_classes{
+    "4590f811-1d3a-11d0-891f-00aa004b2e24","cb8555cc-9128-11d1-ad9b-00c04fd8fdff",
+    "cd184336-9128-11d1-ad9b-00c04fd8fdff","443e7b79-de31-11d2-b340-00104bcc4b4a"};
 std::string guid(const GuestMemory& memory,std::uint64_t address){
     std::string result;constexpr char hex[]="0123456789abcdef";
     for(const unsigned offset:std::array<unsigned,16>{3,2,1,0,5,4,7,6,8,9,10,11,12,13,14,15}){
@@ -21,6 +30,22 @@ std::string guid(const GuestMemory& memory,std::uint64_t address){
     return result;
 }
 std::u16string key(std::u16string text){for(auto& c:text)if(c>=u'a' && c<=u'z')c-=32;return text;}
+struct WmiProperty {std::u16string_view name;std::uint32_t cim;};
+constexpr WmiProperty video_properties[]{
+    {u"AcceleratorCapabilities",0x2012},{u"AdapterCompatibility",8},{u"AdapterDACType",8},{u"AdapterRAM",19},
+    {u"Availability",18},{u"CapabilityDescriptions",0x2008},{u"Caption",8},{u"ColorTableEntries",19},
+    {u"ConfigManagerErrorCode",19},{u"ConfigManagerUserConfig",11},{u"CreationClassName",8},
+    {u"CurrentBitsPerPixel",19},{u"CurrentHorizontalResolution",19},{u"CurrentNumberOfColors",21},
+    {u"CurrentNumberOfColumns",19},{u"CurrentNumberOfRows",19},{u"CurrentRefreshRate",19},{u"CurrentScanMode",18},
+    {u"CurrentVerticalResolution",19},{u"Description",8},{u"DeviceID",8},{u"DeviceSpecificPens",19},{u"DitherType",19},
+    {u"DriverDate",101},{u"DriverVersion",8},{u"ErrorCleared",11},{u"ErrorDescription",8},{u"ICMIntent",19},{u"ICMMethod",19},
+    {u"InfFilename",8},{u"InfSection",8},{u"InstallDate",101},{u"InstalledDisplayDrivers",8},{u"LastErrorCode",19},
+    {u"MaxMemorySupported",19},{u"MaxNumberControlled",19},{u"MaxRefreshRate",19},{u"MinRefreshRate",19},{u"Monochrome",11},
+    {u"Name",8},{u"NumberOfColorPlanes",18},{u"NumberOfVideoPages",19},{u"PNPDeviceID",8},
+    {u"PowerManagementCapabilities",0x2012},{u"PowerManagementSupported",11},{u"ProtocolSupported",18},
+    {u"ReservedSystemPaletteEntries",19},{u"SpecificationVersion",19},{u"Status",8},{u"StatusInfo",18},
+    {u"SystemCreationClassName",8},{u"SystemName",8},{u"SystemPaletteEntries",19},{u"TimeOfLastReset",101},
+    {u"VideoArchitecture",18},{u"VideoMemoryType",18},{u"VideoMode",18},{u"VideoModeDescription",8},{u"VideoProcessor",8}};
 std::u16string property_spelling(const std::u16string& property){
     static const std::map<std::u16string,std::u16string> names=[] {
         std::map<std::u16string,std::u16string> result;
@@ -31,13 +56,41 @@ std::u16string property_spelling(const std::u16string& property){
             u"Speed",u"MemoryType",u"SMBIOSMemoryType",u"FormFactor",u"PartNumber",u"Product",u"Version",
             u"SMBIOSBIOSVersion",u"Caption",u"OSArchitecture",u"TotalVisibleMemorySize",u"FreePhysicalMemory",u"__CLASS",
             u"SMBiosData",u"Size",u"SmbiosMajorVersion",u"SmbiosMinorVersion",u"DmiRevision",u"Used20CallingMethod",u"InstanceName",u"Active"})result.emplace(key(text),text);
+        for(const auto& field:video_properties)result.emplace(key(std::u16string(field.name)),field.name);
         return result;
     }();
     const auto found=names.find(property);return found==names.end()?property:found->second;
 }
 WmiValue string_value(std::u16string value,std::uint32_t cim=8){return {8,cim,0,std::move(value)};}
 WmiValue number_value(std::uint32_t value,std::uint32_t cim=19){return {3,cim,value,{}};}
-std::optional<std::vector<WmiRow>> rows(std::u16string name,const GuestMemory& memory,const std::u16string& name_space,std::span<const std::uint8_t> firmware,const ProcessorInformation& cpu){
+WmiRow video_controller_row(const std::array<std::uint32_t,5>& mode,std::uint64_t gpu_memory){
+    WmiRow row;
+    // CIM 的可空硬體屬性保留型別並回 VT_NULL；不虛構 DAC、INF、記憶體上限或未取得的硬體能力。
+    for(const auto& property:video_properties)row.emplace(key(std::u16string(property.name)),WmiValue{1,property.cim,0,{}});
+    const auto text=[&](std::u16string_view name,std::u16string_view value){row[key(std::u16string(name))]=string_value(std::u16string(value));};
+    const auto number=[&](std::u16string_view name,std::uint32_t value,std::uint32_t cim=19){row[key(std::u16string(name))]=number_value(value,cim);};
+    for(auto name:{u"Name",u"Caption",u"Description",u"VideoProcessor"})text(name,display_identity::adapter_name);
+    text(u"DeviceID",u"VideoController1");text(u"PNPDeviceID",display_identity::instance);text(u"AdapterCompatibility",display_identity::vendor_name);
+    text(u"DriverVersion",display_identity::version);
+    text(u"CreationClassName",u"Win32_VideoController");text(u"SystemCreationClassName",u"Win32_ComputerSystem");text(u"Status",u"OK");
+    // 與 DXGI 相同的 UMA 配接器：獨立顯存為 0，共用顯存配額不冒充 AdapterRAM。
+    const auto adapter=display_identity::adapter_description(false,gpu_memory);std::uint32_t dedicated=0;
+    for(unsigned n=0;n<4;++n)dedicated|=std::uint32_t{adapter[272+n]}<<(n*8);
+    number(u"AdapterRAM",dedicated);number(u"Availability",3,18);number(u"ConfigManagerErrorCode",0);number(u"LastErrorCode",0);
+    if(mode[0] && mode[1]){
+        number(u"CurrentBitsPerPixel",mode[2]);number(u"CurrentHorizontalResolution",mode[0]);number(u"CurrentVerticalResolution",mode[1]);number(u"CurrentRefreshRate",mode[3]);
+        row[u"CURRENTNUMBEROFCOLORS"]=string_value(utf8_to_utf16(std::to_string(UINT64_C(1)<<std::min(mode[2],32U))),21);
+    }
+    number(u"CurrentNumberOfColumns",0);number(u"CurrentNumberOfRows",0);number(u"NumberOfColorPlanes",1,18);
+    number(u"CurrentScanMode",mode[4]==1?4U:mode[4]==2 || mode[4]==3?3U:2U,18);
+    for(auto name:{u"ConfigManagerUserConfig",u"Monochrome",u"PowerManagementSupported"})row[key(name)]={11,11,0,{}};
+    number(u"StatusInfo",3,18);number(u"VideoArchitecture",1,18);number(u"VideoMemoryType",2,18);number(u"MaxNumberControlled",0);
+    const auto moment=std::chrono::sys_seconds{std::chrono::seconds{static_cast<std::int64_t>(display_identity::date_filetime/10000000)-INT64_C(11644473600)}};
+    const auto day=std::chrono::floor<std::chrono::days>(moment);const std::chrono::year_month_day date{day};const std::chrono::hh_mm_ss time_of_day{moment-day};
+    char timestamp[32];std::snprintf(timestamp,sizeof timestamp,"%04d%02u%02u%02lld%02lld%02lld.000000+000",static_cast<int>(date.year()),static_cast<unsigned>(date.month()),static_cast<unsigned>(date.day()),static_cast<long long>(time_of_day.hours().count()),static_cast<long long>(time_of_day.minutes().count()),static_cast<long long>(time_of_day.seconds().count()));
+    row[u"DRIVERDATE"]=string_value(utf8_to_utf16(timestamp),101);return row;
+}
+std::optional<std::vector<WmiRow>> rows(std::u16string name,const GuestMemory& memory,const std::u16string& name_space,std::span<const std::uint8_t> firmware,const ProcessorInformation& cpu,const std::array<std::uint32_t,5>& display,std::uint64_t gpu_memory){
     name=key(std::move(name));WmiRow row;
     if(name_space==u"ROOT\\WMI"){
         if(name==u"MSSMBIOS_RAWSMBIOSTABLES"){
@@ -62,6 +115,7 @@ std::optional<std::vector<WmiRow>> rows(std::u16string name,const GuestMemory& m
         {u"CURRENTCLOCKSPEED",cpu.nominal_mhz?number_value(cpu.nominal_mhz):WmiValue{1,19,0,{}}},
         {u"L2CACHESIZE",number_value(virtual_processor_caches(memory.processor_count())[2].size/1024)},
         {u"L3CACHESIZE",number_value(virtual_processor_caches(memory.processor_count())[3].size/1024)}};
+    else if(name==u"WIN32_VIDEOCONTROLLER")row=video_controller_row(display,gpu_memory);
     else if(name==u"WIN32_COMPUTERSYSTEM")row={
         {u"MANUFACTURER",string_value(utf8_to_utf16(virtual_firmware::manufacturer))},{u"MODEL",string_value(utf8_to_utf16(virtual_firmware::product))},
         {u"SYSTEMTYPE",string_value(u"x64-based PC")},{u"NUMBEROFPROCESSORS",number_value(1)},
@@ -85,7 +139,7 @@ std::optional<std::vector<WmiRow>> rows(std::u16string name,const GuestMemory& m
 }
 std::span<const WindowsServiceDescriptor> wmi_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
-        {"ole32.dll","CoSetProxyBlanket",8},
+        {"ole32.dll","CoSetProxyBlanket",8},{"ole32.dll","CoQueryProxyBlanket",8},
         {"internal-wmi","QueryInterface",3},{"internal-wmi","AddRef",1},{"internal-wmi","Release",1},
         {"internal-wmi","ConnectServer",9},{"internal-wmi","ExecQuery",6},{"internal-wmi","CreateInstanceEnum",5},
         {"internal-wmi","Reset",1},{"internal-wmi","Next",5},{"internal-wmi","Clone",2},{"internal-wmi","Skip",3},
@@ -94,6 +148,52 @@ std::span<const WindowsServiceDescriptor> wmi_service_descriptors(){
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_wmi(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol=="CoSetProxyBlanket" || service.symbol=="CoQueryProxyBlanket"){
+        return service_callback::invoke<std::optional<std::uint32_t>>(
+            this,threads_.current,state,memory,service.symbol,
+            [this](GuestState& s,GuestMemory& m,std::uint64_t target,std::vector<std::uint64_t> args,std::uint64_t id){start_callbacks(s,m,{{target,std::move(args)}},Continuation::NestedResult,id);},
+            [this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(s,m,service);const auto done=[&](std::uint32_t hr){call.return_to(s,hr);return std::optional<std::uint32_t>{};};
+                const bool setting=service.symbol=="CoSetProxyBlanket";const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
+                if(!call(0))co_return done(0x80070057U);
+                try{
+                    if(auto found=runtime_.wmi_objects.find(call(0));found!=runtime_.wmi_objects.end()){
+                        auto& proxy=found->second;
+                        if(setting){
+                            // 本機 WMI 不建立遠端身分或 principal；絕不接受卻捨棄呼叫端的認證。
+                            const auto sentinel=static_cast<std::uint64_t>(x86_?UINT32_MAX:UINT64_MAX);
+                            if((call(3) && call(3)!=sentinel) || (call(6) && call(6)!=sentinel))co_return done(0x80004001U);
+                            const auto defaults=runtime_.com_security.value_or(std::array<std::uint32_t,3>{3,3,0});
+                            auto authn=static_cast<std::uint32_t>(call(1)),authz=static_cast<std::uint32_t>(call(2));
+                            auto level=static_cast<std::uint32_t>(call(4)),imp=static_cast<std::uint32_t>(call(5)),cap=static_cast<std::uint32_t>(call(7));
+                            if(authn==UINT32_MAX)authn=10;if(authz==UINT32_MAX)authz=0;if(!level || level==UINT32_MAX)level=defaults[0]?defaults[0]:3;if(!imp || imp==UINT32_MAX)imp=defaults[1]?defaults[1]:3;
+                            if(cap==0x800U)cap=defaults[2]&0x60U;
+                            if(level>6 || imp>4 || (cap&~0x60U) || (cap&0x60U)==0x60U)co_return done(0x80070057U);
+                            if((authn!=0 && authn!=10 && authn!=16) || authz)co_return done(0x800706d3U);
+                            proxy.authn_service=authn;proxy.authz_service=authz;proxy.authn_level=level;proxy.imp_level=imp;proxy.security_capabilities=cap;
+                        }else{
+                            for(unsigned i=1;i<8;++i)if(call(i))m.check(GuestAddress{call(i)},i==3 || i==6?unit:4,Access::Write);
+                            const std::array<std::uint64_t,7> values{proxy.authn_service,proxy.authz_service,0,proxy.authn_level,proxy.imp_level,0,proxy.security_capabilities};
+                            for(unsigned i=1;i<8;++i)if(call(i))m.store(GuestAddress{call(i)},i==3 || i==6?bits:32,values[i-1]);
+                        }co_return done(0);
+                    }
+                    // 任意客體 COM 代理遵守官方 QI → Query/SetBlanket → Release 契約，保留提供者的 HRESULT。
+                    const auto scratch=allocate_heap(m,unit+16);if(!scratch)co_return done(0x8007000eU);
+                    struct Scratch {WindowsServices& self;GuestState& state;GuestMemory& memory;std::uint64_t pointer;~Scratch(){(void)self.free_heap(memory,pointer,state);}} cleanup{*this,s,m,scratch};
+                    constexpr WindowsGuid client_security{0x3d,0x01,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
+                    m.store(GuestAddress{scratch},bits,0);m.write(GuestAddress{scratch+unit},client_security);
+                    const auto method=[&](std::uint64_t proxy_pointer,unsigned slot){const auto table=m.load(GuestAddress{proxy_pointer},bits);return m.load(GuestAddress{table+slot*unit},bits);};
+                    std::vector<std::uint64_t> args{0};for(unsigned i=0;i<8;++i)args.push_back(call(i));
+                    auto hr=static_cast<std::uint32_t>(co_await service_callback::call(method(call(0),0),{call(0),scratch+unit,scratch}));
+                    if(hr&0x80000000U)co_return done(hr);const auto security=m.load(GuestAddress{scratch},bits);if(!security)co_return done(0x80004002U);
+                    args[0]=security;
+                    // 先解析兩個入口，避免 provider 方法返回後才發現無法釋放。
+                    const auto target=method(security,setting?4:3),release=method(security,2);
+                    hr=static_cast<std::uint32_t>(co_await service_callback::call(target,std::move(args)));
+                    (void)co_await service_callback::call(release,{security});co_return done(hr);
+                }catch(const MemoryFault&){co_return done(0x80004003U);}catch(const HostCallFault&){co_return done(0x80004003U);}catch(const std::bad_alloc&){co_return done(0x8007000eU);}
+            });
+    }
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;std::uint32_t result=0;
     const std::uint8_t width=x86_?32:64;const unsigned unit=width/8;
     const auto output=[&](std::uint64_t at,std::uint64_t value){memory.store(GuestAddress{at},width,value);};
@@ -105,6 +205,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wmi(GuestState& state,Guest
     };
     const auto create=[&](WmiObject value)->std::uint64_t{
         if(runtime_.wmi_objects.size()>=4096)return 0;
+        if(runtime_.com_security){value.authn_level=(*runtime_.com_security)[0];value.imp_level=(*runtime_.com_security)[1];}
         if(!runtime_.wmi_vtables.contains(value.kind)){
             std::map<unsigned,std::string_view> methods{{0,"QueryInterface"},{1,"AddRef"},{2,"Release"}};unsigned count=3;
             if(value.kind==locator){count=4;methods[3]="ConnectServer";}
@@ -122,7 +223,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wmi(GuestState& state,Guest
         if(!arg(4))result=0x80004003U;
         else {
             output(arg(4),0);
-            if(guid(memory,arg(0))!="4590f811-1d3a-11d0-891f-00aa004b2e24")result=0x80040154U;
+            if(std::ranges::find(locator_classes,guid(memory,arg(0)))==locator_classes.end())result=0x80040154U;
             else if(arg(1))result=0x80040110U;
             else if(!(static_cast<std::uint32_t>(arg(2))&1))result=0x80040154U;
             else if(guid(memory,arg(3))!=interfaces[locator] && guid(memory,arg(3))!="00000000-0000-0000-c000-000000000046")result=0x80004002U;
@@ -141,11 +242,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_wmi(GuestState& state,Guest
             else {if(current.references==UINT32_MAX)throw HostCallFault("WMI 引用計數溢位");++current.references;output(arg(2),arg(0));}}
     } else if(name=="AddRef"){if(current.references==UINT32_MAX)throw HostCallFault("WMI 引用計數溢位");result=++current.references;}
     else if(name=="Release"){result=--current.references;if(!result){runtime_.wmi_objects.erase(found);(void)free_heap(memory,arg(0),state);}}
-    else if(name=="CoSetProxyBlanket"){
-        // 所有物件均在此程序內；不接受遠端認證資料或自訂 principal。
-        if(arg(3) || arg(6) || arg(7))result=0x80004001U;
-        else if(static_cast<std::uint32_t>(arg(4))>6 || static_cast<std::uint32_t>(arg(5))>4)result=0x80070057U;
-    } else if(name=="ConnectServer" && current.kind==locator){
+    else if(name=="ConnectServer" && current.kind==locator){
         if(!arg(8))result=0x80004003U;
         else {output(arg(8),0);auto path=key(read_utf16(memory,GuestAddress{arg(1)},1024));std::replace(path.begin(),path.end(),u'/',u'\\');
             if(path.starts_with(u"\\\\.\\"))path.erase(0,4);
@@ -174,7 +271,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_wmi(GuestState& state,Guest
                 const auto root_info=filesystem_.information("C:\\");
                 const auto cpu=guest_processor_information(memory);
                 const auto firmware=virtual_firmware::smbios(memory.processor_count(),installed_physical_memory(memory),root_info.metadata.id^(root_info.metadata.device<<32),cpu);
-                const auto data=rows(class_name,memory,current.name_space,firmware,cpu);
+                std::array<std::uint32_t,5> display{};
+                if(class_name==u"WIN32_VIDEOCONTROLLER"){
+                    const auto native=native_gui_?native_gui_->current_display_mode():std::optional<GuiDisplayMode>{};const auto& monitors=gui_monitors();
+                    if(!monitors.empty()){const auto& monitor=monitors.front();
+                        display={monitor.primary && native?native->width:static_cast<std::uint32_t>(monitor.rect[2]-monitor.rect[0]),monitor.primary && native?native->height:static_cast<std::uint32_t>(monitor.rect[3]-monitor.rect[1]),32,monitor.primary && native?(native->refresh_numerator+native->refresh_denominator/2)/std::max(1U,native->refresh_denominator):monitor.refresh,native?native->scanline:0U};}
+                    if(gui_.display_mode)std::copy(gui_.display_mode->begin(),gui_.display_mode->end(),display.begin());
+                }
+                const auto data=rows(class_name,memory,current.name_space,firmware,cpu,display,gpu_memory_stats().limit);
                 if(std::getenv("X64ARM_TRACE_WMI"))std::fprintf(stderr,"[wmi] query namespace=%s class=%s rows=%lld\n",utf16_to_utf8(current.name_space).c_str(),utf16_to_utf8(class_name).c_str(),data?static_cast<long long>(data->size()):-1LL);
                 if(!data)result=0x80041010U;
                 else {WmiObject value;value.kind=enumerator;value.rows=*data;

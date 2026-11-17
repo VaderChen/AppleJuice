@@ -142,6 +142,16 @@ inline BasicCall<std::uint64_t> call_value(std::uint64_t target,std::vector<std:
 // 依完整規格呼叫客體函式（DispCallFunc 一類需要 64 位元／浮點參數或回傳值者）；回傳值含 EDX:EAX 或 ST(0)／XMM0。
 inline BasicCall<std::uint64_t> call_native(GuestCallback spec){auto target=spec.target;auto arguments=spec.arguments;return {target,std::move(arguments),nullptr,{},std::move(spec)};}
 
+// 續行完成後原 API 會重新進入一次以取回結果（state 回到進入點）；進入續行前有副作用的服務以此判斷，重播時直接取回結果、不重做副作用。
+inline bool completed(void* service,std::uint64_t thread,std::string_view kind,const GuestState& state){
+    std::lock_guard lock(contexts_mutex);
+    for(const auto& [id,candidate]:contexts){
+        (void)id;
+        if(candidate->service==service && candidate->thread==thread && candidate->kind==kind && candidate->entry.rip==state.rip &&
+           candidate->entry.reg(Gpr::Rsp)==state.reg(Gpr::Rsp) && candidate->done())return true;
+    }
+    return false;
+}
 template<class T,class Factory>
 T invoke(void* service,std::uint64_t thread,GuestState& state,GuestMemory& memory,
          std::string_view kind,Begin begin,Factory factory){

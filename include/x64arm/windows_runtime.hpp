@@ -45,6 +45,7 @@ struct RuntimeFunction {
 };
 struct RuntimeImage {
     std::uint64_t base{}, size{}, stack_base{}, stack_size{};
+    std::uint32_t provider_data_rva{},provider_data_size{},provider_data_used{};
     std::uint64_t tls_index{};
     std::vector<std::uint8_t> tls_data;
     std::size_t tls_zero{}, tls_alignment{16};
@@ -134,7 +135,7 @@ struct ModuleOperation {
     std::uint32_t thread_exit_code{};
     bool operator==(const ModuleOperation&) const = default;
 };
-enum class Continuation { NativeApc, NativeApcIoError, RecentDocument, GuiClipboardNotification, GuiBeginPaint, SocketAccept, ComAgileOperation, FunctionTableLookup, ExceptionFunctionLookup, CapturePreviousContext, GuiOpenIcon, ComBindOperation, D3DXProgressOperation, D3DCompileOperation, Msvcp100Operation, UnwindConsolidate, CrtAssertion, CrtFatalDialog, GuiMouseInput, GuiMoveSize, ThemeTextOperation, MdiMoveOperation, StorageOperation, StorageCopyOperation, GuiGrayString, ComOperation, AutomationOperation, DirectInputEnumeration, StackWalkOperation, DemangleOperation, Eh4Operation, GuiAsyncSend, GuiAsyncCallback, GuiWaitMessage, DWriteOperation, CrtNewResult, CrtNewRetry, CrtInvalidNewMode, GuiSendTimeout, AccessibleOperation, SafeArrayOperation, OleStreamCopy, PrintAbort, UnhandledFilter, FiberDelete, UserApc, GuiIntegerText, WindowEnumeration, LocaleEnumeration, RegistryBooleanResult, ResourceEnumeration, MetafileEnumeration, GuiWinEvent, FileTransfer, ReturnUntilFalse, Return, Startup, InitTermE, Exit, ThreadExit, ReturnCallback, Exception, ContinueException, SehFilter, GuiNcCreate, GuiCreate, GuiDialogInit, GuiModalInit, GuiModalDispatch, GuiModalEnd, GuiDestroy, GuiDestroyDefault, GuiMenuInit, GuiMenuFinish, GuiSentMessage, GuiControlOperation, CrtExit, Sort, OleVariantClear, OleVariantCopy, ModuleOperation, OleReleaseStgMedium, MsvcCopy, MsvcUnwind, MsvcCatch, MsvcDestroy, GuiWindowPos, GuiWindowNcCalc, GuiHook, GuiMsgFilterSystem, GuiModalSystemFilter, GuiModalFilter, GuiCbtCreate, GuiCreationNcCreate, GuiCreationNcCalc, GuiCreationCreate, GuiCreationFinish, GuiCreationAbort, GuiDialogProc, GuiBusyHook, GuiBusyResult, OleClipboardOperation, GuiPropertySheet, GuiCbtAction, FontEnumeration, OnExitTable, InitOnce, RegisteredWait, ReturnCallbackFreeHeap, NtCloseResult, ReturnZeroFreeHeap, CertificateDecodeAllocation, CertificateFind, SymbolFunctionEntry, MiniDumpOperation, EtwCallback, EtwProcess, WinrtOperation, NativeV8Operation, NativeOperation, TypeLibraryInvoke, TypeLibraryAddress, PrintDialogOperation, PageSetupStart, PageSetupResult, PageSetupHook, PageSetupPaint, PrintPropertyPageOperation, ShellItemOperation, ComMarshalOperation, OleDragLoop, OleDragTarget, ComProxyDispatch, ComErrorSet, ComErrorRetire, RestrictedError, WinrtOriginSetup, WinrtOriginFinish, GuiDragDetection, ComContextOperation, MediaFoundationQuery, InitTerm, ReturnUntilFailure, ServiceMain, ServiceControl, GuiTextThunk, BeepTone, PolicyRetry, OlePersistence, CrtLongjmp, ComRotOperation, PerflibOperation, MciWait, ConsoleControl, TaskDialogOperation, DdeOperation, ComSpyOperation, GdiplusStream, FontPackage, WinUsbTransfer, WinUsbOverlapped, KernelRequest, SehFinally, MsiOperation, EsentOperation, NestedResult, MonitorEnumeration, GuiRetrievedMessage, AcmEnumeration };
+enum class Continuation { NativeApc, NativeApcIoError, RecentDocument, GuiClipboardNotification, GuiBeginPaint, SocketAccept, ComAgileOperation, FunctionTableLookup, ExceptionFunctionLookup, CapturePreviousContext, GuiOpenIcon, ComBindOperation, D3DXProgressOperation, D3DCompileOperation, Msvcp100Operation, UnwindConsolidate, CrtAssertion, CrtFatalDialog, GuiMouseInput, GuiMoveSize, ThemeTextOperation, MdiMoveOperation, StorageOperation, StorageCopyOperation, GuiGrayString, ComOperation, AutomationOperation, DirectInputEnumeration, StackWalkOperation, DemangleOperation, Eh4Operation, GuiAsyncSend, GuiAsyncCallback, GuiWaitMessage, DWriteOperation, CrtNewResult, CrtNewRetry, CrtInvalidNewMode, GuiSendTimeout, AccessibleOperation, SafeArrayOperation, OleStreamCopy, PrintAbort, UnhandledFilter, FiberDelete, UserApc, GuiIntegerText, WindowEnumeration, LocaleEnumeration, RegistryBooleanResult, ResourceEnumeration, MetafileEnumeration, GuiWinEvent, FileTransfer, ReturnUntilFalse, Return, Startup, InitTermE, Exit, ThreadExit, ReturnCallback, Exception, ContinueException, SehFilter, GuiNcCreate, GuiCreate, GuiDialogInit, GuiModalInit, GuiModalDispatch, GuiModalEnd, GuiDestroy, GuiDestroyDefault, GuiMenuInit, GuiMenuFinish, GuiSentMessage, GuiControlOperation, CrtExit, Sort, OleVariantClear, OleVariantCopy, ModuleOperation, OleReleaseStgMedium, MsvcCopy, MsvcUnwind, MsvcCatch, MsvcDestroy, GuiWindowPos, GuiWindowNcCalc, GuiHook, GuiMsgFilterSystem, GuiModalSystemFilter, GuiModalFilter, GuiCbtCreate, GuiCreationNcCreate, GuiCreationNcCalc, GuiCreationCreate, GuiCreationFinish, GuiCreationAbort, GuiDialogProc, GuiBusyHook, GuiBusyResult, OleClipboardOperation, GuiPropertySheet, GuiCbtAction, FontEnumeration, OnExitTable, InitOnce, RegisteredWait, ReturnCallbackFreeHeap, NtCloseResult, ReturnZeroFreeHeap, CertificateDecodeAllocation, CertificateFind, SymbolFunctionEntry, MiniDumpOperation, EtwCallback, EtwProcess, WinrtOperation, NativeV8Operation, NativeOperation, TypeLibraryInvoke, TypeLibraryAddress, PrintDialogOperation, PageSetupStart, PageSetupResult, PageSetupHook, PageSetupPaint, PrintPropertyPageOperation, ShellItemOperation, ComMarshalOperation, OleDragLoop, OleDragTarget, ComProxyDispatch, ComErrorSet, ComErrorRetire, RestrictedError, WinrtOriginSetup, WinrtOriginFinish, GuiDragDetection, ComContextOperation, MediaFoundationQuery, InitTerm, ReturnUntilFailure, ServiceMain, ServiceControl, GuiTextThunk, BeepTone, PolicyRetry, OlePersistence, CrtLongjmp, ComRotOperation, PerflibOperation, MciWait, ConsoleControl, TaskDialogOperation, DdeOperation, ComSpyOperation, GdiplusStream, FontPackage, WinUsbTransfer, WinUsbOverlapped, KernelRequest, SehFinally, MsiOperation, EsentOperation, NestedResult, MonitorEnumeration, GuiRetrievedMessage, AcmEnumeration, SymbolEnumeration };
 struct GuiHookFrame {
     std::vector<std::uint64_t> handles,scratch;
     std::size_t index{};
@@ -347,6 +348,8 @@ struct WmiObject {
     unsigned kind{},references{1};std::size_t cursor{};std::vector<WmiRow> rows;
     std::u16string name_space;
     std::vector<std::u16string> property_names;bool enumerating{};
+    // 本機 COM 代理的 blanket 狀態；遠端認證資料仍交由真正的 IClientSecurity 提供者處理。
+    std::uint32_t authn_service{10},authz_service{},authn_level{3},imp_level{3},security_capabilities{};
     bool operator==(const WmiObject&) const = default;
 };
 struct CriticalSection {
@@ -391,9 +394,11 @@ struct ProcessSnapshot {
         bool operator==(const Thread&) const = default;
     };
     std::vector<Thread> threads;
+    // TH32CS_SNAPHEAPLIST：建立當下的程序堆積（第一個為預設堆積）。
+    std::vector<std::uint64_t> heaps;
     std::u16string executable;
     std::uint32_t flags{};
-    std::size_t process_cursor{}, thread_cursor{}, module_cursor{};
+    std::size_t process_cursor{}, thread_cursor{}, module_cursor{}, heap_cursor{};
     bool operator==(const ProcessSnapshot&) const = default;
 };
 struct CompletionPacket {
@@ -459,6 +464,8 @@ struct SymbolSession {
     std::map<std::uint64_t,SymbolModule> images;
     std::uint64_t function_callback{}, function_context{};
     bool function_callback_active{};
+    // SymSetContext／SymSetScopeFrom*：目前的 IMAGEHLP_STACK_FRAME（InstructionOffset、ReturnOffset、FrameOffset、StackOffset）。
+    std::array<std::uint64_t,4> scope{};
     bool operator==(const SymbolSession&) const = default;
 };
 struct ComClassRegistration {
@@ -501,7 +508,12 @@ struct RuntimeState {
     std::optional<std::uint32_t> forced_exit_code()const noexcept{return job_exit_code?job_exit_code:shutdown_exit_code;}
     std::uint64_t observed_commit_peak{};
     std::uint32_t symbol_options{6};
+    // SymSetExtendedOption（SYMOPT_EX_*，目前 4 種）與 SymSetParentWindow。
+    std::array<bool,4> symbol_extended_options{};
+    std::uint64_t symbol_parent_window{};
     std::map<std::uint64_t,SymbolSession> symbol_sessions;
+    // ImageLoad 配置的 LOADED_IMAGE；ImageUnload 只接受清單內的位址。
+    std::set<std::uint64_t> imagehlp_images;
     // EnumerateLoadedModules* 回呼使用的模組路徑字串（ANSI／UTF-16），以完整路徑快取，整個程序期間有效。
     std::map<std::u16string,std::array<std::uint64_t,2>> loaded_module_names;
     unsigned processor_count{1};
@@ -538,6 +550,8 @@ struct RuntimeState {
     bool file_apis_ansi{true};
     bool registry_cache_disabled{},registry_user_cache_disabled{};
     std::map<std::uint32_t,std::u16string> registry_predefined_cache;
+    // RegOverridePredefKey：本程序內預先定義機碼改對應到的機碼（複製當時 handle 的路徑、檢視與存取權）。
+    std::map<std::uint32_t,RegistryHandle> registry_predefined_overrides;
     std::map<std::uint64_t,std::uint32_t> token_handles{};
     std::map<std::uint64_t,std::uint64_t> token_handle_objects;
     std::map<std::uint64_t,VirtualToken> token_objects;
@@ -569,6 +583,7 @@ struct RuntimeState {
     std::map<std::uint64_t,WinTrustState> trust_states;
     std::map<std::uint64_t,CatalogAdmin> catalog_admins;
     std::map<std::uint64_t,CatalogContext> catalog_contexts;
+    std::map<std::uint64_t,CatalogDocument> catalog_documents;
     std::set<std::uint64_t> storage_crypto_providers;
     std::map<std::uint64_t, StorageCryptoKey> storage_crypto_keys;
     std::map<std::uint64_t, std::vector<std::uint8_t>> crypto_secrets;
@@ -771,6 +786,8 @@ struct RuntimeState {
     std::uint64_t crt_current_locale{};
     // SetProcessPreferredUILanguages 設定的程序偏好 UI 語言（以 locale 名稱保存）。
     std::vector<std::u16string> preferred_ui_languages;
+    // RtlSetProcessPlaceholderCompatibilityMode；一般程式預設看得到 placeholder（PHCM_EXPOSE_PLACEHOLDERS）。
+    std::int8_t placeholder_mode{2};
     // SetProcessWorkingSetSizeEx 的硬性上下限旗標；預設兩者皆停用。SetSystemFileCacheSize 的設定（需要 SeIncreaseQuotaPrivilege）。
     std::uint32_t working_set_flags{0xa};
     // 程序共用的核心→使用者 instrumentation 入口；0 代表未註冊。

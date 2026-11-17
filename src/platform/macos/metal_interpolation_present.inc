@@ -46,6 +46,7 @@ class MetalInterpolationPresenter {
         return command;
     }
     void run() noexcept {
+        metal_present_thread_start("x64arm.present.queued");
         try {
             for(;;){
                 unsigned index=0;id<MTLCommandBuffer> ready;macos_detail::MetalFrameTiming timing;bool has_generated=false;

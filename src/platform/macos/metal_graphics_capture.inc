@@ -58,17 +58,23 @@ template<class Read> static void metal_trace_target(std::ostream& o,const char* 
         o<<" img="<<w<<'x'<<h<<":f"<<format<<":mean"<<sum/static_cast<double>(std::max<std::size_t>(count*3,1))<<":max"<<peak<<":bad"<<bad;
     }catch(const std::exception&){o<<" img=?";}
 }
-// 常數緩衝內容：每幀每個緩衝只讀一次，全部記 FNV 雜湊；1 KB 以上（View 類）另以獨立行記完整十六進位內容。
-template<class Read> static void metal_trace_constant(std::ostream& o,std::vector<std::string>& extra,const std::shared_ptr<GraphicsResource>& constant,const Read& graphics_read){
-    static std::uint64_t dumped_frame=UINT64_MAX;static std::set<const void*> dumped;
+// 緩衝診斷只讀指定窗口；共用上傳 arena 可能超過百 MiB，不能為幾個常數或頂點複製整份資源。
+template<class Read> static std::vector<std::uint8_t> metal_trace_buffer(const std::shared_ptr<GraphicsResource>& resource,std::uint64_t offset,std::size_t limit,const Read& read){
+    if(!resource || resource->desc.dimension!=1 || offset>=resource->desc.width || !limit)return {};
+    GraphicsView view{resource};view.first=static_cast<std::uint32_t>(offset);view.count=static_cast<std::uint32_t>(std::min<std::size_t>(limit,resource->desc.width-view.first));return read(view);
+}
+// 每幀每個實際綁定窗口記一次雜湊（最多 64 KiB），十六進位最多 8 KiB；明列位移與截短狀態。
+template<class Read> static void metal_trace_constant(std::ostream& o,std::vector<std::string>& extra,const std::shared_ptr<GraphicsResource>& constant,std::uint32_t offset,const Read& graphics_read){
+    static std::uint64_t dumped_frame=UINT64_MAX;static std::set<std::pair<std::uintptr_t,std::uint32_t>> dumped;
     if(dumped_frame!=metal_present_index.load()){dumped_frame=metal_present_index.load();dumped.clear();}
-    if(!constant || !dumped.insert(constant.get()).second)return;
+    if(!constant || !dumped.emplace(reinterpret_cast<std::uintptr_t>(constant.get()),offset).second)return;
     try{
-        const auto bytes=graphics_read(GraphicsView{constant});std::uint64_t hash=1469598103934665603ULL;for(const auto b:bytes){hash^=b;hash*=1099511628211ULL;}
-        o<<" cbh"<<constant.get()<<'='<<bytes.size()<<':'<<std::hex<<hash<<std::dec;
+        const auto bytes=metal_trace_buffer(constant,offset,65536,graphics_read);std::uint64_t hash=1469598103934665603ULL;for(const auto b:bytes){hash^=b;hash*=1099511628211ULL;}
+        o<<" cbh"<<constant.get()<<'@'<<offset<<'='<<bytes.size()<<':'<<std::hex<<hash<<std::dec;
         if(bytes.size()>=1024){
-            std::ostringstream line;line<<"cbdata frame="<<dumped_frame<<" cb="<<constant.get()<<" size="<<bytes.size()<<" hex=";
-            static constexpr char digits[]="0123456789abcdef";for(const auto b:bytes)line<<digits[b>>4]<<digits[b&15];
+            const auto shown=std::min<std::size_t>(bytes.size(),8192);
+            std::ostringstream line;line<<"cbdata frame="<<dumped_frame<<" cb="<<constant.get()<<" offset="<<offset<<" size="<<bytes.size()<<" shown="<<shown<<" truncated="<<(offset<constant->desc.width && shown<constant->desc.width-offset)<<" hex=";
+            static constexpr char digits[]="0123456789abcdef";for(std::size_t i=0;i<shown;++i){const auto b=bytes[i];line<<digits[b>>4]<<digits[b&15];}
             extra.push_back(line.str());
         }
     }catch(const std::exception&){}
@@ -103,7 +109,7 @@ template<class Read> static void metal_trace_stencil_draw(const GraphicsDraw& dr
         for(unsigned i=0;i<draw.stages[0].resources.size();++i)if(draw.stages[0].resources[i].resource){o<<" vt"<<i<<'=';view(draw.stages[0].resources[i]);}
         for(unsigned i=0;i<draw.stages[0].constants.size();++i)if(draw.stages[0].constants[i])o<<" vc"<<i<<'='<<draw.stages[0].constants[i].get();
         for(unsigned i=0;i<draw.stages[1].constants.size();++i)if(draw.stages[1].constants[i])o<<" pc"<<i<<'='<<draw.stages[1].constants[i].get();
-        for(unsigned st=0;st<2;++st)for(const auto& constant:draw.stages[st].constants)metal_trace_constant(o,extra,constant,graphics_read);
+        for(unsigned st=0;st<2;++st)for(unsigned i=0;i<draw.stages[st].constants.size();++i)metal_trace_constant(o,extra,draw.stages[st].constants[i],draw.stages[st].constant_offsets[i],graphics_read);
         if(draw.indirect){try{const auto bytes=graphics_read(GraphicsView{draw.indirect});o<<" ind="<<draw.indirect.get()<<'+'<<draw.indirect_offset<<':';for(unsigned k=0;k<5 && draw.indirect_offset+4*k+4<=bytes.size();++k){std::uint32_t value;std::memcpy(&value,bytes.data()+draw.indirect_offset+4*k,4);o<<value<<(k<4?",":"");}}catch(const std::exception&){o<<" ind=?";}
             // 間接繪製後的渲染目標 0 縮小 8 倍存成 PPM（追蹤檔旁），逐 draw 檢視哪一個畫出異常。
             if(const auto& target=draw.targets[0];target.resource && target.resource->desc.dimension==3){
@@ -158,11 +164,11 @@ template<class Read> static void metal_trace_stencil_draw(const GraphicsDraw& dr
     if(window && trace_pk && draw.stages[1].shader){
         char key[17];std::snprintf(key,sizeof key,"%016llx",static_cast<unsigned long long>(dynamic_cast<const MetalShader&>(*draw.stages[1].shader).content_key));
         // 同一繪製的 VS 常數（vcv）與 VS 緩衝 SRV 內容（vtv，前 32 個值）一併列出：追查 VS 傳給 PS 的係數。
-        if(std::string_view(trace_pk).find(key)!=std::string_view::npos)for(unsigned st=0;st<2;++st){
+        if(std::string_view(trace_pk)=="*" || std::string_view(trace_pk).find(key)!=std::string_view::npos)for(unsigned st=0;st<2;++st){
             for(unsigned i=0;i<draw.stages[st].constants.size();++i){
                 const auto& constant=draw.stages[st].constants[i];if(!constant)continue;
-                try{const auto bytes=graphics_read(GraphicsView{constant});const std::size_t base=draw.stages[st].constant_offsets[i];o<<(st?" pcv":" vcv")<<i<<"@"<<base<<'=';
-                    for(std::size_t at=base;at+4<=bytes.size() && at<base+8192;at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<value<<',';}}
+                try{const auto base=draw.stages[st].constant_offsets[i];const auto bytes=metal_trace_buffer(constant,base,8192,graphics_read);o<<(st?" pcv":" vcv")<<i<<"@"<<base<<'=';
+                    for(std::size_t at=0;at+4<=bytes.size();at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<value<<',';}}
                 catch(const std::exception&){o<<(st?" pcv":" vcv")<<i<<"=?";}
             }
             // PS 紋理輸入的平均／最大（需 X64ARM_GRAPHICS_TRACE_TARGETS=1）：拆解合成輸出由哪個輸入主導。
@@ -173,14 +179,14 @@ template<class Read> static void metal_trace_stencil_draw(const GraphicsDraw& dr
             // PS 緩衝 SRV 內容（ptv，前 32 個值）與第一個頂點緩衝的開頭（vbd0，16 個值）：追查輸出為 0 的來源。
             if(st)for(unsigned i=0;i<draw.stages[1].resources.size();++i){
                 const auto& v=draw.stages[1].resources[i];if(!v.resource || v.resource->desc.dimension!=1)continue;
-                try{const auto bytes=graphics_read(GraphicsView{v.resource});o<<" ptv"<<i<<"@"<<v.first<<"#"<<v.count<<'=';for(std::size_t at=v.first;at+4<=bytes.size() && at<v.first+128;at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<value<<',';}}catch(const std::exception&){o<<" ptv"<<i<<"=?";}
+                try{const auto bytes=metal_trace_buffer(v.resource,v.first,128,graphics_read);o<<" ptv"<<i<<"@"<<v.first<<"#"<<v.count<<'=';for(std::size_t at=0;at+4<=bytes.size();at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<value<<',';}}catch(const std::exception&){o<<" ptv"<<i<<"=?";}
             }
             if(!st && !draw.vertices.empty() && draw.vertices[0].resource){
-                try{const auto bytes=graphics_read(GraphicsView{draw.vertices[0].resource});const std::size_t base=draw.vertices[0].offset;o<<" vbd0=";for(std::size_t at=base;at+4<=bytes.size() && at<base+64;at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<std::hex<<value<<std::dec<<',';}}catch(const std::exception&){o<<" vbd0=?";}
+                try{const auto bytes=metal_trace_buffer(draw.vertices[0].resource,draw.vertices[0].offset,64,graphics_read);o<<" vbd0=";for(std::size_t at=0;at+4<=bytes.size();at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<std::hex<<value<<std::dec<<',';}}catch(const std::exception&){o<<" vbd0=?";}
             }
             if(!st)for(unsigned i=0;i<draw.stages[0].resources.size();++i){
                 const auto& v=draw.stages[0].resources[i];if(!v.resource || v.resource->desc.dimension!=1)continue;
-                try{const auto bytes=graphics_read(GraphicsView{v.resource});o<<" vtv"<<i<<'=';for(std::size_t at=v.first;at+4<=bytes.size() && at<v.first+128;at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<value<<',';}}
+                try{const auto bytes=metal_trace_buffer(v.resource,v.first,128,graphics_read);o<<" vtv"<<i<<'=';for(std::size_t at=0;at+4<=bytes.size();at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<value<<',';}}
                 catch(const std::exception&){o<<" vtv"<<i<<"=?";}
             }
         }
@@ -237,7 +243,7 @@ void MetalGl::graphics_trace_dispatch(const GraphicsStage& stage,std::array<std:
     for(unsigned i=0;i<stage.unordered.size();++i)if(stage.unordered[i].resource){o<<" u"<<i<<'=';view(stage.unordered[i]);}
     for(unsigned i=0;i<stage.resources.size();++i)if(stage.resources[i].resource){o<<" t"<<i<<'=';view(stage.resources[i]);}
     for(unsigned i=0;i<stage.constants.size();++i)if(stage.constants[i])o<<" c"<<i<<'='<<stage.constants[i].get();
-    for(const auto& constant:stage.constants)metal_trace_constant(o,extra,constant,read);
+    for(unsigned i=0;i<stage.constants.size();++i)metal_trace_constant(o,extra,stage.constants[i],stage.constant_offsets[i],read);
     // X64ARM_GRAPHICS_TRACE_CK=<compute 著色器內容雜湊,…>：命中的 dispatch 列出完整常數緩衝（自綁定位移起最多 8 KiB），
     // 並摘要各緩衝 SRV／UAV（以 32 位元浮點看待的有限值平均／最大，及起點前 16 個值）；
     // X64ARM_GRAPHICS_TRACE_CK_AT=<位元組位移,…> 另列 UAV 緩衝在這些位移的 16 個值（dispatch 完成後）。
@@ -248,7 +254,7 @@ void MetalGl::graphics_trace_dispatch(const GraphicsStage& stage,std::array<std:
     for(unsigned i=0;i<stage.constants.size();++i){
         if(!stage.constants[i])continue;
         const std::size_t limit=traced_kernel?8192:640;
-        try{const auto bytes=read(GraphicsView{stage.constants[i]});const std::size_t base=stage.constant_offsets[i];o<<" cv"<<i<<'=';for(std::size_t at=base;at+4<=bytes.size() && at<base+limit;at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<value<<',';}}
+        try{const auto base=stage.constant_offsets[i];const auto bytes=metal_trace_buffer(stage.constants[i],base,limit,read);o<<" cv"<<i<<'@'<<base<<'=';for(std::size_t at=0;at+4<=bytes.size();at+=4){std::uint32_t value;std::memcpy(&value,bytes.data()+at,4);o<<value<<',';}}
         catch(const std::exception&){o<<" cv"<<i<<"=?";}
     }
     if(traced_kernel){

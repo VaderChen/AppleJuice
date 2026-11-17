@@ -14,7 +14,13 @@ std::span<const WindowsServiceDescriptor> msi_service_descriptors(){
         {"msi.dll","MsiDatabaseOpenViewA",3},{"msi.dll","MsiDatabaseOpenViewW",3},{"msi.dll","MsiDatabaseGetPrimaryKeysA",3},{"msi.dll","MsiDatabaseGetPrimaryKeysW",3},
         {"msi.dll","MsiDatabaseIsTablePersistentA",2},{"msi.dll","MsiDatabaseIsTablePersistentW",2},
         {"msi.dll","MsiViewExecute",2},{"msi.dll","MsiViewFetch",2},{"msi.dll","MsiViewClose",1},{"msi.dll","MsiViewGetColumnInfo",3},
-        {"msi.dll","MsiGetProductInfoA",4},{"msi.dll","MsiGetProductInfoW",4},{"msi.dll","MsiGetComponentPathA",4},{"msi.dll","MsiGetComponentPathW",4}
+        {"msi.dll","MsiGetProductInfoA",4},{"msi.dll","MsiGetProductInfoW",4},{"msi.dll","MsiGetComponentPathA",4},{"msi.dll","MsiGetComponentPathW",4},
+        {"msi.dll","MsiEnumProductsA",2},{"msi.dll","MsiEnumProductsW",2},{"msi.dll","MsiQueryProductStateA",1},{"msi.dll","MsiQueryProductStateW",1},
+        {"msi.dll","MsiEnumRelatedProductsA",4},{"msi.dll","MsiEnumRelatedProductsW",4},{"msi.dll","MsiGetFileVersionA",5},{"msi.dll","MsiGetFileVersionW",5},
+        {"msi.dll","MsiGetFileHashA",3},{"msi.dll","MsiGetFileHashW",3},
+        {"msi.dll","MsiEnumComponentsA",2},{"msi.dll","MsiEnumComponentsW",2},{"msi.dll","MsiEnumClientsA",3},{"msi.dll","MsiEnumClientsW",3},
+        {"msi.dll","MsiGetProductCodeA",2},{"msi.dll","MsiGetProductCodeW",2},{"msi.dll","MsiLocateComponentA",3},{"msi.dll","MsiLocateComponentW",3},
+        {"msi.dll","MsiGetUserInfoA",7},{"msi.dll","MsiGetUserInfoW",7}
     };return table;
 }
 MsiState& WindowsServices::msi_bridge(){if(!msi_)msi_=std::make_shared<MsiState>();else if(msi_.use_count()>1)msi_=std::make_shared<MsiState>(*msi_);return *msi_;}
@@ -38,6 +44,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_msi(GuestState& state,Guest
         };
         const auto start=[&](MsiState::Operation op){op.saved_error=saved_error;op.owner=threads_.current;const auto id=bridge.next_operation++;bridge.operations.emplace(id,std::move(op));return resume_msi(state,memory,id,0);};
         if(name.starts_with("MsiGetProductInfo") || name.starts_with("MsiGetComponentPath"))return begin_msi_registry(state,memory,service);
+        if(name.starts_with("MsiEnumProducts") || name.starts_with("MsiQueryProductState") || name.starts_with("MsiEnumRelatedProducts") ||
+           name.starts_with("MsiGetFileVersion") || name.starts_with("MsiGetFileHash") || name.starts_with("MsiEnumComponents") || name.starts_with("MsiEnumClients") ||
+           name.starts_with("MsiGetProductCode") || name.starts_with("MsiLocateComponent") || name.starts_with("MsiGetUserInfo"))return invoke_msi_query(state,memory,service);
         if(name=="MsiCloseHandle"){
             if(!bridge.objects.erase(d(0)))return done(6);collect_msi(memory);return done(0);
         }

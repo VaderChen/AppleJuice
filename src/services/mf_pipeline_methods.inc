@@ -8,7 +8,7 @@ else if(name.starts_with("V_")){
             else throw Failure{invalid};
         }query(item->result_object,guid(arg(1)),arg(2));
     }else if(name=="V_DetachObject"){release(item->result_object);item->result_object=0;}
-    else if(name=="V_ShutdownObject"){if(item->identifier==4 && !item->closed){item->closed=true;if(item->callback)callbacks.push_back({foreign_method(item->callback,mf::sink_shutdown),{item->callback}});}if(item->result_object){auto target=entry(item->result_object).object;if(!target->closed)object_shutdown(target);release(item->result_object);item->result_object=0;}}
+    else if(name=="V_ShutdownObject"){if(item->identifier==4 && !item->closed){item->closed=true;if(item->callback)callbacks.push_back({foreign_method(item->callback,mf::sink_shutdown),{item->callback}});}if(item->result_object){if(bridge.objects.contains(item->result_object)){auto target=entry(item->result_object).object;if(!target->closed)object_shutdown(target);}release(item->result_object);item->result_object=0;}}
 }else if(name.starts_with("Z_")){
     require(item->kind==mf::Transform,no_interface);
     if(name=="Z_Shutdown")object_shutdown(item);

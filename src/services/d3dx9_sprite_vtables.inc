@@ -14,6 +14,28 @@ constexpr WindowsServiceDescriptor spriteMethods[]{
 {"internal-d3d9","Sprite.End",1},
 {"internal-d3d9","Sprite.OnLostDevice",1},
 {"internal-d3d9","Sprite.OnResetDevice",1}};
+// ID3DXLine（d3dx9core.h）：IUnknown 之後依 GetDevice、Begin、Draw、DrawTransform、圖樣／寬度／反鋸齒／GL 線段的 Set／Get、End、OnLostDevice、OnResetDevice。
+constexpr WindowsServiceDescriptor lineMethods[]{
+{"internal-d3d9","Line.QueryInterface",3},
+{"internal-d3d9","Line.AddRef",1},
+{"internal-d3d9","Line.Release",1},
+{"internal-d3d9","Line.GetDevice",2},
+{"internal-d3d9","Line.Begin",1},
+{"internal-d3d9","Line.Draw",4},
+{"internal-d3d9","Line.DrawTransform",5},
+{"internal-d3d9","Line.SetPattern",2},
+{"internal-d3d9","Line.GetPattern",1},
+{"internal-d3d9","Line.SetPatternScale",2},
+{"internal-d3d9","Line.GetPatternScale",1},
+{"internal-d3d9","Line.SetWidth",2},
+{"internal-d3d9","Line.GetWidth",1},
+{"internal-d3d9","Line.SetAntialias",2},
+{"internal-d3d9","Line.GetAntialias",1},
+{"internal-d3d9","Line.SetGLLines",2},
+{"internal-d3d9","Line.GetGLLines",1},
+{"internal-d3d9","Line.End",1},
+{"internal-d3d9","Line.OnLostDevice",1},
+{"internal-d3d9","Line.OnResetDevice",1}};
 constexpr WindowsServiceDescriptor fontMethods[]{
 {"internal-d3d9","Font.QueryInterface",3},
 {"internal-d3d9","Font.AddRef",1},

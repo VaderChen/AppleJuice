@@ -217,7 +217,10 @@ std::u16string decorate_number(std::u16string_view pattern,std::u16string_view n
 using DateFormat=std::unique_ptr<UDateFormat,decltype(&udat_close)>;
 std::u16string date_pattern(UDateFormat* format){
     UErrorCode error=U_ZERO_ERROR;const auto size=udat_toPattern(format,false,nullptr,0,&error);error=U_ZERO_ERROR;
-    std::u16string out(static_cast<std::size_t>(size),0);udat_toPattern(format,false,out.data(),size,&error);if(U_FAILURE(error))throw std::runtime_error("日期格式查詢失敗");return out;
+    std::u16string out(static_cast<std::size_t>(size),0);udat_toPattern(format,false,out.data(),size,&error);if(U_FAILURE(error))throw std::runtime_error("日期格式查詢失敗");
+    // CLDR 42 起時間樣式在 AM／PM 前使用窄不換行空白（U+202F）；Windows 的地區格式一律是一般空白（en-US 為 h:mm:ss tt），
+    // 不換成一般空白時 GetLocaleInfo／GetTimeFormat 的結果與 Windows 不同，缺字型的介面也會顯示成方框。
+    std::replace(out.begin(),out.end(),u'\u202f',u' ');return out;
 }
 std::u16string date_text(UDateFormat* format,UDate stamp){
     UErrorCode error=U_ZERO_ERROR;const auto size=udat_format(format,stamp,nullptr,0,nullptr,&error);error=U_ZERO_ERROR;
@@ -762,7 +765,7 @@ std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
         {"kernel32.dll","GetCalendarInfoA",6},{"kernel32.dll","GetCalendarInfoW",6},{"kernel32.dll","GetCalendarInfoEx",7},
         {"kernel32.dll","EnumCalendarInfoA",4},{"kernel32.dll","EnumCalendarInfoW",4},
         {"kernel32.dll","EnumCalendarInfoExA",4},{"kernel32.dll","EnumCalendarInfoExW",4},{"kernel32.dll","EnumCalendarInfoExEx",6},
-        {"kernel32.dll","SetCalendarInfoA",4},{"kernel32.dll","SetCalendarInfoW",4},
+        {"kernel32.dll","SetCalendarInfoA",4},{"kernel32.dll","SetCalendarInfoW",4},{"kernel32.dll","SetLocaleInfoA",3},{"kernel32.dll","SetLocaleInfoW",3},
         {"kernel32.dll","EnumDateFormatsA",3},{"kernel32.dll","EnumDateFormatsW",3},{"kernel32.dll","EnumDateFormatsExA",3},{"kernel32.dll","EnumDateFormatsExW",3},
         {"kernel32.dll","EnumDateFormatsExEx",4},{"kernel32.dll","EnumTimeFormatsA",3},{"kernel32.dll","EnumTimeFormatsW",3},{"kernel32.dll","EnumTimeFormatsEx",4},
         {"kernel32.dll","EnumSystemCodePagesA",2},{"kernel32.dll","EnumSystemCodePagesW",2},{"kernel32.dll","EnumUILanguagesA",3},{"kernel32.dll","EnumUILanguagesW",3},
@@ -916,6 +919,7 @@ std::vector<std::u16string>* WindowsServices::current_thread_ui_languages(){
     const auto found=threads_.items.find(threads_.current);
     return found==threads_.items.end()?nullptr:&found->second.preferred_ui_languages;
 }
+#include "windows_locale_override.inc"
 std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     const auto finish=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
@@ -1539,6 +1543,37 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             auto bytes=ansi_output(value,"UTF-8");bytes.resize(std::min<std::size_t>(bytes.size(),capacity-1));const auto count=bytes.size();bytes.push_back(0);memory.write(GuestAddress{arg(1)},bytes);return finish(static_cast<std::uint32_t>(count));
         }catch(const MemoryFault&){return fail(998);}catch(const std::bad_alloc&){return fail(14);}
     }
+    if(name=="SetLocaleInfoA" || name=="SetLocaleInfoW"){
+        // (Locale, LCType, lpLCData)：只寫入目前使用者的覆寫值，不改系統預設；A 版本可帶 LOCALE_USE_CP_ACP。
+        const bool wide=name=="SetLocaleInfoW";const auto flags=static_cast<std::uint32_t>(arg(1)),type=flags&0xffffU;
+        if(flags&~0x4000ffffU)return fail(1004);const auto* entry=locale_override(type);if(!entry)return fail(1004);
+        if(!arg(2))return fail(87);const auto locale=numbered(static_cast<std::uint32_t>(arg(0)));const auto user=numbered(0x400);if(!locale || !user)return fail(87);
+        try{
+            const auto value=wide?read_utf16(memory,GuestAddress{arg(2)},256):ansi_input(memory,arg(2),-1,false,ansi_encoding(*locale,(flags&0x40000000U)!=0));
+            if(value.size()>entry->limit)return fail(87);
+            const auto digits=[](std::u16string_view text){return !text.empty() && std::all_of(text.begin(),text.end(),[](char16_t c){return c>=u'0' && c<=u'9';});};
+            if(entry->number){
+                if(!digits(value))return fail(87);unsigned number=0;for(const auto c:value)number=number*10+static_cast<unsigned>(c-u'0');
+                if(number<entry->minimum || number>entry->maximum || (type==0x100a && number!=1 && number!=5 && number!=8 && number!=9))return fail(87);
+            }else{
+                if(value.empty() && type!=0x28 && type!=0x29)return fail(87);
+                if(type==0x13 && value.size()!=10)return fail(87);
+                // 數字分組：以分號分隔的一位數，例如 3;0 或 3;2;0。
+                if(type==0x10 || type==0x18){for(std::size_t i=0;i<value.size();++i)if(i%2?value[i]!=u';':!(value[i]>=u'0' && value[i]<=u'9'))return fail(87);if(value.size()%2==0)return fail(87);}
+            }
+            std::vector<std::pair<std::u16string,std::u16string>> values{{entry->name,value}};
+            const auto current=[&](std::uint32_t kind){if(auto text=user_locale_override(kind))return *text;const auto info=locale_information(*user,kind,false);return info?info->text:std::u16string{};};
+            // 分隔符號與格式連動：sDate／sTime 改寫短日期與時間格式中的分隔符號；sShortDate／sTimeFormat 更新對應的分隔符號；iTime 切換 12／24 小時制。
+            if(type==0x1d)values.emplace_back(u"sShortDate",replace_separator(current(0x1f),current(0x1d),value));
+            else if(type==0x1e)values.emplace_back(u"sTimeFormat",replace_separator(current(0x1003),current(0x1e),value));
+            else if(type==0x1f){if(const auto separator=format_separator(value,u"dMyg");!separator.empty() && separator.size()<=3)values.emplace_back(u"sDate",separator);}
+            else if(type==0x1003){if(const auto separator=format_separator(value,u"hHmst");!separator.empty() && separator.size()<=3)values.emplace_back(u"sTime",separator);
+                bool quoted=false,hours24=false;for(const auto c:value){if(c==u'\'')quoted=!quoted;else if(!quoted && c==u'H')hours24=true;}values.emplace_back(u"iTime",hours24?u"1":u"0");}
+            else if(type==0x23){auto format=current(0x1003);bool quoted=false;for(auto& c:format){if(c==u'\'')quoted=!quoted;else if(!quoted && (c==u'h' || c==u'H'))c=value==u"1"?u'H':u'h';}values.emplace_back(u"sTimeFormat",format);}
+            if(const auto error=set_user_locale_overrides(values,memory))return fail(error);
+            return finish(1);
+        }catch(const MemoryFault&){return fail(998);}
+    }
     if(name=="GetLocaleInfoA" || name=="GetLocaleInfoW" || name=="GetLocaleInfoEx"){
         const bool wide=name!="GetLocaleInfoA",extended=name=="GetLocaleInfoEx";
         const auto flags=static_cast<std::uint32_t>(arg(1)),type=flags&0xffffU;const auto capacity=static_cast<std::int32_t>(arg(3));
@@ -1550,7 +1585,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             std::optional<Locale> locale;
             if(extended)locale=named(requested_locale_name(memory,arg(0)));
             else locale=numbered(static_cast<std::uint32_t>(arg(0)));
-            if(!locale)return fail(87);const auto info=locale_information(*locale,type,genitive);if(!info)return fail(1004);
+            if(!locale)return fail(87);auto info=locale_information(*locale,type,genitive);if(!info)return fail(1004);
+            // 使用者預設地區（LOCALE_USER_DEFAULT、其 LCID、NULL 或其名稱）未指定 LOCALE_NOUSEROVERRIDE 時套用 SetLocaleInfo 的覆寫。
+            const bool user_locale=!(flags&0x80000000U) && !genitive && locale_user_request(extended,extended && arg(0)?requested_locale_name(memory,arg(0)):std::u16string{},static_cast<std::uint32_t>(arg(0)));
+            if(user_locale)if(const auto text=user_locale_override(type)){
+                info->text=*text;
+                if(info->number){std::uint32_t number=0;bool valid=!text->empty();for(const auto c:*text){if(c<u'0' || c>u'9'){valid=false;break;}number=number*10+static_cast<std::uint32_t>(c-u'0');}if(valid)info->number=number;}
+            }
             if(flags&0x20000000U){if(!info->number)return fail(1004);const unsigned required=wide?2:4;
                 if(!capacity)return finish(required);if(static_cast<unsigned>(capacity)<required)return fail(122);
                 memory.store(GuestAddress{arg(2)},32,*info->number);return finish(required);}
@@ -1705,9 +1746,37 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         UErrorCode error=U_ZERO_ERROR;const auto id=icu_locale(*locale);NumberFormat format(unum_open(currency?UNUM_CURRENCY_ACCOUNTING:UNUM_DECIMAL,nullptr,0,id.c_str(),nullptr,&error),unum_close);if(U_FAILURE(error) || !format)return fail(87);
         unum_setAttribute(format.get(),UNUM_ROUNDING_MODE,UNUM_ROUND_HALFUP);
         std::u16string result;
-        if(!arg(3)){
+        // 使用者預設地區有 SetLocaleInfo 覆寫（且未指定 LOCALE_NOUSEROVERRIDE）時，以地區值加覆寫組成 NUMBERFMT／CURRENCYFMT，走明確格式流程。
+        struct NumberParameters {unsigned digits{},zero{},grouping{},negative{},positive{};std::u16string separator,thousands,symbol,sign;};std::optional<NumberParameters> overridden;
+        if(!arg(3) && !(flags&0x80000000U) && locale_user_request(extended,extended?requested():std::u16string{},static_cast<std::uint32_t>(arg(0)))){
+            const std::array<std::uint32_t,9> types=currency?std::array<std::uint32_t,9>{0x19,0x12,0x18,0x16,0x17,0x1c,0x1b,0x14,0x51}:std::array<std::uint32_t,9>{0x11,0x12,0x10,0x0e,0x0f,0x1010,0x51,0x51,0x51};
+            if(std::any_of(types.begin(),types.end(),[&](std::uint32_t type){return user_locale_override(type).has_value();})){
+                const auto text=[&](std::uint32_t type){if(auto value=user_locale_override(type))return *value;const auto info=locale_information(*locale,type,false);return info?info->text:std::u16string{};};
+                const auto number=[&](std::uint32_t type){unsigned value=0;for(const auto c:text(type)){if(c<u'0' || c>u'9')break;value=value*10+static_cast<unsigned>(c-u'0');}return value;};
+                // LOCALE_SGROUPING「3;2;0」→ 32、「3;0」→ 3、「3」→ 30（最後不是 0 時不再重複）。
+                const auto grouping=[&](std::uint32_t type){std::string digits;const auto value=text(type);for(const auto c:value)if(c>=u'0' && c<=u'9')digits.push_back(static_cast<char>(c));
+                    if(digits.empty())return 0U;if(value.size()>=2 && value.ends_with(u";0"))digits.pop_back();else digits.push_back('0');if(digits.empty())return 0U;return static_cast<unsigned>(std::stoul(digits));};
+                NumberParameters value;
+                if(currency){value.digits=number(0x19);value.zero=number(0x12);value.grouping=grouping(0x18);value.separator=text(0x16);value.thousands=text(0x17);value.negative=number(0x1c);value.positive=number(0x1b);value.symbol=text(0x14);}
+                else{value.digits=number(0x11);value.zero=number(0x12);value.grouping=grouping(0x10);value.separator=text(0x0e);value.thousands=text(0x0f);value.negative=number(0x1010);}
+                value.sign=text(0x51);if(value.digits>9 || value.zero>1 || value.negative>(currency?15U:4U) || value.positive>3)return fail(87);
+                overridden=std::move(value);
+            }
+        }
+        if(!arg(3) && !overridden){
             if(!currency){unum_setAttribute(format.get(),UNUM_MIN_FRACTION_DIGITS,2);unum_setAttribute(format.get(),UNUM_MAX_FRACTION_DIGITS,2);}
             result=number_text(format.get(),decimal);
+        }else if(overridden){
+            const auto& value=*overridden;auto sign=value.sign.empty()?number_symbol(format.get(),UNUM_MINUS_SIGN_SYMBOL):value.sign;const bool minus=decimal.front()=='-';if(minus)decimal.erase(0,1);
+            error=U_ZERO_ERROR;NumberFormat magnitude(unum_open(UNUM_DECIMAL,nullptr,0,"en_US_POSIX",nullptr,&error),unum_close);if(U_FAILURE(error) || !magnitude)return fail(87);
+            unum_setAttribute(magnitude.get(),UNUM_GROUPING_USED,0);unum_setAttribute(magnitude.get(),UNUM_MIN_FRACTION_DIGITS,static_cast<std::int32_t>(value.digits));unum_setAttribute(magnitude.get(),UNUM_MAX_FRACTION_DIGITS,static_cast<std::int32_t>(value.digits));
+            unum_setAttribute(magnitude.get(),UNUM_ROUNDING_MODE,UNUM_ROUND_HALFUP);
+            const auto formatted=number_text(magnitude.get(),decimal);const auto dot=formatted.find(u'.');auto integral=formatted.substr(0,dot);
+            if(!value.zero && integral==u"0" && value.digits)integral.clear();result=group_number(integral,value.grouping,value.thousands);if(dot!=formatted.npos)result+=value.separator+formatted.substr(dot+1);
+            static constexpr std::array<std::u16string_view,5> numbers{u"(n)",u"-n",u"- n",u"n-",u"n -"};
+            static constexpr std::array<std::u16string_view,4> positives{u"$n",u"n$",u"$ n",u"n $"};
+            static constexpr std::array<std::u16string_view,16> negatives{u"($n)",u"-$n",u"$-n",u"$n-",u"(n$)",u"-n$",u"n-$",u"n$-",u"-n $",u"-$ n",u"n $-",u"$ n-",u"$ -n",u"n- $",u"($ n)",u"(n $)"};
+            result=decorate_number(currency?(minus?negatives[value.negative]:positives[value.positive]):minus?numbers[value.negative]:u"n",result,value.symbol,sign);
         }else{
             const unsigned pointer=x86_?12U:16U,unit=x86_?4U:8U,order=pointer+unit*2;const auto base=arg(3);
             memory.check(GuestAddress{base},currency?(x86_?32U:48U):(x86_?24U:40U),Access::Read);
@@ -1771,11 +1840,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
             std::u16string marker;DateFormat ampm(udat_open(UDAT_PATTERN,UDAT_PATTERN,id.c_str(),u"UTC",3,u"a",1,&error),udat_close);if(U_FAILURE(error) || !ampm)return fail(87);marker=date_text(ampm.get(),stamp);
             pattern=time_pattern(arg(3)?input_pattern():date_pattern(format.get()),options,arg(3)!=0,marker);
         }
-        if(date && !arg(3)){
+        // 使用者預設地區的格式覆寫（sShortDate／sLongDate／sYearMonth／sTimeFormat），未指定 LOCALE_NOUSEROVERRIDE 時視同呼叫端提供的格式。
+        bool user_pattern=false;
+        if(!arg(3) && !(flags&0x80000000U) && locale_user_request(extended,extended?requested():std::u16string{},static_cast<std::uint32_t>(arg(0)))){
+            const std::uint32_t type=date?(options&2U?0x20U:options&8U?0x1006U:options&0x80U?0U:0x1fU):0x1003U;
+            if(type)if(const auto text=user_locale_override(type)){
+                if(date)pattern=windows_date_pattern(*text);
+                else{UErrorCode marker_error=U_ZERO_ERROR;DateFormat ampm(udat_open(UDAT_PATTERN,UDAT_PATTERN,id.c_str(),u"UTC",3,u"a",1,&marker_error),udat_close);if(U_FAILURE(marker_error) || !ampm)return fail(87);
+                    pattern=time_pattern(*text,options,true,date_text(ampm.get(),stamp));}
+                user_pattern=true;
+            }
+        }
+        if(date && !arg(3) && !user_pattern){
             if(pattern.empty())pattern=date_pattern(format.get());
             auto tokens=date_tokens(pattern);month_pattern_context(tokens);pattern=render_pattern(tokens);
         }
-        if(arg(3) || !pattern.empty())udat_applyPattern(format.get(),false,pattern.data(),static_cast<std::int32_t>(pattern.size()));
+        if(arg(3) || user_pattern || !pattern.empty())udat_applyPattern(format.get(),false,pattern.data(),static_cast<std::int32_t>(pattern.size()));
         const auto value=date_text(format.get(),stamp);
         // A／W 共用日期與旗標語義，只在邊界依語系字碼頁轉換並計算實際緩衝區長度。
         const auto bytes=wide?utf16_bytes(value):ansi_output(value+u'\0',encoding);

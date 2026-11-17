@@ -10,6 +10,7 @@ constexpr WindowsGuid unknown_iid{0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
 constexpr WindowsGuid error_iid{0x20,0xb1,0xf2,0x1c,0x7d,0x54,0x1b,0x10,0x8e,0x65,8,0,0x2b,0x2b,0xd1,0x19};
 constexpr WindowsGuid create_iid{0x40,0x33,0xf0,0x22,0x7d,0x54,0x1b,0x10,0x8e,0x65,8,0,0x2b,0x2b,0xd1,0x19};
 constexpr WindowsGuid support_iid{0x60,0x3d,0x0b,0xdf,0x8f,0x54,0x1b,0x10,0x8e,0x65,8,0,0x2b,0x2b,0xd1,0x19};
+constexpr WindowsGuid language_iid{0xf3,0xdb,0xa2,0x04,0x83,0xdf,0x6c,0x11,0x09,0x46,0x08,0x12,0xab,0xf6,0xe0,0x7d};
 using winrt_error_detail::method;
 }
 std::span<const WindowsServiceDescriptor> com_error_service_descriptors(){
@@ -50,26 +51,44 @@ std::uint64_t WindowsServices::create_com_error(GuestState& state,GuestMemory& m
             memory.store(GuestAddress{target+unit*index++},bits,resolve(row.family,row.symbol).value);
         bridge.restricted_table=target;
     }
-    const auto object=allocate_heap(memory,(restricted?4:3)*unit);if(!object)throw std::bad_alloc();
+    if(restricted && !bridge.language_table){
+        if(runtime_.arena_next>1024U*1024U || 4*unit>1024U*1024U-runtime_.arena_next)throw std::bad_alloc();
+        const auto target=runtime_allocate(memory,{},4*unit);unsigned index=0;
+        for(const auto& row:winrt_error_service_descriptors())if(row.family=="internal-language-error")
+            memory.store(GuestAddress{target+unit*index++},bits,resolve(row.family,row.symbol).value);
+        bridge.language_table=target;
+    }
+    const auto object=allocate_heap(memory,(restricted?5:3)*unit);if(!object)throw std::bad_alloc();
     try{
         memory.store(GuestAddress{object},bits,bridge.info_table);memory.store(GuestAddress{object+unit},bits,bridge.create_table);
         memory.store(GuestAddress{object+2*unit},bits,bridge.support_table);
         bridge.views.emplace(object,ComErrorView{object,ComErrorViewKind::Info});
         bridge.views.emplace(object+unit,ComErrorView{object,ComErrorViewKind::Create});
         bridge.views.emplace(object+2*unit,ComErrorView{object,ComErrorViewKind::Support});
-        if(restricted){memory.store(GuestAddress{object+3*unit},bits,bridge.restricted_table);bridge.views.emplace(object+3*unit,ComErrorView{object,ComErrorViewKind::Restricted});}
+        if(restricted){memory.store(GuestAddress{object+3*unit},bits,bridge.restricted_table);bridge.views.emplace(object+3*unit,ComErrorView{object,ComErrorViewKind::Restricted});
+            memory.store(GuestAddress{object+4*unit},bits,bridge.language_table);bridge.views.emplace(object+4*unit,ComErrorView{object,ComErrorViewKind::Language});}
         if(runtime_.com_errors.create(object,std::move(value))!=com_error::Status::Ok)throw std::bad_alloc();
-    }catch(...){for(unsigned i=0;i<4;++i)bridge.views.erase(object+i*unit);(void)free_heap(memory,object,state);throw;}
+    }catch(...){for(unsigned i=0;i<(restricted?5U:3U);++i)bridge.views.erase(object+i*unit);(void)free_heap(memory,object,state);throw;}
     return object;
 }
 std::uint32_t WindowsServices::release_com_error(GuestState& state,GuestMemory& memory,std::uint64_t pointer){
-    auto& bridge=runtime_.com_error_bridge;const auto view=bridge.views.at(pointer);const auto result=runtime_.com_errors.release(view.object);
-    if(result.destroyed){for(unsigned i=0;i<4;++i)bridge.views.erase(view.object+i*(x86_?4:8));(void)free_heap(memory,view.object,state);}
+    auto& bridge=runtime_.com_error_bridge;const auto view=bridge.views.at(pointer);
+    const auto language=bridge.language_exceptions.find(view.object);const auto view_count=runtime_.com_errors.find(view.object)->restricted?5U:3U;
+    // 先保留釋放槽，避免物件已銷毀後才因配置失敗遺失外部 IUnknown 的引用。
+    if(language!=bridge.language_exceptions.end() && language->second && runtime_.com_errors.find(view.object)->references==1)bridge.language_releases.reserve(bridge.language_releases.size()+1);
+    const auto result=runtime_.com_errors.release(view.object);
+    if(result.destroyed){if(language!=bridge.language_exceptions.end()){if(language->second)bridge.language_releases.push_back(language->second);bridge.language_exceptions.erase(language);}
+        for(unsigned i=0;i<view_count;++i)bridge.views.erase(view.object+i*(x86_?4:8));(void)free_heap(memory,view.object,state);}
     return result.count;
 }
 std::vector<GuestCallback> WindowsServices::retire_com_error(GuestState& state,GuestMemory& memory,std::uint64_t thread,bool callbacks){
     const auto object=runtime_.com_errors.take(thread);if(!object)return {};
-    if(runtime_.com_error_bridge.views.contains(object)){(void)release_com_error(state,memory,object);return {};}
+    if(runtime_.com_error_bridge.views.contains(object)){
+        auto& pending=runtime_.com_error_bridge.language_releases;const auto previous=pending.size();
+        (void)release_com_error(state,memory,object);std::vector<GuestCallback> result;
+        if(callbacks)for(auto i=previous;i<pending.size();++i){const auto language=pending[i];result.push_back({method(memory,language,2),{language}});}
+        pending.resize(previous);return result;
+    }
     if(!callbacks)return {}; // 強制結束與離開 callback frame 後不能重新執行客體 Release。
     const auto target=method(memory,object,2);if(!handles(GuestAddress{target}))memory.check(GuestAddress{target},1,Access::Execute);
     return {{target,{object}}};
@@ -94,7 +113,13 @@ std::optional<std::uint32_t> WindowsServices::resume_com_error_retire(GuestState
 std::optional<std::uint32_t> WindowsServices::invoke_com_error(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;auto& bridge=runtime_.com_error_bridge;
     const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
-    const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
+    const auto done=[&](std::uint64_t value){
+        if(!bridge.language_releases.empty()){
+            std::vector<GuestCallback> callbacks;callbacks.reserve(bridge.language_releases.size());
+            for(auto language:bridge.language_releases)callbacks.push_back({method(memory,language,2),{language}});
+            bridge.language_releases.clear();start_callbacks(state,memory,std::move(callbacks),Continuation::Return,value);
+        }else arg.return_to(state,value);return std::optional<std::uint32_t>{};
+    };
     const auto pointer=[&](std::uint64_t address,std::size_t size){if(!address)throw HostCallFault("COM 錯誤輸出指標為空");memory.check(GuestAddress{address},size,Access::Write);};
     try{
         if(name=="CleanupThread")return resume_com_error_retire(state,memory);
@@ -127,7 +152,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_com_error(GuestState& state
             pointer(arg(2),unit);WindowsGuid iid{};if(arg(1))memory.read(GuestAddress{arg(1)},iid);
             memory.store(GuestAddress{arg(2)},bits,0);if(!arg(1))return done(pointer_error);
             const auto result=iid==unknown_iid || iid==error_iid?view.object:
-                value.restricted?(iid==winrt_error_detail::restricted_iid?view.object+3*unit:0):
+                value.restricted?(iid==winrt_error_detail::restricted_iid?view.object+3*unit:iid==language_iid?view.object+4*unit:0):
                 iid==create_iid?view.object+unit:iid==support_iid?view.object+2*unit:0;
             if(!result)return done(no_interface);
             if(runtime_.com_errors.add_ref(view.object).status!=com_error::Status::Ok)return done(no_memory);

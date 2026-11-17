@@ -63,7 +63,10 @@
             memory.store(GuestAddress{original_arg(9+delta)},pointer_bits,0);effect_code_slot=temporary(std::vector<std::uint8_t>(pointer_size));
             adapted_symbol="D3DX11Compile"+std::string(symbol.substr(std::string_view("D3DX10CreateEffect").size()));symbol=adapted_symbol;
             adapt(3+delta,0);adapt(4+delta,original_arg(3+delta));adapt(5+delta,original_arg(4+delta));adapt(6+delta,original_arg(5+delta));adapt(7+delta,0);adapt(8+delta,effect_code_slot);adapt(9+delta,original_arg(10+delta));adapt(10+delta,original_arg(11+delta));
-        }else if(service.family=="d3dx10_43.dll" && symbol.starts_with("D3DX10") && !symbol.starts_with("D3DX10CreateFont") && symbol!="D3DX10CreateSprite" && symbol!="D3DX10CreateMesh"){
+        }else if(service.family=="d3dx10_43.dll" && symbol.starts_with("D3DX10") && !symbol.starts_with("D3DX10CreateFont") && symbol!="D3DX10CreateSprite" && symbol!="D3DX10CreateMesh" &&
+                 // D3DX10 自己的裝置與版本輔助函式沒有對應的 D3DX11 版本，不改寫名稱。
+                 symbol!="D3DX10CheckVersion" && symbol!="D3DX10CreateDevice" && symbol!="D3DX10CreateDeviceAndSwapChain" && symbol!="D3DX10GetFeatureLevel1" &&
+                 symbol!="D3DX10UnsetAllDeviceObjects" && symbol!="D3DX10PreprocessShaderFromMemory"){
             // D3DX10/11 的圖片資訊及載入設定具有相同 ABI。
             adapted_symbol="D3DX11"+std::string(symbol.substr(6));symbol=adapted_symbol;
             if(symbol.starts_with("D3DX11SaveTexture") || symbol=="D3DX11LoadTextureFromTexture"){

@@ -8,6 +8,12 @@
 // - RtlCreateServiceSid：S-1-5-80-（大寫服務名稱 UTF-16LE 的 SHA-1，5 個 DWORD）。
 // - RtlDeriveCapabilitySidsFromName：大寫能力名稱 UTF-16LE 的 SHA-256（8 個 DWORD），群組 SID S-1-5-32-…、能力 SID S-1-15-3-1024-…。
 // - RtlFindMessage：LdrFindResource_U／LdrAccessResource 取得訊息表，依區塊與項目長度找出 MESSAGE_RESOURCE_ENTRY。
+// - RtlPushFrame／RtlPopFrame／RtlGetFrame：TEB.ActiveFrame（x86 +0xFB0、x64 +0x17C0）的 TEB_ACTIVE_FRAME 串列（Previous 在 +指標寬度）。
+// - RtlGetCurrentTransaction／RtlSetCurrentTransaction：TEB.CurrentTransactionHandle（x86 +0xFAC、x64 +0x17B8）。
+// - NtAreMappedFilesTheSame（Zw*）：兩個位址所在映射的檔案相同為 STATUS_SUCCESS，不同檔案 STATUS_NOT_SAME_DEVICE，
+//   未配置 STATUS_INVALID_ADDRESS，私有記憶體（非檔案映射）STATUS_CONFLICTING_ADDRESSES；沿用 GetMappedFileName 的映射查詢。
+// - kernel32 Heap32First／Heap32Next：以 HeapWalk 列舉目前程序堆積的使用中與空閒區塊；HEAPENTRY32.dwResvd 保存目前序號，
+//   Heap32Next 依此從頭找下一個。其他程序為 ERROR_ACCESS_DENIED，結束為 ERROR_NO_MORE_FILES。
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
@@ -31,7 +37,9 @@ std::span<const WindowsServiceDescriptor> ntdll_extras_service_descriptors(){
         {"ntdll.dll","NtCreateSectionEx",9,0,0,0x132},{"ntdll.dll","ZwCreateSectionEx",9,0,0,0x132},
         {"ntdll.dll","RtlCreateUserStack",6},{"ntdll.dll","RtlFreeUserStack",1},{"ntdll.dll","RtlWalkHeap",2},
         {"ntdll.dll","RtlSetSearchPathMode",1,0,0,0x1},
-        {"ntdll.dll","RtlCreateServiceSid",3},{"ntdll.dll","RtlDeriveCapabilitySidsFromName",3},{"ntdll.dll","RtlFindMessage",5,0,0,0xe}};
+        {"ntdll.dll","RtlCreateServiceSid",3},{"ntdll.dll","RtlDeriveCapabilitySidsFromName",3},{"ntdll.dll","RtlFindMessage",5,0,0,0xe},
+        {"ntdll.dll","RtlPushFrame",1},{"ntdll.dll","RtlPopFrame",1},{"ntdll.dll","RtlGetFrame",0},{"ntdll.dll","RtlGetCurrentTransaction",0},{"ntdll.dll","RtlSetCurrentTransaction",1},
+        {"ntdll.dll","NtAreMappedFilesTheSame",2},{"ntdll.dll","ZwAreMappedFilesTheSame",2},{"kernel32.dll","Heap32First",3},{"kernel32.dll","Heap32Next",1}};
     return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_ntdll_extras(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -53,6 +61,41 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_extras(GuestState& st
             co_return co_await service_callback::call_value(entry(dll,symbol),std::move(arguments));
         };
 
+        // TEB_ACTIVE_FRAME 串列與目前交易 handle：只讀寫目前執行緒的 TEB 欄位。
+        const auto active_frame=teb+(x86_?0xfb0U:0x17c0U),current_transaction=teb+(x86_?0xfacU:0x17b8U);
+        if(name=="RtlGetFrame")co_return done(m.load(GuestAddress{active_frame},bits));
+        if(name=="RtlPushFrame"){if(call(0)){m.store(GuestAddress{call(0)+unit},bits,m.load(GuestAddress{active_frame},bits));m.store(GuestAddress{active_frame},bits,call(0));}co_return done(0);}
+        if(name=="RtlPopFrame"){if(call(0))m.store(GuestAddress{active_frame},bits,m.load(GuestAddress{call(0)+unit},bits));co_return done(0);}
+        if(name=="RtlGetCurrentTransaction")co_return done(m.load(GuestAddress{current_transaction},bits));
+        if(name=="RtlSetCurrentTransaction"){m.store(GuestAddress{current_transaction},bits,call(0));co_return done(1);}
+        if(name=="AreMappedFilesTheSame"){
+            constexpr std::uint32_t status_invalid_address=0xc0000141U,status_conflicting_addresses=0xc0000018U,status_not_same_device=0xc00000d4U;
+            if(!m.query(GuestAddress{call(0)}) || !m.query(GuestAddress{call(1)}))co_return done(status_invalid_address);
+            auto first=mapped_file_name(call(0)),second=mapped_file_name(call(1));if(first.empty() || second.empty())co_return done(status_conflicting_addresses);
+            for(auto* text:{&first,&second})for(auto& c:*text)c=unicode_case_unit(c,true);
+            co_return done(first==second?0U:status_not_same_device);
+        }
+        if(name=="Heap32First" || name=="Heap32Next"){
+            // HEAPENTRY32：dwSize、hHandle、dwAddress、dwBlockSize（皆為指標寬度）、dwFlags、dwLockCount、dwResvd、th32ProcessID（DWORD）、th32HeapID。
+            const auto win32_fail=[&](std::uint32_t code){m.store(GuestAddress{error_at},32,code);last_error_=code;return finish(0);};
+            const auto entry_out=call(0);const unsigned entry_size=x86_?36U:56U,flags_at=4*unit,index_at=4*unit+8,process_at=4*unit+12,heap_at=4*unit+16;
+            if(!entry_out)co_return win32_fail(87);if(m.load(GuestAddress{entry_out},bits)<entry_size)co_return win32_fail(24);
+            const bool first=name=="Heap32First";const auto process=first?static_cast<std::uint32_t>(call(1)):static_cast<std::uint32_t>(m.load(GuestAddress{entry_out+process_at},32));
+            const auto heap=first?call(2):m.load(GuestAddress{entry_out+heap_at},bits);const std::uint32_t wanted=first?0U:static_cast<std::uint32_t>(m.load(GuestAddress{entry_out+index_at},32))+1U;
+            if(process && process!=process_id())co_return win32_fail(5);
+            // PROCESS_HEAP_ENTRY 走訪：略過區域與未提交範圍，使用中與空閒區塊依序編號。
+            const unsigned walk_size=x86_?28U:40U,handle_at=x86_?12U:16U;const auto walk=scratch(walk_size);std::uint32_t index=0;
+            for(;;){
+                if(!co_await win32("kernel32.dll","HeapWalk",{heap,walk})){const auto error=last_error();co_return win32_fail(error==259U?18U:error==6U?87U:error);}
+                const auto flags=static_cast<std::uint32_t>(m.load(GuestAddress{walk+unit+6},16));if(flags&3U)continue;
+                if(index++!=wanted)continue;
+                const auto address=m.load(GuestAddress{walk},bits);const bool moveable=(flags&0x10U)!=0;
+                m.store(GuestAddress{entry_out+unit},bits,moveable?m.load(GuestAddress{walk+handle_at},bits):address);m.store(GuestAddress{entry_out+2*unit},bits,address);
+                m.store(GuestAddress{entry_out+3*unit},bits,m.load(GuestAddress{walk+unit},32));m.store(GuestAddress{entry_out+flags_at},32,(flags&4U)?(moveable?4U:1U):2U);
+                m.store(GuestAddress{entry_out+flags_at+4},32,0);m.store(GuestAddress{entry_out+index_at},32,wanted);m.store(GuestAddress{entry_out+process_at},32,process_id());
+                m.store(GuestAddress{entry_out+heap_at},bits,heap);co_return done(1);
+            }
+        }
         if(name=="GetWriteWatch" || name=="ResetWriteWatch"){
             if(!current_process_handle(call(0)))co_return done(status_invalid_handle);
             const auto result=name=="GetWriteWatch"?co_await win32("kernel32.dll","GetWriteWatch",{call(1),call(2),call(3),call(4),call(5),call(6)})

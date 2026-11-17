@@ -113,13 +113,28 @@ See [Direct3D and x86 compatibility](docs/direct3d-and-x86.md) for details and u
 - **Audio**: DirectSound (including 3D positioning and capture), XAudio2, WASAPI and X3DAudio output through Core Audio, preserving stereo left/right channels and panning.
 - **Input**: DirectInput (including force feedback), XInput and Raw Input use data from physical input devices on macOS.
 - **Video**: H.264 encoding and decoding through Media Foundation and D3D11 DXVA use VideoToolbox hardware acceleration; Windows Media (ASF) VC-1/WMV and WMA are decoded by a built-in, decoder-only FFmpeg. HEVC and AV1 are not yet complete.
-- **Upscaling**: In-game XeSS runs on the MetalFX temporal upscaler; when a game enables XeSS, the Launcher's frame interpolation and 2× upscaling are turned off automatically and the game's upscaler output is shown.
 
 AppleJuice is under active development. Complete Windows support, all applications and all API parameter combinations are not fully supported. Loading a program or opening a window does not establish full application compatibility. Drive mappings are not a complete OS sandbox; enabled services may access mapped files or use the network. Run trusted programs and configure access permissions as needed.
 
 The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required build scripts, `third_party/`, `x64kernel/` and user documentation.
 
-## Tested applications / 2026-11-13 / 22 games
+## Native MetalFX and multichannel HRTF headphone simulation
+
+AppleJuice provides these features natively in its presentation and audio output layers. You can enable them manually even when a game has no built-in MetalFX or HRTF support, without modifying the game or installing a mod.
+
+### MetalFX upscaling and frame interpolation
+
+- **2× upscaling**: Use the main-window switch to enlarge the game's output by 2× with the native macOS MetalFX spatial upscaler. No in-game upscaling integration is required.
+- **Frame interpolation**: AppleJuice separately uses native macOS VideoToolbox to generate an intermediate image between two completed frames, without requiring game-provided depth or motion vectors. This requires macOS 26 or later and a supported device, with input up to 1920×1080. Interpolation does not increase the game's own update rate.
+- **In-game XeSS**: When a game provides XeSS, AppleJuice can map it to MetalFX temporal upscaling. This path automatically disables the Launcher's frame interpolation and 2× upscaling and displays the game's upscaler output.
+
+### Multichannel HRTF headphone simulation
+
+Enable "Spatial headphone mixing" to place channels from 5.1, 7.1 and other multichannel output in virtual speaker positions and render them as binaural stereo through ordinary headphones, preserving the low-frequency channel. Games and media applications do not need built-in HRTF support; the spatial effect depends on the channel information actually supplied.
+
+Linked switches are available in the main window and Settings → Audio. The feature is off by default and takes effect the next time an application starts. Head tracking is currently disabled.
+
+## Tested applications / 2026-11-17 / 23 games
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="Not working (WIP)" title="Not working (WIP)"> Not working (WIP) · <img src="docs/images/support-levels/menu.png" width="16" height="16" alt="Launches" title="Launches"> Launches · <img src="docs/images/support-levels/slow.png" width="16" height="16" alt="Slow" title="Slow"> Slow · <img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="Works well (MetalFX)" title="Works well (MetalFX)"> Works well (MetalFX) · <img src="docs/images/support-levels/good.png" width="16" height="16" alt="Works well" title="Works well"> Works well
 
@@ -143,6 +158,7 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 | Rise of the Tomb Raider | x64 | D3D11 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="Works well (MetalFX)" title="Works well (MetalFX)"> |
 | Shadow of the Tomb Raider | x64 | D3D12 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="Works well (MetalFX)" title="Works well (MetalFX)"> |
 | Cyberpunk 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
+| DEATH STRANDING DIRECTOR'S CUT | x64 | D3D12 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="Launches" title="Launches"> |
 | It Takes Two | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Romance of the Three Kingdoms X with Power Up Kit | x86 | Unknown | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
 | Steam | x64 | Chromium (CEF) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="Slow" title="Slow"> |
@@ -154,6 +170,8 @@ The repository includes `src/`, `include/`, `launcher/`, `cmake/`, required buil
 | Resident Evil Village | x64 | D3D12 (RE Engine) | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="Not working (WIP)" title="Not working (WIP)"> |
 
 "Works well (MetalFX)" means the game meets the works-well criterion with the Launcher's frame interpolation or 2× upscaling (MetalFX) turned on; without them it is rated Slow.
+
+DEATH STRANDING DIRECTOR'S CUT is currently rated "Launches". Loading a Chapter 3 save and moving the character have been verified, but white flicker can still occur and stable 50 FPS has not been achieved. The rating will be updated after these issues are resolved and gameplay and other scenes pass validation. "Works well" requires sustained performance above 50 FPS or reaching the application's own frame-rate cap.
 
 Test records reflect the version and settings at the time and do not establish that complete gameplay, other versions or all settings work.
 

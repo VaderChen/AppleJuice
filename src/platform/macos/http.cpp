@@ -156,8 +156,15 @@ std::shared_ptr<NativeHttp> start_native_http(HttpInput input){
                 if(input.disabled_features&8U){auto* next=curl_slist_append(headers,"Connection: close");if(!next)throw std::bad_alloc();headers=next;}
                 const auto proxy=proxy_for_url(input,parsed);curl_easy_setopt(curl,CURLOPT_PROXY,proxy.c_str());
                 curl_easy_setopt(curl,CURLOPT_URL,url.c_str());curl_easy_setopt(curl,CURLOPT_HTTPHEADER,headers);
-                curl_easy_setopt(curl,CURLOPT_USERNAME,same_origin && !(input.disabled_features&4U) && !input.username.empty()?input.username.c_str():nullptr);
-                curl_easy_setopt(curl,CURLOPT_PASSWORD,same_origin && !(input.disabled_features&4U) && !input.password.empty()?input.password.c_str():nullptr);curl_easy_setopt(curl,CURLOPT_HTTPAUTH,(input.disabled_features&4U)?CURLAUTH_NONE:CURLAUTH_ANY);
+                const auto auth=[](std::uint32_t scheme){return static_cast<long>(scheme==1?CURLAUTH_BASIC:scheme==2?CURLAUTH_NTLM:scheme==8?CURLAUTH_DIGEST:scheme==16?CURLAUTH_NEGOTIATE:CURLAUTH_ANY);};
+                const bool server_auth=same_origin && !(input.disabled_features&4U) && (input.credentials_set || !input.username.empty());
+                curl_easy_setopt(curl,CURLOPT_USERNAME,server_auth?input.username.c_str():nullptr);
+                curl_easy_setopt(curl,CURLOPT_PASSWORD,server_auth?input.password.c_str():nullptr);
+                curl_easy_setopt(curl,CURLOPT_HTTPAUTH,server_auth?auth(input.auth_scheme):CURLAUTH_NONE);
+                const bool proxy_auth=!(input.disabled_features&4U) && (input.proxy_credentials_set || !input.proxy_username.empty());
+                curl_easy_setopt(curl,CURLOPT_PROXYUSERNAME,proxy_auth?input.proxy_username.c_str():nullptr);
+                curl_easy_setopt(curl,CURLOPT_PROXYPASSWORD,proxy_auth?input.proxy_password.c_str():nullptr);
+                curl_easy_setopt(curl,CURLOPT_PROXYAUTH,proxy_auth?auth(input.proxy_auth_scheme):CURLAUTH_NONE);
                 curl_easy_setopt(curl,CURLOPT_POSTFIELDS,nullptr);curl_easy_setopt(curl,CURLOPT_HTTPGET,1L);curl_easy_setopt(curl,CURLOPT_NOBODY,method=="HEAD"?1L:0L);
                 if(method!="HEAD" && send_body && (!input.body.empty() || method=="POST" || method=="PUT")){
                     curl_easy_setopt(curl,CURLOPT_POSTFIELDS,input.body.empty()?"":reinterpret_cast<const char*>(input.body.data()));curl_easy_setopt(curl,CURLOPT_POSTFIELDSIZE_LARGE,static_cast<curl_off_t>(input.body.size()));}

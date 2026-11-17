@@ -124,6 +124,10 @@ else if(name.starts_with("TN_")){
         const auto rate=float_argument(2);if(arg(3))put(arg(3),std::bit_cast<std::uint32_t>(std::clamp(rate,0.F,8.F)));
         require(!d(1),0xc00d36d1U);require(rate==rate && rate>=0,0xc00d36d2U);require(rate<=8,0xc00d36d0U);
     }else {put(arg(3),0);require(d(1)==0,0xc00d36d2U);require(!d(2),0xc00d36d1U);put(arg(3),std::bit_cast<std::uint32_t>(name=="RS_GetSlowestRate"?0.F:8.F));}
+}else if(name=="GS_GetService" && item->kind==mf::Buffer){
+    // D3D9 表面緩衝：MR_BUFFER_SERVICE 取回 IDirect3DSurface9（同一表面，增加參照）。
+    out(arg(3));require(item->extended==mf::iid_D3D9Surface && guid(arg(1))==mf::MR_BUFFER_SERVICE,0xc00d36baU);const auto iid=guid(arg(2));
+    require(iid==mf::iid_D3D9Surface || iid==mf::unknown,no_interface);hold(item->parent);put(arg(3),item->parent,bits);
 }else if(name=="GS_GetService"){
     require(item->kind==mf::Session,no_interface);require(!item->closed,shutdown);out(arg(3));const auto service_id=guid(arg(1)),iid=guid(arg(2));mf::Kind kind{};
     if(service_id==mf::MF_RATE_CONTROL_SERVICE && iid==mf::iid_RateControl)kind=mf::RateControl;

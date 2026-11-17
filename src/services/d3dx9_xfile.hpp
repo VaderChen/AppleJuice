@@ -117,6 +117,8 @@ class Parser {
     }
 #include "d3dx9_hierarchy_parser.inc"
 public:
+    // 已展開的 token 串流（例如 ID3DXFileData 節點依模板還原的資料）直接使用同一組 parser。
+    explicit Parser(std::vector<Token> stream):tokens(std::move(stream)){}
     explicit Parser(std::span<const std::uint8_t> data){
         check(data.size()>=16 && std::memcmp(data.data(),"xof ",4)==0);const std::string format(reinterpret_cast<const char*>(data.data()+8),4);const bool wide=std::memcmp(data.data()+12,"0064",4)==0;std::size_t at=16;
         const auto take=[&](unsigned bytes){check(at<=data.size() && bytes<=data.size()-at);std::uint64_t n=0;for(unsigned i=0;i<bytes;++i)n|=std::uint64_t(data[at++])<<(i*8);return n;};

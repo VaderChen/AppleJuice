@@ -6,6 +6,8 @@
 #include "x64arm/windows_raw_input.hpp"
 #include "x64arm/windows_pointer.hpp"
 #include "dinput_interfaces.hpp"
+#include "winrt_gamepad_state.hpp"
+#include "service_callback_task.hpp"
 #include <cstdlib>
 #include "monotonic_clock.hpp"
 #include <algorithm>
@@ -93,16 +95,20 @@ struct DirectInputState {
     std::array<std::optional<input::Guid>,16> legacy_joystick_slots;
     struct GamepadSlot {std::optional<input::Guid> device;std::array<std::uint8_t,12> state{};std::uint32_t packet{};std::uint16_t keystroke_buttons{};bool sampled{};};
     std::array<GamepadSlot,4> gamepad_slots;
+    std::map<input::Guid,std::array<double,4>> gamepad_vibrations;
     bool xinput_enabled{true}; // XInputEnable(FALSE) 後 GetState 回中性狀態、SetState 不震動。
     // 最近一次處理的裝置清單換代，以及當時更新的 raw input 狀態。
     std::uint64_t device_generation{};const void* raw_input_refreshed{};
     // 最近一次背景輪詢的宿主單調時間（100 ns）。
     std::uint64_t background_polled{};
+    WinrtGamepadBridge winrt_gamepads;
 };
+#include "windows_winrt_gamepad.inc"
 void WindowsServices::set_input_backend(std::shared_ptr<input::Backend> backend){if(dinput_ && !dinput_->objects.empty())throw std::logic_error("DirectInput 物件建立後不能替換輸入後端");if(!dinput_)dinput_=std::make_shared<DirectInputState>();dinput_->backend=std::move(backend);dinput_->gamepad_slots={};dinput_->device_generation=0;dinput_->raw_input_refreshed=nullptr;}
 std::span<const WindowsServiceDescriptor> dinput_service_descriptors(){
     static const auto table=[](){
         std::vector<WindowsServiceDescriptor> result{{"dinput.dll","DirectInputCreateA",4,0,0,2},{"dinput.dll","DirectInputCreateW",4,0,0,2},{"dinput.dll","DirectInputCreateEx",5,0,0,2},{"dinput.dll","GetdfDIJoystick",0},{"dinput8.dll","DirectInput8Create",5,0,0,2}};
+        for(const auto& method:winrt_gamepad::methods)result.push_back({"internal-dinput",method.name,method.arguments,method.wide,0,method.narrow});
         for(const auto& item:std::array<WindowsServiceDescriptor,10>{{{"winmm.dll","joyGetNumDevs",0},{"winmm.dll","joyGetDevCapsA",3},{"winmm.dll","joyGetDevCapsW",3},{"winmm.dll","joyGetPos",2},{"winmm.dll","joyGetPosEx",2},
             {"winmm.dll","joySetCapture",4,0,0,0xe},{"winmm.dll","joyReleaseCapture",1,0,0,1},{"winmm.dll","joySetThreshold",2,0,0,3},{"winmm.dll","joyGetThreshold",2,0,0,1},{"winmm.dll","joyConfigChanged",1,0,0,1}}})result.push_back(item);
         for(auto family:{"xinput1_3.dll","xinput1_4.dll"}){
@@ -145,7 +151,7 @@ void WindowsServices::inject_dinput(bool keyboard,unsigned object,std::int64_t v
 void WindowsServices::finish_dinput_enumeration(std::uint64_t scratch,GuestMemory& memory,const GuestState& state){
     if(!scratch)return;if(dinput_ && dinput_->enumerations.contains(scratch)){for(const auto& o:dinput_->enumerations.at(scratch))if(!--o->references){if(o->is_acquired && (o->cooperative&1))dinput_->backend->cooperative(o->device_id,false);o->is_acquired=false;for(const auto& [key,p]:o->interfaces){(void)key;dinput_->objects.erase(p);(void)free_heap(memory,p,state);}o->interfaces.clear();}dinput_->enumerations.erase(scratch);}(void)free_heap(memory,scratch,state);
 }
-bool WindowsServices::dinput_waiting()const{if(!dinput_)return false;for(const auto& [pointer,interface]:dinput_->objects)if(pointer==interface.object->canonical && interface.object->is_acquired && interface.object->event)return true;return false;}
+bool WindowsServices::dinput_waiting()const{if(!dinput_)return false;if(!dinput_->winrt_gamepads.subscriptions.empty() || !dinput_->winrt_gamepads.pending.empty())return true;for(const auto& [pointer,interface]:dinput_->objects)if(pointer==interface.object->canonical && interface.object->is_acquired && interface.object->event)return true;return false;}
 void WindowsServices::poll_dinput(bool background){
     if(!dinput_ || !dinput_->backend)return;
     // 裝置盤點可能建立 backend；只有背景排程可略過無訂閱者的輪詢。
@@ -330,6 +336,7 @@ void WindowsServices::poll_joystick_captures(){
     }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_dinput(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.family=="internal-dinput" && service.symbol.starts_with("Winrt."))return invoke_winrt_gamepad(state,memory,service);
     if(!runtime_.network.external_io)throw HostCallFault("DirectInput 不能在 compare 模式使用");
     if(!dinput_)dinput_=std::make_shared<DirectInputState>();auto& bridge=*dinput_;if(!bridge.backend)bridge.backend=detail::make_input_backend();
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const unsigned unit=x86_?4U:8U;const std::uint8_t bits=x86_?32:64;

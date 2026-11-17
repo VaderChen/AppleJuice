@@ -41,6 +41,10 @@ std::uint32_t WindowsServices::registry_security_access(const std::u16string& pa
 std::pair<std::u16string,std::uint32_t> WindowsServices::registry_security_handle(std::uint64_t value,std::uint32_t required){
     const auto root=static_cast<std::uint32_t>(value);auto& registry=runtime_.registry;
     if((value==root || value==(UINT64_C(0xffffffff00000000)|root)) && root>=0x80000000U && root<=0x80000006U && root!=0x80000004U){
+        if(const auto overridden=runtime_.registry_predefined_overrides.find(root);overridden!=runtime_.registry_predefined_overrides.end()){
+            if(!registry.keys.contains(overridden->second.path))throw SecurityDescriptorError{1018};
+            if((overridden->second.access&required)!=required)throw SecurityDescriptorError{5};return {overridden->second.path,overridden->second.access};
+        }
         initialize_tokens();std::u16string path(1,static_cast<char16_t>(root&255));
         if(root==0x80000001U)path=registry_current_user_path(true);
         registry.keys.try_emplace(path);const auto granted=registry_security_access(path,required);return {path,granted};
@@ -61,6 +65,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry_security(GuestStat
     try{
         if(!registry_file_.empty() && !runtime_.network.external_io)throw SecurityDescriptorError{50};
         RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,!setting);if(transaction.error)throw SecurityDescriptorError{transaction.error};
+        restore_app_hives(runtime_.registry);
         const auto original=setting?runtime_.registry:RegistryState{};const auto flags=static_cast<std::uint32_t>(call(reg?1:2));
         const auto needed=key_flags(flags,setting);std::u16string path;
         if(named){
@@ -99,6 +104,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_registry_security(GuestStat
             }
             for(auto& [key,descriptor]:changes)runtime_.registry.security_descriptors[key]=std::move(descriptor);
             if(const auto error=commit_registry_transaction(transaction)){runtime_.registry=original;throw SecurityDescriptorError{error};}
+            if(!app_hives_.empty())if(const auto error=persist_app_hives())throw SecurityDescriptorError{error};
             for(const auto& [key,descriptor]:changes){(void)descriptor;poll_registry_notifications(false,key,8);}
         }else{
             if(!(flags&1U))sd.data[0].clear();if(!(flags&2U))sd.data[1].clear();

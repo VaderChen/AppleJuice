@@ -9,6 +9,7 @@
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
 #include <algorithm>
+#include <bit>
 #include <memory>
 
 namespace x64arm {
@@ -20,6 +21,11 @@ using Big=std::unique_ptr<BIGNUM,decltype(&BN_clear_free)>;
 constexpr std::uint32_t bad_hash=0x80090002U,bad_key=0x80090003U,bad_data=0x80090005U,bad_signature=0x80090006U;
 constexpr std::uint32_t bad_algorithm=0x80090008U,bad_flags=0x80090009U,bad_type=0x8009000aU,bad_key_state=0x8009000bU,bad_hash_state=0x8009000cU,no_key=0x8009000dU;
 using crypto_detail::hash_info;
+// 以雜湊值所用的演算法重新雜湊一段資料（CryptDeriveKey 的延伸步驟）；SSL3 SHAMD5 為 MD5 與 SHA-1 串接。
+Bytes digest_with(std::uint32_t algorithm,std::span<const std::uint8_t> data){
+    if(algorithm==0x8008){CryptoHash md5("MD5",false,{}),sha("SHA1",false,{});md5.update(data);sha.update(data);auto out=md5.digest();const auto tail=sha.digest();out.insert(out.end(),tail.begin(),tail.end());return out;}
+    CryptoHash hash(hash_info(algorithm)->name,false,{});hash.update(data);return hash.digest();
+}
 Bytes hash_value(const LegacyCryptHash& hash){
     if(hash.finished)return hash.value;
     auto result=hash.hash.digest();if(hash.algorithm==0x8008){const auto tail=hash.tail.digest();result.insert(result.end(),tail.begin(),tail.end());}return result;
@@ -143,6 +149,34 @@ std::uint32_t WindowsServices::legacy_crypto_call(GuestMemory& memory,const Wind
         if(u32(2)==7 && (!key.private_key || !key.exportable || !(key.permissions&4)))return fail(bad_key_state);
         const auto bytes=export_rsa(key,u32(2)==7);if(bytes.empty())return fail(bad_key);return write(bytes,arg(4),arg(5));
     }
+    if(symbol=="CryptDeriveKey"){
+        // (hProv, Algid, hBaseData, dwFlags, phKey)：金鑰取自雜湊值的前 n 位元組；雜湊不是 SHA-2 而金鑰為 3DES／AES，或雜湊值不夠長時，
+        // 以 64 位元組的 0x36／0x5C 緩衝與雜湊值 XOR 後各自再雜湊、串接後取前 n 位元組。區塊加密為 CBC、IV 全 0；DES 系列調整同位位元。
+        // 高 16 位元指定金鑰長度；CRYPT_CREATE_SALT 以剩餘的雜湊位元作為 40 位元 RC2／RC4 的鹽值。雜湊在此完成，之後不能再加入資料。
+        const auto provider=runtime_.crypt_providers.find(arg(0));if(provider==runtime_.crypt_providers.end())return fail(6);
+        const auto id=u32(1),flags=u32(3)&0xffffU;const auto a=legacy_crypto::algorithm_for(id,provider->second);
+        if(!a || !a->cipher)return fail(bad_algorithm);
+        const auto base=runtime_.legacy_crypto_hashes.find(arg(2));if(base==runtime_.legacy_crypto_hashes.end())return fail(bad_hash);
+        if(flags&~0x415U)return fail(bad_flags);if(!arg(4))return fail(87);
+        const bool des=id==0x6601 || id==0x6603 || id==0x6609;const auto bits=(u32(3)>>16)?u32(3)>>16:a->default_bits;
+        if(bits<a->min_bits || bits>a->max_bits || (!des && bits%8))return fail(bad_data);
+        const bool salted=(id==0x6602 || id==0x6801) && bits==40 && !(flags&0x10);if((flags&4) && !salted)return fail(bad_flags);
+        memory.check(GuestAddress{arg(4)},x86_?4:8,Access::Write);
+        auto& hash=base->second;const auto value=hash_value(hash);hash.value=value;hash.finished=true;
+        const std::size_t size=des?bits/7:bits/8;const bool sha2=hash.algorithm>=0x800c && hash.algorithm<=0x800e;
+        Bytes material=value;
+        if((!sha2 && (id==0x6603 || id==0x6609 || (id>=0x660e && id<=0x6610))) || size>value.size()){
+            Bytes inner(64,0x36),outer(64,0x5c);for(std::size_t i=0;i<value.size() && i<64;++i){inner[i]^=value[i];outer[i]^=value[i];}
+            material=digest_with(hash.algorithm,inner);const auto second=digest_with(hash.algorithm,outer);material.insert(material.end(),second.begin(),second.end());
+            if(size>material.size())return fail(bad_data);
+        }
+        LegacyCryptKey key;key.provider=arg(0);key.algorithm=id;key.bits=bits;key.exportable=bool(flags&1);if(key.exportable)key.permissions|=4;
+        key.secret.assign(material.begin(),material.begin()+static_cast<std::ptrdiff_t>(size));
+        if(des)for(auto& byte:key.secret){byte=static_cast<std::uint8_t>(byte&0xfe);byte=static_cast<std::uint8_t>(byte|((std::popcount(byte)&1)?0:1));}
+        key.iv.resize(a->block>1?a->block:0);
+        if(salted){key.salt.resize(11);if(flags&4)for(std::size_t i=0;i<key.salt.size() && size+i<value.size();++i)key.salt[i]=value[size+i];}
+        if(!new_key(std::move(key),arg(4)))return 0;provider->second.session_bits=bits;return 1;
+    }
     if(symbol=="CryptCreateHash"){
         const auto provider=runtime_.crypt_providers.find(arg(0));if(provider==runtime_.crypt_providers.end())return fail(6);
         const auto* info=hash_info(u32(1));if(!info || (provider->second.type==1 && u32(1)>0x8008))return fail(bad_algorithm);
@@ -164,6 +198,13 @@ std::uint32_t WindowsServices::legacy_crypto_call(GuestMemory& memory,const Wind
         if(u32(3))return fail(bad_flags);if(hash.finished)return fail(bad_hash_state);
         if(u32(2)>output_limit)return fail(8);if(u32(2) && !arg(1))return fail(87);
         const auto bytes=read(arg(1),u32(2));hash.hash.update(bytes);if(hash.algorithm==0x8008)hash.tail.update(bytes);return 1;
+    }
+    if(symbol=="CryptHashSessionKey"){
+        // (hHash, hKey, dwFlags)：雜湊工作階段金鑰的位元組；預設以大端序（反轉）加入，CRYPT_LITTLE_ENDIAN 時依原順序。
+        if(u32(2)&~1U)return fail(bad_flags);if(hash.finished)return fail(bad_hash_state);
+        const auto key=runtime_.legacy_crypto_keys.find(arg(1));if(key==runtime_.legacy_crypto_keys.end() || key->second.secret.empty())return fail(bad_key);
+        auto bytes=key->second.secret;if(!(u32(2)&1U))std::reverse(bytes.begin(),bytes.end());
+        hash.hash.update(bytes);if(hash.algorithm==0x8008)hash.tail.update(bytes);return 1;
     }
     if(symbol=="CryptSetHashParam"){
         if(u32(3))return fail(bad_flags);if(u32(1)!=2)return fail(bad_type);if(!arg(2))return fail(87);

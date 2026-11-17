@@ -80,6 +80,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_etw_controller(GuestState& 
             if(!guid || !handle || code>(name=="EnableTraceEx2"?2U:1U))return finish(87);if(property&~0x10U)return finish(50);config.ignore_keyword_zero=(property&0x10U)!=0;
             const auto found=etw_sessions_.find(handle);const auto core=runtime_.traces.session(handle);if(found==etw_sessions_.end() || !core || !core->active)return finish(6);
             if(!etw_session_access(found->second))return finish(5);etw::Guid id{};memory.read(GuestAddress{guid},id);
+            if(code==1 && std::find(found->second.disallowed.begin(),found->second.disallowed.end(),id)!=found->second.disallowed.end())return finish(5);
             if(code==1 && core->bindings.contains(id) && std::none_of(runtime_.event_providers.begin(),runtime_.event_providers.end(),[&](const auto& item){return item.second.id==id;}))return finish(1);
             const auto previous=runtime_.traces.notification_ids();const auto status=runtime_.traces.enable(handle,id,code,std::move(config));if(status!=etw::Status::Success)return finish(etw::win_error(status));
             std::vector<std::uint64_t> callbacks;for(auto pending:runtime_.traces.notification_ids())if(std::find(previous.begin(),previous.end(),pending)==previous.end())callbacks.push_back(pending);
@@ -87,6 +88,86 @@ std::optional<std::uint32_t> WindowsServices::invoke_etw_controller(GuestState& 
             etw_enable_waits_.emplace(threads_.current,std::move(callbacks));thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::EtwEnable;
             thread.wait.deadline=timeout==UINT32_MAX || runtime_.clock_ticks>UINT64_MAX-std::uint64_t{timeout}*10000?UINT64_MAX:runtime_.clock_ticks+std::uint64_t{timeout}*10000;
             schedule(state,memory);return {};
+        }
+        if(name.starts_with("QueryAllTraces")){
+            // (PropertyArray, PropertyArrayCount, LoggerCount)：依工作階段 handle 順序列出可存取的作用中工作階段，每筆以 QueryTrace 相同格式寫回；
+            // 陣列不足時寫回前 PropertyArrayCount 筆並回報 ERROR_MORE_DATA，LoggerCount 為全部數量。
+            const auto count=static_cast<std::uint32_t>(arg(1));if(!arg(0) || !arg(2) || !count || count>64)return finish(87);memory.check(GuestAddress{arg(2)},4,Access::Write);
+            std::vector<std::uint64_t> handles;
+            for(const auto& [handle,info]:etw_sessions_){const auto core=runtime_.traces.session(handle);if(core && core->active && etw_session_access(info))handles.push_back(handle);}
+            memory.store(GuestAddress{arg(2)},32,handles.size());
+            for(std::size_t i=0;i<handles.size() && i<count;++i){
+                const auto at=memory.load(GuestAddress{arg(0)+i*shape.unit},static_cast<std::uint8_t>(shape.unit*8));Properties item(memory,at,x86_,wide);const auto& info=etw_sessions_.at(handles[i]);
+                const auto status=item.output(handles[i],*runtime_.traces.session(handles[i]),info.minimum,info.maximum,info.flush_timer,info.file_errors,used(handles[i]));if(status)return finish(status);}
+            return finish(handles.size()>count?234U:0U);
+        }
+        if(name.starts_with("EnumerateTraceGuids")){
+            // 本程序登錄的提供者與被工作階段啟用的提供者（GUID 聯集，依 GUID 排序）。
+            std::vector<etw::Guid> guids;
+            for(const auto& [id,registration]:runtime_.event_providers){(void)id;guids.push_back(registration.id);}
+            for(const auto& [handle,info]:etw_sessions_){(void)info;if(const auto core=runtime_.traces.session(handle);core && core->active)for(const auto& [guid,binding]:core->bindings){(void)binding;guids.push_back(guid);}}
+            std::sort(guids.begin(),guids.end());guids.erase(std::unique(guids.begin(),guids.end()),guids.end());
+            // 某 GUID 的啟用資訊：{session, binding}，依工作階段順序。
+            const auto enables=[&](const etw::Guid& guid){std::vector<std::pair<const etw::Session*,const etw::Binding*>> out;
+                for(const auto& [handle,info]:etw_sessions_){(void)info;const auto core=runtime_.traces.session(handle);if(!core || !core->active)continue;
+                    if(const auto found=core->bindings.find(guid);found!=core->bindings.end())out.emplace_back(core,&found->second);}return out;};
+            if(name=="EnumerateTraceGuids"){
+                // (GuidPropertiesArray, PropertyArrayCount, GuidCount)：TRACE_GUID_PROPERTIES {Guid, GuidType, LoggerId, EnableLevel, EnableFlags, IsEnable}（36 位元組）。
+                const auto count=static_cast<std::uint32_t>(arg(1));if(!arg(0) || !arg(2) || !count)return finish(87);memory.check(GuestAddress{arg(2)},4,Access::Write);
+                memory.store(GuestAddress{arg(2)},32,guids.size());
+                for(std::size_t i=0;i<guids.size() && i<count;++i){
+                    const auto at=memory.load(GuestAddress{arg(0)+i*shape.unit},static_cast<std::uint8_t>(shape.unit*8));if(!at)return finish(87);
+                    std::vector<std::uint8_t> bytes(36);std::copy(guids[i].begin(),guids[i].end(),bytes.begin());const auto list=enables(guids[i]);
+                    const auto put=[&](std::size_t offset,std::uint32_t value){for(unsigned b=0;b<4;++b)bytes[offset+b]=static_cast<std::uint8_t>(value>>(8*b));};
+                    if(!list.empty()){put(20,list.front().first->logger_id);put(24,list.front().second->enable.level);put(28,static_cast<std::uint32_t>(list.front().second->enable.any));bytes[32]=1;}
+                    memory.write(GuestAddress{at},bytes);}
+                return finish(guids.size()>count?234U:0U);
+            }
+            // EnumerateTraceGuidsEx(TraceQueryInfoClass, InBuffer, InBufferSize, OutBuffer, OutBufferSize, ReturnLength)：
+            // TraceGuidQueryList（0）與 TraceGuidQueryProcess（2）回傳 GUID 陣列（後者只含本程序登錄者）；TraceGuidQueryInfo（1）回傳 TRACE_GUID_INFO＋
+            // 每個執行個體的 TRACE_PROVIDER_INSTANCE_INFO（NextOffset、EnableCount、Pid、Flags：LEGACY 1、PRE_ENABLE 2）＋各工作階段的 TRACE_ENABLE_INFO（32 位元組）。
+            // TraceGroupQueryList（3）沒有提供者群組，回傳空陣列。輸出不足時回報 ERROR_INSUFFICIENT_BUFFER 並寫回所需大小。
+            const auto info_class=static_cast<std::uint32_t>(arg(0)),out_size=static_cast<std::uint32_t>(arg(4));if(!arg(5))return finish(87);memory.check(GuestAddress{arg(5)},4,Access::Write);
+            std::vector<std::uint8_t> bytes;const auto append32=[&](std::uint32_t value){for(unsigned b=0;b<4;++b)bytes.push_back(static_cast<std::uint8_t>(value>>(8*b)));};
+            const auto append64=[&](std::uint64_t value){for(unsigned b=0;b<8;++b)bytes.push_back(static_cast<std::uint8_t>(value>>(8*b)));};
+            if(info_class==0 || info_class==2){
+                if(info_class==2){guids.clear();for(const auto& [id,registration]:runtime_.event_providers){(void)id;guids.push_back(registration.id);}std::sort(guids.begin(),guids.end());guids.erase(std::unique(guids.begin(),guids.end()),guids.end());}
+                for(const auto& guid:guids)bytes.insert(bytes.end(),guid.begin(),guid.end());
+            }else if(info_class==1){
+                if(!arg(1) || arg(2)!=16)return finish(87);etw::Guid guid{};memory.read(GuestAddress{arg(1)},guid);const auto list=enables(guid);
+                std::vector<const EventProviderRegistration*> instances;for(const auto& [id,registration]:runtime_.event_providers){(void)id;if(registration.id==guid)instances.push_back(&registration);}
+                if(instances.empty() && list.empty())return finish(4200);
+                const std::size_t instance_count=instances.empty()?1:instances.size();append32(static_cast<std::uint32_t>(instance_count));append32(0);
+                const auto per_instance=16+list.size()*32;
+                for(std::size_t i=0;i<instance_count;++i){
+                    append32(i+1<instance_count?static_cast<std::uint32_t>(per_instance):0U);append32(static_cast<std::uint32_t>(list.size()));
+                    append32(instances.empty()?0U:process_id());append32(instances.empty()?2U:(instances[i]->classic?1U:0U));
+                    for(const auto& [session,binding]:list){append32(1);bytes.push_back(binding->enable.level);bytes.push_back(0);
+                        bytes.push_back(static_cast<std::uint8_t>(session->logger_id));bytes.push_back(static_cast<std::uint8_t>(session->logger_id>>8));
+                        append32(binding->enable.ignore_keyword_zero?0x10U:0U);append32(0);append64(binding->enable.any);append64(binding->enable.all);}
+                }
+            }else if(info_class!=3)return finish(87);
+            memory.store(GuestAddress{arg(5)},32,bytes.size());if(bytes.size()>out_size)return finish(122);
+            if(!bytes.empty()){if(!arg(3))return finish(87);memory.write(GuestAddress{arg(3)},bytes);}return finish(0);
+        }
+        if(name=="TraceSetInformation"){
+            // (SessionHandle, InformationClass, TraceInformation, InformationLength)：
+            // TraceSampledProfileIntervalInfo（5）：TRACE_PROFILE_INTERVAL {Source, Interval}，全系統設定（SessionHandle 可為 0），間隔 1221～10000000（100 ns）；
+            // TraceSetDisallowList（10）：GUID 陣列，清單內的提供者之後不能啟用到此工作階段，已啟用者立即停用；TraceProviderBinaryTracking（11）：BOOLEAN。
+            // 其他類別（堆疊追蹤、系統旗標、PMC 等）需要本引擎沒有的核心事件來源，回報 ERROR_NOT_SUPPORTED。
+            const auto handle=arg(0);const auto info_class=static_cast<std::uint32_t>(arg(1)),length=static_cast<std::uint32_t>(arg(3));
+            if(info_class==5){
+                if(!arg(2) || length!=8)return finish(87);const auto source=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)},32)),interval=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)+4},32));
+                if(interval<1221 || interval>10000000)return finish(87);etw_profile_intervals_[source]=interval;return finish(0);
+            }
+            if(info_class!=10 && info_class!=11)return finish(50);
+            const auto found=etw_sessions_.find(handle);const auto core=runtime_.traces.session(handle);if(found==etw_sessions_.end() || !core || !core->active)return finish(6);
+            if(!etw_session_access(found->second))return finish(5);
+            if(info_class==11){if(!arg(2) || length!=1)return finish(87);found->second.binary_tracking=memory.load(GuestAddress{arg(2)},8)!=0;return finish(0);}
+            if(length%16 || (length && !arg(2)) || length>16*1024)return finish(87);std::vector<etw::Guid> list(length/16);
+            for(std::size_t i=0;i<list.size();++i)memory.read(GuestAddress{arg(2)+i*16},list[i]);
+            for(const auto& guid:list)if(core->bindings.contains(guid)){const auto status=runtime_.traces.enable(handle,guid,0,{});if(status!=etw::Status::Success)return finish(etw::win_error(status));}
+            found->second.disallowed=std::move(list);(void)dispatch_etw_notifications(state,memory);return finish(0);
         }
         Properties props(memory,arg(2),x86_,wide);
         if(name.starts_with("StartTrace")){

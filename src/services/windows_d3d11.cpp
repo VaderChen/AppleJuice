@@ -55,7 +55,7 @@ namespace {
 using namespace d3d11_guid;
 constexpr std::uint32_t invalid=0x80070057U, no_interface=0x80004002U, not_supported=0x887a0004U,
     not_found=0x887a0002U, out_of_memory=0x8007000eU, failure=0x80004005U;
-enum class Kind { Mesh10, MeshBuffer10, Sprite10, Font10, Effect10, EffectType10, EffectVariable10, EffectScalar10, EffectVector10, EffectMatrix10, EffectString10, EffectResource10, EffectRenderTarget10, EffectDepthView10, EffectBuffer10, EffectShader10, EffectBlend10, EffectDepth10, EffectRaster10, EffectSampler10, EffectTechnique10, EffectPass10, StateBlock10, ClassLinkage, ClassInstance, Reflection, ReflectionBuffer, ReflectionVariable, ReflectionType, Device, Context, VideoDevice, VideoContext, Multithread, Texture, Decoder, View, Factory, Adapter, BufferObject, Texture1D, Texture3D, ShaderResource, Unordered, RenderTarget, DepthView, VertexShader, PixelShader, ComputeShader, GeometryShader, HullShader, DomainShader, Layout, Blend, DepthState, Raster, Sampler, Query, Predicate, CommandList, DxgiDevice, SwapChain, Output, Blob, DxgiResource, Fence, Annotation };
+enum class Kind { Mesh10, MeshBuffer10, Sprite10, Font10, Effect10, EffectType10, EffectVariable10, EffectScalar10, EffectVector10, EffectMatrix10, EffectString10, EffectResource10, EffectRenderTarget10, EffectDepthView10, EffectBuffer10, EffectShader10, EffectBlend10, EffectDepth10, EffectRaster10, EffectSampler10, EffectTechnique10, EffectPass10, StateBlock10, ClassLinkage, ClassInstance, Reflection, ReflectionBuffer, ReflectionVariable, ReflectionType, Device, Context, VideoDevice, VideoContext, Multithread, Texture, Decoder, View, Factory, Adapter, BufferObject, Texture1D, Texture3D, ShaderResource, Unordered, RenderTarget, DepthView, VertexShader, PixelShader, ComputeShader, GeometryShader, HullShader, DomainShader, Layout, Blend, DepthState, Raster, Sampler, Query, Predicate, CommandList, DxgiDevice, SwapChain, Output, Blob, DxgiResource, Fence, Annotation, DataLoader };
 struct Buffer { std::uint64_t address{}; std::uint32_t capacity{}; bool acquired{}; std::vector<std::uint8_t> submitted; };
 struct ReferenceSurface {
     std::array<std::int32_t,2> poc;
@@ -262,6 +262,8 @@ struct Identity {
     std::map<std::uint8_t,ReferenceSurface> reference_poc;
     bool frame_active{}, submitted{}, protected_threads{};
     std::uint64_t sequence{};
+    // ID3DX10／ID3DX11DataLoader：來源（1 檔案、2 記憶體、3 資源）、檔案路徑，以及 Decompress 回傳的資料位址與長度（檔案載入器的資料在 allocations 內）。
+    struct DataLoader { std::uint32_t source{};std::string path;std::uint64_t data{},size{};bool loaded{},d3d10{}; } data_loader;
 };
 struct Object { Kind kind; std::shared_ptr<Identity> identity; };
 // COM 引用計數存放在客體記憶體：每個身分一格 32 位元（建立根介面時配置、初值 1），各介面物件 [this+指標寬] 指向它。
@@ -394,6 +396,8 @@ struct D3D11State {
     std::map<std::uint32_t,D3D11SharedResource> shared_resources;
     std::uint32_t next_shared_resource{0xa6000000};
     std::map<std::uint64_t,D3DCompileOperation> compilations;
+    // D3D10Get*ShaderProfile 回傳的常駐字串（每個程序配置一次）。
+    std::map<std::string,std::uint64_t> profile_strings;
     std::uint64_t next_compilation{};
     // 每個 D3D11 呼叫都以介面指標查表數次；順序不影響語義（迭代點皆為全體掃描或唯一匹配）。
     D3D11ObjectTable objects;
@@ -591,7 +595,14 @@ std::span<const WindowsServiceDescriptor> d3d11_service_descriptors() {
         {"d3dcompiler_47.dll","D3DCompile",11},{"d3dcompiler_43.dll","D3DCompile",11},
         {"d3dcompiler_47.dll","D3DCompile2",14},{"d3dcompiler_47.dll","D3DCreateBlob",2},{"d3dcompiler_43.dll","D3DCreateBlob",2},
         {"d3dcompiler_47.dll","D3DDisassemble",5},{"d3dcompiler_43.dll","D3DDisassemble",5},
+        {"d3dcompiler_47.dll","D3DPreprocess",7},{"d3dcompiler_43.dll","D3DPreprocess",7},{"d3dcompiler_47.dll","D3DGetBlobPart",5},{"d3dcompiler_43.dll","D3DGetBlobPart",5},
+        {"d3dcompiler_47.dll","D3DStripShader",4},{"d3dcompiler_43.dll","D3DStripShader",4},{"d3dcompiler_47.dll","D3DGetDebugInfo",3},{"d3dcompiler_43.dll","D3DGetDebugInfo",3},
+        {"d3dcompiler_47.dll","D3DReadFileToBlob",2},{"d3dcompiler_47.dll","D3DWriteBlobToFile",3},{"d3dcompiler_47.dll","D3DCompileFromFile",9},
+        {"d3dcompiler_47.dll","D3DAssemble",8},{"d3dcompiler_43.dll","D3DAssemble",8},
+        {"d3d10.dll","D3D10CompileShader",10},{"d3d10.dll","D3D10CompileEffectFromMemory",9},{"d3d10.dll","D3D10GetShaderDebugInfo",3},
+        {"d3d10.dll","D3D10GetVertexShaderProfile",1},{"d3d10.dll","D3D10GetPixelShaderProfile",1},{"d3d10.dll","D3D10GetGeometryShaderProfile",1},
         {"internal-d3d11","BlobPointer",1},{"internal-d3d11","BlobSize",1},
+        {"internal-d3d11","DataLoaderLoad",1},{"internal-d3d11","DataLoaderDecompress",3},{"internal-d3d11","DataLoaderDestroy",1},
 #include "d3d11_graphics_descriptors.inc"
 #include "d3d11_reflection_descriptors.inc"
         {"d3d11.dll","D3D11CreateDevice",10},{"dxgi.dll","CreateDXGIFactory",2},{"dxgi.dll","CreateDXGIFactory1",2},
@@ -1016,6 +1027,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         switch(kind){
         case Kind::StateBlock10:count=7;methods={{0,"QueryInterface"},{1,"AddRef"},{2,"Release"},{3,"StateBlockCapture"},{4,"StateBlockApply"},{5,"StateBlockReleaseObjects"},{6,"GetDevice"}};break;
         case Kind::Blob:count=5;methods.insert({{3,"BlobPointer"},{4,"BlobSize"}});break;
+        // ID3DX10／ID3DX11DataLoader 不是 COM 介面：只有 Load、Decompress、Destroy 三個方法。
+        case Kind::DataLoader:count=3;methods={{0,"DataLoaderLoad"},{1,"DataLoaderDecompress"},{2,"DataLoaderDestroy"}};break;
 #include "d3d11_graphics_vtables.inc"
 #include "d3d10_effect_vtables.inc"
 #include "d3d10_sprite_vtables.inc"
@@ -1225,6 +1238,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
 #include "d3dx11_save_handlers.inc"
 #include "d3dx11_load_handlers.inc"
 #include "d3dx11_transfer_handlers.inc"
+#include "d3dx_data_loader_handlers.inc"
         if(graphics_handled){}
         // 影片資源與圖形資源共用同一 COM 物件表及裝置生命週期。
         else if(symbol=="Unsupported")throw HostCallFault("尚未實作的 D3D11 COM 方法");
@@ -1305,7 +1319,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
             else if(id->kind==Kind::Fence)supported=guid==IID_ID3D11Fence || guid==IID_ID3D11DeviceChild;
             else if(id->kind==Kind::Decoder)supported=guid==IID_ID3D11VideoDecoder || guid==IID_ID3D11DeviceChild;
             else if(id->kind==Kind::View)supported=guid==IID_ID3D11VideoDecoderOutputView || guid==IID_ID3D11View || guid==IID_ID3D11DeviceChild;
-            else if(id->kind==Kind::Reflection)supported=guid==IID_ID3D11ShaderReflection || guid==IID_ID3D11ShaderReflection47 || guid==IID_ID3D11ShaderReflection43 || guid==IID_ID3D12ShaderReflection;
+            else if(id->kind==Kind::Reflection)supported=id->sequence==10?guid==d3d10_guid::IID_ID3D10ShaderReflection:(guid==IID_ID3D11ShaderReflection || guid==IID_ID3D11ShaderReflection47 || guid==IID_ID3D11ShaderReflection43 || guid==IID_ID3D12ShaderReflection);
             else if(id->kind==Kind::Blob)supported=guid==IID_ID3D10Blob;
             else if(id->kind==Kind::Factory)supported=dxgi_factory_guid(guid) || guid==IID_IDXGIObject;
             else if(id->kind==Kind::Adapter)supported=dxgi_adapter_guid(guid) || guid==IID_IDXGIObject;

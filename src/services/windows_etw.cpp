@@ -17,12 +17,15 @@ std::span<const WindowsServiceDescriptor> etw_service_descriptors(){
         {"sechost.dll","SetTraceCallback",2},{"sechost.dll","RemoveTraceCallback",1},
         {"advapi32.dll","EnableTrace",5,0x10},{"advapi32.dll","EnableTraceEx",9,0x64},
         {"advapi32.dll","EnableTraceEx2",8,0x31},{"advapi32.dll","EventActivityIdControl",2},
-        {"advapi32.dll","EventWriteString",4,5}
+        {"advapi32.dll","EventWriteString",4,5},
+        {"advapi32.dll","QueryAllTracesW",3,0,0,2},{"advapi32.dll","QueryAllTracesA",3,0,0,2},{"advapi32.dll","EnumerateTraceGuids",3,0,0,2},
+        {"advapi32.dll","EnumerateTraceGuidsEx",6,0,0,0x15},{"advapi32.dll","TraceSetInformation",4,1,0,0xa}
     };return entries;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_etw(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const auto name=service.symbol;
-    if(name.starts_with("StartTrace") || name.starts_with("ControlTrace") || name.starts_with("StopTrace") || name.starts_with("QueryTrace") || name.starts_with("FlushTrace") || name.starts_with("EnableTrace"))return invoke_etw_controller(state,memory,service);
+    if(name.starts_with("StartTrace") || name.starts_with("ControlTrace") || name.starts_with("StopTrace") || name.starts_with("QueryTrace") || name.starts_with("FlushTrace") || name.starts_with("EnableTrace") ||
+       name.starts_with("QueryAllTraces") || name.starts_with("EnumerateTraceGuids") || name=="TraceSetInformation")return invoke_etw_controller(state,memory,service);
     if(name.starts_with("OpenTrace") || name=="CloseTrace" || name=="ProcessTrace" || name=="SetTraceCallback" || name=="RemoveTraceCallback")return invoke_etw_consumer(state,memory,service);
     return invoke_etw_provider(state,memory,service);
 }

@@ -1,9 +1,18 @@
+#include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "pe_signature.hpp"
+#include "catalog_codec.hpp"
+#include "x64arm/windows_guid.hpp"
+#include "x64arm/windows_paths.hpp"
+#include <ctime>
+#include "code_signing_roots.hpp"
 #include "certificate_packet.hpp"
 #include "sandbox_certificate_roots.hpp"
 #include <algorithm>
+#include <array>
+#include <tuple>
+#include <charconv>
 #include <cstdio>
 #include <openssl/err.h>
 
@@ -22,14 +31,7 @@ std::uint64_t WindowsServices::trust_call(GuestState& state,GuestMemory& memory,
     const auto load=[&](std::uint64_t base,unsigned at,unsigned width=32){return memory.load(GuestAddress{base+at},static_cast<std::uint8_t>(width));};
     const auto put=[&](std::uint64_t base,unsigned at,std::uint64_t value,unsigned width=32){memory.store(GuestAddress{base+at},static_cast<std::uint8_t>(width),value);};
     const auto wide=[&](std::uint64_t pointer){require(pointer);return utf16_to_utf8(read_utf16(memory,GuestAddress{pointer},32768));};
-    const auto file_bytes=[&](std::uint64_t handle,std::uint64_t path){
-        std::shared_ptr<HostFile> native;std::shared_ptr<const std::vector<std::uint8_t>> snapshot;
-        if(handle && handle!=(x86_?UINT32_MAX:UINT64_MAX)){
-            const auto found=files_.find(handle);require(found!=files_.end(),6);require((found->second.access&0x80000001U)!=0,5);require(!found->second.directory->loaded && !(found->second.metadata.attributes&0x10) && !found->second.pipe && !found->second.serial && !found->second.hid,6);native=found->second.native;snapshot=found->second.bytes;
-        }else{require(path);if(!runtime_.network.external_io)throw HostCallFault("compare 不允許 WinTrust 檔案 I/O");const auto opened=filesystem_.open_reader(wide(path));require(!opened.error,opened.error);native=opened.file;}
-        if(native){if(!runtime_.network.external_io)throw HostCallFault("compare 不允許 WinTrust 原生檔案 I/O");const auto info=native->information();require(!info.error,info.error);require(!(info.metadata.attributes&0x10),5);require(info.metadata.size<=256ULL*1024*1024,8);std::vector<std::uint8_t> bytes(static_cast<std::size_t>(info.metadata.size));const auto read=native->read(bytes,0);require(!read.error,read.error);require(read.bytes==bytes.size(),38);return bytes;}
-        require(bool(snapshot),6);return *snapshot;
-    };
+    const auto file_bytes=[&](std::uint64_t handle,std::uint64_t path){return trust_file_contents(memory,handle,path);};
     const auto close_state=[&](WinTrustState& held){for(const auto certificate:held.certificates)(void)free_certificate(state,memory,certificate);for(auto it=held.allocations.rbegin();it!=held.allocations.rend();++it)(void)free_heap(memory,*it,state);};
     try {
         if(symbol=="WTHelperProvDataFromStateData"){
@@ -49,14 +51,55 @@ std::uint64_t WindowsServices::trust_call(GuestState& state,GuestMemory& memory,
             const auto state_offset=x86_?32U:56U,operation_offset=x86_?28U:48U;const auto operation=load(data,operation_offset),previous=load(data,state_offset,bits);memory.check(GuestAddress{data+state_offset},unit,Access::Write);
             if(operation==2 || operation==4){if(previous){const auto old=runtime_.trust_states.find(previous);require(old!=runtime_.trust_states.end(),6);close_state(old->second);runtime_.trust_states.erase(old);}put(data,state_offset,0,bits);return 0;}
             require(operation==0 || operation==1 || operation==3);require(!previous);const auto choice=load(data,x86_?20:32),info=load(data,x86_?24:40,bits);const auto flags=static_cast<std::uint32_t>(load(data,x86_?40:72));require(info);
-            if(size>=(x86_?52U:88U) && load(data,x86_?48:80,bits))return 0x800b0003U;
+            AuthenticodeOptions options;options.code_signing_roots=code_signing_detail::roots_pem;options.lifetime_signing=(flags&0x800U)!=0;
+            const auto settings=size>=(x86_?52U:88U)?load(data,x86_?48:80,bits):0;
+            std::uint32_t signature_flags{};
+            if(settings){
+                require(load(settings,0)>=(x86_?24U:32U));
+                memory.check(GuestAddress{settings+12},8,Access::Write);
+                signature_flags=static_cast<std::uint32_t>(load(settings,8));require(!(signature_flags&~3U));
+                if(signature_flags&1U)options.signature_index=static_cast<std::uint32_t>(load(settings,4));
+                if(const auto policy=load(settings,x86_?20:24,bits)){
+                    require(load(policy,0)>=(x86_?12U:16U));const auto kind=load(policy,4),policy_info=load(policy,8,bits);require(policy_info);
+                    StrongSignaturePolicy strong;
+                    if(kind==2){
+                        const auto value=read_ansi(memory,policy_info,256);
+                        require(value=="1.3.6.1.4.1.311.72.1.1" || value=="1.3.6.1.4.1.311.72.2.1");
+                        for(const auto* algorithm:{"RSA","ECDSA"}){
+                            for(const auto* hash:{"SHA256","SHA384","SHA512"})strong.signature_hashes.emplace_back(algorithm,hash);
+                            if(value=="1.3.6.1.4.1.311.72.2.1")strong.signature_hashes.emplace_back(algorithm,"SHA1");
+                        }
+                        strong.key_lengths={{"RSA",2047},{"ECDSA",256}};strong.revocation_flags=3;
+                    }else{
+                        require(kind==1);strong.revocation_flags=static_cast<std::uint32_t>(load(policy_info,0));require(!(strong.revocation_flags&~3U));
+                        const auto pairs=[&](std::uint64_t pointer,const auto& accept){
+                            require(pointer);const auto value=wide(pointer);require(!value.empty() && value.size()<=8192);std::size_t start{};
+                            while(start<value.size()){
+                                const auto end=value.find(';',start),last=end==value.npos?value.size():end;
+                                const auto item=std::string_view(value).substr(start,last-start);const auto slash=item.find('/');require(slash!=item.npos && slash && slash+1<item.size());
+                                const auto algorithm=item.substr(0,slash);require(algorithm=="RSA" || algorithm=="ECDSA" || algorithm=="DSA");
+                                accept(algorithm,item.substr(slash+1));if(end==value.npos)break;start=end+1;require(start<value.size());
+                            }
+                        };
+                        pairs(load(policy_info,unit,bits),[&](auto algorithm,auto hash){
+                            require(hash=="MD5" || hash=="SHA1" || hash=="SHA256" || hash=="SHA384" || hash=="SHA512");strong.signature_hashes.emplace_back(algorithm,hash);
+                        });
+                        pairs(load(policy_info,unit*2,bits),[&](auto algorithm,auto text){
+                            std::uint32_t minimum{};const auto [end,error]=std::from_chars(text.data(),text.data()+text.size(),minimum);
+                            require(error==std::errc{} && end==text.data()+text.size() && minimum);strong.key_lengths.emplace_back(algorithm,minimum);
+                        });
+                    }
+                    options.strong_policy=std::move(strong);
+                }
+            }
             const auto roots=sandbox_certificate_roots(filesystem_);require(!roots.error,roots.error);
             TrustVerification verified;
-            if(choice==1){require(load(info,0)>=(x86_?16U:32U));const auto bytes=file_bytes(load(info,x86_?8:16,bits),load(info,x86_?4:8,bits));verified=verify_authenticode(bytes,roots.pem);}
+            if(choice==1){require(load(info,0)>=(x86_?16U:32U));const auto bytes=file_bytes(load(info,x86_?8:16,bits),load(info,x86_?4:8,bits));verified=verify_authenticode(bytes,roots.pem,options);}
             else if(choice==2){require(load(info,0)>=(x86_?40U:72U));const auto bytes=file_bytes(load(info,x86_?20:32,bits),load(info,x86_?16:24,bits));const auto count=static_cast<std::uint32_t>(load(info,x86_?28:48));require(count==0 || count==20 || count==32);const auto admin=load(info,x86_?36:64,bits);std::string algorithm=count==32?"SHA256":"SHA1";if(admin){const auto held=runtime_.catalog_admins.find(admin);require(held!=runtime_.catalog_admins.end(),6);algorithm=held->second.algorithm;}const auto hash=catalog_file_hash(bytes,algorithm);
                 if(count){std::vector<std::uint8_t> supplied(count);memory.read(GuestAddress{load(info,x86_?24:40,bits)},supplied);if(hash!=supplied)return 0x80096010U;}
-                const auto catalog=file_bytes(0,load(info,8,bits));verified=verify_catalog(catalog,hash,roots.pem);
+                const auto catalog=file_bytes(0,load(info,8,bits));verified=verify_catalog(catalog,hash,roots.pem,options);
             }else return 0x800b0003U;
+            if(settings){if(signature_flags&2U)put(settings,12,verified.signature_count?verified.signature_count-1:0);put(settings,16,verified.verified_signature_index);}
             // 尚無 CRL／OCSP 查詢時，要求撤銷檢查的呼叫不能被宣告驗證成功。
             if(!verified.status && (load(data,x86_?16:28) || (flags&0xe0U)))verified.status=0x80092013U;
             if(operation==0)return verified.status;
@@ -102,6 +145,40 @@ std::uint64_t WindowsServices::trust_call(GuestState& state,GuestMemory& memory,
         if(symbol=="CryptCATCatalogInfoFromContext"){
             const auto found=runtime_.catalog_contexts.find(arg(0));require(found!=runtime_.catalog_contexts.end(),6);require(arg(1) && !arg(2) && load(arg(1),0)>=524);const auto name=utf16_bytes(utf8_to_utf16(found->second.path));require(name.size()<=520,206);memory.check(GuestAddress{arg(1)+4},520,Access::Write);memory.write(GuestAddress{arg(1)+4},std::vector<std::uint8_t>(520));memory.write(GuestAddress{arg(1)+4},name);return 1;
         }
+        // 目錄資料庫位於 C:\Windows\System32\CatRoot\<子系統 GUID>（與 CryptCATAdminEnumCatalogFromHash 相同）。
+        const auto catalog_directory=[&](const CatalogAdmin& admin){return std::string("C:\\Windows\\System32\\CatRoot\\")+admin.subsystem;};
+        const auto catalog_name=[&](std::string name){const auto slash=name.find_last_of("\\/");if(slash!=std::string::npos)name=name.substr(slash+1);require(!name.empty() && name.find(':')==std::string::npos,87);return name;};
+        if(symbol=="CryptCATAdminAddCatalog"){
+            // (hCatAdmin, CatalogFile, SelectBaseName, Flags)：驗證為簽署目錄後複製到目錄資料庫並回傳 HCATINFO；沒有指定名稱時以內容 SHA-1 產生 {GUID 形式}.cat。
+            // CRYPTCAT_ADDCATALOG_HARDLINK（1）以複製完成；名稱不可含路徑。
+            const auto admin=runtime_.catalog_admins.find(arg(0));require(admin!=runtime_.catalog_admins.end(),6);require(arg(1) && !(arg(3)&~1ULL),87);
+            const auto bytes=file_bytes(0,arg(1));require(is_catalog_file(bytes),11);
+            std::string name;
+            if(arg(2)){name=wide(arg(2));require(!name.empty() && name.find_first_of("\\/:")==std::string::npos,87);}
+            else{const auto digest=catalog_file_hash(std::vector<std::uint8_t>(bytes.begin(),bytes.end()),"SHA1");name=guid_string(std::vector<std::uint8_t>(digest.begin(),digest.begin()+16))+".cat";}
+            const auto directory=catalog_directory(admin->second);for(const auto* level:{"C:\\Windows","C:\\Windows\\System32","C:\\Windows\\System32\\CatRoot"})(void)filesystem_.create_directory(level);(void)filesystem_.create_directory(directory);
+            const auto path=directory+"\\"+name;auto opened=filesystem_.open_host(path,0x40000000U,2,0x80,3);require(!opened.error,opened.error);
+            const auto written=opened.file->write(bytes,0);require(!written.error,written.error);if(const auto error=opened.file->truncate(bytes.size()))require(false,error);
+            require(runtime_.catalog_contexts.size()<4096,8);const auto handle=runtime_.next_crypto_handle++;runtime_.catalog_contexts.emplace(handle,CatalogContext{arg(0),path});last_error_=0;return handle;
+        }
+        if(symbol=="CryptCATAdminRemoveCatalog"){
+            // (hCatAdmin, CatalogFile, Flags)：自目錄資料庫刪除該名稱（可帶路徑，只取檔名）。
+            const auto admin=runtime_.catalog_admins.find(arg(0));require(admin!=runtime_.catalog_admins.end(),6);require(arg(1) && !arg(2),87);
+            const auto error=filesystem_.remove(catalog_directory(admin->second)+"\\"+catalog_name(wide(arg(1))),false);require(!error,error);last_error_=0;return 1;
+        }
+        if(symbol=="CryptCATAdminResolveCatalogPath"){
+            // (hCatAdmin, CatalogFile, CATALOG_INFO*, Flags)：回傳目錄資料庫中的完整路徑（不檢查是否存在）。
+            const auto admin=runtime_.catalog_admins.find(arg(0));require(admin!=runtime_.catalog_admins.end(),6);require(arg(1) && arg(2) && !arg(3) && load(arg(2),0)>=524,87);
+            const auto name=utf16_bytes(utf8_to_utf16(catalog_directory(admin->second)+"\\"+catalog_name(wide(arg(1)))));require(name.size()<=520,206);
+            memory.check(GuestAddress{arg(2)+4},520,Access::Write);memory.write(GuestAddress{arg(2)+4},std::vector<std::uint8_t>(520));memory.write(GuestAddress{arg(2)+4},name);last_error_=0;return 1;
+        }
+        if(symbol=="IsCatalogFile"){
+            // (hFile, FileName)：檔案控制代碼優先，否則讀取檔名；不是簽署目錄時回 FALSE。
+            const auto handle=arg(0)==(x86_?0xffffffffULL:~0ULL)?0:arg(0);if(!handle && !arg(1))return 0;
+            try{last_error_=0;return is_catalog_file(file_bytes(handle,arg(1)))?1:0;}catch(const Error&){return 0;}
+        }
+#include "windows_wintrust_catalog.inc"
+#include "windows_wintrust_spc.inc"
         throw HostCallFault("未實作 WinTrust API");
     }catch(const Error& error){last_error_=error.code;return symbol=="WinVerifyTrust" || symbol=="WinVerifyTrustEx"?0x80070000U|error.code:0;}
     catch(const certificate_detail::CertificateError& error){last_error_=error.code;return symbol=="WinVerifyTrust" || symbol=="WinVerifyTrustEx"?error.code:0;}
@@ -109,4 +186,5 @@ std::uint64_t WindowsServices::trust_call(GuestState& state,GuestMemory& memory,
     catch(const std::bad_alloc&){last_error_=8;return symbol=="WinVerifyTrust" || symbol=="WinVerifyTrustEx"?0x8007000eU:0;}
     catch(const std::runtime_error&){ERR_clear_error();last_error_=13;return symbol=="WinVerifyTrust" || symbol=="WinVerifyTrustEx"?0x800b0003U:0;}
 }
+#include "windows_sip.inc"
 }

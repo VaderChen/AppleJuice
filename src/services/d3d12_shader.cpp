@@ -189,7 +189,12 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
             compiler.add_msl_resource_binding(mapping);
             for(unsigned j=0;j<d.count;++j){
                 const auto reg=d.register_index+j;
-                if(d.space){result.bindings.push_back({kind,spaced_slot(d.type),native+j,UINT32_MAX,d.space,0,reg});continue;}
+                // D3D12 的暫存器編號不等於 D3D11 型別的內部槽位；space 0 也可能使用 s67、b43、t171。
+                // 先保留所有可直接使用的低槽位，再把非零 space 與高編號資源配置到其餘槽位。
+                const bool high=(d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_CBV && reg>=constant_used.size()) ||
+                    (d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SRV && reg>=resource_used.size()) ||
+                    (d.type==VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER && reg>=sampler_used.size());
+                if(d.space || high){result.bindings.push_back({kind,spaced_slot(d.type),native+j,UINT32_MAX,d.space,0,reg});continue;}
                 const auto [slot,source]=kind==4?uav_slot(reg):std::pair<unsigned,unsigned>{reg,UINT32_MAX};
                 result.bindings.push_back({kind,slot,native+j,UINT32_MAX,0,0,source});
             }
@@ -203,6 +208,13 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
         if(const auto found=counter_native.find({b.space,reg});found!=counter_native.end())b.counter_slot=found->second;
     }
     if(next_buffer>31 || next_texture>128 || next_sampler>16)throw std::invalid_argument("現代著色器資源超出 Metal 綁定上限");
+    const auto signatures=[&](const vkd3d_shader_signature& signature,std::vector<GraphicsShaderSemantic>& out){
+        for(unsigned i=0;i<signature.element_count;++i){const auto& e=signature.elements[i];
+            if(e.sysval_semantic==VKD3D_SHADER_SV_NONE && e.semantic_name && e.mask)
+                out.push_back({e.semantic_name,e.semantic_index,e.register_index,e.mask});
+        }
+    };
+    signatures(scan.signatures.input,result.signature_inputs);signatures(scan.signatures.output,result.signature_outputs);
     if(stage==0)for(const auto& input:resources.stage_inputs){
         // 頂點屬性位置即 D3D 輸入簽章暫存器；以語意供 input layout 對應。
         const auto location=compiler.get_decoration(input.id,spv::DecorationLocation);
@@ -212,7 +224,14 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
         result.inputs.push_back({found->semantic_name,found->semantic_index,location});
     }
     if(stage==5)for(unsigned i=0;i<3;++i)result.threads[i]=std::max(1U,compiler.get_execution_mode_argument(spv::ExecutionModeLocalSize,i));
+    // OpArrayLength（structured／raw GetDimensions）需要以原生 buffer 索引查詢 view 的位元組長度。
+    // 輔助表使用下一個未占用槽位，不能沿用預設 25 而覆蓋一般資源。
+    msl.buffer_size_buffer_index=next_buffer;compiler.set_msl_options(msl);
     compiler.rename_entry_point("main","xlatMtlMain",model);result.source=compiler.compile();result.entry="xlatMtlMain";
+    if(compiler.needs_buffer_size_buffer()){
+        if(next_buffer>=31)throw std::invalid_argument("現代著色器的緩衝大小表超出 Metal 綁定上限");
+        result.buffer_sizes_slot=next_buffer;
+    }
     // Metal 沒有 64 位元浮點，裝置也回報 DoublePrecisionFloatShaderOps=FALSE；DXIL 轉譯仍可能為布林轉換產生 double
     // （例如 float(double(a<b)*double(c<d))）。整個字詞換成對應的 float 型別，這類用法的結果不變。
     if(result.source.find("double")!=std::string::npos){
@@ -223,7 +242,7 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
 }
 namespace {
 // 跨程序快取的記錄格式（格式版本、MSL、入口、綁定、頂點輸入、執行緒群組大小）；欄位全部以小端 32 位元長度前綴。
-constexpr std::uint32_t modern_record_version=3; // 2：非零 space 與 UAV 計數器綁定；3：double 降為 float（舊記錄可能含 Metal 不支援的 double）。
+constexpr std::uint32_t modern_record_version=6; // 6：保存階段連結的 D3D 輸入／輸出語意及分量遮罩。
 std::vector<std::uint8_t> encode_modern_shader(const GraphicsModernShader& shader){
     std::vector<std::uint8_t> out;out.reserve(shader.source.size()+shader.bindings.size()*28+256);
     const auto put=[&](std::uint32_t value){const auto* bytes=reinterpret_cast<const std::uint8_t*>(&value);out.insert(out.end(),bytes,bytes+4);};
@@ -234,6 +253,11 @@ std::vector<std::uint8_t> encode_modern_shader(const GraphicsModernShader& shade
     put(static_cast<std::uint32_t>(shader.inputs.size()));
     for(const auto& input:shader.inputs){text(input.semantic);put(input.index);put(input.attribute);}
     for(const auto value:shader.threads)put(value);
+    put(shader.buffer_sizes_slot);
+    const auto signatures=[&](const std::vector<GraphicsShaderSemantic>& values){
+        put(static_cast<std::uint32_t>(values.size()));for(const auto& v:values){text(v.semantic);put(v.index);put(v.location);put(v.mask);}
+    };
+    signatures(shader.signature_inputs);signatures(shader.signature_outputs);
     return out;
 }
 std::optional<GraphicsModernShader> decode_modern_shader(std::span<const std::uint8_t> bytes){
@@ -250,6 +274,15 @@ std::optional<GraphicsModernShader> decode_modern_shader(std::span<const std::ui
     shader.inputs.resize(inputs);
     for(auto& input:shader.inputs){input.semantic=text();input.index=get();input.attribute=get();}
     for(auto& value:shader.threads)value=get();
+    shader.buffer_sizes_slot=get();
+    if(shader.buffer_sizes_slot!=UINT32_MAX && shader.buffer_sizes_slot>=31)return std::nullopt;
+    const auto signatures=[&](std::vector<GraphicsShaderSemantic>& values){
+        const auto count=get();if(!ok || count>(bytes.size()-at)/16){ok=false;return;}
+        values.resize(count);for(auto& v:values){v.semantic=text();v.index=get();v.location=get();v.mask=get();
+            if(v.semantic.empty() || !v.mask || (v.mask&~15U))ok=false;
+        }
+    };
+    signatures(shader.signature_inputs);signatures(shader.signature_outputs);
     if(!ok || at!=bytes.size() || shader.source.empty() || shader.entry.empty())return std::nullopt;
     return shader;
 }

@@ -1,7 +1,11 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/crypto.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
 #include <algorithm>
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+#endif
 
 // kernel32 補充家族：WOW64 檔案系統重新導向狀態、8.3 名稱檢查、封裝（AppModel）查詢與同步屏障。
 // 全部在宿主端執行；8.3 檢查沿用 ntdll 的 RtlIsNameLegalDOS8Dot3，同步屏障的等待經客體回呼續行交給既有等待流程。
@@ -27,7 +31,17 @@ std::optional<PackageName> parse_package_full_name(std::u16string_view text){
     for(const auto c:result.publisher_id)if(!((c>=u'0' && c<=u'9') || (c>=u'a' && c<=u'z')))return std::nullopt;
     return result;
 }
+// 發行者 ID：發行者字串（UTF-16LE、不含結尾 NUL）的 SHA-256 前 8 位元組，以 Crockford base32（小寫）編成 13 字元（最後補 1 個 0 位元）。
+std::u16string package_publisher_id(std::u16string_view publisher){
+    std::vector<std::uint8_t> bytes;bytes.reserve(publisher.size()*2);for(const auto c:publisher){bytes.push_back(static_cast<std::uint8_t>(c));bytes.push_back(static_cast<std::uint8_t>(c>>8));}
+    CryptoHash hash("SHA256",false,{});hash.update(bytes);const auto digest=hash.digest();
+    std::uint64_t value=0;for(unsigned i=0;i<8;++i)value=(value<<8)|digest[i];
+    static constexpr char16_t alphabet[]=u"0123456789abcdefghjkmnpqrstvwxyz";std::u16string out;
+    for(int shift=59;shift>=4;shift-=5)out+=alphabet[(value>>shift)&31U];
+    out+=alphabet[(value&15U)<<1];return out;
 }
+}
+#include "windows_memory_modern.inc"
 std::span<const WindowsServiceDescriptor> kernel32_extra_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"kernel32.dll","Wow64DisableWow64FsRedirection",1},{"kernel32.dll","Wow64RevertWow64FsRedirection",1},{"kernel32.dll","Wow64EnableWow64FsRedirection",1},
@@ -35,13 +49,20 @@ std::span<const WindowsServiceDescriptor> kernel32_extra_service_descriptors(){
         {"kernel32.dll","CheckNameLegalDOS8Dot3A",5,0,0,0x4},{"kernel32.dll","CheckNameLegalDOS8Dot3W",5,0,0,0x4},
         {"kernel32.dll","GetPackageFamilyName",3},{"kernel32.dll","GetPackageFullName",3},{"kernel32.dll","GetPackagePathByFullName",3},
         {"kernel32.dll","GetPackagesByPackageFamily",5},{"kernel32.dll","LoadPackagedLibrary",2,0,0,0x2},
-        {"kernel32.dll","PackageIdFromFullName",4,0,0,0x2},
+        {"kernel32.dll","PackageIdFromFullName",4,0,0,0x2},{"kernel32.dll","PackageFullNameFromId",3},{"kernel32.dll","PackageFamilyNameFromId",3},
         {"kernel32.dll","InitializeSynchronizationBarrier",3,0,0,0x6},{"kernel32.dll","EnterSynchronizationBarrier",2,0,0,0x2},
         {"kernel32.dll","DeleteSynchronizationBarrier",1},
+        // Windows 10 以後的記憶體與輔助計數器（windows_memory_modern.inc）。
+        {"kernel32.dll","MapViewOfFile3",9,1U<<3,0,0x160},{"kernel32.dll","MapViewOfFile3FromApp",9,1U<<3,0,0x160},{"kernel32.dll","MapViewOfFileNuma2",8,1U<<2,0,0xe0},
+        {"kernel32.dll","CreateFileMapping2",9,1U<<5,0,0x11c},{"kernel32.dll","QueryVirtualMemoryInformation",6,0,0,0x4},
+        {"kernel32.dll","QueryAuxiliaryCounterFrequency",1},{"kernel32.dll","ConvertAuxiliaryCounterToPerformanceCounter",3,1},{"kernel32.dll","ConvertPerformanceCounterToAuxiliaryCounter",3,1},
+        {"ntdll.dll","NtQueryAuxiliaryCounterFrequency",1},{"ntdll.dll","ZwQueryAuxiliaryCounterFrequency",1},
+        {"ntdll.dll","NtConvertBetweenAuxiliaryCounterAndPerformanceCounter",4,0,0,0x1},{"ntdll.dll","ZwConvertBetweenAuxiliaryCounterAndPerformanceCounter",4,0,0,0x1},
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_kernel32_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const auto name=service.symbol;
+    if(memory_modern_service(name))return invoke_memory_modern(state,memory,service);
     if(name=="EnterSynchronizationBarrier"){
         // 最後一個抵達的執行緒回 TRUE 並放行本輪所有等待者；其他執行緒等待本輪事件後回 FALSE。
         // 每輪使用各自的手動重設事件，下一輪抵達的執行緒不會被上一輪的訊號放行。
@@ -142,6 +163,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_kernel32_extra(GuestState& 
                 put(16+field*unit,unit,arg(3)+at);const auto data=utf16_bytes(value);std::copy(data.begin(),data.end(),bytes.begin()+static_cast<std::ptrdiff_t>(at));at+=data.size();};
             text(parsed->name,0);text(parsed->resource,2);text(parsed->publisher_id,3);
             memory.write(GuestAddress{arg(3)},bytes);return done(0);
+        }
+        if(name=="PackageFullNameFromId" || name=="PackageFamilyNameFromId"){
+            // (packageId, Length*, Buffer)：全名為 Name_Version_Architecture_ResourceId_PublisherId，家族名稱為 Name_PublisherId；
+            // 長度以字元計且包含結尾 NUL，緩衝區不足回 ERROR_INSUFFICIENT_BUFFER 與所需長度。名稱與發行者必填，發行者 ID 由發行者計算。
+            if(!arg(0) || !arg(1))return done(error_invalid_parameter);
+            const auto architecture=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+4},32));const auto version=memory.load(GuestAddress{arg(0)+8},64);
+            const auto text=[&](unsigned field){const auto pointer=memory.load(GuestAddress{arg(0)+16+field*unit},static_cast<std::uint8_t>(unit*8));return pointer?read_utf16(memory,GuestAddress{pointer},1024):std::u16string{};};
+            const auto package=text(0),publisher=text(1),resource=text(2);
+            if(package.empty() || package.size()>50 || publisher.empty() || package.find(u'_')!=package.npos || resource.find(u'_')!=resource.npos)return done(error_invalid_parameter);
+            constexpr std::pair<std::uint32_t,std::u16string_view> architectures[]{{0,u"x86"},{5,u"arm"},{9,u"x64"},{11,u"neutral"},{12,u"arm64"}};
+            const auto found=std::find_if(std::begin(architectures),std::end(architectures),[&](const auto& item){return item.first==architecture;});
+            if(name=="PackageFullNameFromId" && found==std::end(architectures))return done(error_invalid_parameter);
+            std::u16string result=package;
+            if(name=="PackageFullNameFromId"){
+                result+=u'_';for(int shift=48;shift>=0;shift-=16){result+=utf8_to_utf16(std::to_string((version>>shift)&0xffffU));if(shift)result+=u'.';}
+                result+=u'_';result+=found->second;result+=u'_';result+=resource;
+            }
+            result+=u'_';result+=package_publisher_id(publisher);
+            const auto needed=static_cast<std::uint32_t>(result.size()+1);const auto capacity=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(1)},32));
+            memory.store(GuestAddress{arg(1)},32,needed);if(capacity<needed || !arg(2))return done(error_insufficient_buffer);
+            memory.write(GuestAddress{arg(2)},utf16_bytes(result));return done(0);
         }
         if(name=="InitializeSynchronizationBarrier"){
             // (Barrier*, TotalThreads, SpinCount)：SpinCount 為 -1 時使用預設值；屏障狀態以客體結構位址為鍵。

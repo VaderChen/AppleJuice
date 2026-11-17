@@ -1,5 +1,5 @@
         // D3DX9 網格以共用 D3D9 buffer 保存資料，鎖定後的改動直接供 CPU 前處理使用。
-        bool mesh_handled=symbol.starts_with("RenderToSurface.") || symbol.starts_with("RenderToEnvMap.") || symbol.starts_with("Effect.") || symbol.starts_with("EffectPool.") || symbol.starts_with("Sprite.") || symbol.starts_with("Font.") || symbol.starts_with("Mesh.") || symbol.starts_with("Blob.") || symbol.starts_with("MatrixStack.") || symbol.starts_with("PRT.") || symbol.starts_with("PRTComp.") || symbol.starts_with("PRTEngine.") || symbol.starts_with("D3DX");
+        bool mesh_handled=symbol.starts_with("RenderToSurface.") || symbol.starts_with("RenderToEnvMap.") || symbol.starts_with("Effect.") || symbol.starts_with("EffectPool.") || symbol.starts_with("EffectCompiler.") || symbol.starts_with("Sprite.") || symbol.starts_with("Line.") || symbol.starts_with("Font.") || symbol.starts_with("Mesh.") || symbol.starts_with("Blob.") || symbol.starts_with("MatrixStack.") || symbol.starts_with("PRT.") || symbol.starts_with("PRTComp.") || symbol.starts_with("PRTEngine.") || symbol.starts_with("D3DX");
         const auto declaration=[&](std::uint64_t address){
             std::vector<std::uint8_t> data;require(address!=0);
             for(unsigned i=0;i<65;++i){auto e=read(address+i*8,8);data.insert(data.end(),e.begin(),e.end());if(e[0]==255 && e[1]==0 && e[4]==17)return data;require(i<64 && e[0]==0 && e[1]==0 && e[4]<17 && e[5]==0);}
@@ -126,7 +126,7 @@
 #include "d3dx9_prt_comp_handlers.inc"
 #include "d3dx9_prt_engine_handlers.inc"
         if(concatenate_handled || render_env_handled || hierarchy_handled || animation_set_handled || animation_controller_handled || frame_handled || skin_handled || gutter_handled || save_mesh_handled || atlas_handled || file_handled || render_surface_handled || effect_handled || sprite_handled || shader_handled || prt_handled || texture_handled || clean_handled || tessellation_handled || text_mesh_handled || strips_handled){}
-        else if(symbol.starts_with("D3DXLoadMeshFromX")){
+        else if(symbol.starts_with("D3DXLoadMeshFromX") && !symbol.ends_with("Xof")){
             // InMemory 多一個長度參數；Resource 版本為 (Module, Name, Type, ...)，多兩個參數。
             const bool from_memory=symbol.ends_with("InMemory"),from_resource=symbol.ends_with("Resource");const unsigned shift=from_resource?2:from_memory?1:0;output(7+shift);for(unsigned i=3+shift;i<6+shift;++i)if(arg(i))output(i);if(arg(6+shift))memory.store(GuestAddress{arg(6+shift)},32,0);
             std::vector<std::uint8_t> bytes;if(from_resource)bytes=d3dx_resource_bytes(arg(0),arg(1),arg(2),false);else if(from_memory){require(arg(1)<=512U*1024U*1024U);bytes=read(arg(0),arg(1));}
@@ -139,6 +139,24 @@
                 if(adj_buffer)store_pointer(arg(3+shift),adj_buffer->root);if(materials)store_pointer(arg(4+shift),materials->root);if(effects)store_pointer(arg(5+shift),effects->root);
                 if(arg(6+shift))memory.store(GuestAddress{arg(6+shift)},32,source.materials.size());store_pointer(arg(7+shift),mesh->root);
             }catch(...){if(adj_buffer)release(adj_buffer->root);if(materials)release(materials->root);if(effects)release(effects->root);release(mesh->root);throw;}
+        }else if(symbol=="D3DXLoadMeshFromXof" || symbol=="D3DXLoadSkinMeshFromXof"){
+            // (FileData, Options, Device, Adjacency, Materials, EffectInstances, NumMaterials[, SkinInfo], Mesh)：Mesh 資料節點依模板還原成 token 串流，
+            // 網格、鄰接、材質、效果實例與蒙皮沿用 D3DXLoadMeshFromX／D3DXLoadMeshHierarchyFromX 的同一流程。沒有 SkinWeights 時蒙皮資訊為 0 根骨骼。
+            const bool skinned=symbol=="D3DXLoadSkinMeshFromXof";const unsigned mesh_at=skinned?8:7;
+            output(mesh_at);if(skinned)output(7);for(unsigned i=3;i<6;++i)if(arg(i))output(i);if(arg(6))memory.store(GuestAddress{arg(6)},32,0);
+            auto data=get(arg(0),Kind::XData);require(data->x_document!=nullptr);const auto& document=*data->x_document;require(data->x_index<document.nodes.size());
+            const auto& node=document.nodes[data->x_index];const auto& payload=node.target!=UINT32_MAX?document.nodes.at(node.target):node;require(payload.type=="Mesh");
+            std::vector<d3d9_xfile::Token> tokens;d3d9_xfile::node_tokens(document,data->x_index,tokens);
+            auto source=d3d9_xfile::Parser(std::move(tokens)).parse();auto mesh=make_loaded_mesh(source,u(1),arg(2));std::shared_ptr<Object> adj_buffer,materials,effects,skin;
+            try{
+                if(arg(3)){const auto adj=adjacency(*mesh,1e-6F);adj_buffer=blob(std::span(reinterpret_cast<const std::uint8_t*>(adj.data()),adj.size()*4));}
+                if(arg(4))materials=material_buffer(source.materials);
+                if(arg(5))effects=effect_buffer(source.materials);
+                if(skinned){skin=make_skin(mesh->width,mesh->presentation,static_cast<unsigned>(source.bones.size()));
+                    for(unsigned b=0;b<source.bones.size();++b){auto& bone=skin->skin->bones[b];const auto& from=source.bones[b];bone.name=from.name;bone.vertices=from.vertices;bone.weights=from.weights;bone.offset=from.offset;}}
+                if(adj_buffer)store_pointer(arg(3),adj_buffer->root);if(materials)store_pointer(arg(4),materials->root);if(effects)store_pointer(arg(5),effects->root);
+                if(arg(6))memory.store(GuestAddress{arg(6)},32,source.materials.size());if(skin)store_pointer(arg(7),skin->root);store_pointer(arg(mesh_at),mesh->root);
+            }catch(...){if(adj_buffer)release(adj_buffer->root);if(materials)release(materials->root);if(effects)release(effects->root);if(skin)release(skin->root);release(mesh->root);throw;}
         }else if(symbol=="D3DXCreateBuffer"){
             output(1);require(u(0)!=0);store_pointer(arg(1),blob(std::vector<std::uint8_t>(u(0)))->root);
         }else if(symbol=="D3DXGetDeclVertexSize"){

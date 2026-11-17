@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/unicode.hpp"
+#include "lz_compression.hpp"
 #include <algorithm>
 #include <array>
 #include <string_view>
@@ -22,29 +23,6 @@ std::span<const WindowsServiceDescriptor> legacy_device_service_descriptors(){
 namespace {
 constexpr std::uint32_t lz_bias=400,lz_states=16;
 constexpr std::int32_t lz_bad_input=-1,lz_read_error=-3,lz_write_error=-4,lz_no_memory=-5,lz_bad_value=-7;
-constexpr std::array<std::uint8_t,8> szdd_magic{'S','Z','D','D',0x88,0xf0,0x27,0x33};
-// SZDD：4096 位元組視窗以空白初始化、起點 4080；旗標位元由低到高，1 為字面值，0 為 12 位元位移＋4 位元長度（加 3）。
-std::optional<std::vector<std::uint8_t>> lz_expand(std::span<const std::uint8_t> input,std::uint32_t size){
-    std::vector<std::uint8_t> output;output.reserve(size);std::array<std::uint8_t,4096> window;window.fill(' ');unsigned at=4096-16;std::size_t in=0;
-    while(output.size()<size && in<input.size()){
-        const auto flags=input[in++];
-        for(unsigned bit=0;bit<8 && output.size()<size && in<input.size();++bit){
-            if(flags&(1U<<bit)){const auto value=input[in++];output.push_back(value);window[at]=value;at=(at+1)&4095U;continue;}
-            if(in+1>=input.size())return {};
-            const unsigned low=input[in],high=input[in+1];in+=2;
-            unsigned offset=low|((high&0xf0U)<<4);const unsigned length=(high&0x0fU)+3;
-            for(unsigned k=0;k<length && output.size()<size;++k){const auto value=window[offset];offset=(offset+1)&4095U;output.push_back(value);window[at]=value;at=(at+1)&4095U;}
-        }
-    }
-    if(output.size()!=size)return {};
-    return output;
-}
-// 壓縮檔名的最後一個字元由檔頭補回：底線換成檔頭字元，大小寫跟隨原本的檔名。
-std::string lz_expanded_name(std::string name,char last){
-    if(!last || name.empty() || name.back()!='_')return name;
-    bool upper=false;for(auto it=name.rbegin()+1;it!=name.rend() && *it!='.' && *it!='\\' && *it!='/';++it)if(*it>='A' && *it<='Z'){upper=true;break;}else if(*it>='a' && *it<='z')break;
-    name.back()=upper?static_cast<char>(last>='a' && last<='z'?last-32:last):static_cast<char>(last>='A' && last<='Z'?last+32:last);return name;
-}
 }
 std::optional<std::uint32_t> WindowsServices::invoke_legacy_device(GuestState& entry_state,GuestMemory& entry_memory,const WindowsServiceDescriptor& service){
     if(service.symbol=="GetThreadIOPendingFlag"){
