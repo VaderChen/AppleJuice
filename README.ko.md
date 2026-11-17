@@ -141,32 +141,32 @@ AppleJuice가 화면 표시 및 오디오 출력 단계에서 기본 제공하�
 | 프로그램 | x64/x86 | 주요 동작 코어 | 지원 수준 |
 | --- | --- | --- | :---: |
 | 7-Zip | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
-| WinRAR | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
-| Geekbench 7 | x64 | CPU | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
-| Memelis' RPG | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 드래곤 퀘스트 III HD-2D Remake | x64 | D3D11(Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
-| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 不谙世事的猫艾露莎 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
-| 永恒的黄昏 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
-| 파이널 판타지 VIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
-| 파이널 판타지 IX | x64 | D3D9(Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
+| 艾莉露在异世界的冒险之不死之冠 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 역전재판 123 나루호도 셀렉션 | x86 | D3D11(Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
+| 永恒的黄昏 | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
+| 옥토패스 트래블러 II | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 천수의 사쿠나히메 | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 툼 레이더 (2013) | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
-| 옥토패스 트래블러 II | x64 | D3D11 (Unreal Engine 4) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
-| 클레르 옵스퀴르: 33 원정대 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="원활 (MetalFX)" title="원활 (MetalFX)"> |
+| 파이널 판타지 IX | x64 | D3D9(Unity) | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
+| 파이널 판타지 VIII | x86 | D3D9 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
+| Geekbench 7 | x64 | CPU | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
+| Memelis' RPG | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
+| WinRAR | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="원활" title="원활"> |
 | 라이즈 오브 더 툼 레이더 | x64 | D3D11 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="원활 (MetalFX)" title="원활 (MetalFX)"> |
 | 섀도 오브 더 툼 레이더 | x64 | D3D12 | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="원활 (MetalFX)" title="원활 (MetalFX)"> |
-| It Takes Two | x64 | D3D11(Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
-| Romance of the Three Kingdoms X with Power Up Kit | x86 | 알 수 없음 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
-| Steam | x64 | Chromium(CEF) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
+| 클레르 옵스퀴르: 33 원정대 | x64 | D3D11 (Unreal Engine 5) | <img src="docs/images/support-levels/metalfx.png" width="20" height="20" alt="원활 (MetalFX)" title="원활 (MetalFX)"> |
 | 3DMark | x64 | D3D11 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 사이버펑크 2077 | x64 | D3D12 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 小涵的暑假 | x64 | RPG Maker MV | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 勇者的粉色育女日记 | x64 | RPG Maker MZ | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
-| Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="실행 가능" title="실행 가능"> |
+| It Takes Two | x64 | D3D11(Unreal Engine 4) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
+| Romance of the Three Kingdoms X with Power Up Kit | x86 | 알 수 없음 | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
+| Steam | x64 | Chromium(CEF) | <img src="docs/images/support-levels/slow.png" width="20" height="20" alt="저효율" title="저효율"> |
 | 데이브 더 다이버 | x64 | D3D11(Unity) | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="실행 가능" title="실행 가능"> |
 | DEATH STRANDING DIRECTOR'S CUT | x64 | D3D12 | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="실행 가능" title="실행 가능"> |
+| Signal Force | x86 | RPG Maker MV | <img src="docs/images/support-levels/menu.png" width="20" height="20" alt="실행 가능" title="실행 가능"> |
 | 바이오하자드 빌리지 | x64 | D3D12 (RE Engine) | <img src="docs/images/support-levels/none.png" width="20" height="20" alt="미작동·작업 중" title="미작동·작업 중"> |
 
 "원활 (MetalFX)"는 Launcher의 프레임 보간 또는 2배 확대(MetalFX)를 켜면 원활 기준을 충족한다는 뜻이며, 끄면 저효율에 해당합니다.
