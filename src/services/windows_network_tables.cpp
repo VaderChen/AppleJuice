@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/unicode.hpp"
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -35,8 +36,11 @@ std::uint32_t link_local_scope(std::array<std::uint8_t,16>& address,const in_soc
 }
 std::uint32_t WindowsServices::tcp_table_call(GuestMemory& memory,const WindowsCall& arg,std::string_view symbol){
     try {
-        require(arg(1));const bool extended=symbol=="GetExtendedTcpTable";const auto family=extended?static_cast<std::uint32_t>(arg(3)):2U,kind=extended?static_cast<std::uint32_t>(arg(4)):2U;
-        require(family==2 || family==23);require(kind<=8 && (!extended || !static_cast<std::uint32_t>(arg(5))));if(kind>=6 || (family==23 && kind<3))return 50;
+        // GetTcpTable（MIB_TCPROW）、GetTcpTable2（MIB_TCPROW2）、GetTcp6Table（MIB_TCP6ROW，State 在前）、GetTcp6Table2（MIB_TCP6ROW2）與
+        // GetExtendedTcpTable 的 BASIC／OWNER_PID／OWNER_MODULE 類別；OWNER_MODULE 表頭對齊 8，建立時間與模組資訊欄位為 0（GetOwnerModuleFromTcp*Entry 依 PID 查詢）。
+        require(arg(1));const bool extended=symbol=="GetExtendedTcpTable",version2=symbol=="GetTcpTable2" || symbol=="GetTcp6Table2",ipv6_named=symbol.starts_with("GetTcp6");
+        const auto family=extended?static_cast<std::uint32_t>(arg(3)):ipv6_named?23U:2U,kind=extended?static_cast<std::uint32_t>(arg(4)):version2?5U:2U;
+        require(family==2 || family==23);require(kind<=8 && (!extended || !static_cast<std::uint32_t>(arg(5))));if(extended && family==23 && kind<3)return 50;
         const auto capacity=memory.load(GuestAddress{arg(1)},32);memory.check(GuestAddress{arg(1)},4,Access::Write);if(!runtime_.network.external_io)throw HostCallFault("compare 不允許原生 TCP 表查詢");std::vector<std::uint32_t> pids;const auto status=session_process_ids(pids);require(!status,status);std::vector<Row> rows;
 #if defined(__APPLE__)
         constexpr std::array<std::uint32_t,11> states{1,2,3,4,5,8,6,9,10,7,11};
@@ -54,8 +58,42 @@ std::uint32_t WindowsServices::tcp_table_call(GuestMemory& memory,const WindowsC
         if(static_cast<std::uint32_t>(arg(2)))std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){return std::tuple{a.local,a.local_scope,static_cast<unsigned>(ntohs(a.local_port)),a.remote,a.remote_scope,static_cast<unsigned>(ntohs(a.remote_port))}<std::tuple{b.local,b.local_scope,static_cast<unsigned>(ntohs(b.local_port)),b.remote,b.remote_scope,static_cast<unsigned>(ntohs(b.remote_port))};});
         // 相同 descriptor 被 dup 時只列一個 TCP endpoint。
         std::vector<Row> unique;for(const auto& row:rows)if(std::none_of(unique.begin(),unique.end(),[&](const auto& old){return old.pid==row.pid && old.local==row.local && old.remote==row.remote && old.local_port==row.local_port && old.remote_port==row.remote_port && old.local_scope==row.local_scope && old.remote_scope==row.remote_scope;}))unique.push_back(row);
-        const unsigned stride=family==23?56:kind<3?20:24;std::vector<std::uint8_t> bytes(4+unique.size()*stride);put(bytes,0,unique.size());for(std::size_t i=0;i<unique.size();++i){const auto at=4+i*stride;const auto& row=unique[i];if(family==23){std::copy(row.local.begin(),row.local.end(),bytes.begin()+static_cast<std::ptrdiff_t>(at));put(bytes,at+16,row.local_scope);put(bytes,at+20,row.local_port);std::copy(row.remote.begin(),row.remote.end(),bytes.begin()+static_cast<std::ptrdiff_t>(at+24));put(bytes,at+40,row.remote_scope);put(bytes,at+44,row.remote_port);put(bytes,at+48,row.state);put(bytes,at+52,row.pid);}else{put(bytes,at,row.state);std::copy_n(row.local.begin(),4,bytes.begin()+static_cast<std::ptrdiff_t>(at+4));put(bytes,at+8,row.local_port);std::copy_n(row.remote.begin(),4,bytes.begin()+static_cast<std::ptrdiff_t>(at+12));put(bytes,at+16,row.remote_port);if(kind>=3)put(bytes,at+20,row.pid);}}
+        const bool module=kind>=6,v6_row=symbol=="GetTcp6Table";const unsigned header=module?8:4;
+        const unsigned stride=family==23?(v6_row?52U:module?192U:version2?60U:56U):(module?160U:version2?28U:kind<3?20U:24U);
+        std::vector<std::uint8_t> bytes(header+unique.size()*stride);put(bytes,0,unique.size());
+        for(std::size_t i=0;i<unique.size();++i){
+            const auto at=header+i*stride;const auto& row=unique[i];
+            const auto copy=[&](const std::array<std::uint8_t,16>& address,std::size_t offset,unsigned count){std::copy_n(address.begin(),count,bytes.begin()+static_cast<std::ptrdiff_t>(at+offset));};
+            if(v6_row){put(bytes,at,row.state);copy(row.local,4,16);put(bytes,at+20,row.local_scope);put(bytes,at+24,row.local_port);copy(row.remote,28,16);put(bytes,at+44,row.remote_scope);put(bytes,at+48,row.remote_port);}
+            else if(family==23){copy(row.local,0,16);put(bytes,at+16,row.local_scope);put(bytes,at+20,row.local_port);copy(row.remote,24,16);put(bytes,at+40,row.remote_scope);put(bytes,at+44,row.remote_port);put(bytes,at+48,row.state);put(bytes,at+52,row.pid);}
+            else{put(bytes,at,row.state);copy(row.local,4,4);put(bytes,at+8,row.local_port);copy(row.remote,12,4);put(bytes,at+16,row.remote_port);if(kind>=3)put(bytes,at+20,row.pid);}
+            // Table2 的 dwOffloadState 為 TcpConnectionOffloadStateInHost（0），已由清零的列提供。
+        }
         memory.store(GuestAddress{arg(1)},32,bytes.size());require(arg(0) && capacity>=bytes.size(),122);memory.write(GuestAddress{arg(0)},bytes);return 0;
+    }catch(const Error& error){return error.code;}catch(const MemoryFault&){return 87;}catch(const std::bad_alloc&){return 8;}
+}
+// GetOwnerModuleFrom{Tcp,Tcp6,Udp,Udp6}Entry（列, Class, pBuffer, pdwSize）與 GetOwnerModuleFromPidAndInfo（pid, pInfo, Class, pBuffer, pdwSize）：
+// 只有 TCPIP_OWNER_MODULE_INFO_BASIC（0）；輸出 {pModuleName, pModulePath} 後接兩個 UTF-16 字串。PID 取自列的 dwOwningPid
+// （MIB_TCPROW_OWNER_MODULE 位移 20、MIB_TCP6ROW_OWNER_MODULE 52、MIB_UDPROW_OWNER_MODULE 8、MIB_UDP6ROW_OWNER_MODULE 24）。
+std::uint32_t WindowsServices::owner_module_call(GuestMemory& memory,const WindowsCall& arg,std::string_view symbol){
+    try {
+        const bool by_pid=symbol=="GetOwnerModuleFromPidAndInfo";const unsigned first=by_pid?2:1;
+        const auto kind=static_cast<std::uint32_t>(arg(first));const auto buffer=arg(first+1),size_at=arg(first+2);
+        require(kind==0 && size_at && (by_pid?arg(1)!=0:arg(0)!=0));
+        std::uint32_t pid=0;
+        if(by_pid)pid=static_cast<std::uint32_t>(arg(0));
+        else {const unsigned offset=symbol=="GetOwnerModuleFromTcpEntry"?20U:symbol=="GetOwnerModuleFromTcp6Entry"?52U:symbol=="GetOwnerModuleFromUdpEntry"?8U:24U;
+            pid=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+offset},32));}
+        const auto capacity=memory.load(GuestAddress{size_at},32);memory.check(GuestAddress{size_at},4,Access::Write);
+        require(pid!=0,1168);std::u16string path;if(const auto error=process_image_path(memory,pid,path))return error==1168?1168U:error;
+        auto name=path;if(const auto slash=name.find_last_of(u"\\/");slash!=name.npos)name.erase(0,slash+1);
+        const unsigned unit=x86_?4:8;const auto name_bytes=utf16_bytes(name),path_bytes=utf16_bytes(path);
+        const auto total=2*unit+name_bytes.size()+path_bytes.size();require(total<=UINT32_MAX,8);
+        memory.store(GuestAddress{size_at},32,total);require(buffer && capacity>=total,122);
+        std::vector<std::uint8_t> bytes(total);const auto name_at=buffer+2*unit,path_at=name_at+name_bytes.size();
+        put(bytes,0,name_at,unit);put(bytes,unit,path_at,unit);
+        std::copy(name_bytes.begin(),name_bytes.end(),bytes.begin()+2*unit);std::copy(path_bytes.begin(),path_bytes.end(),bytes.begin()+static_cast<std::ptrdiff_t>(2*unit+name_bytes.size()));
+        memory.write(GuestAddress{buffer},bytes);return 0;
     }catch(const Error& error){return error.code;}catch(const MemoryFault&){return 87;}catch(const std::bad_alloc&){return 8;}
 }
 // GetExtendedUdpTable／GetUdpTable／GetUdp6Table：與 TCP 表同一列舉範圍；UDP 沒有連線狀態，只列本機端點。

@@ -191,6 +191,14 @@ std::span<const WindowsServiceDescriptor> crt_runtime_extra_service_descriptors(
 std::span<const WindowsServiceDescriptor> shlwapi_string_service_descriptors();
 std::span<const WindowsServiceDescriptor> shlwapi_misc_service_descriptors();
 std::span<const WindowsServiceDescriptor> shell_path_service_descriptors();
+std::span<const WindowsServiceDescriptor> shell_utility_service_descriptors();
+std::span<const WindowsServiceDescriptor> url_download_service_descriptors();
+std::span<const WindowsServiceDescriptor> ole_wrapper_service_descriptors();
+std::span<const WindowsServiceDescriptor> file_link_service_descriptors();
+std::span<const WindowsServiceDescriptor> power_scheme_service_descriptors();
+std::span<const WindowsServiceDescriptor> ole_picture_service_descriptors();
+// 由 windows_power.cpp 轉到 invoke_power_schemes 的既有方案查詢入口（描述元仍在 environment 表）。
+bool power_scheme_query_symbol(std::string_view symbol);
 std::span<const WindowsServiceDescriptor> shell_icon_service_descriptors();
 std::span<const WindowsServiceDescriptor> ole_misc_service_descriptors();
 std::span<const WindowsServiceDescriptor> ntdll_table_service_descriptors();

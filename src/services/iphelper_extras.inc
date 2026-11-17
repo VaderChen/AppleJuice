@@ -43,7 +43,17 @@ std::span<const WindowsServiceDescriptor> iphelper_extra_service_descriptors(){
         {"iphlpapi.dll","AllocateAndGetTcpTableFromStack",4,0,0,0xa},{"iphlpapi.dll","AllocateAndGetUdpTableFromStack",4,0,0,0xa},
         {"iphlpapi.dll","AllocateAndGetTcpExTableFromStack",5,0,0,0x1a},
         {"iphlpapi.dll","GetIpStatistics",1},{"iphlpapi.dll","GetIpStatisticsEx",2,0,0,0x2},{"iphlpapi.dll","GetIcmpStatistics",1},{"iphlpapi.dll","GetIcmpStatisticsEx",2,0,0,0x2},
-        {"iphlpapi.dll","GetTcpStatistics",1},{"iphlpapi.dll","GetTcpStatisticsEx",2,0,0,0x2},{"iphlpapi.dll","GetUdpStatistics",1},{"iphlpapi.dll","GetUdpStatisticsEx",2,0,0,0x2}};
+        {"iphlpapi.dll","GetTcpStatistics",1},{"iphlpapi.dll","GetTcpStatisticsEx",2,0,0,0x2},{"iphlpapi.dll","GetUdpStatistics",1},{"iphlpapi.dll","GetUdpStatisticsEx",2,0,0,0x2},
+        // iphelper_tables2.inc
+        {"iphlpapi.dll","GetIfEntry2Ex",2,0,0,0x1},{"iphlpapi.dll","GetIpInterfaceEntry",1},{"iphlpapi.dll","GetIpInterfaceTable",2,0,0,0x1},
+        {"iphlpapi.dll","GetIpForwardTable2",2,0,0,0x1},{"iphlpapi.dll","GetIpNetTable2",2,0,0,0x1},
+        {"iphlpapi.dll","GetTcpTable2",3,0,0,0x4},{"iphlpapi.dll","GetTcp6Table",3,0,0,0x4},{"iphlpapi.dll","GetTcp6Table2",3,0,0,0x4},
+        {"iphlpapi.dll","GetOwnerModuleFromTcpEntry",4,0,0,0x2},{"iphlpapi.dll","GetOwnerModuleFromTcp6Entry",4,0,0,0x2},
+        {"iphlpapi.dll","GetOwnerModuleFromUdpEntry",4,0,0,0x2},{"iphlpapi.dll","GetOwnerModuleFromUdp6Entry",4,0,0,0x2},
+        {"iphlpapi.dll","GetOwnerModuleFromPidAndInfo",5,0,0,0x5},{"iphlpapi.dll","CreateSortedAddressPairs",7,0,0,0x1a},
+        {"iphlpapi.dll","NotifyIpInterfaceChange",5,0,0,0x9},{"iphlpapi.dll","NotifyRouteChange2",5,0,0,0x9},{"iphlpapi.dll","NotifyUnicastIpAddressChange",5,0,0,0x9},
+        {"iphlpapi.dll","CancelMibChangeNotify2",1},{"iphlpapi.dll","NotifyStableUnicastIpAddressTable",5,0,0,0x1},
+        {"iphlpapi.dll","GetRTTAndHopCount",4,0,0,0x5}};
     return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_iphelper_extras(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -53,6 +63,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_iphelper_extras(GuestState&
     const unsigned unit=x86_?4:8;
     const auto config=[&]()->NetworkConfiguration*{auto& c=*runtime_.network.configuration;return refresh_configuration(c,runtime_.network.external_io,false,false)?&c:nullptr;};
     try{
+#include "iphelper_tables2.inc"
         if(name=="GetFriendlyIfIndex")return finish(d(0)&0x00ffffffU);
         if(name=="ConvertGuidToStringA" || name=="ConvertGuidToStringW"){
             if(!arg(0) || !arg(1))return finish(87);std::array<std::uint8_t,16> guid{};memory.read(GuestAddress{arg(0)},guid);

@@ -750,14 +750,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,Gues
         }
     } else if(symbol=="FindNextStreamW") {
         const auto found=runtime_.directory_searches.find(arg(0));
-        if(found==runtime_.directory_searches.end() || !found->second.streams)fail(6);
+        if(found==runtime_.directory_searches.end() || !found->second.streams || found->second.names)fail(6);
         else if(!arg(1))fail(87);
         else if(found->second.cursor==found->second.entries.size())fail(38);
         else {auto& search=found->second;stream_data(memory,arg(1),search.entries[search.cursor]);++search.cursor;result=1;}
     } else if(symbol=="FindClose") {if(runtime_.directory_searches.erase(arg(0)))result=1;else fail(6);}
     else if(symbol.starts_with("FindNextFile")) {
         const auto found=runtime_.directory_searches.find(arg(0));
-        if(found==runtime_.directory_searches.end() || found->second.streams)fail(6);
+        if(found==runtime_.directory_searches.end() || found->second.streams || found->second.names)fail(6);
         else if(found->second.cursor==found->second.entries.size())fail(18);
         else {auto& search=found->second;find_data(memory,arg(1),search.entries[search.cursor],symbol.back()=='W');++search.cursor;result=1;}
     } else if(symbol.starts_with("FindFirstFile")) {

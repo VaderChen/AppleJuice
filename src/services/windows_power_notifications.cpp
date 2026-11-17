@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "x64arm/windows_power_notifications.hpp"
 #include <algorithm>
 
 namespace x64arm {
@@ -7,7 +8,8 @@ std::span<const WindowsServiceDescriptor> power_notification_service_descriptors
         {"user32.dll","RegisterSuspendResumeNotification",2},{"user32.dll","UnregisterSuspendResumeNotification",1},
         {"powrprof.dll","PowerRegisterSuspendResumeNotification",3},{"powrprof.dll","PowerUnregisterSuspendResumeNotification",1},
         {"user32.dll","RegisterPowerSettingNotification",3},{"user32.dll","UnregisterPowerSettingNotification",1},
-        {"powrprof.dll","PowerSettingRegisterNotification",4},{"powrprof.dll","PowerSettingUnregisterNotification",1}
+        {"powrprof.dll","PowerSettingRegisterNotification",4},{"powrprof.dll","PowerSettingUnregisterNotification",1},
+        {"powrprof.dll","PowerRegisterForEffectivePowerModeNotifications",4,0,0,0x1},{"powrprof.dll","PowerUnregisterFromEffectivePowerModeNotifications",1}
     };return table;
 }
 void WindowsServices::set_power_notification_backend(std::shared_ptr<NativePowerNotifications> backend){
@@ -44,17 +46,21 @@ void WindowsServices::poll_power_notification_events(GuestMemory& memory){
             }
             gui_.sent_messages.emplace(gui_.next_object++,std::move(request));
         }else{
+            // EFFECTIVE_POWER_MODE：macOS 低耗電模式為 EffectivePowerModeBatterySaver（0），否則 EffectivePowerModeBalanced（2）。
+            const std::uint32_t mode=event.data.size()>=4 && event.data[0]==1?0U:2U;
+            if(registration.effective && registration.mode==mode){registration.pending.erase(registration.pending.begin());continue;}
             if(registered_waits_.size()>=64)continue;
             const auto worker=acquire_wait_worker(threads_.items.at(threads_.current).context,memory,std::max(UINT64_C(65536),runtime_.image.stack_size));
             if(!worker)continue;
-            if(registration.settings){
+            if(registration.settings && !registration.effective){
                 if(event.data.size()>64)throw HostCallFault("電源設定通知資料超出支援結構大小");
                 memory.write(GuestAddress{registration.payload},event.setting);
                 memory.store(GuestAddress{registration.payload+16},32,event.data.size());
                 memory.write(GuestAddress{registration.payload+20},event.data);
             }
             RegisteredWait work;work.worker=worker;work.power_owner=owner;work.armed=false;work.ready=true;work.closing=true;
-            work.callback_batch={{registration.callback,{registration.context,event.type,registration.settings?registration.payload:0}}};
+            if(registration.effective){work.callback_batch={{registration.callback,{mode,registration.context}}};registration.mode=mode;}
+            else work.callback_batch={{registration.callback,{registration.context,event.type,registration.settings?registration.payload:0}}};
             const auto id=next_registered_wait_++;registered_waits_.emplace(id,std::move(work));wait_workers_[worker]=id;
             auto& thread=threads_.items.at(worker);thread.status=ThreadStatus::Runnable;thread.wait={};
         }
@@ -64,16 +70,18 @@ void WindowsServices::poll_power_notification_events(GuestMemory& memory){
 }
 std::optional<std::uint32_t> WindowsServices::invoke_power_notification_event(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
-    const bool user=service.family=="user32.dll",settings=name.find("Setting")!=name.npos;
+    const bool effective=name.find("EffectivePowerMode")!=name.npos;
+    const bool user=service.family=="user32.dll",settings=effective || name.find("Setting")!=name.npos;
     const bool unregister=name.starts_with("Unregister") || name.starts_with("PowerUnregister") || name=="PowerSettingUnregisterNotification";
     const auto finish=[&](std::uint64_t value,std::uint32_t error=0){
         if(user && error)last_error_=error;
-        arg.return_to(state,user?value:error);return std::optional<std::uint32_t>{};
+        // 有效電源模式介面回傳 HRESULT（HRESULT_FROM_WIN32）。
+        arg.return_to(state,user?value:effective?(error?0x80070000U|(error&0xffffU):0U):error);return std::optional<std::uint32_t>{};
     };
     if(unregister){
         const auto owner=arg(0);auto& caller=threads_.items.at(threads_.current);
         const auto found=power_notifications_.find(owner);
-        if(found==power_notifications_.end() || found->second.settings!=settings || found->second.user32!=user)return finish(0,6);
+        if(found==power_notifications_.end() || found->second.settings!=settings || found->second.user32!=user || found->second.effective!=effective)return finish(0,6);
         const bool self=std::any_of(registered_waits_.begin(),registered_waits_.end(),[&](const auto& entry){return entry.second.power_owner==owner && entry.second.active && entry.second.worker==threads_.current;}) ||
             std::any_of(gui_.sent_messages.begin(),gui_.sent_messages.end(),[&](const auto& entry){return entry.second.power_owner==owner && entry.second.active && entry.second.receiver==threads_.current;});
         if(self)return finish(0,1131); // 等待自己的回呼結束會造成死結。
@@ -93,6 +101,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_power_notification_event(Gu
     }
     std::uint64_t payload=0;
     try{
+        if(effective){
+            // (Version, Callback, Context, RegistrationHandle*)：EFFECTIVE_POWER_MODE_V1／V2；註冊後立即以目前模式在工作執行緒回呼一次，之後模式改變才回呼。
+            const auto version=static_cast<std::uint32_t>(arg(0));const auto callback=arg(1),output=arg(3);
+            if((version!=1 && version!=2) || !callback || !output)return finish(0,87);
+            memory.check(GuestAddress{output},x86_?4:8,Access::Write);memory.check(GuestAddress{callback},1,Access::Execute);
+            if(power_notifications_.size()>=4096)return finish(0,8);
+            if(!runtime_.network.external_io)return finish(0,50);
+            if(!power_notification_backend_)power_notification_backend_=native_power_notifications();
+            if(!power_notification_backend_)return finish(0,50);
+            if(power_notifications_.empty())(void)power_notification_backend_->poll();
+            else poll_power_notification_events(memory);
+            PowerNotification registration;registration.settings=true;registration.effective=true;registration.setting=power::power_saving;
+            registration.callback=callback;registration.context=arg(2);
+            registration.pending.push_back({0x8013,power::power_saving,power_notification_backend_->current_setting(power::power_saving).value_or(std::vector<std::uint8_t>{})});
+            const auto owner=runtime_.allocate_wait_handle();power_notifications_.emplace(owner,std::move(registration));
+            memory.store(GuestAddress{output},x86_?32:64,owner);return finish(0,0);
+        }
         const auto recipient=arg(user?0:(settings?2:1));
         const auto flags=static_cast<std::uint32_t>(arg(user?(settings?2:1):(settings?1:0)));
         const auto output=user?0:arg(settings?3:2);

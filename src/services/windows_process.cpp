@@ -15,6 +15,7 @@
 #include "crt_os_error.hpp"
 #include "monotonic_clock.hpp"
 #include "windows_native_process_parameters.hpp"
+#include "child_presentation_options.hpp"
 #include "service_callback_task.hpp"
 #include <algorithm>
 #include <array>
@@ -1208,6 +1209,81 @@ std::uint32_t WindowsServices::capture_process_snapshot(GuestMemory &memory,
     }
     entries = std::move(captured);
     return 0;
+}
+std::uint32_t WindowsServices::process_image_path(GuestMemory &memory, std::uint32_t pid, std::u16string &path) {
+    if (pid == process_id()) {
+        path = runtime_.image.path;
+        if (path.empty()) {
+            const auto argv = memory.load(GuestAddress{runtime_.wargv_cell}, x86_ ? 32 : 64);
+            const auto first = memory.load(GuestAddress{argv}, x86_ ? 32 : 64);
+            if (first)
+                path = read_utf16(memory, GuestAddress{first});
+            // 與 GetModuleFileName 相同：命令列名稱沒有磁碟代號時視為 C:\ 下。
+            if (!path.empty() && path.find(u':') == path.npos)
+                path = u"C:\\" + path;
+        }
+        return path.empty() ? 1168U : 0U;
+    }
+#if !defined(_WIN32)
+    // 與程序快照相同的遠端資訊請求；選項 6 回傳 \Device\HarddiskVolumeN\… 形式的 NT 路徑。
+    std::vector<std::uint32_t> ids;
+    if (const auto status = session_process_ids(ids))
+        return status;
+    if (!std::binary_search(ids.begin(), ids.end(), pid))
+        return 1168;
+    const auto record = ProcessRecord::open(mapping_session(), pid, false);
+    if (!record || !record->alive())
+        return 1168;
+    auto pattern = (std::filesystem::temp_directory_path() / "x64arm-image-XXXXXX").string();
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back(0);
+    const auto fd = ::mkstemp(name.data());
+    if (fd < 0)
+        return 8;
+    struct Close {
+        int fd;
+        ~Close() { ::close(fd); }
+    } cleanup{fd};
+    (void)::unlink(name.data());
+    (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (::fchmod(fd, 0600) || ::ftruncate(fd, 65534))
+        return 8;
+    std::array<std::uint64_t, 5> values{};
+    std::uint32_t bits{};
+    if (const auto error = remote_process_request(memory, pid, record->data->birth, 14, 6, values, bits, fd))
+        return record->alive() && remote_process_available(pid) ? error : 1168U;
+    if (values[0] < 2 || values[0] > 65534 || values[0] % 2)
+        return 13;
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(values[0]));
+    std::size_t done = 0;
+    while (done < bytes.size()) {
+        const auto count = ::pread(fd, bytes.data() + done, bytes.size() - done, static_cast<off_t>(done));
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+            return 13;
+        done += static_cast<std::size_t>(count);
+    }
+    std::u16string device;
+    for (std::size_t i = 0; i + 1 < bytes.size(); i += 2) {
+        const auto c = static_cast<char16_t>(bytes[i] | (static_cast<unsigned>(bytes[i + 1]) << 8));
+        if (!c)
+            break;
+        device += c;
+    }
+    // NT 裝置名稱換回磁碟代號：比對每個代號的 \Device\HarddiskVolumeN 前綴。
+    for (char16_t letter = u'A'; letter <= u'Z'; ++letter) {
+        const auto prefix = windows_device_name(letter);
+        if (device.size() > prefix.size() && device.compare(0, prefix.size(), prefix) == 0 && device[prefix.size()] == u'\\') {
+            path = std::u16string{letter, u':'} + device.substr(prefix.size());
+            return 0;
+        }
+    }
+    return 13;
+#else
+    (void)memory;
+    return 50;
+#endif
 }
 std::uint32_t WindowsServices::local_process_accounting(std::array<std::uint64_t, 5> &values) const {
     const auto cpu = runtime_.host_clock ? host_process_cpu_time()
@@ -2661,13 +2737,26 @@ bool WindowsServices::create_guest_process(GuestMemory &memory, const std::array
                     // 這三個值是父引擎自己的 UI 控制通道，並非 Windows 環境區塊。
                     // 其他宿主選項照常承襲，避免改變共用效能／圖形設定。
                     std::vector<char *> environment;
+                    const auto presentation=detail::child_presentation_options(host);
+                    std::array<std::string,4> presentation_environment;
+                    if(presentation)presentation_environment=presentation->environment();
                     for (auto item = environ; item && *item; ++item) {
                         const std::string_view value(*item);
                         if (value.starts_with("X64ARM_GUI_AUTOMATION=") ||
                             value.starts_with("X64ARM_GUI_AUTOMATION_FD=") || value.starts_with("X64ARM_GUI_STATE=") ||
                             value.starts_with("X64ARM_GUI_CHILD_AUTOMATION_DIR="))
                             continue;
+                        if(presentation && (value.starts_with("X64ARM_AUDIO_ENVIRONMENT=") ||
+                            value.starts_with("X64ARM_PRESENT_UPSCALE=") || value.starts_with("X64ARM_PRESENT_INTERPOLATION=") ||
+                            value.starts_with("X64ARM_PRESENTATION_PROFILE=")))continue;
                         environment.push_back(*item);
+                    }
+                    if(presentation){
+                        for(auto& value:presentation_environment)environment.push_back(value.data());
+                        if(std::getenv("X64ARM_TRACE_PROCESS_PROTOCOL"))
+                            std::fprintf(stderr,"child_presentation_options spatial=%u upscale=%u interpolation=%u profile=%s\n",
+                                static_cast<unsigned>(presentation->spatial),presentation->upscale,
+                                static_cast<unsigned>(presentation->interpolation),presentation->profile.c_str());
                     }
                     // 測試可為每個子程序明確提供獨立腳本；不重播父程序的控制通道。
                     std::vector<std::string> automation_environment;

@@ -73,6 +73,7 @@ std::optional<std::uint32_t> WindowsServices::resume_registered_wait(GuestState&
     for(const auto pointer:wait.callback_storage)free_heap(memory,pointer,state);
     wait.callback_storage.clear();
     if(wait.device_owner)finish_device_notification(state,memory,wait.device_owner);
+    if(wait.mib_owner)finish_mib_notification(state,memory,wait.mib_owner);
     if(wait.closing)release_registered_wait(handle);
     else {
         wait.armed=!(wait.flags&8U);

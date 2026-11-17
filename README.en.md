@@ -4,6 +4,8 @@
 
 AppleJuice runs supported Windows applications on Apple Silicon Macs. It includes the **Win64 Launcher** graphical application and the **x64arm** command-line tool. AppleJuice loads PE/DLL files, provides Windows compatibility services, and connects windows, graphics, audio and input to native macOS interfaces and Metal.
 
+The release requires **Apple Silicon and macOS 13.0 or later**. Frame interpolation separately requires **macOS 26 or later** and a supported device. When unavailable, interpolation is disabled; ordinary execution, MetalFX upscaling and spatial audio do not require upgrading to macOS 27.
+
 The complete `x64kernel/` static SDK is included; normal builds do not require the kernel source. The kernel is provided separately by AppleJuiceKernel. Statically linked executables and Launcher bundles are distributable AppleJuice products, with the applicable licenses retained.
 
 ## Project goals and features
@@ -133,6 +135,12 @@ AppleJuice provides these features natively in its presentation and audio output
 Enable "Spatial headphone mixing" to place channels from 5.1, 7.1 and other multichannel output in virtual speaker positions and render them as binaural stereo through ordinary headphones, preserving the low-frequency channel. Games and media applications do not need built-in HRTF support; the spatial effect depends on the channel information actually supplied.
 
 Linked switches are available in the main window and Settings → Audio. The feature is off by default and takes effect the next time an application starts. Head tracking is currently disabled.
+
+### Starting games through Steam or another launcher
+
+Select Steam in AppleJuice, set Spatial headphone mixing, 2× upscaling and Frame interpolation, then start the game through Steam. Newly created games and their child processes read the latest settings, so Steam does not need to restart after a switch changes. Restart an already running game to apply new presentation and audio settings.
+
+For a game already in the AppleJuice library, its EXE's saved display settings take priority. Games outside the library inherit the launcher's current display settings. Spatial audio is a global preference. The same process applies to other launchers without game-specific rules.
 
 ## Tested applications / 2026-11-17 / 23 games
 

@@ -15,13 +15,27 @@ import sys
 import tempfile
 import uuid
 from zoneinfo import ZoneInfo
-from bundle_native_v8 import bundle_native_v8
+from bundle_native_v8 import bundle_native_v8, minimum_macos
 from bundle_cross_architecture import bundle_engine
 from build_pe_fixtures import prepare_console_fixture
 from engine_validation import from_evidence, from_state
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 THIRD_PARTY_LICENSE_NAMES = ('LICENSE*', '*-LICENSE', '*-PATENTS', 'COPYING*', 'NOTICE*')
+LAUNCHER_MINIMUM_MACOS = '13.0'  # 與目前 Go 工具鏈支援範圍及 cgo 原生前端一致。
+
+
+def bundle_minimum_macos(app):
+    """Info.plist 依實際內建 Mach-O 的最高部署版本，不沿用建置主機版本。"""
+    versions = [LAUNCHER_MINIMUM_MACOS]
+    for path in app.rglob('*'):
+        if not path.is_file() or path.is_symlink():
+            continue
+        with path.open('rb') as stream:
+            magic = stream.read(4)
+        if magic in (b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca'):
+            versions.append(minimum_macos(path))
+    return max(versions, key=lambda value: tuple(int(part) for part in value.split('.')))
 
 
 def license_files():
@@ -376,7 +390,12 @@ def build_launcher(*, reuse_only=False):
         app = pathlib.Path(staging) / destination.name
         macos = app / 'Contents' / 'MacOS'
         macos.mkdir(parents=True, exist_ok=True)
-        go_environment = dict(os.environ, GOMAXPROCS=str(jobs))
+        go_environment = dict(os.environ, GOMAXPROCS=str(jobs),
+                              MACOSX_DEPLOYMENT_TARGET=LAUNCHER_MINIMUM_MACOS)
+        # runtime/cgo 與 WebView 的原生物件也必須使用相同部署版本；明列旗標納入 Go 快取鍵。
+        for key in ('CGO_CFLAGS', 'CGO_CXXFLAGS', 'CGO_LDFLAGS'):
+            go_environment[key] = (go_environment.get(key, '-O2 -g') +
+                                   ' -mmacosx-version-min=' + LAUNCHER_MINIMUM_MACOS)
         run('go', 'build', '-p', str(jobs), '-trimpath', '-ldflags', f'-X "main.launcherVersion={display_version}"', '-o', str(macos / 'Win64Launcher'), '.', cwd=ROOT / 'launcher', env=go_environment)
         if evidence:
             target = app / 'Contents/Helpers/x64arm.app'
@@ -403,9 +422,9 @@ def build_launcher(*, reuse_only=False):
         if not (kernel_licenses / 'LICENSE.md').is_file():
             raise RuntimeError('缺少靜態連結核心的授權文件，保留既有 Launcher')
         shutil.copytree(kernel_licenses, licenses / 'AppleJuiceKernel')
-        minimum_system = '11.0'
         if args.with_native_v8:
-            minimum_system = bundle_native_v8(ROOT, app, engine_build / 'x64arm_v8_host')
+            bundle_native_v8(ROOT, app, engine_build / 'x64arm_v8_host')
+        minimum_system = bundle_minimum_macos(app)
         info = {
             'CFBundleName': 'AppleJuice', 'CFBundleDisplayName': 'AppleJuice',
             'CFBundleIdentifier': 'dev.x64arm.launcher', 'CFBundleExecutable': 'Win64Launcher',

@@ -25,7 +25,7 @@ std::span<const WindowsServiceDescriptor> system_object_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"kernel32.dll","CompareObjectHandles",2},
         {"ntdll.dll","NtCompareObjects",2},{"ntdll.dll","ZwCompareObjects",2},
-        {"ntdll.dll","NtGetNextThread",6},{"ntdll.dll","ZwGetNextThread",6},
+        {"ntdll.dll","NtGetNextThread",6},{"ntdll.dll","ZwGetNextThread",6},{"ntdll.dll","NtGetNextProcess",5,0,0,0xe},{"ntdll.dll","ZwGetNextProcess",5,0,0,0xe},
         {"ntdll.dll","RtlAcquirePrivilege",4},{"ntdll.dll","RtlReleasePrivilege",1},
         {"kernel32.dll","WerRegisterRuntimeExceptionModule",2},{"kernel32.dll","WerUnregisterRuntimeExceptionModule",2},
         {"kernel32.dll","WerRegisterFile",3},{"kernel32.dll","WerUnregisterFile",1},
@@ -58,6 +58,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_system_objects(GuestState& 
             const bool same=*left==*right;
             if(native)return finish(same?0U:0xC00001EAU); // STATUS_NOT_SAME_OBJECT
             return finish(same?1:0);
+        }
+        if(symbol.ends_with("GetNextProcess")){
+            // (ProcessHandle, DesiredAccess, HandleAttributes, Flags, NewProcessHandle*)：依 PID 順序列舉目前 session 的引擎程序（與 Toolhelp 同一範圍），
+            // 以 OpenProcess 取得 handle；無法以要求的權限開啟者略過。NULL 從頭開始，結束時 STATUS_NO_MORE_ENTRIES。
+            if(u32(3))return finish(0xC00000F2U);
+            if(!arg(4))return finish(0xC000000DU);memory.check(GuestAddress{arg(4)},unit,Access::Write);memory.store(GuestAddress{arg(4)},bits,0);
+            if(u32(2)&~0x1f2U)return finish(0xC00000F0U);
+            std::uint32_t after=0;
+            if(arg(0)){const auto current=x86_?UINT64_C(0xffffffff):UINT64_MAX;
+                if(arg(0)==current || current_process_handle(arg(0)))after=process_id();
+                else if(const auto pid=process_handle_pid(arg(0),0))after=pid;
+                else return finish(0xC0000008U);}
+            std::vector<std::uint32_t> ids;if(const auto error=session_process_ids(ids))return finish(error==8?0xC000009AU:0xC0000001U);
+            for(const auto pid:ids){
+                if(arg(0) && pid<=after)continue;
+                const auto handle=nested_service(state,memory,"kernel32.dll","OpenProcess",{u32(1),(u32(2)&2U)?1U:0U,pid});
+                if(handle){memory.store(GuestAddress{arg(4)},bits,handle);last_error_=0;return finish(0);}
+            }
+            last_error_=0;return finish(0x8000001AU);
         }
         if(symbol.ends_with("GetNextThread")){
             // 只列舉本程序的客體執行緒；跨程序需要遠端執行緒快照，尚無共用來源。

@@ -46,6 +46,8 @@ std::uint32_t WindowsServices::read_power_reason(GuestMemory& memory,std::uint64
     }catch(const MemoryFault&){return 998;}catch(const HostCallFault&){return 13;}catch(const std::bad_alloc&){return 8;}
 }
 std::optional<std::uint32_t> WindowsServices::invoke_power(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    // 電源方案查詢與舊式方案介面集中在 windows_power_schemes.cpp，與方案寫入共用沙箱方案儲存。
+    if(power_scheme_query_symbol(service.symbol))return invoke_power_schemes(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;
     std::uint64_t result=0;const std::uint8_t bits=x86_?32:64;
     const auto d=[&](unsigned i){return static_cast<std::uint32_t>(arg(i));};
@@ -108,107 +110,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_power(GuestState& state,Gue
             }
             return finish(0);
         }catch(const MemoryFault&){return finish(0xc0000005U);}catch(const std::bad_alloc&){return finish(0xc0000017U);}
-    }else if(symbol=="PowerEnumerate"){
-        // 單一 macOS 原生方案：ACCESS_SCHEME 列出方案、ACCESS_SUBGROUP 列出群組、ACCESS_INDIVIDUAL_SETTING 列出群組內設定。
-        const auto finish=[&](std::uint32_t status){arg.return_to(state,status);return std::optional<std::uint32_t>{};};
-        if(arg(0) || !arg(6))return finish(87);
-        const auto load=[&](std::uint64_t at){power::Guid value{};memory.read(GuestAddress{at},value);return value;};
-        const auto access=static_cast<std::uint32_t>(arg(3)),index=static_cast<std::uint32_t>(arg(4));std::vector<power::Guid> items;
-        if(access==16)items.push_back(power::native_scheme);
-        else if(access==17 || access==18){
-            if(!arg(1) || load(arg(1))!=power::native_scheme)return finish(2);
-            if(access==17){for(const auto& setting:power::settings)if(std::find(items.begin(),items.end(),setting.group)==items.end())items.push_back(setting.group);}
-            else {if(!arg(2))return finish(87);const auto group=load(arg(2));for(const auto& setting:power::settings)if(setting.group==group)items.push_back(setting.value);if(items.empty())return finish(2);}
-        }else return finish(87);
-        if(index>=items.size())return finish(259);
-        const auto capacity=memory.load(GuestAddress{arg(6)},32);memory.store(GuestAddress{arg(6)},32,16);
-        if(!arg(5))return finish(0);if(capacity<16)return finish(234);memory.write(GuestAddress{arg(5)},items[index]);return finish(0);
-    }else if(symbol=="PowerReadDescription"){
-        const auto finish=[&](std::uint32_t status){arg.return_to(state,status);return std::optional<std::uint32_t>{};};
-        if(arg(0) || !arg(5))return finish(87);
-        const auto load=[&](std::uint64_t at){power::Guid value{};memory.read(GuestAddress{at},value);return value;};
-        if(arg(1) && load(arg(1))!=power::native_scheme)return finish(2);
-        std::u16string text=u"由 macOS 系統電源偏好設定提供的電源方案";
-        if(arg(2)){
-            const auto group=load(arg(2));std::size_t i=0;while(i<power::settings.size() && power::settings[i].group!=group)++i;if(i==power::settings.size())return finish(2);
-            static constexpr std::u16string_view groups[]{u"顯示器的電源管理設定",u"系統睡眠的電源管理設定",u"磁碟的電源管理設定"};
-            static constexpr std::u16string_view settings[]{u"閒置多久後關閉顯示器（macOS 顯示器睡眠）",u"閒置多久後讓系統睡眠（macOS 系統睡眠）",u"閒置多久後讓磁碟睡眠（macOS 磁碟睡眠）"};
-            if(arg(3) && load(arg(3))!=power::settings[i].value)return finish(2);text=arg(3)?settings[i]:groups[i];
-        }else if(arg(3))return finish(87);
-        const auto bytes=utf16_bytes(text);const auto capacity=memory.load(GuestAddress{arg(5)},32);
-        memory.store(GuestAddress{arg(5)},32,bytes.size());if(!arg(4))return finish(0);if(capacity<bytes.size())return finish(234);memory.write(GuestAddress{arg(4)},bytes);return finish(0);
-    }else if(symbol=="GetActivePwrScheme" || symbol=="EnumPwrSchemes"){
-        // 舊式電源方案介面：唯一方案索引 0；EnumPwrSchemes 以 PWRSCHEMESENUMPROC 回呼方案名稱、描述與 POWER_POLICY。
-        if(symbol=="GetActivePwrScheme"){if(!arg(0)){last_error_=87;arg.return_to(state,0);return std::nullopt;}memory.store(GuestAddress{arg(0)},32,0);arg.return_to(state,1);return std::nullopt;}
-        if(!arg(0)){last_error_=87;arg.return_to(state,0);return std::nullopt;}
-        constexpr std::u16string_view name=u"macOS 原生電源設定",description=u"由 macOS 系統電源偏好設定提供的電源方案";constexpr std::uint64_t policy_size=512;
-        const auto name_bytes=(name.size()+1)*2,description_bytes=(description.size()+1)*2;
-        const auto block=allocate_heap(memory,policy_size+name_bytes+description_bytes);if(!block){last_error_=8;arg.return_to(state,0);return std::nullopt;}
-        memory.fill(GuestAddress{block},0,static_cast<std::size_t>(policy_size+name_bytes+description_bytes));memory.store(GuestAddress{block},32,1); // USER_POWER_POLICY.Revision
-        const auto name_at=block+policy_size,description_at=name_at+name_bytes;
-        for(std::size_t i=0;i<name.size();++i)memory.store(GuestAddress{name_at+i*2},16,name[i]);for(std::size_t i=0;i<description.size();++i)memory.store(GuestAddress{description_at+i*2},16,description[i]);
-        start_callbacks(state,memory,{{arg(0),{0,name_bytes,name_at,description_bytes,description_at,block,arg(1)}},{resolve("kernel32.dll","HeapFree").value,{process_heap,0,block}}},Continuation::Return,1);return std::nullopt;
     }else if(symbol=="GetDevicePowerState"){
         // 沙箱磁碟與裝置皆由宿主檔案系統承載；可開啟的檔案或裝置 handle 即處於 D0（開啟）。
         if(!files_.contains(arg(0)))fail(6);else if(!arg(1))fail(87);else {memory.store(GuestAddress{arg(1)},32,1);result=1;}
-    }else if(symbol=="PowerReadFriendlyName"){
-        const auto finish=[&](std::uint32_t status){arg.return_to(state,status);return std::optional<std::uint32_t>{};};
-        if(arg(0) || !arg(5))return finish(87);
-        const auto load=[&](std::uint64_t at){power::Guid value{};memory.read(GuestAddress{at},value);return value;};
-        if(arg(1) && load(arg(1))!=power::native_scheme)return finish(2);
-        std::u16string name=u"macOS 原生電源設定";
-        if(arg(2)){
-            const auto group=load(arg(2));std::size_t i=0;while(i<power::settings.size() && power::settings[i].group!=group)++i;
-            if(i==power::settings.size())return finish(2);
-            static constexpr std::u16string_view groups[]{u"顯示器",u"睡眠",u"磁碟"};
-            static constexpr std::u16string_view settings[]{u"關閉顯示器時間",u"系統睡眠時間",u"磁碟睡眠時間"};
-            if(arg(3) && load(arg(3))!=power::settings[i].value)return finish(2);
-            name=arg(3)?settings[i]:groups[i];
-        }else if(arg(3))return finish(87);
-        const auto bytes=utf16_bytes(name);const auto capacity=memory.load(GuestAddress{arg(5)},32);
-        memory.store(GuestAddress{arg(5)},32,bytes.size());if(!arg(4))return finish(0);if(capacity<bytes.size())return finish(234);
-        memory.write(GuestAddress{arg(4)},bytes);return finish(0);
-    }else if(symbol=="PowerGetActiveScheme" || symbol.starts_with("PowerRead")){
-        const auto finish=[&](std::uint32_t status){arg.return_to(state,status);return std::optional<std::uint32_t>{};};
-        std::uint64_t allocation=0;
-        try{
-            if(arg(0))return finish(87);
-            const bool scheme=symbol=="PowerGetActiveScheme",index=symbol.ends_with("Index");
-            if(scheme){
-                if(!arg(1))return finish(87);
-                memory.store(GuestAddress{arg(1)},bits,0);
-            }else{
-                if(!arg(3) || (index && !arg(4)) || (!index && arg(5) && !arg(6)))return finish(87);
-                const auto load=[&](std::uint64_t address){power::Guid value{};memory.read(GuestAddress{address},value);return value;};
-                if(arg(1) && load(arg(1))!=power::native_scheme)return finish(2);
-                const auto group=arg(2)?load(arg(2)):power::Guid{},setting=load(arg(3));
-                std::size_t position=0;
-                while(position<power::settings.size() && (group!=power::settings[position].group || setting!=power::settings[position].value))++position;
-                if(position==power::settings.size())return finish(2);
-                // 宿主即時查詢不能進入 deterministic compare。
-                if(!runtime_.network.external_io)return finish(50);
-                const auto preferences=native_power_preferences();if(!preferences)return finish(50);
-                const auto value=power::timeout_value(*preferences,symbol.starts_with("PowerReadDC"),position);
-                if(value.status)return finish(value.status);
-                if(index){memory.store(GuestAddress{arg(4)},32,value.seconds);return finish(0);}
-                const auto capacity=arg(6)?memory.load(GuestAddress{arg(6)},32):0;
-                if(arg(4))memory.check(GuestAddress{arg(4)},4,Access::Write);
-                if(arg(6))memory.check(GuestAddress{arg(6)},4,Access::Write);
-                if(arg(5) && capacity>=4)memory.check(GuestAddress{arg(5)},4,Access::Write);
-                if(arg(4))memory.store(GuestAddress{arg(4)},32,4); // REG_DWORD。
-                if(arg(6))memory.store(GuestAddress{arg(6)},32,4);
-                if(!arg(5))return finish(0);
-                if(capacity<4)return finish(234);
-                memory.store(GuestAddress{arg(5)},32,value.seconds);return finish(0);
-            }
-            if(!runtime_.network.external_io || !native_power_preferences())return finish(50);
-            if(gui_.global_memory.size()>=65536)return finish(8);
-            allocation=allocate_heap(memory,16);if(!allocation)return finish(8);
-            gui_.global_memory.emplace(allocation,GuiGlobalMemory{allocation,16,0,0,false});
-            memory.write(GuestAddress{allocation},power::native_scheme);
-            memory.store(GuestAddress{arg(1)},bits,allocation);return finish(0);
-        }catch(const MemoryFault&){if(allocation){gui_.global_memory.erase(allocation);(void)free_heap(memory,allocation,state);}return finish(998);}
-        catch(const std::bad_alloc&){if(allocation){gui_.global_memory.erase(allocation);(void)free_heap(memory,allocation,state);}return finish(8);}
     }else if(symbol=="PowerDeterminePlatformRole" || symbol=="PowerDeterminePlatformRoleEx"){
         const auto version=symbol.ends_with("Ex")?static_cast<std::uint32_t>(arg(0)):1U;
         if(version!=1 && version!=2)last_error_=87;

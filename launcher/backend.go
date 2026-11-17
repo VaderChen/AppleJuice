@@ -361,6 +361,11 @@ func writeJSONAtomic(path string, value any) error {
 	if err != nil {
 		return err
 	}
+	return writeAtomicFile(path, append(data, '\n'))
+}
+
+func writeAtomicFile(path string, data []byte) error {
+	var err error
 	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
@@ -370,7 +375,7 @@ func writeJSONAtomic(path string, value any) error {
 	}
 	name := f.Name()
 	defer os.Remove(name)
-	if _, err = f.Write(append(data, '\n')); err == nil {
+	if _, err = f.Write(data); err == nil {
 		err = f.Sync()
 	}
 	closeErr := f.Close()
@@ -407,6 +412,9 @@ func (a *App) saveLocked(next Library) error {
 		if err := writeJSONAtomic(filepath.Join(a.dataDir, "library.json"), index); err != nil {
 			return err
 		}
+	}
+	if err := a.savePresentationOptionsLocked(next); err != nil {
+		return err
 	}
 	a.persistentSelected = index.Selected
 	a.library = next
@@ -831,18 +839,19 @@ func (a *App) SaveGlobalSettings(settings GlobalSettings) error {
 	if err = writeJSONAtomic(filepath.Join(a.dataDir, "settings.json"), settings); err != nil {
 		return err
 	}
-	a.library.NativeLibraryBridge = settings.NativeLibraryBridge
-	a.library.NativeV8Bridge = settings.NativeV8Bridge
-	a.library.SpatialHeadphones = settings.SpatialHeadphones
-	a.library.CertificateRootsFile, a.library.CertificateRootsPath = settings.CertificateRootsFile, settings.CertificateRootsPath
-	a.library.OpenGLBackend = settings.OpenGLBackend
-	a.library.CompilerWorkers = settings.CompilerWorkers
-	a.library.CPUCoresX64, a.library.CPUCoresX86 = settings.CPUCoresX64, settings.CPUCoresX86
-	a.library.CDrive = settings.CDrive
-	a.library.Drives = copyDrives(settings.Drives)
-	a.library.Language, a.library.Theme = settings.Language, settings.Theme
-	a.library.WindowsFont = settings.WindowsFont
-	return nil
+	next := a.library
+	next.NativeLibraryBridge = settings.NativeLibraryBridge
+	next.NativeV8Bridge = settings.NativeV8Bridge
+	next.SpatialHeadphones = settings.SpatialHeadphones
+	next.CertificateRootsFile, next.CertificateRootsPath = settings.CertificateRootsFile, settings.CertificateRootsPath
+	next.OpenGLBackend = settings.OpenGLBackend
+	next.CompilerWorkers = settings.CompilerWorkers
+	next.CPUCoresX64, next.CPUCoresX86 = settings.CPUCoresX64, settings.CPUCoresX86
+	next.CDrive = settings.CDrive
+	next.Drives = copyDrives(settings.Drives)
+	next.Language, next.Theme = settings.Language, settings.Theme
+	next.WindowsFont = settings.WindowsFont
+	return a.saveLocked(next)
 }
 func (a *App) SaveSettings(id string, settings Settings) error {
 	settings, err := validateSettings(settings)
@@ -865,7 +874,12 @@ func (a *App) SaveSettings(id string, settings Settings) error {
 			return err
 		}
 	}
-	a.library.Programs[i] = p
+	next := a.library
+	next.Programs = append([]Program{}, next.Programs...)
+	next.Programs[i] = p
+	if err := a.saveLocked(next); err != nil {
+		return err
+	}
 	delete(a.gpuMemoryMigrations, id)
 	return nil
 }
@@ -986,6 +1000,7 @@ func (a *App) Start(id string, settings Settings, cols, rows uint16) (Snapshot, 
 	if err != nil {
 		return Snapshot{}, err
 	}
+	environment = append(environment, "X64ARM_PRESENTATION_PROFILE="+p.ID)
 	if p.PresentUpscale {
 		environment = append(environment, "X64ARM_PRESENT_UPSCALE=2")
 	}

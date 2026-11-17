@@ -1048,9 +1048,22 @@ PeProgram load_pe(std::span<const std::uint8_t> bytes,PeOptions options){
     program.metadata=parsed.metadata;program.memory=GuestMemory{options.memory_limit};
     program.memory.set_execution_mode(x86 ? ExecutionMode::X86 : ExecutionMode::X64);
     map_pe_image(program.memory,parsed);
-    GuestAddress stack_base{x86 ? UINT64_C(0x78000000) : UINT64_C(0x3000000000)}; // x64 主堆疊位於 MMU 視窗內。
-    if(!x86 && prefer_low_guest_stack())
-        if(const auto low=find_guest_address_gap(program.memory,UINT64_C(0x78000000),parsed.stack_size,UINT64_C(0x100000000)))stack_base=*low;
+    const auto mode=program.memory.execution_mode();
+    const auto reserved_end=[&](std::uint64_t first,std::uint64_t end){return windows_address_layout::process_reserved_end(mode,first,end);};
+    const auto stack_limit=windows_address_layout::user_limit(mode,parsed.runtime.large_address_aware);
+    GuestAddress stack_base{};
+    if(!options.no_initial_thread){
+        std::optional<GuestAddress> selected;
+        if(!x86 && prefer_low_guest_stack())
+            selected=find_guest_address_gap(program.memory,UINT64_C(0x78000000),parsed.stack_size,UINT64_C(0x100000000),reserved_end);
+        // 大型 PE 主堆疊與映像都可能占用偏好地址；沿用共用空洞搜尋並保留完整大小。
+        if(!selected)selected=find_guest_address_gap(program.memory,windows_address_layout::process_for_mode(mode).stack,
+                                                   parsed.stack_size,stack_limit,reserved_end);
+        // PE32 非 LAA 程序的偏好位置上方可能放不下完整堆疊；回到同一使用者位址範圍搜尋。
+        if(!selected)selected=find_guest_address_gap(program.memory,UINT64_C(0x10000),parsed.stack_size,stack_limit,reserved_end);
+        if(!selected)reject("主執行緒堆疊沒有足夠的連續客體位址");
+        stack_base=*selected;
+    }
     if(!options.no_initial_thread){startup_profile::Scope phase("loader","map_stack",true);
         program.memory.map(stack_base,static_cast<std::size_t>(parsed.stack_size),read_write);}
     program.services.initialize(program.memory,options.command_line,options.filesystem_root,options.c_drive,options.writable_files,options.install_root,options.drive_mappings,options.certificate_roots_file,options.resident_translation);

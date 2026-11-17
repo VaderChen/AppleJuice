@@ -21,4 +21,31 @@ constexpr bool overlaps(ExecutionMode mode,std::uint64_t address,std::uint64_t s
 inline constexpr auto x86=for_mode(ExecutionMode::X86),x64=for_mode(ExecutionMode::X64);
 static_assert(x86.callbacks==0x7f200000);
 static_assert(x64.callbacks+gateway_capacity<=GuestMemory::native_mmu_window);
+
+// 主堆疊必須避開尚未建立的系統映射；服務層與載入器共用地址契約。
+struct ProcessLayout {std::uint64_t stack,command_line,runtime,teb,peb,exceptions;};
+constexpr ProcessLayout process_for_mode(ExecutionMode mode) noexcept {
+    return mode==ExecutionMode::X86?
+        ProcessLayout{0x78000000,0x70000000,0x70010000,0x70200000,0x70210000,0x70300000}:
+        ProcessLayout{0x3000000000,0x3001000000,0x3002000000,0x3004000000,0x3004010000,0x3005000000};
+}
+inline constexpr auto process_x64=process_for_mode(ExecutionMode::X64);
+inline constexpr std::uint64_t process_heap=0x7ffd0000,shared_user_data=0x7ffe0000;
+constexpr std::uint64_t user_limit(ExecutionMode mode,bool large_address_aware) noexcept {
+    if(mode==ExecutionMode::X86)return large_address_aware?UINT64_C(0xffff0000):UINT64_C(0x7fff0000);
+    const auto mmu_limit=GuestMemory::native_mmu_window-0x10000;
+    return mmu_limit<UINT64_C(0x7fffffff0000)?mmu_limit:UINT64_C(0x7fffffff0000);
+}
+constexpr std::uint64_t process_reserved_end(ExecutionMode mode,std::uint64_t first,std::uint64_t end) noexcept {
+    const auto p=process_for_mode(mode);
+    struct Range {std::uint64_t base,size;};
+    // 命令列／TEB／PEB 預留一個配置粒度；runtime 與例外區沿用既有最大映射大小。
+    const Range ranges[]{{p.command_line,65536},{p.runtime,1U<<20},{p.teb,65536},{p.peb,65536},
+        {p.exceptions,16U*8192},{process_heap,GuestMemory::guest_page_size},
+        {shared_user_data,GuestMemory::guest_page_size},{for_mode(mode).images,reserved_capacity}};
+    auto high=first;
+    for(const auto range:ranges)
+        if(first<range.base+range.size && range.base<end && high<range.base+range.size)high=range.base+range.size;
+    return high;
+}
 }

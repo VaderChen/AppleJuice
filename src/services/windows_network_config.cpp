@@ -13,10 +13,12 @@
 #include <net/if.h>
 #include <resolv.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <net/if_dl.h>
 #include <net/route.h>
+#include <netinet/in.h>
 #include <sys/sysctl.h>
 #include <notify.h>
 #else
@@ -75,6 +77,14 @@ std::vector<std::uint8_t> socket_bytes(const sockaddr* value) {
         std::memcpy(result.data()+8,&address->sin6_addr,16);std::memcpy(result.data()+24,&address->sin6_scope_id,4);
     }
     return result;
+}
+// 宿主核心（KAME）把連結本機／介面本機範圍的 IPv6 位址的 scope 放在位址第 2～3 位元組；Windows SOCKADDR_IN6 位元組改放 sin6_scope_id。
+void clear_embedded_scope(std::vector<std::uint8_t>& bytes){
+    if(bytes.size()<28 || bytes[0]!=23)return;
+    const bool scoped=(bytes[8]==0xfe && (bytes[9]&0xc0)==0x80) || (bytes[8]==0xff && ((bytes[9]&15)==1 || (bytes[9]&15)==2));
+    if(!scoped || (!bytes[10] && !bytes[11]))return;
+    const auto scope=static_cast<std::uint32_t>(bytes[10])<<8|bytes[11];bytes[10]=bytes[11]=0;
+    if(!bytes[24] && !bytes[25] && !bytes[26] && !bytes[27])for(unsigned i=0;i<4;++i)bytes[24+i]=static_cast<std::uint8_t>(scope>>(8*i));
 }
 std::optional<std::vector<std::uint8_t>> ipv4_snapshot(){
     ifaddrs* list=nullptr;if(::getifaddrs(&list))return {};
@@ -207,10 +217,45 @@ bool refresh_configuration(NetworkConfiguration& config,bool external_io,bool st
     else if(statistics && external_io)refresh_interface_statistics(config.interfaces);
     return ensure_descriptions();
 }
+#if defined(__APPLE__)
+// 路由訊息（rt_msghdr 與 RTAX_* 位址）轉成 MIB_IPFORWARD_ROW2（104 位元組）；GetBestRoute2 與 GetIpForwardTable2 共用。
+// 前置位址依遮罩清除主機位元；有 RTF_GATEWAY 才填 NextHop，否則只填位址家族（未指定位址）。
+std::uint32_t encode_route_row(const NetworkInterface& interface,const rt_msghdr& header,const std::array<sockaddr_storage,RTAX_MAX>& addresses,
+                               std::uint8_t family,std::array<std::uint8_t,104>& row){
+    const auto put=[&](std::size_t at,std::uint64_t value,unsigned count) {for(unsigned i=0;i<count;++i)row.at(at+i)=static_cast<std::uint8_t>(value>>(i*8));};
+    auto prefix_address=socket_bytes(reinterpret_cast<const sockaddr*>(&addresses[RTAX_DST]));
+    if(prefix_address.empty())return 13;
+    clear_embedded_scope(prefix_address);
+    std::copy(prefix_address.begin(),prefix_address.end(),row.begin()+12);
+    const auto begin=family==2?4U:8U,total=family==2?32U:128U;
+    unsigned prefix=header.rtm_flags&RTF_HOST?total:0;
+    if(!(header.rtm_flags&RTF_HOST) && (static_cast<unsigned>(header.rtm_addrs)&RTA_NETMASK)) {
+        // 路由遮罩的 sa_len 可短於完整位址（後續位元組視為 0）。
+        const auto* mask=reinterpret_cast<const std::uint8_t*>(&addresses[RTAX_NETMASK]);const unsigned length=mask[0];bool ended=false;
+        for(unsigned bit=0;bit<total;++bit) {
+            const auto at=begin+bit/8;const bool set=at<length && (mask[at]&(0x80U>>(bit%8)))!=0;
+            if(!set)ended=true;else if(ended)return 50;else ++prefix;
+        }
+    }
+    for(unsigned bit=prefix;bit<total;++bit)row[12+begin+bit/8]&=static_cast<std::uint8_t>(~(0x80U>>(bit%8)));
+    row[40]=static_cast<std::uint8_t>(prefix);row[44]=family;
+    if(header.rtm_flags&RTF_GATEWAY) {
+        auto gateway=socket_bytes(reinterpret_cast<const sockaddr*>(&addresses[RTAX_GATEWAY]));
+        if(!gateway.empty() && gateway[0]==family){clear_embedded_scope(gateway);std::copy(gateway.begin(),gateway.end(),row.begin()+44);}
+    }
+    put(0,(std::uint64_t{interface.type}<<48)|(std::uint64_t{interface.index}<<24),8);put(8,interface.index,4);
+    row[72]=static_cast<std::uint8_t>(prefix);
+    const auto expiry=header.rtm_rmx.rmx_expire;
+    const auto lifetime=expiry?static_cast<std::uint32_t>(std::max<std::int64_t>(0,static_cast<std::int64_t>(expiry)-std::time(nullptr))):UINT32_MAX;
+    put(76,lifetime,4);put(80,lifetime,4);put(84,header.rtm_rmx.rmx_hopcount,4);
+    put(88,header.rtm_flags&RTF_GATEWAY?header.rtm_flags&RTF_STATIC?3U:1U:2U,4);
+    row[92]=interface.type==24;row[95]=!expiry;put(100,header.rtm_flags&RTF_GATEWAY?0U:1U,4);
+    return 0;
+}
+#endif
 NetworkRoute query_route(const NetworkConfiguration& config,std::uint64_t luid,std::uint32_t index,
                          std::span<const std::uint8_t> source,std::span<const std::uint8_t> destination) {
     NetworkRoute result;
-    const auto put=[&](std::size_t at,std::uint64_t value,unsigned count) {for(unsigned i=0;i<count;++i)result.row.at(at+i)=static_cast<std::uint8_t>(value>>(i*8));};
     if(luid) {
         const auto item=std::find_if(config.interfaces.begin(),config.interfaces.end(),[&](const auto& item){return ((std::uint64_t{item.type}<<48)|(std::uint64_t{item.index}<<24))==luid;});
         if(item==config.interfaces.end()){result.status=2;return result;}index=item->index;
@@ -268,49 +313,30 @@ NetworkRoute query_route(const NetworkConfiguration& config,std::uint64_t luid,s
     sockaddr_storage selected{};socklen_t size=sizeof(selected);
     if(::getsockname(*probe,reinterpret_cast<sockaddr*>(&selected),&size)!=0){result.status=1231;return result;}
     auto selected_bytes=socket_bytes(reinterpret_cast<sockaddr*>(&selected));std::copy(selected_bytes.begin(),selected_bytes.end(),result.source.begin());
-    const auto prefix_address=socket_bytes(reinterpret_cast<const sockaddr*>(&addresses[RTAX_DST]));
-    if(prefix_address.empty()){result.status=13;return result;}
-    std::copy(prefix_address.begin(),prefix_address.end(),result.row.begin()+12);
-    const auto begin=family==2?4U:8U,total=family==2?32U:128U;
-    unsigned prefix=header.rtm_flags&RTF_HOST?total:0;
-    if(!(header.rtm_flags&RTF_HOST)) {
-        const auto* mask=reinterpret_cast<const std::uint8_t*>(&addresses[RTAX_NETMASK]);bool ended=false;
-        for(unsigned bit=0;bit<total;++bit) {
-            const bool set=(mask[begin+bit/8]&(0x80U>>(bit%8)))!=0;
-            if(!set)ended=true;else if(ended){result.status=50;return result;}else ++prefix;
-        }
-    }
-    for(unsigned bit=prefix;bit<total;++bit)result.row[12+begin+bit/8]&=static_cast<std::uint8_t>(~(0x80U>>(bit%8)));
-    result.row[40]=static_cast<std::uint8_t>(prefix);result.row[44]=family;
-    if(header.rtm_flags&RTF_GATEWAY) {
-        const auto gateway=socket_bytes(reinterpret_cast<const sockaddr*>(&addresses[RTAX_GATEWAY]));
-        if(!gateway.empty())std::copy(gateway.begin(),gateway.end(),result.row.begin()+44);
-    }
-    put(0,(std::uint64_t{interface->type}<<48)|(std::uint64_t{interface->index}<<24),8);put(8,interface->index,4);
-    result.row[72]=static_cast<std::uint8_t>(prefix);
-    const auto expiry=header.rtm_rmx.rmx_expire;
-    const auto lifetime=expiry?static_cast<std::uint32_t>(std::max<std::int64_t>(0,static_cast<std::int64_t>(expiry)-std::time(nullptr))):UINT32_MAX;
-    put(76,lifetime,4);put(80,lifetime,4);put(84,header.rtm_rmx.rmx_hopcount,4);
-    put(88,header.rtm_flags&RTF_GATEWAY?header.rtm_flags&RTF_STATIC?3U:1U:2U,4);
-    result.row[92]=interface->type==24;result.row[95]=!expiry;put(100,header.rtm_flags&RTF_GATEWAY?0U:1U,4);
+    result.status=encode_route_row(*interface,header,addresses,family,result.row);
 #else
-    (void)put;result.status=50;
+    (void)source;result.status=50;
 #endif
     return result;
 }
 #include "windows_ip_neighbors.inc"
+#include "windows_route_table.inc"
 }
 bool snapshot_network_configuration(NetworkConfiguration& result){return capture(result);}
 bool WindowsServices::address_notification_waiting() const {
-    return std::any_of(address_notifications_.begin(),address_notifications_.end(),[](const auto& item){return item.second.pending;});
+    return !mib_notifications_.empty() || std::any_of(address_notifications_.begin(),address_notifications_.end(),[](const auto& item){return item.second.pending;});
 }
 void WindowsServices::poll_address_notifications(GuestMemory& memory){
-    if(!address_notification_waiting())return;
+    if(!mib_notifications_.empty())poll_mib_notifications(memory);
+    if(std::none_of(address_notifications_.begin(),address_notifications_.end(),[](const auto& item){return item.second.pending;}))return;
     const auto now=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     if(now<address_poll_time_)return;address_poll_time_=now+100;
-    const auto snapshot=ipv4_snapshot();if(!snapshot)return;
+    std::optional<std::vector<std::uint8_t>> addresses,routes;bool addresses_read=false,routes_read=false;
     for(auto& [handle,watch]:address_notifications_){
-        (void)handle;if(!watch.pending || watch.snapshot==*snapshot)continue;watch.pending=false;
+        (void)handle;if(!watch.pending)continue;
+        auto& snapshot=watch.routes?routes:addresses;auto& read=watch.routes?routes_read:addresses_read;
+        if(!read){snapshot=watch.routes?ipv4_route_snapshot():ipv4_snapshot();read=true;}
+        if(!snapshot || watch.snapshot==*snapshot)continue;watch.pending=false;
         memory.store(GuestAddress{watch.overlapped},x86_?32:64,0);
         if(const auto e=runtime_.wait_objects.find(watch.event);e!=runtime_.wait_objects.end())e->second.set_signal(true);
         runtime_.network.configuration->captured=false;runtime_.network.configuration->routes.clear();
@@ -330,7 +356,7 @@ std::span<const WindowsServiceDescriptor> network_config_service_descriptors(){
         {"iphlpapi.dll","ConvertInterfaceLuidToGuid",2},{"iphlpapi.dll","ConvertInterfaceGuidToLuid",2},{"winhttp.dll","WinHttpGetIEProxyConfigForCurrentUser",1},{"winhttp.dll","WinHttpGetDefaultProxyConfiguration",1},
         {"winhttp.dll","WinHttpSetDefaultProxyConfiguration",1},{"iphlpapi.dll","GetBestRoute2",7},{"dhcpcsvc.dll","DhcpCApiInitialize",1},{"dhcpcsvc.dll","DhcpCApiCleanup",0},
         {"dhcpcsvc.dll","DhcpRequestParams",9,(1U<<4)|(1U<<5)},{"iphlpapi.dll","GetBestInterface",2},{"iphlpapi.dll","GetBestInterfaceEx",2},{"iphlpapi.dll","NotifyAddrChange",2},
-        {"iphlpapi.dll","CancelIPChangeNotify",1},
+        {"iphlpapi.dll","NotifyRouteChange",2},{"iphlpapi.dll","CancelIPChangeNotify",1},
         {"iphlpapi.dll","SendARP",4,0,0,3},{"iphlpapi.dll","GetIpNetTable",3,0,0,4},
     };return table;
 }
@@ -491,11 +517,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& 
         arg.return_to(state,result);return std::nullopt;
     }
     if(service.symbol=="GetOverlappedResult" || service.symbol=="GetOverlappedResultEx")return invoke_overlapped_result(state,memory,service);
-    if(service.symbol=="NotifyAddrChange" || service.symbol=="CancelIPChangeNotify"){
+    if(service.symbol=="NotifyAddrChange" || service.symbol=="NotifyRouteChange" || service.symbol=="CancelIPChangeNotify"){
         const auto bits=static_cast<std::uint8_t>(x86_?32:64);const auto unit=x86_?4U:8U;
         if(!runtime_.network.external_io)throw HostCallFault("compare 不支援原生網路變更監聽");
         try {
-            if(service.symbol=="NotifyAddrChange"){
+            // NotifyRouteChange 與 NotifyAddrChange 同一套非同步通知（OVERLAPPED、事件、CancelIPChangeNotify），比較的是 IPv4 路由表快照。
+            const bool routes=service.symbol=="NotifyRouteChange";
+            if(service.symbol!="CancelIPChangeNotify"){
                 if(!arg(0) && !arg(1))result=50; // 同步 API 尚未提供；非同步通知使用共用客體排程器。
                 else if(!arg(0) || !arg(1))result=87;
                 else {
@@ -506,9 +534,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& 
                     if(old!=address_notifications_.end() && old->second.pending)result=87;
                     else if(event && (e==runtime_.wait_objects.end() || e->second.kind!=WaitObject::Kind::Event))result=87;
                     else if(address_notifications_.size()>=1024 && old==address_notifications_.end())result=8;
-                    else if(const auto snapshot=ipv4_snapshot()){
+                    else if(const auto snapshot=routes?ipv4_route_snapshot():ipv4_snapshot()){
                         const auto handle=old==address_notifications_.end()?next_address_notification_++:old->first;
-                        address_notifications_[handle]={arg(1),event,*snapshot,true};
+                        address_notifications_[handle]={arg(1),event,*snapshot,true,routes};
                         memory.store(GuestAddress{arg(1)},bits,0x103);memory.store(GuestAddress{arg(1)+unit},bits,0);memory.store(GuestAddress{arg(0)},bits,handle);
                         if(e!=runtime_.wait_objects.end())e->second.set_signal(false);result=997;
                     }else result=232;
@@ -520,7 +548,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& 
                 else {auto& watch=found->second;memory.store(GuestAddress{watch.overlapped},bits,0xc0000120U);watch.pending=false;
                     if(const auto e=runtime_.wait_objects.find(watch.event);e!=runtime_.wait_objects.end())e->second.set_signal(true);result=1;}
             }
-        }catch(const MemoryFault&){if(service.symbol=="NotifyAddrChange")result=87;else result=0;last_error_=87;}
+        }catch(const MemoryFault&){if(service.symbol!="CancelIPChangeNotify")result=87;else result=0;last_error_=87;}
         arg.return_to(state,result);return std::nullopt;
     }
     const auto symbol=service.symbol;
@@ -899,4 +927,5 @@ std::optional<std::uint32_t> WindowsServices::invoke_network_config(GuestState& 
     arg.return_to(state,result);return std::nullopt;
 }
 #include "iphelper_extras.inc"
+#include "iphelper_notifications.inc"
 }

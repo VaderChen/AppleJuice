@@ -92,7 +92,8 @@ func (a *App) engineEnvironmentLocked() ([]string, error) {
 	if a.library.SpatialHeadphones {
 		spatial = "1"
 	}
-	environment = append(environment, "X64ARM_AUDIO_ENVIRONMENT="+spatial)
+	environment = append(environment, "X64ARM_AUDIO_ENVIRONMENT="+spatial,
+		"X64ARM_PRESENTATION_OPTIONS="+a.presentationOptionsPath())
 	// 正常執行固定使用主螢幕桌面 1；只有測試才使用背景桌面。
 	space := a.windowSpaceUUID
 	if !a.windowSpaceTesting && space != "" {

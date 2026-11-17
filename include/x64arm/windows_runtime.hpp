@@ -435,6 +435,7 @@ struct EventProviderRegistration {
 };
 struct DirectorySearch {
     bool streams{};
+    bool names{}; // FindFirstFileNameW：entries 為硬連結的磁碟區相對路徑
     std::vector<DirectoryEntry> entries;
     std::size_t cursor{};
     bool operator==(const DirectorySearch&) const = default;

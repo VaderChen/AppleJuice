@@ -1,8 +1,8 @@
 package main
 
 /*
-#cgo CFLAGS: -x objective-c -fobjc-arc
-#cgo LDFLAGS: -framework Cocoa -framework WebKit -framework UniformTypeIdentifiers -framework CoreText
+#cgo CFLAGS: -x objective-c -fobjc-arc -mmacosx-version-min=13.0
+#cgo LDFLAGS: -mmacosx-version-min=13.0 -framework Cocoa -framework WebKit -framework UniformTypeIdentifiers -framework CoreText
 #include <stdlib.h>
 #include <stdint.h>
 uint64_t launcher_physical_memory(void);

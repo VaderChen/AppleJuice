@@ -289,10 +289,10 @@ public:
     // 合併後的延伸描述表（runtime_service_descriptors() 的來源）。
     static std::span<const WindowsServiceDescriptor> runtime_service_table();
     static constexpr std::size_t output_limit = 16U * 1024U * 1024U;
-    static constexpr GuestAddress command_line_address{0x3001000000ULL}; // x64 系統區塊位於 MMU 視窗內（見 GuestMemory::native_mmu_window）。
+    static constexpr GuestAddress command_line_address{windows_address_layout::process_x64.command_line};
     // 程序堆積的 handle 與 Windows 相同是可讀的 heap 開頭位址（PEB.ProcessHeap、GetProcessHeap）；固定在 KUSER 頁下方、
     // 2 GiB 以內（x86／x64 共用，客體常式可用 imm32 比較），開頭維持 Windows 10 相容的簽章、Flags 與 ForceFlags 欄位。
-    static constexpr std::uint64_t process_heap = 0x7ffd0000;
+    static constexpr std::uint64_t process_heap = windows_address_layout::process_heap;
     void write_heap_header(GuestMemory& memory,std::uint64_t address,std::uint32_t flags);
     void initialize(GuestMemory& memory, std::u16string_view command_line, const std::filesystem::path& filesystem_root = {}, const std::filesystem::path& c_drive = {}, bool writable_files = false, const std::filesystem::path& install_root = {}, const std::map<char,std::filesystem::path>& drives = {}, std::string_view certificate_roots_file = {}, bool resident_translation = false);
     bool uses_guard_fast_path() const noexcept {return guard_fast_code_.value!=0;}
@@ -588,6 +588,8 @@ private:
         std::array<std::uint8_t,16> setting{};
         std::vector<NativePowerEvent> pending;
         bool settings{},closing{},user32{};
+        // PowerRegisterForEffectivePowerModeNotifications：依省電狀態換算 EFFECTIVE_POWER_MODE，模式改變才回呼。
+        bool effective{};std::optional<std::uint32_t> mode;
     };
     std::map<std::uint64_t,PowerNotification> power_notifications_;
     std::shared_ptr<NativePowerNotifications> power_notification_backend_;
@@ -666,6 +668,8 @@ private:
     std::uint64_t shared_user_tick_{UINT64_MAX};
     std::uint32_t process_parent_id() const;
     std::uint32_t capture_process_snapshot(GuestMemory&,std::vector<ProcessSnapshot::Process>&);
+    // session 內程序的映像完整 DOS 路徑（本程序直接取，其他程序以遠端資訊查詢 NT 路徑後換回磁碟代號）；程序不存在時 1168。
+    std::uint32_t process_image_path(GuestMemory&,std::uint32_t,std::u16string&);
     std::uint32_t capture_thread_snapshot(GuestMemory&,std::vector<ProcessSnapshot::Thread>&);
     std::vector<ProcessSnapshot::Thread> local_thread_snapshot();
     struct KernelModuleRecord {std::uint64_t base{},size{};std::uint32_t references{};std::u16string path;};
@@ -1547,13 +1551,13 @@ private:
     bool invoke_parallel_crt_format(GuestState&,GuestMemory&,std::uint64_t);
     static constexpr GuestAddress unresolved_base{windows_address_layout::x64.unresolved};
     std::vector<std::string> unresolved_imports_;
-    static constexpr GuestAddress runtime_base{0x3002000000ULL};
-    static constexpr GuestAddress teb_base{0x3004000000ULL};
-    static constexpr GuestAddress peb_base{0x3004010000ULL};
+    static constexpr GuestAddress runtime_base{windows_address_layout::process_x64.runtime};
+    static constexpr GuestAddress teb_base{windows_address_layout::process_x64.teb};
+    static constexpr GuestAddress peb_base{windows_address_layout::process_x64.peb};
     static constexpr GuestAddress callback_return{windows_address_layout::x64.callbacks};
     static constexpr GuestAddress startup_entry{callback_return.value+0x10};
     static constexpr GuestAddress exception_entry{callback_return.value+0x20};
-    static constexpr GuestAddress exception_base{0x3005000000ULL};
+    static constexpr GuestAddress exception_base{windows_address_layout::process_x64.exceptions};
     ExceptionState exceptions_;
     static constexpr GuestAddress thread_return{callback_return.value+0x30}, thread_start{callback_return.value+0x40};
     static constexpr GuestAddress process_exit_retry{callback_return.value+0x50};
@@ -1776,7 +1780,7 @@ private:
     std::uint64_t next_registry_notification_{1},registry_poll_time_{};
     void poll_registry_notifications(bool reload=true,std::u16string_view mutation={},std::uint32_t filter=0,GuestMemory* memory=nullptr);
     struct RegisteredWait {
-        std::uint64_t target{},callback{},parameter{},worker{},deadline{},completion_event{},timer_owner{},pool_instance{},power_owner{},etw_operation{},device_owner{},perflib_operation{},bluetooth_delivery{},pdh_query{};
+        std::uint64_t target{},callback{},parameter{},worker{},deadline{},completion_event{},timer_owner{},pool_instance{},power_owner{},etw_operation{},device_owner{},perflib_operation{},bluetooth_delivery{},pdh_query{},mib_owner{};
         // 共用 100 ns 間隔，避免 PDH 的 DWORD 秒數在轉成 DWORD 毫秒時溢位。
         std::uint64_t interval_ticks{UINT64_MAX};
         std::vector<GuestCallback> callback_batch;
@@ -2502,8 +2506,7 @@ private:
     // x64 與原生 MMU 視窗（64 TiB）一致：超出視窗的位址每次存取都走受檢 helper，常駐 worker 須回協調者
     // 單步執行。Chromium PartitionAlloc 依 47 位元隨機提示保留記憶體池，上限較低時提示失敗會改選其他位址。
     std::uint64_t user_address_limit() const noexcept {
-        return x86_?(runtime_.image.large_address_aware?UINT64_C(0xffff0000):UINT64_C(0x7fff0000)):
-            std::min<std::uint64_t>(UINT64_C(0x7fffffff0000),GuestMemory::native_mmu_window-0x10000);
+        return windows_address_layout::user_limit(x86_?ExecutionMode::X86:ExecutionMode::X64,runtime_.image.large_address_aware);
     }
     std::uint64_t crt_stream(std::uint64_t pointer) const noexcept {
         const auto base=runtime_base_.value+0x800;
@@ -2635,6 +2638,21 @@ private:
     std::optional<std::uint32_t> invoke_shlwapi_string(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_shlwapi_misc(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_shell_paths(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_shell_utilities(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_url_download(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_ole_wrappers(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_file_links(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_power_schemes(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_ole_picture(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    // oleaut32 StdPicture：type 為 PICTYPE_*（-1 未初始化），尺寸為 HIMETRIC；WMF 另存 placeable 標頭的邏輯範圍；format 為原始檔格式。
+    struct OlePicture {
+        std::uint32_t references{1};std::int16_t type{-1};std::uint64_t handle{},palette{},current_dc{};
+        std::int32_t width{},height{},logical_width{},logical_height{};
+        bool own{},keep_original{true},dirty{},transparent{};std::uint32_t format{};std::vector<std::uint8_t> original;
+        bool operator==(const OlePicture&) const = default;
+    };
+    std::map<std::uint64_t,OlePicture> ole_pictures_;
+    std::array<std::uint64_t,3> ole_picture_vtables_{};
     std::optional<std::uint32_t> invoke_path_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_debug_print(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_url(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
@@ -2686,13 +2704,37 @@ private:
     std::uint32_t read_power_reason(GuestMemory&,std::uint64_t,std::u16string&)const;
     std::uint64_t coalesce_waitable_timer(const WaitObject&)const;
     void cancel_waitable_timer_apcs(std::uint64_t);
-    struct AddressNotification {std::uint64_t overlapped{},event{};std::vector<std::uint8_t> snapshot;bool pending{true};};
+    // routes：NotifyRouteChange（IPv4 路由表快照），否則 NotifyAddrChange（IPv4 位址快照）。
+    struct AddressNotification {std::uint64_t overlapped{},event{};std::vector<std::uint8_t> snapshot;bool pending{true},routes{};};
     std::map<std::uint64_t,AddressNotification> address_notifications_;
     std::uint64_t next_address_notification_{0xb0000},address_poll_time_{};
+    // NotifyIpInterfaceChange／NotifyRouteChange2／NotifyUnicastIpAddressChange：註冊時記下基準列，輪詢時比較穩定欄位，
+    // 每個註冊同一時間只派送一個回呼（工作執行緒上的 RegisteredWait，mib_owner 指回註冊）。
+    struct MibNotification {
+        std::uint32_t kind{}; // 0 IP 介面、1 路由、2 單播位址
+        std::uint16_t family{};
+        std::uint64_t callback{},context{},work{},payload{};
+        // closing：已取消；waiter：取消者正等待執行中的回呼結束，由取消者移除，否則回呼結束時移除。
+        bool closing{},waiter{};
+        std::map<std::vector<std::uint8_t>,std::vector<std::uint8_t>> rows;
+        struct Event {std::uint32_t type{};std::vector<std::uint8_t> row;bool operator==(const Event&) const = default;};
+        std::vector<Event> pending;
+        bool operator==(const MibNotification&) const = default;
+    };
+    std::map<std::uint64_t,MibNotification> mib_notifications_;
+    // urlmon 下載交給 IBindStatusCallback 的 IBinding（Abort、優先權與結束結果）。
+    struct UrlBinding {std::uint32_t references{1},result{};std::int32_t priority{};bool aborted{},completed{};bool operator==(const UrlBinding&) const = default;};
+    std::map<std::uint64_t,UrlBinding> url_bindings_;
+    std::uint64_t url_binding_vtable_{};
+    std::uint64_t next_mib_notification_{0xb8000},mib_poll_time_{};
+    void poll_mib_notifications(GuestMemory&);
+    void finish_mib_notification(GuestState&,GuestMemory&,std::uint64_t);
     bool address_notification_waiting() const;
     void poll_address_notifications(GuestMemory&);
     std::uint32_t tcp_table_call(GuestMemory&,const WindowsCall&,std::string_view);
     std::uint32_t udp_table_call(GuestMemory&,const WindowsCall&,std::string_view);
+    // GetOwnerModuleFromTcpEntry／Tcp6Entry／UdpEntry／Udp6Entry／PidAndInfo：依列中的 dwOwningPid 回報程序映像名稱與路徑。
+    std::uint32_t owner_module_call(GuestMemory&,const WindowsCall&,std::string_view);
     std::optional<std::uint32_t> invoke_network_config(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_tls(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_digest(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);

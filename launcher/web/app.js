@@ -381,14 +381,14 @@ async function startProgram(id) {
 }
 async function stopProgram(id) { applyState(await api('stop', { id })); }
 $('save').onclick = () => perform(async () => { const id = state.selected; const next = await api('save', { id, settings: readSettings() }); drafts.delete(id); applyState(next); toast(selected()?.temporary ? t('本次設定已套用') : t('此程式的設定已儲存')); });
-// 主畫面與設定頁共用全域音訊偏好；下次啟動生效，不保存個別程式的其他草稿。
+// 主畫面與設定頁共用全域音訊偏好；新啟動的程式與子程序讀取最新值，不保存其他草稿。
 $('spatial-headphones-quick').onchange = () => {
   const enabled = $('spatial-headphones-quick').checked;
   return perform(async () => applyState(await api('saveGlobalSettings', {
     globalSettings: { ...state.globalSettings, spatialHeadphones: enabled }
   })));
 };
-// 執行頁的顯示開關：切換即寫入此程式的設定，只更新這兩項，不連帶儲存「程式設定」頁尚未儲存的草稿；於下次啟動生效。
+// 顯示開關切換即保存；新啟動的子程序也會讀取最新設定，已執行的程式於重啟後生效。
 for (const id of ['present-upscale', 'present-interpolation']) $(id).onchange = () => perform(async () => {
   const p = selected(); if (!p) return;
   const display = { presentUpscale: $('present-upscale').checked, presentInterpolation: $('present-interpolation').checked };

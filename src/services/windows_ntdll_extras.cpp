@@ -14,9 +14,14 @@
 //   未配置 STATUS_INVALID_ADDRESS，私有記憶體（非檔案映射）STATUS_CONFLICTING_ADDRESSES；沿用 GetMappedFileName 的映射查詢。
 // - kernel32 Heap32First／Heap32Next：以 HeapWalk 列舉目前程序堆積的使用中與空閒區塊；HEAPENTRY32.dwResvd 保存目前序號，
 //   Heap32Next 依此從頭找下一個。其他程序為 ERROR_ACCESS_DENIED，結束為 ERROR_NO_MORE_FILES。
+// - ApiSetQueryApiSetPresence／Ex：與 IsApiSetImplemented 同一張 API Set 對應表；IsInSchema 為表中有對應，Present 再要求承接模組已內建。
+// - NtAlertMultipleThreadByThreadId（Zw*）：對 MultipleThreadId 陣列逐一呼叫 NtAlertThreadByThreadId，回傳第一個失敗狀態。
+// - RtlQueryPackageIdentity：沙箱程序沒有 MSIX 套件身分，與 GetCurrentPackageFullName 一致回 STATUS_NOT_FOUND，Packaged 為 FALSE。
+// - NtSetInformationVirtualMemory（Zw*）：VmPrefetchInformation（0）轉 PrefetchVirtualMemory（旗標 ULONG 必須為 0）；其他類別 STATUS_INVALID_INFO_CLASS。
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
+#include "x64arm/windows_api_sets.hpp"
 #include <openssl/evp.h>
 #include <algorithm>
 
@@ -39,7 +44,10 @@ std::span<const WindowsServiceDescriptor> ntdll_extras_service_descriptors(){
         {"ntdll.dll","RtlSetSearchPathMode",1,0,0,0x1},
         {"ntdll.dll","RtlCreateServiceSid",3},{"ntdll.dll","RtlDeriveCapabilitySidsFromName",3},{"ntdll.dll","RtlFindMessage",5,0,0,0xe},
         {"ntdll.dll","RtlPushFrame",1},{"ntdll.dll","RtlPopFrame",1},{"ntdll.dll","RtlGetFrame",0},{"ntdll.dll","RtlGetCurrentTransaction",0},{"ntdll.dll","RtlSetCurrentTransaction",1},
-        {"ntdll.dll","NtAreMappedFilesTheSame",2},{"ntdll.dll","ZwAreMappedFilesTheSame",2},{"kernel32.dll","Heap32First",3},{"kernel32.dll","Heap32Next",1}};
+        {"ntdll.dll","NtAreMappedFilesTheSame",2},{"ntdll.dll","ZwAreMappedFilesTheSame",2},{"kernel32.dll","Heap32First",3},{"kernel32.dll","Heap32Next",1},
+        {"ntdll.dll","ApiSetQueryApiSetPresence",2},{"ntdll.dll","ApiSetQueryApiSetPresenceEx",3},
+        {"ntdll.dll","NtAlertMultipleThreadByThreadId",4,0,0,0xa},{"ntdll.dll","ZwAlertMultipleThreadByThreadId",4,0,0,0xa},{"ntdll.dll","RtlQueryPackageIdentity",6},
+        {"ntdll.dll","NtSetInformationVirtualMemory",6,0,0,0x22},{"ntdll.dll","ZwSetInformationVirtualMemory",6,0,0,0x22}};
     return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_ntdll_extras(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -64,6 +72,43 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_extras(GuestState& st
         // TEB_ACTIVE_FRAME 串列與目前交易 handle：只讀寫目前執行緒的 TEB 欄位。
         const auto active_frame=teb+(x86_?0xfb0U:0x17c0U),current_transaction=teb+(x86_?0xfacU:0x17b8U);
         if(name=="RtlGetFrame")co_return done(m.load(GuestAddress{active_frame},bits));
+        if(name=="ApiSetQueryApiSetPresence" || name=="ApiSetQueryApiSetPresenceEx"){
+            // (PCUNICODE_STRING Namespace, [PBOOLEAN IsInSchema,] PBOOLEAN Present)
+            const bool extended=name.ends_with("Ex");const auto present_at=call(extended?2:1),schema_at=extended?call(1):0;
+            if(!call(0) || !present_at || (extended && !schema_at))co_return done(status_invalid_parameter);
+            const auto length=static_cast<std::uint32_t>(m.load(GuestAddress{call(0)},16));const auto buffer=m.load(GuestAddress{call(0)+unit},bits);
+            if(length%2 || length>512 || (length && !buffer))co_return done(status_invalid_parameter);
+            std::string contract;for(std::uint32_t i=0;i<length;i+=2){auto c=static_cast<char16_t>(m.load(GuestAddress{buffer+i},16));if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);
+                if(c>0x7f)co_return done(status_invalid_parameter);contract.push_back(static_cast<char>(c));}
+            if(!contract.ends_with(".dll"))contract+=".dll";
+            const auto host=windows_api_set_host(contract);const bool in_schema=(contract.starts_with("api-ms-") || contract.starts_with("ext-ms-")) && host!=contract;
+            m.store(GuestAddress{present_at},8,in_schema && builtin_module(host)?1U:0U);if(extended)m.store(GuestAddress{schema_at},8,in_schema?1U:0U);
+            co_return done(0);
+        }
+        if(name=="AlertMultipleThreadByThreadId"){
+            const auto ids=call(0);const auto count=static_cast<std::uint32_t>(call(1));
+            if(count && !ids)co_return done(status_invalid_parameter);if(count>1024)co_return done(status_invalid_parameter);
+            std::uint32_t status=0;
+            for(std::uint32_t i=0;i<count;++i){const auto id=m.load(GuestAddress{ids+std::uint64_t{i}*unit},bits);
+                const auto result=static_cast<std::uint32_t>(co_await win32("ntdll.dll","NtAlertThreadByThreadId",{id}));if(result && !status)status=result;}
+            co_return done(status);
+        }
+        if(name=="RtlQueryPackageIdentity"){
+            // (TokenObject, PackageFullName, PackageSize*, AppId, AppIdSize*, Packaged*)
+            if(call(5))m.store(GuestAddress{call(5)},8,0);
+            co_return done(0xc0000225U); // STATUS_NOT_FOUND
+        }
+        if(name=="SetInformationVirtualMemory"){
+            // (ProcessHandle, VmInformationClass, NumberOfEntries, VirtualAddresses, VmInformation, VmInformationLength)
+            const auto kind=static_cast<std::uint32_t>(call(1)),length=static_cast<std::uint32_t>(call(5));
+            if(kind!=0)co_return done(0xc0000003U); // STATUS_INVALID_INFO_CLASS
+            if(length!=4)co_return done(0xc0000004U); // STATUS_INFO_LENGTH_MISMATCH
+            if(!call(4))co_return done(status_invalid_parameter);
+            const auto flags=static_cast<std::uint32_t>(m.load(GuestAddress{call(4)},32));if(flags)co_return done(status_invalid_parameter);
+            if(co_await win32("kernel32.dll","PrefetchVirtualMemory",{call(0),call(2),call(3),0})&UINT32_MAX)co_return done(0);
+            const auto error=last_error();
+            co_return done(error==5?status_access_denied:error==6?status_invalid_handle:error==8?status_no_memory:error==50?0xc00000bbU:status_invalid_parameter);
+        }
         if(name=="RtlPushFrame"){if(call(0)){m.store(GuestAddress{call(0)+unit},bits,m.load(GuestAddress{active_frame},bits));m.store(GuestAddress{active_frame},bits,call(0));}co_return done(0);}
         if(name=="RtlPopFrame"){if(call(0))m.store(GuestAddress{active_frame},bits,m.load(GuestAddress{call(0)+unit},bits));co_return done(0);}
         if(name=="RtlGetCurrentTransaction")co_return done(m.load(GuestAddress{current_transaction},bits));

@@ -286,7 +286,7 @@ void WindowsServices::map_shared_user_data(GuestMemory& memory) {
     for(std::size_t i=0;i<features.size();++i){put(xstate+0x18+i*8,4,features[i].first);put(xstate+0x1c+i*8,4,features[i].second);put(xstate+0x22c+i*4,4,features[i].second);}
     put(xstate+0x228,4,virtual_xsave_bytes);                    // AllFeatureSize
     put(xstate+0x340,4,virtual_xsave_bytes);                    // AllNonLargeFeatureSize
-    memory.map(GuestAddress{0x7ffe0000},page.size(),permission(Access::Read),page);
+    memory.map(GuestAddress{windows_address_layout::shared_user_data},page.size(),permission(Access::Read),page);
     shared_user_tick_=UINT64_MAX;
     // 程序堆積的開頭頁：與 Windows 相同，handle 指向可讀寫的 heap 結構（程序堆積為可成長、非私有）。
     memory.map(GuestAddress{process_heap},GuestMemory::guest_page_size,permission(Access::Read)|permission(Access::Write),std::vector<std::uint8_t>(GuestMemory::guest_page_size));
@@ -588,8 +588,9 @@ void WindowsServices::initialize(GuestMemory& memory, std::u16string_view comman
     callback_return_=GuestAddress{layout.callbacks};startup_entry_=GuestAddress{layout.callbacks+0x10};exception_entry_=GuestAddress{layout.callbacks+0x20};
     thread_return_=GuestAddress{layout.callbacks+0x30};thread_start_=GuestAddress{layout.callbacks+0x40};process_exit_retry_=GuestAddress{layout.callbacks+0x50};
     if (x86_) {
-        command_line_address_ = GuestAddress{0x70000000}; runtime_base_ = GuestAddress{0x70010000};
-        teb_base_ = GuestAddress{0x70200000}; peb_base_ = GuestAddress{0x70210000}; exception_base_ = GuestAddress{0x70300000};
+        const auto process_layout=windows_address_layout::process_for_mode(ExecutionMode::X86);
+        command_line_address_ = GuestAddress{process_layout.command_line}; runtime_base_ = GuestAddress{process_layout.runtime};
+        teb_base_ = GuestAddress{process_layout.teb}; peb_base_ = GuestAddress{process_layout.peb}; exception_base_ = GuestAddress{process_layout.exceptions};
         next_allocation_ = 0x10000000; runtime_.next_virtual = 0x30000000; runtime_.next_module_base = 0x50000000;
     }
     // 配置政策實驗：從低位址空洞搜尋，讓完整頁可使用既有直接頁表。
