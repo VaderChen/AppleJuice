@@ -275,12 +275,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 }result=1;
             }else if(symbol=="InternetOpenUrl"){
                 require(HttpHandle::Kind::Session);if(!arg(1))throw HttpError{87};
-                if(d(4)&~0x85e80300U)throw HttpError{50};
+                if(d(4)&~0x85e83300U)throw HttpError{50};
                 auto pending=object.opening.find(threads_.current);std::uint64_t id=0;
                 if(pending==object.opening.end()){
                     HttpHandle request;request.kind=HttpHandle::Kind::Request;request.inet=inet;request.cache_flags=d(symbol=="InternetOpenUrl"?4:6);request.parent=arg(0);request.input=object.input;request.input.url=ansi?read_ansi(memory,arg(1)):utf16_to_utf8(text(arg(1)));request.input.method="GET";request.context=arg(5);request.input.follow_redirects=!(d(4)&0x200000U);
+                    request.input.certificate_exceptions|=d(4)&0x3000U;
                     const auto authority=request.input.url.find("://");const auto path_at=authority==std::string::npos?authority:request.input.url.find('/',authority+3);request.path=path_at==std::string::npos?"/":request.input.url.substr(path_at);
-                    const auto scheme=request.input.url.substr(0,request.input.url.find(':'));if(lower(scheme)!="http" && lower(scheme)!="https")throw HttpError{12006};
+                    const auto scheme=request.input.url.substr(0,request.input.url.find(':'));if(lower(scheme)!="http" && lower(scheme)!="https")throw HttpError{12006};request.secure=lower(scheme)=="https";
                     if((d(4)&0x800000U) && lower(scheme)!="https")throw HttpError{12005};
                     if(!object.agent.empty())request.input.headers.emplace_back("User-Agent",object.agent);if(arg(2))add_headers(request.input.headers,text(arg(2),d(3)),0x20000000);
                     if(d(4)&0x80000100U)request.input.headers.emplace_back("Cache-Control","no-cache");
@@ -296,7 +297,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 const bool setting=symbol=="InternetSetOption";const auto option=d(1);const bool timeout=option==2 || option==5 || option==6;
                 const unsigned timeout_index=option==2?1:option==5?2:3;
                 const bool string=option==41 || option==28 || option==29;
-                if(!timeout && option!=45 && option!=9 && !string)throw HttpError{12009};
+                if(!timeout && option!=45 && option!=9 && option!=31 && !string)throw HttpError{12009};
+                if(option==31)require(HttpHandle::Kind::Request);
                 if(option==41)require(HttpHandle::Kind::Session);
                 if(option==28 || option==29)require(HttpHandle::Kind::Connection);
                 if(setting){
@@ -310,6 +312,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                         const auto width=option==45?unit:4U;if(d(3)!=width)throw HttpError{12010};
                         const auto value=memory.load(GuestAddress{arg(2)},static_cast<std::uint8_t>(width*8));
                         if(timeout){if(value>INT32_MAX && value!=UINT32_MAX)throw HttpError{87};object.input.timeouts[timeout_index]=static_cast<std::int32_t>(value);}
+                        else if(option==31){if(value&~0x70003381U)throw HttpError{87};object.input.certificate_exceptions=static_cast<std::uint32_t>(value)&0x3380U;}
                         else object.context=value;
                     }
                 }else{
@@ -319,7 +322,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                         const auto& value=option==41?object.agent:option==28?object.input.username:object.input.password;
                         if(ansi){const auto narrow=option==41?value:latin(utf8_to_utf16(value));bytes.assign(narrow.begin(),narrow.end());bytes.push_back(0);}else bytes=utf16_bytes(option==41?wide_latin(value):utf8_to_utf16(value));
                     }else{
-                        const auto value=timeout?static_cast<std::uint32_t>(object.input.timeouts[timeout_index]):option==45?object.context:object.kind==HttpHandle::Kind::Session?1U:object.kind==HttpHandle::Kind::Connection?4U:13U;
+                        const auto value=timeout?static_cast<std::uint32_t>(object.input.timeouts[timeout_index]):option==45?object.context:option==31?object.input.certificate_exceptions|(object.secure?1U:0U):object.kind==HttpHandle::Kind::Session?1U:object.kind==HttpHandle::Kind::Connection?4U:13U;
                         bytes.resize(option==45?unit:4U);for(unsigned i=0;i<bytes.size();++i)bytes[i]=static_cast<std::uint8_t>(value>>(i*8));
                     }
                     if(!arg(2) || capacity<bytes.size()){memory.store(GuestAddress{arg(3)},32,bytes.size());throw HttpError{122};}
@@ -335,7 +338,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 if((inet?(d(5)!=3 || d(6)!=0):d(3)!=0) || !arg(1) || d(2)>65535)throw HttpError{87};HttpHandle connection;connection.kind=HttpHandle::Kind::Connection;connection.parent=arg(0);connection.inet=inet;connection.context=object.context;connection.input=object.input;connection.agent=object.agent;connection.host=utf16_to_utf8(text(arg(1)));connection.port=static_cast<std::uint16_t>(d(2));if(inet){connection.context=arg(7);connection.input.username=utf16_to_utf8(text(arg(3)));connection.input.password=utf16_to_utf8(text(arg(4)));}
                 if(connection.host.empty() || connection.host.find_first_of("/@?# \r\n")!=std::string::npos)throw HttpError{12005};result=insert(std::move(connection));
             }else if(symbol=="WinHttpOpenRequest"){
-                require(HttpHandle::Kind::Connection);if(d(6)&~(inet?0x85e80300U:0x00800100U))throw HttpError{50};HttpHandle request;request.kind=HttpHandle::Kind::Request;request.inet=inet;request.cache_flags=d(symbol=="InternetOpenUrl"?4:6);request.parent=arg(0);request.context=object.context;request.agent=object.agent;request.input=object.input;request.secure=(d(6)&0x00800000U)!=0;if(inet){request.context=arg(7);request.input.follow_redirects=!(d(6)&0x200000U);}
+                require(HttpHandle::Kind::Connection);if(d(6)&~(inet?0x85e83300U:0x00800100U))throw HttpError{50};HttpHandle request;request.kind=HttpHandle::Kind::Request;request.inet=inet;request.cache_flags=d(symbol=="InternetOpenUrl"?4:6);request.parent=arg(0);request.context=object.context;request.agent=object.agent;request.input=object.input;request.secure=(d(6)&0x00800000U)!=0;if(inet){request.context=arg(7);request.input.follow_redirects=!(d(6)&0x200000U);request.input.certificate_exceptions|=d(6)&0x3000U;}
                 request.input.method=arg(1)?latin(text(arg(1))):"GET";if(!token(request.input.method))throw HttpError{87};
                 if(arg(3) && text(arg(3))!=u"HTTP/1.1")throw HttpError{50};request.path=arg(2)?utf16_to_utf8(text(arg(2))):"/";if(request.path.empty())request.path="/";if(request.path[0]!='/')request.path="/"+request.path;
                 const auto port=object.port?object.port:request.secure?443:80;auto host=object.host;if(host.find(':')!=std::string::npos && host.front()!='[')host="["+host+"]";

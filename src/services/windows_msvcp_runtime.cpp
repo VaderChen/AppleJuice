@@ -90,6 +90,8 @@ std::span<const WindowsServiceDescriptor> msvcp_runtime_service_descriptors(){
             rows.push_back({family,entry.name,entry.arguments,entry.wide,0,0,true});
         }
         for(const auto& wrapper:crt_wrappers)rows.push_back({"msvcp140.dll",wrapper.name,wrapper.arguments,0,0,0,true});
+        // msvcr110／msvcr120 的 A 版本在開頭多一個 _locale_t（用於碼頁為 0 時的預設，這裡沿用目前 LC_CTYPE）；其餘參數與 msvcp140 版本相同。
+        rows.push_back({"internal-crt-legacy","__crtCompareStringA",8,0,0,0,true});rows.push_back({"internal-crt-legacy","__crtLCMapStringA",9,0,0,0,true});
         // <random> 的 _XLgamma（float／double／long double）：x86 的 double 占兩個堆疊槽。
         rows.push_back({"msvcp140.dll","?_XLgamma@std@@YAMM@Z",1,0,0,0,true});rows.push_back({"msvcp140.dll","?_XLgamma@std@@YANN@Z",1,1,0,0,true});
         rows.push_back({"msvcp140.dll","?_XLgamma@std@@YAOO@Z",1,1,0,0,true});
@@ -296,33 +298,34 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvcp_runtime(GuestState& s
         }
         // __crtCompareStringA(locale, flags, s1, n1, s2, n2, 碼頁)、__crtLCMapStringA(locale, flags, src, n, dst, ndst, 碼頁, 嚴格)：
         // 依碼頁（0 為目前 LC_CTYPE）轉成 UTF-16 後交給 CompareStringEx／LCMapStringEx；LCMAP_SORTKEY 直接輸出位元組，其他映射結果轉回碼頁。
-        const bool compare=name=="__crtCompareStringA";const auto page=page_of(static_cast<std::uint32_t>(arg(6)));
+        const unsigned shift=service.family=="internal-crt-legacy"?1U:0U;const auto legacy_arg=[&](unsigned i){return arg(i+shift);};
+        const bool compare=name=="__crtCompareStringA";const auto page=page_of(static_cast<std::uint32_t>(legacy_arg(6)));
         const auto narrow=[&](std::uint64_t address,std::int32_t count)->std::optional<std::u16string>{
             if(!address)return std::nullopt;std::string bytes;
             if(count<0)bytes=read_ansi(memory,address,1U<<20);else{bytes.resize(static_cast<std::size_t>(count));memory.read(GuestAddress{address},std::span(reinterpret_cast<std::uint8_t*>(bytes.data()),bytes.size()));}
-            return windows_nls_decode(bytes,page,!compare && static_cast<std::uint32_t>(arg(7))!=0);
+            return windows_nls_decode(bytes,page,!compare && static_cast<std::uint32_t>(legacy_arg(7))!=0);
         };
         GuestScratch scratch(*this,memory,state);
         if(compare){
-            const auto left=narrow(arg(2),static_cast<std::int32_t>(arg(3))),right=narrow(arg(4),static_cast<std::int32_t>(arg(5)));
+            const auto left=narrow(legacy_arg(2),static_cast<std::int32_t>(legacy_arg(3))),right=narrow(legacy_arg(4),static_cast<std::int32_t>(legacy_arg(5)));
             if(!left || !right){last_error_=87;return done(0);}
             const auto first=scratch.text(*left),second=scratch.text(*right);if(!first || !second){last_error_=8;return done(0);}
-            return done(nested_service(state,memory,"kernel32.dll","CompareStringEx",{arg(0),arg(1),first,left->size(),second,right->size(),0,0,0}));
+            return done(nested_service(state,memory,"kernel32.dll","CompareStringEx",{legacy_arg(0),legacy_arg(1),first,left->size(),second,right->size(),0,0,0}));
         }
-        const auto source=narrow(arg(2),static_cast<std::int32_t>(arg(3)));if(!source){last_error_=1113;return done(0);}
-        const auto flags=static_cast<std::uint32_t>(arg(1));const auto input=scratch.text(*source);if(!input){last_error_=8;return done(0);}
-        const auto required=static_cast<std::int32_t>(nested_service(state,memory,"kernel32.dll","LCMapStringEx",{arg(0),flags,input,source->size(),0,0,0,0,0}));
+        const auto source=narrow(legacy_arg(2),static_cast<std::int32_t>(legacy_arg(3)));if(!source){last_error_=1113;return done(0);}
+        const auto flags=static_cast<std::uint32_t>(legacy_arg(1));const auto input=scratch.text(*source);if(!input){last_error_=8;return done(0);}
+        const auto required=static_cast<std::int32_t>(nested_service(state,memory,"kernel32.dll","LCMapStringEx",{legacy_arg(0),flags,input,source->size(),0,0,0,0,0}));
         if(required<=0)return done(0);
         const auto buffer=scratch.allocate(static_cast<std::size_t>(required)*2+2);if(!buffer){last_error_=8;return done(0);}
-        const auto produced=static_cast<std::int32_t>(nested_service(state,memory,"kernel32.dll","LCMapStringEx",{arg(0),flags,input,source->size(),buffer,static_cast<std::uint64_t>(required),0,0,0}));
+        const auto produced=static_cast<std::int32_t>(nested_service(state,memory,"kernel32.dll","LCMapStringEx",{legacy_arg(0),flags,input,source->size(),buffer,static_cast<std::uint64_t>(required),0,0,0}));
         if(produced<=0)return done(0);
         std::vector<std::uint8_t> bytes;
         if(flags&0x400U){bytes.resize(static_cast<std::size_t>(produced));memory.read(GuestAddress{buffer},bytes);}
         else {const auto mapped=read_utf16_counted(memory,GuestAddress{buffer},static_cast<std::size_t>(produced));const auto encoded=windows_nls_encode(mapped,page,false,"?");if(!encoded){last_error_=1113;return done(0);}bytes=encoded->bytes;}
-        const auto capacity=static_cast<std::int32_t>(arg(5));
+        const auto capacity=static_cast<std::int32_t>(legacy_arg(5));
         if(!capacity)return done(bytes.size());
         if(capacity<static_cast<std::int32_t>(bytes.size())){last_error_=122;return done(0);}
-        memory.write(GuestAddress{arg(4)},bytes);return done(bytes.size());
+        memory.write(GuestAddress{legacy_arg(4)},bytes);return done(bytes.size());
     }
     throw HostCallFault("未知的 STL C 輔助匯出");
 }

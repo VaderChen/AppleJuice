@@ -18,7 +18,61 @@ struct Reader {
     std::vector<std::uint8_t> data(std::size_t maximum){const auto size=number(4);if(size>maximum || size>bytes.size()-at)throw std::invalid_argument("服務目錄資料無效");std::vector<std::uint8_t> out(bytes.begin()+static_cast<std::ptrdiff_t>(at),bytes.begin()+static_cast<std::ptrdiff_t>(at+size));at+=size;return out;}
     std::u16string text(){const auto size=number(4);if(size>4096 || size>(bytes.size()-at)/2)throw std::invalid_argument("服務目錄字串無效");std::u16string out;for(std::size_t i=0;i<size;++i)out.push_back(static_cast<char16_t>(number(2)));return out;}
 };
+// 目錄機碼下的二進位值：記帳方式與 catalog 相同（總位元組 16 MiB、值數 4096 上限）。
+// LSP 應用程式類別是整台機器的目錄（HKLM），服務類別與服務登錄同在使用者目錄。
+const auto machine_index=std::u16string(1,u'\2')+u"\\software\\x64arm\\winsock-catalog";
+void store(RegistryState& state,const std::u16string& key_name,const std::u16string& name,std::vector<std::uint8_t> bytes){
+    auto& values=state.keys[key_name];const auto old=values.find(name);const auto previous=old==values.end()?0:old->second.bytes.size();
+    if(state.bytes<previous || state.bytes-previous+bytes.size()>16*1024*1024 || (old==values.end() && state.values>=4096))throw std::length_error("登錄檔容量不足");
+    state.bytes=state.bytes-previous+bytes.size();if(old==values.end())++state.values;values[name]={3,std::move(bytes),{}};
+    state.modified_times[key_name]=UINT64_C(116444736000000000)+static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()/100);
+}
+const RegistryValue* stored(const RegistryState& state,const std::u16string& key_name,const std::u16string& name){
+    const auto key=state.keys.find(key_name);if(key==state.keys.end())return nullptr;const auto value=key->second.find(name);if(value==key->second.end())return nullptr;
+    if(value->second.type!=3 || value->second.bytes.size()>limit)throw std::invalid_argument("Winsock 目錄值型別無效");return &value->second;
+}
 bool identity(const Record& a,const Record& b){return a.service_class==b.service_class && fold(a.name)==fold(b.name) && fold(a.context)==fold(b.context);}
+}
+std::vector<ServiceClass> load_classes(const RegistryState& state){
+    const auto* value=stored(state,index,u"classes");if(!value)return {};Reader r{value->bytes};
+    if(r.number(8)!=UINT64_C(0x31434e5741523458))throw std::invalid_argument("服務類別目錄版本無效");const auto count=r.number(4);if(count>1024)throw std::invalid_argument("服務類別目錄過大");
+    std::vector<ServiceClass> classes;
+    for(std::size_t i=0;i<count;++i){ServiceClass item;for(auto& c:item.id)c=static_cast<std::uint8_t>(r.number(1));item.name=r.text();const auto n=r.number(4);if(n>256)throw std::invalid_argument("服務類別項目過多");
+        for(std::size_t j=0;j<n;++j){ClassInfo info;info.name=r.text();info.namespace_id=static_cast<std::uint32_t>(r.number(4));info.value_type=static_cast<std::uint32_t>(r.number(4));info.value=r.data(65536);item.infos.push_back(std::move(info));}
+        if(std::any_of(classes.begin(),classes.end(),[&](const auto& other){return other.id==item.id;}))throw std::invalid_argument("服務類別重複");classes.push_back(std::move(item));}
+    if(r.at!=r.bytes.size())throw std::invalid_argument("服務類別目錄有多餘資料");return classes;
+}
+void save_classes(RegistryState& state,const std::vector<ServiceClass>& classes){
+    if(classes.size()>1024)throw std::length_error("服務類別目錄容量不足");std::vector<std::uint8_t> bytes;number(bytes,UINT64_C(0x31434e5741523458),8);number(bytes,classes.size(),4);
+    for(const auto& item:classes){bytes.insert(bytes.end(),item.id.begin(),item.id.end());text(bytes,item.name);if(item.infos.size()>256)throw std::length_error("服務類別項目過多");number(bytes,item.infos.size(),4);
+        for(const auto& info:item.infos){text(bytes,info.name);number(bytes,info.namespace_id,4);number(bytes,info.value_type,4);if(info.value.size()>65536)throw std::length_error("服務類別值過大");data(bytes,info.value);}}
+    store(state,index,u"classes",std::move(bytes));
+}
+std::vector<std::uint8_t> class_information(const ServiceClass& item,bool wide,bool x86,std::uint64_t base,std::uint32_t namespace_id){
+    // WSASERVICECLASSINFO：lpServiceClassId、lpszServiceClassName、dwCount、lpClassInfos；WSANSCLASSINFO：lpszName、dwNameSpace、dwValueType、dwValueSize、lpValue。
+    const unsigned unit=x86?4:8,fixed=x86?16:32,entry=x86?20:32;std::vector<const ClassInfo*> infos;
+    for(const auto& info:item.infos)if(!namespace_id || !info.namespace_id || info.namespace_id==namespace_id)infos.push_back(&info);
+    std::vector<std::uint8_t> bytes(fixed+entry*infos.size());
+    const auto set=[&](std::size_t at,std::uint64_t value,unsigned size){for(unsigned i=0;i<size;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(8*i));};
+    const auto append=[&](std::span<const std::uint8_t> value,unsigned alignment){while(bytes.size()%alignment)bytes.push_back(0);const auto at=bytes.size();bytes.insert(bytes.end(),value.begin(),value.end());return at;};
+    const auto string=[&](std::u16string_view value){if(wide)return append(utf16_bytes(value),2);const auto s=utf16_to_utf8(value);std::vector<std::uint8_t> narrow(s.begin(),s.end());narrow.push_back(0);return append(narrow,1);};
+    set(0,base+append(item.id,4),unit);set(unit,base+string(item.name),unit);set(2*unit,infos.size(),4);set(3*unit,infos.empty()?0:base+fixed,unit);
+    for(std::size_t i=0;i<infos.size();++i){const auto at=fixed+entry*i;const auto& info=*infos[i];
+        set(at,base+string(info.name),unit);set(at+unit,info.namespace_id,4);set(at+unit+4,info.value_type,4);set(at+unit+8,info.value.size(),4);
+        set(at+(x86?16:24),info.value.empty()?0:base+append(info.value,8),unit);}
+    return bytes;
+}
+std::vector<ApplicationCategory> load_categories(const RegistryState& state){
+    const auto* value=stored(state,machine_index,u"categories");if(!value)return {};Reader r{value->bytes};
+    if(r.number(8)!=UINT64_C(0x31504c5341523458))throw std::invalid_argument("LSP 類別目錄版本無效");const auto count=r.number(4);if(count>4096)throw std::invalid_argument("LSP 類別目錄過大");
+    std::vector<ApplicationCategory> items;
+    for(std::size_t i=0;i<count;++i){ApplicationCategory item;item.path=r.text();item.extra=r.text();item.categories=static_cast<std::uint32_t>(r.number(4));items.push_back(std::move(item));}
+    if(r.at!=r.bytes.size())throw std::invalid_argument("LSP 類別目錄有多餘資料");return items;
+}
+void save_categories(RegistryState& state,const std::vector<ApplicationCategory>& items){
+    if(items.size()>4096)throw std::length_error("LSP 類別目錄容量不足");std::vector<std::uint8_t> bytes;number(bytes,UINT64_C(0x31504c5341523458),8);number(bytes,items.size(),4);
+    for(const auto& item:items){text(bytes,item.path);text(bytes,item.extra);number(bytes,item.categories,4);}
+    store(state,machine_index,u"categories",std::move(bytes));
 }
 std::u16string fold(std::u16string_view text){std::u16string result(text);for(auto& c:result)c=unicode_case_unit(c,false);return result;}
 bool valid(const Address& a){

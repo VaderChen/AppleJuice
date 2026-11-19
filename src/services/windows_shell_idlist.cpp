@@ -5,6 +5,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
+#include "service_callback_task.hpp"
 
 namespace x64arm {
 namespace {
@@ -13,6 +14,9 @@ constexpr std::size_t idlist_limit=65536;
 }
 std::span<const WindowsServiceDescriptor> shell_idlist_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"shlwapi.dll","IStream_ReadPidl",2},{"shlwapi.dll","IStream_WritePidl",2},
+        {"shell32.dll","ILLoadFromStream",2},{"shell32.dll","ILSaveToStream",2},
+        {"windows.storage.dll","ILLoadFromStreamEx",2},
         {"shell32.dll","ILGetSize",1},{"shell32.dll","ILGetNext",1},{"shell32.dll","ILFindLastID",1},{"shell32.dll","ILRemoveLastID",1},
         {"shell32.dll","ILClone",1},{"shell32.dll","ILCloneFirst",1},{"shell32.dll","ILCombine",2},{"shell32.dll","ILAppendID",3,0,0,0x4},{"shell32.dll","ILIsEqual",2},
         {"shell32.dll","ILIsParent",3},{"shell32.dll","ILFindChild",2},{"shell32.dll","SHGetRealIDL",3},{"shell32.dll","SHSimpleIDListFromPath",1},
@@ -47,6 +51,72 @@ std::optional<std::u16string> WindowsServices::shell_pidl_path(GuestMemory& memo
 std::optional<std::uint32_t> WindowsServices::invoke_shell_idlist(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
+    const bool shlwapi=service.family=="shlwapi.dll";
+    if(shlwapi || name=="ILSaveToStream" || name=="ILLoadFromStream" || name=="ILLoadFromStreamEx"){
+        const bool read=name=="IStream_ReadPidl" || name=="ILLoadFromStream" || name=="ILLoadFromStreamEx";
+        return nested_continuation(state,memory,"PIDL 串流",[this,service,shlwapi,read](GuestState& s,GuestMemory& m)
+            ->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);
+            const auto stream=call(0),pidl=call(1);
+            const auto finish=[&](unsigned hr){call.return_to(s,hr);return std::optional<std::uint32_t>{};};
+            const unsigned width=x86_?4U:8U;
+            const auto bits=static_cast<std::uint8_t>(width*8);
+            if(read){
+                if(!pidl)co_return finish(pointer_error);
+                m.store(GuestAddress{pidl},bits,0);
+            }
+            if(!stream)co_return finish(invalid_argument);
+            const auto table=m.load(GuestAddress{stream},bits);
+            const auto method=m.load(GuestAddress{table+width*(read?3U:4U)},bits);
+            GuestScratch scratch(*this,m,s);
+            const auto header=scratch.allocate(8);
+            if(!header)co_return finish(out_of_memory);
+            const auto transfer=[&](std::uint64_t buffer,unsigned count)->service_callback::Task<unsigned>{
+                m.store(GuestAddress{header+4},32,0);
+                const auto hr=co_await service_callback::call(method,{stream,buffer,count,header+4});
+                if(hr&0x80000000U)co_return hr;
+                co_return m.load(GuestAddress{header+4},32)==count?0U:0x80004005U;
+            };
+            // shell32 使用 WORD 長度，shlwapi 使用 DWORD；兩者都包含最後的零長度項目。
+            const unsigned prefix=shlwapi?4U:2U;
+            const auto length_bits=static_cast<std::uint8_t>(8*prefix);
+            const unsigned limit=shlwapi?UINT32_MAX:UINT16_MAX;
+            auto scan=[&](std::uint64_t address,unsigned bound)->unsigned{
+                unsigned pos=0;
+                while(bound-pos>=2){
+                    const auto cb=static_cast<unsigned>(m.load(GuestAddress{address+pos},16));
+                    if(!cb)return pos+2;
+                    if(cb<2 || cb>bound-pos-2)break;
+                    pos+=cb;
+                }
+                return 0;
+            };
+            if(!read){
+                const unsigned length=pidl?scan(pidl,limit):0;
+                if(pidl && !length)co_return finish(invalid_argument);
+                m.store(GuestAddress{header},length_bits,length);
+                const auto hr=co_await transfer(header,prefix);
+                if(hr)co_return finish(hr);
+                co_return finish(co_await transfer(pidl,length));
+            }
+            const auto hr=co_await transfer(header,prefix);
+            if(hr)co_return finish(hr);
+            const auto length=static_cast<unsigned>(m.load(GuestAddress{header},length_bits));
+            if(!length && !shlwapi)co_return finish(0);
+            if(length<2)co_return finish(invalid_argument);
+            const auto result=nested_service(s,m,"ole32.dll","CoTaskMemAlloc",{length});
+            if(!result)co_return finish(out_of_memory);
+            auto status=co_await transfer(result,length);
+            if(!status && scan(result,length)!=length)status=invalid_argument;
+            if(status)(void)nested_service(s,m,"ole32.dll","CoTaskMemFree",{result});
+            else{
+                if(const auto path=shell_pidl_path(m,result);path && gui_.shell_pidls.size()<8192)
+                    gui_.shell_pidls[result]=*path;
+                m.store(GuestAddress{pidl},bits,result);
+            }
+            co_return finish(status);
+        });
+    }
     // 新的 PIDL：配置後若可解成絕對路徑就登錄，與 shell_make_pidl 建立的 PIDL 相同地被其他 Shell API 接受。
     const auto make=[&](const std::vector<std::uint8_t>& items)->std::uint64_t{
         const auto address=allocate_heap(memory,items.size()+2);if(!address)return 0;

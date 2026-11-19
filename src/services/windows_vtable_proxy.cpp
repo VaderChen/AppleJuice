@@ -2,14 +2,48 @@
 // 呼叫者放好的堆疊與暫存器（x86 stdcall 的雙槽 double、x64 的 XMM 浮點參數）原封不動，由方法本身返回與清理堆疊，
 // 因此本家族與 WIC 的內建物件或程式自行實作的介面都相容。
 #include "x64arm/windows_services.hpp"
+#include "service_callback_task.hpp"
 #include <algorithm>
 #include <string_view>
 
 namespace x64arm {
 namespace {
 // (DLL, 匯出名稱, vtable 索引（含 IUnknown 三個方法）, x86 引數槽數（含 this，double 佔兩槽）)。
-struct ProxyEntry {std::string_view dll,name;unsigned index,slots;};
+constexpr std::uint32_t avi_bad_handle=0x8004406cU;
+enum class AviConversion { none, file_info, stream_info, create_stream };
+struct ProxyEntry {
+    std::string_view dll,name;
+    unsigned index,slots;
+    std::uint32_t null_result=0x80004003U;
+    AviConversion conversion=AviConversion::none;
+};
 constexpr ProxyEntry entries[]{
+    {"avifil32.dll","AVIFileAddRef",1,1,0},
+    {"avifil32.dll","AVIFileRelease",2,1,0},
+    {"avifil32.dll","AVIFileInfoW",3,3,avi_bad_handle},
+    {"avifil32.dll","AVIFileGetStream",4,4,avi_bad_handle},
+    {"avifil32.dll","AVIFileCreateStreamW",5,3,avi_bad_handle},
+    {"avifil32.dll","AVIFileWriteData",6,4,avi_bad_handle},
+    {"avifil32.dll","AVIFileReadData",7,4,avi_bad_handle},
+    {"avifil32.dll","AVIFileEndRecord",8,1,avi_bad_handle},
+    {"avifil32.dll","AVIStreamAddRef",1,1,0},
+    {"avifil32.dll","AVIStreamRelease",2,1,0},
+    {"avifil32.dll","AVIStreamInfoW",4,3,avi_bad_handle},
+    {"avifil32.dll","AVIStreamFindSample",5,3,UINT32_MAX},
+    {"avifil32.dll","AVIStreamReadFormat",6,4,avi_bad_handle},
+    {"avifil32.dll","AVIStreamSetFormat",7,4,avi_bad_handle},
+    {"avifil32.dll","AVIStreamRead",8,7,avi_bad_handle},
+    {"avifil32.dll","AVIStreamWrite",9,8,avi_bad_handle},
+    {"avifil32.dll","AVIStreamReadData",11,4,avi_bad_handle},
+    {"avifil32.dll","AVIStreamWriteData",12,4,avi_bad_handle},
+    {"avifil32.dll","AVIStreamGetFrame",3,2,0},
+    {"avifil32.dll","AVIStreamGetFrameClose",2,1,0},
+    {"avifil32.dll","AVIFileInfo",3,3,avi_bad_handle,AviConversion::file_info},
+    {"avifil32.dll","AVIFileInfoA",3,3,avi_bad_handle,AviConversion::file_info},
+    {"avifil32.dll","AVIStreamInfo",4,3,avi_bad_handle,AviConversion::stream_info},
+    {"avifil32.dll","AVIStreamInfoA",4,3,avi_bad_handle,AviConversion::stream_info},
+    {"avifil32.dll","AVIFileCreateStream",5,3,avi_bad_handle,AviConversion::create_stream},
+    {"avifil32.dll","AVIFileCreateStreamA",5,3,avi_bad_handle,AviConversion::create_stream},
     {"windowscodecs.dll","IPropertyBag2_Write_Proxy",4,4},
     {"windowscodecs.dll","IWICBitmapClipper_Initialize_Proxy",8,3},
     {"windowscodecs.dll","IWICBitmapCodecInfo_DoesSupportAnimation_Proxy",18,2},
@@ -125,10 +159,51 @@ std::optional<std::uint32_t> WindowsServices::invoke_vtable_proxy(GuestState& st
     const std::uint8_t bits=x86_?32:64;
     try{
         // NULL 介面或 vtable 無效時回 E_POINTER，不轉成存取違規。
-        const auto object=arg(0);if(!object){arg.return_to(state,pointer_error);return std::nullopt;}
+        const auto object=arg(0);if(!object){arg.return_to(state,entry->null_result);return std::nullopt;}
         const auto table=memory.load(GuestAddress{object},bits);if(!table){arg.return_to(state,pointer_error);return std::nullopt;}
         const auto method=memory.load(GuestAddress{table+std::uint64_t{entry->index}*(bits/8)},bits);if(!method){arg.return_to(state,pointer_error);return std::nullopt;}
         if(!handles(GuestAddress{method}))memory.check(GuestAddress{method},1,Access::Execute);
+        if(entry->conversion!=AviConversion::none){
+            const auto conversion=entry->conversion;
+            return nested_continuation(state,memory,"AviInfo",[this,service,conversion,method](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall call(s,m,service);
+                const bool create=conversion==AviConversion::create_stream;
+                // A/W 結構只在末尾的 64 字元陣列寬度不同，之前的欄位均為固定寬度。
+                const unsigned prefix=conversion==AviConversion::file_info?44U:76U;
+                const unsigned wide_size=prefix+128;
+                const auto caller_buffer=call(create?2:1);
+                const auto finish=[&](std::uint64_t value){call.return_to(s,value);return std::optional<std::uint32_t>{};};
+                if(!create && static_cast<std::uint32_t>(call(2))<prefix+64)co_return finish(0x8004406bU);
+                if(!caller_buffer)co_return finish(0x8004406aU);
+                GuestScratch scratch(*this,m,s);
+                const auto wide=scratch.allocate(wide_size);
+                if(!wide)co_return finish(0x80044067U);
+                m.write(GuestAddress{wide},std::vector<std::uint8_t>(wide_size));
+                std::vector<std::uint8_t> fixed(prefix);
+                if(create){
+                    m.read(GuestAddress{caller_buffer},fixed);
+                    m.write(GuestAddress{wide},fixed);
+                    unsigned length=0;
+                    while(length<63 && m.load(GuestAddress{caller_buffer+prefix+length},8))++length;
+                    if(length && !nested_service(s,m,"kernel32.dll","MultiByteToWideChar",{0,0,caller_buffer+prefix,length,wide+prefix,63}))
+                        co_return finish(0x8004406aU);
+                    co_return finish(co_await service_callback::call(method,{call(0),call(1),wide}));
+                }
+                m.check(GuestAddress{caller_buffer},prefix+64,Access::Write);
+                const auto result=static_cast<std::uint32_t>(co_await service_callback::call(method,{call(0),wide,wide_size}));
+                if(!(result&0x80000000U)){
+                    m.read(GuestAddress{wide},fixed);
+                    m.write(GuestAddress{caller_buffer},fixed);
+                    unsigned length=0;
+                    while(length<64 && m.load(GuestAddress{wide+prefix+2*length},16))++length;
+                    // 找到可完整裝入的前綴，避免在多位元組字元中間截斷。
+                    while(length && nested_service(s,m,"kernel32.dll","WideCharToMultiByte",{0,0,wide+prefix,length,0,0,0,0})>63)--length;
+                    const auto bytes=length?nested_service(s,m,"kernel32.dll","WideCharToMultiByte",{0,0,wide+prefix,length,caller_buffer+prefix,63,0,0}):0;
+                    m.store(GuestAddress{caller_buffer+prefix+bytes},8,0);
+                }
+                co_return finish(result);
+            });
+        }
         state.rip=GuestAddress{method};return std::nullopt;
     }catch(const MemoryFault&){arg.return_to(state,pointer_error);return std::nullopt;}
 }

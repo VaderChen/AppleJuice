@@ -160,11 +160,14 @@ std::span<const WindowsServiceDescriptor> dbghelp_service_descriptors() {
     };
     return table;
 }
+bool dbghelp_file_tool(std::string_view name); // windows_dbghelp_files.cpp
 std::optional<std::uint32_t> WindowsServices::invoke_dbghelp(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
     if(name=="MiniDumpWriteDump" || name=="MiniDumpReadDumpStream")return invoke_minidump(state,memory,service);
+    if(dbghelp_file_tool(name))return invoke_dbghelp_files(state,memory,service);
     if(name=="UnDecorateSymbolName" || name=="UnDecorateSymbolNameW")return invoke_demangle(state,memory,service);
     if(name=="StackWalk64" || name=="StackWalk" || name=="StackWalkEx")return invoke_stack_walk(state,memory,service);
+    if(name=="ExtensionApiVersion" || name=="WinDbgExtensionDllInit")return invoke_dbghelp_lines(state,memory,service);
     // 不需要 SymInitialize 工作階段的符號輔助函式直接交給符號服務。
     if(name.starts_with("SymUnDName") || name.starts_with("SymMatchString") || name=="SymGetExtendedOption" || name=="SymSetExtendedOption" || name=="SymSetParentWindow" ||
        name=="GetTimestampForLoadedLibrary" || name=="MakeSureDirectoryPathExists" || name.starts_with("SearchTreeForFile"))return invoke_dbghelp_symbols(state,memory,service);
@@ -296,7 +299,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp(GuestState& state,G
         if(!version){version=allocate_heap(memory,8);if(version){memory.store(GuestAddress{version},16,10);memory.store(GuestAddress{version+2},16,0);memory.store(GuestAddress{version+4},16,12);memory.store(GuestAddress{version+6},16,0);}}
         if(!version)fail(8);else result=version;
     }
-    else if(name=="SymSetOptions")result=runtime_.symbol_options=static_cast<std::uint32_t>(arg(0));
+    else if(name=="SymSetOptions"){
+        // 每個登記了 SymRegisterCallback 的工作階段收到 CBA_SET_OPTIONS（CallbackData 為新選項值），回呼結束後回傳新選項。
+        result=runtime_.symbol_options=static_cast<std::uint32_t>(arg(0));std::vector<SymbolCallbackEvent> events;
+        for(const auto& [process,session]:runtime_.symbol_sessions)if(session.event_callback)events.push_back({process,8,0,result,0,0,{}});
+        if(!events.empty() && start_symbol_events(state,memory,events,std::array<std::uint64_t,3>{result,last_error_,0}))return std::nullopt;
+    }
     else if(name=="SymGetOptions")result=runtime_.symbol_options;
     else if(name=="SymInitialize" || name=="SymInitializeW"){
         if(!arg(0) || runtime_.symbol_sessions.contains(arg(0)))fail(87);
@@ -310,7 +318,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dbghelp(GuestState& state,G
     }else {
         const auto found=runtime_.symbol_sessions.find(arg(0));
         if(found==runtime_.symbol_sessions.end())fail(6);
-        else if(name=="SymCleanup"){runtime_.symbol_sessions.erase(found);result=1;}
+        else if(name=="SymCleanup"){for(auto& [base,module]:found->second.images){(void)base;for(const auto* cache:{&module.line_text,&module.line_text_wide})for(const auto& [index,block]:*cache){(void)index;(void)free_heap(memory,block,state);}}runtime_.symbol_sessions.erase(found);result=1;}
         else if(name=="SymRefreshModuleList"){
             if(!current_process_handle(arg(0)))fail(50);else {snapshot(found->second);result=1;}
         }else if(name.starts_with("SymSetSearchPath")){

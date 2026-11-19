@@ -178,6 +178,8 @@ struct NetworkState {
     std::uint64_t next_icmp_handle{0x71000000};
     std::shared_ptr<NetworkConfiguration> configuration{std::make_shared<NetworkConfiguration>()};
     std::uint32_t startups{};
+    // 最近一次 WSAStartup 協商的版本（低位元組為主版本）與 Winsock 1.1 的每執行緒阻塞掛勾（WSASetBlockingHook）。
+    std::uint32_t negotiated_version{};std::map<std::uint64_t,std::uint64_t> blocking_hooks;
     std::uint64_t next_socket{0x90000};
     std::map<std::uint64_t,std::shared_ptr<NativeSocket>> sockets;
     std::set<std::uint64_t> addresses;

@@ -80,12 +80,14 @@ struct GuestThread {
     std::uint64_t cycles{}; // 客體執行成本；等待不累計，與宿主牆鐘獨立。
     std::array<std::uint8_t,16> activity_id{};
     std::uint64_t affinity{UINT64_MAX}, strtok_cursor{}, wcstok_cursor{}, mbstok_cursor{}, invalid_parameter_handler{}, crt_signal_cells{};
+    std::uint64_t se_translator{}; // _set_se_translator 的轉譯函式（每執行緒，新執行緒為 NULL）
     // SetThreadLocale／SetThreadUILanguage／SetThreadPreferredUILanguages；0 與空清單表示沿用使用者預設。
     std::uint32_t locale{}, ui_language{};
     std::vector<std::u16string> preferred_ui_languages;
     // RtlSetThreadPlaceholderCompatibilityMode；0（PHCM_APPLICATION_DEFAULT）表示沿用程序設定。
     std::int8_t placeholder_mode{};
     std::uint32_t com_process_token{};
+    std::uint32_t avi_initializations{};
     std::uint64_t com_call_context{}; // CoSwitchCallContext 設定的呼叫內容物件（不持有參照，與 Windows 相同）。
     std::uint32_t com_cancel_enabled{}; // CoEnableCallCancellation 的巢狀次數。
     std::uint32_t suspended{}, exit_code{}, ideal_processor{};

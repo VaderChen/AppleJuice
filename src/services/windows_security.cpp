@@ -65,7 +65,7 @@ std::span<const WindowsServiceDescriptor> security_service_descriptors() {
         {"advapi32.dll","IsWellKnownSid",2},
         {"advapi32.dll","GetWindowsAccountDomainSid",3},
         {"advapi32.dll","EqualDomainSid",3},
-        {"ntdll.dll", "NtQueryObject", 5},{"ntdll.dll","NtSetInformationObject",4},
+        {"ntdll.dll", "NtQueryObject", 5},{"ntdll.dll","NtSetInformationObject",4},{"ntdll.dll","NtMakeTemporaryObject",1},
         {"shell32.dll", "IsUserAnAdmin", 0},
         {"advapi32.dll","ConvertStringSecurityDescriptorToSecurityDescriptorA",4},{"advapi32.dll","ConvertStringSecurityDescriptorToSecurityDescriptorW",4},
         {"advapi32.dll","ConvertSecurityDescriptorToStringSecurityDescriptorA",5},{"advapi32.dll","ConvertSecurityDescriptorToStringSecurityDescriptorW",5},
@@ -85,6 +85,27 @@ std::span<const WindowsServiceDescriptor> security_service_descriptors() {
         {"advapi32.dll","SaferGetLevelInformation",5},{"advapi32.dll","SaferSetLevelInformation",4},{"advapi32.dll","SaferiIsExecutableFileType",2},{"advapi32.dll","SaferComputeTokenFromLevel",5},
         {"advapi32.dll","SetTokenInformation",4},{"advapi32.dll","IsTokenRestricted",1},
         {"advapi32.dll","CheckTokenMembership",3},{"advapi32.dll","AccessCheck",8},{"advapi32.dll","AccessCheckByType",11},
+        // 依型別存取檢查與稽核警示（windows_access_audit.inc）。
+        {"advapi32.dll","AccessCheckByTypeResultList",11,0,0,0x28},{"ntdll.dll","NtAccessCheckByType",11,0,0,0x28},{"ntdll.dll","ZwAccessCheckByType",11,0,0,0x28},
+        {"ntdll.dll","NtAccessCheckByTypeResultList",11,0,0,0x28},{"ntdll.dll","ZwAccessCheckByTypeResultList",11,0,0,0x28},
+        {"advapi32.dll","AccessCheckAndAuditAlarmA",11,0,0,0xa0},{"advapi32.dll","AccessCheckAndAuditAlarmW",11,0,0,0xa0},
+        {"ntdll.dll","NtAccessCheckAndAuditAlarm",11,0,0,0xa0},{"ntdll.dll","ZwAccessCheckAndAuditAlarm",11,0,0,0xa0},
+        {"advapi32.dll","AccessCheckByTypeAndAuditAlarmA",16,0,0,0x15c0},{"advapi32.dll","AccessCheckByTypeAndAuditAlarmW",16,0,0,0x15c0},
+        {"ntdll.dll","NtAccessCheckByTypeAndAuditAlarm",16,0,0,0x15c0},{"ntdll.dll","ZwAccessCheckByTypeAndAuditAlarm",16,0,0,0x15c0},
+        {"advapi32.dll","AccessCheckByTypeResultListAndAuditAlarmA",16,0,0,0x15c0},{"advapi32.dll","AccessCheckByTypeResultListAndAuditAlarmW",16,0,0,0x15c0},
+        {"ntdll.dll","NtAccessCheckByTypeResultListAndAuditAlarm",16,0,0,0x15c0},{"ntdll.dll","ZwAccessCheckByTypeResultListAndAuditAlarm",16,0,0,0x15c0},
+        {"advapi32.dll","AccessCheckByTypeResultListAndAuditAlarmByHandleA",17,0,0,0x2b80},{"advapi32.dll","AccessCheckByTypeResultListAndAuditAlarmByHandleW",17,0,0,0x2b80},
+        {"ntdll.dll","NtAccessCheckByTypeResultListAndAuditAlarmByHandle",17,0,0,0x2b80},{"ntdll.dll","ZwAccessCheckByTypeResultListAndAuditAlarmByHandle",17,0,0,0x2b80},
+        {"advapi32.dll","ObjectOpenAuditAlarmA",12,0,0,0x6c0},{"advapi32.dll","ObjectOpenAuditAlarmW",12,0,0,0x6c0},
+        {"ntdll.dll","NtOpenObjectAuditAlarm",12,0,0,0x6c0},{"ntdll.dll","ZwOpenObjectAuditAlarm",12,0,0,0x6c0},
+        {"advapi32.dll","ObjectCloseAuditAlarmA",3,0,0,0x4},{"advapi32.dll","ObjectCloseAuditAlarmW",3,0,0,0x4},
+        {"ntdll.dll","NtCloseObjectAuditAlarm",3,0,0,0x4},{"ntdll.dll","ZwCloseObjectAuditAlarm",3,0,0,0x4},
+        {"advapi32.dll","ObjectDeleteAuditAlarmA",3,0,0,0x4},{"advapi32.dll","ObjectDeleteAuditAlarmW",3,0,0,0x4},
+        {"ntdll.dll","NtDeleteObjectAuditAlarm",3,0,0,0x4},{"ntdll.dll","ZwDeleteObjectAuditAlarm",3,0,0,0x4},
+        {"advapi32.dll","ObjectPrivilegeAuditAlarmA",6,0,0,0x28},{"advapi32.dll","ObjectPrivilegeAuditAlarmW",6,0,0,0x28},
+        {"ntdll.dll","NtPrivilegeObjectAuditAlarm",6,0,0,0x28},{"ntdll.dll","ZwPrivilegeObjectAuditAlarm",6,0,0,0x28},
+        {"advapi32.dll","PrivilegedServiceAuditAlarmA",5,0,0,0x10},{"advapi32.dll","PrivilegedServiceAuditAlarmW",5,0,0,0x10},
+        {"ntdll.dll","NtPrivilegedServiceAuditAlarm",5,0,0,0x10},{"ntdll.dll","ZwPrivilegedServiceAuditAlarm",5,0,0,0x10},
         {"advapi32.dll","MapGenericMask",2},{"advapi32.dll","AreAllAccessesGranted",2},{"advapi32.dll","AreAnyAccessesGranted",2},
         {"advapi32.dll", "OpenProcessToken", 3},{"advapi32.dll","LogonUserA",6},{"advapi32.dll","LogonUserW",6},
         {"advapi32.dll", "GetKernelObjectSecurity", 5},{"advapi32.dll","SetKernelObjectSecurity",3},
@@ -204,7 +225,7 @@ std::u16string_view WindowsServices::object_type(std::uint64_t handle) const {
     if(const auto type=process_object_type(handle);!type.empty())return type;
     if((handle>=0x100 && handle<=0x102 && standard_open_[handle-0x100]) || files_.contains(handle) || kernel_device_handle(handle) || runtime_.network.sockets.contains(handle) || runtime_.directory_searches.contains(handle))return u"File";
     if(runtime_.token_handles.contains(handle))return u"Token";
-    if(runtime_.object_directories.contains(handle))return u"Directory";
+    if(const auto directory=runtime_.object_directories.find(handle);directory!=runtime_.object_directories.end())return directory->second.object->symbolic_link()?u"SymbolicLink":u"Directory";
     if(power_requests_.contains(handle))return u"PowerRequest";
     if(transaction_handle(handle))return u"TmTx";
     if(job_handle(handle))return u"Job";
@@ -254,8 +275,10 @@ std::optional<WindowsServices::ObjectMetadata> WindowsServices::object_metadata(
     if(const auto process=process_object_metadata(handle))return process;
     const auto type=object_type(handle);if(type.empty())return {};ObjectMetadata out;out.identity=handle;out.handles=1;out.pointers=1;
     if(const auto directory=runtime_.object_directories.find(handle);directory!=runtime_.object_directories.end()){
-        out.access=directory->second.access;out.identity=UINT64_C(0x4449520000000000)+directory->second.object->index();out.handles=0;
-        for(const auto& [id,item]:runtime_.object_directories){(void)id;if(item.object->index()==directory->second.object->index())++out.handles;}out.pointers=out.handles;
+        // 內建目錄以索引識別；動態目錄、符號連結與私有命名空間以建立時的隨機身分識別。
+        const auto identity=[](const ObjectDirectory& object){return object.dynamic()?object.entry().serial:UINT64_C(0x4449520000000000)+object.index();};
+        out.access=directory->second.access;out.identity=identity(*directory->second.object);out.handles=0;
+        for(const auto& [id,item]:runtime_.object_directories){(void)id;if(identity(*item.object)==out.identity)++out.handles;}out.pointers=out.handles;
     }else if(const auto file=files_.find(handle);file!=files_.end()){
         out.access=security::mapped_access(file->second.access,{0x120089U,0x120116U,0x1200a0U,0x1f01ffU});out.identity=file->second.object;out.handles=0;
         for(const auto& [h,item]:files_){(void)h;if(item.object==out.identity)++out.handles;}out.pointers=out.handles;
@@ -331,6 +354,11 @@ std::uint32_t WindowsServices::local_system_handles(std::vector<SystemHandleReco
         captured.push_back({handle,object,process_id(),info->access,detail::system_object_type_index(object_type(handle)),static_cast<std::uint16_t>(((flags&1U)<<1)|((flags&2U)>>1))});
     }
     output=std::move(captured);return 0;
+}
+// 依型別存取檢查與稽核警示（windows_access_audit.inc）：與稽核原則共用 LSA 分支。
+static bool access_audit_service(std::string_view symbol){
+    if(symbol.starts_with("Zw"))symbol.remove_prefix(2);else if(symbol.starts_with("Nt"))symbol.remove_prefix(2);
+    return symbol.find("AuditAlarm")!=std::string_view::npos || symbol=="AccessCheckByTypeResultList" || symbol=="AccessCheckByType";
 }
 std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state, GuestMemory& memory,
                                                            const WindowsServiceDescriptor& service) {
@@ -653,6 +681,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
         else if(u32(1)!=4)result=0xc0000003U;
         else if(u32(3)!=2)result=0xc0000004U;
         else try{const auto inherit=memory.load(GuestAddress{arg(2)},8),protect=memory.load(GuestAddress{arg(2)+1},8);if(inherit>1 || protect>1)result=0xc000000dU;else runtime_.handle_flags[arg(0)]=static_cast<std::uint32_t>(inherit|(protect<<1));}catch(const MemoryFault&){result=0xc0000005U;}
+    }else if(symbol=="NtMakeTemporaryObject"){
+        // 本引擎的具名物件都是暫時物件：最後一個控制代碼關閉即移除名稱（沒有 NtMakePermanentObject 建立的永久物件）。
+        // 與 Windows 相同只要求控制代碼帶 DELETE 存取；無名物件同樣成功。
+        // 物件命名空間的動態目錄與符號連結可由 NtMakePermanentObject 設為永久，這裡清除旗標，最後一個控制代碼關閉時刪除。
+        const auto info=object_type(arg(0)).empty()?std::nullopt:object_metadata(arg(0));
+        result=!info?0xc0000008U:(info->access&0x10000U)?0U:0xc0000022U; // STATUS_INVALID_HANDLE／STATUS_ACCESS_DENIED
+        if(!result)if(const auto directory=runtime_.object_directories.find(arg(0));directory!=runtime_.object_directories.end() && directory->second.object->dynamic())
+            result=directory->second.object->set_permanent(false);
     }else if(symbol=="NtQueryObject"){
         const auto type=object_type(arg(0));
         if(u32(1)==3)try{
@@ -697,6 +733,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
                         for(std::size_t start=2;start<path.size();){const auto end=path.find(u'\\',start),stop=end==path.npos?path.size():end;const auto display=runtime_.registry.display_names.find(path.substr(0,stop));text+=u'\\';text+=display==runtime_.registry.display_names.end()?path.substr(start,stop-start):display->second;if(end==path.npos)break;start=end+1;}
                     }
                 }
+                if(text.size()>7 && text.starts_with(u"Global\\") && text[7]==u'\uF8FF')text=namespace_display_name(text);
                 if(!text.empty() && text.front()!=u'\\'){
                     if(text.starts_with(u"Global\\"))text=u"\\BaseNamedObjects\\"+text.substr(7);
                     else {if(text.starts_with(u"Local\\"))text.erase(0,6);text=u"\\Sessions\\1\\BaseNamedObjects\\"+text;}
@@ -724,7 +761,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_security(GuestState& state,
     }else if (symbol == "IsUserAnAdmin") {
         initialize_tokens();const auto& token=runtime_.token_objects.at(effective_token_id());const auto administrators=sddl_sid("BA");
         result=token_sid_matches(token,administrators,false) && (!token.restriction_check || token_sid_matches(token,administrators,false,true));
-    } else if (symbol.starts_with("Lsa") || symbol.starts_with("Audit")) {
+    } else if (symbol.starts_with("Lsa") || symbol.starts_with("Audit") || access_audit_service(symbol)) {
 #include "windows_lsa.inc"
     } else if (symbol == "LookupAccountSidLocalA" || symbol == "LookupAccountSidLocalW") {
         // 等同 LookupAccountSid(NULL, ...)：沿用同一查詢與錯誤碼。

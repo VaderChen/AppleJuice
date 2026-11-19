@@ -135,6 +135,7 @@
     // 原則變更通知：LsaRegisterPolicyChangeNotification 的事件依類別（1 稽核、2 帳戶網域、4 DNS 網域）設定為有訊號。
     const auto notify_policy=[&](std::uint32_t information){for(const auto& [kind,event]:lsa_notifications_)if(kind==information)(void)nested_service(state,memory,"kernel32.dll","SetEvent",{event});};
     std::uint32_t audit_error=0;
+    std::uint32_t access_audit_error=0;
     const auto read_rights=[&](std::uint64_t address,std::uint32_t count){
         std::vector<std::string> list;for(std::uint32_t i=0;i<count;++i){const auto name=utf16_to_utf8(read_string(address+i*string_size));const auto right=canonical_right(name);if(!right)throw LsaStatus{status_no_such_privilege};list.push_back(*right);}
         return list;};
@@ -343,11 +344,17 @@
         else if(symbol.starts_with("LsaRegister")){const auto event=runtime_.wait_objects.find(arg(1));
             if(event==runtime_.wait_objects.end() || event->second.kind!=WaitObject::Kind::Event)status=status_invalid_handle;else lsa_notifications_.insert(key);}
         else status=lsa_notifications_.erase(key)?status_success:status_invalid_handle;
+    }else if(access_audit_service(symbol)){
+#include "windows_access_audit.inc"
     }else status=status_not_implemented;
     }catch(const LsaStatus& failure){status=failure.code;}catch(const SecurityDescriptorError&){status=status_invalid_parameter;}catch(const MemoryFault&){status=0xc0000005U;}catch(const std::bad_alloc&){status=status_no_memory;}
     // Audit* 回傳 BOOLEAN 並設定 LastError；例外對應：記憶體存取錯誤 998、記憶體不足 8、參數錯誤 87、其他 1。
     if(symbol.starts_with("Audit")){
         if(status!=status_success && !audit_error)audit_error=status==0xc0000005U?998U:status==status_no_memory?8U:status==status_invalid_parameter?87U:1U;
         if(audit_error)last_error_=audit_error;result=symbol=="AuditFree"?0U:audit_error?0U:1U;}
+    else if(access_audit_service(symbol) && !symbol.starts_with("Nt") && !symbol.starts_with("Zw")){
+        // 存取檢查／稽核警示的 Win32 版回 BOOL：失敗時 LastError 為 NTSTATUS 對應的 Win32 錯誤。
+        if(status){last_error_=static_cast<std::uint32_t>(nested_service(state,memory,"ntdll.dll","RtlNtStatusToDosError",{status}));result=0;}
+        else{if(access_audit_error)last_error_=access_audit_error;result=1;}}
     else result=status;
 }

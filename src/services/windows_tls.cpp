@@ -3,6 +3,8 @@
 #include "x64arm/unicode.hpp"
 #include <algorithm>
 #include <chrono>
+#include <array>
+#include <optional>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/http.h>
@@ -11,6 +13,7 @@
 namespace x64arm {
 namespace {
 constexpr std::uint32_t invalid=0x80090301,unsupported=0x80090302,internal=0x80090304,invalid_token=0x80090308;
+struct SspiBadInput {};
 constexpr std::uint32_t incomplete=0x80090318,small_buffer=0x80090321,continue_needed=0x90312,context_expired=0x90317;
 constexpr std::uint64_t handle_cookie=0x534348414e4e454c;
 struct Buffer {std::uint64_t descriptor{},pointer{};std::uint32_t size{},type{};};
@@ -167,7 +170,11 @@ std::span<const WindowsServiceDescriptor> tls_service_descriptors() {
         {"secur32.dll","QueryContextAttributesA",3},{"secur32.dll","QueryContextAttributesW",3},
         {"secur32.dll","SetContextAttributesA",4},{"secur32.dll","SetContextAttributesW",4},
         {"secur32.dll","EncryptMessage",4},{"secur32.dll","DecryptMessage",4},{"secur32.dll","ApplyControlToken",2},
-        {"secur32.dll","InitSecurityInterfaceW",0},{"secur32.dll","InitSecurityInterfaceA",0}
+        {"secur32.dll","InitSecurityInterfaceW",0},{"secur32.dll","InitSecurityInterfaceA",0},
+        {"secur32.dll","QueryCredentialsAttributesA",3,0,0,0x2},{"secur32.dll","QueryCredentialsAttributesW",3,0,0,0x2},
+        {"secur32.dll","SspiEncodeStringsAsAuthIdentity",4},{"secur32.dll","SspiEncodeAuthIdentityAsStrings",4},{"secur32.dll","SspiFreeAuthIdentity",1},
+        {"secur32.dll","SspiZeroAuthIdentity",1},{"secur32.dll","SspiLocalFree",1},{"secur32.dll","SspiMarshalAuthIdentity",3},
+        {"secur32.dll","SspiUnmarshalAuthIdentity",3,0,0,0x1},{"secur32.dll","SspiPrepareForCredWrite",7}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_tls(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
@@ -196,6 +203,130 @@ std::optional<std::uint32_t> WindowsServices::invoke_tls(GuestState& state,Guest
         }
         arg.return_to(state,table);return std::nullopt;
     }
+    if(symbol.starts_with("Sspi")){
+        // SSPI 認證身分輔助函式：不透明身分為 SEC_WINNT_AUTH_IDENTITY_W（UNICODE，結構與字串在同一 LocalAlloc 區塊），可直接交給 AcquireCredentialsHandle；
+        // 輸入另接受 SEC_WINNT_AUTH_IDENTITY_EXW（Version 0x200）與 ANSI 旗標。序列化為 SEC_WINNT_AUTH_IDENTITY_EX2（Version 0x201，長度以位元組計），
+        // 密碼放在型別 SEC_WINNT_AUTH_DATA_TYPE_PASSWORD 的 SEC_WINNT_AUTH_PACKED_CREDENTIALS。所有輸出以 LocalAlloc 配置，SspiFreeAuthIdentity／SspiLocalFree 以 LocalFree 釋放。
+        constexpr std::uint32_t ok=0,no_memory=0x80090300,bad_parameter=0x8009035d;
+        const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+        constexpr std::array<std::uint8_t,16> password_type{0x2f,0xc3,0xbf,0x28,0xf6,0x10,0x38,0x47,0x98,0xd1,0x1a,0xc0,0x61,0xdf,0x71,0x6a};
+        struct Identity {std::optional<std::u16string> user,domain,password;};
+        const auto local_alloc=[&](std::size_t size)->std::uint64_t{if(size>0x100000)return 0;return nested_service(state,memory,"kernel32.dll","LocalAlloc",{0x40,static_cast<std::uint32_t>(std::max<std::size_t>(size,1))});};
+        const auto local_free=[&](std::uint64_t pointer){if(pointer)(void)nested_service(state,memory,"kernel32.dll","LocalFree",{pointer});};
+        const auto read_identity=[&](std::uint64_t at)->std::optional<Identity>{
+            if(!at)return std::nullopt;
+            const bool extended=memory.load(GuestAddress{at},32)==0x200U && memory.load(GuestAddress{at+4},32)==(x86_?44U:72U);
+            const unsigned base=extended?8U:0U;const unsigned step=x86_?8U:16U;const auto flags=static_cast<std::uint32_t>(memory.load(GuestAddress{at+(extended?(x86_?32U:52U):(x86_?24U:44U))},32));
+            if(!(flags&3U))return std::nullopt;
+            Identity identity;
+            const auto field=[&](unsigned index)->std::optional<std::u16string>{
+                const std::uint64_t pointer=memory.load(GuestAddress{at+base+index*step},bits);const auto length=static_cast<std::uint32_t>(memory.load(GuestAddress{at+base+index*step+unit},32));
+                if(!pointer)return std::nullopt;if(length>4096)throw SspiBadInput{};
+                if(flags&2U){std::u16string text(length,u'\0');for(std::uint32_t i=0;i<length;++i)text[i]=static_cast<char16_t>(memory.load(GuestAddress{pointer+i*2},16));return text;}
+                std::string text(length,'\0');for(std::uint32_t i=0;i<length;++i)text[i]=static_cast<char>(memory.load(GuestAddress{pointer+i},8));return utf8_to_utf16_lossy(text);
+            };
+            identity.user=field(0);identity.domain=field(1);identity.password=field(2);return identity;
+        };
+        const auto store_identity=[&](const Identity& identity)->std::uint64_t{
+            const unsigned header=x86_?28U:48U;std::size_t size=header;for(const auto* part:{&identity.user,&identity.domain,&identity.password})if(*part)size+=((*part)->size()+1)*2;
+            const auto block=local_alloc(size);if(!block)return 0;std::uint64_t cursor=block+header;
+            const auto put=[&](unsigned index,const std::optional<std::u16string>& text){if(!text)return;memory.write(GuestAddress{cursor},utf16_bytes(*text));
+                memory.store(GuestAddress{block+index*(x86_?8U:16U)},bits,cursor);memory.store(GuestAddress{block+index*(x86_?8U:16U)+unit},32,text->size());cursor+=(text->size()+1)*2;};
+            put(0,identity.user);put(1,identity.domain);put(2,identity.password);memory.store(GuestAddress{block+(x86_?24U:44U)},32,2);return block;
+        };
+        const auto store_text=[&](const std::u16string& text)->std::uint64_t{const auto block=local_alloc((text.size()+1)*2);if(block)memory.write(GuestAddress{block},utf16_bytes(text));return block;};
+        const auto finish=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
+        try{
+            if(symbol=="SspiEncodeStringsAsAuthIdentity"){
+                // (pszUserName, pszDomainName, pszPackedCredentialsString, ppAuthIdentity)
+                if(!arg(3))return finish(bad_parameter);if(!arg(0) && !arg(1) && !arg(2))return finish(invalid_token);
+                Identity identity;const auto text_at=[&](unsigned i)->std::optional<std::u16string>{if(!arg(i))return std::nullopt;return read_utf16(memory,GuestAddress{arg(i)},4096);};
+                identity.user=text_at(0);identity.domain=text_at(1);identity.password=text_at(2);
+                memory.check(GuestAddress{arg(3)},unit,Access::Write);const auto block=store_identity(identity);if(!block)return finish(no_memory);
+                memory.store(GuestAddress{arg(3)},bits,block);return finish(ok);
+            }
+            if(symbol=="SspiEncodeAuthIdentityAsStrings"){
+                // (pAuthIdentity, ppszUserName, ppszDomainName, ppszPackedCredentialsString)：沒有的欄位輸出 NULL。
+                const auto identity=read_identity(arg(0));if(!identity)return finish(invalid_token);
+                std::vector<std::uint64_t> made;
+                for(unsigned i=0;i<3;++i){if(!arg(i+1))continue;memory.check(GuestAddress{arg(i+1)},unit,Access::Write);
+                    const auto& part=i==0?identity->user:i==1?identity->domain:identity->password;std::uint64_t pointer=0;
+                    if(part){pointer=store_text(*part);if(!pointer){for(const auto item:made)local_free(item);return finish(no_memory);}made.push_back(pointer);}
+                    memory.store(GuestAddress{arg(i+1)},bits,pointer);}
+                return finish(ok);
+            }
+            if(symbol=="SspiFreeAuthIdentity" || symbol=="SspiLocalFree"){local_free(arg(0));return finish(0);}
+            if(symbol=="SspiZeroAuthIdentity"){
+                // 清除字串與結構（之後仍可交給 SspiFreeAuthIdentity）。
+                if(!arg(0))return finish(0);const bool extended=memory.load(GuestAddress{arg(0)},32)==0x200U && memory.load(GuestAddress{arg(0)+4},32)==(x86_?44U:72U);
+                const unsigned base=extended?8U:0U,step=x86_?8U:16U;const auto flags=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+(extended?(x86_?32U:52U):(x86_?24U:44U))},32));
+                for(unsigned i=0;i<3;++i){const std::uint64_t pointer=memory.load(GuestAddress{arg(0)+base+i*step},bits);const auto length=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+base+i*step+unit},32));
+                    if(pointer && length<=4096)memory.write(GuestAddress{pointer},std::vector<std::uint8_t>(static_cast<std::size_t>(length)*((flags&2U)?2U:1U)));}
+                memory.write(GuestAddress{arg(0)},std::vector<std::uint8_t>(extended?(x86_?44U:72U):(x86_?28U:48U)));return finish(0);
+            }
+            if(symbol=="SspiMarshalAuthIdentity"){
+                // (AuthIdentity, AuthIdentityLength, AuthIdentityByteArray)
+                const auto identity=read_identity(arg(0));if(!identity)return finish(invalid_token);if(!arg(1) || !arg(2))return finish(bad_parameter);
+                std::vector<std::uint8_t> bytes(48);
+                const auto put16=[&](std::size_t at,std::uint32_t v){bytes[at]=static_cast<std::uint8_t>(v);bytes[at+1]=static_cast<std::uint8_t>(v>>8);};
+                const auto put32=[&](std::size_t at,std::uint32_t v){put16(at,v&0xffffU);put16(at+2,v>>16);};
+                const auto append=[&](const std::vector<std::uint8_t>& part)->std::uint32_t{const auto at=static_cast<std::uint32_t>(bytes.size());bytes.insert(bytes.end(),part.begin(),part.end());return at;};
+                const auto text_bytes=[](const std::u16string& text){auto out=utf16_bytes(text);out.resize(text.size()*2);return out;};
+                put32(0,0x201);put16(4,48);
+                if(identity->user){const auto data=text_bytes(*identity->user);put32(12,append(data));put16(16,static_cast<std::uint32_t>(data.size()));}
+                if(identity->domain){const auto data=text_bytes(*identity->domain);put32(20,append(data));put16(24,static_cast<std::uint32_t>(data.size()));}
+                if(identity->password){
+                    // SEC_WINNT_AUTH_PACKED_CREDENTIALS：cbHeaderLength、cbStructureLength、AuthData{CredType, CredData{ByteArrayOffset, ByteArrayLength}}，偏移相對於本結構。
+                    const auto secret=text_bytes(*identity->password);std::vector<std::uint8_t> packed(28);
+                    packed[0]=28;packed[2]=static_cast<std::uint8_t>((28+secret.size())&0xff);packed[3]=static_cast<std::uint8_t>((28+secret.size())>>8);
+                    std::copy(password_type.begin(),password_type.end(),packed.begin()+4);packed[20]=28;packed[24]=static_cast<std::uint8_t>(secret.size());packed[25]=static_cast<std::uint8_t>(secret.size()>>8);
+                    packed.insert(packed.end(),secret.begin(),secret.end());put32(28,append(packed));put16(32,static_cast<std::uint32_t>(packed.size()));
+                }
+                put32(36,2);put32(8,static_cast<std::uint32_t>(bytes.size()));
+                memory.check(GuestAddress{arg(1)},4,Access::Write);memory.check(GuestAddress{arg(2)},unit,Access::Write);
+                const auto block=local_alloc(bytes.size());if(!block)return finish(no_memory);memory.write(GuestAddress{block},bytes);
+                memory.store(GuestAddress{arg(1)},32,bytes.size());memory.store(GuestAddress{arg(2)},bits,block);return finish(ok);
+            }
+            if(symbol=="SspiUnmarshalAuthIdentity"){
+                // (AuthIdentityLength, AuthIdentityByteArray, ppAuthIdentity)
+                const auto length=static_cast<std::uint32_t>(arg(0));if(!arg(1) || !arg(2) || length<48 || length>0x100000)return finish(bad_parameter);
+                std::vector<std::uint8_t> bytes(length);memory.read(GuestAddress{arg(1)},bytes);
+                const auto get16=[&](std::size_t at)->std::uint32_t{return bytes[at]|(std::uint32_t{bytes[at+1]}<<8);};const auto get32=[&](std::size_t at){return get16(at)|(get16(at+2)<<16);};
+                if(get32(0)!=0x201 || get16(4)<48 || get32(8)>length)return finish(invalid_token);
+                const auto slice=[&](std::uint32_t offset,std::uint32_t size)->std::optional<std::vector<std::uint8_t>>{if(!size)return std::nullopt;if(offset>length || size>length-offset)throw SspiBadInput{};return std::vector<std::uint8_t>(bytes.begin()+offset,bytes.begin()+offset+size);};
+                const auto text_of=[](const std::vector<std::uint8_t>& data){std::u16string text;for(std::size_t i=0;i+1<data.size();i+=2)text.push_back(static_cast<char16_t>(data[i]|(data[i+1]<<8)));return text;};
+                Identity identity;
+                try{
+                    if(const auto data=slice(get32(12),get16(16)))identity.user=text_of(*data);
+                    if(const auto data=slice(get32(20),get16(24)))identity.domain=text_of(*data);
+                    if(const auto packed=slice(get32(28),get16(32))){
+                        if(packed->size()<28 || !std::equal(password_type.begin(),password_type.end(),packed->begin()+4))return finish(unsupported);
+                        const std::uint32_t offset=std::uint32_t{(*packed)[20]}|(std::uint32_t{(*packed)[21]}<<8)|(std::uint32_t{(*packed)[22]}<<16)|(std::uint32_t{(*packed)[23]}<<24);
+                        const std::uint32_t size=std::uint32_t{(*packed)[24]}|(std::uint32_t{(*packed)[25]}<<8);
+                        if(offset>packed->size() || size>packed->size()-offset)return finish(invalid_token);
+                        identity.password=text_of(std::vector<std::uint8_t>(packed->begin()+offset,packed->begin()+offset+size));
+                    }
+                }catch(const SspiBadInput&){return finish(invalid_token);}
+                memory.check(GuestAddress{arg(2)},unit,Access::Write);const auto block=store_identity(identity);if(!block)return finish(no_memory);
+                memory.store(GuestAddress{arg(2)},bits,block);return finish(ok);
+            }
+            if(symbol=="SspiPrepareForCredWrite"){
+                // (AuthIdentity, pszTargetName, pCredmanCredentialType, ppszCredmanTargetName, ppszCredmanUserName, ppCredentialBlob, pCredentialBlobSize)：
+                // CRED_TYPE_DOMAIN_PASSWORD；使用者為「網域\使用者」；沒有目標名稱時用使用者名稱；blob 為密碼的 UTF-16（不含 NUL）。
+                const auto identity=read_identity(arg(0));if(!identity)return finish(invalid_token);
+                for(unsigned i=2;i<7;++i)if(!arg(i))return finish(bad_parameter);
+                const auto user=(identity->domain && !identity->domain->empty()?*identity->domain+u"\\":std::u16string{})+identity->user.value_or(u"");
+                const auto target=arg(1)?read_utf16(memory,GuestAddress{arg(1)},4096):user;
+                auto secret=utf16_bytes(identity->password.value_or(u""));secret.resize(identity->password.value_or(u"").size()*2);
+                for(unsigned i=2;i<7;++i)memory.check(GuestAddress{arg(i)},i==2 || i==6?4U:unit,Access::Write);
+                const auto target_block=store_text(target),user_block=store_text(user),blob=local_alloc(secret.size());
+                if(!target_block || !user_block || !blob){local_free(target_block);local_free(user_block);local_free(blob);return finish(no_memory);}
+                if(!secret.empty())memory.write(GuestAddress{blob},secret);
+                memory.store(GuestAddress{arg(2)},32,2);memory.store(GuestAddress{arg(3)},bits,target_block);memory.store(GuestAddress{arg(4)},bits,user_block);
+                memory.store(GuestAddress{arg(5)},bits,blob);memory.store(GuestAddress{arg(6)},32,secret.size());return finish(ok);
+            }
+        }catch(const MemoryFault&){return finish(bad_parameter);}catch(const SspiBadInput&){return finish(bad_parameter);}
+    }
     if(symbol=="CompleteAuthToken" || symbol.starts_with("QuerySecurityPackageInfo") || symbol.starts_with("EnumerateSecurityPackages"))return invoke_digest(state,memory,service);
     if(symbol.starts_with("AcquireCredentialsHandle")){
         try{auto package=text(1);for(auto& c:package)if(c>='A' && c<='Z')c=static_cast<char>(c+32);if(package=="wdigest" || package=="digest")return invoke_digest(state,memory,service);}catch(const MemoryFault&){arg.return_to(state,0x8009035d);return {};}
@@ -219,6 +350,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_tls(GuestState& state,Guest
             if(!result){if(tls.credentials.size()>=1024)result=0x80090300;else {const auto handle=tls.next_handle++;write_handle(memory,arg(7),handle);expiry(arg(8));tls.credentials.emplace(handle,credentials);}}
         }
     } else if(symbol=="FreeCredentialsHandle") {if(!tls.credentials.erase(read_handle(memory,arg(0))))result=invalid;}
+    else if(symbol.starts_with("QueryCredentialsAttributes")) {
+        // Schannel 認證：SECPKG_ATTR_SUPPORTED_ALGS（86，ALG_ID 陣列以 FreeContextBuffer 釋放）、SECPKG_ATTR_CIPHER_STRENGTHS（87）、SECPKG_ATTR_SUPPORTED_PROTOCOLS（88）；
+        // 值來自 AcquireCredentialsHandle 的 SCHANNEL_CRED（未指定時為 OpenSSL 用戶端預設：TLS 1.2／1.3、128～256 位元）。Schannel 沒有認證名稱屬性。
+        const auto found=tls.credentials.find(read_handle(memory,arg(0)));const auto attribute=static_cast<std::uint32_t>(arg(1));
+        if(found==tls.credentials.end())result=invalid;
+        else if(!arg(2))result=0x8009035d;
+        else if(attribute==87){memory.check(GuestAddress{arg(2)},8,Access::Write);memory.store(GuestAddress{arg(2)},32,found->second.minimum_bits?found->second.minimum_bits:128U);memory.store(GuestAddress{arg(2)+4},32,found->second.maximum_bits?found->second.maximum_bits:256U);}
+        else if(attribute==88){memory.check(GuestAddress{arg(2)},4,Access::Write);memory.store(GuestAddress{arg(2)},32,found->second.protocols?found->second.protocols:0x2800U);}
+        else if(attribute==86){
+            // CALG_AES_128、CALG_AES_256、CALG_SHA_256、CALG_SHA_384、CALG_ECDHE、CALG_RSA_KEYX、CALG_ECDSA、CALG_RSA_SIGN（OpenSSL 用戶端實際協商的演算法）。
+            constexpr std::array<std::uint32_t,8> algorithms{0x660e,0x6610,0x800c,0x800d,0xae06,0xa400,0x2203,0x2400};
+            const unsigned unit=x86_?4U:8U;memory.check(GuestAddress{arg(2)},unit*2,Access::Write);
+            const auto block=allocate_heap(memory,algorithms.size()*4);if(!block)result=0x80090300;
+            else{for(std::size_t i=0;i<algorithms.size();++i)memory.store(GuestAddress{block+i*4},32,algorithms[i]);tls.buffers.insert(block);
+                memory.store(GuestAddress{arg(2)},32,algorithms.size());memory.store(GuestAddress{arg(2)+unit},static_cast<std::uint8_t>(unit*8),block);}
+        }else result=unsupported;
+    }
     else if(symbol=="FreeContextBuffer") {if(arg(0) && (!tls.buffers.erase(arg(0)) || !free_heap(memory,arg(0),state)))result=invalid;}
     else if(symbol=="AcceptSecurityContext")result=unsupported;
     else if(symbol.starts_with("InitializeSecurityContext")) {

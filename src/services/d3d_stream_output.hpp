@@ -14,7 +14,7 @@ inline void validate(GraphicsShader& shader,const dxbc::Reflection& reflection){
     if(shader.stream_output.size()>64 || (shader.rasterized_stream!=0 && shader.rasterized_stream!=UINT32_MAX))throw std::invalid_argument("SO 宣告超出支援的單一 stream 範圍");
     std::array<unsigned,4> sizes{};
     for(const auto& e:shader.stream_output){
-        if(e.slot>=4 || e.stream || !e.count || e.count>4 || e.first>4-e.count)throw std::invalid_argument("SO 宣告範圍不合法");
+        if(e.slot>=4 || e.stream || !e.count || (!e.semantic.empty() && (e.count>4 || e.first>4-e.count)))throw std::invalid_argument("SO 宣告範圍不合法");
         if(!e.semantic.empty()){
             const auto found=std::find_if(reflection.signatures[1].begin(),reflection.signatures[1].end(),[&](const auto& s){return equal(s.name,e.semantic) && s.index==e.index && s.stream==e.stream;});
             if(found==reflection.signatures[1].end() || e.first+e.count>static_cast<unsigned>(std::popcount(found->mask)))throw std::invalid_argument("SO semantic 與著色器輸出不符");

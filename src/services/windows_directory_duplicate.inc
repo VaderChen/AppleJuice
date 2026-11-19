@@ -11,7 +11,7 @@ if(const auto directory=runtime_.object_directories.find(arg(1));directory!=runt
     else if(runtime_.object_directories.size()>=process_handle_limit)fail(8);
     else try{
         memory.check(GuestAddress{arg(3)},x86_?4:8,Access::Write);
-        if(!(dword(6)&2U)){initialize_tokens();object.access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(shared_object_security(object.object->descriptor())),object.access,dword(4),{0x20001U,0x2000cU,0x20002U,0xf000fU});}
+        if(!(dword(6)&2U)){initialize_tokens();object.access=security::duplicate_object_access(runtime_.token_objects.at(effective_token_id()),security::parse_relative_descriptor(shared_object_security(object.object->descriptor())),object.access,dword(4),object.object->generic_mapping());}
         const auto handle=runtime_.allocate_wait_handle();runtime_.object_directories.emplace(handle,std::move(object));runtime_.handle_flags[handle]=arg(5)?1U:0U;
         memory.store(GuestAddress{arg(3)},x86_?32:64,handle);result=1;
     }catch(const SecurityDescriptorError& error){fail(error.code);}

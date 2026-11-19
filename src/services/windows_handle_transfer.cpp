@@ -313,7 +313,7 @@ void WindowsServices::import_transfer_handle(const InheritedHandle& item){
         catch(const SecurityDescriptorError&){throw HostCallFault("傳輸權杖物件無效");}
     }
     else if(item.type==11){
-        try{auto object=ObjectDirectory::inherit(mapping_session(),item.descriptor);if(item.access&~0xf000fU)throw SecurityDescriptorError{5};runtime_.object_directories.emplace(item.handle,ObjectDirectoryHandle{std::move(object),item.access});}
+        try{auto object=ObjectDirectory::inherit(mapping_session(),item.descriptor);if(item.access&~object->valid_access())throw SecurityDescriptorError{5};runtime_.object_directories.emplace(item.handle,ObjectDirectoryHandle{std::move(object),item.access});}
         catch(const SecurityDescriptorError&){throw HostCallFault("傳輸物件目錄無效");}
     }
     else if(item.type==10){

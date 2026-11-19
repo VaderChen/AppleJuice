@@ -57,7 +57,7 @@ struct GuestState {
         std::uint32_t control{};
         bool operator==(const RepCompare&) const = default;
     } rep_compare;
-    // DR0–DR3、DR6、DR7 隨架構 context 保存；啟用 comparator 前須有 CPU trap 支援。
+    // DR0–DR3、DR6、DR7 隨架構 context 保存。
     std::array<std::uint64_t,6> debug_registers{0,0,0,0,UINT64_C(0xffff0ff0),0x400};
     // YMM[127:0] 與既有 XMM 共用；高半部附加於尾端，保留既有 resident 欄位位移。
     // Legacy SSE 不改寫此區，VEX.128 的目的寫入必須將對應高半部清零。
@@ -68,4 +68,28 @@ struct GuestState {
     void write(RegisterRef ref, std::uint64_t value);
     bool operator==(const GuestState&) const = default;
 };
+namespace cpu_debug {
+inline constexpr std::uint64_t resume_flag=UINT64_C(1)<<16;
+// 本地／全域啟用位元共用執行比對；資料與 I/O comparator 需另有存取觀察契約。
+inline bool execution_control_supported(std::uint64_t control) noexcept {
+    if(control&0x2000U)return false;
+    for(unsigned slot=0;slot<4;++slot)
+        if(((control>>(slot*2))&3U) && ((control>>(16+slot*4))&3U))return false;
+    return true;
+}
+inline unsigned execution_matches(const GuestState& state) noexcept {
+    const auto control=state.debug_registers[5];unsigned matched=0;
+    if(!(control&0xffU))return 0;
+    for(unsigned slot=0;slot<4;++slot)
+        if(((control>>(slot*2))&3U) && !((control>>(16+slot*4))&3U) &&
+           state.debug_registers[slot]==state.rip.value)matched|=1U<<slot;
+    return matched;
+}
+inline bool raise_execution_breakpoint(GuestState& state) noexcept {
+    if(state.rflags&resume_flag)return false;
+    const auto matched=execution_matches(state);if(!matched)return false;
+    state.debug_registers[4]|=matched;state.rflags|=resume_flag;
+    state.pending_cpu_trap=0x80000004U;return true;
+}
+}
 }

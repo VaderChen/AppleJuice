@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "dialog_template.hpp"
 #include <algorithm>
 #include <map>
 #include <tuple>
@@ -65,19 +66,7 @@ std::int32_t text_height(const std::u16string& text,std::int32_t width){
     }
     return lines*9;
 }
-struct Template {
-    std::vector<std::uint8_t> bytes;std::uint16_t count{};
-    void word(std::uint32_t value){bytes.push_back(static_cast<std::uint8_t>(value));bytes.push_back(static_cast<std::uint8_t>(value>>8));}
-    void dword(std::uint32_t value){word(value&0xffffU);word(value>>16);}
-    void text(const std::u16string& value){for(const auto c:value)word(c);word(0);}
-    void align(){while(bytes.size()%4)bytes.push_back(0);}
-    void item(std::uint32_t style,std::int32_t x,std::int32_t y,std::int32_t cx,std::int32_t cy,std::int32_t id,std::uint16_t atom,const std::u16string& cls,const std::u16string& title){
-        align();dword(0x50000000U|style);dword(0);word(static_cast<std::uint16_t>(x));word(static_cast<std::uint16_t>(y));
-        word(static_cast<std::uint16_t>(cx));word(static_cast<std::uint16_t>(cy));word(static_cast<std::uint16_t>(id));
-        if(atom){word(0xffff);word(atom);}else text(cls);
-        text(title);word(0);++count;
-    }
-};
+
 }
 std::span<const WindowsServiceDescriptor> task_dialog_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
@@ -162,7 +151,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_task_dialog(GuestState& sta
         const auto default_button=std::find(dialog.buttons.begin(),dialog.buttons.end(),config.default_button)!=dialog.buttons.end()?config.default_button:dialog.buttons.front();
         // 版面以 DLU 配置（Segoe UI 9pt）；cxWidth 為工作區寬度 DLU。
         const std::int32_t width=config.width?static_cast<std::int32_t>(std::clamp<std::uint32_t>(config.width,120,1000)):240,margin=7,inner=width-2*margin;
-        Template t;std::int32_t y=margin;const bool dynamic=config.callback!=0;
+        DialogTemplate t;std::int32_t y=margin;const bool dynamic=config.callback!=0;
         const auto label=[&](std::int32_t id,const std::u16string& value,bool reserve){
             auto height=text_height(value,inner);if(!height && reserve)height=9;if(!height)return;
             t.item(0x80U,margin,y,inner,height,id,0x82,{},value);y+=height+5;
@@ -187,7 +176,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_task_dialog(GuestState& sta
         y+=button_height+margin;
         if(!config.footer.empty()){const auto height=text_height(config.footer,inner);t.item(0x80U,margin,y,inner,height,footer_id,0x82,{},config.footer);y+=height+margin;}
         if(!(config.flags&expanded_by_default) && !config.expanded.empty())runtime_.module_events.push_back("task_dialog_note=TaskDialog 展開資訊需展開按鈕，尚未呈現");
-        Template header;
+        DialogTemplate header;
         const std::uint32_t style=0x80000000U|0x00c00000U|0x80U|0x40U|0x800U|(dialog.cancel?0x80000U:0U)|((config.flags&can_be_minimized)?0x20000U:0U);
         header.dword(style);header.dword(0);header.word(t.count);header.word(0);header.word(0);header.word(static_cast<std::uint32_t>(width));header.word(static_cast<std::uint32_t>(y));
         header.word(0);header.word(0);header.text(config.title);header.word(9);header.text(u"Segoe UI");

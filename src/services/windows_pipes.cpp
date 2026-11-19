@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "windows_file_copy.hpp"
+#include "default_pipe_acl.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/security_access.hpp"
@@ -749,7 +750,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
         try {
             auto attributes = read_security_attributes(memory, arg(server ? 7 : 3), x86_, server);
             inherit = attributes.inherit;
-            constexpr security::AccessMapping mapping{0x120089U, 0x120116U, 0x1200a0U, 0x1f01ffU};
+            constexpr auto mapping = pipe_access_mapping;
             rights = server ? ((u32(1) & 1U ? mapping[0] : 0U) | (u32(1) & 2U ? mapping[1] : 0U) | 0x100000U |
                                (u32(1) & 0x10c0000U))
                             : u32(1);
@@ -771,18 +772,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_file_io(GuestState &state, 
                     if (!(sd.control & 4U)) {
                         initialize_tokens();
                         sd.control |= 4;
-                        sd.data[3] = security::encode_acl(
-                            {security::encode_ace(
-                                 {0, 0, mapping[3], security::account_sid(*security::find_account("SYSTEM"))}),
-                             security::encode_ace(
-                                 {0, 0, mapping[3], security::account_sid(*security::find_account("Administrators"))}),
-                             security::encode_ace(
-                                 {0, 0, mapping[3], runtime_.token_objects.at(effective_token_id()).owner}),
-                             security::encode_ace(
-                                 {0, 0, mapping[0], security::account_sid(*security::find_account("Everyone"))}),
-                             security::encode_ace(
-                                 {0, 0, mapping[0],
-                                  security::account_sid(*security::find_account("Anonymous Logon"))})});
+                        sd.data[3] = default_pipe_acl(runtime_.token_objects.at(effective_token_id()).owner);
                     }
                     const auto bytes = object_security_descriptor(std::move(sd), true, true);
                     opened = NamedPipe::create(

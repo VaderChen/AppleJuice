@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/unicode.hpp"
+#include "clipboard_formats.hpp"
 #include "x64arm/windows_cpu_time.hpp"
 #include <algorithm>
 #include <bit>
@@ -12,10 +13,7 @@ namespace {
 std::int32_t signed_word(std::uint64_t value) {
     return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(value));
 }
-std::u16string lower_name(std::u16string text) {
-    for (auto& c : text) if (c >= u'A' && c <= u'Z') c = static_cast<char16_t>(c + 32);
-    return text;
-}
+
 }
 
 std::uint64_t WindowsServices::allocate_gui_global(GuestMemory& memory,std::uint64_t size,std::uint32_t flags){
@@ -31,7 +29,7 @@ void WindowsServices::release_gui_clipboard(GuestState& state,GuestMemory& memor
     std::map<std::uint64_t,std::uint32_t> handles;
     for(const auto& [format,handle]:gui_.clipboard)if(handle && (format<0x200 || format>0x2ff))handles.try_emplace(handle,gui_.clipboard_types.contains(format)?gui_.clipboard_types.at(format):1U);
     for(const auto& [handle,type]:handles){
-        if(type==16){gui_.bitmaps.erase(handle);rasters_.erase(handle);}
+        if(type==16){gui_.bitmaps.erase(handle);gui_.palettes.erase(handle);rasters_.erase(handle);}
         else if(type==64)gui_.metafiles.erase(handle);
         else if(const auto block=gui_.global_memory.find(handle);block!=gui_.global_memory.end()){
             if(block->second.address)(void)free_heap(memory,block->second.address,state);
@@ -57,6 +55,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
         if(!arg(0)){last_error_=87;arg.return_to(state,0);return std::nullopt;}
         memory.store(GuestAddress{arg(0)},32,gui_.process_default_layout);arg.return_to(state,1);return std::nullopt;
     }
+    const auto format_id = [&](std::u16string_view name, std::uint32_t id) {
+        initialize_user_objects();
+        const auto station = gui_.user_handles.at(gui_.station_handle).object;
+        return clipboard_format_id(gui_, processes_ && runtime_.network.external_io ? mapping_session() : std::string{},
+                                   gui_.user_objects.at(station).name, name, id);
+    };
     const auto ui_limits=job_ui_restrictions();
     if((symbol=="GetClipboardData" && (ui_limits&2U)) || ((symbol=="SetClipboardData" || symbol=="EmptyClipboard") && (ui_limits&4U))){
         fail(5);arg.return_to(state,0);return std::nullopt;
@@ -325,7 +329,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
         }else if(dword(1)>65536 || (dword(1) && !arg(0))){last_error_=87;result=UINT32_MAX;}
         else if(!formats.empty()){memory.check(GuestAddress{arg(0)},static_cast<std::size_t>(dword(1))*4,Access::Read);result=UINT32_MAX;for(unsigned i=0;i<dword(1);++i){const auto format=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+4ULL*i},32));if(std::find(formats.begin(),formats.end(),format)!=formats.end()){result=format;break;}}}
     }else if(symbol.starts_with("GetClipboardFormatName")){
-        const auto found=gui_.clipboard_format_names.find(dword(0));const bool wide=symbol.ends_with('W');
+        const auto found=gui_.clipboard_format_names.find(format_id({}, dword(0)));const bool wide=symbol.ends_with('W');
         if(found==gui_.clipboard_format_names.end() || !arg(1) || signed_word(arg(2))<=0)fail(87);
         else {const auto narrow=wide?std::string{}:utf16_to_utf8(found->second);const auto length=wide?found->second.size():narrow.size();result=std::min<std::size_t>(length,dword(2)-1);memory.check(GuestAddress{arg(1)},(result+1)*(wide?2:1),Access::Write);for(std::size_t i=0;i<result;++i)memory.store(GuestAddress{arg(1)+i*(wide?2:1)},wide?16:8,wide?found->second[i]:static_cast<unsigned char>(narrow[i]));memory.store(GuestAddress{arg(1)+result*(wide?2:1)},wide?16:8,0);}
     } else if (symbol == "OpenClipboard") {
@@ -361,14 +365,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
     else if (symbol.starts_with("RegisterClipboardFormat")) {
         if (!arg(0)) fail(87);
         else {
-            const auto original=symbol.ends_with('W') ? read_utf16(memory, GuestAddress{arg(0)}) : utf8_to_utf16_lossy(read_ansi(memory, arg(0)));auto name=lower_name(original);
-            if (name.empty() || name.size() > 255) fail(87);
-            else if (const auto found = gui_.clipboard_formats.find(name); found != gui_.clipboard_formats.end()) result = found->second;
-            else if (gui_.clipboard_next_format > 0xffff) fail(8);
-            else { result = gui_.clipboard_next_format++; gui_.clipboard_formats.emplace(std::move(name), static_cast<std::uint32_t>(result));gui_.clipboard_format_names.emplace(static_cast<std::uint32_t>(result),original); }
+            const auto original=symbol.ends_with('W') ? read_utf16(memory, GuestAddress{arg(0)}) : utf8_to_utf16_lossy(read_ansi(memory, arg(0)));
+            if (original.empty() || original.size() > 255) fail(87);
+            else if (!(result = format_id(original, 0))) fail(8);
         }
     } else if (symbol == "SetClipboardData") {
-        const auto format=dword(0),type=format==2?16U:format==14?64U:1U;
+        const auto format=dword(0),type=(format==2 || format==9)?16U:format==14?64U:1U;
         const bool private_format=format>=0x200 && format<=0x2ff;
         const auto found = gui_.global_memory.find(arg(1));
         const bool rendering=std::any_of(gui_.clipboard_operations.begin(),gui_.clipboard_operations.end(),[&](const auto& p){const auto& op=p.second;
@@ -376,7 +378,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
         if (gui_.clipboard_open_thread != threads_.current && !rendering) fail(1418);
         else if (!gui_.clipboard_owner) fail(5);
         else if (!format || format>0xffff) fail(87);
-        else if (arg(1) && !private_format && ((type==16 && !gui_.bitmaps.contains(arg(1))) || (type==64 && !gui_.metafiles.contains(arg(1))) || (type==1 && (found==gui_.global_memory.end() || !(found->second.flags&2))))) fail(6);
+        else if (arg(1) && !private_format && ((type==16 && !(format==9?gui_.palettes.contains(arg(1)):gui_.bitmaps.contains(arg(1)))) || (type==64 && !gui_.metafiles.contains(arg(1))) || (type==1 && (found==gui_.global_memory.end() || !(found->second.flags&2))))) fail(6);
         else {
             std::optional<std::u16string> text;
             if (arg(1) && (format==1 || format==13)) text=global_text(arg(1),format);
@@ -391,7 +393,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
                     const bool retained = std::any_of(gui_.clipboard.begin(), gui_.clipboard.end(), [&](const auto& item) { return item.second == previous; });
                     const auto block = gui_.global_memory.find(previous);
                     if (!retained && !private_format) {
-                        if(old_type==16){gui_.bitmaps.erase(previous);rasters_.erase(previous);}
+                        if(old_type==16){gui_.bitmaps.erase(previous);gui_.palettes.erase(previous);rasters_.erase(previous);}
                         else if(old_type==64)gui_.metafiles.erase(previous);
                         else if(block!=gui_.global_memory.end()){if(block->second.address)(void)free_heap(memory,block->second.address,state);gui_.global_memory.erase(block);}
                     }

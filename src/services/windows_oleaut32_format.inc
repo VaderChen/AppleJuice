@@ -113,8 +113,160 @@ std::string unsigned_text(unsigned __int128 value){
     std::reverse(out.begin(),out.end());return out;
 }
 }
+#include "windows_oleaut32_varformat.inc"
 std::optional<std::uint32_t> WindowsServices::invoke_oleaut32_format(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     using namespace automation;const auto name=service.symbol;const unsigned unit=x86_?4U:8U,variant_size=x86_?16U:24U;const auto bits=static_cast<std::uint8_t>(unit*8);
+    if(name=="VarTokenizeFormatString"){
+        // (pstrFormat, rgbTok, cbTok, iFirstDay, iFirstWeek, lcid, pcbActual)：記號緩衝區＝簽章、iFirstDay、iFirstWeek、字元數、LCID 與 UTF-16 格式字串。
+        const WindowsCall arg(state,memory,service);const auto done=[&](std::uint32_t status){arg.return_to(state,status);return std::optional<std::uint32_t>{};};
+        const auto first_day=static_cast<std::int32_t>(static_cast<std::uint32_t>(arg(3))),first_week=static_cast<std::int32_t>(static_cast<std::uint32_t>(arg(4)));
+        if(!arg(0) || !arg(1) || first_day<0 || first_day>7 || first_week<0 || first_week>3)return done(invalid);
+        try{
+            const auto format=read_utf16(memory,GuestAddress{arg(0)},32767);const auto size=12U+static_cast<std::uint32_t>(format.size())*2U;
+            if(arg(6))memory.store(GuestAddress{arg(6)},32,size);
+            if(static_cast<std::int32_t>(static_cast<std::uint32_t>(arg(2)))<static_cast<std::int32_t>(size))return done(0x80020013U); // DISP_E_BUFFERTOOSMALL
+            std::vector<std::uint8_t> bytes(size);
+            for(unsigned i=0;i<4;++i){bytes[i]=static_cast<std::uint8_t>(format_token_signature>>(8*i));bytes[8+i]=static_cast<std::uint8_t>(arg(5)>>(8*i));}
+            bytes[4]=static_cast<std::uint8_t>(first_day);bytes[5]=static_cast<std::uint8_t>(first_week);
+            bytes[6]=static_cast<std::uint8_t>(format.size());bytes[7]=static_cast<std::uint8_t>(format.size()>>8);
+            for(std::size_t i=0;i<format.size();++i){bytes[12+i*2]=static_cast<std::uint8_t>(format[i]);bytes[13+i*2]=static_cast<std::uint8_t>(format[i]>>8);}
+            memory.write(GuestAddress{arg(1)},bytes);return done(0);
+        }catch(const MemoryFault&){return done(invalid);}
+    }
+    if(name=="GetAltMonthNames"){
+        // (lcid, LPOLESTR** prgp)：阿拉伯文（回曆月名）、波蘭文與俄文（屬格月名）有替代月名，其餘語言為 NULL。
+        // 陣列有 13 個指標（第 13 個為 NULL），存放在程序內常駐的客體記憶體。
+        const WindowsCall arg(state,memory,service);const auto done=[&](std::uint32_t status){arg.return_to(state,status);return std::optional<std::uint32_t>{};};
+        if(!arg(1))return done(invalid);
+        static constexpr std::array<std::array<std::u16string_view,12>,3> names{{
+            {u"محرم",u"صفر",u"ربيع الاول",u"ربيع الثاني",u"جمادى الاولى",u"جمادى الثانية",u"رجب",u"شعبان",u"رمضان",u"شوال",u"ذو القعدة",u"ذو الحجة"},
+            {u"stycznia",u"lutego",u"marca",u"kwietnia",u"maja",u"czerwca",u"lipca",u"sierpnia",u"września",u"października",u"listopada",u"grudnia"},
+            {u"января",u"февраля",u"марта",u"апреля",u"мая",u"июня",u"июля",u"августа",u"сентября",u"октября",u"ноября",u"декабря"}}};
+        const auto language=static_cast<std::uint32_t>(arg(0))&0x3ffU;const int which=language==0x01?0:language==0x15?1:language==0x19?2:-1;
+        try{
+            memory.check(GuestAddress{arg(1)},unit,Access::Write);
+            if(which<0){memory.store(GuestAddress{arg(1)},bits,0);return done(0);}
+            static std::map<const WindowsServices*,std::array<std::uint64_t,3>> tables;auto& table=tables[this][static_cast<std::size_t>(which)];
+            if(!table){
+                std::vector<std::uint8_t> strings;std::vector<std::size_t> offsets;
+                for(const auto month:names[static_cast<std::size_t>(which)]){offsets.push_back(strings.size());const auto bytes=utf16_bytes(month);strings.insert(strings.end(),bytes.begin(),bytes.end());}
+                const auto size=13*unit+strings.size();const auto block=allocate_heap(memory,size);if(!block)return done(nomemory);
+                std::vector<std::uint8_t> bytes(size);
+                for(std::size_t i=0;i<12;++i){const auto pointer=block+13*unit+offsets[i];for(unsigned b=0;b<unit;++b)bytes[i*unit+b]=static_cast<std::uint8_t>(pointer>>(8*b));}
+                std::copy(strings.begin(),strings.end(),bytes.begin()+static_cast<std::ptrdiff_t>(13*unit));memory.write(GuestAddress{block},bytes);table=block;
+            }
+            memory.store(GuestAddress{arg(1)},bits,table);return done(0);
+        }catch(const MemoryFault&){return done(invalid);}
+    }
+    if(name=="VarFormat" || name=="VarFormatFromTokens"){
+        return nested_continuation(state,memory,"VarFormat",[this,service,variant_size,bits](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);const bool tokens=service.symbol=="VarFormatFromTokens";const auto saved=last_error_;
+            const auto finish=[&](std::uint32_t status){last_error_=saved;call.return_to(s,status);return std::optional<std::uint32_t>{};};
+            // VarFormat(pVarIn, lpszFormat, iFirstDay, iFirstWeek, dwFlags, pbstrOut)；VarFormatFromTokens(pVarIn, pstrFormat, pbTokCur, dwFlags, pbstrOut, lcid)。
+            const auto output=call(tokens?4:5);const auto flags=static_cast<std::uint32_t>(call(tokens?3:4));
+            if(!call(0) || !output)co_return finish(invalid);
+            std::u16string format;std::uint32_t lcid=0x400;int first_day=0,first_week=0;
+            try{
+                m.store(GuestAddress{output},bits,0);
+                if(tokens){
+                    if(!call(2) || m.load(GuestAddress{call(2)},32)!=format_token_signature)co_return finish(invalid);
+                    first_day=static_cast<int>(m.load(GuestAddress{call(2)+4},8));first_week=static_cast<int>(m.load(GuestAddress{call(2)+5},8));
+                    format=read_utf16_counted(m,GuestAddress{call(2)+12},static_cast<std::size_t>(m.load(GuestAddress{call(2)+6},16)));lcid=static_cast<std::uint32_t>(call(5));
+                }else{
+                    if(call(1))format=read_utf16(m,GuestAddress{call(1)},32767);
+                    first_day=static_cast<int>(static_cast<std::int32_t>(static_cast<std::uint32_t>(call(2))));first_week=static_cast<int>(static_cast<std::int32_t>(static_cast<std::uint32_t>(call(3))));
+                }
+            }catch(const MemoryFault&){co_return finish(invalid);}
+            if(first_day<0 || first_day>7 || first_week<0 || first_week>3)co_return finish(invalid);
+            GuestScratch scratch(*this,m,s);constexpr unsigned capacity=512;
+            const auto block=scratch.allocate(variant_size),buffer=scratch.allocate(capacity*2);if(!block || !buffer)co_return finish(nomemory);
+            const auto convert=resolve("oleaut32.dll","VariantChangeTypeEx").value,release=resolve("oleaut32.dll","SysFreeString").value;
+            const auto bstr_text=[&](std::uint64_t bstr){return bstr?read_utf16_counted(m,GuestAddress{bstr},static_cast<std::size_t>(m.load(GuestAddress{bstr-4},32)/2)):std::u16string{};};
+            // 文字形式（字串格式與無法格式化時使用）：布林值顯示 True／False。
+            FormatValue value;std::u16string general;bool have_text=false;
+            auto vt=m.load(GuestAddress{call(0)},16);std::uint64_t variant=call(0);
+            if(vt==(0x4000U|12U)){variant=m.load(GuestAddress{call(0)+8},bits);vt=variant?m.load(GuestAddress{variant},16):0;}
+            const auto base=vt&0xfffU;
+            if(base==1)value.kind=FormatValue::Kind::Null;
+            else{
+                if(!co_await service_callback::call(convert,{block,variant,lcid,2,8})){general=bstr_text(m.load(GuestAddress{block+8},bits));have_text=true;(void)co_await service_callback::call(release,{m.load(GuestAddress{block+8},bits)});m.store(GuestAddress{block},16,0);}
+                value.text=general;
+                if(base==0)value.kind=FormatValue::Kind::Empty;
+                else{
+                    auto status=co_await service_callback::call(convert,{block,variant,lcid,0,14});
+                    if(status==overflow)status=co_await service_callback::call(convert,{block,variant,lcid,0,5});
+                    if(!status){
+                        Value number{};m.read(GuestAddress{block},std::span{number}.first(variant_size));
+                        try{const auto decimal=plain_decimal(number_string(number),0);value.negative=decimal.starts_with('-');value.magnitude=value.negative?decimal.substr(1):decimal;value.kind=FormatValue::Kind::Number;}
+                        catch(const std::exception&){value.kind=FormatValue::Kind::Text;}
+                    }else value.kind=FormatValue::Kind::Text;
+                }
+                value.zero=value.magnitude=="0";
+                if(base!=0 && !co_await service_callback::call(convert,{block,variant,lcid,0,7})){
+                    const auto when=std::bit_cast<double>(m.load(GuestAddress{block+8},64));if(const auto fields=time_fields(when)){value.date=*fields;value.has_date=true;}
+                }
+            }
+            if(format.empty()){
+                // 沒有格式：與轉成字串相同；Null 為 NULL BSTR。
+                if(value.kind==FormatValue::Kind::Null)co_return finish(0);
+                if(!have_text)co_return finish(mismatch);
+            }
+            FormatLocale locale;std::u16string expanded;NamedFormat named=NamedFormat::None;
+            try{
+                const auto nested=[&](std::string_view symbol,std::initializer_list<std::uint64_t> arguments){return static_cast<std::uint32_t>(nested_service(s,m,"kernel32.dll",symbol,arguments));};
+                const auto info=[&](std::uint32_t type){const auto length=nested("GetLocaleInfoW",{lcid,type|(flags&0x80000000U),buffer,capacity});return length?read_utf16(m,GuestAddress{buffer},capacity):std::u16string{};};
+                const auto number=[&](std::uint32_t type){unsigned v=0;for(const auto c:info(type)){if(c<u'0' || c>u'9')break;v=v*10+static_cast<unsigned>(c-u'0');}return v;};
+                if(!format.empty())named=named_format(format,expanded);
+                for(const auto [field,type]:{std::pair{&locale.decimal,0x0eU},{&locale.thousands,0x0fU},{&locale.date_separator,0x1dU},{&locale.time_separator,0x1eU},{&locale.am,0x28U},{&locale.pm,0x29U}})
+                    if(auto text=info(type);!text.empty() || type==0x0fU)*field=std::move(text);
+                // LOCALE_SDAYNAME1（星期一）起；陣列以星期日為 0。
+                for(unsigned i=0;i<7;++i){locale.days[(i+1)%7]=info(0x2aU+i);locale.short_days[(i+1)%7]=info(0x31U+i);}
+                for(unsigned i=0;i<12;++i){locale.months[i]=info(0x38U+i);locale.short_months[i]=info(0x44U+i);}
+                locale.first_day=(number(0x100cU)+1)%7+1;const auto week=number(0x100dU);locale.first_week=week==1?3U:week==2?2U:1U;
+                if(value.has_date){
+                    const auto systemtime=scratch.allocate(16);if(!systemtime)co_return finish(nomemory);
+                    for(unsigned i=0;i<8;++i)m.store(GuestAddress{systemtime+i*2},16,value.date[i]);
+                    const auto date_text=[&](std::uint32_t style){const auto length=nested("GetDateFormatW",{lcid,style|(flags&0x80000000U),systemtime,0,buffer,capacity});return length?read_utf16(m,GuestAddress{buffer},capacity):std::u16string{};};
+                    const auto time_text=[&]{const auto length=nested("GetTimeFormatW",{lcid,flags&0x80000000U,systemtime,0,buffer,capacity});return length?read_utf16(m,GuestAddress{buffer},capacity):std::u16string{};};
+                    locale.short_date=date_text(1);locale.long_date=date_text(2);locale.long_time=time_text();
+                    const bool whole_day=!value.date[4] && !value.date[5] && !value.date[6],no_date=value.date[0]==1899 && value.date[1]==12 && value.date[3]==30;
+                    locale.general_date=no_date?locale.long_time:whole_day?locale.short_date:locale.short_date+u" "+locale.long_time;
+                }
+            }catch(const std::invalid_argument&){co_return finish(invalid);}catch(const std::bad_alloc&){co_return finish(nomemory);}
+            const unsigned day=first_day?static_cast<unsigned>(first_day):locale.first_day,week=first_week?static_cast<unsigned>(first_week):locale.first_week;
+            std::optional<std::u16string> text;
+            if(format.empty())text=general;
+            else switch(named){
+            case NamedFormat::GeneralNumber:
+                if(value.kind!=FormatValue::Kind::Null)text=general;
+                break;
+            case NamedFormat::Currency:
+                if(value.kind==FormatValue::Kind::Text)text=value.text;
+                else if(value.kind!=FormatValue::Kind::Null){
+                    const auto status=co_await service_callback::call(resolve("oleaut32.dll","VarFormatCurrency").value,{variant,UINT32_MAX,UINT32_MAX-1,UINT32_MAX-1,UINT32_MAX-1,flags&0x80000000U,block});
+                    if(status)co_return finish(status);
+                    const auto bstr=m.load(GuestAddress{block},bits);text=bstr_text(bstr);(void)co_await service_callback::call(release,{bstr});
+                }
+                break;
+            case NamedFormat::YesNo:case NamedFormat::TrueFalse:case NamedFormat::OnOff:
+                if(value.kind==FormatValue::Kind::Text)text=value.text;
+                else if(value.kind!=FormatValue::Kind::Null)
+                    text=named==NamedFormat::YesNo?(value.zero?u"No":u"Yes"):named==NamedFormat::TrueFalse?(value.zero?u"False":u"True"):(value.zero?u"Off":u"On");
+                break;
+            case NamedFormat::GeneralDate:case NamedFormat::LongDate:case NamedFormat::ShortDate:case NamedFormat::LongTime:case NamedFormat::ShortTime:
+                if(value.kind==FormatValue::Kind::Null)break;
+                if(!value.has_date)text=general;
+                else text=named==NamedFormat::GeneralDate?locale.general_date:named==NamedFormat::LongDate?locale.long_date:named==NamedFormat::ShortDate?locale.short_date:
+                    named==NamedFormat::LongTime?locale.long_time:format_date_section(u"hh:nn",value,locale,day,week);
+                break;
+            default:text=apply_format(expanded,value,locale,day,week,general);
+            }
+            if(!text)co_return finish(0);
+            auto data=utf16_bytes(*text);data.resize(data.size()-2);
+            const auto string=allocate_bstr(m,data.size(),data);if(!string)co_return finish(nomemory);
+            m.store(GuestAddress{output},bits,string);co_return finish(0);
+        });
+    }
     if(name.starts_with("VarFormat")){
         return nested_continuation(state,memory,"VarFormat",[this,service,unit,variant_size,bits](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
             const WindowsCall call(s,m,service);const auto name=service.symbol;const bool date=name=="VarFormatDateTime";

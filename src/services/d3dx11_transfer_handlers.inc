@@ -44,3 +44,26 @@
                 }
             }
         }
+        if(symbol=="D3DX11FilterTexture"){
+            // (Context, Texture, SrcLevel, MipFilter)：以 SrcLevel 的內容依序縮小產生其下各層，每個陣列元素（含立方體面）各自處理，
+            // 下一層由前一層濾波而來。D3DX11_DEFAULT：SrcLevel 為 0、MipFilter 為 BOX；濾鏡旗標與 D3DX9 相同並沿用共用像素轉換。
+            graphics_handled=true;
+            const auto context=typed(arg(0),Kind::Context),texture=object(arg(1)).identity;
+            require(!context->context_type && texture->device==context->device && texture->resource && !texture->offered);
+            const auto& desc=texture->resource->desc;require(desc.dimension>=2 && desc.samples==1);
+            const auto source_level=static_cast<std::uint32_t>(arg(2))==UINT32_MAX?0U:static_cast<std::uint32_t>(arg(2));
+            const auto filter=static_cast<std::uint32_t>(arg(3))==UINT32_MAX?5U:static_cast<std::uint32_t>(arg(3));
+            require(source_level<desc.levels && (filter&15U)>=1 && (filter&15U)<=5 && !(filter&~0x7f000fU));
+            const auto dimensions=[](const auto& d,unsigned mip){return std::array{std::max(1U,d.width>>mip),std::max(1U,d.height>>mip),std::max(1U,d.depth>>mip)};};
+            for(unsigned element=0;element<desc.layers;++element){
+                if(source_level+1>=desc.levels)break;
+                auto previous=context->native->graphics_read(subresource(texture,element*desc.levels+source_level));auto previous_size=dimensions(desc,source_level);
+                for(unsigned mip=source_level+1;mip<desc.levels;++mip){
+                    const auto size=dimensions(desc,mip);
+                    auto filtered=texture_image::transform(previous,desc.format,previous_size,{0,0,0,previous_size[0],previous_size[1],previous_size[2]},desc.format,size,filter);
+                    const auto pitch=graphics_format_pitch(desc.format,size[0],size[1]);
+                    context->native->graphics_write_region(subresource(texture,element*desc.levels+mip),filtered,pitch[0],pitch[0]*pitch[1],{0,0,0,size[0],size[1],size[2]});
+                    previous=std::move(filtered);previous_size=size;
+                }
+            }
+        }

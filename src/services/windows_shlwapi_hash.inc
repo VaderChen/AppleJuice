@@ -1,0 +1,51 @@
+// shlwapi 雜湊與路徑字元（由 windows_shlwapi_misc.cpp 的 invoke_shlwapi_misc 引入；kernelbase 經別名共用）：
+// - HashData：Pearson 雜湊，每個輸出位元組 i 以 T[(data[0]+i)&255] 起始、依序以 T[h^data[j]] 混入其餘輸入；T 為固定的 0～255 排列。
+// - UrlHashA／W：對 URL 的 ANSI 位元組（W 版先轉 ACP）做 HashData；輸出長度 1～256。
+// - PathIsValidCharA／W：控制字元與 < > | 永遠無效；? * . \ / : ; , 空白 " 依 PIVC_ALLOW_* 旗標；英數字與非 ASCII 字元有效；
+//   其他標點需要 PIVC_ALLOW_NONALPAHABETIC。
+// - SHTruncateString：截斷 ANSI 字串到緩衝區長度減一，不切開多位元組字元（ACP 為 UTF-8），回傳結果長度。
+if(name=="HashData" || name.starts_with("UrlHash")){
+    static const auto table=[]{
+        std::array<std::uint8_t,256> value{};for(unsigned i=0;i<256;++i)value[i]=static_cast<std::uint8_t>(i);
+        std::uint32_t seed=0x2545f491U;for(unsigned i=255;i>0;--i){seed=seed*1103515245U+12345U;std::swap(value[i],value[(seed>>8)%(i+1)]);}
+        return value;
+    }();
+    constexpr std::uint32_t invalid_argument=0x80070057U;
+    std::vector<std::uint8_t> input;std::uint64_t output=0;std::uint32_t count=0;
+    if(name=="HashData"){
+        // (pbData, cbData, pbHash, cbHash)
+        if(!arg(0) || !arg(2))return done(invalid_argument);input.resize(u32(1));if(!input.empty())memory.read(GuestAddress{arg(0)},input);output=arg(2);count=u32(3);
+    }else{
+        // (pszUrl, pbHash, cbHash)
+        if(!arg(0) || !arg(1) || !u32(2) || u32(2)>256)return done(invalid_argument);
+        const auto text=name.ends_with('W')?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(0)},0x10000)):read_ansi(memory,arg(0),0x40000);
+        input.assign(text.begin(),text.end());output=arg(1);count=u32(2);
+    }
+    std::vector<std::uint8_t> hash(count);
+    for(std::uint32_t i=0;i<count;++i){
+        auto h=table[(static_cast<unsigned>(input.empty()?0U:input[0])+i)&255U];
+        for(std::size_t j=1;j<input.size();++j)h=table[h^input[j]];
+        hash[i]=h;
+    }
+    if(count)memory.write(GuestAddress{output},hash);
+    return done(0);
+}
+if(name.starts_with("PathIsValidChar")){
+    // (ch, dwFlags)：A 版為 UCHAR，W 版為 WCHAR。
+    const auto ch=name.ends_with('W')?static_cast<std::uint32_t>(u32(0)&0xffffU):static_cast<std::uint32_t>(u32(0)&0xffU);const auto flags=u32(1);
+    if(ch<0x20 || ch==0x7f || ch=='<' || ch=='>' || ch=='|')return done(0);
+    std::uint32_t needed=0;
+    switch(ch){case '?':needed=0x1;break;case '*':needed=0x2;break;case '.':needed=0x4;break;case '\\':case '/':needed=0x8;break;case ':':needed=0x10;break;
+        case ';':needed=0x20;break;case ',':needed=0x40;break;case ' ':needed=0x80;break;case '"':needed=0x200;break;default:break;}
+    const bool alphanumeric=(ch>='0' && ch<='9') || (ch>='A' && ch<='Z') || (ch>='a' && ch<='z') || ch>=0x80;
+    if(!needed && !alphanumeric)needed=0x100;
+    return done(!needed || (flags&needed)?1U:0U);
+}
+if(name=="SHTruncateString"){
+    // (psz, cchBufferSize)：字串已經放得下時不變。
+    if(!arg(0) || !u32(1))return done(0);
+    auto text=read_ansi(memory,arg(0),0x40000);const auto limit=u32(1);
+    if(text.size()<limit)return done(text.size());
+    std::size_t cut=limit-1;while(cut>0 && (static_cast<unsigned char>(text[cut])&0xc0U)==0x80U)--cut;
+    memory.store(GuestAddress{arg(0)+cut},8,0);return done(cut);
+}

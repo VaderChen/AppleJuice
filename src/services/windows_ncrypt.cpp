@@ -77,6 +77,54 @@ std::uint32_t WindowsServices::storage_crypto_call(GuestMemory& memory,const Win
             require(!u32(2),bad_flags);require(arg(0)!=0);memory.check(GuestAddress{arg(0)},unit,Access::Write);if(arg(1))require(wide(arg(1))=="Microsoft Software Key Storage Provider",0x80090013);require(runtime_.storage_crypto_providers.size()<1024,no_memory);const auto handle=runtime_.next_crypto_handle++;runtime_.storage_crypto_providers.insert(handle);memory.store(GuestAddress{arg(0)},bits,handle);return 0;
         }
         if(symbol=="NCryptIsAlgSupported"){require(provider,bad_handle);require(!(u32(2)&~0x40U),bad_flags);require(storage_supported(wide(arg(1))),unsupported);return 0;}
+        // NCrypt 配置的輸出（NCryptEnumAlgorithms 的陣列、NCryptEnumKeys 的金鑰名稱與列舉狀態）前置 16 位元組標頭（識別碼、種類、長度），
+        // NCryptFreeBuffer 依標頭驗證後釋放；不是 NCrypt 配置的指標回 NTE_INVALID_PARAMETER。
+        constexpr std::uint64_t buffer_magic=UINT64_C(0x3146554243574e4d);
+        const auto allocate_buffer=[&](std::size_t size,std::uint32_t kind)->std::uint64_t{
+            require(size<=output_limit,no_memory);const auto block=allocate_heap(memory,16+size);require(block!=0,no_memory);memory.fill(GuestAddress{block},0,16+size);
+            memory.store(GuestAddress{block},64,buffer_magic);memory.store(GuestAddress{block+8},32,kind);memory.store(GuestAddress{block+12},32,static_cast<std::uint32_t>(size));return block+16;};
+        const auto buffer_kind=[&](std::uint64_t pointer)->std::uint32_t{
+            if(pointer<16)return 0;try{if(memory.load(GuestAddress{pointer-16},64)!=buffer_magic)return 0;return static_cast<std::uint32_t>(memory.load(GuestAddress{pointer-8},32));}catch(const MemoryFault&){return 0;}};
+        if(symbol=="NCryptFreeBuffer"){
+            require(buffer_kind(arg(0))!=0,invalid);memory.store(GuestAddress{arg(0)-16},64,0);(void)free_heap(memory,arg(0)-16,GuestState{});return 0;
+        }
+        if(symbol=="NCryptEnumAlgorithms"){
+            // (hProvider, dwAlgOperations, *pdwAlgCount, **ppAlgList, dwFlags)：本 KSP 可建立與儲存的演算法；dwAlgOperations 為 0 時全部列出。
+            // NCryptAlgorithmName：pszName、dwClass、dwAlgOperations、dwFlags；沒有符合的演算法時 NTE_NOT_SUPPORTED。
+            require(provider,bad_handle);require(!(u32(4)&~0x40U),bad_flags);const auto operations=u32(1);require(!(operations&~0x1fU),invalid);
+            require(arg(2)!=0 && arg(3)!=0);memory.check(GuestAddress{arg(2)},4,Access::Write);memory.check(GuestAddress{arg(3)},unit,Access::Write);
+            struct Entry {std::u16string_view name;std::uint32_t kind,operations;};
+            static constexpr Entry all[]{{u"RSA",3,4U|16U},{u"ECDH_P256",4,8},{u"ECDH_P384",4,8},{u"ECDH_P521",4,8},{u"ECDSA_P256",5,16},{u"ECDSA_P384",5,16},{u"ECDSA_P521",5,16}};
+            std::vector<const Entry*> chosen;for(const auto& entry:all)if(!operations || (entry.operations&operations))chosen.push_back(&entry);
+            require(!chosen.empty(),unsupported);
+            const unsigned entry_size=x86_?16U:24U;std::size_t size=entry_size*chosen.size();for(const auto* entry:chosen)size+=(entry->name.size()+1)*2;
+            const auto list=allocate_buffer(size,1);auto text=list+entry_size*chosen.size();
+            for(std::size_t i=0;i<chosen.size();++i){const auto at=list+entry_size*i;const auto bytes=utf16_bytes(chosen[i]->name);memory.write(GuestAddress{text},bytes);
+                memory.store(GuestAddress{at},bits,text);memory.store(GuestAddress{at+unit},32,chosen[i]->kind);memory.store(GuestAddress{at+unit+4},32,chosen[i]->operations);text+=bytes.size();}
+            memory.store(GuestAddress{arg(2)},32,chosen.size());memory.store(GuestAddress{arg(3)},bits,list);return 0;
+        }
+        if(symbol=="NCryptEnumKeys"){
+            // (hProvider, pszScope, **ppKeyName, **ppEnumState, dwFlags)：持久金鑰依名稱排序逐一傳回（NCRYPT_MACHINE_KEY_FLAG 為機器金鑰）；列舉狀態保存下一個位置，
+            // 每次重新列出容器，讀不出的容器略過；結束時 NTE_NO_MORE_ITEMS。NCryptKeyName：pszName、pszAlgid、dwLegacyKeySpec、dwFlags。pszScope 保留，須為 NULL。
+            require(provider,bad_handle);const auto flags=u32(4);require(!(flags&~0x60U),bad_flags);require(!arg(1) && arg(2)!=0 && arg(3)!=0);
+            memory.check(GuestAddress{arg(2)},unit,Access::Write);memory.check(GuestAddress{arg(3)},unit,Access::Write);const bool machine=(flags&0x20U)!=0;
+            auto state_pointer=memory.load(GuestAddress{arg(3)},bits);std::uint32_t index=0;
+            if(state_pointer){require(buffer_kind(state_pointer)==3,invalid);index=static_cast<std::uint32_t>(memory.load(GuestAddress{state_pointer},32));
+                require((memory.load(GuestAddress{state_pointer+4},32)!=0)==machine,invalid);}
+            external();std::vector<std::string> names;const auto listed=private_key_store_list(private_key_context(),storage_crypto_type,machine,names);require(!listed,storage_error(listed));
+            for(;index<names.size();++index){
+                StorageCryptoKey value;if(load_storage_crypto_key(private_key_context(),names[index],machine,0,value))continue;
+                const auto name=utf16_bytes(utf8_to_utf16(names[index])),algorithm=utf16_bytes(utf8_to_utf16(value.algorithm));OPENSSL_cleanse(value.der.data(),value.der.size());
+                const unsigned fixed=x86_?16U:24U;const auto key_name=allocate_buffer(fixed+name.size()+algorithm.size(),2);
+                memory.write(GuestAddress{key_name+fixed},name);memory.write(GuestAddress{key_name+fixed+name.size()},algorithm);
+                memory.store(GuestAddress{key_name},bits,key_name+fixed);memory.store(GuestAddress{key_name+unit},bits,key_name+fixed+name.size());
+                memory.store(GuestAddress{key_name+2*unit},32,value.legacy_spec);memory.store(GuestAddress{key_name+2*unit+4},32,machine?0x20U:0U);
+                if(!state_pointer){state_pointer=allocate_buffer(8,3);memory.store(GuestAddress{state_pointer+4},32,machine?1U:0U);}
+                memory.store(GuestAddress{state_pointer},32,index+1);memory.store(GuestAddress{arg(2)},bits,key_name);memory.store(GuestAddress{arg(3)},bits,state_pointer);return 0;
+            }
+            if(state_pointer)memory.store(GuestAddress{state_pointer},32,static_cast<std::uint32_t>(names.size()));
+            return 0x8009002aU; // NTE_NO_MORE_ITEMS
+        }
         if(symbol=="NCryptCreatePersistedKey" || symbol=="NCryptOpenKey"){
             require(provider,bad_handle);require(arg(1)!=0);memory.check(GuestAddress{arg(1)},unit,Access::Write);const bool open=symbol=="NCryptOpenKey";const auto flags=u32(open?4:5);require(!(flags&~(open?0x60U:0xe0U)),bad_flags);require(u32(open?3:4)<=2);StorageCryptoKey value;value.user_scope=private_key_context().user_sid;value.machine=(flags&32)!=0;value.overwrite=(flags&128)!=0;value.legacy_spec=u32(open?3:4);
             if(open){value.name=wide(arg(2));require(!value.name.empty());external();StorageCryptoKey restored_key;const auto status=load_storage_crypto_key(private_key_context(),value.name,value.machine,value.legacy_spec,restored_key);require(!status,status);return create(std::move(restored_key),1);}

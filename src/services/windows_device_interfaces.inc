@@ -65,22 +65,5 @@
                 }
                 if(arg(2) || (arg(3)&0x300U)==0x300U)return failed(87);
                 if((arg(3)&0x200U) || (arg(3)&~0x020f013fU))return failed(50);
-                if(runtime_.registry.handles.size()>=4096)return failed(8);
-                auto& registry=runtime_.registry;RegistryTransaction transaction(registry,registry_file_);if(transaction.error)return failed(transaction.error);
-                auto instance=node.port_name.empty()?node.id:node.port_name;std::replace(instance.begin(),instance.end(),u'\\',u'#');
-                const auto path=folded(std::u16string(1,2)+u"\\system\\currentcontrolset\\control\\deviceclasses\\"+guid_name(entry.guid)+u"\\"+instance+u"\\#\\device parameters");
-                if(!registry.keys.contains(path)){
-                    std::map<std::u16string,RegistryValue> values;
-                    const auto add=[&](std::u16string key,std::u16string_view text){RegistryValue value;value.type=1;value.display_name=key;value.bytes=utf16_bytes(text);values.emplace(folded(std::move(key)),std::move(value));};
-                    add(u"DeviceInstance",node.id);add(u"SymbolicLink",node.interface_path);if(!node.port_name.empty())add(u"PortName",node.port_name);
-                    std::uint64_t added=0;for(const auto& [key,value]:values){(void)key;added+=value.bytes.size();}
-                    if(registry.bytes+added>output_limit || registry.values+values.size()>4096 || registry.keys.size()+12>4096)return failed(8);
-                    const auto before=registry;
-                    for(std::size_t end=1;;){registry.keys.try_emplace(path.substr(0,end));end=path.find(u'\\',end+1);if(end==path.npos)break;}
-                    registry.values+=static_cast<std::uint32_t>(values.size());registry.bytes+=added;registry.keys[path]=std::move(values);
-                    if(const auto error=transaction.commit();error){registry=before;return failed(error);}
-                }
-                const auto handle=registry.next_handle++;
-                const auto access=static_cast<std::uint32_t>(arg(3)&0x02000000U?0xf003fU:arg(3)&~0x100U);
-                registry.handles.emplace(handle,RegistryHandle{path,access});return finish(handle);
+                const auto [error,handle]=open_interface_key(node,entry.guid,static_cast<std::uint32_t>(arg(3)));if(error)return failed(error);return finish(handle);
             }

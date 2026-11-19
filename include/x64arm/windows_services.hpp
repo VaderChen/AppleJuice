@@ -55,6 +55,8 @@ struct MinidumpState;
 struct DemangleState;
 struct Msvcp100State;
 struct DeviceConfigurationState;
+struct DnsServiceState;
+struct DnsServiceInstanceData;
 struct SetupInfState;
 struct BluetoothState;
 class MachineShutdown;
@@ -84,6 +86,7 @@ struct MciState;
 struct LegacyJoystick;
 struct JobState;
 struct PrintingState;
+struct UriState;
 struct MetafileState;
 struct OleStreamState;
 struct ComRpcState;
@@ -170,6 +173,24 @@ private:
     alignas(64) std::atomic<std::uintptr_t> owner_{0};
     std::atomic<unsigned> waiters_{0};
     unsigned depth_{0}; // 只由擁有者讀寫。
+};
+// ConcRT 結構化任務集合（以客體集合位址為鍵）：待認領與已排程的 chore、父集合、取消與等待事件。
+struct ConcrtCollection {
+    std::vector<std::uint64_t> pending, scheduled;
+    std::uint64_t parent{}, token{}, event{};
+    std::uint32_t running{};
+    bool canceled{}, registered{};
+};
+// ConcRT 排程器物件（以客體物件位址為鍵）：識別碼、參考數、政策值（與 SchedulerPolicy 的值袋相同的 10 個鍵）與關閉事件。
+struct ConcrtScheduler {
+    std::uint32_t id{}, references{1};
+    std::array<std::uint32_t,10> policy{};
+    std::vector<std::uint64_t> shutdown_events;
+};
+// ConcRT Context 物件（每個客體執行緒一個）：Block／Unblock 的等待事件與狀態。
+struct ConcrtContext {
+    std::uint64_t object{}, event{};
+    bool blocked{}, unblocked{};
 };
 class WindowsServices final : public HostServices {
     friend struct WindowsNetworkTestAccess;
@@ -495,6 +516,39 @@ private:
     struct WerFile {std::u16string key,path;std::uint32_t type{},flags{};};
     std::vector<WerFile> wer_files_;
     std::vector<std::pair<std::u16string,std::u16string>> wer_metadata_;
+    // WerReportCreate 的報告物件（HREPORT → 內容）；沙箱不產生錯誤報告，送出時回 WerDisabled。
+    struct WerReport {std::u16string event_type;std::uint32_t type{};std::array<std::u16string,10> names{},values{};std::uint32_t parameters{},dumps{};
+        std::vector<std::pair<std::u16string,std::uint32_t>> files{};std::map<std::uint32_t,std::u16string> options{};};
+    std::map<std::uint64_t,WerReport> wer_reports_;
+    // IoRing（CreateIoRing）：使用者模式模擬；Build* 排入提交佇列，SubmitIoRing 依序同步執行並產生完成項目。
+    struct IoRingEntry {std::uint32_t op{},file_kind{},buffer_kind{},buffer_index{},buffer_offset{},bytes{},flags{},count{};std::uint64_t file{},buffer{},user_data{},offset{},target{};};
+    struct IoRingCompletion {std::uint64_t user_data{},information{};std::uint32_t result{};};
+    struct IoRing {std::uint32_t version{},required{},advisory{},submission{},completion{};std::uint64_t event{};std::vector<IoRingEntry> pending{};
+        std::vector<IoRingCompletion> completions{};std::vector<std::uint64_t> files{};std::vector<std::pair<std::uint64_t,std::uint32_t>> buffers{};};
+    std::map<std::uint64_t,IoRing> io_rings_;
+    // ConcRT：已隱含附加預設排程器的客體執行緒。
+    std::set<std::uint64_t> concrt_attached_;
+    std::map<std::uint64_t,ConcrtCollection> concrt_collections_;
+    // 每個客體執行緒正在執行 chore 的集合堆疊（巢狀集合的父子關係與目前集合的取消查詢）；取消信標 → 登記時的集合；Oversubscribe 巢狀次數。
+    std::map<std::uint64_t,std::vector<std::uint64_t>> concrt_current_;
+    std::map<std::uint64_t,std::uint64_t> concrt_beacons_;
+    std::map<std::uint64_t,std::uint32_t> concrt_oversubscribed_, concrt_context_ids_;
+    // 排程器、排程群組（物件 → {排程器, 參考數, 識別碼}）、每執行緒明確附加的排程器堆疊、Context 物件與三個 vtable（排程器、群組、Context）。
+    std::map<std::uint64_t,ConcrtScheduler> concrt_schedulers_;
+    std::map<std::uint64_t,std::array<std::uint64_t,3>> concrt_groups_;
+    std::map<std::uint64_t,std::vector<std::uint64_t>> concrt_scheduler_stack_;
+    std::map<std::uint64_t,ConcrtContext> concrt_contexts_;
+    std::uint64_t concrt_default_scheduler_{};
+    std::array<std::uint64_t,3> concrt_vtables_{};
+    std::uint32_t concrt_next_scheduler_{2}, concrt_next_group_{1};
+    bool concrt_canceling(std::uint64_t collection) const {
+        for(unsigned depth=0;collection && depth<256;++depth){const auto found=concrt_collections_.find(collection);if(found==concrt_collections_.end())return false;if(found->second.canceled)return true;collection=found->second.parent;}
+        return false;
+    }
+    bool concrt_descends(std::uint64_t collection,std::uint64_t ancestor) const {
+        for(unsigned depth=0;collection && depth<256;++depth){if(collection==ancestor)return true;const auto found=concrt_collections_.find(collection);if(found==concrt_collections_.end())return false;collection=found->second.parent;}
+        return false;
+    }
     std::vector<std::pair<std::uint64_t,std::uint32_t>> wer_memory_blocks_,wer_excluded_blocks_;
     // Xbox 遊戲 UI：等待 ProcessPendingGameUI 呼叫完成常式的 UI（完成常式、context、結果、是否為玩家選擇器）。
     struct PendingGameUi {std::uint64_t routine{},context{};std::uint32_t result{};bool picker{};};
@@ -540,6 +594,7 @@ private:
     // urlmon 安全區域管理員與 DXVA2 裝置管理員／視訊服務。
     struct UrlSecurityManager {std::uint32_t references{1};std::uint64_t site{};bool operator==(const UrlSecurityManager&)const=default;};
     std::map<std::uint64_t,UrlSecurityManager> url_security_managers_;std::uint64_t url_security_table_{};
+    std::shared_ptr<UriState> uri_state_; // urlmon 的 IUri／IUriBuilder 物件（windows_url_security.cpp）
     // urlmon 工作階段選項：UrlMkSetSessionOption 設定的 User-Agent 與 URL 編碼政策（未設定時依登錄與預設值）。
     std::optional<std::string> urlmon_user_agent_;std::optional<std::uint32_t> urlmon_url_encoding_;
     std::uint32_t url_zone(std::u16string_view url);
@@ -669,7 +724,7 @@ private:
     std::uint32_t process_parent_id() const;
     std::uint32_t capture_process_snapshot(GuestMemory&,std::vector<ProcessSnapshot::Process>&);
     // session 內程序的映像完整 DOS 路徑（本程序直接取，其他程序以遠端資訊查詢 NT 路徑後換回磁碟代號）；程序不存在時 1168。
-    std::uint32_t process_image_path(GuestMemory&,std::uint32_t,std::u16string&);
+    std::uint32_t process_image_path(GuestMemory&,std::uint32_t,std::u16string&,std::uint64_t expected_birth=0);
     std::uint32_t capture_thread_snapshot(GuestMemory&,std::vector<ProcessSnapshot::Thread>&);
     std::vector<ProcessSnapshot::Thread> local_thread_snapshot();
     struct KernelModuleRecord {std::uint64_t base{},size{};std::uint32_t references{};std::u16string path;};
@@ -702,6 +757,24 @@ private:
     std::optional<std::uint32_t> invoke_process_memory(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_nt_process(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_nt_native(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // NT 物件命名空間（windows_object_namespace.inc）：內建／動態目錄、符號連結與私有命名空間共用同一套路徑解析。
+    // status 0 為找到；STATUS_OBJECT_NAME_NOT_FOUND 時 parent／leaf 指出可建立的位置；其餘為錯誤。
+    struct NamespaceLookup {
+        std::uint32_t status{};std::u16string path,parent,leaf,target;
+        std::uint32_t builtin{UINT32_MAX},parent_builtin{UINT32_MAX};bool link{},builtin_link{};
+        std::shared_ptr<ObjectDirectory> entry,parent_entry;
+    };
+    std::vector<std::pair<std::u16string,std::u16string>> builtin_namespace_links();
+    NamespaceLookup lookup_object_namespace(std::u16string path,bool open_link);
+    // NT 名稱（已套用根目錄）→ Win32 具名物件名稱；目錄跟隨符號連結，動態目錄與私有命名空間內的物件使用內部名稱。
+    std::uint32_t namespace_object_name(std::u16string& name,bool creating);
+    // Win32 名稱中的私有命名空間別名或 BaseNamedObjects 下的子目錄；回 Win32 錯誤碼，名稱不含子路徑時不變。
+    std::uint32_t win32_namespace_object_name(std::u16string& name,bool creating);
+    std::u16string namespace_display_name(std::u16string_view name);
+    std::vector<std::pair<std::u16string,std::u16string>> object_directory_listing(const ObjectDirectory&);
+    std::optional<std::uint32_t> invoke_object_namespace(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // 私有命名空間別名（大小寫折疊）→ 建立／開啟時的控制代碼與物件；控制代碼關閉後別名失效。
+    std::map<std::u16string,std::pair<std::uint64_t,std::weak_ptr<ObjectDirectory>>> private_namespace_aliases_;
     std::optional<std::uint32_t> resume_nt_native(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
     struct NativeOperation {
         std::string symbol;
@@ -845,6 +918,7 @@ private:
     std::optional<std::uint32_t> invoke_socket_namespace(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     // dnsapi 的記錄比較／複製、訊息編解碼、解析器快取、設定查詢與 DnsQueryEx（windows_dns_records.cpp）。
     std::optional<std::uint32_t> invoke_dns_records(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::uint64_t dns_store_instance(GuestMemory&,const DnsServiceInstanceData&);
     // 將 RR 依 DNS_RECORD 版面逐筆配置並串接，登錄於 network.addresses 供 DnsRecordListFree 釋放；失敗時全部回收後丟出。
     std::uint64_t dns_store_records(GuestState&,GuestMemory&,const std::vector<dns_detail::Record>&,unsigned charset,const std::vector<unsigned>* charsets=nullptr);
     std::optional<std::uint32_t> invoke_socket_database(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -1010,6 +1084,8 @@ private:
     std::uint32_t default_search_paths(GuestMemory&, std::vector<std::u16string>& paths, std::size_t* current_index = nullptr);
     // SearchTreeForFile 的目錄走訪（FindExecutableImage／FindDebugInfoFile 共用）。
     std::optional<std::u16string> search_tree_for_file(std::u16string root, std::u16string_view file);
+    // search_tree_for_file 與 EnumDirTree 共用的深度優先走訪：最多 limit 個同名檔案。
+    std::vector<std::u16string> find_tree_files(std::u16string root, std::u16string_view file, std::size_t limit);
     std::uint64_t module_export(GuestMemory&, std::uint64_t module, std::string_view symbol, std::optional<std::uint16_t> ordinal, std::vector<std::uint64_t>& created, unsigned depth = 0, GuestState* = nullptr);
     FileSnapshot read_module_file(GuestState*,GuestMemory&,const std::u16string&);
     std::uint32_t call_guest_native_file(GuestState&,GuestMemory&,std::uint64_t,std::vector<std::uint64_t>);
@@ -1038,6 +1114,7 @@ private:
     bool await_loader(GuestState&,GuestMemory&);
     std::shared_ptr<AccessibleState> accessible_;
     std::optional<std::uint32_t> invoke_eventlog(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_wevtapi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::map<std::uint64_t,PendingAutoProxy> autoproxy_;
     struct ProxyResolver {
         std::shared_ptr<NativeAutoProxy> task;
@@ -1244,6 +1321,8 @@ private:
     std::optional<std::uint32_t> invoke_accessible(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::shared_ptr<DWriteState> dwrite_;
     std::shared_ptr<DeviceConfigurationState> device_configuration_;
+    // dnsapi 的 DNS-SD（DnsServiceBrowse／Resolve／Register、mDNS 查詢）以宿主 Bonjour 承接；操作表與內容 handle 在 windows_dns_records.cpp。
+    std::shared_ptr<DnsServiceState> dns_services_;
     std::shared_ptr<SetupInfState> setup_inf_;
     void prepare_machine_clock();
     std::shared_ptr<MachineShutdown> machine_shutdown_;
@@ -1274,6 +1353,8 @@ private:
     std::u16string keyboard_layout_name();
     std::vector<std::u16string>* current_thread_ui_languages();
     std::pair<std::uint32_t,DirectorySearch> search_directory(const std::string& path);
+    // 與 FindFirstFile 相同的 DOS 萬用字元規則（不分大小寫）。
+    bool directory_name_matches(std::u16string pattern,std::u16string_view name);
     bool for_each_free_heap_page(GuestMemory&,const std::function<void(std::uint64_t,std::uint64_t)>&);
     std::uint64_t crt_readlc_active_{},crt_sbh_threshold_{};std::uint32_t crt_sse2_enabled_{1};
     void refresh_device_configuration(bool hid);
@@ -1964,6 +2045,7 @@ private:
     std::shared_ptr<RasterSurface> raster_surface(GuestMemory&,std::uint64_t dc,bool writing=true);
     std::optional<std::uint32_t> invoke_script(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool record_metafile_draw(std::uint64_t, const GuiDraw&);
+    bool record_metafile_escape(std::uint64_t,std::uint16_t,std::span<const std::uint8_t>);
     std::optional<std::uint32_t> invoke_metafile(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     bool raster_draw(GuestMemory&,std::uint64_t dc,GuiDraw&);
     void sync_raster_bitmap(GuestMemory&,std::uint64_t handle);
@@ -2199,6 +2281,11 @@ private:
     std::vector<GuestCallback> revoke_com_message_filter(GuestMemory& memory, std::uint64_t thread);
     std::optional<std::uint32_t> invoke_profile(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_legacy_device(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
+    struct AviDiskState;
+    std::shared_ptr<AviDiskState> avi_disk_;
+    bool begin_avi_disk(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_avi_disk(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_avifil32(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_vtable_proxy(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_version(GuestState&, GuestMemory&, const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_locale(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -2323,9 +2410,17 @@ private:
     std::uint64_t effective_token_id() const;
     std::optional<std::uint32_t> invoke_dbghelp(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_dbghelp_symbols(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::optional<std::uint32_t> invoke_dbghelp_symbol_core(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // DbgHelp 行號與原始檔（windows_dbghelp_lines.inc）；延伸模組 API 的版本區塊與偵錯器回呼表。
+    std::optional<std::uint32_t> invoke_dbghelp_lines(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    bool terminal_install_mode_{}; // SetTermsrvAppInstallMode／TermsrvAppInstallMode
+    std::uint64_t dbghelp_extension_version_{};std::vector<std::uint8_t> dbghelp_extension_apis_;std::array<std::uint32_t,2> dbghelp_extension_debugger_{};
+    std::optional<std::uint32_t> invoke_dbghelp_files(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     void refresh_symbol_modules(SymbolSession&,const GuestMemory&);
     void discard_symbol_callback(std::uint64_t);
     std::optional<std::uint32_t> resume_symbol_callback(GuestState&,GuestMemory&,std::uint64_t,std::uint64_t);
+    bool start_symbol_events(GuestState&,GuestMemory&,const std::vector<SymbolCallbackEvent>&,std::optional<std::array<std::uint64_t,3>>);
+    std::optional<std::uint32_t> finish_symbol_events(GuestState&,GuestMemory&,std::uint64_t,bool);
     std::optional<std::uint32_t> invoke_control_api(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_userstring(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_msvc(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
@@ -2355,6 +2450,7 @@ private:
     std::array<std::int32_t,4> gui_screen_area();
     std::array<std::int32_t,4> gui_work_area(std::uint64_t excluded=0);
     // HMONITOR 為索引＋1，1 固定為主螢幕；rect／work 為 Windows 虛擬桌面座標。
+    GuiPopupPlacement gui_popup_placement(std::int32_t x,std::int32_t y,std::uint32_t flags);
     const std::vector<GuiMonitor>& gui_monitors();
     std::uint64_t gui_monitor_from_rect(const std::array<std::int32_t,4>& rect,std::uint32_t flags);
     void refresh_gui_areas();
@@ -2644,6 +2740,35 @@ private:
     std::optional<std::uint32_t> invoke_file_links(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_power_schemes(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_ole_picture(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_crt_console_read(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_com_monikers(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    std::optional<std::uint32_t> invoke_ole_advise(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
+    // OLE／資料 advise holder：連線（sink 持有一個參考）；資料連線另存 FORMATETC 與 DVTARGETDEVICE 內容。
+    struct OleAdviseEntry {std::uint32_t connection{},advf{};std::uint64_t sink{};std::vector<std::uint8_t> format,target;bool operator==(const OleAdviseEntry&) const = default;};
+    struct OleAdviseHolder {bool data{};std::uint32_t references{1},next{1};std::vector<OleAdviseEntry> entries;bool operator==(const OleAdviseHolder&) const = default;};
+    struct OleStatEnum {std::vector<OleAdviseEntry> entries;std::size_t position{};std::uint32_t references{1};bool operator==(const OleStatEnum&) const = default;};
+    struct OleVerbEnum {
+        struct Verb {std::int32_t verb{};std::u16string name;std::uint32_t flags{},attributes{};bool operator==(const Verb&) const = default;};
+        std::vector<Verb> verbs;std::size_t position{};std::uint32_t references{1};bool operator==(const OleVerbEnum&) const = default;
+    };
+    std::map<std::uint64_t,OleAdviseHolder> ole_advise_holders_;
+    std::map<std::uint64_t,OleStatEnum> ole_stat_enums_;
+    std::map<std::uint64_t,OleVerbEnum> ole_verb_enums_;
+    std::array<std::uint64_t,4> ole_advise_vtables_{};
+    // OLE 系統 moniker：kind 為 MKSYS 值（1 composite、3 anti、4 item、5 pointer、7 class）；composite 的 parts 為攤平的元件（各持有一個參考）。
+    struct ComMoniker {
+        std::uint8_t kind{};std::uint32_t references{1},count{1};std::u16string delimiter,name;std::array<std::uint8_t,16> clsid{};
+        std::uint64_t pointer{};std::vector<std::uint64_t> parts;
+        bool operator==(const ComMoniker&) const = default;
+    };
+    std::map<std::uint64_t,ComMoniker> com_monikers_;
+    struct ComMonikerEnum {std::vector<std::uint64_t> items;std::size_t position{};std::uint32_t references{1};bool operator==(const ComMonikerEnum&) const = default;};
+    std::map<std::uint64_t,ComMonikerEnum> com_moniker_enums_;
+    std::array<std::uint64_t,4> com_moniker_vtables_{};
+    std::map<std::uint64_t,std::pair<std::uint8_t,std::uint32_t>> com_moniker_factories_; // 系統 moniker class factory：kind 與參考數
+    std::uint64_t com_moniker_table(GuestMemory&,unsigned which);
+    std::uint64_t create_com_moniker(GuestMemory&,ComMoniker value);
+    bool begin_moniker_com(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     // oleaut32 StdPicture：type 為 PICTYPE_*（-1 未初始化），尺寸為 HIMETRIC；WMF 另存 placeable 標頭的邏輯範圍；format 為原始檔格式。
     struct OlePicture {
         std::uint32_t references{1};std::int16_t type{-1};std::uint64_t handle{},palette{},current_dc{};
@@ -2652,7 +2777,25 @@ private:
         bool operator==(const OlePicture&) const = default;
     };
     std::map<std::uint64_t,OlePicture> ole_pictures_;
-    std::array<std::uint64_t,3> ole_picture_vtables_{};
+    std::array<std::uint64_t,4> ole_picture_vtables_{}; // IPicture、IPictureDisp、IPersistStream 與 StdFont／StdPicture class factory
+    std::map<std::uint64_t,std::pair<std::uint8_t,std::uint32_t>> ole_class_factories_; // oleaut32 class factory：類別（1 StdFont、2 StdPicture）與參考數
+    std::uint32_t ole_server_locks_{}; // IClassFactory::LockServer 計數，DllCanUnloadNow 依此與存活物件判斷
+    std::uint64_t ole_picture_table(GuestMemory&,unsigned which);
+    bool begin_ole_picture_com(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    bool begin_file_dialog_com(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    // oleaut32 StdFont：size 為 CY（點數×10000）；font 為目前 HFONT（0 表示需重建）；sinks 為連接點 cookie→{是否 IFontEventsDisp, 接收端參照}。
+    struct OleFont {
+        std::uint32_t references{1};std::u16string name;std::int64_t size{};std::int16_t weight{400},charset{};bool italic{},underline{},strike{},dirty{};
+        std::int32_t ratio_logical{72},ratio_himetric{2540};std::uint64_t font{},dc{};
+        std::map<std::uint32_t,std::pair<bool,std::uint64_t>> sinks;std::uint32_t next_cookie{1};
+        bool operator==(const OleFont&) const = default;
+    };
+    std::map<std::uint64_t,OleFont> ole_fonts_;
+    // AddRefHfont 的外部參照（HFONT→計數）與 IEnumConnectionPoints 列舉器（物件→{字型, 位置}、參照計數）。
+    std::map<std::uint64_t,std::uint32_t> ole_font_handles_,ole_font_enum_references_;
+    std::map<std::uint64_t,std::pair<std::uint64_t,std::uint32_t>> ole_font_enums_;
+    std::array<std::uint64_t,6> ole_font_vtables_{};
+    std::optional<std::uint32_t> invoke_ole_font(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_path_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_debug_print(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
     std::optional<std::uint32_t> invoke_url(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service);
@@ -2678,6 +2821,7 @@ private:
     bool random_bytes(std::span<std::uint8_t> bytes);
     std::optional<std::uint32_t> invoke_dpapi(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::optional<std::uint32_t> invoke_credentials(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
+    std::uint32_t security_audit_event(std::uint32_t id,bool success,std::uint16_t category,std::span<const std::u16string> strings,std::span<const std::uint8_t> sid);
     std::uint32_t data_protection_audit(std::u16string_view,std::span<const std::uint8_t>,std::uint32_t,bool,std::uint32_t status=0);
     std::uint32_t legacy_crypto_call(GuestMemory&,const WindowsCall&,std::string_view);
     std::uint64_t acquire_crypto_provider(std::string,std::string,std::uint32_t,std::uint32_t);
@@ -2698,7 +2842,11 @@ private:
     std::vector<std::uint8_t> trust_file_contents(GuestMemory&,std::uint64_t handle,std::uint64_t path);
     std::optional<std::uint32_t> invoke_sip(GuestState&,GuestMemory&,const WindowsServiceDescriptor&);
     std::uint32_t image_certificate_call(GuestMemory&,const WindowsCall&,std::string_view);
+    std::uint32_t cng_configuration_call(GuestState&,GuestMemory&,const WindowsCall&,std::string_view);
+    bool cng_function_enabled(std::u16string_view);
     void rebuild_crt_environment(GuestMemory& memory, const GuestState& state);
+    std::uint32_t replace_process_environment(GuestMemory&,const GuestState&,std::span<const std::uint8_t>,
+                                              std::uint64_t adopted=0,std::uint64_t* previous=nullptr);
     std::optional<std::uint32_t> invoke_environment(GuestState& state, GuestMemory& memory, const WindowsServiceDescriptor& service);
     bool executable_needs_current_directory(std::u16string_view)const;
     std::uint32_t read_power_reason(GuestMemory&,std::uint64_t,std::u16string&)const;

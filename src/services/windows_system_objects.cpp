@@ -2,7 +2,12 @@
 #include "windows_object_identity.hpp"
 #include "x64arm/security_descriptor.hpp"
 #include "x64arm/unicode.hpp"
+#include "x64arm/windows_guid.hpp"
+#include "x64arm/registry_store.hpp"
+#include "registry_text_view.hpp"
 #include <algorithm>
+#include <array>
+#include <set>
 
 #if !defined(_WIN32)
 #include <cerrno>
@@ -32,10 +37,15 @@ std::span<const WindowsServiceDescriptor> system_object_service_descriptors(){
         {"kernel32.dll","WerRegisterCustomMetadata",2},{"kernel32.dll","WerUnregisterCustomMetadata",1},
         {"kernel32.dll","WerRegisterMemoryBlock",2},{"kernel32.dll","WerUnregisterMemoryBlock",1},
         {"kernel32.dll","WerRegisterExcludedMemoryBlock",2},{"kernel32.dll","WerUnregisterExcludedMemoryBlock",1},
+        {"wer.dll","WerReportCreate",4},{"wer.dll","WerReportSetParameter",4},{"wer.dll","WerReportAddFile",4},{"wer.dll","WerReportAddDump",7},
+        {"wer.dll","WerReportSetUIOption",3},{"wer.dll","WerReportSubmit",4},{"wer.dll","WerReportCloseHandle",1},{"wer.dll","WerAddExcludedApplication",2},{"wer.dll","WerRemoveExcludedApplication",2},{"kernel32.dll","QuirkIsEnabled",1},
         {"user32.dll","SetLastErrorEx",2},
         {"gdi32.dll","D3DKMTSetProcessSchedulingPriorityClass",2},{"gdi32.dll","D3DKMTGetProcessSchedulingPriorityClass",2},
         {"msdmo.dll","MoInitMediaType",2},{"msdmo.dll","MoFreeMediaType",1},{"msdmo.dll","MoCopyMediaType",2},
-        {"msdmo.dll","MoCreateMediaType",2},{"msdmo.dll","MoDeleteMediaType",1},{"msdmo.dll","MoDuplicateMediaType",2}
+        {"msdmo.dll","MoCreateMediaType",2},{"msdmo.dll","MoDeleteMediaType",1},{"msdmo.dll","MoDuplicateMediaType",2},
+        {"msdmo.dll","DMORegister",8,0,0,0x58},{"msdmo.dll","DMOUnregister",2},{"msdmo.dll","DMOEnum",7,0,0,0x16},{"msdmo.dll","DMOGetName",2},{"msdmo.dll","DMOGetTypes",7,0,0,0x12},
+        {"internal-msdmo-enum","QueryInterface",3},{"internal-msdmo-enum","AddRef",1},{"internal-msdmo-enum","Release",1},
+        {"internal-msdmo-enum","Next",5,0,0,0x2},{"internal-msdmo-enum","Skip",2,0,0,0x2},{"internal-msdmo-enum","Reset",1},{"internal-msdmo-enum","Clone",2}
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_system_objects(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
@@ -44,6 +54,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_system_objects(GuestState& 
     const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     try{
+#include "windows_dmo_registry.inc"
+#include "windows_wer_report.inc"
         if(symbol=="CompareObjectHandles" || symbol.ends_with("CompareObjects")){
             const bool native=symbol!="CompareObjectHandles";
             using Identity=std::pair<std::u16string,std::pair<std::uint64_t,std::uint64_t>>;
@@ -268,10 +280,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_system_objects(GuestState& 
             return finish(0);
         }
     }catch(const MemoryFault&){
-        if(symbol.starts_with("Mo") || symbol.starts_with("Wer"))return finish(0x80004003U);
+        if(symbol.starts_with("Mo") || symbol.starts_with("Wer") || symbol.starts_with("DMO") || service.family=="internal-msdmo-enum")return finish(0x80004003U);
         if(symbol=="CompareObjectHandles"){last_error_=998;return finish(0);}
         return finish(0xC0000005U);
-    }catch(const std::bad_alloc&){return finish(symbol.starts_with("Mo")?0x8007000EU:0xC000009AU);}
+    }catch(const std::bad_alloc&){return finish(symbol.starts_with("Mo") || symbol.starts_with("DMO") || service.family=="internal-msdmo-enum"?0x8007000EU:0xC000009AU);}
+    catch(const std::runtime_error&){if(symbol.starts_with("DMO"))return finish(0x80040150U);throw;} // REGDB_E_READREGDB
     throw HostCallFault("未知的系統物件入口");
 }
 }

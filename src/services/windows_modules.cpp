@@ -94,6 +94,17 @@ struct BuiltinSystemCall {
     std::uint32_t id{};
     std::uint16_t stack_bytes{};
 };
+struct PointerExport {std::string_view x86_name,x64_name;};
+std::span<const PointerExport> builtin_pointer_exports(std::string_view module){
+    static constexpr PointerExport handlers[]{
+        {"?_Raise_handler@std@@3P6AXABVexception@stdext@@@ZA",
+         "?_Raise_handler@std@@3P6AXAEBVexception@stdext@@@ZEA"}
+    };
+    for(const auto family:{"msvcp80.dll","msvcp90.dll","msvcp100.dll","msvcp110.dll","msvcp120.dll","msvcp140.dll"})
+        if(module==family)return handlers;
+    return {};
+}
+struct BuiltinLayout {std::size_t first_slot,slots,pointer_rva;};
 const auto& builtin_layouts(){
     static const auto bases=[] {
         const auto& catalog=detail::builtin_export_catalog();
@@ -103,7 +114,7 @@ const auto& builtin_layouts(){
         for(const auto& [family,exports]:catalog){(void)exports;
             if(family.ends_with(".dll") || family.ends_with(".drv") || family.ends_with(".ocx") || family.ends_with(".cpl") || family.ends_with(".exe"))names.emplace(family);
         }
-        std::map<std::string,std::pair<std::size_t,std::size_t>> result;std::size_t next=0;
+        std::map<std::string,BuiltinLayout> result;std::size_t next=0;
         const auto align=[](std::size_t value){return (value+4095)&~std::size_t{4095};};
         for(const auto& name:names){
             std::set<std::string> symbols;
@@ -121,13 +132,15 @@ const auto& builtin_layouts(){
             const auto guids=detail::builtin_guid_exports(name);
             for(const auto& value:guids){++named;strings+=value.name.size()+1;}
             // 未解析項目與共用入口可能縮小映像；使用完整名稱集合的上限，涵蓋稀疏序號留下的 EAT 空位。
+            const auto pointers=builtin_pointer_exports(name);
+            for(const auto& pointer:pointers){++named;strings+=1+std::max(pointer.x86_name.size(),pointer.x64_name.size());}
             const auto functions=ordinal_max+named;
             const auto code=align((constants.empty() && guids.empty()?4096:8192)+40+functions*4+named*6+name.size()+1+strings);
             const auto code_end=align(code+symbols.size()*32U);
-            const auto resource=code_end+(name=="ntdll.dll"?4096:0)+detail::builtin_module_data_capacity(name);
+            const auto resource=code_end+(name=="ntdll.dll" || !pointers.empty()?4096:0)+detail::builtin_module_data_capacity(name);
             const auto bytes=align(resource+builtin_version_resource(name,static_cast<std::uint32_t>(resource)).size());
             const auto span=std::max<std::size_t>(1,(bytes+windows_address_layout::module_stride-1)/windows_address_layout::module_stride);
-            result.emplace(name,std::pair{next,span});next+=span;
+            result.emplace(name,BuiltinLayout{next,span,pointers.empty()?0:code_end});next+=span;
         }
         return result;
     }();
@@ -165,6 +178,15 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
         if(next>65535 || guid_base+(i+1)*16>4096 || names.contains(std::string(guids[i].name)))throw ModuleError(8,"內建 DLL GUID 資料匯出超過容量或重複");
         names.emplace(std::string(guids[i].name),next);data_ordinals.emplace(next++,detail::builtin_constant_rva+static_cast<std::uint32_t>(guid_base+i*16));
     }
+    const auto pointers=builtin_pointer_exports(name);
+    const auto pointer_rva=builtin_layouts().at(std::string(name)).pointer_rva;
+    for(std::size_t i=0;i<pointers.size();++i){
+        while(ordinals.contains(next) || data_ordinals.contains(next))++next;
+        const std::string symbol(x86?pointers[i].x86_name:pointers[i].x64_name);
+        if(next>65535 || (i+1)*8>4096 || !names.emplace(symbol,next).second)
+            throw ModuleError(8,"內建 DLL 可寫指標匯出超過容量或重複");
+        data_ordinals.emplace(next++,static_cast<std::uint32_t>(pointer_rva+i*8));
+    }
     const bool constant_data=!constants.empty() || !guids.empty();
     const std::size_t count=std::max(ordinals.empty()?0:ordinals.rbegin()->first,data_ordinals.empty()?0:data_ordinals.rbegin()->first);
     constexpr std::size_t nt=0x80,optional=nt+24;
@@ -178,14 +200,17 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
     const std::size_t stride=x86?16:32;
     const auto code_end=(code+assigned.size()*stride+4095)&~std::size_t{4095};
     // 採 PE 的程式碼、可寫資料、資源順序，資料位於程式碼之後，資源保留獨立唯讀頁。
-    const auto writable=code_end,provider_at=code_end+(user_dispatch?4096:0);
+    const auto writable=pointer_rva?pointer_rva:code_end;
+    if(writable<code_end)throw ModuleError(8,"內建 DLL 程式區段超過可寫資料配置");
+    const bool writable_data=pointer_rva || user_dispatch;
+    const auto provider_at=writable+(writable_data?4096:0);
     const auto provider_size=detail::builtin_module_data_capacity(name),resource_at=provider_at+provider_size;
     const auto resource=builtin_version_resource(name,static_cast<std::uint32_t>(resource_at));
     const auto size=(resource_at+resource.size()+4095)&~std::size_t{4095};
-    BuiltinImage result;result.code=code;result.code_end=code_end;result.resource=resource_at;result.writable=user_dispatch?writable:0;
+    BuiltinImage result;result.code=code;result.code_end=code_end;result.resource=resource_at;result.writable=writable_data?writable:0;
     result.provider_data=provider_size?provider_at:0;result.provider_data_size=provider_size;result.bytes.resize(size);auto& bytes=result.bytes;
     const auto put=[&](std::size_t offset,unsigned width,std::uint64_t value){for(unsigned i=0;i<width;++i)bytes.at(offset+i)=static_cast<std::uint8_t>(value>>(i*8));};
-    put(0,2,0x5a4d);put(0x3c,4,nt);put(nt,4,0x4550);put(nt+4,2,x86?0x14c:0x8664);put(nt+6,2,(assigned.empty()?2:3)+(constant_data?1:0)+(user_dispatch?1:0)+(provider_size?1:0));
+    put(0,2,0x5a4d);put(0x3c,4,nt);put(nt,4,0x4550);put(nt+4,2,x86?0x14c:0x8664);put(nt+6,2,(assigned.empty()?2:3)+(constant_data?1:0)+(writable_data?1:0)+(provider_size?1:0));
     put(nt+20,2,x86?224:240);put(nt+22,2,x86?0x2102:0x2022);
     put(optional,2,x86?0x10b:0x20b);put(optional+4,4,code_end-code);put(optional+8,4,size-4096-(code_end-code));put(optional+20,4,code);
     put(optional+(x86?28:24),x86?4:8,base);put(optional+32,4,4096);put(optional+36,4,512);
@@ -201,11 +226,11 @@ BuiltinImage builtin_headers(std::uint64_t base,std::string_view name,bool x86,c
     const auto exports_section=section+(constant_data?40U:0U);
     const auto data_section=exports_section+40+(assigned.empty()?0U:40U);
     if(constant_data)section_header(section,".rdata",detail::builtin_constant_rva,4096,0x40000040);
-    if(user_dispatch)section_header(data_section,".data",writable,4096,0xc0000040);
+    if(writable_data)section_header(data_section,".data",writable,4096,0xc0000040);
     section_header(exports_section,".edata",edata,code-edata,0x40000040);
     if(!assigned.empty())section_header(exports_section+40,".text",code,code_end-code,0x60000020);
-    if(provider_size)section_header(data_section+(user_dispatch?40U:0U),".mdata",provider_at,provider_size,0x40000040);
-    section_header(data_section+(user_dispatch?40U:0U)+(provider_size?40U:0U),".rsrc",resource_at,size-resource_at,0x40000040);
+    if(provider_size)section_header(data_section+(writable_data?40U:0U),".mdata",provider_at,provider_size,0x40000040);
+    section_header(data_section+(writable_data?40U:0U)+(provider_size?40U:0U),".rsrc",resource_at,size-resource_at,0x40000040);
     for(std::size_t i=0;i<constants.size();++i)put(detail::builtin_constant_rva+i*8,constants[i].bytes,constants[i].value);
     for(std::size_t i=0;i<guids.size();++i)std::copy(guids[i].bytes.begin(),guids[i].bytes.end(),bytes.begin()+static_cast<std::ptrdiff_t>(detail::builtin_constant_rva+guid_base+i*16));
     std::copy(resource.begin(),resource.end(),bytes.begin()+static_cast<std::ptrdiff_t>(resource_at));
@@ -254,10 +279,14 @@ GuestAddress WindowsServices::builtin_constant_address(std::string_view family,s
     const auto constants=detail::builtin_constant_exports(family);
     const auto value=std::find_if(constants.begin(),constants.end(),[&](const auto& item){return item.name==symbol;});
     const auto guids=detail::builtin_guid_exports(family);const auto guid=std::find_if(guids.begin(),guids.end(),[&](const auto& item){return item.name==symbol;});
-    if(value==constants.end() && guid==guids.end())return GuestAddress{};
+    const auto pointers=builtin_pointer_exports(family);
+    const auto pointer=std::find_if(pointers.begin(),pointers.end(),[&](const auto& p){return symbol==(x86_?p.x86_name:p.x64_name);});
+    if(value==constants.end() && guid==guids.end() && pointer==pointers.end())return GuestAddress{};
     const auto& layouts=builtin_layouts();const auto slot=layouts.find(std::string(family));if(slot==layouts.end())return GuestAddress{};
+    const auto base=windows_address_layout::for_mode(x86_?ExecutionMode::X86:ExecutionMode::X64).images+slot->second.first_slot*windows_address_layout::module_stride;
+    if(pointer!=pointers.end())return GuestAddress{base+slot->second.pointer_rva+static_cast<std::size_t>(pointer-pointers.begin())*8};
     const auto offset=value!=constants.end()?static_cast<std::uint64_t>(value-constants.begin())*8:constants.size()*8+static_cast<std::uint64_t>(guid-guids.begin())*16;
-    return GuestAddress{windows_address_layout::for_mode(x86_?ExecutionMode::X86:ExecutionMode::X64).images+slot->second.first*windows_address_layout::module_stride+detail::builtin_constant_rva+offset};
+    return GuestAddress{base+detail::builtin_constant_rva+offset};
 }
 bool WindowsServices::builtin_module(std::string_view name) const {
     if(name=="riched20.dll" || name=="riched32.dll")return true;
@@ -493,9 +522,9 @@ std::uint64_t WindowsServices::load_module(GuestMemory& memory,std::u16string re
         // 每個引擎版本共用固定模組配置，與各程序載入順序無關。匯出表放不進一格的模組占用連續多格：
         // 以匯出解析共用目錄計算 builtin_headers 上限，包含別名、稀疏序號、資料與資源。
         const auto& bases=builtin_layouts();
-        const auto slot=bases.find(name);if(slot==bases.end() || slot->second.first+slot->second.second>windows_address_layout::module_slots)throw ModuleError(8,"內建模組沒有固定配置："+name);
-        const auto base=windows_address_layout::for_mode(memory.execution_mode()).images+slot->second.first*windows_address_layout::module_stride;
-        const auto capacity=slot->second.second*windows_address_layout::module_stride;
+        const auto slot=bases.find(name);if(slot==bases.end() || slot->second.first_slot+slot->second.slots>windows_address_layout::module_slots)throw ModuleError(8,"內建模組沒有固定配置："+name);
+        const auto base=windows_address_layout::for_mode(memory.execution_mode()).images+slot->second.first_slot*windows_address_layout::module_stride;
+        const auto capacity=slot->second.slots*windows_address_layout::module_stride;
         const auto targets=builtin_export_targets(name);
         std::map<std::uint64_t,BuiltinSystemCall> system_calls;
         if(name=="ntdll.dll"){
@@ -844,12 +873,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,Gu
         }else if(symbol.starts_with("GetModuleFileName") || symbol.starts_with("GetModuleBaseName") || symbol.starts_with("GetProcessImageFileName") || symbol.starts_with("QueryFullProcessImageName")) {
             const bool full=symbol.starts_with("QueryFullProcessImageName"),process_path=full || symbol.starts_with("GetProcessImageFileName"),basename=symbol.starts_with("GetModuleBaseName");
             const bool extended=symbol.starts_with("GetModuleFileNameEx") || basename;
-            if((extended || process_path) && !current_process_handle(arg(0),(process_path || !arg(1))?0x1000U:0x410U) && !((process_path || !arg(1)) && current_process_handle(arg(0),0x400U)))throw ModuleError(current_process_handle(arg(0))?5:process_object_type(arg(0))==u"Process"?50:6,"模組路徑查詢權限不足或不支援遠端程序");
+            if(extended && !current_process_handle(arg(0),!arg(1)?0x1000U:0x410U) && !(!arg(1) && current_process_handle(arg(0),0x400U)))throw ModuleError(current_process_handle(arg(0))?5:process_object_type(arg(0))==u"Process"?50:6,"模組路徑查詢權限不足或不支援遠端程序");
             if(full && (arg(1)>1 || !arg(3)))throw ModuleError(87,"程序路徑格式或長度指標無效");
             const auto value=[&](unsigned i){return arg(i+(extended?1U:0U));};
             const auto handle=process_path || !value(0)?runtime_.image.base:value(0);const auto* image=module_image(handle);
             std::u16string path;
-            if(image && !image->private_code)path=image->path;
+            if(process_path){
+                std::uint32_t pid{};
+                std::uint64_t birth{};
+                auto error=process_memory_target(memory,arg(0),0x1000U,pid,birth);
+                if(error==5)error=process_memory_target(memory,arg(0),0x400U,pid,birth);
+                if(error)throw ModuleError(error,"無法取得程序映像查詢權限");
+                if(const auto path_error=process_image_path(memory,pid,path,birth))
+                    throw ModuleError(path_error,"無法取得程序映像路徑");
+            }else if(image && !image->private_code)path=image->path;
             else {
                 const auto found=std::find_if(runtime_.modules.begin(),runtime_.modules.end(),[&](const auto& item){return item.second==handle;});
                 if(found==runtime_.modules.end())throw ModuleError(126,"無效模組 handle");path=u"C:\\Windows\\System32\\"+utf8_to_utf16(found->first);
@@ -927,7 +964,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_module(GuestState& state,Gu
         }else if(symbol=="GetProcAddress") {
             const auto ordinal=arg(1)<=65535?std::optional{static_cast<std::uint16_t>(arg(1))}:std::nullopt;
             const auto name=ordinal?std::string{}:read_string(memory,arg(1));
-            const auto address=module_export(memory,arg(0),name,ordinal,created,0,&state);
+            const auto module=arg(0);
+            const auto address=module_export(memory,module?module:runtime_.image.base,name,ordinal,created,0,&state);
             ModuleOperation operation;operation.created=std::move(created);operation.result=address;
             return start_module_operation(state,memory,std::move(operation));
         }else if(symbol=="DisableThreadLibraryCalls") {

@@ -511,9 +511,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
     }else if(symbol.starts_with("TranslateAccelerator")){
         const auto table=gui_.accelerators.find(arg(1));const auto window=gui_.windows.find(arg(0));
         if(table==gui_.accelerators.end())fail(1403);else if(window==gui_.windows.end())fail(1400);
-        else if(window->second.enabled){const auto message=memory.load(GuestAddress{arg(2)+8},32),key=memory.load(GuestAddress{arg(2)+16},64);
+        else if(window->second.enabled){const auto msg=gui_read_message(memory,arg(2));
             for(const auto& entry:table->second){const auto flags=entry[0];const bool virt=flags&1;
-                if(key!=entry[1] || (virt?(message!=0x100 && message!=0x104):(message!=0x102 && message!=0x106)))continue;
+                if(msg.wparam!=entry[1] || (virt?(msg.message!=0x100 && msg.message!=0x104):(msg.message!=0x102 && msg.message!=0x106)))continue;
                 if(virt && (((flags&4)!=0)!=((gui_.keyboard[16]&128)!=0) || ((flags&8)!=0)!=((gui_.keyboard[17]&128)!=0) || ((flags&16)!=0)!=((gui_.keyboard[18]&128)!=0)))continue;
                 result=1;const auto procedure=window->second.procedure;
                 if(procedure){start_callbacks(state,memory,{{procedure,{arg(0),0x111,0x10000U|entry[2],0}}},Continuation::Return,1);return std::nullopt;}break;

@@ -142,7 +142,7 @@ std::span<const WindowsServiceDescriptor> msvc_service_descriptors(){
         {"crt","??4__non_rtti_object@std@@QEAAAEAV01@AEBV01@@Z",2},{"crt","??4__non_rtti_object@std@@QAEAAV01@ABV01@@Z",1},
         {"crt","?unexpected@@YAXXZ",0},{"crt","?set_new_handler@@YAP6AXXZP6AXXZ@Z",1},
         {"crt","_seh_filter_dll",2},{"crt","_seh_filter_exe",2},{"crt","_amsg_exit",1},{"crt","_assert",3},{"crt","_wassert",3},{"crt","_except_handler3",4},{"crt","_except_handler4_common",6},
-        {"crt","_set_error_mode",1},{"crt","_set_purecall_handler",1},{"crt","_get_purecall_handler",0},{"crt","set_terminate",1},{"crt","_get_terminate",0},
+        {"crt","_set_error_mode",1},{"crt","_set_purecall_handler",1},{"crt","_get_purecall_handler",0},{"crt","set_terminate",1},{"crt","_get_terminate",0},{"crt","_set_se_translator",1},
         {"crt","_local_unwind2",2},{"crt","_seh_longjmp_unwind",1},{"crt","__CxxLongjmpUnwind",1},{"crt","_abnormal_termination",0},
         {"crt","__unDName",6},{"crt","__unDNameEx",7},{"crt","__std_type_info_destroy_list",1},{"crt","__clean_type_info_names_internal",1},
         {"crt","__std_type_info_name",2},{"crt","__std_type_info_compare",2},{"crt","__std_type_info_hash",1}
@@ -400,6 +400,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,Gues
     }
     if(symbol=="__unDName" || symbol=="__unDNameEx" || symbol=="__clean_type_info_names_internal" || symbol.starts_with("__std_type_info_") ||
        symbol.starts_with("?name@type_info@@") || symbol.starts_with("?_name_internal_method@type_info@@"))return invoke_demangle(state,memory,service);
+    if(symbol=="_set_se_translator"){
+        // 每執行緒的 SEH 轉譯函式，回傳先前的設定；C++ 框架處理常式在 /EHa 函式遇到非 C++ 例外時呼叫（見 __CxxFrameHandler）。
+        auto& thread=threads_.items.at(threads_.current);const auto previous=thread.se_translator;thread.se_translator=arg(0);
+        arg.return_to(state,previous);return std::nullopt;
+    }
     if(symbol=="set_terminate" || symbol=="_get_terminate"){
         const auto previous=runtime_.terminate_handler;
         if(symbol=="set_terminate")runtime_.terminate_handler=arg(0);
@@ -542,6 +547,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_msvc(GuestState& state,Gues
         arg.return_to(state,1);return std::nullopt;
     }
     if(level<-1 || level>=static_cast<std::int32_t>(info.unwind.size()))throw HostCallFault("MSVC search state 不合法");
+    // _set_se_translator：/EHa 函式（FI_EHS 已在上方略過）有 try 區塊時，先以 (例外碼, EXCEPTION_POINTERS*) 呼叫本執行緒的轉譯器。
+    // 轉譯器擲出的 C++ 例外是巢狀例外，經處理常式回呼邊界從本框架繼續搜尋（與原 SEH 同一路徑展開）；正常返回時重新進入本處理常式，
+    // 改由 catch(...) 處理原例外。longjmp 與 CLR 例外不轉譯；同一框架（含轉譯器內再次發生的 SEH）只轉譯一次。
+    if(!cpp && !info.tries.empty() && dispatch.code!=0x80000026U && dispatch.code!=0xe0434f4dU && dispatch.code!=0xe0434352U){
+        const auto translator=threads_.items.at(threads_.current).se_translator;
+        const bool translated=std::any_of(exceptions_.stack.begin(),exceptions_.stack.end(),[&](const ExceptionDispatch& item){return item.se_translated_frame==frame;});
+        if(translator && !translated){
+            dispatch.se_translated_frame=frame;GuestCallback translate{translator,{dispatch.code,dispatch.pointers}};
+            start_callbacks(state,memory,{std::move(translate)},Continuation::MsvcTranslate);return std::nullopt;
+        }
+    }
     if(help){memory.store(GuestAddress{help},32,static_cast<std::uint32_t>(level));memory.store(GuestAddress{help+4},32,static_cast<std::uint32_t>(level));}
     const auto object=cpp?record.parameters[1]:0,throw_info=cpp?record.parameters[2]:0;
     const auto* thrown=cpp?module_image(x86_?throw_info:record.parameters[3],true):nullptr;
@@ -633,6 +649,8 @@ std::optional<std::uint32_t> WindowsServices::resume_msvc(GuestState& state,Gues
     if(exceptions_.stack.empty())throw HostCallFault("MSVC callback 缺少例外狀態");
     auto& dispatch=exceptions_.stack.back();auto& plan=dispatch.msvc;
     if(frame.continuation==Continuation::MsvcCopy){begin_msvc_unwind(state,memory);return std::nullopt;}
+    // 轉譯器正常返回：state 已回到處理常式入口，重新執行同一個框架處理常式（se_translated_frame 讓它改找 catch(...)）。
+    if(frame.continuation==Continuation::MsvcTranslate)return std::nullopt;
     if(frame.continuation==Continuation::MsvcCatch){
         if(plan.compressed && value<=2){if(value>=plan.continuation_count)throw HostCallFault("FH4 catch continuation index 無效");value=plan.continuations[static_cast<std::size_t>(value)];}
         memory.check(GuestAddress{value},1,Access::Execute);plan.continuation=value;plan.catching=false;

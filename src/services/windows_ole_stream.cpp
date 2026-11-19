@@ -10,6 +10,8 @@ struct OleStreamState {
         std::u16string path;
         std::uint32_t mode{};
         std::uint64_t registry_key{};std::u16string registry_value; // SHOpenRegStream 的寫回目標
+        // SHCreateStreamWrapper：直接讀寫呼叫者的緩衝區，容量固定，不釋放也不搬移。
+        bool external{};std::uint64_t capacity{};
     };
     struct Stream {std::shared_ptr<Storage> storage;std::uint64_t position{};unsigned references{1};bool lock_bytes{};};
     std::map<std::uint64_t,Stream> streams;std::uint64_t table{},lock_table{};
@@ -17,7 +19,7 @@ struct OleStreamState {
 std::span<const WindowsServiceDescriptor> shell_memory_stream_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"shlwapi.dll","SHCreateMemStream",2},{"shcore.dll","SHCreateMemStream",2},
-        {"shlwapi.dll","#12",2}
+        {"shlwapi.dll","#12",2},{"shlwapi.dll","SHCreateStreamWrapper",4,0,0,0x6}
     };return table;
 }
 std::span<const WindowsServiceDescriptor> ole_stream_service_descriptors(){
@@ -117,7 +119,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_stream(GuestState& stat
         const auto address=allocate_heap(memory,unit);if(!address)return UINT64_C(0);try{memory.store(GuestAddress{address},bits,cache);bridge.streams.emplace(address,std::move(stream));}catch(...){(void)free_heap(memory,address,state);throw;}return address;
     };
     const auto resize=[&](OleStreamState::Storage& storage,std::uint64_t size)->unsigned{
-        const auto found=gui_.global_memory.find(storage.global);if(found==gui_.global_memory.end())return 0x80030006U;auto& block=found->second;if(block.clipboard_owned)return 0x80030005U;if(size>output_limit || size>memory.limit())return medium_full;if(size==block.size)return 0;
+        const auto found=gui_.global_memory.find(storage.global);if(found==gui_.global_memory.end())return 0x80030006U;auto& block=found->second;if(block.clipboard_owned)return 0x80030005U;
+        if(storage.external){if(size>storage.capacity)return medium_full;if(size>block.size)memory.write(GuestAddress{block.address+block.size},std::vector<std::uint8_t>(static_cast<std::size_t>(size-block.size)));block.size=size;return 0;}if(size>output_limit || size>memory.limit())return medium_full;if(size==block.size)return 0;
         if(!size && (block.flags&2)){if(block.locks)return 0x80030021U;if(block.address)(void)free_heap(memory,block.address,state);block.address=0;block.size=0;return 0;}
         const auto allocation=allocations_.find(block.address);const auto capacity=allocation==allocations_.end()?0:allocation->second;
         if(size>capacity){if(block.locks)return 0x80030021U;const auto address=allocate_heap(memory,size);if(!address)return out_of_memory;try{std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));const auto keep=static_cast<std::size_t>(std::min(size,block.size));if(keep)memory.read(GuestAddress{block.address},std::span(bytes).first(keep));memory.write(GuestAddress{address},bytes);auto replacement=block;replacement.address=address;replacement.size=size;
@@ -126,6 +129,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_stream(GuestState& stat
         }else {if(size>block.size)memory.write(GuestAddress{block.address+block.size},std::vector<std::uint8_t>(static_cast<std::size_t>(size-block.size)));block.size=size;}
         return 0;
     };
+        if(name=="SHCreateStreamWrapper"){
+            // (lpbData, cbData, dwReserved, ppStream)：IStream 直接讀寫呼叫者的緩衝區（不複製），大小以 cbData 為上限；保留參數須為 0。
+            if(!arg(3))return finish(invalid);memory.store(GuestAddress{arg(3)},bits,0);
+            if(d(2) || (!arg(0) && d(1)))return finish(invalid);if(d(1))memory.check(GuestAddress{arg(0)},d(1),Access::Write);
+            if(gui_.global_memory.size()>=65536)return finish(out_of_memory);
+            const auto handle=gui_.next_object++;gui_.global_memory.emplace(handle,GuiGlobalMemory{arg(0),d(1),0,0,false});
+            try{OleStreamState::Stream stream;stream.storage=std::make_shared<OleStreamState::Storage>(OleStreamState::Storage{handle,false,true,{}, {},0,0,{},true,d(1)});
+                const auto object=create(std::move(stream));if(object){memory.store(GuestAddress{arg(3)},bits,object);return finish(0);}
+            }catch(...){gui_.global_memory.erase(handle);throw;}
+            gui_.global_memory.erase(handle);return finish(out_of_memory);
+        }
         if(shell_memory){
             // 複製初始 bytes，不借用呼叫者的 buffer；公開介面不暴露 HGLOBAL。
             const auto count=d(1);if((!arg(0) && count) || count>output_limit || gui_.global_memory.size()>=65536)return finish(0);
@@ -166,6 +180,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_stream(GuestState& stat
                 if(value && block!=gui_.global_memory.end())(void)nested_service(state,memory,"advapi32.dll","RegSetValueExW",{storage->registry_key,value,0,3,block->second.address,block->second.size});
                 (void)nested_service(state,memory,"advapi32.dll","RegCloseKey",{storage->registry_key});storage->registry_key=0;
             }
+            if(storage.use_count()==1 && storage->external)gui_.global_memory.erase(storage->global);
             if(storage.use_count()==1 && storage->release){const auto block=gui_.global_memory.find(storage->global);if(block!=gui_.global_memory.end()){if(block->second.address)(void)free_heap(memory,block->second.address,state);gui_.global_memory.erase(block);}}return finish(0);
         }
         if(stream.storage->file){

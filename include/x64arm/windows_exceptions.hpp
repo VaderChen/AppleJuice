@@ -56,13 +56,24 @@ struct ExceptionDispatch {
     std::uint64_t etw_thread{};std::size_t etw_callback_depth{},etw_exception_depth{};std::uint32_t etw_seh_boundary{UINT32_MAX};
     std::size_t user_callback_depth{SIZE_MAX};
     std::size_t protected_callback_depth{SIZE_MAX};
+    // 已呼叫 _set_se_translator 轉譯器的 C++ 框架（establisher／registration）：轉譯器正常返回後重新進入處理常式時改找 catch(...)，
+    // 轉譯器內再次發生的 SEH 也不再轉譯同一框架。
+    std::uint64_t se_translated_frame{};
     ExceptionStage stage{ExceptionStage::Vectored};
-    bool unwound{}, unhandled_called{}, restore_jump{}, winrt_origination{};
+    // API 自己的例外邊界在 VEH 之後、客體呼叫者的 SEH 之前承接。
+    // 非零續行入口只在處理常式未改變 RIP 時使用，保留合法的 CONTEXT 轉向。
+    bool unwound{}, unhandled_called{}, restore_jump{}, api_exception_boundary{};
+    GuestAddress api_exception_resume{};
     MsvcCatch msvc;
     // exception_ptr 重拋所建立的獨立堆積物件；catch 解構完成後由共用 EH 回收。
     std::uint64_t msvc_owned_object{};
     bool operator==(const ExceptionDispatch&) const = default;
 };
+inline void resume_api_exception_boundary(GuestState& state,const ExceptionDispatch& dispatch){
+    const bool after_breakpoint=dispatch.code==0x80000003U && state.rip.value==dispatch.original.rip.value+1;
+    if(dispatch.api_exception_resume.value && (state.rip==dispatch.original.rip || after_breakpoint))
+        state.rip=dispatch.api_exception_resume;
+}
 struct ExceptionState {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> vectors;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> continue_vectors;

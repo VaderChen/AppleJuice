@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <set>
 
@@ -14,11 +15,18 @@ struct PoolObject {
     // I/O：已呼叫 StartThreadpoolIo 但尚未完成的操作數，以及待交給 worker 的完成封包（與 pending 一一對應）。
     std::uint32_t started{};std::deque<CompletionPacket> io;
     bool armed{},set{},closed{},long_running{};
+    // I/O 物件的回呼形式：Win32 TP_IO（CreateThreadpoolIo）、原生 TP_IO（TpAllocIoCompletion，收 IO_STATUS_BLOCK*）、
+    // 舊式檔案繫結（BindIoCompletionCallback／RtlSetIoCompletionCallback，不需 StartThreadpoolIo，繫結到檔案關閉）。
+    enum class IoForm:std::uint8_t {Win32,Native,Bound} form{IoForm::Win32};
 };
 struct PoolInstance {
     std::uint64_t object{},worker{};bool associated{true},long_running{},finalized{};
     std::vector<GuestCallback> cleanup;
+    // 原生 I/O 回呼的 IO_STATUS_BLOCK 複本位置（status_used 的索引）；回呼結束後歸還。
+    std::uint32_t status_slot{UINT32_MAX};
 };
+// 原生 I/O 回呼同時進行的上限；每格放一個 IO_STATUS_BLOCK（x64 16 bytes、x86 8 bytes）。
+constexpr std::uint32_t status_slots=1024;
 // stack_reserve／stack_commit 為 0 時沿用程序映像的堆疊大小（SetThreadpoolStackInformation 之前的預設值）。
 struct PoolDefinition {std::uint32_t minimum{},maximum{64};bool closed{};std::uint64_t stack_reserve{},stack_commit{};};
 std::uint64_t add_ticks(std::uint64_t a,std::uint64_t b){return b>UINT64_MAX-a?UINT64_MAX:a+b;}
@@ -32,6 +40,8 @@ struct ThreadpoolState {
     std::uint64_t next_pool{0x110000},next_object{0xe0000},next_instance{0xf0000},next_group{0x120000};
     // 執行緒池 I/O 共用的內部完成埠：繫結的檔案以完成鍵＝TP_IO 物件送出完成封包。
     std::uint64_t port{};
+    // 原生 I/O 回呼的 IO_STATUS_BLOCK 區（程序 heap，第一個原生 TP_IO 建立時配置，程序結束前保留）與使用中位元。
+    std::uint64_t status_blocks{};std::array<std::uint64_t,status_slots/64> status_used{};
 };
 bool WindowsServices::threadpool_worker_reserved(std::uint64_t worker) const {
     return threadpool_ && threadpool_->worker_owners.contains(worker);
@@ -82,6 +92,7 @@ std::uint64_t WindowsServices::threadpool_next_deadline() const {
 }
 void WindowsServices::release_threadpool_instance(std::uint64_t handle){
     if(!threadpool_)return;auto& pool=*threadpool_;const auto instance=pool.instances.find(handle);if(instance==pool.instances.end())return;
+    if(const auto slot=instance->second.status_slot;slot<status_slots)pool.status_used[slot/64]&=~(UINT64_C(1)<<(slot%64));
     const auto object=pool.objects.find(instance->second.object);
     if(object!=pool.objects.end()){
         auto& value=object->second;if(value.outstanding)--value.outstanding;if(instance->second.associated && value.associated)--value.associated;
@@ -130,21 +141,37 @@ void WindowsServices::poll_threadpool(GuestMemory& memory){
         while(!packets.empty()){
             const auto packet=packets.front();packets.pop_front();if(packet.wait_packet)complete_wait_packet(packet.wait_packet);
             const auto target=pool.objects.find(packet.key);if(target==pool.objects.end() || target->second.kind!=PoolKind::Io || target->second.closed)continue;
-            auto& io=target->second;if(io.started)--io.started;io.io.push_back(packet);io.pending.push_back(0);
+            auto& io=target->second;if(io.form!=PoolObject::IoForm::Bound && io.started)--io.started;io.io.push_back(packet);io.pending.push_back(0);
         }
     }
     for(auto& [handle,object]:pool.objects){
         while(!object.pending.empty()){
             if(!object.owner && registered_waits_.size()>=64)break;
+            const bool native=object.kind==PoolKind::Io && object.form==PoolObject::IoForm::Native;std::uint32_t slot=UINT32_MAX;
+            if(native){
+                for(std::uint32_t i=0;i<status_slots && slot==UINT32_MAX;++i)if(!(pool.status_used[i/64]&(UINT64_C(1)<<(i%64))))slot=i;
+                if(slot==UINT32_MAX || !pool.status_blocks)break; // 回呼結束歸還格位後再派送。
+            }
             const auto worker=acquire_threadpool_worker(threads_.items.at(threads_.current).context,memory,object.owner);
             if(!worker)break;
             const auto instance_id=pool.next_instance++;PoolInstance instance;instance.object=handle;instance.worker=worker;instance.long_running=object.long_running;
             const auto result=object.pending.front();RegisteredWait work;work.worker=worker;work.pool_instance=instance_id;work.armed=false;work.ready=true;work.closing=true;
             auto arguments=std::vector<std::uint64_t>{instance_id,object.context};
             if(object.kind==PoolKind::Io){
-                // PTP_WIN32_IO_CALLBACK(Instance, Context, Overlapped, IoResult, NumberOfBytesTransferred, Io)。
                 const auto packet=object.io.front();object.io.pop_front();
-                arguments.insert(arguments.end(),{packet.overlapped,completion_packet_error(packet.status),packet.bytes,handle});
+                if(object.form==PoolObject::IoForm::Bound){
+                    // LPOVERLAPPED_COMPLETION_ROUTINE(dwErrorCode, dwNumberOfBytesTransfered, lpOverlapped)：沒有 instance 與 context。
+                    arguments={completion_packet_error(packet.status),packet.bytes&UINT32_MAX,packet.overlapped};
+                }else if(native){
+                    // PTP_IO_CALLBACK(Instance, Context, ApcContext, IO_STATUS_BLOCK*, Io)：IO_STATUS_BLOCK 是完成封包的複本，只在回呼期間有效。
+                    const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);const auto block=pool.status_blocks+std::uint64_t{slot}*unit*2;
+                    memory.store(GuestAddress{block},bits,packet.status&UINT32_MAX);memory.store(GuestAddress{block+unit},bits,packet.bytes);
+                    pool.status_used[slot/64]|=UINT64_C(1)<<(slot%64);instance.status_slot=slot;
+                    arguments.insert(arguments.end(),{packet.overlapped,block,handle});
+                }else {
+                    // PTP_WIN32_IO_CALLBACK(Instance, Context, Overlapped, IoResult, NumberOfBytesTransferred, Io)。
+                    arguments.insert(arguments.end(),{packet.overlapped,completion_packet_error(packet.status),packet.bytes,handle});
+                }
             }else if(object.kind!=PoolKind::Simple)arguments.push_back(handle);
             if(object.kind==PoolKind::Wait)arguments.push_back(result);
             work.callback_batch.push_back({object.callback,std::move(arguments)});
@@ -236,12 +263,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_threadpool(GuestState& stat
         memory.store(GuestAddress{arg(1)},bits,definition.stack_reserve?definition.stack_reserve:runtime_.image.stack_size);
         memory.store(GuestAddress{arg(1)+unit},bits,definition.stack_reserve?definition.stack_commit:std::min<std::uint64_t>(runtime_.image.stack_size,0x1000));return finish(1);
     }
+    if(name=="BindIoCompletionCallback"){
+        // (FileHandle, Function, Flags)：檔案以完成鍵＝內部物件繫結到執行緒池的完成埠，之後每個完成封包都在預設池 worker 上
+        // 呼叫 LPOVERLAPPED_COMPLETION_ROUTINE；不需要 StartThreadpoolIo，也沒有關閉函式，繫結持續到檔案關閉。
+        // Flags 保留必須為 0；已繫結任一完成埠（含其他繫結或 TP_IO）的檔案回 ERROR_INVALID_PARAMETER。
+        if(arg(2) || !arg(1))return finish(0,87);if(!handles(GuestAddress{arg(1)}))memory.check(GuestAddress{arg(1)},1,Access::Execute);
+        const auto bound_to=[&](std::uint64_t key){
+            return std::any_of(files_.begin(),files_.end(),[&](const auto& item){return item.second.completion_port==pool.port && item.second.completion_key==key;}) ||
+                std::any_of(runtime_.network.sockets.begin(),runtime_.network.sockets.end(),[&](const auto& item){return item.second->completion_port==pool.port && item.second->completion_key==key;});
+        };
+        // 檔案已全部關閉、沒有待執行或執行中回呼的繫結物件即回收。
+        std::erase_if(pool.objects,[&](const auto& entry){
+            const auto& [key,item]=entry;return item.form==PoolObject::IoForm::Bound && !item.outstanding && item.pending.empty() && !bound_to(key);});
+        std::uint64_t previous=0;
+        if(const auto file=files_.find(arg(0));file!=files_.end())previous=file->second.completion_port;
+        else if(const auto socket=runtime_.network.sockets.find(arg(0));socket!=runtime_.network.sockets.end())previous=socket->second->completion_port;
+        else return finish(0,6);
+        if(previous)return finish(0,87);
+        if(pool.objects.size()>=4096)return finish(0,8);
+        if(!pool.port){pool.port=runtime_.allocate_wait_handle();runtime_.completion_ports.emplace(pool.port,CompletionPort{});}
+        const auto handle=pool.next_object++;
+        if(const auto error=bind_file_completion_port(arg(0),pool.port,handle))return finish(0,error);
+        PoolObject object;object.kind=PoolKind::Io;object.form=PoolObject::IoForm::Bound;object.callback=arg(1);object.target=arg(0);
+        pool.objects.emplace(handle,std::move(object));return finish(1);
+    }
     if(name.starts_with("Create") || name=="TrySubmitThreadpoolCallback"){
         // CreateThreadpoolIo 多一個前置的檔案控制代碼；其餘參數（回呼、context、環境）與其他 Create* 相同。
-        const unsigned shift=name=="CreateThreadpoolIo"?1U:0U;
+        // CreateThreadpoolIoNative 是 TpAllocIoCompletion 的內部入口：同一份 TP_IO，回呼改收 IO_STATUS_BLOCK*。
+        const bool io=name=="CreateThreadpoolIo" || name=="CreateThreadpoolIoNative";const unsigned shift=io?1U:0U;
         if(!arg(shift+0))return finish(0,87);if(!handles(GuestAddress{arg(shift+0)}))memory.check(GuestAddress{arg(shift+0)},1,Access::Execute);
         if(pool.objects.size()>=4096)return finish(0,8);
-        PoolObject object;object.kind=name=="CreateThreadpoolTimer"?PoolKind::Timer:name=="CreateThreadpoolWait"?PoolKind::Wait:name=="CreateThreadpoolIo"?PoolKind::Io:name=="TrySubmitThreadpoolCallback"?PoolKind::Simple:PoolKind::Work;
+        if(name=="CreateThreadpoolIoNative" && !pool.status_blocks){
+            pool.status_blocks=allocate_heap(memory,std::uint64_t{status_slots}*(x86_?8U:16U));if(!pool.status_blocks)return finish(0,8);}
+        PoolObject object;object.kind=name=="CreateThreadpoolTimer"?PoolKind::Timer:name=="CreateThreadpoolWait"?PoolKind::Wait:io?PoolKind::Io:name=="TrySubmitThreadpoolCallback"?PoolKind::Simple:PoolKind::Work;
+        if(name=="CreateThreadpoolIoNative")object.form=PoolObject::IoForm::Native;
         object.callback=arg(shift+0);object.context=arg(shift+1);
         if(arg(shift+2)){
             const auto env=arg(shift+2),version=memory.load(GuestAddress{env},32);const unsigned unit=x86_?4:8;

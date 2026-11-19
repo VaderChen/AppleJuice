@@ -11,6 +11,7 @@
 #include "x64arm/windows_default_environment.hpp"
 #include "x64arm/registry_store.hpp"
 #include "appcontainer_identity.hpp"
+#include "registry_text_view.hpp"
 #include "x64arm/system_performance.hpp"
 #include "windows_native_process_parameters.hpp"
 #include "crt_os_error.hpp"
@@ -104,7 +105,11 @@ std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
         {"userenv.dll","EnterCriticalPolicySection",1},{"userenv.dll","LeaveCriticalPolicySection",1},
         {"userenv.dll","CreateAppContainerProfile",6},{"userenv.dll","DeleteAppContainerProfile",1},
         {"userenv.dll","DeriveAppContainerSidFromAppContainerName",2},{"userenv.dll","GetAppContainerFolderPath",2},
+        {"internal-shell-env","PathUnExpandEnvStringsForUserA",4,0,0,0x8},
+        {"internal-shell-env","PathUnExpandEnvStringsForUserW",4,0,0,0x8},
         {"userenv.dll","ExpandEnvironmentStringsForUserA",4},{"userenv.dll","ExpandEnvironmentStringsForUserW",4},
+        {"userenv.dll","LoadUserProfileA",2},{"userenv.dll","LoadUserProfileW",2},{"userenv.dll","UnloadUserProfile",2},
+        {"userenv.dll","GetAppliedGPOListA",5},{"userenv.dll","GetAppliedGPOListW",5},{"userenv.dll","FreeGPOListA",1},{"userenv.dll","FreeGPOListW",1},
         {"crt","getenv",1},{"crt","_wgetenv",1},{"crt","_putenv",1},{"crt","_wputenv",1},
         {"crt","_dupenv_s",3},{"crt","_wdupenv_s",3},{"crt","getenv_s",4},{"crt","_wgetenv_s",4},
         {"crt","_putenv_s",2},{"crt","_wputenv_s",2},
@@ -123,6 +128,8 @@ std::span<const WindowsServiceDescriptor> environment_service_descriptors() {
         {"kernel32.dll","GetActiveProcessorCount",1},{"kernel32.dll","GetMaximumProcessorCount",1},
         {"kernel32.dll","GetCurrentProcessorNumberEx",1},{"kernel32.dll","GetCurrentProcessorNumber",0},
         {"kernel32.dll","SetThreadGroupAffinity",3},{"kernel32.dll","GetThreadGroupAffinity",2},{"kernel32.dll","GetProcessGroupAffinity",3},
+        {"kernel32.dll","SetProcessGroupAffinity",3},{"kernel32.dll","DeriveCapabilitySidsFromName",5},{"kernel32.dll","IsSystemResumeAutomatic",0},
+        {"kernel32.dll","SetTermsrvAppInstallMode",1,0,0,0x1},{"kernel32.dll","TermsrvAppInstallMode",0},
         {"kernel32.dll","CreateUmsCompletionList",1},{"kernel32.dll","DeleteUmsCompletionList",1},{"kernel32.dll","DequeueUmsCompletionListItems",3},
         {"kernel32.dll","GetUmsCompletionListEvent",2},{"kernel32.dll","GetNextUmsListItem",1},{"kernel32.dll","CreateUmsThreadContext",1},
         {"kernel32.dll","DeleteUmsThreadContext",1},{"kernel32.dll","QueryUmsThreadInformation",5},{"kernel32.dll","SetUmsThreadInformation",4},
@@ -167,7 +174,8 @@ void WindowsServices::import_guest_environment(GuestMemory& memory,const GuestSt
 #endif
 }
 void WindowsServices::configure_initial_environment(GuestMemory& memory,const GuestState& state,std::span<const std::uint8_t> bytes){
-    const auto environment=decode_guest_environment(bytes,true);if(!environment)throw HostCallFault("子程序環境格式無效");runtime_.environment=*environment;runtime_.crt_environment=*environment;rebuild_crt_environment(memory,state);
+    if(replace_process_environment(memory,state,bytes))throw HostCallFault("子程序環境區塊初始化失敗");
+    runtime_.crt_environment=runtime_.environment;rebuild_crt_environment(memory,state);
     // 匯入發生在子程序啟動前；以啟動資料取代建構時的預設快照，之後 _putenv 不再改動初始環境。
     const auto previous_initial=runtime_.initial_environ;
     runtime_.initial_environ=memory.load(GuestAddress{runtime_.environ_cell},x86_?32:64);
@@ -175,6 +183,49 @@ void WindowsServices::configure_initial_environment(GuestMemory& memory,const Gu
     memory.store(GuestAddress{runtime_base_.value+112},x86_?32:64,runtime_.initial_environ);
     memory.store(GuestAddress{runtime_base_.value+120},x86_?32:64,runtime_.initial_wenviron);
     if(previous_initial && previous_initial!=runtime_.initial_environ)(void)free_heap(memory,previous_initial,state);
+}
+std::uint32_t WindowsServices::replace_process_environment(GuestMemory& memory,const GuestState& state,
+                                                          std::span<const std::uint8_t> bytes,
+                                                          std::uint64_t adopted,std::uint64_t* previous){
+    std::uint64_t allocation=0;
+    try{
+        auto environment=decode_guest_environment(bytes,true);
+        if(!environment)return 87;
+        const auto layout=detail::ProcessParameterLayout::for_x86(x86_);
+        const auto bits=static_cast<std::uint8_t>(layout.unit*8);
+        const auto parameters=runtime_.image.base?
+            memory.load(GuestAddress{peb_base_.value+(x86_?0x10U:0x20U)},bits):0;
+        if(!parameters){runtime_.environment=std::move(*environment);if(previous)*previous=0;return 0;}
+        const auto field=parameters+layout.environment,size_field=parameters+layout.environment_size;
+        memory.check(GuestAddress{field},layout.unit,Access::Write);
+        memory.check(GuestAddress{size_field},2*layout.unit,Access::Write);
+        const auto old=memory.load(GuestAddress{field},bits);
+        const auto version=memory.load(GuestAddress{size_field+layout.unit},bits);
+        if(!adopted){
+            allocation=allocate_heap(memory,bytes.size());
+            if(!allocation)return 8;
+            memory.write(GuestAddress{allocation},bytes);
+        }
+        const auto pointer=adopted?adopted:allocation;
+        auto capacity=static_cast<std::uint64_t>(bytes.size());
+        if(const auto found=allocations_.find(pointer);found!=allocations_.end())capacity=found->second;
+        else if(guest_heap_contains(pointer))capacity=guest_heap_block_size(memory,pointer);
+        // 先驗證與準備全部內容，再以同一份區塊發布 PEB 與目前程序的環境表。
+        memory.store(GuestAddress{field},bits,pointer);
+        memory.store(GuestAddress{size_field},bits,capacity);
+        memory.store(GuestAddress{size_field+layout.unit},bits,version+1);
+        runtime_.environment=std::move(*environment);
+        allocation=0;
+        if(previous)*previous=old;
+        else if(old && old!=pointer)(void)free_heap(memory,old,state);
+        return 0;
+    }catch(const MemoryFault&){
+        if(allocation)(void)free_heap(memory,allocation,state);
+        return 998;
+    }catch(const std::bad_alloc&){
+        if(allocation)(void)free_heap(memory,allocation,state);
+        return 8;
+    }
 }
 void WindowsServices::rebuild_crt_environment(GuestMemory& memory,const GuestState& state) {
     const auto& environment=runtime_.crt_environment;const unsigned unit=x86_?4:8;const auto pointers=(environment.size()+1)*unit;
@@ -262,6 +313,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
         const auto found=runtime_.environment_values.find(environment_key(text(index)));
         return found==runtime_.environment_values.end()?0:wide?found->second.second:found->second.first;
     };
+    const auto replace_environment=[&](const GuestEnvironment& environment){
+        try{return replace_process_environment(memory,state,encode_guest_environment(environment));}
+        catch(const std::bad_alloc&){return 8U;}
+        catch(const std::length_error&){return 8U;}
+    };
     const auto processor_mask=runtime_.processor_count==64?UINT64_MAX:(UINT64_C(1)<<runtime_.processor_count)-1;
     std::uint64_t result=0;
     if(symbol.starts_with("NeedCurrentDirectoryForExePath")){
@@ -288,11 +344,87 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
             if(!buffer || capacity<count)return finish(false,122);memory.write(GuestAddress{buffer},bytes);return finish(true);
         }catch(const MemoryFault&){return finish(false,998);}catch(const std::invalid_argument&){return finish(false,13);}catch(const std::length_error&){return finish(false,206);}catch(const std::bad_alloc&){return finish(false,8);}
     }
-    else if(symbol=="CreateEnvironmentBlock" || symbol=="DestroyEnvironmentBlock" || symbol.starts_with("ExpandEnvironmentStringsForUser")){
+    else if(symbol.starts_with("LoadUserProfile") || symbol=="UnloadUserProfile"){
+        // LoadUserProfile(hToken, lpProfileInfo)：沙箱的使用者設定檔一直載入；PROFILEINFO.hProfile 為權杖使用者的 HKCU 根機碼（KEY_ALL_ACCESS）。
+        // 權杖需 TOKEN_QUERY|TOKEN_IMPERSONATE|TOKEN_DUPLICATE；呼叫程序須持有 SeBackupPrivilege 與 SeRestorePrivilege。UnloadUserProfile 關閉該機碼。
+        const auto finish=[&](bool success,unsigned error=0){if(!success)last_error_=error;arg.return_to(state,success);return std::optional<std::uint32_t>{};};
+        initialize_tokens();
+        const auto token=runtime_.token_handles.find(arg(0));if(token==runtime_.token_handles.end())return finish(false,6);
+        auto& registry=runtime_.registry;
+        if(symbol=="UnloadUserProfile"){
+            const auto handle=registry.handles.find(arg(1));
+            if(!arg(1) || handle==registry.handles.end())return finish(false,6);
+            const auto root=registry_user_root(registry,token_user_sid_string(runtime_.token_handle_objects.at(arg(0))),token_user_sid_string(1));
+            if(handle->second.path!=root)return finish(false,87);
+            registry.handles.erase(handle);return finish(true);
+        }
+        if((token->second&0xeU)!=0xeU)return finish(false,5);
+        const auto& process=runtime_.token_objects.at(1);if(!process.has_privilege(17) || !process.has_privilege(18))return finish(false,1314);
+        const unsigned unit=x86_?4U:8U,size=x86_?32U:56U;const auto info=arg(1);
+        try{
+            if(!info || memory.load(GuestAddress{info},32)!=size || !memory.load(GuestAddress{info+8},static_cast<std::uint8_t>(unit*8)))return finish(false,87);
+            memory.check(GuestAddress{info},size,Access::Write);
+            if(registry.handles.size()>=4096)return finish(false,8);
+            const auto root=registry_user_root(registry,token_user_sid_string(runtime_.token_handle_objects.at(arg(0))),token_user_sid_string(1));
+            const auto handle=registry.next_handle++;registry.handles.emplace(handle,RegistryHandle{root,registry_security_access(root,0xf003fU),RegistryView::Native64,root});
+            memory.store(GuestAddress{info+8+unit*5},static_cast<std::uint8_t>(unit*8),handle);return finish(true);
+        }catch(const MemoryFault&){return finish(false,998);}
+    }
+    else if(symbol.starts_with("GetAppliedGPOList") || symbol.starts_with("FreeGPOList")){
+        // 沙箱是獨立的虛擬電腦（不屬於網域），本機群組原則也沒有為任何用戶端延伸套用 GPO：GetAppliedGPOList 回傳空清單（*ppGPOList 為 NULL）。
+        // pMachineName 必須是 NULL 或本機名稱 X64ARM；dwFlags 只接受 GPO_LIST_FLAG_MACHINE。FreeGPOList 收 NULL 為成功。
+        if(symbol.starts_with("FreeGPOList")){
+            const auto finish=[&](bool success,unsigned error=0){if(!success)last_error_=error;arg.return_to(state,success);return std::optional<std::uint32_t>{};};
+            if(!arg(0))return finish(true);
+            return finish(false,87);
+        }
+        const auto done=[&](std::uint32_t error){arg.return_to(state,error);return std::optional<std::uint32_t>{};};
+        if(static_cast<std::uint32_t>(arg(0))&~1U || !arg(3) || !arg(4))return done(87);
+        try{
+            if(arg(1)){
+                auto machine=symbol.ends_with('W')?read_utf16(memory,GuestAddress{arg(1)},260):utf8_to_utf16(read_ansi(memory,arg(1),260));
+                if(machine.starts_with(u"\\"))machine.erase(0,2);
+                for(auto& c:machine)if(c>=u'a' && c<=u'z')c=static_cast<char16_t>(c-32);
+                if(!machine.empty() && machine!=u"X64ARM")return done(53);
+            }
+            memory.check(GuestAddress{arg(4)},x86_?4:8,Access::Write);memory.store(GuestAddress{arg(4)},x86_?32:64,0);return done(0);
+        }catch(const MemoryFault&){return done(998);}
+    }
+    else if(symbol=="CreateEnvironmentBlock" || symbol=="DestroyEnvironmentBlock" || symbol.starts_with("ExpandEnvironmentStringsForUser") || service.family=="internal-shell-env"){
         const auto finish=[&](bool success,unsigned error=0){if(!success)last_error_=error;arg.return_to(state,success);return std::optional<std::uint32_t>{};};
         if(symbol=="DestroyEnvironmentBlock"){const auto found=runtime_.environment_blocks.find(arg(0));if(found==runtime_.environment_blocks.end() || !found->second)return finish(false,87);if(!free_heap(memory,arg(0),state))return finish(false,87);runtime_.environment_blocks.erase(found);return finish(true);}
         const bool creating=symbol=="CreateEnvironmentBlock";const auto handle=arg(creating?1:0);bool user=handle!=0;
         if(creating){if(!arg(0))return finish(false,87);memory.store(GuestAddress{arg(0)},x86_?32:64,0);}
+        const bool packing=service.family=="internal-shell-env";
+        const auto pack_path=[&](const GuestEnvironment& environment){
+            const auto capacity=static_cast<std::int32_t>(arg(3));
+            if(!arg(1) || !arg(2) || capacity<=0){
+                if(!arg(1) && arg(2) && capacity>0)memory.store(GuestAddress{arg(2)},wide?16:8,0);
+                return false;
+            }
+            const auto path=text(1);
+            // 依 Shell 的優先順序選擇第一個能容納的前綴；A 版容量以位元組計算。
+            for(const auto variable:{u"APPDATA",u"USERPROFILE",u"ALLUSERSPROFILE",u"ProgramFiles",u"SystemRoot",u"SystemDrive"}){
+                const auto entry=environment.find(environment_key(variable));
+                if(entry==environment.end())continue;
+                const auto& prefix=entry->second.second;
+                if(prefix.empty() || prefix.size()>path.size())continue;
+                if(!std::equal(prefix.begin(),prefix.end(),path.begin(),[](char16_t a,char16_t b){
+                    return unicode_case_unit(a,false)==unicode_case_unit(b,false);
+                }))continue;
+                const auto prefix_units=wide?prefix.size():utf16_to_utf8(prefix).size();
+                if(prefix_units>=260 || prefix_units>=static_cast<unsigned>(capacity))continue;
+                const auto packed=encode(u"%"+std::u16string(variable)+u"%"+path.substr(prefix.size()));
+                if(packed.size()/(wide?2U:1U)>static_cast<unsigned>(capacity))continue;
+                memory.write(GuestAddress{arg(2)},packed);
+                return true;
+            }
+            return false;
+        };
+        if(packing && (!handle || !arg(1) || !arg(2))){
+            try{arg.return_to(state,pack_path(runtime_.environment));return std::nullopt;}
+            catch(const std::invalid_argument&){return finish(false,13);}
+        }
         if(user){const auto access=runtime_.token_handles.find(handle);if(access==runtime_.token_handles.end())return finish(false,6);const auto& token=runtime_.token_objects.at(runtime_.token_handle_objects.at(handle));const auto required=token.type==1?10U:8U;if((access->second&required)!=required)return finish(false,5);if(token.user.sid!=runtime_.token_objects.at(1).user.sid)return finish(false,50);}
         try{
             GuestEnvironment values=creating && static_cast<std::uint32_t>(arg(2))?runtime_.environment:GuestEnvironment{};
@@ -324,6 +456,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
             };
             merge(std::u16string(1,2)+u"\\system\\currentcontrolset\\control\\session manager\\environment",false);
             if(user){merge(std::u16string(1,1)+u"\\environment",true);merge(std::u16string(1,1)+u"\\volatile environment",false);}
+            if(packing){arg.return_to(state,pack_path(values));return std::nullopt;}
             if(!creating){if(!arg(1) || !arg(2))return finish(false,87);const auto source=wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(read_ansi(memory,arg(1),32767));const auto expanded=expand(source,values);const auto bytes=wide?utf16_bytes(expanded):encode(expanded);const auto count=static_cast<std::uint32_t>(arg(3));if(bytes.size()>(wide?static_cast<std::uint64_t>(count)*2:count))return finish(false,122);memory.write(GuestAddress{arg(2)},bytes);return finish(true);}
             if(runtime_.environment_blocks.size()>=4096)return finish(false,8);std::vector<std::uint8_t> bytes;for(const auto& [key,value]:values){(void)key;const auto entry=utf16_bytes(value.first+u"="+value.second);if(entry.size()>output_limit-bytes.size())return finish(false,8);bytes.insert(bytes.end(),entry.begin(),entry.end());}bytes.push_back(0);bytes.push_back(0);if(values.empty()){bytes.push_back(0);bytes.push_back(0);}const auto pointer=allocate_heap(memory,bytes.size());if(!pointer)return finish(false,8);
             try{memory.write(GuestAddress{pointer},bytes);runtime_.environment_blocks.emplace(pointer,true);memory.store(GuestAddress{arg(0)},x86_?32:64,pointer);}catch(...){runtime_.environment_blocks.erase(pointer);(void)free_heap(memory,pointer,state);throw;}return finish(true);
@@ -471,6 +604,48 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
             else if(!arg(2))last_error_=87;
             else {memory.store(GuestAddress{arg(2)},16,0);memory.store(GuestAddress{arg(1)},16,1);result=1;}
         }
+    } else if(symbol=="SetProcessGroupAffinity") {
+        // (hProcess, GROUP_AFFINITY*, PreviousGroupAffinity*)：只有處理器群組 0；保留欄位須為 0、遮罩非空，沿用 SetProcessAffinityMask 的檢查與套用。
+        const unsigned unit=x86_?4:8;const std::uint8_t width=x86_?32:64;
+        if(!arg(1))last_error_=87;
+        else {
+            memory.check(GuestAddress{arg(1)},unit+8,Access::Read);const auto mask=memory.load(GuestAddress{arg(1)},width);bool reserved=memory.load(GuestAddress{arg(1)+unit},16)!=0;
+            for(unsigned i=0;i<3;++i)if(memory.load(GuestAddress{arg(1)+unit+2+i*2},16))reserved=true;
+            if(reserved || !mask)last_error_=87;
+            else {
+                GuestScratch block(*this,memory,state);const auto masks=block.allocate(unit*2);
+                if(!masks)last_error_=8;
+                else if(nested_service(state,memory,"kernel32.dll","GetProcessAffinityMask",{arg(0),masks,masks+unit})&UINT32_MAX){
+                    const auto previous=memory.load(GuestAddress{masks},width);
+                    if(arg(2))memory.check(GuestAddress{arg(2)},unit+8,Access::Write);
+                    if(nested_service(state,memory,"kernel32.dll","SetProcessAffinityMask",{arg(0),mask})&UINT32_MAX){
+                        if(arg(2)){memory.write(GuestAddress{arg(2)},std::vector<std::uint8_t>(unit+8));memory.store(GuestAddress{arg(2)},width,previous);}
+                        result=1;
+                    }
+                }
+            }
+        }
+    } else if(symbol=="DeriveCapabilitySidsFromName") {
+        // (CapName, CapabilityGroupSids**, CapabilityGroupSidCount*, CapabilitySids**, CapabilitySidCount*)：陣列與每個 SID 都以 LocalAlloc 配置，呼叫端以 LocalFree 釋放。
+        const unsigned unit=x86_?4:8;const std::uint8_t width=x86_?32:64;
+        if(!arg(0) || !arg(1) || !arg(2) || !arg(3) || !arg(4))last_error_=87;
+        else {
+            const auto sids=appcontainer::capability_sids(read_utf16(memory,GuestAddress{arg(0)},32768));std::vector<std::uint64_t> allocated;
+            const auto alloc=[&](std::size_t size){const auto value=nested_service(state,memory,"kernel32.dll","LocalAlloc",{0x40,size});return x86_?value&UINT32_MAX:value;};
+            const auto publish=[&](const std::vector<std::vector<std::uint8_t>>& list,std::uint64_t array_out,std::uint64_t count_out){
+                const auto array=alloc(list.size()*unit);if(!array)return false;allocated.push_back(array);
+                for(std::size_t i=0;i<list.size();++i){const auto sid=alloc(list[i].size());if(!sid)return false;allocated.push_back(sid);memory.write(GuestAddress{sid},list[i]);memory.store(GuestAddress{array+i*unit},width,sid);}
+                memory.store(GuestAddress{array_out},width,array);memory.store(GuestAddress{count_out},32,list.size());return true;};
+            if(publish(sids.groups,arg(1),arg(2)) && publish(sids.capabilities,arg(3),arg(4)))result=1;
+            else {for(const auto block:allocated)(void)nested_service(state,memory,"kernel32.dll","LocalFree",{block});
+                for(const auto out:{arg(1),arg(3)})memory.store(GuestAddress{out},width,0);for(const auto out:{arg(2),arg(4)})memory.store(GuestAddress{out},32,0);last_error_=8;}
+        }
+    } else if(symbol=="IsSystemResumeAutomatic") {
+        // 沙箱不會進入睡眠，也就沒有由喚醒計時器自動恢復、尚未有使用者輸入的狀態。
+        result=0;
+    } else if(symbol=="SetTermsrvAppInstallMode" || symbol=="TermsrvAppInstallMode") {
+        // 遠端桌面服務的「安裝模式」：本程序內的旗標，TermsrvAppInstallMode 回傳目前值。
+        if(symbol=="SetTermsrvAppInstallMode"){terminal_install_mode_=static_cast<std::uint32_t>(arg(0))!=0;result=1;}else result=terminal_install_mode_?1U:0U;
     } else if(symbol=="SetThreadGroupAffinity" || symbol=="GetThreadGroupAffinity") {
         const bool setting=symbol.starts_with("Set");const auto id=thread_id(arg(0));
         const unsigned unit=x86_?4:8;const std::uint8_t width=x86_?32:64;
@@ -670,7 +845,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
                     result=1;
                     if(crt && !drive && directory.size()>=2 && directory[1]==u':'){
                         const auto key=std::u16string{u'=',windows_path_upper(directory[0]),u':'};
-                        runtime_.environment[key]={key,directory};
+                        auto environment=runtime_.environment;environment[key]={key,directory};
+                        directory_error=replace_environment(environment);
                     }
                 }
             }
@@ -729,8 +905,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
         if (!valid) {if (crt) {memory.store(GuestAddress{runtime_.errno_cell},32,22);result=secure?22:UINT32_MAX;}else last_error_=87;}
         else {
             const auto key=environment_key(name);
-            if (remove) runtime_.environment.erase(key);else runtime_.environment[key]={name,value};
-            if (crt) {
+            auto environment=runtime_.environment;
+            if(remove)environment.erase(key);else environment[key]={name,value};
+            const auto error=replace_environment(environment);
+            if(error){
+                if(crt){crt_os_error::store(memory,runtime_.errno_cell,error);result=secure?crt_os_error::mapped(error):UINT32_MAX;}
+                else last_error_=error;
+            }else if (crt) {
                 if (remove) runtime_.crt_environment.erase(key);else runtime_.crt_environment[key]={name,value};
                 rebuild_crt_environment(memory,state);
             } else result=1;
@@ -745,7 +926,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_environment(GuestState& sta
                 const auto size=bytes.size();if(size>=2*width && std::all_of(bytes.end()-2*width,bytes.end(),[](std::uint8_t b){return b==0;}))break;
                 if(size>16U*1024U*1024U)throw HostCallFault("SetEnvironmentStrings 環境區塊超過上限");
             }
-            if(const auto parsed=decode_guest_environment(bytes,wide)){runtime_.environment=*parsed;result=1;}else last_error_=87;
+            if(const auto parsed=decode_guest_environment(bytes,wide)){
+                const auto error=replace_environment(*parsed);
+                if(error)last_error_=error;else result=1;
+            }else last_error_=87;
         }
     } else if (symbol=="DnsHostnameToComputerNameA" || symbol=="DnsHostnameToComputerNameW") {
         // NetBIOS 名稱取第一個 label，轉大寫並截到 15 字元；緩衝區不足回 ERROR_MORE_DATA 與所需大小。

@@ -15,6 +15,7 @@ typedef int (*Compare)(const void *, const void *);
 #define EXPORT __declspec(dllexport)
 #define INLINE static __attribute__((always_inline)) inline
 #include "guest_crt_format.h"
+#include "guest_crt_secure_strings.h"
 
 EXPORT int guest_IsTextUnicode(const void *text,int length,int *tests){
     unsigned flags=tests?(unsigned)*tests:0xffffU;
@@ -31,6 +32,58 @@ EXPORT Size (*volatile host__msize)(void *);
 EXPORT void *(*volatile call_malloc)(Size);
 EXPORT void (*volatile call_free)(void *);
 EXPORT const Word *volatile heap_state;
+EXPORT unsigned *volatile printf_count_state;
+EXPORT int (*volatile call_kernel32_QueryPerformanceCounter)(long long *);
+
+/* 與客體 QPC 共用時間軸。頻率取自唯讀 KUSER_SHARED_DATA 的 QpcFrequency。 */
+EXPORT double guest_omp_get_wtick(void){
+    const long long frequency=*(const volatile long long *)0x7ffe0300;
+    return 1.0/(double)frequency;
+}
+EXPORT double guest_omp_get_wtime(void){
+    long long count;
+    call_kernel32_QueryPerformanceCounter(&count);
+    const long long frequency=*(const volatile long long *)0x7ffe0300;
+    return (double)count/(double)frequency;
+}
+
+/* 初始化、銷毀由宿主管理。熱路徑共用 Win64 臨界區段 ABI 與既有等待／喚醒入口。 */
+typedef struct {
+    Address debug;
+    int count, recursion;
+    Address owner;
+} OmpSection;
+EXPORT void (*volatile call_kernel32_EnterCriticalSection)(OmpSection *);
+EXPORT void (*volatile call_kernel32_LeaveCriticalSection)(OmpSection *);
+EXPORT int (*volatile call_kernel32_TryEnterCriticalSection)(OmpSection *);
+EXPORT unsigned (*volatile call_kernel32_GetCurrentThreadId)(void);
+EXPORT void (*volatile call_kernel32_ExitProcess)(unsigned);
+INLINE int omp_owned(OmpSection *section){
+    return __atomic_load_n(&section->owner,__ATOMIC_RELAXED)==call_kernel32_GetCurrentThreadId();
+}
+EXPORT void guest_omp_set_lock(OmpSection **lock){
+    OmpSection *section=*lock;
+    if(omp_owned(section)){call_kernel32_ExitProcess(1);return;}
+    call_kernel32_EnterCriticalSection(section);
+}
+EXPORT int guest_omp_test_lock(OmpSection **lock){
+    OmpSection *section=*lock;
+    return !omp_owned(section) && call_kernel32_TryEnterCriticalSection(section);
+}
+EXPORT void guest_omp_set_nest_lock(OmpSection **lock){call_kernel32_EnterCriticalSection(*lock);}
+EXPORT int guest_omp_test_nest_lock(OmpSection **lock){
+    OmpSection *section=*lock;
+    return call_kernel32_TryEnterCriticalSection(section)?section->recursion:0;
+}
+EXPORT void guest_omp_unset_lock(OmpSection **lock){call_kernel32_LeaveCriticalSection(*lock);}
+EXPORT void guest_omp_unset_nest_lock(OmpSection **lock){call_kernel32_LeaveCriticalSection(*lock);}
+
+EXPORT int guest__get_printf_count_output(void){
+    return __atomic_load_n(printf_count_state,__ATOMIC_ACQUIRE);
+}
+EXPORT int guest__set_printf_count_output(int enable){
+    return __atomic_exchange_n(printf_count_state,enable != 0,__ATOMIC_ACQ_REL);
+}
 
 /* 同一份位元契約供宿主回退與客體常駐產碼使用；錯誤路徑仍交回原 CRT 服務。 */
 EXPORT int (*volatile host_ilogb)(double);

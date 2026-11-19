@@ -15,7 +15,7 @@ std::span<const WindowsServiceDescriptor> serial_service_descriptors(){
         {"kernel32.dll","GetCommMask",2},{"kernel32.dll","SetCommMask",2},
         {"kernel32.dll","WaitCommEvent",3},{"kernel32.dll","ClearCommError",3},
         {"kernel32.dll","GetCommModemStatus",2},{"kernel32.dll","EscapeCommFunction",2},
-        {"kernel32.dll","SetCommBreak",1},{"kernel32.dll","ClearCommBreak",1},
+        {"kernel32.dll","SetCommBreak",1},{"kernel32.dll","ClearCommBreak",1},{"kernel32.dll","TransmitCommChar",2,0,0,0x2},
         {"kernel32.dll","PurgeComm",2},{"kernel32.dll","SetupComm",3},
         {"kernel32.dll","CancelSynchronousIo",1},
         {"kernel32.dll","GetCommConfig",3},{"kernel32.dll","SetCommConfig",3},{"kernel32.dll","GetCommProperties",2},
@@ -133,6 +133,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_serial(GuestState& state,Gu
                     }
                 }else if(name=="EscapeCommFunction")e=port.escape(d(1));
                 else if(name=="SetCommBreak" || name=="ClearCommBreak")e=port.escape(name=="SetCommBreak"?8:9);
+                else if(name=="TransmitCommChar"){
+                    // 優先字元：立即送出一個位元組（不經 WriteFile 佇列）；需要寫入權。上一個優先字元尚未送完時回 ERROR_IO_PENDING 以外的錯誤由傳輸回報。
+                    if(!(file->second.access&0x40000000U))e=5;
+                    else {auto transfer=port.transfer(SerialTransfer::Kind::Write,{static_cast<std::uint8_t>(d(1)&0xffU)});if(!transfer)e=8;else {const auto sent=port.poll(*transfer);if(sent.error)e=sent.error;}}
+                }
                 else if(name=="GetCommModemStatus"){
                     if(!arg(1))e=87;else {memory.check(GuestAddress{arg(1)},4,Access::Write);std::uint32_t status=0;e=port.modem(status);if(!e)memory.store(GuestAddress{arg(1)},32,status);}
                 }else if(name=="ClearCommError"){

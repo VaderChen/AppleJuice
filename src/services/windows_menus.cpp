@@ -31,7 +31,7 @@ std::span<const WindowsServiceDescriptor> menu_service_descriptors() {
         {"user32.dll","CheckMenuRadioItem",5},{"user32.dll","ChangeMenuA",5},{"user32.dll","ChangeMenuW",5},{"user32.dll","HiliteMenuItem",4},
         {"user32.dll","GetMenuInfo",2},{"user32.dll","SetMenuInfo",2},{"user32.dll","GetMenuDefaultItem",3},{"user32.dll","SetMenuDefaultItem",3},
         {"user32.dll","GetMenuContextHelpId",1},{"user32.dll","SetMenuContextHelpId",2},
-        {"user32.dll","TrackPopupMenu",7},{"user32.dll","TrackPopupMenuEx",6},{"user32.dll","EndMenu",0},
+        {"user32.dll","CalculatePopupWindowPosition",5},{"user32.dll","TrackPopupMenu",7},{"user32.dll","TrackPopupMenuEx",6},{"user32.dll","EndMenu",0},
         {"internal-menu-loop","ReadMessage",0}
     };
     return table;
@@ -162,6 +162,13 @@ std::uint64_t WindowsServices::gui_system_menu(std::uint64_t handle) {
         {0xf030,(style&0x10000)?0U:1U,u"Ma&ximize"},{0,separator,u""},{0xf060,0,u"&Close"}};
     return result;
 }
+GuiPopupPlacement WindowsServices::gui_popup_placement(std::int32_t x,std::int32_t y,std::uint32_t flags) {
+    const auto handle=gui_monitor_from_rect({x,y,x,y},2);
+    const auto monitor=gui_monitors().at(handle-1);
+    const auto work=monitor.primary?gui_work_area():monitor.work;
+    const bool in_work=x>=work[0] && y>=work[1] && x<work[2] && y<work[3];
+    return {(flags&0x10000U) || in_work?work:monitor.rect,{}};
+}
 std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     if(service.family=="internal-menu-loop")return advance_menu_idle(state,memory,state.reg(Gpr::Rax));
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');
@@ -195,7 +202,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
         }
         arg.return_to(state,result);return std::nullopt;
     }
-    if(symbol=="EndMenu"){
+    if(symbol=="CalculatePopupWindowPosition"){
+        const auto flags=d(2);
+        if(!arg(0) || !arg(1) || !arg(4) || (flags&12)==12 || (flags&48)==48)fail(87);
+        else {
+            const auto coord=[&](std::uint64_t addr){return signed32(memory.load(GuestAddress{addr},32));};
+            const auto x=coord(arg(0)),y=coord(arg(0)+4),width=coord(arg(1)),height=coord(arg(1)+4);
+            if(width<0 || height<0)fail(87);
+            else {
+                auto placement=gui_popup_placement(x,y,flags);
+                if(arg(3))for(unsigned i=0;i<4;++i)placement.exclude[i]=coord(arg(3)+4*i);
+                const auto rect=placement.position(x,y,width,height,flags);
+                memory.check(GuestAddress{arg(4)},16,Access::Write);
+                for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(4)+4*i},32,static_cast<std::uint32_t>(rect[i]));
+                result=1;
+            }
+        }
+    }else if(symbol=="EndMenu"){
         // 遞迴追蹤只結束本執行緒最內層選單；不影響其他執行緒的選單。
         for(auto it=gui_.menu_tracks.rbegin();it!=gui_.menu_tracks.rend();++it)if(it->second.thread==threads_.current && it->second.active){it->second.cancel();result=1;break;}
     }else if(symbol=="GetMenuBarInfo" || symbol=="GetMenuItemRect" || symbol=="MenuItemFromPoint"){
@@ -402,13 +425,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_menu(GuestState& state,Gues
         else if(!(flags&1) && std::any_of(gui_.menu_tracks.begin(),gui_.menu_tracks.end(),[&](const auto& item){return item.second.active && item.second.thread==threads_.current;}))fail(1446);
         else if(gui_.menu_tracks.size()>=64)fail(8);
         else {
-            // TPMPARAMS 的排除區域不可靜默忽略；純零 RECT 等同沒有排除區域。
+            GuiMenuTrack track;track.menu=arg(0);track.owner=owner;track.thread=threads_.current;track.flags=flags;track.x=signed32(arg(2));track.y=signed32(arg(3));
             if(ex && arg(5)){
                 if(memory.load(GuestAddress{arg(5)},32)!=20){fail(87);arg.return_to(state,result);return std::nullopt;}
-                memory.check(GuestAddress{arg(5)},20,Access::Read);
-                for(unsigned offset=4;offset<20;offset+=4)if(memory.load(GuestAddress{arg(5)+offset},32)){fail(50);arg.return_to(state,result);return std::nullopt;}
+                for(unsigned i=0;i<4;++i)track.exclude[i]=signed32(memory.load(GuestAddress{arg(5)+4+4*i},32));
             }
-            GuiMenuTrack track;track.menu=arg(0);track.owner=owner;track.thread=threads_.current;track.flags=flags;track.x=signed32(arg(2));track.y=signed32(arg(3));
             const auto token=gui_.next_object++;gui_.menu_tracks[token]=track;
             const auto send=resolve("user32.dll",gui_.windows.at(owner).unicode?"SendMessageW":"SendMessageA").value;
             std::vector<GuestCallback> callbacks;
@@ -570,7 +591,9 @@ std::optional<std::uint32_t> WindowsServices::resume_menu(GuestState& state,Gues
             const auto after=gui_.menus.find(selected.menu);
             return after!=gui_.menus.end() && selected.position<after->second.size() && after->second[selected.position].id==entry.id;
         };
-        const auto selection=native_gui_->popup_menu(track.owner,items,track.x,track.y,track.flags,idle,notify_popup,notify_highlight);
+        auto placement=gui_popup_placement(track.x,track.y,track.flags);
+        placement.exclude=track.exclude;
+        const auto selection=native_gui_->popup_menu(track.owner,items,track.x,track.y,track.flags,idle,notify_popup,notify_highlight,&placement);
         if(trace_services_.find("MenuIdle")!=std::string::npos)std::fprintf(stderr,"[menu-idle] token=%llu cycles=%llu snapshots=%llu\n",static_cast<unsigned long long>(frame.value),static_cast<unsigned long long>(idle_cycles),static_cast<unsigned long long>(snapshot_refreshes));
         // 回呼可能 DestroyWindow／DestroyMenu；不得使用已失效的 owner iterator。
         const auto current=gui_.menu_tracks.find(frame.value);

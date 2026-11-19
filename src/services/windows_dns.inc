@@ -1,3 +1,4 @@
+if(service.family=="internal-dnssd")return invoke_dns_records(state,memory,service);
 if(service.family=="dnsapi.dll"){
     if(!service.symbol.starts_with("DnsQuery_") && service.symbol!="DnsFree" && service.symbol!="DnsRecordListFree")return invoke_dns_records(state,memory,service);
     const WindowsCall dns_call(state,memory,service);std::uint32_t status=0;const unsigned pointer_size=x86_?4U:8U;const auto width=static_cast<std::uint8_t>(pointer_size*8);

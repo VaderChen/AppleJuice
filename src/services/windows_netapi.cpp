@@ -33,7 +33,7 @@ std::span<const WindowsServiceDescriptor> netapi_service_descriptors(){
         {"netapi32.dll","NetRemoteTOD",2},{"netapi32.dll","NetGetDCName",3},{"netapi32.dll","NetGetAnyDCName",3},
         {"netapi32.dll","DsGetDcNameA",6,0,0,0x10},{"netapi32.dll","DsGetDcNameW",6,0,0,0x10},{"netapi32.dll","DsGetSiteNameA",2},{"netapi32.dll","DsGetSiteNameW",2},
         {"netapi32.dll","NetServerEnum",9,0,0,0x4a},{"netapi32.dll","NetServerEnumEx",9,0,0,0x4a},
-        {"netapi32.dll","NetShareEnum",7,0,0,0xa},{"netapi32.dll","NetShareGetInfo",4,0,0,4},{"netapi32.dll","NetSessionEnum",9,0,0,0x28},{"netapi32.dll","NetFileEnum",9,0,0,0x28},
+        {"netapi32.dll","NetServerDiskEnum",7,0,0,0xa},{"netapi32.dll","NetStatisticsGet",5},{"netapi32.dll","NetShareEnum",7,0,0,0xa},{"netapi32.dll","NetShareGetInfo",4,0,0,4},{"netapi32.dll","NetSessionEnum",9,0,0,0x28},{"netapi32.dll","NetFileEnum",9,0,0,0x28},
         {"netapi32.dll","NetUseEnum",7,0,0,0xa},{"netapi32.dll","NetUseGetInfo",4,0,0,4},{"netapi32.dll","NetUseDel",3,0,0,4},
         {"netapi32.dll","NetpGetComputerName",1},{"netapi32.dll","DavGetHTTPFromUNCPath",3},{"netapi32.dll","DavGetUNCFromHTTPPath",3}};
     return table;
@@ -210,6 +210,33 @@ std::optional<std::uint32_t> WindowsServices::invoke_netapi(GuestState& state,Gu
             memory.store(GuestAddress{arg(6)},width,0);const auto start=std::min<std::size_t>(index,records.size());auto count=std::min<std::size_t>(records.size()-start,std::max<std::uint32_t>(u32(3),1));
             memory.store(GuestAddress{arg(5)},32,count);if(count)memory.store(GuestAddress{arg(6)},width,build({records.begin()+static_cast<std::ptrdiff_t>(start),records.begin()+static_cast<std::ptrdiff_t>(start+count)}));
             return finish(start+count<records.size()?more_data:nerr_success);
+        }
+        if(name=="NetServerDiskEnum"){
+            // (servername, level, bufptr, prefmaxlen, entriesread, totalentries, resume_handle)：level 0 為本機固定與抽取式磁碟機，每項三個 WCHAR（"C:" 與 NUL），
+            // 陣列後另加一個 NUL；以 NetApiBufferFree 釋放。遠端名稱已在上方回 ERROR_BAD_NETPATH。
+            if(u32(1))return finish(invalid_level);if(!arg(2) || !arg(4) || !arg(5))return finish(invalid_parameter);
+            memory.check(GuestAddress{arg(2)},unit,Access::Write);memory.store(GuestAddress{arg(2)},width,0);
+            const auto mask=static_cast<std::uint32_t>(nested_service(state,memory,"kernel32.dll","GetLogicalDrives",{}));std::vector<char16_t> letters;
+            GuestScratch temporary(*this,memory,state);
+            for(unsigned i=0;i<26;++i){if(!(mask&(1U<<i)))continue;const std::u16string root{static_cast<char16_t>(u'A'+i),u':',u'\\'};const auto text=temporary.text(root);if(!text)return finish(8);
+                const auto type=static_cast<std::uint32_t>(nested_service(state,memory,"kernel32.dll","GetDriveTypeW",{text}));if(type==2 || type==3)letters.push_back(root[0]);}
+            std::vector<std::uint8_t> block;for(const auto letter:letters){for(const char16_t c:{letter,u':',u'\0'}){block.push_back(static_cast<std::uint8_t>(c));block.push_back(static_cast<std::uint8_t>(c>>8));}}
+            block.push_back(0);block.push_back(0);const auto address=allocate_heap(memory,block.size());if(!address)return finish(8);memory.write(GuestAddress{address},block);
+            memory.store(GuestAddress{arg(2)},width,address);memory.store(GuestAddress{arg(4)},32,letters.size());memory.store(GuestAddress{arg(5)},32,letters.size());
+            if(arg(6))memory.store(GuestAddress{arg(6)},32,0);return finish(nerr_success);
+        }
+        if(name=="NetStatisticsGet"){
+            // (ServerName, Service, Level, Options, Buffer)：只有 level 0、Options 必須為 0；LanmanWorkstation 為 STAT_WORKSTATION_0（216 位元組），
+            // LanmanServer 為 STAT_SERVER_0（17 個 DWORD）。統計起點為開機時間；沙箱沒有 SMB 工作站／伺服器流量，計數器皆為 0。以 NetApiBufferFree 釋放。
+            if(!arg(1) || !arg(4))return finish(invalid_parameter);const auto service_name=folded(wide_text(arg(1)));
+            if(u32(2))return finish(invalid_level);if(u32(3))return finish(invalid_parameter);
+            const bool workstation=service_name==u"lanmanworkstation";if(!workstation && service_name!=u"lanmanserver")return finish(50);
+            memory.check(GuestAddress{arg(4)},unit,Access::Write);memory.store(GuestAddress{arg(4)},width,0);
+            const auto now=runtime_.system_filetime();const auto boot=now>runtime_.clock_ticks?now-runtime_.clock_ticks:0;
+            const auto size=workstation?216U:68U;const auto address=allocate_heap(memory,size);if(!address)return finish(8);memory.fill(GuestAddress{address},0,size);
+            if(workstation)memory.store(GuestAddress{address},64,boot);
+            else memory.store(GuestAddress{address},32,boot>116444736000000000ULL?(boot-116444736000000000ULL)/10000000ULL:0);
+            memory.store(GuestAddress{arg(4)},width,address);return finish(nerr_success);
         }
         if(name=="NetRemoteTOD"){
             // TIME_OF_DAY_INFO（UTC，與客體時區一致）：elapsedt、msecs（開機毫秒）、時分秒與百分秒、timezone、tinterval（0.0001 秒）、日月年與星期。

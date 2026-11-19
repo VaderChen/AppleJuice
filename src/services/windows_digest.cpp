@@ -104,6 +104,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_digest(GuestState& state,Gu
             const auto id=all.next;all.credentials.emplace(id,std::move(credentials));++all.next;handle(memory,arg(7),id);if(arg(8))memory.store(GuestAddress{arg(8)},64,INT64_MAX);
         }else if(symbol=="FreeCredentialsHandle"){
             require(all.credentials.erase(handle(memory,arg(0))),digest::invalid_handle);
+        }else if(symbol.starts_with("QueryCredentialsAttributes")){
+            // (phCredential, ulAttribute, pBuffer)：WDigest 認證只有 SECPKG_CRED_ATTR_NAMES（1）；名稱與內容的 SECPKG_ATTR_NAMES 相同（認證的使用者名稱），以 FreeContextBuffer 釋放。
+            const auto credential=all.credentials.find(handle(memory,arg(0)));require(credential!=all.credentials.end(),digest::invalid_handle);
+            const auto at=arg(2);require(at,invalid_parameter);if(static_cast<std::uint32_t>(arg(1))!=1)throw digest::Error{digest::unsupported};
+            const unsigned width=x86_?4U:8U;memory.check(GuestAddress{at},width,Access::Write);std::vector<std::uint8_t> bytes;
+            if(symbol.ends_with('W'))bytes=utf16_bytes(utf8_to_utf16(credential->second.user));
+            else {bool replaced=false;const auto ansi=utf16_to_cp1252(utf8_to_utf16(credential->second.user),'?',replaced);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
+            const auto pointer=allocate_heap(memory,bytes.size());require(pointer,no_memory);memory.write(GuestAddress{pointer},bytes);runtime_.tls.buffers.insert(pointer);
+            memory.store(GuestAddress{at},static_cast<std::uint8_t>(width*8),pointer);
         }else if(symbol.starts_with("InitializeSecurityContext") || symbol=="AcceptSecurityContext"){
             const bool server=symbol=="AcceptSecurityContext";const auto flags=static_cast<std::uint32_t>(arg(3));
             const auto input_pointer=arg(server?2:6),output_pointer=arg(server?6:9),new_context=arg(server?5:8),attributes=arg(server?7:10),expiry=arg(server?8:11);

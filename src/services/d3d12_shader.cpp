@@ -2,6 +2,9 @@
 #include "shader_memory_cache.hpp"
 #include <vkd3d_shader.h>
 #include <spirv_msl.hpp>
+#include "spirv_point_geometry.hpp"
+#include "spirv_geometry_stream.hpp"
+#include "d3d12_geometry_stream.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -33,7 +36,7 @@ unsigned classify(std::span<const std::uint8_t> bytes){
 }
 }
 bool graphics_modern_shader_required(std::span<const std::uint8_t> bytes){return classify(bytes)==1;}
-static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes){
+static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes,bool point_capture=false,GraphicsGeometryStream* geometry=nullptr){
     static std::mutex lock;const std::lock_guard guard(lock);
     if(!graphics_modern_shader_required(bytes))throw std::invalid_argument("著色器不是 DXIL 或 SM5.1 DXBC");
     if(const char* directory=std::getenv("X64ARM_DUMP_DXBC");directory && *directory){
@@ -43,7 +46,7 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
         std::filesystem::create_directories(path.parent_path());std::ofstream output(path,std::ios::binary);
         output.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));
     }
-    if(stage!=0 && stage!=1 && stage!=5)
+    if(stage!=0 && stage!=1 && stage!=2 && stage!=5)
         throw std::invalid_argument("現代著色器目前支援 VS／PS／CS（階段 "+std::to_string(stage)+(stage==2?" GS":stage==3?" HS":stage==4?" DS":"")+"）");
     bool dxil=false;
     for(unsigned i=0;i<word(bytes,28);++i)if(word(bytes,word(bytes,32+4*i))==0x4c495844U)dxil=true;
@@ -121,8 +124,31 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
     // 診斷：X64ARM_DUMP_SPIRV=<目錄> 保存 vkd3d 輸出的 SPIR-V（檔名為內容雜湊），供 spirv-dis 檢查。
     if(const char* folder=std::getenv("X64ARM_DUMP_SPIRV");folder && *folder){std::uint64_t hash=1469598103934665603ULL;for(const auto w:words){hash^=w;hash*=1099511628211ULL;}
         std::ofstream out(std::filesystem::path(folder)/(std::to_string(hash)+".spv"),std::ios::binary);out.write(reinterpret_cast<const char*>(words.data()),static_cast<std::streamsize>(words.size()*4));}
+    if(geometry){
+        auto stream=spirv_geometry_stream(words);
+        geometry->input_vertices=stream.input_vertices;
+        geometry->output_width=stream.output_topology==spv::ExecutionModeOutputPoints?1:
+                               stream.output_topology==spv::ExecutionModeOutputLineStrip?2:3;
+        geometry->max_vertices=stream.max_vertices;
+        geometry->input_registers=stream.input_registers;
+        geometry->output_registers=stream.output_registers;
+        geometry->output_primitive_words=stream.output_primitive_words();
+        for(const auto& field:stream.interface){
+            const auto& signature=field.input?scan.signatures.input:scan.signatures.output;
+            const auto mask=((1U<<field.width)-1)<<field.component;
+            const auto* sem=std::find_if(signature.elements,signature.elements+signature.element_count,[&](const auto& e){
+                return field.position?e.sysval_semantic==VKD3D_SHADER_SV_POSITION:
+                    e.sysval_semantic==VKD3D_SHADER_SV_NONE && e.register_index==field.reg && e.mask==mask;
+            });
+            if(sem==signature.elements+signature.element_count || !sem->semantic_name)
+                throw std::invalid_argument("幾何階段的暫存器分量與簽章不符");
+            geometry->interface.push_back({sem->semantic_name,sem->semantic_index,field.reg,field.component,field.width,
+                static_cast<uint32_t>(sem->component_type),field.input,field.position});
+        }
+        words=std::move(stream.words);
+    }else if(stage==2)words=spirv_point_geometry(words);
     spirv_cross::CompilerMSL compiler(std::move(words));
-    const auto model=stage==0?spv::ExecutionModelVertex:stage==1?spv::ExecutionModelFragment:spv::ExecutionModelGLCompute;
+    const auto model=(stage==0 || (stage==2 && !geometry))?spv::ExecutionModelVertex:stage==1?spv::ExecutionModelFragment:spv::ExecutionModelGLCompute;
     auto msl=compiler.get_msl_options();msl.platform=spirv_cross::CompilerMSL::Options::macOS;msl.set_msl_version(3,1);msl.pad_fragment_output_components=true;
     // 描述元表的 storage buffer 項目帶長度（spvBufferDescriptor：位址、長度、補齊，共 16 位元組）。
     // MSL 3.1：影像原子運算用原生紋理原子（UAV 紋理已帶 MTLTextureUsageShaderAtomic），不再產生會占用 buffer 槽的 _atomic 別名。
@@ -130,6 +156,8 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
     // typed buffer（Buffer<T>／RWBuffer<T>）用原生 texture_buffer，與執行期的 MTLTextureTypeTextureBuffer 檢視一致；
     // raw／structured 緩衝已由 vkd3d 改為 storage buffer（見 Vkd3dStorageBufferArrays.cmake）。
     msl.texture_buffer_native=true;
+    msl.capture_output_to_buffer=point_capture;
+    msl.vertex_for_tessellation=point_capture;
     msl.runtime_array_rich_descriptor=true;msl.argument_buffers_tier=spirv_cross::CompilerMSL::Options::ArgumentBuffersTier::Tier2;compiler.set_msl_options(msl);
     GraphicsModernShader result;
     // 離散 UAV 緩衝可能來自根描述元，不能改走描述元表；暫存器超出 u7 時改用本著色器未占用的 u0–u7 slot，
@@ -166,6 +194,17 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
     const auto assign=[&](const spirv_cross::SmallVector<spirv_cross::Resource>& resources,unsigned group){
         for(const auto& resource:resources){
             const auto binding=compiler.get_decoration(resource.id,spv::DecorationBinding);const auto found=by_binding.find(binding);
+            if(geometry && compiler.get_decoration(resource.id,spv::DecorationDescriptorSet)==1){
+                if(group!=1 || binding>1)throw std::invalid_argument("幾何暫存緩衝綁定不合法");
+                spirv_cross::MSLResourceBinding mapping{};mapping.stage=model;mapping.desc_set=1;
+                mapping.binding=binding;mapping.count=1;mapping.msl_buffer=next_buffer++;
+                compiler.add_msl_resource_binding(mapping);
+                compiler.set_name(resource.base_type_id,"AJGeometryStorage");
+                compiler.set_member_name(resource.base_type_id,0,"words");
+                compiler.set_name(resource.id,binding==0?"ajGeometryInput":"ajGeometryOutput");
+                (binding==0?geometry->input_slot:geometry->output_slot)=mapping.msl_buffer;
+                continue;
+            }
             if(found==by_binding.end()){
                 const auto counter=counter_registers.find(binding);
                 if(counter==counter_registers.end() || group!=1)throw std::invalid_argument("現代著色器資源缺少 D3D 描述元");
@@ -210,12 +249,14 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
     if(next_buffer>31 || next_texture>128 || next_sampler>16)throw std::invalid_argument("現代著色器資源超出 Metal 綁定上限");
     const auto signatures=[&](const vkd3d_shader_signature& signature,std::vector<GraphicsShaderSemantic>& out){
         for(unsigned i=0;i<signature.element_count;++i){const auto& e=signature.elements[i];
+            if(stage==2 && !geometry && e.sysval_semantic!=VKD3D_SHADER_SV_NONE)
+                throw std::invalid_argument("點幾何著色器的系統語意需要獨立映射");
             if(e.sysval_semantic==VKD3D_SHADER_SV_NONE && e.semantic_name && e.mask)
                 out.push_back({e.semantic_name,e.semantic_index,e.register_index,e.mask});
         }
     };
     signatures(scan.signatures.input,result.signature_inputs);signatures(scan.signatures.output,result.signature_outputs);
-    if(stage==0)for(const auto& input:resources.stage_inputs){
+    if(stage==0 || (stage==2 && !geometry))for(const auto& input:resources.stage_inputs){
         // 頂點屬性位置即 D3D 輸入簽章暫存器；以語意供 input layout 對應。
         const auto location=compiler.get_decoration(input.id,spv::DecorationLocation);
         const auto& signature=scan.signatures.input;
@@ -226,6 +267,11 @@ static GraphicsModernShader translate_modern_shader(std::uint32_t stage,std::spa
     if(stage==5)for(unsigned i=0;i<3;++i)result.threads[i]=std::max(1U,compiler.get_execution_mode_argument(spv::ExecutionModeLocalSize,i));
     // OpArrayLength（structured／raw GetDimensions）需要以原生 buffer 索引查詢 view 的位元組長度。
     // 輔助表使用下一個未占用槽位，不能沿用預設 25 而覆蓋一般資源。
+    if(point_capture){
+        if(next_buffer>=31)throw std::invalid_argument("幾何點擷取缺少輸出緩衝槽位");
+        msl.shader_output_buffer_index=next_buffer++;
+        result.capture_output_slot=msl.shader_output_buffer_index;
+    }
     msl.buffer_size_buffer_index=next_buffer;compiler.set_msl_options(msl);
     compiler.rename_entry_point("main","xlatMtlMain",model);result.source=compiler.compile();result.entry="xlatMtlMain";
     if(compiler.needs_buffer_size_buffer()){
@@ -286,6 +332,14 @@ std::optional<GraphicsModernShader> decode_modern_shader(std::span<const std::ui
     if(!ok || at!=bytes.size() || shader.source.empty() || shader.entry.empty())return std::nullopt;
     return shader;
 }
+}
+GraphicsGeometryStream graphics_modern_geometry_stream(std::span<const uint8_t> bytes){
+    GraphicsGeometryStream result;
+    result.shader=translate_modern_shader(2,bytes,false,&result);
+    return result;
+}
+GraphicsModernShader graphics_modern_point_capture(std::span<const std::uint8_t> bytes){
+    return translate_modern_shader(2,bytes,true);
 }
 // 翻譯結果只取決於（階段、bytecode）與翻譯器本身；跨程序快取命中時略過 vkd3d／SPIRV-Cross（電馭判客 PSO 載入的主要成本）。
 // 階段與格式檢查仍先做，失敗的翻譯不寫入快取。

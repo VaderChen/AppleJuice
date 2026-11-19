@@ -6,6 +6,7 @@
 #include "windows_exception_diagnostics.hpp"
 #include "windows_object_identity.hpp"
 #include "windows_file_stat.hpp"
+#include "windows_native_process_parameters.hpp"
 #include "x64arm/process_io.hpp"
 #include "x64arm/windows_paths.hpp"
 #include "windows_globalroot_path.hpp"
@@ -17,8 +18,19 @@
 #include "x64arm/shared_job.hpp"
 #include "guest_concrt_queue.hpp"
 #include "guest_concrt_queue_code.hpp"
+#include "resource_directory.hpp"
+#include "default_pipe_acl.hpp"
+#include <cstdlib>
+#include <cstring>
+#if !defined(_WIN32)
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <algorithm>
+#include <array>
 #include <charconv>
+#include <span>
 
 namespace x64arm {
 namespace {
@@ -72,9 +84,10 @@ std::u16string rooted_object_name(const RuntimeState& runtime,const ObjectAttrib
     if(!attributes.root)return name;
     const auto directory=runtime.object_directories.find(attributes.root);
     if(directory==runtime.object_directories.end())throw NativeError{0xc0000008U};
+    if(directory->second.object->symbolic_link())throw NativeError{0xc0000024U};
     const auto required=creating?6U:2U;if((directory->second.access&required)!=required)throw NativeError{0xc0000022U};
     if(!name.empty() && name.front()==u'\\')throw NativeError{0xc000003bU};
-    auto root=std::u16string(directory->second.object->name());if(!name.empty()){if(root.back()!=u'\\')root+=u'\\';root+=name;}return root;
+    auto root=std::u16string(directory->second.object->path());if(!name.empty()){if(root.back()!=u'\\')root+=u'\\';root+=name;}return root;
 }
 std::u16string native_string(const GuestMemory& memory,std::uint64_t address,bool x86){
     const auto length=memory.load(GuestAddress{address},16),maximum=memory.load(GuestAddress{address+2},16),buffer=memory.load(GuestAddress{address+(x86?4U:8U)},x86?32:64);
@@ -131,6 +144,18 @@ void concrt_queue::initialize(GuestMemory& memory,std::map<std::uint64_t,Runtime
     for(auto& mapping:parsed.mappings)mapping.permissions=(mapping.permissions&permission(Access::Execute))?read_execute:permission(Access::Read);
     map_pe_image(memory,parsed);images.emplace(base,std::move(image));
 }
+// 物件命名空間（windows_object_namespace.inc）：目錄、符號連結、私有命名空間與邊界描述元。
+static bool object_namespace_service(std::string_view symbol){
+    static constexpr std::array<std::string_view,23> names{
+        "NtCreateDirectoryObject","NtCreateDirectoryObjectEx","NtQueryDirectoryObject","NtCreateSymbolicLinkObject","NtOpenSymbolicLinkObject",
+        "NtQuerySymbolicLinkObject","NtMakePermanentObject","NtCreatePrivateNamespace","NtOpenPrivateNamespace","NtDeletePrivateNamespace",
+        "RtlCreateBoundaryDescriptor","RtlDeleteBoundaryDescriptor","RtlAddSIDToBoundaryDescriptor","RtlAddIntegrityLabelToBoundaryDescriptor",
+        "CreateBoundaryDescriptorA","CreateBoundaryDescriptorW","DeleteBoundaryDescriptor","AddSIDToBoundaryDescriptor","AddIntegrityLabelToBoundaryDescriptor",
+        "CreatePrivateNamespaceA","CreatePrivateNamespaceW","OpenPrivateNamespaceA","OpenPrivateNamespaceW"};
+    if(symbol=="ClosePrivateNamespace")return true;
+    const auto native=symbol.starts_with("Zw")?std::string("Nt")+std::string(symbol.substr(2)):std::string(symbol);
+    return std::find(names.begin(),names.end(),native)!=names.end();
+}
 std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"ntdll.dll","RtlDisownModuleHeapAllocation",2},
@@ -139,9 +164,26 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         {"kernel32.dll","ReadFileScatter",5,0,0,0x4},{"kernel32.dll","WriteFileGather",5,0,0,0x4},
         {"ntdll.dll","NtReadFileScatter",9,0,0,0x40},{"ntdll.dll","ZwReadFileScatter",9,0,0,0x40},{"ntdll.dll","NtWriteFileGather",9,0,0,0x40},{"ntdll.dll","ZwWriteFileGather",9,0,0,0x40},
         {"ntdll.dll","NtOpenDirectoryObject",3,0,0,2},{"ntdll.dll","ZwOpenDirectoryObject",3,0,0,2},
+        {"ntdll.dll","NtCreateDirectoryObject",3,0,0,2},{"ntdll.dll","ZwCreateDirectoryObject",3,0,0,2},
+        {"ntdll.dll","NtCreateDirectoryObjectEx",5,0,0,0x12},{"ntdll.dll","ZwCreateDirectoryObjectEx",5,0,0,0x12},
+        {"ntdll.dll","NtQueryDirectoryObject",7,0,0,0x1c},{"ntdll.dll","ZwQueryDirectoryObject",7,0,0,0x1c},
+        {"ntdll.dll","NtCreateSymbolicLinkObject",4,0,0,2},{"ntdll.dll","ZwCreateSymbolicLinkObject",4,0,0,2},
+        {"ntdll.dll","NtOpenSymbolicLinkObject",3,0,0,2},{"ntdll.dll","ZwOpenSymbolicLinkObject",3,0,0,2},
+        {"ntdll.dll","NtQuerySymbolicLinkObject",3},{"ntdll.dll","ZwQuerySymbolicLinkObject",3},
+        {"ntdll.dll","NtMakePermanentObject",1},{"ntdll.dll","ZwMakePermanentObject",1},
+        {"ntdll.dll","NtCreatePrivateNamespace",4,0,0,2},{"ntdll.dll","ZwCreatePrivateNamespace",4,0,0,2},
+        {"ntdll.dll","NtOpenPrivateNamespace",4,0,0,2},{"ntdll.dll","ZwOpenPrivateNamespace",4,0,0,2},
+        {"ntdll.dll","NtDeletePrivateNamespace",1},{"ntdll.dll","ZwDeletePrivateNamespace",1},
+        {"ntdll.dll","RtlCreateBoundaryDescriptor",2,0,0,2},{"ntdll.dll","RtlDeleteBoundaryDescriptor",1},
+        {"ntdll.dll","RtlAddSIDToBoundaryDescriptor",2},{"ntdll.dll","RtlAddIntegrityLabelToBoundaryDescriptor",2},
+        {"kernel32.dll","CreateBoundaryDescriptorA",2,0,0,2},{"kernel32.dll","CreateBoundaryDescriptorW",2,0,0,2},{"kernel32.dll","DeleteBoundaryDescriptor",1},
+        {"kernel32.dll","AddSIDToBoundaryDescriptor",2},{"kernel32.dll","AddIntegrityLabelToBoundaryDescriptor",2},
+        {"kernel32.dll","CreatePrivateNamespaceA",3},{"kernel32.dll","CreatePrivateNamespaceW",3},
+        {"kernel32.dll","OpenPrivateNamespaceA",2},{"kernel32.dll","OpenPrivateNamespaceW",2},{"kernel32.dll","ClosePrivateNamespace",2,0,0,2},
 #include "concrt_sync_descriptors.inc"
 #include "concrt_lock_descriptors.inc"
 #include "concrt_queue_descriptors.inc"
+#include "concrt_scheduler_descriptors.inc"
         {"ntdll.dll","NtCreateFile",11,0,0,0x5e2},{"ntdll.dll","NtOpenFile",6,0,0,0x32},
         {"ntdll.dll","NtQueryAttributesFile",2},{"ntdll.dll","NtQueryFullAttributesFile",2},
         {"ntdll.dll","NtQueryInformationByName",5,0,0,0x18},
@@ -304,21 +346,21 @@ std::span<const WindowsServiceDescriptor> nt_native_service_descriptors(){
         ,{"ntdll.dll","RtlQueryTimeZoneInformation",1},{"ntdll.dll","RtlQueryDynamicTimeZoneInformation",1},{"ntdll.dll","RtlGetSystemTimePrecise",0}
         ,{"ntdll.dll","RtlGetCurrentDirectory_U",2,0,0,0x1},{"ntdll.dll","RtlSetCurrentDirectory_U",1},{"ntdll.dll","RtlDoesFileExists_U",1},{"ntdll.dll","RtlDosSearchPath_U",6,0,0,0x8}
         ,{"ntdll.dll","RtlQueryEnvironmentVariable_U",3},{"ntdll.dll","RtlQueryEnvironmentVariable",6},{"ntdll.dll","RtlSetEnvironmentVariable",3},{"ntdll.dll","RtlExpandEnvironmentStrings_U",4}
-        ,{"ntdll.dll","RtlExpandEnvironmentStrings",6},{"ntdll.dll","RtlCreateEnvironment",2},{"ntdll.dll","RtlDestroyEnvironment",1},{"ntdll.dll","RtlCopySecurityDescriptor",2}
+        ,{"ntdll.dll","RtlExpandEnvironmentStrings",6},{"ntdll.dll","RtlCreateEnvironment",2},{"ntdll.dll","RtlDestroyEnvironment",1},{"ntdll.dll","RtlSetCurrentEnvironment",2},{"ntdll.dll","RtlDefaultNpAcl",1},{"ntdll.dll","RtlAddProcessTrustLabelAce",6,0,0,0x26},{"ntdll.dll","RtlCopySecurityDescriptor",2}
         ,{"ntdll.dll","RtlAddAccessAllowedObjectAce",7,0,0,0xe},{"ntdll.dll","RtlAddAccessDeniedObjectAce",7,0,0,0xe},{"ntdll.dll","RtlAddAuditAccessObjectAce",9,0,0,0xe}
         ,{"ntdll.dll","RtlNewSecurityObject",6},{"ntdll.dll","RtlNewSecurityObjectEx",8,0,0,0x20},{"ntdll.dll","RtlNewSecurityObjectWithMultipleInheritance",9,0,0,0x50}
         ,{"ntdll.dll","RtlConvertToAutoInheritSecurityObject",6},{"ntdll.dll","RtlDeleteSecurityObject",1},{"ntdll.dll","RtlValidRelativeSecurityDescriptor",3,0,0,0x6}
         // Ldr／Tp／Dbg／地區設定／IDN／正規化／路徑（windows_ntdll_loader.inc）。
-        ,{"ntdll.dll","TpAllocCleanupGroup",1},{"ntdll.dll","TpQueryPoolStackInformation",2},{"ntdll.dll","TpSetPoolStackInformation",2},{"ntdll.dll","TpAllocWork",4},{"ntdll.dll","TpAllocTimer",4},{"ntdll.dll","TpAllocWait",4},{"ntdll.dll","TpAllocPool",2}
+        ,{"ntdll.dll","TpAllocCleanupGroup",1},{"ntdll.dll","TpQueryPoolStackInformation",2},{"ntdll.dll","TpSetPoolStackInformation",2},{"ntdll.dll","TpAllocWork",4},{"ntdll.dll","TpAllocTimer",4},{"ntdll.dll","TpAllocWait",4},{"ntdll.dll","TpAllocPool",2},{"ntdll.dll","TpAllocIoCompletion",5},{"ntdll.dll","RtlSetIoCompletionCallback",3,0,0,0x4}
         ,{"ntdll.dll","TpSetPoolMinThreads",2,0,0,0x2},{"ntdll.dll","TpSimpleTryPost",3},{"ntdll.dll","TpCallbackMayRunLong",1}
         ,{"ntdll.dll","LdrGetDllHandleEx",5,0,0,0x1},{"ntdll.dll","LdrAddRefDll",2,0,0,0x1},{"ntdll.dll","LdrDisableThreadCalloutsForDll",1}
         ,{"ntdll.dll","LdrFindEntryForAddress",2},{"ntdll.dll","LdrGetDllFullName",2},{"ntdll.dll","LdrGetDllDirectory",1},{"ntdll.dll","LdrSetDllDirectory",1}
         ,{"ntdll.dll","LdrAddDllDirectory",2},{"ntdll.dll","LdrRemoveDllDirectory",1},{"ntdll.dll","LdrSetDefaultDllDirectories",1,0,0,0x1}
-        ,{"ntdll.dll","LdrFindResource_U",4,0,0,0x4},{"ntdll.dll","LdrAccessResource",4},{"ntdll.dll","LdrProcessRelocationBlock",4,0,0,0x2}
+        ,{"ntdll.dll","LdrFindResource_U",4,0,0,0x4},{"ntdll.dll","LdrFindResourceDirectory_U",4,0,0,0x4},{"ntdll.dll","LdrAccessResource",4},{"ntdll.dll","LdrProcessRelocationBlock",4,0,0,0x2}
         ,{"ntdll.dll","LdrEnumerateLoadedModules",3},{"ntdll.dll","LdrGetDllPath",4},{"ntdll.dll","RtlGetSearchPath",1},{"ntdll.dll","RtlGetExePath",2},{"ntdll.dll","RtlReleasePath",1},
         {"ntdll.dll","LdrQueryProcessModuleInformation",3},{"ntdll.dll","RtlQueryProcessPlaceholderCompatibilityMode",0},{"ntdll.dll","RtlSetProcessPlaceholderCompatibilityMode",1},
         {"ntdll.dll","RtlQueryThreadPlaceholderCompatibilityMode",0},{"ntdll.dll","RtlSetThreadPlaceholderCompatibilityMode",1},{"ntdll.dll","LdrQueryImageFileExecutionOptions",6,0,0,0x14}
-        ,{"ntdll.dll","DbgBreakPoint",0},{"ntdll.dll","DbgUserBreakPoint",0}
+        ,{"ntdll.dll","DbgBreakPoint",0},{"ntdll.dll","DbgUserBreakPoint",0},{"ntdll.dll","DbgUiRemoteBreakin",1}
         ,{"ntdll.dll","RtlLcidToLocaleName",4,0,0,0x5},{"ntdll.dll","RtlLocaleNameToLcid",3,0,0,0x4},{"ntdll.dll","RtlIsValidLocaleName",2,0,0,0x2}
         ,{"ntdll.dll","RtlGetUserPreferredUILanguages",5,0,0,0x3},{"ntdll.dll","RtlGetSystemPreferredUILanguages",5,0,0,0x3},{"ntdll.dll","RtlGetThreadPreferredUILanguages",4,0,0,0x1}
         ,{"ntdll.dll","RtlGetProcessPreferredUILanguages",4,0,0,0x1},{"ntdll.dll","RtlSetProcessPreferredUILanguages",3,0,0,0x1},{"ntdll.dll","RtlSetThreadPreferredUILanguages",3,0,0,0x1}
@@ -586,6 +628,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
         if(service.symbol=="CancelIo" || service.symbol=="CancelIoEx")return invoke_file_io(state,memory,service);
         return invoke_file_readwrite(state,memory,service);
     }
+    if(object_namespace_service(service.symbol))return invoke_object_namespace(state,memory,service);
     if(nt_object_service(service.symbol))return invoke_nt_object(state,memory,service);
     if(nt_continuation_service(service.symbol))return invoke_nt_continuation(state,memory,service);
     if(nt_family_service(service.symbol))return invoke_nt_family(state,memory,service);
@@ -634,6 +677,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
 #include "windows_wait_completion_native.inc"
 #include "concrt_sync_handlers.inc"
 #include "concrt_lock_handlers.inc"
+#include "concrt_objects.inc"
+#include "concrt_scheduler_handlers.inc"
+#include "concrt_task_collection.inc"
 #include "msvcp_sync_handlers.inc"
         if(name=="CoWaitForMultipleHandles" || name=="CoWaitForMultipleObjects"){
             // COWAIT_*：WAITALL 1、ALERTABLE 2、INPUTAVAILABLE 4、DISPATCH_CALLS 8、DISPATCH_WINDOW_MESSAGES 0x10；
@@ -1032,7 +1078,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_native(GuestState& state
         }
         if(name=="NtCreateSection" || name=="NtOpenSection"){
             const bool create=name=="NtCreateSection";memory.check(GuestAddress{call(0)},unit,Access::Write);const auto attr=object_attributes(memory,call(2),x86_,create);
-            auto section=rooted_object_name(runtime_,attr,create);if(!section.empty()){auto mapped=win32_object_name(section);if(!mapped)return finish(0xc000003bU);section=std::move(*mapped);}
+            auto section=rooted_object_name(runtime_,attr,create);if(!section.empty()){if(const auto status=namespace_object_name(section,create))return finish(status);}
             if(call(1)&~0xf001fU)return finish(0xc0000022U);
             if(create && call(5)!=0x8000000U && call(5)!=0 && call(5)!=0x1000000U && call(5)!=0x11000000U)return finish(0xc00000bbU);
             const auto at=scratch(128+section.size()*2+2);security(attr,at);if(!section.empty())memory.write(GuestAddress{at+128},utf16_bytes(section));op.attributes=static_cast<std::uint32_t>(call(1));op.information=attr.flags;
@@ -1251,6 +1297,7 @@ namespace x64arm {
 #include "windows_nt_shared.inc"
 #include "windows_nt_objects.inc"
 #include "windows_nt_families.inc"
+#include "windows_object_namespace.inc"
 #include "windows_ntdll_rtl.inc"
 #include "windows_ntdll_loader.inc"
 #include "windows_file_segments.inc"

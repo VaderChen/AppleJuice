@@ -21,7 +21,38 @@ constexpr std::uint32_t ok=0,s_false=1,pointer_error=0x80004003U,no_interface=0x
     not_implemented=0x80004001U,fail=0x80004005U,no_aggregation=0x80040110U,class_not_registered=0x80040154U,
     wrong_state=0x88982f04U,unknown_format=0x88982f07U,not_initialized=0x88982f0cU,component_not_found=0x88982f50U,
     no_thumbnail=0x88982f44U,palette_unavailable=0x88982f45U,frame_missing=0x88982f62U,unsupported_pixel_format=0x88982f80U,
-    unsupported_operation=0x88982f81U,insufficient_buffer=0x88982f8cU,already_locked=0x88982f0dU,access_denied=0x80030005U;
+    unsupported_operation=0x88982f81U,insufficient_buffer=0x88982f8cU,already_locked=0x88982f0dU,access_denied=0x80030005U,
+    property_not_found=0x88982f40U,lock_access_denied=0x80070005U;
+// 中繼資料格式的簡稱（查詢語言的區塊名稱，依 WIC 原生格式查詢路徑文件）；比對不分大小寫。
+struct MetadataName {Guid id;std::u16string_view name;};
+constexpr MetadataName metadata_names[]{
+    {guid("79007028-268d-45d6-a3c2-354e6a504bc9"),u"app0"},{guid("8fd3dfc3-f951-492b-817f-69c2e6d9a5b0"),u"app1"},{guid("326556a2-f502-4354-9cc0-8e3f48eaf6b5"),u"app13"},
+    {guid("537396c6-2d8a-4bb6-9bf8-2f0a8e2a3adf"),u"ifd"},{guid("1c3c4f9d-b84a-467d-9493-36cfbd59ea57"),u"exif"},{guid("7134ab8a-9351-44ad-af62-448db6b502ec"),u"gps"},
+    {guid("ed686f8e-681f-4c8b-bd41-a8addbf6b3fc"),u"interop"},{guid("243dcee9-8703-40ee-8ef0-22a600b8058c"),u"thumb"},{guid("bb5acc38-f216-4cec-a6c5-5f6e739763a9"),u"xmp"},
+    {guid("22383cf1-ed17-4e2e-af17-d85b8f6b30d0"),u"xmpstruct"},{guid("833cca5f-dcb7-4516-806f-6596ab26dce4"),u"xmpbag"},{guid("63e8df02-eb6c-456c-a224-b25e794fd648"),u"xmpseq"},
+    {guid("7b08a675-91aa-481b-a798-4da94908613b"),u"xmpalt"},{guid("4fab0914-e129-4087-a1d1-bc812d45a7b5"),u"iptc"},{guid("16100d66-8570-4bb9-b92d-fda4b23ece67"),u"irb"},
+    {guid("0010568c-0852-4e6a-b191-5c33ac5b0430"),u"8bimiptc"},{guid("739f305d-81db-43cb-ac5e-55013ef9f003"),u"8bimResInfo"},{guid("1ca32285-9ccd-4786-8bd8-79539db6a006"),u"8bimiptcdigest"},
+    {guid("220e5f33-afd3-474e-9d31-7d4fe730f557"),u"com"},{guid("86908007-edfc-4860-8d4b-4ee6e83e6058"),u"luminance"},{guid("f73d0dcf-cec6-4f85-9b0e-1c3956b1bef7"),u"chrominance"},
+    {guid("c4b6e0e0-cfb4-4ad3-ab33-9aad2355a34a"),u"commentext"},{guid("e256031e-6299-4929-b98d-5ac884afba92"),u"logscrdesc"},{guid("2e043dc2-c967-4e05-875e-618bf67e85c3"),u"appext"},
+    {guid("2a25cad8-deeb-4c69-a788-0ec2266dcafd"),u"grctlext"},{guid("bd2bb086-4d52-48dd-9677-db483e85ae8f"),u"imgdesc"},{guid("568d8936-c0a9-4923-905d-df2b38238fbc"),u"tEXt"},
+    {guid("f00935a5-1d5d-4cd1-81b2-9324d7eca781"),u"gAMA"},{guid("c2bec729-0b68-4b77-aa0e-6295a6ac1814"),u"iTXt"},{guid("9db3655b-2842-44b3-8067-12e9b375556a"),u"cHRM"},
+    {guid("c115fd36-cc6f-4e3f-8363-524b87c6b0d9"),u"sRGB"},{guid("6b00ae2d-e24b-460a-98b6-878bd03072fd"),u"tIME"},{guid("e14d3571-6b47-4dea-b60a-87ce0a78dfb7"),u"bKGD"},
+    {guid("c59a82da-db74-48a4-bd6a-b69c4931ef95"),u"hIST"},{guid("eb4349ab-b685-450f-91b5-e802e892536c"),u"iCCP"},{guid("a45e592f-9078-4a7c-adb5-4edc4fd61b1f"),u"unknown"}};
+// XMP 常用 schema 的友善前綴（WICMapSchemaToName）；命名空間 URI 以 http 為準，也接受 https 寫法。
+struct SchemaName {std::u16string_view uri,prefix;};
+constexpr SchemaName xmp_schemas[]{
+    {u"http://www.w3.org/1999/02/22-rdf-syntax-ns#",u"rdf"},{u"http://purl.org/dc/elements/1.1/",u"dc"},{u"http://ns.adobe.com/xap/1.0/",u"xmp"},
+    {u"http://ns.adobe.com/xmp/Identifier/qual/1.0/",u"xmpidq"},{u"http://ns.adobe.com/xap/1.0/rights/",u"xmpRights"},{u"http://ns.adobe.com/xap/1.0/mm/",u"xmpMM"},
+    {u"http://ns.adobe.com/xap/1.0/bj/",u"xmpBJ"},{u"http://ns.adobe.com/xap/1.0/t/pg/",u"xmpTPg"},{u"http://ns.adobe.com/pdf/1.3/",u"pdf"},
+    {u"http://ns.adobe.com/photoshop/1.0/",u"photoshop"},{u"http://ns.adobe.com/tiff/1.0/",u"tiff"},{u"http://ns.adobe.com/exif/1.0/",u"exif"},
+    {u"http://ns.adobe.com/xap/1.0/sType/Dimensions#",u"stDim"},{u"http://ns.adobe.com/xap/1.0/g/img/",u"xapGImg"},{u"http://ns.adobe.com/xap/1.0/sType/ResourceEvent#",u"stEvt"},
+    {u"http://ns.adobe.com/xap/1.0/sType/ResourceRef#",u"stRef"},{u"http://ns.adobe.com/xap/1.0/sType/Version#",u"stVer"},{u"http://ns.adobe.com/xap/1.0/sType/Job#",u"stJob"},
+    {u"http://ns.adobe.com/exif/1.0/aux/",u"aux"},{u"http://ns.adobe.com/camera-raw-settings/1.0/",u"crs"},{u"http://ns.adobe.com/xmp/1.0/DynamicMedia/",u"xmpDM"},
+    {u"http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/",u"Iptc4xmpCore"},{u"http://ns.microsoft.com/photo/1.0/",u"MicrosoftPhoto"},{u"http://ns.microsoft.com/photo/1.2/",u"MP"},
+    {u"http://ns.microsoft.com/photo/1.2/t/RegionInfo#",u"MPRI"},{u"http://ns.microsoft.com/photo/1.2/t/Region#",u"MPReg"}};
+bool same_name(std::u16string_view a,std::u16string_view b){
+    return a.size()==b.size() && std::equal(a.begin(),a.end(),b.begin(),[](char16_t x,char16_t y){const auto f=[](char16_t c){return c>=u'A' && c<=u'Z'?static_cast<char16_t>(c+32):c;};return f(x)==f(y);});
+}
 constexpr Guid iid_unknown=guid("00000000-0000-0000-c000-000000000046"),iid_class_factory=guid("00000001-0000-0000-c000-000000000046"),
     iid_factory=guid("ec5ec8a9-c395-4314-9c77-54d7a935ff70"),iid_factory2=guid("7b816b45-1996-4476-b132-de9e247c8af0"),
     iid_decoder=guid("9edde9e7-8dee-47ea-99df-e6faf2ed44bf"),iid_source=guid("00000120-a8f2-4877-ba0a-fd2b6645fb94"),
@@ -185,8 +216,10 @@ struct WicState {
         std::uint64_t inner_stream{},region_offset{};
         // Decoder／Frame／Bitmap 等 BitmapSource 的影像；Converter／Scaler 保存來源物件與參數。
         Guid container{};std::shared_ptr<const Image> image;std::shared_ptr<Image> bitmap;std::uint64_t source{};Guid target{};std::uint32_t width{},height{},mode{};
-        // Lock：所屬 Bitmap、鎖定區域、guest 緩衝與是否可寫。
-        std::uint64_t owner{},data{};std::array<std::uint32_t,4> rect{};bool write{};
+        // Lock：所屬 Bitmap、鎖定區域、guest 緩衝與是否可寫。borrowed：緩衝直接指向 section 映射，不另配置也不寫回。
+        std::uint64_t owner{},data{};std::array<std::uint32_t,4> rect{};bool write{},borrowed{};std::uint32_t lock_stride{};
+        // section 點陣圖（WICCreateBitmapFromSection）：像素位於客體映射的 view；view_base 為 MapViewOfFile 的回傳值，釋放時解除映射。
+        std::uint64_t view{},view_base{};std::uint32_t view_stride{};bool read_only{};
         const PixelFormat* info{};
     };
     std::map<std::uint64_t,Object> objects;std::map<Kind,std::uint64_t> tables;
@@ -195,7 +228,9 @@ struct WicState {
 std::span<const WindowsServiceDescriptor> wic_service_descriptors(){
     static const auto table=[] {
         std::vector<WindowsServiceDescriptor> result{{"windowscodecs.dll","DllGetClassObject",3},{"windowscodecs.dll","DllCanUnloadNow",0},
-            {"windowscodecs.dll","WICConvertBitmapSource",3},{"windowscodecs.dll","WICCreateImagingFactory_Proxy",2}};
+            {"windowscodecs.dll","WICConvertBitmapSource",3},{"windowscodecs.dll","WICCreateImagingFactory_Proxy",2},
+            {"windowscodecs.dll","WICCreateBitmapFromSection",7},{"windowscodecs.dll","WICCreateBitmapFromSectionEx",8},
+            {"windowscodecs.dll","WICMapGuidToShortName",4},{"windowscodecs.dll","WICMapShortNameToGuid",2},{"windowscodecs.dll","WICMapSchemaToName",5}};
         for(const auto& m:common_methods)result.push_back({"internal-wic",m.name,m.args});
         for(unsigned k=0;k<=PixelInfo;++k)for(const auto& m:methods(static_cast<Kind>(k)))
             if(std::none_of(result.begin(),result.end(),[&](const auto& d){return d.family=="internal-wic" && d.symbol==m.name;}))result.push_back({"internal-wic",m.name,m.args,m.wide});
@@ -230,7 +265,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_wic(GuestState& state,Guest
     std::function<void(std::uint64_t)> release=[&](std::uint64_t p){
         const auto found=bridge.objects.find(p);if(found==bridge.objects.end() || --found->second.refs)return;
         auto object=std::move(found->second);bridge.objects.erase(found);(void)free_heap(memory,p,state);
-        if(object.kind==Lock && object.data){
+        if(object.kind==Bitmap && object.view_base)(void)nested_service(state,memory,"kernel32.dll","UnmapViewOfFile",{object.view_base});
+        if(object.kind==Lock && object.data && !object.borrowed){
             if(object.write)if(const auto owner=bridge.objects.find(object.owner);owner!=bridge.objects.end() && owner->second.bitmap){
                 auto& image=*owner->second.bitmap;const auto& f=*find_format(image.format);const auto row=(object.rect[2]*f.bits+7)/8,stride=image.stride();
                 for(std::uint32_t y=0;y<object.rect[3];++y)memory.read(GuestAddress{object.data+std::uint64_t(y)*row},std::span(image.bytes).subspan(std::size_t(object.rect[1]+y)*stride+(object.rect[0]*f.bits)/8,row));
@@ -248,6 +284,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_wic(GuestState& state,Guest
         switch(o.kind){
             case Frame:return o.image;
             case Bitmap:{
+                // section 點陣圖每次讀取都從映射重新取得像素（鎖定的緩衝就是映射本身）。
+                if(o.view){const auto stride=o.bitmap->stride();for(std::uint32_t y=0;y<o.bitmap->height;++y)memory.read(GuestAddress{o.view+std::uint64_t(y)*o.view_stride},std::span(o.bitmap->bytes).subspan(std::size_t(y)*stride,stride));return o.bitmap;}
                 // 可寫鎖定中的像素在 Lock 釋放前寫回；讀取時先同步目前的 guest 緩衝。
                 for(auto& entry:bridge.objects)if(auto& lock=entry.second;lock.kind==Lock && lock.owner==p && lock.write && lock.data){
                     const auto& f=*find_format(o.bitmap->format);const auto row=(lock.rect[2]*f.bits+7)/8,stride=o.bitmap->stride();
@@ -333,6 +371,50 @@ std::optional<std::uint32_t> WindowsServices::invoke_wic(GuestState& state,Guest
                 else put(arg(output),create(Factory,{}),bits);
             }
         }else if(name=="DllCanUnloadNow")result=s_false;
+        else if(name=="WICCreateBitmapFromSection" || name=="WICCreateBitmapFromSectionEx"){
+            // (width, height, pixelFormat, hSection, stride, offset[, desiredAccessLevel], ppIBitmap)：以 section 的映射作為像素；
+            // 位移不必對齊配置粒度（映射從向下對齊的位置開始）。存取等級 Read（1）只允許讀取鎖定，ReadWrite（3）可寫。
+            const bool ex=name.ends_with("Ex");const unsigned output=ex?7:6;put(arg(output),0,bits);
+            const auto width=static_cast<std::uint32_t>(arg(0)),height=static_cast<std::uint32_t>(arg(1)),stride=static_cast<std::uint32_t>(arg(4)),offset=static_cast<std::uint32_t>(arg(5));
+            const auto level=ex?static_cast<std::uint32_t>(arg(6)):3U;const auto* f=find_format(read_guid(arg(2)));
+            if(!f)result=unsupported_pixel_format;
+            else if(!width || !height || std::uint64_t(width)*height>(UINT64_C(1)<<28) || !arg(3) || (level!=1 && level!=3) || stride<(std::uint64_t(width)*f->bits+7)/8)result=invalid;
+            else{
+                const std::uint32_t row=static_cast<std::uint32_t>((std::uint64_t(width)*f->bits+7)/8),aligned=offset&~0xffffU,delta=offset-aligned;
+                const auto size=std::uint64_t(delta)+std::uint64_t(stride)*(height-1)+row;
+                const auto base=nested_service(state,memory,"kernel32.dll","MapViewOfFile",{arg(3),level==3?6U:4U,0,aligned,size});
+                if(!base)result=0x80070000U|(last_error_&0xffffU);
+                else{
+                    auto image=std::make_shared<Image>();image->width=width;image->height=height;image->format=f->id;image->bytes.assign(std::size_t(row)*height,0);
+                    WicState::Object object;object.bitmap=image;object.view_base=base;object.view=base+delta;object.view_stride=stride;object.read_only=level==1;
+                    put(arg(output),create(Bitmap,std::move(object)),bits);
+                }
+            }
+        }else if(name=="WICMapGuidToShortName" || name=="WICMapSchemaToName"){
+            // 字串輸出：cchName 為 0 時只回報需要的長度（含 NUL）；緩衝不足為 WINCODEC_ERR_INSUFFICIENTBUFFER。找不到為 WINCODEC_ERR_PROPERTYNOTFOUND。
+            const bool schema=name=="WICMapSchemaToName";const unsigned count_at=schema?2:1,text_at=schema?3:2,actual_at=schema?4:3;
+            const auto id=read_guid(arg(0));const auto cch=static_cast<std::uint32_t>(arg(count_at));
+            if(!arg(actual_at) || (cch && !arg(text_at)) || (schema && !arg(1)))result=invalid;
+            else{
+                std::u16string_view found;
+                if(!schema){for(const auto& item:metadata_names)if(item.id==id){found=item.name;break;}}
+                else{
+                    // 只有 XMP 系列格式（XMP、XMPStruct、XMPBag、XMPSeq、XMPAlt）有 schema 前綴。
+                    const bool xmp=std::any_of(std::begin(metadata_names),std::end(metadata_names),[&](const auto& m){return m.id==id && m.name.starts_with(u"xmp");});
+                    auto uri=read_utf16(memory,GuestAddress{arg(1)},1024);if(uri.starts_with(u"https://"))uri.erase(4,1);
+                    if(xmp)for(const auto& item:xmp_schemas)if(item.uri==uri){found=item.prefix;break;}
+                }
+                if(found.empty())result=property_not_found;
+                else{
+                    put(arg(actual_at),static_cast<std::uint32_t>(found.size()+1));
+                    if(cch){if(cch<found.size()+1)result=insufficient_buffer;else{check(arg(text_at),(found.size()+1)*2);memory.write(GuestAddress{arg(text_at)},utf16_bytes(std::u16string(found)));}}
+                }
+            }
+        }else if(name=="WICMapShortNameToGuid"){
+            if(!arg(0) || !arg(1))result=invalid;
+            else{const auto wanted=read_utf16(memory,GuestAddress{arg(0)},256);result=property_not_found;
+                for(const auto& item:metadata_names)if(same_name(item.name,wanted)){write_guid(arg(1),item.id);result=ok;break;}}
+        }
         else if(name=="WICConvertBitmapSource"){
             put(arg(2),0,bits);const auto* target=find_format(read_guid(arg(0)));
             if(!target)result=unsupported_pixel_format;
@@ -482,9 +564,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_wic(GuestState& state,Guest
                 else{if(service.arguments>1 && arg(service.arguments-1))put(arg(service.arguments-1),0,bits);result=unsupported_operation;}
             }else if(kind==Lock){
                 const auto& owner=bridge.objects.at(o.owner);const auto& f=*find_format(owner.bitmap->format);const auto row=(o.rect[2]*f.bits+7)/8;
+                const auto stride=o.borrowed?o.lock_stride:row;
                 if(name=="L_GetSize"){put(arg(1),o.rect[2]);put(arg(2),o.rect[3]);}
-                else if(name=="L_GetStride")put(arg(1),row);
-                else if(name=="L_GetDataPointer"){put(arg(1),row*o.rect[3]);put(arg(2),o.data,bits);}
+                else if(name=="L_GetStride")put(arg(1),stride);
+                else if(name=="L_GetDataPointer"){put(arg(1),stride*(o.rect[3]-1)+row);put(arg(2),o.data,bits);}
                 else if(name=="L_GetPixelFormat")write_guid(arg(1),owner.bitmap->format);
             }else if(kind==PixelInfo){
                 const auto& f=*o.info;
@@ -528,6 +611,12 @@ std::optional<std::uint32_t> WindowsServices::invoke_wic(GuestState& state,Guest
                     const auto& f=*find_format(image.format);
                     if(!(flags&3U) || (rect[0]*f.bits)%8)result=invalid;
                     else if(std::any_of(bridge.objects.begin(),bridge.objects.end(),[&](const auto& e){return e.second.kind==Lock && e.second.owner==arg(0) && (e.second.write || (flags&2U));}))result=already_locked;
+                    else if(o.view && o.read_only && (flags&2U))result=lock_access_denied;
+                    else if(o.view){
+                        // section 點陣圖：鎖定緩衝直接指向映射中的區域，寫入立即反映在 section。
+                        WicState::Object lock;lock.owner=arg(0);lock.rect=rect;lock.write=(flags&2U)!=0;lock.borrowed=true;lock.lock_stride=o.view_stride;
+                        lock.data=o.view+std::uint64_t(rect[1])*o.view_stride+(rect[0]*f.bits)/8;addref(arg(0));put(arg(3),create(Lock,std::move(lock)),bits);
+                    }
                     else{
                         // 鎖定區域複製到 guest 緩衝；可寫鎖在讀取來源或 Release 時寫回。
                         const auto row=(rect[2]*f.bits+7)/8,stride=image.stride();const auto data=allocate_heap(memory,std::size_t(row)*rect[3]);if(!data)throw std::bad_alloc{};

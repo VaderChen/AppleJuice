@@ -186,7 +186,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_winrt_error(GuestState& sta
         if(name=="Raise"){
             const auto& op=bridge.origins.at(arg(0));GuestState caller=state;arg.return_to(caller,0);
             const std::array<std::uint64_t,3> parameters{op.hresult,op.length,op.payload};
-            begin_exception(caller,memory,originate_exception,0,parameters);exceptions_.stack.back().winrt_origination=true;state=caller;return std::nullopt;
+            begin_exception(caller,memory,originate_exception,0,parameters);exceptions_.stack.back().api_exception_boundary=true;state=caller;return std::nullopt;
         }
         if(name=="RoOriginateError" || name=="RoOriginateErrorW"){
             const auto hr=static_cast<std::uint32_t>(arg(0));if(!(hr&0x80000000U))return done(0);

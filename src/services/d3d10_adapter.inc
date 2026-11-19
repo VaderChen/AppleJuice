@@ -69,7 +69,7 @@
                  symbol!="D3DX10UnsetAllDeviceObjects" && symbol!="D3DX10PreprocessShaderFromMemory"){
             // D3DX10/11 的圖片資訊及載入設定具有相同 ABI。
             adapted_symbol="D3DX11"+std::string(symbol.substr(6));symbol=adapted_symbol;
-            if(symbol.starts_with("D3DX11SaveTexture") || symbol=="D3DX11LoadTextureFromTexture"){
+            if(symbol.starts_with("D3DX11SaveTexture") || symbol=="D3DX11LoadTextureFromTexture" || symbol=="D3DX11FilterTexture"){
                 for(unsigned i=service.arguments;i>0;--i)adapt(i,original_arg(i-1));
                 adapt(0,object(object(original_arg(0)).identity->device).identity->context10);
             }

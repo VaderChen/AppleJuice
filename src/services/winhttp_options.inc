@@ -5,10 +5,10 @@ const unsigned timeout_index=option==2?0:option==3?1:option==5?2:3;
 const bool string=option==41 || (option>=0x1000 && option<=0x1003);
 const bool pointer=option==1 || option==21 || option==45;
 const bool readonly=option==1 || option==9 || option==21;
-if(!timeout && !string && !pointer && option!=9 && option!=38 && option!=63 && option!=84 && option!=88 && option!=89 && option!=118)throw HttpError{12009};
+if(!timeout && !string && !pointer && option!=9 && option!=31 && option!=38 && option!=63 && option!=84 && option!=88 && option!=89 && option!=118)throw HttpError{12009};
 if(object.inet)throw HttpError{12018};
 if(!readonly && option!=45 && object.kind!=HttpHandle::Kind::Session && object.kind!=HttpHandle::Kind::Request)throw HttpError{12018};
-if(option==63 || (option>=0x1000 && option<=0x1003))require(HttpHandle::Kind::Request);
+if(option==31 || option==63 || (option>=0x1000 && option<=0x1003))require(HttpHandle::Kind::Request);
 if(setting){
     if(readonly)throw HttpError{12011};
     if(object.pending && option!=45)throw HttpError{12019};
@@ -45,6 +45,7 @@ if(setting){
         const auto value=memory.load(GuestAddress{arg(2)},static_cast<std::uint8_t>(width*8));
         if(timeout){if(value>INT32_MAX && value!=UINT32_MAX)throw HttpError{87};object.input.timeouts[timeout_index]=static_cast<std::int32_t>(value);}
         else if(option==45)object.context=value;
+        else if(option==31){if(value&~0x70003301U)throw HttpError{87};object.input.certificate_exceptions=static_cast<std::uint32_t>(value)&0x3300U;}
         else if(option==88){if(value>2)throw HttpError{87};object.input.redirect_policy=static_cast<std::uint32_t>(value);}
         else if(option==89)object.input.max_redirects=static_cast<std::uint32_t>(value);
         else if(option==63){if(value&~15U)throw HttpError{87};object.input.disabled_features|=static_cast<std::uint32_t>(value);}
@@ -66,7 +67,7 @@ if(setting){
     else{
         const auto value=timeout?static_cast<std::uint32_t>(object.input.timeouts[timeout_index]):option==45?object.context:option==21?object.parent:option==1?object.callback:
             option==9?(object.kind==HttpHandle::Kind::Session?1U:object.kind==HttpHandle::Kind::Connection?2U:3U):
-            option==63?object.input.disabled_features:option==84?object.input.secure_protocols:option==88?object.input.redirect_policy:option==89?object.input.max_redirects:object.input.decompression;
+            option==31?object.input.certificate_exceptions|(object.secure?1U:0U):option==63?object.input.disabled_features:option==84?object.input.secure_protocols:option==88?object.input.redirect_policy:option==89?object.input.max_redirects:object.input.decompression;
         bytes.resize(pointer?unit:4U);for(unsigned i=0;i<bytes.size();++i)bytes[i]=static_cast<std::uint8_t>(value>>(i*8));
     }
     if(!arg(2) || capacity<bytes.size()){memory.store(GuestAddress{arg(3)},32,bytes.size());throw HttpError{122};}

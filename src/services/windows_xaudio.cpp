@@ -2,6 +2,7 @@
 #include "x64arm/audio_graph.hpp"
 #include "x64arm/audio_channels.hpp"
 #include "x64arm/audio_adpcm.hpp"
+#include "x64arm/audio_frame_effects.hpp"
 #include "x64arm/unicode.hpp"
 #include "xaudio_interfaces.hpp"
 #include "audio_endpoints.hpp"
@@ -57,14 +58,54 @@ constexpr FxClass fx_classes[]={
     {{0x01,0xc0,0x0b,0xa9,0x97,0xe8,0x97,0xe8,0x74,0x39,0x43,0x55,0,0,0,3},{0x40,0xd7,0x39,0x50,0x36,0xf7,0x9a,0x44,0x84,0xd3,0xa5,0x62,0x02,0x55,0x7b,0x87},audio::Effect::Type::FxEcho,u"FXEcho",64,1000,200000}};
 constexpr xaudio::Guid xapo27{0x01,0xc0,0x0b,0xa9,0x97,0xe8,0x97,0xe8,0x55,0xe4,0x9e,0x47,0,0,0,0},xapo_parameters27{0x01,0xc0,0x0b,0xa9,0x97,0xe8,0x97,0xe8,0x55,0xe4,0x9e,0x47,0,0,0,1};
 constexpr xaudio::Guid xapo28{0x84,0xb9,0x10,0xa4,0x39,0x98,0x19,0x48,0xa0,0xbe,0x28,0x56,0xae,0x6b,0x3a,0xdb},xapo_parameters28{0x66,0x5c,0xd9,0x26,0xf2,0x80,0x9a,0x49,0xad,0x54,0x5a,0xe7,0xf0,0x1c,0x6d,0x98};
+// XAudio2 內建效果（xaudio2fx.h）。2.7 經 CLSID 建立，2.8／2.9 由 CreateAudioReverb／CreateAudioVolumeMeter 建立。
+enum class Builtin:unsigned {None,Reverb,Meter};
+// XAUDIO2FX_REVERB_PARAMETERS（pack 1）：DirectX SDK 與 Windows 8 為 52 位元組；Windows 10（2.9）多 SideDelay 與 DisableLateField，共 57 位元組。
+constexpr unsigned reverb_bytes=52,reverb_bytes_win10=57;
+audio::ReverbParameters parse_reverb(std::span<const std::uint8_t> b){
+    const bool w10=b.size()==reverb_bytes_win10;audio::ReverbParameters p;unsigned o=0;
+    const auto f32=[&]{float v;std::memcpy(&v,b.data()+o,4);o+=4;return v;};
+    const auto u32=[&]{std::uint32_t v;std::memcpy(&v,b.data()+o,4);o+=4;return v;};
+    const auto u8=[&]{return b[o++];};
+    p.wet_dry_mix=f32();p.reflections_delay=u32();p.reverb_delay=u8();p.rear_delay=u8();if(w10)p.side_delay=u8();
+    p.position_left=u8();p.position_right=u8();p.position_matrix_left=u8();p.position_matrix_right=u8();
+    p.early_diffusion=u8();p.late_diffusion=u8();p.low_eq_gain=u8();p.low_eq_cutoff=u8();p.high_eq_gain=u8();p.high_eq_cutoff=u8();
+    p.room_filter_freq=f32();p.room_filter_main=f32();p.room_filter_hf=f32();p.reflections_gain=f32();p.reverb_gain=f32();
+    p.decay_time=f32();p.density=f32();p.room_size=f32();if(w10)p.disable_late_field=u32()!=0;
+    return p;
+}
+std::vector<std::uint8_t> serialize_reverb(const audio::ReverbParameters& p,unsigned size){
+    const bool w10=size==reverb_bytes_win10;std::vector<std::uint8_t> b;b.reserve(size);
+    const auto f32=[&](float v){std::uint8_t t[4];std::memcpy(t,&v,4);b.insert(b.end(),t,t+4);};
+    const auto u32=[&](std::uint32_t v){std::uint8_t t[4];std::memcpy(t,&v,4);b.insert(b.end(),t,t+4);};
+    f32(p.wet_dry_mix);u32(p.reflections_delay);b.push_back(p.reverb_delay);b.push_back(p.rear_delay);if(w10)b.push_back(p.side_delay);
+    for(auto v:{p.position_left,p.position_right,p.position_matrix_left,p.position_matrix_right,p.early_diffusion,p.late_diffusion,p.low_eq_gain,p.low_eq_cutoff,p.high_eq_gain,p.high_eq_cutoff})b.push_back(v);
+    for(auto v:{p.room_filter_freq,p.room_filter_main,p.room_filter_hf,p.reflections_gain,p.reverb_gain,p.decay_time,p.density,p.room_size})f32(v);
+    if(w10)u32(p.disable_late_field?1:0);
+    return b;
+}
 // 宿主 DSP 與目前鎖定的格式。直接呼叫 IXAPO::Process 與掛進語音效果鏈用的是同一組 audio::Effect。
 struct Fx {
     const FxClass* info{};xaudio::Guid clsid{};
+    Builtin builtin{};unsigned version{7};std::shared_ptr<audio::FrameEffect> dsp{}; // 內建效果：整幀 DSP，可改變聲道數
     std::vector<std::shared_ptr<audio::Effect>> pairs; // 每兩聲道一個；[0] 永遠存在並保存目前參數
     unsigned rate{48000},channels{2},maximum_frames{};bool locked{};
     std::uint64_t voice{}; // 非零：由這個語音的效果鏈鎖定，應用程式不能自行解鎖
     float maximum_delay{2000};
     Fx(const FxClass& value,const xaudio::Guid& id):info(&value),clsid(id){pairs.push_back(std::make_shared<audio::Effect>(value.type,rate));}
+    Fx(Builtin kind,unsigned engine_version):builtin(kind),version(engine_version){
+        const bool reverb=kind==Builtin::Reverb;clsid=engine_version==7?(reverb?xaudio::reverb27:xaudio::meter27):(reverb?xaudio::reverb28:xaudio::meter28);
+        if(reverb)dsp=std::make_shared<audio::Reverb>(engine_version>=9);else dsp=std::make_shared<audio::VolumeMeter>();
+        (void)dsp->configure(48000,reverb?2:1,reverb?2:1);channels=dsp->output_channels();
+    }
+    audio::Reverb& reverb()const {return static_cast<audio::Reverb&>(*dsp);}
+    audio::VolumeMeter& meter()const {return static_cast<audio::VolumeMeter&>(*dsp);}
+    // 內建效果的聲道與取樣率限制：reverb 依 XAudio2CreateReverb 的組合與 20～48 kHz；volume meter 輸入輸出相同。
+    bool builtin_supports(unsigned in,unsigned out,unsigned new_rate)const {
+        if(builtin==Builtin::Reverb)return audio::Reverb::supports(in,out,version>=9) && new_rate>=20000 && new_rate<=48000;
+        return in && in==out && in<=64 && new_rate>=1000 && new_rate<=200000;
+    }
+    bool parameter_size(unsigned size)const {return builtin==Builtin::Reverb && (size==reverb_bytes || (version>=9 && size==reverb_bytes_win10));}
     std::span<const std::uint32_t> words()const {return pairs.front()->parameters();}
     void set(std::span<const std::uint32_t> values){
         std::vector<std::uint32_t> copy(values.begin(),values.end());
@@ -79,8 +120,8 @@ struct Fx {
         pairs=std::move(next);rate=new_rate;channels=new_channels;
     }
     void process(std::span<float> pcm){
-        for(std::size_t frame=0;frame+channels<=pcm.size();frame+=channels)for(unsigned pair=0;pair<pairs.size();++pair){
-            const auto left=pair*2,other=left+1<channels?left+1:left;float right=pcm[frame+other];pairs[pair]->process(pcm[frame+left],right);if(other!=left)pcm[frame+other]=right;}
+        for(std::size_t sample=0;sample+channels<=pcm.size();sample+=channels)for(unsigned pair=0;pair<pairs.size();++pair){
+            const auto left=pair*2,other=left+1<channels?left+1:left;float right=pcm[sample+other];pairs[pair]->process(pcm[sample+left],right);if(other!=left)pcm[sample+other]=right;}
     }
 };
 struct Engine {
@@ -104,6 +145,7 @@ struct Engine {
 struct Object {enum Kind {Factory,EngineObject,Voice,Effect} kind{};std::shared_ptr<Engine> engine;Graph::Voice voice{};std::uint64_t callback{};std::uint32_t references{1};std::optional<audio::AdpcmFormat> adpcm{};
     std::shared_ptr<Fx> fx{};            // kind==Effect
     std::vector<std::uint64_t> chain{};  // kind==Voice：效果鏈上的效果物件，各持有一個參考
+    unsigned effect_class{};             // kind==Factory：0 建立引擎；1 reverb、2 volume meter（XAudio 2.7 內建效果）
 };
 void require(bool valid){if(!valid)throw std::invalid_argument("XAudio2 呼叫參數無效");}
 std::uint64_t now(){return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
@@ -131,6 +173,7 @@ std::span<const WindowsServiceDescriptor> xaudio_service_descriptors(){
         // CreateFX 是 cdecl（STDAPIVCALLTYPE）。XAPOFX1_x 兩個參數；XAudio 2.8／2.9 多了初始化資料與長度。
         for(auto module:{"xapofx1_0.dll","xapofx1_1.dll","xapofx1_2.dll","xapofx1_3.dll","xapofx1_4.dll","xapofx1_5.dll","xapofxd1_5.dll"})result.push_back({module,"CreateFX",2,0,0,0,true});
         for(auto module:{"xaudio2_8.dll","xaudio2_9.dll"})result.push_back({module,"CreateFX",4,0,0,8,true});
+        for(auto module:{"xaudio2_8.dll","xaudio2_9.dll"})for(auto symbol:{"CreateAudioReverb","CreateAudioVolumeMeter"})result.push_back({module,symbol,1});
         for(const auto& m:fx_methods)result.push_back({"internal-xapofx",m.name,m.args,0,0,m.narrow});
         for(std::size_t i=3;i<std::size(fx_parameter_methods);++i)result.push_back({"internal-xapofx",fx_parameter_methods[i].name,fx_parameter_methods[i].args,0,0,fx_parameter_methods[i].narrow});
         return result;
@@ -181,8 +224,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
         memory.write(GuestAddress{p+XA_VOLUMES},{reinterpret_cast<const std::uint8_t*>(info.channel_volumes.data()),info.channel_volumes.size()*4});
         put(p+XA_CONTEXT,info.context,64);put(p+XA_QUEUED,info.queued);put(p+XA_SAMPLES,info.samples,64);
     };
-    const auto create=[&](Object o){
-        const auto version=o.engine?o.engine->version:7;const auto kind=o.kind==Object::Factory?0U:o.kind==Object::EngineObject?1U:2U+static_cast<unsigned>(o.engine->graph->state(o.voice).kind);const auto key=version*8+kind;
+    // host_volumes：效果鏈改變聲道數的語音，GetChannelVolumes 改走宿主（常駐常式比對的是輸入聲道數）。
+    const auto table_for=[&](unsigned version,unsigned kind,bool host_volumes){
+        const auto key=version*8+kind+(host_volumes?4096U:0U);
         if(!bridge.tables.contains(key)){
             std::vector<Method> methods;
             if(kind<2)methods.insert(methods.end(),std::begin(identity),std::end(identity));
@@ -192,11 +236,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
             const auto table=runtime_allocate(memory,{},methods.size()*unit);
             const auto image=runtime_.builtin_images.find(callback_return_.value+xaudio_lowering::image_offset);
             for(unsigned i=0;i<methods.size();++i){auto target=resolve("internal-xaudio",methods[i].name).value;
-                if(image!=runtime_.builtin_images.end())if(const auto routine=image->second.export_names.find(std::string(methods[i].name));routine!=image->second.export_names.end())target=image->first+routine->second;
+                if(image!=runtime_.builtin_images.end() && !(host_volumes && methods[i].name=="GetChannelVolumes"))if(const auto routine=image->second.export_names.find(std::string(methods[i].name));routine!=image->second.export_names.end())target=image->first+routine->second;
                 put(table+i*unit,target,bits);
             }bridge.tables.emplace(key,table);
         }
-        const auto pointer=allocate_heap(memory,XA_OBJECT_BYTES);if(!pointer)throw std::bad_alloc{};memory.write(GuestAddress{pointer},std::array<std::uint8_t,XA_OBJECT_BYTES>{});put(pointer,bridge.tables.at(key),bits);publish(pointer,o);bridge.objects.emplace(pointer,std::move(o));return pointer;
+        return bridge.tables.at(key);
+    };
+    const auto object_kind=[&](const Object& o){return o.kind==Object::Factory?0U:o.kind==Object::EngineObject?1U:2U+static_cast<unsigned>(o.engine->graph->state(o.voice).kind);};
+    const auto create=[&](Object o){
+        const auto version=o.engine?o.engine->version:7;const auto table=table_for(version,object_kind(o),false);
+        const auto pointer=allocate_heap(memory,XA_OBJECT_BYTES);if(!pointer)throw std::bad_alloc{};memory.write(GuestAddress{pointer},std::array<std::uint8_t,XA_OBJECT_BYTES>{});put(pointer,table,bits);publish(pointer,o);bridge.objects.emplace(pointer,std::move(o));return pointer;
     };
     const auto new_engine=[&](unsigned version,bool initialized){auto e=std::make_shared<Engine>();e->version=version;e->initialized=initialized;e->devices=audio_endpoint::render();e->last_wall=now();const auto p=create({Object::EngineObject,e});e->handle=p;return p;};
     const auto iid=[&](std::uint64_t p){xaudio::Guid g{};memory.read(GuestAddress{p},g);return g;};
@@ -211,46 +260,90 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
         return 0;
     };
     const auto release_fx=[&](std::uint64_t base){auto& item=object(base);const auto left=--item.references;if(!left){bridge.objects.erase(base);(void)free_heap(memory,base,state);}return left;};
-    using Chain=std::vector<std::pair<std::uint64_t,bool>>;
-    // XAUDIO2_EFFECT_CHAIN（pack 1）。內建 XAPOFX 效果直接以宿主 DSP 掛進語音圖；應用程式自寫的客體 XAPO 仍是明確缺口。
+    struct ChainItem {std::uint64_t base{};bool enabled{};unsigned output{};};
+    using Chain=std::vector<ChainItem>;
+    // XAUDIO2_EFFECT_CHAIN（pack 1）。內建 XAPOFX 與 XAudio2 內建效果直接以宿主 DSP 掛進語音圖；應用程式自寫的客體 XAPO 仍是明確缺口。
     const auto read_chain=[&](std::uint64_t p,unsigned channels,unsigned rate,std::uint64_t voice){Chain result;if(!p)return result;
         const auto count=get(p),items=get(p,4,bits);require(count<=64 && (!count || items));
+        unsigned current=channels;
         for(unsigned i=0;i<count;++i){const auto at=items+i*(unit+8);const auto base=fx_base(get(at,0,bits));
-            if(!base)throw HostCallFault("尚未實作 XAudio2 的客體 XAPO 效果鏈（僅支援內建 XAPOFX 效果）");
-            const auto& fx=*object(base).fx;
-            // XAPOFX 效果不改變聲道數；已被應用程式或其他語音鎖定的效果不能再掛入。
-            require(get(at,unit+4)==channels && fx.supports(channels,rate) && (!fx.locked || (voice && fx.voice==voice)));
-            require(std::none_of(result.begin(),result.end(),[&](const auto& v){return v.first==base;}));result.emplace_back(base,get(at,unit)!=0);
+            if(!base)throw HostCallFault("尚未實作 XAudio2 的客體 XAPO 效果鏈（僅支援內建 XAPOFX 與 XAudio2 內建效果）");
+            const auto& fx=*object(base).fx;const auto output=static_cast<unsigned>(get(at,unit+4));
+            // 每個效果的輸入是前一個效果的輸出（XAUDIO2_EFFECT_DESCRIPTOR.OutputChannels）。XAPOFX 不改變聲道數；
+            // 已被應用程式或其他語音鎖定的效果不能再掛入。
+            if(fx.builtin==Builtin::None)require(output==current && fx.supports(current,rate));else require(fx.builtin_supports(current,output,rate));
+            require(!fx.locked || (voice && fx.voice==voice));
+            require(std::none_of(result.begin(),result.end(),[&](const auto& v){return v.base==base;}));result.push_back({base,get(at,unit)!=0,output});current=output;
         }return result;
     };
+    // 語音輸出聲道數與輸入不同時，GetChannelVolumes 改用宿主入口的虛擬表。
+    const auto retable=[&](std::uint64_t pointer){
+        const auto& o=object(pointer);const auto info=o.engine->graph->state(o.voice);
+        put(pointer,table_for(o.engine->version,object_kind(o),info.output_channels!=info.format.channels),bits);
+    };
     const auto set_chain=[&](std::uint64_t pointer,const Chain& chain,unsigned rate,unsigned channels){
-        auto& voice=object(pointer);std::vector<Graph::EffectSlot> slots;
-        for(const auto& [base,enabled]:chain){auto& fx=*object(base).fx;fx.configure(rate,channels);slots.push_back({fx.pairs,enabled});}
+        auto& voice=object(pointer);std::vector<Graph::EffectSlot> slots;unsigned current=channels;
+        for(const auto& item:chain){auto& fx=*object(item.base).fx;
+            if(fx.builtin==Builtin::None){fx.configure(rate,current);slots.push_back({fx.pairs,item.enabled,{}});}
+            else {require(fx.dsp->configure(rate,current,item.output));fx.rate=rate;fx.channels=item.output;slots.push_back({{},item.enabled,fx.dsp});}
+            current=item.output;
+        }
         voice.engine->graph->set_effect_chain(voice.voice,std::move(slots));
         const auto old=std::move(voice.chain);voice.chain.clear();
         for(const auto base:old){auto& fx=*object(base).fx;fx.locked=false;fx.voice=0;}
-        for(const auto& [base,enabled]:chain){auto& item=object(base);item.fx->locked=true;item.fx->voice=pointer;item.fx->maximum_frames=0;++item.references;voice.chain.push_back(base);}
+        for(const auto& item:chain){auto& entry=object(item.base);entry.fx->locked=true;entry.fx->voice=pointer;entry.fx->maximum_frames=0;++entry.references;voice.chain.push_back(item.base);}
         for(const auto base:old)(void)release_fx(base);
+        retable(pointer);
     };
     const auto drop_chain=[&](Object& voice){const auto old=std::move(voice.chain);voice.chain.clear();for(const auto base:old){auto& fx=*object(base).fx;fx.locked=false;fx.voice=0;(void)release_fx(base);}};
     const auto fx_format=[&](const Fx& fx,std::uint64_t p)->std::optional<PcmWaveFormat>{
-        if(!p)return std::nullopt;auto format=read_pcm_wave_format(memory,p,true,true,fx.info->minimum_rate,fx.info->maximum_rate,{fx.info->maximum_channels,32,true,true});
+        if(!p)return std::nullopt;
+        const unsigned low=fx.builtin==Builtin::None?fx.info->minimum_rate:fx.builtin==Builtin::Reverb?20000U:1000U,high=fx.builtin==Builtin::None?fx.info->maximum_rate:fx.builtin==Builtin::Reverb?48000U:200000U;
+        const unsigned most=fx.builtin==Builtin::None?fx.info->maximum_channels:fx.builtin==Builtin::Reverb?8U:64U;
+        auto format=read_pcm_wave_format(memory,p,true,true,low,high,{most,32,true,true});
         if(format && !format->floating)format.reset();return format;
     };
     const auto task_allocate=[&](std::size_t size){const auto p=allocate_heap(memory,size);if(!p)throw std::bad_alloc{};gui_.task_allocations.insert(p);memory.write(GuestAddress{p},std::vector<std::uint8_t>(size));return p;};
     const auto words_from=[&](std::uint64_t p,std::size_t count){std::vector<std::uint32_t> values(count);memory.read(GuestAddress{p},{reinterpret_cast<std::uint8_t*>(values.data()),count*4});return values;};
     const auto words_to=[&](std::uint64_t p,std::span<const std::uint32_t> values){check(p,values.size()*4);memory.write(GuestAddress{p},{reinterpret_cast<const std::uint8_t*>(values.data()),values.size()*4});};
+    // 效果物件：IXAPO 與 IXAPOParameters 兩個介面指標，XAPOFX 與 XAudio2 內建效果共用方法表。
+    const auto install_fx=[&](std::shared_ptr<Fx> fx){
+        for(unsigned key=0;key<2;++key)if(!bridge.tables.contains(1000+key)){
+            const auto methods=key?std::span<const Method>(fx_parameter_methods):std::span<const Method>(fx_methods);const auto table=runtime_allocate(memory,{},methods.size()*unit);
+            for(unsigned i=0;i<methods.size();++i)put(table+i*unit,resolve("internal-xapofx",methods[i].name).value,bits);bridge.tables.emplace(1000+key,table);
+        }
+        const auto pointer=allocate_heap(memory,2*unit);if(!pointer)throw std::bad_alloc{};put(pointer,bridge.tables.at(1000),bits);put(pointer+unit,bridge.tables.at(1001),bits);
+        Object item;item.kind=Object::Effect;item.fx=std::move(fx);bridge.objects.emplace(pointer,std::move(item));return pointer;
+    };
+    // 2.7 的 CoCreateInstance／類別工廠：IUnknown、IXAPO 或 IXAPOParameters（2.7 IID）。
+    const auto create_builtin=[&](unsigned effect,std::uint64_t riid,std::uint64_t out){
+        const auto query=iid(riid);
+        if(query!=xaudio::unknown && query!=xapo27 && query!=xapo_parameters27)return no_interface;
+        const auto base=install_fx(std::make_shared<Fx>(effect==1?Builtin::Reverb:Builtin::Meter,7));put(out,query==xapo_parameters27?base+unit:base,bits);return 0U;
+    };
+    // XAUDIO2FX_VOLUMEMETER_LEVELS（pack 1）：兩個由應用程式配置的陣列指標與 ChannelCount；只填入非空的陣列。
+    const unsigned levels_bytes=2*unit+4;
+    const auto write_levels=[&](const Fx& fx,std::uint64_t p){
+        const auto peak=get(p,0,bits),rms=get(p,unit,bits);const auto count=static_cast<unsigned>(get(p,2*unit));
+        if(count!=fx.dsp->output_channels() || (!peak && !rms))return false;
+        const auto levels=fx.meter().levels();
+        if(peak){check(peak,count*4);memory.write(GuestAddress{peak},{reinterpret_cast<const std::uint8_t*>(levels.peak.data()),count*4U});}
+        if(rms){check(rms,count*4);memory.write(GuestAddress{rms},{reinterpret_cast<const std::uint8_t*>(levels.rms.data()),count*4U});}
+        return true;
+    };
     std::uint64_t result=0;
     try {
         if(name=="DllCanUnloadNow")result=bridge.objects.empty() && !bridge.locks?0:1;
         else if(name=="DllGetClassObject" || name=="CoGetClassObject"){
             const bool com=name=="CoGetClassObject";const auto out=arg(com?4:2);check(out,unit);put(out,0,bits);
             if(!xaudio::is_class(memory,arg(0)) || (com && !(d(1)&1)))result=0x80040111U;
-            else if(iid(arg(com?3:1))!=xaudio::factory && iid(arg(com?3:1))!=xaudio::unknown)result=no_interface;else put(out,create({Object::Factory,{}}),bits);
+            else if(iid(arg(com?3:1))!=xaudio::factory && iid(arg(com?3:1))!=xaudio::unknown)result=no_interface;
+            else {Object factory{Object::Factory,{}};factory.effect_class=xaudio::effect_class(memory,arg(0));put(out,create(std::move(factory)),bits);}
         }else if(name=="CoCreateInstance" || name=="XAudio2Create" || name=="XAudio2CreateWithVersionInfo"){
             const bool com=name=="CoCreateInstance";const auto out=arg(com?4:0);check(out,unit);put(out,0,bits);
             if(com && arg(1))result=0x80040110U;else if(com && !(d(2)&1))result=0x80040154U;
             else if(com && !com_apartment(threads_.current))result=0x800401f0U;
+            else if(com && xaudio::effect_class(memory,arg(0)))result=create_builtin(xaudio::effect_class(memory,arg(0)),arg(3),out);
             else if(com && iid(arg(3))!=xaudio::iid27 && iid(arg(3))!=xaudio::unknown)result=no_interface;
             // XAudio2Create 的旗標：DEBUG_ENGINE、STOP_ENGINE_WHEN_IDLE、1024_QUANTUM、NO_VIRTUAL_AUDIO_CLIENT。處理器 0 是 Windows 10 標頭的 XAUDIO2_USE_DEFAULT_PROCESSOR，內建混音由宿主排程，不受此值影響。
             else {if(!com)require(!(d(1)&~UINT32_C(0x1a001)));put(out,new_engine(com?7:service.family=="xaudio2_8.dll"?8:9,!com),bits);}
@@ -266,15 +359,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                     if(found->type==audio::Effect::Type::FxEcho && d(3)==4){const auto delay=std::bit_cast<float>(static_cast<std::uint32_t>(get(arg(2))));require(std::isfinite(delay) && delay>=1 && delay<=2000);fx->maximum_delay=delay;fx->set(std::vector<std::uint32_t>(fx->words().begin(),fx->words().end()));}
                     else {require(d(3)==bytes);fx->set(words_from(arg(2),fx->words().size()));}
                 }
-                for(unsigned key=0;key<2;++key)if(!bridge.tables.contains(1000+key)){
-                    const auto methods=key?std::span<const Method>(fx_parameter_methods):std::span<const Method>(fx_methods);const auto table=runtime_allocate(memory,{},methods.size()*unit);
-                    for(unsigned i=0;i<methods.size();++i)put(table+i*unit,resolve("internal-xapofx",methods[i].name).value,bits);bridge.tables.emplace(1000+key,table);
-                }
-                const auto pointer=allocate_heap(memory,2*unit);if(!pointer)throw std::bad_alloc{};put(pointer,bridge.tables.at(1000),bits);put(pointer+unit,bridge.tables.at(1001),bits);
-                Object item;item.kind=Object::Effect;item.fx=std::move(fx);bridge.objects.emplace(pointer,std::move(item));put(out,pointer,bits);
+                put(out,install_fx(std::move(fx)),bits);
             }
+        }else if(name=="CreateAudioReverb" || name=="CreateAudioVolumeMeter"){
+            // XAudio 2.8／2.9（STDAPI）：XAudio2CreateReverb／XAudio2CreateVolumeMeter 的內嵌函式直接呼叫這兩個匯出。
+            const auto out=arg(0);check(out,unit);put(out,0,bits);
+            put(out,install_fx(std::make_shared<Fx>(name=="CreateAudioReverb"?Builtin::Reverb:Builtin::Meter,service.family=="xaudio2_8.dll"?8U:9U)),bits);
         }else if(service.family=="internal-xapofx"){
-            const auto base=fx_base(arg(0));require(base!=0);auto& o=object(base);auto& fx=*o.fx;const auto count=fx.words().size();
+            const auto base=fx_base(arg(0));require(base!=0);auto& o=object(base);auto& fx=*o.fx;const auto count=fx.builtin==Builtin::None?fx.words().size():0;
             if(name=="QueryInterface"){
                 check(arg(2),unit);put(arg(2),0,bits);const auto query=iid(arg(1));
                 if(query==xaudio::unknown || query==xapo27 || query==xapo28){++o.references;put(arg(2),base,bits);}
@@ -282,6 +374,77 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                 else result=no_interface;
             }else if(name=="AddRef")result=++o.references;
             else if(name=="Release")result=release_fx(base);
+            else if(fx.builtin!=Builtin::None){
+                // XAudio2 內建 reverb／volume meter 的 IXAPO 與 IXAPOParameters。
+                const bool reverb=fx.builtin==Builtin::Reverb;
+                if(name=="GetRegistrationProperties"){
+                    check(arg(1),unit);const auto p=task_allocate(1068);memory.write(GuestAddress{p},fx.clsid);memory.write(GuestAddress{p+16},utf16_bytes(reverb?u"AudioReverb":u"AudioVolumeMeter"));
+                    // reverb 會改變聲道數：只要求取樣率、位元數與緩衝數相同，不支援原地處理；volume meter 與 XAPOFX 相同。
+                    put(p+1040,1);put(p+1048,reverb?0x0eU:0x1fU);for(unsigned i=0;i<4;++i)put(p+1052+i*4,1);put(arg(1),p,bits);
+                }else if(name=="IsInputFormatSupported" || name=="IsOutputFormatSupported"){
+                    const bool input=name=="IsInputFormatSupported";const auto other=fx_format(fx,arg(1)),requested=fx_format(fx,arg(2));
+                    bool supported=requested && (!arg(1) || (other && other->rate==requested->rate));
+                    if(supported){
+                        const unsigned in=input?requested->channels:(other?other->channels:0U),out=input?(other?other->channels:0U):requested->channels;
+                        if(reverb)supported=in<=2 && (!out || out<=2 || out==6 || (fx.version>=9 && out==8)) && (!in || !out || audio::Reverb::supports(in,out,fx.version>=9));
+                        else supported=!in || !out || in==out;
+                    }
+                    if(!supported){
+                        result=format_unsupported;
+                        if(arg(3)){
+                            // 回報最接近的格式：取樣率依另一端或夾入支援範圍；聲道依支援的組合。
+                            check(arg(3),unit);require(arg(2)!=0);
+                            const unsigned low=reverb?20000U:1000U,high=reverb?48000U:200000U;
+                            const unsigned rate=other?other->rate:std::clamp<unsigned>(static_cast<unsigned>(get(arg(2),4)),low,high);
+                            const unsigned asked=std::max(1U,static_cast<unsigned>(get(arg(2),2,16)));unsigned channels=asked;
+                            if(!reverb)channels=other?other->channels:std::min(asked,64U);
+                            else if(input)channels=other && other->channels<=2?other->channels:std::min(asked,2U);
+                            else channels=other?other->channels:(asked>2?6U:asked);
+                            const auto p=task_allocate(18);put(p,3,16);put(p+2,channels,16);put(p+4,rate);put(p+8,rate*channels*4);put(p+12,channels*4,16);put(p+14,32,16);put(arg(3),p,bits);
+                        }
+                    }
+                }else if(name=="Initialize"){
+                    // 初始化資料等同初始參數；volume meter 沒有初始化資料。
+                    if(arg(1) && d(2)){require(fx.parameter_size(d(2)));std::vector<std::uint8_t> bytes(d(2));memory.read(GuestAddress{arg(1)},bytes);fx.reverb().set(parse_reverb(bytes));}
+                }else if(name=="Reset")fx.dsp->reset();
+                else if(name=="LockForProcess"){
+                    if(fx.locked || d(1)!=1 || d(3)!=1 || !arg(2) || !arg(4))result=invalid_argument_error;
+                    else {
+                        const auto input=fx_format(fx,get(arg(2),0,bits)),output=fx_format(fx,get(arg(4),0,bits));
+                        if(!input || !output || input->rate!=output->rate || !fx.builtin_supports(input->channels,output->channels,input->rate) || !fx.dsp->configure(input->rate,input->channels,output->channels))result=format_unsupported;
+                        else {
+                            fx.rate=input->rate;fx.channels=output->channels;fx.maximum_frames=static_cast<unsigned>(std::min(get(arg(2),unit),get(arg(4),unit)));fx.locked=true;
+                            if(!reverb)fx.meter().set_pass(UINT32_MAX); // 直接呼叫 Process：整次呼叫為一個處理段
+                        }
+                    }
+                }else if(name=="UnlockForProcess"){if(!fx.voice)fx.locked=false;}
+                else if(name=="Process"){
+                    // 只在鎖定後處理；輸入與輸出聲道數可不同，先讀完整段輸入再寫出，同一塊緩衝區也安全。
+                    if(fx.locked && !fx.voice && d(1)==1 && d(3)==1 && arg(2) && arg(4)){
+                        const auto source=get(arg(2),0,bits),flags=get(arg(2),unit),frames=get(arg(2),unit+4),target=get(arg(4),0,bits);
+                        const unsigned in=fx.dsp->input_channels(),out=fx.dsp->output_channels();
+                        require(flags<=1 && frames<=fx.maximum_frames && frames<=(UINT64_C(1)<<24)/std::max(in,out));
+                        const bool silent=!flags;std::vector<float> input(static_cast<std::size_t>(frames)*in),output(static_cast<std::size_t>(frames)*out);
+                        if(frames && !silent){require(source!=0);memory.read(GuestAddress{source},{reinterpret_cast<std::uint8_t*>(input.data()),input.size()*4});}
+                        std::array<float,64> frame{};
+                        for(std::size_t i=0;i<frames;++i){
+                            frame.fill(0);std::copy_n(input.begin()+static_cast<std::ptrdiff_t>(i*in),in,frame.begin());
+                            fx.dsp->process(frame.data(),d(5)!=0);std::copy_n(frame.begin(),out,output.begin()+static_cast<std::ptrdiff_t>(i*out));
+                        }
+                        if(!reverb)fx.meter().finish_pass();
+                        // reverb 有尾音，輸出一律有效；volume meter 原樣通過，靜音輸入不寫入緩衝區。
+                        std::uint64_t output_flags=flags;
+                        if(frames && (reverb || !silent)){require(target!=0);memory.write(GuestAddress{target},{reinterpret_cast<const std::uint8_t*>(output.data()),output.size()*4});output_flags=reverb?1:flags;}
+                        put(arg(4)+unit,output_flags);put(arg(4)+unit+4,frames);
+                    }
+                }else if(name=="CalcInputFrames" || name=="CalcOutputFrames")result=d(1);
+                else if(name=="SetParameters"){if(reverb && arg(1) && fx.parameter_size(d(2))){std::vector<std::uint8_t> bytes(d(2));memory.read(GuestAddress{arg(1)},bytes);fx.reverb().set(parse_reverb(bytes));}}
+                else if(name=="GetParameters"){
+                    if(reverb){if(arg(1) && fx.parameter_size(d(2))){const auto bytes=serialize_reverb(fx.reverb().parameters(),d(2));check(arg(1),bytes.size());memory.write(GuestAddress{arg(1)},bytes);}}
+                    else if(arg(1) && d(2)==levels_bytes)(void)write_levels(fx,arg(1));
+                }
+                else throw HostCallFault("XAudio2 內建效果方法不合法："+std::string(name));
+            }
             else if(name=="GetRegistrationProperties"){
                 // XAPO_REGISTRATION_PROPERTIES（pack 1，1068 位元組），由呼叫端以 XAPOFree（CoTaskMemFree）釋放。
                 check(arg(1),unit);const auto p=task_allocate(1068);memory.write(GuestAddress{p},fx.clsid);memory.write(GuestAddress{p+16},utf16_bytes(fx.info->name));
@@ -351,7 +514,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                 }
             }else if(o.kind==Object::Factory){
                 if(name=="LockServer"){if(d(1))++bridge.locks;else if(bridge.locks)--bridge.locks;}
-                else if(name=="CreateInstance"){check(arg(3),unit);put(arg(3),0,bits);if(arg(1))result=0x80040110U;else if(iid(arg(2))!=xaudio::iid27 && iid(arg(2))!=xaudio::unknown)result=no_interface;else put(arg(3),new_engine(7,false),bits);}
+                else if(name=="CreateInstance"){check(arg(3),unit);put(arg(3),0,bits);if(arg(1))result=0x80040110U;else if(o.effect_class)result=create_builtin(o.effect_class,arg(2),arg(3));else if(iid(arg(2))!=xaudio::iid27 && iid(arg(2))!=xaudio::unknown)result=no_interface;else put(arg(3),new_engine(7,false),bits);}
                 else throw HostCallFault("XAudio2 工廠方法不合法");
             }else if(name=="Work" || name=="Render" || name=="Complete"){
                 require(o.kind==Object::EngineObject);std::vector<GuestCallback> callbacks;
@@ -455,16 +618,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_xaudio(GuestState& state,Gu
                 else if(name=="GetEffectState"){check(arg(2),4);put(arg(2),d(1)<o.chain.size() && e->graph->effect_enabled(o.voice,d(1))?1:0);}
                 else if(name=="SetEffectParameters" || name=="GetEffectParameters"){
                     // 參數直接寫入效果物件，與 IXAPOParameters 共用同一份；OperationSet 不延後（立即生效）。
-                    require(d(1)<o.chain.size());auto& fx=*object(o.chain[d(1)]).fx;const auto count=fx.words().size();require(arg(2) && d(3)==count*4);
-                    if(name=="SetEffectParameters"){require(d(4)!=UINT32_MAX);fx.set(words_from(arg(2),count));}else words_to(arg(2),fx.words());
+                    require(d(1)<o.chain.size());auto& fx=*object(o.chain[d(1)]).fx;
+                    if(fx.builtin==Builtin::Reverb){
+                        require(arg(2) && fx.parameter_size(d(3)));
+                        if(name=="SetEffectParameters"){require(d(4)!=UINT32_MAX);std::vector<std::uint8_t> bytes(d(3));memory.read(GuestAddress{arg(2)},bytes);fx.reverb().set(parse_reverb(bytes));}
+                        else {const auto bytes=serialize_reverb(fx.reverb().parameters(),d(3));check(arg(2),bytes.size());memory.write(GuestAddress{arg(2)},bytes);}
+                    }else if(fx.builtin==Builtin::Meter){
+                        // volume meter 只能讀取；ChannelCount 必須等於該效果處理的聲道數。
+                        require(name=="GetEffectParameters" && arg(2) && d(3)==levels_bytes && write_levels(fx,arg(2)));
+                    }else {
+                        const auto count=fx.words().size();require(arg(2) && d(3)==count*4);
+                        if(name=="SetEffectParameters"){require(d(4)!=UINT32_MAX);fx.set(words_from(arg(2),count));}else words_to(arg(2),fx.words());
+                    }
                 }
                 else if(name=="GetVolume")put(arg(1),std::bit_cast<std::uint32_t>(info.volume));
                 else if(name=="GetFrequencyRatio")put(arg(1),std::bit_cast<std::uint32_t>(info.ratio));
                 else if(name=="SetVolume" || name=="SetFrequencyRatio"){c.operation=name=="SetVolume"?Graph::Operation::Volume:Graph::Operation::Frequency;c.value=fp(1);require(d(2)!=UINT32_MAX);e->graph->change(std::move(c),d(2));}
-                else if(name=="SetChannelVolumes"){require(d(1)==info.format.channels);c.operation=Graph::Operation::ChannelVolumes;c.values=floats(arg(2),d(1));e->graph->change(std::move(c),d(3));}
-                else if(name=="GetChannelVolumes"){require(d(1)==info.format.channels);check(arg(2),d(1)*4);memory.write(GuestAddress{arg(2)},{reinterpret_cast<const std::uint8_t*>(info.channel_volumes.data()),d(1)*4U});}
+                else if(name=="SetChannelVolumes"){require(d(1)==info.output_channels);c.operation=Graph::Operation::ChannelVolumes;c.values=floats(arg(2),d(1));e->graph->change(std::move(c),d(3));}
+                else if(name=="GetChannelVolumes"){require(d(1)==info.output_channels);check(arg(2),d(1)*4);memory.write(GuestAddress{arg(2)},{reinterpret_cast<const std::uint8_t*>(info.channel_volumes.data()),d(1)*4U});}
                 else if(name=="SetOutputMatrix" || name=="GetOutputMatrix"){
-                    c.destination=dest(arg(1));const auto target=e->graph->state(c.destination);require(d(2)==info.format.channels && d(3)==target.format.channels);
+                    c.destination=dest(arg(1));const auto target=e->graph->state(c.destination);require(d(2)==info.output_channels && d(3)==target.format.channels);
                     if(name=="SetOutputMatrix"){c.operation=Graph::Operation::Matrix;c.values=floats(arg(4),d(2)*d(3));e->graph->change(std::move(c),d(5));}
                     else {const auto v=e->graph->matrix(o.voice,c.destination);check(arg(4),v.size()*4);memory.write(GuestAddress{arg(4)},{reinterpret_cast<const std::uint8_t*>(v.data()),v.size()*4});}
                 }else if(name=="SetFilterParameters" || name=="SetOutputFilterParameters"){const bool output=name=="SetOutputFilterParameters";c.operation=output?Graph::Operation::OutputFilter:Graph::Operation::Filter;if(output)c.destination=dest(arg(1));c.filter=filter(arg(output?2:1));e->graph->change(std::move(c),d(output?3:2));}

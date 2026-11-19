@@ -19,6 +19,10 @@ struct PrintingState {
         std::uint32_t access{8};std::u16string datatype{u"RAW"},default_datatype{u"RAW"};
         std::vector<std::uint8_t> spool;std::vector<std::size_t> page_ends;bool explicit_pages{};
         std::string output;std::u16string title;std::uint64_t submitted{};std::vector<GuiBitmap> pages;std::uint64_t bytes{};
+        // 佇列控制：SetJob 的暫停（JOB_STATUS_PAUSED）與保留旗標、優先權；AddJob 的暫存檔路徑；GetSpoolFileHandle 的暫存檔與已提交位元組；
+        // 「印表機名稱,Job n」開啟的工作控制代碼與其讀取位置。
+        std::uint32_t status{},priority{1};std::u16string spool_path;std::uint64_t spool_handle{},committed{};
+        unsigned read_job{};std::uint64_t read_offset{};
     };
     struct Notice {
         std::uint64_t printer{};unsigned filter{},changes{};
@@ -26,6 +30,9 @@ struct PrintingState {
         std::array<std::uint64_t,3> revisions{};
     };
     std::map<std::uint64_t,Device> devices,handles;std::map<std::uint64_t,Notice> notices;unsigned next_job{1};
+    // 印表機暫停或工作暫停時，EndDocPrinter／ScheduleJob 完成的工作留在佇列，恢復後依序輸出。印表機設定（SetPrinter 第 2、8、9 級）在本程序有效。
+    std::vector<Device> queue;bool paused{};std::uint32_t status{},priority{1},default_priority{1};
+    std::u16string comment{u"CoreGraphics PDF"},location;std::optional<PrinterSettings> defaults;
     std::uint64_t form_poll_time{};
 };
 std::vector<PrinterSettings> WindowsServices::available_printer_settings(unsigned& error){
@@ -128,6 +135,12 @@ std::span<const WindowsServiceDescriptor> printing_service_descriptors(){
         {"winspool.drv","GetPrinterDriverDirectoryA",6},{"winspool.drv","GetPrinterDriverDirectoryW",6},{"winspool.drv","GetPrintProcessorDirectoryA",6},{"winspool.drv","GetPrintProcessorDirectoryW",6},
         {"winspool.drv","IsValidDevmodeA",2},{"winspool.drv","IsValidDevmodeW",2},{"winspool.drv","OpenPrinter2A",4},{"winspool.drv","OpenPrinter2W",4},
         {"winspool.drv","SetDefaultPrinterA",1},{"winspool.drv","SetDefaultPrinterW",1},
+        // 列印佇列控制（windows_print_queue.inc）。
+        {"winspool.drv","EnumJobsA",8,0,0,0x2e},{"winspool.drv","EnumJobsW",8,0,0,0x2e},{"winspool.drv","SetJobA",5,0,0,0x16},{"winspool.drv","SetJobW",5,0,0,0x16},
+        {"winspool.drv","AddJobA",5,0,0,0xa},{"winspool.drv","AddJobW",5,0,0,0xa},{"winspool.drv","ScheduleJob",2,0,0,0x2},
+        {"winspool.drv","GetSpoolFileHandle",1},{"winspool.drv","CommitSpoolData",3,0,0,0x4},{"winspool.drv","CloseSpoolFileHandle",2},
+        {"winspool.drv","SetPrinterA",4,0,0,0xa},{"winspool.drv","SetPrinterW",4,0,0,0xa},{"winspool.drv","ResetPrinterA",2},{"winspool.drv","ResetPrinterW",2},
+        {"winspool.drv","ReadPrinter",4,0,0,0x4},{"winspool.drv","SeekPrinter",5,0x2,0,0x18},{"winspool.drv","FreePrinterNotifyInfo",1},{"winspool.drv","SpoolerInit",0},
         {"spoolss.dll","StartDocPrinterA",3},{"spoolss.dll","StartDocPrinterW",3},{"spoolss.dll","StartPagePrinter",1},{"spoolss.dll","WritePrinter",4},{"spoolss.dll","EndPagePrinter",1},{"spoolss.dll","EndDocPrinter",1},{"spoolss.dll","AbortPrinter",1},
         {"gdi32.dll","ResetDCA",2},{"gdi32.dll","ResetDCW",2},{"gdi32.dll","ExtEscape",6},{"gdi32.dll","DrawEscape",4},{"gdi32.dll","NamedEscape",7}
     };return table;
@@ -166,6 +179,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_printing(GuestState& state,
     if(legacy){
         if(!gui_.contexts.contains(arg(0)))return failure(6);
         const auto count=static_cast<std::int32_t>(arg(2));if(count<0)return failure(87);
+        // Windows 中繼檔錄製 DC：MFCOMMENT（15）記成 META_ESCAPE 註解。
+        if(escape==15 && gui_.emf_recorders.contains(arg(0)) && gui_.emf_recorders.at(arg(0)).wmf){
+            if(count && !arg(3))return failure(87);std::vector<std::uint8_t> data(static_cast<std::size_t>(count));if(count)memory.read(GuestAddress{arg(3)},data);
+            return finish(record_metafile_escape(arg(0),15,data)?1:0);
+        }
         if(escape==8){
             if(count<2)return finish(0);if(!arg(3))return failure(87);
             const auto code=memory.load(GuestAddress{arg(3)},count<4?16:32);
@@ -310,6 +328,44 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
     if(!printing_)printing_=std::make_shared<PrintingState>();
     if(name.find("PrinterData")!=std::string_view::npos || name.starts_with("EnumPrinterKey") || name.starts_with("DeletePrinterKey"))return invoke_printer_data(state,memory,service);
     const auto copy=[&](const PrinterBuffer& buffer,std::uint64_t target,std::uint64_t capacity,std::uint64_t needed){if(!needed)return fail(87);memory.store(GuestAddress{needed},32,buffer.bytes.size());if(capacity<buffer.bytes.size())return fail(122);if(!target && !buffer.bytes.empty())return fail(87);if(!buffer.bytes.empty())memory.write(GuestAddress{target},buffer.bytes);return finish(1);};
+    // 本程序的列印工作：進行中（GDI DC 與 winspool 控制代碼）與佇列中的工作，依工作編號排序。
+    const auto all_jobs=[&]{std::vector<PrintingState::Device*> jobs;for(auto* list:{&printing_->devices,&printing_->handles})for(auto& [handle,device]:*list){(void)handle;if(device.active)jobs.push_back(&device);}
+        for(auto& device:printing_->queue)jobs.push_back(&device);std::sort(jobs.begin(),jobs.end(),[](const auto* a,const auto* b){return a->job<b->job;});return jobs;};
+    const auto print_job=[&](unsigned id)->PrintingState::Device*{for(auto* device:all_jobs())if(device->job==id)return device;return nullptr;};
+    // JOB_INFO_1／JOB_INFO_2：GetJob 與 EnumJobs 共用；at 為結構在緩衝中的位移。
+    const auto write_job=[&](PrinterBuffer& buffer,unsigned at,const PrintingState::Device& device,unsigned level,unsigned position){
+        const auto pages=device.bitmap?device.pages.size():device.page_ends.size();const bool queued=!device.active;
+        buffer.put(at,device.job);buffer.text(at+unit,u"Win64 PDF");buffer.text(at+unit*2,u"\\\\X64ARM");buffer.text(at+unit*3,u"user");buffer.text(at+unit*4,device.title);
+        const unsigned fields=at+(level==1?unit*7:unit*13);
+        const std::uint32_t status=(device.cancelled?4U:queued?0U:8U)|(device.status&(1U|0x10U|0x80U|0x800U|0x2000U));
+        buffer.put(fields,status);buffer.put(fields+4,device.priority);buffer.put(fields+8,position);
+        if(level==1){buffer.text(at+unit*5,device.datatype);buffer.put(fields+12,pages);}
+        else{buffer.text(at+unit*6,device.datatype);buffer.text(at+unit*7,u"Win64 PDF");buffer.text(at+unit*9,u"Win64 PDF");buffer.data(at+unit*10,printer_devmode(wide,device));buffer.put(fields+20,pages);buffer.put(fields+24,device.bytes?device.bytes:device.spool.size());}
+        const auto seconds=static_cast<std::time_t>((device.submitted-UINT64_C(116444736000000000))/10000000);std::tm time{};
+        if(::gmtime_r(&seconds,&time)){const unsigned offset=fields+(level==1?20:28);const unsigned values[]{static_cast<unsigned>(time.tm_year+1900),static_cast<unsigned>(time.tm_mon+1),static_cast<unsigned>(time.tm_wday),static_cast<unsigned>(time.tm_mday),
+            static_cast<unsigned>(time.tm_hour),static_cast<unsigned>(time.tm_min),static_cast<unsigned>(time.tm_sec),static_cast<unsigned>((device.submitted/10000)%1000)};for(unsigned i=0;i<8;++i)buffer.put(offset+i*2,values[i],2);}
+    };
+    // 把 RAW／TEXT 暫存資料轉成 PDF 寫到工作的輸出檔；EndDocPrinter、ScheduleJob 與恢復佇列共用。回 Win32 錯誤碼。
+    const auto emit=[&](PrintingState::Device& device)->unsigned{
+            NativeSpoolDocument document;
+            if(device.datatype==u"RAW" && device.spool.size()>=5 && std::equal(device.spool.begin(),device.spool.begin()+5,"%PDF-"))document=native_pdf_raw_document(device.spool);
+            else {
+                std::vector<std::u16string> pages;std::size_t previous=0;
+                const auto append=[&](std::size_t end){const auto* data=reinterpret_cast<const char*>(device.spool.data());auto value=utf8_to_utf16(std::string_view(data?data+previous:"",end-previous));previous=end;std::u16string page;
+                    for(std::size_t index=0;index<value.size();++index){const auto c=value[index];if(c==u'\f'){pages.push_back(std::move(page));page.clear();}else if(c==u'\r'){page.push_back(u'\n');if(index+1<value.size() && value[index+1]==u'\n')++index;}else if(c==u'\b'){if(!page.empty()){page.pop_back();if(!page.empty() && page.back()>=0xd800 && page.back()<=0xdbff)page.pop_back();}}else if(c<32 && c!=u'\t' && c!=u'\n')throw std::invalid_argument("列印資料不是支援的 PDF 或 UTF-8 文字");else page.push_back(c);}pages.push_back(std::move(page));};
+                for(const auto end:device.page_ends)append(end);if(previous<device.spool.size() || device.page_ends.empty())append(device.spool.size());
+                document=native_pdf_text_document(pages,device.title,device.width,device.height,device.copies,device.collate);
+            }
+            auto file=filesystem_.open_host(device.output,0x40000000,2,0,1);if(file.error)return file.error;
+            std::size_t offset=0;while(offset<document.bytes.size()){const auto written=file.file->write(std::span(document.bytes).subspan(offset),offset);if(written.error || !written.bytes)return written.error?written.error:29;offset+=static_cast<std::size_t>(written.bytes);}
+        return file.file->flush();
+    };
+    // 佇列中的工作：印表機未暫停且工作未暫停時依序輸出，輸出後移除。
+    const auto drain=[&]()->unsigned{
+        if(printing_->paused)return 0;
+        for(auto it=printing_->queue.begin();it!=printing_->queue.end();){if(it->status&1U){++it;continue;}const auto error=emit(*it);if(error)return error;it=printing_->queue.erase(it);printing_changed(0x400);}
+        return 0;
+    };
     if(name.starts_with("EnumPrintProcessorDatatypes")){
         if(!arg(5) || !arg(6))return fail(87);memory.store(GuestAddress{arg(6)},32,0);
         if(d(2)!=1)return fail(124);if(arg(0) && !string(arg(0)).empty() && string(arg(0))!=u"\\\\X64ARM")return fail(1801);
@@ -383,7 +439,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
         const auto text=wide?std::vector<std::uint8_t>{'W',0,'i',0,'n',0,'6',0,'4',0,' ',0,'P',0,'D',0,'F',0,0,0}:std::vector<std::uint8_t>{'W','i','n','6','4',' ','P','D','F',0};memory.write(GuestAddress{arg(0)},text);return finish(1);
     }
     if(name.starts_with("OpenPrinter")){
-        if(!arg(1))return fail(87);memory.check(GuestAddress{arg(1)},unit,Access::Write);if(!available || !printer_name(arg(0)))return fail(1801);if(printing_->handles.size()>=256)return fail(8);PrintingState::Device device;
+        // 「Win64 PDF,Job n」開啟本程序現有工作（進行中或佇列中）的工作控制代碼，供 ReadPrinter／SeekPrinter 讀取暫存資料。
+        unsigned job_handle=0;
+        if(arg(0) && available){auto text=string(arg(0));for(auto& c:text)if(c>=u'A' && c<=u'Z')c+=32;constexpr std::u16string_view prefix=u"win64 pdf,job ";
+            if(text.starts_with(prefix) && text.size()>prefix.size() && text.size()<=prefix.size()+10){unsigned value=0;bool digits=true;for(auto c:text.substr(prefix.size())){if(c<u'0' || c>u'9'){digits=false;break;}value=value*10+static_cast<unsigned>(c-u'0');}
+                if(!digits || !value || !print_job(value))return fail(1801);job_handle=value;}}
+        if(!arg(1))return fail(87);memory.check(GuestAddress{arg(1)},unit,Access::Write);if(!available || (!job_handle && !printer_name(arg(0))))return fail(1801);if(printing_->handles.size()>=256)return fail(8);PrintingState::Device device;
+        if(printing_->defaults)static_cast<PrinterSettings&>(device)=*printing_->defaults;device.read_job=job_handle;
         if(arg(2)){memory.check(GuestAddress{arg(2)},unit*2+4,Access::Read);const auto type=datatype(string(memory.load(GuestAddress{arg(2)},width)));const auto access=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)+unit*2},32));if(access&~0x000f000cU)return fail(5);if(!type.empty() && type!=u"RAW" && type!=u"TEXT")return fail(1804);if(!type.empty())device.default_datatype=device.datatype=type;device.access=access?access:8;if(const auto error=read_printer_settings(memory,memory.load(GuestAddress{arg(2)+unit},width),wide,device))return fail(error);}
         const auto handle=runtime_.allocate_wait_handle();printing_->handles.emplace(handle,std::move(device));memory.store(GuestAddress{arg(1)},width,handle);return finish(1);
     }
@@ -394,7 +456,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
 #include "windows_printer_forms.inc"
     if(name.starts_with("StartDocPrinter") || name=="StartPagePrinter" || name=="WritePrinter" || name=="EndPagePrinter" || name=="EndDocPrinter" || name=="AbortPrinter"){
         const auto found=printing_->handles.find(arg(0));if(found==printing_->handles.end())return fail(6);auto& device=found->second;
-        if(!(device.access&8U))return fail(5);
+        if(!(device.access&8U) || device.read_job)return fail(5);
         const auto discard=[&](){device.active=device.page=device.explicit_pages=false;device.spool.clear();device.page_ends.clear();device.bytes=0;printing_changed(0x400);};
         try{
             if(name.starts_with("StartDocPrinter")){
@@ -414,6 +476,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
             if(name=="WritePrinter"){
                 if(!arg(3))return fail(87);memory.check(GuestAddress{arg(3)},4,Access::Write);
                 const auto write_failure=[&](unsigned error){memory.store(GuestAddress{arg(3)},32,0);return fail(error);};
+                if(device.cancelled)return write_failure(63);if(device.read_job)return write_failure(5);
                 if(device.explicit_pages && !device.page)return write_failure(1906);const auto count=d(2);if(count && !arg(1))return write_failure(87);
                 if(count>128*1024*1024-device.spool.size())return write_failure(8);
                 // pcWritten 可與輸入重疊；完成資料讀取後才提交輸出計數。
@@ -422,20 +485,14 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
                 device.bytes=device.spool.size();memory.store(GuestAddress{arg(3)},32,count);printing_changed(0x200);return finish(1);
             }
             if(device.page)return fail(1906);
-            NativeSpoolDocument document;
-            if(device.datatype==u"RAW" && device.spool.size()>=5 && std::equal(device.spool.begin(),device.spool.begin()+5,"%PDF-"))document=native_pdf_raw_document(device.spool);
-            else {
-                std::vector<std::u16string> pages;std::size_t previous=0;
-                const auto append=[&](std::size_t end){const auto* data=reinterpret_cast<const char*>(device.spool.data());auto value=utf8_to_utf16(std::string_view(data?data+previous:"",end-previous));previous=end;std::u16string page;
-                    for(std::size_t index=0;index<value.size();++index){const auto c=value[index];if(c==u'\f'){pages.push_back(std::move(page));page.clear();}else if(c==u'\r'){page.push_back(u'\n');if(index+1<value.size() && value[index+1]==u'\n')++index;}else if(c==u'\b'){if(!page.empty()){page.pop_back();if(!page.empty() && page.back()>=0xd800 && page.back()<=0xdbff)page.pop_back();}}else if(c<32 && c!=u'\t' && c!=u'\n')throw std::invalid_argument("列印資料不是支援的 PDF 或 UTF-8 文字");else page.push_back(c);}pages.push_back(std::move(page));};
-                for(const auto end:device.page_ends)append(end);if(previous<device.spool.size() || device.page_ends.empty())append(device.spool.size());
-                document=native_pdf_text_document(pages,device.title,device.width,device.height,device.copies,device.collate);
-            }
-            auto file=filesystem_.open_host(device.output,0x40000000,2,0,1);if(file.error)return fail(file.error);
-            std::size_t offset=0;while(offset<document.bytes.size()){const auto written=file.file->write(std::span(document.bytes).subspan(offset),offset);if(written.error || !written.bytes)return fail(written.error?written.error:29);offset+=static_cast<std::size_t>(written.bytes);}
-            if(const auto error=file.file->flush())return fail(error);discard();return finish(1);
+            // SetJob 取消的工作不輸出；印表機或工作暫停時留在佇列，恢復後輸出。
+            if(device.cancelled){discard();return finish(1);}
+            if(device.spool_handle){(void)nested_service(state,memory,"kernel32.dll","CloseHandle",{device.spool_handle});device.spool_handle=0;}
+            if(printing_->paused || (device.status&1U)){auto held=device;held.active=false;held.read_job=0;printing_->queue.push_back(std::move(held));discard();printing_changed(0x200);return finish(1);}
+            if(const auto error=emit(device))return fail(error);discard();return finish(1);
         }catch(const std::bad_alloc&){return fail(8);}catch(const std::length_error&){return fail(8);}catch(const std::invalid_argument&){return fail(13);}catch(const std::domain_error&){return fail(50);}
     }
+#include "windows_print_queue.inc"
     if(name=="FindClosePrinterChangeNotification"){
         if(!printing_->notices.erase(arg(0)))return fail(6);runtime_.wait_objects.erase(arg(0));return finish(1);
     }
@@ -476,21 +533,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_spooler(GuestState& state,G
     }
     if(driver){if(arg(1) && !string(arg(1)).empty() && string(arg(1))!=(x86_?u"Windows NT x86":u"Windows x64"))return fail(1805);if(level!=1 && level!=2)return fail(124);PrinterBuffer buffer(level==1?unit:unit*6,target,x86_,wide);driver_info(buffer,level);return copy(buffer,target,capacity,needed);}
     if(job){
-        const PrintingState::Device* selected=nullptr;for(const auto* list:{&printing_->devices,&printing_->handles})for(const auto& [handle,device]:*list){(void)handle;if(device.active && device.job==d(1))selected=&device;}
-        if(!selected)return fail(87);if(level!=1 && level!=2)return fail(124);const auto& device=*selected;
-        const auto pages=device.bitmap?device.pages.size():device.page_ends.size();
-        PrinterBuffer buffer(level==1?(x86_?64:96):(x86_?104:160),target,x86_,wide);buffer.put(0,device.job);buffer.text(unit,u"Win64 PDF");buffer.text(unit*2,u"\\\\X64ARM");buffer.text(unit*3,u"user");buffer.text(unit*4,device.title);
-        const unsigned fields=level==1?unit*7:unit*13;buffer.put(fields,device.cancelled?4:8);buffer.put(fields+4,1);buffer.put(fields+8,1);
-        if(level==1){buffer.text(unit*5,device.datatype);buffer.put(fields+12,pages);}
-        else{buffer.text(unit*6,device.datatype);buffer.text(unit*7,u"Win64 PDF");buffer.text(unit*9,u"Win64 PDF");buffer.data(unit*10,printer_devmode(wide,device));buffer.put(fields+20,pages);buffer.put(fields+24,device.bytes);}
-        const auto seconds=static_cast<std::time_t>((device.submitted-UINT64_C(116444736000000000))/10000000);std::tm time{};if(::gmtime_r(&seconds,&time)){const unsigned offset=fields+(level==1?20:28);const unsigned values[]{static_cast<unsigned>(time.tm_year+1900),static_cast<unsigned>(time.tm_mon+1),static_cast<unsigned>(time.tm_wday),static_cast<unsigned>(time.tm_mday),static_cast<unsigned>(time.tm_hour),static_cast<unsigned>(time.tm_min),static_cast<unsigned>(time.tm_sec),static_cast<unsigned>((device.submitted/10000)%1000)};for(unsigned i=0;i<8;++i)buffer.put(offset+i*2,values[i],2);}return copy(buffer,target,capacity,needed);
+        const auto jobs=all_jobs();const auto found=std::find_if(jobs.begin(),jobs.end(),[&](const auto* item){return item->job==d(1);});
+        if(found==jobs.end())return fail(87);if(level!=1 && level!=2)return fail(124);
+        PrinterBuffer buffer(level==1?(x86_?64:96):(x86_?104:160),target,x86_,wide);write_job(buffer,0,**found,level,static_cast<unsigned>(found-jobs.begin())+1);
+        return copy(buffer,target,capacity,needed);
     }
-    const unsigned jobs=static_cast<unsigned>(std::count_if(printing_->devices.begin(),printing_->devices.end(),[](const auto& item){return item.second.active;})+std::count_if(printing_->handles.begin(),printing_->handles.end(),[](const auto& item){return item.second.active;}));unsigned size=0;
+    const unsigned jobs=static_cast<unsigned>(std::count_if(printing_->devices.begin(),printing_->devices.end(),[](const auto& item){return item.second.active;})+std::count_if(printing_->handles.begin(),printing_->handles.end(),[](const auto& item){return item.second.active;})+static_cast<std::ptrdiff_t>(printing_->queue.size()));unsigned size=0;
     switch(level){case 1:size=unit*4;break;case 2:size=x86_?84:136;break;case 4:size=unit*3;break;case 5:size=x86_?20:32;break;case 6:size=4;break;case 7:size=unit*2;break;case 8:case 9:size=unit;break;default:return fail(124);}
-    PrinterBuffer buffer(size,target,x86_,wide);const PrintingState::Device defaults;
+    PrinterBuffer buffer(size,target,x86_,wide);PrintingState::Device defaults;if(printing_->defaults)static_cast<PrinterSettings&>(defaults)=*printing_->defaults;
+    const std::uint32_t printer_status=(printing_->paused?1U:0U)|printing_->status;
     switch(level){case 1:buffer.put(0,0x800000);buffer.text(unit,u"Win64 PDF,FILE:,CoreGraphics PDF");buffer.text(unit*2,u"Win64 PDF");buffer.text(unit*3,u"CoreGraphics PDF");break;
-        case 2:buffer.text(unit,u"Win64 PDF");buffer.text(unit*3,u"FILE:");buffer.text(unit*4,u"Win64 PDF");buffer.text(unit*5,u"CoreGraphics PDF");buffer.data(unit*7,printer_devmode(wide,defaults));buffer.text(unit*9,u"Win64 PDF");buffer.text(unit*10,u"RAW");buffer.put(unit*13,0x40);buffer.put(unit*13+4,1);buffer.put(unit*13+8,1);buffer.put(unit*13+24,jobs);break;
-        case 4:buffer.text(0,u"Win64 PDF");buffer.put(unit*2,0x40);break;case 5:buffer.text(0,u"Win64 PDF");buffer.text(unit,u"FILE:");buffer.put(unit*2,0x40);break;case 7:buffer.put(unit,4);break;case 8:case 9:buffer.data(0,printer_devmode(wide,defaults));break;default:break;}
+        case 2:buffer.text(unit,u"Win64 PDF");buffer.text(unit*3,u"FILE:");buffer.text(unit*4,u"Win64 PDF");buffer.text(unit*5,printing_->comment);if(!printing_->location.empty())buffer.text(unit*6,printing_->location);buffer.data(unit*7,printer_devmode(wide,defaults));buffer.text(unit*9,u"Win64 PDF");buffer.text(unit*10,u"RAW");buffer.put(unit*13,0x40);buffer.put(unit*13+4,printing_->priority);buffer.put(unit*13+8,printing_->default_priority);buffer.put(unit*13+20,printer_status);buffer.put(unit*13+24,jobs);break;
+        case 4:buffer.text(0,u"Win64 PDF");buffer.put(unit*2,0x40);break;case 5:buffer.text(0,u"Win64 PDF");buffer.text(unit,u"FILE:");buffer.put(unit*2,0x40);break;case 6:buffer.put(0,printer_status);break;case 7:buffer.put(unit,4);break;case 8:case 9:buffer.data(0,printer_devmode(wide,defaults));break;default:break;}
     if(enumeration && capacity>=buffer.bytes.size() && target)memory.store(GuestAddress{arg(6)},32,1);return copy(buffer,target,capacity,needed);
 }
 // 印表機資料（登錄 HKLM\SYSTEM\CurrentControlSet\Control\Print\Printers\Win64 PDF\<鍵>；非 Ex 版本固定為 PrinterDriverData），經客體登錄 API 存取，

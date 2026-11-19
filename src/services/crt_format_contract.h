@@ -1,5 +1,7 @@
 /* CRT 格式輸出的共用純運算契約；宿主與客體常駐常式使用同一份規則。 */
 #pragma once
+/* 程序 CRT 資料區內，fmode 與 commode 之間保留的 DWORD。 */
+#define X64ARM_CRT_PRINTF_COUNT_OFFSET 28U
 typedef unsigned long long X64armCrtFormatWord;
 #define X64ARM_CRT_PRINTF_OPTIONS_MASK 0x3fULL
 static inline int x64arm_crt_legacy_size(unsigned c,X64armCrtFormatWord options) {

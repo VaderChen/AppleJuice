@@ -134,6 +134,12 @@ std::span<const WindowsServiceDescriptor> setup_inf_service_descriptors(){
         {"setupapi.dll","SetupDiGetINFClassA",5,0,0,8},{"setupapi.dll","SetupDiGetINFClassW",5,0,0,8},
         {"setupapi.dll","SetupDiGetActualSectionToInstallA",6,0,0,8},{"setupapi.dll","SetupDiGetActualSectionToInstallW",6,0,0,8},
         {"setupapi.dll","SetupDiGetActualSectionToInstallExA",8,0,0,0x10},{"setupapi.dll","SetupDiGetActualSectionToInstallExW",8,0,0,0x10},
+        // 裝置元素參數與登錄（windows_setupapi.inc，經 invoke_device_configuration）
+        {"setupapi.dll","SetupDiGetDeviceInstallParamsA",3},{"setupapi.dll","SetupDiGetDeviceInstallParamsW",3},
+        {"setupapi.dll","SetupDiSetDeviceInstallParamsA",3},{"setupapi.dll","SetupDiSetDeviceInstallParamsW",3},
+        {"setupapi.dll","SetupDiGetDevicePropertyKeys",6,0,0,0x28},
+        {"setupapi.dll","SetupDiGetCustomDevicePropertyA",8,0,0,0x48},{"setupapi.dll","SetupDiGetCustomDevicePropertyW",8,0,0,0x48},
+        {"setupapi.dll","SetupDiCreateDevRegKeyA",7,0,0,0x1c},{"setupapi.dll","SetupDiCreateDevRegKeyW",7,0,0,0x1c},
         // 字串表與公用輔助函式（windows_setup_string_table.inc）
         {"setupapi.dll","StringTableInitialize",0},{"setupapi.dll","StringTableInitializeEx",2,0,0,0x3},{"setupapi.dll","StringTableDestroy",1},
         {"setupapi.dll","StringTableAddString",3,0,0,0x4},{"setupapi.dll","StringTableAddStringEx",5,0,0,0x14},{"setupapi.dll","StringTableLookUpString",3,0,0,0x4},
@@ -201,6 +207,24 @@ std::span<const WindowsServiceDescriptor> setup_inf_service_descriptors(){
 }
 
 std::optional<std::uint32_t> WindowsServices::invoke_setup_inf(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol.starts_with("SetupDiCreateDevRegKey") && WindowsCall(state,memory,service)(5)){
+        // 帶 INF 的 SetupDiCreateDevRegKey：先以 InfHandle＝NULL 建立（或開啟）裝置登錄鍵，再以 SetupInstallFromInfSection（SPINST_REGISTRY）
+        // 把 DDInstall 區段的登錄指示套用到新鍵；套用失敗時關閉鍵並回傳 INVALID_HANDLE_VALUE，錯誤碼沿用安裝服務。
+        return nested_continuation(state,memory,"SetupDiCreateDevRegKey",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);const bool wide=service.symbol.ends_with('W');const auto invalid=x86_?std::uint64_t{UINT32_MAX}:UINT64_MAX;
+            const auto finish=[&](std::uint64_t value){call.return_to(s,value);return std::optional<std::uint32_t>{};};
+            if(!call(6) || call(2)!=1 || call(3) || (call(4)!=1 && call(4)!=2)){last_error_=87;co_return finish(invalid);}
+            auto key=co_await service_callback::call_value(resolve("setupapi.dll",service.symbol).value,{call(0),call(1),call(2),call(3),call(4),0,0});
+            if(x86_)key&=UINT32_MAX;
+            if(key==invalid)co_return finish(invalid);
+            const auto installed=co_await service_callback::call_value(resolve("setupapi.dll",wide?"SetupInstallFromInfSectionW":"SetupInstallFromInfSectionA").value,{0,call(5),call(6),4,key,0,0,0,0,0,0});
+            if(!(installed&UINT32_MAX)){const auto error=last_error_;(void)co_await service_callback::call_value(resolve("advapi32.dll","RegCloseKey").value,{key});last_error_=error?error:13U;co_return finish(invalid);}
+            co_return finish(key);
+        });
+    }
+    // 裝置資訊集合的元素參數、屬性鍵、自訂屬性與裝置登錄鍵：與既有 SetupDi 集合操作共用裝置組態狀態。
+    if(service.symbol.starts_with("SetupDiGetDeviceInstallParams") || service.symbol.starts_with("SetupDiSetDeviceInstallParams") || service.symbol=="SetupDiGetDevicePropertyKeys" ||
+       service.symbol.starts_with("SetupDiGetCustomDeviceProperty") || service.symbol.starts_with("SetupDiCreateDevRegKey"))return invoke_device_configuration(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');const unsigned unit=x86_?4U:8U;const auto width=static_cast<std::uint8_t>(unit*8);
     if(!setup_inf_)setup_inf_=std::make_shared<SetupInfState>();auto& handles=setup_inf_->handles;
     const auto finish=[&](std::uint64_t value)->std::optional<std::uint32_t>{arg.return_to(state,value);return std::nullopt;};

@@ -57,4 +57,16 @@ inline void sha1_block(std::array<std::uint32_t,5>& state,const std::uint8_t* bl
     }
     state[0]+=a;state[1]+=b;state[2]+=c;state[3]+=d;state[4]+=e;
 }
+// 一次算完整段訊息的 MD4（NT 雜湊等用途）：補 0x80、填 0 到 56 位元組，最後附上小端序位元長度。
+inline std::array<std::uint8_t,16> md4(const std::uint8_t* data,std::size_t size){
+    auto state=md_initial;std::size_t offset=0;
+    for(;size-offset>=64;offset+=64)md4_block(state,data+offset);
+    std::uint8_t tail[128]{};const auto rest=size-offset;if(rest)std::memcpy(tail,data+offset,rest);tail[rest]=0x80;
+    const std::size_t blocks=rest<56?1:2;const auto bits=static_cast<std::uint64_t>(size)*8;
+    for(unsigned i=0;i<8;++i)tail[blocks*64-8+i]=static_cast<std::uint8_t>(bits>>(8*i));
+    for(std::size_t i=0;i<blocks;++i)md4_block(state,tail+i*64);
+    std::array<std::uint8_t,16> digest{};
+    for(unsigned i=0;i<4;++i)for(unsigned j=0;j<4;++j)digest[i*4+j]=static_cast<std::uint8_t>(state[i]>>(8*j));
+    return digest;
+}
 }

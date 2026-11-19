@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "service_callback_task.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/unicode.hpp"
 #include "builtin_version.hpp"
@@ -51,11 +52,11 @@ struct AccessibleState {
 std::span<const WindowsServiceDescriptor> accessible_service_descriptors(){
     static const auto descriptors=[] {std::vector<WindowsServiceDescriptor> list{{"oleacc.dll","CreateStdAccessibleObject",4},{"oleacc.dll","AccessibleObjectFromWindow",4},{"oleacc.dll","AccessibleChildren",5},{"oleacc.dll","WindowFromAccessibleObject",2},{"oleacc.dll","LresultFromObject",3},{"oleacc.dll","ObjectFromLresult",4},
         {"oleacc.dll","GetRoleTextA",3},{"oleacc.dll","GetRoleTextW",3},{"oleacc.dll","GetStateTextA",3},{"oleacc.dll","GetStateTextW",3},
-        {"oleacc.dll","GetOleaccVersionInfo",2},{"oleacc.dll","GetProcessHandleFromHwnd",1},
+        {"oleacc.dll","GetOleaccVersionInfo",2},{"oleacc.dll","GetProcessHandleFromHwnd",1},{"oleacc.dll","AccessibleObjectFromEvent",5,0,0,0x6},{"oleacc.dll","AccessibleObjectFromPoint",3,0x1},
         {"uiautomationcore.dll","UiaGetReservedMixedAttributeValue",1},{"uiautomationcore.dll","UiaGetReservedNotSupportedValue",1},
         {"uiautomationcore.dll","UiaHostProviderFromHwnd",2},{"uiautomationcore.dll","UiaReturnRawElementProvider",4},
         {"uiautomationcore.dll","UiaRaiseAutomationEvent",2},{"uiautomationcore.dll","UiaRaiseAutomationPropertyChangedEvent",4,0,12},
-        {"uiautomationcore.dll","UiaRaiseStructureChangedEvent",4},{"uiautomationcore.dll","UiaRaiseNotificationEvent",5},{"uiautomationcore.dll","UiaClientsAreListening",0}};
+        {"uiautomationcore.dll","UiaRaiseStructureChangedEvent",4},{"uiautomationcore.dll","UiaRaiseNotificationEvent",5},{"uiautomationcore.dll","UiaClientsAreListening",0},{"uiautomationcore.dll","UiaDisconnectProvider",1},{"uiautomationcore.dll","UiaDisconnectAllProviders",0}};
         list.insert(list.end(),std::begin(methods),std::end(methods));list.insert(list.end(),std::begin(uia_methods),std::end(uia_methods));return list;}();return descriptors;
 }
 std::uint64_t WindowsServices::create_accessible(GuestMemory& memory,std::uint64_t window,std::uint32_t id){
@@ -139,6 +140,57 @@ std::optional<std::uint32_t> WindowsServices::invoke_accessible(GuestState& stat
     const auto bits=static_cast<std::uint8_t>(x86_?32:64);const unsigned unit=x86_?4:8,variant_size=x86_?16:24;
     const auto finish=[&](std::uint64_t value){if(name=="LresultFromObject" && (value&0x80000000U))value=static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(value)));arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     if(!accessible_)accessible_=std::make_shared<AccessibleState>();auto& bridge=*accessible_;
+    if(name=="AccessibleObjectFromEvent" || name=="AccessibleObjectFromPoint"){
+        // Event：(hwnd, dwObjectID, dwChildID, ppacc, pvarChild)：以 AccessibleObjectFromWindow 取得物件；dwChildID 不是 CHILDID_SELF 時以 get_accChild 取子物件，
+        //   子項是物件則回傳子物件與 CHILDID_SELF，否則回傳父物件與子項 ID。
+        // Point：(POINT ptScreen, ppacc, pvarChild)：WindowFromPoint 的視窗之工作區物件（OBJID_CLIENT），再以 accHitTest 逐層往下（最多 64 層）到最內層的物件或子項；
+        //   點不在任何視窗上時 E_FAIL。
+        return nested_continuation(state,memory,"oleacc 物件查詢",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);const bool from_point=service.symbol=="AccessibleObjectFromPoint";const unsigned size=x86_?4U:8U;const auto width=static_cast<std::uint8_t>(size*8);
+            const unsigned variant_bytes=x86_?16U:24U;const auto out=call(from_point?1:3),child_out=call(from_point?2:4);
+            const auto finish=[&](std::uint64_t value){call.return_to(s,value);return std::optional<std::uint32_t>{};};
+            const auto entry=[&](std::string_view dll,std::string_view target){const auto stub=host_service_stub(dll,target);return stub.value?stub.value:resolve(dll,target).value;};
+            const auto method=[&](std::uint64_t object,unsigned index){return m.load(GuestAddress{m.load(GuestAddress{object},width)+index*size},width);};
+            const auto set_child=[&](std::uint32_t id){m.fill(GuestAddress{child_out},0,variant_bytes);m.store(GuestAddress{child_out},16,3);m.store(GuestAddress{child_out+8},32,id);};
+            if(!out || !child_out)co_return finish(pointer_error);m.check(GuestAddress{out},size,Access::Write);m.check(GuestAddress{child_out},variant_bytes,Access::Write);
+            m.store(GuestAddress{out},width,0);m.fill(GuestAddress{child_out},0,variant_bytes);
+            GuestScratch temporary(*this,m,s);const auto iid=temporary.allocate(16),slot=temporary.allocate(size),value=temporary.allocate(variant_bytes);if(!iid || !slot || !value)co_return finish(0x8007000eU);
+            m.write(GuestAddress{iid},accessible_iid);
+            std::uint64_t window=0;std::uint32_t object_id=0xfffffffcU,child_id=0;
+            if(from_point){window=co_await service_callback::call_value(entry("user32.dll","WindowFromPoint"),x86_?std::vector<std::uint64_t>{call(0)&UINT32_MAX,call(0)>>32}:std::vector<std::uint64_t>{call(0)});
+                if(x86_)window&=UINT32_MAX;if(!window)co_return finish(0x80004005U);}
+            else{window=call(0);object_id=static_cast<std::uint32_t>(call(1));child_id=static_cast<std::uint32_t>(call(2));}
+            m.store(GuestAddress{slot},width,0);
+            auto status=static_cast<std::uint32_t>(co_await service_callback::call(entry("oleacc.dll","AccessibleObjectFromWindow"),{window,object_id,iid,slot}));
+            if(status&0x80000000U)co_return finish(status);auto object=m.load(GuestAddress{slot},width);if(!object)co_return finish(0x80004005U);
+            // get_accChild 的 VARIANT 參數：x86 以 16 位元組值傳遞（四個堆疊格），x64 傳指向複本的指標。
+            const auto variant_args=[&](std::uint32_t id){m.fill(GuestAddress{value},0,variant_bytes);m.store(GuestAddress{value},16,3);m.store(GuestAddress{value+8},32,id);
+                if(x86_)return std::vector<std::uint64_t>{m.load(GuestAddress{value},32),m.load(GuestAddress{value+4},32),m.load(GuestAddress{value+8},32),m.load(GuestAddress{value+12},32)};
+                return std::vector<std::uint64_t>{value};};
+            const auto as_accessible=[&](std::uint64_t dispatch)->service_callback::Task<std::uint64_t>{
+                m.store(GuestAddress{slot},width,0);const auto hr=static_cast<std::uint32_t>(co_await service_callback::call(method(dispatch,0),{dispatch,iid,slot}));
+                (void)co_await service_callback::call(method(dispatch,2),{dispatch});co_return hr?0:m.load(GuestAddress{slot},width);};
+            if(!from_point){
+                if(!child_id){m.store(GuestAddress{out},width,object);set_child(0);co_return finish(0);}
+                std::vector<std::uint64_t> args{object};const auto variant=variant_args(child_id);args.insert(args.end(),variant.begin(),variant.end());args.push_back(slot);
+                m.store(GuestAddress{slot},width,0);status=static_cast<std::uint32_t>(co_await service_callback::call(method(object,9),std::move(args))); // get_accChild
+                const auto dispatch=m.load(GuestAddress{slot},width);
+                if(!status && dispatch){if(const auto child=co_await as_accessible(dispatch)){(void)co_await service_callback::call(method(object,2),{object});m.store(GuestAddress{out},width,child);set_child(0);co_return finish(0);}}
+                m.store(GuestAddress{out},width,object);set_child(child_id);co_return finish(0);
+            }
+            const auto x=static_cast<std::uint32_t>(call(0)),y=static_cast<std::uint32_t>(call(0)>>32);
+            for(unsigned depth=0;depth<64;++depth){
+                m.fill(GuestAddress{value},0,variant_bytes);
+                status=static_cast<std::uint32_t>(co_await service_callback::call(method(object,24),{object,x,y,value})); // accHitTest
+                const auto type=m.load(GuestAddress{value},16);
+                if(!status && type==9){const auto dispatch=m.load(GuestAddress{value+8},width);const auto next=dispatch?co_await as_accessible(dispatch):0;
+                    if(next && next!=object){(void)co_await service_callback::call(method(object,2),{object});object=next;continue;}
+                    if(next)(void)co_await service_callback::call(method(next,2),{next});}
+                m.store(GuestAddress{out},width,object);set_child(!status && type==3?static_cast<std::uint32_t>(m.load(GuestAddress{value+8},32)):0U);co_return finish(0);
+            }
+            m.store(GuestAddress{out},width,object);set_child(0);co_return finish(0);
+        });
+    }
     const auto guid=[&](std::uint64_t at){Guid v{};memory.read(GuestAddress{at},v);return v;};
     const auto known=[](const Guid& iid){return iid==accessible_iid || iid==dispatch_iid || iid==unknown_iid;};
     const auto put=[&](std::uint64_t at,std::uint64_t value){memory.store(GuestAddress{at},bits,value);};

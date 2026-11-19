@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_icon.hpp"
 #include "windows_slist.hpp"
+#include "resource_directory.hpp"
 #include "x64arm/windows_userdraw.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/windows_window_state.hpp"
@@ -153,6 +154,38 @@ namespace {
 std::int32_t s32(std::uint64_t v){return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(v));}
 std::u16string lower(std::u16string s){for(auto& c:s)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);return s;}
 }
+bool resource_name_matches(const GuestMemory& memory,std::uint64_t root,std::uint64_t extent,std::uint32_t entry,std::uint64_t requested,bool wide){
+    if(!(entry&0x80000000U))return requested<=65535 && entry==requested;
+    if(requested<=65535)return false;
+    const auto check=[&](std::uint64_t offset,std::uint64_t length){if(offset>extent || length>extent-offset)throw HostCallFault("資源目錄超出 PE 範圍");};
+    const auto offset=entry&0x7fffffffU;check(offset,2);const auto length=memory.load(GuestAddress{root+offset},16);check(offset+2,length*2);std::u16string text;
+    for(std::uint64_t i=0;i<length;++i)text.push_back(static_cast<char16_t>(memory.load(GuestAddress{root+offset+2+i*2},16)));
+    return lower(text)==lower(wide?read_utf16(memory,GuestAddress{requested}):utf8_to_utf16_lossy(read_ansi(memory,requested)));
+}
+ResourceLookup find_resource_entry(const GuestMemory& memory,std::uint64_t base,std::uint64_t size,std::span<const std::uint64_t> keys,bool wide){
+    ResourceLookup lookup;if(size<256)return lookup;
+    const auto optional=base+memory.load(GuestAddress{base+60},32)+24;
+    const auto directory=memory.load(GuestAddress{optional},16)==0x10b?112U:128U;
+    const auto rva=memory.load(GuestAddress{optional+directory},32),extent=memory.load(GuestAddress{optional+directory+4},32);
+    if(!rva || rva>size || extent>size-rva || extent<16)return lookup;
+    const auto check=[&](std::uint64_t offset,std::uint64_t length){if(offset>extent || length>extent-offset)throw HostCallFault("資源目錄超出 PE 範圍");};
+    lookup.present=true;lookup.root=base+rva;lookup.address=lookup.root;lookup.directory=true;
+    std::uint64_t offset=0;
+    for(const auto key:keys){
+        if(!lookup.directory)return lookup;
+        check(offset,16);const auto count=memory.load(GuestAddress{lookup.root+offset+12},16)+memory.load(GuestAddress{lookup.root+offset+14},16);check(offset+16,count*8);
+        bool found=false;
+        for(std::uint64_t i=0;i<count && !found;++i){
+            const auto at=lookup.root+offset+16+i*8;const auto name=static_cast<std::uint32_t>(memory.load(GuestAddress{at},32));
+            if(lookup.depth==2?name!=key:!resource_name_matches(memory,lookup.root,extent,name,key,wide))continue;
+            const auto next=static_cast<std::uint32_t>(memory.load(GuestAddress{at+4},32));
+            lookup.directory=(next&0x80000000U)!=0;offset=next&0x7fffffffU;check(offset,16);lookup.address=lookup.root+offset;found=true;
+        }
+        if(!found)return lookup;
+        ++lookup.depth;
+    }
+    return lookup;
+}
 std::uint64_t WindowsServices::gui_resource(const GuestMemory& memory,std::uint64_t module,std::uint64_t name,std::uint64_t type,bool wide,bool first,int language) const {
     const auto* image=resource_image(module?module:runtime_.image.base);if(!image || image->size<256)return 0;
     const auto base=image->base,size=image->size;
@@ -161,13 +194,7 @@ std::uint64_t WindowsServices::gui_resource(const GuestMemory& memory,std::uint6
     const auto root=base+memory.load(GuestAddress{optional+directory},32),extent=memory.load(GuestAddress{optional+directory+4},32);
     if(root<base || root-base>size || extent>size-(root-base) || extent<16)return 0;
     const auto check=[&](std::uint64_t offset,std::uint64_t length){if(offset>extent || length>extent-offset)throw HostCallFault("資源目錄超出 PE 範圍");};
-    const auto match=[&](std::uint32_t entry,std::uint64_t requested){
-        if(!(entry&0x80000000U))return requested<=65535 && entry==requested;
-        if(requested<=65535)return false;
-        const auto offset=entry&0x7fffffffU;check(offset,2);const auto length=memory.load(GuestAddress{root+offset},16);check(offset+2,length*2);std::u16string text;
-        for(std::uint64_t i=0;i<length;++i)text.push_back(static_cast<char16_t>(memory.load(GuestAddress{root+offset+2+i*2},16)));
-        return lower(text)==lower(wide?read_utf16(memory,GuestAddress{requested}):utf8_to_utf16_lossy(read_ansi(memory,requested)));
-    };
+    const auto match=[&](std::uint32_t entry,std::uint64_t requested){return resource_name_matches(memory,root,extent,entry,requested,wide);};
     std::uint64_t offset=0;
     for(unsigned level=0;level<3;++level){
         check(offset,16);const auto count=memory.load(GuestAddress{root+offset+12},16)+memory.load(GuestAddress{root+offset+14},16);check(offset+16,count*8);bool found=false;
@@ -434,7 +461,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
             if(!callbacks.empty()){start_callbacks(state,memory,std::move(callbacks),Continuation::Return,0);return std::nullopt;}
         }}
     }
-    else if(symbol=="CoCreateInstance" || symbol=="CoGetClassObject"){if(begin_registered_com(state,memory,service))return std::nullopt;if(begin_msxml_com(state,memory,service))return std::nullopt;if(begin_webbrowser_com(state,memory,service))return std::nullopt;if(begin_ribbon_com(state,memory,service))return std::nullopt;if(dmusic::is_class(memory,arg(0)))return invoke_directmusic(state,memory,service);if(wic::is_class(memory,arg(0)))return invoke_wic(state,memory,service);if(dsound::is_class(memory,arg(0)))return invoke_dsound(state,memory,service);if(xaudio::is_class(memory,arg(0)))return invoke_xaudio(state,memory,service);if(wasapi::is_class(memory,arg(0)))return invoke_wasapi(state,memory,service);if(dinput::is_class(memory,arg(0)))return invoke_dinput(state,memory,service);if(symbol=="CoGetClassObject"){memory.store(GuestAddress{arg(4)},x86_?32:64,0);arg.return_to(state,0x80040154U);return std::nullopt;}return invoke_wmi(state,memory,service);}
+    else if(symbol=="CoCreateInstance" || symbol=="CoGetClassObject"){if(begin_registered_com(state,memory,service))return std::nullopt;if(begin_avi_disk(state,memory,service))return std::nullopt;if(begin_msxml_com(state,memory,service))return std::nullopt;if(begin_webbrowser_com(state,memory,service))return std::nullopt;if(begin_ribbon_com(state,memory,service))return std::nullopt;if(begin_moniker_com(state,memory,service))return std::nullopt;if(begin_ole_picture_com(state,memory,service))return std::nullopt;if(begin_file_dialog_com(state,memory,service))return std::nullopt;if(dmusic::is_class(memory,arg(0)))return invoke_directmusic(state,memory,service);if(wic::is_class(memory,arg(0)))return invoke_wic(state,memory,service);if(dsound::is_class(memory,arg(0)))return invoke_dsound(state,memory,service);if(xaudio::is_class(memory,arg(0)))return invoke_xaudio(state,memory,service);if(wasapi::is_class(memory,arg(0)))return invoke_wasapi(state,memory,service);if(dinput::is_class(memory,arg(0)))return invoke_dinput(state,memory,service);if(symbol=="CoGetClassObject"){memory.store(GuestAddress{arg(4)},x86_?32:64,0);arg.return_to(state,0x80040154U);return std::nullopt;}return invoke_wmi(state,memory,service);}
     else if(symbol.starts_with("InitCommonControls")){if(symbol.ends_with("Ex")){if(memory.load(GuestAddress{arg(0)},32)!=8)fail(87);else result=1;}}
     else if(symbol=="DisableProcessWindowsGhosting"){
         // 此 void API 停用的是 Windows 的替身視窗；AppKit 後端本來不建立替身。

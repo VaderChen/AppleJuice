@@ -27,3 +27,4 @@ FetchContent_Declare(spirv_cross
 FetchContent_MakeAvailable(spirv_cross)
 include("${PROJECT_SOURCE_DIR}/cmake/SpirvCrossVertexVaryings.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/SpirvCrossWorkgroupZeroInit.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/SpirvCrossPatchAccess.cmake")

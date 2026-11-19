@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_raw_input.hpp"
 #include "x64arm/unicode.hpp"
+#include "service_callback_task.hpp"
 #include <algorithm>
 #include <map>
 
@@ -18,6 +19,41 @@ std::vector<Button> pressed(const hid::Layout& layout,unsigned type,std::span<co
         }
     }
     return result;
+}
+// 鍵盤頁（0x07）用法對 i8042 Set 1 掃描碼：E0 前綴以 0xe000 標示，0 表示沒有對應。
+// 依 USB HID 用法表與 PS/2 Set 1 的標準對照；PrintScreen（0x46）與 Pause（0x48）另依修飾鍵處理。
+constexpr std::uint16_t keyboard_codes[256]{
+    0,0xff,0,0,0x1e,0x30,0x2e,0x20,0x12,0x21,0x22,0x23,0x17,0x24,0x25,0x26,                     // 00-0f
+    0x32,0x31,0x18,0x19,0x10,0x13,0x1f,0x14,0x16,0x2f,0x11,0x2d,0x15,0x2c,0x02,0x03,          // 10-1f
+    0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x1c,0x01,0x0e,0x0f,0x39,0x0c,0x0d,0x1a,          // 20-2f
+    0x1b,0x2b,0x2b,0x27,0x28,0x29,0x33,0x34,0x35,0x3a,0x3b,0x3c,0x3d,0x3e,0x3f,0x40,          // 30-3f
+    0x41,0x42,0x43,0x44,0x57,0x58,0,0x46,0,0xe052,0xe047,0xe049,0xe053,0xe04f,0xe051,0xe04d,  // 40-4f
+    0xe04b,0xe050,0xe048,0x45,0xe035,0x37,0x4a,0x4e,0xe01c,0x4f,0x50,0x51,0x4b,0x4c,0x4d,0x47,// 50-5f
+    0x48,0x49,0x52,0x53,0x56,0xe05d,0xe05e,0x59,0x64,0x65,0x66,0x67,0x68,0x69,0x6a,0x6b,      // 60-6f
+    0x6c,0x6d,0x6e,0x76,0,0,0,0,0,0,0,0,0,0,0,0xe020,                                         // 70-7f
+    0xe030,0xe02e,0,0,0,0x7e,0,0x73,0x70,0x7d,0x79,0x7b,0x5c,0,0,0,                            // 80-8f
+    0xf2,0xf1,0x78,0x77,0x76,0,0,0,0,0,0,0,0,0,0,0,                                            // 90-9f
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,                          // a0-bf
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,                          // c0-df
+    0x1d,0x2a,0x38,0xe05b,0xe01d,0x36,0xe038,0xe05c};                                          // e0-e7
+// 依 HIDP_KEYBOARD_MODIFIER_STATE 產生一個鍵的掃描碼；LANG1／LANG2 與 Pause 沒有放開碼。
+std::vector<std::uint8_t> scan_codes(unsigned usage,bool make,std::uint32_t modifiers){
+    const bool control=modifiers&0x11U,shift=modifiers&0x22U,alt=modifiers&0x44U;
+    if(usage==0x48){
+        if(!make)return {};
+        if(control)return {0xe0,0x46,0xe0,0xc6};
+        return {0xe1,0x1d,0x45,0xe1,0x9d,0xc5};
+    }
+    if(usage==0x46){
+        if(alt)return {static_cast<std::uint8_t>(make?0x54:0xd4)};
+        if(control || shift)return make?std::vector<std::uint8_t>{0xe0,0x37}:std::vector<std::uint8_t>{0xe0,0xb7};
+        return make?std::vector<std::uint8_t>{0xe0,0x2a,0xe0,0x37}:std::vector<std::uint8_t>{0xe0,0xb7,0xe0,0xaa};
+    }
+    const std::uint32_t code=usage<256?keyboard_codes[usage]:0U;if(!code)throw hid::Error(hid::i8042_trans_unknown);
+    if(code==0xf1 || code==0xf2 || code==0xff)return make?std::vector<std::uint8_t>{static_cast<std::uint8_t>(code)}:std::vector<std::uint8_t>{};
+    const auto base=static_cast<std::uint8_t>((code&0x7fU)|(make?0U:0x80U));
+    if(code&0xe000U)return {0xe0,base};
+    return {base};
 }
 }
 std::span<const WindowsServiceDescriptor> hid_service_descriptors(){
@@ -37,9 +73,38 @@ std::span<const WindowsServiceDescriptor> hid_service_descriptors(){
         {"hid.dll","HidP_GetUsageValueArray",9},{"hid.dll","HidP_SetUsageValueArray",9},
         {"hid.dll","HidP_InitializeReportForID",5},
         {"hid.dll","HidD_GetFeature",3},{"hid.dll","HidD_SetFeature",3},{"hid.dll","HidD_GetInputReport",3},{"hid.dll","HidD_SetOutputReport",3},
-        {"hid.dll","HidD_GetIndexedString",4},{"hid.dll","HidP_GetSpecificButtonCaps",7},{"hid.dll","HidP_GetSpecificValueCaps",7}};return table;
+        {"hid.dll","HidD_GetIndexedString",4},{"hid.dll","HidP_GetSpecificButtonCaps",7},{"hid.dll","HidP_GetSpecificValueCaps",7},
+        {"hid.dll","HidP_GetLinkCollectionNodes",3},{"hid.dll","HidP_MaxUsageListLength",3},{"hid.dll","HidP_SetData",6},{"hid.dll","HidP_UnsetUsages",8},
+        {"hid.dll","HidP_TranslateUsagesToI8042ScanCodes",6}};return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol=="HidP_TranslateUsagesToI8042ScanCodes")
+        // (ChangedUsageList, UsageListLength, KeyAction, ModifierState, InsertCodesProcedure, Context)：每個鍵依序呼叫一次插入回呼（cdecl）。
+        return nested_continuation(state,memory,"HID i8042",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);const auto finish=[&](std::uint32_t status){call.return_to(s,status);return std::optional<std::uint32_t>{};};
+            std::uint64_t buffer=0;
+            struct Release {WindowsServices& self;GuestMemory& m;GuestState& s;std::uint64_t& block;~Release(){if(block)(void)self.free_heap(m,block,s);}} cleanup{*this,m,s,buffer};
+            try{
+                const auto count=static_cast<std::uint32_t>(call(1));const bool make=static_cast<std::uint32_t>(call(2))==1;const auto state_at=call(3),procedure=call(4),context=call(5);
+                if(static_cast<std::uint32_t>(call(2))>1 || !state_at || !procedure || (count && !call(0)))co_return finish(0xc000000dU); // STATUS_INVALID_PARAMETER
+                std::vector<std::uint16_t> usages(count);for(std::uint32_t i=0;i<count;++i)usages[i]=static_cast<std::uint16_t>(m.load(GuestAddress{call(0)+i*2},16));
+                auto modifiers=static_cast<std::uint32_t>(m.load(GuestAddress{state_at},32));
+                buffer=allocate_heap(m,8);if(!buffer)co_return finish(0xc0000017U);
+                for(const auto usage:usages){
+                    if(!usage)continue;
+                    const auto codes=scan_codes(usage,make,modifiers);
+                    // 修飾鍵依按下／放開設定；CapsLock、ScrollLock、NumLock 在按下時切換。
+                    if(usage>=0xe0 && usage<=0xe7){const auto bit=1U<<(usage-0xe0);modifiers=make?modifiers|bit:modifiers&~bit;}
+                    else if(make && (usage==0x39 || usage==0x47 || usage==0x53))modifiers^=usage==0x39?0x100U:usage==0x47?0x200U:0x400U;
+                    m.store(GuestAddress{state_at},32,modifiers);
+                    if(codes.empty())continue;
+                    m.write(GuestAddress{buffer},codes);
+                    (void)co_await service_callback::call_value(procedure,{context,buffer,codes.size()});
+                }
+                co_return finish(hid::success);
+            }catch(const hid::Error& error){co_return finish(error.status);}
+            catch(const MemoryFault&){co_return finish(0xc0000005U);}
+        });
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const auto d=[&](unsigned n){return static_cast<std::uint32_t>(arg(n));};const auto bits=static_cast<std::uint8_t>(x86_?32:64);
     const bool parser=name.starts_with("HidP_");std::uint32_t result=parser?hid::success:0;
     const auto fail=[&](std::uint32_t error){last_error_=error;result=0;};
@@ -144,6 +209,72 @@ std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,Guest
             if(write){if(name=="HidP_SetScaledUsageValue")result=layout.set_scaled_value(*field,element,static_cast<std::int32_t>(d(4)),report);
                 else layout.value(*field,element,d(4),report);memory.write(GuestAddress{arg(6)},report);}
             else memory.store(GuestAddress{arg(4)},32,name=="HidP_GetScaledUsageValue"?static_cast<std::uint32_t>(layout.scaled_value(*field,element,report)):layout.value(*field,element,report));
+        }else if(name=="HidP_GetLinkCollectionNodes"){
+            // (Nodes, Length, Preparsed)：容量不足時回報需要的數量。HIDP_LINK_COLLECTION_NODE 為 x86 20、x64 24 位元組（UserContext 填 NULL）。
+            const auto layout=layout_at(arg(2));if(!arg(1))throw hid::Error(hid::buffer_too_small);
+            memory.check(GuestAddress{arg(1)},4,Access::Write);const auto capacity=memory.load(GuestAddress{arg(1)},32);memory.store(GuestAddress{arg(1)},32,layout.nodes.size());
+            if(capacity<layout.nodes.size() || !arg(0))throw hid::Error(hid::buffer_too_small);
+            const unsigned size=x86_?20U:24U;std::vector<std::uint8_t> data(layout.nodes.size()*size);
+            for(unsigned i=0;i<layout.nodes.size();++i){const auto& n=layout.nodes[i];const auto at=i*size;
+                put(data,at,n.usage.value,2);put(data,at+2,n.usage.page,2);put(data,at+4,n.parent,2);put(data,at+6,n.children,2);put(data,at+8,n.next_sibling,2);put(data,at+10,n.first_child,2);put(data,at+12,n.type&0xffU);}
+            memory.write(GuestAddress{arg(0)},data);
+        }else if(name=="HidP_MaxUsageListLength"){
+            // GetUsages 對該報告類型與用法頁（0 為全部）最多能回傳的用法數：variable 按鈕每個用法一個，array 按鈕為報告數量。
+            const auto layout=layout_at(arg(2));if(d(0)>=3)throw hid::Error(hid::invalid_type);const auto page=d(1)&0xffffU;unsigned total=0;
+            for(const auto& field:layout.fields)if(field.type==d(0) && field.button){
+                if(field.variable()){for(const auto& usage:field.usages)if(!page || usage.page==page)++total;}
+                else if(std::any_of(field.usages.begin(),field.usages.end(),[&](const auto& usage){return !page || usage.page==page;}))total+=field.count;
+            }
+            result=total;
+        }else if(name=="HidP_SetData"){
+            // HIDP_DATA{DataIndex, Reserved, RawValue／On}；依資料索引設定按鈕或數值。失敗時 *DataLength 改為出錯項目的索引，之前的項目已寫入報告。
+            const auto layout=layout_at(arg(3));auto report=report_at(4,5,layout,d(0),true);
+            if(!arg(2))throw hid::Error(hid::buffer_too_small);memory.check(GuestAddress{arg(2)},4,Access::Write);const auto count=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)},32));
+            if(count>65536 || (count && !arg(1)))throw hid::Error(hid::buffer_too_small);
+            std::vector<std::uint8_t> list(static_cast<std::size_t>(count)*8);if(count)memory.read(GuestAddress{arg(1)},list);
+            const auto set_item=[&](unsigned index,std::uint32_t raw)->std::uint32_t{
+                for(const auto& field:layout.fields){
+                    if(field.type!=d(0) || index<field.index || index>=field.index+field.indices())continue;
+                    if(field.report!=report[0])return hid::incompatible_id;
+                    const auto offset=index-field.index;
+                    if(field.button){
+                        const bool on=(raw&0xffU)!=0;
+                        if(field.variable()){layout.value(field,offset,on?1U:0U,report);return hid::success;}
+                        // array 按鈕：邏輯值為用法索引加上最小值；放開時移除，按下時放進第一個空位。
+                        const auto value=static_cast<std::uint32_t>(static_cast<std::int64_t>(offset)+field.minimum);
+                        for(unsigned n=0;n<field.count;++n)if(layout.value(field,n,report)==value){if(!on)layout.value(field,n,0,report);return hid::success;}
+                        if(!on)return hid::button_not_pressed;
+                        for(unsigned n=0;n<field.count;++n)if(!layout.value(field,n,report)){layout.value(field,n,value,report);return hid::success;}
+                        return hid::buffer_too_small;
+                    }
+                    for(unsigned n=0;n<field.count;){const auto span=field.value_count(n);
+                        if(field.data_index(n)==index){if(span>1)return hid::is_value_array;layout.value(field,n,raw,report);return hid::success;}n+=span;}
+                }
+                return hid::data_index_not_found;
+            };
+            std::uint32_t item=0,status=hid::success;
+            for(;item<count;++item){
+                const auto at=item*8;const auto index=static_cast<unsigned>(list[at]|(list[at+1]<<8));
+                const auto raw=static_cast<std::uint32_t>(list[at+4])|(static_cast<std::uint32_t>(list[at+5])<<8)|(static_cast<std::uint32_t>(list[at+6])<<16)|(static_cast<std::uint32_t>(list[at+7])<<24);
+                try{status=set_item(index,raw);}catch(const hid::Error& error){status=error.status;}
+                if(status!=hid::success)break;
+            }
+            memory.write(GuestAddress{arg(4)},report);
+            if(status!=hid::success){memory.store(GuestAddress{arg(2)},32,item);throw hid::Error(status);}
+        }else if(name=="HidP_UnsetUsages"){
+            // 與 HidP_SetUsages 對稱：variable 按鈕清為 0；array 按鈕移除對應的邏輯值，未按下時 HIDP_STATUS_BUTTON_NOT_PRESSED；用法 0 略過。
+            const auto layout=layout_at(arg(5));auto report=report_at(6,7,layout,d(0),true);
+            if(!arg(4))throw hid::Error(hid::buffer_too_small);memory.check(GuestAddress{arg(4)},4,Access::Write);const auto count=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(4)},32));
+            if(count>65536 || (count && !arg(3)))throw hid::Error(hid::buffer_too_small);
+            for(unsigned i=0;i<count;++i){
+                const auto usage=static_cast<std::uint16_t>(memory.load(GuestAddress{arg(3)+i*2},16));if(!usage)continue;unsigned element=0;
+                const auto field=layout.find(d(0),{static_cast<std::uint16_t>(d(1)),usage},d(2)&0xffffU,report[0],true,&element);if(!field)throw hid::Error(hid::usage_not_found);
+                if(field->variable()){layout.value(*field,element,0,report);continue;}
+                const auto value=static_cast<std::uint32_t>(static_cast<std::int64_t>(element)+field->minimum);bool cleared=false;
+                for(unsigned n=0;n<field->count;++n)if(layout.value(*field,n,report)==value){layout.value(*field,n,0,report);cleared=true;}
+                if(!cleared)throw hid::Error(hid::button_not_pressed);
+            }
+            memory.write(GuestAddress{arg(6)},report);
         }else if(name=="HidP_GetUsagesEx"){
             const auto layout=layout_at(arg(4));const auto report=report_at(5,6,layout,d(0),false);
             const auto link=static_cast<std::uint16_t>(d(1));
@@ -175,8 +306,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_hid(GuestState& state,Guest
                 memory.store(GuestAddress{arg(4)},32,usages.size());if(count<usages.size() || (!arg(3) && !usages.empty()))throw hid::Error(hid::buffer_too_small);
                 std::vector<std::uint8_t> data(usages.size()*2);for(unsigned i=0;i<usages.size();++i)put(data,i*2,usages[i],2);memory.write(GuestAddress{arg(3)},data);}
         }
-    }catch(const hid::Error& error){if(parser)result=name=="HidP_MaxDataListLength"?0:error.status;else fail(87);}
-    catch(const MemoryFault&){if(parser)result=hid::invalid_preparsed;else fail(998);}
+    }catch(const hid::Error& error){if(parser)result=name=="HidP_MaxDataListLength" || name=="HidP_MaxUsageListLength"?0:error.status;else fail(87);}
+    catch(const MemoryFault&){if(parser)result=name=="HidP_MaxDataListLength" || name=="HidP_MaxUsageListLength"?0:hid::invalid_preparsed;else fail(998);}
     catch(const std::bad_alloc&){if(parser)result=0xc0000017U;else fail(8);}
     arg.return_to(state,result);return std::nullopt;
 }

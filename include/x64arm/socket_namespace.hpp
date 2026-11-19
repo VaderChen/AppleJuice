@@ -34,7 +34,32 @@ struct Lookup {
     bool too_small{};
     bool operator==(const Lookup&)const=default;
 };
+// 服務類別結構描述（WSAInstallServiceClass）：每個 WSANSCLASSINFO 是 {名稱, 名稱空間, 值型別, 值}。
+struct ClassInfo {
+    std::u16string name;
+    std::uint32_t namespace_id{},value_type{};
+    std::vector<std::uint8_t> value;
+    bool operator==(const ClassInfo&)const=default;
+};
+struct ServiceClass {
+    std::array<std::uint8_t,16> id{};
+    std::u16string name;
+    std::vector<ClassInfo> infos;
+    bool operator==(const ServiceClass&)const=default;
+};
+// LSP 應用程式類別（WSCSetApplicationCategory）：路徑與命令列引數不分大小寫比對。
+struct ApplicationCategory {
+    std::u16string path,extra;
+    std::uint32_t categories{};
+    bool operator==(const ApplicationCategory&)const=default;
+};
 std::u16string fold(std::u16string_view);
+std::vector<ServiceClass> load_classes(const RegistryState&);
+void save_classes(RegistryState&,const std::vector<ServiceClass>&);
+// WSASERVICECLASSINFO＋結構描述的連續版面；namespace_id 不為 0 時只列該名稱空間與 NS_ALL 的項目。
+std::vector<std::uint8_t> class_information(const ServiceClass&,bool wide,bool x86,std::uint64_t base,std::uint32_t namespace_id);
+std::vector<ApplicationCategory> load_categories(const RegistryState&);
+void save_categories(RegistryState&,const std::vector<ApplicationCategory>&);
 bool valid(const Address&);
 std::vector<Record> load(const RegistryState&);
 void save(RegistryState&,const std::vector<Record>&);

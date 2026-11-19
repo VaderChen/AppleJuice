@@ -9,7 +9,8 @@
 // ole32 類別登錄與輔助家族：CoGetTreatAsClass／CoTreatAsClass、OleGetAutoConvert／OleSetAutoConvert、CoGetPSClsid／CoRegisterPSClsid、CoIsOle1Class、
 // OleRegGetUserType、OleRegGetMiscStatus、GetClassFile、IsEqualGUID、IsValidInterface、CoGetCurrentLogicalThreadId、CoIsHandlerConnected、
 // CoLoadLibrary／CoFreeLibrary／CoFreeAllLibraries／CoFreeUnusedLibrariesEx、CoGetState／CoSetState、CoMarshalHresult／CoUnmarshalHresult、
-// CoInitializeWOW／OleInitializeWOW、ReadFmtUserTypeStg／WriteFmtUserTypeStg（MS-OLEDS CompObj 串流）。
+// CoInitializeWOW／OleInitializeWOW、ReadFmtUserTypeStg／WriteFmtUserTypeStg（MS-OLEDS CompObj 串流）、GetConvertStg／SetConvertStg（\1Ole 串流的轉換位元）、
+// OleDoAutoConvert（依 AutoConvertTo 改寫儲存的 CLSID、使用者類型並設定轉換位元）。
 // 登錄一律經 advapi32 讀寫 HKEY_CLASSES_ROOT（使用者與機器類別的合併檢視）；需要呼叫客體程式碼（DllMain、COM 方法）者經 nested_continuation。
 namespace x64arm {
 namespace {
@@ -26,6 +27,7 @@ std::span<const WindowsServiceDescriptor> ole_misc_service_descriptors(){
         {"ole32.dll","CoGetState",1},{"ole32.dll","CoSetState",1},{"ole32.dll","CoMarshalHresult",2,0,0,0x2},{"ole32.dll","CoUnmarshalHresult",2},
         {"ole32.dll","CoInitializeWOW",2,0,0,0x3},{"ole32.dll","OleInitializeWOW",2,0,0,0x3},
         {"ole32.dll","ReadFmtUserTypeStg",3},{"ole32.dll","WriteFmtUserTypeStg",3,0,0,0x2},
+        {"ole32.dll","GetConvertStg",1},{"ole32.dll","SetConvertStg",2,0,0,0x2},{"ole32.dll","OleDoAutoConvert",2},
     };return table;
 }
 std::optional<std::u16string> WindowsServices::class_registry_value(const std::u16string& key,const std::u16string& name){
@@ -114,7 +116,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_misc(GuestState& state,
         }
         if(name=="CoMarshalHresult" || name=="CoUnmarshalHresult" || name=="CoGetState" || name=="CoSetState" || name=="CoLoadLibrary" || name=="CoFreeLibrary" ||
            name=="CoFreeAllLibraries" || name=="CoFreeUnusedLibrariesEx" || name=="CoInitializeWOW" || name=="OleInitializeWOW" ||
-           name=="ReadFmtUserTypeStg" || name=="WriteFmtUserTypeStg" || name=="GetClassFile"){
+           name=="ReadFmtUserTypeStg" || name=="WriteFmtUserTypeStg" || name=="GetClassFile" || name=="GetConvertStg" || name=="SetConvertStg" || name=="OleDoAutoConvert"){
             return nested_continuation(state,memory,"OleMisc",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
                 const WindowsCall call(s,m,service);const auto symbol=service.symbol;const unsigned size=x86_?4U:8U;const auto width=static_cast<std::uint8_t>(size*8);
                 const auto finish=[&](std::uint64_t value){call.return_to(s,value);return std::optional<std::uint32_t>{};};
@@ -153,6 +155,48 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_misc(GuestState& state,
                 if(symbol=="CoFreeUnusedLibrariesEx"){(void)co_await service_callback::call(entry("ole32.dll","CoFreeUnusedLibraries"),{});co_return finish(0);}
                 if(symbol=="CoInitializeWOW")co_return finish(co_await service_callback::call(entry("ole32.dll","CoInitializeEx"),{0,2}));
                 if(symbol=="OleInitializeWOW")co_return finish(co_await service_callback::call(entry("ole32.dll","OleInitialize"),{0}));
+                if(symbol=="GetConvertStg" || symbol=="SetConvertStg"){
+                    // \1Ole 串流（MS-OLEDS OLEStream）：Version 0x02000001、Flags（轉換位元 0x4）、LinkUpdateOption、Reserved1、ReservedMonikerStreamSize。
+                    // Get：串流不存在或不足 8 位元組時轉換位元視為清除（S_FALSE）。Set：讀出原內容只改 Flags，再以 STGM_CREATE 整份寫回（保留連結物件的其餘欄位）；
+                    // 清除時串流不存在即完成，設定時建立 20 位元組的內嵌物件標頭。
+                    if(!call(0))co_return finish(e_invalidarg);const bool setting=symbol=="SetConvertStg",convert=setting && static_cast<std::uint32_t>(call(1))!=0;
+                    const auto ole_name=temporary.text(u"\x0001" u"Ole");const auto buffer=temporary.allocate(4096);if(!ole_name || !buffer)co_return finish(e_outofmemory);
+                    std::vector<std::uint8_t> data;bool present=false;
+                    m.store(GuestAddress{slot},width,0);auto status=static_cast<std::uint32_t>(co_await service_callback::call(method(call(0),4),{call(0),ole_name,0,setting?0x12U:0x10U,0,slot})); // (READWRITE｜)SHARE_EXCLUSIVE
+                    if(!failed(status)){
+                        present=true;const auto stream=m.load(GuestAddress{slot},width);
+                        for(;;){m.store(GuestAddress{slot+8},32,0);status=static_cast<std::uint32_t>(co_await service_callback::call(method(stream,3),{stream,buffer,4096,slot+8}));
+                            const auto got=static_cast<std::size_t>(m.load(GuestAddress{slot+8},32));if(failed(status) || !got || got>4096)break;
+                            const auto at=data.size();data.resize(at+got);m.read(GuestAddress{buffer},std::span(data).subspan(at));if(got<4096 || data.size()>=(1U<<20))break;}
+                        (void)co_await service_callback::call(method(stream,2),{stream});if(failed(status))co_return finish(status);
+                    }else if(status!=0x80030002U)co_return finish(status); // 只有 STG_E_FILENOTFOUND 視為沒有串流
+                    const auto get=[&](std::size_t at){std::uint32_t value=0;for(unsigned i=0;i<4;++i)value|=std::uint32_t{data[at+i]}<<(i*8);return value;};
+                    const auto put=[&](std::size_t at,std::uint32_t value){for(unsigned i=0;i<4;++i)data[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
+                    const bool valid=present && data.size()>=8;const auto flags=valid?get(4):0U;
+                    if(!setting)co_return finish((flags&4U)?0U:1U);
+                    if(((flags&4U)!=0)==convert && (valid || !convert))co_return finish(0);
+                    if(!valid){data.assign(20,0);put(0,0x02000001U);}put(4,convert?(flags|4U):(flags&~4U));
+                    m.store(GuestAddress{slot},width,0);status=static_cast<std::uint32_t>(co_await service_callback::call(method(call(0),3),{call(0),ole_name,0x1012,0,0,slot})); // CREATE｜SHARE_EXCLUSIVE｜READWRITE
+                    if(failed(status))co_return finish(status);const auto stream=m.load(GuestAddress{slot},width);const auto block=temporary.allocate(data.size());
+                    if(!block){(void)co_await service_callback::call(method(stream,2),{stream});co_return finish(e_outofmemory);}m.write(GuestAddress{block},data);m.store(GuestAddress{slot+8},32,0);
+                    status=static_cast<std::uint32_t>(co_await service_callback::call(method(stream,4),{stream,block,data.size(),slot+8}));(void)co_await service_callback::call(method(stream,2),{stream});
+                    if(failed(status))co_return finish(status);co_return finish(m.load(GuestAddress{slot+8},32)==data.size()?0U:0x80030070U);
+                }
+                if(symbol=="OleDoAutoConvert"){
+                    // (pStg, pClsidNew)：讀出儲存的 CLSID，查 AutoConvertTo（沒有時傳回 OleGetAutoConvert 的錯誤），沿用原剪貼簿格式寫入新類別的完整使用者類型，
+                    // 以 IStorage::SetClass 寫新 CLSID 並設定轉換位元；pClsidNew 輸出新 CLSID。
+                    if(!call(0) || !call(1))co_return finish(e_invalidarg);const auto stat=temporary.allocate(96),old_id=temporary.allocate(16);if(!stat || !old_id)co_return finish(e_outofmemory);
+                    auto status=static_cast<std::uint32_t>(co_await service_callback::call(method(call(0),17),{call(0),stat,1}));if(failed(status))co_return finish(status); // STATFLAG_NONAME
+                    m.move(GuestAddress{old_id},GuestAddress{stat+(x86_?48U:56U)},16);
+                    status=static_cast<std::uint32_t>(co_await service_callback::call(entry("ole32.dll","OleGetAutoConvert"),{old_id,call(1)}));if(failed(status))co_return finish(status);
+                    m.store(GuestAddress{slot},16,0);(void)co_await service_callback::call(entry("ole32.dll","ReadFmtUserTypeStg"),{call(0),slot,0});const auto format=m.load(GuestAddress{slot},16);
+                    m.store(GuestAddress{slot+8},width,0);(void)co_await service_callback::call(entry("ole32.dll","OleRegGetUserType"),{call(1),1,slot+8});const auto user=m.load(GuestAddress{slot+8},width);
+                    status=static_cast<std::uint32_t>(co_await service_callback::call(method(call(0),15),{call(0),call(1)})); // IStorage::SetClass
+                    if(!failed(status))status=static_cast<std::uint32_t>(co_await service_callback::call(entry("ole32.dll","WriteFmtUserTypeStg"),{call(0),format,user}));
+                    if(!failed(status))status=static_cast<std::uint32_t>(co_await service_callback::call(entry("ole32.dll","SetConvertStg"),{call(0),1}));
+                    if(user)(void)co_await service_callback::call(entry("ole32.dll","CoTaskMemFree"),{user});
+                    co_return finish(failed(status)?status:0U);
+                }
                 const auto stream_name=temporary.text(u"\x0001" u"CompObj");if(!stream_name)co_return finish(e_outofmemory);
                 if(symbol=="WriteFmtUserTypeStg"){
                     // CompObj 串流：標頭（0xFFFE0001、版本 0x0A03、0xFFFFFFFF＋類別 CLSID）、ANSI 使用者類型、ANSI 剪貼簿格式、保留字串、

@@ -44,8 +44,9 @@ GraphicsLegacyShader graphics_legacy_shader(std::uint32_t stage,std::span<const 
 // SM5.1 DXBC 與 DXIL：經 vkd3d-shader（SPIR-V）與 SPIRV-Cross 轉為 MSL；入口為 xlatMtlMain。
 // 原始 D3D 簽章的位置與分量遮罩；階段連結不能把轉譯器的 locnN 當成語意名稱。
 struct GraphicsShaderSemantic {std::string semantic;std::uint32_t index{},location{},mask{};};
-struct GraphicsModernShader {std::string source,entry;std::vector<GraphicsBinding> bindings;std::vector<GraphicsInput> inputs;std::vector<GraphicsShaderSemantic> signature_inputs,signature_outputs;std::array<std::uint32_t,3> threads{1,1,1};std::uint32_t buffer_sizes_slot{UINT32_MAX};};
+struct GraphicsModernShader {std::string source,entry;std::vector<GraphicsBinding> bindings;std::vector<GraphicsInput> inputs;std::vector<GraphicsShaderSemantic> signature_inputs,signature_outputs;std::array<std::uint32_t,3> threads{1,1,1};std::uint32_t buffer_sizes_slot{UINT32_MAX};std::uint32_t capture_output_slot{UINT32_MAX};};
 bool graphics_modern_shader_required(std::span<const std::uint8_t> bytes);
+GraphicsModernShader graphics_modern_point_capture(std::span<const std::uint8_t> bytes);
 GraphicsModernShader graphics_modern_shader(std::uint32_t stage,std::span<const std::uint8_t> bytes);
 struct GraphicsShader:GraphicsObject {
     std::vector<GraphicsStreamElement> stream_output;

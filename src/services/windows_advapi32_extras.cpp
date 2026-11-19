@@ -9,6 +9,7 @@ std::span<const WindowsServiceDescriptor> advapi32_extra_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"advapi32.dll","RegCopyTreeW",3},{"advapi32.dll","RegCopyTreeA",3},
         {"advapi32.dll","RegLoadMUIStringW",7,0,0,0x28},{"advapi32.dll","RegLoadMUIStringA",7,0,0,0x28},
+        {"internal-shell-resource","SHLoadRegUIStringA",4,0,0,0x8},{"internal-shell-resource","SHLoadRegUIStringW",4,0,0,0x8},
         {"shlwapi.dll","SHLoadIndirectString",4,0,0,0x4},
         // shlwapi 的 SH* 登錄輔助：以 advapi32 的對應操作組合。
         {"shlwapi.dll","SHQueryInfoKeyA",5},{"shlwapi.dll","SHQueryInfoKeyW",5},{"shlwapi.dll","SHEnumKeyExA",4,0,0,0x2},{"shlwapi.dll","SHEnumKeyExW",4,0,0,0x2},
@@ -32,7 +33,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_advapi32_extra(GuestState& 
     const auto indirect=[&](std::u16string text,std::u16string& result)->std::uint32_t{
         if(text.empty() || text.front()!=u'@'){result=std::move(text);return 0;}
         text.erase(0,1);if(const auto comment=text.find(u';');comment!=text.npos)text.resize(comment);
-        const auto comma=text.rfind(u',');if(comma==text.npos || comma+2>text.size() || text[comma+1]!=u'-')return 87;
+        const auto comma=text.rfind(u',');if(comma==text.npos || comma+2>=text.size() || text[comma+1]!=u'-')return 87;
         std::uint32_t id=0;for(std::size_t i=comma+2;i<text.size();++i){if(text[i]<u'0' || text[i]>u'9')return 87;id=id*10+static_cast<std::uint32_t>(text[i]-u'0');if(id>65535)return 87;}
         auto path=text.substr(0,comma);
         const auto source=wide_copy(path),expanded=allocate(32768*2);
@@ -180,6 +181,40 @@ std::optional<std::uint32_t> WindowsServices::invoke_advapi32_extra(GuestState& 
                 return done(reg("RegSetKeyValueA",{arg(0),arg(1),arg(2),type,ansi,narrow.size()+1}));
             }
         }
+        if(name.starts_with("SHLoadRegUIString")){
+            const bool wide=name.ends_with('W');
+            const auto capacity=static_cast<std::uint32_t>(arg(3));
+            if(!arg(2) || !capacity || (wide && capacity>UINT32_MAX/2))return done(0x80004005U);
+            const auto bytes=allocate(4);
+            memory.store(GuestAddress{bytes},32,capacity*(wide?2U:1U));
+            if(reg(wide?"RegQueryValueExW":"RegQueryValueExA",{arg(0),arg(1),0,0,arg(2),bytes}))
+                return done(0x80004005U);
+            const auto count=static_cast<std::uint32_t>(memory.load(GuestAddress{bytes},32));
+            std::u16string source;
+            if(wide)source=read_utf16_counted(memory,GuestAddress{arg(2)},count/2);
+            else{
+                std::string raw(count,'\0');
+                memory.read(GuestAddress{arg(2)},std::span(reinterpret_cast<std::uint8_t*>(raw.data()),raw.size()));
+                source=utf8_to_utf16_lossy(raw);
+            }
+            if(const auto end=source.find(u'\0');end!=source.npos)source.resize(end);
+            std::u16string value;
+            if(const auto error=indirect(std::move(source),value))return done(0x80070000U|(error&0xffffU));
+            if(wide){
+                if(value.size()>=capacity)value.resize(capacity-1);
+                memory.write(GuestAddress{arg(2)},utf16_bytes(value));
+            }else{
+                auto text=utf16_to_utf8(value);
+                if(text.size()>=capacity){
+                    std::size_t end=capacity-1;
+                    while(end && (static_cast<unsigned char>(text[end])&0xc0)==0x80)--end;
+                    text.resize(end);
+                }
+                memory.write(GuestAddress{arg(2)},std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(text.c_str()),text.size()+1));
+            }
+            return done(0);
+        }
         if(name.starts_with("SH") && name!="SHLoadIndirectString"){
             // A／W 版直接交給 advapi32 的同類 A／W 函式，字串不另轉碼。
             const char suffix=name.back()=='A'?'A':'W';
@@ -296,8 +331,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_advapi32_extra(GuestState& 
             const auto capacity=static_cast<std::uint32_t>(arg(2));if(result.size()>=capacity)result.resize(capacity-1);
             memory.write(GuestAddress{arg(1)},utf16_bytes(result));return done(0);
         }
-    }catch(const MemoryFault&){return done(name=="SHLoadIndirectString"?0x800703e6U:998U);}
-    catch(const std::bad_alloc&){return done(name=="SHLoadIndirectString"?0x8007000eU:8U);}
+    }catch(const MemoryFault&){return done(name.starts_with("SHLoad")?0x800703e6U:998U);}
+    catch(const std::bad_alloc&){return done(name.starts_with("SHLoad")?0x8007000eU:8U);}
     (void)unit;
     throw HostCallFault("未知的 advapi32 補充服務");
 }

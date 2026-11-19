@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "cng_algorithms.hpp"
 #include "cng_asymmetric.hpp"
 #include "x64arm/unicode.hpp"
 #include "crypto_text.hpp"
@@ -8,6 +9,9 @@
 #include <cstdlib>
 #include <random>
 #include "crypto_kdf.hpp"
+#include "message_digest.hpp"
+#include <array>
+#include <span>
 namespace x64arm {
 namespace {
 struct HashInfo {std::string_view name;unsigned digest,block;};
@@ -21,6 +25,7 @@ constexpr std::uint32_t invalid_parameter=0xc000000dU, invalid_handle=0xc0000008
 constexpr std::uint64_t rng_algorithm_handle=0x81U;
 constexpr unsigned object_length=256;
 }
+#include "windows_system_function.inc"
 std::span<const WindowsServiceDescriptor> crypto_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
         {"crypt32.dll","CryptHashCertificate",7},{"crypt32.dll","CryptHashCertificate2",7},
@@ -28,6 +33,11 @@ std::span<const WindowsServiceDescriptor> crypto_service_descriptors() {
         {"crypt32.dll","CryptStringToBinaryA",7},{"crypt32.dll","CryptStringToBinaryW",7},
         {"advapi32.dll","CryptAcquireContextA",5},{"advapi32.dll","CryptAcquireContextW",5},
         {"advapi32.dll","CryptReleaseContext",2},{"advapi32.dll","CryptGenRandom",3},{"advapi32.dll","SystemFunction036",2},
+        // LSA／NTLM 的 DES、MD4、RC4 輔助函式（windows_system_function.inc）；035 為 CheckSignatureInFile。
+        {"advapi32.dll","SystemFunction001",3},{"advapi32.dll","SystemFunction002",3},{"advapi32.dll","SystemFunction003",2},{"advapi32.dll","SystemFunction004",3},{"advapi32.dll","SystemFunction005",3},{"advapi32.dll","SystemFunction006",2},{"advapi32.dll","SystemFunction007",2},{"advapi32.dll","SystemFunction008",3},
+        {"advapi32.dll","SystemFunction009",3},{"advapi32.dll","SystemFunction010",3},{"advapi32.dll","SystemFunction011",3},{"advapi32.dll","SystemFunction012",3},{"advapi32.dll","SystemFunction013",3},{"advapi32.dll","SystemFunction014",3},{"advapi32.dll","SystemFunction015",3},{"advapi32.dll","SystemFunction016",3},
+        {"advapi32.dll","SystemFunction017",3},{"advapi32.dll","SystemFunction018",3},{"advapi32.dll","SystemFunction019",3},{"advapi32.dll","SystemFunction020",3},{"advapi32.dll","SystemFunction021",3},{"advapi32.dll","SystemFunction022",3},{"advapi32.dll","SystemFunction023",3},{"advapi32.dll","SystemFunction024",3},
+        {"advapi32.dll","SystemFunction025",3},{"advapi32.dll","SystemFunction026",3},{"advapi32.dll","SystemFunction027",3},{"advapi32.dll","SystemFunction030",2},{"advapi32.dll","SystemFunction031",2},{"advapi32.dll","SystemFunction032",2},{"advapi32.dll","SystemFunction035",1},
         {"advapi32.dll","CryptCreateHash",5},{"advapi32.dll","CryptHashData",4},{"advapi32.dll","CryptDeriveKey",5},{"advapi32.dll","CryptHashSessionKey",3},
         {"advapi32.dll","CryptGetDefaultProviderA",5},{"advapi32.dll","CryptGetDefaultProviderW",5},{"advapi32.dll","CryptSetProviderA",2},{"advapi32.dll","CryptSetProviderW",2},
         {"advapi32.dll","CryptSetProviderExA",4},{"advapi32.dll","CryptSetProviderExW",4},
@@ -58,13 +68,16 @@ std::span<const WindowsServiceDescriptor> crypto_service_descriptors() {
         {"bcrypt.dll","BCryptDestroySecret",1},{"bcrypt.dll","BCryptEncrypt",10},
         {"bcrypt.dll","BCryptDecrypt",10},{"bcrypt.dll","BCryptVerifySignature",7},{"bcrypt.dll","BCryptSignHash",8},
         {"bcrypt.dll","BCryptHash",7},{"bcrypt.dll","BCryptDuplicateKey",5},{"bcrypt.dll","BCryptEnumAlgorithms",4},{"bcrypt.dll","BCryptFreeBuffer",1},
+        // CNG 設定（windows_cng_configuration.cpp）；ncrypt 的同名匯出經服務解析轉到 bcrypt。
+        {"bcrypt.dll","BCryptEnumContextFunctions",5},{"bcrypt.dll","BCryptAddContextFunction",5},{"bcrypt.dll","BCryptRemoveContextFunction",4},
+        {"bcrypt.dll","BCryptAddContextFunctionProvider",6},{"bcrypt.dll","BCryptRemoveContextFunctionProvider",5},{"bcrypt.dll","BCryptRegisterProvider",3},{"bcrypt.dll","BCryptUnregisterProvider",1},
         {"bcrypt.dll","BCryptGetFipsAlgorithmMode",1},{"bcrypt.dll","BCryptDeriveKeyCapi",5},{"bcrypt.dll","BCryptKeyDerivation",6},
         {"ncrypt.dll","NCryptOpenStorageProvider",3},{"ncrypt.dll","NCryptFreeObject",1},
         {"ncrypt.dll","NCryptCreatePersistedKey",6},{"ncrypt.dll","NCryptFinalizeKey",2},
         {"ncrypt.dll","NCryptOpenKey",5},{"ncrypt.dll","NCryptDeleteKey",2},
         {"ncrypt.dll","NCryptImportKey",8},{"ncrypt.dll","NCryptExportKey",8},
         {"ncrypt.dll","NCryptSetProperty",5},{"ncrypt.dll","NCryptGetProperty",6},
-        {"ncrypt.dll","NCryptIsKeyHandle",1},{"ncrypt.dll","NCryptIsAlgSupported",3},
+        {"ncrypt.dll","NCryptIsKeyHandle",1},{"ncrypt.dll","NCryptIsAlgSupported",3},{"ncrypt.dll","NCryptEnumAlgorithms",5,0,0,0x12},{"ncrypt.dll","NCryptEnumKeys",5,0,0,0x10},{"ncrypt.dll","NCryptFreeBuffer",1},
         {"ncrypt.dll","NCryptSignHash",8},{"ncrypt.dll","NCryptVerifySignature",7},
         {"ncrypt.dll","NCryptEncrypt",8},{"ncrypt.dll","NCryptDecrypt",8},
         {"imagehlp.dll","ImageAddCertificate",3},{"imagehlp.dll","ImageEnumerateCertificates",5},
@@ -118,6 +131,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_crypto(GuestState& state,Gu
         std::vector<std::uint8_t> bytes(count);memory.read(GuestAddress{pointer},bytes);return bytes;
     };
     if(symbol.starts_with("CryptSIP"))return invoke_sip(state,memory,service);
+    if(symbol.starts_with("SystemFunction0") && symbol!="SystemFunction036"){
+        if(symbol=="SystemFunction035"){
+            // CheckSignatureInFile：早期 Windows 檢查 CSP DLL 內嵌的簽章資源，現代 Windows 已不要求 CSP 簽章。
+            // 這裡確認路徑可讀且為 PE 映像（MZ 標頭與 PE 簽名）才回傳 TRUE，否則 FALSE 並設定錯誤碼。
+            std::uint32_t result=0;
+            if(!arg(0))last_error_=87;
+            else{
+                if(!runtime_.network.external_io)throw HostCallFault("compare 不允許 CheckSignatureInFile 檔案 I/O");
+                const auto opened=filesystem_.open_reader(read_ansi(memory,arg(0),32767));
+                if(opened.error)last_error_=opened.error;
+                else if(!opened.file || (opened.metadata.attributes&0x10))last_error_=5;
+                else{
+                    std::array<std::uint8_t,1024> header{};const auto read=opened.file->read(header,0);
+                    const auto word=[&](std::size_t at){return std::uint32_t{header[at]}|(std::uint32_t{header[at+1]}<<8)|(std::uint32_t{header[at+2]}<<16)|(std::uint32_t{header[at+3]}<<24);};
+                    const auto offset=read.error || read.bytes<64?0U:word(60);
+                    if(read.error)last_error_=read.error;
+                    else if(read.bytes<64 || header[0]!='M' || header[1]!='Z' || offset<64 || offset+4>read.bytes || word(offset)!=0x00004550U)last_error_=193;
+                    else{result=1;last_error_=0;}
+                }
+            }
+            arg.return_to(state,result);return std::nullopt;
+        }
+        arg.return_to(state,system_function_call(memory,arg,symbol,x86_));return std::nullopt;
+    }
     if(service.family=="wintrust.dll"){
         const auto result=trust_call(state,memory,arg,symbol);
         // 獨立的唯讀診斷不關閉常駐服務，也不改變驗證結果或信任來源。
@@ -145,6 +182,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crypto(GuestState& state,Gu
         arg.return_to(state,result);return std::nullopt;
     }
     if(service.family=="imagehlp.dll")status=image_certificate_call(memory,arg,symbol);
+    else if(symbol.find("ContextFunction")!=std::string_view::npos || symbol=="BCryptRegisterProvider" || symbol=="BCryptUnregisterProvider")status=cng_configuration_call(state,memory,arg,symbol);
     else if(symbol.starts_with("CryptBinaryToString") || symbol.starts_with("CryptStringToBinary")){
         const bool encoding=symbol.starts_with("CryptBinaryToString"),unicode=symbol.ends_with("W");
         try {
@@ -238,6 +276,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crypto(GuestState& state,Gu
         if (!arg(0) || flags_value&~0x28U) status=invalid_parameter;
         else if (flags_value && !hash_info(name)) status=invalid_parameter;
         else if ((arg(2) && wide(2)!="Microsoft Primitive Provider") || (!hash_info(name) && name!="RNG" && name!="AES" && !cng::supported(name) && name!="DH" && !crypto_kdf::supported(name))) status=0xc0000225U;
+        else if (!cng_function_enabled(utf8_to_utf16(name))) status=0xc0000225U; // Default 內容已移除此演算法
         else if (runtime_.crypto_algorithms.size()>=1024) status=0xc0000017U;
         else {
             memory.check(GuestAddress{arg(0)},x86_?4:8,Access::Write);
@@ -316,9 +355,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crypto(GuestState& state,Gu
         }
     } else if (symbol=="BCryptEnumAlgorithms") {
         // (dwAlgOperations, pAlgCount, ppAlgList, dwFlags)：BCRYPT_ALGORITHM_IDENTIFIER 陣列與名稱放在同一塊程序堆積，以 BCryptFreeBuffer 釋放。
-        struct Entry {const char16_t* name;std::uint32_t kind;};
-        static constexpr Entry entries[]{{u"AES",1},{u"MD5",2},{u"SHA1",2},{u"SHA256",2},{u"SHA384",2},{u"SHA512",2},{u"RSA",3},{u"DH",4},{u"ECDH_P256",4},{u"ECDH_P384",4},{u"ECDH_P521",4},
-            {u"RSA_SIGN",5},{u"ECDSA_P256",5},{u"ECDSA_P384",5},{u"ECDSA_P521",5},{u"RNG",6},{u"PBKDF2",7},{u"SP800_108_CTR_HMAC",7},{u"SP800_56A_CONCAT",7},{u"CAPI_KDF",7}};
+        using Entry=cng_catalog::Algorithm;const auto& entries=cng_catalog::algorithms;
         const auto operations=u32(0);
         if (operations&~0x7fU || u32(3) || !arg(1) || !arg(2)) status=invalid_parameter;
         else {

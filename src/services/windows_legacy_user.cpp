@@ -1,9 +1,11 @@
+#include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/windows_region.hpp"
 #include "x64arm/windows_transform.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_version.hpp"
+#include <cmath>
 #include <algorithm>
 #include <bit>
 #include <arpa/inet.h>
@@ -24,11 +26,13 @@ std::span<const WindowsServiceDescriptor> legacy_user_service_descriptors(){
         {"comdlg32.dll","GetFileTitleA",3},{"comdlg32.dll","GetFileTitleW",3},
         {"shell32.dll","InitNetworkAddressControl",0},{"iphlpapi.dll","ParseNetworkString",5},{"internal-netaddress","WindowProc",4},
         {"ole32.dll","IsAccelerator",4},{"ole32.dll","OleTranslateAccelerator",3},{"ole32.dll","OleCreateMenuDescriptor",2},{"ole32.dll","OleDestroyMenuDescriptor",1},
+        {"ole32.dll","OleSetMenuDescriptor",5},{"ole32.dll","OleMetafilePictFromIconAndLabel",4},{"ole32.dll","OleGetIconOfFile",2},{"ole32.dll","OleGetIconOfClass",3},{"internal-ole-menu","SubclassProc",6},
         {"ole32.dll","CoLockObjectExternal",3},
         {"comctl32.dll","DllGetVersion",1},{"shlwapi.dll","DllGetVersion",1},
         {"uxtheme.dll","BufferedPaintInit",0},{"uxtheme.dll","BufferedPaintUnInit",0},{"uxtheme.dll","BeginBufferedPaint",5},{"uxtheme.dll","EndBufferedPaint",2},
         {"uxtheme.dll","GetBufferedPaintBits",3},{"uxtheme.dll","GetBufferedPaintDC",1},{"uxtheme.dll","GetBufferedPaintTargetDC",1},{"uxtheme.dll","GetBufferedPaintTargetRect",2},
         {"uxtheme.dll","BufferedPaintClear",2},{"uxtheme.dll","BufferedPaintSetAlpha",3},
+        {"uxtheme.dll","BeginBufferedAnimation",8},{"uxtheme.dll","EndBufferedAnimation",2},{"uxtheme.dll","BufferedPaintRenderAnimation",2},{"uxtheme.dll","BufferedPaintStopAllAnimations",1},
         {"uxtheme.dll","DrawThemeParentBackground",3},{"uxtheme.dll","DrawThemeParentBackgroundEx",4}
     };return table;
 }
@@ -96,6 +100,7 @@ void store_network_address(GuestMemory& memory,std::uint64_t at,const NetworkStr
 }
 std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
+#include "ole_icon_metafile.inc"
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     const auto fail=[&](std::uint32_t error){last_error_=error;return finish(0);};
     const auto integer=[&](unsigned i){return static_cast<std::int32_t>(arg(i));};
@@ -171,16 +176,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& sta
         }
         if(name=="BufferedPaintInit"){++gui_.buffered_paint_inits;return finish(0);}
         if(name=="BufferedPaintUnInit"){if(gui_.buffered_paint_inits)--gui_.buffered_paint_inits;return finish(0);}
-        if(name=="BeginBufferedPaint"){
-            const auto target=arg(0);if(!target || !arg(1) || !arg(4))return finish(0);
-            const auto rect=normalized(read_rect(arg(1)));const auto format=static_cast<std::uint32_t>(arg(2));
-            const auto width=rect[2]-rect[0],height=rect[3]-rect[1];if(width<=0 || height<=0 || format>3)return fail(87);
+        // 緩衝繪製與緩衝動畫共用：建立承接繪製的記憶體 DC（目標座標）、寫回目標 DC、釋放。
+        const auto make_buffer=[&](std::uint64_t target,const GuiRect& rect,std::uint32_t format,std::uint64_t params)->std::optional<GuiState::BufferedPaint>{
+            const auto width=rect[2]-rect[0],height=rect[3]-rect[1];
             GuiState::BufferedPaint paint;paint.target=target;paint.rect=rect;paint.format=format;
-            if(arg(3)){const auto flags=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(3)+4},32));
-                if(const auto exclude=memory.load(GuestAddress{arg(3)+8},static_cast<std::uint8_t>(unit*8))){paint.exclude=normalized(read_rect(exclude));paint.excluded=true;}
-                if(const auto blend=memory.load(GuestAddress{arg(3)+8+unit},static_cast<std::uint8_t>(unit*8))){paint.blend=static_cast<std::uint32_t>(memory.load(GuestAddress{blend},32));paint.blended=true;}
+            if(params){const auto flags=static_cast<std::uint32_t>(memory.load(GuestAddress{params+4},32));
+                if(const auto exclude=memory.load(GuestAddress{params+8},static_cast<std::uint8_t>(unit*8))){paint.exclude=normalized(read_rect(exclude));paint.excluded=true;}
+                if(const auto blend=memory.load(GuestAddress{params+8+unit},static_cast<std::uint8_t>(unit*8))){paint.blend=static_cast<std::uint32_t>(memory.load(GuestAddress{blend},32));paint.blended=true;}
                 paint.excluded=paint.excluded && !(flags&2U);if(flags&1U)paint.format|=0x100U;}
-            paint.dc=nested_service(state,memory,"gdi32.dll","CreateCompatibleDC",{target});if(!paint.dc)return finish(0);
+            paint.dc=nested_service(state,memory,"gdi32.dll","CreateCompatibleDC",{target});if(!paint.dc)return std::nullopt;
             if((format&255U)==0)paint.bitmap=nested_service(state,memory,"gdi32.dll","CreateCompatibleBitmap",{target,static_cast<std::uint32_t>(width),static_cast<std::uint32_t>(height)});
             else {
                 const bool mono=format==3;const auto info=temporary(48+8+8);memory.store(GuestAddress{info},32,40);memory.store(GuestAddress{info+4},32,static_cast<std::uint32_t>(width));
@@ -188,13 +192,94 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& sta
                 if(mono)memory.store(GuestAddress{info+44},32,0xffffff);
                 paint.bitmap=nested_service(state,memory,"gdi32.dll","CreateDIBSection",{paint.dc,info,0,info+56,0,0});paint.bits=memory.load(GuestAddress{info+56},static_cast<std::uint8_t>(unit*8));
             }
-            if(!paint.bitmap){(void)nested_service(state,memory,"gdi32.dll","DeleteDC",{paint.dc});return finish(0);}
+            if(!paint.bitmap){(void)nested_service(state,memory,"gdi32.dll","DeleteDC",{paint.dc});return std::nullopt;}
             paint.previous=nested_service(state,memory,"gdi32.dll","SelectObject",{paint.dc,paint.bitmap});
             // 緩衝 DC 使用目標座標：視埠原點平移，使 rect 左上角對應緩衝的 (0,0)。
             (void)nested_service(state,memory,"gdi32.dll","SetViewportOrgEx",{paint.dc,static_cast<std::uint32_t>(-rect[0]),static_cast<std::uint32_t>(-rect[1]),0});
             if(paint.format&0x100U)(void)nested_service(state,memory,"gdi32.dll","PatBlt",{paint.dc,static_cast<std::uint32_t>(rect[0]),static_cast<std::uint32_t>(rect[1]),static_cast<std::uint32_t>(width),static_cast<std::uint32_t>(height),0x42});
-            paint.format&=255U;const auto handle=gui_.next_object++;gui_.buffered_paints.emplace(handle,paint);
-            memory.store(GuestAddress{arg(4)},static_cast<std::uint8_t>(unit*8),paint.dc);return finish(handle);
+            paint.format&=255U;return paint;
+        };
+        // alpha 為 0～255 的整體不透明度（緩衝動畫混合用）；沒有指定時依 BP_PAINTPARAMS 的 BLENDFUNCTION 或 SRCCOPY。
+        const auto present_buffer=[&](const GuiState::BufferedPaint& paint,std::uint64_t target,std::optional<std::uint32_t> alpha){
+            const auto width=paint.rect[2]-paint.rect[0],height=paint.rect[3]-paint.rect[1];
+            (void)nested_service(state,memory,"gdi32.dll","SetViewportOrgEx",{paint.dc,0,0,0});
+            if(paint.excluded){(void)nested_service(state,memory,"gdi32.dll","SaveDC",{target});(void)nested_service(state,memory,"gdi32.dll","ExcludeClipRect",{target,static_cast<std::uint32_t>(paint.exclude[0]),static_cast<std::uint32_t>(paint.exclude[1]),static_cast<std::uint32_t>(paint.exclude[2]),static_cast<std::uint32_t>(paint.exclude[3])});}
+            const std::uint64_t x=static_cast<std::uint32_t>(paint.rect[0]),y=static_cast<std::uint32_t>(paint.rect[1]),w=static_cast<std::uint32_t>(width),h=static_cast<std::uint32_t>(height);
+            if(alpha)(void)nested_service(state,memory,"msimg32.dll","AlphaBlend",{target,x,y,w,h,paint.dc,0,0,w,h,(*alpha&255U)<<16});
+            else if(paint.blended)(void)nested_service(state,memory,"msimg32.dll","AlphaBlend",{target,x,y,w,h,paint.dc,0,0,w,h,paint.blend});
+            else (void)nested_service(state,memory,"gdi32.dll","BitBlt",{target,x,y,w,h,paint.dc,0,0,0x00cc0020U});
+            if(paint.excluded)(void)nested_service(state,memory,"gdi32.dll","RestoreDC",{target,UINT32_MAX});
+            (void)nested_service(state,memory,"gdi32.dll","SetViewportOrgEx",{paint.dc,static_cast<std::uint32_t>(-paint.rect[0]),static_cast<std::uint32_t>(-paint.rect[1]),0});
+        };
+        const auto destroy_buffer=[&](const GuiState::BufferedPaint& paint){
+            (void)nested_service(state,memory,"gdi32.dll","SelectObject",{paint.dc,paint.previous});(void)nested_service(state,memory,"gdi32.dll","DeleteObject",{paint.bitmap});(void)nested_service(state,memory,"gdi32.dll","DeleteDC",{paint.dc});
+        };
+        if(name=="BeginBufferedPaint"){
+            const auto target=arg(0);if(!target || !arg(1) || !arg(4))return finish(0);
+            const auto rect=normalized(read_rect(arg(1)));const auto format=static_cast<std::uint32_t>(arg(2));
+            const auto width=rect[2]-rect[0],height=rect[3]-rect[1];if(width<=0 || height<=0 || format>3)return fail(87);
+            const auto paint=make_buffer(target,rect,format,arg(3));if(!paint)return finish(0);
+            const auto handle=gui_.next_object++;gui_.buffered_paints.emplace(handle,*paint);
+            memory.store(GuestAddress{arg(4)},static_cast<std::uint8_t>(unit*8),paint->dc);return finish(handle);
+        }
+        // 緩衝動畫：BeginBufferedAnimation 建立起點／終點兩個緩衝；EndBufferedAnimation 先把起點畫到目標並開始計時（GetTickCount 同一時鐘），
+        // 之後視窗的 WM_PAINT 呼叫 BufferedPaintRenderAnimation 依經過時間混合兩者，並使目標矩形失效以繪製下一格；時間到時畫出終點並結束。
+        const auto invalidate=[&](const GuiState::BufferedAnimation& animation){
+            if(!gui_.windows.contains(animation.window))return;const auto rect=temporary(16);write_rect(rect,animation.to.rect);
+            (void)nested_service(state,memory,"user32.dll","InvalidateRect",{animation.window,rect,0});
+        };
+        const auto end_animation=[&](std::map<std::uint64_t,GuiState::BufferedAnimation>::iterator found){
+            destroy_buffer(found->second.to);if(found->second.has_from)destroy_buffer(found->second.from);return gui_.buffered_animations.erase(found);
+        };
+        if(name=="BeginBufferedAnimation"){
+            // (hwnd, hdcTarget, rcTarget, dwFormat, pPaintParams, pAnimationParams, phdcFrom, phdcTo)：BP_ANIMATIONPARAMS 為 cbSize、dwFlags、style、dwDuration。
+            // 時間為 0 或 BPAS_NONE 時只有終點緩衝（*phdcFrom 為 NULL）；同一視窗已在進行的動畫先停止。已銷毀視窗的動畫一併回收。
+            for(auto it=gui_.buffered_animations.begin();it!=gui_.buffered_animations.end();){
+                if(it->second.running && (it->second.window==arg(0) || !gui_.windows.contains(it->second.window)))it=end_animation(it);else ++it;
+            }
+            const auto window=arg(0),target=arg(1);
+            if(!gui_.windows.contains(window))return fail(1400);
+            if(!target || !arg(2) || !arg(5) || !arg(7) || memory.load(GuestAddress{arg(5)},32)!=16)return fail(87);
+            const auto style=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(5)+8},32)),duration=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(5)+12},32));
+            const auto rect=normalized(read_rect(arg(2)));const auto format=static_cast<std::uint32_t>(arg(3));
+            if(rect[2]-rect[0]<=0 || rect[3]-rect[1]<=0 || format>3 || style>3)return fail(87);
+            GuiState::BufferedAnimation animation;animation.window=window;animation.target=target;animation.style=style;animation.duration=duration;animation.has_from=duration && style;
+            const auto to=make_buffer(target,rect,format,arg(4));if(!to)return finish(0);animation.to=*to;
+            if(animation.has_from){const auto from=make_buffer(target,rect,format,arg(4));if(!from){destroy_buffer(*to);return finish(0);}animation.from=*from;}
+            if(arg(6)){memory.check(GuestAddress{arg(6)},unit,Access::Write);memory.store(GuestAddress{arg(6)},static_cast<std::uint8_t>(unit*8),animation.has_from?animation.from.dc:0);}
+            memory.check(GuestAddress{arg(7)},unit,Access::Write);memory.store(GuestAddress{arg(7)},static_cast<std::uint8_t>(unit*8),animation.to.dc);
+            const auto handle=gui_.next_object++;gui_.buffered_animations.emplace(handle,animation);return finish(handle);
+        }
+        if(name=="EndBufferedAnimation"){
+            // (hbpAnimation, fUpdateTarget)：不更新目標時直接釋放；沒有起點緩衝時立即畫出終點。
+            const auto found=gui_.buffered_animations.find(arg(0));if(found==gui_.buffered_animations.end() || found->second.running)return finish(0x80070057U);
+            auto& animation=found->second;
+            if(!static_cast<std::uint32_t>(arg(1)) || !animation.has_from){if(static_cast<std::uint32_t>(arg(1)))present_buffer(animation.to,animation.target,std::nullopt);(void)end_animation(found);return finish(0);}
+            present_buffer(animation.from,animation.target,std::nullopt);animation.running=true;animation.started=runtime_.clock_ticks/10000;invalidate(animation);
+            return finish(0);
+        }
+        if(name=="BufferedPaintRenderAnimation"){
+            // (hwnd, hdcTarget)：視窗有進行中的動畫時畫出目前畫面並回 TRUE；BPAS_LINEAR 線性、BPAS_CUBIC 為 3t²−2t³、BPAS_SINE 為 sin(t·π/2)。
+            const auto window=arg(0),target=arg(1);bool painted=false;
+            if(!target)return finish(0);
+            for(auto it=gui_.buffered_animations.begin();it!=gui_.buffered_animations.end();){
+                auto& animation=it->second;if(animation.window!=window || !animation.running){++it;continue;}
+                const auto elapsed=runtime_.clock_ticks/10000-animation.started;painted=true;
+                if(elapsed>=animation.duration){present_buffer(animation.to,target,std::nullopt);it=end_animation(it);continue;}
+                const double t=static_cast<double>(elapsed)/animation.duration;
+                const double eased=animation.style==2?t*t*(3-2*t):animation.style==3?std::sin(t*1.5707963267948966):t;
+                present_buffer(animation.from,target,std::nullopt);present_buffer(animation.to,target,static_cast<std::uint32_t>(std::lround(std::clamp(eased,0.0,1.0)*255)));
+                invalidate(animation);++it;
+            }
+            return finish(painted?1U:0U);
+        }
+        if(name=="BufferedPaintStopAllAnimations"){
+            // 停止視窗所有進行中的動畫並使其矩形失效，讓視窗重繪最終狀態；尚未 EndBufferedAnimation 的 handle 仍由呼叫者結束。
+            if(!gui_.windows.contains(arg(0)))return finish(0x80070578U);
+            for(auto it=gui_.buffered_animations.begin();it!=gui_.buffered_animations.end();){
+                if(it->second.window==arg(0) && it->second.running){invalidate(it->second);it=end_animation(it);}else ++it;
+            }
+            return finish(0);
         }
         if(name=="EndBufferedPaint" || name=="GetBufferedPaintBits" || name=="GetBufferedPaintDC" || name=="GetBufferedPaintTargetDC" || name=="GetBufferedPaintTargetRect" || name=="BufferedPaintClear" || name=="BufferedPaintSetAlpha"){
             const auto found=gui_.buffered_paints.find(arg(0));
@@ -217,16 +302,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_legacy_user(GuestState& sta
                 for(auto y=r[1];y<r[3];++y)for(auto x=r[0];x<r[2];++x){const auto row=paint.format==1?height-1-(y-paint.rect[1]):y-paint.rect[1];memory.store(GuestAddress{paint.bits+(static_cast<std::uint64_t>(row)*static_cast<std::uint64_t>(width)+static_cast<std::uint64_t>(x-paint.rect[0]))*4+3},8,alpha);}
                 import_dib_bitmap(memory,paint.bitmap);rasters_.erase(paint.bitmap);return finish(0);
             }
-            if(arg(1)){
-                (void)nested_service(state,memory,"gdi32.dll","SetViewportOrgEx",{paint.dc,0,0,0});
-                if(paint.excluded){(void)nested_service(state,memory,"gdi32.dll","SaveDC",{paint.target});(void)nested_service(state,memory,"gdi32.dll","ExcludeClipRect",{paint.target,static_cast<std::uint32_t>(paint.exclude[0]),static_cast<std::uint32_t>(paint.exclude[1]),static_cast<std::uint32_t>(paint.exclude[2]),static_cast<std::uint32_t>(paint.exclude[3])});}
-                const std::uint64_t x=static_cast<std::uint32_t>(paint.rect[0]),y=static_cast<std::uint32_t>(paint.rect[1]),w=static_cast<std::uint32_t>(width),h=static_cast<std::uint32_t>(height);
-                if(paint.blended)(void)nested_service(state,memory,"msimg32.dll","AlphaBlend",{paint.target,x,y,w,h,paint.dc,0,0,w,h,paint.blend});
-                else (void)nested_service(state,memory,"gdi32.dll","BitBlt",{paint.target,x,y,w,h,paint.dc,0,0,0x00cc0020U});
-                if(paint.excluded)(void)nested_service(state,memory,"gdi32.dll","RestoreDC",{paint.target,UINT32_MAX});
-            }
-            (void)nested_service(state,memory,"gdi32.dll","SelectObject",{paint.dc,paint.previous});(void)nested_service(state,memory,"gdi32.dll","DeleteObject",{paint.bitmap});(void)nested_service(state,memory,"gdi32.dll","DeleteDC",{paint.dc});
-            gui_.buffered_paints.erase(found);return finish(0);
+            if(arg(1))present_buffer(paint,paint.target,std::nullopt);
+            destroy_buffer(paint);gui_.buffered_paints.erase(found);return finish(0);
         }
         if(name=="DrawThemeParentBackground" || name=="DrawThemeParentBackgroundEx"){
             // 以父視窗座標重繪子視窗背景：平移視埠後依序送 WM_ERASEBKGND 與 WM_PRINTCLIENT，最後還原 DC。

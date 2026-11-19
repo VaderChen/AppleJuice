@@ -36,6 +36,14 @@ bool registry_dependent_service(const WindowsServiceDescriptor& service) {
 
     const bool kernel=family=="kernel32.dll" || family=="kernelbase.dll";
     if(kernel) {
+        // NLS 的使用者覆寫共用 HKCU\Control Panel\International；讀取與寫入
+        // 都必須等目前交易發布，不能借用另一個客體保留中的 RegistryIoScope。
+        if(one_of(name,{"GetLocaleInfoA","GetLocaleInfoW","GetLocaleInfoEx","SetLocaleInfoA","SetLocaleInfoW",
+            "GetCalendarInfoA","GetCalendarInfoW","GetCalendarInfoEx",
+            "GetNumberFormatA","GetNumberFormatW","GetNumberFormatEx",
+            "GetCurrencyFormatA","GetCurrencyFormatW","GetCurrencyFormatEx",
+            "GetDateFormatA","GetDateFormatW","GetDateFormatEx",
+            "GetTimeFormatA","GetTimeFormatW","GetTimeFormatEx"}))return true;
         // pending 交易保留 C++ 呼叫堆疊；其間不可銷毀、暫停或改寫該堆疊所屬
         // 執行緒，也不可讓整份 RegistryState 回滾覆蓋其他呼叫的 handle 變動。
         if(one_of(name,{"ExitProcess","TerminateProcess","ExitThread","TerminateThread",
@@ -90,18 +98,20 @@ bool registry_dependent_service(const WindowsServiceDescriptor& service) {
 
     if((family=="ole32.dll" || family=="combase.dll") && one_of(name,{"CoCreateInstance","CoCreateInstanceEx","CoGetClassObject",
         "ProgIDFromCLSID","CLSIDFromProgID","CLSIDFromString","RoGetActivationFactory","RoActivateInstance"}))return true;
+    if(family=="internal-shell-guid" && (name=="GUIDFromStringA" || name=="GUIDFromStringW"))return true;
     if(family=="internal-com-rot" && name=="Register")return true;
     // 外部型別參照會惰性查詢 TypeLib 登錄，包含 COM metadata 與 Invoke。
     // 釋放、引用計數及 QueryInterface 不讀 registry，毋須因 raw I/O 暫停。
     if(contains(type_library_service_descriptors()) && !one_of(name,{"QueryInterface","AddRef","Release"}) &&
        !name.starts_with("Release"))return true;
     if(family=="internal-dwrite" && name=="Factory.GetEudcFontCollection")return true;
-    if((family=="dinput.dll" || family=="dinput8.dll") &&
+    if((family=="dinput.dll" || family=="dinput8.dll" || family=="avifil32.dll") &&
        one_of(name,{"DllRegisterServer","DllUnregisterServer"}))return true;
     if(family=="internal-dinput" && one_of(name,{"BuildActionMap","SetActionMap","ConfigureDevices","EnumDevicesBySemantics"}))return true;
 
     if(family=="shlwapi.dll" && name.starts_with("AssocQueryString"))return true;
     if(family=="shell32.dll" && (name.starts_with("ShellExecute") || name.starts_with("FindExecutable")))return true;
+    if(family=="internal-shell-env" || family=="internal-shell-version")return true;
     if(family=="userenv.dll" && (name.starts_with("GetProfilesDirectory") || name.starts_with("GetDefaultUserProfileDirectory") ||
         name.starts_with("GetAllUsersProfileDirectory") || name.starts_with("GetUserProfileDirectory") ||
         name.starts_with("ExpandEnvironmentStringsForUser") || one_of(name,{"CreateEnvironmentBlock",

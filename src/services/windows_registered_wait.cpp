@@ -21,6 +21,7 @@ std::span<const WindowsServiceDescriptor> registered_wait_service_descriptors(){
         {"kernel32.dll","WaitForThreadpoolWaitCallbacks",2,0,0,0x2},{"kernel32.dll","CloseThreadpoolWait",1},
         {"kernel32.dll","CreateThreadpoolIo",4},{"kernel32.dll","StartThreadpoolIo",1},{"kernel32.dll","CancelThreadpoolIo",1},
         {"kernel32.dll","WaitForThreadpoolIoCallbacks",2,0,0,0x2},{"kernel32.dll","CloseThreadpoolIo",1},
+        {"kernel32.dll","BindIoCompletionCallback",3,0,0,0x4},{"internal-threadpool","CreateThreadpoolIoNative",4},
         {"kernel32.dll","TrySubmitThreadpoolCallback",3},{"kernel32.dll","CallbackMayRunLong",1},
         {"kernel32.dll","DisassociateCurrentThreadFromCallback",1},{"kernel32.dll","SetEventWhenCallbackReturns",2},
         {"kernel32.dll","ReleaseSemaphoreWhenCallbackReturns",3,0,0,0x4},{"kernel32.dll","ReleaseMutexWhenCallbackReturns",2},
@@ -92,7 +93,7 @@ std::uint32_t WindowsServices::queue_pool_callback(const GuestState& state,Guest
 }
 std::optional<std::uint32_t> WindowsServices::invoke_registered_wait(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;
-    if(name.find("Threadpool")!=std::string_view::npos || name.ends_with("WhenCallbackReturns") || name=="CallbackMayRunLong" || name=="DisassociateCurrentThreadFromCallback")return invoke_threadpool(state,memory,service);
+    if(name.find("Threadpool")!=std::string_view::npos || name=="BindIoCompletionCallback" || name.ends_with("WhenCallbackReturns") || name=="CallbackMayRunLong" || name=="DisassociateCurrentThreadFromCallback")return invoke_threadpool(state,memory,service);
     if(name.find("TimerQueue")!=std::string_view::npos)return invoke_timer_queue(state,memory,service);
     const auto finish=[&](std::uint64_t value,std::uint32_t error=0){if(error)last_error_=error;arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     if(name=="WaitDispatch"){

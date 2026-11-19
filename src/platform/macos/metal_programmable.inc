@@ -205,7 +205,10 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_shader_create(std::uint32_t st
     }();
     if(graphics_modern_shader_required(bytes) && !sm51_geometry){
         // VS／PS／CS 的 SM5.1 與 DXIL 沿用 SPIR-V 路徑。
-        auto translated=graphics_modern_shader(stage,bytes);auto shader=std::make_shared<MetalShader>();
+        GraphicsGeometryStream geometry;
+        if(stage==2)geometry=graphics_modern_geometry_stream(bytes);
+        auto translated=stage==2?std::move(geometry.shader):graphics_modern_shader(stage,bytes);
+        auto shader=std::make_shared<MetalShader>();
         shader->stage=stage;shader->serial=++shader_serial_;shader->bytecode.assign(bytes.begin(),bytes.end());shader->source=std::move(translated.source);
         // 診斷：X64ARM_METAL_OVERRIDE_DIR=<目錄>：目錄內有 <內容雜湊>.metal 時以該檔取代翻譯結果（只供 A/B 實驗，繫結不變）。
         if(static const char* const override_dir=std::getenv("X64ARM_METAL_OVERRIDE_DIR");override_dir && *override_dir){
@@ -216,6 +219,13 @@ std::shared_ptr<GraphicsShader> MetalGl::graphics_shader_create(std::uint32_t st
         shader->bindings=std::move(translated.bindings);shader->inputs=std::move(translated.inputs);shader->threads=translated.threads;shader->buffer_sizes_slot=translated.buffer_sizes_slot;
         shader->signature_inputs=std::move(translated.signature_inputs);shader->signature_outputs=std::move(translated.signature_outputs);
         NSError* error=nil;auto options=[MTLCompileOptions new];options.fastMathEnabled=NO;
+        if(stage==2){
+            metal_dxil_geometry(*shader,geometry);
+            const auto validation=shader->source+"\nkernel void x64GeometryValidate() {}\n";
+            if(!metal_library_with_source(device_,validation,options,&error))
+                throw std::invalid_argument("Metal 幾何運算著色器編譯失敗："+std::string(error.localizedDescription.UTF8String));
+            return shader;
+        }
         if(metal_queue_shader_library(device_,*shader,shader->source,[NSString stringWithUTF8String:translated.entry.c_str()],options))return shader;
         MetalStallScope validation_timing("shader_validation_sync",shader->serial,stage);
         auto library=metal_library_with_source(device_,shader->source,options,&error);

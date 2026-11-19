@@ -85,6 +85,14 @@ inline constexpr std::array<std::uint8_t,320> adapter_description(bool x86,std::
 // 沒有另一套軟體光柵器，在它上面建立的裝置仍由同一個 Metal 裝置執行。沒有顯示輸出。
 inline constexpr std::uint64_t warp_adapter_luid=0x78363462;
 inline constexpr std::u16string_view warp_adapter_name=u"Microsoft Basic Render Driver";
+// 對照用（預設關閉）：X64ARM_DXGI_DEDICATED_VIDEO_MEMORY=1 時把同一份受管理的 GPU 額度也填入 DedicatedVideoMemory。
+// 統一記憶體沒有獨立顯存，預設維持 0；有些程式只依 DedicatedVideoMemory 決定資源池大小，用這個開關確認行為是否由此而來。
+inline void apply_dedicated_video_memory(std::array<std::uint8_t,320>& description,bool x86,std::uint64_t limit) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_DXGI_DEDICATED_VIDEO_MEMORY");return value && std::string_view(value)=="1";}();
+    if(!enabled)return;
+    const auto value=x86?std::min<std::uint64_t>(limit,UINT32_MAX):limit;
+    for(unsigned i=0;i<(x86?4U:8U);++i)description[272+i]=static_cast<std::uint8_t>(value>>(8*i));
+}
 inline constexpr std::array<std::uint8_t,320> warp_adapter_description(bool x86,std::uint64_t shared_memory) noexcept {
     std::array<std::uint8_t,320> result{};
     for(std::size_t i=0;i<warp_adapter_name.size();++i){result[i*2]=static_cast<std::uint8_t>(warp_adapter_name[i]);result[i*2+1]=static_cast<std::uint8_t>(warp_adapter_name[i]>>8);}

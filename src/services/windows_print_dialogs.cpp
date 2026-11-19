@@ -3,6 +3,8 @@
 #include "x64arm/windows_printing.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/windows_geometry.hpp"
+#include "x64arm/windows_gui_abi.hpp"
+#include "service_callback_task.hpp"
 #include <algorithm>
 #include <charconv>
 
@@ -37,6 +39,7 @@ std::vector<std::uint8_t> devnames(bool wide){
 std::span<const WindowsServiceDescriptor> print_dialog_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"comdlg32.dll","PrintDlgExA",1},{"comdlg32.dll","PrintDlgExW",1},
+        {"comdlg32.dll","PrintDlgA",1},{"comdlg32.dll","PrintDlgW",1},{"internal-print-dlg","DialogProc",4},
         {"comdlg32.dll","PageSetupDlgA",1},{"comdlg32.dll","PageSetupDlgW",1},{"internal-page-setup","DialogProc",4},
         
         {"internal-print-dialog","RootProc",4},{"internal-print-dialog","GeneralProc",4},
@@ -149,6 +152,7 @@ void WindowsServices::select_print_page(std::uint64_t root,std::uint32_t selecte
     for(std::size_t i=0;i<=data.pages.size();++i)if(const auto h=gui_child(root,static_cast<std::uint32_t>(0x5000+i));h){gui_.windows.at(h).check=selected==i;present_gui(h);}
 }
 std::optional<std::uint32_t> WindowsServices::invoke_print_dialog(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+#include "windows_print_dlg.inc"
     if(service.symbol.starts_with("PageSetupDlg") || service.family=="internal-page-setup")return invoke_page_setup(state,memory,service);
     const WindowsCall arg(state,memory,service);const unsigned unit=x86_?4:8;const auto bits=static_cast<std::uint8_t>(unit*8);
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};

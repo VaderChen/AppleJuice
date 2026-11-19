@@ -246,6 +246,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,Gue
         case 0x80000006:result=18;break;case 0xc0000003:case 0xc000000d:case 0xc0000045:case 0xc000004e:result=87;break;case 0xc0000004:result=24;break;
         case 0x40000000:result=183;break;case 0xc0000018:case 0xc0000019:result=487;break;
         case 0xc0000225:result=1168;break;
+        case 0xc0190002:result=6700;break;case 0xc0190003:result=6701;break;case 0xc0190015:result=6704;break;case 0xc0190016:result=6705;break;
         case 0xc0000020:result=193;break;case 0xc0000040:result=8;break;case 0xc000011e:result=1006;break;
         case 0xc000000f:result=2;break;case 0xc0000010:result=1;break;case 0xc000007f:result=112;break;case 0xc000009a:result=1450;break;case 0xc0000103:result=267;break;
         case 0xc0000008:case 0xc0000024:case 0xc0000235:result=6;break;case 0xc0000011:result=38;break;case 0xc0000017:result=8;break;
@@ -253,7 +254,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_error(GuestState& state,Gue
         case 0xc0000035:result=183;break;case 0xc000003a:result=3;break;case 0xc0000043:result=32;break;
         case 0xc0000033:result=123;break;case 0xc000003b:result=161;break;case 0xc0000054:result=33;break;
         case 0xc00000a2:result=19;break;case 0xc0000101:result=145;break;case 0xc000014b:result=109;break;case 0xc0000185:result=1117;break;
-        case 0xc00000bb:result=50;break;case 0xc0000120:result=995;break;default:result=317;break;
+        case 0xc00000bb:result=50;break;case 0xc0000120:result=995;break;
+        // 安全性與命名：權限不足、沒有模擬權杖、模擬層級不符、泛用權限未展開、無效描述元／SID、名稱過長、沒有更多項目。
+        case 0xc0000061:result=1314;break;case 0xc000005c:result=1309;break;case 0xc00000a5:result=1346;break;case 0xc000008e:result=1360;break;
+        case 0xc0000079:result=1338;break;case 0xc0000078:result=1337;break;case 0xc0000106:result=206;break;case 0x8000001a:result=259;break;
+        default:result=317;break;
         }
     } else {
         const auto flags=static_cast<std::uint32_t>(arg(0));const bool wide=service.symbol.back()=='W';

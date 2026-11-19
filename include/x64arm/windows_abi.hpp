@@ -21,7 +21,11 @@ public:
         }
         const auto sp = state.reg(Gpr::Rsp);
         const auto extent = UINT64_C(40) + (arguments > 4 ? (static_cast<std::uint64_t>(arguments) - 4) * 8 : 0);
-        if (sp % 16 != 8) throw HostCallFault("Windows x64 呼叫入口 RSP 必須為 16n+8");
+        // 16n+8 是編譯器的函式入口慣例；手寫跳轉／尾呼叫仍可能使用另一個
+        // 自然對齊的 8-byte slot。宿主橋接不直接在客體堆疊執行 SIMD，無須
+        // 額外要求 16-byte 入口相位，也不能重排 RSP 改變參數及返回位址。
+        // 保留 slot 自然對齊、返回槽、shadow space 及所有堆疊參數的存取驗證。
+        if (sp % 8) throw HostCallFault("Windows x64 呼叫框架 RSP 必須以 8 位元組對齊");
         if (sp > UINT64_MAX - extent) throw MemoryFault(GuestAddress{sp}, Access::Read, extent, "Windows 呼叫框架溢位");
         memory.check(GuestAddress{sp}, 8, Access::Read);
         memory.check(GuestAddress{sp + 8}, 32, Access::Write);
@@ -77,6 +81,7 @@ std::span<const WindowsServiceDescriptor> imm_service_descriptors();
 std::span<const WindowsServiceDescriptor> property_service_descriptors();
 std::span<const WindowsServiceDescriptor> profile_service_descriptors();
 std::span<const WindowsServiceDescriptor> legacy_device_service_descriptors();
+std::span<const WindowsServiceDescriptor> avifil32_service_descriptors();
 std::span<const WindowsServiceDescriptor> vtable_proxy_service_descriptors();
 std::span<const WindowsServiceDescriptor> shell_idlist_service_descriptors();
 std::span<const WindowsServiceDescriptor> winstation_service_descriptors();
@@ -197,6 +202,9 @@ std::span<const WindowsServiceDescriptor> ole_wrapper_service_descriptors();
 std::span<const WindowsServiceDescriptor> file_link_service_descriptors();
 std::span<const WindowsServiceDescriptor> power_scheme_service_descriptors();
 std::span<const WindowsServiceDescriptor> ole_picture_service_descriptors();
+std::span<const WindowsServiceDescriptor> crt_console_read_service_descriptors();
+std::span<const WindowsServiceDescriptor> com_moniker_service_descriptors();
+std::span<const WindowsServiceDescriptor> ole_advise_service_descriptors();
 // 由 windows_power.cpp 轉到 invoke_power_schemes 的既有方案查詢入口（描述元仍在 environment 表）。
 bool power_scheme_query_symbol(std::string_view symbol);
 std::span<const WindowsServiceDescriptor> shell_icon_service_descriptors();

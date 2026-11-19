@@ -24,7 +24,7 @@ struct Local {
         return values;
     }
 };
-struct Collection {Usage usage{};unsigned parent{},root{};};
+struct Collection {Usage usage{};unsigned parent{},root{},type{};};
 struct ParsedField {Field field;unsigned root{};};
 constexpr std::array<std::uint8_t,8> signature{'M','W','H','P','D','0','0','1'};
 }
@@ -69,7 +69,7 @@ Layout parse(std::span<const std::uint8_t> descriptor,Usage top){
             if(tag==10){
                 if(stack.size()>=64 || collections.size()>=65535)throw Error(invalid_preparsed);
                 const auto values=local.expand();const auto index=static_cast<unsigned>(collections.size());
-                collections.push_back({values.empty()?Usage{}:values.front(),stack.empty()?index:stack.back(),stack.empty()?index:collections[stack.back()].root});stack.push_back(index);
+                collections.push_back({values.empty()?Usage{}:values.front(),stack.empty()?index:stack.back(),stack.empty()?index:collections[stack.back()].root,number&0xffU});stack.push_back(index);
             }else if(tag==12){if(stack.empty())throw Error(invalid_preparsed);stack.pop_back();}
             else if(tag==8 || tag==9 || tag==11){
                 if(stack.empty() || !global.bits || global.bits>65535 || !global.count || global.count>65535)throw Error(invalid_preparsed);
@@ -98,6 +98,11 @@ Layout parse(std::span<const std::uint8_t> descriptor,Usage top){
     std::map<unsigned,unsigned> links;
     for(unsigned i=0;i<collections.size();++i)if(collections[i].root==root)links.emplace(i,static_cast<unsigned>(links.size()));
     result.links=static_cast<std::uint16_t>(links.size());
+    // 連結集合樹：依宣告順序建立，子集合插在父集合清單最前面。
+    result.nodes.resize(links.size());
+    for(const auto [collection,node]:links){auto& item=result.nodes[node];item.usage=collections[collection].usage;item.type=collections[collection].type;
+        if(collection==root)continue;const auto parent=links.at(collections[collection].parent);item.parent=parent;
+        item.next_sibling=result.nodes[parent].first_child;result.nodes[parent].first_child=node;++result.nodes[parent].children;}
     for(auto& item:fields)if(item.root==root){auto& f=item.field;f.link=links.at(f.link);f.index=result.data_indices[f.type];
         if(f.indices()>65535-result.data_indices[f.type])throw Error(invalid_preparsed);
         result.data_indices[f.type]+=f.indices();result.fields.push_back(std::move(f));}

@@ -7,6 +7,8 @@
 #include <bit>
 #include <cmath>
 #include <deque>
+#include <optional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -49,6 +51,8 @@ std::span<const WindowsServiceDescriptor> oleaut32_conversion_service_descriptor
         // VB 格式化與 NUMPARSE（windows_oleaut32_format.inc）。
         for(const auto name:{"VarFormatNumber","VarFormatPercent","VarFormatCurrency"})add(name,7);
         add("VarFormatDateTime",4);add("VarParseNumFromStr",5);add("VarNumFromParseNum",4);
+        // VB 格式字串（windows_oleaut32_varformat.inc）。
+        add("VarFormat",6);add("VarFormatFromTokens",6);add("VarTokenizeFormatString",7);add("GetAltMonthNames",2);
         return out;
     }();
     return table;
@@ -68,7 +72,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_oleaut32_conversion(GuestSt
         if(type==14){put(v,0,2,0);m.write(GuestAddress{pointer},std::span{v}.first(16));}
         else m.write(GuestAddress{pointer},std::span{v}.subspan(8,bytes));
     };
-    if(name.starts_with("VarFormat") || name=="VarParseNumFromStr" || name=="VarNumFromParseNum")return invoke_oleaut32_format(state,memory,service);
+    if(name.starts_with("VarFormat") || name=="VarParseNumFromStr" || name=="VarNumFromParseNum" || name=="VarTokenizeFormatString" || name=="GetAltMonthNames")return invoke_oleaut32_format(state,memory,service);
     const auto [target_name,source_name]=conversion_parts(name);
     const bool conversion=!target_name.empty() && (scalar_type(target_name).first || target_name=="Bstr") && (scalar_type(source_name).first || source_name=="Disp");
     if(conversion && source_name=="Disp"){

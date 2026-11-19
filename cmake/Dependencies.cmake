@@ -11,58 +11,7 @@ if(NOT EXISTS "${hlslcc_SOURCE_DIR}/src/HLSLcc.cpp"
   set(hlslcc_SOURCE_DIR "${hlslcc_SOURCE_DIR}/HLSLcc-3ea1fcd6bd0ac445bc078de0bf32f0950188577b")
 endif()
 # 修正上游 Metal 宣告自行加 sampler 前綴、運算式仍使用原名的通用命名問題。
-set(HLSLCC_METAL_DECL "${hlslcc_SOURCE_DIR}/src/toMetalDeclaration.cpp")
-file(READ "${HLSLCC_METAL_DECL}" HLSLCC_METAL_DECL_SOURCE)
-string(REPLACE "samplerOss << (startsWithSampler ? \"\" : \"sampler\") << name;"
-  "samplerOss << name; (void)startsWithSampler;" HLSLCC_METAL_DECL_PATCHED "${HLSLCC_METAL_DECL_SOURCE}")
-if(NOT HLSLCC_METAL_DECL_SOURCE STREQUAL HLSLCC_METAL_DECL_PATCHED)
-  file(WRITE "${HLSLCC_METAL_DECL}" "${HLSLCC_METAL_DECL_PATCHED}")
-endif()
-set(HLSLCC_METAL_INST "${hlslcc_SOURCE_DIR}/src/toMetalInstruction.cpp")
-file(READ "${HLSLCC_METAL_INST}" HLSLCC_METAL_INST_SOURCE)
-string(REPLACE "TranslateOperand(psDestAddr, TO_FLAG_INTEGER | TO_FLAG_UNSIGNED_INTEGER)"
-  "TranslateOperand(psDestAddr, TO_FLAG_INTEGER | TO_FLAG_UNSIGNED_INTEGER, OPERAND_4_COMPONENT_MASK_X)"
-  HLSLCC_METAL_INST_PATCHED "${HLSLCC_METAL_INST_SOURCE}")
-string(REPLACE "TranslateOperand(psDestByteOff, dstOffFlag)"
-  "TranslateOperand(psDestByteOff, dstOffFlag, OPERAND_4_COMPONENT_MASK_X)"
-  HLSLCC_METAL_INST_PATCHED "${HLSLCC_METAL_INST_PATCHED}")
-# DXBC 的 IF／BREAKC／CONTINUEC／RETC／SWITCH／DISCARD 條件為 scalar。套用 swizzle 的第一個分量，
-# 不讓 Metal 把 bool4／uint4 當成 C++ 的單一 bool；保留 zero／nonzero 判斷語義。
-foreach(CONDITION_TYPE TO_FLAG_BOOL TO_FLAG_UNSIGNED_INTEGER TO_FLAG_INTEGER)
-  string(REPLACE "TranslateOperand(&psInst->asOperands[0], ${CONDITION_TYPE})"
-    "TranslateOperand(&psInst->asOperands[0], ${CONDITION_TYPE}, OPERAND_4_COMPONENT_MASK_X)"
-    HLSLCC_METAL_INST_PATCHED "${HLSLCC_METAL_INST_PATCHED}")
-endforeach()
-if(NOT HLSLCC_METAL_INST_SOURCE STREQUAL HLSLCC_METAL_INST_PATCHED)
-  file(WRITE "${HLSLCC_METAL_INST}" "${HLSLCC_METAL_INST_PATCHED}")
-endif()
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalGeometry.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalLayout.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalPointSize.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalLod.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalMultisampleArray.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccDeclarationReflection.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccSm51Resources.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccTypedBuffers.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccTextureAtomics.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMaskedMoves.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccBitfieldExtract.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccStrongCompareExchange.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccRobustBuffers.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccTempLaneTypes.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccUseDefineChains.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalTessellation.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccTextureScalarOperands.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalSamplerNames.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalClipDistance.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalCullDistance.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalCoverage.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalPosition.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccCoalesceTemps.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalOutputControlPoints.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalMergedHelpers.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalBitOps.cmake")
-include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalPatchConstantRedirect.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/HlslccPatches.cmake")
 file(GLOB HLSLCC_SOURCES CONFIGURE_DEPENDS "${hlslcc_SOURCE_DIR}/src/*.cpp" "${hlslcc_SOURCE_DIR}/src/cbstring/*.c")
 # AppleDouble 是二進位中繼資料，副檔名相同也不能當成原始碼編譯。
 list(FILTER HLSLCC_SOURCES EXCLUDE REGEX "/[.]_[^/]*$")

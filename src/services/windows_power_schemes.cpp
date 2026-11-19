@@ -11,6 +11,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_power_values.hpp"
 #include "x64arm/registry_store.hpp"
+#include "registry_direct_write.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
 #include <algorithm>
@@ -23,7 +24,7 @@ constexpr std::u16string_view store_display=u"\x02\\SYSTEM\\CurrentControlSet\\C
 constexpr std::size_t policy_size=144,global_size=192,processor_size=156,user_scheme_limit=64;
 // POWER_POLICY 內三項逾時的 AC 欄位位移（DC 在其後 4 bytes）：顯示器 VideoTimeout、睡眠 IdleTimeout、磁碟 SpindownTimeout。
 constexpr std::array<unsigned,3> timeout_offset{56,28,64};
-std::u16string folded(std::u16string_view text){std::u16string out(text);for(auto& c:out)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);return out;}
+using registry_direct::folded;using registry_direct::ensure_key;using registry_direct::put_value;using registry_direct::erase_tree;
 std::u16string guid_text(const Guid& id){
     constexpr char16_t digits[]=u"0123456789abcdef";constexpr std::array<unsigned,16> order{3,2,1,0,5,4,7,6,8,9,10,11,12,13,14,15};
     std::u16string out;for(unsigned i=0;i<16;++i){if(i==4 || i==6 || i==8 || i==10)out.push_back(u'-');out.push_back(digits[id[order[i]]>>4]);out.push_back(digits[id[order[i]]&15]);}
@@ -88,28 +89,7 @@ const Scheme* find_index(const Store& store,std::uint32_t index){for(const auto&
 std::size_t setting_position(const Guid& group,const Guid& setting){
     std::size_t i=0;while(i<power::settings.size() && (power::settings[i].group!=group || power::settings[i].value!=setting))++i;return i;
 }
-// 登錄變更（呼叫者持有可寫交易）：機碼與顯示名稱、值數量與位元組統計和其他直接寫入登錄的服務一致。
-void ensure_key(RegistryState& registry,const std::u16string& display,std::uint64_t now){
-    const auto canonical=folded(display);
-    for(std::size_t at=0;;){
-        const auto next=canonical.find(u'\\',at);const auto prefix=canonical.substr(0,next);
-        if(registry.keys.try_emplace(prefix).second){registry.display_names[prefix]=display.substr(0,next);registry.modified_times[prefix]=now;}
-        if(next==canonical.npos)break;at=next+1;
-    }
-}
-void put_value(RegistryState& registry,const std::u16string& display,std::u16string_view name,std::uint32_t type,std::vector<std::uint8_t> bytes,std::uint64_t now){
-    ensure_key(registry,display,now);const auto key=folded(display);auto& values=registry.keys[key];const auto folded_name=folded(name);
-    if(const auto old=values.find(folded_name);old!=values.end())registry.bytes-=old->second.bytes.size();else ++registry.values;
-    registry.bytes+=bytes.size();values[folded_name]={type,std::move(bytes),std::u16string(name)};registry.modified_times[key]=now;
-}
 std::vector<std::uint8_t> dword_bytes(std::uint32_t v){std::vector<std::uint8_t> out(4);put32(out,0,v);return out;}
-void erase_tree(RegistryState& registry,const std::u16string& canonical){
-    for(auto it=registry.keys.lower_bound(canonical);it!=registry.keys.end() && it->first.starts_with(canonical);){
-        if(it->first.size()!=canonical.size() && it->first[canonical.size()]!=u'\\'){++it;continue;}
-        for(const auto& [name,value]:it->second){(void)name;registry.bytes-=value.bytes.size();--registry.values;}
-        registry.modified_times.erase(it->first);registry.display_names.erase(it->first);registry.security_descriptors.erase(it->first);it=registry.keys.erase(it);
-    }
-}
 std::u16string scheme_display(const Guid& id){return std::u16string(store_display)+u"\\"+guid_text(id);}
 void put_values(RegistryState& registry,const Guid& id,const std::array<std::optional<std::uint32_t>,6>& values,std::uint64_t now){
     for(std::size_t i=0;i<power::settings.size();++i)for(unsigned dc=0;dc<2;++dc)if(const auto v=values[i*2+dc])

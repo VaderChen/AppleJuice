@@ -224,7 +224,7 @@ const RuntimeFunction* lookup_function(const RuntimeImage& image, std::uint64_t 
         [](std::uint64_t value, const RuntimeFunction& function) { return value < function.begin; });
     while(found!=image.functions.begin()){
         const auto& function=*--found;
-        if(function.begin==function.end)continue;
+        if(function.begin>=function.end)continue;
         return offset<function.end?&function:nullptr;
     }
     return nullptr;
@@ -233,14 +233,19 @@ namespace {
 template<class Memory>
 void validate_unwind_impl(const Memory& memory, const RuntimeImage& image) {
     for (const auto& function : image.functions) {
-        if(function.begin==function.end)continue;
+        if(function.begin>=function.end)continue;
         auto current = function;std::array<std::uint32_t,32> visited{};std::size_t depth=0;
         for (;;) {
             if(depth==visited.size() || std::find(visited.begin(),visited.begin()+depth,current.unwind)!=visited.begin()+depth)throw HostCallFault("chained unwind 循環或過深");
             visited[depth++]=current.unwind;
             const auto info = parse(memory, image, current.unwind, false);
-            if (info.prolog > current.end - current.begin) throw HostCallFault("unwind prolog 超出函式範圍");
-            for(const auto distance:info.epilogs)if(distance<info.epilog_size || distance>current.end-current.begin-info.prolog)throw HostCallFault("unwind v2 epilog 超出函式範圍");
+            // Windows 以 ControlPc 相對 CodeOffset 決定要還原的操作；SizeOfProlog
+            // 可大於此筆函式範圍（例如重排後共用 xdata），不是載入時的範圍限制。
+            // v2 的實際 epilog 描述仍須完整落在函式內，避免減法下溢。
+            const auto length=current.end-current.begin;
+            for(const auto distance:info.epilogs)
+                if(info.prolog>length || distance<info.epilog_size || distance>length-info.prolog)
+                    throw HostCallFault("unwind v2 epilog 超出函式範圍");
             if (!(info.flags & 4)) break;
             const auto linked = chain(memory, image, info.tail);
             const auto parent = parse(memory, image, linked.unwind, false);
@@ -372,11 +377,11 @@ GuestState read_context(const GuestMemory& memory, std::uint64_t address, const 
         const auto flags=memory.load(GuestAddress{address},32);if(!(flags&0x10000))throw HostCallFault("CONTEXT 缺少 i386 標記");
         if(flags&0x10){
             std::array<std::uint64_t,6> debug{};for(std::size_t i=0;i<6;++i)debug[i]=memory.load(GuestAddress{address+4+i*4},32);
-            if(debug[5]&0x20ffU)throw HostCallFault("CPU 尚未支援啟用硬體 breakpoint comparator");
-            debug[4]=(debug[4]&0xe00fU)|0xffff0ff0U;debug[5]=(debug[5]&0xffff0f00U)|0x400U;state.debug_registers=debug;
+            if(!cpu_debug::execution_control_supported(debug[5]))throw HostCallFault("CPU 尚未支援資料／I/O breakpoint comparator 或 general detect");
+            debug[4]=(debug[4]&0xe00fU)|0xffff0ff0U;debug[5]=(debug[5]&0xffff0f55U)|0x400U;state.debug_registers=debug;
         }
         if(flags&2){constexpr std::array registers{Gpr::Rdi,Gpr::Rsi,Gpr::Rbx,Gpr::Rdx,Gpr::Rcx,Gpr::Rax};for(std::size_t i=0;i<registers.size();++i)state.reg(registers[i])=memory.load(GuestAddress{address+156+i*4},32);}
-        if(flags&1){state.reg(Gpr::Rbp)=memory.load(GuestAddress{address+180},32);state.reg(Gpr::Rsp)=memory.load(GuestAddress{address+196},32);state.rip=GuestAddress{memory.load(GuestAddress{address+184},32)};state.rflags=(memory.load(GuestAddress{address+192},32)&0xcd5U)|2U;}
+        if(flags&1){state.reg(Gpr::Rbp)=memory.load(GuestAddress{address+180},32);state.reg(Gpr::Rsp)=memory.load(GuestAddress{address+196},32);state.rip=GuestAddress{memory.load(GuestAddress{address+184},32)};state.rflags=(memory.load(GuestAddress{address+192},32)&0x10cd5U)|2U;}
         // Selector 只能回復目前的平面區段；任意 LDT／TEB 基底重設不屬 CONTEXT 子集。
         constexpr std::array<unsigned,6> segments{148,188,200,152,144,140};
         for(std::size_t i=0;i<segments.size();++i)if((flags&((i==1 || i==2)?1U:4U)) && memory.load(GuestAddress{address+segments[i]},16)!=state.segments[i])throw HostCallFault("CONTEXT 要求未支援的區段 selector 切換");
@@ -400,14 +405,14 @@ GuestState read_context(const GuestMemory& memory, std::uint64_t address, const 
     if (!(flags_value & 0x100000)) throw HostCallFault("CONTEXT 缺少 AMD64 標記");
     if(flags_value&0x10){
         std::array<std::uint64_t,6> debug{};for(std::size_t i=0;i<6;++i)debug[i]=memory.load(GuestAddress{address+72+i*8},64);
-        if(debug[5]&0x20ffU)throw HostCallFault("CPU 尚未支援啟用硬體 breakpoint comparator");
-        debug[4]=(debug[4]&0xe00fU)|0xffff0ff0U;debug[5]=(debug[5]&0xffff0f00U)|0x400U;state.debug_registers=debug;
+        if(!cpu_debug::execution_control_supported(debug[5]))throw HostCallFault("CPU 尚未支援資料／I/O breakpoint comparator 或 general detect");
+        debug[4]=(debug[4]&0xe00fU)|0xffff0ff0U;debug[5]=(debug[5]&0xffff0f55U)|0x400U;state.debug_registers=debug;
     }
     if (flags_value & 2) for (std::size_t i = 0; i < 16; ++i) if (i != 4) state.gpr[i] = memory.load(GuestAddress{address + 120 + i * 8}, 64);
     if (flags_value & 1) {
         state.reg(Gpr::Rsp) = memory.load(GuestAddress{address + 152}, 64);
         state.rip = GuestAddress{memory.load(GuestAddress{address + 248}, 64)};
-        state.rflags = (memory.load(GuestAddress{address + 68}, 32) & UINT64_C(0x00000cd5)) | 2;
+        state.rflags = (memory.load(GuestAddress{address + 68}, 32) & UINT64_C(0x00010cd5)) | 2;
     }
     if (flags_value & 8) {
         state.x87_control = static_cast<std::uint16_t>(memory.load(GuestAddress{address + 256}, 16));

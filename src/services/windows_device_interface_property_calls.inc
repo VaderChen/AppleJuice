@@ -51,3 +51,16 @@
             switch(error){case 0:return finish(0);case 1784:return finish(3);case 8:return finish(2);case 5:return finish(51);case 122:return finish(26);
                 case 1168:return finish(37);case 0xe0000209U:return finish(53);case 13:case 87:return finish(31);default:return finish(29);}
         }
+        if(name=="CM_Open_Device_Interface_KeyA" || name=="CM_Open_Device_Interface_KeyW"){
+            // (pszDeviceInterface, samDesired, Disposition, phkDeviceInterface, ulFlags)：開啟介面的 Device Parameters 鍵（與 SetupDiOpenDeviceInterfaceRegKey 同一把鍵）；
+            // 此模型中每個介面的鍵都存在，RegDisposition_OpenAlways（0）與 RegDisposition_OpenExisting（1）結果相同。
+            if(!arg(0) || !arg(3))return finish(3);if(static_cast<std::uint32_t>(arg(4)))return finish(4);if(static_cast<std::uint32_t>(arg(2))>1)return finish(0x1f);
+            const auto sam=static_cast<std::uint32_t>(arg(1));if((sam&0x300U)==0x300U)return finish(0x1f);if((sam&0x200U) || (sam&~0x020f013fU))return finish(0x1d);
+            const auto path=folded(read(arg(0)));
+            const auto found=std::find_if(nodes.begin(),nodes.end(),[&](const auto& item){return !item.second.pending_set && !item.second.interface_path.empty() && folded(item.second.interface_path)==path;});
+            if(found==nodes.end())return finish(0x37);
+            memory.check(GuestAddress{arg(3)},x86_?4:8,Access::Write);
+            const auto [error,handle]=open_interface_key(found->second,found->second.interface_guid,sam);
+            if(error)return finish(error==8?2U:error==5?0x33U:0x1dU);
+            memory.store(GuestAddress{arg(3)},x86_?32:64,handle);return finish(0);
+        }

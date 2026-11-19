@@ -8,6 +8,11 @@ static inline int x64arm_classify_float_bits(unsigned long long bits,unsigned wi
     if(exponent==exponent_mask)return fraction?2:1;
     return exponent?-1:fraction?-2:0;
 }
+/* MXCSR.DAZ 在運算輸入階段轉成帶符號零；不改分類 API 或污染浮點旗標。
+   用位元處理，避免宿主不具獨立輸入 flush 模式時連帶改變結果的 FTZ 行為。 */
+static inline unsigned long long x64arm_math_input_float_bits(unsigned long long bits,unsigned width,unsigned mxcsr) {
+    return (mxcsr&0x40U) && x64arm_classify_float_bits(bits,width)==-2?bits&(1ULL<<(width-1)):bits;
+}
 static inline int x64arm_fpclass_float_bits(unsigned long long bits,unsigned width) {
     const unsigned fraction_width=width==32?23:52;
     const int classification=x64arm_classify_float_bits(bits,width);

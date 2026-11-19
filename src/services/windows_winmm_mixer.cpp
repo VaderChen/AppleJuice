@@ -51,6 +51,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_mixer(GuestState& sta
         if(!audio_mixer_backend_)audio_mixer_backend_=audio::make_mixer_backend();if(!winmm_mixer_)winmm_mixer_=std::make_shared<WinmmMixerState>();auto& bridge=*winmm_mixer_;
         poll_winmm_mixer();const auto endpoints=audio_mixer_backend_->endpoints();if(endpoints.size()>256)throw MixerError{7};
         struct Selection {audio::MixerEndpoint endpoint;unsigned id;};
+        // AUX 編號只包含輸入端點，Mixer 則使用包含輸出的完整編號。
+        const auto aux_count=std::count_if(endpoints.begin(),endpoints.end(),[](const auto& e){return e.capture;});
+        const auto aux_index=[&](std::uint64_t id,unsigned error)->unsigned {
+            if(id==UINT32_MAX)id=0; // AUX_MAPPER 指向預設輸入。
+            for(unsigned i=0;i<endpoints.size();++i){
+                if(endpoints[i].capture && id--==0)return i;
+            }
+            throw MixerError{error};
+        };
         const auto select=[&](std::uint64_t object,std::uint32_t flags)->Selection {
             const auto kind=(flags>>28)&7U;const bool handle=flags&0x80000000U;
             if(kind==0){
@@ -68,11 +77,57 @@ std::optional<std::uint32_t> WindowsServices::invoke_winmm_mixer(GuestState& sta
             }else if(kind==4){
                 if(handle){if(!midi_inputs_.contains(object))throw MixerError{5};}
                 else if(object>=midi::input_devices().size())throw MixerError{2};throw MixerError{6};
+            }else if(kind==5){
+                if(handle)throw MixerError{5};
+                const auto i=aux_index(object,2);return {endpoints[i],i};
             }else throw MixerError{2};
             for(unsigned i=0;i<endpoints.size();++i)if(endpoints[i].capture==(kind==2))return {endpoints[i],i};throw MixerError{6};
         };
         const auto validate_flags=[&](std::uint32_t flags,unsigned allowed){if(flags&~(0xf0000000U|allowed))throw MixerError{10};};
-        if(name=="mixerGetNumDevs")result=static_cast<std::uint32_t>(endpoints.size());
+        if(name=="auxGetNumDevs")result=static_cast<std::uint32_t>(aux_count);
+        else if(name.starts_with("aux")){
+            constexpr unsigned get_count=3,get_caps=4,get_volume=5,set_volume=6;
+            const bool raw=name=="auxOutMessage",caps=name.starts_with("auxGetDevCaps");
+            if(caps && !arg(1))throw MixerError{11};
+            const auto& endpoint=endpoints[aux_index(caps?arg(0):d(0),caps?2:5)];
+            const auto message=raw?d(1):caps?get_caps:name=="auxGetVolume"?get_volume:set_volume;
+            const auto param=arg(raw?2:1);
+            switch(message){
+            case get_count:result=static_cast<std::uint32_t>(aux_count);break;
+            case get_caps:{
+                if(!param)throw MixerError{11};
+                const bool unicode=raw || wide;
+                const unsigned technology=unicode?72U:40U;
+                std::vector<std::uint8_t> bytes(technology+8);
+                put(bytes,4,0x100);
+                text(bytes,8,endpoint.name,unicode,32);
+                put(bytes,technology,2,2); // AUXCAPS_AUXIN
+                const unsigned support=endpoint.volume && endpoint.volume_writable?(endpoint.uniform_volume?1U:3U):0U;
+                put(bytes,technology+4,support);
+                const auto size=std::min<std::uint64_t>(raw?arg(3):d(2),bytes.size());
+                if(size)memory.write(GuestAddress{param},std::span(bytes).first(size));
+                break;
+            }
+            case get_volume:{
+                if(!param)throw MixerError{11};
+                if(!endpoint.volume)throw MixerError{8};
+                const auto channel=[&](unsigned c){return static_cast<unsigned>(std::lround(std::clamp((*endpoint.volume)[c],0.F,1.F)*65535.F));};
+                memory.store(GuestAddress{param},32,channel(0)|(channel(1)<<16));
+                break;
+            }
+            case set_volume:{
+                if(!endpoint.volume || !endpoint.volume_writable)throw MixerError{8};
+                if(!runtime_.network.external_io)throw HostCallFault("auxSetVolume is disabled during deterministic compare");
+                const float left=(param&0xffffU)/65535.F;
+                const float right=endpoint.uniform_volume?left:((param>>16)&0xffffU)/65535.F;
+                if(!audio_mixer_backend_->set_volume(endpoint.token,{left,right}))throw MixerError{1};
+                bridge.polled={};poll_winmm_mixer();
+                break;
+            }
+            default:throw MixerError{8};
+            }
+        }
+        else if(name=="mixerGetNumDevs")result=static_cast<std::uint32_t>(endpoints.size());
         else if(name=="mixerClose"){if(!bridge.handles.erase(arg(0)))throw MixerError{5};}
         else if(name=="mixerOpen"){
             const auto flags=d(4);validate_flags(flags,0x10000);if(!arg(0) || arg(3) || ((flags&0x10000) && (!arg(2) || !gui_.windows.contains(arg(2)))) || (!(flags&0x10000) && arg(2)))throw MixerError{11};

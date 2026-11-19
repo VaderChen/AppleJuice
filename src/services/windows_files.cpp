@@ -369,6 +369,7 @@ std::span<const WindowsServiceDescriptor> file_service_descriptors() {
 #include "windows_file_backup.inc"
 // 共用 FindFirstFile／CRT _findfirst 的目錄比對（Windows 萬用字元、不分大小寫）；清單方塊 LB_DIR 亦使用。
 std::pair<std::uint32_t,DirectorySearch> WindowsServices::search_directory(const std::string& path){return find_directory(filesystem_,path);}
+bool WindowsServices::directory_name_matches(std::u16string pattern,std::u16string_view name){return find_matches(std::move(pattern),name,false);}
 std::optional<std::uint32_t> WindowsServices::invoke_file(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     if(service.symbol=="BackupRead" || service.symbol=="BackupWrite" || service.symbol=="BackupSeek")return invoke_file_backup(state,memory,service);
     if(service.symbol=="GetOverlappedResult" || service.symbol=="GetOverlappedResultEx")return invoke_overlapped_result(state,memory,service);

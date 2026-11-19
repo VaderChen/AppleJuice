@@ -12,12 +12,56 @@
 #ifdef X64ARM_HAS_LDAP
 #include <ldap.h>
 #include <lber.h>
+#include <sasl/sasl.h>
 #endif
 
 namespace x64arm {
 #ifdef X64ARM_HAS_LDAP
 namespace {
 unsigned ldap_status(int value){return value<0?80U+static_cast<unsigned>(-value):static_cast<unsigned>(value);}
+struct LdapBindIdentity {
+    std::string user, domain, password;
+};
+int ldap_bind_prompts(LDAP*, unsigned, void* context, void* prompts) {
+    const auto& identity = *static_cast<const LdapBindIdentity*>(context);
+    for (auto* prompt = static_cast<sasl_interact_t*>(prompts); prompt && prompt->id != SASL_CB_LIST_END; ++prompt) {
+        const std::string* field;
+        switch (prompt->id) {
+            case SASL_CB_AUTHNAME: field = &identity.user; break;
+            case SASL_CB_USER: prompt->result = ""; prompt->len = 0; continue;
+            case SASL_CB_GETREALM: field = &identity.domain; break;
+            case SASL_CB_PASS: field = &identity.password; break;
+            default: return LDAP_PARAM_ERROR;
+        }
+        prompt->result = field->data();
+        prompt->len = static_cast<unsigned>(field->size());
+    }
+    return LDAP_SUCCESS;
+}
+// 先從 Root DSE 取得伺服器提供的機制，交給 SASL 從雙方支援的密碼型機制中選擇。
+int ldap_password_bind(LDAP* native, LdapBindIdentity& identity) {
+    char attribute[] = "supportedSASLMechanisms";
+    char* attributes[]{attribute,nullptr};
+    LDAPMessage* root = nullptr;
+    const int status = ldap_search_ext_s(native,"",LDAP_SCOPE_BASE,"(objectClass=*)",
+        attributes,0,nullptr,nullptr,nullptr,1,&root);
+    std::unique_ptr<LDAPMessage,decltype(&ldap_msgfree)> response(root,ldap_msgfree);
+    if(status != LDAP_SUCCESS)return status;
+    auto* entry = root ? ldap_first_entry(native,root) : nullptr;
+    auto** values = entry ? ldap_get_values_len(native,entry,attribute) : nullptr;
+    std::unique_ptr<berval*,decltype(&ldap_value_free_len)> owner(values,ldap_value_free_len);
+    std::string mechanisms;
+    for(unsigned i = 0; values && values[i]; ++i){
+        std::string_view name(values[i]->bv_val,values[i]->bv_len);
+        if(name == "NTLM" || name == "DIGEST-MD5"){
+            if(!mechanisms.empty())mechanisms += ' ';
+            mechanisms += name;
+        }
+    }
+    if(mechanisms.empty())return LDAP_AUTH_METHOD_NOT_SUPPORTED;
+    return ldap_sasl_interactive_bind_s(native,nullptr,mechanisms.c_str(),nullptr,nullptr,
+        LDAP_SASL_QUIET,ldap_bind_prompts,&identity);
+}
 struct LdapConnection {
     LDAP* native{};
     ~LdapConnection(){if(native)ldap_unbind_ext_s(native,nullptr,nullptr);}
@@ -128,7 +172,33 @@ std::optional<std::uint32_t> WindowsServices::invoke_ldap(GuestState& state,Gues
             else {status=ldap_get_option(native,option,&value);if(!status)memory.store(GuestAddress{arg(2)},32,option==LDAP_OPT_RESULT_CODE?ldap_status(value):static_cast<std::uint32_t>(value));}
             return error(status?89:0);
         }
-        if(name.starts_with("ldap_simple_bind_s")){
+        if(name.starts_with("ldap_bind_s") && u32(3) != 0x80U){
+            if(u32(3) != 0x486U)return error(89);
+            // 沙箱沒有宿主登入票證。只使用客體明示的身分與密碼型 SASL 機制。
+            const auto identity_at = arg(2);
+            if(!identity_at)return error(49);
+            const unsigned stride = pointer * 2;
+            const auto flags = memory.load(GuestAddress{identity_at + 2*stride + pointer + 4},32);
+            if(flags != 1 && flags != 2)return error(89);
+            LdapBindIdentity identity;
+            std::array fields{&identity.user, &identity.domain, &identity.password};
+            for(unsigned i = 0; i < fields.size(); ++i){
+                const auto slot = identity_at + i * stride;
+                const auto address = ptr(slot);
+                const auto length = memory.load(GuestAddress{slot + pointer},32);
+                if(length > 4096 || (length && !address))return error(89);
+                if(flags == 1){
+                    *fields[i] = read_bytes(address,length);
+                }else{
+                    std::u16string value;
+                    for(unsigned n = 0; n < length; ++n)
+                        value.push_back(static_cast<char16_t>(memory.load(GuestAddress{address + 2*n},16)));
+                    *fields[i] = utf16_to_utf8(value);
+                }
+            }
+            return error(ldap_status(ldap_password_bind(native,identity)));
+        }
+        if(name.starts_with("ldap_simple_bind_s") || name.starts_with("ldap_bind_s")){
             const auto dn=text(arg(1)),password=text(arg(2));berval credential{password.size(),const_cast<char*>(password.data())};
             return error(ldap_status(ldap_sasl_bind_s(native,arg(1)?dn.c_str():nullptr,LDAP_SASL_SIMPLE,&credential,nullptr,nullptr,nullptr)));
         }

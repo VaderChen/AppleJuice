@@ -16,6 +16,8 @@ std::span<const WindowsServiceDescriptor> ole_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"shlwapi.dll","IUnknown_QueryService",4},{"shcore.dll","IUnknown_QueryService",4},
         {"shlwapi.dll","QISearch",4},
+        {"internal-shell-guid","SHStringFromGUIDA",3,0,0,4},{"internal-shell-guid","SHStringFromGUIDW",3,0,0,4},
+        {"internal-shell-guid","GUIDFromStringA",2},{"internal-shell-guid","GUIDFromStringW",2},
         {"ole32.dll","StringFromGUID2",3},{"ole32.dll","StringFromCLSID",2},{"ole32.dll","StringFromIID",2},{"ole32.dll","CLSIDFromString",2},{"ole32.dll","CLSIDFromProgID",2},{"ole32.dll","IIDFromString",2},
         {"ole32.dll","ProgIDFromCLSID",2},
         {"rpcrt4.dll","UuidFromStringA",2},{"rpcrt4.dll","UuidFromStringW",2},{"rpcrt4.dll","UuidCompare",3},{"rpcrt4.dll","UuidEqual",3},{"rpcrt4.dll","UuidIsNil",2},
@@ -185,6 +187,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole(GuestState& state,Guest
         else {const auto date=static_cast<unsigned>(arg(0))&0xffffU,time=static_cast<unsigned>(arg(1))&0xffffU;fields={(date>>9)+1980,(date>>5)&15,0,date&31,time>>11,(time>>5)&63,(time&31)*2,0};output=arg(2);}
         if(!output)return done(0);const auto value=automation::date_value(fields);if(!value)return done(0);memory.store(GuestAddress{output},64,std::bit_cast<std::uint64_t>(*value));return done(1);
     }
+    if(name=="SHStringFromGUIDA" || name=="SHStringFromGUIDW"){
+        OleGuid guid{};memory.read(GuestAddress{arg(0)},guid);
+        if(static_cast<std::int32_t>(arg(2))<39)return done(0);
+        auto value=windows_guid_text(guid);
+        if(name=="SHStringFromGUIDW")memory.write(GuestAddress{arg(1)},utf16_bytes(value));
+        else {
+            value.push_back(0);
+            memory.write(GuestAddress{arg(1)},std::vector<std::uint8_t>(value.begin(),value.end()));
+        }
+        return done(39);
+    }
     if(name=="StringFromGUID2" || name=="StringFromCLSID" || name=="StringFromIID"){
         const bool caller_buffer=name=="StringFromGUID2";
         if(!arg(0) || !arg(1))return done(caller_buffer?0:e_invalidarg);
@@ -211,18 +224,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole(GuestState& state,Guest
         const auto bytes=utf16_bytes(*registered);const auto pointer=allocate_heap(memory,bytes.size());if(!pointer)return done(e_outofmemory);
         memory.write(GuestAddress{pointer},bytes);memory.store(GuestAddress{arg(1)},bits,pointer);return done(0);
     }
-    if(name=="CLSIDFromString" || name=="CLSIDFromProgID" || name=="IIDFromString" || name.starts_with("UuidFromString")){
-        const bool rpc=name.starts_with("Uuid");if(!arg(1))return done(rpc?87:e_invalidarg);memory.check(GuestAddress{arg(1)},16,Access::Write);
-        if(!arg(0)){if(name=="CLSIDFromProgID")return done(e_invalidarg);memory.write(GuestAddress{arg(1)},OleGuid{});return done(0);}
-        auto text=name=="UuidFromStringA"?utf8_to_utf16(read_ansi(memory,arg(0))):read_utf16(memory,GuestAddress{arg(0)});auto value=name=="CLSIDFromProgID"?std::optional<OleGuid>{}:parse_windows_guid(text,!rpc);
-        if(!value && (name=="CLSIDFromProgID" || (name=="CLSIDFromString" && !text.empty() && text.front()!=u'{'))){
+    const bool shell_parse=name=="GUIDFromStringA" || name=="GUIDFromStringW";
+    const bool clsid_string=name=="CLSIDFromString" || shell_parse;
+    if(clsid_string || name=="CLSIDFromProgID" || name=="IIDFromString" || name.starts_with("UuidFromString")){
+        const auto parsed=[&](std::uint32_t status){return done(shell_parse?static_cast<std::uint32_t>(status==0):status);};
+        const bool rpc=name.starts_with("Uuid");if(!arg(1))return parsed(rpc?87:e_invalidarg);memory.check(GuestAddress{arg(1)},16,Access::Write);
+        if(!arg(0)){if(name=="CLSIDFromProgID")return parsed(e_invalidarg);memory.write(GuestAddress{arg(1)},OleGuid{});return parsed(0);}
+        auto text=name=="GUIDFromStringA"?utf8_to_utf16_lossy(read_ansi(memory,arg(0))):name=="UuidFromStringA"?utf8_to_utf16(read_ansi(memory,arg(0))):read_utf16(memory,GuestAddress{arg(0)});auto value=name=="CLSIDFromProgID"?std::optional<OleGuid>{}:parse_windows_guid(text,!rpc);
+        if(!value && (name=="CLSIDFromProgID" || (clsid_string && !text.empty() && text.front()!=u'{'))){
             if(!registry_file_.empty() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許持久登錄檔 I/O");
-            RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return done(0x80040150U);
+            RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)return parsed(0x80040150U);
             initialize_tokens();RegistryTextView lookup{runtime_.registry,class_registry_roots(runtime_.registry,token_user_sid_string(effective_token_id()),token_user_sid_string(1)),registry_view(0,x86_),false};
             if(!text.empty())if(const auto registered=lookup.value(text+u"\\clsid"))value=parse_windows_guid(*registered,true);
         }
-        if(!value && (name=="CLSIDFromString" || name=="CLSIDFromProgID")){auto progid=text;for(auto& c:progid)if(c>=u'A' && c<=u'Z')c+=32;if(progid==u"shell.explorer" || progid==u"shell.explorer.2")value=webbrowser::clsid;}
-        if(!value)return done(rpc?1705:name=="IIDFromString"?e_invalidarg:0x800401f3U);memory.write(GuestAddress{arg(1)},*value);return done(0);
+        if(!value && (clsid_string || name=="CLSIDFromProgID")){auto progid=text;for(auto& c:progid)if(c>=u'A' && c<=u'Z')c+=32;if(progid==u"shell.explorer" || progid==u"shell.explorer.2")value=webbrowser::clsid;}
+        if(!value)return parsed(rpc?1705:name=="IIDFromString"?e_invalidarg:0x800401f3U);memory.write(GuestAddress{arg(1)},*value);return parsed(0);
     }
     if(name=="UuidCompare" || name=="UuidEqual" || name=="UuidIsNil"){
         OleGuid left{},right{};if(arg(0))memory.read(GuestAddress{arg(0)},left);const auto status=arg(name=="UuidIsNil"?1:2);if(status)memory.store(GuestAddress{status},32,0);

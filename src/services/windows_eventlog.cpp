@@ -1,3 +1,4 @@
+#include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/registry_store.hpp"
@@ -145,10 +146,33 @@ std::uint32_t WindowsServices::data_protection_audit(std::u16string_view descrip
         const auto directory=registry_file_.empty()?std::filesystem::path(mapping_session()):registry_file_.parent_path();append(directory/record_filename(u"security"),record);return 0;
     }catch(const EventError& error){return error.code;}catch(const std::bad_alloc&){return 8;}
 }
+// 物件存取與特殊權限稽核（AccessCheck／Object*／Privileged* AuditAlarm）：與 DPAPI 稽核共用 Security 記錄檔與 EVENTLOGRECORD 格式；
+// 使用者 SID 為呼叫端（模擬中的用戶端）的權杖使用者，category 為工作類別（物件存取 12804、控制代碼操作 12807、敏感權限使用 13056）。
+std::uint32_t WindowsServices::security_audit_event(std::uint32_t id,bool success,std::uint16_t category,std::span<const std::u16string> strings,std::span<const std::uint8_t> sid){
+    try {
+        if(!runtime_.network.external_io)return 50;if(strings.size()>0xffff)return 87;
+        std::vector<std::uint8_t> record(56);put(record,4,0x654c664c);const auto ticks=runtime_.system_filetime();
+        const auto seconds=static_cast<std::uint32_t>(ticks<UINT64_C(116444736000000000)?0:(ticks-UINT64_C(116444736000000000))/10000000);
+        put(record,12,seconds);put(record,16,seconds);put(record,20,id);put(record,24,success?8U:16U,2);put(record,26,static_cast<std::uint32_t>(strings.size()),2);put(record,28,category,2);
+        const auto add=[&](std::u16string_view value){const auto bytes=utf16_bytes(std::u16string(value));record.insert(record.end(),bytes.begin(),bytes.end());};
+        add(u"Microsoft-Windows-Security-Auditing");add(u"X64ARM");record.resize((record.size()+3)&~std::size_t{3});
+        put(record,40,static_cast<std::uint32_t>(sid.size()));put(record,44,static_cast<std::uint32_t>(record.size()));record.insert(record.end(),sid.begin(),sid.end());
+        put(record,36,static_cast<std::uint32_t>(record.size()));for(const auto& value:strings)add(value);
+        put(record,52,static_cast<std::uint32_t>(record.size()));record.resize((record.size()+3)&~std::size_t{3});record.resize(record.size()+4);
+        if(record.size()>0x3ffff)return 1783;put(record,0,static_cast<std::uint32_t>(record.size()));put(record,record.size()-4,static_cast<std::uint32_t>(record.size()));
+        const auto directory=registry_file_.empty()?std::filesystem::path(mapping_session()):registry_file_.parent_path();append(directory/record_filename(u"security"),record);return 0;
+    }catch(const EventError& error){return error.code;}catch(const std::bad_alloc&){return 8;}
+}
 std::span<const WindowsServiceDescriptor> eventlog_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"wevtapi.dll","EvtQuery",4},{"wevtapi.dll","EvtNext",6},{"wevtapi.dll","EvtClose",1},
         {"wevtapi.dll","EvtCreateRenderContext",3},{"wevtapi.dll","EvtRender",7},
+        // 工作階段、訂閱與定位（x86 的 Position 是 LONGLONG）、取消、延伸狀態、書籤、通道列舉與設定、記錄資訊、清除與匯出（windows_wevtapi.inc）。
+        {"wevtapi.dll","EvtOpenSession",4},{"wevtapi.dll","EvtSubscribe",8},{"wevtapi.dll","EvtSeek",5,0x2},{"wevtapi.dll","EvtCancel",1},{"wevtapi.dll","EvtGetExtendedStatus",3},
+        {"wevtapi.dll","EvtCreateBookmark",1},{"wevtapi.dll","EvtUpdateBookmark",2},{"wevtapi.dll","EvtOpenChannelEnum",2},{"wevtapi.dll","EvtNextChannelPath",4},
+        {"wevtapi.dll","EvtOpenChannelConfig",3},{"wevtapi.dll","EvtGetChannelConfigProperty",6},{"wevtapi.dll","EvtSetChannelConfigProperty",4},{"wevtapi.dll","EvtSaveChannelConfig",2},
+        {"wevtapi.dll","EvtOpenLog",3},{"wevtapi.dll","EvtGetLogInfo",5},{"wevtapi.dll","EvtClearLog",4},{"wevtapi.dll","EvtExportLog",5},
+        {"internal-evt-subscription","Deliver",1},
         {"advapi32.dll","OpenEventLogA",2},{"advapi32.dll","OpenEventLogW",2},
         {"advapi32.dll","ReadEventLogA",7},{"advapi32.dll","ReadEventLogW",7},{"advapi32.dll","CloseEventLog",1},
         {"advapi32.dll","GetNumberOfEventLogRecords",2},{"advapi32.dll","GetOldestEventLogRecord",2},
@@ -159,6 +183,7 @@ std::span<const WindowsServiceDescriptor> eventlog_service_descriptors(){
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_eventlog(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.family=="wevtapi.dll" || service.family=="internal-evt-subscription")return invoke_wevtapi(state,memory,service);
     const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W');std::uint64_t result=0;
     const auto text=[&](std::uint64_t address,std::size_t maximum){if(!address)throw EventError{87};return wide?read_utf16(memory,GuestAddress{address},maximum):utf8_to_utf16(read_ansi(memory,address,maximum));};
     const auto log_directory=[&]{return registry_file_.empty()?std::filesystem::path(mapping_session()):registry_file_.parent_path();};
@@ -171,59 +196,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_eventlog(GuestState& state,
         const auto written=opened.file->write(bytes,0);if(written.error)throw EventError{written.error};if(written.bytes!=bytes.size())throw EventError{112};
         if(const auto flushed=opened.file->flush())throw EventError{flushed};};
     try {
-        if(service.family=="wevtapi.dll"){
-            auto& logs=runtime_.eventlog;const auto unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
-            const auto string=[&](std::uint64_t pointer){if(!pointer)throw EventError{87};return read_utf16(memory,GuestAddress{pointer},16384);};
-            const auto new_handle=[&](){if(logs.queries.size()+logs.events.size()+logs.contexts.size()>=4096)throw EventError{8};return logs.next++;};
-            if(symbol=="EvtQuery"){
-                if(arg(0))throw EventError{50};const auto flags=static_cast<unsigned>(arg(3));
-                if((flags&~0x301U) || !(flags&1) || (flags&0x300)==0x300)throw EventError{50};
-                const auto channel=lower(string(arg(1)));if(channel.empty() || channel.find_first_of(u"\\/:")!=channel.npos)throw EventError{15007};
-                const auto query=arg(2)?utf16_to_utf8(string(arg(2))):"*";if(query.empty())throw EventError{15001};if(query.front()=='<')throw EventError{50};
-                auto empty=event_document("<Event><System/></Event>");auto validation=evaluate(empty.get(),query);if(validation->type!=XPATH_NODESET)throw EventError{15001};
-                if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許事件查詢 I/O");
-                if(channel!=u"application" && channel!=u"system" && channel!=u"security"){
-                    RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);if(transaction.error)throw EventError{transaction.error};
-                    const auto prefix=std::u16string(1,u'\2')+u"\\system\\currentcontrolset\\services\\eventlog\\"+channel;
-                    bool exists=false;for(const auto& [key,values]:runtime_.registry.keys){(void)values;if(key==prefix || key.starts_with(prefix+u"\\")){exists=true;break;}}if(!exists)throw EventError{15007};
-                }
-                const auto directory=registry_file_.empty()?std::filesystem::path(mapping_session()):registry_file_.parent_path();auto records=read_records(directory/record_filename(channel),channel==u"application"?u"Application":channel==u"system"?u"System":channel==u"security"?u"Security":string(arg(1)));
-                EventQuery selected;selected.thread=threads_.current;
-                for(auto& record:records){const auto decoded=decode_event(record);auto doc=event_document(decoded.xml);auto matching=evaluate(doc.get(),query);if(matching->nodesetval && matching->nodesetval->nodeNr)selected.records.push_back(std::move(record));}
-                if(flags&0x200)std::reverse(selected.records.begin(),selected.records.end());const auto handle=new_handle();logs.queries.emplace(handle,std::move(selected));result=handle;
-            }else if(symbol=="EvtNext"){
-                const auto found=logs.queries.find(arg(0));if(found==logs.queries.end())throw EventError{6};auto& query=found->second;if(query.thread!=threads_.current)throw EventError{87};
-                const auto capacity=static_cast<unsigned>(arg(1));if(!capacity || capacity>1024 || !arg(2) || !arg(5) || arg(4))throw EventError{87};
-                memory.check(GuestAddress{arg(5)},4,Access::Write);memory.store(GuestAddress{arg(5)},32,0);
-                const auto count=std::min<std::size_t>(capacity,query.records.size()-query.position);if(!count)throw EventError{259};
-                if(logs.events.size()+logs.contexts.size()+logs.queries.size()+count>4096)throw EventError{8};memory.check(GuestAddress{arg(2)},count*unit,Access::Write);
-                std::vector<std::uint64_t> handles;handles.reserve(count);try{for(std::size_t i=0;i<count;++i){auto event=query.records[query.position+i];event.parent=arg(0);const auto handle=new_handle();logs.events.emplace(handle,std::move(event));handles.push_back(handle);}}
-                catch(...){for(auto handle:handles)logs.events.erase(handle);throw;}
-                for(std::size_t i=0;i<count;++i)memory.store(GuestAddress{arg(2)+i*unit},bits,handles[i]);query.position+=count;memory.store(GuestAddress{arg(5)},32,count);result=1;
-            }else if(symbol=="EvtClose"){
-                if(logs.queries.erase(arg(0))){std::erase_if(logs.events,[&](const auto& item){return item.second.parent==arg(0);});result=1;}
-                else if(logs.events.erase(arg(0)) || logs.contexts.erase(arg(0)))result=1;else throw EventError{6};
-            }else if(symbol=="EvtCreateRenderContext"){
-                EventRenderContext context;context.flags=static_cast<unsigned>(arg(2));const auto count=static_cast<unsigned>(arg(0));if(context.flags>2 || count>128 || (context.flags && (count || arg(1))) || (count && !arg(1)))throw EventError{87};
-                auto empty=event_document("<Event/>");for(unsigned i=0;i<count;++i){auto path=utf16_to_utf8(string(memory.load(GuestAddress{arg(1)+i*unit},bits)));auto checked=evaluate(empty.get(),path);if(checked->type!=XPATH_NODESET)throw EventError{15001};context.paths.push_back(std::move(path));}
-                const auto handle=new_handle();logs.contexts.emplace(handle,std::move(context));result=handle;
-            }else if(symbol=="EvtRender"){
-                const auto found=logs.events.find(arg(1));if(found==logs.events.end())throw EventError{6};if(!arg(5) || !arg(6))throw EventError{87};
-                memory.check(GuestAddress{arg(5)},4,Access::Write);memory.check(GuestAddress{arg(6)},4,Access::Write);const auto decoded=decode_event(found->second);std::vector<std::uint8_t> output;unsigned properties=0;
-                if(arg(2)==1){if(arg(0))throw EventError{87};auto xml=decoded.xml;const auto at=xml.find('>');if(at==xml.npos)throw EventError{1500};xml.insert(at," xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"");output=utf16_bytes(utf8_to_utf16(xml));}
-                else if(!arg(2)){
-                    const auto context=logs.contexts.find(arg(0));if(context==logs.contexts.end())throw EventError{6};std::vector<EventValue> values;
-                    if(context->second.flags==1)values.assign(decoded.system.begin(),decoded.system.end());else if(context->second.flags==2)values=decoded.user;
-                    else{auto doc=event_document(decoded.xml);for(const auto& path:context->second.paths)values.push_back(selected_value(doc.get(),path,decoded));}
-                    properties=static_cast<unsigned>(values.size());output.resize(values.size()*16);
-                    for(std::size_t i=0;i<values.size();++i){const auto& value=values[i];put(output,i*16+12,value.type);std::uint64_t data=value.number;
-                        if(value.type==1 || value.type==14 || value.type==19){output.resize((output.size()+7)&~std::size_t{7});data=arg(4)+output.size();output.insert(output.end(),value.bytes.begin(),value.bytes.end());if(value.type==14)put(output,i*16+8,static_cast<unsigned>(value.bytes.size()));}
-                        put(output,i*16,static_cast<unsigned>(data));put(output,i*16+4,static_cast<unsigned>(data>>32));}
-                }else throw EventError{50};
-                memory.store(GuestAddress{arg(5)},32,output.size());memory.store(GuestAddress{arg(6)},32,properties);
-                if(arg(3)<output.size() || (!output.empty() && !arg(4)))throw EventError{122};if(!output.empty())memory.write(GuestAddress{arg(4)},output);result=1;
-            }
-        }else if(symbol.starts_with("OpenEventLog")) {
+        if(symbol.starts_with("OpenEventLog")) {
             const auto server=arg(0)?lower(text(arg(0),256)):std::u16string{};
             if(!server.empty() && server!=u"." && server!=u"x64arm" && server!=u"\\\\x64arm")throw EventError{53};
             auto channel=lower(text(arg(1),254));if(channel.empty() || channel.find_first_of(u"\\/:")!=channel.npos)throw EventError{87};
@@ -334,9 +307,21 @@ std::optional<std::uint32_t> WindowsServices::invoke_eventlog(GuestState& state,
             bool signaled=false;
             for(const auto& [handle,reader]:runtime_.eventlog.readers){(void)handle;if(reader.from_backup || !reader.notify || reader.channel!=found->second.log)continue;
                 const auto event=runtime_.wait_objects.find(reader.notify);if(event!=runtime_.wait_objects.end() && event->second.kind==WaitObject::Kind::Event){event->second.set_signal(true);signaled=true;}}
+            // EvtSubscribe：同一程序中符合查詢的訂閱觸發 signal 事件或排入推送回呼。
+            if(!runtime_.eventlog.subscriptions.empty()){
+                const EventRecord appended{record,found->second.log==u"application"?u"Application":found->second.log==u"system"?u"System":found->second.log,0};
+                for(auto& [handle,subscription]:runtime_.eventlog.subscriptions){
+                    if(subscription.channel!=found->second.log)continue;bool wanted=false;
+                    try{const auto decoded=decode_event(appended);auto doc=event_document(decoded.xml);auto matching=evaluate(doc.get(),subscription.query);wanted=matching->nodesetval && matching->nodesetval->nodeNr>0;}catch(const EventError&){wanted=false;}
+                    if(!wanted)continue;
+                    if(subscription.signal){const auto event=runtime_.wait_objects.find(subscription.signal);if(event!=runtime_.wait_objects.end() && event->second.kind==WaitObject::Kind::Event){event->second.set_signal(true);signaled=true;}}
+                    else if(subscription.callback && !subscription.queued && !queue_pool_callback(state,memory,{resolve("internal-evt-subscription","Deliver").value,{handle}}))subscription.queued=true;
+                }
+            }
             if(signaled)(void)resolve_thread_waits(memory,ThreadWakeScope::Objects);
         }
     }catch(const EventError& error){last_error_=error.code;}catch(const MemoryFault&){last_error_=998;}catch(const std::bad_alloc&){last_error_=8;}
     arg.return_to(state,result);return std::nullopt;
 }
+#include "windows_wevtapi.inc"
 }

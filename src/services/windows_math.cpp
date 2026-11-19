@@ -154,7 +154,7 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"msvbvm60.dll","_allmul",2,3},{"crt","_allmul",2,3},
         {"msvbvm60.dll","_CIatan",0},{"msvbvm60.dll","_CIcos",0},{"msvbvm60.dll","_CIexp",0},
         {"msvbvm60.dll","_CIlog",0},{"msvbvm60.dll","_CIsin",0},{"msvbvm60.dll","_CIsqrt",0},{"msvbvm60.dll","_CItan",0},
-        {"crt", "_ecvt_s", 6},{"crt","_fcvt_s",6},{"crt","_ecvt",4},{"crt","_fcvt",4},{"crt","div",2},{"crt","ldiv",2},{"crt","lldiv",3},{"crt","imaxdiv",3},
+        {"crt", "_ecvt_s", 6},{"crt","_fcvt_s",6},{"crt","_ecvt",4},{"crt","_fcvt",4},{"crt","_gcvt",3},{"crt","_gcvt_s",4},{"crt","div",2},{"crt","ldiv",2},{"crt","lldiv",3},{"crt","imaxdiv",3},
         {"crt","_dtest",1},{"crt","_fdtest",1},{"crt","_ldtest",1},
         {"crt","wcstod",2},{"crt","wcstof",2},{"crt","_wtof",1},
         {"crt","_CIacos",0},{"crt","_CIasin",0},{"crt","_CIatan",0},{"crt","_CIatan2",0},
@@ -163,7 +163,7 @@ std::span<const WindowsServiceDescriptor> math_service_descriptors() {
         {"crt","_CIsinh",0},{"crt","_CIsqrt",0},{"crt","_CItan",0},{"crt","_CItanh",0},
         {"crt","_ftol",0},{"crt","_ftol2",0},{"crt","_ftol2_sse",0},
         {"crt","_clear87",0},{"crt","_clearfp",0},{"crt","_status87",0},{"crt","_statusfp",0},{"crt","_statusfp2",2},
-        {"crt", "fetestexcept", 1}, {"crt", "feclearexcept", 1}, {"crt","fegetround",0},{"crt","fesetround",1},{"crt","fegetenv",1},{"crt","fesetenv",1},{"crt","feholdexcept",1},{"crt","fegetexceptflag",2},{"crt","fesetexceptflag",2}, {"crt", "_dclass", 1}, {"crt", "_fdclass", 1}, {"crt", "_ldclass", 1}, {"crt", "_fpclass", 1}, {"crt", "_fpclassf", 1}, {"crt", "_dsign", 1}, {"crt", "_fdsign", 1}, {"crt", "_ldsign", 1}, {"crt", "_control87", 2}, {"crt", "_controlfp", 2}, {"crt","_controlfp_s",3},
+        {"crt", "fetestexcept", 1}, {"crt", "feclearexcept", 1}, {"crt","fegetround",0},{"crt","fesetround",1},{"crt","fegetenv",1},{"crt","fesetenv",1},{"crt","feholdexcept",1},{"crt","fegetexceptflag",2},{"crt","fesetexceptflag",2}, {"crt","feraiseexcept",1},{"crt","feupdateenv",1}, {"crt", "_dclass", 1}, {"crt", "_fdclass", 1}, {"crt", "_ldclass", 1}, {"crt", "_fpclass", 1}, {"crt", "_fpclassf", 1}, {"crt", "_dsign", 1}, {"crt", "_fdsign", 1}, {"crt", "_ldsign", 1}, {"crt", "_control87", 2}, {"crt", "_controlfp", 2}, {"crt","_controlfp_s",3},
         {"crt","__fpe_flt_rounds",0},{"crt","_fpreset",0},{"crt","_except1",6,12},
         {"crt","_dpcomp",2,3},{"crt","_fdpcomp",2},{"crt","ilogb",1,1},{"crt","ilogbf",1},
         {"crt", "acos", 1,1}, {"crt", "acosh", 1,1}, {"crt", "asin", 1,1}, {"crt", "asinh", 1,1},
@@ -436,6 +436,15 @@ unsigned scalar_math_recipe(const WindowsServiceDescriptor& service) noexcept {
         if(operation->name=="roundf")return 28;
         if(operation->name=="round")return 29;
     }
+    // 正規正數與正負零共用核心 FSQRT；特殊值沿原純量服務保留 errno／FP 契約。
+    static const bool square_root_recipes=[] {
+        const auto* setting=std::getenv("X64ARM_SCALAR_SQRT_RECIPES");
+        return !setting || std::string_view(setting)!="0";
+    }();
+    if(square_root_recipes){
+        if(operation->name=="sqrtf")return 30;
+        if(operation->name=="sqrt")return 31;
+    }
     return 0;
 }
 namespace {
@@ -544,8 +553,8 @@ static bool invoke_native_scalar_math_impl(ResidentScalarCall& call,GuestMemory&
         }
 #endif
         Environment environment(mxcsr,&call.environment);
-        const auto input_double=[&](unsigned n){return std::bit_cast<double>(n?call.second:call.first);};
-        const auto input_float=[&](unsigned n){return std::bit_cast<float>(static_cast<std::uint32_t>(n?call.second:call.first));};
+        const auto input_double=[&](unsigned n){return std::bit_cast<double>(static_cast<std::uint64_t>(x64arm_math_input_float_bits(n?call.second:call.first,64,mxcsr)));};
+        const auto input_float=[&](unsigned n){return std::bit_cast<float>(static_cast<std::uint32_t>(x64arm_math_input_float_bits(n?call.second:call.first,32,mxcsr)));};
         double value{};float single_value{};
         if(operation.integer){
             const auto& conversion=*operation.integer;
@@ -611,8 +620,11 @@ void invoke_scalar_math(GuestState& state,GuestMemory& memory,const WindowsServi
     }
 #endif
     Environment environment(stack_float?static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13:state.mxcsr,boundary);
-    const auto input_double=[&](unsigned n){return stack_float?std::bit_cast<double>(arg(n)):scalar(state,n);};
-    const auto input_float=[&](unsigned n){return stack_float?std::bit_cast<float>(static_cast<std::uint32_t>(arg(n))):scalar_float(state,n);};
+    // x87 的堆疊 ABI 不受 MXCSR.DAZ 影響；Win64 與 SSE2 helper 共用位元輸入契約。
+    const auto input_double=[&](unsigned n){return stack_float?std::bit_cast<double>(arg(n)):
+        std::bit_cast<double>(static_cast<std::uint64_t>(x64arm_math_input_float_bits(std::bit_cast<std::uint64_t>(scalar(state,n)),64,state.mxcsr)));};
+    const auto input_float=[&](unsigned n){return stack_float?std::bit_cast<float>(static_cast<std::uint32_t>(arg(n))):
+        std::bit_cast<float>(static_cast<std::uint32_t>(x64arm_math_input_float_bits(std::bit_cast<std::uint32_t>(scalar_float(state,n)),32,state.mxcsr)));};
     if(operation.integer){
         const auto& conversion=*operation.integer;
         const auto value=round_integer(conversion.single?static_cast<double>(input_float(0)):input_double(0),conversion);
@@ -980,6 +992,30 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         }
         arg.return_to(state,result);return std::nullopt;
     }
+    if(symbol=="feraiseexcept" || symbol=="feupdateenv"){
+        // feraiseexcept：依實際運算的順序設定旗標（無效、除以零、溢位＋不精確、下溢＋不精確、不精確），與以運算引發相同；
+        // 該例外在 MXCSR 未遮罩時與 SIMD 浮點陷阱相同以 STATUS_FLOAT_MULTIPLE_TRAPS 派送，處理常式續行後回傳 0，不再引發其餘例外。
+        // feupdateenv：保存目前的例外旗標、安裝 env（與 fesetenv 相同），再引發保存的旗標。
+        std::uint32_t excepts=0;
+        if(symbol=="feupdateenv"){
+            if(!arg(0)){arg.return_to(state,1);return std::nullopt;}
+            excepts=fenv_status()&0x1fU;const auto all=0x8031fU|(x86_?0x70000U:0U)|0x3000000U;
+            (void)apply_control(static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},32)),all);fenv_set_status(0x8001fU,static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)+4},32)));
+        }else{excepts=static_cast<std::uint32_t>(arg(0));if(excepts&~0x1fU){arg.return_to(state,1);return std::nullopt;}}
+        for(const auto requested:{0x10U,8U,4U,2U,1U}){
+            if(!(excepts&requested))continue;
+            const auto raised=requested|((requested==4U || requested==2U)?1U:0U);fenv_set_status(raised,raised);
+            bool unmasked=false;
+            for(unsigned n=0;n<fenv_exceptions.size();++n)if((raised&fenv_exceptions[n]) && !(state.mxcsr&(1U<<(7+n))))unmasked=true;
+            if(!unmasked)continue;
+            constexpr std::uint32_t multiple_traps=0xc00002b5U;
+            auto caller=state;arg.return_to(caller,0);
+            if(emit_debug_event(caller,memory,debugger::Exception{multiple_traps,0,0,caller.rip.value,{},true})!=debugger::handled)
+                begin_exception(caller,memory,multiple_traps,0,{});
+            state=caller;return std::nullopt;
+        }
+        arg.return_to(state,0);return std::nullopt;
+    }
     if(symbol=="_control87" || symbol=="_controlfp" || symbol=="_controlfp_s") {
         const bool secure=symbol=="_controlfp_s";const unsigned first=secure?1U:0U;
         const auto requested=static_cast<std::uint32_t>(arg(first));
@@ -1055,6 +1091,35 @@ std::optional<std::uint32_t> WindowsServices::invoke_math(GuestState& state, Gue
         std::vector<std::uint8_t> output(digits.mantissa.begin(),digits.mantissa.end());output.push_back(0);memory.write(GuestAddress{buffer},output);
         memory.store(GuestAddress{decimal},32,static_cast<std::uint32_t>(digits.point));memory.store(GuestAddress{sign},32,digits.negative?1:0);
         arg.return_to(state,buffer);return std::nullopt;
+    }
+    if(symbol=="_gcvt" || symbol=="_gcvt_s"){
+        // _gcvt(value, digits, buffer)／_gcvt_s(buffer, sizeInBytes, value, digits)：與 _ecvt 同一套取位後，四捨五入後的指數 < -1 或 > digits-1 時用
+        // 指數格式（小數 digits-1 位、指數三位數），否則用小數格式（小數 digits-小數點位置 位）；去掉尾端的零但保留小數點（1.0 → "1."）。
+        // 位數小於 1 視為 1；小數點取目前 CRT locale。
+        const bool secure=symbol=="_gcvt_s";
+        const auto value=x86_?std::bit_cast<double>(memory.load(GuestAddress{state.reg(Gpr::Rsp)+(secure?12U:4U)},64)):scalar(state,secure?2:0);
+        const auto requested=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+(secure?20U:12U)},32):arg(secure?3:1)));
+        const auto buffer=secure?arg(0):x86_?memory.load(GuestAddress{state.reg(Gpr::Rsp)+16},32):arg(2);
+        const auto size=secure?arg(1):UINT64_MAX;
+        if(!buffer || !size || (secure && requested>=0 && static_cast<std::uint64_t>(requested)>=size))return cvt_invalid(secure?22U:0U);
+        const auto count=std::clamp<std::int32_t>(requested,1,347);
+        const auto digits=cvt_digits(value,count,false);const auto magnitude=digits.point-1;
+        char decimal='.';{const auto symbol_text=windows_crt_numeric(current_crt_locale(state,memory).categories[4]).decimal;if(symbol_text.size()==1)decimal=static_cast<char>(symbol_text[0]);}
+        std::string text=digits.negative?"-":"";
+        if(magnitude<-1 || magnitude>count-1){
+            text.push_back(digits.mantissa.front());if(count>1){text.push_back(decimal);text.append(digits.mantissa.begin()+1,digits.mantissa.end());}
+            std::string exponent=std::to_string(std::abs(magnitude));exponent.insert(exponent.begin(),exponent.size()<3?3-exponent.size():0,'0');
+            const auto mark=text.find(decimal);if(mark!=text.npos){while(text.back()=='0')text.pop_back();}
+            text+=magnitude<0?"e-":"e+";text+=exponent;
+        }else{
+            if(digits.point<=0){text+="0";text.push_back(decimal);text.append(static_cast<std::size_t>(-digits.point),'0');text+=digits.mantissa;}
+            else{const auto whole=std::min<std::size_t>(digits.mantissa.size(),static_cast<std::size_t>(digits.point));text+=digits.mantissa.substr(0,whole);
+                if(whole<digits.mantissa.size()){text.push_back(decimal);text+=digits.mantissa.substr(whole);}}
+            if(text.find(decimal)!=text.npos)while(text.back()=='0')text.pop_back();
+        }
+        if(text.size()+1>size){memory.store(GuestAddress{buffer},8,0);memory.store(GuestAddress{runtime_.errno_cell},32,34);arg.return_to(state,34);return std::nullopt;}
+        std::vector<std::uint8_t> output(text.begin(),text.end());output.push_back(0);memory.write(GuestAddress{buffer},output);
+        arg.return_to(state,secure?0:buffer);return std::nullopt;
     }
     Environment environment(x86_?static_cast<std::uint32_t>((state.x87_control>>10)&3U)<<13:state.mxcsr);
     // Win32 cdecl 依描述表讀取 4／8-byte 堆疊參數；Win64 使用 XMM。

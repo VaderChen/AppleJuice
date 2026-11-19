@@ -10,7 +10,8 @@ inline constexpr std::uint32_t success=0x00110000,invalid_preparsed=0xc0110001,
     invalid_type=0xc0110002,invalid_length=0xc0110003,usage_not_found=0xc0110004,
     value_out_of_range=0xc0110005,bad_log_phy_values=0xc0110006,buffer_too_small=0xc0110007,
     null_value=0x80110001,
-    incompatible_id=0xc011000a,not_value_array=0xc011000b,report_not_found=0xc0110010;
+    i8042_trans_unknown=0xc0110009,incompatible_id=0xc011000a,not_value_array=0xc011000b,is_value_array=0xc011000c,
+    data_index_not_found=0xc011000d,button_not_pressed=0xc011000f,report_not_found=0xc0110010;
 struct Error:std::runtime_error {
     std::uint32_t status;
     explicit Error(std::uint32_t value):std::runtime_error("HID 報告或預解析資料無效"),status(value){}
@@ -28,8 +29,11 @@ struct Field {
     unsigned value_count(unsigned element)const;
     unsigned indices()const;
 };
+// HIDP_LINK_COLLECTION_NODE：0 號是頂層集合；子集合以 FirstChild／NextSibling 串接（後宣告者在前），沒有則為 0。
+struct LinkNode {Usage usage{};unsigned parent{},children{},next_sibling{},first_child{},type{};};
 struct Layout {
     Usage usage{};std::uint16_t links{};
+    std::vector<LinkNode> nodes;
     std::vector<Field> fields;
     std::array<std::array<unsigned,256>,3> report_bytes{};
     std::array<unsigned,3> data_indices{};

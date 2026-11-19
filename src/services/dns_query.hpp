@@ -4,6 +4,8 @@
 #include <arpa/nameser.h>
 #include <resolv.h>
 #include <netdb.h>
+#include <poll.h>
+#include <unistd.h>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -54,6 +56,29 @@ inline std::vector<Record> parse_message(const std::uint8_t* packet,int count){
     }
     return records;
 }
+// libresolv 狀態：res_ninit 後可改用呼叫端指定的伺服器（原生 sockaddr 位元組）；查詢與動態更新共用。
+struct Resolver {
+    struct __res_state state{};bool initialized{};
+    Resolver()=default;Resolver(const Resolver&)=delete;Resolver& operator=(const Resolver&)=delete;
+    ~Resolver(){if(initialized){
+#if defined(__APPLE__)
+        ::res_ndestroy(&state);
+#else
+        ::res_nclose(&state);
+#endif
+    }}
+    void open(const std::vector<std::vector<std::uint8_t>>* servers){
+        if(::res_ninit(&state))throw Error{9002};initialized=true;
+        if(!servers || servers->empty())return;
+#if defined(__APPLE__)
+        std::vector<res_sockaddr_union> list;for(const auto& bytes:*servers){res_sockaddr_union item{};std::memcpy(&item,bytes.data(),std::min(bytes.size(),sizeof(item)));list.push_back(item);}
+        ::res_setservers(&state,list.data(),static_cast<int>(list.size()));
+#else
+        int count=0;for(const auto& bytes:*servers)if(bytes.size()>=sizeof(sockaddr_in) && reinterpret_cast<const sockaddr*>(bytes.data())->sa_family==AF_INET && count<MAXNS)std::memcpy(&state.nsaddr_list[count++],bytes.data(),sizeof(sockaddr_in));
+        if(!count)throw Error{87};state.nscount=count;
+#endif
+    }
+};
 // servers：DnsQueryEx 的 pDnsServerList（原生 sockaddr 位元組）；指定時直接詢問這些伺服器，不讀寫快取與 hosts。
 inline std::vector<Record> query(std::string name,std::uint16_t type,std::uint32_t options,const std::vector<std::vector<std::uint8_t>>* servers=nullptr){
     if(name.empty() || name.size()>253 || !type)throw Error{87};
@@ -81,23 +106,7 @@ inline std::vector<Record> query(std::string name,std::uint16_t type,std::uint32
         if(!records.empty())return records;
     }
     if(options&0x10U)throw Error{9501};
-    struct Resolver {struct __res_state state{};bool initialized{};~Resolver(){if(initialized){
-#if defined(__APPLE__)
-        ::res_ndestroy(&state);
-#else
-        ::res_nclose(&state);
-#endif
-    }}} resolver;
-    if(::res_ninit(&resolver.state))throw Error{9002};resolver.initialized=true;
-    if(custom){
-#if defined(__APPLE__)
-        std::vector<res_sockaddr_union> list;for(const auto& bytes:*servers){res_sockaddr_union item{};std::memcpy(&item,bytes.data(),std::min(bytes.size(),sizeof(item)));list.push_back(item);}
-        ::res_setservers(&resolver.state,list.data(),static_cast<int>(list.size()));
-#else
-        int count=0;for(const auto& bytes:*servers)if(bytes.size()>=sizeof(sockaddr_in) && reinterpret_cast<const sockaddr*>(bytes.data())->sa_family==AF_INET && count<MAXNS)std::memcpy(&resolver.state.nsaddr_list[count++],bytes.data(),sizeof(sockaddr_in));
-        if(!count)throw Error{87};resolver.state.nscount=count;
-#endif
-    }
+    Resolver resolver;resolver.open(custom?servers:nullptr);
     if(options&1U)resolver.state.options|=RES_IGNTC;if(options&2U)resolver.state.options|=RES_USEVC;if(options&4U)resolver.state.options&=~static_cast<decltype(resolver.state.options)>(RES_RECURSE);
     std::array<std::uint8_t,65536> packet{};
     const auto count=options&0x1000U?::res_nquery(&resolver.state,name.c_str(),ns_c_in,type,packet.data(),static_cast<int>(packet.size())):
@@ -150,5 +159,90 @@ inline Blob pack(const Record& record,unsigned unit,unsigned charset){
     default:put(header,record.bytes.size());std::copy(record.bytes.begin(),record.bytes.end(),blob.bytes.begin()+header+4);break;
     }
     return blob;
+}
+
+// RR 的 RDATA 線路格式（名稱不壓縮）；pack／parse_message 的反向，供動態更新使用。
+inline std::vector<std::uint8_t> encode_rdata(const Record& record){
+    std::vector<std::uint8_t> out;const auto put16=[&](std::uint32_t value){out.push_back(static_cast<std::uint8_t>(value>>8));out.push_back(static_cast<std::uint8_t>(value));};
+    const auto put32=[&](std::uint32_t value){put16(value>>16);put16(value&0xffffU);};
+    const auto name=[&](std::size_t index){if(index>=record.names.size())throw Error{87};const auto bytes=encode_name(record.names[index]);out.insert(out.end(),bytes.begin(),bytes.end());};
+    const auto number=[&](std::size_t index){if(index>=record.numbers.size())throw Error{87};return record.numbers[index];};
+    switch(record.type){
+    case 1:case 28:if(record.bytes.size()!=(record.type==1?4U:16U))throw Error{87};return record.bytes;
+    case 2:case 3:case 4:case 5:case 7:case 8:case 9:case 12:case 39:name(0);break;
+    case 6:name(0);name(1);for(std::size_t i=0;i<5;++i)put32(number(i));break;
+    case 14:case 17:name(0);name(1);break;
+    case 15:case 18:case 21:put16(number(0));name(0);break;
+    case 33:for(std::size_t i=0;i<3;++i)put16(number(i));name(0);break;
+    case 13:case 16:case 19:case 20:for(const auto& text:record.names){if(text.size()>255)throw Error{87};out.push_back(static_cast<std::uint8_t>(text.size()));out.insert(out.end(),text.begin(),text.end());}break;
+    default:return record.bytes;
+    }
+    return out;
+}
+// RFC 2136 動態更新：先以 SOA 查詢找出 zone（答案區或授權區的 SOA 擁有者，沒有 SOA 時逐層往上），再送 UPDATE 到同一組伺服器。
+// replace：先刪除整個 RRset（class ANY）再新增；否則刪除指定 RR（class NONE）後新增。回應的 RCODE 對應 DNS_ERROR_RCODE_*（9000＋RCODE）。
+inline std::uint32_t update(const std::vector<Record>& adds,const std::vector<Record>& deletes,bool replace,const std::vector<std::vector<std::uint8_t>>* servers){
+    const auto& sample=!adds.empty()?adds.front():deletes.front();
+    Resolver resolver;resolver.open(servers);
+    // 伺服器清單：呼叫端指定者或系統 resolver 的設定。res_nsend 會把 REFUSED／SERVFAIL／NOTIMP 當成換下一台並回報失敗，
+    // 動態更新需要原樣的 RCODE，因此自行以 UDP 交換：每台伺服器送兩次、各等 2 秒，回應 ID 相符才採用。
+    std::vector<sockaddr_storage> targets;
+    if(servers && !servers->empty()){for(const auto& bytes:*servers){sockaddr_storage item{};std::memcpy(&item,bytes.data(),std::min(bytes.size(),sizeof(item)));targets.push_back(item);}}
+    else{
+#if defined(__APPLE__)
+        std::array<res_sockaddr_union,MAXNS> list{};const auto count=::res_getservers(&resolver.state,list.data(),static_cast<int>(list.size()));
+        for(int i=0;i<count;++i){sockaddr_storage item{};std::memcpy(&item,&list[static_cast<std::size_t>(i)],std::min(sizeof(item),sizeof(list[0])));targets.push_back(item);}
+#else
+        for(int i=0;i<resolver.state.nscount;++i){sockaddr_storage item{};std::memcpy(&item,&resolver.state.nsaddr_list[i],sizeof(sockaddr_in));targets.push_back(item);}
+#endif
+    }
+    if(targets.empty())throw Error{9852}; // DNS_ERROR_NO_DNS_SERVERS
+    std::array<std::uint8_t,65536> answer{};
+    const auto send=[&](const std::uint8_t* message,int size)->int{
+        for(const auto& target:targets){
+            const auto family=target.ss_family;const auto length=static_cast<socklen_t>(family==AF_INET6?sizeof(sockaddr_in6):sizeof(sockaddr_in));
+            const int socket=::socket(family,SOCK_DGRAM,0);if(socket<0)continue;
+            struct Close {int fd;~Close(){::close(fd);}} close_socket{socket};
+            for(int attempt=0;attempt<2;++attempt){
+                if(::sendto(socket,message,static_cast<std::size_t>(size),0,reinterpret_cast<const sockaddr*>(&target),length)!=size)break;
+                const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+                for(;;){
+                    const auto left=std::chrono::duration_cast<std::chrono::milliseconds>(until-std::chrono::steady_clock::now()).count();if(left<=0)break;
+                    pollfd wait{socket,POLLIN,0};if(::poll(&wait,1,static_cast<int>(left))<=0)break;
+                    const auto count=::recv(socket,answer.data(),answer.size(),0);
+                    if(count>=12 && answer[0]==message[0] && answer[1]==message[1] && (answer[2]&0x80))return static_cast<int>(count);
+                }
+            }
+        }
+        throw Error{1460};
+    };
+    std::string zone;
+    for(std::string candidate=sample.name;zone.empty();){
+        std::array<std::uint8_t,NS_PACKETSZ> query{};
+        const auto size=::res_nmkquery(&resolver.state,ns_o_query,candidate.c_str(),ns_c_in,ns_t_soa,nullptr,0,nullptr,query.data(),static_cast<int>(query.size()));if(size<0)throw Error{123};
+        const auto count=send(query.data(),size);ns_msg message{};if(::ns_initparse(answer.data(),count,&message))throw Error{9502};
+        const auto rcode=ns_msg_getflag(message,ns_f_rcode);
+        for(const auto section:{ns_s_an,ns_s_ns})for(int index=0;zone.empty() && index<ns_msg_count(message,section);++index){
+            ns_rr rr{};if(::ns_parserr(&message,section,index,&rr))throw Error{9502};if(ns_rr_type(rr)==ns_t_soa)zone=ns_rr_name(rr);
+        }
+        if(!zone.empty())break;
+        if(rcode && rcode!=ns_r_nxdomain)throw Error{9000U+static_cast<std::uint32_t>(rcode)};
+        const auto dot=candidate.find('.');if(dot==std::string::npos || dot+1>=candidate.size())throw Error{9010}; // DNS_ERROR_RCODE_NOTZONE
+        candidate=candidate.substr(dot+1);
+    }
+    std::vector<std::uint8_t> message(12);
+    const auto put16=[&](std::uint32_t value){message.push_back(static_cast<std::uint8_t>(value>>8));message.push_back(static_cast<std::uint8_t>(value));};
+    const auto put32=[&](std::uint32_t value){put16(value>>16);put16(value&0xffffU);};
+    const auto put_name=[&](const std::string& name){const auto bytes=encode_name(name);message.insert(message.end(),bytes.begin(),bytes.end());};
+    std::uint16_t id=0;::arc4random_buf(&id,sizeof id);message[0]=static_cast<std::uint8_t>(id>>8);message[1]=static_cast<std::uint8_t>(id);message[2]=5U<<3; // opcode UPDATE
+    message[5]=1; // ZOCOUNT
+    const auto updates=static_cast<std::uint32_t>(adds.size()+deletes.size()+(replace?1U:0U));if(updates>0xffffU)throw Error{87};message[8]=static_cast<std::uint8_t>(updates>>8);message[9]=static_cast<std::uint8_t>(updates);
+    put_name(zone);put16(ns_t_soa);put16(ns_c_in);
+    if(replace){put_name(sample.name);put16(sample.type);put16(ns_c_any);put32(0);put16(0);}
+    for(const auto& record:deletes){const auto data=encode_rdata(record);put_name(record.name);put16(record.type);put16(ns_c_none);put32(0);put16(static_cast<std::uint32_t>(data.size()));message.insert(message.end(),data.begin(),data.end());}
+    for(const auto& record:adds){const auto data=encode_rdata(record);put_name(record.name);put16(record.type);put16(ns_c_in);put32(record.ttl);put16(static_cast<std::uint32_t>(data.size()));message.insert(message.end(),data.begin(),data.end());}
+    if(message.size()>65535)throw Error{87};
+    const auto count=send(message.data(),static_cast<int>(message.size()));ns_msg reply{};if(::ns_initparse(answer.data(),count,&reply))throw Error{9502};
+    const auto rcode=ns_msg_getflag(reply,ns_f_rcode);return rcode?9000U+static_cast<std::uint32_t>(rcode):0U;
 }
 }

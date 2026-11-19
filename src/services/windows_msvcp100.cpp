@@ -277,7 +277,6 @@ void WindowsServices::initialize_msvcp100(GuestMemory& memory){
         s.data14.emplace(std::string("??_7?$numpunct@")+character+"@std@@6B@",tables.numpunct);
         s.data14.emplace(std::string("??_7?$num_put@")+character+"V?$ostreambuf_iterator@"+character+"U?$char_traits@"+character+"@std@@@std@@@std@@6B@",tables.num_put);
     }
-    s.data14.emplace("?_Raise_handler@std@@3P6AXAEBVexception@stdext@@@ZEA",runtime_allocate(memory,{},l.p));
     // locale::id::_Id_cnt 是匯出的 static int；inline locale::id 轉換與 ??Bid 共用同一個客體計數，已預建 8 個標準 facet id。
     s.id_count14=runtime_allocate(memory,{},4);memory.store(GuestAddress{s.id_count14},32,8);s.data14.emplace("?_Id_cnt@id@locale@std@@0HA",s.id_count14);
     s.ostream_vb=runtime_allocate(memory,{},8);memory.store(GuestAddress{s.ostream_vb+4},32,8);

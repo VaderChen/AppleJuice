@@ -46,6 +46,25 @@ std::optional<std::u16string> clip_text(const GuiClipboardEntry& entry){
     else{const auto end=std::find(entry.bytes.begin(),entry.bytes.end(),0);if(end!=entry.bytes.end())return utf8_to_utf16_lossy(std::string(entry.bytes.begin(),end));}
     return {};
 }
+// TYMED_GDI 的 CF_PALETTE 保存獨立的 PALETTEENTRY 快照。
+bool clip_save_palette(const GuiState& gui,std::uint64_t handle,GuiClipboardEntry& entry){
+    const auto found=gui.palettes.find(handle);
+    if(found==gui.palettes.end())return false;
+    const auto& colors=found->second.entries;
+    entry.bytes.resize(colors.size()*4);
+    for(std::size_t i=0;i<colors.size();++i)
+        for(unsigned channel=0;channel<4;++channel)entry.bytes[4*i+channel]=static_cast<std::uint8_t>(colors[i]>>(8*channel));
+    return true;
+}
+std::uint64_t clip_palette(GuiState& gui,const GuiClipboardEntry& entry){
+    GuiState::Palette palette;
+    for(std::size_t i=0;i+4<=entry.bytes.size();i+=4){
+        std::uint32_t color=0;
+        for(unsigned channel=0;channel<4;++channel)color|=std::uint32_t(entry.bytes[i+channel])<<(8*channel);
+        palette.entries.push_back(color);
+    }
+    const auto handle=gui.next_object++;gui.palettes.emplace(handle,std::move(palette));return handle;
+}
 std::uint64_t clip_payload(const std::vector<GuiClipboardEntry>& entries){
     std::uint64_t total=0;for(const auto& entry:entries){const auto size=entry.bytes.size()+(entry.bitmap?entry.bitmap->pixels.size()*4:0)+(entry.metafile?entry.metafile->bytes.size():0);
         if(size>clip_limit-total)return clip_limit+1;total+=size;}return total;
@@ -99,7 +118,7 @@ void WindowsServices::discard_ole_clipboard(GuestState& state,GuestMemory& memor
     for(const auto& [thread,object]:op.releases)if(object){const auto retirement=release_com_proxy_owned(state,memory,{thread,object});if(retirement)queue_com_proxy_retirement(memory,retirement);}
     if(op.global)op.resources.emplace_back(1,op.global);
     for(const auto& [type,handle]:op.resources){
-        if(type==16){gui_.bitmaps.erase(handle);rasters_.erase(handle);}else if(type==64)gui_.metafiles.erase(handle);
+        if(type==16){gui_.bitmaps.erase(handle);gui_.palettes.erase(handle);rasters_.erase(handle);}else if(type==64)gui_.metafiles.erase(handle);
         else if(const auto global=gui_.global_memory.find(handle);global!=gui_.global_memory.end() && !global->second.clipboard_owned){if(global->second.address)(void)free_heap(memory,global->second.address,state);gui_.global_memory.erase(global);}
     }
     if(op.buffer)(void)free_heap(memory,op.buffer,state);
@@ -211,6 +230,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_clipboard(GuestState& s
             for(const auto& [format,handle]:gui_.clipboard)if(handle && std::none_of(operation.entries.begin(),operation.entries.end(),[&](const auto& entry){return entry.format.format==format;})){
                 GuiClipboardEntry entry;entry.format.format=format;entry.type=gui_.clipboard_types.contains(format)?gui_.clipboard_types.at(format):1U;entry.format.tymed=entry.type;
                 if(entry.type==1){const auto global=gui_.global_memory.find(handle);if(global==gui_.global_memory.end())continue;if(global->second.size>clip_limit)return done(clip_memory);entry.bytes.resize(static_cast<std::size_t>(global->second.size));if(!entry.bytes.empty())memory.read(GuestAddress{global->second.address},entry.bytes);}
+                else if(entry.type==16 && format==9){if(!clip_save_palette(gui_,handle,entry))continue;}
                 else if(entry.type==16){sync_raster_bitmap(memory,handle);const auto bitmap=gui_.bitmaps.find(handle);if(bitmap==gui_.bitmaps.end())continue;entry.bitmap=bitmap->second;entry.bitmap->dib_address=entry.bitmap->dib_view=entry.bitmap->dib_section=0;}
                 else if(entry.type==64){const auto metafile=gui_.metafiles.find(handle);if(metafile==gui_.metafiles.end())continue;entry.metafile=metafile->second;}
                 else continue;operation.entries.push_back(std::move(entry));
@@ -286,6 +306,7 @@ std::optional<std::uint32_t> WindowsServices::resume_ole_clipboard(GuestState& s
         const auto format=entry.format.format;if(op.prepared.contains(format) || entry.format.aspect!=1 || entry.format.index!=-1 || !entry.format.device.empty())return true;
         std::uint64_t handle{};std::uint32_t type=entry.type;
         if(type==1 || type==4 || type==8){type=1;handle=allocate_gui_global(memory,entry.bytes.size(),2);if(handle && !entry.bytes.empty())memory.write(GuestAddress{gui_.global_memory.at(handle).address},entry.bytes);}
+        else if(type==16 && format==9)handle=clip_palette(gui_,entry);
         else if(type==16 && entry.bitmap){handle=gui_.next_object++;gui_.bitmaps.emplace(handle,*entry.bitmap);}
         else if(type==64 && entry.metafile){handle=gui_.next_object++;gui_.metafiles.emplace(handle,*entry.metafile);}
         if(!handle)return false;op.resources.emplace_back(type,handle);op.prepared.emplace(format,std::make_pair(type,handle));return true;
@@ -316,6 +337,7 @@ std::optional<std::uint32_t> WindowsServices::resume_ole_clipboard(GuestState& s
         const auto& entry=op.entries.front();
         const auto output_medium=[&](std::uint64_t value){if(!op.here){memory.check(GuestAddress{op.output},3*unit,Access::Write);memory.store(GuestAddress{op.output},32,op.type);memory.store(GuestAddress{op.output+unit},bits,value);memory.store(GuestAddress{op.output+2*unit},bits,0);op.global=0;op.storage=0;}return finish(0);};
         if(op.stage==Stage::Start){
+            if(op.type==16 && entry.format.format==9 && !op.here)return output_medium(clip_palette(gui_,entry));
             if(op.type==16 || op.type==64){if(op.here)return finish(clip_tymed);const auto handle=gui_.next_object++;
                 if(op.type==16 && entry.bitmap)gui_.bitmaps.emplace(handle,*entry.bitmap);else if(op.type==64 && entry.metafile)gui_.metafiles.emplace(handle,*entry.metafile);else return finish(clip_tymed);return output_medium(handle);}
             if(op.type==1 && op.here){const auto global=gui_.global_memory.find(op.medium);if(global==gui_.global_memory.end() || global->second.size<entry.bytes.size() || (entry.bytes.size() && !global->second.address))return finish(0x80030070U);
@@ -398,6 +420,7 @@ std::optional<std::uint32_t> WindowsServices::resume_ole_clipboard(GuestState& s
         if(!(entry.format.tymed&op.type) || !op.medium || (op.type!=1 && op.type!=4 && op.type!=8 && op.type!=16 && op.type!=64))return finish(clip_tymed);
         entry.type=op.type;entry.format.tymed=op.type;
         if(op.type==1){if(!global_bytes(op.medium,entry.bytes))return finish(clip_tymed);}
+        else if(op.type==16 && entry.format.format==9){if(!clip_save_palette(gui_,op.medium,entry))return finish(clip_tymed);}
         else if(op.type==16){sync_raster_bitmap(memory,op.medium);const auto bitmap=gui_.bitmaps.find(op.medium);if(bitmap==gui_.bitmaps.end())return finish(clip_tymed);entry.bitmap=bitmap->second;entry.bitmap->dib_address=entry.bitmap->dib_view=entry.bitmap->dib_section=0;}
         else if(op.type==64){const auto metafile=gui_.metafiles.find(op.medium);if(metafile==gui_.metafiles.end())return finish(clip_tymed);entry.metafile=metafile->second;}
         else if(op.type==4){memory.write(GuestAddress{buffer+160},std::vector<std::uint8_t>(80));method(Stage::StreamStat,op.medium,12,{op.medium,buffer+160,1});return {};}

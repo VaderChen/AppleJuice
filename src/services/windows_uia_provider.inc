@@ -41,6 +41,18 @@ if(service.family=="uiautomationcore.dll" || name.starts_with("UIA.")){
         memory.store(GuestAddress{scratch+16},64,token);
         start_callbacks(state,memory,{{target,{arg(3)}}},Continuation::AccessibleOperation,scratch);return {};
     }
+    if(name=="UiaDisconnectProvider" || name=="UiaDisconnectAllProviders"){
+        // 釋放 UI Automation 對提供者持有的參考（UiaReturnRawElementProvider 登記時 AddRef 的那一份），之後的事件回 UIA_E_ELEMENTNOTAVAILABLE；
+        // 與 UiaReturnRawElementProvider(hwnd, 0, 0, NULL) 共用同一套釋放流程。沒有登記的提供者沒有參考可釋放，回 S_OK。
+        const bool all=name=="UiaDisconnectAllProviders";if(!all && !arg(0))return finish(invalid);
+        std::vector<GuestCallback> calls;
+        for(auto it=bridge.uia_providers.begin();it!=bridge.uia_providers.end();){
+            if(!all && it->first!=arg(0)){++it;continue;}
+            calls.push_back({method(it->first,2),{it->first}});it=bridge.uia_providers.erase(it);
+        }
+        if(calls.empty())return finish(0);
+        const auto scratch=scratch_for(12);start_callbacks(state,memory,std::move(calls),Continuation::AccessibleOperation,scratch);return {};
+    }
     if(name=="UiaClientsAreListening"){
         // 本後端的原生輔助使用訂閱由 macOS 管理；不虛構 Windows client 訂閱。
         return finish(0);

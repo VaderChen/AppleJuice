@@ -77,8 +77,19 @@ if(service.family=="msvcp140.dll" || service.family=="msvcp110.dll" || service.f
     const auto tail=[&](const char* target,std::uint64_t argument)->std::optional<std::uint32_t>{
         state.reg(Gpr::Rcx)=argument;state.rip=GuestAddress{resolve("kernel32.dll",target).value};return std::nullopt;};
     if(name=="_Thrd_yield")return x86_?start("kernel32.dll","SwitchToThread",{}):tail("SwitchToThread",0);
-    if(name.starts_with("?_Execute_once@std@@"))
+    if(name.starts_with("?_Execute_once@std@@")){
+        // STL 的 ABI 包裝只把第四個 Context 設為 NULL。Win64 共用同一呼叫
+        // 慣例與 32-byte 影子空間，可直接轉入既有 INIT_ONCE 客體常式及完整
+        // provider；不為已完成的 once 額外建立／返回一層宿主 continuation。
+        // Win32 的 cdecl／stdcall 清理量不同，仍沿用原回呼流程。
+        static const bool tail_once=[] {const auto* value=std::getenv("X64ARM_AOT_MSVCP_ONCE_TAIL");
+            return !value || std::string_view(value)!="0";}();
+        if(!x86_ && tail_once){
+            const auto target=resolve("kernel32.dll","InitOnceExecuteOnce");
+            state.reg(Gpr::R9)=0;state.rip=target;return std::nullopt;
+        }
         return start("kernel32.dll","InitOnceExecuteOnce",{call(0),call(1),call(2),0});
+    }
     // 時鐘與身分沿用 QueryPerformanceCounter（10 MHz）、GetSystemTimePreciseAsFileTime 與 GetCurrentThreadId 的來源。
     if(name=="_Query_perf_frequency"){call.return_to(state,10000000,true);return std::nullopt;}
     if(name=="_Query_perf_counter"){call.return_to(state,runtime_.clock_ticks,true);return std::nullopt;}

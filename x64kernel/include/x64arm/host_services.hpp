@@ -61,8 +61,10 @@ enum class ResidentServiceProgress {Completed,Retry,Coordinator,CompletedWithout
 // 4 由服務端標記 D3D11 命令串流的純量方法。5～9 為程序固定資訊：直接讀客體 TEB／PEB／KUSER_SHARED_DATA
 //（GetCurrentProcessId、GetProcessHeap、GetModuleHandleA／W(NULL)、IsProcessorFeaturePresent），
 // QueryPerformanceFrequency 寫入 10 MHz；都沒有 LastError 副作用，資格不符時交回原服務。
+// 10～12 是 CRT 型別的唯讀比較、雜湊與 typeid；只讀客體記憶體，不快取可變名稱或 RTTI。
 enum class ResidentClockRecipe : unsigned {None=0,Milliseconds32=1,Milliseconds64=2,PerformanceCounter=3,
-    ProcessId=5,ProcessHeap=6,ModuleImage=7,ProcessorFeature=8,PerformanceFrequency=9};
+    ProcessId=5,ProcessHeap=6,ModuleImage=7,ProcessorFeature=8,PerformanceFrequency=9,
+    TypeInfoCompare=10,TypeInfoHash=11,RttiTypeId=12};
 class HostCallFault : public std::runtime_error { using std::runtime_error::runtime_error; };
 struct CpuFault : std::runtime_error {
     std::uint32_t code;
@@ -100,7 +102,8 @@ static_assert(sizeof(ResidentHostEnvironment)==24 && offsetof(ResidentHostEnviro
 enum class ScalarRecipe : unsigned {
     None=0, ExpF=1, Log2=2, LogF=3, SinF=4, CosF=5, LRintF=6, LRint=7, LRoundF=8, LRound=9,
     AcosF=10, PowF=11, Hypot=12, Cos=13, Sin=14, Log=15, Exp=16, AtanF=17, Atan=18, Atan2F=19, Atan2=20, Acos=21,
-    FloorF=22, Floor=23, CeilF=24, Ceil=25, TruncF=26, Trunc=27, RoundF=28, Round=29
+    FloorF=22, Floor=23, CeilF=24, Ceil=25, TruncF=26, Trunc=27, RoundF=28, Round=29,
+    SqrtF=30, Sqrt=31
 };
 // 每批原生執行借用的錯誤格位。cell 必須來自 native_pointer 的私人可寫 4-byte 範圍；
 // 非空時，客體位址與宿主指標須對應同一儲存，生命期及執行緒身分維持到批次出口。

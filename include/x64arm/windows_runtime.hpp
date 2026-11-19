@@ -135,7 +135,7 @@ struct ModuleOperation {
     std::uint32_t thread_exit_code{};
     bool operator==(const ModuleOperation&) const = default;
 };
-enum class Continuation { NativeApc, NativeApcIoError, RecentDocument, GuiClipboardNotification, GuiBeginPaint, SocketAccept, ComAgileOperation, FunctionTableLookup, ExceptionFunctionLookup, CapturePreviousContext, GuiOpenIcon, ComBindOperation, D3DXProgressOperation, D3DCompileOperation, Msvcp100Operation, UnwindConsolidate, CrtAssertion, CrtFatalDialog, GuiMouseInput, GuiMoveSize, ThemeTextOperation, MdiMoveOperation, StorageOperation, StorageCopyOperation, GuiGrayString, ComOperation, AutomationOperation, DirectInputEnumeration, StackWalkOperation, DemangleOperation, Eh4Operation, GuiAsyncSend, GuiAsyncCallback, GuiWaitMessage, DWriteOperation, CrtNewResult, CrtNewRetry, CrtInvalidNewMode, GuiSendTimeout, AccessibleOperation, SafeArrayOperation, OleStreamCopy, PrintAbort, UnhandledFilter, FiberDelete, UserApc, GuiIntegerText, WindowEnumeration, LocaleEnumeration, RegistryBooleanResult, ResourceEnumeration, MetafileEnumeration, GuiWinEvent, FileTransfer, ReturnUntilFalse, Return, Startup, InitTermE, Exit, ThreadExit, ReturnCallback, Exception, ContinueException, SehFilter, GuiNcCreate, GuiCreate, GuiDialogInit, GuiModalInit, GuiModalDispatch, GuiModalEnd, GuiDestroy, GuiDestroyDefault, GuiMenuInit, GuiMenuFinish, GuiSentMessage, GuiControlOperation, CrtExit, Sort, OleVariantClear, OleVariantCopy, ModuleOperation, OleReleaseStgMedium, MsvcCopy, MsvcUnwind, MsvcCatch, MsvcDestroy, GuiWindowPos, GuiWindowNcCalc, GuiHook, GuiMsgFilterSystem, GuiModalSystemFilter, GuiModalFilter, GuiCbtCreate, GuiCreationNcCreate, GuiCreationNcCalc, GuiCreationCreate, GuiCreationFinish, GuiCreationAbort, GuiDialogProc, GuiBusyHook, GuiBusyResult, OleClipboardOperation, GuiPropertySheet, GuiCbtAction, FontEnumeration, OnExitTable, InitOnce, RegisteredWait, ReturnCallbackFreeHeap, NtCloseResult, ReturnZeroFreeHeap, CertificateDecodeAllocation, CertificateFind, SymbolFunctionEntry, MiniDumpOperation, EtwCallback, EtwProcess, WinrtOperation, NativeV8Operation, NativeOperation, TypeLibraryInvoke, TypeLibraryAddress, PrintDialogOperation, PageSetupStart, PageSetupResult, PageSetupHook, PageSetupPaint, PrintPropertyPageOperation, ShellItemOperation, ComMarshalOperation, OleDragLoop, OleDragTarget, ComProxyDispatch, ComErrorSet, ComErrorRetire, RestrictedError, WinrtOriginSetup, WinrtOriginFinish, GuiDragDetection, ComContextOperation, MediaFoundationQuery, InitTerm, ReturnUntilFailure, ServiceMain, ServiceControl, GuiTextThunk, BeepTone, PolicyRetry, OlePersistence, CrtLongjmp, ComRotOperation, PerflibOperation, MciWait, ConsoleControl, TaskDialogOperation, DdeOperation, ComSpyOperation, GdiplusStream, FontPackage, WinUsbTransfer, WinUsbOverlapped, KernelRequest, SehFinally, MsiOperation, EsentOperation, NestedResult, MonitorEnumeration, GuiRetrievedMessage, AcmEnumeration, SymbolEnumeration };
+enum class Continuation { NativeApc, NativeApcIoError, RecentDocument, GuiClipboardNotification, GuiBeginPaint, SocketAccept, ComAgileOperation, FunctionTableLookup, ExceptionFunctionLookup, CapturePreviousContext, GuiOpenIcon, ComBindOperation, D3DXProgressOperation, D3DCompileOperation, Msvcp100Operation, UnwindConsolidate, CrtAssertion, CrtFatalDialog, GuiMouseInput, GuiMoveSize, ThemeTextOperation, MdiMoveOperation, StorageOperation, StorageCopyOperation, GuiGrayString, ComOperation, AutomationOperation, DirectInputEnumeration, StackWalkOperation, DemangleOperation, Eh4Operation, GuiAsyncSend, GuiAsyncCallback, GuiWaitMessage, DWriteOperation, CrtNewResult, CrtNewRetry, CrtInvalidNewMode, GuiSendTimeout, AccessibleOperation, SafeArrayOperation, OleStreamCopy, PrintAbort, UnhandledFilter, FiberDelete, UserApc, GuiIntegerText, WindowEnumeration, LocaleEnumeration, RegistryBooleanResult, ResourceEnumeration, MetafileEnumeration, GuiWinEvent, FileTransfer, ReturnUntilFalse, Return, Startup, InitTermE, Exit, ThreadExit, ReturnCallback, Exception, ContinueException, SehFilter, GuiNcCreate, GuiCreate, GuiDialogInit, GuiModalInit, GuiModalDispatch, GuiModalEnd, GuiDestroy, GuiDestroyDefault, GuiMenuInit, GuiMenuFinish, GuiSentMessage, GuiControlOperation, CrtExit, Sort, OleVariantClear, OleVariantCopy, ModuleOperation, OleReleaseStgMedium, MsvcCopy, MsvcUnwind, MsvcCatch, MsvcDestroy, GuiWindowPos, GuiWindowNcCalc, GuiHook, GuiMsgFilterSystem, GuiModalSystemFilter, GuiModalFilter, GuiCbtCreate, GuiCreationNcCreate, GuiCreationNcCalc, GuiCreationCreate, GuiCreationFinish, GuiCreationAbort, GuiDialogProc, GuiBusyHook, GuiBusyResult, OleClipboardOperation, GuiPropertySheet, GuiCbtAction, FontEnumeration, OnExitTable, InitOnce, RegisteredWait, ReturnCallbackFreeHeap, NtCloseResult, ReturnZeroFreeHeap, CertificateDecodeAllocation, CertificateFind, SymbolFunctionEntry, MiniDumpOperation, EtwCallback, EtwProcess, WinrtOperation, NativeV8Operation, NativeOperation, TypeLibraryInvoke, TypeLibraryAddress, PrintDialogOperation, PageSetupStart, PageSetupResult, PageSetupHook, PageSetupPaint, PrintPropertyPageOperation, ShellItemOperation, ComMarshalOperation, OleDragLoop, OleDragTarget, ComProxyDispatch, ComErrorSet, ComErrorRetire, RestrictedError, WinrtOriginSetup, WinrtOriginFinish, GuiDragDetection, ComContextOperation, MediaFoundationQuery, InitTerm, ReturnUntilFailure, ServiceMain, ServiceControl, GuiTextThunk, BeepTone, PolicyRetry, OlePersistence, CrtLongjmp, ComRotOperation, PerflibOperation, MciWait, ConsoleControl, TaskDialogOperation, DdeOperation, ComSpyOperation, GdiplusStream, FontPackage, WinUsbTransfer, WinUsbOverlapped, KernelRequest, SehFinally, MsiOperation, EsentOperation, NestedResult, MonitorEnumeration, GuiRetrievedMessage, AcmEnumeration, SymbolEnumeration, MsvcTranslate, SymbolEvent, SymbolEventRetry };
 struct GuiHookFrame {
     std::vector<std::uint64_t> handles,scratch;
     std::size_t index{};
@@ -450,6 +450,7 @@ struct SymbolEntry {
     std::uint32_t size{}, index{}, flags{}, tag{};
     bool operator==(const SymbolEntry&) const = default;
 };
+namespace pdb {struct Database;}
 struct SymbolModule {
     RuntimeImage image;
     std::u16string name, image_name, loaded_image_name;
@@ -457,6 +458,12 @@ struct SymbolModule {
     std::shared_ptr<const std::vector<std::uint8_t>> pending;
     std::uint32_t timestamp{}, checksum{}, machine{}, symbol_type{};
     bool no_symbols{}, virtual_module{}, invaded{};
+    // 符號載入失敗已對 SymRegisterCallback 回報過（之後的查詢仍回錯誤，但不重複送 CBA_DEFERRED_SYMBOL_LOAD_FAILURE）。
+    bool load_reported{};
+    // 與映像 CodeView（GUID＋Age）相符的 PDB：符號與行號來源；pdb_name 為實際載入的路徑。
+    // line_text 為 IMAGEHLP_LINE(W)64.FileName 指向的客體字串（依檔案索引，ANSI 與寬字元分開），隨模組卸載釋放。
+    std::shared_ptr<const pdb::Database> pdb;std::u16string pdb_name;
+    std::map<std::uint32_t,std::uint64_t> line_text,line_text_wide;
     bool operator==(const SymbolModule&) const = default;
 };
 struct SymbolSession {
@@ -465,9 +472,24 @@ struct SymbolSession {
     std::map<std::uint64_t,SymbolModule> images;
     std::uint64_t function_callback{}, function_context{};
     bool function_callback_active{};
+    // SymRegisterFunctionEntryCallback（32 位元位址與 PVOID 內容）或 64 版。
+    bool function_callback_legacy{};
+    // SymRegisterCallback（1：IMAGEHLP_DEFERRED_SYMBOL_LOAD、PVOID）、64 版（2：ANSI、ULONG64）、W64（3：UTF-16）。
+    std::uint64_t event_callback{}, event_context{};
+    std::uint8_t event_kind{};
     // SymSetContext／SymSetScopeFrom*：目前的 IMAGEHLP_STACK_FRAME（InstructionOffset、ReturnOffset、FrameOffset、StackOffset）。
     std::array<std::uint64_t,4> scope{};
     bool operator==(const SymbolSession&) const = default;
+};
+// 送給 SymRegisterCallback 回呼的事件：CBA_DEFERRED_SYMBOL_LOAD_START／COMPLETE／FAILURE、CBA_SYMBOLS_UNLOADED 帶模組資訊，
+// CBA_SET_OPTIONS 帶選項值，CBA_DEBUG_INFO 帶文字。
+struct SymbolCallbackEvent {
+    std::uint64_t process{};
+    std::uint32_t action{};
+    std::uint64_t base{}, value{};
+    std::uint32_t checksum{}, timestamp{};
+    std::u16string text;
+    bool operator==(const SymbolCallbackEvent&) const = default;
 };
 struct ComClassRegistration {
     std::array<std::uint8_t,16> clsid{};
@@ -512,13 +534,18 @@ struct RuntimeState {
     // SymSetExtendedOption（SYMOPT_EX_*，目前 4 種）與 SymSetParentWindow。
     std::array<bool,4> symbol_extended_options{};
     std::uint64_t symbol_parent_window{};
+    // SymSetHomeDirectory 設定的家目錄（空字串為預設：dbghelp.dll 所在系統目錄）與 dir 為 NULL 時傳回的 ANSI／UTF-16 字串區塊。
+    std::u16string symbol_home_directory;std::array<std::uint64_t,2> symbol_home_text{};
     std::map<std::uint64_t,SymbolSession> symbol_sessions;
+    // SymRegisterCallback 事件回呼結束後要還原的 API 結果：事件區塊 → {結果, 錯誤碼, 是否 64 位元回傳}。
+    std::map<std::uint64_t,std::array<std::uint64_t,3>> symbol_event_returns;
     // ImageLoad 配置的 LOADED_IMAGE；ImageUnload 只接受清單內的位址。
     std::set<std::uint64_t> imagehlp_images;
     // EnumerateLoadedModules* 回呼使用的模組路徑字串（ANSI／UTF-16），以完整路徑快取，整個程序期間有效。
     std::map<std::u16string,std::array<std::uint64_t,2>> loaded_module_names;
     unsigned processor_count{1};
     std::uint64_t process_affinity{1};
+    std::uint32_t process_affinity_update_mode{}; // SetProcessAffinityUpdateMode（PROCESS_AFFINITY_ENABLE_AUTO_UPDATE）
     std::uint32_t shutdown_level{0x280}, shutdown_flags{};
     std::uint32_t dynamic_code_policy{}, child_process_policy{},signature_policy{};
     // 現代客體預設保留例外；顯式開啟 legacy callback filter 才忽略逸出 GUI 邊界的例外。

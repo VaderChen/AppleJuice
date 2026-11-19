@@ -457,6 +457,11 @@ bool WindowsServices::play_windows_metafile_record(GuestState& state,GuestMemory
     default:last_error_=87;return false;
     }
 }
+// Escape 在 Windows 中繼檔 DC 上記成 META_ESCAPE（跳脫代碼、位元組數、資料），例如 MFCOMMENT 註解；不是 WMF 錄製 DC 時回 false。
+bool WindowsServices::record_metafile_escape(std::uint64_t dc,std::uint16_t escape,std::span<const std::uint8_t> data){
+    const auto found=gui_.emf_recorders.find(dc);if(found==gui_.emf_recorders.end() || !found->second.wmf || data.size()>0xfff0U)return false;
+    Words words{escape,static_cast<std::uint16_t>(data.size())};push_bytes(words,data);wmf_record(found->second,meta_escape,words);return true;
+}
 std::optional<std::uint32_t> WindowsServices::invoke_windows_metafile(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;const unsigned unit=x86_?4U:8U;
     const auto finish=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};

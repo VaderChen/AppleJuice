@@ -210,6 +210,23 @@ void WindowsServices::throw_msvc_exception(GuestState& state,GuestMemory& memory
         state=caller;
 }
 
+// __RTDynamicCast 的純計算版（Win64、RTTI revision 1）：與 invoke_rtti 相同的讀取與判定，只讀客體記憶體、不拋客體例外。
+// 回傳 nullopt 表示無法在此判定（無效 RTTI、記憶體故障、舊版定位表），由完整路徑重做並依原契約拋出 __non_rtti_object。
+// 空物件回傳 0；轉型失敗也回傳 0，是否拋 bad_cast 由呼叫端依 isReference 決定。供常駐 worker 使用。
+std::optional<std::uint64_t> rtti_dynamic_cast_x64(const GuestMemory& memory,std::uint64_t object,std::uint64_t vf_delta,std::uint64_t source_type,std::uint64_t target_type) noexcept {
+    if(!object)return 0;
+    try{
+        RttiReader reader{memory,false};const auto vtable=reader.pointer(object),locator=reader.pointer(offset(vtable,-8));
+        if(!locator)return std::nullopt;
+        memory.check(GuestAddress{locator},24,Access::Read);
+        if(reader.word(locator)!=1)return std::nullopt;
+        reader.image=offset(locator,-static_cast<std::int64_t>(reader.word(locator+20)));
+        auto complete=offset(object,-static_cast<std::int64_t>(reader.word(locator+4)));
+        if(const auto displacement=reader.word(locator+8))
+            complete=offset(complete,-static_cast<std::int64_t>(signed_word(reader.word(offset(object,-static_cast<std::int64_t>(displacement))))));
+        return dynamic_cast_pointer(reader,reader.reference(locator+16),complete,offset(object,-static_cast<std::int64_t>(signed_word(vf_delta))),source_type,target_type);
+    }catch(...){return std::nullopt;}
+}
 std::optional<std::uint32_t> WindowsServices::invoke_rtti(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);const auto symbol=service.symbol;
     if(service.family=="x64arm.msvc" && (symbol=="ExceptionDelete" || symbol=="ExceptionDestroy" || symbol=="ExceptionCopy" || symbol=="ExceptionWhat")){

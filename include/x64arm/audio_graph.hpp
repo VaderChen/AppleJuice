@@ -4,6 +4,7 @@
 #include <optional>
 
 namespace x64arm::audio {
+class FrameEffect;
 // XAudio2 音源／子混音需要的宿主圖。裝置、PCM 解碼與 DSP 沿用 audio 後台。
 // 所有控制方法與 render 共用一把鎖；客體回呼由服務層在 take_events 後派送。
 class VoiceGraph final:public RenderSource {
@@ -22,6 +23,7 @@ public:
         Kind kind{};Format format;unsigned flags{},stage{},queued{};
         bool playing{};float volume{1},ratio{1};std::uint64_t samples{},context{};
         std::vector<float> channel_volumes;Filter filter;unsigned creation_flags{};
+        unsigned output_channels{}; // 效果鏈最後一個效果輸出的聲道數；輸出矩陣與聲道音量都以此為準
     };
     enum class EventKind {BufferStart,BufferEnd,LoopEnd,StreamEnd,CriticalError};
     struct Event {EventKind kind{};Voice voice{};std::uint64_t context{};};
@@ -32,7 +34,8 @@ public:
         unsigned effect{}; // EnableEffect／DisableEffect 的效果鏈索引
     };
     // 效果鏈的一格。Effect 是立體聲 DSP，每兩聲道一個（奇數的最後一個聲道單獨處理），數量須為 (聲道數+1)/2。
-    struct EffectSlot {std::vector<std::shared_ptr<Effect>> pairs;bool enabled{true};};
+    // frame 非空時改以整個音框處理，可改變後續聲道數（XAudio2 內建 reverb、volume meter）；此時 pairs 須為空。
+    struct EffectSlot {std::vector<std::shared_ptr<Effect>> pairs;bool enabled{true};std::shared_ptr<FrameEffect> frame{};};
     VoiceGraph();
     ~VoiceGraph() override;
     Voice create(Kind,Format,unsigned flags=0,unsigned stage=0,float maximum_ratio=2);

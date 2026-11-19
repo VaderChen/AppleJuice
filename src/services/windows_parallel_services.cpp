@@ -1,3 +1,4 @@
+#include "debug_semaphore.hpp"
 #include "windows_scalar_math.hpp"
 #include <string_view>
 #include <string>
@@ -33,6 +34,8 @@
 #include <vector>
 
 namespace x64arm {
+// 定義於 windows_rtti.cpp：__RTDynamicCast 的純計算版，供 worker 路徑使用。
+std::optional<std::uint64_t> rtti_dynamic_cast_x64(const GuestMemory& memory,std::uint64_t object,std::uint64_t vf_delta,std::uint64_t source_type,std::uint64_t target_type) noexcept;
 bool d3d12_worker_residency_service(std::string_view symbol) noexcept;
 
 #ifdef X64ARM_HOST_SERVICES_RESIDENT_HEAP
@@ -134,6 +137,13 @@ ResidentClockRecipe WindowsServices::resident_clock_recipe(GuestAddress address)
         if(symbol=="GetModuleHandleW" || symbol=="GetModuleHandleA")return ResidentClockRecipe::ModuleImage;
         if(symbol=="IsProcessorFeaturePresent")return ResidentClockRecipe::ProcessorFeature;
         if(symbol=="QueryPerformanceFrequency")return ResidentClockRecipe::PerformanceFrequency;
+    }
+    // CRT 唯讀型別查詢共用核心 ARM64 配方；資格不符仍回到完整的字串驗證與 C++ 例外語義。
+    static const bool rtti=[] {const auto* value=std::getenv("X64ARM_AOT_RTTI_QUERY_LOWERING");return !value || std::string_view(value)!="0";}();
+    if(rtti){
+        if(symbol=="__std_type_info_compare")return ResidentClockRecipe::TypeInfoCompare;
+        if(symbol=="__std_type_info_hash")return ResidentClockRecipe::TypeInfoHash;
+        if(symbol=="__RTtypeid")return ResidentClockRecipe::RttiTypeId;
     }
     return ResidentClockRecipe::None;
 }
@@ -290,6 +300,45 @@ bool srw_service(std::string_view symbol) noexcept {
 bool thrd_tail_service(std::string_view symbol) noexcept {
     static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_PARALLEL_THRD_TAIL");return !setting || std::string_view(setting)!="0";}();
     return enabled && (symbol=="_Thrd_sleep" || symbol=="_Thrd_yield");
+}
+// MSVC STL 的 std::call_once 每次呼叫都是「__ExceptionPtrCreate → _Execute_once → __ExceptionPtrDestroy」三個 msvcp140 入口：
+// 空的 exception_ptr 只是把 16 位元組清零，_Execute_once（x64）只把第四引數設為 NULL 後尾跳 InitOnceExecuteOnce
+//（見 msvcp_sync_handlers），_Thrd_id 只回目前執行緒編號。原本三者都交回協調者並被拒絕成全停
+//（Control 遊玩中這三個入口占協調者拒絕的 71%，每秒上萬次全停）。持有控制區的 exception_ptr 解構（要釋放引用）、
+// 輸出不可寫與 Win32 仍交回協調者。X64ARM_PARALLEL_MSVCP_ONCE=0 關閉。
+bool msvcp_once_worker_enabled() noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_MSVCP_ONCE");return !value || std::string_view(value)!="0";}();
+    return enabled;
+}
+bool msvcp_once_tail_service(std::string_view symbol) noexcept {
+    static const bool tail=[] {const auto* value=std::getenv("X64ARM_AOT_MSVCP_ONCE_TAIL");return !value || std::string_view(value)!="0";}();
+    return tail && msvcp_once_worker_enabled() && symbol.starts_with("?_Execute_once@std@@");
+}
+bool msvcp_exception_ptr_worker_service(std::string_view symbol) noexcept {
+    return msvcp_once_worker_enabled() && (symbol=="?__ExceptionPtrCreate@@YAXPEAX@Z" || symbol=="?__ExceptionPtrDestroy@@YAXPEAX@Z");
+}
+bool msvcp_thread_id_worker_service(std::string_view symbol) noexcept {return msvcp_once_worker_enabled() && symbol=="_Thrd_id";}
+// type_info::name()：第一次解修飾後名稱指標快取在 type_info 資料的第一個字組，之後每次只讀回該指標（與 provider 的快取分支相同）。
+// 尚未快取（要配置並掛入串列）時交回協調者。Control 每秒數千次。與上列同一開關。
+bool type_info_name_worker_service(std::string_view symbol) noexcept {return msvcp_once_worker_enabled() && symbol=="__std_type_info_name";}
+// __RTDynamicCast（Win64）：只讀物件的 RTTI 定位表與類別階層後回傳指標，原本每次交回協調者並全停（Control 遊玩中是
+// 全停的最大宗，每秒數百次）。轉型成功、空物件與指標轉型失敗（回傳 NULL）在 worker 完成；參考轉型失敗（要拋 bad_cast）、
+// 無效 RTTI 與記憶體故障交回完整路徑。GetKeyState 只讀鍵盤狀態表（協調者持獨占映射鎖時才更新）。X64ARM_PARALLEL_RTTI_CAST=0 關閉。
+bool rtti_cast_worker_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_RTTI_CAST");return !value || std::string_view(value)!="0";}();
+    return enabled && symbol=="__RTDynamicCast";
+}
+// GetProcessMemoryInfo／K32GetProcessMemoryInfo（Win64、目前程序的虛擬 handle）：只讀核心的 commit 記帳（映射變動時才更新，
+// worker 持共用映射鎖讀取）並寫回 PROCESS_MEMORY_COUNTERS(_EX)，與 provider 相同的欄位。Control 遊玩中每秒約兩千次，原本每次
+// 由協調者持獨占映射鎖完成，期間其他 worker 的服務都在等鎖。真實 handle、緩衝區過小與輸出不可寫交回協調者。
+// X64ARM_PARALLEL_PROCESS_MEMORY=0 關閉。
+bool process_memory_worker_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_PROCESS_MEMORY");return !value || std::string_view(value)!="0";}();
+    return enabled && (symbol=="K32GetProcessMemoryInfo" || symbol=="GetProcessMemoryInfo");
+}
+bool key_state_worker_service(std::string_view symbol) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_PARALLEL_KEY_STATE");return !value || std::string_view(value)!="0";}();
+    return enabled && symbol=="GetKeyState";
 }
 bool msvcp_mutex_service(std::string_view symbol) noexcept {
     return symbol=="_Mtx_lock" || symbol=="_Mtx_unlock" || symbol=="_Mtx_trylock";
@@ -449,7 +498,12 @@ using NativeSegments=std::vector<std::pair<std::uint8_t*,std::size_t>>;
 static bool collect_native_segments(GuestMemory& memory,std::uint64_t address,std::uint64_t size,unsigned access,NativeSegments& out){
     out.clear();
     while(size){
-        const auto window=memory.native_window(GuestAddress{address},access);
+        auto window=memory.native_window(GuestAddress{address},access);
+        // 零複製的 GPU CPU 可見堆積（StableShared 外部 backing）沒有一般原生視窗：改取共用區段視窗。客體碼本來就直接讀寫這段
+        // 宿主記憶體，撤除映射要取獨占映射鎖，worker 持共用鎖期間不會消失。死亡擱淺每秒約兩萬次 memcpy 寫入這類上傳堆積，
+        // 原本每次都交回協調者。X64ARM_PARALLEL_SHARED_WINDOW=0 關閉。
+        static const bool shared_window=[] {const auto* value=std::getenv("X64ARM_PARALLEL_SHARED_WINDOW");return !value || std::string_view(value)!="0";}();
+        if((!window.data || !window.after) && shared_window)window=memory.native_shared_window(GuestAddress{address},access);
         if(!window.data || !window.after)return false;
         const auto part=std::min<std::uint64_t>(window.after,size);
         // 同一映射內相鄰的頁合成一段：後續一次 memmove／memset 完成，不必逐頁呼叫。
@@ -578,6 +632,8 @@ bool WindowsServices::parallel_service_static(GuestAddress address) const noexce
     if(vulkan_worker_symbol(symbol))return true; // 橋接未就緒時 worker 分支交回協調者。
     if(parallel_peek_service(symbol))return true;
     if(parallel_srw_enabled() && (srw_service(symbol) || msvcp_mutex_service(symbol)))return true;
+    if(msvcp_once_tail_service(symbol) || msvcp_exception_ptr_worker_service(symbol) || msvcp_thread_id_worker_service(symbol) || type_info_name_worker_service(symbol))return true;
+    if(rtti_cast_worker_service(symbol) || key_state_worker_service(symbol) || process_memory_worker_service(symbol))return true;
     if(thrd_tail_service(symbol) || parallel_event_service(symbol) || parallel_wait_service(symbol) || parallel_null_wait_service(symbol) || parallel_semaphore_service(symbol) ||
        parallel_wait_multiple_service(symbol))return true;
     if(thread_priority_worker_service(symbol) || crt_string_copy_worker_service(symbol) || process_query_worker_service(symbol))return true;
@@ -692,7 +748,8 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
                 if(output.empty())return false;
                 // 配接器身分與 GPU 配額沿用完整服務。物件表的建立／銷毀受映射鎖保護，
                 // 與 QueryVideoMemoryInfo 同樣不必等候 Metal 重播持有的圖形鎖。
-                const auto desc=display_identity::adapter_description(x86_,gpu_memory_stats().limit);
+                auto desc=display_identity::adapter_description(x86_,gpu_memory_stats().limit);
+                display_identity::apply_dedicated_video_memory(desc,x86_,gpu_memory_stats().limit);
                 std::memcpy(output.data(),desc.data(),size);
                 arg.return_to(state,0);
                 count_scope.accepted=true;state.rep_compare={};return true;
@@ -765,7 +822,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         }
         const bool descriptor_write=descriptor_transfer ||
             symbol=="Device.CreateShaderResourceView" || symbol=="Device.CreateUnorderedAccessView" || symbol=="Device.CreateRenderTargetView" || symbol=="Device.CreateDepthStencilView";
-        // Allocator.Reset、Queue.Wait 實作只回傳成功（重播在提交時進行，GPU 端等待由提交順序保證），同樣免鎖：
+        // Allocator.Reset 不改動共享狀態，同樣免鎖：
         // 取鎖時每次平均 38 µs（等其他持鎖服務）。
         // AddRef／不歸零的 Release 以原子操作改計數，同樣免鎖。
         const bool reference=symbol.ends_with(".AddRef") || symbol.ends_with(".Release");
@@ -793,7 +850,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         }
         if(submit && !d3d12_submitter_)return false;
         const bool unlocked=record_unlocked && (symbol.starts_with("List.") || symbol=="Resource.GetGPUVirtualAddress" || symbol=="Device.GetDescriptorHandleIncrementSize" ||
-            symbol=="Allocator.Reset" || symbol=="Queue.Wait" || descriptor_write || reference || submit || map || named || heap_start || allocation_info || fence_value || description || residency);
+            symbol=="Allocator.Reset" || descriptor_write || reference || submit || map || named || heap_start || allocation_info || fence_value || description || residency);
         std::unique_lock<GraphicsMutex> graphics_lock(graphics_mutex(),std::defer_lock);if(!unlocked)lock_graphics(graphics_lock);
         if(symbol.ends_with(".AddRef") || symbol.ends_with(".Release") || symbol=="Resource.Map" || symbol=="Resource.Unmap"){
             bool done=false;
@@ -856,6 +913,11 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
         if(symbol=="_Thrd_sleep"){try{argument=msvcp_wait_milliseconds(memory,state.reg(Gpr::Rcx));}catch(...){return false;}}
         const auto target=resolve_service("kernel32.dll",symbol=="_Thrd_sleep"?"Sleep":"SwitchToThread",false);if(!target.value)return false;
         state.reg(Gpr::Rcx)=argument;state.rip=target;state.rep_compare={};return true;
+    }
+    if(!x86_ && msvcp_once_tail_service(symbol)){
+        // 與協調者的尾跳相同：Context（第四引數）為 NULL，返回位址與影子空間沿用呼叫端，由 InitOnceExecuteOnce 自行返回。
+        const auto target=resolve_service("kernel32.dll","InitOnceExecuteOnce",false);if(!target.value)return false;
+        state.reg(Gpr::R9)=0;state.rip=target;state.rep_compare={};return true;
     }
     // worker 身分由交給引擎的 context 決定；客體更動 GS 不得冒用另一執行緒。
     // &thread.context 到執行緒編號的對應在程序期間不變（執行緒只增不刪、std::map 節點位址固定），每條 worker 以
@@ -1088,6 +1150,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
             auto& state_object=runtime_.wait_state(object->second);
             std::atomic_ref signal(state_object.count);auto count=signal.load(std::memory_order_acquire);
             do{if(increment>state_object.maximum-count)return false;}while(!signal.compare_exchange_weak(count,count+increment,std::memory_order_acq_rel));
+            detail::debug_semaphore(waiters?"w-release-resolve":"w-release",first,count,count+increment,tid);
             if(previous_count)put(previous_count,count,4);
             result=1;
         }
@@ -1146,6 +1209,7 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
                 }else if(waited.kind==WaitObject::Kind::Semaphore){
                     auto available=signal.load(std::memory_order_acquire);
                     while(available && !signal.compare_exchange_weak(available,available-1,std::memory_order_acq_rel)){}
+                    if(available)detail::debug_semaphore("w-take",first,available,available-1,tid);
                     if(available)result=0;else if(poll)result=0x102;else return false;
                 }else return false;
             }
@@ -1533,7 +1597,39 @@ bool WindowsServices::invoke_parallel_service_impl(GuestState& state,GuestMemory
                return item.second.thread==tid && item.second.consumed && !item.second.active && !item.second.locks;})))return refuse(Pending);
         result=0;
         detail::peek_idle_record(state,memory.native_borrow_generation(),static_cast<const std::uint8_t*>(static_cast<const void*>(stack)),flags,gui_peek_idle_until_);
-    }else if(symbol=="GetCurrentThreadId")result=thread_identifier(tid);
+    }else if(symbol=="GetCurrentThreadId" || msvcp_thread_id_worker_service(symbol))result=thread_identifier(tid);
+    else if(rtti_cast_worker_service(symbol)){
+        // 引數：物件、vfDelta、來源型別、目標型別（R9）、isReference（[rsp+0x28]）。
+        const auto* reference=pointer(sp+0x28,4,1);if(!reference)return false;
+        const auto value=rtti_dynamic_cast_x64(memory,first,second,arguments[2],state.reg(Gpr::R9));
+        if(!value || (!*value && first && load(reference,4)))return false;
+        result=*value;
+    }else if(process_memory_worker_service(symbol)){
+        constexpr unsigned base=72,extended=80; // PROCESS_MEMORY_COUNTERS／_EX（Win64）
+        const auto bytes=static_cast<std::uint32_t>(arguments[2]);
+        if(first!=UINT64_MAX || !second || bytes<base)return false;
+        const unsigned size=bytes>=extended?extended:base;
+        auto* output=static_cast<std::uint8_t*>(pointer(second,size,2));if(!output)return false;
+        const auto usage=memory.usage();
+        std::memset(output,0,size);put(output,size,4);
+        put(output+8,usage.peak_committed,8);put(output+16,usage.committed,8);
+        put(output+8+6*8,usage.private_commit,8);put(output+8+7*8,usage.peak_private_commit,8);
+        if(size==extended)put(output+8+8*8,usage.private_commit,8);
+        result=1;
+    }else if(key_state_worker_service(symbol)){
+        const auto virtual_key=static_cast<std::uint32_t>(first);
+        result=virtual_key<256?((gui_.keyboard[virtual_key]&128)?0x8000U:0U)|(gui_.keyboard[virtual_key]&1U):0;
+    }
+    else if(type_info_name_worker_service(symbol)){
+        const auto* name_cell=pointer(first,8,1);if(!first || !name_cell)return false;
+        result=load(name_cell,8);if(!result)return false;
+    }
+    else if(msvcp_exception_ptr_worker_service(symbol)){
+        // exception_ptr｛記錄指標, 控制區指標｝：建立與空物件的解構都只把兩個字組清零（與 provider 相同的寫入）。
+        auto* object=static_cast<std::uint8_t*>(pointer(first,16,3));if(!first || !object)return false;
+        if(symbol=="?__ExceptionPtrDestroy@@YAXPEAX@Z" && load(object+8,8))return false; // 釋放控制區引用交回協調者。
+        put(object,0,8);put(object+8,0,8);
+    }
     else if(process_query_worker_service(symbol)){
         // 與協調者服務相同的值與寫入內容（GetSystemInfo 共用 windows_system_info_layout.hpp），都不改 LastError。
         if(symbol=="GetCurrentProcessId")result=process_id();

@@ -19,6 +19,11 @@ std::span<const WindowsServiceDescriptor> theme_service_descriptors() {
         {"uxtheme.dll","GetThemeColor",5},{"uxtheme.dll","GetThemeSysColor",2},
         {"uxtheme.dll","GetThemeMargins",7},{"uxtheme.dll","GetThemeBackgroundExtent",6},{"uxtheme.dll","GetThemeBackgroundRegion",6},{"uxtheme.dll","GetThemeTextMetrics",5},
         {"uxtheme.dll","GetThemeSysSize",2},{"uxtheme.dll","GetThemeSysColorBrush",2},{"uxtheme.dll","GetThemeSysBool",2},{"uxtheme.dll","GetThemeSysFont",3},{"uxtheme.dll","GetThemeSysInt",3},
+        {"uxtheme.dll","GetThemeInt",5},{"uxtheme.dll","GetThemeBool",5},{"uxtheme.dll","GetThemeEnumValue",5},{"uxtheme.dll","GetThemeMetric",6},{"uxtheme.dll","GetThemePosition",5},
+        {"uxtheme.dll","GetThemeRect",5},{"uxtheme.dll","GetThemeFont",6},{"uxtheme.dll","GetThemeString",6},{"uxtheme.dll","GetThemeFilename",6},{"uxtheme.dll","GetThemeIntList",5},
+        {"uxtheme.dll","GetThemeStream",7},{"uxtheme.dll","GetThemeBitmap",6},{"uxtheme.dll","GetThemePropertyOrigin",5},{"uxtheme.dll","GetThemeTransitionDuration",6},
+        {"uxtheme.dll","GetThemeSysString",4},{"uxtheme.dll","GetThemeDocumentationProperty",4},{"uxtheme.dll","GetThemeTextExtent",9},
+        {"uxtheme.dll","HitTestThemeBackground",9,0x80},{"uxtheme.dll","DrawThemeEdge",8},{"uxtheme.dll","DrawThemeIcon",7},
         // 僅註冊目前虛擬 Windows 10 19045 ABI 的已知 ordinal；135 是 PreferredAppMode。
         {"uxtheme.dll","OpenNcThemeData",2},{"uxtheme.dll","RefreshImmersiveColorPolicyState",0},
         {"uxtheme.dll","GetIsImmersiveColorUsingHighContrast",1},{"uxtheme.dll","ShouldAppsUseDarkMode",0},
@@ -42,6 +47,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_theme(GuestState& state,Gue
         if(inserted && owner!=gui_.windows.end() && !gui_.dc_objects.contains(handle)){context->second.color=owner->second.text_color;context->second.mode=owner->second.background_mode;}
         return true;
     };
+    // GetThemeBitmap(GBF_DIRECT) 的點陣圖屬於主題 handle，關閉或批次移除主題時一併刪除。
+    const auto release_bitmaps=[&](const GuiThemeData& data){for(const auto& [key,bitmap]:data.bitmaps){(void)key;(void)nested_service(state,memory,"gdi32.dll","DeleteObject",{bitmap});}};
     if(name=="IsThemeActive" || name=="IsAppThemed"){result=active && (name=="IsThemeActive" || (gui_.theme_app_properties&2));last_error_=0;}
     else if(name=="IsCompositionActive"){last_error_=120;}
     else if(name=="ShouldAppsUseDarkMode" || name=="ShouldSystemUseDarkMode" || name=="IsDarkModeAllowedForApp"){}
@@ -93,6 +100,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_theme(GuestState& state,Gue
                 auto app=arg(1)?std::optional{read_utf16(memory,GuestAddress{arg(1)})}:std::nullopt;
                 auto classes=arg(2)?std::optional{read_utf16(memory,GuestAddress{arg(2)})}:std::nullopt;
                 window->second.theme_application=std::move(app);window->second.theme_classes=std::move(classes);
+                for(const auto& [handle,data]:gui_.themes){(void)handle;if(data.window==arg(0))release_bitmaps(data);}
                 std::erase_if(gui_.themes,[&](const auto& item){return item.second.window==arg(0);});gui_.window_themes.erase(arg(0));
                 // 使用既有同步 SendMessage 路由，跨 thread 時必須在接收者 TLS/stack 執行。
                 start_callbacks(state,memory,{{resolve("user32.dll","SendMessageW").value,{arg(0),0x31a,0,0}}},Continuation::Return,0);
@@ -115,6 +123,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_theme(GuestState& state,Gue
     }else if(name=="EnableTheming") {
         if(arg(0) && !native)result=e_notimpl;
         else if(gui_.theme_enabled!=(arg(0)!=0)){
+            for(const auto& [handle,data]:gui_.themes){(void)handle;release_bitmaps(data);}
             gui_.theme_enabled=arg(0)!=0;gui_.themes.clear();gui_.window_themes.clear();std::vector<GuestCallback> callbacks;
             for(const auto& [handle,model]:gui_.windows){(void)model;callbacks.push_back({resolve("user32.dll","SendMessageW").value,{handle,0x31a,0,0}});}
             start_callbacks(state,memory,std::move(callbacks),Continuation::Return,0);return std::nullopt;
@@ -205,7 +214,194 @@ std::optional<std::uint32_t> WindowsServices::invoke_theme(GuestState& state,Gue
                 else if(!(nested_service(state,memory,"gdi32.dll","GetTextMetricsW",{arg(1),arg(4)})&UINT32_MAX))result=0x80004005U;
             }
         }
+    }else if(name=="GetThemeInt" || name=="GetThemeBool" || name=="GetThemeEnumValue" || name=="GetThemeMetric" || name=="GetThemePosition" || name=="GetThemeRect" || name=="GetThemeFont"
+             || name=="GetThemeString" || name=="GetThemeFilename" || name=="GetThemeIntList" || name=="GetThemeStream" || name=="GetThemeBitmap" || name=="GetThemePropertyOrigin"
+             || name=="GetThemeTransitionDuration"){
+        // 主題屬性模型：只含原生控制項度量推導出的屬性，型別為 vssym32 的 TMT_* 原始型別（ENUM 200、STRING 201、INT 202、BOOL 203、COLOR 204、MARGINS 205、
+        // FILENAME 206、POSITION 208、RECT 209、FONT 210、INTLIST 211、HBITMAP 212、DISKSTREAM 213、STREAM 214），來源依 PROPERTYORIGIN（狀態 0、零件 1、類別 2）。
+        // 各取值函式只接受相同原始型別的屬性；主題沒有定義的屬性回 E_PROP_ID_UNSUPPORTED，與主題檔缺少該屬性時相同。
+        struct Property {std::uint32_t type{},origin{};std::int32_t number{};std::array<std::int32_t,2> pair{};std::vector<std::int32_t> list{};};
+        const auto signed_arg=[&](unsigned i){return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(i)));};
+        const auto theme=gui_.themes.find(arg(0));
+        const auto find=[&](std::int32_t part,std::int32_t status,std::uint32_t id)->std::optional<Property>{
+            const auto& data=theme->second;
+            const auto info=native_gui_?native_gui_->theme_metrics(data.class_name,part,status,data.dpi,{}):std::nullopt;if(!info)return std::nullopt;
+            switch(id){
+                case 3802:case 3821:return Property{204,0,static_cast<std::int32_t>(info->background_color&0xffffffU),{},{}}; // TMT_FILLCOLOR／TMT_FILLCOLORHINT
+                case 3803:return Property{204,0,static_cast<std::int32_t>(info->text_color&0xffffffU),{},{}};                  // TMT_TEXTCOLOR
+                case 2201:return Property{203,0,info->transparent?1:0,{},{}};                                                   // TMT_TRANSPARENT
+                case 3403:return Property{208,1,0,info->minimum,{}};                                                             // TMT_MINSIZE
+                case 3409:return Property{208,1,0,info->intrinsic,{}};                                                           // TMT_NORMALSIZE
+                case 4001:return Property{200,2,0,{},{}};                                                                         // TMT_BGTYPE＝BT_IMAGEFILE（背景為影像）
+                case 4004:return Property{200,1,info->fixed_size?0:1,{},{}};                                                     // TMT_SIZINGTYPE：ST_TRUESIZE／ST_STRETCH
+                case 3601:case 3602:{                                                                                             // TMT_SIZINGMARGINS／TMT_CONTENTMARGINS（原始尺寸下的左、上）
+                    const auto measured=native_gui_->theme_metrics(data.class_name,part,status,data.dpi,info->intrinsic);if(!measured)return std::nullopt;
+                    return Property{205,1,std::max(0,measured->content[0]),{std::max(0,measured->content[1]),0},{}};}
+                case 2:return Property{212,0,0,info->intrinsic,{}};                                                              // TMT_DIBDATA：背景影像
+                default:return std::nullopt;
+            }
+        };
+        if(name=="GetThemeTransitionDuration"){
+            // (hTheme, iPartId, iStateIdFrom, iStateIdTo, iPropId, pdwDuration)：TMT_TRANSITIONDURATIONS 為零件層 INTLIST，第一個值 N 為狀態數，其後是 N×N 的毫秒矩陣；
+            // 屬性不存在時輸出 0。
+            const auto from=signed_arg(2),to=signed_arg(3);
+            if(!arg(5) || from<1 || to<1)result=0x80070057U;
+            else if(theme==gui_.themes.end())result=e_handle;
+            else{
+                memory.check(GuestAddress{arg(5)},4,Access::Write);const auto found=find(signed_arg(1),0,static_cast<std::uint32_t>(arg(4)));std::uint32_t duration=0;
+                if(!found || found->type!=211)result=e_prop;
+                else{const auto& list=found->list;const auto states=list.empty()?0:list[0];
+                    if(states<1 || from>states || to>states || list.size()!=1+static_cast<std::size_t>(states)*static_cast<std::size_t>(states))result=0x80070057U;
+                    else duration=static_cast<std::uint32_t>(list[1+static_cast<std::size_t>(states)*static_cast<std::size_t>(from-1)+static_cast<std::size_t>(to-1)]);}
+                memory.store(GuestAddress{arg(5)},32,duration);
+            }
+        }else if(theme==gui_.themes.end())result=e_handle;
+        else{
+            const bool with_dc=name=="GetThemeMetric" || name=="GetThemeFont";const unsigned first=with_dc?2U:1U;
+            const auto part=signed_arg(first),status=signed_arg(first+1);auto id=static_cast<std::uint32_t>(arg(first+2));
+            const auto output=arg(name=="GetThemeBitmap"?5U:first+3);
+            if(with_dc && !valid_dc(arg(1)))result=e_handle;
+            else if(!output || (name=="GetThemeStream" && !arg(5)))result=e_pointer;
+            else if((name=="GetThemeString" || name=="GetThemeFilename") && signed_arg(5)<=0)result=0x80070057U;
+            else if(name=="GetThemePropertyOrigin"){
+                const auto found=find(part,status,id);memory.check(GuestAddress{output},4,Access::Write);memory.store(GuestAddress{output},32,found?found->origin:4U); // PO_NOTFOUND
+            }else if(name=="GetThemeBitmap"){
+                // (hTheme, iPartId, iStateId, iPropId, dwFlags, phBitmap)：iPropId 0 取第一個可用影像，TMT_DIBDATA／TMT_HBITMAP 為背景影像，TMT_GLYPHDIBDATA 為字形影像（此主題沒有）；
+                // GBF_DIRECT 回主題擁有的點陣圖（CloseThemeData 時釋放），GBF_COPY 回呼叫者負責 DeleteObject 的複本。
+                const auto flags=static_cast<std::uint32_t>(arg(4));if(id==0 || id==212)id=2;
+                const auto found=find(part,status,id);auto& data=theme->second;const std::array<std::int32_t,3> key{part,status,static_cast<std::int32_t>(id)};
+                if(flags!=1 && flags!=2)result=0x80070057U;
+                else if(!found || found->type!=212)result=e_prop;
+                else if(const auto cached=data.bitmaps.find(key);flags==1 && cached!=data.bitmaps.end()){memory.check(GuestAddress{output},x86_?4:8,Access::Write);memory.store(GuestAddress{output},x86_?32:64,cached->second);}
+                else{
+                    const auto image=native_gui_->theme_background(data.class_name,part,status,data.dpi,found->pair);
+                    GuestScratch scratch(*this,memory,state);const auto info=image?scratch.allocate(48):0;
+                    if(!image)result=0x80004005U;else if(!info)result=0x8007000eU;
+                    else{
+                        memory.write(GuestAddress{info},std::vector<std::uint8_t>(48));memory.store(GuestAddress{info},32,40);memory.store(GuestAddress{info+4},32,image->width);
+                        memory.store(GuestAddress{info+8},32,static_cast<std::uint32_t>(-static_cast<std::int32_t>(image->height)));memory.store(GuestAddress{info+12},16,1);memory.store(GuestAddress{info+14},16,32);
+                        const auto bitmap=nested_service(state,memory,"gdi32.dll","CreateDIBSection",{0,info,0,info+40,0,0});const auto bits=memory.load(GuestAddress{info+40},x86_?32:64);
+                        if(!bitmap || !bits){if(bitmap)(void)nested_service(state,memory,"gdi32.dll","DeleteObject",{bitmap});result=0x8007000eU;}
+                        else{
+                            // 原生像素為預乘的 R、G、B、A；32 位元 DIB 的位元組順序為 B、G、R、A。
+                            std::vector<std::uint8_t> bytes(image->pixels.size()*4);
+                            for(std::size_t i=0;i<image->pixels.size();++i){const auto pixel=image->pixels[i];bytes[i*4]=static_cast<std::uint8_t>(pixel>>16);bytes[i*4+1]=static_cast<std::uint8_t>(pixel>>8);bytes[i*4+2]=static_cast<std::uint8_t>(pixel);bytes[i*4+3]=static_cast<std::uint8_t>(pixel>>24);}
+                            memory.write(GuestAddress{bits},bytes);import_dib_bitmap(memory,bitmap);rasters_.erase(bitmap);
+                            if(flags==1)data.bitmaps[key]=bitmap;
+                            memory.check(GuestAddress{output},x86_?4:8,Access::Write);memory.store(GuestAddress{output},x86_?32:64,bitmap);
+                        }
+                    }
+                }
+            }else{
+                // 其餘取值函式只接受同一原始型別；GetThemeMetric 另接受列舉、布林、位置（x）、邊界（左）與整數清單（第一個值）。
+                // 此主題的屬性模型沒有字串、檔名、矩形、字型與串流屬性，這些取值函式在參數驗證後回 E_PROP_ID_UNSUPPORTED。
+                const auto found=find(part,status,id);
+                const auto wanted=name=="GetThemeInt"?202U:name=="GetThemeBool"?203U:name=="GetThemeEnumValue"?200U:name=="GetThemePosition"?208U:name=="GetThemeIntList"?211U:0U;
+                const bool accepted=found && (name=="GetThemeMetric"?(found->type==202 || found->type==200 || found->type==203 || found->type==208 || found->type==205 || found->type==211):wanted && found->type==wanted);
+                if(!accepted)result=e_prop;
+                else if(name=="GetThemePosition"){memory.check(GuestAddress{output},8,Access::Write);for(unsigned i=0;i<2;++i)memory.store(GuestAddress{output+i*4},32,static_cast<std::uint32_t>(found->pair[i]));}
+                else if(name=="GetThemeIntList"){
+                    // INTLIST：iValueCount 後接最多 MAX_INTLIST_COUNT（402）個整數。
+                    const auto count=std::min<std::size_t>(found->list.size(),402);memory.check(GuestAddress{output},4+count*4,Access::Write);memory.store(GuestAddress{output},32,count);
+                    for(std::size_t i=0;i<count;++i)memory.store(GuestAddress{output+4+i*4},32,static_cast<std::uint32_t>(found->list[i]));
+                }else{
+                    auto value=found->number;if(found->type==208)value=found->pair[0];else if(found->type==211)value=found->list.empty()?0:found->list[0];
+                    memory.check(GuestAddress{output},4,Access::Write);memory.store(GuestAddress{output},32,static_cast<std::uint32_t>(value));
+                }
+            }
+        }
+    }else if(name=="GetThemeSysString"){
+        // (hTheme, iStringId, pszStringBuff, cchMaxStringChars)：TMT_CSSNAME～TMT_ALIAS（1401～1404）為主題的系統字串；此主題沒有定義這些字串。
+        const auto id=static_cast<std::uint32_t>(arg(1));
+        if(!gui_.themes.contains(arg(0)))result=e_handle;else if(!arg(2))result=e_pointer;else if(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(3)))<=0)result=0x80070057U;
+        else{(void)id;result=e_prop;}
+    }else if(name=="GetThemeDocumentationProperty"){
+        // (pszThemeName, pszPropertyName, pszValueBuff, cchMaxValChars)：主題檔名與 GetCurrentThemeName 相同；[documentation] 只定義 DisplayName、ThemeName 與 Description。
+        if(!arg(0) || !arg(1) || !arg(2))result=e_pointer;
+        else if(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(3)))<=0)result=0x80070057U;
+        else{
+            const auto fold=[](std::u16string text){for(auto& c:text)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);return text;};
+            const auto file=fold(read_utf16(memory,GuestAddress{arg(0)})),property=fold(read_utf16(memory,GuestAddress{arg(1)}));
+            if(!active || file!=fold(u"AppKit/NSAppearanceNameAqua"))result=0x80070002U; // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+            else{
+                std::u16string_view value;
+                if(property==u"displayname" || property==u"themename")value=u"Aqua";else if(property==u"description")value=u"macOS AppKit Aqua (light) appearance";
+                if(value.empty())result=e_prop;
+                else{const auto capacity=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(3)));const auto count=std::min<std::size_t>(value.size(),static_cast<std::size_t>(capacity-1));
+                    memory.check(GuestAddress{arg(2)},(count+1)*2,Access::Write);for(std::size_t i=0;i<count;++i)memory.store(GuestAddress{arg(2)+i*2},16,value[i]);memory.store(GuestAddress{arg(2)+count*2},16,0);}
+            }
+        }
+    }else if(name=="GetThemeTextExtent"){
+        // (hTheme, hdc, iPartId, iStateId, pszText, cchCharCount, dwTextFlags, pBoundingRect, pExtentRect)：主題沒有 TMT_FONT，以 DC 目前字型計算 DrawTextW(DT_CALCRECT)。
+        const auto count=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(5)));
+        if(!gui_.themes.contains(arg(0)) || !arg(1) || !valid_dc(arg(1)))result=e_handle;
+        else if((!arg(4) && count) || !arg(8))result=e_pointer;
+        else if(count<-1)result=0x80070057U;
+        else{
+            GuestScratch scratch(*this,memory,state);const auto rect=scratch.allocate(16);
+            if(!rect)result=0x8007000eU;
+            else{
+                std::vector<std::uint8_t> box(16);if(arg(7)){memory.check(GuestAddress{arg(7)},16,Access::Read);memory.read(GuestAddress{arg(7)},box);}memory.write(GuestAddress{rect},box);
+                const auto height=nested_service(state,memory,"user32.dll","DrawTextW",{arg(1),arg(4),static_cast<std::uint32_t>(count),rect,static_cast<std::uint32_t>(arg(6))|0x400U});
+                if(!(height&UINT32_MAX) && count)result=0x80004005U;
+                else{memory.read(GuestAddress{rect},box);memory.check(GuestAddress{arg(8)},16,Access::Write);memory.write(GuestAddress{arg(8)},box);}
+            }
+        }
+    }else if(name=="HitTestThemeBackground"){
+        // (hTheme, hdc, iPartId, iStateId, dwOptions, pRect, hrgn, ptTest, pwHitTestCode)：HTTB_FIXEDBORDER 2、HTTB_CAPTION 4、HTTB_RESIZINGBORDER_LEFT／TOP／RIGHT／BOTTOM 0x10～0x80、
+        // HTTB_SIZINGTEMPLATE 0x100（此主題沒有 TMT_SIZINGTEMPLATE，改用尺寸邊界）、HTTB_SYSTEMSIZINGMARGINS 0x200（系統調整框寬度）。
+        const auto theme=gui_.themes.find(arg(0));const auto options=static_cast<std::uint32_t>(arg(4));
+        if(theme==gui_.themes.end() || !valid_dc(arg(1)))result=e_handle;
+        else if(!arg(5) || !arg(8))result=e_pointer;
+        else if(options&~0x3f6U)result=0x80070057U;
+        else{
+            const auto& data=theme->second;const auto part=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(2))),status=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(3)));
+            std::array<std::int32_t,4> rect{};memory.check(GuestAddress{arg(5)},16,Access::Read);for(unsigned i=0;i<4;++i)rect[i]=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{arg(5)+i*4},32)));
+            const auto x=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(7))),y=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arg(7)>>32));
+            const std::array<std::int32_t,2> size{std::max(0,rect[2]-rect[0]),std::max(0,rect[3]-rect[1])};
+            const auto info=native_gui_?native_gui_->theme_metrics(data.class_name,part,status,data.dpi,size):std::nullopt;
+            if(!info)result=e_prop;
+            else{
+                const bool inside=arg(6)?(nested_service(state,memory,"gdi32.dll","PtInRegion",{arg(6),static_cast<std::uint32_t>(x),static_cast<std::uint32_t>(y)})&UINT32_MAX)!=0:x>=rect[0] && x<rect[2] && y>=rect[1] && y<rect[3];
+                std::uint32_t code=0; // HTNOWHERE
+                if(inside){
+                    std::array<std::int32_t,4> margin{}; // 左、右、上、下
+                    if(options&0x200U){const auto cx=static_cast<std::int32_t>(system_metric(32,data.dpi)+system_metric(92,data.dpi)),cy=static_cast<std::int32_t>(system_metric(33,data.dpi)+system_metric(92,data.dpi));margin={cx,cx,cy,cy};}
+                    else margin={std::max(0,info->content[0]),std::max(0,size[0]-info->content[2]),std::max(0,info->content[1]),std::max(0,size[1]-info->content[3])};
+                    const bool left=x<rect[0]+margin[0],right=x>=rect[2]-margin[1],top=y<rect[1]+margin[2],bottom=y>=rect[3]-margin[3];
+                    const bool l=options&0x10U,t=options&0x20U,r=options&0x40U,b=options&0x80U;
+                    if(top && left && t && l)code=13;else if(top && right && t && r)code=14;else if(bottom && left && b && l)code=16;else if(bottom && right && b && r)code=17;
+                    else if(left && l)code=10;else if(right && r)code=11;else if(top && t)code=12;else if(bottom && b)code=15;
+                    else if(top && (options&4U))code=2;                               // HTCAPTION
+                    else if((left || right || top || bottom) && (options&2U))code=18;  // HTBORDER
+                    else code=1;                                                       // HTCLIENT
+                }
+                memory.check(GuestAddress{arg(8)},2,Access::Write);memory.store(GuestAddress{arg(8)},16,code);
+            }
+        }
+    }else if(name=="DrawThemeEdge"){
+        // (hTheme, hdc, iPartId, iStateId, pDestRect, uEdge, uFlags, pContentRect)：主題沒有 TMT_EDGE*COLOR，與 DrawEdge 相同使用系統色；BF_ADJUST 時回傳內部矩形。
+        if(!gui_.themes.contains(arg(0)) || !arg(1) || !valid_dc(arg(1)))result=e_handle;
+        else if(!arg(4))result=e_pointer;
+        else{
+            GuestScratch scratch(*this,memory,state);const auto rect=scratch.allocate(16);
+            if(!rect)result=0x8007000eU;
+            else{std::vector<std::uint8_t> box(16);memory.check(GuestAddress{arg(4)},16,Access::Read);memory.read(GuestAddress{arg(4)},box);memory.write(GuestAddress{rect},box);
+                if(!(nested_service(state,memory,"user32.dll","DrawEdge",{arg(1),rect,static_cast<std::uint32_t>(arg(5)),static_cast<std::uint32_t>(arg(6))})&UINT32_MAX))result=0x80004005U;
+                else if(arg(7) && (arg(6)&0x2000U)){memory.read(GuestAddress{rect},box);memory.check(GuestAddress{arg(7)},16,Access::Write);memory.write(GuestAddress{arg(7)},box);}}
+        }
+    }else if(name=="DrawThemeIcon"){
+        // (hTheme, hdc, iPartId, iStateId, pRect, himl, iImageIndex)：主題沒有 TMT_ICONEFFECT（ICE_NONE），在矩形左上角以 ILD_TRANSPARENT 繪製，寬高為矩形大小。
+        if(!gui_.themes.contains(arg(0)) || !arg(1) || !valid_dc(arg(1)))result=e_handle;
+        else if(!arg(4))result=e_pointer;
+        else{
+            std::array<std::int32_t,4> rect{};memory.check(GuestAddress{arg(4)},16,Access::Read);for(unsigned i=0;i<4;++i)rect[i]=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(memory.load(GuestAddress{arg(4)+i*4},32)));
+            const auto width=std::max(0,rect[2]-rect[0]),height=std::max(0,rect[3]-rect[1]);
+            if(!(nested_service(state,memory,"comctl32.dll","ImageList_DrawEx",{arg(5),static_cast<std::uint32_t>(arg(6)),arg(1),static_cast<std::uint32_t>(rect[0]),static_cast<std::uint32_t>(rect[1]),
+                static_cast<std::uint32_t>(width),static_cast<std::uint32_t>(height),0xffffffffU,0xffffffffU,1})&UINT32_MAX))result=0x80004005U;
+        }
     }else if(name=="CloseThemeData") {
+        if(const auto found=gui_.themes.find(arg(0));found!=gui_.themes.end())release_bitmaps(found->second);
         if(!gui_.themes.erase(arg(0)))result=e_handle;
         else std::erase_if(gui_.window_themes,[&](const auto& item){return item.second==arg(0);});
     }else if(name.starts_with("DrawTheme") || name.starts_with("GetThemeBackground") || name=="GetThemePartSize" || name=="IsThemePartDefined" || name=="IsThemeBackgroundPartiallyTransparent") {

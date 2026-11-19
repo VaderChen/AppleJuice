@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <charconv>
+#include <array>
 
 namespace x64arm::certificate_detail {
 PfxKey::~PfxKey(){OPENSSL_cleanse(der.data(),der.size());}
@@ -106,5 +107,53 @@ PfxBundle read_pfx(std::span<const std::uint8_t> input,const char* password,bool
         require_pfx(std::all_of(used.begin(),used.end(),[](bool value){return value;}),0x80090015);
     }catch(const cng::Error& e){throw CertificateError{e.code};}
     return result;
+}
+std::vector<std::uint8_t> write_pfx(const PfxBundle& bundle,const char* password,const PfxWriteOptions& options){
+    ERR_clear_error();
+    const auto release_bags=[](STACK_OF(PKCS12_SAFEBAG)* p){sk_PKCS12_SAFEBAG_pop_free(p,PKCS12_SAFEBAG_free);};
+    const auto release_safes=[](STACK_OF(PKCS7)* p){sk_PKCS7_pop_free(p,PKCS7_free);};
+    std::unique_ptr<STACK_OF(PKCS12_SAFEBAG),decltype(release_bags)> certificate_bags(sk_PKCS12_SAFEBAG_new_null(),release_bags),key_bags(sk_PKCS12_SAFEBAG_new_null(),release_bags);
+    std::unique_ptr<STACK_OF(PKCS7),decltype(release_safes)> safes(sk_PKCS7_new_null(),release_safes);
+    require_pfx(certificate_bags && key_bags && safes,8);
+    const int cipher=options.pbes2?NID_aes_256_cbc:NID_pbe_WithSHA1And3_Key_TripleDES_CBC;constexpr int iterations=2000;
+    const int password_length=password?-1:0;
+    const auto push=[](STACK_OF(PKCS12_SAFEBAG)* bags,PKCS12_SAFEBAG* bag){require_pfx(bag!=nullptr,8);if(!sk_PKCS12_SAFEBAG_push(bags,bag)){PKCS12_SAFEBAG_free(bag);require_pfx(false,8);}};
+    // localKeyID：配對的憑證與金鑰共用 4 位元組金鑰序號。
+    const auto key_id=[](std::size_t index){const auto n=static_cast<std::uint32_t>(index+1);return std::array<unsigned char,4>{static_cast<unsigned char>(n),static_cast<unsigned char>(n>>8),static_cast<unsigned char>(n>>16),static_cast<unsigned char>(n>>24)};};
+    const auto utf16_text=[](const std::vector<std::uint8_t>& bytes){std::u16string text;for(std::size_t i=0;i+1<bytes.size();i+=2)text.push_back(static_cast<char16_t>(bytes[i]|(bytes[i+1]<<8)));while(!text.empty() && !text.back())text.pop_back();return text;};
+    for(const auto& certificate:bundle.certificates){
+        const auto* p=certificate.der.data();std::unique_ptr<X509,decltype(&X509_free)> x509(d2i_X509(nullptr,&p,static_cast<long>(certificate.der.size())),X509_free);
+        require_pfx(x509 && p==certificate.der.data()+certificate.der.size());
+        auto* bag=PKCS12_SAFEBAG_create_cert(x509.get());push(certificate_bags.get(),bag);
+        if(const auto name=certificate.properties.find(11);name!=certificate.properties.end()){const auto text=utf16_text(name->second);
+            if(!text.empty())require_pfx(PKCS12_add_friendlyname_utf8(bag,utf16_to_utf8(text).c_str(),-1)==1,8);}
+        if(certificate.key){auto id=key_id(*certificate.key);require_pfx(PKCS12_add_localkeyid(bag,id.data(),4)==1,8);}
+        if(options.extended_properties)for(const auto& [id,value]:certificate.properties){
+            // 程序內的金鑰 handle、provider 結構與計算出的雜湊不輸出。
+            if(id==1 || id==2 || id==3 || id==4 || id==5 || id==6 || id==78 || id==79 || value.size()>INT32_MAX)continue;
+            const auto oid="1.3.6.1.4.1.311.17.3."+std::to_string(id);
+            require_pfx(PKCS12_add1_attr_by_txt(bag,oid.c_str(),V_ASN1_OCTET_STRING,value.data(),static_cast<int>(value.size()))==1,8);
+        }
+    }
+    for(std::size_t i=0;i<bundle.keys.size();++i){
+        const auto& key=bundle.keys[i];const auto* p=key.der.data();
+        std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> pkey(d2i_AutoPrivateKey(nullptr,&p,static_cast<long>(key.der.size())),EVP_PKEY_free);require_pfx(bool(pkey),0x8009000bU);
+        std::unique_ptr<PKCS8_PRIV_KEY_INFO,decltype(&PKCS8_PRIV_KEY_INFO_free)> info(EVP_PKEY2PKCS8(pkey.get()),PKCS8_PRIV_KEY_INFO_free);require_pfx(bool(info),8);
+        // CSP 金鑰以金鑰用途區分 AT_KEYEXCHANGE（KEY_EX）與 AT_SIGNATURE（KEY_SIG）；CNG 金鑰不帶用途。
+        if(key.spec==1 || key.spec==2)require_pfx(PKCS8_add_keyusage(info.get(),key.spec==1?KEY_EX:KEY_SIG)==1,8);
+        auto* bag=PKCS12_SAFEBAG_create_pkcs8_encrypt(cipher,password,password_length,nullptr,0,iterations,info.get());push(key_bags.get(),bag);
+        if(!key.name.empty())require_pfx(PKCS12_add_friendlyname_utf8(bag,key.name.c_str(),-1)==1,8);
+        if(!key.provider.empty())require_pfx(PKCS12_add_CSPName_asc(bag,key.provider.c_str(),-1)==1,8);
+        if(key.machine)require_pfx(PKCS12_add1_attr_by_NID(bag,NID_LocalKeySet,V_ASN1_BIT_STRING,reinterpret_cast<const unsigned char*>(""),0)==1,8);
+        auto id=key_id(i);require_pfx(PKCS12_add_localkeyid(bag,id.data(),4)==1,8);
+    }
+    const auto add_safe=[&](PKCS7* safe){require_pfx(safe!=nullptr,8);if(!sk_PKCS7_push(safes.get(),safe)){PKCS7_free(safe);require_pfx(false,8);}};
+    if(sk_PKCS12_SAFEBAG_num(certificate_bags.get())>0)
+        add_safe(options.encrypt_certificates?PKCS12_pack_p7encdata(cipher,password,password_length,nullptr,0,iterations,certificate_bags.get()):PKCS12_pack_p7data(certificate_bags.get()));
+    if(sk_PKCS12_SAFEBAG_num(key_bags.get())>0)add_safe(PKCS12_pack_p7data(key_bags.get()));
+    Container pfx(PKCS12_add_safes(safes.get(),0),PKCS12_free);require_pfx(bool(pfx),8);
+    require_pfx(PKCS12_set_mac(pfx.get(),password,password_length,nullptr,0,iterations,options.pbes2?EVP_sha256():EVP_sha1())==1,8);
+    const auto length=i2d_PKCS12(pfx.get(),nullptr);require_pfx(length>0,8);std::vector<std::uint8_t> out(static_cast<std::size_t>(length));
+    auto* cursor=out.data();require_pfx(i2d_PKCS12(pfx.get(),&cursor)==length,8);return out;
 }
 }

@@ -364,7 +364,17 @@
                         resource->subresource_maps.emplace(0U,Identity::SubresourceMap{front->pointer,front->size,4U});front->mapped=0;
                     }
                 }
-                const auto found=resource->subresource_maps.find(u32(2));require(found!=resource->subresource_maps.end());const auto mapping=found->second;if(mapping.type!=1){const auto view=subresource(resource,u32(2));
+                const auto found=resource->subresource_maps.find(u32(2));
+                if(found==resource->subresource_maps.end()){
+                    // 只在契約失敗時保存映射交接狀態；正常 Map／Unmap 不加入逐筆追蹤。
+                    std::ostringstream error;error<<"D3D11 Unmap 找不到 Map：context=0x"<<std::hex<<arg(0)<<" resource=0x"<<arg(1)<<" identity=0x"<<resource->root
+                        <<" subresource=0x"<<u32(2)<<" device=0x"<<resource->device<<" maps="<<std::dec<<resource->subresource_maps.size()<<" persistent="<<resource->persistent_maps.size()
+                        <<" dimension="<<resource->resource->desc.dimension<<" width="<<resource->resource->desc.width<<" height="<<resource->resource->desc.height<<" format="<<resource->resource->desc.format;
+                    if(d3d11_stream_){auto& stream=*d3d11_stream_;error<<" stream_context=0x"<<std::hex<<stream.context.load()<<" stream_owner=0x"<<stream.owner.load()<<" caller=0x"<<(x86_?state.fs_base:state.gs_base);
+                        if(const auto* front=stream.front_maps.find(arg(1)))error<<" front_mapped="<<std::dec<<front->mapped<<" front_pointer=0x"<<std::hex<<front->pointer;else error<<" front=missing";}
+                    throw std::invalid_argument(error.str());
+                }
+                const auto mapping=found->second;if(mapping.type!=1){const auto view=subresource(resource,u32(2));
                     const auto kept_map=resource->persistent_maps.find(u32(2));const bool persistent=kept_map!=resource->persistent_maps.end() && kept_map->second.pointer==mapping.pointer;
                     // 持久區塊直接以短期唯讀視圖上傳，不另複製一份；視圖只在本次呼叫內使用。
                     std::vector<std::uint8_t> copied;std::span<const std::uint8_t> data;

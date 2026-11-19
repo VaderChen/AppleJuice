@@ -19,6 +19,8 @@ inline constexpr WindowsApiSetFamily windows_api_set_families[]{
     {"api-ms-win-core-winrt-","combase.dll"},{"api-ms-win-core-winrt","combase.dll"},
     // 安全、事件、服務：advapi32（Windows 由 sechost／kernelbase 承接）。
     {"api-ms-win-security-","advapi32.dll"},{"api-ms-win-eventing-","advapi32.dll"},{"api-ms-win-service-","advapi32.dll"},
+    // Windows 錯誤報告的報告 API 由 wer.dll 承接。
+    {"ext-ms-win-wer-reporting","wer.dll"},
     {"api-ms-win-power-base","powrprof.dll"},{"api-ms-win-power-setting","powrprof.dll"},
     {"api-ms-win-devices-config","cfgmgr32.dll"},
     {"api-ms-win-shcore-","shcore.dll"},
@@ -80,6 +82,7 @@ static_assert(windows_api_set_host("api-ms-win-core-synch-l1-2-0.dll")=="kernel3
 static_assert(windows_api_set_host("api-ms-win-mm-time-l1-1-0.dll")=="winmm.dll");
 static_assert(windows_api_set_host("api-ms-win-gaming-tcui-l1-1-4.dll")=="gamingtcui.dll");
 static_assert(windows_api_set_host("ext-ms-win-ntuser-powermanagement-l1-1-0.dll")=="user32.dll");
+static_assert(windows_api_set_host("ext-ms-win-wer-reporting-l1-1-0.dll")=="wer.dll");
 static_assert(windows_api_set_host("api-ms-win-crt-runtime-l1-1-0.dll")=="api-ms-win-crt-runtime-l1-1-0.dll");
 static_assert(windows_api_set_host("ext-ms-win-dxcore-l1-1-0.dll")=="ext-ms-win-dxcore-l1-1-0.dll");
 static_assert(windows_api_set_host("vcruntime140_app.dll")=="vcruntime140.dll" && windows_api_set_host("msvcp140_app.dll")=="msvcp140.dll");

@@ -53,8 +53,11 @@ std::uint32_t hls_to_rgb(int hue,int luminance,int saturation){
 }
 std::span<const WindowsServiceDescriptor> shlwapi_misc_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"shlwapi.dll","#542",0},
+        {"shlwapi.dll","#35",3,0,0,0x2},
         {"shlwapi.dll","ColorRGBToHLS",4,0,0,0x1},{"shlwapi.dll","ColorHLSToRGB",3,0,0,0x7},{"shlwapi.dll","ColorAdjustLuma",3,0,0,0x7},
         {"shlwapi.dll","GetMenuPosFromID",2,0,0,0x2},{"shlwapi.dll","GetAcceptLanguagesA",2},{"shlwapi.dll","GetAcceptLanguagesW",2},
+        {"internal-shell-shared","SHMapHandle",5,0,0,0x1e},{"internal-shell-shared","SHLockSharedEx",3,0,0,0x6},
         {"shlwapi.dll","SHAllocShared",3,0,0,0x6},{"shlwapi.dll","SHLockShared",2,0,0,0x2},{"shlwapi.dll","SHUnlockShared",1},{"shlwapi.dll","SHFreeShared",2,0,0,0x2},
         {"shlwapi.dll","WhichPlatform",0},{"shlwapi.dll","SHIsLowMemoryMachine",1,0,0,0x1},{"shlwapi.dll","IsInternetESCEnabled",0},
         {"shlwapi.dll","IStream_Read",3,0,0,0x4},{"shlwapi.dll","IStream_Write",3,0,0,0x4},{"shlwapi.dll","IStream_Reset",1},{"shlwapi.dll","IStream_Size",2},
@@ -70,6 +73,9 @@ std::span<const WindowsServiceDescriptor> shlwapi_misc_service_descriptors(){
         {"shlwapi.dll","ShellMessageBoxA",5,0,0,0x10,true},{"shlwapi.dll","ShellMessageBoxW",5,0,0,0x10,true},
         {"shlwapi.dll","SHCreateShellPalette",1},{"shlwapi.dll","SHGetInverseCMAP",2,0,0,0x2},{"shlwapi.dll","SHSkipJunction",2},{"shlwapi.dll","UrlFixupW",3,0,0,0x4},
         {"shlwapi.dll","MLLoadLibraryA",3,0,0,0x4},{"shlwapi.dll","MLLoadLibraryW",3,0,0,0x4},
+        // 雜湊與路徑字元（windows_shlwapi_hash.inc）。
+        {"shlwapi.dll","HashData",4,0,0,0xa},{"shlwapi.dll","UrlHashA",3,0,0,0x4},{"shlwapi.dll","UrlHashW",3,0,0,0x4},
+        {"shlwapi.dll","PathIsValidCharA",2,0,0,0x3},{"shlwapi.dll","PathIsValidCharW",2,0,0,0x3},{"shlwapi.dll","SHTruncateString",2,0,0,0x2},
         {"shlwapi.dll","SHOpenRegStreamA",4,0,0,0x8},{"shlwapi.dll","SHOpenRegStreamW",4,0,0,0x8},{"shlwapi.dll","SHOpenRegStream2A",4,0,0,0x8},{"shlwapi.dll","SHOpenRegStream2W",4,0,0,0x8},
     };return table;
 }
@@ -80,6 +86,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
     const auto handle=[&](std::uint64_t value){return x86_?value&UINT32_MAX:value;};
     const auto host=[&](std::string_view dll,std::string_view symbol,std::initializer_list<std::uint64_t> args){return nested_service(state,memory,dll,symbol,args);};
     const auto pointer_bits=static_cast<std::uint8_t>(x86_?32:64);
+#include "windows_shlwapi_hash.inc"
+    if(name=="#35"){ // GetStringType3ExW
+        return done(host("kernel32.dll","GetStringTypeW",{4,arg(0),u32(1),arg(2)}));
+    }
     if(name=="ColorRGBToHLS"){
         const auto value=rgb_to_hls(u32(0));
         if(arg(1))memory.store(GuestAddress{arg(1)},16,static_cast<std::uint16_t>(value.hue));
@@ -116,36 +126,73 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         if(length>=capacity){memory.store(GuestAddress{arg(1)},32,length);return done(0x8007007aU);}
         memory.write(GuestAddress{arg(0)},bytes);memory.store(GuestAddress{arg(1)},32,length);return done(0);
     }
-    if(name=="SHAllocShared" || name=="SHLockShared" || name=="SHFreeShared"){
-        // 共用區塊＝分頁檔支援的檔案映射，前 8 位元組記錄資料大小；SHLockShared 回傳標頭之後的位址。
-        // 目標程序不是目前程序時，以 DuplicateHandle 在兩個程序間轉移 handle。
-        const auto self=handle(host("kernel32.dll","GetCurrentProcess",{}));const auto current=static_cast<std::uint32_t>(host("kernel32.dll","GetCurrentProcessId",{}));
-        const auto process_id=u32(name=="SHAllocShared"?2:1);const bool remote=process_id && process_id!=current;
-        GuestScratch temporary(*this,memory,state);const auto slot=temporary.allocate(8);if(!slot)return done(0);memory.store(GuestAddress{slot},64,0);
-        const auto open=[&]{return handle(host("kernel32.dll","OpenProcess",{0x40,0,process_id}));}; // PROCESS_DUP_HANDLE
-        if(name=="SHAllocShared"){
-            const auto size=u32(1);if(size>0x7ffffff0U)return done(0);
-            const auto mapping=handle(host("kernel32.dll","CreateFileMappingW",{x86_?UINT32_MAX:UINT64_MAX,0,4,0,std::uint64_t{size}+8,0}));if(!mapping)return done(0);
-            const auto view=handle(host("kernel32.dll","MapViewOfFile",{mapping,2,0,0,0}));if(!view){(void)host("kernel32.dll","CloseHandle",{mapping});return done(0);}
-            memory.store(GuestAddress{view},32,size);memory.store(GuestAddress{view+4},32,0);
-            if(arg(0) && size){std::vector<std::uint8_t> data(size);memory.read(GuestAddress{arg(0)},data);memory.write(GuestAddress{view+8},data);}
-            (void)host("kernel32.dll","UnmapViewOfFile",{view});if(!remote)return done(mapping);
-            const auto process=open();if(!process){(void)host("kernel32.dll","CloseHandle",{mapping});return done(0);}
-            const auto moved=host("kernel32.dll","DuplicateHandle",{self,mapping,process,slot,0,0,3})&UINT32_MAX; // SAME_ACCESS | CLOSE_SOURCE
-            (void)host("kernel32.dll","CloseHandle",{process});return done(moved?handle(memory.load(GuestAddress{slot},pointer_bits)):0);
-        }
-        auto local=arg(0);std::uint64_t process=0;if(!local)return done(0);
-        if(remote){process=open();if(!process)return done(0);}
-        if(name=="SHFreeShared"){
-            const auto closed=remote?host("kernel32.dll","DuplicateHandle",{process,local,0,0,0,0,1}):host("kernel32.dll","CloseHandle",{local}); // CLOSE_SOURCE
-            if(process)(void)host("kernel32.dll","CloseHandle",{process});return done(closed&UINT32_MAX?1U:0U);
-        }
-        if(remote){const auto copied=host("kernel32.dll","DuplicateHandle",{process,local,self,slot,0xf001f,0,0})&UINT32_MAX;(void)host("kernel32.dll","CloseHandle",{process});
-            if(!copied)return done(0);local=handle(memory.load(GuestAddress{slot},pointer_bits));}
-        const auto view=handle(host("kernel32.dll","MapViewOfFile",{local,6,0,0,0}));if(remote)(void)host("kernel32.dll","CloseHandle",{local}); // FILE_MAP_READ | WRITE
-        return done(view?view+8:0);
+    if(name=="SHUnlockShared"){
+        return done(arg(0)>=4 && host("kernel32.dll","UnmapViewOfFile",{arg(0)-4}));
     }
-    if(name=="SHUnlockShared"){if(!arg(0) || arg(0)<8)return done(0);return done(host("kernel32.dll","UnmapViewOfFile",{arg(0)-8})&UINT32_MAX?1U:0U);}
+    if(name=="SHAllocShared" || name=="SHLockShared" || name=="SHFreeShared" || service.family=="internal-shell-shared"){
+        const auto self=handle(host("kernel32.dll","GetCurrentProcess",{}));
+        const auto current=static_cast<std::uint32_t>(host("kernel32.dll","GetCurrentProcessId",{}));
+        GuestScratch temporary(*this,memory,state);
+        const auto slot=temporary.allocate(8);
+        if(!slot)return done(0);
+        const auto close=[&](std::uint64_t h){return host("kernel32.dll","CloseHandle",{h});};
+        const auto open=[&](std::uint32_t pid){return pid==current?self:handle(host("kernel32.dll","OpenProcess",{0x40,0,pid}));};
+        const auto duplicate=[&](std::uint64_t h,std::uint32_t from,std::uint32_t to,std::uint32_t access,std::uint32_t options){
+            if(!h)return UINT64_C(0);
+            const auto target=open(to);
+            if(!target)return UINT64_C(0);
+            const auto source=open(from);
+            std::uint64_t copy=0;
+            if(source){
+                if(host("kernel32.dll","DuplicateHandle",{source,h,target,slot,access,0,options|2U}))
+                    copy=handle(memory.load(GuestAddress{slot},pointer_bits));
+                if(source!=self)(void)close(source);
+            }
+            if(target!=self)(void)close(target);
+            return copy;
+        };
+        if(name=="SHMapHandle")return done(duplicate(arg(0),u32(1),u32(2),u32(3),u32(4)));
+        if(name=="SHAllocShared"){
+            const auto size=u32(1);
+            if(size>UINT32_MAX-4)return done(0);
+            if(arg(0) && size)memory.check(GuestAddress{arg(0)},size,Access::Read);
+            const auto mapping=handle(host("kernel32.dll","CreateFileMappingW",{self,0,4,0,std::uint64_t{size}+4,0}));
+            if(!mapping)return done(0);
+            std::uint64_t result=0;
+            const auto view=handle(host("kernel32.dll","MapViewOfFile",{mapping,2,0,0,0}));
+            if(view){
+                try{
+                    memory.store(GuestAddress{view},32,size);
+                    if(arg(0)){
+                        std::array<std::uint8_t,4096> buffer;
+                        for(std::size_t offset=0;offset<size;){
+                            auto chunk=std::span(buffer).first(std::min(buffer.size(),size-offset));
+                            memory.read(GuestAddress{arg(0)+offset},chunk);
+                            memory.write(GuestAddress{view+4+offset},chunk);
+                            offset+=chunk.size();
+                        }
+                    }
+                }catch(...){
+                    (void)host("kernel32.dll","UnmapViewOfFile",{view});(void)close(mapping);throw;
+                }
+                (void)host("kernel32.dll","UnmapViewOfFile",{view});
+                result=duplicate(mapping,current,u32(2),0,0);
+            }
+            (void)close(mapping);
+            return done(result);
+        }
+        if(name=="SHFreeShared"){
+            if(!arg(0))return done(1);
+            const auto local=duplicate(arg(0),u32(1),current,0,1);
+            return done(local && close(local));
+        }
+        const auto local=duplicate(arg(0),u32(1),current,0,0);
+        if(!local)return done(0);
+        const bool write=name=="SHLockShared" || u32(2)!=0;
+        const auto view=handle(host("kernel32.dll","MapViewOfFile",{local,write?6U:4U,0,0,0}));
+        (void)close(local);
+        return done(view?view+4:0);
+    }
     if(name=="WhichPlatform")return done(2); // PLATFORM_INTEGRATED：殼層與瀏覽器整合（Windows 2000 以後皆是）
     if(name=="SHIsLowMemoryMachine"){
         // ILMM_IE4（0）：總實體記憶體少於 64 MiB 視為低記憶體。
@@ -378,6 +425,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         const auto handle_of=[&](std::uint64_t value){return x86_?value&UINT32_MAX:value;};
         const bool wide=symbol.ends_with('W');
         const auto text_at=[&](std::uint64_t address)->std::u16string{if(!address)return {};return wide?read_utf16(m,GuestAddress{address},32768):utf8_to_utf16_lossy(read_ansi(m,address,32768));};
+        if(symbol=="#542"){ // GetUIVersion：以實際載入的 shell32 查詢介面版本。
+            const auto library=temporary.text(u"shell32.dll"),info=temporary.allocate(20),proc=temporary.allocate(14);
+            if(!library || !proc || !info)co_return finish(0);
+            constexpr std::uint8_t version_name[]="DllGetVersion";
+            m.write(GuestAddress{proc},version_name);
+            const auto module=handle_of(co_await service_callback::call_value(entry("kernel32.dll","LoadLibraryW"),{library}));
+            if(!module)co_return finish(0);
+            const auto fn=handle_of(co_await service_callback::call_value(entry("kernel32.dll","GetProcAddress"),{module,proc}));
+            std::uint32_t major=0;
+            if(fn){
+                m.store(GuestAddress{info},32,20);
+                if(!status(co_await service_callback::call(fn,{info})))
+                    major=static_cast<std::uint32_t>(m.load(GuestAddress{info+4},32));
+            }
+            (void)co_await service_callback::call(entry("kernel32.dll","FreeLibrary"),{module});
+            co_return finish(major?major:3);
+        }
         if(symbol.starts_with("MLLoadLibrary")){
             // (檔名, HMODULE 基準, 跨碼頁旗標)：依序找 <模組目錄>\mui\<UI 語言>\檔名、<模組目錄>\檔名，以資料檔方式載入；最後交給一般搜尋。
             const auto file=text_at(call(0));if(file.empty())co_return finish(0);const auto buffer=temporary.allocate(2*32768);if(!buffer)co_return finish(0);

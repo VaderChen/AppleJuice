@@ -1,16 +1,70 @@
 #include "x64arm/http.hpp"
 #include "x64arm/resource_usage.hpp"
 #include <curl/curl.h>
+#include <dlfcn.h>
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace x64arm {
 namespace {
 struct HttpError {std::uint32_t code;};
+struct CertificatePolicy {
+    using Verify=int(*)(int,void*);
+    using GetMode=int(*)(const void*);
+    using GetCallback=Verify(*)(const void*);
+    using SetVerify=void(*)(void*,int,Verify);
+    using GetError=int(*)(const void*);
+    using SetError=void(*)(void*,int);
+    GetMode mode{};GetCallback callback{};SetVerify set_verify{};
+    GetError error{};SetError set_error{};
+    bool available{};
+    static thread_local std::uint32_t exceptions;
+    static thread_local Verify previous;
+    static CertificatePolicy& shared();
+    void initialize(){
+        // 系統 curl 的 OpenSSL 相容後端與本專案的靜態 OpenSSL 可有不同 ABI。
+        // 必須從 curl 自己的相依庫取得函式，不能將其 SSL_CTX 交給另一版本。
+        Dl_info image{};
+        if(!dladdr(reinterpret_cast<const void*>(&curl_easy_init),&image) || !image.dli_fname)return;
+        const auto library=dlopen(image.dli_fname,RTLD_LAZY|RTLD_LOCAL);
+        if(!library)return;
+        mode=reinterpret_cast<GetMode>(dlsym(library,"SSL_CTX_get_verify_mode"));
+        callback=reinterpret_cast<GetCallback>(dlsym(library,"SSL_CTX_get_verify_callback"));
+        set_verify=reinterpret_cast<SetVerify>(dlsym(library,"SSL_CTX_set_verify"));
+        error=reinterpret_cast<GetError>(dlsym(library,"X509_STORE_CTX_get_error"));
+        set_error=reinterpret_cast<SetError>(dlsym(library,"X509_STORE_CTX_set_error"));
+        if(mode && callback && set_verify && error && set_error)
+            available=curl_global_sslset(CURLSSLBACKEND_OPENSSL,nullptr,nullptr)==CURLSSLSET_OK;
+        // library 保持程序生命期，讓背景傳輸的函式指標持續有效。
+    }
+    static int verify(int valid,void* store){
+        auto& policy=shared();const auto code=policy.error(store);
+        // 分別處理憑證日期、未知簽發者、用途及無法完成的 CRL 查驗。
+        // 憑證簽章錯誤與已撤銷憑證仍失敗，不能因其他例外而被放行。
+        const bool ignored=((exceptions&0x2000U) && (code==9 || code==10)) ||
+            ((exceptions&0x100U) && (code==2 || code==18 || code==19 || code==20 || code==21)) ||
+            ((exceptions&0x200U) && code==26) ||
+            ((exceptions&0x80U) && (code==3 || code==11 || code==12 || code==15 || code==16 || code==33));
+        if(!valid && ignored){policy.set_error(store,0);valid=1;}
+        return previous?previous(valid,store):valid;
+    }
+    static CURLcode configure(CURL*,void* context,void* opaque){
+        auto& policy=shared();exceptions=static_cast<const HttpInput*>(opaque)->certificate_exceptions;
+        // SSL_connect 與驗證回呼均在這筆傳輸所屬的 worker 執行；例外不跨請求／執行緒。
+        const auto original=policy.callback(context);if(original!=&verify)previous=original;
+        policy.set_verify(context,policy.mode(context),&verify);return CURLE_OK;
+    }
+};
+thread_local std::uint32_t CertificatePolicy::exceptions{};
+thread_local CertificatePolicy::Verify CertificatePolicy::previous{};
+CertificatePolicy& CertificatePolicy::shared(){static CertificatePolicy policy;return policy;}
 std::string lower(std::string value){for(auto& c:value)if(c>='A' && c<='Z')c=static_cast<char>(c+32);return value;}
 struct Url {std::string scheme,host,port;std::string origin()const{return scheme+"://"+host+":"+port;}};
 Url parse_url(const std::string& text){
@@ -114,7 +168,7 @@ private:std::shared_ptr<Transfer> state_;
 };
 }
 std::shared_ptr<NativeHttp> start_native_http(HttpInput input){
-    static std::once_flag initialized;std::call_once(initialized,[]{if(curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK)throw std::bad_alloc();});
+    static std::once_flag initialized;std::call_once(initialized,[]{CertificatePolicy::shared().initialize();if(curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK)throw std::bad_alloc();});
     auto state=std::make_shared<Transfer>();state->send_timeout=input.timeouts[2];state->receive_timeout=input.timeouts[3];auto result=std::make_shared<Request>(state);
     std::thread([state,input=std::move(input)]{
         CURL* curl=curl_easy_init();curl_slist* headers=nullptr;
@@ -123,7 +177,13 @@ std::shared_ptr<NativeHttp> start_native_http(HttpInput input){
             // 每次重新導向重新選擇代理與 bypass，並關閉宿主環境的代理設定。
             curl_easy_setopt(curl,CURLOPT_NOPROXY,"");
             curl_easy_setopt(curl,CURLOPT_NOSIGNAL,1L);curl_easy_setopt(curl,CURLOPT_HTTP_VERSION,CURL_HTTP_VERSION_1_1);
-            curl_easy_setopt(curl,CURLOPT_SSL_VERIFYPEER,1L);curl_easy_setopt(curl,CURLOPT_SSL_VERIFYHOST,2L);
+            curl_easy_setopt(curl,CURLOPT_SSL_VERIFYPEER,1L);curl_easy_setopt(curl,CURLOPT_SSL_VERIFYHOST,(input.certificate_exceptions&0x1000U)?0L:2L);
+            if(!input.certificate_authorities.empty())curl_easy_setopt(curl,CURLOPT_CAINFO,input.certificate_authorities.c_str());
+            if(input.certificate_exceptions&0x2380U){
+                if(!CertificatePolicy::shared().available)throw HttpError{50};
+                if(curl_easy_setopt(curl,CURLOPT_SSL_CTX_FUNCTION,&CertificatePolicy::configure)!=CURLE_OK ||
+                   curl_easy_setopt(curl,CURLOPT_SSL_CTX_DATA,&input)!=CURLE_OK)throw HttpError{50};
+            }
             if(input.secure_protocols){
                 constexpr unsigned masks[]{0x80,0x200,0x800,0x2000};
                 constexpr long versions[]{CURL_SSLVERSION_TLSv1_0,CURL_SSLVERSION_TLSv1_1,CURL_SSLVERSION_TLSv1_2,CURL_SSLVERSION_TLSv1_3};
@@ -172,6 +232,7 @@ std::shared_ptr<NativeHttp> start_native_http(HttpInput input){
                 const auto code=curl_easy_perform(curl);if(!state->result.error)state->result.error=curl_error(code);
                 long status=0;curl_easy_getinfo(curl,CURLINFO_RESPONSE_CODE,&status);state->result.status=static_cast<std::uint32_t>(status);
                 char* effective=nullptr;curl_easy_getinfo(curl,CURLINFO_EFFECTIVE_URL,&effective);if(effective)state->result.effective_url=effective;
+                if(std::getenv("X64ARM_TRACE_HTTP"))std::fprintf(stderr,"[http] pid=%d host=%s status=%ld error=%u response_bytes=%zu certificate_exceptions=%x\n",getpid(),parsed.host.c_str(),status,state->result.error,state->result.body.size(),input.certificate_exceptions);
                 if(state->result.error || !input.follow_redirects || !input.redirect_policy || (input.disabled_features&2U))break;char* next=nullptr;curl_easy_getinfo(curl,CURLINFO_REDIRECT_URL,&next);if(!next)break;
                 if(redirects>=input.max_redirects)throw HttpError{12156};previous_scheme=parsed.scheme;url=next;
                 if(((status==301 || status==302) && method=="POST") || (status==303 && method!="HEAD")){method="GET";send_body=false;}

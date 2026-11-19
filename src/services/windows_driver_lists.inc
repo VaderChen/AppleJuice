@@ -61,3 +61,49 @@
                 if(fits){if(wide){const auto raw=utf16_bytes(ids);std::copy(raw.begin(),raw.end(),bytes.begin()+hardware_at);}else std::copy(encoded.begin(),encoded.end(),bytes.begin()+hardware_at);}
                 (void)unit_size;memory.write(GuestAddress{arg(3)},bytes);if(!fits)return failed(122);return finish(1);
             }
+            // 選取的裝置與驅動：SetupDiSet／GetSelectedDevice、SetupDiSet／GetSelectedDriverA／W、SetupDiSelectBestCompatDrv。
+            // 選取的驅動以列舉時的 token 指回驅動清單；清單銷毀或元素移除後選取一併失效。
+            if(name=="SetupDiSetSelectedDevice" || name=="SetupDiGetSelectedDevice"){
+                if(name=="SetupDiSetSelectedDevice"){const auto node=read_node(arg(1));if(!node)return failed(87);info.selected_device=*node;return finish(1);}
+                if(!info.selected_device || std::find(info.nodes.begin(),info.nodes.end(),*info.selected_device)==info.nodes.end())return failed(0xe0000211U); // ERROR_NO_DEVICE_SELECTED
+                if(!write_node(arg(1),*info.selected_device))return failed(87);return finish(1);
+            }
+            if(name.starts_with("SetupDiSetSelectedDriver") || name.starts_with("SetupDiGetSelectedDriver") || name=="SetupDiSelectBestCompatDrv"){
+                std::uint32_t device=0;if(arg(1)){const auto node=read_node(arg(1));if(!node)return failed(87);device=*node;}
+                const auto unit=x86_?4U:8U,start=8+unit,string_size=wide?512U:256U,v1=start+string_size*3,v2=v1+16;
+                if(name=="SetupDiSelectBestCompatDrv"){
+                    // 相容清單中依硬體識別碼的符合順位（越前面越好）、再依日期與版本選出最佳驅動。
+                    if(!device)return failed(87);const auto list=info.driver_lists.find(std::pair{device,2U});
+                    if(list==info.driver_lists.end() || list->second.empty())return failed(0xe0000228U); // ERROR_NO_COMPAT_DRIVERS
+                    std::vector<std::u16string> hardware;
+                    for(const auto property:{2U,3U})if(const auto entry=nodes.at(device).properties.find(property);entry!=nodes.at(device).properties.end()){
+                        std::u16string id;const auto& bytes=entry->second.second.bytes;
+                        for(std::size_t i=0;i+1<bytes.size();i+=2){const auto c=static_cast<char16_t>(bytes[i]|(std::uint16_t{bytes[i+1]}<<8));if(c)id+=c;else if(!id.empty()){hardware.push_back(driver_store::fold(std::move(id)));id.clear();}}
+                    }
+                    const auto rank=[&](const driver_store::Model& model){std::size_t best=SIZE_MAX;for(const auto& id:model.ids){const auto at=std::find(hardware.begin(),hardware.end(),id);if(at!=hardware.end())best=std::min<std::size_t>(best,static_cast<std::size_t>(at-hardware.begin()));}return best;};
+                    const auto best=std::min_element(list->second.begin(),list->second.end(),[&](const auto& a,const auto& b){
+                        const auto ra=rank(a),rb=rank(b);if(ra!=rb)return ra<rb;if(a.date!=b.date)return a.date>b.date;return a.version>b.version;});
+                    info.selected_drivers[device]={2U,best->token};return finish(1);
+                }
+                if(name.starts_with("SetupDiSetSelectedDriver")){
+                    if(!arg(2)){info.selected_drivers.erase(device);return finish(1);}
+                    const auto size=memory.load(GuestAddress{arg(2)},32);if(size!=v1 && size!=v2)return failed(1784);
+                    const auto type=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(2)+4},32));const auto token=memory.load(GuestAddress{arg(2)+8},static_cast<std::uint8_t>(unit*8));
+                    const auto list=info.driver_lists.find(std::pair{device,type});
+                    if(list==info.driver_lists.end() || std::none_of(list->second.begin(),list->second.end(),[&](const auto& model){return model.token==token;}))return failed(87);
+                    info.selected_drivers[device]={type,token};return finish(1);
+                }
+                const auto selected=info.selected_drivers.find(device);if(selected==info.selected_drivers.end())return failed(0xe0000203U); // ERROR_NO_DRIVER_SELECTED
+                const auto list=info.driver_lists.find(std::pair{device,selected->second.first});
+                if(list==info.driver_lists.end()){info.selected_drivers.erase(selected);return failed(0xe0000203U);}
+                const auto model=std::find_if(list->second.begin(),list->second.end(),[&](const auto& item){return item.token==selected->second.second;});
+                if(model==list->second.end()){info.selected_drivers.erase(selected);return failed(0xe0000203U);}
+                if(!arg(2))return failed(1784);const auto size=memory.load(GuestAddress{arg(2)},32);if(size!=v1 && size!=v2)return failed(1784);
+                memory.check(GuestAddress{arg(2)},size,Access::Write);std::vector<std::uint8_t> bytes(size);
+                const auto put=[&](unsigned at,std::uint64_t value,unsigned length){for(unsigned i=0;i<length;++i)bytes[at+i]=static_cast<std::uint8_t>(value>>(8*i));};
+                put(0,size,4);put(4,selected->second.first,4);put(8,model->token,unit);
+                const std::array texts{model->description,model->manufacturer,model->provider};
+                for(unsigned i=0;i<3;++i){std::vector<std::uint8_t> text;if(wide)text=utf16_bytes(texts[i].substr(0,255));else {const auto value=utf16_to_utf8(texts[i]);text.assign(value.begin(),value.begin()+static_cast<std::ptrdiff_t>(std::min<std::size_t>(255,value.size())));text.push_back(0);}
+                    std::copy(text.begin(),text.end(),bytes.begin()+start+string_size*i);}
+                if(size==v2){put(v1,model->date,8);put(v1+8,model->version,8);}memory.write(GuestAddress{arg(2)},bytes);return finish(1);
+            }

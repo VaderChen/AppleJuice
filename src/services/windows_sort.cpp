@@ -2,6 +2,7 @@
 #include "x64arm/windows_address_layout.hpp"
 #include "x64arm/windows_unwind.hpp"
 #include "guest_crt_algorithms_code.hpp"
+#include "crt_format_contract.h"
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
@@ -49,8 +50,11 @@ void WindowsServices::initialize_guest_crt_algorithms(GuestMemory& memory, Guest
             if(found==table.end())throw std::logic_error("客體 CRT 慢路徑缺少原宿主服務");
             value=runtime_stubs.value+static_cast<std::size_t>(found-table.begin())*16;
         }else if(binding.kind==detail::GuestCrtBindingKind::Call){
-            value=resolve_service("msvcrt.dll",binding.symbol,true).value;
+            const auto kernel=binding.symbol.starts_with("kernel32_");
+            value=resolve_service(kernel?"kernel32.dll":"msvcrt.dll",kernel?binding.symbol.substr(9):binding.symbol,true).value;
         }
+        if(binding.kind==detail::GuestCrtBindingKind::Printf)
+            value=runtime_base_.value+X64ARM_CRT_PRINTF_COUNT_OFFSET;
         bool patched=false;
         for(std::size_t n=0;n<detail::guest_crt_sections.size();++n){
             const auto& section=detail::guest_crt_sections[n];

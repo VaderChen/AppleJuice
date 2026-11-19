@@ -242,25 +242,29 @@ CertificatePacket message_parameter(bool x86,PKCS7* message,std::uint32_t kind,s
     packet.blob(11*unit,std::span(ASN1_STRING_get0_data(signer->enc_digest),static_cast<std::size_t>(ASN1_STRING_length(signer->enc_digest))));
     message_attributes(packet,13*unit,signer->auth_attr);message_attributes(packet,15*unit,signer->unauth_attr);return packet;
 }
-std::vector<std::uint8_t> embedded_message(std::span<const std::uint8_t> bytes){
-    const auto number=[&](std::size_t at,unsigned width){if(at>bytes.size() || width>bytes.size()-at)throw CertificateError{0x80092009};std::uint32_t value=0;for(unsigned i=0;i<width;++i)value|=std::uint32_t{bytes[at+i]}<<(8*i);return value;};
+template<class Read>
+std::vector<std::uint8_t> embedded_message(std::uint64_t size,const Read& read){
+    const auto number=[&](std::uint64_t at,unsigned width){if(at>size || width>size-at)throw CertificateError{0x80092009};const auto bytes=read(at,width);std::uint32_t value=0;for(unsigned i=0;i<width;++i)value|=std::uint32_t{bytes[i]}<<(8*i);return value;};
     if(number(0,2)!=0x5a4d)throw CertificateError{0x80092009};const auto pe=static_cast<std::size_t>(number(60,4));if(number(pe,4)!=0x4550)throw CertificateError{0x80092009};
     const auto optional=pe+24;const auto magic=number(optional,2);const unsigned directories=magic==0x10b?96U:magic==0x20b?112U:0U;
     if(!directories || number(pe+20,2)<directories+40 || number(optional+directories-4,4)<5)throw CertificateError{0x80092009};
-    const auto begin=static_cast<std::size_t>(number(optional+directories+32,4)),size=static_cast<std::size_t>(number(optional+directories+36,4));
-    if(!size || (begin&7) || begin>bytes.size() || size>bytes.size()-begin)throw CertificateError{0x80092009};
-    for(auto at=begin;at<begin+size;){const auto length=static_cast<std::size_t>(number(at,4));if(length<8 || length>begin+size-at)throw CertificateError{0x80092009};
+    const std::uint64_t begin=number(optional+directories+32,4),extent=number(optional+directories+36,4);
+    if(!extent || (begin&7) || begin>size || extent>size-begin)throw CertificateError{0x80092009};
+    for(auto at=begin;at<begin+extent;){const std::uint64_t length=number(at,4);if(length<8 || length>begin+extent-at)throw CertificateError{0x80092009};
         if(number(at+4,2)==0x200 && number(at+6,2)==2){
+            if(length-8>WindowsServices::output_limit+7U)throw CertificateError{8};
+            const auto payload_bytes=read(at+8,static_cast<std::size_t>(length-8));
             // WIN_CERTIFICATE 的 dwLength 可以包含八位元組對齊；CryptMsg 的 DER 本體不能含這些填補。
-            const auto* payload=bytes.data()+at+8;const auto* cursor=payload;long content_size{};int tag{},klass{};
+            const auto* payload=payload_bytes.data();const auto* cursor=payload;long content_size{};int tag{},klass{};
             const auto flags=ASN1_get_object(&cursor,&content_size,&tag,&klass,static_cast<long>(length-8));
             if((flags&0x81) || tag!=V_ASN1_SEQUENCE || klass!=V_ASN1_UNIVERSAL || content_size<0 ||
                cursor<payload || cursor>payload+length-8 || static_cast<std::size_t>(content_size)>static_cast<std::size_t>(payload+length-8-cursor))throw CertificateError{0x80092009};
             const auto* end=cursor+content_size;const auto padding=static_cast<std::size_t>(payload+length-8-end);
             if(padding>7 || !std::all_of(end,payload+length-8,[](auto value){return value==0;}))throw CertificateError{0x80092009};
+            if(static_cast<std::size_t>(end-payload)>WindowsServices::output_limit)throw CertificateError{8};
             return {payload,end};
         }
-        at+=(length+7)&~std::size_t{7};
+        const auto rounded=(length+7)&~UINT64_C(7);if(rounded>begin+extent-at)throw CertificateError{0x80092009};at+=rounded;
     }
     throw CertificateError{0x80092009};
 }
@@ -392,7 +396,7 @@ std::span<const WindowsServiceDescriptor> certificate_service_descriptors(){
         {"crypt32.dll","CertVerifySubjectCertificateContext",3},{"crypt32.dll","CertGetStoreProperty",4},{"crypt32.dll","CertSetStoreProperty",4},
         {"crypt32.dll","I_CryptFreeTls",2},{"crypt32.dll","I_CryptDetachTls",1},{"crypt32.dll","I_CryptReadTrustedPublisherDWORDValueFromRegistry",2},{"crypt32.dll","I_CryptGetDefaultCryptProv",1},
         {"crypt32.dll","CryptGetDefaultOIDFunctionAddress",6},{"crypt32.dll","CryptRegisterOIDInfo",2},{"crypt32.dll","CryptUnregisterOIDInfo",1},{"crypt32.dll","CryptHashMessage",9},{"crypt32.dll","CryptVerifyMessageHash",7},{"crypt32.dll","CryptVerifyDetachedMessageHash",8},{"crypt32.dll","CryptMemAlloc",1},{"crypt32.dll","CryptMemRealloc",2},{"crypt32.dll","CryptMemFree",1},
-        {"crypt32.dll","PFXIsPFXBlob",1},{"crypt32.dll","PFXVerifyPassword",3},{"crypt32.dll","PFXImportCertStore",3},
+        {"crypt32.dll","PFXIsPFXBlob",1},{"crypt32.dll","PFXVerifyPassword",3},{"crypt32.dll","PFXImportCertStore",3},{"crypt32.dll","PFXExportCertStore",4,0,0,0x8},{"crypt32.dll","PFXExportCertStoreEx",5,0,0,0x10},{"crypt32.dll","CertCreateContext",6,0,0,0x1b},
         {"crypt32.dll","CryptInstallOIDFunctionAddress",6},{"crypt32.dll","CryptInitOIDFunctionSet",2},
         {"crypt32.dll","CryptGetOIDFunctionAddress",6},{"crypt32.dll","CryptFreeOIDFunctionAddress",2},
         {"crypt32.dll","CryptQueryObject",11},{"crypt32.dll","CryptMsgOpenToDecode",6},{"crypt32.dll","CryptMsgUpdate",4},
@@ -505,6 +509,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
         auto info=certificate_tlv(48,algorithm);const auto key_bits=certificate_tlv(3,key);info.insert(info.end(),key_bits.begin(),key_bits.end());const auto der=certificate_tlv(48,info);const auto* cursor=der.data();
         std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> output(d2i_PUBKEY(nullptr,&cursor,static_cast<long>(der.size())),EVP_PKEY_free);if(!output || cursor!=der.data()+der.size())throw CertificateError{0x8009310b};return output;
     };
+    #include "certificate_create_context.inc"
     try {
         #include "crypt_oid_info.inc"
         #include "certificate_compare.inc"
@@ -516,6 +521,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
         #include "certificate_sign.inc"
         #include "certificate_link.inc"
         #include "certificate_pfx_import.inc"
+        #include "certificate_pfx_export.inc"
         if(symbol=="CryptInstallOIDFunctionAddress" || symbol=="CryptInitOIDFunctionSet"){
             const bool install=symbol=="CryptInstallOIDFunctionAddress";
             const auto pointer=arg(install?2:0);const auto count=install?u32(3):0U,flags=u32(install?5:1);
@@ -596,15 +602,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_certificate(GuestState& sta
             for(unsigned i=5;i<=10;++i)if(arg(i))memory.check(GuestAddress{arg(i)},i<8?4:unit,Access::Write);
             for(unsigned i=8;i<=10;++i)if(arg(i))memory.store(GuestAddress{arg(i)},bits,0);
             if(!(u32(3)&2))throw CertificateError{50};
-            std::vector<std::uint8_t> input;
-            if(u32(0)==2)input=blob(arg(1));else {const auto file=filesystem_.open(utf16_to_utf8(read_utf16(memory,GuestAddress{arg(1)})));if(file.error)throw CertificateError{file.error};input=*file.bytes;}
-            if(input.empty() || input.size()>output_limit)throw CertificateError{input.empty()?0x80092009U:8U};
+            // PE 容器可遠大於簽章；透過共用檔案／客體記憶體介面按範圍讀取，
+            // 只對實際的憑證／PKCS#7 資料套用配置上限，不複製整個映像。
+            std::uint64_t input_size{};
+            std::function<std::vector<std::uint8_t>(std::uint64_t,std::size_t)> read;
+            if(u32(0)==2){
+                input_size=memory.load(GuestAddress{arg(1)},32);const auto base=memory.load(GuestAddress{arg(1)+unit},bits);
+                if(input_size && (!base || base>UINT64_MAX-input_size))throw CertificateError{87};
+                read=[&,base](std::uint64_t offset,std::size_t count){if(offset>input_size || count>input_size-offset)throw CertificateError{0x80092009};std::vector<std::uint8_t> bytes(count);if(count)memory.read(GuestAddress{base+offset},bytes);return bytes;};
+            }else{
+                const auto file=filesystem_.open_reader(utf16_to_utf8(read_utf16(memory,GuestAddress{arg(1)})));
+                if(file.error)throw CertificateError{file.error};input_size=file.metadata.size;
+                read=[&,reader=file.file](std::uint64_t offset,std::size_t count){if(offset>input_size || count>input_size-offset)throw CertificateError{0x80092009};std::vector<std::uint8_t> bytes(count);if(count){const auto io=reader->read(bytes,offset);if(io.error || io.bytes!=count)throw CertificateError{io.error?io.error:38U};}return bytes;};
+            }
+            if(!input_size)throw CertificateError{0x80092009};
+            const auto prefix=read(0,static_cast<std::size_t>(std::min<std::uint64_t>(input_size,2)));
+            const bool embedded=prefix.size()==2 && prefix[0]=='M' && prefix[1]=='Z';
+            if(embedded && !(u32(2)&0x400))throw CertificateError{0x80092009};
+            if(!embedded && input_size>output_limit)throw CertificateError{8};
+            std::vector<std::uint8_t> input=embedded?embedded_message(input_size,read):read(0,static_cast<std::size_t>(input_size));
             std::uint32_t content=0,encoding=1;SignedMessage parsed(nullptr,PKCS7_free);std::vector<std::vector<std::uint8_t>> certificates,crls;
             if(u32(2)&2){try{auto cert=decode_certificate(input);(void)cert;content=1;certificates.push_back(input);}catch(const CertificateError&){ERR_clear_error();}}
             if(!content && (u32(2)&8)){try{auto crl=decode_crl(input);(void)crl;content=3;crls.push_back(input);}catch(const CertificateError&){ERR_clear_error();}}
             if(!content && (u32(2)&0x700)){
-                auto bytes=input;const bool embedded=bytes.size()>2 && bytes[0]=='M' && bytes[1]=='Z';
-                try{if(embedded){if(!(u32(2)&0x400))throw CertificateError{0x80092009};bytes=embedded_message(bytes);}parsed=decode_message(bytes);
+                auto bytes=std::move(input);
+                try{parsed=decode_message(bytes);
                     content=embedded?10U:PKCS7_type_is_signed(parsed.get())?8U:9U;if(!(u32(2)&(1U<<content)))throw CertificateError{0x80092009};
                     if(embedded && !PKCS7_type_is_signed(parsed.get()))throw CertificateError{0x80092009};input=std::move(bytes);encoding=0x10001;
                     if(PKCS7_type_is_signed(parsed.get())){

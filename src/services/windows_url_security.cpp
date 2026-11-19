@@ -1,9 +1,14 @@
+#include "urlmon_uri_parse.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/registry_store.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
 
 namespace x64arm {
+// IUri／IUriBuilder：客體物件只有 vtable 指標，元件在宿主（urlmon_uri_parse.hpp）。
+struct UriObject {std::uint32_t references{1};uri_model::Uri uri;};
+struct UriBuilderObject {std::uint32_t references{1};uri_model::Uri uri;std::uint64_t base{};bool modified{};std::map<std::uint32_t,std::uint64_t> strings;};
+struct UriState {std::map<std::uint64_t,UriObject> objects;std::map<std::uint64_t,UriBuilderObject> builders;std::uint64_t table{},builder_table{};};
 // urlmon 的 IInternetSecurityManager：URL 對應 Internet Explorer 安全區域。
 // 本機檔案為「本機電腦」，UNC、不含點的主機名稱與 localhost 為「近端內部網路」，其餘網址為「網際網路」；
 // HKCU／HKLM 的 Internet Settings\ZoneMap\Domains 指定優先。
@@ -37,7 +42,20 @@ std::span<const WindowsServiceDescriptor> url_security_service_descriptors(){
         {"internal-url-security","QueryInterface",3},{"internal-url-security","AddRef",1},{"internal-url-security","Release",1},
         {"internal-url-security","SetSecuritySite",2},{"internal-url-security","GetSecuritySite",2},{"internal-url-security","MapUrlToZone",4},
         {"internal-url-security","GetSecurityId",5},{"internal-url-security","ProcessUrlAction",9},{"internal-url-security","QueryCustomPolicy",8},
-        {"internal-url-security","SetZoneMapping",4},{"internal-url-security","GetZoneMappings",4}
+        {"internal-url-security","SetZoneMapping",4},{"internal-url-security","GetZoneMappings",4},
+        // IUri（28 個方法，依 vtable 順序）與 IUriBuilder（26 個方法）；入口：CreateUri、CreateUriWithFragment、CreateIUriBuilder、CoInternetParseIUri、CoInternetCombineIUri、CoInternetCombineUrlEx。
+        {"urlmon.dll","CreateUri",4},{"urlmon.dll","CreateUriWithFragment",5},{"urlmon.dll","CreateIUriBuilder",4},{"urlmon.dll","CoInternetParseIUri",7},
+        {"urlmon.dll","CoInternetCombineIUri",5},{"urlmon.dll","CoInternetCombineUrlEx",5},
+        {"internal-uri","QueryInterface",3},{"internal-uri","AddRef",1},{"internal-uri","Release",1},{"internal-uri","GetPropertyBSTR",4},{"internal-uri","GetPropertyLength",4},{"internal-uri","GetPropertyDWORD",4},
+        {"internal-uri","HasProperty",3},{"internal-uri","GetAbsoluteUri",2},{"internal-uri","GetAuthority",2},{"internal-uri","GetDisplayUri",2},{"internal-uri","GetDomain",2},{"internal-uri","GetExtension",2},
+        {"internal-uri","GetFragment",2},{"internal-uri","GetHost",2},{"internal-uri","GetPassword",2},{"internal-uri","GetPath",2},{"internal-uri","GetPathAndQuery",2},{"internal-uri","GetQuery",2},
+        {"internal-uri","GetRawUri",2},{"internal-uri","GetSchemeName",2},{"internal-uri","GetUserInfo",2},{"internal-uri","GetUserName",2},{"internal-uri","GetHostType",2},{"internal-uri","GetPort",2},
+        {"internal-uri","GetScheme",2},{"internal-uri","GetZone",2},{"internal-uri","GetProperties",2},{"internal-uri","IsEqual",3},
+        {"internal-uri-builder","QueryInterface",3},{"internal-uri-builder","AddRef",1},{"internal-uri-builder","Release",1},{"internal-uri-builder","CreateUriSimple",4},{"internal-uri-builder","CreateUri",5},{"internal-uri-builder","CreateUriWithFlags",6},
+        {"internal-uri-builder","GetIUri",2},{"internal-uri-builder","SetIUri",2},{"internal-uri-builder","GetFragment",3},{"internal-uri-builder","GetHost",3},{"internal-uri-builder","GetPassword",3},{"internal-uri-builder","GetPath",3},
+        {"internal-uri-builder","GetPort",3},{"internal-uri-builder","GetQuery",3},{"internal-uri-builder","GetSchemeName",3},{"internal-uri-builder","GetUserName",3},{"internal-uri-builder","SetFragment",2},{"internal-uri-builder","SetHost",2},
+        {"internal-uri-builder","SetPassword",2},{"internal-uri-builder","SetPath",2},{"internal-uri-builder","SetPort",3},{"internal-uri-builder","SetQuery",2},{"internal-uri-builder","SetSchemeName",2},{"internal-uri-builder","SetUserName",2},
+        {"internal-uri-builder","RemoveProperties",2},{"internal-uri-builder","HasBeenModified",2}
     };return table;
 }
 std::uint32_t WindowsServices::url_zone(std::u16string_view url){
@@ -80,6 +98,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_url_security(GuestState& st
     const auto finish=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     try{
 #include "windows_urlmon_tools.inc"
+#include "windows_urlmon_uri.inc"
         if(name=="CoInternetCreateSecurityManager"){
             if(!arg(1))return finish(pointer_error);memory.check(GuestAddress{arg(1)},unit,Access::Write);memory.store(GuestAddress{arg(1)},bits,0);
             if(arg(2))return finish(invalid);

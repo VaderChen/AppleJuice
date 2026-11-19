@@ -20,6 +20,10 @@ struct HttpInput {
     std::string url,method,proxy,bypass,username,password,proxy_username,proxy_password;
     // WinHTTP 的伺服器與代理認證各自選擇方案；0 沿用 WinINet／SetOption 的自動協商。
     std::uint32_t auth_scheme{},proxy_auth_scheme{};
+    // 每筆請求保留 SECURITY_FLAG_IGNORE_*，與父 handle／其他請求隔離。
+    std::uint32_t certificate_exceptions{};
+    // 原生呼叫端可提供獨立 CA 套件；空白沿用傳輸層的信任來源。
+    std::string certificate_authorities;
     bool credentials_set{},proxy_credentials_set{};
     bool follow_redirects{true};
     std::uint32_t redirect_policy{1},max_redirects{10},disabled_features{},decompression{},secure_protocols{};

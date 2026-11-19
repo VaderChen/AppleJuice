@@ -982,12 +982,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_mapping(GuestState& state,G
         const auto create_access=create && service.family=="internal-nt-mapping"?dword(6):0xf001fU;
         const auto security=create?synchronization_descriptor(memory,arg(1)):SynchronizationDescriptor{arg(1)!=0,{}};
         auto name = name_at ? (symbol.ends_with('W') || from_app ? read_utf16(memory,GuestAddress{name_at}) : utf8_to_utf16(read_ansi(memory,name_at))) : std::u16string{};
+        // 私有命名空間別名與 BaseNamedObjects 下的子目錄（物件命名空間）轉成既有具名物件名稱。
+        const auto namespace_error=name.empty()?0U:win32_namespace_object_name(name,create);
         if(name.starts_with(u"Local\\"))name.erase(0,6);
         const auto protection = create ? dword(2) : 0;
         const auto attributes=protection&~0xffU,mode=protection&0xffU;
         const bool image=(attributes&0x1000000U)!=0;
         const auto size = create ? (from_app ? arg(3) : (std::uint64_t{dword(3)} << 32) | dword(4)) : 0;
-        if (create && ((attributes && attributes!=0x8000000U && attributes!=0x1000000U && attributes!=0x11000000U) ||
+        if(namespace_error)fail(namespace_error);
+        else if (create && ((attributes && attributes!=0x8000000U && attributes!=0x1000000U && attributes!=0x11000000U) ||
             (mode!=2 && mode!=4 && mode!=8 && mode!=0x20U && mode!=0x40U && mode!=0x80U) ||
             (attributes==0x11000000U && mode!=2))) fail(87);
         else if (auto existing=create && !name.empty()?open_mapping(mappings_->name_space,name,0,0,false,{}):Opened{};existing.mapping){

@@ -72,15 +72,21 @@ private:
     };
     static bool finished(const Item& item) { return item.command.status >= MTLCommandBufferStatusCompleted; }
 
-    [[noreturn]] void hang(Item item, std::size_t pending, std::uint64_t age) {
-        const auto* label = item.command.label ? item.command.label.UTF8String : nullptr;
+    void hang(Item item, std::size_t pending, std::uint64_t age) {
+        if (finished(item)) return;
         std::string detail = item.describe ? item.describe() : std::string{};
+        // 診斷可能等待 CPU 鎖；不能把取診斷前的逾時狀態當成最後決定。
+        // completed／error 都已離開 GPU 在途狀態，錯誤沿既有完成回呼處理。
+        const auto status = item.command.status;
+        if (status >= MTLCommandBufferStatusCompleted) return;
+        const auto* label = item.command.label ? item.command.label.UTF8String : nullptr;
         std::fprintf(stderr,
                      "[gpu-hang] Metal 命令緩衝送出 %.1f 秒仍未完成（狀態 %s、標籤 %s、在途 %zu 個），GPU 卡住；結束程序以釋放 GPU。"
                      "設定 X64ARM_METAL_LABELS=1 可記錄卡住批次的繪圖標籤%s%s\n",
-                     static_cast<double>(age) / 1e9, status_name(item.command.status), label ? label : "-", pending,
+                     static_cast<double>(age) / 1e9, status_name(status), label ? label : "-", pending,
                      detail.empty() ? "" : "：", detail.c_str());
         std::fflush(stderr);
+        if (finished(item)) return;
         // DXGI_ERROR_DEVICE_HUNG（0x887A0006）的低 8 位元，與 Windows 上 GPU 逾時後程序結束的情形對應。
         _exit(6);
     }
@@ -103,6 +109,10 @@ private:
                 auto copy = item;
                 lock.unlock();
                 hang(std::move(copy), pending, age);
+                lock.lock();
+                // 已恢復的批次不結束程序。解鎖期間 add() 可能改變 deque，
+                // 重啟掃描，不繼續使用原迭代器；其他未完成批次仍受監看。
+                break;
             }
         }
     }

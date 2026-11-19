@@ -4,11 +4,12 @@
 namespace {
 constexpr std::string_view ntdll_loader_symbols[]{
     "TpAllocWork","TpAllocTimer","TpAllocWait","TpAllocPool","TpSetPoolMinThreads","TpSimpleTryPost","TpCallbackMayRunLong",
+    "TpAllocIoCompletion","RtlSetIoCompletionCallback","LdrFindResourceDirectory_U",
     "TpAllocCleanupGroup","TpQueryPoolStackInformation","TpSetPoolStackInformation",
     "LdrGetDllHandleEx","LdrAddRefDll","LdrDisableThreadCalloutsForDll","LdrFindEntryForAddress","LdrGetDllFullName",
     "LdrGetDllDirectory","LdrSetDllDirectory","LdrAddDllDirectory","LdrRemoveDllDirectory","LdrSetDefaultDllDirectories",
     "LdrFindResource_U","LdrAccessResource","LdrProcessRelocationBlock","LdrEnumerateLoadedModules","LdrQueryImageFileExecutionOptions",
-    "DbgBreakPoint","DbgUserBreakPoint",
+    "DbgBreakPoint","DbgUserBreakPoint","DbgUiRemoteBreakin",
     "RtlLcidToLocaleName","RtlLocaleNameToLcid","RtlIsValidLocaleName","RtlGetUserPreferredUILanguages","RtlGetSystemPreferredUILanguages",
     "RtlGetThreadPreferredUILanguages","RtlIdnToAscii","RtlIdnToUnicode","RtlNormalizeString","RtlIsNormalizedString",
     "RtlGetProcessPreferredUILanguages","RtlSetProcessPreferredUILanguages","RtlSetThreadPreferredUILanguages","RtlIdnToNameprepUnicode",
@@ -48,6 +49,16 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_loader(GuestState& st
             if(!object)return finish(last_error_?nt_status(last_error_):no_memory);
             memory.store(GuestAddress{call(0)},bits,object);return finish(0);
         }
+        if(name=="TpAllocIoCompletion"){
+            // (TP_IO** IoReturn, File, Callback, Context, CallbackEnviron)：與 CreateThreadpoolIo 同一份 TP_IO 與完成埠，
+            // 回呼為原生 PTP_IO_CALLBACK(Instance, Context, ApcContext, IO_STATUS_BLOCK*, Io)；TpStart／Cancel／Release／WaitFor 共用 Win32 入口。
+            if(!call(0))return finish(access_violation);
+            const auto object=pointer_value(host("internal-threadpool","CreateThreadpoolIoNative",{call(1),call(2),call(3),call(4)}));
+            if(!object)return finish(last_error_?nt_status(last_error_):no_memory);
+            memory.store(GuestAddress{call(0)},bits,object);return finish(0);
+        }
+        // (FileHandle, Function, Flags)：BindIoCompletionCallback 的原生版本，回呼收到的是 Win32 錯誤碼。
+        if(name=="RtlSetIoCompletionCallback")return finish(status_of(kernel("BindIoCompletionCallback",{call(0),call(1),word(2)})));
         if(name=="TpAllocPool"){
             if(!call(0))return finish(access_violation);
             const auto pool=pointer_value(kernel("CreateThreadpool",{call(1)}));if(!pool)return finish(last_error_?nt_status(last_error_):no_memory);
@@ -127,6 +138,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_loader(GuestState& st
             }
             memory.store(GuestAddress{call(3)},bits,entry);return finish(0);
         }
+        if(name=="LdrFindResourceDirectory_U"){
+            // (DllHandle, LDR_RESOURCE_INFO* {Type, Name, Language}, Level, IMAGE_RESOURCE_DIRECTORY**)：依序比對 Level 層，
+            // 回傳該層的子目錄（Level 0 為根目錄、1 為類型目錄、2 為名稱下的語系目錄）。與 LdrFindResource_U／FindResource 共用名稱比對。
+            const auto level=word(2);if(level>3)return finish(invalid_parameter);
+            if(!call(3) || (level && !call(1)))return finish(access_violation);
+            const auto* image=resource_image(call(0)?call(0):runtime_.image.base);if(!image)return finish(0xc0000089U);
+            std::array<std::uint64_t,3> keys{};for(unsigned i=0;i<level;++i)keys[i]=memory.load(GuestAddress{call(1)+i*unit},bits);
+            const auto found=find_resource_entry(memory,image->base,image->size,std::span<const std::uint64_t>(keys).first(level),true);
+            if(!found.present)return finish(0xc0000089U); // STATUS_RESOURCE_DATA_NOT_FOUND
+            if(found.depth<level){
+                constexpr std::array<std::uint32_t,3> missing{0xc000008aU,0xc000008bU,0xc0000204U}; // TYPE／NAME／LANG_NOT_FOUND
+                return finish(missing[found.depth]);
+            }
+            if(!found.directory)return finish(0xc0000089U); // 語系層是資料項目，不是目錄。
+            memory.store(GuestAddress{call(3)},bits,found.address);return finish(0);
+        }
         if(name=="LdrAccessResource"){
             // (DllHandle, IMAGE_RESOURCE_DATA_ENTRY*, Resource**, Size*)：與 LoadResource／SizeofResource 相同，OffsetToData 為映像 RVA。
             const auto* image=resource_image(call(0)?call(0):runtime_.image.base);if(!image || !call(1))return finish(0xc0000089U);
@@ -184,6 +211,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_ntdll_loader(GuestState& st
                     }
                     (void)free_heap(m,stop,s);inner.return_to(s,0);co_return std::optional<std::uint32_t>{};
                 });
+        }
+        if(name=="DbgUiRemoteBreakin"){
+            // 與 NT 的遠端中斷執行緒相同：讀取 PEB，必要時通知 debugger／VEH，
+            // 由 API 自身的例外邊界接住未處理中斷，最後沿共用流程正常結束執行緒。
+            // 不返回到 caller，也不終止其他執行緒；TLS／DLL detach 由 exit_thread 承接。
+            last_error_=saved_error;
+            if(!memory.load(GuestAddress{peb_base_.value+2},8))return exit_thread(state,memory,0);
+            const auto breakpoint=resolve("ntdll.dll","DbgBreakPoint");
+            state.rip=breakpoint;
+            if(emit_debug_event(state,memory,debugger::Exception{0x80000003U,0,0,breakpoint.value,{},true})==debugger::handled){
+                if(state.rip!=breakpoint && state.rip.value!=breakpoint.value+1)return std::nullopt;
+                return exit_thread(state,memory,0);
+            }
+            begin_exception(state,memory,0x80000003U,0,{});
+            auto& dispatch=exceptions_.stack.back();dispatch.api_exception_boundary=true;
+            dispatch.api_exception_resume=GuestAddress{callback_return_.value+0x80};
+            return std::nullopt;
         }
         if(name=="DbgBreakPoint" || name=="DbgUserBreakPoint"){
             // 在呼叫者的返回位址引發 EXCEPTION_BREAKPOINT；處理常式以 EXCEPTION_CONTINUE_EXECUTION 繼續時從呼叫之後執行。

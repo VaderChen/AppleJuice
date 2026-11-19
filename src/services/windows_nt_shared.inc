@@ -27,15 +27,16 @@ std::uint32_t nt_timeout_milliseconds(const GuestMemory& memory,std::uint64_t po
 // OBJECT_ATTRIBUTES → Win32 建立／開啟函式的引數：SECURITY_ATTRIBUTES 與 Win32 名稱放在暫存區。
 // 失敗時回 NTSTATUS；成功時 security 為 SECURITY_ATTRIBUTES 位址、name 為名稱位址（無名稱時 0）、flags 為 OBJ_* 屬性。
 struct Win32ObjectRequest {std::uint64_t security{},name{};std::uint32_t flags{};bool inherit() const {return (flags&2U)!=0;}};
-std::uint32_t win32_object_request(GuestMemory& memory,WindowsServices::GuestScratch& scratch,const RuntimeState& runtime,std::uint64_t address,bool x86,bool creating,Win32ObjectRequest& request,bool exclusive=false){
+// resolve 把已套用根目錄的 NT 名稱轉成 Win32 名稱（物件命名空間：跟隨符號連結、動態目錄與私有命名空間）。
+using NamespaceResolver=std::function<std::uint32_t(std::u16string&,bool)>;
+std::uint32_t win32_object_request(GuestMemory& memory,WindowsServices::GuestScratch& scratch,const RuntimeState& runtime,std::uint64_t address,bool x86,bool creating,Win32ObjectRequest& request,const NamespaceResolver& resolve,bool exclusive=false){
     const auto attributes=object_attributes(memory,address,x86,creating,false,exclusive);
     if((attributes.flags&0x22U)==0x22U)return 0xc000000dU;
     const auto rooted=rooted_object_name(runtime,attributes,creating);
     std::u16string object;
     if(!rooted.empty()){
-        auto mapped=win32_object_name(rooted);
-        if(!mapped)return rooted.front()==u'\\'?0xc000003aU:0xc000003bU;
-        object=std::move(*mapped);if(object.empty())return 0xc0000033U;
+        object=rooted;if(const auto status=resolve(object,creating))return status;
+        if(object.empty())return 0xc0000033U;
     }else if(!creating)return 0xc000003bU;
     const unsigned unit=x86?4U:8U;const auto block=scratch.allocate(64+object.size()*2+2);if(!block)return 0xc0000017U;
     memory.store(GuestAddress{block},32,x86?12U:24U);memory.store(GuestAddress{block+unit},x86?32:64,attributes.security);

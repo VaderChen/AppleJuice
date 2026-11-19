@@ -2676,7 +2676,7 @@ public:
     std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags,const std::function<bool()>& idle,const std::function<bool(std::uint64_t,std::uint32_t,bool)>& popup) override {
         return popup_menu(owner,items,x,y,flags,idle,popup,{});
     }
-    std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags,const std::function<bool()>& idle,const std::function<bool(std::uint64_t,std::uint32_t,bool)>& popup,const std::function<bool(const GuiMenuHighlight&)>& highlight) override {
+    std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags,const std::function<bool()>& idle,const std::function<bool(std::uint64_t,std::uint32_t,bool)>& popup,const std::function<bool(const GuiMenuHighlight&)>& highlight,const GuiPopupPlacement* placement=nullptr) override {
         @autoreleasepool {
             // 根選單開始新的 AppKit 追蹤前，先完成前一次追蹤留下的放開／視窗事件。
             // 輪詢產生的 Windows 訊息留在原佇列；遞迴選單由既有追蹤迴圈持有事件，不能重入輪詢。
@@ -2728,11 +2728,17 @@ public:
             };
             NSMutableArray* description=[NSMutableArray array];NSMenu* menu=build(items,description,0);if(!menu)return std::nullopt;record[@"items"]=description;
             if(popup_history_.count>=128)[popup_history_ removeObjectAtIndex:0];[popup_history_ addObject:record];diagnostics();
-            NSPoint location=NSMakePoint(x,y);std::uint64_t handle=owner;
-            for(unsigned depth=0;handle && depth<64;++depth){const auto window=windows_.find(handle);if(window==windows_.end())break;const auto inset=gui_frame_insets(window->second.model);location.x-=static_cast<double>(window->second.model.x)+inset.left;location.y-=static_cast<double>(window->second.model.y)+inset.top;handle=window->second.model.parent;}
             [menu update];const auto size=menu.size;
-            if(flags&8U)location.x-=size.width;else if(flags&4U)location.x-=size.width/2;
-            if(flags&0x20U)location.y-=size.height;else if(flags&0x10U)location.y-=size.height/2;
+            NSPoint location=NSMakePoint(x,y);
+            if(placement){
+                const auto rect=placement->position(x,y,static_cast<std::int32_t>(std::ceil(size.width)),static_cast<std::int32_t>(std::ceil(size.height)),flags);
+                location=NSMakePoint(rect[0],rect[1]);
+            }else{
+                if(flags&8U)location.x-=size.width;else if(flags&4U)location.x-=size.width/2;
+                if(flags&0x20U)location.y-=size.height;else if(flags&0x10U)location.y-=size.height/2;
+            }
+            std::uint64_t handle=owner;
+            for(unsigned depth=0;handle && depth<64;++depth){const auto window=windows_.find(handle);if(window==windows_.end())break;const auto inset=gui_frame_insets(window->second.model);location.x-=static_cast<double>(window->second.model.x)+inset.left;location.y-=static_cast<double>(window->second.model.y)+inset.top;handle=window->second.model.parent;}
             // popUpMenuPositioningItem 執行 AppKit tracking loop；測試也經 NSMenu 本身送 action，絕不直接注入客體命令。
             NSTimer* idleTimer=nil;auto idleError=std::make_shared<std::exception_ptr>();__block bool idleBusy=false;
             __block std::uint64_t idleCycles=0;
@@ -3354,8 +3360,8 @@ public:
     std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags,const std::function<bool()>& idle,const std::function<bool(std::uint64_t,std::uint32_t,bool)>& popup) override {
         return real("popup_menu").popup_menu(owner,items,x,y,flags,idle,popup);
     }
-    std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags,const std::function<bool()>& idle,const std::function<bool(std::uint64_t,std::uint32_t,bool)>& popup,const std::function<bool(const GuiMenuHighlight&)>& highlight) override {
-        return real("popup_menu").popup_menu(owner,items,x,y,flags,idle,popup,highlight);
+    std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags,const std::function<bool()>& idle,const std::function<bool(std::uint64_t,std::uint32_t,bool)>& popup,const std::function<bool(const GuiMenuHighlight&)>& highlight,const GuiPopupPlacement* placement=nullptr) override {
+        return real("popup_menu").popup_menu(owner,items,x,y,flags,idle,popup,highlight,placement);
     }
     void graphics_text(std::uint64_t handle,const GuiDraw& draw) override {real("graphics_text").graphics_text(handle,draw);}
     std::optional<GuiThemeMetrics> theme_metrics(std::u16string_view name,std::int32_t part,std::int32_t state,std::uint32_t property,std::array<std::int32_t,2> size) override {

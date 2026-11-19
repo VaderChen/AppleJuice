@@ -27,17 +27,22 @@ std::uint64_t WindowsServices::store_gui_icon(GuiIcon icon,std::uint32_t flags){
     if(gui_.icons.size()>=8192)throw std::bad_alloc{};const auto handle=gui_.next_object++;gui_.icons.emplace(handle,std::move(icon));return handle;
 }
 std::uint64_t WindowsServices::shell_system_icons(std::uint32_t size){
-    auto& handle=size==16?gui_.shell_small_image_list:gui_.shell_large_image_list;
+    auto& handle=size==16?gui_.shell_small_image_list:size==32?gui_.shell_large_image_list:gui_.shell_sized_image_lists[size];
     if(gui_.image_lists.contains(handle))return handle;
     GuiImageList images;images.width=static_cast<std::int32_t>(size);images.height=images.width;images.flags=0x21;
     for(const auto id:{0U,3U,8U}){auto icon=native_stock_icon(id,size);if(!icon)return 0;icon->system=0x10001U+static_cast<std::uint32_t>(images.images.size());images.images.push_back(std::move(*icon));}
+    // 其他尺寸的系統影像清單在建立時補上已快取的圖示（沿用 32 像素圖像），使索引與大小清單一致。
+    if(size!=16 && size!=32 && gui_.image_lists.contains(gui_.shell_large_image_list)){const auto& source=gui_.image_lists.at(gui_.shell_large_image_list).images;for(std::size_t i=images.images.size();i<source.size();++i)images.images.push_back(source[i]);}
     handle=gui_.next_object++;gui_.image_lists.emplace(handle,std::move(images));return handle;
 }
+
 std::uint64_t WindowsServices::shell_image_list(std::uint32_t size){
-    auto& handle=size==16?gui_.shell_small_image_list:gui_.shell_large_image_list;
-    if(gui_.image_lists.contains(handle))return handle;if(const auto native=shell_system_icons(size))return native;
+    {const auto& existing=size==16?gui_.shell_small_image_list:size==32?gui_.shell_large_image_list:gui_.shell_sized_image_lists[size];if(gui_.image_lists.contains(existing))return existing;}
+    if(const auto native=shell_system_icons(size))return native;
     GuiImageList images;images.width=static_cast<std::int32_t>(size);images.height=images.width;images.flags=0x21;
-    for(std::uint32_t i=0;i<3;++i)images.images.push_back(GuiIcon{{},size,size,0x10001U+i});handle=gui_.next_object++;gui_.image_lists.emplace(handle,std::move(images));return handle;
+    for(std::uint32_t i=0;i<3;++i)images.images.push_back(GuiIcon{{},size,size,0x10001U+i});if(size!=16 && size!=32 && gui_.image_lists.contains(gui_.shell_large_image_list)){const auto& source=gui_.image_lists.at(gui_.shell_large_image_list).images;for(std::size_t i=images.images.size();i<source.size();++i)images.images.push_back(source[i]);}
+    auto& handle=size==16?gui_.shell_small_image_list:size==32?gui_.shell_large_image_list:gui_.shell_sized_image_lists[size];
+    handle=gui_.next_object++;gui_.image_lists.emplace(handle,std::move(images));return handle;
 }
 namespace {
 std::size_t stock_index(std::int32_t index){
@@ -344,6 +349,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_icons(GuestState& sta
             auto big=load(path,index,32),little=load(path,index,16);if(!big || !little)return done(UINT32_MAX);
             auto& large_images=gui_.image_lists.at(shell_image_list(32)).images;auto& small_images=gui_.image_lists.at(shell_image_list(16)).images;
             const auto slot=static_cast<std::uint32_t>(std::max(large_images.size(),small_images.size()));
+            // 其他尺寸的系統影像清單（SHGetImageList）同步加入同一個索引。
+            for(const auto& [size,handle]:gui_.shell_sized_image_lists){if(!gui_.image_lists.contains(handle))continue;auto& sized=gui_.image_lists.at(handle).images;sized.resize(slot+1);
+                if(auto icon=load(path,index,size))sized[slot]=std::move(*icon);else sized[slot]=*big;}
             large_images.resize(slot+1);small_images.resize(slot+1);large_images[slot]=std::move(*big);small_images[slot]=std::move(*little);
             gui_.shell_cached_icons.emplace(std::move(key),slot);return done(slot);
         }

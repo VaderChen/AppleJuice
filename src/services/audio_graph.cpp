@@ -1,5 +1,6 @@
 #include "x64arm/audio_graph.hpp"
 #include "x64arm/audio_channels.hpp"
+#include "x64arm/audio_frame_effects.hpp"
 #include "x64arm/audio_pcm.hpp"
 #include <algorithm>
 #include <bit>
@@ -51,6 +52,11 @@ std::vector<float> default_matrix(const VoiceGraph::Format& from,const VoiceGrap
     }
     return result;
 }
+// 效果鏈改變聲道數後，輸出矩陣以效果輸出的聲道數與預設方位計算。
+VoiceGraph::Format output_format(const VoiceGraph::State& state){
+    auto format=state.format;if(state.output_channels && state.output_channels!=format.channels){format.channels=state.output_channels;format.channel_mask=default_mask(format.channels);}
+    return format;
+}
 float sample(std::span<const std::uint8_t> data,std::size_t frame,unsigned channel,const VoiceGraph::Format& format){
     const auto p=data.data()+(frame*format.channels+channel)*(format.bits/8);
     if(format.floating)return detail::pcm_sample<32,false>(p);
@@ -97,7 +103,7 @@ struct VoiceGraph::Impl {
         case Operation::Start:case Operation::Stop:case Operation::ExitLoop:require(n.state.kind==Kind::Source);break;
         case Operation::Volume:require(gain(c.value));break;
         case Operation::Frequency:require(n.state.kind==Kind::Source && std::isfinite(c.value) && !(n.state.flags&2U));break;
-        case Operation::ChannelVolumes:require(c.values.size()==n.state.format.channels && std::all_of(c.values.begin(),c.values.end(),gain));break;
+        case Operation::ChannelVolumes:require(c.values.size()==n.state.output_channels && std::all_of(c.values.begin(),c.values.end(),gain));break;
         case Operation::Filter:require(n.state.flags&8U);valid_filter(c.filter);break;
         case Operation::OutputFilter:require(edge(n,c.destination).use_filter);valid_filter(c.filter);break;
         case Operation::Matrix:require(c.values.size()==edge(n,c.destination).matrix.size() && std::all_of(c.values.begin(),c.values.end(),gain));break;
@@ -108,7 +114,7 @@ struct VoiceGraph::Impl {
         auto& n=node(c.voice);
         switch(c.operation){
         case Operation::Start:n.state.playing=true;n.tails=false;break;
-        case Operation::Stop:n.state.playing=false;n.tails=c.tails;if(!c.tails){n.filter.reset();for(auto& slot:n.effects)for(auto& effect:slot.pairs)effect->reset();}break;
+        case Operation::Stop:n.state.playing=false;n.tails=c.tails;if(!c.tails){n.filter.reset();for(auto& slot:n.effects){for(auto& effect:slot.pairs)effect->reset();if(slot.frame)slot.frame->reset();}}break;
         case Operation::ExitLoop:if(n.count)n.packets[n.queue[n.head]]->exit_loop=true;break;
         case Operation::Volume:n.state.volume=c.value;break;
         case Operation::ChannelVolumes:std::copy(c.values.begin(),c.values.end(),n.state.channel_volumes.begin());break;
@@ -149,7 +155,7 @@ VoiceGraph::Voice VoiceGraph::create(Kind kind,Format format,unsigned flags,unsi
     require(std::isfinite(maximum_ratio) && maximum_ratio>=(1.F/1024) && maximum_ratio<=1024);
     require(!(flags&~14U) && (kind==Kind::Source || !(flags&6U)));const auto creation_flags=flags;if(flags&4U)flags|=2U;
     std::lock_guard lock(impl_->mutex);if(kind==Kind::Master)require(!impl_->master && valid_channel_layout(format.channels,format.channel_mask));else require(impl_->master!=0);
-    auto n=std::make_unique<Impl::Node>();n->state.kind=kind;n->state.format=format;n->state.flags=flags;n->state.creation_flags=creation_flags;n->state.stage=stage;n->state.channel_volumes.assign(format.channels,1);n->maximum_ratio=maximum_ratio;n->state.ratio=std::min(1.F,maximum_ratio);
+    auto n=std::make_unique<Impl::Node>();n->state.kind=kind;n->state.format=format;n->state.flags=flags;n->state.creation_flags=creation_flags;n->state.stage=stage;n->state.channel_volumes.assign(format.channels,1);n->state.output_channels=format.channels;n->maximum_ratio=maximum_ratio;n->state.ratio=std::min(1.F,maximum_ratio);
     const auto id=impl_->next++;impl_->nodes.emplace(id,std::move(n));if(kind==Kind::Master)impl_->master=id;impl_->rebuild();return id;
 }
 void VoiceGraph::destroy(Voice voice){
@@ -167,8 +173,8 @@ void VoiceGraph::set_sends(Voice voice,std::span<const Send> sends){
         require(!output_rate || output_rate==d.state.format.rate);output_rate=d.state.format.rate;
         require(!(n.state.flags&4U) || output_rate==n.state.format.rate);
         require(std::none_of(edges.begin(),edges.end(),[&](const auto& e){return e.destination==destination;}));
-        auto matrix=s.matrix.empty()?default_matrix(n.state.format,d.state.format):s.matrix;
-        require(matrix.size()==n.state.format.channels*d.state.format.channels && std::all_of(matrix.begin(),matrix.end(),gain));
+        auto matrix=s.matrix.empty()?default_matrix(output_format(n.state),d.state.format):s.matrix;
+        require(matrix.size()==n.state.output_channels*d.state.format.channels && std::all_of(matrix.begin(),matrix.end(),gain));
         edges.push_back({destination,std::move(matrix),s.use_filter,{}});
     }
     n.sends=std::move(edges);
@@ -225,10 +231,22 @@ void VoiceGraph::set_effects(Voice voice,std::vector<std::shared_ptr<Effect>> ef
     std::vector<EffectSlot> slots;for(auto& effect:effects)slots.push_back({{std::move(effect)},true});set_effect_chain(voice,std::move(slots));
 }
 void VoiceGraph::set_effect_chain(Voice voice,std::vector<EffectSlot> slots){
-    std::lock_guard lock(impl_->mutex);auto& n=impl_->node(voice);const auto pairs=(n.state.format.channels+1)/2;
-    for(const auto& slot:slots)require(slot.pairs.size()==pairs && std::all_of(slot.pairs.begin(),slot.pairs.end(),[](const auto& p){return bool(p);}));
+    std::lock_guard lock(impl_->mutex);auto& n=impl_->node(voice);
+    // 每一格的輸入聲道數是前一格的輸出；主控音源的效果不得改變聲道數。
+    unsigned channels=n.state.format.channels;
+    for(const auto& slot:slots){
+        if(slot.frame){require(slot.pairs.empty() && slot.frame->input_channels()==channels && slot.frame->output_channels() && slot.frame->output_channels()<=maximum_channels);channels=slot.frame->output_channels();}
+        else require(slot.pairs.size()==(channels+1)/2 && std::all_of(slot.pairs.begin(),slot.pairs.end(),[](const auto& p){return bool(p);}));
+    }
+    if(n.state.kind==Kind::Master)require(channels==n.state.format.channels);
     for(auto& [set,list]:impl_->changes)std::erase_if(list,[&](const auto& c){return c.voice==voice && (c.operation==Operation::EnableEffect || c.operation==Operation::DisableEffect);});
     n.effects=std::move(slots);
+    if(channels!=n.state.output_channels){
+        // 輸出聲道數改變：聲道音量與各輸出矩陣回到新聲道數的預設值，舊維度的未提交變更失效。
+        n.state.output_channels=channels;n.state.channel_volumes.assign(channels,1);
+        for(auto& e:n.sends){e.matrix=default_matrix(output_format(n.state),impl_->node(e.destination).state.format);e.filter.reset();}
+        for(auto& [set,list]:impl_->changes)std::erase_if(list,[&](const auto& c){return c.voice==voice && (c.operation==Operation::Matrix || c.operation==Operation::ChannelVolumes);});
+    }
 }
 bool VoiceGraph::effect_enabled(Voice voice,unsigned index)const {std::lock_guard lock(impl_->mutex);const auto& n=impl_->node(voice);require(index<n.effects.size());return n.effects[index].enabled;}
 void VoiceGraph::start(bool active){std::lock_guard lock(impl_->mutex);impl_->started=active;}
@@ -265,11 +283,15 @@ std::size_t VoiceGraph::render_frames(std::span<float> output,unsigned rate,bool
             }
             if(n->state.flags&8U)for(unsigned c=0;c<channels;++c)n->frame[c]=n->filter.process(n->frame[c],c);
             for(unsigned c=0;c<channels;++c)n->frame[c]*=n->state.volume;
-            for(auto& slot:n->effects)if(slot.enabled)for(unsigned pair=0;pair<slot.pairs.size();++pair){
-                const auto left=pair*2,other=left+1<channels?left+1:left;float right=n->frame[other];slot.pairs[pair]->process(n->frame[left],right);if(other!=left)n->frame[other]=right;}
-            for(unsigned c=0;c<channels;++c)n->frame[c]*=n->state.channel_volumes[c];
+            unsigned outputs=channels;
+            for(auto& slot:n->effects){
+                if(slot.frame){slot.frame->process(n->frame.data(),slot.enabled);outputs=slot.frame->output_channels();continue;}
+                if(slot.enabled)for(unsigned pair=0;pair<slot.pairs.size();++pair){
+                    const auto left=pair*2,other=left+1<outputs?left+1:left;float right=n->frame[other];slot.pairs[pair]->process(n->frame[left],right);if(other!=left)n->frame[other]=right;}
+            }
+            for(unsigned c=0;c<outputs;++c)n->frame[c]*=n->state.channel_volumes[c];
             for(auto& e:n->sends){auto& destination=*impl_->nodes.at(e.destination);
-                for(unsigned d=0;d<destination.state.format.channels;++d){float sum=0;for(unsigned c=0;c<channels;++c)sum+=n->frame[c]*e.matrix[d*channels+c];if(e.use_filter)sum=e.filter.process(sum,d);destination.frame[d]+=sum;}
+                for(unsigned d=0;d<destination.state.format.channels;++d){float sum=0;for(unsigned c=0;c<outputs;++c)sum+=n->frame[c]*e.matrix[d*outputs+c];if(e.use_filter)sum=e.filter.process(sum,d);destination.frame[d]+=sum;}
             }
         }
         if(output_channels==master.state.format.channels){for(unsigned c=0;c<output_channels;++c)output[frame+c]=master.frame[c];}

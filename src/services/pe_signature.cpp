@@ -48,6 +48,18 @@ bool eku(X509* certificate,std::string_view expected){
     Ref<EXTENDED_KEY_USAGE,EXTENDED_KEY_USAGE_free> usage(static_cast<EXTENDED_KEY_USAGE*>(X509_get_ext_d2i(certificate,NID_ext_key_usage,nullptr,nullptr)),EXTENDED_KEY_USAGE_free);
     if(!usage)return false;for(int i=0;i<sk_ASN1_OBJECT_num(usage.get());++i)if(oid(sk_ASN1_OBJECT_value(usage.get(),i),expected))return true;return false;
 }
+bool permits_code_signing(X509* certificate){
+    // EKU 缺省表示用途不受限制；空、重複或無法解碼的擴充並不等同缺省。
+    // Store／WHQL 等發行者分類仍使用上方的明確 OID 查詢，不能由 any EKU 推得。
+    int critical=-1;
+    Ref<EXTENDED_KEY_USAGE,EXTENDED_KEY_USAGE_free> usage(static_cast<EXTENDED_KEY_USAGE*>(X509_get_ext_d2i(certificate,NID_ext_key_usage,&critical,nullptr)),EXTENDED_KEY_USAGE_free);
+    if(!usage)return critical==-1;
+    for(int i=0;i<sk_ASN1_OBJECT_num(usage.get());++i){
+        const auto* purpose=sk_ASN1_OBJECT_value(usage.get(),i);
+        if(oid(purpose,"1.3.6.1.5.5.7.3.3") || oid(purpose,"2.5.29.37.0"))return true;
+    }
+    return false;
+}
 bool subject(X509* certificate,int nid,std::string_view expected){
     auto* name=X509_get_subject_name(certificate);int index=-1;
     while((index=X509_NAME_get_index_by_NID(name,nid,index))>=0){auto* entry=X509_NAME_get_entry(name,index);unsigned char* text=nullptr;const auto size=ASN1_STRING_to_UTF8(&text,X509_NAME_ENTRY_get_data(entry));
@@ -192,7 +204,9 @@ void general_verify(PKCS7* message,PKCS7_SIGNER_INFO* signer,X509* certificate,B
     const int error=X509_STORE_CTX_get_error(context.get());auto* chain=X509_STORE_CTX_get0_chain(context.get());
     for(int i=0;chain && i<sk_X509_num(chain);++i){auto* cert=sk_X509_value(chain,i);const auto size=i2d_X509(cert,nullptr);if(size<=0)throw Failure("憑證編碼失敗");TrustCertificate item;item.der.resize(static_cast<std::size_t>(size));auto* cursor=item.der.data();(void)i2d_X509(cert,&cursor);Ref<EVP_PKEY,EVP_PKEY_free> key(X509_get_pubkey(cert),EVP_PKEY_free);item.self_signed=X509_check_issued(cert,cert)==X509_V_OK && key && X509_verify(cert,key.get())==1;item.trusted_root=trusted && i==sk_X509_num(chain)-1;result.certificates.push_back(std::move(item));}
     if(!verify(message,trust.get(),contents,indirect,PKCS7_NOVERIFY))throw Failure("數位簽章不符",0x80096010U);
-    if(!eku(certificate,"1.3.6.1.5.5.7.3.3"))throw Failure("憑證沒有程式碼簽章用途",0x800b0110U);
+    if(!permits_code_signing(certificate))throw Failure("憑證不允許程式碼簽章用途",0x800b0110U);
+    for(int i=1;chain && i<sk_X509_num(chain);++i)
+        if(!permits_code_signing(sk_X509_value(chain,i)))throw Failure("憑證鏈限制程式碼簽章用途",0x800b0110U);
     if(!trusted)throw Failure("憑證鏈驗證失敗",chain_status(error));
     if(policy){
         Ref<EVP_PKEY,EVP_PKEY_free> key(X509_get_pubkey(certificate),EVP_PKEY_free);

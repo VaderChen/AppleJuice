@@ -24,6 +24,11 @@ struct AccessCheckResult {
 };
 AccessCheckResult access_check(const VirtualToken&,const SecurityDescriptor&,std::uint32_t,const AccessMapping&,
                                std::span<const ObjectTypeNode> types = {},std::span<const std::uint8_t> self_sid = {});
+// 依物件型別樹逐節點的存取結果（AccessCheckByTypeResultList 家族）；types 為空時只有物件本身一筆。
+std::vector<AccessCheckResult> access_check_list(const VirtualToken&,const SecurityDescriptor&,std::uint32_t,const AccessMapping&,
+                                                 std::span<const ObjectTypeNode> types = {},std::span<const std::uint8_t> self_sid = {});
+std::vector<std::uint32_t> token_acl_access_nodes(const VirtualToken&,const SecurityDescriptor&,std::uint32_t,const AccessMapping&,
+                                                  std::span<const ObjectTypeNode> types,std::span<const std::uint8_t> self_sid);
 std::uint32_t integrity_access(const VirtualToken&,const SecurityDescriptor&,std::uint32_t,const AccessMapping&);
 // 私有物件安全（CreatePrivateObjectSecurity 家族）。flags 為 SEF_* 自動繼承旗標；token 可為空，
 // 只在需要預設擁有者／群組／DACL、驗證擁有者或 SACL 權限時使用，缺少時回 ERROR_NO_TOKEN。

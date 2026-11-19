@@ -16,7 +16,10 @@
 #include <sstream>
 #include <tuple>
 
-namespace x64arm::detail {const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,GuestAddress address) noexcept;}
+namespace x64arm::detail {
+const WindowsServiceDescriptor* runtime_stub_descriptor(GuestAddress stub_base,GuestAddress address) noexcept;
+std::size_t stub_service_index(GuestAddress stub_base,GuestAddress address) noexcept;
+}
 namespace x64arm {
 namespace {
 void trace_cpu_fault_instruction(const GuestState& state,const GuestMemory& memory,std::uint32_t code,std::uint64_t pid,std::uint64_t thread) noexcept {
@@ -429,6 +432,10 @@ std::optional<bool> WindowsServices::append_exception_frame(GuestState& state,Gu
             if(found==calls.rend())throw HostCallFault("NT 系統呼叫例外框架不符");dispatch.walk.rip=GuestAddress{found->caller};continue;
         }
         if(dispatch.walk.rip==thread_return_) {dispatch.walk.rip=return_sentinel;break;}
+        // 一般 API gateway 在客體側沒有堆疊框架；直接呼叫或客體常式尾跳
+        // 進入的記憶體故障，沿下方共用 x64 leaf unwind 讀取原返回位址。
+        // 回呼、系統呼叫及執行緒入口仍使用各自已登錄的框架契約。
+        if(!x86_ && detail::stub_service_index(stub_base_,dispatch.walk.rip)!=SIZE_MAX)break;
         if(dispatch.walk.rip!=callback_return_ || !dispatch.walk_callback_depth)throw HostCallFault("例外堆疊包含無對應框架的主機入口");
         const auto& callback=runtime_.callbacks.at(--dispatch.walk_callback_depth);
         const auto expected=(callback.saved.reg(Gpr::Rsp)-256)&~UINT64_C(15);
@@ -557,9 +564,9 @@ std::optional<std::uint32_t> WindowsServices::advance_exception(GuestState& stat
     };
     if (dispatch.stage == ExceptionStage::Vectored) {
         if (dispatch.index < dispatch.vectors.size()) { call(dispatch.vectors[dispatch.index++], {dispatch.pointers}); return std::nullopt; }
-        // RoOriginateError 在 API 內 raise 並 catch；VEH 仍看得到真實 EXCEPTION_RECORD。
+        // API 內 raise 並 catch；VEH 仍看得到真實 EXCEPTION_RECORD。
         // 僅標記我們建立的 frame，不能吞掉 guest 自己 RaiseException 的同碼例外。
-        if(dispatch.winrt_origination){state=dispatch.original;exceptions_.stack.pop_back();sync_msvc_uncaught(memory);return std::nullopt;}
+        if(dispatch.api_exception_boundary){state=dispatch.original;resume_api_exception_boundary(state,dispatch);exceptions_.stack.pop_back();sync_msvc_uncaught(memory);return std::nullopt;}
         dispatch.stage = ExceptionStage::Search; dispatch.index = 0;
     }
     if(x86_ && (dispatch.stage==ExceptionStage::Search || dispatch.stage==ExceptionStage::Unwind))return advance_x86_exception(state,memory);
@@ -663,7 +670,7 @@ std::optional<std::uint32_t> WindowsServices::resume_exception(GuestState& state
         std::vector<GuestCallback> callbacks;
         for (const auto& handler : exceptions_.continue_vectors) callbacks.push_back({handler.second,{dispatch.pointers}});
         if (!callbacks.empty()) start_callbacks(state,memory,std::move(callbacks),Continuation::ContinueException);
-        else exceptions_.stack.pop_back();
+        else {resume_api_exception_boundary(state,dispatch);exceptions_.stack.pop_back();}
         sync_msvc_uncaught(memory);
         return std::nullopt;
     }

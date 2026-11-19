@@ -11,6 +11,7 @@
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> version_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"internal-shell-version","SHGetFileDescriptionA",5},{"internal-shell-version","SHGetFileDescriptionW",5},
         {"version.dll","GetFileVersionInfoSizeA",2},{"version.dll","GetFileVersionInfoSizeW",2},
         {"version.dll","GetFileVersionInfoA",4},{"version.dll","GetFileVersionInfoW",4},
         {"version.dll","GetFileVersionInfoSizeExA",3},{"version.dll","GetFileVersionInfoSizeExW",3},
@@ -240,8 +241,128 @@ std::optional<std::uint32_t> WindowsServices::invoke_version(GuestState& state,G
     const auto arg=[&](unsigned index){return call(index+(extended?1U:0U));};
     if(extended && (call(0)&~UINT64_C(7))){last_error_=87;call.return_to(state,0);return std::nullopt;}
     const auto text=[&](std::uint64_t pointer){return wide?read_utf16(memory,GuestAddress{pointer}):utf8_to_utf16_lossy(read_ansi(memory,pointer));};
+    const auto read_version=[&](const std::u16string& requested){
+        std::vector<std::u16string> candidates;
+        if(requested.find_first_of(u"\\/:")==requested.npos){if(!runtime_.application_directory.empty())candidates.push_back(runtime_.application_directory+requested);if(!runtime_.dll_directory.empty())candidates.push_back(runtime_.dll_directory+requested);candidates.push_back(u"C:\\Windows\\System32\\"+requested);if(!runtime_.exclude_current_dll_directory)candidates.push_back(requested);}else candidates.push_back(requested);
+        auto key=utf16_to_utf8(requested);std::replace(key.begin(),key.end(),'/','\\');
+        for(auto& c:key)if(c>='A' && c<='Z')c=static_cast<char>(c+32);
+        auto name=key.substr(key.find_last_of('\\')+1);
+        if(name.find('.')==name.npos){name+=".dll";key+=".dll";}
+        std::vector<std::uint8_t> bytes;
+        // 與 LoadLibrary 共用 provider 命名空間；私有路徑的同名檔案仍讀其實際 PE。
+        if((key.find('\\')==key.npos || key=="c:\\windows\\system32\\"+name) && builtin_module(name)){
+            const auto host=windows_api_set_host(name);if(host!=name)name=host;
+            if(name.starts_with("api-ms-win-crt-"))name="ucrtbase.dll";
+            if(name!="kernel32.dll" && name!="wsock32.dll" && !crt_library(name) &&
+               !std::any_of(runtime_service_descriptors().begin(),runtime_service_descriptors().end(),[&](const auto& item){return item.family==name;}))throw VersionFailure{126};
+            bytes=builtin_version_info(name);
+        }else {
+            OpenHostFile opened;opened.error=2;
+            for(const auto& candidate:candidates){opened=filesystem_.open_reader(utf16_to_utf8(candidate),runtime_.application_source,utf16_to_utf8(runtime_.application_directory));if(!opened.error)break;if(opened.error!=2 && opened.error!=3)break;}
+            if(opened.error)throw VersionFailure{opened.error};bytes=PeReader(*opened.file,opened.metadata.size).version();
+        }
+        return bytes;
+    };
     try {
-        if(service.symbol.starts_with("VerQueryValue")){
+        if(service.family=="internal-shell-version"){
+            if(!arg(0) || !arg(4))throw VersionFailure{87};
+            const auto path=text(arg(0));
+            if(path.empty())throw VersionFailure{161};
+            std::u16string description;
+            GuestScratch scratch(*this,memory,state);
+            try{
+                const auto bytes=read_version(path);
+                const auto root=parse_version(bytes);
+                const auto try_key=[&](std::u16string_view key){
+                    const auto* node=query(root,key);
+                    if(node && node->text && node->length)
+                        for(std::size_t i=0;i<node->length;++i){
+                            const auto c=static_cast<char16_t>(number(bytes,node->value+2*i,2));
+                            if(!c)break;
+                            description.push_back(c);
+                        }
+                };
+                if(arg(1))try_key(text(arg(1)));
+                const auto* translations=query(root,u"\\VarFileInfo\\Translation");
+                if(description.empty() && translations && translations->length>=4){
+                    constexpr char16_t digits[]=u"0123456789ABCDEF";
+                    std::u16string key=u"\\StringFileInfo\\";
+                    for(const auto offset:{0U,2U}){
+                        const auto id=number(bytes,translations->value+offset,2);
+                        for(const auto shift:{12,8,4,0})key.push_back(digits[(id>>shift)&15]);
+                    }
+                    try_key(key+u"\\FileDescription");
+                }
+                for(const auto id:{u"040904B0",u"040904E4",u"04090000"})
+                    if(description.empty())try_key(u"\\StringFileInfo\\"+std::u16string(id)+u"\\FileDescription");
+            }catch(const VersionFailure&){
+                const auto filename=scratch.text(path);
+                if(!filename)throw std::bad_alloc();
+                if(static_cast<std::uint32_t>(nested_service(state,memory,"kernel32.dll","GetFileAttributesW",{filename}))==UINT32_MAX)
+                    throw VersionFailure{last_error_};
+            }
+            if(description.empty()){
+                description=path.substr(path.find_last_of(u"\\/")+1);
+                const auto extension=description.rfind(u'.');
+                if(extension!=description.npos)description.resize(extension);
+            }
+            const auto trim=[&](std::u16string_view suffix){
+                if(suffix.empty() || suffix.size()>description.size())return false;
+                const auto pos=description.size()-suffix.size();
+                if(!equal(std::u16string_view(description).substr(pos),suffix))return false;
+                description.resize(pos);
+                while(!description.empty() && description.back()==u' ')description.pop_back();
+                return true;
+            };
+            const auto subkey=scratch.text(u"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileAssociation");
+            const auto cut=scratch.text(u"CutList"),size=scratch.allocate(4);
+            if(!subkey || !cut || !size)throw std::bad_alloc();
+            const auto get_list=[&](std::uint64_t dest){
+                const auto hklm=x86_?0x80000002ULL:0xffffffff80000002ULL;
+                return nested_service(state,memory,"advapi32.dll","RegGetValueW",{hklm,subkey,cut,0x22,0,dest,size});
+            };
+            memory.store(GuestAddress{size},32,0);
+            bool use_argument=true;
+            if(!get_list(0)){
+                const auto capacity=memory.load(GuestAddress{size},32);
+                if(capacity>=2 && capacity<=output_limit){
+                    const auto data=scratch.allocate(capacity);
+                    if(!data)throw std::bad_alloc();
+                    if(!get_list(data)){
+                        use_argument=false;
+                        const auto units=memory.load(GuestAddress{size},32)/2;
+                        for(std::uint64_t at=0;at<units;){
+                            const auto item=read_utf16(memory,GuestAddress{data+2*at},units-at);
+                            if(item.empty() || trim(item))break;
+                            at+=item.size()+1;
+                        }
+                    }
+                }
+            }
+            if(use_argument && arg(2)){
+                auto cursor=arg(2);
+                for(;;){
+                    const auto suffix=text(cursor);
+                    if(suffix.empty() || trim(suffix) || !wide)break;
+                    cursor+=(suffix.size()+1)*2;
+                }
+            }
+            auto bytes=wide?utf16_bytes(description):std::vector<std::uint8_t>{};
+            if(!wide){const auto ansi=utf16_to_utf8(description);bytes.assign(ansi.begin(),ansi.end());bytes.push_back(0);}
+            const unsigned unit=wide?2U:1U;
+            auto count=bytes.size()/unit;
+            if(arg(3)){
+                count=std::min(count,static_cast<std::size_t>(memory.load(GuestAddress{arg(4)},32)));
+                if(count){
+                    if(!wide)while(count>1 && (bytes[count-1]&0xc0U)==0x80U)--count;
+                    bytes.resize(count*unit);
+                    std::fill(bytes.end()-unit,bytes.end(),0);
+                    memory.write(GuestAddress{arg(3)},bytes);
+                }
+            }
+            memory.store(GuestAddress{arg(4)},32,count);
+            result=1;
+        }else if(service.symbol.starts_with("VerQueryValue")){
             if(!arg(0) || !arg(2))throw VersionFailure{87};memory.check(GuestAddress{arg(2)},x86_?4U:8U,Access::Write);if(arg(3))memory.check(GuestAddress{arg(3)},4,Access::Write);
             const auto length=memory.load(GuestAddress{arg(0)},16);if(length<6)throw VersionFailure{13};
             std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));memory.read(GuestAddress{arg(0)},bytes);const auto root=parse_version(bytes);
@@ -263,25 +384,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_version(GuestState& state,G
             if(size_only && arg(1))memory.store(GuestAddress{arg(1)},32,0);
             if(!arg(0))throw VersionFailure{87};const auto requested=text(arg(0));if(requested.empty())throw VersionFailure{161};
             if(!size_only && !arg(3))throw VersionFailure{13};
-            std::vector<std::u16string> candidates;
-            if(requested.find_first_of(u"\\/:")==requested.npos){if(!runtime_.application_directory.empty())candidates.push_back(runtime_.application_directory+requested);if(!runtime_.dll_directory.empty())candidates.push_back(runtime_.dll_directory+requested);candidates.push_back(u"C:\\Windows\\System32\\"+requested);if(!runtime_.exclude_current_dll_directory)candidates.push_back(requested);}else candidates.push_back(requested);
-            auto key=utf16_to_utf8(requested);std::replace(key.begin(),key.end(),'/','\\');
-            for(auto& c:key)if(c>='A' && c<='Z')c=static_cast<char>(c+32);
-            auto name=key.substr(key.find_last_of('\\')+1);
-            if(name.find('.')==name.npos){name+=".dll";key+=".dll";}
-            std::vector<std::uint8_t> bytes;
-            // 與 LoadLibrary 共用 provider 命名空間；私有路徑的同名檔案仍讀其實際 PE。
-            if((key.find('\\')==key.npos || key=="c:\\windows\\system32\\"+name) && builtin_module(name)){
-                const auto host=windows_api_set_host(name);if(host!=name)name=host;
-                if(name.starts_with("api-ms-win-crt-"))name="ucrtbase.dll";
-                if(name!="kernel32.dll" && name!="wsock32.dll" && !crt_library(name) &&
-                   !std::any_of(runtime_service_descriptors().begin(),runtime_service_descriptors().end(),[&](const auto& item){return item.family==name;}))throw VersionFailure{126};
-                bytes=builtin_version_info(name);
-            }else {
-                OpenHostFile opened;opened.error=2;
-                for(const auto& candidate:candidates){opened=filesystem_.open_reader(utf16_to_utf8(candidate),runtime_.application_source,utf16_to_utf8(runtime_.application_directory));if(!opened.error)break;if(opened.error!=2 && opened.error!=3)break;}
-                if(opened.error)throw VersionFailure{opened.error};bytes=PeReader(*opened.file,opened.metadata.size).version();
-            }
+            auto bytes=read_version(requested);
             (void)parse_version(bytes);
             const auto required=buffer_size(bytes.size());
             if(size_only)result=required;

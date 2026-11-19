@@ -1,5 +1,6 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
+#include "crt_secure_string_contract.h"
 #include <algorithm>
 #include <bit>
 #include <cerrno>
@@ -365,11 +366,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& stat
     }else {
         // 安全複製／串接以字元數計算容量；_TRUNCATE 保留 NUL 並回傳 STRUNCATE。
         const bool append=symbol.find("cat")!=symbol.npos,bounded=symbol.find("ncpy")!=symbol.npos || symbol.find("ncat")!=symbol.npos;
-        const auto capacity=arg(1),count=bounded?arg(3):maximum;
+        const auto capacity=arg(1),count=bounded?arg(3):0;
         if(bounded && !count && !arg(0) && !capacity){arg.return_to(state,0);return std::nullopt;}
-        if(!arg(0) || !capacity)return invalid(22);
-        if(capacity>maximum)throw HostCallFault("CRT 安全字串容量超過上限");
-        memory.check(GuestAddress{arg(0)},static_cast<std::size_t>(capacity*unit),Access::Write);
+        if(!arg(0) || !capacity || capacity>x64arm_crt_secure_rsize_max(x86_?4U:8U))return invalid(22);
+        memory.check(GuestAddress{arg(0)},unit,Access::Write);
         const auto fail=[&](std::uint32_t error){memory.store(GuestAddress{arg(0)},width,0);return invalid(error);};
         if(!arg(2) && (!bounded || count))return fail(22);
         std::u16string value;
@@ -377,7 +377,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_string(GuestState& stat
             if(value.size()==capacity)return fail(22);
         }
         const auto room=capacity-value.size()-1;const bool truncate=bounded && count==(x86_?UINT32_MAX:UINT64_MAX);
-        const auto limit=bounded && !truncate?std::min(count,room+1):room+1;
+        const auto limit=x64arm_crt_secure_scan_limit(capacity,value.size(),count,x86_?UINT32_MAX:UINT64_MAX,bounded);
         for(std::uint64_t i=0;i<limit;++i){const auto c=memory.load(address(arg(2),i),width);if(!c)break;
             if(i==room){if(truncate){result=80;break;}return fail(34);}
             value.push_back(static_cast<char16_t>(c));

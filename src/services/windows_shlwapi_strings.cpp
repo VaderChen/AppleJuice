@@ -50,15 +50,6 @@ std::u16string shell_character(std::uint64_t value,bool wide){
 bool shell_equal(std::u16string_view left,std::u16string_view right,bool fold){
     if(!fold)return left==right;const auto compared=windows_nls_compare(left,right,0x409,1);return compared && *compared==0;
 }
-// StrCmpC／StrCmpIC：C 執行階段的序數比較；IC 只折疊 ASCII 字母。
-int ordinal_compare(std::u16string_view left,std::u16string_view right,bool fold,std::size_t count){
-    const auto ascii=[&](char16_t c){return fold && c>=u'A' && c<=u'Z'?static_cast<char16_t>(c+32):c;};
-    for(std::size_t i=0;i<count;++i){
-        const auto a=i<left.size()?ascii(left[i]):char16_t{},b=i<right.size()?ascii(right[i]):char16_t{};
-        if(a!=b)return a<b?-1:1;if(!a)return 0;
-    }
-    return 0;
-}
 // 三位有效數字的位元組大小（KB、MB…）；truncate 為截斷，否則四捨五入到顯示位數。
 std::u16string byte_size_text(std::uint64_t size,bool truncate){
     if(size<1024){auto text=std::to_string(size)+" bytes";return std::u16string(text.begin(),text.end());}
@@ -96,6 +87,10 @@ std::span<const WindowsServiceDescriptor> shlwapi_string_service_descriptors(){
         {"shlwapi.dll","SHStrDupA",2},{"shlwapi.dll","SHStrDupW",2},
         {"shlwapi.dll","SHAnsiToUnicode",3,0,0,0x4},{"shlwapi.dll","SHUnicodeToAnsi",3,0,0,0x4},{"shlwapi.dll","SHAnsiToAnsi",3,0,0,0x4},{"shlwapi.dll","SHUnicodeToUnicode",3,0,0,0x4},
         {"shlwapi.dll","StrRetToBufA",4,0,0,0x8},{"shlwapi.dll","StrRetToBufW",4,0,0,0x8},{"shlwapi.dll","StrRetToStrA",3},{"shlwapi.dll","StrRetToStrW",3},{"shlwapi.dll","StrRetToBSTR",3},
+        {"internal-shell-char","CharUpperNoDBCSA",1},
+        {"internal-shell-char","CharUpperNoDBCSW",1},
+        {"internal-shell-char","CharLowerNoDBCSA",1},
+        {"internal-shell-char","CharLowerNoDBCSW",1},
         {"shlwapi.dll","IsCharSpaceA",1,0,0,0x1},{"shlwapi.dll","IsCharSpaceW",1,0,0,0x1},
         // kernelbase（由 kernel32 承接）的其他 C1 字元分類：BLANK、CNTRL、DIGIT、PUNCT、XDIGIT。
         {"kernel32.dll","IsCharBlankW",1,0,0,0x1},{"kernel32.dll","IsCharCntrlW",1,0,0,0x1},{"kernel32.dll","IsCharDigitW",1,0,0,0x1},
@@ -124,6 +119,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_string(GuestState& 
         auto block=nested_service(state,memory,"ole32.dll","CoTaskMemAlloc",{data.size()});if(x86_)block&=UINT32_MAX;if(block)memory.write(GuestAddress{block},data);return block;};
     const unsigned pointer_bits=x86_?32U:64U;
     try{
+        if(service.family=="internal-shell-char"){
+            // NoDBCS 以系統語系就地轉換，接受的字串須能連同 NUL 放入 MAX_PATH。
+            const auto address=arg(0);
+            if(!address)return done(0);
+            unsigned length=0;
+            while(length<260 && memory.load(GuestAddress{address+length*unit},wide?16:8))++length;
+            if(!length || length==260)return done(0);
+            const auto flags=name.starts_with("CharUpper")?0x200U:0x100U;
+            const auto mapped=nested_service(state,memory,"kernel32.dll",wide?"LCMapStringW":"LCMapStringA",
+                                             {0x800,flags,address,length,address,length});
+            return done(mapped?address:0);
+        }
         if(name.starts_with("StrChr") || name.starts_with("StrRChr")){
             // StrChr(str, ch)／StrChrNW(str, ch, cchMax)／StrRChr(start, end 可為 NULL, ch)。
             if(!arg(0))return done(0);
@@ -160,10 +167,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_string(GuestState& 
         if(name.starts_with("StrCmpC") || name.starts_with("StrCmpIC") || name.starts_with("StrCmpNC") || name.starts_with("StrCmpNIC")){
             const bool fold=name.find("IC")!=name.npos,bounded=name.starts_with("StrCmpN");
             if(!arg(0) || !arg(1))return done(static_cast<std::uint32_t>(arg(0)==arg(1)?0:arg(0)?1:-1));
-            // 序數比較以碼元／位元組為單位（不經語系排序）。
-            const auto raw=[&](std::uint64_t address){if(wide)return read_utf16(memory,GuestAddress{address},1U<<20);const auto bytes=read_ansi(memory,address,1U<<20);return std::u16string(bytes.begin(),bytes.end());};
-            const auto left=raw(arg(0)),right=raw(arg(1));
-            return done(static_cast<std::uint32_t>(ordinal_compare(left,right,fold,bounded?static_cast<std::size_t>(std::max(0,static_cast<std::int32_t>(u32(2)))):SIZE_MAX)));
+            const auto limit=bounded?static_cast<std::uint64_t>(std::max(0,static_cast<std::int32_t>(u32(2)))):UINT64_MAX;
+            const auto read=[&](std::uint64_t address){
+                const auto c=memory.load(GuestAddress{address},wide?16:8);
+                return fold && c>='A' && c<='Z'?c+32:c;
+            };
+            for(std::uint64_t i=0;i<limit;++i){
+                const auto left=read(arg(0)+i*unit),right=read(arg(1)+i*unit);
+                if(left!=right)return done(left<right?UINT32_MAX:1U);
+                if(!left)break;
+            }
+            return done(0);
         }
         if(name=="StrCpyW" || name=="StrCpyNW" || name=="StrCatW" || name.starts_with("StrNCat") || name.starts_with("StrCatBuff")){
             // StrCpyNW／StrNCat 最多複製 cchMax-1 個字元並附加 NUL；StrCatBuff 的 cchDestBuffSize 為整個目的緩衝區大小。

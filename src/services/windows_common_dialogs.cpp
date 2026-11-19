@@ -4,6 +4,7 @@
 #include "x64arm/windows_paths.hpp"
 #include "x64arm/windows_fonts.hpp"
 #include "x64arm/unicode.hpp"
+#include "service_callback_task.hpp"
 #include <algorithm>
 #include <bit>
 #include <charconv>
@@ -17,6 +18,14 @@ std::span<const WindowsServiceDescriptor> common_dialog_service_descriptors() {
         {"comdlg32.dll","GetOpenFileNameA",1},{"comdlg32.dll","GetOpenFileNameW",1},
         {"comdlg32.dll","GetSaveFileNameA",1},{"comdlg32.dll","GetSaveFileNameW",1},
         {"comdlg32.dll","CommDlgExtendedError",0},
+        {"comdlg32.dll","FindTextA",1},{"comdlg32.dll","FindTextW",1},{"comdlg32.dll","ReplaceTextA",1},{"comdlg32.dll","ReplaceTextW",1},{"internal-find-replace","DialogProc",4},
+        {"comdlg32.dll","DllGetClassObject",3},{"internal-file-dialog-factory","QueryInterface",3},{"internal-file-dialog-factory","AddRef",1},{"internal-file-dialog-factory","Release",1},{"internal-file-dialog-factory","CreateInstance",4},{"internal-file-dialog-factory","LockServer",2},
+        {"internal-file-dialog","QueryInterface",3},{"internal-file-dialog","AddRef",1},{"internal-file-dialog","Release",1},{"internal-file-dialog","Show",2},{"internal-file-dialog","SetFileTypes",3},{"internal-file-dialog","SetFileTypeIndex",2},
+        {"internal-file-dialog","GetFileTypeIndex",2},{"internal-file-dialog","Advise",3},{"internal-file-dialog","Unadvise",2},{"internal-file-dialog","SetOptions",2},{"internal-file-dialog","GetOptions",2},{"internal-file-dialog","SetDefaultFolder",2},
+        {"internal-file-dialog","SetFolder",2},{"internal-file-dialog","GetFolder",2},{"internal-file-dialog","GetCurrentSelection",2},{"internal-file-dialog","SetFileName",2},{"internal-file-dialog","GetFileName",2},{"internal-file-dialog","SetTitle",2},
+        {"internal-file-dialog","SetOkButtonLabel",2},{"internal-file-dialog","SetFileNameLabel",2},{"internal-file-dialog","GetResult",2},{"internal-file-dialog","AddPlace",3},{"internal-file-dialog","SetDefaultExtension",2},{"internal-file-dialog","Close",2},
+        {"internal-file-dialog","SetClientGuid",2},{"internal-file-dialog","ClearClientData",1},{"internal-file-dialog","SetFilter",2},{"internal-file-dialog","GetResults",2},{"internal-file-dialog","GetSelectedItems",2},{"internal-file-dialog","SetSaveAsItem",2},
+        {"internal-file-dialog","SetProperties",2},{"internal-file-dialog","SetCollectedProperties",3},{"internal-file-dialog","GetProperties",2},{"internal-file-dialog","ApplyProperties",5},
         {"comdlg32.dll","__CommonDialogProcA",4},{"comdlg32.dll","__CommonDialogProcW",4},
         {"oledlg.dll","OleUIBusyA",1},{"oledlg.dll","OleUIBusyW",1},
         {"oledlg.dll","__OleBusyDialogProcA",4},{"oledlg.dll","__OleBusyDialogProcW",4}
@@ -177,6 +186,8 @@ void WindowsServices::common_dialog_refresh(std::uint64_t handle){
 }
 std::optional<std::uint32_t> WindowsServices::invoke_common_dialog(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.family=="oledlg.dll")return invoke_gui_busy(state,memory,service);
+#include "windows_find_replace.inc"
+#include "windows_file_dialog.inc"
     const WindowsCall arg(state,memory,service);
     if(service.symbol=="CommDlgExtendedError"){arg.return_to(state,gui_.common_dialog_error);return std::nullopt;}
     if(service.symbol.starts_with("__CommonDialogProc")){
@@ -335,5 +346,26 @@ bool WindowsServices::common_dialog_message(GuestMemory& memory,const GuiMessage
         store(abi.file_offset,16,offset);store(abi.extension_offset,16,ext==std::string::npos || ext<offset?0:ext+1);store(abi.filter_index,32,static_cast<std::uint32_t>(control(413).selection+1));
     }
     dialog.ended=true;dialog.dialog_result=1;return true;
+}
+// CoCreateInstance／CoGetClassObject 的 CLSID_FileOpenDialog／CLSID_FileSaveDialog：經 comdlg32 的 DllGetClassObject 與類別工廠建立，
+// 與直接向 DLL 取得工廠共用同一流程。
+bool WindowsServices::begin_file_dialog_com(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    const WindowsCall arg(state,memory,service);if(!arg(0))return false;
+    static constexpr std::array<std::uint8_t,16> open{0x9c,0x5a,0x1c,0xdc,0x8a,0xe8,0xde,0x4d,0xa5,0xa1,0x60,0xf8,0x2a,0x20,0xae,0xf7},
+        save{0xf3,0xe2,0xb4,0xc0,0x21,0xba,0x73,0x47,0x8d,0xba,0x33,0x5e,0xc9,0x46,0xeb,0x8b},factory_iid{1,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
+    std::array<std::uint8_t,16> clsid{};memory.read(GuestAddress{arg(0)},clsid);if(clsid!=open && clsid!=save)return false;
+    const bool create=service.symbol=="CoCreateInstance";const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);const auto output=arg(4);
+    const auto done=[&](std::uint64_t hr){arg.return_to(state,hr&UINT32_MAX);return true;};
+    if(!output)return done(0x80004003U);memory.store(GuestAddress{output},bits,0);if(!arg(3))return done(0x80070057U);
+    if(!com_apartment(threads_.current))return done(0x800401f0U);
+    if(!(static_cast<std::uint32_t>(arg(create?2:1))&1U))return done(0x80040154U); // 只有 in-process 伺服器
+    if(!create)return done(nested_service(state,memory,"comdlg32.dll","DllGetClassObject",{arg(0),arg(3),output}));
+    if(arg(1))return done(0x80040110U);
+    GuestScratch temporary(*this,memory,state);const auto iid=temporary.allocate(16),slot=temporary.allocate(unit);if(!iid || !slot)return done(0x8007000eU);
+    memory.write(GuestAddress{iid},factory_iid);memory.store(GuestAddress{slot},bits,0);
+    const auto status=static_cast<std::uint32_t>(nested_service(state,memory,"comdlg32.dll","DllGetClassObject",{arg(0),iid,slot}));if(status&0x80000000U)return done(status);
+    const auto factory=memory.load(GuestAddress{slot},bits);
+    const auto result=nested_service(state,memory,"internal-file-dialog-factory","CreateInstance",{factory,0,arg(3),output});
+    (void)nested_service(state,memory,"internal-file-dialog-factory","Release",{factory});return done(result);
 }
 }

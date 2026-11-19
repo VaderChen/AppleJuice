@@ -7,6 +7,11 @@
 
 namespace x64arm {
 using WindowsGuid = std::array<std::uint8_t,16>;
+// OLE 標準 GUID 尾碼 {xxxxxxxx-0000-0000-C000-000000000046}。
+inline constexpr WindowsGuid ole_standard_guid(std::uint32_t id){
+    return {static_cast<std::uint8_t>(id),static_cast<std::uint8_t>(id>>8),static_cast<std::uint8_t>(id>>16),
+            static_cast<std::uint8_t>(id>>24),0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
+}
 // GUID 前三個欄位採 Windows little-endian；字串及 UUID 比較使用欄位順序。
 inline constexpr std::array<unsigned,16> windows_guid_order{3,2,1,0,5,4,7,6,8,9,10,11,12,13,14,15};
 inline std::u16string windows_guid_text(const WindowsGuid& value){

@@ -90,6 +90,7 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
         {"kernel32.dll", "GetCommandLineA", 0}, {"kernel32.dll", "GetCurrentProcessId", 0},
         {"kernel32.dll", "GetACP", 0}, {"kernel32.dll", "GetStartupInfoA", 1}, {"kernel32.dll", "GetStartupInfoW", 1},
         {"crt", "__p___argc", 0}, {"crt", "__p___argv", 0}, {"crt", "__p__environ", 0},
+        {"crt", "_get_printf_count_output", 0}, {"crt", "_set_printf_count_output", 1},
         {"crt", "_set_fmode", 1}, {"crt", "_get_fmode", 1}, {"crt", "__p__fmode", 0}, {"crt", "__p__commode", 0}, {"crt", "__p__adjust_fdiv", 0}, {"crt", "_errno", 0},
         {"crt","__crtGetShowWindowMode",0},{"crt","_get_show_window_mode",0},
         {"crt","_get_narrow_winmain_command_line",0},{"crt","_get_wide_winmain_command_line",0},
@@ -280,6 +281,9 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {oleaut32_conversion_service_descriptors(), false, "oleaut32_conversion_service_descriptors", &WindowsServices::invoke_oleaut32_conversion},
             {oleaut32_dispatch_service_descriptors(), false, "oleaut32_dispatch_service_descriptors", &WindowsServices::invoke_oleaut32_dispatch},
             {crt_extra_service_descriptors(), false, "crt_extra_service_descriptors", &WindowsServices::invoke_crt_extra},
+            {crt_console_read_service_descriptors(), false, "crt_console_read_service_descriptors", &WindowsServices::invoke_crt_console_read},
+            {com_moniker_service_descriptors(), true, "com_moniker_service_descriptors", &WindowsServices::invoke_com_monikers},
+            {ole_advise_service_descriptors(), true, "ole_advise_service_descriptors", &WindowsServices::invoke_ole_advise},
             {crt_mbcs_service_descriptors(), false, "crt_mbcs_service_descriptors", &WindowsServices::invoke_crt_mbcs},
             {crt_runtime_extra_service_descriptors(), false, "crt_runtime_extra_service_descriptors", &WindowsServices::invoke_crt_runtime_extra},
             {shlwapi_string_service_descriptors(), false, "shlwapi_string_service_descriptors", &WindowsServices::invoke_shlwapi_string},
@@ -338,6 +342,7 @@ const WindowsServices::RuntimeCatalog& WindowsServices::runtime_catalog() {
             {property_service_descriptors(), false, "property_service_descriptors", &WindowsServices::invoke_properties},
             {profile_service_descriptors(), false, "profile_service_descriptors", &WindowsServices::invoke_profile},
             {legacy_device_service_descriptors(), false, "legacy_device_service_descriptors", &WindowsServices::invoke_legacy_device},
+            {avifil32_service_descriptors(), false, "avifil32_service_descriptors", &WindowsServices::invoke_avifil32},
             {vtable_proxy_service_descriptors(), false, "vtable_proxy_service_descriptors", &WindowsServices::invoke_vtable_proxy},
             {shell_idlist_service_descriptors(), false, "shell_idlist_service_descriptors", &WindowsServices::invoke_shell_idlist},
             {winstation_service_descriptors(), false, "winstation_service_descriptors", &WindowsServices::invoke_winstation},
@@ -598,8 +603,8 @@ CrtFormatLayout crt_format_layout(const WindowsServiceDescriptor& service){
 struct FormatError {unsigned code;};
 struct Formatted {std::u16string text;unsigned encoding_error{};bool failed{};};
 enum class FormatArgumentKind {Integer,Floating,Pointer};
-Formatted format(const GuestMemory& memory,std::u16string_view specification,bool wide,bool wide_strings,unsigned pointer_size,bool three_digit_exponents,bool legacy_msvcrt,
-                 bool positional,bool inspect,const CrtLocaleCategory& locale,std::u16string_view decimal_symbol,
+Formatted format(GuestMemory& memory,std::u16string_view specification,bool wide,bool wide_strings,unsigned pointer_size,bool three_digit_exponents,bool legacy_msvcrt,
+                 bool positional,bool inspect,std::uint64_t count_cell,const CrtLocaleCategory& locale,std::u16string_view decimal_symbol,
                  const std::function<std::uint64_t(unsigned,unsigned,FormatArgumentKind)>& next){
     Formatted result;auto& output=result.text;
     for(std::size_t at=0;at<specification.size();){
@@ -630,10 +635,10 @@ Formatted format(const GuestMemory& memory,std::u16string_view specification,boo
         const bool integer=std::u16string_view(u"diouxX").find(conversion)!=std::u16string_view::npos;
         const bool floating=std::u16string_view(u"fFeEgGaA").find(conversion)!=std::u16string_view::npos;
         const bool string=conversion==u's' || conversion==u'S',character=conversion==u'c' || conversion==u'C';
-        if(!integer && !floating && !string && !character && conversion!=u'p')throw FormatError{22};
+        if(!integer && !floating && !string && !character && conversion!=u'p' && conversion!=u'n')throw FormatError{22};
         const bool pointer_integer=length==u"z" || length==u"t" || length==u"I";
         const unsigned integer_bits=length==u"ll" || length==u"I64" || length==u"j"?64:pointer_integer?pointer_size*8:length==u"h"?16:length==u"hh"?8:32;
-        if(integer && (length==u"L" || length==u"w"))throw FormatError{22};
+        if((integer || conversion==u'n') && (length==u"L" || length==u"w"))throw FormatError{22};
         if(floating && !length.empty() && length!=u"l" && length!=u"L")throw FormatError{22};
         if((string || character) && !length.empty() && length!=u"h" && length!=u"l" && length!=u"w" && length!=u"T")throw FormatError{22};
         // UCRT 的 T 修飾子（%Ts、%Tc）取函式本身的字元寬度，不受舊式寬字串選項影響；其餘轉換不接受。
@@ -641,6 +646,12 @@ Formatted format(const GuestMemory& memory,std::u16string_view specification,boo
         const unsigned size=floating?8:integer?std::max(4U,integer_bits/8):character?4:pointer_size;
         const auto value=next(size,argument,floating?FormatArgumentKind::Floating:integer || character?FormatArgumentKind::Integer:FormatArgumentKind::Pointer);
         if(inspect)continue;
+        if(conversion==u'n'){
+            // worker 的試跑路徑不帶狀態格，由協調者完成客體寫回及例外處理。
+            if(!count_cell || !memory.load(GuestAddress{count_cell},32))throw FormatError{22};
+            memory.store(GuestAddress{value},static_cast<std::uint8_t>(integer_bits),output.size());
+            continue;
+        }
         std::u16string rendered;
         if(string || character){
             const bool opposite=conversion==u'S' || conversion==u'C';const bool source_wide=length==u"T"?wide:length==u"l" || length==u"w" || (length.empty() && (opposite?!wide_strings:wide_strings));
@@ -753,9 +764,9 @@ Formatted format(const GuestMemory& memory,std::u16string_view specification,boo
 }
 // 格式讀取與 ABI 解包共用同一實作；只讀客體記憶體，不提交 errno、回呼或輸出。
 // 強制內聯保留既有單核入口的資料流，worker 只省去服務協調。
-__attribute__((always_inline)) inline Formatted format_arguments(const GuestState& state,const GuestMemory& memory,
+__attribute__((always_inline)) inline Formatted format_arguments(const GuestState& state,GuestMemory& memory,
         const WindowsCall& arg,const CrtFormatLayout& layout,std::uint64_t fmt,
-        std::uint64_t options,bool x86_,const CrtLocaleObject& locale,std::u16string& specification){
+        std::uint64_t options,bool x86_,std::uint64_t count_cell,const CrtLocaleObject& locale,std::u16string& specification){
     const auto& [common,common_stream,common_buffer,stream,standard_output,counting,
                  wide,secure,limited,unbounded,va,underscore,format_index,console,positional,explicit_locale,counted]=layout;
     unsigned index=format_index+1+(explicit_locale?1U:0U);
@@ -769,7 +780,7 @@ __attribute__((always_inline)) inline Formatted format_arguments(const GuestStat
     const auto decimal=windows_crt_numeric(locale.categories[4]).decimal;
     const auto run=[&](bool inspect,const std::function<std::uint64_t(unsigned,unsigned,FormatArgumentKind)>& next){
         return format(memory,specification,wide,wide && (!common || (options&4)),x86_?4:8,common?(options&0x10)!=0:underscore,common && (options&8),
-                      positional,inspect,locale.categories[2],decimal,next);
+                      positional,inspect,count_cell,locale.categories[2],decimal,next);
     };
     struct Argument {unsigned size{},position{};FormatArgumentKind kind{};std::uint64_t value{};};
     std::vector<Argument> slots;bool indexed=false;
@@ -989,6 +1000,8 @@ void WindowsServices::configure_image_after_unwind_validation(GuestState& state,
     }
     }
     }
+    if(initial_thread && replace_process_environment(memory,state,encode_guest_environment(runtime_.environment)))
+        throw HostCallFault("程序環境區塊初始化失敗");
     awaiting_initial_thread_=!initial_thread;
     if(!initial_thread){
         if(runtime_.image.tls_index)memory.store(GuestAddress{runtime_.image.tls_index},32,0);
@@ -1911,6 +1924,7 @@ void WindowsServices::discard_callbacks(std::size_t depth, GuestState& state, Gu
         if(frame.continuation==Continuation::DWriteOperation)discard_dwrite(frame.value,memory,state);
         if(frame.continuation==Continuation::StackWalkOperation)discard_stack_walk(frame.value,memory,state);
         if(frame.continuation==Continuation::SymbolFunctionEntry)discard_symbol_callback(frame.value);
+        if(frame.continuation==Continuation::SymbolEvent || frame.continuation==Continuation::SymbolEventRetry){runtime_.symbol_event_returns.erase(frame.value);(void)free_heap(memory,frame.value,state);}
         if(frame.continuation==Continuation::MiniDumpOperation)discard_minidump(frame.value,memory,state);
         if(frame.continuation==Continuation::EtwCallback)discard_etw_callback(state,memory,frame.value);
         if(frame.continuation==Continuation::EtwProcess)discard_etw_process(state,memory,frame.value);
@@ -2164,6 +2178,8 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     if(finished.continuation==Continuation::ReturnZeroFreeHeap){(void)free_heap(memory,finished.value,state);complete_call(state,memory,0);return std::nullopt;}
     // DbgHelp 的符號／模組列舉：回呼回 FALSE 只停止列舉，函式仍回傳 TRUE；釋放傳給回呼的名稱與 SYMBOL_INFO 區塊。
     if(finished.continuation==Continuation::SymbolEnumeration){(void)free_heap(memory,finished.value,state);complete_call(state,memory,1);return std::nullopt;}
+    // SymRegisterCallback 事件：還原原本的回傳值，或回到 API 入口重新執行查詢。
+    if(finished.continuation==Continuation::SymbolEvent || finished.continuation==Continuation::SymbolEventRetry)return finish_symbol_events(state,memory,finished.value,finished.continuation==Continuation::SymbolEventRetry);
     if(finished.continuation==Continuation::GuiWinEvent){if(finished.value)return advance_gui_modal(state,memory,finished.value);return std::nullopt;}
     if(finished.continuation==Continuation::GuiMouseInput)return resume_gui_mouse(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::GuiMoveSize)return resume_gui_move_size(state,memory,finished.value,callback_value);
@@ -2183,7 +2199,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     if(finished.continuation==Continuation::GuiCbtAction)return resume_gui_cbt_action(state,memory,finished,callback_value);
     if(finished.continuation==Continuation::FontEnumeration)return resume_font_enumeration(state,memory,finished,callback_value);
     if(finished.continuation==Continuation::ModuleOperation)return resume_module_operation(state,memory,finished,callback_value);
-    if(finished.continuation==Continuation::MsvcCopy || finished.continuation==Continuation::MsvcUnwind || finished.continuation==Continuation::MsvcCatch || finished.continuation==Continuation::MsvcDestroy)return resume_msvc(state,memory,finished,callback_value);
+    if(finished.continuation==Continuation::MsvcCopy || finished.continuation==Continuation::MsvcUnwind || finished.continuation==Continuation::MsvcCatch || finished.continuation==Continuation::MsvcDestroy || finished.continuation==Continuation::MsvcTranslate)return resume_msvc(state,memory,finished,callback_value);
     if(finished.continuation==Continuation::OleClipboardOperation)return resume_ole_clipboard(state,memory,finished.value,callback_value);
     if(finished.continuation==Continuation::OleVariantClear || finished.continuation==Continuation::OleVariantCopy || finished.continuation==Continuation::OleReleaseStgMedium)return resume_ole(state,memory,finished);
     if(finished.continuation==Continuation::ConsoleControl){if(!finished.value)return finish_process(state,memory,0xc000013aU);state.reg(Gpr::Rax)=0;return std::nullopt;}
@@ -2233,7 +2249,7 @@ std::optional<std::uint32_t> WindowsServices::resume_callback(GuestState& state,
     if (finished.continuation == Continuation::Exception) return resume_exception(state, memory, callback_value);
     if (finished.continuation == Continuation::ContinueException) {
         if (exceptions_.stack.empty()) throw HostCallFault("繼續例外 callback 缺少派送狀態");
-        state=read_context(memory,exceptions_.stack.back().context,finished.saved);exceptions_.stack.pop_back();sync_msvc_uncaught(memory);return std::nullopt;
+        state=read_context(memory,exceptions_.stack.back().context,finished.saved);resume_api_exception_boundary(state,exceptions_.stack.back());exceptions_.stack.pop_back();sync_msvc_uncaught(memory);return std::nullopt;
     }
     if (finished.continuation == Continuation::SehFilter) return seh_filter_result(state, memory, callback_value);
     if (finished.continuation == Continuation::SehFinally) return seh_finally_result(state, memory);
@@ -2285,6 +2301,15 @@ void WindowsServices::report_crt_fast_fail(const GuestState& state,GuestMemory& 
     const auto* image=module_image(caller,true);
     std::fprintf(stderr,"crt_fast_fail pid=%u symbol=%.*s caller=0x%llx module=%s offset=0x%llx thread=%llu\n",process_id(),static_cast<int>(symbol.size()),symbol.data(),
         static_cast<unsigned long long>(caller),image?utf16_to_utf8(image->path).c_str():"?",static_cast<unsigned long long>(image?caller-image->base:0),static_cast<unsigned long long>(threads_.current));
+    // 失敗退出可能在兩次週期快照之間發生，保留該程序最後已完成的等待。
+    if(const auto* directory=std::getenv("X64ARM_TRACE_THREAD_DUMP");directory && *directory){
+        const auto path=std::filesystem::path(directory)/("threads-"+std::to_string(process_id())+".log");
+        if(auto* out=std::fopen(path.string().c_str(),"a")){
+            std::fprintf(out,"thread_dump failure symbol=%.*s thread=%llu\n",static_cast<int>(symbol.size()),symbol.data(),static_cast<unsigned long long>(threads_.current));
+            trace_guest_thread_waits(out);
+            std::fclose(out);
+        }
+    }
     if(!caller)return;
     // x86 無通用 unwind metadata；只沿單調向上的 EBP chain 讀取最多 16 層。
     // 省略 frame pointer 或鏈已損壞時停止，不把任意堆疊資料冒充返回位址。
@@ -2471,6 +2496,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_runtime(GuestState& state, 
     else if (symbol == "__p__environ") result = runtime_.environ_cell;
     else if (symbol == "__p___initenv") result = runtime_base_.value+112;
     else if (symbol == "__p___winitenv") result = runtime_base_.value+120;
+    else if (symbol == "_get_printf_count_output" || symbol == "_set_printf_count_output") {
+        const GuestAddress cell{runtime_base_.value+X64ARM_CRT_PRINTF_COUNT_OFFSET};
+        result = memory.load(cell,32);
+        if (symbol == "_set_printf_count_output") memory.store(cell,32,static_cast<std::uint32_t>(arg(0)) != 0);
+    }
     else if (symbol == "_set_fmode") {
         const auto mode=static_cast<std::uint32_t>(arg(0));
         if(mode!=0x4000 && mode!=0x8000 && mode!=0x10000){memory.store(GuestAddress{runtime_.errno_cell},32,22);result=22;}
@@ -2927,7 +2957,7 @@ bool WindowsServices::invoke_parallel_crt_format(GuestState& state,GuestMemory& 
         static const CrtLocaleObject initial_locale{};const auto* locale=&initial_locale;
         if(locale_handle){const auto found=runtime_.crt_locales.find(locale_handle);if(found==runtime_.crt_locales.end())return false;locale=&found->second;}
         std::u16string specification;
-        const auto formatted=format_arguments(state,memory,arg,layout,fmt,options,false,*locale,specification);
+        const auto formatted=format_arguments(state,memory,arg,layout,fmt,options,false,0,*locale,specification);
         // errno、無效參數回呼及故障都交回既有 provider；此時還沒有客體副作用。
         if(formatted.encoding_error || formatted.failed)return false;
         result=formatted.text.size();
@@ -2982,7 +3012,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_crt_format(GuestState& stat
     if(!stream && !counting && !console && ((secure && (!destination || !capacity)) || (!destination && capacity)))return invalid_format(22);
     if(limited && !limit){memory.store(GuestAddress{destination},wide?16:8,0);arg.return_to(state,UINT32_MAX);return std::nullopt;}
     std::u16string specification;Formatted formatted;
-    try {formatted=format_arguments(state,memory,arg,layout,fmt,options,x86_,*locale,specification);
+    try {formatted=format_arguments(state,memory,arg,layout,fmt,options,x86_,runtime_base_.value+X64ARM_CRT_PRINTF_COUNT_OFFSET,*locale,specification);
     }catch(const FormatError& error){
         // 無效格式會進入 invalid parameter 處理（多半終止程序）；保留格式字串供相容性診斷。
         std::fprintf(stderr,"crt_format_invalid pid=%u symbol=%.*s errno=%u format=%s\n",process_id(),static_cast<int>(service.symbol.size()),service.symbol.data(),error.code,utf16_to_utf8(specification.substr(0,240)).c_str());

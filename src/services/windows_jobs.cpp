@@ -153,7 +153,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_job(GuestState& state,Guest
         else {
             auto name=nameptr?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{nameptr}):utf8_to_utf16(read_ansi(memory,nameptr))):std::u16string{};
             if(!nameptr){const auto text="x64arm-job-"+std::to_string(process_id())+"-"+std::to_string(runtime_.next_wait_handle);name.assign(text.begin(),text.end());}
-            const auto opened=open_shared_job(mapping_session(),std::move(name),create,[&]{return security.bytes;});
+            // 私有命名空間別名與 BaseNamedObjects 下的子目錄（物件命名空間）轉成既有具名物件名稱。
+            const auto namespace_error=nameptr?win32_namespace_object_name(name,create):0U;
+            const auto opened=namespace_error?OpenSharedJob{{},namespace_error}:open_shared_job(mapping_session(),std::move(name),create,[&]{return security.bytes;});
             if(opened.error)fail(opened.error);else {SharedEventLock lock(opened.job->lock_descriptor());const auto descriptor=shared_object_security(opened.job->descriptor());if(descriptor.empty())throw SecurityDescriptorError{1338};const auto granted=create && !opened.existed?rights:object_security_access(descriptor,rights,{0x20004U,0x2000bU,0x120000U,0x1f003fU});result=runtime_.allocate_wait_handle();jobs_->handles.emplace(result,JobState::Handle{opened.job,granted});runtime_.handle_flags[result]=security.inherit?1:0;if(create)last_error_=opened.existed?183:0;}
         }
     }else if(symbol=="DuplicateHandle"){

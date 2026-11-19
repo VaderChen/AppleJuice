@@ -793,7 +793,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui(GuestState& state, Gues
             const auto height = static_cast<std::uint32_t>(arg(7)) == 0x80000000U ? 360U : static_cast<std::uint32_t>(arg(7));
             if (width > 8192 || height > 8192) { fail(87); }
             else {
-                const auto handle = allocate_gui_window(); GuiWindow window;window.dpi_context=effective_dpi_context();window.nonclient_dpi_scaling=window.dpi_context==UINT64_MAX-3;window.thread=threads_.current;
+                const auto handle = allocate_gui_window(); GuiWindow window;window.dpi_context=effective_dpi_context();if(const auto hosting=dpi_hosting_behavior_.find(threads_.current);hosting!=dpi_hosting_behavior_.end())window.dpi_hosting=hosting->second;window.nonclient_dpi_scaling=window.dpi_context==UINT64_MAX-3;window.thread=threads_.current;
                 window.builtin=builtin;window.class_name=builtin?builtin_name:found->first;window.procedure = builtin?stock_gui_proc(builtin_name,wide):found->second.procedure;window.control_class=std::u16string(stock_gui_class(window.procedure));if(!window.control_class.empty())window.builtin=true;
                 if(!builtin){window.class_atom=found->second.atom;window.extra.resize(found->second.extra_size);}
                 else {const auto* cls=gui_class_record(builtin_name);window.class_atom=cls->atom;window.procedure=cls->procedure==stock_gui_proc(builtin_name,true)?stock_gui_proc(builtin_name,wide):cls->procedure;window.extra.resize(cls->extra_size);}window.title = arg(2)>65535?string(arg(2)):std::u16string{};

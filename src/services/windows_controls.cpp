@@ -308,6 +308,7 @@ void WindowsServices::present_gui(std::uint64_t handle) {
         }
     }
     if(native_gui_ && gui_.windows.contains(handle) && gui_.windows.at(handle).redraw)present_native_window(handle,gui_.windows.at(handle));
+    else publish_gui_window(handle);
 }
 std::vector<GuiWindowCreation> WindowsServices::plan_gui_control_children(std::uint64_t handle,bool wide){
     std::vector<GuiWindowCreation> plans;

@@ -1,4 +1,5 @@
 #include "x64arm/windows_services.hpp"
+#include "service_callback_task.hpp"
 #include "x64arm/windows_window_state.hpp"
 #include "x64arm/windows_icon.hpp"
 #include "x64arm/unicode.hpp"
@@ -34,7 +35,8 @@ std::span<const WindowsServiceDescriptor> shell_service_descriptors() {
         {"internal-shell","IPropertyStore.QueryInterface",3},{"internal-shell","IPropertyStore.AddRef",1},{"internal-shell","IPropertyStore.Release",1},
         {"internal-shell","IPropertyStore.GetCount",2},{"internal-shell","IPropertyStore.GetAt",3},{"internal-shell","IPropertyStore.GetValue",3},{"internal-shell","IPropertyStore.SetValue",3},{"internal-shell","IPropertyStore.Commit",1},
         {"shell32.dll","SHGetKnownFolderPath",4},{"shell32.dll","SHGetKnownFolderIDList",4},
-        {"shell32.dll","SHGetFolderPathA",5},{"shell32.dll","SHGetFolderPathW",5},{"shell32.dll","SHGetFolderPathAndSubDirA",6},{"shell32.dll","SHGetFolderPathAndSubDirW",6},{"shell32.dll","SHGetSettings",2},{"shell32.dll","SHRestricted",1},
+        {"shell32.dll","SHGetFolderPathA",5},{"shell32.dll","SHGetFolderPathW",5},{"shell32.dll","SHGetFolderPathAndSubDirA",6},{"shell32.dll","SHGetFolderPathAndSubDirW",6},{"shell32.dll","SHGetSettings",2},{"shell32.dll","SHGetSetSettings",3},{"shell32.dll","ReadCabinetState",2},{"shell32.dll","SHGetImageList",3},{"shell32.dll","Shell_MergeMenus",6},{"shell32.dll","SHGetNewLinkInfoA",5},{"shell32.dll","SHGetNewLinkInfoW",5},{"shell32.dll","SHGetSetFolderCustomSettings",3},{"shell32.dll","SHIsFileAvailableOffline",2},{"shell32.dll","ShellAboutA",4},{"shell32.dll","ShellAboutW",4},
+        {"shell32.dll","OpenAs_RunDLL",4},{"shell32.dll","OpenAs_RunDLLA",4},{"shell32.dll","OpenAs_RunDLLW",4},{"internal-shell-about","DialogProc",4},{"shell32.dll","SHRestricted",1},
         {"shfolder.dll","SHGetFolderPathA",5},{"shfolder.dll","SHGetFolderPathW",5},
         {"shell32.dll","SHFileOperationA",1},{"shell32.dll","SHFileOperationW",1},
         {"shell32.dll","SHCloneSpecialIDList",3},{"shell32.dll","SHGetSpecialFolderLocation",3},{"shell32.dll","SHGetFolderLocation",5},{"shell32.dll","SHGetFileInfoA",5},{"shell32.dll","SHGetFileInfoW",5},
@@ -261,6 +263,8 @@ std::uint32_t WindowsServices::finish_shell_delete(GuestMemory& memory,const Gui
 #include "windows_shell_recent.inc"
 std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
     if(service.symbol=="SHAddToRecentDocs")return invoke_recent_document(state,memory,service);
+#include "windows_shell_about.inc"
+#include "windows_shell_misc.inc"
     if(service.symbol=="SHAppBarMessage" || service.symbol=="SHOpenFolderAndSelectItems" || service.symbol=="SHOpenWithDialog")return invoke_shell_desktop(state,memory,service);
     if(service.symbol=="SHChangeNotify")return invoke_shell_notification(state,memory,service);
     if(service.symbol.starts_with("ShellExecute") || service.symbol.starts_with("FindExecutable"))return invoke_shell_execute(state,memory,service);

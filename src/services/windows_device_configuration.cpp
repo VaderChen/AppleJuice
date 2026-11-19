@@ -1,3 +1,4 @@
+#include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/gpu_memory.hpp"
 #include "x64arm/unicode.hpp"
@@ -14,6 +15,7 @@
 #include "setup_driver_store.hpp"
 #include "bluetooth_windows.hpp"
 #include "windows_sddl.hpp"
+#include "token_elevation.hpp"
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
@@ -37,6 +39,8 @@ struct DeviceNode {
     std::vector<std::array<std::uint8_t,16>> interface_aliases;
     // SetupDiCreateDeviceInfo 建立、尚未 DIF_REGISTERDEVICE 的元素只屬於該集合；setup_created 表示可由 SetupAPI 移除。
     std::uint64_t pending_set{};bool setup_created{};
+    // CM_Create_DevNode(CM_CREATE_DEVNODE_PHANTOM) 建立的不存在 devnode；與登錄同步時保留此狀態（只在建立的程序內）。
+    bool phantom{};
 };
 bool supports_interface(const DeviceNode& node,const std::array<std::uint8_t,16>& guid){return node.interface_guid==guid || std::find(node.interface_aliases.begin(),node.interface_aliases.end(),guid)!=node.interface_aliases.end();}
 std::u16string folded(std::u16string value){for(auto& ch:value)if(ch>=u'A' && ch<=u'Z')ch+=32;return value;}
@@ -149,8 +153,19 @@ struct DeviceConfigurationState {
         std::array<std::uint8_t,16> class_guid{};bool filtered{};
         std::map<std::pair<std::uint32_t,std::uint32_t>,std::vector<driver_store::Model>> driver_lists;
         std::map<std::uint32_t,std::vector<std::uint8_t>> install_params; // 0 為整個集合的類別安裝參數。
+        // SetupDi(Get|Set)DeviceInstallParams：0 為整個集合；元素沒有自己的參數時沿用集合的參數。
+        struct InstallParams {std::uint32_t flags{},flags_ex{},reserved{};std::uint64_t parent{},handler{},context{},queue{},class_reserved{};std::u16string driver_path;};
+        std::map<std::uint32_t,InstallParams> device_install;
+        // SetupDiSetSelectedDevice 的選取元素；SetupDiSetSelectedDriver／SelectBestCompatDrv 的選取驅動（元素 0 為整個集合）→（清單型別, token）。
+        std::optional<std::uint32_t> selected_device;
+        std::map<std::uint32_t,std::pair<std::uint32_t,std::uint64_t>> selected_drivers;
     };
     std::map<std::uint64_t,InfoSet> sets;
+    // DevGetObjects／DevGetObjectProperties 配置的結果區塊（程序堆積），DevFreeObjects／DevFreeObjectProperties 釋放。
+    std::set<std::uint64_t> query_blocks;
+    // DevCreateObjectQuery 的非同步查詢：建立時取得結果區塊，執行緒池的 internal-devquery Deliver 依序送出回呼；delivering 為正在回呼的執行緒。
+    struct Query {std::uint64_t callback{},context{},block{},delivering{};std::uint32_t count{},flags{},next{};bool closed{},completed{},running{},closed_sent{};};
+    std::map<std::uint64_t,Query> queries;std::uint64_t next_query{0x6e000000};
     std::uint64_t next_set{0x69000000};
     std::uint64_t next_interface{0x6b000000};
     std::uint64_t next_driver{0x6d000000};
@@ -251,7 +266,7 @@ void WindowsServices::refresh_device_configuration(bool enumerate_hid){
                 node.problem=setup_problem(node);
                 text_property(node,23,u"EnumeratorName",node.enumerator);listed.insert(folded(node.id));
                 const auto existing=std::find_if(config.nodes.begin(),config.nodes.end(),[&](const auto& entry){return !entry.second.pending_set && folded(entry.second.id)==folded(node.id);});
-                if(existing!=config.nodes.end()){if(existing->second.setup_created)existing->second=std::move(node);continue;}
+                if(existing!=config.nodes.end()){if(existing->second.setup_created){const bool phantom=existing->second.phantom;existing->second=std::move(node);if(phantom){existing->second.phantom=true;existing->second.present=false;existing->second.status=0;existing->second.problem=0;}}continue;}
                 if(config.nodes.size()>=65536)break;
                 while(config.nodes.contains(config.next_dynamic_node)){if(config.next_dynamic_node==UINT32_MAX)throw std::bad_alloc{};++config.next_dynamic_node;}
                 config.nodes.emplace(config.next_dynamic_node++,std::move(node));
@@ -355,11 +370,81 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
     const auto machine_valid=[&](std::uint64_t handle){return !handle || (device_configuration_ && device_configuration_->machines.contains(handle));};
     if(machine_variant && !machine_valid(arg(service.arguments-1)))return finish(49);
     // 已提升的系統管理員權杖：裝置啟用／停用與類別屬性寫入共用。
-    const auto administrator=[&]{
-        initialize_tokens();const auto& token=runtime_.token_objects.at(effective_token_id());
-        return token.integrity>=0x3000U && std::any_of(token.groups.begin(),token.groups.end(),[](const auto& group){return group.sid==security::account_sid(*security::find_account("Administrators")) && (group.attributes&0x14U)==4U;});
-    };
+    const auto administrator=[&]{initialize_tokens();return elevated_administrator(runtime_.token_objects.at(effective_token_id()));};
     const auto read=[&](std::uint64_t pointer){return pointer?(wide?read_utf16(memory,GuestAddress{pointer},32768):utf8_to_utf16(read_ansi(memory,pointer,32768))):std::u16string{};};
+    if(name=="DevFreeObjects" || name=="DevFreeObjectProperties"){
+        // (count, pointer)：只釋放 DevGetObjects／DevGetObjectProperties 配置的區塊；NULL 或其他指標不處理。
+        if(arg(1) && device_configuration_ && device_configuration_->query_blocks.erase(arg(1)))(void)free_heap(memory,arg(1),state);
+        return finish(0);
+    }
+    if(service.family=="internal-devquery" && service.symbol=="Deliver"){
+        // 非同步裝置查詢的回呼（執行緒池）：依序送出 DevQueryResultAdd 與 DevQueryStateEnumCompleted；查詢被關閉時停止並釋放結果，
+        // DevQueryFlagAsyncClose 的查詢最後送出 DevQueryStateClosed。DEV_QUERY_RESULT_ACTION_DATA 與物件資料只在回呼期間有效。
+        return nested_continuation(state,memory,"裝置查詢回呼",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);const auto handle=call(0);const unsigned object_size=x86_?16U:32U,data_at=x86_?4U:8U;
+            const auto action=allocate_heap(m,data_at+object_size);
+            for(;;){
+                if(!device_configuration_)break;auto& queries=device_configuration_->queries;const auto found=queries.find(handle);if(found==queries.end())break;
+                auto& query=found->second;std::uint32_t kind=0,value=0;bool object=false;
+                if(!action){query.running=false;break;}
+                if(query.closed){
+                    if(query.block){(void)free_heap(m,query.block,s);query.block=0;}
+                    if(!(query.flags&8U) || query.closed_sent){queries.erase(found);break;}
+                    query.closed_sent=true;value=3; // DevQueryResultStateChange：DevQueryStateClosed
+                }else if(query.next<query.count){kind=1;object=true;}
+                else if(!query.completed){query.completed=true;value=1;} // DevQueryStateEnumCompleted
+                else{if(query.block){(void)free_heap(m,query.block,s);query.block=0;}query.running=false;break;}
+                m.write(GuestAddress{action},std::vector<std::uint8_t>(data_at+object_size));m.store(GuestAddress{action},32,kind);
+                if(object){std::vector<std::uint8_t> bytes(object_size);m.read(GuestAddress{query.block+static_cast<std::uint64_t>(query.next)*object_size},bytes);m.write(GuestAddress{action+data_at},bytes);++query.next;}
+                else m.store(GuestAddress{action+data_at},32,value);
+                query.delivering=threads_.current;const auto target=query.callback,context=query.context;
+                (void)co_await service_callback::call(target,{handle,context,action});
+                if(device_configuration_)if(const auto again=device_configuration_->queries.find(handle);again!=device_configuration_->queries.end())again->second.delivering=0;
+            }
+            if(action)(void)free_heap(m,action,s);
+            call.return_to(s,0);co_return std::optional<std::uint32_t>{};
+        });
+    }
+    if(name=="DevCloseObjectQuery"){
+        // 同步關閉：回呼正在其他執行緒執行時等它結束，返回後不再有回呼；在回呼中關閉不等待，回呼返回後由工作執行緒釋放。
+        // DevQueryFlagAsyncClose：立即返回，最後一個回呼是 DevQueryStateClosed。整個呼叫在續行中處理，等待後重新進入時由同一續行完成。
+        return nested_continuation(state,memory,"關閉裝置查詢",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);const auto handle=call(0);
+            const auto done=[&]{call.return_to(s,0);return std::optional<std::uint32_t>{};};
+            if(!device_configuration_)co_return done();
+            {auto& queries=device_configuration_->queries;const auto found=queries.find(handle);if(found==queries.end() || found->second.closed)co_return done();
+                auto& query=found->second;query.closed=true;
+                if(query.flags&8U){
+                    if(!query.running){query.running=true;
+                        if(queue_pool_callback(s,m,{resolve("internal-devquery","Deliver").value,{handle}})){if(query.block)(void)free_heap(m,query.block,s);queries.erase(found);}}
+                    co_return done();
+                }}
+            const auto sleep=resolve("kernel32.dll","Sleep").value;
+            for(;;){
+                if(!device_configuration_)break;auto& items=device_configuration_->queries;const auto item=items.find(handle);if(item==items.end())break;
+                if(item->second.delivering==threads_.current)break;
+                if(!item->second.delivering){if(item->second.block)(void)free_heap(m,item->second.block,s);items.erase(item);break;}
+                (void)co_await service_callback::call(sleep,{1});
+            }
+            co_return done();
+        });
+    }
+    if(name=="DevFindProperty"){
+        // (pKey, Store, pszLocaleName, cProperties, pProperties)：依鍵、存放區與地區名稱（皆為 NULL 或不分大小寫相同）找出 DEVPROPERTY，找不到回 NULL。
+        const unsigned property_size=x86_?40U:48U;const auto store=static_cast<std::uint32_t>(arg(1));const auto count=static_cast<std::uint32_t>(arg(3));
+        if(!arg(0) || (count && !arg(4)))return finish(0);
+        std::array<std::uint8_t,20> key{};memory.read(GuestAddress{arg(0)},key);
+        const auto fold=[](std::u16string text){for(auto& c:text)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);return text;};
+        const auto locale=arg(2)?std::optional{fold(read_utf16(memory,GuestAddress{arg(2)},256))}:std::nullopt;
+        for(std::uint32_t i=0;i<count;++i){
+            const auto at=arg(4)+static_cast<std::uint64_t>(i)*property_size;std::array<std::uint8_t,20> candidate{};memory.read(GuestAddress{at},candidate);
+            if(candidate!=key || memory.load(GuestAddress{at+20},32)!=store)continue;
+            const auto name_at=memory.load(GuestAddress{at+24},x86_?32:64);
+            if(!!name_at!=!!locale || (locale && fold(read_utf16(memory,GuestAddress{name_at},256))!=*locale))continue;
+            return finish(at);
+        }
+        return finish(0);
+    }
     if(!runtime_.network.external_io)throw HostCallFault("原生顯示裝置盤點不支援 deterministic compare");
     if(name=="D3DKMTQueryAdapterInfo"){
 #include "windows_d3dkmt_registry.inc"
@@ -409,6 +494,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
             }
         }
         if(name.starts_with("CM_Locate_DevNode") && folded(read(arg(1))).starts_with(u"hid\\"))enumerate_hid=true;
+        if(name.starts_with("DevGetObject") || ((name=="CM_Open_Device_Interface_KeyA" || name=="CM_Open_Device_Interface_KeyW") && arg(0) && folded(read(arg(0))).starts_with(u"\\\\?\\hid")))enumerate_hid=true;
         if((name.starts_with("CM_Get_Device_Interface_Property") || name.starts_with("CM_Set_Device_Interface_Property")) && arg(0) && folded(read(arg(0))).starts_with(u"\\\\?\\hid"))enumerate_hid=true;
         // 只讀既有裝置資訊集合成員的呼叫：集合成員在 SetupDiGetClassDevs 等建立時取快照（與 Windows 相同），走訪介面與取介面路徑
         // 不必重新盤點宿主裝置（每次約 0.2 ms：IOKit USB、序列埠、藍牙與登錄同步，且在協調者全停下執行）。《古墓奇兵：暗影》手把輪詢
@@ -420,6 +506,28 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
              name=="SetupDiEnumDeviceInfo" || name=="SetupDiDestroyDeviceInfoList");
         if(!set_member_read)refresh_device_configuration(enumerate_hid);
         const auto& nodes=device_configuration_->nodes;
+        // 裝置介面的 Device Parameters 鍵（SetupDiOpenDeviceInterfaceRegKey 與 CM_Open_Device_Interface_Key 共用）：第一次開啟時寫入 DeviceInstance、SymbolicLink（序列埠另有 PortName），
+        // 因此每個介面的鍵在此模型中都存在。回傳 Win32 錯誤與 HKEY。
+        const auto open_interface_key=[&](const DeviceNode& node,const std::array<std::uint8_t,16>& guid,std::uint32_t sam)->std::pair<std::uint32_t,std::uint64_t>{
+            if(runtime_.registry.handles.size()>=4096)return {8,0};
+            auto& registry=runtime_.registry;RegistryTransaction transaction(registry,registry_file_);if(transaction.error)return {transaction.error,0};
+            auto instance=node.port_name.empty()?node.id:node.port_name;std::replace(instance.begin(),instance.end(),u'\\',u'#');
+            const auto path=folded(std::u16string(1,2)+u"\\system\\currentcontrolset\\control\\deviceclasses\\"+guid_name(guid)+u"\\"+instance+u"\\#\\device parameters");
+            if(!registry.keys.contains(path)){
+                std::map<std::u16string,RegistryValue> values;
+                const auto add=[&](std::u16string key,std::u16string_view text){RegistryValue value;value.type=1;value.display_name=key;value.bytes=utf16_bytes(text);values.emplace(folded(std::move(key)),std::move(value));};
+                add(u"DeviceInstance",node.id);add(u"SymbolicLink",node.interface_path);if(!node.port_name.empty())add(u"PortName",node.port_name);
+                std::uint64_t added=0;for(const auto& [key,value]:values){(void)key;added+=value.bytes.size();}
+                if(registry.bytes+added>output_limit || registry.values+values.size()>4096 || registry.keys.size()+12>4096)return {8,0};
+                const auto before=registry;
+                for(std::size_t end=1;;){registry.keys.try_emplace(path.substr(0,end));end=path.find(u'\\',end+1);if(end==path.npos)break;}
+                registry.values+=static_cast<std::uint32_t>(values.size());registry.bytes+=added;registry.keys[path]=std::move(values);
+                if(const auto error=transaction.commit();error){registry=before;return {error,0};}
+            }
+            const auto handle=registry.next_handle++;
+            const auto access=sam&0x02000000U?0xf003fU:sam&~0x100U;
+            registry.handles.emplace(handle,RegistryHandle{path,access});return {0,handle};
+        };
         // 監視器節點要取得 gui_monitors()，原生 GUI 下會建立延遲的 AppKit（每程序約 0.12～0.23 秒），只查 HID、USB 或顯示配接器的無視窗程序不可付這個成本。
         // 節點尚未建立時，只有下列看得到監視器的呼叫才建立；之後由 refresh_device_configuration 持續同步。以 DEVINST、集合或介面 token 為輸入的入口
         // （CM_Get_Parent、CM_Get_DevNode_*、CM_Open_DevNode_Key、SetupDiEnum* 等）不列入：監視器的這些值只可能來自已建立的節點，且監視器沒有子節點，CM_Get_Parent 不會回傳它。
@@ -456,7 +564,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
                 const bool size=name.find("_Size")!=name.npos;
                 return monitor_guid(arg(size?1:0)) || starts(arg(size?2:1),display_identity::monitor_instance_prefix);
             }
-            if(name.starts_with("CM_Get_Device_Interface_Property") || name.starts_with("CM_Set_Device_Interface_Property"))return starts(arg(0),display_identity::monitor_interface_prefix);
+            if(name.starts_with("CM_Get_Device_Interface_Property") || name.starts_with("CM_Set_Device_Interface_Property") || name.starts_with("CM_Open_Device_Interface_Key"))return starts(arg(0),display_identity::monitor_interface_prefix);
+            // 裝置查詢列出全部裝置與介面，包含監視器。
+            if(name.starts_with("DevGetObject"))return true;
             return false;
         };
         if(device_configuration_->monitor_nodes.empty() && sees_monitor_nodes())sync_monitor_nodes(*device_configuration_,gui_monitors());
@@ -492,6 +602,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
             if(!arg(2) || capacity<required)return finish(26);auto bytes=wide?utf16_bytes(text):std::vector<std::uint8_t>(ansi.begin(),ansi.end());if(!wide)bytes.push_back(0);memory.write(GuestAddress{arg(2)},bytes);return finish(0);
         }
 #include "windows_device_interface_property_calls.inc"
+#include "windows_device_query.inc"
         if(name.starts_with("SetupDiClass") || name.starts_with("SetupDiGetClassDescription") || name.starts_with("SetupDiBuildClassInfoList") || name.starts_with("SetupDiOpenClassRegKey") ||
            name=="CM_Enumerate_Classes" || name.starts_with("CM_Get_Class_") || name.starts_with("CM_Open_Class_Key") || name.starts_with("CM_Set_Class_Registry_Property")){
 #include "windows_setup_classes.inc"
@@ -500,6 +611,39 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
         // SetupAPI 的集合只引用同一組 CM devnode；軟體 key 由共用裝置模型產生。
         if(name.starts_with("SetupDi") || name=="DiUninstallDevice"){
 #include "windows_setupapi.inc"
+        }
+        if(name=="CM_Create_DevNodeA" || name=="CM_Create_DevNodeW"){
+            // (pdnDevInst, pDeviceID, dnParent, ulFlags)：在 root 之下建立 root 列舉 devnode 並寫入 Enum\<instance>，與 SetupAPI 註冊的裝置同一模型（可由 DIF_REMOVE 移除）。
+            // CM_CREATE_DEVNODE_GENERATE_ID：pDeviceID 為裝置名稱，實例編號取最小未使用的四位數；否則須為 ROOT\<裝置>\<實例>。
+            // CM_CREATE_DEVNODE_PHANTOM 建立不存在的 devnode；NO_WAIT_INSTALL／DO_NOT_INSTALL 不改變狀態（沒有安裝程序可啟動），裝置停在 CM_PROB_FAILED_INSTALL。
+            const auto flags=static_cast<std::uint32_t>(arg(3));
+            if(!arg(0) || !arg(1))return finish(3);if(flags&~0xfU)return finish(4);
+            if(static_cast<std::uint32_t>(arg(2))!=1)return finish(5);
+            if(!administrator())return finish(0x33);
+            auto& all=device_configuration_->nodes;auto requested=read(arg(1));for(auto& c:requested)if(c>=u'a' && c<=u'z')c=static_cast<char16_t>(c-32);
+            std::u16string id;
+            if(flags&4U){
+                if(requested.empty() || requested.find(u'\\')!=requested.npos || requested.size()>200)return finish(0x1e);
+                for(unsigned number=0;number<10000 && id.empty();++number){
+                    const auto digits=std::to_string(number);auto candidate=u"ROOT\\"+requested+u"\\"+std::u16string(4-digits.size(),u'0');candidate.append(digits.begin(),digits.end());
+                    if(std::none_of(all.begin(),all.end(),[&](const auto& item){return folded(item.second.id)==folded(candidate);}))id=std::move(candidate);
+                }
+                if(id.empty())return finish(0x10);
+            }else{
+                const auto first=requested.find(u'\\'),second=first==requested.npos?requested.npos:requested.find(u'\\',first+1);
+                if(second==requested.npos || second==first+1 || second+1>=requested.size() || requested.find(u'\\',second+1)!=requested.npos || requested.size()>200 || requested.substr(0,first)!=u"ROOT")return finish(0x1e);
+                if(std::any_of(all.begin(),all.end(),[&](const auto& item){return folded(item.second.id)==folded(requested);}))return finish(0x10);
+                id=std::move(requested);
+            }
+            auto& configuration=*device_configuration_;if(all.size()>=65536)return finish(2);
+            while(all.contains(configuration.next_dynamic_node)){if(configuration.next_dynamic_node==UINT32_MAX)return finish(2);++configuration.next_dynamic_node;}
+            memory.check(GuestAddress{arg(0)},4,Access::Write);
+            DeviceNode node;node.id=std::move(id);node.enumerator=u"ROOT";node.parent=1;node.setup_created=true;node.phantom=(flags&2U)!=0;node.present=!node.phantom;
+            text_property(node,23,u"EnumeratorName",node.enumerator);number_property(node,11,u"ConfigFlags",0x40U); // CONFIGFLAG_FINISH_INSTALL
+            node.status=node.present?0x0401U:0U;node.problem=node.present?setup_problem(node):0U; // DN_HAS_PROBLEM｜DN_ROOT_ENUMERATED
+            if(const auto error=write_enum_key(runtime_.registry,registry_file_,node,output_limit))return finish(error==8?2U:0x1dU);
+            const auto handle=configuration.next_dynamic_node++;all.emplace(handle,std::move(node));
+            memory.store(GuestAddress{arg(0)},32,handle);return finish(0);
         }
         if(name.starts_with("CM_Locate_DevNode")){
             if(!arg(0))return finish(3);if(arg(2)&~3U)return finish(4);const auto id=folded(read(arg(1)));
@@ -628,7 +772,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_device_configuration(GuestS
         throw HostCallFault("尚未實作裝置組態服務："+std::string(name));
     }catch(const driver_store::Error& error){last_error_=error.code;return finish(0);}
     catch(const std::invalid_argument&){if(name.starts_with("CM_"))return finish(31);last_error_=13;return finish(0);}
-    catch(const MemoryFault&){if(name.starts_with("Setup") || name.starts_with("Di")){last_error_=87;return finish(name.starts_with("SetupDiGetClassDevs") || name.starts_with("SetupDiCreateDeviceInfoList") || name=="SetupDiOpenDevRegKey" || name=="SetupDiOpenDeviceInterfaceRegKey"?(x86_?UINT32_MAX:UINT64_MAX):0);}return finish(3);}
-    catch(const std::bad_alloc&){if(name.starts_with("Setup") || name.starts_with("Di")){last_error_=8;return finish(name.starts_with("SetupDiGetClassDevs") || name.starts_with("SetupDiCreateDeviceInfoList") || name=="SetupDiOpenDevRegKey" || name=="SetupDiOpenDeviceInterfaceRegKey"?(x86_?UINT32_MAX:UINT64_MAX):0);}return finish(2);}
+    catch(const MemoryFault&){if(name.starts_with("Setup") || name.starts_with("Di")){last_error_=87;return finish(name.starts_with("SetupDiGetClassDevs") || name.starts_with("SetupDiCreateDeviceInfoList") || name=="SetupDiOpenDevRegKey" || name.starts_with("SetupDiCreateDevRegKey") || name=="SetupDiOpenDeviceInterfaceRegKey"?(x86_?UINT32_MAX:UINT64_MAX):0);}return finish(3);}
+    catch(const std::bad_alloc&){if(name.starts_with("Setup") || name.starts_with("Di")){last_error_=8;return finish(name.starts_with("SetupDiGetClassDevs") || name.starts_with("SetupDiCreateDeviceInfoList") || name=="SetupDiOpenDevRegKey" || name.starts_with("SetupDiCreateDevRegKey") || name=="SetupDiOpenDeviceInterfaceRegKey"?(x86_?UINT32_MAX:UINT64_MAX):0);}return finish(2);}
 }
 }

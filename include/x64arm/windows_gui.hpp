@@ -1,4 +1,5 @@
 #pragma once
+#include "x64arm/windows_popup_position.hpp"
 #include "x64arm/windows_printing.hpp"
 #include "x64arm/windows_gui_drag.hpp"
 #include "x64arm/windows_ole_drag.hpp"
@@ -514,6 +515,7 @@ struct GuiWindow {
     std::uint32_t check{}, text_limit{32767};
     std::uint64_t dpi_context{UINT64_MAX};
     bool nonclient_dpi_scaling{};
+    std::uint32_t dpi_hosting{}; // 建立時建立執行緒的 DPI_HOSTING_BEHAVIOR（GetWindowDpiHostingBehavior）
     std::uint32_t context_help_id{}; // SetWindowContextHelpId
     // SetGestureConfig：手勢 ID →（想要, 封鎖）；未設定的 ID 沿用預設。
     std::map<std::uint32_t,std::pair<std::uint32_t,std::uint32_t>> gesture_config{};
@@ -689,7 +691,9 @@ struct GuiMdiMove {
 // message：SetTimer 為 WM_TIMER（0x113），SetSystemTimer 為 WM_SYSTIMER（0x118）；系統計時器在表中的 ID 帶 gui_system_timer_bit，與同 ID 的一般計時器分開。
 inline constexpr std::uint64_t gui_system_timer_bit=UINT64_C(1)<<63;
 struct GuiTimer {std::uint64_t deadline{},interval{},procedure{},thread{},coalescing_tolerance{};std::uint32_t message{0x113};bool operator==(const GuiTimer&) const = default;};
-struct GuiThemeData {std::u16string class_name;std::uint64_t window{};std::uint32_t dpi{96},flags{};bool operator==(const GuiThemeData&)const=default;};
+struct GuiThemeData {std::u16string class_name;std::uint64_t window{};std::uint32_t dpi{96},flags{};
+    // GetThemeBitmap(GBF_DIRECT) 的點陣圖屬於主題 handle：(part, state, 屬性) → HBITMAP，CloseThemeData 時刪除。
+    std::map<std::array<std::int32_t,3>,std::uint64_t> bitmaps{};bool operator==(const GuiThemeData&)const=default;};
 struct GuiThemeMetrics {
     std::array<std::int32_t,2> minimum{},intrinsic{};
     std::array<std::int32_t,4> content{};
@@ -709,7 +713,7 @@ struct GuiMenuInfo {std::uint32_t style{},help_id{};std::uint64_t data{};bool op
 struct GuiMenuSelection {std::uint64_t command{},menu{};std::uint32_t position{};};
 struct GuiMenuHighlight {std::uint64_t menu{};std::uint32_t position{};bool mouse{};};
 struct GuiPopupItem {std::uint64_t id{};std::uint32_t flags{};std::u16string text{};std::vector<GuiPopupItem> children{};std::uint64_t menu{};std::uint32_t position{};GuiIcon bitmap{},checked_bitmap{},unchecked_bitmap{};bool custom_checkmarks{};bool operator==(const GuiPopupItem&) const = default;};
-struct GuiMenuTrack {std::uint64_t menu{},owner{},selection{},thread{};std::uint32_t flags{};std::int32_t x{},y{};std::vector<std::uint64_t> initialized{};bool selected{},active{true},cancelled{},idle_notified{};std::uint64_t root_menu{},selected_menu{};std::uint32_t root_index{},selected_position{};bool main_bar{};void cancel(){cancelled=true;selected=false;}bool operator==(const GuiMenuTrack&) const = default;};
+struct GuiMenuTrack {std::array<std::int32_t,4> exclude{};std::uint64_t menu{},owner{},selection{},thread{};std::uint32_t flags{};std::int32_t x{},y{};std::vector<std::uint64_t> initialized{};bool selected{},active{true},cancelled{},idle_notified{};std::uint64_t root_menu{},selected_menu{};std::uint32_t root_index{},selected_position{};bool main_bar{};void cancel(){cancelled=true;selected=false;}bool operator==(const GuiMenuTrack&) const = default;};
 struct GuiSentMessage {
     GuiMessage message{};
     std::uint64_t sender{},receiver{},sender_stack{},sender_rip{},result{},resume_modal{};
@@ -994,6 +998,38 @@ struct GuiPageSetup {
     std::vector<std::uint64_t> scratch;
     bool operator==(const GuiPageSetup&)const=default;
 };
+// PrintDlg（經典 PRINTDLG）：列印與列印設定對話方塊共用同一份狀態；print_window／setup_window 為目前開啟中的對話方塊，
+// opening_setup 表示下一個 WM_INITDIALOG 屬於列印設定。
+struct GuiClassicPrint {
+    std::uint64_t request{},owner{},instance{},print_hook{},setup_hook{},setup_source{},print_window{},setup_window{};
+    std::uint32_t flags{},from{},to{},minimum{},maximum{};
+    bool wide{true},opening_setup{};
+    PrinterSettings settings{};
+    std::vector<PrinterSettings> forms{};
+    bool operator==(const GuiClassicPrint&)const=default;
+};
+// FindText／ReplaceText：非模態尋找／取代對話方塊；window 於 WM_INITDIALOG 記下，WM_NCDESTROY 時移除。
+struct GuiFindReplace {
+    std::uint64_t request{},owner{},hook{},window{};
+    bool wide{true},replace{};
+    bool operator==(const GuiFindReplace&)const=default;
+};
+// IFileOpenDialog／IFileSaveDialog：物件狀態；events 為 Advise 的 cookie → IFileDialogEvents（已 AddRef）。
+struct GuiFileDialog {
+    std::uint32_t references{1},options{},type_index{1},next_cookie{1},close_result{};
+    bool save{},showing{},closed{},append_default{true},has_client{};
+    std::vector<std::pair<std::u16string,std::u16string>> types{};
+    std::u16string title{},ok_label{},file_name_label{},file_name{},default_extension{},folder{},default_folder{};
+    std::vector<std::u16string> results{},places{};
+    std::map<std::uint32_t,std::uint64_t> events{};
+    std::array<std::uint8_t,16> client{};
+    std::uint64_t properties{},collected{};
+    bool operator==(const GuiFileDialog&)const=default;
+};
+struct GuiFileDialogFactory {
+    bool save{};std::uint32_t references{1};
+    bool operator==(const GuiFileDialogFactory&)const=default;
+};
 struct GuiPrintServices {
     std::uint32_t references{1};std::uint64_t window{};bool wide{true};
     bool operator==(const GuiPrintServices&)const=default;
@@ -1175,6 +1211,13 @@ struct GuiState : GuiStationNamespace {
     std::map<std::uint64_t,GuiPropertyPage> property_pages;
     std::map<std::uint64_t,GuiPrintDialog> print_dialogs;
     std::map<std::uint64_t,GuiPageSetup> page_setups;
+    std::map<std::uint64_t,GuiClassicPrint> classic_prints;
+    std::map<std::uint64_t,GuiFindReplace> find_replaces;
+    std::map<std::uint64_t,GuiFileDialog> file_dialogs;
+    std::map<std::uint64_t,GuiFileDialogFactory> file_dialog_factories;
+    // SetClientGuid 的資料：每個用戶端 GUID 上次確定的資料夾（程序存續期間）。
+    std::map<std::array<std::uint8_t,16>,std::u16string> file_dialog_folders;
+    std::uint64_t file_open_dialog_vtable{},file_save_dialog_vtable{},file_dialog_factory_vtable{};std::uint32_t file_dialog_locks{};
     std::map<std::uint64_t,GuiPrintServices> print_services;
     std::uint64_t print_services_vtable{};
     std::vector<std::uint64_t> z_order;
@@ -1241,6 +1284,12 @@ struct GuiState : GuiStationNamespace {
     GuiIcon default_application_icon{};bool application_icon_loaded{};
     std::map<std::uint64_t,GuiImageList> image_lists{};
     std::uint64_t shell_large_image_list{},shell_small_image_list{};
+    // SHGetImageList 的其他尺寸（48、256 等）：與大小清單共用同一組索引。
+    std::map<std::uint32_t,std::uint64_t> shell_sized_image_lists{};
+    // SHGetImageList 已替 shell 保留一個 IImageList 參考的清單（應用程式 Release 不會銷毀系統影像清單）。
+    std::set<std::uint64_t> shell_pinned_image_lists{};
+    // OleSetMenuDescriptor：框架視窗 → 目前開啟的頂層選單是否屬於就地啟動的物件。
+    std::map<std::uint64_t,bool> ole_menu_object{};
     // Shell_GetCachedImageIndex：「小寫路徑|索引」→ 系統影像清單索引；SHCreateFileExtractIconW 的 IExtractIconW 物件。
     std::map<std::u16string,std::uint32_t> shell_cached_icons;
     struct ShellExtractIcon {std::u16string path;std::uint32_t attributes{},references{1};bool operator==(const ShellExtractIcon&) const = default;};
@@ -1294,6 +1343,9 @@ struct GuiState : GuiStationNamespace {
     // uxtheme 緩衝繪製：記憶體 DC 承接繪製，EndBufferedPaint 依 BLENDFUNCTION 或 SRCCOPY 寫回目標。
     struct BufferedPaint {std::uint64_t target{},dc{},bitmap{},previous{},bits{};std::array<std::int32_t,4> rect{},exclude{};std::uint32_t format{},blend{};bool excluded{},blended{};bool operator==(const BufferedPaint&)const=default;};
     std::map<std::uint64_t,BufferedPaint> buffered_paints{};std::uint32_t buffered_paint_inits{};
+    // uxtheme 緩衝動畫：from／to 兩個緩衝；EndBufferedAnimation 後依時間在 BufferedPaintRenderAnimation 混合兩者，結束時畫 to 並釋放。
+    struct BufferedAnimation {std::uint64_t window{},target{};BufferedPaint from{},to{};std::uint32_t style{},duration{};std::uint64_t started{};bool has_from{},running{};bool operator==(const BufferedAnimation&)const=default;};
+    std::map<std::uint64_t,BufferedAnimation> buffered_animations{};
     // D3DKMT 配接器 handle（同一個虛擬顯示配接器可被開啟多次）。
     std::set<std::uint32_t> kmt_adapters{};std::uint32_t next_kmt_adapter{0x40000040U};
     // D3DKMT 裝置：所屬介面卡與佇列上限；VidPn 來源 0 的擁有者裝置與擁有類型（D3DKMT_VIDPNSOURCEOWNER_TYPE）。
@@ -1454,7 +1506,7 @@ public:
         (void)popup;return popup_menu(owner,items,x,y,flags,idle);
     }
     // 高亮通知可同步改變選單狀態；false 表示客體取消或項目已失效。
-    virtual std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags,const std::function<bool()>& idle,const std::function<bool(std::uint64_t,std::uint32_t,bool)>& popup,const std::function<bool(const GuiMenuHighlight&)>& highlight) {
+    virtual std::optional<GuiMenuSelection> popup_menu(std::uint64_t owner,const std::vector<GuiPopupItem>& items,std::int32_t x,std::int32_t y,std::uint32_t flags,const std::function<bool()>& idle,const std::function<bool(std::uint64_t,std::uint32_t,bool)>& popup,const std::function<bool(const GuiMenuHighlight&)>& highlight,const GuiPopupPlacement* =nullptr) {
         (void)highlight;return popup_menu(owner,items,x,y,flags,idle,popup);
     }
     virtual void graphics_text(std::uint64_t,const GuiDraw&) {}

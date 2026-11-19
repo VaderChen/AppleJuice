@@ -15,9 +15,9 @@
 
 namespace x64arm::detail {
 // ObjectTypeIndex 是本虛擬平台的目錄索引，NtQueryObject 與系統快照共用。
-inline constexpr std::array<std::u16string_view,16> system_object_types{
+inline constexpr std::array<std::u16string_view,17> system_object_types{
     u"Process",u"Thread",u"File",u"Token",u"PowerRequest",u"Job",u"IoCompletion",u"Section",
-    u"Key",u"Event",u"Semaphore",u"Timer",u"WaitCompletionPacket",u"Mutant",u"Directory",u"TmTx"};
+    u"Key",u"Event",u"Semaphore",u"Timer",u"WaitCompletionPacket",u"Mutant",u"Directory",u"TmTx",u"SymbolicLink"};
 inline std::uint16_t system_object_type_index(std::u16string_view type){
     for(std::size_t n=0;n<system_object_types.size();++n)if(system_object_types[n]==type)return static_cast<std::uint16_t>(n+2);
     return 0;

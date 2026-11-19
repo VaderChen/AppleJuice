@@ -11,6 +11,7 @@
 #include "guest_crt_state.h"
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <span>
 #include <bit>
@@ -774,7 +775,8 @@ std::span<const WindowsServiceDescriptor> locale_service_descriptors(){
         {"kernel32.dll","InvalidateNLSCache",0},{"kernel32.dll","IdnToNameprepUnicode",5},{"normaliz.dll","IdnToNameprepUnicode",5},
         {"kernel32.dll","GetThreadLocale",0},{"kernel32.dll","SetThreadLocale",1},{"kernel32.dll","GetThreadUILanguage",0},{"kernel32.dll","SetThreadUILanguage",1},
         {"kernel32.dll","GetThreadPreferredUILanguages",4},{"kernel32.dll","SetThreadPreferredUILanguages",3},{"kernel32.dll","GetUserPreferredUILanguages",4},
-        {"kernel32.dll","GetSystemPreferredUILanguages",4},{"kernel32.dll","GetProcessPreferredUILanguages",4},{"kernel32.dll","SetProcessPreferredUILanguages",3}
+        {"kernel32.dll","GetSystemPreferredUILanguages",4},{"kernel32.dll","GetProcessPreferredUILanguages",4},{"kernel32.dll","SetProcessPreferredUILanguages",3},
+        {"kernel32.dll","GetFileMUIPath",7}
     };return table;
 }
 namespace {
@@ -2114,6 +2116,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_locale(GuestState& state,Gu
         auto* target=thread?current_thread_ui_languages():&runtime_.preferred_ui_languages;if(!target)return fail(87);
         *target=std::move(languages);return finish(1);
     }
+#include "windows_file_mui_path.inc"
     if(name=="GetThreadUILanguage" || name=="SetThreadUILanguage"){
         // SetThreadUILanguage 等同只設定一個執行緒偏好 UI 語言；0 表示沿用目前語言。
         auto* thread=current_thread_ui_languages();

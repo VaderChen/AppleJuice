@@ -4,6 +4,7 @@
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/unicode.hpp"
 #include "window_presentation_fault.hpp"
+#include "clipboard_formats.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -108,10 +109,85 @@ int open_window_file(const std::string &name) {
 }
 #endif
 } // namespace
+std::uint32_t clipboard_format_id(GuiStationNamespace& station, const std::string& directory,
+                                  std::u16string_view station_name, std::u16string_view name,
+                                  std::uint32_t id) {
+    const auto fold = [](std::u16string_view text) {
+        std::u16string key(text);
+        for (auto& ch : key) ch = unicode_case_unit(ch, true);
+        return key;
+    };
+    const auto key = fold(name);
+    const auto lookup = [&]() -> std::uint32_t {
+        if (name.empty()) return station.clipboard_format_names.contains(id) ? id : 0;
+        const auto found = station.clipboard_formats.find(key);
+        return found == station.clipboard_formats.end() ? 0 : found->second;
+    };
+    if (name.empty() && (id < 0xc000 || id > 0xffff)) return 0;
+    if (const auto known = lookup()) return known;
+    const auto remember = [&](std::u16string_view text) {
+        const auto next = station.clipboard_next_format;
+        station.clipboard_format_names.emplace(next, text);
+        station.clipboard_formats.emplace(fold(text), next);
+        ++station.clipboard_next_format;
+        return next;
+    };
+#if !defined(_WIN32)
+    if (!directory.empty()) {
+        const auto station_key = fold(station_name);
+        std::uint64_t hash = UINT64_C(14695981039346656037);
+        for (auto ch : station_key) { hash ^= ch; hash *= UINT64_C(1099511628211); }
+        SharedFd file{open_window_file(directory + "/clipboard-formats-v1-" + std::to_string(hash))};
+        FileLock lock(file.fd);
+        using Record = std::array<char16_t, 256>;
+        struct stat info{};
+        if (::fstat(file.fd, &info) || info.st_size > static_cast<off_t>(0x4001 * sizeof(Record)))
+            throw HostCallFault("剪貼簿格式表大小無效");
+        // 僅發布完整紀錄；中斷寫入留下的尾端由持鎖的下一次寫入覆蓋。
+        const auto records = static_cast<std::size_t>(info.st_size) / sizeof(Record);
+        const auto transfer = [&](Record& record, std::size_t index, bool write) {
+            const auto offset = static_cast<off_t>(index * sizeof(Record));
+            ssize_t count;
+            do {
+                count = write ? ::pwrite(file.fd, record.data(), sizeof(record), offset)
+                              : ::pread(file.fd, record.data(), sizeof(record), offset);
+            } while (count < 0 && errno == EINTR);
+            if (count != sizeof(record)) throw HostCallFault("剪貼簿格式表讀寫失敗");
+        };
+        if (station_key.size() >= Record{}.size()) throw HostCallFault("剪貼簿視窗站名稱過長");
+        Record header{};
+        std::copy(station_key.begin(), station_key.end(), header.begin());
+        if (!records) transfer(header, 0, true);
+        else {
+            Record existing{};
+            transfer(existing, 0, false);
+            if (existing != header) throw HostCallFault("剪貼簿格式表視窗站不符");
+        }
+        for (std::size_t i = 1 + station.clipboard_next_format - 0xc000; i < records; ++i) {
+            Record slot{};
+            transfer(slot, i, false);
+            const auto end = std::find(slot.begin(), slot.end(), u'\0');
+            if (end == slot.begin() || end == slot.end()) throw HostCallFault("無效的剪貼簿格式名稱");
+            remember({slot.data(), static_cast<std::size_t>(end - slot.begin())});
+        }
+        if (const auto known = lookup()) return known;
+        if (name.empty() || station.clipboard_next_format > 0xffff) return 0;
+        Record slot{};
+        std::copy(name.begin(), name.end(), slot.begin());
+        transfer(slot, 1 + station.clipboard_next_format - 0xc000, true);
+    }
+#endif
+    if (name.empty() || station.clipboard_next_format > 0xffff) return 0;
+    return remember(name);
+}
 struct SharedWindowState {
     std::string directory;
     SharedWindowTable *table{};
     std::map<std::uint64_t, SharedWindowInfo> published;
+    std::map<std::uint64_t, std::u16string> long_captions;
+    std::string caption_path(std::uint64_t handle) const {
+        return directory + "/caption-" + std::to_string(handle);
+    }
     std::map<std::uint64_t, std::uint32_t> frames;
     std::map<std::uint64_t, std::shared_ptr<RasterSurface>> surfaces;
     // 各影格表面建立時綁定的原生 view；view 晚於第一張影格出現或被重建時須改綁。
@@ -167,10 +243,15 @@ struct SharedWindowState {
 #if !defined(_WIN32)
         if(std::getenv("X64ARM_SHARED_FRAME_TRACE"))std::fprintf(stderr,"[shared-frame-mapping] cache=%u builds=%llu hits=%llu\n",cache_frames?1U:0U,static_cast<unsigned long long>(mapping_builds),static_cast<unsigned long long>(mapping_hits));
         if (table) {
+            const bool locked = !long_captions.empty() && !lock_file(descriptor, LOCK_EX);
             for (auto h : allocated) {
                 auto &slot = table->slots[h % window_slots];
                 if (__atomic_load_n(&slot.handle, __ATOMIC_ACQUIRE) == h)
                     __atomic_store_n(&slot.handle, 0U, __ATOMIC_RELEASE);
+            }
+            if (locked) {
+                for (const auto& item : long_captions) (void)::unlink(caption_path(item.first).c_str());
+                (void)lock_file(descriptor, LOCK_UN);
             }
             ::munmap(table, sizeof(SharedWindowTable));
         }
@@ -293,10 +374,36 @@ void WindowsServices::publish_gui_window(std::uint64_t handle) {
     if (!shared.allocated.contains(handle))
         return;
     const auto info = describe_gui_window(handle);
-    if (const auto old = shared.published.find(handle); old != shared.published.end() && old->second == info)
+    const auto& title = gui_.windows.at(handle).title;
+    const bool overflow = title.size() >= info.title.size();
+    const auto previous = shared.long_captions.find(handle);
+    const bool changed = overflow ? previous == shared.long_captions.end() || previous->second != title
+                                  : previous != shared.long_captions.end();
+    if (const auto old = shared.published.find(handle); !changed && old != shared.published.end() && old->second == info)
         return;
     // 只在欄位有變化時發布；結構尾端 padding 不屬於視窗狀態。
     std::lock_guard lock(shared);
+#if !defined(_WIN32)
+    if (changed) {
+        const auto path = shared.caption_path(handle);
+        if (overflow) {
+            const auto staging = path + ".new";
+            SharedFd file{open_window_file(staging)};
+            const auto bytes = title.size() * sizeof(char16_t);
+            ssize_t written;
+            do { written = ::pwrite(file.fd, title.data(), bytes, 0); } while (written < 0 && errno == EINTR);
+            if (written != static_cast<ssize_t>(bytes) || ::ftruncate(file.fd, static_cast<off_t>(bytes)) ||
+                ::rename(staging.c_str(), path.c_str())) {
+                (void)::unlink(staging.c_str());
+                throw HostCallFault("無法發布跨程序視窗標題");
+            }
+            shared.long_captions[handle] = title;
+        } else {
+            if (::unlink(path.c_str()) && errno != ENOENT) throw HostCallFault("無法移除跨程序視窗標題");
+            shared.long_captions.erase(previous);
+        }
+    }
+#endif
     shared.published[handle] = info;
     auto &slot = shared.table->slots[handle % window_slots];
     std::array<std::uint32_t, sizeof(info) / 4> words{};
@@ -316,6 +423,9 @@ void WindowsServices::unpublish_gui_window(std::uint64_t handle) {
     if (__atomic_load_n(&slot.handle, __ATOMIC_ACQUIRE) == handle &&
         __atomic_load_n(&slot.owner, __ATOMIC_ACQUIRE) == process_id())
         __atomic_store_n(&slot.handle, 0U, __ATOMIC_RELEASE);
+#if !defined(_WIN32)
+    if (shared.long_captions.erase(handle)) (void)::unlink(shared.caption_path(handle).c_str());
+#endif
     shared.published.erase(handle);
     shared.allocated.erase(handle);
     shared.frames.erase(handle);
@@ -455,7 +565,12 @@ bool WindowsServices::invoke_remote_gui(GuestState &state, GuestMemory &memory,
     const auto handle = symbol == "WindowFromDC" ? (arg(0) >= 0x10000000 ? arg(0) - 0x10000000 : 0) : arg(0);
     if (gui_.windows.contains(handle))
         return false;
-    const auto found = shared_gui_window(handle, false);
+    auto found = shared_gui_window(handle, false);
+    std::unique_lock<SharedWindowState> caption_lock;
+    if (found && symbol.starts_with("GetWindowText") && found->title[found->title.size() - 2]) {
+        caption_lock = std::unique_lock(*shared_windows_);
+        found = shared_gui_window(handle, false);
+    }
     if (!found)
         return false;
     const auto &w = *found;
@@ -568,10 +683,28 @@ bool WindowsServices::invoke_remote_gui(GuestState &state, GuestMemory &memory,
     } else {
         const bool wide = symbol.ends_with('W'), cls = symbol.starts_with("GetClassName"),
                    length = symbol.starts_with("GetWindowTextLength");
-        const auto value = cls ? std::u16string(w.class_name.data()) : std::u16string(w.title.data());
+        auto value = cls ? std::u16string(w.class_name.data()) : std::u16string(w.title.data());
+#if !defined(_WIN32)
+        if (!cls && value.size() == w.title.size() - 1) {
+            SharedFd file{::open(shared_windows_->caption_path(handle).c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC)};
+            if (file.fd >= 0) {
+                struct stat st{};
+                if (::fstat(file.fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != ::geteuid() ||
+                    (st.st_mode & 077) || st.st_nlink != 1 || st.st_size < 0 ||
+                    st.st_size % static_cast<off_t>(sizeof(char16_t)) || static_cast<std::uint64_t>(st.st_size) > output_limit)
+                    throw HostCallFault("跨程序視窗標題檔案無效");
+                const auto bytes = static_cast<std::size_t>(st.st_size);
+                value.resize(bytes / sizeof(char16_t));
+                ssize_t count;
+                do { count = ::pread(file.fd, value.data(), bytes, 0); } while (count < 0 && errno == EINTR);
+                if (count != st.st_size) throw HostCallFault("跨程序視窗標題不完整");
+            } else if (errno != ENOENT) throw HostCallFault("無法讀取跨程序視窗標題");
+        }
+#endif
+        if (caption_lock.owns_lock()) caption_lock.unlock();
         if (length)
             result = wide ? value.size() : utf16_to_utf8(value).size();
-        else if (arg(2)) {
+        else if (arg(1) && static_cast<std::int32_t>(arg(2)) > 0) {
             const auto capacity = static_cast<std::uint32_t>(arg(2));
             if (wide) {
                 result = std::min<std::size_t>(value.size(), capacity - 1);
@@ -580,6 +713,7 @@ bool WindowsServices::invoke_remote_gui(GuestState &state, GuestMemory &memory,
                 const auto text = utf16_to_utf8(value);
                 std::vector<std::uint8_t> bytes(text.begin(), text.end());
                 result = std::min<std::size_t>(bytes.size(), capacity - 1);
+                while (result && result < bytes.size() && (bytes[result] & 0xc0) == 0x80) --result;
                 bytes.resize(result);
                 bytes.push_back(0);
                 memory.write(GuestAddress{arg(1)}, bytes);

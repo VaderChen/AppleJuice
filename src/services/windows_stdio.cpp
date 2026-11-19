@@ -3,6 +3,8 @@
 #include "windows_console_encoding.hpp"
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include "x64arm/unicode.hpp"
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -147,6 +149,16 @@ FileIoResult WindowsServices::write_standard_output(unsigned stream,std::span<co
     if(stream<1 || stream>2 || (!retained && !standard_open_[stream]))return {0,6};
     const auto input_size=bytes.size();std::string converted;
     if(!unicode && console_handle(0x100+stream)){converted=console_output_text(*consoles_[stream]->buffer,std::string_view(reinterpret_cast<const char*>(bytes.data()),bytes.size()));bytes=std::span(reinterpret_cast<const std::uint8_t*>(converted.data()),converted.size());}
+    static const bool trace=[] {const auto* value=std::getenv("X64ARM_TRACE_STDIO");return value && *value && std::string_view(value)!="0";}();
+    if(trace && !bytes.empty()){
+        // 原生主控台亦可保留有界文字預覽；不改變原有輸出目的、內容與回傳值。
+        constexpr char hex[]="0123456789abcdef";std::string preview;
+        for(const auto byte:bytes.first(std::min<std::size_t>(bytes.size(),512))){
+            if(byte>=32 && byte<127 && byte!='\\')preview.push_back(static_cast<char>(byte));
+            else{preview+="\\x";preview.push_back(hex[byte>>4]);preview.push_back(hex[byte&15]);}
+        }
+        std::fprintf(stderr,"[guest_stdio] pid=%u stream=%u requested_bytes=%zu preview=%s\n",process_id(),stream,input_size,preview.c_str());
+    }
     if(console_handle(0x100+stream) && consoles_[stream]->buffer->window){
         auto& buffer=*consoles_[stream]->buffer;if(buffer.window->closed())return {0,109};
         buffer.write(std::string_view(reinterpret_cast<const char*>(bytes.data()),bytes.size()));

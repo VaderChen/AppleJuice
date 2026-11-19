@@ -29,6 +29,7 @@
 #include <chrono>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <set>
 #include <sstream>
 #include <algorithm>
@@ -118,6 +119,294 @@ bool equal_result(const ExecutionResult& a, const ExecutionResult& b) {
     return a.reason == b.reason && a.completed == b.completed && a.rip == b.rip && a.exit_code == b.exit_code &&
         a.fault_address == b.fault_address && a.fault_access == b.fault_access && a.fault_size == b.fault_size;
 }
+std::optional<ExecutionResult> compare_aot_span(AotEngine& engine,GuestState& state,GuestMemory& memory,
+                                               const RunOptions& options,std::ostream& diagnostics,
+                                               const std::filesystem::path& source){
+    const auto* begin=std::getenv("X64ARM_AOT_COMPARE_BEGIN");
+    if(!begin || !*begin)return {};
+    if(const auto* image=std::getenv("X64ARM_AOT_COMPARE_IMAGE");image && *image){
+        std::error_code error;
+        if(source.empty() || !std::filesystem::equivalent(source,image,error))return {};
+    }
+    const auto* end=std::getenv("X64ARM_AOT_COMPARE_END");
+    if(!end || !*end || options.max_instructions!=UINT64_MAX)
+        throw std::invalid_argument("AOT 區段對照需要結束位址與無上限常駐執行");
+    const GuestAddress first{number(begin)};
+    std::optional<Gpr> first_register;
+    std::uint64_t first_value{};
+    const auto* register_setting=std::getenv("X64ARM_AOT_COMPARE_BEGIN_REGISTER");
+    const auto* value_setting=std::getenv("X64ARM_AOT_COMPARE_BEGIN_VALUE");
+    if((register_setting && *register_setting) || (value_setting && *value_setting)){
+        if(!register_setting || !*register_setting || !value_setting || !*value_setting)
+            throw std::invalid_argument("AOT 開始條件須同時指定暫存器與數值");
+        constexpr std::array<std::string_view,16> names{
+            "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+            "r8","r9","r10","r11","r12","r13","r14","r15"};
+        std::string name{register_setting};for(auto& c:name)if(c>='A' && c<='Z')c=static_cast<char>(c-'A'+'a');
+        const auto found=std::find(names.begin(),names.end(),name);
+        if(found==names.end())throw std::invalid_argument("AOT 開始條件的暫存器名稱不合法");
+        first_register=static_cast<Gpr>(found-names.begin());first_value=number(value_setting);
+    }
+    std::vector<GuestAddress> checkpoints;
+    if(const auto* setting=std::getenv("X64ARM_AOT_COMPARE_CHECKPOINTS");setting && *setting){
+        std::string_view remaining{setting};
+        while(!remaining.empty()){
+            const auto comma=remaining.find(',');
+            checkpoints.emplace_back(number(remaining.substr(0,comma)));
+            if(comma==remaining.npos)break;
+            remaining.remove_prefix(comma+1);
+            if(remaining.empty())throw std::invalid_argument("AOT 對照檢查點不可為空");
+        }
+    }
+    checkpoints.emplace_back(number(end));
+    auto observed=options;
+    GuestAddress target=first;
+    bool waiting_for_begin=true;
+    observed.cooperative_stop=[&] {
+        return (options.cooperative_stop && options.cooperative_stop()) ||
+            (state.rip==target && (!waiting_for_begin || !first_register || state.reg(*first_register)==first_value));
+    };
+    auto actual=engine.run(state,memory,observed);
+    if(actual.reason!=StopReason::Returned || state.rip!=first)return actual;
+    waiting_for_begin=false;
+    if(const auto* setting=std::getenv("X64ARM_AOT_NATIVE_COUNT_INSTRUCTIONS");setting && *setting){
+        auto counted=options;counted.max_instructions=number(setting);
+        if(!counted.max_instructions || counted.max_instructions>1000000000)
+            throw std::invalid_argument("原生純客體計數上限必須介於 1–1000000000");
+        const auto* compare_setting=std::getenv("X64ARM_AOT_NATIVE_COUNT_COMPARE");
+        const bool compare=compare_setting && std::string_view(compare_setting)=="1";
+        unsigned trace_limit=0;
+        if(const auto* trace_setting=std::getenv("X64ARM_AOT_NATIVE_COUNT_TRACE");trace_setting && *trace_setting){
+            const auto requested=number(trace_setting);
+            if(requested>4096)throw std::invalid_argument("原生計數的參考前綴觀測不得超過 4096 條");
+            if(requested && !compare)throw std::invalid_argument("參考前綴觀測需要同狀態對照");
+            trace_limit=static_cast<unsigned>(requested);
+        }
+        const auto* bisect_setting=std::getenv("X64ARM_AOT_NATIVE_COUNT_BISECT");
+        const bool bisect=compare && bisect_setting && std::string_view(bisect_setting)=="1";
+        const auto initial_state=state;
+        auto expected_state=state;
+        std::optional<GuestMemory> expected_memory;
+        if(compare)expected_memory.emplace(memory);
+        counted.services=nullptr;counted.diagnose_budget=false;
+        actual=engine.run(state,memory,counted);
+        diagnostics<<"aot_native_count "<<format_result(actual,state)<<std::flush;
+        if(expected_memory){
+            std::optional<GuestMemory> initial_memory;
+            if(bisect)initial_memory.emplace(*expected_memory);
+            RunOptions reference;reference.sentinel=options.sentinel;reference.diagnose_budget=false;
+            reference.max_instructions=actual.completed+(actual.reason==StopReason::BudgetExhausted?0U:1U);
+            unsigned traced_steps=0;
+            if(trace_limit){
+                diagnostics<<"aot_native_count_initial "<<format_result(ExecutionResult{},initial_state);
+                reference.cooperative_stop=[&] {
+                    if(traced_steps>=trace_limit)return false;
+                    try{
+                    const auto decoded=Decoder{memory.execution_mode(),false}.decode_at(*expected_memory,expected_state.rip);
+                    if(decoded.status==DecodeStatus::Ok){
+                        const auto& instruction=decoded.instruction;
+                        diagnostics<<"aot_native_count_step ordinal="<<traced_steps<<" pc=0x"<<std::hex
+                                   <<expected_state.rip.value<<std::dec<<" text="<<std::quoted(instruction_text(instruction,expected_state.rip))<<" bytes=";
+                        for(unsigned n=0;n<instruction.length;++n)diagnostics<<std::hex<<std::setw(2)<<std::setfill('0')<<static_cast<unsigned>(instruction.bytes[n]);
+                        diagnostics<<std::dec<<'\n';
+                        for(unsigned n=0;n<instruction.operand_count;++n){
+                            const auto& operand=instruction.operands[n];
+                            if(operand.kind!=OperandKind::Memory || !operand.width || operand.width>64 || instruction.opcode==Opcode::Lea)continue;
+                            try{const auto address=effective_address(operand,instruction,expected_state,GuestAddress{expected_state.rip.value+instruction.length});
+                                diagnostics<<"aot_native_count_operand ordinal="<<traced_steps<<" address=0x"<<std::hex<<address.value
+                                           <<" value=0x"<<expected_memory->load(address,operand.width)<<std::dec<<" bits="<<static_cast<unsigned>(operand.width)<<'\n';
+                            }catch(const MemoryFault&){}
+                        }
+                    }
+                    }catch(const MemoryFault&){}
+                    ++traced_steps;return false;
+                };
+            }
+            const auto expected=Interpreter{}.run(expected_state,*expected_memory,reference);
+            reference.cooperative_stop={};
+            auto architectural_expected=expected_state;architectural_expected.tsc=state.tsc;
+            const bool matching=equal_result(expected,actual) && state==expected_state &&
+                memory.same_contents(*expected_memory);
+            diagnostics<<"aot_native_count_reference "<<format_result(expected,expected_state);
+            diagnostics<<"aot_native_count_compare result_equal="<<equal_result(expected,actual)
+                       <<" state_equal="<<(state==expected_state)<<" gpr_equal="<<(state.gpr==expected_state.gpr)
+                       <<" flags_equal="<<(state.rflags==expected_state.rflags)
+                       <<" memory_equal="<<memory.same_contents(*expected_memory)
+                       <<" tsc_equal="<<(state.tsc==expected_state.tsc)
+                       <<" architectural_equal="<<(state==architectural_expected)<<'\n'<<std::flush;
+            if(initial_memory && !matching){
+                // 重算皆使用獨立的純客體狀態；不重播先前的 Windows API 或外部資源操作。
+                diagnostics<<"aot_native_count_original "<<format_stats(engine.stats());
+                auto lower_state=initial_state;
+                GuestMemory lower_memory{*initial_memory};std::uint64_t lower_steps=0;
+                const auto trial=[&](std::uint64_t steps,bool details,bool advance){
+                    auto native_state=initial_state,interpreted_state=lower_state;
+                    GuestMemory native_memory{*initial_memory},interpreted_memory{lower_memory};
+                    auto trial_options=reference;trial_options.max_instructions=steps;
+                    engine.clear();
+                    const auto native=engine.run(native_state,native_memory,trial_options);
+                    trial_options.max_instructions=steps-lower_steps;
+                    auto interpreted=Interpreter{}.run(interpreted_state,interpreted_memory,trial_options);
+                    interpreted.completed+=lower_steps;
+                    const bool same=equal_result(native,interpreted) && native_state==interpreted_state &&
+                        native_memory.same_contents(interpreted_memory);
+                    diagnostics<<"aot_native_count_trial steps="<<steps<<" equal="<<same<<'\n';
+                    if(details){
+                        diagnostics<<"aot_native_count_trial_native "<<format_result(native,native_state);
+                        diagnostics<<"aot_native_count_trial_reference "<<format_result(interpreted,interpreted_state);
+                        try{
+                            const auto decoded=Decoder{memory.execution_mode(),false}.decode_at(interpreted_memory,interpreted_state.rip);
+                            if(decoded.status==DecodeStatus::Ok)
+                                diagnostics<<"aot_native_count_trial_next "<<instruction_text(decoded.instruction,interpreted_state.rip)<<'\n';
+                        }catch(const MemoryFault&){}
+                    }
+                    if(same && advance){lower_state=interpreted_state;
+                        lower_memory=std::move(interpreted_memory);lower_steps=steps;}
+                    diagnostics<<std::flush;return same;
+                };
+                std::uint64_t low=0,high=reference.max_instructions;
+                if(!trial(high,false,false)){
+                    while(high-low>1){const auto middle=low+(high-low)/2;
+                        if(trial(middle,false,true))low=middle;else high=middle;}
+                    const bool low_equal=trial(low,true,false),high_equal=trial(high,true,false);
+                    diagnostics<<"aot_native_count_adjacent matching_steps="<<low<<" different_steps="<<high
+                               <<" verified="<<(low_equal && !high_equal)<<'\n'<<std::flush;
+                }else diagnostics<<"aot_native_count_fresh_reproduction=0\n"<<std::flush;
+            }
+        }
+        return actual;
+    }
+    if(const auto* setting=std::getenv("X64ARM_AOT_COMPARE_CONTINUE_INTERPRETER");setting && std::string_view(setting)=="1"){
+        diagnostics<<"diagnostic_interpreter_continuation pc=0x"<<std::hex<<state.rip.value<<std::dec<<'\n';
+        return Interpreter{}.run(state,memory,options);
+    }
+    const auto* api_setting=std::getenv("X64ARM_AOT_COMPARE_API_BOUNDARIES");
+    const bool api_boundaries=api_setting && std::string_view(api_setting)=="1";
+    auto stage_limit=api_boundaries?std::size_t{128}:checkpoints.size();
+    if(api_boundaries)if(const auto* setting=std::getenv("X64ARM_AOT_COMPARE_API_LIMIT");setting && *setting){
+        const auto requested=number(setting);
+        if(!requested || requested>65536)throw std::invalid_argument("API 對照邊界數必須介於 1–65536");
+        stage_limit=static_cast<std::size_t>(requested);
+    }
+    std::uint64_t reference_chunks=1;
+    if(const auto* setting=std::getenv("X64ARM_AOT_COMPARE_REFERENCE_CHUNKS");setting && *setting){
+        reference_chunks=number(setting);
+        if(!reference_chunks || reference_chunks>64)
+            throw std::invalid_argument("參考區段續行次數必須介於 1–64");
+    }
+    // 服務端沿用完整執行契約；使用獨立實例，避免每次 API 都撤銷
+    // 純 CPU 實例的產碼、統計及診斷輸出。
+    AotEngine service_engine;
+    for(std::size_t stage=0;stage<stage_limit;++stage){
+    auto last=api_boundaries?GuestAddress{}:checkpoints[stage];
+    auto expected_state=state;
+    auto expected_memory=memory;
+    RunOptions reference;
+    reference.max_instructions=1000000;
+    if(const auto* setting=std::getenv("X64ARM_AOT_COMPARE_MAX_INSTRUCTIONS");setting && *setting){
+        reference.max_instructions=number(setting);
+        if(!reference.max_instructions || reference.max_instructions>1000000000)
+            throw std::invalid_argument("純客體對照指令上限必須介於 1–1000000000");
+    }
+    reference.sentinel=options.sentinel;
+    const auto* memory_begin=std::getenv("X64ARM_AOT_COMPARE_MEMORY_BEGIN");
+    const auto* memory_end=std::getenv("X64ARM_AOT_COMPARE_MEMORY_END");
+    const bool trace_memory=memory_begin && *memory_begin && memory_end && *memory_end;
+    const auto low=trace_memory?number(memory_begin):0,high=trace_memory?number(memory_end):0;
+    Decoder decoder{memory.execution_mode(),false};
+    unsigned traced=0;
+    reference.cooperative_stop=[&] {
+        if(expected_state.rip==last)return true;
+        if(trace_memory && traced<256)try{
+            const auto decoded=decoder.decode_at(expected_memory,expected_state.rip);
+            const auto& instruction=decoded.instruction;
+            if(decoded.status==DecodeStatus::Ok && instruction.opcode!=Opcode::Lea)
+                for(unsigned i=0;i<instruction.operand_count && traced<256;++i){
+                    const auto& operand=instruction.operands[i];
+                    if(operand.kind!=OperandKind::Memory || !operand.width || operand.width>64)continue;
+                    const auto address=effective_address(operand,instruction,expected_state,
+                                                         GuestAddress{expected_state.rip.value+instruction.length});
+                    if(address.value<low || address.value>=high)continue;
+                    const auto value=expected_memory.load(address,operand.width);
+                    diagnostics<<"aot_span_memory pc=0x"<<std::hex<<expected_state.rip.value
+                               <<" address=0x"<<address.value<<" value=0x"<<value<<std::dec
+                               <<" bits="<<static_cast<unsigned>(operand.width)
+                               <<" instruction="<<instruction_text(instruction,expected_state.rip)<<'\n';
+                    ++traced;
+                }
+        }catch(const MemoryFault&){}
+        return false;
+    };
+    // 對照只重算純客體指令，遇到宿主服務即停止，避免重做檔案、IPC 或其他外部副作用。
+    Interpreter reference_engine;
+    auto expected=reference_engine.run(expected_state,expected_memory,reference);
+    auto reference_completed=expected.completed;
+    for(std::uint64_t chunk=1;expected.reason==StopReason::BudgetExhausted && chunk<reference_chunks;++chunk){
+        diagnostics<<"aot_span_reference_progress completed="<<reference_completed<<" chunk="<<chunk
+                   <<" pc=0x"<<std::hex<<expected_state.rip.value<<std::dec<<'\n'<<std::flush;
+        expected=reference_engine.run(expected_state,expected_memory,reference);
+        reference_completed+=expected.completed;
+    }
+    expected.completed=reference_completed;
+    if(expected.reason==StopReason::BudgetExhausted){
+        // 參考端尚未到達邊界，不能拿中段 RIP 與略過該位置的常駐本體比較。
+        // 純客體快照沒有外部副作用；實際端仍停在原始完整狀態，不冒充已退休。
+        diagnostics<<"aot_span_reference_incomplete "<<format_result(expected,expected_state)<<std::flush;
+        ExecutionResult incomplete;incomplete.reason=StopReason::BudgetExhausted;incomplete.rip=state.rip;
+        return incomplete;
+    }
+    if(api_boundaries)last=expected_state.rip;
+    target=last;
+    // 兩側都只重算目前執行緒的 CPU 指令。原生端若保留 provider，
+    // after_instructions 可能先排程另一條執行緒，甚至停在同名 API 的
+    // 不同次呼叫；那不是同起點／同終點的 CPU 語義對照。
+    // 外部服務、回呼及排程仍由下方唯一一次服務執行承接。
+    auto pure=observed;pure.services=nullptr;
+    actual=engine.run(state,memory,pure);
+    diagnostics<<"aot_span_checkpoint target=0x"<<std::hex<<last.value<<std::dec<<'\n';
+    if(api_boundaries && options.services && options.services->handles(last))
+        diagnostics<<"aot_span_service name="<<options.services->name(last)<<'\n';
+    diagnostics<<"aot_span_reference "<<format_result(expected,expected_state);
+    diagnostics<<"aot_span_actual "<<format_result(actual,state);
+    const bool reference_boundary=expected.reason==StopReason::Returned ||
+        (api_boundaries && options.services && options.services->handles(expected_state.rip));
+    const bool reached=reference_boundary && expected_state.rip==last &&
+                       actual.reason==StopReason::Returned && state.rip==last;
+    const bool vector_equal=state.xmm==expected_state.xmm && state.ymm_upper==expected_state.ymm_upper &&
+        state.mxcsr==expected_state.mxcsr && state.x87==expected_state.x87 &&
+        state.x87_control==expected_state.x87_control && state.x87_status==expected_state.x87_status &&
+        state.x87_tag==expected_state.x87_tag;
+    const bool memory_equal=memory.same_contents(expected_memory);
+    diagnostics<<"aot_span_compare reached="<<reached<<" gpr_equal="<<(state.gpr==expected_state.gpr)
+               <<" flags_equal="<<(state.rflags==expected_state.rflags)
+               <<" vector_equal="<<vector_equal<<" memory_equal="<<memory_equal<<'\n';
+    if(actual.reason!=StopReason::Returned || state.rip!=last)return actual;
+    if(!reached || state.gpr!=expected_state.gpr || state.rflags!=expected_state.rflags ||
+       !vector_equal || !memory_equal)break;
+    if(api_boundaries){
+        if(!options.services || !options.services->handles(last))break;
+        // 外部副作用只執行一次；服務完成後從同一份實際狀態開始下一段純指令對照。
+        // 使用既有單步服務與巢狀回呼契約，不複製服務／宿主資源，也不重播外部 I/O。
+        const auto* service_mode=std::getenv("X64ARM_AOT_COMPARE_SERVICE_INTERPRETER");
+        const bool interpret_service=service_mode && std::string_view(service_mode)=="1";
+        auto service_options=options;
+        unsigned service_boundaries=0;
+        if(interpret_service){
+            service_options.max_instructions=1;service_options.diagnose_budget=false;
+            actual=Interpreter{}.run(state,memory,service_options);
+        }else{
+            service_options.cooperative_stop=[&] {
+                return (options.cooperative_stop && options.cooperative_stop()) || ++service_boundaries>1;
+            };
+            actual=service_engine.run(state,memory,service_options);
+        }
+        diagnostics<<"aot_span_service_result "<<format_result(actual,state)<<std::flush;
+        if(interpret_service?actual.reason!=StopReason::BudgetExhausted:
+           actual.reason!=StopReason::Returned || service_boundaries<2)return actual;
+    }
+    }
+    return {};
+}
 ExecutionResult execute_module(GuestState& state,GuestMemory& memory,RunOptions options,
                                const std::filesystem::path& dump,std::ostream& diagnostics,const std::filesystem::path& source){
     const auto workers=compiler_worker_count();
@@ -131,6 +420,11 @@ ExecutionResult execute_module(GuestState& state,GuestMemory& memory,RunOptions 
     const auto interval=configured && *configured?number(configured):options.max_instructions;
     if(configured && *configured && !interval)throw std::invalid_argument("進度診斷間隔不得為零");
     const auto started=std::chrono::steady_clock::now();startup_profile::mark("aot_module_execute_begin");
+    if(auto stopped=compare_aot_span(engine,state,memory,options,diagnostics,source)){
+        if(!dump.empty())engine.dump(dump);
+        diagnostics<<format_stats(engine.stats());
+        return *stopped;
+    }
     do{
         auto slice=options;slice.max_instructions=std::min(interval,options.max_instructions-completed);
         slice.diagnose_budget=slice.max_instructions==options.max_instructions-completed && options.diagnose_budget;
@@ -144,7 +438,75 @@ ExecutionResult execute_module(GuestState& state,GuestMemory& memory,RunOptions 
 }
 ExecutionResult execute(bool jit, GuestState& state, GuestMemory& memory, RunOptions options,
                         const std::filesystem::path& dump, std::ostream& diagnostics, const std::filesystem::path& source = {}) {
-    if (!jit) return Interpreter{}.run(state, memory, options);
+    const auto* watch=std::getenv("X64ARM_EXECUTION_OBSERVE_QWORD");
+    if((!watch || !*watch) && !jit)watch=std::getenv("X64ARM_INTERPRETER_OBSERVE_QWORD");
+    bool observe=watch && *watch;
+    if(observe)if(const auto* image=std::getenv("X64ARM_EXECUTION_OBSERVE_IMAGE");image && *image){
+        std::error_code error;
+        observe=!source.empty() && std::filesystem::equivalent(source,image,error);
+    }
+    if (observe) {
+        const GuestAddress address{number(watch)};
+        const auto* selected=std::getenv("X64ARM_EXECUTION_OBSERVE_VALUE");
+        if(!selected || !*selected)selected=std::getenv("X64ARM_INTERPRETER_OBSERVE_VALUE");
+        const std::optional<std::uint64_t> match=selected && *selected?std::optional{number(selected)}:std::nullopt;
+        const auto* pc_text=std::getenv("X64ARM_EXECUTION_OBSERVE_PC");
+        if(!pc_text || !*pc_text)pc_text=std::getenv("X64ARM_INTERPRETER_OBSERVE_PC");
+        const std::optional<std::uint64_t> pc=pc_text && *pc_text?std::optional{number(pc_text)}:std::nullopt;
+        std::uint64_t pc_hits=0;
+        GuestAddress last_match{};
+        std::uint64_t matches=0;
+        const auto previous_stop=options.cooperative_stop;
+        std::optional<std::uint64_t> previous_value;
+        GuestAddress previous_pc{};
+        std::array<std::uint64_t,16> previous_registers{};
+        std::uint64_t previous_flags{};
+        std::uint64_t changes=0;
+        // 只在診斷模式讀取客體記憶體。直譯在逐指令邊界觀察，AOT 在既有宿主一致邊界觀察。
+        // 兩次觀察之間可能包含多條指令、服務或排程，前一個 PC 並不等於實際寫入者。
+        const auto record_observation=[&] {
+            try {
+                const auto value=memory.load(address,64);
+                if(pc==state.rip.value && ++pc_hits<=8)
+                    diagnostics<<"guest_qword_pc pc=0x"<<std::hex<<state.rip.value<<" rcx=0x"<<state.reg(Gpr::Rcx)
+                               <<" rdx=0x"<<state.reg(Gpr::Rdx)<<" value=0x"<<value<<std::dec<<'\n';
+                if(previous_value!=value){
+                    ++changes;
+                    if(match==value){++matches;last_match=previous_pc;}
+                    if(changes<=64 || (match==value && matches<=16))
+                        diagnostics<<"guest_qword_change preceding_pc=0x"<<std::hex<<previous_pc.value
+                                   <<" next_pc=0x"<<state.rip.value<<" value=0x"<<value
+                                   <<" rcx=0x"<<state.reg(Gpr::Rcx)<<" rdx=0x"<<state.reg(Gpr::Rdx)<<std::dec<<'\n';
+                    if(match==value && matches<=16){
+                        const auto registers=[&](std::string_view label,GuestAddress at,
+                                                 const auto& values,std::uint64_t flags_value){
+                            diagnostics<<label<<" pc=0x"<<std::hex<<at.value<<" flags=0x"<<flags_value;
+                            for(unsigned i=0;i<values.size();++i)
+                                diagnostics<<' '<<gpr_names[i]<<"=0x"<<values[i];
+                            diagnostics<<std::dec<<'\n';
+                        };
+                        registers("guest_qword_transition_input",previous_pc,previous_registers,previous_flags);
+                        registers("guest_qword_transition_output",state.rip,state.gpr,state.rflags);
+                    }
+                    previous_value=value;
+                }
+            }catch(const MemoryFault&){previous_value.reset();}
+            previous_pc=state.rip;
+            previous_registers=state.gpr;
+            previous_flags=state.rflags;
+        };
+        options.cooperative_stop=[&] {
+            if(previous_stop && previous_stop())return true;
+            record_observation();
+            return false;
+        };
+        auto result=jit?execute_module(state,memory,options,dump,diagnostics,source):
+                        Interpreter{}.run(state,memory,options);
+        record_observation();
+        diagnostics<<"guest_qword_observation changes="<<changes<<" pc_hits="<<pc_hits<<" matches="<<matches<<" last_match_preceding_pc=0x"<<std::hex<<last_match.value<<" address=0x"<<std::hex<<address.value<<std::dec<<'\n';
+        return result;
+    }
+    if(!jit)return Interpreter{}.run(state,memory,options);
     cli::reject_retired_backends();
     return execute_module(state,memory,options,dump,diagnostics,source);
 }
@@ -500,6 +862,28 @@ int main(int argc, char** argv) {
             // 僅釋放 CLI 的引用，仍由既有有界 PE 快取決定可重用快照的生命週期。
             bytes={};pe_bytes.reset();std::vector<std::uint8_t>{}.swap(raw_bytes);
         };
+        const bool child_jit = jit;
+        if (command == "run-pe" && !process_image_source) {
+            const auto* image = std::getenv("X64ARM_DIAGNOSTIC_SERVICE_IMAGE");
+            const auto* trace = std::getenv("X64ARM_DIAGNOSTIC_SERVICES");
+            if (image && *image && trace && *trace) {
+                std::error_code error;
+                if (std::filesystem::equivalent(argv[2], image, error)) {
+                    ::setenv("X64ARM_TRACE_SERVICES", trace, 1);
+                    *diagnostics << "diagnostic_image_services=enabled\n";
+                }
+            }
+        }
+        if (command == "run-pe" && jit && !process_image_source) {
+            // 讓 Steam 照常建立遊戲程序與繼承控制代碼，只對指定的磁碟映像做直譯對照。
+            if (const auto* image = std::getenv("X64ARM_DIAGNOSTIC_INTERPRETER_IMAGE"); image && *image) {
+                std::error_code error;
+                if (std::filesystem::equivalent(argv[2], image, error)) {
+                    jit = false;
+                    *diagnostics << "diagnostic_image_backend=interpreter\n";
+                }
+            }
+        }
         const bool pe = command == "run-pe" || inspection || (comparison && bytes.size() >= 2 && bytes[0] == 'M' && bytes[1] == 'Z');
         if (pe) {
             for (const auto option : {"--load-address", "--entry", "--stack-address", "--stack-size"})
@@ -545,7 +929,7 @@ int main(int argc, char** argv) {
             process_options.startup_data=std::move(startup_data);
             process_options.engine=argv[0];process_options.filesystem_root=pe_options.filesystem_root;process_options.c_drive=pe_options.c_drive;process_options.drive_mappings=pe_options.drive_mappings;process_options.install_root=pe_options.install_root;
             process_options.certificate_roots_file=pe_options.certificate_roots_file;
-            process_options.processor_count=processor_count;process_options.jit=jit;process_options.native_gui=native_gui;process_options.host_clock=host_clock;process_options.writable_files=pe_options.writable_files;process_options.trap_unresolved=pe_options.trap_unresolved_imports;
+            process_options.processor_count=processor_count;process_options.jit=child_jit;process_options.native_gui=native_gui;process_options.host_clock=host_clock;process_options.writable_files=pe_options.writable_files;process_options.trap_unresolved=pe_options.trap_unresolved_imports;
             process_options.max_instructions=run.max_instructions;process_options.memory_limit_mib=program.memory.limit()/1024/1024;process_options.gpu_memory_mib=gpu_memory_mib;
             program.services.configure_processes(std::move(process_options), program.memory);
             if(process_session_descriptor>=0 && process_session.empty())throw std::invalid_argument("mapping session fd 需要命名空間路徑");
@@ -618,6 +1002,20 @@ int main(int argc, char** argv) {
             std::cout << program.services.standard_output();
             std::cerr << program.services.standard_error();
             *diagnostics << format_result(result, program.state);
+            if(result.reason==StopReason::UnsupportedHostCall){
+                // 呼叫框架故障只傾印有限個客體 slot，供核對真正 return PC；
+                // 不改寫狀態，也不讓診斷讀取失敗掩蓋原本的停止原因。
+                const auto sp=program.state.reg(Gpr::Rsp);
+                const unsigned width=program.memory.execution_mode()==ExecutionMode::X86?4U:8U;
+                for(unsigned slot=0;slot<8;++slot){
+                    if(sp>UINT64_MAX-std::uint64_t{slot}*width)break;
+                    const auto at=sp+std::uint64_t{slot}*width;
+                    try{const auto value=program.memory.load(GuestAddress{at},static_cast<std::uint8_t>(width*8));
+                        *diagnostics<<"host_call_stack slot="<<slot<<" address=0x"<<std::hex<<at
+                        <<" value=0x"<<value<<std::dec<<'\n';}
+                    catch(const MemoryFault&){*diagnostics<<std::dec;break;}
+                }
+            }
             *diagnostics << program.services.video_diagnostics();
             *diagnostics << program.services.opengl_diagnostics();
             *diagnostics << program.services.dsound_diagnostics();

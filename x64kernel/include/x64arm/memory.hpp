@@ -188,6 +188,9 @@ public:
     // before 不含目前 byte，after 含目前 byte；排除外部 backing／宿主更新頁。
     struct NativeWindow {std::uint8_t* data{};std::size_t before{},after{};};
     NativeWindow native_window(GuestAddress address,unsigned permissions) noexcept;
+    // 引擎持有生命週期的共用區段（StableShared，例如零複製的 GPU CPU 可見堆積）：與 native_window 相同的頁內視窗。
+    // 宿主更新頁、可執行頁與寫入時複製頁的寫入不適用（回傳空視窗）。呼叫端須自行排除映射變更（服務層的共用映射鎖）。
+    NativeWindow native_shared_window(GuestAddress address,unsigned permissions) noexcept;
     // 完整私人連續 backing 借用：可跨同一 backing 的相鄰 Region，不回填 JIT 頁面快取。
     // 呼叫及使用期間須禁止映射／保護／backing 變動；僅借資料，不借 Region 指標或所有權。
     // 不完整、COW、外部、宿主更新或無法證明無 guest alias 的範圍回傳空值。

@@ -1,3 +1,4 @@
+#include "debug_semaphore.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_security_attributes.hpp"
 #include "x64arm/unicode.hpp"
@@ -30,15 +31,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_sync_object(GuestState& sta
             auto& object=runtime_.wait_state(handle->second);const auto increment=std::bit_cast<std::int32_t>(u32(1));
             if(increment<=0)error=87;
             else {if(arg(2))memory.check(GuestAddress{arg(2)},4,Access::Write);std::uint32_t previous{};
-                error=object.release_semaphore(u32(1),&previous);if(!error){if(arg(2))memory.store(GuestAddress{arg(2)},32,previous);result=1;}}
+                error=object.release_semaphore(u32(1),&previous);if(!error)detail::debug_semaphore("f-release",arg(0),previous,previous+u32(1),threads_.current);if(!error){if(arg(2))memory.store(GuestAddress{arg(2)},32,previous);result=1;}}
         }
     } else {
         const bool create=api.starts_with("Create"),extended=api.find("Ex")!=std::string_view::npos;
         const auto name_pointer=arg(create?(timer?(extended?1U:2U):3U):2U);
         auto name=name_pointer?(api.ends_with('W')?read_utf16(memory,GuestAddress{name_pointer},261):utf8_to_utf16(read_ansi(memory,name_pointer,1041))):std::u16string{};
         if(name.size()>=260)error=206;
+        // 私有命名空間別名與 BaseNamedObjects 下的子目錄（物件命名空間）轉成既有具名物件名稱。
+        if(!error)error=win32_namespace_object_name(name,create);
         if(name.starts_with(u"Local\\"))name.erase(0,6);
-        if(name.find(u'\\',name.starts_with(u"Global\\")?7:0)!=name.npos)error=123;
+        if(!error && name.find(u'\\',name.starts_with(u"Global\\")?7:0)!=name.npos)error=123;
         if(!create && name.empty())error=87;
         const auto raw_access=create?(extended?u32(timer?3U:5U):all_access):u32(0);
         auto access=sync_access(raw_access);

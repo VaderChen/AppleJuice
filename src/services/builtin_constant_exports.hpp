@@ -1,5 +1,6 @@
 #pragma once
 #include "crt_library.hpp"
+#include "x64arm/windows_guid.hpp"
 #include "msvcp_numeric_limits.hpp"
 namespace x64arm::detail {
 // 不可變資料與可呼叫服務分別發布；資料保持真正的 PE RVA 及唯讀頁面。
@@ -47,6 +48,12 @@ inline std::span<const GuidConstant> builtin_guid_exports(std::string_view famil
         {"IID_ITextHost",guid_bytes(0xc5bdd8d0,0xd26e,0x11ce,{0xa8,0x9e,0x00,0xaa,0x00,0x6c,0xad,0xc5})},
         {"IID_ITextHost2",guid_bytes(0x13e670f5,0x1a5a,0x11cf,{0xab,0xeb,0x00,0xaa,0x00,0xb6,0x5e,0xa1})},
         {"IID_ITextServices",guid_bytes(0x8d33f740,0xcf58,0x11ce,{0xa8,0x9d,0x00,0xaa,0x00,0x6c,0xad,0xc5})}};
+    static constexpr GuidConstant avi[]{
+        {"CLSID_AVISimpleUnMarshal",ole_standard_guid(0x20009)},
+        {"IID_IAVIFile",ole_standard_guid(0x20020)},{"IID_IAVIStream",ole_standard_guid(0x20021)},
+        {"IID_IGetFrame",ole_standard_guid(0x20023)},{"IID_IAVIEditStream",ole_standard_guid(0x20024)}
+    };
+    if(family=="avifil32.dll")return avi;
     if(family=="oleacc.dll")return oleacc;
     if(family=="riched20.dll")return riched;
     return {};

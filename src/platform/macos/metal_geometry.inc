@@ -69,6 +69,8 @@ std::string metal_geometry_clean(std::string program_source){
         "if(x64Emit.count < sizeof(x64Emit.vertices)/sizeof(x64Emit.vertices[0])) { x64Emit.vertices[x64Emit.count] = output; x64Emit.strips[x64Emit.count++] = x64Emit.strip; }");
     return program_source;
 }
+#include "metal_point_geometry.inc"
+#include "metal_dxil_geometry.inc"
 std::string metal_pack_varying(const MetalVarying& v,const std::string& field){
     if(v.clip_count){std::string value="float4(";for(unsigned i=0;i<4;++i){if(i)value+=",";value+=i<v.components?field+(v.clip_count>1?"["+std::to_string(v.clip_offset+i)+"]":""):"0";}return value+")";}
     const auto type=v.type==INOUT_COMPONENT_UINT32?"uint":v.type==INOUT_COMPONENT_SINT32?"int":"float";
@@ -139,6 +141,8 @@ std::shared_ptr<MetalPooledBuffer> MetalGl::graphics_scratch_buffer(std::uint64_
 }
 MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDescriptor* descriptor,const std::array<int,32>& slots,const std::vector<std::array<std::uint32_t,3>>& shifted,const std::string& layout_key){@autoreleasepool{
     auto& vs=dynamic_cast<MetalShader&>(*d.stages[0].shader);auto& original_gs=dynamic_cast<MetalShader&>(*d.stages[2].shader);
+    if(vs.output_varyings.empty() && !vs.signature_outputs.empty())
+        vs.output_varyings=metal_point_members(vs.source,vs.signature_outputs,false);
     MetalShader passthrough;auto* selected=&original_gs;
     const auto [primitives,input_count]=metal_input_primitives(d.topology,d.count);
     if(original_gs.stage==0){
@@ -188,9 +192,11 @@ MetalGeometryDraw MetalGl::graphics_geometry(const GraphicsDraw& d,MTLVertexDesc
         if(vertex_id=="mtl_VertexID"){metal_replace(capture,"mtl_VertexID = mtl_VertexID - mtl_BaseVertex;","const uint x64RawVertexID = mtl_VertexID;\nmtl_VertexID = mtl_VertexID - mtl_BaseVertex;");vertex_id="x64RawVertexID";}
         if(instance_id=="mtl_InstanceID"){metal_replace(capture,"mtl_InstanceID = mtl_InstanceID - mtl_BaseInstance;","const uint x64RawInstanceID = mtl_InstanceID;\nmtl_InstanceID = mtl_InstanceID - mtl_BaseInstance;");instance_id="x64RawInstanceID";}
         std::string writes="if("+vertex_id+" < x64CaptureParams.x) { uint x64At=(("+instance_id+"-x64CaptureParams.y)*x64CaptureParams.x+"+vertex_id+")*"+std::to_string(vs.output_varyings.size())+";\n";
-        for(unsigned i=0;i<vs.output_varyings.size();++i)writes+="x64Captured[x64At+"+std::to_string(i)+"]="+metal_pack_varying(vs.output_varyings[i],"output."+vs.output_varyings[i].name)+";\n";
-        writes+="} return;";metal_replace(capture,"return output;",writes);
-        metal_replace(capture,"vertex Mtl_VertexOut xlatMtlMain(","vertex void xlatMtlMain(");
+        const bool modern=capture.find("vertex xlatMtlMain_out xlatMtlMain(")!=capture.npos;
+        const std::string output_name=modern?"out.":"output.";
+        for(unsigned i=0;i<vs.output_varyings.size();++i)writes+="x64Captured[x64At+"+std::to_string(i)+"]="+metal_pack_varying(vs.output_varyings[i],output_name+vs.output_varyings[i].name)+";\n";
+        writes+="} return;";metal_replace(capture,modern?"return out;":"return output;",writes);
+        metal_replace(capture,modern?"vertex xlatMtlMain_out xlatMtlMain(":"vertex Mtl_VertexOut xlatMtlMain(","vertex void xlatMtlMain(");
         {MetalStallScope timing("geometry_capture_library",vs.serial,0);
         library=[device_ newLibraryWithSource:[NSString stringWithUTF8String:capture.c_str()] options:options error:&error];}
         if(!library)throw std::invalid_argument("幾何 VS capture 編譯失敗："+std::string(error.localizedDescription.UTF8String)+"\n"+capture);
@@ -310,6 +316,7 @@ std::shared_ptr<const MetalGeometryMesh> MetalGl::graphics_geometry_mesh(const G
     if(std::any_of(d.stream_targets.begin(),d.stream_targets.end(),[](const auto& target){return bool(target);}))return nullptr;
     const auto* vs=dynamic_cast<const MetalShader*>(d.stages[0].shader.get());const auto* gs=dynamic_cast<const MetalShader*>(d.stages[2].shader.get());
     if(!vs || !gs || gs->stage!=2 || !gs->stream_output.empty())return nullptr;
+    if(vs->output_varyings.empty() && !vs->signature_outputs.empty())return nullptr;
     const bool inline_vertex=!vs->output_varyings.empty();if(inline_vertex && d.indexed)return nullptr;
     unsigned expected=0;switch(d.topology){case 1:expected=1;break;case 2:case 3:expected=2;break;case 4:case 5:expected=3;break;case 10:case 11:expected=4;break;case 12:expected=6;break;default:return nullptr;}
     if(expected!=(gs->geometry_input==6?4U:gs->geometry_input==7?6U:gs->geometry_input))return nullptr;

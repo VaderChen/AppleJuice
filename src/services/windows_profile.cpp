@@ -2,10 +2,13 @@
 #include "x64arm/unicode.hpp"
 #include <algorithm>
 #include <array>
+#include <unicode/ucnv.h>
 
 namespace x64arm {
 std::span<const WindowsServiceDescriptor> profile_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"shlwapi.dll","#294",5,0,0,8},{"shlwapi.dll","#295",4},
+        {"shlwapi.dll","#473",5,0,0,8},{"shlwapi.dll","#474",4},
         {"kernel32.dll","GetProfileIntA",3},{"kernel32.dll","GetProfileIntW",3},
         {"kernel32.dll","GetProfileStringA",5},{"kernel32.dll","GetProfileStringW",5},
         {"kernel32.dll","GetProfileSectionA",3},{"kernel32.dll","GetProfileSectionW",3},
@@ -66,6 +69,17 @@ struct Profile {
     std::optional<std::u16string> value(std::u16string_view name,std::u16string_view key)const{
         const auto [begin,end]=section(name);for(auto i=begin+1;i<end;++i)if(const auto item=entry(lines[i]);item && equal(item->first,key))return value_text(item->second);return {};
     }
+    void set_value(const std::u16string& app,const std::u16string& key,const std::u16string* value){
+        auto [begin,end]=section(app);
+        for(auto i=begin+1;i<end;++i)if(const auto item=entry(lines[i]);item && equal(item->first,key)){
+            if(value)lines[i]=key+u"="+*value;
+            else lines.erase(lines.begin()+static_cast<std::ptrdiff_t>(i));
+            return;
+        }
+        if(!value)return;
+        if(begin==lines.size()){lines.push_back(u"["+app+u"]");end=lines.size();}
+        lines.insert(lines.begin()+static_cast<std::ptrdiff_t>(end),key+u"="+*value);
+    }
     std::vector<std::uint8_t> bytes()const{
         std::u16string text;for(const auto& line:lines){text+=line;text+=u"\r\n";}
         if(encoding==Encoding::Utf16LE || encoding==Encoding::Utf16BE){auto output=utf16_bytes(text);output.resize(output.size()-2);output.insert(output.begin(),{0xff,0xfe});if(encoding==Encoding::Utf16BE)for(std::size_t i=0;i<output.size();i+=2)std::swap(output[i],output[i+1]);return output;}
@@ -77,6 +91,20 @@ std::vector<std::uint8_t> read_file(const HostFile& file){
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(info.metadata.size));std::size_t at=0;
     while(at<bytes.size()){const auto read=file.read(std::span(bytes).subspan(at),at);if(read.error)throw ProfileFailure{read.error};if(!read.bytes)throw ProfileFailure{1117};at+=static_cast<std::size_t>(read.bytes);}return bytes;
 }
+// .W 節以 UTF-7 表示 Unicode。沿用 ICU 轉碼，INI 本身的 BOM 與編碼由 Profile 保存。
+std::u16string shell_ini_utf7(std::u16string_view text,bool encode){
+    if(text.empty())return {};
+    const char* from=encode?"UTF-8":"UTF-7";
+    const char* to=encode?"UTF-7":"UTF-8";
+    const auto input=utf16_to_utf8(text);
+    UErrorCode status=U_ZERO_ERROR;
+    const auto length=ucnv_convert(to,from,nullptr,0,input.data(),static_cast<int32_t>(input.size()),&status);
+    if(status!=U_BUFFER_OVERFLOW_ERROR && U_FAILURE(status))throw ProfileFailure{1113};
+    std::string output(static_cast<std::size_t>(length),'\0');status=U_ZERO_ERROR;
+    ucnv_convert(to,from,output.data(),length,input.data(),static_cast<int32_t>(input.size()),&status);
+    if(U_FAILURE(status))throw ProfileFailure{1113};
+    return utf8_to_utf16(output);
+}
 std::uint32_t integer(std::u16string_view value){
     value=trim(value);bool negative=false;if(!value.empty() && (value.front()==u'+' || value.front()==u'-')){negative=value.front()==u'-';value.remove_prefix(1);}unsigned base=10;
     if(value.size()>2 && value[0]==u'0'){const auto prefix=value[1];if(prefix==u'x' || prefix==u'X')base=16;else if(prefix==u'b' || prefix==u'B')base=2;else if(prefix==u'o' || prefix==u'O')base=8;if(base!=10)value.remove_prefix(2);}
@@ -84,7 +112,16 @@ std::uint32_t integer(std::u16string_view value){
 }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_profile(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    const WindowsCall arg(state,memory,service);const auto symbol=service.symbol;const bool wide=symbol.ends_with('W'),writing=symbol.starts_with("Write"),number=symbol.starts_with("GetPrivateProfileInt") || symbol.starts_with("GetProfileInt"),names=symbol.starts_with("GetPrivateProfileSectionNames");
+    const WindowsCall call(state,memory,service);
+    const auto symbol=service.symbol;
+    const bool shell=service.family=="shlwapi.dll",select_key=symbol=="#473" || symbol=="#474";
+    const bool wide=shell || symbol.ends_with('W'),writing=symbol.starts_with("Write") || symbol=="#295" || symbol=="#474";
+    // Shell 讀取介面省略預設字串，將其參數對齊到既有 PrivateProfile 介面。
+    const auto arg=[&](unsigned index)->std::uint64_t{
+        if(shell && !writing && index>=2)return index==2?0:call(index-1);
+        return call(index);
+    };
+    const bool number=symbol.starts_with("GetPrivateProfileInt") || symbol.starts_with("GetProfileInt"),names=symbol.starts_with("GetPrivateProfileSectionNames");
     const bool system_profile=symbol.starts_with("GetProfile") || symbol.starts_with("WriteProfile");
     const bool section=symbol.find("Section")!=symbol.npos && !names;
     // Get／WritePrivateProfileStruct：值為結構各位元組的十六進位文字，末尾兩位是位元組和的低八位元檢查碼。
@@ -107,12 +144,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_profile(GuestState& state,G
         if(!writing && !number && !structure)(void)copy(arg(names?0U:section?1U:3U),static_cast<std::uint32_t>(arg(names?1U:section?2U:4U)),u"",multiple);
     };
     try{
+        const bool marked=select_key && arg(1) && memory.load(GuestAddress{arg(1)},16)=='@';
+        const bool shadow=shell && arg(0) && arg(1) && (!select_key || marked);
+        const auto key_address=arg(1)+(marked?2U:0U);
         auto path=system_profile || !arg(filename_index)?std::u16string(u"win.ini"):read(arg(filename_index));
         if(path.find(u':')==path.npos && !path.starts_with(u'\\') && !path.starts_with(u'/'))path=u"C:\\Windows\\"+path;
         const auto filename=utf16_to_utf8(path);
         if(writing){
             if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許 INI 宿主寫入");
-            if(!arg(0) && !arg(1) && (section || !arg(2))){last_error_=0;arg.return_to(state,0);return std::nullopt;}
+            if(!arg(0) && !arg(1) && (section || !arg(2))){last_error_=0;call.return_to(state,0);return std::nullopt;}
             if(!arg(0))throw ProfileFailure{87};const auto app=read(arg(0));if(app.find_first_of(u"\r\n[]")!=app.npos)throw ProfileFailure{87};
             // 先驗證 guest 輸入，避免無效參數產生空檔案或部分修改。
             std::vector<std::u16string> replacement;std::u16string key,value;
@@ -120,7 +160,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_profile(GuestState& state,G
                 replacement.push_back(u"["+app+u"]");std::uint64_t at=arg(1);std::size_t total=0;
                 for(;;){const auto ansi=wide?std::string{}:read_ansi(memory,at);auto line=wide?read_utf16(memory,GuestAddress{at}):utf8_to_utf16_lossy(ansi);if(line.empty())break;const auto length=(wide?line.size()*2:ansi.size())+(wide?2U:1U);if(length>output_limit-total)throw ProfileFailure{223};total+=length;at+=length;if(line.find_first_of(u"\r\n")!=line.npos)throw ProfileFailure{87};replacement.push_back(std::move(line));}
             }else if(!section && arg(1)){
-                key=read(arg(1));if(key.empty() || key.find_first_of(u"\r\n=")!=key.npos)throw ProfileFailure{87};
+                key=read(key_address);if(key.empty() || key.find_first_of(u"\r\n=")!=key.npos)throw ProfileFailure{87};
                 if(structure && arg(2)){
                     const auto size=static_cast<std::uint32_t>(arg(3));if(size>output_limit/2)throw ProfileFailure{87};std::vector<std::uint8_t> bytes(size);memory.read(GuestAddress{arg(2)},bytes);
                     unsigned sum=0;constexpr char16_t digits[]=u"0123456789ABCDEF";for(const auto b:bytes){value+=digits[b>>4];value+=digits[b&15];sum+=b;}value+=digits[(sum>>4)&15];value+=digits[sum&15];
@@ -135,10 +175,13 @@ std::optional<std::uint32_t> WindowsServices::invoke_profile(GuestState& state,G
                 profile.lines.erase(profile.lines.begin()+static_cast<std::ptrdiff_t>(begin),profile.lines.begin()+static_cast<std::ptrdiff_t>(end));
                 profile.lines.insert(profile.lines.begin()+static_cast<std::ptrdiff_t>(begin),replacement.begin(),replacement.end());
             }else {
-                auto found=end;for(auto i=begin+1;i<end;++i)if(const auto item=entry(profile.lines[i]);item && equal(item->first,key)){found=i;break;}
-                if(!arg(2)){if(found!=end)profile.lines.erase(profile.lines.begin()+static_cast<std::ptrdiff_t>(found));}
-                else if(found!=end)profile.lines[found]=key+u"="+value;
-                else {if(begin==profile.lines.size()){profile.lines.push_back(u"["+app+u"]");end=profile.lines.size();}profile.lines.insert(profile.lines.begin()+static_cast<std::ptrdiff_t>(end),key+u"="+value);}
+                profile.set_value(app,key,arg(2)?&value:nullptr);
+                if(shadow){
+                    const bool non_ascii=std::any_of(value.begin(),value.end(),[](char16_t c){return c>0x7f;});
+                    const auto encoded=non_ascii?shell_ini_utf7(value,true):std::u16string{};
+                    profile.set_value(app+u".A",key,non_ascii?&value:nullptr);
+                    profile.set_value(app+u".W",key,non_ascii?&encoded:nullptr);
+                }
             }
             const auto bytes=profile.bytes();if(bytes.size()>output_limit)throw ProfileFailure{223};std::size_t at=0;
             while(at<bytes.size()){const auto written=opened.file->write(std::span(bytes).subspan(at),at);if(written.error)throw ProfileFailure{written.error};if(!written.bytes)throw ProfileFailure{1117};at+=static_cast<std::size_t>(written.bytes);}
@@ -167,13 +210,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_profile(GuestState& state,G
                 if(section && !arg(0))throw ProfileFailure{87};std::u16string text;
                 if(names || (!section && !arg(0))){for(const auto& line:profile.lines)if(const auto h=heading(line)){text+=*h;text+=u'\0';}}
                 else if(section || !arg(1)){const auto [begin,end]=profile.section(app);for(auto i=begin+1;i<end;++i)if(const auto item=entry(profile.lines[i])){text+=item->first;if(section){text+=u'=';text+=item->second;}text+=u'\0';}}
-                else if(const auto value=profile.value(app,read(arg(1))))text=*value;
+                else if(shadow){
+                    const auto key=read(key_address),encoded=profile.value(app+u".W",key).value_or(u"");
+                    text=encoded.empty()?profile.value(app,key).value_or(u""):shell_ini_utf7(encoded,false);
+                }
+                else if(const auto value=profile.value(app,read(key_address)))text=*value;
                 else {text=read(arg(2));while(!text.empty() && text.back()==u' ')text.pop_back();}
-                result=copy(output,capacity,std::move(text),multiple);
+                if(symbol=="#294" && multiple){const auto end=text.find(u'\0');if(end!=text.npos)text.resize(end);}
+                result=copy(output,capacity,std::move(text),multiple && symbol!="#294");
             }
         }
     }catch(const ProfileFailure& error){failure(error.error);}
      catch(const std::invalid_argument&){failure(1113);}
-    arg.return_to(state,result);return std::nullopt;
+    call.return_to(state,result);return std::nullopt;
 }
 }

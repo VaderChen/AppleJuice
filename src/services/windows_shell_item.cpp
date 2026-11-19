@@ -77,7 +77,7 @@ std::span<const WindowsServiceDescriptor> shell_item_service_descriptors(){
         {"shell32.dll","SHParseDisplayName",5,0,0,0x8},{"shell32.dll","SHCreateShellItem",4},{"shell32.dll","SHCreateItemWithParent",5},
         {"shell32.dll","SHCreateItemFromRelativeName",5},{"shell32.dll","SHCreateItemInKnownFolder",5,0,0,0x2},{"shell32.dll","SHGetKnownFolderItem",5,0,0,0x2},
         {"shell32.dll","SHCreateShellItemArray",5,0,0,0x4},{"shell32.dll","SHCreateShellItemArrayFromIDLists",3,0,0,0x1},{"shell32.dll","SHCreateShellItemArrayFromShellItem",3},
-        {"shell32.dll","SHGetIDListFromObject",2},{"shell32.dll","SHGetItemFromObject",3},{"shell32.dll","ILSaveToStream",2},{"shell32.dll","SHGetFolderPathEx",5,0,0,0x12},
+        {"shell32.dll","SHGetIDListFromObject",2},{"shell32.dll","SHGetItemFromObject",3},{"shell32.dll","SHGetFolderPathEx",5,0,0,0x12},
         {"shell32.dll","SHGetDesktopFolder",1},{"shell32.dll","SHBindToParent",4},{"shell32.dll","SHBindToObject",5},{"shell32.dll","SHBindToFolderIDListParent",5},
         {"shell32.dll","SHGetDataFromIDListA",5,0,0,0x14},{"shell32.dll","SHGetDataFromIDListW",5,0,0,0x14},{"shell32.dll","SHMapPIDLToSystemImageListIndex",3},
         {"internal-shell-folder","QueryInterface",3},{"internal-shell-folder","AddRef",1},{"internal-shell-folder","Release",1},
@@ -225,7 +225,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_item(GuestState& stat
             if(path.size()>=d(4))return finish(0x8007007aU);memory.write(GuestAddress{arg(3)},utf16_bytes(path));return finish(0);
         }
         if(symbol=="SHCreateShellItem" || symbol=="SHCreateItemWithParent" || symbol=="SHCreateItemFromRelativeName" || symbol=="SHCreateShellItemArray" ||
-           symbol=="SHCreateShellItemArrayFromShellItem" || symbol=="SHGetIDListFromObject" || symbol=="SHGetItemFromObject" || symbol=="ILSaveToStream"){
+           symbol=="SHCreateShellItemArrayFromShellItem" || symbol=="SHGetIDListFromObject" || symbol=="SHGetItemFromObject"){
             // 需要從物件取得路徑者：本引擎的 IShellItem 直接取得；其他物件依序經 IPersistIDList::GetIDList、IPersistFolder2::GetCurFolder、IShellItem::GetDisplayName(FILESYSPATH)。
             return nested_continuation(state,memory,"ShellItemObject",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
                 const WindowsCall call(s,m,service);const auto name=service.symbol;const unsigned size=x86_?4U:8U;const auto width=static_cast<std::uint8_t>(size*8);
@@ -243,7 +243,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_item(GuestState& stat
                 else if(name=="SHCreateShellItemArrayFromShellItem"){out=call(2);riid=call(1);object=call(0);}
                 else if(name=="SHGetIDListFromObject"){out=call(1);object=call(0);}
                 else if(name=="SHGetItemFromObject"){out=call(2);riid=call(1);object=call(0);}
-                if(name!="ILSaveToStream"){if(!out)co_return finish_call(pointer_error);clear(out);}
+                if(!out)co_return finish_call(pointer_error);clear(out);
                 if(object){
                     if(const auto own=gui_.shell_items.find(object);own!=gui_.shell_items.end())path=own->second.path;
                     else {
@@ -275,16 +275,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_item(GuestState& stat
                     if(name=="SHCreateItemFromRelativeName"){if(!call(1))co_return finish_call(invalid);co_return finish_call(make_item(canonical(*path+u"\\"+read_utf16(m,GuestAddress{call(1)},32767),runtime_.current_directory),riid));}
                     if(name=="SHCreateShellItemArrayFromShellItem"){if(!object)co_return finish_call(invalid);Guid iid{};if(riid)m.read(GuestAddress{riid},iid);if(riid && iid!=unknown && iid!=array_iid)co_return finish_call(no_interface);
                         m.store(GuestAddress{out},width,create_shell_item_array(m,{*path}));co_return finish_call(0);}
-                    if(name=="ILSaveToStream"){
-                        // WORD 大小（含結尾的 IDList 位元組數）後接 IDList 本身。
-                        if(!call(0))co_return finish_call(invalid);std::vector<std::uint8_t> bytes;
-                        if(call(1)){for(std::uint64_t at=call(1);;){const auto cb=static_cast<std::uint16_t>(m.load(GuestAddress{at},16));if(!cb)break;const auto chunk=at;at+=cb;
-                            for(std::uint64_t i=0;i<cb;++i)bytes.push_back(static_cast<std::uint8_t>(m.load(GuestAddress{chunk+i},8)));if(bytes.size()>65000)co_return finish_call(invalid);}}
-                        bytes.push_back(0);bytes.push_back(0);std::vector<std::uint8_t> data{static_cast<std::uint8_t>(bytes.size()&0xffU),static_cast<std::uint8_t>(bytes.size()>>8)};data.insert(data.end(),bytes.begin(),bytes.end());
-                        const auto buffer=temporary.allocate(data.size());if(!buffer)co_return finish_call(no_memory);m.write(GuestAddress{buffer},data);m.store(GuestAddress{slot},32,0);
-                        const auto status=static_cast<std::uint32_t>(co_await service_callback::call(method_at(call(0),4),{call(0),buffer,data.size(),slot}));
-                        if(status&0x80000000U)co_return finish_call(status);co_return finish_call(m.load(GuestAddress{slot},32)==data.size()?0U:0x80004005U);
-                    }
                     // SHCreateShellItem／SHCreateItemWithParent／SHCreateShellItemArray：父路徑來自 PIDL 或資料夾物件，子 PIDL 相對於父路徑。
                     std::u16string parent;if(object)parent=*path;else if(call(0)){const auto decoded=shell_pidl_path(m,call(0));if(!decoded)co_return finish_call(invalid);parent=*decoded;}
                     if(name=="SHCreateShellItemArray"){const auto count=static_cast<std::uint32_t>(call(2));if(!count || !call(3) || parent.empty())co_return finish_call(invalid);std::vector<std::u16string> paths;

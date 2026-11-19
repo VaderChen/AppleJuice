@@ -7,6 +7,7 @@
 #include "crt_time_format.hpp"
 #include "crt_time_storage.hpp"
 #include "monotonic_clock.hpp"
+#include "windows_math_environment.hpp"
 #include <algorithm>
 #include <bit>
 #include "x64arm/x87_fp.hpp"
@@ -24,6 +25,7 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
     static constexpr WindowsServiceDescriptor table[]{
         // 自其他群組遷入：處理函式在本檔。
         {"kernel32.dll", "QueryPerformanceCounter", 1},{"kernel32.dll", "QueryPerformanceFrequency", 1},{"kernel32.dll", "GetSystemTimeAsFileTime", 1},{"kernel32.dll", "GetTickCount", 0},
+        {"vcomp140.dll","omp_get_wtime",0},{"vcomp140.dll","omp_get_wtick",0},
         {"crt","clock",0},
         {"crt","_ftime",1},{"crt","_ftime32",1},{"crt","_ftime64",1},
         {"crt","_ftime_s",1},{"crt","_ftime32_s",1},{"crt","_ftime64_s",1},
@@ -80,6 +82,8 @@ std::span<const WindowsServiceDescriptor> time_service_descriptors() {
         ,{"winmm.dll","waveInPrepareHeader",3},{"winmm.dll","waveInUnprepareHeader",3},{"winmm.dll","waveInAddBuffer",3}
         ,{"winmm.dll","waveInStart",1},{"winmm.dll","waveInStop",1},{"winmm.dll","waveInReset",1},{"winmm.dll","waveInGetPosition",3}
         ,{"winmm.dll","waveInMessage",4,0,0,2}
+        ,{"winmm.dll","auxGetNumDevs",0},{"winmm.dll","auxGetDevCapsA",3,0,0,4},{"winmm.dll","auxGetDevCapsW",3,0,0,4}
+        ,{"winmm.dll","auxGetVolume",2,0,0,1},{"winmm.dll","auxSetVolume",2,0,0,3},{"winmm.dll","auxOutMessage",4,0,0,3}
         ,{"winmm.dll","mixerGetNumDevs",0},{"winmm.dll","mixerGetDevCapsA",3,0,0,4},{"winmm.dll","mixerGetDevCapsW",3,0,0,4}
         ,{"winmm.dll","mixerOpen",5,0,0,18},{"winmm.dll","mixerClose",1},{"winmm.dll","mixerGetID",3,0,0,4},{"winmm.dll","mixerMessage",4,0,0,2}
         ,{"winmm.dll","mixerGetLineInfoA",3,0,0,4},{"winmm.dll","mixerGetLineInfoW",3,0,0,4}
@@ -170,6 +174,14 @@ void write_system_time(GuestMemory& memory,std::uint64_t address,const std::tm& 
 }
 }
 std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
+    if(service.family=="vcomp140.dll"){
+        const WindowsCall call(state,memory,service);
+        const auto frequency=memory.load(GuestAddress{0x7ffe0300},64);
+        const auto count=service.symbol=="omp_get_wtime"?runtime_.clock_ticks:1;
+        windows_floating_return(state,x86_,static_cast<double>(count)/static_cast<double>(frequency),false);
+        call.return_to(state,0);
+        return std::nullopt;
+    }
     // 入口已同步共享時鐘。這組只做整數運算及客體讀寫，不依賴宿主浮點環境。
     // 原通用 provider 仍供關閉政策時對照；ABI、返回寬度及故障順序一致。
     if(service.symbol=="QueryPerformanceCounter" || service.symbol=="QueryPerformanceFrequency" ||
@@ -258,7 +270,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_time(GuestState& state,Gues
         }
         arg.return_to(state,result);return std::nullopt;
     }
-    if(service.symbol.starts_with("mixer"))return invoke_winmm_mixer(state,memory,service);
+    if(service.symbol.starts_with("mixer") || service.symbol.starts_with("aux"))return invoke_winmm_mixer(state,memory,service);
     if(service.symbol.starts_with("mmio"))return invoke_mmio(state,memory,service);
     if(service.symbol.starts_with("waveOut"))return invoke_wave_output(state,memory,service);
     if(service.symbol.starts_with("PlaySound") || service.symbol.starts_with("sndPlaySound"))return invoke_play_sound(state,memory,service);

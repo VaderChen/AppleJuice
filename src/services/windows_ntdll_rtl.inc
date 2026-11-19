@@ -69,7 +69,8 @@ constexpr std::string_view rtl_custom_symbols[]{
     "RtlQueryTimeZoneInformation","RtlQueryDynamicTimeZoneInformation","RtlGetSystemTimePrecise",
     "RtlGetCurrentDirectory_U","RtlSetCurrentDirectory_U","RtlDoesFileExists_U","RtlDosSearchPath_U",
     "RtlQueryEnvironmentVariable_U","RtlQueryEnvironmentVariable","RtlSetEnvironmentVariable","RtlExpandEnvironmentStrings_U",
-    "RtlExpandEnvironmentStrings","RtlCreateEnvironment","RtlDestroyEnvironment","RtlCopySecurityDescriptor","RtlValidRelativeSecurityDescriptor"};
+    "RtlExpandEnvironmentStrings","RtlCreateEnvironment","RtlDestroyEnvironment","RtlCopySecurityDescriptor","RtlValidRelativeSecurityDescriptor",
+    "RtlSetCurrentEnvironment","RtlDefaultNpAcl","RtlAddProcessTrustLabelAce"};
 const RtlForward* rtl_forward(std::string_view symbol){
     const auto found=std::find_if(std::begin(rtl_forwards),std::end(rtl_forwards),[&](const auto& item){return item.symbol==symbol;});
     return found==std::end(rtl_forwards)?nullptr:found;
@@ -134,6 +135,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_rtl_family(GuestState& entr
             const auto string_header=[&](std::uint64_t address,std::uint16_t length){memory.store(GuestAddress{address},16,length);};
             const auto string_capacity=[&](std::uint64_t address){return std::uint32_t{read_counted_header(memory,address,x86_).capacity};};
             const auto string_buffer=[&](std::uint64_t address){return read_counted_header(memory,address,x86_).buffer;};
+            // 目前程序環境的 RtlCreateEnvironment 格式複本（雙 NUL 結尾；空環境為四個 0）。
+            const auto environment_snapshot=[&]{
+                std::vector<std::uint8_t> bytes;const auto source=host_value("kernel32.dll","GetEnvironmentStringsW",{});
+                if(source){
+                    auto at=x86_?source&UINT32_MAX:source;
+                    for(;;){const auto entry=read_utf16(memory,GuestAddress{at},32767);if(entry.empty())break;const auto chunk=utf16_bytes(entry);bytes.insert(bytes.end(),chunk.begin(),chunk.end());at+=(entry.size()+1)*2;}
+                    (void)host("kernel32.dll","FreeEnvironmentStringsW",{source});
+                }
+                bytes.push_back(0);bytes.push_back(0);if(bytes.size()==2){bytes.push_back(0);bytes.push_back(0);}
+                return bytes;
+            };
             try{
                 if(const auto* forward=rtl_forward(name)){
                     std::vector<std::uint64_t> args;args.reserve(service.arguments);
@@ -240,6 +252,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_rtl_family(GuestState& entr
                     if((call(4)&0xffU)!=0x11U)co_return finish(invalid_parameter);
                     co_return finish(status_of(host("advapi32.dll","AddMandatoryAce",{call(0),word(1),word(2),word(3),call(5)})));
                 }
+                if(name=="RtlAddProcessTrustLabelAce"){
+                    // (Acl, AceRevision, AceFlags, ProcessTrustLabelSid, AceType, AccessMask)：只接受 SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE（0x14），
+                    // SID 須為程序信任 SID（S-1-19-類型-等級，兩個子授權）；ACE 經 AddAce 附加在 ACL 尾端，共用空間與版本檢查。
+                    if((call(4)&0xffU)!=0x14U || (word(2)&~0x1fU) || !call(0) || !call(3))co_return finish(invalid_parameter);
+                    std::vector<std::uint8_t> sid(8);memory.read(GuestAddress{call(3)},sid);
+                    if(sid[0]!=1 || sid[1]!=2 || !std::all_of(sid.begin()+2,sid.begin()+7,[](auto value){return value==0;}) || sid[7]!=19)co_return finish(invalid_parameter);
+                    sid.resize(16);memory.read(GuestAddress{call(3)},sid);
+                    std::vector<std::uint8_t> ace(8+sid.size());ace[0]=0x14;ace[1]=static_cast<std::uint8_t>(word(2));ace[2]=static_cast<std::uint8_t>(ace.size());
+                    for(unsigned i=0;i<4;++i)ace[4+i]=static_cast<std::uint8_t>(word(5)>>(i*8));std::copy(sid.begin(),sid.end(),ace.begin()+8);
+                    if(!allocate(ace.size()))co_return finish(no_memory);memory.write(GuestAddress{scratch},ace);
+                    if(host("advapi32.dll","AddAce",{call(0),word(1),UINT32_MAX,scratch,ace.size()}))co_return finish(0);
+                    co_return finish(last_error_==122?0xc0000099U:nt_status(last_error_)); // 空間不足為 STATUS_ALLOTTED_SPACE_EXCEEDED
+                }
                 if(name=="RtlQueryTimeZoneInformation" || name=="RtlQueryDynamicTimeZoneInformation"){
                     // RTL_TIME_ZONE_INFORMATION 與 TIME_ZONE_INFORMATION 版面相同，只有兩個日期是 TIME_FIELDS 而非 SYSTEMTIME。
                     if(!call(0))co_return finish(access_violation);
@@ -315,7 +340,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_rtl_family(GuestState& entr
                     if(!call(1))co_return finish(access_violation);
                     const auto key=counted(call(1));if(key.empty() || key.find(u'=',1)!=key.npos)co_return finish(invalid_parameter);
                     const std::optional<std::u16string> value=call(2)?std::optional{counted(call(2))}:std::nullopt;
-                    if(!call(0)){
+                    const auto parameters=memory.load(GuestAddress{peb_base_.value+(x86_?0x10U:0x20U)},bits);
+                    const auto environment_field=parameters+detail::ProcessParameterLayout::for_x86(x86_).environment;
+                    if(!call(0) || call(0)==environment_field){
                         if(!allocate(key.size()*2+2+(value?value->size()*2+2:0)))co_return finish(no_memory);
                         memory.write(GuestAddress{scratch},utf16_bytes(key));const auto text=scratch+key.size()*2+2;
                         if(value)memory.write(GuestAddress{text},utf16_bytes(*value));
@@ -362,18 +389,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_rtl_family(GuestState& entr
                 if(name=="RtlCreateEnvironment"){
                     // (BOOLEAN Inherit, PWSTR* Environment)：Inherit 時複製目前程序環境，否則建立空白區塊。
                     if(!call(1))co_return finish(access_violation);
-                    std::vector<std::uint8_t> bytes{0,0,0,0};
-                    if(call(0)&0xffU){
-                        const auto source=host_value("kernel32.dll","GetEnvironmentStringsW",{});
-                        if(source){
-                            bytes.clear();auto at=x86_?source&UINT32_MAX:source;
-                            for(;;){const auto entry=read_utf16(memory,GuestAddress{at},32767);if(entry.empty())break;const auto chunk=utf16_bytes(entry);bytes.insert(bytes.end(),chunk.begin(),chunk.end());at+=(entry.size()+1)*2;}
-                            bytes.push_back(0);bytes.push_back(0);if(bytes.size()==2){bytes.push_back(0);bytes.push_back(0);}
-                            (void)host("kernel32.dll","FreeEnvironmentStringsW",{source});
-                        }
-                    }
+                    const auto bytes=(call(0)&0xffU)?environment_snapshot():std::vector<std::uint8_t>{0,0,0,0};
                     const auto created=allocate_heap(memory,bytes.size());if(!created)co_return finish(no_memory);
                     memory.write(GuestAddress{created},bytes);memory.store(GuestAddress{call(1)},bits,created);co_return finish(0);
+                }
+                if(name=="RtlSetCurrentEnvironment"){
+                    // 新區塊直接成為目前環境；有輸出指標時將舊區塊所有權交回呼叫端。
+                    if(!call(0))co_return finish(invalid_parameter);
+                    std::uint64_t previous=0;
+                    if(call(1))memory.check(GuestAddress{call(1)},unit,Access::Write);
+                    const auto bytes=detail::capture_native_environment(memory,call(0));
+                    const auto error=replace_process_environment(memory,state,bytes,call(0),call(1)?&previous:nullptr);
+                    if(error)co_return finish(nt_status(error));
+                    if(call(1))memory.store(GuestAddress{call(1)},bits,previous);
+                    co_return finish(0);
+                }
+                if(name=="RtlDefaultNpAcl"){
+                    // (PACL* Acl)：與 CreateNamedPipe 未帶安全描述元時相同的預設 DACL，以程序 heap 配置（呼叫端以 RtlFreeHeap 釋放）。
+                    if(!call(0))co_return finish(access_violation);
+                    initialize_tokens();const auto acl=default_pipe_acl(runtime_.token_objects.at(effective_token_id()).owner);
+                    const auto block=allocate_heap(memory,acl.size());if(!block)co_return finish(no_memory);
+                    memory.write(GuestAddress{block},acl);memory.store(GuestAddress{call(0)},bits,block);co_return finish(0);
                 }
                 if(name=="RtlDestroyEnvironment"){
                     if(call(0) && !free_heap(memory,call(0),state))co_return finish(invalid_parameter);co_return finish(0);
@@ -406,6 +442,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_rtl_family(GuestState& entr
                     memory.store(GuestAddress{call(1)},bits,created);co_return finish(0);
                 }
             }catch(const NativeError& error){co_return finish(error.status);}
+            catch(const detail::NativeProcessError& error){co_return finish(error.status);}
+            catch(const std::bad_alloc&){co_return finish(no_memory);}
             catch(const MemoryFault&){co_return finish(access_violation);}
             throw HostCallFault("未知的 Rtl 轉接服務");
         });

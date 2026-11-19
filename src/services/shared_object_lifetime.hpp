@@ -88,6 +88,8 @@ inline int reopen_live_named_object(const std::string& session,int directory,
     case UINT64_C(0x544e564552413458):known=before.st_size==4096 && dword(24)>0 && dword(24)<260;break;
     case UINT64_C(0x504d455352413458):known=before.st_size==4096 && dword(24)>0 && dword(24)<260 && dword(548)>0 && dword(548)<=INT32_MAX;break;
     case UINT64_C(0x5854554d52413458):known=before.st_size==4096 && dword(40)>0 && dword(40)<260;break;
+    // 物件命名空間的暫時目錄／符號連結／私有命名空間；永久與內建項目（旗標 1、4）不回收。
+    case UINT64_C(0x53504e4f52413458):known=before.st_size==16384 && dword(24)>0 && dword(24)<=1024 && !(dword(20)&5U);break;
     case UINT64_C(0x50414d4d52413458):known=before.st_size>65536 && qword(8)>0 &&
         qword(8)<=static_cast<std::uint64_t>(before.st_size)-65536 && dword(28)>0 && dword(28)<260;break;
     default:break;

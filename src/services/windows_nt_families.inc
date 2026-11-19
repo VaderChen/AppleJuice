@@ -216,7 +216,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_family(GuestState& entry
                 if(name=="NtCreateJobObject" || name=="NtOpenJobObject"){
                     const bool creating=name=="NtCreateJobObject";
                     if(!call(0))co_return finish(access_violation);memory.check(GuestAddress{call(0)},unit,Access::Write);
-                    Win32ObjectRequest request;if(const auto status=win32_object_request(memory,temporary,runtime_,call(2),x86_,creating,request))co_return finish(status);
+                    Win32ObjectRequest request;if(const auto status=win32_object_request(memory,temporary,runtime_,call(2),x86_,creating,request,[this](std::u16string& text,bool create){return namespace_object_name(text,create);}))co_return finish(status);
                     const auto text=request.name;
                     auto handle=creating?host_value("kernel32.dll","CreateJobObjectW",{request.security,text}):
                         host_value("kernel32.dll","OpenJobObjectW",{word(1),request.inherit()?1U:0U,text});

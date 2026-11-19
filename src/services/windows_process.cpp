@@ -69,6 +69,11 @@ struct ProcessRecord {
             std::uint32_t version{}, flags{}, length{};
             std::array<char16_t, 1025> command_line{};
         } restart;
+        // Application Recovery 的回呼登記（舊紀錄此處為零：version 0 表示沒有登記）。
+        struct alignas(8) RecoverySettings {
+            std::uint32_t version{}, flags{}, ping{}, reserved{};
+            std::uint64_t callback{}, parameter{};
+        } recovery;
     };
     static_assert(sizeof(Header) <= 4096);
     int descriptor{-1};
@@ -1210,7 +1215,7 @@ std::uint32_t WindowsServices::capture_process_snapshot(GuestMemory &memory,
     entries = std::move(captured);
     return 0;
 }
-std::uint32_t WindowsServices::process_image_path(GuestMemory &memory, std::uint32_t pid, std::u16string &path) {
+std::uint32_t WindowsServices::process_image_path(GuestMemory &memory, std::uint32_t pid, std::u16string &path, std::uint64_t expected_birth) {
     if (pid == process_id()) {
         path = runtime_.image.path;
         if (path.empty()) {
@@ -1232,7 +1237,7 @@ std::uint32_t WindowsServices::process_image_path(GuestMemory &memory, std::uint
     if (!std::binary_search(ids.begin(), ids.end(), pid))
         return 1168;
     const auto record = ProcessRecord::open(mapping_session(), pid, false);
-    if (!record || !record->alive())
+    if (!record || !record->alive() || (expected_birth && record->data->birth != expected_birth))
         return 1168;
     auto pattern = (std::filesystem::temp_directory_path() / "x64arm-image-XXXXXX").string();
     std::vector<char> name(pattern.begin(), pattern.end());
@@ -2317,6 +2322,8 @@ std::span<const WindowsServiceDescriptor> process_service_descriptors() {
         {"kernel32.dll", "CheckRemoteDebuggerPresent", 2},
         {"kernel32.dll", "GetProcessIoCounters", 2},
         {"kernel32.dll", "SetProcessAffinityMask", 2},
+        {"kernel32.dll", "SetProcessAffinityUpdateMode", 2, 0, 0, 0x2},
+        {"kernel32.dll", "QueryProcessAffinityUpdateMode", 2},
         {"kernel32.dll", "GetProcessAffinityMask", 3},
         {"kernel32.dll", "SetProcessShutdownParameters", 2, 0, 0, 0x3},
         {"kernel32.dll", "GetProcessShutdownParameters", 2},
@@ -2324,6 +2331,8 @@ std::span<const WindowsServiceDescriptor> process_service_descriptors() {
         {"kernel32.dll", "GetProcessHandleCount", 2},
         {"kernel32.dll", "RegisterApplicationRestart", 2, 0, 0, 0x2},
         {"kernel32.dll", "GetApplicationRestartSettings", 4},
+        {"kernel32.dll", "RegisterApplicationRecoveryCallback", 4}, {"kernel32.dll", "UnregisterApplicationRecoveryCallback", 0}, {"kernel32.dll", "GetApplicationRecoveryCallback", 5},
+        {"kernel32.dll", "ApplicationRecoveryInProgress", 1}, {"kernel32.dll", "ApplicationRecoveryFinished", 1},
         {"kernel32.dll", "UnregisterApplicationRestart", 0},
         {"kernel32.dll", "GetProcessMitigationPolicy", 4, 0, 0, 0x2},
         {"kernel32.dll", "SetProcessMitigationPolicy", 3, 0, 0, 0x1},
@@ -3293,6 +3302,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
         result = 0;
     };
 #include "windows_application_restart.inc"
+#include "windows_application_recovery.inc"
 #include "windows_process_termination.inc"
     if (symbol == "GetProcessVersion") {
         // 版本取自目標 EXE 的 OptionalHeader.SubsystemVersion，不是宿主或 Windows 版本。
@@ -3434,6 +3444,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_process(GuestState &state, 
                 memory.store(GuestAddress{arg(1)}, 32, count);
                 result = 1;
             }
+        }
+    } else if (symbol == "SetProcessAffinityUpdateMode" || symbol == "QueryProcessAffinityUpdateMode") {
+        // 只接受本程序的 handle；旗標只有 PROCESS_AFFINITY_ENABLE_AUTO_UPDATE（1）。Query 的輸出可省略。
+        if (!current_process_handle(arg(0)))
+            fail(87);
+        else if (symbol == "SetProcessAffinityUpdateMode") {
+            if (static_cast<std::uint32_t>(arg(1)) & ~1U)
+                fail(87);
+            else {
+                runtime_.process_affinity_update_mode = static_cast<std::uint32_t>(arg(1));
+                result = 1;
+            }
+        } else {
+            if (arg(1)) {
+                memory.check(GuestAddress{arg(1)}, 4, Access::Write);
+                memory.store(GuestAddress{arg(1)}, 32, runtime_.process_affinity_update_mode);
+            }
+            result = 1;
         }
     } else if (symbol == "GetProcessAffinityMask" || symbol == "SetProcessAffinityMask") {
         const bool setting = symbol.starts_with("Set");

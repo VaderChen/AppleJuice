@@ -7,10 +7,11 @@ if (service.family == "concrt140.dll" && name.find("@_Concurrent_queue_base_v4@"
 }
 // Concrt 物件保留 v14 的儲存區大小；私有欄位採共用 SRW／CV 字組，沒有第二套等待佇列。
 // 只處理 critical_section（含 scoped_lock）與 _Condition_variable；其他 Concrt 鎖在 concrt_lock_handlers.inc。
-if (service.family == "concrt140.dll" && (name.find("critical_section@Concurrency@@") != name.npos || name.find("@_Condition_variable@details@Concurrency@@") != name.npos)) {
+if (service.family == "concrt140.dll" && (name.find("critical_section@Concurrency@@") != name.npos || name.find("_Condition_variable@details@Concurrency@@") != name.npos)) {
     const auto self = x86_ ? state.reg(Gpr::Rcx) & UINT32_MAX : call(0);
     const auto argument = [&](unsigned index) { return call(index + (x86_ ? 0U : 1U)); };
-    const bool condition = name.find("@_Condition_variable@") != name.npos;
+    // 建構／解構子的名稱以 ??0_／??1_ 開頭，前面沒有 @；以類別限定名稱判斷。
+    const bool condition = name.find("_Condition_variable@details@Concurrency@@") != name.npos;
     const bool scoped = name.find("scoped_lock@") != name.npos;
     const bool constructor = name.starts_with("??0"), destructor = name.starts_with("??1");
     const auto size = condition ? (x86_ ? 36U : 64U) : scoped ? (x86_ ? 28U : 48U) : (x86_ ? 32U : 56U);

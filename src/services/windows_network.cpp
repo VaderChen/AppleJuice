@@ -316,6 +316,11 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         {"dnsapi.dll","DnsWriteQuestionToBuffer_W",6},{"dnsapi.dll","DnsWriteQuestionToBuffer_UTF8",6},{"dnsapi.dll","DnsExtractRecordsFromMessage_W",3},{"dnsapi.dll","DnsExtractRecordsFromMessage_UTF8",3},
         {"dnsapi.dll","DnsFlushResolverCache",0},{"dnsapi.dll","DnsFlushResolverCacheEntry_A",1},{"dnsapi.dll","DnsFlushResolverCacheEntry_W",1},{"dnsapi.dll","DnsFlushResolverCacheEntry_UTF8",1},{"dnsapi.dll","DnsGetCacheDataTable",1},
         {"dnsapi.dll","DnsQueryConfig",6},{"dnsapi.dll","DnsQueryEx",3},{"dnsapi.dll","DnsServiceConstructInstance",10},{"dnsapi.dll","DnsServiceFreeInstance",1},
+        {"dnsapi.dll","DnsServiceBrowse",2},{"dnsapi.dll","DnsServiceBrowseCancel",1},{"dnsapi.dll","DnsServiceResolve",2},{"dnsapi.dll","DnsServiceResolveCancel",1},
+        {"dnsapi.dll","DnsServiceRegister",2},{"dnsapi.dll","DnsServiceDeRegister",2},{"dnsapi.dll","DnsServiceRegisterCancel",1},{"dnsapi.dll","DnsStartMulticastQuery",2},{"dnsapi.dll","DnsStopMulticastQuery",1},
+        {"dnsapi.dll","DnsAcquireContextHandle_A",3},{"dnsapi.dll","DnsAcquireContextHandle_W",3},{"dnsapi.dll","DnsAcquireContextHandle_UTF8",3},{"dnsapi.dll","DnsReleaseContextHandle",1},{"internal-dnssd","Worker",1},
+        {"dnsapi.dll","DnsModifyRecordsInSet_A",6,0,0,0x4},{"dnsapi.dll","DnsModifyRecordsInSet_W",6,0,0,0x4},{"dnsapi.dll","DnsModifyRecordsInSet_UTF8",6,0,0,0x4},
+        {"dnsapi.dll","DnsReplaceRecordSetA",5,0,0,0x2},{"dnsapi.dll","DnsReplaceRecordSetW",5,0,0,0x2},{"dnsapi.dll","DnsReplaceRecordSetUTF8",5,0,0,0x2},
         
         
         
@@ -342,6 +347,7 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         {"ws2_32.dll","WSAAsyncGetHostByName",5},{"ws2_32.dll","WSAAsyncGetHostByAddr",7},
         {"ws2_32.dll","WSAAsyncGetProtoByName",5},{"ws2_32.dll","WSAAsyncGetProtoByNumber",5},
         {"ws2_32.dll","WSAAsyncGetServByName",6},{"ws2_32.dll","WSAAsyncGetServByPort",6},{"ws2_32.dll","WSACancelAsyncRequest",1},
+        {"ws2_32.dll","WSAIsBlocking",0},{"ws2_32.dll","WSASetBlockingHook",1},{"ws2_32.dll","WSAUnhookBlockingHook",0},{"ws2_32.dll","WSACancelBlockingCall",0},{"internal-wsock-blocking","DefaultHook",0},
         {"ws2_32.dll","inet_addr",1},{"internal-wsock32","inet_network",1},{"ws2_32.dll","inet_ntoa",1},{"ws2_32.dll","WSAAsyncSelect",4},{"ws2_32.dll","WSAEventSelect",3},{"ws2_32.dll","WSAEnumNetworkEvents",3},{"ws2_32.dll","WSACreateEvent",0},{"ws2_32.dll","WSAStartup",2},{"ws2_32.dll","WSACleanup",0},{"ws2_32.dll","WSAGetLastError",0},{"ws2_32.dll","WSASetLastError",1},
         {"mswsock.dll","AcceptEx",8},{"mswsock.dll","GetAcceptExSockaddrs",8},{"mswsock.dll","ConnectEx",7},{"mswsock.dll","DisconnectEx",4},{"mswsock.dll","TransmitFile",7},
         {"ws2_32.dll","AcceptEx",8},{"ws2_32.dll","GetAcceptExSockaddrs",8},{"ws2_32.dll","WSAGetOverlappedResult",5},
@@ -370,7 +376,11 @@ std::span<const WindowsServiceDescriptor> network_service_descriptors() {
         {"ws2_32.dll","WSASetServiceA",3},{"ws2_32.dll","WSASetServiceW",3},
         {"ws2_32.dll","WSAEnumNameSpaceProvidersA",2},{"ws2_32.dll","WSAEnumNameSpaceProvidersW",2},
         {"ws2_32.dll","WSALookupServiceBeginA",3},{"ws2_32.dll","WSALookupServiceBeginW",3},
-        {"ws2_32.dll","WSALookupServiceNextA",4},{"ws2_32.dll","WSALookupServiceNextW",4},{"ws2_32.dll","WSALookupServiceEnd",1}
+        {"ws2_32.dll","WSALookupServiceNextA",4},{"ws2_32.dll","WSALookupServiceNextW",4},{"ws2_32.dll","WSALookupServiceEnd",1},
+        {"ws2_32.dll","WSAInstallServiceClassA",1},{"ws2_32.dll","WSAInstallServiceClassW",1},{"ws2_32.dll","WSARemoveServiceClass",1},
+        {"ws2_32.dll","WSAGetServiceClassInfoA",4},{"ws2_32.dll","WSAGetServiceClassInfoW",4},
+        {"ws2_32.dll","WSAGetServiceClassNameByClassIdA",3},{"ws2_32.dll","WSAGetServiceClassNameByClassIdW",3},
+        {"ws2_32.dll","WSCGetApplicationCategory",6,0,0,0xa},{"ws2_32.dll","WSCSetApplicationCategory",7,0,0,0x1a}
     };return table;
 }
 #include "windows_socket_accept.inc"
@@ -378,8 +388,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
 #include "windows_dns.inc"
 #include "windows_socket_connect_name.inc"
 #include "windows_socket_legacy.inc"
+#include "windows_socket_blocking.inc"
     if(service.symbol=="accept" || service.symbol=="WSAAccept")return invoke_socket_accept(state,memory,service);
-    if(service.symbol.starts_with("WSALookupService") || service.symbol.starts_with("WSASetService") || service.symbol.starts_with("WSAEnumNameSpaceProviders"))return invoke_socket_namespace(state,memory,service);
+    if(service.symbol.starts_with("WSALookupService") || service.symbol.starts_with("WSASetService") || service.symbol.starts_with("WSAEnumNameSpaceProviders") ||
+       service.symbol.starts_with("WSAInstallServiceClass") || service.symbol=="WSARemoveServiceClass" || service.symbol.starts_with("WSAGetServiceClass") ||
+       service.symbol=="WSCGetApplicationCategory" || service.symbol=="WSCSetApplicationCategory")return invoke_socket_namespace(state,memory,service);
     if(service.symbol=="WSAPoll" || service.symbol=="WSASendDisconnect" || service.symbol=="WSARecvDisconnect" || service.symbol=="WSAJoinLeaf")return invoke_socket_poll(state,memory,service);
     if(service.symbol.starts_with("WSAAsyncGet") || service.symbol=="WSACancelAsyncRequest" || service.symbol=="gethostbyname" || service.symbol=="gethostbyaddr" || service.symbol=="getservbyname" || service.symbol=="getservbyport" || service.symbol=="getprotobyname" || service.symbol=="getprotobynumber")return invoke_socket_database(state,memory,service);
     if(service.symbol=="AcceptEx" || service.symbol=="GetAcceptExSockaddrs" || service.symbol=="WSAGetOverlappedResult")return invoke_network_extension(state,memory,service);
@@ -594,7 +607,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
                 const auto limits=x86_?390U:4U;data[limits]=0;data[limits+1]=4;data[limits+2]=0xe3;data[limits+3]=0xff;
                 constexpr std::string_view description="x64arm Winsock",status="Running";
                 std::copy(description.begin(),description.end(),data.begin()+(x86_?4:16));std::copy(status.begin(),status.end(),data.begin()+(x86_?261:273));
-                memory.write(GuestAddress{arg(1)},data);++network.startups;
+                memory.write(GuestAddress{arg(1)},data);++network.startups;network.negotiated_version=data[0]|static_cast<std::uint32_t>(data[1])<<8;
             }
         } else if (symbol=="WSAGetLastError") result=last_error_;
         else if (symbol=="WSASetLastError") last_error_=u32(0);
@@ -636,7 +649,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_network(GuestState& state,G
             else if(!arg(2))fail(10014);
             else {const bool short_value=symbol.ends_with('s');memory.store(GuestAddress{arg(2)},short_value?16:32,short_value?htons(static_cast<std::uint16_t>(arg(1))):htonl(u32(1)));}
         }
-    else if (symbol=="WSACleanup") {if (--network.startups==0) {cancel_socket_lookups();network.namespace_lookups.clear();cancel_network_io(memory);for(const auto& [handle,socket]:network.sockets){(void)socket;runtime_.handle_flags.erase(handle);}for(const auto& [handle,watch]:gui_.socket_watches){const auto socket=network.sockets.find(handle);if(socket!=network.sockets.end() && watch.generation==socket->second->shared->data().watch_generation.load())socket->second->shared->data().watch_generation.fetch_add(1);}network.sockets.clear();network.duplications.clear();network.completion_flags.clear();network.completion_errors.clear();gui_.socket_watches.clear();}}
+    else if (symbol=="WSACleanup") {if (--network.startups==0) {network.blocking_hooks.clear();network.negotiated_version=0;cancel_socket_lookups();network.namespace_lookups.clear();cancel_network_io(memory);for(const auto& [handle,socket]:network.sockets){(void)socket;runtime_.handle_flags.erase(handle);}for(const auto& [handle,watch]:gui_.socket_watches){const auto socket=network.sockets.find(handle);if(socket!=network.sockets.end() && watch.generation==socket->second->shared->data().watch_generation.load())socket->second->shared->data().watch_generation.fetch_add(1);}network.sockets.clear();network.duplications.clear();network.completion_flags.clear();network.completion_errors.clear();gui_.socket_watches.clear();}}
         else if(symbol=="WSADuplicateSocketA" || symbol=="WSADuplicateSocketW"){
             const auto socket=network.sockets.find(arg(0));
             if(socket==network.sockets.end())fail(10038);

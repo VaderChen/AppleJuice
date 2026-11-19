@@ -1,0 +1,11 @@
+// Win32 cdecl 的第 3 個參數只有 64 位元整數與 double 佔兩個堆疊槽。
+VCOMP(_vcomp_reduction_i1,3,0)
+VCOMP(_vcomp_reduction_u1,3,0)
+VCOMP(_vcomp_reduction_i2,3,0)
+VCOMP(_vcomp_reduction_u2,3,0)
+VCOMP(_vcomp_reduction_i4,3,0)
+VCOMP(_vcomp_reduction_u4,3,0)
+VCOMP(_vcomp_reduction_i8,3,4)
+VCOMP(_vcomp_reduction_u8,3,4)
+VCOMP(_vcomp_reduction_r4,3,0)
+VCOMP(_vcomp_reduction_r8,3,4)

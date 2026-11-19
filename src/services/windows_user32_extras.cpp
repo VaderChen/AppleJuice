@@ -13,7 +13,7 @@ std::span<const WindowsServiceDescriptor> user32_extra_service_descriptors(){
         {"user32.dll","ShowWindowAsync",2,0,0,0x2},{"user32.dll","CloseWindow",1},{"user32.dll","GetInputState",0},
         {"user32.dll","GetWindowModuleFileName",3,0,0,0x4},{"user32.dll","GetWindowModuleFileNameA",3,0,0,0x4},{"user32.dll","GetWindowModuleFileNameW",3,0,0,0x4},
         {"user32.dll","SetMessageQueue",1,0,0,0x1},{"user32.dll","IsImmersiveProcess",1},{"user32.dll","GetSystemDpiForProcess",1},
-        {"user32.dll","GetThreadDpiHostingBehavior",0},{"user32.dll","SetThreadDpiHostingBehavior",1,0,0,0x1},
+        {"user32.dll","GetThreadDpiHostingBehavior",0},{"user32.dll","GetWindowDpiHostingBehavior",1},{"user32.dll","SetThreadDpiHostingBehavior",1,0,0,0x1},
         // 視窗屬性列舉、執行緒 GUI 狀態、標題列、視窗字組、說明 ID、內部文字、切換與排列、圖示資訊、手勢設定、Shell 視窗與舊式 IME。
         {"user32.dll","EnumPropsA",2},{"user32.dll","EnumPropsW",2},{"user32.dll","EnumPropsExA",3},{"user32.dll","EnumPropsExW",3},
         {"user32.dll","GetGUIThreadInfo",2},{"user32.dll","GetTitleBarInfo",2},{"user32.dll","GetWindowWord",2},{"user32.dll","SetWindowWord",3},
@@ -153,6 +153,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
         return done(host("user32.dll","GetDpiForSystem",{}));
     }
     if(name=="GetThreadDpiHostingBehavior")return done(dpi_hosting_behavior_[threads_.current]);
+    // 視窗建立時記錄建立執行緒的 hosting 行為；不存在的視窗回 DPI_HOSTING_BEHAVIOR_INVALID（-1）。
+    if(name=="GetWindowDpiHostingBehavior"){const auto found=gui_.windows.find(arg(0));return done(found==gui_.windows.end()?UINT32_MAX:found->second.dpi_hosting);}
     if(name=="SetThreadDpiHostingBehavior"){
         // DPI_HOSTING_BEHAVIOR：DEFAULT＝0、MIXED＝1；回傳先前值，無效值回 INVALID（-1）。
         if(u32(0)>1)return done(UINT32_MAX);

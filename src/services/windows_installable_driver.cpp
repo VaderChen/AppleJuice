@@ -5,7 +5,7 @@
 // - SendDriverMessage（DrvSendMessage）：以執行個體的 dwDriverId 呼叫 DriverProc；無效控制代碼回 0。
 // - CloseDriver（DrvClose）：送 DRV_CLOSE（呼叫者的 lParam1／lParam2）並回傳其結果；模組最後一個執行個體再送 DRV_DISABLE、DRV_FREE，每次都 FreeLibrary。
 // - DefDriverProc（DrvDefDriverProc）：DRV_LOAD／ENABLE／OPEN／CLOSE／DISABLE／FREE 與 DRV_INSTALL／REMOVE（DRVCNF_OK）為 1，其餘為 0。
-// - GetDriverModuleHandle（DrvGetModuleHandle）：執行個體所屬模組。
+// - GetDriverModuleHandle（DrvGetModuleHandle）與 GetDriverFlags 共用執行個體表。有效 PE 驅動程式的存在旗標為 0x80000000。
 // - DriverCallback：依 DCB_* 類型張貼視窗訊息（wParam 為裝置、lParam 為 dwParam1）、執行緒訊息、呼叫 DRVCALLBACK 函式或設定事件；DCB_NULL 不做事。
 // - mmTaskCreate／mmTaskBlock／mmTaskSignal／mmTaskYield／mmGetCurrentTask：驅動程式的工作執行緒。工作即執行緒（HTASK 為執行緒 ID）；
 //   mmTaskCreate 以 CreateThread 從內部入口 TaskStart 開始，再以客體回呼執行 lpfn(dwInst)（TASKCALLBACK 未指定呼叫慣例，回呼框架不依賴被呼叫端清理堆疊），mmTaskSignal 張貼 WM_USER 執行緒訊息，mmTaskBlock 以 GetMessage 等候並分派視窗訊息直到收到 WM_USER。
@@ -19,7 +19,7 @@ namespace x64arm {
 std::span<const WindowsServiceDescriptor> installable_driver_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"winmm.dll","OpenDriver",3},{"winmm.dll","OpenDriverA",3},{"winmm.dll","CloseDriver",3},{"winmm.dll","SendDriverMessage",4,0,0,0x2},
-        {"winmm.dll","DefDriverProc",5,0,0,0x4},{"winmm.dll","GetDriverModuleHandle",1},{"winmm.dll","DriverCallback",7,0,0,0xa},
+        {"winmm.dll","DefDriverProc",5,0,0,0x4},{"winmm.dll","GetDriverModuleHandle",1},{"winmm.dll","GetDriverFlags",1},{"winmm.dll","DriverCallback",7,0,0,0xa},
         {"winmm.dll","mmTaskCreate",3},{"winmm.dll","mmTaskBlock",1,0,0,0x1},{"winmm.dll","mmTaskSignal",1,0,0,0x1},{"winmm.dll","mmTaskYield",0},{"winmm.dll","mmGetCurrentTask",0},
         {"internal-winmm","TaskStart",1}};
     return table;
@@ -40,9 +40,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_installable_driver(GuestSta
         const WindowsCall call(state,memory,service);if(name=="mmTaskYield")threads_.yield=true;
         call.return_to(state,name=="mmGetCurrentTask"?thread_identifier(threads_.current):0);return std::nullopt;
     }
-    if(name=="GetDriverModuleHandle"){
+    if(name=="GetDriverModuleHandle" || name=="GetDriverFlags"){
         const WindowsCall call(state,memory,service);const auto found=installable_drivers_.find(call(0));
-        call.return_to(state,found==installable_drivers_.end()?0:found->second.module);return std::nullopt;
+        std::uint64_t value=0;
+        if(found!=installable_drivers_.end())value=name=="GetDriverFlags"?0x80000000U:found->second.module;
+        call.return_to(state,value);return std::nullopt;
     }
     return nested_continuation(state,memory,"可安裝驅動程式",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
         const WindowsCall call(s,m,service);const auto name=service.symbol;

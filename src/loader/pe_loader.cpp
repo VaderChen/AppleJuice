@@ -192,8 +192,9 @@ void exports(const Image& image, Directory dir, RuntimeImage& runtime) {
         }
     }
 }
-// Debug metadata never executes. Validate both mapped RVA and file-only records,
-// including modern zero-payload reproducible-build records, then leave it untouched.
+// 除錯資料不執行。載入映像使用 AddressOfRawData；只有未映射的資料才使用
+// PointerToRawData。映像重排後，檔案工具的位置可能過時，不能取代有效的 RVA。
+// PE Format / Debug Directory：RVA 為零表示資料只存在於檔案中。
 void debug_directory(const Reader& file, const Image& image, Directory dir) {
     if (!dir.rva) return;
     if (dir.size % 28) reject("debug directory 項目截斷");
@@ -202,9 +203,11 @@ void debug_directory(const Reader& file, const Image& image, Directory dir) {
         const auto size = image.integer(at + 16, 4);
         const auto rva = image.integer(at + 20, 4), raw = image.integer(at + 24, 4);
         if (size) {
-            if (!raw) reject("debug data 缺少檔案位置");
-            file.check(static_cast<std::size_t>(raw), static_cast<std::size_t>(size));
             if (rva) image.check(rva, size);
+            else {
+                if (!raw) reject("debug data 缺少檔案位置");
+                file.check(static_cast<std::size_t>(raw), static_cast<std::size_t>(size));
+            }
         }
     }
 }
@@ -813,11 +816,16 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
         std::uint64_t previous_begin = 0, previous_end = 0;
         for (std::uint64_t at = exception.rva; at < std::uint64_t{exception.rva} + exception.size; at += 12) {
             const auto begin = image.integer(at, 4), end = image.integer(at + 4, 4), unwind = image.integer(at + 8, 4);
-            // Linker 可保留零長度函式的 .pdata。它不覆蓋任何 PC，但實體索引仍須保存。
+            // Linker／封裝工具可保留不涵蓋任何 PC 的 .pdata（begin >= end）。
+            // Windows 查詢只會命中 begin <= PC < end；不使用這些記錄的 xdata。
+            // 保留實體索引，不能刪除後改變 RtlLookupFunctionEntry 的客體表格地址。
             // ICF 可讓不同符號共用同一段程式碼，並各自保留 unwind 記錄。
             // 保留所有實體索引；只容許完全相同的範圍，不接受部分相交或亂序。
             const bool folded = !runtime.functions.empty() && begin == previous_begin && end == previous_end;
-            if (begin > end || begin < previous_begin || (begin < end && begin < previous_end && !folded)) reject("RUNTIME_FUNCTION 範圍未排序或重疊");
+            if (begin < previous_begin || (begin < end && begin < previous_end && !folded)) reject("RUNTIME_FUNCTION 範圍未排序或重疊");
+            runtime.functions.push_back({static_cast<std::uint32_t>(begin), static_cast<std::uint32_t>(end), static_cast<std::uint32_t>(unwind)});
+            previous_begin = begin;
+            if (begin >= end) continue;
             image.check(begin, end - begin); image.check(unwind, 4);
             image.executable(begin,end-begin,"RUNTIME_FUNCTION 不在 executable section");
             const auto header = image.integer(unwind, 1), count_codes = image.integer(unwind + 2, 1);
@@ -828,9 +836,7 @@ ParsedPeImage parse_pe_image_impl(std::span<const std::uint8_t> bytes, std::opti
             const auto tail = unwind + 4 + slots * 2;
             if (header & 32) image.check(tail, 12);
             else if (header & 24) { const auto handler = image.integer(tail, 4); image.check(handler, 1); }
-            runtime.functions.push_back({static_cast<std::uint32_t>(begin), static_cast<std::uint32_t>(end), static_cast<std::uint32_t>(unwind)});
-            previous_begin = begin;
-            if(begin<end)previous_end = end;
+            previous_end = end;
         }
     }
     const auto tls = directories[9];

@@ -8,6 +8,10 @@
 // - SaveAsFile／IPersistStream::Save：KeepOriginalFormat 為真且保有原始檔時寫原始資料，否則點陣圖寫 32 位元 BMP、圖示寫 ICO、WMF 寫 placeable、EMF 寫原生位元組；
 //   OleSavePictureFile 與 Visual Basic 的 SavePicture 相同，JPEG／GIF 改存 BMP。
 // - IPictureDisp：Handle（0）、hPal（2）、Type（3）、Width（4）、Height（5）屬性與 Render（6）方法；沒有型別程式庫（GetTypeInfoCount 為 0）。
+// - class factory：DllGetClassObject（序數 1）與 CoCreateInstance／CoGetClassObject 的 CLSID_StdFont、CLSID_StdPicture 共用一個 IClassFactory；
+//   CreateInstance 建立未初始化圖片（OleCreatePictureIndirect(NULL)）或預設字型（MS Sans Serif 12 點、FW_NORMAL、ANSI_CHARSET，與 MFC 控制項預設 FONTDESC 相同），
+//   之後通常以 IPersistStream::Load 或屬性設定填入。LockServer 計數；DllCanUnloadNow（序數 410）在沒有存活圖片、字型、class factory 與鎖定時回 S_OK。
+//   proxy／stub 類別（PSDispatch 等）需要跨 apartment 封送，回 CLASS_E_CLASSNOTAVAILABLE。
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
@@ -15,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <vector>
 
 namespace x64arm {
 namespace {
@@ -29,6 +34,11 @@ constexpr auto iid_persist=make_guid(0x0000010c,0,0,{0xc0,0,0,0,0,0,0,0x46}),iid
 constexpr auto iid_picture=make_guid(0x7bf80980,0xbf32,0x101a,{0x8b,0xbb,0x00,0xaa,0x00,0x30,0x0c,0xab});
 constexpr auto iid_picture_disp=make_guid(0x7bf80981,0xbf32,0x101a,{0x8b,0xbb,0x00,0xaa,0x00,0x30,0x0c,0xab});
 constexpr auto clsid_std_picture=make_guid(0x0be35204,0x8f91,0x11ce,{0x9d,0xe3,0x00,0xaa,0x00,0x4b,0xb8,0x51});
+constexpr auto clsid_std_font=make_guid(0x0be35203,0x8f91,0x11ce,{0x9d,0xe3,0x00,0xaa,0x00,0x4b,0xb8,0x51});
+constexpr auto iid_class_factory=make_guid(0x00000001,0,0,{0xc0,0,0,0,0,0,0,0x46});
+constexpr std::uint32_t class_e_noaggregation=0x80040110U,class_e_classnotavailable=0x80040111U,regdb_e_classnotreg=0x80040154U,co_e_notinitialized=0x800401f0U;
+// StdFont class factory 的預設 FONTDESC 欄位（cySize 為 CY：點數×10000）。
+constexpr std::int64_t default_font_size=120000;constexpr std::uint16_t default_font_weight=400;
 constexpr std::uint32_t s_ok=0,s_false=1,e_pointer=0x80004003U,e_nointerface=0x80004002U,e_invalidarg=0x80070057U,e_outofmemory=0x8007000eU,
     e_fail=0x80004005U,e_unexpected=0x8000ffffU,ctl_invalid_picture=0x800a01e1U,ctl_file_not_found=0x800a0035U,
     disp_member_not_found=0x80020003U,disp_type_mismatch=0x80020005U,disp_unknown_name=0x80020006U,disp_bad_index=0x8002000bU,disp_bad_param_count=0x8002000eU;
@@ -47,11 +57,16 @@ std::uint64_t signed_arg(std::int64_t v){return static_cast<std::uint64_t>(v);}
 std::int32_t long_arg(std::uint64_t v){return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(v));}
 std::u16string folded(std::u16string text){for(auto& c:text)if(c>=u'A' && c<=u'Z')c=static_cast<char16_t>(c+32);return text;}
 }
+std::span<const WindowsServiceDescriptor> ole_font_service_descriptors(); // windows_ole_font.cpp
 std::span<const WindowsServiceDescriptor> ole_picture_service_descriptors(){
+    // StdFont（windows_ole_font.cpp）與 StdPicture 同一個描述表群組；入口在 invoke_ole_picture 轉給 invoke_ole_font。
+    static const auto combined=[]{
     static constexpr WindowsServiceDescriptor table[]{
         {"oleaut32.dll","OleCreatePictureIndirect",4,0,0,0x4},{"oleaut32.dll","OleLoadPicture",5,0,0,0x6},{"oleaut32.dll","OleLoadPictureEx",8,0,0,0x76},
         {"oleaut32.dll","OleLoadPicturePath",6,0,0,0xc},{"oleaut32.dll","OleLoadPictureFile",2,0,0x1},{"oleaut32.dll","OleSavePictureFile",2},
-        {"oleaut32.dll","OleIconToCursor",2},
+        {"oleaut32.dll","OleIconToCursor",2},{"oleaut32.dll","DllGetClassObject",3},{"oleaut32.dll","DllCanUnloadNow",0},
+        {"internal-oleaut32-factory","QueryInterface",3},{"internal-oleaut32-factory","AddRef",1},{"internal-oleaut32-factory","Release",1},
+        {"internal-oleaut32-factory","CreateInstance",4},{"internal-oleaut32-factory","LockServer",2,0,0,0x2},
         {"internal-oleaut32-picture","QueryInterface",3},{"internal-oleaut32-picture","AddRef",1},{"internal-oleaut32-picture","Release",1},
         {"internal-oleaut32-picture","get_Handle",2},{"internal-oleaut32-picture","get_hPal",2},{"internal-oleaut32-picture","get_Type",2},
         {"internal-oleaut32-picture","get_Width",2},{"internal-oleaut32-picture","get_Height",2},{"internal-oleaut32-picture","Render",11,0,0,0x3fc},
@@ -64,9 +79,78 @@ std::span<const WindowsServiceDescriptor> ole_picture_service_descriptors(){
         {"internal-oleaut32-picture-persist","QueryInterface",3},{"internal-oleaut32-picture-persist","AddRef",1},{"internal-oleaut32-picture-persist","Release",1},
         {"internal-oleaut32-picture-persist","GetClassID",2},{"internal-oleaut32-picture-persist","IsDirty",1},{"internal-oleaut32-picture-persist","Load",2},
         {"internal-oleaut32-picture-persist","Save",3,0,0,0x4},{"internal-oleaut32-picture-persist","GetSizeMax",2}};
+        std::vector<WindowsServiceDescriptor> out(std::begin(table),std::end(table));const auto fonts=ole_font_service_descriptors();out.insert(out.end(),fonts.begin(),fonts.end());return out;
+    }();
+    return combined;
+}
+std::uint64_t WindowsServices::ole_picture_table(GuestMemory& memory,unsigned which){
+    const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+    auto& table=ole_picture_vtables_.at(which);if(table)return table;
+    static constexpr std::array<std::string_view,4> families{"internal-oleaut32-picture","internal-oleaut32-picture-dispatch","internal-oleaut32-picture-persist","internal-oleaut32-factory"};
+    std::vector<std::uint64_t> entries;for(const auto& d:ole_picture_service_descriptors())if(d.family==families[which])entries.push_back(resolve(d.family,d.symbol).value);
+    table=runtime_allocate(memory,{},entries.size()*unit);for(std::size_t i=0;i<entries.size();++i)memory.store(GuestAddress{table+i*unit},bits,entries[i]);
     return table;
 }
+namespace {
+std::uint8_t ole_std_class(const Guid& clsid){return clsid==clsid_std_font?1:clsid==clsid_std_picture?2:0;}
+}
+// CoCreateInstance／CoGetClassObject 的 CLSID_StdFont、CLSID_StdPicture：同步完成（建立物件不需要客體回呼），與其他內建類別共用分派鏈。
+bool WindowsServices::begin_ole_picture_com(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    const WindowsCall arg(state,memory,service);if(!arg(0))return false;
+    Guid clsid{};memory.read(GuestAddress{arg(0)},clsid);const auto kind=ole_std_class(clsid);if(!kind)return false;
+    const bool create=service.symbol=="CoCreateInstance";const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+    const auto output=arg(4);const auto done=[&](std::uint64_t hr){arg.return_to(state,hr&UINT32_MAX);return true;};
+    if(!output)return done(e_pointer);memory.store(GuestAddress{output},bits,0);if(!arg(3))return done(e_invalidarg);
+    if(!com_apartment(threads_.current))return done(co_e_notinitialized);
+    if(!(static_cast<std::uint32_t>(arg(create?2:1))&1U))return done(regdb_e_classnotreg); // 只有 in-process 伺服器
+    Guid iid{};memory.read(GuestAddress{arg(3)},iid);
+    if(!create){
+        if(iid!=iid_unknown && iid!=iid_class_factory)return done(e_nointerface);
+        if(ole_class_factories_.size()>=65536)return done(e_outofmemory);
+        const auto factory=allocate_heap(memory,unit);if(!factory)return done(e_outofmemory);
+        memory.store(GuestAddress{factory},bits,ole_picture_table(memory,3));ole_class_factories_.emplace(factory,std::pair<std::uint8_t,std::uint32_t>{kind,1});
+        memory.store(GuestAddress{output},bits,factory);return done(s_ok);
+    }
+    if(arg(1))return done(class_e_noaggregation);
+    if(kind==2)return done(nested_service(state,memory,"oleaut32.dll","OleCreatePictureIndirect",{0,arg(3),1,output}));
+    // FONTDESC：cbSizeofstruct、lpstrName、cySize、sWeight、sCharset、fItalic、fUnderline、fStrikethrough。
+    GuestScratch temporary(*this,memory,state);const auto face=temporary.text(u"MS Sans Serif");const auto desc=temporary.allocate(x86_?32U:40U);
+    if(!face || !desc)return done(e_outofmemory);const unsigned size_at=x86_?8U:16U;
+    memory.fill(GuestAddress{desc},0,x86_?32U:40U);memory.store(GuestAddress{desc},32,x86_?32U:40U);memory.store(GuestAddress{desc+(x86_?4U:8U)},bits,face);
+    memory.store(GuestAddress{desc+size_at},64,static_cast<std::uint64_t>(default_font_size));memory.store(GuestAddress{desc+size_at+8},16,default_font_weight);
+    return done(nested_service(state,memory,"oleaut32.dll","OleCreateFontIndirect",{desc,arg(3),output}));
+}
 std::optional<std::uint32_t> WindowsServices::invoke_ole_picture(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+    if(service.symbol=="OleCreateFontIndirect" || service.family.starts_with("internal-oleaut32-font"))return invoke_ole_font(state,memory,service);
+    if(service.symbol=="DllGetClassObject" || service.symbol=="DllCanUnloadNow" || (service.family=="internal-oleaut32-factory" && service.symbol!="CreateInstance")){
+        // class factory 與 DLL 入口不呼叫客體程式碼，同步完成；CreateInstance 經下方協程呼叫 OleCreatePictureIndirect／OleCreateFontIndirect。
+        const WindowsCall arg(state,memory,service);const unsigned unit=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(unit*8);
+        const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
+        try{
+            if(service.symbol=="DllCanUnloadNow")return done(ole_pictures_.empty() && ole_fonts_.empty() && ole_class_factories_.empty() && !ole_server_locks_?s_ok:s_false);
+            if(service.symbol=="DllGetClassObject"){
+                // (rclsid, riid, ppv)
+                if(!arg(2))return done(e_pointer);memory.store(GuestAddress{arg(2)},bits,0);if(!arg(0) || !arg(1))return done(e_invalidarg);
+                Guid clsid{},iid{};memory.read(GuestAddress{arg(0)},clsid);memory.read(GuestAddress{arg(1)},iid);const auto kind=ole_std_class(clsid);
+                if(!kind)return done(class_e_classnotavailable);if(iid!=iid_unknown && iid!=iid_class_factory)return done(e_nointerface);
+                if(ole_class_factories_.size()>=65536)return done(e_outofmemory);
+                const auto factory=allocate_heap(memory,unit);if(!factory)return done(e_outofmemory);
+                memory.store(GuestAddress{factory},bits,ole_picture_table(memory,3));ole_class_factories_.emplace(factory,std::pair<std::uint8_t,std::uint32_t>{kind,1});
+                memory.store(GuestAddress{arg(2)},bits,factory);return done(s_ok);
+            }
+            const auto self=arg(0);const auto found=ole_class_factories_.find(self);
+            if(found==ole_class_factories_.end() || memory.load(GuestAddress{self},bits)!=ole_picture_vtables_[3])return done(e_unexpected);
+            if(service.symbol=="QueryInterface"){
+                if(!arg(2))return done(e_pointer);memory.store(GuestAddress{arg(2)},bits,0);if(!arg(1))return done(e_invalidarg);
+                Guid iid{};memory.read(GuestAddress{arg(1)},iid);if(iid!=iid_unknown && iid!=iid_class_factory)return done(e_nointerface);
+                ++found->second.second;memory.store(GuestAddress{arg(2)},bits,self);return done(s_ok);
+            }
+            if(service.symbol=="AddRef")return done(++found->second.second);
+            if(service.symbol=="Release"){const auto left=--found->second.second;if(!left){ole_class_factories_.erase(found);(void)free_heap(memory,self,state);}return done(left);}
+            // LockServer(fLock)：解鎖次數多於鎖定時維持 0。
+            if(static_cast<std::uint32_t>(arg(1)))++ole_server_locks_;else if(ole_server_locks_)--ole_server_locks_;return done(s_ok);
+        }catch(const MemoryFault&){return done(e_invalidarg);}
+    }
     return nested_continuation(state,memory,"oleaut32 圖片",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
         using service_callback::Task;
         const WindowsCall call(s,m,service);const auto finish=[&](std::uint64_t value){call.return_to(s,value);return std::optional<std::uint32_t>{};};
@@ -291,13 +375,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_picture(GuestState& sta
             if(memory_dc){if(previous)(void)co_await api("gdi32.dll","SelectObject",{memory_dc,previous});(void)co_await api("gdi32.dll","DeleteDC",{memory_dc});}
             co_return drawn?s_ok:e_fail;
         };
-        const auto vtable=[&](unsigned which){
-            auto& table=ole_picture_vtables_[which];if(table)return table;
-            static constexpr std::array<std::string_view,3> families{"internal-oleaut32-picture","internal-oleaut32-picture-dispatch","internal-oleaut32-picture-persist"};
-            std::vector<std::uint64_t> entries;for(const auto& d:ole_picture_service_descriptors())if(d.family==families[which])entries.push_back(resolve(d.family,d.symbol).value);
-            table=runtime_allocate(m,{},entries.size()*unit);for(std::size_t i=0;i<entries.size();++i)m.store(GuestAddress{table+i*unit},bits,entries[i]);
-            return table;
-        };
+        const auto vtable=[&](unsigned which){return ole_picture_table(m,which);};
         const auto create=[&]()->std::uint64_t{
             if(ole_pictures_.size()>=65536)throw std::bad_alloc{};
             const auto object=allocate_heap(m,3*unit);if(!object)throw std::bad_alloc{};
@@ -356,6 +434,17 @@ std::optional<std::uint32_t> WindowsServices::invoke_ole_picture(GuestState& sta
             co_return static_cast<std::uint32_t>(co_await api("shlwapi.dll","SHCreateStreamOnFileW",{bytes(utf16_bytes(path)),0x20,stream_at}));
         };
         try{
+            if(family=="internal-oleaut32-factory"){
+                // IClassFactory::CreateInstance(pUnkOuter, riid, ppvObject)
+                const auto found=ole_class_factories_.find(call(0));
+                if(found==ole_class_factories_.end() || m.load(GuestAddress{call(0)},bits)!=ole_picture_vtables_[3])co_return finish(e_unexpected);const auto kind=found->second.first;
+                if(!call(3))co_return finish(e_pointer);m.store(GuestAddress{call(3)},bits,0);if(call(1))co_return finish(class_e_noaggregation);if(!call(2))co_return finish(e_invalidarg);
+                if(kind==2)co_return finish(co_await api("oleaut32.dll","OleCreatePictureIndirect",{0,call(2),1,call(3)})&UINT32_MAX);
+                const auto desc=scratch(x86_?32U:40U);const unsigned size_at=x86_?8U:16U;
+                m.store(GuestAddress{desc},32,x86_?32U:40U);m.store(GuestAddress{desc+(x86_?4U:8U)},bits,bytes(utf16_bytes(u"MS Sans Serif")));
+                m.store(GuestAddress{desc+size_at},64,static_cast<std::uint64_t>(default_font_size));m.store(GuestAddress{desc+size_at+8},16,default_font_weight);
+                co_return finish(co_await api("oleaut32.dll","OleCreateFontIndirect",{desc,call(2),call(3)})&UINT32_MAX);
+            }
             if(family!="oleaut32.dll"){
                 // 介面方法：由 vtable 指標判定介面位移後找回物件。
                 const auto self=call(0);const auto table=m.load(GuestAddress{self},bits);

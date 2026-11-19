@@ -32,10 +32,10 @@ std::uint32_t token_acl_access(const VirtualToken& token,const SecurityDescripto
                               const std::array<std::uint32_t,4>& mapping){
     return token_acl_access(token,sd,desired,mapping,{},{});
 }
-std::uint32_t token_acl_access(const VirtualToken& token,const SecurityDescriptor& sd,std::uint32_t desired,
+std::vector<std::uint32_t> token_acl_access_nodes(const VirtualToken& token,const SecurityDescriptor& sd,std::uint32_t desired,
                               const AccessMapping& mapping,std::span<const ObjectTypeNode> types,std::span<const std::uint8_t> self_sid){
     const bool maximum=desired&0x02000000U;const auto requested=desired&~0x02000000U;
-    if(!(sd.control&4) || sd.data[3].empty())return maximum?(mapping[3]|requested):requested;
+    if(!(sd.control&4) || sd.data[3].empty())return std::vector<std::uint32_t>(std::max<std::size_t>(types.size(),1),maximum?(mapping[3]|requested):requested);
     const auto& acl=sd.data[3];
     if(acl.size()<8)throw SddlError{1336};
     // 物件型別樹：沒有清單時只有物件本身一個節點。
@@ -87,14 +87,20 @@ std::uint32_t token_acl_access(const VirtualToken& token,const SecurityDescripto
         }
         return allowed;
     };
-    auto granted=pass(false)[0];
+    auto granted=pass(false);
     if(token.restriction_check){
-        const auto restricted=pass(true)[0];
-        if(token.write_restricted){const auto write=mapping[3]&~(mapping[0]|mapping[2]|0x120000U);granted&=restricted|~write;}
-        else granted&=restricted;
+        const auto restricted=pass(true);
+        for(std::size_t i=0;i<nodes;++i){
+            if(token.write_restricted){const auto write=mapping[3]&~(mapping[0]|mapping[2]|0x120000U);granted[i]&=restricted[i]|~write;}
+            else granted[i]&=restricted[i];
+        }
     }
-    if((requested&granted)!=requested)return 0;
-    return maximum?granted:requested;
+    for(auto& value:granted)value=(requested&value)!=requested?0U:maximum?value:requested;
+    return granted;
+}
+std::uint32_t token_acl_access(const VirtualToken& token,const SecurityDescriptor& sd,std::uint32_t desired,
+                              const AccessMapping& mapping,std::span<const ObjectTypeNode> types,std::span<const std::uint8_t> self_sid){
+    return token_acl_access_nodes(token,sd,desired,mapping,types,self_sid)[0];
 }
 AccessCheckResult access_check(const VirtualToken& token,const SecurityDescriptor& sd,std::uint32_t desired,const AccessMapping& mapping,
                                std::span<const ObjectTypeNode> types,std::span<const std::uint8_t> self_sid){
@@ -114,6 +120,28 @@ AccessCheckResult access_check(const VirtualToken& token,const SecurityDescripto
         result.granted=0;result.error=5;return result;
     }
     result.granted|=dacl_granted;return result;
+}
+std::vector<AccessCheckResult> access_check_list(const VirtualToken& token,const SecurityDescriptor& sd,std::uint32_t desired,const AccessMapping& mapping,
+                                                 std::span<const ObjectTypeNode> types,std::span<const std::uint8_t> self_sid){
+    // 特權（ACCESS_SYSTEM_SECURITY、WRITE_OWNER）對整個物件裁決一次；DACL 依物件型別樹逐節點裁決，節點結果互不影響。
+    AccessCheckResult base;
+    constexpr std::uint32_t system_security=0x01000000U,write_owner=0x80000U,maximum_allowed=0x02000000U;
+    auto remaining=desired;const auto nodes=std::max<std::size_t>(types.size(),1);
+    const auto use=[&](std::uint32_t right,std::uint64_t luid){
+        if(!(remaining&right) || !token.has_privilege(luid,true))return false;
+        remaining&=~right;base.granted|=right;base.privileges.push_back({luid,0x80000000U});return true;
+    };
+    if((desired&system_security) && !use(system_security,8)){base.error=1314;return std::vector<AccessCheckResult>(nodes,base);}
+    (void)use(write_owner,9);
+    const auto per_node=token_acl_access_nodes(token,sd,remaining,mapping,types,self_sid);
+    const auto requested=remaining&~maximum_allowed;
+    std::vector<AccessCheckResult> results(nodes,base);
+    for(std::size_t i=0;i<nodes;++i){
+        const auto dacl_granted=per_node[i]&~system_security;
+        if((dacl_granted&requested)!=requested || ((remaining&maximum_allowed) && !dacl_granted && !base.granted)){results[i].granted=0;results[i].error=5;}
+        else results[i].granted|=dacl_granted;
+    }
+    return results;
 }
 namespace {
 constexpr std::uint32_t sef_dacl_auto_inherit=1,sef_sacl_auto_inherit=2,sef_default_descriptor_for_object=4,sef_avoid_privilege_check=8,

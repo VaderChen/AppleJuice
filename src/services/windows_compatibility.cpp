@@ -60,6 +60,12 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"wldap32.dll","ldap_search_s",7,0,0,0,true},
         {"wldap32.dll","ldap_search_sA",7,0,0,0,true},
         {"wldap32.dll","ldap_search_sW",7,0,0,0,true},
+        {"wldap32.dll","ldap_bind_s",4,0,0,0x8,true},
+        {"wldap32.dll","ldap_bind_sA",4,0,0,0x8,true},
+        {"wldap32.dll","ldap_bind_sW",4,0,0,0x8,true},
+        {"wldap32.dll","#45",4,0,0,0x8,true},
+        {"wldap32.dll","#72",4,0,0,0x8,true},
+        {"wldap32.dll","#73",4,0,0,0x8,true},
         {"wldap32.dll","ldap_simple_bind_s",3,0,0,0,true},
         {"wldap32.dll","ldap_simple_bind_sA",3,0,0,0,true},
         {"wldap32.dll","ldap_simple_bind_sW",3,0,0,0,true},
@@ -110,6 +116,8 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"setupapi.dll","SetupDiGetDeviceInfoListClass",2},
         {"setupapi.dll","SetupDiGetDeviceInfoListDetailA",2},{"setupapi.dll","SetupDiGetDeviceInfoListDetailW",2},
         {"setupapi.dll","SetupDiBuildDriverInfoList",3,0,0,4},{"setupapi.dll","SetupDiDestroyDriverInfoList",3,0,0,4},
+        {"setupapi.dll","SetupDiSetSelectedDevice",2},{"setupapi.dll","SetupDiGetSelectedDevice",2},{"setupapi.dll","SetupDiSelectBestCompatDrv",2},
+        {"setupapi.dll","SetupDiSetSelectedDriverA",3},{"setupapi.dll","SetupDiSetSelectedDriverW",3},{"setupapi.dll","SetupDiGetSelectedDriverA",3},{"setupapi.dll","SetupDiGetSelectedDriverW",3},
         {"setupapi.dll","SetupDiEnumDriverInfoA",5,0,0,12},{"setupapi.dll","SetupDiEnumDriverInfoW",5,0,0,12},
         {"setupapi.dll","SetupGetInfDriverStoreLocationA",6,0,0,16},{"setupapi.dll","SetupGetInfDriverStoreLocationW",6,0,0,16},
         {"setupapi.dll","SetupDiDestroyDeviceInfoList",1},
@@ -172,6 +180,11 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         CM_SERVICE("CM_Get_Class_Key_NameA",4,8),CM_SERVICE("CM_Get_Class_Key_NameW",4,8),CM_SERVICE("CM_Get_Class_Key_Name_ExA",5,8),CM_SERVICE("CM_Get_Class_Key_Name_ExW",5,8),
         CM_SERVICE("CM_Open_Class_KeyA",6,0x2c),CM_SERVICE("CM_Open_Class_KeyW",6,0x2c),CM_SERVICE("CM_Open_Class_Key_ExA",7,0x2c),CM_SERVICE("CM_Open_Class_Key_ExW",7,0x2c),
         CM_SERVICE("CM_Get_Class_Registry_PropertyA",7,0x22),CM_SERVICE("CM_Get_Class_Registry_PropertyW",7,0x22),CM_SERVICE("CM_Set_Class_Registry_PropertyA",6,0x1a),CM_SERVICE("CM_Set_Class_Registry_PropertyW",6,0x1a),
+        {"cfgmgr32.dll","CM_Open_Device_Interface_KeyA",5,0,0,0x16},{"cfgmgr32.dll","CM_Open_Device_Interface_KeyW",5,0,0,0x16},{"cfgmgr32.dll","CM_Open_Device_Interface_Key_ExA",6,0,0,0x16},{"cfgmgr32.dll","CM_Open_Device_Interface_Key_ExW",6,0,0,0x16},
+        {"cfgmgr32.dll","DevGetObjects",8},{"cfgmgr32.dll","DevGetObjectsEx",10},{"cfgmgr32.dll","DevGetObjectProperties",7},{"cfgmgr32.dll","DevGetObjectPropertiesEx",9},
+        {"cfgmgr32.dll","DevFreeObjects",2},{"cfgmgr32.dll","DevFreeObjectProperties",2},{"cfgmgr32.dll","DevFindProperty",5},
+        {"cfgmgr32.dll","DevCreateObjectQuery",9},{"cfgmgr32.dll","DevCreateObjectQueryEx",11},{"cfgmgr32.dll","DevCloseObjectQuery",1},{"internal-devquery","Deliver",1},
+        CM_SERVICE("CM_Create_DevNodeA",4,0xc),CM_SERVICE("CM_Create_DevNodeW",4,0xc),CM_SERVICE("CM_Create_DevNode_ExA",5,0xc),CM_SERVICE("CM_Create_DevNode_ExW",5,0xc),
         {"cfgmgr32.dll","CM_Get_DevNode_Property_Keys",4,0,0,9},{"cfgmgr32.dll","CM_Get_DevNode_Property_Keys_Ex",5,0,0,9},
         {"cfgmgr32.dll","CM_Get_Class_PropertyW",6,0,0,32},{"cfgmgr32.dll","CM_Get_Class_Property_ExW",7,0,0,32},{"cfgmgr32.dll","CM_Get_Class_Property_Keys",4,0,0,8},{"cfgmgr32.dll","CM_Get_Class_Property_Keys_Ex",5,0,0,8},
         {"setupapi.dll","SetupDiGetDeviceInterfacePropertyW",8,0,0,0xa0},
@@ -262,7 +275,7 @@ std::span<const WindowsServiceDescriptor> compatibility_service_descriptors() {
         {"kernel32.dll", "IsDBCSLeadByteEx", 2},
         {"kernel32.dll", "IsWow64Process", 2}, {"kernel32.dll", "IsWow64Process2", 3},
         {"kernel32.dll", "GetCurrentProcess", 0}, {"kernel32.dll", "GetCurrentThread", 0},
-        {"kernel32.dll", "DuplicateHandle", 7}, {"kernel32.dll", "GetThreadPriorityBoost", 2}, {"kernel32.dll", "SetThreadPriorityBoost", 2}, {"kernel32.dll", "GetThreadPriority", 1}, {"kernel32.dll", "SetThreadPriority", 2},
+        {"kernel32.dll", "DuplicateHandle", 7, 0, 0, 0x70}, {"kernel32.dll", "GetThreadPriorityBoost", 2}, {"kernel32.dll", "SetThreadPriorityBoost", 2}, {"kernel32.dll", "GetThreadPriority", 1}, {"kernel32.dll", "SetThreadPriority", 2},
         {"kernel32.dll", "SetStdHandle", 2},
         {"kernel32.dll", "ReadConsoleA", 5}, {"kernel32.dll", "ReadConsoleW", 5},
         {"kernel32.dll", "WriteConsoleA", 5}, {"kernel32.dll", "WriteConsoleW", 5}, {"kernel32.dll", "SetConsoleMode", 2},
@@ -377,7 +390,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         WindowsCall(state,memory,service).return_to(state,*native);return std::nullopt;
     }
     if(service.symbol.starts_with("CreateSemaphore") || service.symbol.starts_with("OpenSemaphore") || service.symbol.starts_with("CreateWaitableTimer") || service.symbol.starts_with("OpenWaitableTimer") || service.symbol=="ReleaseSemaphore")return invoke_sync_object(state,memory,service);
-    if(service.symbol.starts_with("CM_") || service.symbol.starts_with("CMP_") || service.symbol.starts_with("SetupDi") || service.symbol.starts_with("SetupGetInf") || service.symbol.starts_with("SetupCopyOEMInf") ||
+    if(service.symbol.starts_with("CM_") || service.symbol.starts_with("CMP_") || (service.family=="cfgmgr32.dll" && service.symbol.starts_with("Dev")) || service.family=="internal-devquery" || service.symbol.starts_with("SetupDi") || service.symbol.starts_with("SetupGetInf") || service.symbol.starts_with("SetupCopyOEMInf") ||
        service.symbol.starts_with("SetupUninstallOEMInf") || service.family=="newdev.dll")return invoke_device_configuration(state,memory,service);
     if(service.family=="wldap32.dll")return invoke_ldap(state,memory,service);
     // 沒有 Windows 錯誤回報（Dr. Watson）服務：回報 frrvErrNoDW，呼叫端照常走自己的崩潰處理。
@@ -1289,9 +1302,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         bool valid=true,inherit=!create && arg(1);const auto named=arg(create && extended?1:2);
         auto name=named?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{named}):utf8_to_utf16(read_ansi(memory,named))):std::u16string{};
         if(name.size()>=260){fail(206);valid=false;}
+        // 私有命名空間別名與 BaseNamedObjects 下的子目錄（物件命名空間）轉成既有具名物件名稱。
+        if(valid && !name.empty())if(const auto code=win32_namespace_object_name(name,create)){fail(code);valid=false;}
         if(name.starts_with(u"Local\\"))name.erase(0,6);
         const auto suffix=name.starts_with(u"Global\\")?std::u16string_view(name).substr(7):std::u16string_view(name);
-        if(suffix.find(u'\\')!=suffix.npos){fail(123);valid=false;}
+        if(valid && suffix.find(u'\\')!=suffix.npos){fail(123);valid=false;}
         if(!name.empty() && (std::any_of(runtime_.wait_states.begin(),runtime_.wait_states.end(),[&](const auto& item){return item.second.name==name;}) || std::any_of(runtime_.wait_objects.begin(),runtime_.wait_objects.end(),[&](const auto& item){return item.second.kind==WaitObject::Kind::Event && item.second.name==name;}))){fail(6);valid=false;}
         if(valid && runtime_.wait_objects.size()>=process_handle_limit){fail(8);valid=false;}
         if(extended && (dword(2)&~1U)){fail(87);valid=false;}
@@ -1341,6 +1356,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
         const bool create=symbol.starts_with("Create"),extended=symbol.starts_with("CreateEventEx");bool valid=true,inherit=!create && arg(1);
         const bool exclusive=service.family=="internal-nt-event" && (dword(create?4:3)&0x20U);
         const auto name_at=arg(create?(extended?1:3):2);auto name=name_at?(symbol.ends_with('W')?read_utf16(memory,GuestAddress{name_at}):utf8_to_utf16(read_ansi(memory,name_at))):std::u16string{};
+        // 私有命名空間別名與 BaseNamedObjects 下的子目錄（物件命名空間）轉成既有具名物件名稱。
+        if(!name.empty())if(const auto code=win32_namespace_object_name(name,create)){fail(code);valid=false;}
         if(name.starts_with(u"Local\\"))name.erase(0,6);
         if(!name.empty() && (std::any_of(runtime_.wait_states.begin(),runtime_.wait_states.end(),[&](const auto& item){return item.second.name==name;}) || std::any_of(runtime_.mutex_objects.begin(),runtime_.mutex_objects.end(),[&](const auto& item){return item.second.name==name;}))){fail(6);valid=false;}
         if(extended && (dword(2)&~3U)){fail(87);valid=false;}

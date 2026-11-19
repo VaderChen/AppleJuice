@@ -1,8 +1,19 @@
+#include "service_callback_task.hpp"
 #include "x64arm/windows_services.hpp"
 #include "dns_query.hpp"
 #include "x64arm/network.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
+#include <arpa/inet.h>
+#include <array>
+#include <cctype>
+#include <chrono>
+#include <deque>
+#include <future>
+#include <dns_sd.h>
+#include <map>
+#include <optional>
+#include <poll.h>
 #include <cstring>
 #include <netinet/in.h>
 #include <set>
@@ -52,6 +63,165 @@ bool same_record(const Record& a,const Record& b){
 }
 }
 
+// DNS_SERVICE_INSTANCE 的宿主端內容（DnsServiceConstructInstance 與 DNS-SD 回呼共用同一個版面產生器）。
+struct DnsServiceInstanceData {
+    std::optional<std::u16string> name,host;std::optional<std::array<std::uint8_t,4>> ip4;std::optional<std::array<std::uint8_t,16>> ip6;
+    std::uint16_t port{},priority{},weight{};std::vector<std::pair<std::optional<std::u16string>,std::optional<std::u16string>>> properties;std::uint32_t interface_index{};
+};
+// DNS-SD 操作：Bonjour 回呼（在 DNSServiceProcessResult 內、即處理該操作的客體執行緒上）把結果放進 events，
+// internal-dnssd Worker 在執行緒池逐一轉成客體結構並呼叫客體回呼；delivering 為正在回呼的客體執行緒。
+struct DnsServiceState {
+    enum class Kind {BrowseV1,BrowseV2,Resolve,Register,DeRegister,Multicast};
+    struct Event {std::uint32_t status{};std::vector<dns_detail::Record> records;std::optional<DnsServiceInstanceData> instance;};
+    struct Operation {
+        Kind kind{};DNSServiceRef ref{},address_ref{},connection{};std::vector<DNSRecordRef> address_records;
+        std::uint64_t callback{},context{},handle{},delivering{};std::uint32_t interface_index{};
+        std::deque<Event> events;std::vector<dns_detail::Record> pending; // 批次中的 mDNS 回應（kDNSServiceFlagsMoreComing）
+        DnsServiceInstanceData instance; // 解析中或已註冊的服務
+        std::chrono::steady_clock::time_point deadline{};bool canceled{},done{},idle{},address_started{};
+        ~Operation(){if(connection)DNSServiceRefDeallocate(connection);if(address_ref)DNSServiceRefDeallocate(address_ref);if(ref)DNSServiceRefDeallocate(ref);}
+    };
+    std::map<std::uint64_t,std::unique_ptr<Operation>> operations;std::uint64_t next{0x6f000000};
+    struct Context {std::u16string user,domain;};
+    std::map<std::uint64_t,Context> contexts;std::uint64_t next_context{0x6f800000};
+};
+namespace {
+// DNS 名稱表示法：去掉結尾的點，\DDD 轉回字元（保留 \. 與 \\）。
+std::string dnssd_name(std::string_view text){
+    std::string out;
+    for(std::size_t i=0;i<text.size();++i){
+        if(text[i]=='\\' && i+3<text.size() && std::isdigit(static_cast<unsigned char>(text[i+1])) && std::isdigit(static_cast<unsigned char>(text[i+2])) && std::isdigit(static_cast<unsigned char>(text[i+3]))){
+            const auto value=(text[i+1]-'0')*100+(text[i+2]-'0')*10+(text[i+3]-'0');
+            if(value=='.' || value=='\\'){out.push_back('\\');}out.push_back(static_cast<char>(value));i+=3;continue;
+        }
+        out.push_back(text[i]);
+    }
+    if(!out.empty() && out.back()=='.' && (out.size()<2 || out[out.size()-2]!='\\'))out.pop_back();
+    return out;
+}
+// "Instance._svc._tcp.local" → (instance, "_svc._tcp", "local")；browse 名稱沒有實例部分。
+std::optional<std::array<std::string,3>> dnssd_split(const std::string& name,bool instance){
+    std::size_t at=0;std::string label;
+    if(instance){
+        const auto marker=name.find("._");if(marker==std::string::npos || !marker)return std::nullopt;
+        for(std::size_t i=0;i<marker;++i){if(name[i]=='\\' && i+1<marker)++i;label.push_back(name[i]);}at=marker+1;
+    }
+    const auto first=name.find('.',at);if(first==std::string::npos || name[at]!='_')return std::nullopt;
+    const auto second=name.find('.',first+1);const auto type_end=second==std::string::npos?name.size():second;
+    if(first+1>=name.size() || name[first+1]!='_')return std::nullopt;
+    std::string domain=second==std::string::npos?std::string{}:name.substr(second+1);if(!domain.empty() && domain.back()=='.')domain.pop_back();
+    return std::array<std::string,3>{label,name.substr(at,type_end-at),domain};
+}
+std::uint32_t dnssd_status(DNSServiceErrorType error){
+    switch(error){
+        case kDNSServiceErr_NoError:return 0;
+        case kDNSServiceErr_NoSuchName:case kDNSServiceErr_NoSuchRecord:return 9003;   // DNS_ERROR_RCODE_NAME_ERROR
+        case kDNSServiceErr_NameConflict:return 9007;                                   // DNS_ERROR_RCODE_YXDOMAIN
+        case kDNSServiceErr_BadParam:case kDNSServiceErr_BadFlags:case kDNSServiceErr_BadInterfaceIndex:case kDNSServiceErr_BadReference:return 87;
+        case kDNSServiceErr_NoMemory:return 14;
+        case kDNSServiceErr_Timeout:return 1460;
+        case kDNSServiceErr_NoAuth:case kDNSServiceErr_NotPermitted:case kDNSServiceErr_PolicyDenied:return 5;
+        case kDNSServiceErr_ServiceNotRunning:return 1062;
+        default:return 9002;                                                              // DNS_ERROR_RCODE_SERVER_FAILURE
+    }
+}
+// mDNS 回應的 RDATA（名稱不壓縮）轉成共用 RR 模型。
+std::optional<dns_detail::Record> dnssd_record(const char* name,std::uint16_t type,std::uint32_t ttl,const std::uint8_t* data,std::uint16_t size){
+    dns_detail::Record record;record.name=dnssd_name(name);record.type=type;record.ttl=ttl;record.section=1;
+    const auto* cursor=data;const auto* end=data+size;
+    const auto number=[&](unsigned width)->std::optional<std::uint32_t>{if(static_cast<std::size_t>(end-cursor)<width)return std::nullopt;std::uint32_t value=0;for(unsigned i=0;i<width;++i)value=(value<<8)|*cursor++;return value;};
+    const auto domain=[&]()->bool{std::array<char,NS_MAXDNAME> expanded{};const auto used=::dn_expand(data,end,cursor,expanded.data(),static_cast<int>(expanded.size()));if(used<0)return false;cursor+=used;record.names.emplace_back(expanded.data());return true;};
+    switch(type){
+        case 1:case 28:if(size!=(type==1?4:16))return std::nullopt;record.bytes.assign(data,end);break;
+        case 2:case 5:case 12:case 39:if(!domain())return std::nullopt;break;
+        case 33:for(unsigned i=0;i<3;++i){const auto value=number(2);if(!value)return std::nullopt;record.numbers.push_back(*value);}if(!domain())return std::nullopt;break;
+        case 16:while(cursor<end){const auto length=*cursor++;if(length>end-cursor)return std::nullopt;record.names.emplace_back(reinterpret_cast<const char*>(cursor),length);cursor+=length;}break;
+        default:record.bytes.assign(data,end);break;
+    }
+    return record;
+}
+// TXT 記錄 ↔ DNS_SERVICE_INSTANCE 的 keys／values（"key=value"；沒有等號的鍵值為 NULL）。
+std::vector<std::uint8_t> dnssd_txt(const DnsServiceInstanceData& data){
+    std::vector<std::uint8_t> bytes;
+    for(const auto& [key,value]:data.properties){if(!key)continue;auto item=utf16_to_utf8(*key);if(value){item+='=';item+=utf16_to_utf8(*value);}if(item.size()>255)item.resize(255);bytes.push_back(static_cast<std::uint8_t>(item.size()));bytes.insert(bytes.end(),item.begin(),item.end());}
+    if(bytes.empty())bytes.push_back(0);
+    return bytes;
+}
+void dnssd_properties(DnsServiceInstanceData& data,const unsigned char* txt,std::uint16_t size){
+    data.properties.clear();
+    for(std::uint16_t at=0;at<size;){const auto length=txt[at++];if(length>size-at)break;const std::string item(reinterpret_cast<const char*>(txt+at),length);at+=length;if(item.empty())continue;
+        const auto equal=item.find('=');if(equal==std::string::npos)data.properties.push_back({utf8_to_utf16_lossy(item),std::nullopt});
+        else data.properties.push_back({utf8_to_utf16_lossy(item.substr(0,equal)),utf8_to_utf16_lossy(item.substr(equal+1))});}
+}
+// DNS_SERVICE_INSTANCE 與其字串、位址、屬性陣列放在同一區塊；回傳區塊（指標欄位為區塊內偏移）與需要重定位的欄位。
+std::pair<std::vector<std::uint8_t>,std::vector<std::size_t>> dnssd_instance_layout(const DnsServiceInstanceData& data,bool x86){
+    const unsigned unit=x86?4U:8U,size=x86?40U:72U;std::vector<std::uint8_t> block(size);std::vector<std::size_t> pointers;
+    const auto put=[&](std::size_t at,std::uint64_t value,unsigned bytes){for(unsigned i=0;i<bytes;++i)block[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
+    const auto align=[&]{block.resize((block.size()+unit-1)/unit*unit);};
+    const auto attach=[&](std::size_t field,const std::vector<std::uint8_t>& bytes){align();put(field,block.size(),unit);pointers.push_back(field);block.insert(block.end(),bytes.begin(),bytes.end());};
+    if(data.name)attach(0,utf16_bytes(*data.name));if(data.host)attach(unit,utf16_bytes(*data.host));
+    if(data.ip4)attach(2*unit,{data.ip4->begin(),data.ip4->end()});if(data.ip6)attach(3*unit,{data.ip6->begin(),data.ip6->end()});
+    put(4*unit,data.port,2);put(4*unit+2,data.priority,2);put(4*unit+4,data.weight,2);const auto count=static_cast<std::uint32_t>(data.properties.size());put(x86?24:40,count,4);put(x86?36:64,data.interface_index,4);
+    if(count){
+        align();const auto keys=block.size();put(x86?28:48,keys,unit);pointers.push_back(x86?28:48);block.resize(keys+count*unit);
+        align();const auto values=block.size();put(x86?32:56,values,unit);pointers.push_back(x86?32:56);block.resize(values+count*unit);
+        for(std::uint32_t i=0;i<count;++i){if(data.properties[i].first)attach(keys+i*unit,utf16_bytes(*data.properties[i].first));if(data.properties[i].second)attach(values+i*unit,utf16_bytes(*data.properties[i].second));}
+    }
+    return {std::move(block),std::move(pointers)};
+}
+using DnsOperation=DnsServiceState::Operation;
+void DNSSD_API dnssd_browse_reply(DNSServiceRef,DNSServiceFlags flags,std::uint32_t,DNSServiceErrorType error,const char* name,const char* type,const char* domain,void* context){
+    auto& operation=*static_cast<DnsOperation*>(context);
+    if(error){operation.events.push_back({dnssd_status(error),{},std::nullopt});return;}
+    // 每個實例一筆 PTR：服務型別 → 實例全名；移除時 TTL 為 0。
+    dns_detail::Record record;record.type=12;record.section=1;record.ttl=(flags&kDNSServiceFlagsAdd)?4500U:0U;
+    std::string service=type?type:"";if(!service.empty() && service.back()=='.')service.pop_back();std::string zone=domain?domain:"";if(!zone.empty() && zone.back()=='.')zone.pop_back();
+    record.name=service+(zone.empty()?"":"."+zone);std::string label;for(const char* c=name;c && *c;++c){if(*c=='.' || *c=='\\')label.push_back('\\');label.push_back(*c);}
+    record.names.push_back(label+"."+record.name);operation.pending.push_back(std::move(record));
+    if(!(flags&kDNSServiceFlagsMoreComing)){operation.events.push_back({0,std::move(operation.pending),std::nullopt});operation.pending.clear();}
+}
+void DNSSD_API dnssd_address_reply(DNSServiceRef,DNSServiceFlags flags,std::uint32_t,DNSServiceErrorType error,const char*,const sockaddr* address,std::uint32_t,void* context){
+    auto& operation=*static_cast<DnsOperation*>(context);
+    if(error){operation.events.push_back({dnssd_status(error),{},std::nullopt});operation.done=true;return;}
+    if(address && address->sa_family==AF_INET && !operation.instance.ip4){std::array<std::uint8_t,4> ip{};std::memcpy(ip.data(),&reinterpret_cast<const sockaddr_in*>(address)->sin_addr,4);operation.instance.ip4=ip;}
+    if(address && address->sa_family==AF_INET6 && !operation.instance.ip6){std::array<std::uint8_t,16> ip{};std::memcpy(ip.data(),&reinterpret_cast<const sockaddr_in6*>(address)->sin6_addr,16);operation.instance.ip6=ip;}
+    if(!(flags&kDNSServiceFlagsMoreComing) && (operation.instance.ip4 || operation.instance.ip6) && !operation.done){operation.events.push_back({0,{},operation.instance});operation.done=true;}
+}
+void DNSSD_API dnssd_resolve_reply(DNSServiceRef,DNSServiceFlags,std::uint32_t index,DNSServiceErrorType error,const char*,const char* target,std::uint16_t port,std::uint16_t size,const unsigned char* txt,void* context){
+    auto& operation=*static_cast<DnsOperation*>(context);
+    if(error){operation.events.push_back({dnssd_status(error),{},std::nullopt});operation.done=true;return;}
+    if(operation.address_started)return;operation.address_started=true;
+    operation.instance.host=utf8_to_utf16_lossy(dnssd_name(target?target:""));operation.instance.port=ntohs(port);dnssd_properties(operation.instance,txt,size);
+    operation.instance.interface_index=operation.interface_index;
+    // 主機位址：同一操作再以 DNSServiceGetAddrInfo 取得 IPv4／IPv6。
+    const auto status=DNSServiceGetAddrInfo(&operation.address_ref,0,index,kDNSServiceProtocol_IPv4|kDNSServiceProtocol_IPv6,target,dnssd_address_reply,&operation);
+    if(status){operation.address_ref=nullptr;operation.events.push_back({dnssd_status(status),{},std::nullopt});operation.done=true;}
+}
+void DNSSD_API dnssd_register_reply(DNSServiceRef,DNSServiceFlags,DNSServiceErrorType error,const char* name,const char* type,const char* domain,void* context){
+    auto& operation=*static_cast<DnsOperation*>(context);
+    if(error){operation.events.push_back({dnssd_status(error),{},std::nullopt});return;}
+    // 名稱可能因衝突被改名；回報實際註冊的全名。
+    std::string service=type?type:"";if(!service.empty() && service.back()=='.')service.pop_back();std::string zone=domain?domain:"";if(!zone.empty() && zone.back()=='.')zone.pop_back();
+    std::string label;for(const char* c=name;c && *c;++c){if(*c=='.' || *c=='\\')label.push_back('\\');label.push_back(*c);}
+    operation.instance.name=utf8_to_utf16_lossy(label+"."+service+(zone.empty()?"":"."+zone));operation.events.push_back({0,{},operation.instance});
+}
+void DNSSD_API dnssd_record_reply(DNSServiceRef,DNSRecordRef,DNSServiceFlags,DNSServiceErrorType error,void* context){
+    if(error)static_cast<DnsOperation*>(context)->events.push_back({dnssd_status(error),{},std::nullopt});
+}
+void DNSSD_API dnssd_query_reply(DNSServiceRef,DNSServiceFlags flags,std::uint32_t,DNSServiceErrorType error,const char* name,std::uint16_t type,std::uint16_t,std::uint16_t size,const void* data,std::uint32_t ttl,void* context){
+    auto& operation=*static_cast<DnsOperation*>(context);
+    if(error){operation.events.push_back({dnssd_status(error),{},std::nullopt});return;}
+    if(auto record=dnssd_record(name,type,(flags&kDNSServiceFlagsAdd)?ttl:0U,static_cast<const std::uint8_t*>(data),size))operation.pending.push_back(std::move(*record));
+    if(!(flags&kDNSServiceFlagsMoreComing) && !operation.pending.empty()){operation.events.push_back({0,std::move(operation.pending),std::nullopt});operation.pending.clear();}
+}
+}
+
+std::uint64_t WindowsServices::dns_store_instance(GuestMemory& memory,const DnsServiceInstanceData& data){
+    auto [block,pointers]=dnssd_instance_layout(data,x86_);const unsigned unit=x86_?4U:8U;
+    const auto address=allocate_heap(memory,block.size());if(!address)return 0;
+    for(const auto field:pointers){std::uint64_t relative=0;for(unsigned i=0;i<unit;++i)relative|=std::uint64_t{block[field+i]}<<(i*8);const auto pointer=address+relative;for(unsigned i=0;i<unit;++i)block[field+i]=static_cast<std::uint8_t>(pointer>>(i*8));}
+    memory.write(GuestAddress{address},block);runtime_.network.addresses.insert(address);return address;
+}
 std::uint64_t WindowsServices::dns_store_records(GuestState& state,GuestMemory& memory,const std::vector<Record>& records,unsigned charset,const std::vector<unsigned>* charsets){
     const unsigned unit=x86_?4U:8U;const auto width=static_cast<std::uint8_t>(unit*8);std::vector<std::uint64_t> allocated;
     try{
@@ -92,6 +262,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_dns_records(GuestState& sta
     };
     const auto chain=[&](std::uint64_t head){std::vector<std::uint64_t> items;std::set<std::uint64_t> seen;for(auto at=head;at;at=load(at,width)){if(!seen.insert(at).second || items.size()>=65536)throw Error{invalid_parameter};items.push_back(at);}return items;};
     const auto valid_charset=[](std::uint64_t value){return value>=1 && value<=3;};
+#include "windows_dns_service.inc"
     std::uint64_t result=0;
     try{
         if(symbol=="DnsNameCompare_A" || symbol=="DnsNameCompare_W"){
@@ -274,44 +445,68 @@ std::optional<std::uint32_t> WindowsServices::invoke_dns_records(GuestState& sta
                     }
                 }
             }
+        }else if(symbol.starts_with("DnsModifyRecordsInSet_") || symbol.starts_with("DnsReplaceRecordSet")){
+            // DnsModifyRecordsInSet(pAddRecords, pDeleteRecords, Options, hContext, pServerList, pReserved)／DnsReplaceRecordSet(pNewSet, Options, hContext, pServerList, pReserved)：
+            // RFC 2136 動態更新（dns_detail::update）。所有記錄須同名同型別；pServerList 為 IP4_ARRAY（連接埠 53），沒有時用系統 DNS 伺服器。
+            // hContext 為 DnsAcquireContextHandle 的 handle；沒有 GSS-TSIG，DNS_UPDATE_SECURITY_ONLY 回 ERROR_NOT_SUPPORTED，其他安全選項以非安全更新進行。
+            const bool replace=symbol.starts_with("DnsReplaceRecordSet");
+            const unsigned charset=symbol.ends_with("W")?1U:symbol.ends_with("UTF8")?2U:3U;
+            const auto add_head=call(0),delete_head=replace?0:call(1);const auto options=static_cast<std::uint32_t>(call(replace?1:2));
+            const auto context=call(replace?2:3),server_list=call(replace?3:4),reserved=call(replace?4:5);
+            if((!add_head && !delete_head) || reserved || (options&0xffff0000U))throw Error{invalid_parameter};
+            if(options&0x100U)throw Error{50};
+            if(context && (!dns_services_ || !dns_services_->contexts.contains(context)))throw Error{6};
+            std::vector<Record> adds,deletes;
+            for(const auto at:chain(add_head))adds.push_back(unpack(at,charset));
+            for(const auto at:chain(delete_head))deletes.push_back(unpack(at,charset));
+            const auto& sample=!adds.empty()?adds.front():deletes.front();
+            for(const auto* set:{&adds,&deletes})for(const auto& record:*set)if(!record.type || record.name.empty() || record.type!=sample.type || !dns_detail::same_name(record.name,sample.name))throw Error{invalid_parameter};
+            std::vector<std::vector<std::uint8_t>> servers;
+            if(server_list){
+                const auto count=static_cast<std::uint32_t>(load(server_list,32));if(!count || count>64)throw Error{invalid_parameter};
+                for(std::uint32_t i=0;i<count;++i){sockaddr_in native{};
+#if defined(__APPLE__)
+                    native.sin_len=sizeof(native);
+#endif
+                    native.sin_family=AF_INET;native.sin_port=htons(53);const auto address=static_cast<std::uint32_t>(load(server_list+4+i*4,32));std::memcpy(&native.sin_addr,&address,4);
+                    servers.emplace_back(reinterpret_cast<const std::uint8_t*>(&native),reinterpret_cast<const std::uint8_t*>(&native)+sizeof(native));}
+            }
+            if(!runtime_.network.external_io)throw HostCallFault("比較模式不執行 DNS 動態更新");
+            // 網路往返在宿主執行緒進行，呼叫執行緒以 Sleep(1) 等待，不佔住其他客體執行緒的服務（同一程序內的 DNS 伺服器也能回應）。
+            // 宿主工作只在續行建立時啟動；等待後重新進入由同一續行取回結果，不會重送 UPDATE。
+            return nested_continuation(state,memory,"DNS 動態更新",[this,service,adds,deletes,replace,servers](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+                const WindowsCall frame(s,m,service);
+                auto pending=std::async(std::launch::async,[adds,deletes,replace,servers]()->std::uint32_t{
+                    try{return dns_detail::update(adds,deletes,replace,servers.empty()?nullptr:&servers);}catch(const Error& error){return error.code;}catch(...){return 9002U;}});
+                const auto sleep=resolve("kernel32.dll","Sleep").value;
+                while(pending.wait_for(std::chrono::seconds(0))!=std::future_status::ready)(void)co_await service_callback::call(sleep,{1});
+                frame.return_to(s,pending.get());co_return std::optional<std::uint32_t>{};
+            });
         }else if(symbol=="DnsServiceConstructInstance"){
-            // DNS_SERVICE_INSTANCE 與其字串、位址及屬性陣列配置在同一區塊，由 DnsServiceFreeInstance 釋放。
+            // DNS_SERVICE_INSTANCE 與其字串、位址及屬性陣列配置在同一區塊（與 DNS-SD 回呼共用 dnssd_instance_layout），由 DnsServiceFreeInstance 釋放。
             const auto count=static_cast<std::uint32_t>(call(7));
             if(count>4096 || (count && (!call(8) || !call(9)))){last_error_=invalid_parameter;result=0;}
             else {
-                const unsigned size=x86_?40U:72U;std::vector<std::uint8_t> block(size);std::vector<std::size_t> pointers;
-                const auto put=[&](std::size_t at,std::uint64_t value,unsigned bytes){for(unsigned i=0;i<bytes;++i)block[at+i]=static_cast<std::uint8_t>(value>>(i*8));};
-                const auto align=[&]{block.resize((block.size()+unit-1)/unit*unit);};
-                const auto attach=[&](std::size_t field,const std::vector<std::uint8_t>& bytes){align();put(field,block.size(),unit);pointers.push_back(field);block.insert(block.end(),bytes.begin(),bytes.end());};
-                const auto wide=[&](std::uint64_t pointer){return utf16_bytes(read_utf16(memory,GuestAddress{pointer},1024));};
-                if(call(0))attach(0,wide(call(0)));if(call(1))attach(unit,wide(call(1)));
-                if(call(2)){std::vector<std::uint8_t> ip(4);memory.read(GuestAddress{call(2)},ip);attach(2*unit,ip);}
-                if(call(3)){std::vector<std::uint8_t> ip(16);memory.read(GuestAddress{call(3)},ip);attach(3*unit,ip);}
-                put(4*unit,call(4),2);put(4*unit+2,call(5),2);put(4*unit+4,call(6),2);put(x86_?24:40,count,4);
-                if(count){
-                    align();const auto keys=block.size();put(x86_?28:48,keys,unit);pointers.push_back(x86_?28:48);block.resize(keys+count*unit);
-                    align();const auto values=block.size();put(x86_?32:56,values,unit);pointers.push_back(x86_?32:56);block.resize(values+count*unit);
-                    for(std::uint32_t i=0;i<count;++i){
-                        const auto key=load(call(8)+i*unit,width),value=load(call(9)+i*unit,width);
-                        if(key)attach(keys+i*unit,wide(key));if(value)attach(values+i*unit,wide(value));
-                    }
-                }
-                const auto address=allocate_heap(memory,block.size());
-                if(!address){last_error_=8;result=0;}
-                else {for(const auto field:pointers){std::uint64_t relative=0;for(unsigned i=0;i<unit;++i)relative|=std::uint64_t{block[field+i]}<<(i*8);put(field,address+relative,unit);}
-                    memory.write(GuestAddress{address},block);runtime_.network.addresses.insert(address);result=address;}
+                DnsServiceInstanceData data;const auto wide=[&](std::uint64_t pointer){return read_utf16(memory,GuestAddress{pointer},1024);};
+                if(call(0))data.name=wide(call(0));if(call(1))data.host=wide(call(1));
+                if(call(2)){std::array<std::uint8_t,4> ip{};memory.read(GuestAddress{call(2)},ip);data.ip4=ip;}
+                if(call(3)){std::array<std::uint8_t,16> ip{};memory.read(GuestAddress{call(3)},ip);data.ip6=ip;}
+                data.port=static_cast<std::uint16_t>(call(4));data.priority=static_cast<std::uint16_t>(call(5));data.weight=static_cast<std::uint16_t>(call(6));
+                for(std::uint32_t i=0;i<count;++i){const auto key=load(call(8)+i*unit,width),value=load(call(9)+i*unit,width);
+                    data.properties.push_back({key?std::optional{wide(key)}:std::nullopt,value?std::optional{wide(value)}:std::nullopt});}
+                result=dns_store_instance(memory,data);if(!result)last_error_=8;
             }
         }else if(symbol=="DnsServiceFreeInstance"){
             if(call(0) && runtime_.network.addresses.erase(call(0)))(void)free_heap(memory,call(0),state);
         }else return std::nullopt;
     }catch(const Error& error){
         // 回傳 BOOL／指標的函式以 last error 報告；DNS_STATUS 函式直接回傳錯誤碼。
-        const bool status=symbol.starts_with("DnsValidateName_") || symbol=="DnsQueryConfig" || symbol=="DnsQueryEx" || symbol.starts_with("DnsExtractRecordsFromMessage_");
+        const bool status=symbol.starts_with("DnsValidateName_") || symbol=="DnsQueryConfig" || symbol=="DnsQueryEx" || symbol.starts_with("DnsExtractRecordsFromMessage_") || symbol.starts_with("DnsModifyRecordsInSet_") || symbol.starts_with("DnsReplaceRecordSet");
         last_error_=error.code;result=status?error.code:0;
     }catch(const MemoryFault&){
-        const bool status=symbol=="DnsQueryConfig" || symbol=="DnsQueryEx" || symbol.starts_with("DnsExtractRecordsFromMessage_");
+        const bool status=symbol=="DnsQueryConfig" || symbol=="DnsQueryEx" || symbol.starts_with("DnsExtractRecordsFromMessage_") || symbol.starts_with("DnsModifyRecordsInSet_") || symbol.starts_with("DnsReplaceRecordSet");
         last_error_=invalid_parameter;result=status?invalid_parameter:0;
-    }catch(const std::bad_alloc&){last_error_=8;result=symbol=="DnsQueryConfig" || symbol=="DnsQueryEx"?8:0;}
+    }catch(const std::bad_alloc&){last_error_=8;result=symbol=="DnsQueryConfig" || symbol=="DnsQueryEx" || symbol.starts_with("DnsModifyRecordsInSet_") || symbol.starts_with("DnsReplaceRecordSet")?8:0;}
     call.return_to(state,result);return std::nullopt;
 }
 }

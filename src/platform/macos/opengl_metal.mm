@@ -26,6 +26,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <CoreMedia/CoreMedia.h>
 #include "../../services/graphics_view_flags.hpp"
+#include "../../services/d3d12_geometry_stream.hpp"
 #include "../../services/shader_memory_cache.hpp"
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CATransaction.h>

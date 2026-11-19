@@ -18,10 +18,16 @@ std::span<const WindowsServiceDescriptor> kernelbase_extra_service_descriptors()
     static constexpr WindowsServiceDescriptor table[]{
         {"kernel32.dll","VirtualAllocFromApp",4,0,0,0xc},{"kernel32.dll","VirtualProtectFromApp",4,0,0,0x4},
         {"kernel32.dll","IsApiSetImplemented",1},{"kernel32.dll","StrCpyNXA",3,0,0,0x4},{"kernel32.dll","StrCpyNXW",3,0,0,0x4},
+        {"kernel32.dll","QueryIoRingCapabilities",1},{"kernel32.dll","IsIoRingOpSupported",2},{"kernel32.dll","CreateIoRing",5,0x2},{"kernel32.dll","GetIoRingInfo",2},
+        {"kernel32.dll","SubmitIoRing",4},{"kernel32.dll","CloseIoRing",1},{"kernel32.dll","PopIoRingCompletion",2},{"kernel32.dll","SetIoRingCompletionEvent",2},
+        // x86 以值傳遞的 IORING_HANDLE_REF 佔 2 格、IORING_BUFFER_REF 佔 3 格、UINT64 佔 2 格：wide 位元補足清除格數，引數於實作中自堆疊解析。
+        {"kernel32.dll","BuildIoRingCancelRequest",4,0x2},{"kernel32.dll","BuildIoRingReadFile",7,0x1e},{"kernel32.dll","BuildIoRingWriteFile",8,0x1e},
+        {"kernel32.dll","BuildIoRingFlushFile",5,0x2},{"kernel32.dll","BuildIoRingRegisterFileHandles",4},{"kernel32.dll","BuildIoRingRegisterBuffers",4},
         {"psapi.dll","EnumPageFilesA",2},{"psapi.dll","EnumPageFilesW",2},{"kernel32.dll","K32EnumPageFilesA",2},{"kernel32.dll","K32EnumPageFilesW",2}};
     return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_kernelbase_extras(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
+#include "windows_ioring.inc"
     if(service.symbol.find("EnumPageFiles")!=std::string_view::npos)
         return nested_continuation(state,memory,"分頁檔列舉",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
             const WindowsCall call(s,m,service);const bool wide=service.symbol.ends_with('W');

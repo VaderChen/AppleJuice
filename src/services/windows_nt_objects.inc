@@ -39,7 +39,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_nt_object(GuestState& entry
                     if(!call(0))co_return finish(access_violation);
                     memory.check(GuestAddress{call(0)},unit,Access::Write);
                     Win32ObjectRequest request;
-                    if(const auto status=win32_object_request(memory,scratch,runtime_,call(2),x86_,creating,request,name=="NtCreateEvent" || name=="NtOpenEvent"))co_return finish(status);
+                    if(const auto status=win32_object_request(memory,scratch,runtime_,call(2),x86_,creating,request,[this](std::u16string& text,bool create){return namespace_object_name(text,create);},name=="NtCreateEvent" || name=="NtOpenEvent"))co_return finish(status);
                     const auto security=request.security,text=request.name;
                     const auto access=word(1);std::uint64_t handle=0;
                     if(name=="NtCreateEvent"){

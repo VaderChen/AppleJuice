@@ -143,6 +143,7 @@
 {"d3dx11_42.dll","D3DX11CreateAsyncFileLoaderA",2},{"d3dx11_42.dll","D3DX11CreateAsyncFileLoaderW",2},{"d3dx11_42.dll","D3DX11CreateAsyncMemoryLoader",3},{"d3dx11_42.dll","D3DX11CreateAsyncResourceLoaderA",3},{"d3dx11_42.dll","D3DX11CreateAsyncResourceLoaderW",3},
 {"d3dx11_43.dll","D3DX11CreateAsyncFileLoaderA",2},{"d3dx11_43.dll","D3DX11CreateAsyncFileLoaderW",2},{"d3dx11_43.dll","D3DX11CreateAsyncMemoryLoader",3},{"d3dx11_43.dll","D3DX11CreateAsyncResourceLoaderA",3},{"d3dx11_43.dll","D3DX11CreateAsyncResourceLoaderW",3},
 {"d3dx10_43.dll","D3DX10LoadTextureFromTexture",3},
+{"d3dx10_43.dll","D3DX10FilterTexture",3},
 {"d3dx10_43.dll","D3DX10SaveTextureToFileA",3},
 {"d3dx10_43.dll","D3DX10SaveTextureToFileW",3},
 {"d3dx10_43.dll","D3DX10SaveTextureToMemory",4},
