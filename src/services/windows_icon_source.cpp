@@ -45,6 +45,13 @@ IconChoice choose_icon(std::span<const std::uint8_t> bytes,bool cursor,bool file
     }
     if(!selected)throw std::invalid_argument("圖示群組沒有有效尺寸");return best;
 }
+std::optional<GuiIcon> resolve_system_cursor(const GuiState& gui,std::uint64_t handle){
+    if(handle<0xd000 || !gui_system_cursor_id(handle-0xd000))return {};
+    const auto id=static_cast<std::uint32_t>(handle-0xd000);
+    const auto replacement=gui.system_cursors.find(id);
+    if(replacement!=gui.system_cursors.end())return replacement->second;
+    return native_system_cursor(id);
+}
 void finish_icon(GuiIcon& icon){
     dimensions(icon.width,icon.height);const auto count=static_cast<std::size_t>(icon.width)*icon.height;
     if(icon.rgba.size()!=count)throw std::invalid_argument("圖示像素數目不符");
@@ -264,13 +271,26 @@ std::size_t IconSource::index(std::int32_t requested)const{
     if(requested>=0)return static_cast<std::size_t>(requested);const auto id=static_cast<std::uint64_t>(-static_cast<std::int64_t>(requested));
     for(std::size_t i=0;i<groups_.size();++i)if(!(groups_[i].id&0x80000000U) && groups_[i].id==id)return i;return groups_.size();
 }
+GuiBitmap decode_bitmap_file(std::span<const std::uint8_t> bytes){
+    if(integer(bytes,0,2)!=0x4d42)throw std::invalid_argument("BMP 檔頭不合法");
+    const auto start=integer(bytes,10,4);
+    const auto dib=bytes.subspan(14);
+    const auto header=integer(dib,0,4),bpp=integer(dib,14,2),compression=integer(dib,16,4);
+    const auto colors=bpp<=8?(integer(dib,32,4)?integer(dib,32,4):1U<<bpp):0U;
+    const std::size_t packed=std::size_t{header}+(header==40 && compression==3?12U:0U)+std::size_t{colors}*4;
+    if(start>bytes.size() || start<14 || packed>start-14)throw std::invalid_argument("BMP 像素位置不合法");
+    try{
+        if(packed==start-14)return decode_dib_bitmap(dib);
+        const auto metadata=dib.first(packed);
+        std::vector<std::uint8_t> contiguous(metadata.begin(),metadata.end());
+        contiguous.insert(contiguous.end(),bytes.begin()+start,bytes.end());
+        return decode_dib_bitmap(contiguous);
+    }catch(const HostCallFault& error){throw std::invalid_argument(error.what());}
+}
 GuiIcon IconSource::extract(std::size_t index,std::uint32_t width,std::uint32_t height,std::uint32_t flags,std::uint32_t* id)const{
     if(index>=groups_.size())throw std::invalid_argument("圖示索引不存在");if(id)*id=UINT32_MAX;
     if(bitmap_){
-        const auto start=get(10,4);auto dib=slice(14,bytes_.size()-14);const auto header=integer(dib,0,4),bpp=integer(dib,14,2),compression=integer(dib,16,4);
-        const auto colors=bpp<=8?(integer(dib,32,4)?integer(dib,32,4):1U<<bpp):0U,packed=header+(header==40 && compression==3?12U:0U)+colors*4;
-        if(start<14+packed || start>bytes_.size())throw std::invalid_argument("BMP 像素位置不合法");std::vector<std::uint8_t> packed_dib(dib.begin(),dib.begin()+packed);packed_dib.insert(packed_dib.end(),bytes_.begin()+start,bytes_.end());
-        GuiBitmap bitmap;try{bitmap=decode_dib_bitmap(packed_dib);}catch(const HostCallFault& e){throw std::invalid_argument(e.what());}GuiIcon icon;icon.width=bitmap.width;icon.height=bitmap.height;icon.color_pixels=bitmap.pixels;icon.rgba=bitmap.pixels;
+        auto bitmap=decode_bitmap_file(bytes_);GuiIcon icon;icon.width=bitmap.width;icon.height=bitmap.height;icon.color_pixels=bitmap.pixels;icon.rgba=bitmap.pixels;
         for(auto& pixel:icon.rgba)pixel|=0xff000000U;resize_icon(icon,width,height?height:width,(flags&1)!=0);return icon;
     }
     const auto group=file_?bytes_:data(groups_[index]);const auto choice=choose_icon(group,cursor_,file_,width,height?height:width,(flags&1)!=0);

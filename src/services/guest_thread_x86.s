@@ -385,6 +385,7 @@ gui_timing GetDoubleClickTime, 0, 0
 gui_timing GetCaretBlinkTime, 4, 0
 gui_timing SetDoubleClickTime, 0, 1
 gui_timing SetCaretBlinkTime, 4, 1
+#include "guest_shell_counter.inc"
 // 與 x64／宿主服務共用狀態，慢路徑保留原始 stdcall 堆疊。
 entry GdiFlush
     cmp dword ptr fs:[X64ARM_GDI_BATCH_X86_OFFSET+X64ARM_GDI_BATCH_PENDING_OFFSET], 0
@@ -540,6 +541,54 @@ entry TryEnterCriticalSection
     ret 4
 1:
 slow_end TryEnterCriticalSection
+
+.macro copy_nx name, unit
+entry \name
+    mov eax, dword ptr [esp+4]
+    mov edx, dword ptr [esp+8]
+    mov ecx, dword ptr [esp+12]
+    test eax, eax
+    jz 4f
+    test edx, edx
+    jz 4f
+    test ecx, ecx
+    jle 4f
+    push ebx
+1:
+    dec ecx
+    jz 3f
+.if \unit == 1
+    movzx ebx, byte ptr [edx]
+.else
+    movzx ebx, word ptr [edx]
+.endif
+    test ebx, ebx
+    jz 3f
+.if \unit == 1
+    mov byte ptr [eax], bl
+.else
+    mov word ptr [eax], bx
+.endif
+    add edx, \unit
+    add eax, \unit
+    jmp 1b
+3:
+.if \unit == 1
+    mov byte ptr [eax], 0
+.else
+    mov word ptr [eax], 0
+.endif
+    pop ebx
+4:
+    ret 12
+end \name
+.endm
+
+copy_nx StrCpyNXA, 1
+copy_nx StrCpyNXW, 2
+
+#include "guest_shell_security.inc"
+#include "guest_shell_copy_encoding.inc"
 
 .globl _guest_thread_end
 _guest_thread_end:

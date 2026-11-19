@@ -165,9 +165,14 @@ std::shared_ptr<RasterSurface> WindowsServices::raster_surface(GuestMemory& memo
         return remote_raster_snapshot(memory,hdc);
     if(writing && !printer_drawing_enabled(hdc) && !prepare_legacy_printer_page(memory,hdc))return {};
     import_dib_bitmap(memory,dc->second.bitmap);
-    // 控制項也可持有離屏繪製表面；headless 不應忽略已建立的真實像素。
-    if(!native_gui_){const auto key=dc->second.bitmap?dc->second.bitmap:hdc;const auto found=rasters_.find(key);if(found!=rasters_.end() && writing)mark_gdi_surface(memory,key);return found==rasters_.end()?std::shared_ptr<RasterSurface>{}:found->second;}
     const auto window=hdc>=0x10000000?gui_.windows.find(hdc-0x10000000):gui_.windows.end();
+    // 離屏點陣圖不依賴視窗系統，使用相同的 DIB 上傳、繪製及批次發布流程。
+    if(!native_gui_ && (window!=gui_.windows.end() || !gui_.bitmaps.contains(dc->second.bitmap))){
+        const auto key=dc->second.bitmap?dc->second.bitmap:hdc;
+        const auto found=rasters_.find(key);
+        if(found!=rasters_.end() && writing)mark_gdi_surface(memory,key);
+        return found==rasters_.end()?std::shared_ptr<RasterSurface>{}:found->second;
+    }
     std::uint64_t key=hdc,resource=0;std::uint32_t width=0,height=0;std::span<const std::uint32_t> pixels;void* view=nullptr;
     if(window!=gui_.windows.end()){width=window->second.width;height=window->second.height;view=native_gui_->graphics_view(window->first);}
     else {const auto bitmap=gui_.bitmaps.find(dc->second.bitmap);if(bitmap==gui_.bitmaps.end())return {};key=dc->second.bitmap;width=bitmap->second.width;height=bitmap->second.height;pixels=bitmap->second.pixels;resource=bitmap->second.resource_id;}
@@ -180,12 +185,14 @@ std::shared_ptr<RasterSurface> WindowsServices::raster_surface(GuestMemory& memo
         if(cached==raster_templates_.end()){
             std::uint64_t bytes=0;for(const auto& [id,item]:raster_templates_){(void)id;bytes+=std::uint64_t{item->width()}*item->height()*4;}
             if(raster_templates_.size()>=32 || bytes+std::uint64_t{width}*height*4>gpu_memory_stats().limit/4)raster_templates_.clear();
-            cached=raster_templates_.emplace(resource,make_hardware_raster(width,height,pixels)).first;
+            auto resource_surface=make_hardware_raster(width,height,pixels);
+            if(!resource_surface)return {};
+            cached=raster_templates_.emplace(resource,std::move(resource_surface)).first;
         }
         surface=cached->second;shared=true;
     }
     const bool created=!surface || surface->width()!=width || surface->height()!=height;
-    if(created){surface=make_hardware_raster(width,height,pixels,view);if(window!=gui_.windows.end())native_gui_->graphics_surface(window->first,surface);}
+    if(created){surface=make_hardware_raster(width,height,pixels,view);if(!surface)return {};if(window!=gui_.windows.end())native_gui_->graphics_surface(window->first,surface);}
     if(writing && shared){
         auto independent=make_hardware_raster(width,height);GuiDc copy_dc;const std::array<std::int32_t,4> rect{0,0,static_cast<std::int32_t>(width),static_cast<std::int32_t>(height)};independent->blit(*surface,rect,rect,copy_dc,UINT32_MAX);surface=std::move(independent);shared=false;
     }

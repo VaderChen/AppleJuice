@@ -25,7 +25,7 @@ inline std::uint32_t gui_system_metric(std::uint32_t index,std::uint32_t dpi=96)
     case 5:case 6:case 45:case 46:value=1;break;
     case 11:case 12:case 13:case 14:value=32;break;
     case 7:case 8:case 32:case 33:value=4;break;case 15:value=20;break;
-    case 49:case 71:case 72:value=18;break;default:return 0;
+    case 38:case 39:value=75;break;case 49:case 71:case 72:value=18;break;default:return 0;
     }return gui_scale_metric(value,dpi);
 }
 struct GuiInsets {std::uint32_t left{},top{},right{},bottom{};};

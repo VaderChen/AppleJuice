@@ -37,12 +37,12 @@ std::span<const WindowsServiceDescriptor> shell_service_descriptors() {
         {"shell32.dll","SHGetKnownFolderPath",4},{"shell32.dll","SHGetKnownFolderIDList",4},
         {"shell32.dll","SHGetFolderPathA",5},{"shell32.dll","SHGetFolderPathW",5},{"shell32.dll","SHGetFolderPathAndSubDirA",6},{"shell32.dll","SHGetFolderPathAndSubDirW",6},{"shell32.dll","SHGetSettings",2},{"shell32.dll","SHGetSetSettings",3},{"shell32.dll","ReadCabinetState",2},{"shell32.dll","SHGetImageList",3},{"shell32.dll","Shell_MergeMenus",6},{"shell32.dll","SHGetNewLinkInfoA",5},{"shell32.dll","SHGetNewLinkInfoW",5},{"shell32.dll","SHGetSetFolderCustomSettings",3},{"shell32.dll","SHIsFileAvailableOffline",2},{"shell32.dll","ShellAboutA",4},{"shell32.dll","ShellAboutW",4},
         {"shell32.dll","OpenAs_RunDLL",4},{"shell32.dll","OpenAs_RunDLLA",4},{"shell32.dll","OpenAs_RunDLLW",4},{"internal-shell-about","DialogProc",4},{"shell32.dll","SHRestricted",1},
+        {"shlwapi.dll","#266",4,0,0,1},{"shlwapi.dll","#271",3},{"shell32.dll","#244",2},
         {"shfolder.dll","SHGetFolderPathA",5},{"shfolder.dll","SHGetFolderPathW",5},
-        {"shell32.dll","SHFileOperationA",1},{"shell32.dll","SHFileOperationW",1},
+        {"shell32.dll","SHFreeNameMappings",1},{"shell32.dll","SHFileOperationA",1},{"shell32.dll","SHFileOperationW",1},{"windows.storage.dll","SHFileOperationWithAdditionalFlags",2,0,0,2},
         {"shell32.dll","SHCloneSpecialIDList",3},{"shell32.dll","SHGetSpecialFolderLocation",3},{"shell32.dll","SHGetFolderLocation",5},{"shell32.dll","SHGetFileInfoA",5},{"shell32.dll","SHGetFileInfoW",5},
         {"shell32.dll","SHGetSpecialFolderPathA",4},{"shell32.dll","SHGetSpecialFolderPathW",4},
         {"shell32.dll","SHBrowseForFolderA",1},{"shell32.dll","SHBrowseForFolderW",1},
-        {"shell32.dll","SHGetPathFromIDListA",2},{"shell32.dll","SHGetPathFromIDListW",2},
         {"shell32.dll","ILCreateFromPathA",1},{"shell32.dll","ILCreateFromPathW",1},
         {"shell32.dll","SHILCreateFromPath",3},{"shell32.dll","ILFree",1},
         {"shell32.dll","SHGetMalloc",1},{"ole32.dll","CoGetMalloc",2},
@@ -576,31 +576,149 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
         catch(const std::range_error&){if((symbol.starts_with("PropVariantToString") || symbol=="VariantToString"))return finish(automation::overflow);throw;}
         catch(const MemoryFault&){if((symbol.starts_with("PropVariantToString") || symbol=="VariantToString"))return finish(pointer_error);throw;}
     }
+    if(symbol=="SHFreeNameMappings"){
+        // 表頭、記錄與兩組路徑均位於同一筆客體配置。
+        if(arg(0))(void)free_heap(memory,arg(0),state);
+        arg.return_to(state,0);return std::nullopt;
+    }
     if(symbol.starts_with("SHFileOperation")){
-        const auto p=arg(0);const unsigned pointer_bits=x86_?32U:64U;
+        const auto p=arg(0);const std::uint8_t pointer_bits=x86_?32:64;
         const auto fail=[&](std::uint32_t error){arg.return_to(state,error);};
         if(!p){fail(87);return std::nullopt;}
-        memory.check(GuestAddress{p},x86_?32:56,Access::Read);
-        GuiShellDelete operation;operation.aborted_address=p+(x86_?20:36);
+        const bool extended=symbol=="SHFileOperationWithAdditionalFlags";
+        const bool unicode=wide || extended;
+        memory.check(GuestAddress{p},x86_?30:56,Access::Read);
+        GuiShellDelete operation;operation.aborted_address=p+(x86_?18:36);
         memory.store(GuestAddress{operation.aborted_address},32,1);
-        memory.store(GuestAddress{p+(x86_?24:40)},static_cast<std::uint8_t>(pointer_bits),0);
+        memory.store(GuestAddress{p+(x86_?22:40)},static_cast<std::uint8_t>(pointer_bits),0);
         const auto function=memory.load(GuestAddress{p+(x86_?4:8)},32);
         operation.flags=static_cast<std::uint32_t>(memory.load(GuestAddress{p+(x86_?16:32)},16));
-        if(function!=3 || (operation.flags&~0x6d54U)){fail(50);return std::nullopt;}
-        auto cursor=memory.load(GuestAddress{p+(x86_?8:16)},static_cast<std::uint8_t>(pointer_bits));
-        if(!cursor){fail(87);return std::nullopt;}
-        std::u16string text;std::string ansi;bool terminated=false;
-        for(unsigned count=0;count<65536;++count){
-            const auto c=memory.load(GuestAddress{cursor},wide?16:8);cursor+=wide?2:1;
-            if(!c){
-                if(text.empty() && ansi.empty()){terminated=true;break;}
-                auto path=wide?utf16_to_utf8(text):ansi;
-                if(path.find_first_of("*?")!=std::string::npos || path.size()>32767){fail(50);return std::nullopt;}
-                operation.paths.push_back(std::move(path));text.clear();ansi.clear();
-                if(operation.paths.size()>4096){fail(8);return std::nullopt;}
-            }else if(wide)text.push_back(static_cast<char16_t>(c));else ansi.push_back(static_cast<char>(c));
+        if(extended)operation.flags|=static_cast<std::uint32_t>(arg(1));
+        if(operation.flags&0x80000U){operation.flags|=0x40U;operation.flags&=~0x80000U;}
+        const auto allowed=function==3?0x6dfcU:0x6fbdU;
+        if(function<1 || function>4 || (operation.flags&~allowed)){fail(50);return std::nullopt;}
+        const auto paths=[&](unsigned offset,std::vector<std::string>& list)->unsigned{
+            auto at=memory.load(GuestAddress{p+offset},static_cast<std::uint8_t>(pointer_bits));
+            if(!at)return 87;
+            std::size_t units=0;
+            while(units<65536){
+                const auto path=unicode?utf16_to_utf8(read_utf16(memory,GuestAddress{at},32767)):read_ansi(memory,at,32767);
+                if(path.empty())return list.empty()?87:0;
+                if(list.size()>=4096)return 8;
+                list.push_back(path);
+                const auto length=(unicode?utf8_to_utf16(path).size():path.size())+1;
+                at+=length*(unicode?2:1);units+=length;
+            }
+            return 87;
+        };
+        if(const auto error=paths(x86_?8:16,operation.paths)){fail(error);return std::nullopt;}
+        std::vector<std::string> expanded;
+        for(auto& path:operation.paths){
+            if(path.find_first_of("*?")==path.npos){expanded.push_back(std::move(path));continue;}
+            std::replace(path.begin(),path.end(),'\\','/');
+            const auto split=path.find_last_of('/');
+            const auto parent=split==path.npos?std::string("./"):path.substr(0,split+1);
+            if(parent.find_first_of("*?")!=parent.npos || function==4){fail(123);return std::nullopt;}
+            const auto pattern=utf8_to_utf16(path.substr(split+1));
+            const auto matched=filesystem_.list(parent,[&](std::string_view leaf){
+                return directory_name_matches(pattern,utf8_to_utf16(leaf));
+            });
+            if(matched.error){fail(matched.error);return std::nullopt;}
+            for(const auto& entry:matched.entries){
+                if((operation.flags&0x80U) && (entry.metadata.attributes&16U))continue;
+                expanded.push_back(parent+entry.name);
+            }
         }
-        if(!terminated || operation.paths.empty()){fail(87);return std::nullopt;}
+        operation.paths=std::move(expanded);
+        if(operation.paths.empty()){memory.store(GuestAddress{operation.aborted_address},32,0);arg.return_to(state,0);return std::nullopt;}
+        if(function!=3){
+            std::vector<std::string> targets;
+            if(const auto error=paths(x86_?12:24,targets)){fail(error);return std::nullopt;}
+            const bool paired=(operation.flags&1U)!=0;
+            if((function==4 && (targets.size()!=1 || operation.paths.size()!=1)) ||
+               (paired?targets.size()!=operation.paths.size():targets.size()!=1)){fail(87);return std::nullopt;}
+            if(!filesystem_.writable()){fail(5);return std::nullopt;}
+            if(!runtime_.network.external_io)throw HostCallFault("比較模式不允許 Shell 變更宿主檔案");
+            const bool rename_collision=(operation.flags&8U)!=0;
+            const bool overwrite=!rename_collision && (operation.flags&0x10U)!=0;
+            std::function<unsigned(const std::string&,const std::string&,unsigned)> transfer;
+            transfer=[&](const std::string& from,const std::string& to,unsigned depth)->unsigned{
+                if(depth>128)return 8;
+                const auto source=filesystem_.information(from),target=filesystem_.information(to);
+                if(source.error)return source.error;
+                if(target.error && target.error!=2 && target.error!=3)return target.error;
+                if(source.key==target.key || source.key.ends_with(":/"))return 87;
+                const bool directory=(source.metadata.attributes&16U)!=0;
+                if(directory && target.key.starts_with(source.key+"/"))return 87;
+                if(!target.error && !overwrite)return 1223;
+                if(function==4 || (function==1 && (target.error || !directory)))
+                    return filesystem_.rename(from,to,function!=4 && overwrite,function==1);
+                if(!directory)return filesystem_.copy(from,to,!overwrite);
+                if(source.metadata.attributes&0x400U)return 50;
+                const auto entries=filesystem_.list(from);
+                if(entries.error)return entries.error;
+                if(target.error){
+                    if(const auto error=filesystem_.create_directory(to))return error;
+                }else if(!(target.metadata.attributes&16U))return 183;
+                for(const auto& entry:entries.entries){
+                    if(const auto error=transfer(from+"/"+entry.name,to+"/"+entry.name,depth+1))return error;
+                }
+                return function==1?filesystem_.remove(from,true):0;
+            };
+            std::vector<std::pair<std::u16string,std::u16string>> mappings;
+            unsigned status=0;
+            for(std::size_t i=0;i<operation.paths.size();++i){
+                auto from=operation.paths[i],to=targets[paired?i:0];
+                std::replace(from.begin(),from.end(),'\\','/');
+                while(from.size()>3 && from.back()=='/')from.pop_back();
+                const auto dest=filesystem_.information(to);
+                if(function!=4 && !dest.error && (dest.metadata.attributes&16U))
+                    to+="/"+from.substr(from.find_last_of('/')+1);
+                else if(!paired && operation.paths.size()>1){status=87;break;}
+                std::u16string original;
+                if(rename_collision && !filesystem_.information(to).error){
+                    original=utf8_to_utf16(to);
+                    std::replace(original.begin(),original.end(),u'/',u'\\');
+                    const auto split=original.find_last_of(u"\\:");
+                    const auto parent=split==original.npos?std::u16string{}:original.substr(0,split+1);
+                    const auto leaf=original.substr(split+1);
+                    GuestScratch scratch(*this,memory,state);
+                    const auto directory=scratch.text(parent),base=scratch.text(leaf),out=scratch.allocate(65536);
+                    if(!directory || !base || !out){status=8;break;}
+                    if(!nested_service(state,memory,"shell32.dll","PathMakeUniqueName",{out,32768,base,base,directory})){
+                        status=183;break;
+                    }
+                    to=utf16_to_utf8(read_utf16(memory,GuestAddress{out},32767));
+                }
+                status=transfer(from,to,0);
+                if(status)break;
+                if(!original.empty() && (operation.flags&0x20U))mappings.emplace_back(std::move(original),utf8_to_utf16(to));
+            }
+            if(!mappings.empty()){
+                // NT 的 A/W 入口都回傳 UTF-16；計數不含 NUL。
+                const unsigned width=pointer_bits/8,header=2*width,stride=2*width+8;
+                std::size_t bytes=header+stride*mappings.size();
+                for(const auto& [old_name,new_name]:mappings)bytes+=(old_name.size()+new_name.size()+2)*2;
+                const auto handle=allocate_heap(memory,bytes);
+                if(!handle){fail(8);return std::nullopt;}
+                const auto rows=handle+header;
+                memory.store(GuestAddress{handle},32,mappings.size());
+                memory.store(GuestAddress{handle+width},pointer_bits,rows);
+                auto strings=rows+stride*mappings.size(),row=rows;
+                for(const auto& [old_name,new_name]:mappings){
+                    const auto put=[&](const std::u16string& name,unsigned field){
+                        memory.store(GuestAddress{row+field*width},pointer_bits,strings);
+                        memory.store(GuestAddress{row+2*width+4*field},32,name.size());
+                        memory.write(GuestAddress{strings},utf16_bytes(name));
+                        strings+=2*(name.size()+1);
+                    };
+                    put(old_name,0);put(new_name,1);row+=stride;
+                }
+                memory.store(GuestAddress{p+(x86_?22:40)},pointer_bits,handle);
+            }
+            memory.store(GuestAddress{operation.aborted_address},32,status?1:0);
+            arg.return_to(state,status);return std::nullopt;
+        }
         if(operation.flags&0x10U || !native_gui_){result=finish_shell_delete(memory,operation,(operation.flags&0x10U)!=0);}
         else{
             const auto owner=memory.load(GuestAddress{p},static_cast<std::uint8_t>(pointer_bits));
@@ -624,6 +742,63 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
     }
     else if(symbol=="CoTaskMemFree" || symbol=="ILFree"){
         if(arg(0)){gui_.shell_pidls.erase(arg(0));if(!free_heap(memory,arg(0),state))last_error_=6;else gui_.task_allocations.erase(arg(0));}
+    }else if(symbol=="#244"){
+        // 以正式登錄交易重新整理 SHRestricted 共用的政策來源。
+        const auto key=arg(1)?read_utf16(memory,GuestAddress{arg(1)}):std::u16string{};
+        const auto policy_equal=[](std::u16string_view a,std::u16string_view b){
+            return a.size()==b.size() && std::equal(a.begin(),a.end(),b.begin(),
+                [](char16_t x,char16_t y){return unicode_case_unit(x,false)==unicode_case_unit(y,false);});
+        };
+        if(!arg(1) || policy_equal(key,u"Policy") || policy_equal(key,u"Software\\Microsoft\\Windows\\CurrentVersion\\Policies")){
+            registry_store_cache_.valid=false;
+            RegistryTransaction transaction(runtime_.registry,registry_file_,&registry_store_cache_,true);
+            if(transaction.error)last_error_=transaction.error;
+            else result=1;
+        }
+    }else if(symbol=="#266" || symbol=="#271"){
+        const bool lookup=symbol=="#266";
+        const auto width=x86_?4U:8U;
+        const auto bits=static_cast<std::uint8_t>(width*8);
+        auto root=arg(lookup?1:0);
+        std::uint64_t group=0,value=0,cache=0;
+        if(lookup){
+            auto row=arg(2),slot=arg(3);
+            if(row && slot){
+                for(;;row+=3*width,slot+=4){
+                    const auto policy=memory.load(GuestAddress{row},32);
+                    if(!policy)break;
+                    if(policy!=static_cast<std::uint32_t>(arg(0)))continue;
+                    result=memory.load(GuestAddress{slot},32);
+                    if(result==UINT32_MAX){
+                        cache=slot;
+                        group=memory.load(GuestAddress{row+width},bits);
+                        value=memory.load(GuestAddress{row+2*width},bits);
+                    }
+                    break;
+                }
+            }
+        }else{group=arg(1);value=arg(2);}
+        if(!lookup || cache){
+            GuestScratch scratch(*this,memory,state);
+            if(!root)root=scratch.text(u"Software\\Microsoft\\Windows\\CurrentVersion\\Policies");
+            const auto slot=scratch.allocate(16);
+            result=0;
+            if(root && slot){
+                const auto open=[&](std::uint64_t hive){
+                    return nested_service(state,memory,"advapi32.dll","RegOpenKeyW",{hive,root,slot});
+                };
+                // 先選可開啟的政策根，再查該根底下的子鍵和值。
+                if(!open(0x80000002U) || !open(0x80000001U)){
+                    const auto key=memory.load(GuestAddress{slot},bits);
+                    memory.store(GuestAddress{slot+8},32,0);
+                    memory.store(GuestAddress{slot+12},32,4);
+                    if(!nested_service(state,memory,"shlwapi.dll","SHGetValueW",{key,group,value,0,slot+8,slot+12}))
+                        result=memory.load(GuestAddress{slot+8},32);
+                    (void)nested_service(state,memory,"advapi32.dll","RegCloseKey",{key});
+                }
+            }
+            if(cache)memory.store(GuestAddress{cache},32,result);
+        }
     }else if(symbol=="SHRestricted"){
         const auto requested=static_cast<std::uint32_t>(arg(0));
         const auto user=registry_current_user_path();
@@ -700,11 +875,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell(GuestState& state,Gue
         if(flags&0x4000){
             result=shell_image_list(width);
         }
-    }else if(symbol.starts_with("SHGetPathFromIDList")){
-        const auto found=gui_.shell_pidls.find(arg(0));
-        if(!arg(1)){last_error_=87;}
-        else if(found==gui_.shell_pidls.end() || !allocations_.contains(arg(0))){last_error_=87;memory.store(GuestAddress{arg(1)},wide?16:8,0);}
-        else {const auto& path=found->second;if((wide?path.size():utf16_to_utf8(path).size())>=260)last_error_=206;else {write_text(memory,arg(1),path,wide);result=1;}}
     }else if(symbol.starts_with("ILCreateFromPath") || symbol=="SHILCreateFromPath"){
         const bool hr=symbol=="SHILCreateFromPath";auto path=normalized(read(arg(0)));
         if(hr && !arg(1))result=invalid_argument;

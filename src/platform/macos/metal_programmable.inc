@@ -1252,7 +1252,14 @@ void MetalGl::graphics_draw(const GraphicsDraw& original){@autoreleasepool{
         raster=std::make_unique<GraphicsDraw>(original);raster->stages[2]={};
     }
     const auto& d=raster?*raster:original;
-    if(!d.indirect && (!d.count || !d.instances))return;if(!d.stages[0].shader)throw std::invalid_argument("繪製缺少 VS 著色器");
+    if(!d.indirect && (!d.count || !d.instances))return;
+    // D3D11 沒有綁定頂點著色器時，執行階段捨棄這次繪製（只有除錯層報錯），不終止程式；
+    // 常見於程式建立著色器失敗後仍照常送出繪製。這裡同樣略過，避免整個程序以內部錯誤結束。
+    if(!d.stages[0].shader){
+        static const bool trace=std::getenv("X64ARM_TRACE_GRAPHICS_ERRORS")!=nullptr;
+        if(trace)std::fprintf(stderr,"[graphics] 略過沒有頂點著色器的繪製\n");
+        return;
+    }
     const auto* const inputs=pipeline_inputs(d);
     {
         // D3D 規則的寬容處理，以修正後的副本重入（只有少數繪製，電馭判客 Benchmark 每秒約十餘次；原本拋錯會中止整次

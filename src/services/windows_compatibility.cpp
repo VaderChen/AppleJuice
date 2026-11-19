@@ -1,3 +1,4 @@
+#include "windows_path_character.h"
 #include "windows_system_info_layout.hpp"
 #include "x64arm/windows_services.hpp"
 #include "crt_os_error.hpp"
@@ -721,16 +722,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_compatibility(GuestState& s
             result=arg(0)+at*unit;
         }
     }else if(symbol.starts_with("PathGetCharType")){
-        // GCT_INVALID=0、GCT_LFNCHAR=1、GCT_SHORTCHAR=2、GCT_WILD=4、GCT_SEPARATOR=8；與 Windows 相同，非 ASCII 視為短檔名可用字元。
-        const auto c=static_cast<std::uint32_t>(symbol.ends_with('W')?arg(0)&0xffffU:arg(0)&0xffU);
-        if(c<0x20 || c=='<' || c=='>' || c=='"' || c=='|' || c=='/')result=0;
-        else if(c=='*' || c=='?')result=4;
-        else if(c=='\\' || c==':')result=8;
-        else {
-            const bool alnum=(c>='0' && c<='9') || (c>='A' && c<='Z') || (c>='a' && c<='z');
-            const bool short_name=c>=126 || alnum || ((c&1U) && c!=';') || c=='$' || c=='&' || c=='(' || c=='.' || c=='@' || c=='^' || c=='\'' || c=='`';
-            result=1U|(short_name?2U:0U);
-        }
+        const auto ch=static_cast<unsigned>(arg(0))&(symbol.ends_with('W')?0xffffU:0xffU);
+        result=path_character_type(ch);
     }else if(symbol.starts_with("StrTrim")){
         // 去掉前後屬於 pszTrimChars 的字元並就地前移；有移除任何字元才回 TRUE。
         const unsigned unit=symbol.ends_with('W')?2U:1U;const auto width=static_cast<std::uint8_t>(unit*8);

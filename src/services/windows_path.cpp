@@ -1,3 +1,4 @@
+#include "x64arm/windows_system_paths.hpp"
 #include "x64arm/windows_services.hpp"
 #include "service_callback_task.hpp"
 #include "x64arm/unicode.hpp"
@@ -646,6 +647,14 @@ std::span<const WindowsServiceDescriptor> path_extra_service_descriptors() {
         X64ARM_PATH_PAIR("PathStripPath",1),X64ARM_PATH_PAIR("PathRemoveBlanks",1),X64ARM_PATH_PAIR("PathQuoteSpaces",1),X64ARM_PATH_PAIR("PathGetArgs",1),
         X64ARM_PATH_PAIR("PathRemoveArgs",1),X64ARM_PATH_PAIR("PathIsURL",1),X64ARM_PATH_PAIR("PathFindSuffixArray",3),X64ARM_PATH_PAIR("PathRelativePathTo",5),
         X64ARM_PATH_PAIR("PathParseIconLocation",1),X64ARM_PATH_PAIR("PathIsNetworkPath",1),X64ARM_PATH_PAIR("PathIsLFNFileSpec",1),X64ARM_PATH_PAIR("PathMakePretty",1),
+        {"shlwapi.dll","#440",3,0,0,4},{"shlwapi.dll","#441",3,0,0,4},
+        {"internal-shell-path-search","PathFileExistsDefExtA",2},
+        {"internal-shell-path-search","PathFileExistsDefExtW",2},
+        {"internal-shell-path-search","PathFindOnPathExA",3},
+        {"internal-shell-path-search","PathFindOnPathExW",3},
+        {"internal-shell-path-search","PathFileExistsAndAttributesA",2},
+        {"internal-shell-path-search","PathFileExistsAndAttributesW",2},
+        {"internal-shell-path-search","PathFileExistsDefExtAndAttributesW",3},
         X64ARM_PATH_PAIR("PathIsDirectoryEmpty",1),X64ARM_PATH_PAIR("PathFindOnPath",2),
         {"shlwapi.dll","PathBuildRootA",2,0,0,0x2},{"shlwapi.dll","PathBuildRootW",2,0,0,0x2},
         X64ARM_PATH_PAIR("PathUnquoteSpaces",1),X64ARM_PATH_PAIR("PathUndecorate",1),X64ARM_PATH_PAIR("PathIsContentType",2),
@@ -658,7 +667,7 @@ std::span<const WindowsServiceDescriptor> path_extra_service_descriptors() {
     };return table;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_path_extra(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
-    const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');const unsigned unit=wide?2U:1U;
+    const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W') || name=="#441";const unsigned unit=wide?2U:1U;
     const unsigned pointer_size=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(pointer_size*8);
     const auto done=[&](std::uint64_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
     // 讀到 NUL 為止（最多 MAX_PATH 以外的長字串亦可），A 版每個位元組一個碼元。
@@ -689,6 +698,38 @@ std::optional<std::uint32_t> WindowsServices::invoke_path_extra(GuestState& stat
         return common;
     };
     try{
+        if(name=="#440" || name=="#441"){
+            constexpr auto failure=0x80004005U;
+            const auto capacity=static_cast<std::uint32_t>(arg(2));
+            if(!arg(0) || !arg(1) || !capacity)return done(failure);
+            const auto file=to_wide(read(arg(0)));
+            const std::u16string base=std::u16string(windows_directory)+u"\\Web\\";
+            const auto fallback=from_wide(base+file);
+            if(fallback.size()>=capacity){
+                const auto directory=from_wide(windows_directory);
+                if(directory.size()<capacity)write(arg(1),directory);
+                return done(failure);
+            }
+            GuestScratch scratch(*this,memory,state);
+            const auto exists=[&](const std::u16string& candidate){
+                const auto path=scratch.text(candidate);
+                return path && nested_service(state,memory,"shlwapi.dll","PathFileExistsW",{path});
+            };
+            const auto user=host("GetUserDefaultUILanguage",{});
+            if(user!=host("GetSystemDefaultUILanguage",{})){
+                std::u16string local=base+u"mui\\";
+                for(int shift=12;shift>=0;shift-=4)local+=u"0123456789abcdef"[(user>>shift)&15U];
+                local+=u'\\';
+                local+=file;
+                const auto encoded=from_wide(local);
+                if(encoded.size()<capacity && exists(local)){
+                    write(arg(1),encoded);
+                    return done(0);
+                }
+            }
+            write(arg(1),fallback);
+            return done(exists(base+file)?0U:failure);
+        }
         if(name.starts_with("PathAddBackslash")){
             // 結尾補一個反斜線並回傳 NUL 位置；空字串不變；結果會超過 MAX_PATH 時回 NULL。
             if(!arg(0))return done(0);auto path=read(arg(0));
@@ -820,32 +861,19 @@ std::optional<std::uint32_t> WindowsServices::invoke_path_extra(GuestState& stat
             for(std::size_t i=1;i<path.size();++i)if(path[i]>=u'A' && path[i]<=u'Z')path[i]=static_cast<char16_t>(path[i]+32);
             write(arg(0),path);return done(1);
         }
-        if(name.starts_with("PathIsDirectoryEmpty") || name.starts_with("PathFindOnPath")){
-            GuestScratch temporary(*this,memory,state);const auto& wide_path=to_wide;
-            if(name.starts_with("PathIsDirectoryEmpty")){
-                // 目錄中只有 . 與 .. 時為空；不是目錄時回 FALSE。
-                auto path=wide_path(read(arg(0)));if(path.empty())return done(0);if(path.back()!=u'\\')path.push_back(u'\\');
-                const auto pattern=temporary.text(path+u"*"),data=temporary.allocate(600);if(!pattern || !data)return done(0);
-                const auto attributes=static_cast<std::uint32_t>(host("GetFileAttributesW",{temporary.text(path)}));
-                if(attributes==UINT32_MAX || !(attributes&0x10U))return done(0);
-                // 沒有任何項目（包含檔案系統不列出 . 與 .. 的情況）即為空目錄。
-                auto handle=host("FindFirstFileW",{pattern,data});if(x86_)handle&=UINT32_MAX;if(handle==(x86_?UINT32_MAX:UINT64_MAX))return done(1);
-                bool empty=true;
-                do{const auto entry=read_utf16(memory,GuestAddress{data+44},260);if(entry!=u"." && entry!=u".."){empty=false;break;}}while(host("FindNextFileW",{handle,data}));
-                (void)host("FindClose",{handle});return done(empty?1U:0U);
-            }
-            // (File 輸入輸出 MAX_PATH, OtherDirs NULL 結尾陣列)：先找額外目錄，再找 PATH。
-            if(!arg(0))return done(0);const auto file=wide_path(read(arg(0)));
-            const auto found=[&](const std::u16string& candidate){
-                const auto text=temporary.text(candidate);if(!text || host("GetFileAttributesW",{text})==UINT32_MAX)return false;
-                write(arg(0),from_wide(candidate));
-                return true;};
-            if(arg(1))for(std::uint64_t i=0;;++i){const auto dir=memory.load(GuestAddress{arg(1)+i*pointer_size},bits);if(!dir)break;
-                if(found(combine_path(wide_path(read(dir)),file)))return done(1);}
-            const auto name_text=temporary.text(file),output=temporary.allocate(2*260+2);if(!name_text || !output)return done(0);
-            const auto length=host("SearchPathW",{0,name_text,0,260,output,0});
-            if(length && length<260 && found(read_utf16(memory,GuestAddress{output},260)))return done(1);
-            return done(0);
+#include "windows_shell_path_search.inc"
+        if(name.starts_with("PathIsDirectoryEmpty")){
+            GuestScratch temporary(*this,memory,state);
+            // 目錄中只有 . 與 .. 時為空；不是目錄時回 FALSE。
+            auto path=to_wide(read(arg(0)));if(path.empty())return done(0);if(path.back()!=u'\\')path.push_back(u'\\');
+            const auto pattern=temporary.text(path+u"*"),data=temporary.allocate(600);if(!pattern || !data)return done(0);
+            const auto attributes=static_cast<std::uint32_t>(host("GetFileAttributesW",{temporary.text(path)}));
+            if(attributes==UINT32_MAX || !(attributes&0x10U))return done(0);
+            // 沒有任何項目（包含檔案系統不列出 . 與 .. 的情況）即為空目錄。
+            auto handle=host("FindFirstFileW",{pattern,data});if(x86_)handle&=UINT32_MAX;if(handle==(x86_?UINT32_MAX:UINT64_MAX))return done(1);
+            bool empty=true;
+            do{const auto entry=read_utf16(memory,GuestAddress{data+44},260);if(entry!=u"." && entry!=u".."){empty=false;break;}}while(host("FindNextFileW",{handle,data}));
+            (void)host("FindClose",{handle});return done(empty?1U:0U);
         }
         if(name.starts_with("PathUnquoteSpaces")){
             // 前後皆為雙引號時移除；回傳是否移除。

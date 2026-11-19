@@ -1,3 +1,10 @@
+#include "gui_timing_layout.h"
+#include "x64arm/security_descriptor.hpp"
+#include "shell_dispatch_layout.h"
+#include "shell_window_interfaces.h"
+#include "windows_path_character.h"
+#include "x64arm/windows_guid.hpp"
+#include "x64arm/windows_gui_abi.hpp"
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "service_callback_task.hpp"
@@ -38,10 +45,31 @@ using Iid=std::array<std::uint8_t,16>;
 constexpr Iid iid_unknown{0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
 constexpr Iid iid_object_with_site{0xa3,0x01,0x48,0xfc,0xa9,0x2b,0xcf,0x11,0xa2,0x29,0x00,0xaa,0x00,0x3d,0x73,0x52};
 constexpr Iid iid_security_manager{0xee,0xc9,0xea,0x79,0xf9,0xba,0xce,0x11,0x8c,0x82,0x00,0xaa,0x00,0x4b,0xa9,0x0b};
-constexpr Iid iid_security_site{0xed,0xc9,0xea,0x79,0xf9,0xba,0xce,0x11,0x8c,0x82,0x00,0xaa,0x00,0x4b,0xa9,0x0b};
-constexpr Iid iid_ole_window{0x14,0x01,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
-constexpr Iid iid_shell_view{0xe3,0x14,0x02,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
+constexpr Iid iid_command_target{0xcb,0xbc,0x22,0xb7,0x68,0x4e,0x1b,0x10,0xa2,0xbc,0,0xaa,0,0x40,0x47,0x70};
+constexpr Iid iid_service_provider{0xc1,0x40,0x51,0x6d,0x36,0x74,0xce,0x11,0x80,0x34,0,0xaa,0,0x60,9,0xfa};
+constexpr Iid iid_control_site{0x89,0xb2,0x96,0xb1,0xb4,0xba,0x1a,0x10,0xb6,0x9c,0x00,0xaa,0x00,0x34,0x1d,0x07};
+constexpr Iid iid_input_object{0xaa,0x4f,0x28,0x68,0x48,0x6a,0xd0,0x11,0x8c,0x78,0x00,0xc0,0x4f,0xd9,0x18,0xb4};
+constexpr Iid iid_input_site{0x92,0x83,0xdb,0xf1,0x31,0x73,0xd0,0x11,0x8c,0x99,0x00,0xa0,0xc9,0x2d,0xbf,0xe8};
 constexpr Iid iid_point_container{0x84,0xb2,0x96,0xb1,0xb4,0xba,0x1a,0x10,0xb6,0x9c,0x00,0xaa,0x00,0x34,0x1d,0x07};
+// 客體串列以 DWORD 對齊；未對齊的區塊包在保留簽章的外層，串流只含內層。
+struct ShellDataBlock {
+    std::uint64_t address, payload;
+    std::uint32_t span, length, signature;
+};
+
+ShellDataBlock shell_data_block(const GuestMemory& memory,std::uint64_t address){
+    const auto load=[&](std::uint64_t at){return static_cast<std::uint32_t>(memory.load(GuestAddress{at},32));};
+    const auto span=address?load(address):0U;
+    if(!span)return {address,address,0,0,0};
+    if(span<8 || (span&3))throw std::invalid_argument("資料區塊長度錯誤");
+    memory.check(GuestAddress{address},span,Access::Read);
+    const auto outer=load(address+4);
+    if(outer!=UINT32_MAX)return {address,address,span,span,outer};
+    if(span<16)throw std::invalid_argument("資料區塊容器過短");
+    const auto length=load(address+8);
+    if(length<8 || length>span-8)throw std::invalid_argument("資料區塊超出容器");
+    return {address,address+8,span,length,load(address+12)};
+}
 std::uint32_t hls_to_rgb(int hue,int luminance,int saturation){
     const auto pack=[](int r,int g,int b){const auto clamp=[](int v){return static_cast<std::uint32_t>(std::clamp(v,0,rgb_max));};return clamp(r)|(clamp(g)<<8)|(clamp(b)<<16);};
     if(!saturation){const int gray=luminance*rgb_max/hls_max;return pack(gray,gray,gray);}
@@ -53,14 +81,43 @@ std::uint32_t hls_to_rgb(int hue,int luminance,int saturation){
 }
 std::span<const WindowsServiceDescriptor> shlwapi_misc_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"shlwapi.dll","#491",3,0,0,5},{"shlwapi.dll","#516",6,0,0,1},
+        {"shlwapi.dll","#517",6,0,0,0x29},{"shlwapi.dll","#518",3,0,0,1},{"shlwapi.dll","#519",6,0,0,1},
+        {"shlwapi.dll","#160",2,0,0,2},{"shlwapi.dll","#161",2,0,0,2},
+        {"shlwapi.dll","#356",3},{"shlwapi.dll","#475",2,0,0,2},
+        {"shlwapi.dll","#17",2},{"shlwapi.dll","#18",2},{"shlwapi.dll","#19",1},
+        {"shlwapi.dll","#20",2},{"shlwapi.dll","#21",2,0,0,2},{"shlwapi.dll","#22",2,0,0,2},
+        {"shlwapi.dll","#236",1},{"shlwapi.dll","#343",5},{"shlwapi.dll","#344",5},
+        {"shlwapi.dll","#178",5},{"internal-message-propagation","EnumProc",2},{"shlwapi.dll","#194",2},{"shlwapi.dll","#355",2,0,0,2},
+        {"shlwapi.dll","#163",5},{"shlwapi.dll","#164",6},{"shlwapi.dll","#484",7},
+        {"shlwapi.dll","#188",3},{"shlwapi.dll","#189",2},{"shlwapi.dll","#478",2},
+        {"shlwapi.dll","#479",3},{"shlwapi.dll","#481",1},{"shlwapi.dll","#509",3},
         {"shlwapi.dll","#542",0},
         {"shlwapi.dll","#35",3,0,0,0x2},
         {"shlwapi.dll","ColorRGBToHLS",4,0,0,0x1},{"shlwapi.dll","ColorHLSToRGB",3,0,0,0x7},{"shlwapi.dll","ColorAdjustLuma",3,0,0,0x7},
+        {"internal-shell-persist","IUnknown_GetClassID",2},
+        {"internal-shell-owner","IUnknown_SetOwner",2},
+        {"internal-shell-identity","SHIsSameObject",2},
+        {"internal-shell-slashes","PathSkipLeadingSlashesA",1},
+        {"internal-shell-slashes","FixSlashesAndColonA",1},{"internal-shell-slashes","FixSlashesAndColonW",1},
+        {"internal-shell-fdsa","FDSA_Initialize",5,0,0,0x13},{"internal-shell-fdsa","FDSA_Destroy",1},
+        {"internal-shell-fdsa","FDSA_InsertItem",3,0,0,0x2},{"internal-shell-fdsa","FDSA_DeleteItem",2,0,0,0x2},
+        {"internal-shell-dispatch","SHPackDispParamsV",4,0,0,4},
+        {"internal-shell-dispatch","SHPackDispParams",3,0,0,4,true},
+        {"internal-shell-map","SHSearchMapInt",4,0,0,0xc},
+        {"shlwapi.dll","#222",1},{"shlwapi.dll","#223",1},{"shlwapi.dll","#224",1},
+        {"shlwapi.dll","#422",2,0,0,2},{"shlwapi.dll","#423",2,0,0,2},{"shlwapi.dll","#424",1},
+        {"shlwapi.dll","SHGlobalCounterGetValue",1,0,0,1},{"shlwapi.dll","SHGlobalCounterIncrement",1,0,0,1},
+        {"shlwapi.dll","SHGlobalCounterDecrement",1,0,0,1},{"internal-shell-counter","SHGlobalCounterSetValue",2,0,0,3},
+        {"shlwapi.dll","#193",0},{"shlwapi.dll","#197",3,0,0,0x4},
+        {"shlwapi.dll","#177",2},{"shlwapi.dll","#180",1},
+        {"shlwapi.dll","#181",3,0,0,0x6},{"shlwapi.dll","#182",3,0,0,0x6},{"shlwapi.dll","#192",2,0,0,0x2},
         {"shlwapi.dll","GetMenuPosFromID",2,0,0,0x2},{"shlwapi.dll","GetAcceptLanguagesA",2},{"shlwapi.dll","GetAcceptLanguagesW",2},
         {"internal-shell-shared","SHMapHandle",5,0,0,0x1e},{"internal-shell-shared","SHLockSharedEx",3,0,0,0x6},
         {"shlwapi.dll","SHAllocShared",3,0,0,0x6},{"shlwapi.dll","SHLockShared",2,0,0,0x2},{"shlwapi.dll","SHUnlockShared",1},{"shlwapi.dll","SHFreeShared",2,0,0,0x2},
         {"shlwapi.dll","WhichPlatform",0},{"shlwapi.dll","SHIsLowMemoryMachine",1,0,0,0x1},{"shlwapi.dll","IsInternetESCEnabled",0},
-        {"shlwapi.dll","IStream_Read",3,0,0,0x4},{"shlwapi.dll","IStream_Write",3,0,0,0x4},{"shlwapi.dll","IStream_Reset",1},{"shlwapi.dll","IStream_Size",2},
+        {"shlwapi.dll","#166",1},{"shlwapi.dll","IStream_Read",3,0,0,0x4},{"shlwapi.dll","IStream_Write",3,0,0,0x4},{"shlwapi.dll","IStream_Reset",1},{"shlwapi.dll","IStream_Size",2},
+        {"shlwapi.dll","#267",4},{"shlwapi.dll","#268",2},
         {"shlwapi.dll","IUnknown_AtomicRelease",1},{"shlwapi.dll","IUnknown_Set",2},{"shlwapi.dll","IUnknown_GetSite",3},{"shlwapi.dll","IUnknown_SetSite",2},{"shlwapi.dll","IUnknown_GetWindow",2},
         {"shlwapi.dll","ConnectToConnectionPoint",6,0,0,0x4},
         {"shlwapi.dll","SHSetThreadRef",1},{"shlwapi.dll","SHGetThreadRef",1},{"shlwapi.dll","SHReleaseThreadRef",0},{"shlwapi.dll","SHCreateThreadRef",2},
@@ -72,6 +129,16 @@ std::span<const WindowsServiceDescriptor> shlwapi_misc_service_descriptors(){
         {"shlwapi.dll","SHMessageBoxCheckA",6,0,0,0x18},{"shlwapi.dll","SHMessageBoxCheckW",6,0,0,0x18},
         {"shlwapi.dll","ShellMessageBoxA",5,0,0,0x10,true},{"shlwapi.dll","ShellMessageBoxW",5,0,0,0x10,true},
         {"shlwapi.dll","SHCreateShellPalette",1},{"shlwapi.dll","SHGetInverseCMAP",2,0,0,0x2},{"shlwapi.dll","SHSkipJunction",2},{"shlwapi.dll","UrlFixupW",3,0,0,0x4},
+        {"internal-shell-dialog","SHDialogBox",5},{"internal-shell-dialog","DialogProc",4},
+        {"internal-worker-window","SHDefWindowProc",4},
+        {"internal-worker-window","SHCreateWorkerWindowA",6},{"internal-worker-window","SHCreateWorkerWindowW",6},
+        {"internal-shell-window","SHSetWindowBits",4},{"internal-shell-window","SHSetParentHwnd",2},
+        {"internal-shell-window","SHRegisterClassA",1},{"internal-shell-window","SHRegisterClassW",1},
+        {"internal-shell-window","SHUnregisterClassesA",3},{"internal-shell-window","SHUnregisterClassesW",3},
+        {"internal-dialog-font","SHSetDefaultDialogFont",2,0,0,0x2},
+        {"internal-dialog-font","SHRemoveDefaultDialogFont",1},
+        {"shlwapi.dll","#429",1},{"shlwapi.dll","#430",2,0,0,2},{"shlwapi.dll","#431",1},
+        {"shlwapi.dll","#405",6,0,0,0x24},{"shlwapi.dll","#406",6,0,0,0x24},{"shlwapi.dll","MLFreeLibrary",1},
         {"shlwapi.dll","MLLoadLibraryA",3,0,0,0x4},{"shlwapi.dll","MLLoadLibraryW",3,0,0,0x4},
         // 雜湊與路徑字元（windows_shlwapi_hash.inc）。
         {"shlwapi.dll","HashData",4,0,0,0xa},{"shlwapi.dll","UrlHashA",3,0,0,0x4},{"shlwapi.dll","UrlHashW",3,0,0,0x4},
@@ -86,7 +153,227 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
     const auto handle=[&](std::uint64_t value){return x86_?value&UINT32_MAX:value;};
     const auto host=[&](std::string_view dll,std::string_view symbol,std::initializer_list<std::uint64_t> args){return nested_service(state,memory,dll,symbol,args);};
     const auto pointer_bits=static_cast<std::uint8_t>(x86_?32:64);
+    if(name=="#491"){
+        static constexpr std::u16string_view bases[]{
+            u"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer",u"Software\\Microsoft\\Windows\\Shell",
+            u"Software\\Microsoft\\Windows\\ShellNoRoam",u"Software\\Classes"};
+        static constexpr std::u16string_view groups[]{
+            u"",u"LocalizedResourceName",u"Handlers",u"Associations",u"Volatile",u"MUICache",u"FileExts"};
+        const auto flags=u32(0)==0x1ffff?0x21U:u32(0);
+        const auto base=(flags>>4)&0xff,group=(flags>>12)&0xff;
+        if(base>=std::size(bases) || group>=std::size(groups))return done(0);
+        std::u16string path{bases[base]};
+        if(group){path+=u'\\';path+=groups[group];}
+        if(arg(1)){path+=u'\\';path+=read_utf16(memory,GuestAddress{arg(1)},32768);}
+        GuestScratch scratch(*this,memory,state);
+        const auto text=scratch.text(path),slot=scratch.allocate(8);
+        if(!text || !slot)return done(0);
+        const auto root=handle((flags&15U)==2?UINT64_C(0xffffffff80000002):UINT64_C(0xffffffff80000001));
+        const auto status=u32(2)?host("advapi32.dll","RegCreateKeyExW",{root,text,0,0,0,0x02000000,0,slot,0}):
+            host("advapi32.dll","RegOpenKeyExW",{root,text,0,0x02000000,slot});
+        return done(status?0:memory.load(GuestAddress{slot},pointer_bits));
+    }
+    if(name=="#516" || name=="#517" || name=="#518" || name=="#519"){
+        const auto key=handle(host("shlwapi.dll","#491",{u32(0),arg(1),name=="#517"}));
+        if(!key)return done(0x80070002U);
+        const auto close=[&]{(void)host("advapi32.dll","RegCloseKey",{key});};
+        std::uint64_t error=0;
+        try{
+            if(name=="#517")error=host("advapi32.dll","RegSetValueExW",{key,arg(2),0,u32(3),arg(4),u32(5)});
+            else if(name=="#518")error=host("advapi32.dll","RegDeleteValueW",{key,arg(2)});
+            else if(name=="#516")error=host("shlwapi.dll","SHQueryValueExW",{key,arg(2),0,arg(3),arg(4),arg(5)});
+            else{
+                GuestScratch scratch(*this,memory,state);
+                const auto size=scratch.allocate(4);
+                const auto query=[&](std::uint64_t data){
+                    return host("shlwapi.dll","SHQueryValueExW",{key,arg(2),0,arg(3),data,size});
+                };
+                error=size?query(0):14;
+                if(!error){
+                    memory.check(GuestAddress{arg(4)},pointer_bits/8,Access::Write);
+                    const auto count=memory.load(GuestAddress{size},32);
+                    const auto data=count>UINT32_MAX-2?0:handle(host("kernel32.dll","LocalAlloc",{0,count+2}));
+                    memory.store(GuestAddress{arg(4)},pointer_bits,data);
+                    if(!data)error=14;
+                    else{
+                        memory.store(GuestAddress{size},32,count+2);
+                        error=query(data);
+                        if(arg(5))memory.store(GuestAddress{arg(5)},32,memory.load(GuestAddress{size},32));
+                    }
+                }
+            }
+        }catch(...){close();throw;}
+        close();
+        return done(error?0x80070000U|(error&0xffffU):0U);
+    }
+    if(name=="#160" || name=="#161"){
+        const auto dest=arg(0);
+        if(!dest)return done(0);
+        const auto capacity=u32(1);
+        const bool wide=name=="#161";
+        if(wide)memory.store(GuestAddress{dest},16,0);
+
+        GuestScratch scratch(*this,memory,state);
+        const auto machine=x86_?UINT64_C(0x80000002):UINT64_C(0xffffffff80000002);
+        const auto nt=scratch.text(u"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+        const auto legacy=scratch.text(u"SOFTWARE\\Microsoft\\Windows\\CurrentVersion");
+        const auto ie=scratch.text(u"SOFTWARE\\Microsoft\\Internet Explorer");
+        const auto registration=scratch.text(u"SOFTWARE\\Microsoft\\Internet Explorer\\Registration");
+        const auto slot=scratch.allocate(8),size=scratch.allocate(4),buffer=scratch.allocate(2050);
+        if(!nt || !legacy || !ie || !registration || !slot || !size || !buffer)return done(0);
+        const auto open=[&](std::uint64_t path){
+            return host("advapi32.dll","RegOpenKeyExW",{machine,path,0,0x20019,slot})==0;
+        };
+        if(!open(nt) && !open(legacy))return done(0);
+        const auto current=memory.load(GuestAddress{slot},pointer_bits);
+        const auto field=[&](std::uint64_t root,std::uint64_t path,std::u16string_view label,
+                             unsigned bytes)->std::optional<std::u16string>{
+            const auto value=scratch.text(label);
+            if(!value)return {};
+            memory.store(GuestAddress{size},32,bytes);
+            if(host("shlwapi.dll","SHGetValueW",{root,path,value,0,buffer,size}))return {};
+            const auto length=memory.load(GuestAddress{size},32)/2;
+            memory.store(GuestAddress{buffer+2*length},16,0);
+            return read_utf16(memory,GuestAddress{buffer},length+1);
+        };
+        std::u16string result;
+        if(auto version=field(machine,ie,u"Version",30)){
+            result=*version;
+            result+=field(machine,ie,u"CustomizedVersion",30-static_cast<unsigned>(version->size())).value_or(u"");
+        }
+        const auto append=[&](std::uint64_t root,std::uint64_t path,std::u16string_view label,unsigned bytes){
+            result+=u'~';
+            if(auto value=field(root,path,label,bytes))result+=*value;
+        };
+        append(current,0,u"RegisteredOwner",256);
+        append(current,0,u"RegisteredOrganization",256);
+        result+=u"~0";
+        append(machine,registration,u"ProductId",256);
+        append(machine,legacy,u"IEAKUpdateUrl",2048);
+        append(current,0,u"IEAKHelpString",256);
+        (void)host("advapi32.dll","RegCloseKey",{current});
+        if(capacity){
+            if(result.size()>=capacity)result.resize(capacity-1);
+            if(wide)memory.write(GuestAddress{dest},utf16_bytes(result));
+            else{
+                const auto source=scratch.text(result);
+                if(!source)return done(0);
+                (void)host("kernel32.dll","WideCharToMultiByte",{0,0,source,UINT32_MAX,dest,capacity,0,0});
+            }
+        }
+        return done(1);
+    }
+    if(service.family=="internal-shell-dispatch"){
+        const auto params=arg(0),args=arg(1);
+        const unsigned unit=pointer_bits/8;
+        const auto count=u32(2);
+        const bool indirect=name=="SHPackDispParamsV";
+        auto cursor=indirect?arg(3):0;
+        unsigned index=3;
+        const auto next=[&](unsigned bits){
+            if(!indirect)return arg(index++);
+            const auto value=memory.load(GuestAddress{cursor},static_cast<std::uint8_t>(bits));
+            cursor+=unit;
+            return value;
+        };
+        memory.store(GuestAddress{params},pointer_bits,args);
+        memory.store(GuestAddress{params+unit},pointer_bits,0);
+        memory.store(GuestAddress{params+2*unit},32,count);
+        memory.store(GuestAddress{params+2*unit+4},32,0);
+        for(auto remaining=count;remaining;--remaining){
+            const auto item=args+std::uint64_t{remaining-1}*(8+2*unit);
+            const auto type=shell_dispatch_type(static_cast<std::uint16_t>(next(32)));
+            memory.store(GuestAddress{item},16,type);
+            const auto width=shell_dispatch_width(type,pointer_bits);
+            memory.store(GuestAddress{item+8},static_cast<std::uint8_t>(width),next(std::max(width,32U)));
+        }
+        return done(0);
+    }
+    if(name=="#429")return done(runtime_.multilingual_modules.contains(handle(arg(0))));
+    if(name=="#430"){
+        const auto module=handle(arg(0));
+        if(!module)return done(0x8007000eU);
+        try{runtime_.multilingual_modules.emplace(module,static_cast<std::uint16_t>(arg(1)));}
+        catch(const std::bad_alloc&){return done(0x8007000eU);}
+        return done(0);
+    }
+    if(name=="#431"){
+        const auto found=runtime_.multilingual_modules.find(handle(arg(0)));
+        if(found!=runtime_.multilingual_modules.end())runtime_.multilingual_modules.erase(found);
+        return done(0);
+    }
+#include "windows_shell_security.inc"
+#include "windows_shlwapi_counter.inc"
+#include "windows_shlwapi_fdsa.inc"
 #include "windows_shlwapi_hash.inc"
+    if(name=="#193"){ // SHGetCurColorRes
+        const auto dc=handle(host("user32.dll","GetDC",{0}));
+        const auto depth=static_cast<std::uint32_t>(host("gdi32.dll","GetDeviceCaps",{dc,12}));
+        const auto planes=static_cast<std::uint32_t>(host("gdi32.dll","GetDeviceCaps",{dc,14}));
+        (void)host("user32.dll","ReleaseDC",{0,dc});
+        return done(depth*planes);
+    }
+    if(name=="#197"){ // SHFillRectClr 透過 ETO_OPAQUE 套用 DC 的座標與裁切。
+        const auto dc=arg(0), rect=arg(1);
+        const auto previous=host("gdi32.dll","SetBkColor",{dc,u32(2)});
+        (void)host("gdi32.dll","ExtTextOutA",{dc,0,0,2,rect,0,0,0});
+        (void)host("gdi32.dll","SetBkColor",{dc,previous});
+        return done(0);
+    }
+    if(name=="#19")return done(arg(0)?host("kernel32.dll","LocalFree",{arg(0)}):0);
+    if(name=="#20" || name=="#21" || name=="#22"){
+        const bool add=name=="#20",find=name=="#22";
+        if(!arg(0) || (add && !arg(1)))return done(0);
+        const auto list=find?arg(0):memory.load(GuestAddress{arg(0)},pointer_bits);
+        if(!find)memory.check(GuestAddress{arg(0)},pointer_bits/8,Access::Write);
+        auto cursor=list;
+        ShellDataBlock removed{};
+        for(;;){
+            const auto block=shell_data_block(memory,cursor);
+            if(!block.span)break;
+            if(!add && !removed.span){
+                const auto match=block.payload!=cursor && u32(1)==UINT32_MAX?cursor:block.signature==u32(1)?block.payload:0;
+                if(match){
+                    if(find)return done(match);
+                    removed=block;
+                }
+            }
+            cursor+=block.span;
+        }
+        const auto used=cursor-list;
+        if(add){
+            const auto item=arg(1),length=memory.load(GuestAddress{item},32);
+            if(length<8 || memory.load(GuestAddress{item+4},32)==UINT32_MAX)return done(0);
+            const auto span=(length&3)?((length+3)&~UINT64_C(3))+8:length;
+            if(used+span+4>UINT32_MAX || used+span+4>memory.limit())return done(0);
+            memory.check(GuestAddress{item},length,Access::Read);
+            const auto dest=handle(list?host("kernel32.dll","LocalReAlloc",{list,used+span+4,0x42}):
+                                        host("kernel32.dll","LocalAlloc",{0x40,span+4}));
+            if(!dest)return done(0);
+            // 允許把 SHFindDataBlock 交回的區塊再附加一次；重配後須重定位來源。
+            const auto source=item>=list && item-list<used?dest+(item-list):item;
+            const auto start=dest+used;
+            if(span!=length){
+                memory.store(GuestAddress{start},32,span);
+                memory.store(GuestAddress{start+4},32,UINT32_MAX);
+            }
+            memory.move(GuestAddress{start+(span!=length?8:0)},GuestAddress{source},length);
+            memory.store(GuestAddress{start+span},32,0);
+            memory.store(GuestAddress{arg(0)},pointer_bits,dest);
+            return done(1);
+        }
+        if(!removed.span)return done(0);
+        const auto next=removed.address+removed.span;
+        memory.move(GuestAddress{removed.address},GuestAddress{next},cursor-next+4);
+        if(used==removed.span){
+            (void)host("kernel32.dll","LocalFree",{list});
+            memory.store(GuestAddress{arg(0)},pointer_bits,0);
+        }else{
+            const auto resized=handle(host("kernel32.dll","LocalReAlloc",{list,used-removed.span+4,0x42}));
+            if(resized)memory.store(GuestAddress{arg(0)},pointer_bits,resized);
+        }
+        return done(1);
+    }
     if(name=="#35"){ // GetStringType3ExW
         return done(host("kernel32.dll","GetStringTypeW",{4,arg(0),u32(1),arg(2)}));
     }
@@ -104,11 +391,72 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         if(u32(2))value.luminance+=n>0?(hls_max-value.luminance)*n/1000:value.luminance*n/1000;else value.luminance+=n;
         value.luminance=std::clamp(value.luminance,0,hls_max);return done(hls_to_rgb(value.hue,value.luminance,value.saturation));
     }
-    if(name=="GetMenuPosFromID"){
-        // 回傳命令 ID 相符項目的位置；子選單項目的 ID 為 -1，不會相符。找不到時回 -1。
-        const auto count=static_cast<std::int32_t>(static_cast<std::uint32_t>(host("user32.dll","GetMenuItemCount",{arg(0)})));
-        for(std::int32_t i=0;i<count;++i)if(static_cast<std::uint32_t>(host("user32.dll","GetMenuItemID",{arg(0),static_cast<std::uint32_t>(i)}))==u32(1))return done(static_cast<std::uint32_t>(i));
+    if(name=="PathSkipLeadingSlashesA"){
+        const auto path=arg(0);
+        if(path && memory.load(GuestAddress{path},8)=='/' &&
+           memory.load(GuestAddress{handle(path+1)},8)=='/')return done(handle(path+2));
+        return done(path);
+    }
+    if(name=="FixSlashesAndColonA" || name=="FixSlashesAndColonW"){
+        const unsigned stride=name.ends_with('W')?2U:1U;
+        const auto bits=static_cast<std::uint8_t>(stride*8);
+        for(auto p=arg(0);;p=handle(p+stride)){
+            const auto unit=memory.load(GuestAddress{p},bits);
+            if(!unit)break;
+            if(unit=='/')memory.store(GuestAddress{p},bits,'\\');
+        }
+        return done(0);
+    }
+    if(name=="SHSearchMapInt"){
+        const auto keys=arg(0), values=arg(1);
+        const auto count=static_cast<std::int32_t>(u32(2));
+        const auto key=u32(3);
+        if(keys && values){
+            for(std::int32_t i=0;i<count;++i){
+                const auto offset=static_cast<std::uint64_t>(i)*4;
+                if(memory.load(GuestAddress{handle(keys+offset)},32)==key)
+                    return done(memory.load(GuestAddress{handle(values+offset)},32));
+            }
+        }
         return done(UINT32_MAX);
+    }
+    if(name=="#177"){ // SHLoadMenuPopup
+        const auto menu=handle(host("user32.dll","LoadMenuW",{arg(0),arg(1)}));
+        if(!menu)return done(0);
+        if(host("user32.dll","GetSubMenu",{menu,0}))
+            (void)host("user32.dll","RemoveMenu",{menu,0,0x400});
+        (void)host("user32.dll","DestroyMenu",{menu});
+        return done(1);
+    }
+    if(name=="#180"){ // SHRemoveAllSubMenus 保留已分離的子選單。
+        auto count=static_cast<std::int32_t>(host("user32.dll","GetMenuItemCount",{arg(0)}));
+        while(count>0){
+            const auto index=static_cast<std::uint32_t>(--count);
+            if(host("user32.dll","GetSubMenu",{arg(0),index}))
+                (void)host("user32.dll","RemoveMenu",{arg(0),index,0x400});
+        }
+        return done(static_cast<std::uint32_t>(count)-1);
+    }
+    if(name=="#181")return done(host("user32.dll","EnableMenuItem",{arg(0),u32(1),u32(2)?0U:1U}));
+    if(name=="#182")return done(host("user32.dll","CheckMenuItem",{arg(0),u32(1),u32(2)?8U:0U}));
+    if(name=="GetMenuPosFromID" || name=="#192"){
+        const bool by_position=name=="GetMenuPosFromID";
+        const auto count=by_position?static_cast<std::int32_t>(host("user32.dll","GetMenuItemCount",{arg(0)})):1;
+        const auto missing=by_position?UINT32_MAX:0U;
+        if(count<=0)return done(missing);
+        GuestScratch scratch(*this,memory,state);
+        const unsigned size=x86_?48U:80U;
+        const auto info=scratch.allocate(size);
+        if(!info)return done(missing);
+        memory.store(GuestAddress{info},32,size);
+        memory.store(GuestAddress{info+4},32,by_position?2U:4U);
+        for(std::int32_t i=0;i<count;++i){
+            const auto index=static_cast<std::uint32_t>(i);
+            if(!host("user32.dll","GetMenuItemInfoW",{arg(0),by_position?index:u32(1),by_position,info}))continue;
+            if(!by_position)return done(memory.load(GuestAddress{info+(x86_?20U:24U)},pointer_bits));
+            if(memory.load(GuestAddress{info+16},32)==u32(1))return done(index);
+        }
+        return done(missing);
     }
     if(name.starts_with("GetAcceptLanguages")){
         // (buffer, cch* 輸入輸出)：HKCU\Software\Microsoft\Internet Explorer\International 的 AcceptLanguage，沒有時為使用者預設地區名稱。
@@ -326,8 +674,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         return done(stream);
     }
     if(name=="SHIsChildOrSelf"){
-        // 相同視窗或子孫視窗回 S_OK，否則 S_FALSE。
-        if(arg(0)==arg(1) && arg(0))return done(0);return done(arg(0) && arg(1) && (host("user32.dll","IsChild",{arg(0),arg(1)})&UINT32_MAX)?0U:1U);
+        // 回傳的 BOOL 在兩者相同或有子孫關係時為 FALSE，空控制代碼為 TRUE。
+        const auto parent=arg(0), child=arg(1);
+        if(!parent || !child)return done(1);
+        if(parent==child)return done(0);
+        return done(!static_cast<std::uint32_t>(host("user32.dll","IsChild",{parent,child})));
     }
     return nested_continuation(state,memory,"ShlwapiCom",[this,service](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
         const WindowsCall call(s,m,service);const auto symbol=service.symbol;const unsigned size=x86_?4U:8U;const auto bits=static_cast<std::uint8_t>(size*8);
@@ -335,16 +686,364 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
         const auto method=[&](std::uint64_t object,unsigned index){return m.load(GuestAddress{m.load(GuestAddress{object},bits)+index*size},bits);};
         const auto failed=[](std::uint32_t value){return (value&0x80000000U)!=0;};
         const auto status=[](std::uint64_t value){return static_cast<std::uint32_t>(value);};
+        if(symbol=="IUnknown_AtomicRelease" || symbol=="IUnknown_Set"){
+            const auto dest=call(0);
+            const auto replacement=symbol=="IUnknown_Set"?call(1):0;
+            const auto previous=dest?m.load(GuestAddress{dest},bits):0;
+            if(previous){
+                (void)co_await service_callback::call(method(previous,2),{previous});
+                m.store(GuestAddress{dest},bits,0);
+            }
+            if(replacement){
+                (void)co_await service_callback::call(method(replacement,1),{replacement});
+                m.store(GuestAddress{dest},bits,replacement);
+            }
+            co_return finish(0);
+        }
         // ShellMessageBox 的可變引數起點（第 5 格；x86 為 ESP+4+5*4，x64 為 RSP+8+5*8），供 FormatMessage 當 va_list。
         const auto variadic=s.reg(Gpr::Rsp)+(x86_?24U:48U);(void)variadic;
-        GuestScratch temporary(*this,m,s);const auto slot=temporary.allocate(16);if(!slot)co_return finish(0x8007000eU);
+        GuestScratch temporary(*this,m,s);
+        const auto entry=[&](std::string_view dll,std::string_view target){const auto stub=host_service_stub(dll,target);return stub.value?stub.value:resolve(dll,target).value;};
+        const auto handle_of=[&](std::uint64_t value){return x86_?value&UINT32_MAX:value;};
+        const bool wide=symbol.ends_with('W');
+        if(symbol=="IUnknown_GetWindow" || symbol=="IUnknown_SetOwner" || symbol=="IUnknown_GetClassID"){
+            const auto object=call(0), argument=call(1);
+            const bool class_id=symbol=="IUnknown_GetClassID";
+            if(!object){
+                if(class_id)m.write(GuestAddress{argument},Iid{});
+                co_return finish(0x80004005U);
+            }
+            const auto& query=class_id?class_id_query:symbol=="IUnknown_SetOwner"?owner_query:window_query;
+            const auto requested=temporary.allocate(16+size);
+            if(!requested)co_return finish(0x8007000eU);
+            const auto output=requested+16;
+            std::uint32_t hr=0x80004005U;
+            for(unsigned i=0;i<query.count;++i){
+                const auto& iid=query.iids[i];
+                m.write(GuestAddress{requested},iid);
+                hr=status(co_await service_callback::call(method(object,0),{object,requested,output}));
+                if(query.require_s_ok?hr!=0:failed(hr))continue;
+                const auto target=m.load(GuestAddress{output},bits);
+                hr=status(co_await service_callback::call(method(target,3),{target,argument}));
+                (void)co_await service_callback::call(method(target,2),{target});
+                break;
+            }
+            co_return finish(hr);
+        }
+        if(symbol=="ConnectToConnectionPoint"){
+            const auto sink=call(0), iid=call(1), source=call(3), cookie=call(4), output=call(5);
+            const bool connect=static_cast<std::uint32_t>(call(2))!=0;
+            if(!source || (connect && !sink))co_return finish(0x80004005U);
+            if(output)m.store(GuestAddress{output},bits,0);
+            const auto requested=temporary.allocate(16+2*size);
+            if(!requested)co_return finish(0x8007000eU);
+            m.write(GuestAddress{requested},iid_point_container);
+            const auto container_slot=requested+16, point_slot=container_slot+size;
+            auto hr=status(co_await service_callback::call(method(source,0),{source,requested,container_slot}));
+            if(failed(hr))co_return finish(hr);
+            const auto container=m.load(GuestAddress{container_slot},bits);
+            hr=status(co_await service_callback::call(method(container,4),{container,iid,point_slot}));
+            if(!failed(hr)){
+                const auto point=m.load(GuestAddress{point_slot},bits);
+                if(connect)hr=status(co_await service_callback::call(method(point,5),{point,sink,cookie}));
+                else hr=status(co_await service_callback::call(method(point,6),{point,m.load(GuestAddress{cookie},32)}));
+                if(failed(hr))m.store(GuestAddress{cookie},32,0);
+                if(output && !failed(hr))m.store(GuestAddress{output},bits,point);
+                else (void)co_await service_callback::call(method(point,2),{point});
+            }
+            (void)co_await service_callback::call(method(container,2),{container});
+            co_return finish(hr);
+        }
+        if(symbol=="SHIsSameObject"){
+            const auto left=call(0), right=call(1);
+            if(!left || !right)co_return finish(0);
+            if(left==right)co_return finish(1);
+            const auto buffer=temporary.allocate(16+2*size);
+            if(!buffer)co_return finish(0);
+            m.write(GuestAddress{buffer},iid_unknown);
+            const auto first_slot=buffer+16, second_slot=first_slot+size;
+            if(status(co_await service_callback::call(method(left,0),{left,buffer,first_slot}))!=0)
+                co_return finish(0);
+            const auto second_status=status(co_await service_callback::call(method(right,0),{right,buffer,second_slot}));
+            const auto first=m.load(GuestAddress{first_slot},bits);
+            const auto second=second_status==0?m.load(GuestAddress{second_slot},bits):0;
+            (void)co_await service_callback::call(method(first,2),{first});
+            if(second_status!=0)co_return finish(0);
+            (void)co_await service_callback::call(method(second,2),{second});
+            co_return finish(first==second);
+        }
+        if(symbol=="#178"){
+            const auto parent=call(0);
+            if(!parent)co_return finish(0);
+            const auto args=temporary.allocate(4*size);
+            if(!args){last_error_=8;co_return finish(0);}
+            const bool send=static_cast<std::uint32_t>(call(4))!=0;
+            const bool unicode=co_await service_callback::call(entry("user32.dll","IsWindowUnicode"),{parent});
+            const auto dispatch=send?(unicode?"SendMessageW":"SendMessageA"):(unicode?"PostMessageW":"PostMessageA");
+            m.store(GuestAddress{args},bits,entry("user32.dll",dispatch));
+            for(unsigned i=1;i<4;++i)m.store(GuestAddress{args+i*size},bits,call(i));
+            (void)co_await service_callback::call(entry("user32.dll","EnumChildWindows"),{parent,entry("internal-message-propagation","EnumProc"),args});
+            co_return finish(0);
+        }
+        if(service.family=="internal-message-propagation"){
+            const auto data=call(1);
+            const auto field=[&](unsigned i){return m.load(GuestAddress{data+i*size},bits);};
+            (void)co_await service_callback::call(field(0),{call(0),field(1),field(2),field(3)});
+            co_return finish(1);
+        }
+        if(symbol=="#194"){
+            const auto hand=temporary.allocate(size),msg=temporary.allocate(x86_?28:48);
+            if(!hand || !msg){last_error_=8;co_return finish(UINT32_MAX);}
+            m.store(GuestAddress{hand},bits,call(0));
+            const auto timeout=static_cast<std::uint32_t>(call(1));
+            const auto tick=entry("kernel32.dll","GetTickCount64");
+            const auto start=co_await service_callback::call_value(tick,{});
+            auto remaining=timeout;
+            for(;;){
+                const auto result=co_await service_callback::call(entry("user32.dll","MsgWaitForMultipleObjectsEx"),{1,hand,remaining,0x40,0});
+                if(result!=1)co_return finish(result);
+                (void)co_await service_callback::call(entry("user32.dll","PeekMessageW"),{msg,0,0,0,0});
+                if(timeout!=UINT32_MAX){
+                    const auto elapsed=static_cast<std::uint32_t>((co_await service_callback::call_value(tick,{}))-start);
+                    if(elapsed>=timeout)co_return finish(258);
+                    remaining=timeout-elapsed;
+                }
+            }
+        }
+        if(symbol=="#236" || symbol=="#343" || symbol=="#344"){
+            const bool load=symbol=="#236";
+            if(!call(0) || (!load && !call(4))){last_error_=87;co_return finish(load?0:0x80070057U);}
+            WindowsGuid clsid{};
+            m.read(GuestAddress{call(0)},clsid);
+            const bool user=!load && static_cast<std::uint32_t>(call(2));
+            std::u16string path=user?u"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\CLSID\\":u"CLSID\\";
+            path+=windows_guid_text(clsid);
+            if(load)path+=u"\\InProcServer32";
+            else if(call(1)){
+                path+=u'\\';
+                path+=symbol=="#343"?utf8_to_utf16_lossy(read_ansi(m,call(1))):read_utf16(m,GuestAddress{call(1)});
+            }
+            const auto key=temporary.text(path);
+            if(!key){last_error_=8;co_return finish(load?0:0x8007000eU);}
+            const auto root=user?0x80000001U:0x80000000U;
+            if(!load){
+                const auto error=static_cast<std::uint32_t>(static_cast<std::uint32_t>(call(3))?
+                    co_await service_callback::call(entry("advapi32.dll","RegCreateKeyW"),{root,key,call(4)}):
+                    co_await service_callback::call(entry("advapi32.dll","RegOpenKeyExW"),{root,key,0,0x20019,call(4)}));
+                co_return finish(error?0x80070000U|(error&0xffffU):0);
+            }
+            const auto length=temporary.allocate(4),dll=temporary.allocate(65536);
+            if(!length || !dll){last_error_=8;co_return finish(0);}
+            m.store(GuestAddress{length},32,65536);
+            const auto error=static_cast<std::uint32_t>(co_await service_callback::call(entry("advapi32.dll","RegGetValueW"),{root,key,0,2,0,dll,length}));
+            if(error){last_error_=error;co_return finish(0);}
+            co_return finish(handle_of(co_await service_callback::call_value(entry("kernel32.dll","LoadLibraryExW"),{dll,0,0})));
+        }
+        if(service.family=="internal-shell-dialog"){
+            if(symbol=="SHDialogBox"){
+                const auto data=temporary.allocate(2*size);
+                if(!data){last_error_=8;co_return finish(UINT64_MAX);}
+                m.store(GuestAddress{data},bits,call(3));
+                m.store(GuestAddress{data+size},bits,call(4));
+                const auto proc=entry("internal-shell-dialog","DialogProc");
+                co_return finish(co_await service_callback::call_value(entry("user32.dll","DialogBoxParamA"),{call(0),call(1),call(2),proc,data}));
+            }
+            const auto window=call(0),message=call(1),wp=call(2);
+            auto lp=call(3);
+            std::uint64_t data=0;
+            if(message==0x110){
+                data=lp;
+                (void)co_await service_callback::call(entry("user32.dll","SetWindowLongPtrA"),{window,2*size,data});
+            }else{
+                data=handle_of(co_await service_callback::call_value(entry("user32.dll","GetWindowLongPtrA"),{window,2*size}));
+            }
+            if(data){
+                const auto proc=m.load(GuestAddress{data},bits),context=m.load(GuestAddress{data+size},bits);
+                if(message==0x110)lp=context;
+                if(proc){
+                    const auto result=co_await service_callback::call_value(proc,{context,window,message,wp,lp});
+                    if(result)co_return finish(result);
+                }
+            }
+            if(message==0x110)co_return finish(1);
+            const auto id=wp&0xffff;
+            if(message==0x111 && id!=9){
+                const auto item=handle_of(co_await service_callback::call_value(entry("user32.dll","GetDlgItem"),{window,id}));
+                if(item && (0x30U & co_await service_callback::call(entry("user32.dll","SendMessageA"),{item,0x87,0,0}))){
+                    (void)co_await service_callback::call(entry("user32.dll","EndDialog"),{window,id});
+                    co_return finish(1);
+                }
+            }
+            co_return finish(0);
+        }
+        if(service.family=="internal-worker-window"){
+            if(symbol=="SHDefWindowProc"){
+                const auto window=call(0),message=call(1),wp=call(2),lp=call(3);
+                const bool unicode=co_await service_callback::call(entry("user32.dll","IsWindowUnicode"),{window});
+                co_return finish(co_await service_callback::call_value(entry("user32.dll",unicode?"DefWindowProcW":"DefWindowProcA"),{window,message,wp,lp}));
+            }
+            const auto proc=call(0),parent=call(1),ex_style=call(2),style=call(3),menu=call(4),extra=call(5);
+            const GuiClassAbi abi{x86_,false};
+            const auto cls=temporary.allocate(abi.size),library=temporary.text(u"shlwapi.dll");
+            const auto name_ptr=wide?temporary.text(u"WorkerW"):temporary.allocate(8);
+            if(!cls || !library || !name_ptr){last_error_=8;co_return finish(0);}
+            if(!wide){constexpr std::uint8_t name[]="WorkerA";m.write(GuestAddress{name_ptr},name);}
+            const auto module=handle_of(co_await service_callback::call_value(entry("kernel32.dll","GetModuleHandleW"),{library}));
+            if(!module)co_return finish(0);
+            const auto cursor=handle_of(co_await service_callback::call_value(entry("user32.dll",wide?"LoadCursorW":"LoadCursorA"),{0,32512}));
+            m.store(GuestAddress{cls+abi.procedure},bits,resolve("user32.dll",wide?"DefWindowProcW":"DefWindowProcA").value);
+            m.store(GuestAddress{cls+abi.window_extra},32,size);
+            m.store(GuestAddress{cls+abi.instance},bits,module);
+            m.store(GuestAddress{cls+abi.cursor},bits,cursor);
+            m.store(GuestAddress{cls+abi.background},bits,16);
+            m.store(GuestAddress{cls+abi.name},bits,name_ptr);
+            (void)co_await service_callback::call(entry("internal-shell-window",wide?"SHRegisterClassW":"SHRegisterClassA"),{cls});
+            const auto window=handle_of(co_await service_callback::call_value(entry("user32.dll",wide?"CreateWindowExW":"CreateWindowExA"),
+                {ex_style,name_ptr,0,style,0,0,0,0,parent,menu,module,0}));
+            if(window){
+                (void)co_await service_callback::call(entry("user32.dll","SetWindowLongPtrW"),{window,0,extra});
+                if(proc)(void)co_await service_callback::call(entry("user32.dll",wide?"SetWindowLongPtrW":"SetWindowLongPtrA"),{window,static_cast<std::uint32_t>(-4),proc});
+            }
+            co_return finish(window);
+        }
+        if(service.family=="internal-shell-window"){
+            if(symbol.starts_with("SHRegister") || symbol.starts_with("SHUnregister")){
+                const bool registration=symbol.starts_with("SHRegister");
+                const auto count=registration?1:static_cast<std::int32_t>(call(2));
+                if(count<=0)co_return finish(0);
+                const GuiClassAbi abi{x86_,false};
+                const auto output=temporary.allocate(abi.size);
+                if(!output){last_error_=8;co_return finish(0);}
+                const auto input=call(0);
+                const auto module=registration?m.load(GuestAddress{input+abi.instance},bits):input;
+                const auto get_info=entry("user32.dll",wide?"GetClassInfoW":"GetClassInfoA");
+                if(registration){
+                    const auto name_ptr=m.load(GuestAddress{input+abi.name},bits);
+                    if(co_await service_callback::call(get_info,{module,name_ptr,output}))co_return finish(1);
+                    co_return finish(co_await service_callback::call(entry("user32.dll",wide?"RegisterClassW":"RegisterClassA"),{input}));
+                }
+                const auto remove=entry("user32.dll",wide?"UnregisterClassW":"UnregisterClassA");
+                auto list=call(1);
+                for(std::int32_t i=0;i<count;++i,list+=size){
+                    const auto name_ptr=m.load(GuestAddress{list},bits);
+                    if(co_await service_callback::call(get_info,{module,name_ptr,output}))
+                        (void)co_await service_callback::call(remove,{name_ptr,module});
+                }
+                co_return finish(0);
+            }
+            const bool reparent=symbol=="SHSetParentHwnd";
+            const auto window=call(0),parent=reparent?call(1):0;
+            if(reparent && handle_of(co_await service_callback::call_value(entry("user32.dll","GetParent"),{window}))==parent)
+                co_return finish(0);
+            const auto index=reparent?static_cast<std::uint32_t>(-16):static_cast<std::uint32_t>(call(1));
+            const auto mask=reparent?0xc0000000U:static_cast<std::uint32_t>(call(2));
+            const auto flags=reparent?(parent?0x40000000U:0x80000000U):static_cast<std::uint32_t>(call(3));
+            auto previous=static_cast<std::uint32_t>(co_await service_callback::call(entry("user32.dll","GetWindowLongW"),{window,index}));
+            const auto updated=(previous&~mask)|(flags&mask);
+            if(updated!=previous)
+                previous=static_cast<std::uint32_t>(co_await service_callback::call(entry("user32.dll","SetWindowLongW"),{window,index,updated}));
+            if(!reparent)co_return finish(previous);
+            if(!parent)co_return finish(0);
+            co_return finish(handle_of(co_await service_callback::call_value(entry("user32.dll","SetParent"),{window,parent})));
+        }
+        if(symbol=="#267"){ // SHWeakQueryInterface
+            const auto outer=call(0),inner=call(1),iid=call(2),output=call(3);
+            m.store(GuestAddress{output},bits,0);
+            if(!outer || !inner)co_return finish(0x80004002U);
+            const auto hr=status(co_await service_callback::call(method(inner,0),{inner,iid,output}));
+            if(!failed(hr))(void)co_await service_callback::call(method(outer,2),{outer});
+            co_return finish(hr);
+        }
+        if(symbol=="#268"){ // SHWeakReleaseInterface
+            const auto destination=call(0),source_slot=call(1);
+            if(m.load(GuestAddress{source_slot},bits)){
+                (void)co_await service_callback::call(method(destination,1),{destination});
+                // AddRef 可以重入客體並替換來源；於 Release 前重新讀取。
+                const auto source=m.load(GuestAddress{source_slot},bits);
+                (void)co_await service_callback::call(method(source,2),{source});
+                m.store(GuestAddress{source_slot},bits,0);
+            }
+            co_return finish(0);
+        }
+        const auto slot=temporary.allocate(16);if(!slot)co_return finish(0x8007000eU);
         const auto guid=[&](const Iid& iid){const auto at=temporary.allocate(16);if(at)m.write(GuestAddress{at},iid);return at;};
         const auto take=[&]{const auto value=m.load(GuestAddress{slot},bits);m.store(GuestAddress{slot},bits,0);return value;};
+        if(symbol=="#355"){
+            const auto unknown=call(0),enable=call(1);
+            if(!unknown)co_return finish(0x80004005U);
+            struct Interface {Iid iid;unsigned method;};
+            static constexpr Interface interfaces[]{
+                {{0x17,1,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46},9}, // IOleInPlaceActiveObject
+                {{0x16,1,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46},13}, // IOleInPlaceFrame
+                {{0xe2,0x14,2,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46},9}, // IShellBrowser
+                {{0xed,0xc9,0xea,0x79,0xf9,0xba,0xce,0x11,0x8c,0x82,0,0xaa,0,0x4b,0xa9,0x0b},4}, // IInternetSecurityMgrSite
+                {{0xc0,0x23,0x3f,0xbd,0x3e,0xd4,0xcf,0x11,0x89,0x3b,0,0xaa,0,0xbd,0xce,0x1a},8} // IDocHostUIHandler
+            };
+            std::uint32_t hr=0x80004002U;
+            for(const auto& iface:interfaces){
+                const auto iid=guid(iface.iid);if(!iid)co_return finish(0x8007000eU);
+                m.store(GuestAddress{slot},bits,0);
+                hr=co_await service_callback::call(method(unknown,0),{unknown,iid,slot});
+                if(failed(hr))continue;
+                const auto object=take();if(!object)co_return finish(0x80004003U);
+                (void)co_await service_callback::call(method(object,iface.method),{object,enable});
+                (void)co_await service_callback::call(method(object,2),{object});
+                co_return finish(0);
+            }
+            co_return finish(hr);
+        }
+        if(symbol=="#17" || symbol=="#18"){
+            const auto stream=call(0),list=call(1);
+            if(!stream || (symbol=="#18" && !list))co_return finish(0x80070057U);
+            const auto count=slot+4;
+            if(symbol=="#17"){
+                auto cursor=list;
+                for(;;){
+                    const auto block=shell_data_block(m,cursor);
+                    if(!block.span)break;
+                    const auto hr=status(co_await service_callback::call(method(stream,4),{stream,block.payload,block.length,count}));
+                    if(failed(hr))co_return finish(hr);
+                    if(m.load(GuestAddress{count},32)!=block.length)co_return finish(0x80030070U);
+                    cursor+=block.span;
+                }
+                m.store(GuestAddress{slot},32,0);
+                co_return finish(status(co_await service_callback::call(method(stream,4),{stream,slot,4,count})));
+            }
+            const auto previous=m.load(GuestAddress{list},bits);
+            if(previous)(void)co_await service_callback::call(entry("kernel32.dll","LocalFree"),{previous});
+            m.store(GuestAddress{list},bits,0);
+            for(;;){
+                auto hr=status(co_await service_callback::call(method(stream,3),{stream,slot,4,count}));
+                const auto length=m.load(GuestAddress{slot},32);
+                if(failed(hr) || m.load(GuestAddress{count},32)!=4 || !length)co_return finish(hr);
+                if(length>UINT16_MAX){
+                    // 將超限記錄的長度留給下一位串流讀取者。
+                    const auto seek=method(stream,5);
+                    const auto query=x86_?co_await service_callback::call(seek,{stream,0,0,1,slot+8}):
+                                           co_await service_callback::call(seek,{stream,0,1,slot+8});
+                    if(!failed(status(query))){
+                        const auto offset=m.load(GuestAddress{slot+8},64)-4;
+                        if(x86_)(void)co_await service_callback::call(seek,{stream,status(offset),offset>>32,0,0});
+                        else (void)co_await service_callback::call(seek,{stream,offset,0,0});
+                    }
+                    co_return finish(hr);
+                }
+                if(length<8)continue;
+                GuestScratch scratch(*this,m,s);
+                const auto item=scratch.allocate(length);
+                if(!item)co_return finish(0x8007000eU);
+                m.store(GuestAddress{item},32,length);
+                hr=status(co_await service_callback::call(method(stream,3),{stream,item+4,length-4,count}));
+                if(failed(hr) || m.load(GuestAddress{count},32)!=length-4)co_return finish(hr);
+                if(m.load(GuestAddress{item+4},32)!=UINT32_MAX &&
+                   !(co_await service_callback::call(entry("shlwapi.dll","#20"),{list,item})))co_return finish(0x8007000eU);
+            }
+        }
         if(symbol=="IStream_Read" || symbol=="IStream_Write"){
             // (stream, buffer, cb)：必須處理完全部位元組，否則回 E_FAIL。
             if(!call(0))co_return finish(0x80070057U);m.store(GuestAddress{slot},32,0);const auto bytes=static_cast<std::uint32_t>(call(2));
             const auto result=status(co_await service_callback::call(method(call(0),symbol=="IStream_Read"?3:4),{call(0),call(1),bytes,slot}));
-            if(failed(result))co_return finish(result);co_return finish(m.load(GuestAddress{slot},32)==bytes?0U:0x80004005U);
+            if(failed(result))co_return finish(result);co_return finish(m.load(GuestAddress{slot},32)==bytes?result:0x80004005U);
         }
         if(symbol=="IStream_Reset"){
             // Seek(0, STREAM_SEEK_SET, NULL)；LARGE_INTEGER 在 x86 佔兩格。
@@ -352,62 +1051,101 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
             if(x86_)co_return finish(status(co_await service_callback::call(method(call(0),5),{call(0),0,0,0,0})));
             co_return finish(status(co_await service_callback::call(method(call(0),5),{call(0),0,0,0})));
         }
-        if(symbol=="IStream_Size"){
-            // Stat(STATFLAG_NONAME) 的 cbSize（x86 位移 8、x64 位移 16）。
-            if(!call(0) || !call(1))co_return finish(0x80070057U);const auto stat=temporary.allocate(96);if(!stat)co_return finish(0x8007000eU);
-            const auto result=status(co_await service_callback::call(method(call(0),12),{call(0),stat,1}));
-            if(!failed(result))m.store(GuestAddress{call(1)},64,m.load(GuestAddress{stat+(x86_?8U:16U)},64));co_return finish(result);
+        if(symbol=="IStream_Size" || symbol=="#166"){
+            const bool check_empty=symbol=="#166";
+            const auto stream=call(0);
+            if(!stream)co_return finish(check_empty?1:0x80070057U);
+            const auto stat=temporary.allocate(96);if(!stat)co_return finish(check_empty?1:0x8007000eU);
+            const auto result=status(co_await service_callback::call(method(stream,12),{stream,stat,1}));
+            if(!failed(result)){
+                const auto length=m.load(GuestAddress{stat+(x86_?8U:16U)},64);
+                if(check_empty)co_return finish(length==0);
+                if(call(1))m.store(GuestAddress{call(1)},64,length);
+            }
+            if(!check_empty)co_return finish(result);
+            // Stat 失敗時從當前位置試讀 DWORD；依既有契約，只有讀滿才重設位置。
+            const auto read=status(co_await service_callback::call(method(stream,3),{stream,slot+4,4,slot}));
+            if(failed(read) || m.load(GuestAddress{slot},32)!=4)co_return finish(1);
+            (void)co_await service_callback::call(entry("shlwapi.dll","IStream_Reset"),{stream});
+            co_return finish(0);
         }
-        if(symbol=="IUnknown_AtomicRelease"){
-            if(!call(0))co_return finish(0);const auto object=m.load(GuestAddress{call(0)},bits);if(!object)co_return finish(0);
-            m.store(GuestAddress{call(0)},bits,0);(void)co_await service_callback::call(method(object,2),{object});co_return finish(0);
+        if(symbol=="#163" || symbol=="#164" || symbol=="#484"){
+            const auto unknown=call(0);
+            if(!unknown)co_return finish(0x80004005U);
+            const bool service_exec=symbol=="#484",query_status=symbol=="#163";
+            const auto command_iid=guid(iid_command_target);
+            const auto iid=service_exec?guid(iid_service_provider):command_iid;
+            if(!iid || !command_iid)co_return finish(0x8007000eU);
+            auto result=status(co_await service_callback::call(method(unknown,0),{unknown,iid,slot}));
+            if(failed(result) || (service_exec && result!=0))co_return finish(result);
+            auto target=take();
+            if(service_exec && target){
+                const auto provider=target;
+                result=status(co_await service_callback::call(method(provider,3),{provider,call(1),command_iid,slot}));
+                (void)co_await service_callback::call(method(provider,2),{provider});
+                if(result!=0)co_return finish(result);
+                target=take();
+            }
+            if(target){
+                std::vector<std::uint64_t> args{target};
+                for(unsigned i=service_exec?2:1;i<service.arguments;++i)args.push_back(call(i));
+                result=status(co_await service_callback::call(method(target,query_status?3:4),std::move(args)));
+                (void)co_await service_callback::call(method(target,2),{target});
+            }
+            co_return finish(result);
         }
-        if(symbol=="IUnknown_Set"){
-            // 先 AddRef 新值再釋放舊值，兩者相同時也安全。
-            if(!call(0))co_return finish(0);const auto replacement=call(1);if(replacement)(void)co_await service_callback::call(method(replacement,1),{replacement});
-            const auto previous=m.load(GuestAddress{call(0)},bits);m.store(GuestAddress{call(0)},bits,replacement);
-            if(previous)(void)co_await service_callback::call(method(previous,2),{previous});co_return finish(0);
+        // 各輸入介面沿用相同的 QueryInterface／方法呼叫／Release 生命週期。
+        struct InputMethod {std::string_view ordinal;const Iid& iid;unsigned index,arguments;};
+        static constexpr InputMethod input_methods[]{
+            {"#188",iid_control_site,7,2},{"#189",iid_control_site,8,1},
+            {"#478",iid_input_object,5,1},{"#479",iid_input_object,3,2},
+            {"#481",iid_input_object,4,0},{"#509",iid_input_site,3,2}
+        };
+        for(const auto& input:input_methods){
+            if(symbol!=input.ordinal)continue;
+            const auto unknown=call(0);
+            if(!unknown)co_return finish(symbol=="#189" || symbol=="#479"?0x80004005U:0x80070057U);
+            const auto iid=guid(input.iid);if(!iid)co_return finish(0x8007000eU);
+            auto result=status(co_await service_callback::call(method(unknown,0),{unknown,iid,slot}));
+            if(failed(result) || (symbol=="#479" && result!=0))co_return finish(result);
+            const auto object=take();
+            if(object){
+                std::vector<std::uint64_t> args{object};
+                for(unsigned i=1;i<=input.arguments;++i)args.push_back(call(i));
+                result=status(co_await service_callback::call(method(object,input.index),std::move(args)));
+                (void)co_await service_callback::call(method(object,2),{object});
+            }
+            co_return finish(result);
         }
         if(symbol=="IUnknown_GetSite" || symbol=="IUnknown_SetSite"){
-            const bool get=symbol=="IUnknown_GetSite";if(get){if(!call(2))co_return finish(0x80070057U);m.store(GuestAddress{call(2)},bits,0);}
-            if(!call(0))co_return finish(0x80004005U);const auto site_iid=guid(iid_object_with_site);if(!site_iid)co_return finish(0x8007000eU);
-            auto result=status(co_await service_callback::call(method(call(0),0),{call(0),site_iid,slot}));
-            if(!failed(result)){const auto holder=take();
-                result=status(co_await service_callback::call(method(holder,get?4:3),get?std::vector<std::uint64_t>{holder,call(1),call(2)}:std::vector<std::uint64_t>{holder,call(1)}));
-                (void)co_await service_callback::call(method(holder,2),{holder});co_return finish(result);}
-            if(get)co_return finish(result);
-            // 不支援 IObjectWithSite 時改用 IInternetSecurityManager::SetSecuritySite（站台需支援 IInternetSecurityMgrSite）。
-            const auto manager_iid=guid(iid_security_manager),site_type=guid(iid_security_site);if(!manager_iid || !site_type)co_return finish(0x8007000eU);
-            result=status(co_await service_callback::call(method(call(0),0),{call(0),manager_iid,slot}));if(failed(result))co_return finish(result);
-            const auto manager=take();std::uint64_t security_site=0;
-            if(call(1) && !failed(status(co_await service_callback::call(method(call(1),0),{call(1),site_type,slot}))))security_site=take();
-            result=call(1) && !security_site?0x80004002U:status(co_await service_callback::call(method(manager,3),{manager,security_site}));
-            if(security_site)(void)co_await service_callback::call(method(security_site,2),{security_site});
-            (void)co_await service_callback::call(method(manager,2),{manager});co_return finish(result);
-        }
-        if(symbol=="IUnknown_GetWindow"){
-            // 依序嘗試 IOleWindow、IInternetSecurityMgrSite、IShellView 的 GetWindow（皆為 vtable 第 3 格）。
-            if(!call(0) || !call(1))co_return finish(0x80004005U);m.store(GuestAddress{call(1)},bits,0);
-            for(const auto& iid:{iid_ole_window,iid_security_site,iid_shell_view}){
-                const auto requested=guid(iid);if(!requested)co_return finish(0x8007000eU);
-                if(failed(status(co_await service_callback::call(method(call(0),0),{call(0),requested,slot}))))continue;
-                const auto window=take();const auto result=status(co_await service_callback::call(method(window,3),{window,call(1)}));
-                (void)co_await service_callback::call(method(window,2),{window});co_return finish(result);
+            const bool get=symbol=="IUnknown_GetSite";
+            const auto object=call(0),site=call(1),output=get?call(2):0;
+            if(get && (!object || !site || !output))co_return finish(0x80070057U);
+            if(!object)co_return finish(0x80004005U);
+            const auto site_iid=guid(iid_object_with_site);
+            if(!site_iid)co_return finish(0x8007000eU);
+            m.store(GuestAddress{slot},bits,0);
+            auto hr=status(co_await service_callback::call(method(object,0),{object,site_iid,slot}));
+            if(!failed(hr)){
+                const auto holder=take();
+                if(!holder)co_return finish(hr);
+                if(get)hr=status(co_await service_callback::call(method(holder,4),{holder,site,output}));
+                else hr=status(co_await service_callback::call(method(holder,3),{holder,site}));
+                (void)co_await service_callback::call(method(holder,2),{holder});
+                co_return finish(hr);
             }
-            co_return finish(0x80004005U);
-        }
-        if(symbol=="ConnectToConnectionPoint"){
-            // (sink, riid, fConnect, target, cookie*, IConnectionPoint** 可為 NULL)：經 IConnectionPointContainer::FindConnectionPoint 後 Advise／Unadvise。
-            if(call(5))m.store(GuestAddress{call(5)},bits,0);if(!call(3) || !call(1))co_return finish(0x80070057U);
-            const auto container_iid=guid(iid_point_container);if(!container_iid)co_return finish(0x8007000eU);
-            auto result=status(co_await service_callback::call(method(call(3),0),{call(3),container_iid,slot}));if(failed(result))co_return finish(result);
-            const auto container=take();result=status(co_await service_callback::call(method(container,4),{container,call(1),slot}));
-            (void)co_await service_callback::call(method(container,2),{container});if(failed(result))co_return finish(result);
-            const auto point=take();const bool connect=static_cast<std::uint32_t>(call(2))!=0;
-            if(connect)result=call(0) && call(4)?status(co_await service_callback::call(method(point,5),{point,call(0),call(4)})):0x80070057U;
-            else result=call(4)?status(co_await service_callback::call(method(point,6),{point,m.load(GuestAddress{call(4)},32)})):0x80070057U;
-            if(call(5) && !failed(result))m.store(GuestAddress{call(5)},bits,point);else (void)co_await service_callback::call(method(point,2),{point});
-            co_return finish(result);
+            if(get)co_return finish(hr);
+            // 安全管理員直接接收呼叫端傳入的 site 介面，包含解除關聯用的 NULL。
+            const auto manager_iid=guid(iid_security_manager);
+            if(!manager_iid)co_return finish(0x8007000eU);
+            m.store(GuestAddress{slot},bits,0);
+            hr=status(co_await service_callback::call(method(object,0),{object,manager_iid,slot}));
+            if(failed(hr))co_return finish(hr);
+            const auto manager=take();
+            if(!manager)co_return finish(hr);
+            hr=status(co_await service_callback::call(method(manager,3),{manager,site}));
+            (void)co_await service_callback::call(method(manager,2),{manager});
+            co_return finish(hr);
         }
         if(symbol=="SHGetThreadRef" || symbol=="SHGetInstanceExplorer" || symbol=="_SHGetInstanceExplorer"){
             // 回傳已 AddRef 的參照；沒有時執行緒參照回 E_NOINTERFACE，Explorer 參照回 E_FAIL。
@@ -421,9 +1159,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
             const auto found=shell_thread_refs_.find(threads_.current);if(found==shell_thread_refs_.end())co_return finish(0x80004002U);
             const auto object=found->second;shell_thread_refs_.erase(found);(void)co_await service_callback::call(method(object,2),{object});co_return finish(0);
         }
-        const auto entry=[&](std::string_view dll,std::string_view target){const auto stub=host_service_stub(dll,target);return stub.value?stub.value:resolve(dll,target).value;};
-        const auto handle_of=[&](std::uint64_t value){return x86_?value&UINT32_MAX:value;};
-        const bool wide=symbol.ends_with('W');
         const auto text_at=[&](std::uint64_t address)->std::u16string{if(!address)return {};return wide?read_utf16(m,GuestAddress{address},32768):utf8_to_utf16_lossy(read_ansi(m,address,32768));};
         if(symbol=="#542"){ // GetUIVersion：以實際載入的 shell32 查詢介面版本。
             const auto library=temporary.text(u"shell32.dll"),info=temporary.allocate(20),proc=temporary.allocate(14);
@@ -442,19 +1177,90 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
             (void)co_await service_callback::call(entry("kernel32.dll","FreeLibrary"),{module});
             co_return finish(major?major:3);
         }
+        if(service.family=="internal-dialog-font"){
+            const auto parent=call(0),property=temporary.text(u"PropDlgFont");
+            if(!property)co_return finish(symbol=="SHRemoveDefaultDialogFont"?0:0x8007000eU);
+            if(symbol=="SHRemoveDefaultDialogFont"){
+                const auto font=handle_of(co_await service_callback::call_value(entry("user32.dll","RemovePropW"),{parent,property}));
+                if(font)(void)co_await service_callback::call(entry("gdi32.dll","DeleteObject"),{font});
+                co_return finish(font);
+            }
+            const auto child=handle_of(co_await service_callback::call_value(entry("user32.dll","GetDlgItem"),{parent,call(1)}));
+            if(!child)co_return finish(0);
+            auto original=handle_of(co_await service_callback::call_value(entry("user32.dll","SendMessageW"),{parent,0x31,0,0}));
+            if(!original)original=handle_of(co_await service_callback::call_value(entry("gdi32.dll","GetStockObject"),{17}));
+            const auto current=temporary.allocate(92),system=temporary.allocate(92);
+            if(!current || !system)co_return finish(0x8007000eU);
+            if(!co_await service_callback::call(entry("gdi32.dll","GetObjectW"),{original,92,current}) ||
+               !co_await service_callback::call(entry("user32.dll","SystemParametersInfoW"),{0x1f,92,system,0}))co_return finish(0);
+            if(m.load(GuestAddress{current+23},8)==m.load(GuestAddress{system+23},8))co_return finish(0);
+            auto font=handle_of(co_await service_callback::call_value(entry("user32.dll","GetPropW"),{parent,property}));
+            if(!font){
+                m.store(GuestAddress{system},32,m.load(GuestAddress{current},32));
+                font=handle_of(co_await service_callback::call_value(entry("gdi32.dll","CreateFontIndirectW"),{system}));
+                if(font && !co_await service_callback::call(entry("user32.dll","SetPropW"),{parent,property,font})){
+                    (void)co_await service_callback::call(entry("gdi32.dll","DeleteObject"),{font});
+                    font=0;
+                }
+            }
+            (void)co_await service_callback::call(entry("user32.dll","SendMessageW"),{child,0x30,font?font:original,0});
+            co_return finish(0);
+        }
+        if(symbol=="MLFreeLibrary"){
+            const auto module=handle_of(call(0));
+            (void)co_await service_callback::call(entry("shlwapi.dll","#431"),{module});
+            co_return finish(co_await service_callback::call(entry("kernel32.dll","FreeLibrary"),{module}));
+        }
+        if(symbol=="#405" || symbol=="#406"){
+            const bool unicode=symbol=="#406";
+            const auto module=handle_of(call(1)),dest=call(4);
+            const auto flags=status(call(2));
+            if(!call(0) || !module || module==(x86_?UINT32_MAX:UINT64_MAX) || !call(3) || !dest || (flags && flags!=2))
+                co_return finish(0x80070057U);
+            const auto capacity=unicode?status(call(5)):std::min(status(call(5)),260U);
+            if(capacity<7)co_return finish(0x80004005U);
+            const auto read=[&](std::uint64_t address){return unicode?read_utf16(m,GuestAddress{address}):utf8_to_utf16_lossy(read_ansi(m,address));};
+            const auto file=temporary.text(read(call(0)));
+            const auto resource=read(call(3));
+            std::u16string url=u"res://";
+            if(unicode)m.write(GuestAddress{dest},utf16_bytes(url));
+            if(!file)co_return finish(0x8007000eU);
+            const auto library=handle_of(co_await service_callback::call_value(entry("shlwapi.dll","MLLoadLibraryW"),{file,module,flags}));
+            if(!library)co_return finish(0x80004005U);
+            const auto* image=resource_image(library);
+            bool complete=false;
+            if(image && !image->path.empty() && image->path.size()<260 && capacity>=8+image->path.size()){
+                url+=image->path;
+                if(capacity>=10+image->path.size()+resource.size()){
+                    url+=u'/';url+=resource;complete=true;
+                }
+                if(unicode)m.write(GuestAddress{dest},utf16_bytes(url));
+            }
+            (void)co_await service_callback::call(entry("shlwapi.dll","MLFreeLibrary"),{library});
+            if(!unicode && complete){
+                const auto text=temporary.text(url);
+                if(text)(void)co_await service_callback::call(entry("kernel32.dll","WideCharToMultiByte"),{0,0,text,UINT32_MAX,dest,capacity,0,0});
+            }
+            co_return finish(complete?0:0x80004005U);
+        }
         if(symbol.starts_with("MLLoadLibrary")){
             // (檔名, HMODULE 基準, 跨碼頁旗標)：依序找 <模組目錄>\mui\<UI 語言>\檔名、<模組目錄>\檔名，以資料檔方式載入；最後交給一般搜尋。
             const auto file=text_at(call(0));if(file.empty())co_return finish(0);const auto buffer=temporary.allocate(2*32768);if(!buffer)co_return finish(0);
             const auto length=static_cast<std::uint32_t>(co_await service_callback::call(entry("kernel32.dll","GetModuleFileNameW"),{call(1),buffer,32767}));
             std::vector<std::u16string> candidates;
+            const auto language=static_cast<std::uint16_t>(co_await service_callback::call(entry("kernel32.dll","GetUserDefaultUILanguage"),{}));
             if(length && length<32767){auto directory=read_utf16(m,GuestAddress{buffer},32767);directory.resize(directory.find_last_of(u'\\')+1);
-                const auto language=static_cast<std::uint16_t>(co_await service_callback::call(entry("kernel32.dll","GetUserDefaultUILanguage"),{}));
                 constexpr std::u16string_view hex=u"0123456789ABCDEF";std::u16string code;for(int shift=12;shift>=0;shift-=4)code.push_back(hex[(language>>shift)&15U]);
                 candidates.push_back(directory+u"mui\\"+code+u"\\"+file);candidates.push_back(directory+file);}
             candidates.push_back(file);
             for(const auto& candidate:candidates){const auto path=temporary.text(candidate);if(!path)break;
                 if(&candidate!=&candidates.back() && static_cast<std::uint32_t>(co_await service_callback::call(entry("kernel32.dll","GetFileAttributesW"),{path}))==UINT32_MAX)continue;
-                const auto module=handle_of(co_await service_callback::call_value(entry("kernel32.dll","LoadLibraryExW"),{path,0,0x22}));if(module)co_return finish(module);} // AS_DATAFILE | AS_IMAGE_RESOURCE
+                const auto module=handle_of(co_await service_callback::call_value(entry("kernel32.dll","LoadLibraryExW"),{path,0,0x22}));if(module){
+                    const auto lang=(&candidate==&candidates.front() && candidates.size()>1)?language:
+                        static_cast<std::uint16_t>(co_await service_callback::call(entry("kernel32.dll","GetSystemDefaultUILanguage"),{}));
+                    (void)co_await service_callback::call(entry("shlwapi.dll","#430"),{module,lang});
+                    co_return finish(module);
+                }} // AS_DATAFILE | AS_IMAGE_RESOURCE
             co_return finish(0);
         }
         if(symbol=="SHSkipJunction"){
@@ -568,11 +1374,8 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_misc(GuestState& st
             co_return finish(result);
         }
         if(symbol.starts_with("SHSendMessageBroadcast")){
-            // SendMessageTimeout(HWND_BROADCAST, msg, wParam, lParam, SMTO_ABORTIFHUNG, 30 秒)，回傳結果值。
-            const auto stub=host_service_stub("user32.dll",symbol.ends_with('W')?"SendMessageTimeoutW":"SendMessageTimeoutA");
-            const auto target=stub.value?stub.value:resolve("user32.dll",symbol.ends_with('W')?"SendMessageTimeoutW":"SendMessageTimeoutA").value;
-            m.store(GuestAddress{slot},bits,0);(void)co_await service_callback::call(target,{0xffff,static_cast<std::uint32_t>(call(0)),call(1),call(2),2,30000,slot});
-            co_return finish(m.load(GuestAddress{slot},bits));
+            co_return finish(status(co_await service_callback::call(entry("user32.dll",wide?"SendMessageTimeoutW":"SendMessageTimeoutA"),
+                {0xffff,static_cast<std::uint32_t>(call(0)),call(1),call(2),2,2000,0})));
         }
         throw HostCallFault("未知的 shlwapi COM 輔助服務");
     });

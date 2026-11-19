@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/registry_store.hpp"
@@ -11,6 +13,18 @@
 #include <system_error>
 
 namespace x64arm {
+namespace {
+// 診斷（X64ARM_DEBUG_HTTP=1，預設關閉）：WinINet／WinHTTP 請求完成時列出方法、網址、請求長度、錯誤碼、狀態列與回應長度及開頭，
+// 用來分辨「連不上」與「伺服器回了內容但客體不接受」。只寫 stderr。
+void debug_http_response(const HttpInput& input,const HttpResult& response) noexcept {
+    static const bool enabled=std::getenv("X64ARM_DEBUG_HTTP")!=nullptr;
+    if(!enabled)return;
+    std::string head;
+    for(std::size_t i=0;i<response.body.size() && i<160;++i){const auto c=response.body[i];head+=(c>=32 && c<127)?static_cast<char>(c):'.';}
+    std::fprintf(stderr,"[debug_http] %s %s 請求=%zu 錯誤=%u 狀態=%u「%s」回應=%zu 開頭=%s\n",input.method.c_str(),input.url.c_str(),input.body.size(),
+        response.error,response.status,response.status_line.c_str(),response.body.size(),head.c_str());
+}
+}
 HttpState::HttpState(const HttpState& other):session_cookies(other.session_cookies),next(other.next),last_responses(other.last_responses),nearest_server(other.nearest_server){if(!other.handles.empty() || !other.connection_probes.empty() || other.cache_active)throw std::logic_error("無法複製使用中的 WinHTTP session");}
 HttpState& HttpState::operator=(const HttpState& other){if(this!=&other)*this=HttpState(other);return *this;}
 namespace {
@@ -383,7 +397,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                         object.input.headers=std::move(headers);object.input.body=std::move(body);object.total=d(4);object.cursor=0;object.response={};object.sent=true;object.received=false;start(object);
                     }
                     if(!object.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={arg(0)};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
-                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
+                    object.response=object.pending->take();account_http_io(object);debug_http_response(object.input,object.response);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
                 }
                 else if(symbol=="HttpSendRequestEx"){
                     // INTERNET_BUFFERS 提供首段標頭、資料與 dwBufferTotal；其餘資料由 InternetWriteFile 補齊，HttpEndRequest 才送出。dwBufferTotal 為 0 時以實際寫入量為準。
@@ -407,7 +421,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                     if(arg(1))throw HttpError{87};
                     if(!object.pending){if(!object.sent || object.received || (object.total && object.input.body.size()!=object.total))throw HttpError{12019};object.total=static_cast<std::uint32_t>(object.input.body.size());start(object);}
                     if(!object.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={arg(0)};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
-                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
+                    object.response=object.pending->take();account_http_io(object);debug_http_response(object.input,object.response);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
                 }
                 else if(symbol=="WinHttpSendRequest"){
                     if(object.pending || (object.sent && !object.received && object.total!=d(5)))throw HttpError{12019};if(d(5)>16*1024*1024 || d(4)>d(5) || (d(4) && !arg(3)))throw HttpError{87};
@@ -420,7 +434,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_http(GuestState& state,Gues
                 }else if(symbol=="WinHttpReceiveResponse"){
                     if(arg(1))throw HttpError{87};if(!object.sent || object.received || object.input.body.size()!=object.total)throw HttpError{12019};
                     if(!object.pending)throw HttpError{12019};if(!object.pending->done()){auto& thread=threads_.items.at(threads_.current);thread.status=ThreadStatus::Waiting;thread.wait={};thread.wait.kind=ThreadWaitKind::Http;thread.wait.handles={arg(0)};threads_.yield=true;notify_concurrency_changed();return std::nullopt;}
-                    object.response=object.pending->take();account_http_io(object);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
+                    object.response=object.pending->take();account_http_io(object);debug_http_response(object.input,object.response);object.pending.reset();if(object.inet && object.response.error)runtime_.http.last_responses[threads_.current]={object.response.error,object.response.status_line};if(object.response.error)throw HttpError{object.response.error};object.received=true;remember_http_cookies(object);cache_http_response(object);remember_server(object);result=1;
                 }else if(symbol=="WinHttpReadData" || symbol=="WinHttpQueryDataAvailable"){
                     if(!object.received)throw HttpError{12019};const bool read=symbol=="WinHttpReadData";const auto count=read?std::min<std::size_t>(d(2),object.response.body.size()-std::min(object.cursor,object.response.body.size())):object.response.body.size()-std::min(object.cursor,object.response.body.size());const auto output=arg(read?3:1);if(!output && (read || !inet))throw HttpError{87};if(output)memory.check(GuestAddress{output},4,Access::Write);
                     if(read && count){memory.check(GuestAddress{arg(1)},count,Access::Write);memory.write(GuestAddress{arg(1)},std::span(object.response.body).subspan(object.cursor,count));object.cursor+=count;}if(output)memory.store(GuestAddress{output},32,count);result=1;

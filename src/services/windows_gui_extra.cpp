@@ -174,13 +174,25 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_extra(
                     if(!terminated)fail(13);
                     else if(dword(1)==UINT32_MAX)result=paths.size();
                     else if(dword(1)<paths.size()){
-                        const auto& text=paths[dword(1)];const bool output_wide=symbol.ends_with('W');const auto ansi=output_wide?std::string{}:utf16_to_utf8(text);const auto length=output_wide?text.size():ansi.size();
+                        auto& text=paths[dword(1)];
+                        const bool selectable=symbol=="DragQueryFileAorW";
+                        const bool output_wide=selectable?!dword(4):symbol.ends_with('W');
+                        if(selectable && dword(5) && text.size()<260){
+                            GuestScratch scratch(*this,memory,state);
+                            const auto source=scratch.text(text),target=scratch.allocate(520);
+                            if(source && target){
+                                const auto length=nested_service(state,memory,"kernel32.dll","GetShortPathNameW",{source,target,260});
+                                if(length && length<260)text=read_utf16(memory,GuestAddress{target},259);
+                            }
+                        }
+                        const auto ansi=output_wide?std::string{}:utf16_to_utf8(text);const auto length=output_wide?text.size():ansi.size();
                         if(!arg(2))result=length;
                         else if(dword(3)){
                             result=std::min<std::size_t>(length,dword(3)-1);
                             if(output_wide)memory.write(GuestAddress{arg(2)},utf16_bytes(text.substr(0,result)));
                             else {std::vector<std::uint8_t> bytes(ansi.begin(),ansi.begin()+static_cast<std::ptrdiff_t>(result));bytes.push_back(0);memory.write(GuestAddress{arg(2)},bytes);}
                         }
+                        if(selectable)result=length;
                     }
                 }
             }

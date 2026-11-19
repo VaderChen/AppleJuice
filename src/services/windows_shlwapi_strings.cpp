@@ -85,6 +85,10 @@ std::span<const WindowsServiceDescriptor> shlwapi_string_service_descriptors(){
         {"shlwapi.dll","IntlStrEqWorkerA",4,0,0,0x9},{"shlwapi.dll","IntlStrEqWorkerW",4,0,0,0x9},
         {"shlwapi.dll","ChrCmpIA",2,0,0,0x3},{"shlwapi.dll","ChrCmpIW",2,0,0,0x3},
         {"shlwapi.dll","SHStrDupA",2},{"shlwapi.dll","SHStrDupW",2},
+        {"shlwapi.dll","#364",3,0,0,0x4},{"shlwapi.dll","#365",3,0,0,0x4},
+        {"shcore.dll","#152",3,0,0,1},{"shcore.dll","#153",3,0,0,1},
+        {"shlwapi.dll","#216",4,0,0,9},{"shlwapi.dll","#218",4,0,0,9},
+        {"internal-shcore-codec","SHAnsiToUnicode",3,0,0,4},{"internal-shcore-codec","SHUnicodeToAnsi",3,0,0,4},
         {"shlwapi.dll","SHAnsiToUnicode",3,0,0,0x4},{"shlwapi.dll","SHUnicodeToAnsi",3,0,0,0x4},{"shlwapi.dll","SHAnsiToAnsi",3,0,0,0x4},{"shlwapi.dll","SHUnicodeToUnicode",3,0,0,0x4},
         {"shlwapi.dll","StrRetToBufA",4,0,0,0x8},{"shlwapi.dll","StrRetToBufW",4,0,0,0x8},{"shlwapi.dll","StrRetToStrA",3},{"shlwapi.dll","StrRetToStrW",3},{"shlwapi.dll","StrRetToBSTR",3},
         {"internal-shell-char","CharUpperNoDBCSA",1},
@@ -274,12 +278,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_string(GuestState& 
             const auto block=task_copy(text(arg(0)).joined(),true);if(!block)return done(0x8007000eU);
             memory.store(GuestAddress{arg(1)},static_cast<std::uint8_t>(pointer_bits),block);return done(0);
         }
-        if(name=="SHAnsiToUnicode" || name=="SHUnicodeToAnsi" || name=="SHAnsiToAnsi" || name=="SHUnicodeToUnicode"){
-            // (source, dest, cch)：至多寫入 cch-1 個單位並補 NUL，回傳含 NUL 的寫入單位數；寫成 A 時不切斷 UTF-8 字元。
-            const bool from_wide=name.starts_with("SHUnicode"),to_wide=name.ends_with("Unicode");const auto cch=static_cast<std::int32_t>(u32(2));
-            if(!arg(1) || cch<=0)return done(0);const auto value=arg(0)?shell_text(memory,arg(0),from_wide).joined():std::u16string{};
-            return done(write_as(arg(1),value,static_cast<std::size_t>(cch),to_wide)+1);
+        if(name=="#364"){
+            // ANSI 入口直接複製位元組，截斷也視為可往返。
+            (void)nested_service(state,memory,"kernel32.dll","lstrcpynA",{arg(1),arg(0),u32(2)});
+            return done(1);
         }
+        if(name=="#365"){
+            const auto capacity=static_cast<std::int32_t>(u32(2));
+            if(!arg(0) || !arg(1) || capacity<=0)return done(0);
+            const auto source=read_utf16(memory,GuestAddress{arg(0)},1U<<20);
+            const auto written=write_as(arg(1),source,static_cast<std::size_t>(capacity),false);
+            // 以 MAX_PATH 個 WCHAR（含 NUL）作反向轉換。
+            if(source.size()>=260)return done(0);
+            const auto encoded=read_ansi(memory,arg(1),written+1);
+            return done(utf8_to_utf16_lossy(encoded)==source);
+        }
+#include "windows_shell_codec.inc"
         if(name.starts_with("StrRetTo")){
             // STRRET：uType 之後是指標對齊的聯集。WSTR（0）取 pOleStr 後以 CoTaskMemFree 釋放；OFFSET（1）為 pidl＋uOffset 的 ANSI；CSTR（2）為內含的 260 位元組 ANSI。
             if(!arg(0))return done(0x80070057U);const unsigned field=x86_?4U:8U;const auto type=static_cast<std::uint32_t>(memory.load(GuestAddress{arg(0)},32));
@@ -307,13 +321,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_shlwapi_string(GuestState& 
             return done((memory.load(GuestAddress{buffer+4},16)&mask)?1U:0U);
         }
         if(name.starts_with("SHStripMneumonic")){
-            // 移除第一個助記符號 '&'（"&&" 為字面 '&'），"(&X)" 形式整段移除；回傳助記字元。
-            if(!arg(0))return done(0);auto value=text(arg(0)).joined();std::size_t at=0;
-            for(;at<value.size();++at){if(value[at]!=u'&')continue;if(at+1<value.size() && value[at+1]==u'&'){++at;continue;}break;}
-            if(at+1>=value.size())return done(0);const auto mnemonic=value[at+1];
-            if(at && value[at-1]==u'(' && at+2<value.size() && value[at+2]==u')')value.erase(at-1,4);else value.erase(at,1);
-            write(arg(0),value,value.size()*4+1);
-            if(wide || mnemonic<0x80)return done(mnemonic);return done(static_cast<unsigned char>(utf16_to_utf8_lossy(std::u16string(1,mnemonic)).front()));
+            const auto bits = static_cast<std::uint8_t>(unit * 8);
+            const auto read = [&](std::uint64_t p){ return memory.load(GuestAddress{p}, bits); };
+            auto marker = arg(0);
+            auto mnemonic = read(marker);
+            auto current = mnemonic;
+            while(current && current != '&'){
+                marker += unit;
+                current = read(marker);
+            }
+            if(current){
+                const auto next = read(marker + unit);
+                if(next){
+                    if(next != '&') mnemonic = next;
+                    auto end = marker + unit;
+                    while(read(end)) end += unit;
+                    for(auto p = marker; p < end; p += unit)
+                        memory.store(GuestAddress{p}, bits, read(p + unit));
+                }
+            }
+            return done(mnemonic);
         }
         if(name.starts_with("ChrCmpI")){
             // 相等（不分大小寫）回 0，否則回非零。

@@ -921,6 +921,10 @@ GuestAddress WindowsServices::host_service_stub(std::string_view family,std::str
 GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_view symbol,bool required) const {
     std::string lower(dll);
     for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if(!detail::builtin_arch_supported(lower,x86_)){
+        if(!required)return GuestAddress{};
+        throw std::invalid_argument("內建 DLL 不支援目前客體架構："+lower);
+    }
     if(angle_module(lower) && (!native_angle_ || !native_angle_->supports(symbol))){if(!required)return GuestAddress{};throw std::invalid_argument("ANGLE Metal 入口未啟用："+lower+"!"+std::string(symbol));}
     if(native_library_module(lower) && !native_libraries_.enabled(lower)){if(!required)return GuestAddress{};throw std::invalid_argument("原生函式庫代理未啟用："+lower+"!"+std::string(symbol));}
     if(const auto host=windows_api_set_host(lower);host!=lower)lower=host;
@@ -933,7 +937,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
     }();
     // wsock32 其餘名稱與 ws2_32 共用；只有 wsock32 自己登錄的別名（#1141／#1142、mswsock 轉送、舊版 inet_network）另行解析。
     const auto alias_family=lower=="wsock32.dll" && !aliases.contains({std::string_view{"wsock32.dll"},symbol})?std::string_view{"ws2_32.dll"}:std::string_view{lower};
-    if(const auto found=aliases.find({alias_family,symbol});found!=aliases.end()){
+    if(const auto found=aliases.find({alias_family,symbol});found!=aliases.end() && (!found->second->x86_only || x86_)){
         const auto& alias=*found->second;lower=alias.target_family;symbol=alias.target_symbol;
     }
     if (lower == "wsock32.dll") lower = "ws2_32.dll";
@@ -988,7 +992,7 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
                (srw_routines || symbol.find("SRWLock")==symbol.npos) && (critical_routines || symbol.find("CriticalSection")==symbol.npos) &&
                (fls_mirror_ || !symbol.starts_with("FlsGetValue")) &&
                (once_routines || !symbol.starts_with("InitOnce")) &&
-               symbol!="GetDoubleClickTime" && symbol!="SetDoubleClickTime" && symbol!="GetCaretBlinkTime" && symbol!="SetCaretBlinkTime" && !symbol.starts_with("Gdi") &&
+               symbol!="SHAnsiToAnsi" && symbol!="SHUnicodeToUnicode" && !symbol.starts_with("SHGlobalCounter") && symbol!="CreateAllAccessSecurityAttributes" && symbol!="GetDoubleClickTime" && symbol!="SetDoubleClickTime" && symbol!="GetCaretBlinkTime" && symbol!="SetCaretBlinkTime" && !symbol.starts_with("Gdi") &&
                (language_routines || symbol!="IsValidLanguageGroup"))
                 return GuestAddress{guest_thread_routines_.value+guest_thread_offset(found->second)};
         }
@@ -1102,8 +1106,25 @@ GuestAddress WindowsServices::resolve_service(std::string_view dll,std::string_v
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
                 return GuestAddress{image->first+entry->second};
         }
-        if((descriptor.family=="internal-com-agile" || descriptor.family=="internal-shell-guid" ||
-            (descriptor.family=="shlwapi.dll" && descriptor.symbol.starts_with("StrCmp"))) && trace_services_.empty()){
+        if(descriptor.family=="shlwapi.dll" && (descriptor.symbol=="SHAnsiToAnsi" || descriptor.symbol=="SHUnicodeToUnicode")){
+            const auto entry=guest_thread_routine(descriptor.symbol);
+            if(entry.value)return entry;
+        }
+        if(descriptor.family=="shlwapi.dll" && descriptor.symbol=="#356"){
+            const auto entry=guest_thread_routine("CreateAllAccessSecurityAttributes");
+            if(entry.value)return entry;
+        }
+        if((descriptor.family=="shlwapi.dll" || descriptor.family=="internal-shell-counter") &&
+            descriptor.symbol.starts_with("SHGlobalCounter") && trace_services_.empty()){
+            static const bool enabled=[] {const auto* setting=std::getenv("X64ARM_GUEST_SHELL_COUNTER");return !setting || std::string_view(setting)!="0";}();
+            if(enabled){const auto entry=guest_thread_routine(descriptor.symbol);if(entry.value)return entry;}
+        }
+        if((descriptor.family=="internal-com-agile" || descriptor.family=="internal-shell-persist" || descriptor.family=="internal-shell-owner" || descriptor.family=="internal-shell-identity" || descriptor.family=="internal-shell-slashes" ||
+            descriptor.family=="internal-shell-dispatch" || descriptor.family=="internal-shell-fdsa" || descriptor.family=="internal-shell-map" || descriptor.family=="internal-shell-guid" ||
+            (descriptor.family=="shlwapi.dll" && (descriptor.symbol.starts_with("StrCmp") ||
+                descriptor.symbol=="ConnectToConnectionPoint" || descriptor.symbol=="IUnknown_GetWindow" || descriptor.symbol=="IUnknown_Set" || descriptor.symbol=="IUnknown_AtomicRelease" ||
+                descriptor.symbol.starts_with("SHStripMneumonic") ||
+                descriptor.symbol.starts_with("PathIsValidChar") || descriptor.symbol.starts_with("PathGetCharType")))) && trace_services_.empty()){
             const auto image=runtime_.builtin_images.find(callback_return_.value+com_agile::image_offset);
             if(image!=runtime_.builtin_images.end())if(const auto entry=image->second.export_names.find(std::string(descriptor.symbol));entry!=image->second.export_names.end())
                 return GuestAddress{image->first+entry->second};

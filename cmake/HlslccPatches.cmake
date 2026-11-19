@@ -68,6 +68,7 @@ include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalPullInterpolation.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalTexelFetch.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalBitfieldOperands.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalIntegerShifts.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/HlslccMetalResInfoDimension.cmake")
 
 file(GLOB_RECURSE _hlslcc_files LIST_DIRECTORIES FALSE RELATIVE "${hlslcc_SOURCE_DIR}" "${hlslcc_SOURCE_DIR}/*")
 foreach(_hlslcc_file IN LISTS _hlslcc_files)

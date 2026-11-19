@@ -3,6 +3,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/windows_keyboard.hpp"
 #include "x64arm/windows_gui_abi.hpp"
+#include "x64arm/windows_icon.hpp"
 #include "x64arm/windows_geometry.hpp"
 #include "x64arm/unicode.hpp"
 #include "x64arm/file_security.hpp"
@@ -51,6 +52,7 @@ std::span<const WindowsServiceDescriptor> resource_service_descriptors(){
         {"user32.dll","MonitorFromWindow",2},{"user32.dll","MonitorFromPoint",2,1},{"user32.dll","MonitorFromRect",2},
         {"user32.dll","ChangeWindowMessageFilter",2},{"user32.dll","ChangeWindowMessageFilterEx",4},{"user32.dll","RegisterDeviceNotificationA",3},{"user32.dll","RegisterDeviceNotificationW",3},{"user32.dll","UnregisterDeviceNotification",1},{"user32.dll","EnumDisplayDevicesA",4},{"user32.dll","EnumDisplayDevicesW",4},{"user32.dll","ChangeDisplaySettingsA",2},{"user32.dll","ChangeDisplaySettingsW",2},{"user32.dll","ChangeDisplaySettingsExA",5},{"user32.dll","ChangeDisplaySettingsExW",5},{"user32.dll","EnumDisplaySettingsA",3},{"user32.dll","EnumDisplaySettingsW",3},{"user32.dll","EnumDisplaySettingsExA",4},{"user32.dll","EnumDisplaySettingsExW",4},{"user32.dll","EnumDisplayMonitors",4},{"user32.dll","GetMonitorInfoA",2},{"user32.dll","GetMonitorInfoW",2},
         {"user32.dll","GetDisplayConfigBufferSizes",3},{"user32.dll","QueryDisplayConfig",6},{"user32.dll","DisplayConfigGetDeviceInfo",1},{"user32.dll","DisplayConfigSetDeviceInfo",1},
+        {"shlwapi.dll","#537",2},
         {"user32.dll","SystemParametersInfoA",4},{"user32.dll","SystemParametersInfoW",4}
     };return table;
 }
@@ -457,8 +459,18 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
     }else if(symbol=="GetDialogBaseUnits")result=(16U<<16)|8U;
     else if(symbol.starts_with("LoadBitmap") || symbol.starts_with("LoadImage")){
         const bool image=symbol.starts_with("LoadImage");
-        if(image && (d(2)!=0 || (d(5)&~0xa040U)))fail(50);
-        else if(auto reader=resource(arg(1),2)){
+        const auto load_bitmap=[&]()->std::optional<GuiBitmap>{
+            if(image && (d(2)!=0 || (d(5)&~0xa050U))){fail(50);return {};}
+            if(image && (d(5)&0x10U)){
+                if(arg(0) || arg(1)<=65535){fail(87);return {};}
+                const auto path=wide?utf16_to_utf8(read_utf16(memory,GuestAddress{arg(1)})):read_ansi(memory,arg(1));
+                const auto file=filesystem_.open(path);
+                if(file.error){fail(file.error);return {};}
+                try{return decode_bitmap_file(*file.bytes);}
+                catch(const std::invalid_argument&){fail(193);return {};}
+            }
+            const auto reader=resource(arg(1),2);
+            if(!reader)return {};
             const auto size=reader->end-reader->begin;if(size>16U*1024U*1024U)throw HostCallFault("DIB 資源超過上限");
             std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));memory.read(GuestAddress{reader->begin},bytes);
             GuiBitmap bitmap;
@@ -471,6 +483,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
                     bitmap_templates_[reader->begin]={std::move(bytes),bitmap};
                 }
             }else bitmap=decode_dib_bitmap(bytes);
+            return bitmap;
+        };
+        if(auto loaded=load_bitmap()){
+            auto& bitmap=*loaded;
             const auto width=image && d(3)?d(3):bitmap.width,height=image && d(4)?d(4):bitmap.height;
             if(!width || !height || width>4096 || height>4096 || static_cast<std::uint64_t>(width)*height>4*1024*1024)throw HostCallFault("DIB 輸出尺寸超過上限");
             if(width!=bitmap.width || height!=bitmap.height){GuiBitmap scaled{width,height,std::vector<std::uint32_t>(static_cast<std::size_t>(width)*height)};
@@ -685,6 +701,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
             for(unsigned i=0;i<4;++i){memory.store(GuestAddress{arg(1)+4+i*4},32,static_cast<std::uint32_t>(monitor.rect[i]));memory.store(GuestAddress{arg(1)+20+i*4},32,static_cast<std::uint32_t>(work[i]));}
             memory.store(GuestAddress{arg(1)+36},32,monitor.primary?1U:0U);
             if(size>40)(void)copy_text(arg(1)+40,32,u"\\\\.\\DISPLAY"+utf8_to_utf16(std::to_string(arg(0))));result=1;}
+    }else if(service.family=="shlwapi.dll" && symbol=="#537"){
+        const auto action=d(0);
+        const auto data=arg(1);
+        const auto spi=[&](std::uint32_t size,std::uint64_t parameter){
+            return nested_service(state,memory,"user32.dll","SystemParametersInfoW",{action,size,parameter,0});
+        };
+        if(!data)fail(87);
+        else if(action==0x48 || action==0x49){
+            GuestScratch scratch(*this,memory,state);
+            const auto info=scratch.allocate(8);
+            memory.store(GuestAddress{info},32,8);
+            if(action==0x49)memory.store(GuestAddress{info+4},32,memory.load(GuestAddress{data},32)!=0);
+            result=spi(8,info);
+            if(result && action==0x48)memory.store(GuestAddress{data},32,memory.load(GuestAddress{info+4},32));
+        }else if(action==0x25 || action==0x4b)result=spi(memory.load(GuestAddress{data},32)!=0,0);
+        else if(action==0x26 || action==0x4a || (action>=0x1000 && !(action&1U)))result=spi(0,data);
+        else if(action>=0x1000)result=spi(0,memory.load(GuestAddress{data},32));
+        else fail(87);
     }else if(symbol.starts_with("SystemParametersInfo")){
         // 與 GetSystemMetrics、AppBar 共用桌面／工作區；未支援的 action 回傳明確錯誤。
         const auto font=[&](std::uint64_t pointer){memory.write(GuestAddress{pointer},std::vector<std::uint8_t>(wide?92U:60U));memory.store(GuestAddress{pointer},32,static_cast<std::uint32_t>(-12));memory.store(GuestAddress{pointer+16},32,400);memory.store(GuestAddress{pointer+23},8,1);memory.store(GuestAddress{pointer+24},8,4);memory.store(GuestAddress{pointer+26},8,5);(void)copy_text(pointer+28,32,runtime_.network.external_io?native_ui_font_family():u"Segoe UI");};
@@ -694,6 +728,26 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
                 font(arg(2)+24);memory.store(GuestAddress{arg(2)+24+lf},32,16);memory.store(GuestAddress{arg(2)+28+lf},32,20);font(arg(2)+32+lf);
                 memory.store(GuestAddress{arg(2)+32+lf*2},32,16);memory.store(GuestAddress{arg(2)+36+lf*2},32,20);
                 font(arg(2)+40+lf*2);font(arg(2)+40+lf*3);font(arg(2)+40+lf*4);result=1;}
+        }else if(d(0)==0x2d){
+            const unsigned size=wide?108U:76U;
+            if(!arg(2) || memory.load(GuestAddress{arg(2)},32)!=size)fail(87);
+            else{
+                memory.check(GuestAddress{arg(2)},size,Access::Write);
+                memory.store(GuestAddress{arg(2)+4},32,system_metric(38));
+                memory.store(GuestAddress{arg(2)+8},32,system_metric(39));
+                memory.store(GuestAddress{arg(2)+12},32,1);
+                font(arg(2)+16);result=1;
+            }
+        }else if(d(0)==0x25 || d(0)==0x26 || d(0)==0x48 || d(0)==0x49){
+            const bool animation=d(0)>=0x48;
+            const bool set=d(0)==0x25 || d(0)==0x49;
+            auto& setting=animation?gui_.minimize_animation:gui_.drag_full_windows;
+            if((animation || !set) && !arg(2))fail(87);
+            else if(animation && memory.load(GuestAddress{arg(2)},32)!=8)fail(87);
+            else if(set && (job_ui_restrictions()&8U))fail(5);
+            else if(set && d(3))fail(d(3)&~3U?87:50);
+            else if(set){setting=animation?memory.load(GuestAddress{arg(2)+4},32)!=0:d(1)!=0;result=1;}
+            else {memory.store(GuestAddress{arg(2)+(animation?4:0)},32,setting);result=1;}
         }else if(d(0)==0x21 || d(0)==0x57){
             // SPI_SETMOUSEBUTTONSWAP 與 SwapMouseButton 共用左右鍵對調狀態；SPI_SETCURSORS 還原被 SetSystemCursor 取代的系統游標。
             if(d(0)==0x21)gui_.mouse_buttons_swapped=d(1)!=0;else {gui_.system_cursors.clear();present_gui_cursor();}
@@ -719,8 +773,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_resource(GuestState& state,
             else if(!arg(2))fail(87);else {memory.store(GuestAddress{arg(2)},32,value);result=1;}
         }else if(d(0)==31){font(arg(2));result=1;}
         else if(d(0)==48){memory.check(GuestAddress{arg(2)},16,Access::Write);const auto area=gui_work_area();for(unsigned i=0;i<4;++i)memory.store(GuestAddress{arg(2)+i*4},32,static_cast<std::uint32_t>(area[i]));result=1;}
-        else if(d(0)==0x1022 || d(0)==0x1026){memory.store(GuestAddress{arg(2)},32,0);result=1;}
-        else if(d(0)==0x26){memory.store(GuestAddress{arg(2)},32,1);result=1;}
+        else if((d(0)>=0x1000 && d(0)<=0x1027 && (d(0)&~1U)!=0x1010) ||
+                (d(0)>=0x103e && d(0)<=0x1043) || (d(0)>=0x104a && d(0)<=0x1051)){
+            const auto bit=UINT64_C(1)<<((d(0)-0x1000)/2);
+            if(!(d(0)&1U)){
+                if(!arg(2))fail(87);else {memory.store(GuestAddress{arg(2)},32,(gui_.ui_preferences&bit)!=0);result=1;}
+            }else if(job_ui_restrictions()&8U)fail(5);
+            else if(d(3))fail(d(3)&~3U?87:50);
+            else {if(arg(2))gui_.ui_preferences|=bit;else gui_.ui_preferences&=~bit;result=1;}
+        }
         else fail(87);
     }else throw HostCallFault("未實作的 GUI resource API");
     arg.return_to(state,result);return std::nullopt;

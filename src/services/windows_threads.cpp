@@ -23,6 +23,7 @@
 #endif
 #include "x64arm/windows_services.hpp"
 #include "windows_forced_thread_stop.hpp"
+#include "mpr_state.hpp"
 #include "srw_trace.hpp"
 #include "resident_service_policy.hpp"
 #include "guest_crt_state.h"
@@ -4363,6 +4364,7 @@ std::optional<std::uint32_t> WindowsServices::finish_thread(GuestState &state, G
     cancel_bluetooth_thread(state,memory,threads_.current);
     discard_policy_thread(threads_.current);
     thread_power_requests_.erase(threads_.current);
+    if(mpr_)mpr_->errors.erase(threads_.current);
     (void)retire_com_error(state, memory, threads_.current, false);
     (void)retire_ole_drag_thread(state, memory, threads_.current, false);
     (void)retire_com_proxy_thread(state, memory, threads_.current, false);
@@ -5908,7 +5910,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_thread(GuestState &state, G
             fail(process_object_type(arg(0)) == u"Process" ? 5U : 6U);
         else if (extended && arg(6))
             fail(50);
-        else if (flags_value & ~0x10004U || stack_parameter > 8U * 1024 * 1024)
+        // dwCreationFlags 只有 CREATE_SUSPENDED（0x4）與 STACK_SIZE_PARAM_IS_A_RESERVATION（0x10000）有作用，其他位元與 Windows 相同直接忽略、
+        // 不回 ERROR_INVALID_PARAMETER：有遊戲經 CRT _beginthreadex 傳 0x40，原本建立失敗，主執行緒一直等這條執行緒（伊蘇 VIII 開窗後卡住）。
+        else if (stack_parameter > 8U * 1024 * 1024)
             fail(87);
         else {
             try {

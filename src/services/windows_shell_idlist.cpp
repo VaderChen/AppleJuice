@@ -20,7 +20,7 @@ std::span<const WindowsServiceDescriptor> shell_idlist_service_descriptors(){
         {"shell32.dll","ILGetSize",1},{"shell32.dll","ILGetNext",1},{"shell32.dll","ILFindLastID",1},{"shell32.dll","ILRemoveLastID",1},
         {"shell32.dll","ILClone",1},{"shell32.dll","ILCloneFirst",1},{"shell32.dll","ILCombine",2},{"shell32.dll","ILAppendID",3,0,0,0x4},{"shell32.dll","ILIsEqual",2},
         {"shell32.dll","ILIsParent",3},{"shell32.dll","ILFindChild",2},{"shell32.dll","SHGetRealIDL",3},{"shell32.dll","SHSimpleIDListFromPath",1},
-        {"shell32.dll","SHGetPathFromIDListEx",4},{"shell32.dll","DoEnvironmentSubstA",2},{"shell32.dll","DoEnvironmentSubstW",2},{"shell32.dll","Win32DeleteFile",1},
+        {"shell32.dll","SHGetPathFromIDListA",2},{"shell32.dll","SHGetPathFromIDListW",2},{"shell32.dll","SHGetPathFromIDListEx",4,0,0,0xc},{"shell32.dll","DoEnvironmentSubstA",2},{"shell32.dll","DoEnvironmentSubstW",2},{"shell32.dll","Win32DeleteFile",1},
     };return table;
 }
 // 各項目的（位移, cb）；超過上限或 cb 小於 2 視為格式錯誤。
@@ -37,10 +37,16 @@ static std::vector<std::uint8_t> idlist_bytes(GuestMemory& memory,std::uint64_t 
 std::optional<std::u16string> WindowsServices::shell_pidl_path(GuestMemory& memory,std::uint64_t pidl,std::u16string base) const{
     if(!pidl)return std::nullopt;const bool relative=!base.empty();
     if(!relative)if(const auto found=gui_.shell_pidls.find(pidl);found!=gui_.shell_pidls.end() && allocations_.contains(pidl))return found->second;
+    // 已釋放的小配置仍可能與存活物件共用映射頁。
+    const auto next_free=free_heap_blocks_.upper_bound(pidl);
+    if(next_free!=free_heap_blocks_.begin()){
+        const auto& [start,length]=*std::prev(next_free);
+        if(pidl-start<length)return std::nullopt;
+    }
     try{
         std::u16string path=std::move(base);
         for(const auto& [offset,cb]:idlist_items(memory,pidl)){
-            if(cb<6 || (cb-4)%2)return std::nullopt;const auto type=memory.load(GuestAddress{pidl+offset+2},8);
+            if(cb<6 || (cb-4)%2 || memory.load(GuestAddress{pidl+offset+cb-2},16)!=0)return std::nullopt;const auto type=memory.load(GuestAddress{pidl+offset+2},8);
             std::u16string name;for(std::uint64_t at=4;at+2<cb;at+=2)name.push_back(static_cast<char16_t>(memory.load(GuestAddress{pidl+offset+at},16)));
             if(path.empty()){if(type!=0x2f || name.size()!=3 || name[1]!=u':')return std::nullopt;path=name;}
             else {if(type!=0x31 || name.empty() || name.find(u'\\')!=name.npos)return std::nullopt;if(path.back()!=u'\\')path+=u'\\';path+=name;}
@@ -171,14 +177,31 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_idlist(GuestState& st
             if(path.size()<3 || path[1]!=u':' || path[2]!=u'\\')return done(0);if(path[0]>=u'a' && path[0]<=u'z')path[0]=static_cast<char16_t>(path[0]-32);
             while(path.size()>3 && path.back()==u'\\')path.pop_back();return done(shell_make_pidl(memory,path));
         }
-        if(name=="SHGetPathFromIDListEx"){
-            // (pidl, path, cch, flags)：GPFIDL_ALTNAME（1）回短檔名；緩衝不足回 FALSE。
-            if(!arg(1) || !arg(2) || (arg(3)&~3ULL))return done(0);memory.store(GuestAddress{arg(1)},16,0);
-            auto path=shell_pidl_path(memory,arg(0));if(!path)return done(0);
-            if(arg(3)&1U){GuestScratch scratch(*this,memory,state);const auto source=scratch.text(*path),target=scratch.allocate(1040);
-                const auto length=nested_service(state,memory,"kernel32.dll","GetShortPathNameW",{source,target,520});if(length && length<520)*path=read_utf16(memory,GuestAddress{target},520);}
-            if(path->size()+1>static_cast<std::uint32_t>(arg(2)))return done(0);for(std::size_t i=0;i<path->size();++i)memory.store(GuestAddress{arg(1)+i*2},16,(*path)[i]);
-            memory.store(GuestAddress{arg(1)+path->size()*2},16,0);return done(1);
+        if(name.starts_with("SHGetPathFromIDList")){
+            const bool extended=name=="SHGetPathFromIDListEx",ansi=name.ends_with('A');
+            const auto capacity=extended?static_cast<std::uint32_t>(arg(2)):260U;
+            const auto flags=extended?static_cast<std::uint32_t>(arg(3)):0U;
+            const auto output=GuestAddress{arg(1)};
+            if(!output.value || !capacity || (flags&~3U)){last_error_=87;return done(0);}
+            memory.store(output,ansi?8:16,0);
+            auto path=shell_pidl_path(memory,arg(0));
+            if(!path){last_error_=87;return done(0);}
+            if(flags&1U){
+                GuestScratch scratch(*this,memory,state);
+                const auto source=scratch.text(*path),target=scratch.allocate(1040);
+                if(!source || !target)return done(0);
+                const auto length=nested_service(state,memory,"kernel32.dll","GetShortPathNameW",{source,target,520});
+                if(length && length<520)*path=read_utf16(memory,GuestAddress{target},520);
+            }
+            if(ansi){
+                const auto text=utf16_to_utf8(*path);
+                if(text.size()>=capacity){last_error_=206;return done(0);}
+                memory.write(output,{reinterpret_cast<const std::uint8_t*>(text.c_str()),text.size()+1});
+            }else{
+                if(path->size()>=capacity){last_error_=206;return done(0);}
+                memory.write(output,utf16_bytes(*path));
+            }
+            return done(1);
         }
         if(name=="DoEnvironmentSubstA" || name=="DoEnvironmentSubstW"){
             // 原地展開環境變數：成功時高位字為 TRUE、低位字為新長度；緩衝不足時不修改並回 FALSE 與原容量。

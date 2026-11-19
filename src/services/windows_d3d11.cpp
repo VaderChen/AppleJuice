@@ -980,6 +980,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_d3d11_full(GuestState& stat
         if(d3d11_stream_ && !id->persistent_maps.empty()){const std::lock_guard lock(d3d11_stream_->front_dropped_mutex);d3d11_stream_->front_dropped.push_back(address);d3d11_stream_->front_epoch.fetch_add(1,std::memory_order_release);}
         // 位址可能被新物件重用，命令串流不得再認得這個內容（協調者本地路徑的銷毀不經全停）。
         if(id->kind==Kind::Context && d3d11_stream_)d3d11_stream_->context.store(0,std::memory_order_relaxed);
+        if(id->kind==Kind::Context && id->context_type){d3d11_deferred_contexts().remove(id->root);d3d11_deferred_contexts().remove(address);}
         // 位址也可能變成別的緩衝：可排入更新的緩衝要重新核對。
         if(d3d11_stream_)d3d11_stream_->update_epoch.fetch_add(1,std::memory_order_release);
         // 裝置銷毀時輸出 Metal 後端統計（draws、encoders、GPU 忙碌時間、CPU 等待），供 CPU／GPU 瓶頸判斷。

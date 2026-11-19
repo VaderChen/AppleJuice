@@ -88,7 +88,7 @@ std::u16string requested_locale_name(const GuestMemory& memory,std::uint64_t poi
     if(value==u"!x-sys-default-locale")value=u"en-US";return value;
 }
 std::string codepage_encoding(std::uint32_t page){
-    return page==65001?std::string{"UTF-8"}:page==20127?std::string{"US-ASCII"}:"windows-"+std::to_string(page);
+    return page==65000?std::string{"UTF-7"}:page==65001?std::string{"UTF-8"}:page==20127?std::string{"US-ASCII"}:"windows-"+std::to_string(page);
 }
 std::optional<Locale> numbered(std::uint32_t id){
     if(id==0x400 || id==0x800)id=0x409;

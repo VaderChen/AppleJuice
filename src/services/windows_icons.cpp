@@ -147,11 +147,7 @@ std::optional<std::uint32_t> WindowsServices::invoke_icon_api(GuestState& state,
                 }else {copy.stride=(width*copy.bits_per_pixel+15)/16*2;const auto handle=gui_.next_object;gui_.bitmaps.emplace(handle,std::move(copy));++gui_.next_object;result=handle;}
             }else {
                 const auto source=gui_.icons.find(arg(0));std::optional<GuiIcon> system;
-                if(source==gui_.icons.end() && type==2 && arg(0)>=0xd000 && gui_system_cursor_id(arg(0)-0xd000)){
-                    // 被 SetSystemCursor 取代的系統游標複製取代後的內容。
-                    const auto id=static_cast<std::uint32_t>(arg(0)-0xd000);const auto replaced=gui_.system_cursors.find(id);
-                    system=replaced!=gui_.system_cursors.end()?std::optional<GuiIcon>{replaced->second}:native_system_cursor(id);
-                }
+                if(source==gui_.icons.end() && type==2)system=resolve_system_cursor(gui_,arg(0));
                 if(source==gui_.icons.end() && !system)return fail(type==1?1402:1401);
                 const auto original=source!=gui_.icons.end()?source->second:*system;if(original.is_icon!=(type==1))return fail(87);
                 const auto width=requested_width?requested_width:(flags&0x40U)?system_metric(type==1?11:13):original.width;

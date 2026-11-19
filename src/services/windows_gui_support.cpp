@@ -57,6 +57,8 @@ std::uint32_t WindowsServices::system_metric(std::uint32_t index,std::uint32_t d
 
 std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
+        {"shlwapi.dll","#395",4},{"shlwapi.dll","#397",4},
+        {"shlwapi.dll","#416",5},{"shlwapi.dll","#417",5},
         {"user32.dll","WinHelpA",4},{"user32.dll","WinHelpW",4},
         {"user32.dll","DefFrameProcA",5},{"user32.dll","DefFrameProcW",5},
         {"user32.dll","DefMDIChildProcA",4},{"user32.dll","DefMDIChildProcW",4},
@@ -87,7 +89,7 @@ std::span<const WindowsServiceDescriptor> gui_service_descriptors(){
         {"user32.dll","MessageBoxTimeoutA",6,0,0,0x38},{"user32.dll","MessageBoxTimeoutW",6,0,0,0x38},
         {"comctl32.dll","MakeDragList",1},{"comctl32.dll","LBItemFromPt",3},{"comctl32.dll","DrawInsert",3},
         {"ole32.dll","OleDuplicateData",3},
-        {"shell32.dll","DragAcceptFiles",2},{"user32.dll","ClipCursor",1},{"user32.dll","GetClipCursor",1},{"user32.dll","AttachThreadInput",3},{"user32.dll","GetScrollPos",2},{"shell32.dll","DragQueryFileA",4},{"shell32.dll","DragQueryFileW",4},{"shell32.dll","DragQueryPoint",2},{"shell32.dll","DragFinish",1},
+        {"shell32.dll","DragAcceptFiles",2},{"user32.dll","ClipCursor",1},{"user32.dll","GetClipCursor",1},{"user32.dll","AttachThreadInput",3},{"user32.dll","GetScrollPos",2},{"shell32.dll","DragQueryFileA",4},{"shell32.dll","DragQueryFileAorW",6},{"shell32.dll","DragQueryFileW",4},{"shell32.dll","DragQueryPoint",2},{"shell32.dll","DragFinish",1},
         {"kernel32.dll","GlobalAlloc",2},{"kernel32.dll","GlobalFree",1},{"kernel32.dll","GlobalLock",1},{"kernel32.dll","GlobalUnlock",1},
         {"kernel32.dll","GlobalSize",1},{"kernel32.dll","GlobalFlags",1},{"kernel32.dll","GlobalHandle",1},
         {"kernel32.dll","GlobalReAlloc",3},
@@ -303,7 +305,8 @@ std::optional<std::array<std::uint32_t,2>> WindowsServices::input_message_source
     return own;
 }
 std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    if(service.symbol=="WinHelpA" || service.symbol=="WinHelpW")return invoke_winhelp(state,memory,service);
+    if(service.symbol=="WinHelpA" || service.symbol=="WinHelpW" || (service.family=="shlwapi.dll" &&
+       (service.symbol=="#395" || service.symbol=="#397" || service.symbol=="#416" || service.symbol=="#417")))return invoke_winhelp(state,memory,service);
     if(service.symbol.starts_with("DefFrameProc") || service.symbol.starts_with("DefMDIChildProc") ||
        service.symbol.starts_with("CreateMDIWindow") || service.symbol=="TranslateMDISysAccel" ||
        service.symbol=="ScrollChildren" || service.symbol=="CalcChildScroll")return invoke_mdi(state,memory,service);
@@ -385,18 +388,36 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
     }
     else if(symbol.starts_with("FindWindow")){
         const bool extended=symbol.starts_with("FindWindowEx");
-        const auto parent=extended && arg(0)!=gui_.desktop?arg(0):0,after=extended?arg(1):0;
+        const auto requested_parent=extended?arg(0):0,after=extended?arg(1):0;
+        const auto message_parent=x86_?UINT64_C(0xfffffffd):gui_message_parent;
+        const auto parent=requested_parent==gui_.desktop?0:requested_parent==message_parent?gui_message_parent:requested_parent;
         const auto cls=arg(extended?2:0),caption=arg(extended?3:1);
-        const auto class_name=cls>65535?lower(read(cls)):std::u16string{};
-        const auto title=caption?lower(read(caption)):std::u16string{};
-        if((parent && !gui_.windows.contains(parent)) || (after && (!gui_.windows.contains(after) || gui_.windows.at(after).parent!=parent)))fail(1400);
-        else {bool seen=!after;
+        const auto class_name=cls>65535?read(cls):std::u16string{};
+        const auto title=caption?read(caption):std::u16string{};
+        const auto equal=[](std::u16string_view a,std::u16string_view b){
+            return std::equal(a.begin(),a.end(),b.begin(),b.end(),[](char16_t x,char16_t y){
+                return x==y || unicode_case_unit(x,true)==unicode_case_unit(y,true);
+            });
+        };
+        const auto desktop=thread_desktop_object(threads_.current);
+        const auto find_child=[&](std::uint64_t target_parent)->std::uint64_t{
+            bool seen=!after;
             for(const auto handle:gui_.z_order){
-                const auto found=gui_.windows.find(handle);if(found==gui_.windows.end())continue;const auto& w=found->second;
                 if(!seen){if(handle==after)seen=true;continue;}
-                if(w.desktop_object!=thread_desktop_object(threads_.current) || w.parent!=parent || (cls && (cls<=65535?w.class_atom!=cls:lower(w.class_name)!=class_name)) || (caption && lower(w.title)!=title))continue;
-                result=handle;break;
+                const auto found=gui_.windows.find(handle);
+                if(found==gui_.windows.end() || handle==gui_.desktop)continue;
+                const auto& w=found->second;
+                if(w.desktop_object!=desktop || w.parent!=target_parent)continue;
+                if(cls && (cls<=65535?w.class_atom!=cls:!equal(w.class_name,class_name)))continue;
+                if(!caption || equal(w.title,title))return handle;
             }
+            return 0;
+        };
+        if((parent && parent!=gui_message_parent && !gui_.windows.contains(parent)) ||
+           (after && (!gui_.windows.contains(after) || gui_.windows.at(after).parent!=parent)))fail(1400);
+        else if(cls<=65535 || !class_name.empty()){
+            result=find_child(parent);
+            if(!result && !requested_parent && !after)result=find_child(gui_message_parent);
         }
     }
     else if(symbol=="GetClassNameA" || symbol=="GetClassNameW" || symbol.starts_with("RealGetWindowClass")){
@@ -765,8 +786,20 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         auto parent=arg(symbol=="SetParent"?1:0);if(parent==message_parent)parent=gui_message_parent;if(parent==gui_.desktop)parent=0;
         const auto child=arg(symbol=="SetParent"?0:1);const auto found=gui_.windows.find(child);
         if(symbol=="IsChild"){
-            std::set<std::uint64_t> visited;auto cursor=child;
-            while(cursor && visited.insert(cursor).second){const auto w=gui_.windows.find(cursor);if(w==gui_.windows.end())break;cursor=w->second.parent;if(cursor && cursor==parent){result=1;break;}}
+            std::set<std::uint64_t> visited;
+            auto cursor=child;
+            while(parent && cursor && visited.insert(cursor).second){
+                if(const auto local=gui_.windows.find(cursor);local!=gui_.windows.end()){
+                    if(!(local->second.style&0x40000000U))break;
+                    cursor=local->second.parent;
+                }else{
+                    const auto remote=shared_gui_window(cursor,false);
+                    if(!remote || !(remote->style&0x40000000U))break;
+                    cursor=remote->parent;
+                }
+                if(cursor==gui_message_parent || cursor==gui_.desktop)break;
+                if(cursor==parent){result=1;break;}
+            }
         }else if(found==gui_.windows.end() || (parent && parent!=gui_message_parent && !gui_.windows.contains(parent)))fail(1400);
         else {
             bool cycle=parent==child;auto cursor=parent;std::set<std::uint64_t> visited;
@@ -1003,9 +1036,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_gui_support(GuestState& sta
         const auto icon=gui_.icons.find(arg(0));if(icon==gui_.icons.end())fail(1402);else {auto copy=icon->second;copy.shared=false;result=gui_.next_object++;gui_.icons.emplace(result,std::move(copy));}
     }
     else if(symbol=="GetIconInfo"){
-        const auto found=gui_.icons.find(arg(0));if(found==gui_.icons.end())fail(1402);else if(!arg(1))fail(87);
+        const auto found=gui_.icons.find(arg(0));
+        const auto system=found==gui_.icons.end()?resolve_system_cursor(gui_,arg(0)):std::nullopt;
+        if(found==gui_.icons.end() && !system)fail(1402);else if(!arg(1))fail(87);
         else {
-            const auto& icon=found->second;const auto count=static_cast<std::size_t>(icon.width)*icon.height;
+            const auto& icon=system?*system:found->second;const auto count=static_cast<std::size_t>(icon.width)*icon.height;
             if(icon.mask_pixels.size()!=count*(icon.monochrome?2U:1U) || (!icon.monochrome && icon.color_pixels.size()!=count))fail(50);
             else {
                 const auto unit=x86_?4U:8U,mask_at=x86_?12U:16U;memory.check(GuestAddress{arg(1)},x86_?20:32,Access::Write);

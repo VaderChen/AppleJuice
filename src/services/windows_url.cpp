@@ -1,6 +1,7 @@
 #include "x64arm/windows_services.hpp"
 #include "x64arm/unicode.hpp"
 #include <algorithm>
+#include <unicode/uchar.h>
 
 namespace x64arm {
 namespace {
@@ -9,9 +10,9 @@ constexpr std::uint32_t escape_spaces_only=0x04000000U,dont_escape_extra=0x02000
 constexpr std::uint32_t escape_utf8=0x00040000U,escape_ascii_component=0x00080000U,unescape_inplace=0x00100000U;
 enum : unsigned {escape_slash=1,escape_question=2,escape_hash=4,stop_hash=8,stop_question=16,backslash_as_slash=32,collapse_slashes=64};
 // ParseURL 的 scheme 判定：冒號前至少兩個英數或 + - . 字元。回傳 scheme 長度（0＝不是 URL）。
-std::size_t url_scheme(std::u16string_view url){
+std::size_t url_scheme(std::u16string_view url,bool unicode=false){
     std::size_t at=0;
-    while(at<url.size()){const auto c=url[at];if(!((c>=u'a' && c<=u'z') || (c>=u'A' && c<=u'Z') || (c>=u'0' && c<=u'9') || c==u'-' || c==u'+' || c==u'.'))break;++at;}
+    while(at<url.size()){const auto c=url[at];if(!((c>=u'a' && c<=u'z') || (c>=u'A' && c<=u'Z') || (c>=u'0' && c<=u'9') || c==u'-' || c==u'+' || c==u'.' || (unicode && u_isalnum(c))))break;++at;}
     return at<url.size() && url[at]==u':' && at>1?at:0;
 }
 bool alnum(char16_t c){return (c>=u'a' && c<=u'z') || (c>=u'A' && c<=u'Z') || (c>=u'0' && c<=u'9');}
@@ -147,6 +148,17 @@ std::optional<std::u16string> path_from_url(std::u16string_view url){
 // UrlCanonicalize：可選先解除編碼；scheme 轉小寫，階層式 URL 的 '\' 改成 '/' 並移除 "."／".."（URL_DONT_SIMPLIFY 除外），最後依旗標編碼。
 // URL_WININET_COMPATIBILITY：WinINet 的 InternetCanonicalizeUrl／InternetCombineUrl 只在 URL_ESCAPE_UNSAFE（即未指定 ICU_NO_ENCODE）時才編碼，預設不再單獨編碼空白。
 constexpr std::uint32_t canon_unescape=0x10000000U,canon_escape_unsafe=0x20000000U,canon_dont_simplify=0x08000000U,canon_dos_path=0x00200000U,canon_wininet=0x80000000U;
+std::optional<std::u16string> apply_scheme(const std::u16string& url,std::uint32_t flags){
+    if(url_parts(url) && !(flags&8U) && !dos_path(url))return {};
+    if((flags&4U) && dos_path(url))return url_from_path(url);
+    if(flags&2U){
+        const auto host=lower(url);
+        if(host.starts_with(u"www."))return u"http://"+url;
+        if(host.starts_with(u"ftp."))return u"ftp://"+url;
+    }
+    if(flags&1U)return u"http://"+url;
+    return {};
+}
 std::u16string url_canonicalize(std::u16string text,std::uint32_t flags){
     if((flags&canon_dos_path) && dos_path(text))text=url_from_path(text);
     if(flags&canon_unescape)text=url_unescape(text,0);
@@ -198,6 +210,7 @@ std::u16string url_unescape(std::u16string_view url,std::uint32_t flags){
 std::span<const WindowsServiceDescriptor> url_service_descriptors(){
     static constexpr WindowsServiceDescriptor table[]{
         {"shlwapi.dll","UrlEscapeA",4},{"shlwapi.dll","UrlEscapeW",4},{"shlwapi.dll","UrlUnescapeA",4},{"shlwapi.dll","UrlUnescapeW",4},
+        {"shdocvw.dll","#169",4},{"shdocvw.dll","#170",4},
         {"shlwapi.dll","ParseURLA",2},{"shlwapi.dll","ParseURLW",2},{"shlwapi.dll","UrlGetPartA",5},{"shlwapi.dll","UrlGetPartW",5},{"shlwapi.dll","UrlIsA",2},{"shlwapi.dll","UrlIsW",2},
         {"shlwapi.dll","UrlIsOpaqueA",1},{"shlwapi.dll","UrlIsOpaqueW",1},{"shlwapi.dll","UrlIsNoHistoryA",1},{"shlwapi.dll","UrlIsNoHistoryW",1},
         {"shlwapi.dll","UrlCanonicalizeA",4},{"shlwapi.dll","UrlCanonicalizeW",4},{"shlwapi.dll","UrlCombineA",5},{"shlwapi.dll","UrlCombineW",5},
@@ -209,9 +222,10 @@ std::span<const WindowsServiceDescriptor> url_service_descriptors(){
 // URL 家族的字串輸出共用 output：容量以字元計並含 NUL。
 // A 版本的位元組逐一對應 0～255 的碼元處理，0x80 以上以原位元組轉義（不換碼頁）；UTF-8 選項只用於 W 版本。
 std::optional<std::uint32_t> WindowsServices::invoke_url(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service){
-    const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool wide=name.ends_with('W');
+    const WindowsCall arg(state,memory,service);const auto name=service.symbol;const bool outside=service.family=="shdocvw.dll";
+    const bool wide=name.ends_with('W') || (outside && name=="#170");
     const auto done=[&](std::uint32_t value){arg.return_to(state,value);return std::optional<std::uint32_t>{};};
-    const auto flags=static_cast<std::uint32_t>(arg(3));const bool escape=name.starts_with("UrlEscape");
+    const auto flags=service.arguments>=4?static_cast<std::uint32_t>(arg(3)):0U;const bool escape=name.starts_with("UrlEscape");
     const auto read=[&](std::uint64_t address){
         if(wide)return read_utf16(memory,GuestAddress{address},32768);
         std::u16string text;for(const auto c:read_ansi(memory,address,32768))text.push_back(static_cast<unsigned char>(c));return text;
@@ -237,11 +251,23 @@ std::optional<std::uint32_t> WindowsServices::invoke_url(GuestState& state,Guest
         case 6:return url.find(u'?')!=url.npos;
         default:return false;}};
     try{
+        if(outside){
+            if(!arg(0) || !arg(2))return done(0);
+            const auto source=read(arg(0));
+            auto applied=apply_scheme(source,3);
+            const auto text=url_canonicalize(applied?std::move(*applied):source,escape_spaces_only);
+            const auto capacity=memory.load(GuestAddress{arg(2)},32);
+            const auto needed=static_cast<std::uint32_t>(text.size()+1);
+            if(capacity<needed){memory.store(GuestAddress{arg(2)},32,needed);return done(0);}
+            if(arg(1))write(arg(1),text);
+            memory.store(GuestAddress{arg(2)},32,needed-1);
+            return done(arg(1)?(wide?1U:needed):0U);
+        }
         if(name.starts_with("ParseURL")){
             // PARSEDURL：cbSize、pszProtocol、cchProtocol、pszSuffix、cchSuffix、nScheme；指標指向輸入字串內部。
             const unsigned unit=x86_?4U:8U,size=x86_?24U:40U,scheme_at=x86_?20U:36U;if(!arg(1))return done(url_invalid);if(memory.load(GuestAddress{arg(1)},32)!=size)return done(url_invalid);
-            if(!arg(0))return done(0x80041001U);const auto url=read(arg(0));const auto length=url_scheme(url);
-            if(!length){memory.store(GuestAddress{arg(1)+scheme_at},32,UINT32_MAX);return done(0x80041001U);}
+            if(!arg(0))return done(0x80041001U);const auto url=read(arg(0));const auto length=url_scheme(url,wide);
+            if(!length){memory.store(GuestAddress{arg(1)+unit},x86_?32:64,0);return done(0x80041001U);}
             const auto at=[&](std::size_t offset){return arg(0)+offset*(wide?2U:1U);};
             memory.store(GuestAddress{arg(1)+unit},x86_?32:64,at(0));memory.store(GuestAddress{arg(1)+unit*2},32,length);
             memory.store(GuestAddress{arg(1)+unit*3},x86_?32:64,at(length+1));memory.store(GuestAddress{arg(1)+unit*4},32,url.size()-length-1);
@@ -288,12 +314,10 @@ std::optional<std::uint32_t> WindowsServices::invoke_url(GuestState& state,Guest
             arg.return_to(state,arg(0)+url.find(u'#')*(wide?2U:1U));return std::nullopt;
         }
         if(name.starts_with("UrlApplyScheme")){
-            // URL_APPLY_DEFAULT 1、GUESSSCHEME 2、GUESSFILE 4、FORCEAPPLY 8：已有 scheme 且未 FORCEAPPLY 時回 S_FALSE。
-            if(!arg(0))return done(url_invalid);const auto url=read(arg(0));const auto apply=static_cast<std::uint32_t>(arg(3));
-            if(url_parts(url) && !(apply&8U) && !dos_path(url))return done(1);
-            if((apply&4U) && dos_path(url))return output(arg(1),arg(2),url_from_path(url));
-            if(apply&2U){const auto host=lower(url);if(host.starts_with(u"www."))return output(arg(1),arg(2),u"http://"+url);if(host.starts_with(u"ftp."))return output(arg(1),arg(2),u"ftp://"+url);}
-            if(apply&1U)return output(arg(1),arg(2),u"http://"+url);return done(1);
+            if(!arg(0))return done(url_invalid);
+            const auto applied=apply_scheme(read(arg(0)),flags);
+            if(!applied)return done(1);
+            return output(arg(1),arg(2),*applied);
         }
         if(escape){
             if(!arg(0) || !arg(1) || !arg(2) || !memory.load(GuestAddress{arg(2)},32))return done(url_invalid);
@@ -306,6 +330,6 @@ std::optional<std::uint32_t> WindowsServices::invoke_url(GuestState& state,Guest
         const auto result=url_unescape(read(arg(0)),wide?flags:flags&~escape_utf8);
         if(inplace){write(arg(0),result);return done(0);}
         return output(arg(1),arg(2),result);
-    }catch(const MemoryFault&){return done(url_invalid);}
+    }catch(const MemoryFault&){return done(outside?0U:url_invalid);}
 }
 }

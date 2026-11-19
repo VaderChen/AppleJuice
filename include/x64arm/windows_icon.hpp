@@ -4,6 +4,7 @@
 #include <optional>
 
 namespace x64arm {
+GuiBitmap decode_bitmap_file(std::span<const std::uint8_t> bytes);
 struct IconChoice {std::size_t offset{};std::uint32_t width{},height{},depth{},id{};};
 IconChoice choose_icon(std::span<const std::uint8_t>,bool cursor,bool file,
                        std::uint32_t width,std::uint32_t height,bool monochrome=false,bool prefer_larger=false);
@@ -24,6 +25,7 @@ inline constexpr bool gui_system_cursor_id(std::uint64_t id){
     case 32646:case 32648:case 32649:case 32650:case 32651:case 32671:case 32672:return true;default:return false;}
 }
 std::span<const std::uint32_t> stock_icon_ids();
+std::optional<GuiIcon> resolve_system_cursor(const GuiState&,std::uint64_t handle);
 bool stock_icon_valid(std::uint32_t);
 inline constexpr std::u16string_view stock_icon_path=u"C:\\Windows\\System32\\MacWinStockIcons.dll";
 bool is_stock_icon_path(std::u16string_view);

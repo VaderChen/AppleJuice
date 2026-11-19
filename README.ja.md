@@ -142,7 +142,7 @@ AppleJuice で Steam を選択し、ヘッドフォン空間ミックス、2 倍
 
 AppleJuice のライブラリに登録したゲームは、EXE ごとの表示設定を優先します。未登録のゲームはランチャーの現在の表示設定を引き継ぎます。空間音声は全体設定です。同じ処理を他のランチャーにも適用し、ゲーム名による例外は設けません。
 
-## 動作確認の記録 / 2026-11-17 / 全 23 本のゲーム
+## 動作確認の記録 / 2026-11-19 / 全 24 本のゲーム
 
 <img src="docs/images/support-levels/none.png" width="16" height="16" alt="動作不可・対応中" title="動作不可・対応中"> 動作不可・対応中　<img src="docs/images/support-levels/menu.png" width="16" height="16" alt="起動可" title="起動可"> 起動可　<img src="docs/images/support-levels/slow.png" width="16" height="16" alt="低効率" title="低効率"> 低効率　<img src="docs/images/support-levels/metalfx.png" width="16" height="16" alt="良好（MetalFX）" title="良好（MetalFX）"> 良好（MetalFX）　<img src="docs/images/support-levels/good.png" width="16" height="16" alt="良好" title="良好"> 良好
 
@@ -152,6 +152,7 @@ AppleJuice のライブラリに登録したゲームは、EXE ごとの表示�
 | Geekbench 7 | x64 | CPU | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | Memelis' RPG | x86 | RPG Maker MV | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | WinRAR | x64 | Win32 GUI | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
+| イースVIII -Lacrimosa of DANA- | x64 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | オクトパストラベラーII | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | トゥームレイダー（2013） | x86 | D3D11 | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |
 | ドラゴンクエストIII　そして伝説へ… | x64 | D3D11（Unreal Engine 4） | <img src="docs/images/support-levels/good.png" width="20" height="20" alt="良好" title="良好"> |

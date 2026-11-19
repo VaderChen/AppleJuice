@@ -1256,6 +1256,8 @@ struct GuiState : GuiStationNamespace {
     std::map<std::uint32_t,std::uint64_t> ole_drag_cursors;
     std::int32_t mouse_drag_width{4},mouse_drag_height{4};
     std::uint32_t mouse_hover_width{4},mouse_hover_height{4},mouse_hover_time{400};
+    bool drag_full_windows{true},minimize_animation{true};
+    std::uint64_t ui_preferences{0x1280000010ULL}; // UserPreferencesMask 的預設位元。
     bool font_smoothing{true};
     bool ghosting_disabled{};
     std::uint32_t font_smoothing_type{2},font_smoothing_contrast{1400},font_smoothing_orientation{1};

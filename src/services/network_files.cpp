@@ -24,11 +24,23 @@ std::uint32_t NetworkFiles::add(const std::string& scope,std::shared_ptr<Network
 }
 std::uint32_t NetworkFiles::remove(const std::string& scope,std::u16string_view name,bool force){
     const auto key=network_resources::canonical(std::u16string(name));std::lock_guard lock(mutex_);const auto session=sessions_.find(scope);if(session==sessions_.end())return 2250;
-    auto& values=session->second;const auto found=std::find_if(values.begin(),values.end(),[&](const auto& row){return network_resources::canonical(row->remote)==key || (row->drive && key==std::u16string(1,static_cast<char16_t>(row->drive+32))+u":");});
-    if(found==values.end())return 2250;if(!force && (*found)->leases.load(std::memory_order_acquire))return 2404;
-    // 相同 share 的其他本機名稱仍可能使用此掛載；最後一個連線才關閉原生資源。
-    const auto mount=(*found)->mount;const bool last=std::count_if(values.begin(),values.end(),[&](const auto& row){return row->mount==mount;})==1;
-    if(last){const auto error=mount->disconnect(force);if(error)return error;}values.erase(found);return 0;
+    auto& values=session->second;
+    const auto matches=[&](const auto& row){
+        if(row->drive)return key==std::u16string(1,static_cast<char16_t>(row->drive+32))+u":";
+        return network_resources::canonical(row->remote)==key;
+    };
+    if(std::none_of(values.begin(),values.end(),matches))return 2250;
+    if(!force && std::any_of(values.begin(),values.end(),[&](const auto& row){
+        return matches(row) && row->leases.load(std::memory_order_acquire);
+    }))return 2404;
+    for(auto it=values.begin();it!=values.end();){
+        if(!matches(*it)){++it;continue;}
+        const auto& mount=(*it)->mount;
+        const bool last=std::count_if(values.begin(),values.end(),[&](const auto& row){return row->mount==mount;})==1;
+        if(last){const auto error=mount->disconnect(force);if(error)return error;}
+        it=values.erase(it);
+    }
+    return 0;
 }
 std::shared_ptr<void> NetworkFiles::lease(std::shared_ptr<NetworkFileBinding> binding){
     struct Lease {std::shared_ptr<NetworkFileBinding> row;explicit Lease(std::shared_ptr<NetworkFileBinding> value):row(std::move(value)){row->leases.fetch_add(1,std::memory_order_acq_rel);}~Lease(){row->leases.fetch_sub(1,std::memory_order_acq_rel);}};

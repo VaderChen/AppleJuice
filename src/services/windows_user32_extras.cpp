@@ -231,9 +231,11 @@ std::optional<std::uint32_t> WindowsServices::invoke_user32_extra(GuestState& st
         // ICONINFOEX：ICONINFO 欄位後接 wResID、szModName[MAX_PATH]、szResName[MAX_PATH]（A 為字元、W 為 WCHAR）。
         const bool wide=name.ends_with('W');const unsigned unit=x86_?4U:8U,fixed=16+2*unit,character=wide?2U:1U;
         const auto size=(fixed+2+520*character+unit-1)/unit*unit;if(!arg(1) || memory.load(GuestAddress{arg(1)},32)!=size){last_error_=87;return done(0);}
-        const auto icon=gui_.icons.find(arg(0));if(icon==gui_.icons.end()){last_error_=1402;return done(0);}
-        const auto resource_instance=icon->second.resource_instance;const auto resource_id=icon->second.resource_name_id;const auto resource_name=icon->second.resource_name;
         GuestScratch scratch(*this,memory,state);const auto info=scratch.allocate(x86_?20:32);if(!host("user32.dll","GetIconInfo",{arg(0),info}))return done(0);
+        const auto icon=gui_.icons.find(arg(0));
+        const auto resource_instance=icon==gui_.icons.end()?0:icon->second.resource_instance;
+        const auto resource_id=icon==gui_.icons.end()?static_cast<std::uint32_t>(arg(0)-0xd000):icon->second.resource_name_id;
+        const auto resource_name=icon==gui_.icons.end()?std::u16string{}:icon->second.resource_name;
         memory.store(GuestAddress{arg(1)+4},32,memory.load(GuestAddress{info},32));memory.store(GuestAddress{arg(1)+8},32,memory.load(GuestAddress{info+4},32));memory.store(GuestAddress{arg(1)+12},32,memory.load(GuestAddress{info+8},32));
         memory.store(GuestAddress{arg(1)+16},x86_?32:64,memory.load(GuestAddress{info+(x86_?12U:16U)},x86_?32:64));memory.store(GuestAddress{arg(1)+16+unit},x86_?32:64,memory.load(GuestAddress{info+(x86_?16U:24U)},x86_?32:64));
         memory.store(GuestAddress{arg(1)+fixed},16,resource_id);memory.fill(GuestAddress{arg(1)+fixed+2},0,520*character);

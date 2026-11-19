@@ -697,6 +697,8 @@ struct RuntimeState {
     std::map<std::uint64_t,CrtJumpOperation> crt_jump_operations;
     std::uint64_t next_crt_jump_operation{1};
     std::map<std::uint64_t,RuntimeModule> resource_modules;
+    // 每次 MLSetMLHInstance 都登記一筆，MLClearMLHInstance 僅移除一次登記。
+    std::multimap<std::uint64_t,std::uint16_t> multilingual_modules;
     // 只有共用邊緣頁需要 reference count；大型配置內部的完整頁可整段映射／釋放。
     std::map<std::uint64_t,std::uint32_t> heap_pages;
     std::map<std::uint64_t,std::uint64_t> heap_generations;

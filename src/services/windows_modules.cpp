@@ -112,7 +112,7 @@ const auto& builtin_layouts(){
         for(const auto name:modern_crt_libraries)names.emplace(name);
         for(const auto name:legacy_crt_libraries)names.emplace(name);
         for(const auto& [family,exports]:catalog){(void)exports;
-            if(family.ends_with(".dll") || family.ends_with(".drv") || family.ends_with(".ocx") || family.ends_with(".cpl") || family.ends_with(".exe"))names.emplace(family);
+            if(family.ends_with(".dll") || family.ends_with(".drv") || family.ends_with(".ocx") || family.ends_with(".cpl") || family.ends_with(".exe") || family.ends_with(".exe16"))names.emplace(family);
         }
         std::map<std::string,BuiltinLayout> result;std::size_t next=0;
         const auto align=[](std::size_t value){return (value+4095)&~std::size_t{4095};};
@@ -289,6 +289,7 @@ GuestAddress WindowsServices::builtin_constant_address(std::string_view family,s
     return GuestAddress{base+detail::builtin_constant_rva+offset};
 }
 bool WindowsServices::builtin_module(std::string_view name) const {
+    if(!detail::builtin_arch_supported(name,x86_))return false;
     if(name=="riched20.dll" || name=="riched32.dll")return true;
     if(angle_module(name))return native_angle_!=nullptr;
     if(native_library_module(name))return native_libraries_.enabled(name);

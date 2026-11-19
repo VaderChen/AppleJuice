@@ -5,12 +5,22 @@ x64arm_hlslcc_patch(../include/ShaderInfo.h
   "    uint32_t ui32RangeID;"
   "    uint32_t ui32RangeID;\n    uint32_t ui32SourceBindPoint = 0;")
 # SM5.1 的大暫存器編號與不同 space 先由正規化器處理，避免反射階段以原始編號配置巨型索引表。
+# 判斷必須與正規化器相同（只有 5.1）：舊版寫成「次版本為 0」，SM4.1（vs_4_1／ps_4_1）因此沒有繫結點→常數緩衝對應，
+# cb1 以上全對到索引 0 的緩衝，Metal 端重複宣告 CB0、找不到 CB1，CreateVertexShader 失敗（伊蘇 VIII 新遊戲時崩潰）。
+# 已修補過的樹先把舊條件換成新條件，下方修補才會判定為已套用。
+file(READ "${hlslcc_SOURCE_DIR}/src/reflect.cpp" x64arm_reflect_source)
+string(REPLACE "if (psShaderInfo->ui32MinorVersion == 0) "
+  "if (psShaderInfo->ui32MajorVersion != 5 || psShaderInfo->ui32MinorVersion != 1) "
+  x64arm_reflect_migrated "${x64arm_reflect_source}")
+if(NOT x64arm_reflect_migrated STREQUAL x64arm_reflect_source)
+  file(WRITE "${hlslcc_SOURCE_DIR}/src/reflect.cpp" "${x64arm_reflect_migrated}")
+endif()
 x64arm_hlslcc_patch(reflect.cpp
   "        ASSERT(psResBindings[i].ui32BindPoint < MAX_RESOURCE_BINDINGS);"
-  "        if (psShaderInfo->ui32MinorVersion == 0) ASSERT(psResBindings[i].ui32BindPoint < MAX_RESOURCE_BINDINGS);")
+  "        if (psShaderInfo->ui32MajorVersion != 5 || psShaderInfo->ui32MinorVersion != 1) ASSERT(psResBindings[i].ui32BindPoint < MAX_RESOURCE_BINDINGS);")
 x64arm_hlslcc_patch(reflect.cpp
   "                    psShaderInfo->aui32ResourceMap[eRGroup][psResBindings[i].ui32BindPoint] = cbufIndex;"
-  "                    if (psShaderInfo->ui32MinorVersion == 0) psShaderInfo->aui32ResourceMap[eRGroup][psResBindings[i].ui32BindPoint] = cbufIndex;")
+  "                    if (psShaderInfo->ui32MajorVersion != 5 || psShaderInfo->ui32MinorVersion != 1) psShaderInfo->aui32ResourceMap[eRGroup][psResBindings[i].ui32BindPoint] = cbufIndex;")
 x64arm_hlslcc_patch(decode.cpp
   "uint32_t DecodeOperand(const uint32_t *pui32Tokens, Operand* psOperand)"
   "#include \"x64arm_sm51_resources.inc\"\n\nuint32_t DecodeOperand(const uint32_t *pui32Tokens, Operand* psOperand)")

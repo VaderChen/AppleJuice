@@ -4,6 +4,8 @@
 
 namespace x64arm {
 struct MprState {
+    struct ExtendedError {std::uint32_t code{};std::u16string description,provider;};
+    std::map<std::uint64_t,ExtendedError> errors;
     struct Enumeration {std::string scope;std::vector<network_resources::Resource> values;std::size_t position{};};
     std::shared_ptr<network_resources::Backend> backend;
     std::map<std::uint64_t,Enumeration> enumerations;

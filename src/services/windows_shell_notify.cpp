@@ -204,12 +204,27 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_notification(GuestSta
             if(!wide && ansi.size()>=248)return finish(206);
             const auto path=wide?read_utf16(memory,GuestAddress{arg(1)}):utf8_to_utf16(ansi);
             if(path.size()>=248)return finish(206);auto destination=canonical(path);if(destination.empty())return finish(161);
-            const auto security=synchronization_security(memory,symbol=="SHCreateDirectory"?0:arg(2),x86_);if(security.error)return finish(security.error);
+            const auto attributes=symbol=="SHCreateDirectory"?0:arg(2);
+            std::vector<std::uint8_t> descriptor;
+            if(attributes){
+                try{descriptor=file_creation_descriptor(memory,attributes);}
+                catch(const SecurityDescriptorError& error){return finish(error.code);}
+            }
             if(filesystem_.writable() && !runtime_.network.external_io)throw HostCallFault("比較模式不允許宿主 Shell 目錄建立");
             const auto existing=filesystem_.information(utf16_to_utf8(destination));if(!existing.error)return finish(183);
             for(std::size_t at=3;at<=destination.size();++at)if(at==destination.size() || destination[at]==u'\\'){
                 const auto prefix=destination.substr(0,at);const auto info=filesystem_.information(utf16_to_utf8(prefix));
-                if(info.error){const auto error=filesystem_.create_directory(utf16_to_utf8(prefix));if(error && error!=183)return finish(error);const auto verify=filesystem_.information(utf16_to_utf8(prefix));if(verify.error)return finish(verify.error);if(!(verify.metadata.attributes&16))return finish(3);if(!error)shell_notify(memory,8,{prefix,{}},false);}
+                if(info.error){
+                    // 中間目錄繼承父層權限，只有指定的最末目錄套用呼叫端的描述元。
+                    const bool leaf=at==destination.size();
+                    const auto name=utf16_to_utf8(prefix);
+                    const auto error=leaf && attributes?filesystem_.create_directory(name,[&]{return descriptor;}):filesystem_.create_directory(name);
+                    if(error && (error!=183 || leaf))return finish(error);
+                    if(!error)shell_notify(memory,8,{prefix,{}},false);
+                    const auto verify=filesystem_.information(name);
+                    if(verify.error)return finish(verify.error);
+                    if(!(verify.metadata.attributes&16))return finish(3);
+                }
                 else if(!(info.metadata.attributes&16))return finish(3);
                 const auto visible=filesystem_.list(utf16_to_utf8(prefix));if(visible.error)return finish(visible.error==5?1223:visible.error);
             }

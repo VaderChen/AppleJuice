@@ -18,6 +18,32 @@ namespace detail {const WindowsServiceDescriptor* runtime_stub_descriptor(GuestA
 enum class D3D11StreamClass:std::uint8_t {Other,Sync,NoDrain,Release,Map,GetData,GetTargets,Query,Unmap,Update,Copy,Scalar,Shader,Constants,Pointers,VertexBuffers,Viewports,Scissors,Blend,Uavs,Targets,TargetsUavs,Clear,ClearDepth,Present};
 // 目前這條宿主執行緒是串流執行緒（Present 的處理程式不能讓客體執行緒等待，也不是客體執行緒）。
 thread_local bool d3d11_on_stream_thread=false;
+// 延遲內容（ID3D11DeviceContext，CreateDeferredContext 建立）的登錄表：延遲內容只錄製自己的命令清單，處理程式只動該內容的繫結與
+// 命令（裝置層資料在圖形鎖下存取），與立即內容串流中尚未處理的命令沒有先後關係——D3D11 物件底下的資源身分只在建立時指定，
+// 內容更新的順序由 ExecuteCommandList 實際執行時決定。串流入口認得它之後不必先等立即內容的佇列清空（Control 的多條錄製
+// 執行緒原本每幀約 70 次、合計約 7 ms 等在這裡）。無鎖讀取：建立時加入、最後一次釋放時移除；表滿或用其他介面指標呼叫時
+// 查不到，沿用原本的清空。X64ARM_D3D11_STREAM_DEFERRED_NO_DRAIN=0 關閉（同成品對照）。
+struct D3D11DeferredContexts {
+    std::array<std::atomic<std::uint64_t>,64> items{};
+    bool add(std::uint64_t pointer) noexcept {
+        if(!pointer || contains(pointer))return pointer!=0;
+        for(auto& item:items){std::uint64_t empty=0;if(item.compare_exchange_strong(empty,pointer,std::memory_order_acq_rel))return true;}
+        return false;
+    }
+    void remove(std::uint64_t pointer) noexcept {
+        if(pointer)for(auto& item:items){auto expected=pointer;(void)item.compare_exchange_strong(expected,0,std::memory_order_acq_rel);}
+    }
+    bool contains(std::uint64_t pointer) const noexcept {
+        if(!pointer)return false;
+        for(const auto& item:items)if(item.load(std::memory_order_acquire)==pointer)return true;
+        return false;
+    }
+};
+D3D11DeferredContexts& d3d11_deferred_contexts() noexcept {static D3D11DeferredContexts value;return value;}
+bool d3d11_deferred_no_drain(std::uint64_t pointer) noexcept {
+    static const bool enabled=[] {const auto* value=std::getenv("X64ARM_D3D11_STREAM_DEFERRED_NO_DRAIN");return !value || std::string_view(value)!="0";}();
+    return enabled && d3d11_deferred_contexts().contains(pointer);
+}
 struct D3D11CommandStream;
 void d3d11_stream_resident_detach(const D3D11CommandStream*) noexcept;
 // 持久映射前端路徑的對應表（擁有者私有）：固定 16384 格開放定址（乘法雜湊取高 shift 位元、線性探查），核心常駐入口（resident_d3d11_arm64.inc 類別 6／7）
@@ -242,7 +268,8 @@ D3D11StreamClass d3d11_stream_class(std::string_view symbol) noexcept {
     }
     // 只讀建立時就固定的描述或物件自己的欄位，與佇列裡的命令無關；裝置建立只新增物件。協調者路徑另依 d3d11_stream_needs_drain 判斷。
     constexpr std::string_view no_drain[]{"BufferGetDesc","Texture1DGetDesc","Texture3DGetDesc","GraphicsGetDesc","TextureGetDesc","GetResource","SetPrivateData","GetFullscreenState",
-        "QueryVideoMemoryInfo","SetVideoMemoryReservation","AddRef","QueryInterface","GetDevice","GetParent","GetDesc","GetImmediateContext","CreateBuffer"};
+        "QueryVideoMemoryInfo","SetVideoMemoryReservation","AddRef","QueryInterface","GetDevice","GetParent","GetDesc","GetImmediateContext","CreateBuffer",
+        "ResourceGetType"}; // ResourceGetType：資源維度建立後不變（Control 每幀數次由錄製執行緒查詢）。
     if(display_identity::adapter_description_size(symbol,false) && display_identity::parallel_graphics_descriptions())return D3D11StreamClass::NoDrain;
     if(std::find(std::begin(no_drain),std::end(no_drain),symbol)!=std::end(no_drain))return D3D11StreamClass::NoDrain;
     return D3D11StreamClass::Sync;
@@ -600,7 +627,7 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
         };
         switch(kind){
         case D3D11StreamClass::Map:{
-            if(!owner32)return sync32();
+            if(!owner32){if(d3d11_deferred_no_drain(self))return D3D11StreamStep::Continue;return sync32();}
             // Map(this, pResource, Subresource, MapType, MapFlags, pMappedResource)。
             std::array<std::uint32_t,7> map{};if(!read_frame(map.data(),map.size()))return sync32();
             const bool do_not_wait=(map[5]&0x100000U)!=0;
@@ -659,7 +686,7 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
         case D3D11StreamClass::TargetsUavs:break;
         default:return sync32();
         }
-        if(!owner32)return sync32();
+        if(!owner32){if(d3d11_deferred_no_drain(self))return D3D11StreamStep::Continue;return sync32();}
         // 環滿：與 x64 相同不持鎖等出八分之一的空位。
         const auto head=stream.head.load(std::memory_order_relaxed);
         if(head-stream.cached_tail>=stream.slots){
@@ -818,6 +845,8 @@ WindowsServices::D3D11StreamStep WindowsServices::d3d11_stream_entry(GuestState&
         d3d11_stream_drain();
         return D3D11StreamStep::Coordinator;
     }
+    // 延遲內容的呼叫不屬於這條串流，也不依賴它的進度：直接走一般處理，不清空。
+    if(!owner && kind!=D3D11StreamClass::Sync && d3d11_deferred_no_drain(state.reg(Gpr::Rcx)))return D3D11StreamStep::Continue;
     if(!owner || kind==D3D11StreamClass::Sync)return sync();
     if(kind==D3D11StreamClass::Map){
         // 同一資源的 Unmap 還沒處理時，客體不能拿到（同一塊）區塊來寫。Map 本身照常同步，不依賴其他命令。DO_NOT_WAIT 不等（見 d3d11_map_do_not_wait）。

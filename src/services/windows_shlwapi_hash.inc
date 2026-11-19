@@ -1,8 +1,7 @@
 // shlwapi 雜湊與路徑字元（由 windows_shlwapi_misc.cpp 的 invoke_shlwapi_misc 引入；kernelbase 經別名共用）：
 // - HashData：Pearson 雜湊，每個輸出位元組 i 以 T[(data[0]+i)&255] 起始、依序以 T[h^data[j]] 混入其餘輸入；T 為固定的 0～255 排列。
 // - UrlHashA／W：對 URL 的 ANSI 位元組（W 版先轉 ACP）做 HashData；輸出長度 1～256。
-// - PathIsValidCharA／W：控制字元與 < > | 永遠無效；? * . \ / : ; , 空白 " 依 PIVC_ALLOW_* 旗標；英數字與非 ASCII 字元有效；
-//   其他標點需要 PIVC_ALLOW_NONALPAHABETIC。
+// - PathIsValidCharA／W：回傳呼叫端遮罩與碼元類別的交集。
 // - SHTruncateString：截斷 ANSI 字串到緩衝區長度減一，不切開多位元組字元（ACP 為 UTF-8），回傳結果長度。
 if(name=="HashData" || name.starts_with("UrlHash")){
     static const auto table=[]{
@@ -31,15 +30,8 @@ if(name=="HashData" || name.starts_with("UrlHash")){
     return done(0);
 }
 if(name.starts_with("PathIsValidChar")){
-    // (ch, dwFlags)：A 版為 UCHAR，W 版為 WCHAR。
-    const auto ch=name.ends_with('W')?static_cast<std::uint32_t>(u32(0)&0xffffU):static_cast<std::uint32_t>(u32(0)&0xffU);const auto flags=u32(1);
-    if(ch<0x20 || ch==0x7f || ch=='<' || ch=='>' || ch=='|')return done(0);
-    std::uint32_t needed=0;
-    switch(ch){case '?':needed=0x1;break;case '*':needed=0x2;break;case '.':needed=0x4;break;case '\\':case '/':needed=0x8;break;case ':':needed=0x10;break;
-        case ';':needed=0x20;break;case ',':needed=0x40;break;case ' ':needed=0x80;break;case '"':needed=0x200;break;default:break;}
-    const bool alphanumeric=(ch>='0' && ch<='9') || (ch>='A' && ch<='Z') || (ch>='a' && ch<='z') || ch>=0x80;
-    if(!needed && !alphanumeric)needed=0x100;
-    return done(!needed || (flags&needed)?1U:0U);
+    const auto ch=u32(0)&(name.ends_with('W')?0xffffU:0xffU);
+    return done(u32(1)&path_character_class(ch));
 }
 if(name=="SHTruncateString"){
     // (psz, cchBufferSize)：字串已經放得下時不變。

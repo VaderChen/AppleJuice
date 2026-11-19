@@ -1,7 +1,7 @@
         // 命令保存完整繪製狀態及資料快照；錄製期間不提交 GPU，也不保留客體暫存指標。
         if(!graphics_handled && symbol=="CreateDeferredContext"){
             graphics_handled=true;auto device=typed(arg(0),Kind::Device);require(!u32(1) && !(device->creation_flags&1));
-            if(arg(2)){output(2);write_pointer(arg(2),0);auto context=create(Kind::Context,device->root);context->context_type=1;write_pointer(arg(2),context->root);}
+            if(arg(2)){output(2);write_pointer(arg(2),0);auto context=create(Kind::Context,device->root);context->context_type=1;(void)d3d11_deferred_contexts().add(context->root);write_pointer(arg(2),context->root);}
             else result=1;
         }else if(!graphics_handled && symbol=="FinishCommandList"){
             graphics_handled=true;auto context=typed(arg(0),Kind::Context);

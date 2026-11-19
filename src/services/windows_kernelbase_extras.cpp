@@ -51,6 +51,22 @@ std::optional<std::uint32_t> WindowsServices::invoke_kernelbase_extras(GuestStat
         });
     const WindowsCall arg(state,memory,service);const auto name=service.symbol;std::uint64_t result=0;
     const auto api=[&](std::string_view dll,std::string_view symbol,std::initializer_list<std::uint64_t> arguments){return nested_service(state,memory,dll,symbol,arguments);};
+    if(name.starts_with("StrCpyNX")){
+        const unsigned unit=name.ends_with('W')?2U:1U;
+        const auto bits=static_cast<std::uint8_t>(unit*8);
+        auto dst=arg(0),src=arg(1);
+        auto remaining=static_cast<std::int32_t>(arg(2));
+        if(dst && src && remaining>0){
+            while(--remaining){
+                const auto ch=memory.load(GuestAddress{src},bits);
+                if(!ch)break;
+                memory.store(GuestAddress{dst},bits,ch);
+                dst+=unit;src+=unit;
+            }
+            memory.store(GuestAddress{dst},bits,0);
+        }
+        arg.return_to(state,dst);return std::nullopt;
+    }
     try {
         if(name=="VirtualAllocFromApp"){
             if(static_cast<std::uint32_t>(arg(3))&0xf0U){last_error_=87;result=0;}
@@ -66,16 +82,9 @@ std::optional<std::uint32_t> WindowsServices::invoke_kernelbase_extras(GuestStat
                 const auto host=windows_api_set_host(contract);
                 result=(contract.starts_with("api-ms-") || contract.starts_with("ext-ms-")) && host!=contract && builtin_module(host)?1U:0U;
             }
-        }else if(name.starts_with("StrCpyNX")){
-            const bool wide=name.ends_with('W');const unsigned unit=wide?2U:1U;const auto limit=static_cast<std::int32_t>(arg(2));
-            result=arg(0);
-            if(arg(0) && arg(1) && limit>0){
-                std::uint64_t copied=0;
-                for(;copied+1<static_cast<std::uint64_t>(limit);++copied){const auto c=memory.load(GuestAddress{arg(1)+copied*unit},static_cast<std::uint8_t>(unit*8));if(!c)break;memory.store(GuestAddress{arg(0)+copied*unit},static_cast<std::uint8_t>(unit*8),c);}
-                memory.store(GuestAddress{arg(0)+copied*unit},static_cast<std::uint8_t>(unit*8),0);result=arg(0)+copied*unit;
-            }
+
         }
-    }catch(const MemoryFault&){last_error_=998;if(!name.starts_with("StrCpyNX"))result=0;}
+    }catch(const MemoryFault&){last_error_=998;result=0;}
     arg.return_to(state,result);return std::nullopt;
 }
 }

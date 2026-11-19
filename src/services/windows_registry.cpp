@@ -72,6 +72,7 @@ std::span<const WindowsServiceDescriptor> registry_service_descriptors() {
         {"advapi32.dll","RegDeleteKeyExA",4,0,0,0xc},{"advapi32.dll","RegDeleteKeyExW",4,0,0,0xc},
         {"advapi32.dll","RegDeleteTreeA",2},{"advapi32.dll","RegDeleteTreeW",2},
         {"advapi32.dll","RegRenameKey",3},{"advapi32.dll","RegLoadAppKeyA",5,0,0,0x1c},{"advapi32.dll","RegLoadAppKeyW",5,0,0,0x1c},{"advapi32.dll","RegOpenUserClassesRoot",4,0,0,0x6},{"advapi32.dll","RegOverridePredefKey",2},
+        {"internal-shell-registry","SHGetValueGoodBootA",6},{"internal-shell-registry","SHGetValueGoodBootW",6},
         {"shlwapi.dll","SHGetValueA",6},{"shlwapi.dll","SHGetValueW",6},{"shlwapi.dll","SHRegGetUSValueA",8},{"shlwapi.dll","SHRegGetUSValueW",8},
         {"shlwapi.dll","SHDeleteKeyA",2},{"shlwapi.dll","SHDeleteKeyW",2},
         {"advapi32.dll","RegNotifyChangeKeyValue",5,0,0,0x16},{"advapi32.dll","RegCloseKey",1},
@@ -235,8 +236,13 @@ std::uint32_t WindowsServices::rename_registry_key(const RegistryHandle& key,std
 }
 std::optional<std::uint32_t> WindowsServices::invoke_registry(GuestState& state,GuestMemory& memory,const WindowsServiceDescriptor& service) {
     // SHGetValue（hkey, subkey, value, type*, data, size*）：開啟子機碼後交給 SHQueryValueEx，與 Windows 相同地把 REG_EXPAND_SZ 展開成 REG_SZ。
-    if(service.symbol=="SHGetValueA" || service.symbol=="SHGetValueW"){
+    const bool good_boot=service.symbol=="SHGetValueGoodBootA" || service.symbol=="SHGetValueGoodBootW";
+    if(good_boot || service.symbol=="SHGetValueA" || service.symbol=="SHGetValueW"){
         const bool wide=service.symbol.ends_with('W');const WindowsCall arg(state,memory,service);const auto bits=static_cast<std::uint8_t>(x86_?32:64);
+        if(good_boot && system_metric(67)){ // SM_CLEANBOOT：安全模式下不讀寫查詢參數。
+            arg.return_to(state,1); // ERROR_INVALID_FUNCTION
+            return std::nullopt;
+        }
         std::uint64_t key=arg(0);bool opened=false;std::uint32_t result=0;
         {
             GuestScratch scratch(*this,memory,state);

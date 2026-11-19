@@ -38,9 +38,16 @@ public:
     virtual std::uint32_t disconnect(bool force)=0;
 };
 struct Connection {std::shared_ptr<Mount> mount;std::uint32_t error{};};
+// 內建 SMB 重新導向器支援 A: 到 Z:；印表機可列舉，但沒有 LPT 重新導向。
+struct ProviderInfo {
+    std::u16string_view name{provider_name};
+    std::uint32_t network_type{0x00020000},version{0x00050001};
+    std::uint32_t printer_mask{},drive_mask{0x03ffffff};
+};
 class Backend {
 public:
     virtual ~Backend()=default;
+    virtual std::optional<ProviderInfo> provider()const{return ProviderInfo{};}
     virtual Servers servers()=0;
     virtual Shares shares(std::u16string_view server,const Credentials&)=0;
     virtual Connection connect(const Path&,const Credentials&,const std::filesystem::path& destination,bool readonly)=0;

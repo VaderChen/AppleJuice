@@ -113,15 +113,18 @@ if(service.symbol=="SHGetImageList" || service.symbol=="Shell_MergeMenus" || ser
             auto result=directory+name;
             if(!must_copy && !(flags&4U)){
                 const auto stem=name.substr(0,name.size()-((flags&8U)?0:4)),suffix=(flags&8U)?std::u16string{}:name.substr(name.size()-4);
-                for(unsigned copy=2;copy<1000;++copy){
-                    const auto candidate=wide_text(result);if(!candidate)break;
+                const auto candidate=scratch.allocate(260*sizeof(char16_t));
+                if(!candidate)co_return finish(0);
+                for(std::uint64_t copy=2;;++copy){
+                    if(result.size()>=260)co_return finish(0);
+                    m.write(GuestAddress{candidate},utf16_bytes(result));
                     if(co_await service_callback::call(api("kernel32.dll","GetFileAttributesW"),{candidate})==UINT32_MAX)break;
                     const auto number=utf8_to_utf16(std::to_string(copy));
                     result=directory+((flags&2U)?u"Shortcut ("+number+u") to "+stem.substr(12):stem+u" ("+number+u")")+suffix;
                 }
             }
             if(result.size()>=260)co_return finish(0);
-            if(wide)m.write(GuestAddress{call(2)},utf16_bytes(result));else{auto ansi=utf16_to_utf8(result);ansi.push_back(0);m.write(GuestAddress{call(2)},std::span(reinterpret_cast<const std::uint8_t*>(ansi.data()),ansi.size()));}
+            if(wide)m.write(GuestAddress{call(2)},utf16_bytes(result));else{auto ansi=utf16_to_utf8(result);if(ansi.size()>=260)co_return finish(0);ansi.push_back(0);m.write(GuestAddress{call(2)},std::span(reinterpret_cast<const std::uint8_t*>(ansi.data()),ansi.size()));}
             co_return finish(1);
         }
         // SHGetSetFolderCustomSettings(pfcs, pszPath, dwReadWrite)：FCS_READ 1、FCS_FORCEWRITE 2、FCS_WRITE 3（只寫入尚未設定的值）。

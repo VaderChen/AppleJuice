@@ -15,7 +15,7 @@ std::span<const WindowsServiceDescriptor> shell_path_service_descriptors(){
         {"shell32.dll","IsLFNDriveA",1},{"shell32.dll","IsLFNDriveW",1},{"shell32.dll","PathCleanupSpec",2},{"shell32.dll","PathGetShortPath",1},
         {"shell32.dll","PathIsExe",1},{"shell32.dll","PathMakeUniqueName",5,0,0,0x2},{"shell32.dll","PathYetAnotherMakeUniqueName",4},
         {"shell32.dll","PathQualify",1},{"shell32.dll","PathResolve",3,0,0,0x4},
-        {"shell32.dll","SHPathPrepareForWriteA",4,0,0,0x8},{"shell32.dll","SHPathPrepareForWriteW",4,0,0,0x8},{"shell32.dll","SHValidateUNC",3,0,0,0x4},
+        {"shell32.dll","SHPathPrepareForWriteA",4,0,0,0x8},{"shell32.dll","SHPathPrepareForWriteW",4,0,0,0x8},
         {"shell32.dll","CheckEscapesA",2,0,0,0x2},{"shell32.dll","CheckEscapesW",2,0,0,0x2},
         {"shell32.dll","SheChangeDirA",1},{"shell32.dll","SheChangeDirW",1},{"shell32.dll","SheGetDirA",2,0,0,0x1},{"shell32.dll","SheGetDirW",2,0,0,0x1},
         {"shell32.dll","SHQueryRecycleBinA",2},{"shell32.dll","SHQueryRecycleBinW",2},{"shell32.dll","SHEmptyRecycleBinA",3,0,0,0x4},{"shell32.dll","SHEmptyRecycleBinW",3,0,0,0x4},
@@ -117,20 +117,59 @@ std::optional<std::uint32_t> WindowsServices::invoke_shell_paths(GuestState& sta
         return done(write(arg(0),*full)?1U:0U);
     }
     if(name.starts_with("SHPathPrepareForWrite")){
-        // (HWND, punkEnableModless, 路徑, SHPPFW_*)：DIRCREATE 1／ASKDIRCREATE 2 時建立缺少的目錄（不顯示詢問），IGNOREFILENAME 4 先去掉最後一段，MEDIACHECKONLY 0x10 只檢查根目錄。
-        auto path=read(arg(2));const auto flags=u32(3);if(path.empty())return done(0x80070057U);
-        if(flags&4U){const auto slash=path.find_last_of(u'\\');if(slash!=path.npos)path.resize(std::max<std::size_t>(slash,root_of(path).size()));}
-        if(flags&0x10U){const auto root=root_of(path);return done(root.empty() || exists(root)?0U:0x80070015U);} // ERROR_NOT_READY
-        const auto current=attributes(path);if(current!=UINT32_MAX)return done((current&0x10U)?0U:0x8007010bU); // ERROR_DIRECTORY
-        if(!(flags&3U))return done(0x80070003U);
-        const auto text=temporary.text(path);if(!text)return done(0x8007000eU);
-        const auto error=static_cast<std::uint32_t>(nested_service(state,memory,"shell32.dll","SHCreateDirectoryExW",{arg(0),text,0}));
-        return done(!error || error==183?0U:0x80070000U|(error&0xffffU));
-    }
-    if(name=="SHValidateUNC"){
-        // (HWND, UNC 路徑, VALIDATEUNC_*)：只接受 \\server\share 形式，且共用根可以存取。
-        const auto path=read_utf16(memory,GuestAddress{arg(1)},32768);const auto root=path.starts_with(u"\\\\")?root_of(path):std::u16string{};
-        if(root.size()<5 || root.find(u'\\',2)==root.size()-1){last_error_=67;return done(0);}if(!exists(root)){last_error_=67;return done(0);}return done(1); // ERROR_BAD_NET_NAME
+        return nested_continuation(state,memory,"SHPathPrepareForWrite",[this,service,root_of](GuestState& s,GuestMemory& m)->service_callback::Task<std::optional<std::uint32_t>>{
+            const WindowsCall call(s,m,service);
+            const auto finish=[&](std::uint32_t hr){call.return_to(s,hr);return std::optional<std::uint32_t>{};};
+            GuestScratch scratch(*this,m,s);
+            if(!call(2))co_return finish(0x80070057U);
+            auto path=service.symbol.ends_with('A')?utf8_to_utf16_lossy(read_ansi(m,call(2),32768)):read_utf16(m,GuestAddress{call(2)},32768);
+            const auto flags=static_cast<std::uint32_t>(call(3));
+            if(path.empty() || (flags&3U)==3U)co_return finish(0x80070057U);
+            std::replace(path.begin(),path.end(),u'/',u'\\');
+            if(flags&4U){
+                const auto slash=path.find_last_of(u'\\');
+                if(slash==path.npos)path=u".";
+                else path.resize(std::max<std::size_t>(slash,root_of(path).size()));
+            }
+            const auto probe=[this,&path]()->std::uint32_t{
+                const auto info=filesystem_.information(utf16_to_utf8(path));
+                if(info.error)return info.error==2?3U:info.error;
+                return (info.metadata.attributes&16U)?0U:267U;
+            };
+            auto error=probe();
+            if(!error)co_return finish(0);
+            const auto create=[this](GuestState& s,GuestMemory& m,std::uint64_t target)->std::uint32_t{
+                const auto code=static_cast<std::uint32_t>(nested_service(s,m,"shell32.dll","SHCreateDirectoryExW",{0,target,0}));
+                if(code!=183)return code;
+                const auto info=filesystem_.information(utf16_to_utf8(read_utf16(m,GuestAddress{target})));
+                return info.error?info.error:(info.metadata.attributes&16U)?0U:267U;
+            };
+            const bool ask=error==3 && (flags&2U);
+            if(error==3 && (flags&1U)){
+                const auto target=scratch.text(path);
+                if(!target)co_return finish(0x8007000eU);
+                error=create(s,m,target);
+            }
+            if(!error)co_return finish(0);
+            const auto owner=call(0),unknown=call(1);
+            if(!owner || (!ask && (flags&0x10U)))co_return finish(0x80070000U|(ask?1223U:error));
+
+            const auto target=scratch.text(path),title=scratch.text(u"準備目錄");
+            const auto question=scratch.text(u"要建立此目錄嗎？\n"+path),message=scratch.text(u"無法存取目錄：\n"+path);
+            if(!target || !title || !question || !message){call.return_to(s,0x8007000eU);co_return std::nullopt;}
+            const auto box=resolve("user32.dll","MessageBoxW").value;
+            const auto toggle=resolve("shlwapi.dll","#355").value;
+            if(unknown)(void)co_await service_callback::call(toggle,{unknown,0});
+            auto code=error;
+            if(ask){
+                const auto answer=co_await service_callback::call(box,{owner,question,title,0x124U});
+                code=answer==6?create(s,m,target):1223U;
+            }
+            if(code && code!=1223 && !(flags&0x10U))
+                (void)co_await service_callback::call(box,{owner,message,title,0x10U});
+            if(unknown)(void)co_await service_callback::call(toggle,{unknown,1});
+            call.return_to(s,code?0x80070000U|code:0U);co_return std::nullopt;
+        });
     }
     if(name.starts_with("CheckEscapes")){
         // (字串 輸入輸出, 容量)：含空白或命令列特殊字元時加上雙引號；回傳處理後的長度（放不下時不變）。

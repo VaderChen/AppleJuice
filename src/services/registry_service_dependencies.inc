@@ -98,6 +98,7 @@ bool registry_dependent_service(const WindowsServiceDescriptor& service) {
 
     if((family=="ole32.dll" || family=="combase.dll") && one_of(name,{"CoCreateInstance","CoCreateInstanceEx","CoGetClassObject",
         "ProgIDFromCLSID","CLSIDFromProgID","CLSIDFromString","RoGetActivationFactory","RoActivateInstance"}))return true;
+    if(family=="shlwapi.dll" && one_of(name,{"#236","#343","#344"}))return true;
     if(family=="internal-shell-guid" && (name=="GUIDFromStringA" || name=="GUIDFromStringW"))return true;
     if(family=="internal-com-rot" && name=="Register")return true;
     // 外部型別參照會惰性查詢 TypeLib 登錄，包含 COM metadata 與 Invoke。
@@ -123,8 +124,9 @@ bool registry_dependent_service(const WindowsServiceDescriptor& service) {
     if(family=="winhttp.dll" && one_of(name,{"WinHttpOpen","WinHttpSetOption","WinHttpGetDefaultProxyConfiguration",
         "WinHttpSetDefaultProxyConfiguration","WinHttpGetIEProxyConfigForCurrentUser"}))return true;
     if(family=="ws2_32.dll" && (name.starts_with("WSASetService") || name.starts_with("WSALookupServiceBegin")))return true;
-    if(family=="mpr.dll" && (name.starts_with("WNetOpenEnum") || name.starts_with("WNetAddConnection2") ||
-        name.starts_with("WNetCancelConnection2")))return true;
+    if(family=="shell32.dll" && name=="SHValidateUNC")return true;
+    if(family=="mpr.dll" && (name.starts_with("WNetRestoreConnection") || name.starts_with("WNetOpenEnum") || name.starts_with("WNetAddConnection") || name.starts_with("WNetUseConnection") ||
+        name.starts_with("WNetGetConnection") || name.starts_with("WNetGetUniversalName") || name.starts_with("WNetCancelConnection2")))return true;
     if((family=="wevtapi.dll" && name=="EvtQuery") || (family=="advapi32.dll" &&
        (name.starts_with("OpenEventLog") || name.starts_with("RegisterEventSource"))))return true;
     if(family=="internal-url-security" && one_of(name,{"MapUrlToZone","GetSecurityId","ProcessUrlAction"}))return true;

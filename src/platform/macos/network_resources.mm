@@ -1,4 +1,5 @@
 #include "x64arm/network_resources.hpp"
+#include "x64arm/network_provider_error.hpp"
 #include "x64arm/unicode.hpp"
 #import <Foundation/Foundation.h>
 #include <NetFS/NetFS.h>
@@ -19,7 +20,7 @@ template<class T> struct Cf {
     Cf(const Cf&)=delete;Cf& operator=(const Cf&)=delete;
     Cf(Cf&& other)noexcept:value(std::exchange(other.value,nullptr)){}
 };
-std::uint32_t error(int code){switch(code){case 0:return 0;case ENOMEM:return 8;case EACCES:case EPERM:return 5;case EAUTH:return 1326;case ENOENT:return 67;case ENETDOWN:case ENETUNREACH:return 1222;case EHOSTUNREACH:case ECONNREFUSED:return 53;case ETIMEDOUT:return 121;case EBUSY:return 2404;case -128:return 1223;default:return 1208;}}
+std::uint32_t error(int code){switch(code){case 0:return 0;case ENOMEM:return 8;case EACCES:case EPERM:return 5;case EAUTH:return 1326;case ENOENT:return 67;case ENETDOWN:case ENETUNREACH:return 1222;case EHOSTUNREACH:case ECONNREFUSED:return 53;case ETIMEDOUT:return 121;case EBUSY:return 2404;case -128:return 1223;default:native_provider_error=code;return 1208;}}
 std::u16string text(CFStringRef value){if(!value)return {};const auto length=CFStringGetLength(value);std::u16string result(static_cast<std::size_t>(length),u'\0');CFStringGetCharacters(value,CFRangeMake(0,length),reinterpret_cast<UniChar*>(result.data()));return result;}
 Cf<CFStringRef> string(std::u16string_view value){return Cf<CFStringRef>(CFStringCreateWithCharacters(kCFAllocatorDefault,reinterpret_cast<const UniChar*>(value.data()),static_cast<CFIndex>(value.size())));}
 Cf<CFMutableDictionaryRef> options(const Credentials& credentials){

@@ -67,6 +67,8 @@ std::optional<GuiIcon> native_stock_icon(std::uint32_t id,std::uint32_t size){
 }
 std::optional<GuiIcon> native_system_cursor(std::uint32_t id){
     @autoreleasepool {
+        // 尚未建立客體視窗時，AppKit 仍需初始化才會提供系統游標影像。
+        if(!NSApp && NSThread.isMainThread)[NSApplication sharedApplication];
         NSCursor* cursor=x64arm_system_cursor(id);if(!cursor)return {};
         NSRect rect={NSZeroPoint,cursor.image.size};const auto cg=[cursor.image CGImageForProposedRect:&rect context:nil hints:nil];
         auto icon=pixels(cg,static_cast<std::uint32_t>(rect.size.width),static_cast<std::uint32_t>(rect.size.height));

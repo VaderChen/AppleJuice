@@ -985,5 +985,51 @@ entry D3D12DeviceCopyDescriptorsSimple
 1:
 slow_end D3D12DeviceCopyDescriptorsSimple
 
+.macro copy_nx name, unit
+entry \name
+    mov rax, rcx
+    test rax, rax
+    jz 4f
+    test rdx, rdx
+    jz 4f
+    test r8d, r8d
+    jle 4f
+1:
+    dec r8d
+    jz 3f
+.if \unit == 1
+    movzx r9d, byte ptr [rdx]
+.else
+    movzx r9d, word ptr [rdx]
+.endif
+    test r9d, r9d
+    jz 3f
+.if \unit == 1
+    mov byte ptr [rax], r9b
+.else
+    mov word ptr [rax], r9w
+.endif
+    add rdx, \unit
+    add rax, \unit
+    jmp 1b
+3:
+.if \unit == 1
+    mov byte ptr [rax], 0
+.else
+    mov word ptr [rax], 0
+.endif
+4:
+    ret
+end \name
+.endm
+
+copy_nx StrCpyNXA, 1
+copy_nx StrCpyNXW, 2
+
+#include "guest_shell_counter.inc"
+
+#include "guest_shell_security.inc"
+#include "guest_shell_copy_encoding.inc"
+
 .globl _guest_thread_end
 _guest_thread_end:

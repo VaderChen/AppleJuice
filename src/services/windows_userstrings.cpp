@@ -41,7 +41,7 @@ std::basic_string<Character> user32_format(const GuestMemory& memory,std::basic_
         if(at<format.size()&&format[at]=='.'){++at;precision=decimal();}
         Character length=0;bool wide_integer=false;
         if(at<format.size()&&(format[at]=='h'||format[at]=='l'||format[at]=='w'))length=format[at++];
-        else if(at<format.size()&&format[at]=='I'){++at;wide_integer=true;if(at+1<format.size()&&format[at]=='6'&&format[at+1]=='4')at+=2;else if(at+1<format.size()&&format[at]=='3'&&format[at+1]=='2'){at+=2;wide_integer=false;}}
+        else if(at<format.size()&&format[at]=='I'){++at;wide_integer=!x86;if(at+1<format.size()&&format[at]=='6'&&format[at+1]=='4'){at+=2;wide_integer=true;}else if(at+1<format.size()&&format[at]=='3'&&format[at+1]=='2'){at+=2;wide_integer=false;}}
         if(at==format.size())break;const auto kind=format[at++];
         const bool string=kind=='s'||kind=='S',character=kind=='c'||kind=='C';const bool number=kind=='d'||kind=='i'||kind=='u'||kind=='x'||kind=='X'||kind=='p';
         if(!string&&!character&&!number){result.push_back(kind);continue;}
@@ -96,9 +96,15 @@ std::optional<std::uint32_t> WindowsServices::invoke_userstring(GuestState& stat
         if(wide){const auto format=read_utf16(memory,GuestAddress{arg(1+shift)},65536);const auto text=user32_format<char16_t>(memory,format,true,next,truncated,limit,x86);result=text.size();output=utf16_bytes(text);}
         else {const auto format=read_ansi(memory,arg(1+shift),65536);auto text=user32_format<char>(memory,format,false,next,truncated,limit,x86);
             // A 版的 ACP 為 UTF-8：截斷時不留下半個多位元組字元。
-            if(truncated){auto size=text.size();while(size && (static_cast<unsigned char>(text[size-1])&0xc0U)==0x80U)--size;if(size && static_cast<unsigned char>(text[size-1])>=0xc0U)text.resize(size-1);}
+            if(truncated && !text.empty()){
+                auto start=text.size()-1;
+                while(start && (static_cast<unsigned char>(text[start])&0xc0U)==0x80U)--start;
+                const auto lead=static_cast<unsigned char>(text[start]);
+                const unsigned bytes=lead>=0xf0?4U:lead>=0xe0?3U:lead>=0xc0?2U:1U;
+                if(text.size()-start<bytes)text.resize(start);
+            }
             result=text.size();output.assign(text.begin(),text.end());output.push_back(0);}
-        memory.write(GuestAddress{arg(0)},output);if(truncated && !bounded){last_error_=122;result=1024;}
+        memory.write(GuestAddress{arg(0)},output);if(!bounded && (truncated || result==limit))result=1024;
     } else if (symbol.starts_with("CharNext") || symbol.starts_with("CharPrev")) {
         const bool extended = symbol.ends_with("ExA"), previous = symbol.starts_with("CharPrev");
         const auto shift = extended ? 1U : 0U;

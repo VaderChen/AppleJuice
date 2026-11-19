@@ -11,6 +11,18 @@ std::span<const WindowsServiceDescriptor> advapi32_extra_service_descriptors(){
         {"advapi32.dll","RegLoadMUIStringW",7,0,0,0x28},{"advapi32.dll","RegLoadMUIStringA",7,0,0,0x28},
         {"internal-shell-resource","SHLoadRegUIStringA",4,0,0,0x8},{"internal-shell-resource","SHLoadRegUIStringW",4,0,0,0x8},
         {"shlwapi.dll","SHLoadIndirectString",4,0,0,0x4},
+        {"internal-shell-mime","RegisterMIMETypeForExtensionA",2},
+        {"internal-shell-mime","RegisterMIMETypeForExtensionW",2},
+        {"internal-shell-mime","UnregisterMIMETypeForExtensionA",1},
+        {"internal-shell-mime","UnregisterMIMETypeForExtensionW",1},
+        {"internal-shell-mime","RegisterExtensionForMIMETypeA",2},
+        {"internal-shell-mime","RegisterExtensionForMIMETypeW",2},
+        {"internal-shell-mime","UnregisterExtensionForMIMETypeA",1},
+        {"internal-shell-mime","UnregisterExtensionForMIMETypeW",1},
+        {"internal-shell-mime","GetMIMETypeSubKeyA",3,0,0,4},
+        {"internal-shell-mime","GetMIMETypeSubKeyW",3,0,0,4},
+        {"internal-shell-mime","MIME_GetExtensionA",3,0,0,4},
+        {"internal-shell-mime","MIME_GetExtensionW",3,0,0,4},
         // shlwapi 的 SH* 登錄輔助：以 advapi32 的對應操作組合。
         {"shlwapi.dll","SHQueryInfoKeyA",5},{"shlwapi.dll","SHQueryInfoKeyW",5},{"shlwapi.dll","SHEnumKeyExA",4,0,0,0x2},{"shlwapi.dll","SHEnumKeyExW",4,0,0,0x2},
         {"shlwapi.dll","SHEnumValueA",7,0,0,0x2},{"shlwapi.dll","SHEnumValueW",7,0,0,0x2},{"shlwapi.dll","SHQueryValueExA",6},{"shlwapi.dll","SHQueryValueExW",6},
@@ -58,6 +70,73 @@ std::optional<std::uint32_t> WindowsServices::invoke_advapi32_extra(GuestState& 
         }
         return best;};
     try{
+        if(service.family=="internal-shell-mime"){
+            const auto mime=[&]<typename Char>(Char){
+                using Text=std::basic_string<Char>;
+                constexpr bool wide=sizeof(Char)==2;
+                const auto encoded=[](std::string_view ascii){return Text(ascii.begin(),ascii.end());};
+                const auto read=[&](std::uint64_t address)->Text{
+                    if constexpr(wide)return read_utf16(memory,GuestAddress{address});
+                    else return read_ansi(memory,address,32768);
+                };
+                const auto write=[&](std::uint64_t address,const Text& text){
+                    memory.write(GuestAddress{address},std::span(reinterpret_cast<const std::uint8_t*>(text.c_str()),(text.size()+1)*sizeof(Char)));
+                };
+                const auto copy=[&](const Text& text){
+                    const auto at=allocate((text.size()+1)*sizeof(Char));write(at,text);return at;
+                };
+                const auto shell=[&](std::string symbol,std::initializer_list<std::uint64_t> args){
+                    return host("shlwapi.dll",symbol+(wide?'W':'A'),args);
+                };
+                constexpr std::uint64_t classes=0x80000000U;
+                if(name.starts_with("RegisterMIMETypeForExtension") || name.starts_with("UnregisterMIMETypeForExtension")){
+                    const auto label=copy(encoded("Content Type"));
+                    if(name.starts_with("Unregister"))return shell("SHDeleteValue",{classes,arg(0),label})==0;
+                    if(!arg(1))return false;
+                    return shell("SHSetValue",{classes,arg(0),label,1,arg(1),(read(arg(1)).size()+1)*sizeof(Char)})==0;
+                }
+                const bool lookup=name.starts_with("MIME_GetExtension");
+                const bool registration=name.starts_with("RegisterExtension");
+                const auto type=arg(registration?1:0);
+                const auto capacity=service.arguments==3?static_cast<std::uint32_t>(arg(2)):0U;
+                if(lookup){
+                    if(!arg(1) || static_cast<std::int32_t>(capacity)<=0)return false;
+                    memory.store(GuestAddress{arg(1)},sizeof(Char)*8,0);
+                    if(capacity<=2)return false;
+                }
+                if(!type)return false;
+                const Text path=encoded("MIME\\Database\\Content Type\\")+read(type);
+                if(name.starts_with("GetMIMETypeSubKey")){
+                    if(!arg(1) || path.size()>=capacity)return false;
+                    write(arg(1),path);return true;
+                }
+                if(path.size()>=260)return false;
+                const auto key=copy(path),label=copy(encoded("Extension"));
+                if(registration){
+                    if(!arg(0))return false;
+                    return shell("SHSetValue",{classes,key,label,1,arg(0),(read(arg(0)).size()+1)*sizeof(Char)})==0;
+                }
+                if(!lookup){
+                    if(shell("SHDeleteValue",{classes,key,label}))return false;
+                    (void)shell("SHDeleteEmptyKey",{classes,key});
+                    return true;
+                }
+                const auto size=allocate(4),kind=allocate(4);
+                memory.store(GuestAddress{size},32,0);
+                if(shell("SHGetValue",{classes,key,label,kind,0,size}) || memory.load(GuestAddress{kind},32)!=1)return false;
+                const auto bytes=memory.load(GuestAddress{size},32);
+                if(!bytes || bytes%sizeof(Char) || bytes/sizeof(Char)>capacity-1)return false;
+                const auto value=allocate(bytes+sizeof(Char));
+                memory.store(GuestAddress{value+bytes},sizeof(Char)*8,0);
+                if(shell("SHGetValue",{classes,key,label,kind,value,size}) || memory.load(GuestAddress{kind},32)!=1)return false;
+                auto extension=read(value);
+                if(extension.empty())return false;
+                if(extension.front()!=Char('.'))extension.insert(extension.begin(),Char('.'));
+                if(extension.size()>=capacity)return false;
+                write(arg(1),extension);return true;
+            };
+            return done(name.ends_with('W')?mime(char16_t{}):mime(char{}));
+        }
         if(name=="PathUnExpandEnvStringsA" || name=="PathUnExpandEnvStringsW"){
             // (path, buffer, cch)：沒有可換的或緩衝不足回 FALSE。
             const bool wide=name.ends_with('W');if(!arg(0) || !arg(1))return done(0);
@@ -155,14 +234,24 @@ std::optional<std::uint32_t> WindowsServices::invoke_advapi32_extra(GuestState& 
                 if(text==u"yes" || text==u"true" || text==u"1")return done(1);if(text==u"no" || text==u"false" || text==u"0")return done(0);return done(fallback);
             }
             if(name=="SHRegGetIntW"){
-                // (hkey, value, default)：REG_SZ 解析為十進位整數，REG_DWORD 直接取值。
-                const auto data=allocate(64),size=allocate(8),type=size+4;memory.store(GuestAddress{size},32,62);memory.fill(GuestAddress{data},0,64);
-                if(reg("RegQueryValueExW",{arg(0),arg(1),0,type,data,size}))return done(arg(2));
-                const auto kind=static_cast<std::uint32_t>(memory.load(GuestAddress{type},32));if(kind==4)return done(static_cast<std::uint32_t>(memory.load(GuestAddress{data},32)));
-                if(kind!=1 && kind!=2)return done(arg(2));const auto text=read_utf16(memory,GuestAddress{data},31);
-                std::int64_t value=0;bool negative=false;std::size_t i=0;if(i<text.size() && (text[i]==u'-' || text[i]==u'+')){negative=text[i]==u'-';++i;}
-                if(i==text.size() || text[i]<u'0' || text[i]>u'9')return done(arg(2));for(;i<text.size() && text[i]>=u'0' && text[i]<=u'9';++i)value=value*10+(text[i]-u'0');
-                return done(static_cast<std::uint32_t>(static_cast<std::int32_t>(negative?-value:value)));
+                // 沿用 Shell 查值的環境變數展開，以及本引擎的 DWORD 與帶號十進位支援。
+                constexpr unsigned capacity=32*sizeof(char16_t);
+                const auto data=allocate(capacity+2),size=allocate(8),type=size+4;
+                memory.fill(GuestAddress{data},0,capacity+2);
+                memory.store(GuestAddress{size},32,capacity);
+                if(host("shlwapi.dll","SHQueryValueExW",{arg(0),arg(1),0,type,data,size}))return done(arg(2));
+                const auto kind=memory.load(GuestAddress{type},32);
+                if(kind==4 && memory.load(GuestAddress{size},32)==4)return done(memory.load(GuestAddress{data},32));
+                if(kind!=1)return done(arg(2));
+                const auto text=read_utf16(memory,GuestAddress{data},33);
+                const bool negative=!text.empty() && text.front()==u'-';
+                std::size_t i=negative || (!text.empty() && text.front()==u'+') ? 1 : 0;
+                if(i==text.size() || text[i]<u'0' || text[i]>u'9')return done(arg(2));
+                const std::uint64_t limit=negative?0x80000000ULL:0x7fffffffULL;
+                std::uint64_t value=0;
+                for(;i<text.size() && text[i]>=u'0' && text[i]<=u'9';++i)
+                    value=std::min(limit,value*10+text[i]-u'0');
+                return done(static_cast<std::uint32_t>(negative?-value:value));
             }
             if(name.starts_with("SHRegGetPath")){
                 // (hkey, subkey, value, path[MAX_PATH], flags)：開啟子機碼後經 SHQueryValueEx 讀入（REG_EXPAND_SZ 展開成 REG_SZ）。
